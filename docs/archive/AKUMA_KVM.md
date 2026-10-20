@@ -258,6 +258,7 @@ device-map work in `crates/akuma-firecracker` and
 |---|---|
 | 10-20 | M1 started: APM Vol 2 rev 3.45 extracted with a pure-stdlib PDF/ToUnicode-CMap extractor; all VMCB layouts, exit codes, consistency checks and the enabling sequence recorded (§2); no code yet |
 | 10-20 | `akuma-svm-amd64` written and host-tested (13 tests); APM Vol 3 rev 3.38 downloaded, §E.4.9 EDX bits extracted with the same extractor (NP=0, NRIPS=3, table in §2.6); `amd64/src/kvm.rs` wired behind `kvmtest`, built and installed to `/boot/akuma-amd64` — awaiting the reboot with `kvmtest` on the kernel line |
+| 10-21 | First `kvmtest` run, **rehearsed in QEMU/KVM on ryzen** (nested SVM, `overlays/ryzen/grub.cfg` entry 27, serial log): three bugs in the trivial guest, each only visible from the exit code. (1) `GUEST_CODE` used `F3 0F 01 D9` — that is `VMGEXIT` (SEV-ES), not `VMMCALL` (`0F 01 D9`); fixed, length 3 not 4. (2) VMCB segment `limit` is the byte-scaled 32-bit value: `0xFFFFF` is a 1 MiB limit and the guest code sits at ~17 MiB, so the first fetch was an intercepted `#GP` (exit `0x4d`, rip = code_pa); now `0xFFFF_FFFF`. (3) NPT entries need U=1 (nested walks are user-mode accesses): without it, exit `0x400` NPF with `info1=0x1_0000_0015` (present, fetch, final GPA). After all three: `trivial guest: PASS (vmmcalls=2)`. Metal before the fixes: entry 27 reset the box straight back to Pop (no klog — it never reached herd). Metal after: see below |
 
 ---
 

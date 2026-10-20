@@ -921,15 +921,17 @@ pub mod npt {
     /// Physical address field of an NPT entry: bits 51:12.
     pub const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
-    /// An interior (pointer) entry pointing at `child_pa`.
+    /// An interior (pointer) entry pointing at `child_pa`. Guest accesses walk
+    /// the NPT as user-mode accesses (APM Vol 2 §15.25.5), so every entry needs
+    /// U=1 or a present page still faults (NPF, P=1).
     #[must_use]
     pub const fn pointer(child_pa: u64) -> u64 {
-        (child_pa & ADDR_MASK) | P | RW
+        (child_pa & ADDR_MASK) | P | RW | US
     }
     /// A 2 MiB leaf mapping `pa` (which must be 2 MiB aligned).
     #[must_use]
     pub const fn leaf_2m(pa: u64) -> u64 {
-        (pa & ADDR_MASK) | P | RW | PS
+        (pa & ADDR_MASK) | P | RW | US | PS
     }
 }
 
@@ -1278,8 +1280,8 @@ mod tests {
 
     #[test]
     fn npt_encodings_are_the_documented_subset() {
-        assert_eq!(npt::pointer(0x1234_5000), 0x1234_5000 | 0b11);
-        assert_eq!(npt::leaf_2m(0x200_0000), 0x200_0000 | npt::P | npt::RW | npt::PS);
+        assert_eq!(npt::pointer(0x1234_5000), 0x1234_5000 | 0b111);
+        assert_eq!(npt::leaf_2m(0x200_0000), 0x200_0000 | npt::P | npt::RW | npt::US | npt::PS);
         assert_eq!(npt::leaf_2m(0x200_0000) & npt::PS != 0, true);
         assert_eq!(0x1234_5000 & npt::ADDR_MASK, 0x1234_5000);
     }

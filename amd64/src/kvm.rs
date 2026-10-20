@@ -102,9 +102,9 @@ pub fn init(cmdline: &str) {
 /// "hello" — an intercept we asked for, at a known length; `HLT` is the stop
 /// marker. The trailing `jmp $` would wedge the guest if it were ever
 /// reached, which is exactly what makes it a canary.
-const GUEST_CODE: [u8; 11] = [
-    0xF3, 0x0F, 0x01, 0xD9, // vmmcall
-    0xF3, 0x0F, 0x01, 0xD9, // vmmcall
+const GUEST_CODE: [u8; 9] = [
+    0x0F, 0x01, 0xD9, // vmmcall (an F3 prefix would make it VMGEXIT, which #GPs outside SEV-ES)
+    0x0F, 0x01, 0xD9, // vmmcall
     0xF4, // hlt
     0xEB, 0xFE, // jmp $
 ];
@@ -170,9 +170,10 @@ fn trivial_guest(nrips: bool) {
         v.set_tlb_control(ctrl::TLB_DO_NOTHING);
         v.set_np_enable(true);
         v.set_n_cr3(pml4_pa);
-        // Flat segments: base 0, limit 0xFFFFF paired with G=1 (the raw limit
-        // field is the pre-granularity form; G=0 would cap at 1 MiB).
-        let flat = |attr: SegAttr| Seg { selector: 0, attr, limit: 0xF_FFFF, base: 0 };
+        // Flat segments: base 0, limit 0xFFFF_FFFF. The VMCB limit field is the
+        // byte-scaled 32-bit limit, not the 20-bit pre-granularity form: 0xFFFFF
+        // here is a 1 MiB limit, and the guest code sits above it (#GP on fetch).
+        let flat = |attr: SegAttr| Seg { selector: 0, attr, limit: 0xFFFF_FFFF, base: 0 };
         v.set_seg(save::CS, flat(SegAttr::CODE32_DPL0));
         let data = flat(SegAttr::DATA32_RW_DPL0);
         v.set_seg(save::ES, data);
@@ -183,11 +184,11 @@ fn trivial_guest(nrips: bool) {
         // the host's (that is what VMLOAD/VMSAVE are for, §15.5.3/§15.5.4).
         v.set_seg(
             save::FS,
-            Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xF_FFFF, base: msr::read(Msr::FsBase) },
+            Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base: msr::read(Msr::FsBase) },
         );
         v.set_seg(
             save::GS,
-            Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xF_FFFF, base: msr::read(Msr::GsBase) },
+            Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base: msr::read(Msr::GsBase) },
         );
         // 32-bit protected, unpaged: PG=0 keeps guest-linear == guest-physical
         // for the NPT; LME/LMA stay clear so no PAE/long-mode checks apply.
@@ -237,8 +238,8 @@ fn trivial_guest(nrips: bool) {
             ExitCode::Vmmcall => {
                 vmmcalls += 1;
                 // Trap-style exit: nRIP is the resume point when NRIPS is
-                // present; otherwise the vmmcall length (4) by hand.
-                let next = if nrips && v.nrip() != 0 { v.nrip() } else { v.rip() + 4 };
+                // present; otherwise the vmmcall length (3) by hand.
+                let next = if nrips && v.nrip() != 0 { v.nrip() } else { v.rip() + 3 };
                 v.set_rip(next);
             }
             ExitCode::Hlt => {

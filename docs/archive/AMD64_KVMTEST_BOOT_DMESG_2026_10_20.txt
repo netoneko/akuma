@@ -1,0 +1,511 @@
+ (19 differ), polls 45 (0 timed out), 26319 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000da00002b got 0x00000000f400002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000208e3 got 0x00000000000207d4
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cc38 got 0x000000000002cac3
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e4099e got 0x0000000002e40999
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66a got 0x00000000008cd66b
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000b0000 got 0x00000000000a0000
+[rtw]   op 397 reg 0x0000000000010378 want 0x0000000000000118 got 0x0000000000000142
+[rtw]   op 400 reg 0x0000000000010370 want 0x000000009ee00000 got 0x0000000094280000
+[bkls>] core=3 ticket=489413 serving=489412 owner=4 spins=1048576
+[bkls>] core=3 ticket=489413 serving=489412 owner=4 spins=2097152
+[bkls>] core=3 ticket=489413 serving=489412 owner=4 spins=4194304
+[rtw] chan (switch): 1440 ops, 865 writes, 0 h2c, checks 525 (2 differ), polls 37 (1 timed out), 110278 us
+[rtw]   op 7 reg 0x000000000000ce40 want 0x000000005600002b got 0x000000003300002b
+[rtw]   op 718 reg 0x000000000000ce40 want 0x000000005600002b got 0x000000003300002b
+[rtw]   op 1439 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000000
+[rtw] scan: 155 beacons, 24 networks
+[rtw]   bss a2:b5:3c:xx:xx:xx ch 1 ssid#6f339e6e wpa2-psk
+[rtw]   bss 4a:3f:da:xx:xx:xx ch 1 ssid#a4a63da6 open
+[rtw]   bss bc:d5:ed:xx:xx:xx ch 1 ssid#329ba75b wpa2-psk
+[rtw]   bss 94:3c:96:xx:xx:xx ch 1 ssid#305a7ee6 wpa2-psk
+[rtw]   bss 92:d8:e5:xx:xx:xx ch 1 ssid#058add01 wpa2-psk
+[rtw]   bss 72:d5:ed:xx:xx:xx ch 1 ssid#329ba75b wpa2-psk
+[rtw]   bss 50:6f:0c:xx:xx:xx ch 2 ssid#631a4670 wpa2-psk
+[rtw]   bss 00:f8:cc:xx:xx:xx ch 6 ssid#7d2028cf wpa2-psk
+[rtw]   bss 04:95:e6:xx:xx:xx ch 8 ssid#7617faf3 wpa2-psk
+[rtw]   bss 9c:e5:49:xx:xx:xx ch 6 ssid#c9577d26 wpa2-psk
+[rtw]   bss 10:2b:aa:xx:xx:xx ch 6 ssid#137fe768 wpa2-psk
+[rtw]   bss 00:f8:cc:xx:xx:xx ch 6 ssid#5252c105 wpa2-psk
+[rtw]   bss 7c:d4:a8:xx:xx:xx ch 7 ssid#e3c1ef10 wpa2-psk
+[rtw]   bss d0:cf:0e:xx:xx:xx ch 4 ssid#862eb32e wpa2-psk
+[rtw]   bss b0:22:7a:xx:xx:xx ch 6 ssid#10e64dcc wpa2-psk
+[rtw]   bss 00:b8:c2:xx:xx:xx ch 3 ssid#c570f892 wpa2-psk
+[rtw]   bss da:d8:e5:xx:xx:xx ch 11 ssid#0806e212 wpa2-psk
+[rtw]   bss 00:1d:aa:xx:xx:xx ch 11 ssid#17c2f35c other
+[rtw]   bss 02:1d:aa:xx:xx:xx ch 11 ssid#c222f3a5 other
+[rtw]   bss a4:91:b1:xx:xx:xx ch 11 ssid#2ce1df73 wpa2-psk
+[rtw]   bss dc:92:72:xx:xx:xx ch 12 ssid#bb2f668d wpa2-psk
+[rtw]   bss c4:eb:42:xx:xx:xx ch 11 ssid#ee47acd1 wpa2-psk
+[rtw]   bss 00:b8:c2:xx:xx:xx ch 3 ssid#0ed2c5e4 wpa2-psk
+[rtw]   bss 80:af:ca:xx:xx:xx ch 3 ssid#35c09850 wpa2-psk
+[rtw] join: bss a4:91:b1:xx:xx:xx ch 11 ssid#2ce1df73
+[rtw] join attempt 1
+[bkls>] core=2 ticket=498591 serving=498590 owner=6 spins=1048576
+[bkls>] core=2 ticket=498591 serving=498590 owner=6 spins=2097152
+[bkls>] core=2 ticket=498591 serving=498590 owner=6 spins=4194304
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (14 differ), polls 37 (1 timed out), 110081 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004d00002b got 0x000000004600002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000207d4 got 0x0000000000020b00
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cac3 got 0x000000000002cf21
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40999 got 0x0000000002e409a8
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66b got 0x00000000008cd66a
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000a0000 got 0x00000000000d0000
+[rtw]   op 186 reg 0x00000000000142c4 want 0x0000000000280280 got 0x0000000000a80280
+[rtw]   op 188 reg 0x0000000000014c14 want 0x0000000000000909 got 0x0000000000001939
+[bkls>] core=2 ticket=498591 serving=498590 owner=6 spins=8388608
+[rtw] join2 (prepare): 4072 ops, 1693 writes, 9 h2c, checks 1787 (51 differ), polls 550 (0 timed out), 38378 us
+[rtw]   op 20 reg 0x00000000000000ac want 0x00000000c000000b got 0x0000000000000000
+[rtw]   op 649 reg 0x00000000000000ac want 0x000000004000200b got 0x0000000080000000
+[rtw]   op 654 reg 0x00000000000000ac want 0x000000004000200b got 0x0000000080000000
+[rtw]   op 1967 reg 0x00000000000000ac want 0x00000000c000280b got 0x0000000000000000
+[rtw]   op 2050 reg 0x0000000000015838 want 0x0000000002004121 got 0x0000000002001121
+[rtw]   op 2054 reg 0x0000000000015858 want 0x0000000002004121 got 0x0000000002000121
+[rtw]   op 2056 reg 0x0000000000015860 want 0x0000000002004121 got 0x0000000002000121
+[rtw]   op 2260 reg 0x0000000000015828 want 0x0000000002004121 got 0x0000000002001121
+[BKL] stuck: owner=6 waiter=3 tag=501 serving=498590 folded=6 (aff0+1)
+[bkls>] core=2 ticket=498591 serving=498590 owner=6 spins=16777216
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (36 differ), polls 37 (1 timed out), 110090 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004d00002b got 0x000000007c00002b
+[rtw]   op 10 reg 0x0000000000015818 want 0x00000000082c1800 got 0x00000000182c18e8
+[rtw]   op 12 reg 0x0000000000015820 want 0x0000000000000080 got 0x0000000080000080
+[rtw]   op 14 reg 0x0000000000017818 want 0x00000000082c1800 got 0x00000000182c18e8
+[rtw]   op 16 reg 0x0000000000017820 want 0x0000000000000080 got 0x0000000080000080
+[rtw]   op 29 reg 0x0000000000010704 want 0x00000000601c0502 got 0x00000000601e0502
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000207d4 got 0x00000000000208e3
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cac3 got 0x000000000002cc38
+[rtw] auth tx: idx 0x0000000000000001 -> 0x0000000000010001, release reports +1 status done, dmac_err 0x0000000000000000 idct 0x0000000000000000; rx total 1163 bad 0 crc 0 idx 0x00000000008b008b; heard 148, from ap 41, mgmt to us 0, to us 1; no answer; ap fc 80x4 88x18 94x7 b4x12
+[rtw] auth tx: idx 0x0000000000010002 -> 0x0000000000020002, release reports +1 status done, dmac_err 0x0000000000000000 idct 0x0000000000000000; rx total 1401 bad 0 crc 0 idx 0x00000000007b0079; heard 120, from ap 26, mgmt to us 0, to us 1; no answer; ap fc 94x8 80x3 b4x7 88x8
+[rtw] auth tx: idx 0x0000000000020003 -> 0x0000000000030003, release reports +1 status done, dmac_err 0x0000000000000000 idct 0x0000000000000000; rx total 1595 bad 0 crc 0 idx 0x00000000003b003b; heard 96, from ap 23, mgmt to us 0, to us 1; no answer; ap fc 80x3 88x7 94x6 b4x7
+[rtw] auth tx: idx 0x0000000000030004 -> 0x0000000000040004, release reports +0 status done, dmac_err 0x0000000000000000 idct 0x0000000000000000; rx total 1599 bad 0 crc 0 idx 0x00000000003f003f; heard 2, from ap 1, mgmt to us 1, to us 2; answer a1 hit; ap fc b0x1
+[rtw] auth: accepted
+[rtw] assoc tx: idx 0x0000000000040005 -> 0x0000000000050005, release reports +1 status done, dmac_err 0x0000000000000000 idct 0x0000000000000000; rx total 1603 bad 0 crc 0 idx 0x0000000000430043; heard 2, from ap 1, mgmt to us 1, to us 2; answer a1 hit; ap fc 10x1
+[rtw] assoc: accepted, aid 4
+[rtw] join3 (associated): 28 ops, 3 writes, 15 h2c, checks 4 (1 differ), polls 0 (0 timed out), 2449 us
+[rtw]   op 11 reg 0x00000000000000ac want 0x000000004000208b got 0x0000000080000000
+[rtw] eapol: message 1 answered (a1 hit)
+[rtw] join4 (keys): 18 ops, 2 writes, 9 h2c, checks 2 (2 differ), polls 0 (0 timed out), 15500 us
+[rtw]   op 5 reg 0x00000000000000ac want 0x00000000c000208b[bkls>] core=2 ticket=556432 serving=556431 owner=1 spins=1048576
+ got 0x0000000000000000
+[rtw]   op 9 reg 0x00000000000000ac want 0x000000004000208b got 0x0000000080000000
+[rtw] eapol: message 3 answered, keys installed, group key id 1
+[rtw] link: rx data 0 amsdu 0/0 clear 0 undecrypted 0 replayed 0 unparsed 0 -> stack 0 (dropped 0); tx 1 failed 0 (stack dropped 0); released done 6 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 0 tx 0 rst rx 0 tx 0; laps 5 max gap 6005 ms
+[SmolNet] DHCP configured
+[SmolNet] IP: 192.168.1.159/24
+  mem:  heap 24125/1048576 KiB (peak 24773), pmm 12516 MiB free
+[PSTATS] PID 1 (/bin/herd) 13.07s: 1562 syscalls (119/s) in_kernel=25773ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=122(12844ms) nanosleep=122(12844ms) io_setup=718(37ms) nr315=1(35ms) nr1=82(9ms) nr257=24(0ms) getdents64=129(0ms) nr217=4(0ms) mkdirat=9(0ms) nr258=9(0ms)
+[PSTATS] PID 26 (/bin/sh) 13.01s: 356 syscalls (27/s) in_kernel=61ms pmm=3204250free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 12.97s: 557 syscalls (42/s) in_kernel=4325ms pmm=3204250free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 12.95s: 623 syscalls (48/s) in_kernel=16396ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=77(8197ms) nanosleep=77(8197ms) io_setup=206(0ms) getdents64=2(0ms) nr217=2(0ms) nr257=84(0ms) nr3=84(0ms) close=84(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 10.79s: 36 syscalls (3/s) in_kernel=0ms pmm=3204250free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 12.96s: 101 syscalls (7/s) in_kernel=24318ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=13(12015ms) nanosleep=13(12015ms) io_setup=13(284ms) nr5=14(2ms) nr257=14(0ms) nr9=1(0ms) nr3=14(0ms) close=14(0ms) nr1=5(0ms)
+[PSTATS] PID 37 (/bin/sshd) 12.96s: 33292 syscalls (2568/s) in_kernel=25524ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=11087(12758ms) nanosleep=11087(12751ms) nr43=11087(12ms) io_setup=4(0ms) nr257=3(0ms) mkdirat=2(0ms) nr258=2(0ms) nr9=1(0ms) nr50=1(0ms) nr1=8(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 11.84s: 64 syscalls (5/s) in_kernel=0ms pmm=3204250free/3608622tot retired=0/0p pgfault=15(15pg) | nr2=3(0ms) epoll_create1=2(0ms) nr50=1(0ms) nr41=3(0ms) nr3=4(0ms) nr9=2(0ms) nr49=2(0ms) close=4(0ms) fstat=1(0ms) io_setup=1(0ms)
+[bkls>] core=5 ticket=703676 serving=703675 owner=6 spins=1048576
+[FAULTSTAT] n=5644 bkl_wait=410ns service=6554ns
+[FAULTSTAT] file_faults=4650 pages=15559 shared=11671 file_service=7718ns
+[IDLESTAT] halts=114509 shots=0 shot_ticks_credited=0
+  dns: 1.1.1.1: no reply before timeout
+  clock: synced via SNTP (pool.ntp.org, retry)
+  clock: CMOS RTC written from SNTP (2026-10-20 21:24 UTC) and read back
+[kbd] polls=1500 st=0x1c or=0x1c scancodes=0
+  mem:  heap 24511/1048576 KiB (peak 24773), pmm 12516 MiB free
+[herd] Reloading config...
+  mem:  heap 24831/1048576 KiB (peak 24900), pmm 12516 MiB free
+[kbd] polls=3000 st=0x1c or=0x1c scancodes=0
+  mem:  heap 25151/1048576 KiB (peak 25220), pmm 12516 MiB free
+[PSTATS] PID 1 (/bin/herd) 43.07s: 4913 syscalls (114/s) in_kernel=85792ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=422(42852ms) nanosleep=422(42852ms) io_setup=2530(38ms) nr315=1(35ms) nr1=83(9ms) getdents64=431(1ms) nr257=31(1ms) nr217=6(0ms) mkdirat=9(0ms) nr258=9(0ms)
+[PSTATS] PID 26 (/bin/sh) 43.01s: 356 syscalls (8/s) in_kernel=61ms pmm=3204250free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 42.98s: 557 syscalls (12/s) in_kernel=4325ms pmm=3204250free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 42.95s: 677 syscalls (15/s) in_kernel=76396ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=83(38197ms) nanosleep=83(38197ms) io_setup=230(0ms) getdents64=2(0ms) nr217=2(0ms) nr257=90(0ms) nr3=90(0ms) close=90(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 40.79s: 36 syscalls (0/s) in_kernel=0ms pmm=3204250free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 42.96s: 311 syscalls (7/s) in_kernel=84331ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=43(42016ms) nanosleep=43(42016ms) io_setup=43(289ms) nr5=44(7ms) nr257=44(0ms) nr3=44(0ms) close=44(0ms) nr9=1(0ms) nr1=5(0ms)
+[PSTATS] PID 37 (/bin/sshd) 42.96s: 119731 syscalls (2786/s) in_kernel=84771ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=39900(42378ms) nanosleep=39900(42362ms) nr43=39900(28ms) io_setup=4(0ms) nr257=3(0ms) mkdirat=2(0ms) nr258=2(0ms) nr9=1(0ms) nr50=1(0ms) nr1=8(0ms)
+[bkls>] core=4 ticket=1649917 serving=1649916 owner=2 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 37.91s: 254 syscalls (6/s) in_kernel=72038ms pmm=3204250free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=19(36000ms) nanosleep=19(36000ms) nr257=24(16ms) nr1=35(8ms) nr162=19(3ms) nr81=19(3ms) nr264=21(2ms) nr38=21(2ms) nr103=19(0ms) nr3=23(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 41.84s: 64 syscalls (1/s) in_kernel=0ms pmm=3204250free/3608622tot retired=0/0p pgfault=15(15pg) | nr2=3(0ms) epoll_create1=2(0ms) nr50=1(0ms) nr41=3(0ms) nr3=4(0ms) nr9=2(0ms) nr49=2(0ms) close=4(0ms) fstat=1(0ms) io_setup=1(0ms)
+[FAULTSTAT] n=5644 bkl_wait=410ns service=6554ns
+[FAULTSTAT] file_faults=4650 pages=15559 shared=11671 file_service=7718ns
+[IDLESTAT] halts=386366 shots=0 shot_ticks_credited=0
+[herd] Reloading config...
+[kbd] polls=4500 st=0x1c or=0x1c scancodes=0
+  mem:  heap 25535/1048576 KiB (peak 25604), pmm 12516 MiB free
+[HEAP-R] 25MB used (realloc 8->16)
+[rtw] tcp tx 50191 -> 22 RST | ip len 40 of 40 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 46.62.210.86
+  mem:  heap 25855/1048576 KiB (peak 25924), pmm 12516 MiB free
+[rtw] link: rx data 30 amsdu 0/0 clear 0 undecrypted 0 replayed 0 unparsed 0 -> stack 29 (dropped 0); tx 8 failed 0 (stack dropped 0); released done 14 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 0 tx 0 rst rx 0 tx 1; laps 24549 max gap 27 ms
+[rtw] join4 (group rekey): 6 ops, 0 writes, 3 h2c, checks 0 (0 differ), polls 0 (0 timed out), 365 us
+[rtw] link: rx data 30 amsdu 0/0 clear 0 undecrypted 0 replayed 0 unparsed 0 -> stack 29 (dropped 0); tx 8 failed 0 (stack dropped 0); released done 14 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 0 tx 0 rst rx 0 tx 1; laps 24549 max gap 27 ms
+[herd] Reloading config...
+[kbd] polls=6000 st=0x1c or=0x1c scancodes=0
+[rtw] link: rx data 34 amsdu 0/0 clear 0 undecrypted 0 replayed 0 unparsed 0 -> stack 33 (dropped 0); tx 9 failed 0 (stack dropped 0); released done 16 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 0 tx 0 rst rx 0 tx 1; laps 28814 max gap 27 ms
+  mem:  heap 26175/1048576 KiB (peak 26244), pmm 12516 MiB free
+[PSTATS] PID 1 (/bin/herd) 73.07s: 8320 syscalls (113/s) in_kernel=145808ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=722(72859ms) nanosleep=722(72859ms) io_setup=4355(39ms) nr315=1(35ms) nr1=86(9ms) getdents64=735(1ms) nr257=46(1ms) nr217=10(0ms) nr43=722(0ms) wait4=725(0ms)
+[PSTATS] PID 26 (/bin/sh) 73.01s: 356 syscalls (4/s) in_kernel=61ms pmm=3204250free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 72.98s: 557 syscalls (7/s) in_kernel=4325ms pmm=3204250free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 72.95s: 731 syscalls (10/s) in_kernel=136397ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=89(68197ms) nanosleep=89(68197ms) io_setup=254(0ms) nr257=96(0ms) getdents64=2(0ms) nr217=2(0ms) nr3=96(0ms) close=96(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 70.79s: 36 syscalls (0/s) in_kernel=0ms pmm=3204250free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 72.96s: 526 syscalls (7/s) in_kernel=144361ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=73(72019ms) nanosleep=73(72019ms) io_setup=73(294ms) nr1=7(14ms) nr5=74(12ms) nr257=75(1ms) nr3=75(0ms) close=75(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 72.96s: 205969 syscalls (2822/s) in_kernel=143900ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=68646(71940ms) nanosleep=68646(71913ms) nr43=68646(45ms) io_setup=4(0ms) nr257=3(0ms) mkdirat=2(0ms) nr258=2(0ms) nr9=1(0ms) nr50=1(0ms) nr1=8(0ms)
+[bkls>] core=7 ticket=2578705 serving=2578704 owner=5 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 67.91s: 428 syscalls (6/s) in_kernel=132072ms pmm=3204250free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=34(66000ms) nanosleep=34(66000ms) nr257=39(31ms) nr1=59(14ms) nr162=34(6ms) nr81=34(6ms) nr264=36(5ms) nr38=36(5ms) nr103=34(1ms) nr3=38(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 71.84s: 64 syscalls (0/s) in_kernel=0ms pmm=3204250free/3608622tot retired=0/0p pgfault=15(15pg) | nr2=3(0ms) epoll_create1=2(0ms) nr50=1(0ms) nr41=3(0ms) nr3=4(0ms) nr9=2(0ms) nr49=2(0ms) close=4(0ms) fstat=1(0ms) io_setup=1(0ms)
+[FAULTSTAT] n=5644 bkl_wait=410ns service=6554ns
+[FAULTSTAT] file_faults=4650 pages=15559 shared=11671 file_service=7718ns
+[IDLESTAT] halts=659153 shots=0 shot_ticks_credited=0
+  mem:  heap 26559/1048576 KiB (peak 26628), pmm 12516 MiB free
+[kbd] polls=7500 st=0x1c or=0x1c scancodes=0
+[herd] Reloading config...
+  [touchpad] polls=4096 nack=0 empty=4096 reports=0 other=0 down=0
+  mem:  heap 26879/1048576 KiB (peak 26948), pmm 12516 MiB free
+[kbd] polls=9000 st=0x1c or=0x1c scancodes=0
+  mem:  heap 27199/1048576 KiB (peak 27268), pmm 12516 MiB free
+[PSTATS] PID 1 (/bin/herd) 103.08s: 11660 syscalls (113/s) in_kernel=205626ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=1021(102767ms) nanosleep=1021(102766ms) io_setup=6161(40ms) nr315=1(35ms) nr1=87(10ms) getdents64=1036(1ms) nr257=53(1ms) nr217=12(0ms) nr43=1021(0ms) wait4=1024(0ms)
+[PSTATS] PID 26 (/bin/sh) 103.01s: 356 syscalls (3/s) in_kernel=61ms pmm=3204250free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 102.98s: 557 syscalls (5/s) in_kernel=4325ms pmm=3204250free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 102.95s: 785 syscalls (7/s) in_kernel=196399ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=95(98199ms) nanosleep=95(98199ms) io_setup=278(0ms) nr257=102(0ms) getdents64=2(0ms) nr217=2(0ms) nr3=102(0ms) close=102(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 100.79s: 36 syscalls (0/s) in_kernel=0ms pmm=3204250free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 102.96s: 736 syscalls (7/s) in_kernel=204375ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=103(102020ms) nanosleep=103(102020ms) io_setup=103(299ms) nr5=104(17ms) nr1=7(14ms) nr257=105(2ms) nr3=105(0ms) close=105(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 102.96s: 292375 syscalls (2839/s) in_kernel=203197ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=97448(101585ms) nanosleep=97448(101548ms) nr43=97448(61ms) io_setup=4(0ms) nr257=3(0ms) mkdirat=2(0ms) nr258=2(0ms) nr9=1(0ms) nr50=1(0ms) nr1=8(0ms)
+[bkls>] core=8 ticket=3505160 serving=3505159 owner=7 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 97.91s: 601 syscalls (6/s) in_kernel=192103ms pmm=3204250free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=49(96000ms) nanosleep=49(96000ms) nr257=54(45ms) nr1=82(20ms) nr162=49(9ms) nr81=49(9ms) nr264=51(7ms) nr38=51(7ms) nr103=49(2ms) nr3=53(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 101.84s: 64 syscalls (0/s) in_kernel=0ms pmm=3204250free/3608622tot retired=0/0p pgfault=15(15pg) | nr2=3(0ms) epoll_create1=2(0ms) nr50=1(0ms) nr41=3(0ms) nr3=4(0ms) nr9=2(0ms) nr49=2(0ms) close=4(0ms) fstat=1(0ms) io_setup=1(0ms)
+[FAULTSTAT] n=5644 bkl_wait=410ns service=6554ns
+[FAULTSTAT] file_faults=4650 pages=15559 shared=11671 file_service=7718ns
+[IDLESTAT] halts=931074 shots=0 shot_ticks_credited=0
+[herd] Reloading config...
+  mem:  heap 27583/1048576 KiB (peak 27652), pmm 12516 MiB free
+[kbd] polls=10500 st=0x1c or=0x1c scancodes=0
+  mem:  heap 27903/1048576 KiB (peak 27972), pmm 12516 MiB free
+[herd] Reloading config...
+[kbd] polls=12000 st=0x1c or=0x1c scancodes=0
+[rtw] link: rx data 68 amsdu 0/0 clear 0 undecrypted 0 replayed 0 unparsed 0 -> stack 67 (dropped 0); tx 11 failed 0 (stack dropped 0); released done 18 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 0 tx 0 rst rx 0 tx 1; laps 28816 max gap 27 ms
+  mem:  heap 28223/1048576 KiB (peak 28292), pmm 12516 MiB free
+[PSTATS] PID 1 (/bin/herd) 133.08s: 15062 syscalls (113/s) in_kernel=265672ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=1321(132788ms) nanosleep=1321(132788ms) io_setup=7985(42ms) nr315=1(35ms) nr1=89(10ms) getdents64=1340(2ms) nr257=67(1ms) nr217=16(0ms) nr43=1321(0ms) wait4=1324(0ms)
+[PSTATS] PID 26 (/bin/sh) 133.01s: 356 syscalls (2/s) in_kernel=61ms pmm=3204250free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 132.98s: 557 syscalls (4/s) in_kernel=4325ms pmm=3204250free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 132.95s: 839 syscalls (6/s) in_kernel=256401ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=101(128200ms) nanosleep=101(128200ms) io_setup=302(0ms) nr257=108(0ms) getdents64=2(0ms) nr217=2(0ms) nr3=108(0ms) close=108(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 130.79s: 36 syscalls (0/s) in_kernel=0ms pmm=3204250free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 132.96s: 946 syscalls (7/s) in_kernel=264386ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=133(132021ms) nanosleep=133(132020ms) io_setup=133(304ms) nr5=134(22ms) nr1=7(14ms) nr257=135(2ms) nr3=135(0ms) close=135(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 132.96s: 378766 syscalls (2848/s) in_kernel=262473ms pmm=3204250free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=126245(131220ms) nanosleep=126245(131173ms) nr43=126245(78ms) io_setup=4(0ms) nr257=3(0ms) mkdirat=2(0ms) nr258=2(0ms) nr9=1(0ms) nr50=1(0ms) nr1=8(0ms)
+[bkls>] core=4 ticket=4433782 serving=4433781 owner=2 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 127.91s: 773 syscalls (6/s) in_kernel=252134ms pmm=3204250free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=64(126000ms) nanosleep=64(126000ms) nr257=69(57ms) nr1=104(26ms) nr162=64(12ms) nr81=64(12ms) nr264=66(10ms) nr38=66(10ms) nr103=64(2ms) nr3=68(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 131.84s: 64 syscalls (0/s) in_kernel=0ms pmm=3204250free/3608622tot retired=0/0p pgfault=15(15pg) | nr2=3(0ms) epoll_create1=2(0ms) nr50=1(0ms) nr41=3(0ms) nr3=4(0ms) nr9=2(0ms) nr49=2(0ms) close=4(0ms) fstat=1(0ms) io_setup=1(0ms)
+[FAULTSTAT] n=5644 bkl_wait=410ns service=6554ns
+[FAULTSTAT] file_faults=4650 pages=15559 shared=11671 file_service=7718ns
+[IDLESTAT] halts=1203697 shots=0 shot_ticks_credited=0
+[HEAP] 28MB used (alloc=65536 bytes)
+  mem:  heap 28607/1048576 KiB (peak 28676), pmm 12516 MiB free
+[kbd] polls=13500 st=0x1c or=0x1c scancodes=0
+[herd] Reloading config...
+  mem:  heap 28927/1048576 KiB (peak 28996), pmm 12516 MiB free
+[rtw] tcp rx 49252 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp rx 49252 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 49252 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[rtw] tcp rx 49252 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp rx 49252 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp rx 49252 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp rx 49254 -> 4444 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 4444 -> 49254 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[rtw] tcp rx 49255 -> 22 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 22 -> 49255 RST | ip len 40 of 40 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[kbd] polls=15000 st=0x1c or=0x1c scancodes=0
+  mem:  heap 30502/1048576 KiB (peak 31336), pmm 12516 MiB free
+[PSTATS] PID 1 (/bin/herd) 163.08s: 18428 syscalls (112/s) in_kernel=325689ms pmm=3204217free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=1621(162796ms) nanosleep=1621(162795ms) io_setup=9800(43ms) nr315=1(35ms) nr1=93(11ms) getdents64=1642(2ms) nr257=77(2ms) nr43=1621(0ms) nr217=18(0ms) wait4=1624(0ms)
+[PSTATS] PID 26 (/bin/sh) 163.01s: 356 syscalls (2/s) in_kernel=61ms pmm=3204217free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 162.98s: 557 syscalls (3/s) in_kernel=4325ms pmm=3204217free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 162.95s: 893 syscalls (5/s) in_kernel=316401ms pmm=3204217free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=107(158200ms) nanosleep=107(158200ms) io_setup=326(0ms) nr257=114(0ms) getdents64=2(0ms) nr217=2(0ms) nr3=114(0ms) close=114(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 160.79s: 36 syscalls (0/s) in_kernel=0ms pmm=3204217free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 162.96s: 1156 syscalls (7/s) in_kernel=324399ms pmm=3204217free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=163(162022ms) nanosleep=163(162022ms) io_setup=163(309ms) nr5=164(27ms) nr1=7(14ms) nr257=165(3ms) nr3=165(0ms) close=165(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 162.96s: 465815 syscalls (2858/s) in_kernel=321694ms pmm=3204217free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=155039(160826ms) nanosleep=155039(160770ms) nr43=155041(94ms) io_setup=11(1ms) truncate=605(0ms) nr257=6(0ms) mkdirat=2(0ms) nr258=2(0ms) nr44=14(0ms) nr9=1(0ms)
+[bkls>] core=8 ticket=5366791 serving=5366790 owner=2 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 157.91s: 945 syscalls (5/s) in_kernel=312167ms pmm=3204217free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=79(156001ms) nanosleep=79(156001ms) nr257=84(70ms) nr1=126(32ms) nr162=79(15ms) nr81=79(15ms) nr264=81(13ms) nr38=81(13ms) nr103=79(3ms) nr3=83(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 161.84s: 205 syscalls (1/s) in_kernel=154113ms pmm=3204217free/3608622tot retired=0/0p pgfault=63(63pg) | nr271=6(154112ms) close=8(0ms) nr2=3(0ms) epoll_create1=2(0ms) nr9=11(0ms) nr11=9(0ms) nr52=3(0ms) getpeername=3(0ms) nr3=7(0ms) nr14=18(0ms)
+[FAULTSTAT] n=5853 bkl_wait=425ns service=6629ns
+[FAULTSTAT] file_faults=4850 pages=17267 shared=13054 file_service=7767ns
+[IDLESTAT] halts=1476942 shots=0 shot_ticks_credited=0
+[herd] Reloading config...
+[HEAP-R] 30MB used (realloc 8->16)
+[rtw] tcp rx 49263 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 49263 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[HEAP] 33MB used (alloc=65536 bytes)
+[HEAP-R] 35MB used (realloc 75->150)
+[HEAP] 38MB used (alloc=65536 bytes)
+[HEAP-R] 40MB used (realloc 128->256)
+[HEAP] 43MB used (alloc=65536 bytes)
+[HEAP-R] 45MB used (realloc 96->192)
+  mem:  heap 47268/1048576 KiB (peak 47276), pmm 12511 MiB free
+[HEAP] 48MB used (alloc=28672 bytes)
+[HEAP-R] 50MB used (realloc 128->256)
+[HEAP] 53MB used (alloc=65536 bytes)
+[HEAP-R] 55MB used (realloc 128->256)
+[HEAP] 58MB used (alloc=65536 bytes)
+[HEAP-R] 60MB used (realloc 128->256)
+[HEAP] 63MB used (alloc=65536 bytes)
+[HEAP-R] 65MB used (realloc 128->256)
+[HEAP] 68MB used (alloc=65536 bytes)
+[HEAP-R] 70MB used (realloc 66->132)
+[HEAP] 73MB used (alloc=144 bytes)
+[HEAP-R] 75MB used (realloc 108->216)
+[HEAP] 78MB used (alloc=65536 bytes)
+[HEAP-R] 80MB used (realloc 76->152)
+[HEAP] 83MB used (alloc=65536 bytes)
+[HEAP-R] 85MB used (realloc 99->198)
+[HEAP] 88MB used (alloc=65536 bytes)
+[HEAP-R] 90MB used (realloc 128->256)
+[HEAP] 93MB used (alloc=65536 bytes)
+[HEAP-R] 95MB used (realloc 60->120)
+[HEAP] 98MB used (alloc=65536 bytes)
+[HEAP-R] 100MB used (realloc 640->1280)
+[HEAP] 103MB used (alloc=4096 bytes)
+[HEAP-R] 105MB used (realloc 110->220)
+[HEAP] 108MB used (alloc=65536 bytes)
+[HEAP-R] 110MB used (realloc 114->228)
+[HEAP] 113MB used (alloc=65536 bytes)
+[HEAP-R] 115MB used (realloc 84->168)
+[HEAP] 118MB used (alloc=65536 bytes)
+[HEAP-R] 120MB used (realloc 5120->10240)
+[HEAP] 123MB used (alloc=65536 bytes)
+[HEAP-R] 125MB used (realloc 128->256)
+[HEAP] 128MB used (alloc=65536 bytes)
+[HEAP-R] 130MB used (realloc 160->320)
+[HEAP] 133MB used (alloc=65536 bytes)
+[HEAP-R] 135MB used (realloc 128->256)
+[HEAP] 138MB used (alloc=65536 bytes)
+[HEAP-R] 140MB used (realloc 640->1280)
+[HEAP] 143MB used (alloc=65536 bytes)
+[HEAP-R] 145MB used (realloc 36->72)
+[HEAP] 148MB used (alloc=65536 bytes)
+[HEAP-R] 150MB used (realloc 327680->655360)
+  [touchpad] polls=8192 nack=0 empty=8192 reports=0 other=0 down=0
+[HEAP] 153MB used (alloc=65536 bytes)
+[HEAP-R] 155MB used (realloc 160->320)
+[HEAP] 158MB used (alloc=65536 bytes)
+[HEAP-R] 160MB used (realloc 53->106)
+[HEAP] 163MB used (alloc=65536 bytes)
+[HEAP-R] 165MB used (realloc 128->256)
+[HEAP] 168MB used (alloc=65536 bytes)
+[HEAP-R] 170MB used (realloc 128->256)
+[HEAP] 173MB used (alloc=65536 bytes)
+[HEAP-R] 175MB used (realloc 128->256)
+[HEAP] 178MB used (alloc=65536 bytes)
+[HEAP-R] 180MB used (realloc 128->256)
+[HEAP] 183MB used (alloc=4096 bytes)
+[HEAP-R] 185MB used (realloc 128->256)
+[HEAP] 188MB used (alloc=65536 bytes)
+[HEAP-R] 190MB used (realloc 128->256)
+[kbd] polls=16500 st=0x1c or=0x1c scancodes=0
+[HEAP] 193MB used (alloc=65536 bytes)
+[HEAP-R] 195MB used (realloc 128->256)
+[HEAP] 198MB used (alloc=65536 bytes)
+[HEAP-R] 200MB used (realloc 53->106)
+[HEAP] 203MB used (alloc=65536 bytes)
+[HEAP-R] 205MB used (realloc 128->256)
+[HEAP] 208MB used (alloc=65536 bytes)
+[HEAP-R] 210MB used (realloc 128->256)
+[HEAP] 213MB used (alloc=65536 bytes)
+[HEAP-R] 215MB used (realloc 128->256)
+[HEAP] 218MB used (alloc=65536 bytes)
+[HEAP-R] 220MB used (realloc 128->256)
+[HEAP] 223MB used (alloc=65536 bytes)
+[HEAP-R] 225MB used (realloc 66->132)
+[HEAP] 228MB used (alloc=65536 bytes)
+[HEAP-R] 230MB used (realloc 2560->5120)
+[HEAP] 233MB used (alloc=65536 bytes)
+[HEAP-R] 235MB used (realloc 60->120)
+[HEAP] 238MB used (alloc=65536 bytes)
+[HEAP-R] 240MB used (realloc 160->320)
+[HEAP] 243MB used (alloc=65536 bytes)
+[HEAP-R] 245MB used (realloc 128->256)
+[HEAP] 248MB used (alloc=65536 bytes)
+[HEAP-R] 250MB used (realloc 128->256)
+[HEAP] 253MB used (alloc=151552 bytes)
+[HEAP-R] 255MB used (realloc 160->320)
+[HEAP] 258MB used (alloc=65536 bytes)
+[HEAP-R] 260MB used (realloc 1280->2560)
+  mem:  heap 267587/1048576 KiB (peak 268000), pmm 12516 MiB free
+[rtw] tcp rx 49266 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 49266 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[herd] Reloading config...
+[rtw] tcp rx 49269 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 49269 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[syscall] no row for x86_64 nr=40 — returning ENOSYS (add it to akuma-syscalls-abi's table)
+[rtw] link: rx data 412 amsdu 0/0 clear 0 undecrypted 0 replayed 9 unparsed 0 -> stack 402 (dropped 0); tx 379 failed 0 (stack dropped 3); released done 126 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 10 tx 5 rst rx 0 tx 2; laps 29090 max gap 28 ms
+[kbd] polls=18000 st=0x1c or=0x1c scancodes=0
+  mem:  heap 268800/1048576 KiB (peak 269344), pmm 12512 MiB free
+[PSTATS] PID 1 (/bin/herd) 193.08s: 21900 syscalls (113/s) in_kernel=385717ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=1921(192803ms) nanosleep=1921(192803ms) io_setup=11638(45ms) nr315=1(35ms) nr1=109(19ms) nr257=105(3ms) getdents64=1946(3ms) nr217=22(1ms) nr43=1921(0ms) wait4=1924(0ms)
+[PSTATS] PID 26 (/bin/sh) 193.01s: 356 syscalls (1/s) in_kernel=61ms pmm=3203100free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 192.98s: 557 syscalls (2/s) in_kernel=4325ms pmm=3203100free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 192.95s: 947 syscalls (4/s) in_kernel=376402ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=113(188200ms) nanosleep=113(188200ms) io_setup=350(0ms) nr257=120(0ms) getdents64=2(0ms) nr217=2(0ms) nr3=120(0ms) close=120(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 190.79s: 36 syscalls (0/s) in_kernel=0ms pmm=3203100free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 192.97s: 1371 syscalls (7/s) in_kernel=384425ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=193(192022ms) nanosleep=193(192022ms) io_setup=193(315ms) nr5=194(32ms) nr1=9(27ms) nr257=196(3ms) nr3=196(0ms) close=196(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 192.96s: 570748 syscalls (2957/s) in_kernel=380957ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=183748(190445ms) nanosleep=183748(190380ms) nr43=183755(112ms) nr44=8896(8ms) io_setup=8079(6ms) truncate=2347(3ms) nr257=15(0ms) mkdirat=2(0ms) nr258=2(0ms) nr1=86(0ms)
+[bkls>] core=8 ticket=7348703 serving=7348702 owner=2 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 187.91s: 1121 syscalls (5/s) in_kernel=372201ms pmm=3203100free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=94(186001ms) nanosleep=94(186001ms) nr257=99(79ms) nr1=152(41ms) nr162=94(19ms) nr81=94(19ms) nr264=96(17ms) nr38=96(17ms) nr103=94(3ms) nr3=98(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 191.84s: 205 syscalls (1/s) in_kernel=154113ms pmm=3203100free/3608622tot retired=0/0p pgfault=63(63pg) | nr271=6(154112ms) close=8(0ms) nr2=3(0ms) epoll_create1=2(0ms) nr9=11(0ms) nr11=9(0ms) nr52=3(0ms) getpeername=3(0ms) nr3=7(0ms) nr14=18(0ms)
+[FAULTSTAT] n=5981 bkl_wait=502ns service=8611ns
+[FAULTSTAT] file_faults=4955 pages=17975 shared=13054 file_service=10160ns
+[IDLESTAT] halts=1739012 shots=0 shot_ticks_credited=0
+  mem:  heap 268766/1048576 KiB (peak 269344), pmm 12512 MiB free
+[herd] Reloading config...
+  mem:  heap 268765/1048576 KiB (peak 269344), pmm 12512 MiB free
+  mem:  heap 268765/1048576 KiB (peak 269344), pmm 12512 MiB free
+[PSTATS] PID 1 (/bin/herd) 223.08s: 25240 syscalls (113/s) in_kernel=445535ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=2220(222711ms) nanosleep=2220(222710ms) io_setup=13444(46ms) nr315=1(35ms) nr1=110(19ms) nr257=112(3ms) getdents64=2247(3ms) nr217=24(1ms) nr43=2220(0ms) wait4=2223(0ms)
+[PSTATS] PID 26 (/bin/sh) 223.01s: 356 syscalls (1/s) in_kernel=61ms pmm=3203100free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 222.98s: 557 syscalls (2/s) in_kernel=4325ms pmm=3203100free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 222.95s: 1001 syscalls (4/s) in_kernel=436402ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=119(218200ms) nanosleep=119(218200ms) io_setup=374(0ms) nr257=126(0ms) getdents64=2(0ms) nr217=2(0ms) nr3=126(0ms) close=126(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 220.79s: 36 syscalls (0/s) in_kernel=0ms pmm=3203100free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 222.97s: 1581 syscalls (7/s) in_kernel=444436ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=223(222023ms) nanosleep=223(222022ms) io_setup=223(320ms) nr5=224(37ms) nr1=9(27ms) nr257=226(4ms) nr3=226(0ms) close=226(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 222.96s: 689655 syscalls (3093/s) in_kernel=440035ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=212509(219962ms) nanosleep=212509(219887ms) nr43=212516(132ms) nr44=39970(37ms) io_setup=9629(10ms) truncate=2347(3ms) nr257=15(0ms) mkdirat=2(0ms) nr258=2(0ms) nr1=86(0ms)
+[bkls>] core=5 ticket=8312213 serving=8312212 owner=2 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 217.91s: 1291 syscalls (5/s) in_kernel=432237ms pmm=3203100free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=109(216002ms) nanosleep=109(216002ms) nr257=114(86ms) nr1=172(49ms) nr162=109(24ms) nr81=109(24ms) nr264=111(21ms) nr38=111(21ms) nr103=109(4ms) nr3=113(0ms)
+[PSTATS] PID 883 (/bin/cat) 38.73s: 140 syscalls (3/s) in_kernel=37667ms pmm=3203100free/3608622tot retired=0/0p pgfault=1(1pg) | nr1=46(37641ms) io_setup=46(24ms) nr40=1(0ms) pipe2=1(0ms) nr2=1(0ms) nr4=3(0ms) nr9=5(0ms) nr10=3(0ms) nr13=6(0ms) nr14=1(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 221.84s: 205 syscalls (0/s) in_kernel=154113ms pmm=3203100free/3608622tot retired=0/0p pgfault=63(63pg) | nr271=6(154112ms) close=8(0ms) nr2=3(0ms) epoll_create1=2(0ms) nr9=11(0ms) nr11=9(0ms) nr52=3(0ms) getpeername=3(0ms) nr3=7(0ms) nr14=18(0ms)
+[FAULTSTAT] n=5981 bkl_wait=502ns service=8611ns
+[FAULTSTAT] file_faults=4955 pages=17975 shared=13054 file_service=10160ns
+[IDLESTAT] halts=2009200 shots=0 shot_ticks_credited=0
+[herd] Reloading config...
+  mem:  heap 268763/1048576 KiB (peak 269344), pmm 12512 MiB free
+  mem:  heap 268762/1048576 KiB (peak 269344), pmm 12512 MiB free
+[herd] Reloading config...
+[rtw] link: rx data 4028 amsdu 0/0 clear 0 undecrypted 0 replayed 70 unparsed 0 -> stack 3957 (dropped 0); tx 6375 failed 0 (stack dropped 116); released done 1051 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 10 tx 5 rst rx 0 tx 2; laps 33353 max gap 30 ms
+  mem:  heap 268762/1048576 KiB (peak 269344), pmm 12512 MiB free
+[PSTATS] PID 1 (/bin/herd) 253.08s: 28642 syscalls (113/s) in_kernel=505580ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=2520(252732ms) nanosleep=2520(252731ms) io_setup=15268(47ms) nr315=1(35ms) nr1=112(20ms) nr257=126(4ms) getdents64=2551(3ms) nr217=28(1ms) nr43=2520(1ms) wait4=2523(0ms)
+[PSTATS] PID 26 (/bin/sh) 253.01s: 356 syscalls (1/s) in_kernel=61ms pmm=3203100free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 252.98s: 557 syscalls (2/s) in_kernel=4325ms pmm=3203100free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 252.95s: 1055 syscalls (4/s) in_kernel=496403ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=125(248201ms) nanosleep=125(248201ms) io_setup=398(0ms) nr257=132(0ms) getdents64=2(0ms) nr217=2(0ms) nr3=132(0ms) close=132(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 250.79s: 36 syscalls (0/s) in_kernel=0ms pmm=3203100free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 252.97s: 1791 syscalls (7/s) in_kernel=504449ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=253(252023ms) nanosleep=253(252023ms) io_setup=253(326ms) nr5=254(42ms) nr1=9(27ms) nr257=256(4ms) nr3=256(0ms) close=256(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 252.96s: 807206 syscalls (3190/s) in_kernel=499216ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=241287(249533ms) nanosleep=241287(249449ms) nr43=241294(151ms) nr44=70140(63ms) io_setup=10676(13ms) truncate=2347(3ms) nr257=15(0ms) mkdirat=2(0ms) nr258=2(0ms) nr1=86(0ms)
+[bkls>] core=4 ticket=9277252 serving=9277251 owner=2 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 247.91s: 1461 syscalls (5/s) in_kernel=492275ms pmm=3203100free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=124(246002ms) nanosleep=124(246002ms) nr257=129(94ms) nr1=192(58ms) nr162=124(30ms) nr81=124(30ms) nr264=126(25ms) nr38=126(25ms) nr103=124(5ms) nr3=128(0ms)
+[PSTATS] PID 883 (/bin/cat) 68.73s: 172 syscalls (2/s) in_kernel=68010ms pmm=3203100free/3608622tot retired=0/0p pgfault=1(1pg) | nr1=62(67980ms) io_setup=62(29ms) nr40=1(0ms) pipe2=1(0ms) nr2=1(0ms) nr4=3(0ms) nr9=5(0ms) nr10=3(0ms) nr13=6(0ms) nr14=1(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 251.84s: 205 syscalls (0/s) in_kernel=154113ms pmm=3203100free/3608622tot retired=0/0p pgfault=63(63pg) | nr271=6(154112ms) close=8(0ms) nr2=3(0ms) epoll_create1=2(0ms) nr9=11(0ms) nr11=9(0ms) nr52=3(0ms) getpeername=3(0ms) nr3=7(0ms) nr14=18(0ms)
+[FAULTSTAT] n=5981 bkl_wait=502ns service=8611ns
+[FAULTSTAT] file_faults=4955 pages=17975 shared=13054 file_service=10160ns
+[IDLESTAT] halts=2280147 shots=0 shot_ticks_credited=0
+  [touchpad] polls=12288 nack=0 empty=12288 reports=0 other=0 down=0
+  mem:  heap 268760/1048576 KiB (peak 269344), pmm 12512 MiB free
+[herd] Reloading config...
+  mem:  heap 268758/1048576 KiB (peak 269344), pmm 12512 MiB free
+  mem:  heap 268756/1048576 KiB (peak 269344), pmm 12512 MiB free
+[PSTATS] PID 1 (/bin/herd) 283.08s: 31993 syscalls (113/s) in_kernel=565597ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=2820(282740ms) nanosleep=2820(282739ms) io_setup=17080(48ms) nr315=1(35ms) nr1=113(20ms) nr257=133(4ms) getdents64=2853(3ms) nr43=2820(1ms) nr217=30(1ms) wait4=2823(0ms)
+[PSTATS] PID 26 (/bin/sh) 283.01s: 356 syscalls (1/s) in_kernel=61ms pmm=3203100free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 282.98s: 557 syscalls (1/s) in_kernel=4325ms pmm=3203100free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 282.95s: 1109 syscalls (3/s) in_kernel=556405ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=131(278201ms) nanosleep=131(278201ms) io_setup=422(0ms) nr257=138(0ms) getdents64=2(0ms) nr217=2(0ms) nr3=138(0ms) close=138(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 280.79s: 36 syscalls (0/s) in_kernel=0ms pmm=3203100free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 282.97s: 2001 syscalls (7/s) in_kernel=564461ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=283(282024ms) nanosleep=283(282024ms) io_setup=283(331ms) nr5=284(47ms) nr1=9(27ms) nr257=286(4ms) nr3=286(0ms) close=286(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 282.96s: 926112 syscalls (3272/s) in_kernel=558280ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=270062(279043ms) nanosleep=270062(278949ms) nr43=270069(171ms) nr44=101222(93ms) io_setup=12175(17ms) truncate=2347(3ms) nr257=15(0ms) mkdirat=2(0ms) nr258=2(0ms) nr1=86(0ms)
+[bkls>] core=6 ticket=10243772 serving=10243771 owner=5 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 277.91s: 1632 syscalls (5/s) in_kernel=552313ms pmm=3203100free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=139(276003ms) nanosleep=139(276003ms) nr257=144(101ms) nr1=213(66ms) nr162=139(35ms) nr81=139(35ms) nr264=141(29ms) nr38=141(29ms) nr103=139(5ms) nr3=143(0ms)
+[PSTATS] PID 883 (/bin/cat) 98.73s: 218 syscalls (2/s) in_kernel=98079ms pmm=3203100free/3608622tot retired=0/0p pgfault=1(1pg) | nr1=85(98040ms) io_setup=85(37ms) nr40=1(0ms) pipe2=1(0ms) nr2=1(0ms) nr4=3(0ms) nr9=5(0ms) nr10=3(0ms) nr13=6(0ms) nr14=1(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 281.84s: 205 syscalls (0/s) in_kernel=154113ms pmm=3203100free/3608622tot retired=0/0p pgfault=63(63pg) | nr271=6(154112ms) close=8(0ms) nr2=3(0ms) epoll_create1=2(0ms) nr9=11(0ms) nr11=9(0ms) nr52=3(0ms) getpeername=3(0ms) nr3=7(0ms) nr14=18(0ms)
+[FAULTSTAT] n=5981 bkl_wait=502ns service=8611ns
+[FAULTSTAT] file_faults=4955 pages=17975 shared=13054 file_service=10160ns
+[IDLESTAT] halts=2551200 shots=0 shot_ticks_credited=0
+[herd] Reloading config...
+  mem:  heap 268755/1048576 KiB (peak 269344), pmm 12512 MiB free
+  mem:  heap 268754/1048576 KiB (peak 269344), pmm 12512 MiB free
+[herd] Reloading config...
+[rtw] link: rx data 7741 amsdu 0/0 clear 0 undecrypted 0 replayed 113 unparsed 0 -> stack 7627 (dropped 0); tx 12645 failed 0 (stack dropped 184); released done 1988 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 10 tx 5 rst rx 0 tx 2; laps 34162 max gap 31 ms
+  mem:  heap 268754/1048576 KiB (peak 269344), pmm 12512 MiB free
+[PSTATS] PID 1 (/bin/herd) 313.08s: 35395 syscalls (113/s) in_kernel=625614ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=3120(312747ms) nanosleep=3120(312746ms) io_setup=18904(50ms) nr315=1(35ms) nr1=115(21ms) nr257=147(4ms) getdents64=3157(4ms) nr43=3120(1ms) nr217=34(1ms) wait4=3123(0ms)
+[PSTATS] PID 26 (/bin/sh) 313.01s: 356 syscalls (1/s) in_kernel=61ms pmm=3203100free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 312.98s: 557 syscalls (1/s) in_kernel=4325ms pmm=3203100free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 312.96s: 1163 syscalls (3/s) in_kernel=616405ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=137(308201ms) nanosleep=137(308201ms) io_setup=446(0ms) nr257=144(0ms) getdents64=2(0ms) nr217=2(0ms) nr3=144(0ms) close=144(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 310.79s: 36 syscalls (0/s) in_kernel=0ms pmm=3203100free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 312.97s: 2211 syscalls (7/s) in_kernel=624473ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=313(312024ms) nanosleep=313(312024ms) io_setup=313(336ms) nr5=314(53ms) nr1=9(27ms) nr257=316(5ms) nr3=316(0ms) close=316(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 312.96s: 1045603 syscalls (3340/s) in_kernel=617295ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=298820(308527ms) nanosleep=298820(308424ms) nr43=298827(191ms) nr44=132661(124ms) io_setup=13953(22ms) truncate=2347(3ms) nr257=15(0ms) mkdirat=2(0ms) nr258=2(0ms) nr1=86(0ms)
+[bkls>] core=8 ticket=11212171 serving=11212170 owner=6 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 307.91s: 1802 syscalls (5/s) in_kernel=612347ms pmm=3203100free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=154(306004ms) nanosleep=154(306004ms) nr257=159(108ms) nr1=233(75ms) nr162=154(40ms) nr81=154(40ms) nr264=156(34ms) nr38=156(34ms) nr103=154(6ms) nr3=158(0ms)
+[PSTATS] PID 883 (/bin/cat) 128.73s: 274 syscalls (2/s) in_kernel=127866ms pmm=3203100free/3608622tot retired=0/0p pgfault=1(1pg) | nr1=113(127816ms) io_setup=113(48ms) nr40=1(0ms) pipe2=1(0ms) nr2=1(0ms) nr4=3(0ms) nr9=5(0ms) nr10=3(0ms) nr13=6(0ms) nr14=1(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 311.84s: 205 syscalls (0/s) in_kernel=154113ms pmm=3203100free/3608622tot retired=0/0p pgfault=63(63pg) | nr271=6(154112ms) close=8(0ms) nr2=3(0ms) epoll_create1=2(0ms) nr9=11(0ms) nr11=9(0ms) nr52=3(0ms) getpeername=3(0ms) nr3=7(0ms) nr14=18(0ms)
+[FAULTSTAT] n=5981 bkl_wait=502ns service=8611ns
+[FAULTSTAT] file_faults=4955 pages=17975 shared=13054 file_service=10160ns
+[IDLESTAT] halts=2822903 shots=0 shot_ticks_credited=0
+[rtw] tcp rx 49297 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 49297 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[HEAP] 263MB used (alloc=670312 bytes)
+  mem:  heap 268777/1048576 KiB (peak 269463), pmm 12512 MiB free
+[herd] Reloading config...
+  mem:  heap 268653/1048576 KiB (peak 269463), pmm 12513 MiB free
+  mem:  heap 268651/1048576 KiB (peak 269463), pmm 12513 MiB free
+[rtw] tcp rx 49304 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 49304 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+  [touchpad] polls=16384 nack=0 empty=16384 reports=0 other=0 down=0
+[PSTATS] PID 1 (/bin/herd) 343.08s: 38780 syscalls (113/s) in_kernel=685430ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=3419(342652ms) nanosleep=3419(342651ms) io_setup=20719(51ms) nr315=1(35ms) nr1=125(24ms) nr257=163(4ms) getdents64=3458(4ms) nr43=3419(1ms) nr217=36(1ms) wait4=3422(1ms)
+[PSTATS] PID 26 (/bin/sh) 343.02s: 356 syscalls (1/s) in_kernel=61ms pmm=3203100free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 342.98s: 557 syscalls (1/s) in_kernel=4325ms pmm=3203100free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 342.96s: 1217 syscalls (3/s) in_kernel=676405ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=143(338201ms) nanosleep=143(338201ms) io_setup=470(0ms) nr257=150(0ms) getdents64=2(0ms) nr217=2(0ms) nr3=150(0ms) close=150(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 340.80s: 36 syscalls (0/s) in_kernel=0ms pmm=3203100free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 342.97s: 2421 syscalls (7/s) in_kernel=684486ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=343(342025ms) nanosleep=343(342025ms) io_setup=343(342ms) nr5=344(58ms) nr1=9(27ms) nr257=346(5ms) nr3=346(0ms) close=346(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 342.96s: 1167026 syscalls (3402/s) in_kernel=676323ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=327578(338016ms) nanosleep=327578(337904ms) nr43=327589(211ms) nr44=163398(154ms) io_setup=15714(27ms) truncate=4916(7ms) nr257=21(1ms) mkdirat=2(0ms) nr258=2(0ms) nr1=126(0ms)
+[bkls>] core=4 ticket=12182219 serving=12182218 owner=6 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 337.91s: 1974 syscalls (5/s) in_kernel=672386ms pmm=3203100free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=169(336004ms) nanosleep=169(336004ms) nr257=174(119ms) nr1=255(83ms) nr162=169(45ms) nr81=169(45ms) nr264=171(38ms) nr38=171(37ms) nr103=169(6ms) nr3=173(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 341.84s: 205 syscalls (0/s) in_kernel=154113ms pmm=3203100free/3608622tot retired=0/0p pgfault=63(63pg) | nr271=6(154112ms) close=8(0ms) nr2=3(0ms) epoll_create1=2(0ms) nr9=11(0ms) nr11=9(0ms) nr52=3(0ms) getpeername=3(0ms) nr3=7(0ms) nr14=18(0ms)
+[FAULTSTAT] n=5984 bkl_wait=502ns service=8607ns
+[FAULTSTAT] file_faults=4955 pages=17975 shared=13054 file_service=10160ns
+[IDLESTAT] halts=3094531 shots=0 shot_ticks_credited=0
+[herd] Reloading config...
+  mem:  heap 268772/1048576 KiB (peak 269463), pmm 12512 MiB free
+  mem:  heap 268772/1048576 KiB (peak 269463), pmm 12512 MiB free
+[herd] Reloading config...
+[rtw] link: rx data 11560 amsdu 0/0 clear 0 undecrypted 0 replayed 155 unparsed 0 -> stack 11404 (dropped 0); tx 19719 failed 0 (stack dropped 250); released done 2997 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 12 tx 7 rst rx 0 tx 2; laps 34915 max gap 31 ms
+  mem:  heap 268769/1048576 KiB (peak 269463), pmm 12512 MiB free
+[PSTATS] PID 1 (/bin/herd) 373.08s: 42182 syscalls (113/s) in_kernel=745502ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=3719(372687ms) nanosleep=3719(372686ms) io_setup=22543(52ms) nr315=1(35ms) nr1=127(24ms) nr257=177(5ms) getdents64=3762(4ms) nr43=3719(1ms) nr217=40(1ms) wait4=3722(1ms)
+[PSTATS] PID 26 (/bin/sh) 373.02s: 356 syscalls (0/s) in_kernel=61ms pmm=3203100free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 372.98s: 557 syscalls (1/s) in_kernel=4325ms pmm=3203100free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 372.96s: 1271 syscalls (3/s) in_kernel=736405ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=149(368201ms) nanosleep=149(368201ms) io_setup=494(0ms) nr257=156(0ms) getdents64=2(0ms) nr217=2(0ms) nr3=156(0ms) close=156(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 370.80s: 36 syscalls (0/s) in_kernel=0ms pmm=3203100free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 372.97s: 2631 syscalls (7/s) in_kernel=744498ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=373(372026ms) nanosleep=373(372026ms) io_setup=373(347ms) nr5=374(64ms) nr1=9(27ms) nr257=376(5ms) nr3=376(0ms) close=376(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 372.96s: 1287062 syscalls (3450/s) in_kernel=735317ms pmm=3203100free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=356334(367489ms) nanosleep=356334(367367ms) nr43=356345(230ms) nr44=195130(187ms) io_setup=17750(32ms) truncate=4916(7ms) nr257=21(1ms) mkdirat=2(0ms) nr258=2(0ms) nr1=126(0ms)
+[bkls>] core=3 ticket=13150629 serving=13150628 owner=2 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 367.91s: 2144 syscalls (5/s) in_kernel=732421ms pmm=3203100free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=184(366004ms) nanosleep=184(366004ms) nr257=189(126ms) nr1=275(92ms) nr162=184(50ms) nr81=184(50ms) nr264=186(42ms) nr38=186(42ms) nr103=184(7ms) nr3=188(0ms)
+[PSTATS] PID 888 (/bin/cat) 32.69s: 150 syscalls (4/s) in_kernel=32428ms pmm=3203100free/3608622tot retired=0/0p pgfault=1(1pg) | nr1=51(32410ms) io_setup=51(16ms) pipe2=1(0ms) nr2=1(0ms) nr4=3(0ms) nr9=5(0ms) nr10=3(0ms) nr218=2(0ms) nr13=6(0ms) nr17=1(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 371.84s: 205 syscalls (0/s) in_kernel=154113ms pmm=3203100free/3608622tot retired=0/0p pgfault=63(63pg) | nr271=6(154112ms) close=8(0ms) nr2=3(0ms) epoll_create1=2(0ms) nr9=11(0ms) nr11=9(0ms) nr52=3(0ms) getpeername=3(0ms) nr3=7(0ms) nr14=18(0ms)
+[FAULTSTAT] n=5984 bkl_wait=502ns service=8607ns
+[FAULTSTAT] file_faults=4955 pages=17975 shared=13054 file_service=10160ns
+[IDLESTAT] halts=3366208 shots=0 shot_ticks_credited=0
+  mem:  heap 268736/1048576 KiB (peak 269463), pmm 12512 MiB free
+[herd] Reloading config...
+  mem:  heap 268734/1048576 KiB (peak 269463), pmm 12512 MiB free
+  mem:  heap 268637/1048576 KiB (peak 269463), pmm 12513 MiB free
+[PSTATS] PID 1 (/bin/herd) 403.08s: 45533 syscalls (112/s) in_kernel=805520ms pmm=3203531free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=4019(402695ms) nanosleep=4019(402694ms) io_setup=24355(53ms) nr315=1(35ms) nr1=128(24ms) nr257=184(5ms) getdents64=4064(5ms) nr43=4019(1ms) nr217=42(1ms) wait4=4022(1ms)
+[PSTATS] PID 26 (/bin/sh) 403.02s: 356 syscalls (0/s) in_kernel=61ms pmm=3203531free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 402.98s: 557 syscalls (1/s) in_kernel=4325ms pmm=3203531free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 402.96s: 1325 syscalls (3/s) in_kernel=796406ms pmm=3203531free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=155(398202ms) nanosleep=155(398202ms) io_setup=518(0ms) nr257=162(0ms) nr3=162(0ms) getdents64=2(0ms) nr217=2(0ms) close=162(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 400.80s: 36 syscalls (0/s) in_kernel=0ms pmm=3203531free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 402.97s: 2841 syscalls (7/s) in_kernel=804510ms pmm=3203531free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=403(402026ms) nanosleep=403(402026ms) io_setup=403(353ms) nr5=404(69ms) nr1=9(27ms) nr257=406(6ms) nr3=406(0ms) close=406(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 402.96s: 1405322 syscalls (3487/s) in_kernel=794423ms pmm=3203531free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=385114(397022ms) nanosleep=385114(396890ms) nr43=385125(250ms) nr44=225769(215ms) io_setup=19031(36ms) truncate=4916(7ms) nr257=21(1ms) mkdirat=2(0ms) nr258=2(0ms) nr1=126(0ms)
+[bkls>] core=8 ticket=14115993 serving=14115992 owner=6 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 397.91s: 2314 syscalls (5/s) in_kernel=792461ms pmm=3203531free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=199(396004ms) nanosleep=199(396004ms) nr257=204(136ms) nr1=295(100ms) nr162=199(56ms) nr81=199(56ms) nr264=201(47ms) nr38=201(47ms) nr103=199(7ms) nr3=203(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 401.84s: 205 syscalls (0/s) in_kernel=154113ms pmm=3203531free/3608622tot retired=0/0p pgfault=63(63pg) | nr271=6(154112ms) close=8(0ms) nr2=3(0ms) epoll_create1=2(0ms) nr9=11(0ms) nr11=9(0ms) nr52=3(0ms) getpeername=3(0ms) nr3=7(0ms) nr14=18(0ms)
+[FAULTSTAT] n=5984 bkl_wait=502ns service=8607ns
+[FAULTSTAT] file_faults=4955 pages=17975 shared=13054 file_service=10160ns
+[IDLESTAT] halts=3637228 shots=0 shot_ticks_credited=0
+[herd] Reloading config...
+  mem:  heap 268634/1048576 KiB (peak 269463), pmm 12513 MiB free
+[rtw] tcp rx 49332 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 49332 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+  mem:  heap 267640/1048576 KiB (peak 269463), pmm 12513 MiB free
+[herd] Reloading config...
+  [touchpad] polls=20480 nack=0 empty=20480 reports=0 other=0 down=0
+[rtw] link: rx data 14244 amsdu 0/0 clear 0 undecrypted 0 replayed 182 unparsed 0 -> stack 14061 (dropped 0); tx 24392 failed 0 (stack dropped 307); released done 3685 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 13 tx 8 rst rx 0 tx 2; laps 32583 max gap 30 ms
+  mem:  heap 267606/1048576 KiB (peak 269463), pmm 12513 MiB free
+[rtw] tcp rx 49336 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 49336 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[PSTATS] PID 1 (/bin/herd) 433.08s: 48985 syscalls (113/s) in_kernel=865539ms pmm=3203531free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=4319(432702ms) nanosleep=4319(432701ms) io_setup=26189(54ms) nr315=1(35ms) nr1=140(28ms) nr257=208(5ms) getdents64=4368(5ms) nr43=4319(1ms) nr217=46(1ms) wait4=4322(1ms)
+[PSTATS] PID 26 (/bin/sh) 433.02s: 356 syscalls (0/s) in_kernel=61ms pmm=3203531free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(25ms) wait4=12(24ms) io_setup=42(4ms) close=33(1ms) nr7=10(1ms) nr2=10(1ms) nr4=12(0ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=23(0ms)
+[PSTATS] PID 33 (/usr/bin/bash) 432.98s: 557 syscalls (1/s) in_kernel=4325ms pmm=3203531free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=14(2148ms) wait4=14(2148ms) io_setup=22(13ms) close=25(8ms) nr2=8(2ms) epoll_create1=4(1ms) nr4=6(0ms) nr10=6(0ms) nr9=28(0ms) nr8=11(0ms)
+[PSTATS] PID 38 (/bin/wifi) 432.96s: 1379 syscalls (3/s) in_kernel=856406ms pmm=3203531free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=161(428202ms) nanosleep=161(428202ms) io_setup=542(0ms) nr257=168(0ms) nr3=168(0ms) getdents64=2(0ms) nr217=2(0ms) close=168(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 867 (/usr/bin/sleep) 430.80s: 36 syscalls (0/s) in_kernel=0ms pmm=3203531free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr10=3(0ms) nr3=1(0ms) nr13=6(0ms) close=1(0ms) nr9=1(0ms) nr12=2(0ms) nr14=3(0ms) unlinkat=1(0ms) nr39=1(0ms)
+[PSTATS] PID 36 (/bin/powersaved) 432.97s: 3051 syscalls (7/s) in_kernel=864523ms pmm=3203531free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=433(432027ms) nanosleep=433(432027ms) io_setup=433(358ms) nr5=434(74ms) nr1=9(27ms) nr257=436(6ms) nr3=436(0ms) close=436(0ms) nr9=1(0ms)
+[PSTATS] PID 37 (/bin/sshd) 432.96s: 1506556 syscalls (3479/s) in_kernel=853673ms pmm=3203531free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=413906(426633ms) nanosleep=413906(426493ms) nr43=413922(268ms) nr44=238385(227ms) io_setup=19760(37ms) truncate=6338(9ms) nr257=27(1ms) mkdirat=2(0ms) nr258=2(0ms) nr1=168(0ms)
+[bkls>] core=5 ticket=15067902 serving=15067901 owner=2 spins=1048576
+[PSTATS] PID 868 (/bin/klogd) 427.91s: 2487 syscalls (5/s) in_kernel=852501ms pmm=3203531free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=214(426005ms) nanosleep=214(426005ms) nr257=219(150ms) nr1=318(108ms) nr162=214(61ms) nr81=214(61ms) nr264=216(50ms) nr38=216(50ms) nr103=214(8ms) nr3=218(0ms)
+[PSTATS] PID 842 (/usr/bin/sshd) 431.84s: 205 syscalls (0/s) in_kernel=154113ms pmm=3203531free/3608622tot retired=0/0p pgfault=63(63pg) | nr271=6(154112ms) close=8(0ms) nr2=3(0ms) epoll_create1=2(0ms) nr9=11(0ms) nr11=9(0ms) nr52=3(0ms) getpeername=3(0ms) nr3=7(0ms) nr14=18(0ms)
+[FAULTSTAT] n=6024 bkl_wait=499ns service=8555ns
+[FAULTSTAT] file_faults=4955 pages=17975 shared=13054 file_service=10160ns
+[IDLESTAT] halts=3908946 shots=0 shot_ticks_credited=0
+[rtw] tcp rx 49341 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 49341 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
