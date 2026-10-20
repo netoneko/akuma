@@ -3582,6 +3582,12 @@ fn current_mm_process() -> Option<&'static akuma_exec::process::Process> {
     akuma_exec::process::current_thread_tgid_process().map(|(_tgid, p)| p)
 }
 
+/// The pid of [`current_mm_process`] — the thread-group leader whose region
+/// list every memory syscall edits. Trace-only.
+pub fn current_mm_pid() -> u32 {
+    current_mm_process().map_or(0, |p| p.pid)
+}
+
 /// Run `f` with the running process's user address space, under its lock.
 ///
 /// The address-space counterpart of [`with_current_regions`], and the same

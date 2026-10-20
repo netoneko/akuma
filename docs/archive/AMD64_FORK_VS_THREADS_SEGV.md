@@ -2,6 +2,8 @@
 
 **Status: OPEN — reproduced 100 %, root cause not found.** Found 2026-10-19/20 on the ryzen metal
 (kernel `7d4d22d6-release-smp-shared`, GRUB entry 20, `smp=8`) when `crush` died at startup.
+**Also reproduced locally under QEMU on the Mac at SMP=2** (2026-10-20 addendum at the bottom —
+harness, traces, and re-ranked hypotheses there).
 
 ## Symptom
 
@@ -105,3 +107,133 @@ from a multithreaded Bun while its main thread stalls).
 ## Next
 
 `proposals/NEXT_AGENT_AMD64_FORK_VS_THREADS_SEGV.md` is the prompt for the fix.
+
+## Addendum — 2026-10-20 evening: reproduced OFF the metal, traced, and re-ranked (agent session on the Mac)
+
+The ryzen box was unreachable all session (192.168.1.126 down, not pingable), so the hunt ran
+locally. **The bug reproduces under QEMU on the Mac**, which changes the logistics of everything
+below: no metal, no reboot needed, ~4 min per run.
+
+### The local harness (this is how every claim below was made)
+
+```sh
+# repro binary — the Mac has a Go toolchain
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o target/gofork/gofork \
+    scripts/utils/go_fork_stack_repro/main.go
+# disk: build the standard image and drop the binary in
+sh amd64/mkdisk.sh target/gofork/root.img 128
+export PATH="/opt/homebrew/opt/e2fsprogs/sbin:$PATH"   # debugfs is keg-only
+debugfs -w -R "write target/gofork/gofork bin/gofork" target/gofork/root.img
+# boot it as init, SMP=2; output (and the crash) lands in the log
+DISK=$PWD/target/gofork/root.img SMP=2 INIT=/bin/gofork \
+    INITARGS=-spawners,8,-rounds,200 SSH_PORT=2224 HTTP_PORT=8081 \
+    overlays/devbox-amd64/run.sh > run.log 2>&1
+```
+
+TCG (no KVM on Apple Silicon) is fine — the crash is a race that 2 vCPUs hit readily. sshd into
+the guest does **not** work (TCP connects, the handshake never completes); booting gofork as
+`INIT` avoids that entirely.
+
+### Results (kernel `4b7bdc59` + the instrumentation described below)
+
+| config | result |
+|---|---|
+| SMP=1 | **passes** (`OK`) — the write-up's open `smp=1` question, answered locally |
+| SMP=2, `-spawners 8` | **crashes — the exact metal signature**: `SIGSEGV code=0x1 addr=0x248800000 pc=0x4c7854` (`main.grow`) |
+| SMP=8 | crashes; presentations vary (below) |
+| SMP=2, children with a 100 ms lifetime (`/bin/busysleep`, a busy-loop Go binary) | **passed** — see "per-fork-cycle race" below |
+
+Crash presentations seen (all are Go-runtime memory corruption, downstream):
+
+1. `SIGSEGV code=0x1` MAPERR at the first page of a `PROT_NONE` arena reservation (the metal
+   signature) — analysed in full below; it is **not** a region-list bug.
+2. `fatal error: found bad pointer in Go heap` — a heap word holds `0x248490060` while its span
+   says `limit=0x24836df80`; span metadata (persistentalloc memory) or a heap word is stale/garbage.
+3. `#GP` (SI_KERNEL, addr=0) inside `mheap.allocNeedsZero ← initSpan` — a non-canonical address
+   read out of corrupted span metadata. `pmm-forensics` was **silent** in every crash.
+4. `newproc1: new g is not Gdead` — a `g`'s status word garbage.
+
+The common denominator: **live parent memory contains garbage that no allocator or refcount
+instrument explains** — `0xff…` words and wrong status fields, not zeros. A zero-fill race
+(`populate_page` over a live page) would read as nils; this reads as a **lost update or a clobber
+via a stale translation**.
+
+### What the instrumentation found (why-codes, and the one full trace)
+
+Landed in the tree this session (see "Tree changes" below): `amd64/src/mm.rs` now counts and
+prints every demand fault the kernel **refuses** (`FAULT_REFUSALS` + `note_fault_refusal`, with
+the refusing arm named), `cow_write_fault` prints the `akuma-cow` `Fault` outcome, and a
+`REGION_TRACE` toggle prints every `MAP_FIXED` replace, region detach and region insert with the
+editing pid.
+
+The one run captured end-to-end (`target/gofork/pid1.log`, keep the file while it exists):
+
+- Go grows its heap in 64 MB `sysReserve` chunks, then `sysMap`s it into use in 4 MB `MAP_FIXED`
+  pieces: chunk 1 `[0x248000000,+4M)`, chunk 2 `[0x248400000,+4M)` — both traced, both split off
+  the `PROT_NONE` reservation correctly (`detach … pieces=1`, RW insert, all `pid=1`).
+- Then the write at **`0x248800000`** — chunk 3's first page — is refused `why=prot-none`, and the
+  `[sig!-at]` line names the region: `[0x248800000, 56 MB) prot=Prot(0)` — the un-splitted
+  reservation tail, created by the chunk-2 detach's split.
+- **Go never issued a `MAP_FIXED` for chunk 3.** Every region surgery in the whole boot is traced
+  and the list is *self-consistent*: nothing was lost, nothing overlapped, nothing was edited by a
+  foreign pid.
+
+So the prot-none SIGSEGV is **downstream**: a corrupted stack bound / `g` / span made Go write
+into arena space it had never mapped. The kernel's region list, the PMM refcounts, the UAF
+quarantine, the premature-free check and the resurrection detector are all clean *and all
+mutually consistent* — which kills the easy forms of H2 and redirects the hunt.
+
+### Re-ranked hypotheses
+
+- **H2 (frame accounting) — weakened but not dead.** `pmm-forensics` (quarantine +
+  premature-free + resurrection) ran through every crash silent, and the region/refcount story is
+  coherent. Whatever corrupts memory either is a *lost write* (no free involved) or bypasses the
+  ledger entirely.
+- **H1 (fork walk vs concurrent fault) — the PTE-edit interleavings the write-up asked about are
+  all closed by `as_lock`**: the amd64 walk (`share_parent_memory_into`) holds the leader's
+  `address_space.lock()` for the whole walk, and every fault-side install (`install_filled_page`)
+  and CoW break (`cow_write_fault`) takes the same lock. The demote's TLB shootdown broadcasts and
+  waits for peer acks — zero `[TLB] stuck` lines in any crash run. What is *not* closed: the
+  correctness of that coherence under a peer that holds a **writable** translation of a page the
+  walk demoted — the write-through is silent (no fault, no counter) and lands in the frame the
+  child now shares, which is exactly a "lost update" from the writer's own point of view… or from
+  the reader's, depending on which core the Copy arm then hands a fresh frame to.
+- **NEW — per-fork-cycle race with instant-exit children.** Children that live 100 ms (`busysleep`)
+  passed while instant `/bin/true` children crash: the corruption rate scales with fork cycles, so
+  the trigger is a per-fork window — child teardown (ledger drop, slot recycle, `THREAD_IDENTITY`
+  invalidation) or the share pass itself, racing parent activity on the other core. `busysleep`
+  simply runs ~100× fewer cycles in the same wall time.
+- **H3 (large-stack allocation path) — dead.** `-spawners 0` with the same stack growth passes,
+  and the corruption is not in the stack allocation path but in shared runtime structures.
+
+### What the next agent should do first
+
+1. **Keep the local harness.** Every experiment above is one rebuild + one 4-minute QEMU boot. Do
+   not wait for the ryzen box; do run the final fix there (the doc's original "Done when" still
+   applies, with `/bin/gofork` at 20/20).
+2. **Decide lost-write vs clobber with one experiment.** Cheapest known: run the repro under
+   `REGION_TRACE=true` plus a per-va *write* watch is not available; instead, add a Go-side canary
+   (a goroutine that continuously verifies a few known heap words) or — kernel-side — log
+   `cow_write_fault`'s Copy/TakeInPlace arms for VAs inside the gofork arena range with the frame
+   and the refs, and look for two live mappings of one frame (a stale-RW peer writes the old
+   frame after the Copy arm re-mapped the VA).
+3. **Child-teardown focus**: instrument `Process::free`'s ledger drop (frames dec'd per exit) and
+   the slot recycle path; then A/B the repro with `/bin/true` vs a child that lives ~1 ms.
+4. The original prompt's method (trace on `Fault`, self-test, fix under the invariant, verify slot
+   on metal) stands; only the *local* leg of it changed.
+5. The CLAUDE `/login` freeze (~18 `vfork`s from multithreaded Bun) remains flagged as possibly
+   the same bug — nothing new either way this session.
+
+### Tree changes this session (instrumentation only; behaviour unchanged)
+
+- `amd64/src/mm.rs`: `FAULT_REFUSALS` counter + `note_fault_refusal(va, why)` (prints first 8,
+  then every 1024th — a healthy kernel prints nothing); refusal points named `no-region`,
+  `prot-none`, `oom`, `install`, `populate`; `REGION_TRACE` toggle (default **off**) with
+  `MAP_FIXED`/detach/insert lines carrying the editing pid; `usermode::current_mm_pid()`.
+- `amd64/src/idt.rs`: `cow_write_fault`'s `CowAction::Fault` arm prints via
+  `note_fault_refusal(addr, "cow-fault (ro, unmarked)")` — the bounded `Fault`-outcome trace the
+  fix prompt asked for.
+- `amd64/src/usermode.rs`: nothing behavioural; `current_mm_pid` added.
+- Everything compiles clean (`cargo check -p akuma-amd64 --target x86_64-unknown-none`), boots,
+  and passes the self-test suite (824 passed, 0 failed in this configuration).
+

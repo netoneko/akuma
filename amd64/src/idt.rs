@@ -832,7 +832,18 @@ fn cow_write_fault(addr: u64) -> bool {
             COW_RETRIES.fetch_add(1, Ordering::Relaxed);
             true
         }
-        CowAction::Fault => false,
+        CowAction::Fault => {
+            // The birth record of a spurious SIGSEGV: read-only, unmarked —
+            // but was the frame shared, and was a fork walk in flight? Without
+            // this line the decision is unreconstructable after the fact: Go
+            // installs its own SIGSEGV handler, so the kernel print is the only
+            // evidence that survives the crash.
+            crate::mm::note_fault_refusal(
+                addr,
+                "cow-fault (ro, unmarked)",
+            );
+            false
+        }
         // Sole owner: clear the marker and grant the write. No allocation, no
         // copy, no memory pressure — and this is the common case, because a
         // `fork` child usually `execve`s and leaves the parent alone with

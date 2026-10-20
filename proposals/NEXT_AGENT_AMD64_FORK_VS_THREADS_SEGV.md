@@ -7,6 +7,9 @@ faults**. It is reproduced 100 % of the time by a 2.8 MB program already install
 
 Read `docs/archive/AMD64_FORK_VS_THREADS_SEGV.md` first — it is the write-up, with the evidence
 table, what is and is not established, and three ranked hypotheses. This prompt does not repeat it.
+**Read its 2026-10-20 addendum too**: the bug now reproduces locally under QEMU on the Mac
+(SMP=2, exact metal signature), `smp=1` passes, `pmm-forensics` is silent, and the hypothesis
+ranking changed — the addendum's "What the next agent should do first" is the current method.
 
 ## The reproduction (run this before and after every change)
 

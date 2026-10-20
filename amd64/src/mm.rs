@@ -668,6 +668,11 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         // `MAP_FIXED` **replaces**: whatever is there goes away first, mappings
         // and region records alike. Doing this before reserving is what keeps
         // the new region from being clipped by the teardown of the old one.
+        region_trace(format_args!(
+            "[MMT] MAP_FIXED va=0x{want:x} pages={pages} prot={:?} pid={}\n",
+            region_prot,
+            usermode::current_mm_pid(),
+        ));
         unmap_range(want, want + byte_len);
         want
     } else if noreplace {
@@ -818,6 +823,11 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
         region = region.file_backed(file);
     }
     usermode::with_current_regions(|regions| insert_region_sorted(regions, region));
+    region_trace(format_args!(
+        "[MMT] insert  va=0x{base:x} pages={pages} prot={:?} pid={}\n",
+        region_prot,
+        usermode::current_mm_pid(),
+    ));
 
     if lazy_file.is_some() {
         // Nothing is allocated and nothing is read. `fault_in` fills pages from
@@ -1071,6 +1081,7 @@ fn populate_page(va: usize, prot: Prot) -> bool {
     // Zeroed before mapping: a recycled frame otherwise hands ring 3 whatever the
     // previous owner left in it. The same rule the ELF loader follows.
     let Some(frame) = akuma_pmm::alloc_page_zeroed() else {
+        note_fault_refusal(va as u64, "oom");
         return false;
     };
     // A brand-new frame is unshared, so `pte_prot_for`'s CoW rule cannot fire;
@@ -1090,6 +1101,7 @@ fn populate_page(va: usize, prot: Prot) -> bool {
         }
         // Out of page-table memory, or no process. Unchanged.
         PageInstall::Failed => {
+            note_fault_refusal(va as u64, "install");
             akuma_pmm::free_page(frame, 0);
             false
         }
@@ -1257,6 +1269,56 @@ fn note_fault_race(va: usize) {
     }
 }
 
+/// Demand faults the kernel **refused to serve** — the population that reaches
+/// ring 3 as a `SIGSEGV`.
+///
+/// Zero in a healthy kernel: every not-present fault inside a live region is
+/// servable, so a non-zero reading here is the fork-vs-threads SIGSEGV's exact
+/// birth record. Kept permanently and printed on the first and every 1024th,
+/// because the crash that makes the process die also takes the console with it —
+/// a line already on the UART is the only evidence that survives.
+///
+/// `why` names the arm that refused, so the print says not just *that* a fault
+/// was refused but *which* decision produced the refusal:
+/// `no-region` (no mapping covered the address), `prot-none` (a reservation or
+/// guard page), `oom` (no frame), `as-none` (no address space), `install`
+/// (the publish into the page tables failed), `cow-fault` (`akuma-cow` decided
+/// the write was a genuine protection violation).
+pub static FAULT_REFUSALS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Count one refusal, and say why on the first and every 1024th.
+pub fn note_fault_refusal(va: u64, why: &str) {
+    let n = FAULT_REFUSALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_multiple_of(1024) {
+        let mut w = akuma_primitives::console::StackWriter::<160>::new();
+        let _ = core::fmt::write(
+            &mut w,
+            format_args!("[MM] fault REFUSED #{n} va=0x{va:x} why={why}\n"),
+        );
+        w.flush();
+    }
+}
+
+/// Bounded region-surgery trace for the fork-vs-threads SIGSEGV hunt
+/// (`docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`). The repro's mmap/munmap
+/// population is small enough that a capped print of every `MAP_FIXED` replace
+/// and every region detach fits on the console, and the sequence beside the
+/// refusal line is the whole story of how a `PROT_NONE` reservation came to
+/// cover an address the program had mapped read-write. Stays in the tree
+/// behind the toggle, off by default.
+pub static REGION_TRACE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// One trace line, if [`REGION_TRACE`] is on.
+pub fn region_trace(fmt: core::fmt::Arguments<'_>) {
+    if REGION_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
+        let mut w = akuma_primitives::console::StackWriter::<160>::new();
+        let _ = core::fmt::write(&mut w, fmt);
+        w.flush();
+    }
+}
+
 /// Allocate, **fill from a file**, map and record one page at `va`.
 ///
 /// [`populate_page`]'s sibling, and the difference is the whole reason
@@ -1392,10 +1454,15 @@ pub fn fault_in(addr: u64) -> bool {
         // cannot see, because faults are counted there but never timed.
         // Relies on the sorted invariant `akuma_mmap::insert_region_sorted`
         // documents and every mutator in that crate preserves.
-        let idx = akuma_mmap::region_index_containing(regions, page)?;
+        let idx = akuma_mmap::region_index_containing(regions, page);
+        let Some(idx) = idx else {
+            note_fault_refusal(addr, "no-region");
+            return None;
+        };
         let region = &regions[idx];
         let prot = region.recorded_prot().unwrap_or(Prot::RW_NO_EXEC);
         if prot.is_none() {
+            note_fault_refusal(addr, "prot-none");
             return None; // a reservation, or a guard page: a real fault
         }
         // Extent as well as identity: the readahead below must not run off the
@@ -1412,7 +1479,13 @@ pub fn fault_in(addr: u64) -> bool {
     };
 
     match file {
-        None => populate_page(page, prot),
+        None => {
+            let ok = populate_page(page, prot);
+            if !ok {
+                note_fault_refusal(addr, "populate");
+            }
+            ok
+        }
         Some((file, region_start, region_pages, shared_write)) => {
             let t0 = akuma_cpu::tsc::rdtsc();
             let ok = if shared_write {
@@ -2082,6 +2155,11 @@ fn unmap_range(start: usize, end: usize) {
             r.file.is_some() && r.start_va < end && r.start_va.saturating_add(r.len_bytes()) > start
         });
         let _pieces: Vec<_> = akuma_mmap::detach_eager_regions_in_range(regions, start, end);
+        region_trace(format_args!(
+            "[MMT] detach 0x{start:x}..0x{end:x} pieces={} pid={}\n",
+            _pieces.len(),
+            usermode::current_mm_pid(),
+        ));
         if unmaps_a_file {
             // The pins are per *inode*, so which ones to drop can only be
             // decided against the survivors: a program that maps one shared
