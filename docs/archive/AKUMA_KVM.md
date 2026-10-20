@@ -53,8 +53,7 @@ that extraction. The dumps live in `/tmp` (volatile); the durable form is the
 `akuma-svm-amd64` crate's tests, which pin each offset/bit to its table
 citation, and this document.
 
-Still pending from the spec (see §4): APM Vol 3 (24594) §3.3 for the exact
-`Fn8000_000A.EDX` bit numbers; the NPT leaf PTE bit table; the save-area
+Still pending from the spec (see §4): the NPT leaf PTE bit table; the save-area
 `LASTEXCPTO` offset (presumed `290h`, unverified).
 
 ## 2. What the spec says (APM Vol 2, 24593 rev 3.45)
@@ -183,11 +182,14 @@ sequential RIP for trap-style intercepts.
 ### 2.6 CPUID Fn8000_000A and NPT
 
 `Fn8000_000A`: EAX = SVM revision, EBX = number of ASIDs. EDX bits
-**explicitly numbered** in Vol 2 text: AVIC=13, GMET=17, x2AVIC=18, SSS=19,
-ROGPT=21, HOST_MCE_OVERRIDE=23, TLBSYNC=24, BusLockThreshold=29. Named but
-**unnumbered until Vol 3 §3.3**: NP, LbrVirt, SVML, NRIPS, TscRateMsr,
-VmcbClean, FlushByAsid, DecodeAssists, PauseFilter, PauseFilterThreshold,
-VNMI. Unverified: `401h` AVIC_NOACCEL.
+(numbered from Vol 3 rev 3.38 Appendix E.4.9, pp. 661–662 — the per-font
+CMap extraction is §1): NP=0, LbrVirt=1, SVML=2, NRIPS=3, TscRateMsr=4,
+VmcbClean=5, FlushByAsid=6, DecodeAssists=7, PmcVirt=8, PauseFilter=10,
+PauseFilterThreshold=12, AVIC=13, VMSAVEvirt=15, VGIF=16, GMET=17,
+x2AVIC=18, SSSCheck=19, SpecCtrl=20, ROGPT=21, HOST_MCE_OVERRIDE=23,
+TlbiCtl=24, VNMI=25, IbsVirt=26, ExtLvtAvicAccessChg=27,
+NestedVirtVmcbAddrChk=28, BusLockThreshold=29, IdleHltIntercept=30.
+Unverified: `401h` AVIC_NOACCEL.
 
 NPT: `NP_ENABLE` = `090h` bit 0, `N_CR3` = `0B0h`; requires `EDX[NP]`.
 Consistency: an MBZ bit set in nCR3 → VMEXIT_INVALID; the host must have
@@ -239,8 +241,10 @@ device-map work in `crates/akuma-firecracker` and
 
 ## 4. Open items
 
-- APM Vol 3 (24594) §3.3: exact `Fn8000_000A.EDX` bit numbers (NP, NRIPS,
-  SVML, …) — needed before `kvm.rs` can branch on NRIPS; the khub URL is
+- APM Vol 3 (24594) §3.3: exact `Fn8000_000A.EDX` bit numbers — **done
+  2026-10-20**, extracted from the downloaded rev 3.38 PDF (Appendix E.4.9,
+  pp. 661–662), table in §2.6 above. Still open: the NPT leaf PTE bit table
+  (§"Nested Table Walk") before the Linux rung.
   still unknown.
 - NPT leaf PTE bit table (Vol 2 §"Nested Table Walk", ~p. 571).
 - `LASTEXCPTO` offset verification; `401h` AVIC_NOACCEL.
