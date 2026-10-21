@@ -56,6 +56,12 @@ no-bkl-process = []
 debug-info = ["akuma-mmu/debug-info"]
 
 [dependencies]
+# The fd table's state machine: lowest-free allocation, the dup/dup2/dup3/
+# F_DUPFD numbering rules, the close-on-exec sweep and fork's copy (epoll
+# stripping as a stated policy, not an accident), host-tested with their
+# effects returned instead of performed. This crate keeps the locks, the
+# `FileDescriptor` payload and the kernel-side reference bumps/release.
+akuma-fdtable = { path = "../akuma-fdtable" }
 # The safe-to-execute AArch64 instructions (barriers, cache/TLB maintenance,
 # core parking, DAIF, read-only system registers) behind safe `#[inline(always)]`
 # functions, so the trivially-dischargeable `unsafe` blocks live in one crate

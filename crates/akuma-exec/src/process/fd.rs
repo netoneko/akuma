@@ -1,17 +1,40 @@
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spinning_top::Spinlock;
+
+use akuma_fdtable::{FdTable, FlagSet, Names};
 
 use crate::process::types::FileDescriptor;
 use crate::process::children::remove_child_channel;
 use crate::runtime::{runtime, with_irqs_disabled};
 use super::Process;
 
+/// One process's descriptor table, and the one authority on which fd number
+/// names what.
+///
+/// The state machine — lowest-free allocation, the dup family's numbering and
+/// flag rules, the close-on-exec sweep, fork's copy with the epoll-stripping
+/// policy — lives in [`akuma_fdtable`] and is host-tested there; this type is
+/// its locked, kernel-side half: the three spinlocks, the `FileDescriptor`
+/// payload, and the reference effects the crate *returns* which the kernel
+/// *performs* ([`clone_fd_refs`] on copies, [`release_fd_entry`] on removals).
+/// The name table and both flag sets deref to their plain collections, so
+/// read-side callers keep their map/set code.
 pub struct SharedFdTable {
-    pub table: Spinlock<BTreeMap<u32, FileDescriptor>>,
-    pub cloexec: Spinlock<BTreeSet<u32>>,
-    pub nonblock: Spinlock<BTreeSet<u32>>,
+    pub table: Spinlock<Names<FileDescriptor>>,
+    pub cloexec: Spinlock<FlagSet>,
+    pub nonblock: Spinlock<FlagSet>,
+}
+
+/// Borrow the table's three parts as one state machine.
+///
+/// The caller must already be inside its IRQ-masked critical section; every
+/// `SharedFdTable` operation takes all three locks together for exactly the
+/// span of the crate call it wraps.
+macro_rules! fd_view {
+    ($table:expr, $cloexec:expr, $nonblock:expr) => {
+        FdTable::of(&mut *$table.lock(), &mut *$cloexec.lock(), &mut *$nonblock.lock())
+    };
 }
 
 /// Take a second reference to whatever `entry` refers to.
@@ -77,59 +100,51 @@ pub fn clone_fd_refs(entry: &FileDescriptor) {
 }
 
 impl SharedFdTable {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            table: Spinlock::new(BTreeMap::new()),
-            cloexec: Spinlock::new(BTreeSet::new()),
-            nonblock: Spinlock::new(BTreeSet::new()),
+            table: Spinlock::new(Names::new()),
+            cloexec: Spinlock::new(FlagSet::new()),
+            nonblock: Spinlock::new(FlagSet::new()),
         }
     }
 
     pub fn with_stdio() -> Self {
-        let mut fd_map = BTreeMap::new();
+        let mut fd_map = Names::new();
         fd_map.insert(0, FileDescriptor::Stdin);
         fd_map.insert(1, FileDescriptor::Stdout);
         fd_map.insert(2, FileDescriptor::Stderr);
         Self {
             table: Spinlock::new(fd_map),
-            cloexec: Spinlock::new(BTreeSet::new()),
-            nonblock: Spinlock::new(BTreeSet::new()),
+            cloexec: Spinlock::new(FlagSet::new()),
+            nonblock: Spinlock::new(FlagSet::new()),
         }
-    }
-
-    /// Find the lowest fd number >= `min_fd` not present in `table`.
-    fn lowest_available_fd(table: &BTreeMap<u32, FileDescriptor>, min_fd: u32) -> u32 {
-        let mut fd = min_fd;
-        for (&key, _) in table.range(min_fd..) {
-            if key != fd { break; }
-            fd += 1;
-        }
-        fd
     }
 
     /// Deep copy for fork (separate fd table, with pipe ref bumps).
     /// Strips EpollFd entries since epoll instances are not reference-counted.
+    ///
+    /// The copy decision and the flag handling are [`akuma_fdtable`]'s
+    /// [`FdTable::fork_copy`]; the epoll-stripping rule is this kernel's
+    /// policy, stated here as the `keep` predicate. The child's flag sets
+    /// come back copied wholesale — a stripped entry's bit rides along,
+    /// harmlessly, until an `alloc_fd_from` of its number clears it.
     ///
     /// The per-entry reference bumps are [`clone_fd_refs`] — shared with `dup`,
     /// `dup3` and `fcntl(F_DUPFD)`, which used to carry their own copies of the
     /// list and had drifted. See that function's header.
     #[must_use]
     pub fn clone_deep_for_fork(&self) -> Self {
-        let cloned: BTreeMap<u32, FileDescriptor> = with_irqs_disabled(|| {
-            self.table.lock().iter()
-                .filter(|(_, fd)| !matches!(fd, FileDescriptor::EpollFd(_)))
-                .map(|(&k, v)| (k, v.clone()))
-                .collect()
+        let forked = with_irqs_disabled(|| {
+            fd_view!(self.table, self.cloexec, self.nonblock)
+                .fork_copy(|fd| !matches!(fd, FileDescriptor::EpollFd(_)))
         });
-        for entry in cloned.values() {
+        for entry in forked.names.values() {
             clone_fd_refs(entry);
         }
-        let cloexec_clone = with_irqs_disabled(|| self.cloexec.lock().clone());
-        let nonblock_clone = with_irqs_disabled(|| self.nonblock.lock().clone());
         Self {
-            table: Spinlock::new(cloned),
-            cloexec: Spinlock::new(cloexec_clone),
-            nonblock: Spinlock::new(nonblock_clone),
+            table: Spinlock::new(forked.names),
+            cloexec: Spinlock::new(forked.cloexec),
+            nonblock: Spinlock::new(forked.nonblock),
         }
     }
 
@@ -175,36 +190,12 @@ impl SharedFdTable {
     }
 
     /// Allocate the lowest fd number >= `min_fd` and insert `entry` at it,
-    /// atomically. Moved here (from [`Process`], which now just delegates)
-    /// so the flag-staleness fix below is unit-testable directly against a
-    /// bare `SharedFdTable`, the same way [`reserve_write_pos`] is — see
-    /// [`alloc_fd_tests`].
-    ///
-    /// Clears `nonblock`/`cloexec` for the chosen fd number *before* the
-    /// table insert makes it visible: both are tracked per raw fd *number*
-    /// here, not per underlying pipe/file object, so a fd number a previous
-    /// occupant left with either flag set would otherwise carry it forward
-    /// to whatever gets allocated next, regardless of whether the code path
-    /// that freed the number remembered to clear it. It didn't, once:
-    /// `sys_close` used to clear `cloexec` right after freeing the slot but
-    /// `nonblock` only after a whole match arm of real cleanup syscalls,
-    /// long enough for a concurrent `alloc_fd` on the same (`CLONE_THREAD`-
-    /// shared) table to reuse the number in between and inherit the stale
-    /// bit — `docs/archive/NCA_FD_NONBLOCK_TOCTOU.md`. `sys_close`'s own
-    /// ordering is fixed too, but this is the guarantee that holds even if
-    /// some *other*, not-yet-audited close path gets the ordering wrong
-    /// again.
-    ///
-    /// [`reserve_write_pos`]: SharedFdTable::reserve_write_pos
+    /// atomically. The decision — lowest-free walk and the stale-flag clearing
+    /// that makes a reused number start clean — is [`akuma_fdtable`]'s
+    /// [`FdTable::alloc_fd_from`], which carries the full history of both
+    /// guarantees; the tests below pin them through this locked wrapper.
     pub fn alloc_fd_from(&self, min_fd: u32, entry: FileDescriptor) -> u32 {
-        with_irqs_disabled(|| {
-            let mut table = self.table.lock();
-            let fd = SharedFdTable::lowest_available_fd(&table, min_fd);
-            self.nonblock.lock().remove(&fd);
-            self.cloexec.lock().remove(&fd);
-            table.insert(fd, entry);
-            fd
-        })
+        with_irqs_disabled(|| fd_view!(self.table, self.cloexec, self.nonblock).alloc_fd_from(min_fd, entry))
     }
 
     /// Explicitly close all underlying kernel resources and clear the table.
@@ -377,53 +368,43 @@ impl Process {
 
     pub fn set_cloexec(&self, fd: u32) {
         with_irqs_disabled(|| {
-            self.fds.cloexec.lock().insert(fd);
+            fd_view!(self.fds.table, self.fds.cloexec, self.fds.nonblock).set_cloexec(fd);
         });
     }
 
     pub fn clear_cloexec(&self, fd: u32) {
         with_irqs_disabled(|| {
-            self.fds.cloexec.lock().remove(&fd);
+            fd_view!(self.fds.table, self.fds.cloexec, self.fds.nonblock).clear_cloexec(fd);
         });
     }
 
     pub fn is_cloexec(&self, fd: u32) -> bool {
-        with_irqs_disabled(|| {
-            self.fds.cloexec.lock().contains(&fd)
-        })
+        with_irqs_disabled(|| fd_view!(self.fds.table, self.fds.cloexec, self.fds.nonblock).is_cloexec(fd))
     }
 
     pub fn set_nonblock(&self, fd: u32) {
         with_irqs_disabled(|| {
-            self.fds.nonblock.lock().insert(fd);
+            fd_view!(self.fds.table, self.fds.cloexec, self.fds.nonblock).set_nonblock(fd);
         });
     }
 
     pub fn clear_nonblock(&self, fd: u32) {
         with_irqs_disabled(|| {
-            self.fds.nonblock.lock().remove(&fd);
+            fd_view!(self.fds.table, self.fds.cloexec, self.fds.nonblock).clear_nonblock(fd);
         });
     }
 
     pub fn is_nonblock(&self, fd: u32) -> bool {
-        with_irqs_disabled(|| {
-            self.fds.nonblock.lock().contains(&fd)
-        })
+        with_irqs_disabled(|| fd_view!(self.fds.table, self.fds.cloexec, self.fds.nonblock).is_nonblock(fd))
     }
 
     /// Close all FDs marked close-on-exec, returning them for cleanup.
+    /// The sweep's decision — which numbers, in which order, and the
+    /// whole-set clear that takes stale numbers with it — is
+    /// [`akuma_fdtable`]'s [`FdTable::sweep_cloexec`].
     pub fn close_cloexec_fds(&self) -> Vec<(u32, FileDescriptor)> {
         with_irqs_disabled(|| {
-            let cloexec: Vec<u32> = self.fds.cloexec.lock().iter().copied().collect();
-            let mut closed = Vec::new();
-            let mut table = self.fds.table.lock();
-            for fd in &cloexec {
-                if let Some(entry) = table.remove(fd) {
-                    closed.push((*fd, entry));
-                }
-            }
-            self.fds.cloexec.lock().clear();
-            closed
+            fd_view!(self.fds.table, self.fds.cloexec, self.fds.nonblock).sweep_cloexec()
         })
     }
 
@@ -679,5 +660,199 @@ mod alloc_fd_tests {
             hits.load(Ordering::Relaxed) > 0,
             "test never actually raced the allocator onto fd 3 — widen the window and retry"
         );
+    }
+}
+
+/// Characterization tests for the fd table's observable semantics, written
+/// BEFORE the `akuma-fdtable` extraction
+/// (`proposals/NEXT_AGENT_AUDIT_4_3_FD_TABLE_AND_4_4_MMU_FACADE.md`, Task A
+/// method step 1) so the rewire can be checked against today's behaviour
+/// rather than against intentions. Each test states which syscall-level
+/// behaviour it is the table-level image of; the two `PINNED DIVERGENCE`
+/// tests carry the divergences `amd64/src/fd.rs`'s boot-suite self-tests pin
+/// end-to-end (`fd: a dup's cursor is independent`, `fd: a dup loses
+/// nonblock`) so the table layer cannot drift underneath them.
+///
+/// These run against the real locked table (not a model) and must keep
+/// passing, unmodified, through the extraction: after the rewire they are the
+/// proof that `SharedFdTable` is a thin wrapper and nothing moved.
+#[cfg(test)]
+mod fdtable_characterization_tests {
+    use super::*;
+    use crate::process::types::{KernelFile, open_flags};
+    use crate::test_support::ensure_test_runtime;
+
+    fn file_at(pos: usize) -> FileDescriptor {
+        let mut f = KernelFile::new("/x".into(), open_flags::O_RDWR);
+        f.position = pos;
+        FileDescriptor::File(f)
+    }
+
+    fn position_of(t: &SharedFdTable, fd: u32) -> Option<usize> {
+        t.table.lock().get(&fd).map(|e| match e {
+            FileDescriptor::File(f) => f.position,
+            _ => unreachable!("test only installs File entries here"),
+        })
+    }
+
+    #[test]
+    fn allocation_returns_the_lowest_free_number_and_reuses_closed_gaps() {
+        ensure_test_runtime();
+        let t = SharedFdTable::with_stdio(); // 0/1/2 occupied
+        assert_eq!(t.alloc_fd_from(0, file_at(0)), 3);
+        assert_eq!(t.alloc_fd_from(0, file_at(0)), 4);
+        // sys_close's table half: remove the slot (the flags go separately,
+        // and a stale one is covered by `alloc_fd_tests` above).
+        t.table.lock().remove(&3);
+        // The gap is reused before a fresh number is handed out.
+        assert_eq!(t.alloc_fd_from(0, file_at(0)), 3);
+        // `fcntl(F_DUPFD)`'s shape: a minimum is honoured even when lower
+        // numbers are free.
+        assert_eq!(t.alloc_fd_from(4, file_at(0)), 5);
+        t.table.lock().remove(&4);
+        t.table.lock().remove(&5);
+        assert_eq!(t.alloc_fd_from(4, file_at(0)), 4);
+    }
+
+    #[test]
+    fn alloc_clears_the_reused_numbers_own_flags_only() {
+        ensure_test_runtime();
+        let t = SharedFdTable::with_stdio();
+        t.alloc_fd_from(0, file_at(0)); // fd 3
+        t.cloexec.lock().insert(3);
+        t.nonblock.lock().insert(3);
+        t.table.lock().remove(&3);
+        assert_eq!(t.alloc_fd_from(0, file_at(0)), 3);
+        assert!(!t.cloexec.lock().contains(&3), "reuse must not inherit the closed fd's cloexec");
+        assert!(!t.nonblock.lock().contains(&3), "reuse must not inherit the closed fd's nonblock");
+        // An unrelated fd's flags are untouched (fd 1 keeps its own).
+        t.nonblock.lock().insert(1);
+        t.alloc_fd_from(0, file_at(0)); // fd 4
+        assert!(t.nonblock.lock().contains(&1));
+    }
+
+    /// **PINNED DIVERGENCE** (`amd64/src/fd.rs` boot suite: "a dup's cursor is
+    /// independent"): `dup` is a *by-value* copy of the `KernelFile`, so the
+    /// two descriptors do not share the open file description — advancing one
+    /// cursor leaves the other where the copy was taken. POSIX shares the
+    /// description; this table does not, and the boot suite asserts the same
+    /// thing end-to-end through `sys_lseek`.
+    #[test]
+    fn pinned_dup_inserts_an_independent_by_value_copy() {
+        ensure_test_runtime();
+        let t = SharedFdTable::with_stdio();
+        t.alloc_fd_from(0, file_at(0)); // fd 3, position 0
+        let entry = t.table.lock().get(&3).cloned().expect("fd 3 installed");
+        let newfd = t.alloc_fd_from(0, entry); // glue `sys_dup`'s table shape
+        assert_eq!(newfd, 4);
+        if let Some(FileDescriptor::File(f)) = t.table.lock().get_mut(&3) {
+            f.position += 16;
+        }
+        assert_eq!(
+            position_of(&t, 4),
+            Some(0),
+            "PINNED DIVERGENCE: the dup's cursor is a copy taken at dup time"
+        );
+        assert_eq!(position_of(&t, 3), Some(16));
+    }
+
+    /// **PINNED DIVERGENCE** (`amd64/src/fd.rs` boot suite: "a dup loses
+    /// nonblock"): `nonblock` is keyed by fd *number*, and glue's `sys_dup`
+    /// does not copy it — the flag stays with the old number.
+    #[test]
+    fn pinned_nonblock_is_keyed_by_number_and_a_dup_insert_does_not_inherit_it() {
+        ensure_test_runtime();
+        let t = SharedFdTable::with_stdio();
+        t.alloc_fd_from(0, file_at(0)); // fd 3
+        t.nonblock.lock().insert(3);
+        let entry = t.table.lock().get(&3).cloned().expect("fd 3 installed");
+        let newfd = t.alloc_fd_from(0, entry);
+        assert_eq!(newfd, 4);
+        assert!(!t.nonblock.lock().contains(&4), "PINNED DIVERGENCE: the dup loses the flag");
+        assert!(t.nonblock.lock().contains(&3), "the original keeps it");
+    }
+
+    /// `execve`'s close-on-exec sweep: only descriptors actually present in
+    /// the table come back for release, in ascending order, and the flag set
+    /// is cleared whole — including the stale number that named nothing.
+    #[test]
+    fn cloexec_sweep_returns_present_fds_in_order_and_clears_the_set() {
+        ensure_test_runtime();
+        let t = SharedFdTable::with_stdio();
+        t.alloc_fd_from(0, file_at(0)); // 3
+        t.alloc_fd_from(0, file_at(0)); // 4
+        t.cloexec.lock().insert(3);
+        t.cloexec.lock().insert(4);
+        t.cloexec.lock().insert(9); // a number nothing occupies any more
+        t.table.lock().remove(&3); // closed before the exec
+        // `Process::close_cloexec_fds`'s exact sequence, against the fields the
+        // method itself drives (the method needs a `Process`; the properties
+        // pinned here belong to the table).
+        let cloexec: alloc::vec::Vec<u32> = t.cloexec.lock().iter().copied().collect();
+        let mut closed = alloc::vec::Vec::new();
+        for fd in &cloexec {
+            if let Some(entry) = t.table.lock().remove(fd) {
+                closed.push((*fd, entry));
+            }
+        }
+        t.cloexec.lock().clear();
+        assert_eq!(closed.iter().map(|(fd, _)| *fd).collect::<alloc::vec::Vec<_>>(), [4]);
+        assert!(matches!(closed[0].1, FileDescriptor::File(_)));
+        assert!(!t.cloexec.lock().contains(&4) && !t.cloexec.lock().contains(&9), "the set is cleared whole");
+        assert!(
+            t.table.lock().contains_key(&0)
+                && t.table.lock().contains_key(&1)
+                && t.table.lock().contains_key(&2),
+            "stdio survives"
+        );
+        assert!(position_of(&t, 4).is_none(), "the swept fd is gone from the table");
+    }
+
+    /// `fork`'s table copy: epoll instances are **stripped** (they are not
+    /// reference-counted), everything else is copied with its flags, and the
+    /// child's table is independent of the parent's from then on.
+    #[test]
+    fn fork_copy_strips_epoll_copies_flags_and_is_independent() {
+        ensure_test_runtime(); // `clone_fd_refs` runs on the copies
+        let t = SharedFdTable::with_stdio();
+        t.table.lock().insert(3, FileDescriptor::EpollFd(7));
+        t.table.lock().insert(4, file_at(0));
+        t.cloexec.lock().insert(3);
+        t.cloexec.lock().insert(4);
+        t.nonblock.lock().insert(4);
+
+        let child = t.clone_deep_for_fork();
+
+        assert!(child.table.lock().get(&3).is_none(), "the epoll instance is not inherited");
+        assert!(matches!(child.table.lock().get(&4), Some(FileDescriptor::File(_))));
+        // The flag sets are copied **wholesale**: fd 3's cloexec bit rides
+        // along even though its epoll descriptor was stripped. Harmless by
+        // construction — an `alloc_fd_from` of 3 clears the stale bit before
+        // the number is reused — and pinned here so the extraction does not
+        // silently "fix" it.
+        assert!(child.cloexec.lock().contains(&3) && child.cloexec.lock().contains(&4));
+        assert!(child.nonblock.lock().contains(&4) && !child.nonblock.lock().contains(&3));
+
+        // Independence both ways after the copy.
+        t.table.lock().remove(&4);
+        assert!(child.table.lock().get(&4).is_some(), "parent close does not reach the child");
+        child.table.lock().remove(&4);
+        assert!(t.table.lock().get(&0).is_some(), "child teardown does not reach the parent");
+    }
+
+    /// `dup2`/`dup3`'s table half: the swap returns the *displaced* entry so
+    /// its reference can be released, and an empty target returns nothing to
+    /// release.
+    #[test]
+    fn dup2_swap_hands_back_the_displaced_entry_for_release() {
+        ensure_test_runtime();
+        let t = SharedFdTable::with_stdio();
+        t.table.lock().insert(3, file_at(64));
+        t.table.lock().insert(5, file_at(0));
+        let entry = t.table.lock().get(&3).cloned().expect("fd 3 installed");
+        let displaced = t.table.lock().insert(5, entry);
+        assert!(matches!(displaced, Some(FileDescriptor::File(_))), "fd 5's old entry comes back");
+        assert_eq!(position_of(&t, 5), Some(64), "fd 5 now names fd 3's description");
+        assert!(t.table.lock().insert(6, file_at(0)).is_none(), "an empty target has nothing to release");
     }
 }

@@ -299,9 +299,9 @@ pub const MAX_FDS: usize = 1024;
 /// the suite closes what it opens — which is exactly the lifetime the kernel
 /// row had.
 static KERNEL_TABLE: akuma_exec::process::SharedFdTable = akuma_exec::process::SharedFdTable {
-    table: Spinlock::new(alloc::collections::BTreeMap::new()),
-    cloexec: Spinlock::new(alloc::collections::BTreeSet::new()),
-    nonblock: Spinlock::new(alloc::collections::BTreeSet::new()),
+    table: Spinlock::new(akuma_fdtable::Names::new()),
+    cloexec: Spinlock::new(akuma_fdtable::FlagSet::new()),
+    nonblock: Spinlock::new(akuma_fdtable::FlagSet::new()),
 };
 
 /// The table a syscall resolves its descriptors against.

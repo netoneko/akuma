@@ -4,6 +4,7 @@ default-members = [
     ".",
     "crates/akuma-alloc",
     "crates/akuma-exec",
+    "crates/akuma-fdtable",
     "crates/akuma-exceptions",
     "crates/akuma-uart",
     "crates/akuma-fdt",

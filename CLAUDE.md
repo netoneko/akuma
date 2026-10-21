@@ -8,8 +8,13 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,terminal,timer,trap-aarch64,user-space,vfs,virtio}`
+  `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,fdtable,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,terminal,timer,trap-aarch64,user-space,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
+  `akuma-fdtable` is the fd table's state machine — lowest-free allocation,
+  dup/close/sweep/fork decisions, effects returned not performed, `forbid`,
+  no locks; `SharedFdTable` in `akuma-exec` keeps the locks and performs the
+  effects. **Never compute a lowest-free fd, sweep cloexec, or copy a table
+  for fork outside it** (`docs/reference/subsystems/fdtable.md`).
   `akuma-port` is x86 **port I/O**, under the same rule as `akuma-cpu` below with
   one difference that is the point: no function takes a port number. `in`/`out` are only safe to execute
   against the device that owns the port, so the crate exposes devices (`COM1`,

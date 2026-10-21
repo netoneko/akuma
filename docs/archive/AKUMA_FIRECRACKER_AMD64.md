@@ -1969,6 +1969,10 @@ is the `static` array + spinlock around the leaf. See
   note). A spawned child and `sshd` share it; it works because fd 0/1/2 are
   routed per task and the numbered fds each side holds do not collide in
   practice.
+  **Corrected 2026-10-21:** this stopped being true on 2026-09-06 — amd64 got
+  one `SharedFdTable` per process (C2 step 4b,
+  `AKUMA_AMD64_C2_SLICES_6_AND_7.md`); today the per-process table's state
+  machine is `crates/akuma-fdtable` (`AKUMA_FDTABLE_EXTRACTION.md`).
 
 ### 3.24.5 Deferred: the allocation audit
 

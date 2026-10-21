@@ -1,6 +1,15 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — two crates added 2026-10-18, headline **not** regenerated:
+**Grade: A** — Regenerated 2026-10-21 with
+`python3 scripts/cloc_akuma.py src crates` after **`akuma-fdtable`**
+([`subsystems/fdtable.md`](subsystems/fdtable.md)): the fd table's state
+machine out of `akuma-exec`'s `SharedFdTable`, **239 production lines, 0
+`unsafe` sites, carrying the ban from its first commit**
+([`AKUMA_FDTABLE_EXTRACTION.md`](../archive/AKUMA_FDTABLE_EXTRACTION.md)).
+**70 of 96 crates** forbid; 81344 of 82627 production lines (98.4%) sit
+outside any `unsafe` block; 0 sites inside enforced crates.
+
+The run before, 2026-10-18, headline **not** regenerated, added
 **`akuma-dns`** (forbids; the DNS client, `akuma_net::dns::resolve_ipv4`) and
 **`akuma-port`**, which cannot: it is the only crate that executes `in`/`out`, so
 its `unsafe` is four `asm!` blocks in `src/raw.rs` (4 sites, 16 lines) behind the

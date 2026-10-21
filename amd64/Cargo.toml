@@ -339,6 +339,9 @@ akuma-primitives = { path = "../crates/akuma-primitives" }
 # Statically allocated DMA memory (rings, contexts, bounce buffers) with the
 # `unsafe` inside: `DmaArray`. The xHCI and HDA drivers hold no raw statics.
 akuma-dma = { path = "../crates/akuma-dma" }
+# The fd table's parts (`Names`/`FlagSet`) that `KERNEL_TABLE`'s static is
+# made of; the state machine itself comes in through `akuma-exec`.
+akuma-fdtable = { path = "../crates/akuma-fdtable" }
 # Page tables in memory + the amd64 walker; and the entry format it walks.
 akuma-pagetable = { path = "../crates/akuma-pagetable" }
 akuma-pte-amd64 = { path = "../crates/akuma-pte-amd64" }

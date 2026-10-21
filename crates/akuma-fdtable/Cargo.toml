@@ -1,0 +1,13 @@
+[package]
+name = "akuma-fdtable"
+version = "0.1.0"
+edition = "2024"
+description = "The per-process fd table as a pure, host-tested state machine: lowest-free allocation, the dup/dup2/dup3/F_DUPFD rules, close/close_range, the close-on-exec sweep and fork's copy with its epoll-stripping policy. Locks, hooks and kernel-object releases stay with the kernel; effects are returned, never performed."
+
+[lints]
+workspace = true
+
+# No dependencies, deliberately: releasing a pipe end or bumping a socket
+# reference is an effect this crate *returns* (`Dup::payload`, `Forked`) rather
+# than performs, so nothing in it locks, hooks or names a descriptor type.
+[dependencies]

@@ -444,6 +444,17 @@ fd table onto it closes a convergence blocker and a spawn-ceiling
 (`AKUMA_FIRECRACKER_AMD64.md` §3.24.4) at once, and is a prerequisite for the
 microVM runner: a guest process's fd table should not be the host kernel's.
 
+**Corrected 2026-10-21** (`AKUMA_FDTABLE_EXTRACTION.md`): two premises here
+went stale. The per-process table already existed when this was written —
+amd64 grew one `SharedFdTable` per process on 2026-09-06 (C2 step 4b), so the
+"single-kernel-fd-table" gap was already closed. And the extraction landed on
+2026-10-21 as `crates/akuma-fdtable`, a pure `#![forbid(unsafe_code)]` state
+machine over `BTreeMap`/`BTreeSet` views, with `akuma-slot-table` explicitly
+**rejected**: its lock-free id-recycling machinery has no matching reader
+here — the kernel's three fd locks (names, cloexec, nonblock) are ordinary
+spinlocks with borrow-holding readers (`/proc/<pid>/fd`, the exec sweep), not
+lock-free iterators. The microVM-runner point stands.
+
 ### 4.4 `mmu` safe-wrapper facade
 
 `akuma-mmu` holds 549 `unsafe` lines — a third of the kernel's total (§2.2).

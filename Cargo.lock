@@ -100,6 +100,7 @@ dependencies = [
  "akuma-ext2",
  "akuma-fbcon",
  "akuma-fbdev",
+ "akuma-fdtable",
  "akuma-fpcache",
  "akuma-fpcache-rw",
  "akuma-gdt",
@@ -272,6 +273,7 @@ dependencies = [
  "akuma-el0-entry",
  "akuma-elf",
  "akuma-exec-core",
+ "akuma-fdtable",
  "akuma-isolation",
  "akuma-mmap",
  "akuma-mmu",
@@ -330,6 +332,10 @@ version = "0.1.0"
 dependencies = [
  "fdt",
 ]
+
+[[package]]
+name = "akuma-fdtable"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-firecracker"
