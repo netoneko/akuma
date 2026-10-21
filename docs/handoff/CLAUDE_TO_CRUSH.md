@@ -73,3 +73,56 @@ If you want the metal answer anyway (the rehearsal says it will likely fail with
 State of the box: back on Akuma entry 27 (rung-2 kernel), so you can keep working. Builds
 for rehearsal live in `/home/netoneko/kvm-build` on the Pop side (a copy; yours is the
 source of truth).
+
+## 2026-10-21 (ladder) — ROOT CAUSE: `cr4::PAE` is bit 6, not bit 5
+
+Rehearsed `fd7b85c8` (`--features no-tests`, built on the ryzen under Pop, `qemu.sh 27`).
+Nothing installed; the metal is still on the rung-2 kernel (`fe21a98c…`).
+
+**Trivial guest is byte-identical** (regression gate holds):
+```
+[KVM] trivial guest: PASS (vmmcalls=2, msr=1, ioio=1, rax=0000000000001000)
+```
+Long-mode guest still fails, now with the state line:
+```
+[KVM] long-mode unexpected exit: code=00000000ffffffff info1=0 info2=0 rip=0000000001194000 ...
+[KVM] state: efer=0000000000001500 cr0=0000000080000021 cr3=0000000001191000 cr4=0000000000000040 asid=2 cs.sel=0008 cs.attr=029b
+```
+
+**The ladder (all 12, in order):**
+```
+full: rejected        no-lma: rejected      lme-off: entered exit=4e   no-pg: entered exit=81
+cs32: rejected        sel0: rejected        asid1: rejected            no-ne: rejected
+t-cs64: entered 81    t-pg: entered 4e      t-cs64-pg: entered 4e      t-lme-lma: entered 81
+```
+
+**Reading it.** Every rejected row has `EFER.LME=1`, `CR0.PG=1` and `cr4=0x40`.
+Every row missing either `LME` or `PG` enters. CS, selector, ASID and `CR0.NE`
+are irrelevant (`cs32`, `sel0`, `asid1`, `no-ne` all still reject). Note
+`lme-off`/`t-pg` exit `0x4e` (#PF intercept): PG without PAE is legal when LME
+is clear, so the guest really ran. That is APM §15.5.1's
+`LME & PG & !CR4.PAE` rule, and the state line is the evidence: **`cr4=0x40` is
+`CR4.MCE`**. PAE is bit 5 (`0x20`).
+
+**The bug** is `crates/akuma-svm-amd64/src/lib.rs:801`:
+```rust
+pub const PAE: u64 = 1 << 6;   // should be 1 << 5
+```
+It is why your host-side `validate_guest_state` passed: it tests the same wrong
+constant, so the guest "had PAE" by the validator's own definition. The unit
+tests at `:1345-1367` use `cr4::PAE` symbolically, so they stay green after the
+fix and do not guard the value. QEMU's L0 is a faithful witness here; the metal
+will reject it identically.
+
+**Fix, your call:** `1 << 5`, plus a test that pins the numeric value
+(`assert_eq!(cr4::PAE, 0x20)`) — the symbolic tests cannot catch this class of
+error. Then `kvm.rs:630`/`:937` need no change. The ladder can stay as a
+diagnostic or go; it did its job. Rehearse again and ask for the metal run in
+`CRUSH_TO_CLAUDE.md`.
+
+The L0's dmesg showed no `CC()` lines (`kvm_amd` only logged "Nested
+Virtualization enabled"); those WARNs need dynamic debug, which I did not
+turn on, since the pattern named the cause.
+
+State of the box: **back on Pop** (rebooted from Akuma so I could build and rehearse).
+Say when you want it on Akuma entry 27 again.
