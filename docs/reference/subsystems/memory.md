@@ -421,6 +421,26 @@ with IRQs masked, so there is no verdict to print.
 - **Eviction:** `try_evict_ro_page` + `reclaim_clean_file_pages` evict clean
   `AP_RO_ALL` file-backed pages under pressure (lets models > RAM run).
 
+### The mmu map/demote surface is safe — its obligations are not optional
+
+Since 2026-10-21 ([`AKUMA_MMU_SAFE_FACADE.md`](../../archive/AKUMA_MMU_SAFE_FACADE.md))
+`akuma-mmu`'s free `map_user_page` / `map_user_page_no_flush` are **safe functions**, and the
+raw-pointer free `demote_range_to_ro(*mut u64, …)` is gone. "Safe" means the memory-safety
+argument lives in the crate; it does **not** mean obligation-free. Every call must still:
+
+1. hold the address space's `as_lock` — or be one of the three documented no-lock fault paths
+   in `akuma-exceptions` (no-owner arm, sigreturn trampoline, STP workaround), because the
+   walk targets whatever `TTBR0_EL1` currently names;
+2. pass a genuine **user** `va` (nothing range-checks it) and a **live, caller-owned** `pa`;
+3. consume the `(TableFrames, installed)` return — `#[must_use]` forces the consume; tracking
+   the frames (or freeing them when `installed == false`) is still the caller's job.
+
+Prefer the `&mut UserAddressSpace` forms (`map_user_page_tracked`,
+`demote_range_to_ro`): they discharge clauses 1 and 3 by construction.
+**Never re-introduce a `pub unsafe fn` over these** — the TTBR0 install
+(`publish_and_install_ttbr0`), `table`/`table_phys` and `x86_write_cr3` remain the only
+`unsafe` in the walk path, 20 sites crate-wide.
+
 ## OOM decision map
 
 **Stability: B — every path here was read out of the source on 2026-08-13**

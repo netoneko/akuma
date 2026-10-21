@@ -1596,9 +1596,8 @@ fn demand_page_lazy_region(
             let asg = owner.address_space.lock();
             for (cur_va, pf, owns_ref) in filled.iter().copied() {
                 // no_flush: batch the TLB invalidation after the loop.
-                let (table_frames, installed) = unsafe {
-                    akuma_exec::mmu::map_user_page_no_flush(cur_va, pf.addr, map_flags)
-                };
+                let (table_frames, installed) =
+                    akuma_exec::mmu::map_user_page_no_flush(cur_va, pf.addr, map_flags);
                 for tf in table_frames {
                     asg.track_page_table_frame(tf);
                 }
@@ -1714,9 +1713,8 @@ fn demand_page_lazy_region(
             let mut installed_ok = false;
             if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                 let asg = owner.address_space.lock();
-                let (table_frames, installed) = unsafe {
-                    akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags)
-                };
+                let (table_frames, installed) =
+                    akuma_exec::mmu::map_user_page(page_va, pf.addr, map_flags);
                 for tf in table_frames { asg.track_page_table_frame(tf); }
                 if installed {
                     asg.track_user_frame(pf);
@@ -1739,9 +1737,8 @@ fn demand_page_lazy_region(
         let mut installed_ok = false;
         if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
             let asg = owner.address_space.lock();
-            let (table_frames, installed) = unsafe {
-                akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
-            };
+            let (table_frames, installed) =
+                akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags);
             for tf in table_frames {
                 asg.track_page_table_frame(tf);
             }
@@ -2007,9 +2004,8 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
                 let (table_frames, installed) = match owner {
                     Some(owner) => {
                         let asg = owner.address_space.lock();
-                        let (table_frames, installed) = unsafe {
-                            akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
-                        };
+                        let (table_frames, installed) =
+                            akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags);
                         if installed {
                             asg.track_user_frame(page_frame);
                         }
@@ -2018,9 +2014,7 @@ fn ensure_user_page_mapped(pid: u32, page_va: usize) -> bool {
                         }
                         (table_frames, installed)
                     }
-                    None => unsafe {
-                        akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags)
-                    },
+                    None => akuma_exec::mmu::map_user_page(page_va, page_frame.addr, map_flags),
                 };
                 // Frees after the hold is released; ownership rules unchanged — the
                 // data frame goes back to the PMM iff nothing mapped it (lost CAS
@@ -2065,9 +2059,11 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
         core::ptr::copy_nonoverlapping(TRAMPOLINE.as_ptr(), ptr, TRAMPOLINE.len());
     }
 
-    let (table_frames, installed) = unsafe {
-        akuma_exec::mmu::map_user_page(SIGRETURN_TRAMPOLINE_ADDR, frame.addr, akuma_exec::mmu::user_flags::RX)
-    };
+    let (table_frames, installed) = akuma_exec::mmu::map_user_page(
+        SIGRETURN_TRAMPOLINE_ADDR,
+        frame.addr,
+        akuma_exec::mmu::user_flags::RX,
+    );
 
     if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
         let asg = owner.address_space.lock();
@@ -4440,9 +4436,11 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
                         let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
                         if akuma_exec::process::lazy_region_lookup_for_page_fault(pid, store_va as usize).is_some()
                             && let Some(pf) = alloc_page_zeroed() {
-                                let (tfs, installed) = unsafe {
-                                    akuma_exec::mmu::map_user_page(page_va, pf.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-                                };
+                                let (tfs, installed) = akuma_exec::mmu::map_user_page(
+                                    page_va,
+                                    pf.addr,
+                                    akuma_exec::mmu::user_flags::RW_NO_EXEC,
+                                );
                                 if installed {
                                     if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                                         let asg = owner.address_space.lock();
@@ -4868,9 +4866,11 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
                             let mut installed_ok = false;
                             if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                                 let asg = owner.address_space.lock();
-                                let (table_frames, installed) = unsafe {
-                                    akuma_exec::mmu::map_user_page(page_va, page_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-                                };
+                                let (table_frames, installed) = akuma_exec::mmu::map_user_page(
+                                    page_va,
+                                    page_frame.addr,
+                                    akuma_exec::mmu::user_flags::RW_NO_EXEC,
+                                );
                                 for tf in table_frames {
                                     asg.track_page_table_frame(tf);
                                 }
@@ -4925,9 +4925,11 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
                             safe_print!(192, "[DP-eager] pid={} re-map va=0x{:x} frame=0x{:x}\n",
                                 pid, page_va, phys.addr);
                             let asg = owner.address_space.lock();
-                            let (table_frames, _) = unsafe {
-                                akuma_exec::mmu::map_user_page(page_va, phys.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-                            };
+                            let (table_frames, _) = akuma_exec::mmu::map_user_page(
+                                page_va,
+                                phys.addr,
+                                akuma_exec::mmu::user_flags::RW_NO_EXEC,
+                            );
                             for tf in table_frames {
                                 asg.track_page_table_frame(tf);
                             }

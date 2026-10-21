@@ -3449,9 +3449,8 @@ fn test_map_user_page_preserves_irq_state() -> bool {
     let disabled_before = read_daif_i();
 
     // Call map_user_page — the internal IrqGuard must not leak state
-    let (table_frames, _) = unsafe {
-        akuma_exec::mmu::map_user_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-    };
+    let (table_frames, _) =
+        akuma_exec::mmu::map_user_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
 
     let disabled_after = read_daif_i();
 
@@ -3488,9 +3487,8 @@ fn test_map_user_page_roundtrip() -> bool {
 
     let before = akuma_exec::mmu::is_current_user_page_mapped(test_va);
 
-    let (table_frames, _) = unsafe {
-        akuma_exec::mmu::map_user_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-    };
+    let (table_frames, _) =
+        akuma_exec::mmu::map_user_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
 
     let after_map = akuma_exec::mmu::is_current_user_page_mapped(test_va);
 
@@ -4164,9 +4162,11 @@ fn test_map_127_pages_all_ptes_exist() -> bool {
             return false;
         };
         // Drop the returned table frames — matches real kernel behavior
-        let _ = unsafe {
-            akuma_exec::mmu::map_user_page(base_va + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-        };
+        let _ = akuma_exec::mmu::map_user_page(
+            base_va + i * 4096,
+            frame.addr,
+            akuma_exec::mmu::user_flags::RW_NO_EXEC,
+        );
         frames.push(frame);
     }
 
@@ -4210,9 +4210,11 @@ fn test_map_pages_survive_subsequent_allocs() -> bool {
             for f in frames { crate::pmm::free_page(f); }
             console::print("  OOM\n"); return false;
         };
-        let _ = unsafe {
-            akuma_exec::mmu::map_user_page(base_va + i * 4096, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-        };
+        let _ = akuma_exec::mmu::map_user_page(
+            base_va + i * 4096,
+            frame.addr,
+            akuma_exec::mmu::user_flags::RW_NO_EXEC,
+        );
         frames.push(frame);
     }
 
@@ -4269,9 +4271,11 @@ fn test_map_interleaved_regions_same_l3() -> bool {
                 return false;
             };
             let va = base_2mb + offset + i * 4096;
-            let _ = unsafe {
-                akuma_exec::mmu::map_user_page(va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-            };
+            let _ = akuma_exec::mmu::map_user_page(
+                va,
+                frame.addr,
+                akuma_exec::mmu::user_flags::RW_NO_EXEC,
+            );
             mappings.push((va, frame));
         }
     }
@@ -4660,16 +4664,14 @@ fn test_map_user_page_race_leaks_frame() -> bool {
     let test_va: usize = 0x41_8000_0000; // 262GB
 
     // Map frame_a at test_va (first mapper wins)
-    let (table_frames_a, installed_a) = unsafe {
-        akuma_exec::mmu::map_user_page(test_va, frame_a.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-    };
+    let (table_frames_a, installed_a) =
+        akuma_exec::mmu::map_user_page(test_va, frame_a.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
 
     let _mapped_a = akuma_exec::mmu::is_current_user_page_mapped(test_va);
 
     // Now simulate a racing second mapper: map frame_b at the SAME VA
-    let (table_frames_b, installed_b) = unsafe {
-        akuma_exec::mmu::map_user_page(test_va, frame_b.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-    };
+    let (table_frames_b, installed_b) =
+        akuma_exec::mmu::map_user_page(test_va, frame_b.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
 
     // After the fix, map_user_page returns (TableFrames, bool) where
     // bool=true means "PTE was installed", bool=false means "already mapped,
@@ -4805,9 +4807,11 @@ fn test_readahead_race_phantom_frames() -> bool {
     let mut all_installed = true;
     for i in 0..NUM_PAGES {
         let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
-        let (tfs, installed) = unsafe {
-            akuma_exec::mmu::map_user_page(base_va + i * 0x1000, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC)
-        };
+        let (tfs, installed) = akuma_exec::mmu::map_user_page(
+            base_va + i * 0x1000,
+            frame.addr,
+            akuma_exec::mmu::user_flags::RW_NO_EXEC,
+        );
         if !installed {
             all_installed = false;
         }
@@ -7106,9 +7110,7 @@ fn test_map_user_page_already_mapped() -> bool {
     addr_space.activate();
 
     // First map should succeed with installed=true
-    let (frames1, installed1) = unsafe {
-        map_user_page(test_va, page1.addr, user_flags::RW)
-    };
+    let (frames1, installed1) = map_user_page(test_va, page1.addr, user_flags::RW);
     addr_space.track_user_frame(page1);
     for f in frames1 {
         addr_space.track_page_table_frame(f);
@@ -7118,9 +7120,7 @@ fn test_map_user_page_already_mapped() -> bool {
     let is_mapped_after_first = is_current_user_page_mapped(test_va);
 
     // Second map to same VA should return installed=false (page already there)
-    let (frames2, installed2) = unsafe {
-        map_user_page(test_va, page2.addr, user_flags::RW)
-    };
+    let (frames2, installed2) = map_user_page(test_va, page2.addr, user_flags::RW);
 
     // Page should still be mapped
     let is_mapped_after_second = is_current_user_page_mapped(test_va);
@@ -7214,9 +7214,9 @@ fn test_kernel_va_rejected_as_user_pointer() -> bool {
 
     proc.address_space.activate();
 
-    let (frames, _) = unsafe { map_user_page(user_va, user_page.addr, user_flags::RW) };
+    let (frames, _) = map_user_page(user_va, user_page.addr, user_flags::RW);
     { let asg = proc.address_space.lock(); asg.track_user_frame(user_page); for f in frames { asg.track_page_table_frame(f); } }
-    let (frames, _) = unsafe { map_user_page(none_va, none_page.addr, user_flags::NONE) };
+    let (frames, _) = map_user_page(none_va, none_page.addr, user_flags::NONE);
     { let asg = proc.address_space.lock(); asg.track_user_frame(none_page); for f in frames { asg.track_page_table_frame(f); } }
 
     // 1. The kernel VA really is mapped in this user address space...
@@ -7863,7 +7863,7 @@ fn test_block_shatter_preserves_identity() -> bool {
         | akuma_exec::mmu::attr_index(akuma_exec::mmu::MAIR_NORMAL_WB);
     let block_entry = block_pa | block_flags;
 
-    unsafe { akuma_exec::mmu::shatter_block_to_pages(frame.addr, block_entry); }
+    akuma_exec::mmu::shatter_block_to_pages(frame, block_entry);
 
     let mut pass = true;
     let l3_ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *const u64;

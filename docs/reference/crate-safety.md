@@ -1,13 +1,21 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — Regenerated 2026-10-21 with
-`python3 scripts/cloc_akuma.py src crates` after **`akuma-fdtable`**
+**Grade: A** — Regenerated 2026-10-21 (second run of the day) with
+`python3 scripts/cloc_akuma.py src crates` after the **`akuma-mmu` safe facade**
+([`AKUMA_MMU_SAFE_FACADE.md`](../archive/AKUMA_MMU_SAFE_FACADE.md)): the four public
+`unsafe fn`s went safe or were deleted, the shootdown-hook transmutes became
+`akuma_primitives::OnceCopy`, and the two TTBR0 installs merged into one leaf —
+**`akuma-mmu` 31 → 20 sites, and `akuma-exceptions` 38 → 29** (its nine call-site
+`unsafe` blocks went with them). 81519 of 82758 production lines (98.5%) sit
+outside any `unsafe` block; 0 sites inside enforced crates. **70 of 97 crates**
+forbid — the 97th component, `akuma-svm-amd64`, arrived with the kvm-ladder
+merge and starts at 0 sites like every new crate.
+
+The run before, earlier the same day, added **`akuma-fdtable`**
 ([`subsystems/fdtable.md`](subsystems/fdtable.md)): the fd table's state
 machine out of `akuma-exec`'s `SharedFdTable`, **239 production lines, 0
 `unsafe` sites, carrying the ban from its first commit**
 ([`AKUMA_FDTABLE_EXTRACTION.md`](../archive/AKUMA_FDTABLE_EXTRACTION.md)).
-**70 of 96 crates** forbid; 81344 of 82627 production lines (98.4%) sit
-outside any `unsafe` block; 0 sites inside enforced crates.
 
 The run before, 2026-10-18, headline **not** regenerated, added
 **`akuma-dns`** (forbids; the DNS client, `akuma_net::dns::resolve_ipv4`) and
@@ -718,8 +726,8 @@ crates and a long tail holding one obligation each.
 | crate | sites | why it is irreducible |
 |---|---:|---|
 | `akuma-slot-table` | 9 | the lock-free per-slot `*mut Process` store under the process table — FREE/ACTIVE/RETIRED state, the reuse generation, the retire timestamp, and every deref of those pointers. Generic `SlotTable<T, N>`, never names `Process`. One stated contract at the top of `lib.rs`: a slot's `Box<T>` is dropped only by `reclaim_retired` after a cooldown that outlasts any held stale pointer, and within a generation the pointer is immutable. The shape `akuma-locks-rw-cell`/`akuma-gic` use |
-| `akuma-exceptions` | 80 | the vector table, the EL0/EL1 trap handlers and the fault repair behind them. Irreducible in the strongest sense on this list: `forbid` rejects `global_asm!` and `#[unsafe(no_mangle)]` outright, and this crate is a vector table plus the five handlers it `bl`s. One stated contract at the top of `lib.rs` covers all 80, the shape `akuma-net-nic` and `akuma-gic` use |
-| `akuma-mmu` | 71 | page tables, `UserAddressSpace`, ASIDs, the per-core TTBR free gate. Was 64; the `oof-part-2` branch moved ~6 raw-pointer sites in as safe helpers for `akuma-exec` (`write_phys`, `read_current_user_val`, `with_phys_bytes_mut`, `write_current_user_val`, and 2026-09-02 `UserAddressSpace::demote_range_to_ro` — the `&self`-safe form of the free `demote_range_to_ro(*mut u64, …)` `unsafe fn`, walking `self.l0_frame`, so `akuma-exec`'s CoW-fork path holds no `unsafe`). Each is stated once here instead of at every call site |
+| `akuma-exceptions` | 29 | the vector table, the EL0/EL1 trap handlers and the fault repair behind them. Irreducible in the strongest sense on this list: `forbid` rejects `global_asm!` and `#[unsafe(no_mangle)]` outright, and this crate is a vector table plus the five handlers it `bl`s. One stated contract at the top of `lib.rs` covers all of them, the shape `akuma-net-nic` and `akuma-gic` use. Was 80 in an older run, 38 just before 2026-10-21, when the nine call-site `unsafe` blocks around `map_user_page` left with the mmu facade ([`AKUMA_MMU_SAFE_FACADE.md`](../archive/AKUMA_MMU_SAFE_FACADE.md)) |
+| `akuma-mmu` | 20 | page tables, `UserAddressSpace`, ASIDs, the per-core TTBR free gate. Was 64; the `oof-part-2` branch moved ~6 raw-pointer sites in as safe helpers for `akuma-exec` (`write_phys`, `read_current_user_val`, `with_phys_bytes_mut`, `write_current_user_val`, and 2026-09-02 `UserAddressSpace::demote_range_to_ro`, walking `self.l0_frame`, so `akuma-exec`'s CoW-fork path holds no `unsafe`). Was 71 until 2026-10-21: the facade made the free `map_user_page{,_no_flush}` safe (`#[must_use]` obligations, not `unsafe`), deleted the raw-pointer free `demote_range_to_ro` and the `usize → fn` shootdown transmutes, and merged the TTBR0 installs into one leaf ([`AKUMA_MMU_SAFE_FACADE.md`](../archive/AKUMA_MMU_SAFE_FACADE.md)). What remains: the one walk `unsafe` (`table`/`table_phys`), the TTBR0 and CR3 leaves, linker symbols, and the named user-access helpers' internals |
 | `akuma-virtio` | 38 | MMIO and DMA by definition |
 | `akuma-cpu` | 32 | `asm!` is unconditionally unsafe; the crate exists so ~160 tree-wide sites don't each have to say so |
 | `akuma-net-nic` | 23 | DMA-visible frame arenas, virtio descriptor rings, the NIC MMIO doorbell, and smoltcp's `Device` impls |

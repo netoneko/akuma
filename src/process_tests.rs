@@ -7428,7 +7428,7 @@ fn bench_fork_cow_share() {
         let _ = child.map_page(va, pa, child_flags);
         child.track_user_frame(crate::pmm::PhysFrame::new(pa));
     }
-    unsafe { mmu::demote_range_to_ro(parent_l0.cast_mut(), BENCH_VA_BASE, mapped); }
+    parent.address_space.get_mut().demote_range_to_ro(BENCH_VA_BASE, mapped);
     let _ = mmu::flush_tlb_asid(0, mmu::TlbTarget::AllCores);
     let elapsed = crate::timer::uptime_us() - start;
     let per_page_ns = (elapsed.saturating_mul(1000)) / shared.max(1) as u64;

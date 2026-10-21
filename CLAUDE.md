@@ -208,6 +208,15 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   was never going to, but it makes the walker's remaining content honest and it
   is what amd64 replaced its own capped, refcount-less `FrameSet` with
   (`docs/archive/AKUMA_USER_SPACE_LEDGER.md`).
+  `akuma-mmu`'s map/demote surface is **safe since 2026-10-21**
+  (`docs/archive/AKUMA_MMU_SAFE_FACADE.md`): free `map_user_page`/`map_user_page_no_flush`
+  are safe `#[must_use]` functions whose "held `as_lock` (or a documented no-lock fault
+  path), user `va`, live `pa`, consume the return" obligations are docs, not types, and the
+  raw-pointer free `demote_range_to_ro` is gone — prefer the `&mut UserAddressSpace` forms,
+  which discharge the obligations by construction. **Never re-introduce a `pub unsafe fn`
+  over these, and never add a fourth no-lock call site without writing down why.** The only
+  `unsafe` left in the walk path is the `table`/`table_phys` contract, the TTBR0/CR3 leaves
+  and linker symbols.
   `akuma-cow` is the copy-on-write **write-fault decision** and nothing else:
   `(live PTE writable?, PTE CoW-marked?, share count)` -> `Retry` / `Fault` /
   `TakeInPlace` / `Copy`. Four situations that need different answers and are

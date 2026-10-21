@@ -884,30 +884,24 @@ type ShootdownSend = fn() -> bool;
 type ShootdownWait = fn();
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-static SHOOTDOWN_SEND: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static SHOOTDOWN_SEND: akuma_primitives::OnceCopy<ShootdownSend> = akuma_primitives::OnceCopy::new();
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-static SHOOTDOWN_WAIT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static SHOOTDOWN_WAIT: akuma_primitives::OnceCopy<ShootdownWait> = akuma_primitives::OnceCopy::new();
 
 /// Register the x86 shootdown hooks. Called once by the kernel, from **both**
 /// boot protocols, before any user task exists. Until then — and on a
 /// one-core machine, forever — `TlbTarget::AllCores` is core-local.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn set_shootdown_hooks(send: ShootdownSend, wait: ShootdownWait) {
-    SHOOTDOWN_SEND.store(send as usize, core::sync::atomic::Ordering::Release);
-    SHOOTDOWN_WAIT.store(wait as usize, core::sync::atomic::Ordering::Release);
+    SHOOTDOWN_SEND.set(send);
+    SHOOTDOWN_WAIT.set(wait);
 }
 
 /// Broadcast if the kernel armed the hooks; `true` means peers were IPI'd.
 #[inline]
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn shootdown_send_if_armed() -> bool {
-    let send = SHOOTDOWN_SEND.load(core::sync::atomic::Ordering::Acquire);
-    if send == 0 {
-        return false;
-    }
-    // SAFETY: the value was stored from a `fn() -> bool` by `set_shootdown_hooks`
-    // and is never written again.
-    let send = unsafe { core::mem::transmute::<usize, ShootdownSend>(send) };
+    let Some(send) = SHOOTDOWN_SEND.get() else { return false };
     send()
 }
 
@@ -916,12 +910,7 @@ fn shootdown_send_if_armed() -> bool {
 #[inline]
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn shootdown_wait_remote() {
-    let wait = SHOOTDOWN_WAIT.load(core::sync::atomic::Ordering::Acquire);
-    if wait == 0 {
-        return;
-    }
-    // SAFETY: as `shootdown_send_if_armed`.
-    let wait = unsafe { core::mem::transmute::<usize, ShootdownWait>(wait) };
+    let Some(wait) = SHOOTDOWN_WAIT.get() else { return };
     wait();
 }
 
@@ -2130,9 +2119,7 @@ impl UserAddressSpace {
     /// (`akuma_exec::process::cow_share_and_demote_range`) calls this per chunk
     /// under the per-AS `as_lock`, then issues the range TLB flush.
     ///
-    /// The `&self`-safe form of the free [`demote_range_to_ro`] `unsafe fn`:
-    /// that one takes a raw `*mut u64` L0 the caller vouches for, this one walks
-    /// `self.l0_frame` — this address space's own L0 root, allocated in `new`
+    /// its own root — `self.l0_frame`, allocated in `new`
     /// and never reassigned, so the walk always has a real tree to follow
     /// (`AKUMA_EXEC_AUDIT.md` §6.E group 3).
     pub fn demote_range_to_ro(&mut self, va_start: usize, pages: usize) -> usize {
@@ -2211,9 +2198,9 @@ impl UserAddressSpace {
     /// `map_user_page` path: CAS install, refuses a VA that is already mapped,
     /// hands the table frames back so they can be tracked, and flushes.
     ///
-    /// This is [`map_user_page`]'s four-clause `# Safety` contract turned into a
-    /// signature. Every clause is discharged here rather than restated at the call
-    /// site:
+    /// This is [`map_user_page`]'s four-clause caller-obligation contract turned
+    /// into a signature. Every clause is discharged here rather than restated at
+    /// the call site:
     ///
     /// 1. **The address space is held.** `&mut UserAddressSpace` is only reachable
     ///    through `Process::with_address_space`, which takes `as_lock` with IRQs
@@ -2296,10 +2283,11 @@ impl UserAddressSpace {
             debug_assert!(false, "map_and_track on an address space that is not installed");
             return false;
         }
-        // SAFETY: clauses 1-3 are established above and by the `&mut self` receiver;
-        // clause 4 is discharged by the tracking below, which runs on both arms.
-        let (table_frames, installed) =
-            unsafe { map_user_page_inner(va, frame.addr, user_flags_val, flush) };
+        // [`map_user_page_inner`]'s obligations, discharged here rather than
+        // restated at the call: clauses 1-3 are established above and by the
+        // `&mut self` receiver; clause 4 by the tracking below, which runs on
+        // both arms.
+        let (table_frames, installed) = map_user_page_inner(va, frame.addr, user_flags_val, flush);
         self.track_user_frame(frame);
         for tf in table_frames {
             self.track_page_table_frame(tf);
@@ -2561,11 +2549,7 @@ impl UserAddressSpace {
         let _irq = IrqGuard::new();
         let _ = flush_tlb_all(TlbTarget::AllCores);
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        unsafe {
-            let _core = publish_l0_begin(_ttbr0, akuma_bkl::bkl::current_core_id() as usize);
-            core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _ttbr0);
-            publish_l0_end(_core);
-        }
+        publish_and_install_ttbr0(_ttbr0);
         let _ = flush_tlb_all(TlbTarget::AllCores);
         crate::note_current_expected_l0(_ttbr0);
     }
@@ -2576,14 +2560,35 @@ impl UserAddressSpace {
         let _irq = IrqGuard::new();
         let _ = flush_tlb_all(TlbTarget::AllCores);
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        unsafe {
-            let _core = publish_l0_begin(_boot_ttbr0, akuma_bkl::bkl::current_core_id() as usize);
-            core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) _boot_ttbr0);
-            publish_l0_end(_core);
-        }
+        publish_and_install_ttbr0(_boot_ttbr0);
         let _ = flush_tlb_all(TlbTarget::AllCores);
         crate::note_current_expected_l0(_boot_ttbr0);
     }
+}
+
+/// Install `ttbr0` as this core's user translation base — the **one**
+/// `TTBR0_EL1` write in this crate, shared by [`UserAddressSpace::activate`]
+/// and [`UserAddressSpace::deactivate`], which used to carry byte-identical
+/// copies of the bracket. The brackets are part of the write's safety: the
+/// publish tells the TTBR-free gate which L0 is going live / was live, so a
+/// concurrent free cannot reclaim a table this core is about to walk.
+///
+/// The caller must hold the switch path's `IrqGuard` — the install and its
+/// `note_current_expected_l0` follow-up are one atomic step no preemption may
+/// split — and pass a root that maps the running kernel (both callers pass a
+/// root this module built, which always does).
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn publish_and_install_ttbr0(ttbr0: u64) {
+    let token = publish_l0_begin(ttbr0, akuma_bkl::bkl::current_core_id() as usize);
+    // SAFETY: the one `msr ttbr0_el1` in this crate. Per the `akuma-cpu` rule a
+    // write that re-points state the kernel dereferences is never safe to wrap
+    // in a general API; this is the leaf that states the obligation instead:
+    // `ttbr0` must map the running kernel, and the publish brackets above and
+    // below are what make a concurrent TTBR free check against the right value.
+    unsafe {
+        core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) ttbr0);
+    }
+    publish_l0_end(token);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3006,6 +3011,13 @@ const fn x86_entry_span(level: u32) -> usize {
 /// deliberately not done: it would invalidate the parent entry the cursor is
 /// walking, and the frames are reclaimed at teardown by the ledger anyway.
 #[cfg(target_arch = "x86_64")]
+// The shootdown — and so the only read — is behind the kernel-target cfg below;
+// on a host build the variable is written and never read, which `unused_assignments`
+// (and, for the binding itself, `unused_variables`) would flag there.
+#[cfg_attr(
+    not(all(target_os = "none", target_arch = "x86_64")),
+    allow(unused_variables, unused_assignments)
+)]
 fn x86_walk_leaves(
     root: u64,
     ledger: &FrameLedger,
@@ -3018,11 +3030,7 @@ fn x86_walk_leaves(
     // Whether any leaf was actually edited. The per-leaf `invlpg` in the arms
     // below is core-local — it cannot reach a peer running this address
     // space — so one ranged shootdown covers the whole walk when it edited
-    // anything (see `flush_tlb_range_all_asid`'s x86 arm). The shootdown —
-    // and so the only read — is behind the kernel-target cfg below; on a
-    // host build the variable is written and never read, which the
-    // workspace-denied `unused_variables` would reject.
-    #[cfg_attr(not(all(target_os = "none", target_arch = "x86_64")), allow(unused_variables))]
+    // anything (see `flush_tlb_range_all_asid`'s x86 arm).
     let mut edited = false;
     while va < end {
         let step = match x86_walk::lookup::<KernelPhysMap>(root, va) {
@@ -3936,8 +3944,14 @@ impl Drop for UserAddressSpace {
 
 /// Populate an L3 page table from a 2MB block descriptor, preserving the
 /// block's identity mapping as 512 individual 4KB page entries.
-pub unsafe fn shatter_block_to_pages(l3_frame_addr: usize, block_entry: u64) {
-    shatter_into(table_phys(l3_frame_addr), block_entry);
+///
+/// The caller names the table by [`PhysFrame`], not by raw address: a frame the
+/// type system handed out is one the walker can descend through, where an
+/// arbitrary `usize` could name any word in the physmap. The entry itself is
+/// still the caller's to vouch for — this writes 512 descriptors derived from
+/// it and touches nothing else.
+pub fn shatter_block_to_pages(frame: PhysFrame, block_entry: u64) {
+    shatter_into(table_phys(frame.addr), block_entry);
 }
 
 /// [`shatter_block_to_pages`] over a table the caller has already named - every
@@ -3994,7 +4008,8 @@ impl<'a> IntoIterator for &'a TableFrames {
     }
 }
 
-/// Map a user page at `va` to physical address `pa`.
+/// Map a user page at `va` to physical address `pa` in the *current* user
+/// address space.
 ///
 /// Returns `(table_frames, installed)`:
 /// - `table_frames`: any intermediate page table frames allocated during the walk.
@@ -4002,18 +4017,24 @@ impl<'a> IntoIterator for &'a TableFrames {
 ///   already valid (another thread won the race).  When `false`, the caller's
 ///   data frame was NOT mapped and should be freed.
 ///
-/// # Safety
+/// # Caller obligations
 ///
-/// This edits the live page tables reached through `TTBR0_EL1`. The caller must
-/// uphold all four of:
+/// This is safe, but only correct under all four of:
 ///
 /// 1. **The address space is the caller's own and is held.** The walk reads
 ///    `TTBR0_EL1`, so it always targets *the currently installed* user address
 ///    space — it cannot be pointed at another process. On `smp-shared` the caller
 ///    must be inside that process's `as_lock` (`Process::with_address_space`), or
 ///    a concurrent unmap can free a table frame this walk is descending through.
+///    The fault paths that call this WITHOUT the lock (the `None =>` no-owner arm,
+///    the sigreturn trampoline, the STP-misrouting workaround in
+///    `akuma-exceptions`) are safe for the same reason a re-read of TTBR0 there
+///    is: the space cannot go away under them. Do not add a fourth no-lock call
+///    site without writing down why.
 /// 2. **`va` is a user VA.** Nothing here range-checks it; a kernel VA would edit
-///    the kernel's own translation through the user tables.
+///    the kernel's own translation through the user tables. (There is no checked
+///    user-VA newtype in this crate to make this compile-time, so it stays a
+///    documented obligation, same as every other TTBR0-relative walker here.)
 /// 3. **`pa` is a live frame the caller owns**, page-aligned, and not already
 ///    mapped elsewhere in a way that contradicts `user_flags_val`.
 /// 4. **The return value is consumed.** Every frame in `table_frames` must be
@@ -4021,8 +4042,14 @@ impl<'a> IntoIterator for &'a TableFrames {
 ///    false` means `pa` was *not* mapped, so the caller still owns it. Discarding
 ///    that flag is how a VA-lifetime bug becomes silent memory corruption — see
 ///    the `[WPF] ... cow_ref=0 lazy_self=NONE` note at `sys_mmap`'s eager install.
-pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (TableFrames, bool) {
-    unsafe { map_user_page_inner(va, pa, user_flags_val, true) }
+///    `#[must_use]` forces the first half of that (use it); tracking the frames
+///    is still on the caller.
+///
+/// Same shape as [`update_current_user_page_flags`] — current space via TTBR0,
+/// caller serializes — which went safe first.
+#[must_use = "the table frames must be tracked or freed, and installed == false means `pa` was not mapped and must be freed"]
+pub fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (TableFrames, bool) {
+    map_user_page_inner(va, pa, user_flags_val, true)
 }
 
 /// The body behind [`map_user_page`] and [`map_user_page_no_flush`]. The two were
@@ -4032,7 +4059,7 @@ pub unsafe fn map_user_page(va: usize, pa: usize, user_flags_val: u64) -> (Table
 /// `flush` is a literal at both call sites and this is `#[inline]` into two one-line
 /// wrappers, so the branch is constant-folded away in each.
 #[inline]
-unsafe fn map_user_page_inner(
+fn map_user_page_inner(
     va: usize,
     pa: usize,
     user_flags_val: u64,
@@ -4187,13 +4214,12 @@ pub fn remap_current_user_page(va: usize, pa: usize, user_flags_val: u64) -> boo
 /// The caller is responsible for issuing the TLB flush before the new
 /// mappings can be safely used by userspace.
 ///
-/// # Safety
-///
-/// Every requirement of [`map_user_page`], plus: the caller must issue the range
-/// flush before userspace can reach the new mappings.
-pub unsafe fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) -> (TableFrames, bool) {
+/// Every caller obligation of [`map_user_page`] applies, plus: the caller must
+/// issue the range flush before userspace can reach the new mappings.
+#[must_use = "the table frames must be tracked or freed, and installed == false means `pa` was not mapped and must be freed"]
+pub fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) -> (TableFrames, bool) {
     // No TLB flush — caller must call flush_tlb_range after mapping all pages.
-    unsafe { map_user_page_inner(va, pa, user_flags_val, false) }
+    map_user_page_inner(va, pa, user_flags_val, false)
 }
 
 /// Flush TLB entries for a contiguous range of virtual addresses.
@@ -4759,23 +4785,8 @@ pub fn collect_mapped_pages_with_flags_into(
     });
 }
 
-/// Demote all RW L3 PTEs in [va_start, va_start + pages*PAGE_SIZE) to RO.
-///
-/// Walks the page table via raw L0 pointer (no `&mut UserAddressSpace` needed).
-/// Returns the number of PTEs actually demoted.  Caller must flush the TLB
-/// after calling this (e.g. `flush_tlb_asid`).
-///
-/// # SMP safety
-/// Under `kernel_smp_shared`, this function ensures all PTE writes are visible
-/// before returning, so a subsequent `flush_tlb_all()` guarantees that no core
-/// can use a stale RW TLB entry after the demotion. This is critical for CoW
-/// fork correctness: the demote+flush window must be atomic with respect to
-/// genuinely-parallel EL0 on peer cores.
-pub unsafe fn demote_range_to_ro(l0_ptr: *mut u64, va_start: usize, pages: usize) -> usize {
-    demote_range(table(l0_ptr as usize), va_start, pages)
-}
-
-/// [`demote_range_to_ro`]'s body, over a table the caller has already named.
+/// [`UserAddressSpace::demote_range_to_ro`]'s body, over a table the caller has
+/// already named.
 fn demote_range(l0: &akuma_pagetable::Table, va_start: usize, pages: usize) -> usize {
     const AP_MASK: u64 = flags::AP_RO_ALL | flags::AP_RW_ALL; // bits [7:6]
     let mut demoted = 0usize;
@@ -4917,5 +4928,188 @@ mod x86_encoding_tests {
         assert_eq!(via_u64(user_flags::RX), 0x0000_0000_0000_0005);
         assert_eq!(via_u64(user_flags::RO_NO_EXEC), 0x8000_0000_0000_0005);
         assert_eq!(via_u64(user_flags::NONE), 0x8000_0000_0000_0001);
+    }
+}
+
+#[cfg(test)]
+mod table_walk_characterization_tests {
+    //! Pins the pure AArch64 walk decisions — [`shatter_into`], [`demote_range`]
+    //! and [`resolve_user_leaf`] — so the safe-facade refactor of the free
+    //! `unsafe fn`s moves no behaviour. Host-runnable because the walkers are
+    //! arch-neutral code over [`akuma_pagetable::Table`] and the physmap is the
+    //! identity off-target: a leaked table's own address serves as its "physical"
+    //! frame number in the descriptors, and [`table_phys`] of it lands back here.
+
+    use super::*;
+    use akuma_pagetable::Table;
+
+    #[repr(align(4096))]
+    struct Aligned(Table);
+
+    fn table() -> &'static Table {
+        &Box::leak(Box::new(Aligned(Table::zeroed()))).0
+    }
+
+    fn addr_of(t: &Table) -> u64 {
+        core::ptr::from_ref(t) as u64
+    }
+
+    const TDESC: u64 = flags::VALID | flags::TABLE;
+
+    fn link(upper: &Table, idx: usize, lower: &Table) {
+        upper.set(idx, addr_of(lower) | TDESC);
+    }
+
+    fn va_of(l0: usize, l1: usize, l2: usize, l3: usize) -> usize {
+        (l0 << 39) | (l1 << 30) | (l2 << 21) | (l3 << 12)
+    }
+
+    const RW_PAGE: u64 = flags::AF | flags::UXN | flags::AP_RW_ALL;
+
+    fn chain_to_l3(l3: &Table) -> (&'static Table, &'static Table) {
+        let l0 = table();
+        let l1 = table();
+        let l2 = table();
+        link(l0, 0, l1);
+        link(l1, 0, l2);
+        link(l2, 0, l3);
+        (l0, l1)
+    }
+
+    // ── resolve_user_leaf ──────────────────────────────────────────────────
+
+    #[test]
+    fn full_chain_resolves_the_leaf_and_carries_the_offset() {
+        let l3 = table();
+        let (l0, _) = chain_to_l3(l3);
+        let page_pa: u64 = 0x1234_5000;
+        l3.set(7, page_pa | flags::VALID | RW_PAGE);
+        let va = va_of(0, 0, 0, 7) + 0xabc;
+        let leaf = resolve_user_leaf(l0, va).expect("mapped va must resolve");
+        assert_eq!(leaf.phys(va), 0x1234_5abc);
+        assert!(leaf.user_accessible());
+        assert!(leaf.user_writable());
+    }
+
+    #[test]
+    fn missing_middle_level_is_none() {
+        let l1 = table();
+        let l0 = table();
+        link(l0, 0, l1);
+        assert!(resolve_user_leaf(l0, va_of(0, 0, 0, 7)).is_none());
+    }
+
+    #[test]
+    fn invalid_leaf_entry_is_none() {
+        let l3 = table();
+        let (l0, _) = chain_to_l3(l3);
+        assert!(resolve_user_leaf(l0, va_of(0, 0, 0, 7)).is_none());
+    }
+
+    #[test]
+    fn two_mb_block_is_a_leaf_with_block_masks() {
+        let l2 = table();
+        let l1 = table();
+        let l0 = table();
+        link(l0, 0, l1);
+        link(l1, 0, l2);
+        let block_pa: u64 = 0x5000_0000;
+        l2.set(3, block_pa | flags::VALID | flags::AF | flags::AP_RW_ALL);
+        let va = (3 << 21) + 0x123_456;
+        let leaf = resolve_user_leaf(l0, va).expect("2MB block must resolve");
+        assert_eq!(leaf.phys(va), 0x5012_3456_usize);
+        assert!(leaf.user_writable());
+    }
+
+    #[test]
+    fn ap_bits_decide_accessibility_not_writability() {
+        let l3 = table();
+        let (l0, _) = chain_to_l3(l3);
+        let ro: u64 = flags::AF | flags::AP_RO_ALL;
+        l3.set(1, 0x2000 | flags::VALID | ro);
+        let leaf = resolve_user_leaf(l0, va_of(0, 0, 0, 1)).expect("RO page resolves");
+        assert!(leaf.user_accessible());
+        assert!(!leaf.user_writable());
+
+        let el1_only: u64 = flags::AF | flags::AP_RW_EL1;
+        l3.set(2, 0x3000 | flags::VALID | el1_only);
+        let leaf = resolve_user_leaf(l0, va_of(0, 0, 0, 2)).expect("EL1-only page resolves");
+        assert!(!leaf.user_accessible());
+        assert!(!leaf.user_writable());
+    }
+
+    // ── demote_range ───────────────────────────────────────────────────────
+
+    #[test]
+    fn demotes_rw_user_pages_and_counts_them() {
+        let l3 = table();
+        let (l0, _) = chain_to_l3(l3);
+        let page_a: u64 = 0x4000;
+        let page_b: u64 = 0x5000;
+        l3.set(3, page_a | flags::VALID | RW_PAGE);
+        l3.set(4, page_b | flags::VALID | RW_PAGE | flags::NG);
+        let base = va_of(0, 0, 0, 0);
+        assert_eq!(demote_range(l0, base + 3 * PAGE_SIZE, 2), 2);
+        for (idx, page) in [(3usize, page_a), (4, page_b)] {
+            let entry = l3.get(idx);
+            assert_eq!(entry & 0x0000_FFFF_FFFF_F000, page, "pa must not move");
+            assert_eq!(entry & (flags::AP_RO_ALL | flags::AP_RW_ALL), flags::AP_RO_ALL);
+            assert_eq!(entry & flags::AF, flags::AF, "attrs beside AP survive");
+            assert_eq!(entry & flags::NG, if idx == 4 { flags::NG } else { 0 });
+        }
+    }
+
+    #[test]
+    fn read_only_and_el1_only_pages_are_left_alone() {
+        let l3 = table();
+        let (l0, _) = chain_to_l3(l3);
+        let ro = 0x2000 | flags::VALID | flags::AF | flags::AP_RO_ALL;
+        let el1_rw = 0x3000 | flags::VALID | flags::AF | flags::AP_RW_EL1;
+        l3.set(1, ro);
+        l3.set(2, el1_rw);
+        let base = va_of(0, 0, 0, 0);
+        assert_eq!(demote_range(l0, base + PAGE_SIZE, 2), 0);
+        assert_eq!(l3.get(1), ro);
+        assert_eq!(l3.get(2), el1_rw);
+    }
+
+    #[test]
+    fn unmapped_tail_of_the_range_is_skipped() {
+        let l3 = table();
+        let (l0, _) = chain_to_l3(l3);
+        l3.set(0, 0x6000 | flags::VALID | RW_PAGE);
+        let base = va_of(0, 0, 0, 0);
+        assert_eq!(demote_range(l0, base, 5), 1);
+        assert_eq!(l3.get(0) & (flags::AP_RO_ALL | flags::AP_RW_ALL), flags::AP_RO_ALL);
+    }
+
+    #[test]
+    fn zero_pages_is_a_no_op() {
+        let l3 = table();
+        let (l0, _) = chain_to_l3(l3);
+        assert_eq!(demote_range(l0, va_of(0, 0, 0, 0), 0), 0);
+    }
+
+    // ── shatter_into ───────────────────────────────────────────────────────
+
+    #[test]
+    fn shatter_maps_every_4k_page_of_the_block_with_the_blocks_attrs() {
+        let l3 = table();
+        let block_pa: u64 = 0x5000_0000;
+        let block_entry = block_pa
+            | flags::VALID
+            | flags::BLOCK
+            | flags::AF
+            | flags::UXN
+            | flags::NG
+            | flags::SH_INNER
+            | attr_index(MAIR_NORMAL_WB);
+        shatter_into(l3, block_entry);
+        let attrs = block_entry & 0xFFF0_0000_0000_0FFC;
+        for i in [0usize, 1, 255, 511] {
+            let expected =
+                (block_pa + ((i as u64) << 12)) | attrs | flags::VALID | flags::TABLE;
+            assert_eq!(l3.get(i), expected, "page {i} of the block");
+        }
     }
 }

@@ -77,9 +77,8 @@ mod tests {
     #[test]
     fn allocate_all_then_none() {
         let mut alloc = AsidAllocator::new();
-        let mut asids = alloc::vec::Vec::new();
         for _ in 0..255 {
-            asids.push(alloc.alloc().unwrap());
+            assert!(alloc.alloc().is_some());
         }
         assert_eq!(alloc.alloc(), None);
     }
