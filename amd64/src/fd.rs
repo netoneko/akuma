@@ -2407,7 +2407,15 @@ type MapRow = (usize, usize, bool, bool, bool, bool);
 ///
 /// `None` means "no such process", which procfs turns into an absent file.
 pub fn pid_map_rows(pid: u32) -> Option<Vec<MapRow>> {
-    let regions = akuma_exec::process::with_process(pid, |p| {
+    // Walk the address space's **owner**, not `pid`. A `/proc/<tid>/maps` read
+    // for a `CLONE_VM` thread reaches the leader's page tables, but the thread's
+    // own `address_space` lock is a different lock from the leader's — so the
+    // leader's `execve` (which frees the old tables) or exit ran alongside the
+    // walk, and the walk followed a frame field out of a freed-and-reused table
+    // into an unmapped physmap address (`docs/archive/PROC_MAPS_WALK_FREED_TABLES.md`).
+    // The leader also holds the regions; a member's list is empty.
+    let (owner, l0) = akuma_exec::process::address_space_owner_of(pid)?;
+    let regions = akuma_exec::process::with_process(owner, |p| {
         p.mmap_regions
             .lock()
             .iter()
@@ -2434,9 +2442,16 @@ pub fn pid_map_rows(pid: u32) -> Option<Vec<MapRow>> {
     // second and a 2 MB read of the same file never returned at all.
     let mut extents: Vec<(usize, usize)> = rows.iter().map(|r| (r.0, r.1)).collect();
     extents.sort_unstable();
-    let leaves = akuma_exec::process::with_process(pid, |p| {
-        collect_leaf_runs(&p.address_space.lock(), &extents)
-    })?;
+    let leaves = akuma_exec::process::with_process(owner, |p| {
+        let uas = p.address_space.lock();
+        // `execve` swaps the space under this lock; if it did between the owner
+        // lookup and here, the tables `l0` named are freed. Report no such file
+        // rather than walk them.
+        if p.address_space.is_shared() || p.address_space.l0_phys() != l0 {
+            return None;
+        }
+        Some(collect_leaf_runs(&uas, &extents))
+    })??;
     rows.extend(leaves);
     rows.sort_unstable_by_key(|r| r.0);
     Some(rows)

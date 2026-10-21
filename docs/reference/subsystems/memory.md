@@ -399,6 +399,15 @@ with IRQs masked, so there is no verdict to print.
 5. **vfork fast-path** (`VFORK_FASTPATH_ENABLED`, `CLONE_VFORK|CLONE_VM`):
    `new_shared(parent_l0)` (no copy, no demote); `replace_image` drops shared
    view on exec → parent takes zero CoW faults.
+6. **A walk of someone else's page tables locks the address-space owner, not the
+   pid it was asked about.** A `CLONE_VM` member shares the leader's L0 but its own
+   `Process::address_space` lock is a different, fresh one, so locking the member
+   excludes the leader's `execve`/exit — which free the tables. Resolve with
+   `akuma_exec::process::address_space_owner_of(pid)`, lock the owner, and re-check
+   `l0_phys()` under the lock (`fd::pid_map_rows` is the pattern). The walker's
+   `KernelPhysMap` asserts every table frame is inside the physmap, so a stale
+   table panics naming the frame instead of faulting anonymously
+   (`archive/PROC_MAPS_WALK_FREED_TABLES.md`).
 
 ## Userspace memory model
 
@@ -795,6 +804,8 @@ memory exists and the collectors are starved — not that memory leaked. A high
 
 ## Background
 
+- `archive/PROC_MAPS_WALK_FREED_TABLES.md` — rule 6 of the user-memory model: walk the
+  address-space owner's tables, under the owner's lock.
 - `archive/MEMORY_LAYOUT.md` (partly superseded on heap sizing).
 - `archive/USERSPACE_MEMORY_MODEL.md`, `archive/COW_OPTIMIZATIONS.md`.
 - `archive/LOW_MEMORY_ENVIRONMENT.md` — the densest source; extreme hardening.

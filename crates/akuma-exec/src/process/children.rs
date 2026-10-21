@@ -1336,6 +1336,27 @@ fn owner_pid_for_l0_phys(l0_phys: usize) -> Option<Pid> {
     })
 }
 
+/// The process whose address space `pid` runs in, with the L0 that was resolved.
+///
+/// `pid` itself for an address-space owner; for a `CLONE_VM` member (a thread, a
+/// `vfork` child) the owner that holds the same L0. A member's own
+/// [`Process::address_space`] has the owner's root but a **fresh lock** (see the
+/// comment in `Process::new`), so taking it excludes nothing: the owner's `execve`
+/// or exit frees the tables under a different lock. A walk of the tables must be
+/// done on the owner, and must confirm under the owner's lock that the root is
+/// still the returned one — the second element is what to compare it with.
+///
+/// `None` if `pid` is gone, or is a member whose owner has already exited.
+pub fn address_space_owner_of(pid: Pid) -> Option<(Pid, usize)> {
+    let (l0, shared) = crate::process::table::with_process(pid, |p| {
+        (p.address_space.l0_phys(), p.address_space.is_shared())
+    })?;
+    if !shared {
+        return Some((pid, l0));
+    }
+    owner_pid_for_l0_phys(l0).map(|owner| (owner, l0))
+}
+
 /// Thread group leader PID for page-fault / CoW paths: all `CLONE_VM` threads in a group must
 /// share one [`Process::fault_mutex`] and resolve to the leader's [`Process::lazy_regions`]
 /// (see `clone_lazy_regions`,

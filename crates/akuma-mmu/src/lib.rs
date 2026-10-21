@@ -2817,6 +2817,15 @@ struct KernelPhysMap;
 #[cfg(target_arch = "x86_64")]
 impl akuma_pagetable::PhysMap for KernelPhysMap {
     fn table_addr(pa: u64) -> usize {
+        // `phys_to_virt` is a bare `pa + PHYSMAP_OFFSET`. A frame field read out
+        // of a table that something else is freeing is arbitrary data, and
+        // following it faulted ring 0 at an unmapped physmap address with
+        // nothing naming the table (`docs/archive/PROC_MAPS_WALK_FREED_TABLES.md`).
+        // Fail here instead, with the frame in the message.
+        assert!(
+            akuma_primitives::addr::physmap_contains(pa as usize),
+            "page-table walk followed frame {pa:#x}, outside the physmap"
+        );
         phys_to_virt(pa as usize) as usize
     }
 }

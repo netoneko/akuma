@@ -69,6 +69,33 @@ pub const PHYSMAP_OFFSET: usize = 0;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub const PHYSMAP_OFFSET: usize = 0xFFFF_8000_0000_0000;
 
+/// How much physical memory the amd64 physmap covers: the first 64 GiB.
+///
+/// The one value; `amd64/src/phys.rs` takes its `PHYSMAP_LIMIT` from here, and
+/// `boot.s` builds that many page directories from it. Unconditional (not
+/// `cfg`-gated like [`PHYSMAP_OFFSET`]) so [`physmap_contains`] can be tested on
+/// the host; it means nothing on AArch64, where the kernel map is the identity.
+pub const PHYSMAP_LIMIT: usize = 64 << 30;
+
+/// Does the physmap reach `paddr`?
+///
+/// Always true on AArch64. On amd64 it is `paddr < PHYSMAP_LIMIT`, and it is the
+/// check that stops a table walker following a garbage frame field into
+/// `PHYSMAP_OFFSET + paddr` — an unmapped address, so a ring-0 `#PF` with no
+/// hint of which table was bad. Walking a page table something else is freeing
+/// reads exactly such frames (`docs/archive/PROC_MAPS_WALK_FREED_TABLES.md`).
+#[inline(always)]
+#[must_use]
+pub const fn physmap_contains(paddr: usize) -> bool {
+    !cfg!(all(target_os = "none", target_arch = "x86_64")) || below_physmap_limit(paddr)
+}
+
+/// The amd64 arm of [`physmap_contains`], separate so the host can test it.
+#[inline(always)]
+const fn below_physmap_limit(paddr: usize) -> bool {
+    paddr < PHYSMAP_LIMIT
+}
+
 /// Base of the amd64 kernel's device (MMIO) window, PML4 slot 257.
 ///
 /// A second window rather than a range inside the physmap, because device
@@ -369,7 +396,22 @@ pub const DEV_WINDOW_NO_OVERLAP: () = {
 
 #[cfg(test)]
 mod tests {
-    use super::{phys_to_virt, virt_to_phys};
+    use super::{below_physmap_limit, phys_to_virt, physmap_contains, virt_to_phys, PHYSMAP_LIMIT};
+
+    #[test]
+    fn physmap_limit_is_64_gib_and_the_host_build_has_no_window() {
+        assert_eq!(PHYSMAP_LIMIT, 64 << 30);
+        // Host tests are never `target_os = "none"`, so `physmap_contains` gives
+        // the AArch64 answer: no limit.
+        assert!(physmap_contains(0));
+        assert!(physmap_contains(0x20_0a6d_5000));
+        // The amd64 arm: the last byte inside the window, the first outside, and
+        // the frame field that faulted ryzen on 2026-10-21 (129 GiB).
+        assert!(below_physmap_limit(0));
+        assert!(below_physmap_limit(PHYSMAP_LIMIT - 1));
+        assert!(!below_physmap_limit(PHYSMAP_LIMIT));
+        assert!(!below_physmap_limit(0x20_0a6d_5000));
+    }
 
     #[test]
     fn translation_is_the_identity() {

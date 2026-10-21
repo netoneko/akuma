@@ -76,7 +76,7 @@ pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
 /// walks the live page tables for the last page of this window on every boot,
 /// so a drift is a failed self-test rather than a `phys_to_virt` that returns a
 /// plausible pointer into nothing.
-pub const PHYSMAP_LIMIT: u64 = 64 << 30;
+pub const PHYSMAP_LIMIT: u64 = akuma_primitives::addr::PHYSMAP_LIMIT as u64;
 
 /// Page directories `boot.s` builds, one per GiB of [`PHYSMAP_LIMIT`].
 ///
