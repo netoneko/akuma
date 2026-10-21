@@ -2,7 +2,10 @@
 //!
 //! A CPUID probe that prints one `[KVM]` line on every boot, plus — behind the
 //! `kvmtest` cmdline flag, the `hdatest` precedent — a trivial guest: two
-//! `vmmcall`s and a `hlt` under nested paging. The data side (VMCB vocabulary,
+//! `vmmcall`s and a `hlt` under nested paging, and a **long-mode** guest: a
+//! paged 64-bit guest whose own page tables are walked *under* the nested
+//! ones — the two-level translation (guest VA → guest PA → host PA) the
+//! Linux rung stands on. The data side (VMCB vocabulary,
 //! §15.5.1 guest-state validation, NPT encodings) lives in
 //! `akuma-svm-amd64` and is host-tested; this module is only the wiring and
 //! the three `unsafe` sites the CPU actually requires (two MSR writes and the
@@ -71,8 +74,9 @@ fn dec(v: u64) {
 // Probe
 // ---------------------------------------------------------------------------
 
-/// Probe for SVM and, with `kvmtest` on the command line, run the trivial
-/// guest. Safe to call on any x86_64 part: the only MSR touched (`VM_CR`) is
+/// Probe for SVM and, with `kvmtest` on the command line, run the rehearsal
+/// guests (trivial, then long-mode). Safe to call on any x86_64 part: the
+/// only MSR touched (`VM_CR`) is
 /// read strictly after CPUID advertises SVM — an rdmsr of an unimplemented
 /// MSR `#GP`s.
 pub fn init(cmdline: &str) {
@@ -121,6 +125,7 @@ pub fn init(cmdline: &str) {
         }
         SVM_WANTED.store(true, Ordering::Release);
         trivial_guest(nrips);
+        longmode_guest(nrips);
     }
 }
 
@@ -468,6 +473,265 @@ fn trivial_guest(nrips: bool) {
     dec(msr_exits);
     p(", ioio=");
     dec(ioio_exits);
+    p(", rax=");
+    hx(final_v.rax(), 16);
+    p(")\n");
+    if !pass {
+        p("[KVM] why: ");
+        p(why);
+        p("\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The long-mode guest
+// ---------------------------------------------------------------------------
+
+/// The checkpoint-one magic, carried by the prologue's one `movabs`: a
+/// 32-bit decode of the same bytes loads only the low half (`mov eax, imm32`
+/// zeroes the high half), so matching the full 64 bits *is* the long-mode
+/// proof — plus the `rdmsr` round trip, checkpoint two.
+const LONGMODE_MAGIC: u64 = 0x1234_5678_9ABC_DEF0;
+
+/// `movabs rax, magic`, `vmmcall` (checkpoint one), `rdmsr(EFER)` —
+/// intercepted by the MSRPM read bit — `vmmcall` (checkpoint two: RAX =
+/// EFER[31:0]), `hlt`, spin. Same canary shape as the trivial guest: the
+/// trailing `jmp $` wedges the guest if it is ever reached.
+const LONGMODE_CODE: [u8; 26] = [
+    0x48, 0xB8, 0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12, // movabs rax, LONGMODE_MAGIC
+    0x0F, 0x01, 0xD9, // vmmcall — checkpoint one: RAX = the magic
+    0xB9, 0x80, 0x00, 0x00, 0xC0, // mov ecx, 0xC000_0080 (EFER)
+    0x0F, 0x32, // rdmsr — intercepted by the MSRPM read bit (exit 7Ch)
+    0x0F, 0x01, 0xD9, // vmmcall — checkpoint two: RAX = EFER[31:0]
+    0xF4, // hlt — the stop marker
+    0xEB, 0xFE, // jmp $
+];
+
+/// The long-mode rung: the trivial guest's rehearsal with the guest paged
+/// and 64-bit. The guest walks its own three-level identity table (the
+/// PTE encoding is the same x86-64 one `npt` names, so its builders make
+/// guest entries too) *under* the nested tables — proving the two-level
+/// translation, guest VA → guest PA → host PA, that the Linux rung stands
+/// on. Breadcrumbs 0x11–0x19 mirror the trivial guest's 1–9, so a reset
+/// names which guest died.
+fn longmode_guest(nrips: bool) {
+    crumb(0x11);
+    let Some(mut vmcb_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] long-mode: no frame for VMCB\n");
+        return;
+    };
+    let Some(mut npml4_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] long-mode: no frame for NPT PML4\n");
+        return;
+    };
+    let Some(mut npdpt_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] long-mode: no frame for NPT PDPT\n");
+        return;
+    };
+    let Some(mut npd_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] long-mode: no frame for NPT PD\n");
+        return;
+    };
+    let Some(mut gpml4_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] long-mode: no frame for guest PML4\n");
+        return;
+    };
+    let Some(mut gpdpt_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] long-mode: no frame for guest PDPT\n");
+        return;
+    };
+    let Some(mut gpd_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] long-mode: no frame for guest PD\n");
+        return;
+    };
+    let Some(mut code_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] long-mode: no frame for guest code\n");
+        return;
+    };
+
+    crumb(0x12);
+    let code_pa = code_f.pa() as u64;
+    code_f.bytes_mut()[..LONGMODE_CODE.len()].copy_from_slice(&LONGMODE_CODE);
+
+    let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
+    if msrpm_pa % 4096 != 0 || iopm_pa % 4096 != 0 {
+        p("[KVM] permission map base not 4-KiB aligned\n");
+        return;
+    }
+
+    // Nested paging, identity for every guest-physical address the run
+    // touches: the code *and* the three guest page-table pages, which the
+    // guest paging walk itself reads as guest-physical memory. Two of the
+    // four PAs can share a 2 MiB page; writing that entry twice is fine.
+    let npml4_pa = npml4_f.pa() as u64;
+    let npdpt_pa = npdpt_f.pa() as u64;
+    let npd_pa = npd_f.pa() as u64;
+    let gpml4_pa = gpml4_f.pa() as u64;
+    let gpdpt_pa = gpdpt_f.pa() as u64;
+    let gpd_pa = gpd_f.pa() as u64;
+    svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
+    svm::wr64(npdpt_f.bytes_mut(), 0, svm::npt::pointer(npd_pa));
+    for pa in [code_pa, gpml4_pa, gpdpt_pa, gpd_pa] {
+        let idx = ((pa >> 21) & 0x1FF) as usize;
+        svm::wr64(npd_f.bytes_mut(), idx * 8, svm::npt::leaf_2m(pa & !0x1F_FFFF));
+    }
+
+    // Guest paging, identity at every level: the indices come from
+    // `code_pa`, so guest VA == guest PA == host PA wherever the PMM put
+    // the frames.
+    svm::wr64(gpml4_f.bytes_mut(), ((code_pa >> 39) & 0x1FF) as usize * 8, svm::npt::pointer(gpdpt_pa));
+    svm::wr64(gpdpt_f.bytes_mut(), ((code_pa >> 30) & 0x1FF) as usize * 8, svm::npt::pointer(gpd_pa));
+    svm::wr64(gpd_f.bytes_mut(), ((code_pa >> 21) & 0x1FF) as usize * 8, svm::npt::leaf_2m(code_pa & !0x1F_FFFF));
+
+    // VMCB — the trivial guest's intercepts and maps; ASID 2, so this
+    // guest's translations cannot collide with the trivial guest's in the
+    // TLB the ASID tags.
+    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
+    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
+    {
+        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        v.set_intr0(
+            intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT,
+        );
+        v.set_intr1(intr1::VMRUN | intr1::VMMCALL);
+        v.set_excp(svm::excp::DB | svm::excp::UD | svm::excp::GP | svm::excp::PF);
+        v.set_iopm_base(iopm_pa);
+        v.set_msrpm_base(msrpm_pa);
+        v.set_asid(2);
+        v.set_tlb_control(ctrl::TLB_DO_NOTHING);
+        v.set_np_enable(true);
+        v.set_n_cr3(npml4_pa);
+        let flat = |attr: SegAttr| Seg { selector: 0, attr, limit: 0xFFFF_FFFF, base: 0 };
+        v.set_seg(
+            save::CS,
+            Seg { selector: 0x08, attr: SegAttr::CODE64_DPL0, limit: 0xFFFF_FFFF, base: 0 },
+        );
+        let data = flat(SegAttr::DATA32_RW_DPL0);
+        v.set_seg(save::ES, data);
+        v.set_seg(save::SS, data);
+        v.set_seg(save::DS, data);
+        // FS/GS carry the host bases — same reason as the trivial guest.
+        v.set_seg(
+            save::FS,
+            Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base: msr::read(Msr::FsBase) },
+        );
+        v.set_seg(
+            save::GS,
+            Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base: msr::read(Msr::GsBase) },
+        );
+        // 64-bit paged: exactly the state the crate's `long_mode_page` test
+        // helper pins as legal. Guest CR3 walks the identity table above;
+        // RIP is the guest VA it maps.
+        v.set_efer(svm::msr::EFER_SVME | svm::msr::EFER_LME | svm::msr::EFER_LMA);
+        v.set_cr0(svm::cr0::PE | svm::cr0::NE | svm::cr0::PG);
+        v.set_cr3(gpml4_pa);
+        v.set_cr4(svm::cr4::PAE);
+        v.set_rflags(0x2);
+        v.set_cpl(0);
+        v.set_rip(code_pa);
+        v.set_rsp(0);
+    }
+
+    crumb(0x13);
+    {
+        let v = Vmcb::new(vmcb_f.bytes_mut());
+        if let Err(e) = svm::validate_guest_state(&v) {
+            p("[KVM] long-mode guest state rejected: ");
+            p(e.name());
+            p("\n");
+            return;
+        }
+    }
+
+    crumb(0x14);
+    if !enable_on_core(0) {
+        p("[KVM] long-mode: no host save area for the BSP\n");
+        return;
+    }
+
+    crumb(0x15);
+    p("[KVM] running long-mode guest (nrips=");
+    p(if nrips { "yes" } else { "no" });
+    p(", code_pa=");
+    hx(code_pa, 16);
+    p(")\n");
+
+    // Same excursion shape as the trivial guest: IRQs masked for the whole
+    // run, RCX/RDX round-tripped through the loop (Table B-2).
+    akuma_cpu::daif::mask_irq();
+    let mut vmmcalls = 0u64;
+    let mut msr_exits = 0u64;
+    let (mut guest_rcx, mut guest_rdx) = (0u64, 0u64);
+    let (mut halted, mut why) = (false, "loop exhausted");
+    for _ in 0..8 {
+        crumb(0x17);
+        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx) };
+        guest_rcx = rcx_out;
+        guest_rdx = rdx_out;
+        crumb(0x18);
+        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        match ExitCode::from_u64(v.exitcode()) {
+            ExitCode::Msr => {
+                msr_exits += 1;
+                if guest_rcx != u64::from(svm::msr::EFER) {
+                    why = "unexpected MSR access";
+                    p("[KVM] long-mode unexpected MSR access: ");
+                    dump_exit(&v, guest_rcx, guest_rdx);
+                    break;
+                }
+                // RDMSR of the guest's EFER: value is EDX:EAX, same as the
+                // trivial guest's handler.
+                let efer = v.efer();
+                v.set_rax(efer & 0xFFFF_FFFF);
+                guest_rdx = efer >> 32;
+                v.set_rip(next_rip(&v, nrips, 2));
+            }
+            ExitCode::Vmmcall => {
+                vmmcalls += 1;
+                if vmmcalls == 1 && v.rax() != LONGMODE_MAGIC {
+                    why = "checkpoint one: RAX != magic (not a 64-bit decode of the prologue)";
+                    p("[KVM] ");
+                    p(why);
+                    p(": ");
+                    dump_exit(&v, guest_rcx, guest_rdx);
+                    break;
+                }
+                if vmmcalls == 2 && v.rax() != v.efer() & 0xFFFF_FFFF {
+                    why = "checkpoint two: RAX != EFER[31:0] after RDMSR";
+                    p("[KVM] ");
+                    p(why);
+                    p(": ");
+                    dump_exit(&v, guest_rcx, guest_rdx);
+                    break;
+                }
+                v.set_rip(next_rip(&v, nrips, 3));
+            }
+            ExitCode::Hlt => {
+                halted = true;
+                break;
+            }
+            _ => {
+                why = "unexpected exit";
+                p("[KVM] long-mode unexpected exit: ");
+                dump_exit(&v, guest_rcx, guest_rdx);
+                break;
+            }
+        }
+    }
+    akuma_cpu::daif::unmask_irq();
+    crumb(0x19);
+
+    let final_v = Vmcb::new(vmcb_f.bytes_mut());
+    let pass = halted
+        && vmmcalls == 2
+        && msr_exits == 1
+        && final_v.rax() == svm::msr::EFER_SVME | svm::msr::EFER_LME | svm::msr::EFER_LMA;
+    p("[KVM] long-mode guest: ");
+    p(if pass { "PASS" } else { "FAIL" });
+    p(" (vmmcalls=");
+    dec(vmmcalls);
+    p(", msr=");
+    dec(msr_exits);
     p(", rax=");
     hx(final_v.rax(), 16);
     p(")\n");

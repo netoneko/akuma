@@ -416,6 +416,11 @@ impl SegAttr {
     /// 32-bit read/write data, DPL 0, accessed: type `3`, S=1, P=1, G=1
     /// (the rung-0 guest's SS/DS/ES; same G=1/limit `0xFFFFF` pairing).
     pub const DATA32_RW_DPL0: Self = Self::from_fields(0x3, true, 0, true, false, false, false, true);
+    /// 64-bit code, DPL 0, accessed: type `B`, S=1, P=1, **L=1, D=0**.
+    /// With paging on the two together are the long-mode state §15.5.1
+    /// demands (`LongModeLAndD` rejects L and D set at once); limit and G
+    /// are ignored in 64-bit mode and left clear.
+    pub const CODE64_DPL0: Self = Self::from_fields(0xB, true, 0, true, false, true, false, false);
 }
 
 /// One decoded segment register from the save area.
@@ -1379,6 +1384,74 @@ mod tests {
         let mut page = rung0_page();
         Vmcb::new(&mut page).set_intr1(intr1::VMMCALL);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::VmrunNotIntercepted));
+    }
+
+    /// The long-mode shape: rung 0's flat state with long mode switched
+    /// on — guest paging up (`PG` + `PAE`), `LME` and `LMA` set, a 64-bit
+    /// CS. This is the state the paged guest rung loads and what
+    /// `LongModeLAndD` guards.
+    fn long_mode_page() -> [u8; VMCB_SIZE] {
+        let mut page = rung0_page();
+        let mut vmcb = Vmcb::new(&mut page);
+        vmcb.set_efer(msr::EFER_SVME | msr::EFER_LME | msr::EFER_LMA);
+        vmcb.set_cr0(cr0::PE | cr0::NE | cr0::PG);
+        vmcb.set_cr4(cr4::PAE);
+        vmcb.set_seg(
+            save::CS,
+            Seg { selector: 0x08, attr: SegAttr::CODE64_DPL0, limit: 0xFFFF_FFFF, base: 0 },
+        );
+        page
+    }
+
+    /// L=1 with D=0 is the whole long-mode segment attribute: type `B`,
+    /// S=1, P=1, raw word 0x29B (0xB + S + P + L).
+    #[test]
+    fn code64_attr_is_long_not_db() {
+        let a = SegAttr::CODE64_DPL0;
+        assert_eq!(a.ty(), 0xB);
+        assert!(a.is_code_data());
+        assert_eq!(a.dpl(), 0);
+        assert!(a.is_present());
+        assert!(a.is_long());
+        assert!(!a.is_db());
+        assert!(!a.is_4k_granular());
+        assert_eq!(a.0, 0x29B);
+    }
+
+    #[test]
+    fn long_mode_paged_guest_is_legal() {
+        let mut page = long_mode_page();
+        let vmcb = Vmcb::new(&mut page);
+        assert_eq!(validate_guest_state(&vmcb), Ok(()));
+    }
+
+    /// The long-mode state minus one ingredient must fail the one check the
+    /// missing ingredient belongs to — the exact failure a transposed bit
+    /// in a VMCB builder would take.
+    #[test]
+    fn long_mode_guest_loses_legality_one_ingredient_at_a_time() {
+        // No PAE -> LmePgWithoutPae.
+        let mut page = long_mode_page();
+        Vmcb::new(&mut page).set_cr4(0);
+        assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::LmePgWithoutPae));
+
+        // No PE -> LmePgWithoutPe.
+        let mut page = long_mode_page();
+        Vmcb::new(&mut page).set_cr0(cr0::NE | cr0::PG);
+        assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::LmePgWithoutPe));
+
+        // CS.L and CS.D together -> LongModeLAndD.
+        let mut page = long_mode_page();
+        Vmcb::new(&mut page).set_seg(
+            save::CS,
+            Seg {
+                selector: 0x08,
+                attr: SegAttr::from_fields(0xB, true, 0, true, false, true, true, false),
+                limit: 0xFFFF_FFFF,
+                base: 0,
+            },
+        );
+        assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::LongModeLAndD));
     }
 
     #[test]
