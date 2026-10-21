@@ -916,11 +916,13 @@ fn twolvl_guest(nrips: bool) {
 
     // Guest paging: three pointer entries and two 4-KiB leaves — the PT
     // level is real, and every entry holds a *guest-physical* address for
-    // the NPT to relocate. PML4[0] → PDPT, PDPT[1] → PD, PD[0] → PT,
+    // the NPT to relocate. PML4[0] → PDPT, PDPT[1] → PD, PD[128] → PT
+    // (CODE_VA = 1 GiB + 128 x 2 MiB, so its PD index is 128, not 0),
     // PT[0] → code GPA, PT[1] → data GPA.
     svm::wr64(gpml4_f.bytes_mut(), 0, svm::npt::pointer(gpt_gpa[1]));
     svm::wr64(gpdpt_f.bytes_mut(), 8, svm::npt::pointer(gpt_gpa[2]));
-    svm::wr64(gpd_f.bytes_mut(), 0, svm::npt::pointer(gpt_gpa[3]));
+    let pd_idx = ((TWOVL_CODE_VA >> 21) & 0x1FF) as usize;
+    svm::wr64(gpd_f.bytes_mut(), pd_idx * 8, svm::npt::pointer(gpt_gpa[3]));
     svm::wr64(gpt_f.bytes_mut(), 0, svm::npt::leaf_4k(code_gpa));
     svm::wr64(gpt_f.bytes_mut(), 8, svm::npt::leaf_4k(data_gpa));
 
