@@ -797,8 +797,10 @@ pub mod cr0 {
 
 /// CR4 bits the consistency checks name.
 pub mod cr4 {
-    /// PAE — physical address extension.
-    pub const PAE: u64 = 1 << 6;
+    /// PAE — physical address extension (bit 5). Bit 6 is `MCE`; the two
+    /// were transposed once and the consistency ladder caught the L0
+    /// rejecting the resulting `LME & PG & !PAE` state.
+    pub const PAE: u64 = 1 << 5;
 }
 
 /// A VMRUN consistency check that the guest state violates (§15.5.1).
@@ -1106,6 +1108,32 @@ mod tests {
         ] {
             assert_eq!(SAVE_AREA_BASE + rel, abs, "offset 0x{rel:03X} must land at 0x{abs:03X}");
         }
+    }
+
+    /// Numeric pins for the CR0/CR4/EFER bit vocabulary. The validator
+    /// reasons *through* these constants, so a symbolic test can never
+    /// catch a transposed bit — `cr4::PAE` rode at `1 << 6` (`MCE`) while
+    /// every test stayed green, and only the L0's `VMEXIT_INVALID` named
+    /// it. Pin the encodings against Vol 3 so the same slip fails `cargo
+    /// test` instead of a boot.
+    #[test]
+    fn bit_constants_are_vol3_encodings() {
+        // CR0 (Table 3-14-ish; the encodings are ancient and stable).
+        assert_eq!(cr0::PE, 1 << 0);
+        assert_eq!(cr0::NE, 1 << 5);
+        assert_eq!(cr0::NW, 1 << 29);
+        assert_eq!(cr0::CD, 1 << 30);
+        assert_eq!(cr0::PG, 1 << 31);
+        // CR4: PAE is bit 5; bit 6 is MCE — the transposition this pins.
+        assert_eq!(cr4::PAE, 0x20);
+        // EFER (MSR 0xC000_0080) bits, and the MSR addresses themselves.
+        assert_eq!(msr::EFER_LME, 1 << 8);
+        assert_eq!(msr::EFER_LMA, 1 << 10);
+        assert_eq!(msr::EFER_SVME, 1 << 12);
+        assert_eq!(msr::EFER, 0xC000_0080);
+        assert_eq!(msr::VM_CR, 0xC001_0114);
+        assert_eq!(msr::VM_CR_SVMDIS, 1 << 4);
+        assert_eq!(msr::VM_HSAVE_PA, 0xC001_0117);
     }
 
     #[test]

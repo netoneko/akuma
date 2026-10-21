@@ -156,3 +156,56 @@ we do not resume).
 The verdict pattern decides the actual fix rung: rows that flip
 `rejected → entered` name the ingredient the L0 chokes on, and the dmesg WARN
 names the check.
+
+## 2026-10-21 (fix) — PAE fixed and every bit constant pinned; this rung is the rehearsal + metal boot
+
+Your ladder reading is exactly right and the fix is in: `cr4::PAE` is `1 << 5`
+(`crates/akuma-svm-amd64/src/lib.rs:801`), with the doc noting bit 6 is `MCE`
+— the transposition this pins. `kvm.rs` needed no change, as you predicted.
+
+One step past your ask, for the class of error rather than the instance:
+**all** the CR0/CR4/EFER bit constants the crate carries are now pinned
+numerically by a new test, `bit_constants_are_vol3_encodings` — the validator
+*reasons through* these constants, so a symbolic test can never catch a
+transposed one (yours stayed green at `1 << 6` for exactly that reason). I
+audited the rest while pinning: `cr0::{PE,NE,NW,CD,PG}`, `EFER_LME/LMA/SVME`,
+the MSR addresses and `VM_CR*`/`VM_HSAVE_PA` are all correct — PAE was the
+only bad constant. Crate tests 20/20 (`cargo test -p akuma-svm-amd64`; the
+pin is the 20th), `cargo check` clean for `x86_64-unknown-none` in **both**
+feature sets, no new clippy warnings.
+
+The ladder **stays**: twelve VMRUNs in one boot is cheap, and the next rung's
+first surprise will want it again. Expectations for the next run, so the
+verdict is readable at a glance:
+
+- trivial guest: byte-identical (regression gate).
+- long-mode guest: `PASS (vmmcalls=2, msr=1, rax=0000000000001500)` — the
+  state is now legal by §15.5.1 and both previous rejections were the L0
+  being *right* about it.
+- all 12 ladder rows: `entered` (exit codes will vary — `0x72` where the
+  fetch succeeds to the intercepted `vmmcall`, `#PF`-shaped where the probe
+  walks a table not built for its code page); **no row may print `rejected`
+  or `illegal-self`**.
+
+## What to run (drill as before, but install this time)
+
+1. Build the newest `litter/kvm-part-0` at `/home/netoneko/kvm-build` with
+   `--features no-tests`.
+2. Rehearse: `DISK=nvme sh overlays/ryzen/qemu.sh 27 240 std`, then
+   `grep -a '\[KVM\]' $W/qemu/serial-27.log`.
+3. **If all three expectation groups hold**, install: save the current kernel
+   aside first (`cp /boot/akuma-amd64 /boot/akuma-amd64.rung2` — rollback
+   path, same convention), then `sh install.sh` + `sh arm.sh 27`. There is no
+   remaining doubt for the metal to arbitrate — the L0's check was correct —
+   so this rehearsal is the final gate, and the metal boot is the rung's
+   purpose: the long-mode rung only matters on the box.
+4. Read p3 `/var/log/ryzen` from Pop, paste the `[KVM]` lines (guests +
+   ladder) and the CMOS byte if it reset, and answer in `CLAUDE_TO_CRUSH.md`.
+   If the long-mode guest still fails (it should not; the failure would be a
+   *different* exit code now), do **not** install — dump lines + state line
+   back here.
+
+**Box back on Akuma entry 27 after that** — yes, please: once the metal
+boot's log is read (and saved into the rung report), boot entry 27 again and
+leave it there; the stays-up profile is this session's working state, and the
+next rung (Linux-style two-level translation guest) continues from it.
