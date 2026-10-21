@@ -9,8 +9,8 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1442
-- **Docs contributing at least one fix:** 397
+- **Total distinct fixes counted:** 1444
+- **Docs contributing at least one fix:** 398
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
@@ -27,10 +27,10 @@ from several subsystems under one write-up.
 | VFS & Filesystem | 134 | 9.3% | 40 |
 | Boot & Drivers | 129 | 8.9% | 20 |
 | Signals & Exceptions | 40 | 2.8% | 15 |
-| Misc / Cross-cutting | 48 | 3.3% | 16 |
+| Misc / Cross-cutting | 50 | 3.5% | 17 |
 | Console & Terminal | 58 | 4.0% | 18 |
 | Containers | 55 | 3.8% | 10 |
-| **Total** | **1442** | **100.0%** | **397** |
+| **Total** | **1444** | **100.0%** | **398** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -2050,7 +2050,12 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_METAL_CONTROL_RUN_2026_10_18.md
 - Emulating a trapped `MRS` with `rt == 31` on AArch64 wrote word 31 of the trap frame (`sp_el0`) instead of discarding the result as `XZR`, as the read side already did
 
-## Misc / Cross-cutting (48 fixes, 16 docs)
+## Misc / Cross-cutting (50 fixes, 17 docs)
+
+### docs/archive/AKUMA_KVM.md
+(The SVM rungs — trivial guest, permission maps + AP hook, the 12-probe consistency ladder, the long-mode metal PASS, the two-level translation rung — are capability, not fixes; the ladder is an instrument, not a defect. These are the two defects the rungs surfaced.)
+- `#VMEXIT` leaves GIF clear, and the seed's exit path never re-enabled it: after the trivial guest's PASS the host got no interrupts, the timer went silent and the watchdog reset the metal ~1 min later — a PASS that killed the box. `stgi` now runs in the same `asm!` block as `vmrun` (`f9f04d0e`)
+- `cr4::PAE` was `1 << 6` — bit 6 is `MCE`, PAE is bit 5 — so a long-mode guest (CR0.PG, EFER.LME/LMA set) failed §15.5.1's `LME & PG & !PAE` consistency check and VMRUN returned VMEXIT_INVALID on both QEMU/KVM and the metal; the crate's own validator had passed the state because it tested the same wrong constant, and the unit tests could not see a transposed literal because they used the symbolic name. Fixed to `1 << 5` (`bbaa81d1`), and every CR0/CR4/EFER bit constant the crate carries is now pinned numerically by `bit_constants_are_vol3_encodings` — the validator *reasons through* these constants, so a symbolic test can never catch this class of error
 
 ### docs/archive/AKUMA_ENTRY_EXTRACTION.md
 (The `akuma-entry` split itself is a refactor and is not counted; these are the two defects it surfaced. The `with_boot_identity_fdt` change — mapping and range-checking the DTB pointer instead of vouching for it by comment — is a hardening with no observed failure, and is not counted either.)
@@ -2369,3 +2374,5 @@ userspace: apk-tools/BUILD_NOTES, apk-tools/PIE_LOADER, box/OCI_IMAGE_PULL, box/
 Also scanned 2026-10-08 (the ryzen laptop, wifi and Chromium work, 4 archive docs added and 1 edited). AKUMA_ACPI_POWER carries no counted fix: it adds `/proc/power` and the DSDT lookup as new capability, and its battery decode is unread on the laptop. Not counted, open by their own text: `init=` following no symlinks, the still-missing x86_64 syscalls (`sendfile`, `get_mempolicy`, `rt_tgsigqueueinfo`, `landlock_create_ruleset`, `inotify_init`), the cross-core `now_us()` underflow in the station daemon, and the symlink dirent file type written wrongly by `apk`. (Chromium's whole-image `execve`, the crashpad `posix_spawn` `ENOENT` and `int3` arriving as SIGSEGV were open when first scanned and are counted above as Fixes 8, 12 and 9 of AKUMA_AMD64_CHROMIUM_KERNEL_WORK, added 2026-10-08.) The 16-core wedge listed in AKUMA_AMD64_ON_RYZEN_LAPTOP is counted once, under AKUMA_AMD64_SMP_WIDTH, which documents the fix. The whole-file-heap section folded into AKUMA_AMD64_CHROMIUM_KERNEL_WORK only restates fixes already counted (the `fd.rs` whole-file cache, the OOM handler's BKL release, the `Slab:` witness); its `execve` whole-image read is Fix 8, counted above.
 
 Also scanned 2026-10-16 (closing `ugh`, 55 commits ahead of main, 17 archive docs added or edited). Counted above: AKUMA_GENTOO, AKUMA_GENTOO_PORTAGE_CRASH, AKUMA_PROC_ENUMERATION_HANG, HARD_LINKS, UNIX_PERMISSIONS, BOX_BUILD, NETWORKING_AUDIT and AKUMA_AMD64_TOUCHPAD_I2C_HID, plus one new bullet each for AKUMA_AMD64_BOXES_AUDIT and AKUMA_SELF_HOSTING_AMD64. Still uncounted: AMD64_SPAWN_EXT_WORKDIR_CRASH and HERD_DUPLICATE_SERVICE_PROCESSES, listed open above, were re-run on the ryzen metal on 2026-10-14 and no longer reproduce; each attributes the cure to a fix counted elsewhere (AKUMA_AMD64_BOXES_AUDIT's `spawn_ext` faults; AKUMA_AMD64_BARE_METAL_SELFHOST §6 item 6) and says so is inferred, not proven. AKUMA_ACPI_POWER gained the energy ledger and the idle wake budget, which are capability, not fixes. The 2026-10-14 corrections in AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS, AKUMA_AMD64_BARE_METAL_SELFHOST and AKUMA_AMD64_LAPIC_ONESHOT_STALE point at fixes already counted in those subsections and add none.
+
+Also scanned 2026-10-21 (the `kvm-part-0` branch — the SVM hypervisor rungs on the ryzen metal, rung 0 through the two-level translation rung). Counted above: AKUMA_KVM, two fixes (the GIF-left-clear watchdog reset `f9f04d0e` cured with `stgi`; the `cr4::PAE` transposition, `1<<6` for `1<<5`, found by the ladder's `cr4=0x40` tell and fixed in `bbaa81d1`). The branch's other archive docs carry no counted fix: AKUMA_KVMTEST_METAL_DMESG_2026_10_21 and AMD64_KVMTEST_RUNG3_LONGMODE_METAL_DMESG_2026_10_21 are boot logs, AMD64_KVM_REBOOT_NOTE_2026_10_20 is the reboot plan behind the GIF fix above, and AKUMA_FDTABLE_EXTRACTION plus AKUMA_MMU_SAFE_FACADE (`06accb83`, `eee578df`) are behaviour-preserving extractions with host tests, the same no-defect shape as the 2026-09-13 port records. The handoff pair (CRUSH_TO_CLAUDE / CLAUDE_TO_CRUSH) and the rung-4 NPT transcription (constants pinned by test, no defect) are records, not fixes.

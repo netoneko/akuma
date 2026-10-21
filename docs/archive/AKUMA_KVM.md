@@ -85,7 +85,34 @@ Read downwards; the sections below are the reference record.
    ▼   SVM on the APs: the BSP reserves all 16 host save areas up front
    │   and leaks them (no allocation during AP bring-up); every AP
    │   enables through `kvm::ap_hook` in `ap_entry64`.
-   ▼   (next: the Linux rung — long-mode guest state first)
+ [10-21] ═══ RUNG 3: LONG-MODE GUEST, REACHED THROUGH THE LADDER ═══ "PAE=1<<6"
+   │
+   ▼   The long-mode guest met VMEXIT_INVALID from both QEMU/KVM and the
+   │   metal. A 12-probe consistency ladder (one VMRUN per ingredient set,
+   │   unique ASID per row) bisected it; cr4=0x40 was the tell: `cr4::PAE`
+   │   was `1<<6`, which is MCE — PAE is `1<<5`, and §15.5.1 refuses
+   │   LME & PG & !PAE. Fixed (`bbaa81d1`) and every CR0/CR4/EFER bit
+   │   constant pinned numerically: the validator *reasons through* the
+   │   constants, so the symbolic tests stayed green at the wrong value.
+   ▼   The long-mode guest then PASSED on the metal (kernel b6b8c8d2…,
+   │   installed, rollback /boot/akuma-amd64.rung2): trivial + long-mode
+   │   PASS, all 12 ladder rows entered, row-for-row identical to the
+   │   QEMU rehearsal. Metal Fn8000_000A reads asids=32768 (16 under QEMU).
+   ▼
+ [10-21] ═══ RUNG 4: TWO-LEVEL TRANSLATION ═══  "written; rehearsal pending"
+   │
+   ▼   First guest with non-identity translation at BOTH levels: the guest
+   │   walks its own long-mode page tables (gVA 0x5000_0000/0x5000_1000 →
+   │   gPAs in the 0x4000_0000 band), and NPT maps those gPAs to the real
+   │   hPAs. A PMM frame is not 2 MiB aligned, so each leaf's gPA is
+   │   REGION | (hpa & 0x1F_FFFF) — computed at runtime, which translates
+   │   back to exactly the frame; the banner prints gva= gpa= hpa=. Two
+   │   vmmcalls — one after loading the exec magic, one after reading the
+   │   data page through its gVA — prove fetch and data both survive both
+   │   translations. The NPT leaf bit table (Vol 2 §5.3 Figs 519–529) and
+   │   the NPF error-code bits (§15.25.6 p. 573) are transcribed and
+   │   pinned for exactly this rung's failure mode (ASID 14; ladder 1–13).
+   ▼   (next: QEMU rehearsal + metal, then the Linux rung)
 ```
 
 ---
@@ -296,6 +323,11 @@ device-map work in `crates/akuma-firecracker` and
 `docs/reference/firecracker/memory-map.md` becomes the guest-side spec);
 3 — akuma as its own guest.
 
+As flown the rungs renumbered: 0 trivial, 2 permission maps + AP hook,
+3 long-mode guest (the consistency ladder was its diagnostic detour),
+4 two-level translation guest (timeline below); the Linux rung is next,
+and the original "3 — akuma as its own guest" stands behind it.
+
 **Rung 0 design (decided, not yet built):**
 
 - Crate `akuma-svm-amd64` (naming: `akuma-<thing>-<arch>`),
@@ -332,9 +364,15 @@ device-map work in `crates/akuma-firecracker` and
 
 - APM Vol 3 (24594) §3.3: exact `Fn8000_000A.EDX` bit numbers — **done
   2026-10-20**, extracted from the downloaded rev 3.38 PDF (Appendix E.4.9,
-  pp. 661–662), table in §2.6 above. Still open: the NPT leaf PTE bit
-  table (§"Nested Table Walk", next bullet).
-- NPT leaf PTE bit table (Vol 2 §"Nested Table Walk", ~p. 571).
+  pp. 661–662), table in §2.6 above.
+- NPT leaf PTE bit table — **done 2026-10-21**: transcribed from Vol 2
+  §5.3 (Figures 519–529, the 4-KiB leaf encoding) plus the
+  §15.25.5/§15.25.7 accessed/dirty semantics into `crates/akuma-svm-amd64`:
+  the `npt` constants + `leaf_4k()` builder, and a new `npf` module for
+  the NPF `EXITINFO1` error-code bits (§15.25.6, p. 573) — bits 32
+  (FINAL) vs 33 (GPT_WALK) name the failing level directly, which is the
+  rung-4 diagnostic. Pinned numerically by
+  `npt_bits_are_vol2_fig519_529` / `npf_error_bits_are_vol2_p573`.
 - `LASTEXCPTO` offset verification; `401h` AVIC_NOACCEL.
 - IOIO `EXITINFO1` bit decode (§15.10.2, not in the extract) and
   `VMEXIT_MSR` `EXITINFO1`/`EXITINFO2` layout — not yet transcribed; the

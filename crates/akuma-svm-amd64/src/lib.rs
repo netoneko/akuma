@@ -913,11 +913,22 @@ impl Illicit {
 
 /// Nested page-table entry encodings.
 ///
-/// **Subset pending verification:** the exact NPT leaf bit table (A/D
-/// semantics, PKS) is not yet transcribed from Vol 2 §"Nested Table Walk";
-/// what §15.5.x and the NP text pin is Present / R / W / `PS` / the physical
-/// address field, and that A/D are hardware-set. Re-verify before the Linux
-/// rung before adding bits.
+/// The NPT walk uses the long-mode page-table format against `N_CR3`
+/// (§15.25.3: the extra translation "uses the same paging mode as the VMM";
+/// §15.25.5). Transcribed from Vol 2 §5.3, Figures 519–529:
+///
+/// - 4-KiB PTE leaf: `P`(0) `RW`(1) `US`(2) `PWT`(3) `PCD`(4) `A`(5) `D`(6)
+///   `PAT`(7) `G`(8) AVL(11:9) base[51:12] `NX`(63);
+/// - 2-MiB PDE leaf: the same, `PS`(7)=1 and PAT(12), base[51:21];
+/// - interior entries: `PS`=0, `D` and `G` MBZ; `NX` is honored at every
+///   level when the host's own `EFER.NXE` is set (§5.6.3, §15.25.7).
+///
+/// The NPT-specific rules the builders bake in (§15.25.5, §15.25.7): a
+/// guest-page-table walk is a **user write** at this level, so a page the
+/// guest's walker must touch needs U|W or it NPFs; A/D are hardware-set in
+/// the entries the walks touch, so builders never set them; guest
+/// writability and executability are the AND of the two levels, and `G`
+/// (like `CR0.WP`) is guest-only — the nested `G` is ignored.
 pub mod npt {
     /// Present.
     pub const P: u64 = 1 << 0;
@@ -925,8 +936,22 @@ pub mod npt {
     pub const RW: u64 = 1 << 1;
     /// User.
     pub const US: u64 = 1 << 2;
-    /// Page size — a 2 MiB leaf at the PD level.
+    /// Page-level write-through.
+    pub const PWT: u64 = 1 << 3;
+    /// Page-level cache disable.
+    pub const PCD: u64 = 1 << 4;
+    /// Accessed — hardware-set by the walk, never set by a builder.
+    pub const A: u64 = 1 << 5;
+    /// Dirty — hardware-set; MBZ in an interior entry.
+    pub const D: u64 = 1 << 6;
+    /// Page size — a 2 MiB leaf at the PD level; MBZ in an interior entry.
     pub const PS: u64 = 1 << 7;
+    /// Global — guest-only under nested paging (§15.25.7); ignored here.
+    pub const G: u64 = 1 << 8;
+    /// PAT — the memory-type index bit at a 4-KiB leaf (Figure 523).
+    pub const PAT: u64 = 1 << 12;
+    /// No-execute — honored when the host's `EFER.NXE` is set (§15.25.7).
+    pub const NX: u64 = 1 << 63;
     /// Physical address field of an NPT entry: bits 51:12.
     pub const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -942,6 +967,35 @@ pub mod npt {
     pub const fn leaf_2m(pa: u64) -> u64 {
         (pa & ADDR_MASK) | P | RW | US | PS
     }
+    /// A 4 KiB leaf mapping `pa` (which must be 4 KiB aligned).
+    #[must_use]
+    pub const fn leaf_4k(pa: u64) -> u64 {
+        (pa & ADDR_MASK) | P | RW | US
+    }
+}
+
+/// The `#VMEXIT(NPF)` `EXITINFO1` error code (§15.25.6, the page-573 field
+/// list): a #PF-shaped code, plus the walk-order and shadow-stack bits the
+/// NPF form adds above bit 31.
+pub mod npf {
+    /// The nested page was not present.
+    pub const P: u64 = 1 << 0;
+    /// The nested-level access was a write (guest-table walks always are).
+    pub const RW: u64 = 1 << 1;
+    /// The nested-level access was a user access (MMU walks always are).
+    pub const US: u64 = 1 << 2;
+    /// Reserved bits were set in the nested entry.
+    pub const RSV: u64 = 1 << 3;
+    /// The access was a code read (a guest-table walk never reports this).
+    pub const ID: u64 = 1 << 4;
+    /// The fault was a shadow-stack access.
+    pub const SS: u64 = 1 << 6;
+    /// The fault happened on the final guest-physical → system-physical walk.
+    pub const FINAL: u64 = 1 << 32;
+    /// The fault happened on a walk of the guest's page-table pages.
+    pub const GPT_WALK: u64 = 1 << 33;
+    /// The leaf named a supervisor shadow-stack page with the check enabled.
+    pub const SHADOW_STACK: u64 = 1 << 37;
 }
 
 /// The MSR permissions map (§15.11).
@@ -1487,7 +1541,48 @@ mod tests {
         assert_eq!(npt::pointer(0x1234_5000), 0x1234_5000 | 0b111);
         assert_eq!(npt::leaf_2m(0x200_0000), 0x200_0000 | npt::P | npt::RW | npt::US | npt::PS);
         assert_eq!(npt::leaf_2m(0x200_0000) & npt::PS != 0, true);
+        // The 4-KiB leaf carries no PS: bit 7 belongs to the 2-MiB PDE form.
+        assert_eq!(npt::leaf_4k(0x1234_5000), 0x1234_5000 | 0b111);
+        assert_eq!(npt::leaf_4k(0x1234_5000) & npt::PS, 0);
         assert_eq!(0x1234_5000 & npt::ADDR_MASK, 0x1234_5000);
+        assert_eq!(npt::ADDR_MASK & 0xFFF, 0);
+    }
+
+    /// Numeric pins for the NPT bit vocabulary. The builders *are* these
+    /// constants, so a symbolic test stays green through a transposition —
+    /// the class of error `cr4::PAE` rode on. Figures 519–529 (Vol 2 §5.3)
+    /// pin the positions; §15.25.5/§15.25.7 pin the semantics recorded in
+    /// the module doc.
+    #[test]
+    fn npt_bits_are_vol2_fig519_529() {
+        assert_eq!(npt::P, 1 << 0);
+        assert_eq!(npt::RW, 1 << 1);
+        assert_eq!(npt::US, 1 << 2);
+        assert_eq!(npt::PWT, 1 << 3);
+        assert_eq!(npt::PCD, 1 << 4);
+        assert_eq!(npt::A, 1 << 5);
+        assert_eq!(npt::D, 1 << 6);
+        assert_eq!(npt::PS, 1 << 7);
+        assert_eq!(npt::G, 1 << 8);
+        assert_eq!(npt::PAT, 1 << 12);
+        assert_eq!(npt::NX, 1 << 63);
+        assert_eq!(npt::ADDR_MASK, 0x000F_FFFF_FFFF_F000);
+    }
+
+    /// The NPF error code (§15.25.6, p. 573): #PF-shaped low bits, the
+    /// walk-order bits at 32/33, the shadow-stack bit at 37. Bit 5 stays
+    /// reserved — a constant pinned at 1 << 5 would be the PAE slip again.
+    #[test]
+    fn npf_error_bits_are_vol2_p573() {
+        assert_eq!(npf::P, 1 << 0);
+        assert_eq!(npf::RW, 1 << 1);
+        assert_eq!(npf::US, 1 << 2);
+        assert_eq!(npf::RSV, 1 << 3);
+        assert_eq!(npf::ID, 1 << 4);
+        assert_eq!(npf::SS, 1 << 6);
+        assert_eq!(npf::FINAL, 1 << 32);
+        assert_eq!(npf::GPT_WALK, 1 << 33);
+        assert_eq!(npf::SHADOW_STACK, 1 << 37);
     }
 
     #[test]

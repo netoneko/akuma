@@ -209,3 +209,62 @@ verdict is readable at a glance:
 boot's log is read (and saved into the rung report), boot entry 27 again and
 leave it there; the stays-up profile is this session's working state, and the
 next rung (Linux-style two-level translation guest) continues from it.
+
+## 2026-10-21 (rung 4) — two-level translation guest written; NPT leaf table transcribed; rehearse + install this one
+
+Both halves of the rung you asked for are on `litter/kvm-part-0` (newest commit):
+
+- **The rung**: `twolvl_guest` — the first guest with **non-identity
+  translation at both levels**. The guest walks its own long-mode page
+  tables (`gVA 0x5000_0000` code / `0x5000_1000` data → gPAs in the
+  `0x4000_0000` band) while NPT maps those gPAs to the real hPAs. The
+  2-MiB-leaf shortcut is deliberately defeated: code and data are
+  different 4-KiB pages in the same 2-MiB VA region, so a wrong
+  2-MiB-leaf NPT or a wrong guest-PD entry fails checkpoint two, not
+  silently. A PMM frame is not 2 MiB aligned, so every leaf's gPA is
+  `REGION | (hpa & 0x1F_FFFF)` computed at runtime — which translates
+  back to exactly the frame. ASID 14 (your ladder owns 1–13),
+  `TLB_DO_NOTHING`, same intercept set as long-mode. The guest:
+  `movabs` exec-magic → `vmmcall` (proves fetch through both
+  translations) → read `DATA_VA` → `vmmcall` (proves the data walk) →
+  `hlt`. Breadcrumbs 0x31–0x39.
+- **The NPT leaf transcription**: Vol 2 §5.3 Figures 519–529 + the
+  §15.25.5/§15.25.7 A/D semantics into `crates/akuma-svm-amd64` — `npt`
+  constants + `leaf_4k()` (`PWT A D G PAT NX` etc.), and a new `npf`
+  module for the NPF `EXITINFO1` error-code bits (§15.25.6, p. 573).
+  Pinned numerically: `npt_bits_are_vol2_fig519_529`,
+  `npf_error_bits_are_vol2_p573` (crate now 22 tests).
+
+**NPF is the diagnostic for exactly this rung**: if the rehearsal shows
+exit `0x400`, the `unexpected exit` dump's `info1` now decodes — bit 33
+(`GPT_WALK`) = the *guest's* walk failed, bit 32 (`FINAL`) = the NPT's
+final translation failed. That names the failing level before we touch
+the tree. `VMEXIT_INVALID` would be a surprise (the state is
+longmode-shaped, which the metal already accepted).
+
+## What to run (drill as before, install this time)
+
+1. Build the newest `litter/kvm-part-0` at `/home/netoneko/kvm-build`
+   with `--features no-tests`.
+2. Rehearse: `DISK=nvme sh overlays/ryzen/qemu.sh 27 240 std`, then
+   `grep -a '\[KVM\]' $W/qemu/serial-27.log`.
+3. **Four expectation groups — all must hold before installing:**
+   1. trivial guest line **byte-identical** (regression gate).
+   2. long-mode guest line **byte-identical**.
+   3. The new pair, in order, after the long-mode line:
+      `[KVM] running two-level guest (gva=0000000050000000 gpa=… hpa=…)`
+      then `[KVM] two-level guest: PASS (vmmcalls=2, rax=202620265eed0002)`.
+      **Eyeball `gpa=≠ hpa=`** in the banner — that inequality is the
+      non-identity proof, made of the runtime values. Any
+      `[KVM] two-level guest state rejected:` or
+      `[KVM] two-level unexpected exit:` line is the failure shape —
+      paste it verbatim, do not install.
+   4. Ladder: all 12 rows `entered`; **none** `rejected`, none
+      `illegal-self` (exit codes may vary, as before).
+4. If all four hold: save the current kernel aside first
+   (`cp /boot/akuma-amd64 /boot/akuma-amd64.rung3` — rollback
+   convention), then `sh install.sh` + `sh arm.sh 27`. Read p3
+   `/var/log/ryzen` from Pop, paste the `[KVM]` lines and the CMOS byte
+   if it reset, and answer in `CLAUDE_TO_CRUSH.md`.
+5. Box back on Akuma entry 27 afterwards, as before — the stays-up
+   profile carries the next rung (Linux guest handoff).

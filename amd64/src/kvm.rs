@@ -2,10 +2,12 @@
 //!
 //! A CPUID probe that prints one `[KVM]` line on every boot, plus — behind the
 //! `kvmtest` cmdline flag, the `hdatest` precedent — a trivial guest: two
-//! `vmmcall`s and a `hlt` under nested paging, and a **long-mode** guest: a
+//! `vmmcall`s and a `hlt` under nested paging, a **long-mode** guest: a
 //! paged 64-bit guest whose own page tables are walked *under* the nested
-//! ones — the two-level translation (guest VA → guest PA → host PA) the
-//! Linux rung stands on. The data side (VMCB vocabulary,
+//! ones, and a **two-level** guest: both translations non-identity — the
+//! guest page tables map a synthetic VA to a synthetic guest-PA the NPT
+//! then relocates onto wherever the PMM put a frame — the shape a real
+//! loader stands on. The data side (VMCB vocabulary,
 //! §15.5.1 guest-state validation, NPT encodings) lives in
 //! `akuma-svm-amd64` and is host-tested; this module is only the wiring and
 //! the three `unsafe` sites the CPU actually requires (two MSR writes and the
@@ -126,6 +128,7 @@ pub fn init(cmdline: &str) {
         SVM_WANTED.store(true, Ordering::Release);
         trivial_guest(nrips);
         longmode_guest(nrips);
+        twolvl_guest(nrips);
         consistency_ladder();
     }
 }
@@ -735,6 +738,320 @@ fn longmode_guest(nrips: bool) {
     dec(vmmcalls);
     p(", msr=");
     dec(msr_exits);
+    p(", rax=");
+    hx(final_v.rax(), 16);
+    p(")\n");
+    if !pass {
+        p("[KVM] why: ");
+        p(why);
+        p("\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two-level rung: both translations non-identity
+// ---------------------------------------------------------------------------
+
+/// The checkpoint-one magic — the prologue's `movabs` again, decoded only
+/// correctly in 64-bit mode.
+const TWOVL_EXEC_MAGIC: u64 = 0x2026_1026_2026_1001;
+/// The word at the data VA; its landing in RAX is the second translation
+/// doing its job (a different VA → a different guest page → a different
+/// host frame than the code's).
+const TWOVL_DATA_MAGIC: u64 = 0x2026_2026_5EED_0002;
+
+/// Guest-physical layout, synthetic and deliberately **not** where the PMM
+/// puts anything: every page lives in its own 2-MiB NPT region of the 1–2
+/// GiB band, and each NPT leaf points at a host window the region base is
+/// nothing like — the NPT is non-identity by construction, not by hope.
+/// A PMM frame is not 2-MiB aligned, so the leaf maps the frame's aligned
+/// window and the page's guest PA carries the frame's own offset inside
+/// that window (runtime, not a constant): guest PA = region | frame &
+/// 0x1F_FFFF then translates to exactly `frame_pa`, the bytes' home.
+const TWOVL_CODE_REGION: u64 = 0x4000_0000;
+const TWOVL_DATA_REGION: u64 = 0x4020_0000;
+/// The guest page-table pages: PML4, PDPT, PD, PT — each NPT-mapped in its
+/// own region, because the guest walker reads them as guest-physical memory
+/// (§15.25.5) and four separate frames are not physically contiguous.
+const TWOVL_GPT_REGION: [u64; 4] = [0x4040_0000, 0x4060_0000, 0x4080_0000, 0x40A0_0000];
+
+/// Guest-virtual layout, in a third region entirely: the code and the data
+/// share a 2-MiB region but sit in **different 4-KiB pages** — if the PT
+/// level were skipped (a 2-MiB leaf where the rung builds a 4-KiB one), the
+/// data read would land in the code page and checkpoint two fails.
+const TWOVL_CODE_VA: u64 = 0x5000_0000;
+const TWOVL_DATA_VA: u64 = 0x5000_1000;
+
+/// `movabs r64, imm64` (`48 B8+rd`), the immediate little-endian — built
+/// from the layout constants, so the bytes cannot drift from the VAs and
+/// magics they encode.
+const fn movabs(reg: u8, imm: u64) -> [u8; 10] {
+    let b = imm.to_le_bytes();
+    [0x48, 0xB8 + reg, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]
+}
+
+/// `movabs rax, EXEC_MAGIC`, `vmmcall` (checkpoint one: the fetch and the
+/// decode came through gVA → gPA → hPA), `movabs rsi, DATA_VA`,
+/// `mov rax, [rsi]` — a *data* walk through the second mapping —
+/// `vmmcall` (checkpoint two: RAX = the data word), `hlt`, spin. Same
+/// wedge-canary tail as every rehearsal guest.
+const TWOVL_CODE: [u8; 32] = {
+    let mut c = [0u8; 32];
+    let mut i = 0;
+    while i < 10 {
+        c[i] = movabs(0, TWOVL_EXEC_MAGIC)[i];
+        i += 1;
+    }
+    c[10] = 0x0F;
+    c[11] = 0x01;
+    c[12] = 0xD9; // vmmcall — checkpoint one
+    i = 0;
+    while i < 10 {
+        c[13 + i] = movabs(6, TWOVL_DATA_VA)[i]; // B8+r6 = rsi
+        i += 1;
+    }
+    c[23] = 0x48;
+    c[24] = 0x8B;
+    c[25] = 0x06; // mov rax, [rsi] — the data walk
+    c[26] = 0x0F;
+    c[27] = 0x01;
+    c[28] = 0xD9; // vmmcall — checkpoint two: RAX = DATA_MAGIC
+    c[29] = 0xF4; // hlt — the stop marker
+    c[30] = 0xEB;
+    c[31] = 0xFE; // jmp $
+    c
+};
+
+/// The Linux rung's foundation, proven in isolation: guest VA ≠ guest PA
+/// (the guest page tables do real per-page work) *and* guest PA ≠ host PA
+/// (the NPT relocates each synthetic region onto wherever the PMM put a
+/// frame). The trivial rung proved VMRUN, the long-mode rung proved a paged
+/// 64-bit guest over an identity NPT; this rung removes the identity from
+/// **both** levels at once — the exact shape a loader stands on when it
+/// places a guest image at guest-physical addresses the host does not have.
+/// Breadcrumbs 0x31–0x39 mirror the other guests' runs.
+fn twolvl_guest(nrips: bool) {
+    crumb(0x31);
+    let Some(mut vmcb_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] two-level: no frame for VMCB\n");
+        return;
+    };
+    let Some(mut npml4_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] two-level: no frame for NPT PML4\n");
+        return;
+    };
+    let Some(mut npdpt_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] two-level: no frame for NPT PDPT\n");
+        return;
+    };
+    let Some(mut npd_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] two-level: no frame for NPT PD\n");
+        return;
+    };
+    let Some(mut gpml4_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] two-level: no frame for guest PML4\n");
+        return;
+    };
+    let Some(mut gpdpt_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] two-level: no frame for guest PDPT\n");
+        return;
+    };
+    let Some(mut gpd_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] two-level: no frame for guest PD\n");
+        return;
+    };
+    let Some(mut gpt_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] two-level: no frame for guest PT\n");
+        return;
+    };
+    let Some(mut code_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] two-level: no frame for guest code\n");
+        return;
+    };
+    let Some(mut data_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] two-level: no frame for guest data\n");
+        return;
+    };
+
+    crumb(0x32);
+    // The runtime guest-physical address of every page: its region base or'd
+    // with the frame's offset inside the aligned window the NPT leaf maps —
+    // which is what makes the leaf's translation land on the frame itself.
+    let code_gpa = TWOVL_CODE_REGION | (code_f.pa() as u64 & 0x1F_FFFF);
+    let data_gpa = TWOVL_DATA_REGION | (data_f.pa() as u64 & 0x1F_FFFF);
+    let gpt_gpa = [
+        TWOVL_GPT_REGION[0] | (gpml4_f.pa() as u64 & 0x1F_FFFF),
+        TWOVL_GPT_REGION[1] | (gpdpt_f.pa() as u64 & 0x1F_FFFF),
+        TWOVL_GPT_REGION[2] | (gpd_f.pa() as u64 & 0x1F_FFFF),
+        TWOVL_GPT_REGION[3] | (gpt_f.pa() as u64 & 0x1F_FFFF),
+    ];
+    code_f.bytes_mut()[..TWOVL_CODE.len()].copy_from_slice(&TWOVL_CODE);
+    data_f.bytes_mut()[..8].copy_from_slice(&TWOVL_DATA_MAGIC.to_le_bytes());
+
+    let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
+    if msrpm_pa % 4096 != 0 || iopm_pa % 4096 != 0 {
+        p("[KVM] permission map base not 4-KiB aligned\n");
+        return;
+    }
+
+    // NPT: every synthetic 2-MiB region → the aligned window holding the
+    // frame that plays it. All six regions share PDPT index 1 (the 1–2 GiB
+    // band), so one NPT PD covers them.
+    let npml4_pa = npml4_f.pa() as u64;
+    let npdpt_pa = npdpt_f.pa() as u64;
+    let npd_pa = npd_f.pa() as u64;
+    svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
+    svm::wr64(npdpt_f.bytes_mut(), 8, svm::npt::pointer(npd_pa));
+    for (region, frame_pa) in [
+        (TWOVL_CODE_REGION, code_f.pa() as u64),
+        (TWOVL_DATA_REGION, data_f.pa() as u64),
+        (TWOVL_GPT_REGION[0], gpml4_f.pa() as u64),
+        (TWOVL_GPT_REGION[1], gpdpt_f.pa() as u64),
+        (TWOVL_GPT_REGION[2], gpd_f.pa() as u64),
+        (TWOVL_GPT_REGION[3], gpt_f.pa() as u64),
+    ] {
+        let idx = ((region >> 21) & 0x1FF) as usize;
+        svm::wr64(npd_f.bytes_mut(), idx * 8, svm::npt::leaf_2m(frame_pa & !0x1F_FFFF));
+    }
+
+    // Guest paging: three pointer entries and two 4-KiB leaves — the PT
+    // level is real, and every entry holds a *guest-physical* address for
+    // the NPT to relocate. PML4[0] → PDPT, PDPT[1] → PD, PD[0] → PT,
+    // PT[0] → code GPA, PT[1] → data GPA.
+    svm::wr64(gpml4_f.bytes_mut(), 0, svm::npt::pointer(gpt_gpa[1]));
+    svm::wr64(gpdpt_f.bytes_mut(), 8, svm::npt::pointer(gpt_gpa[2]));
+    svm::wr64(gpd_f.bytes_mut(), 0, svm::npt::pointer(gpt_gpa[3]));
+    svm::wr64(gpt_f.bytes_mut(), 0, svm::npt::leaf_4k(code_gpa));
+    svm::wr64(gpt_f.bytes_mut(), 8, svm::npt::leaf_4k(data_gpa));
+
+    // VMCB — the long-mode rung's state with the synthetic CR3 and VA in
+    // place of the identity ones; ASID 14 stays clear of the ladder's 1–13.
+    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
+    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
+    {
+        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        v.set_intr0(
+            intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT,
+        );
+        v.set_intr1(intr1::VMRUN | intr1::VMMCALL);
+        v.set_excp(svm::excp::DB | svm::excp::UD | svm::excp::GP | svm::excp::PF);
+        v.set_iopm_base(iopm_pa);
+        v.set_msrpm_base(msrpm_pa);
+        v.set_asid(14);
+        v.set_tlb_control(ctrl::TLB_DO_NOTHING);
+        v.set_np_enable(true);
+        v.set_n_cr3(npml4_pa);
+        let flat = |attr: SegAttr| Seg { selector: 0, attr, limit: 0xFFFF_FFFF, base: 0 };
+        v.set_seg(
+            save::CS,
+            Seg { selector: 0x08, attr: SegAttr::CODE64_DPL0, limit: 0xFFFF_FFFF, base: 0 },
+        );
+        let data = flat(SegAttr::DATA32_RW_DPL0);
+        v.set_seg(save::ES, data);
+        v.set_seg(save::SS, data);
+        v.set_seg(save::DS, data);
+        // FS/GS carry the host bases, same as every rehearsal guest.
+        v.set_seg(
+            save::FS,
+            Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base: msr::read(Msr::FsBase) },
+        );
+        v.set_seg(
+            save::GS,
+            Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base: msr::read(Msr::GsBase) },
+        );
+        v.set_efer(svm::msr::EFER_SVME | svm::msr::EFER_LME | svm::msr::EFER_LMA);
+        v.set_cr0(svm::cr0::PE | svm::cr0::NE | svm::cr0::PG);
+        v.set_cr3(gpt_gpa[0]);
+        v.set_cr4(svm::cr4::PAE);
+        v.set_rflags(0x2);
+        v.set_cpl(0);
+        v.set_rip(TWOVL_CODE_VA);
+        v.set_rsp(0);
+    }
+
+    crumb(0x33);
+    {
+        let v = Vmcb::new(vmcb_f.bytes_mut());
+        if let Err(e) = svm::validate_guest_state(&v) {
+            p("[KVM] two-level guest state rejected: ");
+            p(e.name());
+            p("\n");
+            return;
+        }
+    }
+
+    crumb(0x34);
+    if !enable_on_core(0) {
+        p("[KVM] two-level: no host save area for the BSP\n");
+        return;
+    }
+
+    crumb(0x35);
+    p("[KVM] running two-level guest (gva=");
+    hx(TWOVL_CODE_VA, 16);
+    p(" gpa=");
+    hx(code_gpa, 16);
+    p(" hpa=");
+    hx(code_f.pa() as u64, 16);
+    p(")\n");
+
+    // Same excursion shape as both earlier guests: IRQs masked for the run,
+    // RCX/RDX round-tripped (Table B-2; this guest writes RSI only inside
+    // itself, before any exit, so the shared-GPR contract does not reach it).
+    akuma_cpu::daif::mask_irq();
+    let mut vmmcalls = 0u64;
+    let (mut guest_rcx, mut guest_rdx) = (0u64, 0u64);
+    let (mut halted, mut why) = (false, "loop exhausted");
+    for _ in 0..8 {
+        crumb(0x37);
+        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx) };
+        guest_rcx = rcx_out;
+        guest_rdx = rdx_out;
+        crumb(0x38);
+        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        match ExitCode::from_u64(v.exitcode()) {
+            ExitCode::Vmmcall => {
+                vmmcalls += 1;
+                if vmmcalls == 1 && v.rax() != TWOVL_EXEC_MAGIC {
+                    why = "checkpoint one: RAX != exec magic (fetch through gVA/gPA failed)";
+                    p("[KVM] ");
+                    p(why);
+                    p(": ");
+                    dump_exit(&v, guest_rcx, guest_rdx);
+                    break;
+                }
+                if vmmcalls == 2 && v.rax() != TWOVL_DATA_MAGIC {
+                    why = "checkpoint two: RAX != data magic (the data walk did not land)";
+                    p("[KVM] ");
+                    p(why);
+                    p(": ");
+                    dump_exit(&v, guest_rcx, guest_rdx);
+                    break;
+                }
+                v.set_rip(next_rip(&v, nrips, 3));
+            }
+            ExitCode::Hlt => {
+                halted = true;
+                break;
+            }
+            _ => {
+                why = "unexpected exit";
+                p("[KVM] two-level unexpected exit: ");
+                dump_exit(&v, guest_rcx, guest_rdx);
+                dump_state(&v);
+                break;
+            }
+        }
+    }
+    akuma_cpu::daif::unmask_irq();
+    crumb(0x39);
+
+    let final_v = Vmcb::new(vmcb_f.bytes_mut());
+    let pass = halted && vmmcalls == 2 && final_v.rax() == TWOVL_DATA_MAGIC;
+    p("[KVM] two-level guest: ");
+    p(if pass { "PASS" } else { "FAIL" });
+    p(" (vmmcalls=");
+    dec(vmmcalls);
     p(", rax=");
     hx(final_v.rax(), 16);
     p(")\n");
