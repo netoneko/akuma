@@ -126,6 +126,7 @@ pub fn init(cmdline: &str) {
         SVM_WANTED.store(true, Ordering::Release);
         trivial_guest(nrips);
         longmode_guest(nrips);
+        consistency_ladder();
     }
 }
 
@@ -452,6 +453,7 @@ fn trivial_guest(nrips: bool) {
                 why = "unexpected exit";
                 p("[KVM] unexpected exit: ");
                 dump_exit(&v, guest_rcx, guest_rdx);
+                dump_state(&v);
                 break;
             }
         }
@@ -714,6 +716,7 @@ fn longmode_guest(nrips: bool) {
                 why = "unexpected exit";
                 p("[KVM] long-mode unexpected exit: ");
                 dump_exit(&v, guest_rcx, guest_rdx);
+                dump_state(&v);
                 break;
             }
         }
@@ -740,6 +743,227 @@ fn longmode_guest(nrips: bool) {
         p(why);
         p("\n");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The consistency ladder
+// ---------------------------------------------------------------------------
+
+/// `vmmcall; jmp $`. The probe's first instruction is intercepted by
+/// `intr1::VMMCALL`, so any exit other than `VMEXIT_INVALID` proves VMRUN
+/// accepted the state and entered the guest; the trailing `jmp $` is the
+/// wedge-canary every rehearsal guest carries.
+const PROBE_CODE: [u8; 5] = [0x0F, 0x01, 0xD9, 0xEB, 0xFE];
+
+/// One ladder row: which ingredients the probe's guest state carries. Everything
+/// not named here is identical to the long-mode rung (the intercepts, the
+/// permission maps, DR6/DR7, the data segments, rflags, cpl, rip, rsp).
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy)]
+struct LadderCfg {
+    efer_lme: bool,
+    efer_lma: bool,
+    cr0_pg: bool,
+    cr0_ne: bool,
+    cr4_pae: bool,
+    cr3_g: bool,
+    cs64: bool,
+    cs_sel8: bool,
+    asid: u32,
+}
+
+/// The L0 (KVM under QEMU) rejects the long-mode rung with `VMEXIT_INVALID`
+/// while the trivial rung passes, and an audit of KVM v6.6/v6.8/v6.9
+/// `__nested_vmcb_check_save`/`__nested_vmcb_check_controls` passes our state
+/// on paper, so the failing check is version-specific or outside those two
+/// functions. The ladder is the bisect: one VMRUN per row against the trivial
+/// baseline, each row flipping one or two ingredients, each verdict printed.
+/// Every row passes `akuma_svm_amd64`'s APM §15.5.1 transcription (a row that
+/// did not would print `illegal-self` instead of running). The rejection
+/// pattern, cross-checked with the L0's own `CC()` WARN in dmesg, names the
+/// failing check exactly.
+const LADDER: [(&str, LadderCfg); 12] = [
+    ("full", LadderCfg { efer_lme: true, efer_lma: true, cr0_pg: true, cr0_ne: true, cr4_pae: true, cr3_g: true, cs64: true, cs_sel8: true, asid: 3 }),
+    ("no-lma", LadderCfg { efer_lme: true, efer_lma: false, cr0_pg: true, cr0_ne: true, cr4_pae: true, cr3_g: true, cs64: true, cs_sel8: true, asid: 4 }),
+    ("lme-off", LadderCfg { efer_lme: false, efer_lma: false, cr0_pg: true, cr0_ne: true, cr4_pae: true, cr3_g: true, cs64: true, cs_sel8: true, asid: 5 }),
+    ("no-pg", LadderCfg { efer_lme: true, efer_lma: true, cr0_pg: false, cr0_ne: true, cr4_pae: true, cr3_g: false, cs64: true, cs_sel8: true, asid: 6 }),
+    ("cs32", LadderCfg { efer_lme: true, efer_lma: true, cr0_pg: true, cr0_ne: true, cr4_pae: true, cr3_g: true, cs64: false, cs_sel8: true, asid: 7 }),
+    ("sel0", LadderCfg { efer_lme: true, efer_lma: true, cr0_pg: true, cr0_ne: true, cr4_pae: true, cr3_g: true, cs64: true, cs_sel8: false, asid: 8 }),
+    ("asid1", LadderCfg { efer_lme: true, efer_lma: true, cr0_pg: true, cr0_ne: true, cr4_pae: true, cr3_g: true, cs64: true, cs_sel8: true, asid: 1 }),
+    ("no-ne", LadderCfg { efer_lme: true, efer_lma: true, cr0_pg: true, cr0_ne: false, cr4_pae: true, cr3_g: true, cs64: true, cs_sel8: true, asid: 9 }),
+    ("t-cs64", LadderCfg { efer_lme: false, efer_lma: false, cr0_pg: false, cr0_ne: true, cr4_pae: false, cr3_g: false, cs64: true, cs_sel8: true, asid: 10 }),
+    ("t-pg", LadderCfg { efer_lme: false, efer_lma: false, cr0_pg: true, cr0_ne: true, cr4_pae: true, cr3_g: true, cs64: false, cs_sel8: false, asid: 11 }),
+    ("t-cs64-pg", LadderCfg { efer_lme: false, efer_lma: false, cr0_pg: true, cr0_ne: true, cr4_pae: true, cr3_g: true, cs64: true, cs_sel8: true, asid: 12 }),
+    ("t-lme-lma", LadderCfg { efer_lme: true, efer_lma: true, cr0_pg: false, cr0_ne: true, cr4_pae: false, cr3_g: false, cs64: false, cs_sel8: false, asid: 13 }),
+];
+
+/// Run the ladder. Each probe gets a freshly zeroed VMCB frame, a unique ASID
+/// (except the deliberate `asid1` row) and `TLB_DO_NOTHING`, so consecutive
+/// probes cannot poison each other through the L0's shadow state; the frame
+/// is freed between rows, which KVM tolerates (its shadow pages key on the
+/// L1 GPAs, whose backing HPAs do not move). IRQs stay masked across the
+/// whole ladder: one VMRUN per row, no waiting in between.
+fn consistency_ladder() {
+    crumb(0x21);
+    let Some(mut code_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] ladder: no frame for probe code\n");
+        return;
+    };
+    let Some(mut npml4_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] ladder: no frame for NPT PML4\n");
+        return;
+    };
+    let Some(mut npdpt_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] ladder: no frame for NPT PDPT\n");
+        return;
+    };
+    let Some(mut npd_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] ladder: no frame for NPT PD\n");
+        return;
+    };
+    let Some(mut gpml4_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] ladder: no frame for guest PML4\n");
+        return;
+    };
+    let Some(mut gpdpt_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] ladder: no frame for guest PDPT\n");
+        return;
+    };
+    let Some(mut gpd_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] ladder: no frame for guest PD\n");
+        return;
+    };
+
+    let code_pa = code_f.pa() as u64;
+    code_f.bytes_mut()[..PROBE_CODE.len()].copy_from_slice(&PROBE_CODE);
+    let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
+
+    // Nested and guest paging, built once for `probe_pa` exactly as the
+    // long-mode rung builds them; rows that do not page simply never walk.
+    let npml4_pa = npml4_f.pa() as u64;
+    let npdpt_pa = npdpt_f.pa() as u64;
+    let npd_pa = npd_f.pa() as u64;
+    let gpml4_pa = gpml4_f.pa() as u64;
+    let gpdpt_pa = gpdpt_f.pa() as u64;
+    let gpd_pa = gpd_f.pa() as u64;
+    svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
+    svm::wr64(npdpt_f.bytes_mut(), 0, svm::npt::pointer(npd_pa));
+    for pa in [code_pa, gpml4_pa, gpdpt_pa, gpd_pa] {
+        let idx = ((pa >> 21) & 0x1FF) as usize;
+        svm::wr64(npd_f.bytes_mut(), idx * 8, svm::npt::leaf_2m(pa & !0x1F_FFFF));
+    }
+    svm::wr64(gpml4_f.bytes_mut(), ((code_pa >> 39) & 0x1FF) as usize * 8, svm::npt::pointer(gpdpt_pa));
+    svm::wr64(gpdpt_f.bytes_mut(), ((code_pa >> 30) & 0x1FF) as usize * 8, svm::npt::pointer(gpd_pa));
+    svm::wr64(gpd_f.bytes_mut(), ((code_pa >> 21) & 0x1FF) as usize * 8, svm::npt::leaf_2m(code_pa & !0x1F_FFFF));
+
+    if !enable_on_core(0) {
+        p("[KVM] ladder: no host save area for the BSP\n");
+        return;
+    }
+
+    p("[KVM] ladder: ");
+    dec(LADDER.len() as u64);
+    p(" probes, code_pa=");
+    hx(code_pa, 16);
+    p("\n");
+
+    akuma_cpu::daif::mask_irq();
+    for (i, (name, cfg)) in LADDER.iter().enumerate() {
+        let Some(mut vmcb_f) = FreshFrame::alloc_zeroed() else {
+            p("[KVM] ladder ");
+            p(name);
+            p(": no frame for VMCB\n");
+            break;
+        };
+        p("[KVM] ladder ");
+        p(name);
+        p(": ");
+
+        svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
+        svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
+        {
+            let mut v = Vmcb::new(vmcb_f.bytes_mut());
+            v.set_intr0(
+                intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT,
+            );
+            v.set_intr1(intr1::VMRUN | intr1::VMMCALL);
+            v.set_excp(svm::excp::DB | svm::excp::UD | svm::excp::GP | svm::excp::PF);
+            v.set_iopm_base(iopm_pa);
+            v.set_msrpm_base(msrpm_pa);
+            v.set_asid(cfg.asid);
+            v.set_tlb_control(ctrl::TLB_DO_NOTHING);
+            v.set_np_enable(true);
+            v.set_n_cr3(npml4_pa);
+            let flat = |attr: SegAttr| Seg { selector: 0, attr, limit: 0xFFFF_FFFF, base: 0 };
+            v.set_seg(
+                save::CS,
+                Seg {
+                    selector: if cfg.cs_sel8 { 0x08 } else { 0 },
+                    attr: if cfg.cs64 { SegAttr::CODE64_DPL0 } else { SegAttr::CODE32_DPL0 },
+                    limit: 0xFFFF_FFFF,
+                    base: 0,
+                },
+            );
+            let data = flat(SegAttr::DATA32_RW_DPL0);
+            v.set_seg(save::ES, data);
+            v.set_seg(save::SS, data);
+            v.set_seg(save::DS, data);
+            // FS/GS carry the host bases, same as every rehearsal guest.
+            v.set_seg(
+                save::FS,
+                Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base: msr::read(Msr::FsBase) },
+            );
+            v.set_seg(
+                save::GS,
+                Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base: msr::read(Msr::GsBase) },
+            );
+            let mut efer = svm::msr::EFER_SVME;
+            if cfg.efer_lme {
+                efer |= svm::msr::EFER_LME;
+            }
+            if cfg.efer_lma {
+                efer |= svm::msr::EFER_LMA;
+            }
+            v.set_efer(efer);
+            let mut cr0 = svm::cr0::PE;
+            if cfg.cr0_ne {
+                cr0 |= svm::cr0::NE;
+            }
+            if cfg.cr0_pg {
+                cr0 |= svm::cr0::PG;
+            }
+            v.set_cr0(cr0);
+            v.set_cr3(if cfg.cr3_g { gpml4_pa } else { 0 });
+            v.set_cr4(if cfg.cr4_pae { svm::cr4::PAE } else { 0 });
+            v.set_rflags(0x2);
+            v.set_cpl(0);
+            v.set_rip(code_pa);
+            v.set_rsp(0);
+        }
+        {
+            let v = Vmcb::new(vmcb_f.bytes_mut());
+            if let Err(e) = svm::validate_guest_state(&v) {
+                p("illegal-self ");
+                p(e.name());
+                p("\n");
+                continue;
+            }
+        }
+
+        crumb(0x22 + i as u8);
+        unsafe { vmrun(vmcb_f.pa() as u64, 0, 0) };
+        let v = Vmcb::new(vmcb_f.bytes_mut());
+        if ExitCode::from_u64(v.exitcode()) == ExitCode::Invalid {
+            p("rejected\n");
+            dump_state(&v);
+        } else {
+            p("entered exit=");
+            hx(v.exitcode(), 8);
+            p("\n");
+        }
+    }
+    akuma_cpu::daif::unmask_irq();
+    crumb(0x2E);
 }
 
 /// The resume RIP after a trap-style exit: nRIP when the NRIPS feature is
@@ -780,6 +1004,27 @@ fn dump_exit(v: &Vmcb<'_>, rcx: u64, rdx: u64) {
         hx(u64::from(bytes[i]), 2);
         p(" ");
     }
+    p("\n");
+}
+
+/// The state half of a self-contained INVALID dump: which EFER/CR values the
+/// L0 was handed when it refused the guest. The exit line plus this one
+/// identify the failing L0 check without a second boot.
+fn dump_state(v: &Vmcb<'_>) {
+    p("[KVM] state: efer=");
+    hx(v.efer(), 16);
+    p(" cr0=");
+    hx(v.cr0(), 16);
+    p(" cr3=");
+    hx(v.cr3(), 16);
+    p(" cr4=");
+    hx(v.cr4(), 16);
+    p(" asid=");
+    dec(u64::from(v.asid()));
+    p(" cs.sel=");
+    hx(u64::from(v.seg(save::CS).selector), 4);
+    p(" cs.attr=");
+    hx(u64::from(v.seg(save::CS).attr.0), 4);
     p("\n");
 }
 
