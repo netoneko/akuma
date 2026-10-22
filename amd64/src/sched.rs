@@ -2366,9 +2366,15 @@ pub fn allow_tick() {
         // Interrupts on for exactly the `hlt`, then off again — the same
         // bracket `idle_loop` uses.
         let halt_tsc = akuma_cpu::tsc::rdtsc();
+        let halt_started_us = akuma_primitives::clock::uptime_us();
         akuma_cpu::park::wfi();
         note_halted(halt_tsc);
         crate::lapic::restore_periodic();
+        // A halt is not CPU time: credit it back to the caller exactly as `idle_loop` does for
+        // the idle thread, or a task whose only wait is this one (the VM task, the netpoll
+        // daemon) is billed for every second it sleeps and `/proc/stat` reads its core as
+        // 100% busy against a TSC-measured 12% (`docs/archive/KVM_CPU_ACCOUNTING.md`).
+        threading::credit_halted_time(threading::current_thread_id(), halt_started_us);
         if held {
             crate::smp::bkl_enter();
         }

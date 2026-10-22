@@ -1721,7 +1721,7 @@ pub fn run(nrips: bool, vm: &Vm) {
             akuma_cpu::daif::unmask_irq();
             if now_us >= next_acct_us {
                 next_acct_us = now_us + ACCT_PERIOD_US;
-                acct.report(exits, crate::smp::cpu_index());
+                acct.report(exits, [n_hlt, n_lapic, n_io, n_msr, n_irq, n_net, n_mmio], crate::smp::cpu_index());
             }
         }
         let relay_t0 = akuma_cpu::tsc::rdtsc();
@@ -2315,6 +2315,8 @@ struct Acct {
     relay: u64,
     last_tsc: u64,
     last_exits: u64,
+    /// Per-kind exit counts at the last report: hlt, lapic page, port I/O, MSR, host irq, NIC, disk.
+    last_kinds: [u64; 7],
     last_halt: [u64; crate::smp::MAX_CPUS],
 }
 
@@ -2324,7 +2326,7 @@ impl Acct {
         for (c, h) in last_halt.iter_mut().enumerate() {
             *h = crate::sched::halted_tsc(c);
         }
-        Self { guest: 0, sleep: 0, yielded: 0, relay: 0, last_tsc: akuma_cpu::tsc::rdtsc(), last_exits: 0, last_halt }
+        Self { guest: 0, sleep: 0, yielded: 0, relay: 0, last_tsc: akuma_cpu::tsc::rdtsc(), last_exits: 0, last_kinds: [0; 7], last_halt }
     }
 
     /// `part` / `whole` as a percentage with one decimal.
@@ -2338,7 +2340,7 @@ impl Acct {
 
     /// One `[KVM] cpu:` line: this task's split, then each core's busy share (100% minus the
     /// time it spent halted) over the same interval, then the interval's exit rate.
-    fn report(&mut self, exits: u64, vcpu_core: usize) {
+    fn report(&mut self, exits: u64, kinds: [u64; 7], vcpu_core: usize) {
         let now = akuma_cpu::tsc::rdtsc();
         let wall = now.wrapping_sub(self.last_tsc);
         if wall == 0 {
@@ -2364,14 +2366,21 @@ impl Acct {
             p("%");
         }
         let hz = crate::lapic::tsc_hz().max(1);
+        let per_s = |d: u64| (u128::from(d) * u128::from(hz) / u128::from(wall)) as u64;
         p("  exits/s=");
-        dec((u128::from(exits - self.last_exits) * u128::from(hz) / u128::from(wall)) as u64);
+        dec(per_s(exits - self.last_exits));
+        for (name, k) in ["hlt", "lapic", "io", "msr", "irq", "net", "blk"].iter().zip(0..) {
+            p(" ");
+            p(name);
+            p("=");
+            dec(per_s(kinds[k] - self.last_kinds[k]));
+        }
         p("\n");
-        *self = Self { last_halt: self.last_halt, last_tsc: now, last_exits: exits, ..Self::zero() };
+        *self = Self { last_halt: self.last_halt, last_tsc: now, last_exits: exits, last_kinds: kinds, ..Self::zero() };
     }
 
     const fn zero() -> Self {
-        Self { guest: 0, sleep: 0, yielded: 0, relay: 0, last_tsc: 0, last_exits: 0, last_halt: [0; crate::smp::MAX_CPUS] }
+        Self { guest: 0, sleep: 0, yielded: 0, relay: 0, last_tsc: 0, last_exits: 0, last_kinds: [0; 7], last_halt: [0; crate::smp::MAX_CPUS] }
     }
 }
 
