@@ -1,7 +1,10 @@
 # The Linux rung: a real `vmlinux` under the SVM hypervisor
 
-**Date:** 2026-10-22. **Status:** banner reached under QEMU TCG (`[KVM] linux guest:
-PASS (banner=yes)`); **not yet run on metal.** Continues
+**Date:** 2026-10-22. **Status:** **PASS on the metal** (ryzen, entry 28):
+`[KVM] linux guest: PASS (banner=yes)` — Linux 6.1.128 printed its banner and ran
+on to its first timer wait on real Zen 4 under this hypervisor
+([`AMD64_KVMTEST_RUNG6_LINUX_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_RUNG6_LINUX_METAL_DMESG_2026_10_22.txt)).
+Also PASS under QEMU TCG and under QEMU/KVM with nested SVM on ryzen. Continues
 [`AKUMA_KVM.md`](AKUMA_KVM.md) (rungs 0-4, crush) — this is rung 5 (PVH handoff
 dry run, crush's) and rung 6 (the real kernel). No Linux or KVM source was read
 (GPL, binding for the project); every layout and bit is from AMD APM Vol 2/3 or
@@ -75,11 +78,27 @@ the built kernel to p3 `/boot/akuma-amd64.verify`, `arm.sh 28`. Entry 28 boots
 `.verify` when present (else `akk`), so entries 20/27 and the live kernel are
 untouched and rollback is "arm another entry".
 
+## Results
+
+| where | result |
+|---|---|
+| QEMU TCG, Mac (`noladder`) | PASS, 12 823 exits, 2 012 host IRQs |
+| QEMU/KVM nested SVM, ryzen (`qemu.sh 28`, p3 32 GiB) | PASS, 12 923 exits, 2 009 IRQs; all 12 ladder rows `entered` |
+| **metal, ryzen entry 28** | **PASS**, 12 964 exits, 2 001 IRQs, 4 reflected exceptions, 5 262 console bytes; `rip=ffffffff81000ee6` in the first delay loop; ASIDs 32768, `nrips=yes`; Akuma then finished booting (wifi, DHCP, SNTP) |
+
+The nested rehearsal earned its keep: it found that on the multiboot2 path
+`kvm::late` ran *before* `boot::late_init`'s `lapic::init`, so the host had no
+tick — the guest's spin never produced an exit and the wall-clock budget (checked
+on exits) never fired. The call now lives in the late-init closure on both paths.
+TCG could not show it because its host timer was already running.
+
 ## Still open
 
 - Timer: PIT (ports 0x40-0x43, 0x61) then interrupt injection (`EVENTINJ`
   type 0), then the LAPIC timer — until then Linux stops at its first delay loop.
-- Metal: not run. Under QEMU/KVM nesting the rung is rehearsed on ryzen first.
+- p3's `e2fsck -fn` reports a corrupted directory in crush's cargo cache
+  (`/root/ktarget/.../build/akuma-amd64/<hash>/out`, last written Oct 18) — not
+  caused by this work, not repaired; `rm -r` that directory from Pop, then `e2fsck`.
 - The ladder's last row under TCG (an emulation artefact; metal passes).
 - `unsafe`: `amd64/src` 82 → 87 (the trampoline, its call, the host `VMSAVE`,
   and two call sites); budget updated in the same commit.

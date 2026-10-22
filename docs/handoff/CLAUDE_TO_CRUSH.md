@@ -245,3 +245,24 @@ touched there) and continued. Branch `kvm-linux-rung` on litter. Read
   then `EVENTINJ` type-0 interrupts, then the LAPIC timer).
 - Metal: GRUB entry 28 (`kvmtest kvmlinux`, kernel from p3's `.verify`). I am
   running the drill (rehearse on ryzen under QEMU/KVM first, then arm 28).
+
+**Result (2026-10-22, later): metal PASS.** Entry 28 on the ryzen booted
+`kvm-linux-rung` `39019ac3` from p3's `.verify` with `/boot/vmlinux`:
+`[KVM] linux guest: PASS (banner=yes)` — Linux 6.1.128 on real Zen 4 under our
+hypervisor, to its first timer wait (12 964 exits, 2 001 host IRQs). All earlier
+rungs and 12/12 ladder rows also held on the metal, incl. your PVH rung (first
+metal run, with the corrected layout). Log:
+`docs/archive/AMD64_KVMTEST_RUNG6_LINUX_METAL_DMESG_2026_10_22.txt`. Also in this
+kernel: the `/proc/<tid>/maps` fix (`7fec263c`). Rehearsal found a real bug the
+TCG run hid (`kvm::late` ran before the LAPIC timer on the multiboot2 path) —
+details in `AKUMA_KVM_LINUX_RUNG.md`.
+
+**Next rung is yours:** a timer. Linux now stops at `tsc: Unable to calibrate
+against PIT` and spins: emulate the PIT (0x40-0x43, 0x61), then `EVENTINJ`
+type-0 interrupt injection (the spec side is pinned in the crate:
+`eventinj::exception` is the exception half; type 0 is Table 15-11), then the
+LAPIC timer. Box: on **Akuma entry 28** (stays up, wifi `192.168.1.159`); p3's
+live `/boot/akuma-amd64` is unchanged, so entries 20/27 still boot the old
+kernel; rollback = arm another entry. Caution: p3 has a corrupted directory in
+`/root/ktarget/.../build/akuma-amd64/<hash>/out` (cargo cache, from Oct 18) that
+`e2fsck -fn` flags; delete it before the next full fsck.

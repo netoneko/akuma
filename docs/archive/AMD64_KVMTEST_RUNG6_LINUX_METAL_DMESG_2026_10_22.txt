@@ -1,0 +1,232 @@
+# Entry 28 on ryzen (metal), 2026-10-22: the Linux rung, from dmesg
+# Kernel: litter/kvm-linux-rung 39019ac3 as p3 /boot/akuma-amd64.verify; guest: Firecracker CI vmlinux-6.1.128 (sha256 27a8310b...ecc8) as p3 /boot/vmlinux.
+# Filtered to the [KVM] lines, the guest's console and the boot lines around them; the wifi/BKL chatter is dropped.
+
+  clock: seeded from the CMOS RTC (2026-10-22 0:45 UTC); SNTP will correct it
+[KVM] Fn8000_000A: rev=00000001 asids=32768 edx=1ebf1cff
+[KVM] SVM available; EFER.SVME not yet enabled (per-core, rung 2)
+[KVM] running trivial guest (nrips=yes, code_pa=000000000120d000)
+[KVM] trivial guest: PASS (vmmcalls=2, msr=1, ioio=1, rax=0000000000001000)
+[KVM] running long-mode guest (nrips=yes, code_pa=0000000001210000)
+[KVM] long-mode guest: PASS (vmmcalls=2, msr=1, rax=0000000000001500)
+[KVM] running two-level guest (gva=0000000050000000 gpa=0000000040011000 hpa=0000000001211000)
+[KVM] two-level guest: PASS (vmmcalls=2, rax=202620265eed0002)
+[KVM] running pvh guest (start=00000000405ff000)
+[KVM] pvh guest: PASS (vmmcalls=2, rax=0000000000000001)
+[KVM] ladder: 12 probes, code_pa=0000000001209000
+[KVM] ladder full: entered exit=00000081
+[KVM] ladder no-lma: entered exit=00000081
+[KVM] ladder lme-off: entered exit=0000004e
+[KVM] ladder no-pg: entered exit=00000081
+[KVM] ladder cs32: entered exit=00000081
+[KVM] ladder sel0: entered exit=00000081
+[KVM] ladder asid1: entered exit=00000081
+[KVM] ladder no-ne: entered exit=00000081
+[KVM] ladder t-cs64: entered exit=00000081
+[KVM] ladder t-pg: entered exit=0000004e
+[KVM] ladder t-cs64-pg: entered exit=0000004e
+[KVM] ladder t-lme-lma: entered exit=00000081
+  nvme: 0000000000001c5c:0000000000001d59
+  nvme: CAP.TO 20000 ms, MQES 256, DSTRD 0, firmware left CC=0x0000000000460001 CSTS=0x0000000000000001
+  nvme: disabled in 0 ms
+  nvme: ready in 3 ms
+  nvme: SKHynix_HFS512GEJ4X112N fw 51040C31, mdts 256 KiB, vwc yes
+  nvme: ns1 476 GiB in 512-byte blocks, 256 blocks per command
+  nvme: init total 10 ms
+  nvme: p3 = LBA 567296..=210282495 (100 GiB) "Basic data partition"
+  fs:   ext2 mounted on /dev/nvme0n1p3
+[SmolNet] MAC: 02:41:4b:55:4d:41[SmolNet] static IPv4 169.254.65.77/16 gw 169.254.0.1
+[SmolNet] DHCP enabled
+[SmolNet] Initialized successfully
+[KVM] linux: loading /boot/vmlinux
+[KVM] linux: loaded 20273 KiB in 4 segments, PVH entry 010004f0
+[KVM] linux: running (start=07fff000, ram=128 MiB)
+[KVM] linux: rdmsr c0000080 -> 0000000000000000
+[KVM] linux: wrmsr c0000080 <- 0000000000000100
+[KVM] linux: wrmsr c0000101 <- 00000000023d8580
+[KVM] linux: wrmsr c0000101 <- 0000000002324000
+[KVM] linux: cpuid 00000000/01 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 00000001/63 -> 00a70f52 00100800 42d82203 078ba97f
+[KVM] linux: cpuid 80000000/03 -> 80000028 68747541 444d4163 69746e65
+[KVM] linux: cpuid 80000001/63 -> 00a70f52 10000000 000211f3 2fd3fbff
+[KVM] linux: cpuid 00000001/f3 -> 00a70f52 00100800 42d82203 078ba97f
+[KVM] linux: wrmsr c0000101 <- ffffffff82324000
+[KVM] linux: cpuid 80000001/01 -> 00a70f52 10000000 000211f3 2fd3fbff
+[KVM] linux: rdmsr c0000080 -> 0000000000000500
+[KVM] linux: wrmsr c0000080 <- 0000000000000d01
+[KVM] linux: #PF rip=ffffffff823491b5 err=00000000 addr=ffff8880023d7560
+[KVM] linux: code@ffffffff823491b5 f3 a5 48 89 e5 e8 2d b9 61 ff 8b 35 23 47 27 00 
+[KVM] linux: #PF rip=ffffffff823491ea err=00000000 addr=ffff888007ffd000
+[KVM] linux: code@ffffffff823491ea f3 a5 5d e9 ce 72 8b ff 49 89 f2 48 8b 35 c4 11 
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+[KVM] linux: cpuid 00000006/00 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000007/00 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 0000000d/01 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 80000000/00 -> 80000028 68747541 444d4163 69746e65
+[KVM] linux: cpuid 80000001/00 -> 00a70f52 10000000 000211f3 2fd3fbff
+[KVM] linux: cpuid 80000007/00 -> 00000000 0000003b 00000000 0000e799
+[KVM] linux: cpuid 80000008/00 -> 00003030 791ef257 0000400f 00010000
+[KVM] linux: cpuid 8000000a/00 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 8000001f/00 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 80000021/00 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 00000006/00 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 00000006/00 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 00000007/01 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 00000007/02 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 00000007/02 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 0000000f/00 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 0000000f/01 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 0000000f/01 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 0000000f/01 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: cpuid 00000010/00 -> 00000000 00000000 00000000 00000000
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+[KVM] linux: msr rd 0000008b (default)
+[KVM] linux: rdmsr 0000008b -> 0000000000000000
+[KVM] linux: msr rd c0010015 (default)
+[KVM] linux: rdmsr c0010015 -> 0000000000000000
+[KVM] linux: #PF rip=ffffffff823494cc err=00000000 addr=ffff888000000413
+[KVM] linux: code@ffffffff823494cc 0f b7 82 13 04 00 00 0f b7 ba 0e 04 00 00 48 89 
+[    0.000000] Linux version 6.1.128 (root@bd3f41838d3f) (gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, GNU ld (GNU Binutils for Ubuntu) 2.38) #1 SMP PREEMPT_DYNAMIC Mon Mar 10 14:07:44 UTC 2025
+[    0.000000] Command line: console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr noapic nolapic nosmp noacpi pci=off mitigations=off panic=-1
+[    0.000000] KASLR disabled
+[    0.000000] [Firmware Bug]: TSC doesn't count with P0 frequency!
+[    0.000000] BIOS-provided physical RAM map:
+[    0.000000] BIOS-e820: [mem 0x0000000000000000-0x000000000009ffff] usable
+[    0.000000] BIOS-e820: [mem 0x00000000000a0000-0x00000000000fffff] reserved
+[    0.000000] BIOS-e820: [mem 0x0000000000100000-0x0000000007ffcfff] usable
+[    0.000000] printk: bootconsole [earlyser0] enabled
+[    0.000000] NX (Execute Disable) protection: active
+[    0.000000] DMI not present or invalid.
+[    0.000000] tsc: Fast TSC calibration failed
+[    0.000000] last_pfn = 0x7ffd max_arch_pfn = 0x400000000
+[    0.000000] Disabled
+[    0.000000] x86/PAT: MTRRs disabled, skipping PAT initialization too.
+[KVM] linux: rdmsr 00000277 -> 0007040600070406
+[    0.000000] x86/PAT: Configuration [0-7]: WB  WT  UC- UC  WB  WT  UC- UC  
+[    0.000000] Using GB pages for direct mapping
+[KVM] linux: #PF rip=ffffffff81960ee2 err=00000002 addr=ffff888002800000
+[KVM] linux: code@ffffffff81960ee2 48 89 07 48 89 47 08 48 89 47 10 48 89 47 18 48 
+[    0.000000] ACPI: Early table checksum verification disabled
+[    0.000000] ACPI BIOS Error (bug): A valid RSDP was not found (20220331/tbxfroot-210)
+[    0.000000] No NUMA configuration found
+[    0.000000] Faking a node at [mem 0x0000000000000000-0x0000000007ffcfff]
+[    0.000000] NODE_DATA(0) allocated [mem 0x07fdb000-0x07ffcfff]
+[    0.000000] Zone ranges:
+[    0.000000]   DMA      [mem 0x0000000000001000-0x0000000000ffffff]
+[    0.000000]   DMA32    [mem 0x0000000001000000-0x0000000007ffcfff]
+[    0.000000]   Normal   empty
+[    0.000000] Movable zone start for each node
+[    0.000000] Early memory node ranges
+[    0.000000]   node   0: [mem 0x0000000000001000-0x000000000009ffff]
+[    0.000000]   node   0: [mem 0x0000000000100000-0x0000000007ffcfff]
+[    0.000000] Initmem setup node 0 [mem 0x0000000000001000-0x0000000007ffcfff]
+[    0.000000] On node 0, zone DMA: 1 pages in unavailable ranges
+[    0.000000] On node 0, zone DMA: 96 pages in unavailable ranges
+[    0.000000] On node 0, zone DMA32: 3 pages in unavailable ranges
+[    0.000000] No local APIC present
+[    0.000000] APIC: disable apic facility
+[    0.000000] APIC: switched to apic NOOP
+[    0.000000] smpboot: Allowing 1 CPUs, 0 hotplug CPUs
+[    0.000000] PM: hibernation: Registered nosave memory: [mem 0x00000000-0x00000fff]
+[    0.000000] PM: hibernation: Registered nosave memory: [mem 0x000a0000-0x000fffff]
+[    0.000000] [mem 0x07ffd000-0xffffffff] available for PCI devices
+[    0.000000] Booting paravirtualized kernel on bare hardware
+[    0.000000] clocksource: refined-jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645519600211568 ns
+[    0.000000] setup_percpu: NR_CPUS:64 nr_cpumask_bits:1 nr_cpu_ids:1 nr_node_ids:1
+[    0.000000] percpu: Embedded 44 pages/cpu s147880 r0 d32344 u2097152
+[KVM] linux: wrmsr c0000101 <- ffff888007a00000
+[KVM] linux: wrmsr c0000101 <- ffff888007a00000
+[    0.000000] Fallback order for Node 0: 0 
+[    0.000000] Built 1 zonelists, mobility grouping on.  Total pages: 31997
+[    0.000000] Policy zone: DMA32
+[    0.000000] Kernel command line: console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr noapic nolapic nosmp noacpi pci=off mitigations=off panic=-1
+[    0.000000] Unknown kernel command line parameters "nokaslr noacpi", will be passed to user space.
+[    0.000000] random: crng init done
+[    0.000000] Dentry cache hash table entries: 16384 (order: 5, 131072 bytes, linear)
+[    0.000000] Inode-cache hash table entries: 8192 (order: 4, 65536 bytes, linear)
+[KVM] linux: wrmsr c0000103 <- 0000000000000000
+[KVM] linux: msr wr c0000103 <- 0000000000000000 (default)
+[KVM] linux: wrmsr c0000101 <- ffff888007a00000
+[KVM] linux: wrmsr c0000081 <- 0023001000000000
+[KVM] linux: wrmsr c0000082 <- ffffffff81a00080
+[KVM] linux: wrmsr c0000083 <- ffffffff81a016e0
+[KVM] linux: wrmsr 00000174 <- 0000000000000010
+[KVM] linux: wrmsr 00000175 <- fffffe0000003000
+[KVM] linux: wrmsr 00000176 <- ffffffff81a01620
+[KVM] linux: wrmsr c0000084 <- 0000000000257fd5
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+[    0.000000] mem auto-init: stack:off, heap alloc:off, heap free:off
+[    0.000000] Memory: 102556K/130672K available (12289K kernel code, 1079K rwdata, 2136K rodata, 2596K init, 2336K bss, 27860K reserved, 0K cma-reserved)
+[    0.000000] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
+[    0.000000] Dynamic Preempt: none
+[    0.000000] rcu: Preemptible hierarchical RCU implementation.
+[    0.000000] rcu: 	RCU restricting CPUs from NR_CPUS=64 to nr_cpu_ids=1.
+[    0.000000] 	Trampoline variant of Tasks RCU enabled.
+[    0.000000] 	Tracing variant of Tasks RCU enabled.
+[    0.000000] rcu: RCU calculated value of scheduler-enlistment delay is 25 jiffies.
+[    0.000000] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=1
+[    0.000000] Using NULL legacy PIC
+[    0.000000] NR_IRQS: 4352, nr_irqs: 24, preallocated irqs: 0
+[    0.000000] rcu: srcu_init: Setting srcu_struct sizes based on contention.
+[    0.000000] Console: colour dummy device 80x25
+[    0.000000] printk: console [ttyS0] enabled
+[    0.000000] printk: console [ttyS0] enabled
+[    0.000000] printk: bootconsole [earlyser0] disabled
+[    0.000000] printk: bootconsole [earlyser0] disabled
+[    0.000000] APIC disabled via kernel command line
+[    0.000000] Failed to register legacy timer interrupt
+[    0.000000] APIC: Keep in PIC mode(8259)
+[    0.000000] tsc: Unable to calibrate against PIT
+[    0.000000] tsc: No reference (HPET/PMTIMER) available
+[    0.000000] tsc: Marking TSC unstable due to could not calculate TSC khz
+[KVM] linux: stopped: guest console quiet after the banner (waiting for a timer nobody emulates)
+[KVM] linux: exits=12964 cpuid=323 msr=23 io=10612 irq=2001 exc=4 console_bytes=5262 rip=ffffffff81000ee6
+[KVM] linux guest: PASS (banner=yes)
+  smp:  cpu 1  smp:  cpu 1 online (lapic id  tsc offset 1)
+3839602840  [KVM] cpu 1 cycles
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=0 (aff0+1)
+  smp:  cpu 2 tsc offset 3839602897 cycles
+  smp:  cpu 2 online (lapic id 2)
+  [KVM] cpu 2 svm enabled
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 3 tsc offset 3839602878  smp:  cpu 3 online (lapic id  cycles
+  [KVM] cpu 3 svm enabled
+[BKL] stuck: owner=1 waiter=4 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu   smp:  cpu 4 online (lapic id 4 tsc offset 3839602916 cycles
+  [KVM] cpu 4 svm enabled
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 5 tsc offset 3839602897 cycles
+  smp:  cpu 5 online (lapic id 5)
+  [KVM] cpu 5 svm enabled
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=4 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 6  smp:  cpu 6 online (lapic id  tsc offset 3839602859 cycles
+  [KVM] cpu 6 svm enabled
+[BKL] stuck: owner=1 waiter=5 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=3 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu   smp:  cpu 7 tsc offset 7 online (lapic id 3839602764 cycles
+  smp:  87)
+  [KVM] cpu 7[BKLPROF] enabled (amd64 diagnostic)
+[BKL] stuck: owner=1 waiter=5 tag=501 serving=0 folded=8 (aff0+1)
+[SmolNet] DHCP deconfigured - reverting to static 169.254.65.77
+  clock: retry: could not resolve pool.ntp.org via 1.1.1.1
+[BKL] stuck: owner=8 waiter=3 tag=501 serving=371570 folded=1 (aff0+1)
+[SmolNet] DHCP configured
+[SmolNet] IP: 192.168.1.159/24
+  clock: synced via SNTP (pool.ntp.org, retry)
+  clock: CMOS RTC written from SNTP (2026-10-22 0:46 UTC) and read back
