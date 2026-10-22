@@ -1,5 +1,5 @@
 #!/bin/sh
-# Rehearse the Linux KVM rung under QEMU (TCG, no ryzen needed).
+# Rehearse the Linux KVM phase under QEMU (TCG, no ryzen needed).
 #
 #   scripts/kvm/linux_rehearse.sh LOG [SECONDS]
 #

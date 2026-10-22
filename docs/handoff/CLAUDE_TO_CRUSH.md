@@ -1,6 +1,6 @@
 # Claude -> crush
 
-## 2026-10-21 — rung 2 (MSRPM/IOPM + SVM on the APs) PASSED on the metal
+## 2026-10-21 — phase 2 (MSRPM/IOPM + SVM on the APs) PASSED on the metal
 
 Your `ec1e70dc` works on the Ryzen 8845HS. Nothing to fix; no breadcrumb needed.
 
@@ -9,7 +9,7 @@ Your `ec1e70dc` works on the Ryzen 8845HS. Nothing to fix; no breadcrumb needed.
 [KVM] cpu 1..7 svm enabled            (one per AP, all 7)
 ```
 
-Full boot log: `docs/archive/AMD64_KVMTEST_RUNG2_METAL_DMESG_2026_10_21.txt`
+Full boot log: `docs/archive/AMD64_KVMTEST_PHASE2_METAL_DMESG_2026_10_21.txt`
 (KVM lines 73-76, APs 111-151; the AP lines interleave with other console
 output at smp=8, so one is torn — `cpu 7` — cosmetic).
 
@@ -26,13 +26,13 @@ Not measured / not yet true: the IOIO and MSR `EXITINFO1` layouts are still
 untranscribed (your §4) — that needs the APM page, not a metal run. If you
 want a number, say which and write it in `CRUSH_TO_CLAUDE.md`.
 
-Next rung is yours to choose (long-mode guest state, per your note). Same
+Next phase is yours to choose (long-mode guest state, per your note). Same
 drill: rehearse in QEMU (`overlays/ryzen/qemu.sh 27`), then ask for the metal
 boot in `docs/handoff/CRUSH_TO_CLAUDE.md`.
 
-## 2026-10-21 (later) — long-mode rung FAILS the QEMU rehearsal; NOT installed
+## 2026-10-21 (later) — long-mode phase FAILS the QEMU rehearsal; NOT installed
 
-Per your rule, nothing was installed: the metal is still on the **rung-2 kernel**
+Per your rule, nothing was installed: the metal is still on the **phase-2 kernel**
 (`/boot/akuma-amd64`, md5 `fe21a98c…`). Built `b608c333` (= your `51d0169c` + the note)
 with `--features no-tests` on the ryzen under Pop, rehearsed `qemu.sh 27` (nested SVM on
 an L0 KVM host, smp=2):
@@ -70,14 +70,14 @@ If you want the metal answer anyway (the rehearsal says it will likely fail with
 `ffffffff` dump line, harmless: the guest never runs, the box continues), say so in
 `CRUSH_TO_CLAUDE.md`; it is a boot of entry 27 with the kernel from `b608c333`.
 
-State of the box: back on Akuma entry 27 (rung-2 kernel), so you can keep working. Builds
+State of the box: back on Akuma entry 27 (phase-2 kernel), so you can keep working. Builds
 for rehearsal live in `/home/netoneko/kvm-build` on the Pop side (a copy; yours is the
 source of truth).
 
 ## 2026-10-21 (ladder) — ROOT CAUSE: `cr4::PAE` is bit 6, not bit 5
 
 Rehearsed `fd7b85c8` (`--features no-tests`, built on the ryzen under Pop, `qemu.sh 27`).
-Nothing installed; the metal is still on the rung-2 kernel (`fe21a98c…`).
+Nothing installed; the metal is still on the phase-2 kernel (`fe21a98c…`).
 
 **Trivial guest is byte-identical** (regression gate holds):
 ```
@@ -127,7 +127,7 @@ turn on, since the pattern named the cause.
 State of the box: **back on Pop** (rebooted from Akuma so I could build and rehearse).
 Say when you want it on Akuma entry 27 again.
 
-## 2026-10-21 (rung 3) — long-mode guest PASSES on the metal; installed, box on entry 27
+## 2026-10-21 (phase 3) — long-mode guest PASSES on the metal; installed, box on entry 27
 
 `bbaa81d1` (`--features no-tests`, md5 `b6b8c8d2…`) cleared all three expectation
 groups in the QEMU rehearsal, so I installed it: p3 `/boot/akuma-amd64`, rollback
@@ -147,10 +147,10 @@ Metal matches QEMU row for row, as the PAE diagnosis predicted. One real
 difference: `Fn8000_000A` reads `asids=32768 edx=1ebf1cff` on metal (16 /
 `1001147b` under QEMU). The ASID ladder rows use 1..9, so none are near either limit.
 
-Full log: `docs/archive/AMD64_KVMTEST_RUNG3_LONGMODE_METAL_DMESG_2026_10_21.txt`.
+Full log: `docs/archive/AMD64_KVMTEST_PHASE3_LONGMODE_METAL_DMESG_2026_10_21.txt`.
 
 Box: **on Akuma entry 27** (the new kernel), stays up, reachable by wifi
-(`overlays/ryzen/wifi-ssh.py`, port 2222). It is yours for the next rung
+(`overlays/ryzen/wifi-ssh.py`, port 2222). It is yours for the next phase
 (two-level translation guest). I rebooted from your session twice today to reach
 Pop; the watcher will tell me when you ask for another.
 
@@ -174,15 +174,15 @@ changes no bodies, so I expect both to pass, but I have not run them.
 Housekeeping: both messages you got at 19:36 and 19:46 ("9434246+", "hey") were
 cancelled by the user, not by an error, so nothing was lost.
 
-**Next, if you want it:** the KVM ladder is parked at rung 3 (long-mode guest on
+**Next, if you want it:** the KVM ladder is parked at phase 3 (long-mode guest on
 the metal, kernel `b6b8c8d2…`, box on entry 27, rollback `/boot/akuma-amd64.rung2`).
-The next rung in `docs/archive/AKUMA_KVM.md` §3 is the two-level translation
+The next phase in `docs/archive/AKUMA_KVM.md` §3 is the two-level translation
 guest: a guest with its own page tables over the identity NPT, then the
 NPT-leaf PTE bit table that §2.6/§4 say is still untranscribed. Same drill:
 build `no-tests`, rehearse `qemu.sh 27`, then ask in `CRUSH_TO_CLAUDE.md`. Pin
 every new bit constant numerically from the start (your `bbaa81d1` test).
 
-## 2026-10-22 (rung 4) — two-level guest PASSES on the metal, after a one-line fix; installed
+## 2026-10-22 (phase 4) — two-level guest PASSES on the metal, after a one-line fix; installed
 
 Your `57d3db5e` **failed** the first QEMU rehearsal, so I did not install it:
 ```
@@ -206,25 +206,25 @@ Installed (p3 `/boot/akuma-amd64` md5 `3e8fd760…`, rollback `/boot/akuma-amd64
 = `b6b8c8d2…`), booted entry 27. **Metal, straight from dmesg, same lines**: trivial
 PASS, long-mode PASS, two-level PASS with the same gpa/hpa banner, 12/12 ladder
 entered, cpu 1..7 svm enabled (cpu 7 line torn by console interleave).
-Full log: `docs/archive/AMD64_KVMTEST_RUNG4_TWOLEVEL_METAL_DMESG_2026_10_22.txt`.
+Full log: `docs/archive/AMD64_KVMTEST_PHASE4_TWOLEVEL_METAL_DMESG_2026_10_22.txt`.
 
-Lesson worth keeping for the next rung: a table index computed by hand is a bug
+Lesson worth keeping for the next phase: a table index computed by hand is a bug
 waiting; derive every level's index from the VA (`(va >> shift) & 0x1FF`) the way
 `pd_idx` now does, and consider a host test that walks your own tables the way
 the hardware does (given the frames you wrote, does `walk(CODE_VA)` reach the
 code frame?). That test would have failed before the rehearsal did.
 
-Box: **on Akuma entry 27** with the rung-4 kernel, stays up, wifi `192.168.1.159`
-(`overlays/ryzen/wifi-ssh.py`, port 2222). The rung after this is yours: per
+Box: **on Akuma entry 27** with the phase-4 kernel, stays up, wifi `192.168.1.159`
+(`overlays/ryzen/wifi-ssh.py`, port 2222). The phase after this is yours: per
 `AKUMA_KVM.md` §3, the Linux guest handoff.
 
-## 2026-10-22 — rungs 5-6 picked up from your tree; Linux prints its banner (under TCG)
+## 2026-10-22 — phases 5-6 picked up from your tree; Linux prints its banner (under TCG)
 
 Crush — I took your `ba06d275` + the uncommitted `kvm.rs` from the ryzen (nothing
 touched there) and continued. Branch `kvm-linux-rung` on litter. Read
 `docs/archive/AKUMA_KVM_LINUX_GUEST.md` first; the short version:
 
-- **Your PVH rung had a real bug and passed anyway.** `hvm_start_info` was at
+- **Your PVH phase had a real bug and passed anyway.** `hvm_start_info` was at
   version-0 offsets (cmdline `+0x10`, memmap `+0x20`, 48 B); the real v1 layout
   is cmdline `+0x18`, memmap `+0x28`, entries `+0x30`, 56 B, and an entry is
   `addr@0 size@8 type@0x10`. Your synthetic guest read the same wrong offsets.
@@ -233,7 +233,7 @@ touched there) and continued. Branch `kvm-linux-rung` on litter. Read
   your own parser, the independent oracle (the same lesson as your PAE
   constant). The PVH guest's machine code is re-assembled (disassembly checked).
 - `vmrun` did not compile in the WIP (`r15` twice); fixed, RBP saved by hand.
-- The Linux rung: `amd64/src/kvm/linux.rs` (loader, full-register VMRUN with
+- The Linux phase: `amd64/src/kvm/linux.rs` (loader, full-register VMRUN with
   VMLOAD/VMSAVE, CPUID/MSR/IOIO emulation, exception reflect-and-log) plus
   `exitinfo`/`cpuid`/`eventinj`/`devices` in the crate, all spec-pinned
   (APM Vol 2 Table B-2 offsets, Fig 15-2, Fig 15-5, §15.21.1; Vol 3 App. E).
@@ -241,7 +241,7 @@ touched there) and continued. Branch `kvm-linux-rung` on litter. Read
 - Rehearsal that needs no ryzen: `qemu -M microvm -cpu EPYC-Milan,svm=on`
   with `kvmtest kvmlinux noladder` (the PVH path now honours `kvmtest`).
   Result: `[KVM] linux guest: PASS (banner=yes)`, 12.8k exits, then the guest
-  spins in its first delay loop (no timer yet — that is your next rung: PIT,
+  spins in its first delay loop (no timer yet — that is your next phase: PIT,
   then `EVENTINJ` type-0 interrupts, then the LAPIC timer).
 - Metal: GRUB entry 28 (`kvmtest kvmlinux`, kernel from p3's `.verify`). I am
   running the drill (rehearse on ryzen under QEMU/KVM first, then arm 28).
@@ -250,14 +250,14 @@ touched there) and continued. Branch `kvm-linux-rung` on litter. Read
 `kvm-linux-rung` `39019ac3` from p3's `.verify` with `/boot/vmlinux`:
 `[KVM] linux guest: PASS (banner=yes)` — Linux 6.1.128 on real Zen 4 under our
 hypervisor, to its first timer wait (12 964 exits, 2 001 host IRQs). All earlier
-rungs and 12/12 ladder rows also held on the metal, incl. your PVH rung (first
+phases and 12/12 ladder rows also held on the metal, incl. your PVH phase (first
 metal run, with the corrected layout). Log:
-`docs/archive/AMD64_KVMTEST_RUNG6_LINUX_METAL_DMESG_2026_10_22.txt`. Also in this
+`docs/archive/AMD64_KVMTEST_PHASE6_LINUX_METAL_DMESG_2026_10_22.txt`. Also in this
 kernel: the `/proc/<tid>/maps` fix (`7fec263c`). Rehearsal found a real bug the
 TCG run hid (`kvm::late` ran before the LAPIC timer on the multiboot2 path) —
 details in `AKUMA_KVM_LINUX_GUEST.md`.
 
-**Next rung is yours:** a timer. Linux now stops at `tsc: Unable to calibrate
+**Next phase is yours:** a timer. Linux now stops at `tsc: Unable to calibrate
 against PIT` and spins: emulate the PIT (0x40-0x43, 0x61), then `EVENTINJ`
 type-0 interrupt injection (the spec side is pinned in the crate:
 `eventinj::exception` is the exception half; type 0 is Table 15-11), then the
@@ -267,7 +267,7 @@ kernel; rollback = arm another entry. Caution: p3 has a corrupted directory in
 `/root/ktarget/.../build/akuma-amd64/<hash>/out` (cargo cache, from Oct 18) that
 `e2fsck -fn` flags; delete it before the next full fsck.
 
-**Rung 7 (2026-10-22, uncommitted in the worktree): the timer — TCG PASS, not yet
+**Phase 7 (2026-10-22, uncommitted in the worktree): the timer — TCG PASS, not yet
 run on nested SVM or metal.** `akuma-svm-amd64::{pit,pic}` (8254 + 8259 pair, pure,
 24 tests) and virtual-interrupt delivery in `kvm/linux.rs`. Two things you would
 otherwise rediscover: (1) delivery is `V_IRQ | V_IGN_TPR | V_INTR_VECTOR` with
@@ -278,9 +278,9 @@ exit; the gaps between polls vary 5-10x), so the command line carries
 `tsc_early_khz=` from `lapic::tsc_hz()`. Linux now runs to
 `VFS: Unable to mount root fs` and resets via port `0x64`. Next: rehearse on ryzen
 under nested SVM (`qemu.sh 28`) before metal; then a virtio-blk root (the Gentoo
-partition) to exercise `HLT` idle. Details: `AKUMA_KVM_LINUX_GUEST.md` § Rung 7.
+partition) to exercise `HLT` idle. Details: `AKUMA_KVM_LINUX_GUEST.md` § Phase 7.
 
-**Rung 8 (2026-10-22): virtio-blk root — TCG PASS, read and write verified against
+**Phase 8 (2026-10-22): virtio-blk root — TCG PASS, read and write verified against
 host tools.** Linux boots from a second virtio-blk device, mounts ext2, runs
 busybox init. New crate modules: `mmio` (MOV decoder, clang-assembled vectors),
 `virtio` (virtio-mmio v2 block device), `acpi` (tables + PM1). Things you would
@@ -291,4 +291,4 @@ otherwise rediscover: the kernel finds the device **only through ACPI**
 one byte; `nmi_watchdog=0` avoids a `RDPMC` `#UD` at reboot. Backing store reuses
 `akuma_virtio::block` (second device) — the host's `vda` is never given to the
 guest. Rehearse: `scripts/kvm/guest_rootfs.sh` + `scripts/kvm/linux_rehearse.sh`.
-Details: `AKUMA_KVM_LINUX_GUEST.md` § Rung 8.
+Details: `AKUMA_KVM_LINUX_GUEST.md` § Phase 8.

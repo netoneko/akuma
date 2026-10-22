@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the ext2 root image the Linux KVM rung boots from.
+# Build the ext2 root image the Linux KVM phase boots from.
 #
 #   scripts/kvm/guest_rootfs.sh OUT.img BUSYBOX [INITTAB]
 #
@@ -7,7 +7,7 @@
 # /bin/sh as busybox, a /dev/console and /dev/null, and an /etc/inittab that
 # (default) mounts /proc, prints markers, checks a read (md5 of busybox) and a
 # write (a 256 KiB pattern file) and reboots. Needs e2fsprogs (mke2fs, debugfs).
-# See docs/archive/AKUMA_KVM_LINUX_GUEST.md, "Rung 8".
+# See docs/archive/AKUMA_KVM_LINUX_GUEST.md, "Phase 8".
 set -eu
 OUT=${1:?usage: guest_rootfs.sh OUT.img BUSYBOX [INITTAB]}
 BB=${2:?usage: guest_rootfs.sh OUT.img BUSYBOX [INITTAB]}

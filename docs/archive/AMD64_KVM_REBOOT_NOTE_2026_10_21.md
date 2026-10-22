@@ -15,7 +15,7 @@ extends the rung-0 guest from "two vmmcalls, hlt" to a guest that exercises
   next VMRUN as an asm input — RDX is *shared*, not saved, Table B-2) and
   advances RIP for the IOIO exit. `vmrun` now declares the shared GPRs
   clobbered; **rbx/rbp cannot be inline-asm operands in Rust** (LLVM-reserved
-  / frame pointer) — the seed guest never writes them, rung 2 needs a real
+  / frame pointer) — the seed guest never writes them, phase 2 needs a real
   register file.
 - **SVM on the APs**: the BSP reserves all 16 host save areas up front
   (`reserve_hsaves`, deliberately leaked — no allocation during AP bring-up),
@@ -73,4 +73,4 @@ fields — the handler reads RCX/RDX as shared GPRs instead. If metal hands us
 a dump line, its `info1` is free data for the next extraction.
 
 Keep the spec-first, host-tested, honest-about-what-is-unproven habit. Next
-rung after this: Linux as the guest — long-mode guest state first.
+phase after this: Linux as the guest — long-mode guest state first.

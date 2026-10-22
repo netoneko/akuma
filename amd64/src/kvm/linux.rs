@@ -1,9 +1,9 @@
-//! The Linux rung: a real `vmlinux`, entered the PVH way, run until it stops.
+//! The Linux phase: a real `vmlinux`, entered the PVH way, run until it stops.
 //!
-//! Everything earlier rungs proved composes here: a guest entered 32-bit,
-//! unpaged, with EBX = `hvm_start_info` (the PVH rung), under two-level
-//! translation (the two-level rung), with the permission maps armed (the
-//! trivial rung). What is new is the *payload* — an ELF kernel streamed off the
+//! Everything earlier phases proved composes here: a guest entered 32-bit,
+//! unpaged, with EBX = `hvm_start_info` (the PVH phase), under two-level
+//! translation (the two-level phase), with the permission maps armed (the
+//! trivial phase). What is new is the *payload* — an ELF kernel streamed off the
 //! root filesystem into guest RAM — and the thing a payload needs that a
 //! dozen-byte test guest never did: **a platform**. The guest asks the
 //! hypervisor questions (`CPUID`), touches registers the hypervisor owns
@@ -31,7 +31,7 @@
 //! No interrupt injection, no timer, no local APIC, no PCI. The command line
 //! says so (`noapic nolapic nosmp noacpi`), and a guest that waits for a tick
 //! stops the run at `HLT` — which is a finding, not a failure of the loader.
-//! The rung's pass is the kernel's banner arriving on the emulated COM1.
+//! The phase's pass is the kernel's banner arriving on the emulated COM1.
 
 use super::{crumb, dec, dump_exit, dump_state, enable_on_core, hx, image_pa, next_rip, p, Iopm, Msrpm};
 use crate::phys::FreshFrame;
@@ -83,8 +83,8 @@ const LOG_FIRST: u32 = 40;
 /// nobody emulates must not hold the boot — least of all on metal.
 const RUN_BUDGET_US: u64 = 120_000_000;
 const QUIET_BUDGET_US: u64 = 20_000_000;
-/// ASID: unique among the rungs (ladder 1-13, two-level 14, pvh 15 under
-/// QEMU's 16); the first entry flushes, so it cannot see a previous rung's
+/// ASID: unique among the phases (ladder 1-13, two-level 14, pvh 15 under
+/// QEMU's 16); the first entry flushes, so it cannot see a previous phase's
 /// stale translations.
 const ASID: u32 = 1;
 
@@ -720,7 +720,7 @@ fn guest_code(ram: &Ram, v: &Vmcb<'_>, va: u64) -> Option<[u8; 16]> {
     let paging = v.cr0() & svm::cr0::PG != 0;
     let gpa = if paging {
         // Only the long-mode walk is implemented; a guest paging any other way
-        // is not one this rung has seen.
+        // is not one this phase has seen.
         if v.efer() & svm::msr::EFER_LMA == 0 {
             return None;
         }
@@ -774,7 +774,7 @@ fn dump_code(ram: &Ram, v: &Vmcb<'_>, va: u64) {
     }
 }
 
-/// Run the Linux rung. Called once SVM is enabled and the root filesystem is
+/// Run the Linux phase. Called once SVM is enabled and the root filesystem is
 /// mounted (`kvm::late`).
 /// [`LINUX_CMDLINE`] followed by ` tsc_early_khz=<khz>` (omitted when the host
 /// has no calibrated TSC), assembled in `buf`.

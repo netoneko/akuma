@@ -1,4 +1,4 @@
-//! SVM hypervisor seed — M1 rung 0 (`docs/archive/AKUMA_KVM.md`).
+//! SVM hypervisor seed — M1 phase 0 (`docs/archive/AKUMA_KVM.md`).
 //!
 //! A CPUID probe that prints one `[KVM]` line on every boot, plus — behind the
 //! `kvmtest` cmdline flag, the `hdatest` precedent — a trivial guest: two
@@ -16,9 +16,9 @@
 //! Spec-first: no Linux/KVM code was consulted (GPL); every constant traces to
 //! the APM citation recorded in the crate or the milestone doc.
 //!
-//! Rung-0 shape, each choice deliberate (see the doc's §3/§4): the enable
+//! Phase-0 shape, each choice deliberate (see the doc's §3/§4): the enable
 //! is per-core MSR state, so the BSP enables at probe time and every AP
-//! follows in `ap_entry64` ([`ap_hook`], behind `kvmtest` — rung 2 owns
+//! follows in `ap_entry64` ([`ap_hook`], behind `kvmtest` — phase 2 owns
 //! the default), each against a host save area reserved up front and
 //! leaked, so no AP allocates during bring-up; the MSRPM/IOPM are `.bss`
 //! statics because the two things §15.11/§15.10.1 demand of them — 4-KiB
@@ -35,7 +35,7 @@
 //! the host's register file. The asm therefore clobbers all of them,
 //! round-trips RCX and RDX (the two the seed guest exercises) through the
 //! exit loop, and treats the rest as host-garbage at the next entry — a
-//! real VMM keeps its own register file and feeds them all back (rung 2).
+//! real VMM keeps its own register file and feeds them all back (phase 2).
 //! The first guest that writes RCX before an intercepted instruction
 //! would otherwise corrupt the host in flight.
 
@@ -106,7 +106,7 @@ pub fn init(cmdline: &str) {
     }
 
     // Fn8000_000A (Vol 3 §E.4.9): EAX revision, EBX ASID count, EDX feature
-    // bits — NP=0 and NRIPS=3 are the two rung 0 branches on.
+    // bits — NP=0 and NRIPS=3 are the two phase 0 branches on.
     let fa = __cpuid(0x8000_000A);
     p("[KVM] Fn8000_000A: rev=");
     hx(u64::from(fa.eax), 8);
@@ -116,13 +116,13 @@ pub fn init(cmdline: &str) {
     hx(u64::from(fa.edx), 8);
     p("\n");
     if fa.edx & 1 == 0 {
-        p("[KVM] EDX[NP] clear: no nested paging, rung 0 needs it\n");
+        p("[KVM] EDX[NP] clear: no nested paging, phase 0 needs it\n");
         return;
     }
     let nrips = fa.edx & (1 << 3) != 0;
     NRIPS.store(nrips, Ordering::Relaxed);
 
-    p("[KVM] SVM available; EFER.SVME not yet enabled (per-core, rung 2)\n");
+    p("[KVM] SVM available; EFER.SVME not yet enabled (per-core, phase 2)\n");
     if want_test {
         if !reserve_hsaves() {
             p("[KVM] kvmtest: no frame for the BSP host save area\n");
@@ -136,17 +136,17 @@ pub fn init(cmdline: &str) {
         // `noladder`: skip the twelve consistency probes. Under QEMU TCG the last
         // row (LME+LMA with paging off) resets the machine, which is TCG's
         // emulation of an illegal VMRUN state, not the hardware's — the metal
-        // answers it `entered`. A rehearsal that wants the rungs *after* the
-        // ladder (the Linux rung) passes this.
+        // answers it `entered`. A rehearsal that wants the phases *after* the
+        // ladder (the Linux phase) passes this.
         if !cmdline.split_ascii_whitespace().any(|t| t == "noladder") {
             consistency_ladder();
         }
     }
 }
 
-/// The rungs that need the root filesystem, run once it is mounted: with
-/// `kvmtest` (which enabled SVM and ran the early rungs in [`init`]) and
-/// `kvmlinux` both on the command line, the Linux rung — a real `vmlinux` off
+/// The phases that need the root filesystem, run once it is mounted: with
+/// `kvmtest` (which enabled SVM and ran the early phases in [`init`]) and
+/// `kvmlinux` both on the command line, the Linux phase — a real `vmlinux` off
 /// `/boot/vmlinux`.
 pub fn late(cmdline: &str) {
     let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
@@ -537,11 +537,11 @@ const LONGMODE_CODE: [u8; 26] = [
     0xEB, 0xFE, // jmp $
 ];
 
-/// The long-mode rung: the trivial guest's rehearsal with the guest paged
+/// The long-mode phase: the trivial guest's rehearsal with the guest paged
 /// and 64-bit. The guest walks its own three-level identity table (the
 /// PTE encoding is the same x86-64 one `npt` names, so its builders make
 /// guest entries too) *under* the nested tables — proving the two-level
-/// translation, guest VA → guest PA → host PA, that the Linux rung stands
+/// translation, guest VA → guest PA → host PA, that the Linux phase stands
 /// on. Breadcrumbs 0x11–0x19 mirror the trivial guest's 1–9, so a reset
 /// names which guest died.
 fn longmode_guest(nrips: bool) {
@@ -774,7 +774,7 @@ fn longmode_guest(nrips: bool) {
 }
 
 // ---------------------------------------------------------------------------
-// The two-level rung: both translations non-identity
+// The two-level phase: both translations non-identity
 // ---------------------------------------------------------------------------
 
 /// The checkpoint-one magic — the prologue's `movabs` again, decoded only
@@ -802,7 +802,7 @@ const TWOVL_GPT_REGION: [u64; 4] = [0x4040_0000, 0x4060_0000, 0x4080_0000, 0x40A
 
 /// Guest-virtual layout, in a third region entirely: the code and the data
 /// share a 2-MiB region but sit in **different 4-KiB pages** — if the PT
-/// level were skipped (a 2-MiB leaf where the rung builds a 4-KiB one), the
+/// level were skipped (a 2-MiB leaf where the phase builds a 4-KiB one), the
 /// data read would land in the code page and checkpoint two fails.
 const TWOVL_CODE_VA: u64 = 0x5000_0000;
 const TWOVL_DATA_VA: u64 = 0x5000_1000;
@@ -847,11 +847,11 @@ const TWOVL_CODE: [u8; 32] = {
     c
 };
 
-/// The Linux rung's foundation, proven in isolation: guest VA ≠ guest PA
+/// The Linux phase's foundation, proven in isolation: guest VA ≠ guest PA
 /// (the guest page tables do real per-page work) *and* guest PA ≠ host PA
 /// (the NPT relocates each synthetic region onto wherever the PMM put a
-/// frame). The trivial rung proved VMRUN, the long-mode rung proved a paged
-/// 64-bit guest over an identity NPT; this rung removes the identity from
+/// frame). The trivial phase proved VMRUN, the long-mode phase proved a paged
+/// 64-bit guest over an identity NPT; this phase removes the identity from
 /// **both** levels at once — the exact shape a loader stands on when it
 /// places a guest image at guest-physical addresses the host does not have.
 /// Breadcrumbs 0x31–0x39 mirror the other guests' runs.
@@ -951,7 +951,7 @@ fn twolvl_guest(nrips: bool) {
     svm::wr64(gpt_f.bytes_mut(), 0, svm::npt::leaf_4k(code_gpa));
     svm::wr64(gpt_f.bytes_mut(), 8, svm::npt::leaf_4k(data_gpa));
 
-    // VMCB — the long-mode rung's state with the synthetic CR3 and VA in
+    // VMCB — the long-mode phase's state with the synthetic CR3 and VA in
     // place of the identity ones; ASID 14 stays clear of the ladder's 1–13.
     svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
     svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
@@ -1097,11 +1097,11 @@ fn twolvl_guest(nrips: bool) {
 /// its first dword back, so it must be at least 4 bytes.
 const PVH_CMDLINE: &str = "console=hvc0";
 /// The code page plays this 2-MiB region of the 1–2 GiB band (one 2-MiB
-/// NPT leaf, the two-level rung's window trick).
+/// NPT leaf, the two-level phase's window trick).
 const PVH_CODE_REGION: u64 = 0x4000_0000;
 /// The handoff pages' region top: `pvh::plan` packs cmdline/memmap/start
 /// directly under it. Three distinct 4-KiB pages inside one 2-MiB region —
-/// which is why this rung's NPT grows the PT level the earlier rungs never
+/// which is why this phase's NPT grows the PT level the earlier phases never
 /// needed.
 const PVH_TOP_GPA: u64 = 0x4060_0000;
 
@@ -1165,14 +1165,14 @@ const PVH_CODE: [u8; 0x59] = [
     0xEB, 0xFE, // 0x57 jmp $
 ];
 
-/// The Linux rung's **protocol**, proven before the Linux rung's **payload**:
+/// The Linux phase's **protocol**, proven before the Linux phase's **payload**:
 /// a guest entered exactly the way a PVH loader enters one — 32-bit
 /// protected mode, paging off, EBX holding `hvm_start_info`'s guest-physical
 /// address — reading the handoff blobs the crate's `pvh` writers built. A
 /// synthetic guest stands in for the image: the ELF note that names the
 /// entry is host-testable (`elf::entry_phys32`), and the entry register is
-/// the part only a VMRUN can prove. If this rung passes, what remains for
-/// the Linux rung is the payload: parse a real image, copy its segments,
+/// the part only a VMRUN can prove. If this phase passes, what remains for
+/// the Linux phase is the payload: parse a real image, copy its segments,
 /// field its I/O. Breadcrumbs 0x41–0x49.
 fn pvh_guest(nrips: bool) {
     crumb(0x41);
@@ -1233,7 +1233,7 @@ fn pvh_guest(nrips: bool) {
 
     // NPT: the code page rides a 2-MiB leaf in its own region; the three
     // handoff pages, packed in one region by `pvh::plan`, need real 4-KiB
-    // leaves — the first PT level any rung's nested tables have built.
+    // leaves — the first PT level any phase's nested tables have built.
     let npml4_pa = npml4_f.pa() as u64;
     let npdpt_pa = npdpt_f.pa() as u64;
     let npd_pa = npd_f.pa() as u64;
@@ -1251,7 +1251,7 @@ fn pvh_guest(nrips: bool) {
         svm::wr64(nptpt_f.bytes_mut(), ((gpa >> 12) & 0x1FF) as usize * 8, svm::npt::leaf_4k(frame_pa));
     }
 
-    // VMCB — the trivial rung's 32-bit unpaged state, ASID 15 (ladder 1–13,
+    // VMCB — the trivial phase's 32-bit unpaged state, ASID 15 (ladder 1–13,
     // two-level 14), and EBX = start_info's GPA delivered through the
     // extended `vmrun`, which is the entire PVH convention.
     svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
@@ -1404,7 +1404,7 @@ fn pvh_guest(nrips: bool) {
 const PROBE_CODE: [u8; 5] = [0x0F, 0x01, 0xD9, 0xEB, 0xFE];
 
 /// One ladder row: which ingredients the probe's guest state carries. Everything
-/// not named here is identical to the long-mode rung (the intercepts, the
+/// not named here is identical to the long-mode phase (the intercepts, the
 /// permission maps, DR6/DR7, the data segments, rflags, cpl, rip, rsp).
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy)]
@@ -1420,8 +1420,8 @@ struct LadderCfg {
     asid: u32,
 }
 
-/// The L0 (KVM under QEMU) rejects the long-mode rung with `VMEXIT_INVALID`
-/// while the trivial rung passes, and an audit of KVM v6.6/v6.8/v6.9
+/// The L0 (KVM under QEMU) rejects the long-mode phase with `VMEXIT_INVALID`
+/// while the trivial phase passes, and an audit of KVM v6.6/v6.8/v6.9
 /// `__nested_vmcb_check_save`/`__nested_vmcb_check_controls` passes our state
 /// on paper, so the failing check is version-specific or outside those two
 /// functions. The ladder is the bisect: one VMRUN per row against the trivial
@@ -1487,7 +1487,7 @@ fn consistency_ladder() {
     let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
 
     // Nested and guest paging, built once for `probe_pa` exactly as the
-    // long-mode rung builds them; rows that do not page simply never walk.
+    // long-mode phase builds them; rows that do not page simply never walk.
     let npml4_pa = npml4_f.pa() as u64;
     let npdpt_pa = npdpt_f.pa() as u64;
     let npd_pa = npd_f.pa() as u64;
@@ -1692,7 +1692,7 @@ fn dump_state(v: &Vmcb<'_>) {
 /// the value rides in through r15 and the asm pushes the host's RBX, loads
 /// it, and restores it after the exit — the guest entered with EBX set,
 /// which is exactly what the PVH handoff convention demands (start_info's
-/// guest-physical address), and what no earlier rung needed. RBP is
+/// guest-physical address), and what no earlier phase needed. RBP is
 /// saved and restored by hand around the VMRUN (it is the frame pointer, so
 /// it cannot be an operand): VMRUN does not restore it, and a Linux guest uses
 /// it freely.

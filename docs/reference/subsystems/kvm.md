@@ -3,11 +3,11 @@
 An AMD SVM (AMD-V) + nested-paging hypervisor inside the amd64 kernel, developed
 on the ryzen metal it runs on. It runs a real Linux guest (Firecracker CI
 `vmlinux-6.1.128`) with a console, timer interrupts and a virtio-blk ext2 root.
-Source: **`amd64/src/kvm.rs`** (rungs 0-5, the consistency ladder),
-**`amd64/src/kvm/linux.rs`** (the Linux rung), and the pure models in
+Source: **`amd64/src/kvm.rs`** (phases 0-5, the consistency ladder),
+**`amd64/src/kvm/linux.rs`** (the Linux phase), and the pure models in
 **`crates/akuma-svm-amd64`**.
 
-> **Stability: C (active risk).** Rungs 0-8 have passed on the metal (2026-10-22:
+> **Stability: C (active risk).** Phases 0-8 have passed on the metal (2026-10-22:
 > Linux boots from a virtio-blk root on the ryzen, entry 28). The guest cannot reach any
 > real device — NPT maps only its RAM and every port and MSR is intercepted — so a
 > wrong guest is a stopped run, not a hardware hazard. A wrong *host* side can
@@ -69,6 +69,6 @@ Kernel command line: `kvmtest kvmlinux` (add `noladder` under TCG).
 
 ## Background
 
-[`../../archive/AKUMA_KVM.md`](../../archive/AKUMA_KVM.md) (the rungs and their
+[`../../archive/AKUMA_KVM.md`](../../archive/AKUMA_KVM.md) (the phases and their
 timeline), [`../../archive/AKUMA_KVM_LINUX_GUEST.md`](../../archive/AKUMA_KVM_LINUX_GUEST.md)
-(the Linux rung, rungs 7-8, every bug found and how).
+(the Linux phase, phases 7-8, every bug found and how).

@@ -23,7 +23,7 @@ Pop with `/dev/port` (index 0x70, data 0x71). Entry 27 in
 kernel until Pop re-arms it; `dmesg` loses the boot to `[rtw]` spam within
 minutes, so read it first.
 
-Next rung: per `AKUMA_KVM.md`, enable SVM on the APs, then MSRPM/IOPM. Keep the
+Next phase: per `AKUMA_KVM.md`, enable SVM on the APs, then MSRPM/IOPM. Keep the
 spec-first, host-tested, honest-about-what-is-unproven habit.
 
 ## Talking to Claude (the outer session)

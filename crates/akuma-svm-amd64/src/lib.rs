@@ -488,7 +488,7 @@ impl SegAttr {
     /// the raw 32-bit limit field tops out at 1 MiB, which is not flat.
     pub const CODE32_DPL0: Self = Self::from_fields(0xB, true, 0, true, false, false, true, true);
     /// 32-bit read/write data, DPL 0, accessed: type `3`, S=1, P=1, G=1
-    /// (the rung-0 guest's SS/DS/ES; same G=1/limit `0xFFFFF` pairing).
+    /// (the phase-0 guest's SS/DS/ES; same G=1/limit `0xFFFFF` pairing).
     pub const DATA32_RW_DPL0: Self = Self::from_fields(0x3, true, 0, true, false, false, false, true);
     /// 64-bit code, DPL 0, accessed: type `B`, S=1, P=1, **L=1, D=0**.
     /// With paging on the two together are the long-mode state §15.5.1
@@ -955,7 +955,7 @@ pub enum Illicit {
 ///
 /// Deliberately **not** implemented, pending exact bit tables from the spec
 /// transcription: the MBZ-bit sets of CR3/CR4 and the EFER reserved bits
-/// (Vol 3 owns the encodings; transcribe before the Linux rung), MSRPM/IOPM
+/// (Vol 3 owns the encodings; transcribe before the Linux phase), MSRPM/IOPM
 /// beyond max physical address (needs the box's max PA), event-injection
 /// legality (the seed never injects: EVENTINJ stays 0), and the S_CET checks
 /// (CET unused).
@@ -1228,14 +1228,14 @@ pub mod iopm {
 /// Page tables as **indices and walks**.
 ///
 /// The one computation a hand-built table gets silently wrong is which slot
-/// a VA names at each level — rung 4 wrote its PD→PT entry at slot 0 when
+/// a VA names at each level — phase 4 wrote its PD→PT entry at slot 0 when
 /// `0x5000_0000` names slot 128, and the rehearsal spent a guest `#PF`
 /// discovering it. [`idx`] derives every level's index from the VA, and
 /// [`walk`]/[`translate`] read a built table back the way the MMU would, so
 /// a builder can check its own work before any guest runs.
 ///
 /// Entries use the same encoding as [`npt`] — which is the x86-64 PTE, and
-/// so also the guest's own tables (the long-mode rung already builds guest
+/// so also the guest's own tables (the long-mode phase already builds guest
 /// entries with `npt`'s builders).
 pub mod tables {
     /// Shift of the PML4 index field.
@@ -1248,7 +1248,7 @@ pub mod tables {
     pub const PT_SHIFT: u32 = 12;
 
     /// The 9-bit index `va` names at the level whose field starts at
-    /// `shift`. The whole lesson of rung 4 in one line: the index is a
+    /// `shift`. The whole lesson of phase 4 in one line: the index is a
     /// property of the VA, derived here rather than computed by hand at a
     /// call site.
     #[must_use]
@@ -1821,7 +1821,7 @@ pub mod elf {
 /// This is the Xen project's public PVH entry ABI (the `hvm_start_info` /
 /// `hvm_memmap_table_entry` wire format): magic `336EC578h`, version 0, a
 /// flags qword, the guest-physical addresses of the command line, the RSDP
-/// (0 = none, what a no-ACPI rung hands over) and the memory map, then the
+/// (0 = none, what a no-ACPI phase hands over) and the memory map, then the
 /// entry count. The guest is *entered* in 32-bit protected mode, paging
 /// off, with EBX holding `start_info`'s guest-physical address — the entry
 /// EIP comes from the image's ELF note (`elf::entry_phys32`). No Linux code
@@ -1846,7 +1846,7 @@ pub mod pvh {
     /// kernel's own parser (`akuma-ryzen-amd64`'s `StartInfo`, the one that
     /// boots on QEMU and Firecracker). Until 2026-10-22 this module had
     /// `cmdline` at `+0x10`, `memmap` at `+0x20` and a 48-byte struct, and its
-    /// synthetic guest read the same wrong offsets — so the PVH rung passed
+    /// synthetic guest read the same wrong offsets — so the PVH phase passed
     /// while a real guest saw no command line and no memory map.
     pub const START_SIZE: usize = 56;
     /// `sizeof(hvm_memmap_table_entry)`: u64 addr, u64 size, u32 type, u32
@@ -2220,9 +2220,9 @@ mod tests {
 
     // ---- the §15.5.1 validator ----
 
-    /// A guest state that must pass: the rung-0 shape — 32-bit flat
+    /// A guest state that must pass: the phase-0 shape — 32-bit flat
     /// protected mode, no guest paging, SVME on, ASID 1, VMRUN intercepted.
-    fn rung0_page() -> [u8; VMCB_SIZE] {
+    fn phase0_page() -> [u8; VMCB_SIZE] {
         let mut page = [0u8; VMCB_SIZE];
         let mut vmcb = Vmcb::new(&mut page);
         vmcb.set_efer(msr::EFER_SVME);
@@ -2239,7 +2239,7 @@ mod tests {
 
     #[test]
     fn flat_protected_no_paging_guest_is_legal() {
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         let vmcb = Vmcb::new(&mut page);
         assert_eq!(validate_guest_state(&vmcb), Ok(()));
     }
@@ -2247,41 +2247,41 @@ mod tests {
     #[test]
     fn each_consistency_check_fires_on_its_own_violation() {
         // SVME clear -> SvmeClear.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         Vmcb::new(&mut page).set_efer(0);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::SvmeClear));
 
         // CD=0 with NW=1 -> Cr0CdWithoutNw.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         Vmcb::new(&mut page).set_cr0(cr0::PE | cr0::NE | cr0::NW);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::Cr0CdWithoutNw));
         // ...but CD=1 with NW=1 is the historical reset shape and is legal.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         Vmcb::new(&mut page).set_cr0(cr0::PE | cr0::NE | cr0::NW | cr0::CD);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Ok(()));
 
         // CR0[63:32] set -> Cr0HighBits.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         Vmcb::new(&mut page).set_cr0(cr0::PE | cr0::NE | 1 << 32);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::Cr0HighBits));
 
         // DR6[63:32] set -> Dr6HighBits.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         wr64(&mut page, 0x568, 1 << 32);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::Dr6HighBits));
 
         // DR7[63:32] set -> Dr7HighBits.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         wr64(&mut page, 0x560, 1 << 32);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::Dr7HighBits));
 
         // LMA without LME -> LmaWithoutLme.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         Vmcb::new(&mut page).set_efer(msr::EFER_SVME | msr::EFER_LMA);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::LmaWithoutLme));
 
         // LME & PG without PAE -> LmePgWithoutPae.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         let mut vmcb = Vmcb::new(&mut page);
         vmcb.set_efer(msr::EFER_SVME | msr::EFER_LME);
         vmcb.set_cr0(cr0::PE | cr0::NE | cr0::PG);
@@ -2289,7 +2289,7 @@ mod tests {
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::LmePgWithoutPae));
 
         // LME & PG without PE -> LmePgWithoutPe.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         let mut vmcb = Vmcb::new(&mut page);
         vmcb.set_efer(msr::EFER_SVME | msr::EFER_LME);
         vmcb.set_cr0(cr0::NE | cr0::PG);
@@ -2298,7 +2298,7 @@ mod tests {
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::LmePgWithoutPe));
 
         // LME & PG & PAE with CS.L and CS.D both set -> LongModeLAndD.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         let mut vmcb = Vmcb::new(&mut page);
         vmcb.set_efer(msr::EFER_SVME | msr::EFER_LME);
         vmcb.set_cr0(cr0::PE | cr0::NE | cr0::PG);
@@ -2314,22 +2314,22 @@ mod tests {
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::LongModeLAndD));
 
         // ASID 0 -> AsidZero.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         Vmcb::new(&mut page).set_asid(0);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::AsidZero));
 
         // VMRUN intercept clear -> VmrunNotIntercepted.
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         Vmcb::new(&mut page).set_intr1(intr1::VMMCALL);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::VmrunNotIntercepted));
     }
 
-    /// The long-mode shape: rung 0's flat state with long mode switched
+    /// The long-mode shape: phase 0's flat state with long mode switched
     /// on — guest paging up (`PG` + `PAE`), `LME` and `LMA` set, a 64-bit
-    /// CS. This is the state the paged guest rung loads and what
+    /// CS. This is the state the paged guest phase loads and what
     /// `LongModeLAndD` guards.
     fn long_mode_page() -> [u8; VMCB_SIZE] {
-        let mut page = rung0_page();
+        let mut page = phase0_page();
         let mut vmcb = Vmcb::new(&mut page);
         vmcb.set_efer(msr::EFER_SVME | msr::EFER_LME | msr::EFER_LMA);
         vmcb.set_cr0(cr0::PE | cr0::NE | cr0::PG);
@@ -2525,7 +2525,7 @@ mod tests {
         assert!(iopm::intercepted(&page, 0x1235));
     }
 
-    /// The rung-4 bug as a standing test: `0x5000_0000` names PD slot 128,
+    /// The phase-4 bug as a standing test: `0x5000_0000` names PD slot 128,
     /// not slot 0. Every level's index derived from the VA, pinned here for
     /// a VA that caught the hand-computed kind.
     #[test]
@@ -2543,7 +2543,7 @@ mod tests {
 
     /// A walk over a table built exactly the way the two-level guest builds
     /// its own — PML4 → PDPT → PD → PT, 4-KiB leaves — must reach the code
-    /// frame. This is the host-side rehearsal the rung-4 note asked for: a
+    /// frame. This is the host-side rehearsal the phase-4 note asked for: a
     /// builder that writes a slot by hand fails here before any guest runs.
     #[test]
     fn walk_reads_a_built_table_the_way_the_mmu_does() {
@@ -2739,7 +2739,7 @@ mod tests {
 
     /// The real thing, when one is at hand: `AKUMA_TEST_VMLINUX=<path>` (the
     /// Firecracker CI `vmlinux-6.1.128`). Skipped silently otherwise — a 40 MB
-    /// kernel is not a repo file. Pins what the Linux rung's loader will see:
+    /// kernel is not a repo file. Pins what the Linux phase's loader will see:
     /// four `PT_LOAD`s from physical 16 MiB, and a PVH entry in that range.
     #[test]
     fn real_vmlinux_parses_when_provided() {
@@ -3050,7 +3050,7 @@ mod tests {
     /// The independent oracle: the blobs the writer builds, read back by the
     /// parser the kernel itself boots with on QEMU and Firecracker
     /// (`akuma-ryzen-amd64`). A writer and a test that share one misreading of
-    /// the layout agree with each other and with nothing else — the PVH rung
+    /// the layout agree with each other and with nothing else — the PVH phase
     /// passed for exactly that reason while Linux saw no command line.
     #[test]
     fn pvh_blobs_parse_with_the_kernels_own_start_info_reader() {

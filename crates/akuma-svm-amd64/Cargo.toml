@@ -19,7 +19,7 @@ workspace = true
 # entry's exact bit table (A/D, PKS, ...) is still pending transcription from
 # Vol 2 §"Nested Table Walk", and a wrong shared constant would make both
 # walkers wrong in the same way. The bits below are the subset §15.5.x pins,
-# marked for verification before the Linux rung.
+# marked for verification before the Linux phase.
 [dependencies]
 
 # Test-only: the kernel's own `hvm_start_info` reader, as an independent oracle

@@ -53,7 +53,7 @@ Read downwards; the sections below are the reference record.
    │   amd64/src/kvm.rs: CPUID probe + trivial guest behind kvmtest
    │   (two vmmcalls, hlt, identity NPT, three unsafe sites).
    ▼
- [10-21] ═══ RUNG 0: A GUEST RUNS ON THE METAL ═══  "trivial guest: PASS"
+ [10-21] ═══ PHASE 0: A GUEST RUNS ON THE METAL ═══  "trivial guest: PASS"
    │
    ▼   Rehearsed in QEMU/KVM on ryzen (nested SVM, grub entry 27);
    │   three guest bugs, each visible only from the exit code:
@@ -81,11 +81,11 @@ Read downwards; the sections below are the reference record.
    │   asm input (RDX is shared, not saved). `vmrun` declares the shared
    │   GPRs clobbered per Table B-2 — rbx/rbp cannot be inline-asm
    │   operands in Rust (LLVM-reserved / frame pointer); the seed guest
-   │   never writes them, rung 2 gets a real register file.
+   │   never writes them, phase 2 gets a real register file.
    ▼   SVM on the APs: the BSP reserves all 16 host save areas up front
    │   and leaks them (no allocation during AP bring-up); every AP
    │   enables through `kvm::ap_hook` in `ap_entry64`.
- [10-21] ═══ RUNG 3: LONG-MODE GUEST, REACHED THROUGH THE LADDER ═══ "PAE=1<<6"
+ [10-21] ═══ PHASE 3: LONG-MODE GUEST, REACHED THROUGH THE LADDER ═══ "PAE=1<<6"
    │
    ▼   The long-mode guest met VMEXIT_INVALID from both QEMU/KVM and the
    │   metal. A 12-probe consistency ladder (one VMRUN per ingredient set,
@@ -99,7 +99,7 @@ Read downwards; the sections below are the reference record.
    │   PASS, all 12 ladder rows entered, row-for-row identical to the
    │   QEMU rehearsal. Metal Fn8000_000A reads asids=32768 (16 under QEMU).
    ▼
- [10-21] ═══ RUNG 4: TWO-LEVEL TRANSLATION ═══  "written; rehearsal pending"
+ [10-21] ═══ PHASE 4: TWO-LEVEL TRANSLATION ═══  "written; rehearsal pending"
    │
    ▼   First guest with non-identity translation at BOTH levels: the guest
    │   walks its own long-mode page tables (gVA 0x5000_0000/0x5000_1000 →
@@ -111,18 +111,18 @@ Read downwards; the sections below are the reference record.
    │   data page through its gVA — prove fetch and data both survive both
    │   translations. The NPT leaf bit table (Vol 2 §5.3 Figs 519–529) and
    │   the NPF error-code bits (§15.25.6 p. 573) are transcribed and
-   │   pinned for exactly this rung's failure mode (ASID 14; ladder 1–13).
-   ▼   (metal PASS 2026-10-22; the Linux rung follows)
- [10-22] ═══ RUNGS 5-6: PVH HANDOFF, THEN A REAL LINUX ═══  "banner on the metal"
+   │   pinned for exactly this phase's failure mode (ASID 14; ladder 1–13).
+   ▼   (metal PASS 2026-10-22; the Linux phase follows)
+ [10-22] ═══ PHASES 5-6: PVH HANDOFF, THEN A REAL LINUX ═══  "banner on the metal"
    │
-   ▼   Rung 5 (crush) enters a synthetic guest the PVH way; rung 6 loads the
+   ▼   Phase 5 (crush) enters a synthetic guest the PVH way; phase 6 loads the
    │   Firecracker CI vmlinux and runs it with CPUID/MSR/port-I/O emulated —
    │   `Linux version 6.1.128` arrives on the emulated COM1 and the guest runs
    │   on to its first timer wait. Found on the way: the PVH note type (9, is
-   │   18), and a start_info layout the rung-5 guest agreed with and Linux did
+   │   18), and a start_info layout the phase-5 guest agreed with and Linux did
    │   not. Metal 2026-10-22: PASS (entry 28,
    │   banner on real Zen 4). [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md)
- [10-22] ═══ RUNG 7: A TIMER — THE GUEST'S CLOCK TICKS ═══  "TCG breakthrough"
+ [10-22] ═══ PHASE 7: A TIMER — THE GUEST'S CLOCK TICKS ═══  "TCG breakthrough"
    │
    ▼   Pure, host-tested 8254 + 8259 models; interrupts reach the guest as
    │   virtual INTRs (V_IRQ | V_IGN_TPR, §15.21.4 — the hardware already waits
@@ -131,7 +131,7 @@ Read downwards; the sections below are the reference record.
    │   the TSC (every poll is a VM exit; the gaps vary 5-10x), so the command
    │   line says `tsc_early_khz=`. Linux goes from spinning in its first delay
    │   loop (1.3 M exits) to the root-fs panic in 96 K, 144 interrupts taken.
- [10-22] ═══ RUNG 8: A DISK — LINUX BOOTS FROM A VIRTIO-BLK ROOT ═══  "TCG: init runs"
+ [10-22] ═══ PHASE 8: A DISK — LINUX BOOTS FROM A VIRTIO-BLK ROOT ═══  "TCG: init runs"
    │
    ▼   Four more pure models: a MOV decoder (nested page faults name the
    │   address and nothing else; 33 clang-assembled vectors), a virtio-mmio v2
@@ -144,13 +144,13 @@ Read downwards; the sections below are the reference record.
    ▼   QEMU TCG: ext2 root mounts, busybox init runs, the guest's md5 of a
    │   1.1 MB file equals the host's, a 256 KiB file the guest wrote reads
    │   back identical under host debugfs.
- [10-22] ═══ RUNG 8 ON THE METAL: LINUX BOOTS ON REAL ZEN 4 ═══  "marvels of engineering"
+ [10-22] ═══ PHASE 8 ON THE METAL: LINUX BOOTS ON REAL ZEN 4 ═══  "marvels of engineering"
    │
    ▼   Nested SVM first, then entry 28 on the ryzen: the guest prints
        `model name : AMD Ryzen 7 8845HS`, detects the real 3.79 GHz TSC,
        mounts a file on p3 as its virtio-blk root, runs init, matches both
        md5s and reboots itself. 99 869 exits, 207 virtual interrupts.
-       [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Rung 7, 8
+       [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Phase 7, 8
 ```
 
 ---
@@ -323,7 +323,7 @@ hCR0.PG=1; a guest with gCR0.PG=0 + NPT is **legal** (guest-linear =
 guest-physical, NPT still translates); A/D bits are hardware-set in NPT
 entries. The exact NPT leaf PTE bit table is not yet transcribed; the plan is
 to reuse `akuma-pte-amd64` constants (P|RW|A) for the identity map and verify
-against §"Nested Table Walk" before the Linux rung.
+against §"Nested Table Walk" before the Linux phase.
 
 ### 2.7 The permission maps (§15.10.1 IOPM, §15.11 MSRPM)
 
@@ -355,18 +355,18 @@ guest's `rdmsr` and `out 0x80, al`.
 
 ## 3. Plan
 
-**Rungs:** 0 — trivial guest on metal (this milestone); 1 — (skipped;
+**Phases:** 0 — trivial guest on metal (this milestone); 1 — (skipped;
 folded into 0); 2 — Linux guest (PVH-style handoff; the Firecracker
 device-map work in `crates/akuma-firecracker` and
 `docs/reference/firecracker/memory-map.md` becomes the guest-side spec);
 3 — akuma as its own guest.
 
-As flown the rungs renumbered: 0 trivial, 2 permission maps + AP hook,
+As flown the phases renumbered: 0 trivial, 2 permission maps + AP hook,
 3 long-mode guest (the consistency ladder was its diagnostic detour),
-4 two-level translation guest (timeline below); the Linux rung is next,
+4 two-level translation guest (timeline below); the Linux phase is next,
 and the original "3 — akuma as its own guest" stands behind it.
 
-**Rung 0 design (decided, not yet built):**
+**Phase 0 design (decided, not yet built):**
 
 - Crate `akuma-svm-amd64` (naming: `akuma-<thing>-<arch>`),
   `#![forbid(unsafe_code)]`, zero deps (or `akuma-pte-amd64` only): VMCB
@@ -381,7 +381,7 @@ and the original "3 — akuma as its own guest" stands behind it.
   PG=0 — legal with NPT on), CR4=0, RFLAGS=2, CPL field=0, guest
   EFER=SVME (LME/LMA=0), ASID=1, TLB_CONTROL=0; code donates a frame at
   GPA=PA under an identity-mapped NPT (2 MiB via one PML4→PDPT→PD 2 MiB
-  leaf, 3 `FreshFrame`s — proving the NPT path from day one since rung 2
+  leaf, 3 `FreshFrame`s — proving the NPT path from day one since phase 2
   needs it anyway). Guest body: `vmmcall` twice, `hlt`. VMMCALL exits log
   and resume (RIP += 4, or nRIP when NRIPS); HLT is completion.
 - FS/GS zero-delta trick: guest FS/GS bases are set to the **current host
@@ -409,7 +409,7 @@ and the original "3 — akuma as its own guest" stands behind it.
   the `npt` constants + `leaf_4k()` builder, and a new `npf` module for
   the NPF `EXITINFO1` error-code bits (§15.25.6, p. 573) — bits 32
   (FINAL) vs 33 (GPT_WALK) name the failing level directly, which is the
-  rung-4 diagnostic. Pinned numerically by
+  phase-4 diagnostic. Pinned numerically by
   `npt_bits_are_vol2_fig519_529` / `npf_error_bits_are_vol2_p573`.
 - `LASTEXCPTO` offset verification; `401h` AVIC_NOACCEL.
 - IOIO `EXITINFO1` bit decode (§15.10.2, not in the extract) and
@@ -431,7 +431,7 @@ and the original "3 — akuma as its own guest" stands behind it.
   reboot (user in the loop), verify.
 - `crates/akuma-firecracker` and
   [`../reference/firecracker/memory-map.md`](../reference/firecracker/memory-map.md)
-  — the Firecracker memory-map vocabulary; from rung 2 it is the guest-side
+  — the Firecracker memory-map vocabulary; from phase 2 it is the guest-side
   spec.
 - AMD APM Vol 2 (24593) rev 3.45 — the sole source for §2; obtained from
   `docs.amd.com` (khub document `LNBl5evreogi0r25VIFF2g`). No Linux/KVM

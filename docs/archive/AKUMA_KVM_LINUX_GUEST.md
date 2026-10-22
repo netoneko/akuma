@@ -1,19 +1,19 @@
-# The Linux rung: a real `vmlinux` under the SVM hypervisor
+# The Linux phase: a real `vmlinux` under the SVM hypervisor
 
-**Date:** 2026-10-22. **Status:** **PASS on the metal** through rung 8 (Linux boots from a virtio-blk root on the ryzen, entry 28); rung 6:
+**Date:** 2026-10-22. **Status:** **PASS on the metal** through phase 8 (Linux boots from a virtio-blk root on the ryzen, entry 28); phase 6:
 `[KVM] linux guest: PASS (banner=yes)` — Linux 6.1.128 printed its banner and ran
 on to its first timer wait on real Zen 4 under this hypervisor
-([`AMD64_KVMTEST_RUNG6_LINUX_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_RUNG6_LINUX_METAL_DMESG_2026_10_22.txt)).
+([`AMD64_KVMTEST_PHASE6_LINUX_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE6_LINUX_METAL_DMESG_2026_10_22.txt)).
 Also PASS under QEMU TCG and under QEMU/KVM with nested SVM on ryzen. Continues
-[`AKUMA_KVM.md`](AKUMA_KVM.md) (rungs 0-4, crush) — this is rung 5 (PVH handoff
-dry run, crush's) and rung 6 (the real kernel). No Linux or KVM source was read
+[`AKUMA_KVM.md`](AKUMA_KVM.md) (phases 0-4, crush) — this is phase 5 (PVH handoff
+dry run, crush's) and phase 6 (the real kernel). No Linux or KVM source was read
 (GPL, binding for the project); every layout and bit is from AMD APM Vol 2/3 or
 Xen's public `start_info.h`, and the guest's behaviour was learned from its exit
 trace.
 
 ## What runs
 
-`kvmtest kvmlinux` on the command line. `kvm::init` runs rungs 0-5 and the ladder
+`kvmtest kvmlinux` on the command line. `kvm::init` runs phases 0-5 and the ladder
 early; `kvm::late` (after the root mount — PVH path: inside `boot::late_init`'s
 closure; multiboot2 path: right after `have_fs`) runs `amd64/src/kvm/linux.rs`:
 
@@ -42,9 +42,9 @@ closure; multiboot2 path: right after `have_fs`) runs `amd64/src/kvm/linux.rs`:
 
 Because the guest cannot reach any real device (NPT maps only its RAM; every
 port and MSR is intercepted), a wrong guest is a stopped run, not a hardware
-hazard. Rung 6 had no timer; rung 7 (below) adds one.
+hazard. Phase 6 had no timer; phase 7 (below) adds one.
 
-## Rung 7: a PIT, a PIC and interrupt injection (2026-10-22)
+## Phase 7: a PIT, a PIC and interrupt injection (2026-10-22)
 
 `akuma_svm_amd64::{pit, pic}` are pure, host-tested models (24 tests):
 
@@ -88,12 +88,12 @@ tick, and the delay loop is calibrated from it (`Calibrating delay loop
 | QEMU TCG, Mac (`noladder`) | PASS: 144 virtual interrupts taken, `tsc-early` clocksource, runs to `VFS: Unable to mount root fs`, reset pulse recognised, 95 773 exits (was 1.3 M of spinning) |
 
 Not yet exercised: `HLT` idle (the guest panics before it idles — needs a root
-filesystem); nested-SVM and metal runs of this rung. Granularity: while the guest
+filesystem); nested-SVM and metal runs of this phase. Granularity: while the guest
 runs, IRQ0 is polled once per exit, and the host tick is the only exit a busy guest
 is guaranteed to produce, so a guest that spins with `IF` set sees timer
 interrupts at the host-tick rate, not the PIT's. Idle (HLT) is exact.
 
-## Rung 8: a virtio-blk root (2026-10-22)
+## Phase 8: a virtio-blk root (2026-10-22)
 
 The guest boots from a virtio-blk disk, mounts its ext2 root, runs busybox `init`
 and reboots. Four new pure, host-tested models in `akuma-svm-amd64`, plus the
@@ -172,7 +172,7 @@ root image; it worked.
 | where | result |
 |---|---|
 | nested SVM, ryzen (`qemu.sh 28`, p3 32 GiB, KVM) | PASS: `tsc: Detected 3789.926 MHz`, `[vda] 32768 blocks`, `VFS: Mounted root (ext2)`, guest `md5sum /bin/busybox` = `ebce4301…` (host's), guest-written `/wtest` = `71277886…`; 100 301 exits, 305 virtual interrupts; the rehearsal's own root `e2fsck` clean |
-| **metal, ryzen entry 28** | **PASS**: `tsc: Detected 3793.429 MHz`, `model name : AMD Ryzen 7 8845HS w/ Radeon 780M Graphics` printed by the guest, same two md5s, `reboot: machine restart` → clean stop; **99 869 exits, 207 virtual interrupts, 156 MMIO accesses, 21 host IRQs**; the file `/boot/guest-root.img` was rewritten by the guest (mtime = the boot). Log: [`AMD64_KVMTEST_RUNG8_VIRTIO_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_RUNG8_VIRTIO_METAL_DMESG_2026_10_22.txt) (the kernel's `dmesg` ring had wrapped under wifi chatter; this is `klog-176.all`) |
+| **metal, ryzen entry 28** | **PASS**: `tsc: Detected 3793.429 MHz`, `model name : AMD Ryzen 7 8845HS w/ Radeon 780M Graphics` printed by the guest, same two md5s, `reboot: machine restart` → clean stop; **99 869 exits, 207 virtual interrupts, 156 MMIO accesses, 21 host IRQs**; the file `/boot/guest-root.img` was rewritten by the guest (mtime = the boot). Log: [`AMD64_KVMTEST_PHASE8_VIRTIO_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE8_VIRTIO_METAL_DMESG_2026_10_22.txt) (the kernel's `dmesg` ring had wrapped under wifi chatter; this is `klog-176.all`) |
 
 Honest scope: the guest is a 16 MiB ext2 + busybox, not Gentoo; one vCPU, no
 network, no LAPIC. The wifi station then took minutes to join —
@@ -188,7 +188,7 @@ raised once per `process` (fine for one queue, revisit with more devices).
 |---|---|---|
 | `vmrun` did not compile (WIP) | `r15` declared as an input and as a clobber | — |
 | PVH entry never found in a real kernel | `PVH_NOTE_TYPE` was 9 (`XEN_ELFNOTE_LOADER`); the entry note is 18 (`PHYS32_ENTRY`); the walker also stepped notes by unpadded sizes | synthetic-image tests built their note from the same constant |
-| Linux `ud2` in its PVH setup, no cmdline, no memmap | `hvm_start_info` written at version-0 offsets (cmdline `+0x10`, memmap `+0x20`, 48 B; entry `type@0`): the v1 layout is cmdline `+0x18`, rsdp `+0x20`, memmap `+0x28`, entries `+0x30`, 56 B; entry `addr@0 size@8 type@0x10` | the PVH rung's synthetic guest read the same wrong offsets and passed. Now `pvh_blobs_parse_with_the_kernels_own_start_info_reader` reads our blobs with `akuma-ryzen-amd64`'s `StartInfo` — the parser that boots on QEMU and Firecracker |
+| Linux `ud2` in its PVH setup, no cmdline, no memmap | `hvm_start_info` written at version-0 offsets (cmdline `+0x10`, memmap `+0x20`, 48 B; entry `type@0`): the v1 layout is cmdline `+0x18`, rsdp `+0x20`, memmap `+0x28`, entries `+0x30`, 56 B; entry `addr@0 size@8 type@0x10` | the PVH phase's synthetic guest read the same wrong offsets and passed. Now `pvh_blobs_parse_with_the_kernels_own_start_info_reader` reads our blobs with `akuma-ryzen-amd64`'s `StartInfo` — the parser that boots on QEMU and Firecracker |
 | triple fault with no cause | `#UD` delivered through an empty IDT | exception intercepts + re-injection print the first fault and the instruction bytes (guest page-table walk with crush's `tables::walk`) |
 
 Lesson, again: a layout test written by the same hand as the writer pins the
