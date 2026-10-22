@@ -220,6 +220,31 @@ adds one for a single driver. It is opened by the kernel's own `openat` arm like
   loops 63% each, 2,4 gave 98% (`docs/archive/KVM_CPU_ACCOUNTING.md`). A `[KVM] cpu:` line per task shows where
   each core's time goes.
 
+```
+ machine: kvmcores=1-7 (allowed)      VM spec: vcpus=2  vm_cores=2,4
+                                       place() = allowed & vm_cores -> vCPU0 on core 2, vCPU1 on core 4
+
+ core 0          core 1        core 2 (reserved)      core 3        core 4 (reserved)     core 5..7
+ ------------    ----------    -------------------    ----------    -------------------   ----------
+ boot thread     sshd          vm_task (coordinator)  netpoll       worker task           herd, wifi,
+ pinned here,    netpoll       = serve(vCPU0, owner)  user procs    = serve(vCPU1)        user procs
+ never reserved  user procs    relay, NIC rx          run here      guest code only       run here
+ user procs      run here      guest code
+ run here
+                               RESERVED_CORES = {2,4}: sched::hook_can_run() answers "no" for any
+                               thread that is not pinned to that core -> sshd & co. never land there
+
+ vCPU0 <--- state word + poke flag + wake IPI (smp::kick_core) ---> vCPU1
+        INIT / STARTUP / fixed IPI / disk interrupt for the PIC (vCPU0's)
+
+ shared by both tasks:  guest RAM + NPT (read-only after build)
+                        Spinlock<Devices>: PIT, PIC, UART, LAPICs, virtio-blk, virtio-net+gateway, relay
+```
+
+Reservation is a mask the picker consults: a reserved core only runs threads pinned to it. It is set
+when the VM starts (cores of all vCPUs, minus core 0) and cleared when it ends; a thread already on the
+core keeps it until its next switch-out, after which it can only be placed elsewhere.
+
 | herd key | |
 |---|---|
 | `vm = true` | the service is a VM (`command` is not needed; it is `herd vm-run`) |
