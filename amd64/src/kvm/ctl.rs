@@ -178,6 +178,31 @@ fn status_line() {
     emit(core::str::from_utf8(&l.buf[..l.n]).unwrap_or("[kvm] status: ?\n"));
 }
 
+/// `status`'s previous reading of each core's halted cycles, and of the TSC, so a second
+/// `status` reports the interval between the two (the first, the time since boot).
+static CORES_LAST_TSC: AtomicU64 = AtomicU64::new(0);
+static CORES_LAST_HALT: [AtomicU64; crate::smp::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// One `[kvm] cores:` line: each host core's busy share since the last `status`, from the
+/// cycles it spent halted. The tick accounting (`/proc/stat`) cannot say this: it bills a halt
+/// inside a task (`allow_tick`) to that task. Works with no VM, so it is the A/B's baseline.
+fn cores_line() {
+    use core::fmt::Write as _;
+    let now = akuma_cpu::tsc::rdtsc();
+    let wall = now.wrapping_sub(CORES_LAST_TSC.swap(now, Ordering::Relaxed));
+    let mut l = Line { buf: [0; 192], n: 0 };
+    let _ = write!(l, "[kvm] cores: interval_ms={} busy%:", u128::from(wall) * 1000 / u128::from(crate::lapic::tsc_hz().max(1)));
+    for c in 0..crate::smp::online_cpus().min(crate::smp::MAX_CPUS) {
+        let h = crate::sched::halted_tsc(c);
+        let halted = h.wrapping_sub(CORES_LAST_HALT[c].swap(h, Ordering::Relaxed)).min(wall);
+        let tenths = if wall == 0 { 0 } else { u128::from(wall - halted) * 1000 / u128::from(wall) };
+        let _ = write!(l, " c{c}={}.{}", tenths / 10, tenths % 10);
+    }
+    let _ = writeln!(l);
+    // `p` routes to the stream while a VM runs and to the host console (and `dmesg`) otherwise.
+    super::p(core::str::from_utf8(&l.buf[..l.n]).unwrap_or("[kvm] cores: ?\n"));
+}
+
 // ---------------------------------------------------------------------------
 // The device
 // ---------------------------------------------------------------------------
@@ -209,6 +234,7 @@ pub fn dev_write(buf: u64, len: usize) -> u64 {
         }
         "status" => {
             status_line();
+            cores_line();
             len as u64
         }
         _ => create(text, len),

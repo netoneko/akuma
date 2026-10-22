@@ -1490,6 +1490,7 @@ pub fn idle_loop() -> ! {
             // vector is installed and its handler takes the BKL itself.
             // `idlemwait` swaps the same bracket's wait instruction; the CPUID
             // gate ran at `set_idle_policy_from_cmdline`.
+            let halt_tsc = akuma_cpu::tsc::rdtsc();
             if IDLE_MWAIT.load(Ordering::Relaxed) != 0 {
                 // The lightest MWAIT hint (`IDLE_MWAIT` is set only when CPUID
                 // advertises MONITOR/MWAIT).
@@ -1497,6 +1498,7 @@ pub fn idle_loop() -> ! {
             } else {
                 akuma_cpu::park::wfi();
             }
+            note_halted(halt_tsc);
             crate::lapic::restore_periodic();
             // The shot (if any) was cancelled by a non-timer wake: credit the
             // ticks it skipped, before `credit_halted_time` reads the clock.
@@ -2363,7 +2365,9 @@ pub fn allow_tick() {
         crate::lapic::arm_deadline();
         // Interrupts on for exactly the `hlt`, then off again — the same
         // bracket `idle_loop` uses.
+        let halt_tsc = akuma_cpu::tsc::rdtsc();
         akuma_cpu::park::wfi();
+        note_halted(halt_tsc);
         crate::lapic::restore_periodic();
         if held {
             crate::smp::bkl_enter();
@@ -2373,6 +2377,25 @@ pub fn allow_tick() {
         // Interrupts on for exactly one instruction.
         akuma_cpu::park::irq_window();
     }
+}
+
+/// Per core: TSC cycles spent inside a halt (`idle_loop`'s and [`allow_tick`]'s), the one
+/// measure of "this core slept" that does not depend on which task was current. The tick
+/// accounting bills an `allow_tick` halt to the task that called it, so a core whose only task
+/// halts that way reads 100% busy in `/proc/stat` while it is asleep.
+static HALT_TSC: [AtomicU64; crate::smp::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// Cycles `core` has spent halted since boot (see [`HALT_TSC`]).
+#[must_use]
+pub fn halted_tsc(core: usize) -> u64 {
+    HALT_TSC.get(core).map_or(0, |c| c.load(Ordering::Relaxed))
+}
+
+/// Add the cycles since `since` to this core's halted total.
+#[inline]
+fn note_halted(since: u64) {
+    let spent = akuma_cpu::tsc::rdtsc().wrapping_sub(since);
+    HALT_TSC[smp::cpu_index()].fetch_add(spent, Ordering::Relaxed);
 }
 
 /// Times [`idle_loop`] put the core to sleep.

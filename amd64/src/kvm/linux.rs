@@ -101,6 +101,8 @@ pub(super) const MAX_VCPUS: usize = 4;
 /// the next (µs), when more than one can run. Short enough that an AP spinning on a
 /// flag the BSP is about to set does not cost a host tick (10 ms) per round.
 const QUANTUM_US: u64 = 500;
+/// How often a service guest reports where its task's time went (`Acct`).
+const ACCT_PERIOD_US: u64 = 5_000_000;
 /// The line the Akuma kernel prints when every processor the MADT listed is up
 /// (`amd64/src/smp.rs`): the SMP guest's pass needs it.
 const SMP_UP_LINE: &[u8] = b"smp:  2 cpus online";
@@ -1685,6 +1687,8 @@ pub fn run(nrips: bool, vm: &Vm) {
     let started_us = crate::net::uptime_us();
     plat.last_tx_us = started_us;
     let (mut n_lapic, mut n_ticks) = (0u64, 0u64);
+    let mut acct = Acct::new();
+    let mut next_acct_us = started_us + ACCT_PERIOD_US;
     'run: loop {
         if exits >= MAX_EXITS && !service {
             break 'run;
@@ -1711,9 +1715,16 @@ pub fn run(nrips: bool, vm: &Vm) {
             // kernel runs with interrupts masked outside its idle loop, and the switch
             // expects that.
             akuma_cpu::daif::mask_irq();
+            let t0 = akuma_cpu::tsc::rdtsc();
             crate::sched::yield_now();
+            acct.yielded += akuma_cpu::tsc::rdtsc().wrapping_sub(t0);
             akuma_cpu::daif::unmask_irq();
+            if now_us >= next_acct_us {
+                next_acct_us = now_us + ACCT_PERIOD_US;
+                acct.report(exits, crate::smp::cpu_index());
+            }
         }
+        let relay_t0 = akuma_cpu::tsc::rdtsc();
         if let (Some(r), Some((dev, wire))) = (relay.as_mut(), net.as_mut())
             && now_us >= next_relay_us
         {
@@ -1770,6 +1781,7 @@ pub fn run(nrips: bool, vm: &Vm) {
         if let Some((dev, wire)) = net.as_mut() {
             dev.deliver_rx(&ram, wire, scratch.bytes_mut());
         }
+        acct.relay += akuma_cpu::tsc::rdtsc().wrapping_sub(relay_t0);
         // A halted processor wakes when something can be offered to it.
         for j in 0..n_cpu {
             if states[j] == CpuState::Halted && plat.offer(j, now_us).is_some() {
@@ -1788,6 +1800,7 @@ pub fn run(nrips: bool, vm: &Vm) {
                     // Sleep until the guest's next timer (or any host interrupt: the NIC's,
                     // a keystroke) instead of burning the core.
                     akuma_cpu::daif::mask_irq();
+                    let sleep_t0 = akuma_cpu::tsc::rdtsc();
                     if let Some(due) = (0..n_cpu).filter_map(|j| plat.next_event_us(j)).min() {
                         let _ = crate::lapic::arm_oneshot_in_us(due.saturating_sub(crate::net::uptime_us()).min(1000));
                     }
@@ -1797,6 +1810,7 @@ pub fn run(nrips: bool, vm: &Vm) {
                         let _ = crate::lapic::arm_oneshot_in_us(250);
                     }
                     crate::sched::allow_tick();
+                    acct.sleep += akuma_cpu::tsc::rdtsc().wrapping_sub(sleep_t0);
                     akuma_cpu::daif::unmask_irq();
                 } else {
                     core::hint::spin_loop();
@@ -1859,7 +1873,9 @@ pub fn run(nrips: bool, vm: &Vm) {
         }
         // SAFETY: the VMCB and the host save image are live frames this
         // function owns; SVM is enabled on this core (`enable_on_core`).
+        let guest_t0 = akuma_cpu::tsc::rdtsc();
         unsafe { vmrun_regs(vmcb_pas[i], host_pa, &mut regs_all[i]) };
+        acct.guest += akuma_cpu::tsc::rdtsc().wrapping_sub(guest_t0);
         if service {
             akuma_bkl::bkl::dropped_window_close();
         }
@@ -2287,6 +2303,76 @@ pub fn run(nrips: bool, vm: &Vm) {
         }
     }
     p(")\n");
+}
+
+/// Where the VM task's time goes, in TSC cycles, and how long every host core slept: the
+/// measure the tick accounting cannot give (it bills a core's halt to the task that called
+/// `allow_tick`, so an idle guest reads as a busy core). Reported every few seconds.
+struct Acct {
+    guest: u64,
+    sleep: u64,
+    yielded: u64,
+    relay: u64,
+    last_tsc: u64,
+    last_exits: u64,
+    last_halt: [u64; crate::smp::MAX_CPUS],
+}
+
+impl Acct {
+    fn new() -> Self {
+        let mut last_halt = [0; crate::smp::MAX_CPUS];
+        for (c, h) in last_halt.iter_mut().enumerate() {
+            *h = crate::sched::halted_tsc(c);
+        }
+        Self { guest: 0, sleep: 0, yielded: 0, relay: 0, last_tsc: akuma_cpu::tsc::rdtsc(), last_exits: 0, last_halt }
+    }
+
+    /// `part` / `whole` as a percentage with one decimal.
+    fn pct(name: &str, part: u64, whole: u64) {
+        let t = if whole == 0 { 0 } else { (u128::from(part) * 1000 / u128::from(whole)) as u64 };
+        p(name);
+        dec(t / 10);
+        p(".");
+        dec(t % 10);
+    }
+
+    /// One `[KVM] cpu:` line: this task's split, then each core's busy share (100% minus the
+    /// time it spent halted) over the same interval, then the interval's exit rate.
+    fn report(&mut self, exits: u64, vcpu_core: usize) {
+        let now = akuma_cpu::tsc::rdtsc();
+        let wall = now.wrapping_sub(self.last_tsc);
+        if wall == 0 {
+            return;
+        }
+        let other = wall.saturating_sub(self.guest + self.sleep + self.yielded + self.relay);
+        p("[KVM] cpu: task(core ");
+        dec(vcpu_core as u64);
+        p(") ");
+        Self::pct("guest=", self.guest, wall);
+        Self::pct("% sleep=", self.sleep, wall);
+        Self::pct("% yield=", self.yielded, wall);
+        Self::pct("% relay=", self.relay, wall);
+        Self::pct("% other=", other, wall);
+        p("%  busy:");
+        for c in 0..crate::smp::online_cpus().min(crate::smp::MAX_CPUS) {
+            let h = crate::sched::halted_tsc(c);
+            let halted = h.wrapping_sub(self.last_halt[c]).min(wall);
+            self.last_halt[c] = h;
+            p(" c");
+            dec(c as u64);
+            Self::pct("=", wall - halted, wall);
+            p("%");
+        }
+        let hz = crate::lapic::tsc_hz().max(1);
+        p("  exits/s=");
+        dec((u128::from(exits - self.last_exits) * u128::from(hz) / u128::from(wall)) as u64);
+        p("\n");
+        *self = Self { last_halt: self.last_halt, last_tsc: now, last_exits: exits, ..Self::zero() };
+    }
+
+    const fn zero() -> Self {
+        Self { guest: 0, sleep: 0, yielded: 0, relay: 0, last_tsc: 0, last_exits: 0, last_halt: [0; crate::smp::MAX_CPUS] }
+    }
 }
 
 /// Where a virtual processor is in its life.
