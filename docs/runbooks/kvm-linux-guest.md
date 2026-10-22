@@ -87,7 +87,7 @@ writes are gone when the guest stops). OpenSSH answers on the guest's 4444, forw
 only the keys in p7's `/root/.ssh/authorized_keys` get in. Its init is `/akuma-kvm-init.sh`
 (`overlays/ryzen/gentoo/akuma-kvm-init.sh`).
 
-**herd runs the guest (`vm = true`, ryzen entry 30):** boot entry 30 (`kvmctl kvmmem=3072`: SVM armed, 3 GiB
+**herd runs the guest (`vm = true`, ryzen entry 30):** boot entry 30 (`kvmctl kvmmem=4096`: SVM armed, 4 GiB
 reserved, no guest at boot), then enable **one** of `overlays/ryzen/rootfs/etc/herd/available/vm-serve.conf`
 (the busybox guest, sshd on host 2223) or `vm-gentoo.conf` (Gentoo from the RAM-copied image, host 2223 →
 guest 4444) by copying it to p3's `/etc/herd/enabled/` (p3 does not take `rootfs/`; the two share the VM slot and the

@@ -269,6 +269,11 @@ impl Vm {
         self.spec.as_ref().map_or(&[], Spec::forwards)
     }
 
+    /// Did the spec name a disk? (Then the guest must not start without one.)
+    fn wants_disk(&self) -> bool {
+        self.spec.as_ref().is_some_and(|s| !s.disk.is_empty())
+    }
+
     /// What to say when there is no disk.
     fn disk_hint(&self) -> &str {
         match &self.spec {
@@ -1469,6 +1474,13 @@ pub fn run(nrips: bool, vm: &Vm) {
     // and the memory map reports it (type 3) instead of as RAM.
     let disk = vm.pick_disk();
     let _disk_lease = MemLease(disk);
+    // A spec that names a disk does not run without it: a refused RAM copy (the reserve is too
+    // small) or a missing image would otherwise boot a rootless guest that halts and is restarted
+    // forever (found on the ryzen 2026-10-22, a 3 GiB image against a 3 GiB reserve).
+    if disk.is_none() && vm.wants_disk() {
+        p("[KVM] linux: refused: the spec's disk is not available, not starting without it\n");
+        return;
+    }
     // Only Linux is told about its disk through ACPI; the Akuma guest finds it on
     // the command line.
     // The SMP guest needs the MADT whatever its disk is.
