@@ -157,7 +157,18 @@ shadow wherever the hypervisor completes an instruction.
   and its **`utime` climbs (1002 -> 3004 ticks between samples, `stime` 0)**: `nc` is **spinning in
   user mode with no syscalls** after its poll timeout (a stuck `exit_group` would not show, but
   stime would). The shell, its parent, waits for it.
-* Next: sample the guest RIP while it spins (the hypervisor's stop line prints `rip`) and look at
+* **It is a general guest-kernel bug, not a hypervisor one — reproduced on plain QEMU with no SVM.**
+  `scripts/kvm/udp_stall_repro.sh LOG` runs a UDP echo on the host (127.0.0.1:7777, which slirp
+  shows the guest as 10.0.2.2:7777) and the guest's `nc -u -w 2` against it: **STALL**. A guest
+  `strace` of `nc` there reads `poll->1, read(0)->12 (send), poll->2, read(3)->12, read(0)->0
+  (stdin EOF), shutdown(3, SHUT_WR)->0, write(1)->12, poll(2000 ms)->0 (the timeout)` and then
+  **no further syscall**; QEMU's own monitor goes unresponsive while it spins (the guest is
+  hammering something that holds QEMU's lock). slirp's DNS reply (`10.0.2.3:53`, same flow, same
+  `shutdown`) does *not* stall, so the trigger is subtler than "a reply arrived": the next place to
+  look is `nc`'s exit after `shutdown(SHUT_WR)` on a UDP socket (`close` of a shut-down UDP socket
+  with the peer's address `10.0.2.2`), and the guest idle loop's timer re-arming
+  (`lapic::arm_deadline` with an already-due deadline: the stalled guest's RIP is in it every time).
+* Next (any of): sample the guest RIP while it spins (the hypervisor's stop line prints `rip`) and look at
   what busybox's `nc` does after a UDP reply plus timeout; compare against the byte-exact content
   of the gateway's reply (a malformed datagram that the guest stack accepts but `nc` mishandles is
   the cheapest explanation, since slirp's reply works).
