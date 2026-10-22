@@ -1,8 +1,10 @@
-# KVM: the SVM hypervisor and its Linux guest
+# KVM: the SVM hypervisor, its Linux guest and its Akuma guest
 
 An AMD SVM (AMD-V) + nested-paging hypervisor inside the amd64 kernel, developed
 on the ryzen metal it runs on. It runs a real Linux guest (Firecracker CI
-`vmlinux-6.1.128`) with a console, timer interrupts and a virtio-blk ext2 root.
+`vmlinux-6.1.128`) with a console, timer interrupts and a virtio-blk ext2 root, and
+the **Akuma amd64 kernel itself** as a guest (local APIC, virtio from the command
+line, busybox init).
 Source: **`amd64/src/kvm.rs`** (phases 0-5, the consistency ladder),
 **`amd64/src/kvm/linux.rs`** (the Linux phase), and the pure models in
 **`crates/akuma-svm-amd64`**.
@@ -31,7 +33,8 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 | `elf`, `pvh` | `PT_LOAD` and the Xen PVH entry note; `hvm_start_info` v1 + memory map (+ ACPI entry, `rsdp_paddr`) |
 | `devices::{Uart, MsrStore}` | 16550 (incl. the THRE interrupt) and remembered MSRs |
 | `pit`, `pic` | 8254 as a function of `now` (1.193182 MHz ticks); 8259A pair, edge-triggered |
-| `mmio` | decodes the `MOV` of a faulting device access (nested page faults give the address only) |
+| `lapic` | xAPIC register page + timer (periodic/one-shot, 1 GHz bus clock), IRR/ISR with priority classes, self-IPI; a function of `now` |
+| `mmio` | decodes the `MOV` — and read-only `CMP`/`TEST` — of a faulting device access (nested page faults give the address only), with the flag arithmetic |
 | `virtio` | virtio-mmio **v2** block device over the traits `GuestMem` and `Disk` |
 | `acpi` | RSDP v2 / XSDT / FADT / MADT / DSDT with one `LNRO0005` device; `Pm1` registers |
 
@@ -54,6 +57,19 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
   `VIRTIO_MMIO_CMDLINE_DEVICES`. **Never set FADT `HW_REDUCED_ACPI`**: Linux then
   has no legacy PIC/PIT by definition, drops both, and the device's interrupt is
   "not found" (tell-tale: `NR_IRQS … nr_irqs: 8, preallocated irqs: 0`).
+- **One offer, one accept.** `Platform::offer(now)` polls every source and returns the
+  vector for the guest; `accept` is the INTA/acknowledge once the processor clears
+  `V_IRQ`. With the local APIC on (the guest set `IA32_APIC_BASE` bit 11) it is the
+  only source; without it, the PIC. A new interrupt source goes through these two,
+  never straight into `V_INTR`.
+- **The APIC page is emulated only while the guest has it enabled**, at the base the
+  guest wrote. A guest told `nolapic` never sets the bit and a touch of that page stays
+  a fatal nested page fault naming the address.
+- **A device access is not always a `MOV`.** LLVM folds a volatile load used only by a
+  comparison into the `CMP`/`TEST`. `mmio::decode` covers those (they read once and
+  write only flags); read-modify-write forms are refused.
+- **The Akuma guest needs ≥ 768 MiB** (its fixed 512 MiB heap must sit in one region)
+  and finds its disk from `virtio_mmio.device=` on the command line, not ACPI.
 - **The guest never gets the host's root.** Its disk is the machine's *second*
   `akuma_virtio::block` device, else the preallocated file `/boot/guest-root.img`.
 - **Unknown device instructions stop the run.** `mmio::decode` answers `None` for
@@ -65,10 +81,15 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 ## Run it
 
 Runbook: [`../../runbooks/kvm-linux-guest.md`](../../runbooks/kvm-linux-guest.md).
-Kernel command line: `kvmtest kvmlinux` (add `noladder` under TCG).
+Kernel command line: `kvmtest kvmlinux` or `kvmtest kvmakuma` (add `noladder` under
+TCG). `kvmlinux` runs the Akuma guest instead when p3's `/boot/kvm-guest` begins with
+`akuma` — the bootloader entry's command line is baked into `grubx64.efi`, so the file
+is the lever that lets one entry serve both.
 
 ## Background
 
 [`../../archive/AKUMA_KVM.md`](../../archive/AKUMA_KVM.md) (the phases and their
 timeline), [`../../archive/AKUMA_KVM_LINUX_GUEST.md`](../../archive/AKUMA_KVM_LINUX_GUEST.md)
-(the Linux phase, phases 7-8, every bug found and how).
+(the Linux phase, phases 7-8, every bug found and how),
+[`../../archive/AKUMA_KVM_AKUMA_GUEST.md`](../../archive/AKUMA_KVM_AKUMA_GUEST.md)
+(Akuma as the guest: the local APIC, the `CMP` decoder gap, results).

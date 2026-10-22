@@ -232,7 +232,10 @@ TCG could not show it because its host timer was already running.
 - The Gentoo partition as the backing store (needs a second NVMe window in
   `nvme.rs`, or a file on p3), then more guest: networking (virtio-net), SMP, the
   LAPIC timer.
-- LAPIC timer (the guest is told `nolapic` today).
+- LAPIC timer for *Linux* (told `nolapic` today). The model exists now
+  (`akuma_svm_amd64::lapic`, written for the Akuma guest —
+  [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md)); enabling it for Linux is a
+  command-line and ACPI MADT change.
 - p3's `e2fsck -fn` reports a corrupted directory in crush's cargo cache
   (`/root/ktarget/.../build/akuma-amd64/<hash>/out`, last written Oct 18) — not
   caused by this work, not repaired; `rm -r` that directory from Pop, then `e2fsck`.

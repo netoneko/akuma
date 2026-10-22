@@ -1,4 +1,4 @@
-# Run the Linux guest under Akuma's hypervisor
+# Run a guest (Linux, or Akuma itself) under Akuma's hypervisor
 
 **Stability: C.** Rehearsal on QEMU TCG is routine; nested SVM and the metal follow
 the one-shot loop in [`overlays/ryzen/README.md`](../../overlays/ryzen/README.md).
@@ -28,6 +28,24 @@ boots `.verify` when present. Rehearse under nested SVM from Pop
 (`DISK=nvme sh overlays/ryzen/qemu.sh 28 240 std`), then `arm.sh 28`. Read the
 result with `dmesg | grep -a '\[KVM\]'` on the booted Akuma.
 
+## 3. The Akuma guest (this kernel booting under itself)
+
+```sh
+# KERNEL = the amd64 build above (it is both host and guest); BUSYBOX = static x86_64
+scripts/kvm/akuma_rehearse.sh /tmp/ak.log        # builds both images, runs QEMU TCG
+SELECTOR=1 scripts/kvm/akuma_rehearse.sh /tmp/ak.log   # as ryzen's entry 28 does
+```
+
+Expect `[KVM] akuma guest: PASS (banner=yes, init=yes)`, the guest's own console
+(`blk: 1 virtio slot(s)`, `fs: ext2 mounted on /dev/vda`, `AKUMA-GUEST-DONE`), and
+the script's host-side `md5` of the guest-written `/wtest` plus a clean `e2fsck`.
+
+On the ryzen (build there): the guest kernel is any PVH build of the kernel, at
+`/boot/akuma-guest`; the guest disk is the 16 MiB image from
+`scripts/kvm/akuma_guest_rootfs.sh` at `/boot/akuma-guest-root.img`; and either boot
+entry 29 (needs a `grubx64.efi` with it) or write `akuma` to `/boot/kvm-guest` and boot
+entry 28. Delete `/boot/kvm-guest` to get the Linux guest back.
+
 ## If it goes wrong
 
 | you see (in the guest's console) | it is |
@@ -37,11 +55,14 @@ result with `dmesg | grep -a '\[KVM\]'` on the booted Akuma.
 | `Waiting for root device /dev/vda...` forever, no `virtio_blk` line | no ACPI node: the guest has no disk (`[KVM] linux: no guest disk`) or `noacpi` is on the command line |
 | init prints one character and stops | the UART lost its THRE interrupt (IRQ4 / `OUT2`) |
 | `[KVM] linux: … instruction the MMIO decoder does not know` | the guest used a non-`MOV` access on the virtio window; add the encoding to `mmio` with a clang-assembled vector |
+| Akuma guest: `[FATAL] heap ends … but the region holding it ends …` | guest RAM below the kernel's fixed 512 MiB heap + image (768 MiB is the floor used) |
+| Akuma guest: `…touched the local APIC page with an instruction the MMIO decoder does not know` | a non-`MOV`/`CMP`/`TEST` access on the page; add the encoding to `mmio` with a clang vector |
+| Akuma guest: stops with `guest halted waiting for an interrupt nothing can raise` | the guest halted with `IF` set and no unmasked timer: its LAPIC timer LVT is masked or the count is 0 |
 | `#UD` in `x86_perf_event_update` at reboot | the NMI watchdog's perf event; `nmi_watchdog=0` (cause of the `RDPMC` fault not understood) |
 
 ## Verify
 
-`[KVM] linux guest: PASS`, the guest's `md5sum /bin/busybox` equals the host's
+`[KVM] linux guest: PASS` (or `[KVM] akuma guest: PASS (… init=yes)`), the guest's `md5sum /bin/busybox` equals the host's
 `md5` of the same file, and the file the guest wrote (`/wtest`) dumps from the
 image under host `debugfs` with the md5 the guest printed and `e2fsck -fn` clean.
 

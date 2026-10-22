@@ -145,15 +145,37 @@ pub fn init(cmdline: &str) {
 }
 
 /// The phases that need the root filesystem, run once it is mounted: with
-/// `kvmtest` (which enabled SVM and ran the early phases in [`init`]) and
-/// `kvmlinux` both on the command line, the Linux phase — a real `vmlinux` off
-/// `/boot/vmlinux`.
+/// `kvmtest` (which enabled SVM and ran the early phases in [`init`]) and one of
+///
+/// * `kvmlinux` — the Linux phase, a real `vmlinux` off `/boot/vmlinux`; or
+/// * `kvmakuma` — the Akuma phase, this kernel's own ELF off `/boot/akuma-guest`
+///   booting as the guest (`docs/archive/AKUMA_KVM_AKUMA_GUEST.md`).
+///
+/// `kvmlinux` also runs the Akuma guest when p3's `/boot/kvm-guest` begins with
+/// `akuma`: the bootloader entry's command line is baked into `grubx64.efi`, so a
+/// one-word file on the root is the lever that lets one entry serve both guests.
 pub fn late(cmdline: &str) {
     let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
-    if SVM_WANTED.load(Ordering::Acquire) && flag("kvmlinux") {
-        linux::run(NRIPS.load(Ordering::Relaxed));
+    if !SVM_WANTED.load(Ordering::Acquire) {
+        return;
+    }
+    let guest = if flag("kvmakuma") {
+        Some(linux::Guest::Akuma)
+    } else if flag("kvmlinux") {
+        let mut sel = [0u8; 8];
+        let akuma = akuma_vfs_glue::read_at(GUEST_SELECTOR_PATH, 0, &mut sel).is_ok_and(|n| sel[..n].starts_with(b"akuma"));
+        Some(if akuma { linux::Guest::Akuma } else { linux::Guest::Linux })
+    } else {
+        None
+    };
+    if let Some(g) = guest {
+        linux::run(NRIPS.load(Ordering::Relaxed), g);
     }
 }
+
+/// Optional file whose first word picks the guest for an entry that says
+/// `kvmlinux` (`akuma`; anything else, or no file, is Linux).
+const GUEST_SELECTOR_PATH: &str = "/boot/kvm-guest";
 
 // ---------------------------------------------------------------------------
 // Per-core enable + the permission maps

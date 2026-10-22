@@ -255,8 +255,13 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `akuma-svm-amd64` is the **SVM hypervisor's vocabulary and device models** (2026-10-22;
   `forbid(unsafe_code)`, no dependencies; `amd64/src/kvm*.rs` owns every `unsafe`): the VMCB
   layouts each pinned to its APM table, `cpuid::filter`, NPT encodings, PVH/ELF loading, and the
-  pure models a Linux guest runs on — 8254 `pit`, 8259 `pic`, 16550 `Uart` (with its THRE
-  interrupt), the `mmio` MOV decoder, a virtio-mmio v2 block device (`virtio`) and `acpi`. It is
+  pure models a Linux guest — and, since 2026-10-22, **Akuma's own kernel** (`kvmakuma`,
+  `docs/archive/AKUMA_KVM_AKUMA_GUEST.md`) — runs on: 8254 `pit`, 8259 `pic`, xAPIC `lapic`
+  (register page + timer, a function of `now`), 16550 `Uart` (with its THRE interrupt), the
+  `mmio` MOV/CMP/TEST decoder (LLVM folds a volatile load into a comparison — its flag
+  arithmetic is checked against real x86 `cmp`/`test`), a virtio-mmio v2 block device
+  (`virtio`) and `acpi`. Interrupts reach the guest through `Platform::offer`/`accept`, never
+  straight into `V_INTR`. It is
   the *device* side; `akuma-virtio` is the driver side and is reused as the guest disk's backing
   store. **Never set FADT `HW_REDUCED_ACPI`** (Linux then drops the PIC/PIT and the device IRQ
   vanishes) and **no Linux/KVM source may be read** — only the APM, the virtio/ACPI specs and

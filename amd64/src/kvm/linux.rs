@@ -37,6 +37,7 @@ use super::{crumb, dec, dump_exit, dump_state, enable_on_core, hx, image_pa, nex
 use crate::phys::FreshFrame;
 use akuma_svm_amd64 as svm;
 use akuma_svm_amd64::devices::{MsrStore, Uart};
+use akuma_svm_amd64::lapic::{self, Lapic};
 use akuma_svm_amd64::mmio;
 use akuma_svm_amd64::pic::PicPair;
 use akuma_svm_amd64::pit::{self, Pit};
@@ -47,6 +48,81 @@ use core::arch::x86_64::__cpuid_count;
 /// Where the guest kernel is read from (an uncompressed, PVH-capable ELF —
 /// Firecracker's CI `vmlinux-6.1.128` is one).
 const LINUX_PATH: &str = "/boot/vmlinux";
+/// Where the Akuma guest's kernel is read from: a copy of the amd64 ELF this
+/// hypervisor itself runs from (any PVH build of the kernel will do).
+const AKUMA_PATH: &str = "/boot/akuma-guest";
+/// What the Akuma guest is told. It finds its disk from the command line (a
+/// `virtio_mmio.device=` token, the Firecracker spelling), polls it, and has no
+/// ACPI, PCI or network. `nosmp`: one virtual CPU. The init is a script on the
+/// guest's disk; its arguments are comma-separated because the command line is
+/// split on whitespace.
+const AKUMA_CMDLINE: &str = "nosmp";
+/// Appended when the guest has a disk.
+const AKUMA_DISK_ARGS: &str = " virtio_mmio.device=4K@0xd0000000:5 init=/bin/busybox initargs=sh,/etc/guest.sh";
+/// The Akuma guest's disk when the machine has no second virtio-blk device.
+const AKUMA_DISK_IMAGE_PATH: &str = "/boot/akuma-guest-root.img";
+/// The Akuma guest's RAM. The kernel takes a fixed 512 MiB heap
+/// (`amd64/src/mem.rs` `HEAP_SIZE`) out of one region and refuses to boot when the
+/// region is smaller; the rest is its frame allocator. One page directory of
+/// 2 MiB nested leaves maps 1 GiB, which bounds this.
+const AKUMA_RAM_BYTES: u64 = 768 << 20;
+
+/// Which kernel the run boots.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Guest {
+    /// A Linux `vmlinux`: PIC and PIT, no local APIC, ACPI-described virtio.
+    Linux,
+    /// The Akuma amd64 kernel itself: local APIC and its timer, virtio from the
+    /// command line. The third rung of the ladder (`docs/archive/AKUMA_KVM.md`).
+    Akuma,
+}
+
+impl Guest {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Linux => LINUX_PATH,
+            Self::Akuma => AKUMA_PATH,
+        }
+    }
+
+    const fn ram_bytes(self) -> u64 {
+        match self {
+            Self::Linux => RAM_BYTES,
+            Self::Akuma => AKUMA_RAM_BYTES,
+        }
+    }
+
+    const fn disk_path(self) -> &'static str {
+        match self {
+            Self::Linux => DISK_IMAGE_PATH,
+            Self::Akuma => AKUMA_DISK_IMAGE_PATH,
+        }
+    }
+
+    /// The first line the guest's console prints: PASS needs it.
+    const fn banner(self) -> &'static [u8] {
+        match self {
+            Self::Linux => b"Linux version",
+            Self::Akuma => b"Akuma/amd64",
+        }
+    }
+
+    /// What the guest's init prints when it has run to the end (Akuma only: a
+    /// Linux run ends on the reset pulse its own `reboot` makes).
+    const fn done(self) -> Option<&'static [u8]> {
+        match self {
+            Self::Linux => None,
+            Self::Akuma => Some(b"AKUMA-GUEST-DONE"),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Akuma => "akuma",
+        }
+    }
+}
 /// What the guest is told. No APIC, no SMP, no PCI: none of them is emulated;
 /// the console, the PIT/PIC and (with a disk) one virtio-blk are.
 const LINUX_CMDLINE: &str =
@@ -210,27 +286,28 @@ unsafe fn vmrun_regs(vmcb_pa: u64, host_pa: u64, regs: &mut GuestRegs) {
 /// allocation, so guest-physical `g` is host-physical `base + g`.
 struct Ram {
     base: u64,
+    bytes: u64,
     alloc_pa: usize,
     alloc_pages: usize,
 }
 
 impl Ram {
-    fn alloc() -> Option<Self> {
-        let alloc_pages = ((RAM_BYTES + RAM_ALIGN) / 4096) as usize;
+    fn alloc(bytes: u64) -> Option<Self> {
+        let alloc_pages = ((bytes + RAM_ALIGN) / 4096) as usize;
         let alloc_pa = akuma_pmm::alloc_pages_contiguous_zeroed(alloc_pages)?;
         let base = (alloc_pa as u64 + RAM_ALIGN - 1) & !(RAM_ALIGN - 1);
-        Some(Self { base, alloc_pa, alloc_pages })
+        Some(Self { base, bytes, alloc_pa, alloc_pages })
     }
 
     /// Copy `src` into guest-physical `gpa`. False if it leaves RAM.
     fn write(&self, gpa: u64, src: &[u8]) -> bool {
-        gpa.checked_add(src.len() as u64).is_some_and(|end| end <= RAM_BYTES)
+        gpa.checked_add(src.len() as u64).is_some_and(|end| end <= self.bytes)
             && akuma_mmu::copy_to_phys((self.base + gpa) as usize, src)
     }
 
     /// Copy guest-physical `gpa` out. False if it leaves RAM.
     fn copy_out(&self, gpa: u64, dst: &mut [u8]) -> bool {
-        gpa.checked_add(dst.len() as u64).is_some_and(|end| end <= RAM_BYTES)
+        gpa.checked_add(dst.len() as u64).is_some_and(|end| end <= self.bytes)
             && akuma_mmu::copy_from_phys((self.base + gpa) as usize, dst)
     }
 }
@@ -253,22 +330,22 @@ enum HostDisk {
     /// driven by the same driver the host's root uses.
     Virtio(usize),
     /// A file on the host's filesystem, preallocated.
-    File,
+    File(&'static str),
 }
 
 impl HostDisk {
     /// The disk to give the guest, if the machine has one.
-    fn pick() -> Option<Self> {
+    fn pick(file: &'static str) -> Option<Self> {
         if akuma_virtio::block::device_count() > 1 && akuma_virtio::block::device_name(1).is_some() {
             return Some(Self::Virtio(1));
         }
-        akuma_vfs_glue::file_size(DISK_IMAGE_PATH).ok().filter(|&n| n >= virtio::SECTOR).map(|_| Self::File)
+        akuma_vfs_glue::file_size(file).ok().filter(|&n| n >= virtio::SECTOR).map(|_| Self::File(file))
     }
 
     const fn what(self) -> &'static str {
         match self {
             Self::Virtio(_) => "second virtio-blk device",
-            Self::File => DISK_IMAGE_PATH,
+            Self::File(path) => path,
         }
     }
 }
@@ -277,21 +354,21 @@ impl Disk for HostDisk {
     fn sectors(&self) -> u64 {
         match *self {
             Self::Virtio(i) => akuma_virtio::block::with_device_at(i, |d| d.capacity_sectors()).unwrap_or(0),
-            Self::File => akuma_vfs_glue::file_size(DISK_IMAGE_PATH).map_or(0, |n| n / virtio::SECTOR),
+            Self::File(path) => akuma_vfs_glue::file_size(path).map_or(0, |n| n / virtio::SECTOR),
         }
     }
 
     fn read(&mut self, offset: u64, dst: &mut [u8]) -> bool {
         match *self {
             Self::Virtio(i) => akuma_virtio::block::read_bytes_at(i, offset, dst).is_ok(),
-            Self::File => akuma_vfs_glue::read_at(DISK_IMAGE_PATH, offset as usize, dst).is_ok_and(|n| n == dst.len()),
+            Self::File(path) => akuma_vfs_glue::read_at(path, offset as usize, dst).is_ok_and(|n| n == dst.len()),
         }
     }
 
     fn write(&mut self, offset: u64, src: &[u8]) -> bool {
         match *self {
             Self::Virtio(i) => akuma_virtio::block::write_bytes_at(i, offset, src).is_ok(),
-            Self::File => akuma_vfs_glue::write_at(DISK_IMAGE_PATH, offset as usize, src).is_ok_and(|n| n == src.len()),
+            Self::File(path) => akuma_vfs_glue::write_at(path, offset as usize, src).is_ok_and(|n| n == src.len()),
         }
     }
 
@@ -366,7 +443,7 @@ fn build_npt(ram: &Ram) -> Option<Npt> {
     let mut pd = FreshFrame::alloc_zeroed()?;
     svm::wr64(pml4.bytes_mut(), 0, svm::npt::pointer(pdpt.pa() as u64));
     svm::wr64(pdpt.bytes_mut(), 0, svm::npt::pointer(pd.pa() as u64));
-    for i in 0..(RAM_BYTES >> 21) {
+    for i in 0..(ram.bytes >> 21) {
         svm::wr64(pd.bytes_mut(), i as usize * 8, svm::npt::leaf_2m(ram.base + (i << 21)));
     }
     Some(Npt { pml4, _pdpt: pdpt, _pd: pd })
@@ -383,17 +460,17 @@ fn zero_segment() -> elf::Segment {
     elf::Segment { offset: 0, pa: 0, filesz: 0, memsz: 0 }
 }
 
-/// Stream `LINUX_PATH`'s `PT_LOAD` segments into guest RAM at their physical
+/// Stream `path`'s `PT_LOAD` segments into guest RAM at their physical
 /// addresses and find the PVH entry. `chunk` is the read window (one frame —
 /// no kernel-heap copy of a 40 MB image, the exec loader's own rule).
-fn load_vmlinux(ram: &Ram, chunk: &mut FreshFrame) -> Result<Loaded, &'static str> {
+fn load_kernel(path: &str, ram: &Ram, chunk: &mut FreshFrame) -> Result<Loaded, &'static str> {
     const MAX_SEGS: usize = 8;
     let mut loads = [zero_segment(); MAX_SEGS];
     let mut notes = [zero_segment(); MAX_SEGS];
     let (mut nloads, mut nnotes) = (0usize, 0usize);
     {
         let buf = chunk.bytes_mut();
-        let got = akuma_vfs_glue::read_at(LINUX_PATH, 0, &mut buf[..]).map_err(|_| "cannot read /boot/vmlinux")?;
+        let got = akuma_vfs_glue::read_at(path, 0, &mut buf[..]).map_err(|_| "cannot read the kernel image")?;
         let image = elf::Image::parse(&buf[..got]).ok_or("not an ELF64 little-endian image")?;
         for s in image.segments() {
             if nloads == MAX_SEGS {
@@ -422,7 +499,7 @@ fn load_vmlinux(ram: &Ram, chunk: &mut FreshFrame) -> Result<Loaded, &'static st
         }
         let buf = chunk.bytes_mut();
         let want = s.filesz as usize;
-        let got = akuma_vfs_glue::read_at(LINUX_PATH, s.offset as usize, &mut buf[..want])
+        let got = akuma_vfs_glue::read_at(path, s.offset as usize, &mut buf[..want])
             .map_err(|_| "cannot read the note segment")?;
         if let Some(e) = elf::find_pvh_entry(&buf[..got]) {
             entry = Some(e);
@@ -432,7 +509,7 @@ fn load_vmlinux(ram: &Ram, chunk: &mut FreshFrame) -> Result<Loaded, &'static st
     let entry = entry.ok_or("no PVH entry note (a bzImage, or a kernel built without CONFIG_PVH)")?;
 
     // Leave the top of RAM to the handoff pages.
-    let limit = RAM_BYTES - 0x4000;
+    let limit = ram.bytes - 0x4000;
     let mut bytes = 0u64;
     for s in &loads[..nloads] {
         let end = s.pa.checked_add(s.memsz).ok_or("segment wraps")?;
@@ -443,7 +520,7 @@ fn load_vmlinux(ram: &Ram, chunk: &mut FreshFrame) -> Result<Loaded, &'static st
         while done < s.filesz {
             let want = (s.filesz - done).min(4096) as usize;
             let buf = chunk.bytes_mut();
-            let got = akuma_vfs_glue::read_at(LINUX_PATH, (s.offset + done) as usize, &mut buf[..want])
+            let got = akuma_vfs_glue::read_at(path, (s.offset + done) as usize, &mut buf[..want])
                 .map_err(|_| "read error inside a segment")?;
             if got == 0 {
                 return Err("image is shorter than its program headers say");
@@ -469,11 +546,18 @@ struct Platform {
     pic: PicPair,
     /// The ACPI PM1 registers the FADT points at.
     pm1: svm::acpi::Pm1,
+    /// The local APIC, reached through the MMIO page once the guest has set
+    /// `IA32_APIC_BASE`'s enable bit. Absent (a Linux guest told `nolapic`
+    /// never sets it) the PIC is the whole interrupt fabric.
+    lapic: Lapic,
+    /// `IA32_APIC_BASE`: base, BSP flag, global enable.
+    apic_base: u64,
     msrs: MsrStore<48>,
     cmos_index: u8,
-    /// How much of "Linux version" the console has spelled so far.
-    banner: usize,
-    banner_seen: bool,
+    /// The first console line the guest must print, and (Akuma) the line its
+    /// init prints at the end.
+    banner: Needle,
+    done: Needle,
     tx_bytes: u64,
     /// `uptime_us` at the last console byte.
     last_tx_us: u64,
@@ -486,19 +570,66 @@ struct Platform {
     n_msr: usize,
 }
 
-const BANNER: &[u8] = b"Linux version";
+/// A console line being waited for, matched a byte at a time.
+struct Needle {
+    pat: &'static [u8],
+    at: usize,
+    seen: bool,
+}
+
+impl Needle {
+    const fn new(pat: &'static [u8]) -> Self {
+        Self { pat, at: 0, seen: false }
+    }
+
+    fn feed(&mut self, b: u8) {
+        if self.seen || self.pat.is_empty() {
+            return;
+        }
+        if b == self.pat[self.at] {
+            self.at += 1;
+            self.seen = self.at == self.pat.len();
+        } else {
+            self.at = usize::from(b == self.pat[0]);
+        }
+    }
+}
+
+/// `IA32_APIC_BASE`: bit 11 global enable, bit 8 BSP, bits 51:12 the base.
+const APIC_BASE_ENABLE: u64 = 1 << 11;
+const APIC_BASE_BSP: u64 = 1 << 8;
+const APIC_BASE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// Where an interrupt offered to the guest came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Pic,
+    Lapic,
+}
+
+/// An interrupt on its way to the guest as a virtual INTR.
+#[derive(Clone, Copy)]
+struct Offer {
+    vector: u8,
+    source: Source,
+}
 
 impl Platform {
-    const fn new() -> Self {
+    const fn new(guest: Guest) -> Self {
         Self {
             uart: Uart::new(),
             pit: Pit::new(),
             pic: PicPair::new(),
             pm1: svm::acpi::Pm1::new(),
+            lapic: Lapic::new(),
+            apic_base: lapic::DEFAULT_BASE | APIC_BASE_BSP,
             msrs: MsrStore::new(),
             cmos_index: 0,
-            banner: 0,
-            banner_seen: false,
+            banner: Needle::new(guest.banner()),
+            done: Needle::new(match guest.done() {
+                Some(d) => d,
+                None => b"",
+            }),
             tx_bytes: 0,
             last_tx_us: 0,
             seen_io: [0; 32],
@@ -516,15 +647,45 @@ impl Platform {
         self.last_tx_us = crate::net::uptime_us();
         let one = [b];
         p(core::str::from_utf8(&one).unwrap_or("?"));
-        if self.banner_seen {
-            return;
+        self.banner.feed(b);
+        self.done.feed(b);
+    }
+
+    /// Is the local APIC on, and where does its page sit?
+    fn lapic_page(&self) -> Option<u64> {
+        (self.apic_base & APIC_BASE_ENABLE != 0).then_some(self.apic_base & APIC_BASE_ADDR)
+    }
+
+    /// Bring every interrupt source up to `now_us` and say which vector, if any,
+    /// the guest should be offered. With the local APIC on it is the only
+    /// source (the PIC reaches the CPU through LINT0, which is not modelled);
+    /// without it the PIC is the whole fabric.
+    fn offer(&mut self, now_us: u64) -> Option<Offer> {
+        if self.pit.take_irq0(pit::ticks_from_us(now_us)) {
+            self.pic.raise(0);
         }
-        if b == BANNER[self.banner] {
-            self.banner += 1;
-            self.banner_seen = self.banner == BANNER.len();
-        } else {
-            self.banner = usize::from(b == BANNER[0]);
+        if self.lapic_page().is_some() {
+            self.lapic.poll(lapic::bus_ticks_from_us(now_us));
+            return self.lapic.pending().map(|vector| Offer { vector, source: Source::Lapic });
         }
+        self.pic.pending().map(|vector| Offer { vector, source: Source::Pic })
+    }
+
+    /// The guest took `offer` (the processor cleared `V_IRQ`): the INTA cycle.
+    /// False if the PIC acknowledged a different vector than it offered.
+    fn accept(&mut self, offer: Offer) -> bool {
+        match offer.source {
+            Source::Pic => self.pic.acknowledge() == Some(offer.vector),
+            Source::Lapic => {
+                self.lapic.acknowledge(offer.vector);
+                true
+            }
+        }
+    }
+
+    /// Could an interrupt ever arrive for a guest halted with `IF` set?
+    fn can_wake(&self) -> bool {
+        if self.lapic_page().is_some() { self.lapic.next_event().is_some() } else { self.pit.next_irq0_tick().is_some() }
     }
 
     fn note_io(&mut self, port: u16, write: bool, val: u32) {
@@ -647,8 +808,8 @@ impl Platform {
             MSR_PAT => v.save64(save::G_PAT),
             // The host's time-stamp counter, as `RDTSC` already returns it.
             MSR_TSC => akuma_cpu::tsc::rdtsc(),
-            // Base 0xFEE0_0000, BSP, global enable clear: a local APIC that is off.
-            MSR_APIC_BASE => 0xFEE0_0100,
+            // Base 0xFEE0_0000, BSP; the enable bit is the guest's to set.
+            MSR_APIC_BASE => self.apic_base,
             _ => {
                 self.note_msr(msr, false, 0);
                 self.msrs.get(msr).unwrap_or(0)
@@ -685,6 +846,8 @@ impl Platform {
             MSR_SYSENTER_ESP => v.set_save64(save::SYSENTER_ESP, val),
             MSR_SYSENTER_EIP => v.set_save64(save::SYSENTER_EIP, val),
             MSR_PAT => v.set_save64(save::G_PAT, val),
+            // Base and enable are the guest's; the BSP flag is ours.
+            MSR_APIC_BASE => self.apic_base = (val & (APIC_BASE_ADDR | APIC_BASE_ENABLE)) | APIC_BASE_BSP,
             _ => {
                 self.note_msr(msr, true, val);
                 if !self.msrs.set(msr, val) {
@@ -753,6 +916,73 @@ fn mmio_write(
     }
 }
 
+/// A device the guest reaches by loads and stores to a window.
+trait MmioDev {
+    fn load(&mut self, size: u8) -> u64;
+    fn store(&mut self, size: u8, val: u64);
+}
+
+/// The local APIC's register page, at `off` into it, at bus time `now`.
+struct LapicDev<'a> {
+    lapic: &'a mut Lapic,
+    off: u64,
+    now: u64,
+}
+
+impl MmioDev for LapicDev<'_> {
+    fn load(&mut self, _size: u8) -> u64 {
+        u64::from(self.lapic.read(self.off, self.now))
+    }
+
+    fn store(&mut self, _size: u8, val: u64) {
+        self.lapic.write(self.off, val as u32, self.now);
+    }
+}
+
+/// The virtio-blk window, at `off`.
+struct VirtioDev<'a> {
+    dev: &'a mut MmioBlk,
+    disk: &'a mut HostDisk,
+    ram: &'a Ram,
+    bounce: &'a mut [u8],
+    pic: &'a mut PicPair,
+    off: u64,
+}
+
+impl MmioDev for VirtioDev<'_> {
+    fn load(&mut self, size: u8) -> u64 {
+        self.dev.read(self.off, size)
+    }
+
+    fn store(&mut self, size: u8, val: u64) {
+        mmio_write(self.dev, self.disk, self.ram, self.bounce, self.pic, self.off, size, val);
+    }
+}
+
+/// Carry out a decoded access against `dev` and step the guest past the
+/// instruction. A compare reads the device once and writes only the flags.
+fn mmio_emulate(a: &mmio::Access, dev: &mut dyn MmioDev, v: &mut Vmcb<'_>, regs: &mut GuestRegs) {
+    match a.kind {
+        mmio::Kind::Load { reg, .. } => {
+            let val = dev.load(a.size);
+            let old = get_reg(v, regs, reg);
+            set_reg(v, regs, reg, a.load_result(old, val));
+        }
+        mmio::Kind::Store { reg, .. } => dev.store(a.size, a.store_value(get_reg(v, regs, reg))),
+        mmio::Kind::StoreImm(_) => dev.store(a.size, a.store_value(0)),
+        mmio::Kind::Compare { other, .. } => {
+            let device = dev.load(a.size);
+            let reg_value = match other {
+                mmio::Other::Reg { reg, .. } => get_reg(v, regs, reg),
+                mmio::Other::Imm(_) => 0,
+            };
+            let flags = a.compare_flags(reg_value, device);
+            v.set_rflags((v.rflags() & !mmio::ARITH_FLAGS) | flags);
+        }
+    }
+    v.set_rip(v.rip() + u64::from(a.len));
+}
+
 /// One serial line: the guest's instruction bytes at `va`, for a post-mortem.
 fn dump_code(ram: &Ram, v: &Vmcb<'_>, va: u64) {
     match guest_code(ram, v, va) {
@@ -778,8 +1008,8 @@ fn dump_code(ram: &Ram, v: &Vmcb<'_>, va: u64) {
 /// mounted (`kvm::late`).
 /// [`LINUX_CMDLINE`] followed by ` tsc_early_khz=<khz>` (omitted when the host
 /// has no calibrated TSC), assembled in `buf`.
-fn cmdline_with_tsc<'a>(buf: &'a mut [u8; 400], khz: u64, extra: &str) -> &'a str {
-    let base = LINUX_CMDLINE.as_bytes();
+fn cmdline_with_tsc<'a>(buf: &'a mut [u8; 400], base: &str, khz: u64, extra: &str) -> &'a str {
+    let base = base.as_bytes();
     buf[..base.len()].copy_from_slice(base);
     let mut n = base.len();
     buf[n..n + extra.len()].copy_from_slice(extra.as_bytes());
@@ -798,15 +1028,18 @@ fn cmdline_with_tsc<'a>(buf: &'a mut [u8; 400], khz: u64, extra: &str) -> &'a st
         buf[n..n + digits.len() - i].copy_from_slice(&digits[i..]);
         n += digits.len() - i;
     }
-    core::str::from_utf8(&buf[..n]).unwrap_or(LINUX_CMDLINE)
+    core::str::from_utf8(&buf[..n]).unwrap_or("")
 }
 
-pub fn run(nrips: bool) {
+pub fn run(nrips: bool, guest: Guest) {
     crumb(0x51);
     p("[KVM] linux: loading ");
-    p(LINUX_PATH);
+    p(guest.name());
+    p(" guest ");
+    p(guest.path());
     p("\n");
-    let Some(ram) = Ram::alloc() else {
+    let ram_bytes = guest.ram_bytes();
+    let Some(ram) = Ram::alloc(ram_bytes) else {
         p("[KVM] linux: no contiguous frames for guest RAM\n");
         return;
     };
@@ -819,7 +1052,7 @@ pub fn run(nrips: bool) {
         p("[KVM] linux: no scratch frame\n");
         return;
     };
-    let loaded = match load_vmlinux(&ram, &mut scratch) {
+    let loaded = match load_kernel(guest.path(), &ram, &mut scratch) {
         Ok(l) => l,
         Err(why) => {
             p("[KVM] linux: load failed: ");
@@ -841,16 +1074,28 @@ pub fn run(nrips: bool) {
     // memmap's one RAM entry stopping short of them.
     // With a disk, one more page under the handoff pages holds the ACPI tables
     // and the memory map reports it (type 3) instead of as RAM.
-    let disk = HostDisk::pick();
-    let acpi_gpa = RAM_BYTES - 0x4000;
-    let l = pvh::plan(RAM_BYTES, 0, if disk.is_some() { acpi_gpa } else { RAM_BYTES - 0x3000 });
+    let disk = HostDisk::pick(guest.disk_path());
+    // Only Linux is told about its disk through ACPI; the Akuma guest finds it on
+    // the command line.
+    let acpi = disk.is_some() && guest == Guest::Linux;
+    let acpi_gpa = ram_bytes - 0x4000;
+    let l = pvh::plan(ram_bytes, 0, if acpi { acpi_gpa } else { ram_bytes - 0x3000 });
     scratch.bytes_mut().fill(0);
     // The guest is told the host's TSC rate rather than left to calibrate it
     // through trapped port reads: a poll loop whose every iteration is a
     // VM exit measures the exits, not the PIT (`tsc_early_khz` is a documented
     // kernel parameter). Built on the stack: no allocation.
     let mut cmd = [0u8; 400];
-    let cmdline = cmdline_with_tsc(&mut cmd, crate::lapic::tsc_hz() / 1000, if disk.is_some() { ROOT_ARGS } else { NO_DISK_ARGS });
+    let cmdline = match guest {
+        Guest::Linux => cmdline_with_tsc(
+            &mut cmd,
+            LINUX_CMDLINE,
+            crate::lapic::tsc_hz() / 1000,
+            if disk.is_some() { ROOT_ARGS } else { NO_DISK_ARGS },
+        ),
+        // The Akuma guest calibrates its own TSC against the virtual PIT.
+        Guest::Akuma => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { AKUMA_DISK_ARGS } else { "" }),
+    };
     match disk {
         Some(d) => {
             p("[KVM] linux: guest disk: ");
@@ -859,7 +1104,11 @@ pub fn run(nrips: bool) {
             dec(d.sectors() >> 11);
             p(" MiB\n");
         }
-        None => p("[KVM] linux: no guest disk (no second virtio-blk, no /boot/guest-root.img)\n"),
+        None => {
+            p("[KVM] linux: no guest disk (no second virtio-blk, no ");
+            p(guest.disk_path());
+            p(")\n");
+        }
     }
     if !pvh::write_cmdline(scratch.bytes_mut(), cmdline) || !ram.write(l.cmdline_gpa, scratch.bytes_mut()) {
         p("[KVM] linux: cmdline handoff failed\n");
@@ -875,7 +1124,7 @@ pub fn run(nrips: bool) {
     scratch.bytes_mut().fill(0);
     pvh::write_memmap(scratch.bytes_mut(), &l);
     pvh::write_start(start_page.bytes_mut(), &l);
-    if disk.is_some() {
+    if acpi {
         let dev = svm::acpi::VirtioMmio { base: VIRTIO_BASE as u32, len: VIRTIO_LEN as u32, irq: u32::from(VIRTIO_IRQ) };
         let Some(mut acpi_page) = FreshFrame::alloc_zeroed() else {
             p("[KVM] linux: no frame for the ACPI tables\n");
@@ -919,7 +1168,12 @@ pub fn run(nrips: bool) {
         // #UD, #GP, #PF and #DF are intercepted only to be seen: each is logged
         // and re-injected, so the guest behaves as if they were not. A triple
         // fault names no cause; the exception before it does.
-        v.set_excp(excp::UD | excp::GP | excp::PF | excp::DF);
+        // The Akuma guest demand-faults all its user memory: its #PF is routine
+        // (nested paging delivers it without an exit), so only Linux's is traced.
+        v.set_excp(match guest {
+            Guest::Linux => excp::UD | excp::GP | excp::PF | excp::DF,
+            Guest::Akuma => excp::UD | excp::GP | excp::DF,
+        });
         v.set_iopm_base(image_pa(iopm));
         v.set_msrpm_base(image_pa(msrpm));
         v.set_asid(ASID);
@@ -991,11 +1245,11 @@ pub fn run(nrips: bool) {
     p("[KVM] linux: running (start=");
     hx(l.start_gpa, 8);
     p(", ram=");
-    dec(RAM_BYTES >> 20);
+    dec(ram_bytes >> 20);
     p(" MiB)\n");
 
     let mut regs = GuestRegs { rbx: l.start_gpa, ..GuestRegs::default() };
-    let mut plat = Platform::new();
+    let mut plat = Platform::new(guest);
     let mut log = ExitLog { cpuid: 0, msr: 0, exc: 0 };
     let (mut exits, mut n_cpuid, mut n_msr, mut n_io, mut n_irq, mut n_exc) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut stopped = "exit budget spent";
@@ -1011,6 +1265,7 @@ pub fn run(nrips: bool) {
     akuma_cpu::daif::unmask_irq();
     let started_us = crate::net::uptime_us();
     plat.last_tx_us = started_us;
+    let (mut n_lapic, mut n_ticks) = (0u64, 0u64);
     'run: while exits < MAX_EXITS {
         exits += 1;
         let now_us = crate::net::uptime_us();
@@ -1018,20 +1273,21 @@ pub fn run(nrips: bool) {
             stopped = "wall-clock budget spent";
             break 'run;
         }
-        if plat.banner_seen && now_us.saturating_sub(plat.last_tx_us) > QUIET_BUDGET_US {
+        if plat.banner.seen && now_us.saturating_sub(plat.last_tx_us) > QUIET_BUDGET_US {
             stopped = "guest console quiet after the banner";
             break 'run;
         }
-        // The PIT's channel 0 has had an edge since we last looked: IRQ0 is
-        // requested. Then offer the PIC's best vector to the guest as a virtual
-        // INTR; the processor takes it when the guest's IF allows (§15.21.4)
-        // and writes V_IRQ back cleared when it has.
-        if plat.pit.take_irq0(pit::ticks_from_us(now_us)) {
-            plat.pic.raise(0);
+        if plat.done.seen {
+            stopped = "guest reported its init ran to the end";
+            break 'run;
         }
-        let offered = plat.pic.pending();
+        // Bring the interrupt sources up to now (the PIT's channel 0 edge, the
+        // local APIC's timer), then offer the best vector to the guest as a
+        // virtual INTR; the processor takes it when the guest's IF allows
+        // (§15.21.4) and writes V_IRQ back cleared when it has.
+        let offered = plat.offer(now_us);
         Vmcb::new(vmcb_f.bytes_mut()).set_v_intr(match offered {
-            Some(vec) => ctrl::v_intr_extint(vec),
+            Some(o) => ctrl::v_intr_extint(o.vector),
             None => ctrl::V_INTR_MASKING,
         });
         crumb(0x57);
@@ -1046,16 +1302,19 @@ pub fn run(nrips: bool) {
         // vector: that is the INTA cycle, and it happens before any exit this
         // run can report, so the PIC is up to date before a port write (the
         // guest's EOI) is looked at.
-        if let Some(vec) = offered
+        if let Some(o) = offered
             && v.v_intr() & ctrl::V_IRQ == 0
         {
             n_inj += 1;
-            if plat.pic.acknowledge() != Some(vec) {
+            if !plat.accept(o) {
                 p("\n[KVM] linux: PIC acknowledged a different vector than it offered\n");
+            }
+            if o.source == Source::Lapic {
+                n_ticks += 1;
             }
             if n_inj <= LOG_FIRST.into() {
                 p("\n[KVM] linux: irq vector ");
-                hx(u64::from(vec), 2);
+                hx(u64::from(o.vector), 2);
                 p(" taken at rip=");
                 hx(v.rip(), 16);
                 p("\n");
@@ -1155,17 +1414,14 @@ pub fn run(nrips: bool) {
                     break 'run;
                 }
                 v.set_rip(next_rip(&v, nrips, 1));
-                // Idle until the PIT can raise an interrupt the PIC will offer.
-                // The host tick keeps running underneath (IRQs are on).
+                // Idle until a timer can raise an interrupt the guest will be
+                // offered. The host tick keeps running underneath (IRQs are on).
                 loop {
                     let now = crate::net::uptime_us();
-                    if plat.pit.take_irq0(pit::ticks_from_us(now)) {
-                        plat.pic.raise(0);
-                    }
-                    if plat.pic.pending().is_some() {
+                    if plat.offer(now).is_some() {
                         break;
                     }
-                    if plat.pit.next_irq0_tick().is_none() {
+                    if !plat.can_wake() {
                         stopped = "guest halted waiting for an interrupt nothing can raise";
                         break 'run;
                     }
@@ -1225,6 +1481,24 @@ pub fn run(nrips: bool) {
                 }
                 v.set_eventinj(eventinj::exception(vector, err));
             }
+            ExitCode::Npf if plat.lapic_page().is_some_and(|b| (b..b + lapic::PAGE_LEN).contains(&v.exitinfo2())) => {
+                n_lapic += 1;
+                let off = v.exitinfo2() - (plat.apic_base & APIC_BASE_ADDR);
+                let access = guest_code(&ram, &v, v.rip()).and_then(|c| mmio::decode(&c));
+                let Some(a) = access else {
+                    stopped = "guest touched the local APIC page with an instruction the MMIO decoder does not know";
+                    fatal = true;
+                    p("\n[KVM] linux: ");
+                    p(stopped);
+                    p(" rip=");
+                    hx(v.rip(), 16);
+                    p("\n");
+                    dump_code(&ram, &v, v.rip());
+                    break 'run;
+                };
+                let now = lapic::bus_ticks_from_us(crate::net::uptime_us());
+                mmio_emulate(&a, &mut LapicDev { lapic: &mut plat.lapic, off, now }, &mut v, &mut regs);
+            }
             ExitCode::Npf if blk.is_some() && (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_LEN).contains(&v.exitinfo2()) => {
                 n_mmio += 1;
                 let off = v.exitinfo2() - VIRTIO_BASE;
@@ -1241,22 +1515,9 @@ pub fn run(nrips: bool) {
                     break 'run;
                 };
                 let (dev, hostdisk) = blk.as_mut().expect("checked by the guard");
-                match a.kind {
-                    mmio::Kind::Load { reg, .. } => {
-                        let val = dev.read(off, a.size);
-                        let old = get_reg(&v, &regs, reg);
-                        set_reg(&mut v, &mut regs, reg, a.load_result(old, val));
-                    }
-                    mmio::Kind::Store { reg, .. } => {
-                        let val = a.store_value(get_reg(&v, &regs, reg));
-                        mmio_write(dev, hostdisk, &ram, scratch.bytes_mut(), &mut plat.pic, off, a.size, val);
-                    }
-                    mmio::Kind::StoreImm(_) => {
-                        let val = a.store_value(0);
-                        mmio_write(dev, hostdisk, &ram, scratch.bytes_mut(), &mut plat.pic, off, a.size, val);
-                    }
-                }
-                v.set_rip(v.rip() + u64::from(a.len));
+                let mut window =
+                    VirtioDev { dev, disk: hostdisk, ram: &ram, bounce: scratch.bytes_mut(), pic: &mut plat.pic, off };
+                mmio_emulate(&a, &mut window, &mut v, &mut regs);
             }
             ExitCode::Npf => {
                 stopped = "nested page fault (guest touched unmapped guest-physical memory)";
@@ -1316,16 +1577,28 @@ pub fn run(nrips: bool) {
     dec(n_hlt);
     p(" mmio=");
     dec(n_mmio);
+    p(" lapic=");
+    dec(n_lapic);
+    p(" lapic_irq=");
+    dec(n_ticks);
     p(" console_bytes=");
     dec(plat.tx_bytes);
     p(" rip=");
     hx(v.rip(), 16);
     p("\n");
-    let pass = plat.banner_seen && !fatal;
-    p("[KVM] linux guest: ");
+    // A Linux run passes on its banner; the Akuma guest must also have run its
+    // init to the end (the marker the script on its disk prints).
+    let pass = plat.banner.seen && !fatal && (guest == Guest::Linux || plat.done.seen);
+    p("[KVM] ");
+    p(guest.name());
+    p(" guest: ");
     p(if pass { "PASS" } else { "FAIL" });
     p(" (banner=");
-    p(if plat.banner_seen { "yes" } else { "no" });
+    p(if plat.banner.seen { "yes" } else { "no" });
+    if guest == Guest::Akuma {
+        p(", init=");
+        p(if plat.done.seen { "yes" } else { "no" });
+    }
     p(")\n");
 }
 

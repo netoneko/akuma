@@ -39,6 +39,7 @@
 //! [`ctrl`] offsets are from the page base.
 
 pub mod acpi;
+pub mod lapic;
 pub mod mmio;
 pub mod pic;
 pub mod pit;
