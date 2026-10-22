@@ -3594,6 +3594,20 @@ pub fn x86_earliest_wake_time() -> Option<u64> {
     (best != u64::MAX).then_some(best)
 }
 
+/// Is a parked thread's deadline (`earliest`, from [`x86_earliest_wake_time`])
+/// already due at `now_us`?
+///
+/// The question a **kernel wait loop that halts instead of yielding** must ask
+/// before it halts. Only [`x86_yield_now`] runs the wake pass, so such a loop
+/// never readies the due sleeper; and because the sleeper stays `WAITING` with
+/// a past deadline, the halt's one-shot timer is armed for 1 count, fires at
+/// once, and the loop spins at interrupt rate while the sleeper starves
+/// (`docs/archive/UDP_REPLY_WAIT_TIMER_STORM.md`). A due deadline means: yield.
+#[must_use]
+pub fn wake_is_due(earliest: Option<u64>, now_us: u64) -> bool {
+    earliest.is_some_and(|t| t <= now_us)
+}
+
 /// The x86_64 cooperative switch: called from [`yield_now`]'s x86_64 arm and
 /// from [`schedule_blocking`]'s.
 ///
@@ -7924,5 +7938,18 @@ mod ryzen_2026_10_16_slot_hold_tests {
         assert_eq!(slot_held_by(B), 0x7400_0002, "another zombie's hold was released");
         assert_eq!(release_slots_held_by(0x7400_0002), 1);
         assert_eq!(release_slots_held_by(0), 0, "pid 0 is 'no hold', never a match");
+    }
+}
+
+#[cfg(test)]
+mod wake_due_tests {
+    use super::wake_is_due;
+
+    #[test]
+    fn due_only_when_a_deadline_has_passed() {
+        assert!(!wake_is_due(None, 100));
+        assert!(!wake_is_due(Some(101), 100));
+        assert!(wake_is_due(Some(100), 100));
+        assert!(wake_is_due(Some(1), 100));
     }
 }

@@ -324,6 +324,16 @@ fn net_blocking_relax() {
     if crate::rtw89_sta::is_link() {
         crate::sched::yield_now();
     }
+    // **A sleeper whose deadline has passed needs the scheduler, not a halt.**
+    // Only the yield path runs the wake pass; `allow_tick` does not, so a waiter
+    // that only halts leaves the sleeper `WAITING` with a past deadline, and
+    // `lapic::arm_deadline` then arms a 1-count one-shot every lap: an interrupt
+    // storm with the sleeper (the netpoll daemon among them) starved. Measured
+    // as `nc -u -w 2` hanging after a UDP reply (`docs/archive/UDP_REPLY_WAIT_TIMER_STORM.md`).
+    if akuma_threading::wake_is_due(akuma_threading::x86_earliest_wake_time(), uptime_us()) {
+        crate::sched::yield_now();
+        return;
+    }
     if crate::lapic::timer_running() {
         crate::sched::allow_tick();
     } else {

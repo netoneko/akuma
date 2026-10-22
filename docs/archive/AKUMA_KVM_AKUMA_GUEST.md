@@ -146,7 +146,7 @@ shadow wherever the hypervisor completes an instruction.
 | the same image on plain QEMU with `-netdev user` | finishes (`nc` returns after its timeout, `AKUMA-GUEST-DONE`) |
 | the one-vCPU, hello and SMP guests after the shadow fix | unchanged **PASS** |
 
-**Item 4, rechecked after TCP/ssh (2026-10-22, TCG): the UDP stall is narrowed, not fixed.**
+**Item 4 (2026-10-22): FIXED — see UDP_REPLY_WAIT_TIMER_STORM.md. (History of the narrowing follows.)**
 * It still reproduces with the current gateway and kernel, and TCP probes do not trigger it
   (`NET=1 TCPPROBE=1`: `tcp echo: akuma-tcp-probe`, finishes).
 * **A reply datagram is required.** `NETPROBE_PORT=9` (a UDP port the gateway does not answer, so

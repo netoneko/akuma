@@ -9,8 +9,8 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1449
-- **Docs contributing at least one fix:** 399
+- **Total distinct fixes counted:** 1450
+- **Docs contributing at least one fix:** 400
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
@@ -19,7 +19,7 @@ from several subsystems under one write-up.
 | Memory & Virtual Memory | 176 | 12.1% | 57 |
 | Scheduler & Process Management | 139 | 9.6% | 43 |
 | SMP & Locking | 133 | 9.2% | 54 |
-| Networking | 92 | 6.3% | 33 |
+| Networking | 93 | 6.4% | 34 |
 | Userspace Apps & Libraries | 40 | 2.8% | 21 |
 | Rump Kernel & Syscall Proxy | 26 | 1.8% | 6 |
 | Toolchain & Self-Hosting | 91 | 6.3% | 13 |
@@ -1100,7 +1100,10 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_TLB_STUCK_MMAP_REGIONS.md
 - `Process::mmap_regions` had no shootdown assist, so a BKL-free `/proc/<pid>/maps` read (`fd::pid_map_rows`) spun IRQ-masked on it while a `munmap` sender held it in `wait_for_acks`, and a multi-threaded `claude` wedged the whole ryzen (no ssh, no ping, no watchdog); it is an `AssistedSpinlock` now (the sibling of the `as_lock` fix)
 
-## Networking (92 fixes, 33 docs)
+## Networking (93 fixes, 34 docs)
+
+### docs/archive/UDP_REPLY_WAIT_TIMER_STORM.md
+- `nc -u -w 2` hung after a UDP reply: the blocking-recv wait loop (`net_blocking_relax` -> `allow_tick`) halted without ever running the wake pass, so a sleeper with a past deadline stayed `WAITING`, `lapic::arm_deadline` armed a 1-count one-shot every lap and the core spun at interrupt rate with the sleeper starved. Fixed by yielding when `wake_is_due`
 
 ### docs/archive/AKUMA_NET_SPLIT.md
 - `VirtioSmoltcpDevice::receive` built its tx token as `unsafe { &mut *(&raw mut *self) }` while the rx token was live, so two `&mut` to the same device existed at once — UB by the language's rules independently of whether the NIC raced them. The fix is a reorder, and works because `take_rx_frame` returns a raw pointer whose provenance is the BSS frame arena rather than `self`; `LoopbackAwareDevice::receive` had already solved the same problem 200 lines below
