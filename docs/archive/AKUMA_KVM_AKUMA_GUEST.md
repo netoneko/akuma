@@ -139,8 +139,20 @@ shadow wherever the hypervisor completes an instruction.
 | where | result |
 |---|---|
 | QEMU TCG, `NET=1 scripts/kvm/akuma_rehearse.sh` | **PASS** (`net=yes`): 10 frames, `arp=2 dhcp_offer=1 dhcp_ack=1`, the guest's `eth0` reads `inet addr:10.0.2.15  Bcast:10.0.2.255  Mask:255.255.255.0`; `HLT` exits 503 (was 127 915) |
-| QEMU TCG, `NETPROBE=1` (`nc -u -w 2 10.0.2.2 7`) | the echo **worked both ways** (guest strace: `nc` read its 16 bytes back from the socket, wrote them out, the shell read them from the pipe), then the guest **stalled after `nc`'s poll timeout** (nothing runnable, timer interrupts still arriving, no further syscalls from `nc`, no verdict). Not diagnosed: the same image on plain QEMU `-netdev user` finishes; under TCG host time runs ~20x slow against the wall clock, which may be all of it. To be run on the metal. |
+| QEMU TCG, `NETPROBE=1` (`nc -u -w 2 10.0.2.2 7`) | the echo **worked both ways** (guest strace: `nc` read its 16 bytes back from the socket and wrote them out, the shell read them from the pipe); `nc`'s 2 s poll then timed out and the guest **never finished**: no verdict |
+| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma-net`, kernel `89cea0b4` built on the ryzen), `GUEST=net` | the device, the gateway and the guest's stack are **proven on hardware**: `net_mmio=69 net_frames=11 arp=2 dhcp_offer=1 dhcp_ack=1 udp_echo=1 net_ignored=6 net_lost=0`, `eth0 52:54:00:12:34:56 inet addr:10.0.2.15 Bcast:10.0.2.255 Mask:255.255.255.0`. Verdict **FAIL (init=no)** for the same reason as under TCG: after `nc`'s timeout the guest sits in an idle loop re-arming its LAPIC timer (377 558 timer interrupts, 377 535 `HLT`s, 2.6 M LAPIC MMIO exits in the 20 s before the quiet-console stop) and the init script never reaches its last line. Log: [`AMD64_KVMTEST_PHASE12_NET_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE12_NET_METAL_DMESG_2026_10_22.txt) |
+| the same image on plain QEMU with `-netdev user` | finishes (`nc` returns after its timeout, `AKUMA-GUEST-DONE`) |
 | the one-vCPU, hello and SMP guests after the shadow fix | unchanged **PASS** |
+
+**Open (the guest, not the device):** the stall reproduces on the metal and under TCG with the gateway
+answering, and not on QEMU with slirp (which does not answer port 7, so `nc` there never receives a
+datagram). `strace` prints a syscall on *return*, so `nc`'s `exit_group` leaves no line; the likeliest
+shape is that `nc` exits and the parent's `wait4` is never woken, with the netpoll daemon spinning (the
+class of `NETWORK`/`SOCKET_TABLE` ordering bug in
+[`BKL_TICKET_LIVELOCK_FIRECRACKER`](BUG_FIX_LIST.md)'s neighbourhood). To find it: `strace_pid=` on the
+shell, the guest's own dmesg, and a `NETPROBE=1` run with the gateway's UDP echo disabled (the A/B that
+separates "a datagram arrived" from "a timeout elapsed"). Without `NETPROBE` the NIC guest passes
+(`GUEST=net` stages it *with* the probe; use `GUEST=busybox` with a `NET=1` image for the quick one).
 
 `busybox ping` cannot be used as a probe: Akuma has no raw sockets (`can't create raw socket`).
 

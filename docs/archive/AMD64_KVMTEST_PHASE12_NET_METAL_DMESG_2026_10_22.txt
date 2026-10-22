@@ -1,0 +1,968 @@
+n at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+  dns: 10.0.2.3: no reply before timeout
+
+  dns: 1.1.1.1: no reply before timeout
+
+  dns: 8.8.8.8: no reply before timeout
+
+  clock: boot: could not resolve pool.ntp.org via 10.0.2.3
+
+  net:  netpoll daemon spawned in slot 1
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+
+                      =#=      .-
+
+                      +*#*:.:-**
+
+                      +%%#%##***
+
+                      +%%%#%%#**.
+
+                      +%@@@%%%+*:
+
+          :::::--=+++*%@%@%%%%*-
+
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+
+*%%%%%@%@@%@@@%%%%#%@@@@@@@%%@@%@@@*+--
+
+ ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+
+         .--+**%@@@@@%@@%%@@%*       :-.
+
+                  ::::---#@%%*
+
+
+
+  Akuma/amd64  0.0.8-amd64
+
+
+
+-- running /bin/busybox --
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+[threads] new high-water: 5 live user threads (terminated=0 free=507 ceiling=512)
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+AKUMA-GUEST-UP
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+Akuma akuma 0.0.8 89cea0b-release-smp-shared x86_64 GNU/Linux
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000007/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 80000000/00 -> 80000028 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 80000001/00 -> 00a70f52 10000000 000211f3 2fd3fbff
+
+[KVM] linux: cpuid 80000000/00 -> 80000028 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 80000002/00 -> 20444d41 657a7952 2037206e 35343838
+
+[KVM] linux: cpuid 80000003/00 -> 77205348 6152202f 6e6f6564 30383720
+
+[KVM] linux: cpuid 80000004/00 -> 7247204d 69687061 20207363 00202020
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000007/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 80000000/00 -> 80000028 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 80000001/00 -> 00a70f52 10000000 000211f3 2fd3fbff
+
+[KVM] linux: cpuid 80000000/00 -> 80000028 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 80000002/00 -> 20444d41 657a7952 2037206e 35343838
+
+[KVM] linux: cpuid 80000003/00 -> 77205348 6152202f 6e6f6564 30383720
+
+[KVM] linux: cpuid 80000004/00 -> 7247204d 69687061 20207363 00202020
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+guest cpus: 1
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+ebce43017d2cb316ea45e08374de7315  /bin/busybox
+[threads] new high-water: 6 live user threads (terminated=0 free=506 ceiling=512)
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+71277886028e270c53e947eb5989f7f2  /wtest
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+eth0      Link encap:Ethernet  HWaddr 52:54:00:12:34:56  
+          inet addr:10.0.2.15  Bcast:10.0.2.255  Mask:255.255.255.0
+          UP BROADCAST RUNNING MULTICAST  MTU:1514  Metric:1
+          RX packets:4 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:10 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 
+          RX bytes:768 (768.0 B)  TX bytes:1136 (1.1 KiB)
+
+lo        Link encap:Ethernet  HWaddr 00:00:00:00:00:00  
+          inet addr:127.0.0.1  Mask:255.0.0.0
+          UP LOOPBACK RUNNING  MTU:65536  Metric:1
+          RX packets:0 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:0 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 
+          RX bytes:0 (0.0 B)  TX bytes:0 (0.0 B)
+
+[threads] new high-water: 7 live user threads (terminated=0 free=505 ceiling=512)
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: stopped: guest console quiet after the banner
+[KVM] linux: exits=3033459 cpuid=34 msr=4202 io=11168 irq=1 exc=0 injected=377558 hlt=377535 mmio=1665 lapic=2638785 lapic_irq=377558 net_mmio=69 net_frames=11 arp=2 dhcp_offer=1 dhcp_ack=1 icmp=0 udp_echo=1 net_ignored=6 net_lost=0 console_bytes=4332 rip=ffffffff802c8502
+[KVM] akuma-net guest: FAIL (banner=yes, init=no, net=yes)
+  smp:  cpu 1 tsc offset 3841053756 cycles
+  smp:  cpu 1 online (lapic id 1)
+  [KVM] cpu 1 svm enabled
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=1048576
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=2097152
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=4194304
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=8388608
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=0 (aff0+1)
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=16777216
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=33554432
+  smp:  cpu 2 tsc offset 3841053756 cycles
+  smp:  cpu 2 online (lapic id 2)
+  [KVM] cpu 2 svm enabled
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=67108864
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 3 tsc offset 3841053775 cycles
+  smp:  cpu 3 online (lapic id 3)
+  [KVM] cpu 3 svm enabled
+[BKL] stuck: owner=1 waiter=4 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 4 tsc offset 3841053718 cycles
+  smp:  cpu 4 online (lapic id 4)
+  [KVM] cpu 4 svm enabled
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=134217728
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 5 tsc offset 3841053775 cycles
+  smp:  cpu 5 online (lapic id 5)
+  [KVM] cpu 5 svm enabled
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=4 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 6 tsc offset 3841053756 cycles
+  smp:  cpu 6 online (lapic id 6)
+  [KVM] cpu 6 svm enabled
+[BKL] stuck: owner=1 waiter=5 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=4 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 7 tsc offset 3841053718 cycles
+  smp:  8 cpus online
+  smp:  cpu 7 online (lapic id [BKLPROF] enabled (amd64 diagnostic)
+7)
+  [KVM] cpu 7  net:  wifi link: DHCP and the wall clock follow the join
+ svm enabled
+  net:  netpoll daemon spawned in slot 10
+  [touchpad] GXTP5100 @0x000000000000005d on dw_i2c 0x00000000fedc2000
+  [touchpad] dw_i2c v=0x000000003230322a fs=99:214 (kept) fifo=256/256
+  [touchpad] hid 27c6:01e0 rdesc=665 maxin=32
+  [touchpad] ptp report 4 contacts=5 range=3751x2327 -> 1920x1200
+[BKL] stuck: owner=1 waiter=6 tag=501 serving=0 folded=8 (aff0+1)
+  [touchpad] up: /dev/input/mouse0
+[fb] 1920x1200 pitch 7680 (= width*bpp) bpp 32 cell 11x22 grid 171x53 margin 15,9 wc on clear 1.2ms = 7177MB/s
+
+                      =#=      .-
+                      +*#*:.:-**
+                      +%%#%##***
+                      +%%%#%%#**.
+                      +%@@@%%%+*:
+          :::::--=+++*%@%@%%%%*-
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+*%%%%%@%@@%@@@%%%%#%@@@@@@@%%@@%@@@*+--
+ ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+         .--+**%@@@@@%@@%%@@%*       :-.
+                  ::::---#@%%*
+
+  Akuma/amd64  0.0.8-amd64
+
+-- running /bin/herd --
+[BKL] stuck: owner=1 waiter=6 tag=501 serving=0 folded=8 (aff0+1)
+[rtw] join1 (start): 18337 ops, 9165 writes, 29 h2c, checks 5561 (88 differ), polls 3564 (0 timed out), 35052 us
+[rtw]   op 13376 reg 0x00000000000000ac want 0x00000000c000008b got 0x0000000000000003
+[rtw]   op 13415 reg 0x00000000000000ac want 0x00000000c000008b got 0x0000000000000003
+[rtw]   op 15634 reg 0x00000000000000ac want 0x000000004000000b got 0x0000000080000003
+[rtw]   op 15639 reg 0x00000000000000ac want 0x000000004000000b got 0x0000000080000003
+[rtw]   op 15688 reg 0x000000000001c0fc want 0x00000000c1100041 got 0x00000000c1100031
+[rtw]   op 15699 reg 0x000000000001c1fc want 0x00000000c110fff1 got 0x00000000c1100001
+[rtw]   op 15704 reg 0x000000000001c0fc want 0x00000000c1104bfc got 0x00000000c1104bfd
+[rtw]   op 15705 reg 0x000000000001c0fc want 0x00000000c1104bfc got 0x00000000c1104bfd
+[IDLESTAT] halts=0 shots=0 shot_ticks_credited=0
+[SmolNet] DHCP deconfigured - reverting to static 169.254.65.77
+  [touchpad] empty read: 00 00 04 01 0e 0d a3 01 00 00 00 00 00 00
+[SCHED] WARNING: yield_now with IRQs masked tid=3 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=5 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=6 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=7 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=10 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=11 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+[herd] Userspace supervisor starting (rev 8e1e99190a-dirty)...
+[HEAP] 13MB used (alloc=16384 bytes)
+  [touchpad] empty read: 00 00 04 01 0e 0d a3 01 00 00 00 00 00 00
+[herd] Starting service: console
+[boot] shell after 31748 ms (starting +0, network +30365, starting services +30458)
+[splash] ended after 31748 ms: 509 frames, draw avg 651 us max 1025 us
+[fbcon] burst: 6386 bytes, 0 ms drawing
+[threads] new high-water: 15 live user threads (terminated=0 free=497 ceiling=512)
+[herd] Started console (pid=2)
+[herd] Starting service: gentoo (boxed)
+[HEAP-R] 15MB used (realloc 128->256)
+[HEAP] 18MB used (alloc=727552 bytes)
+[38;5;103mroot[0m:[1;38;5;111m/[0m [38;5;117m#[0m [6n[herd] Started gentoo (pid=9)
+[herd] Starting service: klog
+[herd] Started klog (pid=10)
+[herd] Starting service: powersave
+[herd] Started powersave (pid=11)
+[herd] Starting service: sshd
+[herd] Started sshd (pid=12)
+[herd] Starting service: wifiauto
+[herd] Started wifiauto (pid=13)
+[herd] Reloading config...
+[threads] new high-water: 20 live user threads (terminated=0 free=492 ceiling=512)
+[syscall] no row for x86_64 nr=439 — returning ENOSYS (add it to akuma-syscalls-abi's table)
+[threads] new high-water: 21 live user threads (terminated=0 free=491 ceiling=512)
+[HEAP-R] 20MB used (realloc 4080->8160)
+[threads] new high-water: 22 live user threads (terminated=0 free=490 ceiling=512)
+[syscall] no row for x86_64 nr=430 — returning ENOSYS (add it to akuma-syscalls-abi's table)
+[threads] new high-water: 23 live user threads (terminated=0 free=489 ceiling=512)
+[threads] new high-water: 24 live user threads (terminated=0 free=488 ceiling=512)
+[HEAP] 23MB used (alloc=727552 bytes)
+[threads] new high-water: 25 live user threads (terminated=0 free=487 ceiling=512)
+[bkls>] core=3 ticket=137416 serving=137415 owner=1 spins=1048576
+[rtw] chan (switch): 1543 ops, 901 writes, 0 h2c, checks 579 (26 differ), polls 45 (0 timed out), 26841 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004400002b got 0x000000006b00002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x000000000002028a got 0x000000000001fe4f
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002c37e got 0x000000000002bdac
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40980 got 0x0000000002e4096c
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66c got 0x00000000008cd66d
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000050000 got 0x0000000000010000
+[rtw]   op 186 reg 0x00000000000142ac want 0x0000000022ce8066 got 0x0000000022ce803c
+[rtw]   op 188 reg 0x00000000000142c4 want 0x0000000000a80280 got 0x0000000000280280
+[bkls>] core=3 ticket=137416 serving=137415 owner=1 spins=2097152
+[HEAP-R] 25MB used (realloc 32->64)
+[HEAP] 28MB used (alloc=727552 bytes)
+[syscall] no row for x86_64 nr=436 — returning ENOSYS (add it to akuma-syscalls-abi's table)
+[threads] new high-water: 26 live user threads (terminated=0 free=486 ceiling=512)
+[herd] reaped 2 orphaned process(es)
+  dns: 1.1.1.1: no reply before timeout
+[HEAP-R] 30MB used (realloc 1320->2640)
+[HEAP] 33MB used (alloc=727552 bytes)
+[herd] reaped 1 orphaned process(es)
+[bkls>] core=1 ticket=243204 serving=243203 owner=5 spins=1048576
+[bkls>] core=1 ticket=243204 serving=243203 owner=5 spins=2097152
+[bkls>] core=1 ticket=243204 serving=243203 owner=5 spins=4194304
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (19 differ), polls 37 (1 timed out), 111093 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004d00002b got 0x00000000d000002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000207d4 got 0x0000000000020399
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cac3 got 0x000000000002c4f2
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40999 got 0x0000000002e40985
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66b got 0x00000000008cd66c
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000a0000 got 0x0000000000060000
+[rtw]   op 186 reg 0x00000000000142c4 want 0x0000000000280280 got 0x0000000000a80280
+[rtw]   op 188 reg 0x0000000000014c14 want 0x0000000000000909 got 0x0000000000001929
+[bkls>] core=8 ticket=260671 serving=260670 owner=7 spins=1048576
+[rtw] chan (switch): 1514 ops, 886 writes, 0 h2c, checks 565 (35 differ), polls 45 (0 timed out), 26868 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000a200002b got 0x000000001600002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x000000000001fe4f got 0x00000000000208e3
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002bdac got 0x000000000002cc38
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e4096c got 0x0000000002e4099e
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66d got 0x00000000008cd66a
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000010000 got 0x00000000000b0000
+[rtw]   op 188 reg 0x0000000000014c14 want 0x0000000000000151 got 0x0000000000000909
+[rtw]   op 192 reg 0x0000000000014cd8 want 0x0000000000000151 got 0x0000000000000909
+  dns: 8.8.8.8: no reply before timeout
+  clock: retry: could not resolve pool.ntp.org via 1.1.1.1
+  mem:  heap 34220/1048576 KiB (peak 35171), pmm 12517 MiB free
+[bkls>] core=3 ticket=287223 serving=287222 owner=2 spins=1048576
+[bkls>] core=3 ticket=287223 serving=287222 owner=2 spins=2097152
+[bkls>] core=3 ticket=287223 serving=287222 owner=2 spins=4194304
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (2 differ), polls 37 (1 timed out), 111198 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004b00002b got 0x000000007000002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x000000004b00002b got 0x000000007000002b
+[rtw]   op 1424 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=6 ticket=296636 serving=296635 owner=5 spins=1048576
+[rtw] chan (switch): 1514 ops, 886 writes, 0 h2c, checks 565 (10 differ), polls 45 (0 timed out), 26751 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000bc00002b got 0x00000000c100002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x00000000bc00002b got 0x00000000c100002b
+[rtw]   op 1466 reg 0x0000000000011aec want 0x0000000000011f67 got 0x0000000000020c8b
+[rtw]   op 1467 reg 0x0000000000011acc want 0x0000000000000000 got 0x0000000000740000
+[rtw]   op 1468 reg 0x0000000000011ad0 want 0x0000000002903299 got 0x0000000001f22e54
+[rtw]   op 1469 reg 0x0000000000011ad4 want 0x000000000cb9172f got 0x0000000003f613b7
+[rtw]   op 1472 reg 0x0000000000011ae0 want 0x0000000000400010 got 0x00000000003d0010
+[rtw]   op 1473 reg 0x0000000000011ae4 want 0x0000000010f9282a got 0x00000000123f2a81
+[bkls>] core=2 ticket=306008 serving=306007 owner=1 spins=1048576
+[bkls>] core=2 ticket=306008 serving=306007 owner=1 spins=2097152
+[bkls>] core=2 ticket=306008 serving=306007 owner=1 spins=4194304
+[rtw] chan (switch): 1439 ops, 865 writes, 0 h2c, checks 525 (3 differ), polls 37 (1 timed out), 111388 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000b300002b got 0x00000000df00002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x00000000b300002b got 0x00000000df00002b
+[rtw]   op 897 reg 0x00000000000142ac want 0x0000000022ce803c got 0x0000000022ce8026
+[rtw]   op 1438 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=1 ticket=315326 serving=315325 owner=2 spins=1048576
+[bkls>] core=1 ticket=315326 serving=315325 owner=2 spins=2097152
+[bkls>] core=1 ticket=315326 serving=315325 owner=2 spins=4194304
+[rtw] chan (switch): 1453 ops, 872 writes, 0 h2c, checks 532 (27 differ), polls 37 (1 timed out), 91484 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000e100002b got 0x000000002000002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x0000000000020399 got 0x000000000002028a
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002c4f2 got 0x000000000002c37e
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40985 got 0x0000000002e40980
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000060000 got 0x0000000000050000
+[rtw]   op 186 reg 0x00000000000142ac want 0x0000000022ce8026 got 0x0000000022ce8066
+[rtw]   op 190 reg 0x0000000000014c14 want 0x0000000000001929 got 0x0000000000001939
+[rtw]   op 200 reg 0x0000000000014cd8 want 0x0000000000001929 got 0x0000000000001939
+[bkls>] core=7 ticket=324461 serving=324460 owner=4 spins=1048576
+[rtw] chan (switch): 1540 ops, 901 writes, 0 h2c, checks 579 (10 differ), polls 45 (0 timed out), 25618 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000007100002b got 0x000000007000002b
+[rtw]   op 731 reg 0x000000000000ce40 want 0x000000007100002b got 0x000000007000002b
+[rtw]   op 1492 reg 0x0000000000011aec want 0x0000000000012581 got 0x0000000000020c8e
+[rtw]   op 1493 reg 0x0000000000011acc want 0x0000000000000000 got 0x0000000005480000
+[rtw]   op 1494 reg 0x0000000000011ad0 want 0x000000000d862f96 got 0x00000000030616ce
+[rtw]   op 1495 reg 0x0000000000011ad4 want 0x000000000f662656 got 0x0000000005850b2d
+[rtw]   op 1498 reg 0x0000000000011ae0 want 0x00000000003d000f got 0x00000000003d0010
+[rtw]   op 1499 reg 0x0000000000011ae4 want 0x000000000e9c58c5 got 0x0000000008e81264
+[bkls>] core=2 ticket=333865 serving=333864 owner=1 spins=1048576
+[bkls>] core=2 ticket=333865 serving=333864 owner=1 spins=2097152
+[bkls>] core=2 ticket=333865 serving=333864 owner=1 spins=4194304
+[rtw] chan (switch): 1439 ops, 865 writes, 0 h2c, checks 525 (2 differ), polls 37 (1 timed out), 111461 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000a900002b got 0x000000000e00002b
+[rtw]   op 731 reg 0x000000000000ce40 want 0x00000000a900002b got 0x000000000e00002b
+[rtw]   op 1438 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=8 ticket=342807 serving=342806 owner=1 spins=1048576
+[rtw] chan (switch): 1512 ops, 886 writes, 0 h2c, checks 565 (10 differ), polls 45 (0 timed out), 26419 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000ed00002b got 0x000000005b00002b
+[rtw]   op 718 reg 0x000000000000ce40 want 0x00000000ed00002b got 0x000000005b00002b
+[rtw]   op 1464 reg 0x0000000000011aec want 0x000000000001135f got 0x00000000000209b2
+[rtw]   op 1465 reg 0x0000000000011acc want 0x0000000000000000 got 0x0000000001210000
+[rtw]   op 1466 reg 0x0000000000011ad0 want 0x00000000014d18ad got 0x00000000040108fe
+[rtw]   op 1467 reg 0x0000000000011ad4 want 0x0000000007620fcc got 0x00000000042608b0
+[rtw]   op 1470 reg 0x0000000000011ae0 want 0x0000000000430010 got 0x0000000000370010
+[rtw]   op 1471 reg 0x0000000000011ae4 want 0x0000000006f31759 got 0x0000000005600d5c
+[bkls>] core=8 ticket=342807 serving=342806 owner=1 spins=2097152
+[bkls>] core=2 ticket=352317 serving=352316 owner=8 spins=1048576
+[rtw] chan (switch): 1512 ops, 886 writes, 0 h2c, checks 565 (20 differ), polls 45 (0 timed out), 26305 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000da00002b got 0x00000000b900002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000208e3 got 0x00000000000207d4
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cc38 got 0x000000000002cac3
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e4099e got 0x0000000002e40999
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66a got 0x00000000008cd66b
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000b0000 got 0x00000000000a0000
+[rtw]   op 397 reg 0x0000000000010378 want 0x0000000000000118 got 0x0000000000000142
+[rtw]   op 400 reg 0x0000000000010370 want 0x000000009ee00000 got 0x0000000094280000
+[bkls>] core=7 ticket=361207 serving=361206 owner=4 spins=1048576
+[bkls>] core=7 ticket=361207 serving=361206 owner=4 spins=2097152
+[bkls>] core=7 ticket=361207 serving=361206 owner=4 spins=4194304
+[rtw] chan (switch): 1440 ops, 865 writes, 0 h2c, checks 525 (2 differ), polls 37 (1 timed out), 111612 us
+[rtw]   op 7 reg 0x000000000000ce40 want 0x000000005600002b got 0x00000000f100002b
+[rtw]   op 718 reg 0x000000000000ce40 want 0x000000005600002b got 0x00000000f100002b
+[rtw]   op 1439 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[rtw] scan: 242 beacons, 24 networks
+[rtw]   bss 92:d8:e5:xx:xx:xx ch 1 ssid#058add01 wpa2-psk
+[rtw]   bss 4a:3f:da:xx:xx:xx ch 1 ssid#a4a63da6 open
+[rtw]   bss 12:67:62:xx:xx:xx ch 1 ssid#8ba7c8e1 wpa2-psk
+[rtw]   bss 72:d5:ed:xx:xx:xx ch 1 ssid#329ba75b wpa2-psk
+[rtw]   bss 1c:57:3e:xx:xx:xx ch 1 ssid#b0b6418f open
+[rtw]   bss bc:d5:ed:xx:xx:xx ch 1 ssid#329ba75b wpa2-psk
+[rtw]   bss b8:fb:b3:xx:xx:xx ch 1 ssid#6e452639 other
+[rtw]   bss d8:78:7f:xx:xx:xx ch 1 ssid#df93ad0e wpa2-psk
+[rtw]   bss 50:2c:c6:xx:xx:xx ch 1 ssid#db2c4d7d wpa2-psk
+[rtw]   bss d8:78:7f:xx:xx:xx ch 1 ssid#a927ecd6 wpa2-psk
+[rtw]   bss da:d8:e5:xx:xx:xx ch 1 ssid#68266439 wpa2-psk
+[rtw]   bss 20:97:27:xx:xx:xx ch 2 ssid#ef0d903e wpa2-psk
+[rtw]   bss 36:5f:45:xx:xx:xx ch 1 ssid#c0ffb78f open
+[rtw]   bss 94:3c:96:xx:xx:xx ch 1 ssid#305a7ee6 wpa2-psk
+[rtw]   bss d8:78:7f:xx:xx:xx ch 1 ssid#b0b6418f open
+[rtw]   bss 00:f8:cc:xx:xx:xx ch 6 ssid#5252c105 wpa2-psk
+[rtw]   bss 00:f8:cc:xx:xx:xx ch 6 ssid#7d2028cf wpa2-psk
+[rtw]   bss 10:2b:aa:xx:xx:xx ch 6 ssid#137fe768 wpa2-psk
+[rtw]   bss 9c:e5:49:xx:xx:xx ch 6 ssid#c9577d26 wpa2-psk
+[rtw]   bss 00:27:15:xx:xx:xx ch 6 ssid#2a072229 wpa2-psk
+[rtw]   bss 00:b8:c2:xx:xx:xx ch 6 ssid#919d7c55 wpa2-psk
+[rtw]   bss 04:95:e6:xx:xx:xx ch 8 ssid#7617faf3 wpa2-psk
+[rtw]   bss fa:8f:ca:xx:xx:xx ch 6 ssid#725a9555 open
+[rtw]   bss b0:22:7a:xx:xx:xx ch 6 ssid#10e64dcc wpa2-psk
+[bkls>] core=1 ticket=446793 serving=446792 owner=2 spins=1048576
+[rtw] chan (switch): 1526 ops, 893 writes, 0 h2c, checks 572 (11 differ), polls 45 (0 timed out), 26382 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000006600002b got 0x000000000500002b
+[rtw]   op 732 reg 0x000000000000ce40 want 0x000000006600002b got 0x000000000500002b
+[rtw]   op 1478 reg 0x0000000000011aec want 0x00000000000164e3 got 0x00000000000138c8
+[rtw]   op 1479 reg 0x0000000000011acc want 0x0000000000000000 got 0x00000000024c0000
+[rtw]   op 1480 reg 0x0000000000011ad0 want 0x0000000005382486 got 0x00000000051a0adc
+[rtw]   op 1481 reg 0x0000000000011ad4 want 0x000000002d7a24ea got 0x000000001aac0fe5
+[rtw]   op 1484 reg 0x0000000000011ae0 want 0x00000000003b000f got 0x00000000003e0011
+[rtw]   op 1485 reg 0x0000000000011ae4 want 0x0000000009046b5e got 0x00000000068d287a
+[bkls>] core=6 ticket=465076 serving=465075 owner=2 spins=1048576
+[rtw] chan (switch): 1543 ops, 901 writes, 0 h2c, checks 579 (23 differ), polls 45 (0 timed out), 26859 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004400002b got 0x000000007300002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x000000000002028a got 0x000000000001fe4f
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002c37e got 0x000000000002bdac
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40980 got 0x0000000002e4096c
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66c got 0x00000000008cd66d
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000050000 got 0x0000000000010000
+[rtw]   op 188 reg 0x00000000000142c4 want 0x0000000000a80280 got 0x0000000000280280
+[rtw]   op 190 reg 0x0000000000014c14 want 0x0000000000001939 got 0x0000000000000939
+[bkls>] core=6 ticket=465076 serving=465075 owner=2 spins=2097152
+  mem:  heap 34478/1048576 KiB (peak 35171), pmm 12517 MiB free
+[bkls>] core=4 ticket=483628 serving=483627 owner=3 spins=1048576
+[bkls>] core=4 ticket=483628 serving=483627 owner=3 spins=2097152
+[bkls>] core=4 ticket=483628 serving=483627 owner=3 spins=4194304
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (19 differ), polls 37 (1 timed out), 111475 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004d00002b got 0x000000000a00002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000207d4 got 0x0000000000020399
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cac3 got 0x000000000002c4f2
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40999 got 0x0000000002e40985
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66b got 0x00000000008cd66c
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000a0000 got 0x0000000000060000
+[rtw]   op 186 reg 0x00000000000142c4 want 0x0000000000280280 got 0x0000000000a80280
+[rtw]   op 188 reg 0x0000000000014c14 want 0x0000000000000909 got 0x0000000000001929
+[bkls>] core=1 ticket=502022 serving=502021 owner=2 spins=1048576
+[rtw] chan (switch): 1514 ops, 886 writes, 0 h2c, checks 565 (35 differ), polls 45 (0 timed out), 26861 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000a200002b got 0x000000005f00002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x000000000001fe4f got 0x00000000000208e3
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002bdac got 0x000000000002cc38
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e4096c got 0x0000000002e4099e
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66d got 0x00000000008cd66a
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000010000 got 0x00000000000b0000
+[rtw]   op 188 reg 0x0000000000014c14 want 0x0000000000000151 got 0x0000000000000909
+[rtw]   op 192 reg 0x0000000000014cd8 want 0x0000000000000151 got 0x0000000000000909
+[bkls>] core=1 ticket=520768 serving=520767 owner=8 spins=1048576
+[bkls>] core=1 ticket=520768 serving=520767 owner=8 spins=2097152
+[bkls>] core=1 ticket=520768 serving=520767 owner=8 spins=4194304
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (2 differ), polls 37 (1 timed out), 111597 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004b00002b got 0x00000000bc00002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x000000004b00002b got 0x00000000bc00002b
+[rtw]   op 1424 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=2 ticket=529927 serving=529926 owner=1 spins=1048576
+[rtw] chan (switch): 1514 ops, 886 writes, 0 h2c, checks 565 (10 differ), polls 45 (0 timed out), 26744 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000bc00002b got 0x000000000800002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x00000000bc00002b got 0x000000000800002b
+[rtw]   op 1466 reg 0x0000000000011aec want 0x0000000000011f67 got 0x0000000000021261
+[rtw]   op 1467 reg 0x0000000000011acc want 0x0000000000000000 got 0x0000000001080000
+[rtw]   op 1468 reg 0x0000000000011ad0 want 0x0000000002903299 got 0x00000000025f1b51
+[rtw]   op 1469 reg 0x0000000000011ad4 want 0x000000000cb9172f got 0x0000000007ab0c9b
+[rtw]   op 1472 reg 0x0000000000011ae0 want 0x0000000000400010 got 0x00000000003b0011
+[rtw]   op 1473 reg 0x0000000000011ae4 want 0x0000000010f9282a got 0x000000000bc8168d
+[bkls>] core=2 ticket=539256 serving=539255 owner=1 spins=1048576
+[bkls>] core=2 ticket=539256 serving=539255 owner=1 spins=2097152
+[bkls>] core=2 ticket=539256 serving=539255 owner=1 spins=4194304
+[rtw] chan (switch): 1439 ops, 865 writes, 0 h2c, checks 525 (3 differ), polls 37 (1 timed out), 111558 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000b300002b got 0x000000002d00002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x00000000b300002b got 0x000000002d00002b
+[rtw]   op 897 reg 0x00000000000142ac want 0x0000000022ce803c got 0x0000000022ce8026
+[rtw]   op 1438 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=4 ticket=548533 serving=548532 owner=3 spins=1048576
+[bkls>] core=4 ticket=548533 serving=548532 owner=3 spins=2097152
+[bkls>] core=4 ticket=548533 serving=548532 owner=3 spins=4194304
+[rtw] chan (switch): 1453 ops, 872 writes, 0 h2c, checks 532 (27 differ), polls 37 (1 timed out), 91800 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000e100002b got 0x000000006900002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x0000000000020399 got 0x000000000002028a
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002c4f2 got 0x000000000002c37e
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40985 got 0x0000000002e40980
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000060000 got 0x0000000000050000
+[rtw]   op 186 reg 0x00000000000142ac want 0x0000000022ce8026 got 0x0000000022ce8066
+[rtw]   op 190 reg 0x0000000000014c14 want 0x0000000000001929 got 0x0000000000001939
+[rtw]   op 200 reg 0x0000000000014cd8 want 0x0000000000001929 got 0x0000000000001939
+[bkls>] core=1 ticket=557912 serving=557911 owner=2 spins=1048576
+[rtw] chan (switch): 1540 ops, 901 writes, 0 h2c, checks 579 (10 differ), polls 45 (0 timed out), 25607 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000007100002b got 0x000000009a00002b
+[rtw]   op 731 reg 0x000000000000ce40 want 0x000000007100002b got 0x000000009a00002b
+[rtw]   op 1492 reg 0x0000000000011aec want 0x0000000000012581 got 0x0000000000020f79
+[rtw]   op 1493 reg 0x0000000000011acc want 0x0000000000000000 got 0x00000000020e0000
+[rtw]   op 1494 reg 0x0000000000011ad0 want 0x000000000d862f96 got 0x0000000009c81880
+[rtw]   op 1495 reg 0x0000000000011ad4 want 0x000000000f662656 got 0x0000000005a90f2f
+[rtw]   op 1498 reg 0x0000000000011ae0 want 0x00000000003d000f got 0x00000000003a0010
+[rtw]   op 1499 reg 0x0000000000011ae4 want 0x000000000e9c58c5 got 0x0000000008b820a8
+[bkls>] core=2 ticket=567126 serving=567125 owner=1 spins=1048576
+[bkls>] core=2 ticket=567126 serving=567125 owner=1 spins=2097152
+[bkls>] core=2 ticket=567126 serving=567125 owner=1 spins=4194304
+[rtw] chan (switch): 1439 ops, 865 writes, 0 h2c, checks 525 (2 differ), polls 37 (1 timed out), 111443 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000a900002b got 0x000000009500002b
+[rtw]   op 731 reg 0x000000000000ce40 want 0x00000000a900002b got 0x000000009500002b
+[rtw]   op 1438 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=2 ticket=576392 serving=576391 owner=1 spins=1048576
+[rtw] chan (switch): 1512 ops, 886 writes, 0 h2c, checks 565 (10 differ), polls 45 (0 timed out), 26425 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000ed00002b got 0x00000000eb00002b
+[rtw]   op 718 reg 0x000000000000ce40 want 0x00000000ed00002b got 0x00000000eb00002b
+[rtw]   op 1464 reg 0x0000000000011aec want 0x000000000001135f got 0x0000000000020d28
+[rtw]   op 1465 reg 0x0000000000011acc want 0x0000000000000000 got 0x0000000002a50000
+[rtw]   op 1466 reg 0x0000000000011ad0 want 0x00000000014d18ad got 0x0000000011330965
+[rtw]   op 1467 reg 0x0000000000011ad4 want 0x0000000007620fcc got 0x0000000006330616
+[rtw]   op 1470 reg 0x0000000000011ae0 want 0x0000000000430010 got 0x000000000035000f
+[rtw]   op 1471 reg 0x0000000000011ae4 want 0x0000000006f31759 got 0x000000000b7514ee
+[bkls>] core=1 ticket=585642 serving=585641 owner=2 spins=1048576
+[rtw] chan (switch): 1512 ops, 886 writes, 0 h2c, checks 565 (19 differ), polls 45 (0 timed out), 26303 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000da00002b got 0x000000004800002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000208e3 got 0x00000000000207d4
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cc38 got 0x000000000002cac3
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e4099e got 0x0000000002e40999
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66a got 0x00000000008cd66b
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000b0000 got 0x00000000000a0000
+[rtw]   op 397 reg 0x0000000000010378 want 0x0000000000000118 got 0x0000000000000142
+[rtw]   op 400 reg 0x0000000000010370 want 0x000000009ee00000 got 0x0000000094280000
+[bkls>] core=5 ticket=585643 serving=585642 owner=1 spins=2097152
+[bkls>] core=2 ticket=595025 serving=595024 owner=1 spins=1048576
+[bkls>] core=2 ticket=595025 serving=595024 owner=1 spins=2097152
+[bkls>] core=2 ticket=595025 serving=595024 owner=1 spins=4194304
+[rtw] chan (switch): 1440 ops, 865 writes, 0 h2c, checks 525 (2 differ), polls 37 (1 timed out), 111508 us
+[rtw]   op 7 reg 0x000000000000ce40 want 0x000000005600002b got 0x000000007700002b
+[rtw]   op 718 reg 0x000000000000ce40 want 0x000000005600002b got 0x000000007700002b
+[rtw]   op 1439 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[rtw] scan: 226 beacons, 24 networks
+[rtw]   bss 72:d5:ed:xx:xx:xx ch 1 ssid#329ba75b wpa2-psk
+[rtw]   bss d8:78:7f:xx:xx:xx ch 1 ssid#a927ecd6 wpa2-psk
+[rtw]   bss bc:d5:ed:xx:xx:xx ch 1 ssid#329ba75b wpa2-psk
+[rtw]   bss b8:fb:b3:xx:xx:xx ch 1 ssid#6e452639 other
+[rtw]   bss 00:b8:c2:xx:xx:xx ch 3 ssid#0ed2c5e4 wpa2-psk
+[rtw]   bss 1c:57:3e:xx:xx:xx ch 1 ssid#b0b6418f open
+[rtw]   bss 92:d8:e5:xx:xx:xx ch 1 ssid#058add01 wpa2-psk
+[rtw]   bss 20:97:27:xx:xx:xx ch 2 ssid#ef0d903e wpa2-psk
+[rtw]   bss d8:78:7f:xx:xx:xx ch 1 ssid#df93ad0e wpa2-psk
+[rtw]   bss 12:67:62:xx:xx:xx ch 1 ssid#8ba7c8e1 wpa2-psk
+[rtw]   bss cc:19:a8:xx:xx:xx ch 1 ssid#72cc11ed wpa2-psk
+[rtw]   bss 00:f8:cc:xx:xx:xx ch 6 ssid#5252c105 wpa2-psk
+[rtw]   bss 00:b8:c2:xx:xx:xx ch 6 ssid#919d7c55 wpa2-psk
+[rtw]   bss 62:d8:a4:xx:xx:xx ch 6 ssid#d4bcc16e wpa2-psk
+[rtw]   bss 34:20:03:xx:xx:xx ch 6 ssid#9126bc52 wpa2-psk
+[rtw]   bss 04:95:e6:xx:xx:xx ch 8 ssid#7617faf3 wpa2-psk
+[rtw]   bss fa:8f:ca:xx:xx:xx ch 6 ssid#725a9555 open
+[rtw]   bss 10:2b:aa:xx:xx:xx ch 6 ssid#137fe768 wpa2-psk
+[rtw]   bss 9c:e5:49:xx:xx:xx ch 6 ssid#c9577d26 wpa2-psk
+[rtw]   bss d0:cf:0e:xx:xx:xx ch 6 ssid#98173826 wpa2-psk
+[rtw]   bss c4:eb:42:xx:xx:xx ch 11 ssid#ee47acd1 wpa2-psk
+[rtw]   bss a2:b5:3c:xx:xx:xx ch 11 ssid#6f339e6e wpa2-psk
+[rtw]   bss 02:1d:aa:xx:xx:xx ch 11 ssid#c222f3a5 other
+[rtw]   bss da:d8:e5:xx:xx:xx ch 11 ssid#0806e212 wpa2-psk
+[kbd] polls=1500 st=0x1c or=0x1c scancodes=0
+  dns: 1.1.1.1: no reply before timeout
+  dns: 8.8.8.8: no reply before timeout
+  clock: retry: could not resolve pool.ntp.org via 1.1.1.1
+[herd] Reloading config...
+[bkls>] core=2 ticket=679491 serving=679490 owner=6 spins=1048576
+[rtw] chan (switch): 1526 ops, 893 writes, 0 h2c, checks 572 (11 differ), polls 45 (0 timed out), 26398 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000006600002b got 0x00000000aa00002b
+[rtw]   op 732 reg 0x000000000000ce40 want 0x000000006600002b got 0x00000000aa00002b
+[rtw]   op 1478 reg 0x0000000000011aec want 0x00000000000164e3 got 0x000000000001372d
+[rtw]   op 1479 reg 0x0000000000011acc want 0x0000000000000000 got 0x0000000000ef0000
+[rtw]   op 1480 reg 0x0000000000011ad0 want 0x0000000005382486 got 0x0000000005820faa
+[rtw]   op 1481 reg 0x0000000000011ad4 want 0x000000002d7a24ea got 0x0000000019250fe0
+[rtw]   op 1484 reg 0x0000000000011ae0 want 0x00000000003b000f got 0x00000000003b0011
+[rtw]   op 1485 reg 0x0000000000011ae4 want 0x0000000009046b5e got 0x00000000082627da
+[bkls>] core=5 ticket=679493 serving=679492 owner=1 spins=2097152
+  mem:  heap 34736/1048576 KiB (peak 35171), pmm 12517 MiB free
+[bkls>] core=2 ticket=698322 serving=698321 owner=1 spins=1048576
+[rtw] chan (switch): 1543 ops, 901 writes, 0 h2c, checks 579 (23 differ), polls 45 (0 timed out), 26898 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004400002b got 0x000000001b00002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x000000000002028a got 0x000000000001fe4f
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002c37e got 0x000000000002bdac
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40980 got 0x0000000002e4096c
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66c got 0x00000000008cd66d
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000050000 got 0x0000000000010000
+[rtw]   op 188 reg 0x00000000000142c4 want 0x0000000000a80280 got 0x0000000000280280
+[rtw]   op 190 reg 0x0000000000014c14 want 0x0000000000001939 got 0x0000000000000939
+[bkls>] core=7 ticket=716996 serving=716995 owner=4 spins=1048576
+[bkls>] core=7 ticket=716996 serving=716995 owner=4 spins=2097152
+[bkls>] core=7 ticket=716996 serving=716995 owner=4 spins=4194304
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (19 differ), polls 37 (1 timed out), 111064 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004d00002b got 0x000000008a00002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000207d4 got 0x0000000000020399
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cac3 got 0x000000000002c4f2
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40999 got 0x0000000002e40985
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66b got 0x00000000008cd66c
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000a0000 got 0x0000000000060000
+[rtw]   op 186 reg 0x00000000000142c4 want 0x0000000000280280 got 0x0000000000a80280
+[rtw]   op 188 reg 0x0000000000014c14 want 0x0000000000000909 got 0x0000000000001929
+[bkls>] core=3 ticket=735528 serving=735527 owner=2 spins=1048576
+[rtw] chan (switch): 1514 ops, 886 writes, 0 h2c, checks 565 (35 differ), polls 45 (0 timed out), 26862 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000a200002b got 0x000000007a00002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x000000000001fe4f got 0x00000000000208e3
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002bdac got 0x000000000002cc38
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e4096c got 0x0000000002e4099e
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66d got 0x00000000008cd66a
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000010000 got 0x00000000000b0000
+[rtw]   op 188 reg 0x0000000000014c14 want 0x0000000000000151 got 0x0000000000000909
+[rtw]   op 192 reg 0x0000000000014cd8 want 0x0000000000000151 got 0x0000000000000909
+[bkls>] core=2 ticket=753771 serving=753770 owner=1 spins=1048576
+[bkls>] core=2 ticket=753771 serving=753770 owner=1 spins=2097152
+[bkls>] core=2 ticket=753771 serving=753770 owner=1 spins=4194304
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (2 differ), polls 37 (1 timed out), 110866 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004b00002b got 0x00000000d500002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x000000004b00002b got 0x00000000d500002b
+[rtw]   op 1424 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=2 ticket=762908 serving=762907 owner=1 spins=1048576
+[rtw] chan (switch): 1514 ops, 886 writes, 0 h2c, checks 565 (10 differ), polls 45 (0 timed out), 26804 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000bc00002b got 0x000000002700002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x00000000bc00002b got 0x000000002700002b
+[rtw]   op 1466 reg 0x0000000000011aec want 0x0000000000011f67 got 0x0000000000021500
+[rtw]   op 1467 reg 0x0000000000011acc want 0x0000000000000000 got 0x00000000007c0000
+[rtw]   op 1468 reg 0x0000000000011ad0 want 0x0000000002903299 got 0x0000000001d321cb
+[rtw]   op 1469 reg 0x0000000000011ad4 want 0x000000000cb9172f got 0x0000000008cb0c80
+[rtw]   op 1472 reg 0x0000000000011ae0 want 0x0000000000400010 got 0x0000000000360010
+[rtw]   op 1473 reg 0x0000000000011ae4 want 0x0000000010f9282a got 0x000000000a981e85
+[bkls>] core=2 ticket=772305 serving=772304 owner=7 spins=1048576
+[bkls>] core=2 ticket=772305 serving=772304 owner=7 spins=2097152
+[bkls>] core=2 ticket=772305 serving=772304 owner=7 spins=4194304
+[rtw] chan (switch): 1439 ops, 865 writes, 0 h2c, checks 525 (3 differ), polls 37 (1 timed out), 110968 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000b300002b got 0x000000005000002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x00000000b300002b got 0x000000005000002b
+[rtw]   op 897 reg 0x00000000000142ac want 0x0000000022ce803c got 0x0000000022ce8026
+[rtw]   op 1438 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=8 ticket=781387 serving=781386 owner=4 spins=1048576
+[bkls>] core=8 ticket=781387 serving=781386 owner=4 spins=2097152
+[bkls>] core=8 ticket=781387 serving=781386 owner=4 spins=4194304
+[rtw] chan (switch): 1453 ops, 872 writes, 0 h2c, checks 532 (27 differ), polls 37 (1 timed out), 91037 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000e100002b got 0x000000009100002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x0000000000020399 got 0x000000000002028a
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002c4f2 got 0x000000000002c37e
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40985 got 0x0000000002e40980
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000060000 got 0x0000000000050000
+[rtw]   op 186 reg 0x00000000000142ac want 0x0000000022ce8026 got 0x0000000022ce8066
+[rtw]   op 190 reg 0x0000000000014c14 want 0x0000000000001929 got 0x0000000000001939
+[rtw]   op 200 reg 0x0000000000014cd8 want 0x0000000000001929 got 0x0000000000001939
+[bkls>] core=3 ticket=790416 serving=790415 owner=1 spins=1048576
+[rtw] chan (switch): 1540 ops, 901 writes, 0 h2c, checks 579 (10 differ), polls 45 (0 timed out), 25670 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000007100002b got 0x00000000d200002b
+[rtw]   op 731 reg 0x000000000000ce40 want 0x000000007100002b got 0x00000000d200002b
+[rtw]   op 1492 reg 0x0000000000011aec want 0x0000000000012581 got 0x0000000000020f04
+[rtw]   op 1493 reg 0x0000000000011acc want 0x0000000000000000 got 0x00000000014e0000
+[rtw]   op 1494 reg 0x0000000000011ad0 want 0x000000000d862f96 got 0x0000000004b81b91
+[rtw]   op 1495 reg 0x0000000000011ad4 want 0x000000000f662656 got 0x0000000006650bea
+[rtw]   op 1498 reg 0x0000000000011ae0 want 0x00000000003d000f got 0x000000000038000f
+[rtw]   op 1499 reg 0x0000000000011ae4 want 0x000000000e9c58c5 got 0x000000000b3218c1
+[bkls>] core=7 ticket=790419 serving=790418 owner=2 spins=2097152
+[bkls>] core=4 ticket=799482 serving=799481 owner=1 spins=1048576
+[bkls>] core=4 ticket=799482 serving=799481 owner=1 spins=2097152
+[bkls>] core=4 ticket=799482 serving=799481 owner=1 spins=4194304
+[rtw] chan (switch): 1439 ops, 865 writes, 0 h2c, checks 525 (2 differ), polls 37 (1 timed out), 110742 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000a900002b got 0x000000006000002b
+[rtw]   op 731 reg 0x000000000000ce40 want 0x00000000a900002b got 0x000000006000002b
+[rtw]   op 1438 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=3 ticket=808849 serving=808848 owner=4 spins=1048576
+[rtw] chan (switch): 1512 ops, 886 writes, 0 h2c, checks 565 (10 differ), polls 45 (0 timed out), 26426 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000ed00002b got 0x000000009d00002b
+[rtw]   op 718 reg 0x000000000000ce40 want 0x00000000ed00002b got 0x000000009d00002b
+[rtw]   op 1464 reg 0x0000000000011aec want 0x000000000001135f got 0x0000000000020de0
+[rtw]   op 1465 reg 0x0000000000011acc want 0x0000000000000000 got 0x0000000001d10000
+[rtw]   op 1466 reg 0x0000000000011ad0 want 0x00000000014d18ad got 0x00000000038106e0
+[rtw]   op 1467 reg 0x0000000000011ad4 want 0x0000000007620fcc got 0x000000000617072a
+[rtw]   op 1470 reg 0x0000000000011ae0 want 0x0000000000430010 got 0x0000000000370011
+[rtw]   op 1471 reg 0x0000000000011ae4 want 0x0000000006f31759 got 0x0000000003dd0c9c
+[bkls>] core=4 ticket=817883 serving=817882 owner=1 spins=1048576
+[rtw] chan (switch): 1512 ops, 886 writes, 0 h2c, checks 565 (19 differ), polls 45 (0 timed out), 26314 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000da00002b got 0x00000000d300002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000208e3 got 0x00000000000207d4
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cc38 got 0x000000000002cac3
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e4099e got 0x0000000002e40999
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66a got 0x00000000008cd66b
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000b0000 got 0x00000000000a0000
+[rtw]   op 397 reg 0x0000000000010378 want 0x0000000000000118 got 0x0000000000000142
+[rtw]   op 400 reg 0x0000000000010370 want 0x000000009ee00000 got 0x0000000094280000
+[bkls>] core=6 ticket=817884 serving=817883 owner=4 spins=2097152
+[bkls>] core=2 ticket=827217 serving=827216 owner=4 spins=1048576
+[bkls>] core=2 ticket=827217 serving=827216 owner=4 spins=2097152
+[bkls>] core=2 ticket=827217 serving=827216 owner=4 spins=4194304
+[rtw] chan (switch): 1440 ops, 865 writes, 0 h2c, checks 525 (2 differ), polls 37 (1 timed out), 110828 us
+[rtw]   op 7 reg 0x000000000000ce40 want 0x000000005600002b got 0x00000000f100002b
+[rtw]   op 718 reg 0x000000000000ce40 want 0x000000005600002b got 0x00000000f100002b
+[rtw]   op 1439 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[rtw] scan: 231 beacons, 24 networks
+[rtw]   bss 12:67:62:xx:xx:xx ch 1 ssid#8ba7c8e1 wpa2-psk
+[rtw]   bss 72:d5:ed:xx:xx:xx ch 1 ssid#329ba75b wpa2-psk
+[rtw]   bss d8:78:7f:xx:xx:xx ch 1 ssid#a927ecd6 wpa2-psk
+[rtw]   bss bc:d5:ed:xx:xx:xx ch 1 ssid#329ba75b wpa2-psk
+[rtw]   bss 92:d8:e5:xx:xx:xx ch 1 ssid#058add01 wpa2-psk
+[rtw]   bss 20:97:27:xx:xx:xx ch 2 ssid#ef0d903e wpa2-psk
+[rtw]   bss da:d8:e5:xx:xx:xx ch 1 ssid#68266439 wpa2-psk
+[rtw]   bss cc:19:a8:xx:xx:xx ch 1 ssid#72cc11ed wpa2-psk
+[rtw]   bss 4a:3f:da:xx:xx:xx ch 1 ssid#a4a63da6 open
+[rtw]   bss d8:78:7f:xx:xx:xx ch 1 ssid#b0b6418f open
+[rtw]   bss b8:fb:b3:xx:xx:xx ch 1 ssid#6e452639 other
+[rtw]   bss 00:b8:c2:xx:xx:xx ch 6 ssid#919d7c55 wpa2-psk
+[rtw]   bss 10:2b:aa:xx:xx:xx ch 6 ssid#137fe768 wpa2-psk
+[rtw]   bss 9c:e5:49:xx:xx:xx ch 6 ssid#c9577d26 wpa2-psk
+[rtw]   bss 00:f8:cc:xx:xx:xx ch 6 ssid#5252c105 wpa2-psk
+[rtw]   bss 00:f8:cc:xx:xx:xx ch 6 ssid#7d2028cf wpa2-psk
+[rtw]   bss 34:20:03:xx:xx:xx ch 6 ssid#9126bc52 wpa2-psk
+[rtw]   bss 54:49:fc:xx:xx:xx ch 6 ssid#08d9d5bc wpa2-psk
+[rtw]   bss a4:91:b1:xx:xx:xx ch 11 ssid#2ce1df73 wpa2-psk
+[rtw]   bss a2:b5:3c:xx:xx:xx ch 11 ssid#6f339e6e wpa2-psk
+[rtw]   bss da:d8:e5:xx:xx:xx ch 11 ssid#0806e212 wpa2-psk
+[rtw]   bss 00:1d:aa:xx:xx:xx ch 11 ssid#17c2f35c other
+[rtw]   bss 02:1d:aa:xx:xx:xx ch 11 ssid#c222f3a5 other
+[rtw]   bss c4:eb:42:xx:xx:xx ch 11 ssid#ee47acd1 wpa2-psk
+[rtw] join: bss a4:91:b1:xx:xx:xx ch 11 ssid#2ce1df73
+[rtw] join attempt 1
+[bkls>] core=2 ticket=837482 serving=837481 owner=5 spins=1048576
+[bkls>] core=2 ticket=837482 serving=837481 owner=5 spins=2097152
+[bkls>] core=2 ticket=837482 serving=837481 owner=5 spins=4194304
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (14 differ), polls 37 (1 timed out), 110954 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004d00002b got 0x000000004c00002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000207d4 got 0x0000000000020b00
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cac3 got 0x000000000002cf21
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40999 got 0x0000000002e409a8
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66b got 0x00000000008cd66a
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000a0000 got 0x00000000000d0000
+[rtw]   op 186 reg 0x00000000000142c4 want 0x0000000000280280 got 0x0000000000a80280
+[rtw]   op 188 reg 0x0000000000014c14 want 0x0000000000000909 got 0x0000000000001939
+[bkls>] core=2 ticket=837482 serving=837481 owner=5 spins=8388608
+[rtw] join2 (prepare)[BKL] stuck: owner=5 waiter=6 tag=501 serving=837481 folded=1 (aff0+1)
+: 4072 ops, 1693 writes, 9 h2c, checks 1787 (52 differ), polls 550 (0 timed out), 38268 us
+[rtw]   op 20 reg 0x00000000000000ac want 0x00000000c000000b got 0x0000000000000003
+[rtw]   op 649 reg 0x00000000000000ac want 0x000000004000200b got 0x0000000080000003
+[rtw]   op 654 reg 0x00000000000000ac want 0x000000004000200b got 0x0000000080000003
+[rtw]   op 1967 reg 0x00000000000000ac want 0x00000000c000280b got 0x0000000000000003
+[rtw]   op 2050 reg 0x0000000000015838 want 0x0000000002004121 got 0x0000000002001121
+[rtw]   op 2054 reg 0x0000000000015858 want 0x0000000002004121 got 0x0000000002000121
+[rtw]   op 2056 reg 0x0000000000015860 want 0x0000000002004121 got 0x0000000002000121
+[rtw]   op 2260 reg 0x0000000000015828 want 0x0000000002004121 got 0x0000000002001121
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (36 differ), polls 37 (1 timed out), 109743 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004d00002b got 0x000000008200002b
+[rtw]   op 10 reg 0x0000000000015818 want 0x00000000082c1800 got 0x00000000182c18e8
+[rtw]   op 12 reg 0x0000000000015820 want 0x0000000000000080 got 0x0000000080000080
+[rtw]   op 14 reg 0x0000000000017818 want 0x00000000082c1800 got 0x00000000182c18e8
+[rtw]   op 16 reg 0x0000000000017820 want 0x0000000000000080 got 0x0000000080000080
+[rtw]   op 29 reg 0x0000000000010704 want 0x00000000601c0502 got 0x00000000601e0502
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000207d4 got 0x00000000000208e3
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cac3 got 0x000000000002cc38
+[bkls>] core=2 ticket=837482 serving=837481 owner=5 spins=16777216
+[rtw] auth tx: idx 0x0000000000010001 -> 0x0000000000010001, release reports +0 status done, dmac_err 0x0000000000000000 idct 0x0000000000000000; rx total 5123 bad 0 crc 0 idx 0x0000000000030003; heard 3, from ap 1, mgmt to us 1, to us 2; answer a1 hit; ap fc b0x1
+[rtw] auth: accepted
+[rtw] assoc tx: idx 0x0000000000010002 -> 0x0000000000020002, release reports +1 status done, dmac_err 0x0000000000000000 idct 0x0000000000000000; rx total 5127 bad 0 crc 0 idx 0x0000000000070007; heard 2, from ap 1, mgmt to us 1, to us 2; answer a1 hit; ap fc 10x1
+[rtw] assoc: accepted, aid 1
+[rtw] join3 (associated): 28 ops, 3 writes, 15 h2c, checks 4 (1 differ), polls 0 (0 timed out), 2450 us
+[rtw]   op 11 reg 0x00000000000000ac want 0x000000004000208b got 0x0000000080000003
+[rtw] eapol: message 1 answered (a1 hit)
+[rtw] join4 (keys): 18 ops, 2 writes, 9 h2c, checks 2 (2 differ), polls 0 (0 timed out), 15502 us
+[rtw]   op 5 reg 0x00000000000000ac want 0x00000000c000208b got 0x0000000000000003
+[rtw]   op 9 reg 0x00000000000000ac want 0x000000004000208b got 0x0000000080000003
+[rtw] eapol: message 3 answered, keys installed, group key id 2
+[bkls>] core=4 ticket=839237 serving=839236 owner=1 spins=1048576
+[rtw] link: rx data 0 amsdu 0/0 clear 0 undecrypted 0 replayed 0 unparsed 1 -> stack 0 (dropped 0); tx 1 failed 0 (stack dropped 0); released done 3 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 0 tx 0 rst rx 0 tx 0; laps 215 max gap 6098 ms
+[SmolNet] DHCP configured
+[SmolNet] IP: 192.168.1.159/24
+[PSTATS] PID 1 (/bin/herd) 30.05s: 3393 syscalls (112/s) in_kernel=59709ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=281(29806ms) nanosleep=281(29806ms) nr315=1(58ms) io_setup=1730(8ms) nr1=68(7ms) nr258=9(6ms) mkdirat=9(6ms) nr257=32(6ms) getdents64=290(1ms) nr217=6(0ms)
+[PSTATS] PID 2 (/bin/sh) 29.94s: 358 syscalls (11/s) in_kernel=97ms pmm=3204474free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(37ms) wait4=12(37ms) io_setup=43(9ms) nr7=10(7ms) nr4=12(3ms) close=33(1ms) epoll_create1=2(0ms) nr2=10(0ms) nr217=2(0ms) nr9=24(0ms)
+[PSTATS] PID 9 (/usr/bin/bash) 29.87s: 560 syscalls (18/s) in_kernel=4374ms pmm=3204474free/3608622tot retired=0/0p pgfault=210(210pg) | getdents64=15(2176ms) wait4=15(2176ms) io_setup=22(10ms) close=25(7ms) nr2=8(2ms) nr4=6(0ms) epoll_create1=4(0ms) nr10=6(0ms) nr8=11(0ms) nr9=28(0ms)
+[PSTATS] PID 10 (/bin/klogd) 29.86s: 218 syscalls (7/s) in_kernel=56232ms pmm=3204474free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=15(28097ms) nanosleep=15(28097ms) nr257=21(17ms) nr1=34(7ms) nr162=15(3ms) nr81=15(3ms) nr264=18(2ms) nr38=18(2ms) io_setup=1(0ms) nr103=15(0ms)
+[PSTATS] PID 11 (/bin/powersaved) 29.86s: 220 syscalls (7/s) in_kernel=58039ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=30(29014ms) nanosleep=30(29014ms) nr5=31(5ms) io_setup=30(4ms) nr257=31(0ms) nr3=31(0ms) close=31(0ms) nr9=1(0ms) nr1=5(0ms)
+[PSTATS] PID 12 (/bin/sshd) 29.86s: 74254 syscalls (2486/s) in_kernel=58687ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=24741(29331ms) nanosleep=24741(29305ms) nr43=24741(49ms) io_setup=4(0ms) nr257=3(0ms) nr9=1(0ms) mkdirat=2(0ms) nr258=2(0ms) nr50=1(0ms) nr1=8(0ms)
+[PSTATS] PID 13 (/bin/wifi) 29.86s: 1558 syscalls (52/s) in_kernel=57339ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=174(28668ms) nanosleep=174(28668ms) io_setup=612(0ms) nr257=191(0ms) nr3=191(0ms) nr217=6(0ms) getdents64=6(0ms) close=191(0ms) nr1=9(0ms) nr9=1(0ms)
+[bkls>] core=2 ticket=874833 serving=874832 owner=8 spins=1048576
+[PSTATS] PID 843 (/usr/bin/sleep) 27.66s: 36 syscalls (1/s) in_kernel=0ms pmm=3204474free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr3=1(0ms) nr10=3(0ms) nr14=3(0ms) close=1(0ms) nr218=2(0ms) nr9=1(0ms) nr12=2(0ms) nr13=6(0ms) unlinkat=1(0ms)
+[PSTATS] PID 818 (/usr/bin/sshd) 28.71s: 64 syscalls (2/s) in_kernel=0ms pmm=3204474free/3608622tot retired=0/0p pgfault=15(15pg) | nr2=3(0ms) epoll_create1=2(0ms) nr50=1(0ms) nr49=2(0ms) nr3=4(0ms) nr9=2(0ms) nr41=3(0ms) fstat=1(0ms) io_setup=1(0ms) close=4(0ms)
+[FAULTSTAT] n=5560 bkl_wait=525ns service=6364ns
+[FAULTSTAT] file_faults=4650 pages=15559 shared=11671 file_service=7376ns
+[IDLESTAT] halts=187918 shots=768 shot_ticks_credited=0
+[bkls>] core=8 ticket=881675 serving=881674 owner=5 spins=1048576
+  mem:  heap 35056/1048576 KiB (peak 35171), pmm 12517 MiB free
+[kbd] polls=3000 st=0x1c or=0x1c scancodes=0
+  clock: synced via SNTP (pool.ntp.org, retry)
+  clock: CMOS RTC written from SNTP (2026-10-22 11:30 UTC) and read back
+[rtw] tcp rx 58976 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 58976 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[herd] Reloading config...
+  mem:  heap 34411/1048576 KiB (peak 35830), pmm 12517 MiB free
+[kbd] polls=4500 st=0x1c or=0x1c scancodes=0
+[rtw] tcp rx 58991 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 58991 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+  mem:  heap 34731/1048576 KiB (peak 35830), pmm 12517 MiB free
+[PSTATS] PID 1 (/bin/herd) 60.05s: 6762 syscalls (112/s) in_kernel=119429ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=579(59613ms) nanosleep=579(59612ms) nr1=77(110ms) nr315=1(58ms) io_setup=3538(9ms) nr258=9(6ms) mkdirat=9(6ms) nr257=47(6ms) getdents64=590(1ms) nr217=8(0ms)
+[PSTATS] PID 2 (/bin/sh) 59.94s: 358 syscalls (5/s) in_kernel=97ms pmm=3204474free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(37ms) wait4=12(37ms) io_setup=43(9ms) nr7=10(7ms) nr4=12(3ms) close=33(1ms) epoll_create1=2(0ms) nr2=10(0ms) nr217=2(0ms) nr9=24(0ms)
+[PSTATS] PID 9 (/usr/bin/bash) 59.87s: 560 syscalls (9/s) in_kernel=4374ms pmm=3204474free/3608622tot retired=0/0p pgfault=210(210pg) | getdents64=15(2176ms) wait4=15(2176ms) io_setup=22(10ms) close=25(7ms) nr2=8(2ms) nr4=6(0ms) epoll_create1=4(0ms) nr10=6(0ms) nr8=11(0ms) nr9=28(0ms)
+[PSTATS] PID 10 (/bin/klogd) 59.86s: 392 syscalls (6/s) in_kernel=116283ms pmm=3204474free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=30(58097ms) nanosleep=30(58097ms) nr257=36(51ms) nr1=58(13ms) nr162=30(6ms) nr81=30(6ms) nr264=33(4ms) nr38=33(4ms) nr103=30(0ms) io_setup=1(0ms)
+[PSTATS] PID 11 (/bin/powersaved) 59.86s: 435 syscalls (7/s) in_kernel=118065ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=60(59015ms) nanosleep=60(59015ms) nr1=7(14ms) nr5=61(10ms) io_setup=60(9ms) nr257=62(1ms) nr3=62(0ms) close=62(0ms) nr9=1(0ms)
+[PSTATS] PID 12 (/bin/sshd) 59.86s: 161734 syscalls (2701/s) in_kernel=117629ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=53491(58797ms) nanosleep=53491(58762ms) nr43=53495(65ms) truncate=1087(1ms) io_setup=32(0ms) nr257=9(0ms) nr44=33(0ms) nr1=48(0ms) nr9=1(0ms) mkdirat=2(0ms)
+[PSTATS] PID 13 (/bin/wifi) 59.86s: 1612 syscalls (26/s) in_kernel=117340ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=180(58669ms) nanosleep=180(58668ms) io_setup=636(0ms) nr257=197(0ms) nr3=197(0ms) nr217=6(0ms) getdents64=6(0ms) close=197(0ms) nr1=9(0ms) nr9=1(0ms)
+[bkls>] core=2 ticket=1847445 serving=1847444 owner=4 spins=1048576
+[PSTATS] PID 843 (/usr/bin/sleep) 57.66s: 36 syscalls (0/s) in_kernel=0ms pmm=3204474free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr3=1(0ms) nr10=3(0ms) nr14=3(0ms) close=1(0ms) nr218=2(0ms) nr9=1(0ms) nr12=2(0ms) nr13=6(0ms) unlinkat=1(0ms)
+[PSTATS] PID 818 (/usr/bin/sshd) 58.71s: 64 syscalls (1/s) in_kernel=0ms pmm=3204474free/3608622tot retired=0/0p pgfault=15(15pg) | nr2=3(0ms) epoll_create1=2(0ms) nr50=1(0ms) nr49=2(0ms) nr3=4(0ms) nr9=2(0ms) nr41=3(0ms) fstat=1(0ms) io_setup=1(0ms) close=4(0ms)
+[FAULTSTAT] n=5620 bkl_wait=521ns service=6302ns
+[FAULTSTAT] file_faults=4650 pages=15559 shared=11671 file_service=7376ns
+[IDLESTAT] halts=463191 shots=768 shot_ticks_credited=0
+[herd] Reloading config...
+  mem:  heap 35018/1048576 KiB (peak 35830), pmm 12517 MiB free
+[kbd] polls=6000 st=0x1c or=0x1c scancodes=0
+  mem:  heap 35403/1048576 KiB (peak 35830), pmm 12517 MiB free
+[herd] Reloading config...
+[kbd] polls=7500 st=0x1c or=0x1c scancodes=0
+  mem:  heap 35722/1048576 KiB (peak 35830), pmm 12517 MiB free
+[HEAP-R] 35MB used (realloc 8->16)
+  [touchpad] polls=4096 nack=0 empty=4096 reports=0 other=0 down=0
+[rtw] link: rx data 292 amsdu 0/0 clear 0 undecrypted 0 replayed 2 unparsed 1 -> stack 290 (dropped 0); tx 57 failed 0 (stack dropped 0); released done 39 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 2 tx 2 rst rx 0 tx 0; laps 28845 max gap 28 ms
+[PSTATS] PID 1 (/bin/herd) 90.05s: 10164 syscalls (112/s) in_kernel=179461ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=879(89627ms) nanosleep=879(89627ms) nr1=79(111ms) nr315=1(58ms) io_setup=5362(11ms) nr257=61(7ms) nr258=9(6ms) mkdirat=9(6ms) getdents64=894(1ms) nr43=879(0ms)
+[PSTATS] PID 2 (/bin/sh) 89.94s: 358 syscalls (3/s) in_kernel=97ms pmm=3204474free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(37ms) wait4=12(37ms) io_setup=43(9ms) nr7=10(7ms) nr4=12(3ms) close=33(1ms) epoll_create1=2(0ms) nr2=10(0ms) nr217=2(0ms) nr9=24(0ms)
+[PSTATS] PID 9 (/usr/bin/bash) 89.87s: 560 syscalls (6/s) in_kernel=4374ms pmm=3204474free/3608622tot retired=0/0p pgfault=210(210pg) | getdents64=15(2176ms) wait4=15(2176ms) io_setup=22(10ms) close=25(7ms) nr2=8(2ms) nr4=6(0ms) epoll_create1=4(0ms) nr10=6(0ms) nr8=11(0ms) nr9=28(0ms)
+[PSTATS] PID 10 (/bin/klogd) 89.86s: 565 syscalls (6/s) in_kernel=176315ms pmm=3204474free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=45(88097ms) nanosleep=45(88097ms) nr257=51(65ms) nr1=81(20ms) nr162=45(9ms) nr81=45(9ms) nr264=48(6ms) nr38=48(6ms) nr103=45(1ms) io_setup=1(0ms)
+[PSTATS] PID 11 (/bin/powersaved) 89.86s: 645 syscalls (7/s) in_kernel=178078ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=90(89016ms) nanosleep=90(89016ms) nr5=91(14ms) io_setup=90(14ms) nr1=7(14ms) nr257=92(2ms) nr3=92(0ms) close=92(0ms) nr9=1(0ms)
+[PSTATS] PID 12 (/bin/sshd) 89.86s: 248134 syscalls (2761/s) in_kernel=176577ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=82291(88268ms) nanosleep=82291(88224ms) nr43=82295(80ms) truncate=1087(1ms) io_setup=32(0ms) nr257=9(0ms) nr44=33(0ms) nr1=48(0ms) nr9=1(0ms) mkdirat=2(0ms)
+[PSTATS] PID 13 (/bin/wifi) 89.86s: 1666 syscalls (18/s) in_kernel=177340ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=186(88669ms) nanosleep=186(88668ms) io_setup=660(0ms) nr257=203(0ms) nr3=203(0ms) nr217=6(0ms) getdents64=6(0ms) close=203(0ms) nr1=9(0ms) nr9=1(0ms)
+[bkls>] core=8 ticket=2778177 serving=2778176 owner=2 spins=1048576
+[PSTATS] PID 843 (/usr/bin/sleep) 87.66s: 36 syscalls (0/s) in_kernel=0ms pmm=3204474free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr3=1(0ms) nr10=3(0ms) nr14=3(0ms) close=1(0ms) nr218=2(0ms) nr9=1(0ms) nr12=2(0ms) nr13=6(0ms) unlinkat=1(0ms)
+[PSTATS] PID 818 (/usr/bin/sshd) 88.71s: 64 syscalls (0/s) in_kernel=0ms pmm=3204474free/3608622tot retired=0/0p pgfault=15(15pg) | nr2=3(0ms) epoll_create1=2(0ms) nr50=1(0ms) nr49=2(0ms) nr3=4(0ms) nr9=2(0ms) nr41=3(0ms) fstat=1(0ms) io_setup=1(0ms) close=4(0ms)
+[FAULTSTAT] n=5620 bkl_wait=521ns service=6302ns
+[FAULTSTAT] file_faults=4650 pages=15559 shared=11671 file_service=7376ns
+[IDLESTAT] halts=736903 shots=768 shot_ticks_credited=0
+  mem:  heap 36043/1048576 KiB (peak 36111), pmm 12517 MiB free
+[kbd] polls=9000 st=0x1c or=0x1c scancodes=0
+[herd] Reloading config...
+  mem:  heap 36487/1048576 KiB (peak 36571), pmm 12517 MiB free
+[kbd] polls=10500 st=0x1c or=0x1c scancodes=0
+  mem:  heap 36807/1048576 KiB (peak 36875), pmm 12517 MiB free
+[rtw] tcp rx 59017 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 59017 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
