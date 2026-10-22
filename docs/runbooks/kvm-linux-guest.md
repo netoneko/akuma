@@ -69,7 +69,7 @@ busybox guest a virtio-net NIC on the hypervisor's own gateway. Expect the guest
 `[KVM] akuma-net guest: PASS (banner=yes, init=yes, net=yes)` with `dhcp_offer=1 dhcp_ack=1
 arp=` in the summary. `NETPROBE=1` adds a UDP-echo probe (`nc -u -w 2`, `udp_echo=1`); under
 TCG its 2 s wait costs many minutes of wall time and the guest then stalls after the timeout
-(`docs/archive/AKUMA_KVM_AKUMA_GUEST.md` § A NIC), so it is opt-in. `GUEST=net` stages it.
+(`docs/archive/AKUMA_KVM_AKUMA_GUEST.md` § A NIC), so it is opt-in: `GUEST=netprobe` stages it, `GUEST=net` does not.
 
 ## If it goes wrong
 

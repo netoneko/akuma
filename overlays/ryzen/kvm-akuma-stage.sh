@@ -3,7 +3,7 @@
 #
 #   BRANCH=kvm-part-1 sh build.sh                 (netoneko, ryzen: builds the kernel ON the ryzen)
 #   GUEST=hello sh scripts/kvm/akuma_hello_rootfs.sh $W/out/akuma-hello-root.img   (netoneko, optional)
-#   [GUEST=hello|smp|net|linux|linux-apic] sh kvm-akuma-stage.sh [KERNEL]                (root, in Pop; p3 not mounted by Akuma; SRC=<clone> W=<dir> override)
+#   [GUEST=hello|smp|net|netprobe|linux|linux-apic] sh kvm-akuma-stage.sh [KERNEL]                (root, in Pop; p3 not mounted by Akuma; SRC=<clone> W=<dir> override)
 #   sh arm.sh 28                                  (boots entry 28 once; ~3 min later Pop is back)
 #
 # Does, each step safe to repeat:
@@ -65,10 +65,12 @@ else
     E2FSPROGS=/sbin sh "$SRC/scripts/kvm/akuma_guest_rootfs.sh" "$T/guest.img" "$BB"
     cp "$T/guest.img" $P/boot/akuma-guest-root.img
     rm -rf "$T"
-    # `net` additionally runs the NIC probe in the guest's init script.
-    if [ "$GUEST" = net ]; then
+    # `net` shows the lease in the guest's init script; `netprobe` also runs the UDP-echo probe
+    # (`nc -u -w 2`), after which the guest currently stalls (docs/archive/AKUMA_KVM_AKUMA_GUEST.md).
+    if [ "$GUEST" = net ] || [ "$GUEST" = netprobe ]; then
         T=$(mktemp -d)
-        NET=1 NETPROBE=1 E2FSPROGS=/sbin sh "$SRC/scripts/kvm/akuma_guest_rootfs.sh" "$T/guest.img" "$BB"
+        if [ "$GUEST" = netprobe ]; then PROBE=1; else PROBE=; fi
+        NET=1 NETPROBE=$PROBE E2FSPROGS=/sbin sh "$SRC/scripts/kvm/akuma_guest_rootfs.sh" "$T/guest.img" "$BB"
         cp "$T/guest.img" $P/boot/akuma-guest-root.img
         rm -rf "$T"
         printf akuma-net > $P/boot/kvm-guest
