@@ -47,4 +47,4 @@ image under host `debugfs` with the md5 the guest printed and `e2fsck -fn` clean
 
 ## Background
 
-[`../archive/AKUMA_KVM_LINUX_RUNG.md`](../archive/AKUMA_KVM_LINUX_RUNG.md) · [`../archive/AKUMA_KVM.md`](../archive/AKUMA_KVM.md)
+[`../archive/AKUMA_KVM_LINUX_GUEST.md`](../archive/AKUMA_KVM_LINUX_GUEST.md) · [`../archive/AKUMA_KVM.md`](../archive/AKUMA_KVM.md)

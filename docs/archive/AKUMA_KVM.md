@@ -121,7 +121,7 @@ Read downwards; the sections below are the reference record.
    │   on to its first timer wait. Found on the way: the PVH note type (9, is
    │   18), and a start_info layout the rung-5 guest agreed with and Linux did
    │   not. Metal 2026-10-22: PASS (entry 28,
-   │   banner on real Zen 4). [`AKUMA_KVM_LINUX_RUNG.md`](AKUMA_KVM_LINUX_RUNG.md)
+   │   banner on real Zen 4). [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md)
  [10-22] ═══ RUNG 7: A TIMER — THE GUEST'S CLOCK TICKS ═══  "TCG breakthrough"
    │
    ▼   Pure, host-tested 8254 + 8259 models; interrupts reach the guest as
@@ -150,7 +150,7 @@ Read downwards; the sections below are the reference record.
        `model name : AMD Ryzen 7 8845HS`, detects the real 3.79 GHz TSC,
        mounts a file on p3 as its virtio-blk root, runs init, matches both
        md5s and reboots itself. 99 869 exits, 207 virtual interrupts.
-       [`AKUMA_KVM_LINUX_RUNG.md`](AKUMA_KVM_LINUX_RUNG.md) § Rung 7, 8
+       [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Rung 7, 8
 ```
 
 ---

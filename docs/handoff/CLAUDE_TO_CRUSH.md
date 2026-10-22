@@ -222,7 +222,7 @@ Box: **on Akuma entry 27** with the rung-4 kernel, stays up, wifi `192.168.1.159
 
 Crush — I took your `ba06d275` + the uncommitted `kvm.rs` from the ryzen (nothing
 touched there) and continued. Branch `kvm-linux-rung` on litter. Read
-`docs/archive/AKUMA_KVM_LINUX_RUNG.md` first; the short version:
+`docs/archive/AKUMA_KVM_LINUX_GUEST.md` first; the short version:
 
 - **Your PVH rung had a real bug and passed anyway.** `hvm_start_info` was at
   version-0 offsets (cmdline `+0x10`, memmap `+0x20`, 48 B); the real v1 layout
@@ -255,7 +255,7 @@ metal run, with the corrected layout). Log:
 `docs/archive/AMD64_KVMTEST_RUNG6_LINUX_METAL_DMESG_2026_10_22.txt`. Also in this
 kernel: the `/proc/<tid>/maps` fix (`7fec263c`). Rehearsal found a real bug the
 TCG run hid (`kvm::late` ran before the LAPIC timer on the multiboot2 path) —
-details in `AKUMA_KVM_LINUX_RUNG.md`.
+details in `AKUMA_KVM_LINUX_GUEST.md`.
 
 **Next rung is yours:** a timer. Linux now stops at `tsc: Unable to calibrate
 against PIT` and spins: emulate the PIT (0x40-0x43, 0x61), then `EVENTINJ`
@@ -278,7 +278,7 @@ exit; the gaps between polls vary 5-10x), so the command line carries
 `tsc_early_khz=` from `lapic::tsc_hz()`. Linux now runs to
 `VFS: Unable to mount root fs` and resets via port `0x64`. Next: rehearse on ryzen
 under nested SVM (`qemu.sh 28`) before metal; then a virtio-blk root (the Gentoo
-partition) to exercise `HLT` idle. Details: `AKUMA_KVM_LINUX_RUNG.md` § Rung 7.
+partition) to exercise `HLT` idle. Details: `AKUMA_KVM_LINUX_GUEST.md` § Rung 7.
 
 **Rung 8 (2026-10-22): virtio-blk root — TCG PASS, read and write verified against
 host tools.** Linux boots from a second virtio-blk device, mounts ext2, runs
@@ -291,4 +291,4 @@ otherwise rediscover: the kernel finds the device **only through ACPI**
 one byte; `nmi_watchdog=0` avoids a `RDPMC` `#UD` at reboot. Backing store reuses
 `akuma_virtio::block` (second device) — the host's `vda` is never given to the
 guest. Rehearse: `scripts/kvm/guest_rootfs.sh` + `scripts/kvm/linux_rehearse.sh`.
-Details: `AKUMA_KVM_LINUX_RUNG.md` § Rung 8.
+Details: `AKUMA_KVM_LINUX_GUEST.md` § Rung 8.

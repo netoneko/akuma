@@ -70,5 +70,5 @@ Kernel command line: `kvmtest kvmlinux` (add `noladder` under TCG).
 ## Background
 
 [`../../archive/AKUMA_KVM.md`](../../archive/AKUMA_KVM.md) (the rungs and their
-timeline), [`../../archive/AKUMA_KVM_LINUX_RUNG.md`](../../archive/AKUMA_KVM_LINUX_RUNG.md)
+timeline), [`../../archive/AKUMA_KVM_LINUX_GUEST.md`](../../archive/AKUMA_KVM_LINUX_GUEST.md)
 (the Linux rung, rungs 7-8, every bug found and how).
