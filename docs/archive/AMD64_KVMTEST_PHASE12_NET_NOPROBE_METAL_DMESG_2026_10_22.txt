@@ -1,0 +1,890 @@
+
+Akuma/amd64 - bare metal, booted by GRUB 2.06-2ubuntu14.8
+  cmd:  init=/bin/herd initargs=daemon root=/dev/nvme0n1p3 rtw89wifi wdt smp=8 idlesleep ecram=0xfeec2380 kvmtest kvmlinux
+  uart: present  kbd: i8042 present
+  font: IBM Plex Mono 11x22 11x22 scale 1 -> 171x53 cells
+  fb:   1920x1200 @ 32bpp, pitch 7680, at 0x00000004b0000000
+  ram:  14096 MiB usable across 8 regions
+  pci:  42 function(s)
+    00:00.0  1022:14e8  class 06/00/00
+    00:00.2  1022:14e9  class 08/06/00
+    00:01.0  1022:14ea  class 06/00/00
+    00:02.0  1022:14ea  class 06/00/00
+    00:02.1  1022:14ee  class 06/04/00  [bridge]  bar2=mem:0x0000000000010100  bar3=io:0x00000000200001f0  bar4=mem:0x0000000080c080c0  bar5=io:0x000000000001fff0
+    00:02.2  1022:14ee  class 06/04/00  [bridge]  bar2=mem:0x0000000000020200  bar3=io:0x0000000020002120  bar4=mem:0x0000000080b080b0  bar5=io:0x000000000001fff0
+    00:02.4  1022:14ee  class 06/04/00  [bridge]  bar2=mem:0x0000000000030300  bar3=io:0x00000000200001f0  bar4=mem:0x0000000080a080a0  bar5=io:0x000000000001fff0
+    00:03.0  1022:14ea  class 06/00/00
+    00:03.2  0000:0000  class 00/00/00
+    00:03.3  0000:0000  class 00/00/00
+    00:03.4  0000:0000  class 00/00/00
+    00:04.0  1022:14ea  class 06/00/00
+    00:08.0  1022:14ea  class 06/00/00
+    00:08.1  1022:14eb  class 06/04/00  [bridge]  bar2=mem:0x0000000000040400  bar3=io:0x0000000000001110  bar4=mem:0x0000000080608000  bar5=io:0x00000000c071b000
+    00:08.2  1022:14eb  class 06/04/00  [bridge]  bar2=mem:0x0000000000050500  bar3=io:0x00000000000001f0  bar4=mem:0x0000000080908090  bar5=io:0x00000000c081c080
+    00:08.3  1022:14eb  class 06/04/00  [bridge]  bar2=mem:0x0000000000060600  bar3=io:0x00000000000001f0  bar4=mem:0x0000000080808070  bar5=io:0x000000000001fff0
+    00:14.0  1022:790b  class 0c/05/00
+    00:14.3  1022:790e  class 06/01/00
+    00:18.0  1022:14f0  class 06/00/00
+    00:18.1  1022:14f1  class 06/00/00
+    00:18.2  1022:14f2  class 06/00/00
+    00:18.3  1022:14f3  class 06/00/00
+    00:18.4  1022:14f4  class 06/00/00
+    00:18.5  1022:14f5  class 06/00/00
+    00:18.6  1022:14f6  class 06/00/00
+    00:18.7  1022:14f7  class 06/00/00
+    01:00.0  10ec:522a  class ff/00/00  bar0=mem:0x0000000080c00000
+    02:00.0  10ec:c852  class 02/80/00  bar0=io:0x0000000000002000  bar2=mem:0x0000000080b00000(64)
+    03:00.0  1c5c:1d59  class 01/08/02  bar0=mem:0x0000000080a00000(64)
+    04:00.0  1002:1900  class 03/00/00  bar0=mem:0x00000004b0000000(64)  bar2=mem:0x0000000080000000(64)  bar4=io:0x0000000000001000  bar5=mem:0x0000000080600000
+    04:00.1  1002:1640  class 04/03/00  bar0=mem:0x00000000806c8000
+    04:00.2  1022:15c7  class 10/80/00  bar2=mem:0x0000000080500000  bar5=mem:0x00000000806ce000
+    04:00.3  1022:15b9  class 0c/03/30  [xHCI]  bar0=mem:0x0000000080200000(64)
+    04:00.4  1022:15ba  class 0c/03/30  [xHCI]  bar0=mem:0x0000000080300000(64)
+    04:00.5  1022:15e2  class 04/80/00  bar0=mem:0x0000000080680000  bar2=mem:0x00000004c0000000(64)
+    04:00.6  1022:15e3  class 04/03/00  bar0=mem:0x00000000806c0000
+    04:00.7  1022:164a  class 11/80/00  bar2=mem:0x0000000080400000  bar5=mem:0x00000000806cc000
+    05:00.0  1022:14ec  class 13/00/00
+    05:00.1  1022:1502  class 11/80/00  bar0=mem:0x0000000080900000  bar1=mem:0x00000000809c0000  bar2=mem:0x00000004c0800000(64)  bar4=mem:0x0000000080980000
+    06:00.0  1022:14ec  class 13/00/00
+    06:00.3  1022:15c0  class 0c/03/30  [xHCI]  bar0=mem:0x0000000080700000(64)
+    06:00.4  1022:15c1  class 0c/03/30  [xHCI]  bar0=mem:0x0000000080800000(64)
+  [xhci] quiesced 4 controller(s): bus-master off, INTx masked
+  mod:  root image at 0x0000000009f3c000 + 524288 KiB
+  mem:  RAM the machine reported, and what became of each:
+    0x0000000000000000 + 0 MiB  unused (below the 1 MiB floor)
+    0x0000000000100000 + 155 MiB  pmm
+    0x0000000009e01000 + 0 MiB  pmm
+    0x0000000009f3c000 + 596 MiB  pmm
+    0x00000000343f8000 + 1063 MiB  pmm
+    0x000000007a9fe000 + 21 MiB  pmm
+    0x000000007bfed000 + 0 MiB  pmm
+    0x0000000100000000 + 12259 MiB  heap + pmm
+  mem:  14096 MiB usable, 14096 MiB managed, physmap reaches 64 GiB
+  kernel ends 0x0000000001195f40
+  heap: 0x0000000100000000 + 1024 MiB ... ok
+  pmm:  arena 0x0000000000100000 + 16354 MiB spanning 7 RAM region(s)
+  pmm:  14096 MiB RAM, 3211160 free frames (12543 MiB)
+  clock: seeded from the CMOS RTC (2026-10-22 11:54 UTC); SNTP will correct it
+[fpcache] shared file-page cache enabled, base cap=451077 pages (+20% elastic)
+[HDA] audio function 1002:1640
+[HDA] audio function 1022:15e3
+[HDA] first 04:03 function is not Intel; leaving audio off
+[KVM] Fn8000_000A: rev=00000001 asids=32768 edx=1ebf1cff
+[KVM] SVM available; EFER.SVME not yet enabled (per-core, phase 2)
+[KVM] running trivial guest (nrips=yes, code_pa=00000000011aa000)
+[KVM] trivial guest: PASS (vmmcalls=2, msr=1, ioio=1, rax=0000000000001000)
+[KVM] running long-mode guest (nrips=yes, code_pa=00000000011ad000)
+[KVM] long-mode guest: PASS (vmmcalls=2, msr=1, rax=0000000000001500)
+[KVM] running two-level guest (gva=0000000050000000 gpa=00000000401ae000 hpa=00000000011ae000)
+[KVM] two-level guest: PASS (vmmcalls=2, rax=202620265eed0002)
+[KVM] running pvh guest (start=00000000405ff000)
+[KVM] pvh guest: PASS (vmmcalls=2, rax=0000000000000001)
+[KVM] ladder: 12 probes, code_pa=00000000011a6000
+[KVM] ladder full: entered exit=00000081
+[KVM] ladder no-lma: entered exit=00000081
+[KVM] ladder lme-off: entered exit=0000004e
+[KVM] ladder no-pg: entered exit=00000081
+[KVM] ladder cs32: entered exit=00000081
+[KVM] ladder sel0: entered exit=00000081
+[KVM] ladder asid1: entered exit=00000081
+[KVM] ladder no-ne: entered exit=00000081
+[KVM] ladder t-cs64: entered exit=00000081
+[KVM] ladder t-pg: entered exit=0000004e
+[KVM] ladder t-cs64-pg: entered exit=0000004e
+[KVM] ladder t-lme-lma: entered exit=00000081
+  [power] source=ec window=0x00000000feec2380
+  wdt:  AMD FCH watchdog armed, 60 s, reset on expiry; CONTROL=0x0000000000000001
+  nvme: 0000000000001c5c:0000000000001d59
+  nvme: CAP.TO 20000 ms, MQES 256, DSTRD 0, firmware left CC=0x0000000000460001 CSTS=0x0000000000000001
+  nvme: disabled in 0 ms
+  nvme: ready in 3 ms
+  nvme: SKHynix_HFS512GEJ4X112N fw 51040C31, mdts 256 KiB, vwc yes
+  nvme: ns1 476 GiB in 512-byte blocks, 256 blocks per command
+  nvme: init total 10 ms
+  nvme: p3 = LBA 567296..=210282495 (100 GiB) "Basic data partition"
+  fs:   ext2 mounted on /dev/nvme0n1p3
+[rtw] firmware /lib/firmware/rtw89/rtw8852c_fw-1.bin, 2375560 bytes
+[rtw] root port command was 0x0000000000000003
+[rtw] arrived: IC_PWR_STATE 0x0000000002200005
+[rtw] arrived: WCPU_FW_CTRL 0x00000000000000e2
+[rtw] chip cut 0x0000000000000001
+[rtw] image offset 0x0000000000057ef0
+[rtw] image bytes 0x0000000000051008
+[rtw] powered on 0x0000000000000000
+[rtw] download-mode DMA ready 0x0000000000000000
+[rtw] h2c path ready, FW_CTRL 0x0000000000000023
+[rtw] header accepted, FW_CTRL 0x0000000000000027
+[rtw] section packets sent 0x00000000000000a6
+[rtw] fw ready v0.27.122 (cut 1, 166 packets, FW_CTRL 0x00000000000000e2, 47371 us)
+[rtw] card kept for the station (rtw89wifi); /dev/wifi0 is the radio
+  nic:  wifi station (rtw89) — the link comes up when userspace joins
+[SmolNet] MAC: 02:41:4b:55:4d:41[SmolNet] static IPv4 169.254.65.77/16 gw 169.254.0.1
+[SmolNet] DHCP enabled
+[SmolNet] Initialized successfully
+  net:  stack up
+  lapic: base=0x00000000fee00000 id=0 timer vector=32 periodic
+  lapic: calibrated vs PIT: 15006 counts per 10000us (24 MHz); tsc 3794 MHz
+  [idle] wake budget on, up to 100 ticks per idle sleep
+[KVM] linux: loading akuma-net guest /boot/akuma-guest
+[KVM] linux: loaded 9840 KiB in 4 segments, PVH entry 00201000
+[KVM] linux: guest disk: /boot/akuma-guest-root.img, 16 MiB
+[KVM] linux: running (start=2ffff000, ram=768 MiB, vcpus=1)
+
+[KVM] linux: rdmsr c0000080 -> 0000000000000000
+
+[KVM] linux: wrmsr c0000080 <- 0000000000000900
+
+
+Akuma/amd64 ??? long mode reached
+
+  uart: present  kbd: no i8042
+
+  hvm_start_info @ 0x000000002ffff000
+
+
+[KVM] linux: wrmsr c0000101 <- ffffffff80c64bc0
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 0000000d/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000007/00 -> 00000000 00000000 00000000 00000000
+  smap: off (CPUID lacks SMAP)  smep: off (CPUID lacks SMEP)
+
+  version=1 modules=0 rsdp=0x0000000000000000 cmdline=0x000000002fffd000
+
+  memmap: 1 entries
+
+    0x0000000000000000 + 0x000000002fffd000  RAM
+
+  usable RAM: 767 MiB
+
+  virtio-mmio: 0x00000000d0000000 + 0x0000000000001000 irq 5
+
+  virtio-mmio: 0x00000000d0001000 + 0x0000000000001000 irq 6
+
+  acpi: none found (no RSDP in the EBDA or the BIOS window)
+
+  mem:  RAM the machine reported, and what became of each:
+
+    0x0000000000000000 + 767 MiB  heap + pmm
+
+  mem:  767 MiB usable, 766 MiB managed, physmap reaches 64 GiB
+
+  kernel ends 0x0000000001195f40
+
+  heap: 0x0000000001196000 + 512 MiB ... ok
+
+  pmm:  arena 0x0000000000100000 + 766 MiB spanning 1 RAM region(s)
+
+  pmm:  766 MiB RAM, 61031 free frames (238 MiB)
+
+  [power] source=none (no ERAM region in the DSDT/SSDTs)
+
+  clock: CMOS RTC holds no date; waiting for SNTP
+
+[fpcache] shared file-page cache enabled, base cap=24543 pages (+20% elastic)
+
+  blk:  2 virtio slot(s) at pa 0x00000000d0000000 stride 0x0000000000001000 irq 5
+
+[Block] Initializing block device driver...
+
+[Block] Found virtio-blk at slot 0
+
+[Block] Registered vda: 16 MB (32768 sectors)
+
+[Block] Block devices initialized: 1
+
+  fs:   ext2 mounted on /dev/vda
+
+[SmolNet] Initializing network stack...
+
+[SmolNet] Found virtio-net at slot 1
+
+[SmolNet] MAC: 52:54:00:12:34:56[SmolNet] static IPv4 10.0.2.15/24 gw 10.0.2.2
+
+[SmolNet] DHCP enabled
+
+[SmolNet] Initialized successfully
+
+  net:  stack up
+
+
+[KVM] linux: rdmsr 0000001b -> 00000000fee00100
+
+[KVM] linux: wrmsr 0000001b <- 00000000fee00900
+  lapic: base=0x00000000fee00000 id=0 timer vector=32 periodic
+
+  lapic: calibrated vs PIT: 625125 counts per 10000us (1000 MHz); tsc 3795 MHz
+
+
+[KVM] linux: rdmsr c0000080 -> 0000000000000d00
+
+[KVM] linux: wrmsr c0000080 <- 0000000000000d01
+
+[KVM] linux: wrmsr c0000081 <- 0013000800000000
+
+[KVM] linux: wrmsr c0000082 <- ffffffff802b1358
+
+[KVM] linux: wrmsr c0000084 <- 0000000000047700
+[BKLPROF] enabled (amd64 diagnostic)
+
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+[SmolNet] DHCP deconfigured - reverting to static 10.0.2.15
+
+[SmolNet] DHCP configured
+
+[SmolNet] IP: 10.0.2.15/24
+
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802c84f8
+  dns: 10.0.2.3: no reply before timeout
+
+  dns: 1.1.1.1: no reply before timeout
+
+  dns: 8.8.8.8: no reply before timeout
+
+  clock: boot: could not resolve pool.ntp.org via 10.0.2.3
+
+  net:  netpoll daemon spawned in slot 1
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+
+                      =#=      .-
+
+                      +*#*:.:-**
+
+                      +%%#%##***
+
+                      +%%%#%%#**.
+
+                      +%@@@%%%+*:
+
+          :::::--=+++*%@%@%%%%*-
+
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+
+*%%%%%@%@@%@@@%%%%#%@@@@@@@%%@@%@@@*+--
+
+ ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+
+         .--+**%@@@@@%@@%%@@%*       :-.
+
+                  ::::---#@%%*
+
+
+
+  Akuma/amd64  0.0.8-amd64
+
+
+
+-- running /bin/busybox --
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+[threads] new high-water: 5 live user threads (terminated=0 free=507 ceiling=512)
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+AKUMA-GUEST-UP
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+Akuma akuma 0.0.8 89cea0b-release-smp-shared x86_64 GNU/Linux
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000007/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 80000000/00 -> 80000028 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 80000001/00 -> 00a70f52 10000000 000211f3 2fd3fbff
+
+[KVM] linux: cpuid 80000000/00 -> 80000028 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 80000002/00 -> 20444d41 657a7952 2037206e 35343838
+
+[KVM] linux: cpuid 80000003/00 -> 77205348 6152202f 6e6f6564 30383720
+
+[KVM] linux: cpuid 80000004/00 -> 7247204d 69687061 20207363 00202020
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000007/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 80000000/00 -> 80000028 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 80000001/00 -> 00a70f52 10000000 000211f3 2fd3fbff
+
+[KVM] linux: cpuid 80000000/00 -> 80000028 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 80000002/00 -> 20444d41 657a7952 2037206e 35343838
+
+[KVM] linux: cpuid 80000003/00 -> 77205348 6152202f 6e6f6564 30383720
+
+[KVM] linux: cpuid 80000004/00 -> 7247204d 69687061 20207363 00202020
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+guest cpus: 1
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+ebce43017d2cb316ea45e08374de7315  /bin/busybox
+[threads] new high-water: 6 live user threads (terminated=0 free=506 ceiling=512)
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+71277886028e270c53e947eb5989f7f2  /wtest
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+eth0      Link encap:Ethernet  HWaddr 52:54:00:12:34:56  
+          inet addr:10.0.2.15  Bcast:10.0.2.255  Mask:255.255.255.0
+          UP BROADCAST RUNNING MULTICAST  MTU:1514  Metric:1
+          RX packets:4 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:10 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 
+          RX bytes:768 (768.0 B)  TX bytes:1136 (1.1 KiB)
+
+lo        Link encap:Ethernet  HWaddr 00:00:00:00:00:00  
+          inet addr:127.0.0.1  Mask:255.0.0.0
+          UP LOOPBACK RUNNING  MTU:65536  Metric:1
+          RX packets:0 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:0 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 
+          RX bytes:0 (0.0 B)  TX bytes:0 (0.0 B)
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078bab7f
+AKUMA-GUEST-DONE
+[KVM] linux: stopped: guest reported its init ran to the end
+[KVM] linux: exits=13570 cpuid=33 msr=179 io=10581 irq=2 exc=0 injected=524 hlt=502 mmio=1665 lapic=541 lapic_irq=524 net_mmio=67 net_frames=10 arp=2 dhcp_offer=1 dhcp_ack=1 icmp=0 udp_echo=0 net_ignored=6 net_lost=0 console_bytes=4266 rip=ffffffff802fface
+[KVM] akuma-net guest: PASS (banner=yes, init=yes, net=yes)
+  smp:  cpu 1 tsc offset 3839328366 cycles
+  smp:  cpu 1 online (lapic id 1)
+  [KVM] cpu 1 svm enabled
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=1048576
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=2097152
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=4194304
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=8388608
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=0 (aff0+1)
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=16777216
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=33554432
+  smp:  cpu 2 tsc offset 3839328290 cycles
+  smp:  cpu 2 online (lapic id 2)
+  [KVM] cpu 2 svm enabled
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=67108864
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 3 tsc offset 3839328385 cycles
+  smp:  cpu 3 online (lapic id 3)
+  [KVM] cpu 3 svm enabled
+[BKL] stuck: owner=1 waiter=4 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 4 tsc offset 3839328423 cycles
+  smp:  cpu 4 online (lapic id 4)
+  [KVM] cpu 4 svm enabled
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=134217728
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 5 tsc offset 3839328328 cycles
+  smp:  cpu 5 online (lapic id 5)
+  [KVM] cpu 5 svm enabled
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=4 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 6 tsc offset 3839328404 cycles
+  smp:  cpu 6 online (lapic id 6)
+  [KVM] cpu 6 svm enabled
+[BKL] stuck: owner=1 waiter=6 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=4 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=3 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 7 tsc offset 3839328347 cycles
+  smp:  8 cpus online
+  smp:  cpu 7 online (lapic id [BKLPROF] enabled (amd64 diagnostic)
+7)
+  [KVM] cpu 7  net:  wifi link: DHCP and the wall clock follow the join
+ svm enabled
+  net:  netpoll daemon spawned in slot 10
+  [touchpad] GXTP5100 @0x000000000000005d on dw_i2c 0x00000000fedc2000
+  [touchpad] dw_i2c v=0x000000003230322a fs=99:214 (kept) fifo=256/256
+  [touchpad] hid 27c6:01e0 rdesc=665 maxin=32
+  [touchpad] ptp report 4 contacts=5 range=3751x2327 -> 1920x1200
+  [touchpad] up: /dev/input/mouse0
+[fb] 1920x1200 pitch 7680 (= width*bpp) bpp 32 cell 11x22 grid 171x53 margin 15,9 wc on clear 1.5ms = 5767MB/s
+
+                      =#=      .-
+                      +*#*:.:-**
+                      +%%#%##***
+                      +%%%#%%#**.
+                      +%@@@%%%+*:
+          :::::--=+++*%@%@%%%%*-
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+*%%%%%@%@@%@@@%%%%#%@@@@@@@%%@@%@@@*+--
+ ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+         .--+**%@@@@@%@@%%@@%*       :-.
+[BKL] stuck: owner=1 waiter=6 tag=501 serving=0 folded=8 (aff0+1)
+                  ::::---#@%%*
+
+  Akuma/amd64  0.0.8-amd64
+
+-- running /bin/herd --
+[rtw] join1 (start): 18337 ops, 9165 writes, 29 h2c, checks 5561 (84 differ), polls 3564 (0 timed out), 36160 us
+[rtw]   op 13376 reg 0x00000000000000ac want 0x00000000c000008b got 0x0000000000000003
+[rtw]   op 13415 reg 0x00000000000000ac want 0x00000000c000008b got 0x0000000000000003
+[rtw]   op 15634 reg 0x00000000000000ac want 0x000000004000000b got 0x0000000080000003
+[rtw]   op 15639 reg 0x00000000000000ac want 0x000000004000000b got 0x0000000080000003
+[rtw]   op 15704 reg 0x000000000001c0fc want 0x00000000c1104bfc got 0x00000000c11047fc
+[rtw]   op 15705 reg 0x000000000001c0fc want 0x00000000c1104bfc got 0x00000000c11047fc
+[rtw]   op 15752 reg 0x000000000001c05c want 0x0000000070f00012 got 0x0000000078f80012
+[rtw]   op 15754 reg 0x000000000001c064 want 0x00000000ffff0780 got 0x00000000ffff0f80
+[SmolNet] DHCP deconfigured - reverting to static 169.254.65.77
+  [touchpad] empty read: 00 00 04 01 0e 0d a3 01 00 00 00 00 00 00
+[SCHED] WARNING: yield_now with IRQs masked tid=3 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=5 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=6 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=7 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=10 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=5 lr=0x0
+[SCHED] WARNING: yield_now with IRQs masked tid=11 lr=0x0
+[herd] Userspace supervisor starting (rev 8e1e99190a-dirty)...
+[HEAP] 13MB used (alloc=16384 bytes)
+[herd] Starting service: console
+  [touchpad] empty read: 00 00 04 01 0e 0d a3 01 00 00 00 00 00 00
+[boot] shell after 11543 ms (starting +0, network +10357, starting services +10449)
+[splash] ended after 11543 ms: 501 frames, draw avg 650 us max 1031 us
+[herd] Started console (pid=2)
+[herd] Starting service: gentoo (boxed)
+[HEAP-R] 15MB used (realloc 14->28)
+[threads] new high-water: 15 live user threads (terminated=0 free=497 ceiling=512)
+[fbcon] burst: 6395 bytes, 1 ms drawing
+[HEAP] 18MB used (alloc=727552 bytes)
+[threads] new high-water: 16 live user threads (terminated=0 free=496 ceiling=512)
+[herd] Started gentoo (pid=9)
+[herd] Starting service: klog
+[herd] Started klog (pid=10)
+[herd] Starting service: powersave
+[herd] Started powersave (pid=11)
+[herd] Starting service: sshd
+[herd] Started sshd (pid=12)
+[herd] Starting service: wifiauto
+[herd] Started wifiauto (pid=13)
+[threads] new high-water: 20 live user threads (terminated=0 free=492 ceiling=512)
+[38;5;103mroot[0m:[1;38;5;111m/[0m [38;5;117m#[0m [6n[syscall] no row for x86_64 nr=439 — returning ENOSYS (add it to akuma-syscalls-abi's table)
+[HEAP-R] 20MB used (realloc 512->1024)
+[threads] new high-water: 21 live user threads (terminated=0 free=491 ceiling=512)
+[threads] new high-water: 22 live user threads (terminated=0 free=490 ceiling=512)
+[syscall] no row for x86_64 nr=430 — returning ENOSYS (add it to akuma-syscalls-abi's table)
+[threads] new high-water: 23 live user threads (terminated=0 free=489 ceiling=512)
+[threads] new high-water: 24 live user threads (terminated=0 free=488 ceiling=512)
+[HEAP] 23MB used (alloc=727552 bytes)
+[threads] new high-water: 25 live user threads (terminated=0 free=487 ceiling=512)
+[bkls>] core=3 ticket=136385 serving=136384 owner=1 spins=1048576
+[rtw] chan (switch): 1543 ops, 901 writes, 0 h2c, checks 579 (26 differ), polls 45 (0 timed out), 26842 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004400002b got 0x000000006d00002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x000000000002028a got 0x000000000001fe4f
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002c37e got 0x000000000002bdac
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40980 got 0x0000000002e4096c
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66c got 0x00000000008cd66d
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000050000 got 0x0000000000010000
+[rtw]   op 186 reg 0x00000000000142ac want 0x0000000022ce8066 got 0x0000000022ce803c
+[rtw]   op 188 reg 0x00000000000142c4 want 0x0000000000a80280 got 0x0000000000280280
+[bkls>] core=3 ticket=136385 serving=136384 owner=1 spins=2097152
+[HEAP-R] 25MB used (realloc 32->64)
+[HEAP] 28MB used (alloc=727552 bytes)
+[syscall] no row for x86_64 nr=436 — returning ENOSYS (add it to akuma-syscalls-abi's table)
+[threads] new high-water: 26 live user threads (terminated=0 free=486 ceiling=512)
+[HEAP-R] 30MB used (realloc 1320->2640)
+[HEAP] 33MB used (alloc=65536 bytes)
+[herd] reaped 3 orphaned process(es)
+  dns: 1.1.1.1: no reply before timeout
+[bkls>] core=8 ticket=242855 serving=242854 owner=4 spins=1048576
+[bkls>] core=8 ticket=242855 serving=242854 owner=4 spins=2097152
+[bkls>] core=8 ticket=242855 serving=242854 owner=4 spins=4194304
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (19 differ), polls 37 (1 timed out), 111063 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004d00002b got 0x00000000e300002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000207d4 got 0x0000000000020399
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cac3 got 0x000000000002c4f2
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40999 got 0x0000000002e40985
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66b got 0x00000000008cd66c
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000a0000 got 0x0000000000060000
+[rtw]   op 186 reg 0x00000000000142c4 want 0x0000000000280280 got 0x0000000000a80280
+[rtw]   op 188 reg 0x0000000000014c14 want 0x0000000000000909 got 0x0000000000001929
+[bkls>] core=1 ticket=260312 serving=260311 owner=2 spins=1048576
+[rtw] chan (switch): 1514 ops, 886 writes, 0 h2c, checks 565 (35 differ), polls 45 (0 timed out), 26862 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000a200002b got 0x00000000c900002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x000000000001fe4f got 0x00000000000208e3
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002bdac got 0x000000000002cc38
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e4096c got 0x0000000002e4099e
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66d got 0x00000000008cd66a
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000010000 got 0x00000000000b0000
+[rtw]   op 188 reg 0x0000000000014c14 want 0x0000000000000151 got 0x0000000000000909
+[rtw]   op 192 reg 0x0000000000014cd8 want 0x0000000000000151 got 0x0000000000000909
+  dns: 8.8.8.8: no reply before timeout
+  clock: retry: could not resolve pool.ntp.org via 1.1.1.1
+  mem:  heap 34277/1048576 KiB (peak 35228), pmm 12517 MiB free
+[bkls>] core=3 ticket=286804 serving=286803 owner=4 spins=1048576
+[bkls>] core=3 ticket=286804 serving=286803 owner=4 spins=2097152
+[bkls>] core=3 ticket=286804 serving=286803 owner=4 spins=4194304
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (2 differ), polls 37 (1 timed out), 111406 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004b00002b got 0x000000004300002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x000000004b00002b got 0x000000004300002b
+[rtw]   op 1424 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=7 ticket=296205 serving=296204 owner=8 spins=1048576
+[rtw] chan (switch): 1514 ops, 886 writes, 0 h2c, checks 565 (10 differ), polls 45 (0 timed out), 26791 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000bc00002b got 0x00000000a500002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x00000000bc00002b got 0x00000000a500002b
+[rtw]   op 1466 reg 0x0000000000011aec want 0x0000000000011f67 got 0x0000000000020e8a
+[rtw]   op 1467 reg 0x0000000000011acc want 0x0000000000000000 got 0x0000000000800000
+[rtw]   op 1468 reg 0x0000000000011ad0 want 0x0000000002903299 got 0x00000000064f218c
+[rtw]   op 1469 reg 0x0000000000011ad4 want 0x000000000cb9172f got 0x0000000004f011fc
+[rtw]   op 1472 reg 0x0000000000011ae0 want 0x0000000000400010 got 0x0000000000380010
+[rtw]   op 1473 reg 0x0000000000011ae4 want 0x0000000010f9282a got 0x000000000c002446
+[bkls>] core=6 ticket=296210 serving=296209 owner=1 spins=2097152
+[bkls>] core=6 ticket=305330 serving=305329 owner=3 spins=1048576
+[bkls>] core=6 ticket=305330 serving=305329 owner=3 spins=2097152
+[bkls>] core=6 ticket=305330 serving=305329 owner=3 spins=4194304
+[rtw] chan (switch): 1439 ops, 865 writes, 0 h2c, checks 525 (3 differ), polls 37 (1 timed out), 111518 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000b300002b got 0x00000000df00002b
+[rtw]   op 717 reg 0x000000000000ce40 want 0x00000000b300002b got 0x00000000df00002b
+[rtw]   op 897 reg 0x00000000000142ac want 0x0000000022ce803c got 0x0000000022ce8026
+[rtw]   op 1438 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=7 ticket=314681 serving=314680 owner=1 spins=1048576
+[bkls>] core=7 ticket=314681 serving=314680 owner=1 spins=2097152
+[bkls>] core=7 ticket=314681 serving=314680 owner=1 spins=4194304
+[rtw] chan (switch): 1453 ops, 872 writes, 0 h2c, checks 532 (27 differ), polls 37 (1 timed out), 91840 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000e100002b got 0x000000001c00002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x0000000000020399 got 0x000000000002028a
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002c4f2 got 0x000000000002c37e
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40985 got 0x0000000002e40980
+[rtw]   op 148 reg 0x0000000000010734 want 0x0000000000060000 got 0x0000000000050000
+[rtw]   op 186 reg 0x00000000000142ac want 0x0000000022ce8026 got 0x0000000022ce8066
+[rtw]   op 190 reg 0x0000000000014c14 want 0x0000000000001929 got 0x0000000000001939
+[rtw]   op 200 reg 0x0000000000014cd8 want 0x0000000000001929 got 0x0000000000001939
+[bkls>] core=1 ticket=323986 serving=323985 owner=2 spins=1048576
+[rtw] chan (switch): 1540 ops, 901 writes, 0 h2c, checks 579 (10 differ), polls 45 (0 timed out), 25606 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000007100002b got 0x000000006100002b
+[rtw]   op 731 reg 0x000000000000ce40 want 0x000000007100002b got 0x000000006100002b
+[rtw]   op 1492 reg 0x0000000000011aec want 0x0000000000012581 got 0x00000000000214dc
+[rtw]   op 1493 reg 0x0000000000011acc want 0x0000000000000000 got 0x00000000047b0000
+[rtw]   op 1494 reg 0x0000000000011ad0 want 0x000000000d862f96 got 0x0000000005361794
+[rtw]   op 1495 reg 0x0000000000011ad4 want 0x000000000f662656 got 0x000000000b010876
+[rtw]   op 1498 reg 0x0000000000011ae0 want 0x00000000003d000f got 0x0000000000370010
+[rtw]   op 1499 reg 0x0000000000011ae4 want 0x000000000e9c58c5 got 0x000000000b2e1c10
+[bkls>] core=2 ticket=333092 serving=333091 owner=1 spins=1048576
+[bkls>] core=2 ticket=333092 serving=333091 owner=1 spins=2097152
+[bkls>] core=2 ticket=333092 serving=333091 owner=1 spins=4194304
+[rtw] chan (switch): 1439 ops, 865 writes, 0 h2c, checks 525 (2 differ), polls 37 (1 timed out), 111451 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000a900002b got 0x00000000fa00002b
+[rtw]   op 731 reg 0x000000000000ce40 want 0x00000000a900002b got 0x00000000fa00002b
+[rtw]   op 1438 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[bkls>] core=3 ticket=342090 serving=342089 owner=4 spins=1048576
+[rtw] chan (switch): 1512 ops, 886 writes, 0 h2c, checks 565 (10 differ), polls 45 (0 timed out), 26415 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000ed00002b got 0x000000002f00002b
+[rtw]   op 718 reg 0x000000000000ce40 want 0x00000000ed00002b got 0x000000002f00002b
+[rtw]   op 1464 reg 0x0000000000011aec want 0x000000000001135f got 0x0000000000020e99
+[rtw]   op 1465 reg 0x0000000000011acc want 0x0000000000000000 got 0x0000000002510000
+[rtw]   op 1466 reg 0x0000000000011ad0 want 0x00000000014d18ad got 0x00000000043006d3
+[rtw]   op 1467 reg 0x0000000000011ad4 want 0x0000000007620fcc got 0x0000000006680536
+[rtw]   op 1470 reg 0x0000000000011ae0 want 0x0000000000430010 got 0x00000000003b0010
+[rtw]   op 1471 reg 0x0000000000011ae4 want 0x0000000006f31759 got 0x00000000053c0cb5
+[bkls>] core=5 ticket=351414 serving=351413 owner=6 spins=1048576
+[rtw] chan (switch): 1512 ops, 886 writes, 0 h2c, checks 565 (19 differ), polls 45 (0 timed out), 26306 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x00000000da00002b got 0x000000007600002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000208e3 got 0x00000000000207d4
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cc38 got 0x000000000002cac3
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e4099e got 0x0000000002e40999
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66a got 0x00000000008cd66b
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000b0000 got 0x00000000000a0000
+[rtw]   op 397 reg 0x0000000000010378 want 0x0000000000000118 got 0x0000000000000142
+[rtw]   op 400 reg 0x0000000000010370 want 0x000000009ee00000 got 0x0000000094280000
+[bkls>] core=1 ticket=351415 serving=351414 owner=5 spins=2097152
+[bkls>] core=5 ticket=360329 serving=360328 owner=7 spins=1048576
+[bkls>] core=5 ticket=360329 serving=360328 owner=7 spins=2097152
+[bkls>] core=5 ticket=360329 serving=360328 owner=7 spins=4194304
+[rtw] chan (switch): 1440 ops, 865 writes, 0 h2c, checks 525 (2 differ), polls 37 (1 timed out), 111604 us
+[rtw]   op 7 reg 0x000000000000ce40 want 0x000000005600002b got 0x00000000b000002b
+[rtw]   op 718 reg 0x000000000000ce40 want 0x000000005600002b got 0x00000000b000002b
+[rtw]   op 1439 reg 0x00000000000000ac want 0x0000000000000080 got 0x0000000000000003
+[rtw] scan: 255 beacons, 24 networks
+[rtw]   bss 5e:72:cd:xx:xx:xx ch 1 ssid#a6b3e266 wpa2-psk
+[rtw]   bss 94:3c:96:xx:xx:xx ch 1 ssid#305a7ee6 wpa2-psk
+[rtw]   bss 20:97:27:xx:xx:xx ch 2 ssid#ef0d903e wpa2-psk
+[rtw]   bss c8:70:23:xx:xx:xx ch 1 ssid#c9ba36ff wpa2-psk
+[rtw]   bss 4a:3f:da:xx:xx:xx ch 1 ssid#a4a63da6 open
+[rtw]   bss 12:67:62:xx:xx:xx ch 1 ssid#8ba7c8e1 wpa2-psk
+[rtw]   bss cc:19:a8:xx:xx:xx ch 1 ssid#72cc11ed wpa2-psk
+[rtw]   bss 72:d5:ed:xx:xx:xx ch 1 ssid#329ba75b wpa2-psk
+[rtw]   bss bc:d5:ed:xx:xx:xx ch 1 ssid#329ba75b wpa2-psk
+[rtw]   bss 92:d8:e5:xx:xx:xx ch 1 ssid#058add01 wpa2-psk
+[rtw]   bss b8:fb:b3:xx:xx:xx ch 1 ssid#6e452639 other
+[rtw]   bss 1c:57:3e:xx:xx:xx ch 1 ssid#b0b6418f open
+[rtw]   bss d8:78:7f:xx:xx:xx ch 1 ssid#b0b6418f open
+[rtw]   bss da:d8:e5:xx:xx:xx ch 1 ssid#68266439 wpa2-psk
+[rtw]   bss 00:f8:cc:xx:xx:xx ch 6 ssid#5252c105 wpa2-psk
+[rtw]   bss 00:f8:cc:xx:xx:xx ch 6 ssid#7d2028cf wpa2-psk
+[rtw]   bss 10:2b:aa:xx:xx:xx ch 6 ssid#137fe768 wpa2-psk
+[rtw]   bss 9c:e5:49:xx:xx:xx ch 6 ssid#c9577d26 wpa2-psk
+[rtw]   bss 00:b8:c2:xx:xx:xx ch 6 ssid#919d7c55 wpa2-psk
+[rtw]   bss c4:65:16:xx:xx:xx ch 6 ssid#9b1b4711 wpa2-psk
+[rtw]   bss d0:cf:0e:xx:xx:xx ch 4 ssid#862eb32e wpa2-psk
+[rtw]   bss da:d8:e5:xx:xx:xx ch 11 ssid#0806e212 wpa2-psk
+[rtw]   bss 04:4a:69:xx:xx:xx ch 11 ssid#0c455aae wpa2-psk
+[rtw]   bss a4:91:b1:xx:xx:xx ch 11 ssid#2ce1df73 wpa2-psk
+[rtw] join: bss a4:91:b1:xx:xx:xx ch 11 ssid#2ce1df73
+[rtw] join attempt 1
+[bkls>] core=3 ticket=369854 serving=369853 owner=2 spins=1048576
+[bkls>] core=3 ticket=369854 serving=369853 owner=2 spins=2097152
+[bkls>] core=3 ticket=369854 serving=369853 owner=2 spins=4194304
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (14 differ), polls 37 (1 timed out), 111255 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004d00002b got 0x000000001500002b
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000207d4 got 0x0000000000020b00
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cac3 got 0x000000000002cf21
+[rtw]   op 128 reg 0x0000000000014e30 want 0x0000000002e40999 got 0x0000000002e409a8
+[rtw]   op 130 reg 0x0000000000014974 want 0x00000000008cd66b got 0x00000000008cd66a
+[rtw]   op 148 reg 0x0000000000010734 want 0x00000000000a0000 got 0x00000000000d0000
+[rtw]   op 186 reg 0x00000000000142c4 want 0x0000000000280280 got 0x0000000000a80280
+[rtw]   op 188 reg 0x0000000000014c14 want 0x0000000000000909 got 0x0000000000001939
+[bkls>] core=3 ticket=369854 serving=369853 owner=2 spins=8388608
+[rtw] join2 (prepare): 4072 ops, 1693 writes, 9 h2c, checks 1787 (52 differ), polls 550 (0 timed out), 38391 us
+[rtw]   op 20 reg 0x00000000000000ac want 0x00000000c000000b got 0x0000000000000003
+[rtw]   op 649 reg 0x00000000000000ac want 0x000000004000200b got 0x0000000080000003
+[rtw]   op 654 reg 0x00000000000000ac want 0x000000004000200b got 0x0000000080000003
+[rtw]   op 1967 reg 0x00000000000000ac want 0x00000000c000280b got 0x0000000000000003
+[rtw]   op 2050 reg 0x0000000000015838 want 0x0000000002004121 got 0x0000000002001121
+[rtw]   op 2054 reg 0x0000000000015858 want 0x0000000002004121 got 0x0000000002000121
+[rtw]   op 2056 reg 0x0000000000015860 want 0x0000000002004121 got 0x0000000002000121
+[rtw]   op 2260 reg 0x0000000000015828 want 0x0000000002004121 got 0x0000000002001121
+[BKL] stuck: owner=2 waiter=8 tag=501 serving=369853 folded=1 (aff0+1)
+[rtw] chan (switch): 1425 ops, 858 writes, 0 h2c, checks 518 (36 differ), polls 37 (1 timed out), 110922 us
+[rtw]   op 6 reg 0x000000000000ce40 want 0x000000004d00002b got 0x000000003700002b
+[rtw]   op 10 reg 0x0000000000015818 want 0x00000000082c1800 got 0x00000000182c18e8
+[rtw]   op 12 reg 0x0000000000015820 want 0x0000000000000080 got 0x0000000080000080
+[rtw]   op 14 reg 0x0000000000017818 want 0x00000000082c1800 got 0x00000000182c18e8
+[rtw]   op 16 reg 0x0000000000017820 want 0x0000000000000080 got 0x0000000080000080
+[rtw]   op 29 reg 0x0000000000010704 want 0x00000000601c0502 got 0x00000000601e0502
+[rtw]   op 38 reg 0x0000000000014a1c want 0x00000000000207d4 got 0x00000000000208e3
+[rtw]   op 40 reg 0x0000000000014a20 want 0x000000000002cac3 got 0x000000000002cc38
+[rtw] auth tx: idx 0x0000000000000001 -> 0x0000000000010001, release reports +0 status done, dmac_err 0x0000000000000000 idct 0x0000000000000000; rx total 1982 bad 0 crc 0 idx 0x0000000000c000be; heard 1, from ap 1, mgmt to us 1, to us 1; answer a1 hit; ap fc b0x1
+[rtw] auth: accepted
+[rtw] assoc tx: idx 0x0000000000010002 -> 0x0000000000020002, release reports +1 status done, dmac_err 0x0000000000000000 idct 0x0000000000000000; rx total 1992 bad 0 crc 0 idx 0x0000000000c800c8; heard 5, from ap 2, mgmt to us 2, to us 4; answer a1 hit; ap fc b0x1 10x1
+[rtw] assoc: accepted, aid 1
+[rtw] join3 (associated): 28 ops, 3 writes, 15 h2c, checks 4 (1 differ), polls 0 (0 timed out), 2450 us
+[rtw]   op 11 reg 0x00000000000000ac want 0x000000004000208b got 0x0000000080000003
+[rtw] eapol: message 1 answered (a1 hit)
+[rtw] join4 (keys): 18 ops, 2 writes, 9 h2c, checks 2 (2 differ), polls 0 (0 timed out), 15501 us
+[rtw]   op 5 reg 0x00000000000000ac want 0x00000000c000208b got 0x0000000000000003
+[rtw]   op 9 reg 0x00000000000000ac want 0x000000004000208b got 0x0000000080000003
+[rtw] eapol: message 3 answered, keys installed, group key id 2
+[bkls>] core=3 ticket=374187 serving=374186 owner=2 spins=1048576
+[rtw] link: rx data 0 amsdu 0/0 clear 0 undecrypted 0 replayed 0 unparsed 0 -> stack 0 (dropped 0); tx 1 failed 0 (stack dropped 0); released done 3 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 0 tx 0 rst rx 0 tx 0; laps 6 max gap 6014 ms
+[SmolNet] DHCP configured
+[SmolNet] IP: 192.168.1.159/24
+[herd] Reloading config...
+  mem:  heap 34471/1048576 KiB (peak 35228), pmm 12517 MiB free
+[kbd] polls=1500 st=0x1c or=0x1c scancodes=0
+  clock: synced via SNTP (pool.ntp.org, retry)
+  clock: CMOS RTC written from SNTP (2026-10-22 11:55 UTC) and read back
+[rtw] tcp rx 59695 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 59695 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[rtw] tcp rx 59695 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp rx 59695 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp rx 59695 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp rx 59695 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp rx 59704 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp rx 59704 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 59704 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[rtw] tcp rx 59695 -> 2222 RST | ip len 40 of 40 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[PSTATS] PID 1 (/bin/herd) 19.76s: 2353 syscalls (119/s) in_kernel=39225ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=190(19585ms) nanosleep=190(19585ms) nr315=1(35ms) nr1=67(8ms) nr258=9(3ms) mkdirat=9(3ms) io_setup=1175(1ms) nr257=28(1ms) getdents64=197(0ms) nr217=4(0ms)
+[PSTATS] PID 2 (/bin/sh) 19.68s: 358 syscalls (18/s) in_kernel=88ms pmm=3204474free/3608622tot retired=0/0p pgfault=92(92pg) | getdents64=14(36ms) wait4=12(36ms) io_setup=43(6ms) nr4=12(2ms) nr7=10(2ms) close=33(1ms) nr2=10(1ms) epoll_create1=2(0ms) nr217=2(0ms) nr9=24(0ms)
+[PSTATS] PID 13 (/bin/wifi) 19.63s: 481 syscalls (24/s) in_kernel=32993ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=61(16495ms) nanosleep=61(16495ms) nr257=68(1ms) getdents64=2(0ms) nr217=2(0ms) io_setup=144(0ms) nr3=68(0ms) close=68(0ms) nr1=5(0ms) nr9=1(0ms)
+[PSTATS] PID 9 (/usr/bin/bash) 19.64s: 560 syscalls (28/s) in_kernel=4348ms pmm=3204474free/3608622tot retired=0/0p pgfault=208(208pg) | getdents64=15(2161ms) wait4=15(2161ms) io_setup=22(9ms) close=25(7ms) nr2=8(4ms) nr9=28(2ms) nr4=6(0ms) nr8=11(0ms) epoll_create1=4(0ms) nr5=6(0ms)
+[PSTATS] PID 10 (/bin/klogd) 19.64s: 158 syscalls (8/s) in_kernel=36227ms pmm=3204474free/3608622tot retired=0/0p pgfault=66(66pg) | unlinkat=10(18008ms) nanosleep=10(18008ms) nr257=16(193ms) nr1=24(6ms) nr264=13(3ms) nr38=13(3ms) nr162=10(1ms) nr81=10(1ms) nr103=10(0ms) nr258=3(0ms)
+[PSTATS] PID 11 (/bin/powersaved) 19.64s: 150 syscalls (7/s) in_kernel=38008ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=20(19000ms) nanosleep=20(19000ms) io_setup=20(3ms) nr5=21(2ms) nr257=21(0ms) nr3=21(0ms) nr9=1(0ms) close=21(0ms) nr1=5(0ms)
+[PSTATS] PID 12 (/bin/sshd) 19.63s: 53812 syscalls (2740/s) in_kernel=38600ms pmm=3204474free/3608622tot retired=0/0p pgfault=0(0pg) | unlinkat=17541(19295ms) nanosleep=17541(19287ms) nr43=17543(13ms) truncate=1092(1ms) io_setup=15(0ms) nr257=6(0ms) nr44=14(0ms) nr1=28(0ms) nr318=1(0ms) getrandom=1(0ms)
+[bkls>] core=4 ticket=803105 serving=803104 owner=2 spins=1048576
+[PSTATS] PID 843 (/usr/bin/sleep) 17.45s: 36 syscalls (2/s) in_kernel=0ms pmm=3204474free/3608622tot retired=0/0p pgfault=15(15pg) | pipe2=1(0ms) nr3=1(0ms) nr10=3(0ms) nr13=6(0ms) nr14=3(0ms) rt_sigaction=6(0ms) rt_sigprocmask=3(0ms) nr218=2(0ms) nr9=1(0ms) nr12=2(0ms)
+[PSTATS] PID 818 (/usr/bin/sshd) 18.49s: 64 syscalls (3/s) in_kernel=1ms pmm=3204474free/3608622tot retired=0/0p pgfault=15(15pg) | nr2=3(0ms) epoll_create1=2(0ms) nr50=1(0ms) nr49=2(0ms) nr9=2(0ms) nr3=4(0ms) nr41=3(0ms) close=4(0ms) fstat=1(0ms) io_setup=1(0ms)
+[FAULTSTAT] n=5563 bkl_wait=840ns service=6771ns
+[FAULTSTAT] file_faults=4650 pages=15559 shared=11671 file_service=7867ns
+[IDLESTAT] halts=165405 shots=13 shot_ticks_credited=0
+  mem:  heap 33665/1048576 KiB (peak 35375), pmm 12517 MiB free
+[herd] Reloading config...
+[kbd] polls=3000 st=0x1c or=0x1c scancodes=0
+  mem:  heap 33921/1048576 KiB (peak 35375), pmm 12517 MiB free
+[rtw] link: rx data 112 amsdu 0/0 clear 0 undecrypted 0 replayed 1 unparsed 0 -> stack 110 (dropped 0); tx 29 failed 0 (stack dropped 0); released done 25 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 7 tx 2 rst rx 1 tx 0; laps 12522 max gap 28 ms
+[rtw] join4 (group rekey): 6 ops, 0 writes, 3 h2c, checks 0 (0 differ), polls 0 (0 timed out), 365 us
+[rtw] link: rx data 112 amsdu 0/0 clear 0 undecrypted 0 replayed 1 unparsed 0 -> stack 110 (dropped 0); tx 29 failed 0 (stack dropped 0); released done 25 retry-limit 0 lifetime 0 dropped 0; tcp syn rx 7 tx 2 rst rx 1 tx 0; laps 12522 max gap 28 ms
+[rtw] tcp rx 59711 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
+[rtw] tcp tx 2222 -> 59711 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[rtw] tcp tx 2222 -> 59711 SYN+ACK | ip len 52 of 52 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.159 > 192.168.1.203
+[rtw] tcp rx 59711 -> 2222 SYN | ip len 64 of 64 ttl 64 df 1 ipsum ok tcpsum ok 192.168.1.203 > 192.168.1.159
