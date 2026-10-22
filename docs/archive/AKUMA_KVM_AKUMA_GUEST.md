@@ -84,7 +84,7 @@ the run on the line's last words (`run by Akuma`).
 ## Two virtual processors (phase 11, 2026-10-22)
 
 `kvmtest kvmsmp` (`/boot/kvm-guest` = `akuma-smp`): the busybox guest with two vCPUs, run in
-turn on the host core. **Rehearsed under QEMU TCG only — not yet on the metal.**
+turn on the host core. Rehearsed under QEMU TCG, then **PASSED ON THE METAL** (below).
 
 What it took, in the order it was found:
 
@@ -109,6 +109,7 @@ What it took, in the order it was found:
 | where | result |
 |---|---|
 | QEMU TCG, `SMP=1 scripts/kvm/akuma_rehearse.sh` x7 | **PASS** every time: `guest cpus: 2`, `/wtest` md5 `71277886…` (host `debugfs`), clean `e2fsck`, 2-3 or ~255 IPIs, 45-305 `HLT`s |
+| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma-smp`, kernel `89cea0b4`) | **PASS** (`banner=yes, init=yes, smp=yes`): `cpu 1 started at 00008000`, `smp:  2 cpus online`, 15 769 exits, 2 IPIs (INIT, STARTUP), 2 557 `PAUSE` yields, 18 `HLT`s, 50 virtual interrupts. Log: [`AMD64_KVMTEST_PHASE11_SMP_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE11_SMP_METAL_DMESG_2026_10_22.txt). Distinct ASIDs per vCPU therefore work on real silicon. |
 | QEMU TCG, one-vCPU Akuma and hello guests | unchanged **PASS** |
 | the Linux guests | not rerun (no `vmlinux` off the metal); their path differs only by one-element arrays |
 
@@ -163,7 +164,7 @@ separates "a datagram arrived" from "a timeout elapsed"). Without `NETPROBE` the
   deadline — [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Phase 10.)
 * No IOAPIC, no PCI, no route from the gateway to anywhere (no TCP, no DNS answers). SMP (above) is cooperative multiplexing on one host
   core, not parallel: two vCPUs run at most one core's worth. Not yet run on the metal.
-* ASIDs are distinct per vCPU but untested on real hardware (TCG ignores them).
+* The SMP run on the metal is one data point (a short busybox script); a long multi-process load on both vCPUs has not been run.
 * The guest's `HLT` with `IF` clear stops the run (same as the Linux guest).
 
 ## Background
