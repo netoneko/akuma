@@ -65,6 +65,17 @@ const AKUMA_DISK_ARGS: &str = " virtio_mmio.device=4K@0xd0000000:5 init=/bin/bus
 /// [`AKUMA_DISK_ARGS`] and then the NIC's window.
 const AKUMA_NET_ARGS: &str =
     " virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6 init=/bin/busybox initargs=sh,/etc/guest.sh";
+/// The Gentoo guest: [`AKUMA_NET_ARGS`]' devices, but `bash` runs a script that lives in the
+/// image. (Comma-separated, like `initargs=sh,/etc/guest.sh`; there is one argument.)
+const GENTOO_ARGS: &str =
+    " virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6 init=/usr/bin/bash initargs=/akuma-kvm-init.sh";
+/// Bytes copied per read while loading a RAM disk.
+const CHUNK_COPY: usize = 1 << 20;
+/// The Gentoo guest's disk: an ext2 image on the host's root, **copied into RAM** when the
+/// guest starts. Writes land in the copy and are gone when the guest stops.
+const GENTOO_IMAGE_PATH: &str = "/boot/gentoo-guest.img";
+/// The port the Gentoo guest's OpenSSH listens on (box 0's configuration on p7).
+const GENTOO_SSH_PORT: u16 = 4444;
 /// The service guest's disk image (sshd, its keys) when the machine has no second virtio-blk.
 const AKUMA_SERVE_IMAGE_PATH: &str = "/boot/akuma-serve-root.img";
 /// The Akuma guest's disk when the machine has no second virtio-blk device.
@@ -140,17 +151,33 @@ pub enum Guest {
     /// forwarded to it ([`super::relay`]). It has no budgets: it runs until the guest
     /// stops or the host does.
     AkumaServe,
+    /// [`Guest::AkumaServe`] with Gentoo (the ext2 image at [`GENTOO_IMAGE_PATH`], held in RAM)
+    /// as its root: `bash` as init, OpenSSH on [`GENTOO_SSH_PORT`] forwarded to the host.
+    AkumaGentoo,
 }
 
 impl Guest {
     /// Is this a guest that runs for as long as the host does (as a background task)?
     pub const fn is_service(self) -> bool {
-        matches!(self, Self::AkumaServe)
+        matches!(self, Self::AkumaServe | Self::AkumaGentoo)
+    }
+
+    /// The port on the guest the host's forward connects to.
+    pub const fn guest_port(self) -> u16 {
+        match self {
+            Self::AkumaGentoo => GENTOO_SSH_PORT,
+            _ => 22,
+        }
+    }
+
+    /// Is the disk copied into RAM (rather than read from its backing store as needed)?
+    const fn disk_in_ram(self) -> bool {
+        matches!(self, Self::AkumaGentoo)
     }
 
     /// Does the guest have a NIC?
     const fn has_net(self) -> bool {
-        matches!(self, Self::AkumaNet | Self::AkumaServe)
+        matches!(self, Self::AkumaNet | Self::AkumaServe | Self::AkumaGentoo)
     }
 
     /// How many virtual processors the guest has.
@@ -163,7 +190,7 @@ impl Guest {
 
     /// Is the guest this kernel's own ELF (as opposed to a Linux `vmlinux`)?
     const fn is_akuma(self) -> bool {
-        matches!(self, Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe)
+        matches!(self, Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe | Self::AkumaGentoo)
     }
 
     const fn is_linux(self) -> bool {
@@ -178,14 +205,14 @@ impl Guest {
     const fn path(self) -> &'static str {
         match self {
             Self::Linux | Self::LinuxApic => LINUX_PATH,
-            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe => AKUMA_PATH,
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe | Self::AkumaGentoo => AKUMA_PATH,
         }
     }
 
     const fn ram_bytes(self) -> u64 {
         match self {
             Self::Linux | Self::LinuxApic => RAM_BYTES,
-            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe => AKUMA_RAM_BYTES,
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe | Self::AkumaGentoo => AKUMA_RAM_BYTES,
         }
     }
 
@@ -194,6 +221,7 @@ impl Guest {
             Self::Linux | Self::LinuxApic => DISK_IMAGE_PATH,
             Self::Akuma | Self::AkumaSmp | Self::AkumaNet => AKUMA_DISK_IMAGE_PATH,
             Self::AkumaServe => AKUMA_SERVE_IMAGE_PATH,
+            Self::AkumaGentoo => GENTOO_IMAGE_PATH,
             Self::AkumaHello => HELLO_DISK_IMAGE_PATH,
         }
     }
@@ -202,7 +230,7 @@ impl Guest {
     const fn banner(self) -> &'static [u8] {
         match self {
             Self::Linux | Self::LinuxApic => b"Linux version",
-            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe => b"Akuma/amd64",
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe | Self::AkumaGentoo => b"Akuma/amd64",
         }
     }
 
@@ -213,7 +241,7 @@ impl Guest {
             Self::Linux | Self::LinuxApic => None,
             Self::Akuma | Self::AkumaSmp | Self::AkumaNet => Some(b"AKUMA-GUEST-DONE"),
             // A service never finishes; the line that says its sshd is up is the milestone.
-            Self::AkumaServe => Some(b"AKUMA-GUEST-SSHD-STARTED"),
+            Self::AkumaServe | Self::AkumaGentoo => Some(b"AKUMA-GUEST-SSHD-STARTED"),
             Self::AkumaHello => Some(b"run by Akuma"),
         }
     }
@@ -227,6 +255,7 @@ impl Guest {
             Self::AkumaSmp => "akuma-smp",
             Self::AkumaNet => "akuma-net",
             Self::AkumaServe => "akuma-serve",
+            Self::AkumaGentoo => "akuma-gentoo",
         }
     }
 }
@@ -438,21 +467,65 @@ enum HostDisk {
     Virtio(usize),
     /// A file on the host's filesystem, preallocated.
     File(&'static str),
+    /// A copy of an image file held in contiguous host frames from `base`, `bytes` long. Never
+    /// freed: it exists for a service guest that lasts as long as the host does, and a guest
+    /// that fails to start leaks it until the next boot.
+    Mem { base: u64, bytes: u64 },
 }
 
 impl HostDisk {
     /// The disk to give the guest, if the machine has one.
-    fn pick(file: &'static str) -> Option<Self> {
+    fn pick(file: &'static str, in_ram: bool) -> Option<Self> {
+        if in_ram {
+            return Self::load_into_ram(file);
+        }
         if akuma_virtio::block::device_count() > 1 && akuma_virtio::block::device_name(1).is_some() {
             return Some(Self::Virtio(1));
         }
         akuma_vfs_glue::file_size(file).ok().filter(|&n| n >= virtio::SECTOR).map(|_| Self::File(file))
     }
 
+    /// Copy the whole of `file` into freshly allocated contiguous frames, 1 MiB at a time.
+    fn load_into_ram(file: &'static str) -> Option<Self> {
+        let bytes = akuma_vfs_glue::file_size(file).ok().filter(|&n| n >= virtio::SECTOR)? as u64;
+        let pages = bytes.div_ceil(4096) as usize;
+        let Some(base) = akuma_pmm::alloc_pages_contiguous_zeroed(pages) else {
+            p("[KVM] linux: no contiguous frames for the RAM copy of ");
+            p(file);
+            p("\n");
+            return None;
+        };
+        let mut buf = alloc::vec::Vec::new();
+        if buf.try_reserve_exact(CHUNK_COPY).is_err() {
+            akuma_pmm::free_pages_contiguous(base, pages);
+            return None;
+        }
+        buf.resize(CHUNK_COPY, 0u8);
+        p("[KVM] linux: copying ");
+        p(file);
+        p(" (");
+        dec(bytes >> 20);
+        p(" MiB) into RAM\n");
+        let mut off = 0u64;
+        while off < bytes {
+            let n = ((bytes - off) as usize).min(CHUNK_COPY);
+            let ok = akuma_vfs_glue::read_at(file, off as usize, &mut buf[..n]).is_ok_and(|got| got == n)
+                && akuma_mmu::copy_to_phys(base + off as usize, &buf[..n]);
+            if !ok {
+                p("[KVM] linux: reading the image failed\n");
+                akuma_pmm::free_pages_contiguous(base, pages);
+                return None;
+            }
+            off += n as u64;
+        }
+        Some(Self::Mem { base: base as u64, bytes })
+    }
+
     const fn what(self) -> &'static str {
         match self {
             Self::Virtio(_) => "second virtio-blk device",
             Self::File(path) => path,
+            Self::Mem { .. } => "RAM copy of the image",
         }
     }
 }
@@ -462,6 +535,7 @@ impl Disk for HostDisk {
         match *self {
             Self::Virtio(i) => akuma_virtio::block::with_device_at(i, |d| d.capacity_sectors()).unwrap_or(0),
             Self::File(path) => akuma_vfs_glue::file_size(path).map_or(0, |n| n / virtio::SECTOR),
+            Self::Mem { bytes, .. } => bytes / virtio::SECTOR,
         }
     }
 
@@ -469,6 +543,10 @@ impl Disk for HostDisk {
         match *self {
             Self::Virtio(i) => akuma_virtio::block::read_bytes_at(i, offset, dst).is_ok(),
             Self::File(path) => akuma_vfs_glue::read_at(path, offset as usize, dst).is_ok_and(|n| n == dst.len()),
+            Self::Mem { base, bytes } => {
+                offset.checked_add(dst.len() as u64).is_some_and(|end| end <= bytes)
+                    && akuma_mmu::copy_from_phys((base + offset) as usize, dst)
+            }
         }
     }
 
@@ -476,6 +554,10 @@ impl Disk for HostDisk {
         match *self {
             Self::Virtio(i) => akuma_virtio::block::write_bytes_at(i, offset, src).is_ok(),
             Self::File(path) => akuma_vfs_glue::write_at(path, offset as usize, src).is_ok_and(|n| n == src.len()),
+            Self::Mem { base, bytes } => {
+                offset.checked_add(src.len() as u64).is_some_and(|end| end <= bytes)
+                    && akuma_mmu::copy_to_phys((base + offset) as usize, src)
+            }
         }
     }
 
@@ -1272,7 +1354,7 @@ pub fn run(nrips: bool, guest: Guest) {
     // memmap's one RAM entry stopping short of them.
     // With a disk, one more page under the handoff pages holds the ACPI tables
     // and the memory map reports it (type 3) instead of as RAM.
-    let disk = HostDisk::pick(guest.disk_path());
+    let disk = HostDisk::pick(guest.disk_path(), guest.disk_in_ram());
     // Only Linux is told about its disk through ACPI; the Akuma guest finds it on
     // the command line.
     // The SMP guest needs the MADT whatever its disk is.
@@ -1304,6 +1386,7 @@ pub fn run(nrips: bool, guest: Guest) {
         Guest::AkumaSmp => cmdline_with_tsc(&mut cmd, "", 0, if disk.is_some() { AKUMA_DISK_ARGS } else { "" }),
         // The disk's window first, then the NIC's: slot order is device order.
         Guest::AkumaNet | Guest::AkumaServe => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { AKUMA_NET_ARGS } else { NET_ARGS }),
+        Guest::AkumaGentoo => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { GENTOO_ARGS } else { NET_ARGS }),
     };
     match disk {
         Some(d) => {
@@ -1430,7 +1513,7 @@ pub fn run(nrips: bool, guest: Guest) {
         None
     };
     let service = guest.is_service();
-    let mut relay = service.then(|| Relay::new(super::SERVE_PORT.load(core::sync::atomic::Ordering::Relaxed)));
+    let mut relay = service.then(|| Relay::new(super::SERVE_PORT.load(core::sync::atomic::Ordering::Relaxed), guest.guest_port()));
     let mut next_relay_us = 0u64;
     let mut next_status_us = 0u64;
     let mut n_net = 0u64;
@@ -1477,6 +1560,34 @@ pub fn run(nrips: bool, guest: Guest) {
             if now_us >= next_status_us {
                 next_status_us = now_us + 5_000_000;
                 r.status(wire);
+                if r.active() {
+                    // Where the guest is while a relayed connection waits on it: if cpu0 sits
+                    // halted with no timer due and frames queued, nothing is going to wake it.
+                    p("[KVM] guest: cpu0=");
+                    p(match states[0] {
+                        CpuState::Runnable => "run",
+                        CpuState::Halted => "halted",
+                        _ => "other",
+                    });
+                    p(" exits=");
+                    dec(exits);
+                    p(" next_event_in_us=");
+                    match plat.next_event_us(0) {
+                        Some(d) => dec(d.saturating_sub(now_us)),
+                        None => p("none"),
+                    }
+                    p(" gw_queued=");
+                    dec(wire.queued() as u64);
+                    p(" gw_frames_from_guest=");
+                    dec(wire.stats.frames);
+                    p(" gw_lost=");
+                    dec(wire.stats.lost);
+                    p(" gw_ignored=");
+                    dec(wire.stats.ignored);
+                    p(" gw_resets=");
+                    dec(wire.stats.tcp_resets);
+                    p("\n");
+                }
             }
         }
         // Frames the gateway has for the guest go into the buffers it has posted.
@@ -2035,7 +2146,7 @@ fn init_vmcb(page: &mut [u8; 4096], guest: Guest, npt_root: u64, asid: u32) {
     // (nested paging delivers it without an exit), so only Linux's is traced.
     v.set_excp(match guest {
         Guest::Linux | Guest::LinuxApic => excp::UD | excp::GP | excp::PF | excp::DF,
-        Guest::Akuma | Guest::AkumaHello | Guest::AkumaSmp | Guest::AkumaNet | Guest::AkumaServe => excp::UD | excp::GP | excp::DF,
+        Guest::Akuma | Guest::AkumaHello | Guest::AkumaSmp | Guest::AkumaNet | Guest::AkumaServe | Guest::AkumaGentoo => excp::UD | excp::GP | excp::DF,
     });
     v.set_iopm_base(image_pa(static_iopm()));
     v.set_msrpm_base(image_pa(static_msrpm()));

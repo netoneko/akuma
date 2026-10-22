@@ -131,6 +131,13 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
   and finds its disk from `virtio_mmio.device=` on the command line, not ACPI.
 - **The guest never gets the host's root.** Its disk is the machine's *second*
   `akuma_virtio::block` device, else the preallocated file `/boot/guest-root.img`.
+- **A forwarded connection must not depend on one SYN or one 4-tuple.** The gateway's TCP has no
+  retransmit timer and the guest polls its NIC, so a forward slot's source port is a rotating
+  generation (`FWD_GENS`) and the relay re-sends an unanswered SYN (`SYN_RETRY_US`, `SYN_TRIES`)
+  before resetting the client. Incident: [`KVM_RELAY_SYN_STALL.md`](../../archive/KVM_RELAY_SYN_STALL.md).
+- **A service guest's disk may be a RAM copy of a file** (`HostDisk::Mem`, `kvmgentoo`): the guest
+  never touches a host block device, and its writes die with it. A second NVMe window is not the
+  way to give a guest a partition; the driver's single GPT window is p3's on purpose.
 - **Unknown device instructions stop the run.** `mmio::decode` answers `None` for
   anything but the `MOV` family; guessing would corrupt state silently.
 - **Pin layouts against an independent consumer**, not the writer: PVH blobs are
@@ -143,7 +150,7 @@ Runbook: [`../../runbooks/kvm-linux-guest.md`](../../runbooks/kvm-linux-guest.md
 Kernel command line: `kvmtest kvmlinux`, `kvmtest kvmlapic` (Linux with the local APIC) or `kvmtest kvmakuma` (add `noladder` under
 TCG). `kvmhello` is the same guest on a 2 MiB root whose only file is `/bin/hello`.
 `kvmsmp` is the busybox guest with two virtual processors; `kvmnet` (`akuma-net`) the one with a NIC. `kvmlinux` runs an Akuma guest instead when p3's `/boot/kvm-guest` begins with
-`akuma` (busybox root), `akuma-hello`, `akuma-smp`, `akuma-net` or `linux-apic` — the bootloader entry's command line is baked into `grubx64.efi`, so the file
+`akuma` (busybox root), `akuma-hello`, `akuma-smp`, `akuma-net`, `akuma-serve`, `akuma-gentoo` or `linux-apic` — the bootloader entry's command line is baked into `grubx64.efi`, so the file
 is the lever that lets one entry serve both.
 
 ## Background

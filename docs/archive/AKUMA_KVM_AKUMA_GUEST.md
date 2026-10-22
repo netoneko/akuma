@@ -221,6 +221,32 @@ visibility (it now logs per-slot ring and window state every 5 s). Re-run with
 TCP made the guest's `nc` TCP probe pass (`NET=1 TCPPROBE=1`: `tcp echo: akuma-tcp-probe`),
 which the UDP probe never did; see the open item below.
 
+## Gentoo as a guest (phase 14, 2026-10-22)
+
+`kvmgentoo` / `/boot/kvm-guest` = `akuma-gentoo`: the service guest with **Gentoo from the ryzen's p7
+as its root**. `init=/usr/bin/bash initargs=/akuma-kvm-init.sh` (`overlays/ryzen/gentoo/`): set the
+hostname, `ifconfig`, start OpenSSH (p7's own configuration, port 4444); the relay forwards host port
+2223 to the guest's 4444 (`Guest::guest_port`). **On the metal:** `ssh -p 2223 root@<ryzen wifi ip>`
+lands in `akuma-gentoo` — Gentoo Linux, `/dev/vda` 3.0 G, 766 MiB RAM.
+
+Choices worth keeping:
+
+- **The disk is a RAM copy of an image file** (`HostDisk::Mem`): `/boot/gentoo-guest.img` is read
+  once into contiguous frames when the guest starts; the guest cannot touch p7 or p3, and its
+  writes are gone when it stops. No second NVMe window was added (the NVMe driver has exactly one
+  GPT window, p3's, by design).
+- **p7 is never written.** It is `clean with errors` (invalid symlink inodes, mostly under
+  `/var/lib/box/layers`, from the old ext2 bitmap bug), so `mke2fs -d` dies with `EUCLEAN`;
+  `overlays/ryzen/kvm-gentoo-image.sh` reads it with `tar` (3 complaints) into a staging copy and
+  builds the image from that. An `e2fsck -fy -z` repair was deliberately not run.
+- The image is 3 GiB for 1.8 GiB of files; the hypervisor copies it in 1 MiB reads (about a minute
+  at boot, before the guest is entered).
+
+Also this day: the relay's SYN stall ([`KVM_RELAY_SYN_STALL.md`](KVM_RELAY_SYN_STALL.md)), the
+hostname split (`akuma-ryzen` host / `akuma-kvm`, `akuma-gentoo` guests: the host's Gentoo box
+re-set the name to `localhost` from its OpenRC `conf.d/hostname`, so the herd oneshot alone was not
+enough).
+
 ## Still open
 
 * (Fixed 2026-10-22, same day: a guest spinning with `IF` set used to see timer

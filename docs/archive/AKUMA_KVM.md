@@ -183,6 +183,20 @@ Read downwards; the sections below are the reference record.
    ▼   gateway TCP (checked against smoltcp), a host-port relay, the guest run as a pinned
    │   background task. TCG: a real ssh from the Mac reaches the guest's sshd.
    │   [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md) § ssh into the guest
+ [10-22] ═══ THE RELAY WEDGES ON THE METAL, AND IS MADE TO RECOVER ═══  "a SYN sent once, a port reused"
+   │
+   ▼   Three overlapping ssh sessions on two slots left both `connecting` for good on the ryzen;
+   │   TCG never shows it. The gateway's TCP had no retransmit and reused one source port per
+   │   slot. Fresh port per connection, SYN retry after 1.5 s, host tests against smoltcp; 27
+   │   retries and no give-up over ~14 stress rounds. Why the first SYN is lost: still open.
+   │   [`KVM_RELAY_SYN_STALL.md`](KVM_RELAY_SYN_STALL.md)
+ [10-22] ═══ PHASE 14: GENTOO AS A GUEST ═══  "p7's Linux userland under the ryzen's own hypervisor"
+   │
+   ▼   `kvmgentoo`: the Akuma guest kernel with Gentoo (a RAM copy of a 3 GiB image built from p7,
+   │   which is never written) as its root, `bash` as init, OpenSSH on 4444 forwarded to host
+   │   port 2223. METAL: `ssh -p 2223` lands in `akuma-gentoo`, Gentoo Linux, 49 h after the
+   │   first KVM commit (`akuma-svm-amd64`, 10-20 20:32).
+   │   [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md) § Gentoo as a guest
 ```
 
 ---

@@ -22,8 +22,6 @@ use akuma_svm_amd64::gateway::{Gateway, FWD_SLOTS};
 const EAGAIN: i32 = 11;
 /// `shutdown(SHUT_WR)`.
 const SHUT_WR: i32 = 1;
-/// The port on the guest every connection is forwarded to (its sshd).
-const GUEST_PORT: u16 = 22;
 /// Bytes moved per direction per round.
 const CHUNK: usize = 2048;
 /// Rounds per [`Relay::poll`] while bytes keep moving. A poll is rare (the run loop sleeps
@@ -32,6 +30,13 @@ const CHUNK: usize = 2048;
 const ROUNDS: usize = 16;
 /// How long to wait before retrying a listener the host stack refused (µs).
 const RETRY_US: u64 = 1_000_000;
+/// How long a SYN may go unanswered before it is sent again, from a new source port (µs).
+/// The gateway's TCP sends it once and has no timer, and on the ryzen (2026-10-22) a SYN the
+/// guest never answered left the slot `connecting` for good — and with every slot stuck
+/// nothing was accepted, the listen backlog filled and the port began to refuse.
+const SYN_RETRY_US: u64 = 1_500_000;
+/// SYNs sent per connection before the client is refused (reset) and the slot freed.
+const SYN_TRIES: u8 = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -53,11 +58,14 @@ struct Slot {
     up: [u8; CHUNK],
     up_off: usize,
     up_len: usize,
+    /// When the SYN last went out, and how many have.
+    syn_at_us: u64,
+    syn_tries: u8,
 }
 
 impl Slot {
     const fn new() -> Self {
-        Self { sock: 0, phase: Phase::Idle, host_eof: false, guest_eof_passed: false, up: [0; CHUNK], up_off: 0, up_len: 0 }
+        Self { sock: 0, phase: Phase::Idle, host_eof: false, guest_eof_passed: false, up: [0; CHUNK], up_off: 0, up_len: 0, syn_at_us: 0, syn_tries: 0 }
     }
 }
 
@@ -71,10 +79,17 @@ pub struct Counts {
     /// Times the host socket had no room (or no data) when the relay asked.
     pub send_blocked: u64,
     pub recv_idle: u64,
+    /// SYNs sent again after [`SYN_RETRY_US`] of silence, and connections given up on.
+    pub syn_retries: u64,
+    pub syn_gave_up: u64,
+    /// The slowest SYN-to-established time seen (µs): slow answers or lost SYNs?
+    pub connect_us_max: u64,
 }
 
 pub struct Relay {
     port: u16,
+    /// The port on the guest every connection is forwarded to (its sshd).
+    guest_port: u16,
     listener: Option<usize>,
     retry_at_us: u64,
     slots: [Slot; FWD_SLOTS],
@@ -82,9 +97,9 @@ pub struct Relay {
 }
 
 impl Relay {
-    /// A relay for host port `port`; nothing is bound until the first [`Relay::poll`].
-    pub const fn new(port: u16) -> Self {
-        Self { port, listener: None, retry_at_us: 0, slots: [const { Slot::new() }; FWD_SLOTS], counts: Counts { accepted: 0, to_guest: 0, to_host: 0, refused: 0, send_blocked: 0, recv_idle: 0 } }
+    /// A relay for host port `port`, forwarding to `guest_port` on the guest; nothing is bound until the first [`Relay::poll`].
+    pub const fn new(port: u16, guest_port: u16) -> Self {
+        Self { port, guest_port, listener: None, retry_at_us: 0, slots: [const { Slot::new() }; FWD_SLOTS], counts: Counts { accepted: 0, to_guest: 0, to_host: 0, refused: 0, send_blocked: 0, recv_idle: 0, syn_retries: 0, syn_gave_up: 0, connect_us_max: 0 } }
     }
 
     /// Is the listener up?
@@ -137,6 +152,14 @@ impl Relay {
             super::dec(self.counts.send_blocked);
             super::p(" host_recv_idle=");
             super::dec(self.counts.recv_idle);
+            super::p(" syn_tries=");
+            super::dec(u64::from(self.slots[i].syn_tries));
+            super::p(" syn_retries=");
+            super::dec(self.counts.syn_retries);
+            super::p(" gave_up=");
+            super::dec(self.counts.syn_gave_up);
+            super::p(" connect_us_max=");
+            super::dec(self.counts.connect_us_max);
             super::p("\n");
         }
     }
@@ -174,10 +197,12 @@ impl Relay {
             if self.slots[i].phase == Phase::Idle {
                 match socket::socket_accept(listener, true) {
                     Ok((sock, _peer)) => {
-                        if gw.fwd_open(i, GUEST_PORT) {
+                        if gw.fwd_open(i, self.guest_port) {
                             self.slots[i] = Slot::new();
                             self.slots[i].sock = sock;
                             self.slots[i].phase = Phase::Connecting;
+                            self.slots[i].syn_at_us = now_us;
+                            self.slots[i].syn_tries = 1;
                             self.counts.accepted += 1;
                         } else {
                             socket::remove_socket(sock);
@@ -193,11 +218,24 @@ impl Relay {
                 Phase::Idle => {}
                 Phase::Connecting => {
                     if gw.fwd(i).is_established() {
+                        let took = now_us.saturating_sub(self.slots[i].syn_at_us);
+                        self.counts.connect_us_max = self.counts.connect_us_max.max(took);
                         self.slots[i].phase = Phase::Open;
                     } else if gw.fwd(i).is_closed() {
                         // The guest refused (nothing listening yet) or reset.
                         self.counts.refused += 1;
                         self.teardown(i, gw);
+                    } else if now_us.saturating_sub(self.slots[i].syn_at_us) >= SYN_RETRY_US {
+                        if self.slots[i].syn_tries >= SYN_TRIES {
+                            // The guest never answered: reset the client rather than hold the
+                            // slot (and, with every slot held, the listen backlog) for good.
+                            self.counts.syn_gave_up += 1;
+                            self.teardown(i, gw);
+                        } else if gw.fwd_reopen(i) {
+                            self.counts.syn_retries += 1;
+                            self.slots[i].syn_tries += 1;
+                            self.slots[i].syn_at_us = now_us;
+                        }
                     }
                 }
                 Phase::Open => self.pump_open(i, gw),

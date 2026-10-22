@@ -175,7 +175,9 @@ pub fn late(cmdline: &str) {
 /// Which guest the command line (and, for `kvmlinux`, the selector file) asks for.
 fn pick_guest(cmdline: &str) -> Option<linux::Guest> {
     let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
-    if flag("kvmserve") {
+    if flag("kvmgentoo") {
+        Some(linux::Guest::AkumaGentoo)
+    } else if flag("kvmserve") {
         Some(linux::Guest::AkumaServe)
     } else if flag("kvmlapic") {
         Some(linux::Guest::LinuxApic)
@@ -200,6 +202,8 @@ fn pick_guest(cmdline: &str) -> Option<linux::Guest> {
             linux::Guest::AkumaNet
         } else if sel.starts_with(b"akuma-smp") {
             linux::Guest::AkumaSmp
+        } else if sel.starts_with(b"akuma-gentoo") {
+            linux::Guest::AkumaGentoo
         } else if sel.starts_with(b"akuma-serve") {
             linux::Guest::AkumaServe
         } else if sel.starts_with(b"akuma") {
@@ -214,6 +218,8 @@ fn pick_guest(cmdline: &str) -> Option<linux::Guest> {
 
 /// The host port a service guest's sshd is forwarded to (`kvmfwd=<port>`; 2223).
 static SERVE_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(2223);
+/// Which service guest [`spawn_service`] chose, for [`serve_task`] (which takes no arguments).
+static SERVICE_GENTOO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Start the service guest (`kvmserve`, or `akuma-serve` in the selector file) as a
 /// background kernel task pinned to the core that enabled SVM, if one was asked for. Call
@@ -230,6 +236,7 @@ pub fn spawn_service(cmdline: &str) {
     {
         SERVE_PORT.store(port, Ordering::Relaxed);
     }
+    SERVICE_GENTOO.store(pick_guest(cmdline) == Some(linux::Guest::AkumaGentoo), Ordering::Relaxed);
     // Core 0 enabled SVM and owns the host save area (`run` enables it again, idempotently).
     match crate::sched::spawn_daemon_on(serve_task, 0) {
         Some(slot) => {
@@ -242,7 +249,8 @@ pub fn spawn_service(cmdline: &str) {
 }
 
 extern "C" fn serve_task() -> ! {
-    linux::run(NRIPS.load(Ordering::Relaxed), linux::Guest::AkumaServe);
+    let guest = if SERVICE_GENTOO.load(Ordering::Relaxed) { linux::Guest::AkumaGentoo } else { linux::Guest::AkumaServe };
+    linux::run(NRIPS.load(Ordering::Relaxed), guest);
     p("[KVM] service guest ended\n");
     loop {
         crate::sched::yield_now();

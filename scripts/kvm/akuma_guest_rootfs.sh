@@ -50,6 +50,7 @@ if [ -n "${SERVE:-}" ]; then
     printf 'root:x:0:0:root:/root:/bin/sh\n' > "$T/etc/passwd"
 fi
 cat > "$T/etc/guest.sh" <<'SH'
+/bin/busybox hostname akuma-kvm
 /bin/busybox echo AKUMA-GUEST-UP
 /bin/busybox uname -a
 /bin/busybox echo "guest cpus: $(/bin/busybox grep -c '^processor' /proc/cpuinfo)"

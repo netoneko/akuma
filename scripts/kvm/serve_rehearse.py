@@ -19,6 +19,7 @@ ap.add_argument("--wait", type=int, default=900)
 ap.add_argument("--hold", action="store_true")
 ap.add_argument("--bulk", type=int, default=0, help="also upload and download this many KiB through ssh, with md5s")
 ap.add_argument("--port", type=int, default=2223)
+ap.add_argument("--stress", type=int, default=0, help="rounds of overlapping + back-to-back sessions (the wedge shape from the ryzen, 2026-10-22)")
 a = ap.parse_args()
 
 here = os.path.dirname(os.path.abspath(__file__))
@@ -106,6 +107,63 @@ if ok and a.bulk:
     except subprocess.TimeoutExpired:
         print("bulk transfer TIMED OUT")
         ok = False
+if ok and a.stress:
+    # Overlapping sessions (the relay has two slots), then connection churn. A session that
+    # never gets its banner, or a port that stops accepting, is the wedge.
+    base = ["ssh", "-p", str(a.port), "-i", key, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30", "root@127.0.0.1"]
+    for rnd in range(a.stress):
+        t = time.time()
+        ps = [subprocess.Popen(base + [f"sleep {4 + i}; echo s{i}-ok"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for i in range(3)]
+        outs = []
+        for p_ in ps:
+            try:
+                o, e = p_.communicate(timeout=120)
+                outs.append(o.strip() or ("ERR " + e.strip()[-60:]))
+            except subprocess.TimeoutExpired:
+                p_.kill()
+                outs.append("TIMEOUT")
+        bad = [o for i, o in enumerate(outs) if o != f"s{i}-ok"]
+        print(f"stress round {rnd}: overlap x3 {outs} in {time.time() - t:.0f}s")
+        for k in range(3):
+            try:
+                r = subprocess.run(base + ["echo churn-ok"], capture_output=True, text=True, timeout=60)
+                if "churn-ok" not in r.stdout:
+                    bad.append("churn " + r.stderr.strip()[-60:])
+            except subprocess.TimeoutExpired:
+                bad.append("churn TIMEOUT")
+        # Abusive clients, as a flaky link or a killed ssh produces: connect-and-drop, a
+        # hold of more connections than there are slots, and garbage then close.
+        import socket
+        for k in range(8):
+            c = socket.create_connection(("127.0.0.1", a.port), timeout=30)
+            c.close()
+        held = [socket.create_connection(("127.0.0.1", a.port), timeout=30) for _ in range(4)]
+        time.sleep(3)
+        for c in held:
+            try:
+                c.sendall(b"garbage\r\n")
+            except OSError:
+                pass
+        for c in held:
+            c.close()
+        for k in range(3):
+            c = socket.create_connection(("127.0.0.1", a.port), timeout=30)
+            c.sendall(os.urandom(300))
+            c.close()
+        time.sleep(2)
+        for k in range(2):
+            try:
+                r = subprocess.run(base + ["echo after-abuse-ok"], capture_output=True, text=True, timeout=90)
+                if "after-abuse-ok" not in r.stdout:
+                    bad.append("after-abuse " + r.stderr.strip()[-60:])
+            except subprocess.TimeoutExpired:
+                bad.append("after-abuse TIMEOUT")
+        print(f"stress round {rnd}: abuse {'ok' if not bad else bad}")
+        if bad:
+            print("stress WEDGE:", bad)
+            ok = False
+            break
 print("[REHEARSE] akuma-serve:", "PASS" if ok else "FAIL")
 for l in log().splitlines():
     if "[KVM] relay" in l or "service guest" in l:

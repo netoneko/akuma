@@ -50,8 +50,15 @@ pub const DEPTH: usize = 8;
 pub const RING: usize = 8192;
 /// Connections the gateway opens to the guest.
 pub const FWD_SLOTS: usize = 2;
-/// The gateway's source port for forward slot `i` is `FWD_PORT_BASE + i`.
+/// The gateway's source port for forward slot `i`, generation `g`: `FWD_PORT_BASE + i + FWD_SLOTS * g`.
+///
+/// Every [`Gateway::fwd_open`] takes the slot's next
+/// generation, so a connection never reuses the 4-tuple of the one before it: a guest that still
+/// holds that one half-open (a reset lost to a full queue, TIME-WAIT) would ignore the new SYN,
+/// and a SYN is sent once.
 pub const FWD_PORT_BASE: u16 = 40_000;
+/// Source-port generations per slot.
+pub const FWD_GENS: usize = 8;
 /// The TCP and UDP echo port (RFC 862).
 pub const ECHO_PORT: u16 = 7;
 const CONNS: usize = 1 + FWD_SLOTS;
@@ -144,6 +151,8 @@ pub struct Gateway<'a> {
     /// Connections the gateway opened to the guest, and the guest port each targets.
     fwd: [Tcp<'a>; FWD_SLOTS],
     fwd_peer: [u16; FWD_SLOTS],
+    /// The source-port generation each slot's current (or last) connection uses.
+    fwd_gen: [u8; FWD_SLOTS],
     /// Next initial sequence number.
     iss: u32,
     pub stats: Stats,
@@ -316,6 +325,7 @@ impl<'a> Gateway<'a> {
             echo_peer: 0,
             fwd,
             fwd_peer: [0; FWD_SLOTS],
+            fwd_gen: [0; FWD_SLOTS],
             iss: 0x4B1D_0000,
             stats: Stats::new(),
         })
@@ -532,9 +542,11 @@ impl<'a> Gateway<'a> {
             } else {
                 self.reset_for(src, sport, dport, &s);
             }
-        } else if (FWD_PORT_BASE..FWD_PORT_BASE + FWD_SLOTS as u16).contains(&dport) {
-            let i = usize::from(dport - FWD_PORT_BASE);
-            if self.fwd[i].state() != tcp::State::Closed && sport == self.fwd_peer[i] {
+        } else if (FWD_PORT_BASE..FWD_PORT_BASE + (FWD_SLOTS * FWD_GENS) as u16).contains(&dport) {
+            let off = usize::from(dport - FWD_PORT_BASE);
+            let i = off % FWD_SLOTS;
+            // Only the slot's current generation is live; an older one is a stale connection.
+            if off / FWD_SLOTS == usize::from(self.fwd_gen[i]) && self.fwd[i].state() != tcp::State::Closed && sport == self.fwd_peer[i] {
                 self.fwd[i].input(&s);
             } else {
                 self.reset_for(src, sport, dport, &s);
@@ -604,11 +616,12 @@ impl<'a> Gateway<'a> {
         }
         for i in 0..FWD_SLOTS {
             let peer = self.fwd_peer[i];
+            let sport = self.fwd_port(i);
             while self.q.has_room() && self.fwd[i].wants_tx() {
                 let conn = &mut self.fwd[i];
                 let pushed = self.q.push_with(|out| {
                     let o = conn.poll_tx(&mut out[54..54 + tcp::MSS])?;
-                    Some(build_tcp(out, mac, GATEWAY_IP, GUEST_IP, FWD_PORT_BASE + i as u16, peer, &o))
+                    Some(build_tcp(out, mac, GATEWAY_IP, GUEST_IP, sport, peer, &o))
                 });
                 if !pushed {
                     break;
@@ -625,8 +638,32 @@ impl<'a> Gateway<'a> {
         }
         let iss = self.next_iss();
         self.fwd_peer[slot] = guest_port;
+        self.fwd_gen[slot] = ((usize::from(self.fwd_gen[slot]) + 1) % FWD_GENS) as u8;
         self.fwd[slot].connect(iss);
         true
+    }
+
+    /// The source port forward slot `slot`'s current connection uses.
+    fn fwd_port(&self, slot: usize) -> u16 {
+        FWD_PORT_BASE + (slot + FWD_SLOTS * usize::from(self.fwd_gen[slot])) as u16
+    }
+
+    /// Start slot `slot`'s connection over, from a new source port, to the same guest port: the
+    /// SYN is sent once, so one the guest never answered is retried by the caller. The old
+    /// attempt is reset (the guest may be holding it half-open). False if the slot is idle.
+    pub fn fwd_reopen(&mut self, slot: usize) -> bool {
+        if slot >= FWD_SLOTS || self.fwd[slot].state() == tcp::State::Closed {
+            return false;
+        }
+        let peer = self.fwd_peer[slot];
+        self.fwd_release(slot);
+        self.fwd_open(slot, peer)
+    }
+
+    /// Frames waiting for the guest.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.q.count
     }
 
     /// Forward slot `slot`'s connection, for reading, writing, closing and asking its state.

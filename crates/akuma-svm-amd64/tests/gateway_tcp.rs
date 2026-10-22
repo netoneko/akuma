@@ -260,3 +260,73 @@ fn a_guest_that_closes_first_is_seen_as_end_of_stream() {
     });
     assert_eq!(got, b"last words");
 }
+
+#[test]
+fn a_syn_the_guest_never_saw_is_retried_from_a_new_port_and_the_old_attempt_is_dead() {
+    // The 2026-10-22 ryzen wedge: slots stuck `connecting`, `in_flight=1`, for good. The SYN is
+    // sent once and nothing retried it; the metal never said where it went.
+    let mut net = Net::new();
+    let h = net.socket();
+    net.sockets.get_mut::<tcp::Socket>(h).listen(22).unwrap();
+    assert!(net.gw.fwd_open(0, 22));
+    net.gw.pump();
+    // The guest never sees it: take the frame off the queue.
+    let mut lost = [0u8; 2048];
+    let mut dropped = 0;
+    while net.gw.receive(&mut lost).is_some() {
+        dropped += 1;
+    }
+    assert_eq!(dropped, 1, "exactly the SYN was queued");
+    for _ in 0..2_000 {
+        net.step();
+    }
+    assert!(!net.gw.fwd(0).is_established(), "nothing answers a SYN nobody received");
+    assert_eq!(net.gw.fwd(0).state(), State::SynSent);
+
+    assert!(net.gw.fwd_reopen(0));
+    net.run_until("established after the retry", |n| {
+        n.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established && n.gw.fwd(0).is_established()
+    });
+
+    // The retry also works with bytes flowing, and an idle slot is not reopened.
+    assert!(net.gw.fwd(0).write(b"hello") == 5);
+    let mut got = Vec::new();
+    net.run_until("bytes arrive", |n| {
+        let s = n.sockets.get_mut::<tcp::Socket>(h);
+        let mut b = [0u8; 16];
+        while s.can_recv() {
+            let k = s.recv_slice(&mut b).unwrap();
+            got.extend_from_slice(&b[..k]);
+        }
+        got == b"hello"
+    });
+    assert!(!net.gw.fwd_reopen(1), "slot 1 is idle: nothing to retry");
+}
+
+#[test]
+fn every_connection_on_a_slot_uses_a_new_source_port() {
+    // A guest holding the previous connection half-open (a lost reset, TIME-WAIT) must not be
+    // able to swallow the next SYN: the tuple differs each time.
+    let mut net = Net::new();
+    let h = net.socket();
+    let mut ports = Vec::new();
+    for round in 0..10 {
+        net.sockets.get_mut::<tcp::Socket>(h).listen(22).unwrap();
+        assert!(net.gw.fwd_open(0, 22), "round {round}");
+        net.run_until("established", |n| n.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established);
+        ports.push(net.sockets.get::<tcp::Socket>(h).remote_endpoint().unwrap().port);
+        net.gw.fwd(0).close();
+        net.run_until("guest sees EOF", |n| !n.sockets.get::<tcp::Socket>(h).may_recv());
+        net.sockets.get_mut::<tcp::Socket>(h).close();
+        net.run_until("closed", |n| n.gw.fwd(0).is_closed());
+        net.sockets.get_mut::<tcp::Socket>(h).abort();
+        net.gw.fwd_release(0);
+        for _ in 0..5 {
+            net.step();
+        }
+    }
+    for w in ports.windows(2) {
+        assert_ne!(w[0], w[1], "consecutive connections reused a source port: {ports:?}");
+    }
+    assert!(ports.iter().all(|p| (FWD_PORT_BASE..FWD_PORT_BASE + 16).contains(p)), "{ports:?}");
+}
