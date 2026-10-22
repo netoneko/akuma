@@ -135,6 +135,9 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
   retransmit timer and the guest polls its NIC, so a forward slot's source port is a rotating
   generation (`FWD_GENS`) and the relay re-sends an unanswered SYN (`SYN_RETRY_US`, `SYN_TRIES`)
   before resetting the client. Incident: [`KVM_RELAY_SYN_STALL.md`](../../archive/KVM_RELAY_SYN_STALL.md).
+- **A service guest's virtual processors come from the selector file** (`vcpus=N` after the guest
+  word, 1 to 4; `kvmvcpus=N` on the command line): all of them run on the one host core the
+  service task is pinned to, taking turns, so more of them is latency, not compute.
 - **A service guest's disk may be a RAM copy of a file** (`HostDisk::Mem`, `kvmgentoo`): the guest
   never touches a host block device, and its writes die with it. A second NVMe window is not the
   way to give a guest a partition; the driver's single GPT window is p3's on purpose.

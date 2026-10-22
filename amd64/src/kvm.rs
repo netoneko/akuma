@@ -218,6 +218,23 @@ fn pick_guest(cmdline: &str) -> Option<linux::Guest> {
 
 /// The host port a service guest's sshd is forwarded to (`kvmfwd=<port>`; 2223).
 static SERVE_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(2223);
+/// Virtual processors of the service guest (`vcpus=N` in `/boot/kvm-guest`, or `kvmvcpus=N`).
+static SERVICE_VCPUS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+
+/// How many virtual processors the service guest has: 1 to [`linux::MAX_VCPUS`]. They share the
+/// one host core the service task is pinned to, taking turns.
+pub(crate) fn service_vcpus() -> usize {
+    usize::from(SERVICE_VCPUS.load(Ordering::Relaxed)).clamp(1, linux::MAX_VCPUS)
+}
+
+/// The `N` of the first `vcpus=N` token in `text`.
+fn vcpus_in(text: &[u8]) -> Option<u8> {
+    let at = text.windows(6).position(|w| w == b"vcpus=")?;
+    let digits = &text[at + 6..];
+    let end = digits.iter().position(|b| !b.is_ascii_digit()).unwrap_or(digits.len());
+    core::str::from_utf8(&digits[..end]).ok()?.parse().ok()
+}
+
 /// Which service guest [`spawn_service`] chose, for [`serve_task`] (which takes no arguments).
 static SERVICE_GENTOO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -235,6 +252,12 @@ pub fn spawn_service(cmdline: &str) {
         .and_then(|v| v.parse::<u16>().ok())
     {
         SERVE_PORT.store(port, Ordering::Relaxed);
+    }
+    let mut sel = [0u8; 64];
+    let n = akuma_vfs_glue::read_at(GUEST_SELECTOR_PATH, 0, &mut sel).unwrap_or(0);
+    let from_cmdline = cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("kvmvcpus=")).and_then(|v| v.parse::<u8>().ok());
+    if let Some(v) = from_cmdline.or_else(|| vcpus_in(&sel[..n])) {
+        SERVICE_VCPUS.store(v, Ordering::Relaxed);
     }
     SERVICE_GENTOO.store(pick_guest(cmdline) == Some(linux::Guest::AkumaGentoo), Ordering::Relaxed);
     // Core 0 enabled SVM and owns the host save area (`run` enables it again, idempotently).

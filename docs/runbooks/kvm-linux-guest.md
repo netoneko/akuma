@@ -79,6 +79,30 @@ root@<host>`. The guest accepts the repo's test key and every key in the ryzen A
 `/etc/sshd/authorized_keys` (the stage script folds them in). The host forward port is
 `kvmfwd=` on the command line (2223). A service guest keeps running until the host reboots.
 
+**Gentoo as the guest (`GUEST=gentoo`):** in Pop, `sh overlays/ryzen/kvm-gentoo-image.sh [3G]` builds
+`/boot/gentoo-guest.img` on p3 from p7 (read-only; `tar` into a staging copy, because p7 has ext2
+errors that make `mke2fs -d` die with `EUCLEAN`; p7 is never written), then `GUEST=gentoo sh
+kvm-akuma-stage.sh` and `arm.sh 28`. The hypervisor copies the image into RAM at start (a minute;
+writes are gone when the guest stops). OpenSSH answers on the guest's 4444, forwarded to host 2223;
+only the keys in p7's `/root/.ssh/authorized_keys` get in. Its init is `/akuma-kvm-init.sh`
+(`overlays/ryzen/gentoo/akuma-kvm-init.sh`).
+
+**Virtual processors of a service guest:** `vcpus=N` (1 to 4) in `/boot/kvm-guest`, e.g.
+`printf 'akuma-serve vcpus=2' > /mnt/p3/boot/kvm-guest`, or `kvmvcpus=N` on the command line. They
+take turns on the one host core the service task is pinned to: no more compute, and measured *worse*
+on 2026-10-22 (late SYN-ACKs 7 of 99 against 0 of 105, one 33 s upload stall); leave it at one.
+
+**Stability and speed checks (run against the ryzen, no guest-side tools needed):**
+`scripts/kvm/relay_stress.py <ryzen ip>` (three overlapping sessions on the relay's two slots,
+connect-and-drop, silent holds, garbage; each followed by a real ssh that must answer) and
+`scripts/kvm/relay_bulk.py <ryzen ip>` (timed 4-8 MiB each way through the relay *from the ryzen
+itself*, so the slow wifi link to the Mac is out of the measurement; the serve guest only, it needs
+the host's machine key). Read the result in `dmesg | grep -a 'KVM\] \(relay\|guest\)'`: `syn_retries`,
+`gave_up`, `stale_in` and `rx_starved` say what the relay saw ([`KVM_RELAY_SYN_STALL.md`](../archive/KVM_RELAY_SYN_STALL.md)).
+Hostnames: the host is `akuma-ryzen` (`etc/herd/available/hostname.conf`, enabled on p3; its
+Gentoo box's `conf.d/hostname` must say the same or OpenRC resets it to `localhost`), the guests
+`akuma-kvm` and `akuma-gentoo`.
+
 ## If it goes wrong
 
 | you see (in the guest's console) | it is |
@@ -91,6 +115,7 @@ root@<host>`. The guest accepts the repo's test key and every key in the ryzen A
 | Akuma guest: `[FATAL] heap ends … but the region holding it ends …` | guest RAM below the kernel's fixed 512 MiB heap + image (768 MiB is the floor used) |
 | Akuma guest: `…touched the local APIC page with an instruction the MMIO decoder does not know` | a non-`MOV`/`CMP`/`TEST` access on the page; add the encoding to `mmio` with a clang vector |
 | Akuma guest: stops with `guest halted waiting for an interrupt nothing can raise` | the guest halted with `IF` set and no unmasked timer: its LAPIC timer LVT is masked or the count is 0 |
+| ssh into the guest hangs at the banner / the host port refuses; relay line stuck at `connecting … in_flight=1` | a slot's SYN got no SYN-ACK: before 2026-10-22 a reused source port against a stale guest connection, now the SYN is retried from a new port after 4 s and given up on after 4 tries. `syn_retries`/`stale_in` in the relay and `[KVM] guest:` lines; [`KVM_RELAY_SYN_STALL.md`](../archive/KVM_RELAY_SYN_STALL.md) |
 | `#UD` in `x86_perf_event_update` at reboot | the NMI watchdog's perf event; `nmi_watchdog=0` (cause of the `RDPMC` fault not understood) |
 
 ## Verify

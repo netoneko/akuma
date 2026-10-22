@@ -63,6 +63,17 @@ stale_in=0`.
   for 10 minutes before, takes 46 s (upload 28 s, md5-exact). The wifi is the limit: the host's own
   1 MiB download from `speed.cloudflare.com` takes 27 s (~39 KB/s).
 
+## Two virtual processors did not help (tried the same evening)
+
+`vcpus=2` in `/boot/kvm-guest` (serve guest, same kernel and 4 s retry): the guest sees 2 processors
+(`grep -c ^processor /proc/cpuinfo`) and the stress passes, but the relay got *slower to answer*:
+`syn_out=99 synack_in=92 stale_in=5 syn_retries=7`, against 0 retries over 105 connections with one
+vCPU; one 8 MiB upload stalled for 33.7 s (243 KiB/s) before the next ran at 7.3 MB/s. Both
+vCPUs run on the one host core the service task is pinned to, taking turns, so the guest gains no
+compute and pays for the time-slicing. The option stays (`vcpus=N`) for experiments; the default
+is one. More vCPUs only help once they run on separate host cores, which the single-task
+hypervisor does not do.
+
 ## Still open
 
 - `rx_starved` is ~20% of frames: the guest's NIC driver posts one receive buffer

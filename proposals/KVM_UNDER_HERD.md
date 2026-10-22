@@ -59,6 +59,13 @@ control; a console sink per VM; per-VM forwards with more than two slots.
    no NIC): that is what makes "any OCI image, unmodified" true and retires the Linux-ABI gaps for
    workloads that need them.
 
+## 4b. Firecracker needs `/dev/kvm`
+
+Added 2026-10-22: running Firecracker (or QEMU) on an Akuma host needs the real KVM ioctl ABI and a
+userspace VMM that handles MMIO/port-I/O exits — a different shape from today's all-in-kernel
+devices (`NEXT_AGENT_KVM_HERD.md` § Decisions). The herd service type comes first and is useful alone;
+design its `Vm` so the device models sit behind a seam a `/dev/kvm` front end can later bypass.
+
 ## 5. Open questions
 
 - Persistent disk by default (like a container) or disposable (like today's RAM copy)?

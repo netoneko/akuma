@@ -101,7 +101,7 @@ const BIOS_RSDP_GPA: u64 = 0xE_0000;
 /// routing, and each more is one more VMCB and one more share of the host core.
 const AKUMA_SMP_VCPUS: usize = 2;
 /// Most virtual processors any guest has: sizes the per-processor arrays.
-const MAX_VCPUS: usize = 4;
+pub(super) const MAX_VCPUS: usize = 4;
 /// How long one virtual processor runs before the host timer takes the core back for
 /// the next (µs), when more than one can run. Short enough that an AP spinning on a
 /// flag the BSP is about to set does not cost a host tick (10 ms) per round.
@@ -181,9 +181,12 @@ impl Guest {
     }
 
     /// How many virtual processors the guest has.
-    const fn vcpus(self) -> usize {
+    fn vcpus(self) -> usize {
         match self {
             Self::AkumaSmp => AKUMA_SMP_VCPUS,
+            // A service guest's count is the selector file's `vcpus=N` (or `kvmvcpus=N`): the
+            // bootloader's command line is baked into the EFI binary, the file is not.
+            Self::AkumaServe | Self::AkumaGentoo => super::service_vcpus(),
             _ => 1,
         }
     }
@@ -809,7 +812,7 @@ struct Offer {
 }
 
 impl Platform {
-    const fn new(guest: Guest) -> Self {
+    fn new(guest: Guest) -> Self {
         Self {
             uart: Uart::new(),
             pit: Pit::new(),
@@ -1385,8 +1388,10 @@ pub fn run(nrips: bool, guest: Guest) {
         // No `nosmp`: the MADT says how many processors there are.
         Guest::AkumaSmp => cmdline_with_tsc(&mut cmd, "", 0, if disk.is_some() { AKUMA_DISK_ARGS } else { "" }),
         // The disk's window first, then the NIC's: slot order is device order.
-        Guest::AkumaNet | Guest::AkumaServe => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { AKUMA_NET_ARGS } else { NET_ARGS }),
-        Guest::AkumaGentoo => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { GENTOO_ARGS } else { NET_ARGS }),
+        Guest::AkumaNet => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { AKUMA_NET_ARGS } else { NET_ARGS }),
+        // `nosmp` only for one processor: with more, the MADT says how many there are.
+        Guest::AkumaServe => cmdline_with_tsc(&mut cmd, if guest.vcpus() > 1 { "" } else { AKUMA_CMDLINE }, 0, if disk.is_some() { AKUMA_NET_ARGS } else { NET_ARGS }),
+        Guest::AkumaGentoo => cmdline_with_tsc(&mut cmd, if guest.vcpus() > 1 { "" } else { AKUMA_CMDLINE }, 0, if disk.is_some() { GENTOO_ARGS } else { NET_ARGS }),
     };
     match disk {
         Some(d) => {
