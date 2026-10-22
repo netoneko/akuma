@@ -1,0 +1,775 @@
+
+Akuma/amd64 - bare metal, booted by GRUB 2.06-2ubuntu14.8
+  cmd:  init=/bin/herd initargs=daemon root=/dev/nvme0n1p3 rtw89wifi wdt smp=8 idlesleep ecram=0xfeec2380 kvmtest kvmlinux
+  uart: present  kbd: i8042 present
+  font: IBM Plex Mono 11x22 11x22 scale 1 -> 171x53 cells
+  fb:   1920x1200 @ 32bpp, pitch 7680, at 0x00000004b0000000
+  ram:  14096 MiB usable across 8 regions
+  pci:  42 function(s)
+    00:00.0  1022:14e8  class 06/00/00
+    00:00.2  1022:14e9  class 08/06/00
+    00:01.0  1022:14ea  class 06/00/00
+    00:02.0  1022:14ea  class 06/00/00
+    00:02.1  1022:14ee  class 06/04/00  [bridge]  bar2=mem:0x0000000000010100  bar3=io:0x00000000200001f0  bar4=mem:0x0000000080c080c0  bar5=io:0x000000000001fff0
+    00:02.2  1022:14ee  class 06/04/00  [bridge]  bar2=mem:0x0000000000020200  bar3=io:0x0000000020002120  bar4=mem:0x0000000080b080b0  bar5=io:0x000000000001fff0
+    00:02.4  1022:14ee  class 06/04/00  [bridge]  bar2=mem:0x0000000000030300  bar3=io:0x00000000200001f0  bar4=mem:0x0000000080a080a0  bar5=io:0x000000000001fff0
+    00:03.0  1022:14ea  class 06/00/00
+    00:03.2  0000:0000  class 00/00/00
+    00:03.3  0000:0000  class 00/00/00
+    00:03.4  0000:0000  class 00/00/00
+    00:04.0  1022:14ea  class 06/00/00
+    00:08.0  1022:14ea  class 06/00/00
+    00:08.1  1022:14eb  class 06/04/00  [bridge]  bar2=mem:0x0000000000040400  bar3=io:0x0000000000001110  bar4=mem:0x0000000080608000  bar5=io:0x00000000c071b000
+    00:08.2  1022:14eb  class 06/04/00  [bridge]  bar2=mem:0x0000000000050500  bar3=io:0x00000000000001f0  bar4=mem:0x0000000080908090  bar5=io:0x00000000c081c080
+    00:08.3  1022:14eb  class 06/04/00  [bridge]  bar2=mem:0x0000000000060600  bar3=io:0x00000000000001f0  bar4=mem:0x0000000080808070  bar5=io:0x000000000001fff0
+    00:14.0  1022:790b  class 0c/05/00
+    00:14.3  1022:790e  class 06/01/00
+    00:18.0  1022:14f0  class 06/00/00
+    00:18.1  1022:14f1  class 06/00/00
+    00:18.2  1022:14f2  class 06/00/00
+    00:18.3  1022:14f3  class 06/00/00
+    00:18.4  1022:14f4  class 06/00/00
+    00:18.5  1022:14f5  class 06/00/00
+    00:18.6  1022:14f6  class 06/00/00
+    00:18.7  1022:14f7  class 06/00/00
+    01:00.0  10ec:522a  class ff/00/00  bar0=mem:0x0000000080c00000
+    02:00.0  10ec:c852  class 02/80/00  bar0=io:0x0000000000002000  bar2=mem:0x0000000080b00000(64)
+    03:00.0  1c5c:1d59  class 01/08/02  bar0=mem:0x0000000080a00000(64)
+    04:00.0  1002:1900  class 03/00/00  bar0=mem:0x00000004b0000000(64)  bar2=mem:0x0000000080000000(64)  bar4=io:0x0000000000001000  bar5=mem:0x0000000080600000
+    04:00.1  1002:1640  class 04/03/00  bar0=mem:0x00000000806c8000
+    04:00.2  1022:15c7  class 10/80/00  bar2=mem:0x0000000080500000  bar5=mem:0x00000000806ce000
+    04:00.3  1022:15b9  class 0c/03/30  [xHCI]  bar0=mem:0x0000000080200000(64)
+    04:00.4  1022:15ba  class 0c/03/30  [xHCI]  bar0=mem:0x0000000080300000(64)
+    04:00.5  1022:15e2  class 04/80/00  bar0=mem:0x0000000080680000  bar2=mem:0x00000004c0000000(64)
+    04:00.6  1022:15e3  class 04/03/00  bar0=mem:0x00000000806c0000
+    04:00.7  1022:164a  class 11/80/00  bar2=mem:0x0000000080400000  bar5=mem:0x00000000806cc000
+    05:00.0  1022:14ec  class 13/00/00
+    05:00.1  1022:1502  class 11/80/00  bar0=mem:0x0000000080900000  bar1=mem:0x00000000809c0000  bar2=mem:0x00000004c0800000(64)  bar4=mem:0x0000000080980000
+    06:00.0  1022:14ec  class 13/00/00
+    06:00.3  1022:15c0  class 0c/03/30  [xHCI]  bar0=mem:0x0000000080700000(64)
+    06:00.4  1022:15c1  class 0c/03/30  [xHCI]  bar0=mem:0x0000000080800000(64)
+  [xhci] quiesced 4 controller(s): bus-master off, INTx masked
+  mod:  root image at 0x0000000009f3c000 + 524288 KiB
+  mem:  RAM the machine reported, and what became of each:
+    0x0000000000000000 + 0 MiB  unused (below the 1 MiB floor)
+    0x0000000000100000 + 155 MiB  pmm
+    0x0000000009e01000 + 0 MiB  pmm
+    0x0000000009f3c000 + 596 MiB  pmm
+    0x00000000343f8000 + 1063 MiB  pmm
+    0x000000007a9fe000 + 21 MiB  pmm
+    0x000000007bfed000 + 0 MiB  pmm
+    0x0000000100000000 + 12259 MiB  heap + pmm
+  mem:  14096 MiB usable, 14096 MiB managed, physmap reaches 64 GiB
+  kernel ends 0x000000000118ca40
+  heap: 0x0000000100000000 + 1024 MiB ... ok
+  pmm:  arena 0x0000000000100000 + 16354 MiB spanning 7 RAM region(s)
+  pmm:  14096 MiB RAM, 3211169 free frames (12543 MiB)
+  clock: seeded from the CMOS RTC (2026-10-22 2:41 UTC); SNTP will correct it
+[fpcache] shared file-page cache enabled, base cap=451077 pages (+20% elastic)
+[HDA] audio function 1002:1640
+[HDA] audio function 1022:15e3
+[HDA] first 04:03 function is not Intel; leaving audio off
+[KVM] Fn8000_000A: rev=00000001 asids=32768 edx=1ebf1cff
+[KVM] SVM available; EFER.SVME not yet enabled (per-core, rung 2)
+[KVM] running trivial guest (nrips=yes, code_pa=00000000011a1000)
+[KVM] trivial guest: PASS (vmmcalls=2, msr=1, ioio=1, rax=0000000000001000)
+[KVM] running long-mode guest (nrips=yes, code_pa=00000000011a4000)
+[KVM] long-mode guest: PASS (vmmcalls=2, msr=1, rax=0000000000001500)
+[KVM] running two-level guest (gva=0000000050000000 gpa=00000000401a5000 hpa=00000000011a5000)
+[KVM] two-level guest: PASS (vmmcalls=2, rax=202620265eed0002)
+[KVM] running pvh guest (start=00000000405ff000)
+[KVM] pvh guest: PASS (vmmcalls=2, rax=0000000000000001)
+[KVM] ladder: 12 probes, code_pa=000000000119d000
+[KVM] ladder full: entered exit=00000081
+[KVM] ladder no-lma: entered exit=00000081
+[KVM] ladder lme-off: entered exit=0000004e
+[KVM] ladder no-pg: entered exit=00000081
+[KVM] ladder cs32: entered exit=00000081
+[KVM] ladder sel0: entered exit=00000081
+[KVM] ladder asid1: entered exit=00000081
+[KVM] ladder no-ne: entered exit=00000081
+[KVM] ladder t-cs64: entered exit=00000081
+[KVM] ladder t-pg: entered exit=0000004e
+[KVM] ladder t-cs64-pg: entered exit=0000004e
+[KVM] ladder t-lme-lma: entered exit=00000081
+  [power] source=ec window=0x00000000feec2380
+  wdt:  AMD FCH watchdog armed, 60 s, reset on expiry; CONTROL=0x0000000000000011
+  nvme: 0000000000001c5c:0000000000001d59
+  nvme: CAP.TO 20000 ms, MQES 256, DSTRD 0, firmware left CC=0x0000000000460001 CSTS=0x0000000000000001
+  nvme: disabled in 0 ms
+  nvme: ready in 3 ms
+  nvme: SKHynix_HFS512GEJ4X112N fw 51040C31, mdts 256 KiB, vwc yes
+  nvme: ns1 476 GiB in 512-byte blocks, 256 blocks per command
+  nvme: init total 10 ms
+  nvme: p3 = LBA 567296..=210282495 (100 GiB) "Basic data partition"
+  fs:   ext2 mounted on /dev/nvme0n1p3
+[rtw] firmware /lib/firmware/rtw89/rtw8852c_fw-1.bin, 2375560 bytes
+[rtw] root port command was 0x0000000000000003
+[rtw] arrived: IC_PWR_STATE 0x0000000002200005
+[rtw] arrived: WCPU_FW_CTRL 0x00000000000000e2
+[rtw] chip cut 0x0000000000000001
+[rtw] image offset 0x0000000000057ef0
+[rtw] image bytes 0x0000000000051008
+[rtw] powered on 0x0000000000000000
+[rtw] download-mode DMA ready 0x0000000000000000
+[rtw] h2c path ready, FW_CTRL 0x0000000000000023
+[rtw] header accepted, FW_CTRL 0x0000000000000027
+[rtw] section packets sent 0x00000000000000a6
+[rtw] fw ready v0.27.122 (cut 1, 166 packets, FW_CTRL 0x00000000000000e2, 46564 us)
+[rtw] card kept for the station (rtw89wifi); /dev/wifi0 is the radio
+  nic:  wifi station (rtw89) — the link comes up when userspace joins
+[SmolNet] MAC: 02:41:4b:55:4d:41[SmolNet] static IPv4 169.254.65.77/16 gw 169.254.0.1
+[SmolNet] DHCP enabled
+[SmolNet] Initialized successfully
+  net:  stack up
+  lapic: base=0x00000000fee00000 id=0 timer vector=32 periodic
+  lapic: calibrated vs PIT: 15002 counts per 10000us (24 MHz); tsc 3793 MHz
+  [idle] wake budget on, up to 100 ticks per idle sleep
+[KVM] linux: loading /boot/vmlinux
+[HEAP] 13MB used (alloc=65536 bytes)
+[HEAP-R] 16MB used (realloc 6144->12288)
+[HEAP] 18MB used (alloc=65536 bytes)
+[KVM] linux: loaded 20273 KiB in 4 segments, PVH entry 010004f0
+[KVM] linux: guest disk: /boot/guest-root.img, 16 MiB
+[KVM] linux: running (start=07fff000, ram=128 MiB)
+
+[KVM] linux: rdmsr c0000080 -> 0000000000000000
+
+[KVM] linux: wrmsr c0000080 <- 0000000000000100
+
+[KVM] linux: wrmsr c0000101 <- 00000000023d8580
+
+[KVM] linux: wrmsr c0000101 <- 0000000002324000
+
+[KVM] linux: cpuid 00000000/01 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000001/63 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: cpuid 80000000/03 -> 80000028 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 80000001/63 -> 00a70f52 10000000 000211f3 2fd3fbff
+
+[KVM] linux: cpuid 00000001/f3 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: wrmsr c0000101 <- ffffffff82324000
+
+[KVM] linux: cpuid 80000001/01 -> 00a70f52 10000000 000211f3 2fd3fbff
+
+[KVM] linux: rdmsr c0000080 -> 0000000000000500
+
+[KVM] linux: wrmsr c0000080 <- 0000000000000d01
+
+[KVM] linux: #PF rip=ffffffff823491b5 err=00000000 addr=ffff8880023d7560
+[KVM] linux: code@ffffffff823491b5 f3 a5 48 89 e5 e8 2d b9 61 ff 8b 35 23 47 27 00 
+
+[KVM] linux: #PF rip=ffffffff823491ea err=00000000 addr=ffff888007ffd000
+[KVM] linux: code@ffffffff823491ea f3 a5 5d e9 ce 72 8b ff 49 89 f2 48 8b 35 c4 11 
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: cpuid 00000006/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000007/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 0000000d/01 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 80000000/00 -> 80000028 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 80000001/00 -> 00a70f52 10000000 000211f3 2fd3fbff
+
+[KVM] linux: cpuid 80000007/00 -> 00000000 0000003b 00000000 0000e799
+
+[KVM] linux: cpuid 80000008/00 -> 00003030 791ef257 0000400f 00010000
+
+[KVM] linux: cpuid 8000000a/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 8000001f/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 80000021/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000006/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000006/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000007/01 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000007/02 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000007/02 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 0000000f/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 0000000f/01 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 0000000f/01 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 0000000f/01 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: cpuid 00000010/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000000/00 -> 00000010 68747541 444d4163 69746e65
+
+[KVM] linux: msr rd 0000008b (default)
+
+[KVM] linux: rdmsr 0000008b -> 0000000000000000
+
+[KVM] linux: msr rd c0010015 (default)
+
+[KVM] linux: rdmsr c0010015 -> 0000000000000000
+
+[KVM] linux: #PF rip=ffffffff823494cc err=00000000 addr=ffff888000000413
+[KVM] linux: code@ffffffff823494cc 0f b7 82 13 04 00 00 0f b7 ba 0e 04 00 00 48 89 
+[    0.000000] Linux version 6.1.128 (root@bd3f41838d3f) (gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, GNU ld (GNU Binutils for Ubuntu) 2.38) #1 SMP PREEMPT_DYNAMIC Mon Mar 10 14:07:44 UTC 2025
+[    0.000000] Command line: console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr noapic nolapic nosmp nmi_watchdog=0 pci=off mitigations=off panic=-1 root=/dev/vda rw rootwait tsc_early_khz=3793429
+[    0.000000] KASLR disabled
+[    0.000000] [Firmware Bug]: TSC doesn't count with P0 frequency!
+[    0.000000] BIOS-provided physical RAM map:
+[    0.000000] BIOS-e820: [mem 0x0000000000000000-0x000000000009ffff] usable
+[    0.000000] BIOS-e820: [mem 0x00000000000a0000-0x00000000000fffff] reserved
+[    0.000000] BIOS-e820: [mem 0x0000000000100000-0x0000000007ffbfff] usable
+[    0.000000] BIOS-e820: [mem 0x0000000007ffc000-0x0000000007ffcfff] ACPI data
+[    0.000000] printk: bootconsole [earlyser0] enabled
+[    0.000000] NX (Execute Disable) protection: active
+[    0.000000] DMI not present or invalid.
+[    0.000000] tsc: Detected 3793.429 MHz processor
+[    0.000012] last_pfn = 0x7ffc max_arch_pfn = 0x400000000
+[    0.001817] Disabled
+[    0.002902] x86/PAT: MTRRs disabled, skipping PAT initialization too.
+
+[KVM] linux: rdmsr 00000277 -> 0007040600070406
+[    0.006648] x86/PAT: Configuration [0-7]: WB  WT  UC- UC  WB  WT  UC- UC  
+[    0.008802] Using GB pages for direct mapping
+
+[KVM] linux: #PF rip=ffffffff81960ee2 err=00000002 addr=ffff888002800000
+[KVM] linux: code@ffffffff81960ee2 48 89 07 48 89 47 08 48 89 47 10 48 89 47 18 48 
+[    0.013814] ACPI: Early table checksum verification disabled
+[    0.015694] ACPI: RSDP 0x0000000007FFC000 000024 (v02 AKUMA )
+[    0.017604] ACPI: XSDT 0x0000000007FFC040 000034 (v01 AKUMA  KVMTEST  00000001 AKMA 00000001)
+[    0.020148] ACPI: FACP 0x0000000007FFC080 000114 (v06 AKUMA  KVMTEST  00000001 AKMA 00000001)
+[    0.022684] ACPI: DSDT 0x0000000007FFC200 000061 (v02 AKUMA  KVMTEST  00000001 AKMA 00000001)
+[    0.025217] ACPI: APIC 0x0000000007FFC1A0 000034 (v05 AKUMA  KVMTEST  00000001 AKMA 00000001)
+[    0.027755] ACPI: Reserving FACP table memory at [mem 0x7ffc080-0x7ffc193]
+[    0.029909] ACPI: Reserving DSDT table memory at [mem 0x7ffc200-0x7ffc260]
+[    0.032067] ACPI: Reserving APIC table memory at [mem 0x7ffc1a0-0x7ffc1d3]
+[    0.034294] No NUMA configuration found
+[    0.035851] Faking a node at [mem 0x0000000000000000-0x0000000007ffbfff]
+[    0.038086] NODE_DATA(0) allocated [mem 0x07fda000-0x07ffbfff]
+[    0.040175] Zone ranges:
+[    0.041417]   DMA      [mem 0x0000000000001000-0x0000000000ffffff]
+[    0.043549]   DMA32    [mem 0x0000000001000000-0x0000000007ffbfff]
+[    0.045602]   Normal   empty
+[    0.046879] Movable zone start for each node
+[    0.048462] Early memory node ranges
+[    0.049864]   node   0: [mem 0x0000000000001000-0x000000000009ffff]
+[    0.051884]   node   0: [mem 0x0000000000100000-0x0000000007ffbfff]
+[    0.053916] Initmem setup node 0 [mem 0x0000000000001000-0x0000000007ffbfff]
+[    0.056114] On node 0, zone DMA: 1 pages in unavailable ranges
+[    0.056186] On node 0, zone DMA: 96 pages in unavailable ranges
+[    0.058298] On node 0, zone DMA32: 4 pages in unavailable ranges
+[    0.060241] No local APIC present
+[    0.063563] APIC: disable apic facility
+[    0.065038] APIC: switched to apic NOOP
+[    0.066510] smpboot: Allowing 1 CPUs, 0 hotplug CPUs
+[    0.068244] PM: hibernation: Registered nosave memory: [mem 0x00000000-0x00000fff]
+[    0.070560] PM: hibernation: Registered nosave memory: [mem 0x000a0000-0x000fffff]
+[    0.072862] [mem 0x07ffd000-0xffffffff] available for PCI devices
+[    0.074835] Booting paravirtualized kernel on bare hardware
+[    0.076704] clocksource: refined-jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645519600211568 ns
+[    0.079663] setup_percpu: NR_CPUS:64 nr_cpumask_bits:1 nr_cpu_ids:1 nr_node_ids:1
+[    0.082192] percpu: Embedded 44 pages/cpu s147880 r0 d32344 u2097152
+
+[KVM] linux: wrmsr c0000101 <- ffff888007a00000
+
+[KVM] linux: wrmsr c0000101 <- ffff888007a00000
+[    0.087641] Fallback order for Node 0: 0 
+[    0.087643] Built 1 zonelists, mobility grouping on.  Total pages: 31996
+[    0.091264] Policy zone: DMA32
+[    0.092555] Kernel command line: console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr noapic nolapic nosmp nmi_watchdog=0 pci=off mitigations=off panic=-1 root=/dev/vda rw rootwait tsc_early_khz=3793429
+[    0.097315] Unknown kernel command line parameters "nokaslr", will be passed to user space.
+[    0.099807] random: crng init done
+[    0.101192] Dentry cache hash table entries: 16384 (order: 5, 131072 bytes, linear)
+[    0.103532] Inode-cache hash table entries: 8192 (order: 4, 65536 bytes, linear)
+
+[KVM] linux: wrmsr c0000103 <- 0000000000000000
+
+[KVM] linux: msr wr c0000103 <- 0000000000000000 (default)
+
+[KVM] linux: wrmsr c0000101 <- ffff888007a00000
+
+[KVM] linux: wrmsr c0000081 <- 0023001000000000
+
+[KVM] linux: wrmsr c0000082 <- ffffffff81a00080
+
+[KVM] linux: wrmsr c0000083 <- ffffffff81a016e0
+
+[KVM] linux: wrmsr 00000174 <- 0000000000000010
+
+[KVM] linux: wrmsr 00000175 <- fffffe0000003000
+
+[KVM] linux: wrmsr 00000176 <- ffffffff81a01620
+
+[KVM] linux: wrmsr c0000084 <- 0000000000257fd5
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+[    0.126182] mem auto-init: stack:off, heap alloc:off, heap free:off
+[    0.128372] Memory: 102552K/130668K available (12289K kernel code, 1079K rwdata, 2136K rodata, 2596K init, 2336K bss, 27860K reserved, 0K cma-reserved)
+[    0.132089] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
+Poking KASLR using RDRAND RDTSC...
+[    0.135754] Dynamic Preempt: none
+[    0.137122] rcu: Preemptible hierarchical RCU implementation.
+[    0.139021] rcu: 	RCU restricting CPUs from NR_CPUS=64 to nr_cpu_ids=1.
+[    0.141125] 	Trampoline variant of Tasks RCU enabled.
+[    0.142866] 	Tracing variant of Tasks RCU enabled.
+[    0.144553] rcu: RCU calculated value of scheduler-enlistment delay is 25 jiffies.
+[    0.146871] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=1
+[    0.149024] NR_IRQS: 4352, nr_irqs: 24, preallocated irqs: 16
+[    0.151140] rcu: srcu_init: Setting srcu_struct sizes based on contention.
+[    0.153442] Console: colour dummy device 80x25
+[    0.155082] printk: console [ttyS0] enabled
+[    0.155082] printk: console [ttyS0] enabled
+[    0.158195] printk: bootconsole [earlyser0] disabled
+[    0.158195] printk: bootconsole [earlyser0] disabled
+[    0.161681] ACPI: Core revision 20220331
+[    0.163215] ACPI: setting ELCR to 0200 (from 0000)
+[    0.164933] APIC disabled via kernel command line
+[    0.166657] APIC: Keep in PIC mode(8259)
+[    0.168165] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x6d5c33a3c39, max_idle_ns: 881590985363 ns
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.172958] Calibrating delay loop (skipped), value calculated using timer frequency.. 7586.85 BogoMIPS (lpj=15173716)
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: rdmsr 0000008b -> 0000000000000000
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: msr rd c0011029 (default)
+
+[KVM] linux: rdmsr c0011029 -> 0000000000000000
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: wrmsr c0011029 <- 0000000000000002
+
+[KVM] linux: rdmsr c0010015 -> 0000000000000000
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: wrmsr c0010015 <- 0000000040000000
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: msr rd c001102e (default)
+
+[KVM] linux: rdmsr c001102e -> 0000000000000000
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: wrmsr c001102e <- 0000000000000020
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.204968] Last level iTLB entries: 4KB 512, 2MB 512, 4MB 256
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.208963] Last level dTLB entries: 4KB 3072, 2MB 3072, 4MB 1536, 1GB 0
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: msr rd 00000048 (default)
+
+[KVM] linux: rdmsr 00000048 -> 0000000000000000
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.216963] Spectre V2 : User space: Vulnerable
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.220963] Speculative Store Bypass: Vulnerable
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.224964] x86/fpu: x87 FPU will use FXSAVE
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.240758] Freeing SMP alternatives memory: 40K
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.240964] pid_max: default: 32768 minimum: 301
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.244974] LSM: Security Framework initializing
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.248967] SELinux:  Initializing.
+[    0.250375] SELinux: CONFIG_SECURITY_SELINUX_CHECKREQPROT_VALUE is non-zero.  This is deprecated and will be rejected in a future kernel release.
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.256962] SELinux: https://github.com/SELinuxProject/selinux-kernel/wiki/DEPRECATE-checkreqprot
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.260988] Mount-cache hash table entries: 512 (order: 0, 4096 bytes, linear)
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.264963] Mountpoint-cache hash table entries: 512 (order: 0, 4096 bytes, linear)
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.269152] smpboot: weird, boot CPU (#0) not listed by the BIOS
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.272963] smpboot: SMP disabled
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.277035] cblist_init_generic: Setting adjustable number of callback queues.
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.280962] cblist_init_generic: Setting shift to 0 and lim to 1.
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.284972] cblist_init_generic: Setting adjustable number of callback queues.
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.288962] cblist_init_generic: Setting shift to 0 and lim to 1.
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.292972] Performance Events: 
+[    0.292974] no APIC, boot with the "lapic" boot parameter to force-enable it.
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+[    0.296962] no hardware sampling interrupt available.
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: msr rd c0010000 (default)
+
+[KVM] linux: rdmsr c0010000 -> 0000000000000000
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: msr rd c0010001 (default)
+
+[KVM] linux: rdmsr c0010001 -> 0000000000000000
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: msr rd c0010002 (default)
+
+[KVM] linux: rdmsr c0010002 -> 0000000000000000
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: msr rd c0010003 (default)
+
+[KVM] linux: rdmsr c0010003 -> 0000000000000000
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: msr rd c0010007 (default)
+
+[KVM] linux: rdmsr c0010007 -> 0000000000000000
+
+[KVM] linux: irq vector 30 taken at rip=ffffffff8101f462
+
+[KVM] linux: wrmsr c0010007 <- 000000000000ffff
+
+[KVM] linux: rdmsr c0010007 -> 000000000000ffff
+[    0.334641] AMD PMU driver.
+[    0.336963] ... version:                0
+[    0.338488] ... bit width:              48
+[    0.340042] ... generic registers:      4
+[    0.340962] ... value mask:             0000ffffffffffff
+[    0.342791] ... max period:             00007fffffffffff
+[    0.344962] ... fixed-purpose events:   0
+[    0.346493] ... event mask:             000000000000000f
+
+[KVM] linux: rdmsr c0000080 -> 0000000000000d01
+[    0.350689] signal: max sigframe size: 1440
+[    0.352269] rcu: Hierarchical SRCU implementation.
+[    0.352962] rcu: 	Max phase no-delay instances is 1000.
+[    0.354831] smp: Bringing up secondary CPUs ...
+[    0.356963] smp: Brought up 1 node, 1 CPU
+[    0.358496] smpboot: Max logical packages: 1
+[    0.360084] smpboot: Total of 1 processors activated (7586.85 BogoMIPS)
+[    0.361031] devtmpfs: initialized
+[    0.362437] x86/mm: Memory block size: 128MB
+[    0.365085] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645041785100000 ns
+[    0.368963] futex hash table entries: 256 (order: 2, 16384 bytes, linear)
+[    0.371204] NET: Registered PF_NETLINK/PF_ROUTE protocol family
+[    0.373019] audit: initializing netlink subsys (disabled)
+[    0.374900] thermal_sys: Registered thermal governor 'fair_share'
+[    0.374901] thermal_sys: Registered thermal governor 'step_wise'
+[    0.376963] thermal_sys: Registered thermal governor 'user_space'
+[    0.378943] audit: type=2000 audit(943920000.204:1): state=initialized audit_enabled=0 res=1
+[    0.383506] cpuidle: using governor ladder
+[    0.384964] cpuidle: using governor menu
+[    0.386987] HugeTLB: registered 1.00 GiB page size, pre-allocated 0 pages
+[    0.388963] HugeTLB: 16380 KiB vmemmap can be freed for a 1.00 GiB page
+[    0.391078] HugeTLB: registered 2.00 MiB page size, pre-allocated 0 pages
+[    0.392962] HugeTLB: 28 KiB vmemmap can be freed for a 2.00 MiB page
+[    0.395191] ACPI: Added _OSI(Module Device)
+[    0.396963] ACPI: Added _OSI(Processor Device)
+[    0.398589] ACPI: Added _OSI(3.0 _SCP Extensions)
+[    0.400962] ACPI: Added _OSI(Processor Aggregator Device)
+[    0.402822] ACPI: 1 ACPI AML tables successfully acquired and loaded
+[    0.405071] ACPI: Interpreter enabled
+[    0.406525] ACPI: PM: (supports S0)
+[    0.407934] ACPI: Using PIC for interrupt routing
+[    0.409064] iommu: Default domain type: Translated 
+[    0.410797] iommu: DMA domain TLB invalidation policy: lazy mode 
+[    0.412996] SCSI subsystem initialized
+[    0.414473] pps_core: LinuxPPS API ver. 1 registered
+[    0.416226] pps_core: Software ver. 5.3.6 - Copyright 2005-2007 Rodolfo Giometti <giometti@linux.it>
+[    0.416963] PTP clock support registered
+[    0.421046] NetLabel: Initializing
+[    0.422437] NetLabel:  domain hash size = 128
+[    0.424050] NetLabel:  protocols = UNLABELED CIPSOv4 CALIPSO
+[    0.424971] NetLabel:  unlabeled traffic allowed by default
+[    0.426902] clocksource: Switched to clocksource tsc-early
+[    0.426902] VFS: Disk quotas dquot_6.6.0
+[    0.428392] VFS: Dquot-cache hash table entries: 512 (order 0, 4096 bytes)
+[    0.430615] pnp: PnP ACPI init
+[    0.431931] pnp: PnP ACPI: found 0 devices
+[    0.433987] NET: Registered PF_INET protocol family
+[    0.435749] IP idents hash table entries: 2048 (order: 2, 16384 bytes, linear)
+[    0.438091] tcp_listen_portaddr_hash hash table entries: 256 (order: 0, 4096 bytes, linear)
+[    0.440608] Table-perturb hash table entries: 65536 (order: 6, 262144 bytes, linear)
+[    0.443002] TCP established hash table entries: 1024 (order: 1, 8192 bytes, linear)
+[    0.445357] TCP bind hash table entries: 1024 (order: 3, 32768 bytes, linear)
+[    0.447630] TCP: Hash tables configured (established 1024 bind 1024)
+[    0.449770] MPTCP token hash table entries: 256 (order: 0, 6144 bytes, linear)
+[    0.452237] UDP hash table entries: 256 (order: 1, 8192 bytes, linear)
+[    0.454522] UDP-Lite hash table entries: 256 (order: 1, 8192 bytes, linear)
+[    0.456908] NET: Registered PF_UNIX/PF_LOCAL protocol family
+[    0.459037] RPC: Registered named UNIX socket transport module.
+[    0.461145] RPC: Registered udp transport module.
+[    0.462978] RPC: Registered tcp transport module.
+[    0.464782] RPC: Registered tcp NFSv4.1 backchannel transport module.
+[    0.467050] NET: Registered PF_XDP protocol family
+
+[KVM] linux: msr rd c00000e9 (default)
+
+[KVM] linux: rdmsr c00000e9 -> 0000000000000000
+
+[KVM] linux: io in  0087 (default)
+[    0.473980] Initialise system trusted keyrings
+[    0.475638] Key type blacklist registered
+[    0.477319] workingset: timestamp_bits=36 max_order=15 bucket_order=0
+[    0.480063] zbud: loaded
+[    0.481441] squashfs: version 4.0 (2009/01/31) Phillip Lougher
+[    0.483487] NFS: Registering the id_resolver key type
+[    0.485256] Key type id_resolver registered
+[    0.486847] Key type id_legacy registered
+[    0.488383] nfs4filelayout_init: NFSv4 File Layout Driver Registering...
+[    0.490573] SGI XFS with ACLs, security attributes, quota, no debug enabled
+[    0.494548] Key type asymmetric registered
+[    0.501550] Asymmetric key parser 'x509' registered
+[    0.503372] Block layer SCSI generic (bsg) driver version 0.4 loaded (major 251)
+[    0.505866] io scheduler mq-deadline registered
+[    0.507665] io scheduler kyber registered
+[    0.509296] io scheduler bfq registered
+[    0.511057] Serial: 8250/16550 driver, 1 ports, IRQ sharing disabled
+[    0.513422] serial8250: ttyS0 at I/O 0x3f8 (irq = 4, base_baud = 115200) is a 16450
+[    0.517356] loop: module loaded
+[    0.518894] virtio_blk virtio0: 1/0/0 default/read/poll queues
+[    0.521262] virtio_blk virtio0: [vda] 32768 512-byte logical blocks (16.8 MB/16.0 MiB)
+[    0.524294] Loading iSCSI transport class v2.0-870.
+[    0.526325] iscsi: registered transport (tcp)
+[    0.528063] i8042: PNP: No PS/2 controller found.
+[    0.529877] hid: raw HID events driver (C) Jiri Kosina
+[    0.531917] Initializing XFRM netlink socket
+[    0.533651] NET: Registered PF_INET6 protocol family
+[    0.535774] Segment Routing with IPv6
+[    0.537336] In-situ OAM (IOAM) with IPv6
+
+[KVM] linux: #PF rip=ffffffff81960f7e err=00000002 addr=00000000004c7290
+[KVM] linux: code@ffffffff81960f7e f3 48 ab 83 e2 07 74 04 89 d1 f3 aa 31 c0 c3 cc 
+
+[KVM] linux: #PF rip=ffffffff81961501 err=00000002 addr=00007ffde79ccf59
+[KVM] linux: code@ffffffff81961501 f3 a4 31 c0 0f 1f 00 c3 cc cc cc cc 8d 0c ca 89 
+[    0.546073] bpfilter: Loaded bpfilter_umh pid 136
+
+[KVM] linux: #PF rip=0000000000401780 err=00000014 addr=0000000000401780
+[KVM] linux: code@0000000000401780 unreadable (not mapped in the guest's tables, or outside RAM)
+
+[KVM] linux: #PF rip=0000000000402b85 err=00000006 addr=00000000004cc230
+[KVM] linux: code@0000000000402b85 48 89 3d a4 96 0c 00 48 89 05 cd 1e 0c 00 0f 1f 
+
+[KVM] linux: #PF rip=0000000000402b8c err=00000006 addr=00000000004c4a60
+[KVM] linux: code@0000000000402b8c 48 89 05 cd 1e 0c 00 0f 1f 44 00 00 48 83 c7 08 
+
+[KVM] linux: #PF rip=000000000044be20 err=00000014 addr=000000000044be20
+[KVM] linux: code@000000000044be20 unreadable (not mapped in the guest's tables, or outside RAM)
+
+[KVM] linux: #PF rip=000000000044be8a err=00000004 addr=000000000049c598
+[KVM] linux: code@000000000044be8a 48 63 04 81 48 01 c8 3e ff e0 0f 1f 40 00 48 8b 
+
+[KVM] linux: #PF rip=000000000044c20e err=00000006 addr=00000000004c6158
+[KVM] linux: code@000000000044c20e 48 89 05 43 9f 07 00 e9 75 fd ff ff 66 0f 1f 44 
+
+[KVM] linux: #PF rip=000000000044ba9f err=00000004 addr=00000000004c3cf0
+[KVM] linux: code@000000000044ba9f 44 8b 40 30 48 8b 40 48 41 83 f8 02 77 3b 45 85 
+
+[KVM] linux: #PF rip=000000000044b612 err=00000007 addr=00000000004c3d08
+[KVM] linux: code@000000000044b612 4c 89 4a 48 48 89 42 38 48 89 4a 40 c6 42 50 01 
+
+[KVM] linux: #PF rip=000000000040315f err=00000007 addr=00000000004c5110
+[KVM] linux: code@000000000040315f 48 89 05 aa 1f 0c 00 48 d1 fa 48 89 15 a8 1f 0c 
+
+[KVM] linux: #PF rip=0000000000403213 err=00000004 addr=00000000004002f0
+[KVM] linux: code@0000000000403213 83 7b 08 25 4c 8b 33 74 e4 48 8d 3d 35 52 09 00 
+
+[KVM] linux: #PF rip=000000000041be00 err=00000014 addr=000000000041be00
+[KVM] linux: code@000000000041be00 unreadable (not mapped in the guest's tables, or outside RAM)
+
+[KVM] linux: #PF rip=0000000000485400 err=00000014 addr=0000000000485400
+[KVM] linux: code@0000000000485400 unreadable (not mapped in the guest's tables, or outside RAM)
+
+[KVM] linux: #PF rip=0000000000470e80 err=00000014 addr=0000000000470e80
+[KVM] linux: code@0000000000470e80 unreadable (not mapped in the guest's tables, or outside RAM)
+
+[KVM] linux: #PF rip=000000000046dbc0 err=00000014 addr=000000000046dbc0
+[KVM] linux: code@000000000046dbc0 unreadable (not mapped in the guest's tables, or outside RAM)
+
+[KVM] linux: #PF rip=0000000000425690 err=00000014 addr=0000000000425690
+[KVM] linux: code@0000000000425690 unreadable (not mapped in the guest's tables, or outside RAM)
+
+[KVM] linux: #PF rip=00000000004270c0 err=00000006 addr=000000003b71b358
+[KVM] linux: code@00000000004270c0 4c 89 4f e0 4c 89 57 e8 4c 89 5f f0 48 89 57 f8 
+
+[KVM] linux: #PF rip=000000000045be50 err=00000014 addr=000000000045be50
+[KVM] linux: code@000000000045be50 unreadable (not mapped in the guest's tables, or outside RAM)
+
+[KVM] linux: #PF rip=000000000046bc12 err=00000004 addr=00000000004c81d0
+[KVM] linux: code@000000000046bc12 8b 05 b8 c5 05 00 85 c0 75 0a c7 05 72 ae 05 00 
+
+[KVM] linux: #PF rip=000000000047a261 err=00000006 addr=00007ffde79cbbb8
+[KVM] linux: code@000000000047a261 48 83 0c 24 00 48 83 ec 08 ba 00 10 00 00 48 8d 
+
+[KVM] linux: #PF rip=ffffffff815955c8 err=00000000 addr=00000000004aeab8
+[KVM] linux: code@ffffffff815955c8 49 8b 74 15 00 48 89 f7 4a 8d 04 06 48 f7 d7 48 
+
+[KVM] linux: #PF rip=0000000000438850 err=00000014 addr=0000000000438850
+[KVM] linux: code@0000000000438850 unreadable (not mapped in the guest's tables, or outside RAM)
+
+[KVM] linux: #PF rip=0000000000417c09 err=00000006 addr=000000003b71c058
+[KVM] linux: code@0000000000417c09 48 89 46 08 48 8d 41 10 eb 43 0f 1f 44 00 00 8b 
+
+[KVM] linux: #PF rip=000000000044c2bd err=00000004 addr=00007ffde79f7020
+[KVM] linux: code@000000000044c2bd 48 8b 47 20 44 0f b7 47 38 48 01 f8 66 44 89 85 
+
+[KVM] linux: #PF rip=0000000000495700 err=00000014 addr=0000000000495700
+[KVM] linux: code@0000000000495700 unreadable (not mapped in the guest's tables, or outside RAM)
+[    0.629955] NET: Registered PF_PACKET protocol family
+[    0.631733] Bridge firewalling registered
+[    0.633281] Key type dns_resolver registered
+[    0.634913] NET: Registered PF_VSOCK protocol family
+[    0.636701] IPI shorthand broadcast: enabled
+[    0.638329] sched_clock: Marking stable (622764472, 15545749)->(651104296, -12794075)
+[    0.640776] registered taskstats version 1
+[    0.642431] Loading compiled-in X.509 certificates
+[    0.644162] zswap: loaded using pool lzo/zbud
+[    0.645814] Key type .fscrypt registered
+[    0.647347] Key type fscrypt-provisioning registered
+[    0.649134] Key type encrypted registered
+[    0.650956] clk: Disabling unused clocks
+[    0.652793] EXT4-fs (vda): mounting ext2 file system using the ext4 subsystem
+[    0.656117] EXT4-fs (vda): mounted filesystem without journal. Quota mode: none.
+[    0.658442] VFS: Mounted root (ext2 filesystem) on device 254:0.
+[    0.660741] devtmpfs: mounted
+[    0.662321] Freeing unused kernel image (initmem) memory: 2596K
+[    0.664288] Write protecting the kernel read-only data: 18432k
+[    0.666546] Freeing unused kernel image (text/rodata gap) memory: 2044K
+[    0.668905] Freeing unused kernel image (rodata/data gap) memory: 1960K
+[    0.671062] Run /sbin/init as init process
+=== AKUMA KVM: a Linux guest, root on virtio-blk ===
+Linux (none) 6.1.128 #1 SMP PREEMPT_DYNAMIC Mon Mar 10 14:07:44 UTC 2025 x86_64 GNU/Linux
+model name	: AMD Ryzen 7 8845HS w/ Radeon 780M Graphics
+ebce43017d2cb316ea45e08374de7315  /bin/busybox
+71277886028e270c53e947eb5989f7f2  /wtest
+0.71 0.09
+GUEST-ROOTFS-DONE
+[    0.734174] reboot: Restarting system
+[    0.735724] reboot: machine restart
+
+[KVM] linux: stopped: guest requested a reset (keyboard-controller pulse: its panic=-1 reboot)
+[KVM] linux: exits=99869 cpuid=436 msr=122 io=98745 irq=21 exc=388 injected=207 hlt=1 mmio=156 console_bytes=15414 rip=ffffffff81035e34
+[KVM] linux guest: PASS (banner=yes)
+  smp:  cpu 1 tsc offset 3840795679 cycles
+  smp:  cpu 1 online (lapic id 1)
+  [KVM] cpu 1 svm enabled
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=1048576
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=2097152
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=4194304
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=8388608
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=0 (aff0+1)
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=16777216
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=33554432
+  smp:  cpu 2 tsc offset 3840795793 cycles
+  smp:  cpu 2 online (lapic id 2)
+  [KVM] cpu 2 svm enabled
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=67108864
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 3 tsc offset 3840795698 cycles
+  smp:  cpu 3 online (lapic id 3)
+  [KVM] cpu 3 svm enabled
+[BKL] stuck: owner=1 waiter=4 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 4 tsc offset 3840795774 cycles
+  smp:  cpu 4 online (lapic id 4)
+  [KVM] cpu 4 svm enabled
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+[bkls>] core=2 ticket=1 serving=0 owner=1 spins=134217728
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 5 tsc offset 3840795698 cycles
+  smp:  cpu 5 online (lapic id 5)
+  [KVM] cpu 5 svm enabled
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=4 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 6 tsc offset 3840795717 cycles
+  smp:  cpu 6 online (lapic id 6)
+  [KVM] cpu 6 svm enabled
+[BKL] stuck: owner=1 waiter=5 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=4 tag=511 serving=0 folded=8 (aff0+1)
+[BKL] stuck: owner=1 waiter=2 tag=511 serving=0 folded=8 (aff0+1)
+  smp:  cpu 7 tsc offset 3840795736 cycles
+  smp:  8 cpus online
+  smp:  cpu 7 online (lapic id [BKLPROF] enabled (amd64 diagnostic)
+7)
+  [KVM] cpu 7  net:  wifi link: DHCP and the wall clock follow the join
+ svm enabled
+  net:  netpoll daemon spawned in slot 10

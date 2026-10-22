@@ -7,8 +7,8 @@ Source: **`amd64/src/kvm.rs`** (rungs 0-5, the consistency ladder),
 **`amd64/src/kvm/linux.rs`** (the Linux rung), and the pure models in
 **`crates/akuma-svm-amd64`**.
 
-> **Stability: C (active risk).** Rungs 0-6 have passed on the metal; rungs 7-8
-> (timer, virtio-blk) are verified on QEMU TCG only. The guest cannot reach any
+> **Stability: C (active risk).** Rungs 0-8 have passed on the metal (2026-10-22:
+> Linux boots from a virtio-blk root on the ryzen, entry 28). The guest cannot reach any
 > real device — NPT maps only its RAM and every port and MSR is intercepted — so a
 > wrong guest is a stopped run, not a hardware hazard. A wrong *host* side can
 > still wedge the box (a `#VMEXIT` leaves GIF clear: `stgi` must follow `vmrun`).

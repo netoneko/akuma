@@ -1,6 +1,6 @@
 # The Linux rung: a real `vmlinux` under the SVM hypervisor
 
-**Date:** 2026-10-22. **Status:** **PASS on the metal** (ryzen, entry 28):
+**Date:** 2026-10-22. **Status:** **PASS on the metal** through rung 8 (Linux boots from a virtio-blk root on the ryzen, entry 28); rung 6:
 `[KVM] linux guest: PASS (banner=yes)` — Linux 6.1.128 printed its banner and ran
 on to its first timer wait on real Zen 4 under this hypervisor
 ([`AMD64_KVMTEST_RUNG6_LINUX_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_RUNG6_LINUX_METAL_DMESG_2026_10_22.txt)).
@@ -163,7 +163,22 @@ builds the 16 MiB ext2 image from a static busybox with `mke2fs -d` + `debugfs
 mknod`; `scripts/kvm/linux_rehearse.sh` runs the QEMU rehearsal and, with a
 guest image, requires the guest's `GUEST-ROOTFS-DONE`.
 
-**Not yet:** nested-SVM and metal runs of rungs 7-8; a raw partition as the
+**Nested SVM and the metal (2026-10-22, later).** Built **on the ryzen** (the
+Mac-built-kernel hang), kernel as `/boot/akuma-amd64.verify`, the guest disk as the
+file `/boot/guest-root.img` on p3 (16 MiB), `/boot/vmlinux` as before. The file
+backend had not run anywhere until a TCG pass with the disk inside the host's own
+root image; it worked.
+
+| where | result |
+|---|---|
+| nested SVM, ryzen (`qemu.sh 28`, p3 32 GiB, KVM) | PASS: `tsc: Detected 3789.926 MHz`, `[vda] 32768 blocks`, `VFS: Mounted root (ext2)`, guest `md5sum /bin/busybox` = `ebce4301…` (host's), guest-written `/wtest` = `71277886…`; 100 301 exits, 305 virtual interrupts; the rehearsal's own root `e2fsck` clean |
+| **metal, ryzen entry 28** | **PASS**: `tsc: Detected 3793.429 MHz`, `model name : AMD Ryzen 7 8845HS w/ Radeon 780M Graphics` printed by the guest, same two md5s, `reboot: machine restart` → clean stop; **99 869 exits, 207 virtual interrupts, 156 MMIO accesses, 21 host IRQs**; the file `/boot/guest-root.img` was rewritten by the guest (mtime = the boot). Log: [`AMD64_KVMTEST_RUNG8_VIRTIO_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_RUNG8_VIRTIO_METAL_DMESG_2026_10_22.txt) (the kernel's `dmesg` ring had wrapped under wifi chatter; this is `klog-176.all`) |
+
+Honest scope: the guest is a 16 MiB ext2 + busybox, not Gentoo; one vCPU, no
+network, no LAPIC. The wifi station then took minutes to join —
+[`AMD64_WIFI_JOIN_LATENCY_2026_10_22.md`](AMD64_WIFI_JOIN_LATENCY_2026_10_22.md).
+
+**Not yet:** a raw partition as the
 backing store (NVMe second window); the LAPIC timer; queue interrupts are edge-
 raised once per `process` (fine for one queue, revisit with more devices).
 
@@ -214,8 +229,9 @@ TCG could not show it because its host timer was already running.
 
 ## Still open
 
-- Rungs 7-8 on nested SVM (`qemu.sh 28`) and metal; then the Gentoo partition as
-  the backing store (needs a second NVMe window in `nvme.rs`, or a file on p3).
+- The Gentoo partition as the backing store (needs a second NVMe window in
+  `nvme.rs`, or a file on p3), then more guest: networking (virtio-net), SMP, the
+  LAPIC timer.
 - LAPIC timer (the guest is told `nolapic` today).
 - p3's `e2fsck -fn` reports a corrupted directory in crush's cargo cache
   (`/root/ktarget/.../build/akuma-amd64/<hash>/out`, last written Oct 18) — not

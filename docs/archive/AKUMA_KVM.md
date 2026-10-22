@@ -142,8 +142,14 @@ Read downwards; the sections below are the reference record.
    │   stalls after one byte without a transmit interrupt. Backing store is
    │   the existing `akuma_virtio::block` driver, second device.
    ▼   QEMU TCG: ext2 root mounts, busybox init runs, the guest's md5 of a
-       1.1 MB file equals the host's, a 256 KiB file the guest wrote reads
-       back identical under host debugfs. Nested SVM and metal: next.
+   │   1.1 MB file equals the host's, a 256 KiB file the guest wrote reads
+   │   back identical under host debugfs.
+ [10-22] ═══ RUNG 8 ON THE METAL: LINUX BOOTS ON REAL ZEN 4 ═══  "marvels of engineering"
+   │
+   ▼   Nested SVM first, then entry 28 on the ryzen: the guest prints
+       `model name : AMD Ryzen 7 8845HS`, detects the real 3.79 GHz TSC,
+       mounts a file on p3 as its virtio-blk root, runs init, matches both
+       md5s and reboots itself. 99 869 exits, 207 virtual interrupts.
        [`AKUMA_KVM_LINUX_RUNG.md`](AKUMA_KVM_LINUX_RUNG.md) § Rung 7, 8
 ```
 
