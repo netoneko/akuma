@@ -330,3 +330,28 @@ fn every_connection_on_a_slot_uses_a_new_source_port() {
     }
     assert!(ports.iter().all(|p| (FWD_PORT_BASE..FWD_PORT_BASE + 16).contains(p)), "{ports:?}");
 }
+
+#[test]
+fn a_reset_gateway_is_a_fresh_one() {
+    // The hypervisor reuses one gateway (and its lent storage) for every guest it runs: after
+    // `reset` nothing of the last guest may survive - not its connections, its counters, its
+    // queued frames or the source-port generation - and the next guest must connect normally.
+    let mut net = Net::new();
+    let h = net.socket();
+    net.sockets.get_mut::<tcp::Socket>(h).listen(22).unwrap();
+    assert!(net.gw.fwd_open(0, 22));
+    net.run_until("established", |n| n.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established);
+    let first_port = net.sockets.get::<tcp::Socket>(h).remote_endpoint().unwrap().port;
+    assert!(net.gw.stats.frames > 0);
+    net.sockets.get_mut::<tcp::Socket>(h).abort();
+    net.gw.reset();
+    assert_eq!(net.gw.stats.frames, 0);
+    assert_eq!(net.gw.queued(), 0);
+    assert!(net.gw.fwd(0).state() == State::Closed);
+    // The generation starts over, so the first connection of the next guest is the first port again.
+    net.step();
+    net.sockets.get_mut::<tcp::Socket>(h).listen(22).unwrap();
+    assert!(net.gw.fwd_open(0, 22));
+    net.run_until("established again", |n| n.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established);
+    assert_eq!(net.sockets.get::<tcp::Socket>(h).remote_endpoint().unwrap().port, first_port);
+}

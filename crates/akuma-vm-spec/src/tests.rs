@@ -216,3 +216,53 @@ impl CloneOwned for DiskSource<'_> {
         }
     }
 }
+
+#[test]
+fn a_core_mask_is_a_spec_key_and_round_trips() {
+    let s = parse("kernel=/k\nvcpus=2\ncores=4-5\n").unwrap();
+    assert_eq!(s.cores, 0b11 << 4);
+    let mut b = [0u8; MAX_WIRE];
+    let n = s.encode(&mut b).unwrap();
+    assert!(core::str::from_utf8(&b[..n]).unwrap().contains("cores=4-5\n"));
+    assert_eq!(parse(core::str::from_utf8(&b[..n]).unwrap()).unwrap(), s);
+    // No preference is not written, and is the default.
+    let d = parse("kernel=/k\n").unwrap();
+    assert_eq!(d.cores, 0);
+    let n = d.encode(&mut b).unwrap();
+    assert!(!core::str::from_utf8(&b[..n]).unwrap().contains("cores="));
+    assert_eq!(parse("kernel=/k\ncores=\n"), Err(Error::BadValue));
+    assert_eq!(parse("kernel=/k\ncores=5-4\n"), Err(Error::BadValue));
+}
+
+#[test]
+fn a_mask_formats_as_the_list_that_parses_back() {
+    use crate::cores::{format, parse as parse_list};
+    let mut b = [0u8; 40];
+    for list in ["0", "4-7", "0,2,4-5", "1,3,5,7", "0-63", "62-63"] {
+        let m = parse_list(list).unwrap();
+        let n = format(m, &mut b).unwrap();
+        assert_eq!(core::str::from_utf8(&b[..n]).unwrap(), list);
+    }
+    assert_eq!(format(0, &mut b), None);
+    assert_eq!(format(0b1010101, &mut [0u8; 3]), None);
+}
+
+#[test]
+fn vcpus_are_placed_on_the_cores_both_sides_allow() {
+    use crate::cores::place;
+    let ready = |_c: u32| true;
+    // Machine allows 4-7, the VM asks for nothing in particular: spread over the machine's cores.
+    assert_eq!(place(0, 0xF0, ready, 3).unwrap()[..3], [4, 5, 6]);
+    // The VM's own mask narrows it.
+    assert_eq!(place(0b1100_0000, 0xF0, ready, 2).unwrap()[..2], [6, 7]);
+    // Fewer cores than processors: wrap (they share a core and take turns).
+    assert_eq!(place(0b0001_0000, 0xF0, ready, 3).unwrap()[..3], [4, 4, 4]);
+    // The default machine allows core 0 only: everything on it, as before placement existed.
+    assert_eq!(place(0, 1, ready, 4).unwrap(), [0, 0, 0, 0]);
+    // A core without SVM is skipped.
+    assert_eq!(place(0, 0xF0, |c| c != 4, 2).unwrap()[..2], [5, 6]);
+    // A VM mask outside the machine's: ignored, not obeyed.
+    assert_eq!(place(0b11, 0xF0, ready, 2).unwrap()[..2], [4, 5]);
+    // No usable core anywhere.
+    assert_eq!(place(0, 0xF0, |_| false, 1), None);
+}

@@ -767,6 +767,22 @@ pub fn kick_halted_core() {
     }
 }
 
+/// Interrupt core `cpu` (not this one) with the wake IPI, whatever it is doing: it ends a
+/// `hlt`, and a core running a guest takes a `#VMEXIT` for it. For a hypervisor task that must
+/// look at something *now* — a virtual interrupt for its guest, a stop request — rather than
+/// at its next sleep or host tick. Unlike [`kick_halted_core`] it names the core and does not
+/// care whether the idle loop had announced a halt.
+pub fn kick_core(cpu: usize) {
+    if cpu == cpu_index() || cpu >= ONLINE.load(Ordering::Acquire).min(MAX_CPUS) {
+        return;
+    }
+    // `IF` off across the two ICR writes (see `kick_halted_core`).
+    let flags = akuma_cpu::daif::save_and_mask_irq();
+    lapic::send_fixed(PERCPU[cpu].lapic_id.load(Ordering::Relaxed), WAKE_VECTOR);
+    akuma_cpu::daif::restore(flags);
+    WAKE_IPIS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Install [`WAKE_VECTOR`] in the shared IDT. Called from `lapic::init`, next
 /// to the shootdown vector, on both boot protocols.
 pub fn install_wake_vector() {

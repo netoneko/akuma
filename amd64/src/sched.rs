@@ -626,7 +626,45 @@ fn hook_can_run(slot: usize) -> bool {
     let cpu = smp::cpu_index() as u32;
     let m = &MACHINE[slot];
     let pinned = m.pinned.load(Ordering::Relaxed);
-    !m.idle.load(Ordering::Relaxed) && (pinned == NO_CPU || pinned == cpu)
+    if m.idle.load(Ordering::Relaxed) {
+        return false;
+    }
+    // A reserved core (a running VM's, see [`reserve_cores`]) runs only what is pinned to it.
+    if pinned != cpu && RESERVED_CORES.load(Ordering::Relaxed) & (1 << cpu) != 0 {
+        return false;
+    }
+    pinned == NO_CPU || pinned == cpu
+}
+
+/// Cores kept for tasks pinned to them: the picker never hands an unpinned thread to one.
+/// Set while a VM runs on them (`kvm::linux`), so a guest's virtual processor is not
+/// time-sliced against sshd on its own core. Core 0 is never reserved (the boot thread and
+/// the tick bookkeeping live there). A thread already running on a core when its bit is set
+/// keeps it until it next switches out.
+static RESERVED_CORES: AtomicU64 = AtomicU64::new(0);
+
+/// Reserve the cores in `mask` (bit `c` = core `c`; bit 0 is ignored); 0 releases them all.
+pub fn reserve_cores(mask: u64) {
+    RESERVED_CORES.store(mask & !1, Ordering::Relaxed);
+}
+
+/// Move the running thread to core `cpu` and keep it there: pins it, then parks until a
+/// picker on that core hands it back. False if it did not get there. For a task whose state
+/// is per-core (a hypervisor run loop's `EFER.SVME` and host save area) and whose core is
+/// only known when its work arrives.
+pub fn repin_current(cpu: usize) -> bool {
+    if smp::cpu_index() == cpu {
+        MACHINE[current()].pinned.store(cpu as u32, Ordering::Relaxed);
+        return true;
+    }
+    MACHINE[current()].pinned.store(cpu as u32, Ordering::Relaxed);
+    for _ in 0..200 {
+        block_until_deadline(crate::net::uptime_us() + 500);
+        if smp::cpu_index() == cpu {
+            return true;
+        }
+    }
+    false
 }
 
 /// Which task slot, if any, is still carrying `l0_base` as the root its next

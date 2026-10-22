@@ -17,6 +17,7 @@
 //! | `vm_cmdline` | guest command line tail (rest of the line, spaces kept) |
 //! | `vm_ram_mib` | guest RAM, 16-1024 |
 //! | `vm_vcpus` | virtual processors, 1-4 |
+//! | `vm_cores` | host cores the virtual processors may run on (`4-5`); the kernel's `kvmcores=` is the allowed set, so a core outside it is ignored |
 //! | `vm_disk` | disk image path, or `/dev/nvme0n1p<N>` to use that NVMe partition in place (empty: the machine's second virtio-blk) |
 //! | `vm_disk_ram` | copy the disk into RAM at start |
 //! | `vm_forward` | `host:guest`, repeatable |
@@ -203,6 +204,14 @@ mod tests {
         assert_eq!(c.finish(no_files).unwrap().unwrap().forwards().len(), 2);
         let c = conf(&[("vm", "1"), ("vm_kernel", "/k"), ("vm_forward", "1:1"), ("vm_forward", "2:2"), ("vm_forward", "3:3"), ("vm_forward", "4:4"), ("vm_forward", "5:5")]);
         assert!(matches!(c.finish(no_files), Err(VmError::Key(_, Error::TooManyForwards))));
+    }
+
+    #[test]
+    fn cores_are_a_list_and_reach_the_spec() {
+        let c = conf(&[("vm", "1"), ("vm_kernel", "/k"), ("vm_vcpus", "2"), ("vm_cores", "4-5")]);
+        assert_eq!(c.finish(no_files).unwrap().unwrap().cores, 0b11 << 4);
+        let c = conf(&[("vm", "1"), ("vm_kernel", "/k"), ("vm_cores", "5-4")]);
+        assert!(matches!(c.finish(no_files), Err(VmError::Key(k, Error::BadValue)) if k == "vm_cores"));
     }
 
     #[test]

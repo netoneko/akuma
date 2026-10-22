@@ -31,6 +31,11 @@ ap.add_argument("--herd", action="store_true", help="host init is herd; the gues
 ap.add_argument("--herd-conf", help="with --herd: this conf instead of the generated one")
 ap.add_argument("--restart", action="store_true", help="with --herd: a host oneshot kills the `herd vm-run` process (pid 2) after 90 s; herd must bring the guest back and ssh must work again")
 ap.add_argument("--stress", type=int, default=0, help="rounds of overlapping + back-to-back sessions (the wedge shape from the ryzen, 2026-10-22)")
+ap.add_argument("--host-smp", type=int, default=1, help="QEMU -smp and the host kernel's smp=: host cores for vCPUs to spread over")
+ap.add_argument("--kvmcores", help="the host kernel's kvmcores= (the cores the hypervisor may use), e.g. 1-2")
+ap.add_argument("--vcpus", type=int, default=1, help="with --herd: vm_vcpus of the generated conf")
+ap.add_argument("--vm-cores", help="with --herd: vm_cores of the generated conf")
+ap.add_argument("--probe", type=int, default=0, help="run this many parallel CPU-bound loops in the guest and print the wall time and /proc/cpuinfo's processor count (the vCPU speedup probe)")
 a = ap.parse_args()
 
 here = os.path.dirname(os.path.abspath(__file__))
@@ -56,7 +61,7 @@ if a.herd:
     os.makedirs(f"{w}/host/var/log/herd")
     os.makedirs(f"{w}/host/var/run/herd")
     conf = open(a.herd_conf).read() if a.herd_conf else (
-        "vm = true\nvm_type = kvm\nvm_kernel = /boot/akuma-guest\nvm_ram_mib = 768\nvm_vcpus = 1\n"
+        f"vm = true\nvm_type = kvm\nvm_kernel = /boot/akuma-guest\nvm_ram_mib = 768\nvm_vcpus = {a.vcpus}\n" + (f"vm_cores = {a.vm_cores}\n" if a.vm_cores else "") +
         f"vm_forward = {a.port}:22\nvm_cmdline = init=/bin/busybox initargs=sh,/etc/guest.sh\n"
         "restart = true\nrestart_delay_ms = 5000\n")
     open(f"{w}/host/etc/herd/enabled/vm-serve.conf", "w").write(conf)
@@ -71,12 +76,13 @@ subprocess.run(["sh", f"{here}/akuma_guest_rootfs.sh", f"{w}/guest.img", busybox
 # The service guest reads /boot/akuma-serve-root.img only without a second virtio-blk; give it one.
 q = subprocess.Popen([
     "qemu-system-x86_64", "-M", "microvm", "-cpu", "EPYC-Milan,svm=on",
-    "-global", "virtio-mmio.force-legacy=false", "-m", os.environ.get("MEM", "3072"), "-smp", "1",
+    "-global", "virtio-mmio.force-legacy=false", "-m", os.environ.get("MEM", "3072"), "-smp", str(a.host_smp),
     "-kernel", kernel,
     "-drive", f"id=d0,file={w}/root.img,format=raw,if=none", "-device", "virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0",
     "-drive", f"id=d1,file={w}/guest.img,format=raw,if=none", "-device", "virtio-blk-device,drive=d1,bus=virtio-mmio-bus.1",
     "-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{a.port}-:{a.port}", "-device", "virtio-net-device,netdev=n0,bus=virtio-mmio-bus.2",
     "-append", f"virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6 virtio_mmio.device=512@0xfeb00400:7 "
+               + (f"smp={a.host_smp} " if a.host_smp > 1 else "") + (f"kvmcores={a.kvmcores} " if a.kvmcores else "")
                + (f"kvmctl kvmmem=1536 init=/bin/herd initargs=daemon" if a.herd else
                   f"kvmtest kvmserve noladder kvmfwd={a.port} init=/bin/busybox initargs=sleep,1000000"),
     "-serial", f"file:{a.log}", "-display", "none", "-no-reboot"],
@@ -214,6 +220,22 @@ if ok and a.stress:
             print("stress WEDGE:", bad)
             ok = False
             break
+if ok and a.probe:
+    # The vCPU speedup probe: N identical CPU-bound busybox loops at once. On one host core they
+    # take N times as long as one; on N cores about as long as one. Wall time is this machine's
+    # clock around the ssh, so the fixed cost of the connection is in both numbers: compare
+    # --probe 1 against --probe N on the same boot.
+    base = ["ssh", "-p", str(a.port), "-i", key, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=60", "root@127.0.0.1"]
+    loops = int(os.environ.get("PROBE_LOOPS", "200000"))
+    body = f"i=0; while [ $i -lt {loops} ]; do i=$((i+1)); done"
+    for n in sorted({1, a.probe}):
+        cmd = "; ".join([f"({body}) &" for _ in range(n)] + ["wait", "echo probe-done"])
+        t = time.time()
+        r = subprocess.run(base + [f"grep -c ^processor /proc/cpuinfo; {cmd}"], capture_output=True, text=True, timeout=1800)
+        cpus = r.stdout.split()[0] if r.stdout.split() else "?"
+        print(f"[REHEARSE] probe x{n}: {time.time() - t:.1f}s (guest sees {cpus} processors) {'ok' if 'probe-done' in r.stdout else 'FAILED ' + r.stderr.strip()[-60:]}")
+        ok = ok and "probe-done" in r.stdout
 if ok and a.restart:
     # The oneshot fires 90 s after herd starts; wait for the replacement guest and talk to it.
     t1 = time.time()

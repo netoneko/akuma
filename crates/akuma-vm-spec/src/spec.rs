@@ -194,6 +194,9 @@ pub struct Spec {
     pub cmdline: Text<MAX_CMDLINE>,
     pub ram_mib: u32,
     pub vcpus: u8,
+    /// Host cores the virtual processors may run on (`vm_cores`); 0: no preference. Intersected
+    /// with the machine's `kvmcores=` by [`crate::cores::place`].
+    pub cores: u64,
     /// Empty: the guest has no disk of its own (it gets the machine's fallback image).
     pub disk: Text<MAX_PATH>,
     /// Copy the disk into RAM at start: the guest never touches the host's storage and its
@@ -211,6 +214,7 @@ impl Default for Spec {
             cmdline: Text::new(),
             ram_mib: DEFAULT_RAM_MIB,
             vcpus: 1,
+            cores: 0,
             disk: Text::new(),
             disk_ram: false,
             forwards: [Forward { host: 0, guest: 0 }; MAX_FORWARDS],
@@ -283,6 +287,7 @@ impl Spec {
                 }
                 self.vcpus = n;
             }
+            "cores" => self.cores = crate::cores::parse(value).ok_or(Error::BadValue)?,
             "disk" | "path_on_host" => {
                 disk_source_of(value)?;
                 self.disk.set(value)?;
@@ -339,6 +344,13 @@ impl Spec {
         }
         w.num("ram_mib", u64::from(self.ram_mib))?;
         w.num("vcpus", u64::from(self.vcpus))?;
+        if self.cores != 0 {
+            w.put(b"cores=")?;
+            let mut list = [0u8; 40];
+            let n = crate::cores::format(self.cores, &mut list)?;
+            w.put(&list[..n])?;
+            w.put(b"\n")?;
+        }
         if !self.disk.is_empty() {
             w.line("disk", self.disk.as_str())?;
             w.line("disk_ram", if self.disk_ram { "1" } else { "0" })?;

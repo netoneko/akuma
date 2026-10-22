@@ -347,6 +347,26 @@ impl<'a> Gateway<'a> {
         })
     }
 
+    /// Forget everything - queued frames, every connection, the guest's address, the counters -
+    /// and keep the storage it was lent. A gateway outlives one guest this way: the lender
+    /// (the hypervisor, which can only lend `'static` storage to a multi-core machine) hands the
+    /// same gateway to the next guest instead of leaking a fresh 60 KiB per start.
+    pub fn reset(&mut self) {
+        self.q.lens = [0; DEPTH];
+        self.q.head = 0;
+        self.q.count = 0;
+        self.guest_mac = GUEST_MAC;
+        self.echo.clear();
+        self.echo_peer = 0;
+        for c in &mut self.fwd {
+            c.clear();
+        }
+        self.fwd_peer = [0; FWD_SLOTS];
+        self.fwd_gen = [0; FWD_SLOTS];
+        self.iss = 0x4B1D_0000;
+        self.stats = Stats::new();
+    }
+
     /// Build a reply in the next free slot with `build`, which returns its length.
     fn enqueue(&mut self, build: impl FnOnce(&mut [u8]) -> Option<usize>) -> bool {
         let ok = self.q.push_with(build);
