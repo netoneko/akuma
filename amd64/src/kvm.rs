@@ -152,6 +152,9 @@ pub fn init(cmdline: &str) {
         }
         if let Some(mask) = cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("kvmcores=")).and_then(akuma_vm_spec::cores::parse) {
             VM_CORES.store(mask, Ordering::Relaxed);
+            // The cores handed to the hypervisor are the hypervisor's from boot: the host
+            // schedules nothing on them, whether or not a VM is running (core 0 never).
+            crate::sched::reserve_cores(mask);
         }
     }
     if want_test {
@@ -353,6 +356,11 @@ pub(crate) fn nrips() -> bool {
 /// The cores the VM task may run on (`kvmcores=`, a list like `4-7`); bit 0 (the boot core)
 /// when absent. All of a guest's virtual processors still take turns on **one** of them.
 static VM_CORES: AtomicU64 = AtomicU64::new(1);
+
+/// The cores the host schedules nothing on while no VM runs: `kvmcores=` less core 0, when given.
+pub(crate) fn boot_reserved() -> u64 {
+    if VM_CORES.load(Ordering::Relaxed) == 1 { 0 } else { VM_CORES.load(Ordering::Relaxed) & !1 }
+}
 
 pub(crate) fn vm_cores() -> u64 {
     VM_CORES.load(Ordering::Relaxed)

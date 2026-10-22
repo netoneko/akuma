@@ -212,7 +212,7 @@ adds one for a single driver. It is opened by the kernel's own `openat` arm like
   `i`-th usable core of the intersection (wrapping: processors sharing a core take turns, as before placement). The
   VM task repins itself to processor 0's core; every other core gets a persistent worker task
   (`kvm/linux/machine.rs`) that serves the processors placed there. While a service VM runs, its cores (never core 0)
-  are **reserved**: the picker hands them only tasks pinned to them (`sched::reserve_cores`). Shared state is guest RAM
+  are **reserved**: the picker hands them only tasks pinned to them (`sched::reserve_cores`). With `kvmcores=` given, the whole set is reserved **from boot** (less core 0), so the host schedules nothing there even with no VM running; the cores are still registered and tick (not starting them at all is the planned next step). Shared state is guest RAM
   and the NPT (read-only once built), the devices behind one lock, and a state word + `poke` flag per processor; a
   cross-core IPI, INIT, STARTUP, or a disk interrupt for processor 0 sets the flag and sends the wake IPI
   (`smp::kick_core`). Exits are still handled under the BKL, so groups serialise there; never hold the device lock
@@ -265,6 +265,46 @@ are used; its crates' `kvm-bindings` come from the Linux UAPI headers and stay o
 Kernel parameters: `kvmctl` (arm SVM for `/dev/kvm0`, run nothing at boot), `kvmmem=<MiB>`,
 `kvmcores=<list>`. The older `kvmtest` + `kvmserve`/`kvmgentoo`/selector-file path is a shim: it builds the
 same `Spec` (`kvm::legacy_service`) and queues it with no owner, so the rehearsal flags and entry 28 keep working.
+
+## Isolation modes under herd (one supervisor, four shapes of "a machine")
+
+```
+                                  herd  (init, pid 1: reads /etc/herd/enabled/*.conf)
+                                    |   same restart / max_retries / log policy for every shape
+        +---------------------------+-----------------------------+------------------------------+
+        |                           |                             |                              |
+   (a) process                (b) box                      (c) VM, Akuma kernel           (d) VM, Linux kernel
+   command = ...              boxed = true                 vm = true                      vm = true
+   no isolation               box_root / bundle            vm_kernel = /boot/akuma-guest  vm_kernel = vmlinux
+                              (OCI rootfs, overlay)        vm_type = kvm                  (PVH; legacy boot flag
+        |                           |                             |                         only today, not yet
+        |                  +--------+---------+          +--------+---------+               a herd-run guest)
+        |                  |                  |          |                  |                     |
+        |             box: Alpine        box: Gentoo   guest: Akuma     guest: Akuma          guest: Linux
+        |             (OCI image,        (/opt/gentoo  kernel +         kernel + Gentoo       kernel + any
+        |              apk userland)      root on p3)  busybox root     userland on p7        root (virtio-blk)
+        |                  |                  |          |                  |                     |
+ isolation by:       namespaces in ONE Akuma kernel      hardware: SVM + nested paging, own kernel,
+                     (mount/pid/net views, fs policy)    own RAM slice of the kvmmem= reserve, own cores
+        |                  |                  |          |                  |                     |
+ network:            host stack (smoltcp) or a rump     built-in gateway 10.0.2.2 (DHCP/ARP/ICMP), host
+                     box via stack = rump; ports are    ports forwarded in: vm_forward = host:guest
+                     the host's                         (a relay listens on the host, one per forward)
+        |                  |                  |          |                  |                     |
+ storage:            host fs         overlay on OCI     vm_disk = image file, RAM copy (vm_disk_ram), or a
+                                     layers / SubdirFs  GPT partition in place (/dev/nvme0n1p7); the host's
+                                                        own root is never offered
+        |                  |                  |          |                  |                     |
+ config:             command, args   bundle = OCI       vm_ram_mib, vm_vcpus, vm_cores, vm_cmdline,
+                                     config.json        or vm_config = a Firecracker JSON (boot-source,
+                                                        machine-config, drives[0]); vm_* keys win
+```
+
+Everything above is a herd service: `herd start/stop/status`, restart policy and `/var/log/herd/<name>.log`
+are the same. A VM's lifetime is its supervising process (`herd vm-run`); the guest's console is its log.
+Boxes share one kernel and cost almost nothing; VMs cost a RAM slice and cores (reserved from the host,
+`kvmcores=`/`vm_cores`) and give a separate kernel. Firecracker-style (`vm_type = firecracker`) is reserved
+for the `/dev/kvm` userspace-VMM track.
 
 ## Run it
 

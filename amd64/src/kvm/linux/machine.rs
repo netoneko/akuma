@@ -1188,7 +1188,7 @@ pub fn run(nrips: bool, vm: &Vm) {
         for i in 0..n_cpu {
             reserve |= 1 << sh.place[i];
         }
-        crate::sched::reserve_cores(reserve);
+        crate::sched::reserve_cores(reserve | super::super::boot_reserved());
     }
 
     crumb(0x55);
@@ -1236,7 +1236,7 @@ pub fn run(nrips: bool, vm: &Vm) {
         }
     }
     if service {
-        crate::sched::reserve_cores(0);
+        crate::sched::reserve_cores(super::super::boot_reserved());
     }
     if owner_core != here && started {
         let _ = crate::sched::repin_current(here);

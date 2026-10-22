@@ -162,6 +162,46 @@ restart = true
 # UNBOXED — box 0 itself is rump under rump-default, no join_box needed
 ```
 
+## Isolation modes under herd (one supervisor, four shapes of "a machine")
+
+```
+                                  herd  (init, pid 1: reads /etc/herd/enabled/*.conf)
+                                    |   same restart / max_retries / log policy for every shape
+        +---------------------------+-----------------------------+------------------------------+
+        |                           |                             |                              |
+   (a) process                (b) box                      (c) VM, Akuma kernel           (d) VM, Linux kernel
+   command = ...              boxed = true                 vm = true                      vm = true
+   no isolation               box_root / bundle            vm_kernel = /boot/akuma-guest  vm_kernel = vmlinux
+                              (OCI rootfs, overlay)        vm_type = kvm                  (PVH; legacy boot flag
+        |                           |                             |                         only today, not yet
+        |                  +--------+---------+          +--------+---------+               a herd-run guest)
+        |                  |                  |          |                  |                     |
+        |             box: Alpine        box: Gentoo   guest: Akuma     guest: Akuma          guest: Linux
+        |             (OCI image,        (/opt/gentoo  kernel +         kernel + Gentoo       kernel + any
+        |              apk userland)      root on p3)  busybox root     userland on p7        root (virtio-blk)
+        |                  |                  |          |                  |                     |
+ isolation by:       namespaces in ONE Akuma kernel      hardware: SVM + nested paging, own kernel,
+                     (mount/pid/net views, fs policy)    own RAM slice of the kvmmem= reserve, own cores
+        |                  |                  |          |                  |                     |
+ network:            host stack (smoltcp) or a rump     built-in gateway 10.0.2.2 (DHCP/ARP/ICMP), host
+                     box via stack = rump; ports are    ports forwarded in: vm_forward = host:guest
+                     the host's                         (a relay listens on the host, one per forward)
+        |                  |                  |          |                  |                     |
+ storage:            host fs         overlay on OCI     vm_disk = image file, RAM copy (vm_disk_ram), or a
+                                     layers / SubdirFs  GPT partition in place (/dev/nvme0n1p7); the host's
+                                                        own root is never offered
+        |                  |                  |          |                  |                     |
+ config:             command, args   bundle = OCI       vm_ram_mib, vm_vcpus, vm_cores, vm_cmdline,
+                                     config.json        or vm_config = a Firecracker JSON (boot-source,
+                                                        machine-config, drives[0]); vm_* keys win
+```
+
+Everything above is a herd service: `herd start/stop/status`, restart policy and `/var/log/herd/<name>.log`
+are the same. A VM's lifetime is its supervising process (`herd vm-run`); the guest's console is its log.
+Boxes share one kernel and cost almost nothing; VMs cost a RAM slice and cores (reserved from the host,
+`kvmcores=`/`vm_cores`) and give a separate kernel. Firecracker-style (`vm_type = firecracker`) is reserved
+for the `/dev/kvm` userspace-VMM track.
+
 ## Mount policy: composed from outside, once
 
 A box's mount namespace is built **entirely by box 0**, through `MOUNT_IN_NS`,
