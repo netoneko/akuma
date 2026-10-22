@@ -158,6 +158,26 @@ separates "a datagram arrived" from "a timeout elapsed"). Without `NETPROBE` the
 
 `busybox ping` cannot be used as a probe: Akuma has no raw sockets (`can't create raw socket`).
 
+## ssh into the guest (phase 13, 2026-10-22)
+
+`kvmserve` (`/boot/kvm-guest` = `akuma-serve`): the guest runs `userspace/sshd` on its port 22
+and its init script never ends; a host port (2223) is forwarded to it. **Rehearsed under TCG
+end to end with a real `ssh`** (`scripts/kvm/serve_rehearse.py`): QEMU's `hostfwd` ->
+the host Akuma's relay -> the gateway's TCP -> the guest's sshd, running `echo`, `uname -a` and
+`cat /proc/cpuinfo` in the guest.
+
+What it took: **TCP in the gateway** (`akuma-svm-amd64::tcp`, ~400 lines, verified against
+smoltcp in both roles with 300 KB echoed back byte-exact and 200 KB / 150 KB streamed each way
+— `tests/gateway_tcp.rs`); gateway **forward slots** (the gateway opens the connection *to* the
+guest); a **relay** on the host's socket API; and the hypervisor as a **background host task**
+(the host's network does not exist when `kvm::late` runs, and on the ryzen wifi only joins after
+init), which meant pinning a daemon to core 0, re-`VMSAVE`ing the host state each entry,
+yielding the BKL, and sleeping with `hlt` when the guest is idle. Found on the way: a host with
+no `init` ends in `halt()`, so the task is never scheduled.
+
+TCP made the guest's `nc` TCP probe pass (`NET=1 TCPPROBE=1`: `tcp echo: akuma-tcp-probe`),
+which the UDP probe never did; see the open item below.
+
 ## Still open
 
 * (Fixed 2026-10-22, same day: a guest spinning with `IF` set used to see timer

@@ -732,7 +732,8 @@ mod tests {
         use crate::gateway::{build_udp, Gateway, GATEWAY_IP, GATEWAY_MAC, GUEST_IP, GUEST_MAC};
         let m = Mem::new(0x10000);
         let mut d = bring_up();
-        let mut wire = Gateway::new();
+        let storage = vec![0u8; crate::gateway::STORAGE].leak();
+        let mut wire = Gateway::new(storage).unwrap();
         // A receive buffer is posted first, as a driver does.
         desc(&m, RXQ, 0, BUF + 0x2000, 2048, DESC_WRITE, 0);
         make_available(&m, RXQ, 0, 0);

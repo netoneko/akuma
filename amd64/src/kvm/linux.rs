@@ -41,6 +41,7 @@ use akuma_svm_amd64::lapic::{self, IpiMode, Lapic};
 use akuma_svm_amd64::mmio;
 use akuma_svm_amd64::pic::PicPair;
 use akuma_svm_amd64::pit::{self, Pit};
+use super::relay::Relay;
 use akuma_svm_amd64::gateway::Gateway;
 use akuma_svm_amd64::virtio::{self, Disk, GuestMem, MmioBlk};
 use akuma_svm_amd64::virtio_net::MmioNet;
@@ -64,6 +65,8 @@ const AKUMA_DISK_ARGS: &str = " virtio_mmio.device=4K@0xd0000000:5 init=/bin/bus
 /// [`AKUMA_DISK_ARGS`] and then the NIC's window.
 const AKUMA_NET_ARGS: &str =
     " virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6 init=/bin/busybox initargs=sh,/etc/guest.sh";
+/// The service guest's disk image (sshd, its keys) when the machine has no second virtio-blk.
+const AKUMA_SERVE_IMAGE_PATH: &str = "/boot/akuma-serve-root.img";
 /// The Akuma guest's disk when the machine has no second virtio-blk device.
 const AKUMA_DISK_IMAGE_PATH: &str = "/boot/akuma-guest-root.img";
 /// The Akuma guest's RAM. The kernel takes a fixed 512 MiB heap
@@ -132,12 +135,22 @@ pub enum Guest {
     /// gateway ([`svm::gateway`]): it should lease `10.0.2.15` by DHCP and reach
     /// `10.0.2.2`. One virtual processor.
     AkumaNet,
+    /// The Akuma guest as a **service**: NIC, sshd on its port 22 and a script that never
+    /// ends, run as a background host task ([`super::spawn_service`]) with a host port
+    /// forwarded to it ([`super::relay`]). It has no budgets: it runs until the guest
+    /// stops or the host does.
+    AkumaServe,
 }
 
 impl Guest {
+    /// Is this a guest that runs for as long as the host does (as a background task)?
+    pub const fn is_service(self) -> bool {
+        matches!(self, Self::AkumaServe)
+    }
+
     /// Does the guest have a NIC?
     const fn has_net(self) -> bool {
-        matches!(self, Self::AkumaNet)
+        matches!(self, Self::AkumaNet | Self::AkumaServe)
     }
 
     /// How many virtual processors the guest has.
@@ -150,7 +163,7 @@ impl Guest {
 
     /// Is the guest this kernel's own ELF (as opposed to a Linux `vmlinux`)?
     const fn is_akuma(self) -> bool {
-        matches!(self, Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet)
+        matches!(self, Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe)
     }
 
     const fn is_linux(self) -> bool {
@@ -165,14 +178,14 @@ impl Guest {
     const fn path(self) -> &'static str {
         match self {
             Self::Linux | Self::LinuxApic => LINUX_PATH,
-            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet => AKUMA_PATH,
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe => AKUMA_PATH,
         }
     }
 
     const fn ram_bytes(self) -> u64 {
         match self {
             Self::Linux | Self::LinuxApic => RAM_BYTES,
-            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet => AKUMA_RAM_BYTES,
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe => AKUMA_RAM_BYTES,
         }
     }
 
@@ -180,6 +193,7 @@ impl Guest {
         match self {
             Self::Linux | Self::LinuxApic => DISK_IMAGE_PATH,
             Self::Akuma | Self::AkumaSmp | Self::AkumaNet => AKUMA_DISK_IMAGE_PATH,
+            Self::AkumaServe => AKUMA_SERVE_IMAGE_PATH,
             Self::AkumaHello => HELLO_DISK_IMAGE_PATH,
         }
     }
@@ -188,7 +202,7 @@ impl Guest {
     const fn banner(self) -> &'static [u8] {
         match self {
             Self::Linux | Self::LinuxApic => b"Linux version",
-            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet => b"Akuma/amd64",
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet | Self::AkumaServe => b"Akuma/amd64",
         }
     }
 
@@ -198,6 +212,8 @@ impl Guest {
         match self {
             Self::Linux | Self::LinuxApic => None,
             Self::Akuma | Self::AkumaSmp | Self::AkumaNet => Some(b"AKUMA-GUEST-DONE"),
+            // A service never finishes; the line that says its sshd is up is the milestone.
+            Self::AkumaServe => Some(b"AKUMA-GUEST-SSHD-STARTED"),
             Self::AkumaHello => Some(b"run by Akuma"),
         }
     }
@@ -210,6 +226,7 @@ impl Guest {
             Self::AkumaHello => "akuma-hello",
             Self::AkumaSmp => "akuma-smp",
             Self::AkumaNet => "akuma-net",
+            Self::AkumaServe => "akuma-serve",
         }
     }
 }
@@ -1092,15 +1109,15 @@ impl MmioDev for LapicDev<'_> {
 }
 
 /// The virtio-net window, at `off`: a doorbell write runs the queues at once.
-struct NetDev<'a> {
+struct NetDev<'a, 'g> {
     dev: &'a mut MmioNet,
-    wire: &'a mut Gateway,
+    wire: &'a mut Gateway<'g>,
     ram: &'a Ram,
     bounce: &'a mut [u8],
     off: u64,
 }
 
-impl MmioDev for NetDev<'_> {
+impl MmioDev for NetDev<'_, '_> {
     fn load(&mut self, size: u8) -> u64 {
         self.dev.read(self.off, size)
     }
@@ -1286,7 +1303,7 @@ pub fn run(nrips: bool, guest: Guest) {
         // No `nosmp`: the MADT says how many processors there are.
         Guest::AkumaSmp => cmdline_with_tsc(&mut cmd, "", 0, if disk.is_some() { AKUMA_DISK_ARGS } else { "" }),
         // The disk's window first, then the NIC's: slot order is device order.
-        Guest::AkumaNet => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { AKUMA_NET_ARGS } else { NET_ARGS }),
+        Guest::AkumaNet | Guest::AkumaServe => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { AKUMA_NET_ARGS } else { NET_ARGS }),
     };
     match disk {
         Some(d) => {
@@ -1379,9 +1396,7 @@ pub fn run(nrips: bool, guest: Guest) {
     // that `vmrun_regs` loads back after every exit.
     let host_pa = host_f.pa() as u64;
     let _ = host_f.bytes_mut();
-    // SAFETY: `host_pa` is a frame this function owns, 4-KiB-aligned; VMSAVE
-    // writes the 4 KiB state-save layout into it and nothing else.
-    unsafe { core::arch::asm!("vmsave rax", in("rax") host_pa, options(nostack)) };
+    save_host(host_pa);
 
     crumb(0x55);
     p("[KVM] linux: running (start=");
@@ -1406,7 +1421,17 @@ pub fn run(nrips: bool, guest: Guest) {
     let (mut n_inj, mut n_hlt, mut n_mmio) = (0u64, 0u64, 0u64);
     let (mut n_ipi, mut n_init, mut n_sipi, mut n_pause) = (0u64, 0u64, 0u64, 0u64);
     let mut blk = disk.map(|d| (MmioBlk::new(d.sectors()), d));
-    let mut net = guest.has_net().then(|| (MmioNet::new(svm::gateway::GUEST_MAC), Gateway::new()));
+    // The gateway's queue and TCP rings live on the heap, lent to it: a few tens of KiB is
+    // too much to build on a 32 KiB task stack.
+    let mut gw_storage = alloc::vec![0u8; if guest.has_net() { svm::gateway::STORAGE } else { 0 }];
+    let mut net = if guest.has_net() {
+        Gateway::new(&mut gw_storage).map(|g| (MmioNet::new(svm::gateway::GUEST_MAC), g))
+    } else {
+        None
+    };
+    let service = guest.is_service();
+    let mut relay = service.then(|| Relay::new(super::SERVE_PORT.load(core::sync::atomic::Ordering::Relaxed)));
+    let mut next_relay_us = 0u64;
     let mut n_net = 0u64;
     if crate::lapic::tsc_uptime_us().is_none() {
         p("[KVM] linux: warning: host uptime is 10 ms ticks; PIT timing will be coarse\n");
@@ -1419,21 +1444,35 @@ pub fn run(nrips: bool, guest: Guest) {
     plat.last_tx_us = started_us;
     let (mut n_lapic, mut n_ticks) = (0u64, 0u64);
     'run: loop {
-        if exits >= MAX_EXITS {
+        if exits >= MAX_EXITS && !service {
             break 'run;
         }
         let now_us = crate::net::uptime_us();
-        if now_us.saturating_sub(started_us) > RUN_BUDGET_US {
+        if now_us.saturating_sub(started_us) > RUN_BUDGET_US && !service {
             stopped = "wall-clock budget spent";
             break 'run;
         }
-        if plat.banner.seen && now_us.saturating_sub(plat.last_tx_us) > QUIET_BUDGET_US {
+        if plat.banner.seen && now_us.saturating_sub(plat.last_tx_us) > QUIET_BUDGET_US && !service {
             stopped = "guest console quiet after the banner";
             break 'run;
         }
-        if plat.done.seen {
+        if plat.done.seen && !service {
             stopped = "guest reported its init ran to the end";
             break 'run;
+        }
+        if service {
+            // Other host tasks (the network, sshd) get the core between guest entries. The
+            // kernel runs with interrupts masked outside its idle loop, and the switch
+            // expects that.
+            akuma_cpu::daif::mask_irq();
+            crate::sched::yield_now();
+            akuma_cpu::daif::unmask_irq();
+        }
+        if let (Some(r), Some((_, wire))) = (relay.as_mut(), net.as_mut())
+            && now_us >= next_relay_us
+        {
+            next_relay_us = now_us + 200;
+            r.poll(wire, now_us);
         }
         // Frames the gateway has for the guest go into the buffers it has posted.
         if let Some((dev, wire)) = net.as_mut() {
@@ -1450,7 +1489,18 @@ pub fn run(nrips: bool, guest: Guest) {
             // Nobody can run. If a halted processor's timer can still wake it, wait
             // for it (the host tick runs underneath: IRQs are on).
             if (0..n_cpu).any(|j| states[j] == CpuState::Halted && plat.can_wake(j)) {
-                core::hint::spin_loop();
+                if service {
+                    // Sleep until the guest's next timer (or any host interrupt: the NIC's,
+                    // a keystroke) instead of burning the core.
+                    akuma_cpu::daif::mask_irq();
+                    if let Some(due) = (0..n_cpu).filter_map(|j| plat.next_event_us(j)).min() {
+                        let _ = crate::lapic::arm_oneshot_in_us(due.saturating_sub(crate::net::uptime_us()).min(1000));
+                    }
+                    crate::sched::allow_tick();
+                    akuma_cpu::daif::unmask_irq();
+                } else {
+                    core::hint::spin_loop();
+                }
                 continue 'run;
             }
             stopped = if states.contains(&CpuState::Dead) {
@@ -1497,6 +1547,9 @@ pub fn run(nrips: bool, guest: Guest) {
             akuma_cpu::daif::unmask_irq();
         }
         crumb(0x57);
+        if service {
+            save_host(host_pa);
+        }
         // SAFETY: the VMCB and the host save image are live frames this
         // function owns; SVM is enabled on this core (`enable_on_core`).
         unsafe { vmrun_regs(vmcb_pas[i], host_pa, &mut regs_all[i]) };
@@ -1959,7 +2012,7 @@ fn init_vmcb(page: &mut [u8; 4096], guest: Guest, npt_root: u64, asid: u32) {
     // (nested paging delivers it without an exit), so only Linux's is traced.
     v.set_excp(match guest {
         Guest::Linux | Guest::LinuxApic => excp::UD | excp::GP | excp::PF | excp::DF,
-        Guest::Akuma | Guest::AkumaHello | Guest::AkumaSmp | Guest::AkumaNet => excp::UD | excp::GP | excp::DF,
+        Guest::Akuma | Guest::AkumaHello | Guest::AkumaSmp | Guest::AkumaNet | Guest::AkumaServe => excp::UD | excp::GP | excp::DF,
     });
     v.set_iopm_base(image_pa(static_iopm()));
     v.set_msrpm_base(image_pa(static_msrpm()));
@@ -2035,6 +2088,16 @@ fn set_startup_state(v: &mut Vmcb<'_>, vector: u8) {
     // This address space has not been seen by this ASID: flush.
     v.set_tlb_control(ctrl::TLB_FLUSH_ALL);
     v.set_v_intr(ctrl::V_INTR_MASKING);
+}
+
+/// `VMSAVE` the host's own FS/GS/TR/LDTR/syscall-MSR state into the page at `host_pa`, which
+/// `vmrun_regs` loads back after every exit. A service guest does this before every entry:
+/// it yields to other host tasks between entries, and one of them may have moved
+/// `KernelGsBase` or `FS_BASE`, which a stale save would put back.
+fn save_host(host_pa: u64) {
+    // SAFETY: `host_pa` is a frame the caller owns, 4-KiB-aligned; VMSAVE writes the 4 KiB
+    // state-save layout into it and nothing else.
+    unsafe { core::arch::asm!("vmsave rax", in("rax") host_pa, options(nostack)) };
 }
 
 fn static_msrpm() -> &'static Msrpm {

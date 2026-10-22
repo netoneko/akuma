@@ -44,6 +44,7 @@ pub mod lapic;
 pub mod mmio;
 pub mod pic;
 pub mod pit;
+pub mod tcp;
 pub mod virtio;
 pub mod virtio_net;
 

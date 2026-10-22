@@ -668,6 +668,7 @@ name = "akuma-svm-amd64"
 version = "0.1.0"
 dependencies = [
  "akuma-ryzen-amd64",
+ "smoltcp",
 ]
 
 [[package]]

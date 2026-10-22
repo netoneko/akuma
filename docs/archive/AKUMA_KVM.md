@@ -178,6 +178,11 @@ Read downwards; the sections below are the reference record.
    │   The guest leased 10.0.2.15 under TCG. Found on the way: the interrupt shadow
    │   left set by a stepped-over HLT.
    │   [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md) § A NIC
+ [10-22] ═══ PHASE 13: SSH INTO THE GUEST ═══  "TCP in the gateway, a relay, a background hypervisor"
+   │
+   ▼   gateway TCP (checked against smoltcp), a host-port relay, the guest run as a pinned
+   │   background task. TCG: a real ssh from the Mac reaches the guest's sshd.
+   │   [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md) § ssh into the guest
 ```
 
 ---

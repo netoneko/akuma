@@ -1232,6 +1232,8 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
         // `skiptests` path shares this function and there is no suite to have
         // spawned it.
         crate::net::spawn_netpoll();
+        // A service guest (`kvmserve`) listens on this host's stack: start it now.
+        crate::kvm::spawn_service(cmdline);
         if cmdline.split_ascii_whitespace().any(|t| t == "netprobe") {
             crate::net::enable_probe();
         }

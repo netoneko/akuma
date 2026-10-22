@@ -2193,6 +2193,17 @@ pub fn spawn_daemon(entry: extern "C" fn() -> !) -> Option<usize> {
     spawn_ready(entry, 0, true)
 }
 
+/// [`spawn_daemon`] pinned to core `cpu`: it never runs anywhere else. For a thread whose
+/// state lives in one core's registers — the SVM hypervisor's run loop (`kvm/linux.rs`),
+/// whose `EFER.SVME` and host save area are per core.
+pub fn spawn_daemon_on(entry: extern "C" fn() -> !, cpu: usize) -> Option<usize> {
+    let slot = spawn_unpublished(entry, 0, true)?;
+    // Before publication, like every other field the picker reads.
+    MACHINE[slot].pinned.store(cpu as u32, Ordering::Relaxed);
+    publish_task(slot);
+    Some(slot)
+}
+
 /// [`spawn`] with the space root and daemon flag set before the slot becomes
 /// schedulable. Every field the scheduler or the picker reads is in place before
 /// publication — that ordering is the whole point; see

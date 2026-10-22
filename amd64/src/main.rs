@@ -374,6 +374,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
                 serial::puts("  net:  DHCP did not settle; no wall clock yet (SNTP will retry)\n");
             }
             net::spawn_netpoll();
+            // A service guest (`kvmserve`) needs the host's network: start it now.
+            kvm::spawn_service(cmdline);
         }
     }
 

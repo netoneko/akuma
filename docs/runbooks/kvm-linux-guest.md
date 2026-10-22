@@ -71,6 +71,14 @@ arp=` in the summary. `NETPROBE=1` adds a UDP-echo probe (`nc -u -w 2`, `udp_ech
 TCG its 2 s wait costs many minutes of wall time and the guest then stalls after the timeout
 (`docs/archive/AKUMA_KVM_AKUMA_GUEST.md` § A NIC), so it is opt-in: `GUEST=netprobe` stages it, `GUEST=net` does not.
 
+**ssh into the guest:** `scripts/kvm/serve_rehearse.py LOG` (TCG; `--hold` leaves it running)
+boots the host Akuma with a user-mode NIC forwarding `localhost:2223`, waits for the guest's
+`AKUMA-GUEST-SSHD-STARTED`, and runs a real `ssh -p 2223` command in the guest. On the ryzen:
+`GUEST=serve` stage + `arm.sh 28`; then from the ryzen itself, or the LAN, `ssh -p 2223
+root@<host>`. The guest accepts the repo's test key and every key in the ryzen Akuma's
+`/etc/sshd/authorized_keys` (the stage script folds them in). The host forward port is
+`kvmfwd=` on the command line (2223). A service guest keeps running until the host reboots.
+
 ## If it goes wrong
 
 | you see (in the guest's console) | it is |

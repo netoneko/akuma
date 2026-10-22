@@ -8,17 +8,24 @@
 //! * **DHCP** (RFC 2131): DISCOVER → OFFER and REQUEST → ACK, always for `10.0.2.15`,
 //!   with the gateway as router, the proxy as resolver, a day's lease;
 //! * **ICMP echo** to the gateway (the payload comes back as sent);
-//! * **UDP echo** to the gateway's port 7 (RFC 862).
+//! * **UDP echo** to the gateway's port 7 (RFC 862);
+//! * **TCP** ([`crate::tcp`]): an **echo** server on the gateway's port 7, and
+//!   **forward slots** — connections the *gateway opens to the guest* (the hypervisor's
+//!   relay: a host listener's clients reach the guest's sshd this way). A closed port is
+//!   answered with a reset.
 //!
 //! Everything else the guest sends is counted and dropped. That is enough for a guest
 //! to bring its stack up, reach "its gateway" and prove both directions of the device
 //! against an independent implementation of the protocols; it is deliberately not a
 //! route to anywhere.
 //!
-//! No allocation: replies are built in place into a fixed queue of [`DEPTH`] slots of
-//! [`SLOT`] bytes. A reply that finds the queue full is dropped (and counted): the
-//! guest retransmits, as it would on a lossy link.
+//! No allocation: replies are built in place into a queue of [`DEPTH`] slots of
+//! [`SLOT`] bytes, in storage the caller lends ([`STORAGE`] bytes: the queue and the
+//! rings of the TCP connections). A reply that finds the queue full is dropped (and
+//! counted): the guest retransmits. TCP segments are *pulled* only while the queue has
+//! room, so the TCP side never loses a frame ([`crate::tcp`]'s contract).
 
+use crate::tcp::{self, Segment, Tcp};
 use crate::virtio_net::NetBackend;
 
 /// The guest's hardware address (QEMU's default for the first NIC).
@@ -35,10 +42,21 @@ pub const DNS_IP: [u8; 4] = [10, 0, 2, 3];
 pub const NETMASK: [u8; 4] = [255, 255, 255, 0];
 pub const BROADCAST_IP: [u8; 4] = [10, 0, 2, 255];
 
-/// Bytes of one reply slot: an Ethernet header, a 20-byte IP header and a payload.
-pub const SLOT: usize = 600;
+/// Bytes of one reply slot: a full Ethernet frame.
+pub const SLOT: usize = 1536;
 /// Reply slots.
 pub const DEPTH: usize = 8;
+/// Bytes of each TCP ring (every connection has two).
+pub const RING: usize = 8192;
+/// Connections the gateway opens to the guest.
+pub const FWD_SLOTS: usize = 2;
+/// The gateway's source port for forward slot `i` is `FWD_PORT_BASE + i`.
+pub const FWD_PORT_BASE: u16 = 40_000;
+/// The TCP and UDP echo port (RFC 862).
+pub const ECHO_PORT: u16 = 7;
+const CONNS: usize = 1 + FWD_SLOTS;
+/// Storage the gateway needs lent to it, in bytes.
+pub const STORAGE: usize = DEPTH * SLOT + CONNS * 2 * RING;
 
 const ETH_ARP: u16 = 0x0806;
 const ETH_IP: u16 = 0x0800;
@@ -60,26 +78,75 @@ pub struct Stats {
     pub dhcp_acks: u64,
     pub icmp_echoes: u64,
     pub udp_echoes: u64,
+    /// TCP connections accepted by the echo server, and segments it echoed.
+    pub tcp_accepts: u64,
+    /// Resets sent to segments for ports nothing listens on.
+    pub tcp_resets: u64,
     /// Frames ignored: not for the gateway, malformed, or a protocol it does not speak.
     pub ignored: u64,
     /// Replies lost to a full queue or a frame too big for a slot.
     pub lost: u64,
 }
 
-/// The gateway: a queue of frames for the guest and the counters.
-#[derive(Clone, Debug)]
-pub struct Gateway {
-    slots: [[u8; SLOT]; DEPTH],
+/// The frames waiting for the guest: a ring of [`DEPTH`] slots in borrowed storage.
+#[derive(Debug)]
+struct Queue<'a> {
+    slots: &'a mut [u8],
     lens: [usize; DEPTH],
     head: usize,
     count: usize,
-    pub stats: Stats,
 }
 
-impl Default for Gateway {
-    fn default() -> Self {
-        Self::new()
+impl Queue<'_> {
+    const fn has_room(&self) -> bool {
+        self.count < DEPTH
     }
+
+    /// Build a frame in the next free slot with `build` (which returns its length).
+    fn push_with(&mut self, build: impl FnOnce(&mut [u8]) -> Option<usize>) -> bool {
+        if !self.has_room() {
+            return false;
+        }
+        let at = (self.head + self.count) % DEPTH;
+        let Some(n) = build(&mut self.slots[at * SLOT..(at + 1) * SLOT]) else { return false };
+        self.lens[at] = n;
+        self.count += 1;
+        true
+    }
+}
+
+impl Stats {
+    const fn new() -> Self {
+        Self {
+            frames: 0,
+            arp_replies: 0,
+            dhcp_offers: 0,
+            dhcp_acks: 0,
+            icmp_echoes: 0,
+            udp_echoes: 0,
+            tcp_accepts: 0,
+            tcp_resets: 0,
+            ignored: 0,
+            lost: 0,
+        }
+    }
+}
+
+/// The gateway: a queue of frames for the guest, its TCP connections and the counters.
+#[derive(Debug)]
+pub struct Gateway<'a> {
+    q: Queue<'a>,
+    /// The guest's hardware address, as last seen on a frame from it.
+    guest_mac: [u8; 6],
+    /// The TCP echo server's connection, and the guest port it is bound to.
+    echo: Tcp<'a>,
+    echo_peer: u16,
+    /// Connections the gateway opened to the guest, and the guest port each targets.
+    fwd: [Tcp<'a>; FWD_SLOTS],
+    fwd_peer: [u16; FWD_SLOTS],
+    /// Next initial sequence number.
+    iss: u32,
+    pub stats: Stats,
 }
 
 /// The Internet checksum (RFC 1071) over `data`, seeded with `seed` (a pseudo-header sum).
@@ -157,6 +224,50 @@ pub(crate) fn build_udp(
     Some(total)
 }
 
+/// Write an Ethernet + IPv4 + TCP frame into `out` for `o`, whose payload (if any) is
+/// already at `out[54..54 + o.len]` (where [`Tcp::poll_tx`] was told to put it). Returns
+/// the frame's length.
+#[allow(clippy::too_many_arguments)]
+fn build_tcp(out: &mut [u8], dst_mac: [u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4], sport: u16, dport: u16, o: &tcp::Out) -> usize {
+    let hdr = if o.mss_option { 24 } else { 20 };
+    let tcp_len = hdr + o.len;
+    let ip_len = 20 + tcp_len;
+    // The payload sits after a 20-byte TCP header; a SYN (no payload) carries its option
+    // in the four bytes after that.
+    out[..6].copy_from_slice(&dst_mac);
+    out[6..12].copy_from_slice(&GATEWAY_MAC);
+    out[12..14].copy_from_slice(&ETH_IP.to_be_bytes());
+    {
+        let ip = &mut out[14..34];
+        ip[0] = 0x45;
+        ip[1] = 0;
+        ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+        ip[4..8].copy_from_slice(&[0, 0, 0x40, 0]);
+        ip[8] = 64;
+        ip[9] = 6;
+        ip[10..12].fill(0);
+        ip[12..16].copy_from_slice(&src_ip);
+        ip[16..20].copy_from_slice(&dst_ip);
+        let c = checksum(ip, 0);
+        ip[10..12].copy_from_slice(&c.to_be_bytes());
+    }
+    if o.mss_option {
+        out[54..58].copy_from_slice(&[2, 4, (tcp::MSS >> 8) as u8, tcp::MSS as u8]);
+    }
+    let t = &mut out[34..34 + tcp_len];
+    t[0..2].copy_from_slice(&sport.to_be_bytes());
+    t[2..4].copy_from_slice(&dport.to_be_bytes());
+    t[4..8].copy_from_slice(&o.seq.to_be_bytes());
+    t[8..12].copy_from_slice(&o.ack.to_be_bytes());
+    t[12] = ((hdr / 4) as u8) << 4;
+    t[13] = o.flags;
+    t[14..16].copy_from_slice(&o.window.to_be_bytes());
+    t[16..20].fill(0);
+    let c = checksum(t, pseudo_sum(src_ip, dst_ip, 6, tcp_len));
+    t[16..18].copy_from_slice(&c.to_be_bytes());
+    14 + ip_len
+}
+
 /// The DHCP option with `code` in `opts` (after the magic cookie), as its value bytes.
 fn dhcp_option(opts: &[u8], code: u8) -> Option<&[u8]> {
     let mut i = 0;
@@ -177,33 +288,51 @@ fn dhcp_option(opts: &[u8], code: u8) -> Option<&[u8]> {
     None
 }
 
-impl Gateway {
-    /// A gateway with nothing queued.
+impl<'a> Gateway<'a> {
+    /// A gateway with nothing queued, in `storage` ([`STORAGE`] bytes or more; the excess
+    /// is unused). `None` if it is too small.
     #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            slots: [[0; SLOT]; DEPTH],
-            lens: [0; DEPTH],
-            head: 0,
-            count: 0,
-            stats: Stats { frames: 0, arp_replies: 0, dhcp_offers: 0, dhcp_acks: 0, icmp_echoes: 0, udp_echoes: 0, ignored: 0, lost: 0 },
+    pub fn new(storage: &'a mut [u8]) -> Option<Self> {
+        if storage.len() < STORAGE {
+            return None;
         }
+        let (slots, mut rest) = storage.split_at_mut(DEPTH * SLOT);
+        let mut ring = || {
+            let (r, tail) = core::mem::take(&mut rest).split_at_mut(RING);
+            rest = tail;
+            r
+        };
+        let mut conn = || {
+            let rx = ring();
+            let tx = ring();
+            Tcp::new(rx, tx)
+        };
+        let echo = conn();
+        let fwd = [conn(), conn()];
+        Some(Self {
+            q: Queue { slots, lens: [0; DEPTH], head: 0, count: 0 },
+            guest_mac: GUEST_MAC,
+            echo,
+            echo_peer: 0,
+            fwd,
+            fwd_peer: [0; FWD_SLOTS],
+            iss: 0x4B1D_0000,
+            stats: Stats::new(),
+        })
     }
 
     /// Build a reply in the next free slot with `build`, which returns its length.
     fn enqueue(&mut self, build: impl FnOnce(&mut [u8]) -> Option<usize>) -> bool {
-        if self.count == DEPTH {
+        let ok = self.q.push_with(build);
+        if !ok {
             self.stats.lost += 1;
-            return false;
         }
-        let at = (self.head + self.count) % DEPTH;
-        let Some(n) = build(&mut self.slots[at]) else {
-            self.stats.lost += 1;
-            return false;
-        };
-        self.lens[at] = n;
-        self.count += 1;
-        true
+        ok
+    }
+
+    fn next_iss(&mut self) -> u32 {
+        self.iss = self.iss.wrapping_add(0x1_0007);
+        self.iss
     }
 
     fn arp(&mut self, f: &[u8]) {
@@ -254,6 +383,7 @@ impl Gateway {
         match f[23] {
             1 if dst == GATEWAY_IP => self.icmp(f, ihl, total),
             17 => self.udp(f, src, dst, payload),
+            6 if dst == GATEWAY_IP => self.tcp_in(src, payload),
             _ => self.stats.ignored += 1,
         }
     }
@@ -370,37 +500,183 @@ impl Gateway {
             }
         }
     }
+    /// A TCP segment for the gateway (`seg` is the IP payload; the IP header was checked).
+    fn tcp_in(&mut self, src: [u8; 4], seg: &[u8]) {
+        if seg.len() < 20 || checksum(seg, pseudo_sum(src, GATEWAY_IP, 6, seg.len())) != 0 {
+            self.stats.ignored += 1;
+            return;
+        }
+        let off = usize::from(seg[12] >> 4) * 4;
+        if off < 20 || off > seg.len() {
+            self.stats.ignored += 1;
+            return;
+        }
+        let (sport, dport) = (be16(seg, 0), be16(seg, 2));
+        let s = Segment {
+            seq: u32::from_be_bytes([seg[4], seg[5], seg[6], seg[7]]),
+            ack: u32::from_be_bytes([seg[8], seg[9], seg[10], seg[11]]),
+            flags: seg[13],
+            window: be16(seg, 14),
+            payload: &seg[off..],
+        };
+        if dport == ECHO_PORT {
+            let fresh = self.echo.state() == tcp::State::Closed && s.flags & tcp::flag::SYN != 0;
+            if fresh {
+                let iss = self.next_iss();
+                if self.echo.accept(&s, iss) {
+                    self.echo_peer = sport;
+                    self.stats.tcp_accepts += 1;
+                }
+            } else if self.echo.state() != tcp::State::Closed && sport == self.echo_peer {
+                self.echo.input(&s);
+            } else {
+                self.reset_for(src, sport, dport, &s);
+            }
+        } else if (FWD_PORT_BASE..FWD_PORT_BASE + FWD_SLOTS as u16).contains(&dport) {
+            let i = usize::from(dport - FWD_PORT_BASE);
+            if self.fwd[i].state() != tcp::State::Closed && sport == self.fwd_peer[i] {
+                self.fwd[i].input(&s);
+            } else {
+                self.reset_for(src, sport, dport, &s);
+            }
+        } else {
+            self.reset_for(src, sport, dport, &s);
+        }
+    }
+
+    /// Answer a segment for a connection that does not exist with a reset (RFC 793 p.65),
+    /// unless it is itself a reset.
+    fn reset_for(&mut self, src: [u8; 4], sport: u16, dport: u16, s: &Segment<'_>) {
+        if s.flags & tcp::flag::RST != 0 {
+            return;
+        }
+        let o = if s.flags & tcp::flag::ACK != 0 {
+            tcp::Out { seq: s.ack, ack: 0, flags: tcp::flag::RST, window: 0, len: 0, mss_option: false }
+        } else {
+            let seg_len = s.payload.len() as u32 + u32::from(s.flags & tcp::flag::SYN != 0) + u32::from(s.flags & tcp::flag::FIN != 0);
+            tcp::Out { seq: 0, ack: s.seq.wrapping_add(seg_len), flags: tcp::flag::RST | tcp::flag::ACK, window: 0, len: 0, mss_option: false }
+        };
+        let mac = self.guest_mac;
+        if self.enqueue(|out| Some(build_tcp(out, mac, GATEWAY_IP, src, dport, sport, &o))) {
+            self.stats.tcp_resets += 1;
+        }
+    }
+
+    /// Move the echo connection's received bytes back to its sender, and close it when the
+    /// peer does.
+    fn echo_step(&mut self) {
+        let mut tmp = [0u8; 512];
+        loop {
+            let room = self.echo.write_room().min(tmp.len());
+            if room == 0 || self.echo.readable() == 0 {
+                break;
+            }
+            let n = self.echo.read(&mut tmp[..room]);
+            if n == 0 {
+                break;
+            }
+            self.echo.write(&tmp[..n]);
+        }
+        if self.echo.peer_finished() {
+            self.echo.close();
+        }
+        if self.echo.is_closed() {
+            self.echo.clear();
+        }
+    }
+
+    /// Send what the TCP connections have to say, while the queue has room. The hypervisor
+    /// calls this once per turn (and after every transmit); the TCP side is pulled, so it
+    /// never loses a frame to a full queue.
+    pub fn pump(&mut self) {
+        self.echo_step();
+        let mac = self.guest_mac;
+        let echo_peer = self.echo_peer;
+        while self.q.has_room() && self.echo.wants_tx() {
+            let echo = &mut self.echo;
+            let pushed = self.q.push_with(|out| {
+                let o = echo.poll_tx(&mut out[54..54 + tcp::MSS])?;
+                Some(build_tcp(out, mac, GATEWAY_IP, GUEST_IP, ECHO_PORT, echo_peer, &o))
+            });
+            if !pushed {
+                break;
+            }
+        }
+        for i in 0..FWD_SLOTS {
+            let peer = self.fwd_peer[i];
+            while self.q.has_room() && self.fwd[i].wants_tx() {
+                let conn = &mut self.fwd[i];
+                let pushed = self.q.push_with(|out| {
+                    let o = conn.poll_tx(&mut out[54..54 + tcp::MSS])?;
+                    Some(build_tcp(out, mac, GATEWAY_IP, GUEST_IP, FWD_PORT_BASE + i as u16, peer, &o))
+                });
+                if !pushed {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Open forward slot `slot` to `guest_port` on the guest: the SYN goes out at the next
+    /// [`Gateway::pump`]. False if the slot is in use.
+    pub fn fwd_open(&mut self, slot: usize, guest_port: u16) -> bool {
+        if slot >= FWD_SLOTS || self.fwd[slot].state() != tcp::State::Closed || !self.fwd[slot].is_closed() {
+            return false;
+        }
+        let iss = self.next_iss();
+        self.fwd_peer[slot] = guest_port;
+        self.fwd[slot].connect(iss);
+        true
+    }
+
+    /// Forward slot `slot`'s connection, for reading, writing, closing and asking its state.
+    pub fn fwd(&mut self, slot: usize) -> &mut Tcp<'a> {
+        &mut self.fwd[slot]
+    }
+
+    /// Free slot `slot` once its connection is closed (or abandon it with a reset).
+    pub fn fwd_release(&mut self, slot: usize) {
+        self.fwd[slot].abort();
+        self.pump();
+        if self.fwd[slot].is_closed() {
+            self.fwd[slot].clear();
+        }
+    }
 }
 
-impl NetBackend for Gateway {
+impl NetBackend for Gateway<'_> {
     fn transmit(&mut self, frame: &[u8]) {
         self.stats.frames += 1;
         if frame.len() < 14 {
             self.stats.ignored += 1;
             return;
         }
+        // The guest's address, for frames the gateway starts (forward connections).
+        self.guest_mac = [frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]];
         match be16(frame, 12) {
             ETH_ARP => self.arp(frame),
             ETH_IP => self.ipv4(frame),
             _ => self.stats.ignored += 1,
         }
+        self.pump();
     }
 
     fn has_frame(&self) -> bool {
-        self.count > 0
+        self.q.count > 0
     }
 
     fn receive(&mut self, dst: &mut [u8]) -> Option<usize> {
-        if self.count == 0 {
+        if self.q.count == 0 {
             return None;
         }
-        let n = self.lens[self.head];
+        let at = self.q.head;
+        let n = self.q.lens[at];
         let fits = n <= dst.len();
         if fits {
-            dst[..n].copy_from_slice(&self.slots[self.head][..n]);
+            dst[..n].copy_from_slice(&self.q.slots[at * SLOT..at * SLOT + n]);
         }
-        self.head = (self.head + 1) % DEPTH;
-        self.count -= 1;
+        self.q.head = (at + 1) % DEPTH;
+        self.q.count -= 1;
         Some(if fits { n } else { 0 })
     }
 }
@@ -411,6 +687,11 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
+
+    fn gw() -> Gateway<'static> {
+        let storage: &'static mut [u8] = std::boxed::Box::leak(vec![0u8; STORAGE].into_boxed_slice());
+        Gateway::new(storage).expect("enough storage")
+    }
 
     /// RFC 1071 verification by an independent route: the ones-complement sum of the
     /// words, checksum included, is 0xFFFF.
@@ -514,7 +795,7 @@ mod tests {
 
     #[test]
     fn arp_for_the_gateway_and_the_proxy_is_answered_others_are_not() {
-        let mut g = Gateway::new();
+        let mut g = gw();
         for target in [GATEWAY_IP, DNS_IP] {
             g.transmit(&arp_request(target));
             let r = take(&mut g);
@@ -534,7 +815,7 @@ mod tests {
 
     #[test]
     fn dhcp_discover_gets_an_offer_and_request_an_ack_with_the_slirp_parameters() {
-        let mut g = Gateway::new();
+        let mut g = gw();
         for (kind, reply, xid) in [(DHCP_DISCOVER, DHCP_OFFER, 0xDEAD_BEEFu32), (DHCP_REQUEST, DHCP_ACK, 0x1234_5678)] {
             g.transmit(&udp_from_guest([0; 4], [255; 4], 68, 67, &dhcp_msg(kind, xid)));
             let f = take(&mut g);
@@ -563,7 +844,7 @@ mod tests {
 
     #[test]
     fn dhcp_that_is_not_a_discover_or_request_or_is_malformed_is_ignored() {
-        let mut g = Gateway::new();
+        let mut g = gw();
         for kind in [4u8, 7, 8] {
             g.transmit(&udp_from_guest([0; 4], [255; 4], 68, 67, &dhcp_msg(kind, 1)));
         }
@@ -586,7 +867,7 @@ mod tests {
 
     #[test]
     fn an_echo_request_to_the_gateway_comes_back_as_a_valid_reply() {
-        let mut g = Gateway::new();
+        let mut g = gw();
         let data: Vec<u8> = (0..56).collect();
         for len in [0usize, 1, 56] {
             let mut icmp = vec![8, 0, 0, 0, 0x12, 0x34, 0x00, 0x07];
@@ -614,7 +895,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_or_misaddressed_echo_is_ignored() {
-        let mut g = Gateway::new();
+        let mut g = gw();
         let mut icmp = vec![8, 0, 0, 0, 0, 1, 0, 1];
         let c = checksum(&icmp, 0);
         icmp[2..4].copy_from_slice(&c.to_be_bytes());
@@ -644,7 +925,7 @@ mod tests {
 
     #[test]
     fn udp_echo_returns_the_payload_from_port_7_to_the_senders_port() {
-        let mut g = Gateway::new();
+        let mut g = gw();
         g.transmit(&udp_from_guest(GUEST_IP, GATEWAY_IP, 40_000, 7, b"hello, akuma"));
         let f = take(&mut g);
         assert_eq!(&f[..6], &GUEST_MAC);
@@ -668,7 +949,7 @@ mod tests {
 
     #[test]
     fn everything_else_is_counted_and_dropped() {
-        let mut g = Gateway::new();
+        let mut g = gw();
         g.transmit(&[1, 2, 3]); // runt
         let mut v6 = arp_request(GATEWAY_IP);
         v6[12..14].copy_from_slice(&0x86DDu16.to_be_bytes());
@@ -681,7 +962,7 @@ mod tests {
 
     #[test]
     fn the_queue_is_fifo_bounded_and_a_small_buffer_costs_only_that_frame() {
-        let mut g = Gateway::new();
+        let mut g = gw();
         for i in 0..DEPTH + 2 {
             g.transmit(&udp_from_guest(GUEST_IP, GATEWAY_IP, 5000 + i as u16, 7, &[i as u8; 4]));
         }

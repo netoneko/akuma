@@ -25,5 +25,9 @@ workspace = true
 # Test-only: the kernel's own `hvm_start_info` reader, as an independent oracle
 # for the PVH blob writer (a writer tested only against itself shares its own
 # misreading of the layout). Never a dependency of the crate proper.
+#
+# `smoltcp` is the same kind of oracle for `gateway`'s TCP: a real, independent
+# stack drives the gateway's connections in the tests.
 [dev-dependencies]
 akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64" }
+smoltcp = { version = "0.12.0", default-features = false, features = ["std", "proto-ipv4", "socket-tcp", "medium-ethernet"] }

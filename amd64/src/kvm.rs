@@ -50,6 +50,7 @@ use core::arch::x86_64::__cpuid;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 mod linux;
+mod relay;
 
 // ---------------------------------------------------------------------------
 // Console helpers (hda.rs precedent: `puts` straight to the port, no alloc)
@@ -159,11 +160,24 @@ pub fn init(cmdline: &str) {
 /// `akuma` (busybox root) or `akuma-hello` (hello-world root): the bootloader entry's command line is baked into `grubx64.efi`, so a
 /// one-word file on the root is the lever that lets one entry serve both guests.
 pub fn late(cmdline: &str) {
-    let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
     if !SVM_WANTED.load(Ordering::Acquire) {
         return;
     }
-    let guest = if flag("kvmlapic") {
+    // A service guest (`kvmserve`) is not run here: it needs the host's network, which
+    // does not exist yet. [`spawn_service`] starts it once it does.
+    if let Some(g) = pick_guest(cmdline)
+        && !g.is_service()
+    {
+        linux::run(NRIPS.load(Ordering::Relaxed), g);
+    }
+}
+
+/// Which guest the command line (and, for `kvmlinux`, the selector file) asks for.
+fn pick_guest(cmdline: &str) -> Option<linux::Guest> {
+    let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
+    if flag("kvmserve") {
+        Some(linux::Guest::AkumaServe)
+    } else if flag("kvmlapic") {
         Some(linux::Guest::LinuxApic)
     } else if flag("kvmnet") {
         Some(linux::Guest::AkumaNet)
@@ -186,6 +200,8 @@ pub fn late(cmdline: &str) {
             linux::Guest::AkumaNet
         } else if sel.starts_with(b"akuma-smp") {
             linux::Guest::AkumaSmp
+        } else if sel.starts_with(b"akuma-serve") {
+            linux::Guest::AkumaServe
         } else if sel.starts_with(b"akuma") {
             linux::Guest::Akuma
         } else {
@@ -193,9 +209,44 @@ pub fn late(cmdline: &str) {
         })
     } else {
         None
-    };
-    if let Some(g) = guest {
-        linux::run(NRIPS.load(Ordering::Relaxed), g);
+    }
+}
+
+/// The host port a service guest's sshd is forwarded to (`kvmfwd=<port>`; 2223).
+static SERVE_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(2223);
+
+/// Start the service guest (`kvmserve`, or `akuma-serve` in the selector file) as a
+/// background kernel task pinned to the core that enabled SVM, if one was asked for. Call
+/// it **after** the host's network is up and its netpoll daemon is running: the guest's
+/// port forward listens on the host's stack.
+pub fn spawn_service(cmdline: &str) {
+    if !SVM_WANTED.load(Ordering::Acquire) || !pick_guest(cmdline).is_some_and(linux::Guest::is_service) {
+        return;
+    }
+    if let Some(port) = cmdline
+        .split_ascii_whitespace()
+        .find_map(|t| t.strip_prefix("kvmfwd="))
+        .and_then(|v| v.parse::<u16>().ok())
+    {
+        SERVE_PORT.store(port, Ordering::Relaxed);
+    }
+    // Core 0 enabled SVM and owns the host save area (`run` enables it again, idempotently).
+    match crate::sched::spawn_daemon_on(serve_task, 0) {
+        Some(slot) => {
+            p("[KVM] service guest task spawned in slot ");
+            dec(slot as u64);
+            p("\n");
+        }
+        None => p("[KVM] no task slot for the service guest\n"),
+    }
+}
+
+extern "C" fn serve_task() -> ! {
+    linux::run(NRIPS.load(Ordering::Relaxed), linux::Guest::AkumaServe);
+    p("[KVM] service guest ended\n");
+    loop {
+        crate::sched::yield_now();
+        crate::sched::allow_tick();
     }
 }
 

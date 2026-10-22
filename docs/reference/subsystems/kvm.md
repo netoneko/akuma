@@ -37,6 +37,7 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 | `lapic` | xAPIC register page + timer (periodic/one-shot, 1 GHz bus clock), IRR/ISR with priority classes, self-IPI; a function of `now` |
 | `mmio` | decodes the `MOV` — and read-only `CMP`/`TEST` — of a faulting device access (nested page faults give the address only), with the flag arithmetic |
 | `virtio` | virtio-mmio **v2** block device over the traits `GuestMem` and `Disk` |
+| `tcp` | one TCP connection as a pure state machine for a **lossless** peer (handshake in both roles, in-order data through lent rings with real windows, FIN/RST; no retransmit timer, no congestion control, no out-of-order queue) |
 | `virtio_net`, `gateway` | virtio-mmio v2 **network** device (queues 0/1, 12-byte header, MAC) over `GuestMem` and `NetBackend`; and the backend: a slirp-style gateway (`10.0.2.2`) that answers ARP, DHCP, ICMP echo and UDP echo and drops the rest |
 | `acpi` | RSDP v2 / XSDT / FADT / MADT / DSDT with one `LNRO0005` device; `Pm1` registers |
 
@@ -91,6 +92,27 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
   holder is the processor that is not running (a convoy of `[bkls>]` lines) and the
   guest's spin-count logic sees stalls no real machine produces (`SWITCH BADFRAME`).
   The exit does **not** advance RIP: step over it like `HLT` (nRIP, else the length).
+- **The gateway's TCP is lossless by construction, not by recovery.** `Gateway::pump` *pulls*
+  a segment only while the reply queue has room, and the guest's frames reach it
+  synchronously, so `tcp` needs no retransmit timer. Its tests drive it with smoltcp (the
+  guest's own stack) in both roles: `crates/akuma-svm-amd64/tests/gateway_tcp.rs`. The
+  gateway's storage (`gateway::STORAGE`, ~60 KiB: the queue and six 8 KiB rings) is lent by the
+  caller from the heap — it is far too big to build on a 32 KiB kernel task stack.
+- **A service guest (`kvmserve`, `akuma-serve`) is a background host task**, not a call
+  from boot: its port forward lives on the host's network stack, which exists only after
+  boot (on the ryzen, after init). `kvm::spawn_service` starts it **pinned to core 0** (the
+  core with SVM enabled) once netpoll is up; `late` skips it. Between guest entries it
+  `VMSAVE`s the host state again (other tasks run on the core in between and may have moved
+  `KernelGsBase`/`FS_BASE`), yields (`sched::yield_now`, so the BKL is dropped for the
+  network and sshd), and polls the relay at most every 200 µs. It has no wall-clock, quiet or
+  exit budgets; idle, it arms the host one-shot at the guest's next timer and `hlt`s
+  (`sched::allow_tick`). The host must have an init that stays alive (herd on the ryzen; the
+  TCG rehearsal gives it `busybox sleep`): without one the boot ends in `halt()` and the
+  task is never scheduled.
+- **The relay** (`kvm/relay.rs`): a listener on host port `kvmfwd=` (2223) whose clients are
+  connected, through a gateway forward slot (the *gateway* opens the connection to the guest's
+  port 22), to the guest's sshd. Non-blocking throughout; `socket_*` poll the host stack
+  themselves. Two slots.
 - **The NIC is polled and has no route out.** `Guest::AkumaNet` puts the virtio-net window
   in the slot after the disk's (`0xD0001000`; the guest finds devices as evenly spaced
   `virtio_mmio.device=` windows, in order) and **never raises its interrupt line** (the
