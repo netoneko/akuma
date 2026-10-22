@@ -207,19 +207,25 @@ adds one for a single driver. It is opened by the kernel's own `openat` arm like
   (`[KVM] linux: refused: guest RAM does not fit the kvmmem= reserve`), never retried from the page
   allocator; without `kvmmem=` the page allocator is used, as it always was. Guest RAM is bounded at
   1 GiB by the nested page table (one directory of 2 MiB leaves) and the Akuma guest needs ≥ 768 MiB.
-- **Cores (`kvmcores=<list>`, e.g. `4-7`).** The VM task is placed on the first listed core that has
-  SVM enabled; default core 0. This moves the *whole* hypervisor off the boot core. It is **not yet a
-  reservation** — nothing keeps other tasks off that core — and it does not spread vCPUs. Real core
-  reservation is the multi-vCPU step: one pinned task per vCPU (own VMCB and run loop), the guest's RAM,
-  NPT, device models, gateway and relay behind locks or handed to one owner core, a placement policy
-  (which cores a VM may use, so host services keep some), and cross-core delivery of virtual IPIs
-  (today an IPI is a flag set in the same loop). Until then more vCPUs add context switches, not compute.
+- **Cores (`kvmcores=<list>`, spec `vm_cores`).** `kvmcores` is the machine's allowed set (default core 0), `vm_cores`
+  the VM's own mask (default: everything allowed); `akuma_vm_spec::cores::place` puts virtual processor `i` on the
+  `i`-th usable core of the intersection (wrapping: processors sharing a core take turns, as before placement). The
+  VM task repins itself to processor 0's core; every other core gets a persistent worker task
+  (`kvm/linux/machine.rs`) that serves the processors placed there. While a service VM runs, its cores (never core 0)
+  are **reserved**: the picker hands them only tasks pinned to them (`sched::reserve_cores`). Shared state is guest RAM
+  and the NPT (read-only once built), the devices behind one lock, and a state word + `poke` flag per processor; a
+  cross-core IPI, INIT, STARTUP, or a disk interrupt for processor 0 sets the flag and sends the wake IPI
+  (`smp::kick_core`). Exits are still handled under the BKL, so groups serialise there; never hold the device lock
+  across `yield_now`, `VMRUN` or a sleep. **Pick cores that are not SMT siblings**: on the ryzen 2,3 gave two guest
+  loops 63% each, 2,4 gave 98% (`docs/archive/KVM_CPU_ACCOUNTING.md`). A `[KVM] cpu:` line per task shows where
+  each core's time goes.
 
 | herd key | |
 |---|---|
 | `vm = true` | the service is a VM (`command` is not needed; it is `herd vm-run`) |
 | `vm_type` | `kvm` (default) or `firecracker` (reserved: parses, the service is not loaded) |
 | `vm_kernel`, `vm_cmdline` | kernel image (an Akuma ELF), the guest command line tail (rest of the line) |
+| `vm_cores` | host cores for the vCPUs (`2,4`), within `kvmcores=` |
 | `vm_ram_mib`, `vm_vcpus` | 16–1024 (default 768), 1–4 (default 1) |
 | `vm_disk`, `vm_disk_ram` | image path, or `/dev/nvme0n1p<N>` (that partition in place; never with `vm_disk_ram`); empty: the machine's second virtio-blk. `vm_disk_ram` copies an image into RAM at start |
 | `vm_forward` | `host:guest`, repeatable up to four |
