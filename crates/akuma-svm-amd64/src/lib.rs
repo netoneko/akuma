@@ -278,10 +278,35 @@ pub mod excp {
     pub const DB: u32 = 1 << 1;
     /// #UD.
     pub const UD: u32 = 1 << 6;
+    /// #DF.
+    pub const DF: u32 = 1 << 8;
     /// #GP.
     pub const GP: u32 = 1 << 13;
     /// #PF.
     pub const PF: u32 = 1 << 14;
+}
+
+/// `EVENTINJ` (APM Vol 2 §15.20, Figure 15-5, rev 3.45, p. 553): an event for
+/// the next `VMRUN` to deliver to the guest before its first instruction.
+pub mod eventinj {
+    /// `V` — bit 31: an event is to be injected.
+    pub const VALID: u64 = 1 << 31;
+    /// `EV` — bit 11: the exception pushes an error code.
+    pub const ERROR_CODE_VALID: u64 = 1 << 11;
+    /// `TYPE` — bits 10:8, value 3: exception (fault or trap) — Table 15-11.
+    pub const TYPE_EXCEPTION: u64 = 3 << 8;
+
+    /// An exception `vector`, with an `error` code if the vector pushes one
+    /// (`ERRORCODE` bits 63:32). The vector must be a real exception, not 2
+    /// (an NMI): `VMRUN` answers an illegal event with `VMEXIT_INVALID`.
+    #[must_use]
+    pub const fn exception(vector: u8, error: Option<u32>) -> u64 {
+        let base = VALID | TYPE_EXCEPTION | vector as u64;
+        match error {
+            Some(code) => base | ERROR_CODE_VALID | ((code as u64) << 32),
+            None => base,
+        }
+    }
 }
 
 /// State save area offsets, **relative to `0400h`** in the VMCB page
@@ -329,12 +354,27 @@ pub mod save {
     pub const RSP: usize = 0x1D8;
     /// Guest RAX.
     pub const RAX: usize = 0x1F8;
+    /// Guest `STAR` (Table B-2, APM Vol 2 rev 3.45, p. 771).
+    pub const STAR: usize = 0x200;
+    /// Guest `LSTAR`.
+    pub const LSTAR: usize = 0x208;
+    /// Guest `CSTAR`.
+    pub const CSTAR: usize = 0x210;
+    /// Guest `SFMASK`.
+    pub const SFMASK: usize = 0x218;
+    /// Guest `KernelGsBase` (what `SWAPGS` exchanges).
+    pub const KERNEL_GS_BASE: usize = 0x220;
+    /// Guest `SYSENTER_CS`.
+    pub const SYSENTER_CS: usize = 0x228;
+    /// Guest `SYSENTER_ESP`.
+    pub const SYSENTER_ESP: usize = 0x230;
+    /// Guest `SYSENTER_EIP`.
+    pub const SYSENTER_EIP: usize = 0x238;
     /// Guest CR2.
     pub const CR2: usize = 0x240;
     /// Guest PAT.
     pub const G_PAT: usize = 0x268;
-    /// `LASTEXCPFROM` (presumed `290h`; **not yet verified** — Table B-2
-    /// transcription ends at `288h`).
+    /// `LASTEXCPFROM` (Table B-2: `288h`, verified against rev 3.45).
     pub const LASTEXCPFROM: usize = 0x288;
 }
 
@@ -474,6 +514,10 @@ pub enum ExitCode {
     Invalid,
     /// `VMEXIT_BUSY` (unlaunched VMCB in use).
     Busy,
+    /// Triple fault — the guest took an exception with no handler and gave
+    /// up (Appendix C `7Fh`). A guest under construction hits this instead of
+    /// wedging the machine.
+    Shutdown,
     /// Anything else — value as in Appendix C.
     Other(u64),
 }
@@ -497,6 +541,7 @@ impl ExitCode {
             0x81 => Self::Vmmcall,
             0x87 => Self::Rdtscp,
             0x400 => Self::Npf,
+            0x7F => Self::Shutdown,
             0xFFFF_FFFF => Self::Invalid,
             0xFFFF_FFFE => Self::Busy,
             other => Self::Other(other),
@@ -773,6 +818,22 @@ impl<'a> Vmcb<'a> {
     /// Guest RAX.
     pub fn set_rax(&mut self, v: u64) {
         wr64(self.page, SAVE_AREA_BASE + save::RAX, v);
+    }
+    /// A qword of the state save area, by its [`save`] offset: the MSR-backed
+    /// fields (`STAR`, `LSTAR`, `KernelGsBase`, `SYSENTER_*`, `G_PAT`, …) an
+    /// intercepted `RDMSR`/`WRMSR` reads and writes.
+    #[must_use]
+    pub const fn save64(&self, off: usize) -> u64 {
+        rd64(self.page, SAVE_AREA_BASE + off)
+    }
+    /// Write a qword of the state save area, by its [`save`] offset.
+    pub fn set_save64(&mut self, off: usize, v: u64) {
+        wr64(self.page, SAVE_AREA_BASE + off, v);
+    }
+    /// Event injection (`EVENTINJ`, control `0A8h`) for the next `VMRUN`: the
+    /// guest takes the event as if it had arisen on its own.
+    pub fn set_eventinj(&mut self, v: u64) {
+        wr64(self.page, ctrl::EVENTINJ, v);
     }
     /// Guest RAX.
     #[must_use]
@@ -1091,6 +1152,17 @@ pub mod iopm {
         page
     }
 
+    /// The map that intercepts **every** port.
+    ///
+    /// `0xFF` repeated — bit 1 = intercept — for each of the 64K+3 bits. A
+    /// guest whose port traffic the VMM must see (a real OS probes hundreds
+    /// of ports) arms this rather than naming ports one `with_port` at a
+    /// time.
+    #[must_use]
+    pub const fn all() -> [u8; SIZE] {
+        [0xFF; SIZE]
+    }
+
     /// Is access to `port` intercepted?
     #[must_use]
     pub const fn intercepted(page: &[u8; SIZE], port: u16) -> bool {
@@ -1099,8 +1171,689 @@ pub mod iopm {
     }
 }
 
+/// Page tables as **indices and walks**.
+///
+/// The one computation a hand-built table gets silently wrong is which slot
+/// a VA names at each level — rung 4 wrote its PD→PT entry at slot 0 when
+/// `0x5000_0000` names slot 128, and the rehearsal spent a guest `#PF`
+/// discovering it. [`idx`] derives every level's index from the VA, and
+/// [`walk`]/[`translate`] read a built table back the way the MMU would, so
+/// a builder can check its own work before any guest runs.
+///
+/// Entries use the same encoding as [`npt`] — which is the x86-64 PTE, and
+/// so also the guest's own tables (the long-mode rung already builds guest
+/// entries with `npt`'s builders).
+pub mod tables {
+    /// Shift of the PML4 index field.
+    pub const PML4_SHIFT: u32 = 39;
+    /// Shift of the PDPT index field.
+    pub const PDPT_SHIFT: u32 = 30;
+    /// Shift of the PD index field.
+    pub const PD_SHIFT: u32 = 21;
+    /// Shift of the PT index field.
+    pub const PT_SHIFT: u32 = 12;
+
+    /// The 9-bit index `va` names at the level whose field starts at
+    /// `shift`. The whole lesson of rung 4 in one line: the index is a
+    /// property of the VA, derived here rather than computed by hand at a
+    /// call site.
+    #[must_use]
+    pub const fn idx(va: u64, shift: u32) -> usize {
+        ((va >> shift) & 0x1FF) as usize
+    }
+
+    /// Read access to 4-KiB table pages by physical address.
+    ///
+    /// The kernel reads through the physmap; a host test backs the pages in
+    /// a table of its own. Nothing here can write — a walk is evidence, not
+    /// a mutation.
+    pub trait PageSource {
+        /// The little-endian u64 at `off` in the table page at `table_pa`.
+        fn read(&self, table_pa: u64, off: usize) -> u64;
+    }
+
+    /// Why a walk stopped.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WalkError {
+        /// A table page the walk reached could not be read (unmapped, or a
+        /// zero pointer entry).
+        Missing,
+        /// The entry at `shift` lacked P — the walk is over and the VA is
+        /// unmapped at that level.
+        Absent(u32),
+    }
+
+    /// A resolved leaf: its entry and the shift of the level it sits at
+    /// (12 = 4 KiB, 21 = 2 MiB, 30 = 1 GiB — the PS-bit levels).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Leaf {
+        pub entry: u64,
+        pub shift: u32,
+    }
+
+    impl Leaf {
+        /// The physical address `va` translates to through this leaf: the
+        /// entry's address field plus the VA's offset inside the page.
+        #[must_use]
+        pub fn pa(self, va: u64) -> u64 {
+            (self.entry & super::npt::ADDR_MASK) | (va & ((1 << self.shift) - 1))
+        }
+    }
+
+    /// Walk a 4-level table the way the MMU does: index by `va` at each
+    /// level, follow interior pointers, stop at the first leaf (P with PS)
+    /// or at the PT.
+    pub fn walk<S: PageSource>(src: &S, root_pa: u64, va: u64) -> Result<Leaf, WalkError> {
+        let mut table = root_pa;
+        for shift in [PML4_SHIFT, PDPT_SHIFT, PD_SHIFT] {
+            let entry = src.read(table, idx(va, shift) * 8);
+            if entry & super::npt::P == 0 {
+                return Err(WalkError::Absent(shift));
+            }
+            if entry & super::npt::PS != 0 {
+                return Ok(Leaf { entry, shift });
+            }
+            table = entry & super::npt::ADDR_MASK;
+            if table == 0 {
+                return Err(WalkError::Missing);
+            }
+        }
+        let entry = src.read(table, idx(va, PT_SHIFT) * 8);
+        if entry & super::npt::P == 0 {
+            return Err(WalkError::Absent(PT_SHIFT));
+        }
+        Ok(Leaf { entry, shift: PT_SHIFT })
+    }
+
+    /// The physical address `va` resolves to, or why it does not.
+    pub fn translate<S: PageSource>(src: &S, root_pa: u64, va: u64) -> Result<u64, WalkError> {
+        walk(src, root_pa, va).map(|leaf| leaf.pa(va))
+    }
+}
+
+/// The ELF64 image, as far as a loader needs to see it: the `PT_LOAD`
+/// segments and the note that names a PVH 32-bit entry point.
+///
+/// Field offsets are the ELF64 layout from the System V generic ABI (the
+/// `elf.h` everyone shares); the tests build an image byte-by-byte and read
+/// it back, so a transposed offset is a test failure here rather than a
+/// guest that never starts. vmlinux ELF images built with `CONFIG_PVH`
+/// carry the entry note; a bzImage does not (its own header is a different
+/// format, deliberately not decoded yet).
+/// Decoded `EXITINFO1` for the exits whose layout is a bitfield.
+pub mod exitinfo {
+    /// An intercepted `IN`/`OUT`/`INS`/`OUTS`: `EXITINFO1` as APM Vol 2 §15.10.2,
+    /// Figure 15-2 (rev 3.45, p. 538). `EXITINFO2` is the RIP of the
+    /// instruction *after* it, so no length decode is needed to resume.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Io {
+        /// Bits 31:16 — the port.
+        pub port: u16,
+        /// Bit 0 — `TYPE`: 1 = `IN`, 0 = `OUT`.
+        pub is_in: bool,
+        /// Bit 2 — `STR`: `INS`/`OUTS`.
+        pub string: bool,
+        /// Bit 3 — `REP`.
+        pub rep: bool,
+        /// Bits 6:4 — `SZ32`/`SZ16`/`SZ8`, as a byte count. 0 if none is set,
+        /// which the architecture does not produce.
+        pub size: u8,
+        /// Bits 9:7 — `A64`/`A32`/`A16`, as a width in bits. 0 if none is set.
+        pub addr_bits: u8,
+        /// Bits 12:10 — the effective segment (`INS` is always ES = 0).
+        pub seg: u8,
+    }
+
+    impl Io {
+        /// Decode `EXITINFO1`.
+        #[must_use]
+        pub const fn decode(info1: u64) -> Self {
+            let size = if info1 & (1 << 4) != 0 {
+                1
+            } else if info1 & (1 << 5) != 0 {
+                2
+            } else if info1 & (1 << 6) != 0 {
+                4
+            } else {
+                0
+            };
+            let addr_bits = if info1 & (1 << 9) != 0 {
+                64
+            } else if info1 & (1 << 8) != 0 {
+                32
+            } else if info1 & (1 << 7) != 0 {
+                16
+            } else {
+                0
+            };
+            Self {
+                port: (info1 >> 16) as u16,
+                is_in: info1 & 1 != 0,
+                string: info1 & (1 << 2) != 0,
+                rep: info1 & (1 << 3) != 0,
+                size,
+                addr_bits,
+                seg: ((info1 >> 10) & 0x7) as u8,
+            }
+        }
+
+        /// The mask of the operand's bytes in RAX (`0xFF`, `0xFFFF`,
+        /// `0xFFFF_FFFF`). A write to AL/AX leaves the rest of RAX alone; a
+        /// write to EAX is the caller's to zero-extend.
+        #[must_use]
+        pub const fn mask(&self) -> u64 {
+            match self.size {
+                1 => 0xFF,
+                2 => 0xFFFF,
+                _ => 0xFFFF_FFFF,
+            }
+        }
+    }
+
+    /// `VMEXIT_MSR`'s `EXITINFO1` (§15.11, rev 3.45, p. 540): 0 = `RDMSR`,
+    /// 1 = `WRMSR`.
+    #[must_use]
+    pub const fn msr_is_write(info1: u64) -> bool {
+        info1 & 1 != 0
+    }
+}
+
+/// What CPUID tells a guest.
+///
+/// The host's answer, with every capability the hypervisor does not provide
+/// taken out — a feature the guest sees is a feature it will use. Bit
+/// positions are APM Vol 3 rev 3.38 Appendix E (Fn0000_0001 ECX/EDX,
+/// Fn8000_0001 ECX), pinned by tests.
+pub mod cpuid {
+    /// `Fn0000_0001` ECX bits removed.
+    ///
+    /// Hypervisor-present (31), F16C (29), AVX (28), OSXSAVE (27), XSAVE (26),
+    /// x2APIC (21), FMA (12), MONITOR (3). XSAVE and everything riding on it
+    /// go together: `XSETBV` and `XCR0` are
+    /// the host's, `VMRUN` does not swap them, and a guest that wrote its own
+    /// would be changing the host's.
+    pub const LEAF1_ECX_CLEAR: u32 =
+        (1 << 31) | (1 << 29) | (1 << 28) | (1 << 27) | (1 << 26) | (1 << 21) | (1 << 12) | (1 << 3);
+    /// `Fn0000_0001` EDX bits removed: APIC (9) — there is no local APIC model
+    /// yet — plus MCE (7), MCA (14), MTRR (12) and HTT (28): machine-check and
+    /// MTRR MSRs are the host's, and the guest is one thread.
+    pub const LEAF1_EDX_CLEAR: u32 = (1 << 28) | (1 << 14) | (1 << 12) | (1 << 9) | (1 << 7);
+    /// `Fn8000_0001` ECX bits removed.
+    ///
+    /// SVM (2) — no nested virtualization — ExtApicSpace (3), OSVW (9), IBS (10), WDT (13), LWP (15), TopologyExt
+    /// (22), the performance-counter extensions (23, 24, 27, 28), DataBkptExt
+    /// (26), MONITORX (29) and AddrMaskExt (30).
+    pub const EXT1_ECX_CLEAR: u32 = (1 << 30)
+        | (1 << 29)
+        | (1 << 28)
+        | (1 << 27)
+        | (1 << 26)
+        | (1 << 24)
+        | (1 << 23)
+        | (1 << 22)
+        | (1 << 15)
+        | (1 << 13)
+        | (1 << 10)
+        | (1 << 9)
+        | (1 << 3)
+        | (1 << 2);
+
+    /// The guest's CPUID for `leaf`, given the host's `[eax, ebx, ecx, edx]`.
+    ///
+    /// Leaves that describe features the hypervisor does not provide — 4
+    /// (cache topology), 5 (MONITOR/MWAIT), 6 (thermal), 7 (structured
+    /// extended features: AVX2, SMEP, …), 0xA, 0xB, 0xD (XSAVE state), 0x1F,
+    /// the hypervisor range 0x4000_0000.., and the extended leaves
+    /// 0x8000_000A (SVM) and 0x8000_001D.. (topology, SEV, …) — read as zero.
+    #[must_use]
+    pub const fn filter(leaf: u32, host: [u32; 4]) -> [u32; 4] {
+        let [eax, ebx, ecx, edx] = host;
+        match leaf {
+            0x0000_0001 => [eax, ebx, ecx & !LEAF1_ECX_CLEAR, edx & !LEAF1_EDX_CLEAR],
+            0x0000_0004..=0x0000_0007 | 0x0000_000A..=0x0000_001F => [0; 4],
+            0x4000_0000..=0x4FFF_FFFF => [0; 4],
+            0x8000_0001 => [eax, ebx, ecx & !EXT1_ECX_CLEAR, edx],
+            0x8000_000A | 0x8000_001D..=0x8000_FFFF => [0; 4],
+            _ => [eax, ebx, ecx, edx],
+        }
+    }
+}
+
+/// Device models a guest talks to over port I/O and MSRs. Pure state
+/// machines — no I/O of their own — so the host tests drive them the way an
+/// exit handler would.
+pub mod devices {
+    /// A 16550 UART's register file (COM1 = ports `0x3F8..=0x3FF`).
+    ///
+    /// As much of it as a Linux guest's early console and 8250 probe exercise: the
+    /// transmitter is always ready, nothing is ever received, and writes to the
+    /// transmit register come back to the caller as the character sent.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Uart {
+        ier: u8,
+        lcr: u8,
+        mcr: u8,
+        scr: u8,
+        dll: u8,
+        dlm: u8,
+    }
+
+    /// `LSR` read as always: transmit-holding-register empty (bit 5) and
+    /// transmitter empty (bit 6); no data ready, no errors.
+    pub const LSR_READY: u8 = 0x60;
+    /// `IIR`: bit 0 set = no interrupt pending (no FIFO enabled).
+    pub const IIR_NONE: u8 = 0x01;
+
+    impl Uart {
+        /// A UART in its reset state.
+        #[must_use]
+        pub const fn new() -> Self {
+            Self { ier: 0, lcr: 0, mcr: 0, scr: 0, dll: 0, dlm: 0 }
+        }
+
+        const fn dlab(&self) -> bool {
+            self.lcr & 0x80 != 0
+        }
+
+        /// Read register `reg` (the port minus the base, `0..8`).
+        #[must_use]
+        pub fn read(&self, reg: u8) -> u8 {
+            match reg & 7 {
+                0 => if self.dlab() { self.dll } else { 0 },
+                1 => if self.dlab() { self.dlm } else { self.ier },
+                2 => IIR_NONE,
+                3 => self.lcr,
+                4 => self.mcr,
+                5 => LSR_READY,
+                // Modem status. In loopback (MCR bit 4) the outputs feed the
+                // inputs — DTR to DSR (bit 5), RTS to CTS (bit 4), OUT1 to RI
+                // (bit 6), OUT2 to DCD (bit 7) — which is how the 8250 driver
+                // proves a UART is there. Out of loopback: carrier, DSR, CTS up.
+                6 => {
+                    if self.mcr & 0x10 != 0 {
+                        ((self.mcr & 0x01) << 5)
+                            | ((self.mcr & 0x02) << 3)
+                            | ((self.mcr & 0x04) << 4)
+                            | ((self.mcr & 0x08) << 4)
+                    } else {
+                        0xB0
+                    }
+                }
+                _ => self.scr,
+            }
+        }
+
+        /// Write register `reg`. `Some(byte)` when this write transmitted a
+        /// character (the transmit register, divisor latch closed).
+        pub fn write(&mut self, reg: u8, v: u8) -> Option<u8> {
+            match reg & 7 {
+                0 => {
+                    if self.dlab() {
+                        self.dll = v;
+                    } else {
+                        // In loopback the character never leaves the chip.
+                        return if self.mcr & 0x10 != 0 { None } else { Some(v) };
+                    }
+                }
+                1 => {
+                    if self.dlab() {
+                        self.dlm = v;
+                    } else {
+                        self.ier = v & 0x0F;
+                    }
+                }
+                3 => self.lcr = v,
+                4 => self.mcr = v & 0x1F,
+                7 => self.scr = v,
+                _ => {} // FCR and the read-only registers: accepted, ignored.
+            }
+            None
+        }
+    }
+
+    /// A small table of MSR values the hypervisor merely remembers: what a guest
+    /// wrote reads back. Fixed capacity, no allocation; a full table refuses
+    /// the write (the caller logs it) rather than grow.
+    #[derive(Clone, Copy, Debug)]
+    pub struct MsrStore<const N: usize> {
+        slots: [(u32, u64); N],
+        used: usize,
+    }
+
+    impl<const N: usize> Default for MsrStore<N> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl<const N: usize> MsrStore<N> {
+        /// An empty store.
+        #[must_use]
+        pub const fn new() -> Self {
+            Self { slots: [(0, 0); N], used: 0 }
+        }
+
+        /// The remembered value of `msr`.
+        #[must_use]
+        pub fn get(&self, msr: u32) -> Option<u64> {
+            self.slots[..self.used].iter().find(|s| s.0 == msr).map(|s| s.1)
+        }
+
+        /// Remember `v` for `msr`. False if the table is full.
+        pub fn set(&mut self, msr: u32, v: u64) -> bool {
+            if let Some(s) = self.slots[..self.used].iter_mut().find(|s| s.0 == msr) {
+                s.1 = v;
+                return true;
+            }
+            if self.used == N {
+                return false;
+            }
+            self.slots[self.used] = (msr, v);
+            self.used += 1;
+            true
+        }
+    }
+}
+
+pub mod elf {
+    /// `\x7fELF`.
+    pub const MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
+    /// `EI_CLASS` = 64-bit.
+    pub const CLASS64: u8 = 2;
+    /// `EI_DATA` = little-endian.
+    pub const DATA_LE: u8 = 1;
+    /// `p_type` = loadable segment.
+    pub const PT_LOAD: u32 = 1;
+    /// `p_type` = note segment.
+    pub const PT_NOTE: u32 = 4;
+
+    const E_PHOFF: usize = 0x20;
+    const E_PHENTSIZE: usize = 0x36;
+    const E_PHNUM: usize = 0x38;
+    const EHDR_SIZE: usize = 64;
+    const P_TYPE: usize = 0x00;
+    const P_OFFSET: usize = 0x08;
+    const P_PADDR: usize = 0x18;
+    const P_FILESZ: usize = 0x20;
+    const P_MEMSZ: usize = 0x28;
+    const PHDR_SIZE: usize = 56;
+
+    /// The note naming the PVH 32-bit entry: name "Xen", type 18.
+    ///
+    /// The type is `XEN_ELFNOTE_PHYS32_ENTRY`, whose descriptor is the entry's
+    /// guest-physical address. Pinned against `amd64/src/boot.s` (which
+    /// emits this very note and is what QEMU's and Firecracker's PVH loaders
+    /// boot) and against the Firecracker CI `vmlinux-6.1.128`'s own note
+    /// (`readobj --notes`: owner Xen, type 0x12). It was 9 until 2026-10-22 —
+    /// `XEN_ELFNOTE_LOADER`'s number — and no synthetic-image test could
+    /// see it, because they all used this constant.
+    pub const PVH_NOTE_NAME: &[u8] = b"Xen";
+    pub const PVH_NOTE_TYPE: u32 = 18;
+
+    /// One `PT_LOAD` segment.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Segment {
+        /// Where the segment's bytes sit in the image.
+        pub offset: u64,
+        /// Guest-physical address the bytes load at.
+        pub pa: u64,
+        /// Bytes present in the image.
+        pub filesz: u64,
+        /// Bytes present in memory (`memsz - filesz` zeroes).
+        pub memsz: u64,
+    }
+
+    /// A parsed ELF64 header over borrowed bytes.
+    #[derive(Clone, Copy)]
+    pub struct Image<'a> {
+        bytes: &'a [u8],
+        phoff: u64,
+        phentsize: u64,
+        phnum: u64,
+    }
+
+    impl<'a> Image<'a> {
+        /// Parse the header. Rejects short, wrong-magic, wrong-class and
+        /// wrong-endianness images, and a program-header table whose extent
+        /// leaves the image — anything else is a loader bug waiting.
+        #[must_use]
+        pub fn parse(bytes: &'a [u8]) -> Option<Self> {
+            if bytes.len() < EHDR_SIZE || bytes[..4] != MAGIC {
+                return None;
+            }
+            if bytes[4] != CLASS64 || bytes[5] != DATA_LE {
+                return None;
+            }
+            let phoff = u64::from_le_bytes(bytes[E_PHOFF..E_PHOFF + 8].try_into().ok()?);
+            let phentsize =
+                u64::from(u16::from_le_bytes(bytes[E_PHENTSIZE..E_PHENTSIZE + 2].try_into().ok()?));
+            let phnum = u64::from(u16::from_le_bytes(bytes[E_PHNUM..E_PHNUM + 2].try_into().ok()?));
+            if phentsize < PHDR_SIZE as u64 {
+                return None;
+            }
+            let end = phoff.checked_add(phentsize.checked_mul(phnum)?)?;
+            if end as usize > bytes.len() {
+                return None;
+            }
+            Some(Self { bytes, phoff, phentsize, phnum })
+        }
+
+        /// The `PT_LOAD` segments, in header order.
+        pub fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
+            (0..self.phnum).filter_map(|i| {
+                self.phdr(i).and_then(|(ptype, seg)| (ptype == PT_LOAD).then_some(seg))
+            })
+        }
+
+        /// The PVH 32-bit entry point, from the note segment: name `Xen`,
+        /// type 18, descriptor = the entry address. `None` for an image
+        /// without the note — including every bzImage. Needs the note segment's
+        /// bytes in `self.bytes`; a loader that holds only the file's head
+        /// reads [`Image::note_segments`] and calls [`find_pvh_entry`] itself.
+        #[must_use]
+        pub fn entry_phys32(&self) -> Option<u32> {
+            for seg in self.note_segments() {
+                let start = usize::try_from(seg.offset).ok()?;
+                let end = start.checked_add(usize::try_from(seg.filesz).ok()?)?;
+                if let Some(entry) = self.bytes.get(start..end).and_then(find_pvh_entry) {
+                    return Some(entry);
+                }
+            }
+            None
+        }
+
+        /// The `PT_NOTE` segments, in header order (`pa`/`memsz` are as in the
+        /// header; `offset`/`filesz` say where the notes sit in the image).
+        pub fn note_segments(&self) -> impl Iterator<Item = Segment> + '_ {
+            (0..self.phnum).filter_map(|i| {
+                self.phdr(i).and_then(|(ptype, seg)| (ptype == PT_NOTE).then_some(seg))
+            })
+        }
+
+        fn phdr(&self, i: u64) -> Option<(u32, Segment)> {
+            let base = self.phoff as usize + i as usize * self.phentsize as usize;
+            let b = self.bytes.get(base..base + PHDR_SIZE)?;
+            let rd32 =
+                |o: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
+            let rd64 =
+                |o: usize| -> Option<u64> { Some(u64::from_le_bytes(b.get(o..o + 8)?.try_into().ok()?)) };
+            Some((
+                rd32(P_TYPE)?,
+                Segment {
+                    offset: rd64(P_OFFSET)?,
+                    pa: rd64(P_PADDR)?,
+                    filesz: rd64(P_FILESZ)?,
+                    memsz: rd64(P_MEMSZ)?,
+                },
+            ))
+        }
+    }
+
+    /// The PVH entry from an ELF note stream (the bytes of one `PT_NOTE`
+    /// segment): name `Xen`, type 18, descriptor = the 32-bit entry address.
+    ///
+    /// Bounds-safe over hostile input: every read is checked and a malformed
+    /// stream ends the walk with `None`.
+    #[must_use]
+    pub fn find_pvh_entry(notes: &[u8]) -> Option<u32> {
+        let rd32 = |at: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(notes.get(at..at.checked_add(4)?)?.try_into().ok()?))
+        };
+        let mut pos = 0usize;
+        while pos.checked_add(12)? <= notes.len() {
+            let namesz = rd32(pos)? as usize;
+            let descsz = rd32(pos + 4)? as usize;
+            let ty = rd32(pos + 8)?;
+            let name_at = pos + 12;
+            // ELF pads the name and the descriptor each to a 4-byte boundary;
+            // `namesz`/`descsz` are the unpadded sizes. A real kernel carries
+            // notes before the Xen one with odd-length names ("Linux\0" is 6),
+            // so stepping by the raw sizes loses the stream and misses the
+            // entry.
+            let desc_at = name_at.checked_add(namesz.checked_add(3)? & !3)?;
+            let next = desc_at.checked_add(descsz.checked_add(3)? & !3)?;
+            if desc_at.checked_add(descsz)? > notes.len() {
+                return None;
+            }
+            // The stored name is "Xen\0" (namesz counts the NUL): compare the
+            // prefix, bounded by namesz (a 3-byte namesz names "Xen" bare).
+            let name = notes.get(name_at..name_at.checked_add(namesz.min(PVH_NOTE_NAME.len() + 1))?)?;
+            let name_ok = name.starts_with(PVH_NOTE_NAME);
+            if ty == PVH_NOTE_TYPE && name_ok && descsz >= 4 {
+                return rd32(desc_at);
+            }
+            pos = next;
+        }
+        None
+    }
+}
+
+/// The PVH handoff: `hvm_start_info` and its memory-map table, built into
+/// guest RAM by [`plan`] + the three writers.
+///
+/// This is the Xen project's public PVH entry ABI (the `hvm_start_info` /
+/// `hvm_memmap_table_entry` wire format): magic `336EC578h`, version 0, a
+/// flags qword, the guest-physical addresses of the command line, the RSDP
+/// (0 = none, what a no-ACPI rung hands over) and the memory map, then the
+/// entry count. The guest is *entered* in 32-bit protected mode, paging
+/// off, with EBX holding `start_info`'s guest-physical address — the entry
+/// EIP comes from the image's ELF note (`elf::entry_phys32`). No Linux code
+/// is consulted anywhere in this crate; the format is the platform's boot
+/// ABI, the same bytes every PVH loader writes.
+pub mod pvh {
+    /// `hvm_start_info.magic`.
+    pub const START_MAGIC: u32 = 0x336E_C578;
+    /// `hvm_start_info.version`: 1, the version that carries the memory map
+    /// (`memmap_paddr`/`memmap_entries`); version 0 stops after `rsdp_paddr`
+    /// and a guest then reads no memory map at all.
+    pub const START_VERSION: u32 = 1;
+    /// `hvm_memmap_table_entry.type` = usable RAM.
+    pub const MEMMAP_RAM: u32 = 1;
+    /// `sizeof(hvm_start_info)` at version 1 (Xen's public `start_info.h`).
+    ///
+    /// Fields: u32 magic, u32 version, u32 flags, u32 nr_modules, u64 modlist_paddr,
+    /// u64 cmdline_paddr, u64 rsdp_paddr, u64 memmap_paddr, u32 memmap_entries,
+    /// u32 reserved.
+    ///
+    /// The offsets are pinned by a test that reads the blobs back with the
+    /// kernel's own parser (`akuma-ryzen-amd64`'s `StartInfo`, the one that
+    /// boots on QEMU and Firecracker). Until 2026-10-22 this module had
+    /// `cmdline` at `+0x10`, `memmap` at `+0x20` and a 48-byte struct, and its
+    /// synthetic guest read the same wrong offsets — so the PVH rung passed
+    /// while a real guest saw no command line and no memory map.
+    pub const START_SIZE: usize = 56;
+    /// `sizeof(hvm_memmap_table_entry)`: u64 addr, u64 size, u32 type, u32
+    /// reserved.
+    pub const MEMMAP_ENTRY_SIZE: usize = 24;
+
+    const F_MAGIC: usize = 0x00;
+    const F_VERSION: usize = 0x04;
+    const F_FLAGS: usize = 0x08;
+    const F_NR_MODULES: usize = 0x0C;
+    const F_MODLIST: usize = 0x10;
+    const F_CMDLINE: usize = 0x18;
+    const F_RSDP: usize = 0x20;
+    const F_MEMMAP: usize = 0x28;
+    const F_ENTRIES: usize = 0x30;
+    const F_RESERVED: usize = 0x34;
+    const E_ADDR: usize = 0x00;
+    const E_SIZE: usize = 0x08;
+    const E_TYPE: usize = 0x10;
+    const E_RESERVED: usize = 0x14;
+
+    /// Where the handoff blobs live in guest RAM: one 4-KiB page each,
+    /// packed directly under `top_gpa` (the top of guest RAM), above
+    /// anything a loader places.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Layout {
+        pub cmdline_gpa: u64,
+        pub memmap_gpa: u64,
+        pub start_gpa: u64,
+        /// The RAM extent the memory map reports.
+        pub ram_base: u64,
+        pub ram_len: u64,
+    }
+
+    /// The layout: three pages under `top_gpa`, one RAM entry covering
+    /// `[ram_base, ram_base + ram_len)`.
+    #[must_use]
+    pub const fn plan(top_gpa: u64, ram_base: u64, ram_len: u64) -> Layout {
+        Layout {
+            cmdline_gpa: top_gpa - 0x3000,
+            memmap_gpa: top_gpa - 0x2000,
+            start_gpa: top_gpa - 0x1000,
+            ram_base,
+            ram_len,
+        }
+    }
+
+    /// Write `hvm_start_info` into the `start_gpa` page.
+    pub fn write_start(buf: &mut [u8], l: &Layout) {
+        wr32(buf, F_MAGIC, START_MAGIC);
+        wr32(buf, F_VERSION, START_VERSION);
+        wr32(buf, F_FLAGS, 0);
+        wr32(buf, F_NR_MODULES, 0);
+        wr64(buf, F_MODLIST, 0);
+        wr64(buf, F_CMDLINE, l.cmdline_gpa);
+        wr64(buf, F_RSDP, 0);
+        wr64(buf, F_MEMMAP, l.memmap_gpa);
+        wr32(buf, F_ENTRIES, 1);
+        wr32(buf, F_RESERVED, 0);
+    }
+
+    /// Write the one-entry memory map into the `memmap_gpa` page.
+    pub fn write_memmap(buf: &mut [u8], l: &Layout) {
+        wr64(buf, E_ADDR, l.ram_base);
+        wr64(buf, E_SIZE, l.ram_len);
+        wr32(buf, E_TYPE, MEMMAP_RAM);
+        wr32(buf, E_RESERVED, 0);
+    }
+
+    /// Write the NUL-terminated command line into the `cmdline_gpa` page;
+    /// false if it does not fit a page (it never will — 4 KiB).
+    pub fn write_cmdline(buf: &mut [u8], cmdline: &str) -> bool {
+        if cmdline.len() + 1 > buf.len() {
+            return false;
+        }
+        buf[..cmdline.len()].copy_from_slice(cmdline.as_bytes());
+        buf[cmdline.len()] = 0;
+        true
+    }
+
+    fn wr32(buf: &mut [u8], off: usize, v: u32) {
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn wr64(buf: &mut [u8], off: usize, v: u64) {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // The crate is `no_std`; the harness links std, but the path needs naming
+    // for the one test that reads a real kernel off disk.
+    extern crate std;
     use super::*;
 
     /// A VMCB page with one recognizable byte pattern everywhere, so an
@@ -1667,5 +2420,510 @@ mod tests {
         let page = iopm::with_port([0xFF; iopm::SIZE], 0x1234, false);
         assert!(!iopm::intercepted(&page, 0x1234));
         assert!(iopm::intercepted(&page, 0x1235));
+    }
+
+    /// The rung-4 bug as a standing test: `0x5000_0000` names PD slot 128,
+    /// not slot 0. Every level's index derived from the VA, pinned here for
+    /// a VA that caught the hand-computed kind.
+    #[test]
+    fn table_indices_are_derived_from_the_va() {
+        let va = 0x5000_0000; // 1 GiB + 256 MiB
+        assert_eq!(tables::idx(va, tables::PML4_SHIFT), 0);
+        assert_eq!(tables::idx(va, tables::PDPT_SHIFT), 1);
+        assert_eq!(tables::idx(va, tables::PD_SHIFT), 128);
+        assert_eq!(tables::idx(va, tables::PT_SHIFT), 0);
+        // One bit below the PD field walks back to slot 127.
+        assert_eq!(tables::idx(va - 0x1000, tables::PD_SHIFT), 127);
+        // A VA high in the canonical half hits the top slot.
+        assert_eq!(tables::idx(0xFFFF_FFFF_FFFF_F000, tables::PML4_SHIFT), 511);
+    }
+
+    /// A walk over a table built exactly the way the two-level guest builds
+    /// its own — PML4 → PDPT → PD → PT, 4-KiB leaves — must reach the code
+    /// frame. This is the host-side rehearsal the rung-4 note asked for: a
+    /// builder that writes a slot by hand fails here before any guest runs.
+    #[test]
+    fn walk_reads_a_built_table_the_way_the_mmu_does() {
+        struct FourPages {
+            pml4: [u64; 512],
+            pdpt: [u64; 512],
+            pd: [u64; 512],
+            pt: [u64; 512],
+        }
+        impl tables::PageSource for FourPages {
+            fn read(&self, table_pa: u64, off: usize) -> u64 {
+                match table_pa {
+                    0x1000 => self.pml4[off / 8],
+                    0x2000 => self.pdpt[off / 8],
+                    0x3000 => self.pd[off / 8],
+                    _ => self.pt[off / 8],
+                }
+            }
+        }
+        let mut b = FourPages {
+            pml4: [0; 512],
+            pdpt: [0; 512],
+            pd: [0; 512],
+            pt: [0; 512],
+        };
+        let (pml4, pdpt, pd, pt, code) = (0x1000u64, 0x2000u64, 0x3000u64, 0x4000u64, 0x9000u64);
+        let va = 0x5000_0000u64;
+        b.pml4[tables::idx(va, tables::PML4_SHIFT)] = npt::pointer(pdpt);
+        b.pdpt[tables::idx(va, tables::PDPT_SHIFT)] = npt::pointer(pd);
+        b.pd[tables::idx(va, tables::PD_SHIFT)] = npt::pointer(pt);
+        b.pt[tables::idx(va, tables::PT_SHIFT)] = npt::leaf_4k(code);
+
+        let leaf = tables::walk(&b, pml4, va).unwrap();
+        assert_eq!(leaf.shift, tables::PT_SHIFT);
+        assert_eq!(tables::translate(&b, pml4, va), Ok(code));
+        // An offset inside the page lands inside the frame.
+        assert_eq!(tables::translate(&b, pml4, va + 0xABC), Ok(code + 0xABC));
+        // An unmapped VA in the same PDPT reports the level it stopped at.
+        assert_eq!(tables::walk(&b, pml4, 0x4000_0000), Err(tables::WalkError::Absent(tables::PD_SHIFT)));
+        // A zero pointer entry is a missing page, not a leaf.
+        b.pml4[tables::idx(va, tables::PML4_SHIFT)] = 0;
+        assert_eq!(tables::walk(&b, pml4, va), Err(tables::WalkError::Absent(tables::PML4_SHIFT)));
+    }
+
+    /// A 2-MiB leaf short-circuits at the PD: the PS-bit level, and the
+    /// offset inside the page is the 21 low bits, not the 12.
+    #[test]
+    fn walk_stops_at_a_large_page_leaf() {
+        struct TwoPages {
+            pml4: [u64; 512],
+            pd: [u64; 512],
+        }
+        impl tables::PageSource for TwoPages {
+            fn read(&self, table_pa: u64, off: usize) -> u64 {
+                if table_pa == 0x1000 {
+                    self.pml4[off / 8]
+                } else {
+                    self.pd[off / 8]
+                }
+            }
+        }
+        let mut src = TwoPages { pml4: [0; 512], pd: [0; 512] };
+        // PML4 1, PDPT 2, PD 2: three distinct slots, 2-MiB region 0x40_0000.
+        let va = 0x8040_0000u64;
+        let pd_frame = 0x2000_0000u64;
+        src.pml4[tables::idx(va, tables::PML4_SHIFT)] = npt::pointer(0x1000);
+        src.pml4[tables::idx(va, tables::PDPT_SHIFT)] = npt::pointer(0x2000);
+        src.pd[tables::idx(va, tables::PD_SHIFT)] = npt::leaf_2m(pd_frame);
+        let leaf = tables::walk(&src, 0x1000, va).unwrap();
+        assert_eq!(leaf.shift, tables::PD_SHIFT);
+        // The page base itself has zero offset inside the 2-MiB leaf.
+        assert_eq!(tables::translate(&src, 0x1000, va), Ok(pd_frame));
+        // 0x800 inside the page rides along, proving the mask is 21 bits.
+        assert_eq!(tables::translate(&src, 0x1000, va + 0x800), Ok(pd_frame + 0x800));
+    }
+
+    /// An ELF64 built byte-by-byte in the test, read back through the
+    /// parser: the segment list is the PT_LOAD set in header order, and the
+    /// Xen type-18 note names the 32-bit entry.
+    #[test]
+    fn elf_image_roundtrips_segments_and_pvh_note() {
+        let mut img = [0u8; 0x400];
+        img[..4].copy_from_slice(&elf::MAGIC);
+        img[4] = elf::CLASS64;
+        img[5] = elf::DATA_LE;
+        img[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        img[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        img[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+        // PHDR 0: PT_LOAD text at pa 0x100_0000, bytes at file offset 0x200.
+        let ph0 = 64;
+        img[ph0..ph0 + 4].copy_from_slice(&elf::PT_LOAD.to_le_bytes());
+        img[ph0 + 0x08..ph0 + 0x10].copy_from_slice(&0x200u64.to_le_bytes());
+        img[ph0 + 0x18..ph0 + 0x20].copy_from_slice(&0x100_0000u64.to_le_bytes());
+        img[ph0 + 0x20..ph0 + 0x28].copy_from_slice(&0x178u64.to_le_bytes());
+        img[ph0 + 0x28..ph0 + 0x30].copy_from_slice(&0x178u64.to_le_bytes());
+        // PHDR 1: PT_NOTE holding the PVH entry note (name "Xen", type 18,
+        // descriptor = entry 0x120_0000).
+        let ph1 = 64 + 56;
+        img[ph1..ph1 + 4].copy_from_slice(&elf::PT_NOTE.to_le_bytes());
+        img[ph1 + 0x08..ph1 + 0x10].copy_from_slice(&0x300u64.to_le_bytes());
+        img[ph1 + 0x20..ph1 + 0x28].copy_from_slice(&20u64.to_le_bytes()); // 12+4+4
+        img[ph1 + 0x28..ph1 + 0x30].copy_from_slice(&20u64.to_le_bytes());
+        img[0x300..0x304].copy_from_slice(&4u32.to_le_bytes()); // namesz
+        img[0x304..0x308].copy_from_slice(&4u32.to_le_bytes()); // descsz
+        img[0x308..0x30C].copy_from_slice(&18u32.to_le_bytes()); // type
+        img[0x30C..0x310].copy_from_slice(b"Xen\0");
+        img[0x310..0x314].copy_from_slice(&0x120_0000u32.to_le_bytes());
+
+        let image = elf::Image::parse(&img).unwrap();
+        let mut segs = [None; 4];
+        let mut n = 0;
+        for s in image.segments() {
+            segs[n] = Some(s);
+            n += 1;
+        }
+        assert_eq!(n, 1);
+        let s = segs[0].unwrap();
+        assert_eq!(s.offset, 0x200);
+        assert_eq!(s.pa, 0x100_0000);
+        assert_eq!(s.filesz, 0x178);
+        assert_eq!(image.entry_phys32(), Some(0x120_0000));
+
+        // The rejects: short, bad magic, 32-bit class, big-endian.
+        assert!(elf::Image::parse(&img[..32]).is_none());
+        let mut bad = img;
+        bad[0] = b'X';
+        assert!(elf::Image::parse(&bad).is_none());
+        let mut bad = img;
+        bad[4] = 1;
+        assert!(elf::Image::parse(&bad).is_none());
+        let mut bad = img;
+        bad[5] = 2;
+        assert!(elf::Image::parse(&bad).is_none());
+        // A program-header table running past the image is a reject:
+        // 64 + 18*56 = 1072 > 0x400.
+        let mut bad = img;
+        bad[0x38..0x3A].copy_from_slice(&18u16.to_le_bytes());
+        assert!(elf::Image::parse(&bad).is_none());
+        // No note segment -> no entry (every bzImage).
+        let mut bare = [0u8; 0x400];
+        bare[..4].copy_from_slice(&elf::MAGIC);
+        bare[4] = elf::CLASS64;
+        bare[5] = elf::DATA_LE;
+        bare[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        bare[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        bare[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+        bare[64..68].copy_from_slice(&elf::PT_LOAD.to_le_bytes());
+        assert_eq!(elf::Image::parse(&bare).unwrap().entry_phys32(), None);
+    }
+
+    /// The note number, pinned numerically and against the loader contract:
+    /// `XEN_ELFNOTE_PHYS32_ENTRY` is 18. The synthetic-image test above builds
+    /// its note from the same constant, so it can never catch a wrong value —
+    /// this one can (the constant was 9, `XEN_ELFNOTE_LOADER`).
+    #[test]
+    fn pvh_note_type_is_xen_elfnote_phys32_entry() {
+        assert_eq!(elf::PVH_NOTE_TYPE, 18);
+        assert_eq!(elf::PVH_NOTE_NAME, b"Xen");
+    }
+
+    /// A note segment as a real kernel lays it out: a note with an odd-length
+    /// name and descriptor *before* the Xen one, each padded to 4 bytes. The
+    /// entry is found only if the parser steps by the padded sizes.
+    #[test]
+    fn pvh_entry_is_found_behind_padded_notes() {
+        let mut img = [0u8; 0x200];
+        img[..4].copy_from_slice(&elf::MAGIC);
+        img[4] = elf::CLASS64;
+        img[5] = elf::DATA_LE;
+        img[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        img[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        img[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+        let ph = 64;
+        img[ph..ph + 4].copy_from_slice(&elf::PT_NOTE.to_le_bytes());
+        img[ph + 0x08..ph + 0x10].copy_from_slice(&0x100u64.to_le_bytes());
+        let total = (12 + 8 + 4) + (12 + 4 + 4); // "Linux\0"+3 bytes, padded; then Xen
+        img[ph + 0x20..ph + 0x28].copy_from_slice(&(total as u64).to_le_bytes());
+        // note 1: namesz 6 ("Linux\0", padded to 8), descsz 3 (padded to 4), type 0x100
+        img[0x100..0x104].copy_from_slice(&6u32.to_le_bytes());
+        img[0x104..0x108].copy_from_slice(&3u32.to_le_bytes());
+        img[0x108..0x10C].copy_from_slice(&0x100u32.to_le_bytes());
+        img[0x10C..0x112].copy_from_slice(b"Linux\0");
+        img[0x114..0x117].copy_from_slice(&[1, 2, 3]);
+        // note 2: the Xen entry note, right after the padding.
+        let n2 = 0x100 + 12 + 8 + 4;
+        img[n2..n2 + 4].copy_from_slice(&4u32.to_le_bytes());
+        img[n2 + 4..n2 + 8].copy_from_slice(&4u32.to_le_bytes());
+        img[n2 + 8..n2 + 12].copy_from_slice(&18u32.to_le_bytes());
+        img[n2 + 12..n2 + 16].copy_from_slice(b"Xen\0");
+        img[n2 + 16..n2 + 20].copy_from_slice(&0x0100_0140u32.to_le_bytes());
+        assert_eq!(elf::Image::parse(&img).unwrap().entry_phys32(), Some(0x0100_0140));
+    }
+
+    /// The real thing, when one is at hand: `AKUMA_TEST_VMLINUX=<path>` (the
+    /// Firecracker CI `vmlinux-6.1.128`). Skipped silently otherwise — a 40 MB
+    /// kernel is not a repo file. Pins what the Linux rung's loader will see:
+    /// four `PT_LOAD`s from physical 16 MiB, and a PVH entry in that range.
+    #[test]
+    fn real_vmlinux_parses_when_provided() {
+        let Ok(path) = std::env::var("AKUMA_TEST_VMLINUX") else { return };
+        let bytes = std::fs::read(path).expect("AKUMA_TEST_VMLINUX is unreadable");
+        let image = elf::Image::parse(&bytes).expect("not an ELF64 LE image");
+        let segs: std::vec::Vec<_> = image.segments().collect();
+        assert_eq!(segs.len(), 4, "vmlinux-6.1.128 has four PT_LOADs");
+        assert_eq!(segs[0].pa, 0x100_0000);
+        let entry = image.entry_phys32().expect("no PVH note found in a PVH-capable kernel");
+        assert!(
+            (0x100_0000..0x200_0000).contains(&u64::from(entry)),
+            "PVH entry {entry:#x} outside the text segment"
+        );
+    }
+
+    /// `EXITINFO1` for an intercepted IN/OUT, decoded field by field against
+    /// Figure 15-2 (§15.10.2): PORT 31:16, SEG 12:10, A64/A32/A16 9/8/7,
+    /// SZ32/SZ16/SZ8 6/5/4, REP 3, STR 2, TYPE 0 (1 = IN).
+    #[test]
+    fn ioio_exitinfo1_is_vol2_figure_15_2() {
+        // `in al, dx` with dx = 0x3FD (the 16550 line-status register).
+        let io = exitinfo::Io::decode(0x03FD_0011);
+        assert_eq!(io.port, 0x3FD);
+        assert!(io.is_in);
+        assert!(!io.string && !io.rep);
+        assert_eq!(io.size, 1);
+        assert_eq!(io.mask(), 0xFF);
+        // `out dx, eax` to 0xCF8: SZ32, TYPE 0.
+        let io = exitinfo::Io::decode(0x0CF8_0040);
+        assert_eq!((io.port, io.is_in, io.size), (0xCF8, false, 4));
+        assert_eq!(io.mask(), 0xFFFF_FFFF);
+        // `rep outsw` with 32-bit addressing through ES (seg 0) vs DS (seg 3).
+        let io = exitinfo::Io::decode((0x60 << 16) | (3 << 10) | (1 << 8) | (1 << 5) | (1 << 3) | (1 << 2));
+        assert_eq!((io.port, io.is_in, io.string, io.rep), (0x60, false, true, true));
+        assert_eq!((io.size, io.addr_bits, io.seg), (2, 32, 3));
+        // The three address-size bits, one at a time.
+        assert_eq!(exitinfo::Io::decode(1 << 7).addr_bits, 16);
+        assert_eq!(exitinfo::Io::decode(1 << 8).addr_bits, 32);
+        assert_eq!(exitinfo::Io::decode(1 << 9).addr_bits, 64);
+        // The architecture never sets none; the decoder says so rather than guess.
+        assert_eq!(exitinfo::Io::decode(0).size, 0);
+        // MSR exits: EXITINFO1 = 0 is RDMSR, 1 is WRMSR (§15.11).
+        assert!(!exitinfo::msr_is_write(0));
+        assert!(exitinfo::msr_is_write(1));
+    }
+
+    /// The save-area MSR fields of Table B-2 (rev 3.45, pp. 770-771), by offset.
+    #[test]
+    fn save_area_msr_offsets_are_table_b2() {
+        assert_eq!(save::STAR, 0x200);
+        assert_eq!(save::LSTAR, 0x208);
+        assert_eq!(save::CSTAR, 0x210);
+        assert_eq!(save::SFMASK, 0x218);
+        assert_eq!(save::KERNEL_GS_BASE, 0x220);
+        assert_eq!(save::SYSENTER_CS, 0x228);
+        assert_eq!(save::SYSENTER_ESP, 0x230);
+        assert_eq!(save::SYSENTER_EIP, 0x238);
+        assert_eq!(save::CR2, 0x240);
+        assert_eq!(save::G_PAT, 0x268);
+        assert_eq!(save::LASTEXCPFROM, 0x288);
+    }
+
+    /// What CPUID removes, pinned to the Vol 3 feature tables, and the leaves
+    /// that read as zero.
+    #[test]
+    fn guest_cpuid_hides_what_the_hypervisor_does_not_provide() {
+        let all = [0xFFFF_FFFF; 4];
+        // Fn0000_0001 ECX (Vol 3 Appendix E): 31 hypervisor, 29 F16C, 28 AVX,
+        // 27 OSXSAVE, 26 XSAVE, 21 x2APIC, 12 FMA, 3 MONITOR.
+        let l1 = cpuid::filter(1, all);
+        for bit in [31, 29, 28, 27, 26, 21, 12, 3] {
+            assert_eq!(l1[2] & (1 << bit), 0, "ECX bit {bit} must be hidden");
+        }
+        // What stays: SSE3 0, PCLMULQDQ 1, SSSE3 9, CMPXCHG16B 13, SSE4.1/4.2,
+        // MOVBE 22, POPCNT 23, AES 25, RDRAND 30.
+        for bit in [0, 1, 9, 13, 19, 20, 22, 23, 25, 30] {
+            assert_ne!(l1[2] & (1 << bit), 0, "ECX bit {bit} must survive");
+        }
+        // EDX: APIC 9, MCE 7, MTRR 12, MCA 14, HTT 28 hidden; TSC 4, MSR 5,
+        // PAE 6, PAT 16, FXSR 24, SSE 25, SSE2 26 stay.
+        for bit in [9, 7, 12, 14, 28] {
+            assert_eq!(l1[3] & (1 << bit), 0, "EDX bit {bit} must be hidden");
+        }
+        for bit in [4, 5, 6, 16, 24, 25, 26] {
+            assert_ne!(l1[3] & (1 << bit), 0, "EDX bit {bit} must survive");
+        }
+        // EAX (family/model/stepping) and EBX (APIC id, brand) pass through.
+        assert_eq!((l1[0], l1[1]), (0xFFFF_FFFF, 0xFFFF_FFFF));
+        // Fn8000_0001 ECX: SVM 2 and TopologyExtensions 22 hidden; LahfSahf 0
+        // and ABM 5 stay. EDX (NX 20, SYSCALL 11, LM 29) is untouched.
+        let e1 = cpuid::filter(0x8000_0001, all);
+        for bit in [2, 3, 9, 22, 23] {
+            assert_eq!(e1[2] & (1 << bit), 0, "ext ECX bit {bit} must be hidden");
+        }
+        for bit in [0, 5, 8] {
+            assert_ne!(e1[2] & (1 << bit), 0, "ext ECX bit {bit} must survive");
+        }
+        assert_eq!(e1[3], 0xFFFF_FFFF);
+        // Zeroed leaves.
+        for leaf in [4, 5, 6, 7, 0xA, 0xB, 0xD, 0x1F, 0x4000_0000, 0x4000_0001, 0x8000_000A, 0x8000_001D, 0x8000_001E] {
+            assert_eq!(cpuid::filter(leaf, all), [0; 4], "leaf {leaf:#x} must read zero");
+        }
+        // Passed through untouched.
+        for leaf in [0, 2, 3, 0x8000_0000, 0x8000_0002, 0x8000_0007, 0x8000_0008] {
+            assert_eq!(cpuid::filter(leaf, all), all, "leaf {leaf:#x} must pass through");
+        }
+    }
+
+    /// `EVENTINJ`, bit by bit against Figure 15-5 / Table 15-11.
+    #[test]
+    fn eventinj_is_vol2_figure_15_5() {
+        // #UD: vector 6, no error code. V (31) | TYPE=3 (10:8) | VECTOR.
+        assert_eq!(eventinj::exception(6, None), 0x8000_0306);
+        // #GP(0): vector 13 pushes an error code, EV (11) set.
+        assert_eq!(eventinj::exception(13, Some(0)), 0x8000_0B0D);
+        // #PF with error code 0x7: ERRORCODE rides bits 63:32.
+        assert_eq!(eventinj::exception(14, Some(7)), 0x0000_0007_8000_0B0E);
+        assert_eq!(eventinj::VALID, 1 << 31);
+        assert_eq!(eventinj::ERROR_CODE_VALID, 1 << 11);
+        assert_eq!(eventinj::TYPE_EXCEPTION >> 8, 3);
+        assert_eq!(excp::DF, 1 << 8);
+    }
+
+    /// The 16550 as the early console and the 8250 probe see it.
+    #[test]
+    fn uart_transmits_and_answers_the_probe() {
+        let mut u = devices::Uart::new();
+        // Always ready to send, nothing received, no interrupt pending.
+        assert_eq!(u.read(5), 0x60);
+        assert_eq!(u.read(2), 0x01);
+        assert_eq!(u.read(0), 0);
+        // A character written to the transmit register comes back out.
+        assert_eq!(u.write(0, b'L'), Some(b'L'));
+        // With DLAB set, registers 0/1 are the divisor latch and send nothing.
+        assert_eq!(u.write(3, 0x83), None);
+        assert_eq!(u.write(0, 0x01), None);
+        assert_eq!(u.write(1, 0x00), None);
+        assert_eq!((u.read(0), u.read(1)), (0x01, 0x00));
+        // DLAB closed again: register 1 is IER, register 0 transmits.
+        assert_eq!(u.write(3, 0x03), None);
+        assert_eq!(u.read(3), 0x03);
+        assert_eq!(u.write(1, 0xFF), None);
+        assert_eq!(u.read(1), 0x0F);
+        assert_eq!(u.write(0, b'x'), Some(b'x'));
+        // The scratch register reads back what was written.
+        u.write(7, 0xA5);
+        assert_eq!(u.read(7), 0xA5);
+        // Out of loopback the modem lines read DCD|DSR|CTS.
+        assert_eq!(u.read(6), 0xB0);
+        // Loopback: outputs feed inputs and nothing is transmitted. The 8250
+        // driver writes MCR = LOOP|0x0A (RTS, OUT2) and expects MSR high bits
+        // 0x90 (CTS, DCD).
+        u.write(4, 0x10 | 0x0A);
+        assert_eq!(u.read(6) & 0xF0, 0x90);
+        assert_eq!(u.write(0, b'!'), None);
+    }
+
+    #[test]
+    fn msr_store_remembers_until_full() {
+        let mut m = devices::MsrStore::<2>::new();
+        assert_eq!(m.get(0x277), None);
+        assert!(m.set(0x277, 7));
+        assert!(m.set(0x1A0, 1));
+        assert!(m.set(0x277, 9)); // overwrite, not a new slot
+        assert_eq!((m.get(0x277), m.get(0x1A0)), (Some(9), Some(1)));
+        assert!(!m.set(0xC0000103, 5), "a full store refuses a third MSR");
+        assert_eq!(m.get(0xC0000103), None);
+    }
+
+    /// The loader reads only the note segment out of a 40 MB file, so the
+    /// stream walker must work on a bare slice — and not panic on garbage.
+    #[test]
+    fn find_pvh_entry_is_bounds_safe() {
+        // note 1 (6-byte name, 3-byte desc, padded) then the Xen entry note.
+        let mut n = [0u8; 44];
+        n[0..4].copy_from_slice(&6u32.to_le_bytes());
+        n[4..8].copy_from_slice(&3u32.to_le_bytes());
+        n[8..12].copy_from_slice(&0x100u32.to_le_bytes());
+        n[12..18].copy_from_slice(b"Linux\0");
+        n[20..23].copy_from_slice(&[1, 2, 3]);
+        n[24..28].copy_from_slice(&4u32.to_le_bytes());
+        n[28..32].copy_from_slice(&4u32.to_le_bytes());
+        n[32..36].copy_from_slice(&18u32.to_le_bytes());
+        n[36..40].copy_from_slice(b"Xen\0");
+        n[40..44].copy_from_slice(&0x0100_0140u32.to_le_bytes());
+        assert_eq!(elf::find_pvh_entry(&n), Some(0x0100_0140));
+        // Truncated anywhere: None, never a panic.
+        for cut in 0..n.len() {
+            let _ = elf::find_pvh_entry(&n[..cut]);
+        }
+        // A descriptor size that runs off the end, and an absurd one.
+        let mut bad = n;
+        bad[28..32].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        assert_eq!(elf::find_pvh_entry(&bad), None);
+        assert_eq!(elf::find_pvh_entry(&[]), None);
+        // Right name, wrong type: not the entry.
+        let mut other = n;
+        other[32..36].copy_from_slice(&9u32.to_le_bytes());
+        assert_eq!(elf::find_pvh_entry(&other), None);
+    }
+
+    /// The PVH wire format: `hvm_start_info` version 1 and its memory-map
+    /// entry, byte for byte (Xen's public `start_info.h`).
+    #[test]
+    fn pvh_handoff_blobs_are_the_hvm_start_info_layout() {
+        assert_eq!(pvh::START_MAGIC, 0x336E_C578);
+        assert_eq!(pvh::START_VERSION, 1);
+        assert_eq!(pvh::MEMMAP_RAM, 1);
+        assert_eq!(pvh::START_SIZE, 56);
+        assert_eq!(pvh::MEMMAP_ENTRY_SIZE, 24);
+
+        let l = pvh::plan(0x1000_0000, 0, 0xFF00_0000);
+        assert_eq!(l.cmdline_gpa, 0x1000_0000 - 0x3000);
+        assert_eq!(l.memmap_gpa, 0x1000_0000 - 0x2000);
+        assert_eq!(l.start_gpa, 0x1000_0000 - 0x1000);
+
+        let mut page = [0u8; 4096];
+        pvh::write_start(&mut page, &l);
+        assert_eq!(&page[0x00..0x04], &0x336E_C578u32.to_le_bytes());
+        assert_eq!(&page[0x04..0x08], &1u32.to_le_bytes()); // version
+        assert_eq!(&page[0x08..0x0C], &0u32.to_le_bytes()); // flags
+        assert_eq!(&page[0x0C..0x10], &0u32.to_le_bytes()); // nr_modules
+        assert_eq!(&page[0x10..0x18], &0u64.to_le_bytes()); // modlist_paddr
+        assert_eq!(&page[0x18..0x20], &l.cmdline_gpa.to_le_bytes());
+        assert_eq!(&page[0x20..0x28], &0u64.to_le_bytes()); // rsdp = none
+        assert_eq!(&page[0x28..0x30], &l.memmap_gpa.to_le_bytes());
+        assert_eq!(&page[0x30..0x34], &1u32.to_le_bytes()); // memmap_entries
+        assert_eq!(&page[0x34..0x38], &0u32.to_le_bytes()); // reserved
+
+        let mut page = [0u8; 4096];
+        pvh::write_memmap(&mut page, &l);
+        assert_eq!(&page[0x00..0x08], &0u64.to_le_bytes()); // addr
+        assert_eq!(&page[0x08..0x10], &0xFF00_0000u64.to_le_bytes()); // size
+        assert_eq!(&page[0x10..0x14], &1u32.to_le_bytes()); // type = RAM
+        assert_eq!(&page[0x14..0x18], &0u32.to_le_bytes()); // reserved
+
+        let mut page = [0u8; 4096];
+        assert!(pvh::write_cmdline(&mut page, "console=hvc0"));
+        assert_eq!(&page[..13], b"console=hvc0\0");
+        assert!(!pvh::write_cmdline(&mut page, &"x".repeat(4096)));
+    }
+
+    /// The independent oracle: the blobs the writer builds, read back by the
+    /// parser the kernel itself boots with on QEMU and Firecracker
+    /// (`akuma-ryzen-amd64`). A writer and a test that share one misreading of
+    /// the layout agree with each other and with nothing else — the PVH rung
+    /// passed for exactly that reason while Linux saw no command line.
+    #[test]
+    fn pvh_blobs_parse_with_the_kernels_own_start_info_reader() {
+        use akuma_ryzen_amd64::{PhysMem, StartInfo};
+
+        struct Guest {
+            pages: [(u64, [u8; 4096]); 3],
+        }
+        impl PhysMem for Guest {
+            fn read(&self, pa: u64, buf: &mut [u8]) -> bool {
+                for (base, bytes) in &self.pages {
+                    if pa >= *base && pa + buf.len() as u64 <= base + 4096 {
+                        let at = (pa - base) as usize;
+                        buf.copy_from_slice(&bytes[at..at + buf.len()]);
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+
+        let l = pvh::plan(0x0800_0000, 0, 0x0800_0000 - 0x3000);
+        let mut g = Guest {
+            pages: [(l.start_gpa, [0; 4096]), (l.memmap_gpa, [0; 4096]), (l.cmdline_gpa, [0; 4096])],
+        };
+        pvh::write_start(&mut g.pages[0].1, &l);
+        pvh::write_memmap(&mut g.pages[1].1, &l);
+        assert!(pvh::write_cmdline(&mut g.pages[2].1, "console=ttyS0 earlyprintk=serial,ttyS0"));
+
+        let si = StartInfo::parse(&g, l.start_gpa).expect("the kernel's parser rejects our start_info");
+        assert_eq!(si.version, 1);
+        assert_eq!(si.nr_modules, 0);
+        assert_eq!(si.cmdline_paddr, l.cmdline_gpa);
+        assert_eq!(si.rsdp_paddr, 0);
+        assert_eq!(si.memmap_paddr, l.memmap_gpa);
+        assert_eq!(si.memmap_entries, 1);
+        let e = si.memmap_entry(&g, 0).expect("memmap entry 0");
+        assert_eq!((e.addr, e.size, e.kind), (0, 0x0800_0000 - 0x3000, 1));
+        assert!(e.is_ram());
+        let mut buf = [0u8; 128];
+        assert_eq!(si.cmdline(&g, &mut buf), Some("console=ttyS0 earlyprintk=serial,ttyS0"));
     }
 }

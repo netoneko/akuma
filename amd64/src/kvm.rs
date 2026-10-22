@@ -49,6 +49,8 @@ use akuma_svm_amd64::{ctrl, intr0, intr1, save, ExitCode, Seg, SegAttr, Vmcb};
 use core::arch::x86_64::__cpuid;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+mod linux;
+
 // ---------------------------------------------------------------------------
 // Console helpers (hda.rs precedent: `puts` straight to the port, no alloc)
 // ---------------------------------------------------------------------------
@@ -118,6 +120,7 @@ pub fn init(cmdline: &str) {
         return;
     }
     let nrips = fa.edx & (1 << 3) != 0;
+    NRIPS.store(nrips, Ordering::Relaxed);
 
     p("[KVM] SVM available; EFER.SVME not yet enabled (per-core, rung 2)\n");
     if want_test {
@@ -129,7 +132,26 @@ pub fn init(cmdline: &str) {
         trivial_guest(nrips);
         longmode_guest(nrips);
         twolvl_guest(nrips);
-        consistency_ladder();
+        pvh_guest(nrips);
+        // `noladder`: skip the twelve consistency probes. Under QEMU TCG the last
+        // row (LME+LMA with paging off) resets the machine, which is TCG's
+        // emulation of an illegal VMRUN state, not the hardware's — the metal
+        // answers it `entered`. A rehearsal that wants the rungs *after* the
+        // ladder (the Linux rung) passes this.
+        if !cmdline.split_ascii_whitespace().any(|t| t == "noladder") {
+            consistency_ladder();
+        }
+    }
+}
+
+/// The rungs that need the root filesystem, run once it is mounted: with
+/// `kvmtest` (which enabled SVM and ran the early rungs in [`init`]) and
+/// `kvmlinux` both on the command line, the Linux rung — a real `vmlinux` off
+/// `/boot/vmlinux`.
+pub fn late(cmdline: &str) {
+    let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
+    if SVM_WANTED.load(Ordering::Acquire) && flag("kvmlinux") {
+        linux::run(NRIPS.load(Ordering::Relaxed));
     }
 }
 
@@ -140,6 +162,9 @@ pub fn init(cmdline: &str) {
 /// Set once the probe passed and `kvmtest` asked for the rehearsal: every
 /// core that later reaches [`ap_hook`] enables SVM too.
 static SVM_WANTED: AtomicBool = AtomicBool::new(false);
+
+/// `Fn8000_000A.EDX[NRIPS]`, remembered from the probe for [`late`].
+static NRIPS: AtomicBool = AtomicBool::new(false);
 
 /// Per-core host save area physical addresses (§15.30.4: one live,
 /// 4-KiB-aligned page per core, distinct from every VMCB). Reserved by the
@@ -406,7 +431,7 @@ fn trivial_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(7);
-        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx) };
+        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
         crumb(8);
@@ -670,7 +695,7 @@ fn longmode_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(0x17);
-        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx) };
+        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
         crumb(0x18);
@@ -1006,7 +1031,7 @@ fn twolvl_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(0x37);
-        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx) };
+        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
         crumb(0x38);
@@ -1051,6 +1076,310 @@ fn twolvl_guest(nrips: bool) {
     let final_v = Vmcb::new(vmcb_f.bytes_mut());
     let pass = halted && vmmcalls == 2 && final_v.rax() == TWOVL_DATA_MAGIC;
     p("[KVM] two-level guest: ");
+    p(if pass { "PASS" } else { "FAIL" });
+    p(" (vmmcalls=");
+    dec(vmmcalls);
+    p(", rax=");
+    hx(final_v.rax(), 16);
+    p(")\n");
+    if !pass {
+        p("[KVM] why: ");
+        p(why);
+        p("\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The PVH dry run: the Linux handoff convention, proven with a synthetic guest
+// ---------------------------------------------------------------------------
+
+/// The command line the handoff hands over — the guest's self-check reads
+/// its first dword back, so it must be at least 4 bytes.
+const PVH_CMDLINE: &str = "console=hvc0";
+/// The code page plays this 2-MiB region of the 1–2 GiB band (one 2-MiB
+/// NPT leaf, the two-level rung's window trick).
+const PVH_CODE_REGION: u64 = 0x4000_0000;
+/// The handoff pages' region top: `pvh::plan` packs cmdline/memmap/start
+/// directly under it. Three distinct 4-KiB pages inside one 2-MiB region —
+/// which is why this rung's NPT grows the PT level the earlier rungs never
+/// needed.
+const PVH_TOP_GPA: u64 = 0x4060_0000;
+
+/// The guest: entered 32-bit, unpaged, **EBX = start_info GPA** (delivered
+/// through the extended `vmrun`), exactly the PVH convention. Each check
+/// reads the handoff through the NPT (guest-physical → host-physical) and
+/// either falls through to the next or `vmmcall`s with a 0FADDE0n marker:
+///
+/// ```text
+/// 0x00  mov eax, [ebx]               ; hvm_start_info.magic
+/// 0x02  cmp eax, 336EC578h
+/// 0x13  vmmcall                      ; cp1: RAX = the magic itself
+/// 0x16  mov eax, [ebx+4]             ; version — must be 1 (the memmap's)
+/// 0x28  mov ecx, [ebx+18h]           ; cmdline_paddr, then its first dword
+/// 0x2D  cmp eax, 736E6F63h           ; "cons"
+/// 0x3E  mov ecx, [ebx+28h]           ; memmap_paddr, then entry 0's type
+/// 0x41  mov eax, [ecx+10h]           ; (addr@0, size@8, type@10h)
+/// 0x44  cmp eax, 1                   ; MEMMAP_RAM
+/// 0x53  vmmcall                      ; cp2: RAX = 1
+/// 0x56  hlt
+/// ```
+///
+/// The offsets are the real `hvm_start_info` ones (the kernel's own reader,
+/// `akuma-ryzen-amd64`, uses them on QEMU and Firecracker): this guest read
+/// `cmdline` at `+0x10` and the entry type at `+0` until 2026-10-22, matching
+/// a writer that had the same mistake — see `akuma_svm_amd64::pvh`.
+///
+/// Every `mov eax` zeroes RAX's upper half, so the checkpoints compare as
+/// full-width values on the host. The wedge-canary tail marks every failure
+/// path.
+const PVH_CODE: [u8; 0x59] = [
+    0x8B, 0x03, // 0x00 mov eax, [ebx]
+    0x3D, 0x78, 0xC5, 0x6E, 0x33, // 0x02 cmp eax, 336EC578h
+    0x74, 0x0A, // 0x07 jz magic_ok
+    0xB8, 0x00, 0xDE, 0xAD, 0x0F, // 0x09 mov eax, 0FADDE00h — fail 0
+    0x0F, 0x01, 0xD9, // 0x0E vmmcall
+    0xEB, 0xFE, // 0x11 jmp $
+    0x0F, 0x01, 0xD9, // 0x13 vmmcall — checkpoint one: RAX = magic
+    0x8B, 0x43, 0x04, // 0x16 mov eax, [ebx+4]
+    0x83, 0xF8, 0x01, // 0x19 cmp eax, 1
+    0x74, 0x0A, // 0x1C jz version_ok
+    0xB8, 0x01, 0xDE, 0xAD, 0x0F, // 0x1E mov eax, 0FADDE01h — fail 1
+    0x0F, 0x01, 0xD9, // 0x23 vmmcall
+    0xEB, 0xFE, // 0x26 jmp $
+    0x8B, 0x4B, 0x18, // 0x28 mov ecx, [ebx+18h]
+    0x8B, 0x01, // 0x2B mov eax, [ecx]
+    0x3D, 0x63, 0x6F, 0x6E, 0x73, // 0x2D cmp eax, 736E6F63h ("cons")
+    0x74, 0x0A, // 0x32 jz cmdline_ok
+    0xB8, 0x02, 0xDE, 0xAD, 0x0F, // 0x34 mov eax, 0FADDE02h — fail 2
+    0x0F, 0x01, 0xD9, // 0x39 vmmcall
+    0xEB, 0xFE, // 0x3C jmp $
+    0x8B, 0x4B, 0x28, // 0x3E mov ecx, [ebx+28h]
+    0x8B, 0x41, 0x10, // 0x41 mov eax, [ecx+10h]
+    0x83, 0xF8, 0x01, // 0x44 cmp eax, 1
+    0x74, 0x0A, // 0x47 jz memmap_ok
+    0xB8, 0x03, 0xDE, 0xAD, 0x0F, // 0x49 mov eax, 0FADDE03h — fail 3
+    0x0F, 0x01, 0xD9, // 0x4E vmmcall
+    0xEB, 0xFE, // 0x51 jmp $
+    0x0F, 0x01, 0xD9, // 0x53 vmmcall — checkpoint two: RAX = 1
+    0xF4, // 0x56 hlt — the stop marker
+    0xEB, 0xFE, // 0x57 jmp $
+];
+
+/// The Linux rung's **protocol**, proven before the Linux rung's **payload**:
+/// a guest entered exactly the way a PVH loader enters one — 32-bit
+/// protected mode, paging off, EBX holding `hvm_start_info`'s guest-physical
+/// address — reading the handoff blobs the crate's `pvh` writers built. A
+/// synthetic guest stands in for the image: the ELF note that names the
+/// entry is host-testable (`elf::entry_phys32`), and the entry register is
+/// the part only a VMRUN can prove. If this rung passes, what remains for
+/// the Linux rung is the payload: parse a real image, copy its segments,
+/// field its I/O. Breadcrumbs 0x41–0x49.
+fn pvh_guest(nrips: bool) {
+    crumb(0x41);
+    let Some(mut vmcb_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] pvh: no frame for VMCB\n");
+        return;
+    };
+    let Some(mut npml4_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] pvh: no frame for NPT PML4\n");
+        return;
+    };
+    let Some(mut npdpt_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] pvh: no frame for NPT PDPT\n");
+        return;
+    };
+    let Some(mut npd_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] pvh: no frame for NPT PD\n");
+        return;
+    };
+    // The PT level the handoff forces: three blob pages share one 2-MiB
+    // region, which no single leaf can cover.
+    let Some(mut nptpt_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] pvh: no frame for NPT PT\n");
+        return;
+    };
+    let Some(mut code_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] pvh: no frame for guest code\n");
+        return;
+    };
+    let Some(mut cmdline_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] pvh: no frame for the cmdline page\n");
+        return;
+    };
+    let Some(mut memmap_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] pvh: no frame for the memmap page\n");
+        return;
+    };
+    let Some(mut start_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] pvh: no frame for the start_info page\n");
+        return;
+    };
+
+    crumb(0x42);
+    code_f.bytes_mut()[..PVH_CODE.len()].copy_from_slice(&PVH_CODE);
+    let l = svm::pvh::plan(PVH_TOP_GPA, PVH_CODE_REGION, PVH_TOP_GPA - PVH_CODE_REGION);
+    svm::pvh::write_start(start_f.bytes_mut(), &l);
+    svm::pvh::write_memmap(memmap_f.bytes_mut(), &l);
+    if !svm::pvh::write_cmdline(cmdline_f.bytes_mut(), PVH_CMDLINE) {
+        p("[KVM] pvh: cmdline does not fit a page\n");
+        return;
+    }
+
+    let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
+    if msrpm_pa % 4096 != 0 || iopm_pa % 4096 != 0 {
+        p("[KVM] permission map base not 4-KiB aligned\n");
+        return;
+    }
+
+    // NPT: the code page rides a 2-MiB leaf in its own region; the three
+    // handoff pages, packed in one region by `pvh::plan`, need real 4-KiB
+    // leaves — the first PT level any rung's nested tables have built.
+    let npml4_pa = npml4_f.pa() as u64;
+    let npdpt_pa = npdpt_f.pa() as u64;
+    let npd_pa = npd_f.pa() as u64;
+    let nptpt_pa = nptpt_f.pa() as u64;
+    svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
+    svm::wr64(npdpt_f.bytes_mut(), 8, svm::npt::pointer(npd_pa));
+    let code_gpa = PVH_CODE_REGION | (code_f.pa() as u64 & 0x1F_FFFF);
+    svm::wr64(npd_f.bytes_mut(), 0, svm::npt::leaf_2m(code_f.pa() as u64 & !0x1F_FFFF));
+    svm::wr64(npd_f.bytes_mut(), 2 * 8, svm::npt::pointer(nptpt_pa));
+    for (gpa, frame_pa) in [
+        (l.cmdline_gpa, cmdline_f.pa() as u64),
+        (l.memmap_gpa, memmap_f.pa() as u64),
+        (l.start_gpa, start_f.pa() as u64),
+    ] {
+        svm::wr64(nptpt_f.bytes_mut(), ((gpa >> 12) & 0x1FF) as usize * 8, svm::npt::leaf_4k(frame_pa));
+    }
+
+    // VMCB — the trivial rung's 32-bit unpaged state, ASID 15 (ladder 1–13,
+    // two-level 14), and EBX = start_info's GPA delivered through the
+    // extended `vmrun`, which is the entire PVH convention.
+    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
+    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
+    {
+        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        v.set_intr0(
+            intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT,
+        );
+        v.set_intr1(intr1::VMRUN | intr1::VMMCALL);
+        v.set_excp(svm::excp::DB | svm::excp::UD | svm::excp::GP | svm::excp::PF);
+        v.set_iopm_base(iopm_pa);
+        v.set_msrpm_base(msrpm_pa);
+        v.set_asid(15);
+        v.set_tlb_control(ctrl::TLB_DO_NOTHING);
+        v.set_np_enable(true);
+        v.set_n_cr3(npml4_pa);
+        let flat = |attr: SegAttr| Seg { selector: 0, attr, limit: 0xFFFF_FFFF, base: 0 };
+        v.set_seg(
+            save::CS,
+            Seg { selector: 0x08, attr: SegAttr::CODE32_DPL0, limit: 0xFFFF_FFFF, base: 0 },
+        );
+        let data = flat(SegAttr::DATA32_RW_DPL0);
+        v.set_seg(save::ES, data);
+        v.set_seg(save::SS, data);
+        v.set_seg(save::DS, data);
+        // FS/GS carry the host bases, same as every rehearsal guest.
+        v.set_seg(
+            save::FS,
+            Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base: msr::read(Msr::FsBase) },
+        );
+        v.set_seg(
+            save::GS,
+            Seg { selector: 0, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base: msr::read(Msr::GsBase) },
+        );
+        // 32-bit protected, unpaged — the PVH entry shape.
+        v.set_efer(svm::msr::EFER_SVME);
+        v.set_cr0(svm::cr0::PE | svm::cr0::NE);
+        v.set_cr3(0);
+        v.set_cr4(0);
+        v.set_rflags(0x2);
+        v.set_cpl(0);
+        v.set_rip(code_gpa);
+        v.set_rsp(0);
+    }
+
+    crumb(0x43);
+    {
+        let v = Vmcb::new(vmcb_f.bytes_mut());
+        if let Err(e) = svm::validate_guest_state(&v) {
+            p("[KVM] pvh guest state rejected: ");
+            p(e.name());
+            p("\n");
+            return;
+        }
+    }
+
+    crumb(0x44);
+    if !enable_on_core(0) {
+        p("[KVM] pvh: no host save area for the BSP\n");
+        return;
+    }
+
+    crumb(0x45);
+    p("[KVM] running pvh guest (start=");
+    hx(l.start_gpa, 16);
+    p(")\n");
+
+    akuma_cpu::daif::mask_irq();
+    let mut vmmcalls = 0u64;
+    let (mut guest_rcx, mut guest_rdx) = (0u64, 0u64);
+    let (mut halted, mut why) = (false, "loop exhausted");
+    for _ in 0..8 {
+        crumb(0x47);
+        let (rcx_out, rdx_out) =
+            unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx, l.start_gpa) };
+        guest_rcx = rcx_out;
+        guest_rdx = rdx_out;
+        crumb(0x48);
+        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        match ExitCode::from_u64(v.exitcode()) {
+            ExitCode::Vmmcall => {
+                vmmcalls += 1;
+                if vmmcalls == 1 && v.rax() != u64::from(svm::pvh::START_MAGIC) {
+                    why = "checkpoint one: RAX != hvm_start_info magic (EBX handoff broken)";
+                    p("[KVM] ");
+                    p(why);
+                    p(": ");
+                    dump_exit(&v, guest_rcx, guest_rdx);
+                    break;
+                }
+                if vmmcalls == 2 && v.rax() != u64::from(svm::pvh::MEMMAP_RAM) {
+                    why = "checkpoint two: RAX != memmap RAM type (the blob chain did not resolve)";
+                    p("[KVM] ");
+                    p(why);
+                    p(": ");
+                    dump_exit(&v, guest_rcx, guest_rdx);
+                    break;
+                }
+                if vmmcalls > 2 {
+                    why = "guest self-check failed (0FADDE0n marker in RAX)";
+                    p("[KVM] ");
+                    p(why);
+                    p(": ");
+                    dump_exit(&v, guest_rcx, guest_rdx);
+                    break;
+                }
+                v.set_rip(next_rip(&v, nrips, 3));
+            }
+            ExitCode::Hlt => {
+                halted = true;
+                break;
+            }
+            _ => {
+                why = "unexpected exit";
+                p("[KVM] pvh unexpected exit: ");
+                dump_exit(&v, guest_rcx, guest_rdx);
+                dump_state(&v);
+                break;
+            }
+        }
+    }
+    akuma_cpu::daif::unmask_irq();
+    crumb(0x49);
+
+    let final_v = Vmcb::new(vmcb_f.bytes_mut());
+    let pass = halted && vmmcalls == 2 && final_v.rax() == u64::from(svm::pvh::MEMMAP_RAM);
+    p("[KVM] pvh guest: ");
     p(if pass { "PASS" } else { "FAIL" });
     p(" (vmmcalls=");
     dec(vmmcalls);
@@ -1270,7 +1599,7 @@ fn consistency_ladder() {
         }
 
         crumb(0x22 + i as u8);
-        unsafe { vmrun(vmcb_f.pa() as u64, 0, 0) };
+        unsafe { vmrun(vmcb_f.pa() as u64, 0, 0, 0) };
         let v = Vmcb::new(vmcb_f.bytes_mut());
         if ExitCode::from_u64(v.exitcode()) == ExitCode::Invalid {
             p("rejected\n");
@@ -1359,11 +1688,16 @@ fn dump_state(v: &Vmcb<'_>) {
 /// `VM_HSAVE_PA` pointed at a live host save area with `EFER.SVME` set.
 /// Returns with GIF set (`stgi`).
 ///
-/// RBX and RBP are not declared: they cannot be inline-asm operands (LLVM
-/// reserves RBX; RBP is the frame pointer). The seed guest never writes
-/// them; rung 2 (the Linux rung) needs a real register file to cover it.
+/// RBX is delivered by hand: LLVM reserves it as an inline-asm operand, so
+/// the value rides in through r15 and the asm pushes the host's RBX, loads
+/// it, and restores it after the exit — the guest entered with EBX set,
+/// which is exactly what the PVH handoff convention demands (start_info's
+/// guest-physical address), and what no earlier rung needed. RBP is
+/// saved and restored by hand around the VMRUN (it is the frame pointer, so
+/// it cannot be an operand): VMRUN does not restore it, and a Linux guest uses
+/// it freely.
 #[inline(never)]
-unsafe fn vmrun(vmcb_pa: u64, guest_rcx: u64, guest_rdx: u64) -> (u64, u64) {
+unsafe fn vmrun(vmcb_pa: u64, guest_rcx: u64, guest_rdx: u64, guest_rbx: u64) -> (u64, u64) {
     let (rcx, rdx);
     // SAFETY: per the contract above — VMRUN with RAX = VMCB PA; the host
     // state it needs (EFER.SVME, VM_HSAVE_PA) is installed by the caller.
@@ -1373,11 +1707,17 @@ unsafe fn vmrun(vmcb_pa: u64, guest_rcx: u64, guest_rdx: u64) -> (u64, u64) {
         // silent and the watchdog resets the box (metal, 2026-10-21; the CMOS
         // breadcrumb read 9 = the guest had finished).
         core::arch::asm!(
+            "push rbp",
+            "push rbx",
+            "mov rbx, r15",
             "vmrun rax",
+            "pop rbx",
+            "pop rbp",
             "stgi",
             inlateout("rax") vmcb_pa => _,
             inlateout("rcx") guest_rcx => rcx,
             inlateout("rdx") guest_rdx => rdx,
+            inlateout("r15") guest_rbx => _,
             lateout("rsi") _,
             lateout("rdi") _,
             lateout("r8") _,
@@ -1387,8 +1727,7 @@ unsafe fn vmrun(vmcb_pa: u64, guest_rcx: u64, guest_rdx: u64) -> (u64, u64) {
             lateout("r12") _,
             lateout("r13") _,
             lateout("r14") _,
-            lateout("r15") _,
-            options(nostack)
+            options()
         );
     }
     (rcx, rdx)

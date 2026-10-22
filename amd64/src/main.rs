@@ -337,6 +337,22 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
                 (si.cmdline_paddr, si.cmdline_paddr + 4096),
             ];
             smp::set_cpu_cap_from_cmdline(cmdline);
+            // The SVM hypervisor rehearsal, on request only. `kvmtest` on the
+            // command line runs here the rungs the multiboot2 path runs on the
+            // metal, so they can be rehearsed under QEMU TCG
+            // (`-cpu EPYC-Milan,svm=on`) without a reboot of the machine. It
+            // must follow `late_init`'s `lapic::init`: the rungs unmask IRQs
+            // around each VMRUN loop, and before the LAPIC is up the
+            // microvm's unremapped legacy PIC delivers its pending serial and
+            // PIT lines as vectors 4 and 0 — a `#DE`. Before
+            // `start_secondaries` so the APs enable SVM too. Opt-in like `pci`:
+            // a plain PVH boot (Firecracker) has no SVM and prints nothing new.
+            if machine::flag(hvm_start_info, "kvmtest") {
+                kvm::init(cmdline);
+                // After the root mount (above): the Linux rung reads its kernel
+                // off the filesystem.
+                kvm::late(cmdline);
+            }
             if !cmdline.split_ascii_whitespace().any(|w| w == "nosmp")
                 && smp::trampoline_page_available(&machine, &keep_out)
             {

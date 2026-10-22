@@ -21,3 +21,9 @@ workspace = true
 # walkers wrong in the same way. The bits below are the subset §15.5.x pins,
 # marked for verification before the Linux rung.
 [dependencies]
+
+# Test-only: the kernel's own `hvm_start_info` reader, as an independent oracle
+# for the PVH blob writer (a writer tested only against itself shares its own
+# misreading of the layout). Never a dependency of the crate proper.
+[dev-dependencies]
+akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64" }
