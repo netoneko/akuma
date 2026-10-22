@@ -213,6 +213,11 @@ Read downwards; the sections below are the reference record.
    │   back to its full size. Found on the metal: a 3 GiB image against `kvmmem=3072` printed the refusal and
    │   then booted a rootless guest forever; a spec that names a disk now does not start without it, and the
    │   entry reserves 4096.
+   │   **Gentoo on p7 in place (2026-10-23, metal):** `vm_disk = /dev/nvme0n1p7` through a second
+   │   bounds-checked NVMe window (the host's p3 and overlapping partitions refused); no RAM copy. The guest
+   │   boots Gentoo from the real partition, `relay_stress.py` PASS, a marker and a 1 MiB blob it wrote read back
+   │   md5-identical from Pop's ext2 driver, filesystem state unchanged ("clean with errors"). p7 was backed up
+   │   read-only first (tar, 1.65 GB; five box-layer cert files unreadable from the existing errors).
    │   [`../reference/subsystems/kvm.md`](../reference/subsystems/kvm.md) § VMs as services
 ```
 
