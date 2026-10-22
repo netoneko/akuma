@@ -1103,7 +1103,7 @@ aren't recorded anywhere else.)
 ## Networking (94 fixes, 35 docs)
 
 ### docs/archive/KVM_RELAY_SYN_STALL.md
-- The KVM host relay wedged on the ryzen when overlapping sessions lost a SYN: the gateway's TCP sent it once (no retransmit timer), reused one source port per slot, and the relay never timed a `Connecting` slot out, so both slots stuck, the listen backlog filled and the port refused. Fixed with a rotating source-port generation per slot, a SYN retry after 1.5 s and a give-up that resets the client (`Gateway::fwd_reopen`, `relay.rs`)
+- The KVM host relay wedged on the ryzen under overlapping sessions: a forward slot reused one source port for every connection and the gateway's TCP sent its SYN once (no retransmit), so a guest holding the previous connection on that tuple never answered, the slot stayed `connecting`, the listen backlog filled and the port refused. Fixed with a rotating source-port generation per slot and a SYN retry (4 s) that gives up by resetting the client (`Gateway::fwd_reopen`, `relay.rs`); the SYNs a first 1.5 s retry chased were slow, not lost
 
 ### docs/archive/UDP_REPLY_WAIT_TIMER_STORM.md
 - `nc -u -w 2` hung after a UDP reply: the blocking-recv wait loop (`net_blocking_relax` -> `allow_tick`) halted without ever running the wake pass, so a sleeper with a past deadline stayed `WAITING`, `lapic::arm_deadline` armed a 1-count one-shot every lap and the core spun at interrupt rate with the sleeper starved. Fixed by yielding when `wake_is_due`

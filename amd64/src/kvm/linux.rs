@@ -1552,7 +1552,7 @@ pub fn run(nrips: bool, guest: Guest) {
             crate::sched::yield_now();
             akuma_cpu::daif::unmask_irq();
         }
-        if let (Some(r), Some((_, wire))) = (relay.as_mut(), net.as_mut())
+        if let (Some(r), Some((dev, wire))) = (relay.as_mut(), net.as_mut())
             && now_us >= next_relay_us
         {
             next_relay_us = now_us + 200;
@@ -1586,6 +1586,20 @@ pub fn run(nrips: bool, guest: Guest) {
                     dec(wire.stats.ignored);
                     p(" gw_resets=");
                     dec(wire.stats.tcp_resets);
+                    p(" syn_out=");
+                    dec(wire.stats.fwd_syn_out);
+                    p(" syn_to_guest=");
+                    dec(wire.stats.rx_syn_delivered);
+                    p(" synack_in=");
+                    dec(wire.stats.fwd_synack_in);
+                    p(" rst_in=");
+                    dec(wire.stats.fwd_rst_in);
+                    p(" stale_in=");
+                    dec(wire.stats.fwd_stale_in);
+                    p(" rx_to_guest=");
+                    dec(wire.stats.rx_delivered);
+                    p(" rx_starved=");
+                    dec(dev.rx_starved);
                     p("\n");
                 }
             }

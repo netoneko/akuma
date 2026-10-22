@@ -212,7 +212,7 @@ commands in the guest (`uname -a`, `/proc/cpuinfo`, `eth0 10.0.2.15`), and the r
 **the host Akuma's own sshd, with no guest in the path, also moves ~55 KB/s outbound over the
 ryzen's wifi** (4 MiB in 77 s), while the identical bulk test on the TCG rig (virtio host NIC) does
 2 MiB up and down intact in ~1 s. So the throughput ceiling is the ryzen's wifi path, not the
-gateway or relay; the hung download is not explained by it and is open. Two suspects, both
+gateway or relay; the hung download is not explained by it and is open. **Closed 2026-10-22 (later): [`KVM_RELAY_SYN_STALL.md`](KVM_RELAY_SYN_STALL.md): the same 1 MiB download completes in 46 s, and the relay itself moves 4-8 MB/s from the host.** Two suspects, both
 addressed but unverified on metal: the service task held the BKL through every guest entry
 (starving the wifi/network tasks on a 16-core host; now a dropped-BKL window), and the relay had no
 visibility (it now logs per-slot ring and window state every 5 s). Re-run with

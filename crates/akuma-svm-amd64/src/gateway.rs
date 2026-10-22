@@ -93,6 +93,16 @@ pub struct Stats {
     pub ignored: u64,
     /// Replies lost to a full queue or a frame too big for a slot.
     pub lost: u64,
+    /// The forward connections' life, in order: SYNs built for the guest, SYNs handed to the
+    /// guest's receive buffers, and what came back for a live connection (SYN-ACK, RST) or for
+    /// an old one (stale). The 2026-10-22 stall was a SYN that vanished between these.
+    pub fwd_syn_out: u64,
+    pub rx_syn_delivered: u64,
+    pub fwd_synack_in: u64,
+    pub fwd_rst_in: u64,
+    pub fwd_stale_in: u64,
+    /// Frames handed to the guest's receive buffers.
+    pub rx_delivered: u64,
 }
 
 /// The frames waiting for the guest: a ring of [`DEPTH`] slots in borrowed storage.
@@ -135,6 +145,12 @@ impl Stats {
             tcp_resets: 0,
             ignored: 0,
             lost: 0,
+            fwd_syn_out: 0,
+            rx_syn_delivered: 0,
+            fwd_synack_in: 0,
+            fwd_rst_in: 0,
+            fwd_stale_in: 0,
+            rx_delivered: 0,
         }
     }
 }
@@ -547,8 +563,14 @@ impl<'a> Gateway<'a> {
             let i = off % FWD_SLOTS;
             // Only the slot's current generation is live; an older one is a stale connection.
             if off / FWD_SLOTS == usize::from(self.fwd_gen[i]) && self.fwd[i].state() != tcp::State::Closed && sport == self.fwd_peer[i] {
+                if s.flags & tcp::flag::RST != 0 {
+                    self.stats.fwd_rst_in += 1;
+                } else if s.flags & (tcp::flag::SYN | tcp::flag::ACK) == (tcp::flag::SYN | tcp::flag::ACK) {
+                    self.stats.fwd_synack_in += 1;
+                }
                 self.fwd[i].input(&s);
             } else {
+                self.stats.fwd_stale_in += 1;
                 self.reset_for(src, sport, dport, &s);
             }
         } else {
@@ -619,12 +641,17 @@ impl<'a> Gateway<'a> {
             let sport = self.fwd_port(i);
             while self.q.has_room() && self.fwd[i].wants_tx() {
                 let conn = &mut self.fwd[i];
+                let mut syn = false;
                 let pushed = self.q.push_with(|out| {
                     let o = conn.poll_tx(&mut out[54..54 + tcp::MSS])?;
+                    syn = o.flags & (tcp::flag::SYN | tcp::flag::ACK) == tcp::flag::SYN;
                     Some(build_tcp(out, mac, GATEWAY_IP, GUEST_IP, sport, peer, &o))
                 });
                 if !pushed {
                     break;
+                }
+                if syn {
+                    self.stats.fwd_syn_out += 1;
                 }
             }
         }
@@ -714,6 +741,13 @@ impl NetBackend for Gateway<'_> {
         }
         self.q.head = (at + 1) % DEPTH;
         self.q.count -= 1;
+        if fits {
+            self.stats.rx_delivered += 1;
+            // An IPv4 TCP segment with SYN set and ACK clear (Ethernet 14 + IP 20, flags at 47).
+            if n >= 48 && dst[12] == 0x08 && dst[13] == 0x00 && dst[23] == 6 && dst[47] & 0x12 == 0x02 {
+                self.stats.rx_syn_delivered += 1;
+            }
+        }
         Some(if fits { n } else { 0 })
     }
 }

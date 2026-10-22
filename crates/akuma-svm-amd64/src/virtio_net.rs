@@ -69,6 +69,8 @@ pub struct MmioNet {
     queue_sel: u32,
     queues: [Queue; 2],
     interrupt_status: u32,
+    /// Times a frame waited because the driver had posted no receive buffer.
+    pub rx_starved: u64,
 }
 
 impl MmioNet {
@@ -85,11 +87,14 @@ impl MmioNet {
             queue_sel: 0,
             queues: [Q; 2],
             interrupt_status: 0,
+            rx_starved: 0,
         }
     }
 
     fn reset(&mut self) {
+        let starved = self.rx_starved;
         *self = Self::new(self.mac);
+        self.rx_starved = starved;
     }
 
     /// The interrupt line's level: any unacknowledged status bit.
@@ -337,7 +342,10 @@ impl MmioNet {
             let head = match self.peek(RX, mem) {
                 Ok(Some(h)) => h,
                 // No buffer posted: the frame waits.
-                Ok(None) => break,
+                Ok(None) => {
+                    self.rx_starved += 1;
+                    break;
+                }
                 Err(()) => return self.broken(out),
             };
             // Room in the chain's device-writable descriptors, after the header.

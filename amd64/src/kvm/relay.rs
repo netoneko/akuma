@@ -31,10 +31,11 @@ const ROUNDS: usize = 16;
 /// How long to wait before retrying a listener the host stack refused (µs).
 const RETRY_US: u64 = 1_000_000;
 /// How long a SYN may go unanswered before it is sent again, from a new source port (µs).
-/// The gateway's TCP sends it once and has no timer, and on the ryzen (2026-10-22) a SYN the
-/// guest never answered left the slot `connecting` for good — and with every slot stuck
-/// nothing was accepted, the listen backlog filled and the port began to refuse.
-const SYN_RETRY_US: u64 = 1_500_000;
+/// The gateway's TCP sends it once and has no timer. Measured on the ryzen (2026-10-22): every SYN
+/// reaches the guest and is answered, but a busy one-vCPU guest can take seconds (its netpoll waits
+/// behind a key exchange), so this is generous: a retry costs the guest a half-open socket. What
+/// wedged for good was a reused 4-tuple, which the source-port rotation removes.
+const SYN_RETRY_US: u64 = 4_000_000;
 /// SYNs sent per connection before the client is refused (reset) and the slot freed.
 const SYN_TRIES: u8 = 4;
 

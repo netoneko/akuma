@@ -245,6 +245,12 @@ console-notify = []
 # the syscall MSRs — is `boot::late_init`, which this build calls instead. See
 # `self_tests`' own header for the rule that keeps the two in step.
 no-tests = []
+# The virtio-net path with an 8-slot receive ring (and a staged transmit ring) instead of ONE
+# receive buffer. Off: it measured worse on AArch64 (wake latency, `akuma-net` [features]) and
+# the KVM guest's relay moves 4-8 MB/s without it. The guest does wait for its one buffer (about
+# a fifth of frames: `rx_starved` in the `[KVM] guest:` line); if that ever matters, this is the
+# A/B. docs/archive/KVM_RELAY_SYN_STALL.md.
+net-noalloc = ["akuma-net/net-noalloc"]
 
 [dependencies]
 # Stage A of the amd64 bring-up: the kernel's own memory management, running on
