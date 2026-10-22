@@ -150,7 +150,8 @@ pub fn init(cmdline: &str) {
 /// * `kvmlinux` — the Linux phase, a real `vmlinux` off `/boot/vmlinux`; or
 /// * `kvmakuma` — the Akuma phase, this kernel's own ELF off `/boot/akuma-guest`
 ///   booting as the guest (`docs/archive/AKUMA_KVM_AKUMA_GUEST.md`); or
-/// * `kvmhello` — the same guest on a 2 MiB root whose only file is `/bin/hello`.
+/// * `kvmhello` — the same guest on a 2 MiB root whose only file is `/bin/hello`; or
+/// * `kvmlapic` — the Linux phase with the local APIC on (`/boot/kvm-guest` = `linux-apic`).
 ///
 /// `kvmlinux` also runs an Akuma guest when p3's `/boot/kvm-guest` begins with
 /// `akuma` (busybox root) or `akuma-hello` (hello-world root): the bootloader entry's command line is baked into `grubx64.efi`, so a
@@ -160,7 +161,9 @@ pub fn late(cmdline: &str) {
     if !SVM_WANTED.load(Ordering::Acquire) {
         return;
     }
-    let guest = if flag("kvmhello") {
+    let guest = if flag("kvmlapic") {
+        Some(linux::Guest::LinuxApic)
+    } else if flag("kvmhello") {
         Some(linux::Guest::AkumaHello)
     } else if flag("kvmakuma") {
         Some(linux::Guest::Akuma)
@@ -169,7 +172,9 @@ pub fn late(cmdline: &str) {
         let n = akuma_vfs_glue::read_at(GUEST_SELECTOR_PATH, 0, &mut sel).unwrap_or(0);
         let sel = &sel[..n];
         // `akuma-hello` before `akuma`: the longer word starts with the shorter.
-        Some(if sel.starts_with(b"akuma-hello") {
+        Some(if sel.starts_with(b"linux-apic") {
+            linux::Guest::LinuxApic
+        } else if sel.starts_with(b"akuma-hello") {
             linux::Guest::AkumaHello
         } else if sel.starts_with(b"akuma") {
             linux::Guest::Akuma

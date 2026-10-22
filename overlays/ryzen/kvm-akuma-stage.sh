@@ -3,7 +3,7 @@
 #
 #   BRANCH=kvm-part-1 sh build.sh                 (netoneko, ryzen: builds the kernel ON the ryzen)
 #   GUEST=hello sh scripts/kvm/akuma_hello_rootfs.sh $W/out/akuma-hello-root.img   (netoneko, optional)
-#   [GUEST=hello] sh kvm-akuma-stage.sh [KERNEL]                (root, in Pop; p3 not mounted by Akuma; SRC=<clone> W=<dir> override)
+#   [GUEST=hello|linux|linux-apic] sh kvm-akuma-stage.sh [KERNEL]                (root, in Pop; p3 not mounted by Akuma; SRC=<clone> W=<dir> override)
 #   sh arm.sh 28                                  (boots entry 28 once; ~3 min later Pop is back)
 #
 # Does, each step safe to repeat:
@@ -34,7 +34,9 @@ GUEST=${GUEST:-busybox}
 HELLO_IMG=${HELLO_IMG:-$W/out/akuma-hello-root.img}
 
 [ -f "$K" ] || { echo "no kernel at $K (run build.sh first)"; exit 1; }
-if [ "$GUEST" = hello ]; then
+if [ "$GUEST" = linux ] || [ "$GUEST" = linux-apic ]; then
+    :   # the Linux guests need no image staged: /boot/vmlinux and /boot/guest-root.img are already on p3
+elif [ "$GUEST" = hello ]; then
     [ -f "$HELLO_IMG" ] || { echo "no hello root at $HELLO_IMG (scripts/kvm/akuma_hello_rootfs.sh builds it)"; exit 1; }
 else
     [ -f "$BB" ] || { echo "no busybox at $BB (build.sh's mkdisk step fetches it)"; exit 1; }
@@ -50,7 +52,11 @@ fi
 cp "$K" $P/boot/akuma-amd64.verify
 cp "$K" $P/boot/akuma-guest
 
-if [ "$GUEST" = hello ]; then
+if [ "$GUEST" = linux ]; then
+    rm -f $P/boot/kvm-guest
+elif [ "$GUEST" = linux-apic ]; then
+    printf linux-apic > $P/boot/kvm-guest
+elif [ "$GUEST" = hello ]; then
     cp "$HELLO_IMG" $P/boot/akuma-hello-root.img
     printf akuma-hello > $P/boot/kvm-guest
 else
@@ -62,6 +68,6 @@ else
 fi
 
 sync
-ls -la $P/boot/akuma-amd64.verify $P/boot/akuma-guest $P/boot/akuma-*-root.img $P/boot/kvm-guest
+ls -la $P/boot/akuma-amd64.verify $P/boot/akuma-guest $P/boot/akuma-*-root.img $P/boot/kvm-guest 2>&1
 umount $P
 echo "staged. Next: sh arm.sh 28"

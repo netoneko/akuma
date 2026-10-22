@@ -865,6 +865,36 @@ pub fn arm_deadline() {
     ONESHOT_ARMS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Make this core's next timer interrupt arrive in `us` microseconds, if that is
+/// sooner than the periodic tick would. Returns whether it armed.
+///
+/// The SVM hypervisor's use (`kvm/linux.rs`): a guest's timer deadline is only
+/// visible to the host as a VM exit, and a guest that never exits on its own gets
+/// one every host tick — 10 ms, which is coarser than the 4 ms tick Linux asks of
+/// its APIC timer and lost the difference as coalesced interrupts. Arming the
+/// host's one-shot at the guest's deadline makes the exit land there.
+///
+/// Same machinery as [`arm_deadline`] (the `ONESHOT` flag, and [`on_tick`]'s
+/// [`restore_periodic`] bringing the periodic tick back once the shot fires), so
+/// the host tick resumes by itself; and like it, called with interrupts off on the
+/// core whose timer it touches. A shot already in flight that fires sooner stays.
+pub fn arm_oneshot_in_us(us: u64) -> bool {
+    if !TIMER_RUNNING.load(Ordering::Relaxed) || !is_calibrated() {
+        return false;
+    }
+    let per_tick = u64::from(TIMER_COUNT.load(Ordering::Relaxed));
+    let counts = (us * per_tick).div_ceil(u64::from(US_PER_TICK_TARGET)).max(1);
+    // The periodic tick (or a shot already armed) serves it as soon: leave it.
+    if counts >= u64::from(read(REG_TIMER_CUR)) {
+        return false;
+    }
+    write(REG_LVT_TIMER, u32::from(TIMER_VECTOR));
+    write(REG_TIMER_INIT, counts as u32);
+    ONESHOT[crate::smp::cpu_index()].store(true, Ordering::Relaxed);
+    ONESHOT_ARMS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 /// After the `hlt` [`arm_deadline`] prepared: back to the periodic tick, if
 /// this core left it.
 pub fn restore_periodic() {

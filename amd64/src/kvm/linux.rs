@@ -72,11 +72,23 @@ const HELLO_DISK_ARGS: &str = " virtio_mmio.device=4K@0xd0000000:5 init=/bin/hel
 /// Its disk when the machine has no second virtio-blk device (2 MiB, one file).
 const HELLO_DISK_IMAGE_PATH: &str = "/boot/akuma-hello-root.img";
 
+/// What `LinuxApic` is told: as [`LINUX_CMDLINE`] but with the local APIC left on
+/// (`noapic` still hides the I/O APIC, which does not exist: the legacy PIC reaches
+/// the processor through LINT0, the virtual wire), and `tsc=reliable`: the TSC is the
+/// host's own, while the clocksource watchdog's reference is the jiffies tick, which
+/// is only as exact as interrupt delivery to a guest that sees time through VM exits.
+const LINUX_APIC_CMDLINE: &str =
+    "console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr noapic nosmp nmi_watchdog=0 pci=off mitigations=off panic=-1 tsc=reliable";
+
 /// Which kernel the run boots.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Guest {
     /// A Linux `vmlinux`: PIC and PIT, no local APIC, ACPI-described virtio.
     Linux,
+    /// The same Linux with the local APIC on: CPUID reports it, the guest
+    /// calibrates and uses the APIC timer, and the PIC's interrupts arrive through
+    /// LINT0 in ExtINT mode (the virtual wire).
+    LinuxApic,
     /// The Akuma amd64 kernel itself: local APIC and its timer, virtio from the
     /// command line. The third rung of the ladder (`docs/archive/AKUMA_KVM.md`).
     Akuma,
@@ -88,26 +100,35 @@ pub enum Guest {
 impl Guest {
     /// Is the guest this kernel's own ELF (as opposed to a Linux `vmlinux`)?
     const fn is_akuma(self) -> bool {
+        matches!(self, Self::Akuma | Self::AkumaHello)
+    }
+
+    const fn is_linux(self) -> bool {
+        matches!(self, Self::Linux | Self::LinuxApic)
+    }
+
+    /// Does CPUID report a local APIC to this guest?
+    const fn exposes_apic(self) -> bool {
         !matches!(self, Self::Linux)
     }
 
     const fn path(self) -> &'static str {
         match self {
-            Self::Linux => LINUX_PATH,
+            Self::Linux | Self::LinuxApic => LINUX_PATH,
             Self::Akuma | Self::AkumaHello => AKUMA_PATH,
         }
     }
 
     const fn ram_bytes(self) -> u64 {
         match self {
-            Self::Linux => RAM_BYTES,
+            Self::Linux | Self::LinuxApic => RAM_BYTES,
             Self::Akuma | Self::AkumaHello => AKUMA_RAM_BYTES,
         }
     }
 
     const fn disk_path(self) -> &'static str {
         match self {
-            Self::Linux => DISK_IMAGE_PATH,
+            Self::Linux | Self::LinuxApic => DISK_IMAGE_PATH,
             Self::Akuma => AKUMA_DISK_IMAGE_PATH,
             Self::AkumaHello => HELLO_DISK_IMAGE_PATH,
         }
@@ -116,7 +137,7 @@ impl Guest {
     /// The first line the guest's console prints: PASS needs it.
     const fn banner(self) -> &'static [u8] {
         match self {
-            Self::Linux => b"Linux version",
+            Self::Linux | Self::LinuxApic => b"Linux version",
             Self::Akuma | Self::AkumaHello => b"Akuma/amd64",
         }
     }
@@ -125,7 +146,7 @@ impl Guest {
     /// Linux run ends on the reset pulse its own `reboot` makes).
     const fn done(self) -> Option<&'static [u8]> {
         match self {
-            Self::Linux => None,
+            Self::Linux | Self::LinuxApic => None,
             Self::Akuma => Some(b"AKUMA-GUEST-DONE"),
             Self::AkumaHello => Some(b"run by Akuma"),
         }
@@ -134,6 +155,7 @@ impl Guest {
     const fn name(self) -> &'static str {
         match self {
             Self::Linux => "linux",
+            Self::LinuxApic => "linux-apic",
             Self::Akuma => "akuma",
             Self::AkumaHello => "akuma-hello",
         }
@@ -638,7 +660,9 @@ impl Platform {
             pic: PicPair::new(),
             pm1: svm::acpi::Pm1::new(),
             lapic: Lapic::new(),
-            apic_base: lapic::DEFAULT_BASE | APIC_BASE_BSP,
+            // What firmware leaves behind: enabled, for a guest that sees an APIC in
+            // CPUID. (A guest told `nolapic` never looks at the page.)
+            apic_base: lapic::DEFAULT_BASE | APIC_BASE_BSP | if matches!(guest, Guest::LinuxApic) { APIC_BASE_ENABLE } else { 0 },
             msrs: MsrStore::new(),
             cmos_index: 0,
             banner: Needle::new(guest.banner()),
@@ -682,7 +706,15 @@ impl Platform {
         }
         if self.lapic_page().is_some() {
             self.lapic.poll(lapic::bus_ticks_from_us(now_us));
-            return self.lapic.pending().map(|vector| Offer { vector, source: Source::Lapic });
+            if let Some(vector) = self.lapic.pending() {
+                return Some(Offer { vector, source: Source::Lapic });
+            }
+            // The virtual wire: with LINT0 in ExtINT mode the PIC's output reaches
+            // the processor through the local APIC.
+            if self.lapic.lint0_extint() {
+                return self.pic.pending().map(|vector| Offer { vector, source: Source::Pic });
+            }
+            return None;
         }
         self.pic.pending().map(|vector| Offer { vector, source: Source::Pic })
     }
@@ -699,9 +731,29 @@ impl Platform {
         }
     }
 
+    /// The host `uptime_us` at which the guest's earliest timer will next have
+    /// something to deliver, if any can. Used to make the host's own timer interrupt
+    /// land there, so a guest that never exits gets its tick on time and not at the
+    /// next 10 ms host tick.
+    fn next_event_us(&self) -> Option<u64> {
+        let pit = self.pit.next_irq0_tick().map(pit::us_from_ticks);
+        if self.lapic_page().is_none() {
+            return pit;
+        }
+        let per_us = lapic::bus_ticks_from_us(1);
+        let apic = self.lapic.next_event().map(|t| t.div_ceil(per_us));
+        match (apic, if self.lapic.lint0_extint() { pit } else { None }) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Could an interrupt ever arrive for a guest halted with `IF` set?
     fn can_wake(&self) -> bool {
-        if self.lapic_page().is_some() { self.lapic.next_event().is_some() } else { self.pit.next_irq0_tick().is_some() }
+        if self.lapic_page().is_none() {
+            return self.pit.next_irq0_tick().is_some();
+        }
+        self.lapic.next_event().is_some() || (self.lapic.lint0_extint() && self.pit.next_irq0_tick().is_some())
     }
 
     fn note_io(&mut self, port: u16, write: bool, val: u32) {
@@ -1093,7 +1145,7 @@ pub fn run(nrips: bool, guest: Guest) {
     let disk = HostDisk::pick(guest.disk_path());
     // Only Linux is told about its disk through ACPI; the Akuma guest finds it on
     // the command line.
-    let acpi = disk.is_some() && guest == Guest::Linux;
+    let acpi = disk.is_some() && guest.is_linux();
     let acpi_gpa = ram_bytes - 0x4000;
     let l = pvh::plan(ram_bytes, 0, if acpi { acpi_gpa } else { ram_bytes - 0x3000 });
     scratch.bytes_mut().fill(0);
@@ -1103,9 +1155,9 @@ pub fn run(nrips: bool, guest: Guest) {
     // kernel parameter). Built on the stack: no allocation.
     let mut cmd = [0u8; 400];
     let cmdline = match guest {
-        Guest::Linux => cmdline_with_tsc(
+        Guest::Linux | Guest::LinuxApic => cmdline_with_tsc(
             &mut cmd,
-            LINUX_CMDLINE,
+            if guest == Guest::LinuxApic { LINUX_APIC_CMDLINE } else { LINUX_CMDLINE },
             crate::lapic::tsc_hz() / 1000,
             if disk.is_some() { ROOT_ARGS } else { NO_DISK_ARGS },
         ),
@@ -1188,7 +1240,7 @@ pub fn run(nrips: bool, guest: Guest) {
         // The Akuma guest demand-faults all its user memory: its #PF is routine
         // (nested paging delivers it without an exit), so only Linux's is traced.
         v.set_excp(match guest {
-            Guest::Linux => excp::UD | excp::GP | excp::PF | excp::DF,
+            Guest::Linux | Guest::LinuxApic => excp::UD | excp::GP | excp::PF | excp::DF,
             Guest::Akuma | Guest::AkumaHello => excp::UD | excp::GP | excp::DF,
         });
         v.set_iopm_base(image_pa(iopm));
@@ -1307,6 +1359,14 @@ pub fn run(nrips: bool, guest: Guest) {
             Some(o) => ctrl::v_intr_extint(o.vector),
             None => ctrl::V_INTR_MASKING,
         });
+        // Have the host's own timer interrupt come when the guest's next timer is
+        // due, if that is before the periodic host tick: the exit it causes is where
+        // the guest gets its interrupt. Interrupts off while the timer is touched.
+        if let Some(due) = plat.next_event_us() {
+            akuma_cpu::daif::mask_irq();
+            let _ = crate::lapic::arm_oneshot_in_us(due.saturating_sub(crate::net::uptime_us()));
+            akuma_cpu::daif::unmask_irq();
+        }
         crumb(0x57);
         // SAFETY: the VMCB and the host save image are live frames this
         // function owns; SVM is enabled on this core (`enable_on_core`).
@@ -1342,7 +1402,14 @@ pub fn run(nrips: bool, guest: Guest) {
                 n_cpuid += 1;
                 let (leaf, sub) = (v.rax() as u32, regs.rcx as u32);
                 let h = __cpuid_count(leaf, sub);
-                let [a, b, c, d] = svm::cpuid::filter(leaf, [h.eax, h.ebx, h.ecx, h.edx]);
+                let [a, mut b, c, mut d] = svm::cpuid::filter(leaf, [h.eax, h.ebx, h.ecx, h.edx]);
+                // A guest with a local APIC sees it in CPUID and, being the only
+                // processor, has initial APIC id 0 (the host core's id is no business of
+                // its).
+                if leaf == 1 && guest.exposes_apic() {
+                    d |= h.edx & (1 << 9);
+                    b &= 0x00FF_FFFF;
+                }
                 // The hypervisor leaves (0x4000_0000..) are scanned 256 at a time;
                 // one line says so, the rest would drown the log.
                 if log.cpuid < LOG_FIRST && !(0x4000_0000..0x5000_0000).contains(&leaf) {
@@ -1605,7 +1672,7 @@ pub fn run(nrips: bool, guest: Guest) {
     p("\n");
     // A Linux run passes on its banner; the Akuma guest must also have run its
     // init to the end (the marker the script on its disk prints).
-    let pass = plat.banner.seen && !fatal && (guest == Guest::Linux || plat.done.seen);
+    let pass = plat.banner.seen && !fatal && (guest.is_linux() || plat.done.seen);
     p("[KVM] ");
     p(guest.name());
     p(" guest: ");

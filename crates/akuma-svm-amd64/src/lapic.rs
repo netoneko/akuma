@@ -308,6 +308,18 @@ impl Lapic {
         }
     }
 
+    /// Is LINT0 programmed as the "virtual wire" (ExtINT delivery, unmasked) on a
+    /// software-enabled unit? That is how a guest with a local APIC but no I/O
+    /// APIC receives the legacy 8259's interrupts: the processor runs an
+    /// interrupt-acknowledge cycle to the PIC instead of taking a vector from
+    /// the APIC's own request register.
+    #[must_use]
+    pub const fn lint0_extint(&self) -> bool {
+        const DELIVERY_MODE_MASK: u32 = 0b111 << 8;
+        const EXTINT: u32 = 0b111 << 8;
+        self.enabled() && self.lvt_lint0 & LVT_MASKED == 0 && self.lvt_lint0 & DELIVERY_MODE_MASK == EXTINT
+    }
+
     /// The bus tick of the next timer expiry that would raise an interrupt, for a
     /// halted guest: `None` when the timer is stopped, masked, or the unit is
     /// software-disabled. (A request already pending is [`Lapic::pending`]'s.)
@@ -722,6 +734,27 @@ mod tests {
         // was already due and stays raised.
         l.write(0x320, LVT_MASKED | 32 | (1 << 17), 10_500 * US);
         assert_eq!(l.pending(), Some(32));
+    }
+
+    #[test]
+    fn lint0_extint_is_the_virtual_wire() {
+        let mut l = Lapic::new();
+        // Reset: masked, and the unit is disabled.
+        assert!(!l.lint0_extint());
+        l.write(0xF0, 0x1FF, 0);
+        assert!(!l.lint0_extint(), "still masked");
+        // ExtINT (delivery mode 111), unmasked.
+        l.write(0x350, 0x700, 0);
+        assert!(l.lint0_extint());
+        // Fixed delivery on vector 0x30 is not a virtual wire.
+        l.write(0x350, 0x30, 0);
+        assert!(!l.lint0_extint());
+        // Masked ExtINT is not either, and neither is a disabled unit.
+        l.write(0x350, 0x700 | LVT_MASKED, 0);
+        assert!(!l.lint0_extint());
+        l.write(0x350, 0x700, 0);
+        l.write(0xF0, 0xFF, 0);
+        assert!(!l.lint0_extint());
     }
 
     #[test]
