@@ -3,7 +3,8 @@
 
     python3 overlays/ryzen/kvm-serve-stage.py [--no-arm]
 
-1. reads the public keys the ryzen's Akuma accepts (`/etc/sshd/authorized_keys` on its p3);
+1. reads the public keys the ryzen's Akuma accepts (`/etc/sshd/authorized_keys` on its p3) and
+   its own machine key (`/etc/sshd/id_ed25519.pub`, the identity its `ssh` client uses);
 2. builds the guest's root here (`scripts/kvm/akuma_guest_rootfs.sh`, SERVE=1): busybox,
    sshd, and those keys plus the repo's test key as the guest's authorized keys;
 3. uploads it to the ryzen's `~/akuma-metal/out/`;
@@ -23,7 +24,10 @@ a = ap.parse_args()
 root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 os.chdir(root)
 
-rc, out, err = hpbox.ryzen_root("mountpoint -q /mnt/p3 || mount /dev/nvme0n1p3 /mnt/p3; cat /mnt/p3/etc/sshd/authorized_keys; umount /mnt/p3 2>/dev/null; true")
+# The accepted keys, and the machine's own public key: the Akuma `ssh` client on the ryzen
+# uses its sshd host key (`/etc/sshd/id_ed25519`) as its identity, so trusting `.pub` is what
+# lets the ryzen ssh into the guest "from itself".
+rc, out, err = hpbox.ryzen_root("mountpoint -q /mnt/p3 || mount /dev/nvme0n1p3 /mnt/p3; cat /mnt/p3/etc/sshd/authorized_keys /mnt/p3/etc/sshd/id_ed25519.pub; umount /mnt/p3 2>/dev/null; true")
 if rc != 0 or "ssh-" not in out:
     sys.exit(f"could not read the ryzen's authorized keys: rc={rc} {err}")
 test = open("target/x86_64-unknown-none/release/amd64-ssh-test-key.pub").read()

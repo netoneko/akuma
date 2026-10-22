@@ -175,6 +175,22 @@ init), which meant pinning a daemon to core 0, re-`VMSAVE`ing the host state eac
 yielding the BKL, and sleeping with `hlt` when the guest is idle. Found on the way: a host with
 no `init` ends in `halt()`, so the task is never scheduled.
 
+**On the metal (ryzen entry 28, `GUEST=serve`, kernel `6a290876`; staged by
+`overlays/ryzen/kvm-serve-stage.py`):** `ssh -p 2223 root@<ryzen wifi ip>` from the Mac ran
+commands in the guest (`uname -a`, `/proc/cpuinfo`, `eth0 10.0.2.15`), and the ryzen's own Akuma
+`ssh -p 2223 root@127.0.0.1` reached it too, with the ryzen's machine key
+(`/etc/sshd/id_ed25519`, the identity its client falls back to) added to the guest's
+`authorized_keys`. A 1 MiB upload arrived byte-exact (md5) but at ~60 KB/s; a 1 MiB **download**
+(guest to Mac) never finished in 10 minutes and held a relay slot. The control that localizes it:
+**the host Akuma's own sshd, with no guest in the path, also moves ~55 KB/s outbound over the
+ryzen's wifi** (4 MiB in 77 s), while the identical bulk test on the TCG rig (virtio host NIC) does
+2 MiB up and down intact in ~1 s. So the throughput ceiling is the ryzen's wifi path, not the
+gateway or relay; the hung download is not explained by it and is open. Two suspects, both
+addressed but unverified on metal: the service task held the BKL through every guest entry
+(starving the wifi/network tasks on a 16-core host; now a dropped-BKL window), and the relay had no
+visibility (it now logs per-slot ring and window state every 5 s). Re-run with
+`--bulk` equivalents once the box is free, and compare a boot with no service guest.
+
 TCP made the guest's `nc` TCP probe pass (`NET=1 TCPPROBE=1`: `tcp echo: akuma-tcp-probe`),
 which the UDP probe never did; see the open item below.
 
