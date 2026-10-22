@@ -24,8 +24,12 @@ const EAGAIN: i32 = 11;
 const SHUT_WR: i32 = 1;
 /// The port on the guest every connection is forwarded to (its sshd).
 const GUEST_PORT: u16 = 22;
-/// Bytes moved per direction per poll.
-const CHUNK: usize = 1024;
+/// Bytes moved per direction per round.
+const CHUNK: usize = 2048;
+/// Rounds per [`Relay::poll`] while bytes keep moving. A poll is rare (the run loop sleeps
+/// between host interrupts), so one chunk per poll capped the relay at `CHUNK` x (wakes per
+/// second): ~100 KB/s on a 100 Hz tick.
+const ROUNDS: usize = 16;
 /// How long to wait before retrying a listener the host stack refused (µs).
 const RETRY_US: u64 = 1_000_000;
 
@@ -144,8 +148,26 @@ impl Relay {
         gw.fwd_release(i);
     }
 
-    /// Move whatever can move, both ways, on every connection. Cheap when idle.
+    /// Is any connection open or being opened? (The run loop sleeps less while one is.)
+    pub fn active(&self) -> bool {
+        self.slots.iter().any(|s| s.phase != Phase::Idle)
+    }
+
+    /// Move whatever can move, both ways, on every connection, until nothing moves or
+    /// [`ROUNDS`] rounds have. Cheap when idle.
     pub fn poll(&mut self, gw: &mut Gateway<'_>, now_us: u64) {
+        for _ in 0..ROUNDS {
+            let before = self.counts.to_guest + self.counts.to_host + self.counts.accepted;
+            self.poll_once(gw, now_us);
+            // Frames the gateway queued for the guest are the caller's to deliver; once the
+            // queue is full there is nothing more to do this wake.
+            if self.counts.to_guest + self.counts.to_host + self.counts.accepted == before {
+                break;
+            }
+        }
+    }
+
+    fn poll_once(&mut self, gw: &mut Gateway<'_>, now_us: u64) {
         self.ensure_listener(now_us);
         let Some(listener) = self.listener else { return };
         for i in 0..FWD_SLOTS {

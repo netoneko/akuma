@@ -1493,13 +1493,21 @@ pub fn run(nrips: bool, guest: Guest) {
         let Some(i) = (1..=n_cpu).map(|d| (cur + d) % n_cpu).find(|&j| states[j] == CpuState::Runnable) else {
             // Nobody can run. If a halted processor's timer can still wake it, wait
             // for it (the host tick runs underneath: IRQs are on).
-            if (0..n_cpu).any(|j| states[j] == CpuState::Halted && plat.can_wake(j)) {
+            // A service guest that halts with no timer armed is not dead: the relay may yet
+            // have something for it, and the host has other work. Only a processor halted with
+            // interrupts off (or none left) ends the run.
+            if (0..n_cpu).any(|j| states[j] == CpuState::Halted && (service || plat.can_wake(j))) {
                 if service {
                     // Sleep until the guest's next timer (or any host interrupt: the NIC's,
                     // a keystroke) instead of burning the core.
                     akuma_cpu::daif::mask_irq();
                     if let Some(due) = (0..n_cpu).filter_map(|j| plat.next_event_us(j)).min() {
                         let _ = crate::lapic::arm_oneshot_in_us(due.saturating_sub(crate::net::uptime_us()).min(1000));
+                    }
+                    // A relayed connection is waiting on this loop to move its bytes; do not
+                    // sleep through the host's 10 ms tick (the guest's own timer may be stopped).
+                    if relay.as_ref().is_some_and(Relay::active) {
+                        let _ = crate::lapic::arm_oneshot_in_us(250);
                     }
                     crate::sched::allow_tick();
                     akuma_cpu::daif::unmask_irq();
