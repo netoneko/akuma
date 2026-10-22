@@ -1432,6 +1432,7 @@ pub fn run(nrips: bool, guest: Guest) {
     let service = guest.is_service();
     let mut relay = service.then(|| Relay::new(super::SERVE_PORT.load(core::sync::atomic::Ordering::Relaxed)));
     let mut next_relay_us = 0u64;
+    let mut next_status_us = 0u64;
     let mut n_net = 0u64;
     if crate::lapic::tsc_uptime_us().is_none() {
         p("[KVM] linux: warning: host uptime is 10 ms ticks; PIT timing will be coarse\n");
@@ -1473,6 +1474,10 @@ pub fn run(nrips: bool, guest: Guest) {
         {
             next_relay_us = now_us + 200;
             r.poll(wire, now_us);
+            if now_us >= next_status_us {
+                next_status_us = now_us + 5_000_000;
+                r.status(wire);
+            }
         }
         // Frames the gateway has for the guest go into the buffers it has posted.
         if let Some((dev, wire)) = net.as_mut() {
@@ -1550,9 +1555,19 @@ pub fn run(nrips: bool, guest: Guest) {
         if service {
             save_host(host_pa);
         }
+        // A service guest runs with the BKL released: on a many-core host the network and
+        // wifi tasks (and every syscall) wait on it, and a guest entry can last a whole
+        // quantum. The window is what the netpoll daemon uses for its own long BKL-free
+        // stretches; the host interrupt that ends an entry leaves the lock released too.
+        if service {
+            akuma_bkl::bkl::dropped_window_open();
+        }
         // SAFETY: the VMCB and the host save image are live frames this
         // function owns; SVM is enabled on this core (`enable_on_core`).
         unsafe { vmrun_regs(vmcb_pas[i], host_pa, &mut regs_all[i]) };
+        if service {
+            akuma_bkl::bkl::dropped_window_close();
+        }
         crumb(0x58);
         let regs = &mut regs_all[i];
         let mut v = vmcb_of(&mut vmcbs, i);

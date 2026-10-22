@@ -74,6 +74,16 @@ pub enum State {
     LastAck,
 }
 
+/// What [`Tcp::snapshot`] reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    pub state: State,
+    pub tx_queued: usize,
+    pub rx_queued: usize,
+    pub peer_window: u32,
+    pub in_flight: u32,
+}
+
 /// A byte ring over a borrowed buffer.
 #[derive(Debug)]
 struct Ring<'a> {
@@ -285,6 +295,19 @@ impl<'a> Tcp<'a> {
             }
         }
         n
+    }
+
+    /// A snapshot for diagnostics: state, bytes queued to send (unacknowledged plus unsent),
+    /// bytes received and unread, the peer's window, and bytes in flight.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            state: self.state,
+            tx_queued: self.tx.len,
+            rx_queued: self.rx.len,
+            peer_window: self.snd_wnd,
+            in_flight: self.snd_nxt.wrapping_sub(self.snd_una),
+        }
     }
 
     /// Bytes waiting to be read.

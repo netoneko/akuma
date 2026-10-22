@@ -17,6 +17,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("log")
 ap.add_argument("--wait", type=int, default=900)
 ap.add_argument("--hold", action="store_true")
+ap.add_argument("--bulk", type=int, default=0, help="also upload and download this many KiB through ssh, with md5s")
 ap.add_argument("--port", type=int, default=2223)
 a = ap.parse_args()
 
@@ -89,6 +90,22 @@ while time.time() - t0 < a.wait:
         last = "ssh timed out"
     time.sleep(5)
 print(last.strip())
+if ok and a.bulk:
+    import hashlib
+    base = ["ssh", "-p", str(a.port), "-i", key, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "root@127.0.0.1"]
+    data = os.urandom(a.bulk * 1024)
+    h = hashlib.md5(data).hexdigest()
+    t = time.time()
+    try:
+        r = subprocess.run(base + ["cat > /tmp/big && md5sum /tmp/big"], input=data, capture_output=True, timeout=900)
+        print(f"bulk upload {a.bulk} KiB: {'ok' if h in r.stdout.decode() else 'MISMATCH ' + r.stdout.decode()} in {time.time() - t:.1f}s")
+        t = time.time()
+        r = subprocess.run(base + ["cat /tmp/big"], capture_output=True, timeout=900)
+        print(f"bulk download {len(r.stdout)} bytes: {'ok' if hashlib.md5(r.stdout).hexdigest() == h else 'MISMATCH'} in {time.time() - t:.1f}s")
+    except subprocess.TimeoutExpired:
+        print("bulk transfer TIMED OUT")
+        ok = False
 print("[REHEARSE] akuma-serve:", "PASS" if ok else "FAIL")
 for l in log().splitlines():
     if "[KVM] relay" in l or "service guest" in l:

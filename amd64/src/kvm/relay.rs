@@ -64,6 +64,9 @@ pub struct Counts {
     pub to_guest: u64,
     pub to_host: u64,
     pub refused: u64,
+    /// Times the host socket had no room (or no data) when the relay asked.
+    pub send_blocked: u64,
+    pub recv_idle: u64,
 }
 
 pub struct Relay {
@@ -77,7 +80,7 @@ pub struct Relay {
 impl Relay {
     /// A relay for host port `port`; nothing is bound until the first [`Relay::poll`].
     pub const fn new(port: u16) -> Self {
-        Self { port, listener: None, retry_at_us: 0, slots: [const { Slot::new() }; FWD_SLOTS], counts: Counts { accepted: 0, to_guest: 0, to_host: 0, refused: 0 } }
+        Self { port, listener: None, retry_at_us: 0, slots: [const { Slot::new() }; FWD_SLOTS], counts: Counts { accepted: 0, to_guest: 0, to_host: 0, refused: 0, send_blocked: 0, recv_idle: 0 } }
     }
 
     /// Is the listener up?
@@ -99,6 +102,38 @@ impl Relay {
             super::p("\n");
         } else {
             socket::remove_socket(idx);
+        }
+    }
+
+    /// One line per active connection, for the log: where bytes are sitting.
+    pub fn status(&self, gw: &mut Gateway<'_>) {
+        for i in 0..FWD_SLOTS {
+            if self.slots[i].phase == Phase::Idle {
+                continue;
+            }
+            let t = gw.fwd(i).snapshot();
+            super::p("[KVM] relay: slot ");
+            super::dec(i as u64);
+            super::p(if self.slots[i].phase == Phase::Open { " open" } else { " connecting" });
+            super::p(" to_guest=");
+            super::dec(self.counts.to_guest);
+            super::p(" to_host=");
+            super::dec(self.counts.to_host);
+            super::p(" up_pending=");
+            super::dec(self.slots[i].up_len as u64);
+            super::p(" gw_tx=");
+            super::dec(t.tx_queued as u64);
+            super::p(" gw_rx=");
+            super::dec(t.rx_queued as u64);
+            super::p(" in_flight=");
+            super::dec(u64::from(t.in_flight));
+            super::p(" peer_wnd=");
+            super::dec(u64::from(t.peer_window));
+            super::p(" host_send_blocked=");
+            super::dec(self.counts.send_blocked);
+            super::p(" host_recv_idle=");
+            super::dec(self.counts.recv_idle);
+            super::p("\n");
         }
     }
 
@@ -173,7 +208,7 @@ impl Relay {
                         s.up_off = 0;
                     }
                 }
-                Err(e) if e == EAGAIN => {}
+                Err(e) if e == EAGAIN => self.counts.send_blocked += 1,
                 Err(_) => {
                     gw.fwd(i).abort();
                     self.teardown(i, gw);
@@ -199,7 +234,7 @@ impl Relay {
                         let took = gw.fwd(i).write(&buf[..n]);
                         self.counts.to_guest += took as u64;
                     }
-                    Err(e) if e == EAGAIN => {}
+                    Err(e) if e == EAGAIN => self.counts.recv_idle += 1,
                     Err(_) => {
                         gw.fwd(i).abort();
                         self.teardown(i, gw);
