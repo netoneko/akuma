@@ -112,12 +112,44 @@ What it took, in the order it was found:
 | QEMU TCG, one-vCPU Akuma and hello guests | unchanged **PASS** |
 | the Linux guests | not rerun (no `vmlinux` off the metal); their path differs only by one-element arrays |
 
+## A NIC (phase 12, 2026-10-22)
+
+`kvmtest kvmnet` (`/boot/kvm-guest` = `akuma-net`): the busybox guest with a **virtio-net**
+device in the slot after the disk's (`virtio_mmio.device=4K@0xd0001000:6`), wired to a
+gateway that lives inside the hypervisor. **Rehearsed under QEMU TCG only.**
+
+* `akuma-svm-amd64::virtio_net` is the device: virtio-mmio v2, queue 0 = receive, queue 1 =
+  transmit, the 12-byte `virtio_net_hdr`, a MAC in config space; `VERSION_1` and `MAC` offered,
+  nothing else. 13 host tests, including a loop-in-the-ring and a runaway-index driver.
+* `akuma-svm-amd64::gateway` is the backend, QEMU-slirp's addresses on purpose (a guest that
+  falls back to `10.0.2.15` agrees with it): ARP for `10.0.2.2`/`.3`, DHCP (DISCOVER -> OFFER,
+  REQUEST -> ACK, `10.0.2.15`, router `.2`, resolver `.3`, a day), ICMP echo and UDP echo (port 7)
+  to the gateway; everything else is counted and dropped. Replies are built in place into 8 fixed
+  slots; checksums are real and the tests verify them by an independent sum.
+* The guest polls its NIC, so the interrupt line is announced and never raised; received frames are
+  delivered at the top of every loop turn and after each transmit.
+
+Found on the way: **a stepped-over `HLT` left the interrupt shadow set.** `sti; hlt; cli` intercepts
+`HLT` inside the one-instruction shadow `STI` opens; the handler advanced RIP but left the bit in the
+VMCB, so the `cli` ran shielded, IF dropped, and the timer interrupt that had woken the guest was not
+taken. 127 915 of 139 967 exits were `HLT` with 37 interrupts injected. Every guest has done this since
+phase 0; it only showed once something kept the guest idle. `Vmcb::complete_instruction` now ends the
+shadow wherever the hypervisor completes an instruction.
+
+| where | result |
+|---|---|
+| QEMU TCG, `NET=1 scripts/kvm/akuma_rehearse.sh` | **PASS** (`net=yes`): 10 frames, `arp=2 dhcp_offer=1 dhcp_ack=1`, the guest's `eth0` reads `inet addr:10.0.2.15  Bcast:10.0.2.255  Mask:255.255.255.0`; `HLT` exits 503 (was 127 915) |
+| QEMU TCG, `NETPROBE=1` (`nc -u -w 2 10.0.2.2 7`) | the echo **worked both ways** (guest strace: `nc` read its 16 bytes back from the socket, wrote them out, the shell read them from the pipe), then the guest **stalled after `nc`'s poll timeout** (nothing runnable, timer interrupts still arriving, no further syscalls from `nc`, no verdict). Not diagnosed: the same image on plain QEMU `-netdev user` finishes; under TCG host time runs ~20x slow against the wall clock, which may be all of it. To be run on the metal. |
+| the one-vCPU, hello and SMP guests after the shadow fix | unchanged **PASS** |
+
+`busybox ping` cannot be used as a probe: Akuma has no raw sockets (`can't create raw socket`).
+
 ## Still open
 
 * (Fixed 2026-10-22, same day: a guest spinning with `IF` set used to see timer
   interrupts at the 10 ms host-tick rate; the host's one-shot is now armed at the guest's
   deadline — [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Phase 10.)
-* No IOAPIC, no virtio-net, no PCI. SMP (above) is cooperative multiplexing on one host
+* No IOAPIC, no PCI, no route from the gateway to anywhere (no TCP, no DNS answers). SMP (above) is cooperative multiplexing on one host
   core, not parallel: two vCPUs run at most one core's worth. Not yet run on the metal.
 * ASIDs are distinct per vCPU but untested on real hardware (TCG ignores them).
 * The guest's `HLT` with `IF` clear stops the run (same as the Linux guest).

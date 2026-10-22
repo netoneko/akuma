@@ -62,6 +62,15 @@ the guest's `smp:  2 cpus online` and `guest cpus: 2`, and
 `[KVM] akuma-smp guest: PASS (banner=yes, init=yes, smp=yes)`; the summary line carries
 `vcpus=2 ipi= init=1 sipi=1 pause=` and each processor's final `rip`/state.
 
+A NIC: `NET=1 scripts/kvm/akuma_rehearse.sh LOG` (`kvmtest kvmnet`, or `akuma-net` in
+`/boot/kvm-guest`; on the ryzen `GUEST=net sh overlays/ryzen/kvm-akuma-stage.sh`) gives the
+busybox guest a virtio-net NIC on the hypervisor's own gateway. Expect the guest's
+`eth0 ... inet addr:10.0.2.15  Bcast:10.0.2.255  Mask:255.255.255.0`, and
+`[KVM] akuma-net guest: PASS (banner=yes, init=yes, net=yes)` with `dhcp_offer=1 dhcp_ack=1
+arp=` in the summary. `NETPROBE=1` adds a UDP-echo probe (`nc -u -w 2`, `udp_echo=1`); under
+TCG its 2 s wait costs many minutes of wall time and the guest then stalls after the timeout
+(`docs/archive/AKUMA_KVM_AKUMA_GUEST.md` § A NIC), so it is opt-in. `GUEST=net` stages it.
+
 ## If it goes wrong
 
 | you see (in the guest's console) | it is |

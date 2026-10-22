@@ -41,7 +41,9 @@ use akuma_svm_amd64::lapic::{self, IpiMode, Lapic};
 use akuma_svm_amd64::mmio;
 use akuma_svm_amd64::pic::PicPair;
 use akuma_svm_amd64::pit::{self, Pit};
+use akuma_svm_amd64::gateway::Gateway;
 use akuma_svm_amd64::virtio::{self, Disk, GuestMem, MmioBlk};
+use akuma_svm_amd64::virtio_net::MmioNet;
 use akuma_svm_amd64::{ctrl, elf, eventinj, excp, exitinfo, intr0, intr1, pvh, save, tables, ExitCode, Seg, SegAttr, Vmcb};
 use core::arch::x86_64::__cpuid_count;
 
@@ -59,6 +61,9 @@ const AKUMA_PATH: &str = "/boot/akuma-guest";
 const AKUMA_CMDLINE: &str = "nosmp";
 /// Appended when the guest has a disk.
 const AKUMA_DISK_ARGS: &str = " virtio_mmio.device=4K@0xd0000000:5 init=/bin/busybox initargs=sh,/etc/guest.sh";
+/// [`AKUMA_DISK_ARGS`] and then the NIC's window.
+const AKUMA_NET_ARGS: &str =
+    " virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6 init=/bin/busybox initargs=sh,/etc/guest.sh";
 /// The Akuma guest's disk when the machine has no second virtio-blk device.
 const AKUMA_DISK_IMAGE_PATH: &str = "/boot/akuma-guest-root.img";
 /// The Akuma guest's RAM. The kernel takes a fixed 512 MiB heap
@@ -66,6 +71,13 @@ const AKUMA_DISK_IMAGE_PATH: &str = "/boot/akuma-guest-root.img";
 /// region is smaller; the rest is its frame allocator. One page directory of
 /// 2 MiB nested leaves maps 1 GiB, which bounds this.
 const AKUMA_RAM_BYTES: u64 = 768 << 20;
+
+/// The NIC's register window: the next slot after the disk's (the guest finds devices
+/// as evenly spaced `virtio_mmio.device=` windows, in the order given). Its interrupt
+/// line is announced but never raised: the guest polls.
+const NET_BASE: u64 = 0xD000_1000;
+const NET_LEN: u64 = 0x1000;
+const NET_ARGS: &str = " virtio_mmio.device=4K@0xd0001000:6";
 
 /// Where an Akuma guest's ACPI page goes: the first address of the BIOS read-only window
 /// its RSDP scan covers (`0xE0000..0x100000`).
@@ -116,9 +128,18 @@ pub enum Guest {
     /// them, the guest starts the others with INIT and STARTUP IPIs through its local
     /// APIC, and the hypervisor runs them in turn on the host core.
     AkumaSmp,
+    /// The Akuma guest with a virtio-net NIC (MMIO, polled) wired to an in-hypervisor
+    /// gateway ([`svm::gateway`]): it should lease `10.0.2.15` by DHCP and reach
+    /// `10.0.2.2`. One virtual processor.
+    AkumaNet,
 }
 
 impl Guest {
+    /// Does the guest have a NIC?
+    const fn has_net(self) -> bool {
+        matches!(self, Self::AkumaNet)
+    }
+
     /// How many virtual processors the guest has.
     const fn vcpus(self) -> usize {
         match self {
@@ -129,7 +150,7 @@ impl Guest {
 
     /// Is the guest this kernel's own ELF (as opposed to a Linux `vmlinux`)?
     const fn is_akuma(self) -> bool {
-        matches!(self, Self::Akuma | Self::AkumaHello | Self::AkumaSmp)
+        matches!(self, Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet)
     }
 
     const fn is_linux(self) -> bool {
@@ -144,21 +165,21 @@ impl Guest {
     const fn path(self) -> &'static str {
         match self {
             Self::Linux | Self::LinuxApic => LINUX_PATH,
-            Self::Akuma | Self::AkumaHello | Self::AkumaSmp => AKUMA_PATH,
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet => AKUMA_PATH,
         }
     }
 
     const fn ram_bytes(self) -> u64 {
         match self {
             Self::Linux | Self::LinuxApic => RAM_BYTES,
-            Self::Akuma | Self::AkumaHello | Self::AkumaSmp => AKUMA_RAM_BYTES,
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet => AKUMA_RAM_BYTES,
         }
     }
 
     const fn disk_path(self) -> &'static str {
         match self {
             Self::Linux | Self::LinuxApic => DISK_IMAGE_PATH,
-            Self::Akuma | Self::AkumaSmp => AKUMA_DISK_IMAGE_PATH,
+            Self::Akuma | Self::AkumaSmp | Self::AkumaNet => AKUMA_DISK_IMAGE_PATH,
             Self::AkumaHello => HELLO_DISK_IMAGE_PATH,
         }
     }
@@ -167,7 +188,7 @@ impl Guest {
     const fn banner(self) -> &'static [u8] {
         match self {
             Self::Linux | Self::LinuxApic => b"Linux version",
-            Self::Akuma | Self::AkumaHello | Self::AkumaSmp => b"Akuma/amd64",
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp | Self::AkumaNet => b"Akuma/amd64",
         }
     }
 
@@ -176,7 +197,7 @@ impl Guest {
     const fn done(self) -> Option<&'static [u8]> {
         match self {
             Self::Linux | Self::LinuxApic => None,
-            Self::Akuma | Self::AkumaSmp => Some(b"AKUMA-GUEST-DONE"),
+            Self::Akuma | Self::AkumaSmp | Self::AkumaNet => Some(b"AKUMA-GUEST-DONE"),
             Self::AkumaHello => Some(b"run by Akuma"),
         }
     }
@@ -188,6 +209,7 @@ impl Guest {
             Self::Akuma => "akuma",
             Self::AkumaHello => "akuma-hello",
             Self::AkumaSmp => "akuma-smp",
+            Self::AkumaNet => "akuma-net",
         }
     }
 }
@@ -1069,6 +1091,35 @@ impl MmioDev for LapicDev<'_> {
     }
 }
 
+/// The virtio-net window, at `off`: a doorbell write runs the queues at once.
+struct NetDev<'a> {
+    dev: &'a mut MmioNet,
+    wire: &'a mut Gateway,
+    ram: &'a Ram,
+    bounce: &'a mut [u8],
+    off: u64,
+}
+
+impl MmioDev for NetDev<'_> {
+    fn load(&mut self, size: u8) -> u64 {
+        self.dev.read(self.off, size)
+    }
+
+    fn store(&mut self, size: u8, val: u64) {
+        match self.dev.write(self.off, size, val) {
+            virtio::Write::Notify(1) => {
+                // Transmit, then anything the gateway answered goes straight back.
+                self.dev.process_tx(self.ram, self.wire, self.bounce);
+                self.dev.deliver_rx(self.ram, self.wire, self.bounce);
+            }
+            virtio::Write::Notify(0) => {
+                self.dev.deliver_rx(self.ram, self.wire, self.bounce);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The virtio-blk window, at `off`.
 struct VirtioDev<'a> {
     dev: &'a mut MmioBlk,
@@ -1110,7 +1161,7 @@ fn mmio_emulate(a: &mmio::Access, dev: &mut dyn MmioDev, v: &mut Vmcb<'_>, regs:
             v.set_rflags((v.rflags() & !mmio::ARITH_FLAGS) | flags);
         }
     }
-    v.set_rip(v.rip() + u64::from(a.len));
+    v.complete_instruction(v.rip() + u64::from(a.len));
 }
 
 /// One serial line: the guest's instruction bytes at `va`, for a post-mortem.
@@ -1234,6 +1285,8 @@ pub fn run(nrips: bool, guest: Guest) {
         Guest::AkumaHello => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { HELLO_DISK_ARGS } else { "" }),
         // No `nosmp`: the MADT says how many processors there are.
         Guest::AkumaSmp => cmdline_with_tsc(&mut cmd, "", 0, if disk.is_some() { AKUMA_DISK_ARGS } else { "" }),
+        // The disk's window first, then the NIC's: slot order is device order.
+        Guest::AkumaNet => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { AKUMA_NET_ARGS } else { NET_ARGS }),
     };
     match disk {
         Some(d) => {
@@ -1353,6 +1406,8 @@ pub fn run(nrips: bool, guest: Guest) {
     let (mut n_inj, mut n_hlt, mut n_mmio) = (0u64, 0u64, 0u64);
     let (mut n_ipi, mut n_init, mut n_sipi, mut n_pause) = (0u64, 0u64, 0u64, 0u64);
     let mut blk = disk.map(|d| (MmioBlk::new(d.sectors()), d));
+    let mut net = guest.has_net().then(|| (MmioNet::new(svm::gateway::GUEST_MAC), Gateway::new()));
+    let mut n_net = 0u64;
     if crate::lapic::tsc_uptime_us().is_none() {
         p("[KVM] linux: warning: host uptime is 10 ms ticks; PIT timing will be coarse\n");
     }
@@ -1379,6 +1434,10 @@ pub fn run(nrips: bool, guest: Guest) {
         if plat.done.seen {
             stopped = "guest reported its init ran to the end";
             break 'run;
+        }
+        // Frames the gateway has for the guest go into the buffers it has posted.
+        if let Some((dev, wire)) = net.as_mut() {
+            dev.deliver_rx(&ram, wire, scratch.bytes_mut());
         }
         // A halted processor wakes when something can be offered to it.
         for j in 0..n_cpu {
@@ -1504,7 +1563,8 @@ pub fn run(nrips: bool, guest: Guest) {
                 regs.rbx = u64::from(b);
                 regs.rcx = u64::from(c);
                 regs.rdx = u64::from(d);
-                v.set_rip(next_rip(&v, nrips, 2));
+                let next = next_rip(&v, nrips, 2);
+                v.complete_instruction(next);
             }
             ExitCode::Msr => {
                 n_msr += 1;
@@ -1534,7 +1594,8 @@ pub fn run(nrips: bool, guest: Guest) {
                     v.set_rax(val & 0xFFFF_FFFF);
                     regs.rdx = val >> 32;
                 }
-                v.set_rip(next_rip(&v, nrips, 2));
+                let next = next_rip(&v, nrips, 2);
+                v.complete_instruction(next);
             }
             ExitCode::Ioio => {
                 n_io += 1;
@@ -1557,11 +1618,11 @@ pub fn run(nrips: bool, guest: Guest) {
                     plat.io_out(io.port, io.size, (v.rax() & io.mask()) as u32, pit::ticks_from_us(crate::net::uptime_us()));
                 }
                 if plat.reset_requested {
-                    v.set_rip(v.exitinfo2());
+                    v.complete_instruction(v.exitinfo2());
                     stopped = "guest requested a reset (keyboard-controller pulse: its panic=-1 reboot)";
                     break 'run;
                 }
-                v.set_rip(v.exitinfo2());
+                v.complete_instruction(v.exitinfo2());
             }
             ExitCode::Hlt => {
                 n_hlt += 1;
@@ -1570,7 +1631,8 @@ pub fn run(nrips: bool, guest: Guest) {
                     // processor can, and stops when none can.
                     states[i] = CpuState::Dead;
                 } else {
-                    v.set_rip(next_rip(&v, nrips, 1));
+                    let next = next_rip(&v, nrips, 1);
+                v.complete_instruction(next);
                     // Idle until an interrupt can reach it; the others run meanwhile.
                     states[i] = CpuState::Halted;
                 }
@@ -1582,7 +1644,8 @@ pub fn run(nrips: bool, guest: Guest) {
             // Step over the `PAUSE` (`F3 90`); the next turn goes to the other processor.
             ExitCode::Pause => {
                 n_pause += 1;
-                v.set_rip(next_rip(&v, nrips, 2));
+                let next = next_rip(&v, nrips, 2);
+                v.complete_instruction(next);
             }
             ExitCode::Ud | ExitCode::Gp | ExitCode::Pf | ExitCode::Other(0x48) => {
                 n_exc += 1;
@@ -1646,6 +1709,25 @@ pub fn run(nrips: bool, guest: Guest) {
                 };
                 let now = lapic::bus_ticks_from_us(crate::net::uptime_us());
                 mmio_emulate(&a, &mut LapicDev { lapic: &mut plat.lapics[i], off, now }, &mut v, regs);
+            }
+            ExitCode::Npf if net.is_some() && (NET_BASE..NET_BASE + NET_LEN).contains(&v.exitinfo2()) => {
+                n_net += 1;
+                let off = v.exitinfo2() - NET_BASE;
+                let access = guest_code(&ram, &v, v.rip()).and_then(|c| mmio::decode(&c));
+                let Some(a) = access else {
+                    stopped = "guest touched the NIC window with an instruction the MMIO decoder does not know";
+                    fatal = true;
+                    p("\n[KVM] linux: ");
+                    p(stopped);
+                    p(" rip=");
+                    hx(v.rip(), 16);
+                    p("\n");
+                    dump_code(&ram, &v, v.rip());
+                    break 'run;
+                };
+                let (dev, wire) = net.as_mut().expect("checked by the guard");
+                let mut window = NetDev { dev, wire, ram: &ram, bounce: scratch.bytes_mut(), off };
+                mmio_emulate(&a, &mut window, &mut v, regs);
             }
             ExitCode::Npf if blk.is_some() && (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_LEN).contains(&v.exitinfo2()) => {
                 n_mmio += 1;
@@ -1787,6 +1869,27 @@ pub fn run(nrips: bool, guest: Guest) {
         p(" pause=");
         dec(n_pause);
     }
+    if let Some((_, wire)) = net.as_ref() {
+        let s = wire.stats;
+        p(" net_mmio=");
+        dec(n_net);
+        p(" net_frames=");
+        dec(s.frames);
+        p(" arp=");
+        dec(s.arp_replies);
+        p(" dhcp_offer=");
+        dec(s.dhcp_offers);
+        p(" dhcp_ack=");
+        dec(s.dhcp_acks);
+        p(" icmp=");
+        dec(s.icmp_echoes);
+        p(" udp_echo=");
+        dec(s.udp_echoes);
+        p(" net_ignored=");
+        dec(s.ignored);
+        p(" net_lost=");
+        dec(s.lost);
+    }
     p(" console_bytes=");
     dec(plat.tx_bytes);
     p(" rip=");
@@ -1795,7 +1898,9 @@ pub fn run(nrips: bool, guest: Guest) {
     // A Linux run passes on its banner; the Akuma guest must also have run its
     // init to the end (the marker the script on its disk prints).
     // The SMP guest must also have started every processor.
-    let pass = plat.banner.seen && !fatal && (guest.is_linux() || plat.done.seen) && (n_cpu == 1 || plat.smp_up.seen);
+    // The NIC guest must also have been leased its address.
+    let net_ok = net.as_ref().is_none_or(|(_, wire)| wire.stats.dhcp_acks > 0);
+    let pass = plat.banner.seen && !fatal && (guest.is_linux() || plat.done.seen) && (n_cpu == 1 || plat.smp_up.seen) && net_ok;
     p("[KVM] ");
     p(guest.name());
     p(" guest: ");
@@ -1808,6 +1913,10 @@ pub fn run(nrips: bool, guest: Guest) {
         if n_cpu > 1 {
             p(", smp=");
             p(if plat.smp_up.seen { "yes" } else { "no" });
+        }
+        if guest.has_net() {
+            p(", net=");
+            p(if net_ok { "yes" } else { "no" });
         }
     }
     p(")\n");
@@ -1850,7 +1959,7 @@ fn init_vmcb(page: &mut [u8; 4096], guest: Guest, npt_root: u64, asid: u32) {
     // (nested paging delivers it without an exit), so only Linux's is traced.
     v.set_excp(match guest {
         Guest::Linux | Guest::LinuxApic => excp::UD | excp::GP | excp::PF | excp::DF,
-        Guest::Akuma | Guest::AkumaHello | Guest::AkumaSmp => excp::UD | excp::GP | excp::DF,
+        Guest::Akuma | Guest::AkumaHello | Guest::AkumaSmp | Guest::AkumaNet => excp::UD | excp::GP | excp::DF,
     });
     v.set_iopm_base(image_pa(static_iopm()));
     v.set_msrpm_base(image_pa(static_msrpm()));

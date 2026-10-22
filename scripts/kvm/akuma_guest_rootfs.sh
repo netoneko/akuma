@@ -27,8 +27,19 @@ cat > "$T/etc/guest.sh" <<'SH'
 /bin/busybox yes | /bin/busybox head -c 262144 > /wtest
 /bin/busybox sync
 /bin/busybox md5sum /wtest
-/bin/busybox echo AKUMA-GUEST-DONE
 SH
+if [ -n "${NET:-}" ]; then
+    # The NIC guest (`kvmnet`): show the lease. The hypervisor's own counters (DHCP, ARP)
+    # are the verdict; these lines are for the log.
+    echo '/bin/busybox ifconfig' >> "$T/etc/guest.sh"
+fi
+if [ -n "${NETPROBE:-}" ]; then
+    # Also talk to the gateway the hypervisor plays: UDP echo on its port 7 (busybox ping
+    # needs a raw socket, which Akuma has not). Its `-w 2` wait takes minutes of wall
+    # time under TCG, so it is opt-in.
+    echo '/bin/busybox echo "udp echo: $(/bin/busybox echo akuma-net-probe | /bin/busybox nc -u -w 2 10.0.2.2 7)"' >> "$T/etc/guest.sh"
+fi
+echo '/bin/busybox echo AKUMA-GUEST-DONE' >> "$T/etc/guest.sh"
 rm -f "$OUT"
 "$E2/mke2fs" -q -t ext2 -d "$T" -L akumaguest "$OUT" 16M
 echo "wrote $OUT"

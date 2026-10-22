@@ -39,11 +39,13 @@
 //! [`ctrl`] offsets are from the page base.
 
 pub mod acpi;
+pub mod gateway;
 pub mod lapic;
 pub mod mmio;
 pub mod pic;
 pub mod pit;
 pub mod virtio;
+pub mod virtio_net;
 
 /// Page size of a VMCB (and of the host save area).
 pub const VMCB_SIZE: usize = 4096;
@@ -736,6 +738,17 @@ impl<'a> Vmcb<'a> {
     #[must_use]
     pub const fn interrupt_shadow(&self) -> bool {
         rd64(self.page, ctrl::INT_SHADOW) & ctrl::INT_SHADOW_BIT != 0
+    }
+    /// The hypervisor has completed the intercepted instruction: resume at `rip` and end
+    /// any interrupt shadow. The shadow is the one-instruction window after `STI` or
+    /// `MOV SS`; an intercept lands *inside* it (the instruction it covers has not
+    /// retired), so a hypervisor that steps over that instruction itself must also end
+    /// the shadow, or the instruction after it is shielded as well (`sti; hlt; cli`
+    /// would then never take the interrupt that woke it).
+    pub fn complete_instruction(&mut self, rip: u64) {
+        self.set_rip(rip);
+        let shadow = rd64(self.page, ctrl::INT_SHADOW) & !ctrl::INT_SHADOW_BIT;
+        wr64(self.page, ctrl::INT_SHADOW, shadow);
     }
     /// The `EVENTINJ` qword (`0A8h`) as it stands.
     #[must_use]
@@ -1989,6 +2002,19 @@ mod tests {
     // for the one test that reads a real kernel off disk.
     extern crate std;
     use super::*;
+
+    #[test]
+    fn completing_an_instruction_ends_the_interrupt_shadow_and_only_that() {
+        let mut page = [0u8; VMCB_SIZE];
+        wr64(&mut page, ctrl::INT_SHADOW, ctrl::INT_SHADOW_BIT | 2);
+        let mut v = Vmcb::new(&mut page);
+        assert!(v.interrupt_shadow());
+        v.complete_instruction(0x1234);
+        assert!(!v.interrupt_shadow());
+        assert_eq!(v.rip(), 0x1234);
+        // Bit 1 of the same qword (the guest-interrupt-mask bit) is not ours to clear.
+        assert_eq!(rd64(&page, ctrl::INT_SHADOW), 2);
+    }
 
     #[test]
     fn a_startup_ipi_starts_in_real_mode_at_the_vectors_page() {

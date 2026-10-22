@@ -172,6 +172,12 @@ Read downwards; the sections below are the reference record.
    │   MADT at 0xE0000 (the guest scans, ignoring rsdp_paddr); PAUSE intercepted so a
    │   spinning waiter yields. TCG only so far: 7/7 PASS, md5 verified on the host.
    │   [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md) § Two virtual processors
+ [10-22] ═══ PHASE 12: A NIC FOR THE AKUMA GUEST ═══  "virtio-net on a gateway that lives in the hypervisor"
+   │
+   ▼   virtio-mmio net device + a slirp-style gateway (ARP, DHCP, ICMP/UDP echo), polled.
+   │   The guest leased 10.0.2.15 under TCG. Found on the way: the interrupt shadow
+   │   left set by a stepped-over HLT.
+   │   [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md) § A NIC
 ```
 
 ---

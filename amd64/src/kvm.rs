@@ -151,6 +151,7 @@ pub fn init(cmdline: &str) {
 /// * `kvmakuma` — the Akuma phase, this kernel's own ELF off `/boot/akuma-guest`
 ///   booting as the guest (`docs/archive/AKUMA_KVM_AKUMA_GUEST.md`); or
 /// * `kvmhello` — the same guest on a 2 MiB root whose only file is `/bin/hello`; or
+/// * `kvmnet` — the Akuma guest with a virtio-net NIC on an in-hypervisor gateway (`akuma-net`); or
 /// * `kvmsmp` — the Akuma guest with two virtual processors (`/boot/kvm-guest` = `akuma-smp`); or
 /// * `kvmlapic` — the Linux phase with the local APIC on (`/boot/kvm-guest` = `linux-apic`).
 ///
@@ -164,6 +165,8 @@ pub fn late(cmdline: &str) {
     }
     let guest = if flag("kvmlapic") {
         Some(linux::Guest::LinuxApic)
+    } else if flag("kvmnet") {
+        Some(linux::Guest::AkumaNet)
     } else if flag("kvmsmp") {
         Some(linux::Guest::AkumaSmp)
     } else if flag("kvmhello") {
@@ -179,6 +182,8 @@ pub fn late(cmdline: &str) {
             linux::Guest::LinuxApic
         } else if sel.starts_with(b"akuma-hello") {
             linux::Guest::AkumaHello
+        } else if sel.starts_with(b"akuma-net") {
+            linux::Guest::AkumaNet
         } else if sel.starts_with(b"akuma-smp") {
             linux::Guest::AkumaSmp
         } else if sel.starts_with(b"akuma") {

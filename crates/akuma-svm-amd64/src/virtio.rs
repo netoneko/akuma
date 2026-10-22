@@ -179,17 +179,17 @@ const AVAIL_NO_INTERRUPT: u16 = 1;
 /// The identity `GET_ID` returns.
 const DEVICE_ID_STRING: &[u8; 20] = b"akuma-kvm-virtio-blk";
 
-fn rd16(m: &dyn GuestMem, gpa: u64) -> Option<u16> {
+pub(crate) fn rd16(m: &dyn GuestMem, gpa: u64) -> Option<u16> {
     let mut b = [0u8; 2];
     m.read(gpa, &mut b).then(|| u16::from_le_bytes(b))
 }
 
-fn rd32(m: &dyn GuestMem, gpa: u64) -> Option<u32> {
+pub(crate) fn rd32(m: &dyn GuestMem, gpa: u64) -> Option<u32> {
     let mut b = [0u8; 4];
     m.read(gpa, &mut b).then(|| u32::from_le_bytes(b))
 }
 
-fn rd64(m: &dyn GuestMem, gpa: u64) -> Option<u64> {
+pub(crate) fn rd64(m: &dyn GuestMem, gpa: u64) -> Option<u64> {
     let mut b = [0u8; 8];
     m.read(gpa, &mut b).then(|| u64::from_le_bytes(b))
 }

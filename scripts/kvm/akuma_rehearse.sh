@@ -13,7 +13,11 @@
 #      HELLO=1     the tiny-root guest: /bin/hello is its only program (akuma_hello_rootfs.sh)
 #      SMP=1       the busybox guest with two virtual processors (`kvmsmp`; passes only when
 #                  the guest reports "smp:  2 cpus online")
+#      NET=1       the busybox guest with a virtio-net NIC on the hypervisor's gateway (`kvmnet`;
+#                  passes only when the guest was leased 10.0.2.15 by the gateway's DHCP)
+#      NETPROBE=1  with NET=1, also run a UDP-echo probe in the guest (minutes of wall time under TCG)
 #      SELECTOR=1  boot with `kvmlinux` and /boot/kvm-guest=akuma, as ryzen's entry 28 does
+#      QEMU_EXTRA  extra QEMU arguments (e.g. "-monitor unix:/tmp/mon,server,nowait")
 #      EXTRA   extra host command-line tokens (e.g. "nosmp")
 # Builds both images fresh in a temp dir, stops at the verdict line, and checks
 # the guest-written file from the host side (debugfs) when the run passed.
@@ -39,6 +43,10 @@ if [ -n "${SMP:-}" ]; then
     FLAG=kvmsmp
     WHO=akuma-smp
 fi
+if [ -n "${NET:-}" ]; then
+    FLAG=kvmnet
+    WHO=akuma-net
+fi
 if [ -n "${SELECTOR:-}" ]; then
     printf '%s' "$WHO" > "$W/host/boot/kvm-guest"
     FLAG=kvmlinux
@@ -55,7 +63,7 @@ qemu-system-x86_64 -M microvm -cpu EPYC-Milan,svm=on -global virtio-mmio.force-l
     -drive id=d0,file="$W/root.img",format=raw,if=none -device virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0 \
     -drive id=d1,file="$W/guest.img",format=raw,if=none -device virtio-blk-device,drive=d1,bus=virtio-mmio-bus.1 \
     -append "virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6 kvmtest $FLAG noladder $EXTRA" \
-    -serial file:"$LOG" -display none -no-reboot &
+    -serial file:"$LOG" -display none -no-reboot ${QEMU_EXTRA:-} &
 Q=$!
 i=0
 while [ "$i" -lt "$MAX" ] && kill -0 "$Q" 2>/dev/null && ! grep -aq "$WHO guest:" "$LOG" 2>/dev/null; do

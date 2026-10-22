@@ -37,6 +37,7 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 | `lapic` | xAPIC register page + timer (periodic/one-shot, 1 GHz bus clock), IRR/ISR with priority classes, self-IPI; a function of `now` |
 | `mmio` | decodes the `MOV` — and read-only `CMP`/`TEST` — of a faulting device access (nested page faults give the address only), with the flag arithmetic |
 | `virtio` | virtio-mmio **v2** block device over the traits `GuestMem` and `Disk` |
+| `virtio_net`, `gateway` | virtio-mmio v2 **network** device (queues 0/1, 12-byte header, MAC) over `GuestMem` and `NetBackend`; and the backend: a slirp-style gateway (`10.0.2.2`) that answers ARP, DHCP, ICMP echo and UDP echo and drops the rest |
 | `acpi` | RSDP v2 / XSDT / FADT / MADT / DSDT with one `LNRO0005` device; `Pm1` registers |
 
 ## Invariants
@@ -90,6 +91,17 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
   holder is the processor that is not running (a convoy of `[bkls>]` lines) and the
   guest's spin-count logic sees stalls no real machine produces (`SWITCH BADFRAME`).
   The exit does **not** advance RIP: step over it like `HLT` (nRIP, else the length).
+- **The NIC is polled and has no route out.** `Guest::AkumaNet` puts the virtio-net window
+  in the slot after the disk's (`0xD0001000`; the guest finds devices as evenly spaced
+  `virtio_mmio.device=` windows, in order) and **never raises its interrupt line** (the
+  guest has no IOAPIC and polls). Frames the gateway has for the guest are delivered into
+  posted receive buffers at the top of every loop turn and after each transmit. The
+  gateway is a model, not a route: anything but ARP/DHCP/ICMP-echo/UDP-echo-to-7 is
+  counted and dropped.
+- **Stepping over an intercepted instruction ends the interrupt shadow**
+  (`Vmcb::complete_instruction`). `sti; hlt` intercepts `HLT` inside the shadow; leaving
+  the bit set shields the next instruction too, and the `cli` after the halt then runs
+  before the interrupt that woke it can be taken (127 915 of 139 967 exits were `HLT`).
 - **The Akuma kernel finds ACPI by scanning `0xE0000..0xFFFFF`** and ignores
   `rsdp_paddr`, so an Akuma guest's table page is placed at `0xE0000` (inside the RAM
   entry, no entry of its own); Linux gets `rsdp_paddr` and a type-3 entry.
@@ -108,8 +120,8 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 Runbook: [`../../runbooks/kvm-linux-guest.md`](../../runbooks/kvm-linux-guest.md).
 Kernel command line: `kvmtest kvmlinux`, `kvmtest kvmlapic` (Linux with the local APIC) or `kvmtest kvmakuma` (add `noladder` under
 TCG). `kvmhello` is the same guest on a 2 MiB root whose only file is `/bin/hello`.
-`kvmsmp` is the busybox guest with two virtual processors. `kvmlinux` runs an Akuma guest instead when p3's `/boot/kvm-guest` begins with
-`akuma` (busybox root), `akuma-hello`, `akuma-smp` or `linux-apic` — the bootloader entry's command line is baked into `grubx64.efi`, so the file
+`kvmsmp` is the busybox guest with two virtual processors; `kvmnet` (`akuma-net`) the one with a NIC. `kvmlinux` runs an Akuma guest instead when p3's `/boot/kvm-guest` begins with
+`akuma` (busybox root), `akuma-hello`, `akuma-smp`, `akuma-net` or `linux-apic` — the bootloader entry's command line is baked into `grubx64.efi`, so the file
 is the lever that lets one entry serve both.
 
 ## Background
