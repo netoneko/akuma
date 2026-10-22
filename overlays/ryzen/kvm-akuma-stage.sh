@@ -2,7 +2,7 @@
 # Stage the "Akuma boots under Akuma's hypervisor" run onto ryzen's p3, from Pop.
 #
 #   BRANCH=kvm-part-1 sh build.sh                 (netoneko, ryzen: builds the kernel ON the ryzen)
-#   sh kvm-akuma-stage.sh                         (root, in Pop; p3 not mounted by Akuma)
+#   sh kvm-akuma-stage.sh [KERNEL]                (root, in Pop; p3 not mounted by Akuma; SRC=<clone> W=<dir> override)
 #   sh arm.sh 28                                  (boots entry 28 once; ~3 min later Pop is back)
 #
 # Does, each step safe to repeat:
@@ -22,7 +22,7 @@
 # docs/runbooks/kvm-linux-guest.md § 3, docs/archive/AKUMA_KVM_AKUMA_GUEST.md.
 set -eu
 W=${W:-/home/netoneko/akuma-metal}
-SRC=$W/akuma
+SRC=${SRC:-$W/akuma}   # the clone the kernel was built in (and the scripts come from)
 K=${1:-$W/out/akuma-amd64}
 BB=$SRC/target/x86_64-unknown-none/release/busybox-x86_64
 P=/mnt/p3
