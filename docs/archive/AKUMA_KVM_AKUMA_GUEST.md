@@ -146,6 +146,22 @@ shadow wherever the hypervisor completes an instruction.
 | the same image on plain QEMU with `-netdev user` | finishes (`nc` returns after its timeout, `AKUMA-GUEST-DONE`) |
 | the one-vCPU, hello and SMP guests after the shadow fix | unchanged **PASS** |
 
+**Item 4, rechecked after TCP/ssh (2026-10-22, TCG): the UDP stall is narrowed, not fixed.**
+* It still reproduces with the current gateway and kernel, and TCP probes do not trigger it
+  (`NET=1 TCPPROBE=1`: `tcp echo: akuma-tcp-probe`, finishes).
+* **A reply datagram is required.** `NETPROBE_PORT=9` (a UDP port the gateway does not answer, so
+  `nc -u -w 2` just times out) completes and passes; port 7 (the gateway echoes) stalls.
+* **Not the hypervisor's timers or a lost wakeup.** The same guest on plain QEMU (no SVM) receiving a
+  real UDP reply (slirp's DNS at 10.0.2.3:53) finishes normally. And a background watcher in the
+  guest (`GUEST_PRE`) shows the system is alive while "stalled": the `nc` process is in state `R`
+  and its **`utime` climbs (1002 -> 3004 ticks between samples, `stime` 0)**: `nc` is **spinning in
+  user mode with no syscalls** after its poll timeout (a stuck `exit_group` would not show, but
+  stime would). The shell, its parent, waits for it.
+* Next: sample the guest RIP while it spins (the hypervisor's stop line prints `rip`) and look at
+  what busybox's `nc` does after a UDP reply plus timeout; compare against the byte-exact content
+  of the gateway's reply (a malformed datagram that the guest stack accepts but `nc` mishandles is
+  the cheapest explanation, since slirp's reply works).
+
 **Open (the guest, not the device):** the stall reproduces on the metal and under TCG with the gateway
 answering, and not on QEMU with slirp (which does not answer port 7, so `nc` there never receives a
 datagram). `strace` prints a syscall on *return*, so `nc`'s `exit_group` leaves no line; the likeliest

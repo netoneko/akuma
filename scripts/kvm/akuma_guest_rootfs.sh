@@ -63,11 +63,20 @@ if [ -n "${NET:-}" ]; then
     # are the verdict; these lines are for the log.
     echo '/bin/busybox ifconfig' >> "$T/etc/guest.sh"
 fi
+if [ -n "${GUEST_PRE:-}" ]; then
+    # Shell lines run before the probes (e.g. a background watcher).
+    printf '%s\n' "$GUEST_PRE" >> "$T/etc/guest.sh"
+fi
 if [ -n "${NETPROBE:-}" ]; then
     # Also talk to the gateway the hypervisor plays: UDP echo on its port 7 (busybox ping
     # needs a raw socket, which Akuma has not). Its `-w 2` wait takes minutes of wall
     # time under TCG, so it is opt-in.
-    echo '/bin/busybox echo "udp echo: $(/bin/busybox echo akuma-net-probe | /bin/busybox nc -u -w 2 10.0.2.2 7)"' >> "$T/etc/guest.sh"
+    # NETPROBE_PORT=9 aims it at a port the gateway does not answer (the timeout-only control).
+    echo "/bin/busybox echo \"udp probe: \$(/bin/busybox echo akuma-net-probe | /bin/busybox nc -u -w 2 10.0.2.2 ${NETPROBE_PORT:-7})\"" >> "$T/etc/guest.sh"
+fi
+if [ -n "${GUEST_EXTRA:-}" ]; then
+    # Extra shell lines for the guest's script, before its last line (experiments).
+    printf '%s\n' "$GUEST_EXTRA" >> "$T/etc/guest.sh"
 fi
 if [ -n "${TCPPROBE:-}" ]; then
     echo '/bin/busybox echo "tcp echo: $(/bin/busybox echo akuma-tcp-probe | /bin/busybox nc -w 3 10.0.2.2 7)"' >> "$T/etc/guest.sh"
