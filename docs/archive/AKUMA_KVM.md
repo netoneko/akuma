@@ -122,6 +122,29 @@ Read downwards; the sections below are the reference record.
    │   18), and a start_info layout the rung-5 guest agreed with and Linux did
    │   not. Metal 2026-10-22: PASS (entry 28,
    │   banner on real Zen 4). [`AKUMA_KVM_LINUX_RUNG.md`](AKUMA_KVM_LINUX_RUNG.md)
+ [10-22] ═══ RUNG 7: A TIMER — THE GUEST'S CLOCK TICKS ═══  "TCG breakthrough"
+   │
+   ▼   Pure, host-tested 8254 + 8259 models; interrupts reach the guest as
+   │   virtual INTRs (V_IRQ | V_IGN_TPR, §15.21.4 — the hardware already waits
+   │   for IF and the interrupt shadow, so no window logic). HLT now idles to
+   │   the next PIT edge instead of ending the run. The PIT cannot calibrate
+   │   the TSC (every poll is a VM exit; the gaps vary 5-10x), so the command
+   │   line says `tsc_early_khz=`. Linux goes from spinning in its first delay
+   │   loop (1.3 M exits) to the root-fs panic in 96 K, 144 interrupts taken.
+ [10-22] ═══ RUNG 8: A DISK — LINUX BOOTS FROM A VIRTIO-BLK ROOT ═══  "TCG: init runs"
+   │
+   ▼   Four more pure models: a MOV decoder (nested page faults name the
+   │   address and nothing else; 33 clang-assembled vectors), a virtio-mmio v2
+   │   block device, ACPI tables (RSDP→XSDT→FADT/MADT→DSDT with an LNRO0005
+   │   node — the only way this kernel finds a virtio device) and the 8250's
+   │   THRE interrupt. Two traps found from the guest's own log: FADT
+   │   HW_REDUCED_ACPI silently deletes the PIC (`nr_irqs: 8`), and a 16450
+   │   stalls after one byte without a transmit interrupt. Backing store is
+   │   the existing `akuma_virtio::block` driver, second device.
+   ▼   QEMU TCG: ext2 root mounts, busybox init runs, the guest's md5 of a
+       1.1 MB file equals the host's, a 256 KiB file the guest wrote reads
+       back identical under host debugfs. Nested SVM and metal: next.
+       [`AKUMA_KVM_LINUX_RUNG.md`](AKUMA_KVM_LINUX_RUNG.md) § Rung 7, 8
 ```
 
 ---
