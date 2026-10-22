@@ -1042,14 +1042,6 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         mount_ram()
     };
 
-    // The KVM rungs that need the root filesystem (`kvmtest kvmlinux`): the Linux
-    // guest reads `/boot/vmlinux` off it. After the mount, before the wifi and
-    // network bring-up so a guest run cannot starve them; the early rungs ran in
-    // `kvm::init` above.
-    if have_fs {
-        crate::kvm::late(info.cmdline());
-    }
-
     // `rtw89` (ryzen): the wifi card up to running firmware, then shut down
     // again — wifi stage W1; `rtw89wifi` keeps it up for the station
     // (W3/W4). After the root mount: the firmware is a file.
@@ -1082,6 +1074,18 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         // The idle wake budget (`idlesleep` / `idlemwait`), the same call the
         // PVH path makes in `main.rs`.
         crate::sched::set_idle_policy_from_cmdline(cmdline);
+        // The KVM rungs that need the root filesystem (`kvmtest kvmlinux`): the
+        // Linux guest reads `/boot/vmlinux` off it. Here — after `late_init`'s
+        // `lapic::init`, before the secondaries start — and not right after the
+        // mount: the run needs the host tick (its wall-clock budget, the
+        // scheduler, the hardware watchdog), and before the LAPIC timer there is
+        // none, so a guest that spins without exiting never gives the host a
+        // chance to stop it (found rehearsing under QEMU/KVM, 2026-10-22). Same
+        // place as the PVH path's call in `main.rs`; the BSP only, so the
+        // thread cannot migrate off the core that enabled SVM.
+        if have_fs {
+            crate::kvm::late(cmdline);
+        }
         if !nosmp && crate::smp::trampoline_page_available(&machine, &mb2_keep_out()) {
             crate::smp::start_secondaries(machine.madt.as_ref());
         }
