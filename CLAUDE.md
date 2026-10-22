@@ -8,7 +8,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,fdtable,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,terminal,timer,trap-aarch64,user-space,vfs,virtio}`
+  `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,fdtable,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,svm-amd64,terminal,timer,trap-aarch64,user-space,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
   `akuma-fdtable` is the fd table's state machine — lowest-free allocation,
   dup/close/sweep/fork decisions, effects returned not performed, `forbid`,
@@ -252,6 +252,15 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   a crate: extraction found the line had been emitting **41** fields where its
   own comment listed 44, and a `comm` truncation that could panic the kernel on
   a UTF-8 boundary (`docs/archive/AKUMA_AMD64_STREAMLINING.md` §4b).
+  `akuma-svm-amd64` is the **SVM hypervisor's vocabulary and device models** (2026-10-22;
+  `forbid(unsafe_code)`, no dependencies; `amd64/src/kvm*.rs` owns every `unsafe`): the VMCB
+  layouts each pinned to its APM table, `cpuid::filter`, NPT encodings, PVH/ELF loading, and the
+  pure models a Linux guest runs on — 8254 `pit`, 8259 `pic`, 16550 `Uart` (with its THRE
+  interrupt), the `mmio` MOV decoder, a virtio-mmio v2 block device (`virtio`) and `acpi`. It is
+  the *device* side; `akuma-virtio` is the driver side and is reused as the guest disk's backing
+  store. **Never set FADT `HW_REDUCED_ACPI`** (Linux then drops the PIC/PIT and the device IRQ
+  vanishes) and **no Linux/KVM source may be read** — only the APM, the virtio/ACPI specs and
+  datasheets (`docs/reference/subsystems/kvm.md`, `docs/runbooks/kvm-linux-guest.md`).
   `akuma-dmesg` is the console history ring behind `dmesg(1)` plus the
   `syslog(2)` action decode, shared by both kernels' consoles
   (`docs/archive/AKUMA_AMD64_STREAMLINING.md` §4).

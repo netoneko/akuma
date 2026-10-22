@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1444
-- **Docs contributing at least one fix:** 398
+- **Total distinct fixes counted:** 1449
+- **Docs contributing at least one fix:** 399
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 242 | 16.8% | 33 |
-| Memory & Virtual Memory | 176 | 12.2% | 57 |
+| Syscall / ABI Compatibility Audits | 242 | 16.7% | 33 |
+| Memory & Virtual Memory | 176 | 12.1% | 57 |
 | Scheduler & Process Management | 139 | 9.6% | 43 |
 | SMP & Locking | 133 | 9.2% | 54 |
-| Networking | 92 | 6.4% | 33 |
+| Networking | 92 | 6.3% | 33 |
 | Userspace Apps & Libraries | 40 | 2.8% | 21 |
 | Rump Kernel & Syscall Proxy | 26 | 1.8% | 6 |
 | Toolchain & Self-Hosting | 91 | 6.3% | 13 |
 | SSH | 39 | 2.7% | 18 |
-| VFS & Filesystem | 134 | 9.3% | 40 |
+| VFS & Filesystem | 134 | 9.2% | 40 |
 | Boot & Drivers | 129 | 8.9% | 20 |
 | Signals & Exceptions | 40 | 2.8% | 15 |
-| Misc / Cross-cutting | 50 | 3.5% | 17 |
+| Misc / Cross-cutting | 55 | 3.8% | 18 |
 | Console & Terminal | 58 | 4.0% | 18 |
 | Containers | 55 | 3.8% | 10 |
-| **Total** | **1444** | **100.0%** | **398** |
+| **Total** | **1449** | **100.0%** | **399** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -2050,12 +2050,20 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_METAL_CONTROL_RUN_2026_10_18.md
 - Emulating a trapped `MRS` with `rt == 31` on AArch64 wrote word 31 of the trap frame (`sp_el0`) instead of discarding the result as `XZR`, as the read side already did
 
-## Misc / Cross-cutting (50 fixes, 17 docs)
+## Misc / Cross-cutting (55 fixes, 18 docs)
 
 ### docs/archive/AKUMA_KVM.md
 (The SVM rungs — trivial guest, permission maps + AP hook, the 12-probe consistency ladder, the long-mode metal PASS, the two-level translation rung — are capability, not fixes; the ladder is an instrument, not a defect. These are the two defects the rungs surfaced.)
 - `#VMEXIT` leaves GIF clear, and the seed's exit path never re-enabled it: after the trivial guest's PASS the host got no interrupts, the timer went silent and the watchdog reset the metal ~1 min later — a PASS that killed the box. `stgi` now runs in the same `asm!` block as `vmrun` (`f9f04d0e`)
 - `cr4::PAE` was `1 << 6` — bit 6 is `MCE`, PAE is bit 5 — so a long-mode guest (CR0.PG, EFER.LME/LMA set) failed §15.5.1's `LME & PG & !PAE` consistency check and VMRUN returned VMEXIT_INVALID on both QEMU/KVM and the metal; the crate's own validator had passed the state because it tested the same wrong constant, and the unit tests could not see a transposed literal because they used the symbolic name. Fixed to `1 << 5` (`bbaa81d1`), and every CR0/CR4/EFER bit constant the crate carries is now pinned numerically by `bit_constants_are_vol3_encodings` — the validator *reasons through* these constants, so a symbolic test can never catch this class of error
+
+### docs/archive/AKUMA_KVM_LINUX_RUNG.md
+(The Linux rungs — the PVH loader, the PIT/PIC models, virtual-interrupt delivery, the MOV decoder, the virtio-blk device, the ACPI tables — are capability, not fixes; `tsc_early_khz` replaces a calibration that cannot work through trapped port reads, a design decision, not a defect. These are the defects the rungs surfaced. The `RDPMC` `#UD` at guest reboot is worked around with `nmi_watchdog=0` and its cause is not understood, so it is not counted.)
+- `PVH_NOTE_TYPE` was 9 (`XEN_ELFNOTE_LOADER`) where the entry note is 18 (`PHYS32_ENTRY`), and the note walker stepped by unpadded sizes, so a real kernel's PVH entry was never found; the synthetic-image tests built their note from the same constant and passed
+- `hvm_start_info` was written at version-0 offsets (cmdline `+0x10`, memmap `+0x20`, 48 bytes), so Linux saw no command line and no memory map; the rung-5 guest read the same wrong offsets and passed. The v1 layout is cmdline `+0x18`, rsdp `+0x20`, memmap `+0x28`, 56 bytes, now pinned by reading the blobs back with `akuma-ryzen-amd64`'s `StartInfo` parser
+- `kvm::late` ran before `lapic::init` on the multiboot2 path, so the host had no tick: a guest that spun produced no exit and the wall-clock budget, which is checked on exits, never fired; found only by the nested-SVM rehearsal because TCG's host timer was already running
+- the ACPI FADT first set `HW_REDUCED_ACPI`, which tells Linux there is no legacy PIC or PIT: it dropped both (`nr_irqs: 8, preallocated irqs: 0`), never created IRQ 5, and the virtio device's interrupt came back disabled (`virtio-mmio LNRO0005:00: error -ENXIO: IRQ index 0 not found`); the FADT is now full-hardware with a PM1 block
+- the UART model never raised the transmit-empty interrupt, so a `16450` driver that owns the console stalled after one character (init's output stopped at `G`); the model now raises THRE on `IER` enable and per character, clears it on an `IIR` read and gates it with `OUT2`
 
 ### docs/archive/AKUMA_ENTRY_EXTRACTION.md
 (The `akuma-entry` split itself is a refactor and is not counted; these are the two defects it surfaced. The `with_boot_identity_fdt` change — mapping and range-checking the DTB pointer instead of vouching for it by comment — is a hardening with no observed failure, and is not counted either.)
@@ -2376,3 +2384,5 @@ Also scanned 2026-10-08 (the ryzen laptop, wifi and Chromium work, 4 archive doc
 Also scanned 2026-10-16 (closing `ugh`, 55 commits ahead of main, 17 archive docs added or edited). Counted above: AKUMA_GENTOO, AKUMA_GENTOO_PORTAGE_CRASH, AKUMA_PROC_ENUMERATION_HANG, HARD_LINKS, UNIX_PERMISSIONS, BOX_BUILD, NETWORKING_AUDIT and AKUMA_AMD64_TOUCHPAD_I2C_HID, plus one new bullet each for AKUMA_AMD64_BOXES_AUDIT and AKUMA_SELF_HOSTING_AMD64. Still uncounted: AMD64_SPAWN_EXT_WORKDIR_CRASH and HERD_DUPLICATE_SERVICE_PROCESSES, listed open above, were re-run on the ryzen metal on 2026-10-14 and no longer reproduce; each attributes the cure to a fix counted elsewhere (AKUMA_AMD64_BOXES_AUDIT's `spawn_ext` faults; AKUMA_AMD64_BARE_METAL_SELFHOST §6 item 6) and says so is inferred, not proven. AKUMA_ACPI_POWER gained the energy ledger and the idle wake budget, which are capability, not fixes. The 2026-10-14 corrections in AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS, AKUMA_AMD64_BARE_METAL_SELFHOST and AKUMA_AMD64_LAPIC_ONESHOT_STALE point at fixes already counted in those subsections and add none.
 
 Also scanned 2026-10-21 (the `kvm-part-0` branch — the SVM hypervisor rungs on the ryzen metal, rung 0 through the two-level translation rung). Counted above: AKUMA_KVM, two fixes (the GIF-left-clear watchdog reset `f9f04d0e` cured with `stgi`; the `cr4::PAE` transposition, `1<<6` for `1<<5`, found by the ladder's `cr4=0x40` tell and fixed in `bbaa81d1`). The branch's other archive docs carry no counted fix: AKUMA_KVMTEST_METAL_DMESG_2026_10_21 and AMD64_KVMTEST_RUNG3_LONGMODE_METAL_DMESG_2026_10_21 are boot logs, AMD64_KVM_REBOOT_NOTE_2026_10_20 is the reboot plan behind the GIF fix above, and AKUMA_FDTABLE_EXTRACTION plus AKUMA_MMU_SAFE_FACADE (`06accb83`, `eee578df`) are behaviour-preserving extractions with host tests, the same no-defect shape as the 2026-09-13 port records. The handoff pair (CRUSH_TO_CLAUDE / CLAUDE_TO_CRUSH) and the rung-4 NPT transcription (constants pinned by test, no defect) are records, not fixes.
+
+Also scanned 2026-10-22 (the `kvm-linux-rung` branch — the Linux guest under the SVM hypervisor, rungs 5 through 8). Counted above: AKUMA_KVM_LINUX_RUNG, five fixes (the PVH note type and its unpadded walk; the version-0 `hvm_start_info` layout; `kvm::late` before the host tick; FADT `HW_REDUCED_ACPI` deleting the guest's PIC; the missing UART THRE interrupt). The `/proc/<tid>/maps` change (`7fec263c`) is a fix already counted under its own doc. The rung-6 metal dmesg (AMD64_KVMTEST_RUNG6_LINUX_METAL_DMESG_2026_10_22) is a boot log, not a fix; the `RDPMC` `#UD` at guest reboot is an open question with a workaround (`nmi_watchdog=0`), not a counted fix.
