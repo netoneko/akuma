@@ -67,6 +67,11 @@ const AKUMA_DISK_IMAGE_PATH: &str = "/boot/akuma-guest-root.img";
 /// 2 MiB nested leaves maps 1 GiB, which bounds this.
 const AKUMA_RAM_BYTES: u64 = 768 << 20;
 
+/// The tiny-root Akuma guest's command-line tail: its only program is `/bin/hello`.
+const HELLO_DISK_ARGS: &str = " virtio_mmio.device=4K@0xd0000000:5 init=/bin/hello";
+/// Its disk when the machine has no second virtio-blk device (2 MiB, one file).
+const HELLO_DISK_IMAGE_PATH: &str = "/boot/akuma-hello-root.img";
+
 /// Which kernel the run boots.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Guest {
@@ -75,20 +80,28 @@ pub enum Guest {
     /// The Akuma amd64 kernel itself: local APIC and its timer, virtio from the
     /// command line. The third rung of the ladder (`docs/archive/AKUMA_KVM.md`).
     Akuma,
+    /// The same Akuma guest on the smallest possible root: a 2 MiB ext2 with one
+    /// file, `/bin/hello`, as init. No busybox, no script, no shell.
+    AkumaHello,
 }
 
 impl Guest {
+    /// Is the guest this kernel's own ELF (as opposed to a Linux `vmlinux`)?
+    const fn is_akuma(self) -> bool {
+        !matches!(self, Self::Linux)
+    }
+
     const fn path(self) -> &'static str {
         match self {
             Self::Linux => LINUX_PATH,
-            Self::Akuma => AKUMA_PATH,
+            Self::Akuma | Self::AkumaHello => AKUMA_PATH,
         }
     }
 
     const fn ram_bytes(self) -> u64 {
         match self {
             Self::Linux => RAM_BYTES,
-            Self::Akuma => AKUMA_RAM_BYTES,
+            Self::Akuma | Self::AkumaHello => AKUMA_RAM_BYTES,
         }
     }
 
@@ -96,6 +109,7 @@ impl Guest {
         match self {
             Self::Linux => DISK_IMAGE_PATH,
             Self::Akuma => AKUMA_DISK_IMAGE_PATH,
+            Self::AkumaHello => HELLO_DISK_IMAGE_PATH,
         }
     }
 
@@ -103,7 +117,7 @@ impl Guest {
     const fn banner(self) -> &'static [u8] {
         match self {
             Self::Linux => b"Linux version",
-            Self::Akuma => b"Akuma/amd64",
+            Self::Akuma | Self::AkumaHello => b"Akuma/amd64",
         }
     }
 
@@ -113,6 +127,7 @@ impl Guest {
         match self {
             Self::Linux => None,
             Self::Akuma => Some(b"AKUMA-GUEST-DONE"),
+            Self::AkumaHello => Some(b"run by Akuma"),
         }
     }
 
@@ -120,6 +135,7 @@ impl Guest {
         match self {
             Self::Linux => "linux",
             Self::Akuma => "akuma",
+            Self::AkumaHello => "akuma-hello",
         }
     }
 }
@@ -1095,6 +1111,7 @@ pub fn run(nrips: bool, guest: Guest) {
         ),
         // The Akuma guest calibrates its own TSC against the virtual PIT.
         Guest::Akuma => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { AKUMA_DISK_ARGS } else { "" }),
+        Guest::AkumaHello => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { HELLO_DISK_ARGS } else { "" }),
     };
     match disk {
         Some(d) => {
@@ -1172,7 +1189,7 @@ pub fn run(nrips: bool, guest: Guest) {
         // (nested paging delivers it without an exit), so only Linux's is traced.
         v.set_excp(match guest {
             Guest::Linux => excp::UD | excp::GP | excp::PF | excp::DF,
-            Guest::Akuma => excp::UD | excp::GP | excp::DF,
+            Guest::Akuma | Guest::AkumaHello => excp::UD | excp::GP | excp::DF,
         });
         v.set_iopm_base(image_pa(iopm));
         v.set_msrpm_base(image_pa(msrpm));
@@ -1595,7 +1612,7 @@ pub fn run(nrips: bool, guest: Guest) {
     p(if pass { "PASS" } else { "FAIL" });
     p(" (banner=");
     p(if plat.banner.seen { "yes" } else { "no" });
-    if guest == Guest::Akuma {
+    if guest.is_akuma() {
         p(", init=");
         p(if plat.done.seen { "yes" } else { "no" });
     }

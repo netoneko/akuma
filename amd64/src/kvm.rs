@@ -149,22 +149,33 @@ pub fn init(cmdline: &str) {
 ///
 /// * `kvmlinux` — the Linux phase, a real `vmlinux` off `/boot/vmlinux`; or
 /// * `kvmakuma` — the Akuma phase, this kernel's own ELF off `/boot/akuma-guest`
-///   booting as the guest (`docs/archive/AKUMA_KVM_AKUMA_GUEST.md`).
+///   booting as the guest (`docs/archive/AKUMA_KVM_AKUMA_GUEST.md`); or
+/// * `kvmhello` — the same guest on a 2 MiB root whose only file is `/bin/hello`.
 ///
-/// `kvmlinux` also runs the Akuma guest when p3's `/boot/kvm-guest` begins with
-/// `akuma`: the bootloader entry's command line is baked into `grubx64.efi`, so a
+/// `kvmlinux` also runs an Akuma guest when p3's `/boot/kvm-guest` begins with
+/// `akuma` (busybox root) or `akuma-hello` (hello-world root): the bootloader entry's command line is baked into `grubx64.efi`, so a
 /// one-word file on the root is the lever that lets one entry serve both guests.
 pub fn late(cmdline: &str) {
     let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
     if !SVM_WANTED.load(Ordering::Acquire) {
         return;
     }
-    let guest = if flag("kvmakuma") {
+    let guest = if flag("kvmhello") {
+        Some(linux::Guest::AkumaHello)
+    } else if flag("kvmakuma") {
         Some(linux::Guest::Akuma)
     } else if flag("kvmlinux") {
-        let mut sel = [0u8; 8];
-        let akuma = akuma_vfs_glue::read_at(GUEST_SELECTOR_PATH, 0, &mut sel).is_ok_and(|n| sel[..n].starts_with(b"akuma"));
-        Some(if akuma { linux::Guest::Akuma } else { linux::Guest::Linux })
+        let mut sel = [0u8; 16];
+        let n = akuma_vfs_glue::read_at(GUEST_SELECTOR_PATH, 0, &mut sel).unwrap_or(0);
+        let sel = &sel[..n];
+        // `akuma-hello` before `akuma`: the longer word starts with the shorter.
+        Some(if sel.starts_with(b"akuma-hello") {
+            linux::Guest::AkumaHello
+        } else if sel.starts_with(b"akuma") {
+            linux::Guest::Akuma
+        } else {
+            linux::Guest::Linux
+        })
     } else {
         None
     };
