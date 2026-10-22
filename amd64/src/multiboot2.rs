@@ -1042,6 +1042,14 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         mount_ram()
     };
 
+    // The KVM rungs that need the root filesystem (`kvmtest kvmlinux`): the Linux
+    // guest reads `/boot/vmlinux` off it. After the mount, before the wifi and
+    // network bring-up so a guest run cannot starve them; the early rungs ran in
+    // `kvm::init` above.
+    if have_fs {
+        crate::kvm::late(info.cmdline());
+    }
+
     // `rtw89` (ryzen): the wifi card up to running firmware, then shut down
     // again — wifi stage W1; `rtw89wifi` keeps it up for the station
     // (W3/W4). After the root mount: the firmware is a file.

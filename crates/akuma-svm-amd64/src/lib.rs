@@ -133,6 +133,13 @@ pub mod ctrl {
     pub const PML_INDEX: usize = 0x1D0;
 
     /// `TLB_CONTROL` encodings (39:32 of [`GUEST_ASID`]).
+    /// `V_INTR_MASKING` — bit 24 of the `V_INTR` qword (`060h`, Table B-1).
+    ///
+    /// Set: the host's `EFLAGS.IF` at `VMRUN` controls *physical* interrupts
+    /// while the guest runs and the guest's `IF` controls virtual ones only
+    /// (§15.21.1) — so the host's timer tick (scheduler, watchdog) reaches it
+    /// whatever the guest does with `IF`. Clear: the guest's `IF` gates both.
+    pub const V_INTR_MASKING: u64 = 1 << 24;
     pub const TLB_DO_NOTHING: u8 = 0;
     /// Flush the entire TLB on `VMRUN`.
     pub const TLB_FLUSH_ALL: u8 = 1;
@@ -829,6 +836,11 @@ impl<'a> Vmcb<'a> {
     /// Write a qword of the state save area, by its [`save`] offset.
     pub fn set_save64(&mut self, off: usize, v: u64) {
         wr64(self.page, SAVE_AREA_BASE + off, v);
+    }
+    /// The `V_INTR` qword (control `060h`): virtual-interrupt state and
+    /// [`ctrl::V_INTR_MASKING`].
+    pub fn set_v_intr(&mut self, v: u64) {
+        wr64(self.page, ctrl::V_INTR, v);
     }
     /// Event injection (`EVENTINJ`, control `0A8h`) for the next `VMRUN`: the
     /// guest takes the event as if it had arisen on its own.
@@ -2744,6 +2756,17 @@ mod tests {
         for leaf in [0, 2, 3, 0x8000_0000, 0x8000_0002, 0x8000_0007, 0x8000_0008] {
             assert_eq!(cpuid::filter(leaf, all), all, "leaf {leaf:#x} must pass through");
         }
+    }
+
+    /// `V_INTR_MASKING` is bit 24 of the qword at `060h` (Table B-1), and the
+    /// setter writes it there.
+    #[test]
+    fn v_intr_masking_is_bit_24_of_060h() {
+        assert_eq!(ctrl::V_INTR_MASKING, 1 << 24);
+        assert_eq!(ctrl::V_INTR, 0x060);
+        let mut page = [0u8; VMCB_SIZE];
+        Vmcb::new(&mut page).set_v_intr(ctrl::V_INTR_MASKING);
+        assert_eq!(&page[0x60..0x68], &0x0100_0000u64.to_le_bytes());
     }
 
     /// `EVENTINJ`, bit by bit against Figure 15-5 / Table 15-11.

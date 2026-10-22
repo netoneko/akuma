@@ -72,6 +72,15 @@ done
     $DEBUGFS -w -R "write overlays/ryzen/rootfs/$f /$f" $OUT/root.img >/dev/null 2>&1
     echo "overlay: /$f $($DEBUGFS -R "stat /$f" $OUT/root.img 2>/dev/null | grep -o 'Size: [0-9]*')"
 done
+# A guest kernel for the KVM Linux rung (entry 28): `$W/vmlinux`, if staged (the
+# Firecracker CI `vmlinux-6.1.128`, fetched once from Pop), goes in as
+# `/boot/vmlinux` so the rehearsal's p3 has it — on the metal p3 it is copied by hand.
+if [ -s $W/vmlinux ]; then
+    /sbin/debugfs -w -R "mkdir /boot" $OUT/root.img >/dev/null 2>&1
+    /sbin/debugfs -w -R "write $W/vmlinux /boot/vmlinux" $OUT/root.img >/dev/null 2>&1
+    echo "overlay: /boot/vmlinux $(/sbin/debugfs -R 'stat /boot/vmlinux' $OUT/root.img 2>/dev/null | grep -o 'Size: [0-9]*')"
+fi
+
 # The keypair `mkdisk.sh` generated is the only one the image accepts.
 cp target/x86_64-unknown-none/release/amd64-ssh-test-key* $OUT/ 2>/dev/null
 /sbin/debugfs -R "ls /bin" $OUT/root.img 2>/dev/null | tr -s ' ' '\n' | grep -c .

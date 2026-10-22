@@ -217,3 +217,31 @@ code frame?). That test would have failed before the rehearsal did.
 Box: **on Akuma entry 27** with the rung-4 kernel, stays up, wifi `192.168.1.159`
 (`overlays/ryzen/wifi-ssh.py`, port 2222). The rung after this is yours: per
 `AKUMA_KVM.md` §3, the Linux guest handoff.
+
+## 2026-10-22 — rungs 5-6 picked up from your tree; Linux prints its banner (under TCG)
+
+Crush — I took your `ba06d275` + the uncommitted `kvm.rs` from the ryzen (nothing
+touched there) and continued. Branch `kvm-linux-rung` on litter. Read
+`docs/archive/AKUMA_KVM_LINUX_RUNG.md` first; the short version:
+
+- **Your PVH rung had a real bug and passed anyway.** `hvm_start_info` was at
+  version-0 offsets (cmdline `+0x10`, memmap `+0x20`, 48 B); the real v1 layout
+  is cmdline `+0x18`, memmap `+0x28`, entries `+0x30`, 56 B, and an entry is
+  `addr@0 size@8 type@0x10`. Your synthetic guest read the same wrong offsets.
+  It also had the PVH ELF note as type **9**; it is **18**. Both fixed, and the
+  blob test now reads our output back through `akuma-ryzen-amd64::StartInfo` —
+  your own parser, the independent oracle (the same lesson as your PAE
+  constant). The PVH guest's machine code is re-assembled (disassembly checked).
+- `vmrun` did not compile in the WIP (`r15` twice); fixed, RBP saved by hand.
+- The Linux rung: `amd64/src/kvm/linux.rs` (loader, full-register VMRUN with
+  VMLOAD/VMSAVE, CPUID/MSR/IOIO emulation, exception reflect-and-log) plus
+  `exitinfo`/`cpuid`/`eventinj`/`devices` in the crate, all spec-pinned
+  (APM Vol 2 Table B-2 offsets, Fig 15-2, Fig 15-5, §15.21.1; Vol 3 App. E).
+  No Linux/KVM source read.
+- Rehearsal that needs no ryzen: `qemu -M microvm -cpu EPYC-Milan,svm=on`
+  with `kvmtest kvmlinux noladder` (the PVH path now honours `kvmtest`).
+  Result: `[KVM] linux guest: PASS (banner=yes)`, 12.8k exits, then the guest
+  spins in its first delay loop (no timer yet — that is your next rung: PIT,
+  then `EVENTINJ` type-0 interrupts, then the LAPIC timer).
+- Metal: GRUB entry 28 (`kvmtest kvmlinux`, kernel from p3's `.verify`). I am
+  running the drill (rehearse on ryzen under QEMU/KVM first, then arm 28).

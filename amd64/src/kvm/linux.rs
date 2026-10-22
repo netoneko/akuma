@@ -56,6 +56,11 @@ const RAM_ALIGN: u64 = 2 << 20;
 const MAX_EXITS: u64 = 4_000_000;
 /// The first this-many exits of each interesting kind are printed whole.
 const LOG_FIRST: u32 = 40;
+/// Wall-clock budget for the whole run, and for how long the console may stay
+/// silent once the banner has been seen. A guest that spins waiting for a timer
+/// nobody emulates must not hold the boot — least of all on metal.
+const RUN_BUDGET_US: u64 = 120_000_000;
+const QUIET_BUDGET_US: u64 = 20_000_000;
 /// ASID: unique among the rungs (ladder 1-13, two-level 14, pvh 15 under
 /// QEMU's 16); the first entry flushes, so it cannot see a previous rung's
 /// stale translations.
@@ -333,6 +338,8 @@ struct Platform {
     banner: usize,
     banner_seen: bool,
     tx_bytes: u64,
+    /// `uptime_us` at the last console byte.
+    last_tx_us: u64,
     /// Ports / MSRs answered by default, each logged the first time.
     seen_io: [u16; 32],
     n_io: usize,
@@ -351,6 +358,7 @@ impl Platform {
             banner: 0,
             banner_seen: false,
             tx_bytes: 0,
+            last_tx_us: 0,
             seen_io: [0; 32],
             n_io: 0,
             seen_msr: [0; 48],
@@ -362,6 +370,7 @@ impl Platform {
     /// the banner matcher.
     fn console(&mut self, b: u8) {
         self.tx_bytes += 1;
+        self.last_tx_us = crate::net::uptime_us();
         let one = [b];
         p(core::str::from_utf8(&one).unwrap_or("?"));
         if self.banner_seen {
@@ -658,6 +667,10 @@ pub fn run(nrips: bool) {
         v.set_asid(ASID);
         v.set_tlb_control(ctrl::TLB_FLUSH_ALL);
         v.set_np_enable(true);
+        // The host's IF — not the guest's — decides whether a physical interrupt
+        // is taken while the guest runs, so the host tick (scheduler, hardware
+        // watchdog) is never starved by a guest running with IF clear.
+        v.set_v_intr(ctrl::V_INTR_MASKING);
         v.set_n_cr3(npt.pml4.pa() as u64);
         let data = |base: u64| Seg { selector: 0x18, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base };
         v.set_seg(
@@ -730,9 +743,22 @@ pub fn run(nrips: bool) {
     let mut stopped = "exit budget spent";
     let mut fatal = false;
 
-    akuma_cpu::daif::mask_irq();
+    // IRQs on for the whole run: with V_INTR_MASKING the host IF at VMRUN gates
+    // physical interrupts, and a tick must reach the host.
+    akuma_cpu::daif::unmask_irq();
+    let started_us = crate::net::uptime_us();
+    plat.last_tx_us = started_us;
     'run: while exits < MAX_EXITS {
         exits += 1;
+        let now_us = crate::net::uptime_us();
+        if now_us.saturating_sub(started_us) > RUN_BUDGET_US {
+            stopped = "wall-clock budget spent";
+            break 'run;
+        }
+        if plat.banner_seen && now_us.saturating_sub(plat.last_tx_us) > QUIET_BUDGET_US {
+            stopped = "guest console quiet after the banner (waiting for a timer nobody emulates)";
+            break 'run;
+        }
         crumb(0x57);
         // SAFETY: the VMCB and the host save image are live frames this
         // function owns; SVM is enabled on this core (`enable_on_core`).
@@ -832,14 +858,10 @@ pub fn run(nrips: bool) {
                 };
                 break 'run;
             }
-            // A host interrupt or NMI arrived while the guest ran: let the host
-            // take it (a brief IRQ window), then resume.
-            ExitCode::Other(0x60 | 0x61) => {
-                n_irq += 1;
-                akuma_cpu::daif::unmask_irq();
-                core::hint::spin_loop();
-                akuma_cpu::daif::mask_irq();
-            }
+            // A host interrupt or NMI arrived while the guest ran. The host's IF
+            // is set, so it was taken at the `stgi` that ended the exit; there
+            // is nothing to do but resume (and count it).
+            ExitCode::Other(0x60 | 0x61) => n_irq += 1,
             ExitCode::Ud | ExitCode::Gp | ExitCode::Pf | ExitCode::Other(0x48) => {
                 n_exc += 1;
                 let code = v.exitcode();
@@ -920,7 +942,6 @@ pub fn run(nrips: bool) {
             }
         }
     }
-    akuma_cpu::daif::unmask_irq();
     crumb(0x59);
 
     let v = Vmcb::new(vmcb_f.bytes_mut());

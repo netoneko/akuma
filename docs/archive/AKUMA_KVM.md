@@ -112,7 +112,15 @@ Read downwards; the sections below are the reference record.
    │   translations. The NPT leaf bit table (Vol 2 §5.3 Figs 519–529) and
    │   the NPF error-code bits (§15.25.6 p. 573) are transcribed and
    │   pinned for exactly this rung's failure mode (ASID 14; ladder 1–13).
-   ▼   (next: QEMU rehearsal + metal, then the Linux rung)
+   ▼   (metal PASS 2026-10-22; the Linux rung follows)
+ [10-22] ═══ RUNGS 5-6: PVH HANDOFF, THEN A REAL LINUX ═══  "banner under TCG"
+   │
+   ▼   Rung 5 (crush) enters a synthetic guest the PVH way; rung 6 loads the
+   │   Firecracker CI vmlinux and runs it with CPUID/MSR/port-I/O emulated —
+   │   `Linux version 6.1.128` arrives on the emulated COM1 and the guest runs
+   │   on to its first timer wait. Found on the way: the PVH note type (9, is
+   │   18), and a start_info layout the rung-5 guest agreed with and Linux did
+   │   not. Metal: pending. [`AKUMA_KVM_LINUX_RUNG.md`](AKUMA_KVM_LINUX_RUNG.md)
 ```
 
 ---
