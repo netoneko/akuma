@@ -93,6 +93,80 @@ runs, IRQ0 is polled once per exit, and the host tick is the only exit a busy gu
 is guaranteed to produce, so a guest that spins with `IF` set sees timer
 interrupts at the host-tick rate, not the PIT's. Idle (HLT) is exact.
 
+## Rung 8: a virtio-blk root (2026-10-22)
+
+The guest boots from a virtio-blk disk, mounts its ext2 root, runs busybox `init`
+and reboots. Four new pure, host-tested models in `akuma-svm-amd64`, plus the
+wiring in `kvm/linux.rs`:
+
+* `mmio` — decodes the `MOV` a guest uses to touch a device (`88/89/8A/8B`,
+  `C6/C7`, `0F B6/B7/BE/BF`, `63`; prefixes, REX, ModRM/SIB/disp lengths), because
+  a nested page fault names the address and nothing else. 33 test vectors were
+  **assembled by clang**, not hand-written. Unknown instructions stop the run.
+* `virtio` — a virtio-mmio **version 2** block device: register file, one split
+  virtqueue, `IN/OUT/FLUSH/GET_ID`, status/feature negotiation (`VERSION_1`,
+  `SEG_MAX`, `FLUSH` offered), bounds/alignment/direction checks, a hostile-ring
+  guard (`DEVICE_NEEDS_RESET`). Over two traits, `GuestMem` and `Disk`.
+* `acpi` — RSDP v2, XSDT, FADT (rev 6), MADT, DSDT with one
+  `Device(VIO0) { _HID "LNRO0005", _UID, _CRS }`, plus `Pm1` (the PM1a status/
+  enable/control registers the FADT names). Read back in a test by
+  `akuma-ryzen-amd64`'s table walker, the code that parses real firmware.
+* `uart` gains the THRE interrupt (IRQ4); `pit`/`pic` unchanged.
+
+**Why ACPI.** The Firecracker CI kernel has `CONFIG_VIRTIO_MMIO=y` and no
+`CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES` (read from its embedded `IKCFG`), so
+`virtio_mmio.device=` is silently ignored; with no virtio-PCI either, a device
+is discoverable only as an ACPI `LNRO0005` node. `rsdp_paddr` in `start_info`
+carries the RSDP (the kernel honours it; real VMMs leave it 0 and the BIOS area
+is scanned instead).
+
+**The trap: do not set FADT `HW_REDUCED_ACPI`.** First version did, and the
+guest's own log said what followed: `nr_irqs: 8, preallocated irqs: 0` (a
+non-ACPI boot says `24`/`16`). A hardware-reduced platform has no legacy PIC or
+PIT by definition, so Linux drops both, never creates IRQ 5, and the device's
+interrupt comes back disabled: `virtio-mmio LNRO0005:00: error -ENXIO: IRQ index
+0 not found` (after `virtio_blk` had already probed — 23 emulated register
+accesses). Setting `IAPC_BOOT_ARCH.LEGACY_DEVICES` does not help; the reduced
+flag wins. The FADT is full-hardware with a PM1 block (ports `0x600-0x605`,
+`SCI_EN` always set, no `SMI_CMD` — zero means ACPI mode is already on), no PM
+timer, no GPE.
+
+Two more guest-visible traps, both from the log:
+
+* **8250 transmit stalls without a THRE interrupt.** Early `printk` polls, but
+  once the console driver takes over a `16450` waits for an interrupt after every
+  character. Symptom: init's output stops after one byte (`G`). The UART model
+  now raises THRE on IER enable and on each character, clears it on an `IIR`
+  read, and gates it with `OUT2`.
+* **`#UD` on `RDPMC` at reboot.** The only perf event is the NMI watchdog;
+  `x86_pmu_del` runs `RDPMC` in `perf_reboot`. `nmi_watchdog=0` removes it.
+  (Why `RDPMC` itself faults in this guest is not understood.)
+
+**Backing store: the existing driver.** `HostDisk` is the machine's *second*
+`akuma_virtio::block` device (`read_bytes_at`/`write_bytes_at`; the host's own
+`vda` is never offered), else a preallocated file `/boot/guest-root.img` through
+`akuma_vfs_glue`. Akuma's virtio-blk is the driver role; the new `virtio` module
+is the device role, which nothing in the tree had. The ryzen's NVMe driver holds
+a single partition window, so a raw Gentoo partition needs a second window in
+`nvme.rs` first (open).
+
+**Verified (QEMU TCG), both directions, against independent tools:**
+
+| check | result |
+|---|---|
+| guest `md5sum /bin/busybox` (1.1 MB read through the device) | `ebce4301…` = the host's `md5` of the same file |
+| guest writes a 256 KiB pattern file, `sync` | host `debugfs dump` of the image: identical md5 (`71277886…`), `e2fsck -fn` clean |
+| boot | `[vda] 32768 512-byte logical blocks`, `VFS: Mounted root (ext2 filesystem)`, `Run /sbin/init`, init output, `reboot -f`, clean stop; 98 882 exits, 234 interrupts, 126 MMIO accesses |
+
+Tooling (kept in the repo, not the scratchpad): `scripts/kvm/guest_rootfs.sh`
+builds the 16 MiB ext2 image from a static busybox with `mke2fs -d` + `debugfs
+mknod`; `scripts/kvm/linux_rehearse.sh` runs the QEMU rehearsal and, with a
+guest image, requires the guest's `GUEST-ROOTFS-DONE`.
+
+**Not yet:** nested-SVM and metal runs of rungs 7-8; a raw partition as the
+backing store (NVMe second window); the LAPIC timer; queue interrupts are edge-
+raised once per `process` (fine for one queue, revisit with more devices).
+
 ## Bugs found on the way (all in code that was already "green")
 
 | symptom | cause | how it hid |
@@ -140,11 +214,9 @@ TCG could not show it because its host timer was already running.
 
 ## Still open
 
-- A root filesystem: the guest now panics at `VFS: Unable to mount root fs`. A
-  virtio-blk device backed by a host partition (the Gentoo one on ryzen) is the
-  natural next rung; it also exercises `HLT` idle.
-- LAPIC timer (the guest is told `nolapic` today), nested-SVM and metal runs of
-  rung 7.
+- Rungs 7-8 on nested SVM (`qemu.sh 28`) and metal; then the Gentoo partition as
+  the backing store (needs a second NVMe window in `nvme.rs`, or a file on p3).
+- LAPIC timer (the guest is told `nolapic` today).
 - p3's `e2fsck -fn` reports a corrupted directory in crush's cargo cache
   (`/root/ktarget/.../build/akuma-amd64/<hash>/out`, last written Oct 18) — not
   caused by this work, not repaired; `rm -r` that directory from Pop, then `e2fsck`.

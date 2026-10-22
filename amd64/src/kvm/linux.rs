@@ -37,18 +37,38 @@ use super::{crumb, dec, dump_exit, dump_state, enable_on_core, hx, image_pa, nex
 use crate::phys::FreshFrame;
 use akuma_svm_amd64 as svm;
 use akuma_svm_amd64::devices::{MsrStore, Uart};
+use akuma_svm_amd64::mmio;
 use akuma_svm_amd64::pic::PicPair;
 use akuma_svm_amd64::pit::{self, Pit};
+use akuma_svm_amd64::virtio::{self, Disk, GuestMem, MmioBlk};
 use akuma_svm_amd64::{ctrl, elf, eventinj, excp, exitinfo, intr0, intr1, pvh, save, tables, ExitCode, Seg, SegAttr, Vmcb};
 use core::arch::x86_64::__cpuid_count;
 
 /// Where the guest kernel is read from (an uncompressed, PVH-capable ELF —
 /// Firecracker's CI `vmlinux-6.1.128` is one).
 const LINUX_PATH: &str = "/boot/vmlinux";
-/// What the guest is told. No APIC, no ACPI, no SMP, no PCI: none of them is
-/// emulated; and the console is the one device that is.
+/// What the guest is told. No APIC, no SMP, no PCI: none of them is emulated;
+/// the console, the PIT/PIC and (with a disk) one virtio-blk are.
 const LINUX_CMDLINE: &str =
-    "console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr noapic nolapic nosmp noacpi pci=off mitigations=off panic=-1";
+    "console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr noapic nolapic nosmp nmi_watchdog=0 pci=off mitigations=off panic=-1";
+/// Without a disk there is nothing for ACPI to describe.
+const NO_DISK_ARGS: &str = " noacpi";
+/// Where the guest's virtio-blk device sits, and the PIC line it raises. The
+/// window is above RAM, so the NPT leaves it unmapped and every access is a
+/// nested page fault the run loop emulates (`akuma_svm_amd64::{mmio,virtio}`).
+const VIRTIO_BASE: u64 = 0xD000_0000;
+const VIRTIO_LEN: u64 = 0x1000;
+const VIRTIO_IRQ: u8 = 5;
+/// COM1's line on the PIC.
+const UART_IRQ: u8 = 4;
+/// Appended to the guest's command line when it has a disk.
+/// The device itself is announced through ACPI (`akuma_svm_amd64::acpi`): the
+/// guest kernel is built without `VIRTIO_MMIO_CMDLINE_DEVICES`.
+const ROOT_ARGS: &str = " root=/dev/vda rw rootwait";
+/// A disk image on the host filesystem, used when the machine has no second
+/// virtio-blk device to give the guest.
+const DISK_IMAGE_PATH: &str = "/boot/guest-root.img";
+
 /// Guest RAM: contiguous host frames mapped 1:1-by-offset through 2 MiB NPT
 /// leaves. The kernel's text loads at 16 MiB and runs to ~40 MiB; the rest is
 /// what it has to play with.
@@ -215,6 +235,115 @@ impl Ram {
     }
 }
 
+impl GuestMem for Ram {
+    fn read(&self, gpa: u64, dst: &mut [u8]) -> bool {
+        self.copy_out(gpa, dst)
+    }
+
+    fn write(&self, gpa: u64, src: &[u8]) -> bool {
+        Self::write(self, gpa, src)
+    }
+}
+
+/// What backs the guest's disk. The host's own boot disk (`vda`) is never
+/// offered: a guest with write access to the host's root is not isolated.
+#[derive(Clone, Copy)]
+enum HostDisk {
+    /// Device `idx` of `akuma_virtio::block`: the machine's second virtio-blk,
+    /// driven by the same driver the host's root uses.
+    Virtio(usize),
+    /// A file on the host's filesystem, preallocated.
+    File,
+}
+
+impl HostDisk {
+    /// The disk to give the guest, if the machine has one.
+    fn pick() -> Option<Self> {
+        if akuma_virtio::block::device_count() > 1 && akuma_virtio::block::device_name(1).is_some() {
+            return Some(Self::Virtio(1));
+        }
+        akuma_vfs_glue::file_size(DISK_IMAGE_PATH).ok().filter(|&n| n >= virtio::SECTOR).map(|_| Self::File)
+    }
+
+    const fn what(self) -> &'static str {
+        match self {
+            Self::Virtio(_) => "second virtio-blk device",
+            Self::File => DISK_IMAGE_PATH,
+        }
+    }
+}
+
+impl Disk for HostDisk {
+    fn sectors(&self) -> u64 {
+        match *self {
+            Self::Virtio(i) => akuma_virtio::block::with_device_at(i, |d| d.capacity_sectors()).unwrap_or(0),
+            Self::File => akuma_vfs_glue::file_size(DISK_IMAGE_PATH).map_or(0, |n| n / virtio::SECTOR),
+        }
+    }
+
+    fn read(&mut self, offset: u64, dst: &mut [u8]) -> bool {
+        match *self {
+            Self::Virtio(i) => akuma_virtio::block::read_bytes_at(i, offset, dst).is_ok(),
+            Self::File => akuma_vfs_glue::read_at(DISK_IMAGE_PATH, offset as usize, dst).is_ok_and(|n| n == dst.len()),
+        }
+    }
+
+    fn write(&mut self, offset: u64, src: &[u8]) -> bool {
+        match *self {
+            Self::Virtio(i) => akuma_virtio::block::write_bytes_at(i, offset, src).is_ok(),
+            Self::File => akuma_vfs_glue::write_at(DISK_IMAGE_PATH, offset as usize, src).is_ok_and(|n| n == src.len()),
+        }
+    }
+
+    fn flush(&mut self) -> bool {
+        true
+    }
+}
+
+/// General register `n` in the instruction encoding's numbering (RAX, RCX, RDX,
+/// RBX, RSP, RBP, RSI, RDI, R8-R15): the VMCB holds RAX and RSP, `regs` the rest.
+fn get_reg(v: &Vmcb<'_>, r: &GuestRegs, n: u8) -> u64 {
+    match n {
+        0 => v.rax(),
+        1 => r.rcx,
+        2 => r.rdx,
+        3 => r.rbx,
+        4 => v.rsp(),
+        5 => r.rbp,
+        6 => r.rsi,
+        7 => r.rdi,
+        8 => r.r8,
+        9 => r.r9,
+        10 => r.r10,
+        11 => r.r11,
+        12 => r.r12,
+        13 => r.r13,
+        14 => r.r14,
+        _ => r.r15,
+    }
+}
+
+fn set_reg(v: &mut Vmcb<'_>, r: &mut GuestRegs, n: u8, val: u64) {
+    match n {
+        0 => v.set_rax(val),
+        1 => r.rcx = val,
+        2 => r.rdx = val,
+        3 => r.rbx = val,
+        4 => v.set_rsp(val),
+        5 => r.rbp = val,
+        6 => r.rsi = val,
+        7 => r.rdi = val,
+        8 => r.r8 = val,
+        9 => r.r9 = val,
+        10 => r.r10 = val,
+        11 => r.r11 = val,
+        12 => r.r12 = val,
+        13 => r.r13 = val,
+        14 => r.r14 = val,
+        _ => r.r15 = val,
+    }
+}
+
 impl Drop for Ram {
     fn drop(&mut self) {
         akuma_pmm::free_pages_contiguous(self.alloc_pa, self.alloc_pages);
@@ -338,6 +467,8 @@ struct Platform {
     pit: Pit,
     /// The two 8259s: with no APIC they are the whole interrupt fabric.
     pic: PicPair,
+    /// The ACPI PM1 registers the FADT points at.
+    pm1: svm::acpi::Pm1,
     msrs: MsrStore<48>,
     cmos_index: u8,
     /// How much of "Linux version" the console has spelled so far.
@@ -363,6 +494,7 @@ impl Platform {
             uart: Uart::new(),
             pit: Pit::new(),
             pic: PicPair::new(),
+            pm1: svm::acpi::Pm1::new(),
             msrs: MsrStore::new(),
             cmos_index: 0,
             banner: 0,
@@ -413,14 +545,31 @@ impl Platform {
         p(" (default)\n");
     }
 
-    fn io_in(&mut self, port: u16, now: u64) -> u32 {
+    /// Present the UART's interrupt line to the PIC (IRQ4). The 8259 is
+    /// edge-triggered and its IRR is sticky, so raising while the level stays
+    /// high is the same as raising once.
+    fn sync_uart_irq(&mut self) {
+        if self.uart.irq_level() {
+            self.pic.raise(UART_IRQ);
+        }
+    }
+
+    fn io_in(&mut self, port: u16, size: u8, now: u64) -> u32 {
         match port {
-            0x3F8..=0x3FF => u32::from(self.uart.read((port - 0x3F8) as u8)),
+            0x3F8..=0x3FF => {
+                let v = u32::from(self.uart.read_clearing((port - 0x3F8) as u8));
+                self.sync_uart_irq();
+                v
+            }
             // CMOS data port: every register reads zero (status A's
             // update-in-progress bit stays clear, so a wait-for-RTC loop ends).
             0x71 => 0,
             // PIC.
             0x20 | 0x21 | 0xA0 | 0xA1 => u32::from(self.pic.read(port).unwrap_or(0xFF)),
+            // ACPI PM1 block (status/enable/control) and the PIC trigger mode
+            // registers the ACPI driver reads and writes.
+            p if svm::acpi::Pm1::owns(p) => self.pm1.read(p, size),
+            0x4D0 | 0x4D1 => 0,
             // PIT, and system control port B (channel 2's gate and output).
             0x40..=0x43 => u32::from(self.pit.read((port - 0x40) as u8, now)),
             0x61 => u32::from(self.pit.port_b_read(now)),
@@ -436,12 +585,13 @@ impl Platform {
         }
     }
 
-    fn io_out(&mut self, port: u16, val: u32, now: u64) {
+    fn io_out(&mut self, port: u16, size: u8, val: u32, now: u64) {
         match port {
             0x3F8..=0x3FF => {
                 if let Some(c) = self.uart.write((port - 0x3F8) as u8, val as u8) {
                     self.console(c);
                 }
+                self.sync_uart_irq();
             }
             0x70 => self.cmos_index = val as u8 & 0x7F,
             // The keyboard controller's CPU-reset pulse: how a PC reboots, and
@@ -450,6 +600,8 @@ impl Platform {
             0x20 | 0x21 | 0xA0 | 0xA1 => {
                 self.pic.write(port, val as u8);
             }
+            p if svm::acpi::Pm1::owns(p) => self.pm1.write(p, size, val),
+            0x4D0 | 0x4D1 => {}
             0x40..=0x43 => self.pit.write((port - 0x40) as u8, val as u8, now),
             0x61 => self.pit.port_b_write(val as u8, now),
             // POST, CMOS data, PCI address/data, VGA: accepted.
@@ -580,6 +732,27 @@ fn guest_code(ram: &Ram, v: &Vmcb<'_>, va: u64) -> Option<[u8; 16]> {
     ram.copy_out(gpa, &mut code).then_some(code)
 }
 
+/// A guest store to the virtio window: apply it, and when it rang the doorbell,
+/// serve the queue and raise the interrupt line.
+#[allow(clippy::too_many_arguments)]
+fn mmio_write(
+    dev: &mut MmioBlk,
+    disk: &mut HostDisk,
+    ram: &Ram,
+    bounce: &mut [u8],
+    pic: &mut PicPair,
+    off: u64,
+    size: u8,
+    val: u64,
+) {
+    if dev.write(off, size, val) == virtio::Write::Notify(0) {
+        let done = dev.process(ram, disk, bounce);
+        if done.interrupt {
+            pic.raise(VIRTIO_IRQ);
+        }
+    }
+}
+
 /// One serial line: the guest's instruction bytes at `va`, for a post-mortem.
 fn dump_code(ram: &Ram, v: &Vmcb<'_>, va: u64) {
     match guest_code(ram, v, va) {
@@ -605,10 +778,12 @@ fn dump_code(ram: &Ram, v: &Vmcb<'_>, va: u64) {
 /// mounted (`kvm::late`).
 /// [`LINUX_CMDLINE`] followed by ` tsc_early_khz=<khz>` (omitted when the host
 /// has no calibrated TSC), assembled in `buf`.
-fn cmdline_with_tsc(buf: &mut [u8; 320], khz: u64) -> &str {
+fn cmdline_with_tsc<'a>(buf: &'a mut [u8; 400], khz: u64, extra: &str) -> &'a str {
     let base = LINUX_CMDLINE.as_bytes();
     buf[..base.len()].copy_from_slice(base);
     let mut n = base.len();
+    buf[n..n + extra.len()].copy_from_slice(extra.as_bytes());
+    n += extra.len();
     if khz != 0 {
         let key = b" tsc_early_khz=";
         buf[n..n + key.len()].copy_from_slice(key);
@@ -664,24 +839,60 @@ pub fn run(nrips: bool) {
 
     // The handoff: cmdline, memmap and start_info under the top of RAM, the
     // memmap's one RAM entry stopping short of them.
-    let l = pvh::plan(RAM_BYTES, 0, RAM_BYTES - 0x3000);
+    // With a disk, one more page under the handoff pages holds the ACPI tables
+    // and the memory map reports it (type 3) instead of as RAM.
+    let disk = HostDisk::pick();
+    let acpi_gpa = RAM_BYTES - 0x4000;
+    let l = pvh::plan(RAM_BYTES, 0, if disk.is_some() { acpi_gpa } else { RAM_BYTES - 0x3000 });
     scratch.bytes_mut().fill(0);
     // The guest is told the host's TSC rate rather than left to calibrate it
     // through trapped port reads: a poll loop whose every iteration is a
     // VM exit measures the exits, not the PIT (`tsc_early_khz` is a documented
     // kernel parameter). Built on the stack: no allocation.
-    let mut cmd = [0u8; 320];
-    let cmdline = cmdline_with_tsc(&mut cmd, crate::lapic::tsc_hz() / 1000);
+    let mut cmd = [0u8; 400];
+    let cmdline = cmdline_with_tsc(&mut cmd, crate::lapic::tsc_hz() / 1000, if disk.is_some() { ROOT_ARGS } else { NO_DISK_ARGS });
+    match disk {
+        Some(d) => {
+            p("[KVM] linux: guest disk: ");
+            p(d.what());
+            p(", ");
+            dec(d.sectors() >> 11);
+            p(" MiB\n");
+        }
+        None => p("[KVM] linux: no guest disk (no second virtio-blk, no /boot/guest-root.img)\n"),
+    }
     if !pvh::write_cmdline(scratch.bytes_mut(), cmdline) || !ram.write(l.cmdline_gpa, scratch.bytes_mut()) {
         p("[KVM] linux: cmdline handoff failed\n");
         return;
     }
+    // The memory map and start_info are built together: with a disk the ACPI
+    // entry and `rsdp_paddr` go into them, and the tables into their own page.
+    let mut start_page = FreshFrame::alloc_zeroed();
+    let Some(start_page) = start_page.as_mut() else {
+        p("[KVM] linux: no frame for start_info\n");
+        return;
+    };
     scratch.bytes_mut().fill(0);
     pvh::write_memmap(scratch.bytes_mut(), &l);
+    pvh::write_start(start_page.bytes_mut(), &l);
+    if disk.is_some() {
+        let dev = svm::acpi::VirtioMmio { base: VIRTIO_BASE as u32, len: VIRTIO_LEN as u32, irq: u32::from(VIRTIO_IRQ) };
+        let Some(mut acpi_page) = FreshFrame::alloc_zeroed() else {
+            p("[KVM] linux: no frame for the ACPI tables\n");
+            return;
+        };
+        let Some(rsdp) = svm::acpi::build(acpi_page.bytes_mut(), acpi_gpa, &dev) else {
+            p("[KVM] linux: ACPI tables do not fit\n");
+            return;
+        };
+        pvh::add_acpi(start_page.bytes_mut(), scratch.bytes_mut(), rsdp, acpi_gpa, 0x1000);
+        if !ram.write(acpi_gpa, acpi_page.bytes_mut()) {
+            p("[KVM] linux: ACPI handoff failed\n");
+            return;
+        }
+    }
     let memmap_ok = ram.write(l.memmap_gpa, scratch.bytes_mut());
-    scratch.bytes_mut().fill(0);
-    pvh::write_start(scratch.bytes_mut(), &l);
-    if !memmap_ok || !ram.write(l.start_gpa, scratch.bytes_mut()) {
+    if !memmap_ok || !ram.write(l.start_gpa, start_page.bytes_mut()) {
         p("[KVM] linux: handoff pages failed\n");
         return;
     }
@@ -789,7 +1000,8 @@ pub fn run(nrips: bool) {
     let (mut exits, mut n_cpuid, mut n_msr, mut n_io, mut n_irq, mut n_exc) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut stopped = "exit budget spent";
     let mut fatal = false;
-    let (mut n_inj, mut n_hlt) = (0u64, 0u64);
+    let (mut n_inj, mut n_hlt, mut n_mmio) = (0u64, 0u64, 0u64);
+    let mut blk = disk.map(|d| (MmioBlk::new(d.sectors()), d));
     if crate::lapic::tsc_uptime_us().is_none() {
         p("[KVM] linux: warning: host uptime is 10 ms ticks; PIT timing will be coarse\n");
     }
@@ -923,11 +1135,11 @@ pub fn run(nrips: bool) {
                     break 'run;
                 }
                 if io.is_in {
-                    let val = u64::from(plat.io_in(io.port, pit::ticks_from_us(crate::net::uptime_us()))) & io.mask();
+                    let val = u64::from(plat.io_in(io.port, io.size, pit::ticks_from_us(crate::net::uptime_us()))) & io.mask();
                     let rax = v.rax();
                     v.set_rax(if io.size == 4 { val } else { (rax & !io.mask()) | val });
                 } else {
-                    plat.io_out(io.port, (v.rax() & io.mask()) as u32, pit::ticks_from_us(crate::net::uptime_us()));
+                    plat.io_out(io.port, io.size, (v.rax() & io.mask()) as u32, pit::ticks_from_us(crate::net::uptime_us()));
                 }
                 if plat.reset_requested {
                     v.set_rip(v.exitinfo2());
@@ -1013,6 +1225,39 @@ pub fn run(nrips: bool) {
                 }
                 v.set_eventinj(eventinj::exception(vector, err));
             }
+            ExitCode::Npf if blk.is_some() && (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_LEN).contains(&v.exitinfo2()) => {
+                n_mmio += 1;
+                let off = v.exitinfo2() - VIRTIO_BASE;
+                let access = guest_code(&ram, &v, v.rip()).and_then(|c| mmio::decode(&c));
+                let Some(a) = access else {
+                    stopped = "guest touched the virtio window with an instruction the MMIO decoder does not know";
+                    fatal = true;
+                    p("\n[KVM] linux: ");
+                    p(stopped);
+                    p(" rip=");
+                    hx(v.rip(), 16);
+                    p("\n");
+                    dump_code(&ram, &v, v.rip());
+                    break 'run;
+                };
+                let (dev, hostdisk) = blk.as_mut().expect("checked by the guard");
+                match a.kind {
+                    mmio::Kind::Load { reg, .. } => {
+                        let val = dev.read(off, a.size);
+                        let old = get_reg(&v, &regs, reg);
+                        set_reg(&mut v, &mut regs, reg, a.load_result(old, val));
+                    }
+                    mmio::Kind::Store { reg, .. } => {
+                        let val = a.store_value(get_reg(&v, &regs, reg));
+                        mmio_write(dev, hostdisk, &ram, scratch.bytes_mut(), &mut plat.pic, off, a.size, val);
+                    }
+                    mmio::Kind::StoreImm(_) => {
+                        let val = a.store_value(0);
+                        mmio_write(dev, hostdisk, &ram, scratch.bytes_mut(), &mut plat.pic, off, a.size, val);
+                    }
+                }
+                v.set_rip(v.rip() + u64::from(a.len));
+            }
             ExitCode::Npf => {
                 stopped = "nested page fault (guest touched unmapped guest-physical memory)";
                 fatal = true;
@@ -1069,6 +1314,8 @@ pub fn run(nrips: bool) {
     dec(n_inj);
     p(" hlt=");
     dec(n_hlt);
+    p(" mmio=");
+    dec(n_mmio);
     p(" console_bytes=");
     dec(plat.tx_bytes);
     p(" rip=");

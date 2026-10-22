@@ -38,8 +38,11 @@
 //! [`save`] are **relative to the save-area start** (`0400h` in the page);
 //! [`ctrl`] offsets are from the page base.
 
+pub mod acpi;
+pub mod mmio;
 pub mod pic;
 pub mod pit;
+pub mod virtio;
 
 /// Page size of a VMCB (and of the host save area).
 pub const VMCB_SIZE: usize = 4096;
@@ -1487,6 +1490,8 @@ pub mod devices {
         scr: u8,
         dll: u8,
         dlm: u8,
+        /// The transmitter-holding-register-empty interrupt is pending.
+        thre: bool,
     }
 
     /// `LSR` read as always: transmit-holding-register empty (bit 5) and
@@ -1499,7 +1504,7 @@ pub mod devices {
         /// A UART in its reset state.
         #[must_use]
         pub const fn new() -> Self {
-            Self { ier: 0, lcr: 0, mcr: 0, scr: 0, dll: 0, dlm: 0 }
+            Self { ier: 0, lcr: 0, mcr: 0, scr: 0, dll: 0, dlm: 0, thre: false }
         }
 
         const fn dlab(&self) -> bool {
@@ -1512,7 +1517,7 @@ pub mod devices {
             match reg & 7 {
                 0 => if self.dlab() { self.dll } else { 0 },
                 1 => if self.dlab() { self.dlm } else { self.ier },
-                2 => IIR_NONE,
+                2 => self.iir(),
                 3 => self.lcr,
                 4 => self.mcr,
                 5 => LSR_READY,
@@ -1534,6 +1539,29 @@ pub mod devices {
             }
         }
 
+        /// `IIR` as the guest would read it: `0x02` (THRE) while that interrupt is
+        /// pending and enabled, else [`IIR_NONE`].
+        const fn iir(&self) -> u8 {
+            if self.thre && self.ier & 0x02 != 0 { 0x02 } else { IIR_NONE }
+        }
+
+        /// Read register `reg` with a real read's side effect: reading `IIR`
+        /// while THRE is the source clears it (16550 datasheet).
+        pub fn read_clearing(&mut self, reg: u8) -> u8 {
+            let v = self.read(reg);
+            if reg & 7 == 2 && v == 0x02 {
+                self.thre = false;
+            }
+            v
+        }
+
+        /// Whether the interrupt line is high: THRE pending and enabled, gated by
+        /// `OUT2` in `MCR` as on a PC.
+        #[must_use]
+        pub const fn irq_level(&self) -> bool {
+            self.thre && self.ier & 0x02 != 0 && self.mcr & 0x08 != 0
+        }
+
         /// Write register `reg`. `Some(byte)` when this write transmitted a
         /// character (the transmit register, divisor latch closed).
         pub fn write(&mut self, reg: u8, v: u8) -> Option<u8> {
@@ -1542,6 +1570,8 @@ pub mod devices {
                     if self.dlab() {
                         self.dll = v;
                     } else {
+                        // The holding register empties at once: THRE re-arms.
+                        self.thre = true;
                         // In loopback the character never leaves the chip.
                         return if self.mcr & 0x10 != 0 { None } else { Some(v) };
                     }
@@ -1550,7 +1580,13 @@ pub mod devices {
                     if self.dlab() {
                         self.dlm = v;
                     } else {
+                        let was = self.ier;
                         self.ier = v & 0x0F;
+                        // Enabling THRE while the holding register is empty
+                        // raises it at once.
+                        if self.ier & 0x02 != 0 && was & 0x02 == 0 {
+                            self.thre = true;
+                        }
                     }
                 }
                 3 => self.lcr = v,
@@ -1878,6 +1914,22 @@ pub mod pvh {
         wr64(buf, E_SIZE, l.ram_len);
         wr32(buf, E_TYPE, MEMMAP_RAM);
         wr32(buf, E_RESERVED, 0);
+    }
+
+    /// `hvm_memmap_table_entry.type` = ACPI tables (reclaimable).
+    pub const MEMMAP_ACPI: u32 = 3;
+
+    /// Add an ACPI-tables entry `[gpa, gpa + len)` as entry 1 of the memory map.
+    ///
+    /// Also points `start_buf`'s `rsdp_paddr` at `rsdp_gpa`; the start_info then
+    /// reports two entries. Entry 0 ([`write_memmap`]'s RAM) must not overlap it.
+    pub fn add_acpi(start_buf: &mut [u8], memmap_buf: &mut [u8], rsdp_gpa: u64, gpa: u64, len: u64) {
+        wr64(memmap_buf, MEMMAP_ENTRY_SIZE + E_ADDR, gpa);
+        wr64(memmap_buf, MEMMAP_ENTRY_SIZE + E_SIZE, len);
+        wr32(memmap_buf, MEMMAP_ENTRY_SIZE + E_TYPE, MEMMAP_ACPI);
+        wr32(memmap_buf, MEMMAP_ENTRY_SIZE + E_RESERVED, 0);
+        wr64(start_buf, F_RSDP, rsdp_gpa);
+        wr32(start_buf, F_ENTRIES, 2);
     }
 
     /// Write the NUL-terminated command line into the `cmdline_gpa` page;
@@ -2875,6 +2927,41 @@ mod tests {
         assert_eq!(u.write(0, b'!'), None);
     }
 
+    /// The transmit-empty interrupt an interrupt-driven 8250 driver lives on:
+    /// raised by enabling it, re-armed by each character, cleared by reading
+    /// `IIR`, gated by `OUT2`.
+    #[test]
+    fn uart_thre_interrupt_follows_the_datasheet() {
+        let mut u = devices::Uart::new();
+        u.write(4, 0x08); // OUT2
+        assert!(!u.irq_level());
+        u.write(1, 0x02); // ETBEI
+        assert!(u.irq_level());
+        assert_eq!(u.read(2), 0x02, "a peek does not clear");
+        assert_eq!(u.read_clearing(2), 0x02);
+        assert!(!u.irq_level());
+        assert_eq!(u.read_clearing(2), 0x01, "nothing pending now");
+        // Each character sent empties the holding register again.
+        u.write(0, b'a');
+        assert!(u.irq_level());
+        assert_eq!(u.read_clearing(2), 0x02);
+        // Without OUT2 the line stays low though the source is pending.
+        u.write(4, 0);
+        u.write(0, b'b');
+        assert!(!u.irq_level());
+        assert_eq!(u.read(2), 0x02);
+        // Disabling the source hides it.
+        u.write(1, 0x00);
+        assert_eq!(u.read(2), 0x01);
+        // DLAB writes to register 0 are the divisor, not a character.
+        u.write(4, 0x08);
+        u.write(1, 0x02);
+        u.read_clearing(2);
+        u.write(3, 0x80);
+        u.write(0, 0x01);
+        assert!(!u.irq_level());
+    }
+
     #[test]
     fn msr_store_remembers_until_full() {
         let mut m = devices::MsrStore::<2>::new();
@@ -3005,5 +3092,63 @@ mod tests {
         assert!(e.is_ram());
         let mut buf = [0u8; 128];
         assert_eq!(si.cmdline(&g, &mut buf), Some("console=ttyS0 earlyprintk=serial,ttyS0"));
+    }
+
+    /// The ACPI page, read back with the walker the host kernel uses on real
+    /// firmware tables (`akuma-ryzen-amd64`): RSDP bytes -> XSDT -> FADT -> DSDT,
+    /// and the start_info + memory map that announce it.
+    #[test]
+    fn acpi_tables_are_found_by_the_kernels_own_table_walker() {
+        use akuma_ryzen_amd64::acpi::{dsdt, find_table, rsdp_from_bytes};
+        use akuma_ryzen_amd64::{PhysMem, StartInfo};
+
+        const TOP: u64 = 0x0800_0000;
+        struct Guest {
+            pages: [(u64, [u8; 4096]); 4],
+        }
+        impl PhysMem for Guest {
+            fn read(&self, pa: u64, buf: &mut [u8]) -> bool {
+                self.pages.iter().any(|(base, bytes)| {
+                    let ok = pa >= *base && pa + buf.len() as u64 <= base + 4096;
+                    if ok {
+                        let at = (pa - base) as usize;
+                        buf.copy_from_slice(&bytes[at..at + buf.len()]);
+                    }
+                    ok
+                })
+            }
+        }
+        let l = pvh::plan(TOP, 0, TOP - 0x4000);
+        let acpi_gpa = TOP - 0x4000;
+        let mut g = Guest {
+            pages: [(l.start_gpa, [0; 4096]), (l.memmap_gpa, [0; 4096]), (l.cmdline_gpa, [0; 4096]), (acpi_gpa, [0; 4096])],
+        };
+        let dev = acpi::VirtioMmio { base: 0xD000_0000, len: 0x1000, irq: 5 };
+        let rsdp_gpa = acpi::build(&mut g.pages[3].1, acpi_gpa, &dev).unwrap();
+        pvh::write_start(&mut g.pages[0].1, &l);
+        pvh::write_memmap(&mut g.pages[1].1, &l);
+        let (a, b) = g.pages.split_at_mut(1);
+        pvh::add_acpi(&mut a[0].1, &mut b[0].1, rsdp_gpa, acpi_gpa, 0x1000);
+
+        let si = StartInfo::parse(&g, l.start_gpa).expect("start_info");
+        assert_eq!(si.rsdp_paddr, rsdp_gpa);
+        assert_eq!(si.memmap_entries, 2);
+        let ram = si.memmap_entry(&g, 0).unwrap();
+        let tab = si.memmap_entry(&g, 1).unwrap();
+        assert!(ram.is_ram() && !tab.is_ram());
+        assert_eq!((tab.addr, tab.size, tab.kind), (acpi_gpa, 0x1000, 3));
+        assert!(ram.addr + ram.size <= tab.addr, "RAM stops where the tables start");
+
+        // The table walker, starting from the RSDP the start_info names.
+        let mut rsdp_bytes = [0u8; 36];
+        assert!(g.read(si.rsdp_paddr, &mut rsdp_bytes));
+        let rsdp = rsdp_from_bytes(&rsdp_bytes).expect("the walker's RSDP checks reject it");
+        assert_eq!(rsdp.revision, 2);
+        assert_ne!(rsdp.xsdt, 0, "extended checksum accepted");
+        let fadt = find_table(&g, &rsdp, b"FACP").expect("FADT through the XSDT");
+        assert_eq!(fadt.length, 276);
+        let d = dsdt(&g, &rsdp).expect("DSDT through the FADT");
+        assert_eq!(&d.signature, b"DSDT");
+        assert_eq!(d.addr, acpi_gpa + acpi::DSDT_OFF as u64);
     }
 }

@@ -279,3 +279,16 @@ exit; the gaps between polls vary 5-10x), so the command line carries
 `VFS: Unable to mount root fs` and resets via port `0x64`. Next: rehearse on ryzen
 under nested SVM (`qemu.sh 28`) before metal; then a virtio-blk root (the Gentoo
 partition) to exercise `HLT` idle. Details: `AKUMA_KVM_LINUX_RUNG.md` § Rung 7.
+
+**Rung 8 (2026-10-22): virtio-blk root — TCG PASS, read and write verified against
+host tools.** Linux boots from a second virtio-blk device, mounts ext2, runs
+busybox init. New crate modules: `mmio` (MOV decoder, clang-assembled vectors),
+`virtio` (virtio-mmio v2 block device), `acpi` (tables + PM1). Things you would
+otherwise rediscover: the kernel finds the device **only through ACPI**
+(`LNRO0005`; no cmdline devices, no virtio-PCI); **never set FADT
+`HW_REDUCED_ACPI`** (Linux then drops the PIC/PIT and the device IRQ is
+"not found"); the 8250 needs a **THRE interrupt** or init's output stops after
+one byte; `nmi_watchdog=0` avoids a `RDPMC` `#UD` at reboot. Backing store reuses
+`akuma_virtio::block` (second device) — the host's `vda` is never given to the
+guest. Rehearse: `scripts/kvm/guest_rootfs.sh` + `scripts/kvm/linux_rehearse.sh`.
+Details: `AKUMA_KVM_LINUX_RUNG.md` § Rung 8.
