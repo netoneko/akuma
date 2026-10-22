@@ -266,3 +266,16 @@ live `/boot/akuma-amd64` is unchanged, so entries 20/27 still boot the old
 kernel; rollback = arm another entry. Caution: p3 has a corrupted directory in
 `/root/ktarget/.../build/akuma-amd64/<hash>/out` (cargo cache, from Oct 18) that
 `e2fsck -fn` flags; delete it before the next full fsck.
+
+**Rung 7 (2026-10-22, uncommitted in the worktree): the timer — TCG PASS, not yet
+run on nested SVM or metal.** `akuma-svm-amd64::{pit,pic}` (8254 + 8259 pair, pure,
+24 tests) and virtual-interrupt delivery in `kvm/linux.rs`. Two things you would
+otherwise rediscover: (1) delivery is `V_IRQ | V_IGN_TPR | V_INTR_VECTOR` with
+`V_INTR_MASKING` (§15.21.4), acknowledged on the first exit after `V_IRQ` reads
+back clear — not `EVENTINJ`, which would need its own interrupt-window logic;
+(2) the PIT cannot calibrate the TSC through trapped port reads (every poll is an
+exit; the gaps between polls vary 5-10x), so the command line carries
+`tsc_early_khz=` from `lapic::tsc_hz()`. Linux now runs to
+`VFS: Unable to mount root fs` and resets via port `0x64`. Next: rehearse on ryzen
+under nested SVM (`qemu.sh 28`) before metal; then a virtio-blk root (the Gentoo
+partition) to exercise `HLT` idle. Details: `AKUMA_KVM_LINUX_RUNG.md` § Rung 7.

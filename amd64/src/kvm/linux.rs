@@ -37,6 +37,8 @@ use super::{crumb, dec, dump_exit, dump_state, enable_on_core, hx, image_pa, nex
 use crate::phys::FreshFrame;
 use akuma_svm_amd64 as svm;
 use akuma_svm_amd64::devices::{MsrStore, Uart};
+use akuma_svm_amd64::pic::PicPair;
+use akuma_svm_amd64::pit::{self, Pit};
 use akuma_svm_amd64::{ctrl, elf, eventinj, excp, exitinfo, intr0, intr1, pvh, save, tables, ExitCode, Seg, SegAttr, Vmcb};
 use core::arch::x86_64::__cpuid_count;
 
@@ -332,6 +334,10 @@ fn load_vmlinux(ram: &Ram, chunk: &mut FreshFrame) -> Result<Loaded, &'static st
 /// remember what they were given.
 struct Platform {
     uart: Uart,
+    /// The 8254: channel 2 calibrates the guest's TSC, channel 0 is IRQ0.
+    pit: Pit,
+    /// The two 8259s: with no APIC they are the whole interrupt fabric.
+    pic: PicPair,
     msrs: MsrStore<48>,
     cmos_index: u8,
     /// How much of "Linux version" the console has spelled so far.
@@ -343,6 +349,8 @@ struct Platform {
     /// Ports / MSRs answered by default, each logged the first time.
     seen_io: [u16; 32],
     n_io: usize,
+    /// The guest pulsed the keyboard controller's reset line (`0xFE` to `0x64`).
+    reset_requested: bool,
     seen_msr: [u32; 48],
     n_msr: usize,
 }
@@ -353,6 +361,8 @@ impl Platform {
     const fn new() -> Self {
         Self {
             uart: Uart::new(),
+            pit: Pit::new(),
+            pic: PicPair::new(),
             msrs: MsrStore::new(),
             cmos_index: 0,
             banner: 0,
@@ -361,6 +371,7 @@ impl Platform {
             last_tx_us: 0,
             seen_io: [0; 32],
             n_io: 0,
+            reset_requested: false,
             seen_msr: [0; 48],
             n_msr: 0,
         }
@@ -402,17 +413,17 @@ impl Platform {
         p(" (default)\n");
     }
 
-    fn io_in(&mut self, port: u16) -> u32 {
+    fn io_in(&mut self, port: u16, now: u64) -> u32 {
         match port {
             0x3F8..=0x3FF => u32::from(self.uart.read((port - 0x3F8) as u8)),
             // CMOS data port: every register reads zero (status A's
             // update-in-progress bit stays clear, so a wait-for-RTC loop ends).
             0x71 => 0,
-            // PIC: all lines masked, nothing in service.
-            0x21 | 0xA1 => 0xFF,
-            0x20 | 0xA0 => 0,
-            // PIT, system control port B.
-            0x40..=0x43 | 0x61 => 0,
+            // PIC.
+            0x20 | 0x21 | 0xA0 | 0xA1 => u32::from(self.pic.read(port).unwrap_or(0xFF)),
+            // PIT, and system control port B (channel 2's gate and output).
+            0x40..=0x43 => u32::from(self.pit.read((port - 0x40) as u8, now)),
+            0x61 => u32::from(self.pit.port_b_read(now)),
             // PCI config: no devices.
             0xCF8 => 0,
             0xCFC..=0xCFF => 0xFFFF_FFFF,
@@ -425,7 +436,7 @@ impl Platform {
         }
     }
 
-    fn io_out(&mut self, port: u16, val: u32) {
+    fn io_out(&mut self, port: u16, val: u32, now: u64) {
         match port {
             0x3F8..=0x3FF => {
                 if let Some(c) = self.uart.write((port - 0x3F8) as u8, val as u8) {
@@ -433,9 +444,16 @@ impl Platform {
                 }
             }
             0x70 => self.cmos_index = val as u8 & 0x7F,
-            // POST, CMOS data, PIC, PIT, port B, PCI address/data, VGA: accepted.
-            0x80 | 0x71 | 0x20 | 0x21 | 0xA0 | 0xA1 | 0x40..=0x43 | 0x61 | 0xCF8 | 0xCFC..=0xCFF
-            | 0x3C0..=0x3DF => {}
+            // The keyboard controller's CPU-reset pulse: how a PC reboots, and
+            // what `panic=-1` ends in.
+            0x64 if val as u8 == 0xFE => self.reset_requested = true,
+            0x20 | 0x21 | 0xA0 | 0xA1 => {
+                self.pic.write(port, val as u8);
+            }
+            0x40..=0x43 => self.pit.write((port - 0x40) as u8, val as u8, now),
+            0x61 => self.pit.port_b_write(val as u8, now),
+            // POST, CMOS data, PCI address/data, VGA: accepted.
+            0x80 | 0x71 | 0xCF8 | 0xCFC..=0xCFF | 0x3C0..=0x3DF => {}
             _ => self.note_io(port, true, val),
         }
     }
@@ -585,6 +603,29 @@ fn dump_code(ram: &Ram, v: &Vmcb<'_>, va: u64) {
 
 /// Run the Linux rung. Called once SVM is enabled and the root filesystem is
 /// mounted (`kvm::late`).
+/// [`LINUX_CMDLINE`] followed by ` tsc_early_khz=<khz>` (omitted when the host
+/// has no calibrated TSC), assembled in `buf`.
+fn cmdline_with_tsc(buf: &mut [u8; 320], khz: u64) -> &str {
+    let base = LINUX_CMDLINE.as_bytes();
+    buf[..base.len()].copy_from_slice(base);
+    let mut n = base.len();
+    if khz != 0 {
+        let key = b" tsc_early_khz=";
+        buf[n..n + key.len()].copy_from_slice(key);
+        n += key.len();
+        let mut digits = [0u8; 20];
+        let (mut i, mut v) = (digits.len(), khz);
+        while v > 0 {
+            i -= 1;
+            digits[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        buf[n..n + digits.len() - i].copy_from_slice(&digits[i..]);
+        n += digits.len() - i;
+    }
+    core::str::from_utf8(&buf[..n]).unwrap_or(LINUX_CMDLINE)
+}
+
 pub fn run(nrips: bool) {
     crumb(0x51);
     p("[KVM] linux: loading ");
@@ -625,7 +666,13 @@ pub fn run(nrips: bool) {
     // memmap's one RAM entry stopping short of them.
     let l = pvh::plan(RAM_BYTES, 0, RAM_BYTES - 0x3000);
     scratch.bytes_mut().fill(0);
-    if !pvh::write_cmdline(scratch.bytes_mut(), LINUX_CMDLINE) || !ram.write(l.cmdline_gpa, scratch.bytes_mut()) {
+    // The guest is told the host's TSC rate rather than left to calibrate it
+    // through trapped port reads: a poll loop whose every iteration is a
+    // VM exit measures the exits, not the PIT (`tsc_early_khz` is a documented
+    // kernel parameter). Built on the stack: no allocation.
+    let mut cmd = [0u8; 320];
+    let cmdline = cmdline_with_tsc(&mut cmd, crate::lapic::tsc_hz() / 1000);
+    if !pvh::write_cmdline(scratch.bytes_mut(), cmdline) || !ram.write(l.cmdline_gpa, scratch.bytes_mut()) {
         p("[KVM] linux: cmdline handoff failed\n");
         return;
     }
@@ -742,6 +789,10 @@ pub fn run(nrips: bool) {
     let (mut exits, mut n_cpuid, mut n_msr, mut n_io, mut n_irq, mut n_exc) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut stopped = "exit budget spent";
     let mut fatal = false;
+    let (mut n_inj, mut n_hlt) = (0u64, 0u64);
+    if crate::lapic::tsc_uptime_us().is_none() {
+        p("[KVM] linux: warning: host uptime is 10 ms ticks; PIT timing will be coarse\n");
+    }
 
     // IRQs on for the whole run: with V_INTR_MASKING the host IF at VMRUN gates
     // physical interrupts, and a tick must reach the host.
@@ -756,9 +807,21 @@ pub fn run(nrips: bool) {
             break 'run;
         }
         if plat.banner_seen && now_us.saturating_sub(plat.last_tx_us) > QUIET_BUDGET_US {
-            stopped = "guest console quiet after the banner (waiting for a timer nobody emulates)";
+            stopped = "guest console quiet after the banner";
             break 'run;
         }
+        // The PIT's channel 0 has had an edge since we last looked: IRQ0 is
+        // requested. Then offer the PIC's best vector to the guest as a virtual
+        // INTR; the processor takes it when the guest's IF allows (§15.21.4)
+        // and writes V_IRQ back cleared when it has.
+        if plat.pit.take_irq0(pit::ticks_from_us(now_us)) {
+            plat.pic.raise(0);
+        }
+        let offered = plat.pic.pending();
+        Vmcb::new(vmcb_f.bytes_mut()).set_v_intr(match offered {
+            Some(vec) => ctrl::v_intr_extint(vec),
+            None => ctrl::V_INTR_MASKING,
+        });
         crumb(0x57);
         // SAFETY: the VMCB and the host save image are live frames this
         // function owns; SVM is enabled on this core (`enable_on_core`).
@@ -767,6 +830,25 @@ pub fn run(nrips: bool) {
         let mut v = Vmcb::new(vmcb_f.bytes_mut());
         // The first entry flushed; the rest need not.
         v.set_tlb_control(ctrl::TLB_DO_NOTHING);
+        // V_IRQ comes back cleared once the guest has dispatched the offered
+        // vector: that is the INTA cycle, and it happens before any exit this
+        // run can report, so the PIC is up to date before a port write (the
+        // guest's EOI) is looked at.
+        if let Some(vec) = offered
+            && v.v_intr() & ctrl::V_IRQ == 0
+        {
+            n_inj += 1;
+            if plat.pic.acknowledge() != Some(vec) {
+                p("\n[KVM] linux: PIC acknowledged a different vector than it offered\n");
+            }
+            if n_inj <= LOG_FIRST.into() {
+                p("\n[KVM] linux: irq vector ");
+                hx(u64::from(vec), 2);
+                p(" taken at rip=");
+                hx(v.rip(), 16);
+                p("\n");
+            }
+        }
         match ExitCode::from_u64(v.exitcode()) {
             ExitCode::Cpuid => {
                 n_cpuid += 1;
@@ -841,22 +923,46 @@ pub fn run(nrips: bool) {
                     break 'run;
                 }
                 if io.is_in {
-                    let val = u64::from(plat.io_in(io.port)) & io.mask();
+                    let val = u64::from(plat.io_in(io.port, pit::ticks_from_us(crate::net::uptime_us()))) & io.mask();
                     let rax = v.rax();
                     v.set_rax(if io.size == 4 { val } else { (rax & !io.mask()) | val });
                 } else {
-                    plat.io_out(io.port, (v.rax() & io.mask()) as u32);
+                    plat.io_out(io.port, (v.rax() & io.mask()) as u32, pit::ticks_from_us(crate::net::uptime_us()));
+                }
+                if plat.reset_requested {
+                    v.set_rip(v.exitinfo2());
+                    stopped = "guest requested a reset (keyboard-controller pulse: its panic=-1 reboot)";
+                    break 'run;
                 }
                 v.set_rip(v.exitinfo2());
             }
             ExitCode::Hlt => {
-                let if_set = v.rflags() & (1 << 9) != 0;
-                stopped = if if_set {
-                    "guest halted waiting for an interrupt (no timer is emulated)"
-                } else {
-                    "guest halted with interrupts off"
-                };
-                break 'run;
+                n_hlt += 1;
+                if v.rflags() & (1 << 9) == 0 {
+                    stopped = "guest halted with interrupts off";
+                    break 'run;
+                }
+                v.set_rip(next_rip(&v, nrips, 1));
+                // Idle until the PIT can raise an interrupt the PIC will offer.
+                // The host tick keeps running underneath (IRQs are on).
+                loop {
+                    let now = crate::net::uptime_us();
+                    if plat.pit.take_irq0(pit::ticks_from_us(now)) {
+                        plat.pic.raise(0);
+                    }
+                    if plat.pic.pending().is_some() {
+                        break;
+                    }
+                    if plat.pit.next_irq0_tick().is_none() {
+                        stopped = "guest halted waiting for an interrupt nothing can raise";
+                        break 'run;
+                    }
+                    if now.saturating_sub(started_us) > RUN_BUDGET_US {
+                        stopped = "wall-clock budget spent";
+                        break 'run;
+                    }
+                    core::hint::spin_loop();
+                }
             }
             // A host interrupt or NMI arrived while the guest ran. The host's IF
             // is set, so it was taken at the `stgi` that ended the exit; there
@@ -959,6 +1065,10 @@ pub fn run(nrips: bool) {
     dec(n_irq);
     p(" exc=");
     dec(n_exc);
+    p(" injected=");
+    dec(n_inj);
+    p(" hlt=");
+    dec(n_hlt);
     p(" console_bytes=");
     dec(plat.tx_bytes);
     p(" rip=");

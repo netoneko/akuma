@@ -38,6 +38,9 @@
 //! [`save`] are **relative to the save-area start** (`0400h` in the page);
 //! [`ctrl`] offsets are from the page base.
 
+pub mod pic;
+pub mod pit;
+
 /// Page size of a VMCB (and of the host save area).
 pub const VMCB_SIZE: usize = 4096;
 /// The state save area begins here in the VMCB page (Table B-2; SEV-ES off).
@@ -140,6 +143,27 @@ pub mod ctrl {
     /// (§15.21.1) — so the host's timer tick (scheduler, watchdog) reaches it
     /// whatever the guest does with `IF`. Clear: the guest's `IF` gates both.
     pub const V_INTR_MASKING: u64 = 1 << 24;
+    /// `V_IRQ` — bit 8 of `060h`: a virtual INTR is pending (Table B-1). The
+    /// processor writes it back on `#VMEXIT`, so a cleared bit means the guest
+    /// took the interrupt (§15.21.4).
+    pub const V_IRQ: u64 = 1 << 8;
+    /// `V_IGN_TPR` — bit 20 of `060h`: the pending virtual interrupt ignores the
+    /// virtual TPR — the ExtINT shape a legacy PIC delivers (§15.21.4).
+    pub const V_IGN_TPR: u64 = 1 << 20;
+    /// `V_INTR_VECTOR` — bits 39:32 of `060h`: the vector the virtual interrupt
+    /// is dispatched through.
+    pub const V_INTR_VECTOR_SHIFT: u32 = 32;
+    /// `INTERRUPT_SHADOW` — bit 0 of `068h`: the guest is in the one-instruction
+    /// window after `STI` or `MOV SS` (§15.21.5).
+    pub const INT_SHADOW_BIT: u64 = 1;
+
+    /// The `V_INTR` qword for a legacy-PIC interrupt on `vector`: masking
+    /// virtualised, a virtual INTR pending, TPR ignored. The guest takes it when
+    /// its `RFLAGS.IF` is set and it is not in an interrupt shadow.
+    #[must_use]
+    pub const fn v_intr_extint(vector: u8) -> u64 {
+        V_INTR_MASKING | V_IRQ | V_IGN_TPR | ((vector as u64) << V_INTR_VECTOR_SHIFT)
+    }
     pub const TLB_DO_NOTHING: u8 = 0;
     /// Flush the entire TLB on `VMRUN`.
     pub const TLB_FLUSH_ALL: u8 = 1;
@@ -698,6 +722,21 @@ impl<'a> Vmcb<'a> {
     #[must_use]
     pub const fn exitintinfo(&self) -> u64 {
         rd64(self.page, ctrl::EXITINTINFO)
+    }
+    /// The `V_INTR` qword (`060h`) as the last `#VMEXIT` left it.
+    #[must_use]
+    pub const fn v_intr(&self) -> u64 {
+        rd64(self.page, ctrl::V_INTR)
+    }
+    /// Whether the guest is in an interrupt shadow (`068h` bit 0).
+    #[must_use]
+    pub const fn interrupt_shadow(&self) -> bool {
+        rd64(self.page, ctrl::INT_SHADOW) & ctrl::INT_SHADOW_BIT != 0
+    }
+    /// The `EVENTINJ` qword (`0A8h`) as it stands.
+    #[must_use]
+    pub const fn eventinj(&self) -> u64 {
+        rd64(self.page, ctrl::EVENTINJ)
     }
     /// Next RIP (`0C8h`), saved with NRIPS; 0 before the first run.
     #[must_use]
@@ -2767,6 +2806,24 @@ mod tests {
         let mut page = [0u8; VMCB_SIZE];
         Vmcb::new(&mut page).set_v_intr(ctrl::V_INTR_MASKING);
         assert_eq!(&page[0x60..0x68], &0x0100_0000u64.to_le_bytes());
+    }
+
+    /// The virtual-interrupt fields of `060h` / `068h`, bit by bit against
+    /// Table B-1: V_IRQ 8, V_IGN_TPR 20, V_INTR_MASKING 24, V_INTR_VECTOR 39:32,
+    /// INTERRUPT_SHADOW bit 0 of the next qword.
+    #[test]
+    fn virtual_interrupt_fields_are_table_b_1() {
+        assert_eq!(ctrl::V_IRQ, 0x100);
+        assert_eq!(ctrl::V_IGN_TPR, 0x10_0000);
+        assert_eq!(ctrl::v_intr_extint(0x30), 0x0000_0030_0110_0100);
+        assert_eq!(ctrl::v_intr_extint(0xEF) >> 32, 0xEF);
+        let mut page = [0u8; VMCB_SIZE];
+        page[0x68] = 1;
+        assert!(Vmcb::new(&mut page).interrupt_shadow());
+        page[0x68] = 2; // GUEST_INTERRUPT_MASK is SEV-ES's, not the shadow.
+        assert!(!Vmcb::new(&mut page).interrupt_shadow());
+        Vmcb::new(&mut page).set_v_intr(ctrl::v_intr_extint(0x20));
+        assert_eq!(Vmcb::new(&mut page).v_intr() & ctrl::V_IRQ, ctrl::V_IRQ);
     }
 
     /// `EVENTINJ`, bit by bit against Figure 15-5 / Table 15-11.

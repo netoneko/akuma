@@ -42,10 +42,56 @@ closure; multiboot2 path: right after `have_fs`) runs `amd64/src/kvm/linux.rs`:
 
 Because the guest cannot reach any real device (NPT maps only its RAM; every
 port and MSR is intercepted), a wrong guest is a stopped run, not a hardware
-hazard. What it does *not* have: a timer. Linux calibrates against the PIT,
-fails (`tsc: Unable to calibrate against PIT`), and spins in its first delay
-loop — which is where the quiet budget ends the run. PIT/LAPIC-timer emulation
-and interrupt injection are the next rung.
+hazard. Rung 6 had no timer; rung 7 (below) adds one.
+
+## Rung 7: a PIT, a PIC and interrupt injection (2026-10-22)
+
+`akuma_svm_amd64::{pit, pic}` are pure, host-tested models (24 tests):
+
+* `pit::Pit` — an 8254 as a function of `now` in input-clock ticks (1.193182 MHz,
+  `ticks_from_us`). Control word, counter latch, read-back, modes 0-5 (binary
+  only), port B (`0x61`) gate/output/refresh-toggle for channel 2, and for
+  channel 0 `take_irq0(now)` / `next_irq0_tick()`: output rising edges, coalesced
+  when the caller is late, as an 8259 whose IRR bit is already set does.
+* `pic::PicPair` — two 8259As: ICW1-4, OCW1-3, edge-triggered, fixed priority,
+  fully nested, auto-EOI, the slave on IRQ2. `pending()` is the vector to offer;
+  `acknowledge()` is the INTA cycle.
+
+Delivery is the **virtual interrupt** of §15.21.4, not `EVENTINJ`: before every
+`VMRUN` the loop polls channel 0, raises IRQ0 and writes
+`V_INTR = ctrl::v_intr_extint(vector)` (`V_INTR_MASKING | V_IRQ | V_IGN_TPR |
+vector << 32`); the processor holds it until the guest's `IF` is set and it is out
+of an interrupt shadow, and writes `V_IRQ` back cleared when it dispatches. The
+first exit afterwards sees the bit clear and performs the PIC acknowledge — before
+it looks at anything else, so the guest's EOI (an exit of its own) always finds the
+PIC up to date. No interrupt-window logic, no `VINTR` intercept: the hardware
+already does the "wait until IF" part. `EVENTINJ` type 0 would need both, and
+stays unused. `HLT` with `IF` set now advances `RIP` and idles until the PIT can
+raise an interrupt (it stopped the run before); `HLT` with nothing armed stops it.
+A `0xFE` to port `0x64` (the keyboard-controller reset pulse, which is what
+`panic=-1` ends in) is a clean stop.
+
+**The PIT does not calibrate the TSC, and cannot here.** The guest's PIT probe
+polls port B bit 5 for 10 ms; every poll is an exit. Measured over 750-770 polls
+per window (TCG): largest gap between two polls 5-10x the smallest (a host tick
+landing in the loop), and the guest gave up three times with
+`tsc: Unable to calibrate against PIT`. A trapped port read measures the exit,
+not the clock — which is why real hypervisors tell the guest its TSC rate instead.
+The guest's command line now ends `tsc_early_khz=<host TSC kHz>` (documented
+kernel parameter; `lapic::tsc_hz()`; assembled on the stack), and the guest
+prints `tsc: Detected 998.200 MHz processor`. The PIT model stays: IRQ0 is the
+tick, and the delay loop is calibrated from it (`Calibrating delay loop
+(skipped), value calculated using timer frequency`).
+
+| where | result |
+|---|---|
+| QEMU TCG, Mac (`noladder`) | PASS: 144 virtual interrupts taken, `tsc-early` clocksource, runs to `VFS: Unable to mount root fs`, reset pulse recognised, 95 773 exits (was 1.3 M of spinning) |
+
+Not yet exercised: `HLT` idle (the guest panics before it idles — needs a root
+filesystem); nested-SVM and metal runs of this rung. Granularity: while the guest
+runs, IRQ0 is polled once per exit, and the host tick is the only exit a busy guest
+is guaranteed to produce, so a guest that spins with `IF` set sees timer
+interrupts at the host-tick rate, not the PIT's. Idle (HLT) is exact.
 
 ## Bugs found on the way (all in code that was already "green")
 
@@ -94,8 +140,11 @@ TCG could not show it because its host timer was already running.
 
 ## Still open
 
-- Timer: PIT (ports 0x40-0x43, 0x61) then interrupt injection (`EVENTINJ`
-  type 0), then the LAPIC timer — until then Linux stops at its first delay loop.
+- A root filesystem: the guest now panics at `VFS: Unable to mount root fs`. A
+  virtio-blk device backed by a host partition (the Gentoo one on ryzen) is the
+  natural next rung; it also exercises `HLT` idle.
+- LAPIC timer (the guest is told `nolapic` today), nested-SVM and metal runs of
+  rung 7.
 - p3's `e2fsck -fn` reports a corrupted directory in crush's cargo cache
   (`/root/ktarget/.../build/akuma-amd64/<hash>/out`, last written Oct 18) — not
   caused by this work, not repaired; `rm -r` that directory from Pop, then `e2fsck`.
