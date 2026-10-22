@@ -1,0 +1,155 @@
+# ryzen metal (entry 28, /boot/kvm-guest=akuma-hello), 2026-10-22: Akuma's own kernel as the SVM guest, root = a 2 MiB ext2 whose only file is /bin/hello.
+# Host kernel d79495a built on the ryzen. dmesg region from the guest load to the verdict.
+128:[KVM] linux: loading akuma-hello guest /boot/akuma-guest
+[KVM] linux: loading akuma-hello guest /boot/akuma-guest
+[KVM] linux: loaded 9831 KiB in 4 segments, PVH entry 00201000
+[KVM] linux: guest disk: /boot/akuma-hello-root.img, 2 MiB
+[KVM] linux: running (start=2ffff000, ram=768 MiB)
+
+[KVM] linux: rdmsr c0000080 -> 0000000000000000
+
+[KVM] linux: wrmsr c0000080 <- 0000000000000900
+
+
+Akuma/amd64 ??? long mode reached
+
+  uart: present  kbd: no i8042
+
+  hvm_start_info @ 0x000000002ffff000
+
+
+[KVM] linux: wrmsr c0000101 <- ffffffff80c837c0
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: cpuid 0000000d/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000007/00 -> 00000000 00000000 00000000 00000000
+  smap: off (CPUID lacks SMAP)  smep: off (CPUID lacks SMEP)
+
+  version=1 modules=0 rsdp=0x0000000000000000 cmdline=0x000000002fffd000
+
+  memmap: 1 entries
+
+    0x0000000000000000 + 0x000000002fffd000  RAM
+
+  usable RAM: 767 MiB
+
+  virtio-mmio: 0x00000000d0000000 + 0x0000000000001000 irq 5
+
+  acpi: none found (no RSDP in the EBDA or the BIOS window)
+
+  mem:  RAM the machine reported, and what became of each:
+
+    0x0000000000000000 + 767 MiB  heap + pmm
+
+  mem:  767 MiB usable, 766 MiB managed, physmap reaches 64 GiB
+
+  kernel ends 0x0000000001193140
+
+  heap: 0x0000000001194000 + 512 MiB ... ok
+
+  pmm:  arena 0x0000000000100000 + 766 MiB spanning 1 RAM region(s)
+
+  pmm:  766 MiB RAM, 61033 free frames (238 MiB)
+
+  [power] source=none (no ERAM region in the DSDT/SSDTs)
+
+  clock: CMOS RTC holds no date; waiting for SNTP
+
+[fpcache] shared file-page cache enabled, base cap=24543 pages (+20% elastic)
+
+  blk:  1 virtio slot(s) at pa 0x00000000d0000000 stride 0x0000000000001000 irq 5
+
+[Block] Initializing block device driver...
+
+[Block] Found virtio-blk at slot 0
+
+[Block] Registered vda: 2 MB (4096 sectors)
+
+[Block] Block devices initialized: 1
+
+  fs:   ext2 mounted on /dev/vda
+
+[SmolNet] Initializing network stack...
+
+  net:  no stack: No virtio-net device found
+
+
+[KVM] linux: rdmsr 0000001b -> 00000000fee00100
+
+[KVM] linux: wrmsr 0000001b <- 00000000fee00900
+  lapic: base=0x00000000fee00000 id=0 timer vector=32 periodic
+
+  lapic: calibrated vs PIT: 624750 counts per 10000us (999 MHz); tsc 3791 MHz
+
+
+[KVM] linux: rdmsr c0000080 -> 0000000000000d00
+
+[KVM] linux: wrmsr c0000080 <- 0000000000000d01
+
+[KVM] linux: wrmsr c0000081 <- 0013000800000000
+
+[KVM] linux: wrmsr c0000082 <- ffffffff802bf340
+
+[KVM] linux: wrmsr c0000084 <- 0000000000047700
+[BKLPROF] enabled (amd64 diagnostic)
+
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802fe5c8
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+
+                      =#=      .-
+
+                      +*#*:.:-**
+
+                      +%%#%##***
+
+                      +%%%#%%#**.
+
+       
+[KVM] linux: irq vector 20 taken at rip=ffffffff802fe5c8
+               +%@@@%%%+*:
+
+          :::::--=+++*%@%@%%%%*-
+
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+
+*%%%%%@%@@%@@@%%%%#%@@@@@
+[KVM] linux: irq vector 20 taken at rip=ffffffff802fe5c8
+@@%%@@%@@@*+--
+
+ ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+
+         .--+**%@@@@@%@@%%@@%*       :-.
+
+                  ::::---#@%%*
+
+
+
+  Akuma/amd64  0.0.8-amd64
+
+
+
+-- running /bin/hello --
+
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff802fe5c8
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+Hello, world! This is the init of a guest of Akuma, run by Akuma
+[KVM] linux: stopped: guest reported its init ran to the end
+[KVM] linux: exits=6531 cpuid=4 msr=13 io=6449 irq=0 exc=0 injected=4 hlt=0 mmio=46 lapic=18 lapic_irq=4 console_bytes=2198 rip=ffffffff802ad42e
+[KVM] akuma-hello guest: PASS (banner=yes, init=yes)

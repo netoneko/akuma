@@ -67,6 +67,20 @@ per-guest, and `kvm::late` picks the guest.
 | Linux guest regression (same kernel, `linux_rehearse.sh`) | PASS, `init ran to completion` — unchanged |
 | **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma`, kernel `b3a2c71` built on the ryzen) | **PASS**: the guest calibrated its LAPIC timer against the virtual PIT (`625062 counts per 10000us`) and measured the real TSC (**3794 MHz**), `blk` from the command line, ext2 mounted, `uname` printed, `md5sum /bin/busybox` = `ebce4301…` (the host's), `/wtest` = `71277886…`, `AKUMA-GUEST-DONE`; **9 853 exits, 24 virtual interrupts, 1 665 MMIO, 38 LAPIC page accesses**. Independent check from Pop: `/boot/akuma-guest-root.img` on p3 was rewritten by the guest (mtime = the boot), `debugfs dump /wtest` → md5 `71277886…`, `e2fsck -fn` clean. Log: [`AMD64_KVMTEST_PHASE9_AKUMA_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE9_AKUMA_METAL_DMESG_2026_10_22.txt) |
 
+## The smallest root: hello world as init
+
+`kvmtest kvmhello` (or `kvmlinux` with `/boot/kvm-guest` = `akuma-hello`) boots the same
+guest kernel on a **2 MiB ext2 whose only file is `/bin/hello`** — a 8.9 KB `no_std`
+program (`userspace/amd64/helloworld`, built by `scripts/kvm/akuma_hello_rootfs.sh`)
+that `write`s one line and `exit_group`s. No busybox, no shell, no script; the command
+line is `nosmp virtio_mmio.device=4K@0xd0000000:5 init=/bin/hello`. The hypervisor stops
+the run on the line's last words (`run by Akuma`).
+
+| where | result |
+|---|---|
+| QEMU TCG | **PASS** (flag and selector), 5 269 exits; the busybox guest unchanged |
+| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma-hello`, kernel `d79495a` built on the ryzen) | **PASS**: `Hello, world! This is the init of a guest of Akuma, run by Akuma`, 6 531 exits, 4 virtual interrupts, 46 MMIO, 18 LAPIC page accesses; guest TSC 3791 MHz. Log: [`AMD64_KVMTEST_PHASE9_HELLO_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE9_HELLO_METAL_DMESG_2026_10_22.txt) |
+
 ## Still open
 
 * LAPIC timer granularity: a guest spinning with `IF` set sees timer interrupts at the

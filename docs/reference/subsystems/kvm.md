@@ -83,8 +83,9 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 
 Runbook: [`../../runbooks/kvm-linux-guest.md`](../../runbooks/kvm-linux-guest.md).
 Kernel command line: `kvmtest kvmlinux` or `kvmtest kvmakuma` (add `noladder` under
-TCG). `kvmlinux` runs the Akuma guest instead when p3's `/boot/kvm-guest` begins with
-`akuma` — the bootloader entry's command line is baked into `grubx64.efi`, so the file
+TCG). `kvmhello` is the same guest on a 2 MiB root whose only file is `/bin/hello`.
+`kvmlinux` runs an Akuma guest instead when p3's `/boot/kvm-guest` begins with
+`akuma` (busybox root) or `akuma-hello` — the bootloader entry's command line is baked into `grubx64.efi`, so the file
 is the lever that lets one entry serve both.
 
 ## Background

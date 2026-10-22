@@ -46,6 +46,12 @@ On the ryzen (build there): the guest kernel is any PVH build of the kernel, at
 entry 29 (needs a `grubx64.efi` with it) or write `akuma` to `/boot/kvm-guest` and boot
 entry 28. Delete `/boot/kvm-guest` to get the Linux guest back.
 
+The smallest root: `HELLO=1 scripts/kvm/akuma_rehearse.sh LOG` rehearses the guest whose
+only program is `/bin/hello` (`[KVM] akuma-hello guest: PASS`, and `Hello, world!` on the
+guest console). On the ryzen build the image there
+(`sh scripts/kvm/akuma_hello_rootfs.sh $W/out/akuma-hello-root.img`) and stage with
+`GUEST=hello sh overlays/ryzen/kvm-akuma-stage.sh`.
+
 ## If it goes wrong
 
 | you see (in the guest's console) | it is |
