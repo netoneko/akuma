@@ -17,7 +17,7 @@
 //! | `vm_cmdline` | guest command line tail (rest of the line, spaces kept) |
 //! | `vm_ram_mib` | guest RAM, 16-1024 |
 //! | `vm_vcpus` | virtual processors, 1-4 |
-//! | `vm_disk` | disk image path (empty: the machine's second virtio-blk) |
+//! | `vm_disk` | disk image path, or `/dev/nvme0n1p<N>` to use that NVMe partition in place (empty: the machine's second virtio-blk) |
 //! | `vm_disk_ram` | copy the disk into RAM at start |
 //! | `vm_forward` | `host:guest`, repeatable |
 //! | `vm_config` | a Firecracker JSON config (`boot-source`, `machine-config`, `drives`) read first; explicit `vm_*` keys override it |
@@ -234,6 +234,17 @@ mod tests {
         let mut c = VmConfig::default();
         assert!(!c.apply("command", "/bin/x"));
         assert!(!c.apply("restart", "true"));
+    }
+
+    #[test]
+    fn a_partition_disk_is_accepted_and_never_ram_copied() {
+        let c = conf(&[("vm", "true"), ("vm_kernel", "/k"), ("vm_disk", "/dev/nvme0n1p7")]);
+        let s = c.finish(no_files).unwrap().unwrap();
+        assert_eq!(s.disk_source(), akuma_vm_spec::DiskSource::NvmePartition(7));
+        let c = conf(&[("vm", "true"), ("vm_kernel", "/k"), ("vm_disk", "/dev/nvme0n1p7"), ("vm_disk_ram", "true")]);
+        assert_eq!(c.finish(no_files), Err(VmError::Spec(Error::Conflict)));
+        let c = conf(&[("vm", "true"), ("vm_kernel", "/k"), ("vm_disk", "/dev/sda1")]);
+        assert!(matches!(c.finish(no_files), Err(VmError::Key(k, Error::BadValue)) if k == "vm_disk"));
     }
 
     const FC: &str = r#"{

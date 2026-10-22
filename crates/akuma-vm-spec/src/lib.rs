@@ -25,7 +25,7 @@ pub mod arena;
 pub mod cores;
 pub mod spec;
 
-pub use spec::{Backend, Error, Forward, Spec, Text};
+pub use spec::{Backend, DiskSource, Error, Forward, Spec, Text};
 
 #[cfg(test)]
 mod tests;

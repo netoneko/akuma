@@ -135,6 +135,11 @@ struct Nvme {
     ns_lbas: u64,
     max_blocks: u32,
     window: Option<Window>,
+    /// The GPT number [`open_partition`] selected for the host (0: none yet).
+    host_part: u32,
+    /// A partition lent to the hypervisor's guest ([`open_guest_partition`]): its own window,
+    /// checked by the same code as the host's, and never the host's own.
+    guest: Option<Window>,
     /// A command timed out or the controller reported fatal status; the
     /// controller has been disabled and nothing more is issued.
     dead: bool,
@@ -360,6 +365,8 @@ pub fn init() -> Result<(), &'static str> {
         ns_lbas: 0,
         max_blocks: 0,
         window: None,
+        host_part: 0,
+        guest: None,
         dead: false,
     };
 
@@ -399,12 +406,9 @@ pub fn init() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Select GPT partition `number` (Linux numbering: `nvme0n1p3` is 3) as the
-/// only range later reads and writes may touch. Reads LBA 1 and the entry
-/// array; refuses unless both CRCs check.
-pub fn open_partition(number: u32) -> Result<(), &'static str> {
-    let mut g = NVME.lock();
-    let n = g.as_mut().ok_or("NVMe not initialised")?;
+/// Read the GPT and return the window of partition `number`. Refuses unless both CRCs check.
+/// Caller holds the `NVME` lock; this uses the bounce buffer.
+fn partition_window(n: &mut Nvme, number: u32) -> Result<Window, &'static str> {
     let bl = n.lba_bytes as usize;
     n.io(false, 1, 1, 0)?;
     let hdr = Header::parse(&BOUNCE.view()[..bl]).map_err(|_| "no valid primary GPT")?;
@@ -438,18 +442,54 @@ pub fn open_partition(number: u32) -> Result<(), &'static str> {
     serial::puts(" GiB) \"");
     serial::puts(core::str::from_utf8(&name[..len]).unwrap_or("?"));
     serial::puts("\"\n");
+    Ok(w)
+}
+
+/// Select GPT partition `number` (Linux numbering: `nvme0n1p3` is 3) as the
+/// only range later reads and writes may touch. Reads LBA 1 and the entry
+/// array; refuses unless both CRCs check.
+pub fn open_partition(number: u32) -> Result<(), &'static str> {
+    let mut g = NVME.lock();
+    let n = g.as_mut().ok_or("NVMe not initialised")?;
+    let w = partition_window(n, number)?;
     n.window = Some(w);
+    n.host_part = number;
     Ok(())
 }
 
-/// Read `buf.len()` bytes at byte `offset` **within the open partition**.
-pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
-    if buf.is_empty() {
-        return Ok(());
-    }
+/// Lend partition `number` to the hypervisor's guest: a **second** window, validated like the
+/// first and refused when it is the host's partition or overlaps it (the host's root is never
+/// the guest's disk). One at a time. Returns its size in bytes.
+pub fn open_guest_partition(number: u32) -> Result<u64, &'static str> {
     let mut g = NVME.lock();
     let n = g.as_mut().ok_or("NVMe not initialised")?;
-    let w = n.window()?;
+    if n.guest.is_some() {
+        return Err("a guest partition is already open");
+    }
+    let host = n.window.ok_or("the host has no NVMe partition open")?;
+    if number == n.host_part {
+        return Err("that partition is the host's root");
+    }
+    let w = partition_window(n, number)?;
+    if w.first_lba < host.first_lba + host.lbas && host.first_lba < w.first_lba + w.lbas {
+        return Err("that partition overlaps the host's");
+    }
+    n.guest = Some(w);
+    Ok(w.bytes())
+}
+
+/// Give the guest's partition back (flushing the controller's cache first).
+pub fn close_guest_partition() {
+    let mut g = NVME.lock();
+    let Some(n) = g.as_mut() else { return };
+    if n.guest.take().is_some() && !n.dead {
+        let _ = n.submit(false, cmd::flush(0, NSID), "flush guest partition");
+    }
+}
+
+/// Read within `w` (the host's or the guest's window): every byte offset is checked against
+/// the window and every LBA run goes through [`Window::absolute`].
+fn read_in(n: &mut Nvme, w: Window, offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
     if !w.fits(offset, buf.len()) {
         return Err("read outside the NVMe partition");
     }
@@ -464,15 +504,8 @@ pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Write `data` at byte `offset` **within the open partition**. A partial block
-/// at either end is read-modify-written.
-pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    let mut g = NVME.lock();
-    let n = g.as_mut().ok_or("NVMe not initialised")?;
-    let w = n.window()?;
+/// Write within `w`; a partial block at either end is read-modify-written.
+fn write_in(n: &mut Nvme, w: Window, offset: u64, data: &[u8]) -> Result<(), &'static str> {
     if !w.fits(offset, data.len()) {
         return Err("write outside the NVMe partition");
     }
@@ -488,6 +521,51 @@ pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
         done += c.take;
     }
     Ok(())
+}
+
+/// Read `buf.len()` bytes at byte `offset` **within the open partition**.
+pub fn read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let mut g = NVME.lock();
+    let n = g.as_mut().ok_or("NVMe not initialised")?;
+    let w = n.window()?;
+    read_in(n, w, offset, buf)
+}
+
+/// Write `data` at byte `offset` **within the open partition**. A partial block
+/// at either end is read-modify-written.
+pub fn write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let mut g = NVME.lock();
+    let n = g.as_mut().ok_or("NVMe not initialised")?;
+    let w = n.window()?;
+    write_in(n, w, offset, data)
+}
+
+/// [`read_bytes`] within the **guest's** partition.
+pub fn guest_read(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let mut g = NVME.lock();
+    let n = g.as_mut().ok_or("NVMe not initialised")?;
+    let w = n.guest.ok_or("no guest partition open")?;
+    read_in(n, w, offset, buf)
+}
+
+/// [`write_bytes`] within the **guest's** partition.
+pub fn guest_write(offset: u64, data: &[u8]) -> Result<(), &'static str> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let mut g = NVME.lock();
+    let n = g.as_mut().ok_or("NVMe not initialised")?;
+    let w = n.guest.ok_or("no guest partition open")?;
+    write_in(n, w, offset, data)
 }
 
 /// Flush the controller's volatile write cache. A no-op success when the

@@ -42,7 +42,7 @@ use akuma_svm_amd64::mmio;
 use akuma_svm_amd64::pic::PicPair;
 use akuma_svm_amd64::pit::{self, Pit};
 use super::relay::Relay;
-use akuma_vm_spec::{Forward, Spec, Text};
+use akuma_vm_spec::{DiskSource, Forward, Spec, Text};
 use akuma_svm_amd64::gateway::Gateway;
 use akuma_svm_amd64::virtio::{self, Disk, GuestMem, MmioBlk};
 use akuma_svm_amd64::virtio_net::MmioNet;
@@ -286,13 +286,12 @@ impl Vm {
     /// file (or its RAM copy); an empty one is the machine's second virtio-blk device.
     fn pick_disk(&self) -> Option<HostDisk> {
         let Some(s) = &self.spec else { return HostDisk::pick(self.guest.disk_path()) };
-        if s.disk_ram {
-            return HostDisk::load_into_ram(s.disk.as_str());
+        match s.disk_source() {
+            DiskSource::None => HostDisk::second_virtio(),
+            DiskSource::File(f) if s.disk_ram => HostDisk::load_into_ram(f),
+            DiskSource::File(f) => HostDisk::file(f),
+            DiskSource::NvmePartition(n) => HostDisk::nvme_partition(n),
         }
-        if s.disk.is_empty() {
-            return HostDisk::second_virtio();
-        }
-        HostDisk::file(s.disk.as_str())
     }
 }
 
@@ -548,15 +547,20 @@ enum HostDisk {
     /// slice of the reserve (`off` is its handle) or page-allocator frames. Returned by
     /// [`MemLease`] when the run ends, so a restarting guest does not leak its image.
     Mem { base: u64, bytes: u64, off: Option<u64> },
+    /// A GPT partition of the NVMe disk, used **in place** through the driver's second window
+    /// ([`crate::nvme::open_guest_partition`]): the guest's writes are the partition's.
+    Nvme { bytes: u64 },
 }
 
-/// Gives a RAM-copy disk back when the run ends, on every path out of it.
-struct MemLease(Option<HostDisk>);
+/// Gives a RAM-copy disk (or a lent partition) back when the run ends, on every path out of it.
+struct DiskLease(Option<HostDisk>);
 
-impl Drop for MemLease {
+impl Drop for DiskLease {
     fn drop(&mut self) {
-        if let Some(HostDisk::Mem { base, bytes, off }) = self.0 {
-            release_mem(base, bytes, off);
+        match self.0 {
+            Some(HostDisk::Mem { base, bytes, off }) => release_mem(base, bytes, off),
+            Some(HostDisk::Nvme { .. }) => crate::nvme::close_guest_partition(),
+            _ => {}
         }
     }
 }
@@ -635,11 +639,27 @@ impl HostDisk {
         Some(Self::Mem { base, bytes, off })
     }
 
+    /// GPT partition `number` of the NVMe disk, lent to the guest (refused if it is the host's).
+    fn nvme_partition(number: u32) -> Option<Self> {
+        match crate::nvme::open_guest_partition(number) {
+            Ok(bytes) => Some(Self::Nvme { bytes }),
+            Err(why) => {
+                p("[KVM] linux: refused: NVMe partition ");
+                dec(u64::from(number));
+                p(": ");
+                p(why);
+                p("\n");
+                None
+            }
+        }
+    }
+
     fn what(&self) -> &str {
         match self {
             Self::Virtio(_) => "second virtio-blk device",
             Self::File(path) => path.as_str(),
             Self::Mem { .. } => "RAM copy of the image",
+            Self::Nvme { .. } => "NVMe partition, in place",
         }
     }
 }
@@ -649,7 +669,7 @@ impl Disk for HostDisk {
         match *self {
             Self::Virtio(i) => akuma_virtio::block::with_device_at(i, |d| d.capacity_sectors()).unwrap_or(0),
             Self::File(path) => akuma_vfs_glue::file_size(path.as_str()).map_or(0, |n| n / virtio::SECTOR),
-            Self::Mem { bytes, .. } => bytes / virtio::SECTOR,
+            Self::Mem { bytes, .. } | Self::Nvme { bytes } => bytes / virtio::SECTOR,
         }
     }
 
@@ -657,6 +677,7 @@ impl Disk for HostDisk {
         match *self {
             Self::Virtio(i) => akuma_virtio::block::read_bytes_at(i, offset, dst).is_ok(),
             Self::File(path) => akuma_vfs_glue::read_at(path.as_str(), offset as usize, dst).is_ok_and(|n| n == dst.len()),
+            Self::Nvme { .. } => crate::nvme::guest_read(offset, dst).is_ok(),
             Self::Mem { base, bytes, .. } => {
                 offset.checked_add(dst.len() as u64).is_some_and(|end| end <= bytes)
                     && akuma_mmu::copy_from_phys((base + offset) as usize, dst)
@@ -668,6 +689,7 @@ impl Disk for HostDisk {
         match *self {
             Self::Virtio(i) => akuma_virtio::block::write_bytes_at(i, offset, src).is_ok(),
             Self::File(path) => akuma_vfs_glue::write_at(path.as_str(), offset as usize, src).is_ok_and(|n| n == src.len()),
+            Self::Nvme { .. } => crate::nvme::guest_write(offset, src).is_ok(),
             Self::Mem { base, bytes, .. } => {
                 offset.checked_add(src.len() as u64).is_some_and(|end| end <= bytes)
                     && akuma_mmu::copy_to_phys((base + offset) as usize, src)
@@ -676,7 +698,10 @@ impl Disk for HostDisk {
     }
 
     fn flush(&mut self) -> bool {
-        true
+        match self {
+            Self::Nvme { .. } => crate::nvme::flush().is_ok(),
+            _ => true,
+        }
     }
 }
 
@@ -1473,7 +1498,7 @@ pub fn run(nrips: bool, vm: &Vm) {
     // With a disk, one more page under the handoff pages holds the ACPI tables
     // and the memory map reports it (type 3) instead of as RAM.
     let disk = vm.pick_disk();
-    let _disk_lease = MemLease(disk);
+    let _disk_lease = DiskLease(disk);
     // A spec that names a disk does not run without it: a refused RAM copy (the reserve is too
     // small) or a missing image would otherwise boot a rootless guest that halts and is restarted
     // forever (found on the ryzen 2026-10-22, a 3 GiB image against a 3 GiB reserve).

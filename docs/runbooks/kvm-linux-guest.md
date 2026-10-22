@@ -89,8 +89,8 @@ only the keys in p7's `/root/.ssh/authorized_keys` get in. Its init is `/akuma-k
 
 **herd runs the guest (`vm = true`, ryzen entry 30):** boot entry 30 (`kvmctl kvmmem=4096`: SVM armed, 4 GiB
 reserved, no guest at boot), then enable **one** of `overlays/ryzen/rootfs/etc/herd/available/vm-serve.conf`
-(the busybox guest, sshd on host 2223) or `vm-gentoo.conf` (Gentoo from the RAM-copied image, host 2223 →
-guest 4444) by copying it to p3's `/etc/herd/enabled/` (p3 does not take `rootfs/`; the two share the VM slot and the
+(the busybox guest, sshd on host 2223) or `vm-gentoo.conf` (Gentoo **on p7 itself**, in place, host 2223 →
+guest 4444; stage `/akuma-kvm-init.sh` on p7 from Pop, back p7 up first, keep it unmounted, disable the `gentoo` herd box) by copying it to p3's `/etc/herd/enabled/` (p3 does not take `rootfs/`; the two share the VM slot and the
 port). Check: `herd status` lists the service as `running (vm)`; `herd log vm-gentoo` is the guest's console;
 `kill` the `herd vm-run` pid and herd restarts it (the guest is stopped within 200 ms of its owner's death, the
 new one waits out `EBUSY`); `echo status > /dev/kvm0; herd log vm-gentoo | tail` shows the kernel's view. Rehearse

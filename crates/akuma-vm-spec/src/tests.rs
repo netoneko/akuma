@@ -4,7 +4,7 @@ use core::fmt::Write as _;
 
 use crate::arena::{Arena, MAX_EXTENTS};
 use crate::spec::{MAX_CMDLINE, MAX_FORWARDS, MAX_PATH, MAX_WIRE};
-use crate::{Backend, Error, Forward, Spec};
+use crate::{Backend, DiskSource, Error, Forward, Spec};
 
 const GENTOO: &str = "type=kvm\nkernel=/boot/akuma-guest\ncmdline=init=/usr/bin/bash initargs=/akuma-kvm-init.sh\n\
 ram_mib=768\nvcpus=1\ndisk=/boot/gentoo-guest.img\ndisk_ram=1\nforward=2223:4444\n";
@@ -163,4 +163,56 @@ fn core_lists() {
     assert_eq!(parse("63"), Some(1 << 63));
     assert_eq!(first(0xf0, |c| c != 4), Some(5));
     assert_eq!(first(0xf0, |_| false), None);
+}
+
+#[test]
+fn a_disk_is_a_file_a_partition_or_nothing() {
+    let src = |d: &str| parse(&std::format!("kernel=/k\ndisk={d}\n")).map(|s| s.disk_source().clone_owned());
+    assert_eq!(parse("kernel=/k\n").unwrap().disk_source(), DiskSource::None);
+    assert_eq!(src("/boot/x.img"), Ok(Owned::File("/boot/x.img".into())));
+    assert_eq!(src("/dev/nvme0n1p7"), Ok(Owned::Part(7)));
+    assert_eq!(src("/dev/nvme0n1p128"), Ok(Owned::Part(128)));
+}
+
+#[test]
+fn only_an_nvme_partition_may_be_named_as_a_device() {
+    for bad in ["/dev/nvme0n1", "/dev/nvme0n1p", "/dev/nvme0n1p0", "/dev/nvme0n1p129", "/dev/nvme0n1p7a", "/dev/nvme0n1p-1", "/dev/nvme1n1p3", "/dev/sda1", "/dev/vda", "/dev/"] {
+        assert_eq!(parse(&std::format!("kernel=/k\ndisk={bad}\n")), Err(Error::BadValue), "{bad}");
+    }
+}
+
+#[test]
+fn a_partition_is_never_copied_into_ram() {
+    assert_eq!(parse("kernel=/k\ndisk=/dev/nvme0n1p7\ndisk_ram=1\n"), Err(Error::Conflict));
+    assert!(parse("kernel=/k\ndisk=/dev/nvme0n1p7\ndisk_ram=0\n").is_ok());
+    assert!(parse("kernel=/k\ndisk=/boot/g.img\ndisk_ram=1\n").is_ok());
+}
+
+#[test]
+fn a_partition_spec_round_trips() {
+    let s = parse("kernel=/k\ndisk=/dev/nvme0n1p7\n").unwrap();
+    let mut b = [0u8; MAX_WIRE];
+    let n = s.encode(&mut b).unwrap();
+    assert_eq!(parse(core::str::from_utf8(&b[..n]).unwrap()).unwrap(), s);
+}
+
+#[derive(Debug, PartialEq)]
+enum Owned {
+    None,
+    File(std::string::String),
+    Part(u32),
+}
+
+trait CloneOwned {
+    fn clone_owned(&self) -> Owned;
+}
+
+impl CloneOwned for DiskSource<'_> {
+    fn clone_owned(&self) -> Owned {
+        match self {
+            DiskSource::None => Owned::None,
+            DiskSource::File(f) => Owned::File((*f).into()),
+            DiskSource::NvmePartition(n) => Owned::Part(*n),
+        }
+    }
 }

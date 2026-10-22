@@ -17,6 +17,41 @@ pub const MAX_VCPUS: u8 = 4;
 /// The wire document the kernel accepts in one `write` (`encode` never exceeds it).
 pub const MAX_WIRE: usize = 768;
 
+/// The only raw block device a spec may name: a partition of the machine's NVMe disk,
+/// `/dev/nvme0n1p<N>`. The host's own root partition is refused by the kernel, not here.
+pub const NVME_PARTITION_PREFIX: &str = "/dev/nvme0n1p";
+
+/// Where a spec's `disk` lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskSource<'a> {
+    /// No `disk`: the machine's second virtio-blk device, if it has one.
+    None,
+    /// A file on the host's filesystem (or the image copied into RAM, with `disk_ram`).
+    File(&'a str),
+    /// GPT partition `N` of the NVMe disk, used in place: the guest's writes are the partition's.
+    NvmePartition(u32),
+}
+
+fn disk_source_of(path: &str) -> Result<DiskSource<'_>, Error> {
+    if path.is_empty() {
+        return Ok(DiskSource::None);
+    }
+    if let Some(num) = path.strip_prefix(NVME_PARTITION_PREFIX) {
+        if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::BadValue);
+        }
+        return match num.parse::<u32>() {
+            Ok(n @ 1..=128) => Ok(DiskSource::NvmePartition(n)),
+            _ => Err(Error::BadValue),
+        };
+    }
+    // No other raw device: a guest does not get to name a disk the kernel has not vetted.
+    if path.starts_with("/dev/") {
+        return Err(Error::BadValue);
+    }
+    Ok(DiskSource::File(path))
+}
+
 /// A `Copy` string of at most `N` bytes: printable ASCII, no newline.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Text<const N: usize> {
@@ -128,6 +163,8 @@ pub enum Error {
     BadLine,
     /// The document is longer than [`MAX_WIRE`].
     TooBig,
+    /// Two settings that cannot go together (`disk_ram` with a partition).
+    Conflict,
 }
 
 impl Error {
@@ -144,6 +181,7 @@ impl Error {
             Self::Missing => "a required field is empty",
             Self::BadLine => "line without '='",
             Self::TooBig => "document too long",
+            Self::Conflict => "settings that cannot be combined",
         }
     }
 }
@@ -197,6 +235,12 @@ fn port(v: &str) -> Result<u16, Error> {
 }
 
 impl Spec {
+    /// Where the disk lives (validated when it was set).
+    #[must_use]
+    pub fn disk_source(&self) -> DiskSource<'_> {
+        disk_source_of(self.disk.as_str()).unwrap_or(DiskSource::None)
+    }
+
     #[must_use]
     pub fn forwards(&self) -> &[Forward] {
         &self.forwards[..usize::from(self.n_forwards)]
@@ -239,7 +283,10 @@ impl Spec {
                 }
                 self.vcpus = n;
             }
-            "disk" | "path_on_host" => self.disk.set(value)?,
+            "disk" | "path_on_host" => {
+                disk_source_of(value)?;
+                self.disk.set(value)?;
+            }
             "disk_ram" => self.disk_ram = flag(value)?,
             "forward" => self.add_forward(value)?,
             _ => return Err(Error::UnknownKey),
@@ -254,6 +301,10 @@ impl Spec {
         }
         if self.disk_ram && self.disk.is_empty() {
             return Err(Error::Missing);
+        }
+        // A partition is used in place: there is nothing to copy into RAM.
+        if self.disk_ram && matches!(self.disk_source(), DiskSource::NvmePartition(_)) {
+            return Err(Error::Conflict);
         }
         Ok(())
     }

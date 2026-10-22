@@ -147,10 +147,16 @@ disagree on a key or a limit.
 - **A service guest's virtual processors come from its spec** (`vm_vcpus`, 1 to 4; for the boot
   flags `kvmvcpus=N`, or `vcpus=N` after the guest word in the selector file): all of them run on
   the one host core the VM task is pinned to, taking turns, so more of them is latency, not compute.
-- **A service guest's disk may be a RAM copy of a file** (`HostDisk::Mem`, `vm_disk_ram`): the guest
-  never touches a host block device, and its writes die with it. The copy is a slice of the reserve and
-  goes back to it (`MemLease`) when the run ends, on every path out. A second NVMe window is not the
-  way to give a guest a partition; the driver's single GPT window is p3's on purpose.
+- **A service guest's disk is a file, a RAM copy of a file, or an NVMe partition in place**
+  (`vm_disk`, `vm_disk_ram`). A RAM copy (`HostDisk::Mem`) never touches a host block device and its writes die
+  with it; the copy is a slice of the reserve and goes back (`DiskLease`) when the run ends, on every path out.
+  A partition (`vm_disk = /dev/nvme0n1p<N>`, `HostDisk::Nvme`, 2026-10-22) is used **in place** — its writes are
+  the partition's — through a **second NVMe window** (`nvme::open_guest_partition`): validated from the same
+  CRC-checked GPT, bounds-checked by the same `Window`/`absolute` path as the host's p3 window, one at a time,
+  and **refused when it is the host's partition or overlaps it** (the host's root is never a guest's disk). No
+  other raw device can be named (`akuma-vm-spec` rejects `/dev/sda1`, `/dev/nvme0n1`, …), and `disk_ram` with a
+  partition is a `Conflict`. (Until 2026-10-22 this paragraph said a second window was deliberately not the
+  way to give a guest a partition; that was written before there was a bounds-checked way to do it.)
 - **Unknown device instructions stop the run.** `mmio::decode` answers `None` for
   anything but the `MOV` family; guessing would corrupt state silently.
 - **Pin layouts against an independent consumer**, not the writer: PVH blobs are
@@ -215,7 +221,7 @@ adds one for a single driver. It is opened by the kernel's own `openat` arm like
 | `vm_type` | `kvm` (default) or `firecracker` (reserved: parses, the service is not loaded) |
 | `vm_kernel`, `vm_cmdline` | kernel image (an Akuma ELF), the guest command line tail (rest of the line) |
 | `vm_ram_mib`, `vm_vcpus` | 16–1024 (default 768), 1–4 (default 1) |
-| `vm_disk`, `vm_disk_ram` | image path (empty: the machine's second virtio-blk), copy it into RAM at start |
+| `vm_disk`, `vm_disk_ram` | image path, or `/dev/nvme0n1p<N>` (that partition in place; never with `vm_disk_ram`); empty: the machine's second virtio-blk. `vm_disk_ram` copies an image into RAM at start |
 | `vm_forward` | `host:guest`, repeatable up to four |
 | `vm_config` | a Firecracker JSON config (`boot-source`, `machine-config`, `drives[0]`) read first; explicit `vm_*` keys win |
 
