@@ -151,11 +151,6 @@ Read downwards; the sections below are the reference record.
        mounts a file on p3 as its virtio-blk root, runs init, matches both
        md5s and reboots itself. 99 869 exits, 207 virtual interrupts.
        [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Phase 7, 8
- [10-22] ═══ PHASE 10: LINUX WITH A LOCAL APIC ═══  "the same model, switched on for Linux"
-   │
-   ▼   CPUID reports the APIC, the PIC arrives through LINT0 ExtINT, the host's one-shot
-   │   fires at the guest's deadline. Metal: 136 LAPIC interrupts, same md5s.
-   │   [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Phase 10
  [10-22] ═══ PHASE 9: AKUMA ON AKUMA ═══  "third step of the ladder: PASS ON THE METAL"
    │
    ▼   The kernel's own ELF as the guest: a pure local-APIC model (register page,
@@ -166,6 +161,11 @@ Read downwards; the sections below are the reference record.
        identical on the host. Metal (ryzen entry 28): PASS, TSC 3794 MHz measured by
        the guest, 9 853 exits, written file verified from Pop with debugfs/e2fsck.
        [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md)
+ [10-22] ═══ PHASE 10: LINUX WITH A LOCAL APIC ═══  "the same model, switched on for Linux"
+   │
+   ▼   CPUID reports the APIC, the PIC arrives through LINT0 ExtINT, the host's one-shot
+   │   fires at the guest's deadline. Metal: 136 LAPIC interrupts, same md5s.
+   │   [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Phase 10
 ```
 
 ---
