@@ -1,8 +1,8 @@
-# Rung 3: Akuma boots under its own hypervisor
+# Phase 9: Akuma boots under its own hypervisor
 
 **Date:** 2026-10-22. **Status:** **PASS on the ryzen metal** (entry 28, 2026-10-22) and under QEMU TCG:
 `[KVM] akuma guest: PASS (banner=yes, init=yes)`. Nested SVM was skipped (the box was
-offline for it; the metal run went straight after TCG). Third rung of the ladder in [`AKUMA_KVM.md`](AKUMA_KVM.md) ("KVM runs
+offline for it; the metal run went straight after TCG). Third step of the ladder in [`AKUMA_KVM.md`](AKUMA_KVM.md) ("KVM runs
 akuma"); continues [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md). No Linux
 or KVM source was read; every register offset and bit is the architectural xAPIC
 map (AMD APM Vol 2, ch. 16), the x86 `CMP`/`TEST` definitions, or the guest's own

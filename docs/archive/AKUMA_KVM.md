@@ -151,7 +151,7 @@ Read downwards; the sections below are the reference record.
        mounts a file on p3 as its virtio-blk root, runs init, matches both
        md5s and reboots itself. 99 869 exits, 207 virtual interrupts.
        [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Phase 7, 8
- [10-22] ═══ PHASE 9: AKUMA ON AKUMA ═══  "rung 3: PASS ON THE METAL"
+ [10-22] ═══ PHASE 9: AKUMA ON AKUMA ═══  "third step of the ladder: PASS ON THE METAL"
    │
    ▼   The kernel's own ELF as the guest: a pure local-APIC model (register page,
        periodic/one-shot timer, IRR/ISR priority), delivered as the same virtual
