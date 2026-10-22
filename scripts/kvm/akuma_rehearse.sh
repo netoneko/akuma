@@ -11,6 +11,8 @@
 #      MEM     QEMU RAM in MiB (default 3072: the host takes its own heap and the
 #              guest takes 768 MiB contiguous)
 #      HELLO=1     the tiny-root guest: /bin/hello is its only program (akuma_hello_rootfs.sh)
+#      SMP=1       the busybox guest with two virtual processors (`kvmsmp`; passes only when
+#                  the guest reports "smp:  2 cpus online")
 #      SELECTOR=1  boot with `kvmlinux` and /boot/kvm-guest=akuma, as ryzen's entry 28 does
 #      EXTRA   extra host command-line tokens (e.g. "nosmp")
 # Builds both images fresh in a temp dir, stops at the verdict line, and checks
@@ -32,6 +34,10 @@ WHO=akuma
 if [ -n "${HELLO:-}" ]; then
     FLAG=kvmhello
     WHO=akuma-hello
+fi
+if [ -n "${SMP:-}" ]; then
+    FLAG=kvmsmp
+    WHO=akuma-smp
 fi
 if [ -n "${SELECTOR:-}" ]; then
     printf '%s' "$WHO" > "$W/host/boot/kvm-guest"

@@ -528,9 +528,9 @@ pub enum ExitCode {
     Vintr,
     /// `CPUID`.
     Cpuid,
-    /// `PAUSE` — hardware **advances RIP** on this exit.
+    /// `PAUSE`. RIP still names the instruction: the handler steps over it (nRIP, or 2 bytes).
     Pause,
-    /// `HLT` — hardware **advances RIP** on this exit.
+    /// `HLT`. RIP still names the instruction: the handler steps over it (nRIP, or 1 byte).
     Hlt,
     /// I/O instruction.
     Ioio,
@@ -1474,6 +1474,36 @@ pub mod cpuid {
     }
 }
 
+/// The state a processor is in after a STARTUP IPI: real mode, `CS:IP = vector<<8 : 0`.
+///
+/// What `INIT` leaves is architectural (APM Vol 2 §14.1.3, Table 14-1): `CR0` has only
+/// `ET`, `CS` is `vector << 8` with base `vector << 12` (the STARTUP vector is the page
+/// number of the first instruction), every other segment is selector 0, base 0, limit
+/// `0xFFFF`, and `RIP` is 0. Paging is off, so nested paging sees the addresses as guest-physical.
+pub mod realmode {
+    use super::{Seg, SegAttr};
+
+    /// `CR0` after `INIT`: the extension-type bit. (Cache-disable/not-write-through
+    /// are what a reset sets; with nested paging they change nothing a guest can see.)
+    pub const CR0: u64 = 0x10;
+    /// Real-mode code, accessed, read/execute: type `B`, S=1, P=1, 16-bit.
+    pub const CODE: SegAttr = SegAttr::from_fields(0xB, true, 0, true, false, false, false, false);
+    /// Real-mode data, accessed, read/write: type `3`, S=1, P=1, 16-bit.
+    pub const DATA: SegAttr = SegAttr::from_fields(0x3, true, 0, true, false, false, false, false);
+
+    /// `CS` after a STARTUP IPI with `vector`.
+    #[must_use]
+    pub const fn startup_cs(vector: u8) -> Seg {
+        Seg { selector: (vector as u16) << 8, attr: CODE, limit: 0xFFFF, base: (vector as u64) << 12 }
+    }
+
+    /// `DS`/`ES`/`SS`/`FS`/`GS` after `INIT`.
+    #[must_use]
+    pub const fn data() -> Seg {
+        Seg { selector: 0, attr: DATA, limit: 0xFFFF, base: 0 }
+    }
+}
+
 /// Device models a guest talks to over port I/O and MSRs. Pure state
 /// machines — no I/O of their own — so the host tests drive them the way an
 /// exit handler would.
@@ -1959,6 +1989,20 @@ mod tests {
     // for the one test that reads a real kernel off disk.
     extern crate std;
     use super::*;
+
+    #[test]
+    fn a_startup_ipi_starts_in_real_mode_at_the_vectors_page() {
+        let cs = realmode::startup_cs(0x08);
+        assert_eq!((cs.selector, cs.base, cs.limit), (0x0800, 0x8000, 0xFFFF));
+        // base = selector * 16: the real-mode address rule the guest's trampoline relies on.
+        assert_eq!(u64::from(cs.selector) << 4, cs.base);
+        assert!(cs.attr.is_present() && !cs.attr.is_db() && !cs.attr.is_long());
+        let ds = realmode::data();
+        assert_eq!((ds.selector, ds.base, ds.limit), (0, 0, 0xFFFF));
+        assert_eq!(cs.attr.0 & 0xF, 0xB);
+        assert_eq!(ds.attr.0 & 0xF, 0x3);
+        assert_eq!(realmode::CR0 & 1, 0, "protected mode off");
+    }
 
     /// A VMCB page with one recognizable byte pattern everywhere, so an
     /// accessor that reads the wrong offset fails loudly rather than

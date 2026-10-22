@@ -55,6 +55,13 @@ guest console). On the ryzen build the image there
 (`sh scripts/kvm/akuma_hello_rootfs.sh $W/out/akuma-hello-root.img`) and stage with
 `GUEST=hello sh overlays/ryzen/kvm-akuma-stage.sh`.
 
+Two virtual processors: `SMP=1 scripts/kvm/akuma_rehearse.sh LOG` (`kvmtest kvmsmp`, or
+`akuma-smp` in `/boot/kvm-guest`; on the ryzen `GUEST=smp sh overlays/ryzen/kvm-akuma-stage.sh`)
+runs the busybox guest with a two-CPU MADT. Expect `[KVM] linux: cpu 1 started at 00008000`,
+the guest's `smp:  2 cpus online` and `guest cpus: 2`, and
+`[KVM] akuma-smp guest: PASS (banner=yes, init=yes, smp=yes)`; the summary line carries
+`vcpus=2 ipi= init=1 sipi=1 pause=` and each processor's final `rip`/state.
+
 ## If it goes wrong
 
 | you see (in the guest's console) | it is |

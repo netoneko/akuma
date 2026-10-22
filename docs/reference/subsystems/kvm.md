@@ -76,6 +76,23 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 - **A device access is not always a `MOV`.** LLVM folds a volatile load used only by a
   comparison into the `CMP`/`TEST`. `mmio::decode` covers those (they read once and
   write only flags); read-modify-write forms are refused.
+- **Virtual processors take turns on the host core** (`Guest::AkumaSmp`, 2 vCPUs;
+  `MAX_VCPUS` = 4). Each has its own VMCB, **ASID** (the TLB is tagged by it, and two
+  processors share one core), `Lapic` (APIC id = index), `IA32_APIC_BASE` and MSR table;
+  the PIT/PIC are processor 0's only. After every exit the loop moves on to the next
+  runnable processor. An ICR write that names another processor leaves an `Ipi` in the
+  sender's `Lapic` outbox, routed *after* the exit's VMCB borrow ends (a STARTUP
+  rewrites another VMCB): INIT parks and resets the target, STARTUP starts a parked one
+  in real mode at `vector << 12` (`realmode`), fixed raises the vector (not on a parked
+  processor). The MADT lists `n` CPUs (`acpi::build_smp`).
+- **`PAUSE` is intercepted while more than one processor can run**, so a spin-waiter
+  yields the core at once. Without it a waiter burns its whole slice on a lock whose
+  holder is the processor that is not running (a convoy of `[bkls>]` lines) and the
+  guest's spin-count logic sees stalls no real machine produces (`SWITCH BADFRAME`).
+  The exit does **not** advance RIP: step over it like `HLT` (nRIP, else the length).
+- **The Akuma kernel finds ACPI by scanning `0xE0000..0xFFFFF`** and ignores
+  `rsdp_paddr`, so an Akuma guest's table page is placed at `0xE0000` (inside the RAM
+  entry, no entry of its own); Linux gets `rsdp_paddr` and a type-3 entry.
 - **The Akuma guest needs ≥ 768 MiB** (its fixed 512 MiB heap must sit in one region)
   and finds its disk from `virtio_mmio.device=` on the command line, not ACPI.
 - **The guest never gets the host's root.** Its disk is the machine's *second*
@@ -91,8 +108,8 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 Runbook: [`../../runbooks/kvm-linux-guest.md`](../../runbooks/kvm-linux-guest.md).
 Kernel command line: `kvmtest kvmlinux`, `kvmtest kvmlapic` (Linux with the local APIC) or `kvmtest kvmakuma` (add `noladder` under
 TCG). `kvmhello` is the same guest on a 2 MiB root whose only file is `/bin/hello`.
-`kvmlinux` runs an Akuma guest instead when p3's `/boot/kvm-guest` begins with
-`akuma` (busybox root), `akuma-hello` or `linux-apic` — the bootloader entry's command line is baked into `grubx64.efi`, so the file
+`kvmsmp` is the busybox guest with two virtual processors. `kvmlinux` runs an Akuma guest instead when p3's `/boot/kvm-guest` begins with
+`akuma` (busybox root), `akuma-hello`, `akuma-smp` or `linux-apic` — the bootloader entry's command line is baked into `grubx64.efi`, so the file
 is the lever that lets one entry serve both.
 
 ## Background

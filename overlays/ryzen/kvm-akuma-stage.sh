@@ -3,7 +3,7 @@
 #
 #   BRANCH=kvm-part-1 sh build.sh                 (netoneko, ryzen: builds the kernel ON the ryzen)
 #   GUEST=hello sh scripts/kvm/akuma_hello_rootfs.sh $W/out/akuma-hello-root.img   (netoneko, optional)
-#   [GUEST=hello|linux|linux-apic] sh kvm-akuma-stage.sh [KERNEL]                (root, in Pop; p3 not mounted by Akuma; SRC=<clone> W=<dir> override)
+#   [GUEST=hello|smp|linux|linux-apic] sh kvm-akuma-stage.sh [KERNEL]                (root, in Pop; p3 not mounted by Akuma; SRC=<clone> W=<dir> override)
 #   sh arm.sh 28                                  (boots entry 28 once; ~3 min later Pop is back)
 #
 # Does, each step safe to repeat:
@@ -60,11 +60,12 @@ elif [ "$GUEST" = hello ]; then
     cp "$HELLO_IMG" $P/boot/akuma-hello-root.img
     printf akuma-hello > $P/boot/kvm-guest
 else
+    # `busybox` and `smp` share the busybox root; `smp` boots it with two virtual processors.
     T=$(mktemp -d)
     E2FSPROGS=/sbin sh "$SRC/scripts/kvm/akuma_guest_rootfs.sh" "$T/guest.img" "$BB"
     cp "$T/guest.img" $P/boot/akuma-guest-root.img
     rm -rf "$T"
-    printf akuma > $P/boot/kvm-guest
+    if [ "$GUEST" = smp ]; then printf akuma-smp > $P/boot/kvm-guest; else printf akuma > $P/boot/kvm-guest; fi
 fi
 
 sync

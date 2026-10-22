@@ -22,6 +22,7 @@ ln -s busybox "$T/bin/sh"
 cat > "$T/etc/guest.sh" <<'SH'
 /bin/busybox echo AKUMA-GUEST-UP
 /bin/busybox uname -a
+/bin/busybox echo "guest cpus: $(/bin/busybox grep -c '^processor' /proc/cpuinfo)"
 /bin/busybox md5sum /bin/busybox
 /bin/busybox yes | /bin/busybox head -c 262144 > /wtest
 /bin/busybox sync

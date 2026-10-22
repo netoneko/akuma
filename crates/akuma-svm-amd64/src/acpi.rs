@@ -45,7 +45,16 @@ pub const FADT_OFF: usize = 0x080;
 /// See [`RSDP_OFF`].
 pub const MADT_OFF: usize = 0x1A0;
 /// `sizeof(MADT)` as built: header, two words, one 8-byte local APIC entry.
-pub const MADT_LEN: usize = 36 + 8 + 8;
+pub const MADT_LEN: usize = madt_len(1);
+/// Most processors the MADT page has room for (`MADT_OFF` to `DSDT_OFF`).
+pub const MAX_CPUS: usize = (DSDT_OFF - MADT_OFF - 44) / 8;
+
+/// The MADT's length with `cpus` processor-local-APIC entries of 8 bytes after
+/// its 44-byte header.
+#[must_use]
+pub const fn madt_len(cpus: usize) -> usize {
+    44 + 8 * cpus
+}
 /// See [`RSDP_OFF`].
 pub const DSDT_OFF: usize = 0x200;
 /// `sizeof(FADT)` for revision 6.
@@ -268,7 +277,13 @@ fn aml(out: &mut Out<'_>, dev: &VirtioMmio) {
 /// Returns the RSDP's guest-physical address (the page's start), or `None` if
 /// `page` is too small.
 pub fn build(page: &mut [u8], page_gpa: u64, dev: &VirtioMmio) -> Option<u64> {
-    if page.len() < PAGE {
+    build_smp(page, page_gpa, dev, 1)
+}
+
+/// [`build`] with `cpus` processors in the MADT: ACPI processor id and APIC id
+/// both `0..cpus`, all enabled. `None` for zero or more than [`MAX_CPUS`].
+pub fn build_smp(page: &mut [u8], page_gpa: u64, dev: &VirtioMmio, cpus: usize) -> Option<u64> {
+    if page.len() < PAGE || cpus == 0 || cpus > MAX_CPUS {
         return None;
     }
     page[..PAGE].fill(0);
@@ -306,18 +321,22 @@ pub fn build(page: &mut [u8], page_gpa: u64, dev: &VirtioMmio) -> Option<u64> {
         header(f, b"FACP", FADT_LEN, 6);
     }
 
-    // MADT: PCAT_COMPAT says two 8259s are present; the one processor-local
-    // APIC entry (type 0, length 8: ACPI id 0, APIC id 0, enabled) is the CPU.
+    // MADT: PCAT_COMPAT says two 8259s are present; each processor-local APIC
+    // entry (type 0, length 8: ACPI id n, APIC id n, enabled) is a CPU.
     {
-        let m = &mut page[MADT_OFF..MADT_OFF + MADT_LEN];
+        let len = madt_len(cpus);
+        let m = &mut page[MADT_OFF..MADT_OFF + len];
         put32(m, 36, 0xFEE0_0000); // local interrupt controller address
         put32(m, 40, 1); // flags: PCAT_COMPAT
-        m[44] = 0; // entry type: processor local APIC
-        m[45] = 8; // entry length
-        m[46] = 0; // ACPI processor id
-        m[47] = 0; // APIC id
-        put32(m, 48, 1); // flags: enabled
-        header(m, b"APIC", MADT_LEN, 5);
+        for n in 0..cpus {
+            let e = 44 + 8 * n;
+            m[e] = 0; // entry type: processor local APIC
+            m[e + 1] = 8; // entry length
+            m[e + 2] = n as u8; // ACPI processor id
+            m[e + 3] = n as u8; // APIC id
+            put32(m, e + 4, 1); // flags: enabled
+        }
+        header(m, b"APIC", len, 5);
     }
 
     // XSDT: header + two 64-bit pointers.
@@ -512,6 +531,27 @@ mod tests {
         // Ports outside the block are not ours.
         assert!(Pm1::owns(0x600) && Pm1::owns(0x605));
         assert!(!Pm1::owns(0x5FF) && !Pm1::owns(0x606));
+    }
+
+    #[test]
+    fn the_madt_lists_every_cpu_with_its_apic_id() {
+        let mut p = [0u8; PAGE];
+        assert_eq!(build_smp(&mut p, GPA, &DEV, 3), Some(GPA));
+        let m = MADT_OFF;
+        assert_eq!(le32(&p, m + 4) as usize, madt_len(3));
+        assert_eq!(sum(&p[m..m + madt_len(3)]), 0);
+        for n in 0..3 {
+            let e = m + 44 + 8 * n;
+            assert_eq!(&p[e..e + 4], &[0, 8, n as u8, n as u8]);
+            assert_eq!(le32(&p, e + 4), 1);
+        }
+        // The table ends where the length says: nothing of a longer table remains.
+        assert_eq!(p[m + madt_len(3)], 0);
+        // The DSDT after it is untouched by the longest MADT.
+        assert_eq!(build_smp(&mut p, GPA, &DEV, MAX_CPUS), Some(GPA));
+        assert_eq!(&p[DSDT_OFF..DSDT_OFF + 4], b"DSDT");
+        assert_eq!(build_smp(&mut p, GPA, &DEV, 0), None);
+        assert_eq!(build_smp(&mut p, GPA, &DEV, MAX_CPUS + 1), None);
     }
 
     #[test]

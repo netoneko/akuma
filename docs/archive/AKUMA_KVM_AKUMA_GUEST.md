@@ -81,13 +81,45 @@ the run on the line's last words (`run by Akuma`).
 | QEMU TCG | **PASS** (flag and selector), 5 269 exits; the busybox guest unchanged |
 | **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma-hello`, kernel `d79495a` built on the ryzen) | **PASS**: `Hello, world! This is the init of a guest of Akuma, run by Akuma`, 6 531 exits, 4 virtual interrupts, 46 MMIO, 18 LAPIC page accesses; guest TSC 3791 MHz. Log: [`AMD64_KVMTEST_PHASE9_HELLO_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE9_HELLO_METAL_DMESG_2026_10_22.txt) |
 
+## Two virtual processors (phase 11, 2026-10-22)
+
+`kvmtest kvmsmp` (`/boot/kvm-guest` = `akuma-smp`): the busybox guest with two vCPUs, run in
+turn on the host core. **Rehearsed under QEMU TCG only — not yet on the metal.**
+
+What it took, in the order it was found:
+
+* **The guest scans, it is not told.** The first run reported `acpi: none found (no RSDP in
+  the EBDA or the BIOS window)` although `rsdp_paddr` pointed at a valid table: the Akuma
+  kernel ignores that field (`akuma-ryzen-amd64` `acpi.rs`: it is 0 on QEMU and Firecracker).
+  The table page now sits at `0xE0000`, the BIOS window's first address.
+* **INIT/STARTUP.** `Lapic` returns the ICR write as an `Ipi`; INIT parks and resets the
+  target, STARTUP puts it in real mode at `vector << 12` with the architectural reset state
+  (`realmode`); the guest's own trampoline at `0x8000` does the rest. `smp:  2 cpus online`.
+* **`SWITCH BADFRAME` (a corrupted saved frame) with 500 µs and 5 ms slices**, and
+  `[bkls>] spins=` convoys, while the BSP held the BKL and the AP spun: a descheduled lock holder.
+  The same kernel under plain QEMU `-smp 2` ran clean, so it was the multiplexing. Intercepting
+  `PAUSE` while two processors are runnable ends both. The cause of the corrupted frame was
+  **not** pinned down; the working assumption is spin-count logic in the guest, and an
+  uninstrumented guest that never executes `PAUSE` could still meet it.
+* **`PAUSE` does not advance RIP.** The first version of the exit arm did nothing, so the
+  guest re-executed the same `PAUSE` forever (1.5 M exits, no interrupts, console quiet).
+  `ExitCode::{Pause,Hlt}`'s doc comment claimed the hardware advances RIP; the `HLT` arm had
+  always stepped over it by hand. Corrected.
+
+| where | result |
+|---|---|
+| QEMU TCG, `SMP=1 scripts/kvm/akuma_rehearse.sh` x7 | **PASS** every time: `guest cpus: 2`, `/wtest` md5 `71277886…` (host `debugfs`), clean `e2fsck`, 2-3 or ~255 IPIs, 45-305 `HLT`s |
+| QEMU TCG, one-vCPU Akuma and hello guests | unchanged **PASS** |
+| the Linux guests | not rerun (no `vmlinux` off the metal); their path differs only by one-element arrays |
+
 ## Still open
 
 * (Fixed 2026-10-22, same day: a guest spinning with `IF` set used to see timer
   interrupts at the 10 ms host-tick rate; the host's one-shot is now armed at the guest's
   deadline — [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Phase 10.)
-* One vCPU (`nosmp`), no IOAPIC, no virtio-net, no PCI. SMP needs INIT/STARTUP delivery
-  and a second VMCB; the `Lapic` model already carries the ICR.
+* No IOAPIC, no virtio-net, no PCI. SMP (above) is cooperative multiplexing on one host
+  core, not parallel: two vCPUs run at most one core's worth. Not yet run on the metal.
+* ASIDs are distinct per vCPU but untested on real hardware (TCG ignores them).
 * The guest's `HLT` with `IF` clear stops the run (same as the Linux guest).
 
 ## Background

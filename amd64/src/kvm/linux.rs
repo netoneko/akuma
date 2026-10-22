@@ -37,7 +37,7 @@ use super::{crumb, dec, dump_exit, dump_state, enable_on_core, hx, image_pa, nex
 use crate::phys::FreshFrame;
 use akuma_svm_amd64 as svm;
 use akuma_svm_amd64::devices::{MsrStore, Uart};
-use akuma_svm_amd64::lapic::{self, Lapic};
+use akuma_svm_amd64::lapic::{self, IpiMode, Lapic};
 use akuma_svm_amd64::mmio;
 use akuma_svm_amd64::pic::PicPair;
 use akuma_svm_amd64::pit::{self, Pit};
@@ -67,6 +67,23 @@ const AKUMA_DISK_IMAGE_PATH: &str = "/boot/akuma-guest-root.img";
 /// 2 MiB nested leaves maps 1 GiB, which bounds this.
 const AKUMA_RAM_BYTES: u64 = 768 << 20;
 
+/// Where an Akuma guest's ACPI page goes: the first address of the BIOS read-only window
+/// its RSDP scan covers (`0xE0000..0x100000`).
+const BIOS_RSDP_GPA: u64 = 0xE_0000;
+/// Virtual processors of [`Guest::AkumaSmp`]. The ACPI page has room for
+/// [`svm::acpi::MAX_CPUS`]; two is what proves the INIT/STARTUP path and the IPI
+/// routing, and each more is one more VMCB and one more share of the host core.
+const AKUMA_SMP_VCPUS: usize = 2;
+/// Most virtual processors any guest has: sizes the per-processor arrays.
+const MAX_VCPUS: usize = 4;
+/// How long one virtual processor runs before the host timer takes the core back for
+/// the next (µs), when more than one can run. Short enough that an AP spinning on a
+/// flag the BSP is about to set does not cost a host tick (10 ms) per round.
+const QUANTUM_US: u64 = 500;
+/// The line the Akuma kernel prints when every processor the MADT listed is up
+/// (`amd64/src/smp.rs`): the SMP guest's pass needs it.
+const SMP_UP_LINE: &[u8] = b"smp:  2 cpus online";
+
 /// The tiny-root Akuma guest's command-line tail: its only program is `/bin/hello`.
 const HELLO_DISK_ARGS: &str = " virtio_mmio.device=4K@0xd0000000:5 init=/bin/hello";
 /// Its disk when the machine has no second virtio-blk device (2 MiB, one file).
@@ -95,12 +112,24 @@ pub enum Guest {
     /// The same Akuma guest on the smallest possible root: a 2 MiB ext2 with one
     /// file, `/bin/hello`, as init. No busybox, no script, no shell.
     AkumaHello,
+    /// The Akuma guest with [`AKUMA_SMP_VCPUS`] virtual processors: an ACPI MADT lists
+    /// them, the guest starts the others with INIT and STARTUP IPIs through its local
+    /// APIC, and the hypervisor runs them in turn on the host core.
+    AkumaSmp,
 }
 
 impl Guest {
+    /// How many virtual processors the guest has.
+    const fn vcpus(self) -> usize {
+        match self {
+            Self::AkumaSmp => AKUMA_SMP_VCPUS,
+            _ => 1,
+        }
+    }
+
     /// Is the guest this kernel's own ELF (as opposed to a Linux `vmlinux`)?
     const fn is_akuma(self) -> bool {
-        matches!(self, Self::Akuma | Self::AkumaHello)
+        matches!(self, Self::Akuma | Self::AkumaHello | Self::AkumaSmp)
     }
 
     const fn is_linux(self) -> bool {
@@ -115,21 +144,21 @@ impl Guest {
     const fn path(self) -> &'static str {
         match self {
             Self::Linux | Self::LinuxApic => LINUX_PATH,
-            Self::Akuma | Self::AkumaHello => AKUMA_PATH,
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp => AKUMA_PATH,
         }
     }
 
     const fn ram_bytes(self) -> u64 {
         match self {
             Self::Linux | Self::LinuxApic => RAM_BYTES,
-            Self::Akuma | Self::AkumaHello => AKUMA_RAM_BYTES,
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp => AKUMA_RAM_BYTES,
         }
     }
 
     const fn disk_path(self) -> &'static str {
         match self {
             Self::Linux | Self::LinuxApic => DISK_IMAGE_PATH,
-            Self::Akuma => AKUMA_DISK_IMAGE_PATH,
+            Self::Akuma | Self::AkumaSmp => AKUMA_DISK_IMAGE_PATH,
             Self::AkumaHello => HELLO_DISK_IMAGE_PATH,
         }
     }
@@ -138,7 +167,7 @@ impl Guest {
     const fn banner(self) -> &'static [u8] {
         match self {
             Self::Linux | Self::LinuxApic => b"Linux version",
-            Self::Akuma | Self::AkumaHello => b"Akuma/amd64",
+            Self::Akuma | Self::AkumaHello | Self::AkumaSmp => b"Akuma/amd64",
         }
     }
 
@@ -147,7 +176,7 @@ impl Guest {
     const fn done(self) -> Option<&'static [u8]> {
         match self {
             Self::Linux | Self::LinuxApic => None,
-            Self::Akuma => Some(b"AKUMA-GUEST-DONE"),
+            Self::Akuma | Self::AkumaSmp => Some(b"AKUMA-GUEST-DONE"),
             Self::AkumaHello => Some(b"run by Akuma"),
         }
     }
@@ -158,6 +187,7 @@ impl Guest {
             Self::LinuxApic => "linux-apic",
             Self::Akuma => "akuma",
             Self::AkumaHello => "akuma-hello",
+            Self::AkumaSmp => "akuma-smp",
         }
     }
 }
@@ -584,13 +614,18 @@ struct Platform {
     pic: PicPair,
     /// The ACPI PM1 registers the FADT points at.
     pm1: svm::acpi::Pm1,
-    /// The local APIC, reached through the MMIO page once the guest has set
-    /// `IA32_APIC_BASE`'s enable bit. Absent (a Linux guest told `nolapic`
-    /// never sets it) the PIC is the whole interrupt fabric.
-    lapic: Lapic,
-    /// `IA32_APIC_BASE`: base, BSP flag, global enable.
-    apic_base: u64,
-    msrs: MsrStore<48>,
+    /// Each processor's local APIC, reached through the MMIO page once the guest has
+    /// set `IA32_APIC_BASE`'s enable bit. Absent (a Linux guest told `nolapic`
+    /// never sets it) the PIC is the whole interrupt fabric. APIC id = index.
+    lapics: [Lapic; MAX_VCPUS],
+    /// Each processor's `IA32_APIC_BASE`: base, BSP flag (processor 0 only), global enable.
+    apic_bases: [u64; MAX_VCPUS],
+    /// Each processor's remembered MSRs.
+    msrs: [MsrStore<48>; MAX_VCPUS],
+    /// The processor whose exit is being handled: what `rdmsr`/`wrmsr` read and write.
+    cur: usize,
+    /// "smp: N cpus online", the Akuma kernel's report that every processor started.
+    smp_up: Needle,
     cmos_index: u8,
     /// The first console line the guest must print, and (Akuma) the line its
     /// init prints at the end.
@@ -659,11 +694,28 @@ impl Platform {
             pit: Pit::new(),
             pic: PicPair::new(),
             pm1: svm::acpi::Pm1::new(),
-            lapic: Lapic::new(),
+            lapics: {
+                let mut a = [const { Lapic::new() }; MAX_VCPUS];
+                let mut i = 0;
+                while i < MAX_VCPUS {
+                    a[i] = Lapic::new().with_id(i as u8);
+                    i += 1;
+                }
+                a
+            },
             // What firmware leaves behind: enabled, for a guest that sees an APIC in
-            // CPUID. (A guest told `nolapic` never looks at the page.)
-            apic_base: lapic::DEFAULT_BASE | APIC_BASE_BSP | if matches!(guest, Guest::LinuxApic) { APIC_BASE_ENABLE } else { 0 },
-            msrs: MsrStore::new(),
+            // CPUID. (A guest told `nolapic` never looks at the page.) The SMP guest's
+            // processors all start enabled, as hardware's do; the one-processor Akuma
+            // guest has always set the bit itself.
+            apic_bases: {
+                let on = matches!(guest, Guest::LinuxApic | Guest::AkumaSmp);
+                let mut a = [lapic::DEFAULT_BASE | if on { APIC_BASE_ENABLE } else { 0 }; MAX_VCPUS];
+                a[0] |= APIC_BASE_BSP;
+                a
+            },
+            msrs: [const { MsrStore::new() }; MAX_VCPUS],
+            cur: 0,
+            smp_up: Needle::new(if guest.vcpus() > 1 { SMP_UP_LINE } else { b"" }),
             cmos_index: 0,
             banner: Needle::new(guest.banner()),
             done: Needle::new(match guest.done() {
@@ -689,71 +741,78 @@ impl Platform {
         p(core::str::from_utf8(&one).unwrap_or("?"));
         self.banner.feed(b);
         self.done.feed(b);
+        self.smp_up.feed(b);
     }
 
-    /// Is the local APIC on, and where does its page sit?
-    fn lapic_page(&self) -> Option<u64> {
-        (self.apic_base & APIC_BASE_ENABLE != 0).then_some(self.apic_base & APIC_BASE_ADDR)
+    /// Is processor `cpu`'s local APIC on, and where does its page sit?
+    fn lapic_page(&self, cpu: usize) -> Option<u64> {
+        let base = self.apic_bases[cpu];
+        (base & APIC_BASE_ENABLE != 0).then_some(base & APIC_BASE_ADDR)
     }
 
-    /// Bring every interrupt source up to `now_us` and say which vector, if any,
-    /// the guest should be offered. With the local APIC on it is the only
-    /// source (the PIC reaches the CPU through LINT0, which is not modelled);
-    /// without it the PIC is the whole fabric.
-    fn offer(&mut self, now_us: u64) -> Option<Offer> {
-        if self.pit.take_irq0(pit::ticks_from_us(now_us)) {
+    /// Bring every interrupt source `cpu` sees up to `now_us` and say which vector, if
+    /// any, it should be offered. With the local APIC on it is the only source
+    /// (the PIC reaches processor 0 through LINT0, the virtual wire); without it
+    /// the PIC is the whole fabric. The PIC and PIT are processor 0's: no other
+    /// processor is ever offered their vectors.
+    fn offer(&mut self, cpu: usize, now_us: u64) -> Option<Offer> {
+        if cpu == 0 && self.pit.take_irq0(pit::ticks_from_us(now_us)) {
             self.pic.raise(0);
         }
-        if self.lapic_page().is_some() {
-            self.lapic.poll(lapic::bus_ticks_from_us(now_us));
-            if let Some(vector) = self.lapic.pending() {
+        if self.lapic_page(cpu).is_some() {
+            let lapic = &mut self.lapics[cpu];
+            lapic.poll(lapic::bus_ticks_from_us(now_us));
+            if let Some(vector) = lapic.pending() {
                 return Some(Offer { vector, source: Source::Lapic });
             }
             // The virtual wire: with LINT0 in ExtINT mode the PIC's output reaches
             // the processor through the local APIC.
-            if self.lapic.lint0_extint() {
+            if cpu == 0 && lapic.lint0_extint() {
                 return self.pic.pending().map(|vector| Offer { vector, source: Source::Pic });
             }
             return None;
         }
-        self.pic.pending().map(|vector| Offer { vector, source: Source::Pic })
+        if cpu == 0 { self.pic.pending().map(|vector| Offer { vector, source: Source::Pic }) } else { None }
     }
 
-    /// The guest took `offer` (the processor cleared `V_IRQ`): the INTA cycle.
+    /// `cpu` took `offer` (the processor cleared `V_IRQ`): the INTA cycle.
     /// False if the PIC acknowledged a different vector than it offered.
-    fn accept(&mut self, offer: Offer) -> bool {
+    fn accept(&mut self, cpu: usize, offer: Offer) -> bool {
         match offer.source {
             Source::Pic => self.pic.acknowledge() == Some(offer.vector),
             Source::Lapic => {
-                self.lapic.acknowledge(offer.vector);
+                self.lapics[cpu].acknowledge(offer.vector);
                 true
             }
         }
     }
 
-    /// The host `uptime_us` at which the guest's earliest timer will next have
+    /// The host `uptime_us` at which `cpu`'s earliest timer will next have
     /// something to deliver, if any can. Used to make the host's own timer interrupt
     /// land there, so a guest that never exits gets its tick on time and not at the
     /// next 10 ms host tick.
-    fn next_event_us(&self) -> Option<u64> {
-        let pit = self.pit.next_irq0_tick().map(pit::us_from_ticks);
-        if self.lapic_page().is_none() {
+    fn next_event_us(&self, cpu: usize) -> Option<u64> {
+        let pit = if cpu == 0 { self.pit.next_irq0_tick().map(pit::us_from_ticks) } else { None };
+        if self.lapic_page(cpu).is_none() {
             return pit;
         }
+        let lapic = &self.lapics[cpu];
         let per_us = lapic::bus_ticks_from_us(1);
-        let apic = self.lapic.next_event().map(|t| t.div_ceil(per_us));
-        match (apic, if self.lapic.lint0_extint() { pit } else { None }) {
+        let apic = lapic.next_event().map(|t| t.div_ceil(per_us));
+        match (apic, if lapic.lint0_extint() { pit } else { None }) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
     }
 
-    /// Could an interrupt ever arrive for a guest halted with `IF` set?
-    fn can_wake(&self) -> bool {
-        if self.lapic_page().is_none() {
-            return self.pit.next_irq0_tick().is_some();
+    /// Could an interrupt ever arrive for `cpu`, halted with `IF` set?
+    fn can_wake(&self, cpu: usize) -> bool {
+        let pit = cpu == 0 && self.pit.next_irq0_tick().is_some();
+        if self.lapic_page(cpu).is_none() {
+            return pit;
         }
-        self.lapic.next_event().is_some() || (self.lapic.lint0_extint() && self.pit.next_irq0_tick().is_some())
+        let lapic = &self.lapics[cpu];
+        lapic.next_event().is_some() || (lapic.lint0_extint() && pit)
     }
 
     fn note_io(&mut self, port: u16, write: bool, val: u32) {
@@ -877,10 +936,10 @@ impl Platform {
             // The host's time-stamp counter, as `RDTSC` already returns it.
             MSR_TSC => akuma_cpu::tsc::rdtsc(),
             // Base 0xFEE0_0000, BSP; the enable bit is the guest's to set.
-            MSR_APIC_BASE => self.apic_base,
+            MSR_APIC_BASE => self.apic_bases[self.cur],
             _ => {
                 self.note_msr(msr, false, 0);
-                self.msrs.get(msr).unwrap_or(0)
+                self.msrs[self.cur].get(msr).unwrap_or(0)
             }
         }
     }
@@ -915,10 +974,13 @@ impl Platform {
             MSR_SYSENTER_EIP => v.set_save64(save::SYSENTER_EIP, val),
             MSR_PAT => v.set_save64(save::G_PAT, val),
             // Base and enable are the guest's; the BSP flag is ours.
-            MSR_APIC_BASE => self.apic_base = (val & (APIC_BASE_ADDR | APIC_BASE_ENABLE)) | APIC_BASE_BSP,
+            MSR_APIC_BASE => {
+                let bsp = if self.cur == 0 { APIC_BASE_BSP } else { 0 };
+                self.apic_bases[self.cur] = (val & (APIC_BASE_ADDR | APIC_BASE_ENABLE)) | bsp;
+            }
             _ => {
                 self.note_msr(msr, true, val);
-                if !self.msrs.set(msr, val) {
+                if !self.msrs[self.cur].set(msr, val) {
                     p("[KVM] linux: MSR store full\n");
                 }
             }
@@ -1145,9 +1207,15 @@ pub fn run(nrips: bool, guest: Guest) {
     let disk = HostDisk::pick(guest.disk_path());
     // Only Linux is told about its disk through ACPI; the Akuma guest finds it on
     // the command line.
-    let acpi = disk.is_some() && guest.is_linux();
-    let acpi_gpa = ram_bytes - 0x4000;
-    let l = pvh::plan(ram_bytes, 0, if acpi { acpi_gpa } else { ram_bytes - 0x3000 });
+    // The SMP guest needs the MADT whatever its disk is.
+    let acpi = (disk.is_some() && guest.is_linux()) || guest.vcpus() > 1;
+    // Linux is handed the tables by `rsdp_paddr` and a memory-map entry under the top of
+    // RAM. The Akuma kernel ignores that field and scans the BIOS window for the RSDP
+    // (`akuma-ryzen-amd64`'s `find_rsdp`), so its page sits at the window's start, as
+    // Firecracker's does, inside the RAM entry and with no entry of its own.
+    let acpi_by_scan = guest.is_akuma();
+    let acpi_gpa = if acpi_by_scan { BIOS_RSDP_GPA } else { ram_bytes - 0x4000 };
+    let l = pvh::plan(ram_bytes, 0, if acpi && !acpi_by_scan { acpi_gpa } else { ram_bytes - 0x3000 });
     scratch.bytes_mut().fill(0);
     // The guest is told the host's TSC rate rather than left to calibrate it
     // through trapped port reads: a poll loop whose every iteration is a
@@ -1164,6 +1232,8 @@ pub fn run(nrips: bool, guest: Guest) {
         // The Akuma guest calibrates its own TSC against the virtual PIT.
         Guest::Akuma => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { AKUMA_DISK_ARGS } else { "" }),
         Guest::AkumaHello => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { HELLO_DISK_ARGS } else { "" }),
+        // No `nosmp`: the MADT says how many processors there are.
+        Guest::AkumaSmp => cmdline_with_tsc(&mut cmd, "", 0, if disk.is_some() { AKUMA_DISK_ARGS } else { "" }),
     };
     match disk {
         Some(d) => {
@@ -1199,11 +1269,13 @@ pub fn run(nrips: bool, guest: Guest) {
             p("[KVM] linux: no frame for the ACPI tables\n");
             return;
         };
-        let Some(rsdp) = svm::acpi::build(acpi_page.bytes_mut(), acpi_gpa, &dev) else {
+        let Some(rsdp) = svm::acpi::build_smp(acpi_page.bytes_mut(), acpi_gpa, &dev, guest.vcpus()) else {
             p("[KVM] linux: ACPI tables do not fit\n");
             return;
         };
-        pvh::add_acpi(start_page.bytes_mut(), scratch.bytes_mut(), rsdp, acpi_gpa, 0x1000);
+        if !acpi_by_scan {
+            pvh::add_acpi(start_page.bytes_mut(), scratch.bytes_mut(), rsdp, acpi_gpa, 0x1000);
+        }
         if !ram.write(acpi_gpa, acpi_page.bytes_mut()) {
             p("[KVM] linux: ACPI handoff failed\n");
             return;
@@ -1215,79 +1287,28 @@ pub fn run(nrips: bool, guest: Guest) {
         return;
     }
 
-    let (Some(mut vmcb_f), Some(mut host_f)) = (FreshFrame::alloc_zeroed(), FreshFrame::alloc_zeroed()) else {
-        p("[KVM] linux: no frame for the VMCB\n");
+    let Some(mut host_f) = FreshFrame::alloc_zeroed() else {
+        p("[KVM] linux: no frame for the host save area\n");
         return;
     };
-    let msrpm = static_msrpm();
-    let iopm = static_iopm();
-
-    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
-    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
-    {
-        let mut v = Vmcb::new(vmcb_f.bytes_mut());
-        // Everything the guest can ask the hypervisor about is intercepted: CPUID,
-        // every port, every MSR, HLT, the host's own interrupts and NMIs (so a
-        // timer tick reaches the host), and a triple fault (so a dead guest is a
-        // report and not a reset).
-        v.set_intr0(
-            intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT | intr0::SHUTDOWN,
-        );
-        v.set_intr1(intr1::VMRUN | intr1::VMMCALL | intr1::XSETBV);
-        // #UD, #GP, #PF and #DF are intercepted only to be seen: each is logged
-        // and re-injected, so the guest behaves as if they were not. A triple
-        // fault names no cause; the exception before it does.
-        // The Akuma guest demand-faults all its user memory: its #PF is routine
-        // (nested paging delivers it without an exit), so only Linux's is traced.
-        v.set_excp(match guest {
-            Guest::Linux | Guest::LinuxApic => excp::UD | excp::GP | excp::PF | excp::DF,
-            Guest::Akuma | Guest::AkumaHello => excp::UD | excp::GP | excp::DF,
-        });
-        v.set_iopm_base(image_pa(iopm));
-        v.set_msrpm_base(image_pa(msrpm));
-        v.set_asid(ASID);
-        v.set_tlb_control(ctrl::TLB_FLUSH_ALL);
-        v.set_np_enable(true);
-        // The host's IF — not the guest's — decides whether a physical interrupt
-        // is taken while the guest runs, so the host tick (scheduler, hardware
-        // watchdog) is never starved by a guest running with IF clear.
-        v.set_v_intr(ctrl::V_INTR_MASKING);
-        v.set_n_cr3(npt.pml4.pa() as u64);
-        let data = |base: u64| Seg { selector: 0x18, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base };
-        v.set_seg(
-            save::CS,
-            Seg { selector: 0x10, attr: SegAttr::CODE32_DPL0, limit: 0xFFFF_FFFF, base: 0 },
-        );
-        v.set_seg(save::ES, data(0));
-        v.set_seg(save::SS, data(0));
-        v.set_seg(save::DS, data(0));
-        v.set_seg(save::FS, data(0));
-        v.set_seg(save::GS, data(0));
-        // PVH asks for a 32-bit busy TSS in TR: type 0xB, present, small.
-        v.set_seg(
-            save::TR,
-            Seg {
-                selector: 0x20,
-                attr: SegAttr::from_fields(0xB, false, 0, true, false, false, false, false),
-                limit: 0x67,
-                base: 0,
-            },
-        );
-        // 32-bit protected mode, paging off: the PVH entry shape.
-        v.set_efer(svm::msr::EFER_SVME);
-        v.set_cr0(svm::cr0::PE | svm::cr0::NE);
-        v.set_cr3(0);
-        v.set_cr4(0);
-        v.set_rflags(0x2);
-        v.set_cpl(0);
-        v.set_rip(u64::from(loaded.entry));
-        v.set_rsp(0);
-        // The architectural reset PAT (WB, WT, UC-, UC twice): used because
-        // nested paging is on.
-        v.set_save64(save::G_PAT, 0x0007_0406_0007_0406);
+    // One VMCB per virtual processor, each with its own ASID (the TLB is tagged by it,
+    // and two processors share one host core).
+    let n_cpu = guest.vcpus();
+    let mut vmcbs = [const { None::<FreshFrame> }; MAX_VCPUS];
+    let mut vmcb_pas = [0u64; MAX_VCPUS];
+    for (i, slot) in vmcbs.iter_mut().enumerate().take(n_cpu) {
+        let Some(mut f) = FreshFrame::alloc_zeroed() else {
+            p("[KVM] linux: no frame for a VMCB\n");
+            return;
+        };
+        init_vmcb(f.bytes_mut(), guest, npt.pml4.pa() as u64, ASID + i as u32);
+        vmcb_pas[i] = f.pa() as u64;
+        *slot = Some(f);
     }
+    // The BSP starts the way PVH says: 32-bit protected mode, paging off.
     {
-        let v = Vmcb::new(vmcb_f.bytes_mut());
+        let mut v = vmcb_of(&mut vmcbs, 0);
+        set_pvh_state(&mut v, loaded.entry);
         if let Err(e) = svm::validate_guest_state(&v) {
             p("[KVM] linux: guest state rejected: ");
             p(e.name());
@@ -1304,7 +1325,6 @@ pub fn run(nrips: bool, guest: Guest) {
     // The host's FS/GS/TR/LDTR/syscall-MSR state, parked in a VMCB-format page
     // that `vmrun_regs` loads back after every exit.
     let host_pa = host_f.pa() as u64;
-    let vmcb_pa = vmcb_f.pa() as u64;
     let _ = host_f.bytes_mut();
     // SAFETY: `host_pa` is a frame this function owns, 4-KiB-aligned; VMSAVE
     // writes the 4 KiB state-save layout into it and nothing else.
@@ -1315,15 +1335,23 @@ pub fn run(nrips: bool, guest: Guest) {
     hx(l.start_gpa, 8);
     p(", ram=");
     dec(ram_bytes >> 20);
-    p(" MiB)\n");
+    p(" MiB, vcpus=");
+    dec(n_cpu as u64);
+    p(")\n");
 
-    let mut regs = GuestRegs { rbx: l.start_gpa, ..GuestRegs::default() };
+    // The BSP runs; the others wait for INIT and STARTUP from it.
+    let mut regs_all = [GuestRegs::default(); MAX_VCPUS];
+    regs_all[0].rbx = l.start_gpa;
+    let mut states = [CpuState::Parked; MAX_VCPUS];
+    states[0] = CpuState::Runnable;
+    let mut cur = n_cpu - 1;
     let mut plat = Platform::new(guest);
     let mut log = ExitLog { cpuid: 0, msr: 0, exc: 0 };
     let (mut exits, mut n_cpuid, mut n_msr, mut n_io, mut n_irq, mut n_exc) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut stopped = "exit budget spent";
     let mut fatal = false;
     let (mut n_inj, mut n_hlt, mut n_mmio) = (0u64, 0u64, 0u64);
+    let (mut n_ipi, mut n_init, mut n_sipi, mut n_pause) = (0u64, 0u64, 0u64, 0u64);
     let mut blk = disk.map(|d| (MmioBlk::new(d.sectors()), d));
     if crate::lapic::tsc_uptime_us().is_none() {
         p("[KVM] linux: warning: host uptime is 10 ms ticks; PIT timing will be coarse\n");
@@ -1335,8 +1363,10 @@ pub fn run(nrips: bool, guest: Guest) {
     let started_us = crate::net::uptime_us();
     plat.last_tx_us = started_us;
     let (mut n_lapic, mut n_ticks) = (0u64, 0u64);
-    'run: while exits < MAX_EXITS {
-        exits += 1;
+    'run: loop {
+        if exits >= MAX_EXITS {
+            break 'run;
+        }
         let now_us = crate::net::uptime_us();
         if now_us.saturating_sub(started_us) > RUN_BUDGET_US {
             stopped = "wall-clock budget spent";
@@ -1350,19 +1380,59 @@ pub fn run(nrips: bool, guest: Guest) {
             stopped = "guest reported its init ran to the end";
             break 'run;
         }
+        // A halted processor wakes when something can be offered to it.
+        for j in 0..n_cpu {
+            if states[j] == CpuState::Halted && plat.offer(j, now_us).is_some() {
+                states[j] = CpuState::Runnable;
+            }
+        }
+        // The next runnable processor after the one that just ran.
+        let Some(i) = (1..=n_cpu).map(|d| (cur + d) % n_cpu).find(|&j| states[j] == CpuState::Runnable) else {
+            // Nobody can run. If a halted processor's timer can still wake it, wait
+            // for it (the host tick runs underneath: IRQs are on).
+            if (0..n_cpu).any(|j| states[j] == CpuState::Halted && plat.can_wake(j)) {
+                core::hint::spin_loop();
+                continue 'run;
+            }
+            stopped = if states.contains(&CpuState::Dead) {
+                "guest halted with interrupts off"
+            } else {
+                "guest halted waiting for an interrupt nothing can raise"
+            };
+            break 'run;
+        };
+        exits += 1;
+        cur = i;
+        plat.cur = i;
         // Bring the interrupt sources up to now (the PIT's channel 0 edge, the
         // local APIC's timer), then offer the best vector to the guest as a
         // virtual INTR; the processor takes it when the guest's IF allows
         // (§15.21.4) and writes V_IRQ back cleared when it has.
-        let offered = plat.offer(now_us);
-        Vmcb::new(vmcb_f.bytes_mut()).set_v_intr(match offered {
+        let offered = plat.offer(i, now_us);
+        vmcb_of(&mut vmcbs, i).set_v_intr(match offered {
             Some(o) => ctrl::v_intr_extint(o.vector),
             None => ctrl::V_INTR_MASKING,
         });
-        // Have the host's own timer interrupt come when the guest's next timer is
-        // due, if that is before the periodic host tick: the exit it causes is where
-        // the guest gets its interrupt. Interrupts off while the timer is touched.
-        if let Some(due) = plat.next_event_us() {
+        // Have the host's own timer interrupt come when any processor's timer is due,
+        // or when this one's turn is up and another can run, if that is before the
+        // periodic host tick: the exit it causes is where the guest gets its interrupt
+        // and the next processor its turn. Interrupts off while the timer is touched.
+        // While another processor can run, a `PAUSE` (the guest's spin-wait hint) gives it
+        // the core at once: a waiter would otherwise burn its whole slice on a lock whose
+        // holder is the processor that is not running, and spin-count logic in the guest
+        // (timeouts, backoff) would see stalls no real machine produces. Alone, the
+        // guest spins undisturbed.
+        let runnable = (0..n_cpu).filter(|&j| states[j] == CpuState::Runnable).count();
+        vmcb_of(&mut vmcbs, i).set_intr0(if runnable > 1 { INTR0_BASE | intr0::PAUSE } else { INTR0_BASE });
+        let mut due = (0..n_cpu)
+            .filter(|&j| matches!(states[j], CpuState::Runnable | CpuState::Halted))
+            .filter_map(|j| plat.next_event_us(j))
+            .min();
+        if runnable > 1 {
+            let slice = now_us + QUANTUM_US;
+            due = Some(due.map_or(slice, |d| d.min(slice)));
+        }
+        if let Some(due) = due {
             akuma_cpu::daif::mask_irq();
             let _ = crate::lapic::arm_oneshot_in_us(due.saturating_sub(crate::net::uptime_us()));
             akuma_cpu::daif::unmask_irq();
@@ -1370,9 +1440,10 @@ pub fn run(nrips: bool, guest: Guest) {
         crumb(0x57);
         // SAFETY: the VMCB and the host save image are live frames this
         // function owns; SVM is enabled on this core (`enable_on_core`).
-        unsafe { vmrun_regs(vmcb_pa, host_pa, &mut regs) };
+        unsafe { vmrun_regs(vmcb_pas[i], host_pa, &mut regs_all[i]) };
         crumb(0x58);
-        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        let regs = &mut regs_all[i];
+        let mut v = vmcb_of(&mut vmcbs, i);
         // The first entry flushed; the rest need not.
         v.set_tlb_control(ctrl::TLB_DO_NOTHING);
         // V_IRQ comes back cleared once the guest has dispatched the offered
@@ -1383,7 +1454,7 @@ pub fn run(nrips: bool, guest: Guest) {
             && v.v_intr() & ctrl::V_IRQ == 0
         {
             n_inj += 1;
-            if !plat.accept(o) {
+            if !plat.accept(i, o) {
                 p("\n[KVM] linux: PIC acknowledged a different vector than it offered\n");
             }
             if o.source == Source::Lapic {
@@ -1408,7 +1479,8 @@ pub fn run(nrips: bool, guest: Guest) {
                 // its).
                 if leaf == 1 && guest.exposes_apic() {
                     d |= h.edx & (1 << 9);
-                    b &= 0x00FF_FFFF;
+                    // Initial APIC id: the processor's index, not the host core's.
+                    b = (b & 0x00FF_FFFF) | ((i as u32) << 24);
                 }
                 // The hypervisor leaves (0x4000_0000..) are scanned 256 at a time;
                 // one line says so, the rest would drown the log.
@@ -1494,32 +1566,24 @@ pub fn run(nrips: bool, guest: Guest) {
             ExitCode::Hlt => {
                 n_hlt += 1;
                 if v.rflags() & (1 << 9) == 0 {
-                    stopped = "guest halted with interrupts off";
-                    break 'run;
-                }
-                v.set_rip(next_rip(&v, nrips, 1));
-                // Idle until a timer can raise an interrupt the guest will be
-                // offered. The host tick keeps running underneath (IRQs are on).
-                loop {
-                    let now = crate::net::uptime_us();
-                    if plat.offer(now).is_some() {
-                        break;
-                    }
-                    if !plat.can_wake() {
-                        stopped = "guest halted waiting for an interrupt nothing can raise";
-                        break 'run;
-                    }
-                    if now.saturating_sub(started_us) > RUN_BUDGET_US {
-                        stopped = "wall-clock budget spent";
-                        break 'run;
-                    }
-                    core::hint::spin_loop();
+                    // Nothing can wake it. The run goes on without it while another
+                    // processor can, and stops when none can.
+                    states[i] = CpuState::Dead;
+                } else {
+                    v.set_rip(next_rip(&v, nrips, 1));
+                    // Idle until an interrupt can reach it; the others run meanwhile.
+                    states[i] = CpuState::Halted;
                 }
             }
             // A host interrupt or NMI arrived while the guest ran. The host's IF
             // is set, so it was taken at the `stgi` that ended the exit; there
             // is nothing to do but resume (and count it).
             ExitCode::Other(0x60 | 0x61) => n_irq += 1,
+            // Step over the `PAUSE` (`F3 90`); the next turn goes to the other processor.
+            ExitCode::Pause => {
+                n_pause += 1;
+                v.set_rip(next_rip(&v, nrips, 2));
+            }
             ExitCode::Ud | ExitCode::Gp | ExitCode::Pf | ExitCode::Other(0x48) => {
                 n_exc += 1;
                 let code = v.exitcode();
@@ -1565,9 +1629,9 @@ pub fn run(nrips: bool, guest: Guest) {
                 }
                 v.set_eventinj(eventinj::exception(vector, err));
             }
-            ExitCode::Npf if plat.lapic_page().is_some_and(|b| (b..b + lapic::PAGE_LEN).contains(&v.exitinfo2())) => {
+            ExitCode::Npf if plat.lapic_page(i).is_some_and(|b| (b..b + lapic::PAGE_LEN).contains(&v.exitinfo2())) => {
                 n_lapic += 1;
-                let off = v.exitinfo2() - (plat.apic_base & APIC_BASE_ADDR);
+                let off = v.exitinfo2() - (plat.apic_bases[i] & APIC_BASE_ADDR);
                 let access = guest_code(&ram, &v, v.rip()).and_then(|c| mmio::decode(&c));
                 let Some(a) = access else {
                     stopped = "guest touched the local APIC page with an instruction the MMIO decoder does not know";
@@ -1581,7 +1645,7 @@ pub fn run(nrips: bool, guest: Guest) {
                     break 'run;
                 };
                 let now = lapic::bus_ticks_from_us(crate::net::uptime_us());
-                mmio_emulate(&a, &mut LapicDev { lapic: &mut plat.lapic, off, now }, &mut v, &mut regs);
+                mmio_emulate(&a, &mut LapicDev { lapic: &mut plat.lapics[i], off, now }, &mut v, regs);
             }
             ExitCode::Npf if blk.is_some() && (VIRTIO_BASE..VIRTIO_BASE + VIRTIO_LEN).contains(&v.exitinfo2()) => {
                 n_mmio += 1;
@@ -1601,7 +1665,7 @@ pub fn run(nrips: bool, guest: Guest) {
                 let (dev, hostdisk) = blk.as_mut().expect("checked by the guard");
                 let mut window =
                     VirtioDev { dev, disk: hostdisk, ram: &ram, bounce: scratch.bytes_mut(), pic: &mut plat.pic, off };
-                mmio_emulate(&a, &mut window, &mut v, &mut regs);
+                mmio_emulate(&a, &mut window, &mut v, regs);
             }
             ExitCode::Npf => {
                 stopped = "nested page fault (guest touched unmapped guest-physical memory)";
@@ -1637,10 +1701,56 @@ pub fn run(nrips: bool, guest: Guest) {
                 break 'run;
             }
         }
+        // An ICR write that named other processors: route it now that this exit's
+        // borrow of the VMCB is over (a STARTUP rewrites another processor's).
+        if let Some(ipi) = plat.lapics[i].take_ipi() {
+            n_ipi += 1;
+            for j in 0..n_cpu {
+                if j == i || !ipi.reaches(plat.lapics[j].id()) {
+                    continue;
+                }
+                match ipi.mode {
+                    // A processor held in INIT takes no interrupts.
+                    IpiMode::Fixed if states[j] != CpuState::Parked => plat.lapics[j].raise(ipi.vector),
+                    IpiMode::Fixed => {}
+                    IpiMode::Init => {
+                        n_init += 1;
+                        states[j] = CpuState::Parked;
+                        plat.lapics[j].init_reset();
+                    }
+                    IpiMode::Startup if states[j] == CpuState::Parked => {
+                        n_sipi += 1;
+                        p("\n[KVM] linux: cpu ");
+                        dec(j as u64);
+                        p(" started at ");
+                        hx(u64::from(ipi.vector) << 12, 8);
+                        p("\n");
+                        set_startup_state(&mut vmcb_of(&mut vmcbs, j), ipi.vector);
+                        regs_all[j] = GuestRegs::default();
+                        states[j] = CpuState::Runnable;
+                    }
+                    IpiMode::Startup => {}
+                }
+            }
+        }
     }
     crumb(0x59);
 
-    let v = Vmcb::new(vmcb_f.bytes_mut());
+    if n_cpu > 1 {
+        for j in 0..n_cpu {
+            p("\n[KVM] linux: cpu ");
+            dec(j as u64);
+            p(match states[j] {
+                CpuState::Parked => " parked",
+                CpuState::Runnable => " runnable",
+                CpuState::Halted => " halted",
+                CpuState::Dead => " halted with interrupts off",
+            });
+            p(" rip=");
+            hx(vmcb_of(&mut vmcbs, j).rip(), 16);
+        }
+    }
+    let v = vmcb_of(&mut vmcbs, cur);
     p("\n[KVM] linux: stopped: ");
     p(stopped);
     p("\n[KVM] linux: exits=");
@@ -1665,6 +1775,18 @@ pub fn run(nrips: bool, guest: Guest) {
     dec(n_lapic);
     p(" lapic_irq=");
     dec(n_ticks);
+    if n_cpu > 1 {
+        p(" vcpus=");
+        dec(n_cpu as u64);
+        p(" ipi=");
+        dec(n_ipi);
+        p(" init=");
+        dec(n_init);
+        p(" sipi=");
+        dec(n_sipi);
+        p(" pause=");
+        dec(n_pause);
+    }
     p(" console_bytes=");
     dec(plat.tx_bytes);
     p(" rip=");
@@ -1672,7 +1794,8 @@ pub fn run(nrips: bool, guest: Guest) {
     p("\n");
     // A Linux run passes on its banner; the Akuma guest must also have run its
     // init to the end (the marker the script on its disk prints).
-    let pass = plat.banner.seen && !fatal && (guest.is_linux() || plat.done.seen);
+    // The SMP guest must also have started every processor.
+    let pass = plat.banner.seen && !fatal && (guest.is_linux() || plat.done.seen) && (n_cpu == 1 || plat.smp_up.seen);
     p("[KVM] ");
     p(guest.name());
     p(" guest: ");
@@ -1682,8 +1805,127 @@ pub fn run(nrips: bool, guest: Guest) {
     if guest.is_akuma() {
         p(", init=");
         p(if plat.done.seen { "yes" } else { "no" });
+        if n_cpu > 1 {
+            p(", smp=");
+            p(if plat.smp_up.seen { "yes" } else { "no" });
+        }
     }
     p(")\n");
+}
+
+/// Where a virtual processor is in its life.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CpuState {
+    /// Waiting for INIT/STARTUP (every processor but the BSP at power-on, and any after INIT).
+    Parked,
+    Runnable,
+    /// Executed `HLT` with `IF` set: runs again when an interrupt can be offered to it.
+    Halted,
+    /// Executed `HLT` with `IF` clear: nothing will ever wake it.
+    Dead,
+}
+
+/// Processor `cpu`'s VMCB.
+fn vmcb_of(frames: &mut [Option<FreshFrame>; MAX_VCPUS], cpu: usize) -> Vmcb<'_> {
+    Vmcb::new(frames[cpu].as_mut().expect("a VMCB is allocated for every virtual processor").bytes_mut())
+}
+
+/// What every processor intercepts: CPUID, every port, every MSR, HLT, the host's own
+/// interrupts and NMIs (so a timer tick reaches the host), and a triple fault (so a dead
+/// guest is a report and not a reset).
+const INTR0_BASE: u32 =
+    intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT | intr0::SHUTDOWN;
+
+/// The controls every virtual processor shares: everything the guest can ask the
+/// hypervisor about is intercepted, nested paging is on, and the host's `IF` — not
+/// the guest's — decides whether a physical interrupt is taken while the guest runs.
+fn init_vmcb(page: &mut [u8; 4096], guest: Guest, npt_root: u64, asid: u32) {
+    let mut v = Vmcb::new(page);
+    v.set_intr0(INTR0_BASE);
+    v.set_intr1(intr1::VMRUN | intr1::VMMCALL | intr1::XSETBV);
+    // #UD, #GP, #PF and #DF are intercepted only to be seen: each is logged
+    // and re-injected, so the guest behaves as if they were not. A triple
+    // fault names no cause; the exception before it does.
+    // The Akuma guest demand-faults all its user memory: its #PF is routine
+    // (nested paging delivers it without an exit), so only Linux's is traced.
+    v.set_excp(match guest {
+        Guest::Linux | Guest::LinuxApic => excp::UD | excp::GP | excp::PF | excp::DF,
+        Guest::Akuma | Guest::AkumaHello | Guest::AkumaSmp => excp::UD | excp::GP | excp::DF,
+    });
+    v.set_iopm_base(image_pa(static_iopm()));
+    v.set_msrpm_base(image_pa(static_msrpm()));
+    v.set_asid(asid);
+    v.set_tlb_control(ctrl::TLB_FLUSH_ALL);
+    v.set_np_enable(true);
+    v.set_v_intr(ctrl::V_INTR_MASKING);
+    v.set_n_cr3(npt_root);
+    v.set_save64(save::DR6, 0xFFFF_0FF0);
+    v.set_save64(save::DR7, 0x400);
+    // The architectural reset PAT (WB, WT, UC-, UC twice): used because
+    // nested paging is on.
+    v.set_save64(save::G_PAT, 0x0007_0406_0007_0406);
+}
+
+/// The BSP's state at the PVH entry: 32-bit protected mode, paging off.
+fn set_pvh_state(v: &mut Vmcb<'_>, entry: u32) {
+    let data = |base: u64| Seg { selector: 0x18, attr: SegAttr::DATA32_RW_DPL0, limit: 0xFFFF_FFFF, base };
+    v.set_seg(save::CS, Seg { selector: 0x10, attr: SegAttr::CODE32_DPL0, limit: 0xFFFF_FFFF, base: 0 });
+    v.set_seg(save::ES, data(0));
+    v.set_seg(save::SS, data(0));
+    v.set_seg(save::DS, data(0));
+    v.set_seg(save::FS, data(0));
+    v.set_seg(save::GS, data(0));
+    // PVH asks for a 32-bit busy TSS in TR: type 0xB, present, small.
+    v.set_seg(
+        save::TR,
+        Seg {
+            selector: 0x20,
+            attr: SegAttr::from_fields(0xB, false, 0, true, false, false, false, false),
+            limit: 0x67,
+            base: 0,
+        },
+    );
+    v.set_efer(svm::msr::EFER_SVME);
+    v.set_cr0(svm::cr0::PE | svm::cr0::NE);
+    v.set_cr3(0);
+    v.set_cr4(0);
+    v.set_rflags(0x2);
+    v.set_cpl(0);
+    v.set_rip(u64::from(entry));
+    v.set_rsp(0);
+}
+
+/// An application processor's state after a STARTUP IPI with `vector`: real mode at
+/// `vector << 12` (`svm::realmode`), the descriptor tables at their reset extent.
+fn set_startup_state(v: &mut Vmcb<'_>, vector: u8) {
+    v.set_seg(save::CS, svm::realmode::startup_cs(vector));
+    for seg in [save::ES, save::SS, save::DS, save::FS, save::GS] {
+        v.set_seg(seg, svm::realmode::data());
+    }
+    // GDTR, IDTR, LDTR and TR keep their reset extents: base 0, limit 0xFFFF.
+    let table = Seg { selector: 0, attr: SegAttr(0), limit: 0xFFFF, base: 0 };
+    v.set_seg(save::GDTR, table);
+    v.set_seg(save::IDTR, table);
+    v.set_seg(
+        save::LDTR,
+        Seg { selector: 0, attr: SegAttr::from_fields(0x2, false, 0, true, false, false, false, false), limit: 0xFFFF, base: 0 },
+    );
+    v.set_seg(
+        save::TR,
+        Seg { selector: 0, attr: SegAttr::from_fields(0xB, false, 0, true, false, false, false, false), limit: 0xFFFF, base: 0 },
+    );
+    v.set_efer(svm::msr::EFER_SVME);
+    v.set_cr0(svm::realmode::CR0);
+    v.set_cr3(0);
+    v.set_cr4(0);
+    v.set_rflags(0x2);
+    v.set_cpl(0);
+    v.set_rip(0);
+    v.set_rsp(0);
+    v.set_rax(0);
+    // This address space has not been seen by this ASID: flush.
+    v.set_tlb_control(ctrl::TLB_FLUSH_ALL);
+    v.set_v_intr(ctrl::V_INTR_MASKING);
 }
 
 fn static_msrpm() -> &'static Msrpm {

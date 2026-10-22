@@ -166,6 +166,12 @@ Read downwards; the sections below are the reference record.
    ▼   CPUID reports the APIC, the PIC arrives through LINT0 ExtINT, the host's one-shot
    │   fires at the guest's deadline. Metal: 136 LAPIC interrupts, same md5s.
    │   [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Phase 10
+ [10-22] ═══ PHASE 11: AKUMA WITH TWO VIRTUAL PROCESSORS ═══  "INIT, STARTUP, one host core"
+   │
+   ▼   vCPUs take turns on the host core (VMCB, ASID, local APIC each); ICR routing; a
+   │   MADT at 0xE0000 (the guest scans, ignoring rsdp_paddr); PAUSE intercepted so a
+   │   spinning waiter yields. TCG only so far: 7/7 PASS, md5 verified on the host.
+   │   [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md) § Two virtual processors
 ```
 
 ---

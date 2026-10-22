@@ -134,6 +134,49 @@ pub struct Lapic {
     timer_next: Option<u64>,
     irr: [u32; 8],
     isr: [u32; 8],
+    /// The last ICR write that names other processors, until [`Lapic::take_ipi`].
+    outbox: Option<Ipi>,
+}
+
+/// What an ICR write asks of the processors it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpiMode {
+    /// Delivery mode 000: raise `vector`.
+    Fixed,
+    /// Delivery mode 101, level assert: reset the target and park it until a STARTUP.
+    Init,
+    /// Delivery mode 110: start a parked target in real mode at `vector << 12`.
+    Startup,
+}
+
+/// Who an ICR write names, after the destination shorthand (bits 19:18) is applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpiDest {
+    /// Physical destination: the APIC id.
+    Id(u8),
+    /// Shorthand "all excluding self".
+    AllButSelf,
+    /// Shorthand "all including self" (the sender already took its own copy).
+    All,
+}
+
+/// An inter-processor interrupt on its way from one local APIC to the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ipi {
+    pub mode: IpiMode,
+    pub vector: u8,
+    pub dest: IpiDest,
+}
+
+impl Ipi {
+    /// Does the processor with APIC id `id`, which is not the sender, receive this?
+    #[must_use]
+    pub const fn reaches(&self, id: u8) -> bool {
+        match self.dest {
+            IpiDest::Id(d) => d == id,
+            IpiDest::AllButSelf | IpiDest::All => true,
+        }
+    }
 }
 
 impl Default for Lapic {
@@ -167,7 +210,15 @@ impl Lapic {
             timer_next: None,
             irr: [0; 8],
             isr: [0; 8],
+            outbox: None,
         }
+    }
+
+    /// This unit with APIC id `id`.
+    #[must_use]
+    pub const fn with_id(mut self, id: u8) -> Self {
+        self.id = id;
+        self
     }
 
     /// The processor's APIC id (the ID register's bits 31:24).
@@ -414,23 +465,51 @@ impl Lapic {
         }
     }
 
-    /// An ICR write: only a fixed-delivery IPI that targets this processor does
-    /// anything. Destination shorthand (bits 19:18): 00 none (the destination is
-    /// `icr_high[31:24]`), 01 self, 10 all including self, 11 all excluding self.
+    /// An ICR write. A fixed IPI that includes this processor is delivered to it
+    /// here; the whole request (the sender's copy aside) waits in the outbox for
+    /// the machine to route to the others. Destination shorthand (bits 19:18): 00
+    /// none (the destination is `icr_high[31:24]`), 01 self, 10 all including self,
+    /// 11 all excluding self. Modes other than fixed, INIT and STARTUP, and an INIT
+    /// level *de*-assert, do nothing.
     fn send_ipi(&mut self, low: u32) {
-        let delivery_mode = (low >> 8) & 0b111;
-        if delivery_mode != 0 {
-            return;
-        }
-        let vector = low as u8;
-        let hits_self = match (low >> 18) & 0b11 {
-            0b00 => (self.icr_high >> 24) as u8 == self.id,
-            0b01 | 0b10 => true,
-            _ => false,
+        const LEVEL: u32 = 1 << 15;
+        const ASSERT: u32 = 1 << 14;
+        let mode = match (low >> 8) & 0b111 {
+            0b000 => IpiMode::Fixed,
+            0b101 if low & LEVEL == 0 || low & ASSERT != 0 => IpiMode::Init,
+            0b110 => IpiMode::Startup,
+            _ => return,
         };
-        if hits_self {
+        let vector = low as u8;
+        let dest = match (low >> 18) & 0b11 {
+            0b00 => IpiDest::Id((self.icr_high >> 24) as u8),
+            0b01 => IpiDest::Id(self.id),
+            0b10 => IpiDest::All,
+            _ => IpiDest::AllButSelf,
+        };
+        let hits_self = match dest {
+            IpiDest::Id(d) => d == self.id,
+            IpiDest::All => true,
+            IpiDest::AllButSelf => false,
+        };
+        if hits_self && mode == IpiMode::Fixed {
             self.raise(vector);
         }
+        // A request that names only this processor has nobody to route to.
+        if !matches!(dest, IpiDest::Id(d) if d == self.id) {
+            self.outbox = Some(Ipi { mode, vector, dest });
+        }
+    }
+
+    /// The IPI the last ICR write left for the other processors, if any.
+    pub fn take_ipi(&mut self) -> Option<Ipi> {
+        self.outbox.take()
+    }
+
+    /// An INIT: the unit returns to its reset state (software-disabled, every LVT
+    /// masked, no requests), keeping its APIC id.
+    pub fn init_reset(&mut self) {
+        *self = Self::new().with_id(self.id);
     }
 }
 
@@ -709,11 +788,73 @@ mod tests {
         l.write(0x310, 0, 0);
         l.write(0x300, 0x46, 0);
         assert_eq!(l.pending(), Some(0x46));
-        // INIT / STARTUP have no target here.
+        // INIT to a processor that is not this one raises nothing here.
         l.acknowledge(0x46);
         l.eoi();
         l.write(0x300, (0b101 << 8) | 0xC000, 0);
         assert_eq!(l.pending(), None);
+    }
+
+    #[test]
+    fn other_processors_requests_wait_in_the_outbox() {
+        let mut l = enabled().with_id(1);
+        // Fixed, physical destination 2: nothing for the sender, one request out.
+        l.write(0x310, 2 << 24, 0);
+        l.write(0x300, 0x50, 0);
+        assert_eq!(l.pending(), None);
+        let ipi = l.take_ipi().expect("routed");
+        assert_eq!((ipi.mode, ipi.vector, ipi.dest), (IpiMode::Fixed, 0x50, IpiDest::Id(2)));
+        assert!(ipi.reaches(2) && !ipi.reaches(0));
+        assert_eq!(l.take_ipi(), None, "taken once");
+        // "All including self": the sender takes its copy, the rest are routed.
+        l.write(0x300, (0b10 << 18) | 0x51, 0);
+        assert_eq!(l.pending(), Some(0x51));
+        assert_eq!(l.take_ipi().map(|i| i.dest), Some(IpiDest::All));
+        // "All excluding self" is not delivered here.
+        l.acknowledge(0x51);
+        l.eoi();
+        l.write(0x300, (0b11 << 18) | 0x52, 0);
+        assert_eq!(l.pending(), None);
+        assert_eq!(l.take_ipi().map(|i| i.dest), Some(IpiDest::AllButSelf));
+        // An IPI to itself by id has nobody to route to.
+        l.write(0x310, 1 << 24, 0);
+        l.write(0x300, 0x53, 0);
+        assert_eq!(l.pending(), Some(0x53));
+        assert_eq!(l.take_ipi(), None);
+    }
+
+    #[test]
+    fn init_and_startup_are_routed_and_an_init_deassert_is_not() {
+        let mut l = enabled();
+        l.write(0x310, 1 << 24, 0);
+        // INIT, level-triggered assert (the Akuma guest's `send_init` shape).
+        l.write(0x300, (0b101 << 8) | (1 << 14) | (1 << 15), 0);
+        assert_eq!(l.take_ipi().map(|i| i.mode), Some(IpiMode::Init));
+        // INIT level de-assert: dropped.
+        l.write(0x300, (0b101 << 8) | (1 << 15), 0);
+        assert_eq!(l.take_ipi(), None);
+        // STARTUP, vector 0x08: the page the guest's trampoline sits in.
+        l.write(0x300, (0b110 << 8) | 0x08, 0);
+        let sipi = l.take_ipi().expect("routed");
+        assert_eq!((sipi.mode, sipi.vector, sipi.dest), (IpiMode::Startup, 0x08, IpiDest::Id(1)));
+        // Lowest-priority, NMI, SMI, reserved: not modelled.
+        for mode in [0b001u32, 0b010, 0b100, 0b111] {
+            l.write(0x300, mode << 8, 0);
+            assert_eq!(l.take_ipi(), None, "mode {mode:#b}");
+        }
+    }
+
+    #[test]
+    fn init_returns_the_unit_to_reset_but_keeps_its_id() {
+        let mut l = enabled().with_id(3);
+        start_periodic(&mut l, 625_000, 0);
+        l.raise(0x40);
+        l.init_reset();
+        assert_eq!(l.id(), 3);
+        assert!(!l.enabled());
+        assert_eq!(l.next_event(), None);
+        l.write(0xF0, 0x1FF, 0);
+        assert_eq!(l.pending(), None, "requests were cleared");
     }
 
     #[test]
