@@ -3,7 +3,7 @@
 #
 #   BRANCH=kvm-part-1 sh build.sh                 (netoneko, ryzen: builds the kernel ON the ryzen)
 #   GUEST=hello sh scripts/kvm/akuma_hello_rootfs.sh $W/out/akuma-hello-root.img   (netoneko, optional)
-#   [GUEST=hello|smp|net|netprobe|linux|linux-apic] sh kvm-akuma-stage.sh [KERNEL]                (root, in Pop; p3 not mounted by Akuma; SRC=<clone> W=<dir> override)
+#   [GUEST=hello|smp|net|netprobe|serve|linux|linux-apic] sh kvm-akuma-stage.sh [KERNEL]                (root, in Pop; p3 not mounted by Akuma; SRC=<clone> W=<dir> override)
 #   sh arm.sh 28                                  (boots entry 28 once; ~3 min later Pop is back)
 #
 # Does, each step safe to repeat:
@@ -32,10 +32,13 @@ BB=$SRC/target/x86_64-unknown-none/release/busybox-x86_64
 P=/mnt/p3
 GUEST=${GUEST:-busybox}
 HELLO_IMG=${HELLO_IMG:-$W/out/akuma-hello-root.img}
+SERVE_IMG=${SERVE_IMG:-$W/out/akuma-serve-root.img}
 
 [ -f "$K" ] || { echo "no kernel at $K (run build.sh first)"; exit 1; }
 if [ "$GUEST" = linux ] || [ "$GUEST" = linux-apic ]; then
     :   # the Linux guests need no image staged: /boot/vmlinux and /boot/guest-root.img are already on p3
+elif [ "$GUEST" = serve ]; then
+    [ -f "$SERVE_IMG" ] || { echo "no service root at $SERVE_IMG (overlays/ryzen/kvm-serve-stage.py builds and uploads it)"; exit 1; }
 elif [ "$GUEST" = hello ]; then
     [ -f "$HELLO_IMG" ] || { echo "no hello root at $HELLO_IMG (scripts/kvm/akuma_hello_rootfs.sh builds it)"; exit 1; }
 else
@@ -56,6 +59,11 @@ if [ "$GUEST" = linux ]; then
     rm -f $P/boot/kvm-guest
 elif [ "$GUEST" = linux-apic ]; then
     printf linux-apic > $P/boot/kvm-guest
+elif [ "$GUEST" = serve ]; then
+    # The service guest: sshd on its port 22, forwarded to host port 2223 (`kvmfwd=`). Its root
+    # carries sshd and the keys it accepts, so it is built off-box and arrives as an image.
+    cp "$SERVE_IMG" $P/boot/akuma-serve-root.img
+    printf akuma-serve > $P/boot/kvm-guest
 elif [ "$GUEST" = hello ]; then
     cp "$HELLO_IMG" $P/boot/akuma-hello-root.img
     printf akuma-hello > $P/boot/kvm-guest
