@@ -427,6 +427,7 @@ anything reached only from `akuma_exec::init`). When the archive says *fixed*, a
 | `ps` prints only a header, `ls /proc` is empty, or you need `/proc/<pid>/{stat,status,cmdline}` on either kernel | The formats are `crates/akuma-procfs`, shared by both kernels — [`archive/AKUMA_AMD64_STREAMLINING.md`](archive/AKUMA_AMD64_STREAMLINING.md) §4b. Two traps: `/proc` **exists as a real empty ext2 directory** on the amd64 image (so `getdents64` succeeds and returns nothing), and **busybox stats `/proc/<pid>/` with a trailing slash** — `strip_prefix("/proc/")` leaves `"1/"`, `procps_scan` reads the failed `stat` as "the process exited" and skips every pid silently. Extraction also found the `stat` line emitting **41 fields where its own comment listed 44**, and a `comm` truncation that could panic the kernel on a UTF-8 boundary |
 | Reuse an AArch64 crate on amd64, or find out what actually blocks one | Measured, not assumed: [`archive/AKUMA_ELF_ARCH_NEUTRAL.md`](archive/AKUMA_ELF_ARCH_NEUTRAL.md). `akuma-mmu`, `akuma-exec-core`, `akuma-vfs`, `akuma-net`, `akuma-ext2`, `akuma-isolation`, `akuma-scheduler`, `akuma-timer` and `akuma-bkl` **already build for `x86_64-unknown-none`**. Seven blocked crates had three root causes: a `#[cfg(target_os = "none")]` that selects the AArch64 arm on `x86_64-unknown-none` too (**grep for that shape — it is no longer a safe spelling**), three method calls in `akuma-elf` (fixed with the `UserPages` trait), and `akuma-gic`, which is genuinely AArch64. **`akuma-exec` is the real wall** — 54 concrete `UserAddressSpace` mentions and it genuinely uses the MMU |
 | Run a Linux guest under Akuma's own SVM hypervisor (TCG rehearsal, nested SVM, metal) | [`runbooks/kvm-linux-guest.md`](runbooks/kvm-linux-guest.md) |
+| Run a guest as a herd service (`vm = true`, `/dev/kvm0`, `kvmctl kvmmem=`) | [`runbooks/kvm-linux-guest.md`](runbooks/kvm-linux-guest.md) § *herd runs the guest*; keys and invariants in [`reference/subsystems/kvm.md`](reference/subsystems/kvm.md) § *VMs as services* |
 | Toggle debug knobs | [`reference/subsystems/config-flags.md`](reference/subsystems/config-flags.md) |
 | Run the acceptance playbooks | [`acceptance/`](../acceptance/) |
 
@@ -435,7 +436,7 @@ anything reached only from `akuma_exec::init`). When the archive says *fixed*, a
 | Subsystem | Doc | Grade |
 |---|---|---|
 | Boot / MMU / DTB | [`reference/subsystems/boot.md`](reference/subsystems/boot.md) | B |
-| KVM (SVM hypervisor, Linux guest) | [`reference/subsystems/kvm.md`](reference/subsystems/kvm.md) | **C** |
+| KVM (SVM hypervisor, Linux/Akuma guests, `/dev/kvm0`, `vm = true`) | [`reference/subsystems/kvm.md`](reference/subsystems/kvm.md) | **C** |
 | Memory (PMM, heap, COW) | [`reference/subsystems/memory.md`](reference/subsystems/memory.md) | **C** |
 | Scheduler / threads | [`reference/subsystems/scheduler.md`](reference/subsystems/scheduler.md) | A |
 | Thread & thread-group lifecycle (states, teardown lock tree, eret leaves) | [`reference/subsystems/thread-lifecycle.md`](reference/subsystems/thread-lifecycle.md) | **C** |

@@ -244,6 +244,10 @@ pub enum FileDescriptor {
     /// kernel opens one; a read regenerates the two-line snapshot fresh, so
     /// there is no per-descriptor cursor state to keep.
     DevPower,
+    /// The hypervisor's control device (`/dev/kvm0`): a VM spec or `stop`/`status` in, the
+    /// guest's console out (`akuma-vm-spec`, `amd64/src/kvm/ctl.rs`). Only the amd64 kernel
+    /// opens one, and only when the hypervisor is armed (`kvmctl`); one VM at a time.
+    DevKvm,
     /// The pointer node (`/dev/input/mouse0`): 8-byte records from the
     /// laptop's touchpad (`akuma-touchpad::ptp::encode`). Only the amd64
     /// kernel opens one, and only when a touchpad came up; reads never block.

@@ -10,6 +10,14 @@ connects through the hypervisor's gateway to sshd on the guest's port 22. The ch
 real `ssh` from this machine running a command in the guest. Env: KERNEL, BUSYBOX, SSHD,
 KEY (the private key whose .pub goes in the guest's authorized_keys), MEM, E2FSPROGS.
 `--hold` leaves QEMU running (and prints how to reach it) instead of killing it.
+
+`--herd` boots the host the way the ryzen runs it instead of with the `kvmserve` flag: herd is
+init (env HERD, default userspace/target/x86_64-unknown-none/release/herd), the kernel is armed
+with `kvmctl kvmmem=...`, and a `vm = true` conf in /etc/herd/enabled brings the guest up through
+/dev/kvm0. The guest's console is then herd's log, which the script reads back from the host
+disk with debugfs once QEMU is stopped. `--herd-conf FILE` rehearses a real conf (a ryzen
+`vm-serve.conf`) instead of the generated one; its paths must be ones the script stages
+(/boot/akuma-guest).
 """
 import os, subprocess, sys, tempfile, time, shutil, argparse
 
@@ -19,6 +27,9 @@ ap.add_argument("--wait", type=int, default=900)
 ap.add_argument("--hold", action="store_true")
 ap.add_argument("--bulk", type=int, default=0, help="also upload and download this many KiB through ssh, with md5s")
 ap.add_argument("--port", type=int, default=2223)
+ap.add_argument("--herd", action="store_true", help="host init is herd; the guest is a vm = true service (see above)")
+ap.add_argument("--herd-conf", help="with --herd: this conf instead of the generated one")
+ap.add_argument("--restart", action="store_true", help="with --herd: a host oneshot kills the `herd vm-run` process (pid 2) after 90 s; herd must bring the guest back and ssh must work again")
 ap.add_argument("--stress", type=int, default=0, help="rounds of overlapping + back-to-back sessions (the wedge shape from the ryzen, 2026-10-22)")
 a = ap.parse_args()
 
@@ -37,6 +48,23 @@ shutil.copy(kernel, f"{w}/host/boot/akuma-guest")
 # scheduler never runs the service task. (On the ryzen herd is init.)
 shutil.copy(busybox, f"{w}/host/bin/busybox")
 os.chmod(f"{w}/host/bin/busybox", 0o755)
+if a.herd:
+    herd = os.environ.get("HERD", "userspace/target/x86_64-unknown-none/release/herd")
+    shutil.copy(herd, f"{w}/host/bin/herd")
+    os.chmod(f"{w}/host/bin/herd", 0o755)
+    os.makedirs(f"{w}/host/etc/herd/enabled")
+    os.makedirs(f"{w}/host/var/log/herd")
+    os.makedirs(f"{w}/host/var/run/herd")
+    conf = open(a.herd_conf).read() if a.herd_conf else (
+        "vm = true\nvm_type = kvm\nvm_kernel = /boot/akuma-guest\nvm_ram_mib = 768\nvm_vcpus = 1\n"
+        f"vm_forward = {a.port}:22\nvm_cmdline = init=/bin/busybox initargs=sh,/etc/guest.sh\n"
+        "restart = true\nrestart_delay_ms = 5000\n")
+    open(f"{w}/host/etc/herd/enabled/vm-serve.conf", "w").write(conf)
+    if a.restart:
+        # herd is pid 1, so the first `vm-run` is pid 2. Killing it is what a crash, `herd stop`
+        # or `kill` looks like to the kernel: the owner is gone, the lease ends the guest.
+        open(f"{w}/host/etc/herd/enabled/killvm.conf", "w").write(
+            "command = /bin/busybox\nargs = kill 2\noneshot = true\nstart_delay_ms = 90000\n")
 subprocess.run([f"{e2}/mke2fs", "-q", "-t", "ext2", "-d", f"{w}/host", "-L", "kvmhost", f"{w}/root.img", "48M"], check=True)
 env = dict(os.environ, SERVE="1", NET="1", AUTHORIZED_KEYS=key + ".pub")
 subprocess.run(["sh", f"{here}/akuma_guest_rootfs.sh", f"{w}/guest.img", busybox], check=True, env=env, stdout=subprocess.DEVNULL)
@@ -48,7 +76,9 @@ q = subprocess.Popen([
     "-drive", f"id=d0,file={w}/root.img,format=raw,if=none", "-device", "virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0",
     "-drive", f"id=d1,file={w}/guest.img,format=raw,if=none", "-device", "virtio-blk-device,drive=d1,bus=virtio-mmio-bus.1",
     "-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{a.port}-:{a.port}", "-device", "virtio-net-device,netdev=n0,bus=virtio-mmio-bus.2",
-    "-append", f"virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6 virtio_mmio.device=512@0xfeb00400:7 kvmtest kvmserve noladder kvmfwd={a.port} init=/bin/busybox initargs=sleep,1000000",
+    "-append", f"virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6 virtio_mmio.device=512@0xfeb00400:7 "
+               + (f"kvmctl kvmmem=1536 init=/bin/herd initargs=daemon" if a.herd else
+                  f"kvmtest kvmserve noladder kvmfwd={a.port} init=/bin/busybox initargs=sleep,1000000"),
     "-serial", f"file:{a.log}", "-display", "none", "-no-reboot"],
     stderr=subprocess.DEVNULL)
 
@@ -58,22 +88,42 @@ def log():
     except OSError:
         return ""
 
+def herd_log():
+    """The guest's console as herd logged it on the host disk (`--herd`): read after QEMU stops."""
+    out = ""
+    for f in ("vm-serve.log.old", "vm-serve.log"):
+        r = subprocess.run([f"{e2}/debugfs", "-R", f"cat /var/log/herd/{f}", f"{w}/root.img"], capture_output=True)
+        out += r.stdout.decode("latin1")
+    return out
+
 def finish(rc):
     if not a.hold:
         q.kill()
         q.wait()
+        if a.herd:
+            hl = herd_log()
+            print(f"[REHEARSE] herd log vm-serve.log: {len(hl)} bytes; guest banner={'Akuma/amd64' in hl}; sshd marker={'AKUMA-GUEST-SSHD-STARTED' in hl}; vm-run created={hl.count('[vm-run] guest created')}x")
+            if rc == 0 and a.restart and hl.count("[vm-run] guest created") < 2:
+                print("[REHEARSE] restart: the second guest never says it was created")
+                rc = 1
+            if rc == 0 and "AKUMA-GUEST-SSHD-STARTED" not in hl:
+                print("[REHEARSE] ssh worked but the guest console is not in herd's log")
+                rc = 1
         shutil.rmtree(w, ignore_errors=True)
     else:
         print(f"QEMU pid {q.pid} left running; ssh -p {a.port} -i {key} root@127.0.0.1")
     sys.exit(rc)
 
 t0 = time.time()
-while time.time() - t0 < a.wait and "AKUMA-GUEST-SSHD-STARTED" not in log():
+# Under `--herd` the guest's console is herd's log, not the serial line: herd's own "Started"
+# line is the marker, and ssh succeeding is the proof the guest is up.
+marker = "[herd] Started vm-serve" if a.herd else "AKUMA-GUEST-SSHD-STARTED"
+while time.time() - t0 < a.wait and marker not in log():
     if q.poll() is not None:
         print("QEMU exited early"); finish(1)
     time.sleep(2)
-if "AKUMA-GUEST-SSHD-STARTED" not in log():
-    print("guest sshd never reported started"); finish(1)
+if marker not in log():
+    print("guest never reported started"); finish(1)
 print(f"guest up after {time.time() - t0:.0f}s; trying ssh")
 last = ""
 ok = False
@@ -164,8 +214,29 @@ if ok and a.stress:
             print("stress WEDGE:", bad)
             ok = False
             break
-print("[REHEARSE] akuma-serve:", "PASS" if ok else "FAIL")
+if ok and a.restart:
+    # The oneshot fires 90 s after herd starts; wait for the replacement guest and talk to it.
+    t1 = time.time()
+    while time.time() - t1 < a.wait and log().count("[herd] Started vm-serve") < 2:
+        time.sleep(2)
+    again = False
+    last = ""
+    while log().count("[herd] Started vm-serve") >= 2 and time.time() - t1 < a.wait:
+        try:
+            r = subprocess.run(["ssh", "-p", str(a.port), "-i", key, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no",
+                                "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes", "-o", "ConnectTimeout=60", "-o", "LogLevel=ERROR",
+                                "root@127.0.0.1", "echo hello-after-restart"], capture_output=True, text=True, timeout=240)
+            last = r.stdout + r.stderr
+            if "hello-after-restart" in r.stdout:
+                again = True
+                break
+        except subprocess.TimeoutExpired:
+            last = "ssh timed out"
+        time.sleep(5)
+    print(f"[REHEARSE] restart: herd started vm-serve {log().count('[herd] Started vm-serve')}x; ssh after restart: {'ok' if again else 'FAILED ' + last.strip()[-80:]}")
+    ok = ok and again
+print("[REHEARSE] akuma-serve" + (" (herd)" if a.herd else "") + ":", "PASS" if ok else "FAIL")
 for l in log().splitlines():
-    if "[KVM] relay" in l or "service guest" in l:
+    if "[KVM] relay" in l or "service guest" in l or "kvm0" in l or "kvmmem" in l or "[herd]" in l:
         print(l)
 finish(0 if ok else 1)

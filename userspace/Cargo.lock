@@ -114,6 +114,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-vm-spec"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-wifi"
 version = "0.1.0"
 
@@ -518,6 +522,7 @@ dependencies = [
 name = "herd"
 version = "0.1.0"
 dependencies = [
+ "akuma-vm-spec",
  "box",
  "libakuma",
 ]

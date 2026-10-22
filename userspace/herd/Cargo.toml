@@ -24,6 +24,9 @@ libakuma = { path = "../libakuma", optional = true }
 # box-id convention (`boxlib::spec::box_id_for`) — herd never spawns `box`
 # itself, and stays off `pull` (TLS, tar, the registry client) entirely.
 boxlib = { package = "box", path = "../box", default-features = false }
+# The VM spec the kernel parses off `/dev/kvm0`: herd builds it from `vm_*` keys, so the two
+# cannot disagree on a key, a limit or a default. no_std, no dependencies.
+akuma-vm-spec = { path = "../../crates/akuma-vm-spec" }
 
 # The binary's own unit tests (`src/main.rs`'s `mod tests`) link libakuma on the
 # host with `host-test`, which drops its `_start`, allocator and panic handler.

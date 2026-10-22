@@ -68,6 +68,7 @@ default-members = [
     "crates/akuma-slot-table",
     "crates/akuma-sntp",
     "crates/akuma-svm-amd64",
+    "crates/akuma-vm-spec",
     "crates/akuma-cmos-rtc",
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-abi",

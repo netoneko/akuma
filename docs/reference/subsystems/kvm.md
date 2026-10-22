@@ -41,6 +41,12 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 | `virtio_net`, `gateway` | virtio-mmio v2 **network** device (queues 0/1, 12-byte header, MAC) over `GuestMem` and `NetBackend`; and the backend: a slirp-style gateway (`10.0.2.2`) that answers ARP, DHCP, ICMP echo and UDP echo and drops the rest |
 | `acpi` | RSDP v2 / XSDT / FADT / MADT / DSDT with one `LNRO0005` device; `Pm1` registers |
 
+The VM's *description* is a separate leaf crate, **`akuma-vm-spec`** (`forbid(unsafe_code)`, no
+dependencies): the `Spec` (kernel, command line, RAM, vCPUs, disk, port forwards, backend) with its
+parser, its `key=value` wire text, the first-fit extent `arena` over the reserved guest RAM, and the
+`kvmcores=` list parser. The kernel (`amd64/src/kvm/ctl.rs`) and herd both depend on it, so they cannot
+disagree on a key or a limit.
+
 ## Invariants
 
 - **`stgi` in the same `asm!` as `vmrun`.** `#VMEXIT` leaves GIF clear; without it
@@ -98,21 +104,24 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
   guest's own stack) in both roles: `crates/akuma-svm-amd64/tests/gateway_tcp.rs`. The
   gateway's storage (`gateway::STORAGE`, ~60 KiB: the queue and six 8 KiB rings) is lent by the
   caller from the heap — it is far too big to build on a 32 KiB kernel task stack.
-- **A service guest (`kvmserve`, `akuma-serve`) is a background host task**, not a call
+- **A service guest is the VM task's guest** (see *VMs as services* below), not a call
   from boot: its port forward lives on the host's network stack, which exists only after
-  boot (on the ryzen, after init). `kvm::spawn_service` starts it **pinned to core 0** (the
-  core with SVM enabled) once netpoll is up; `late` skips it. Between guest entries it
+  boot (on the ryzen, after init). The VM task is **pinned to one core with SVM enabled** (core 0,
+  or the first of `kvmcores=`); the boot flags `kvmserve`/`kvmgentoo` queue the same spec through
+  `kvm::spawn_service` once netpoll is up; `late` skips them. Between guest entries it
   `VMSAVE`s the host state again (other tasks run on the core in between and may have moved
   `KernelGsBase`/`FS_BASE`), yields (`sched::yield_now`, so the BKL is dropped for the
   network and sshd), and polls the relay at most every 200 µs. It has no wall-clock, quiet or
   exit budgets; idle, it arms the host one-shot at the guest's next timer and `hlt`s
   (`sched::allow_tick`). The host must have an init that stays alive (herd on the ryzen; the
-  TCG rehearsal gives it `busybox sleep`): without one the boot ends in `halt()` and the
-  task is never scheduled.
+  TCG rehearsal gives it herd, or `busybox sleep` for the boot flag): without one the boot ends in
+  `halt()` and the task is never scheduled.
 - **The relay** (`kvm/relay.rs`): a listener on host port `kvmfwd=` (2223) whose clients are
   connected, through a gateway forward slot (the *gateway* opens the connection to the guest's
-  port 22), to the guest's sshd. Non-blocking throughout; `socket_*` poll the host stack
-  themselves. Two slots.
+  port), to the guest's sshd. Non-blocking throughout; `socket_*` poll the host stack
+  themselves. One listener per `forward` of the spec (up to four), sharing the gateway's two
+  connection slots; `Relay::close` gives every socket back when the guest ends, so a restarted guest
+  binds the same ports.
 - **The NIC is polled and has no route out.** `Guest::AkumaNet` puts the virtio-net window
   in the slot after the disk's (`0xD0001000`; the guest finds devices as evenly spaced
   `virtio_mmio.device=` windows, in order) and **never raises its interrupt line** (the
@@ -135,17 +144,87 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
   retransmit timer and the guest polls its NIC, so a forward slot's source port is a rotating
   generation (`FWD_GENS`) and the relay re-sends an unanswered SYN (`SYN_RETRY_US`, `SYN_TRIES`)
   before resetting the client. Incident: [`KVM_RELAY_SYN_STALL.md`](../../archive/KVM_RELAY_SYN_STALL.md).
-- **A service guest's virtual processors come from the selector file** (`vcpus=N` after the guest
-  word, 1 to 4; `kvmvcpus=N` on the command line): all of them run on the one host core the
-  service task is pinned to, taking turns, so more of them is latency, not compute.
-- **A service guest's disk may be a RAM copy of a file** (`HostDisk::Mem`, `kvmgentoo`): the guest
-  never touches a host block device, and its writes die with it. A second NVMe window is not the
+- **A service guest's virtual processors come from its spec** (`vm_vcpus`, 1 to 4; for the boot
+  flags `kvmvcpus=N`, or `vcpus=N` after the guest word in the selector file): all of them run on
+  the one host core the VM task is pinned to, taking turns, so more of them is latency, not compute.
+- **A service guest's disk may be a RAM copy of a file** (`HostDisk::Mem`, `vm_disk_ram`): the guest
+  never touches a host block device, and its writes die with it. The copy is a slice of the reserve and
+  goes back to it (`MemLease`) when the run ends, on every path out. A second NVMe window is not the
   way to give a guest a partition; the driver's single GPT window is p3's on purpose.
 - **Unknown device instructions stop the run.** `mmio::decode` answers `None` for
   anything but the `MOV` family; guessing would corrupt state silently.
 - **Pin layouts against an independent consumer**, not the writer: PVH blobs are
   read back with `akuma-ryzen-amd64`'s `StartInfo`, ACPI with its table walker,
   `MOV` encodings come from clang, the disk path from host `md5`/`debugfs`/`e2fsck`.
+
+## VMs as services: `/dev/kvm0` and herd
+
+**AMD SVM only** (Intel VMX is out of scope). Grade of this section: **C** — the metal gate is
+[`../../runbooks/kvm-linux-guest.md`](../../runbooks/kvm-linux-guest.md) § *herd*.
+
+A VM is a herd service. herd turns `vm_*` keys into an `akuma_vm_spec::Spec`, writes its wire text to
+`/var/run/herd/<name>.vm` and supervises one ordinary process, `herd vm-run <file>`. That process
+opens **`/dev/kvm0`**, writes the spec (`create`), copies the console to stdout (so the guest's console
+**is** `/var/log/herd/<name>.log`) and exits when the guest does. The VM runs while that process does.
+
+| operation | how |
+|---|---|
+| create | `write` a spec to `/dev/kvm0`: parsed whole, refused whole — `EINVAL` (bad spec; the reason is on the host console), `EOPNOTSUPP` (`type=firecracker`), `ENODEV` (hypervisor not armed), `EBUSY` (a VM exists), `ENOMEM` (no task slot) |
+| stop | `write` `stop` |
+| status | `write` `status`: one `[kvm] status: state= gen= owner= up_s= type= vcpus= ram_mib= forwards= reserve_mib= console_lost=` line is appended to the console stream |
+| console | `read`: bytes; `EAGAIN` while the guest lives and is quiet; `0` once it has ended and the stream is drained. One reader: the cursor belongs to the device |
+
+Why a character device: it takes effects (a `/proc` file would be read-only plumbing) and a
+Firecracker-shaped `/dev/kvm` can sit beside it later; why not a syscall: nothing else in this kernel
+adds one for a single driver. It is opened by the kernel's own `openat` arm like `/dev/power`, so
+`ls /dev` does not list it; `open` is `ENOENT` unless the kernel was booted with `kvmctl`.
+
+- **The VM's lifetime is its owner's.** The creating process is the lease-holder; the run loop checks
+  every 200 ms that it is still alive and stops the guest when it is not. That is what lets herd
+  supervise a VM with a pid alone: `herd stop`, a crash or a `kill` of the `vm-run` process ends the
+  guest, and the ordinary `restart`/`max_retries` policy brings it back (a replacement `create` waits
+  out `EBUSY` while the old one tears down). A boot-flag guest has no owner and no lease.
+- **One VM at a time; one VM task.** The task is spawned on the first `create`, pinned to a core with
+  SVM enabled, and serves every later VM. Every virtual processor of the VM takes turns inside it.
+- **The console goes to a ring, not the host's.** While a `/dev/kvm0` VM runs, everything the
+  hypervisor prints for it (the guest's serial and its own `[KVM]` lines) goes to a 32 KiB static
+  ring (`akuma_dmesg::Ring`) instead of the host's serial line and dmesg. If the reader is slower than
+  the guest the oldest bytes are lost (`console_lost`). The 100 ms drain keeps that rare.
+- **No allocation on any of it** apart from the RAM-disk copy's 1 MiB chunk (fallible, freed). The spec
+  is a `Copy` value; the wire document is capped at 768 bytes and read onto the stack.
+- **Reserved memory (`kvmmem=<MiB>`).** The kernel takes one contiguous block at boot, while memory is
+  unfragmented, and every VM's RAM and RAM-disk copy is a 2 MiB-aligned slice of it
+  (`akuma_vm_spec::arena`, first fit, zeroed when carved). **A request that does not fit is refused**
+  (`[KVM] linux: refused: guest RAM does not fit the kvmmem= reserve`), never retried from the page
+  allocator; without `kvmmem=` the page allocator is used, as it always was. Guest RAM is bounded at
+  1 GiB by the nested page table (one directory of 2 MiB leaves) and the Akuma guest needs ≥ 768 MiB.
+- **Cores (`kvmcores=<list>`, e.g. `4-7`).** The VM task is placed on the first listed core that has
+  SVM enabled; default core 0. This moves the *whole* hypervisor off the boot core. It is **not yet a
+  reservation** — nothing keeps other tasks off that core — and it does not spread vCPUs. Real core
+  reservation is the multi-vCPU step: one pinned task per vCPU (own VMCB and run loop), the guest's RAM,
+  NPT, device models, gateway and relay behind locks or handed to one owner core, a placement policy
+  (which cores a VM may use, so host services keep some), and cross-core delivery of virtual IPIs
+  (today an IPI is a flag set in the same loop). Until then more vCPUs add context switches, not compute.
+
+| herd key | |
+|---|---|
+| `vm = true` | the service is a VM (`command` is not needed; it is `herd vm-run`) |
+| `vm_type` | `kvm` (default) or `firecracker` (reserved: parses, the service is not loaded) |
+| `vm_kernel`, `vm_cmdline` | kernel image (an Akuma ELF), the guest command line tail (rest of the line) |
+| `vm_ram_mib`, `vm_vcpus` | 16–1024 (default 768), 1–4 (default 1) |
+| `vm_disk`, `vm_disk_ram` | image path (empty: the machine's second virtio-blk), copy it into RAM at start |
+| `vm_forward` | `host:guest`, repeatable up to four |
+| `vm_config` | a Firecracker JSON config (`boot-source`, `machine-config`, `drives[0]`) read first; explicit `vm_*` keys win |
+
+The spec keys use Firecracker's words as aliases (`kernel_image_path`, `boot_args`, `vcpu_count`,
+`mem_size_mib`, `path_on_host`), so a config written for one backend needs no translation for the other;
+network interfaces are not imported (a guest reaches the host through the built-in gateway; ports are
+forwarded). **No Firecracker or Linux/KVM source is imported or read** — only the config schema's field names
+are used; its crates' `kvm-bindings` come from the Linux UAPI headers and stay out.
+
+Kernel parameters: `kvmctl` (arm SVM for `/dev/kvm0`, run nothing at boot), `kvmmem=<MiB>`,
+`kvmcores=<list>`. The older `kvmtest` + `kvmserve`/`kvmgentoo`/selector-file path is a shim: it builds the
+same `Spec` (`kvm::legacy_service`) and queues it with no owner, so the rehearsal flags and entry 28 keep working.
 
 ## Run it
 

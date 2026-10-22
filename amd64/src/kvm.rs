@@ -44,11 +44,13 @@ use crate::serial;
 use crate::smp;
 use akuma_cpu::msr::{self, Msr};
 use akuma_svm_amd64 as svm;
+use akuma_vm_spec::Spec;
 use akuma_svm_amd64::{ctrl, intr0, intr1, save, ExitCode, Seg, SegAttr, Vmcb};
 
 use core::arch::x86_64::__cpuid;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+pub mod ctl;
 mod linux;
 mod relay;
 
@@ -57,7 +59,11 @@ mod relay;
 // ---------------------------------------------------------------------------
 
 fn p(s: &str) {
-    serial::puts(s);
+    if ctl::attached() {
+        ctl::emit(s);
+    } else {
+        serial::puts(s);
+    }
 }
 
 /// Breadcrumb for a run that resets the machine before any log can be read: the
@@ -68,11 +74,19 @@ fn crumb(step: u8) {
 }
 
 fn hx(v: u64, nibbles: u32) {
-    serial::put_hexn(v, nibbles);
+    if ctl::attached() {
+        ctl::emit_hex(v, nibbles);
+    } else {
+        serial::put_hexn(v, nibbles);
+    }
 }
 
 fn dec(v: u64) {
-    serial::put_dec(v);
+    if ctl::attached() {
+        ctl::emit_dec(v);
+    } else {
+        serial::put_dec(v);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +99,10 @@ fn dec(v: u64) {
 /// read strictly after CPUID advertises SVM — an rdmsr of an unimplemented
 /// MSR `#GP`s.
 pub fn init(cmdline: &str) {
-    let want_test = cmdline.split_ascii_whitespace().any(|t| t == "kvmtest");
+    let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
+    let want_test = flag("kvmtest");
+    // `kvmctl`: arm the hypervisor for `/dev/kvm0` and run nothing at boot.
+    let want_ctl = flag("kvmctl");
 
     // Extended CPUID leaf range, then the SVM feature bit: Fn8000_0001.ECX[2]
     // (APM Vol 3 §3.1/§15.4).
@@ -124,12 +141,20 @@ pub fn init(cmdline: &str) {
     NRIPS.store(nrips, Ordering::Relaxed);
 
     p("[KVM] SVM available; EFER.SVME not yet enabled (per-core, phase 2)\n");
-    if want_test {
+    if want_test || want_ctl {
         if !reserve_hsaves() {
             p("[KVM] kvmtest: no frame for the BSP host save area\n");
             return;
         }
         SVM_WANTED.store(true, Ordering::Release);
+        if let Some(mib) = cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("kvmmem=")).and_then(|v| v.parse::<u64>().ok()) {
+            ctl::reserve_init(mib);
+        }
+        if let Some(mask) = cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("kvmcores=")).and_then(akuma_vm_spec::cores::parse) {
+            VM_CORES.store(mask, Ordering::Relaxed);
+        }
+    }
+    if want_test {
         trivial_guest(nrips);
         longmode_guest(nrips);
         twolvl_guest(nrips);
@@ -165,36 +190,111 @@ pub fn late(cmdline: &str) {
     }
     // A service guest (`kvmserve`) is not run here: it needs the host's network, which
     // does not exist yet. [`spawn_service`] starts it once it does.
-    if let Some(g) = pick_guest(cmdline)
-        && !g.is_service()
-    {
-        linux::run(NRIPS.load(Ordering::Relaxed), g);
+    if let Some(Pick::Guest(g)) = pick_guest(cmdline) {
+        linux::run(NRIPS.load(Ordering::Relaxed), &linux::Vm::legacy(g));
     }
 }
 
+/// What the boot flags ask for: a rehearsal guest that runs once, or a service guest, which is
+/// the same [`Spec`] a `/dev/kvm0` write carries.
+enum Pick {
+    Guest(linux::Guest),
+    Service(Spec),
+}
+
+/// The words of a service guest the flags and the selector file leave open.
+const SERVE_CMDLINE: &str = "init=/bin/busybox initargs=sh,/etc/guest.sh";
+const GENTOO_CMDLINE: &str = "init=/usr/bin/bash initargs=/akuma-kvm-init.sh";
+const GENTOO_IMAGE: &str = "/boot/gentoo-guest.img";
+const SERVE_IMAGE: &str = "/boot/akuma-serve-root.img";
+const GUEST_KERNEL: &str = "/boot/akuma-guest";
+
+/// The boot-flag shim: `kvmserve`/`kvmgentoo` (or the selector file's `akuma-serve` /
+/// `akuma-gentoo`) as the spec a herd service would have written. `kvmfwd=<port>` is the host
+/// port (2223); `kvmvcpus=N` or `vcpus=N` in the selector file the virtual processors.
+fn legacy_service(cmdline: &str, gentoo: bool) -> Option<Spec> {
+    let port = cmdline
+        .split_ascii_whitespace()
+        .find_map(|t| t.strip_prefix("kvmfwd="))
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(2223);
+    let mut sel = [0u8; 64];
+    let n = akuma_vfs_glue::read_at(GUEST_SELECTOR_PATH, 0, &mut sel).unwrap_or(0);
+    let vcpus = cmdline
+        .split_ascii_whitespace()
+        .find_map(|t| t.strip_prefix("kvmvcpus="))
+        .and_then(|v| v.parse::<u8>().ok())
+        .or_else(|| vcpus_in(&sel[..n]))
+        .unwrap_or(1);
+    let mut s = Spec::default();
+    let mut num = [0u8; 8];
+    let ok = s.set("kernel", GUEST_KERNEL).is_ok()
+        && s.set("vcpus", fmt_u16(u16::from(vcpus), &mut num)).is_ok()
+        && s.set("cmdline", if gentoo { GENTOO_CMDLINE } else { SERVE_CMDLINE }).is_ok()
+        && if gentoo {
+            s.set("disk", GENTOO_IMAGE).is_ok() && s.set("disk_ram", "1").is_ok()
+        } else if akuma_virtio::block::device_count() > 1 && akuma_virtio::block::device_name(1).is_some() {
+            // The machine's second virtio-blk is the guest's disk (an empty `disk`).
+            true
+        } else {
+            s.set("disk", SERVE_IMAGE).is_ok()
+        };
+    let mut fwd = [0u8; 24];
+    let mut w = 0;
+    for part in [fmt_u16(port, &mut num).as_bytes(), b":", if gentoo { b"4444" } else { b"22" }] {
+        fwd[w..w + part.len()].copy_from_slice(part);
+        w += part.len();
+    }
+    let ok = ok && core::str::from_utf8(&fwd[..w]).is_ok_and(|f| s.add_forward(f).is_ok());
+    if !ok {
+        p("[KVM] boot-flag service spec is invalid\n");
+        return None;
+    }
+    Some(s)
+}
+
+fn fmt_u16(mut v: u16, out: &mut [u8; 8]) -> &str {
+    let mut i = out.len();
+    loop {
+        i -= 1;
+        out[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    core::str::from_utf8(&out[i..]).unwrap_or("0")
+}
+
 /// Which guest the command line (and, for `kvmlinux`, the selector file) asks for.
-fn pick_guest(cmdline: &str) -> Option<linux::Guest> {
+fn pick_guest(cmdline: &str) -> Option<Pick> {
     let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
     if flag("kvmgentoo") {
-        Some(linux::Guest::AkumaGentoo)
+        legacy_service(cmdline, true).map(Pick::Service)
     } else if flag("kvmserve") {
-        Some(linux::Guest::AkumaServe)
+        legacy_service(cmdline, false).map(Pick::Service)
     } else if flag("kvmlapic") {
-        Some(linux::Guest::LinuxApic)
+        Some(Pick::Guest(linux::Guest::LinuxApic))
     } else if flag("kvmnet") {
-        Some(linux::Guest::AkumaNet)
+        Some(Pick::Guest(linux::Guest::AkumaNet))
     } else if flag("kvmsmp") {
-        Some(linux::Guest::AkumaSmp)
+        Some(Pick::Guest(linux::Guest::AkumaSmp))
     } else if flag("kvmhello") {
-        Some(linux::Guest::AkumaHello)
+        Some(Pick::Guest(linux::Guest::AkumaHello))
     } else if flag("kvmakuma") {
-        Some(linux::Guest::Akuma)
+        Some(Pick::Guest(linux::Guest::Akuma))
     } else if flag("kvmlinux") {
         let mut sel = [0u8; 16];
         let n = akuma_vfs_glue::read_at(GUEST_SELECTOR_PATH, 0, &mut sel).unwrap_or(0);
         let sel = &sel[..n];
         // `akuma-hello` before `akuma`: the longer word starts with the shorter.
-        Some(if sel.starts_with(b"linux-apic") {
+        if sel.starts_with(b"akuma-gentoo") {
+            return legacy_service(cmdline, true).map(Pick::Service);
+        }
+        if sel.starts_with(b"akuma-serve") {
+            return legacy_service(cmdline, false).map(Pick::Service);
+        }
+        Some(Pick::Guest(if sel.starts_with(b"linux-apic") {
             linux::Guest::LinuxApic
         } else if sel.starts_with(b"akuma-hello") {
             linux::Guest::AkumaHello
@@ -202,29 +302,14 @@ fn pick_guest(cmdline: &str) -> Option<linux::Guest> {
             linux::Guest::AkumaNet
         } else if sel.starts_with(b"akuma-smp") {
             linux::Guest::AkumaSmp
-        } else if sel.starts_with(b"akuma-gentoo") {
-            linux::Guest::AkumaGentoo
-        } else if sel.starts_with(b"akuma-serve") {
-            linux::Guest::AkumaServe
         } else if sel.starts_with(b"akuma") {
             linux::Guest::Akuma
         } else {
             linux::Guest::Linux
-        })
+        }))
     } else {
         None
     }
-}
-
-/// The host port a service guest's sshd is forwarded to (`kvmfwd=<port>`; 2223).
-static SERVE_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(2223);
-/// Virtual processors of the service guest (`vcpus=N` in `/boot/kvm-guest`, or `kvmvcpus=N`).
-static SERVICE_VCPUS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
-
-/// How many virtual processors the service guest has: 1 to [`linux::MAX_VCPUS`]. They share the
-/// one host core the service task is pinned to, taking turns.
-pub(crate) fn service_vcpus() -> usize {
-    usize::from(SERVICE_VCPUS.load(Ordering::Relaxed)).clamp(1, linux::MAX_VCPUS)
 }
 
 /// The `N` of the first `vcpus=N` token in `text`.
@@ -235,50 +320,42 @@ fn vcpus_in(text: &[u8]) -> Option<u8> {
     core::str::from_utf8(&digits[..end]).ok()?.parse().ok()
 }
 
-/// Which service guest [`spawn_service`] chose, for [`serve_task`] (which takes no arguments).
-static SERVICE_GENTOO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// Start the service guest (`kvmserve`, or `akuma-serve` in the selector file) as a
-/// background kernel task pinned to the core that enabled SVM, if one was asked for. Call
-/// it **after** the host's network is up and its netpoll daemon is running: the guest's
-/// port forward listens on the host's stack.
+/// Start the boot-flag service guest (`kvmserve`, `kvmgentoo`, or the selector file's
+/// `akuma-serve`/`akuma-gentoo`) in the VM slot, as a guest with no owner. Call it **after**
+/// the host's network is up and its netpoll daemon is running: the guest's port forward listens
+/// on the host's stack. A guest brought up through `/dev/kvm0` needs no call here.
 pub fn spawn_service(cmdline: &str) {
-    if !SVM_WANTED.load(Ordering::Acquire) || !pick_guest(cmdline).is_some_and(linux::Guest::is_service) {
+    if !SVM_WANTED.load(Ordering::Acquire) {
         return;
     }
-    if let Some(port) = cmdline
-        .split_ascii_whitespace()
-        .find_map(|t| t.strip_prefix("kvmfwd="))
-        .and_then(|v| v.parse::<u16>().ok())
-    {
-        SERVE_PORT.store(port, Ordering::Relaxed);
-    }
-    let mut sel = [0u8; 64];
-    let n = akuma_vfs_glue::read_at(GUEST_SELECTOR_PATH, 0, &mut sel).unwrap_or(0);
-    let from_cmdline = cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("kvmvcpus=")).and_then(|v| v.parse::<u8>().ok());
-    if let Some(v) = from_cmdline.or_else(|| vcpus_in(&sel[..n])) {
-        SERVICE_VCPUS.store(v, Ordering::Relaxed);
-    }
-    SERVICE_GENTOO.store(pick_guest(cmdline) == Some(linux::Guest::AkumaGentoo), Ordering::Relaxed);
-    // Core 0 enabled SVM and owns the host save area (`run` enables it again, idempotently).
-    match crate::sched::spawn_daemon_on(serve_task, 0) {
-        Some(slot) => {
-            p("[KVM] service guest task spawned in slot ");
-            dec(slot as u64);
-            p("\n");
-        }
-        None => p("[KVM] no task slot for the service guest\n"),
+    let Some(Pick::Service(spec)) = pick_guest(cmdline) else { return };
+    if ctl::create_unowned(&spec) {
+        p("[KVM] service guest queued\n");
+    } else {
+        p("[KVM] no task slot for the service guest\n");
     }
 }
 
-extern "C" fn serve_task() -> ! {
-    let guest = if SERVICE_GENTOO.load(Ordering::Relaxed) { linux::Guest::AkumaGentoo } else { linux::Guest::AkumaServe };
-    linux::run(NRIPS.load(Ordering::Relaxed), guest);
-    p("[KVM] service guest ended\n");
-    loop {
-        crate::sched::yield_now();
-        crate::sched::allow_tick();
-    }
+/// Has the probe armed the hypervisor (SVM present, a host save area reserved)?
+pub(crate) fn svm_armed() -> bool {
+    SVM_WANTED.load(Ordering::Acquire)
+}
+
+/// Can the VM task run on core `c`: SVM enabled there (core 0 enables it on its first run).
+pub(crate) fn core_ready(c: usize) -> bool {
+    c == 0 || SVM_ENABLED.get(c).is_some_and(|e| e.load(Ordering::Acquire))
+}
+
+pub(crate) fn nrips() -> bool {
+    NRIPS.load(Ordering::Relaxed)
+}
+
+/// The cores the VM task may run on (`kvmcores=`, a list like `4-7`); bit 0 (the boot core)
+/// when absent. All of a guest's virtual processors still take turns on **one** of them.
+static VM_CORES: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn vm_cores() -> u64 {
+    VM_CORES.load(Ordering::Relaxed)
 }
 
 /// Optional file whose first word picks the guest for an entry that says

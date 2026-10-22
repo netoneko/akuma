@@ -1,7 +1,16 @@
 # Next: herd brings up KVM machines (`vm = true`)
 
-> **Status 2026-10-22:** written as the next agent's prompt. The idea and its reasoning are in
-> [`KVM_UNDER_HERD.md`](KVM_UNDER_HERD.md); this is the task. Nothing here is built.
+> **Status 2026-10-22 (evening):** track 1 is built and TCG-rehearsed (`vm = true`, `/dev/kvm0`,
+> `akuma-vm-spec`, `kvmctl`/`kvmmem=`/`kvmcores=`); the metal gate is the open part. See
+> [`../docs/reference/subsystems/kvm.md`](../docs/reference/subsystems/kvm.md) § VMs as services. The prompt
+> below is kept as written. **Next step (multi-vCPU / multi-VM):** one host task per vCPU, each pinned to
+> its own core with its own VMCB and run loop; guest RAM, NPT, device models, gateway and relay behind
+> locks or one owner core; a placement policy with a core mask in the spec (VM N gets cores X–Y so host
+> services keep some); cross-core delivery of virtual IPIs and interrupts. Today every vCPU time-slices
+> inside one task, so more vCPUs add context switches, not compute.
+
+> Original header: written as the next agent's prompt. The idea and its reasoning are in
+> [`KVM_UNDER_HERD.md`](KVM_UNDER_HERD.md); this is the task.
 
 ## Decisions made after the first draft (2026-10-22, the user)
 

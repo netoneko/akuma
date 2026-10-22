@@ -17,6 +17,7 @@
 
 use akuma_net::socket::{self, socket_const::SOCK_STREAM, SocketAddrV4};
 use akuma_svm_amd64::gateway::{Gateway, FWD_SLOTS};
+use akuma_vm_spec::{spec::MAX_FORWARDS, Forward};
 
 /// `EAGAIN`, as the host socket layer reports it (a positive errno).
 const EAGAIN: i32 = 11;
@@ -70,6 +71,7 @@ impl Slot {
     }
 }
 
+
 /// What the relay has done, for the end-of-run summary.
 #[derive(Clone, Copy, Default)]
 pub struct Counts {
@@ -88,40 +90,70 @@ pub struct Counts {
 }
 
 pub struct Relay {
-    port: u16,
-    /// The port on the guest every connection is forwarded to (its sshd).
-    guest_port: u16,
-    listener: Option<usize>,
+    /// The forwards, in the order the spec gave them; each has its own host listener, and
+    /// all of them share the gateway's [`FWD_SLOTS`] connection slots.
+    fwds: [Forward; MAX_FORWARDS],
+    n_fwds: usize,
+    listeners: [Option<usize>; MAX_FORWARDS],
     retry_at_us: u64,
     slots: [Slot; FWD_SLOTS],
+    /// The guest port each live slot's connection goes to.
+    slot_guest: [u16; FWD_SLOTS],
     pub counts: Counts,
 }
 
 impl Relay {
-    /// A relay for host port `port`, forwarding to `guest_port` on the guest; nothing is bound until the first [`Relay::poll`].
-    pub const fn new(port: u16, guest_port: u16) -> Self {
-        Self { port, guest_port, listener: None, retry_at_us: 0, slots: [const { Slot::new() }; FWD_SLOTS], counts: Counts { accepted: 0, to_guest: 0, to_host: 0, refused: 0, send_blocked: 0, recv_idle: 0, syn_retries: 0, syn_gave_up: 0, connect_us_max: 0 } }
+    /// A relay for `forwards` (at most [`MAX_FORWARDS`]); nothing is bound until the first
+    /// [`Relay::poll`].
+    pub const fn new(forwards: &[Forward]) -> Self {
+        let mut fwds = [Forward { host: 0, guest: 0 }; MAX_FORWARDS];
+        let mut i = 0;
+        while i < forwards.len() && i < MAX_FORWARDS {
+            fwds[i] = forwards[i];
+            i += 1;
+        }
+        Self { fwds, n_fwds: i, listeners: [None; MAX_FORWARDS], retry_at_us: 0, slots: [const { Slot::new() }; FWD_SLOTS], slot_guest: [0; FWD_SLOTS], counts: Counts { accepted: 0, to_guest: 0, to_host: 0, refused: 0, send_blocked: 0, recv_idle: 0, syn_retries: 0, syn_gave_up: 0, connect_us_max: 0 } }
     }
 
-    /// Is the listener up?
-    pub const fn listening(&self) -> bool {
-        self.listener.is_some()
+    /// Is every forward's listener up?
+    pub fn listening(&self) -> bool {
+        self.listeners[..self.n_fwds].iter().all(Option::is_some)
     }
 
-    fn ensure_listener(&mut self, now_us: u64) {
-        if self.listener.is_some() || now_us < self.retry_at_us {
+    fn ensure_listeners(&mut self, now_us: u64) {
+        if self.listening() || now_us < self.retry_at_us {
             return;
         }
         self.retry_at_us = now_us + RETRY_US;
-        let Some(idx) = socket::alloc_socket(SOCK_STREAM) else { return };
-        let up = socket::socket_bind(idx, SocketAddrV4::new([0; 4], self.port)).is_ok() && socket::socket_listen(idx, 4).is_ok();
-        if up {
-            self.listener = Some(idx);
-            super::p("[KVM] relay: listening on host port ");
-            super::dec(u64::from(self.port));
-            super::p("\n");
-        } else {
-            socket::remove_socket(idx);
+        for k in 0..self.n_fwds {
+            if self.listeners[k].is_some() {
+                continue;
+            }
+            let Some(idx) = socket::alloc_socket(SOCK_STREAM) else { return };
+            let up = socket::socket_bind(idx, SocketAddrV4::new([0; 4], self.fwds[k].host)).is_ok() && socket::socket_listen(idx, 4).is_ok();
+            if up {
+                self.listeners[k] = Some(idx);
+                super::p("[KVM] relay: listening on host port ");
+                super::dec(u64::from(self.fwds[k].host));
+                super::p("\n");
+            } else {
+                socket::remove_socket(idx);
+            }
+        }
+    }
+
+    /// Release every host socket (listeners and live connections) and the gateway's slots, so
+    /// a restarted guest can bind the same ports.
+    pub fn close(&mut self, gw: &mut Gateway<'_>) {
+        for i in 0..FWD_SLOTS {
+            if self.slots[i].phase != Phase::Idle {
+                self.teardown(i, gw);
+            }
+        }
+        for l in &mut self.listeners {
+            if let Some(idx) = l.take() {
+                socket::remove_socket(idx);
+            }
         }
     }
 
@@ -135,6 +167,8 @@ impl Relay {
             super::p("[KVM] relay: slot ");
             super::dec(i as u64);
             super::p(if self.slots[i].phase == Phase::Open { " open" } else { " connecting" });
+            super::p(" guest_port=");
+            super::dec(u64::from(self.slot_guest[i]));
             super::p(" to_guest=");
             super::dec(self.counts.to_guest);
             super::p(" to_host=");
@@ -169,6 +203,7 @@ impl Relay {
         let s = &mut self.slots[i];
         socket::remove_socket(s.sock);
         *s = Slot::new();
+        self.slot_guest[i] = 0;
         gw.fwd_release(i);
     }
 
@@ -192,26 +227,28 @@ impl Relay {
     }
 
     fn poll_once(&mut self, gw: &mut Gateway<'_>, now_us: u64) {
-        self.ensure_listener(now_us);
-        let Some(listener) = self.listener else { return };
+        self.ensure_listeners(now_us);
         for i in 0..FWD_SLOTS {
-            if self.slots[i].phase == Phase::Idle {
-                match socket::socket_accept(listener, true) {
-                    Ok((sock, _peer)) => {
-                        if gw.fwd_open(i, self.guest_port) {
-                            self.slots[i] = Slot::new();
-                            self.slots[i].sock = sock;
-                            self.slots[i].phase = Phase::Connecting;
-                            self.slots[i].syn_at_us = now_us;
-                            self.slots[i].syn_tries = 1;
-                            self.counts.accepted += 1;
-                        } else {
-                            socket::remove_socket(sock);
-                            self.counts.refused += 1;
-                        }
-                    }
-                    Err(_) => break,
-                }
+            if self.slots[i].phase != Phase::Idle {
+                continue;
+            }
+            // The first forward with a client waiting takes the slot.
+            let accepted = (0..self.n_fwds).find_map(|k| {
+                let l = self.listeners[k]?;
+                socket::socket_accept(l, true).ok().map(|(sock, _peer)| (sock, self.fwds[k].guest))
+            });
+            let Some((sock, guest_port)) = accepted else { break };
+            if gw.fwd_open(i, guest_port) {
+                self.slots[i] = Slot::new();
+                self.slots[i].sock = sock;
+                self.slots[i].phase = Phase::Connecting;
+                self.slots[i].syn_at_us = now_us;
+                self.slots[i].syn_tries = 1;
+                self.slot_guest[i] = guest_port;
+                self.counts.accepted += 1;
+            } else {
+                socket::remove_socket(sock);
+                self.counts.refused += 1;
             }
         }
         for i in 0..FWD_SLOTS {

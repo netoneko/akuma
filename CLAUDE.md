@@ -266,6 +266,14 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   store. **Never set FADT `HW_REDUCED_ACPI`** (Linux then drops the PIC/PIT and the device IRQ
   vanishes) and **no Linux/KVM source may be read** — only the APM, the virtio/ACPI specs and
   datasheets (`docs/reference/subsystems/kvm.md`, `docs/runbooks/kvm-linux-guest.md`).
+  `akuma-vm-spec` is **what a VM is, before anything runs it** (2026-10-22; `forbid(unsafe_code)`,
+  no dependencies): the `Spec` (kernel, cmdline, RAM, vCPUs, disk, forwards, backend), its parser and
+  `key=value` wire text, Firecracker's field names as aliases, the first-fit `arena` over the
+  `kvmmem=` reserve and the `kvmcores=` list. herd builds a spec from `vm_*` keys and the kernel
+  parses the same text off `/dev/kvm0` (`amd64/src/kvm/ctl.rs`), so the two cannot disagree.
+  **Never parse a VM description anywhere else, and never put guest RAM anywhere but the reserve
+  when `kvmmem=` is set — a request that does not fit is refused**
+  (`docs/reference/subsystems/kvm.md` § VMs as services).
   `akuma-dmesg` is the console history ring behind `dmesg(1)` plus the
   `syslog(2)` action decode, shared by both kernels' consoles
   (`docs/archive/AKUMA_AMD64_STREAMLINING.md` §4).

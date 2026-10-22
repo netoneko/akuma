@@ -49,6 +49,7 @@
     "crates/akuma-selftest",
     "crates/akuma-sntp",
     "crates/akuma-svm-amd64",
+    "crates/akuma-vm-spec",
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-abi",
     "crates/akuma-syscalls-glue",

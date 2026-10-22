@@ -153,6 +153,7 @@ dependencies = [
  "akuma-vfs",
  "akuma-vfs-glue",
  "akuma-virtio",
+ "akuma-vm-spec",
  "akuma-wifi",
  "akuma-wpa",
  "akuma-xhci",
@@ -910,6 +911,10 @@ dependencies = [
  "virtio-drivers",
  "zerocopy",
 ]
+
+[[package]]
+name = "akuma-vm-spec"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-wifi"

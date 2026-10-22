@@ -1,6 +1,6 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — Regenerated 2026-10-21 (second run of the day) with
+**Grade: A** — *2026-10-22 (evening): one crate added, **`akuma-vm-spec`** (forbids, 0 sites; the VM spec shared by herd and the kernel) — the headline below is not regenerated.* Regenerated 2026-10-21 (second run of the day) with
 `python3 scripts/cloc_akuma.py src crates` after the **`akuma-mmu` safe facade**
 ([`AKUMA_MMU_SAFE_FACADE.md`](../archive/AKUMA_MMU_SAFE_FACADE.md)): the four public
 `unsafe fn`s went safe or were deleted, the shootdown-hook transmutes became

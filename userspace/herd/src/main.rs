@@ -28,6 +28,7 @@ use boxlib::spec::{self, box_id_for};
 use boxlib::sys;
 
 use herd::exit::{classify, classify_spawn_failure, Exit, Outcome, Policy};
+use herd::vm::{self, VmConfig};
 
 // ============================================================================
 // Constants
@@ -41,6 +42,10 @@ const POLL_INTERVAL_MS: u64 = 100;
 
 /// Maximum log file size before rotation (32KB)
 const MAX_LOG_SIZE: usize = 32 * 1024;
+
+/// The same for a `vm = true` service: a guest's boot console alone is ~30 KB, and its log is the
+/// only record of it, so rotating at 32 KB threw the boot away.
+const VM_MAX_LOG_SIZE: usize = 256 * 1024;
 
 /// Default restart delay in milliseconds
 const DEFAULT_RESTART_DELAY_MS: u64 = 1000;
@@ -124,6 +129,13 @@ fn ensure_directories() {
         print("\n");
     }
     
+    // Create /var/run/herd (the specs `vm-run` reads)
+    if !mkdir_p(vm::SPEC_DIR) {
+        print("[herd] Warning: Failed to create ");
+        print(vm::SPEC_DIR);
+        print("\n");
+    }
+
     // Create /var/log/herd
     if !mkdir_p(HERD_LOG_DIR) {
         print("[herd] Warning: Failed to create ");
@@ -267,6 +279,9 @@ struct ServiceConfig {
     /// via that core's console ring, and its exit is reaped by that core's kernel.
     /// Mutually exclusive with boxes (see `is_boxed`).
     core: u32,
+    /// `vm = true`: this service is a KVM guest (`docs/reference/subsystems/kvm.md`). The
+    /// supervised process is `herd vm-run <spec file>`; `command` is [`vm::HELPER`].
+    vm: Option<akuma_vm_spec::Spec>,
 }
 
 impl Default for ServiceConfig {
@@ -289,6 +304,7 @@ impl Default for ServiceConfig {
             workdir: String::new(),
             console: false,
             core: 0,
+            vm: None,
         }
     }
 }
@@ -446,6 +462,17 @@ impl HerdState {
 
 #[cfg_attr(not(test), no_mangle)]
 pub extern "C" fn main() {
+    // The helper a VM service runs: no supervisor, no directories.
+    if libakuma::arg(1) == Some("vm-run") {
+        match libakuma::arg(2) {
+            Some(path) => vm_run(path),
+            None => {
+                print("Usage: herd vm-run <spec file>\n");
+                exit(1);
+            }
+        }
+    }
+
     // Ensure required directories exist
     ensure_directories();
 
@@ -596,6 +623,7 @@ fn supervisor_loop(mut state: HerdState) {
 
 fn parse_service_config(content: &str) -> Option<ServiceConfig> {
     let mut config = ServiceConfig::default();
+    let mut vmc = VmConfig::default();
 
     for line in content.lines() {
         let line = line.trim();
@@ -606,6 +634,11 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
             let value = value.trim();
+
+            // `vm`, `vm_*`: gathered whole and checked once, below.
+            if vmc.apply(key, value) {
+                continue;
+            }
 
             match key {
                 "command" => config.command = String::from(value),
@@ -669,6 +702,23 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                 }
                 _ => {}
             }
+        }
+    }
+
+    match vmc.finish(read_file_string) {
+        Ok(Some(spec)) => {
+            config.vm = Some(spec);
+            config.command = String::from(vm::HELPER);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // (`print` is an Akuma syscall: not under the host test harness.)
+            if !cfg!(test) {
+                print("[herd] Warning: vm service not loaded: ");
+                print(&e.describe());
+                print("\n");
+            }
+            return None;
         }
     }
 
@@ -951,6 +1001,86 @@ fn setup_fs_mounts(box_id: u64, mounts: &[String]) {
     }
 }
 
+/// Start a `vm = true` service: write its spec where `vm-run` reads it and spawn
+/// `herd vm-run <file>`. That process **is** the service as far as herd is concerned.
+fn spawn_vm_helper(name: &str, spec: &akuma_vm_spec::Spec) -> Option<SpawnResult> {
+    let mut wire = [0u8; akuma_vm_spec::spec::MAX_WIRE];
+    let n = spec.encode(&mut wire)?;
+    let path = vm::spec_path(name);
+    if !write_file(&path, &wire[..n]) {
+        print("[herd] Error: cannot write ");
+        print(&path);
+        print("\n");
+        return None;
+    }
+    spawn(vm::HELPER, Some(&["vm-run", path.as_str()]))
+}
+
+/// `herd vm-run <spec file>`: the process a VM service is. Creates the VM through `/dev/kvm0`,
+/// copies the guest's console to stdout (herd logs it to `/var/log/herd/<service>.log`), and
+/// exits when the guest does. The kernel ties the VM's life to this process: if it is killed
+/// (`herd stop`, a crash, `kill`), the guest is stopped, and herd's restart policy decides what
+/// happens next. Never returns.
+fn vm_run(spec_path: &str) -> ! {
+    /// `-EBUSY` / `-EAGAIN`.
+    const EBUSY: isize = -16;
+    const EAGAIN: isize = -11;
+    /// How often a `status` line is asked for, so the log carries the kernel's view (µs).
+    const STATUS_EVERY_US: u64 = 60_000_000;
+
+    let Some(spec) = read_file_bytes(spec_path) else {
+        print("[vm-run] cannot read the spec file\n");
+        exit(2);
+    };
+    let fd = open("/dev/kvm0", open_flags::O_RDWR);
+    if fd < 0 {
+        print("[vm-run] no /dev/kvm0: the kernel was not booted with kvmctl\n");
+        exit(2);
+    }
+    // A guest that was just stopped may still be tearing down: wait for the slot.
+    let mut waited = 0;
+    loop {
+        let r = write_fd(fd, &spec);
+        if r >= 0 {
+            break;
+        }
+        if r == EBUSY && waited < 150 {
+            waited += 1;
+            sleep_ms(200);
+            continue;
+        }
+        print("[vm-run] the kernel refused the spec (errno ");
+        print_dec((-r) as usize);
+        print(")\n");
+        exit(3);
+    }
+    print("[vm-run] guest created\n");
+    let mut buf = [0u8; 512];
+    let mut next_status = uptime() + STATUS_EVERY_US;
+    loop {
+        let n = read_fd(fd, &mut buf);
+        if n > 0 {
+            write_fd(1, &buf[..n as usize]);
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        if n != EAGAIN {
+            print("[vm-run] console read failed\n");
+            exit(4);
+        }
+        if uptime() >= next_status {
+            next_status = uptime() + STATUS_EVERY_US;
+            write_fd(fd, b"status\n");
+        }
+        sleep_ms(50);
+    }
+    print("[vm-run] guest ended\n");
+    // A service that ends is restarted by herd's policy; say it was not a clean stop.
+    exit(1);
+}
+
 fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     // Core-pinned service (multikernel): don't spawn locally. Hand the command to the
     // target core's kernel via core_init — the activation message carries the program
@@ -1076,7 +1206,9 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     }
     print("\n");
 
-    let spawn_res = if !config.join_box.is_empty() {
+    let spawn_res = if let Some(spec) = &config.vm {
+        spawn_vm_helper(name, spec)
+    } else if !config.join_box.is_empty() {
         // Join an EXISTING box (e.g. sshd into the rumpnet box so its AF_INET is
         // sysproxy-routed to that box's rump_server). The target box was registered
         // and stack-marked by its owner service — do NOT register_box or
@@ -1562,6 +1694,9 @@ fn status_report(state: &HerdState) -> String {
         if let Some(pid) = svc.pid {
             out.push_str(&format!(" pid={pid}"));
         }
+        if svc.config.vm.is_some() {
+            out.push_str(" (vm)");
+        }
         out.push_str(&format!(" restarts={}", svc.restart_count));
         if let Some(code) = svc.last_exit_code {
             out.push_str(&format!(" last_exit={code}"));
@@ -1899,8 +2034,14 @@ fn append_to_log(state: &mut HerdState, service_name: &str, data: &[u8]) {
         .map(|svc| svc.log_size)
         .unwrap_or(0);
 
+    let max_size = if state.services.get(service_name).is_some_and(|svc| svc.config.vm.is_some()) {
+        VM_MAX_LOG_SIZE
+    } else {
+        MAX_LOG_SIZE
+    };
+
     // Check if rotation is needed
-    if current_size + data.len() > MAX_LOG_SIZE {
+    if current_size + data.len() > max_size {
         // Rotate: copy current to .old
         if let Some(content) = read_file_bytes(&log_path) {
             write_file(&log_old_path, &content);
@@ -2014,6 +2155,7 @@ fn print_usage() {
     print("  start <svc>    Start an enabled service now (no reload wait)\n");
     print("  stop <svc>     Stop and reap a running service now, without disabling it\n");
     print("  log <svc>      Show service log\n");
+    print("  vm-run <file>  (internal) the process a `vm = true` service runs\n");
     print("  help           Show this help\n");
     print("\n");
     print("Without arguments, runs as daemon in foreground.\n");
@@ -2441,6 +2583,34 @@ mod tests {
         // ...but one that already exited is still reaped.
         let (t, _) = run_terminate(Some(0), false);
         assert!(matches!(t, Termination::Reaped { escalated: false, .. }));
+    }
+
+    const VM_CONF: &str = "vm = true\nvm_kernel = /boot/akuma-guest\nvm_disk = /boot/gentoo-guest.img\nvm_disk_ram = true\n\
+vm_ram_mib = 768\nvm_vcpus = 2\nvm_forward = 2223:4444\nvm_cmdline = init=/usr/bin/bash initargs=/x.sh\nrestart = true\nmax_retries = 3\n";
+
+    #[test]
+    fn a_vm_conf_becomes_the_helper_service() {
+        let c = parse_service_config(VM_CONF).expect("a vm service needs no `command`");
+        assert_eq!(c.command, "/bin/herd");
+        let spec = c.vm.expect("vm spec");
+        assert_eq!((spec.vcpus, spec.ram_mib, spec.disk_ram), (2, 768, true));
+        assert_eq!(spec.forwards().len(), 1);
+        assert!(c.restart);
+        assert_eq!(c.max_retries, 3, "the ordinary restart keys still apply to a VM");
+    }
+
+    #[test]
+    fn a_bad_vm_conf_is_not_loaded() {
+        assert!(parse_service_config("vm = true\nvm_vcpus = 9\nvm_kernel = /k\n").is_none());
+        assert!(parse_service_config("vm = true\nvm_type = firecracker\nvm_kernel = /k\n").is_none());
+        assert!(parse_service_config("vm = true\n").is_none());
+    }
+
+    #[test]
+    fn a_plain_service_is_untouched_by_the_vm_keys() {
+        let c = parse_service_config("command = /bin/sshd\nargs = -p 22\n").unwrap();
+        assert!(c.vm.is_none());
+        assert_eq!(c.command, "/bin/sshd");
     }
 
     #[test]

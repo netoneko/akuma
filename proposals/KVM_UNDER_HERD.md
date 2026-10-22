@@ -1,6 +1,8 @@
 # Idea: KVM machines brought up by herd (and, later, `box`)
 
-> **Status 2026-10-22:** an idea, nothing built. Written down after the Gentoo guest ran on the
+> **Status 2026-10-22 (evening):** step 2 below is built (herd `vm = true`, `/dev/kvm0`, one VM, a `kvmmem=`
+> reserve that refuses over-provisioning, Firecracker-compatible keys, `vm_type = kvm|firecracker` for a later
+> backend); steps 3-5 are not. Earlier: an idea, nothing built. Written down after the Gentoo guest ran on the
 > ryzen (`docs/archive/AKUMA_KVM_AKUMA_GUEST.md` § Gentoo as a guest). The decision taken in
 > conversation: **herd is the integration point** — it is Akuma's init system, it already
 > supervises, restarts and logs services, and it already knows a "boxed" service type. A VM is

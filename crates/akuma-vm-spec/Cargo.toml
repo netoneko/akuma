@@ -1,0 +1,10 @@
+[package]
+name = "akuma-vm-spec"
+version = "0.1.0"
+edition = "2024"
+description = "What a VM is, before anything runs it: the spec (kernel, cmdline, RAM, vCPUs, disk, port forwards, backend) parsed and validated with no allocation, the `key=value` wire text `/dev/kvm0` takes and herd writes, Firecracker's field names as aliases, and the extent arena that slices the reserved guest-RAM block. no_std, no dependencies."
+
+[lints]
+workspace = true
+
+[dependencies]

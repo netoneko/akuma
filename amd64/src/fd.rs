@@ -589,6 +589,27 @@ fn open_power(flags: u32) -> u64 {
     u64::from(fd)
 }
 
+/// `open("/dev/kvm0")`: a `DevKvm` descriptor, when the hypervisor is armed (`kvmctl`).
+fn open_kvm(flags: u32) -> u64 {
+    if !crate::kvm::svm_armed() {
+        return errno::ENOENT;
+    }
+    let Some(proc) = akuma_exec::process::current_process_shared() else {
+        return errno::ESRCH;
+    };
+    let fd = proc.alloc_fd(FileDescriptor::DevKvm);
+    if flags & open_flags::O_CLOEXEC != 0 {
+        proc.set_cloexec(fd);
+    }
+    u64::from(fd)
+}
+
+/// Is `fd` a `/dev/kvm0` descriptor?
+#[must_use]
+pub fn is_dev_kvm(fd: u64) -> bool {
+    table_with(fd, |d| matches!(d, FileDescriptor::DevKvm)).unwrap_or(false)
+}
+
 /// Is `fd` a `/dev/wifi0` descriptor?
 #[must_use]
 pub fn is_dev_wifi(fd: u64) -> bool {
@@ -841,6 +862,10 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     // every machine — a box with no EC and no screen still has idle facts.
     if resolved == "/dev/power" {
         return open_power(flags);
+    }
+    // `/dev/kvm0`: the hypervisor's control device (`crate::kvm::ctl`), when armed.
+    if resolved == "/dev/kvm0" {
+        return open_kvm(flags);
     }
     // `/dev/input/mouse0`: the touchpad's pointer stream (`crate::touchpad`).
     if resolved == "/dev/input/mouse0" {
@@ -1129,6 +1154,10 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     // `/dev/input/mouse0`: whole 8-byte pointer records, or `EAGAIN`.
     if is_dev_mouse(fd) {
         return crate::touchpad::dev_read(buf, len.min(MAX_IO) as usize);
+    }
+    // `/dev/kvm0`: the guest's console stream, `EAGAIN` while it is quiet, 0 once it ended.
+    if is_dev_kvm(fd) {
+        return crate::kvm::ctl::dev_read(buf, len.min(MAX_IO) as usize);
     }
     // `/dev/power`: the kernel's idle/dim facts, fresh per read.
     if is_dev_power(fd) {
@@ -1746,6 +1775,19 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
             st_mode: 0o020_644,
             st_nlink: 1,
             st_rdev: (13 << 8) | 32,
+            st_blksize: 4096,
+            ..Default::default()
+        };
+        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
+        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
+    }
+    // `/dev/kvm0`: a misc character device (10, 244), root-only — the next free minor.
+    if is_dev_kvm(fd) {
+        let g = akuma_syscalls_linux::Stat {
+            st_ino: 22,
+            st_mode: 0o020_600,
+            st_nlink: 1,
+            st_rdev: (10 << 8) | 244,
             st_blksize: 4096,
             ..Default::default()
         };

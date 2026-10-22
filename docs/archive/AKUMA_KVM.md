@@ -198,6 +198,15 @@ Read downwards; the sections below are the reference record.
    │   port 2223. METAL: `ssh -p 2223` lands in `akuma-gentoo`, Gentoo Linux, 49 h after the
    │   first KVM commit (`akuma-svm-amd64`, 10-20 20:32).
    │   [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md) § Gentoo as a guest
+ [10-22] ═══ PHASE 15: A GUEST IS A HERD SERVICE ═══  "vm = true, /dev/kvm0, a reserve to slice"
+   │
+   ▼   The boot flags and the selector file stop being the way a guest is chosen: herd turns `vm_*`
+   │   keys into a spec (`akuma-vm-spec`, Firecracker's field names as aliases), supervises
+   │   `herd vm-run`, and the kernel's `/dev/kvm0` creates, stops and reports the VM, whose lifetime is
+   │   its owner process's. The guest's console is herd's log. RAM and the RAM-disk copy are slices of a
+   │   `kvmmem=` reserve and an over-provisioned request is refused; `kvmcores=` moves the VM task off
+   │   core 0. TCG: the guest boots from a herd conf and passes `serve_rehearse.py --herd --stress 3`.
+   │   [`../reference/subsystems/kvm.md`](../reference/subsystems/kvm.md) § VMs as services
 ```
 
 ---

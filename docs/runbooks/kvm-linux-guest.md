@@ -87,7 +87,19 @@ writes are gone when the guest stops). OpenSSH answers on the guest's 4444, forw
 only the keys in p7's `/root/.ssh/authorized_keys` get in. Its init is `/akuma-kvm-init.sh`
 (`overlays/ryzen/gentoo/akuma-kvm-init.sh`).
 
-**Virtual processors of a service guest:** `vcpus=N` (1 to 4) in `/boot/kvm-guest`, e.g.
+**herd runs the guest (`vm = true`, ryzen entry 30):** boot entry 30 (`kvmctl kvmmem=3072`: SVM armed, 3 GiB
+reserved, no guest at boot), then enable **one** of `overlays/ryzen/rootfs/etc/herd/available/vm-serve.conf`
+(the busybox guest, sshd on host 2223) or `vm-gentoo.conf` (Gentoo from the RAM-copied image, host 2223 →
+guest 4444) by copying it to p3's `/etc/herd/enabled/` (p3 does not take `rootfs/`; the two share the VM slot and the
+port). Check: `herd status` lists the service as `running (vm)`; `herd log vm-gentoo` is the guest's console;
+`kill` the `herd vm-run` pid and herd restarts it (the guest is stopped within 200 ms of its owner's death, the
+new one waits out `EBUSY`); `echo status > /dev/kvm0; herd log vm-gentoo | tail` shows the kernel's view. Rehearse
+the same chain under TCG with `scripts/kvm/serve_rehearse.py LOG --herd --stress 3` (the script reads the
+guest's console back from herd's log on the host disk and requires `AKUMA-GUEST-SSHD-STARTED` in it). The boot
+flags `kvmserve`/`kvmgentoo` and `/boot/kvm-guest` still work as a shim over the same spec.
+Reference: [`../reference/subsystems/kvm.md`](../reference/subsystems/kvm.md) § *VMs as services*.
+
+**Virtual processors of a service guest:** `vm_vcpus` (1 to 4; with the boot flags `vcpus=N` in `/boot/kvm-guest`), e.g.
 `printf 'akuma-serve vcpus=2' > /mnt/p3/boot/kvm-guest`, or `kvmvcpus=N` on the command line. They
 take turns on the one host core the service task is pinned to: no more compute, and measured *worse*
 on 2026-10-22 (late SYN-ACKs 7 of 99 against 0 of 105, one 33 s upload stall); leave it at one.
@@ -111,6 +123,9 @@ Gentoo box's `conf.d/hostname` must say the same or OpenRC resets it to `localho
 | `virtio-mmio LNRO0005:00: error -ENXIO: IRQ index 0 not found` | FADT flagged hardware-reduced, or the interrupt descriptor is missing: look for `nr_irqs: 8, preallocated irqs: 0` |
 | `Waiting for root device /dev/vda...` forever, no `virtio_blk` line | no ACPI node: the guest has no disk (`[KVM] linux: no guest disk`) or `noacpi` is on the command line |
 | init prints one character and stops | the UART lost its THRE interrupt (IRQ4 / `OUT2`) |
+| `vm-run` exits 3 / `[vm-run] the kernel refused the spec (errno 22)` | the spec was refused whole: the reason is the `[KVM] kvm0: spec refused: …` line on the host console (an out-of-range `vm_vcpus`, a missing `vm_kernel`, a duplicate `vm_forward`…) |
+| `[vm-run] no /dev/kvm0` | the kernel was not booted with `kvmctl` (or `kvmtest`) |
+| `[KVM] linux: refused: guest RAM does not fit the kvmmem= reserve` | the reserve is smaller than this VM's RAM (+ its RAM-disk copy); raise `kvmmem=` |
 | `[KVM] linux: … instruction the MMIO decoder does not know` | the guest used a non-`MOV` access on the virtio window; add the encoding to `mmio` with a clang-assembled vector |
 | Akuma guest: `[FATAL] heap ends … but the region holding it ends …` | guest RAM below the kernel's fixed 512 MiB heap + image (768 MiB is the floor used) |
 | Akuma guest: `…touched the local APIC page with an instruction the MMIO decoder does not know` | a non-`MOV`/`CMP`/`TEST` access on the page; add the encoding to `mmio` with a clang vector |
