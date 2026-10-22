@@ -1,0 +1,288 @@
+# ryzen metal (entry 28, /boot/kvm-guest=akuma), 2026-10-22: Akuma's own kernel booted as the SVM guest.
+# Host kernel b3a2c71 built on the ryzen. dmesg region from the guest load to the verdict.
+[KVM] linux: loading akuma guest /boot/akuma-guest
+[KVM] linux: loaded 9829 KiB in 4 segments, PVH entry 00201000
+[KVM] linux: guest disk: /boot/akuma-guest-root.img, 16 MiB
+[KVM] linux: running (start=2ffff000, ram=768 MiB)
+
+[KVM] linux: rdmsr c0000080 -> 0000000000000000
+
+[KVM] linux: wrmsr c0000080 <- 0000000000000900
+
+
+Akuma/amd64 ??? long mode reached
+
+  uart: present  kbd: no i8042
+
+  hvm_start_info @ 0x000000002ffff000
+
+
+[KVM] linux: wrmsr c0000101 <- ffffffff81103dc0
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: cpuid 0000000d/00 -> 00000000 00000000 00000000 00000000
+
+[KVM] linux: cpuid 00000007/00 -> 00000000 00000000 00000000 00000000
+  smap: off (CPUID lacks SMAP)  smep: off (CPUID lacks SMEP)
+
+  version=1 modules=0 rsdp=0x0000000000000000 cmdline=0x000000002fffd000
+
+  memmap: 1 entries
+
+    0x0000000000000000 + 0x000000002fffd000  RAM
+
+  usable RAM: 767 MiB
+
+  virtio-mmio: 0x00000000d0000000 + 0x0000000000001000 irq 5
+
+  acpi: none found (no RSDP in the EBDA or the BIOS window)
+
+  mem:  RAM the machine reported, and what became of each:
+
+    0x0000000000000000 + 767 MiB  heap + pmm
+
+  mem:  767 MiB usable, 766 MiB managed, physmap reaches 64 GiB
+
+  kernel ends 0x0000000001192540
+
+  heap: 0x0000000001193000 + 512 MiB ... ok
+
+  pmm:  arena 0x0000000000100000 + 766 MiB spanning 1 RAM region(s)
+
+  pmm:  766 MiB RAM, 61034 free frames (238 MiB)
+
+  [power] source=none (no ERAM region in the DSDT/SSDTs)
+
+  clock: CMOS RTC holds no date; waiting for SNTP
+
+[fpcache] shared file-page cache enabled, base cap=24543 pages (+20% elastic)
+
+  blk:  1 virtio slot(s) at pa 0x00000000d0000000 stride 0x0000000000001000 irq 5
+
+[Block] Initializing block device driver...
+
+[Block] Found virtio-blk at slot 0
+
+[Block] Registered vda: 16 MB (32768 sectors)
+
+[Block] Block devices initialized: 1
+
+  fs:   ext2 mounted on /dev/vda
+
+[SmolNet] Initializing network stack...
+
+  net:  no stack: No virtio-net device found
+
+
+[KVM] linux: rdmsr 0000001b -> 00000000fee00100
+
+[KVM] linux: wrmsr 0000001b <- 00000000fee00900
+  lapic: base=0x00000000fee00000 id=0 timer vector=32 periodic
+
+  lapic: calibrated vs PIT: 625062 counts per 10000us (1000 MHz); tsc 3794 MHz
+
+
+[KVM] linux: rdmsr c0000080 -> 0000000000000d00
+
+[KVM] linux: wrmsr c0000080 <- 0000000000000d01
+
+[KVM] linux: wrmsr c0000081 <- 0013000800000000
+
+[KVM] linux: wrmsr c0000082 <- ffffffff802bf3c0
+
+[KVM] linux: wrmsr c0000084 <- 0000000000047700
+[BKLPROF] enabled (amd64 diagnostic)
+
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+
+                      =#=      .-
+
+                      +*#*:.:-**
+
+                      +%%#%##***
+
+                      +%%%#%%#**.
+
+                      +%@@@%%%+*:
+
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+          :::::--=+++*%@%@%%%%*-
+
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+
+*%%%%%@%@@%@@@%%%%#%@@@@@@@%%@@%@@@*+--
+
+ ::=+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+
+         .--+**%@@@@@%@@%%@@%*       :-.
+
+                  ::::---#@%%*
+
+
+
+  Akuma/amd64  0.0.8-amd64
+
+
+
+-- running /bin/busybox --
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+[threads] new high-water: 4 live user threads (terminated=0 free=508 ceiling=512)
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+[SCHED] WARNING: yield_now with IRQs masked tid=3 lr=0x0
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+AKUMA-GUEST-UP
+[SCHED] WARNING: yield_now with IRQs masked tid=3 lr=0x0
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+[SCHED] WARNING: yield_now with IRQs masked tid=3 lr=0x0
+
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000100 <- 0000000000000000
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: wrmsr c0000100 <- 0000000000713198
+
+[KVM] linux: wrmsr c0000102 <- 0000000000000000
+Akuma akuma 0.0.8 b3a2c71-release-smp-shared x86_64 GNU/Linux
+[SCHED] WARNING: yield_now with IRQs masked tid=3 lr=0x0
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+[SCHED] WARNING: yield_now with IRQs masked tid=3 lr=0x0
+
+ebce43017d2cb316ea45e08374de7315  /bin/busybox
+[SCHED] WARNING: yield_now with IRQs masked tid=3 lr=0x0
+
+[threads] new high-water: 5 live user threads (terminated=0 free=507 ceiling=512)
+
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+[SCHED] WARNING: yield_now with IRQs masked tid=1 lr=0x0
+
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+[SCHED] WARNING: yield_now with IRQs masked tid=4 lr=0x0
+
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+71277886028e270c53e947eb5989f7f2  /wtest
+
+[KVM] linux: cpuid 00000001/00 -> 00a70f52 00100800 42d82203 078ba97f
+
+[KVM] linux: irq vector 20 taken at rip=ffffffff80335018
+AKUMA-GUEST-DONE
+[KVM] linux: stopped: guest reported its init ran to the end
+[KVM] linux: exits=9853 cpuid=12 msr=144 io=7992 irq=1 exc=0 injected=24 hlt=0 mmio=1665 lapic=38 lapic_irq=24 console_bytes=2950 rip=ffffffff802ae02e
+[KVM] akuma guest: PASS (banner=yes, init=yes)

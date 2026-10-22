@@ -1,8 +1,8 @@
 # Rung 3: Akuma boots under its own hypervisor
 
-**Date:** 2026-10-22. **Status:** **PASS under QEMU TCG** (`[KVM] akuma guest: PASS
-(banner=yes, init=yes)`); nested SVM and the metal: see § Results (updated as they
-land). Third rung of the ladder in [`AKUMA_KVM.md`](AKUMA_KVM.md) ("KVM runs
+**Date:** 2026-10-22. **Status:** **PASS on the ryzen metal** (entry 28, 2026-10-22) and under QEMU TCG:
+`[KVM] akuma guest: PASS (banner=yes, init=yes)`. Nested SVM was skipped (the box was
+offline for it; the metal run went straight after TCG). Third rung of the ladder in [`AKUMA_KVM.md`](AKUMA_KVM.md) ("KVM runs
 akuma"); continues [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md). No Linux
 or KVM source was read; every register offset and bit is the architectural xAPIC
 map (AMD APM Vol 2, ch. 16), the x86 `CMP`/`TEST` definitions, or the guest's own
@@ -65,6 +65,7 @@ per-guest, and `kvm::late` picks the guest.
 |---|---|
 | QEMU TCG, Mac (`scripts/kvm/akuma_rehearse.sh`) | **PASS**: banner, 34 LAPIC timer interrupts delivered, `blk` found from the command line, ext2 mounted, busybox init ran, 10 516 exits (3 453 MMIO, 48 LAPIC page accesses). Guest `/wtest` md5 `71277886…` = host `debugfs` dump of the image; `e2fsck -fn` clean. Same through the `/boot/kvm-guest` selector |
 | Linux guest regression (same kernel, `linux_rehearse.sh`) | PASS, `init ran to completion` — unchanged |
+| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma`, kernel `b3a2c71` built on the ryzen) | **PASS**: the guest calibrated its LAPIC timer against the virtual PIT (`625062 counts per 10000us`) and measured the real TSC (**3794 MHz**), `blk` from the command line, ext2 mounted, `uname` printed, `md5sum /bin/busybox` = `ebce4301…` (the host's), `/wtest` = `71277886…`, `AKUMA-GUEST-DONE`; **9 853 exits, 24 virtual interrupts, 1 665 MMIO, 38 LAPIC page accesses**. Independent check from Pop: `/boot/akuma-guest-root.img` on p3 was rewritten by the guest (mtime = the boot), `debugfs dump /wtest` → md5 `71277886…`, `e2fsck -fn` clean. Log: [`AMD64_KVMTEST_PHASE9_AKUMA_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE9_AKUMA_METAL_DMESG_2026_10_22.txt) |
 
 ## Still open
 

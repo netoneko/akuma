@@ -18,7 +18,7 @@ the ISA here is **AMD SVM (AMD-V) + nested page tables**, not Intel VT-x.
 
 1. KVM runs something simple (a trivial guest exits and returns).
 2. KVM runs Linux.
-3. KVM runs akuma. **Done under QEMU TCG 2026-10-22** ([`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md)).
+3. KVM runs akuma. **Done 2026-10-22, on QEMU TCG and on the ryzen metal** ([`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md)).
 
 **License constraint (binding for the whole project):** no Linux code may be
 used or consulted — KVM included — because of GPL incompatibility. Everything
@@ -151,14 +151,16 @@ Read downwards; the sections below are the reference record.
        mounts a file on p3 as its virtio-blk root, runs init, matches both
        md5s and reboots itself. 99 869 exits, 207 virtual interrupts.
        [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Phase 7, 8
- [10-22] ═══ PHASE 9: AKUMA ON AKUMA ═══  "rung 3: TCG PASS"
+ [10-22] ═══ PHASE 9: AKUMA ON AKUMA ═══  "rung 3: PASS ON THE METAL"
    │
    ▼   The kernel's own ELF as the guest: a pure local-APIC model (register page,
        periodic/one-shot timer, IRR/ISR priority), delivered as the same virtual
        INTR; and the MMIO decoder learns CMP/TEST (LLVM folds a volatile load into
        the comparison) with flag arithmetic checked against 1 600 real x86 cmp/test
        results. Busybox init runs in the guest, its written file reads back
-       identical on the host. [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md)
+       identical on the host. Metal (ryzen entry 28): PASS, TSC 3794 MHz measured by
+       the guest, 9 853 exits, written file verified from Pop with debugfs/e2fsck.
+       [`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md)
 ```
 
 ---

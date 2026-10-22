@@ -9,8 +9,9 @@ Source: **`amd64/src/kvm.rs`** (phases 0-5, the consistency ladder),
 **`amd64/src/kvm/linux.rs`** (the Linux phase), and the pure models in
 **`crates/akuma-svm-amd64`**.
 
-> **Stability: C (active risk).** Phases 0-8 have passed on the metal (2026-10-22:
-> Linux boots from a virtio-blk root on the ryzen, entry 28). The guest cannot reach any
+> **Stability: C (active risk).** Phases 0-9 have passed on the metal (2026-10-22:
+> Linux boots from a virtio-blk root on the ryzen, entry 28; so does Akuma's own
+> kernel). The guest cannot reach any
 > real device — NPT maps only its RAM and every port and MSR is intercepted — so a
 > wrong guest is a stopped run, not a hardware hazard. A wrong *host* side can
 > still wedge the box (a `#VMEXIT` leaves GIF clear: `stgi` must follow `vmrun`).
