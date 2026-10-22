@@ -206,6 +206,13 @@ Read downwards; the sections below are the reference record.
    │   its owner process's. The guest's console is herd's log. RAM and the RAM-disk copy are slices of a
    │   `kvmmem=` reserve and an over-provisioned request is refused; `kvmcores=` moves the VM task off
    │   core 0. TCG: the guest boots from a herd conf and passes `serve_rehearse.py --herd --stress 3`.
+   │   **Metal PASS (ryzen entry 30, 2026-10-22):** both guests come up from herd (`vm-serve`, then
+   │   `vm-gentoo` with its 3 GiB image copied into the reserve), `relay_stress.py` PASS on each,
+   │   `relay_bulk.py` 2.6-4.3 MB/s, md5-clean 4 MiB each way into Gentoo, `herd status` shows `(vm)`, and a
+   │   kill of the `herd vm-run` pid or `echo stop > /dev/kvm0` makes herd restart the guest with the reserve
+   │   back to its full size. Found on the metal: a 3 GiB image against `kvmmem=3072` printed the refusal and
+   │   then booted a rootless guest forever; a spec that names a disk now does not start without it, and the
+   │   entry reserves 4096.
    │   [`../reference/subsystems/kvm.md`](../reference/subsystems/kvm.md) § VMs as services
 ```
 

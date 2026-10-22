@@ -159,8 +159,9 @@ disagree on a key or a limit.
 
 ## VMs as services: `/dev/kvm0` and herd
 
-**AMD SVM only** (Intel VMX is out of scope). Grade of this section: **C** — the metal gate is
-[`../../runbooks/kvm-linux-guest.md`](../../runbooks/kvm-linux-guest.md) § *herd*.
+**AMD SVM only** (Intel VMX is out of scope). Grade of this section: **C** — passed on the ryzen metal
+2026-10-22 (entry 30, `kvmctl kvmmem=4096`; `vm-serve` and `vm-gentoo`, restart by kill and by `stop`).
+Runbook: [`../../runbooks/kvm-linux-guest.md`](../../runbooks/kvm-linux-guest.md) § *herd*.
 
 A VM is a herd service. herd turns `vm_*` keys into an `akuma_vm_spec::Spec`, writes its wire text to
 `/var/run/herd/<name>.vm` and supervises one ordinary process, `herd vm-run <file>`. That process
@@ -192,6 +193,8 @@ adds one for a single driver. It is opened by the kernel's own `openat` arm like
   the guest the oldest bytes are lost (`console_lost`). The 100 ms drain keeps that rare.
 - **No allocation on any of it** apart from the RAM-disk copy's 1 MiB chunk (fallible, freed). The spec
   is a `Copy` value; the wire document is capped at 768 bytes and read onto the stack.
+- **A spec that names a disk does not start without it.** A refused RAM copy or a missing image ends the run
+  at once (`refused: the spec's disk is not available`) instead of booting a rootless guest.
 - **Reserved memory (`kvmmem=<MiB>`).** The kernel takes one contiguous block at boot, while memory is
   unfragmented, and every VM's RAM and RAM-disk copy is a 2 MiB-aligned slice of it
   (`akuma_vm_spec::arena`, first fit, zeroed when carved). **A request that does not fit is refused**
