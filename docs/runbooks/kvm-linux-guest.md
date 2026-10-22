@@ -28,6 +28,9 @@ boots `.verify` when present. Rehearse under nested SVM from Pop
 (`DISK=nvme sh overlays/ryzen/qemu.sh 28 240 std`), then `arm.sh 28`. Read the
 result with `dmesg | grep -a '\[KVM\]'` on the booted Akuma.
 
+Linux with the local APIC: `FLAG=kvmlapic ROOT=… GUEST=… sh scripts/kvm/linux_rehearse.sh LOG`
+(`[KVM] linux-apic guest: PASS`).
+
 ## 3. The Akuma guest (this kernel booting under itself)
 
 ```sh
@@ -44,7 +47,7 @@ On the ryzen (build there): the guest kernel is any PVH build of the kernel, at
 `/boot/akuma-guest`; the guest disk is the 16 MiB image from
 `scripts/kvm/akuma_guest_rootfs.sh` at `/boot/akuma-guest-root.img`; and either boot
 entry 29 (needs a `grubx64.efi` with it) or write `akuma` to `/boot/kvm-guest` and boot
-entry 28. Delete `/boot/kvm-guest` to get the Linux guest back.
+entry 28. Delete `/boot/kvm-guest` to get the Linux guest back (`GUEST=linux sh overlays/ryzen/kvm-akuma-stage.sh` does it, `GUEST=linux-apic` selects Linux with the local APIC).
 
 The smallest root: `HELLO=1 scripts/kvm/akuma_rehearse.sh LOG` rehearses the guest whose
 only program is `/bin/hello` (`[KVM] akuma-hello guest: PASS`, and `Hello, world!` on the

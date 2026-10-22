@@ -182,6 +182,34 @@ network, no LAPIC. The wifi station then took minutes to join —
 backing store (NVMe second window); the LAPIC timer; queue interrupts are edge-
 raised once per `process` (fine for one queue, revisit with more devices).
 
+## Phase 10: Linux with the local APIC on (2026-10-22)
+
+`kvmtest kvmlapic` (or `kvmlinux` with `/boot/kvm-guest` = `linux-apic`). Opt-in, so the
+phase-8 guest above is unchanged. The local APIC model written for the Akuma guest
+([`AKUMA_KVM_AKUMA_GUEST.md`](AKUMA_KVM_AKUMA_GUEST.md)) is switched on for Linux:
+
+* CPUID leaf 1 reports the APIC (EDX bit 9) with initial APIC id 0; the command line drops
+  `nolapic` (`noapic` stays: there is no I/O APIC);
+* `IA32_APIC_BASE` starts **enabled**, as firmware leaves it. First attempt started it clear
+  and the guest read the ID register of a page that was not there (`gpa=fee00020`);
+* the legacy PIC reaches the guest through **LINT0 in ExtINT mode** (the virtual wire):
+  `Lapic::lint0_extint`, and `Platform::offer` asks the PIC when it is set;
+* `tsc=reliable`: the clocksource watchdog's reference is the jiffies tick, only as exact as
+  interrupt delivery, and it declared the host's own TSC "unstable" (jiffies 480 ms against
+  544 ms of TSC).
+
+Linux then calibrates and uses the APIC timer as its tick (207 LAPIC interrupts in a boot,
+no PIT ticks), and mounts the same ext2 root. **Granularity fixed with it:** before every
+`VMRUN` the host's own one-shot is armed at the guest's next timer deadline when that is
+sooner than the periodic host tick (`lapic::arm_oneshot_in_us`, the scheduler's
+`arm_deadline` machinery), so a guest that never exits gets its interrupt on time instead of
+at the next 10 ms host tick.
+
+| where | result |
+|---|---|
+| QEMU TCG | PASS: init ran to completion, no `unstable`, APIC timer ticks; the PIC-only Linux guest, the Akuma guests: all unchanged |
+| **metal, ryzen entry 28** (`/boot/kvm-guest` = `linux-apic`, kernel `d877cd1` built on the ryzen) | **PASS**: `tsc: Detected 3794.125 MHz`, `model name : AMD Ryzen 7 8845HS`, guest `md5sum /bin/busybox` = `ebce4301…`, guest-written `/wtest` = `71277886…`, reboot → clean stop; 100 136 exits, **136 interrupts through the LAPIC**, 381 LAPIC page accesses, no watchdog complaint. Log: [`AMD64_KVMTEST_PHASE10_LINUXAPIC_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE10_LINUXAPIC_METAL_DMESG_2026_10_22.txt). The hello-world Akuma guest re-run on the same kernel: PASS (6 572 exits) |
+
 ## Bugs found on the way (all in code that was already "green")
 
 | symptom | cause | how it hid |

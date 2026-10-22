@@ -63,6 +63,13 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
   `V_IRQ`. With the local APIC on (the guest set `IA32_APIC_BASE` bit 11) it is the
   only source; without it, the PIC. A new interrupt source goes through these two,
   never straight into `V_INTR`.
+- **Host timer at the guest's deadline.** Before each `VMRUN` the loop arms the host's
+  one-shot (`lapic::arm_oneshot_in_us`) at `Platform::next_event_us()` when sooner than
+  the periodic tick; `on_tick`'s `restore_periodic` brings the periodic tick back. Never
+  `restore_periodic` after an ordinary exit: an exit storm would then postpone the host
+  tick (and the hardware watchdog's pet) indefinitely.
+- **Legacy interrupts with a local APIC arrive through LINT0 ExtINT** (the virtual wire);
+  `Lapic::lint0_extint` says whether the PIC may be consulted.
 - **The APIC page is emulated only while the guest has it enabled**, at the base the
   guest wrote. A guest told `nolapic` never sets the bit and a touch of that page stays
   a fatal nested page fault naming the address.
@@ -82,10 +89,10 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 ## Run it
 
 Runbook: [`../../runbooks/kvm-linux-guest.md`](../../runbooks/kvm-linux-guest.md).
-Kernel command line: `kvmtest kvmlinux` or `kvmtest kvmakuma` (add `noladder` under
+Kernel command line: `kvmtest kvmlinux`, `kvmtest kvmlapic` (Linux with the local APIC) or `kvmtest kvmakuma` (add `noladder` under
 TCG). `kvmhello` is the same guest on a 2 MiB root whose only file is `/bin/hello`.
 `kvmlinux` runs an Akuma guest instead when p3's `/boot/kvm-guest` begins with
-`akuma` (busybox root) or `akuma-hello` — the bootloader entry's command line is baked into `grubx64.efi`, so the file
+`akuma` (busybox root), `akuma-hello` or `linux-apic` — the bootloader entry's command line is baked into `grubx64.efi`, so the file
 is the lever that lets one entry serve both.
 
 ## Background

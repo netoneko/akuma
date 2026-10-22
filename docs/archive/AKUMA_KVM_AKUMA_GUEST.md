@@ -83,10 +83,9 @@ the run on the line's last words (`run by Akuma`).
 
 ## Still open
 
-* LAPIC timer granularity: a guest spinning with `IF` set sees timer interrupts at the
-  host-tick rate (the host tick is the only exit it is guaranteed to produce), HLT idle
-  is exact. Fine for a 10 ms guest tick; a finer guest would need the host to arm a
-  one-shot at the guest's deadline.
+* (Fixed 2026-10-22, same day: a guest spinning with `IF` set used to see timer
+  interrupts at the 10 ms host-tick rate; the host's one-shot is now armed at the guest's
+  deadline — [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) § Phase 10.)
 * One vCPU (`nosmp`), no IOAPIC, no virtio-net, no PCI. SMP needs INIT/STARTUP delivery
   and a second VMCB; the `Lapic` model already carries the ICR.
 * The guest's `HLT` with `IF` clear stops the run (same as the Linux guest).
