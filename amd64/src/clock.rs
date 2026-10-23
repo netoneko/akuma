@@ -16,10 +16,15 @@
 //! which `e2fsck` reported after the guest's hard reboot. The RTC is a
 //! seed, not the truth — it drifts, and may hold local time on a machine
 //! that dual-boots Windows — so SNTP still runs and overrides it
-//! ([`RTC_ONLY`]), and once it has, the chip is **written back**
-//! ([`write_rtc_from_sntp`], as Linux's `sync_cmos_clock` does) so the next
-//! offline boot seeds from a corrected clock. Only SNTP writes it: a ring-3
-//! `settimeofday` sets the kernel's clock and nothing else, as on Linux.
+//! ([`RTC_ONLY`]) in RAM. It no longer writes the chip: the write-back
+//! (Linux's `sync_cmos_clock`, in the tree 2026-10-12..2026-10-23) was the
+//! kernel's only hand on firmware-owned CMOS — the SET window a reset could
+//! land in, the century register 0x32 hardcoded rather than read from ACPI —
+//! and this machine's firmware rejected its CMOS after every Akuma run, so
+//! the chip belongs to the firmware and Linux alone now (2026-10-23, the
+//! CMOS task; `kvm.rs`'s 0x7F breadcrumbs moved to RAM the same day). What
+//! it costs: an offline boot seeds from whatever the last chip-writer left,
+//! which is exactly what every boot before 2026-10-12 did.
 //!
 //! # What this file is, after C3
 //!
@@ -190,9 +195,11 @@ pub fn seed_from_rtc() {
 }
 
 /// The CMOS index/data ports. Nothing else in this kernel touches them, and
-/// the two users here never overlap: [`seed_from_rtc`] runs at boot before
-/// the netpoll daemon exists, [`write_rtc_from_sntp`] from that daemon (or
-/// the boot one-shot, same thread as the seed) afterwards.
+/// only reads run today: [`seed_from_rtc`] at boot, before the netpoll daemon
+/// exists. (The SNTP write-back is gone — module header — and `kvm.rs`'s
+/// breadcrumbs left the chip for a RAM word; the `write` arm stays because
+/// [`akuma_cmos_rtc::Cmos`] requires it and so the correct sequence lives in
+/// one place if a caller ever earns it.)
 struct Ports;
 
 impl akuma_cmos_rtc::Cmos for Ports {
@@ -203,57 +210,15 @@ impl akuma_cmos_rtc::Cmos for Ports {
         akuma_port::CMOS.read(reg)
     }
     fn write(&mut self, reg: u8, v: u8) {
-        // The crate writes only the clock's own registers (0x00–0x09, 0x32) and
-        // the SET bit of status B, under SET, in the format the chip was found
-        // in; nothing here can reach the chip's alarm, interrupt enables or the
-        // NVRAM the firmware keeps past 0x32.
+        // No in-tree caller (module header). If one returns, route it through
+        // `akuma_cmos_rtc::write`, which touches only the clock's own
+        // registers (0x00–0x09, 0x32) and the SET bit of status B, under SET,
+        // in the format the chip was found in — and read the chip back.
         akuma_port::CMOS.write(reg, v);
     }
 }
 
-/// `net::uptime_us` before which [`write_rtc_from_sntp`] does nothing again:
-/// Linux's `sync_cmos_clock` interval. SNTP succeeds once per boot today, so
-/// this guards a future caller, not a present one.
-const RTC_WRITE_INTERVAL_US: u64 = 11 * 60 * 1_000_000;
-static NEXT_RTC_WRITE_US: AtomicU64 = AtomicU64::new(0);
-
-/// Write the synced wall clock to the CMOS RTC, so the next boot with no
-/// network seeds from a corrected clock ([`seed_from_rtc`]). Only from an
-/// SNTP success — never from `settimeofday`/`clock_settime`/`adjtimex`,
-/// which is `hwclock --systohc`'s job on Linux too. Whole seconds; the chip
-/// drifts more than that between boots. Read back by the crate before it
-/// reports success; one line either way.
-fn write_rtc_from_sntp() {
-    let now = crate::net::uptime_us();
-    if now < NEXT_RTC_WRITE_US.load(Ordering::Relaxed) {
-        return;
-    }
-    NEXT_RTC_WRITE_US.store(now.saturating_add(RTC_WRITE_INTERVAL_US), Ordering::Relaxed);
-    let Some(dt) = akuma_cmos_rtc::civil_from_unix(now_us() / 1_000_000) else {
-        serial::puts("  clock: SNTP time is outside the years the CMOS RTC seed would believe; not written\n");
-        return;
-    };
-    match akuma_cmos_rtc::write(&mut Ports, &dt) {
-        Ok(()) => {
-            serial::puts("  clock: CMOS RTC written from SNTP (");
-            put_date(&dt);
-            serial::puts(" UTC) and read back\n");
-        }
-        Err(e) => {
-            serial::puts("  clock: CMOS RTC not written: ");
-            serial::puts(match e {
-                akuma_cmos_rtc::Error::OutOfRange => "date out of range",
-                akuma_cmos_rtc::Error::ReadBackDiffers => "read back differs (no chip, or it dropped the write)",
-                akuma_cmos_rtc::Error::UpdateNeverEnded => "it never finished updating",
-                akuma_cmos_rtc::Error::Unstable => "reads never agreed",
-                akuma_cmos_rtc::Error::Malformed => "it holds no date after the write",
-            });
-            serial::puts("\n");
-        }
-    }
-}
-
-/// `YYYY-M-D H:MM`-ish, for the lines above.
+/// `YYYY-M-D H:MM`-ish, for the seed line above.
 fn put_date(dt: &akuma_cmos_rtc::DateTime) {
     serial::put_dec(u64::from(dt.year));
     serial::puts("-");
@@ -438,7 +403,8 @@ fn report_outcome(outcome: SyncOutcome, ctx: &str) {
             serial::puts(", ");
             serial::puts(ctx);
             serial::puts(")\n");
-            write_rtc_from_sntp();
+            // The chip is not written (module header): SNTP corrects the wall
+            // clock in RAM; the CMOS RTC stays the firmware's and Linux's.
         }
         SyncOutcome::DnsFailed => {
             serial::puts("  clock: ");

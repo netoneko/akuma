@@ -48,7 +48,7 @@ use akuma_vm_spec::Spec;
 use akuma_svm_amd64::{ctrl, intr0, intr1, save, ExitCode, Seg, SegAttr, Vmcb};
 
 use core::arch::x86_64::__cpuid;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 pub mod api;
 pub mod ctl;
@@ -68,11 +68,35 @@ fn p(s: &str) {
     }
 }
 
-/// Breadcrumb for a run that resets the machine before any log can be read: the
-/// last step reached, in CMOS byte 0x7F (port 0x70/0x71 from Linux's /dev/port).
-/// CMOS survives the reset; serial and the console ring do not.
+/// Breadcrumb for a run that wedges before its log can be read: the last step
+/// reached, in RAM, reported by `kvmctl status` (`last_crumb=`).
+///
+/// This byte used to be CMOS **0x7F** — "survives the reset that kills the
+/// console ring" — which is how the laptop's firmware came to find a byte it
+/// keeps changed underneath it: `linux/machine.rs` crumbs around **every
+/// `VMRUN` of every guest** (0x57/0x58), so every boot that ran a guest —
+/// a `kvmtest` rehearsal, a `kvmserve` service guest, any `/dev/kvm0` machine,
+/// no `kvmtest` flag needed — wrote 0x7F thousands of times while the guest
+/// ran, and the rehearsal guests once per step besides. A firmware that
+/// checksums the CMOS banks past the RTC (most do something of the kind) then
+/// fails its POST clock/CMOS check on the next boot until it rewrites its own
+/// settings: the deterministic "Akuma ran, so the next POST wants F1" the
+/// owner saw. The store below costs one byte of RAM and touches no hardware;
+/// each rehearsal step still prints its own line around the `crumb`, so a
+/// serial capture keeps the full sequence, and `last_crumb` puts the tail of
+/// a wedged run on the status line.
+static LAST_CRUMB: AtomicU8 = AtomicU8::new(0);
+
 fn crumb(step: u8) {
-    akuma_port::CMOS.write(0x7F, step);
+    LAST_CRUMB.store(step, Ordering::Relaxed);
+}
+
+/// [`crumb`]'s last value — `ctl`'s status line prints it, so a wedged or
+/// reset guest run's furthest step is readable from the host without any
+/// CMOS access at all.
+#[must_use]
+pub fn last_crumb() -> u8 {
+    LAST_CRUMB.load(Ordering::Relaxed)
 }
 
 fn hx(v: u64, nibbles: u32) {
@@ -478,10 +502,49 @@ static MSRPM: Msrpm = Msrpm(svm::msrpm::with_access(
 ));
 
 /// The I/O permissions map (§15.10.1): 12 contiguous KiB, same `.bss`
-/// argument, one bit armed: port `0x80` (POST).
+/// argument, armed for port `0x80` (POST, the one exit the seed guests
+/// exercise) **and for the whole CMOS port range `0x70`–`0x77`** — the
+/// index/data pair and the extended-bank ports every chipset decodes there.
+/// The rehearsal guests run every other port natively on purpose (that is
+/// what the map is for), but "natively" must never mean the real RTC/NVRAM
+/// chip: a guest that grows one more `out` instruction would otherwise write
+/// the machine's firmware settings from inside the rehearsal. Everything a
+/// real OS guest sees goes through `IOPM_ALL` in `kvm/linux.rs`.
 #[repr(C, align(4096))]
 struct Iopm([u8; svm::iopm::SIZE]);
-static IOPM: Iopm = Iopm(svm::iopm::with_port([0; svm::iopm::SIZE], 0x80, true));
+static IOPM: Iopm = Iopm(svm::iopm::with_port(
+    svm::iopm::with_port(
+        svm::iopm::with_port(
+            svm::iopm::with_port(
+                svm::iopm::with_port(
+                    svm::iopm::with_port(
+                        svm::iopm::with_port(
+                            svm::iopm::with_port(
+                                svm::iopm::with_port([0; svm::iopm::SIZE], 0x80, true),
+                                0x70,
+                                true,
+                            ),
+                            0x71,
+                            true,
+                        ),
+                        0x72,
+                        true,
+                    ),
+                    0x73,
+                    true,
+                ),
+                0x74,
+                true,
+            ),
+            0x75,
+            true,
+        ),
+        0x76,
+        true,
+    ),
+    0x77,
+    true,
+));
 
 /// The physical address of an object in the kernel image — the derivation
 /// `linker.ld` bakes into every section (`AT(ADDR(...) - KERNEL_VMA)`) and

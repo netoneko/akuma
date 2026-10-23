@@ -173,6 +173,7 @@ fn status_line() {
     if let Some((used, total)) = reserve_usage() {
         let _ = write!(l, " reserve_mib={}/{}", used >> 20, total >> 20);
     }
+    let _ = write!(l, " last_crumb={:#04x}", super::last_crumb());
     let lost = LOST.load(Ordering::Relaxed);
     let _ = writeln!(l, " console_lost={lost}");
     emit(core::str::from_utf8(&l.buf[..l.n]).unwrap_or("[kvm] status: ?\n"));

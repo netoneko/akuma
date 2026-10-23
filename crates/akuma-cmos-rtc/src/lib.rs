@@ -10,11 +10,16 @@
 //! ryzen menu entry 7's fsck, `docs/archive/WIFI_FUZZ_AND_LOSSY_SIM.md`).
 //!
 //! This crate is the decode and the encode, host-tested; the kernel supplies
-//! the port accesses through [`Cmos`], anchors its wall clock with [`read`]'s
-//! result, and once SNTP has synced writes the chip back with [`write`] so the
-//! next boot without a network starts from a corrected clock — what Linux's
-//! `sync_cmos_clock` does, and like it only from NTP, never from a ring-3
-//! `settimeofday` (that is `hwclock --systohc`'s job). SNTP still corrects the
+//! the port accesses through [`Cmos`] and anchors its wall clock with
+//! [`read`]'s result. It stopped writing the chip (2026-10-23): the SNTP
+//! write-back below `write`'s docs was the kernel's only hand on
+//! firmware-owned CMOS — a SET window a reset could land in, a hardcoded
+//! century register — and the machine's firmware rejected its CMOS after
+//! every Akuma run, so the chip is the firmware's and Linux's alone now.
+//! [`write`] stays: the correct sequence, host-tested against the [`Chip`]
+//! model in here, so whoever re-enables a writer inherits the right one —
+//! what Linux's `sync_cmos_clock` does, and like it only from NTP, never
+//! from a ring-3 `settimeofday` (that is `hwclock --systohc`'s job). SNTP still corrects the
 //! seed every boot: a CMOS clock drifts seconds a month and may hold local
 //! time on a machine that dual-boots Windows (ryzen's holds UTC: `timedatectl`
 //! says `RTC in local TZ: no`).
