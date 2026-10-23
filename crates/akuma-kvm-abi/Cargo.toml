@@ -1,0 +1,10 @@
+[package]
+name = "akuma-kvm-abi"
+version = "0.1.0"
+edition = "2024"
+description = "The ioctl protocol a VMM (Firecracker) speaks to /dev/kvm, as pure data: request decode, argument layouts, the memslot table. Learned from the unmodified binary's syscalls (docs/archive/AKUMA_FIRECRACKER_KVM.md), not from any source. no_std, no dependencies."
+
+[lints]
+workspace = true
+
+[dependencies]

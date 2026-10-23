@@ -50,6 +50,7 @@
     "crates/akuma-sntp",
     "crates/akuma-svm-amd64",
     "crates/akuma-vm-spec",
+    "crates/akuma-kvm-abi",
     "crates/akuma-syscalls",
     "crates/akuma-syscalls-abi",
     "crates/akuma-syscalls-glue",
