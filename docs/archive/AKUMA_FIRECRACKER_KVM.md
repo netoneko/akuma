@@ -430,15 +430,45 @@ herd's `cpus` applies to the spawn only, not to a later `herd` restart of an alr
   `71277886...`), `AKUMA-GUEST-DONE`, then Firecracker's `Hlt`. No `[EXCEPTION]` in dmesg.
 * After it: `herd start vm-serve-mc` and `ssh -p 2223` into the `kvm0` guest still work.
 
-### Networking under Firecracker: today it does not start (2026-10-23)
+### Networking under Firecracker: `/dev/net/tun` (2026-10-23, kernel `db4c9e6`, ryzen metal)
 
-`"network-interfaces":[{"iface_id":"eth0","host_dev_name":"tap0",...}]` makes Firecracker exit before the first `RUN`:
-`Open tap device failed: Couldn't open /dev/net/tun: No such file or directory`. There is no `/dev/net/tun` node. What it would
-take: a tun/tap node (`TUNSETIFF` with `IFF_TAP|IFF_NO_PI|IFF_VNET_HDR`, `TUNSETOFFLOAD`, `TUNSETVNETHDRSZ`, read/write of
-frames with the virtio-net header, `EPOLLIN` readiness) whose far end is the `kvm0` gateway (`akuma_svm_amd64::gateway`: ARP,
-DHCP, ICMP echo, port forwards, and with `vm_outbound` TCP/DNS out through `kvm/relay.rs`). The gateway is host-tested; the
-missing parts are the node itself, a pump that runs without `kvm0`'s coordinator loop (the relay is driven from it today), and
-frame hand-off to a Firecracker virtio-net device whose guest driver is the Akuma guest's own.
+`"network-interfaces":[{"iface_id":"eth0","host_dev_name":"tap0",...}]` used to exit before the first `RUN` (`Couldn't open
+/dev/net/tun`). Built, in the order Firecracker asked for it:
+
+1. **`/dev/net/tun`** (`amd64/src/kvm/tun.rs`, `FileDescriptor::DevTun`, `FdState::DevTun`, a fifth syscall hook
+   `dev_tun_has_frame`): `TUNSETIFF` / `TUNSETVNETHDRSZ` (12) / `TUNSETOFFLOAD` / `TUNGETFEATURES` / `TUNGETIFF`; a frame behind a
+   zeroed virtio-net header per `read`; `EPOLLIN` from a relaxed flag the pump and every read/write refresh. The far end is the
+   `kvm0` gateway (`akuma_svm_amd64::gateway`: ARP, DHCP 10.0.2.15, ICMP/UDP echo); `tunout` on the kernel command line lets
+   guest TCP/DNS out through `kvm/relay.rs`, `tunfwd=<host>:<guest>` forwards one port; a daemon thread polls the relay.
+2. **`memfd_create`** (an unlinked `/tmp/.memfd-N`; Firecracker's rx `IovDeque` maps it twice) and **`fcntl(F_ADD_SEALS/F_GET_SEALS)`**
+   (accepted, not enforced). New abi row 319 / 279.
+3. **`writev`/`readv` on the tap are one frame.** The generic `sys_writev` walked the iovecs with one `write` each, so
+   Firecracker's `[12-byte virtio header][frame]` arrived as two writes: a 12-byte runt and a header-less frame the gateway
+   ignored (`ignored == frames`). Same family as [`WRITEV_SHORT_WRITE_SPLICE.md`](WRITEV_SHORT_WRITE_SPLICE.md): a vectored call on
+   a datagram-like fd is atomic.
+
+*Verified on the ryzen:* the guest finds `eth0` (`AA:FC:00:00:00:01`), DHCP is offered and acknowledged (`dhcp=1/1`,
+"DHCP configured", 10.0.2.15/24), ARP is answered, and a UDP datagram to the gateway's port 7 is echoed (`rx_delivered` follows).
+Guest DNS to 10.0.2.3 is ignored without `tunout` (expected). `/proc`-style counters: `[tun] writes= reads= eagain= polls= gw: ...`
+every 2 s while frames move; `[tun] tx len= ethertype= proto= l4=` for the first 40 guest frames.
+
+*Open — the guest wedges after ~10 s of network activity.* With the NIC attached the guest stops making progress: no more
+frames, the guest script never reaches its probe lines, and the host sees `vcpu idle ... due_in_us=none`. The new
+`[kvmapi] irq state` line says why it cannot be woken: PIC masks `0xff/0xff` (the Akuma guest polls its virtio devices),
+LAPIC nothing pending, LVT timer `0x20` unmasked **one-shot with an initial count that has already expired and is never
+re-armed**. So it is not a lost host interrupt: the guest believes it has no timeout and nothing to poll, i.e. it is wedged
+inside itself (a lock or a wait on a virtio-net completion). Controls: the same guest with no NIC sleeps 20 s fine on metal;
+`kvm0`'s NIC guest (`kvmnet`, a polled model device) works. Next steps: have the guest print from its netpoll/virtio-net path
+(`strace_err`, a guest `dmesg`), compare the used-ring/avail-event handling of Firecracker's virtio-net with the model device the
+guest driver was written against (`akuma_svm_amd64::virtio_net`: no `VIRTIO_NET_F_CSUM`, 12-byte header, no mergeable buffers;
+Firecracker offers more and the guest may mis-negotiate), and run the guest under `kvm0` with Firecracker's device model if
+possible. The TCG run of the same scenario is too slow to iterate; the metal cycle (push, Pop build, `arm.sh 29`) is about two
+minutes.
+
+*Side finding for the clock/CMOS work:* under Firecracker the guest reads CMOS ports `0x70/0x71` and Firecracker answers
+`IO write @ 0x70 failed: bus_error: MissingAddressRange` (no RTC model); the guest logs `clock: CMOS RTC holds no date; waiting
+for SNTP`. A Firecracker/`kvm0` guest therefore cannot exercise the real CMOS write path; for the checksum investigation the
+suspects stay the host kernel's own CMOS writes (SNTP clock sync, `crumb()` breadcrumbs at byte `0x7F` in `kvm.rs`) and a `reboot -f` mid-write.
 
 ## Before the KVM work is finished
 
