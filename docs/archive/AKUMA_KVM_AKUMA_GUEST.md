@@ -65,7 +65,7 @@ per-guest, and `kvm::late` picks the guest.
 |---|---|
 | QEMU TCG, Mac (`scripts/kvm/akuma_rehearse.sh`) | **PASS**: banner, 34 LAPIC timer interrupts delivered, `blk` found from the command line, ext2 mounted, busybox init ran, 10 516 exits (3 453 MMIO, 48 LAPIC page accesses). Guest `/wtest` md5 `71277886…` = host `debugfs` dump of the image; `e2fsck -fn` clean. Same through the `/boot/kvm-guest` selector |
 | Linux guest regression (same kernel, `linux_rehearse.sh`) | PASS, `init ran to completion` — unchanged |
-| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma`, kernel `b3a2c71` built on the ryzen) | **PASS**: the guest calibrated its LAPIC timer against the virtual PIT (`625062 counts per 10000us`) and measured the real TSC (**3794 MHz**), `blk` from the command line, ext2 mounted, `uname` printed, `md5sum /bin/busybox` = `ebce4301…` (the host's), `/wtest` = `71277886…`, `AKUMA-GUEST-DONE`; **9 853 exits, 24 virtual interrupts, 1 665 MMIO, 38 LAPIC page accesses**. Independent check from Pop: `/boot/akuma-guest-root.img` on p3 was rewritten by the guest (mtime = the boot), `debugfs dump /wtest` → md5 `71277886…`, `e2fsck -fn` clean. Log: [`AMD64_KVMTEST_PHASE9_AKUMA_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE9_AKUMA_METAL_DMESG_2026_10_22.txt) |
+| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma`, kernel `b3a2c71` built on the ryzen) | **PASS**: the guest calibrated its LAPIC timer against the virtual PIT (`625062 counts per 10000us`) and measured the real TSC (**3794 MHz**), `blk` from the command line, ext2 mounted, `uname` printed, `md5sum /bin/busybox` = `ebce4301…` (the host's), `/wtest` = `71277886…`, `AKUMA-GUEST-DONE`; **9 853 exits, 24 virtual interrupts, 1 665 MMIO, 38 LAPIC page accesses**. Independent check from Pop: `/boot/akuma-guest-root.img` on p3 was rewritten by the guest (mtime = the boot), `debugfs dump /wtest` → md5 `71277886…`, `e2fsck -fn` clean. Log: [`AMD64_KVMTEST_PHASE9_AKUMA_METAL_DMESG.txt`](AMD64_KVMTEST_PHASE9_AKUMA_METAL_DMESG.txt) |
 
 ## The smallest root: hello world as init
 
@@ -79,7 +79,7 @@ the run on the line's last words (`run by Akuma`).
 | where | result |
 |---|---|
 | QEMU TCG | **PASS** (flag and selector), 5 269 exits; the busybox guest unchanged |
-| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma-hello`, kernel `d79495a` built on the ryzen) | **PASS**: `Hello, world! This is the init of a guest of Akuma, run by Akuma`, 6 531 exits, 4 virtual interrupts, 46 MMIO, 18 LAPIC page accesses; guest TSC 3791 MHz. Log: [`AMD64_KVMTEST_PHASE9_HELLO_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE9_HELLO_METAL_DMESG_2026_10_22.txt) |
+| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma-hello`, kernel `d79495a` built on the ryzen) | **PASS**: `Hello, world! This is the init of a guest of Akuma, run by Akuma`, 6 531 exits, 4 virtual interrupts, 46 MMIO, 18 LAPIC page accesses; guest TSC 3791 MHz. Log: [`AMD64_KVMTEST_PHASE9_HELLO_METAL_DMESG.txt`](AMD64_KVMTEST_PHASE9_HELLO_METAL_DMESG.txt) |
 
 ## Two virtual processors (phase 11, 2026-10-22)
 
@@ -109,7 +109,7 @@ What it took, in the order it was found:
 | where | result |
 |---|---|
 | QEMU TCG, `SMP=1 scripts/kvm/akuma_rehearse.sh` x7 | **PASS** every time: `guest cpus: 2`, `/wtest` md5 `71277886…` (host `debugfs`), clean `e2fsck`, 2-3 or ~255 IPIs, 45-305 `HLT`s |
-| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma-smp`, kernel `89cea0b4`) | **PASS** (`banner=yes, init=yes, smp=yes`): `cpu 1 started at 00008000`, `smp:  2 cpus online`, 15 769 exits, 2 IPIs (INIT, STARTUP), 2 557 `PAUSE` yields, 18 `HLT`s, 50 virtual interrupts. Log: [`AMD64_KVMTEST_PHASE11_SMP_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE11_SMP_METAL_DMESG_2026_10_22.txt). Distinct ASIDs per vCPU therefore work on real silicon. |
+| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma-smp`, kernel `89cea0b4`) | **PASS** (`banner=yes, init=yes, smp=yes`): `cpu 1 started at 00008000`, `smp:  2 cpus online`, 15 769 exits, 2 IPIs (INIT, STARTUP), 2 557 `PAUSE` yields, 18 `HLT`s, 50 virtual interrupts. Log: [`AMD64_KVMTEST_PHASE11_SMP_METAL_DMESG.txt`](AMD64_KVMTEST_PHASE11_SMP_METAL_DMESG.txt). Distinct ASIDs per vCPU therefore work on real silicon. |
 | QEMU TCG, one-vCPU Akuma and hello guests | unchanged **PASS** |
 | the Linux guests | not rerun (no `vmlinux` off the metal); their path differs only by one-element arrays |
 
@@ -141,8 +141,8 @@ shadow wherever the hypervisor completes an instruction.
 |---|---|
 | QEMU TCG, `NET=1 scripts/kvm/akuma_rehearse.sh` | **PASS** (`net=yes`): 10 frames, `arp=2 dhcp_offer=1 dhcp_ack=1`, the guest's `eth0` reads `inet addr:10.0.2.15  Bcast:10.0.2.255  Mask:255.255.255.0`; `HLT` exits 503 (was 127 915) |
 | QEMU TCG, `NETPROBE=1` (`nc -u -w 2 10.0.2.2 7`) | the echo **worked both ways** (guest strace: `nc` read its 16 bytes back from the socket and wrote them out, the shell read them from the pipe); `nc`'s 2 s poll then timed out and the guest **never finished**: no verdict |
-| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma-net`, kernel `89cea0b4` built on the ryzen), `GUEST=net` | the device, the gateway and the guest's stack are **proven on hardware**: `net_mmio=69 net_frames=11 arp=2 dhcp_offer=1 dhcp_ack=1 udp_echo=1 net_ignored=6 net_lost=0`, `eth0 52:54:00:12:34:56 inet addr:10.0.2.15 Bcast:10.0.2.255 Mask:255.255.255.0`. Verdict **FAIL (init=no)** for the same reason as under TCG: after `nc`'s timeout the guest sits in an idle loop re-arming its LAPIC timer (377 558 timer interrupts, 377 535 `HLT`s, 2.6 M LAPIC MMIO exits in the 20 s before the quiet-console stop) and the init script never reaches its last line. Log: [`AMD64_KVMTEST_PHASE12_NET_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE12_NET_METAL_DMESG_2026_10_22.txt) |
-| **metal, ryzen entry 28, `GUEST=net` (no probe)** | **PASS** (`banner=yes, init=yes, net=yes`): `net_mmio=67 net_frames=10 arp=2 dhcp_offer=1 dhcp_ack=1`, `eth0 inet addr:10.0.2.15`, `AKUMA-GUEST-DONE`, 13 570 exits, 502 `HLT`s, 524 virtual interrupts (no timer storm). Log: [`AMD64_KVMTEST_PHASE12_NET_NOPROBE_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE12_NET_NOPROBE_METAL_DMESG_2026_10_22.txt) |
+| **metal, ryzen entry 28** (`/boot/kvm-guest` = `akuma-net`, kernel `89cea0b4` built on the ryzen), `GUEST=net` | the device, the gateway and the guest's stack are **proven on hardware**: `net_mmio=69 net_frames=11 arp=2 dhcp_offer=1 dhcp_ack=1 udp_echo=1 net_ignored=6 net_lost=0`, `eth0 52:54:00:12:34:56 inet addr:10.0.2.15 Bcast:10.0.2.255 Mask:255.255.255.0`. Verdict **FAIL (init=no)** for the same reason as under TCG: after `nc`'s timeout the guest sits in an idle loop re-arming its LAPIC timer (377 558 timer interrupts, 377 535 `HLT`s, 2.6 M LAPIC MMIO exits in the 20 s before the quiet-console stop) and the init script never reaches its last line. Log: [`AMD64_KVMTEST_PHASE12_NET_METAL_DMESG.txt`](AMD64_KVMTEST_PHASE12_NET_METAL_DMESG.txt) |
+| **metal, ryzen entry 28, `GUEST=net` (no probe)** | **PASS** (`banner=yes, init=yes, net=yes`): `net_mmio=67 net_frames=10 arp=2 dhcp_offer=1 dhcp_ack=1`, `eth0 inet addr:10.0.2.15`, `AKUMA-GUEST-DONE`, 13 570 exits, 502 `HLT`s, 524 virtual interrupts (no timer storm). Log: [`AMD64_KVMTEST_PHASE12_NET_NOPROBE_METAL_DMESG.txt`](AMD64_KVMTEST_PHASE12_NET_NOPROBE_METAL_DMESG.txt) |
 | the same image on plain QEMU with `-netdev user` | finishes (`nc` returns after its timeout, `AKUMA-GUEST-DONE`) |
 | the one-vCPU, hello and SMP guests after the shadow fix | unchanged **PASS** |
 

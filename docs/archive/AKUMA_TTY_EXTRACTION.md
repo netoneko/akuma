@@ -51,7 +51,7 @@ and flags. 86 tests in the crate (67 inherited + 19 new).
 | `cargo check`, `cargo check -p akuma-amd64 --target x86_64-unknown-none` | clean |
 | `scripts/check_unsafe_budget.py` | ok, 434 sites; `akuma-tty` budget 0 |
 | amd64 boot suite, ryzen rehearsal (`DISK=nvme KERNEL=out/k-tty-tests overlays/ryzen/qemu.sh 0 300 std`, built ON ryzen) | **804 passed, 0 failed**, `e2fsck` clean |
-| AArch64 boot suite, Lima KVM, `SMP=1`, 2 GB | **300 `[Test]…PASSED`, 1 FAILED** — identical, line for line, to a clean-`HEAD` kernel booted the same way. The one failure (`test_epoll_socket_waker`, latency 16 ms vs 11 ms) predates this: `AMD64_METAL_CONTROL_RUN_2026_10_18.md` |
+| AArch64 boot suite, Lima KVM, `SMP=1`, 2 GB | **300 `[Test]…PASSED`, 1 FAILED** — identical, line for line, to a clean-`HEAD` kernel booted the same way. The one failure (`test_epoll_socket_waker`, latency 16 ms vs 11 ms) predates this: `AMD64_METAL_CONTROL_RUN.md` |
 | AArch64 `SMP=2` | intermittent panic "ExceptionHooks not registered": **not from this change** — reproduced on `main`'s merge-base; fixed separately, `AARCH64_SMP_HOOKS_RACE.md` |
 | image size | +1728 B on the AArch64 release kernel (5033024 vs 5031296) |
 

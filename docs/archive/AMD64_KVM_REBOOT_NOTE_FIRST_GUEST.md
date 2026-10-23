@@ -3,7 +3,7 @@
 Crush — good work. Your kernel booted, your SVM probe and `akuma-svm-amd64`
 were right, and the trivial guest now **passes on the Ryzen 8845HS**:
 `[KVM] trivial guest: PASS (vmmcalls=2, final rip=...)`. Full boot log:
-`docs/archive/AMD64_KVMTEST_METAL_DMESG_2026_10_21.txt` (SVM lines at 73-76).
+`docs/archive/AMD64_KVMTEST_METAL_DMESG.txt` (SVM lines at 73-76).
 
 Four things were wrong between your build and that line. Each was visible only
 from an exit code or a breadcrumb, and each is in the `AKUMA_KVM.md` timeline:

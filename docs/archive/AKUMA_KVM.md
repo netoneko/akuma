@@ -66,8 +66,8 @@ Read downwards; the sections below are the reference record.
    │   GIF clear, the host got no interrupts, the timer went silent
    │   and the wdt fired. Fix: stgi in the same asm! as vmrun.
    │   After: PASS and the box stays up.
-   │                        docs: AMD64_KVMTEST_METAL_DMESG_2026_10_21.txt,
-   │                              AMD64_KVM_REBOOT_NOTE_2026_10_20.md
+   │                        docs: AMD64_KVMTEST_METAL_DMESG.txt,
+   │                              AMD64_KVM_REBOOT_NOTE_FIRST_GUEST.md
    ▼
  [10-21] ═══ THE PERMISSION MAPS + THE SHARED GPRS ═══  "rdmsr + out 0x80"
    │

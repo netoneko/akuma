@@ -190,7 +190,7 @@ kernels only ever met GRUB on metal, where nobody greps the verdict line.
 
 ## Background
 
-- [`AMD64_METAL_CONTROL_RUN_2026_10_18.md`](AMD64_METAL_CONTROL_RUN_2026_10_18.md)
+- [`AMD64_METAL_CONTROL_RUN.md`](AMD64_METAL_CONTROL_RUN.md)
   — the trashcan control run that proved the failure pre-existing and wrongly
   suspected MAXPHYADDR / 1 GiB pages (a software walk reads RAM; CPUID cannot
   make a present entry read as absent).

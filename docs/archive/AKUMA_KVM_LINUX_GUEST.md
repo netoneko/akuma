@@ -3,7 +3,7 @@
 **Date:** 2026-10-22. **Status:** **PASS on the metal** through phase 8 (Linux boots from a virtio-blk root on the ryzen, entry 28); phase 6:
 `[KVM] linux guest: PASS (banner=yes)` — Linux 6.1.128 printed its banner and ran
 on to its first timer wait on real Zen 4 under this hypervisor
-([`AMD64_KVMTEST_PHASE6_LINUX_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE6_LINUX_METAL_DMESG_2026_10_22.txt)).
+([`AMD64_KVMTEST_PHASE6_LINUX_METAL_DMESG.txt`](AMD64_KVMTEST_PHASE6_LINUX_METAL_DMESG.txt)).
 Also PASS under QEMU TCG and under QEMU/KVM with nested SVM on ryzen. Continues
 [`AKUMA_KVM.md`](AKUMA_KVM.md) (phases 0-4, crush) — this is phase 5 (PVH handoff
 dry run, crush's) and phase 6 (the real kernel). No Linux or KVM source was read
@@ -172,11 +172,11 @@ root image; it worked.
 | where | result |
 |---|---|
 | nested SVM, ryzen (`qemu.sh 28`, p3 32 GiB, KVM) | PASS: `tsc: Detected 3789.926 MHz`, `[vda] 32768 blocks`, `VFS: Mounted root (ext2)`, guest `md5sum /bin/busybox` = `ebce4301…` (host's), guest-written `/wtest` = `71277886…`; 100 301 exits, 305 virtual interrupts; the rehearsal's own root `e2fsck` clean |
-| **metal, ryzen entry 28** | **PASS**: `tsc: Detected 3793.429 MHz`, `model name : AMD Ryzen 7 8845HS w/ Radeon 780M Graphics` printed by the guest, same two md5s, `reboot: machine restart` → clean stop; **99 869 exits, 207 virtual interrupts, 156 MMIO accesses, 21 host IRQs**; the file `/boot/guest-root.img` was rewritten by the guest (mtime = the boot). Log: [`AMD64_KVMTEST_PHASE8_VIRTIO_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE8_VIRTIO_METAL_DMESG_2026_10_22.txt) (the kernel's `dmesg` ring had wrapped under wifi chatter; this is `klog-176.all`) |
+| **metal, ryzen entry 28** | **PASS**: `tsc: Detected 3793.429 MHz`, `model name : AMD Ryzen 7 8845HS w/ Radeon 780M Graphics` printed by the guest, same two md5s, `reboot: machine restart` → clean stop; **99 869 exits, 207 virtual interrupts, 156 MMIO accesses, 21 host IRQs**; the file `/boot/guest-root.img` was rewritten by the guest (mtime = the boot). Log: [`AMD64_KVMTEST_PHASE8_VIRTIO_METAL_DMESG.txt`](AMD64_KVMTEST_PHASE8_VIRTIO_METAL_DMESG.txt) (the kernel's `dmesg` ring had wrapped under wifi chatter; this is `klog-176.all`) |
 
 Honest scope: the guest is a 16 MiB ext2 + busybox, not Gentoo; one vCPU, no
 network, no LAPIC. The wifi station then took minutes to join —
-[`AMD64_WIFI_JOIN_LATENCY_2026_10_22.md`](AMD64_WIFI_JOIN_LATENCY_2026_10_22.md).
+[`AMD64_WIFI_JOIN_LATENCY.md`](AMD64_WIFI_JOIN_LATENCY.md).
 
 **Not yet:** a raw partition as the
 backing store (NVMe second window); the LAPIC timer; queue interrupts are edge-
@@ -208,7 +208,7 @@ at the next 10 ms host tick.
 | where | result |
 |---|---|
 | QEMU TCG | PASS: init ran to completion, no `unstable`, APIC timer ticks; the PIC-only Linux guest, the Akuma guests: all unchanged |
-| **metal, ryzen entry 28** (`/boot/kvm-guest` = `linux-apic`, kernel `d877cd1` built on the ryzen) | **PASS**: `tsc: Detected 3794.125 MHz`, `model name : AMD Ryzen 7 8845HS`, guest `md5sum /bin/busybox` = `ebce4301…`, guest-written `/wtest` = `71277886…`, reboot → clean stop; 100 136 exits, **136 interrupts through the LAPIC**, 381 LAPIC page accesses, no watchdog complaint. Log: [`AMD64_KVMTEST_PHASE10_LINUXAPIC_METAL_DMESG_2026_10_22.txt`](AMD64_KVMTEST_PHASE10_LINUXAPIC_METAL_DMESG_2026_10_22.txt). The hello-world Akuma guest re-run on the same kernel: PASS (6 572 exits) |
+| **metal, ryzen entry 28** (`/boot/kvm-guest` = `linux-apic`, kernel `d877cd1` built on the ryzen) | **PASS**: `tsc: Detected 3794.125 MHz`, `model name : AMD Ryzen 7 8845HS`, guest `md5sum /bin/busybox` = `ebce4301…`, guest-written `/wtest` = `71277886…`, reboot → clean stop; 100 136 exits, **136 interrupts through the LAPIC**, 381 LAPIC page accesses, no watchdog complaint. Log: [`AMD64_KVMTEST_PHASE10_LINUXAPIC_METAL_DMESG.txt`](AMD64_KVMTEST_PHASE10_LINUXAPIC_METAL_DMESG.txt). The hello-world Akuma guest re-run on the same kernel: PASS (6 572 exits) |
 
 ## Bugs found on the way (all in code that was already "green")
 

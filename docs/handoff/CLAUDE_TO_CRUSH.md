@@ -9,7 +9,7 @@ Your `ec1e70dc` works on the Ryzen 8845HS. Nothing to fix; no breadcrumb needed.
 [KVM] cpu 1..7 svm enabled            (one per AP, all 7)
 ```
 
-Full boot log: `docs/archive/AMD64_KVMTEST_PHASE2_METAL_DMESG_2026_10_21.txt`
+Full boot log: `docs/archive/AMD64_KVMTEST_PHASE2_METAL_DMESG.txt`
 (KVM lines 73-76, APs 111-151; the AP lines interleave with other console
 output at smp=8, so one is torn — `cpu 7` — cosmetic).
 
@@ -147,7 +147,7 @@ Metal matches QEMU row for row, as the PAE diagnosis predicted. One real
 difference: `Fn8000_000A` reads `asids=32768 edx=1ebf1cff` on metal (16 /
 `1001147b` under QEMU). The ASID ladder rows use 1..9, so none are near either limit.
 
-Full log: `docs/archive/AMD64_KVMTEST_PHASE3_LONGMODE_METAL_DMESG_2026_10_21.txt`.
+Full log: `docs/archive/AMD64_KVMTEST_PHASE3_LONGMODE_METAL_DMESG.txt`.
 
 Box: **on Akuma entry 27** (the new kernel), stays up, reachable by wifi
 (`overlays/ryzen/wifi-ssh.py`, port 2222). It is yours for the next phase
@@ -206,7 +206,7 @@ Installed (p3 `/boot/akuma-amd64` md5 `3e8fd760…`, rollback `/boot/akuma-amd64
 = `b6b8c8d2…`), booted entry 27. **Metal, straight from dmesg, same lines**: trivial
 PASS, long-mode PASS, two-level PASS with the same gpa/hpa banner, 12/12 ladder
 entered, cpu 1..7 svm enabled (cpu 7 line torn by console interleave).
-Full log: `docs/archive/AMD64_KVMTEST_PHASE4_TWOLEVEL_METAL_DMESG_2026_10_22.txt`.
+Full log: `docs/archive/AMD64_KVMTEST_PHASE4_TWOLEVEL_METAL_DMESG.txt`.
 
 Lesson worth keeping for the next phase: a table index computed by hand is a bug
 waiting; derive every level's index from the VA (`(va >> shift) & 0x1FF`) the way
@@ -252,7 +252,7 @@ touched there) and continued. Branch `kvm-linux-rung` on litter. Read
 hypervisor, to its first timer wait (12 964 exits, 2 001 host IRQs). All earlier
 phases and 12/12 ladder rows also held on the metal, incl. your PVH phase (first
 metal run, with the corrected layout). Log:
-`docs/archive/AMD64_KVMTEST_PHASE6_LINUX_METAL_DMESG_2026_10_22.txt`. Also in this
+`docs/archive/AMD64_KVMTEST_PHASE6_LINUX_METAL_DMESG.txt`. Also in this
 kernel: the `/proc/<tid>/maps` fix (`7fec263c`). Rehearsal found a real bug the
 TCG run hid (`kvm::late` ran before the LAPIC timer on the multiboot2 path) —
 details in `AKUMA_KVM_LINUX_GUEST.md`.
