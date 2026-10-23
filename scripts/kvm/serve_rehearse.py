@@ -32,6 +32,7 @@ ap.add_argument("--herd-conf", help="with --herd: this conf instead of the gener
 ap.add_argument("--restart", action="store_true", help="with --herd: a host oneshot kills the `herd vm-run` process (pid 2) after 90 s; herd must bring the guest back and ssh must work again")
 ap.add_argument("--stress", type=int, default=0, help="rounds of overlapping + back-to-back sessions (the wedge shape from the ryzen, 2026-10-22)")
 ap.add_argument("--host-smp", type=int, default=1, help="QEMU -smp and the host kernel's smp=: host cores for vCPUs to spread over")
+ap.add_argument("--host-cap", type=int, help="the host kernel's smp= when it should start fewer cores than QEMU has (the rest are for VMs, started on demand)")
 ap.add_argument("--kvmcores", help="the host kernel's kvmcores= (the cores the hypervisor may use), e.g. 1-2")
 ap.add_argument("--vcpus", type=int, default=1, help="with --herd: vm_vcpus of the generated conf")
 ap.add_argument("--vm-cores", help="with --herd: vm_cores of the generated conf")
@@ -82,10 +83,10 @@ q = subprocess.Popen([
     "-drive", f"id=d1,file={w}/guest.img,format=raw,if=none", "-device", "virtio-blk-device,drive=d1,bus=virtio-mmio-bus.1",
     "-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{a.port}-:{a.port}", "-device", "virtio-net-device,netdev=n0,bus=virtio-mmio-bus.2",
     "-append", f"virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6 virtio_mmio.device=512@0xfeb00400:7 "
-               + (f"smp={a.host_smp} " if a.host_smp > 1 else "") + (f"kvmcores={a.kvmcores} " if a.kvmcores else "")
+               + (f"smp={a.host_cap or a.host_smp} " if a.host_smp > 1 else "") + (f"kvmcores={a.kvmcores} " if a.kvmcores else "")
                + (f"kvmctl kvmmem=1536 init=/bin/herd initargs=daemon" if a.herd else
                   f"kvmtest kvmserve noladder kvmfwd={a.port} init=/bin/busybox initargs=sleep,1000000"),
-    "-serial", f"file:{a.log}", "-display", "none", "-no-reboot"],
+    "-serial", f"file:{a.log}", "-display", "none", "-no-reboot"] + (["-accel", "tcg,thread=multi"] if os.environ.get("MTTCG") else []) + (["-monitor", f"unix:{os.environ['QMON']},server,nowait"] if os.environ.get("QMON") else []),
     stderr=subprocess.DEVNULL)
 
 def log():

@@ -486,7 +486,7 @@ static TSC_SYNC_DONE: AtomicU64 = AtomicU64::new(0);
 /// reading is assumed to sit at the midpoint, so the error is at most half the
 /// round trip, and the shortest of [`TSC_SYNC_ROUNDS`] trips is the one kept
 /// (Linux's `tsc_sync` estimates the same way).
-pub fn tsc_sync_bsp(idx: usize) -> i64 {
+pub fn tsc_sync_bsp(idx: usize, base: i64) -> i64 {
     let mut best_rtt = u64::MAX;
     let mut best_off = 0i64;
     TSC_SYNC_REQ.store(0, Ordering::SeqCst);
@@ -509,7 +509,7 @@ pub fn tsc_sync_bsp(idx: usize) -> i64 {
         if rtt < best_rtt {
             best_rtt = rtt;
             let mid = t0.wrapping_add(rtt / 2);
-            best_off = t1.wrapping_sub(mid) as i64;
+            best_off = (t1.wrapping_sub(mid) as i64).wrapping_add(base);
         }
     }
     TSC_OFFSET[idx].store(best_off, Ordering::Relaxed);
@@ -1098,4 +1098,10 @@ pub fn smoke_test(t: &mut Suite) {
     // the same five ticks), which is itself evidence the ticks come from a
     // clock rather than from anything correlated with instruction count.
     t.note("lapic: spins waiting for 5 ticks", spins);
+}
+
+/// Core `idx`'s TSC offset from the BSP's (cycles; 0 for the BSP and for an unsynced core).
+#[must_use]
+pub fn tsc_offset_of(idx: usize) -> i64 {
+    TSC_OFFSET.get(idx).map_or(0, |o| o.load(Ordering::Relaxed))
 }

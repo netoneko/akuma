@@ -624,6 +624,7 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
         return 0;
     }
 
+    TRAMP_OK.store(true, Ordering::Release);
     let mut started = 0usize;
     let mut idx = 0usize;
     for &id in madt.cpus() {
@@ -640,7 +641,10 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
         // with all cores while entry 12 ran clean on one) — and a way to run
         // rio on a few cores where all sixteen will not come up.
         if cap != usize::MAX && 1 + started >= cap {
-            break;
+            // Not started now, and not touched: remembered so a VM can start it later
+            // ([`ensure_started`]). The core stays in the firmware's wait-for-startup state.
+            DEFERRED_ID[idx].store(id + 1, Ordering::Relaxed);
+            continue;
         }
         let cpu = &PERCPU[idx];
         cpu.lapic_id.store(id, Ordering::Relaxed);
@@ -687,7 +691,7 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
             }
         }
         // The AP is spinning in `tsc_sync_ap` now; measure its clock.
-        let off = lapic::tsc_sync_bsp(idx);
+        let off = lapic::tsc_sync_bsp(idx, 0);
         serial::puts("  smp:  cpu ");
         serial::put_dec(idx as u64);
         serial::puts(" tsc offset ");
@@ -703,6 +707,107 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
     serial::put_dec((1 + started) as u64);
     serial::puts(" cpus online\n");
     started
+}
+
+/// Per core index: the LAPIC id + 1 of an AP the MADT lists and `smp=` left unstarted; 0 for none.
+static DEFERRED_ID: [core::sync::atomic::AtomicU32; MAX_CPUS] = [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CPUS];
+/// The trampoline page was checked and is usable (set by [`start_secondaries`]).
+static TRAMP_OK: AtomicBool = AtomicBool::new(false);
+/// One late start at a time: they share the trampoline's mailbox and the TSC-sync words.
+static LATE_START: spinning_top::Spinlock<()> = spinning_top::Spinlock::new(());
+
+/// Is core `idx` one the host did not start at boot (`smp=` cut it off) but can start on demand?
+#[must_use]
+pub fn is_deferred(idx: usize) -> bool {
+    idx < MAX_CPUS && idx >= ONLINE.load(Ordering::Acquire) && DEFERRED_ID[idx].load(Ordering::Relaxed) != 0
+}
+
+/// Busy-wait `us` microseconds on the TSC. For bring-up after boot, where the LAPIC timer
+/// (which `lapic::delay_counts` borrows) is this core's running tick and must not be touched.
+fn tsc_delay_us(us: u64) {
+    let hz = crate::lapic::tsc_hz().max(1);
+    let end = akuma_cpu::tsc::rdtsc().wrapping_add(us * hz / 1_000_000);
+    while (akuma_cpu::tsc::rdtsc().wrapping_sub(end) as i64) < 0 {
+        core::hint::spin_loop();
+    }
+}
+
+/// Make sure core `idx` is running as a host core, starting it (and every deferred core below
+/// it, so the online set stays contiguous: cores are counted, not listed) if `smp=` left it out.
+/// True if it is up. **Called by the hypervisor when a VM is placed on a core the host never
+/// started**; until then such a core has not been woken, written to, or counted by Akuma.
+pub fn ensure_started(idx: usize) -> bool {
+    if idx < ONLINE.load(Ordering::Acquire) {
+        return true;
+    }
+    if idx >= MAX_CPUS || !TRAMP_OK.load(Ordering::Acquire) {
+        return false;
+    }
+    let _guard = LATE_START.lock();
+    while ONLINE.load(Ordering::Acquire) <= idx {
+        let next = ONLINE.load(Ordering::Acquire);
+        let id = DEFERRED_ID[next].load(Ordering::Relaxed);
+        if id == 0 || !start_late(next, id - 1) {
+            return false;
+        }
+        ONLINE.store(next + 1, Ordering::Release);
+    }
+    true
+}
+
+/// [`start_secondaries`]' loop body for one core, run after boot from whichever core the caller
+/// is on, with delays on the TSC.
+fn start_late(idx: usize, id: u32) -> bool {
+    let ap_root = ap_boot_root(sched::kernel_root());
+    if ap_root >= (4 << 30) || !install_trampoline() {
+        return false;
+    }
+    let cpu = &PERCPU[idx];
+    cpu.lapic_id.store(id, Ordering::Relaxed);
+    cpu.index.store(idx as u32, Ordering::Relaxed);
+    let stack = alloc::vec![0u8; AP_STACK_SIZE].leak();
+    let stack_top = (stack.as_ptr() as usize + AP_STACK_SIZE) & !0xf;
+    cpu.stack_top.store(stack_top as u64, Ordering::Relaxed);
+    let Some(idle_slot) = sched::register_idle_task(idx) else {
+        return false;
+    };
+    cpu.idle_task.store(idle_slot, Ordering::Relaxed);
+    cpu.current_task.store(idle_slot, Ordering::Relaxed);
+    cpu.current_uctx.store(sched::uctx_ptr(idle_slot) as u64, Ordering::Relaxed);
+    mailbox_write(AP_MB_CR3, ap_root);
+    mailbox_write(AP_MB_STACK, (stack_top - 8) as u64);
+    #[allow(function_casts_as_integer)]
+    mailbox_write(AP_MB_ENTRY, ap_entry64 as usize as u64);
+    mailbox_write(AP_MB_INDEX, idx as u64);
+    core::sync::atomic::fence(Ordering::SeqCst);
+    // `IF` off across each ICR pair: an interrupt between the writes that sent its own IPI
+    // would retarget this one.
+    let flags = akuma_cpu::daif::save_and_mask_irq();
+    lapic::send_init(id);
+    akuma_cpu::daif::restore(flags);
+    tsc_delay_us(10_000);
+    let flags = akuma_cpu::daif::save_and_mask_irq();
+    lapic::send_startup(id, AP_STARTUP_VECTOR);
+    akuma_cpu::daif::restore(flags);
+    if !wait_online(idx) {
+        let flags = akuma_cpu::daif::save_and_mask_irq();
+        lapic::send_startup(id, AP_STARTUP_VECTOR);
+        akuma_cpu::daif::restore(flags);
+        tsc_delay_us(10_000);
+        if !wait_online(idx) {
+            serial::puts("  smp:  [FAIL] late start: cpu ");
+            serial::put_dec(idx as u64);
+            serial::puts(" did not come online\n");
+            return false;
+        }
+    }
+    // The AP's clock against ours, then against the BSP's (ours has its own offset).
+    let base = crate::lapic::tsc_offset_of(cpu_index());
+    let _ = lapic::tsc_sync_bsp(idx, base);
+    serial::puts("  smp:  cpu ");
+    serial::put_dec(idx as u64);
+    serial::puts(" started on demand for a VM\n");
+    true
 }
 
 fn wait_online(idx: usize) -> bool {

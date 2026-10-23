@@ -330,10 +330,18 @@ fn ensure_task() -> bool {
     if TASK_UP.load(Ordering::Acquire) {
         return true;
     }
-    let Some(core) = akuma_vm_spec::cores::first(super::vm_cores(), |c| super::core_ready(c as usize)) else {
+    // A core the host already runs is preferred (the task is repinned to its VM's first core when
+    // a VM starts); a core `smp=` left out is started only if there is no other.
+    let Some(core) = akuma_vm_spec::cores::first(super::vm_cores(), |c| super::core_ready(c as usize) && !crate::smp::is_deferred(c as usize))
+        .or_else(|| akuma_vm_spec::cores::first(super::vm_cores(), |c| super::core_ready(c as usize)))
+    else {
         super::p("[KVM] kvm0: no core in kvmcores= has SVM enabled\n");
         return false;
     };
+    if !crate::smp::ensure_started(core as usize) {
+        super::p("[KVM] kvm0: could not start the VM task's core\n");
+        return false;
+    }
     let Some(slot) = crate::sched::spawn_daemon_on(vm_task, core as usize) else {
         super::p("[KVM] kvm0: no task slot for the VM task\n");
         return false;

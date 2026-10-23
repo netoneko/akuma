@@ -346,7 +346,7 @@ pub(crate) fn svm_armed() -> bool {
 
 /// Can the VM task run on core `c`: SVM enabled there (core 0 enables it on its first run).
 pub(crate) fn core_ready(c: usize) -> bool {
-    c == 0 || SVM_ENABLED.get(c).is_some_and(|e| e.load(Ordering::Acquire))
+    c == 0 || SVM_ENABLED.get(c).is_some_and(|e| e.load(Ordering::Acquire)) || smp::is_deferred(c)
 }
 
 pub(crate) fn nrips() -> bool {

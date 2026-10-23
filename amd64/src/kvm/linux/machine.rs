@@ -235,6 +235,21 @@ impl Shared {
     }
 }
 
+/// The device lock, taken without ever waiting **while holding the big kernel lock**. Every task
+/// handles its exits under the BKL, so a task spinning here on a lock whose holder needs the BKL
+/// back (after a `yield_now` inside the relay or a network call) would hold the BKL against the
+/// one task that can release this lock: a two-party deadlock. Dropping the BKL between attempts
+/// lets the holder finish.
+fn lock_dev(sh: &Shared) -> spinning_top::guard::SpinlockGuard<'_, Devices> {
+    loop {
+        if let Some(g) = sh.dev.try_lock() {
+            return g;
+        }
+        crate::smp::bkl_drop_window();
+        core::hint::spin_loop();
+    }
+}
+
 /// Memory for the gateway's queue and rings, which it borrows for its whole life. A machine's
 /// tasks share it, so the borrow has to be `'static`; the storage is allocated once and the
 /// gateway is handed from guest to guest (`Gateway::reset`) rather than leaked afresh per start.
@@ -369,7 +384,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
                 break 'run;
             }
             let (banner, last_tx, done) = {
-                let d = sh.dev.lock();
+                let d = lock_dev(sh);
                 (d.plat.banner.seen, d.plat.last_tx_us, d.plat.done.seen)
             };
             if banner && now_us.saturating_sub(last_tx) > QUIET_BUDGET_US {
@@ -419,7 +434,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
         // The owner moves the relay's bytes and gives the guest the frames waiting for it.
         if owner {
             let relay_t0 = akuma_cpu::tsc::rdtsc();
-            let mut dg = sh.dev.lock();
+            let mut dg = lock_dev(sh);
             let Devices { relay, net, scratch, plat, .. } = &mut *dg;
             if let (Some(r), Some((dev, wire))) = (relay.as_mut(), net.as_mut())
                 && now_us >= next_relay_us
@@ -483,7 +498,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
 
         // A halted processor wakes when something can be offered to it.
         {
-            let mut dg = sh.dev.lock();
+            let mut dg = lock_dev(sh);
             for j in members() {
                 if sh.cpu[j].state() == CpuState::Halted && dg.plat.offer(j, now_us).is_some() {
                     sh.cpu[j].cas(CpuState::Halted, CpuState::Runnable);
@@ -495,7 +510,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
         let Some(i) = next_runnable(sh, group, cur) else {
             // Nobody in this group can run.
             let ended = {
-                let dg = sh.dev.lock();
+                let dg = lock_dev(sh);
                 sh.nothing_can_run(&dg)
             };
             if ended {
@@ -519,13 +534,13 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
                 }
                 let sleep_t0 = akuma_cpu::tsc::rdtsc();
                 let due = {
-                    let dg = sh.dev.lock();
+                    let dg = lock_dev(sh);
                     members().filter(|&j| sh.cpu[j].state() == CpuState::Halted).filter_map(|j| dg.plat.next_event_us(j)).min()
                 };
                 let mut wait = due.map(|d| d.saturating_sub(crate::net::uptime_us()));
                 if owner {
                     // The relay's `accept` and the lease check run from this loop.
-                    let cap = if sh.dev.lock().relay.as_ref().is_some_and(Relay::active) { OWNER_ACTIVE_CAP_US } else { OWNER_IDLE_CAP_US };
+                    let cap = if lock_dev(sh).relay.as_ref().is_some_and(Relay::active) { OWNER_ACTIVE_CAP_US } else { OWNER_IDLE_CAP_US };
                     wait = Some(wait.map_or(cap, |w| w.min(cap)));
                 }
                 if let Some(w) = wait {
@@ -547,7 +562,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
         // it when the guest's IF allows (§15.21.4) and writes V_IRQ back cleared when it has.
         let runnable = members().filter(|&j| sh.cpu[j].state() == CpuState::Runnable).count();
         let (offered, mut due) = {
-            let mut dg = sh.dev.lock();
+            let mut dg = lock_dev(sh);
             let offered = dg.plat.offer(i, now_us);
             let due = members()
                 .filter(|&j| matches!(sh.cpu[j].state(), CpuState::Runnable | CpuState::Halted))
@@ -602,7 +617,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
 
         // Everything below touches the devices: one lock for the whole exit, dropped before the
         // next yield, `VMRUN` or sleep.
-        let mut dg = sh.dev.lock();
+        let mut dg = lock_dev(sh);
         let Devices { plat, blk, net, scratch, log, .. } = &mut *dg;
         plat.cur = i;
         // V_IRQ comes back cleared once the guest has dispatched the offered vector: that is the
@@ -1155,6 +1170,15 @@ pub fn run(nrips: bool, vm: &Vm) {
     for i in 0..n_cpu {
         group_of_core[usize::from(sh.place[i])] |= 1 << i;
     }
+    // A core the host did not start at boot (`smp=` cut it off) is started now, for this VM.
+    for core in 0..crate::smp::MAX_CPUS {
+        if group_of_core[core] != 0 && !crate::smp::ensure_started(core) {
+            p("[KVM] linux: could not start core ");
+            dec(core as u64);
+            p("\n");
+            return;
+        }
+    }
     let owner_core = usize::from(sh.place[0]);
     // The coordinator runs the owner group, so it has to be on that core: its state (SVME, the
     // host save area) is per core. A boot-time rehearsal is already there.
@@ -1253,7 +1277,7 @@ fn report(sh: &Shared, n_cpu: usize) {
         (w.reason, w.fatal)
     };
     let c = *sh.totals.lock();
-    let mut dg = sh.dev.lock();
+    let mut dg = lock_dev(sh);
     let Devices { plat, net, relay, .. } = &mut *dg;
     if n_cpu > 1 {
         for j in 0..n_cpu {
