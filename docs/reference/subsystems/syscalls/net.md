@@ -289,7 +289,8 @@ feature, not a defect — but it is *loud*: servers that try to bind `::` first
 print a scary-looking startup warning and then serve IPv4 normally. See
 [`../../../archive/DEVBOX_ISSUES.md`](../../../archive/DEVBOX_ISSUES.md) Issue 9,
 which also records that `cargo` cannot reach crates.io because of it while
-`curl` can.
+`curl` can. A work-item survey for adding IPv6 lives in
+[`../../../archive/AKUMA_IPV6.md`](../../../archive/AKUMA_IPV6.md).
 
 ## The net bounce buffer
 

@@ -12,7 +12,7 @@
 
 **Self-hosting achieved on amd64** (2026-09-13) - verified on bare metal HP 500-502nj (2015 setup) see [here](./docs/archive/AKUMA_SELF_HOSTING_AMD64.md).
 
-**Booting Akuma and Linux as KVM guests with Akuma as host kernel achieved** (2026-10-22) - an AMD SVM hypervisor inside the amd64 kernel, verified on bare metal Ryzen 7 8845HS; see [here](./docs/archive/AKUMA_KVM.md) (design and reference: [`kvm.md`](./docs/reference/subsystems/kvm.md)).
+**Booting Akuma, Linux and NetBSD as KVM guests with Akuma as host kernel achieved** (2026-10-22) - an AMD SVM hypervisor inside the amd64 kernel, verified on bare metal Ryzen 7 8845HS; see [here](./docs/archive/AKUMA_KVM.md) (design and reference: [`kvm.md`](./docs/reference/subsystems/kvm.md)).
 
 ```
                                              %#%:                +
