@@ -1,6 +1,6 @@
 # The KVM dev cycle: an agent builds and tests Akuma kernels on the ryzen, and a laptop does the reboots
 
-**Date:** 2026-10-23. **Status:** first run under way (`goose-glm`, task 01, the CMOS corruption). **Branch:** `kvm-part-1`.
+**Date:** 2026-10-23. **Status:** loop proven 2026-10-23 (`goose-glm` found and fixed the CMOS corruption in one session; section 7). **Branch:** `kvm-part-1`.
 
 The point of this document is to make one thing routine before the next big experiment: **an agent that lives inside Akuma edits the
 kernel, builds it there, proves it boots as a guest of Akuma's own hypervisor, and hands a candidate over for a clean reboot of
@@ -168,9 +168,13 @@ log) or into a byte the firmware does not cover; make the reset path write 0x0F 
 |---|---|---|
 | 18:2x UTC | `sync` | bundle `4162e1b4..e005ab18` (238 KB), `dev-base` checked out on Akuma |
 | 18:23-18:30 UTC | task 00 warm-up (goose-glm, 1 session) | **PASS.** `kbuild --features no-tests` incremental 1m04s; `/boot/akuma-guest-dev` booted as a `kvm0` guest to `AKUMA-GUEST-DONE` within the first 10 s poll, guest `uname` build id `e005ab18` (the fresh kernel), md5 `ebce4301...`, host `dmesg` clean. goose needed `herd enable vm-dev` (not in the brief; added), and left it enabled (the orchestrator disabled it). Side lines the guest prints: `clock: CMOS RTC holds no date; waiting for SNTP`, `guest: FAIL (banner=yes, init=no, net=yes)` (herd's marker check; the guest exits by design). |
-| | CMOS dump on Pop before any test | |
-| | task 01 | |
-| | `reboot-test` | |
+| 18:31-18:52 UTC | task 01 (goose-glm, one session, ~20 min) | **Found and fixed.** Commit `fbc419b2` on `cmos-fix` (cherry-picked onto `kvm-part-1`): the kernel makes **zero** writes to ports 0x70/0x71 after it. Suspect 2 was the cause and worse than listed: `kvm/linux/machine.rs` calls `crumb()` (CMOS 0x7F) around **every `VMRUN` of every guest**, so any boot that ran a `kvm0` guest rewrote 0x7F thousands of times, deterministically; suspect 1 (SNTP write-back, SET window, hard-coded century 0x32) was the only other writer and is removed (`akuma-cmos-rtc::write` kept, host-tested). Suspect 3 (reset mid-access) is moot with no writers left. Cleared: every real-guest VMCB is `IOPM_ALL`; the one native-I/O map (rehearsal guests) now also intercepts 0x70-0x77. Breadcrumbs live in RAM (`LAST_CRUMB`, shown on the `kvmctl` status line). Its own guest test: build 51 s, `AKUMA-GUEST-DONE`, `exc=0`. |
+| 21:53 IDT | `reboot-test` (VMs stopped first) | **PASS.** Pop returned, CMOS classic checksum `OK` (`sum=05e8 stored=05e8`), regA=26 regB=02 regD=80 diag=02, 0x7F=0x59 (the old kernel's last guest exit), Akuma back on the fixed kernel, `dmesg` clean. (The first invocation lost its ssh to the dying box and crashed in the script; `--resume` carried on. Whether the firmware showed an F1 prompt on that reboot is not recorded.) |
+| 21:55 IDT | `reboot-test --keep-vms` (guests running at the reset) | **PASS, and the discriminating one.** The old kernel leaves 0x57/0x58 in 0x7F when reset during a guest run; 0x7F stayed 0x59, so the fixed kernel did not write it. CMOS checksum `OK`, Pop back, Akuma back, `clock: synced via SNTP` with no CMOS write line, no exceptions. |
+
+*Not proven:* that the firmware's own F1 complaint is gone for good (it is the owner's to confirm at the next cold boot, and a stored
+checksum the firmware already distrusts may need one visit to its setup screen to be rewritten); a weak CMOS battery would look the same.
+goose's own note: after the one recovery the source of the corruption is gone.
 
 ## Background
 

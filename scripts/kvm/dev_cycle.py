@@ -140,11 +140,16 @@ def cmd_reboot_test(a):
     os.makedirs(OUT, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     rep = [f"reboot-test {stamp} entry={a.entry}"]
-    rc, o, _ = akuma("md5sum /boot/akuma-amd64.verify; dmesg | tail -n 400", 60)
-    open(os.path.join(OUT, f"{stamp}-akuma-before.dmesg"), "w").write(o)
-    rep.append("before: " + o.splitlines()[0] if o else "before: (no dmesg)")
-    print("clean reboot: stopping VMs, sync, reboot")
-    akuma("for s in $(herd status | grep '(vm)' | cut -d: -f1); do herd stop $s; done; sync; sleep 1; sync; reboot -f", 30)
+    if not a.resume:
+        rc, o, _ = akuma("md5sum /boot/akuma-amd64.verify; dmesg | tail -n 400", 60)
+        open(os.path.join(OUT, f"{stamp}-akuma-before.dmesg"), "w").write(o)
+        rep.append("before: " + o.splitlines()[0] if o else "before: (no dmesg)")
+    print("clean reboot: stopping VMs, sync, reboot" if not a.resume else "resuming after the reboot")
+    if not a.resume:
+        try:
+            akuma(("" if a.keep_vms else "for s in $(herd status | grep '(vm)' | cut -d: -f1); do herd stop $s; done; ") + "sync; sleep 1; sync; reboot -f", 45)
+        except subprocess.TimeoutExpired:
+            pass  # the box died under the ssh session: that is the reboot working
     try:
         t = wait(lambda: pop("echo up", 10)[0] == 0, "Pop", a.pop_budget)
     except SystemExit as ex:
@@ -188,6 +193,8 @@ def main():
     s = sp.add_parser("collect"); s.add_argument("branch"); s.set_defaults(f=cmd_collect)
     sp.add_parser("cmos").set_defaults(f=cmd_cmos)
     s = sp.add_parser("reboot-test"); s.add_argument("--entry", type=int, default=29)
+    s.add_argument("--keep-vms", action="store_true", help="reboot with guests still running (the old kernel leaves 0x57/0x58 in CMOS 0x7F then; a fixed one must not)")
+    s.add_argument("--resume", action="store_true", help="the reboot already happened: skip it, wait for Pop and carry on")
     s.add_argument("--pop-budget", type=int, default=240); s.add_argument("--akuma-budget", type=int, default=300)
     s.set_defaults(f=cmd_reboot_test)
     a = ap.parse_args()
