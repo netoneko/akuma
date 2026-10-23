@@ -268,6 +268,13 @@ Kernel parameters: `kvmctl` (arm SVM for `/dev/kvm0`, run nothing at boot), `kvm
 `kvmcores=<list>`. The older `kvmtest` + `kvmserve`/`kvmgentoo`/selector-file path is a shim: it builds the
 same `Spec` (`kvm::legacy_service`) and queues it with no owner, so the rehearsal flags and entry 28 keep working.
 
+## Open items (2026-10-23)
+
+* **Large guest->host transfers wedge the guest** (96 MiB+ through the relay), on the old kernel too; the host's
+  `/bin/ssh` client spins while the relay's host socket stays full. Evidence and next experiments:
+  [`KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE.md`](../../archive/KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE.md).
+* **NetBSD as a guest**: its MICROVM kernel carries a PVH note; needs a `Guest::NetBsd` (IOAPIC question). Same doc, §3.
+
 ## Isolation modes under herd (one supervisor, four shapes of "a machine")
 
 ```
