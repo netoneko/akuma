@@ -125,6 +125,24 @@ impl Platform {
     }
 
     /// Could an interrupt ever reach `cpu`, halted with `IF` set?
+    /// The interrupt state a stuck idle vCPU is waiting on (the `kvmapi` census instrument):
+    /// PIC vector offered (0xffff none), master/slave masks, LAPIC pending vector (0xffff none), PPR,
+    /// LVT timer, timer initial count, and whether LINT0 passes the PIC through.
+    pub(super) fn irq_state(&mut self, cpu: usize, now: u64) -> [u32; 8] {
+        let none = |v: Option<u8>| v.map_or(0xffff, u32::from);
+        let l = &mut self.lapics[cpu];
+        [
+            self.pic.pending().map_or(0xffff, u32::from),
+            u32::from(self.pic.read(0x21).unwrap_or(0)),
+            u32::from(self.pic.read(0xA1).unwrap_or(0)),
+            none(l.pending()),
+            u32::from(l.ppr()),
+            l.read(0x320, now),
+            l.read(0x380, now),
+            u32::from(l.lint0_extint()),
+        ]
+    }
+
     pub(super) fn can_wake(&self, cpu: usize) -> bool {
         let pit = cpu == 0 && self.pit.next_irq0_tick().is_some();
         if self.lapic_page(cpu).is_none() {

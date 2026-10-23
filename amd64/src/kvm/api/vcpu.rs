@@ -776,6 +776,10 @@ fn idle(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, ev: &Events) -> Option
             return None;
         }
         let deadline = due.unwrap_or(now + 1_000).min(now + 1_000);
+        if IDLE_TURNS.load(core::sync::atomic::Ordering::Relaxed) % 4000 == 0 {
+            let st = with_plat(plat, |p| p.irq_state(id, now));
+            akuma_primitives::safe_print!(160, "[kvmapi] irq state pic={:#x} imr={:#x}/{:#x} lapic={:#x} ppr={:#x} lvt_timer={:#x} count={:#x} extint={}\n", st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]);
+        }
         idle_note(vc, now, due, can_wake);
         akuma_cpu::daif::mask_irq();
         crate::sched::block_until_deadline(deadline.max(now + 50));
