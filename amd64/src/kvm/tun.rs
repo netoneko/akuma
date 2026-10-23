@@ -184,8 +184,12 @@ pub fn read_frame(b: &mut [u8; BUF]) -> Result<usize, u64> {
 /// One frame behind its header from `b`. A runt is `EINVAL`, an oversize frame is dropped.
 pub fn write_frame(b: &[u8]) -> u64 {
     let len = b.len();
-    if WRITES.fetch_add(1, Ordering::Relaxed) < 3 {
-        akuma_primitives::safe_print!(160, "[tun] write len={} first={:02x?}\n", len, &b[..len.min(30)]);
+    if WRITES.fetch_add(1, Ordering::Relaxed) < 40 && len >= 14 + 12 {
+        // The census line: ethertype, and for IPv4 the protocol and the first four bytes after the header (ports).
+        let f = &b[12..];
+        let et = u16::from_be_bytes([f[12], f[13]]);
+        let (proto, l4) = if et == 0x0800 && f.len() >= 38 { (f[23], &f[34..38]) } else { (0, &f[..0]) };
+        akuma_primitives::safe_print!(128, "[tun] tx len={} ethertype={:#06x} proto={} l4={:02x?}\n", len, et, proto, l4);
     }
     with(|t| {
         if len < t.hdr {
