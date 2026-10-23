@@ -12,6 +12,7 @@
 //! | [`state`] | the vCPU argument structures: registers, segment registers, CPUID and MSR entries |
 //! | [`slots`] | the guest-memory slot table: `SET_USER_MEMORY_REGION` validated against the reserved slice |
 //! | [`fdargs`] | `IRQFD`, `IOEVENTFD`, `PIT2` arguments |
+//! | [`runpage`] | the vCPU run page: exit reason and the port-I/O / MMIO exit records (a hypothesis, see there) |
 //!
 //! `no_std`, `forbid(unsafe_code)`, no dependencies, no allocation: the kernel decodes on a path
 //! that must not allocate.
@@ -21,6 +22,7 @@
 
 pub mod fdargs;
 pub mod req;
+pub mod runpage;
 pub mod slots;
 pub mod state;
 

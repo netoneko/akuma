@@ -362,40 +362,40 @@ const QUIET_BUDGET_US: u64 = 20_000_000;
 /// stale translations.
 const ASID: u32 = 1;
 
-const MSR_EFER: u32 = 0xC000_0080;
-const MSR_STAR: u32 = 0xC000_0081;
-const MSR_LSTAR: u32 = 0xC000_0082;
-const MSR_CSTAR: u32 = 0xC000_0083;
-const MSR_SFMASK: u32 = 0xC000_0084;
-const MSR_FS_BASE: u32 = 0xC000_0100;
-const MSR_GS_BASE: u32 = 0xC000_0101;
-const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
-const MSR_SYSENTER_CS: u32 = 0x174;
-const MSR_SYSENTER_ESP: u32 = 0x175;
-const MSR_SYSENTER_EIP: u32 = 0x176;
-const MSR_PAT: u32 = 0x277;
-const MSR_TSC: u32 = 0x10;
-const MSR_APIC_BASE: u32 = 0x1B;
+pub(super) const MSR_EFER: u32 = 0xC000_0080;
+pub(super) const MSR_STAR: u32 = 0xC000_0081;
+pub(super) const MSR_LSTAR: u32 = 0xC000_0082;
+pub(super) const MSR_CSTAR: u32 = 0xC000_0083;
+pub(super) const MSR_SFMASK: u32 = 0xC000_0084;
+pub(super) const MSR_FS_BASE: u32 = 0xC000_0100;
+pub(super) const MSR_GS_BASE: u32 = 0xC000_0101;
+pub(super) const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+pub(super) const MSR_SYSENTER_CS: u32 = 0x174;
+pub(super) const MSR_SYSENTER_ESP: u32 = 0x175;
+pub(super) const MSR_SYSENTER_EIP: u32 = 0x176;
+pub(super) const MSR_PAT: u32 = 0x277;
+pub(super) const MSR_TSC: u32 = 0x10;
+pub(super) const MSR_APIC_BASE: u32 = 0x1B;
 
 /// The guest's general registers: the ones `VMRUN` does not carry (RAX, RSP,
 /// RIP and RFLAGS live in the VMCB). Field order is the asm's offsets.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct GuestRegs {
-    rbx: u64, // 0x00
-    rcx: u64, // 0x08
-    rdx: u64, // 0x10
-    rsi: u64, // 0x18
-    rdi: u64, // 0x20
-    rbp: u64, // 0x28
-    r8: u64,  // 0x30
-    r9: u64,  // 0x38
-    r10: u64, // 0x40
-    r11: u64, // 0x48
-    r12: u64, // 0x50
-    r13: u64, // 0x58
-    r14: u64, // 0x60
-    r15: u64, // 0x68
+pub(super) struct GuestRegs {
+    pub(super) rbx: u64, // 0x00
+    pub(super) rcx: u64, // 0x08
+    pub(super) rdx: u64, // 0x10
+    pub(super) rsi: u64, // 0x18
+    pub(super) rdi: u64, // 0x20
+    pub(super) rbp: u64, // 0x28
+    pub(super) r8: u64,  // 0x30
+    pub(super) r9: u64,  // 0x38
+    pub(super) r10: u64, // 0x40
+    pub(super) r11: u64, // 0x48
+    pub(super) r12: u64, // 0x50
+    pub(super) r13: u64, // 0x58
+    pub(super) r14: u64, // 0x60
+    pub(super) r15: u64, // 0x68
 }
 
 /// Enter the guest once: load its register file, `VMLOAD` its FS/GS/TR/LDTR
@@ -410,7 +410,7 @@ struct GuestRegs {
 /// at nothing); and the core must have `EFER.SVME` and `VM_HSAVE_PA` set as for
 /// [`super::vmrun`]. Returns with GIF set (`stgi`).
 #[inline(never)]
-unsafe fn vmrun_regs(vmcb_pa: u64, host_pa: u64, regs: &mut GuestRegs) {
+pub(super) unsafe fn vmrun_regs(vmcb_pa: u64, host_pa: u64, regs: &mut GuestRegs) {
     // SAFETY: per the contract above. The stack pushes are balanced (so no
     // `nostack`); RBX and RBP cannot be operands and are saved by hand; every
     // other GPR is declared clobbered, which is the shared-register contract;
@@ -726,7 +726,7 @@ impl Disk for HostDisk {
 
 /// General register `n` in the instruction encoding's numbering (RAX, RCX, RDX,
 /// RBX, RSP, RBP, RSI, RDI, R8-R15): the VMCB holds RAX and RSP, `regs` the rest.
-fn get_reg(v: &Vmcb<'_>, r: &GuestRegs, n: u8) -> u64 {
+pub(super) fn get_reg(v: &Vmcb<'_>, r: &GuestRegs, n: u8) -> u64 {
     match n {
         0 => v.rax(),
         1 => r.rcx,
@@ -747,7 +747,7 @@ fn get_reg(v: &Vmcb<'_>, r: &GuestRegs, n: u8) -> u64 {
     }
 }
 
-fn set_reg(v: &mut Vmcb<'_>, r: &mut GuestRegs, n: u8, val: u64) {
+pub(super) fn set_reg(v: &mut Vmcb<'_>, r: &mut GuestRegs, n: u8, val: u64) {
     match n {
         0 => v.set_rax(val),
         1 => r.rcx = val,
@@ -951,9 +951,9 @@ impl Needle {
 }
 
 /// `IA32_APIC_BASE`: bit 11 global enable, bit 8 BSP, bits 51:12 the base.
-const APIC_BASE_ENABLE: u64 = 1 << 11;
-const APIC_BASE_BSP: u64 = 1 << 8;
-const APIC_BASE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
+pub(super) const APIC_BASE_ENABLE: u64 = 1 << 11;
+pub(super) const APIC_BASE_BSP: u64 = 1 << 8;
+pub(super) const APIC_BASE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
 
 /// Where an interrupt offered to the guest came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1570,13 +1570,13 @@ fn vmcb_of(frames: &mut [Option<FreshFrame>; MAX_VCPUS], cpu: usize) -> Vmcb<'_>
 /// What every processor intercepts: CPUID, every port, every MSR, HLT, the host's own
 /// interrupts and NMIs (so a timer tick reaches the host), and a triple fault (so a dead
 /// guest is a report and not a reset).
-const INTR0_BASE: u32 =
+pub(super) const INTR0_BASE: u32 =
     intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT | intr0::SHUTDOWN;
 
 /// The controls every virtual processor shares: everything the guest can ask the
 /// hypervisor about is intercepted, nested paging is on, and the host's `IF` — not
 /// the guest's — decides whether a physical interrupt is taken while the guest runs.
-fn init_vmcb(page: &mut [u8; 4096], guest: Guest, npt_root: u64, asid: u32) {
+pub(super) fn init_vmcb(page: &mut [u8; 4096], guest: Guest, npt_root: u64, asid: u32) {
     let mut v = Vmcb::new(page);
     v.set_intr0(INTR0_BASE);
     v.set_intr1(intr1::VMRUN | intr1::VMMCALL | intr1::XSETBV);
@@ -1669,7 +1669,7 @@ fn set_startup_state(v: &mut Vmcb<'_>, vector: u8) {
 /// `vmrun_regs` loads back after every exit. A service guest does this before every entry:
 /// it yields to other host tasks between entries, and one of them may have moved
 /// `KernelGsBase` or `FS_BASE`, which a stale save would put back.
-fn save_host(host_pa: u64) {
+pub(super) fn save_host(host_pa: u64) {
     // SAFETY: `host_pa` is a frame the caller owns, 4-KiB-aligned; VMSAVE writes the 4 KiB
     // state-save layout into it and nothing else.
     unsafe { core::arch::asm!("vmsave rax", in("rax") host_pa, options(nostack)) };

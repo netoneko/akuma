@@ -15,6 +15,9 @@
 //! after: this is still the census instrument of `docs/archive/AKUMA_FIRECRACKER_KVM.md`, now with
 //! answers. No allocation anywhere: handle and VM tables are statics.
 
+mod platform;
+mod vcpu;
+
 use akuma_exec_core::process::FileDescriptor;
 use akuma_kvm_abi::fdargs::{IOEVENTFD_LEN, IRQFD_LEN, Ioeventfd, Irqfd};
 use akuma_kvm_abi::req::{self, Kind, Op};
@@ -24,7 +27,10 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spinning_top::Spinlock;
 
 use crate::fd::errno;
+use crate::phys::FreshFrame;
 use crate::serial;
+use platform::Platform;
+use vcpu::Vcpu;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -72,7 +78,12 @@ struct Vm {
     irqchip: bool,
     pit: bool,
     tss: u64,
-    vcpus: [bool; MAX_VCPUS],
+    /// The vCPUs; `None` while one is inside `RUN` (its thread owns it) or not yet created.
+    vcpus: [Option<Vcpu>; MAX_VCPUS],
+    created: [bool; MAX_VCPUS],
+    /// Host-physical addresses of each vCPU's run frames, for `mmap`.
+    run_pas: [[usize; vcpu::RUN_PAGES]; MAX_VCPUS],
+    npt: Option<Npt>,
     irqfds: [Option<Irqfd>; MAX_IRQFDS],
     ioeventfds: [Option<Ioeventfd>; MAX_IOEVENTFDS],
 }
@@ -86,7 +97,10 @@ impl Vm {
             irqchip: false,
             pit: false,
             tss: 0,
-            vcpus: [false; MAX_VCPUS],
+            vcpus: [const { None }; MAX_VCPUS],
+            created: [false; MAX_VCPUS],
+            run_pas: [[0; vcpu::RUN_PAGES]; MAX_VCPUS],
+            npt: None,
             irqfds: [None; MAX_IRQFDS],
             ioeventfds: [None; MAX_IOEVENTFDS],
         }
@@ -94,6 +108,30 @@ impl Vm {
 }
 
 static VM: Spinlock<Option<Vm>> = Spinlock::new(None);
+/// The in-kernel PIT/PIC/LAPIC, created by `CREATE_IRQCHIP`.
+static PLAT: Spinlock<Option<Platform>> = Spinlock::new(None);
+
+/// The nested page table over the memslots: PML4 -> PDPT -> PD of 2 MiB leaves, built at the first `RUN`.
+struct Npt {
+    pml4: FreshFrame,
+    _pdpt: FreshFrame,
+    _pd: FreshFrame,
+}
+
+fn build_npt(slots: &Table) -> Option<Npt> {
+    let mut pml4 = FreshFrame::alloc_zeroed()?;
+    let mut pdpt = FreshFrame::alloc_zeroed()?;
+    let mut pd = FreshFrame::alloc_zeroed()?;
+    akuma_svm_amd64::wr64(pml4.bytes_mut(), 0, akuma_svm_amd64::npt::pointer(pdpt.pa() as u64));
+    akuma_svm_amd64::wr64(pdpt.bytes_mut(), 0, akuma_svm_amd64::npt::pointer(pd.pa() as u64));
+    for s in slots.iter() {
+        for i in 0..(s.region.size >> 21) {
+            let idx = ((s.region.gpa >> 21) + i) as usize;
+            akuma_svm_amd64::wr64(pd.bytes_mut(), idx * 8, akuma_svm_amd64::npt::leaf_2m(s.slice_off + (i << 21)));
+        }
+    }
+    Some(Npt { pml4, _pdpt: pdpt, _pd: pd })
+}
 
 fn irq_off<T>(f: impl FnOnce() -> T) -> T {
     akuma_primitives::irq::with_irqs_disabled(f)
@@ -120,6 +158,7 @@ fn destroy_vm() {
             super::ctl::uncarve(off);
         }
     }
+    irq_off(|| *PLAT.lock() = None);
     reap_handles();
 }
 
@@ -190,6 +229,7 @@ fn answer(h: Handle, op: Op, arg: u64) -> u64 {
                 return errno::EEXIST;
             }
             v.irqchip = true;
+            irq_off(|| *PLAT.lock() = Some(Platform::new()));
             0
         }),
         Op::CreatePit2 => with_vm(|v| {
@@ -203,17 +243,65 @@ fn answer(h: Handle, op: Op, arg: u64) -> u64 {
         Op::SetUserMemoryRegion => set_memory_region(arg),
         Op::Irqfd => irqfd(arg),
         Op::Ioeventfd => ioeventfd(arg),
-        Op::SetMsrs => crate::uaccess::read_val::<u32>(arg).map_or(errno::EFAULT, u64::from),
-        // vCPU state marshalling and the run loop are slice 1b / 2.
-        Op::Run => {
-            check_shared_memory();
-            0
-        }
-        Op::SetCpuid2 | Op::SetRegs | Op::SetFpu | Op::GetSregs | Op::SetSregs | Op::GetLapic | Op::SetLapic => {
-            let _ = h;
-            0
-        }
+        Op::SetMsrs => set_msrs(h, arg),
+        Op::SetCpuid2 => set_cpuid2(h, arg),
+        Op::SetRegs => match user_bytes::<{ akuma_kvm_abi::state::REGS_LEN }>(arg).and_then(|b| akuma_kvm_abi::state::Regs::parse(&b)) {
+            Some(r) => with_vcpu(h.vcpu, |vc, _| {
+                vc.set_regs(&r);
+                0
+            }),
+            None => errno::EFAULT,
+        },
+        Op::SetFpu => match user_bytes::<{ akuma_kvm_abi::state::FPU_LEN }>(arg) {
+            Some(b) => with_vcpu(h.vcpu, |vc, _| {
+                vc.set_fpu(&b);
+                0
+            }),
+            None => errno::EFAULT,
+        },
+        Op::SetSregs => match user_bytes::<{ akuma_kvm_abi::state::SREGS_LEN }>(arg).and_then(|b| akuma_kvm_abi::state::Sregs::parse(&b)) {
+            Some(s) => with_vcpu(h.vcpu, |vc, p| {
+                vc.set_sregs(&s, p);
+                0
+            }),
+            None => errno::EFAULT,
+        },
+        Op::GetSregs => with_vcpu(h.vcpu, |vc, p| {
+            let mut out = [0u8; akuma_kvm_abi::state::SREGS_LEN];
+            vc.get_sregs(p).encode(&mut out);
+            if crate::uaccess::write_bytes(arg, &out) { 0 } else { errno::EFAULT }
+        }),
+        Op::GetLapic | Op::SetLapic => 0, // slice 3: the LAPIC register image
+        Op::Run => run_vcpu(h.vcpu),
     }
+}
+
+/// `SET_MSRS`: a header `{nmsrs, pad}` and that many 16-byte entries; returns how many were taken.
+fn set_msrs(h: Handle, arg: u64) -> u64 {
+    let Some(n) = crate::uaccess::read_val::<u32>(arg).map(|n| n as usize) else { return errno::EFAULT };
+    if n > 64 {
+        return errno::E2BIG;
+    }
+    let mut buf = [0u8; 64 * akuma_kvm_abi::state::MSR_ENTRY_LEN];
+    let len = n * akuma_kvm_abi::state::MSR_ENTRY_LEN;
+    if !crate::uaccess::read_bytes(arg + akuma_kvm_abi::state::LIST_HDR as u64, &mut buf[..len]) {
+        return errno::EFAULT;
+    }
+    with_vcpu(h.vcpu, |vc, p| vc.set_msrs(&buf[..len], n, p) as u64)
+}
+
+/// `SET_CPUID2`: a header `{nent, pad}` and that many 40-byte entries.
+fn set_cpuid2(h: Handle, arg: u64) -> u64 {
+    let Some(n) = crate::uaccess::read_val::<u32>(arg).map(|n| n as usize) else { return errno::EFAULT };
+    if n > vcpu::MAX_CPUID {
+        return errno::E2BIG;
+    }
+    let mut buf = [0u8; vcpu::MAX_CPUID * CPUID_ENTRY_LEN];
+    let len = n * CPUID_ENTRY_LEN;
+    if !crate::uaccess::read_bytes(arg + LIST_HDR as u64, &mut buf[..len]) {
+        return errno::EFAULT;
+    }
+    with_vcpu(h.vcpu, |vc, _| if vc.set_cpuid(&buf[..len], n) { 0 } else { errno::E2BIG })
 }
 
 /// Slice-1 check, logged: the bytes at guest-physical 0x201000 (the PVH entry the VMM loaded the kernel
@@ -271,17 +359,84 @@ fn create_vcpu(id: u64) -> u64 {
     if id as usize >= MAX_VCPUS {
         return errno::EINVAL;
     }
+    let id = id as usize;
+    let r = with_vm(|v| if v.created[id] { errno::EEXIST } else { 0 });
+    if r != 0 {
+        return r;
+    }
+    let Some(vc) = Vcpu::new(id) else { return errno::ENOMEM };
+    let pas = [vc.run[0].pa(), vc.run[1].pa()];
     let r = with_vm(|v| {
-        if v.vcpus[id as usize] {
-            return errno::EEXIST;
-        }
-        v.vcpus[id as usize] = true;
+        v.created[id] = true;
+        v.run_pas[id] = pas;
+        v.vcpus[id] = Some(vc);
         0
     });
     if r != 0 {
         return r;
     }
     new_handle(Kind::Vcpu, id as u8)
+}
+
+/// Run `f` on vCPU `id` if it is here (not running on another thread).
+fn with_vcpu(id: u8, f: impl FnOnce(&mut Vcpu, &mut Platform) -> u64) -> u64 {
+    irq_off(|| {
+        let mut vm = VM.lock();
+        let mut plat = PLAT.lock();
+        let (Some(v), Some(p)) = (vm.as_mut(), plat.as_mut()) else { return errno::EINVAL };
+        match v.vcpus[id as usize].as_mut() {
+            Some(vc) => f(vc, p),
+            None => errno::EBUSY,
+        }
+    })
+}
+
+fn user_bytes<const N: usize>(arg: u64) -> Option<[u8; N]> {
+    let mut b = [0u8; N];
+    crate::uaccess::read_bytes(arg, &mut b).then_some(b)
+}
+
+fn run_vcpu(id: u8) -> u64 {
+    let taken = irq_off(|| {
+        let mut g = VM.lock();
+        let v = g.as_mut()?;
+        if v.npt.is_none() {
+            v.npt = build_npt(&v.slots);
+        }
+        let npt_pa = v.npt.as_ref()?.pml4.pa() as u64;
+        Some((v.vcpus[id as usize].take()?, v.slots, npt_pa))
+    });
+    let Some((mut vc, slots, npt_pa)) = taken else { return errno::EBUSY };
+    if irq_off(|| PLAT.lock().is_none()) {
+        irq_off(|| {
+            if let Some(v) = VM.lock().as_mut() {
+                v.vcpus[id as usize] = Some(vc);
+            }
+        });
+        return errno::EINVAL;
+    }
+    let r = vcpu::run(&mut vc, &PLAT, &slots, npt_pa);
+    irq_off(|| {
+        if let Some(v) = VM.lock().as_mut() {
+            v.vcpus[id as usize] = Some(vc);
+        }
+    });
+    r
+}
+
+/// `mmap` of a vCPU descriptor: the run page(s) as shared memory.
+pub fn mmap_vcpu(id: u32, addr: u64, len: u64, prot: u64, flags: u64) -> u64 {
+    let Some(h) = irq_off(|| HANDLES.lock().get(id as usize - 1).copied().flatten()) else { return errno::EBADF };
+    if h.kind != Kind::Vcpu {
+        return errno::ENODEV;
+    }
+    let pages = (len as usize).div_ceil(4096);
+    if pages == 0 || pages > vcpu::RUN_PAGES {
+        return errno::EINVAL;
+    }
+    let pas = irq_off(|| VM.lock().as_ref().map(|v| v.run_pas[h.vcpu as usize]));
+    let Some(pas) = pas else { return errno::EINVAL };
+    crate::mm::mmap_frames(addr, flags as u32, prot as u32, &pas[..pages])
 }
 
 fn set_memory_region(arg: u64) -> u64 {

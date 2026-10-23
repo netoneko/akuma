@@ -168,3 +168,48 @@ fn fd_arguments_from_the_dumps() {
     assert!(!io.matches(0xc000_1054, 4, 0));
     assert!(!io.matches(0xc000_1050, 2, 0));
 }
+
+#[test]
+fn run_page_io_and_mmio_records() {
+    use crate::runpage::*;
+    let mut p = [0u8; PAGE];
+    set_io(&mut p, IO_OUT, 1, 0x3f8, u32::from(b'A'));
+    assert_eq!(u32::from_le_bytes(p[8..12].try_into().unwrap()), 2);
+    assert_eq!((p[off::IO_DIRECTION], p[off::IO_SIZE]), (IO_OUT, 1));
+    assert_eq!(u16::from_le_bytes([p[off::IO_PORT], p[off::IO_PORT + 1]]), 0x3f8);
+    assert_eq!(u32::from_le_bytes(p[off::IO_COUNT..off::IO_COUNT + 4].try_into().unwrap()), 1);
+    assert_eq!(p[IO_DATA], b'A');
+    // The VMM answers an IN by writing the data where data_offset points.
+    p[IO_DATA] = 0x60;
+    assert_eq!(io_in_value(&p, 1), 0x60);
+    assert_eq!(io_in_value(&p, 4) & 0xff, 0x60);
+    set_mmio(&mut p, 0xc000_1050, 4, true, 7);
+    assert_eq!(u32::from_le_bytes(p[8..12].try_into().unwrap()), 6);
+    assert_eq!(mmio_value(&p), 7);
+    assert_eq!(p[off::MMIO_IS_WRITE], 1);
+    assert!(!immediate_exit(&p));
+}
+
+#[test]
+fn fpu_argument_maps_onto_the_fxsave_area() {
+    let mut src = [0u8; FPU_LEN];
+    src[0] = 0xAA; // st0 byte 0
+    src[16 * 7 + 15] = 0xBB; // st7 last byte
+    src[128] = 0x7f;
+    src[129] = 0x03; // fcw 0x37f
+    src[132] = 0xff; // ftwx
+    src[152] = 0xCC; // xmm0 byte 0
+    src[152 + 16 * 15 + 15] = 0xDD; // xmm15 last byte
+    src[408] = 0x80;
+    src[409] = 0x1f; // mxcsr 0x1f80
+    let mut out = [0u8; 512];
+    fpu_to_fxsave(&src, &mut out);
+    assert_eq!(&out[0..2], &[0x7f, 0x03]);
+    assert_eq!(out[4], 0xff);
+    assert_eq!(&out[24..26], &[0x80, 0x1f]);
+    assert_eq!(out[32], 0xAA);
+    assert_eq!(out[32 + 16 * 7 + 15], 0xBB);
+    assert_eq!(out[160], 0xCC);
+    assert_eq!(out[160 + 16 * 15 + 15], 0xDD);
+    assert_eq!(&out[28..32], &[0; 4], "mxcsr_mask is the CPU's to say");
+}

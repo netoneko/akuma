@@ -9,6 +9,6 @@ cargo build -p akuma-amd64 --target x86_64-unknown-none --release --features no-
 rm -f "$LOG"
 P0="echo P0-BEGIN
 for i in ${REPEATS:-1}; do /usr/bin/firecracker ${FCARGS:---no-api --no-seccomp --config-file /vm.json}; echo \"run \$i rc=\$?\"; done
-echo P0-END" FCDIR=$D/fc GCCDIR=$D/gcc MUSLDIR=$D/musl KCMDLINE="kvmctl kvmmem=512 kvmapi ${EXTRA:-}" scripts/kvm/firecracker_phase0.sh "$LOG" "${SECS:-90}" >/dev/null 2>&1 &
+echo P0-END" FCDIR=$D/fc GCCDIR=$D/gcc MUSLDIR=$D/musl KCMDLINE="kvmctl kvmmem=${KVMMEM:-1024} kvmapi ${EXTRA:-}" scripts/kvm/firecracker_phase0.sh "$LOG" "${SECS:-90}" >/dev/null 2>&1 &
 timeout "${SECS:-90}" sh -c "until grep -aq 'P0-END' $LOG 2>/dev/null; do sleep 2; done" || true
 grep -a "kvmapi\|rror\|panic" "$LOG" | cut -c1-300

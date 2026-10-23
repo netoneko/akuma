@@ -3466,3 +3466,57 @@ pub fn remap_user_to_phys(start: usize, len: usize, pa: usize) -> bool {
     })
     .unwrap_or(false)
 }
+
+/// Map the physical frames `frames` (page-aligned addresses, in order) into the calling process as one
+/// read-write shared region, at `addr` with `MAP_FIXED` or at a fresh address. The frames are
+/// **borrowed**, as `mmap_framebuffer`'s are: recorded as a region, absent from the ledger, so no
+/// teardown path hands them to the allocator. For the hypervisor's vCPU run page (`kvm::api`), which
+/// the kernel keeps writing through the physmap while the VMM reads it. Returns the address or an errno.
+pub fn mmap_frames(addr: u64, flags: u32, prot: u32, frames: &[usize]) -> u64 {
+    use akuma_syscalls_linux::flags::map::MAP_FIXED;
+    let pages = frames.len();
+    if pages == 0 {
+        return errno::EINVAL;
+    }
+    if !have_address_space() {
+        return errno::ESRCH;
+    }
+    let byte_len = pages * PAGE_SIZE as usize;
+    let base = if flags & MAP_FIXED != 0 {
+        let want = addr as usize;
+        if want.saturating_add(byte_len) > USER_VA_LIMIT {
+            return errno::EINVAL;
+        }
+        unmap_range(want, want + byte_len);
+        want
+    } else {
+        let Some(found) = usermode::with_current_regions_and_cursor(|regions, cursor| {
+            let hint = cursor.load(core::sync::atomic::Ordering::Relaxed);
+            let placed = find_free_va_from(regions, pages, hint).0;
+            if let Some(base) = placed {
+                cursor.store(base.saturating_add(byte_len), core::sync::atomic::Ordering::Relaxed);
+            }
+            placed
+        })
+        .flatten() else {
+            return errno::ENOMEM;
+        };
+        found
+    };
+    let region_prot = Prot::from_prot(prot);
+    usermode::with_current_regions(|regions| {
+        insert_region_sorted(regions, MmapRegion::inherited_with_prot(base, pages, region_prot));
+    });
+    let pte = PteProt::from_region(region_prot);
+    let mapped = usermode::with_current_address_space(|uas| {
+        frames.iter().enumerate().all(|(i, &pa)| {
+            uas.map_device_page(base + i * PAGE_SIZE as usize, pa, pte, akuma_mmu::MemAttr::WriteBack)
+        })
+    })
+    .unwrap_or(false);
+    if !mapped {
+        unmap_range(base, base + byte_len);
+        return errno::ENOMEM;
+    }
+    base as u64
+}

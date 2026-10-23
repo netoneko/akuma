@@ -139,6 +139,16 @@ impl FxArea {
     pub const fn zeroed() -> Self {
         Self([0; 832])
     }
+
+    /// The state a guest or a fresh program starts with ([`FxArea::initial`]).
+    pub const fn reset_state() -> Self {
+        Self::initial()
+    }
+
+    /// The 512-byte `fxsave` legacy area: x87 and SSE state, the part a guest without `XSAVE` uses.
+    pub fn legacy_mut(&mut self) -> &mut [u8] {
+        &mut self.0[..512]
+    }
     /// The reset state a program expects: x87 control word `0x37F`, `MXCSR`
     /// `0x1F80` (every SSE exception masked). Not all-zero: an all-zero `MXCSR`
     /// unmasks every exception, and the first inexact result in ring 3 would
@@ -646,6 +656,11 @@ static RESERVED_CORES: AtomicU64 = AtomicU64::new(0);
 /// Reserve the cores in `mask` (bit `c` = core `c`; bit 0 is ignored); 0 releases them all.
 pub fn reserve_cores(mask: u64) {
     RESERVED_CORES.store(mask & !1, Ordering::Relaxed);
+}
+
+/// Let the running thread go to any core again (undo [`repin_current`]).
+pub fn unpin_current() {
+    MACHINE[current()].pinned.store(NO_CPU, Ordering::Relaxed);
 }
 
 /// Move the running thread to core `cpu` and keep it there: pins it, then parks until a

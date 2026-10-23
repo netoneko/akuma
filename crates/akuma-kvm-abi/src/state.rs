@@ -298,3 +298,30 @@ pub fn list_count(hdr: &[u8], stride: usize, len: usize) -> Option<usize> {
     let n = rd32(hdr, 0)? as usize;
     (LIST_HDR + n.checked_mul(stride)? <= len).then_some(n)
 }
+
+/// `SET_FPU` argument length.
+///
+/// Eight 16-byte x87 registers, control/status/tag words, instruction and data pointers, sixteen
+/// 16-byte XMM registers, `MXCSR`: 128 + 2+2+1+1+2+8+8 + 256 + 4 + 4 of padding adds up to exactly
+/// the size the VMM sent, which is the evidence for this layout.
+pub const FPU_LEN: usize = 416;
+
+/// Rewrite a [`FPU_LEN`]-byte FPU argument as the 512-byte `FXSAVE` legacy area (Intel SDM Vol 1
+/// §10.5): `FCW`, `FSW`, abridged tag, `FOP`, `FIP`, `FDP`, `MXCSR` in the header; `ST0-7` from byte
+/// 32; `XMM0-15` from byte 160.
+pub fn fpu_to_fxsave(src: &[u8; FPU_LEN], dst: &mut [u8; 512]) {
+    dst.fill(0);
+    dst[0..2].copy_from_slice(&src[128..130]); // fcw
+    dst[2..4].copy_from_slice(&src[130..132]); // fsw
+    dst[4] = src[132]; // ftwx (already the abridged tag)
+    dst[6..8].copy_from_slice(&src[134..136]); // last opcode
+    dst[8..16].copy_from_slice(&src[136..144]); // last ip
+    dst[16..24].copy_from_slice(&src[144..152]); // last data pointer
+    dst[24..28].copy_from_slice(&src[408..412]); // mxcsr
+    for i in 0..8 {
+        dst[32 + 16 * i..48 + 16 * i].copy_from_slice(&src[16 * i..16 * i + 16]);
+    }
+    for i in 0..16 {
+        dst[160 + 16 * i..176 + 16 * i].copy_from_slice(&src[152 + 16 * i..168 + 16 * i]);
+    }
+}

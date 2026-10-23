@@ -21,9 +21,9 @@ cp "$MUSLDIR/lib/ld-musl-x86_64.so.1" "$T/lib/"; cp "$MUSLDIR/lib/libc.musl-x86_
 cp "$GCCDIR/usr/lib/libgcc_s.so.1" "$T/usr/lib/"; cp "$GCCDIR/usr/lib/libgcc_s.so.1" "$T/lib/"
 cp "$FCDIR/usr/bin/firecracker" "$T/usr/bin/"; chmod 755 "$T/usr/bin/firecracker"
 cp "$KERNEL" "$T/boot/akuma-guest"
-cat > "$T/vm.json" <<'J'
+cat > "$T/vm.json" <<J
 {"boot-source":{"kernel_image_path":"/boot/akuma-guest","boot_args":"console=ttyS0"},
- "machine-config":{"vcpu_count":1,"mem_size_mib":128},
+ "machine-config":{"vcpu_count":1,"mem_size_mib":${MEM_MIB:-768}},
  "drives":[{"drive_id":"rootfs","path_on_host":"/boot/akuma-guest","is_root_device":true,"is_read_only":true}]}
 J
 if [ -n "${P0:-}" ]; then printf '%s\n' "$P0" > "$T/etc/p0.sh"; else cat > "$T/etc/p0.sh" <<'S'
