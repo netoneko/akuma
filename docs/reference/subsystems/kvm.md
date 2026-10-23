@@ -250,7 +250,7 @@ core keeps it until its next switch-out, after which it can only be placed elsew
 | herd key | |
 |---|---|
 | `vm = true` | the service is a VM (`command` is not needed; it is `herd vm-run`) |
-| `vm_type` | `kvm` (default) or `firecracker` (reserved: parses, the service is not loaded) |
+| `vm_type` | `kvm` (default) or `firecracker` (reserved: parses, the service is not loaded; a Firecracker VM runs as an ordinary `command =` service against `/dev/kvm`, see above) |
 | `vm_kernel`, `vm_cmdline` | kernel image (an Akuma ELF), the guest command line tail (rest of the line) |
 | `vm_cores` | host cores for the vCPUs (`2,4`), within `kvmcores=` |
 | `vm_ram_mib`, `vm_vcpus` | 16–1024 (default 768), 1–4 (default 1) |
@@ -298,7 +298,45 @@ small task stack). `[KVM] relay: outbound opened= failed= denied= ... gw_syns= g
 `scripts/kvm/serve_rehearse.py LOG --herd --outbound` (a web server on the Mac by LAN address; DNS; the Alpine CDN).
 How it was built, verified, and the one open item: [`KVM_OUTBOUND_NETWORKING.md`](../../archive/KVM_OUTBOUND_NETWORKING.md).
 
+## `/dev/kvm`: the KVM-ioctl node (an unmodified Firecracker, 2026-10-23)
+
+Beside `/dev/kvm0` (a spec written, the kernel runs the whole VM) there is **`/dev/kvm`**, the Linux-shaped protocol a
+userspace VMM speaks: system fd -> `CREATE_VM` -> VM fd -> `CREATE_VCPU` -> vCPU fd, `KVM_RUN` as the vCPU loop, the VMM
+emulating every device but the PIT, PIC and local APIC. **Grade C.** Armed by `kvmctl` (or `kvmapi`); `open` is `ENOENT`
+otherwise. Verified: Alpine's `firecracker --no-api --no-seccomp --config-file vm.json` boots the Akuma kernel as a guest
+(Firecracker-served virtio-blk root, serial through its emulated 16550) on TCG and on the ryzen
+([`../../runbooks/run-firecracker-on-akuma.md`](../../runbooks/run-firecracker-on-akuma.md)). How the protocol was learned and
+what is unconfirmed: [`../../archive/AKUMA_FIRECRACKER_KVM.md`](../../archive/AKUMA_FIRECRACKER_KVM.md). Code: the pure crate
+`crates/akuma-kvm-abi` (request decode, vCPU argument layouts, the memslot table, the run page; `forbid(unsafe)`),
+`amd64/src/kvm/api.rs` + `api/{vcpu,platform}.rs`, `mm::{remap_user_to_phys, mmap_frames}`.
+
+- **Handles.** `FileDescriptor::DevKvm(id)`: 0 is `/dev/kvm0`, `n > 0` names a slot of the handle table (system / VM / vCPU),
+  so `dup` needs no reference counts. A handle, and the VM, live until their owner process is gone (reaped by the next
+  `open`, `CREATE_VM`, or a `/dev/kvm0` create). **One VM, and not beside a `/dev/kvm0` VM**: either side is `EBUSY`.
+- **Guest RAM is a slice of the `kvmmem=` reserve, remapped into the VMM.** `SET_USER_MEMORY_REGION` carves a 2 MiB-aligned
+  slice (zeroed), copies the VMM's range into it and moves the VMM's PTEs onto it; the leaves are *borrowed* (not in the
+  frame ledger, no share count: `munmap`/exit/`fork` never free them) and the NPT is the same 2 MiB-leaf table `kvm0` builds.
+  No `kvmmem=` or no room: `ENOMEM`. Guest RAM <= 1 GiB, regions 2 MiB aligned, a slot is set once, no dirty logging.
+  **A VMM that forks after `CREATE_VM` is logged** (`[kvmapi] WARNING`), not prevented: the child would CoW-share frames
+  the guest writes through.
+- **`KVM_RUN` is the VMM thread's syscall.** The thread is pinned to its core (`sched::repin_current`; SVM enabled on
+  demand), the host FPU/SSE state is saved around every `VMRUN`, the BKL is released **only** around `VMRUN` (the exit path
+  and the eventfd wake need it held), and `yield_now` runs between entries because the kernel switches cooperatively (a
+  woken device thread otherwise never runs on a one-core host). Signals end it with `EINTR`.
+- **Exits.** CPUID (from the VMM's own table), MSRs, PIT/PIC ports and the LAPIC page are the kernel's; every other port and
+  MMIO address is returned through the run page and completed at the next `RUN`. A registered `IOEVENTFD` doorbell signals its
+  eventfd and never leaves the kernel; an `IRQFD` eventfd is **polled** at every entry and idle wake and raises PIC pin `gsi`
+  (< 16): up to a millisecond of interrupt latency, no waker hook yet.
+- **Never put a large value on the kernel stack in this path.** The kernel stack is **32 KiB with no guard page** (heap-allocated,
+  `sched::STACK_SIZE`); an overflow corrupts the neighbouring heap chunk. The vCPU, its CPUID table, FPU image and event
+  snapshot are heap-allocated once at `CREATE_VCPU` (fallible) and `RUN` moves pointers; the first version copied ~6 KiB
+  through closures and the ryzen died in `talc::free` on the fifth run (`../../archive/AKUMA_FIRECRACKER_KVM.md` § *Metal*).
+- The run-page layout, the `IOEVENTFD` flag bits and the `SET_FPU` layout are **hypotheses confirmed only as far as
+  Firecracker exercised them**; `GET/SET_LAPIC`, the I/O APIC, `SET_GSI_ROUTING` and more than one vCPU are not done.
+
 ## Open items (2026-10-23)
+
+* **Firecracker on `/dev/kvm`: the to-do list that ends the KVM work** is in [`../../archive/AKUMA_FIRECRACKER_KVM.md`](../../archive/AKUMA_FIRECRACKER_KVM.md) § *Before the KVM work is finished*: CPU **affinity** (placing vCPU threads and `sched_setaffinity`), the I/O APIC, `GET/SET_LAPIC`, more than one vCPU, seccomp, a kernel-stack guard, a real `HLT` block, an irqfd waker, NetBSD, and lifting the one-VM exclusivity.
 
 * **Large guest->host transfers wedge the guest** (96 MiB+ through the relay), on the old kernel too; the host's
   `/bin/ssh` client spins while the relay's host socket stays full. Evidence and next experiments:
@@ -346,8 +384,7 @@ How it was built, verified, and the one open item: [`KVM_OUTBOUND_NETWORKING.md`
 Everything above is a herd service: `herd start/stop/status`, restart policy and `/var/log/herd/<name>.log`
 are the same. A VM's lifetime is its supervising process (`herd vm-run`); the guest's console is its log.
 Boxes share one kernel and cost almost nothing; VMs cost a RAM slice and cores (reserved from the host,
-`kvmcores=`/`vm_cores`) and give a separate kernel. Firecracker-style (`vm_type = firecracker`) is reserved
-for the `/dev/kvm` userspace-VMM track.
+`kvmcores=`/`vm_cores`) and give a separate kernel. Firecracker itself runs as an ordinary process against `/dev/kvm` (above); `vm_type = firecracker` stays reserved.
 
 ## Run it
 

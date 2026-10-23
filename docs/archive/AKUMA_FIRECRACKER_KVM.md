@@ -304,3 +304,59 @@ are accepted and ignored (Firecracker's `SET_LAPIC` LINT setup is therefore not 
 one vCPU only has been run, no `SET_GSI_ROUTING`, `KVM_RUN` kicks by `tkill` signal are untested, string port I/O is an
 `INTERNAL_ERROR`, HLT with `IF=0` is reported as an exit, `--no-seccomp` is required, **and nothing here has run on the
 ryzen metal yet**. The guest RAM remap loses a VMM that forks after `CREATE_VM` (logged nowhere yet).
+
+## Metal (ryzen, 2026-10-23)
+
+**Result: the unmodified Alpine `firecracker --no-api --no-seccomp --config-file /root/fc/vm.json` boots the Akuma kernel
+as a guest on the ryzen's bare metal**, entry 30 (`kvmctl kvmmem=4096 kvmcores=4-7`), kernel built **on the ryzen** from the
+pushed branch, guest kernel `/boot/akuma-guest`, 768 MiB, one vCPU, a 16 MiB ext2 root served by Firecracker's virtio-blk
+(`/root/fc/root.img`, a copy of `/boot/akuma-guest-root.img`). The console shows the guest's banner and
+`[Block] Registered vda: 16 MB`, `fs: ext2 mounted on /dev/vda`, `AKUMA-GUEST-UP`,
+`ebce43017d2cb316ea45e08374de7315  /bin/busybox` (identical to the host's md5 and to the TCG rehearsal's) and
+`71277886028e270c53e947eb5989f7f2  /wtest` (the guest-written 256 KiB file, identical to the rehearsal's),
+`AKUMA-GUEST-DONE`, then Firecracker's `Unexpected exit reason on vcpu run: Hlt`. First run 43 s (zeroing the 768 MiB
+slice and the guest's cold boot); later runs take about a second.
+
+Recipe used (all recorded in [`../runbooks/run-firecracker-on-akuma.md`](../runbooks/run-firecracker-on-akuma.md)):
+files staged on p3 while Akuma was up (`/root/fc/{firecracker,vm.json,run.sh}`), `reboot -f` to Pop, fresh clone of the pushed
+branch in `~/akuma-metal/fc-kvm` (the existing checkout there is detached with local edits and was left alone; the
+`akuma-fbcon` font submodule copied from it), `cargo build -p akuma-amd64 --release --features no-tests`, kernel copied to
+p3's `/boot/akuma-amd64.verify` (md5 checked, the old one kept as `.verify.pre-fc-api`), `arm.sh 29`. Herd starts the NetBSD
+and `vm-serve-mc` services at that boot and one holds the `/dev/kvm0` slot, so the first `CREATE_VM` was `EBUSY` (the
+documented exclusivity); `herd stop` of both freed it.
+
+### Incident: the host died on the fifth Firecracker run (kernel `bb76ea9`)
+
+*Symptom.* Run 1 clean; runs 2 and 3 halted within 0.3 s with no guest output; a later run took the host down:
+`[EXCEPTION] #PF page fault err=0 rip=0xffffffff802883c6 cr2=0xfffffffffffffff8 core=1 task_slot=24` at the shell prompt
+(photo from the laptop's screen). **Cause (probable, not proven):** `rip` symbolizes, against the very binary that ran
+(built on the ryzen), to **`talc::Talc<…PmmOomHandler>::free`**, the kernel heap's free, faulting on a null-minus-8
+chunk header: the heap was corrupted. The new code's `RUN` path moved a ~4 KiB `Vcpu` (CPUID table, FPU image) and a
+~2 KiB event snapshot by value through several closures; the kernel stack is **32 KiB with no guard page and is itself
+heap-allocated**, so an overflow silently overwrites the next heap chunk. That fits a failure that gets worse with each
+run, and the immediate halts of runs 2 and 3, but no stack depth was measured. *Fix:* the vCPU is a `Box`, its CPUID
+table, FPU image and event snapshot are heap arrays allocated once at `CREATE_VCPU` (fallible), the VM's registrations are
+copied in place, and `RUN` moves pointers. *Verified:* TCG, three consecutive runs all pass (before: runs 2 and 3 halted at
+once); metal, see the stress result below. **What is still open:** nothing guards a kernel stack (a canary or guard page
+would turn the next overflow into a named fault), and the claim "this was the stack" stays a hypothesis until a measurement
+says so.
+
+## Before the KVM work is finished
+
+In the owner's order of importance (2026-10-23), nothing below is done:
+
+1. **CPU affinity.** (a) Place the vCPU threads of a `/dev/kvm` VM on chosen cores the way `kvm0` places its vCPUs
+   (`vm_cores`, `kvmcores=`, `sched::reserve_cores`): a herd key on a `command =` service (a `cpus = 4-7` style list) handed to
+   the node, and `repin_current` choosing from it instead of "wherever the thread is". (b) `sched_setaffinity` (today only
+   `sched_getaffinity` exists), so `taskset` and any service can be pinned, and a herd key that applies it to the process.
+   Firecracker has no pinning option of its own.
+2. A **kernel-stack guard** (canary or guard page) and a measurement of the real depth of the `RUN` path.
+3. The **I/O APIC** model and `SET_GSI_ROUTING`; `GET/SET_LAPIC` actually applied.
+4. **More than one vCPU** (SMP guests: INIT/STARTUP IPIs between vCPU threads), and the `tkill` kick path (`EINTR`) exercised.
+5. `HLT` with `IF=0` should block the vCPU like a real KVM instead of exiting; string port I/O; the `IOEVENTFD`
+   deassign/port-I/O flags and the run-page extras confirmed or corrected against more of Firecracker's behaviour.
+6. An **irqfd waker** instead of polling (interrupt latency is up to a millisecond now).
+7. **seccomp**: either `seccomp(2)`/`prctl` accepting filters or `--no-seccomp` stays the documented mode.
+8. NetBSD `MICROVM` as the second guest; a Linux guest (needs the I/O APIC).
+9. Lift the one-VM exclusivity with `/dev/kvm0` (both own SVM and the reserved cores); a herd service shape for a
+   Firecracker VM (`command = firecracker ...`, restart policy) once affinity exists.
