@@ -38,7 +38,7 @@ CMOS). Keep pure logic in `crates/akuma-cmos-rtc` with host tests (`cargo test -
 allocation on console paths, `safe_print!`/`tprint!` only).
 
 ## How you test (the loop, from the manual)
-1. `kbuild --features no-tests`; copy the kernel to `/boot/akuma-guest-dev`; run it as the guest through herd (`vm-dev`, see task 00).
+1. `kbuild --features no-tests`; copy the kernel to `/boot/akuma-guest-dev`; run it as the guest through herd (`vm-dev`: `herd enable vm-dev; herd start vm-dev`, and when done `herd stop vm-dev; herd disable vm-dev`; see task 00 and the manual).
    It must boot to `AKUMA-GUEST-DONE` with no `EXCEPTION`.
 2. Install the same build as the HOST kernel for the next boot ONLY via `kinstall /root/ktarget/x86_64-unknown-none/release/akuma-amd64 /boot/akuma-amd64.verify`
    (never the default `/boot/akuma-amd64`).

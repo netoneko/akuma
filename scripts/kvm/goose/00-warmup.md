@@ -27,10 +27,11 @@ Do exactly this, in order, and write what happened (commands, exit codes, wall t
    vm_cmdline = init=/bin/busybox initargs=sh,/etc/guest.sh
    restart = false
    ```
-6. Only one `/dev/kvm0` VM can exist: `herd stop vm-netbsd; herd stop vm-serve-mc` (ignore "not running"), then `herd start vm-dev`.
+6. Only one `/dev/kvm0` VM can exist: `herd stop vm-netbsd; herd stop vm-serve-mc` (ignore "not running"), then `herd enable vm-dev` (herd only starts services it has enabled) and `herd start vm-dev`.
    Wait up to three minutes, polling `grep -a -E 'AKUMA-GUEST|EXCEPTION|panic' /var/log/herd/vm-dev.log` every ten seconds.
    PASS = the log shows `AKUMA-GUEST-UP` and `AKUMA-GUEST-DONE` and the md5 `ebce43017d2cb316ea45e08374de7315  /bin/busybox`.
    Also run `dmesg | grep -a -E 'EXCEPTION|panic' | head` and report whether it is empty.
-7. `herd stop vm-dev`, then restore: `herd start vm-serve-mc`.
+7. `herd stop vm-dev; herd disable vm-dev` (an enabled `vm-dev` would start at every boot and take the `kvm0` slot from
+   `vm-serve-mc`), then restore: `herd start vm-serve-mc`.
 8. Finish by writing `PASS` or `FAIL: <why>` as the last line of `/root/dev-cycle/warmup-report.md`, and stop. Do not reboot the
    machine, do not edit any source file, do not commit anything in this task.

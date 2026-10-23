@@ -47,7 +47,8 @@ The pieces on the ryzen (entry 30 = `kvmctl kvmmem=4096 kvmcores=4-7`, reserve a
 | `/etc/herd/available/vm-dev.conf` | the service: `vm = true`, `vm_kernel = /boot/akuma-guest-dev`, `vm_disk = /boot/akuma-dev-root.img`, 768 MiB, 1 vCPU, `restart = false`. |
 | `/var/log/herd/vm-dev.log` | the guest's console. |
 
-**One `kvm0` VM at a time.** `herd stop vm-netbsd; herd stop vm-serve-mc; herd start vm-dev`, and restore `vm-serve-mc` afterwards.
+**One `kvm0` VM at a time.** `herd stop vm-netbsd; herd stop vm-serve-mc; herd enable vm-dev; herd start vm-dev` (herd starts only enabled services), and
+afterwards `herd stop vm-dev; herd disable vm-dev` (an enabled `vm-dev` would start at every boot and take the slot) and `herd start vm-serve-mc`.
 PASS for a guest boot is `AKUMA-GUEST-UP`, `ebce43017d2cb316ea45e08374de7315  /bin/busybox`, `AKUMA-GUEST-DONE` in the log and no
 `EXCEPTION` or `panic` in the host's `dmesg`.
 
@@ -165,8 +166,8 @@ log) or into a byte the firmware does not cover; make the reset path write 0x0F 
 
 | when | step | result |
 |---|---|---|
-| | `sync` | |
-| | task 00 warm-up | |
+| 18:2x UTC | `sync` | bundle `4162e1b4..e005ab18` (238 KB), `dev-base` checked out on Akuma |
+| 18:23-18:30 UTC | task 00 warm-up (goose-glm, 1 session) | **PASS.** `kbuild --features no-tests` incremental 1m04s; `/boot/akuma-guest-dev` booted as a `kvm0` guest to `AKUMA-GUEST-DONE` within the first 10 s poll, guest `uname` build id `e005ab18` (the fresh kernel), md5 `ebce4301...`, host `dmesg` clean. goose needed `herd enable vm-dev` (not in the brief; added), and left it enabled (the orchestrator disabled it). Side lines the guest prints: `clock: CMOS RTC holds no date; waiting for SNTP`, `guest: FAIL (banner=yes, init=no, net=yes)` (herd's marker check; the guest exits by design). |
 | | CMOS dump on Pop before any test | |
 | | task 01 | |
 | | `reboot-test` | |
