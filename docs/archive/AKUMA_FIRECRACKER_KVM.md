@@ -96,3 +96,14 @@ The shape of the problem is now concrete: **Firecracker wants an in-kernel PIC+I
 a per-vCPU run page with `KVM_RUN` exits for port I/O and MMIO**, while Akuma's hypervisor has no IOAPIC, a
 PIC/PIT/LAPIC that are fully in-kernel, RAM from a reserved 2 MiB-aligned block, and a one-VM node. Stub
 and census scripts: `amd64/src/kvm/api.rs`, `scripts/kvm/fc_census.sh`.
+
+Added after the first census: `SET_REGS`/`SET_SREGS` show a **PVH** entry (`rip=0x201000`, `rbx=0x6000`,
+`CR0=0x11`, flat 32-bit segments, GDT at 0x500), i.e. the same entry state the hypervisor already builds.
+
+## Phase 2: design (2026-10-23)
+
+Written up in [`proposals/KVM_ABI_SHIM.md`](../../proposals/KVM_ABI_SHIM.md): the census mapped onto what
+the hypervisor models, the five hard parts sized (guest RAM from the VMM's own memory; `KVM_RUN` in syscall
+context; ioeventfd/irqfd; IOAPIC; naming) with options and a recommendation (a new `/dev/kvm` node, a new
+run loop reusing the pure models, kvm0 untouched, ~4-6 k lines, five slices). **Waiting for the owner's
+approval of the three questions at its end before any Phase 3 code.**

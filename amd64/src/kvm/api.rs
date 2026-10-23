@@ -123,7 +123,7 @@ pub fn ioctl(fd: u64, req: u32, arg: u64) -> u64 {
     let pre = size > 0 && req >> 30 & 1 != 0;
     if pre {
         serial::puts("[kvmapi]   in: ");
-        dump(arg, var_len(arg, req).unwrap_or(size.min(96)));
+        dump(arg, var_len(arg, req).unwrap_or(size.min(288)));
     }
     let r = answer(req, arg);
     serial::puts("[kvmapi] #");
@@ -152,7 +152,7 @@ pub fn ioctl(fd: u64, req: u32, arg: u64) -> u64 {
     serial::puts("\n");
     if size > 0 && req >> 30 & 2 != 0 {
         serial::puts("[kvmapi]   out: ");
-        dump(arg, var_len(arg, req).unwrap_or(size.min(96)));
+        dump(arg, var_len(arg, req).unwrap_or(size.min(288)));
     }
     r
 }
