@@ -58,3 +58,14 @@ between attempts). **Not verified under TCG**: the two-vCPU multi-core rehearsal
 relay never gets a SYN-ACK there (one vCPU on a dedicated core and two vCPUs on one core both pass); the metal runs
 above are the gate. Also measured: wifi ping latency to the ryzen was 1-2 s that evening with the *original*
 kernel too, so slow ssh that night is the link, not this work.
+
+## BKL out of exit handling (2026-10-23)
+
+A service guest's `serve` loop now runs inside one dropped-BKL window (`Unlocked` in `machine.rs`), so two
+vCPU groups' exits contend on the device lock only. The BKL is still taken, in the order device lock -> BKL, for
+`HostDisk` I/O other than a RAM copy and for `ctl::should_stop`'s foreign-pid lookup; `yield_now` takes it for
+its own switch. The relay's `socket_*` calls and the NIC window run without it (same argument as the netpoll
+daemon's BKL-free drain). Verified under TCG with one vCPU: `serve_rehearse.py --stress 3 --bulk 2048` and
+`--bulk 1024` PASS, no `[BKL] stuck`. **Not yet measured on the metal**: the expected effect is the two-core
+relay bulk rate rising from 8-11 MB/s towards the single-vCPU 14-17 MB/s; run `relay_profile.py` on `vm-serve-mc`.
+Not verified under multi-core TCG (the open hang above is unchanged).

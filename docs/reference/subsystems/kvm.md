@@ -215,8 +215,10 @@ adds one for a single driver. It is opened by the kernel's own `openat` arm like
   are **reserved**: the picker hands them only tasks pinned to them (`sched::reserve_cores`). With `kvmcores=` given, the whole set is reserved **from boot** (less core 0), so the host schedules nothing there even with no VM running; a core is **not even started** by the host when `smp=` cuts it off: `smp::ensure_started` wakes it (and every deferred core below it, so the online set stays contiguous) the first time a VM is placed on it, with the same AP path and TSC-based delays; until then the firmware's wait-for-startup state is all it has seen (`smp=6 kvmcores=4-7 vm_cores=4,7` on the ryzen starts cores 6 and 7 only when the VM does). A started core stays up and reserved; there is no unplug. Shared state is guest RAM
   and the NPT (read-only once built), the devices behind one lock, and a state word + `poke` flag per processor; a
   cross-core IPI, INIT, STARTUP, or a disk interrupt for processor 0 sets the flag and sends the wake IPI
-  (`smp::kick_core`). Exits are still handled under the BKL, so groups serialise there; never hold the device lock
-  across `yield_now`, `VMRUN` or a sleep. **Pick cores that are not SMT siblings**: on the ryzen 2,3 gave two guest
+  (`smp::kick_core`). A service guest's exits are handled **without the BKL** (the whole of `serve` is one dropped-BKL window), so groups
+  contend on the device lock alone; the BKL is taken only for a host-backed disk (`HostDisk::bkl`), the lease check's
+  foreign-pid lookup and `yield_now`'s switch, always *after* the device lock, never before it. Rehearsal guests keep the
+  old BKL-held shape. Never hold the device lock across `yield_now`, `VMRUN` or a sleep. **Pick cores that are not SMT siblings**: on the ryzen 2,3 gave two guest
   loops 63% each, 2,4 gave 98% (`docs/archive/KVM_CPU_ACCOUNTING.md`). A `[KVM] cpu:` line per task shows where
   each core's time goes.
 

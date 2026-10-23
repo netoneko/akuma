@@ -668,8 +668,19 @@ impl HostDisk {
     }
 }
 
+impl HostDisk {
+    /// The host's filesystem and block drivers still expect the big kernel lock; a service guest
+    /// handles its exits without it (`machine.rs`), so every access except a RAM copy takes it
+    /// for the duration. The device lock is held by the caller: the order is device lock, then
+    /// BKL, never the reverse. A no-op for a caller that holds the BKL already.
+    fn bkl(&self) -> Option<akuma_bkl::bkl::DroppedWindowPause> {
+        (!matches!(self, Self::Mem { .. })).then(akuma_bkl::bkl::DroppedWindowPause::new)
+    }
+}
+
 impl Disk for HostDisk {
     fn sectors(&self) -> u64 {
+        let _bkl = self.bkl();
         match *self {
             Self::Virtio(i) => akuma_virtio::block::with_device_at(i, |d| d.capacity_sectors()).unwrap_or(0),
             Self::File(path) => akuma_vfs_glue::file_size(path.as_str()).map_or(0, |n| n / virtio::SECTOR),
@@ -678,6 +689,7 @@ impl Disk for HostDisk {
     }
 
     fn read(&mut self, offset: u64, dst: &mut [u8]) -> bool {
+        let _bkl = self.bkl();
         match *self {
             Self::Virtio(i) => akuma_virtio::block::read_bytes_at(i, offset, dst).is_ok(),
             Self::File(path) => akuma_vfs_glue::read_at(path.as_str(), offset as usize, dst).is_ok_and(|n| n == dst.len()),
@@ -690,6 +702,7 @@ impl Disk for HostDisk {
     }
 
     fn write(&mut self, offset: u64, src: &[u8]) -> bool {
+        let _bkl = self.bkl();
         match *self {
             Self::Virtio(i) => akuma_virtio::block::write_bytes_at(i, offset, src).is_ok(),
             Self::File(path) => akuma_vfs_glue::write_at(path.as_str(), offset as usize, src).is_ok_and(|n| n == src.len()),
@@ -702,6 +715,7 @@ impl Disk for HostDisk {
     }
 
     fn flush(&mut self) -> bool {
+        let _bkl = self.bkl();
         match self {
             Self::Nvme { .. } => crate::nvme::flush().is_ok(),
             _ => true,

@@ -417,6 +417,9 @@ pub(super) fn should_stop() -> bool {
     }
     LEASE_CHECKED_US.store(now, Ordering::Relaxed);
     let owner = irq_off(|| SLOT.lock().owner);
+    // A foreign-pid lookup belongs on the BKL slow path (`lookup_process_shared`'s own warning),
+    // and a service guest's tasks run BKL-free: take it for this one check, every `LEASE_CHECK_US`.
+    let _bkl = akuma_bkl::bkl::DroppedWindowPause::new();
     owner != 0 && akuma_exec::process::lookup_process_shared(owner).is_none()
 }
 

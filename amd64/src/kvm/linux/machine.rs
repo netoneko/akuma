@@ -21,14 +21,18 @@
 //! is the **owner** (the relay and the NIC's receive side are polled from there) and runs in the
 //! task that created the machine.
 //!
-//! **What serialises the groups.** An exit is handled with the device lock held, and an exit is
-//! handled with the big kernel lock held (the window around `VMRUN` is the only place it is
-//! dropped), so two groups never emulate at once and the device lock never contends today. It is
-//! there because the borrow checker needs *a* lock for state shared between tasks, and so that
-//! taking the BKL out of exit handling later (the NIC and the relay already run BKL-free
-//! elsewhere) is a change to one line and not to this design. **Never hold the device lock
-//! across `yield_now`, `VMRUN` or a sleep**: the BKL is released at exactly those points and
-//! another group would take the lock while its owner is parked.
+//! **What serialises the groups.** An exit is handled with the device lock held and, for a
+//! service guest, **without the big kernel lock**: the whole of [`serve`] runs inside one
+//! dropped-BKL window ([`Unlocked`]), so two groups' exits contend on the device lock alone and
+//! the BKL is taken only where host state that still depends on it is touched - a disk image on
+//! the host's filesystem or block devices (`HostDisk`), the lease check's foreign-pid lookup
+//! (`ctl::should_stop`), and `yield_now`'s own switch. The relay's `socket_*` calls and the NIC
+//! window need nothing: the socket table and `NETWORK` sit behind their own locks (the netpoll
+//! daemon drains them BKL-free for the same reason). The lock order is **device lock, then BKL**
+//! and never the reverse, so a disk read under the device lock may wait for the BKL but nobody
+//! holding the BKL ever waits for the device lock. Rehearsal guests (`service` false) keep the
+//! old shape: BKL held, released only around `VMRUN`. **Never hold the device lock across
+//! `yield_now`, `VMRUN` or a sleep**: another group would take the lock while its owner is parked.
 //!
 //! **Cross-processor signals** are state words and a kick, in that order: the sender changes
 //! the target's atomics (`state`, `sipi`, `init`, a local APIC's pending bits under the device
@@ -235,11 +239,29 @@ impl Shared {
     }
 }
 
-/// The device lock, taken without ever waiting **while holding the big kernel lock**. Every task
-/// handles its exits under the BKL, so a task spinning here on a lock whose holder needs the BKL
-/// back (after a `yield_now` inside the relay or a network call) would hold the BKL against the
-/// one task that can release this lock: a two-party deadlock. Dropping the BKL between attempts
-/// lets the holder finish.
+/// A dropped-BKL window for as long as the value lives: a service guest's tasks handle their
+/// exits with the big kernel lock released (see the module comment). Nests with the window
+/// around `VMRUN`, whose close then leaves the lock released.
+struct Unlocked;
+
+impl Unlocked {
+    fn new() -> Self {
+        akuma_bkl::bkl::dropped_window_open();
+        Self
+    }
+}
+
+impl Drop for Unlocked {
+    fn drop(&mut self) {
+        akuma_bkl::bkl::dropped_window_close();
+    }
+}
+
+/// The device lock, taken without ever waiting **while holding the big kernel lock**. A rehearsal
+/// guest handles its exits under the BKL, so a task spinning here on a lock whose holder needs the
+/// BKL back (after a `yield_now` inside the relay or a network call) would hold the BKL against
+/// the one task that can release this lock: a two-party deadlock. Dropping the BKL between
+/// attempts lets the holder finish. (A no-op for a service guest, which does not hold it.)
 fn lock_dev(sh: &Shared) -> spinning_top::guard::SpinlockGuard<'_, Devices> {
     loop {
         if let Some(g) = sh.dev.try_lock() {
@@ -365,6 +387,8 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
     // IRQs on for the whole run: with V_INTR_MASKING the host IF at VMRUN gates physical
     // interrupts, and a tick must reach the host.
     akuma_cpu::daif::unmask_irq();
+    // A service guest's exits are handled BKL-free; closed when `serve` returns.
+    let _unlocked = service.then(Unlocked::new);
     'run: loop {
         if sh.stop.load(Ordering::Acquire) {
             break 'run;
@@ -597,7 +621,8 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
         // A service guest runs with the BKL released: on a many-core host the network and wifi
         // tasks (and every syscall) wait on it, and a guest entry can last a whole quantum. The
         // window is what the netpoll daemon uses for its own long BKL-free stretches; the host
-        // interrupt that ends an entry leaves the lock released too.
+        // interrupt that ends an entry leaves the lock released too. (Nested in `_unlocked`
+        // above: this close does not take the lock back.)
         if service {
             akuma_bkl::bkl::dropped_window_open();
         }
