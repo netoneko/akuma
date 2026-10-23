@@ -111,6 +111,7 @@ dependencies = [
  "akuma-ieee80211",
  "akuma-isolation",
  "akuma-kacho",
+ "akuma-kvm-abi",
  "akuma-locks-rw",
  "akuma-mmap",
  "akuma-mmu",
@@ -458,6 +459,10 @@ dependencies = [
  "log",
  "spinning_top",
 ]
+
+[[package]]
+name = "akuma-kvm-abi"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-locks-rw"

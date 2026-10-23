@@ -35,6 +35,8 @@ use vcpu::Vcpu;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static SEQ: AtomicU32 = AtomicU32::new(0);
+/// `RUN` calls since the VM was created (the first few are logged: the hot path stays quiet after).
+static RUN_CALLS: AtomicU32 = AtomicU32::new(0);
 
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Release);
@@ -371,6 +373,8 @@ fn create_vm() -> u64 {
         Some(_) => return errno::EBUSY,
         None => {}
     }
+    RUN_CALLS.store(0, Ordering::Relaxed);
+    vcpu::reset_trace();
     irq_off(|| *VM.lock() = Some(Vm::new(current_tgid())));
     let fd = new_handle(Kind::Vm, 0);
     if (fd as i64) < 0 {
@@ -596,6 +600,9 @@ pub fn ioctl(fd: u64, id: u32, req: u32, arg: u64) -> u64 {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     // `RUN` is the hot path: log the first few, then only count (a line per exit would be the cost).
     if req == 0xAE80 && n > RUN_LOG_FIRST + 40 {
+        if RUN_CALLS.fetch_add(1, Ordering::Relaxed) < 8 {
+            serial::puts("[kvmapi] RUN called\n");
+        }
         return match irq_off(|| HANDLES.lock().get(id as usize - 1).copied().flatten()) {
             Some(h) if h.kind == Kind::Vcpu => run_vcpu(h.vcpu),
             _ => errno::EBADF,

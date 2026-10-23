@@ -483,6 +483,7 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
         crate::sched::fpu_restore_live(&host_fpu);
 
         let mut v = Vmcb::new(vc.vmcb.bytes_mut());
+        trace_exit(v.exitcode(), v.rip(), v.exitinfo1(), v.exitinfo2());
         // The INTA cycle: V_IRQ comes back cleared once the guest has dispatched the vector.
         if let Some(o) = offered
             && v.v_intr() & ctrl::V_IRQ == 0
@@ -748,9 +749,69 @@ fn idle(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, ev: &Events) -> Option
             return None;
         }
         let deadline = due.unwrap_or(now + 1_000).min(now + 1_000);
-        let _ = can_wake;
+        idle_note(vc, now, due, can_wake);
         akuma_cpu::daif::mask_irq();
         crate::sched::block_until_deadline(deadline.max(now + 50));
         akuma_cpu::daif::unmask_irq();
     }
+}
+
+static IDLE_TURNS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// A guest idling a long time with nothing due is the signature of a lost interrupt: say what it is waiting on, a
+/// few times (the `kvmapi` census instrument; lines go to the console ring).
+fn idle_note(vc: &mut Vcpu, now: u64, due: Option<u64>, can_wake: bool) {
+    use core::sync::atomic::Ordering;
+    let n = IDLE_TURNS.fetch_add(1, Ordering::Relaxed);
+    if n == 0 || !n.is_multiple_of(4000) || n > 4000 * 6 {
+        return;
+    }
+    let (rip, rflags) = {
+        let v = vc.vmcb();
+        (v.rip(), v.rflags())
+    };
+    let s = crate::serial::puts;
+    s("[kvmapi] vcpu idle turns=");
+    crate::serial::put_dec(u64::from(n));
+    s(" rip=0x");
+    crate::serial::put_hexn(rip, 16);
+    s(" rflags=0x");
+    crate::serial::put_hexn(rflags, 8);
+    s(" due_in_us=");
+    match due {
+        Some(d) => crate::serial::put_dec(d.saturating_sub(now)),
+        None => s("none"),
+    }
+    s(" can_wake=");
+    s(if can_wake { "yes" } else { "no" });
+    s("\n");
+}
+
+static EXITS_TRACED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Forget the exit trace (a new VM): the first exits of each VM are logged.
+pub(super) fn reset_trace() {
+    EXITS_TRACED.store(0, core::sync::atomic::Ordering::Relaxed);
+    IDLE_TURNS.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The first 24 exits of a VM, then one in 8192: code, rip, the two info words (the `kvmapi` census instrument).
+fn trace_exit(code: u64, rip: u64, i1: u64, i2: u64) {
+    use core::sync::atomic::Ordering;
+    let n = EXITS_TRACED.fetch_add(1, Ordering::Relaxed);
+    if n >= 24 && !n.is_multiple_of(8192) {
+        return;
+    }
+    let s = crate::serial::puts;
+    s("[kvmapi] exit #");
+    crate::serial::put_dec(u64::from(n));
+    s(" code=0x");
+    crate::serial::put_hexn(code, 4);
+    s(" rip=0x");
+    crate::serial::put_hexn(rip, 16);
+    s(" i1=0x");
+    crate::serial::put_hexn(i1, 8);
+    s(" i2=0x");
+    crate::serial::put_hexn(i2, 8);
+    s("\n");
 }
