@@ -1050,6 +1050,14 @@ extern "C" fn syscall_handler(
         serial::put_dec(nr);
         serial::puts(" a1=0x");
         serial::put_hex(a1);
+        // The other two arguments and the time: `poll`'s timeout and how long a call really took are
+        // what a "hangs after a UDP reply" trace needs (`UDP_REPLY_WAIT_TIMER_STORM.md`).
+        serial::puts(" a2=0x");
+        serial::put_hex(a2);
+        serial::puts(" a3=0x");
+        serial::put_hex(a3);
+        serial::puts(" t=");
+        serial::put_dec(crate::net::uptime_us());
         match nr {
             // `clone`'s flag word and `futex`'s op decide everything about the
             // call and neither is legible as a hex blob. Added 2026-09-06 after
@@ -1126,6 +1134,8 @@ extern "C" fn syscall_handler(
         serial::put_dec(nr);
         serial::puts(" -> 0x");
         serial::put_hex(r);
+        serial::puts(" t=");
+        serial::put_dec(crate::net::uptime_us());
         serial::puts("\n");
     }
     let uctx = crate::smp::current_uctx();
