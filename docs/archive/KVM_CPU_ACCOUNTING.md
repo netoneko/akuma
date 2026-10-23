@@ -47,3 +47,14 @@ two-vCPU Akuma guest, CPU-bound shell loops:
 
 `relay_stress.py` passes (3 rounds) on both guests; bulk through the relay with two dedicated vCPU
 cores is 11.2-11.5 MB/s (7.5 time-sliced, 14-17 for one vCPU: exit handling is serialised under the BKL).
+
+## Reserved cores and on-demand cores (same day, later)
+
+`kvmcores=4-7` reserves its whole set from boot (a stress run of 8 host busy loops stayed on cores 0 and 2). With
+`smp=6` the host never starts cores 6 and 7; `smp::ensure_started` starts them when a VM is placed there
+(metal: `vm_cores = 4,7`, stress passes, bulk 8-11 MB/s). A found-and-fixed deadlock on the way: a task spinning
+on the device lock while holding the BKL, against a holder that needs the BKL back (`lock_dev` now drops the BKL
+between attempts). **Not verified under TCG**: the two-vCPU multi-core rehearsal boots the guest to sshd but the
+relay never gets a SYN-ACK there (one vCPU on a dedicated core and two vCPUs on one core both pass); the metal runs
+above are the gate. Also measured: wifi ping latency to the ryzen was 1-2 s that evening with the *original*
+kernel too, so slow ssh that night is the link, not this work.
