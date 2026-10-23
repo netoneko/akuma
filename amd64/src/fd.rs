@@ -610,6 +610,16 @@ pub fn is_dev_kvm(fd: u64) -> bool {
     table_with(fd, |d| matches!(d, FileDescriptor::DevKvm(0))).unwrap_or(false)
 }
 
+/// The eventfd id behind descriptor `fd` of the calling process, if it is an eventfd.
+#[must_use]
+pub fn eventfd_id_of(fd: u64) -> Option<u32> {
+    table_with(fd, |d| match d {
+        FileDescriptor::EventFd(id) => Some(*id),
+        _ => None,
+    })
+    .flatten()
+}
+
 /// The handle id of a `/dev/kvm` (KVM-ioctl node) descriptor; `None` for anything else, `/dev/kvm0` included.
 #[must_use]
 pub fn dev_kvm_api_id(fd: u64) -> Option<u32> {

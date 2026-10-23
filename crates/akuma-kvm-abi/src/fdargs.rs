@@ -33,6 +33,8 @@ pub struct Ioeventfd {
 }
 
 pub const IOEVENTFD_DATAMATCH: u32 = 1;
+/// Flag bit 2: remove a registration (the bits after datamatch are port-I/O and deassign).
+pub const IOEVENTFD_DEASSIGN: u32 = 4;
 
 impl Ioeventfd {
     #[must_use]

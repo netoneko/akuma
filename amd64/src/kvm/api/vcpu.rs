@@ -4,6 +4,7 @@
 //! and every other port and MMIO access returned to the VMM through the run page
 //! ([`akuma_kvm_abi::runpage`]) and completed at the next `RUN`.
 
+use akuma_kvm_abi::fdargs::{Ioeventfd, Irqfd};
 use akuma_kvm_abi::runpage::{self, Exit};
 use akuma_kvm_abi::slots::Table;
 use akuma_kvm_abi::state::{
@@ -23,6 +24,59 @@ use crate::sched::FxArea;
 pub(super) const MAX_CPUID: usize = 96;
 /// The run mapping is two pages: the structure, then room for the coalesced-MMIO ring.
 pub(super) const RUN_PAGES: usize = 2;
+
+/// The VMM's eventfd registrations, copied at the start of a `RUN` (so the exit loop holds no VM lock).
+#[derive(Clone, Copy)]
+pub(super) struct Events {
+    io: [Option<(Ioeventfd, u32)>; super::MAX_IOEVENTFDS],
+    irq: [Option<(Irqfd, u32)>; super::MAX_IRQFDS],
+}
+
+impl Events {
+    pub(super) fn snapshot(
+        io: &[Option<(Ioeventfd, u32)>; super::MAX_IOEVENTFDS],
+        irq: &[Option<(Irqfd, u32)>; super::MAX_IRQFDS],
+    ) -> Self {
+        Self { io: *io, irq: *irq }
+    }
+
+    /// Does a store of `size` bytes of `val` to `addr` ring a registered doorbell? If so, signal it.
+    fn doorbell(&self, addr: u64, size: u8, val: u64) -> bool {
+        let Some((_, id)) = self.io.iter().flatten().find(|(e, _)| e.matches(addr, u32::from(size), val)) else {
+            return false;
+        };
+        let _ = akuma_syscalls_glue::eventfd::eventfd_write(*id, 1);
+        note("doorbell", addr, DOORBELLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
+        true
+    }
+
+    /// Raise the legacy line of every interrupt eventfd that was signalled. gsi `n` < 16 is PIC pin `n`
+    /// (the default routing; there is no I/O APIC yet).
+    fn poll_irqs(&self, plat: &Spinlock<Option<Platform>>) {
+        for (irqfd, id) in self.irq.iter().flatten() {
+            if akuma_syscalls_glue::eventfd::eventfd_read(*id).is_ok() && irqfd.gsi < 16 {
+                note("irqfd gsi", u64::from(irqfd.gsi), IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
+                with_plat(plat, |p| p.raise_irq(irqfd.gsi as u8));
+            }
+        }
+    }
+}
+
+static DOORBELLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static IRQS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Log the first few of an event kind (the `kvmapi` census instrument).
+fn note(what: &str, v: u64, n: u32) {
+    if n < 12 {
+        crate::serial::puts("[kvmapi] ");
+        crate::serial::puts(what);
+        crate::serial::puts(" 0x");
+        crate::serial::put_hexn(v, 8);
+        crate::serial::puts(" #");
+        crate::serial::put_dec(u64::from(n));
+        crate::serial::puts("\n");
+    }
+}
 
 /// What the VMM owes the guest from the exit that returned to it.
 #[derive(Clone, Copy)]
@@ -300,7 +354,7 @@ fn signal_pending() -> bool {
 const QUANTUM_US: u64 = 5_000;
 
 /// `KVM_RUN`. 0 when the VMM has something to do (the run page says what), `EINTR` for a signal.
-pub(super) fn run(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64) -> u64 {
+pub(super) fn run(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64, ev: &Events) -> u64 {
     // The core must have SVM on and the thread must stay on it.
     let mut me = crate::smp::cpu_index();
     for _ in 0..3 {
@@ -319,10 +373,9 @@ pub(super) fn run(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Tabl
     if runpage::immediate_exit(vc.run[0].bytes_mut()) {
         return errno::EINTR;
     }
-    let _unlocked = Unlocked::new();
     let saved_flags = akuma_cpu::daif::read();
     akuma_cpu::daif::unmask_irq();
-    let r = run_inner(vc, plat, slots, npt_pa, me);
+    let r = run_inner(vc, plat, slots, npt_pa, ev, me);
     akuma_cpu::daif::restore(saved_flags);
     r
 }
@@ -331,7 +384,7 @@ fn io_ticks() -> u64 {
     svm::pit::ticks_from_us(crate::net::uptime_us())
 }
 
-fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64, _core: usize) -> u64 {
+fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64, ev: &Events, _core: usize) -> u64 {
     let mem = SlotMem(slots);
     let id = vc.id;
     let nrips = true;
@@ -348,6 +401,12 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
         if signal_pending() {
             return errno::EINTR;
         }
+        // Other host threads (the VMM's own device thread, the network) get the core between entries:
+        // the kernel switches cooperatively, and the switch expects interrupts masked.
+        akuma_cpu::daif::mask_irq();
+        crate::sched::yield_now();
+        akuma_cpu::daif::unmask_irq();
+        ev.poll_irqs(plat);
         let now = crate::net::uptime_us();
         // Offer the best vector (bringing the PIT and the APIC timer up to now), and find when the next
         // timer will want a host interrupt.
@@ -378,7 +437,9 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
         crate::sched::fpu_restore_live(&vc.fpu);
         // SAFETY: the VMCB and host-save frames are live and owned by `vc`; SVM is enabled on this core
         // (`enable_on_core`) and the thread is pinned to it.
+        let unlocked = Unlocked::new();
         unsafe { vmrun_regs(vmcb_pa, host_pa, &mut vc.regs) };
+        drop(unlocked);
         crate::sched::fpu_save_live(&mut vc.fpu);
         host_fpu.sanitize();
         crate::sched::fpu_restore_live(&host_fpu);
@@ -459,7 +520,7 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
                 }
                 let next = next_rip(&v, nrips, 1);
                 v.complete_instruction(next);
-                if let Some(r) = idle(vc, plat) {
+                if let Some(r) = idle(vc, plat, ev) {
                     return r;
                 }
             }
@@ -497,8 +558,8 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
                         let mut dev = LapicDev { lapic: p.lapic(id), off, now };
                         emulate(&a, &mut dev, &mut v, &mut vc.regs);
                     });
-                } else {
-                    return mmio_exit(vc, gpa, a);
+                } else if let Some(r) = mmio_exit(vc, ev, gpa, a) {
+                    return r;
                 }
             }
             ExitCode::Shutdown => {
@@ -525,7 +586,7 @@ fn internal_error(vc: &mut Vcpu, suberror: u32) -> u64 {
 }
 
 /// A load/store/compare outside the in-kernel devices: tell the VMM, finish stores now, loads on re-entry.
-fn mmio_exit(vc: &mut Vcpu, gpa: u64, a: mmio::Access) -> u64 {
+fn mmio_exit(vc: &mut Vcpu, ev: &Events, gpa: u64, a: mmio::Access) -> Option<u64> {
     let (is_write, val) = {
         let regs = vc.regs;
         let v = vc.vmcb();
@@ -535,6 +596,12 @@ fn mmio_exit(vc: &mut Vcpu, gpa: u64, a: mmio::Access) -> u64 {
             _ => (false, 0),
         }
     };
+    if is_write && ev.doorbell(gpa, a.size, val) {
+        // A registered doorbell: signal the eventfd and carry on, no trip to the VMM.
+        let mut v = vc.vmcb();
+        v.complete_instruction(v.rip() + u64::from(a.len));
+        return None;
+    }
     runpage::set_mmio(vc.page(), gpa, a.size, is_write, val);
     if is_write {
         let mut v = vc.vmcb();
@@ -542,7 +609,7 @@ fn mmio_exit(vc: &mut Vcpu, gpa: u64, a: mmio::Access) -> u64 {
     } else {
         vc.pending = Pending::Mmio(a);
     }
-    0
+    Some(0)
 }
 
 /// Apply what the VMM left in the run page for the last exit.
@@ -627,12 +694,13 @@ fn emulate(a: &mmio::Access, dev: &mut dyn MmioDev, v: &mut Vmcb<'_>, regs: &mut
 
 /// `HLT` with `IF` set: sleep until the guest has something to be offered, a signal arrives, or a
 /// host deadline passes. `Some(errno)` ends the `RUN`.
-fn idle(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>) -> Option<u64> {
+fn idle(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, ev: &Events) -> Option<u64> {
     let id = vc.id;
     loop {
         if signal_pending() {
             return Some(errno::EINTR);
         }
+        ev.poll_irqs(plat);
         let now = crate::net::uptime_us();
         let (offer, due, can_wake): (Option<Offer>, Option<u64>, bool) =
             with_plat(plat, |p| (p.offer(id, now), p.next_event_us(id), p.can_wake(id)));

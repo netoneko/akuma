@@ -31,7 +31,7 @@ pub fn eventfd_create(initval: u32, flags: u32) -> u32 {
     id
 }
 
-pub(super) fn eventfd_read(id: u32) -> Result<u64, i32> {
+pub fn eventfd_read(id: u32) -> Result<u64, i32> {
     akuma_primitives::irq::with_irqs_disabled(|| {
         let mut table = EVENTFDS.lock();
         if let Some(efd) = table.get_mut(&id) {

@@ -19,7 +19,7 @@ mod platform;
 mod vcpu;
 
 use akuma_exec_core::process::FileDescriptor;
-use akuma_kvm_abi::fdargs::{IOEVENTFD_LEN, IRQFD_LEN, Ioeventfd, Irqfd};
+use akuma_kvm_abi::fdargs::{IOEVENTFD_DEASSIGN, IOEVENTFD_LEN, IRQFD_LEN, Ioeventfd, Irqfd};
 use akuma_kvm_abi::req::{self, Kind, Op};
 use akuma_kvm_abi::slots::{self, MAX_SLOTS, Region, Table};
 use akuma_kvm_abi::state::{CPUID_ENTRY_LEN, CpuidEntry, LIST_HDR};
@@ -52,9 +52,10 @@ pub fn enabled() -> bool {
 // ---------------------------------------------------------------------------
 
 const MAX_HANDLES: usize = 32;
+const RUN_LOG_FIRST: u32 = 0;
 const MAX_VCPUS: usize = 4;
-const MAX_IRQFDS: usize = 16;
-const MAX_IOEVENTFDS: usize = 32;
+pub(super) const MAX_IRQFDS: usize = 16;
+pub(super) const MAX_IOEVENTFDS: usize = 32;
 /// The size of the vCPU's run page the VMM maps (two 4 KiB pages).
 const RUN_MAP_SIZE: u64 = 0x2000;
 /// Capabilities the VMM asked about; all of them answered "yes" (1). Anything else is 0.
@@ -84,8 +85,9 @@ struct Vm {
     /// Host-physical addresses of each vCPU's run frames, for `mmap`.
     run_pas: [[usize; vcpu::RUN_PAGES]; MAX_VCPUS],
     npt: Option<Npt>,
-    irqfds: [Option<Irqfd>; MAX_IRQFDS],
-    ioeventfds: [Option<Ioeventfd>; MAX_IOEVENTFDS],
+    /// Each with the kernel id of its eventfd (a reference is held until the VM is destroyed).
+    irqfds: [Option<(Irqfd, u32)>; MAX_IRQFDS],
+    ioeventfds: [Option<(Ioeventfd, u32)>; MAX_IOEVENTFDS],
 }
 
 impl Vm {
@@ -152,10 +154,16 @@ pub fn vm_live() -> bool {
 /// slices must not outlive this: it is only called when the owner is gone (or at `CREATE_VM`
 /// finding a dead owner).
 fn destroy_vm() {
-    let carved = irq_off(|| VM.lock().take().map(|v| v.carved));
-    if let Some(carved) = carved {
-        for off in carved.into_iter().flatten() {
+    let taken = irq_off(|| VM.lock().take());
+    if let Some(vm) = taken {
+        for off in vm.carved.into_iter().flatten() {
             super::ctl::uncarve(off);
+        }
+        for (_, id) in vm.irqfds.into_iter().flatten() {
+            akuma_syscalls_glue::eventfd::eventfd_close(id);
+        }
+        for (_, id) in vm.ioeventfds.into_iter().flatten() {
+            akuma_syscalls_glue::eventfd::eventfd_close(id);
         }
     }
     irq_off(|| *PLAT.lock() = None);
@@ -404,9 +412,10 @@ fn run_vcpu(id: u8) -> u64 {
             v.npt = build_npt(&v.slots);
         }
         let npt_pa = v.npt.as_ref()?.pml4.pa() as u64;
-        Some((v.vcpus[id as usize].take()?, v.slots, npt_pa))
+        let events = vcpu::Events::snapshot(&v.ioeventfds, &v.irqfds);
+        Some((v.vcpus[id as usize].take()?, v.slots, npt_pa, events))
     });
-    let Some((mut vc, slots, npt_pa)) = taken else { return errno::EBUSY };
+    let Some((mut vc, slots, npt_pa, events)) = taken else { return errno::EBUSY };
     if irq_off(|| PLAT.lock().is_none()) {
         irq_off(|| {
             if let Some(v) = VM.lock().as_mut() {
@@ -415,7 +424,7 @@ fn run_vcpu(id: u8) -> u64 {
         });
         return errno::EINVAL;
     }
-    let r = vcpu::run(&mut vc, &PLAT, &slots, npt_pa);
+    let r = vcpu::run(&mut vc, &PLAT, &slots, npt_pa, &events);
     irq_off(|| {
         if let Some(v) = VM.lock().as_mut() {
             v.vcpus[id as usize] = Some(vc);
@@ -494,24 +503,32 @@ fn irqfd(arg: u64) -> u64 {
         return errno::EFAULT;
     }
     let Some(a) = Irqfd::parse(&raw) else { return errno::EFAULT };
-    with_vm(|v| {
-        if a.flags & 1 != 0 {
-            // deassign
+    let deassign = a.flags & 1 != 0;
+    let id = crate::fd::eventfd_id_of(u64::from(a.fd));
+    let freed = with_vm(|v| {
+        if deassign {
             for s in &mut v.irqfds {
-                if s.is_some_and(|x| x.fd == a.fd && x.gsi == a.gsi) {
+                if let Some((x, eid)) = *s
+                    && x.fd == a.fd
+                    && x.gsi == a.gsi
+                {
+                    akuma_syscalls_glue::eventfd::eventfd_close(eid);
                     *s = None;
                 }
             }
             return 0;
         }
+        let Some(eid) = id else { return errno::EBADF };
         match v.irqfds.iter_mut().find(|s| s.is_none()) {
             Some(s) => {
-                *s = Some(a);
+                akuma_syscalls_glue::eventfd::eventfd_clone_ref(eid);
+                *s = Some((a, eid));
                 0
             }
             None => errno::ENOMEM,
         }
-    })
+    });
+    freed
 }
 
 fn ioeventfd(arg: u64) -> u64 {
@@ -520,18 +537,42 @@ fn ioeventfd(arg: u64) -> u64 {
         return errno::EFAULT;
     }
     let Some(a) = Ioeventfd::parse(&raw) else { return errno::EFAULT };
-    with_vm(|v| match v.ioeventfds.iter_mut().find(|s| s.is_none()) {
-        Some(s) => {
-            *s = Some(a);
-            0
+    let id = crate::fd::eventfd_id_of(a.fd.cast_unsigned().into());
+    with_vm(|v| {
+        if a.flags & IOEVENTFD_DEASSIGN != 0 {
+            for s in &mut v.ioeventfds {
+                if let Some((x, eid)) = *s
+                    && x.addr == a.addr
+                    && x.fd == a.fd
+                {
+                    akuma_syscalls_glue::eventfd::eventfd_close(eid);
+                    *s = None;
+                }
+            }
+            return 0;
         }
-        None => errno::ENOMEM,
+        let Some(eid) = id else { return errno::EBADF };
+        match v.ioeventfds.iter_mut().find(|s| s.is_none()) {
+            Some(s) => {
+                akuma_syscalls_glue::eventfd::eventfd_clone_ref(eid);
+                *s = Some((a, eid));
+                0
+            }
+            None => errno::ENOMEM,
+        }
     })
 }
 
 /// `ioctl(fd, req, arg)` on a `/dev/kvm` descriptor with handle `id`.
 pub fn ioctl(fd: u64, id: u32, req: u32, arg: u64) -> u64 {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    // `RUN` is the hot path: log the first few, then only count (a line per exit would be the cost).
+    if req == 0xAE80 && n > RUN_LOG_FIRST + 40 {
+        return match irq_off(|| HANDLES.lock().get(id as usize - 1).copied().flatten()) {
+            Some(h) if h.kind == Kind::Vcpu => run_vcpu(h.vcpu),
+            _ => errno::EBADF,
+        };
+    }
     let h = irq_off(|| HANDLES.lock().get(id as usize - 1).copied().flatten());
     let size = ((req >> 16) & 0x3fff) as usize;
     if size > 0 && req >> 30 & 1 != 0 {
