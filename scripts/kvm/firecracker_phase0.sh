@@ -21,10 +21,12 @@ cp "$MUSLDIR/lib/ld-musl-x86_64.so.1" "$T/lib/"; cp "$MUSLDIR/lib/libc.musl-x86_
 cp "$GCCDIR/usr/lib/libgcc_s.so.1" "$T/usr/lib/"; cp "$GCCDIR/usr/lib/libgcc_s.so.1" "$T/lib/"
 cp "$FCDIR/usr/bin/firecracker" "$T/usr/bin/"; chmod 755 "$T/usr/bin/firecracker"
 cp "$KERNEL" "$T/boot/akuma-guest"
+DRIVE_PATH=/boot/akuma-guest; DRIVE_RO=true
+if [ -n "${GUEST_IMG:-}" ]; then cp "$GUEST_IMG" "$T/guest-root.img"; DRIVE_PATH=/guest-root.img; DRIVE_RO=false; fi
 cat > "$T/vm.json" <<J
-{"boot-source":{"kernel_image_path":"/boot/akuma-guest","boot_args":"console=ttyS0"},
+{"boot-source":{"kernel_image_path":"/boot/akuma-guest","boot_args":"${BOOT_ARGS:-console=ttyS0}"},
  "machine-config":{"vcpu_count":1,"mem_size_mib":${MEM_MIB:-768}},
- "drives":[{"drive_id":"rootfs","path_on_host":"/boot/akuma-guest","is_root_device":true,"is_read_only":true}]}
+ "drives":[{"drive_id":"rootfs","path_on_host":"$DRIVE_PATH","is_root_device":true,"is_read_only":$DRIVE_RO}]}
 J
 if [ -n "${P0:-}" ]; then printf '%s\n' "$P0" > "$T/etc/p0.sh"; else cat > "$T/etc/p0.sh" <<'S'
 echo P0-BEGIN
@@ -35,7 +37,7 @@ echo "run rc=$?"
 echo P0-END
 S
 fi
-"$E2/mke2fs" -q -t ext2 -d "$T" -L p0 /tmp/p0root.$$.img 64M 2>/dev/null || "$E2/mke2fs" -q -t ext2 -d "$T" /tmp/p0root.$$.img 64M
+"$E2/mke2fs" -q -t ext2 -d "$T" -L p0 /tmp/p0root.$$.img ${ROOT_MB:-64}M 2>/dev/null || "$E2/mke2fs" -q -t ext2 -d "$T" /tmp/p0root.$$.img ${ROOT_MB:-64}M
 IMG=/tmp/p0root.$$.img
 CL="virtio_mmio.device=512@0xfeb00000:5 init=/bin/busybox initargs=sh,/etc/p0.sh strace_err ${KCMDLINE:-}"
 timeout "$SECS" qemu-system-x86_64 -M microvm -cpu EPYC-Milan,svm=on -global virtio-mmio.force-legacy=false \

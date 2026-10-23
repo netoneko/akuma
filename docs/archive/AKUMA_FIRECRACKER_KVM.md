@@ -246,3 +246,61 @@ the unmodified Firecracker walks the same 40 ioctls as the census to `KVM_RUN` w
 slice and through the VMM's own mapping (`SAME`, nonzero); three consecutive runs each carve, run and reap their
 slice with no corruption. Not yet: vCPU state (cpuid/msrs/regs/sregs/fpu/lapic are accepted and ignored),
 the run loop, and any real exit.
+
+### Slices 1b-3 (2026-10-23): vCPU state, `KVM_RUN`, interrupts — the Akuma kernel boots under Firecracker
+
+**Result (TCG rehearsal, `scripts/kvm/fc_census.sh` with `GUEST_IMG=<akuma_guest_rootfs.sh image>`):** the unmodified
+Alpine `firecracker --no-api --no-seccomp --config-file vm.json`, with the Akuma kernel as the guest (PVH ELF, 768 MiB,
+one vCPU, a Firecracker-served virtio-blk root), boots to its busybox init. The console shows the guest's banner
+through **Firecracker's emulated 16550**, then the guest mounts ext2 on `/dev/vda`, prints `AKUMA-GUEST-UP`, the md5
+of `/bin/busybox` read through virtio (equal to the host's `md5` of the same file), writes and re-reads a 256 KiB
+file (`/wtest`, md5 printed) and prints `AKUMA-GUEST-DONE`; it ends in `cli; hlt`, which this node reports as
+`KVM_EXIT_HLT` and Firecracker logs as "Unexpected exit reason on vcpu run: Hlt" (a real KVM would block).
+
+What was built, in the order it was needed:
+
+* `crates/akuma-kvm-abi` (pure, `forbid(unsafe)`, 12 host tests): request decode per descriptor kind, `Regs`/`Sregs`/
+  `CpuidEntry`/`MsrEntry`/FPU layouts (test vectors are the census dumps), the memslot `Table`, `Irqfd`/`Ioeventfd`,
+  and `runpage` (below).
+* `amd64/src/kvm/api.rs`: `FileDescriptor::DevKvm(id)` handles (system / VM / vCPU), one static `Vm`, reaping by dead
+  owner, `GET_SUPPORTED_CPUID` from the host CPUID through `cpuid::filter`, memslots on a reserved slice
+  (`mm::remap_user_to_phys`), a 2 MiB-leaf NPT built at the first `RUN`, `mmap` of a vCPU fd as its two run
+  frames (`mm::mmap_frames`: borrowed frames, one physical page behind every mapping), IRQFD/IOEVENTFD resolved to the
+  kernel's eventfd ids (a reference held until the VM dies).
+* `amd64/src/kvm/api/vcpu.rs`: per-vCPU VMCB, host-save frame, GPR file, CPUID table (the VMM's own, 96 entries),
+  guest FPU image, and `run`: the world switch **in the VMM thread's syscall** (thread pinned to its core, SVM
+  enabled on demand, host FPU saved/restored around `VMRUN`, BKL released only around `VMRUN`, a `yield_now` between
+  entries so the VMM's device thread can run, signal check -> `EINTR`). Exits: CPUID from the VMM's table; MSRs;
+  PIT/PIC ports in the kernel; every other port, and every MMIO outside the LAPIC page, goes to the VMM through the
+  run page and is completed at the next `RUN` (an `IN` or MMIO load finishes when the VMM has filled the data; a
+  store finishes at once); registered doorbells signal their eventfd and never leave the kernel; irqfds are polled at
+  every entry and every idle wake and raise the PIC pin `gsi` (< 16).
+* `amd64/src/kvm/api/platform.rs`: PIT, PIC pair, LAPICs, MSR policy (the `kvm0` arithmetic, minus the 16550 and
+  keyboard controller the VMM emulates itself).
+
+**The run-page layout is a hypothesis that Firecracker confirmed by behaviour.** The census cannot show it (only the VMM
+reads the page), so it was written from general knowledge of the interface (`exit_reason` at byte 8; the I/O record
+`{direction, size, port, count, data_offset}` and the MMIO record `{phys_addr, data[8], len, is_write}` at byte 32),
+then tested: a guest `out` to 0x3f8 reaching Firecracker's serial output proves the I/O record, the guest's virtio-blk
+driver reading Firecracker's device registers proves the MMIO load/store records and their completion, and a
+`doorbell` signalled from the kernel waking Firecracker's device thread proves the eventfd path. Likewise the
+`IOEVENTFD` flag bits (datamatch = bit 0, deassign = bit 2) and the `SET_FPU` layout (its 416 bytes add up) are
+unconfirmed beyond what this run exercised.
+
+**Bugs found on the way** (each one a silent wedge or wrong answer, none in the pure crate):
+
+1. `destroy_vm` cleared the whole handle table, including the *new* process's system handle (second run: `EBADF`).
+   Handles are now reaped by dead owner only.
+2. A `/dev/kvm0` create after a Firecracker VM was `EBUSY` until another `CREATE_VM` reaped the dead VM: `vm_live()`
+   now reaps a dead owner itself.
+3. `KVM_RUN` never yielded: on one core the woken Firecracker device thread never ran (doorbell fired, nothing
+   answered, guest waited forever). `yield_now` between entries (with IRQs masked for the switch, as `kvm0` does).
+4. The first design held the BKL released for the whole run; the eventfd wake path needs it. The window is now only
+   around `VMRUN`.
+5. Two overlapping rig runs corrupted a log by editing the script under a running shell (rig lesson, not a kernel bug).
+
+**Not done / open:** the I/O APIC (the guest's ACPI lists one at 0xfec00000; the Akuma guest uses the PIC), `GET/SET_LAPIC`
+are accepted and ignored (Firecracker's `SET_LAPIC` LINT setup is therefore not applied: the Akuma guest does not need it),
+one vCPU only has been run, no `SET_GSI_ROUTING`, `KVM_RUN` kicks by `tkill` signal are untested, string port I/O is an
+`INTERNAL_ERROR`, HLT with `IF=0` is reported as an exit, `--no-seccomp` is required, **and nothing here has run on the
+ryzen metal yet**. The guest RAM remap loses a VMM that forks after `CREATE_VM` (logged nowhere yet).

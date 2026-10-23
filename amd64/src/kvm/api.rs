@@ -139,6 +139,21 @@ fn irq_off<T>(f: impl FnOnce() -> T) -> T {
     akuma_primitives::irq::with_irqs_disabled(f)
 }
 
+/// A process is forking: if it owns the API VM, say so on the console. The guest's RAM is the VMM's memory
+/// remapped onto the reserved slice, and a fork would CoW-share frames the guest writes through, so the
+/// child and the guest would diverge. Not prevented (the VMM does not fork after `CREATE_VM`), only visible.
+pub fn note_fork() {
+    if !enabled() {
+        return;
+    }
+    let tgid = current_tgid();
+    if irq_off(|| VM.lock().as_ref().is_some_and(|v| v.owner == tgid)) {
+        serial::puts("[kvmapi] WARNING: pid ");
+        serial::put_dec(u64::from(tgid));
+        serial::puts(" forked while it owns a /dev/kvm VM: the child's view of guest RAM is not the guest's\n");
+    }
+}
+
 /// Is an API VM alive (so a `/dev/kvm0` VM must wait)?
 #[must_use]
 pub fn vm_live() -> bool {

@@ -5438,6 +5438,7 @@ fn sys_fork() -> u64 {
     // The parent-slot bound this used to check (`>= PROC_SLOTS`) is gone with
     // the hand-rolled slot search; `current_process()` inside `fork_process` is
     // the same question asked of the authoritative table.
+    crate::kvm::api::note_fork();
     let child_pid = alloc_pid();
     match akuma_exec::process::fork_process(child_pid, 0) {
         Ok(pid) => u64::from(pid),

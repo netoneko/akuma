@@ -101,7 +101,8 @@ fn dec(v: u64) {
 /// MSR `#GP`s.
 pub fn init(cmdline: &str) {
     let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
-    api::set_enabled(flag("kvmapi"));
+    // `/dev/kvm` (the KVM-ioctl node) comes with the hypervisor: `kvmctl` arms it, `kvmapi` alone (rehearsal) too.
+    api::set_enabled(flag("kvmapi") || flag("kvmctl"));
     let want_test = flag("kvmtest");
     // `kvmctl`: arm the hypervisor for `/dev/kvm0` and run nothing at boot.
     let want_ctl = flag("kvmctl");
