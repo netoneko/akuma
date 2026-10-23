@@ -29,6 +29,7 @@ pub fn register() {
         // No touchpad on this target either: `/dev/input/mouse0` never exists,
         // so the hook has nothing to say.
         dev_mouse_has_events: || false,
+        dev_tun_has_frame: || false,
     });
 }
 

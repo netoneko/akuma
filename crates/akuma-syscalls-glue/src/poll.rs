@@ -742,6 +742,9 @@ fn epoll_check_fd_readiness_at(fd_num: u32, requested: u32, waker: Option<&Waker
         akuma_exec::process::FileDescriptor::DevMouse => FdState::DevMouse {
             can_read: requested & ep::EPOLLIN != 0 && crate::hooks::dev_mouse_has_events(),
         },
+        akuma_exec::process::FileDescriptor::DevTun => FdState::DevTun {
+            can_read: requested & ep::EPOLLIN != 0 && crate::hooks::dev_tun_has_frame(),
+        },
         _ => FdState::Unmodelled,
     };
 

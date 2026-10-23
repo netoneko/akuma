@@ -630,6 +630,12 @@ pub fn dev_kvm_api_id(fd: u64) -> Option<u32> {
     .flatten()
 }
 
+/// Is `fd` a `/dev/net/tun` descriptor?
+#[must_use]
+pub fn is_dev_tun(fd: u64) -> bool {
+    table_with(fd, |d| matches!(d, FileDescriptor::DevTun)).unwrap_or(false)
+}
+
 /// Is `fd` a `/dev/wifi0` descriptor?
 #[must_use]
 pub fn is_dev_wifi(fd: u64) -> bool {
@@ -708,6 +714,13 @@ pub fn is_nonblocking(fd: u64) -> bool {
 /// [`FIRST_FILE_FD`] — Linux's "lowest available" — which is the same
 /// convergence `openat` made in batch 2d.
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+    // `F_ADD_SEALS` / `F_GET_SEALS` (memfd): accepted and not enforced — Firecracker seals the
+    // ring buffer it maps twice and only checks that the call succeeded. No seal is ever reported.
+    const F_ADD_SEALS: u64 = 1033;
+    const F_GET_SEALS: u64 = 1034;
+    if cmd == F_ADD_SEALS || cmd == F_GET_SEALS {
+        return if table_with(fd, |_| ()).is_some() { 0 } else { errno::EBADF };
+    }
     akuma_syscalls_glue::fs::sys_fcntl(fd as u32, cmd as u32, arg)
 }
 
@@ -890,6 +903,10 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     // `/dev/kvm`: the census stub (`crate::kvm::api`), only with the `kvmapi` boot flag.
     if resolved == "/dev/kvm" && crate::kvm::api::enabled() {
         return crate::kvm::api::open(flags);
+    }
+    // `/dev/net/tun`: the tap for a userspace VMM's NIC, behind the hypervisor's gateway.
+    if resolved == "/dev/net/tun" {
+        return crate::kvm::tun::open(flags);
     }
     // `/dev/input/mouse0`: the touchpad's pointer stream (`crate::touchpad`).
     if resolved == "/dev/input/mouse0" {
@@ -1174,6 +1191,10 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
             return errno::ESRCH;
         };
         return crate::wifi::read(proc.tgid, fd as u32, buf, len.min(MAX_IO) as usize);
+    }
+    // `/dev/net/tun`: one frame behind its virtio-net header, or `EAGAIN`.
+    if is_dev_tun(fd) {
+        return crate::kvm::tun::read(buf, len.min(MAX_IO) as usize);
     }
     // `/dev/input/mouse0`: whole 8-byte pointer records, or `EAGAIN`.
     if is_dev_mouse(fd) {
@@ -2220,6 +2241,9 @@ pub fn sys_access(path: u64) -> u64 {
 pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     if let Some(id) = dev_kvm_api_id(fd) {
         return crate::kvm::api::ioctl(fd, id, req as u32, arg);
+    }
+    if is_dev_tun(fd) {
+        return crate::kvm::tun::ioctl(req as u32, arg);
     }
     // The fbdev requests, on a `/dev/fb0` descriptor only.
     if is_dev_fb(fd) {

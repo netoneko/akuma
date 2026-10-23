@@ -121,6 +121,10 @@ pub enum FdState {
     /// without the node answers `can_read: false`.
     DevMouse { can_read: bool },
 
+    /// The tap node (`/dev/net/tun`): readable while the gateway has a frame for the guest, always
+    /// writable (a frame is consumed or dropped, never queued behind a full ring).
+    DevTun { can_read: bool },
+
     /// An fd kind with no readiness model — a plain file, most of them.
     /// Reported ready for whatever was asked, which is the POSIX answer for a
     /// regular file and a lie for anything else.
@@ -297,6 +301,15 @@ pub const fn readiness(state: FdState, requested: u32) -> u32 {
         FdState::DevMouse { can_read } => {
             if wants_in && can_read {
                 ready |= EPOLLIN;
+            }
+        }
+
+        FdState::DevTun { can_read } => {
+            if wants_in && can_read {
+                ready |= EPOLLIN;
+            }
+            if wants_out {
+                ready |= EPOLLOUT;
             }
         }
 

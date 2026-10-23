@@ -1375,6 +1375,11 @@ pub struct SyscallHooks {
     /// [`poll::epoll_check_fd_readiness`], which is how `has_events` reaches
     /// `poll(2)` without glue knowing a touchpad exists.
     pub dev_mouse_has_events: fn() -> bool,
+
+    /// Does the tap node (`/dev/net/tun`) have a frame for its reader? amd64 only; the AArch64
+    /// kernel registers `|| false`. The one reader is the `DevTun` arm of
+    /// [`poll::epoll_check_fd_readiness`].
+    pub dev_tun_has_frame: fn() -> bool,
 }
 
 static HOOKS: akuma_primitives::OnceCopy<SyscallHooks> = akuma_primitives::OnceCopy::new();
@@ -1424,5 +1429,8 @@ pub(crate) mod hooks {
     }
     pub fn dev_mouse_has_events() -> bool {
         HOOKS.get().is_some_and(|h| (h.dev_mouse_has_events)())
+    }
+    pub fn dev_tun_has_frame() -> bool {
+        HOOKS.get().is_some_and(|h| (h.dev_tun_has_frame)())
     }
 }

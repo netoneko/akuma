@@ -187,6 +187,8 @@ pub fn install_shared_sinks() {
         // poller rings a bell when a record lands — the readiness re-checks at
         // the blocking-poll tick, like the console hook above.
         dev_mouse_has_events: crate::touchpad::has_events,
+        // The fifth: the tap node's gateway queue (`/dev/net/tun`), a relaxed flag the pump refreshes.
+        dev_tun_has_frame: crate::kvm::tun::has_frame,
     });
     // The wake effect for the **one** pipe table (4b batch 2b). This target
     // shares `akuma-syscalls-glue`'s table rather than keeping a second

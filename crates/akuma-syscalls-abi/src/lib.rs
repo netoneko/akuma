@@ -443,6 +443,8 @@ syscall_table! {
     /// Process-wide memory barrier. `akuma-syscalls-mem` has decoded its
     /// command set since that crate existed; only the number was absent.
     Membarrier => MEMBARRIER = 324, nr::MEMBARRIER;
+    /// An anonymous file: Firecracker's virtio-net ring buffer maps one twice. Amd64-native.
+    MemfdCreate => MEMFD_CREATE = 319, nr::MEMFD_CREATE;
 
     // ── process lifecycle ──────────────────────────────────────────────────
     /// x86-only `fork`(57)/`vfork`(58) narrow to this with `CLONE_VM` clear;
@@ -962,6 +964,7 @@ mod tests {
             (Syscall::Fchownat, 260, 54),
             (Syscall::Linkat, 265, 37),
             (Syscall::Membarrier, 324, 283),
+            (Syscall::MemfdCreate, 319, 279),
             (Syscall::Pwritev2, 328, 287),
             (Syscall::Fsync, 74, 82),
             (Syscall::Fdatasync, 75, 83),

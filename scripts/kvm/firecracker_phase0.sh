@@ -5,7 +5,7 @@
 #
 # Builds an ext2 root (busybox, Alpine musl + libgcc, firecracker from FCDIR/GCCDIR/MUSLDIR = extracted
 # apks) and boots the amd64 kernel under QEMU microvm (TCG) with `strace_err`, running /etc/p0.sh.
-# The console log is LOG. Env: QSMP (QEMU cores, default 1), FCDIR GCCDIR MUSLDIR (extracted apks), KERNEL, BUSYBOX, P0 (script body).
+# The console log is LOG. Env: NETDEV (give the VM a tap NIC), QSMP (QEMU cores, default 1), FCDIR GCCDIR MUSLDIR (extracted apks), KERNEL, BUSYBOX, P0 (script body).
 set -eu
 LOG=${1:?usage: firecracker_phase0.sh LOG [SECONDS]}
 SECS=${2:-240}
@@ -23,10 +23,13 @@ cp "$FCDIR/usr/bin/firecracker" "$T/usr/bin/"; chmod 755 "$T/usr/bin/firecracker
 cp "$KERNEL" "$T/boot/akuma-guest"
 DRIVE_PATH=/boot/akuma-guest; DRIVE_RO=true
 if [ -n "${GUEST_IMG:-}" ]; then cp "$GUEST_IMG" "$T/guest-root.img"; DRIVE_PATH=/guest-root.img; DRIVE_RO=false; fi
+NETJ=""
+[ -n "${NETDEV:-}" ] && NETJ=',
+ "network-interfaces":[{"iface_id":"eth0","host_dev_name":"tap0","guest_mac":"AA:FC:00:00:00:01"}]'
 cat > "$T/vm.json" <<J
 {"boot-source":{"kernel_image_path":"/boot/akuma-guest","boot_args":"${BOOT_ARGS:-console=ttyS0}"},
  "machine-config":{"vcpu_count":1,"mem_size_mib":${MEM_MIB:-768}},
- "drives":[{"drive_id":"rootfs","path_on_host":"$DRIVE_PATH","is_root_device":true,"is_read_only":$DRIVE_RO}]}
+ "drives":[{"drive_id":"rootfs","path_on_host":"$DRIVE_PATH","is_root_device":true,"is_read_only":$DRIVE_RO}]$NETJ}
 J
 if [ -n "${P0:-}" ]; then printf '%s\n' "$P0" > "$T/etc/p0.sh"; else cat > "$T/etc/p0.sh" <<'S'
 echo P0-BEGIN

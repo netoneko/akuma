@@ -949,6 +949,7 @@ impl ProcFilesystem {
             FileDescriptor::DevKvm(0) => String::from("/dev/kvm0"),
             FileDescriptor::DevKvm(_) => String::from("/dev/kvm"),
             FileDescriptor::DevMouse => String::from("/dev/input/mouse0"),
+            FileDescriptor::DevTun => String::from("/dev/net/tun"),
             // `ttyname(3)` reads this link: the slave's name is what `tty`,
             // `ps` and `sshd` print for a pty session.
             FileDescriptor::PtyMaster(_) => String::from("/dev/ptmx"),

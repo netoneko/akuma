@@ -52,6 +52,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub mod api;
 pub mod ctl;
+pub mod tun;
 mod linux;
 mod relay;
 
@@ -103,6 +104,7 @@ pub fn init(cmdline: &str) {
     let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
     // `/dev/kvm` (the KVM-ioctl node) comes with the hypervisor: `kvmctl` arms it, `kvmapi` alone (rehearsal) too.
     api::set_enabled(flag("kvmapi") || flag("kvmctl"));
+    tun::init(cmdline);
     let want_test = flag("kvmtest");
     // `kvmctl`: arm the hypervisor for `/dev/kvm0` and run nothing at boot.
     let want_ctl = flag("kvmctl");

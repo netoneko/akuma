@@ -1713,6 +1713,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Linkat => to_glue(call, [a1, a2, a3, a4, a5, 0]),
         Syscall::Fchownat => to_glue(call, [a1, a2, a3, a4, a5, 0]),
         Syscall::Membarrier => to_glue(call, [a1, 0, 0, 0, 0, 0]),
+        Syscall::MemfdCreate => sys_memfd_create(a2),
         Syscall::Prctl => to_glue(call, [a1, a2, a3, a4, a5, 0]),
         // `rustc` sizes its codegen thread pool from this one, so an `ENOSYS`
         // was quietly making every in-guest build single-threaded.
@@ -1785,6 +1786,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 && let Some(p) = current_process()
             {
                 crate::fbdev::release(p.tgid);
+            }
+            // The tap: host sockets and the gateway's slots go back (`crate::kvm::tun`).
+            if crate::fd::is_dev_tun(a1) {
+                crate::kvm::tun::release();
             }
             // A `/dev/wifi0` descriptor's read cursor (`crate::wifi`).
             if crate::fd::is_dev_wifi(a1)
@@ -2554,6 +2559,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
 /// written) is returned, per POSIX.
 fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
     use crate::fd::errno;
+    // A tap frame is one `writev`: splitting it per segment would send the header as its own frame.
+    if crate::fd::is_dev_tun(fd) {
+        return crate::kvm::tun::writev(iov, cnt as usize);
+    }
     let cnt = (cnt as usize).min(1024);
     let mut total: u64 = 0;
     for i in 0..cnt {
@@ -2582,6 +2591,9 @@ fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
 /// `readv(fd, iov, iovcnt)` — the mirror of [`sys_writev`].
 fn sys_readv(fd: u64, iov: u64, cnt: u64) -> u64 {
     use crate::fd::errno;
+    if crate::fd::is_dev_tun(fd) {
+        return crate::kvm::tun::readv(iov, cnt as usize);
+    }
     let cnt = (cnt as usize).min(1024);
     let mut total: u64 = 0;
     for i in 0..cnt {
@@ -2640,6 +2652,46 @@ fn proc_count() -> u16 {
     // for a cosmetic `sysinfo` field the registered count is the better one:
     // it is what `ps` lists.
     akuma_exec::process::process_count().min(u16::MAX as usize) as u16
+}
+
+/// `memfd_create(name, flags)`: an unlinked file under `/tmp`, so `ftruncate` and a `MAP_SHARED` mmap
+/// (twice, at adjacent addresses, as Firecracker's ring buffers do) behave as on a memfd. The name is
+/// only a debugging label on Linux and is not read here. Costs ext2 blocks, not a tmpfs page.
+fn sys_memfd_create(flags: u64) -> u64 {
+    use crate::fd::errno;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    const MFD_CLOEXEC: u64 = 1;
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let mut path = [0u8; 40];
+    let prefix = b"/tmp/.memfd-";
+    path[..prefix.len()].copy_from_slice(prefix);
+    let mut n = prefix.len();
+    let mut num = u64::from(SEQ.fetch_add(1, Ordering::Relaxed)) | u64::from(crate::smp::cpu_index() as u32) << 32;
+    let mut digits = [0u8; 20];
+    let mut d = digits.len();
+    loop {
+        d -= 1;
+        digits[d] = b'0' + (num % 10) as u8;
+        num /= 10;
+        if num == 0 {
+            break;
+        }
+    }
+    path[n..n + digits.len() - d].copy_from_slice(&digits[d..]);
+    n += digits.len() - d;
+    let Ok(p) = core::str::from_utf8(&path[..n]) else { return errno::EINVAL };
+    const O_RDWR: u32 = 2;
+    const O_CREAT: u32 = 0o100;
+    const O_EXCL: u32 = 0o200;
+    const O_CLOEXEC: u32 = 0o200_0000;
+    let oflags = O_RDWR | O_CREAT | O_EXCL | if flags & MFD_CLOEXEC != 0 { O_CLOEXEC } else { 0 };
+    match akuma_syscalls_glue::fs::openat_path(-100, p, oflags, 0o600) {
+        Ok(fd) => {
+            let _ = akuma_vfs_glue::fs::remove_file(p);
+            fd
+        }
+        Err(e) => e,
+    }
 }
 
 /// The task slot `tid` names for the affinity calls: 0 is the caller; otherwise a process id
@@ -2895,6 +2947,11 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     // `/dev/wifi0`: command lines for the wifi driver (`crate::wifi`).
     if crate::fd::is_dev_wifi(fd) {
         return crate::wifi::write(buf, len as usize);
+    }
+
+    // `/dev/net/tun`: one frame behind its virtio-net header (`crate::kvm::tun`).
+    if crate::fd::is_dev_tun(fd) {
+        return crate::kvm::tun::write(buf, len as usize);
     }
 
     // `/dev/kvm0`: a VM spec, `stop` or `status` (`crate::kvm::ctl`). Refused whole.

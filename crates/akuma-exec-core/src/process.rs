@@ -253,6 +253,10 @@ pub enum FileDescriptor {
     /// laptop's touchpad (`akuma-touchpad::ptp::encode`). Only the amd64
     /// kernel opens one, and only when a touchpad came up; reads never block.
     DevMouse,
+    /// The tap clone device (`/dev/net/tun`): Ethernet frames (with a virtio-net header) to and from
+    /// the hypervisor's gateway, for a userspace VMM's network device (`amd64/src/kvm/tun.rs`).
+    /// Only the amd64 kernel opens one, with the `/dev/kvm` node armed; one at a time.
+    DevTun,
     /// The master side of pseudo-terminal pair `N` (`open("/dev/ptmx")`).
     ///
     /// Reference-counted like a pipe end — `dup`, `fork` and `close` go through
