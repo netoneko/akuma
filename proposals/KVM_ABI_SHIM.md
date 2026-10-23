@@ -25,19 +25,21 @@ RAM), 32-bit flat protected mode (`CR0=0x11`, no paging, flat code/data selector
 
 ## 2. The hard parts, sized
 
-**(a) Guest memory is the VMM's own memory.** The NPT must point at the frames behind a *user* range of the
-calling process. Design: a memslot table (`gpa -> uaddr`, pure, host-tested) and a **4 KiB-leaf NPT builder**
-(new; the current one only makes 2 MiB leaves over a contiguous block). Leaves are installed on demand from
-the nested page fault: translate gpa -> uaddr, make the page present in the VMM's address space (touch it
-through the process's page tables, the same demand-fault path a `copy_to_user` takes), read the frame out of
-the walker (`akuma-mmu`), **pin it** (CoW refcount + 1, so neither fork-CoW nor reclaim nor the file-page
-cache moves or frees it) and map it. Unpinning happens when the VM fd closes. Consequences and limits for v1:
-`munmap`/`MADV_DONTNEED`/`mprotect` of a registered slot while the VM lives are *not* followed (Firecracker
-does none of them to guest RAM; documented as a rule, refused where cheap); no dirty logging; no fork after
-`CREATE_VM`. Kernel access to guest memory (instruction fetch for MMIO decode, `hvm_start_info`) goes through
-the same user mapping, because `KVM_RUN` runs **in the VMM thread's context** (see b). Cost: ~600 lines +
-tests; the riskiest piece (frame lifetime) is also the one the existing `akuma-user-space` ledger and CoW
-refcount already model.
+**(a) Guest memory is the VMM's own memory: DECIDED (owner, 2026-10-23) - reserved slice, remapped.**
+Firecracker `mmap`s anonymous memory and passes it as `uaddr`. Rather than pin scattered frames behind a
+4 KiB NPT, the shim **gates Firecracker to the `kvmmem=` reserve**: at `SET_USER_MEMORY_REGION` it takes a
+2 MiB-aligned slice of the arena (`akuma_vm_spec::arena`, the kvm0 allocator), copies the range's current
+contents into it, and rewrites the VMM's PTEs for `[uaddr, uaddr+size)` onto the slice frames ("direct
+memory transfer"). The existing `build_npt` (2 MiB leaves, <= 1 GiB) then maps the guest unchanged, and the
+VMM and the guest share the same frames with no refcounts, no pinning and no on-demand faults. Rules: the
+frames are **borrowed** (a mapping kind that never enters the process's frame ledger or the PMM free path:
+`munmap`/exit only drop PTEs); the slice returns to the arena when the VM fd closes (like kvm0's RAM and
+`DiskLease`); a request that does not fit the reserve is refused (no `kvmmem=` -> `ENOMEM`). A VMM that
+forks after `CREATE_VM` is logged to dmesg, not prevented. Rejected alternative, kept for the record: pin
+the VMM's scattered frames behind a 4 KiB-leaf NPT built on demand (needs a write fault per page so no CoW
+share remains, a 4 KiB NPT builder, and "no munmap/fork" rules; more general, more code, no reserve needed).
+Cost: a PTE-rewrite + borrowed-frames operation in `akuma-mmu`/`akuma-user-space` (to be written; first
+task of slice 1), ~200 lines + tests.
 
 **(b) `KVM_RUN` in syscall context.** The ioctl runs the world-switch loop on the calling thread, like the
 real thing: no VM task, the VMM's own threads are the vCPUs. This removes the cross-address-space problem in
@@ -113,4 +115,4 @@ which already exists). Phase 3 slices, each ending in a TCG rehearsal and a doc 
 
 1. Approve Option 1 and the v1 exclusivity rule (Firecracker VM xor kvm0 VM)?
 2. Accept `--no-seccomp` as the supported mode for v1?
-3. Accept "no munmap/mprotect of a live guest-RAM slot" as a documented rule?
+3. ~~Accept "no munmap/mprotect of a live guest-RAM slot"~~ superseded: guest RAM is a borrowed reserve slice (a).

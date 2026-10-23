@@ -105,5 +105,4 @@ Added after the first census: `SET_REGS`/`SET_SREGS` show a **PVH** entry (`rip=
 Written up in [`proposals/KVM_ABI_SHIM.md`](../../proposals/KVM_ABI_SHIM.md): the census mapped onto what
 the hypervisor models, the five hard parts sized (guest RAM from the VMM's own memory; `KVM_RUN` in syscall
 context; ioeventfd/irqfd; IOAPIC; naming) with options and a recommendation (a new `/dev/kvm` node, a new
-run loop reusing the pure models, kvm0 untouched, ~4-6 k lines, five slices). **Waiting for the owner's
-approval of the three questions at its end before any Phase 3 code.**
+run loop reusing the pure models, kvm0 untouched, ~4-6 k lines, five slices). **Owner's answers (2026-10-23): guest RAM is a slice of the `kvmmem=` reserve remapped into the VMM's address space (borrowed frames, kvm0's arena); fork is logged to dmesg; the protocol is learned from the syscall inputs (no Firecracker source read). Phase 3 approved.**
