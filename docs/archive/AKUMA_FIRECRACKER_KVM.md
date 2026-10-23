@@ -341,6 +341,20 @@ once); metal, see the stress result below. **What is still open:** nothing guard
 would turn the next overflow into a named fault), and the claim "this was the stack" stays a hypothesis until a measurement
 says so.
 
+### Metal verification after the fix (kernel `0a27ad8`, same boot)
+
+* **12 consecutive Firecracker runs, 12 passes** (`/root/fc/loop.sh`: each run detached with its output in a file, a run counts
+  only with `AKUMA-GUEST-DONE` and both md5s), no `[EXCEPTION]` in `dmesg`, no Firecracker process left behind.
+* **The herd-managed `kvm0` path still works afterwards:** `herd start vm-serve-mc`, then `ssh -p 2223 root@<ryzen>` from the Mac
+  reaches the guest through the relay (`Akuma akuma-kvm ...`, 2 processors).
+* **A rig trap that looked like a kernel bug.** Two Firecracker processes sat idle forever (zero CPU, the VMM's event loop
+  alive, the vCPU thread parked) after a test that piped `run.sh` into `grep -q`: grep exits at the first match, the pipe
+  closes, and Firecracker's console writes then fail forever. Never judge a run by an early-exiting reader; give the
+  output to a file. (The hang was *not* reproduced with output going to a file; the exit and idle tracing added for the hunt
+  stays, off the hot path, in `amd64/src/kvm/api/vcpu.rs`.) `kill -9` of such a process freed the VM for the next one.
+* The box's own `ssh` client takes no `-o` options (`cannot resolve host '-o'`); use `ssh -p 2223 root@127.0.0.1 'cmd'`, or go
+  in from the Mac.
+
 ## Before the KVM work is finished
 
 In the owner's order of importance (2026-10-23), nothing below is done:
@@ -360,3 +374,4 @@ In the owner's order of importance (2026-10-23), nothing below is done:
 8. NetBSD `MICROVM` as the second guest; a Linux guest (needs the I/O APIC).
 9. Lift the one-VM exclusivity with `/dev/kvm0` (both own SVM and the reserved cores); a herd service shape for a
    Firecracker VM (`command = firecracker ...`, restart policy) once affinity exists.
+10. **Investigate the clock checksum error the ryzen reported when booting Linux (Pop) after Akuma runs** (2026-10-23, reported by the owner, not yet looked at): suspects are what Akuma writes to the CMOS/RTC (the SNTP clock sync, the `crumb()` breadcrumbs in CMOS byte 0x7F that `kvm` uses) and a `reboot -f`/watchdog reset mid-write.

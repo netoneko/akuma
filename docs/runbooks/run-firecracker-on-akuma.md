@@ -39,7 +39,7 @@ x86_64-unknown-none --release --features no-tests` with `CARGO_TARGET_DIR` set, 
 
 ```sh
 herd stop vm-netbsd; herd stop vm-serve-mc      # entry 30 starts them; one VM at a time
-sh /root/fc/run.sh                              # firecracker --no-api --no-seccomp --config-file /root/fc/vm.json
+sh /root/fc/run.sh > /root/fc/run.log 2>&1      # to a file, never into `grep -q`; firecracker --no-api --no-seccomp --config-file /root/fc/vm.json
 ```
 
 ## Verify
@@ -56,6 +56,7 @@ The same lines as in § 1, with the host's `dmesg` free of `[EXCEPTION]`; run it
 | `Failed to set the requested seccomp filters on vCPU 0` | run with `--no-seccomp` |
 | the guest stops at `heap: ... 512 MiB` | the guest needs `mem_size_mib` >= 768 (its fixed 512 MiB heap) |
 | `Failed to create VM: Cannot allocate memory` / `guest RAM does not fit the kvmmem= reserve` | no `kvmmem=` (or too small) at boot: guest RAM is a slice of the reserve |
+| a Firecracker process idles forever with zero CPU | its console pipe was closed under it (`run.sh | grep -q`): send its output to a file, `kill -9` it |
 | the host dies with `[EXCEPTION] #PF` in `talc::free` after a few runs | kernel-stack/heap corruption: the 2026-10-23 incident, [`../archive/AKUMA_FIRECRACKER_KVM.md`](../archive/AKUMA_FIRECRACKER_KVM.md) § *Metal* |
 
 ## Background
