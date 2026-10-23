@@ -50,6 +50,7 @@ use akuma_svm_amd64::{ctrl, intr0, intr1, save, ExitCode, Seg, SegAttr, Vmcb};
 use core::arch::x86_64::__cpuid;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+pub mod api;
 pub mod ctl;
 mod linux;
 mod relay;
@@ -100,6 +101,7 @@ fn dec(v: u64) {
 /// MSR `#GP`s.
 pub fn init(cmdline: &str) {
     let flag = |name: &str| cmdline.split_ascii_whitespace().any(|t| t == name);
+    api::set_enabled(flag("kvmapi"));
     let want_test = flag("kvmtest");
     // `kvmctl`: arm the hypervisor for `/dev/kvm0` and run nothing at boot.
     let want_ctl = flag("kvmctl");

@@ -23,7 +23,8 @@ cp "$FCDIR/usr/bin/firecracker" "$T/usr/bin/"; chmod 755 "$T/usr/bin/firecracker
 cp "$KERNEL" "$T/boot/akuma-guest"
 cat > "$T/vm.json" <<'J'
 {"boot-source":{"kernel_image_path":"/boot/akuma-guest","boot_args":"console=ttyS0"},
- "machine-config":{"vcpu_count":1,"mem_size_mib":128},"drives":[]}
+ "machine-config":{"vcpu_count":1,"mem_size_mib":128},
+ "drives":[{"drive_id":"rootfs","path_on_host":"/boot/akuma-guest","is_root_device":true,"is_read_only":true}]}
 J
 if [ -n "${P0:-}" ]; then printf '%s\n' "$P0" > "$T/etc/p0.sh"; else cat > "$T/etc/p0.sh" <<'S'
 echo P0-BEGIN
