@@ -246,8 +246,9 @@ pub enum FileDescriptor {
     DevPower,
     /// The hypervisor's control device (`/dev/kvm0`): a VM spec or `stop`/`status` in, the
     /// guest's console out (`akuma-vm-spec`, `amd64/src/kvm/ctl.rs`). Only the amd64 kernel
-    /// opens one, and only when the hypervisor is armed (`kvmctl`); one VM at a time.
-    DevKvm,
+    /// opens one, and only when the hypervisor is armed (`kvmctl`); one VM at a time. The id is 0 for
+    /// `/dev/kvm0` and `n > 0` for handle `n` of the KVM-ioctl node `/dev/kvm` (`amd64/src/kvm/api.rs`).
+    DevKvm(u32),
     /// The pointer node (`/dev/input/mouse0`): 8-byte records from the
     /// laptop's touchpad (`akuma-touchpad::ptp::encode`). Only the amd64
     /// kernel opens one, and only when a touchpad came up; reads never block.

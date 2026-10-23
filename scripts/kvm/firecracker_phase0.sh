@@ -38,8 +38,8 @@ fi
 "$E2/mke2fs" -q -t ext2 -d "$T" -L p0 /tmp/p0root.$$.img 64M 2>/dev/null || "$E2/mke2fs" -q -t ext2 -d "$T" /tmp/p0root.$$.img 64M
 IMG=/tmp/p0root.$$.img
 CL="virtio_mmio.device=512@0xfeb00000:5 init=/bin/busybox initargs=sh,/etc/p0.sh strace_err ${KCMDLINE:-}"
-timeout "$SECS" qemu-system-x86_64 -M microvm -cpu max -global virtio-mmio.force-legacy=false \
-  -kernel "$KERNEL" -m 1024 -smp 1 \
+timeout "$SECS" qemu-system-x86_64 -M microvm -cpu EPYC-Milan,svm=on -global virtio-mmio.force-legacy=false \
+  -kernel "$KERNEL" -m 2048 -smp 1 \
   -drive id=d0,file=$IMG,format=raw,if=none -device virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0 \
   -append "$CL" -serial mon:stdio -display none -no-reboot > "$LOG" 2>&1 || true
 rm -f "$IMG"

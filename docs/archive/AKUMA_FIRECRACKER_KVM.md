@@ -226,3 +226,23 @@ which already exists). Phase 3 slices, each ending in a TCG rehearsal and a doc 
 ## Phase 3: progress log
 
 Slice 1 (plumbing) started 2026-10-23. Working from this document; entries below record what was built and how it was verified.
+
+### Slice 1a (2026-10-23): handles, one VM, guest RAM on a reserved slice
+
+Built: pure crate `crates/akuma-kvm-abi` (request decode per descriptor kind, `Regs`/`Sregs`/`CpuidEntry`/
+`MsrEntry` layouts, the memslot `Table`, `Irqfd`/`Ioeventfd`; 10 host tests whose vectors are the census dumps)
+and the glue `amd64/src/kvm/api.rs`: `FileDescriptor::DevKvm(u32)` (0 = `/dev/kvm0`, `n` = handle `n` of the new
+node), a static handle table and one static `Vm`; `CREATE_VM` (EBUSY while a kvm0 VM exists, and kvm0's `create`
+is EBUSY while an API VM lives; a VM whose owner process is gone is reaped by either), `CREATE_VCPU`,
+`GET_SUPPORTED_CPUID` from the host's CPUID through `cpuid::filter`, `CHECK_EXTENSION`, `SET_TSS_ADDR`,
+`CREATE_IRQCHIP`/`PIT2` (recorded), `IRQFD`/`IOEVENTFD` (recorded), and **`SET_USER_MEMORY_REGION`**: carve a
+2 MiB-aligned slice of the `kvmmem=` reserve and `mm::remap_user_to_phys` moves the VMM's PTEs for the range onto it
+(copies present pages, hands the old anonymous frames back through the ledger, maps the rest; the new leaves are
+borrowed like `/dev/fb0`'s: not in the ledger, no share count).
+
+Verified (TCG rehearsal, `scripts/kvm/fc_census.sh`, kernel `kvmctl kvmmem=512 kvmapi`, QEMU `-cpu EPYC-Milan,svm=on`):
+the unmodified Firecracker walks the same 40 ioctls as the census to `KVM_RUN` with **real answers**, and at
+`RUN` the bytes at guest-physical `0x201000` (the PVH entry it loaded the kernel to) read identically through the
+slice and through the VMM's own mapping (`SAME`, nonzero); three consecutive runs each carve, run and reap their
+slice with no corruption. Not yet: vCPU state (cpuid/msrs/regs/sregs/fpu/lapic are accepted and ignored),
+the run loop, and any real exit.

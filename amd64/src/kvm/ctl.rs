@@ -241,6 +241,11 @@ pub fn dev_write(buf: u64, len: usize) -> u64 {
     }
 }
 
+/// Is a `/dev/kvm0` VM pending or running (so the KVM-ioctl node must not start one)?
+pub(super) fn vm_active() -> bool {
+    irq_off(|| matches!(SLOT.lock().phase, Phase::Pending | Phase::Running))
+}
+
 fn create(text: &str, len: usize) -> u64 {
     let spec = match Spec::parse_wire(text) {
         Ok(s) => s,
@@ -261,6 +266,9 @@ fn create(text: &str, len: usize) -> u64 {
     }
     if !super::svm_armed() {
         return errno::ENODEV;
+    }
+    if super::api::vm_live() {
+        return errno::EBUSY;
     }
     let owner = crate::usermode::current_process().map_or(0, |p| p.tgid);
     let started = irq_off(|| {

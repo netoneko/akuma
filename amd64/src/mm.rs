@@ -3425,3 +3425,44 @@ fn va_placement_check(t: &mut Suite) {
         find_free_va(&mut [], usize::MAX).is_none(),
     );
 }
+
+/// Point the calling process's `[start, start + len)` at the contiguous physical block at `pa`:
+/// the hypervisor's "direct memory transfer" for a VMM's guest RAM (`kvm::api`,
+/// `docs/archive/AKUMA_FIRECRACKER_KVM.md`). A page already present keeps its bytes (copied into the
+/// block) and its old frame goes back through the ledger exactly as `munmap` would; an absent page
+/// becomes the block's zeroed page. The new leaves are **borrowed**, like `mmap_framebuffer`'s: not in
+/// the ledger, no share count, so `munmap`/exit/`fork` never hand the block to the page allocator.
+///
+/// `start`/`len`/`pa` are page aligned. `false`: out of page-table frames partway (what was moved stays
+/// moved, and consistent). Only the calling thread's TLB is flushed: call before the VMM has other
+/// threads touching the range.
+pub fn remap_user_to_phys(start: usize, len: usize, pa: usize) -> bool {
+    use akuma_mmu::MemAttr;
+    let page = PAGE_SIZE as usize;
+    if len == 0 || !start.is_multiple_of(page) || !len.is_multiple_of(page) || !pa.is_multiple_of(page) {
+        return false;
+    }
+    let end = start + len;
+    let pte = PteProt::from_region(Prot::from_prot(0b11));
+    usermode::with_current_address_space(|uas| {
+        let mut buf = [0u8; PAGE_SIZE as usize];
+        uas.rewrite_leaves_in_range(start, end, |ledger, leaf| {
+            if leaf.attr != MemAttr::WriteBack {
+                return LeafAction::Keep;
+            }
+            let new_pa = pa + (leaf.va - start);
+            if !akuma_mmu::copy_from_phys(leaf.pa, &mut buf) || !akuma_mmu::copy_to_phys(new_pa, &buf) {
+                return LeafAction::Keep;
+            }
+            if ledger.remove_user_frame(PhysFrame::new(leaf.pa)) && akuma_pmm::cow_ref_dec(leaf.pa) {
+                akuma_pmm::free_page(leaf.pa, 0);
+            }
+            LeafAction::Remap(new_pa, pte, false)
+        });
+        (0..len / page).all(|i| {
+            let va = start + i * page;
+            uas.translate(va).is_some() || uas.map_device_page(va, pa + i * page, pte, MemAttr::WriteBack)
+        })
+    })
+    .unwrap_or(false)
+}

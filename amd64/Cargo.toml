@@ -267,6 +267,7 @@ akuma-cpu = { path = "../crates/akuma-cpu" }
 # host-tested there, consumed by `kvm.rs` on the metal.
 akuma-svm-amd64 = { path = "../crates/akuma-svm-amd64" }
 akuma-vm-spec = { path = "../crates/akuma-vm-spec" }
+akuma-kvm-abi = { path = "../crates/akuma-kvm-abi" }
 # The Big Kernel Lock (`smp.rs`'s `bkl_enter`/`bkl_leave` forward here).
 akuma-bkl = { path = "../crates/akuma-bkl" }
 # Syscall identity across architectures. Proposal item 5's shape, and the amd64

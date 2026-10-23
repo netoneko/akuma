@@ -1815,7 +1815,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // ignored; a file mapping cannot ignore it.
         // Census stub (`kvm::api`): a `/dev/kvm` descriptor maps as anonymous memory, enough to see
         // what the VMM does with the vCPU's run page.
-        Syscall::Mmap if crate::kvm::api::enabled() && crate::fd::is_dev_kvm(a5) => {
+        Syscall::Mmap if crate::fd::dev_kvm_api_id(a5).is_some() => {
             crate::kvm::api::note_mmap(a5, a1, a2, a3, a4, a6);
             crate::mm::sys_mmap(a1, a2, a3, a4 | 0x20, u64::MAX, 0)
         }

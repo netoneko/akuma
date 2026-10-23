@@ -597,19 +597,7 @@ fn open_kvm(flags: u32) -> u64 {
     let Some(proc) = akuma_exec::process::current_process_shared() else {
         return errno::ESRCH;
     };
-    let fd = proc.alloc_fd(FileDescriptor::DevKvm);
-    if flags & open_flags::O_CLOEXEC != 0 {
-        proc.set_cloexec(fd);
-    }
-    u64::from(fd)
-}
-
-/// `open("/dev/kvm")` under `kvmapi`: a `DevKvm` descriptor whose ioctls the census stub answers.
-fn open_kvm_api(flags: u32) -> u64 {
-    let Some(proc) = akuma_exec::process::current_process_shared() else {
-        return errno::ESRCH;
-    };
-    let fd = proc.alloc_fd(FileDescriptor::DevKvm);
+    let fd = proc.alloc_fd(FileDescriptor::DevKvm(0));
     if flags & open_flags::O_CLOEXEC != 0 {
         proc.set_cloexec(fd);
     }
@@ -619,7 +607,17 @@ fn open_kvm_api(flags: u32) -> u64 {
 /// Is `fd` a `/dev/kvm0` descriptor?
 #[must_use]
 pub fn is_dev_kvm(fd: u64) -> bool {
-    table_with(fd, |d| matches!(d, FileDescriptor::DevKvm)).unwrap_or(false)
+    table_with(fd, |d| matches!(d, FileDescriptor::DevKvm(0))).unwrap_or(false)
+}
+
+/// The handle id of a `/dev/kvm` (KVM-ioctl node) descriptor; `None` for anything else, `/dev/kvm0` included.
+#[must_use]
+pub fn dev_kvm_api_id(fd: u64) -> Option<u32> {
+    table_with(fd, |d| match d {
+        FileDescriptor::DevKvm(n) if *n > 0 => Some(*n),
+        _ => None,
+    })
+    .flatten()
 }
 
 /// Is `fd` a `/dev/wifi0` descriptor?
@@ -881,7 +879,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     }
     // `/dev/kvm`: the census stub (`crate::kvm::api`), only with the `kvmapi` boot flag.
     if resolved == "/dev/kvm" && crate::kvm::api::enabled() {
-        return open_kvm_api(flags);
+        return crate::kvm::api::open(flags);
     }
     // `/dev/input/mouse0`: the touchpad's pointer stream (`crate::touchpad`).
     if resolved == "/dev/input/mouse0" {
@@ -2210,8 +2208,8 @@ pub fn sys_access(path: u64) -> u64 {
 ///   boot task can be in that state, and `boot_row_register` is the answer the
 ///   suite already uses for it (4b batch 2b).
 pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
-    if crate::kvm::api::enabled() && is_dev_kvm(fd) {
-        return crate::kvm::api::ioctl(fd, req as u32, arg);
+    if let Some(id) = dev_kvm_api_id(fd) {
+        return crate::kvm::api::ioctl(fd, id, req as u32, arg);
     }
     // The fbdev requests, on a `/dev/fb0` descriptor only.
     if is_dev_fb(fd) {
