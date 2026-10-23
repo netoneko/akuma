@@ -10,8 +10,8 @@ Do exactly this, in order, and write what happened (commands, exit codes, wall t
 
 1. `cd /src/github.com/netoneko/akuma && git status -sb && git log -3 --format='%h %s'`. You should be on branch `dev-base`.
    Create your branch: `git checkout -b cmos-fix`.
-2. Build the kernel: `kbuild --features no-tests > /root/dev-cycle/kbuild.log 2>&1; echo rc=$?`. It is incremental and takes
-   one to fifteen minutes (`-j1` is the default and the safe choice). Do not run `cargo clean`. If it fails, read the log and
+2. Build the kernel: `kbuild -j 4 --features no-tests > /root/dev-cycle/kbuild.log 2>&1; echo rc=$?`. It is incremental and takes
+   one to fifteen minutes (`-j 4` is stable on this box; the wrapper's default of 1 is only conservative). Do not run `cargo clean`. If it fails, read the log and
    fix the cause of the failure only if it is in the environment, not in the source; report it either way.
 3. Copy the result next to the other guest kernels: `cp /root/ktarget/x86_64-unknown-none/release/akuma-amd64 /boot/akuma-guest-dev`
    (never overwrite `/boot/akuma-guest`, `/boot/akuma-amd64` or `/boot/akuma-amd64.verify` in this task).

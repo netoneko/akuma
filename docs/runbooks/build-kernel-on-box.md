@@ -34,9 +34,11 @@ akuma-amd64 --target x86_64-unknown-none --release --offline -j1`.
 
 - **Never pass `-j1` yourself.** The default is already 1, and cargo rejects
   a duplicate `--jobs`: `error: the argument '--jobs <N>' cannot be used
-  multiple times`. Only pass `-j` for a *different* value, and don't — SMP is
-  on and `-j4`+ has previously corrupted this build and SIGSEGV'd the linker.
-  One core, always.
+  multiple times`. Only pass `-j` for a *different* value — and on a multi-core
+  box `kbuild -j 4` is the normal choice: it has been stable for weeks (the
+  early-SMP `-j4` corruption and wedges were root-caused and fixed;
+  [`AMD64_J4_BUILD_CRASH_HUNT.md`](../archive/AMD64_J4_BUILD_CRASH_HUNT.md)).
+  The wrapper's default stays 1 only as a conservative default.
 - **Use a long timeout — at least 20 minutes.** A clean build (`kbuild -c`)
   is ~13–23 minutes. An incremental one is *not* reliably fast: measured live
   2026-09-25 against a cache last built 5 days earlier, `kbuild` recompiled
@@ -107,7 +109,7 @@ broken destroys the one thing standing between a bad build and a stuck box.
 | `Error loading shared library librustc_driver-….so` | you ran `cargo`/`rustc` directly instead of through `kbuild`, so `LD_LIBRARY_PATH` was never set — this kernel has no `/proc/self/exe`, so musl can't resolve rustc's own `$ORIGIN` relative path on its own |
 | `relocation R_X86_64_32 cannot be used against symbol '_start'` | built from the wrong working directory — cargo reads `.cargo/config.toml` from the *cwd*, not `--manifest-path`. `kbuild` always `cd`s to `$AKUMA_SRC` first; don't invoke cargo yourself from somewhere else |
 | `error: the argument '--jobs <N>' cannot be used multiple times` | you passed `-j1` (or any `-j N`) as an extra arg on top of `kbuild`'s own default — see step 1 |
-| build SIGSEGVs the linker near the very end, deterministically | you built at `-j4`+ with SMP on. Rebuild at the default `-j1` |
+| build SIGSEGVs the linker near the very end, deterministically | not `-j4` as such (`kbuild -j 4` has been stable for weeks): a stale or half-written kernel/linker artifact, or a recurrence of the `-j4` corruption class. Rebuild once; if it repeats, keep the log and see [`AMD64_J4_BUILD_CRASH_HUNT.md`](../archive/AMD64_J4_BUILD_CRASH_HUNT.md) § *Resolved* before blaming `-j` |
 | a symbol you just added is "not found" | the box's checkout can drift from what you think is there — `git -C $AKUMA_SRC log -1` and `git status` before assuming the code is stale, not the build |
 | `/bin/kbuild` (or `ubuild`/`mbuild`/`kinstall`) missing or stale | reinstall from the checkout: `cd $AKUMA_SRC && cp -f scripts/box/{kbuild,ubuild,mbuild,kinstall} /bin/ && chmod +x /bin/{kbuild,ubuild,mbuild,kinstall}` — [`scripts/box/README.md`](../../scripts/box/README.md) |
 

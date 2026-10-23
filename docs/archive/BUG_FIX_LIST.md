@@ -9,28 +9,28 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1451
-- **Docs contributing at least one fix:** 401
+- **Total distinct fixes counted:** 1468
+- **Docs contributing at least one fix:** 405
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 242 | 16.7% | 33 |
-| Memory & Virtual Memory | 176 | 12.1% | 57 |
-| Scheduler & Process Management | 139 | 9.6% | 43 |
-| SMP & Locking | 133 | 9.2% | 54 |
-| Networking | 94 | 6.5% | 35 |
-| Userspace Apps & Libraries | 40 | 2.8% | 21 |
+| Syscall / ABI Compatibility Audits | 242 | 16.5% | 33 |
+| Memory & Virtual Memory | 176 | 12.0% | 57 |
+| Scheduler & Process Management | 139 | 9.5% | 43 |
+| SMP & Locking | 136 | 9.3% | 56 |
+| Networking | 94 | 6.4% | 35 |
+| Userspace Apps & Libraries | 40 | 2.7% | 21 |
 | Rump Kernel & Syscall Proxy | 26 | 1.8% | 6 |
-| Toolchain & Self-Hosting | 91 | 6.3% | 13 |
+| Toolchain & Self-Hosting | 91 | 6.2% | 13 |
 | SSH | 39 | 2.7% | 18 |
-| VFS & Filesystem | 134 | 9.2% | 40 |
-| Boot & Drivers | 129 | 8.9% | 20 |
-| Signals & Exceptions | 40 | 2.8% | 15 |
-| Misc / Cross-cutting | 55 | 3.8% | 18 |
+| VFS & Filesystem | 134 | 9.1% | 40 |
+| Boot & Drivers | 139 | 9.5% | 21 |
+| Signals & Exceptions | 40 | 2.7% | 15 |
+| Misc / Cross-cutting | 59 | 4.0% | 19 |
 | Console & Terminal | 58 | 4.0% | 18 |
-| Containers | 55 | 3.8% | 10 |
-| **Total** | **1449** | **100.0%** | **399** |
+| Containers | 55 | 3.7% | 10 |
+| **Total** | **1468** | **100.0%** | **405** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -42,11 +42,11 @@ from several subsystems under one write-up.
 - 20 — `docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md`
 - 20 — `docs/archive/GOLANG_IPC.md`
 - 19 — `docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md`
+- 19 — `docs/archive/AKUMA_FIRECRACKER_KVM.md`
 - 18 — `docs/archive/DASH_MISSING_SYSCALLS.md`
 - 16 — `docs/archive/AKUMA_SELF_HOSTING.md`
 - 15 — `docs/archive/SMP_SHARED.md`
 - 15 — `docs/archive/AKUMA_AMD64_USB_XHCI.md`
-- 14 — `docs/archive/BUN_MEMORY_STUDY.md`
 
 ---
 
@@ -847,7 +847,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/AKUMA_STALE_TID_ZOMBIE_SLOT.md
 - On amd64 a zombie's tid was reissued before the parent reaped it, so a `kill` of the zombie's pid could resolve to the tid's new owner; the slot is held (`SLOT_HELD_BY`, one `slot_reusable` rule shared by claim and reap) from `run_process`'s exit until `retire_process` releases it
 
-## SMP & Locking (133 fixes, 54 docs)
+## SMP & Locking (136 fixes, 56 docs)
 
 ### docs/archive/AKUMA_EXEC_AUDIT.md
 (The `akuma-exec` -> `#![forbid(unsafe_code)]` campaign is a refactor and is not counted — see `AKUMA_EXEC_FORBID_UNSAFE.md`; these are the soundness defects it surfaced and fixed. §5b's triplicated `FrameSource` enum + converters is a duplication cleanup with no bug and is not counted; §6.E group 3 turned out to be non-problems and is not counted.)
@@ -1099,6 +1099,13 @@ aren't recorded anywhere else.)
 
 ### docs/archive/AMD64_TLB_STUCK_MMAP_REGIONS.md
 - `Process::mmap_regions` had no shootdown assist, so a BKL-free `/proc/<pid>/maps` read (`fd::pid_map_rows`) spun IRQ-masked on it while a `munmap` sender held it in `wait_for_acks`, and a multi-threaded `claude` wedged the whole ryzen (no ssh, no ping, no watchdog); it is an `AssistedSpinlock` now (the sibling of the `as_lock` fix)
+
+### docs/archive/KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE.md
+- A service guest's exits were handled with the BKL held, so two vCPU groups on two cores serialised on it (relay bulk 8-11 MB/s against 14-17 MB/s for one vCPU); the `serve` loop now runs inside one dropped-BKL window with lock order device lock -> BKL, taking the BKL only for non-RAM `HostDisk` I/O, the stop check's foreign-pid lookup and `yield_now`'s own switch.
+
+### docs/archive/KVM_CPU_ACCOUNTING.md
+- `/proc/stat` reported cpu0 100 % busy with an idle guest: `allow_tick` halted inside the calling task without crediting the halted time (`idle_loop` already did), so a core whose only task halts that way read fully busy; TSC measurement showed 12-13 % and `allow_tick` now credits its halt.
+- A task spinning on the hypervisor's device lock while holding the BKL deadlocked against a holder that needed the BKL back (found with on-demand cores, `smp::ensure_started`); `lock_dev` now drops the BKL between attempts.
 
 ## Networking (94 fixes, 35 docs)
 
@@ -1810,7 +1817,7 @@ aren't recorded anywhere else.)
 - Every `stat`/`open`/`exec` path component read the whole directory (`lookup_path` -> `read_inode_data` + `parse_directory`), 238 ms per `stat` in that directory; `Ext2Filesystem::find_in_dir` scans block by block and stops at the match (50 stats: 11.9 s -> 0.58 s)
 - herd's `hda-capture` service (`restart = true`, exits at once) wrote a `dmesg-boot-<ts>.txt` into `/root` every ~3 s, 146,113 files and a 5.5 MiB directory in ten days, which is what turned every lookup into a linear scan; the script writes `/var/log/dmesg/hda-boot-*.txt` pruned to the newest 20 and the service is disabled
 
-## Boot & Drivers (129 fixes, 20 docs)
+## Boot & Drivers (139 fixes, 21 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
@@ -1825,6 +1832,14 @@ aren't recorded anywhere else.)
 - §3.10 On a 4 GB microVM Firecracker places the FDT around 6 GiB while `boot.rs` statically maps `[0, 3 GiB)`, so reading `x0` faulted before the kernel printed a word about memory — and `extend_boot_ram_identity_map` cannot help, since it needs the RAM size the FDT is being read to discover; fixed with `mmu::ensure_boot_identity_covers(dtb_ptr)` immediately before `detect_memory`
 - §3.12 Removing `max_level_off` from `akuma-net`'s `log` dependency resurrected 25 previously-dead `log::` statements, several inside preemption-disabled sections, wedging a single-vCPU guest — a print is a lock acquisition, and one inside a section that disables preemption has nothing to yield to on a one-core machine
 - §5.1 Inbound RX never reached the guest: Firecracker's virtio-net reads nothing off the host tap until the **total** capacity of posted receive descriptors reaches `MAX_BUFFER_SIZE` = 65562 bytes, so a single 2 KB buffer left every inbound frame dropped into `no_rx_avail_buffer` with no guest-visible error — TX correct on the wire, `DHCPOFFER` answered, no `DHCPREQUEST`, host ARP unanswered. `RX_BUFFER_LEN` is now 65568; verified end-to-end 2026-08-21 (DHCP lease + operator SSH session) per `AKUMA_FIRECRACKER_TERRAFORM.md` §10
+- The `/dev/kvm` node's `destroy_vm` cleared the whole handle table, including the *new* process's system handle: a second Firecracker run failed with `EBADF`; handles are now reaped by dead owner only.
+- A `/dev/kvm0` create after a Firecracker VM answered `EBUSY` until another `CREATE_VM` happened to reap the dead VM; `vm_live()` now reaps a dead owner itself.
+- `KVM_RUN` never yielded: on a one-core host the Firecracker device thread the doorbell had woken never ran, so the guest waited forever; a `yield_now` between entries (IRQs masked for the switch, as `kvm0` does).
+- The first `KVM_RUN` held the BKL released for the whole run, but the eventfd wake path needs it; the window is now only around `VMRUN`.
+- The ryzen died on the fifth Firecracker run (`#PF` in `talc::free`): a ~6 KiB `Vcpu` + event snapshot moved by value through closures on a 32 KiB heap-allocated kernel stack with no guard page, the probable overflow corrupting the neighbouring heap chunk; the vCPU, CPUID table, FPU image and snapshot are heap-allocated once at `CREATE_VCPU` and `RUN` moves pointers (12/12 runs afterwards; cause probable, not proven).
+- `sched_setaffinity` was a stub returning 0 and `sched_getaffinity` reported every online core whatever had been asked, so `taskset` lied and a VMM's vCPU thread could not be placed; threads carry an inherited core mask (`akuma_vm_spec::affinity`, a reserved `kvmcores=` core runs a thread only if it names it), `KVM_RUN` places vCPU `i` on the `i`-th core of the mask, and herd gets `cpus =`.
+- `/proc/<pid>/stat` field 39 (`processor`) was a constant 0, so no placement could be observed; it reports the core the thread last ran on.
+- Firecracker's `/dev/net/tun` frames were all ignored by the gateway: the generic `writev` made one `write` per iovec, so the 12-byte virtio-net header went out as its own runt frame and the real frame arrived header-less; `writev`/`readv` on the tap are one frame each.
 
 ### docs/archive/GICD_IROUTER_ALIASING.md
 - `GICD_IROUTER` writes landed on the **redistributor**: the distributor was mapped as a single 4 KiB page while `GICD_IROUTER` lives at offset `0x6000`, making `DEV_GIC_DIST_VA + 0x6000` exactly `DEV_GICR_SGI_VA`. Latent on QEMU only because its `GICD_IROUTER` resets to 0, which targets core 0 — the value the code wanted — and would corrupt redistributor state for real at INTID >= 128. Fixed by giving each device a *span* rather than a page in `akuma_primitives::addr`, plus a `const` no-overlap assertion (`DEV_WINDOW_NO_OVERLAP`) and two host tests; the predecessor test compared base addresses only, which is why a 64 KiB device declared as one page went unnoticed
@@ -1983,6 +1998,10 @@ aren't recorded anywhere else.)
 - The touchpad did not count as activity (`idle_ms=` only saw the keyboard), so a finger on the pad did not undim the console; a finger down or a click now calls `input::note_input`
 - `powersaved` cached the brightness it last wrote, so a dim changed by anything else left its restore unwritten; it re-syncs from the `dim=` in the `/proc/power` it already reads each lap
 
+### docs/archive/AKUMA_KVM_DEV_CYCLE.md
+- The firmware on the ryzen rejected its CMOS after every Akuma run because `kvm.rs`'s `crumb()` wrote a step number to CMOS byte `0x7F` around **every `VMRUN` of every guest** (`kvm/linux/machine.rs`), thousands of writes per `kvm0` boot, deterministic and persistent; breadcrumbs now live in a RAM static (`LAST_CRUMB`, shown on the `kvmctl` status line). Found and fixed by goose-glm inside Akuma in one 21-minute session; verified by a clean reboot with a guest still running (`0x7F` untouched, classic checksum OK).
+- The SNTP write-back to the RTC (`clock.rs` `write_rtc_from_sntp`: SET window, hard-coded century `0x32`, status B) was the kernel's only other hand on firmware-owned CMOS and a reset in its window halts the clock with a half-written date; the kernel now makes zero writes to ports `0x70`/`0x71` (`akuma-cmos-rtc::write` stays, host-tested, with no caller), and the rehearsal guests' I/O map also intercepts `0x70`-`0x77`.
+
 ## Signals & Exceptions (40 fixes, 15 docs)
 
 ### docs/archive/CTRL_C_SIGINT_DELIVERY.md
@@ -2056,7 +2075,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_METAL_CONTROL_RUN_2026_10_18.md
 - Emulating a trapped `MRS` with `rt == 31` on AArch64 wrote word 31 of the trap frame (`sp_el0`) instead of discarding the result as `XZR`, as the read side already did
 
-## Misc / Cross-cutting (55 fixes, 18 docs)
+## Misc / Cross-cutting (59 fixes, 19 docs)
 
 ### docs/archive/AKUMA_KVM.md
 (The SVM phases — trivial guest, permission maps + AP hook, the 12-probe consistency ladder, the long-mode metal PASS, the two-level translation phase — are capability, not fixes; the ladder is an instrument, not a defect. These are the two defects the phases surfaced.)
@@ -2167,6 +2186,13 @@ aren't recorded anywhere else.)
 - `embedded-tls` failed every handshake with `api.z.ai` as `DecodeError`, reproducible on a laptop with no Akuma in the path: the server's **informational** `supported_groups` list contains `41` (`curveSM2`), `NamedGroup::parse` returns `InvalidData` for anything outside its ten, and the extension macro turns that into a fatal decode — after `secp256r1` had already been agreed, where RFC 8446 requires unknown values to be ignored. Fixed in the `netoneko/embedded-tls` fork's `akuma-0.19` branch (skip unrecognized code points, with a test pinning that the buffer still ends past the whole list), consumed through `userspace/Cargo.toml`'s `[patch.crates-io]` — the root one has no `embedded-tls` in its lockfile, so a patch there does nothing
 - all three TLS consumers printed the same flat "TLS handshake failed" for failures demanding completely different fixes (`InsufficientSpace`, `InvalidCipherSuite`, `DecodeError`), which is the single biggest reason the above cost a session; `libakuma_tls::tls_error_name` maps every variant and unpacks the two alert-carrying ones
 - the RTL8169 stall watchdog was given a chip-evidence test whose cost was never asked about — `snapshot()` is eleven MMIO reads, on a receive-poll loop that laps thousands of times a second under the BKL — and the box booted into it unreachable, twice: the retry moved the reads behind the `quiet` window, which is true on *every* lap once it passes on an idle link. `MPC` is deleted from the poll path; `INT_RDU` already arrives in the `ISR` harvested every lap and is the better signal. Every gate was green on both dark kernels, and neither fast-lane target runs this driver (both virtio)
+
+### docs/archive/AKUMA_KVM_AKUMA_GUEST.md
+(The phases — Akuma booting under its own hypervisor, two vCPUs, a NIC, ssh into the guest, Gentoo — are capability, not fixes; the UDP-reply stall found in phase 12 is counted under `UDP_REPLY_WAIT_TIMER_STORM.md`, and the guest-timer-rate fix under `AKUMA_KVM_LINUX_GUEST.md`. These are the defects the phases surfaced.)
+- The `PAUSE` intercept exit did not advance RIP (`ExitCode::{Pause,Hlt}`'s doc comment claimed the hardware does), so the SMP guest re-executed the same `PAUSE` forever: 1.5 M exits, no interrupts, a quiet console; the arm steps over it and the comment is corrected.
+- The Akuma guest *scans* for the ACPI RSDP (the kernel ignores `hvm_start_info.rsdp_paddr`), so the first SMP run reported `acpi: none found` although the table was valid; the table page now sits at `0xE0000`, the BIOS window's first address.
+- A stepped-over `HLT` left the interrupt shadow set: `sti; hlt; cli` intercepts `HLT` inside the one-instruction shadow `STI` opens, the handler advanced RIP but left the bit in the VMCB, and the next entry delivered nothing; every place the hypervisor completes an instruction now clears it.
+- The host's Gentoo box re-set the hostname to `localhost` from its OpenRC `conf.d/hostname`, so the herd oneshot that names a guest was not enough; the guests are `akuma-kvm`/`akuma-gentoo` and the host `akuma-ryzen`, split by hostname service.
 
 ## Console & Terminal (58 fixes, 18 docs)
 
@@ -2392,3 +2418,5 @@ Also scanned 2026-10-16 (closing `ugh`, 55 commits ahead of main, 17 archive doc
 Also scanned 2026-10-21 (the `kvm-part-0` branch — the SVM hypervisor phases on the ryzen metal, phase 0 through the two-level translation phase). Counted above: AKUMA_KVM, two fixes (the GIF-left-clear watchdog reset `f9f04d0e` cured with `stgi`; the `cr4::PAE` transposition, `1<<6` for `1<<5`, found by the ladder's `cr4=0x40` tell and fixed in `bbaa81d1`). The branch's other archive docs carry no counted fix: AKUMA_KVMTEST_METAL_DMESG_2026_10_21 and AMD64_KVMTEST_PHASE3_LONGMODE_METAL_DMESG_2026_10_21 are boot logs, AMD64_KVM_REBOOT_NOTE_2026_10_20 is the reboot plan behind the GIF fix above, and AKUMA_FDTABLE_EXTRACTION plus AKUMA_MMU_SAFE_FACADE (`06accb83`, `eee578df`) are behaviour-preserving extractions with host tests, the same no-defect shape as the 2026-09-13 port records. The handoff pair (CRUSH_TO_CLAUDE / CLAUDE_TO_CRUSH) and the rung-4 NPT transcription (constants pinned by test, no defect) are records, not fixes.
 
 Also scanned 2026-10-22 (the `kvm-linux-rung` branch — the Linux guest under the SVM hypervisor, phases 5 through 8). Counted above: AKUMA_KVM_LINUX_GUEST, five fixes (the PVH note type and its unpadded walk; the version-0 `hvm_start_info` layout; `kvm::late` before the host tick; FADT `HW_REDUCED_ACPI` deleting the guest's PIC; the missing UART THRE interrupt). The `/proc/<tid>/maps` change (`7fec263c`) is a fix already counted under its own doc. The rung-6 metal dmesg (AMD64_KVMTEST_PHASE6_LINUX_METAL_DMESG_2026_10_22) is a boot log, not a fix; the `RDPMC` `#UD` at guest reboot is an open question with a workaround (`nmi_watchdog=0`), not a counted fix. AMD64_KVMTEST_PHASE8_VIRTIO_METAL_DMESG_2026_10_22 is a boot log, and AMD64_WIFI_JOIN_LATENCY_2026_10_22 records an open, unexplained delay — neither is a counted fix.
+
+Also scanned 2026-10-23 (the `kvm-part-1` branch — the SVM hypervisor, `kvm0` guests under herd, the `/dev/kvm` node, affinity, `/dev/net/tun`, the goose-glm dev cycle, 114 commits — ahead of merging it to `main`). Counted above: AKUMA_FIRECRACKER_KVM gained eight (the `/dev/kvm` node's handle-table, `EBUSY`, yield and BKL-window bugs, the 5th-run heap corruption, the `sched_setaffinity` stub, the constant `processor` field, the per-iovec `writev` on the tap), AKUMA_KVM_DEV_CYCLE (the CMOS corruption: two writers) is new under Boot & Drivers, AKUMA_KVM_AKUMA_GUEST (four) under Misc / Cross-cutting, and KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE (one) and KVM_CPU_ACCOUNTING (two) under SMP & Locking. Carry no counted fix: AKUMA_IPV6 (a scoping note — a missing feature, not a defect), AKUMA_KVM_NETBSD_GUEST (a capability; its "not obvious" list is traps — one VM at a time, `console=com` required — not defects), KVM_OUTBOUND_NETWORKING (a feature, off by default, with one open item), AMD64_KVM_REBOOT_NOTE_2026_10_21 and the two `docs/handoff/` files (hand-off notes). KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE's second half, the ~63 MB relay wedge and the relay slot that is never freed after it, is **open and pre-existing**, so adds no bullet; the `/dev/net/tun` guest wedge in AKUMA_FIRECRACKER_KVM is **open** (theories ranked in the doc). Fix-shaped commits with no archive doc to cite, named rather than left silent: `b0c82641` (`akuma-mmu` host build, ranged-walk flag only read on the kernel target — a build break, no runtime defect) and `158ed98d` (a clippy sweep). `AKUMA_FDTABLE_EXTRACTION` and `AKUMA_MMU_SAFE_FACADE` stay behaviour-preserving extractions, `CLONE_AUDIT` an audit with its findings counted elsewhere; the already-listed AKUMA_KVM, AKUMA_KVM_LINUX_GUEST, KVM_RELAY_SYN_STALL and UDP_REPLY_WAIT_TIMER_STORM gained nothing new on this branch since their last update.

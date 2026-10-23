@@ -4,7 +4,8 @@
 #   kbuild [-c] [-j N] [-p PKG] [--online] [extra cargo args…]
 #     -c        cargo clean first (that is the trial; an incremental green
 #               build proves much less)
-#     -j N      jobs, default 1 — SMP is on and -j4 has corrupted this build
+#     -j N      jobs, default 1; `-j 4` is the normal setting on a multi-core box (stable for weeks —
+#               the old SMP corruption/wedges are fixed, docs/archive/AMD64_J4_BUILD_CRASH_HUNT.md)
 #     -p PKG    package, default akuma-amd64
 #     --online  drop --offline (needed only after adding a dependency)
 #

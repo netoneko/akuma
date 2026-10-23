@@ -299,7 +299,7 @@ In progress / not yet done:
   command line) and run `gofork` there.
 - The box's traps: an ssh/crush session has **no `PATH`** (full paths, or `. /etc/akuma-dev.env`);
   closing a pty does not kill its children — `kill -9` strays by pid, never `pkill -f`; `-j1` for
-  builds (`-j4` has corrupted builds there). There is no Go toolchain on the box: `gofork` is
+  builds (*correction 2026-10-23: `-j4` has been stable for weeks; the corruption this note feared was fixed, see `AMD64_J4_BUILD_CRASH_HUNT.md`, so use `kbuild -j 4`*). There is no Go toolchain on the box: `gofork` is
   rebuilt on the Mac.
 - Kernel conventions apply: no allocation on the signal path, console output through
   `safe_print!`, `amd64` never `x86`.

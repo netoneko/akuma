@@ -871,6 +871,8 @@ second place to get it wrong.
 
 ### The SMP=4 `-j4` build wedge — the cheap repro
 
+**Status (2026-10-23): historical.** This wedge was root-caused and fixed (a group-fatal kill that could not reach a leader parked in an untimed `FUTEX_WAIT`, 2026-09-18; the rest of the `-j4` family is closed in [`AMD64_J4_BUILD_CRASH_HUNT.md`](../archive/AMD64_J4_BUILD_CRASH_HUNT.md)); `kbuild -j 4` has been stable for weeks. The harness below remains the regression gate: a cell that WEDGEs again is news.
+
 The wedge that blocks a fast in-guest build reproduces on **one crate**, not
 on the 95-crate build it was found with, and it is deterministic:
 

@@ -90,7 +90,7 @@ sockets beyond ssh.)
 
 * **Akuma sessions have no environment.** Every command starts with `. /etc/akuma-dev.env;` (sets `PATH`, `LD_LIBRARY_PATH` for
   rustc, `CARGO_HOME`, `AKUMA_SRC=/src/github.com/netoneko/akuma`) and `export TERM=dumb GIT_PAGER=cat` (otherwise `git` waits on a pager).
-* **`kbuild` is the build** (`-j1` default, `-j4` has corrupted builds; output in `/root/ktarget`, not the checkout; incremental
+* **`kbuild` is the build** (`-j1` is only the wrapper's default: use `kbuild -j 4 --features no-tests`, stable for weeks; output in `/root/ktarget`, not the checkout; incremental
   builds take one to fifteen minutes; never `cargo clean`). `kinstall [elf] [dest]` writes a kernel to a dest, default
   `/boot/akuma-amd64`; **the dev loop installs only to `/boot/akuma-amd64.verify`**, which is menu entry 30's kernel (`arm.sh 29`).
   The default entry's kernel is the fallback and is never touched.
@@ -175,6 +175,53 @@ log) or into a byte the firmware does not cover; make the reset path write 0x0F 
 *Not proven:* that the firmware's own F1 complaint is gone for good (it is the owner's to confirm at the next cold boot, and a stored
 checksum the firmware already distrusts may need one visit to its setup screen to be rewritten); a weak CMOS battery would look the same.
 goose's own note: after the one recovery the source of the corruption is gone.
+
+## 8. What the first run cost (goose-glm, one bug, 2026-10-23)
+
+Measured from goose's own session database (`/root/.local/share/goose/sessions/sessions.db`, copied off Akuma) with
+[`scripts/kvm/goose_stats.py`](../../scripts/kvm/goose_stats.py); the raw logs and the JSON are in `scripts/kvm/dev_cycle_out/goose/`
+(git-ignored; regenerate with `dev_cycle.py`-style pulls: `cat` the db, `-wal` and `-shm` off Akuma). Model `glm-5.3-flash`
+(z.ai coding plan, `GOOSE_THINKING_EFFORT=low`, `goose 1.52.0`), tools `shell` / `edit` / `write` from the `developer` extension.
+
+| | warm-up (task 00, no code change) | CMOS bug (task 01) | both |
+|---|---:|---:|---:|
+| wall time (session start to last message) | 4 m 52 s | **20 m 54 s** | 25 m 46 s |
+| LLM requests (usage-ledger rows) | 22 | 57 | 79 |
+| input tokens | 315,541 | 3,787,524 | 4,103,065 |
+| of which served from the provider's cache | 291,264 (92 %) | 3,686,144 (97 %) | 3,977,408 |
+| output tokens | 7,063 | 38,335 | 45,398 |
+| total tokens | 322,604 | 3,825,859 | 4,148,463 |
+| time inside the LLM (provider `elapsedMs`) | 212 s | 1,166 s (93 % of wall) | 1,378 s |
+| mean time to first token | 6.5 s | 10.3 s | |
+| tool calls (distinct) | 21 | 74 | 95 |
+| of which `shell` / `edit` / `write` | 16 / 3 / 2 | 60 / 12 / 2 | 76 / 15 / 4 |
+| tool execution and everything else (wall minus LLM) | 80 s | 88 s | 168 s |
+| reasoning text written ("thinking") | 8 k chars | 139 k chars | |
+| prose written to the user | 3.6 k chars | 8.1 k chars | |
+
+**Timeline of the bug session** (seconds from the first message): 0 task read; **700 s (11 m 40 s, 47 tool calls)** investigating
+before the first source edit (`amd64/src/kvm.rs`); 949 s first `kbuild` (51 s of the 88 s of tool time); 1,017 s the fresh kernel started as
+a `kvm0` guest (`AKUMA-GUEST-DONE`, `exc=0`); **1,100 s (18 m 20 s) `git commit`**; 1,242 s last call. Tool calls: ~65 % reading/searching
+(`grep`, `sed -n`, `cat` of the CMOS, clock, reboot and VMCB code), 12 `edit`s over four files, one build, one guest boot, one install.
+The commit message, `READY-FOR-REBOOT` and `QUESTIONS.md` it wrote were accurate when checked against the code and the reboot tests.
+
+**Per fixed bug**, for planning the next experiment (the bug is one defect with two writers; the model counted it as two fixes plus a
+hardening of the rehearsal I/O map):
+
+* **~21 minutes of agent wall time, ~3.8 M tokens (97 % cached, 38 k generated), 57 model requests, 74 tool calls.** Cost is dominated by
+  the model: 93 % of the wall time was the provider thinking, not Akuma building (an incremental kernel build is ~1 minute, measured at the wrapper's default `-j1`; the briefs now say `-j 4`).
+* **The orchestrator's share** (this laptop session): sync, two briefs, one `reboot-test` of ~2 minutes of machine time each, a CMOS dump
+  on Pop each time. From brief to a verified result (checksum OK, Pop and Akuma back, no exceptions; the discriminating
+  reboot-while-a-guest-runs test also passed): about **25 minutes wall**, of which ~4 minutes were reboots. The briefing took far longer
+  than the work (the manual, the task file, the orchestration script were written for this run and are now reusable).
+* Cache hit rates this high mean the per-turn cost is the growing context, not new text: the session re-read ~3.7 M tokens of its own
+  history. A summarising/compacting step or shorter tool output (`grep -n | head`, `sed -n` windows) is the lever, not a bigger model.
+* What cost nothing: no Firecracker, no QEMU, no reboot by the agent; the whole loop ran against real hardware with ~2 minutes of
+  machine time per cycle.
+
+**Caveats.** One bug, one model, one sitting, a bug that was visible by reading code (no hardware heisenbug); the briefing named the
+suspects, which shortened the search (the extra suspects added by the orchestrator, the IOPM and the 0x7F range, were both checked and
+one of them, the 0x7F breadcrumb, was the cause); goose does not report money (the plan is flat-rate), so there is no cost figure.
 
 ## Background
 
