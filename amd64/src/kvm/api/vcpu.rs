@@ -857,6 +857,8 @@ mod evring {
     }
 }
 
+static TRACE_DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 static IDLE_TURNS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// A guest idling a long time with nothing due is the signature of a lost interrupt: say what it is waiting on, a
@@ -864,7 +866,12 @@ static IDLE_TURNS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 fn idle_note(vc: &mut Vcpu, now: u64, due: Option<u64>, can_wake: bool) {
     use core::sync::atomic::Ordering;
     let n = IDLE_TURNS.fetch_add(1, Ordering::Relaxed);
-    if n == 0 || !n.is_multiple_of(4000) || n > 4000 * 6 {
+    if n == 0 || !n.is_multiple_of(4000) {
+        return;
+    }
+    // The lost-interrupt signature: halted with IF set and nothing that could ever wake the guest.
+    let stuck = due.is_none() && !can_wake;
+    if n > 4000 * 6 && !(stuck && !TRACE_DUMPED.load(Ordering::Relaxed)) {
         return;
     }
     let (rip, rflags) = {
@@ -886,7 +893,7 @@ fn idle_note(vc: &mut Vcpu, now: u64, due: Option<u64>, can_wake: bool) {
     s(" can_wake=");
     s(if can_wake { "yes" } else { "no" });
     s("\n");
-    if n == 4000 && due.is_none() && !can_wake {
+    if stuck && !TRACE_DUMPED.swap(true, Ordering::Relaxed) {
         evring::dump();
     }
 }
@@ -898,6 +905,7 @@ pub(super) fn reset_trace() {
     EXITS_TRACED.store(0, core::sync::atomic::Ordering::Relaxed);
     IDLE_TURNS.store(0, core::sync::atomic::Ordering::Relaxed);
     evring::reset();
+    TRACE_DUMPED.store(false, core::sync::atomic::Ordering::Relaxed);
     PLACED_TRACED.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
