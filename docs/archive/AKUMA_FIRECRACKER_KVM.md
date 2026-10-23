@@ -417,15 +417,34 @@ sent Firecracker's output to a file inside the guest looked like a hang for the 
 before the cap); with the console as stdout it is visibly slow, not stuck. If it matters, the next refinement is to mask only the
 vCPU threads (a per-thread `cpus`), which the node can do by itself now that it reads the thread's mask.
 
-*Not yet done:* the ryzen (metal) verification; a thread that is blocked or running elsewhere when its mask changes migrates at its
+*Not yet done:* a thread that is blocked or running elsewhere when its mask changes migrates at its
 next switch-out, not at once (only the caller moves immediately); `sched_setaffinity` on a tid that is not a Process thread is `ESRCH`;
 herd's `cpus` applies to the spawn only, not to a later `herd` restart of an already-running service's children.
+
+### CPU affinity on the ryzen (metal, 2026-10-23, kernel `0bb4f8c`, built on the ryzen, entry 30, `kvmcores=4-7`)
+
+* `taskset -c 4/5/6/7/4-5 <spin>` ran on core 4 / 5 / 6 / 7 / 5 (processor field of `/proc/self/stat`); `taskset -c 9` is `EINVAL`;
+  an unmasked shell stayed on core 3. Reserved cores took only threads that named them.
+* **Firecracker as a herd service with `cpus = 6-7`** (`/etc/herd/available/fc-test.conf`, `command = /root/fc/firecracker ...`):
+  `[KVM] vcpu 0 -> core 6 (thread affinity 0xc0, kvmcores 0xf0)`; the guest printed its banner, both md5s (`ebce4301...`,
+  `71277886...`), `AKUMA-GUEST-DONE`, then Firecracker's `Hlt`. No `[EXCEPTION]` in dmesg.
+* After it: `herd start vm-serve-mc` and `ssh -p 2223` into the `kvm0` guest still work.
+
+### Networking under Firecracker: today it does not start (2026-10-23)
+
+`"network-interfaces":[{"iface_id":"eth0","host_dev_name":"tap0",...}]` makes Firecracker exit before the first `RUN`:
+`Open tap device failed: Couldn't open /dev/net/tun: No such file or directory`. There is no `/dev/net/tun` node. What it would
+take: a tun/tap node (`TUNSETIFF` with `IFF_TAP|IFF_NO_PI|IFF_VNET_HDR`, `TUNSETOFFLOAD`, `TUNSETVNETHDRSZ`, read/write of
+frames with the virtio-net header, `EPOLLIN` readiness) whose far end is the `kvm0` gateway (`akuma_svm_amd64::gateway`: ARP,
+DHCP, ICMP echo, port forwards, and with `vm_outbound` TCP/DNS out through `kvm/relay.rs`). The gateway is host-tested; the
+missing parts are the node itself, a pump that runs without `kvm0`'s coordinator loop (the relay is driven from it today), and
+frame hand-off to a Firecracker virtio-net device whose guest driver is the Akuma guest's own.
 
 ## Before the KVM work is finished
 
 In the owner's order of importance (2026-10-23), nothing below is done:
 
-1. **CPU affinity** (built and rehearsed on TCG 2026-10-23, § *CPU affinity: built and rehearsed*; metal result below once run). (a) Place the vCPU threads of a `/dev/kvm` VM on chosen cores the way `kvm0` places its vCPUs
+1. **CPU affinity** (built and rehearsed on TCG 2026-10-23, § *CPU affinity: built and rehearsed*; metal result: § *CPU affinity on the ryzen*). (a) Place the vCPU threads of a `/dev/kvm` VM on chosen cores the way `kvm0` places its vCPUs
    (`vm_cores`, `kvmcores=`, `sched::reserve_cores`): a herd key on a `command =` service (a `cpus = 4-7` style list) handed to
    the node, and `repin_current` choosing from it instead of "wherever the thread is". (b) `sched_setaffinity` (today only
    `sched_getaffinity` exists), so `taskset` and any service can be pinned, and a herd key that applies it to the process.
