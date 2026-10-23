@@ -355,11 +355,77 @@ says so.
 * The box's own `ssh` client takes no `-o` options (`cannot resolve host '-o'`); use `ssh -p 2223 root@127.0.0.1 'cmd'`, or go
   in from the Mac.
 
+## CPU affinity (design, 2026-10-23)
+
+**Problem.** `KVM_RUN` pins its thread to "whatever core it happens to be on" (`repin_current(me)` in `api/vcpu.rs`), and
+the scheduler knows one thing per thread, `Machine::pinned` (a single core or `NO_CPU`). `sched_setaffinity` is a
+stub returning 0 in glue; `sched_getaffinity` reports "all online cores" whatever was asked. Firecracker has no pinning
+option, so placement has to come from outside the process, the way `taskset` does it.
+
+**Model: one mask per thread, inherited.** `Machine` gains `affinity: AtomicU64` (0 = any core, the default; bit `c` =
+core `c`), beside `pinned`, which stays the kernel's *hard* single-core pin (hypervisor run loop). A thread may run on core
+`cpu` iff `pinned` allows it **and** `affinity` allows it. The decision is `akuma_vm_spec::affinity::can_run` (pure,
+host-tested); `sched::hook_can_run` only loads the three words. A new slot inherits its creator's mask in
+`prepare_task_slot` (Linux: fork/clone/exec keep it), so `taskset -c 4-7 cmd` and a herd service need no per-thread work.
+
+**Reserved cores (`kvmcores=`).** Today a reserved core runs only threads *pinned* to it. The rule becomes: a reserved core runs
+a thread iff it is pinned there **or its affinity mask names that core**. An unpinned, unmasked thread (sshd, everything
+default) never lands on a reserved core, which is the property to keep; a thread that *asks* for core 5 gets it, which is how
+a service reaches a reserved core without a kernel special case. Core 0 is never reserved.
+
+**`sched_setaffinity(tid, len, mask)`** (amd64-native arm, not glue's no-op): `tid` 0 = caller, else a Process pid (its
+`thread_id` slot). Mask is read as little-endian bytes, bits >= 64 must be zero; the effective mask is the request intersected
+with the online cores, empty = `EINVAL` (Linux). A mask covering every online core is stored as 0. Setting the caller's own
+mask moves it at once if it stands on a core the mask excludes (park loop as `repin_current`); another thread migrates at its
+next switch-out. `sched_getaffinity` returns the stored mask (0 = all online), same byte count rule as before.
+
+**vCPU placement in `/dev/kvm`.** The vCPU thread's own affinity *is* the placement request, so no new ioctl: in `run_pinned`,
+`wanted` = the thread's mask (0 = none), `allowed` = `kvmcores=` when set, else all online cores; `cores::place(wanted, allowed,
+core_ready, id + 1)[id]` is vCPU `id`'s core (vCPU i -> i-th candidate, wrapping). With no mask and no `kvmcores=` nothing changes:
+the thread stays where it is. The thread is moved there with `repin_current` (hard pin for the run, released by `Pinned`),
+leaving `affinity` as the VMM set it.
+
+**Herd key `cpus = 4-7`** on any service (including a `command = firecracker ...` one): herd parses it with
+`cores::parse`, sets *its own* affinity to the mask around the `spawn` call (the child inherits at slot creation, so no
+window in which it runs elsewhere), then restores it. Plain `taskset` works for ad-hoc runs. Mutually exclusive with the
+multikernel `core =` key.
+
+**Allocation analysis.** Nothing allocates: a `u64` per slot, byte copies on the stack (<= 128 B mask buffer).
+
+### CPU affinity: built and rehearsed (TCG, 2026-10-23)
+
+*Built as designed above.* Pure: `akuma_vm_spec::affinity` (`decode`, `effective`, `report`, `can_run`; 6 host tests, including
+the reserved-core rule and "a hard pin to a core the mask excludes runs nowhere"). Effect: `sched::{affinity_of, set_affinity}`,
+`Machine::affinity` inherited in `prepare_task_slot`, `hook_can_run` calling `can_run`; `sched_setaffinity` is a new
+`akuma-syscalls-abi` row (203 / 122) with amd64-native arms for both calls in `usermode.rs` (the glue arm stays a no-op for
+AArch64); `placed_core` in `api/vcpu.rs`; herd's `cpus` key (`userspace/herd`, `cpus_enter`/`cpus_leave` around the spawn).
+`/proc/<pid>/stat` field 39 (`processor`) used to be a constant 0 and now reports the core the thread last ran on
+(`akuma-procfs::ProcStat::processor`, from `threading::get_thread_last_core`), which is what makes placement observable.
+
+*Rehearsal* (QEMU TCG `-smp 4`, `smp=4 kvmctl kvmmem=1024 kvmapi kvmcores=2-3`, `scripts/kvm/firecracker_phase0.sh` with `QSMP=4`,
+Alpine edge `firecracker` 1.17.0; the rig now links `taskset`/`cut`/`kill` into the guest root):
+
+| run | result |
+|---|---|
+| `taskset -c 2/3/1-2 sh -c '<spin>; cut -d" " -f39 /proc/self/stat'` | processor `2` / `3` / `2`; `taskset -p` reads back `4`, `8`, `6`; `taskset -c 5 true` fails (`EINVAL`, only 4 cores) |
+| `firecracker ...` with no mask, `kvmcores=2-3` | `[KVM] vcpu 0 -> core 2 (thread affinity 0x0, kvmcores 0xc)`; guest banner, both md5s, `AKUMA-GUEST-DONE`, then `Hlt` — about 30 s |
+| `taskset -c 3 firecracker ...` | `[KVM] vcpu 0 -> core 3 (thread affinity 0x8, kvmcores 0xc)`; same guest output — about 115 s |
+
+The gap is not a bug in placement: `taskset` on the *whole* VMM puts its API/device threads on the vCPU's core, where they take
+turns with the vCPU thread (the `yield_now` between entries), while with no mask they ran on other cores. A first attempt that
+sent Firecracker's output to a file inside the guest looked like a hang for the same reason (nothing printed for 25 minutes
+before the cap); with the console as stdout it is visibly slow, not stuck. If it matters, the next refinement is to mask only the
+vCPU threads (a per-thread `cpus`), which the node can do by itself now that it reads the thread's mask.
+
+*Not yet done:* the ryzen (metal) verification; a thread that is blocked or running elsewhere when its mask changes migrates at its
+next switch-out, not at once (only the caller moves immediately); `sched_setaffinity` on a tid that is not a Process thread is `ESRCH`;
+herd's `cpus` applies to the spawn only, not to a later `herd` restart of an already-running service's children.
+
 ## Before the KVM work is finished
 
 In the owner's order of importance (2026-10-23), nothing below is done:
 
-1. **CPU affinity.** (a) Place the vCPU threads of a `/dev/kvm` VM on chosen cores the way `kvm0` places its vCPUs
+1. **CPU affinity** (built and rehearsed on TCG 2026-10-23, § *CPU affinity: built and rehearsed*; metal result below once run). (a) Place the vCPU threads of a `/dev/kvm` VM on chosen cores the way `kvm0` places its vCPUs
    (`vm_cores`, `kvmcores=`, `sched::reserve_cores`): a herd key on a `command =` service (a `cpus = 4-7` style list) handed to
    the node, and `repin_current` choosing from it instead of "wherever the thread is". (b) `sched_setaffinity` (today only
    `sched_getaffinity` exists), so `taskset` and any service can be pinned, and a herd key that applies it to the process.

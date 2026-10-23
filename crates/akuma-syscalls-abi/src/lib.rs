@@ -522,6 +522,8 @@ syscall_table! {
     /// pool from it**, so `ENOSYS` here quietly makes every in-guest build
     /// single-threaded — a performance answer delivered as an error.
     SchedGetaffinity => SCHED_GETAFFINITY = 204, nr::SCHED_GETAFFINITY;
+    /// Pin a thread to a set of cores (`taskset`, herd's `cpus =`). Handled natively on amd64.
+    SchedSetaffinity => SCHED_SETAFFINITY = 203, nr::SCHED_SETAFFINITY;
     /// File-creation mask. musl reads it during start-up; glue answers the
     /// conventional `0o022` rather than tracking one.
     Umask      => UMASK      = 95,  nr::UMASK;
@@ -956,6 +958,7 @@ mod tests {
             (Syscall::Umask, 95, 166),
             (Syscall::Prctl, 157, 167),
             (Syscall::SchedGetaffinity, 204, 123),
+            (Syscall::SchedSetaffinity, 203, 122),
             (Syscall::Fchownat, 260, 54),
             (Syscall::Linkat, 265, 37),
             (Syscall::Membarrier, 324, 283),

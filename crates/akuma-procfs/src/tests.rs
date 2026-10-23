@@ -14,13 +14,24 @@ use std::format;
 use super::*;
 
 fn stat_of(pid: u32, ppid: u32, name: &str, state: ProcState, us: u64) -> ProcStat<'_> {
-    ProcStat { pid, ppid, state, name, cpu_time_us: us, uid: 0, gid: 0, groups: &[] }
+    ProcStat { pid, ppid, state, name, cpu_time_us: us, uid: 0, gid: 0, groups: &[], processor: 0 }
 }
 
 fn render_stat_str(p: &ProcStat) -> String {
     let mut buf = [0u8; STAT_LINE_MAX];
     let n = render_pid_stat(p, &mut buf);
     String::from_utf8(buf[..n].to_vec()).unwrap()
+}
+
+/// `processor` is field 39 (`taskset`-style tools and `top`'s `P` column read it).
+#[test]
+fn stat_line_reports_the_core_in_field_39() {
+    let mut p = stat_of(42, 7, "/bin/busybox", ProcState::Running, 0);
+    p.processor = 5;
+    let line = render_stat_str(&p);
+    let fields: Vec<&str> = line.trim_end().split(' ').collect();
+    assert_eq!(fields.len(), 44);
+    assert_eq!(fields[38], "5");
 }
 
 /// The whole reason the crate exists: `ps` finds `utime` by counting to field

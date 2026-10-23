@@ -209,6 +209,8 @@ pub mod syscall {
         /// asm-generic `getpid`. See [`super::super::getpid`] for why the
         /// number lives here rather than as a literal at the call site.
         pub const GETPID: u64 = 172;
+        pub const SCHED_SETAFFINITY: u64 = 122;
+        pub const SCHED_GETAFFINITY: u64 = 123;
         pub const SET_TID_ADDRESS: u64 = 96;
         pub const EXIT_GROUP: u64 = 94;
         pub const SET_TPIDR_EL0: u64 = 320;
@@ -302,6 +304,8 @@ pub mod syscall {
         /// here. The kernel agrees: `akuma-syscalls-abi` has
         /// `Getpid => GETPID = 39, nr::GETPID`.
         pub const GETPID: u64 = 39;
+        pub const SCHED_SETAFFINITY: u64 = 203;
+        pub const SCHED_GETAFFINITY: u64 = 204;
         pub const SET_TID_ADDRESS: u64 = 218;
         pub const EXIT_GROUP: u64 = 231;
         pub const SET_TPIDR_EL0: u64 = AKUMA_PRIVATE_BASE + 320;

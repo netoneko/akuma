@@ -319,10 +319,15 @@ what is unconfirmed: [`../../archive/AKUMA_FIRECRACKER_KVM.md`](../../archive/AK
   No `kvmmem=` or no room: `ENOMEM`. Guest RAM <= 1 GiB, regions 2 MiB aligned, a slot is set once, no dirty logging.
   **A VMM that forks after `CREATE_VM` is logged** (`[kvmapi] WARNING`), not prevented: the child would CoW-share frames
   the guest writes through.
-- **`KVM_RUN` is the VMM thread's syscall.** The thread is pinned to its core (`sched::repin_current`; SVM enabled on
+- **`KVM_RUN` is the VMM thread's syscall.** The thread is pinned for the run to its vCPU's core (`sched::repin_current`; SVM enabled on
   demand), the host FPU/SSE state is saved around every `VMRUN`, the BKL is released **only** around `VMRUN` (the exit path
   and the eventfd wake need it held), and `yield_now` runs between entries because the kernel switches cooperatively (a
   woken device thread otherwise never runs on a one-core host). Signals end it with `EINTR`.
+- **Placement is the vCPU thread's affinity** (`taskset -c 4-7 firecracker ...`, or `cpus = 4-7` on a herd service; both are
+  `sched_setaffinity`, inherited by the threads the VMM creates). vCPU `i` runs on the `i`-th core of that mask intersected with
+  `kvmcores=` (`akuma_vm_spec::cores::place`); with no mask and no `kvmcores=` the thread stays where it is, with no mask and
+  `kvmcores=` the vCPUs spread over the reserved cores. `[KVM] vcpu N -> core C` is logged for the first runs. A reserved core
+  runs only threads pinned to it or whose affinity names it. Design: `../../archive/AKUMA_FIRECRACKER_KVM.md` § *CPU affinity*.
 - **Exits.** CPUID (from the VMM's own table), MSRs, PIT/PIC ports and the LAPIC page are the kernel's; every other port and
   MMIO address is returned through the run page and completed at the next `RUN`. A registered `IOEVENTFD` doorbell signals its
   eventfd and never leaves the kernel; an `IRQFD` eventfd is **polled** at every entry and idle wake and raises PIC pin `gsi`

@@ -279,6 +279,11 @@ struct ServiceConfig {
     /// via that core's console ring, and its exit is reaped by that core's kernel.
     /// Mutually exclusive with boxes (see `is_boxed`).
     core: u32,
+    /// `cpus = 4-7`: the host cores the service (and everything it spawns) may run on, 0 = any.
+    /// herd sets its own affinity to the mask around the spawn, so the child is born with it
+    /// (affinity is inherited) and never runs elsewhere; a core the kernel does not have is
+    /// refused by the kernel and the service starts unrestricted, with a warning.
+    cpus: u64,
     /// `vm = true`: this service is a KVM guest (`docs/reference/subsystems/kvm.md`). The
     /// supervised process is `herd vm-run <spec file>`; `command` is [`vm::HELPER`].
     vm: Option<akuma_vm_spec::Spec>,
@@ -304,6 +309,7 @@ impl Default for ServiceConfig {
             workdir: String::new(),
             console: false,
             core: 0,
+            cpus: 0,
             vm: None,
         }
     }
@@ -697,6 +703,17 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                         config.env.push(String::from(value));
                     }
                 }
+                "cpus" => match akuma_vm_spec::cores::parse(value) {
+                    Some(mask) => config.cpus = mask,
+                    None if value.is_empty() => {}
+                    None => {
+                        if !cfg!(test) {
+                            print("[herd] Warning: bad cpus = value ignored: ");
+                            print(value);
+                            print("\n");
+                        }
+                    }
+                },
                 "core" => {
                     config.core = value.parse::<u64>().ok().unwrap_or(0) as u32;
                 }
@@ -1081,6 +1098,39 @@ fn vm_run(spec_path: &str) -> ! {
     exit(1);
 }
 
+/// `sched_setaffinity(0, ..)` on herd itself; returns the mask to hand back to [`cpus_leave`]
+/// (`None` when nothing was changed). x86_64 only: the AArch64 kernel treats the call as a no-op.
+fn cpus_enter(mask: u64) -> Option<u64> {
+    if mask == 0 {
+        return None;
+    }
+    let prev = cpus_get();
+    if cpus_set(mask) == 0 {
+        Some(prev)
+    } else {
+        print("[herd] Warning: cpus = refused by the kernel; starting unrestricted\n");
+        None
+    }
+}
+
+fn cpus_leave(prev: Option<u64>) {
+    if let Some(m) = prev {
+        // `sched_getaffinity` reports "all cores" as an explicit full mask; setting that back is "any".
+        let _ = cpus_set(m);
+    }
+}
+
+fn cpus_get() -> u64 {
+    let mut m = [0u64; 2];
+    let n = libakuma::syscall(libakuma::syscall::SCHED_GETAFFINITY, 0, 16, m.as_mut_ptr() as u64, 0, 0, 0);
+    if (n as i64) < 8 { u64::MAX } else { m[0] }
+}
+
+fn cpus_set(mask: u64) -> u64 {
+    let m = [mask, 0u64];
+    libakuma::syscall(libakuma::syscall::SCHED_SETAFFINITY, 0, 16, m.as_ptr() as u64, 0, 0, 0)
+}
+
 fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     // Core-pinned service (multikernel): don't spawn locally. Hand the command to the
     // target core's kernel via core_init — the activation message carries the program
@@ -1206,6 +1256,7 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     }
     print("\n");
 
+    let prev_cpus = cpus_enter(config.cpus);
     let spawn_res = if let Some(spec) = &config.vm {
         spawn_vm_helper(name, spec)
     } else if !config.join_box.is_empty() {
@@ -1354,6 +1405,8 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
             sys::spawn_ext_env(&config.command, args_opt, env.as_deref(), None, &mut options)
         }
     };
+
+    cpus_leave(prev_cpus);
 
     match spawn_res {
         Some(SpawnResult { pid, stdout_fd }) => {

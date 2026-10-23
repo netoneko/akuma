@@ -309,6 +309,10 @@ struct Machine {
     /// is pinned to the boot core — it drives the self-tests against that core's
     /// LAPIC — and every idle thread to its own.
     pinned: AtomicU32,
+    /// The cores this thread may use (`sched_setaffinity`; bit `c` = core `c`), or 0 for any.
+    /// Inherited by every slot this thread creates ([`prepare_task_slot`]); the decision is
+    /// `akuma_vm_spec::affinity::can_run`.
+    affinity: AtomicU64,
 }
 
 /// A thread's two stacks, as memory the kernel owns and the CPU also writes.
@@ -359,6 +363,7 @@ impl Machine {
             daemon: AtomicBool::new(false),
             idle: AtomicBool::new(false),
             pinned: AtomicU32::new(NO_CPU),
+            affinity: AtomicU64::new(0),
         }
     }
 }
@@ -639,11 +644,14 @@ fn hook_can_run(slot: usize) -> bool {
     if m.idle.load(Ordering::Relaxed) {
         return false;
     }
-    // A reserved core (a running VM's, see [`reserve_cores`]) runs only what is pinned to it.
-    if pinned != cpu && RESERVED_CORES.load(Ordering::Relaxed) & (1 << cpu) != 0 {
-        return false;
-    }
-    pinned == NO_CPU || pinned == cpu
+    // A reserved core (a running VM's, see [`reserve_cores`]) runs only what is pinned to it
+    // or what asked for it by affinity.
+    akuma_vm_spec::affinity::can_run(
+        (pinned != NO_CPU).then_some(pinned),
+        m.affinity.load(Ordering::Relaxed),
+        RESERVED_CORES.load(Ordering::Relaxed),
+        cpu,
+    )
 }
 
 /// Cores kept for tasks pinned to them: the picker never hands an unpinned thread to one.
@@ -656,6 +664,30 @@ static RESERVED_CORES: AtomicU64 = AtomicU64::new(0);
 /// Reserve the cores in `mask` (bit `c` = core `c`; bit 0 is ignored); 0 releases them all.
 pub fn reserve_cores(mask: u64) {
     RESERVED_CORES.store(mask & !1, Ordering::Relaxed);
+}
+
+/// The affinity mask of task `slot` (0 = any core).
+pub fn affinity_of(slot: usize) -> u64 {
+    MACHINE.get(slot).map_or(0, |m| m.affinity.load(Ordering::Relaxed))
+}
+
+/// Set the affinity mask of task `slot` (already normalised by `akuma_vm_spec::affinity::effective`).
+/// If `slot` is the running thread and stands on a core the mask excludes, it moves now (parks until
+/// a picker on an allowed core hands it back); any other thread leaves at its next switch-out.
+/// False if the running thread could not be moved.
+pub fn set_affinity(slot: usize, mask: u64) -> bool {
+    let Some(m) = MACHINE.get(slot) else { return false };
+    m.affinity.store(mask, Ordering::Relaxed);
+    if slot != current() || mask == 0 || mask & (1 << smp::cpu_index()) != 0 {
+        return true;
+    }
+    for _ in 0..200 {
+        block_until_deadline(crate::net::uptime_us() + 500);
+        if mask & (1 << smp::cpu_index()) != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Let the running thread go to any core again (undo [`repin_current`]).
@@ -2137,6 +2169,8 @@ pub fn prepare_task_slot(slot: usize) -> Option<usize> {
     m.daemon.store(false, Ordering::Relaxed);
     m.idle.store(false, Ordering::Relaxed);
     m.pinned.store(NO_CPU, Ordering::Relaxed);
+    // A child starts where its creator may run (fork/clone/exec keep the mask).
+    m.affinity.store(MACHINE[current()].affinity.load(Ordering::Relaxed), Ordering::Relaxed);
     m.uctx.set(UserCtx::new());
     m.fx.set(FxArea::initial());
     Some(stack_top)

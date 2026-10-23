@@ -138,6 +138,8 @@ pub struct ProcStat<'a> {
     pub uid: u32,
     pub gid: u32,
     pub groups: &'a [u32],
+    /// The core the thread last ran on (`stat` field 39, `processor`); 0 when it never ran.
+    pub processor: u32,
 }
 
 impl ProcStat<'_> {
@@ -197,11 +199,12 @@ pub fn render_pid_stat(p: &ProcStat, buf: &mut [u8]) -> usize {
     let comm = p.comm();
     let state = p.state.stat_char();
     let utime = p.utime_jiffies();
+    let processor = p.processor;
     let mut pos = 0usize;
     let mut w = FmtBuf { buf, pos: &mut pos };
     let _ = writeln!(
         w,
-        "{pid} ({comm}) {state} {ppid} {pid} {pid} 0 -1 0 0 0 0 0 {utime} 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+        "{pid} ({comm}) {state} {ppid} {pid} {pid} 0 -1 0 0 0 0 0 {utime} 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {processor} 0 0 0 0 0"
     );
     pos
 }

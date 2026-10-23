@@ -392,9 +392,36 @@ pub(super) fn run(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Tabl
     r
 }
 
+/// The core vCPU `id` belongs on: its thread's affinity mask (what `taskset` or herd's `cpus =`
+/// set on the VMM) against `kvmcores=` (every online core when absent), vCPU `i` on the `i`-th
+/// candidate. `None` (stay where the thread is) when neither a mask nor `kvmcores=` says anything.
+static PLACED_TRACED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn placed_core(id: usize) -> Option<usize> {
+    let wanted = crate::sched::affinity_of(akuma_exec::threading::current_thread_id());
+    let kvm = crate::kvm::vm_cores();
+    if wanted == 0 && kvm == 1 {
+        return None;
+    }
+    let online = crate::smp::online_cpus();
+    let allowed = if kvm == 1 { akuma_vm_spec::affinity::online_mask(online) } else { kvm };
+    let placed = akuma_vm_spec::cores::place(wanted, allowed, |c| (c as usize) < online, id + 1)?;
+    Some(usize::from(*placed.get(id.min(akuma_vm_spec::cores::MAX_PLACED - 1))?))
+}
+
 fn run_pinned(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64, ev: &Events) -> u64 {
     // The core must have SVM on and the thread must stay on it.
-    let mut me = crate::smp::cpu_index();
+    let mut me = placed_core(vc.id).unwrap_or_else(crate::smp::cpu_index);
+    if PLACED_TRACED.fetch_or(1 << (vc.id & 31), core::sync::atomic::Ordering::Relaxed) & (1 << (vc.id & 31)) == 0 {
+        akuma_primitives::safe_print!(
+            128,
+            "[KVM] vcpu {} -> core {} (thread affinity {:#x}, kvmcores {:#x})\n",
+            vc.id,
+            me,
+            crate::sched::affinity_of(akuma_exec::threading::current_thread_id()),
+            crate::kvm::vm_cores()
+        );
+    }
     for _ in 0..3 {
         if !crate::sched::repin_current(me) {
             return errno::EAGAIN;
@@ -793,6 +820,7 @@ static EXITS_TRACED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 pub(super) fn reset_trace() {
     EXITS_TRACED.store(0, core::sync::atomic::Ordering::Relaxed);
     IDLE_TURNS.store(0, core::sync::atomic::Ordering::Relaxed);
+    PLACED_TRACED.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// The first 24 exits of a VM, then one in 8192: code, rip, the two info words (the `kvmapi` census instrument).

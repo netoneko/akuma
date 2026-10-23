@@ -1716,7 +1716,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         Syscall::Prctl => to_glue(call, [a1, a2, a3, a4, a5, 0]),
         // `rustc` sizes its codegen thread pool from this one, so an `ENOSYS`
         // was quietly making every in-guest build single-threaded.
-        Syscall::SchedGetaffinity => to_glue(call, [a1, a2, a3, 0, 0, 0]),
+        Syscall::SchedGetaffinity => sys_sched_getaffinity(a1, a2, a3),
+        Syscall::SchedSetaffinity => sys_sched_setaffinity(a1, a2, a3),
         Syscall::Umask => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         Syscall::Fsync | Syscall::Fdatasync => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         // `sync(2)` takes no arguments; `syncfs(fd)` scopes the flush to the
@@ -2639,6 +2640,58 @@ fn proc_count() -> u16 {
     // for a cosmetic `sysinfo` field the registered count is the better one:
     // it is what `ps` lists.
     akuma_exec::process::process_count().min(u16::MAX as usize) as u16
+}
+
+/// The task slot `tid` names for the affinity calls: 0 is the caller; otherwise a process id
+/// (what `taskset -p` and `ps` show), then, failing that, a thread id (what `gettid` returns).
+fn affinity_slot(tid: u64) -> Option<usize> {
+    if tid == 0 {
+        return Some(akuma_exec::threading::current_thread_id());
+    }
+    let tid = u32::try_from(tid).ok()?;
+    if let Some(slot) = akuma_exec::process::lookup_process_shared(tid).and_then(|p| p.thread_id) {
+        return Some(slot);
+    }
+    let slot = tid as usize;
+    (slot < akuma_exec::threading::MAX_THREADS && akuma_exec::process::find_pid_by_thread(slot).is_some()).then_some(slot)
+}
+
+/// `sched_setaffinity(tid, len, mask)`: the request is decoded and clipped by
+/// `akuma_vm_spec::affinity`; `sched::set_affinity` stores it and moves the caller if needed.
+fn sys_sched_setaffinity(tid: u64, len: u64, mask_ptr: u64) -> u64 {
+    use crate::fd::errno;
+    use akuma_vm_spec::affinity;
+    const MAX: usize = 128;
+    let len = len as usize;
+    if len < 8 {
+        return errno::EINVAL;
+    }
+    let mut buf = [0u8; MAX];
+    let n = len.min(MAX);
+    if !crate::uaccess::read_bytes(mask_ptr, &mut buf[..n]) {
+        return errno::EFAULT;
+    }
+    // A caller's bytes past what we read are not inspected: a real cpu_set that large is all zero.
+    let Some(slot) = affinity_slot(tid) else { return errno::ESRCH };
+    let Ok(requested) = affinity::decode(&buf[..n]) else { return errno::EINVAL };
+    let Ok(mask) = affinity::effective(requested, crate::smp::online_cpus()) else { return errno::EINVAL };
+    if crate::sched::set_affinity(slot, mask) { 0 } else { errno::EAGAIN }
+}
+
+/// `sched_getaffinity(tid, len, mask)`: the stored mask, or every online core; returns the bytes
+/// written (musl zeroes the rest from that count).
+fn sys_sched_getaffinity(tid: u64, len: u64, mask_ptr: u64) -> u64 {
+    use crate::fd::errno;
+    let len = len as usize;
+    if len < 8 {
+        return errno::EINVAL;
+    }
+    let Some(slot) = affinity_slot(tid) else { return errno::ESRCH };
+    let mask = akuma_vm_spec::affinity::report(crate::sched::affinity_of(slot), crate::smp::online_cpus());
+    if !crate::uaccess::write_bytes(mask_ptr, &mask.to_le_bytes()) {
+        return errno::EFAULT;
+    }
+    8
 }
 
 /// `syslog(type, bufp, len)` — the `klogctl(2)` operations `busybox dmesg`

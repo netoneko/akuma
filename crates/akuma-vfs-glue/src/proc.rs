@@ -396,6 +396,7 @@ fn proc_stat_of<'a>(
         uid: creds.uid(),
         gid: creds.gid(),
         groups: creds.groups(),
+        processor: p.thread_id.map_or(0, |t| match threading::get_thread_last_core(t) { 0xFF => 0, c => u32::from(c) }),
     }
 }
 

@@ -14,6 +14,7 @@
 //! | [`spec`] | [`Spec`]: fixed-size, `Copy`, no allocation; `set` one key, `parse_wire` a document, `encode` it back |
 //! | [`arena`] | [`arena::Arena`]: first-fit extents over the reserved guest-RAM block (`kvmmem=`) |
 //! | [`cores`] | the `kvmcores=` list as a bit mask |
+//! | [`affinity`] | per-thread CPU masks: `sched_setaffinity` decode/clip, and "may this thread run on that core" |
 //!
 //! `no_std`, `forbid(unsafe_code)`, no dependencies: the kernel parses on a path that runs
 //! under memory pressure and must not allocate.
@@ -21,6 +22,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod affinity;
 pub mod arena;
 pub mod cores;
 pub mod spec;
