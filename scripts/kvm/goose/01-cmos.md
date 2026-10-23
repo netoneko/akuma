@@ -1,7 +1,8 @@
 # Task 01: find and fix what corrupts the machine's CMOS (firmware reports a bad clock / checksum)
 
 Read `docs/archive/AKUMA_KVM_DEV_CYCLE.md` (your manual: the loop, the rules, the hosts) and `docs/archive/AKUMA_FIRECRACKER_KVM.md`
-only if you want background. You work inside Akuma on the ryzen, on branch `cmos-fix` (make it from `dev-base` if it does not exist).
+only if you want background. You work inside Akuma on the ryzen, on branch `cmos-fix`: start with `cd /src/github.com/netoneko/akuma && git checkout cmos-fix && git merge --ff-only dev-base`
+(create it from `dev-base` if it does not exist). `dev-base` is where the laptop puts the current source.
 
 ## The problem
 After Akuma has run on this laptop, the next boot stops in FIRMWARE (before any OS) on a clock / CMOS error and asks for F1 to
