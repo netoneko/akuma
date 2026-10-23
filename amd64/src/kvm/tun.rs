@@ -164,7 +164,14 @@ pub fn read_frame(b: &mut [u8; BUF]) -> Result<usize, u64> {
             match t.gw.receive(&mut b[t.hdr..]) {
                 None => return None,
                 Some(0) => {} // dropped as oversize; look at the next
-                Some(n) => return Some(t.hdr + n),
+                Some(n) => {
+                    // virtio_net_hdr_v1.num_buffers (bytes 10..12) is 1 for a frame in one buffer; a VMM that
+                    // negotiated MRG_RXBUF treats 0 as invalid.
+                    if t.hdr >= 12 {
+                        b[10..12].copy_from_slice(&1u16.to_le_bytes());
+                    }
+                    return Some(t.hdr + n);
+                }
             }
         }
     })
