@@ -17,7 +17,14 @@
 //! Everything else the guest sends is counted and dropped. That is enough for a guest
 //! to bring its stack up, reach "its gateway" and prove both directions of the device
 //! against an independent implementation of the protocols; it is deliberately not a
-//! route to anywhere.
+//! route to anywhere - **unless the hypervisor turns outbound on** ([`Gateway::set_outbound`],
+//! the spec's `vm_outbound`). Then the guest's TCP connections to addresses outside its own subnet
+//! are *held* here until the host says whether it could make the same connection
+//! ([`Gateway::out_take_request`], [`Gateway::out_accept`], [`Gateway::out_refuse`]): the gateway
+//! answers the guest as the far end (a SYN-ACK from the real address and port, or a reset) and the
+//! host moves the bytes, exactly as for a forward slot. DNS queries to the proxy (`10.0.2.3:53`)
+//! are queued for the host to forward ([`Gateway::dns_take`], [`Gateway::dns_reply`]). Nothing
+//! else leaves: no UDP but DNS, no ICMP past the gateway.
 //!
 //! No allocation: replies are built in place into a queue of [`DEPTH`] slots of
 //! [`SLOT`] bytes, in storage the caller lends ([`STORAGE`] bytes: the queue and the
@@ -61,7 +68,13 @@ pub const FWD_PORT_BASE: u16 = 40_000;
 pub const FWD_GENS: usize = 8;
 /// The TCP and UDP echo port (RFC 862).
 pub const ECHO_PORT: u16 = 7;
-const CONNS: usize = 1 + FWD_SLOTS;
+/// Connections the guest opens outward (when outbound is on).
+pub const OUT_SLOTS: usize = 8;
+/// DNS queries in flight between the guest and the host's resolver.
+pub const DNS_SLOTS: usize = 4;
+/// The longest DNS query forwarded (the classic UDP limit; a stub resolver's are far shorter).
+pub const DNS_MAX: usize = 512;
+const CONNS: usize = 1 + FWD_SLOTS + OUT_SLOTS;
 /// Storage the gateway needs lent to it, in bytes.
 pub const STORAGE: usize = DEPTH * SLOT + CONNS * 2 * RING;
 
@@ -103,6 +116,13 @@ pub struct Stats {
     pub fwd_stale_in: u64,
     /// Frames handed to the guest's receive buffers.
     pub rx_delivered: u64,
+    /// Outbound: connections the guest asked for, ones refused for want of a slot, ones the host
+    /// refused, DNS queries queued for the host and answers handed back.
+    pub out_syns: u64,
+    pub out_full: u64,
+    pub out_refused: u64,
+    pub dns_queries: u64,
+    pub dns_replies: u64,
 }
 
 /// The frames waiting for the guest: a ring of [`DEPTH`] slots in borrowed storage.
@@ -151,8 +171,65 @@ impl Stats {
             fwd_rst_in: 0,
             fwd_stale_in: 0,
             rx_delivered: 0,
+            out_syns: 0,
+            out_full: 0,
+            out_refused: 0,
+            dns_queries: 0,
+            dns_replies: 0,
         }
     }
+}
+
+/// Where an outbound connection is in its life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutPhase {
+    Free,
+    /// The guest's SYN is held; the host has not been told yet.
+    Asked,
+    /// The host is making the connection; the guest's SYN is still held.
+    Connecting,
+    /// The host connected and the guest was answered: a connection like any other.
+    Open,
+    /// The host could not connect: a reset is owed to the guest.
+    Refusing,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutMeta {
+    phase: OutPhase,
+    /// The guest's port, and the real peer the guest believes it reached.
+    gport: u16,
+    dst: [u8; 4],
+    dport: u16,
+    /// The held SYN: its sequence number and window, for the SYN-ACK.
+    syn_seq: u32,
+    syn_win: u16,
+}
+
+impl OutMeta {
+    const FREE: Self = Self { phase: OutPhase::Free, gport: 0, dst: [0; 4], dport: 0, syn_seq: 0, syn_win: 0 };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DnsPhase {
+    Free,
+    /// Queued for the host to take.
+    Queued,
+    /// The host has it; the answer is still to come.
+    Taken,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DnsSlot {
+    phase: DnsPhase,
+    /// The guest's source port, and the query as it sent it.
+    sport: u16,
+    len: usize,
+    buf: [u8; DNS_MAX],
+}
+
+impl DnsSlot {
+    const FREE: Self = Self { phase: DnsPhase::Free, sport: 0, len: 0, buf: [0; DNS_MAX] };
 }
 
 /// The gateway: a queue of frames for the guest, its TCP connections and the counters.
@@ -169,6 +246,11 @@ pub struct Gateway<'a> {
     fwd_peer: [u16; FWD_SLOTS],
     /// The source-port generation each slot's current (or last) connection uses.
     fwd_gen: [u8; FWD_SLOTS],
+    /// Connections the guest opened outward, when outbound is on, and what each is.
+    outbound: bool,
+    out: [Tcp<'a>; OUT_SLOTS],
+    out_meta: [OutMeta; OUT_SLOTS],
+    dns: [DnsSlot; DNS_SLOTS],
     /// Next initial sequence number.
     iss: u32,
     pub stats: Stats,
@@ -313,6 +395,32 @@ fn dhcp_option(opts: &[u8], code: u8) -> Option<&[u8]> {
     None
 }
 
+/// Is `dst` somewhere an outbound connection may be made to? Not the guest's own subnet (the gateway
+/// and the proxy answer there), not "this host", loopback, multicast or the limited broadcast.
+fn routable(dst: [u8; 4]) -> bool {
+    !(dst[0] == 0 || dst[0] == 127 || dst[0] >= 224 || dst[..3] == [10, 0, 2])
+}
+
+/// A TCP segment (`seg` is the IP payload) from `src` to `dst`, if its checksum and header
+/// length are good: the ports and the parsed segment.
+fn parse_segment(src: [u8; 4], dst: [u8; 4], seg: &[u8]) -> Option<(u16, u16, Segment<'_>)> {
+    if seg.len() < 20 || checksum(seg, pseudo_sum(src, dst, 6, seg.len())) != 0 {
+        return None;
+    }
+    let off = usize::from(seg[12] >> 4) * 4;
+    if off < 20 || off > seg.len() {
+        return None;
+    }
+    let s = Segment {
+        seq: u32::from_be_bytes([seg[4], seg[5], seg[6], seg[7]]),
+        ack: u32::from_be_bytes([seg[8], seg[9], seg[10], seg[11]]),
+        flags: seg[13],
+        window: be16(seg, 14),
+        payload: &seg[off..],
+    };
+    Some((be16(seg, 0), be16(seg, 2), s))
+}
+
 impl<'a> Gateway<'a> {
     /// A gateway with nothing queued, in `storage` ([`STORAGE`] bytes or more; the excess
     /// is unused). `None` if it is too small.
@@ -334,6 +442,7 @@ impl<'a> Gateway<'a> {
         };
         let echo = conn();
         let fwd = [conn(), conn()];
+        let out: [Tcp<'a>; OUT_SLOTS] = core::array::from_fn(|_| conn());
         Some(Self {
             q: Queue { slots, lens: [0; DEPTH], head: 0, count: 0 },
             guest_mac: GUEST_MAC,
@@ -342,6 +451,10 @@ impl<'a> Gateway<'a> {
             fwd,
             fwd_peer: [0; FWD_SLOTS],
             fwd_gen: [0; FWD_SLOTS],
+            outbound: false,
+            out,
+            out_meta: [OutMeta::FREE; OUT_SLOTS],
+            dns: [DnsSlot::FREE; DNS_SLOTS],
             iss: 0x4B1D_0000,
             stats: Stats::new(),
         })
@@ -363,6 +476,12 @@ impl<'a> Gateway<'a> {
         }
         self.fwd_peer = [0; FWD_SLOTS];
         self.fwd_gen = [0; FWD_SLOTS];
+        self.outbound = false;
+        for c in &mut self.out {
+            c.clear();
+        }
+        self.out_meta = [OutMeta::FREE; OUT_SLOTS];
+        self.dns = [DnsSlot::FREE; DNS_SLOTS];
         self.iss = 0x4B1D_0000;
         self.stats = Stats::new();
     }
@@ -430,6 +549,7 @@ impl<'a> Gateway<'a> {
             1 if dst == GATEWAY_IP => self.icmp(f, ihl, total),
             17 => self.udp(f, src, dst, payload),
             6 if dst == GATEWAY_IP => self.tcp_in(src, payload),
+            6 if self.outbound && routable(dst) => self.out_in(src, dst, payload),
             _ => self.stats.ignored += 1,
         }
     }
@@ -489,8 +609,31 @@ impl<'a> Gateway<'a> {
                     self.stats.udp_echoes += 1;
                 }
             }
+            53 if dst == DNS_IP && self.outbound => self.dns_in(sport, data),
             _ => self.stats.ignored += 1,
         }
+    }
+
+    /// A DNS query for the proxy: queued for the host to forward. A repeat of one already queued
+    /// or in flight (same port, same id) is the guest's retry and is ignored.
+    fn dns_in(&mut self, sport: u16, data: &[u8]) {
+        if data.len() < 12 || data.len() > DNS_MAX {
+            self.stats.ignored += 1;
+            return;
+        }
+        let id = be16(data, 0);
+        if self.dns.iter().any(|d| d.phase != DnsPhase::Free && d.sport == sport && be16(&d.buf, 0) == id) {
+            return;
+        }
+        let Some(d) = self.dns.iter_mut().find(|d| d.phase == DnsPhase::Free) else {
+            self.stats.lost += 1;
+            return;
+        };
+        d.phase = DnsPhase::Queued;
+        d.sport = sport;
+        d.len = data.len();
+        d.buf[..data.len()].copy_from_slice(data);
+        self.stats.dns_queries += 1;
     }
 
     fn dhcp(&mut self, d: &[u8]) {
@@ -548,22 +691,9 @@ impl<'a> Gateway<'a> {
     }
     /// A TCP segment for the gateway (`seg` is the IP payload; the IP header was checked).
     fn tcp_in(&mut self, src: [u8; 4], seg: &[u8]) {
-        if seg.len() < 20 || checksum(seg, pseudo_sum(src, GATEWAY_IP, 6, seg.len())) != 0 {
+        let Some((sport, dport, s)) = parse_segment(src, GATEWAY_IP, seg) else {
             self.stats.ignored += 1;
             return;
-        }
-        let off = usize::from(seg[12] >> 4) * 4;
-        if off < 20 || off > seg.len() {
-            self.stats.ignored += 1;
-            return;
-        }
-        let (sport, dport) = (be16(seg, 0), be16(seg, 2));
-        let s = Segment {
-            seq: u32::from_be_bytes([seg[4], seg[5], seg[6], seg[7]]),
-            ack: u32::from_be_bytes([seg[8], seg[9], seg[10], seg[11]]),
-            flags: seg[13],
-            window: be16(seg, 14),
-            payload: &seg[off..],
         };
         if dport == ECHO_PORT {
             let fresh = self.echo.state() == tcp::State::Closed && s.flags & tcp::flag::SYN != 0;
@@ -601,6 +731,12 @@ impl<'a> Gateway<'a> {
     /// Answer a segment for a connection that does not exist with a reset (RFC 793 p.65),
     /// unless it is itself a reset.
     fn reset_for(&mut self, src: [u8; 4], sport: u16, dport: u16, s: &Segment<'_>) {
+        self.reset_from(GATEWAY_IP, src, sport, dport, s);
+    }
+
+    /// The same, from the address the segment was sent to (`from`), which is not the gateway's
+    /// for an outbound connection.
+    fn reset_from(&mut self, from: [u8; 4], src: [u8; 4], sport: u16, dport: u16, s: &Segment<'_>) {
         if s.flags & tcp::flag::RST != 0 {
             return;
         }
@@ -611,7 +747,7 @@ impl<'a> Gateway<'a> {
             tcp::Out { seq: 0, ack: s.seq.wrapping_add(seg_len), flags: tcp::flag::RST | tcp::flag::ACK, window: 0, len: 0, mss_option: false }
         };
         let mac = self.guest_mac;
-        if self.enqueue(|out| Some(build_tcp(out, mac, GATEWAY_IP, src, dport, sport, &o))) {
+        if self.enqueue(|out| Some(build_tcp(out, mac, from, src, dport, sport, &o))) {
             self.stats.tcp_resets += 1;
         }
     }
@@ -675,6 +811,176 @@ impl<'a> Gateway<'a> {
                 }
             }
         }
+        for i in 0..OUT_SLOTS {
+            let m = self.out_meta[i];
+            match m.phase {
+                OutPhase::Refusing => {
+                    // The host could not connect: the far end answers with a reset.
+                    let o = tcp::Out { seq: 0, ack: m.syn_seq.wrapping_add(1), flags: tcp::flag::RST | tcp::flag::ACK, window: 0, len: 0, mss_option: false };
+                    if self.q.push_with(|out| Some(build_tcp(out, mac, m.dst, GUEST_IP, m.dport, m.gport, &o))) {
+                        self.out_meta[i] = OutMeta::FREE;
+                        self.stats.out_refused += 1;
+                    }
+                }
+                OutPhase::Open => {
+                    while self.q.has_room() && self.out[i].wants_tx() {
+                        let conn = &mut self.out[i];
+                        let pushed = self.q.push_with(|out| {
+                            let o = conn.poll_tx(&mut out[54..54 + tcp::MSS])?;
+                            Some(build_tcp(out, mac, m.dst, GUEST_IP, m.dport, m.gport, &o))
+                        });
+                        if !pushed {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Let the guest's TCP connections to addresses outside its subnet, and its DNS queries,
+    /// through to the host (see the module comment). Off by default.
+    pub fn set_outbound(&mut self, on: bool) {
+        self.outbound = on;
+    }
+
+    /// A segment from the guest to `dst`, an address outside the guest's subnet.
+    fn out_in(&mut self, src: [u8; 4], dst: [u8; 4], seg: &[u8]) {
+        let Some((sport, dport, s)) = parse_segment(src, dst, seg) else {
+            self.stats.ignored += 1;
+            return;
+        };
+        if src != GUEST_IP {
+            self.stats.ignored += 1;
+            return;
+        }
+        let found = (0..OUT_SLOTS).find(|&i| {
+            let m = &self.out_meta[i];
+            m.phase != OutPhase::Free && m.gport == sport && m.dst == dst && m.dport == dport
+        });
+        match found {
+            Some(i) => match self.out_meta[i].phase {
+                // A held SYN's retransmission, or an ACK of nothing: the host has not answered yet.
+                OutPhase::Asked | OutPhase::Connecting => {
+                    if s.flags & tcp::flag::RST != 0 {
+                        self.out_meta[i] = OutMeta::FREE;
+                    }
+                }
+                OutPhase::Open => self.out[i].input(&s),
+                OutPhase::Refusing | OutPhase::Free => {}
+            },
+            None if s.flags & (tcp::flag::SYN | tcp::flag::ACK | tcp::flag::RST) == tcp::flag::SYN => {
+                if let Some(i) = (0..OUT_SLOTS).find(|&i| self.out_meta[i].phase == OutPhase::Free && self.out[i].is_closed()) {
+                    self.out_meta[i] = OutMeta { phase: OutPhase::Asked, gport: sport, dst, dport, syn_seq: s.seq, syn_win: s.window };
+                    self.stats.out_syns += 1;
+                } else {
+                    self.stats.out_full += 1;
+                    self.reset_from(dst, src, sport, dport, &s);
+                }
+            }
+            None => self.reset_from(dst, src, sport, dport, &s),
+        }
+    }
+
+    /// Where outbound slot `slot` is in its life.
+    #[must_use]
+    pub fn out_phase(&self, slot: usize) -> OutPhase {
+        self.out_meta.get(slot).map_or(OutPhase::Free, |m| m.phase)
+    }
+
+    /// The connection the guest wants in `slot`, if the host has not been told yet: the address
+    /// and port it believes it is reaching. The slot is then `Connecting`.
+    pub fn out_take_request(&mut self, slot: usize) -> Option<([u8; 4], u16)> {
+        let m = self.out_meta.get_mut(slot)?;
+        if m.phase != OutPhase::Asked {
+            return None;
+        }
+        m.phase = OutPhase::Connecting;
+        Some((m.dst, m.dport))
+    }
+
+    /// The host made the connection: answer the guest's held SYN. False if the slot is not
+    /// `Connecting` (the guest gave up meanwhile).
+    pub fn out_accept(&mut self, slot: usize) -> bool {
+        let Some(m) = self.out_meta.get(slot).copied() else { return false };
+        if m.phase != OutPhase::Connecting {
+            return false;
+        }
+        let iss = self.next_iss();
+        let syn = Segment { seq: m.syn_seq, ack: 0, flags: tcp::flag::SYN, window: m.syn_win, payload: &[] };
+        if !self.out[slot].accept(&syn, iss) {
+            return false;
+        }
+        self.out_meta[slot].phase = OutPhase::Open;
+        true
+    }
+
+    /// The host could not make the connection: the guest is reset at the next [`Gateway::pump`].
+    pub fn out_refuse(&mut self, slot: usize) {
+        if let Some(m) = self.out_meta.get_mut(slot)
+            && matches!(m.phase, OutPhase::Asked | OutPhase::Connecting)
+        {
+            m.phase = OutPhase::Refusing;
+        }
+    }
+
+    /// Outbound slot `slot`'s connection, for reading, writing, closing and asking its state.
+    pub fn out(&mut self, slot: usize) -> &mut Tcp<'a> {
+        &mut self.out[slot]
+    }
+
+    /// Free outbound slot `slot` once its connection is closed (or abandon it with a reset).
+    pub fn out_release(&mut self, slot: usize) {
+        if self.out_meta[slot].phase == OutPhase::Open {
+            self.out[slot].abort();
+            self.pump();
+        }
+        if self.out[slot].is_closed() {
+            self.out[slot].clear();
+            self.out_meta[slot] = OutMeta::FREE;
+        }
+    }
+
+    /// The query in DNS slot `slot`, if the host has not taken it yet: the bytes as the guest
+    /// sent them (the host forwards them verbatim and matches the answer by the id in the first
+    /// two bytes).
+    pub fn dns_take(&mut self, slot: usize) -> Option<&[u8]> {
+        let d = self.dns.get_mut(slot)?;
+        if d.phase != DnsPhase::Queued {
+            return None;
+        }
+        d.phase = DnsPhase::Taken;
+        Some(&d.buf[..d.len])
+    }
+
+    /// Hand the guest the answer to the query in `slot`, from the proxy. False if the queue is
+    /// full (the guest retries its query) or the slot holds none.
+    pub fn dns_reply(&mut self, slot: usize, answer: &[u8]) -> bool {
+        let Some(d) = self.dns.get(slot).copied() else { return false };
+        if d.phase != DnsPhase::Taken {
+            return false;
+        }
+        let mac = self.guest_mac;
+        let ok = self.enqueue(|o| build_udp(o, mac, DNS_IP, GUEST_IP, 53, d.sport, answer));
+        if ok {
+            self.dns[slot] = DnsSlot::FREE;
+            self.stats.dns_replies += 1;
+        }
+        ok
+    }
+
+    /// Forget DNS slot `slot` (no answer is coming).
+    pub fn dns_drop(&mut self, slot: usize) {
+        if let Some(d) = self.dns.get_mut(slot) {
+            *d = DnsSlot::FREE;
+        }
+    }
+
+    /// Is DNS slot `slot` waiting for an answer from the host?
+    #[must_use]
+    pub fn dns_waiting(&self, slot: usize) -> bool {
+        self.dns.get(slot).is_some_and(|d| d.phase == DnsPhase::Taken)
     }
 
     /// Open forward slot `slot` to `guest_port` on the guest: the SYN goes out at the next
@@ -778,6 +1084,16 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
+
+    #[test]
+    fn only_addresses_outside_the_guests_world_are_routable() {
+        for ok in [[93, 184, 216, 34], [8, 8, 8, 8], [192, 168, 1, 1], [10, 0, 3, 1], [172, 16, 0, 1], [10, 1, 2, 3]] {
+            assert!(routable(ok), "{ok:?}");
+        }
+        for no in [[10, 0, 2, 2], [10, 0, 2, 3], [10, 0, 2, 15], [10, 0, 2, 255], [127, 0, 0, 1], [0, 0, 0, 0], [224, 0, 0, 251], [255, 255, 255, 255]] {
+            assert!(!routable(no), "{no:?}");
+        }
+    }
 
     fn gw() -> Gateway<'static> {
         let storage: &'static mut [u8] = std::boxed::Box::leak(vec![0u8; STORAGE].into_boxed_slice());

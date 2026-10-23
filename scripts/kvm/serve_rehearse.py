@@ -37,6 +37,13 @@ ap.add_argument("--kvmcores", help="the host kernel's kvmcores= (the cores the h
 ap.add_argument("--vcpus", type=int, default=1, help="with --herd: vm_vcpus of the generated conf")
 ap.add_argument("--vm-cores", help="with --herd: vm_cores of the generated conf")
 ap.add_argument("--probe", type=int, default=0, help="run this many parallel CPU-bound loops in the guest and print the wall time and /proc/cpuinfo's processor count (the vCPU speedup probe)")
+ap.add_argument("--outbound", action="store_true",
+                help="with --herd: `vm_outbound = true`; then fetch from a web server on this machine (by its LAN address, through the gateway's"
+                     " outbound path and the host's slirp NIC) and resolve a name through the DNS proxy")
+ap.add_argument("--host-ssh-bulk", type=int, default=0, metavar="MIB",
+                help="with --herd: a herd oneshot on the HOST runs its own /bin/ssh against the relay and pulls this many MiB of /dev/zero through `wc -c`"
+                     " (the ryzen's wedge shape, 2026-10-23, without a wifi link); the result is read back from the host disk")
+ap.add_argument("--host-ssh-wait", type=int, default=300, help="with --host-ssh-bulk: seconds to let the transfer run before reading the result")
 a = ap.parse_args()
 
 here = os.path.dirname(os.path.abspath(__file__))
@@ -64,15 +71,38 @@ if a.herd:
     conf = open(a.herd_conf).read() if a.herd_conf else (
         f"vm = true\nvm_type = kvm\nvm_kernel = /boot/akuma-guest\nvm_ram_mib = 768\nvm_vcpus = {a.vcpus}\n" + (f"vm_cores = {a.vm_cores}\n" if a.vm_cores else "") +
         f"vm_forward = {a.port}:22\nvm_cmdline = init=/bin/busybox initargs=sh,/etc/guest.sh\n"
-        "restart = true\nrestart_delay_ms = 5000\n")
+        + ("vm_outbound = true\n" if a.outbound else "") + "restart = true\nrestart_delay_ms = 5000\n")
     open(f"{w}/host/etc/herd/enabled/vm-serve.conf", "w").write(conf)
+    if a.host_ssh_bulk:
+        # The host's Akuma `ssh` client, with a raw ed25519 identity at /etc/sshd/id_ed25519 (its default
+        # key) that the guest trusts: the 32-byte seed, and the public line appended to the guest's keys.
+        import base64, struct
+        seed = os.urandom(32)
+        der = bytes.fromhex("302e020100300506032b657004220420") + seed
+        pub = subprocess.run(["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"], input=der, capture_output=True, check=True).stdout[-32:]
+        blob = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + pub
+        keys_file = f"{w}/authorized_keys"
+        open(keys_file, "w").write(open(key + ".pub").read().rstrip("\n") + "\nssh-ed25519 " + base64.b64encode(blob).decode() + " hostcli\n")
+        os.makedirs(f"{w}/host/etc/sshd")
+        open(f"{w}/host/etc/sshd/id_ed25519", "wb").write(seed)
+        os.makedirs(f"{w}/host/root/.ssh")
+        shutil.copy(os.environ.get("HOST_SSH", "userspace/target/x86_64-unknown-none/release/ssh"), f"{w}/host/bin/ssh")
+        os.chmod(f"{w}/host/bin/ssh", 0o755)
+        open(f"{w}/host/root/hostbulk.sh", "w").write(
+            "B=/bin/busybox\ni=0\nwhile [ $i -lt 40 ]; do\n"
+            f"  echo yes | /bin/ssh -p {a.port} root@127.0.0.1 true >/var/log/herd/hostbulk.try 2>&1 && break\n"
+            "  i=$((i+1)); $B sleep 5\ndone\necho started > /var/log/herd/hostbulk.out\n"
+            f"n=$(/bin/ssh -p {a.port} root@127.0.0.1 'head -c {a.host_ssh_bulk << 20} /dev/zero' 2>/var/log/herd/hostbulk.err | $B wc -c)\n"
+            "echo bytes=$n > /var/log/herd/hostbulk.out\n")
+        open(f"{w}/host/etc/herd/enabled/hostbulk.conf", "w").write(
+            "command = /bin/busybox\nargs = sh /root/hostbulk.sh\noneshot = true\nstart_delay_ms = 20000\n")
     if a.restart:
         # herd is pid 1, so the first `vm-run` is pid 2. Killing it is what a crash, `herd stop`
         # or `kill` looks like to the kernel: the owner is gone, the lease ends the guest.
         open(f"{w}/host/etc/herd/enabled/killvm.conf", "w").write(
             "command = /bin/busybox\nargs = kill 2\noneshot = true\nstart_delay_ms = 90000\n")
 subprocess.run([f"{e2}/mke2fs", "-q", "-t", "ext2", "-d", f"{w}/host", "-L", "kvmhost", f"{w}/root.img", "48M"], check=True)
-env = dict(os.environ, SERVE="1", NET="1", AUTHORIZED_KEYS=key + ".pub")
+env = dict(os.environ, SERVE="1", NET="1", AUTHORIZED_KEYS=(f"{w}/authorized_keys" if a.host_ssh_bulk else key + ".pub"))
 subprocess.run(["sh", f"{here}/akuma_guest_rootfs.sh", f"{w}/guest.img", busybox], check=True, env=env, stdout=subprocess.DEVNULL)
 # The service guest reads /boot/akuma-serve-root.img only without a second virtio-blk; give it one.
 q = subprocess.Popen([
@@ -110,6 +140,8 @@ def finish(rc):
         if a.herd:
             hl = herd_log()
             print(f"[REHEARSE] herd log vm-serve.log: {len(hl)} bytes; guest banner={'Akuma/amd64' in hl}; sshd marker={'AKUMA-GUEST-SSHD-STARTED' in hl}; vm-run created={hl.count('[vm-run] guest created')}x")
+            for l in [l for l in hl.splitlines() if "relay: dns" in l or "relay: outbound" in l][:8]:
+                print(f"[REHEARSE] {l.strip()[:200]}")
             if rc == 0 and a.restart and hl.count("[vm-run] guest created") < 2:
                 print("[REHEARSE] restart: the second guest never says it was created")
                 rc = 1
@@ -237,6 +269,54 @@ if ok and a.probe:
         cpus = r.stdout.split()[0] if r.stdout.split() else "?"
         print(f"[REHEARSE] probe x{n}: {time.time() - t:.1f}s (guest sees {cpus} processors) {'ok' if 'probe-done' in r.stdout else 'FAILED ' + r.stderr.strip()[-60:]}")
         ok = ok and "probe-done" in r.stdout
+if ok and a.outbound:
+    # The guest reaches a server on this machine (a LAN address: 10.0.2.2 is the guest's own gateway)
+    # through the hypervisor's outbound path, and resolves a name through the DNS proxy.
+    import hashlib, http.server, socket, threading, functools
+    lan = ""
+    for ifname in ("en0", "en1"):
+        lan = subprocess.run(["ipconfig", "getifaddr", ifname], capture_output=True, text=True).stdout.strip()
+        if lan:
+            break
+    if not lan:
+        s_ = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s_.connect(("192.0.2.1", 9)); lan = s_.getsockname()[0]; s_.close()
+    web = f"{w}/web"
+    os.makedirs(web)
+    big = os.urandom(4 << 20)
+    open(f"{web}/probe.txt", "w").write("outbound-probe-ok\n")
+    open(f"{web}/big.bin", "wb").write(big)
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=web)
+    handler.log_message = lambda *a_, **k_: None
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    wp = srv.server_address[1]
+    base = ["ssh", "-p", str(a.port), "-i", key, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=60", "root@127.0.0.1"]
+    def guest(cmd, t=300):
+        try:
+            r = subprocess.run(base + [cmd], capture_output=True, timeout=t)
+            return r.stdout.decode("latin1"), r.stderr.decode("latin1")
+        except subprocess.TimeoutExpired:
+            return "TIMEOUT", ""
+    out, err = guest(f"wget -q -O - http://{lan}:{wp}/probe.txt")
+    good = "outbound-probe-ok" in out
+    print(f"[REHEARSE] outbound: wget http://{lan}:{wp}/probe.txt -> {out.strip()[:60]!r} {'ok' if good else 'FAILED ' + err.strip()[-80:]}")
+    t = time.time()
+    out, err = guest(f"wget -q -O - http://{lan}:{wp}/big.bin | md5sum")
+    big_ok = hashlib.md5(big).hexdigest() in out
+    print(f"[REHEARSE] outbound: 4 MiB download md5 {'ok' if big_ok else 'MISMATCH ' + out.strip()[:50] + err.strip()[-60:]} in {time.time() - t:.1f}s")
+    # Names that resolve from here (example.com does not on every network).
+    out, err = guest("nslookup neverssl.com 10.0.2.3 2>&1 | head -8")
+    dns_ok = "Address" in out and "can't find" not in out.lower()
+    print(f"[REHEARSE] outbound: nslookup neverssl.com -> {'ok' if dns_ok else 'FAILED'} {out.strip().replace(chr(10), ' | ')[:160]}")
+    out, err = guest("wget -q -T 30 -O - http://neverssl.com/ 2>&1 | head -c 300")
+    name_ok = "neverssl" in out.lower()
+    print(f"[REHEARSE] outbound: wget http://neverssl.com/ -> {'ok' if name_ok else 'FAILED'} {out.strip().replace(chr(10), ' ')[:100]!r}")
+    out, err = guest("wget -q -T 30 -O - http://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml 2>&1 | head -c 200")
+    apk_ok = "title" in out or "flavor" in out or "branch" in out
+    print(f"[REHEARSE] outbound: wget the Alpine CDN's latest-releases.yaml -> {'ok' if apk_ok else 'FAILED'} {out.strip().replace(chr(10), ' ')[:100]!r}")
+    srv.shutdown()
+    ok = ok and good and big_ok and dns_ok and name_ok and apk_ok
 if ok and a.restart:
     # The oneshot fires 90 s after herd starts; wait for the replacement guest and talk to it.
     t1 = time.time()
@@ -258,6 +338,25 @@ if ok and a.restart:
         time.sleep(5)
     print(f"[REHEARSE] restart: herd started vm-serve {log().count('[herd] Started vm-serve')}x; ssh after restart: {'ok' if again else 'FAILED ' + last.strip()[-80:]}")
     ok = ok and again
+if a.host_ssh_bulk:
+    # Let the host's own ssh run (progress is the relay's `to_host=` counter), then read what it wrote.
+    t2 = time.time()
+    seen = ""
+    while time.time() - t2 < a.host_ssh_wait:
+        time.sleep(10)
+        lines = [l for l in log().splitlines() if "relay: slot" in l and "to_host=" in l]
+        cur = lines[-1].split("to_host=")[1].split()[0] if lines else "-"
+        if cur != seen:
+            seen = cur
+            print(f"[REHEARSE] host ssh: relay to_host={cur} after {time.time() - t2:.0f}s", flush=True)
+    q.kill()
+    q.wait()
+    for f in ("hostbulk.out", "hostbulk.err", "hostbulk.try"):
+        r = subprocess.run([f"{e2}/debugfs", "-R", f"cat /var/log/herd/{f}", f"{w}/root.img"], capture_output=True)
+        print(f"[REHEARSE] host {f}: {r.stdout.decode('latin1').strip()[-300:]!r}")
+    # `wc -c` counts a few bytes of ssh's own chatter (the host-key notice) on top of the payload.
+    got = subprocess.run([f"{e2}/debugfs", "-R", "cat /var/log/herd/hostbulk.out", f"{w}/root.img"], capture_output=True).stdout.decode("latin1").strip()
+    ok = ok and got.startswith("bytes=") and got[6:].isdigit() and int(got[6:]) >= a.host_ssh_bulk << 20
 print("[REHEARSE] akuma-serve" + (" (herd)" if a.herd else "") + ":", "PASS" if ok else "FAIL")
 for l in log().splitlines():
     if "[KVM] relay" in l or "service guest" in l or "kvm0" in l or "kvmmem" in l or "[herd]" in l:

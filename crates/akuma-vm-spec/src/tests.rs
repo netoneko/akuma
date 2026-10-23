@@ -40,6 +40,17 @@ fn encode_round_trips() {
 }
 
 #[test]
+fn outbound_is_off_unless_asked_for_and_survives_the_wire() {
+    assert!(!parse("kernel=/k\n").unwrap().outbound);
+    let s = parse("kernel=/k\noutbound=1\n").unwrap();
+    assert!(s.outbound);
+    let mut b = [0u8; MAX_WIRE];
+    let n = s.encode(&mut b).unwrap();
+    assert!(parse(core::str::from_utf8(&b[..n]).unwrap()).unwrap().outbound);
+    assert_eq!(parse("kernel=/k\noutbound=maybe\n"), Err(Error::BadValue));
+}
+
+#[test]
 fn the_largest_spec_still_encodes_within_the_wire_limit() {
     let mut s = Spec::default();
     s.set("kernel", &"k".repeat(MAX_PATH)).unwrap();
@@ -48,6 +59,7 @@ fn the_largest_spec_still_encodes_within_the_wire_limit() {
     for p in 0..MAX_FORWARDS {
         s.add_forward(&std::format!("{}:{}", 60000 + p, 65000 + p)).unwrap();
     }
+    s.set("outbound", "1").unwrap();
     let mut b = [0u8; MAX_WIRE];
     assert!(s.encode(&mut b).is_some());
 }

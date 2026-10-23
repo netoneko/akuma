@@ -35,7 +35,7 @@ if [ -n "${SERVE:-}" ]; then
     # `--install`: it is an Akuma binary.)
     for a in ls cat cp mv rm mkdir rmdir ln ps kill sleep echo pwd env grep sed awk head tail wc sort uniq \
         cut tr tee touch chmod chown date uname id whoami hostname dmesg df du free uptime top vi nc wget \
-        ifconfig netstat md5sum sha256sum dd sync mount umount find xargs which test true false; do
+        ifconfig netstat nslookup md5sum sha256sum dd sync mount umount find xargs which test true false; do
         ln -sf busybox "$T/bin/$a"
     done
     SSHD=${SSHD:-userspace/target/x86_64-unknown-none/release/sshd}
@@ -48,6 +48,8 @@ if [ -n "${SERVE:-}" ]; then
     cp "$KEYS" "$T/etc/sshd/authorized_keys"
     printf 'shell = /bin/sh\n' > "$T/etc/sshd/sshd.conf"
     printf 'root:x:0:0:root:/root:/bin/sh\n' > "$T/etc/passwd"
+    # The gateway's DNS proxy (answered only when the guest's spec says `vm_outbound`).
+    printf 'nameserver 10.0.2.3\n' > "$T/etc/resolv.conf"
 fi
 cat > "$T/etc/guest.sh" <<'SH'
 /bin/busybox hostname akuma-kvm

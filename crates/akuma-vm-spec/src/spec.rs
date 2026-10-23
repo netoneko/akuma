@@ -202,6 +202,9 @@ pub struct Spec {
     /// Copy the disk into RAM at start: the guest never touches the host's storage and its
     /// writes die with it.
     pub disk_ram: bool,
+    /// Let the guest's TCP connections and DNS queries out through the host's network
+    /// (`vm_outbound`). Off by default: a guest then has no route anywhere but the ports forwarded in.
+    pub outbound: bool,
     forwards: [Forward; MAX_FORWARDS],
     n_forwards: u8,
 }
@@ -217,6 +220,7 @@ impl Default for Spec {
             cores: 0,
             disk: Text::new(),
             disk_ram: false,
+            outbound: false,
             forwards: [Forward { host: 0, guest: 0 }; MAX_FORWARDS],
             n_forwards: 0,
         }
@@ -293,6 +297,7 @@ impl Spec {
                 self.disk.set(value)?;
             }
             "disk_ram" => self.disk_ram = flag(value)?,
+            "outbound" => self.outbound = flag(value)?,
             "forward" => self.add_forward(value)?,
             _ => return Err(Error::UnknownKey),
         }
@@ -354,6 +359,9 @@ impl Spec {
         if !self.disk.is_empty() {
             w.line("disk", self.disk.as_str())?;
             w.line("disk_ram", if self.disk_ram { "1" } else { "0" })?;
+        }
+        if self.outbound {
+            w.line("outbound", "1")?;
         }
         for f in self.forwards() {
             w.put(b"forward=")?;

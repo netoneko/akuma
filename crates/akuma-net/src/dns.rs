@@ -111,6 +111,14 @@ fn resolvers() -> ([[u8; 4]; 1 + MAX_FALLBACK_RESOLVERS], usize) {
     (list, n)
 }
 
+/// The resolver the host itself would ask first (the configured one, else a fallback), for a
+/// forwarder that relays raw DNS datagrams for someone else (the hypervisor's guest proxy).
+#[must_use]
+pub fn upstream() -> Option<[u8; 4]> {
+    let (list, n) = resolvers();
+    list[..n].first().copied()
+}
+
 /// Resolve `host` to an IPv4 address, blocking for up to `timeout_us` in total.
 ///
 /// `localhost` and a dotted-quad literal are answered without a query. Anything

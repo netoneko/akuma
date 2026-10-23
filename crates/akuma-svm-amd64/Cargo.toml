@@ -30,4 +30,4 @@ workspace = true
 # stack drives the gateway's connections in the tests.
 [dev-dependencies]
 akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64" }
-smoltcp = { version = "0.12.0", default-features = false, features = ["std", "proto-ipv4", "socket-tcp", "medium-ethernet"] }
+smoltcp = { version = "0.12.0", default-features = false, features = ["std", "proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet"] }

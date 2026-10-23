@@ -122,7 +122,7 @@ disagree on a key or a limit.
   themselves. One listener per `forward` of the spec (up to four), sharing the gateway's two
   connection slots; `Relay::close` gives every socket back when the guest ends, so a restarted guest
   binds the same ports.
-- **The NIC is polled and has no route out.** `Guest::AkumaNet` puts the virtio-net window
+- **The NIC is polled and has no route out unless the spec says `vm_outbound`** (see *Outbound networking* below). `Guest::AkumaNet` puts the virtio-net window
   in the slot after the disk's (`0xD0001000`; the guest finds devices as evenly spaced
   `virtio_mmio.device=` windows, in order) and **never raises its interrupt line** (the
   guest has no IOAPIC and polls). Frames the gateway has for the guest are delivered into
@@ -256,6 +256,7 @@ core keeps it until its next switch-out, after which it can only be placed elsew
 | `vm_ram_mib`, `vm_vcpus` | 16–1024 (default 768), 1–4 (default 1) |
 | `vm_disk`, `vm_disk_ram` | image path, or `/dev/nvme0n1p<N>` (that partition in place; never with `vm_disk_ram`); empty: the machine's second virtio-blk. `vm_disk_ram` copies an image into RAM at start |
 | `vm_forward` | `host:guest`, repeatable up to four |
+| `vm_outbound` | `true`: the guest's TCP connections and DNS queries leave through the host (default off: no route out) |
 | `vm_config` | a Firecracker JSON config (`boot-source`, `machine-config`, `drives[0]`) read first; explicit `vm_*` keys win |
 
 The spec keys use Firecracker's words as aliases (`kernel_image_path`, `boot_args`, `vcpu_count`,
@@ -268,11 +269,42 @@ Kernel parameters: `kvmctl` (arm SVM for `/dev/kvm0`, run nothing at boot), `kvm
 `kvmcores=<list>`. The older `kvmtest` + `kvmserve`/`kvmgentoo`/selector-file path is a shim: it builds the
 same `Spec` (`kvm::legacy_service`) and queues it with no owner, so the rehearsal flags and entry 28 keep working.
 
+## Outbound networking (`vm_outbound`, 2026-10-23)
+
+Off by default: the gateway is "a model, not a route" and a guest then reaches nothing but its gateway. With
+`vm_outbound = true` in the herd conf (kernel side: `Spec::outbound`, the wire key `outbound=1`; a service guest only,
+the legacy boot flags never get it) the gateway lets two things out and nothing else:
+
+* **TCP to an address outside the guest's `10.0.2.0/24`.** The gateway *holds* the guest's SYN in one of
+  `OUT_SLOTS` (8) outbound slots and tells the relay (`Gateway::out_take_request`). The relay makes the same
+  connection from the host's stack (a non-blocking `socket_connect`) and answers the guest with
+  `out_accept` (a SYN-ACK *from the real address and port*, so the guest believes it reached it) or
+  `out_refuse` (a RST). After that the bytes move through the same `shuttle` as a forward slot. Not
+  forwarded: the guest's own subnet, `0/8`, `127/8`, multicast and broadcast (`gateway::routable`,
+  `relay::outbound_allowed`); a ninth connection is reset (`out_full`).
+* **DNS to the proxy `10.0.2.3:53`.** The query is queued (`DNS_SLOTS` = 4, up to `DNS_MAX` = 512 bytes), sent
+  verbatim by the relay over one UDP socket to `akuma_net::dns::upstream()` (the host's own first resolver),
+  and the answer is matched back by id and sent to the guest from `10.0.2.3`. A query without an answer for 5 s is
+  dropped (the guest retries).
+
+What it does **not** do: ICMP past the gateway (`ping 8.8.8.8` fails), UDP other than DNS, IPv6, inbound beyond the
+`vm_forward` list. **Isolation changes with it:** a guest's connections leave from the *host's* address, so a
+guest with `vm_outbound` reaches whatever the host reaches (its LAN, its own LAN address and the host's sshd
+included; loopback excepted). Turn it on for guests you trust with the host's network.
+
+The relay's per-slot state is heap, allocated once on the first outbound poll (the relay is built by value on a
+small task stack). `[KVM] relay: outbound opened= failed= denied= ... gw_syns= gw_full= gw_refused=` and one
+`out slot` line per live connection are in the status output. Rehearse it with
+`scripts/kvm/serve_rehearse.py LOG --herd --outbound` (a web server on the Mac by LAN address; DNS; the Alpine CDN).
+How it was built, verified, and the one open item: [`KVM_OUTBOUND_NETWORKING.md`](../../archive/KVM_OUTBOUND_NETWORKING.md).
+
 ## Open items (2026-10-23)
 
 * **Large guest->host transfers wedge the guest** (96 MiB+ through the relay), on the old kernel too; the host's
   `/bin/ssh` client spins while the relay's host socket stays full. Evidence and next experiments:
   [`KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE.md`](../../archive/KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE.md).
+* **Outbound to `neverssl.com:80`** is refused although the Mac reaches the same address
+  ([`KVM_OUTBOUND_NETWORKING.md`](../../archive/KVM_OUTBOUND_NETWORKING.md) § Open).
 * **NetBSD as a guest**: its MICROVM kernel carries a PVH note; needs a `Guest::NetBsd` (IOAPIC question). Same doc, §3.
 
 ## Isolation modes under herd (one supervisor, four shapes of "a machine")

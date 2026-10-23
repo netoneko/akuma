@@ -111,3 +111,18 @@ retrying a `socket_send` that returns EAGAIN on a socket whose peer is gone. Two
 
 The relay should bound this regardless: a slot whose host socket has made no progress for N seconds
 (`host_send_blocked` without `up_off` moving) should be reset like an idle one.
+
+### 2b. The wedge does not reproduce under TCG, even with the host's own `/bin/ssh` (same day)
+
+* Mac OpenSSH -> relay -> guest under TCG, 150 MB of `/dev/zero`: completes (61 s, no stall).
+* The host's own Akuma `ssh` client against its own relay under TCG, 100 MiB through `wc -c`
+  (`scripts/kvm/serve_rehearse.py --herd --host-ssh-bulk 100`, a herd oneshot on the host with a
+  generated raw key the guest trusts): completes, `bytes=104857728`.
+
+So the relay, the gateway, the guest's sshd and the host's ssh client are all fine on one host core
+at TCG speed; the ~63 MB wedge on the ryzen needs what TCG does not have: **real SMP on the host**
+(`smp=8`, the relay's owner task on core 4, the ssh client and `wc` on cores 0-3), real timing, the
+BKL-free netpoll drain. The suspects narrow to host-side concurrency in `akuma-net`'s loopback path
+(the relay's socket and the client's are the two ends of one loopback TCP connection) or in the
+client's pipe to `wc`. Next: rehearse with `--host-smp 4` (QEMU `-smp 4`, `smp=4`), and add a
+probe on the ryzen that reads `/proc/net/tcp` queue sizes (the current output has no queue columns).

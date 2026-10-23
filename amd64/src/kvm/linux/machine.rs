@@ -1152,17 +1152,23 @@ pub fn run(nrips: bool, vm: &Vm) {
 
     // The devices. The gateway's queue and TCP rings are lent to it for good, so it is a pooled
     // `'static` value handed from guest to guest.
+    // Only a service guest with `vm_outbound` gets a route out; everything else has the ports forwarded in.
+    let outbound = service && vm.spec.as_ref().is_some_and(|s| s.outbound);
+    if outbound {
+        p("[KVM] linux: outbound networking on (the guest's TCP and DNS leave through the host)\n");
+    }
     let blk = disk.map(|d| (MmioBlk::new(d.sectors()), d));
     let net = if guest.has_net() {
-        let Some(gw) = take_gateway() else {
+        let Some(mut gw) = take_gateway() else {
             p("[KVM] linux: no memory for the gateway\n");
             return;
         };
+        gw.set_outbound(outbound);
         Some((MmioNet::new(svm::gateway::GUEST_MAC), gw))
     } else {
         None
     };
-    let relay = service.then(|| Relay::new(vm.forwards()));
+    let relay = service.then(|| Relay::new(vm.forwards(), outbound));
     if crate::lapic::tsc_uptime_us().is_none() {
         p("[KVM] linux: warning: host uptime is 10 ms ticks; PIT timing will be coarse\n");
     }

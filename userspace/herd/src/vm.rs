@@ -20,6 +20,7 @@
 //! | `vm_cores` | host cores the virtual processors may run on (`4-5`); the kernel's `kvmcores=` is the allowed set, so a core outside it is ignored |
 //! | `vm_disk` | disk image path, or `/dev/nvme0n1p<N>` to use that NVMe partition in place (empty: the machine's second virtio-blk) |
 //! | `vm_disk_ram` | copy the disk into RAM at start |
+//! | `vm_outbound` | let the guest's TCP connections and DNS queries out through the host's network (default off) |
 //! | `vm_forward` | `host:guest`, repeatable |
 //! | `vm_config` | a Firecracker JSON config (`boot-source`, `machine-config`, `drives`) read first; explicit `vm_*` keys override it |
 

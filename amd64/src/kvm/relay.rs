@@ -12,11 +12,23 @@
 //! `socket_*` calls drive the host stack themselves (`socket_recv` polls it), so this needs
 //! no daemon of its own.
 //!
-//! No allocation: a chunk buffer per direction on the stack, one for each slot's
-//! guest-to-host leftovers.
+//! **Outbound** (the spec's `vm_outbound`): the other direction. A connection the *guest* opens
+//! to an address outside its own subnet is held by the gateway ([`Gateway::out_take_request`]);
+//! the relay makes the same connection from the host's stack (a non-blocking `connect`) and
+//! answers the guest through [`Gateway::out_accept`] or [`Gateway::out_refuse`], after which the
+//! bytes move exactly as for a forward. DNS queries the gateway queues for its proxy are sent,
+//! verbatim, to the host's own resolver over one UDP socket and the answers matched back by id.
+//! The guest's connections are the host's connections: they leave from the host's address, so
+//! anything the host can reach, a guest with `vm_outbound` can reach (loopback excepted).
+//!
+//! No allocation on the forward path: a chunk buffer per direction on the stack, one for each
+//! slot's guest-to-host leftovers. The outbound slots (eight more of them) are allocated once,
+//! fallibly, when outbound is first polled: the relay is built by value on a small task stack.
 
-use akuma_net::socket::{self, socket_const::SOCK_STREAM, SocketAddrV4};
-use akuma_svm_amd64::gateway::{Gateway, FWD_SLOTS};
+use akuma_net::socket::{self, socket_const::{SOCK_DGRAM, SOCK_STREAM}, SocketAddrV4};
+use akuma_svm_amd64::gateway::{Gateway, OutPhase, DNS_SLOTS, FWD_SLOTS, OUT_SLOTS};
+use akuma_svm_amd64::tcp::Tcp;
+use alloc::vec::Vec;
 use akuma_vm_spec::{spec::MAX_FORWARDS, Forward};
 
 /// `EAGAIN`, as the host socket layer reports it (a positive errno).
@@ -39,6 +51,12 @@ const RETRY_US: u64 = 1_000_000;
 const SYN_RETRY_US: u64 = 4_000_000;
 /// SYNs sent per connection before the client is refused (reset) and the slot freed.
 const SYN_TRIES: u8 = 4;
+/// `connect(2)` reports a non-blocking dial in flight as `EINPROGRESS`.
+const EINPROGRESS: i32 = 115;
+/// How long the host may take to make an outbound connection before the guest is refused (µs).
+const OUT_CONNECT_US: u64 = 15_000_000;
+/// How long a forwarded DNS query waits for its answer before it is dropped (the guest retries) (µs).
+const DNS_WAIT_US: u64 = 5_000_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -48,18 +66,29 @@ enum Phase {
     Open,
 }
 
-struct Slot {
-    sock: usize,
-    phase: Phase,
-    /// The host client closed its side (we saw EOF): the guest has been told with a FIN.
+/// The bytes in flight between one guest connection and its host socket.
+struct Pipe {
+    /// The host peer closed its side (we saw EOF): the guest has been told with a FIN.
     host_eof: bool,
     /// The guest closed its side and everything it sent has been delivered: the host
-    /// client has been told with `shutdown(SHUT_WR)`.
+    /// peer has been told with `shutdown(SHUT_WR)`.
     guest_eof_passed: bool,
     /// Guest-to-host bytes read from the guest but not yet accepted by the host socket.
     up: [u8; CHUNK],
     up_off: usize,
     up_len: usize,
+}
+
+impl Pipe {
+    const fn new() -> Self {
+        Self { host_eof: false, guest_eof_passed: false, up: [0; CHUNK], up_off: 0, up_len: 0 }
+    }
+}
+
+struct Slot {
+    sock: usize,
+    phase: Phase,
+    pipe: Pipe,
     /// When the SYN last went out, and how many have.
     syn_at_us: u64,
     syn_tries: u8,
@@ -67,7 +96,24 @@ struct Slot {
 
 impl Slot {
     const fn new() -> Self {
-        Self { sock: 0, phase: Phase::Idle, host_eof: false, guest_eof_passed: false, up: [0; CHUNK], up_off: 0, up_len: 0, syn_at_us: 0, syn_tries: 0 }
+        Self { sock: 0, phase: Phase::Idle, pipe: Pipe::new(), syn_at_us: 0, syn_tries: 0 }
+    }
+}
+
+/// One connection the guest opened outward.
+struct OutSlot {
+    sock: usize,
+    phase: Phase,
+    pipe: Pipe,
+    /// When the host's dial began, and to where (for the log).
+    started_us: u64,
+    dst: [u8; 4],
+    dport: u16,
+}
+
+impl OutSlot {
+    const fn new() -> Self {
+        Self { sock: 0, phase: Phase::Idle, pipe: Pipe::new(), started_us: 0, dst: [0; 4], dport: 0 }
     }
 }
 
@@ -87,6 +133,17 @@ pub struct Counts {
     pub syn_gave_up: u64,
     /// The slowest SYN-to-established time seen (µs): slow answers or lost SYNs?
     pub connect_us_max: u64,
+    /// Outbound: connections the host made for the guest, ones it could not (refused, timed out,
+    /// no socket), ones denied by policy, and the bytes moved each way.
+    pub out_opened: u64,
+    pub out_failed: u64,
+    pub out_denied: u64,
+    pub out_to_guest: u64,
+    pub out_to_host: u64,
+    /// DNS queries forwarded to the host's resolver, answers handed back, queries that timed out.
+    pub dns_fwd: u64,
+    pub dns_answered: u64,
+    pub dns_timeouts: u64,
 }
 
 pub struct Relay {
@@ -99,20 +156,27 @@ pub struct Relay {
     slots: [Slot; FWD_SLOTS],
     /// The guest port each live slot's connection goes to.
     slot_guest: [u16; FWD_SLOTS],
+    /// The spec allows the guest out (`vm_outbound`); the slots below exist once it is polled.
+    outbound: bool,
+    out: Vec<OutSlot>,
+    /// The UDP socket DNS queries leave from, and what each gateway DNS slot is waiting on:
+    /// the query's id and when it went out.
+    dns_sock: Option<usize>,
+    dns_wait: [Option<(u16, u64)>; DNS_SLOTS],
     pub counts: Counts,
 }
 
 impl Relay {
     /// A relay for `forwards` (at most [`MAX_FORWARDS`]); nothing is bound until the first
     /// [`Relay::poll`].
-    pub const fn new(forwards: &[Forward]) -> Self {
+    pub const fn new(forwards: &[Forward], outbound: bool) -> Self {
         let mut fwds = [Forward { host: 0, guest: 0 }; MAX_FORWARDS];
         let mut i = 0;
         while i < forwards.len() && i < MAX_FORWARDS {
             fwds[i] = forwards[i];
             i += 1;
         }
-        Self { fwds, n_fwds: i, listeners: [None; MAX_FORWARDS], retry_at_us: 0, slots: [const { Slot::new() }; FWD_SLOTS], slot_guest: [0; FWD_SLOTS], counts: Counts { accepted: 0, to_guest: 0, to_host: 0, refused: 0, send_blocked: 0, recv_idle: 0, syn_retries: 0, syn_gave_up: 0, connect_us_max: 0 } }
+        Self { fwds, n_fwds: i, listeners: [None; MAX_FORWARDS], retry_at_us: 0, slots: [const { Slot::new() }; FWD_SLOTS], slot_guest: [0; FWD_SLOTS], outbound, out: Vec::new(), dns_sock: None, dns_wait: [None; DNS_SLOTS], counts: Counts { accepted: 0, to_guest: 0, to_host: 0, refused: 0, send_blocked: 0, recv_idle: 0, syn_retries: 0, syn_gave_up: 0, connect_us_max: 0, out_opened: 0, out_failed: 0, out_denied: 0, out_to_guest: 0, out_to_host: 0, dns_fwd: 0, dns_answered: 0, dns_timeouts: 0 } }
     }
 
     /// Is every forward's listener up?
@@ -150,6 +214,19 @@ impl Relay {
                 self.teardown(i, gw);
             }
         }
+        for i in 0..self.out.len() {
+            if self.out[i].phase != Phase::Idle {
+                self.out_teardown(i, gw);
+            }
+        }
+        for i in 0..DNS_SLOTS {
+            if self.dns_wait[i].take().is_some() {
+                gw.dns_drop(i);
+            }
+        }
+        if let Some(s) = self.dns_sock.take() {
+            socket::remove_socket(s);
+        }
         for l in &mut self.listeners {
             if let Some(idx) = l.take() {
                 socket::remove_socket(idx);
@@ -159,6 +236,67 @@ impl Relay {
 
     /// One line per active connection, for the log: where bytes are sitting.
     pub fn status(&self, gw: &mut Gateway<'_>) {
+        if self.outbound {
+            let c = &self.counts;
+            super::p("[KVM] relay: outbound opened=");
+            super::dec(c.out_opened);
+            super::p(" failed=");
+            super::dec(c.out_failed);
+            super::p(" denied=");
+            super::dec(c.out_denied);
+            super::p(" to_guest=");
+            super::dec(c.out_to_guest);
+            super::p(" to_host=");
+            super::dec(c.out_to_host);
+            super::p(" dns_fwd=");
+            super::dec(c.dns_fwd);
+            super::p(" dns_answered=");
+            super::dec(c.dns_answered);
+            super::p(" dns_timeouts=");
+            super::dec(c.dns_timeouts);
+            super::p(" gw_syns=");
+            super::dec(gw.stats.out_syns);
+            super::p(" gw_full=");
+            super::dec(gw.stats.out_full);
+            super::p(" gw_refused=");
+            super::dec(gw.stats.out_refused);
+            super::p(" resets=");
+            super::dec(gw.stats.tcp_resets);
+            super::p("\n");
+            for i in 0..OUT_SLOTS {
+                let ph = gw.out_phase(i);
+                if ph == OutPhase::Free && self.out.get(i).is_none_or(|o| o.phase == Phase::Idle) {
+                    continue;
+                }
+                super::p("[KVM] relay: out slot ");
+                super::dec(i as u64);
+                super::p(match ph {
+                    OutPhase::Free => " gw=free",
+                    OutPhase::Asked => " gw=asked",
+                    OutPhase::Connecting => " gw=connecting",
+                    OutPhase::Open => " gw=open",
+                    OutPhase::Refusing => " gw=refusing",
+                });
+                super::p(match self.out.get(i).map(|o| o.phase) {
+                    Some(Phase::Connecting) => " relay=dialing",
+                    Some(Phase::Open) => " relay=open",
+                    _ => " relay=idle",
+                });
+                super::p(" tcp_state=");
+                super::p(match gw.out(i).state() {
+                    akuma_svm_amd64::tcp::State::Closed => "closed",
+                    akuma_svm_amd64::tcp::State::Established => "established",
+                    akuma_svm_amd64::tcp::State::CloseWait => "close_wait",
+                    akuma_svm_amd64::tcp::State::FinWait1 => "fin_wait1",
+                    akuma_svm_amd64::tcp::State::FinWait2 => "fin_wait2",
+                    akuma_svm_amd64::tcp::State::LastAck => "last_ack",
+                    akuma_svm_amd64::tcp::State::Closing => "closing",
+                    akuma_svm_amd64::tcp::State::SynRcvd => "syn_rcvd",
+                    akuma_svm_amd64::tcp::State::SynSent => "syn_sent",
+                });
+                super::p("\n");
+            }
+        }
         for i in 0..FWD_SLOTS {
             if self.slots[i].phase == Phase::Idle {
                 continue;
@@ -174,7 +312,7 @@ impl Relay {
             super::p(" to_host=");
             super::dec(self.counts.to_host);
             super::p(" up_pending=");
-            super::dec(self.slots[i].up_len as u64);
+            super::dec(self.slots[i].pipe.up_len as u64);
             super::p(" gw_tx=");
             super::dec(t.tx_queued as u64);
             super::p(" gw_rx=");
@@ -209,18 +347,19 @@ impl Relay {
 
     /// Is any connection open or being opened? (The run loop sleeps less while one is.)
     pub fn active(&self) -> bool {
-        self.slots.iter().any(|s| s.phase != Phase::Idle)
+        self.slots.iter().any(|s| s.phase != Phase::Idle) || self.out.iter().any(|s| s.phase != Phase::Idle) || self.dns_wait.iter().any(Option::is_some)
     }
 
     /// Move whatever can move, both ways, on every connection, until nothing moves or
     /// [`ROUNDS`] rounds have. Cheap when idle.
     pub fn poll(&mut self, gw: &mut Gateway<'_>, now_us: u64) {
         for _ in 0..ROUNDS {
-            let before = self.counts.to_guest + self.counts.to_host + self.counts.accepted;
+            let moved = |c: &Counts| c.to_guest + c.to_host + c.accepted + c.out_to_guest + c.out_to_host + c.out_opened + c.dns_answered;
+            let before = moved(&self.counts);
             self.poll_once(gw, now_us);
             // Frames the gateway queued for the guest are the caller's to deliver; once the
             // queue is full there is nothing more to do this wake.
-            if self.counts.to_guest + self.counts.to_host + self.counts.accepted == before {
+            if moved(&self.counts) == before {
                 break;
             }
         }
@@ -279,70 +418,292 @@ impl Relay {
                 Phase::Open => self.pump_open(i, gw),
             }
         }
+        if self.outbound {
+            self.poll_out(gw, now_us);
+            self.poll_dns(gw, now_us);
+        }
         gw.pump();
     }
 
     fn pump_open(&mut self, i: usize, gw: &mut Gateway<'_>) {
-        if gw.fwd(i).was_reset() || (gw.fwd(i).is_closed() && self.slots[i].up_len == 0) {
-            self.teardown(i, gw);
-            return;
-        }
-        let sock = self.slots[i].sock;
-        // Guest to host: read a chunk if the last one is gone, offer it to the host socket.
-        if self.slots[i].up_len == 0 {
-            let s = &mut self.slots[i];
-            let n = gw.fwd(i).read(&mut s.up);
-            s.up_off = 0;
-            s.up_len = n;
-        }
-        if self.slots[i].up_len > 0 {
-            let s = &mut self.slots[i];
-            match socket::socket_send(sock, &s.up[s.up_off..s.up_len], true) {
-                Ok(n) => {
-                    s.up_off += n;
-                    self.counts.to_host += n as u64;
-                    if s.up_off >= s.up_len {
-                        s.up_len = 0;
-                        s.up_off = 0;
-                    }
-                }
-                Err(e) if e == EAGAIN => self.counts.send_blocked += 1,
-                Err(_) => {
-                    gw.fwd(i).abort();
-                    self.teardown(i, gw);
-                    return;
-                }
-            }
-        }
-        if gw.fwd(i).peer_finished() && self.slots[i].up_len == 0 && !self.slots[i].guest_eof_passed {
-            let _ = socket::socket_shutdown(sock, SHUT_WR);
-            self.slots[i].guest_eof_passed = true;
-        }
-        // Host to guest.
-        if !self.slots[i].host_eof {
-            let room = gw.fwd(i).write_room().min(CHUNK);
-            if room > 0 {
-                let mut buf = [0u8; CHUNK];
-                match socket::socket_recv(sock, &mut buf[..room], true) {
-                    Ok(0) => {
-                        self.slots[i].host_eof = true;
-                        gw.fwd(i).close();
-                    }
-                    Ok(n) => {
-                        let took = gw.fwd(i).write(&buf[..n]);
-                        self.counts.to_guest += took as u64;
-                    }
-                    Err(e) if e == EAGAIN => self.counts.recv_idle += 1,
-                    Err(_) => {
-                        gw.fwd(i).abort();
-                        self.teardown(i, gw);
-                        return;
-                    }
-                }
-            }
-        }
-        if self.slots[i].host_eof && self.slots[i].guest_eof_passed && gw.fwd(i).is_closed() {
+        let done = shuttle(gw.fwd(i), self.slots[i].sock, &mut self.slots[i].pipe, &mut self.counts.to_host, &mut self.counts.to_guest, &mut self.counts.send_blocked, &mut self.counts.recv_idle);
+        if done {
             self.teardown(i, gw);
         }
     }
+
+    /// Outbound slot storage, allocated once and fallibly (the relay is built on a small stack).
+    fn ensure_out(&mut self) -> bool {
+        if self.out.len() == OUT_SLOTS {
+            return true;
+        }
+        if self.out.try_reserve_exact(OUT_SLOTS).is_err() {
+            return false;
+        }
+        while self.out.len() < OUT_SLOTS {
+            self.out.push(OutSlot::new());
+        }
+        true
+    }
+
+    fn out_teardown(&mut self, i: usize, gw: &mut Gateway<'_>) {
+        socket::remove_socket(self.out[i].sock);
+        self.out[i].phase = Phase::Idle;
+        self.out[i].pipe = Pipe::new();
+        gw.out_release(i);
+    }
+
+    /// The guest's outward connections: dial what it asked for, answer it, move the bytes.
+    fn poll_out(&mut self, gw: &mut Gateway<'_>, now_us: u64) {
+        if !self.ensure_out() {
+            return;
+        }
+        for i in 0..OUT_SLOTS {
+            match self.out[i].phase {
+                Phase::Idle => {
+                    let Some((ip, port)) = gw.out_take_request(i) else { continue };
+                    if !outbound_allowed(ip) {
+                        self.counts.out_denied += 1;
+                        gw.out_refuse(i);
+                        continue;
+                    }
+                    let Some(sock) = socket::alloc_socket(SOCK_STREAM) else {
+                        self.counts.out_failed += 1;
+                        gw.out_refuse(i);
+                        continue;
+                    };
+                    match socket::socket_connect(sock, SocketAddrV4::new(ip, port), true) {
+                        Ok(()) | Err(EINPROGRESS) => {
+                            self.out[i].sock = sock;
+                            self.out[i].phase = Phase::Connecting;
+                            self.out[i].started_us = now_us;
+                            self.out[i].dst = ip;
+                            self.out[i].dport = port;
+                        }
+                        Err(_) => {
+                            socket::remove_socket(sock);
+                            self.counts.out_failed += 1;
+                            gw.out_refuse(i);
+                        }
+                    }
+                }
+                Phase::Connecting => {
+                    let sock = self.out[i].sock;
+                    // The guest gave up (it reset its held SYN): drop the dial.
+                    if gw.out_phase(i) != OutPhase::Connecting {
+                        self.out_teardown(i, gw);
+                        continue;
+                    }
+                    let _ = socket::socket_tcp_ready(sock); // polls the host stack
+                    let state = socket::tcp_recv_snapshot(sock).map_or("CLOSED", |s| s.state);
+                    if state == "ESTABLISHED" {
+                        if gw.out_accept(i) {
+                            self.out[i].phase = Phase::Open;
+                            self.counts.out_opened += 1;
+                        } else {
+                            self.out_teardown(i, gw);
+                        }
+                    } else if state != "SYN_SENT" || now_us.saturating_sub(self.out[i].started_us) >= OUT_CONNECT_US {
+                        // Refused, reset, or nothing answered in time.
+                        if self.counts.out_failed < 6 {
+                            let d = self.out[i].dst;
+                            super::p("[KVM] relay: dial to ");
+                            for (k, b) in d.iter().enumerate() {
+                                if k > 0 {
+                                    super::p(".");
+                                }
+                                super::dec(u64::from(*b));
+                            }
+                            super::p(":");
+                            super::dec(u64::from(self.out[i].dport));
+                            super::p(" ended in state ");
+                            super::p(state);
+                            super::p(" after ");
+                            super::dec(now_us.saturating_sub(self.out[i].started_us) / 1000);
+                            super::p(" ms\n");
+                        }
+                        self.counts.out_failed += 1;
+                        gw.out_refuse(i);
+                        socket::remove_socket(sock);
+                        self.out[i].phase = Phase::Idle;
+                    }
+                }
+                Phase::Open => {
+                    let sock = self.out[i].sock;
+                    let c = &mut self.counts;
+                    let done = shuttle(gw.out(i), sock, &mut self.out[i].pipe, &mut c.out_to_host, &mut c.out_to_guest, &mut c.send_blocked, &mut c.recv_idle);
+                    if done {
+                        self.out_teardown(i, gw);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Forward the guest's DNS queries to the host's resolver and hand the answers back.
+    fn poll_dns(&mut self, gw: &mut Gateway<'_>, now_us: u64) {
+        for i in 0..DNS_SLOTS {
+            if self.dns_wait[i].is_some() {
+                continue;
+            }
+            let mut q = [0u8; akuma_svm_amd64::gateway::DNS_MAX];
+            let n = match gw.dns_take(i) {
+                Some(b) => {
+                    q[..b.len()].copy_from_slice(b);
+                    b.len()
+                }
+                None => continue,
+            };
+            let sock = match self.dns_sock {
+                Some(s) => Some(s),
+                None => {
+                    let s = socket::alloc_socket(SOCK_DGRAM);
+                    self.dns_sock = s;
+                    s
+                }
+            };
+            let sent = match (sock, akuma_net::dns::upstream()) {
+                (Some(s), Some(up)) => {
+                    let ok = socket::socket_send_udp(s, &q[..n], SocketAddrV4::new(up, 53)).is_ok();
+                    if self.counts.dns_fwd < 3 {
+                        super::p("[KVM] relay: dns query ");
+                        super::dec(n as u64);
+                        super::p(" bytes to ");
+                        super::dec(u64::from(up[0]));
+                        super::p(".");
+                        super::dec(u64::from(up[1]));
+                        super::p(".");
+                        super::dec(u64::from(up[2]));
+                        super::p(".");
+                        super::dec(u64::from(up[3]));
+                        super::p(if ok { " sent\n" } else { " FAILED\n" });
+                    }
+                    ok
+                }
+                _ => {
+                    super::p("[KVM] relay: dns query dropped: no UDP socket or no resolver\n");
+                    false
+                }
+            };
+            if sent {
+                self.dns_wait[i] = Some((u16::from_be_bytes([q[0], q[1]]), now_us));
+                self.counts.dns_fwd += 1;
+            } else {
+                gw.dns_drop(i);
+            }
+        }
+        if let Some(sock) = self.dns_sock {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, _from)) = socket::socket_recv_udp(sock, &mut buf, true) {
+                if n < 12 {
+                    continue;
+                }
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                if self.counts.dns_answered < 3 {
+                    super::p("[KVM] relay: dns reply ");
+                    super::dec(n as u64);
+                    super::p(" bytes rcode=");
+                    super::dec(u64::from(buf[3] & 0xF));
+                    super::p("\n");
+                }
+                let hit = (0..DNS_SLOTS).find(|&i| self.dns_wait[i].is_some_and(|(w, _)| w == id) && gw.dns_waiting(i));
+                if let Some(i) = hit {
+                    self.dns_wait[i] = None;
+                    if gw.dns_reply(i, &buf[..n]) {
+                        self.counts.dns_answered += 1;
+                    } else {
+                        // The wire was full: the guest's retry asks again.
+                        gw.dns_drop(i);
+                    }
+                }
+            }
+        }
+        for i in 0..DNS_SLOTS {
+            if let Some((_, t)) = self.dns_wait[i]
+                && now_us.saturating_sub(t) >= DNS_WAIT_US
+            {
+                self.dns_wait[i] = None;
+                gw.dns_drop(i);
+                self.counts.dns_timeouts += 1;
+            }
+        }
+    }
+}
+
+/// May the host dial `ip` for a guest? The gateway has already kept the guest's own subnet,
+/// loopback, "this host" and multicast from getting this far; this is the host's own say.
+fn outbound_allowed(ip: [u8; 4]) -> bool {
+    !(ip[0] == 0 || ip[0] == 127 || ip[0] >= 224)
+}
+
+/// Say, for the first few, why a host socket broke a connection (an errno from the host stack).
+fn note_err(what: &str, errno: i32) {
+    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 6 {
+        super::p("[KVM] relay: host socket ");
+        super::p(what);
+        super::p(" failed, errno ");
+        super::dec(errno.unsigned_abs().into());
+        super::p("\n");
+    }
+}
+
+/// Move bytes between a guest connection and its host socket, both ways, one chunk each.
+/// True when the connection is finished (or broken) and both ends should be torn down.
+fn shuttle(conn: &mut Tcp<'_>, sock: usize, p: &mut Pipe, to_host: &mut u64, to_guest: &mut u64, send_blocked: &mut u64, recv_idle: &mut u64) -> bool {
+    if conn.was_reset() || (conn.is_closed() && p.up_len == 0) {
+        return true;
+    }
+    // Guest to host: read a chunk if the last one is gone, offer it to the host socket.
+    if p.up_len == 0 {
+        let n = conn.read(&mut p.up);
+        p.up_off = 0;
+        p.up_len = n;
+    }
+    if p.up_len > 0 {
+        match socket::socket_send(sock, &p.up[p.up_off..p.up_len], true) {
+            Ok(n) => {
+                p.up_off += n;
+                *to_host += n as u64;
+                if p.up_off >= p.up_len {
+                    p.up_len = 0;
+                    p.up_off = 0;
+                }
+            }
+            Err(e) if e == EAGAIN => *send_blocked += 1,
+            Err(e) => {
+                note_err("send", e);
+                conn.abort();
+                return true;
+            }
+        }
+    }
+    if conn.peer_finished() && p.up_len == 0 && !p.guest_eof_passed {
+        let _ = socket::socket_shutdown(sock, SHUT_WR);
+        p.guest_eof_passed = true;
+    }
+    // Host to guest.
+    if !p.host_eof {
+        let room = conn.write_room().min(CHUNK);
+        if room > 0 {
+            let mut buf = [0u8; CHUNK];
+            match socket::socket_recv(sock, &mut buf[..room], true) {
+                Ok(0) => {
+                    p.host_eof = true;
+                    conn.close();
+                }
+                Ok(n) => {
+                    let took = conn.write(&buf[..n]);
+                    *to_guest += took as u64;
+                }
+                Err(e) if e == EAGAIN => *recv_idle += 1,
+                Err(e) => {
+                    note_err("recv", e);
+                    conn.abort();
+                    return true;
+                }
+            }
+        }
+    }
+    p.host_eof && p.guest_eof_passed && conn.is_closed()
 }
