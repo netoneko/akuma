@@ -12,6 +12,8 @@ use akuma_kvm_abi::state::{
 };
 use akuma_svm_amd64 as svm;
 use akuma_svm_amd64::{ExitCode, Seg, SegAttr, Vmcb, ctrl, eventinj, exitinfo, mmio, save, tables};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
 use super::platform::{Offer, Platform, Source};
@@ -33,11 +35,16 @@ pub(super) struct Events {
 }
 
 impl Events {
-    pub(super) fn snapshot(
+    pub(super) const EMPTY: Self = Self { io: [None; super::MAX_IOEVENTFDS], irq: [None; super::MAX_IRQFDS] };
+
+    /// Copy the VM's registrations in place (no large temporary on the kernel stack).
+    pub(super) fn refresh(
+        &mut self,
         io: &[Option<(Ioeventfd, u32)>; super::MAX_IOEVENTFDS],
         irq: &[Option<(Irqfd, u32)>; super::MAX_IRQFDS],
-    ) -> Self {
-        Self { io: *io, irq: *irq }
+    ) {
+        self.io.copy_from_slice(io);
+        self.irq.copy_from_slice(irq);
     }
 
     /// Does a store of `size` bytes of `val` to `addr` ring a registered doorbell? If so, signal it.
@@ -95,10 +102,22 @@ pub(super) struct Vcpu {
     /// The run mapping's frames (the VMM maps them; the kernel writes exits through the physmap).
     pub(super) run: [FreshFrame; RUN_PAGES],
     regs: GuestRegs,
-    cpuid: [CpuidEntry; MAX_CPUID],
+    /// The big state lives on the heap, allocated once at `CREATE_VCPU`: a 32 KiB kernel stack cannot
+    /// afford to carry (and copy) several kilobytes of it through `RUN`.
+    cpuid: Box<[CpuidEntry; MAX_CPUID]>,
     n_cpuid: usize,
-    fpu: FxArea,
+    fpu: Box<[FxArea; 1]>,
+    /// Taken out for the duration of a `RUN` (so the exit loop can borrow it beside the rest of `self`).
+    events: Option<Box<[Events; 1]>>,
     pending: Pending,
+}
+
+/// A fallible one-time heap allocation of `n` copies of `v` as a fixed-size array.
+fn heap_array<T: Clone, const N: usize>(v: T) -> Option<Box<[T; N]>> {
+    let mut vec = Vec::new();
+    vec.try_reserve_exact(N).ok()?;
+    vec.resize(N, v);
+    vec.into_boxed_slice().try_into().ok()
 }
 
 impl Vcpu {
@@ -113,15 +132,27 @@ impl Vcpu {
             host,
             run,
             regs: GuestRegs::default(),
-            cpuid: [CpuidEntry::default(); MAX_CPUID],
+            cpuid: heap_array(CpuidEntry::default())?,
             n_cpuid: 0,
-            fpu: FxArea::reset_state(),
+            fpu: heap_array(FxArea::reset_state())?,
+            events: Some(heap_array(Events::EMPTY)?),
             pending: Pending::None,
         })
     }
 
     fn vmcb(&mut self) -> Vmcb<'_> {
         Vmcb::new(self.vmcb.bytes_mut())
+    }
+
+    /// Copy the VM's eventfd registrations in (before a `RUN`).
+    pub(super) fn refresh_events(
+        &mut self,
+        io: &[Option<(Ioeventfd, u32)>; super::MAX_IOEVENTFDS],
+        irq: &[Option<(Irqfd, u32)>; super::MAX_IRQFDS],
+    ) {
+        if let Some(e) = self.events.as_mut() {
+            e[0].refresh(io, irq);
+        }
     }
 
     // ----- state in -----
@@ -265,9 +296,9 @@ impl Vcpu {
     pub(super) fn set_fpu(&mut self, arg: &[u8; FPU_LEN]) {
         let mut legacy = [0u8; 512];
         akuma_kvm_abi::state::fpu_to_fxsave(arg, &mut legacy);
-        self.fpu = FxArea::reset_state();
-        self.fpu.legacy_mut().copy_from_slice(&legacy);
-        self.fpu.sanitize();
+        self.fpu[0] = FxArea::reset_state();
+        self.fpu[0].legacy_mut().copy_from_slice(&legacy);
+        self.fpu[0].sanitize();
     }
 
     // ----- the run page -----
@@ -354,7 +385,14 @@ fn signal_pending() -> bool {
 const QUANTUM_US: u64 = 5_000;
 
 /// `KVM_RUN`. 0 when the VMM has something to do (the run page says what), `EINTR` for a signal.
-pub(super) fn run(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64, ev: &Events) -> u64 {
+pub(super) fn run(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64) -> u64 {
+    let Some(ev) = vc.events.take() else { return errno::EBUSY };
+    let r = run_pinned(vc, plat, slots, npt_pa, &ev[0]);
+    vc.events = Some(ev);
+    r
+}
+
+fn run_pinned(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64, ev: &Events) -> u64 {
     // The core must have SVM on and the thread must stay on it.
     let mut me = crate::smp::cpu_index();
     for _ in 0..3 {
@@ -434,13 +472,13 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
 
         save_host(host_pa);
         crate::sched::fpu_save_live(&mut host_fpu);
-        crate::sched::fpu_restore_live(&vc.fpu);
+        crate::sched::fpu_restore_live(&vc.fpu[0]);
         // SAFETY: the VMCB and host-save frames are live and owned by `vc`; SVM is enabled on this core
         // (`enable_on_core`) and the thread is pinned to it.
         let unlocked = Unlocked::new();
         unsafe { vmrun_regs(vmcb_pa, host_pa, &mut vc.regs) };
         drop(unlocked);
-        crate::sched::fpu_save_live(&mut vc.fpu);
+        crate::sched::fpu_save_live(&mut vc.fpu[0]);
         host_fpu.sanitize();
         crate::sched::fpu_restore_live(&host_fpu);
 
