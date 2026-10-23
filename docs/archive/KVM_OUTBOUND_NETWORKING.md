@@ -31,7 +31,10 @@ the host's upstream answers them.
 * TCG rehearsal (`serve_rehearse.py --herd --outbound`): `wget` of a file on the Mac by LAN address; a 4 MiB
   download with a matching md5 in 0.8 s; `nslookup neverssl.com 10.0.2.3`; `wget` of the Alpine CDN's
   `latest-releases.yaml` over the real internet.
-* Metal: see the follow-up section below if one was added.
+* Metal (ryzen entry 30, kernel `158ed98d`, `vm-serve-mc` with `vm_outbound = true`, 2 vCPUs on cores 4,6): from the
+  host, `ssh -p 2223 root@127.0.0.1` into the guest, `echo nameserver 10.0.2.3 > /etc/resolv.conf` (the staged image
+  had none; it persists in the image), then `wget` of `http://dl-cdn.alpinelinux.org/.../latest-releases.yaml`
+  (`branch: v3.24`, `arch: x86_64`) and of `http://pool.ntp.org/` **by name**: both worked. The image has no `nslookup`.
 
 ## Open
 

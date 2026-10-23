@@ -305,7 +305,9 @@ How it was built, verified, and the one open item: [`KVM_OUTBOUND_NETWORKING.md`
   [`KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE.md`](../../archive/KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE.md).
 * **Outbound to `neverssl.com:80`** is refused although the Mac reaches the same address
   ([`KVM_OUTBOUND_NETWORKING.md`](../../archive/KVM_OUTBOUND_NETWORKING.md) § Open).
-* **NetBSD as a guest**: its MICROVM kernel carries a PVH note; needs a `Guest::NetBsd` (IOAPIC question). Same doc, §3.
+* **NetBSD as a guest**: `netbsd-MICROVM` boots unmodified on the metal (PVH, `console=com`, virtio-mmio NIC) and stops at
+  its root prompt; it needs a root disk. One VM at a time through `/dev/kvm0` (a second service gets errno 16).
+  [`AKUMA_KVM_NETBSD_GUEST.md`](../../archive/AKUMA_KVM_NETBSD_GUEST.md).
 
 ## Isolation modes under herd (one supervisor, four shapes of "a machine")
 

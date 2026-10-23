@@ -75,6 +75,8 @@ reader on the host instead of `/bin/ssh`. **Do not use `-o` with the host's `ssh
 
 ## 3. NetBSD amd64 as a guest
 
+**Superseded the same day by [`AKUMA_KVM_NETBSD_GUEST.md`](AKUMA_KVM_NETBSD_GUEST.md): `netbsd-MICROVM` boots unmodified (the "needs a `Guest::NetBsd`/IOAPIC" guess below was wrong).**
+
 * `NetBSD-11.0-amd64.iso` (SHA512 verified against `cdn.netbsd.org/.../11.0/SHA512`) carries
   `amd64/binary/kernel/netbsd-{GENERIC,MICROVM,INSTALL}.gz`.
 * **Both `netbsd-MICROVM` (9.3 MB) and `netbsd-GENERIC` (30 MB) have the Xen ELF note type 18
