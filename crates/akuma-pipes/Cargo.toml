@@ -7,3 +7,6 @@ edition = "2024"
 # is an effect this crate returns rather than performs — see the crate docs.
 [dependencies]
 akuma-pipe = { path = "../akuma-pipe" }
+
+[lints]
+workspace = true

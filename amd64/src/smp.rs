@@ -89,12 +89,11 @@ static CPU_CAP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// call), and a bad or zero `N` is ignored.
 pub fn set_cpu_cap_from_cmdline(cmdline: &str) {
     for t in cmdline.split_ascii_whitespace() {
-        if let Some(n) = t.strip_prefix("smp=") {
-            if let Ok(n) = n.parse::<usize>() {
-                if n >= 1 {
-                    CPU_CAP.store(n, Ordering::Relaxed);
-                }
-            }
+        if let Some(n) = t.strip_prefix("smp=")
+            && let Ok(n) = n.parse::<usize>()
+            && n >= 1
+        {
+            CPU_CAP.store(n, Ordering::Relaxed);
         }
     }
 }
@@ -727,7 +726,7 @@ pub fn is_deferred(idx: usize) -> bool {
 fn tsc_delay_us(us: u64) {
     let hz = crate::lapic::tsc_hz().max(1);
     let end = akuma_cpu::tsc::rdtsc().wrapping_add(us * hz / 1_000_000);
-    while (akuma_cpu::tsc::rdtsc().wrapping_sub(end) as i64) < 0 {
+    while akuma_cpu::tsc::rdtsc().wrapping_sub(end).cast_signed() < 0 {
         core::hint::spin_loop();
     }
 }

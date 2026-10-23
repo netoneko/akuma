@@ -509,7 +509,7 @@ pub fn tsc_sync_bsp(idx: usize, base: i64) -> i64 {
         if rtt < best_rtt {
             best_rtt = rtt;
             let mid = t0.wrapping_add(rtt / 2);
-            best_off = (t1.wrapping_sub(mid) as i64).wrapping_add(base);
+            best_off = t1.wrapping_sub(mid).cast_signed().wrapping_add(base);
         }
     }
     TSC_OFFSET[idx].store(best_off, Ordering::Relaxed);

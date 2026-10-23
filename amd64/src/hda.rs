@@ -171,6 +171,7 @@ enum PosSrc {
     Clock,
 }
 
+#[allow(clippy::struct_excessive_bools, reason = "independent device-state flags (ring in use, running, ...), not a state machine")]
 struct Hda {
     regs: Mmio,
     /// Codec address (lowest set bit of STATESTS).
@@ -271,7 +272,7 @@ impl Hda {
         fence(Ordering::SeqCst);
         r.w16(reg::CORBWP, np as u16);
 
-        let mut w = Wait::new(50_000);
+        let mut wait = Wait::new(50_000);
         loop {
             let rwp = (r.r16(reg::RIRBWP) & 0xFF) as u8;
             if rwp != self.rirb_rp {
@@ -283,20 +284,20 @@ impl Hda {
                     // The controller wrote this entry before advancing RIRBWP
                     // past it; evict our stale line first.
                     RIRB.flush(usize::from(k) * 8, 8);
-                    let e = RIRB.get(usize::from(k));
-                    let ex = (e >> 32) as u32;
+                    let entry = RIRB.get(usize::from(k));
+                    let ex = (entry >> 32) as u32;
                     if ex & 0x10 != 0 {
                         continue; // unsolicited: not the answer to what we sent
                     }
                     if resp.is_none() {
-                        resp = Some(e as u32);
+                        resp = Some(entry as u32);
                     }
                 }
                 self.rirb_rp = rwp;
                 r.w8(reg::RIRBSTS, 0x05);
                 return resp;
             }
-            if w.expired() {
+            if wait.expired() {
                 return None;
             }
             core::hint::spin_loop();
@@ -305,7 +306,7 @@ impl Hda {
 
     /// Immediate command interface: one verb at a time, no DMA. The fallback
     /// Linux takes when the rings will not answer.
-    fn send_ici(&mut self, v: u32) -> Option<u32> {
+    fn send_ici(&self, v: u32) -> Option<u32> {
         let r = &self.regs;
         let mut w = Wait::new(5_000);
         while r.r16(reg::IRS) & 1 != 0 {
@@ -376,8 +377,8 @@ impl Hda {
         r.w8(sd + reg::SD_CTL + 2, TAG << 4); // stream tag, bits 23:20
 
         let mut l = VerbList::new();
-        for i in 0..self.ndacs {
-            codec::stream_verbs(self.dacs[i], TAG, fw, &mut l);
+        for &dac in &self.dacs[..self.ndacs] {
+            codec::stream_verbs(dac, TAG, fw, &mut l);
         }
         let failed = self.run(&l);
         self.ring = PlayRing::new(RING_BYTES as u32);
@@ -418,7 +419,7 @@ impl Hda {
     /// silence. The bytes behind the play position are ones the hardware has
     /// already fetched, and the writer cannot reach them yet (it stops
     /// `GUARD` short of a full lap), so this races with neither.
-    fn silence_consumed(&mut self, from: u64, to: u64) {
+    fn silence_consumed(from: u64, to: u64) {
         let n = (to - from).min(RING_BYTES as u64) as usize;
         if n == 0 {
             return;
@@ -447,7 +448,7 @@ impl Hda {
         let before = self.ring.consumed();
         self.ring.observe(pos);
         if self.pos_src != PosSrc::Clock {
-            self.silence_consumed(before, self.ring.consumed());
+            Self::silence_consumed(before, self.ring.consumed());
         }
         // A source that has not moved 60 ms after RUN does not work on this
         // controller: move to the next.
@@ -938,9 +939,9 @@ pub fn init(selftest: bool) {
             p("[HDA] route ");
             p(role_name(want));
             p(":");
-            for i in 0..usize::from(path.len) {
+            for &nid in &path.nid[..usize::from(path.len)] {
                 p(" ");
-                hx(u64::from(path.nid[i]), 2);
+                hx(u64::from(nid), 2);
             }
             p("\n");
             if first_pin == 0 {
@@ -1005,7 +1006,7 @@ fn tone(ms: u32) {
         let n = ((frames_total - done) as usize).min(buf.len() / 4);
         for f in 0..n {
             // Triangle, period 100 frames (441 Hz at 44.1 kHz), +-8000.
-            let x = (phase % 100) as i32;
+            let x = (phase % 100).cast_signed();
             let s = (if x < 50 { x * 320 - 8000 } else { (100 - x) * 320 - 8000 }) as i16;
             buf[f * 4..f * 4 + 2].copy_from_slice(&s.to_le_bytes());
             buf[f * 4 + 2..f * 4 + 4].copy_from_slice(&s.to_le_bytes());

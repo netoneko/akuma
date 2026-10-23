@@ -187,7 +187,7 @@ impl Dw {
 
     /// Re-initialise after a timeout or bus error (Linux's no-GPIO
     /// recovery): drop the enable so the FIFOs flush, bring it back.
-    pub fn recover(&mut self) {
+    pub fn recover(&self) {
         let _ = self.set_enabled(false);
         let _ = self.rd(ic::CLR_INTR);
         let _ = self.set_enabled(true);
@@ -200,7 +200,7 @@ impl Dw {
     /// [`XferError::NoDevice`] on a NACK, [`XferError::Timeout`] if the
     /// transfer outlives 40 ms (the caller `recover`s), [`XferError::Bus`]
     /// for any other abort.
-    pub fn xfer(&mut self, wr: &[u8], rd: &mut [u8]) -> Result<(), XferError> {
+    pub fn xfer(&self, wr: &[u8], rd: &mut [u8]) -> Result<(), XferError> {
         let total = wr.len() + rd.len();
         if total == 0 {
             return Ok(());

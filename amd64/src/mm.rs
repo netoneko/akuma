@@ -2321,8 +2321,7 @@ fn flush_shared_write(regions: &[WriteBackRegion]) {
         // used to see the file's stale bytes (`chromeprobe`'s shmvar c/d).
         by_path.push(write_back_target_ok(&r.path, r.mount_id, r.inode));
         let size = akuma_vfs_glue::fs::metadata_open_file(&r.path, r.mount_id, r.inode)
-            .map(|m| m.size as usize)
-            .unwrap_or(0);
+            .map_or(0, |m| m.size as usize);
         let end_va = r.start_va.saturating_add(r.pages * PAGE_SIZE as usize);
         let _ = usermode::with_current_address_space(|uas| {
             uas.rewrite_leaves_in_range(r.start_va, end_va, |_ledger, leaf| {

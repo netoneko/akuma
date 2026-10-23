@@ -249,6 +249,7 @@ impl Vm {
         Self { guest, spec: None }
     }
 
+    #[allow(clippy::large_types_passed_by_value, reason = "the Spec is moved into the Vm: one per VM, built once")]
     pub const fn from_spec(spec: Spec) -> Self {
         Self { guest: Guest::AkumaSpec, spec: Some(spec) }
     }
@@ -262,11 +263,11 @@ impl Vm {
     }
 
     fn path(&self) -> &str {
-        self.spec.as_ref().map_or(self.guest.path(), |s| s.kernel.as_str())
+        self.spec.as_ref().map_or_else(|| self.guest.path(), |s| s.kernel.as_str())
     }
 
     fn ram_bytes(&self) -> u64 {
-        self.spec.as_ref().map_or(self.guest.ram_bytes(), |s| u64::from(s.ram_mib) << 20)
+        self.spec.as_ref().map_or_else(|| self.guest.ram_bytes(), |s| u64::from(s.ram_mib) << 20)
     }
 
     fn forwards(&self) -> &[Forward] {
@@ -1425,22 +1426,19 @@ fn mmio_emulate(a: &mmio::Access, dev: &mut dyn MmioDev, v: &mut Vmcb<'_>, regs:
 
 /// One serial line: the guest's instruction bytes at `va`, for a post-mortem.
 fn dump_code(ram: &Ram, v: &Vmcb<'_>, va: u64) {
-    match guest_code(ram, v, va) {
-        Some(code) => {
-            p("[KVM] linux: code@");
-            hx(va, 16);
+    if let Some(code) = guest_code(ram, v, va) {
+        p("[KVM] linux: code@");
+        hx(va, 16);
+        p(" ");
+        for b in code {
+            hx(u64::from(b), 2);
             p(" ");
-            for b in code {
-                hx(u64::from(b), 2);
-                p(" ");
-            }
-            p("\n");
         }
-        None => {
-            p("[KVM] linux: code@");
-            hx(va, 16);
-            p(" unreadable (not mapped in the guest's tables, or outside RAM)\n");
-        }
+        p("\n");
+    } else {
+        p("[KVM] linux: code@");
+        hx(va, 16);
+        p(" unreadable (not mapped in the guest's tables, or outside RAM)\n");
     }
 }
 
@@ -1524,10 +1522,10 @@ impl Acct {
         Self::pct("% relay=", self.relay, wall);
         Self::pct("% other=", other, wall);
         p("%  busy:");
-        for c in 0..crate::smp::online_cpus().min(crate::smp::MAX_CPUS) {
+        for (c, last) in self.last_halt.iter_mut().enumerate().take(crate::smp::online_cpus().min(crate::smp::MAX_CPUS)) {
             let h = crate::sched::halted_tsc(c);
-            let halted = h.wrapping_sub(self.last_halt[c]).min(wall);
-            self.last_halt[c] = h;
+            let halted = h.wrapping_sub(*last).min(wall);
+            *last = h;
             p(" c");
             dec(c as u64);
             Self::pct("=", wall - halted, wall);

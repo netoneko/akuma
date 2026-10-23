@@ -279,17 +279,14 @@ static GATEWAY: Spinlock<Option<Gateway<'static>>> = Spinlock::new(None);
 
 fn take_gateway() -> Option<Gateway<'static>> {
     let pooled = GATEWAY.lock().take();
-    match pooled {
-        Some(mut g) => {
-            g.reset();
-            Some(g)
-        }
-        None => {
-            let mut v = alloc::vec::Vec::new();
-            v.try_reserve_exact(svm::gateway::STORAGE).ok()?;
-            v.resize(svm::gateway::STORAGE, 0u8);
-            Gateway::new(v.leak())
-        }
+    if let Some(mut g) = pooled {
+        g.reset();
+        Some(g)
+    } else {
+        let mut v = alloc::vec::Vec::new();
+        v.try_reserve_exact(svm::gateway::STORAGE).ok()?;
+        v.resize(svm::gateway::STORAGE, 0u8);
+        Gateway::new(v.leak())
     }
 }
 
@@ -308,16 +305,13 @@ extern "C" fn worker_task() -> ! {
     let core = crate::smp::cpu_index();
     loop {
         let job = JOBS[core].lock().take();
-        match job {
-            Some(Job { sh, group }) => {
-                serve(&sh, group, false);
-                // Dropping the Arc is the signal the coordinator waits for.
-                drop(sh);
-            }
-            None => {
-                crate::sched::yield_now();
-                crate::sched::allow_tick();
-            }
+        if let Some(Job { sh, group }) = job {
+            serve(&sh, group, false);
+            // Dropping the Arc is the signal the coordinator waits for.
+            drop(sh);
+        } else {
+            crate::sched::yield_now();
+            crate::sched::allow_tick();
         }
     }
 }
@@ -345,7 +339,7 @@ fn next_runnable(sh: &Shared, group: u32, after: usize) -> Option<usize> {
 }
 
 /// Run the processors in `group` on this core until the machine stops.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 fn serve(sh: &Shared, group: u32, owner: bool) {
     let guest = sh.guest;
     let nrips = sh.nrips;
@@ -1051,27 +1045,21 @@ pub fn run(nrips: bool, vm: &Vm) {
         // The disk's window first, then the NIC's: slot order is device order.
         Guest::AkumaNet => cmdline_with_tsc(&mut cmd, AKUMA_CMDLINE, 0, if disk.is_some() { AKUMA_NET_ARGS } else { NET_ARGS }),
         // `nosmp` only for one processor: with more, the MADT says how many there are.
-        Guest::AkumaSpec => match spec_cmdline(&mut cmd, vm, disk.is_some()) {
-            Some(c) => c,
-            None => {
-                p("[KVM] linux: the spec's command line does not fit\n");
-                return;
-            }
+        Guest::AkumaSpec => if let Some(c) = spec_cmdline(&mut cmd, vm, disk.is_some()) { c } else {
+            p("[KVM] linux: the spec's command line does not fit\n");
+            return;
         },
     };
-    match disk {
-        Some(d) => {
-            p("[KVM] linux: guest disk: ");
-            p(d.what());
-            p(", ");
-            dec(d.sectors() >> 11);
-            p(" MiB\n");
-        }
-        None => {
-            p("[KVM] linux: no guest disk (no second virtio-blk, no ");
-            p(vm.disk_hint());
-            p(")\n");
-        }
+    if let Some(d) = disk {
+        p("[KVM] linux: guest disk: ");
+        p(d.what());
+        p(", ");
+        dec(d.sectors() >> 11);
+        p(" MiB\n");
+    } else {
+        p("[KVM] linux: no guest disk (no second virtio-blk, no ");
+        p(vm.disk_hint());
+        p(")\n");
     }
     if !pvh::write_cmdline(scratch.bytes_mut(), cmdline) || !ram.write(l.cmdline_gpa, scratch.bytes_mut()) {
         p("[KVM] linux: cmdline handoff failed\n");
@@ -1202,8 +1190,8 @@ pub fn run(nrips: bool, vm: &Vm) {
         group_of_core[usize::from(sh.place[i])] |= 1 << i;
     }
     // A core the host did not start at boot (`smp=` cut it off) is started now, for this VM.
-    for core in 0..crate::smp::MAX_CPUS {
-        if group_of_core[core] != 0 && !crate::smp::ensure_started(core) {
+    for (core, &group) in group_of_core.iter().enumerate() {
+        if group != 0 && !crate::smp::ensure_started(core) {
             p("[KVM] linux: could not start core ");
             dec(core as u64);
             p("\n");
@@ -1240,8 +1228,8 @@ pub fn run(nrips: bool, vm: &Vm) {
     // Keep the guest's cores to its own tasks while it runs (never core 0).
     let mut reserve = 0u64;
     if service {
-        for i in 0..n_cpu {
-            reserve |= 1 << sh.place[i];
+        for &core in &sh.place[..n_cpu] {
+            reserve |= 1 << core;
         }
         crate::sched::reserve_cores(reserve | super::super::boot_reserved());
     }
@@ -1254,11 +1242,11 @@ pub fn run(nrips: bool, vm: &Vm) {
     p(" MiB, vcpus=");
     dec(n_cpu as u64);
     p(", cores=");
-    for i in 0..n_cpu {
+    for (i, &core) in sh.place[..n_cpu].iter().enumerate() {
         if i > 0 {
             p(",");
         }
-        dec(u64::from(sh.place[i]));
+        dec(u64::from(core));
     }
     p(")\n");
 
@@ -1270,12 +1258,11 @@ pub fn run(nrips: bool, vm: &Vm) {
     // holds its job; take those back.
     sh.request_stop("run ended", false);
     for core in 0..crate::smp::MAX_CPUS {
-        if group_of_core[core] != 0 && core != owner_core {
-            if let Some(job) = JOBS[core].lock().take() {
+        if group_of_core[core] != 0 && core != owner_core
+            && let Some(job) = JOBS[core].lock().take() {
                 drop(job);
                 workers = workers.saturating_sub(1);
             }
-        }
     }
     let _ = workers;
     let mut waited = 0u32;
@@ -1286,7 +1273,7 @@ pub fn run(nrips: bool, vm: &Vm) {
         akuma_cpu::daif::unmask_irq();
         crate::sched::yield_now();
         waited += 1;
-        if waited % 4000 == 0 {
+        if waited.is_multiple_of(4000) {
             p("[KVM] linux: still waiting for a virtual processor's task\n");
         }
     }
@@ -1311,17 +1298,17 @@ fn report(sh: &Shared, n_cpu: usize) {
     let mut dg = lock_dev(sh);
     let Devices { plat, net, relay, .. } = &mut *dg;
     if n_cpu > 1 {
-        for j in 0..n_cpu {
+        for (j, cpu) in sh.cpu[..n_cpu].iter().enumerate() {
             p("\n[KVM] linux: cpu ");
             dec(j as u64);
-            p(match sh.cpu[j].state() {
+            p(match cpu.state() {
                 CpuState::Parked => " parked",
                 CpuState::Runnable => " runnable",
                 CpuState::Halted => " halted",
                 CpuState::Dead => " halted with interrupts off",
             });
             p(" rip=");
-            hx(sh.cpu[j].rip.load(Ordering::Relaxed), 16);
+            hx(cpu.rip.load(Ordering::Relaxed), 16);
         }
     }
     // Give the host's ports back: a restarted guest binds the same ones.

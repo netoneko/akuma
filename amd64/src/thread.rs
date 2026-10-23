@@ -407,9 +407,8 @@ pub fn bind_clone_child(
     // Find and claim a free row under one guard, so two cores cannot take the same.
     let claimed = {
         let mut table = THREADS.lock();
-        table.iter().position(Option::is_none).map(|slot| {
+        table.iter().position(Option::is_none).inspect(|&slot| {
             table[slot] = Some(Thread { task, proc_slot, clear_child_tid });
-            slot
         })
     };
     let Some(slot) = claimed else {

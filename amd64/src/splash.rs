@@ -157,13 +157,12 @@ pub fn note_byte(b: u8) {
                 frame();
             }
         }
-        0x20..=0x7E => {
-            if l.cur_len < LINE_CAP {
+        0x20..=0x7E
+            if l.cur_len < LINE_CAP => {
                 let i = l.cur_len;
                 l.cur[i] = b;
                 l.cur_len += 1;
             }
-        }
         _ => {}
     }
 }
@@ -289,14 +288,14 @@ pub fn end_for_console() {
             let _ = write!(b, "{}{} +{}", if i == 0 { "" } else { ", " }, name, at - 1);
         }
     }
-    let _ = write!(b, ")\n");
+    let _ = writeln!(b, ")");
     serial::klog_only(b.as_str());
     let mut w = StackWriter::<96>::new();
     let frames = FRAMES.load(Ordering::Relaxed).max(1);
     let per_ms = (tsc_hz() / 1000).max(1);
-    let _ = write!(
+    let _ = writeln!(
         w,
-        "[splash] ended after {} ms: {} frames, draw avg {} us max {} us\n",
+        "[splash] ended after {} ms: {} frames, draw avg {} us max {} us",
         elapsed_ms(),
         frames,
         DRAW_CYCLES.load(Ordering::Relaxed) / frames * 1000 / per_ms,

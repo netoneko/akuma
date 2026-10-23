@@ -1261,8 +1261,7 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
         let args: alloc::vec::Vec<&str> = cmdline
             .split_ascii_whitespace()
             .find_map(|t| t.strip_prefix("initargs="))
-            .map(|v| v.split(',').filter(|s| !s.is_empty()).collect())
-            .unwrap_or_default();
+            .map_or_default(|v| v.split(',').filter(|s| !s.is_empty()).collect());
         // stdout reaches the screen through the mirror, and stdin is the i8042
         // (`kbd`, the firmware's USB emulation) through `console`'s pump, which
         // `run_init` starts. A program that reads fd 0 here gets the keyboard

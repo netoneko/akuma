@@ -94,10 +94,7 @@ fn ecram_override(cmdline: &str) -> Option<u64> {
 /// Scan the DSDT and every SSDT for the `ERAM` region.
 fn find_window(machine: &MachineDescription) -> Option<u64> {
     let rsdp = machine.rsdp.as_ref()?;
-    let mut found = None;
-    if let Some(t) = akuma_ryzen_amd64::acpi::dsdt(&Physmap, rsdp) {
-        found = scan_table(t.addr, t.length);
-    }
+    let mut found = akuma_ryzen_amd64::acpi::dsdt(&Physmap, rsdp).and_then(|t| scan_table(t.addr, t.length));
     if found.is_none() {
         akuma_ryzen_amd64::acpi::for_each_table(&Physmap, rsdp, |t| {
             if found.is_none() && &t.signature == b"SSDT" {

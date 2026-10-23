@@ -521,11 +521,12 @@ impl Station {
             with_status(|s| s.link = Link::Scanning);
         }
         let mut order = [0u8; script::CHAN_COUNT];
-        let mut count = script::scan_order(self.wanted.map_or(0, |w| w.chan), &mut order);
-        if self.peer.is_some() {
+        let count = if self.peer.is_some() {
             order[0] = self.chan;
-            count = 1;
-        }
+            1
+        } else {
+            script::scan_order(self.wanted.map_or(0, |w| w.chan), &mut order)
+        };
         let mut found = [Bss::EMPTY; MAX_BSS];
         let mut n = 0;
         let mut beacons = 0u32;
@@ -564,7 +565,7 @@ impl Station {
                     found[n] = Bss {
                         ssid,
                         bssid: b.bssid,
-                        chan: b.channel.map_or(u16::from(ch), u16::from),
+                        chan: b.channel.map_or_else(|| u16::from(ch), u16::from),
                         signal: 0,
                         security: security_of(&b),
                     };
@@ -1040,7 +1041,7 @@ impl Station {
             self.link_lost();
             return;
         }
-        let heard = (self.stats.rx_data as u32).wrapping_add(self.stats.rx_unparsed as u32).wrapping_add(self.stats.rx_msdus as u32);
+        let heard = self.stats.rx_data.wrapping_add(self.stats.rx_unparsed).wrapping_add(self.stats.rx_msdus);
         if heard != self.heard {
             self.heard = heard;
             self.heard_at = now_us();
@@ -1368,7 +1369,7 @@ fn send_eapol(card: &mut Card, peer: &mut Peer, body: &[u8]) -> Result<(), JoinE
 /// 4 goes this way: an access point that never got the first one has not
 /// installed the pairwise key (it does so on receiving message 4), so a
 /// protected reply is unreadable to it and it gives up with a deauthentication.
-fn send_eapol_clear(card: &mut Card, peer: &mut Peer, body: &[u8]) -> Result<(), JoinError> {
+fn send_eapol_clear(card: &mut Card, peer: &Peer, body: &[u8]) -> Result<(), JoinError> {
     let mut f = [0u8; sta::QOS_HDR_LEN + 8 + eapol::HDR_LEN + eapol::MAX_KEY_DATA];
     let seq = next_seq();
     let len = sta::data_frame(&mut f, &peer.bssid, &MAC, &peer.bssid, 7, seq, None, sta::ETHERTYPE_EAPOL, body)

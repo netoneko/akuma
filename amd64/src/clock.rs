@@ -164,20 +164,19 @@ pub fn seed_from_rtc() {
         return;
     }
     match akuma_cmos_rtc::read(&mut Ports) {
-        Ok(dt) => match akuma_cmos_rtc::unix_seconds(&dt) {
-            Some(secs) => {
+        Ok(dt) => {
+            if let Some(secs) = akuma_cmos_rtc::unix_seconds(&dt) {
                 set_unix_us(secs * 1_000_000);
                 RTC_ONLY.store(true, Ordering::Relaxed);
                 serial::puts("  clock: seeded from the CMOS RTC (");
                 put_date(&dt);
                 serial::puts(" UTC); SNTP will correct it\n");
-            }
-            None => {
+            } else {
                 serial::puts("  clock: CMOS RTC says year ");
                 serial::put_dec(u64::from(dt.year));
                 serial::puts(" — not believed (dead battery?); waiting for SNTP\n");
             }
-        },
+        }
         Err(e) => {
             serial::puts(match e {
                 akuma_cmos_rtc::Error::UpdateNeverEnded => "  clock: CMOS RTC never finished updating; waiting for SNTP\n",

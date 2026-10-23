@@ -2128,7 +2128,7 @@ mod tests {
         page[0x4CB] = 3;
         wr32(&mut page, 0x058, 7);
         wr32(&mut page, 0x090, 1);
-        wr64(&mut page, 0x0B0, 0xABCD_000);
+        wr64(&mut page, 0x0B0, 0x0ABC_D000);
         wr64(&mut page, 0x0C8, 0x5555);
         wr64(&mut page, 0x070, 0x81);
         let vmcb = Vmcb::new(&mut page);
@@ -2137,7 +2137,7 @@ mod tests {
         assert_eq!(vmcb.cpl(), 3);
         assert_eq!(vmcb.asid(), 7);
         assert!(vmcb.np_enable());
-        assert_eq!(vmcb.n_cr3(), 0xABCD_000);
+        assert_eq!(vmcb.n_cr3(), 0x0ABC_D000);
         assert_eq!(vmcb.nrip(), 0x5555);
         assert_eq!(vmcb.exitcode(), 0x81);
         assert_eq!(rd64(vmcb.page(), ctrl::EXITCODE), vmcb.exitcode());
@@ -2357,7 +2357,6 @@ mod tests {
         let mut vmcb = Vmcb::new(&mut page);
         vmcb.set_efer(msr::EFER_SVME | msr::EFER_LME);
         vmcb.set_cr0(cr0::PE | cr0::NE | cr0::PG);
-        drop(vmcb);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::LmePgWithoutPae));
 
         // LME & PG without PE -> LmePgWithoutPe.
@@ -2366,7 +2365,6 @@ mod tests {
         vmcb.set_efer(msr::EFER_SVME | msr::EFER_LME);
         vmcb.set_cr0(cr0::NE | cr0::PG);
         vmcb.set_cr4(cr4::PAE);
-        drop(vmcb);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::LmePgWithoutPe));
 
         // LME & PG & PAE with CS.L and CS.D both set -> LongModeLAndD.
@@ -2382,7 +2380,6 @@ mod tests {
             base: 0,
         };
         vmcb.set_seg(save::CS, bad_cs);
-        drop(vmcb);
         assert_eq!(validate_guest_state(&Vmcb::new(&mut page)), Err(Illicit::LongModeLAndD));
 
         // ASID 0 -> AsidZero.
@@ -2468,7 +2465,7 @@ mod tests {
     fn npt_encodings_are_the_documented_subset() {
         assert_eq!(npt::pointer(0x1234_5000), 0x1234_5000 | 0b111);
         assert_eq!(npt::leaf_2m(0x200_0000), 0x200_0000 | npt::P | npt::RW | npt::US | npt::PS);
-        assert_eq!(npt::leaf_2m(0x200_0000) & npt::PS != 0, true);
+        assert!(npt::leaf_2m(0x200_0000) & npt::PS != 0);
         // The 4-KiB leaf carries no PS: bit 7 belongs to the 2-MiB PDE form.
         assert_eq!(npt::leaf_4k(0x1234_5000), 0x1234_5000 | 0b111);
         assert_eq!(npt::leaf_4k(0x1234_5000) & npt::PS, 0);
@@ -2529,7 +2526,7 @@ mod tests {
             Illicit::VmrunNotIntercepted,
         ];
         for (i, a) in all.iter().enumerate() {
-            assert!(!a.name().is_empty());
+            assert_ne!(a.name(), "");
             for b in &all[i + 1..] {
                 assert_ne!(a.name(), b.name());
             }
@@ -3170,6 +3167,7 @@ mod tests {
     /// firmware tables (`akuma-ryzen-amd64`): RSDP bytes -> XSDT -> FADT -> DSDT,
     /// and the start_info + memory map that announce it.
     #[test]
+    #[allow(clippy::many_single_char_names, reason = "a test wiring a guest, a layout and a table walk: g, l, ...")]
     fn acpi_tables_are_found_by_the_kernels_own_table_walker() {
         use akuma_ryzen_amd64::acpi::{dsdt, find_table, rsdp_from_bytes};
         use akuma_ryzen_amd64::{PhysMem, StartInfo};
@@ -3192,6 +3190,7 @@ mod tests {
         }
         let l = pvh::plan(TOP, 0, TOP - 0x4000);
         let acpi_gpa = TOP - 0x4000;
+        #[allow(clippy::large_stack_arrays, reason = "four guest pages in a test")]
         let mut g = Guest {
             pages: [(l.start_gpa, [0; 4096]), (l.memmap_gpa, [0; 4096]), (l.cmdline_gpa, [0; 4096]), (acpi_gpa, [0; 4096])],
         };

@@ -219,8 +219,8 @@ impl Relay {
                 self.out_teardown(i, gw);
             }
         }
-        for i in 0..DNS_SLOTS {
-            if self.dns_wait[i].take().is_some() {
+        for (i, w) in self.dns_wait.iter_mut().enumerate() {
+            if w.take().is_some() {
                 gw.dns_drop(i);
             }
         }
@@ -554,36 +554,30 @@ impl Relay {
                 }
                 None => continue,
             };
-            let sock = match self.dns_sock {
-                Some(s) => Some(s),
-                None => {
-                    let s = socket::alloc_socket(SOCK_DGRAM);
-                    self.dns_sock = s;
-                    s
-                }
+            let sock = if let Some(s) = self.dns_sock { Some(s) } else {
+                let s = socket::alloc_socket(SOCK_DGRAM);
+                self.dns_sock = s;
+                s
             };
-            let sent = match (sock, akuma_net::dns::upstream()) {
-                (Some(s), Some(up)) => {
-                    let ok = socket::socket_send_udp(s, &q[..n], SocketAddrV4::new(up, 53)).is_ok();
-                    if self.counts.dns_fwd < 3 {
-                        super::p("[KVM] relay: dns query ");
-                        super::dec(n as u64);
-                        super::p(" bytes to ");
-                        super::dec(u64::from(up[0]));
-                        super::p(".");
-                        super::dec(u64::from(up[1]));
-                        super::p(".");
-                        super::dec(u64::from(up[2]));
-                        super::p(".");
-                        super::dec(u64::from(up[3]));
-                        super::p(if ok { " sent\n" } else { " FAILED\n" });
-                    }
-                    ok
+            let sent = if let (Some(s), Some(up)) = (sock, akuma_net::dns::upstream()) {
+                let ok = socket::socket_send_udp(s, &q[..n], SocketAddrV4::new(up, 53)).is_ok();
+                if self.counts.dns_fwd < 3 {
+                    super::p("[KVM] relay: dns query ");
+                    super::dec(n as u64);
+                    super::p(" bytes to ");
+                    super::dec(u64::from(up[0]));
+                    super::p(".");
+                    super::dec(u64::from(up[1]));
+                    super::p(".");
+                    super::dec(u64::from(up[2]));
+                    super::p(".");
+                    super::dec(u64::from(up[3]));
+                    super::p(if ok { " sent\n" } else { " FAILED\n" });
                 }
-                _ => {
-                    super::p("[KVM] relay: dns query dropped: no UDP socket or no resolver\n");
-                    false
-                }
+                ok
+            } else {
+                super::p("[KVM] relay: dns query dropped: no UDP socket or no resolver\n");
+                false
             };
             if sent {
                 self.dns_wait[i] = Some((u16::from_be_bytes([q[0], q[1]]), now_us));

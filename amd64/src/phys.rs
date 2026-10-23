@@ -166,7 +166,7 @@ impl FreshFrame {
     /// # Panics
     /// If `src_pa` is not page-aligned or is outside the physmap.
     pub fn copy_from_frame(&mut self, src_pa: usize) {
-        assert!(src_pa % PAGE_SIZE == 0, "copy_from_frame: unaligned source");
+        assert!(src_pa.is_multiple_of(PAGE_SIZE), "copy_from_frame: unaligned source");
         assert_ne!(src_pa, self.pa, "copy_from_frame: a frame cannot be its own source");
         // SAFETY: `phys_ptr` asserts `src_pa` is inside the physmap; the frame is
         // a whole page of RAM; it is not `self.pa` (checked), so the shared view

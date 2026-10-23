@@ -96,8 +96,8 @@ struct Kbd {
 }
 
 impl Kbd {
-    const fn new() -> Kbd {
-        Kbd { mods: 0, pending: 0, alt_follow: 0, qbuf: [0; Q_CAP], q_head: 0, q_tail: 0 }
+    const fn new() -> Self {
+        Self { mods: 0, pending: 0, alt_follow: 0, qbuf: [0; Q_CAP], q_head: 0, q_tail: 0 }
     }
 
     /// Queue one slice; drops bytes if (impossibly — the longest sequence is

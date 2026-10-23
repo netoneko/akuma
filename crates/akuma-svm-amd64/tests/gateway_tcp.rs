@@ -71,7 +71,7 @@ impl Net {
             a.push(IpCidr::new(IpAddress::v4(GUEST_IP[0], GUEST_IP[1], GUEST_IP[2], GUEST_IP[3]), 24)).unwrap();
         });
         let storage: &'static mut [u8] = Box::leak(vec![0u8; STORAGE].into_boxed_slice());
-        Net { dev, iface, sockets: SocketSet::new(vec![]), gw: Gateway::new(storage).unwrap(), ms: 0 }
+        Self { dev, iface, sockets: SocketSet::new(vec![]), gw: Gateway::new(storage).unwrap(), ms: 0 }
     }
 
     /// A guest whose default route is the gateway, with outbound switched on.
@@ -112,7 +112,7 @@ impl Net {
         self.iface.poll(now, &mut self.dev, &mut self.sockets);
     }
 
-    fn run_until(&mut self, what: &str, mut done: impl FnMut(&mut Net) -> bool) {
+    fn run_until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) {
         for _ in 0..200_000 {
             self.step();
             if done(self) {
@@ -163,7 +163,7 @@ fn smoltcp_client_gets_its_bytes_echoed_back_intact() {
     for _ in 0..50 {
         net.step();
     }
-    assert!(net.gw.fwd(0).state() == State::Closed);
+    assert_eq!(net.gw.fwd(0).state(), State::Closed);
 }
 
 #[test]
@@ -304,7 +304,7 @@ fn a_syn_the_guest_never_saw_is_retried_from_a_new_port_and_the_old_attempt_is_d
     });
 
     // The retry also works with bytes flowing, and an idle slot is not reopened.
-    assert!(net.gw.fwd(0).write(b"hello") == 5);
+    assert_eq!(net.gw.fwd(0).write(b"hello"), 5);
     let mut got = Vec::new();
     net.run_until("bytes arrive", |n| {
         let s = n.sockets.get_mut::<tcp::Socket>(h);
@@ -362,7 +362,7 @@ fn a_reset_gateway_is_a_fresh_one() {
     net.gw.reset();
     assert_eq!(net.gw.stats.frames, 0);
     assert_eq!(net.gw.queued(), 0);
-    assert!(net.gw.fwd(0).state() == State::Closed);
+    assert_eq!(net.gw.fwd(0).state(), State::Closed);
     // The generation starts over, so the first connection of the next guest is the first port again.
     net.step();
     net.sockets.get_mut::<tcp::Socket>(h).listen(22).unwrap();
@@ -458,9 +458,8 @@ fn a_host_that_cannot_connect_resets_the_guest_and_frees_the_slot() {
 #[test]
 fn the_ninth_connection_is_reset_and_a_stray_segment_is_reset() {
     let mut net = Net::outbound();
-    let mut hs = Vec::new();
     for i in 0..OUT_SLOTS as u16 {
-        hs.push(net.connect(WEB, 80, 41_000 + i));
+        net.connect(WEB, 80, 41_000 + i);
     }
     net.run_until("all held", |n| (0..OUT_SLOTS).all(|i| n.gw.out_phase(i) == OutPhase::Asked));
     let extra = net.connect(WEB, 80, 41_100);

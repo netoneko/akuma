@@ -106,7 +106,7 @@ pub static USER_DEMAND_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// and how much of it is waiting for the lock) had no instrument.
 pub static FAULT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-#[inline(always)]
+#[inline]
 fn tsc() -> u64 {
     akuma_cpu::tsc::rdtsc()
 }
@@ -751,7 +751,7 @@ fn describe_page_fault(code: PageFaultCode) {
 /// never has anything to lose. The *real* ledger update happens against the
 /// **owner** process under the hold taken below, which is where a replaced
 /// frame has to be recorded.
-pub(crate) fn faulting_address_space() -> akuma_mmu::UserAddressSpace {
+pub fn faulting_address_space() -> akuma_mmu::UserAddressSpace {
     // `new_shared` cannot fail on this target — it allocates nothing — but it
     // returns `Option` because the shared callers in `akuma-exec` are written
     // against a fallible constructor. An `expect` here would be a panic in the

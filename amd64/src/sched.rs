@@ -2103,12 +2103,9 @@ pub fn prepare_task_slot(slot: usize) -> Option<usize> {
     // stack is for traps taken while this thread is in ring 3; separate from its
     // kernel stack because a preempted thread is suspended on the interrupt
     // frame, and the two must not overlap.
-    let stacks = match m.stacks.get() {
-        Some(stacks) => stacks,
-        None => {
-            m.stacks.set(Stacks::leak_new());
-            m.stacks.get()?
-        }
+    let stacks = if let Some(stacks) = m.stacks.get() { stacks } else {
+        m.stacks.set(Stacks::leak_new());
+        m.stacks.get()?
     };
     let stack_top = stacks.kernel_base() + STACK_SIZE;
     // Repainted on every reuse, not only on first allocation: a recycled slot

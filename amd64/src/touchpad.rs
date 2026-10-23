@@ -176,7 +176,7 @@ fn delay_ms(ms: u64) {
 
 /// Write a command, retrying the first attempt once after the 400 µs
 /// wake-from-sleep gap some panels need.
-fn write_retry(dw: &mut Dw, bytes: &[u8]) -> Result<(), XferError> {
+fn write_retry(dw: &Dw, bytes: &[u8]) -> Result<(), XferError> {
     match dw.xfer(bytes, &mut []) {
         Err(XferError::NoDevice) => {
             spin_us(akuma_i2c_hid::ADDR_RETRY_DELAY_US);
@@ -186,7 +186,7 @@ fn write_retry(dw: &mut Dw, bytes: &[u8]) -> Result<(), XferError> {
     }
 }
 
-fn read_register(dw: &mut Dw, reg: u16, out: &mut [u8]) -> Result<(), XferError> {
+fn read_register(dw: &Dw, reg: u16, out: &mut [u8]) -> Result<(), XferError> {
     let r = reg.to_le_bytes();
     match dw.xfer(&r, out) {
         Err(XferError::NoDevice) => {
@@ -215,7 +215,7 @@ fn put_bits(payload: &mut [u8], pos: u32, size: u32, value: u32) {
 /// `SET_REPORT(feature)` — spec §7.2.3: the 4/5-byte command, the data
 /// register, a length word covering itself, the id and the data, then the
 /// report id and the data.
-fn set_feature(dw: &mut Dw, d: &HidDescriptor, id: u8, data: &[u8]) -> Result<(), XferError> {
+fn set_feature(dw: &Dw, d: &HidDescriptor, id: u8, data: &[u8]) -> Result<(), XferError> {
     let mut b = [0u8; 48];
     let mut n = encode_command(&mut b, d.command_register, opcode::SET_REPORT, ReportType::Feature, id);
     if n + 4 + 1 + data.len() > b.len() {
@@ -238,7 +238,7 @@ fn set_feature(dw: &mut Dw, d: &HidDescriptor, id: u8, data: &[u8]) -> Result<()
 /// mode. Without it a Windows-PTP pad stays on its boot-mouse report. The
 /// usages (Digitizer page): Input Mode `0x52` = 3 (touchpad), Surface Switch
 /// `0x57` = 1, Button Switch `0x58` = 1.
-fn enable_ptp_mode(dw: &mut Dw, d: &HidDescriptor, rdesc: &[u8]) {
+fn enable_ptp_mode(dw: &Dw, d: &HidDescriptor, rdesc: &[u8]) {
     const PAGE: u32 = 0x0D << 16;
     // Several of these fields can share one feature report (Surface Switch
     // and Button Switch do), and `SET_REPORT` replaces the whole report: one
@@ -313,7 +313,7 @@ fn bring_up(mmio: u64, addr: u8) -> Option<Pad> {
     let mut raw = [0u8; HID_DESC_SIZE];
     let mut desc = None;
     for _ in 0..akuma_i2c_hid::BRINGUP_ATTEMPTS {
-        match read_register(&mut dw, HID_DESC_REGISTER, &mut raw) {
+        match read_register(&dw, HID_DESC_REGISTER, &mut raw) {
             Ok(()) => match HidDescriptor::parse(&raw) {
                 Ok(d) => {
                     desc = Some(d);
@@ -347,14 +347,14 @@ fn bring_up(mmio: u64, addr: u8) -> Option<Pad> {
     // Power on, settle, reset, wait for the zero-length acknowledgement.
     let mut cmd = [0u8; 8];
     let n = encode_set_power(&mut cmd, desc.command_register, PowerState::On);
-    if write_retry(&mut dw, &cmd[..n]).is_err() {
+    if write_retry(&dw, &cmd[..n]).is_err() {
         fail("SET_POWER failed");
         return None;
     }
     let quirks = Quirks::for_vid_pid(desc.vendor_id, desc.product_id);
     delay_ms(akuma_i2c_hid::POWER_ON_DELAY_MS + quirks.post_power_delay_ms);
     let n = encode_reset(&mut cmd, desc.command_register);
-    if write_retry(&mut dw, &cmd[..n]).is_err() {
+    if write_retry(&dw, &cmd[..n]).is_err() {
         fail("RESET failed");
         return None;
     }
@@ -375,7 +375,7 @@ fn bring_up(mmio: u64, addr: u8) -> Option<Pad> {
 
     let mut rdesc = [0u8; RDESC_MAX];
     let rlen = usize::from(desc.report_desc_len);
-    if read_register(&mut dw, desc.report_desc_register, &mut rdesc[..rlen]).is_err() {
+    if read_register(&dw, desc.report_desc_register, &mut rdesc[..rlen]).is_err() {
         fail("report descriptor read failed");
         return None;
     }
@@ -392,7 +392,7 @@ fn bring_up(mmio: u64, addr: u8) -> Option<Pad> {
         fail("bad pointer geometry");
         return None;
     };
-    enable_ptp_mode(&mut dw, &desc, rdesc);
+    enable_ptp_mode(&dw, &desc, rdesc);
     serial::puts("  [touchpad] ptp report ");
     serial::put_dec(u64::from(layout.report_id));
     serial::puts(" contacts=");
@@ -500,7 +500,7 @@ impl Pad {
     }
 
     /// A decoded frame, for the first-boot log: raw head, then each contact.
-    fn dump_frame(&mut self, touching: bool) {
+    fn dump_frame(&self, touching: bool) {
         serial::puts("  [touchpad] frame:");
         for b in &self.inbuf[..self.in_len.min(40)] {
             serial::puts(" ");
@@ -523,7 +523,7 @@ impl Pad {
     }
 
     /// One line per 4096 polls (about 65 s idle): the counters.
-    fn summary(&mut self) {
+    fn summary(&self) {
         let total = self.st.polls + self.st.nack;
         if total == 0 || !total.is_multiple_of(4096) {
             return;

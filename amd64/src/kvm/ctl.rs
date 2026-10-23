@@ -192,9 +192,9 @@ fn cores_line() {
     let wall = now.wrapping_sub(CORES_LAST_TSC.swap(now, Ordering::Relaxed));
     let mut l = Line { buf: [0; 192], n: 0 };
     let _ = write!(l, "[kvm] cores: interval_ms={} busy%:", u128::from(wall) * 1000 / u128::from(crate::lapic::tsc_hz().max(1)));
-    for c in 0..crate::smp::online_cpus().min(crate::smp::MAX_CPUS) {
+    for (c, last) in CORES_LAST_HALT.iter().enumerate().take(crate::smp::online_cpus().min(crate::smp::MAX_CPUS)) {
         let h = crate::sched::halted_tsc(c);
-        let halted = h.wrapping_sub(CORES_LAST_HALT[c].swap(h, Ordering::Relaxed)).min(wall);
+        let halted = h.wrapping_sub(last.swap(h, Ordering::Relaxed)).min(wall);
         let tenths = if wall == 0 { 0 } else { u128::from(wall - halted) * 1000 / u128::from(wall) };
         let _ = write!(l, " c{c}={}.{}", tenths / 10, tenths % 10);
     }

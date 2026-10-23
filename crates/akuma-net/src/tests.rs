@@ -155,18 +155,18 @@ mod socket_constants_tests {
     #[test]
     fn ephemeral_port_range_valid() {
         // IANA ephemeral port range
-        assert!(EPHEMERAL_PORT_START >= 49152);
+        const { assert!(EPHEMERAL_PORT_START >= 49152) };
         // EPHEMERAL_PORT_END is u16, so always <= 65535
         assert_eq!(EPHEMERAL_PORT_END, 65535);
-        assert!(EPHEMERAL_PORT_START < EPHEMERAL_PORT_END);
+        const { assert!(EPHEMERAL_PORT_START < EPHEMERAL_PORT_END) };
     }
 
     #[test]
     fn max_sockets_reasonable() {
         // Should support at least a modest number of concurrent connections
-        assert!(MAX_SOCKETS >= 64);
+        const { assert!(MAX_SOCKETS >= 64) };
         // But not be unreasonably large for embedded/kernel use
-        assert!(MAX_SOCKETS <= 1024);
+        const { assert!(MAX_SOCKETS <= 1024) };
     }
 }
 
@@ -579,7 +579,7 @@ mod guarded_handle_tests {
     #[test]
     fn a_live_tcp_handle_reads_through() {
         let (set, h) = tcp_set();
-        assert_eq!(tcp_get(&set, h, |s| s.state()), Some(tcp::State::Closed));
+        assert_eq!(tcp_get(&set, h, smoltcp::socket::tcp::Socket::state), Some(tcp::State::Closed));
     }
 
     /// The wedge itself: the exact sequence a killed process leaves behind —
@@ -591,7 +591,7 @@ mod guarded_handle_tests {
     fn a_removed_tcp_handle_answers_none_not_a_panic() {
         let (mut set, h) = tcp_set();
         set.remove(h);
-        assert_eq!(tcp_get(&set, h, |s| s.state()), None);
+        assert_eq!(tcp_get(&set, h, smoltcp::socket::tcp::Socket::state), None);
         assert_eq!(tcp_get_mut(&mut set, h, |s| s.state()), None);
     }
 
@@ -599,7 +599,7 @@ mod guarded_handle_tests {
     fn a_removed_udp_handle_answers_none_not_a_panic() {
         let (mut set, h) = udp_set();
         set.remove(h);
-        assert_eq!(udp_get(&set, h, |s| s.can_recv()), None);
+        assert_eq!(udp_get(&set, h, smoltcp::socket::udp::Socket::can_recv), None);
         assert_eq!(udp_get_mut(&mut set, h, |s| s.can_send()), None);
     }
 
@@ -608,7 +608,7 @@ mod guarded_handle_tests {
     #[test]
     fn a_live_udp_handle_reads_through() {
         let (set, h) = udp_set();
-        assert_eq!(udp_get(&set, h, |s| s.can_recv()), Some(false));
+        assert_eq!(udp_get(&set, h, smoltcp::socket::udp::Socket::can_recv), Some(false));
     }
 
     /// Removing a *different* handle must not disturb this one: the guard is a
@@ -627,7 +627,7 @@ mod guarded_handle_tests {
             tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
         ));
         set.remove(a);
-        assert_eq!(tcp_get(&set, b, |s| s.state()), Some(tcp::State::Closed));
+        assert_eq!(tcp_get(&set, b, smoltcp::socket::tcp::Socket::state), Some(tcp::State::Closed));
     }
 }
 

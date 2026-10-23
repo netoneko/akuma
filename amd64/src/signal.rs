@@ -732,13 +732,14 @@ pub fn deliver_fault_signal(
             drop(regions);
             let uas = crate::idt::faulting_address_space();
             let pg = a & !0xfff;
-            match (uas.pte_prot(pg), uas.translate(pg)) {
-                (Some((pp, marked)), Some(pa)) => akuma_primitives::tprint!(
+            if let (Some((pp, marked)), Some(pa)) = (uas.pte_prot(pg), uas.translate(pg)) {
+                akuma_primitives::tprint!(
                     160,
                     "[sig!-at] pte write={} exec={} marked={} refs={} pa={:#x}\n",
                     pp.write, pp.exec, marked, akuma_pmm::cow_ref_get(pa & !0xfff), pa & !0xfff,
-                ),
-                _ => akuma_primitives::tprint!(96, "[sig!-at] no PTE for {pg:#x}\n"),
+                );
+            } else {
+                akuma_primitives::tprint!(96, "[sig!-at] no PTE for {pg:#x}\n");
             }
         }
     }

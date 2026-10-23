@@ -6097,7 +6097,7 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
         // rather than `exit-signal TERM`) and to herd, whose `signaled()` never
         // fired. That is what hid the stale `GROUP_EXIT_STATUS` kill
         // (`spawn_process_task`) behind a meaningless-looking exit code.
-        let raw = akuma_syscalls_glue::proc::encode_wait_status(code) as i32;
+        let raw = akuma_syscalls_glue::proc::encode_wait_status(code).cast_signed();
         // A bad `status` pointer loses the status, not the reap: the child is
         // already gone and `wait4` reporting its pid is the useful half.
         let _ = crate::uaccess::write_val::<i32>(status_ptr, raw);

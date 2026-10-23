@@ -200,6 +200,7 @@ pub fn late(cmdline: &str) {
 
 /// What the boot flags ask for: a rehearsal guest that runs once, or a service guest, which is
 /// the same [`Spec`] a `/dev/kvm0` write carries.
+#[allow(clippy::large_enum_variant, reason = "built once at boot and consumed at once; boxing a Spec would put an allocation on that path for nothing")]
 enum Pick {
     Guest(linux::Guest),
     Service(Spec),
@@ -340,16 +341,16 @@ pub fn spawn_service(cmdline: &str) {
 }
 
 /// Has the probe armed the hypervisor (SVM present, a host save area reserved)?
-pub(crate) fn svm_armed() -> bool {
+pub fn svm_armed() -> bool {
     SVM_WANTED.load(Ordering::Acquire)
 }
 
 /// Can the VM task run on core `c`: SVM enabled there (core 0 enables it on its first run).
-pub(crate) fn core_ready(c: usize) -> bool {
+pub fn core_ready(c: usize) -> bool {
     c == 0 || SVM_ENABLED.get(c).is_some_and(|e| e.load(Ordering::Acquire)) || smp::is_deferred(c)
 }
 
-pub(crate) fn nrips() -> bool {
+pub fn nrips() -> bool {
     NRIPS.load(Ordering::Relaxed)
 }
 
@@ -358,11 +359,11 @@ pub(crate) fn nrips() -> bool {
 static VM_CORES: AtomicU64 = AtomicU64::new(1);
 
 /// The cores the host schedules nothing on while no VM runs: `kvmcores=` less core 0, when given.
-pub(crate) fn boot_reserved() -> u64 {
+pub fn boot_reserved() -> u64 {
     if VM_CORES.load(Ordering::Relaxed) == 1 { 0 } else { VM_CORES.load(Ordering::Relaxed) & !1 }
 }
 
-pub(crate) fn vm_cores() -> u64 {
+pub fn vm_cores() -> u64 {
     VM_CORES.load(Ordering::Relaxed)
 }
 

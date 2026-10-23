@@ -1761,7 +1761,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
             st_ino: 19,
             st_mode: 0o020_600,
             st_nlink: 1,
-            st_rdev: (10 << 8) | 242,
+            st_rdev: (10 << 8) | 0xF2,
             st_blksize: 4096,
             ..Default::default()
         };
@@ -1787,7 +1787,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
             st_ino: 22,
             st_mode: 0o020_600,
             st_nlink: 1,
-            st_rdev: (10 << 8) | 244,
+            st_rdev: (10 << 8) | 0xF4,
             st_blksize: 4096,
             ..Default::default()
         };
@@ -1801,7 +1801,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
             st_ino: 20,
             st_mode: 0o020_600,
             st_nlink: 1,
-            st_rdev: (10 << 8) | 243,
+            st_rdev: (10 << 8) | 0xF3,
             st_blksize: 4096,
             ..Default::default()
         };

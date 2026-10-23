@@ -548,7 +548,7 @@ mod tests {
         }
 
         fn established() -> Self {
-            let mut p = Pair { a: conn(), b: conn() };
+            let mut p = Self { a: conn(), b: conn() };
             p.a.connect(1000);
             // The passive side learns of the SYN from the first segment out of `a`.
             let mut buf = [0u8; MSS];

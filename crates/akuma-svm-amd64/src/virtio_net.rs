@@ -616,7 +616,7 @@ mod tests {
         m.put(TXQ[1] + 2, &2u16.to_le_bytes());
         let out = d.process_tx(&m, &mut w, &mut bounce());
         assert_eq!(out.completed, 2);
-        assert!(w.sent.is_empty());
+        assert_eq!(w.sent, [] as [tests::std::vec::Vec<u8>; 0]);
         assert_eq!(used_idx(&m, TXQ), 2);
         assert!(d.driver_ok());
     }
@@ -736,6 +736,7 @@ mod tests {
     /// The two halves together, the way a guest's stack drives them: a DHCP DISCOVER goes
     /// down the transmit queue and the gateway's OFFER comes up the receive queue.
     #[test]
+    #[allow(clippy::many_single_char_names, reason = "a test wiring a memory, a device and a few buffers: m, d, l, ...")]
     fn a_dhcp_discover_through_the_device_is_answered_through_the_device() {
         use crate::gateway::{build_udp, Gateway, GATEWAY_IP, GATEWAY_MAC, GUEST_IP, GUEST_MAC};
         let m = Mem::new(0x10000);
