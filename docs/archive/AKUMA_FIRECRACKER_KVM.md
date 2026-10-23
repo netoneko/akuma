@@ -465,6 +465,60 @@ Firecracker offers more and the guest may mis-negotiate), and run the guest unde
 possible. The TCG run of the same scenario is too slow to iterate; the metal cycle (push, Pop build, `arm.sh 29`) is about two
 minutes.
 
+### The guest wedge under Firecracker + `/dev/net/tun`: material and theories (2026-10-23, parked)
+
+*Parked on purpose:* Firecracker support is shaky, so the KVM dev cycle ([`AKUMA_KVM_DEV_CYCLE.md`](AKUMA_KVM_DEV_CYCLE.md)) uses `/dev/kvm0`
+guests, not Firecracker. Everything needed to resume is here.
+
+**Material.**
+
+* Rig: `scripts/kvm/firecracker_phase0.sh` (`NETDEV=1`, `QSMP=n`, `GUEST_IMG=`), guest image `NET=1 NETPROBE=1 TCPPROBE=1
+  scripts/kvm/akuma_guest_rootfs.sh`; on the ryzen `/root/fc/{fcnet.sh,vm-net.json,net-root.img}`; the metal cycle (push, Pop
+  build into `~/akuma-metal/fc-target`, p3 `.verify`, `arm.sh 29`) is about two minutes, TCG is far too slow (a guest that boots in
+  seconds on metal needs 5+ minutes under TCG).
+* Host side counters (`dmesg`): `[tun] writes= reads= eagain= polls= gw: frames= arp= dhcp=1/1 lost= rx_delivered= ignored=`; first 40
+  guest frames as `[tun] tx len= ethertype= proto= l4=` (DHCP discover/request, ARP, UDP 7 echo, many UDP 53 = DNS, ignored by design);
+  the first 16 ioctls as `[tun] ioctl 0x400454ca / 0x400454d8 / 0x400454d0`.
+* Stuck state (`[kvmapi] irq state`, added for this): `pic=0xffff imr=0xff/0xff lapic=0xffff ppr=0 lvt_timer=0x20 count=0xbef6 extint=0`
+  and `vcpu idle ... due_in_us=none can_wake=no`; earlier snapshots of the same run showed the timer armed (`due_in_us=875..1747`).
+  Last tap traffic: `writes=39 reads=8 eagain=9 polls=23043 arp=5 dhcp=1/1 ignored=31`, then nothing. Exits in the window before the
+  wedge: PIT/serial port exits, LAPIC accesses at `0xfee00380` (timer count), `0xfee00320` (LVT timer), `0xfee000b0` (EOI), `irqfd gsi 6`
+  eleven times.
+* Controls that pass: the same guest with no NIC, `sleep 20` on metal (timers fine); `kvm0` NIC guest (`kvmnet`, the model
+  `virtio_net` device, polled); Firecracker + block device only.
+* The guest runs with the PIC fully masked: it polls its virtio devices and sleeps on LAPIC one-shots, so a missing wakeup shows as
+  "no timer armed", not as an interrupt that never arrived.
+
+**Theories, most likely first** (none confirmed; each has a cheap test).
+
+1. **A guest-side hang in its virtio-net/netpoll path.** The timer fired once and was not re-armed, which means every guest thread
+   including the netpoll daemon (which parks with a deadline) is blocked without a deadline: something waits indefinitely, e.g. on a TX
+   completion, a lock, or an rx buffer. *Test:* guest `strace_err`/dmesg over the serial console right before the wedge; add a guest
+   kernel print in the virtio-net poll path; count used-ring updates Firecracker made vs what the guest consumed.
+2. **Feature mismatch.** Firecracker's virtio-net offers more than the model device the guest driver was written against (the model
+   offers `VIRTIO_F_VERSION_1` and `VIRTIO_NET_F_MAC` only; Firecracker adds `CSUM`, `GUEST_CSUM`, `GUEST_TSO4/6`, `GUEST_UFO`,
+   `HOST_TSO4/6`, `HOST_UFO`, `MRG_RXBUF`, ...). If the guest driver accepts a bit it does not implement (`MRG_RXBUF` changes the header's
+   `num_buffers` and lets one frame span buffers), rx can silently misbehave. *Test:* print the offered/accepted feature words in the guest
+   driver; mask Firecracker's offer (its net config has no knob, so mask in the guest).
+3. **`memfd` double-mapping is not coherent.** Firecracker's rx `IovDeque` maps one memfd twice at adjacent addresses and expects both views
+   to alias the same pages. Our `memfd_create` is an unlinked ext2 file mapped `MAP_SHARED` (the `fpcache-rw` path, "first shared writable
+   file page published" appears in the log). If the two views are separate frames, the iovec ring Firecracker builds is torn: wrong
+   descriptor lengths, a frame written into the wrong buffer, a bogus used length handed to the guest. *Test:* a ten-line static program:
+   `memfd_create`, `ftruncate`, `mmap` twice back to back with `MAP_FIXED`, write through one, read through the other, across the
+   page boundary.
+4. **The 12-byte header on receive.** We hand Firecracker a zeroed header; a real tap fills `num_buffers`. If Firecracker passes our
+   header through to a `MRG_RXBUF` guest as is, `num_buffers == 0` is invalid (must be >= 1). *Test:* set byte 10 of the header to 1 in
+   `tun::read_frame`.
+5. **A lost edge.** Firecracker registers the tap `EPOLLIN` edge-triggered; readiness is a relaxed flag polled by the epoll wait. A frame
+   queued while the guest has no free rx buffer is only read when the guest refills the ring and kicks the queue. *Test:* log rx-queue
+   kicks vs tap reads; make `HAS_FRAME` re-arm an edge on every `receive`.
+6. **Oversize or too-short writes.** `tun::write_frame` drops an oversize frame and returns the full length, `EINVAL`s a runt; a TX
+   descriptor chain longer than `BUF` (1526) would be dropped silently (no jumbo frames offered, so unlikely).
+7. **Interrupt delivery is irrelevant.** The PIC is masked in the stuck state and the guest polls, so irqfd latency cannot explain a
+   permanent stop (it would only slow it down).
+
+*Next experiment when this resumes:* theories 3 and 4 first (cheap, host side), then 2 (guest print), then 1.
+
 *Side finding for the clock/CMOS work:* under Firecracker the guest reads CMOS ports `0x70/0x71` and Firecracker answers
 `IO write @ 0x70 failed: bus_error: MissingAddressRange` (no RTC model); the guest logs `clock: CMOS RTC holds no date; waiting
 for SNTP`. A Firecracker/`kvm0` guest therefore cannot exercise the real CMOS write path; for the checksum investigation the
