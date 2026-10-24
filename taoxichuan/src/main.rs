@@ -46,6 +46,9 @@
 // Stage 1 registers every trap kind it does not specifically expect; until
 // stage 2 gives some of them real jobs, that is the whole surface.
 #![allow(function_casts_as_integer)]
+// Same allow as akuma-boot-amd64: several entry-point docs open with a long
+// paragraph on purpose (the why lives in the first block).
+#![allow(clippy::too_long_first_doc_paragraph)]
 
 extern crate alloc;
 
@@ -378,19 +381,28 @@ fn no_clock() -> u64 {
 
 /// ASCII only, on purpose: the guest console's host-side relay sanitises
 /// non-ASCII bytes to `?`, and the gate's evidence is this log.
+///
+/// The picture: Jingdezhen as the emperor's kilns knew it -- the Chang in
+/// front (junks on the water, kiln-fire glow on the current), hills behind,
+/// and along the bank the egg-shaped hulu kilns with tall chimneys breathing
+/// smoke, a house with upturned eaves, and a pagoda. The crates kernel sits
+/// on the bank in the middle of it, where the wharf shed would be.
 const ART: &str = concat!(
-    "  +------------------------------------------------------+
-",
-    "  |   Taoxichuan  --  tao xi chuan, the kiln-fire market  |
-",
-    "  |   A kernel composed from Akuma's crates, one stage   |
-",
-    "  |   at a time, fired in Akuma's own kiln: booted under |
-",
-    "  |   Akuma's hypervisor, on Akuma's metal.              |
-",
-    "  +------------------------------------------------------+
-",
+    "     ~      _       _                      ~      _         _  ~\n",
+    "    ( )   __/ \\_______/ \\__/ \\            ( )   ___/ \\______/ (_)\n",
+    "      |                    /--\\             |                  |\n",
+    "   .-----.       ,^.      //[]\\\\         .-----.              .--.\n",
+    "  ( |^^| )      /___\\     | [] |        ( |^^| )             ( () )\n",
+    "   '-----'      |___|    /|____|\\        '-----'              '--'\n",
+    "  +------------------------------------------------------+\n",
+    "  |   Taoxichuan  --  tao xi chuan, the kiln-fire market  |\n",
+    "  |   A kernel composed from Akuma's crates, one stage   |\n",
+    "  |   at a time, fired in Akuma's own kiln: booted under |\n",
+    "  |   Akuma's hypervisor, on Akuma's metal.              |\n",
+    "  +------------------------------------------------------+\n",
+    "  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~\n",
+    "        |\\                            |\\\n",
+    "   ~*~\\__|_\\______   ~  ~  ~  ~   ~*~\\__|_\\______   ~  ~  ~  ~  ~\n",
 );
 
 fn banner() {
