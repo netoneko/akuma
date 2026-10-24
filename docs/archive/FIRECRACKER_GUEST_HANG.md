@@ -104,7 +104,7 @@ expected `PASS` on Linux).
 * With both fixes (`f43dee19` as the guest, host `1182a007` unchanged, Firecracker rig `/root/fc/fcnet.sh`, 90 s cap per run):
 * `epollops` on the ryzen's unfixed kernel: `FAIL poll_timeout_clears_revents`, the only failure.
 
-**Result: 42 of 42 clean** (12, then a 30-run soak; each run ≈ 28 s to `AKUMA-GUEST-DONE` with `udp probe: akuma-net-probe` and `tcp echo: akuma-tcp-probe`), no ring dump, no stuck probe. Before: 6 runs on the unfixed kernel gave 1 dump (A) and 5 stuck probes (B); the older guest kernel (`ff4695f`) gave 6 stuck probes, and a 12-run loop with only fix A gave 12 stuck probes (B), which is how B was separated from A.
+**Result: 42 of 42 clean** (12, then a 30-run soak; each run ≈ 28 s to `AKUMA-GUEST-DONE` with `udp probe: akuma-net-probe` and `tcp echo: akuma-tcp-probe`), no ring dump, no stuck probe. Then the final HEAD (`54d18941`, built on the ryzen) as **both** host (clean reboot test: PASS, no exception) and guest: 10 of 10 clean, and `epollops` on that host: 0 FAIL. Before: 6 runs on the unfixed kernel gave 1 dump (A) and 5 stuck probes (B); the older guest kernel (`ff4695f`) gave 6 stuck probes, and a 12-run loop with only fix A gave 12 stuck probes (B), which is how B was separated from A.
 
 ## Open
 
