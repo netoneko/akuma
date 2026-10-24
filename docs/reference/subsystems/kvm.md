@@ -76,6 +76,11 @@ disagree on a key or a limit.
   the periodic tick; `on_tick`'s `restore_periodic` brings the periodic tick back. Never
   `restore_periodic` after an ordinary exit: an exit storm would then postpone the host
   tick (and the hardware watchdog's pet) indefinitely.
+  **The arm functions (`arm_deadline`, `arm_oneshot_in_us`, `arm_idle_shot`) run with interrupts
+  off, whatever the caller's `IF`**: a tick between the count write and the `ONESHOT` store is
+  not restored, and the `sti; hlt` after it sleeps with no timer for good
+  (`archive/FIRECRACKER_GUEST_HANG.md`). The ring dump `[kvmapi] trace:` prints when a guest halts with
+  nothing due and nothing that can wake it.
 - **Legacy interrupts with a local APIC arrive through LINT0 ExtINT** (the virtual wire);
   `Lapic::lint0_extint` says whether the PIC may be consulted.
 - **The APIC page is emulated only while the guest has it enabled**, at the base the

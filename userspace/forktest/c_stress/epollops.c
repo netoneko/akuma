@@ -353,6 +353,35 @@ static void probe_poll_reports_hup_unasked(void) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Probe 7b: a poll(2) that times out must zero `revents`.
+ *
+ * Linux stores `revents` for every entry on every call, so an array reused
+ * across calls never carries the previous answer. busybox `nc -u -w 2` reuses
+ * its array and reads whichever fd shows a `revents` bit: the call that timed
+ * out left the previous call's POLLIN in place, and nc then blocked in a read
+ * on a socket with nothing to say, forever (`docs/archive/FIRECRACKER_GUEST_HANG.md`).
+ * ------------------------------------------------------------------------ */
+static void probe_poll_timeout_clears_revents(void) {
+    const char *n = "poll_timeout_clears_revents";
+    int p[2];
+    char c = 'x';
+    if (pipe(p) < 0) { skip(n, "no pipe"); return; }
+
+    struct pollfd pf = { .fd = p[0], .events = POLLIN, .revents = 0 };
+    if (write(p[1], &c, 1) != 1) { skip(n, "no write"); goto out; }
+    if (poll(&pf, 1, 1000) != 1 || !(pf.revents & POLLIN)) { skip(n, "the first poll did not see the byte"); goto out; }
+    if (read(p[0], &c, 1) != 1) { skip(n, "no read"); goto out; }
+
+    /* Same array, still holding POLLIN from the call above; nothing is readable now. */
+    int r = poll(&pf, 1, 50);
+    if (r != 0) bad(n, "poll() of a drained pipe did not time out");
+    else if (pf.revents != 0) bad(n, "a timed-out poll() left the previous call's revents in the array");
+    else ok(n, "the timed-out poll() wrote revents = 0");
+out:
+    close(p[0]); close(p[1]);
+}
+
+/* ---------------------------------------------------------------------------
  * Probe 8: select(2) must WRITE all three fd sets, exceptfds included.
  *
  * `select` reports by overwriting, so a set the kernel never writes comes back
@@ -616,6 +645,7 @@ int main(void) {
     probe_zero_timeout_is_nonblocking();
     probe_level_triggered_repeats();
     probe_poll_reports_hup_unasked();
+    probe_poll_timeout_clears_revents();
     probe_select_clears_exceptfds();
     probe_select_counts_bits_not_fds();
     probe_listener_is_readable(34561);

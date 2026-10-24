@@ -846,7 +846,7 @@ pub fn arm_deadline() {
     // is then free to land between the count write and the `ONESHOT` store: `on_tick` sees the flag clear, does
     // not restore the periodic tick, and the `sti; hlt` that follows sleeps past a one-shot that has already
     // fired and nothing left to wake it. Under a hypervisor the window is a whole VM exit wide (the host
-    // yields between entries), so a 0.8 ms shot expires inside it (`docs/archive/LAPIC_ONESHOT_LOST_WAKEUP.md`).
+    // yields between entries), so a 0.8 ms shot expires inside it (`docs/archive/FIRECRACKER_GUEST_HANG.md`).
     akuma_primitives::irq::with_irqs_disabled(|| {
         if !TIMER_RUNNING.load(Ordering::Relaxed) || !is_calibrated() {
             return;

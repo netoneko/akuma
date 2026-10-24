@@ -9,8 +9,8 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1468
-- **Docs contributing at least one fix:** 405
+- **Total distinct fixes counted:** 1470
+- **Docs contributing at least one fix:** 406
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
@@ -25,12 +25,12 @@ from several subsystems under one write-up.
 | Toolchain & Self-Hosting | 91 | 6.2% | 13 |
 | SSH | 39 | 2.7% | 18 |
 | VFS & Filesystem | 134 | 9.1% | 40 |
-| Boot & Drivers | 139 | 9.5% | 21 |
+| Boot & Drivers | 141 | 9.6% | 22 |
 | Signals & Exceptions | 40 | 2.7% | 15 |
 | Misc / Cross-cutting | 59 | 4.0% | 19 |
-| Console & Terminal | 58 | 4.0% | 18 |
+| Console & Terminal | 58 | 3.9% | 18 |
 | Containers | 55 | 3.7% | 10 |
-| **Total** | **1468** | **100.0%** | **405** |
+| **Total** | **1470** | **100.0%** | **406** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -1817,7 +1817,7 @@ aren't recorded anywhere else.)
 - Every `stat`/`open`/`exec` path component read the whole directory (`lookup_path` -> `read_inode_data` + `parse_directory`), 238 ms per `stat` in that directory; `Ext2Filesystem::find_in_dir` scans block by block and stops at the match (50 stats: 11.9 s -> 0.58 s)
 - herd's `hda-capture` service (`restart = true`, exits at once) wrote a `dmesg-boot-<ts>.txt` into `/root` every ~3 s, 146,113 files and a 5.5 MiB directory in ten days, which is what turned every lookup into a linear scan; the script writes `/var/log/dmesg/hda-boot-*.txt` pruned to the newest 20 and the service is disabled
 
-## Boot & Drivers (139 fixes, 21 docs)
+## Boot & Drivers (141 fixes, 22 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
@@ -2001,6 +2001,10 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_KVM_DEV_CYCLE.md
 - The firmware on the ryzen rejected its CMOS after every Akuma run because `kvm.rs`'s `crumb()` wrote a step number to CMOS byte `0x7F` around **every `VMRUN` of every guest** (`kvm/linux/machine.rs`), thousands of writes per `kvm0` boot, deterministic and persistent; breadcrumbs now live in a RAM static (`LAST_CRUMB`, shown on the `kvmctl` status line). Found and fixed by goose-glm inside Akuma in one 21-minute session; verified by a clean reboot with a guest still running (`0x7F` untouched, classic checksum OK).
 - The SNTP write-back to the RTC (`clock.rs` `write_rtc_from_sntp`: SET window, hard-coded century `0x32`, status B) was the kernel's only other hand on firmware-owned CMOS and a reset in its window halts the clock with a half-written date; the kernel now makes zero writes to ports `0x70`/`0x71` (`akuma-cmos-rtc::write` stays, host-tested, with no caller), and the rehearsal guests' I/O map also intercepts `0x70`-`0x77`.
+
+### docs/archive/FIRECRACKER_GUEST_HANG.md
+- `lapic::arm_deadline`/`arm_oneshot_in_us`/`arm_idle_shot` wrote the one-shot's count and only then set `ONESHOT`, and `net_blocking_relax` → `allow_tick` called them with `IF` set (the BKL release restores the flags it was taken under): a tick landing between the two (a whole VM exit wide under SVM) found the flag clear, did not restore the periodic tick, and the `sti; hlt` after it slept on a spent one-shot with no timer left — a guest hang that read as a Firecracker/NIC wedge; the three arm functions now run with interrupts off
+- A `poll(2)`/`ppoll(2)` that timed out returned 0 without writing its scan back, so a caller reusing its array (busybox `nc -u -w 2`) kept the previous call's `POLLIN`, read a socket with nothing to say and looped on a 10 s `ETIMEDOUT` forever; the timeout path now stores the zeroed `revents`, pinned by `epollops` `poll_timeout_clears_revents`
 
 ## Signals & Exceptions (40 fixes, 15 docs)
 
@@ -2420,3 +2424,5 @@ Also scanned 2026-10-21 (the `kvm-part-0` branch — the SVM hypervisor phases o
 Also scanned 2026-10-22 (the `kvm-linux-rung` branch — the Linux guest under the SVM hypervisor, phases 5 through 8). Counted above: AKUMA_KVM_LINUX_GUEST, five fixes (the PVH note type and its unpadded walk; the version-0 `hvm_start_info` layout; `kvm::late` before the host tick; FADT `HW_REDUCED_ACPI` deleting the guest's PIC; the missing UART THRE interrupt). The `/proc/<tid>/maps` change (`7fec263c`) is a fix already counted under its own doc. The rung-6 metal dmesg (AMD64_KVMTEST_PHASE6_LINUX_METAL_DMESG) is a boot log, not a fix; the `RDPMC` `#UD` at guest reboot is an open question with a workaround (`nmi_watchdog=0`), not a counted fix. AMD64_KVMTEST_PHASE8_VIRTIO_METAL_DMESG is a boot log, and AMD64_WIFI_JOIN_LATENCY records an open, unexplained delay — neither is a counted fix.
 
 Also scanned 2026-10-23 (the `kvm-part-1` branch — the SVM hypervisor, `kvm0` guests under herd, the `/dev/kvm` node, affinity, `/dev/net/tun`, the goose-glm dev cycle, 114 commits — ahead of merging it to `main`). Counted above: AKUMA_FIRECRACKER_KVM gained eight (the `/dev/kvm` node's handle-table, `EBUSY`, yield and BKL-window bugs, the 5th-run heap corruption, the `sched_setaffinity` stub, the constant `processor` field, the per-iovec `writev` on the tap), AKUMA_KVM_DEV_CYCLE (the CMOS corruption: two writers) is new under Boot & Drivers, AKUMA_KVM_AKUMA_GUEST (four) under Misc / Cross-cutting, and KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE (one) and KVM_CPU_ACCOUNTING (two) under SMP & Locking. Carry no counted fix: AKUMA_IPV6 (a scoping note — a missing feature, not a defect), AKUMA_KVM_NETBSD_GUEST (a capability; its "not obvious" list is traps — one VM at a time, `console=com` required — not defects), KVM_OUTBOUND_NETWORKING (a feature, off by default, with one open item), AMD64_KVM_REBOOT_NOTE_PERMISSION_MAPS and the two `docs/handoff/` files (hand-off notes). KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE's second half, the ~63 MB relay wedge and the relay slot that is never freed after it, is **open and pre-existing**, so adds no bullet; the `/dev/net/tun` guest wedge in AKUMA_FIRECRACKER_KVM is **open** (theories ranked in the doc). Fix-shaped commits with no archive doc to cite, named rather than left silent: `b0c82641` (`akuma-mmu` host build, ranged-walk flag only read on the kernel target — a build break, no runtime defect) and `158ed98d` (a clippy sweep). `AKUMA_FDTABLE_EXTRACTION` and `AKUMA_MMU_SAFE_FACADE` stay behaviour-preserving extractions, `CLONE_AUDIT` an audit with its findings counted elsewhere; the already-listed AKUMA_KVM, AKUMA_KVM_LINUX_GUEST, KVM_RELAY_SYN_STALL and UDP_REPLY_WAIT_TIMER_STORM gained nothing new on this branch since their last update.
+
+Also scanned 2026-10-24 (the Firecracker guest hang on `kvm-part-1`: 5 code commits, 1 archive doc). Counted above: FIRECRACKER_GUEST_HANG, two fixes. It **resolves** the `/dev/net/tun` guest wedge that AKUMA_FIRECRACKER_KVM and the 2026-10-23 paragraph above call open — that wedge was the first of the two counted fixes, not a tap or virtio-net defect, so AKUMA_FIRECRACKER_KVM gains no bullet. UDP_REPLY_WAIT_TIMER_STORM gained a correction (its second `recvfrom` was the second fix) and no bullet. Fix-shaped commits with no archive doc to cite, named rather than left silent: the `num_buffers = 1` in `tun::read_frame` (a correct but unrelated hardening of the receive header, not a counted defect) and the `evring`/`strace_pid` instrumentation (diagnostic aids, no defect).
