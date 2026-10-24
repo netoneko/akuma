@@ -24,8 +24,10 @@ for f in ("sessions.db", "sessions.db-wal", "sessions.db-shm"):
         os.remove(d + "/" + f)  # a stale copy from a previous run would corrupt the read
 c = sqlite3.connect(d + "/sessions.db")
 fmt = "%Y-%m-%d %H:%M:%S"
-q = ("select s.id, s.name, s.created_at, s.updated_at, count(u.session_id), sum(u.input_tokens), sum(u.output_tokens),"
-     " sum(u.cache_read_tokens), max(u.input_tokens) from sessions s join usage_ledger u on u.session_id=s.id"
+# coalesce: a session whose ledger rows carry no token counts (a failed or cancelled call) sums to NULL
+q = ("select s.id, s.name, s.created_at, s.updated_at, count(u.session_id), coalesce(sum(u.input_tokens), 0),"
+     " coalesce(sum(u.output_tokens), 0), coalesce(sum(u.cache_read_tokens), 0), coalesce(max(u.input_tokens), 0)"
+     " from sessions s join usage_ledger u on u.session_id=s.id"
      " where s.created_at>=? group by s.id order by s.created_at")
 tot = [0, 0, 0, 0, 0]
 for sid, name, cr, up, n, i, o, cache, mx in c.execute(q, (since,)):

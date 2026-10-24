@@ -39,6 +39,47 @@ Facts, as found *(Sonnet)*:
   an ACP server on `127.0.0.1:3285`, secured with a key kept in `~/.akuma/goose/acp_secret_key`),
   and Sonnet watches both and takes over if Kimi's quota runs out.
 
+**Owner's note on the banner (2026-10-24, evening).** The owner was not a fan of goose-glm's
+skyline art (`511f4fdb`; the words stay, the owner approved those). They went to other
+models for a redraw and report **deep disappointment with Mistral** and **mild disappointment
+with Gemini**. The new banner was made by Gemini; after many failed attempts to get Gemini
+to adjust it, the owner gave up and adjusted it by hand, and committed the result
+(`419fb968`, "better banner for taoxi kernel"). Recorded as the owner's opinion of those
+models on this art task, outside the two tracks of the experiment; it says nothing about
+either model's coding.
+
+**Oversight change #2 (2026-10-24, 18:20-18:30 IDT): Kimi (goose on the Mac) ran out of quota;
+Sonnet supervises again** *(Sonnet)*. Kimi's two supervisor stints, for the record:
+
+- *Crush, `k3-256k`, ~16:00-16:57:* took 26% of its 5-hour quota in about 23 minutes, hung on empty
+  turns, and spent turns debugging a key that the Sonnet smoke test had swapped (see the tooling note).
+  Closed by the owner.
+- *goose, `k3-256k` low effort, session `20261024_3`, 17:04-~18:25:* **how far it got.** It merged
+  goose-glm's finished stage 1 (`bd59f4aa`), ran the aarch64 check of the merged tree (build 662,792 B,
+  Firecracker boot, zero faults, `--no-disk` control; `9418bdf1`, PASS), wrote and pushed the stage 2 brief
+  (`d59f0df1`), sent it to goose-glm, and committed the tooling edits (`c87730e1`). Model time was about 22
+  minutes: 1.30M accumulated input, 19.8k output tokens (`sessions.db`, Mac goose).
+- **Failure modes.** (1) It ended its turn right after sending stage 2 ("I'll validate when the turn ends"),
+  twice, which stops the loop because nothing re-prompts a turn-based agent; fixed by moving the waiting
+  into `scripts/kvm/goose/supervise-loop.sh`, which prompts it only when goose-glm's driver exits. (2) The
+  owner's instruction to send the next stage to goose-glm *before* validating the last one (so goose is
+  never idle) arrived after stage 2 had already gone out, so it was never exercised. (3) Quota ran out
+  (reported by the owner, ~18:23) before the stage-2 close; our logs show no 429 because Kimi was not
+  prompted again. The loop was stopped so it would not burn a prompt on the error. The owner, annoyed by
+  the run of failures, then **unsubscribed from Kimi**; Kimi does not come back in this experiment, and
+  Sonnet is the supervisor from here (the host track is no longer open-weights from this point, as
+  already noted for the first handover).
+- **The pull side is unreliable, and the owner knows:** Kimi learns what goose did by polling a log file and
+  reading `RESULT.md` over ssh; a machine-readable status per stage, a detached driver launcher and a
+  proper wait/notify channel between the two agents are the fix, to be done later.
+- **State at handover:** stage 1 passes on both tracks. Stage 2 is running on goose-glm (branch
+  `taoxichuan-s2`, `92e9572b` pushed: the `akuma-ring3-amd64` crate; ~480 lines of uncommitted
+  composition in `taoxichuan/src/main.rs` on the box; 11.7M input / 107k output tokens in the first
+  hour on `glm-5.3-flash`, and the owner reads the z.ai quota meter as clearly cheaper than the
+  `glm-5.3` stage-1 run). Sonnet closes stage 2 when the driver exits: read `RESULT.md`, send the stage 3
+  brief first, then the aarch64 check (plus `cargo check -p` of the new crate on the Mac: its
+  `naked_asm!` is not `cfg`-gated for x86_64).
+
 Working rules carried over from the owner's last Crush session (the "wisdom"):
 
 1. Every stage is a **separate goose prompt** (new ACP session); help it when
