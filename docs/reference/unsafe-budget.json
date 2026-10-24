@@ -3,6 +3,7 @@
     "crates/akuma-bkl",
     "crates/akuma-boot",
     "crates/akuma-cmos-rtc",
+    "crates/akuma-comconsole",
     "crates/akuma-config",
     "crates/akuma-cow",
     "crates/akuma-dmesg",
@@ -74,8 +75,9 @@
     "crates/akuma-xhci"
   ],
   "unsafe_sites": {
-    "amd64/src": 89,
+    "amd64/src": 85,
     "crates/akuma-alloc": 24,
+    "crates/akuma-boot-amd64": 4,
     "crates/akuma-cpu": 65,
     "crates/akuma-dma": 17,
     "crates/akuma-el0-entry": 4,
