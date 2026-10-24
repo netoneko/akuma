@@ -688,6 +688,9 @@ pub mod nr {
     pub const READ: u64 = 0;
     /// `write(2)`.
     pub const WRITE: u64 = 1;
+    /// `writev(2)` — musl's stdio flushes through this, even for a single
+    /// buffer (the empty `wbase` head is one zero-length iovec).
+    pub const WRITEV: u64 = 20;
     /// `mmap(2)`.
     pub const MMAP: u64 = 9;
     /// `mprotect(2)`.
@@ -724,6 +727,9 @@ pub mod err {
     pub const EPERM: u64 = 1;
     /// No such file or directory.
     pub const ENOENT: u64 = 2;
+    /// No such device (mmap of something that is not anonymous or a device
+    /// this kernel serves).
+    pub const ENODEV: u64 = 19;
     /// Bad file descriptor.
     pub const EBADF: u64 = 9;
     /// Out of memory.

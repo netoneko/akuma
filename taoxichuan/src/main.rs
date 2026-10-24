@@ -550,6 +550,29 @@ fn copy_from_user(dst: &mut [u8], src_va: u64) -> bool {
     true
 }
 
+/// Copy `len` bytes of task memory at `buf_va` into the console, chunked.
+/// False on a bad pointer (`-EFAULT` at the call site).
+fn emit(buf_va: u64, len: u64) -> bool {
+    let mut chunk = [0u8; 512];
+    let mut done = 0u64;
+    while done < len {
+        let n = (len - done).min(chunk.len() as u64) as usize;
+        if !copy_from_user(&mut chunk[..n], buf_va + done) {
+            return false;
+        }
+        if let Ok(s) = core::str::from_utf8(&chunk[..n]) {
+            console::puts(s);
+        } else {
+            // The relay sanitises non-ASCII anyway; name what would
+            // have been silently mangled.
+            console::puts("  [tty] write: non-utf8 bytes elided\n");
+            break;
+        }
+        done += n as u64;
+    }
+    true
+}
+
 /// The syscall table, minimal on purpose: what static musl's startup and a
 /// `printf`-and-exit `main` issue, and nothing else. Unknown numbers answer
 /// `-ENOSYS` — the honest answer, and the one musl's `printf` path survives
@@ -561,27 +584,36 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             if fd != 1 && fd != 2 {
                 return e(ring3::err::EBADF);
             }
-            if len > WRITE_LIMIT || !user_ok(buf, len) {
+            if len > WRITE_LIMIT || !user_ok(buf, len) || !emit(buf, len) {
                 return e(ring3::err::EFAULT);
             }
-            let mut chunk = [0u8; 512];
-            let mut done = 0u64;
-            while done < len {
-                let n = (len - done).min(chunk.len() as u64) as usize;
-                if !copy_from_user(&mut chunk[..n], buf + done) {
+            len
+        }
+        ring3::nr::WRITEV => {
+            // musl's stdio flush: `writev(fd, iov, iovcnt)`, 16-byte iovecs.
+            let (fd, iov_va, iovcnt) = (fr.arg1(), fr.arg2(), fr.arg3());
+            if fd != 1 && fd != 2 {
+                return e(ring3::err::EBADF);
+            }
+            if iovcnt == 0 || iovcnt > 1024 || !user_ok(iov_va, iovcnt * 16) {
+                return e(ring3::err::EFAULT);
+            }
+            let mut total = 0u64;
+            for i in 0..iovcnt {
+                let mut iv = [0u8; 16];
+                if !copy_from_user(&mut iv, iov_va + i * 16) {
                     return e(ring3::err::EFAULT);
                 }
-                if let Ok(s) = core::str::from_utf8(&chunk[..n]) {
-                    console::puts(s);
-                } else {
-                    // The relay sanitises non-ASCII anyway; name what would
-                    // have been silently mangled.
-                    console::puts("  [tty] write: non-utf8 bytes elided\n");
-                    break;
+                let (base, len) = (
+                    u64::from_le_bytes(iv[0..8].try_into().unwrap()),
+                    u64::from_le_bytes(iv[8..16].try_into().unwrap()),
+                );
+                if len > WRITE_LIMIT || !user_ok(base, len) || !emit(base, len) {
+                    return e(ring3::err::EFAULT);
                 }
-                done += n as u64;
+                total += len;
             }
-            len
+            total
         }
         ring3::nr::EXIT | ring3::nr::EXIT_GROUP => {
             let code = fr.arg1() & 0xFF; // what wait(2) would see
@@ -647,7 +679,12 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                     0
                 }
-                _ => e(ring3::err::ENOSYS),
+                other => {
+            // Name the gap: a stage-3 task (busybox) will hit numbers this
+            // table does not serve, and the console should say which.
+            akuma_primitives::safe_print!(160, "  [sc] unhandled nr {}\n", other);
+            e(ring3::err::ENOSYS)
+        }
             }
         }
         ring3::nr::SET_TID_ADDRESS => 1, // one task: the tid, and nothing to clear
@@ -707,7 +744,12 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 0
             }
         }
-        _ => e(ring3::err::ENOSYS),
+        other => {
+            // Name the gap: a stage-3 task (busybox) will hit numbers this
+            // table does not serve, and the console should say which.
+            akuma_primitives::safe_print!(160, "  [sc] unhandled nr {}\n", other);
+            e(ring3::err::ENOSYS)
+        }
     }
 }
 
