@@ -447,9 +447,20 @@ static SYSCALL_STACK_TOP: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 /// Where the stub parked the interrupted user `RSP` before switching away.
 /// `syscall` does not hand over a stack pointer in a register, and the user
 /// stack must not be touched before the kernel chooses to, so the stash is
-/// kernel memory. Single core, `IF` off: no other writer exists.
+/// kernel memory. Single core, `IF` off: no other writer exists. An
+/// `UnsafeCell` behind a manual `Sync` because two writers exist on stage 4:
+/// the stub's asm, and the nested-task handoff (`user_rsp_stash`/
+/// `set_user_rsp_stash` below) — the cell changes nothing for the asm, which
+/// takes the address.
 #[cfg(target_arch = "x86_64")]
-static USER_RSP_STASH: u64 = 0;
+struct StashCell(core::cell::UnsafeCell<u64>);
+// SAFETY: the stash is syscall-path memory — one core, `IF` clear while it
+// is written (the stub, or the nested-task handoff). No cross-thread access
+// exists in a kernel with one core and no scheduler.
+#[cfg(target_arch = "x86_64")]
+unsafe impl Sync for StashCell {}
+#[cfg(target_arch = "x86_64")]
+static USER_RSP_STASH: StashCell = StashCell(core::cell::UnsafeCell::new(0));
 
 /// The kernel's dispatcher, stored as an address so the naked stub can `call`
 /// it through memory (a naked function has no Rust-level names to reach).
@@ -525,6 +536,48 @@ pub struct EntryFrame {
 
 /// The dispatcher's type: inspect the frame, return the `RAX` value.
 pub type Dispatcher = fn(&mut SyscallFrame) -> u64;
+
+// -- Nested-task knobs (taoxichuan stage 4) --------------------------------
+//
+// The minimal kernel's stage-4 SPAWN runs a child to completion *inside* the
+// parent's syscall. During that nested run the child's own `syscall`
+// crossings use the same two statics the stub uses — the parked user `RSP`
+// and the kernel stack top — and both must be redirected for the child and
+// restored for the parent. The statics stay private; these accessors are the
+// whole of the new surface, and they are plain loads/stores on memory the
+// stub itself treats as single-core, `IF`-off scratch.
+
+/// The user `RSP` the stub stashed for the task currently in the kernel.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn user_rsp_stash() -> u64 {
+    // SAFETY: single core, `IF` clear inside the syscall path — the same
+    // discipline that owns every write to this static (the stub's own asm
+    // included).
+    unsafe { core::ptr::read_volatile(USER_RSP_STASH.0.get()) }
+}
+
+/// Redirect the stub's user-`RSP` stash (see [`user_rsp_stash`]).
+#[cfg(target_arch = "x86_64")]
+pub fn set_user_rsp_stash(v: u64) {
+    // SAFETY: as `user_rsp_stash`.
+    unsafe { core::ptr::write_volatile(USER_RSP_STASH.0.get(), v) }
+}
+
+/// The stack top the stub switches to on the next `syscall`.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn syscall_stack_top() -> u64 {
+    SYSCALL_STACK_TOP.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Point the stub's kernel stack at a lower region for a nested run. The
+/// caller owns the arithmetic: the value must leave the region between the
+/// stack's base and the current top untouched (the live dispatch frames).
+#[cfg(target_arch = "x86_64")]
+pub fn set_syscall_stack_top(v: u64) {
+    SYSCALL_STACK_TOP.store(v, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// Install `dispatcher` and point `EFER.SCE`/`STAR`/`LSTAR`/`SFMASK` at the
 /// stub. Call once, before the first ring-3 entry.
@@ -768,6 +821,48 @@ pub mod nr {
     pub const FCNTL: u64 = 72;
     /// `exit_group(2)` — musl's `exit(3)` calls this.
     pub const EXIT_GROUP: u64 = 231;
+
+    // -- Stage 4: the socket family, the clock arms sshd's loop sleeps in,
+    // -- and Akuma's private syscalls (0x1000 base on x86_64 — 300 is
+    // -- `getcpu` here, so the AArch64 offsets cannot be reused; see
+    // -- `libakuma`'s numbering note).
+
+    /// `nanosleep(2)`.
+    pub const NANOSLEEP: u64 = 35;
+    /// `clock_nanosleep(2)`.
+    pub const CLOCK_NANOSLEEP: u64 = 230;
+    /// `socket(2)`.
+    pub const SOCKET: u64 = 41;
+    /// `connect(2)`.
+    pub const CONNECT: u64 = 42;
+    /// `accept(2)`.
+    pub const ACCEPT: u64 = 43;
+    /// `sendto(2)`.
+    pub const SENDTO: u64 = 44;
+    /// `recvfrom(2)`.
+    pub const RECVFROM: u64 = 45;
+    /// `shutdown(2)`.
+    pub const SHUTDOWN: u64 = 48;
+    /// `bind(2)`.
+    pub const BIND: u64 = 49;
+    /// `listen(2)`.
+    pub const LISTEN: u64 = 50;
+    /// `getppid(2)`.
+    pub const GETPPID: u64 = 110;
+    /// `gettid(2)`.
+    pub const GETTID: u64 = 186;
+    /// `getrandom(2)`.
+    pub const GETRANDOM: u64 = 318;
+    /// Akuma's private syscall base on x86_64.
+    pub const AKUMA_PRIVATE_BASE: u64 = 0x1000;
+    /// Akuma SPAWN: `spawn(path, argv, envp, stdin, stdin_len, flags)` —
+    /// returns the packed `pid | stdout_fd << 32` word.
+    pub const SPAWN: u64 = AKUMA_PRIVATE_BASE + 301;
+    /// Akuma WAITPID: `waitpid(pid, &status)` — pid when reaped, 0 while
+    /// running.
+    pub const WAITPID: u64 = AKUMA_PRIVATE_BASE + 303;
+    /// Akuma CLOSE_CHILD_STDIN: deliver EOF to a spawned child's stdin.
+    pub const CLOSE_CHILD_STDIN: u64 = AKUMA_PRIVATE_BASE + 326;
 }
 
 /// `openat(2)` flag bits (x86_64) and `dirfd` special values.
@@ -822,6 +917,17 @@ pub mod err {
     pub const ENOSYS: u64 = 38;
     /// Address out of range (canonical forms): returned for a bad `arch_prctl`.
     pub const ERANGE: u64 = 34;
+    /// Resource temporarily unavailable / operation would block (`O_NONBLOCK`
+    /// on a socket with nothing to read or write; `try_accept` with an empty
+    /// backlog).
+    pub const EAGAIN: u64 = 11;
+    /// No child processes (`waitpid` for a pid that is nobody's child).
+    pub const ECHILD: u64 = 10;
+    /// Address family not supported by the protocol (`socket(2)` for a
+    /// family this stack does not serve — every family but `AF_INET`).
+    pub const EAFNOSUPPORT: u64 = 47;
+    /// Socket operation on a non-socket (an fd that is not a socket fd).
+    pub const ENOTSOCK: u64 = 88;
 }
 
 /// `arch_prctl(2)` requests, x86_64.

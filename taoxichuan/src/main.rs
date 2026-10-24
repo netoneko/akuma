@@ -87,9 +87,14 @@
 
 extern crate alloc;
 
+mod child;
+mod net;
+mod sock;
+
 use akuma_boot_amd64::{mem, paging, phys};
 use akuma_comconsole as console;
 use akuma_idt_amd64 as idt_lib;
+use akuma_ring3_amd64::err;
 use akuma_trap_amd64 as trap;
 use akuma_trap_amd64::{InterruptStackFrame, Kind, Trap};
 use akuma_vfs::Filesystem;
@@ -511,6 +516,9 @@ const SLOT_CEILING: u32 = 16;
 /// stale behind the task's back), with the cursor the next `getdents64`
 /// resumes from. A regular file carries the inode number and its own cursor.
 /// Paths are not kept: nothing at this stage resolves through an fd.
+/// Stage 4 adds the two non-file kinds the sshd stage needs: a socket (the
+/// index into `akuma-net`'s socket table) and a spawned child's stdout (the
+/// index into `child.rs`'s spawn slots — the "pipe" of the child model).
 enum OpenFile {
     Dir {
         entries: Vec<akuma_vfs::DirEntry>,
@@ -521,6 +529,12 @@ enum OpenFile {
         offset: u64,
         size: u64,
     },
+    /// A TCP/UDP socket: `akuma_net`'s socket-table index. `sock.rs` serves
+    /// every access through it.
+    Socket(usize),
+    /// A spawned child's stdout buffer: `child.rs`'s spawn-slot index.
+    /// Drained by `read`, then EOF — a pipe that is just a buffer.
+    ChildOut(usize),
 }
 
 /// The one task: its root page table, the user ranges a pointer may name, the
@@ -540,19 +554,43 @@ struct Task {
     fd_nonblock: fdtable::FlagSet,
 }
 
-static mut TASK: Task = Task {
-    root_pa: 0,
-    regions: [(0, 0); 16],
-    n_regions: 0,
-    brk_base: 0,
-    brk_cur: 0,
-    brk_end: 0,
-    mmap_cur: MMAP_BASE,
-    exit: None,
-    fd_names: fdtable::Names::new(),
-    fd_cloexec: fdtable::FlagSet::new(),
-    fd_nonblock: fdtable::FlagSet::new(),
-};
+static mut TASKS: [Task; 2] = [Task::new(), Task::new()];
+/// Which slot `task()` hands out: 0 is the boot's init task (sshd for this
+/// stage's gate), 1 is the child running inside a SPAWN (`child.rs`).
+static mut TASK_SLOT: usize = 0;
+
+impl Task {
+    const fn new() -> Self {
+        Self {
+            root_pa: 0,
+            regions: [(0, 0); 16],
+            n_regions: 0,
+            brk_base: 0,
+            brk_cur: 0,
+            brk_end: 0,
+            mmap_cur: MMAP_BASE,
+            exit: None,
+            fd_names: fdtable::Names::new(),
+            fd_cloexec: fdtable::FlagSet::new(),
+            fd_nonblock: fdtable::FlagSet::new(),
+        }
+    }
+}
+
+/// Switch which task slot the syscall path acts on (the SPAWN arm and the
+/// child exit, both in `child.rs`).
+fn set_task_slot(i: usize) {
+    // SAFETY: single core, `IF` clear — the same discipline as `task()`.
+    unsafe {
+        *core::ptr::addr_of_mut!(TASK_SLOT) = i;
+    }
+}
+
+/// Both slots, for the spawn path (it snapshots the parent's `root_pa`).
+fn task_slots() -> &'static mut [Task; 2] {
+    // SAFETY: as `task`.
+    unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
+}
 
 /// The task, for the spawn path and the dispatcher.
 ///
@@ -563,7 +601,10 @@ fn task() -> &'static mut Task {
     // SAFETY: see above — the aliasing conditions are the single-core,
     // interrupts-off discipline of this kernel, and the pointer is never
     // published anywhere else.
-    unsafe { &mut *core::ptr::addr_of_mut!(TASK) }
+    unsafe {
+        let slot = core::ptr::read_volatile(&raw const TASK_SLOT);
+        &mut (*core::ptr::addr_of_mut!(TASKS))[slot]
+    }
 }
 
 fn add_region(start: u64, end: u64) {
@@ -776,13 +817,33 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     match fr.rax {
         ring3::nr::WRITE => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
-            if fd != 1 && fd != 2 {
-                return e(ring3::err::EBADF);
-            }
-            if len > WRITE_LIMIT || !user_ok(buf, len) || !emit(buf, len) {
+            if len > WRITE_LIMIT || !user_ok(buf, len) {
                 return e(ring3::err::EFAULT);
             }
-            len
+            // Stage 4: a nested child's fd 1 is the pipe (the buffer its
+            // parent drains through the ChildOut fd); everything else —
+            // sshd's own stdout/stderr included — is the console, as before.
+            if child::nested_active() && fd == 1 {
+                if !child::child_write(buf, len) {
+                    return e(ring3::err::EFAULT);
+                }
+                return len;
+            }
+            if fd == 1 || fd == 2 {
+                if !emit(buf, len) {
+                    return e(ring3::err::EFAULT);
+                }
+                return len;
+            }
+            // The only other writable kind is a socket fd (sock.rs answers
+            // ENOTSOCK for anything else that is open, EBADF comes from the
+            // get below).
+            let is_sock =
+                fd_table().with(fd as u32, |d| matches!(d, OpenFile::Socket(_))).unwrap_or(false);
+            if is_sock {
+                return sock::write_arm(fd, buf, len);
+            }
+            e(ring3::err::EBADF)
         }
         ring3::nr::WRITEV => {
             // musl's stdio flush: `writev(fd, iov, iovcnt)`, 16-byte iovecs.
@@ -814,6 +875,14 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let code = fr.arg1() & 0xFF; // what wait(2) would see
             let t = task();
             t.exit = Some(code);
+            // Stage 4: a nested child's exit does NOT reach the reaper — it
+            // hands the machine back to the parent (`child.rs`'s model:
+            // run-to-completion inside the SPAWN syscall, coroutine-style
+            // return). The boot's own sequential tasks still chain through
+            // `task_done` exactly as stage 3 left them.
+            if child::nested_active() {
+                child::child_exit(code)
+            }
             // Stage 3: not a halt — the report and the next spawn (or the
             // final gate line) live in `task_done`. This arm never returns to
             // the stub: the task is gone, and its parked `syscall` frame on
@@ -882,7 +951,8 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::SET_TID_ADDRESS => 1, // one task: the tid, and nothing to clear
-        ring3::nr::GETPID => 1,
+        ring3::nr::GETPID | ring3::nr::GETTID => u64::from(child::current_pid()),
+        ring3::nr::GETPPID => 1, // everything here is the init task's child
         ring3::nr::GETUID | ring3::nr::GETEUID => 0,
         ring3::nr::GETGID | ring3::nr::GETEGID => 0,
         ring3::nr::IOCTL => e(ring3::err::ENOTTY), // the console is a serial line, not a tty
@@ -950,6 +1020,24 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             if fd == 0 {
                 return 0;
             }
+            // Stage 4: socket fds read through sock.rs; a spawned child's
+            // stdout fd drains its pipe (then EOF).
+            if (fd as u32) < SLOT_CEILING {
+                let mut slot_idx: usize = usize::MAX;
+                let kind = fd_table().with(fd as u32, |d| match d {
+                    OpenFile::Socket(_) => 1,
+                    OpenFile::ChildOut(slot) => {
+                        slot_idx = *slot;
+                        2
+                    }
+                    _ => 0,
+                });
+                match kind {
+                    Some(1) => return sock::read_arm(fd, buf, len),
+                    Some(2) => return child::read_child_out(slot_idx, buf, len),
+                    _ => {}
+                }
+            }
             if fd == 1 || fd == 2 || fd as u32 >= SLOT_CEILING {
                 return e(ring3::err::EBADF);
             }
@@ -987,6 +1075,10 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                     res = Ok(total);
                 }
+                // Socket and ChildOut fds were served above; the closure's
+                // match stays exhaustive so a new kind cannot silently fall
+                // through to the file path.
+                OpenFile::Socket(_) | OpenFile::ChildOut(_) => {}
             });
             match (found, res) {
                 (false, _) => e(ring3::err::EBADF),
@@ -1090,7 +1182,19 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     0
                 }
                 3 => 0, // F_GETFL: O_RDONLY, the only access mode served
-                4 => 0, // F_SETFL: accepted; no async/nonblock behavior exists
+                4 => {
+                    // F_SETFL: the one flag with a behaviour behind it is
+                    // O_NONBLOCK — recorded in the fd table, read by the
+                    // socket arms (and accepted silently on a child's
+                    // stdout fd, where nonblock is the only mode there is).
+                    const O_NONBLOCK: u64 = 0x800;
+                    if arg & O_NONBLOCK != 0 {
+                        fd_table().set_nonblock(fd as u32);
+                    } else {
+                        fd_table().clear_nonblock(fd as u32);
+                    }
+                    0
+                }
                 _ => e(ring3::err::EINVAL),
             }
         }
@@ -1103,6 +1207,13 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             if fd as u32 >= SLOT_CEILING {
                 return e(ring3::err::EBADF);
+            }
+            // A socket fd releases its kernel side (the smoltcp handle)
+            // before the slot itself goes.
+            let is_sock =
+                fd_table().with(fd as u32, |d| matches!(d, OpenFile::Socket(_))).unwrap_or(false);
+            if is_sock {
+                sock::close_arm(fd);
             }
             match fd_table().close(fd as u32) {
                 Some(_) => 0,
@@ -1175,7 +1286,9 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                         used += reclen;
                     }
                 }
-                OpenFile::File { .. } => res = Err(ring3::err::ENOTDIR),
+                OpenFile::File { .. } | OpenFile::Socket(_) | OpenFile::ChildOut(_) => {
+                    res = Err(ring3::err::ENOTDIR);
+                }
             });
             if !found {
                 return e(ring3::err::EBADF);
@@ -1199,19 +1312,86 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             0
         }
         ring3::nr::CLOCK_GETTIME => {
-            // No clock exists behind this kernel (the CMOS holds no date and
-            // nothing syncs); zeroed is the honest answer, and musl's struct
-            // timespec is two u64s. `clk_id` is accepted: no clock can be
-            // the wrong one when there is no clock.
-            let tp = fr.arg2();
+            // Stage 4: the calibrated TSC gives both clocks real elapsed
+            // time (net.rs). CLOCK_REALTIME reports boot-relative seconds —
+            // there is still no wall clock behind this kernel, and nothing
+            // on this stage's path reads the absolute value (sshd's timers
+            // are all deltas); musl's `struct timespec` is two u64s.
+            let (clk, tp) = (fr.arg1(), fr.arg2());
+            let _ = clk;
             if !user_ok(tp, 16) {
                 return e(ring3::err::EFAULT);
             }
-            if !copy_to_user(tp, &[0u8; 16]) {
+            let us = net::uptime_us();
+            let mut ts = [0u8; 16];
+            ts[0..8].copy_from_slice(&(us / 1_000_000).to_le_bytes());
+            ts[8..16].copy_from_slice(&((us % 1_000_000) * 1_000).to_le_bytes());
+            if !copy_to_user(tp, &ts) {
                 return e(ring3::err::EFAULT);
             }
             0
         }
+        ring3::nr::NANOSLEEP | ring3::nr::CLOCK_NANOSLEEP => {
+            // The serve loop's tick: `sleep_ms(1)` lands here, and every lap
+            // pumps the NIC (net.rs) — this arm is what keeps TCP alive
+            // while sshd idles. Both spellings accepted, the same sniff the
+            // full kernel makes: `a0` below one page is the raw
+            // (seconds, nanos) register pair libakuma's non-linux-abi path
+            // sends; anything above is a `*const timespec`.
+            let (a0, a1, a2, a3) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
+            let (sec, nanos) = if a0 < 4096 {
+                (a0, a1)
+            } else {
+                let mut ts = [0u8; 16];
+                if !user_ok(a0, 16) || !copy_from_user(&mut ts, a0) {
+                    return e(ring3::err::EFAULT);
+                }
+                (
+                    u64::from_le_bytes(ts[0..8].try_into().unwrap()),
+                    u64::from_le_bytes(ts[8..16].try_into().unwrap()),
+                )
+            };
+            let _ = (a2, a3);
+            // Cap: a task may sleep at most 60 s per call. Nothing on this
+            // kernel can signal a sleeper awake, so an unbounded request
+            // would be an unbounded stall of the whole machine.
+            let total_us = sec
+                .saturating_mul(1_000_000)
+                .saturating_add(nanos / 1_000)
+                .min(60_000_000);
+            child::sleep_us(total_us);
+            0
+        }
+        ring3::nr::GETRANDOM => {
+            // `getrandom(buf, len, flags)` — sshd's key exchange reads this.
+            // net.rs's RDRAND-backed fill; a CPU without the instruction
+            // gets the stated-weak source and the boot console says so.
+            let (buf, len) = (fr.arg1(), fr.arg2());
+            if len > WRITE_LIMIT || !user_ok(buf, len) {
+                return e(ring3::err::EFAULT);
+            }
+            let mut tmp = alloc::vec![0u8; len as usize];
+            net::rng_fill(&mut tmp);
+            if !copy_to_user(buf, &tmp) {
+                return e(ring3::err::EFAULT);
+            }
+            len
+        }
+        ring3::nr::SOCKET => sock::socket_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        ring3::nr::BIND => sock::bind_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        ring3::nr::LISTEN => sock::listen_arm(fr.arg1(), fr.arg2()),
+        ring3::nr::ACCEPT => sock::accept_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        ring3::nr::CONNECT => sock::connect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        ring3::nr::SENDTO => {
+            sock::sendto_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), 16)
+        }
+        ring3::nr::RECVFROM => {
+            sock::recvfrom_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6())
+        }
+        ring3::nr::SHUTDOWN => sock::shutdown_arm(fr.arg1(), fr.arg2()),
+        ring3::nr::SPAWN => child::spawn_arm(fr),
+        ring3::nr::WAITPID => child::waitpid_arm(fr.arg1(), fr.arg2()),
+        ring3::nr::CLOSE_CHILD_STDIN => child::close_stdin_arm(fr.arg1()),
         ring3::nr::GETTIMEOFDAY => {
             // Same no-clock contract; struct timeval is two u64s, `tz` is
             // optional and never filled.
@@ -1434,30 +1614,30 @@ fn task_done(code: u64) -> ! {
     console::puts("Taoxichuan: all programs done\n");
     halt();
 }
-/// Load the image, build the task's address space, and cross. Never returns:
-/// the task ends in the dispatcher's `exit` or the trap handler's `[Fault]`.
-fn spawn(path: &str, image: &[u8]) -> ! {    let img = match ring3::Image::parse(image) {
-        Ok(img) => img,
-        Err(err) => {
-            akuma_primitives::safe_print!(160, "  init: ELF refused: {:?}\n", err);
-            halt();
-        }
-    };
-    akuma_primitives::safe_print!(
-        160,
-        "  init: {} PT_LOAD segment(s), entry 0x{:016x}\n",
-        img.segments().len(),
-        img.entry()
-    );
+/// Load an ELF image into the CURRENT task slot: fresh page root (the
+/// kernel's upper half shared by PML4 copy), every `PT_LOAD` placed eagerly
+/// at its link address, a Linux initial stack with argc/argv/envp/auxv on
+/// it, heap slabs registered, the fd table reset. Returns where to cross:
+/// the root to load into CR3, the entry, the initial `rsp`.
+///
+/// Shared by the boot spawn (`spawn`) and the SPAWN syscall's child
+/// (`child.rs`) — one loader, one placement story. Runs with the kernel
+/// half live (the physmap does all the copying); the caller chooses the
+/// CR3 moment.
+fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
+    let img = ring3::Image::parse(image).ok()?;
+    let t = task();
+    t.fd_names = fdtable::Names::new();
+    t.fd_cloexec = fdtable::FlagSet::new();
+    t.fd_nonblock = fdtable::FlagSet::new();
+    t.exit = None;
+    t.mmap_cur = MMAP_BASE;
 
     // The task's root: a fresh page table whose upper half is the kernel's
     // (one PML4 copy shares every kernel subtree — physmap, device window,
     // kernel image), whose lower half holds only the task. The kernel's own
     // root keeps its identity map; the task's root simply has none.
-    let Some(root_page) = akuma_pmm::alloc_page_zeroed() else {
-        console::puts("  init: no free frame for the task's page root\n");
-        halt();
-    };
+    let root_page = akuma_pmm::alloc_page_zeroed()?;
     let root = root_page as u64;
     let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
     // SAFETY: both frames are PMM/established pages inside the physmap; the
@@ -1470,13 +1650,7 @@ fn spawn(path: &str, image: &[u8]) -> ! {    let img = match ring3::Image::parse
             (*utbl)[i] = (*ktbl)[i];
         }
     }
-    let t = task();
     t.root_pa = root;
-    // A fresh task owns a fresh fd table: stage 3's sequential tasks do not
-    // inherit anything (no fork exists to inherit through).
-    t.fd_names.clear();
-    t.fd_cloexec.clear();
-    t.fd_nonblock.clear();
 
     // Place every PT_LOAD at its link address, page by page: fresh zeroed
     // frame, map, copy the file-backed slice through the physmap. The zeroed
@@ -1493,13 +1667,9 @@ fn spawn(path: &str, image: &[u8]) -> ! {    let img = match ring3::Image::parse
         let file = img.segment_bytes(seg);
         let mut pva = first;
         while pva < last {
-            let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
-                console::puts("  init: out of frames placing the image\n");
-                halt();
-            };
+            let pa = akuma_pmm::alloc_page_zeroed()?;
             if !paging::map_page_in(root, pva as usize, pa as u64, pte, MemAttr::WriteBack) {
-                console::puts("  init: map_page_in refused a user page\n");
-                halt();
+                return None;
             }
             // The page's overlap with the segment's file-backed range.
             let from = pva.max(seg.vaddr);
@@ -1525,24 +1695,19 @@ fn spawn(path: &str, image: &[u8]) -> ! {    let img = match ring3::Image::parse
     let mut stack_top_pa = 0u64;
     let mut pva = stack_base;
     while pva < USER_STACK_TOP {
-        let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
-            console::puts("  init: out of frames for the user stack\n");
-            halt();
-        };
+        let pa = akuma_pmm::alloc_page_zeroed()?;
         if pva + 4096 == USER_STACK_TOP {
             stack_top_pa = pa as u64;
         }
         if !paging::map_page_in(root, pva as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
-            console::puts("  init: map_page_in refused a stack page\n");
-            halt();
+            return None;
         }
         pva += 4096;
     }
     add_region(stack_base, USER_STACK_TOP);
 
-    // argc/argv/envp/auxv. argv[0] is the path the command line named;
-    // argv[1..] are that program's `initargs=`/`thenargs=` entries; no env.
-    // `AT_RANDOM`/`AT_EXECFN` values are the builder's to fill.
+    // argc/argv/envp/auxv. `AT_RANDOM`/`AT_EXECFN` values are the builder's
+    // to fill.
     const AUX_N: usize = 14;
     let mut aux = [(0u64, 0u64); AUX_N];
     aux[0] = (ring3::AT_BASE, 0); // no interpreter
@@ -1559,19 +1724,13 @@ fn spawn(path: &str, image: &[u8]) -> ! {    let img = match ring3::Image::parse
     aux[11] = (ring3::AT_HWCAP, 0);
     aux[12] = (ring3::AT_CLKTCK, 100);
     aux[13] = (ring3::AT_RANDOM, 0);
-    // SAFETY: boot statics; read before the crossing that consumes the copy.
-    let mut argv: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
-    let n_args = unsafe {
-        let progs = &*core::ptr::addr_of!(PROGRAMS);
-        let cur = CURRENT;
-        let p = &progs[cur];
-        for k in 0..p.n_args {
-            argv[k + 1] = p.arg_str(k);
-        }
-        p.n_args
-    };
+    let mut full_argv: [&str; MAX_ARGV + 1] = [argv.first().copied().unwrap_or(""); MAX_ARGV + 1];
+    let n_args = argv.len().min(MAX_ARGV);
+    for (k, a) in argv[..n_args].iter().enumerate() {
+        full_argv[k] = a;
+    }
     let mut block = [0u8; 512];
-    let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &argv[..=n_args], &[], &aux);
+    let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &full_argv[..=n_args], env, &aux);
 
     // SAFETY: the top stack page is a mapped task frame; the block ends at
     // `USER_STACK_TOP`, so its bytes sit at `page_pa + (4096 - block.len())`.
@@ -1589,14 +1748,42 @@ fn spawn(path: &str, image: &[u8]) -> ! {    let img = match ring3::Image::parse
     add_region(brk0, t.brk_end);
     add_region(MMAP_BASE, MMAP_BASE + SLAB);
 
-    akuma_primitives::safe_print!(
-        160,
-        "  init: {} user page(s) mapped at root 0x{:016x}, stack 0x{:016x}..0x{:016x}\n",
-        placed + USER_STACK_PAGES,
-        root,
-        stack_base,
-        USER_STACK_TOP
-    );
+    let _ = placed;
+    Some(TaskImage { root_pa: root, entry: img.entry(), rsp })
+}
+
+/// Where a loaded task starts: the root for CR3, the entry, the stack.
+pub struct TaskImage {
+    pub root_pa: u64,
+    pub entry: u64,
+    pub rsp: u64,
+}
+
+/// Load the image, build the task's address space, and cross. Never returns:
+/// the task ends in the dispatcher's `exit` or the trap handler's `[Fault]`.
+fn spawn(path: &str, image: &[u8]) -> ! {
+    if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
+        akuma_primitives::safe_print!(160, "  init: ELF refused: bad magic\n");
+        halt();
+    }
+    // SAFETY: boot statics; read before the crossing that consumes the copy.
+    let (argv, n_args) = unsafe {
+        let progs = &*core::ptr::addr_of!(PROGRAMS);
+        let cur = CURRENT;
+        let p = &progs[cur];
+        let mut a: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
+        for k in 0..p.n_args {
+            a[k + 1] = p.arg_str(k);
+        }
+        let n = p.n_args;
+        let mut owned: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
+        owned[1..=n].copy_from_slice(&a[1..=n]);
+        (owned, n)
+    };
+    let Some(ti) = load_task(&argv[..=n_args], &[], image) else {
+        akuma_primitives::safe_print!(160, "  init: task load failed\n");
+        halt();
+    };
 
     // Arm the syscall path, then cross. `mov cr3` is the write the ctlreg
     // crate deliberately does not own (reads safe, writes unsafe at the call
@@ -1611,15 +1798,17 @@ fn spawn(path: &str, image: &[u8]) -> ! {    let img = match ring3::Image::parse
     unsafe {
         core::arch::asm!(
             "mov cr3, {r}",
-            r = in(reg) root,
+            r = in(reg) ti.root_pa,
             options(nostack, preserves_flags)
         );
     }
-    // SAFETY: `EntryFrame` is plain `u64` fields; all-zero is a valid value.
-    let mut ef: ring3::EntryFrame = unsafe { core::mem::zeroed() };
-    ef.rip = img.entry();
-    ef.rflags = 0x202; // IF set, reserved bit 1 set
-    ef.rsp = rsp;
+    let ef = ring3::EntryFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
+        rdx: 0, rsi: 0, rdi: 0, rax: 0,
+        rip: ti.entry,
+        rflags: 0x202, // IF set, reserved bit 1 set
+        rsp: ti.rsp,
+    };
     // SAFETY: the address space maps the kernel half (shared PML4 entries)
     // and the task's pages; `ef` names image-placed code on the built stack.
     unsafe { ring3::enter_user(&ef) }
@@ -1712,6 +1901,12 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     unsafe {
         *core::ptr::addr_of_mut!(ROOT_FS) = Some(fs);
     }
+
+    // Stage 4: the network path — calibrate the TSC against the PIT, pull up
+    // smoltcp on virtio-net, wait (bounded, pumping the NIC) for DHCP. A
+    // guest with no NIC or no lease still boots; sshd will bind and simply
+    // never answer, which is a legible failure, not a hang.
+    let _ = net::net_init();
 
     // ---- The init-spawn point ------------------------------------------------
     //
