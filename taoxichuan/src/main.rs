@@ -376,13 +376,21 @@ fn no_clock() -> u64 {
 // its own: the last thing on the console before the machine would hand over.
 // ---------------------------------------------------------------------------
 
+/// ASCII only, on purpose: the guest console's host-side relay sanitises
+/// non-ASCII bytes to `?`, and the gate's evidence is this log.
 const ART: &str = concat!(
-    "  |\\         Taoxichuan — the composed kernel.         /|\n",
-    "  | \\   From one kiln, fired in another: a kernel     / |\n",
-    "  |  \\  built from Akuma's crates, booted under       /  |\n",
-    "  |  /  Akuma's own hypervisor, on its own metal.     \\  |\n",
-    "  | /        陶 熙 川  — the kiln-fire stage.          \\ |\n",
-    "  |/                                                  \\|\n",
+    "  +------------------------------------------------------+
+",
+    "  |   Taoxichuan  --  tao xi chuan, the kiln-fire market  |
+",
+    "  |   A kernel composed from Akuma's crates, one stage   |
+",
+    "  |   at a time, fired in Akuma's own kiln: booted under |
+",
+    "  |   Akuma's hypervisor, on Akuma's metal.              |
+",
+    "  +------------------------------------------------------+
+",
 );
 
 fn banner() {
@@ -390,7 +398,7 @@ fn banner() {
     console::puts(ART);
     console::puts("\n  Taoxichuan ");
     console::puts(env!("CARGO_PKG_VERSION"));
-    console::puts(" (Akuma/amd64 crates) x86_64 — stage 1\n\n");
+    console::puts(" (Akuma/amd64 crates) x86_64 -- stage 1\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +415,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // the boot kit's memory bring-up reports through `safe_print!`.
     akuma_primitives::console::set_print_hook(console::puts);
 
-    console::puts("\nTaoxichuan/amd64 — long mode reached\n");
+    console::puts("\nTaoxichuan/amd64 -- long mode reached\n");
     console::puts("  uart: ");
     console::puts(if console::present() { "present\n" } else { "absent (reads report no data)\n" });
     console::puts("  hvm_start_info @ 0x");
@@ -460,13 +468,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         evict_clean_file_pages: |_| 0,
         shrink_page_cache: |_| 0,
     }) {
-        console::puts("\nTaoxichuan/amd64 — memory bring-up FAILED\n");
+        console::puts("\nTaoxichuan/amd64 -- memory bring-up FAILED\n");
         halt();
     }
 
     // The root disk, and the ext2 root on it.
     if !blk_init(&machine.virtio) {
-        console::puts("  [FATAL] no virtio block device — the pinned root (ext2 on virtio-blk) cannot mount\n");
+        console::puts("  [FATAL] no virtio block device -- the pinned root (ext2 on virtio-blk) cannot mount\n");
         halt();
     }
     let Ok(fs) = akuma_ext2::Ext2Filesystem::new(Vda, no_clock) else {
@@ -488,14 +496,14 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     let mut init_buf = [0u8; 128];
     let init_path = cmdline_token(hvm_start_info, "init=", &mut init_buf);
     let Some(path) = init_path else {
-        console::puts("  init: no init= on the command line — nothing to spawn\n");
+        console::puts("  init: no init= on the command line -- nothing to spawn\n");
         console::puts("Taoxichuan: stage 1 gate NOT reached (no init)\n");
         halt();
     };
     let mut args_buf = [0u8; 128];
     let args = cmdline_token(hvm_start_info, "initargs=", &mut args_buf).unwrap_or("");
 
-    console::puts("Taoxichuan: init spawn — init=");
+    console::puts("Taoxichuan: init spawn -- init=");
     console::puts(path);
     if !args.is_empty() {
         console::puts(" argv=[");
@@ -516,7 +524,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     console::puts(" bytes on the ext2 root, ELF magic ");
     console::puts(if elf { "ok" } else { "MISSING" });
     console::puts("\n");
-    console::puts("Taoxichuan: stage 1 gate reached — init spawn (userspace is stage 2)\n");
+    console::puts("Taoxichuan: stage 1 gate reached -- init spawn (userspace is stage 2)\n");
 
     // Park: interrupts masked, core halted. A quiet core, not a spinning one.
     halt();
@@ -530,7 +538,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain_mb2(_info_phys: u64) -> ! {
     console::init();
-    console::puts("\nTaoxichuan: multiboot2 boot — not composed in this kernel (PVH/VMM only)\n");
+    console::puts("\nTaoxichuan: multiboot2 boot -- not composed in this kernel (PVH/VMM only)\n");
     halt();
 }
 
