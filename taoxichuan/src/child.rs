@@ -260,7 +260,10 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     // Load the image while the PARENT's CR3 is still active: everything the
     // load touches (ext2 root, PMM, page tables) lives in the kernel half,
     // and the copy loop writes the child's frames through the physmap.
-    let Ok(image) = crate::root_fs().read_file(path) else {
+    // `/bin/sh` (what the exec path spawns) is a symlink on the serve
+    // image; the chain walker resolves it the same way `open` does.
+    let effective = crate::resolve_effective(path);
+    let Ok(image) = crate::root_fs().read_file(&effective) else {
         slots()[slot_idx].used = false;
         return crate::e(crate::err::ENOENT);
     };

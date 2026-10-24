@@ -688,6 +688,32 @@ fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
     true
 }
 
+/// The ext2 lookup does not follow symlinks (a deliberate crate boundary:
+/// `akuma-ext2` resolves components, `akuma-vfs::path` owns the chain
+/// walker). The serve image's `/bin/sh` — what sshd's exec path spawns — is
+/// a symlink, so every path that names a program goes through the chain
+/// walker with ext2 as the effect provider: `is_symlink` to decide, the
+/// link inode's bytes for the target (relative targets joined by the
+/// walker), 8 hops to ELOOP. The stage-3 `open` path gets the same walker,
+/// because `/etc/sshd/sshd.conf`'s `shell = /bin/sh` is the exact case.
+fn read_link_target(path: &str) -> Option<alloc::string::String> {
+    let fs = root_fs();
+    if !fs.is_symlink(path) {
+        return None;
+    }
+    let raw = fs.read_file(path).ok()?;
+    alloc::string::String::from_utf8(raw).ok().map(|s| {
+        // Strip exactly one trailing newline, the convention for link text.
+        let s = s.trim_end_matches('\n');
+        alloc::string::String::from(s)
+    })
+}
+
+/// Resolve symlinks (bounded), returning the effective path to look up.
+fn resolve_effective(path: &str) -> alloc::string::String {
+    akuma_vfs::resolve_symlink_chain(path, 8, read_link_target)
+}
+
 /// Read a NUL-terminated path from the task at `src_va` into `buf`, returning
 /// the `&str` it held. `None` (`-EFAULT` at the call site) on a bad byte or
 /// no terminator inside `buf.len()`.
@@ -755,6 +781,8 @@ fn open_common(path_va: u64, flags: u64) -> u64 {
     if !path.starts_with('/') {
         return e(ring3::err::ENOENT); // nothing to resolve ".." against
     }
+    // Stage 4: symlinks resolve (`/bin/sh` is one).
+    let path = &resolve_effective(path);
     let fs = root_fs();
     let Ok(md) = fs.metadata(path) else {
         return e(ring3::err::ENOENT);

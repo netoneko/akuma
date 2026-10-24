@@ -1254,6 +1254,7 @@ dependencies = [
  "akuma-fdtable",
  "akuma-gdt",
  "akuma-idt-amd64",
+ "akuma-net",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-ring3-amd64",
