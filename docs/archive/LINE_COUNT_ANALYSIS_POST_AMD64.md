@@ -155,6 +155,64 @@ for the next measurement.
 
 ---
 
+## Stat 6: what the kernels link from outside the repo
+
+*Measured 2026-10-24, HEAD `e8b58e24` plus the `--external` flag below (working
+tree), after Taoxichuan stage 3. Not on the 2026-10-23 tree used above, so these
+rows are a separate series.*
+
+Every other stat here counts code this repo owns. `scripts/cloc_akuma.py
+--external` adds the crates.io libraries each kernel actually links: it asks
+`cargo metadata --offline --filter-platform <triple>` for the kernel package's
+**normal** dependency closure, drops proc-macro crates (`syn`, `quote`: they run
+on the host and put nothing in the image), and counts each remaining crate's
+`src/` with the same lexer. "Own code" below is the script's *links* row: the
+kernel's source plus only the workspace crates it reaches through Cargo path
+dependencies. That is smaller than the "platform total" rows above, which count
+every crate in `crates/` whether or not a given kernel links it.
+
+| kernel | own code (links) | external code | external / own | external crates | external `unsafe` sites |
+|---|---:|---:|---:|---:|---:|
+| AArch64 (`src` + linked crates) | 66,554 | 67,781 | **1.02x** | 25 | 1,407 |
+| amd64 (`amd64/src` + linked crates) | 107,750 | 80,201 | **0.74x** | 29 | 1,795 |
+| Taoxichuan (stage 3, `taoxichuan/src` + 23 crates) | 14,892 | 27,312 | **1.83x** | 10 | 1,096 |
+
+**Superseded in part (2026-10-24, later the same day).** The table above was computed with the first
+`--external`, which read `path =` lines from `Cargo.toml` text. The script now asks `cargo tree`, which resolves
+features and targets, and the figures moved: AArch64 own 65,340 / external 66,504; amd64 own 107,151 / external
+78,924 (the text walk over-counted by 1-2 crates per kernel). The Taoxichuan row was measured on the stage-3 tree and
+is stale: stage 4 added `akuma-net`, `akuma-net-nic` and their libraries. More important, **lines in the graph are
+not code in the image**: on an unstripped aarch64 Taoxichuan-feature kernel, 23 external crates were in the graph
+and 7 contributed bytes (10.5 KB, about 1% of the symbols), so the external column is an upper bound on what a reviewer
+might trust, not a measure of what runs (`cloc_akuma.py --elf`, and the stage-4 section of
+`MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md`). The planned before/after baseline is deferred until the working system.
+
+Production code in each cell; test code is counted separately by the script
+(35,292 / 58,413 / 10,405 external test lines).
+
+- **The AArch64 kernel links about as much third-party source as it owns (1.0x);
+  amd64 about three-quarters as much (0.74x).** amd64 owns more and borrows
+  proportionally less.
+- **Taoxichuan inverts it: 1.8x.** It is the smallest of our own code (about a
+  seventh of amd64's) and carries ten libraries, of which `zerocopy` (9.3k),
+  `virtio-drivers` (7.5k), `lock_api` (3.1k) and `log` (2.5k) are four fifths. The
+  larger kernels' extra external weight is mostly `smoltcp` (24.7k, networking),
+  `memchr`, `heapless`, `elf`, `vte` and `unicode-width`, none of which
+  Taoxichuan links yet. Stage 4 (sshd) is the stage most likely to move this row.
+- **External `unsafe` is large next to our own** (1,096-1,795 sites vs 185-383),
+  and 450 of Taoxichuan's 1,096 are `zerocopy`'s. That is third-party code this
+  repo's `forbid`/budget gates do not cover.
+
+Caveats specific to this stat: each crate's `src/` is counted **whole**, so cargo
+features and `#[cfg]` pruning are not applied and the figures are an upper bound
+on what is compiled in (it is the amount of third-party source a reviewer would
+trust, not an object-code estimate); two versions of one crate (`bitflags` 1.x
+and 2.x, `defmt` 0.3 and 1.0 on the larger kernels) are counted as two crates;
+`cargo metadata` needs the registry unpacked locally, so a cold machine prints
+"unavailable" for the row rather than a wrong number.
+
+---
+
 ## The peer-group rows, re-measured per platform
 
 The prior doc's comparison table is reproduced there with public-source figures
@@ -222,6 +280,7 @@ python3 scripts/cloc_akuma.py --json                      # tree total (default 
 python3 scripts/cloc_akuma.py --json src crates           # continuity series
 python3 scripts/cloc_akuma.py --json amd64/src            # the amd64 kernel
 python3 scripts/cloc_akuma.py --vs v0.0.7-akuma-on-aws    # delta vs the prior snapshot
+python3 scripts/cloc_akuma.py --top 0 --external          # Stat 6: linked crates.io libraries per kernel
 git rev-list --count HEAD
 ls docs/archive/*.md | wc -l
 python3 -c "import json; print(len(json.load(open('docs/reference/unsafe-budget.json'))['forbids']))"

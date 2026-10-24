@@ -71,7 +71,7 @@ the gap between them is the duplication the shared-crate extraction has not yet
 absorbed.
 
 Usage:
-    scripts/cloc_akuma.py                      # defaults to src/ crates/ amd64/src/
+    scripts/cloc_akuma.py                      # defaults to src/ crates/ amd64/src/ taoxichuan/src/
     scripts/cloc_akuma.py src crates --by-file
     scripts/cloc_akuma.py --json
     scripts/cloc_akuma.py --all-languages      # also C, asm, shell, TOML, Markdown, ...
@@ -83,9 +83,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 
@@ -1151,7 +1153,7 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
         # port's `unsafe` is the one being driven down.
         def root_of(comp: str) -> str:
             parts = comp.split(os.sep)
-            return os.sep.join(parts[:2] if parts[0] == "amd64" else parts[:1]) + os.sep
+            return os.sep.join(parts[:2] if parts[0] in ("amd64", "taoxichuan") else parts[:1]) + os.sep
 
         scopes = [("crates/", crates)]
         for root in sorted({root_of(c) for c in bins}, key=lambda r: (r != "src/", r)):
@@ -1199,9 +1201,67 @@ def path_deps(manifest: str) -> set:
     return found
 
 
+_TREE_LINE = re.compile(r"^(\S+) v(\S+)(?: \(([^)]*)\))?")
+
+
+def cargo_tree(pkg: str, triple: str, features: str = "", default: bool = True):
+    """Packages cargo links into `pkg` for `triple`: [(name, version, abs_path_or_None)].
+
+    `cargo tree` resolves features for THIS package alone (`cargo metadata`
+    unifies them across the whole workspace, which can switch on optional
+    dependencies another member wanted), applies target-specific dependency
+    tables, and with `no-proc-macro` drops host-only crates (`syn`, `quote`).
+    None if cargo cannot answer.
+    """
+    cmd = ["cargo", "tree", "-p", pkg, "--target", triple, "-e", "normal,no-proc-macro",
+           "--prefix", "none", "--offline"]
+    if not default:
+        cmd.append("--no-default-features")
+    if features:
+        cmd += ["--features", features]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    seen: set = set()
+    for line in out.splitlines():
+        m = _TREE_LINE.match(line.strip())
+        if not m:
+            continue
+        loc = m.group(3) or ""
+        seen.add((m.group(1), m.group(2), loc if loc.startswith("/") else None))
+    return sorted(seen)
+
+
+#: manifest -> (cargo package, target triple) for the kernels `linked_crates` can ask cargo about.
+KERNEL_PACKAGES = {
+    "Cargo.toml": ("akuma", "aarch64-unknown-none"),
+    os.path.join("amd64", "Cargo.toml"): ("akuma-amd64", "x86_64-unknown-none"),
+    os.path.join("taoxichuan", "Cargo.toml"): ("taoxichuan", "x86_64-unknown-none"),
+}
+
+
 def linked_crates(root_manifest: str) -> set:
-    """Transitive closure of path dependencies from a kernel's manifest, as
-    repo-relative crate directories (the root manifest's own dir excluded)."""
+    """Workspace crate directories a kernel links, as repo-relative paths (the
+    kernel's own dir excluded).
+
+    Asks `cargo tree` (feature- and target-aware) for the kernels in
+    KERNEL_PACKAGES. The fallback, and the walk for any other manifest, reads
+    `path = ".."` lines out of Cargo.toml text, which cannot see features or
+    that a crate is only needed for another architecture — it over-counts
+    (taoxichuan: 29 crates by text, 27 by cargo) — so it is a fallback only.
+    """
+    kp = KERNEL_PACKAGES.get(root_manifest)
+    if kp:
+        tree = cargo_tree(*kp)
+        if tree:
+            root = os.path.abspath(".")
+            own = os.path.abspath(os.path.dirname(root_manifest))
+            dirs = set()
+            for _name, _ver, path in tree:
+                if path and os.path.abspath(path) not in (own, root):
+                    dirs.add(os.path.relpath(path, root))
+            return dirs
     seen: set = set()
     todo = list(path_deps(root_manifest))
     while todo:
@@ -1248,6 +1308,8 @@ def platform_buckets(files: list) -> dict:
             buckets.setdefault("aarch64 bin", []).append(comp)
         elif comp == "amd64" or comp.startswith("amd64" + os.sep):
             buckets.setdefault("amd64 bin", []).append(comp)
+        elif comp == "taoxichuan" or comp.startswith("taoxichuan" + os.sep):
+            buckets.setdefault("taoxichuan bin", []).append(comp)
         elif have_graph and comp in a64 and comp in x64:
             buckets.setdefault("shared crates", []).append(comp)
         elif have_graph and comp in x64:
@@ -1296,7 +1358,7 @@ def print_platform_report(files: list, W: int) -> None:
         f"{'unsafe':>8}{'enforced':>10}"
     )
     print(rule(W))
-    order = ("aarch64 bin", "amd64 bin", "aarch64-only crates",
+    order = ("aarch64 bin", "amd64 bin", "taoxichuan bin", "aarch64-only crates",
              "amd64-only crates", "shared crates")
     for name in order:
         if name not in by_bucket:
@@ -1321,6 +1383,24 @@ def print_platform_report(files: list, W: int) -> None:
             tot.merge(agg)
         print(f"{label:<24}{tot.files:>8}{tot.code:>11}{tot.test_code:>11}{tot.unsafe_sites:>8}")
 
+    # The minimal self-hosting kernel (`taoxichuan/`, docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md):
+    # its footprint is its own source plus the closure of its path dependencies, which sit in
+    # whichever bucket above they belong to, so it cannot be a sum of buckets.
+    if "taoxichuan bin" in by_bucket:
+        linked = linked_crates(os.path.join("taoxichuan", "Cargo.toml"))
+        tx = Agg()
+        tx.merge(by_bucket["taoxichuan bin"])
+        n_crates = 0
+        seen_comps: set = set()
+        for fc in files:
+            comp = component_of(fc.path)
+            if comp in linked:
+                tx.add(fc)
+                seen_comps.add(comp)
+        n_crates = len(seen_comps)
+        print(f"{'taoxichuan kernel links':<24}{tx.files:>8}{tx.code:>11}{tx.test_code:>11}{tx.unsafe_sites:>8}")
+        print(f"  ({n_crates} of {len(linked)} linked crates counted, plus taoxichuan/src itself)")
+
     for name in ("aarch64-only crates", "amd64-only crates"):
         if name in members:
             crates = sorted(members[name])
@@ -1330,6 +1410,172 @@ def print_platform_report(files: list, W: int) -> None:
     print("sum to more than the tree. Attribution comes from each kernel's")
     print("Cargo path-dependency closure; crates neither kernel reaches fall")
     print("back to #[cfg(target_arch = ..)] attributes (cfg!() not parsed).")
+    print(rule(W))
+
+
+#: kernel name -> (manifest, target triple). The triple is what `cargo metadata
+#: --filter-platform` resolves target-specific dependencies against.
+EXTERNAL_KERNELS = {
+    "aarch64": ("Cargo.toml", "aarch64-unknown-none"),
+    "amd64": (os.path.join("amd64", "Cargo.toml"), "x86_64-unknown-none"),
+    "taoxichuan": (os.path.join("taoxichuan", "Cargo.toml"), "x86_64-unknown-none"),
+}
+
+
+def external_closure(manifest: str, triple: str):
+    """crates.io / git packages a kernel links, as [(name, version, src_dir)].
+
+    Asks `cargo tree` (offline: the registry is already unpacked for the
+    build) for the kernel package's NORMAL dependency edges, so
+    build- and dev-dependencies are out, features are resolved for that package
+    alone, and proc-macro crates go with everything only they pull in (syn,
+    quote, ...): they run on the host and none of their code is in the image.
+    Returns None if cargo cannot answer.
+    """
+    kp = KERNEL_PACKAGES.get(manifest)
+    tree = cargo_tree(kp[0], triple) if kp else None
+    if tree is None:
+        return None
+    try:
+        meta = json.loads(subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--offline", "--filter-platform", triple],
+            capture_output=True, text=True, timeout=120, check=True,
+        ).stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    where = {(p["name"], p["version"]): os.path.dirname(p["manifest_path"])
+             for p in meta["packages"] if p["source"]}
+    # `cargo tree` says WHICH crates link (feature-correct); `metadata` only says where their source is.
+    return sorted(
+        (n, v, os.path.join(where[(n, v)], "src"))
+        for n, v, path in tree if path is None and (n, v) in where
+    )
+
+
+def print_external_report(kernel_gate: bool, W: int) -> None:
+    """Code linked from external libraries, per kernel.
+
+    Each external crate's `src/` is counted whole: this is an UPPER bound on
+    what is compiled in, because cargo features and `#[cfg]`s prune code this
+    counter does not evaluate (virtio-drivers' optional transports, zerocopy's
+    derive support). It is the amount of third-party source a reviewer would
+    have to trust, which is the number the experiment wants.
+    """
+    print()
+    print(rule(W))
+    print("External libraries linked (normal deps, proc-macros excluded; crate src/ counted whole)")
+    print(rule(W))
+    for kernel, (manifest, triple) in EXTERNAL_KERNELS.items():
+        if not os.path.exists(manifest):
+            continue
+        deps = external_closure(manifest, triple)
+        if deps is None:
+            print(f"{kernel}: cargo metadata unavailable (offline registry missing?)")
+            continue
+        tot = Agg()
+        rows_ = []
+        for name, ver, src in deps:
+            if not os.path.isdir(src):
+                continue
+            files, _ = walk([src], kernel_gate)
+            a = Agg()
+            for fc in files:
+                a.add(fc)
+            tot.merge(a)
+            rows_.append((a.code, f"{name} {ver}", a))
+        print(f"{kernel} ({triple}): {len(rows_)} crates")
+        print(f"  {'crate':<30}{'files':>8}{'prod code':>11}{'test code':>11}{'unsafe':>8}")
+        for _, label, a in sorted(rows_, key=lambda r: -r[0]):
+            print(f"  {label:<30}{a.files:>8}{a.code:>11}{a.test_code:>11}{a.unsafe_sites:>8}")
+        print(f"  {'TOTAL':<30}{tot.files:>8}{tot.code:>11}{tot.test_code:>11}{tot.unsafe_sites:>8}")
+        print(rule(W))
+
+
+def elf_symbol_bytes(elf: str):
+    """{crate: bytes} of defined symbols in an UNSTRIPPED ELF, via `rust-nm`.
+
+    A symbol is attributed to the crate named first in its demangled path
+    (`<smoltcp::X as T>::f` -> smoltcp). Code inlined into a caller is the
+    caller's, so this UNDER-counts small helper crates and generics; a crate
+    with zero bytes is genuinely absent or fully inlined. The extreme-size
+    profile strips symbols, so build with CARGO_PROFILE_EXTREME_SIZE_STRIP=none.
+    """
+    try:
+        out = subprocess.run(["rust-nm", "-S", "--demangle", "--defined-only", elf],
+                             capture_output=True, text=True, timeout=120, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    ident = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)::")
+    sz: dict = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            size = int(parts[1], 16)
+        except ValueError:
+            continue
+        name = re.sub(r"^[<&*\[\(\)\]\s]*(mut |dyn |const )?", "", parts[3].strip())
+        m = ident.match(name)
+        sz[m.group(1) if m else "(unattributed)"] = sz.get(m.group(1) if m else "(unattributed)", 0) + size
+    return sz
+
+
+def print_elf_report(elf: str, pkg: str, triple: str, features: str, default: bool,
+                     kernel_gate: bool, W: int) -> None:
+    """Source lines vs bytes actually in the image, per linked crate.
+
+    The line-count footprint above is "what the dependency graph links"; this
+    is "what the linker kept". They differ a lot: a crate can be in the graph
+    and contribute nothing once LTO drops what nothing calls.
+    """
+    sz = elf_symbol_bytes(elf)
+    tree = cargo_tree(pkg, triple, features, default)
+    if sz is None or tree is None:
+        print(f"--elf: need `rust-nm` and `cargo tree` ({elf})")
+        return
+    print()
+    print(rule(W))
+    print(f"Image check: {elf}")
+    print(f"  graph = cargo tree -p {pkg} --target {triple}"
+          + ("" if default else " --no-default-features") + (f" --features {features}" if features else ""))
+    print(rule(W))
+    print(f"{'crate':<30}{'kind':>6}{'prod lines':>12}{'image bytes':>13}")
+    rows_ = []
+    tot = {"ws": [0, 0, 0, 0], "ext": [0, 0, 0, 0]}  # lines, bytes, crates, crates-with-bytes
+    root = os.path.abspath(".")
+    for name, ver, path in tree:
+        if path and os.path.abspath(path) in (root, os.path.abspath(os.path.join(root, pkg))):
+            continue
+        kind = "ws" if path else "ext"
+        src = os.path.join(path, "src") if path else None
+        if src is None:
+            m = next((d for d in glob.glob(os.path.expanduser(f"~/.cargo/registry/src/*/{name}-{ver}/src"))), None)
+            src = m
+        lines = 0
+        if src and os.path.isdir(src):
+            files, _ = walk([src], kernel_gate)
+            lines = sum(fc.code for fc in files) if files and hasattr(files[0], "code") else 0
+            if not lines:
+                a = Agg()
+                for fc in files:
+                    a.add(fc)
+                lines = a.code
+        b = sz.get(name.replace("-", "_"), 0)
+        rows_.append((name, kind, lines, b))
+        t = tot[kind]
+        t[0] += lines
+        t[1] += b
+        t[2] += 1
+        t[3] += 1 if b else 0
+    for name, kind, lines, b in sorted(rows_, key=lambda r: (-r[3], -r[2])):
+        print(f"{name:<30}{kind:>6}{lines:>12}{b:>13}" + ("   <- 0 B in image" if not b else ""))
+    print(rule(W))
+    for label, key in (("workspace crates", "ws"), ("external crates", "ext")):
+        l, b, n, nb = tot[key]
+        print(f"{label:<22}{n:>4} in graph, {nb:>3} with bytes in image; {l:>7} lines counted, {b:>8} B in image")
+    print(f"{'rest of image':<22}core+alloc {sz.get('core', 0) + sz.get('alloc', 0)} B, "
+          f"unattributed {sz.get('(unattributed)', 0)} B")
     print(rule(W))
 
 
@@ -1743,12 +1989,12 @@ def emit_json(files: list, paths: list) -> None:
 # `amd64/src`, not `amd64`: the bin's directory also holds `mkdisk.sh`, `Cargo.toml`,
 # a README and linker/boot scaffolding, which this counter would report as code.
 # The platform split keys on the `amd64/` prefix, so the narrower root changes nothing there.
-DEFAULT_PATHS = ["src", "crates", os.path.join("amd64", "src")]
+DEFAULT_PATHS = ["src", "crates", os.path.join("amd64", "src"), os.path.join("taoxichuan", "src")]
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("paths", nargs="*", default=DEFAULT_PATHS, help="files/dirs (default: src crates amd64/src)")
+    ap.add_argument("paths", nargs="*", default=DEFAULT_PATHS, help="files/dirs (default: src crates amd64/src taoxichuan/src)")
     ap.add_argument("--by-file", action="store_true", help="per-file table")
     ap.add_argument("--top", type=int, default=15, help="show N largest files (0 = off)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1767,6 +2013,17 @@ def main() -> int:
         action="store_true",
         help="also count C, assembly, shell, TOML, Markdown, JSON, ... (default: Rust only)",
     )
+    ap.add_argument(
+        "--external",
+        action="store_true",
+        help="also count the crates.io/git libraries each kernel links (via `cargo metadata`, offline)",
+    )
+    ap.add_argument("--elf", metavar="PATH",
+                    help="check the linked-crate set against an UNSTRIPPED kernel ELF (symbol bytes per crate)")
+    ap.add_argument("--elf-package", default="akuma", help="cargo package the ELF was built from (default akuma)")
+    ap.add_argument("--elf-triple", default="aarch64-unknown-none")
+    ap.add_argument("--elf-features", default="", help="features the ELF was built with")
+    ap.add_argument("--elf-no-default-features", action="store_true")
     ap.add_argument("--rev", help="count this git revision's tree instead of the working tree")
     ap.add_argument("--vs", metavar="REV",
                     help="also count REV and print the delta REV -> (--rev or working tree)")
@@ -1806,6 +2063,11 @@ def main() -> int:
         emit_json(files, paths)
     else:
         print_report(files, paths, ignored, args.by_file, args.top)
+        if args.external:
+            print_external_report(kernel_gate, 78)
+        if args.elf:
+            print_elf_report(args.elf, args.elf_package, args.elf_triple, args.elf_features,
+                             not args.elf_no_default_features, kernel_gate, 78)
     return 0
 
 

@@ -668,3 +668,100 @@ network path — virtio-net exists in the main kernel's SmolNet, not in taoxichu
 taoxichuan today; fork-or-not — taoxichuan is sequential-only, no fork/clone/execve; `/dev/null` and
 `/dev/urandom` — no device layer, and no entropy source, `AT_RANDOM` is still the deterministic canary;
 host key — no writable files, read-only `open` only).
+
+### Stage 4 — supervisor interventions and measurements (Sonnet), 2026-10-24 21:44-23:35 IDT
+
+Not a gate result. This is what the supervisor did while goose-glm worked the sshd stage, so the next supervisor
+does not have to rediscover it. Times are IDT; the box's own clock and `/var/log/herd` are UTC (-3 h).
+
+**Timeline.**
+- 21:44 the detached sender fired `taoxichuan-03b-finish.md` after a probe returned "pong" (quota reset 21:39).
+  03b ran 18 min, `end_turn`: RESULT.md PASS, main-kernel regression boots, log section (`3b930292`).
+- 22:04 stage 4 (`taoxichuan-04-sshd.md`) sent before validating stage 3 (docs-only delta; the aarch64 results
+  stood). Goose wrote `net.rs`, `child.rs`, `sock.rs` and the syscall arms from 22:25, first build 22:52, and
+  made its first commit at 23:11 (`0f1c9926`, 67 min in, past the brief's 20-minute rule).
+- 23:20 first real stage-4 boot (kernel 604,696 B, `init=/bin/sshd`, forward `2224:22`): the guest reaches
+  `fs: ext2 root mounted on /dev/vda`, then the log goes silent (no banner, no init spawn); `vm-dev`
+  `last_exit=1`. This is the lead handed to the continuation brief.
+- 23:30:22 supervisor sent ACP `session/cancel` (connection and session ids are in the head of the driver log);
+  HTTP 202, turn ended `stopReason: cancelled` at 23:30:49 and the driver exited 0. Owner's call: 72% of the
+  window was spent and the remaining quota was better used on one named failure.
+- 23:30-23:33 supervisor: restored `vm-serve-mc` and disabled `vm-dev`, committed goose's uncommitted files on the
+  box as `e418fd61` (owner authorised it; no push), stopped and started `goose-glm` (new pid), wrote and sent
+  `taoxichuan-04b-continue.md` (about 25-30 min of work; commit and push every 10 min; PARTIAL result if not
+  done).
+
+**Quota, measured from `sessions.db` (`scripts/kvm/goose_box_stats.py`, run through ssh as base64).** The
+window is about 41M input tokens (stage 4 plus 03b were 27.57M at 23:25 = 67%, the owner read 69%). Stage 4's burn
+rate rose as its context grew: 6.9M in the first 35 min, 13.3M at 49 min (16M/h, context 190k), 26.4M at 80 min
+(+13.1M in 32 min = 25M/h, about 60% of a window per hour, context 220k). An earlier "5% an hour" estimate was
+wrong: it averaged over the cheap 03b run and idle time. Lesson: a long stage's cost per hour is dominated by
+the context it re-reads on every call, so a window lasts about 2 h of stage-4-sized work, not 5.
+
+**Findings.**
+- **`goose serve` pins a core even with nothing running** (one tokio worker, 1,001-1,002 ticks per 10 s,
+  also with no prompt in flight); a stop/start cleared it. `herd restart` is not a command. Detail and the probe
+  plan: `GOOSE_SERVE_IDLE_SPIN.md`.
+- **`/proc/stat` per-cpu rows for cores 0-3 are not monotonic** (negative deltas); aggregate and cores 4-7 are
+  sane. Separate accounting bug, recorded in the spin doc.
+- **The cloc script's "links" footprint was wrong in three ways**, found while answering "are we checking linked
+  code correctly?": (1) it read `path =` lines out of `Cargo.toml` text, which counts optional and other-arch
+  dependencies (taoxichuan 29 crates by text, 27 by `cargo tree`); (2) it counted whole crates regardless of
+  features; (3) a crate in the dependency graph is not code in the image. Check against an unstripped aarch64
+  `taoxichuan,platform-firecracker` kernel: 85 crates in the graph, 52 put any symbol into the binary; 23 external
+  crates in the graph, 7 contribute 10.5 KB (about 1% of 843 KB of symbols) although 66.5k external source lines
+  were counted; `smoltcp` (24.7k lines), `zerocopy`, `heapless` contribute 0 bytes. The script now uses
+  `cargo tree` and has `--external` (libraries) and `--elf` (symbol bytes per crate; needs
+  `CARGO_PROFILE_EXTREME_SIZE_STRIP=none`, as extreme-size strips). Symbol attribution under-counts inlined code.
+  Numbers: `LINE_COUNT_ANALYSIS_POST_AMD64.md` Stat 6.
+- **The aarch64 path cannot reach goose's stage-4 code.** The aarch64 "Taoxichuan" kernel is the full Akuma
+  kernel behind a feature; its Firecracker boot is green (662,792 B, 134 lines, 0 faults, sshd started; `--no-disk`
+  control 80 lines) but an ssh attempt through the Lima tap (`guest-setup.sh` run, port 4444) did not connect
+  within the owner's patience, and it would have exercised the full kernel's sshd, not `net.rs`/`child.rs`.
+  Left as is; the real test is the amd64 guest.
+
+**Side effects the next supervisor should know.** (1) To back up goose's work I ran `git add -N taoxichuan crates` on
+the box, which marked new files intent-to-add in the index (contents unchanged). Backups are in the supervisor's
+scratchpad, not in the repo. (2) `guest-setup.sh` created `tap0`, NAT and the 4444 forward inside the Lima VM `fc`.
+(3) Merged `litter/taoxichuan-s4` into `rust-org-il-experiment` locally (`78bdaf10`) mid-stage at the owner's request.
+
+### Stage 4 — host track (Sonnet), aarch64 / Firecracker in Lima `fc` — PASS; metal track PASS (goose-glm, 04b)
+
+**Metal result (goose-glm, session `20261024_34`, `/root/dev-cycle/taoxichuan-s4/RESULT.md`).** PASS at
+`taoxichuan-s4` @ `29d4b562`, pushed to `litter`. An ssh round trip into the Taoxichuan guest
+(`init=/bin/sshd initargs=--port,22`, host 2224 -> guest 22 through the relay) runs `echo` and
+`cat /etc/sshd/sshd.conf` with byte-equal output and zero `[Fault]`/`PANIC`/`[sig!]` lines; exec-only, no pty. 16
+crates in the dep tree (stage 3: 15), image 604,712 B. The boot chain it proved: ext2 root, TSC calibrated against the PIT, virtio-net at slot 1
+(polled), smoltcp + DHCP lease `10.0.2.15/24`, banner, init spawn, ring 3, sshd listen, key exchange, exec.
+
+**Three stacked causes (goose's finding, verified in the commits):** (1) the 23:20 IDT "hang after the root mounts"
+that the 04b brief described was a **stale guest binary** (`/boot/akuma-guest-dev` built before the supervisor's checkpoint), not the tree, so
+the brief's lead was wrong and goose said so; (2) the real kernel bug: `mmap` demanded `fd == -1` for
+`MAP_ANONYMOUS` while libakuma passes `fd = 0` and Linux ignores it, so sshd's first allocation returned `ENODEV`
+(`31b934fa`, `29d4b562`); (3) the gate recipe's `ssh -T` is OpenSSH syntax and the box has only the akuma client
+(`/bin/ssh -p 2224 root@localhost '<cmd>'`). Boot markers in `net_init` were left in (16 bytes).
+
+**Supervisor verification.** (a) From the Mac, a plain `ssh -p 2224 root@192.168.1.159 '<cmd>'` with the owner's key
+succeeded on the first attempt after `herd start vm-dev`, so the relay is reachable from the LAN, not only
+from the box. (b) aarch64: merged `litter/taoxichuan-s4` as `16f79ff9`; the Taoxichuan-feature kernel is still **662,792 B**;
+`cargo test -p akuma-ring3-amd64` 8 passed; Firecracker boot with the disk is 132 console lines, 0
+`Fault|PANIC|sig!`, "Ext2 filesystem mounted", "sshd started"; the `--no-disk` control is 80 lines with
+"Block device not found" and no sshd (it proves the first two lines come from the disk). The aarch64 kernel does not
+contain stage 4's `net.rs`/`child.rs`, so this shows no regression, not that stage 4 works there.
+
+**Open items found while using the guest (not gate failures).** `ls /bin` over ssh prints "ls: cannot access
+/bin" (stat/getdents on that path); the console prints `[sc] unhandled nr 4415` repeatedly (an unimplemented
+syscall number nobody has identified); `uname` answers `Akuma 0.1.0 Akuma-OS x86_64` for `-a` and plain `Akuma`
+for `-r` and `-m` (hardcoded in sshd/paws, per the owner; not a kernel matter); sshd tolerates `unhandled nr 258` (`set_robust_list`) and `nr 5`. Goose's stage-6 list: outbound
+relay (`vm_outbound`) and DNS, `writev`/`readlink` class arms, a wall clock (`utc_seconds` is `None`), untested 1 MiB
+mmap/brk slabs.
+
+**Cost.** Stage 4 part 1 (`20261024_31`): 80 min, 163 calls, 26.4M input at the last full reading (23:25); part 2 (`20261024_34`,
+after the stop/start): **19.1 min, 59 calls, 2.02M input, 28k output, largest context 59k.** The window (~41M input
+tokens) was about 76% spent at the end. The restart paid for itself: a fresh 59k context cost a tenth of the
+220k-context session per call. The `goose serve` idle spin did not reappear in this ~20-minute session
+(`GOOSE_SERVE_IDLE_SPIN.md`).
+
+**State left on the box.** `vm-dev` is running at the owner's request so they can ssh in (`vm-serve-mc` halted); restore with
+`herd stop vm-dev; herd disable vm-dev; herd start vm-serve-mc`. The next stage needs a quota refill (reset ~02:39 IDT) and a stage-5
+brief; none is written.
