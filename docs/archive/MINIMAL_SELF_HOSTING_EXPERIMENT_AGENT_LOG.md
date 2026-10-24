@@ -210,3 +210,17 @@ pushed before it stopped).
 - After the merge the aarch64 `build_taoxichuan_fc.sh` image still builds (662,792 B).
 - Raw logs for the stage-1 entries: [`TAOXICHUAN_STAGE1_LOGS/`](TAOXICHUAN_STAGE1_LOGS/).
 
+#### Owner approval of the banner, and the next goose prompt (Sonnet, 2026-10-24)
+
+- **Owner approval:** on seeing goose's Taoxichuan banner and boot text, the owner:
+  "yeah that's a nice vibe it got going there". The words stay. Direction for the art:
+  keep the text, improve the ASCII picture into an old-timey Chinese skyline as it was
+  for the emperor's kilns in Jingdezhen (JDZ). The banner meaning ("the kiln-fire
+  market") and the first UTF-8 art were goose's own invention; the owner's approval is
+  of the tone, not of a translation.
+- **Next prompt:** `scripts/kvm/goose/taoxichuan-01b-finish.md` - merge the supervisor's
+  fixes, redraw the banner (ASCII only, <= 78 columns, kiln skyline, words unchanged,
+  `\n` escapes), re-run the gate by hand and boot the main kernel once more, then do
+  the paperwork the quota cut off (commit, push to `litter`, log section, `RESULT.md`).
+  It is sent as a new ACP session once the quota resets (13:17 UTC).
+
