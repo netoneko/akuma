@@ -224,3 +224,76 @@ pushed before it stopped).
   the paperwork the quota cut off (commit, push to `litter`, log section, `RESULT.md`).
   It is sent as a new ACP session once the quota resets (13:17 UTC).
 
+
+### Stage 1 — metal track (goose-glm), finish — 2026-10-24 — PASS, signed off
+
+Second session of the metal track (GLM 5.3-flash on the ryzen box; the first
+reached the gate but was cut by quota before the paperwork). Branch
+`taoxichuan-s1` at `511f4fdb` = fast-forward merge of `origin/rust-org-il-experiment`
+(`be04a01d`, carrying the supervisor's two fixes) + one banner commit. Pushed to
+`litter` after every commit; nothing was left uncommitted this time.
+
+- **Took the supervisor's fixes first:** merged `origin/rust-org-il-experiment`
+  with zero conflicts. It gates the `global_asm!` of `boot.s` behind
+  `#[cfg(target_arch = "x86_64")]` (AT&T x86 asm broke the aarch64 Mac host
+  build) and adds the same two clippy allows `akuma-bkl`/`akuma-elf` carry to
+  `akuma-boot-amd64`. Both verified in the diff before the merge.
+- **The banner kept its words and got a picture:** same four text lines, same
+  `Taoxichuan 0.1.0 (Akuma/amd64 crates) x86_64 -- stage 1` line, same status
+  lines. Around them, a woodblock-print Jingdezhen: the Chang in front with two
+  junks and kiln-fire glow (`~*~`) on the water, hills behind, and along the
+  bank two big hulu kilns breathing smoke through tall chimneys, a house with
+  upturned eaves, a pagoda, a small third kiln — and the crates kernel sitting
+  on the bank where the wharf shed would be. ASCII-only (0x20–0x7E), 15 lines,
+  67 columns max, still one `const ART: &str = concat!(...)` printed with one
+  `console::puts(ART)`. The art was laid out on a column grid by a throwaway
+  python script that also checked ASCII-onlyness and emitted the Rust literals,
+  so the strings now carry `\n` escapes — the real newlines inside the previous
+  `concat!` literals are gone. One extra allow,
+  `clippy::too_long_first_doc_paragraph`, on the `taoxichuan` crate (same one
+  the supervisor gave `akuma-boot-amd64`); it flags a pre-existing doc comment
+  on the multiboot2 entry, not anything from this session.
+- **The gate, re-run by hand — PASS.** `kbuild -j 4 -p taoxichuan --features
+  no-tests` (166,368 bytes), installed to `/boot/akuma-guest-dev` only, the
+  `vm-serve-mc` → `vm-dev` dance as in `AKUMA_KVM_DEV_CYCLE.md`, log at
+  `/root/dev-cycle/taoxichuan-s1/vm-dev-pass.log` (373 lines). Kernel's own
+  evidence: `Taoxichuan: init spawn -- init=/bin/busybox argv=[sh,/etc/guest.sh]`,
+  `init: 1131168 bytes on the ext2 root, ELF magic ok`,
+  `Taoxichuan: stage 1 gate reached -- init spawn (userspace is stage 2)`;
+  0 `[Fault]`/`PANIC`/`[sig!]` lines. `vm-serve-mc` running again afterwards.
+- **The merge did not break the main kernel:** built `akuma-amd64`
+  (`kbuild -j 4 --features no-tests`, 46.7 s, 11,089,944 bytes), same
+  install/dance, guest reached `AKUMA-GUEST-UP` → `AKUMA-GUEST-DONE` with zero
+  fault lines in that boot's segment.
+- **The banner as printed** (from the pass log):
+
+```
+     ~      _       _                      ~      _         _  ~
+    ( )   __/ \_______/ \__/ \            ( )   ___/ \______/ (_)
+      |                    /--\             |                  |
+   .-----.       ,^.      //[]\\         .-----.              .--.
+  ( |^^| )      /___\     | [] |        ( |^^| )             ( () )
+   '-----'      |___|    /|____|\        '-----'              '--'
+  +------------------------------------------------------+
+  |   Taoxichuan  --  tao xi chuan, the kiln-fire market  |
+  |   A kernel composed from Akuma's crates, one stage   |
+  |   at a time, fired in Akuma's own kiln: booted under |
+  |   Akuma's hypervisor, on Akuma's metal.              |
+  +------------------------------------------------------+
+  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~
+        |\                            |\
+   ~*~\__|_\______   ~  ~  ~  ~   ~*~\__|_\______   ~  ~  ~  ~  ~
+
+  Taoxichuan 0.1.0 (Akuma/amd64 crates) x86_64 -- stage 1
+
+Taoxichuan: stage 1 gate reached -- init spawn (userspace is stage 2)
+```
+
+- **Surprises, small:** (1) bare `cargo clippy -p taoxichuan` on this box dies
+  inside dependencies (`scopeguard`, `log`, `zerocopy`) — it must run with
+  `--target x86_64-unknown-none --offline`, then deps check clean and only the
+  crate itself is linted; (2) herd's generic
+  `[KVM] akuma-vm guest: FAIL (banner=yes, init=no, ...)` marker still prints on
+  clean passes, exactly as the dev-cycle doc says; (3) the old dev log keeps
+  previous boots appended, so fault-greps for the regression boot were scoped
+  to that boot's segment of the file.
