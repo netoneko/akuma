@@ -55,6 +55,16 @@ mod tests;
 /// code/rodata splits); 16 covers every static link this loader will meet.
 pub const MAX_SEGMENTS: usize = 16;
 
+/// Where an `ET_DYN` image (static-PIE — Alpine's `apk.static` is one) is
+/// placed. The image's link addresses start near zero, so the kernel shifts
+/// every `p_vaddr`, the entry and `AT_PHDR` by this base; musl's static-PIE
+/// startup (`__dls2`) does its own relocation in userspace, so the kernel
+/// processes no `RELA`s (the aarch64 kernel made the same move:
+/// `docs/archive/APK_MISSING_SYSCALLS.md`). The amd64 map has PIE code here,
+/// `mmap` at `0x6000_0000_0000` and the stack at `0x7000_0000_0000` — no
+/// overlap; `brk` follows `image_end` above the placed image.
+pub const PIE_BASE: u64 = 0x1000_0000;
+
 /// Software permissions of one segment — the `p_flags` triple, reduced to the
 /// three shapes a static link actually produces.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,8 +81,9 @@ pub enum Prot {
 /// and how much of it is file-backed versus zero-filled.
 #[derive(Clone, Copy, Debug)]
 pub struct Segment {
-    /// Link address (the `p_vaddr` the image was linked at; this loader does
-    /// not relocate, so a non-PIE `ET_EXEC` is required).
+    /// Link address (the `p_vaddr` the image was linked at). For `ET_DYN`
+    /// (static-PIE) images this is already shifted by [`PIE_BASE`]; the
+    /// placement is the shift, and userspace relocates from there.
     pub vaddr: u64,
     /// Byte offset of the file-backed part within the image.
     pub offset: u64,
@@ -90,8 +101,7 @@ pub enum LoadError {
     Magic,
     /// Not ELF64 little-endian (`EI_CLASS`/`EI_DATA`).
     NotElf64Le,
-    /// Neither `ET_EXEC` nor `ET_DYN`; this loader does not relocate, so only
-    /// a static non-PIE image (which is `ET_EXEC`) can run as linked.
+    /// Neither `ET_EXEC` nor `ET_DYN`.
     NotExec,
     /// The program header table is missing or outside the image.
     PhdrTable,
@@ -144,12 +154,15 @@ impl<'a> Image<'a> {
         if e_type != 2 && e_type != 3 {
             return Err(LoadError::NotExec);
         }
+        // ET_DYN (static-PIE): shift every link address by [`PIE_BASE`] — the
+        // one placement decision; userspace self-relocates from there.
+        let base = if e_type == 3 { PIE_BASE } else { 0 };
         let rd = |off: usize| -> u64 {
             let mut b = [0u8; 8];
             b.copy_from_slice(&data[off..off + 8]);
             u64::from_le_bytes(b)
         };
-        let entry = rd(24);
+        let entry = rd(24) + base;
         let e_phoff = rd(32);
         let e_phentsize = u64::from(u16::from_le_bytes([data[54], data[55]]));
         let e_phnum = u64::from(u16::from_le_bytes([data[56], data[57]]));
@@ -201,7 +214,8 @@ impl<'a> Image<'a> {
             } else {
                 Prot::Ro
             };
-            img.segments[img.n_segments] = Segment { vaddr: p_vaddr, offset: p_offset, filesz: p_filesz, memsz: p_memsz, prot };
+            img.segments[img.n_segments] =
+                Segment { vaddr: p_vaddr + base, offset: p_offset, filesz: p_filesz, memsz: p_memsz, prot };
             img.n_segments += 1;
         }
         if img.n_segments == 0 {
@@ -215,7 +229,7 @@ impl<'a> Image<'a> {
             let ph = e_phoff + i * e_phentsize;
             let p_type = u32::from_le_bytes([data[ph as usize], data[ph as usize + 1], data[ph as usize + 2], data[ph as usize + 3]]);
             if p_type == PT_PHDR {
-                img.phdr_va = rd(ph as usize + 16);
+                img.phdr_va = rd(ph as usize + 16) + base;
                 break;
             }
         }
@@ -822,6 +836,109 @@ pub mod nr {
     /// `exit_group(2)` — musl's `exit(3)` calls this.
     pub const EXIT_GROUP: u64 = 231;
 
+    // -- Stage 6, phase A: what apk.static needs to start (all x86_64
+    // -- numbers; the aarch64 crate keeps the generic numbering).
+
+    /// `fstat(2)` — x86_64's legacy number (aarch64 uses 80).
+    pub const FSTAT: u64 = 5;
+    /// `lseek(2)` — x86_64's legacy number (aarch64: 62).
+    pub const LSEEK: u64 = 8;
+    /// `uname(2)` (aarch64: 160).
+    pub const UNAME: u64 = 63;
+    /// `getcwd(2)` (aarch64: 17).
+    pub const GETCWD: u64 = 79;
+    /// `dup(2)` (aarch64: 23).
+    pub const DUP: u64 = 32;
+    /// `flock(2)` — stub: success, nothing locks (one task).
+    pub const FLOCK: u64 = 73;
+    /// `umask(2)` — stub: reports the conventional `0o022`.
+    pub const UMASK: u64 = 95;
+    /// `mremap(2)` — musl `realloc` on mmapped chunks.
+    pub const MREMAP: u64 = 25;
+    /// `statfs(2)` (aarch64: 43).
+    pub const STATFS: u64 = 137;
+    /// `fstatfs(2)` (aarch64: 44) — apk treats ENOSYS here as "forbidden".
+    pub const FSTATFS: u64 = 138;
+    /// `fchmod(2)` — stub: root's mode is the mode.
+    pub const FCHMOD: u64 = 91;
+
+    // -- Stage 6, phase C: unpack + commit (the *at family, x86_64).
+
+    /// `mkdirat(2)` (aarch64: 34).
+    pub const MKDIRAT: u64 = 258;
+    /// `newfstatat(2)` — musl's stat()/fstatat() on x86_64 (aarch64: 79).
+    pub const NEWFSTATAT: u64 = 262;
+    /// `unlinkat(2)` (aarch64: 35).
+    pub const UNLINKAT: u64 = 263;
+    /// `renameat(2)` (aarch64: 38).
+    pub const RENAMEAT: u64 = 264;
+    /// `linkat(2)` — apk 3 prefers it for hard-linked package files.
+    pub const LINKAT: u64 = 265;
+    /// `symlinkat(2)` (aarch64: 36).
+    pub const SYMLINKAT: u64 = 266;
+    /// `readlinkat(2)` (aarch64: 78).
+    pub const READLINKAT: u64 = 267;
+    /// `fchmodat(2)` — stub like `FCHMOD`.
+    pub const FCHMODAT: u64 = 268;
+    /// `fchownat(2)` — stub: everything is root already.
+    pub const FCHOWNAT: u64 = 260;
+    /// `faccessat(2)` (aarch64: 48).
+    pub const FACCESSAT: u64 = 269;
+
+    // -- Stage 6 checklist: numbers the unhandled arm may still print, named
+    // -- so a boot log reads as a plan. Most have no arm yet.
+
+    /// `poll(2)` (ppoll is 271).
+    pub const POLL: u64 = 7;
+    /// `dup2(2)` (dup3 is 292).
+    pub const DUP2: u64 = 33;
+    /// `dup3(2)`.
+    pub const DUP3: u64 = 292;
+    /// `nanosleep` shares 35; `select(2)`.
+    pub const SELECT_PSELECT6: u64 = 23;
+    /// `sched_yield(2)`.
+    pub const SCHED_YIELD: u64 = 24;
+    /// `sendmsg(2)`.
+    pub const SENDMSG: u64 = 46;
+    /// `recvmsg(2)`.
+    pub const RECVMSG: u64 = 47;
+    /// `clone(2)` — phase D contingency (install scripts).
+    pub const CLONE: u64 = 56;
+    /// `execve(2)` — phase D contingency.
+    pub const EXECVE: u64 = 59;
+    /// `wait4(2)` — phase D contingency.
+    pub const WAIT4: u64 = 61;
+    /// `chdir(2)` (fchdir is 81).
+    pub const CHDIR: u64 = 80;
+    /// `fchdir(2)`.
+    pub const FCHDIR: u64 = 81;
+    /// `getrusage(2)`.
+    pub const GETRUSAGE: u64 = 98;
+    /// `sysinfo(2)`.
+    pub const SYSINFO: u64 = 99;
+    /// `sigaltstack(2)`.
+    pub const SIGALTSTACK: u64 = 131;
+    /// `pipe2(2)` — phase D contingency.
+    pub const PIPE2: u64 = 293;
+    /// `futex(2)`.
+    pub const FUTEX: u64 = 202;
+    /// `getsockname(2)`.
+    pub const GETSOCKNAME: u64 = 51;
+    /// `getpeername(2)`.
+    pub const GETPEERNAME: u64 = 52;
+    /// `setsockopt(2)`.
+    pub const SETSOCKOPT: u64 = 54;
+    /// `getsockopt(2)`.
+    pub const GETSOCKOPT: u64 = 55;
+    /// `set_robust_list(2)` — tolerated ENOSYS by sshd already.
+    pub const SET_ROBUST_LIST: u64 = 273;
+    /// `prlimit64(2)`.
+    pub const PR_LIMIT64: u64 = 302;
+    /// `kill(2)`.
+    pub const KILL: u64 = 62;
+    /// `utimensat(2)`.
+    pub const UTIMENSAT: u64 = 88;
+
     // -- Stage 4: the socket family, the clock arms sshd's loop sleeps in,
     // -- and Akuma's private syscalls (0x1000 base on x86_64 — 300 is
     // -- `getcpu` here, so the AArch64 offsets cannot be reused; see
@@ -863,15 +980,26 @@ pub mod nr {
     pub const WAITPID: u64 = AKUMA_PRIVATE_BASE + 303;
     /// Akuma CLOSE_CHILD_STDIN: deliver EOF to a spawned child's stdin.
     pub const CLOSE_CHILD_STDIN: u64 = AKUMA_PRIVATE_BASE + 326;
+    /// Akuma UPTIME: boot-relative time (libakuma's sshd/sh ask for it; the
+    /// aarch64 offsets cannot be reused below 0x1000+301 on x86_64).
+    pub const UPTIME: u64 = AKUMA_PRIVATE_BASE + 319;
 }
 
 /// `openat(2)` flag bits (x86_64) and `dirfd` special values.
 pub mod open {
+    /// `O_RDONLY` — 0, the only access mode a read-only root used to serve.
+    pub const O_RDONLY: u64 = 0;
     /// `O_ACCMODE` mask: `O_RDONLY` is 0 — the only access mode the
     /// read-only-in-spirit root serves.
     pub const O_ACCMODE: u64 = 0b11;
-    /// `O_CREAT` — rejected: no write path exists on the root.
+    /// `O_WRONLY` — served once the root grew a write path (stage 6).
+    pub const O_WRONLY: u64 = 0b01;
+    /// `O_RDWR`.
+    pub const O_RDWR: u64 = 0b10;
+    /// `O_CREAT` — create when missing (stage 6: the root writes).
     pub const O_CREAT: u64 = 0x40;
+    /// `O_TRUNC` — empty an existing file on open.
+    pub const O_TRUNC: u64 = 0x200;
     /// `O_DIRECTORY` — the caller wants a directory; anything else is
     /// `ENOTDIR`.
     pub const O_DIRECTORY: u64 = 0x1_0000;
@@ -880,6 +1008,12 @@ pub mod open {
     pub const O_CLOEXEC: u64 = 0x8_0000;
     /// `AT_FDCWD`: the only `dirfd` this kernel serves (absolute paths only).
     pub const AT_FDCWD: u64 = (-100i64) as u64;
+    /// `AT_SYMLINK_NOFOLLOW` — `newfstatat`'s lstat mode.
+    pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    /// `AT_REMOVEDIR` — `unlinkat` removing a directory.
+    pub const AT_REMOVEDIR: u64 = 0x200;
+    /// `AT_EMPTY_PATH` — operate on the `dirfd` itself.
+    pub const AT_EMPTY_PATH: u64 = 0x1000;
 }
 
 /// errno values, negated on return.
@@ -928,6 +1062,16 @@ pub mod err {
     pub const EAFNOSUPPORT: u64 = 47;
     /// Socket operation on a non-socket (an fd that is not a socket fd).
     pub const ENOTSOCK: u64 = 88;
+    /// File exists (`O_CREAT`/`mkdirat` on a path that is already there).
+    pub const EEXIST: u64 = 17;
+    /// Illegal seek (`lseek` on a pipe/socket fd).
+    pub const ESPIPE: u64 = 29;
+    /// Directory not empty (`unlinkat AT_REMOVEDIR` on a full directory).
+    pub const ENOTEMPTY: u64 = 39;
+    /// No space left on the device.
+    pub const ENOSPC: u64 = 28;
+    /// Cross-device link (`rename`/`link` across mounts — one mount here).
+    pub const EXDEV: u64 = 18;
 }
 
 /// `arch_prctl(2)` requests, x86_64.

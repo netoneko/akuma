@@ -497,9 +497,12 @@ fn banner() {
 /// places. 16 pages — far more than musl's startup touches, and cheap.
 const USER_STACK_TOP: u64 = 0x0000_7000_0000_0000;
 const USER_STACK_PAGES: u64 = 16;
-/// `brk` and anonymous `mmap` each get a fixed 1 MiB slab, registered as user
-/// regions up front so every user-pointer check is one range scan.
-const SLAB: u64 = 0x0010_0000;
+/// `brk` and anonymous `mmap` each get a fixed slab, registered as user
+/// regions up front so every user-pointer check is one range scan. Stage 6:
+/// 64 MiB each — apk.static's musl heap (realloc→mremap traffic) blew past
+/// the old 1 MiB on the aarch64 bring-up; the cost is only pages actually
+/// touched, and the range is far from PIE code (`PIE_BASE`) and the stack.
+const SLAB: u64 = 0x0400_0000;
 const MMAP_BASE: u64 = 0x0000_6000_0000_0000;
 /// Cap on one `write(2)`: the console is a serial line, not a disk.
 const WRITE_LIMIT: u64 = 1 << 20;
@@ -511,16 +514,19 @@ const WRITE_LIMIT: u64 = 1 << 20;
 const SLOT_CEILING: u32 = 16;
 
 /// One open description: what an fd in the table names. A directory caches
-/// its `read_dir` listing at open time (this kernel's `getdents64` serves the
-/// cache; the ext2 root is read-only in spirit, so the listing cannot go
-/// stale behind the task's back), with the cursor the next `getdents64`
-/// resumes from. A regular file carries the inode number and its own cursor.
-/// Paths are not kept: nothing at this stage resolves through an fd.
+/// its `read_dir` listing at open time (this kernel's `getdents64`
+/// serves the cache; the ext2 root's listing cannot go stale behind the
+/// task's back), with the cursor the next `getdents64` resumes from, and —
+/// stage 6 — the directory's path, because apk opens a directory and then
+/// passes its fd to `openat`/`renameat` for dirfd-relative resolution.
+/// A regular file carries the inode number and its own cursor. Paths are not
+/// kept on files: an fd-relative *write* target names a directory fd.
 /// Stage 4 adds the two non-file kinds the sshd stage needs: a socket (the
 /// index into `akuma-net`'s socket table) and a spawned child's stdout (the
 /// index into `child.rs`'s spawn slots — the "pipe" of the child model).
 enum OpenFile {
     Dir {
+        path: alloc::string::String,
         entries: Vec<akuma_vfs::DirEntry>,
         cursor: usize,
     },
@@ -771,9 +777,6 @@ fn emit(buf_va: u64, len: u64) -> bool {
 /// read-only access only: the root is read-only in spirit and this kernel has
 /// no write path to lie about.
 fn open_common(path_va: u64, flags: u64) -> u64 {
-    if flags & ring3::open::O_ACCMODE != 0 || flags & ring3::open::O_CREAT != 0 {
-        return e(ring3::err::EACCES);
-    }
     let mut pbuf = [0u8; 128];
     let Some(path) = user_str(path_va, &mut pbuf) else {
         return e(ring3::err::EFAULT);
@@ -781,25 +784,61 @@ fn open_common(path_va: u64, flags: u64) -> u64 {
     if !path.starts_with('/') {
         return e(ring3::err::ENOENT); // nothing to resolve ".." against
     }
-    // Stage 4: symlinks resolve (`/bin/sh` is one).
-    let path = &resolve_effective(path);
+    // Stage 6: write access is served — apk unpacks with O_WRONLY|O_CREAT|
+    // O_TRUNC. The description is an ext2 lookup (or create) — no VFS mount
+    // table, one root.
+    let acc = flags & ring3::open::O_ACCMODE;
+    // Stage 4: symlinks resolve (`/bin/sh` is one). A fresh O_CREAT file has
+    // no links to resolve; `resolve_effective` passes such a path through.
+    let path = resolve_effective(path);
     let fs = root_fs();
-    let Ok(md) = fs.metadata(path) else {
-        return e(ring3::err::ENOENT);
+    let md = match fs.metadata(&path) {
+        Ok(md) => Some(md),
+        Err(_) if flags & ring3::open::O_CREAT != 0 && acc != ring3::open::O_RDONLY => {
+            // Create empty; the fd's writes fill it. `write_file` on a
+            // missing path allocates the inode and the directory entry.
+            match fs.write_file(&path, &[]) {
+                Ok(()) => fs.metadata(&path).ok(),
+                Err(_) => return e(ring3::err::EACCES),
+            }
+        }
+        Err(_) => return e(ring3::err::ENOENT),
     };
-    if !md.is_dir && flags & ring3::open::O_DIRECTORY != 0 {
+    let Some(md) = md else { return e(ring3::err::EIO) };
+    if md.is_dir {
+        if acc != ring3::open::O_RDONLY {
+            return e(ring3::err::EISDIR);
+        }
+        if flags & ring3::open::O_DIRECTORY == 0 {
+            // a directory opened for reading without O_DIRECTORY is still a
+            // directory; Linux allows it (getdents on it works)
+        }
+    } else if flags & ring3::open::O_DIRECTORY != 0 {
         return e(ring3::err::ENOTDIR);
     }
     let desc = if md.is_dir {
         // The listing is the open description's payload: `getdents64`
         // serves the cache, the root cannot change behind the task.
-        match fs.read_dir(path) {
-            Ok(entries) => OpenFile::Dir { entries, cursor: 0 },
+        match fs.read_dir(&path) {
+            Ok(entries) => {
+                OpenFile::Dir { path, entries, cursor: 0 }
+            }
             Err(_) => return e(ring3::err::EIO),
         }
     } else {
-        match fs.resolve_inode(path) {
-            Ok(inode) => OpenFile::File { inode, offset: 0, size: md.size },
+        match fs.resolve_inode(&path) {
+            Ok(inode) => {
+                let mut size = md.size;
+                if flags & ring3::open::O_TRUNC != 0 && acc != ring3::open::O_RDONLY {
+                    // ftruncate-to-zero at open: the writes that follow
+                    // expect to start from an empty file.
+                    if fs.truncate_by_inode(inode, 0).is_err() {
+                        return e(ring3::err::EIO);
+                    }
+                    size = 0;
+                }
+                OpenFile::File { inode, offset: 0, size }
+            }
             Err(_) => return e(ring3::err::EIO),
         }
     };
@@ -814,11 +853,331 @@ fn open_common(path_va: u64, flags: u64) -> u64 {
     u64::from(fd)
 }
 
+/// Stage 6, phase A: write a task buffer into the open file fd. Chunks
+/// through the staging buffer the `read` arm uses; the ext2 write path
+/// (`write_at_by_inode`) extends the file as the offset passes its end, and
+/// the fd's size/cursor follow the bytes that landed.
+fn write_file_arm(fd: u64, buf: u64, len: u64) -> u64 {
+    let mut chunk = [0u8; 1024];
+    let mut total = 0u64;
+    let mut res: Result<u64, u64> = Ok(0);
+    let found = fd_table().update(fd as u32, |of| {
+        let OpenFile::File { inode, offset, size } = of else {
+            res = Err(ring3::err::EBADF);
+            return;
+        };
+        let mut done = 0u64;
+        while done < len {
+            let want = ((len - done) as usize).min(chunk.len());
+            if !copy_from_user(&mut chunk[..want], buf + done) {
+                res = Err(ring3::err::EFAULT);
+                return;
+            }
+            match root_fs().write_at_by_inode(*inode, (*offset + done) as usize, &chunk[..want]) {
+                Ok(n) if n > 0 => {
+                    *offset += n as u64;
+                    *size = (*size).max(*offset);
+                    done += n as u64;
+                    total += n as u64;
+                    if (n as usize) < want {
+                        break; // short write: stop where the disk stopped
+                    }
+                }
+                _ => {
+                    res = Err(ring3::err::EIO);
+                    return;
+                }
+            }
+        }
+        res = Ok(total);
+    });
+    match (found, res) {
+        (false, _) => e(ring3::err::EBADF),
+        (_, Err(no)) => e(no),
+        (_, Ok(n)) => n,
+    }
+}
+
+/// Stage 6: dirfd-relative path resolution. Absolute paths pass through; a
+/// relative path resolves against an open directory fd's path (apk opens the
+/// db / cache directory and then passes its fd to `openat`/`renameat`); a
+/// relative path at `AT_FDCWD` resolves against `/` — this kernel has no
+/// working directory, and every task it boots runs at the root. `None` means
+/// the caller sees `EBADF` (a non-directory fd where a dirfd was required).
+fn resolve_at(dirfd: u64, path: &str) -> Option<alloc::string::String> {
+    if path.starts_with('/') {
+        return Some(alloc::string::String::from(path));
+    }
+    if dirfd == ring3::open::AT_FDCWD {
+        return Some(alloc::format!("/{}", path));
+    }
+    let dir = fd_table().with(dirfd as u32, |d| match d {
+        OpenFile::Dir { path, .. } => Some(path.clone()),
+        _ => None,
+    })??;
+    Some(alloc::format!("{}/{}", dir.trim_end_matches('/'), path))
+}
+
+/// Pull a NUL-terminated path out of the task, resolve it through a dirfd,
+/// and hand it to `f`. `EBADF` for a non-directory dirfd, `EFAULT` for a bad
+/// task pointer. The `at` family's shared front half.
+fn path_at(path_arg: u64, dirfd: u64, f: impl FnOnce(&str) -> u64) -> u64 {
+    let mut pbuf = [0u8; 128];
+    let Some(path) = user_str(path_arg, &mut pbuf) else {
+        return e(ring3::err::EFAULT);
+    };
+    if path.is_empty() {
+        return e(ring3::err::ENOENT);
+    }
+    let Some(full) = resolve_at(dirfd, path) else {
+        return e(ring3::err::EBADF);
+    };
+    f(&full)
+}
+
+/// `stat` semantics over a fully-resolved path (symlinks followed by the
+/// caller's `resolve_effective`).
+fn stat_path(path: &str, buf: u64) -> u64 {
+    match root_fs().metadata(path) {
+        Ok(md) => match fill_stat64(
+            buf,
+            md.inode,
+            md.mode,
+            md.size,
+            u64::from(md.links.unwrap_or(if md.is_dir { 2 } else { 1 })),
+        ) {
+            Ok(()) => 0,
+            Err(no) => e(no),
+        },
+        Err(_) => e(ring3::err::ENOENT),
+    }
+}
+
+/// `lstat` semantics: the final component is looked up in its parent's
+/// listing instead of followed, so a symlink names itself (mode
+/// `S_IFLNK`, the link's own size). Same shape as the `LSTAT` arm.
+fn lstat_path(path: &str, buf: u64) -> u64 {
+    let Some(idx) = path.rfind('/') else {
+        return e(ring3::err::ENOENT);
+    };
+    let (parent, name) = (&path[..idx.max(1)], &path[idx + 1..]);
+    if name.is_empty() {
+        stat_path(path, buf)
+    } else {
+        let fs = root_fs();
+        let Ok(entries) = fs.read_dir(parent) else {
+            return e(ring3::err::ENOENT);
+        };
+        let Some(ent) = entries.iter().find(|e| e.name == name) else {
+            return e(ring3::err::ENOENT);
+        };
+        let mode = if ent.is_symlink {
+            0o120777 // S_IFLNK | rwxrwxrwx: the convention for links
+        } else if ent.is_dir {
+            0o40755
+        } else {
+            0o100644
+        };
+        match fill_stat64(buf, 0, mode, ent.size, if ent.is_dir { 2 } else { 1 }) {
+            Ok(()) => 0,
+            Err(no) => e(no),
+        }
+    }
+}
+
+/// Fill the x86_64 `struct statfs` (120 bytes): ext2's magic `0xEF53` and
+/// plausible counts — aarch64 measured that `ENOSYS` here made apk treat
+/// later operations as forbidden, so this arm must exist and look sane.
+fn fill_statfs(buf: u64) -> u64 {
+    if !user_ok(buf, 120) {
+        return e(ring3::err::EFAULT);
+    }
+    let mut s = [0u8; 120];
+    let mut w = |i: usize, v: u64| s[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    w(0, 0xEF53); // f_type
+    w(1, 4096); // f_bsize
+    w(2, 4096); // f_blocks (16 MiB / 4 KiB)
+    w(3, 2053); // f_bfree — the fresh image's free-block count
+    w(4, 2053); // f_bavail
+    w(5, 4096); // f_files
+    w(6, 2048); // f_ffree
+    // f_fsid (slot 7) stays zero; nothing reads it.
+    w(8, 255); // f_namelen
+    w(9, 4096); // f_frsize
+    w(10, 0); // f_flags: not read-only — this root writes now
+    if !copy_to_user(buf, &s) {
+        return e(ring3::err::EFAULT);
+    }
+    0
+}
+
+/// `fstat` for an fd of any kind: files carry their inode (real mode from
+/// the on-disk inode), directories get the conventional 0o40755, the two
+/// non-fs kinds (socket, child stdout) get a plausible pipe-ish mode.
+fn fstat_fd(fd: u64, buf: u64) -> u64 {
+    if !user_ok(buf, 144) {
+        return e(ring3::err::EFAULT);
+    }
+    if fd <= 2 || fd as u32 >= SLOT_CEILING {
+        return e(ring3::err::EBADF);
+    }
+    let info = fd_table().with(fd as u32, |d| match d {
+        OpenFile::File { inode, size, .. } => Some((*inode as u64, *size, 0u8)),
+        OpenFile::Dir { .. } => Some((0, 0, 1)),
+        _ => Some((0, 0, 2)),
+    });
+    let Some(Some((inode, size, kind))) = info else {
+        return e(ring3::err::EBADF);
+    };
+    let (mode, links) = match kind {
+        0 => match root_fs().metadata_by_inode(inode as u32) {
+            Ok(md) => (md.mode, u64::from(md.links.unwrap_or(1))),
+            Err(_) => (0o100644, 1),
+        },
+        1 => (0o40755, 2),
+        _ => (0o100600, 1),
+    };
+    match fill_stat64(buf, inode, mode, size, links) {
+        Ok(()) => 0,
+        Err(no) => e(no),
+    }
+}
+
+/// A fresh open description equal to `d` — `dup(2)`'s copy. The offset is
+/// *copied*, not shared (the table stores descriptions by value); nothing in
+/// the apk path reads through two fds sharing one offset.
+fn clone_desc(d: &OpenFile) -> Option<OpenFile> {
+    match d {
+        OpenFile::File { inode, offset, size } => {
+            Some(OpenFile::File { inode: *inode, offset: *offset, size: *size })
+        }
+        OpenFile::Dir { path, entries, cursor } => Some(OpenFile::Dir {
+            path: path.clone(),
+            entries: entries.clone(),
+            cursor: *cursor,
+        }),
+        OpenFile::Socket(i) => Some(OpenFile::Socket(*i)),
+        OpenFile::ChildOut(i) => Some(OpenFile::ChildOut(*i)),
+    }
+}
+
+/// Map the shared crate's `FsError` onto the errno the syscall arm returns.
+fn fs_err(err: akuma_vfs::FsError) -> u64 {
+    use akuma_vfs::FsError as F;
+    match err {
+        F::NotFound | F::NotInitialized => ring3::err::ENOENT,
+        F::AlreadyExists => ring3::err::EEXIST,
+        F::NotADirectory => ring3::err::ENOTDIR,
+        F::NotAFile => ring3::err::EISDIR,
+        F::DirectoryNotEmpty => ring3::err::ENOTEMPTY,
+        F::PermissionDenied | F::ReadOnly => ring3::err::EACCES,
+        F::InvalidPath => ring3::err::EINVAL,
+        F::NoSpace => ring3::err::ENOSPC,
+        F::TooManyOpenFiles => ring3::err::EMFILE,
+        F::CrossDevice => ring3::err::EXDEV,
+        _ => ring3::err::EIO,
+    }
+}
+
+/// Reverse-map a syscall number to its name, for the unhandled arm — each
+/// boot then reads as a checklist instead of a table of bare numbers.
+fn nr_name(nr: u64) -> &'static str {
+    match nr {
+        ring3::nr::READ => "read",
+        ring3::nr::WRITE => "write",
+        ring3::nr::OPEN => "open",
+        ring3::nr::CLOSE => "close",
+        ring3::nr::STAT => "stat",
+        ring3::nr::FSTAT => "fstat",
+        ring3::nr::LSTAT => "lstat",
+        ring3::nr::LSEEK => "lseek",
+        ring3::nr::MMAP => "mmap",
+        ring3::nr::MPROTECT => "mprotect",
+        ring3::nr::MUNMAP => "munmap",
+        ring3::nr::MREMAP => "mremap",
+        ring3::nr::BRK => "brk",
+        ring3::nr::IOCTL => "ioctl",
+        ring3::nr::POLL => "poll/ppoll",
+        ring3::nr::DUP => "dup",
+        ring3::nr::NANOSLEEP => "nanosleep",
+        ring3::nr::GETPID => "getpid",
+        ring3::nr::UNAME => "uname",
+        ring3::nr::FLOCK => "flock",
+        ring3::nr::FCNTL => "fcntl",
+        ring3::nr::FCHMOD => "fchmod",
+        ring3::nr::FCHOWNAT => "fchownat",
+        ring3::nr::UMASK => "umask",
+        ring3::nr::GETTIMEOFDAY => "gettimeofday",
+        ring3::nr::GETRUSAGE => "getrusage",
+        ring3::nr::GETCWD => "getcwd",
+        ring3::nr::READLINKAT => "readlinkat",
+        ring3::nr::SYSINFO => "sysinfo",
+        ring3::nr::FSTATFS => "fstatfs",
+        ring3::nr::STATFS => "statfs",
+        ring3::nr::UNLINKAT => "unlinkat",
+        ring3::nr::LINKAT => "linkat",
+        ring3::nr::SYMLINKAT => "symlinkat",
+        ring3::nr::RENAMEAT => "renameat",
+        ring3::nr::UTIMENSAT => "utimensat",
+        ring3::nr::MKDIRAT => "mkdirat",
+        ring3::nr::SOCKET => "socket",
+        ring3::nr::CONNECT => "connect",
+        ring3::nr::ACCEPT => "accept",
+        ring3::nr::SENDTO => "sendto",
+        ring3::nr::RECVFROM => "recvfrom",
+        ring3::nr::SENDMSG => "sendmsg",
+        ring3::nr::RECVMSG => "recvmsg",
+        ring3::nr::SHUTDOWN => "shutdown",
+        ring3::nr::BIND => "bind",
+        ring3::nr::LISTEN => "listen",
+        ring3::nr::GETSOCKNAME => "getsockname",
+        ring3::nr::GETPEERNAME => "getpeername",
+        ring3::nr::SETSOCKOPT => "setsockopt",
+        ring3::nr::GETSOCKOPT => "getsockopt",
+        ring3::nr::CLONE => "clone",
+        ring3::nr::EXECVE => "execve",
+        ring3::nr::EXIT => "exit",
+        ring3::nr::WAIT4 => "wait4",
+        ring3::nr::KILL => "kill",
+        ring3::nr::RT_SIGACTION => "rt_sigaction",
+        ring3::nr::RT_SIGPROCMASK => "rt_sigprocmask",
+        ring3::nr::PIPE2 => "pipe2",
+        ring3::nr::SELECT_PSELECT6 => "select/pselect6",
+        ring3::nr::SCHED_YIELD => "sched_yield",
+        ring3::nr::SET_TID_ADDRESS => "set_tid_address",
+        ring3::nr::GETDENTS64 => "getdents64",
+        ring3::nr::GETRANDOM => "getrandom",
+        ring3::nr::FACCESSAT => "faccessat",
+        ring3::nr::NEWFSTATAT => "newfstatat",
+        ring3::nr::CLOCK_GETTIME => "clock_gettime",
+        ring3::nr::CLOCK_NANOSLEEP => "clock_nanosleep",
+        ring3::nr::EXIT_GROUP => "exit_group",
+        ring3::nr::OPENAT => "openat",
+        ring3::nr::ARCH_PRCTL => "arch_prctl",
+        ring3::nr::GETTID => "gettid",
+        ring3::nr::SET_ROBUST_LIST => "set_robust_list",
+        ring3::nr::GETUID => "getuid",
+        ring3::nr::GETGID => "getgid",
+        ring3::nr::GETEUID => "geteuid",
+        ring3::nr::GETEGID => "getegid",
+        ring3::nr::GETPPID => "getppid",
+        ring3::nr::PR_LIMIT64 => "prlimit64",
+        ring3::nr::SIGALTSTACK => "sigaltstack",
+        ring3::nr::FUTEX => "futex",
+        ring3::nr::FCHDIR => "fchdir",
+        ring3::nr::CHDIR => "chdir",
+        ring3::nr::DUP2 | ring3::nr::DUP3 => "dup2/dup3",
+        ring3::nr::WAITPID => "akuma-waitpid",
+        ring3::nr::CLOSE_CHILD_STDIN => "akuma-close-child-stdin",
+        ring3::nr::UPTIME => "akuma-uptime",
+        _ => "?",
+    }
+}
+
 /// Fill the x86_64 `struct stat` (144 bytes) at the task's `buf`: device
 /// numbers and all times zero (one disk, no clock), the rest from the
 /// arguments. `Err(errno)` on a bad task pointer.
-fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result<(), u64> {
-    if !user_ok(buf, 144) {
+fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result<(), u64> {    if !user_ok(buf, 144) {
         return Err(ring3::err::EFAULT);
     }
     let mut st = [0u8; 144];
@@ -863,13 +1222,19 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
                 return len;
             }
-            // The only other writable kind is a socket fd (sock.rs answers
+            // The only other writable kinds: a socket fd (sock.rs answers
             // ENOTSOCK for anything else that is open, EBADF comes from the
-            // get below).
-            let is_sock =
-                fd_table().with(fd as u32, |d| matches!(d, OpenFile::Socket(_))).unwrap_or(false);
-            if is_sock {
-                return sock::write_arm(fd, buf, len);
+            // get below) and — stage 6 — a regular file fd (the ext2 write
+            // path; apk unpacks through this).
+            let kind = fd_table().with(fd as u32, |d| match d {
+                OpenFile::Socket(_) => 1,
+                OpenFile::File { .. } => 2,
+                _ => 0,
+            });
+            match kind {
+                Some(1) => return sock::write_arm(fd, buf, len),
+                Some(2) => return write_file_arm(fd, buf, len),
+                _ => {}
             }
             e(ring3::err::EBADF)
         }
@@ -971,11 +1336,12 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     0
                 }
                 other => {
-            // Name the gap: a stage-3 task (busybox) will hit numbers this
-            // table does not serve, and the console should say which.
-            akuma_primitives::safe_print!(160, "  [sc] unhandled nr {}\n", other);
-            e(ring3::err::ENOSYS)
-        }
+                    // Name the gap: an arch code this table does not serve.
+                    // (The *syscall-level* checklist arm is at the bottom of
+                    // the dispatcher's own match.)
+                    akuma_primitives::safe_print!(160, "  [sc] arch_prctl code {}\n", other);
+                    e(ring3::err::ENOSYS)
+                }
             }
         }
         ring3::nr::SET_TID_ADDRESS => 1, // one task: the tid, and nothing to clear
@@ -1289,7 +1655,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let mut used = 0usize;
             let mut res: Result<(), u64> = Ok(());
             let found = fd_table().update(fd as u32, |of| match of {
-                OpenFile::Dir { entries, cursor } => {
+                OpenFile::Dir { path: _, entries, cursor } => {
                     let cap = (len as usize).min(scratch.len());
                     while *cursor < entries.len() {
                         let ent = &entries[*cursor];
@@ -1409,8 +1775,288 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             len
         }
-        ring3::nr::SOCKET => sock::socket_arm(fr.arg1(), fr.arg2(), fr.arg3()),
-        ring3::nr::BIND => sock::bind_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        // ---- Stage 6, phase A: apk.static startup ----------------------
+        ring3::nr::FSTAT => fstat_fd(fr.arg1(), fr.arg2()),
+        ring3::nr::NEWFSTATAT => {
+            // musl's stat()/fstatat() on x86_64: the *at number for all of
+            // them. Follows the final symlink unless AT_SYMLINK_NOFOLLOW.
+            let (dirfd, path_va, buf, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
+            if !user_ok(buf, 144) {
+                return e(ring3::err::EFAULT);
+            }
+            let mut pbuf = [0u8; 128];
+            let Some(path) = user_str(path_va, &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            if path.is_empty() {
+                if flags & ring3::open::AT_EMPTY_PATH != 0 {
+                    return fstat_fd(dirfd, buf);
+                }
+                return e(ring3::err::ENOENT);
+            }
+            let Some(full) = resolve_at(dirfd, path) else {
+                return e(ring3::err::EBADF);
+            };
+            if flags & ring3::open::AT_SYMLINK_NOFOLLOW != 0 {
+                lstat_path(&full, buf)
+            } else {
+                stat_path(&resolve_effective(&full), buf)
+            }
+        }
+        ring3::nr::LSEEK => {
+            let (fd, off, whence) = (fr.arg1(), fr.arg2() as i64, fr.arg3());
+            if fd <= 2 || fd as u32 >= SLOT_CEILING {
+                return e(ring3::err::EBADF);
+            }
+            let mut res: Result<u64, u64> = Err(ring3::err::EBADF);
+            fd_table().update(fd as u32, |d| match d {
+                OpenFile::File { offset, size, .. } => {
+                    let base = match whence {
+                        0 => 0i64,            // SEEK_SET
+                        1 => *offset as i64,  // SEEK_CUR
+                        2 => *size as i64,    // SEEK_END
+                        _ => {
+                            res = Err(ring3::err::EINVAL);
+                            return;
+                        }
+                    };
+                    let next = base + off;
+                    if next < 0 {
+                        res = Err(ring3::err::EINVAL);
+                    } else {
+                        *offset = next as u64;
+                        res = Ok(*offset);
+                    }
+                }
+                OpenFile::Dir { entries, cursor, .. } => {
+                    // seekdir/rewinddir shape: only the cursor moves.
+                    match whence {
+                        0 => *cursor = 0,
+                        2 => *cursor = entries.len(),
+                        _ => {}
+                    }
+                    res = Ok(0);
+                }
+                _ => res = Err(ring3::err::ESPIPE),
+            });
+            match res {
+                Ok(v) => v,
+                Err(no) => e(no),
+            }
+        }
+        ring3::nr::UNAME => {
+            // struct utsname: six NUL-terminated 65-byte fields. The release
+            // string is a plausible Linux one — apk prints it, nothing
+            // branches on it.
+            let buf = fr.arg1();
+            if !user_ok(buf, 65 * 6) {
+                return e(ring3::err::EFAULT);
+            }
+            let fields: [&[u8]; 6] = [
+                b"Linux\0",
+                b"taoxichuan\0",
+                b"6.6.0-akuma\0",
+                b"#1 SMP akuma-taoxichuan\0",
+                b"x86_64\0",
+                b"(none)\0",
+            ];
+            for (i, f) in fields.iter().enumerate() {
+                let mut one = [0u8; 65];
+                one[..f.len()].copy_from_slice(f);
+                if !copy_to_user(buf + (i as u64) * 65, &one) {
+                    return e(ring3::err::EFAULT);
+                }
+            }
+            0
+        }
+        ring3::nr::STATFS => {
+            let mut pbuf = [0u8; 128];
+            let Some(path) = user_str(fr.arg1(), &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            if root_fs().metadata(&resolve_effective(path)).is_err() {
+                return e(ring3::err::ENOENT);
+            }
+            fill_statfs(fr.arg2())
+        }
+        ring3::nr::FSTATFS => fill_statfs(fr.arg2()),
+        ring3::nr::FACCESSAT => {
+            let (dirfd, mode) = (fr.arg1(), fr.arg3());
+            if mode > 7 {
+                return e(ring3::err::EINVAL);
+            }
+            // Root, one task, one disk: existence is the whole check.
+            path_at(fr.arg2(), dirfd, |p| match root_fs().metadata(p) {
+                Ok(_) => 0,
+                Err(_) => e(ring3::err::ENOENT),
+            })
+        }
+        ring3::nr::READLINKAT => {
+            // No final-component resolution: the ext2 read_symlink walks the
+            // link raw, which is exactly lstat-style.
+            let (dirfd, buf, bufsz) = (fr.arg1(), fr.arg3(), fr.arg4());
+            if bufsz == 0 || !user_ok(buf, bufsz) {
+                return e(ring3::err::EFAULT);
+            }
+            path_at(fr.arg2(), dirfd, |p| match root_fs().read_symlink(p) {
+                Ok(t) => {
+                    let bytes = t.as_bytes();
+                    let n = (bytes.len() as u64).min(bufsz);
+                    if !copy_to_user(buf, &bytes[..n as usize]) {
+                        return e(ring3::err::EFAULT);
+                    }
+                    n
+                }
+                Err(_) => e(ring3::err::EINVAL),
+            })
+        }
+        // ---- Stage 6, phase C: unpack + commit --------------------------
+        ring3::nr::MKDIRAT => {
+            // mode (arg3) is accepted and ignored: root owns everything.
+            path_at(fr.arg2(), fr.arg1(), |p| match root_fs().create_dir(p) {
+                Ok(()) => 0,
+                Err(no) => e(fs_err(no)),
+            })
+        }
+        ring3::nr::UNLINKAT => {
+            let (dirfd, flags) = (fr.arg1(), fr.arg4());
+            path_at(fr.arg2(), dirfd, |p| {
+                let r = if flags & ring3::open::AT_REMOVEDIR != 0 {
+                    root_fs().remove_dir(p)
+                } else {
+                    root_fs().remove_file(p)
+                };
+                match r {
+                    Ok(()) => 0,
+                    Err(no) => e(fs_err(no)),
+                }
+            })
+        }
+        ring3::nr::RENAMEAT => {
+            let (od, old_va, nd, new_va) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
+            let mut ob = [0u8; 128];
+            let mut nb = [0u8; 128];
+            let Some(old) = user_str(old_va, &mut ob) else {
+                return e(ring3::err::EFAULT);
+            };
+            let Some(new) = user_str(new_va, &mut nb) else {
+                return e(ring3::err::EFAULT);
+            };
+            let (Some(old), Some(new)) = (resolve_at(od, old), resolve_at(nd, new)) else {
+                return e(ring3::err::EBADF);
+            };
+            match root_fs().rename(&old, &new) {
+                Ok(()) => 0,
+                Err(no) => e(fs_err(no)),
+            }
+        }
+        ring3::nr::SYMLINKAT => {
+            let (target_va, dirfd, link_va) = (fr.arg1(), fr.arg2(), fr.arg3());
+            let mut tb = [0u8; 128];
+            let mut lb = [0u8; 128];
+            let Some(target) = user_str(target_va, &mut tb) else {
+                return e(ring3::err::EFAULT);
+            };
+            let Some(link) = user_str(link_va, &mut lb) else {
+                return e(ring3::err::EFAULT);
+            };
+            let Some(link) = resolve_at(dirfd, link) else {
+                return e(ring3::err::EBADF);
+            };
+            match root_fs().create_symlink(&link, target) {
+                Ok(()) => 0,
+                Err(no) => e(fs_err(no)),
+            }
+        }
+        ring3::nr::LINKAT => {
+            // No hardlink arm on the ext2 trait yet; apk only needs it for
+            // packages that ship hard-linked files. The checklist print
+            // above will say if this one is real.
+            e(ring3::err::ENOSYS)
+        }
+        ring3::nr::FCHMOD | ring3::nr::FCHMODAT => 0, // root's mode is the mode
+        ring3::nr::FCHOWNAT => 0,                    // everything is root already
+        ring3::nr::UMASK => 0o022,                   // conventional; no files inherit it
+        ring3::nr::FLOCK => 0,                       // one task: nothing contends
+        ring3::nr::GETCWD => {
+            let (buf, size) = (fr.arg1(), fr.arg2());
+            if size < 2 {
+                return e(ring3::err::ERANGE);
+            }
+            if !user_ok(buf, 2) {
+                return e(ring3::err::EFAULT);
+            }
+            if !copy_to_user(buf, b"/\0") {
+                return e(ring3::err::EFAULT);
+            }
+            2
+        }
+        ring3::nr::DUP => {
+            let fd = fr.arg1();
+            if fd <= 2 || fd as u32 >= SLOT_CEILING {
+                return e(ring3::err::EBADF);
+            }
+            let desc = fd_table().with(fd as u32, clone_desc);
+            let Some(Some(desc)) = desc else {
+                return e(ring3::err::EBADF);
+            };
+            let mut table = fd_table();
+            let Some(_slot) = table.free_below(3, SLOT_CEILING) else {
+                return e(ring3::err::EMFILE);
+            };
+            u64::from(table.alloc_fd_from(3, desc))
+        }
+        ring3::nr::MREMAP => {
+            // musl's realloc on an mmapped chunk. Shrink keeps the address
+            // (the slab never unmaps, so it stays valid); grow moves to a
+            // fresh region at the mmap cursor and copies the overlap —
+            // MAYMOVE semantics, which the caller accepts by using the
+            // returned address. MREMAP_FIXED is refused: no fixed targets.
+            let (old, old_sz, new_sz, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
+            if new_sz == 0 || flags & 2 != 0 {
+                return e(ring3::err::EINVAL);
+            }
+            if old_sz == 0 || !user_ok(old, old_sz) {
+                return e(ring3::err::EFAULT);
+            }
+            if new_sz <= old_sz {
+                return old;
+            }
+            let pages = (new_sz + 0xFFF) & !0xFFF;
+            let t = task();
+            let base = (t.mmap_cur + 0xF) & !0xF;
+            if base + pages > MMAP_BASE + SLAB {
+                return e(ring3::err::ENOMEM);
+            }
+            let mut page = base & !0xFFF;
+            while page < base + pages {
+                let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
+                    return e(ring3::err::ENOMEM);
+                };
+                if !paging::map_page_in(t.root_pa, page as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
+                    return e(ring3::err::ENOMEM);
+                }
+                page += 4096;
+            }
+            let copy = old_sz.min(new_sz);
+            let mut chunk = [0u8; 1024];
+            let mut done = 0u64;
+            while done < copy {
+                let n = ((copy - done) as usize).min(chunk.len());
+                if !copy_from_user(&mut chunk[..n], old + done)
+                    || !copy_to_user(base + done, &chunk[..n])
+                {
+                    return e(ring3::err::EFAULT);
+                }
+                done += n as u64;
+            }
+            t.mmap_cur = base + pages;
+            base
+        }
+        // Akuma private: libakuma's sshd/sh ask for uptime; the clock arm's
+        // elapsed-time source, in microseconds.
+        ring3::nr::UPTIME => net::uptime_us(),
+        ring3::nr::SOCKET => sock::socket_arm(fr.arg1(), fr.arg2(), fr.arg3()),        ring3::nr::BIND => sock::bind_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::LISTEN => sock::listen_arm(fr.arg1(), fr.arg2()),
         ring3::nr::ACCEPT => sock::accept_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::CONNECT => sock::connect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
@@ -1437,9 +2083,10 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             0
         }
         other => {
-            // Name the gap: a stage-3 task (busybox) will hit numbers this
-            // table does not serve, and the console should say which.
-            akuma_primitives::safe_print!(160, "  [sc] unhandled nr {}\n", other);
+            // Name the gap: a guest task hit a number this table does not
+            // serve. The name first, then the raw number — each boot reads
+            // as a checklist of exactly what is still missing.
+            akuma_primitives::safe_print!(160, "  [sc] unhandled {} ({})\n", nr_name(other), other);
             e(ring3::err::ENOSYS)
         }
     }
