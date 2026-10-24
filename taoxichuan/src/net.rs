@@ -340,7 +340,9 @@ pub fn netpoll() {
 /// start DHCP). Then the DHCP wait: bounded, pumping the NIC, so the guest
 /// has its address before init asks the socket layer for a port.
 pub fn net_init() -> bool {
+    akuma_primitives::safe_print!(96, "  net: [1] calibrate begin\n");
     calibrate();
+    akuma_primitives::safe_print!(96, "  net: [2] stack init begin\n");
     if akuma_net::init(runtime(), true).is_err() {
         akuma_comconsole::puts("  net: stack init failed -- no virtio-net device\n");
         return false;
