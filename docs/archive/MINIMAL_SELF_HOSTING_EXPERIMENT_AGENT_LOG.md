@@ -125,12 +125,12 @@ pushed before it stopped).
   root, ELF magic ok`; `Taoxichuan: stage 1 gate reached`; 0 `fault|panic|sig!`
   lines. The guest then halts with interrupts off, as a stage-1 kernel with no
   userspace should.
-- **Disagreement, recorded not averaged:** the generic harness verdict printed `[KVM]
-  akuma-vm guest: FAIL (banner=yes, init=no, net=no)`. That check looks for the
-  full Akuma init/net markers, which a stage-1 kernel never prints; the stage-1 gate
-  is the kernel's own `init spawn` line. Both facts stand; the stage is signed off
-  only when the harness is given a stage-1 expectation or the gate is re-run by
-  hand.
+- **The harness `FAIL` line is noise, not a finding.** `[KVM] akuma-vm guest: FAIL
+  (banner=yes, init=no, net=...)` is herd's marker check; the guest exits by design
+  and the line appears on clean main-kernel passes too (`AKUMA_KVM_DEV_CYCLE.md`,
+  task 00 row). Corrects an earlier version of this entry that called it a
+  disagreement. The stage-1 gate is the kernel's own `init spawn` line plus the
+  zero-fault grep.
 - **Stopped by quota, not by failure:** at 09:56 UTC z.ai answered `Usage limit
   reached for 5 hour. Your limit will reset at 2026-10-24 21:17:13` and the turn
   ended. No `RESULT.md` was written, and `taoxichuan/src/main.rs` has an
@@ -146,4 +146,23 @@ pushed before it stopped).
   applies to flash as well** (it is per account, not per model), so the new default
   can only be measured after the reset. Compare its tokens-per-stage against the
   16.1M input / 69k output above.
+
+#### Where goose stopped, and the main-kernel check (Sonnet, 10:35-10:45 UTC)
+
+- **Stopped at the paperwork, not mid-work.** Last moves (09:53-09:55): first boot
+  passed all three gate conditions; made the banner ASCII-only (the host console
+  relay turned UTF-8 into `???`), rebuilt, re-ran the gate clean, saved evidence to
+  `/root/dev-cycle/taoxichuan-s1/`, tore down (`vm-dev` stopped+disabled,
+  `vm-serve-mc` back). The next call (commit, log section, `RESULT.md`) hit the
+  quota. Uncommitted at the stop: the ASCII-banner edit in `taoxichuan/src/main.rs`.
+- **Main amd64 kernel after goose's boot-kit refactor: boots.** `kbuild -j 4
+  --features no-tests` at `43edbffc` (37 s incremental), installed to
+  `/boot/akuma-guest-dev` only, booted as a `kvm0` guest from a fresh copy of the
+  pristine root: `AKUMA-GUEST-UP`, `uname` build id `43edbffc`, `AKUMA-GUEST-DONE`
+  on the first poll, zero `[Fault]|PANIC|[sig!]`, host `dmesg` clean. Console saved
+  as `/root/dev-cycle/main-amd64-after-refactor.log`. `vm-serve-mc` restored.
+- **What this does not cover:** a `kvm0` guest enters by PVH. The refactor touched
+  `multiboot2.rs`, `boot.s` and the paging/phys code, whose GRUB/multiboot2 and
+  real-hardware path is not exercised by it. Needs the OVMF multiboot2 rig or a
+  metal boot before the refactor merges to the main amd64 line.
 
