@@ -85,11 +85,17 @@ build on the Mac for amd64. If the box does not answer, say so and wait; do not 
 ## Git
 
 You may commit and `git push origin rust-org-il-experiment`, and merge goose's `taoxichuan-s*`
-branches from `litter` into it after (or, for a fix-forward, before) the aarch64 check. Never
+branches from `litter` into it after (or, for a fix-forward, before) the aarch64 check. You may
+also push to `litter` (owner update 2026-10-24): e.g. to land goose's uncommitted work on its
+behalf when a quota cut strands it. Never
 `git reset`, `rebase`, `commit --amend` on pushed commits, force-push, or otherwise rewrite history, in
-this repo or any submodule. Do not push to `litter` (that is goose's remote) and do not touch the
+this repo or any submodule. Do not touch the
 dirty submodules (`userspace/rumpkernel/src-netbsd`, `userspace/tcc/tinycc`) or untracked `root/`.
 Commit messages end with the attribution line your tooling gives you, if any.
+
+Every brief tells goose to **commit and push to `litter` frequently** (after each sub-task, not
+only at the end): the stage-1 quota cut left its last edit uncommitted and the work had to be
+recovered by hand.
 
 ## Stop
 

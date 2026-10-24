@@ -64,7 +64,9 @@ to prove the merge did not break it.
 ## 4. Paperwork (the part that was left undone)
 
 1. Save the final gate console log to `/root/dev-cycle/taoxichuan-s1/vm-dev-pass.log`.
-2. Commit everything on `taoxichuan-s1` (small commits are fine) and `git push litter taoxichuan-s1`
+2. Commit **early and often** on `taoxichuan-s1` (commit after each numbered step, not only at the
+   end - last time the quota cut left an edit uncommitted and the supervisor had to recover it by
+   hand) and `git push litter taoxichuan-s1` after each commit
    (over 2 minutes: kill it and `git bundle create /root/dev-cycle/taoxichuan-s1.bundle taoxichuan-s1`,
    and say so).
 3. Append a dated `### Stage 1 - metal track (goose-glm), finish` section to
