@@ -166,3 +166,32 @@ pushed before it stopped).
   real-hardware path is not exercised by it. Needs the OVMF multiboot2 rig or a
   metal boot before the refactor merges to the main amd64 line.
 
+#### Metal verification (Sonnet, 10:46-10:50 UTC) — PASS, both kernels
+
+- **Main amd64 kernel on bare metal, after goose's boot-kit refactor: PASS.**
+  Installed the `43edbffc` build (md5 `22910843...`, the one that booted as a guest) to
+  `/boot/akuma-amd64.verify` only, after copying the old one to
+  `.verify.pre-taoxi`; the default "known good" kernel was not touched. Ran
+  `scripts/kvm/dev_cycle.py reboot-test --entry 29` (clean reboot, Akuma -> Pop -> GRUB
+  entry -> Akuma). Result: Pop returned, CMOS checksum OK (`05e8` = `05e8`), Akuma came
+  back with `uname` build id **`43edbffc`** on the ryzen's 8 cores (SVM enabled on
+  cpus 1-7, `kvmmem` 4096 MiB reserved, wifi up, CMOS RTC seeded), and `dmesg` has
+  zero `EXCEPTION|panic|[sig!]` lines. This is the GRUB/multiboot2 + real-hardware
+  path the PVH guest test could not cover; the refactor of `boot.s`,
+  `multiboot2.rs`, paging and phys is cleared on metal.
+- **Services after the reboot came back on their own:** `goose-glm` (first clean
+  start from boot, 0 restarts, `/health` 200, default model now `glm-5.3-flash`),
+  `vm-serve-mc`, `sshd`, `wifiauto`.
+- **Not tested on metal:** Taoxichuan itself. It is a PVH/virtio-mmio guest kernel
+  (kvm0/Firecracker), not a GRUB/metal kernel; its gates are the guest ones.
+- **aarch64 / Firecracker (host track), re-run on the pushed feature set:**
+  `scripts/build_taoxichuan_fc.sh` image (662,792 B) boots in Lima `fc`: ext2
+  mounted, `/bin/sshd` spawned by the kernel with no herd, 133 log lines, zero
+  `[Fault]|PANIC|[sig!]`. The image differs from the first build by bytes; the
+  kernel embeds the git id and HEAD moved. Not diffed further.
+- **Still open for stage 1:** goose's uncommitted ASCII-banner edit, its
+  `RESULT.md`, and a hand re-run of the Taoxichuan gate (after the quota resets at
+  13:17 UTC). The two tracks have passed the same gate on different architectures
+  (aarch64 + Firecracker by Sonnet, amd64 + Akuma KVM by goose), which is parity of
+  intent, not the same kernel.
+
