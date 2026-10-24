@@ -1255,6 +1255,7 @@ dependencies = [
  "akuma-idt-amd64",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-ring3-amd64",
  "akuma-ryzen-amd64",
  "akuma-trap-amd64",
  "akuma-vfs",
