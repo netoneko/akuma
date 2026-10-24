@@ -989,9 +989,12 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             if len == 0 {
                 return e(ring3::err::EINVAL);
             }
-            if flags & ring3::mmap::MAP_ANONYMOUS == 0 || fd != 0xFFFF_FFFF_FFFF_FFFF {
+            if flags & ring3::mmap::MAP_ANONYMOUS == 0 {
                 return e(ring3::err::ENODEV); // no file-backed mappings in this kernel
             }
+            // fd is ignored for MAP_ANONYMOUS (Linux semantics): libakuma's
+            // mmap wrapper passes fd = 0, and the full kernel accepts it, so
+            // demanding -1 here rejected sshd's very first allocation.
             let t = task();
             let pages = (len + 0xFFF) & !0xFFF;
             let base = if flags & ring3::mmap::MAP_FIXED != 0
