@@ -484,6 +484,12 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
                 Some(o) => ctrl::v_intr_extint(o.vector),
                 None => ctrl::V_INTR_MASKING,
             });
+            evring::push(
+                evring::ENTRY,
+                v.rflags(),
+                offered.map_or(0x100, |o| u64::from(o.vector)) | v.v_intr() << 16,
+                due.map_or(0, |d| d.saturating_sub(now)),
+            );
             if first {
                 v.set_tlb_control(ctrl::TLB_FLUSH_ALL);
                 first = false;
@@ -511,10 +517,12 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
 
         let mut v = Vmcb::new(vc.vmcb.bytes_mut());
         trace_exit(v.exitcode(), v.rip(), v.exitinfo1(), v.exitinfo2());
+        evring::push(evring::EXIT, v.rip(), v.exitcode() << 32 | (v.exitinfo1() & 0xffff_ffff), v.exitinfo2());
         // The INTA cycle: V_IRQ comes back cleared once the guest has dispatched the vector.
         if let Some(o) = offered
             && v.v_intr() & ctrl::V_IRQ == 0
         {
+            evring::push(evring::ACCEPT, u64::from(o.vector), 0, 0);
             with_plat(plat, |p| p.accept(id, o));
         }
         let code = ExitCode::from_u64(v.exitcode());
@@ -730,6 +738,7 @@ impl MmioDev for LapicDev<'_> {
     }
 
     fn store(&mut self, _size: u8, val: u64) {
+        evring::push(evring::LAPIC_W, self.off, val, self.now);
         self.lapic.write(self.off, val as u32, self.now);
     }
 }
@@ -787,6 +796,69 @@ fn idle(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, ev: &Events) -> Option
     }
 }
 
+/// The last `N` things the vCPU thread did, newest overwriting oldest, for the lost-interrupt hunt: what was
+/// offered and injected, what the guest exited for, and the LAPIC registers it wrote. Fixed statics, one writer
+/// (the vCPU thread), no allocation; dumped by [`idle_note`] when a guest halts with nothing that can wake it.
+mod evring {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+
+    const N: usize = 160;
+    const WORDS: usize = 4;
+    pub(super) const ENTRY: u8 = 1;
+    pub(super) const EXIT: u8 = 2;
+    pub(super) const LAPIC_W: u8 = 3;
+    pub(super) const ACCEPT: u8 = 4;
+
+    static RING: [AtomicU64; N * WORDS] = [const { AtomicU64::new(0) }; N * WORDS];
+    static HEAD: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn push(kind: u8, a: u64, b: u64, c: u64) {
+        let us = crate::net::uptime_us() & 0x00ff_ffff_ffff_ffff;
+        let at = HEAD.fetch_add(1, Relaxed) % N * WORDS;
+        RING[at].store(u64::from(kind) << 56 | us, Relaxed);
+        RING[at + 1].store(a, Relaxed);
+        RING[at + 2].store(b, Relaxed);
+        RING[at + 3].store(c, Relaxed);
+    }
+
+    pub(super) fn reset() {
+        HEAD.store(0, Relaxed);
+        for w in &RING {
+            w.store(0, Relaxed);
+        }
+    }
+
+    /// Print the ring oldest first. Times are microseconds before the newest record.
+    pub(super) fn dump() {
+        let head = HEAD.load(Relaxed);
+        let newest = RING[head.wrapping_sub(1) % N * WORDS].load(Relaxed) & 0x00ff_ffff_ffff_ffff;
+        akuma_primitives::safe_print!(96, "[kvmapi] trace: last {} records, newest at uptime {} us\n", head.min(N), newest);
+        for i in head.saturating_sub(N)..head {
+            let at = i % N * WORDS;
+            let w0 = RING[at].load(Relaxed);
+            let (a, b, c) = (RING[at + 1].load(Relaxed), RING[at + 2].load(Relaxed), RING[at + 3].load(Relaxed));
+            let back = newest.saturating_sub(w0 & 0x00ff_ffff_ffff_ffff);
+            match (w0 >> 56) as u8 {
+                ENTRY => akuma_primitives::safe_print!(
+                    160,
+                    "[kvmapi] -{:>8} ENTRY rflags={:#x} offered={:#x} vintr={:#x} due_in={}\n",
+                    back, a, b & 0x1ff, b >> 16, c
+                ),
+                EXIT => akuma_primitives::safe_print!(
+                    160,
+                    "[kvmapi] -{:>8} EXIT  code={:#x} rip={:#x} i1={:#x} i2={:#x}\n",
+                    back, b >> 32, a, b & 0xffff_ffff, c
+                ),
+                LAPIC_W => akuma_primitives::safe_print!(160, "[kvmapi] -{:>8} LAPIC write off={:#x} val={:#x}\n", back, a, b),
+                ACCEPT => akuma_primitives::safe_print!(160, "[kvmapi] -{:>8} ACCEPT vector={:#x}\n", back, a),
+                _ => {}
+            }
+        }
+    }
+}
+
+static TRACE_DUMPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 static IDLE_TURNS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// A guest idling a long time with nothing due is the signature of a lost interrupt: say what it is waiting on, a
@@ -794,7 +866,12 @@ static IDLE_TURNS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 fn idle_note(vc: &mut Vcpu, now: u64, due: Option<u64>, can_wake: bool) {
     use core::sync::atomic::Ordering;
     let n = IDLE_TURNS.fetch_add(1, Ordering::Relaxed);
-    if n == 0 || !n.is_multiple_of(4000) || n > 4000 * 6 {
+    if n == 0 || !n.is_multiple_of(4000) {
+        return;
+    }
+    // The lost-interrupt signature: halted with IF set and nothing that could ever wake the guest.
+    let stuck = due.is_none() && !can_wake;
+    if n > 4000 * 6 && !(stuck && !TRACE_DUMPED.load(Ordering::Relaxed)) {
         return;
     }
     let (rip, rflags) = {
@@ -816,6 +893,9 @@ fn idle_note(vc: &mut Vcpu, now: u64, due: Option<u64>, can_wake: bool) {
     s(" can_wake=");
     s(if can_wake { "yes" } else { "no" });
     s("\n");
+    if stuck && !TRACE_DUMPED.swap(true, Ordering::Relaxed) {
+        evring::dump();
+    }
 }
 
 static EXITS_TRACED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -824,6 +904,8 @@ static EXITS_TRACED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 pub(super) fn reset_trace() {
     EXITS_TRACED.store(0, core::sync::atomic::Ordering::Relaxed);
     IDLE_TURNS.store(0, core::sync::atomic::Ordering::Relaxed);
+    evring::reset();
+    TRACE_DUMPED.store(false, core::sync::atomic::Ordering::Relaxed);
     PLACED_TRACED.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 

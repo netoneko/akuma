@@ -133,6 +133,8 @@ packed, unlike x86_64) before `copy_from_user_safe`; a bad pointer → `EFAULT`.
 error) rather than `EEXIST`. `MOD`/`DEL` on an absent `fd` → `ENOENT`.
 Unknown `op` → `EINVAL`.
 
+**`poll(2)` / `ppoll(2)` (`ppoll_timeout_us`)**: every call stores `revents` for every entry, including the call that times out (all zero) — a caller that reuses its array (busybox `nc -u -w`) must never see the previous call's answer. Pinned by `epollops` `poll_timeout_clears_revents`; `archive/FIRECRACKER_GUEST_HANG.md`.
+
 **`sys_epoll_pwait`**: `maxevents <= 0` → `EINVAL`. The output buffer is
 validated for `maxevents * 16` bytes → `EFAULT` if it doesn't fit. `timeout`
 follows the standard three-way convention: `> 0` real timeout (ms→µs),
@@ -352,6 +354,7 @@ by routing the EL1 fault-recovery pad through `return_to_kernel(-14)`
   `NETWORK`↔`SOCKET_TABLE`) and their fixes, and a Go-toolchain compatibility
   survey run through this subsystem.
 - `archive/NETWORKING_POLLING_AND_ACK_FIXES.md`.
+- `archive/FIRECRACKER_GUEST_HANG.md` — the `poll(2)` timeout that kept stale `revents` (and the LAPIC race next to it).
 - [`../../../runbooks/debug-network.md`](../../../runbooks/debug-network.md) —
   "epoll issues" table (symptom/cause/status/fix), the live source of truth
   for what's fixed vs. open in this file.

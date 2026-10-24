@@ -36,6 +36,10 @@ The predicate is a pure function with a host test in `akuma-threading`.
 * `scripts/kvm/udp_stall_repro.sh`: `no stall: udp host echo: akuma-probe` 34 of 34 runs.
 * `cargo test -p akuma-threading wake_due`, `scripts/check_unsafe_budget.py`: green.
 
+## Correction 2026-10-24
+
+The "second, blocking `recvfrom`" in § Cause was not `nc` design: `nc` only reads an fd whose `revents` is set, and the timed-out `poll` left the previous call's `POLLIN` in the array. With `poll(2)` zeroing `revents` on timeout (`FIRECRACKER_GUEST_HANG.md` § B) `nc -u -w 2` exits at the timeout and never reaches that `recvfrom`. The wake-pass fix above stands: the blocking wait is still reachable by other callers.
+
 ## Still open
 
 Other halting loops (`allow_tick` callers outside `schedule_blocking`) have the same shape if

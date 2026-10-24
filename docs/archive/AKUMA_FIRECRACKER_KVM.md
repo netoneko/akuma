@@ -452,6 +452,8 @@ herd's `cpus` applies to the spawn only, not to a later `herd` restart of an alr
 Guest DNS to 10.0.2.3 is ignored without `tunout` (expected). `/proc`-style counters: `[tun] writes= reads= eagain= polls= gw: ...`
 every 2 s while frames move; `[tun] tx len= ethertype= proto= l4=` for the first 40 guest frames.
 
+*Correction 2026-10-24: resolved, and not what this section guessed — see [`FIRECRACKER_GUEST_HANG.md`](FIRECRACKER_GUEST_HANG.md). Two guest-kernel bugs on the blocking-socket-wait path (a `lapic::arm_deadline` race and a `poll(2)` timeout that kept stale `revents`); the NIC, the tap and the virtio-net model were fine. The text below is the state at the time.*
+
 *Open — the guest wedges after ~10 s of network activity.* With the NIC attached the guest stops making progress: no more
 frames, the guest script never reaches its probe lines, and the host sees `vcpu idle ... due_in_us=none`. The new
 `[kvmapi] irq state` line says why it cannot be woken: PIC masks `0xff/0xff` (the Akuma guest polls its virtio devices),
@@ -466,6 +468,8 @@ possible. The TCG run of the same scenario is too slow to iterate; the metal cyc
 minutes.
 
 ### The guest wedge under Firecracker + `/dev/net/tun`: material and theories (2026-10-23, parked)
+
+*Correction 2026-10-24: every theory below is disproved — [`FIRECRACKER_GUEST_HANG.md`](FIRECRACKER_GUEST_HANG.md) has the cause and the fix; theory 1 (a guest-side hang inside the guest, in a wait with no deadline) was the closest, and theory 4's `num_buffers = 1` went in anyway.*
 
 *Parked on purpose:* Firecracker support is shaky, so the KVM dev cycle ([`AKUMA_KVM_DEV_CYCLE.md`](AKUMA_KVM_DEV_CYCLE.md)) uses `/dev/kvm0`
 guests, not Firecracker. Everything needed to resume is here.

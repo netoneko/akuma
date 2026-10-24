@@ -1796,8 +1796,18 @@ pub fn ppoll_timeout_us(fds_ptr: u64, nfds: usize, timeout_us: Option<u64>) -> S
                 }
                 return Ok(ready_count as u64);
             }
-            // A timeout is a normal return for poll(2): zero fds ready.
-            WaitStep::Failed(WaitError::TimedOut) => return Ok(0),
+            // A timeout is a normal return for poll(2): zero fds ready. **The array is still written
+            // back**: Linux stores `revents = 0` for every entry on every call, and a caller that
+            // reuses its array relies on it. busybox `nc -u -w 2` reads whichever of its two fds has
+            // `revents` set, so the previous call's `POLLIN` surviving a timeout sent it into a
+            // blocking `recvfrom` on a socket with nothing to say, forever
+            // (`docs/archive/FIRECRACKER_GUEST_HANG.md`).
+            WaitStep::Failed(WaitError::TimedOut) => {
+                if nfds > 0 && copy_to_user(fds_ptr, as_user_bytes(&kernel_fds)).is_err() {
+                    return Err(EFAULT);
+                }
+                return Ok(0);
+            }
             // The signal is delivered by the syscall-return path; without
             // returning to it the wake is consumed and ppoll sleeps through
             // its own SIGALRM.

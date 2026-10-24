@@ -841,28 +841,36 @@ pub static ONESHOT_ARMS: AtomicU64 = AtomicU64::new(0);
 /// Only the halting core's own timer is touched, from that core with
 /// interrupts off; no lock, no allocation.
 pub fn arm_deadline() {
-    if !TIMER_RUNNING.load(Ordering::Relaxed) || !is_calibrated() {
-        return;
-    }
-    // A one-shot left over from an earlier halt (see `on_tick`) would make the
-    // `REG_TIMER_CUR` comparison below read an expired timer as "the periodic
-    // tick serves it sooner". Put the periodic mode back first.
-    restore_periodic();
-    let Some(now) = tsc_uptime_us() else { return };
-    let Some(due) = akuma_threading::x86_earliest_wake_time() else { return };
-    let per_tick = u64::from(TIMER_COUNT.load(Ordering::Relaxed));
-    // Already due: the wake pass will find it without a halt; arm the minimum
-    // so the halt ends at once if the caller halts anyway.
-    let left_us = due.saturating_sub(now);
-    let counts = (left_us * per_tick).div_ceil(u64::from(US_PER_TICK_TARGET)).max(1);
-    // The periodic tick serves it as soon: leave the timer alone.
-    if counts >= u64::from(read(REG_TIMER_CUR)) {
-        return;
-    }
-    write(REG_LVT_TIMER, u32::from(TIMER_VECTOR));
-    write(REG_TIMER_INIT, counts as u32);
-    ONESHOT[crate::smp::cpu_index()].store(true, Ordering::Relaxed);
-    ONESHOT_ARMS.fetch_add(1, Ordering::Relaxed);
+    // **Interrupts off for the whole arm.** Callers are meant to arrive masked, but `net_blocking_relax` ->
+    // `allow_tick` reaches here with `IF` set (the BKL release restores the flags it was taken under). The tick
+    // is then free to land between the count write and the `ONESHOT` store: `on_tick` sees the flag clear, does
+    // not restore the periodic tick, and the `sti; hlt` that follows sleeps past a one-shot that has already
+    // fired and nothing left to wake it. Under a hypervisor the window is a whole VM exit wide (the host
+    // yields between entries), so a 0.8 ms shot expires inside it (`docs/archive/FIRECRACKER_GUEST_HANG.md`).
+    akuma_primitives::irq::with_irqs_disabled(|| {
+        if !TIMER_RUNNING.load(Ordering::Relaxed) || !is_calibrated() {
+            return;
+        }
+        // A one-shot left over from an earlier halt (see `on_tick`) would make the
+        // `REG_TIMER_CUR` comparison below read an expired timer as "the periodic
+        // tick serves it sooner". Put the periodic mode back first.
+        restore_periodic();
+        let Some(now) = tsc_uptime_us() else { return };
+        let Some(due) = akuma_threading::x86_earliest_wake_time() else { return };
+        let per_tick = u64::from(TIMER_COUNT.load(Ordering::Relaxed));
+        // Already due: the wake pass will find it without a halt; arm the minimum
+        // so the halt ends at once if the caller halts anyway.
+        let left_us = due.saturating_sub(now);
+        let counts = (left_us * per_tick).div_ceil(u64::from(US_PER_TICK_TARGET)).max(1);
+        // The periodic tick serves it as soon: leave the timer alone.
+        if counts >= u64::from(read(REG_TIMER_CUR)) {
+            return;
+        }
+        write(REG_LVT_TIMER, u32::from(TIMER_VECTOR));
+        write(REG_TIMER_INIT, counts as u32);
+        ONESHOT[crate::smp::cpu_index()].store(true, Ordering::Relaxed);
+        ONESHOT_ARMS.fetch_add(1, Ordering::Relaxed);
+    })
 }
 
 /// Make this core's next timer interrupt arrive in `us` microseconds, if that is
@@ -879,20 +887,23 @@ pub fn arm_deadline() {
 /// the host tick resumes by itself; and like it, called with interrupts off on the
 /// core whose timer it touches. A shot already in flight that fires sooner stays.
 pub fn arm_oneshot_in_us(us: u64) -> bool {
-    if !TIMER_RUNNING.load(Ordering::Relaxed) || !is_calibrated() {
-        return false;
-    }
-    let per_tick = u64::from(TIMER_COUNT.load(Ordering::Relaxed));
-    let counts = (us * per_tick).div_ceil(u64::from(US_PER_TICK_TARGET)).max(1);
-    // The periodic tick (or a shot already armed) serves it as soon: leave it.
-    if counts >= u64::from(read(REG_TIMER_CUR)) {
-        return false;
-    }
-    write(REG_LVT_TIMER, u32::from(TIMER_VECTOR));
-    write(REG_TIMER_INIT, counts as u32);
-    ONESHOT[crate::smp::cpu_index()].store(true, Ordering::Relaxed);
-    ONESHOT_ARMS.fetch_add(1, Ordering::Relaxed);
-    true
+    // Interrupts off for the whole arm, whatever the caller's `IF` was: see `arm_deadline`.
+    akuma_primitives::irq::with_irqs_disabled(|| {
+        if !TIMER_RUNNING.load(Ordering::Relaxed) || !is_calibrated() {
+            return false;
+        }
+        let per_tick = u64::from(TIMER_COUNT.load(Ordering::Relaxed));
+        let counts = (us * per_tick).div_ceil(u64::from(US_PER_TICK_TARGET)).max(1);
+        // The periodic tick (or a shot already armed) serves it as soon: leave it.
+        if counts >= u64::from(read(REG_TIMER_CUR)) {
+            return false;
+        }
+        write(REG_LVT_TIMER, u32::from(TIMER_VECTOR));
+        write(REG_TIMER_INIT, counts as u32);
+        ONESHOT[crate::smp::cpu_index()].store(true, Ordering::Relaxed);
+        ONESHOT_ARMS.fetch_add(1, Ordering::Relaxed);
+        true
+    })
 }
 
 /// After the `hlt` [`arm_deadline`] prepared: back to the periodic tick, if
@@ -968,45 +979,48 @@ fn credit_shot_fired() {
 /// Callers hold `IF` clear (the idle loop's contract), so the shot cannot fire
 /// between the arm and the `sti`.
 pub fn arm_idle_shot(max_ticks: u32) -> u32 {
-    let cpu = crate::smp::cpu_index();
-    if !TIMER_RUNNING.load(Ordering::Relaxed) || !is_calibrated() {
-        return 0;
-    }
-    if ONESHOT[cpu].load(Ordering::Relaxed) {
-        return 0;
-    }
-    // A one-shot left over from an earlier halt would make the
-    // `REG_TIMER_CUR` comparison below read an expired timer as "the periodic
-    // tick serves sooner" (the same trap `arm_deadline` documents).
-    restore_periodic();
-    let Some(now) = tsc_uptime_us() else { return 0 };
-    let per_tick = u64::from(TIMER_COUNT.load(Ordering::Relaxed));
-    let cap_counts = u64::from(max_ticks.max(1)) * per_tick;
-    // Wake at the earliest parked deadline when it falls inside the budget —
-    // in exact counts, not rounded ticks, or a 3 ms futex deadline would wake
-    // 10 ms late and undo `arm_deadline`'s measured win. Past the cap, sleep
-    // the cap.
-    let shot_counts = match akuma_threading::x86_earliest_wake_time() {
-        Some(due) => {
-            let left_us = due.saturating_sub(now);
-            let exact = (left_us * per_tick).div_ceil(u64::from(US_PER_TICK_TARGET)).max(1);
-            if exact < cap_counts { exact } else { cap_counts }
+    // Interrupts off for the whole arm, whatever the caller's `IF` was: see `arm_deadline`.
+    akuma_primitives::irq::with_irqs_disabled(|| {
+        let cpu = crate::smp::cpu_index();
+        if !TIMER_RUNNING.load(Ordering::Relaxed) || !is_calibrated() {
+            return 0;
         }
-        None => cap_counts,
-    };
-    // The periodic tick fires this soon or sooner anyway: leave it alone.
-    if shot_counts <= u64::from(read(REG_TIMER_CUR)) {
-        return 0;
-    }
-    let armed_ticks = shot_counts.div_ceil(per_tick) as u32;
-    write(REG_LVT_TIMER, u32::from(TIMER_VECTOR));
-    write(REG_TIMER_INIT, shot_counts as u32);
-    ARMED_IDLE_TICKS[cpu].store(armed_ticks, Ordering::Relaxed);
-    ARMED_IDLE_AT_US[cpu].store(now, Ordering::Relaxed);
-    ONESHOT[cpu].store(true, Ordering::Relaxed);
-    ONESHOT_ARMS.fetch_add(1, Ordering::Relaxed);
-    IDLE_SHOTS.fetch_add(1, Ordering::Relaxed);
-    armed_ticks
+        if ONESHOT[cpu].load(Ordering::Relaxed) {
+            return 0;
+        }
+        // A one-shot left over from an earlier halt would make the
+        // `REG_TIMER_CUR` comparison below read an expired timer as "the periodic
+        // tick serves sooner" (the same trap `arm_deadline` documents).
+        restore_periodic();
+        let Some(now) = tsc_uptime_us() else { return 0 };
+        let per_tick = u64::from(TIMER_COUNT.load(Ordering::Relaxed));
+        let cap_counts = u64::from(max_ticks.max(1)) * per_tick;
+        // Wake at the earliest parked deadline when it falls inside the budget —
+        // in exact counts, not rounded ticks, or a 3 ms futex deadline would wake
+        // 10 ms late and undo `arm_deadline`'s measured win. Past the cap, sleep
+        // the cap.
+        let shot_counts = match akuma_threading::x86_earliest_wake_time() {
+            Some(due) => {
+                let left_us = due.saturating_sub(now);
+                let exact = (left_us * per_tick).div_ceil(u64::from(US_PER_TICK_TARGET)).max(1);
+                if exact < cap_counts { exact } else { cap_counts }
+            }
+            None => cap_counts,
+        };
+        // The periodic tick fires this soon or sooner anyway: leave it alone.
+        if shot_counts <= u64::from(read(REG_TIMER_CUR)) {
+            return 0;
+        }
+        let armed_ticks = shot_counts.div_ceil(per_tick) as u32;
+        write(REG_LVT_TIMER, u32::from(TIMER_VECTOR));
+        write(REG_TIMER_INIT, shot_counts as u32);
+        ARMED_IDLE_TICKS[cpu].store(armed_ticks, Ordering::Relaxed);
+        ARMED_IDLE_AT_US[cpu].store(now, Ordering::Relaxed);
+        ONESHOT[cpu].store(true, Ordering::Relaxed);
+        ONESHOT_ARMS.fetch_add(1, Ordering::Relaxed);
+        IDLE_SHOTS.fetch_add(1, Ordering::Relaxed);
+        armed_ticks
+    })
 }
 
 /// The halt [`arm_idle_shot`] prepared ended on something that was not the
