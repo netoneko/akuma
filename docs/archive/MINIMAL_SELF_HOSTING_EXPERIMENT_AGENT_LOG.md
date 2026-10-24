@@ -16,6 +16,29 @@ handover; entries after it are marked *(Sonnet)*. Note for the open-weights
 claim: the host track is no longer open-weights from this point; the metal
 track still is.
 
+**Owner's note (2026-10-24, evening): the tooling was badly configured, and the owner is
+frustrated about it.** The owner says that is their own fault. Recorded here because it
+cost real tokens and time on both tracks and is easy to mistake for a model failure.
+Facts, as found *(Sonnet)*:
+
+- Kimi's first session ran out of tokens on a bad subscription setting (see above). The
+  replacement Kimi session (Crush, `k3-256k`) used 26% of its 5-hour quota in about 23
+  minutes, mostly re-reading a growing context on every call.
+- Crush was given `reasoning_effort: low` for `k3-256k`; from then on about a quarter of its
+  calls (10 of 38 in one hour) came back empty and were dropped ("unsupported reasoning
+  metadata"), and one request hung for five minutes. Crush was closed.
+- `goose-kimi` and `goose-glm` both write the same `secrets.yaml`, and `goose-glm-serve` reads
+  it. A one-word smoke test of `goose-kimi` (by Sonnet) put Kimi's key under the live server
+  and goose-glm answered every prompt with `Authentication required`; Kimi then burned
+  turns debugging the key. Fixed by restoring the key and restarting `goose-glm-serve`.
+- A `send_after_reset.py` left over from an earlier Sonnet session sent the `01b` brief to
+  goose-glm a second time (session `20261024_24`, 16:44) while Kimi's own send
+  (`20261024_22`, 16:39) was still running: two overlapping sessions on one checkout for
+  about 13 minutes, until Kimi's driver died with Crush.
+- The supervisor now runs as goose with Kimi on the Mac (`scripts/kvm/goose/goose-kimi-mac.sh`,
+  an ACP server on `127.0.0.1:3285`, secured with a key kept in `~/.akuma/goose/acp_secret_key`),
+  and Sonnet watches both and takes over if Kimi's quota runs out.
+
 Working rules carried over from the owner's last Crush session (the "wisdom"):
 
 1. Every stage is a **separate goose prompt** (new ACP session); help it when

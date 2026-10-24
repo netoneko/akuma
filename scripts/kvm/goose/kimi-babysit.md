@@ -70,6 +70,16 @@ back). Never `pkill` by name, never touch `/boot/akuma-guest`, never reboot, nev
 Firecracker guest or `vm-serve-mc` (it must be running at the end of every goose stage), and do not
 build on the Mac for amd64. If the box does not answer, say so and wait; do not guess.
 
+**Credentials (this broke a run once).** `goose-glm-serve` is the only goose on the box that may
+run: it reads `/root/.config/goose/secrets.yaml`, which must hold the **z.ai** key. `goose-kimi` and
+`goose-glm` both overwrite that file, so running either one (even a one-word smoke test) swaps the
+key under the live server and every goose prompt then fails with `Authentication required`. Do not
+run `goose-kimi`, `goose-glm`, `crush-*` or any goose CLI on the box. Never read, print, `od`, `head`
+or hash token files (`/root/.akuma/*/token`); they do not belong in your context. If a goose probe
+says `Authentication required`, the fix is one step: restart `goose-glm-serve` by pid (`herd status`
+shows it) and probe again with `python3 -I scripts/goose_acp_probe.py`. If that still fails, stop and
+log it; do not debug keys.
+
 ## Quota, hangs, and honesty
 
 - z.ai's 5-hour limit is per account. If a turn ends with `Usage limit reached ... reset at <time>`,

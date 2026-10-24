@@ -7,6 +7,10 @@ import json, sys, threading, urllib.request, time
 import os
 H = os.environ.get("GOOSE_ACP", "http://192.168.1.159:3284/acp")
 HDR = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
+# A secured `goose serve` (GOOSE_SERVER__SECRET_KEY) wants this header; the ryzen one is unauthenticated.
+import os as _os
+if _os.environ.get("GOOSE_ACP_KEY_FILE"):
+    HDR["x-secret-key"] = open(_os.path.expanduser(_os.environ["GOOSE_ACP_KEY_FILE"])).read().strip()
 def post(body, conn=None, sess=None):
     h = dict(HDR)
     if conn: h["acp-connection-id"] = conn
@@ -16,7 +20,7 @@ def post(body, conn=None, sess=None):
 conn, b = post({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}})
 msgs = []
 def stream():
-    r = urllib.request.urlopen(urllib.request.Request(H, headers={"accept":"text/event-stream","acp-connection-id":conn}), timeout=120)
+    r = urllib.request.urlopen(urllib.request.Request(H, headers={**{k: v for k, v in HDR.items() if k == "x-secret-key"}, "accept":"text/event-stream","acp-connection-id":conn}), timeout=120)
     for line in r:
         line = line.decode().strip()
         if line.startswith("data:"):
@@ -29,11 +33,11 @@ def wait(id_, t=90):
         for m in msgs:
             if m.get("id") == id_: return m
         time.sleep(0.3)
-post({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/root","mcpServers":[]}}, conn)
+post({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":os.environ.get("GOOSE_ACP_CWD","/root"),"mcpServers":[]}}, conn)
 r = wait(2); print("session/new:", json.dumps(r)[:300])
 sid = r["result"]["sessionId"]
 def stream2():
-    rr = urllib.request.urlopen(urllib.request.Request(H, headers={"accept":"text/event-stream","acp-connection-id":conn,"acp-session-id":sid}), timeout=150)
+    rr = urllib.request.urlopen(urllib.request.Request(H, headers={**{k: v for k, v in HDR.items() if k == "x-secret-key"}, "accept":"text/event-stream","acp-connection-id":conn,"acp-session-id":sid}), timeout=150)
     for line in rr:
         line = line.decode().strip()
         if line.startswith("data:"):

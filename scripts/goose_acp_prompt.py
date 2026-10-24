@@ -25,6 +25,10 @@ import urllib.request
 
 H = os.environ.get("GOOSE_ACP", "http://192.168.1.159:3284/acp")
 HDR = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
+# A secured `goose serve` (GOOSE_SERVER__SECRET_KEY) wants this header; the ryzen one is unauthenticated.
+import os as _os
+if _os.environ.get("GOOSE_ACP_KEY_FILE"):
+    HDR["x-secret-key"] = open(_os.path.expanduser(_os.environ["GOOSE_ACP_KEY_FILE"])).read().strip()
 
 ap = argparse.ArgumentParser()
 ap.add_argument("brief", help="file with the prompt text")
@@ -121,7 +125,7 @@ if not conn:
 log(f"connected: {conn}")
 
 threading.Thread(target=stream_loop, args=(
-    {"accept": "text/event-stream", "acp-connection-id": conn}, "conn"), daemon=True).start()
+    {**{k: v for k, v in HDR.items() if k == "x-secret-key"}, "accept": "text/event-stream", "acp-connection-id": conn}, "conn"), daemon=True).start()
 time.sleep(1)
 
 post({"jsonrpc": "2.0", "id": 2, "method": "session/new",
@@ -134,7 +138,7 @@ sid = r["result"]["sessionId"]
 log(f"session: {sid}")
 
 threading.Thread(target=stream_loop, args=(
-    {"accept": "text/event-stream", "acp-connection-id": conn,
+    {**{k: v for k, v in HDR.items() if k == "x-secret-key"}, "accept": "text/event-stream", "acp-connection-id": conn,
      "acp-session-id": sid}, "session"), daemon=True).start()
 time.sleep(1)
 
