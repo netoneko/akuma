@@ -985,7 +985,8 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::GETGID | ring3::nr::GETEGID => 0,
         ring3::nr::IOCTL => e(ring3::err::ENOTTY), // the console is a serial line, not a tty
         ring3::nr::MMAP => {
-            let (addr, len, prot, flags, fd) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5());
+            let (addr, len, prot, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
+            let _ = fr.arg5(); // fd: ignored for MAP_ANONYMOUS
             if len == 0 {
                 return e(ring3::err::EINVAL);
             }
