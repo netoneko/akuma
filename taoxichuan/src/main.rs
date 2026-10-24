@@ -7,6 +7,20 @@
 //! crate first and pulling that (`akuma-boot-amd64`, `akuma-comconsole` are
 //! stage 1's extractions).
 //!
+//! # Stage 2 — ring 3
+//!
+//! The gate: the same static musl `hello` the host built runs in ring 3,
+//! prints its line, and exits 0 — the kernel reports the captured exit code,
+//! and the zero-`[Fault]` grep still holds. The spawn point stage 1 stopped
+//! at is now the real thing: a fresh root page table (the kernel's upper half
+//! shared by PML4 copy, the identity map left behind in the kernel's own
+//! root), the ELF's `PT_LOAD`s placed eagerly at their link addresses, a
+//! Linux initial stack, and `sysretq`. Syscalls come back through
+//! `akuma-ring3-amd64`'s stub: `write` into the console, `exit_group`
+//! captured and reported, `brk`/`mmap`/`arch_prctl`/`set_tid_address` enough
+//! for musl's startup. One task, one core, no scheduler — the task that only
+//! exits does not need one.
+//!
 //! # Stage 1 — boots in KVM
 //!
 //! The gate: reach init spawn, print the banner on the guest console, zero
@@ -58,6 +72,8 @@ use akuma_idt_amd64 as idt_lib;
 use akuma_trap_amd64 as trap;
 use akuma_trap_amd64::{InterruptStackFrame, Kind, Trap};
 use akuma_vfs::Filesystem;
+use akuma_boot_amd64::paging::{MemAttr, PteProt};
+use akuma_ring3_amd64 as ring3;
 
 /// The heap. `#[global_allocator]` is a binary-level declaration; the crate
 /// exports the implementation, this kernel installs it.
@@ -170,6 +186,22 @@ static IDT: idt_lib::Idt = idt_lib::Idt::new();
 /// frame and a halt. The `[Fault]` token is the gate's vocabulary.
 fn fault_trap(t: &mut Trap<'_>) {
     let code = t.error_code.unwrap_or(0);
+    // Stage 2: a fault *from ring 3* is the task's death, not the kernel's —
+    // say which, and park. There is no scheduler to reap through and no other
+    // task to keep running; what matters for the gate is that this prints
+    // `[Fault]` and stops instead of triple-faulting into guest silence.
+    if t.from_ring3() {
+        akuma_primitives::safe_print!(
+            192,
+            "[Fault] ring3 {:?} rip=0x{:016x} rsp=0x{:016x} cr2=0x{:016x} code=0x{:x} -- task killed\n",
+            t.kind,
+            t.frame.rip,
+            t.frame.rsp,
+            akuma_cpu::ctlreg::cr2(),
+            code
+        );
+        halt();
+    }
     akuma_primitives::safe_print!(
         192,
         "[Fault] {:?} rip=0x{:016x} rsp=0x{:016x} cr2=0x{:016x} code=0x{:x}\n",
@@ -410,7 +442,448 @@ fn banner() {
     console::puts(ART);
     console::puts("\n  Taoxichuan ");
     console::puts(env!("CARGO_PKG_VERSION"));
-    console::puts(" (Akuma/amd64 crates) x86_64 -- stage 1\n\n");
+    console::puts(" (Akuma/amd64 crates) x86_64 -- stage 2\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: the task, its syscalls, and the crossing into ring 3.
+// ---------------------------------------------------------------------------
+
+/// Top of the task's stack: canonical user half, far from anything the kernel
+/// places. 16 pages — far more than musl's startup touches, and cheap.
+const USER_STACK_TOP: u64 = 0x0000_7000_0000_0000;
+const USER_STACK_PAGES: u64 = 16;
+/// `brk` and anonymous `mmap` each get a fixed 1 MiB slab, registered as user
+/// regions up front so every user-pointer check is one range scan.
+const SLAB: u64 = 0x0010_0000;
+const MMAP_BASE: u64 = 0x0000_6000_0000_0000;
+/// Cap on one `write(2)`: the console is a serial line, not a disk.
+const WRITE_LIMIT: u64 = 1 << 20;
+
+/// The one task: its root page table, the user ranges a pointer may name, the
+/// heap cursors, and the exit code once captured.
+struct Task {
+    root_pa: u64,
+    regions: [(u64, u64); 16],
+    n_regions: usize,
+    brk_base: u64,
+    brk_cur: u64,
+    brk_end: u64,
+    mmap_cur: u64,
+    exit: Option<u64>,
+}
+
+static mut TASK: Task = Task {
+    root_pa: 0,
+    regions: [(0, 0); 16],
+    n_regions: 0,
+    brk_base: 0,
+    brk_cur: 0,
+    brk_end: 0,
+    mmap_cur: MMAP_BASE,
+    exit: None,
+};
+
+/// The task, for the spawn path and the dispatcher.
+///
+/// SAFETY: one core; every touch is either before ring 3 exists or inside the
+/// syscall dispatcher (`IF` clear from `syscall`'s own masking). No references
+/// to the static are held across the boundary itself.
+fn task() -> &'static mut Task {
+    // SAFETY: see above — the aliasing conditions are the single-core,
+    // interrupts-off discipline of this kernel, and the pointer is never
+    // published anywhere else.
+    unsafe { &mut *core::ptr::addr_of_mut!(TASK) }
+}
+
+fn add_region(start: u64, end: u64) {
+    let t = task();
+    t.regions[t.n_regions] = (start, end);
+    t.n_regions += 1;
+}
+
+/// Is `[va, va+len)` fully inside a region this kernel mapped for the task?
+/// The check that makes `write(1, ptr, len)` honest: a bogus pointer is
+/// `-EFAULT`, not a kernel fault.
+fn user_ok(va: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(end) = va.checked_add(len) else {
+        return false;
+    };
+    if end > 0x0000_8000_0000_0000 {
+        return false; // the user half only
+    }
+    let t = task();
+    t.regions[..t.n_regions].iter().any(|&(s, e)| va >= s && end <= e)
+}
+
+/// errno returns are the negated value in `RAX` — plain wrapping arithmetic
+/// on `u64`, no signed casts.
+fn e(code: u64) -> u64 {
+    0u64.wrapping_sub(code)
+}
+
+/// Copy `dst.len()` bytes from the task's address space at `src_va`, one page
+/// at a time through the physmap. False (`-EFAULT`) when a page does not
+/// translate — the regions check above should make that unreachable, so it is
+/// a backstop, not the gate.
+fn copy_from_user(dst: &mut [u8], src_va: u64) -> bool {
+    let root = task().root_pa;
+    let mut done = 0usize;
+    while done < dst.len() {
+        let va = src_va + done as u64;
+        let page_rem = 4096 - (va & 0xFFF) as usize;
+        let n = page_rem.min(dst.len() - done);
+        let Some(pa) = paging::translate_in(root, (va & !0xFFF) as usize) else {
+            return false;
+        };
+        // SAFETY: `pa + off` is a PMM frame inside the physmap (alloc_page's
+        // contract), and `n` stays within the frame by construction.
+        let src = phys::phys_ptr::<u8>(pa + (va & 0xFFF));
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, dst[done..].as_mut_ptr(), n);
+        }
+        done += n;
+    }
+    true
+}
+
+/// The syscall table, minimal on purpose: what static musl's startup and a
+/// `printf`-and-exit `main` issue, and nothing else. Unknown numbers answer
+/// `-ENOSYS` — the honest answer, and the one musl's `printf` path survives
+/// for everything it merely probes.
+fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
+    match fr.rax {
+        ring3::nr::WRITE => {
+            let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
+            if fd != 1 && fd != 2 {
+                return e(ring3::err::EBADF);
+            }
+            if len > WRITE_LIMIT || !user_ok(buf, len) {
+                return e(ring3::err::EFAULT);
+            }
+            let mut chunk = [0u8; 512];
+            let mut done = 0u64;
+            while done < len {
+                let n = (len - done).min(chunk.len() as u64) as usize;
+                if !copy_from_user(&mut chunk[..n], buf + done) {
+                    return e(ring3::err::EFAULT);
+                }
+                if let Ok(s) = core::str::from_utf8(&chunk[..n]) {
+                    console::puts(s);
+                } else {
+                    // The relay sanitises non-ASCII anyway; name what would
+                    // have been silently mangled.
+                    console::puts("  [tty] write: non-utf8 bytes elided\n");
+                    break;
+                }
+                done += n as u64;
+            }
+            len
+        }
+        ring3::nr::EXIT | ring3::nr::EXIT_GROUP => {
+            let code = fr.arg1() & 0xFF; // what wait(2) would see
+            let t = task();
+            t.exit = Some(code);
+            console::puts("Taoxichuan: hello exit code ");
+            console::put_dec(code);
+            console::puts("\n");
+            if code == 0 {
+                console::puts("Taoxichuan: stage 2 gate reached -- ring-3 ran, exited clean, output above\n");
+            }
+            halt();
+        }
+        ring3::nr::BRK => {
+            let want = fr.arg1();
+            let t = task();
+            if want < t.brk_base || want >= t.brk_end {
+                return t.brk_cur; // failure: Linux returns the *old* break
+            }
+            if want > t.brk_cur {
+                // Grow: map fresh zeroed pages. Shrink is a bookkeeping move
+                // (no unmap) — a `printf`-and-exit task never asks for it.
+                let mut page = t.brk_cur & !0xFFF;
+                let end = (want + 0xFFF) & !0xFFF;
+                while page < end {
+                    let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
+                        return t.brk_cur;
+                    };
+                    if !paging::map_page_in(t.root_pa, page as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
+                        return t.brk_cur;
+                    }
+                    page += 4096;
+                }
+            }
+            t.brk_cur = want;
+            want
+        }
+        ring3::nr::ARCH_PRCTL => {
+            let (code, addr) = (fr.arg1(), fr.arg2());
+            match code {
+                ring3::arch::ARCH_SET_FS => {
+                    if addr >= 0x0000_8000_0000_0000 {
+                        return e(ring3::err::EPERM); // the kernel half is not a TLS base
+                    }
+                    // `akuma_cpu::msr::set_fs_base` is the closed wrmsr path,
+                    // canonical-check included.
+                    match akuma_cpu::msr::set_fs_base(addr) {
+                        Ok(()) => 0,
+                        Err(_) => e(ring3::err::ERANGE),
+                    }
+                }
+                ring3::arch::ARCH_GET_FS => {
+                    if !user_ok(addr, 8) {
+                        return e(ring3::err::EFAULT);
+                    }
+                    let v = akuma_cpu::msr::read(akuma_cpu::msr::Msr::FsBase);
+                    // SAFETY: `addr` passed `user_ok` — a mapped task page;
+                    // the physmap translation is the same walk the copy above
+                    // makes.
+                    let dst = phys::phys_ptr::<u64>(paging::translate_in(task().root_pa, addr as usize).unwrap_or(0) + (addr & 0xFFF));
+                    unsafe {
+                        dst.write_volatile(v);
+                    }
+                    0
+                }
+                _ => e(ring3::err::ENOSYS),
+            }
+        }
+        ring3::nr::SET_TID_ADDRESS => 1, // one task: the tid, and nothing to clear
+        ring3::nr::GETPID => 1,
+        ring3::nr::GETUID | ring3::nr::GETEUID => 0,
+        ring3::nr::GETGID | ring3::nr::GETEGID => 0,
+        ring3::nr::IOCTL => e(ring3::err::ENOTTY), // the console is a serial line, not a tty
+        ring3::nr::MMAP => {
+            let (addr, len, prot, flags, fd) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5());
+            if len == 0 {
+                return e(ring3::err::EINVAL);
+            }
+            if flags & ring3::mmap::MAP_ANONYMOUS == 0 || fd != 0xFFFF_FFFF_FFFF_FFFF {
+                return e(ring3::err::ENODEV); // no file-backed mappings in this kernel
+            }
+            let t = task();
+            let pages = (len + 0xFFF) & !0xFFF;
+            let base = if flags & ring3::mmap::MAP_FIXED != 0
+                && addr >= MMAP_BASE
+                && addr + pages <= MMAP_BASE + SLAB
+            {
+                addr
+            } else {
+                (t.mmap_cur + 0xF) & !0xF
+            };
+            if base + pages > MMAP_BASE + SLAB {
+                return e(ring3::err::ENOMEM);
+            }
+            // Anonymous memory is RW; exec is honoured by widening, at the
+            // cost of W^X — a task that maps RWX here tells the kernel it
+            // wants it, and there is no W^X policy layer to argue with.
+            let pte = if prot & ring3::mmap::PROT_EXEC != 0 {
+                PteProt::USER_RWX
+            } else {
+                PteProt::USER_RW
+            };
+            let mut page = base & !0xFFF;
+            while page < base + pages {
+                let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
+                    return e(ring3::err::ENOMEM);
+                };
+                if !paging::map_page_in(t.root_pa, page as usize, pa as u64, pte, MemAttr::WriteBack) {
+                    return e(ring3::err::ENOMEM);
+                }
+                page += 4096;
+            }
+            t.mmap_cur = base + pages;
+            base
+        }
+        ring3::nr::MUNMAP | ring3::nr::MPROTECT => {
+            // Unmap is a no-op (the slabs live as long as the task); mprotect
+            // is accepted and ignored — nothing in this kernel enforces
+            // per-page protection changes after placement.
+            if fr.arg1() & 0xFFF != 0 {
+                e(ring3::err::EINVAL)
+            } else {
+                0
+            }
+        }
+        _ => e(ring3::err::ENOSYS),
+    }
+}
+
+/// Load the image, build the task's address space, and cross. Never returns:
+/// the task ends in the dispatcher's `exit` or the trap handler's `[Fault]`.
+fn spawn(path: &str, image: &[u8]) -> ! {
+    let img = match ring3::Image::parse(image) {
+        Ok(img) => img,
+        Err(err) => {
+            akuma_primitives::safe_print!(160, "  init: ELF refused: {:?}\n", err);
+            halt();
+        }
+    };
+    akuma_primitives::safe_print!(
+        160,
+        "  init: {} PT_LOAD segment(s), entry 0x{:016x}\n",
+        img.segments().len(),
+        img.entry()
+    );
+
+    // The task's root: a fresh page table whose upper half is the kernel's
+    // (one PML4 copy shares every kernel subtree — physmap, device window,
+    // kernel image), whose lower half holds only the task. The kernel's own
+    // root keeps its identity map; the task's root simply has none.
+    let Some(root_page) = akuma_pmm::alloc_page_zeroed() else {
+        console::puts("  init: no free frame for the task's page root\n");
+        halt();
+    };
+    let root = root_page as u64;
+    let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
+    // SAFETY: both frames are PMM/established pages inside the physmap; the
+    // copies are plain RAM writes through the physmap, and the task's tables
+    // are not live until the CR3 load below.
+    unsafe {
+        let ktbl = phys::phys_ptr::<[u64; 512]>(kroot);
+        let utbl = phys::phys_ptr::<[u64; 512]>(root);
+        for i in 256..512 {
+            (*utbl)[i] = (*ktbl)[i];
+        }
+    }
+    let t = task();
+    t.root_pa = root;
+
+    // Place every PT_LOAD at its link address, page by page: fresh zeroed
+    // frame, map, copy the file-backed slice through the physmap. The zeroed
+    // tail (`memsz > filesz` — `.bss`) needs nothing more.
+    let mut placed = 0u64;
+    for seg in img.segments() {
+        let pte = match seg.prot {
+            ring3::Prot::Ro => PteProt::USER_RO,
+            ring3::Prot::Rx => PteProt::USER_RX,
+            ring3::Prot::Rw => PteProt::USER_RW,
+        };
+        let first = seg.vaddr & !0xFFF;
+        let last = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
+        let file = img.segment_bytes(seg);
+        let mut pva = first;
+        while pva < last {
+            let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
+                console::puts("  init: out of frames placing the image\n");
+                halt();
+            };
+            if !paging::map_page_in(root, pva as usize, pa as u64, pte, MemAttr::WriteBack) {
+                console::puts("  init: map_page_in refused a user page\n");
+                halt();
+            }
+            // The page's overlap with the segment's file-backed range.
+            let from = pva.max(seg.vaddr);
+            let to = (pva + 4096).min(seg.vaddr + seg.filesz);
+            if from < to {
+                let src = &file[(from - seg.vaddr) as usize..(to - seg.vaddr) as usize];
+                // SAFETY: `pa` is this page's fresh frame; `from - pva` stays
+                // inside it because `from >= pva` and `to <= pva + 4096`.
+                let dst = phys::phys_ptr::<u8>(pa as u64 + (from - pva));
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+                }
+            }
+            placed += 1;
+            pva += 4096;
+        }
+        add_region(first, last);
+    }
+
+    // The stack, then the initial block on it. The block is < half a page and
+    // ends at `USER_STACK_TOP`, so it lands entirely in the top page.
+    let stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
+    let mut stack_top_pa = 0u64;
+    let mut pva = stack_base;
+    while pva < USER_STACK_TOP {
+        let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
+            console::puts("  init: out of frames for the user stack\n");
+            halt();
+        };
+        if pva + 4096 == USER_STACK_TOP {
+            stack_top_pa = pa as u64;
+        }
+        if !paging::map_page_in(root, pva as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
+            console::puts("  init: map_page_in refused a stack page\n");
+            halt();
+        }
+        pva += 4096;
+    }
+    add_region(stack_base, USER_STACK_TOP);
+
+    // argc/argv/envp/auxv. argv[0] is the path the command line named; no
+    // env. `AT_RANDOM`/`AT_EXECFN` values are the builder's to fill.
+    const AUX_N: usize = 14;
+    let mut aux = [(0u64, 0u64); AUX_N];
+    aux[0] = (ring3::AT_BASE, 0); // no interpreter
+    aux[1] = (ring3::AT_PHDR, img.phdr_va());
+    aux[2] = (ring3::AT_PHENT, img.phent());
+    aux[3] = (ring3::AT_PHNUM, img.phnum());
+    aux[4] = (ring3::AT_PAGESZ, 4096);
+    aux[5] = (ring3::AT_ENTRY, img.entry());
+    aux[6] = (ring3::AT_UID, 0);
+    aux[7] = (ring3::AT_EUID, 0);
+    aux[8] = (ring3::AT_GID, 0);
+    aux[9] = (ring3::AT_EGID, 0);
+    aux[10] = (ring3::AT_SECURE, 0);
+    aux[11] = (ring3::AT_HWCAP, 0);
+    aux[12] = (ring3::AT_CLKTCK, 100);
+    aux[13] = (ring3::AT_RANDOM, 0);
+    let mut block = [0u8; 512];
+    let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &[path], &[], &aux);
+
+    // SAFETY: the top stack page is a mapped task frame; the block ends at
+    // `USER_STACK_TOP`, so its bytes sit at `page_pa + (4096 - block.len())`.
+    let dst = phys::phys_ptr::<u8>(stack_top_pa + (4096 - block.len() as u64));
+    unsafe {
+        core::ptr::copy_nonoverlapping(block.as_ptr(), dst, block.len());
+    }
+
+    // The heap slabs: `brk` above the image, `mmap` in its own window. Both
+    // registered now, so a pointer check is one scan.
+    let brk0 = (img.image_end() + 0xFFF) & !0xFFF;
+    t.brk_base = brk0;
+    t.brk_cur = brk0;
+    t.brk_end = brk0 + SLAB;
+    add_region(brk0, t.brk_end);
+    add_region(MMAP_BASE, MMAP_BASE + SLAB);
+
+    akuma_primitives::safe_print!(
+        160,
+        "  init: {} user page(s) mapped at root 0x{:016x}, stack 0x{:016x}..0x{:016x}\n",
+        placed + USER_STACK_PAGES,
+        root,
+        stack_base,
+        USER_STACK_TOP
+    );
+
+    // Arm the syscall path, then cross. `mov cr3` is the write the ctlreg
+    // crate deliberately does not own (reads safe, writes unsafe at the call
+    // site): it loads the task's root, flushing the non-global TLB — the
+    // kernel half survives through the shared PML4 entries.
+    ring3::enable_syscalls(dispatch);
+    console::puts("Taoxichuan: entering ring 3 -- ");
+    console::puts(path);
+    console::puts("\n");
+    // SAFETY: one documented control-register write; interrupts are masked,
+    // one core, and the root was built entirely before this line.
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {r}",
+            r = in(reg) root,
+            options(nostack, preserves_flags)
+        );
+    }
+    // SAFETY: `EntryFrame` is plain `u64` fields; all-zero is a valid value.
+    let mut ef: ring3::EntryFrame = unsafe { core::mem::zeroed() };
+    ef.rip = img.entry();
+    ef.rflags = 0x202; // IF set, reserved bit 1 set
+    ef.rsp = rsp;
+    // SAFETY: the address space maps the kernel half (shared PML4 entries)
+    // and the task's pages; `ef` names image-placed code on the built stack.
+    unsafe { ring3::enter_user(&ef) }
 }
 
 // ---------------------------------------------------------------------------
@@ -538,8 +1011,9 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     console::puts("\n");
     console::puts("Taoxichuan: stage 1 gate reached -- init spawn (userspace is stage 2)\n");
 
-    // Park: interrupts masked, core halted. A quiet core, not a spinning one.
-    halt();
+    // Stage 2: the spawn is real now. Load, cross, and the task's own exit
+    // (or its fault) is the next line on this console.
+    spawn(path, &image);
 }
 
 /// The multiboot2 entry — called by `boot.s` when GRUB's magic says the info
