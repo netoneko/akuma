@@ -1,0 +1,20 @@
+#!/bin/sh
+# goose-glm as a long-running ACP server (HTTP + WebSocket) on 0.0.0.0:3284.
+# Same provider setup as goose-glm. HOME=/root so git, logs and sessions live where
+# an ssh session sees them. GOOSE_MODE=auto approves every tool call and
+# --dangerously-unauthenticated drops the key check: anything on the LAN can run
+# commands as root. Owner's call, 2026-10-24.
+HOME=/root; export HOME
+. /etc/akuma-dev.env
+umask 077
+cd /root
+mkdir -p /root/.config/goose
+printf "OPENAI_API_KEY: %s\n" "$(cat /root/.akuma/z.ai/token)" > /root/.config/goose/secrets.yaml
+GOOSE_DISABLE_KEYRING=1; export GOOSE_DISABLE_KEYRING
+GOOSE_PROVIDER=openai; export GOOSE_PROVIDER
+GOOSE_MODEL=${GOOSE_MODEL:-glm-5.3}; export GOOSE_MODEL
+GOOSE_THINKING_EFFORT=${GOOSE_THINKING_EFFORT:-low}; export GOOSE_THINKING_EFFORT
+GOOSE_MODE=auto; export GOOSE_MODE
+OPENAI_HOST=https://api.z.ai; export OPENAI_HOST
+OPENAI_BASE_PATH=api/coding/paas/v4/chat/completions; export OPENAI_BASE_PATH
+exec /usr/local/bin/goose serve --dangerously-unauthenticated --host 0.0.0.0 --port 3284 "$@"
