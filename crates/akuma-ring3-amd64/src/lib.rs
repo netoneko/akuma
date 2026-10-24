@@ -457,10 +457,16 @@ static USER_RSP_STASH: u64 = 0;
 static DISPATCH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// The frame the stub builds on the kernel stack, one field per pushed
-/// register in push order (lowest address first): r15 at `[rsp]`, then down
-/// the list. The offsets are load-bearing on both sides of the `call` — the
-/// stub indexes `[rsp + N]` by hand, and `#[repr(C)]` fixes the Rust side to
-/// match. `user_rip`/`user_rflags` are what `syscall` stashed in `RCX`/`R11`.
+/// register in **memory order** — `syscall` pushes `r10`, `r8`, `r9` in that
+/// sequence, so the *lowest* address holds the last push: `r9` sits at +48,
+/// `r10` at +64. The offsets are load-bearing on both sides of the `call` —
+/// the stub indexes `[rsp + N]` by hand, and `#[repr(C)]` fixes the Rust
+/// side to match. `user_rip`/`user_rflags` are what `syscall` stashed in
+/// `RCX`/`R11`. (Stage 2 wrote this struct in *push* order — `r10, r8, r9`
+/// — which silently swapped args 4 and 6 for every syscall with more than
+/// three arguments; nothing until stage 3's `openat`/`mmap` had that many,
+/// so the pinned offset tests, which never named these three fields, stayed
+/// green while the ABI was wrong.)
 #[repr(C)]
 pub struct SyscallFrame {
     pub r15: u64,
@@ -469,11 +475,14 @@ pub struct SyscallFrame {
     pub r12: u64,
     pub rbp: u64,
     pub rbx: u64,
-    /// Fourth argument. `syscall` takes it in `R10` because `RCX` carries the
-    /// return address.
-    pub r10: u64,
-    pub r8: u64,
+    /// Sixth argument (`R9`), at the slot the stub's last of the three
+    /// pushes occupies.
     pub r9: u64,
+    /// Fifth argument (`R8`).
+    pub r8: u64,
+    /// Fourth argument. `syscall` takes it in `R10` because `RCX` carries
+    /// the return address.
+    pub r10: u64,
     pub rdx: u64,
     pub rsi: u64,
     pub rdi: u64,
@@ -710,6 +719,10 @@ pub mod nr {
     pub const BRK: u64 = 12;
     /// `ioctl(2)`.
     pub const IOCTL: u64 = 16;
+    /// `stat(2)` — x86_64 keeps the legacy number, and musl's `stat()` maps
+    /// to it (not `newfstatat`); busybox `ls` stats its argument to learn
+    /// whether it is a directory.
+    pub const STAT: u64 = 4;
     /// `close(2)` — the fd-table counterpart to `openat`'s allocation.
     pub const CLOSE: u64 = 3;
     /// `rt_sigaction(2)` — accepted and recorded-not: this kernel has no
@@ -734,11 +747,25 @@ pub mod nr {
     pub const ARCH_PRCTL: u64 = 158;
     /// `set_tid_address(2)`.
     pub const SET_TID_ADDRESS: u64 = 218;
+    /// `clock_gettime(2)` — zeroed: this kernel has no clock (the host
+    /// tracks no wall time either), and the applets that call it only want
+    /// *a* time, not a true one.
+    pub const CLOCK_GETTIME: u64 = 228;
+    /// `gettimeofday(2)` — same contract as `CLOCK_GETTIME`.
+    pub const GETTIMEOFDAY: u64 = 96;
     /// `getdents64(2)` — the directory read `ls` walks a directory with.
     pub const GETDENTS64: u64 = 217;
     /// `openat(2)` — the one path in; `dirfd` must be `AT_FDCWD` (absolute
     /// paths only: this kernel has no working directory).
     pub const OPENAT: u64 = 257;
+    /// `open(2)` — x86_64 keeps the legacy number, and musl's `open()` maps
+    /// to it; same contract as `OPENAT` minus the dirfd.
+    pub const OPEN: u64 = 2;
+    /// `lstat(2)` — legacy number; musl's `lstat()` maps to it. Does not
+    /// follow a final symlink.
+    pub const LSTAT: u64 = 6;
+    /// `fcntl(2)` — only the fd-flag commands busybox issues are served.
+    pub const FCNTL: u64 = 72;
     /// `exit_group(2)` — musl's `exit(3)` calls this.
     pub const EXIT_GROUP: u64 = 231;
 }
@@ -753,6 +780,9 @@ pub mod open {
     /// `O_DIRECTORY` — the caller wants a directory; anything else is
     /// `ENOTDIR`.
     pub const O_DIRECTORY: u64 = 0x1_0000;
+    /// `O_CLOEXEC` — recorded on the fd, meaningless until an exec family
+    /// exists.
+    pub const O_CLOEXEC: u64 = 0x8_0000;
     /// `AT_FDCWD`: the only `dirfd` this kernel serves (absolute paths only).
     pub const AT_FDCWD: u64 = (-100i64) as u64;
 }

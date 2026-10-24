@@ -185,9 +185,21 @@ fn stack_without_at_random_has_no_canary() {
 fn syscall_frame_offsets_match_the_stub_push_order() {
     // The stub pushes r11, rcx, rax, rdi, rsi, rdx, r10, r8, r9, rbx, rbp,
     // r12, r13, r14, r15 below an 8-byte pad, so [rsp] is r15 and the RAX
-    // slot the result is stored to sits at +96.
+    // slot the result is stored to sits at +96. Pushes go DOWN in memory:
+    // the last of the three argument pushes (r9) is the one at +48.
     use core::mem::offset_of;
     assert_eq!(offset_of!(SyscallFrame, r15), 0);
+    assert_eq!(offset_of!(SyscallFrame, r14), 8);
+    assert_eq!(offset_of!(SyscallFrame, r13), 16);
+    assert_eq!(offset_of!(SyscallFrame, r12), 24);
+    assert_eq!(offset_of!(SyscallFrame, rbp), 32);
+    assert_eq!(offset_of!(SyscallFrame, rbx), 40);
+    assert_eq!(offset_of!(SyscallFrame, r9), 48);
+    assert_eq!(offset_of!(SyscallFrame, r8), 56);
+    assert_eq!(offset_of!(SyscallFrame, r10), 64);
+    assert_eq!(offset_of!(SyscallFrame, rdx), 72);
+    assert_eq!(offset_of!(SyscallFrame, rsi), 80);
+    assert_eq!(offset_of!(SyscallFrame, rdi), 88);
     assert_eq!(offset_of!(SyscallFrame, rax), 96);
     assert_eq!(offset_of!(SyscallFrame, user_rip), 104);
     assert_eq!(offset_of!(SyscallFrame, user_rflags), 112);

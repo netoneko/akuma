@@ -1251,6 +1251,7 @@ dependencies = [
  "akuma-comconsole",
  "akuma-cpu",
  "akuma-ext2",
+ "akuma-fdtable",
  "akuma-gdt",
  "akuma-idt-amd64",
  "akuma-pmm",
