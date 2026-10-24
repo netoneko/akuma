@@ -105,3 +105,38 @@ claim was re-done, not trusted).
 - Metal track (goose, amd64, Akuma KVM) has not reported yet; the stage does not
   count until it does.
 
+### Stage 1 — metal track (goose-glm), amd64 / Akuma KVM — reached the gate, not signed off
+
+Built by goose-glm (GLM 5.3) on the ryzen box; supervised by Sonnet. Branch
+`taoxichuan-s1`, commit `43edbffc`, pushed to `litter` by Sonnet (goose had not
+pushed before it stopped).
+
+- **What it composed:** a real new source tree. `taoxichuan/` is the composition
+  root (own `main.rs`, `linker.ld`, `build.rs`; pulls 13 crates; PVH boot, ext2 root
+  on polled virtio-blk, single vCPU, no scheduler/BKL/userspace). Two crates were
+  extracted first, as the brief asks: `akuma-boot-amd64` (`boot.s`, `phys.rs`, the
+  paging walker, the memory policy; `amd64/` now re-exports them) and
+  `akuma-comconsole` (the 16550 console). Image: 162 KB. The `amd64/` kernel was
+  refactored onto the shared crates (about 1,000 lines moved) and still *builds*;
+  **it has not been booted since**: open item before merging.
+- **Gate evidence** (`/root/dev-cycle/taoxichuan-s1/vm-dev-pass.log` on the box,
+  09:55 UTC): banner box; `ext2 root mounted on /dev/vda`; `Taoxichuan: init spawn
+  -- init=/bin/busybox argv=[sh,/etc/guest.sh]`; `init: 1131168 bytes on the ext2
+  root, ELF magic ok`; `Taoxichuan: stage 1 gate reached`; 0 `fault|panic|sig!`
+  lines. The guest then halts with interrupts off, as a stage-1 kernel with no
+  userspace should.
+- **Disagreement, recorded not averaged:** the generic harness verdict printed `[KVM]
+  akuma-vm guest: FAIL (banner=yes, init=no, net=no)`. That check looks for the
+  full Akuma init/net markers, which a stage-1 kernel never prints; the stage-1 gate
+  is the kernel's own `init spawn` line. Both facts stand; the stage is signed off
+  only when the harness is given a stage-1 expectation or the gate is re-run by
+  hand.
+- **Stopped by quota, not by failure:** at 09:56 UTC z.ai answered `Usage limit
+  reached for 5 hour. Your limit will reset at 2026-10-24 21:17:13` and the turn
+  ended. No `RESULT.md` was written, and `taoxichuan/src/main.rs` has an
+  uncommitted edit. The 5-hour window on the lowest GLM tier is a real constraint of
+  this track: plan stages to fit it.
+- **Cost (from `sessions.db`, session `20261024_9`):** 77.2 min wall, 142 LLM calls,
+  16,057,961 input tokens (15,736,512 cache reads, 98.0%), 68,932 output tokens,
+  largest context 181,081.
+
