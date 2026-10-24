@@ -26,7 +26,11 @@ Working rules carried over from the owner's last Crush session (the "wisdom"):
    bundles; reconcile the two tracks' changes into one kernel.
 4. Say honestly **who built what** (host vs goose) in this log.
 5. Document the process here as it goes; hypervisor disagreements are findings.
-6. Agents' shells need `HOME=/root` (ssh does not set it; git and logs depend on it).
+6. **Cost is tokens and time worked, not dollars**: goose-glm is on the lowest-tier
+   GLM subscription. After every goose session, record wall time, LLM calls, input /
+   output / cache-read tokens and the largest context in this log
+   (`scripts/kvm/goose_box_stats.py`, run on the box).
+7. Agents' shells need `HOME=/root` (ssh does not set it; git and logs depend on it).
 
 Tracks:
 
@@ -65,6 +69,11 @@ findings, recorded here, not averaged away.
   in `akuma-config` / `akuma-kernel-glue`, `taoxichuan-fc.bin`) are **not in the
   tree** (uncommitted, lost with the session): treated as unverified and to be
   redone, not as a pass.
+
+- 2026-10-24 *(Sonnet)*: first cost reading of the stage-1 session (`20261024_9`, at
+  09:30 UTC, still running): 52 min wall, 96 LLM calls, 8,391,298 input tokens of
+  which 8,103,936 (96.6%) cache reads, 46,859 output, largest context 148,749. The
+  cost is re-reading a growing history, not generation.
 
 (Entries append below this line, newest stage last.)
 
