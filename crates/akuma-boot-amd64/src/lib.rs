@@ -32,6 +32,9 @@
 
 #![cfg_attr(not(test), no_std)]
 #![allow(unsafe_code)]
+// Same two allows as the sibling hardware crates (akuma-bkl, akuma-elf, akuma-exec): the module docs here
+// are long on purpose, and the page-table helpers return values their callers always use.
+#![allow(clippy::too_long_first_doc_paragraph, clippy::must_use_candidate)]
 
 pub mod mem;
 pub mod paging;
@@ -43,6 +46,9 @@ pub mod phys;
 // them the same value rather than two values that agree today. `boot.s`
 // deliberately contains no other brace, so the whole file is a valid format
 // template.
+// x86_64 only: the trampoline is AT&T x86 assembly, and the host-side clippy/test pass in the
+// pre-commit hook runs this crate on whatever the developer's machine is (an aarch64 Mac).
+#[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     include_str!("boot.s"),
     PDS = const phys::PHYSMAP_PDS,

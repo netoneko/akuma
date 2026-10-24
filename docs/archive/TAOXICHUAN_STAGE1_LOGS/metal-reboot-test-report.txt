@@ -1,0 +1,49 @@
+reboot-test 20261024-134651 entry=29
+before: 22910843926fd694ab2adb69e41bd7cd  /boot/akuma-amd64.verify
+Pop up after 2s
+CMOS on Pop after the clean reboot:
+40 22 47 29 10 00 06 24 10 26 26 02 50 80 02 00 53 42 53 48 00 00 00 00 50 80 20 2e 00 48 a5 94 60 15 00 81 11 00 84 04 01 48 00 41 00 00 05 e8 69 80 20 bb 31 40 48 00 82 01 20 01 40 00 00 00 00 60 40 00 31 50 00 12 c0 00 0e d2 55 aa 4d c8 77 21 31 89 14 ad 95 43 03 a8 85 3b a1 21 c5 00 04 03 00 08 00 00 00 00 07 29 80 0c 20 08 00 20 00 94 08 60 81 24 21 29 20 22 38 00 04 20 10 59
+classic-checksum 0x10-0x2d sum=05e8 stored=05e8 OK
+regA=26 regB=02 regD=80 diag=02 crumb[7f]=59
+
+Pop rtc/cmos kernel lines:
+[    0.012144] clocksource: refined-jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 1910969940391419 ns
+[    0.047843] clocksource: hpet: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 133484873504 ns
+[    0.054863] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x6d567a2e9e9, max_idle_ns: 881590759303 ns
+[    0.192865] Measured 3812694432 cycles TSC warp between CPUs, turning off TSC clock.
+[    0.200127] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 1911260446275000 ns
+[    0.200127] PM: RTC time: 10:47:04, date: 2026-10-24
+[    0.283180] acpi PNP0A08:00: _OSC: OS supports [ExtendedConfig ASPM ClockPM Segments MSI EDR HPX-Type3]
+[    0.357925] PTP clock support registered
+[    0.370909] clocksource: Switched to clocksource hpet
+[    0.382505] clocksource: acpi_pm: mask: 0xffffff max_cycles: 0xffffff, max_idle_ns: 2085701024 ns
+[    0.461990] rtc_cmos 00:01: RTC can wake from S4
+[    0.462371] rtc_cmos 00:01: registered as rtc0
+[    0.462455] rtc_cmos 00:01: setting system clock to 2026-10-24T10:47:04 UTC (1792838824)
+[    0.462515] rtc_cmos 00:01: alarms up to one month, y3k, 114 bytes nvram
+[    4.340770] Unstable clock detected, switching default tracing clock to "global"
+               If you want to keep using the local clock, then add:
+                 "trace_clock=local"
+[    4.342234] clk: Disabling unused clocks
+
+2026-10-24 13:47:40.847094+03:00
+Sat Oct 24 10:47:41 AM UTC 2026
+
+Akuma up after 0s
+Akuma dmesg (clock/cmos/exception lines):
+  clock: seeded from the CMOS RTC (2026-10-24 10:48 UTC); SNTP will correct it
+[KVM] Fn8000_000A: rev=00000001 asids=32768 edx=1ebf1cff
+[KVM] SVM available; EFER.SVME not yet enabled (per-core, phase 2)
+[KVM] kvmmem: reserved 4096 MiB for guests
+3840210441  [KVM] cpu 1 cycles
+  [KVM] cpu 2 svm enabled
+  [KVM] cpu 3 svm enabled
+  [KVM] cpu 4 svm enabled
+  [KVM] cpu 5 svm enabled
+  [KVM] cpu 6 svm enabled
+  [KVM] cpu 7[BKLPROF] enabled (amd64 diagnostic)
+  net:  wifi link: DHCP and the wall clock follow the join
+  clock: retry: could not resolve pool.ntp.org via 1.1.1.1
+Akuma akuma-ryzen 0.0.8 43edbffc-release-smp-shared x86_64 GNU/Linux
+
+VERDICT: PASS (clean reboot, Pop and Akuma both came back, no exception)

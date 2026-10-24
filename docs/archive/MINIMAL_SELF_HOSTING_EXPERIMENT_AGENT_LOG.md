@@ -195,3 +195,18 @@ pushed before it stopped).
   (aarch64 + Firecracker by Sonnet, amd64 + Akuma KVM by goose), which is parity of
   intent, not the same kernel.
 
+#### Integration (Sonnet, 10:55-11:05 UTC)
+
+- Goose's last edit committed on its behalf as `107eb25c` (ASCII banner), pushed to
+  `litter/taoxichuan-s1`, and `taoxichuan-s1` merged into `rust-org-il-experiment`
+  (`0c41abbc`, clean). Workspace gained the `taoxichuan` member. **Merge broke the
+  Mac's pre-commit hook**: it runs clippy/tests on every extracted crate, and
+  `akuma-boot-amd64` assembled its AT&T x86 `boot.s` unconditionally (fine on goose's
+  x86 box, `att_syntax` is x86-only on an aarch64 host). Fixed by gating that
+  `global_asm!` on `target_arch = "x86_64"`; checked that the x86_64 rlib still
+  carries `_start`/`_start_mb2`. Both new crates still have **no host tests**, only
+  the KVM gate. Lesson for the next prompt to goose: its box is x86, so a crate that
+  builds there can still fail the aarch64 host pass; tell it to `cfg`-gate asm.
+- After the merge the aarch64 `build_taoxichuan_fc.sh` image still builds (662,792 B).
+- Raw logs for the stage-1 entries: [`TAOXICHUAN_STAGE1_LOGS/`](TAOXICHUAN_STAGE1_LOGS/).
+
