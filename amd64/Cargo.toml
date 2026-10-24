@@ -261,6 +261,12 @@ net-noalloc = ["akuma-net/net-noalloc"]
 # (`cli`/`sti`/`pushfq`) are real, and `paging.rs`/`exec_runtime.rs` consume
 # them directly instead of private copies.
 akuma-alloc = { path = "../crates/akuma-alloc" }
+# The boot kit — boot.s, the physmap, the kernel's own page tables, heap+PMM
+# bring-up — pulled as a crate since the Taoxichuan stage-1 extraction
+# (2026-10-24) so the composed kernel (`taoxichuan/`) and this one share one
+# boot block instead of two copies that drift. `phys.rs`, the walker half of
+# `paging.rs` and the policy half of `mem.rs` are re-export shims onto it.
+akuma-boot-amd64 = { path = "../crates/akuma-boot-amd64" }
 akuma-pmm = { path = "../crates/akuma-pmm" }
 akuma-cpu = { path = "../crates/akuma-cpu" }
 # The SVM seed's VMCB vocabulary, exit codes and §15.5.1 guest-state checks —

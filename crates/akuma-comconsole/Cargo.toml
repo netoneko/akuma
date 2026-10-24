@@ -1,0 +1,16 @@
+[package]
+name = "akuma-comconsole"
+version = "0.1.0"
+edition = "2024"
+description = "The 16550 COM-port boot console: the machine half of amd64's serial.rs, minimal (no ring, no framebuffer mirror, no line discipline) — the console a composed kernel prints its banner on before anything else exists"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The only dependency, on purpose: this console must be reachable before the
+# heap, before paging, before anything but `boot.s` — so the one thing it may
+# need is the port-I/O crate that owns COM1. Everything richer (the dmesg ring,
+# the framebuffer mirror, the tty discipline) is layered by whichever kernel
+# pulls this, not baked in here.
+akuma-port = { path = "../akuma-port" }

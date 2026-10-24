@@ -87,6 +87,7 @@ dependencies = [
  "akuma-alloc",
  "akuma-bkl",
  "akuma-boot",
+ "akuma-boot-amd64",
  "akuma-cmos-rtc",
  "akuma-config",
  "akuma-cow",
@@ -178,8 +179,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-boot-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-cpu",
+ "akuma-pagetable",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-pte-amd64",
+ "akuma-ryzen-amd64",
+]
+
+[[package]]
 name = "akuma-cmos-rtc"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-comconsole"
+version = "0.1.0"
+dependencies = [
+ "akuma-port",
+]
 
 [[package]]
 name = "akuma-config"
@@ -1211,6 +1232,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3ae828aa394de34c7de08f522d1b86bd1c182c668d27da69caadda00590f26d"
 dependencies = [
  "lock_api",
+]
+
+[[package]]
+name = "taoxichuan"
+version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-boot-amd64",
+ "akuma-comconsole",
+ "akuma-cpu",
+ "akuma-ext2",
+ "akuma-gdt",
+ "akuma-idt-amd64",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-ryzen-amd64",
+ "akuma-trap-amd64",
+ "akuma-vfs",
+ "akuma-virtio",
 ]
 
 [[package]]

@@ -1,0 +1,56 @@
+[package]
+name = "taoxichuan"
+version = "0.1.0"
+edition = "2024"
+description = "Taoxichuan: the minimal composed Akuma amd64 kernel — the minimal-self-hosting experiment's composition root, one stage at a time. Stage 1: boot as a kvm0/Firecracker PVH guest, ext2 root on virtio-blk, reach init spawn, banner on the console, zero faults."
+
+# Not in `default-members`: like `akuma-amd64`, this is an x86_64-only bin the
+# default (aarch64) build must never reach.
+[lints]
+workspace = true
+
+[features]
+# The same opt-in `akuma-amd64` has: compile any boot self-tests out. Stage 1
+# has none yet; the feature exists so the pinned build command
+# (`kbuild -j 4 --features no-tests`) is the same for every kernel.
+no-tests = []
+
+[dependencies]
+# ---- The stage-1 crate lines, in boot order ---------------------------------
+#
+# The boot kit: PVH trampoline (boot.s — its `global_asm!` lives in the crate),
+# the physmap, kernel page tables, heap + PMM bring-up. One crate where
+# `amd64/src` used to be the only home of all four.
+akuma-boot-amd64 = { path = "../crates/akuma-boot-amd64" }
+# The console: COM1, minimal. The banner's only dependency at this stage.
+akuma-comconsole = { path = "../crates/akuma-comconsole" }
+# The GDT/TSS descriptors this kernel loads (one core, no userspace yet — the
+# TSS exists so the table is the finished shape, not because ring 3 runs).
+akuma-gdt = { path = "../crates/akuma-gdt" }
+# The IDT (table + lidt) and the trap entry stubs; the fault handlers that make
+# a wrong kernel *reportable* — a #PF prints `[Fault]` and halts instead of
+# triple-faulting the guest into silence.
+akuma-idt-amd64 = { path = "../crates/akuma-idt-amd64" }
+akuma-trap-amd64 = { path = "../crates/akuma-trap-amd64" }
+# The machine's own description of itself: the PVH handoff, the memory map, the
+# virtio-mmio command line.
+akuma-ryzen-amd64 = { path = "../crates/akuma-ryzen-amd64" }
+# The heap allocator (installed here as the global allocator) and the frame
+# allocator `paging` and `virtio` allocate through.
+akuma-alloc = { path = "../crates/akuma-alloc" }
+akuma-pmm = { path = "../crates/akuma-pmm" }
+# The leaf crate every shared crate talks through: the console hook
+# (`safe_print!`), the physmap limit, the virtio window.
+akuma-primitives = { path = "../crates/akuma-primitives" }
+# virtio-mmio block: the root disk's transport and driver, polled.
+akuma-virtio = { path = "../crates/akuma-virtio" }
+# ext2 on that disk: the root filesystem, and the `Filesystem` vocabulary it
+# implements. No VFS mount table yet — that is a later stage's line.
+akuma-ext2 = { path = "../crates/akuma-ext2" }
+akuma-vfs = { path = "../crates/akuma-vfs" }
+# cr0/cr2/cr3/cr4 reads (fault reports, the WP bit), `invlpg`, `park`.
+akuma-cpu = { path = "../crates/akuma-cpu" }
+
+[[bin]]
+name = "taoxichuan"
+path = "src/main.rs"

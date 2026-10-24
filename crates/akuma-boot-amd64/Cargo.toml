@@ -1,0 +1,31 @@
+[package]
+name = "akuma-boot-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The amd64 boot kit, extracted from amd64/src: the PVH/multiboot2 trampoline (boot.s), the physmap translations (phys.rs), the kernel's own page-table mappings (paging.rs), and the heap+PMM bring-up (mem.rs) — everything a composed amd64 kernel needs before it can allocate, pulled as crates instead of inherited as modules"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `PHYSMAP_LIMIT` (the one value `boot.s`'s page-directory count and `phys.rs`
+# both derive from), the `MmioWindow` `paging::map_device_window` hands out, and
+# `safe_print!` — the crate's diagnostics go through the registered print hook
+# so whichever kernel pulls this keeps its own console (ring, framebuffer mirror
+# or a bare COM port).
+akuma-primitives = { path = "../akuma-primitives" }
+# The physical frame allocator: `phys.rs`'s `FreshFrame`, `paging.rs`'s
+# intermediate-table frames, `mem.rs`'s whole second half.
+akuma-pmm = { path = "../akuma-pmm" }
+# The kernel heap allocator `mem.rs` brings up.
+akuma-alloc = { path = "../akuma-alloc" }
+# `MachineDescription`/`MemRegion` — the memory map `mem.rs` walks. No other
+# dependency of that crate, so this edge stays cheap.
+akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64" }
+# The amd64 page-table walker (`paging.rs` is its machine half: the active root,
+# the physmap as `PhysMap`, and the map/unmap/translate wrappers).
+akuma-pagetable = { path = "../akuma-pagetable" }
+# The PTE vocabulary and encoder the walker writes.
+akuma-pte-amd64 = { path = "../akuma-pte-amd64" }
+# `cr3` reads, `invlpg`, `load_cr3` — the register half of `paging.rs`.
+akuma-cpu = { path = "../akuma-cpu" }

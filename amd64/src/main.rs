@@ -168,18 +168,6 @@ mod watchdog;
 mod wifi;
 mod xhci;
 
-#[cfg(target_arch = "x86_64")]
-// `PDS` is the one number `boot.s` is not allowed to know on its own: it sizes
-// the boot page directories, and `phys::PHYSMAP_LIMIT` is what every `phys_to_virt`
-// is checked against. Passing it in as a `const` operand makes them the same
-// value rather than two values that agree today. `boot.s` deliberately contains
-// no other brace, so the whole file is a valid format template.
-core::arch::global_asm!(
-    include_str!("boot.s"),
-    PDS = const phys::PHYSMAP_PDS,
-    options(att_syntax)
-);
-
 /// The kernel heap.
 ///
 /// `#[global_allocator]` is a binary-level declaration, so it lives here rather
@@ -220,6 +208,12 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     serial::init();
+
+    // The print hook, before anything prints through a shared crate:
+    // `akuma-boot-amd64`'s mem bring-up (this kernel's `mem::init`) reports
+    // through `safe_print!`, so the hook must be live by then. Same sink as
+    // `boot::install_shared_sinks` registers (idempotent re-store later).
+    akuma_primitives::console::set_print_hook(serial::puts);
 
     serial::puts("\n");
     serial::puts("Akuma/amd64 — long mode reached\n");
