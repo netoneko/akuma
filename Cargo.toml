@@ -700,6 +700,10 @@ rump-default = ["rump", "akuma-kernel-glue/rump-default"]
 # the built-in server (which is smoltcp-only) would be the one thing still on
 # the native stack.
 userspace-sshd = ["akuma-config/userspace-sshd"]
+# The minimal self-hosting kernel (docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md):
+# the composition root's name in the tree. Build with --no-default-features plus a
+# platform feature (scripts/build_taoxichuan_fc.sh). One line per stage that pulls a crate.
+taoxichuan = ["no-tests", "extreme", "userspace-sshd"]
 
 # The devbox meta-feature: rump is the default stack and there is no built-in
 # SSH. Selected with `--features devbox` (+ the `devbox` profile). Built with

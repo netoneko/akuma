@@ -67,3 +67,32 @@ findings, recorded here, not averaged away.
   redone, not as a pass.
 
 (Entries append below this line, newest stage last.)
+
+### Stage 1 — host track (Sonnet), aarch64 / Firecracker in Lima `fc` — PASS
+
+Built and run by Sonnet on the Mac, not by goose and not by Kimi (Kimi's earlier
+claim was re-done, not trusted).
+
+- **Composition root, now named in the tree:** Cargo feature `taoxichuan`
+  (`no-tests`, `extreme`, `userspace-sshd`) + `platform-firecracker`, built by
+  `scripts/build_taoxichuan_fc.sh`. Zero new Rust source: stage 1 is a feature
+  selection over the existing crate tree. The image is **byte-identical**
+  (`cmp`) to the one from Kimi's ad-hoc `--features no-tests,extreme,userspace-sshd,
+  platform-firecracker` recipe, 662,792 bytes flat (729,136 ELF).
+- **Boot:** `FC_KERNEL=taoxichuan-fc.bin overlays/devbox-firecracker/run.sh --no-net`,
+  1 vCPU, 1 GiB, the existing 2 GiB ext2 `disk.img` on virtio-blk.
+- **Gate evidence** (`/tmp/akuma-fc-boot.log` in the guest, 134 lines):
+  `[FS] Ext2 filesystem mounted at /` -> `[Main] Starting userspace sshd (no
+  supervisor)...` -> `[Main] sshd started (tid=8)`; kernel-spawned, no herd.
+  `grep -c "Fault|PANIC|sig!"` = 0 (the only `fault` text is the `[TLB]
+  stale_write_faults=0` counter). Banner: `Akuma Kernel starting...`.
+- **Control:** with `--no-disk` the same image reaches only `Block device not
+  found`/`Continuing without filesystem` and never spawns init — so "reaches init
+  spawn" needs the disk; a diskless pass would have meant nothing.
+- **Observations, not failures:** the banner says Akuma, not Taoxichuan (a
+  kernel-visible name is still to do); `[unregister] pid=1 tid=8 has NO map owner`
+  follows the sshd start, and `[EXCC] el0=29` shows sshd running at EL0 for a
+  moment; with `--no-net` it has nothing to serve, which is stage 4's business.
+- Metal track (goose, amd64, Akuma KVM) has not reported yet; the stage does not
+  count until it does.
+
