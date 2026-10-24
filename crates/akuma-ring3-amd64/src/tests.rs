@@ -72,6 +72,28 @@ fn parse_computes_phdr_when_no_pt_phdr() {
 }
 
 #[test]
+fn parse_shifts_et_dyn_by_the_pie_base() {
+    // Static-PIE shape (Alpine's apk.static): ET_DYN, link addresses near
+    // zero. Every placed address — entry, phdrs, segments, image end — is
+    // the link address plus PIE_BASE; nothing else moves.
+    let mut image = sample_image();
+    image[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    // Overwrite the three phdrs for a near-zero link map (entry/phdr too).
+    image[24..32].copy_from_slice(&0x10a7u64.to_le_bytes());
+    image[0x40..0x40 + 56].copy_from_slice(&phdr(1, 5, 0x0, 0x0, 0x1000, 0x1000));
+    image[0x40 + 56..0x40 + 112].copy_from_slice(&phdr(1, 6, 0x2000, 0x2000, 0x200, 0x300));
+    image[0x40 + 112..0x40 + 168].copy_from_slice(&phdr(6, 4, 0x40, 0x40, 168, 168));
+    let img = Image::parse(&image).expect("static-PIE parses");
+    let b = PIE_BASE;
+    assert_eq!(img.entry(), 0x10a7 + b);
+    assert_eq!(img.phdr_va(), 0x40 + b, "PT_PHDR shifted too");
+    let segs = img.segments();
+    assert_eq!(segs[0].vaddr, 0 + b);
+    assert_eq!(segs[1].vaddr, 0x2000 + b);
+    assert_eq!(img.image_end(), 0x2300 + b);
+}
+
+#[test]
 fn parse_rejects_bad_images() {
     let good = sample_image();
     assert!(matches!(Image::parse(&good[..32]), Err(LoadError::Magic)), "truncated before the header ends");
