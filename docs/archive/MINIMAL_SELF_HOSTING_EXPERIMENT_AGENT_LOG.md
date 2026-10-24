@@ -765,3 +765,41 @@ tokens) was about 76% spent at the end. The restart paid for itself: a fresh 59k
 **State left on the box.** `vm-dev` is running at the owner's request so they can ssh in (`vm-serve-mc` halted); restore with
 `herd stop vm-dev; herd disable vm-dev; herd start vm-serve-mc`. The next stage needs a quota refill (reset ~02:39 IDT) and a stage-5
 brief; none is written.
+
+### Stage 6 — planning and session A (offline apk), supervisor view (Sonnet), 2026-10-25 00:02-01:05 IDT
+
+**Plan.** goose-glm (planning only, 15 min, ~3% of a window) wrote `TAOXICHUAN_STAGE6_PLAN.md` (`f61ca77e`): ~32 missing
+core syscall arms in three phases, `nr 4415` identified as the private `UPTIME` (`0x1000 + 319`; verified), outbound
+via `vm_outbound = true` and a host-local HTTP mirror, the clock from `epoch=` on the kernel command line, milestones
+M0-M7, 2-3 sessions. Supervisor concern recorded: the plan's host reference ran `apk.static` on the Akuma box itself, so a
+bug could be shared by reference and subject; the supervisor computes the reference on the Mac with plain `tar`.
+
+**Staging (supervisor).** Because the quota left (~20%) would be lost at the 02:44 reset, the owner asked for a no-network
+variant: `/boot/akuma-dev-root-apk.img` = the stage-4 root (16 MiB, fsck-clean, 2,053 blocks free after) plus
+`/bin/apk.static` (apk-tools-static 3.0.8-r0, **static-PIE**, 5,470,888 B), `/pkgs/ca-certificates-bundle-20261020-r0.apk`
+(real, signed, no deps, no scripts), the Alpine release keys and apk config. Built on the Mac with e2fsprogs `debugfs -w`
+(not resized, to avoid new ext2 features the guest driver may not read), moved to the box over HTTP with matching sha256,
+`.orig` kept for fresh-copy boots. Independent expected result: `/etc/ssl/certs/ca-certificates.crt` sha256 `5961c0a3...3f568b`
+plus three symlinks (`/root/dev-cycle/taoxichuan-s6/EXPECTED.txt`).
+
+**Session A (`taoxichuan-06a-offline-apk.md`, sent 00:33).** goose committed the ET_DYN static-PIE base in the ring-3 loader
+plus phase A/C syscall arms (`06070926`, host tests green incl. a new ET_DYN test) in 20 min, booted the apk image
+cleanly, then stopped on the quota at 01:04:08 (the error prints China time: reset `2026-10-25 07:44:08` = **02:44:08 IDT**,
+not 02:39: the window opens at the first request). Services restored by the supervisor; tree clean; nothing lost.
+
+**Finding that reframes stage 4.** `/var/log/herd/vm-dev.log` shows for every ssh exec: `'/bin/sh' failed to spawn,
+retrying with the built-in emergency shell /bin/paws`, then `both failed to spawn, running built-in paws in-process`. This is in
+the stage-4 boot too. So the stage-4 gate passed (`echo`, `cat`) on **paws builtins inside sshd; no external binary has ever
+been spawned from an ssh session in the Taoxichuan kernel**, which also explains `ls /bin` failing. The gate as pinned in the
+experiment doc (output byte-equal, exec-only) is satisfied; "sshd spawns a real command" is not. Fix is the first item of the
+next brief (`taoxichuan-06b-spawn-then-apk.md`); G1 (`apk.static --version`) cannot pass before it.
+
+**Fans.** The owner's fans were the `vm-dev` guest, not goose: the Taoxichuan kernel's sleep loop polls the NIC and never halts
+its vCPU, so core 4 sat at 100% (`guest=99.8%` in the host's `[KVM] cpu:` line) while `vm-serve-mc`'s full kernel idles at ~7%.
+Rule: stop `vm-dev` when a session ends. A `hlt`/idle path in the guest's wait loop is a real follow-up (needs a wake source:
+kvm0 raises no NIC interrupt, so it needs a timer exit). `goose serve` did not spin after the stop/start restarts
+(`GOOSE_SERVE_IDLE_SPIN.md`).
+
+**Quota (from `sessions.db`).** Session A (`20261024_35`-ish) used the last ~18% of the window in ~31 min (full read
+unavailable after the stop). Window arithmetic: ~41M input tokens per 5 h; stage 4 part 1 burned it at ~60%/h with a 220k
+context, part 2 and the planning and 6A sessions at ~10-35%/h with fresh contexts.
