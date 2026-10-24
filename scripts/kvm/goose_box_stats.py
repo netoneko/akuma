@@ -17,7 +17,11 @@ since = sys.argv[1] if len(sys.argv) > 1 else dt.datetime.utcnow().strftime("%Y-
 d = "/tmp/gbs"
 os.makedirs(d, exist_ok=True)
 for f in ("sessions.db", "sessions.db-wal", "sessions.db-shm"):
-    shutil.copy("/root/.local/share/goose/sessions/" + f, d + "/" + f)
+    src = "/root/.local/share/goose/sessions/" + f
+    if os.path.exists(src):  # the wal/shm vanish when goose checkpoints
+        shutil.copy(src, d + "/" + f)
+    elif os.path.exists(d + "/" + f):
+        os.remove(d + "/" + f)  # a stale copy from a previous run would corrupt the read
 c = sqlite3.connect(d + "/sessions.db")
 fmt = "%Y-%m-%d %H:%M:%S"
 q = ("select s.id, s.name, s.created_at, s.updated_at, count(u.session_id), sum(u.input_tokens), sum(u.output_tokens),"
