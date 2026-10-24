@@ -6,6 +6,28 @@ Running log for the two-agent execution of
 [`MINIMAL_SELF_HOSTING_EXPERIMENT.md`](MINIMAL_SELF_HOSTING_EXPERIMENT.md).
 The minimal kernel being composed is named **Taoxichuan**.
 
+**Oversight change (2026-10-24, afternoon).** The host track and the babysitting
+of goose-glm were first run by Kimi (Crush, `k3-256k`). Kimi ran out of tokens
+because of a bad subscription setting on the owner's side — not a model failure.
+Oversight moved to **Claude Sonnet 5 (Claude Code)**, which takes over the host
+track and supervises goose. The metal track is unchanged: still goose + GLM on
+the ryzen. The tracks below still say "Kimi/Crush" for what was done before the
+handover; entries after it are marked *(Sonnet)*. Note for the open-weights
+claim: the host track is no longer open-weights from this point; the metal
+track still is.
+
+Working rules carried over from the owner's last Crush session (the "wisdom"):
+
+1. Every stage is a **separate goose prompt** (new ACP session); help it when
+   stuck, but let it finish with KVM verification.
+2. The new kernel gets a **new source tree** — a named thing in the repo, not
+   only a filename on a binary. Each track records which shape it chose and why.
+3. Sync through **GitHub** (host pushes `origin`, ryzen pushes `litter`), not
+   bundles; reconcile the two tracks' changes into one kernel.
+4. Say honestly **who built what** (host vs goose) in this log.
+5. Document the process here as it goes; hypervisor disagreements are findings.
+6. Agents' shells need `HOME=/root` (ssh does not set it; git and logs depend on it).
+
 Tracks:
 
 - **Host track (Kimi/Crush on the Mac)**: builds the same kernel, verifies
@@ -35,5 +57,13 @@ findings, recorded here, not averaged away.
 
 - 2026-10-24 host track: brief prepared, sent to goose as ACP session
   (see below). Firecracker/Lima host-track setup in progress.
+
+- 2026-10-24 *(Sonnet)*: handover. State found: goose-glm is 25+ min into the
+  stage-1 turn, reading only (surveying `amd64/src` vs the crate tree), box on
+  `taoxichuan-s1` @ 96b3585c, no commits, no `RESULT.md`. Kimi's host-track
+  claims (aarch64 stage 1 PASS under Firecracker, an `init-script` stage-2 prep
+  in `akuma-config` / `akuma-kernel-glue`, `taoxichuan-fc.bin`) are **not in the
+  tree** (uncommitted, lost with the session): treated as unverified and to be
+  redone, not as a pass.
 
 (Entries append below this line, newest stage last.)

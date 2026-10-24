@@ -1,6 +1,10 @@
 # The minimal self-hosting kernel — experiment brief
 
-**Status: brief, not started. Date: 2026-10-23.**
+**Status: in progress (started 2026-10-24); see [`MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md`](MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md). Date: 2026-10-23.**
+
+**Oversight note (2026-10-24):** the host track and goose supervision moved from
+Kimi to Claude Sonnet 5 after Kimi ran out of tokens (a bad subscription setting
+on the owner's side). The metal track is still goose + GLM.
 
 Prepared as part of rust.org.il talk prep
 ([`RUST_ORG_IL_TALK.md`](RUST_ORG_IL_TALK.md)) — the talk's composability
