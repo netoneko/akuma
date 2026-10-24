@@ -349,3 +349,46 @@ pass contributed no source changes (the merge was already up to date and
   sibling is a segment-trimmed copy of the same boot).
 - `vm-serve-mc` running at the end. Nothing above rewritten, nothing left
   uncommitted.
+
+### Stage 1 — host track (Kimi, goose on the Mac), aarch64 check of the merged tree — 2026-10-24 — PASS
+
+The supervision moved from Crush to goose (`k3-256k`, low effort) on the Mac; this is
+that session's step 4 for stage 1, run after goose-glm's 01b finish landed on `litter`.
+
+- **Merge:** `litter/taoxichuan-s1` @ `d2781860` into `rust-org-il-experiment`
+  (`bd59f4aa`) — clean, no conflict (the expected agent-log append conflict did not
+  materialize; the two sides' appends were disjoint). Tree gained only the skyline
+  banner in `taoxichuan/src/main.rs` and the two metal-track log sections.
+- **Compiles (aarch64):** `scripts/build_taoxichuan_fc.sh` → `taoxichuan-fc.bin`,
+  662,792 B, 12.9 s incremental. No portability fix needed this round; the merge did
+  not touch the aarch64 feature-set path.
+- **Boots (Lima `fc`):** `FC_KERNEL=taoxichuan-fc.bin overlays/devbox-firecracker/run.sh
+  --no-net`; console `/tmp/akuma-fc-boot.log`, 164 lines. Banner `Akuma Kernel
+  starting...` (line 12), `[FS] Ext2 filesystem mounted at /` (line 77), `[Main]
+  Starting userspace sshd (no supervisor)...` / `sshd started (tid=8)` (lines
+  117-118). `grep -c "Fault\|PANIC\|sig!"` = 0.
+- **Control:** the same image with `--no-disk` stops at `[Block] Block device not
+  found` / `Continuing without filesystem...` and spawns no sshd (count 0) — the
+  gate still means something.
+- **Disagreements:** none. Both tracks pass the stage-1 gate, on different kernels:
+  goose's new `taoxichuan` crate (amd64, PVH, halts at the gate line) vs the
+  feature-set composition (aarch64, Firecracker, spawns a real sshd). Parity of
+  intent, as recorded before.
+- **goose-glm cost (from `sessions.db` on the box):**
+  - stage 1 main, session `20261024_9` (`glm-5.3`): 77.2 min wall, 142 LLM calls,
+    16,057,961 input tokens (15,736,512 cache reads, 98.0%), 68,932 output,
+    largest context 181,081.
+  - 01b finish, two independent runs (`glm-5.3-flash`, low effort): session
+    `20261024_22` = 23.2 min, 47 calls, 1,416,929 in / 32,453 out, max_ctx 46,778;
+    session `20261024_24` = 24.3 min, 48 calls, 1,774,288 in / 42,094 out,
+    max_ctx 60,907. The two runs agree on every gate fact (see the re-verification
+    section above). Flash at low effort costs roughly a tenth of the input tokens
+    of the `glm-5.3` run for a paperwork-sized task.
+- **Tooling note:** the duplicate 01b send (the `send_after_reset.py` leftover, see
+  the owner's note) ran to completion with no harm — its re-verification section is
+  its output. The supervisor now sends only when no `goose_acp_prompt` driver is
+  alive.
+
+**Stage 1 counts: both tracks pass the gate.** Next: stage 2 (userspace works — a
+static musl hello runs, exit 0, output matches the host-built binary), brief
+`scripts/kvm/goose/taoxichuan-02-hello.md`.
