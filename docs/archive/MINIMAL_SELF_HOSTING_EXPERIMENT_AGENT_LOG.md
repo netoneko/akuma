@@ -601,3 +601,66 @@ the binary and the reference output.
   roughly 40M input tokens at flash weight (an estimate from one data point).
 - **Also this stage:** the owner asked that every brief tell goose to commit and push every 20 minutes when something is
   uncommitted (stage 3 sat uncommitted ~45 min), and to gate all amd64-specific code; both are in the 3b brief.
+
+### Stage 3 — metal track (goose-glm), finish — 2026-10-24 — PASS
+
+*2026-10-24 ~22:00 IDT, `glm-5.3-flash` (low effort), the 03b continuation session. Branch `taoxichuan-s3`;
+gate commit `6c4602b7`, merged `origin/rust-org-il-experiment` (`f22e0d5d`) as a clean fast-forward before any
+of this. No code changes this session — composition was done at the gate; this is the paperwork.*
+
+**What was composed (recap of the gate commit).** Over stage 2's ring-3 crossing, the fd table pulled in as
+`akuma-fdtable` (the arch-neutral fd-decision state machine, zero deps; this kernel supplies the effects,
+16 fixed slots) and the syscalls busybox needs to answer a prompt and list a directory: `open`/`openat`
+(absolute paths, `AT_FDCWD` only, read-only), `getdents64` (from the listing cached on the open description),
+`stat`/`lstat` (the legacy x86_64 numbers musl maps to), `fcntl` fd-flag commands, `rt_sigaction`/
+`rt_sigprocmask` accepted no-ops (no delivery exists), `clock_gettime`/`gettimeofday` zeroed (no clock,
+honestly). The task model is sequential by design: `exit_group` no longer halts, it reports and chains the
+next program from the cmdline (`init=`/`initargs=`, `then=`/`thenargs=`), kernel-reaped — `fork` was not
+needed because the gate is two non-interactive programs, and not having it kept the address-space story at
+"one image at a time, eager-mapped".
+
+**The bug of the stage** (in the gate commit message, worth restating): `SyscallFrame` listed r10/r8/r9 in
+push order; the stack holds r9/r8/r10 — args 4 and 6 were swapped for every syscall with more than three
+arguments. Latent through stage 2 (nothing took >3 args), fatal at the first mmap: musl's flags arrived in
+the offset slot, the anonymous check failed, malloc OOM'd. The first symptom was `echo: out of memory`, the
+second the `-ENOSYS` arm printing unhandled nr 228 (`openat`) and 96 (`getdents64`) — both fixed from the
+printed numbers. Struct fixed to memory order; the offset test now pins all 15 slots.
+
+**Numbers:** 15 crates (14 + `akuma-fdtable`), `taoxichuan/src/main.rs` 1,790 lines, release binary
+266,752 B (198,072 B at stage 2).
+
+**Gate evidence, clean single boot from the merged tree** (`/root/dev-cycle/taoxichuan-s3/vm-dev-pass.log`,
+4,205 B; the previous file was a 3 KB trim): `kbuild -j 4 -p taoxichuan --features no-tests`,
+`install_kernel_amd64.sh` → `/boot/akuma-guest-dev` (266,752 B, md5 verified), `herd start vm-dev`
+(stage-3 cmdline kept: `init=/bin/busybox initargs=echo,hello-from-taoxichuan-stage-3 then=/bin/busybox
+thenargs=ls,/bin`). Console: `hello-from-taoxichuan-stage-3` (exit 0), `ls /bin` → `busybox`, `hello`, `sh`
+(exit 0), `Taoxichuan: stage 3 gate reached -- sequential tasks ran clean, outputs above`, guest halts.
+Fault grep (`page fault|panic|oops|unhandled`) over the segment: **0**; KVM `exc=0`.
+
+**Byte-compare (done at the gate, verified by the supervisor, recorded here for the file):**
+`ref-echo.out == guest-echo.out` and `ref-ls.out == guest-ls.out`, SHA256
+`137128a9…` (echo) and `ddec525c…` (ls) in `refs/SHA256SUMS.ref`.
+
+**Main amd64 kernel regression boot as guest** (`vm-dev-main-amd64.log`, 10,976 B): `kbuild -j 4 --features
+no-tests` (akuma-amd64, 11,089,888 B) into the same `akuma-guest-dev` slot, cmdline back on the stage-1 line
+`init=/bin/busybox initargs=sh,/etc/guest.sh`: banner, ext2 root mounted, SmolNet up (virtio-net, DHCP
+configured, 10.0.2.15/24), `AKUMA-GUEST-UP`, busybox md5 `ebce43017d2cb316ea45e08374de7315`,
+`AKUMA-GUEST-DONE`, init exited, guest halted; fault grep **0**, `exc=0`. DNS/SNTP timed out as expected
+(no upstream). Services restored: `vm-serve-mc` running (pid 8815), `vm-dev` stopped and disabled,
+`/etc/herd/available/vm-dev.conf` left on the stage-1 busybox line.
+
+**New gotcha for the next VM dance:** the KVM loader does not read `/etc/herd/available/vm-dev.conf` at
+start — it reads the compiled `/var/run/herd/vm-dev.vm`, and `herd enable` on an already-enabled service
+does NOT re-emit it from the (updated) conf; the daemon keeps its own first-enable copy. Editing the conf
+and stop/enable/start still booted the old cmdline twice before I found it. Fix: `sed` the `.vm` file
+directly, then `herd start` (start does not reload config). The guest-side tell is cheap: wrong cmdline
+prints `hello-from-taoxichuan-stage-3`, right one prints the busybox md5.
+
+**Cost:** this session cannot see its own meter (no `sessions.db` readable from inside); the supervisor's
+stage-3 numbers above (session `20261024_28`: 66.3 min, 169 calls, 17.57M input / 96K output) stand, and
+this continuation adds the paperwork boots (two guest boots, one 53 s kernel build) plus docs on top.
+`RESULT.md` written at `/root/dev-cycle/taoxichuan-s3/RESULT.md` with the stage-4 advice (sshd needs: a
+network path — virtio-net exists in the main kernel's SmolNet, not in taoxichuan; sockets — none in
+taoxichuan today; fork-or-not — taoxichuan is sequential-only, no fork/clone/execve; `/dev/null` and
+`/dev/urandom` — no device layer, and no entropy source, `AT_RANDOM` is still the deterministic canary;
+host key — no writable files, read-only `open` only).
