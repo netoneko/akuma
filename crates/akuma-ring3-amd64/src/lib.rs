@@ -41,6 +41,7 @@
 // with a long paragraph on purpose (the why lives in the first block).
 #![allow(clippy::too_long_first_doc_paragraph)]
 
+#[cfg(target_arch = "x86_64")]
 use akuma_cpu::msr::{self, Msr};
 
 #[cfg(test)]
@@ -431,23 +432,28 @@ pub fn canary_byte(i: u64) -> u8 {
 pub const SYSCALL_STACK_SIZE: usize = 16 * 1024;
 
 #[repr(align(16))]
+#[cfg(target_arch = "x86_64")]
 struct SyscallStack(#[allow(dead_code)] [u8; SYSCALL_STACK_SIZE]);
+#[cfg(target_arch = "x86_64")]
 static SYSCALL_STACK: SyscallStack = SyscallStack([0; SYSCALL_STACK_SIZE]);
 
 /// The stack top the stub switches to. Fixed at first use: `enable_syscalls`
 /// stores it (a static's address is a link-time fact, but casting one to an
 /// integer is not const-evaluable, so the value is written at runtime rather
 /// than computed in a `static` initializer).
+#[cfg(target_arch = "x86_64")]
 static SYSCALL_STACK_TOP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Where the stub parked the interrupted user `RSP` before switching away.
 /// `syscall` does not hand over a stack pointer in a register, and the user
 /// stack must not be touched before the kernel chooses to, so the stash is
 /// kernel memory. Single core, `IF` off: no other writer exists.
+#[cfg(target_arch = "x86_64")]
 static USER_RSP_STASH: u64 = 0;
 
 /// The kernel's dispatcher, stored as an address so the naked stub can `call`
 /// it through memory (a naked function has no Rust-level names to reach).
+#[cfg(target_arch = "x86_64")]
 static DISPATCH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// The frame the stub builds on the kernel stack, one field per pushed
@@ -513,6 +519,7 @@ pub type Dispatcher = fn(&mut SyscallFrame) -> u64;
 
 /// Install `dispatcher` and point `EFER.SCE`/`STAR`/`LSTAR`/`SFMASK` at the
 /// stub. Call once, before the first ring-3 entry.
+#[cfg(target_arch = "x86_64")]
 pub fn enable_syscalls(dispatcher: Dispatcher) {
     DISPATCH.store(dispatcher as usize, core::sync::atomic::Ordering::Relaxed);
     SYSCALL_STACK_TOP.store(
@@ -579,6 +586,7 @@ impl SyscallFrame {
 #[doc(hidden)]
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
+#[cfg(target_arch = "x86_64")]
 pub extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
         // In: RAX = nr, RCX = user RIP, R11 = user RFLAGS, RSP = user RSP
@@ -651,6 +659,7 @@ pub extern "C" fn syscall_entry() {
 /// and the user half (it executes there afterwards). Naked on purpose: the
 /// body is the crossing, and the pointer arrives in `RDI` per the C ABI.
 #[unsafe(naked)]
+#[cfg(target_arch = "x86_64")]
 pub unsafe extern "C" fn enter_user(f: &EntryFrame) -> ! {
     core::arch::naked_asm!(
         // The frame pointer is RDI; every load is spent against it, and the
@@ -701,6 +710,14 @@ pub mod nr {
     pub const BRK: u64 = 12;
     /// `ioctl(2)`.
     pub const IOCTL: u64 = 16;
+    /// `close(2)` — the fd-table counterpart to `openat`'s allocation.
+    pub const CLOSE: u64 = 3;
+    /// `rt_sigaction(2)` — accepted and recorded-not: this kernel has no
+    /// signal delivery, so a registration has nothing to attach to. Returning
+    /// success for a no-op is what lets musl's startup proceed.
+    pub const RT_SIGACTION: u64 = 13;
+    /// `rt_sigprocmask(2)` — same no-op contract as `RT_SIGACTION`.
+    pub const RT_SIGPROCMASK: u64 = 14;
     /// `getpid(2)`.
     pub const GETPID: u64 = 39;
     /// `getuid(2)`.
@@ -717,8 +734,27 @@ pub mod nr {
     pub const ARCH_PRCTL: u64 = 158;
     /// `set_tid_address(2)`.
     pub const SET_TID_ADDRESS: u64 = 218;
+    /// `getdents64(2)` — the directory read `ls` walks a directory with.
+    pub const GETDENTS64: u64 = 217;
+    /// `openat(2)` — the one path in; `dirfd` must be `AT_FDCWD` (absolute
+    /// paths only: this kernel has no working directory).
+    pub const OPENAT: u64 = 257;
     /// `exit_group(2)` — musl's `exit(3)` calls this.
     pub const EXIT_GROUP: u64 = 231;
+}
+
+/// `openat(2)` flag bits (x86_64) and `dirfd` special values.
+pub mod open {
+    /// `O_ACCMODE` mask: `O_RDONLY` is 0 — the only access mode the
+    /// read-only-in-spirit root serves.
+    pub const O_ACCMODE: u64 = 0b11;
+    /// `O_CREAT` — rejected: no write path exists on the root.
+    pub const O_CREAT: u64 = 0x40;
+    /// `O_DIRECTORY` — the caller wants a directory; anything else is
+    /// `ENOTDIR`.
+    pub const O_DIRECTORY: u64 = 0x1_0000;
+    /// `AT_FDCWD`: the only `dirfd` this kernel serves (absolute paths only).
+    pub const AT_FDCWD: u64 = (-100i64) as u64;
 }
 
 /// errno values, negated on return.
@@ -727,13 +763,25 @@ pub mod err {
     pub const EPERM: u64 = 1;
     /// No such file or directory.
     pub const ENOENT: u64 = 2;
+    /// I/O error (the filesystem refused a read the dispatcher asked for).
+    pub const EIO: u64 = 5;
     /// No such device (mmap of something that is not anonymous or a device
     /// this kernel serves).
     pub const ENODEV: u64 = 19;
+    /// Not a directory (`O_DIRECTORY` opened on a file; `getdents64` on an fd
+    /// that is not a directory).
+    pub const ENOTDIR: u64 = 20;
+    /// Is a directory (`read(2)` on a directory fd).
+    pub const EISDIR: u64 = 21;
+    /// Permission denied (`openat` with a write access mode on a root this
+    /// kernel does not write).
+    pub const EACCES: u64 = 13;
     /// Bad file descriptor.
     pub const EBADF: u64 = 9;
     /// Out of memory.
     pub const ENOMEM: u64 = 12;
+    /// Too many open files (the fd table's fixed slot ceiling).
+    pub const EMFILE: u64 = 24;
     /// Bad address.
     pub const EFAULT: u64 = 14;
     /// Invalid argument.
