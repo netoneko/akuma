@@ -57,6 +57,14 @@ akuma-cpu = { path = "../crates/akuma-cpu" }
 # `PteProt`/`MemAttr` for the user mappings arrive via `akuma-boot-amd64`'s
 # `paging` re-export.
 akuma-ring3-amd64 = { path = "../crates/akuma-ring3-amd64" }
+# ---- The stage-3 crate line -------------------------------------------------
+#
+# The fd *decisions* (lowest-free allocation, close, the flags sets), extracted
+# from `amd64/src/fd.rs` long before this kernel existed and host-tested with
+# zero dependencies: this kernel keeps a few fixed slots of it per task and
+# supplies the effects itself (an open description here is a path on the ext2
+# root, nothing to reference-count).
+akuma-fdtable = { path = "../crates/akuma-fdtable" }
 
 [[bin]]
 name = "taoxichuan"

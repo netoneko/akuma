@@ -21,6 +21,27 @@
 //! for musl's startup. One task, one core, no scheduler — the task that only
 //! exits does not need one.
 //!
+//! # Stage 3 — busybox, sequentially
+//!
+//! The gate: the guest runs `busybox echo <fixed string>` and
+//! `busybox ls <fixed directory on the ext2 root>` as kernel-spawned
+//! programs, each byte-identical to the reference (the same binary run on the
+//! box against the same file set), exit code 0, zero fault lines. No shell,
+//! no pty, no `fork`: the two programs are *sequential kernel-reaped tasks* —
+//! spawn, run to `exit`, then spawn the next. `exit_group` does not halt the
+//! machine any more; it reports, and the boot sequence continues with the
+//! next program on the command line (`init=`/`initargs=` for the first,
+//! `then=`/`thenargs=` for each follow-up). What the applets needed beyond
+//! stage 2: an fd table (pulled, not written: `akuma-fdtable`, the extracted
+//! fd-*decision* crate — this kernel supplies the effects, a few fixed slots
+//! of it per task), and the syscalls their startup and their work ask for:
+//! `openat` (absolute paths only, `AT_FDCWD` only, read-only), `getdents64`
+//! (served from the directory listing cached on the open description),
+//! `close`, `read` (a file fd, or `EOF` on the console's stdin — there is no
+//! input path), and `rt_sigaction`/`rt_sigprocmask` as accepted no-ops: there
+//! is no signal delivery to register against, and saying so beats failing
+//! startup on a service the kernel never promised.
+//!
 //! # Stage 1 — boots in KVM
 //!
 //! The gate: reach init spawn, print the banner on the guest console, zero
@@ -74,7 +95,8 @@ use akuma_trap_amd64::{InterruptStackFrame, Kind, Trap};
 use akuma_vfs::Filesystem;
 use akuma_boot_amd64::paging::{MemAttr, PteProt};
 use akuma_ring3_amd64 as ring3;
-
+use akuma_fdtable as fdtable;
+use alloc::vec::Vec;
 /// The heap. `#[global_allocator]` is a binary-level declaration; the crate
 /// exports the implementation, this kernel installs it.
 #[global_allocator]
@@ -406,6 +428,23 @@ fn no_clock() -> u64 {
     0
 }
 
+/// The mounted ext2 root, from `kmain`'s mount point and from every fd
+/// syscall. Stage 3's move out of `kmain`'s frame: `openat`/`getdents64`
+/// answer from ring-0 syscall context, which has no access to a local.
+///
+/// SAFETY: one core; every touch is either before ring 3 exists or inside
+/// the syscall dispatcher (`IF` clear from `syscall`'s own masking) — the
+/// same discipline `task()` documents. `Ext2Filesystem` is `Send + Sync`
+/// (`akuma-vfs`'s `Filesystem` supertraits); the interior lock is a spinlock
+/// that never blocks on anything this kernel runs.
+static mut ROOT_FS: Option<akuma_ext2::Ext2Filesystem<Vda>> = None;
+
+/// The mounted root, for the dispatcher. Panics if called before the mount —
+/// which no caller does: the mount precedes the first ring-3 crossing.
+fn root_fs() -> &'static akuma_ext2::Ext2Filesystem<Vda> {
+    // SAFETY: see above; the Option is always Some past `kmain`'s mount.
+    unsafe { (&*core::ptr::addr_of!(ROOT_FS)).as_ref().unwrap() }
+}
 // ---------------------------------------------------------------------------
 // The banner — printed at the init-spawn point, where the full kernel prints
 // its own: the last thing on the console before the machine would hand over.
@@ -442,7 +481,7 @@ fn banner() {
     console::puts(ART);
     console::puts("\n  Taoxichuan ");
     console::puts(env!("CARGO_PKG_VERSION"));
-    console::puts(" (Akuma/amd64 crates) x86_64 -- stage 2\n\n");
+    console::puts(" (Akuma/amd64 crates) x86_64 -- stage 3\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -460,8 +499,33 @@ const MMAP_BASE: u64 = 0x0000_6000_0000_0000;
 /// Cap on one `write(2)`: the console is a serial line, not a disk.
 const WRITE_LIMIT: u64 = 1 << 20;
 
+/// The fd table's fixed slot ceiling — "a few fixed slots" is the pinned
+/// shape for this stage. fds 0/1/2 are the console (write-only) and never
+/// enter the table; 3..SLOT_CEILING is what `openat` may hand out. The
+/// *decisions* (lowest free, close, the flag sets) are `akuma-fdtable`'s.
+const SLOT_CEILING: u32 = 16;
+
+/// One open description: what an fd in the table names. A directory caches
+/// its `read_dir` listing at open time (this kernel's `getdents64` serves the
+/// cache; the ext2 root is read-only in spirit, so the listing cannot go
+/// stale behind the task's back), with the cursor the next `getdents64`
+/// resumes from. A regular file carries the inode number and its own cursor.
+/// Paths are not kept: nothing at this stage resolves through an fd.
+enum OpenFile {
+    Dir {
+        entries: Vec<akuma_vfs::DirEntry>,
+        cursor: usize,
+    },
+    File {
+        inode: u32,
+        offset: u64,
+        size: u64,
+    },
+}
+
 /// The one task: its root page table, the user ranges a pointer may name, the
-/// heap cursors, and the exit code once captured.
+/// heap cursors, its fd table's three `akuma-fdtable` parts, and the exit
+/// code once captured.
 struct Task {
     root_pa: u64,
     regions: [(u64, u64); 16],
@@ -471,6 +535,9 @@ struct Task {
     brk_end: u64,
     mmap_cur: u64,
     exit: Option<u64>,
+    fd_names: fdtable::Names<OpenFile>,
+    fd_cloexec: fdtable::FlagSet,
+    fd_nonblock: fdtable::FlagSet,
 }
 
 static mut TASK: Task = Task {
@@ -482,6 +549,9 @@ static mut TASK: Task = Task {
     brk_end: 0,
     mmap_cur: MMAP_BASE,
     exit: None,
+    fd_names: fdtable::Names::new(),
+    fd_cloexec: fdtable::FlagSet::new(),
+    fd_nonblock: fdtable::FlagSet::new(),
 };
 
 /// The task, for the spawn path and the dispatcher.
@@ -550,6 +620,57 @@ fn copy_from_user(dst: &mut [u8], src_va: u64) -> bool {
     true
 }
 
+/// Copy `src` into the task's address space at `dst_va`, one page at a time
+/// through the physmap — `copy_from_user`'s mirror, for syscalls that fill
+/// user buffers (`getdents64`, `read`). False (`-EFAULT`) when a page does
+/// not translate; the regions check is the gate, this is the backstop.
+fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
+    let root = task().root_pa;
+    let mut done = 0usize;
+    while done < src.len() {
+        let va = dst_va + done as u64;
+        let page_rem = 4096 - (va & 0xFFF) as usize;
+        let n = page_rem.min(src.len() - done);
+        let Some(pa) = paging::translate_in(root, (va & !0xFFF) as usize) else {
+            return false;
+        };
+        // SAFETY: `pa + off` is a PMM frame inside the physmap (alloc_page's
+        // contract), `n` stays within the frame by construction, and the page
+        // is a task page this kernel mapped RW (or RO, for image bytes —
+        // every caller writes only into stack/heap/scratch regions).
+        let dst = phys::phys_ptr::<u8>(pa + (va & 0xFFF));
+        unsafe {
+            core::ptr::copy_nonoverlapping(src[done..].as_ptr(), dst, n);
+        }
+        done += n;
+    }
+    true
+}
+
+/// Read a NUL-terminated path from the task at `src_va` into `buf`, returning
+/// the `&str` it held. `None` (`-EFAULT` at the call site) on a bad byte or
+/// no terminator inside `buf.len()`.
+fn user_str(src_va: u64, buf: &mut [u8]) -> Option<&str> {
+    for i in 0..buf.len() {
+        let mut one = [0u8; 1];
+        if !copy_from_user(&mut one, src_va + i as u64) {
+            return None;
+        }
+        if one[0] == 0 {
+            return core::str::from_utf8(&buf[..i]).ok();
+        }
+        buf[i] = one[0];
+    }
+    None
+}
+
+/// Borrow the task's fd table as one `akuma-fdtable` view. The single-core,
+/// `IF`-off discipline that owns `task()` owns this too.
+fn fd_table() -> fdtable::FdTable<'static, OpenFile> {
+    let t = task();
+    fdtable::FdTable::of(&mut t.fd_names, &mut t.fd_cloexec, &mut t.fd_nonblock)
+}
+
 /// Copy `len` bytes of task memory at `buf_va` into the console, chunked.
 /// False on a bad pointer (`-EFAULT` at the call site).
 fn emit(buf_va: u64, len: u64) -> bool {
@@ -577,6 +698,80 @@ fn emit(buf_va: u64, len: u64) -> bool {
 /// `printf`-and-exit `main` issue, and nothing else. Unknown numbers answer
 /// `-ENOSYS` — the honest answer, and the one musl's `printf` path survives
 /// for everything it merely probes.
+/// The open body shared by `openat` (with its `AT_FDCWD` check at the call
+/// site) and legacy `open`: resolve the absolute path on the ext2 root, build
+/// the open description, take the lowest free fd slot. Absolute paths only,
+/// read-only access only: the root is read-only in spirit and this kernel has
+/// no write path to lie about.
+fn open_common(path_va: u64, flags: u64) -> u64 {
+    if flags & ring3::open::O_ACCMODE != 0 || flags & ring3::open::O_CREAT != 0 {
+        return e(ring3::err::EACCES);
+    }
+    let mut pbuf = [0u8; 128];
+    let Some(path) = user_str(path_va, &mut pbuf) else {
+        return e(ring3::err::EFAULT);
+    };
+    if !path.starts_with('/') {
+        return e(ring3::err::ENOENT); // nothing to resolve ".." against
+    }
+    let fs = root_fs();
+    let Ok(md) = fs.metadata(path) else {
+        return e(ring3::err::ENOENT);
+    };
+    if !md.is_dir && flags & ring3::open::O_DIRECTORY != 0 {
+        return e(ring3::err::ENOTDIR);
+    }
+    let desc = if md.is_dir {
+        // The listing is the open description's payload: `getdents64`
+        // serves the cache, the root cannot change behind the task.
+        match fs.read_dir(path) {
+            Ok(entries) => OpenFile::Dir { entries, cursor: 0 },
+            Err(_) => return e(ring3::err::EIO),
+        }
+    } else {
+        match fs.resolve_inode(path) {
+            Ok(inode) => OpenFile::File { inode, offset: 0, size: md.size },
+            Err(_) => return e(ring3::err::EIO),
+        }
+    };
+    let mut table = fd_table();
+    let Some(_slot) = table.free_below(3, SLOT_CEILING) else {
+        return e(ring3::err::EMFILE);
+    };
+    let fd = table.alloc_fd_from(3, desc);
+    if flags & ring3::open::O_CLOEXEC != 0 {
+        table.set_cloexec(fd); // O_CLOEXEC: recorded, nothing execs yet
+    }
+    u64::from(fd)
+}
+
+/// Fill the x86_64 `struct stat` (144 bytes) at the task's `buf`: device
+/// numbers and all times zero (one disk, no clock), the rest from the
+/// arguments. `Err(errno)` on a bad task pointer.
+fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result<(), u64> {
+    if !user_ok(buf, 144) {
+        return Err(ring3::err::EFAULT);
+    }
+    let mut st = [0u8; 144];
+    let le = |v: u64| v.to_le_bytes();
+    st[0..8].copy_from_slice(&le(0)); // st_dev
+    st[8..16].copy_from_slice(&le(inode)); // st_ino
+    st[16..24].copy_from_slice(&le(links)); // st_nlink
+    st[24..28].copy_from_slice(&mode.to_le_bytes()); // st_mode
+    st[28..32].copy_from_slice(&0u32.to_le_bytes()); // st_uid
+    st[32..36].copy_from_slice(&0u32.to_le_bytes()); // st_gid
+    st[40..48].copy_from_slice(&le(0)); // st_rdev
+    st[48..56].copy_from_slice(&le(size)); // st_size
+    st[56..64].copy_from_slice(&le(4096)); // st_blksize
+    st[64..72].copy_from_slice(&le(size.div_ceil(512))); // st_blocks
+    // st_atime/mtime/ctime + nsec (offsets 72..120): zero — no clock, as
+    // everywhere in this kernel; the unused tail (120..144) stays zero too.
+    if !copy_to_user(buf, &st) {
+        return Err(ring3::err::EFAULT);
+    }
+    Ok(())
+}
+
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     match fr.rax {
         ring3::nr::WRITE => {
@@ -619,13 +814,12 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let code = fr.arg1() & 0xFF; // what wait(2) would see
             let t = task();
             t.exit = Some(code);
-            console::puts("Taoxichuan: hello exit code ");
-            console::put_dec(code);
-            console::puts("\n");
-            if code == 0 {
-                console::puts("Taoxichuan: stage 2 gate reached -- ring-3 ran, exited clean, output above\n");
-            }
-            halt();
+            // Stage 3: not a halt — the report and the next spawn (or the
+            // final gate line) live in `task_done`. This arm never returns to
+            // the stub: the task is gone, and its parked `syscall` frame on
+            // the syscall stack is abandoned by design (the stub restarts
+            // from the stack top on the next task's first syscall).
+            task_done(code)
         }
         ring3::nr::BRK => {
             let want = fr.arg1();
@@ -744,6 +938,292 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 0
             }
         }
+        ring3::nr::READ => {
+            // fd 0: the console has no input path wired, so read(0) is EOF —
+            // the honest answer, not a hang. fds 1/2 are write-only. Any
+            // other number must name a file fd from `openat`; directories
+            // refuse with `EISDIR` the way Linux's read does.
+            let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
+            if len > WRITE_LIMIT || !user_ok(buf, len) {
+                return e(ring3::err::EFAULT);
+            }
+            if fd == 0 {
+                return 0;
+            }
+            if fd == 1 || fd == 2 || fd as u32 >= SLOT_CEILING {
+                return e(ring3::err::EBADF);
+            }
+            let mut chunk = [0u8; 512];
+            let mut res: Result<u64, u64> = Ok(0);
+            let found = fd_table().update(fd as u32, |of| match of {
+                OpenFile::Dir { .. } => res = Err(ring3::err::EISDIR),
+                OpenFile::File { inode, offset, size } => {
+                    let mut total = 0u64;
+                    while total < len {
+                        let want = ((len - total) as usize).min(chunk.len());
+                        let have = size.saturating_sub(*offset) as usize;
+                        let n = want.min(have);
+                        if n == 0 {
+                            break;
+                        }
+                        match root_fs().read_at_by_inode(*inode, *offset as usize, &mut chunk[..n]) {
+                            Ok(0) => break,
+                            Ok(got) => {
+                                if !copy_to_user(buf + total, &chunk[..got]) {
+                                    res = Err(ring3::err::EFAULT);
+                                    return;
+                                }
+                                *offset += got as u64;
+                                total += got as u64;
+                                if got < n {
+                                    break; // short read: end of file
+                                }
+                            }
+                            Err(_) => {
+                                res = Err(ring3::err::EIO);
+                                return;
+                            }
+                        }
+                    }
+                    res = Ok(total);
+                }
+            });
+            match (found, res) {
+                (false, _) => e(ring3::err::EBADF),
+                (_, Err(no)) => e(no),
+                (_, Ok(n)) => n,
+            }
+        }
+        ring3::nr::STAT => {
+            // musl's `stat()` on x86_64: the legacy number, the 144-byte
+            // `struct stat`. Everything the ext2 root knows is filled
+            // (mode/size/inode/nlink); everything it does not (times — no
+            // clock; device numbers — one disk) is zero, the honest value.
+            let (path_va, buf) = (fr.arg1(), fr.arg2());
+            if !user_ok(buf, 144) {
+                return e(ring3::err::EFAULT);
+            }
+            let mut pbuf = [0u8; 128];
+            let Some(path) = user_str(path_va, &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            match root_fs().metadata(path) {
+                Ok(md) => match fill_stat64(
+                    buf,
+                    md.inode,
+                    md.mode,
+                    md.size,
+                    u64::from(md.links.unwrap_or(if md.is_dir { 2 } else { 1 })),
+                ) {
+                    Ok(()) => 0,
+                    Err(no) => e(no),
+                },
+                Err(_) => e(ring3::err::ENOENT),
+            }
+        }
+        ring3::nr::LSTAT => {
+            // `lstat` does not follow a final symlink — and the ext2
+            // `metadata` does — so the final component is looked up in its
+            // parent's listing instead: the listing carries the kind and
+            // size of the link itself. Only the name and kind reach the
+            // caller on this stage's paths, but the shape is the real one.
+            let (path_va, buf) = (fr.arg1(), fr.arg2());
+            if !user_ok(buf, 144) {
+                return e(ring3::err::EFAULT);
+            }
+            let mut pbuf = [0u8; 128];
+            let Some(path) = user_str(path_va, &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            let Some(idx) = path.rfind('/') else {
+                return e(ring3::err::ENOENT);
+            };
+            let (parent, name) = (&path[..idx.max(1)], &path[idx + 1..]);
+            if name.is_empty() {
+                // The root itself (or a trailing slash): nothing to not-follow.
+                match root_fs().metadata(path) {
+                    Ok(md) => match fill_stat64(buf, md.inode, md.mode, md.size, 2) {
+                        Ok(()) => 0,
+                        Err(no) => e(no),
+                    },
+                    Err(_) => e(ring3::err::ENOENT),
+                }
+            } else {
+                let fs = root_fs();
+                let Ok(entries) = fs.read_dir(parent) else {
+                    return e(ring3::err::ENOENT);
+                };
+                let Some(ent) = entries.iter().find(|e| e.name == name) else {
+                    return e(ring3::err::ENOENT);
+                };
+                let mode = if ent.is_symlink {
+                    0o120777 // S_IFLNK | rwxrwxrwx: the convention for links
+                } else if ent.is_dir {
+                    0o40755
+                } else {
+                    0o100644
+                };
+                match fill_stat64(buf, 0, mode, ent.size, if ent.is_dir { 2 } else { 1 }) {
+                    Ok(()) => 0,
+                    Err(no) => e(no),
+                }
+            }
+        }
+        ring3::nr::FCNTL => {
+            // The fd-flag commands only; the table owns the cloexec bit.
+            let (fd, cmd, arg) = (fr.arg1(), fr.arg2(), fr.arg3());
+            match cmd {
+                1 => {
+                    // F_GETFD
+                    if fd <= 2 || fd as u32 >= SLOT_CEILING {
+                        0
+                    } else {
+                        u64::from(fd_table().is_cloexec(fd as u32))
+                    }
+                }
+                2 => {
+                    // F_SETFD: FD_CLOEXEC is the one bit in existence.
+                    let ok_slot = fd > 2 && (fd as u32) < SLOT_CEILING;
+                    if ok_slot && arg & 1 != 0 {
+                        fd_table().set_cloexec(fd as u32);
+                    }
+                    0
+                }
+                3 => 0, // F_GETFL: O_RDONLY, the only access mode served
+                4 => 0, // F_SETFL: accepted; no async/nonblock behavior exists
+                _ => e(ring3::err::EINVAL),
+            }
+        }
+        ring3::nr::CLOSE => {
+            // fds 0/1/2 are the console and hold no kernel reference to
+            // release; closing them is the no-op Linux's stdio-close is.
+            let fd = fr.arg1();
+            if fd <= 2 {
+                return 0;
+            }
+            if fd as u32 >= SLOT_CEILING {
+                return e(ring3::err::EBADF);
+            }
+            match fd_table().close(fd as u32) {
+                Some(_) => 0,
+                None => e(ring3::err::EBADF),
+            }
+        }
+        ring3::nr::OPENAT => {
+            // The one way in. Absolute paths only (`AT_FDCWD` only: there is
+            // no working directory), read-only access only: the root is
+            // read-only in spirit and this kernel has no write path to lie
+            // about. The description is an ext2 lookup now — no VFS mount
+            // table, one root.
+            let (dirfd, path_va, flags) = (fr.arg1(), fr.arg2(), fr.arg3());
+            if dirfd != ring3::open::AT_FDCWD {
+                return e(ring3::err::EBADF);
+            }
+            open_common(path_va, flags)
+        }
+        ring3::nr::OPEN => {
+            // musl's `open()` on x86_64: the legacy number, no dirfd.
+            let (path_va, flags) = (fr.arg1(), fr.arg2());
+            open_common(path_va, flags)
+        }
+        ring3::nr::GETDENTS64 => {
+            // `ls`'s walk: fill `linux_dirent64` records from the open
+            // description's cached listing. `d_ino` is 0 — the listing
+            // carries names and kinds, not inode numbers, and nothing on
+            // this path reads them. `d_off` is the running cursor, a cookie
+            // that only has to be monotonic within one open.
+            let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
+            if len == 0 {
+                return e(ring3::err::EINVAL);
+            }
+            if !user_ok(buf, len) {
+                return e(ring3::err::EFAULT);
+            }
+            if fd as u32 >= SLOT_CEILING {
+                return e(ring3::err::EBADF);
+            }
+            let mut scratch = [0u8; 1024];
+            let mut used = 0usize;
+            let mut res: Result<(), u64> = Ok(());
+            let found = fd_table().update(fd as u32, |of| match of {
+                OpenFile::Dir { entries, cursor } => {
+                    let cap = (len as usize).min(scratch.len());
+                    while *cursor < entries.len() {
+                        let ent = &entries[*cursor];
+                        let name = ent.name.as_bytes();
+                        let reclen = (19 + name.len() + 1 + 7) & !7;
+                        if used + reclen > cap {
+                            if used == 0 {
+                                res = Err(ring3::err::EINVAL); // not even one fits
+                            }
+                            break;
+                        }
+                        let rec = &mut scratch[used..used + reclen];
+                        rec[..8].copy_from_slice(&0u64.to_le_bytes());
+                        rec[8..16].copy_from_slice(&(*cursor as u64 + 1).to_le_bytes());
+                        rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+                        rec[18] = if ent.is_dir {
+                            4 // DT_DIR
+                        } else if ent.is_symlink {
+                            10 // DT_LNK
+                        } else {
+                            8 // DT_REG
+                        };
+                        rec[19..19 + name.len()].copy_from_slice(name);
+                        rec[19 + name.len()] = 0;
+                        *cursor += 1;
+                        used += reclen;
+                    }
+                }
+                OpenFile::File { .. } => res = Err(ring3::err::ENOTDIR),
+            });
+            if !found {
+                return e(ring3::err::EBADF);
+            }
+            if let Err(no) = res {
+                return e(no);
+            }
+            if used == 0 {
+                return 0; // end of directory
+            }
+            if !copy_to_user(buf, &scratch[..used]) {
+                return e(ring3::err::EFAULT);
+            }
+            used as u64
+        }
+        ring3::nr::RT_SIGACTION | ring3::nr::RT_SIGPROCMASK => {
+            // No signal delivery exists: nothing can ever be delivered, so a
+            // handler registration or a mask change is accepted as the no-op
+            // it is here. musl's startup installs both before `main` —
+            // failing them would fail a program that can never be signalled.
+            0
+        }
+        ring3::nr::CLOCK_GETTIME => {
+            // No clock exists behind this kernel (the CMOS holds no date and
+            // nothing syncs); zeroed is the honest answer, and musl's struct
+            // timespec is two u64s. `clk_id` is accepted: no clock can be
+            // the wrong one when there is no clock.
+            let tp = fr.arg2();
+            if !user_ok(tp, 16) {
+                return e(ring3::err::EFAULT);
+            }
+            if !copy_to_user(tp, &[0u8; 16]) {
+                return e(ring3::err::EFAULT);
+            }
+            0
+        }
+        ring3::nr::GETTIMEOFDAY => {
+            // Same no-clock contract; struct timeval is two u64s, `tz` is
+            // optional and never filled.
+            let (tv, tz) = (fr.arg1(), fr.arg2());
+            if !user_ok(tv, 16) || !copy_to_user(tv, &[0u8; 16]) {
+                return e(ring3::err::EFAULT);
+            }
+            if tz != 0 && !user_ok(tz, 8) {
+                return e(ring3::err::EFAULT);
+            }
+            0
+        }
         other => {
             // Name the gap: a stage-3 task (busybox) will hit numbers this
             // table does not serve, and the console should say which.
@@ -753,10 +1233,210 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 3: the program list, and the sequential kernel-reaped tasks.
+// ---------------------------------------------------------------------------
+
+/// Programs the boot will run, one after another, each to `exit`. The gate
+/// needs two (busybox echo, busybox ls); the list is the general shape and
+/// the command line fills it (`init=`/`initargs=`, then `then=`/`thenargs=`
+/// per follow-up). Fixed slots, no heap: the dispatcher's reaper reads these
+/// after the task that booted them is gone.
+const MAX_PROGRAMS: usize = 4;
+/// argv entries per program beyond `argv[0]`, and their byte budget each.
+/// The command line is 512 bytes total; 8×95 cannot overflow it.
+const MAX_ARGV: usize = 8;
+const ARG_LEN: usize = 96;
+
+#[derive(Clone, Copy)]
+struct Prog {
+    path: [u8; ARG_LEN],
+    args: [[u8; ARG_LEN]; MAX_ARGV],
+    n_args: usize,
+}
+
+impl Prog {
+    const fn new() -> Self {
+        Self {
+            path: [0; ARG_LEN],
+            args: [[0; ARG_LEN]; MAX_ARGV],
+            n_args: 0,
+        }
+    }
+
+    /// argv[0], as the string it was stored as.
+    fn path_str(&self) -> &str {
+        str_until_nul(&self.path)
+    }
+
+    /// One argv entry beyond `argv[0]`.
+    fn arg_str(&self, i: usize) -> &str {
+        str_until_nul(&self.args[i])
+    }
+}
+
+/// The `&str` a NUL-padded slot holds ("" when unset).
+fn str_until_nul(buf: &[u8]) -> &str {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    core::str::from_utf8(&buf[..end]).unwrap_or("")
+}
+
+static mut PROGRAMS: [Prog; MAX_PROGRAMS] = [Prog::new(); MAX_PROGRAMS];
+static mut N_PROGRAMS: usize = 0;
+static mut CURRENT: usize = 0;
+static mut EXIT_CODES: [u64; MAX_PROGRAMS] = [0; MAX_PROGRAMS];
+
+/// Fill the program list from the boot command line: `init=`/`initargs=`
+/// name the first program (the stage-1/2 token pair, unchanged), each
+/// `then=`/`thenargs=` pair appends one. `initargs`/`thenargs` are
+/// comma-separated (the stage-1 busybox line's convention,
+/// `initargs=sh,/etc/guest.sh`).
+fn parse_programs(cmdline: &str) {
+    let mut idx = 0usize;
+    for token in cmdline.split_ascii_whitespace() {
+        let (set_path, set_args) = if let Some(v) = token.strip_prefix("init=") {
+            (Some(v), None)
+        } else if let Some(v) = token.strip_prefix("initargs=") {
+            (None, Some(v))
+        } else if let Some(v) = token.strip_prefix("then=") {
+            idx += 1;
+            (Some(v), None)
+        } else if let Some(v) = token.strip_prefix("thenargs=") {
+            (None, Some(v))
+        } else {
+            (None, None)
+        };
+        // SAFETY: the program statics, boot-phase only — no ring 3 exists
+        // while this runs, same discipline as every other boot static.
+        let progs = unsafe { &mut *core::ptr::addr_of_mut!(PROGRAMS) };
+        if idx >= MAX_PROGRAMS {
+            break;
+        }
+        let p = &mut progs[idx];
+        if let Some(v) = set_path {
+            store_slot(&mut p.path, v);
+        }
+        if let Some(v) = set_args {
+            for a in v.split(',').take(MAX_ARGV) {
+                if p.n_args < MAX_ARGV {
+                    store_slot(&mut p.args[p.n_args], a);
+                    p.n_args += 1;
+                }
+            }
+        }
+    }
+    // SAFETY: boot-phase only, see above.
+    unsafe {
+        N_PROGRAMS = idx + 1;
+        CURRENT = 0;
+    }
+}
+
+fn store_slot(dst: &mut [u8], s: &str) {
+    let b = s.as_bytes();
+    let n = b.len().min(dst.len() - 1);
+    dst[..n].copy_from_slice(&b[..n]);
+    dst[n] = 0;
+}
+
+/// Spawn program `i` from the list, printing the spawn-evidence lines the
+/// stage-1 gate was pinned on (they are per-program now: two tasks, two spawn
+/// lines). Never returns.
+fn run_program(i: usize) -> ! {
+    // SAFETY: boot statics; `CURRENT` is read by the dispatcher's reaper, and
+    // every write here precedes the first crossing of the program it names.
+    let (path, n_args) = unsafe {
+        CURRENT = i;
+        let progs = &*core::ptr::addr_of!(PROGRAMS);
+        (progs[i].path_str(), progs[i].n_args)
+    };
+    console::puts("Taoxichuan: init spawn -- init=");
+    console::puts(path);
+    if n_args > 0 {
+        console::puts(" argv=[");
+        // SAFETY: boot statics, see above.
+        let args: [&str; MAX_ARGV] = unsafe {
+            let progs = &*core::ptr::addr_of!(PROGRAMS);
+            let mut a = [""; MAX_ARGV];
+            for (k, slot) in a.iter_mut().enumerate() {
+                if k < n_args {
+                    *slot = progs[i].arg_str(k);
+                }
+            }
+            a
+        };
+        for (k, a) in args.iter().enumerate() {
+            if k >= n_args {
+                break;
+            }
+            if k > 0 {
+                console::puts(",");
+            }
+            console::puts(a);
+        }
+        console::puts("]");
+    }
+    console::puts("\n");
+
+    let fs = root_fs();
+    if !fs.exists(path) {
+        console::puts("  init: NOT on the mounted root\n");
+        halt();
+    }
+    let image = fs.read_file(path).unwrap_or_default();
+    let elf = image.len() >= 4 && image[..4] == [0x7f, b'E', b'L', b'F'];
+    console::puts("  init: ");
+    console::put_dec(image.len() as u64);
+    console::puts(" bytes on the ext2 root, ELF magic ");
+    console::puts(if elf { "ok" } else { "MISSING" });
+    console::puts("\n");
+    console::puts("Taoxichuan: stage 1 gate reached -- init spawn (userspace is stage 2)\n");
+
+    spawn(path, &image)
+}
+
+/// The dispatcher's reaper, in place of stage 2's `halt()`: report the exit,
+/// then either spawn the next program or close the boot out. Runs on the
+/// syscall stack inside the dying task's dispatcher frame; the stack the
+/// stub parked is abandoned with the task (the stub restarts at its top on
+/// the next task's first syscall).
+fn task_done(code: u64) -> ! {
+    // SAFETY: boot statics; single core, IF clear, no other reader.
+    let (i, n, path) = unsafe {
+        EXIT_CODES[CURRENT] = code;
+        let progs = &*core::ptr::addr_of!(PROGRAMS);
+        (CURRENT, N_PROGRAMS, progs[CURRENT].path_str())
+    };
+    // The stage-2 gate's own evidence lines, verbatim, on the boot that
+    // re-checks that gate; every other program gets the generic line.
+    if path == "/bin/hello" {
+        console::puts("Taoxichuan: hello exit code ");
+        console::put_dec(code);
+        console::puts("\n");
+        if code == 0 {
+            console::puts("Taoxichuan: stage 2 gate reached -- ring-3 ran, exited clean, output above\n");
+        }
+    } else {
+        console::puts("Taoxichuan: exit code ");
+        console::put_dec(code);
+        console::puts(" from ");
+        console::puts(path);
+        console::puts("\n");
+    }
+    if i + 1 < n {
+        run_program(i + 1);
+    }
+    let all_zero = unsafe { EXIT_CODES[..n].iter().all(|&c| c == 0) };
+    if n >= 2 && all_zero {
+        // The stage-3 gate's own line: two kernel-reaped tasks, both clean.
+        console::puts("Taoxichuan: stage 3 gate reached -- sequential tasks ran clean, outputs above\n");
+    }
+    console::puts("Taoxichuan: all programs done\n");
+    halt();
+}
 /// Load the image, build the task's address space, and cross. Never returns:
 /// the task ends in the dispatcher's `exit` or the trap handler's `[Fault]`.
-fn spawn(path: &str, image: &[u8]) -> ! {
-    let img = match ring3::Image::parse(image) {
+fn spawn(path: &str, image: &[u8]) -> ! {    let img = match ring3::Image::parse(image) {
         Ok(img) => img,
         Err(err) => {
             akuma_primitives::safe_print!(160, "  init: ELF refused: {:?}\n", err);
@@ -792,6 +1472,11 @@ fn spawn(path: &str, image: &[u8]) -> ! {
     }
     let t = task();
     t.root_pa = root;
+    // A fresh task owns a fresh fd table: stage 3's sequential tasks do not
+    // inherit anything (no fork exists to inherit through).
+    t.fd_names.clear();
+    t.fd_cloexec.clear();
+    t.fd_nonblock.clear();
 
     // Place every PT_LOAD at its link address, page by page: fresh zeroed
     // frame, map, copy the file-backed slice through the physmap. The zeroed
@@ -855,8 +1540,9 @@ fn spawn(path: &str, image: &[u8]) -> ! {
     }
     add_region(stack_base, USER_STACK_TOP);
 
-    // argc/argv/envp/auxv. argv[0] is the path the command line named; no
-    // env. `AT_RANDOM`/`AT_EXECFN` values are the builder's to fill.
+    // argc/argv/envp/auxv. argv[0] is the path the command line named;
+    // argv[1..] are that program's `initargs=`/`thenargs=` entries; no env.
+    // `AT_RANDOM`/`AT_EXECFN` values are the builder's to fill.
     const AUX_N: usize = 14;
     let mut aux = [(0u64, 0u64); AUX_N];
     aux[0] = (ring3::AT_BASE, 0); // no interpreter
@@ -873,8 +1559,19 @@ fn spawn(path: &str, image: &[u8]) -> ! {
     aux[11] = (ring3::AT_HWCAP, 0);
     aux[12] = (ring3::AT_CLKTCK, 100);
     aux[13] = (ring3::AT_RANDOM, 0);
+    // SAFETY: boot statics; read before the crossing that consumes the copy.
+    let mut argv: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
+    let n_args = unsafe {
+        let progs = &*core::ptr::addr_of!(PROGRAMS);
+        let cur = CURRENT;
+        let p = &progs[cur];
+        for k in 0..p.n_args {
+            argv[k + 1] = p.arg_str(k);
+        }
+        p.n_args
+    };
     let mut block = [0u8; 512];
-    let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &[path], &[], &aux);
+    let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &argv[..=n_args], &[], &aux);
 
     // SAFETY: the top stack page is a mapped task frame; the block ends at
     // `USER_STACK_TOP`, so its bytes sit at `page_pa + (4096 - block.len())`.
@@ -1009,6 +1706,12 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         halt();
     };
     console::puts("  fs:   ext2 root mounted on /dev/vda\n");
+    // Publish the mount for the dispatcher's fd syscalls (`ROOT_FS` above);
+    // from here on the local binding is dead.
+    // SAFETY: boot phase, one core, no ring 3 yet.
+    unsafe {
+        *core::ptr::addr_of_mut!(ROOT_FS) = Some(fs);
+    }
 
     // ---- The init-spawn point ------------------------------------------------
     //
@@ -1020,42 +1723,23 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // are an ELF. Loading and entering user mode is stage 2's line.
     banner();
 
-    let mut init_buf = [0u8; 128];
-    let init_path = cmdline_token(hvm_start_info, "init=", &mut init_buf);
-    let Some(path) = init_path else {
+    let mut init_buf = [0u8; 512];
+    let cmdline_str = cmdline(hvm_start_info, &mut init_buf);
+    if cmdline_token(hvm_start_info, "init=", &mut [0u8; 128]).is_none() {
         console::puts("  init: no init= on the command line -- nothing to spawn\n");
         console::puts("Taoxichuan: stage 1 gate NOT reached (no init)\n");
         halt();
-    };
-    let mut args_buf = [0u8; 128];
-    let args = cmdline_token(hvm_start_info, "initargs=", &mut args_buf).unwrap_or("");
-
-    console::puts("Taoxichuan: init spawn -- init=");
-    console::puts(path);
-    if !args.is_empty() {
-        console::puts(" argv=[");
-        console::puts(args);
-        console::puts("]");
     }
-    console::puts("\n");
-
-    if !fs.exists(path) {
-        console::puts("  init: NOT on the mounted root\n");
-        halt();
-    }
-    // Read the image head: the spawn stands on these bytes being an ELF.
-    let image = fs.read_file(path).unwrap_or_default();
-    let elf = image.len() >= 4 && image[..4] == [0x7f, b'E', b'L', b'F'];
-    console::puts("  init: ");
-    console::put_dec(image.len() as u64);
-    console::puts(" bytes on the ext2 root, ELF magic ");
-    console::puts(if elf { "ok" } else { "MISSING" });
-    console::puts("\n");
-    console::puts("Taoxichuan: stage 1 gate reached -- init spawn (userspace is stage 2)\n");
+    // Stage 3: the whole program list comes off the command line here
+    // (`init=`/`initargs=` for the first program, `then=`/`thenargs=` for
+    // each follow-up), so the dispatcher's reaper never parses anything
+    // after a task is live.
+    parse_programs(cmdline_str);
 
     // Stage 2: the spawn is real now. Load, cross, and the task's own exit
-    // (or its fault) is the next line on this console.
-    spawn(path, &image);
+    // (or its fault) is the next line on this console; stage 3 chains the
+    // next program from there.
+    run_program(0);
 }
 
 /// The multiboot2 entry — called by `boot.s` when GRUB's magic says the info
