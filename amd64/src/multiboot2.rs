@@ -809,6 +809,10 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // port access (see `serial::PRESENT`), skipping it would mean no serial
     // output at all on a machine that does have one.
     serial::init();
+    // The shared-crate print hook, for the same reason `kmain` sets it before
+    // its memory bring-up: `mem::init` reports through `safe_print!`, and on
+    // this path the sink it wants is serial's framebuffer mirror.
+    akuma_primitives::console::set_print_hook(serial::puts);
 
     // SAFETY: GRUB guarantees %ebx points at an information block whose first
     // u32 is its own total size, and boot.s has mapped all of low physical

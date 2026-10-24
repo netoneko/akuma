@@ -1,161 +1,47 @@
-//! x86_64 4-level page tables **for the kernel's own mappings**: map, unmap,
-//! translate.
+//! x86_64 4-level page tables **for the kernel's own mappings**.
 //!
-//! Stage B of the amd64 bring-up. `boot.s` leaves the machine on a fixed
-//! identity map of the first 1 GiB built from 2 MiB pages; this is the first
-//! code that can *change* a mapping, which is the prerequisite for anything that
-//! demand-pages, protects a region, or addresses memory beyond that window.
+//! The walker half — map/unmap/translate, the physmap `PhysMap` impl, the
+//! device-window mapper — lives in `akuma-boot-amd64::paging` since the
+//! Taoxichuan stage-1 extraction (2026-10-24), and this module re-exports it so
+//! every `crate::paging::{MemAttr, PteProt, map_page, …}` call site is
+//! unchanged.
 //!
-//! # This file used to serve two roles; step 5a took one away
-//!
-//! Until then it owned **both** the kernel's own tables and every process's:
-//! `AddressSpace::{new,map,translate,prot,free}`, `for_each_user_leaf`,
-//! `for_each_leaf_in_range` and `prot_in` were a second, complete x86 walker
-//! beside `akuma_mmu::UserAddressSpace` — the one `akuma-exec`, `akuma-elf` and
-//! `akuma-syscalls-glue` reach through. `mm.rs`, `idt.rs`, `usermode.rs`,
-//! `loader.rs` and `fd.rs` all went through this one; they go through the crate
-//! now, and the user half of this file is gone
-//! (`docs/archive/AKUMA_AMD64_STEP5A_ONE_WALKER.md`).
-//!
-//! What remains is role 1 and only role 1: the kernel image, the physmap, the
-//! device window and the MMIO pages `pci.rs`/`lapic.rs`/`blk.rs` map. `akuma-mmu`
-//! does not do kernel mappings on **either** architecture, so this is not a
-//! duplicate of anything.
-//!
-//! [`activate`] is the one function here that both roles need, which is why it
-//! publishes to `akuma-mmu`'s per-core live-L0 registry — see its own header.
-//!
-//! # Two `Prot`s, and why they stay two
-//!
-//! [`PteProt`] is the **page-table** vocabulary: what the hardware is told.
-//! `akuma_mmap::Prot` is the **region** vocabulary: what a mapping is *supposed*
-//! to be. They were both called `Prot` until 2026-09-07 and the rename is what
-//! makes the difference visible at every call site.
-//!
-//! Both the type and [`akuma_mmu::encode_pte`] behind [`encode`] are the shared
-//! crate's since step 5a; this file re-exports them (see [`PteProt`]'s note).
-//! The bits stay named here — with the walker that writes them — because the two
-//! architectures' encodings share **no field**:
-//!
-//! | | AArch64 | x86_64 |
-//! |---|---|---|
-//! | writable | `AP[7:6]` == `01` (a *field*, not a bit) | bit 1 set |
-//! | user | `AP[6]` set | bit 2 set |
-//! | no-execute (EL0/user) | `UXN`, bit 54 | `NX`, bit 63 |
-//! | no-execute (EL1/kernel) | `PXN`, bit 53 | — (no separate bit) |
-//! | access flag | `AF`, bit 10, **must be set by software** | `A`, bit 5, set by hardware |
-//!
-//! Note the last two rows especially: AArch64 has two execute-permission bits to
-//! x86's one, so `PXN` has no x86 counterpart and a straight bit-for-bit
-//! translation loses information in one direction. That asymmetry is why
-//! `akuma_mmap::Prot` is an opaque token rather than `{read, write, exec}` —
-//! `RO` and `RX` grant EL0 the same thing and differ only in `PXN`, which x86
-//! cannot spell, so x86 maps both to the same PTE and says so in
-//! [`PteProt::from_region`].
-//!
-//! Do **not** try to make the region token carry the CoW marker: it is x86 PTE
-//! bit 9 ([`COW`]), meaningless to a region, and `akuma-cow` already takes
-//! decoded booleans precisely so it never sees a PTE. It is not a field of
-//! [`PteProt`] either — it is `encode_pte`'s third argument, and the mappings
-//! *this* file makes are the kernel's own, which never carry it.
-//!
-//! # Why the tables can be dereferenced directly
-//!
-//! Every page-table frame is allocated from `akuma-pmm`, whose pool is inside the
-//! region `boot.s` identity-maps, so a physical address *is* a valid pointer.
-//! [`table_mut`] asserts that rather than assuming it: the moment the PMM is
-//! given memory above 1 GiB, this stops being true, and the failure mode is a
-//! page fault with no IDT installed — a triple-fault and a guest that vanishes
-//! with no output.
+//! What stays here is the half that is *this kernel's own*: [`activate`]
+//! (every CR3 switch, published to `akuma-mmu`'s per-core live-L0 registry so a
+//! dropped `UserAddressSpace` cannot free tables a core still runs),
+//! [`activate_unpublished`] (the AP boot path), [`drop_identity_map`] (the
+//! trampoline's map retired, with the registry-publishing reload), and the boot
+//! self-test suite.
 
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
-use akuma_pagetable::PhysMap;
-use akuma_pagetable::amd64 as walk;
+use crate::smp;
 
-use crate::phys::phys_to_virt;
-
-/// The error code the CPU pushes for vector 14, asked as questions — the crate's
-/// (`akuma-pte-amd64`), re-exported so the `crate::paging::PageFaultCode` call
-/// sites in `idt.rs` are unchanged.
-pub use akuma_pte_amd64::PageFaultCode;
-
-/// The page-permission vocabulary and its encoder — `akuma-pte-amd64`'s.
-///
-/// Re-exported rather than merely used, so the `crate::paging::{MemAttr,
-/// PteProt}` call sites in `blk.rs`, `lapic.rs`, `pci.rs`, `idt.rs` and
-/// `uaccess.rs` are unchanged: those are kernel mappings, and this is still the
-/// module that performs them. The copy-on-write marker is **not** a field of
-/// [`PteProt`] — it is `encode_pte`'s third argument, and the mappings made here
-/// are the kernel's own, which never carry it.
-pub use akuma_pte_amd64::{MemAttr, PteProt};
-
-const PAGE_SIZE: usize = akuma_pte_amd64::PAGE_SIZE;
-
-/// The physmap, as `akuma-pagetable` asks for it.
-///
-/// `phys_to_virt` asserts the frame is inside [`crate::phys::PHYSMAP_LIMIT`]: the
-/// moment the PMM is given memory above that, a table frame stops being
-/// reachable, and the failure mode of *not* asserting is a page fault with no IDT
-/// installed — a triple-fault and a guest that vanishes with no output.
-pub struct Physmap;
-
-impl PhysMap for Physmap {
-    fn table_addr(pa: u64) -> usize {
-        phys_to_virt(pa) as usize
-    }
-}
-
-/// The active top-level table, from `CR3`.
-#[must_use]
-pub fn active_root() -> u64 {
-    read_cr3()
-}
+// The walker half: constants, translations, map/unmap — one implementation,
+// shared with the composed kernels that pull `akuma-boot-amd64`.
+pub use akuma_boot_amd64::paging::{
+    MemAttr, PageFaultCode, Physmap, PteProt, active_root, map_device_window, map_page,
+    map_page_in, translate, translate_in, unmap_page, unmap_page_in,
+};
 
 /// Switch the active address space, publishing the transition to
 /// `akuma-mmu`'s per-core live-L0 registry.
-///
-/// # The publish is not bookkeeping
-///
-/// `akuma_mmu::UserAddressSpace` frees its page tables in `Drop`, and that is
-/// only safe because `any_core_on_l0` first asks whether any core is still
-/// running them — parking the frames if so. That registry is fed by
-/// `publish_l0_begin`/`publish_l0_end`, whose only caller was the
-/// `#[cfg(target_arch = "aarch64")]` `msr ttbr0_el1` block in `akuma-threading`.
-/// This target writes `CR3` here, so until now the gate answered "no core holds
-/// this" for **every** table — and step 5a is where address spaces start
-/// dropping (`proposals/AMD64_STEP5_PROCESS_TABLE.md`). Publishing before there
-/// is a consumer is the right order: the registry has to be correct *for the
-/// whole run* before the first `Drop`, not from the moment one is added.
-///
-/// `smp::cpu_index()`, not `bkl::current_core_id()` — that one is a literal `0`
-/// on every build without `kernel_smp_shared`, which this target is while
-/// running four cores. See `publish_l0_begin`'s own note.
-///
-/// IRQs are masked across the pair, as the registry requires: it publishes into
-/// *this* core's slot, and a thread that migrated between the two calls would
-/// leave a stale ACTIVE entry naming a table this core no longer runs. Save and
-/// restore rather than `cli`/`sti`, because most callers already have them off.
 ///
 /// # Safety
 /// `root` must be a PML4 that maps every page this kernel is currently
 /// executing from and every page it will touch before switching back — the
 /// kernel image, its stacks, the heap, the PMM pool and the LAPIC window. An
-/// address space missing any of those faults on the instruction after `mov cr3`,
-/// with no way to report it.
+/// address space missing any of those faults on the instruction after
+/// `mov cr3`, with no way to report it.
 pub unsafe fn activate(root: u64) {
     // Published on every call, not only when the root changes — which is where
     // the AArch64 caller puts its `if new_ttbr0 != current_ttbr0`. Deliberate,
     // and matching this function's existing "write CR3 unconditionally" rule:
     // the `mov cr3` here is a full TLB flush costing hundreds of cycles, next to
-    // which three uncontended `xchg` is a small constant. A publish-on-change
-    // refinement is available (compare against `ACTIVE_L0` rather than re-reading
-    // CR3) if a real scheduler probe ever shows it matters — the boot suite
-    // cannot answer that question in either direction, for the reasons
-    // `boot::self_tests`' guest-clock stamp records.
+    // which three uncontended `xchg` is a small constant.
     let flags = akuma_cpu::daif::save_and_mask_irq();
-    let core = akuma_mmu::publish_l0_begin(root, crate::smp::cpu_index());
+    let core = akuma_mmu::publish_l0_begin(root, smp::cpu_index());
     // SAFETY: caller's obligation, stated above. Writing CR3 also flushes the
     // non-global TLB, which is what makes the switch take effect.
     unsafe { akuma_pagetable::amd64::load_cr3(root) };
@@ -164,149 +50,38 @@ pub unsafe fn activate(root: u64) {
     akuma_cpu::daif::restore(flags);
 }
 
-
 /// [`activate`] **without** the registry publish, for the one caller that runs
 /// before this core can say which core it is.
 ///
 /// `smp::ap_entry64`'s very first act — before `install_percpu`, before even
 /// `idt::load()` — is to get off the boot tables. `cpu_index()` reads `gs:[0]`
 /// and `IA32_GS_BASE` is still 0 there, so publishing would dereference address
-/// 0 on a core with no IDT: a triple fault whose symptom is the *BSP* hanging in
-/// `start_secondaries` waiting for a core that is already dead. Measured
-/// 2026-09-07 — the suite stopped after `preempt: teardown leaks nothing` and
-/// produced no tally at all. It is the trap `smp`'s own module header states for
-/// `percpu_installed`, arrived at from the other direction.
-///
-/// **A separate entry point rather than a `percpu_installed()` check inside
-/// [`activate`]**, because that check is an `rdmsr` and `activate` is on the
-/// context-switch path. One caller knows it is early; every other caller should
-/// not pay a serialising MSR read for it.
-///
-/// Skipping the publish here is not a hole: the only transition before per-CPU
-/// state exists is boot tables → kernel root, and neither is ever freed, so the
-/// gate has nothing to protect. Every switch that can name a *user* address
-/// space happens long after.
+/// 0 on a core with no IDT.
 ///
 /// # Safety
 /// As [`activate`], plus: the caller must be on a path where per-CPU state does
-/// not yet exist. Anywhere else, use [`activate`] so the free gate sees the
-/// switch.
+/// not yet exist.
 pub unsafe fn activate_unpublished(root: u64) {
     // SAFETY: caller's obligation, stated above.
     unsafe { akuma_pagetable::amd64::load_cr3(root) };
 }
 
-// `irq_save_mask`/`irq_restore` were here until 2026-09-08, when
-// `akuma_cpu::daif` grew real x86 arms (`save_and_mask_irq` = `pushfq`/`cli`,
-// `restore` = `popfq`) and this file's private copy became the crate's. The
-// comment that used to justify the copy — that `daif` is a silent no-op on
-// this target — retired with it.
-
-/// The active top-level table, from `CR3`.
-fn read_cr3() -> u64 {
-    akuma_cpu::ctlreg::cr3() & akuma_pte_amd64::ADDR_MASK
+/// Retire the trampoline's identity map: clear PML4 slot 0 and reload CR3
+/// through [`activate`], so the registry sees the flush and the lower half is
+/// free for userspace.
+pub fn drop_identity_map() {
+    akuma_boot_amd64::paging::clear_identity_slot();
+    // SAFETY: the caller must already be running from the kernel window with a
+    // physmap stack — which `boot.s`'s `high_entry` arranges before it calls
+    // `kmain`. Reloading CR3 flushes the now-stale identity translations.
+    unsafe { activate(active_root()) };
 }
 
-/// Map `[pa, pa + len)` as device memory in the device window and return the `len`
-/// bytes at `pa` as a register window.
-///
-/// The one place that vouches "these bytes are device registers" for a physical
-/// range: every page was just mapped [`MemAttr::Device`] for the kernel's lifetime
-/// (the device window is never torn down), so a safe
-/// [`akuma_primitives::mmio::MmioWindow`] over it cannot name memory the CPU may
-/// serve from cache. Drivers take the window from here instead of each wrapping
-/// the address in their own `unsafe`. Mapping allocates page-table frames, so it
-/// must run after `mem::init_reserving`.
-#[must_use]
-pub fn map_device_window(pa: u64, len: u64) -> Option<akuma_primitives::mmio::MmioWindow> {
-    use crate::phys::DEVMAP_BASE;
-    let first = pa & !(PAGE_SIZE as u64 - 1);
-    let last = (pa + len).div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
-    let mut p = first;
-    while p < last {
-        if !map_page((DEVMAP_BASE + p) as usize, p, PteProt::KERNEL_RW, MemAttr::Device) {
-            return None;
-        }
-        p += PAGE_SIZE as u64;
-    }
-    // SAFETY: `[pa, pa + len)` is covered by the pages just mapped Device above,
-    // for the kernel's lifetime. Callers name the access widths and offsets.
-    Some(unsafe { akuma_primitives::mmio::MmioWindow::new((DEVMAP_BASE + pa) as usize, len as usize) })
-}
-
-/// Invalidate one page's TLB entry.
-///
-/// The amd64 counterpart of `tlbi vaae1`, and a good illustration of proposal
-/// item 3: `invlpg` is *core-local*, where AArch64's `tlbi ...is` broadcasts to
-/// the inner-shareable domain. On amd64 a multi-core kernel must send an IPI to
-/// every other core that could hold the translation — there is no broadcast
-/// form. This file's own walker edits only the kernel's boot-time tables, so
-/// core-local is complete here; user address spaces go through
-/// `akuma_mmu::flush_tlb_*`, which owns the shootdown IPI.
-fn invlpg(va: usize) {
-    akuma_cpu::tlb::invlpg(va);
-}
-
-/// Map `va` to `pa` in the **active** address space.
-pub fn map_page(va: usize, pa: u64, prot: PteProt, attr: MemAttr) -> bool {
-    map_page_in(read_cr3(), va, pa, prot, attr)
-}
-
-/// Map `va` to `pa` in the address space rooted at `root`.
-///
-/// Taking the root as a parameter rather than always reading `CR3` is what lets
-/// a process's tables be built *before* they are activated — the alternative is
-/// switching to a half-built address space, which cannot be done safely from
-/// code that is itself running out of memory those tables describe.
-///
-/// Intermediate tables come straight from the PMM and are not tracked: these are
-/// the kernel's own mappings, which are never torn down.
-pub fn map_page_in(root: u64, va: usize, pa: u64, prot: PteProt, attr: MemAttr) -> bool {
-    assert_eq!(va % PAGE_SIZE, 0, "va must be page aligned");
-    assert_eq!(pa % PAGE_SIZE as u64, 0, "pa must be page aligned");
-
-    let leaf = akuma_pte_amd64::leaf(pa, prot, attr, false);
-    let mapped = walk::map_leaf::<Physmap>(root, va, leaf, prot.user, || {
-        akuma_pmm::alloc_page().map(|f| f as u64)
-    });
-    if mapped {
-        invlpg(va);
-    }
-    mapped
-}
-
-/// Remove the mapping for `va` in the active address space.
-pub fn unmap_page(va: usize) -> Option<u64> {
-    unmap_page_in(read_cr3(), va)
-}
-
-/// Remove the mapping for `va` in the address space rooted at `root`.
-pub fn unmap_page_in(root: u64, va: usize) -> Option<u64> {
-    let frame = walk::unmap::<Physmap>(root, va)?;
-    invlpg(va);
-    Some(frame)
-}
-
-/// Resolve `va` in the active address space.
-///
-/// Walks rather than trusting a shadow structure, so it reports what the
-/// *hardware* would do — which is the only useful answer when checking whether a
-/// mapping took effect.
-pub fn translate(va: usize) -> Option<u64> {
-    translate_in(read_cr3(), va)
-}
-
-/// Resolve `va` in the address space rooted at `root`.
-pub fn translate_in(root: u64, va: usize) -> Option<u64> {
-    walk::translate::<Physmap>(root, va)
-}
-
-#[cfg(not(feature = "no-tests"))]
-/// Map a frame outside the identity map, write through it, read it back, unmap.
 ///
 /// Chosen VA is 1 GiB — the first address `boot.s` does *not* map, so the whole
 /// path (allocate PDPT entry, PD, PT, leaf) is exercised and a false pass from
 /// accidentally hitting the identity map is impossible.
+#[cfg(not(feature = "no-tests"))]
 pub fn smoke_test(t: &mut Suite) {
     const TEST_VA: usize = 1 << 30;
     const PATTERN: u64 = 0x0bad_c0de_dead_beef;
@@ -522,22 +297,4 @@ fn nx_encoding_check(t: &mut Suite) {
     t.check("W^X: kernel mappings are not user-reachable", (rw | rx | ro) & US == 0);
     t.check("attr: device is uncacheable, normal is not",
             dev & (PCD | PWT) == PCD | PWT && rw & (PCD | PWT) == 0);
-}
-
-/// Unmap the lower half of the kernel's own address space.
-///
-/// `boot.s` builds an identity map so the 32-bit trampoline has somewhere to
-/// stand. Once the kernel is executing from its high linked address and reaching
-/// physical memory through the physmap, that mapping is not merely unnecessary —
-/// it *occupies the lower half*, which belongs to userspace. Dropping it is what
-/// lets a process be mapped wherever it is linked.
-///
-/// Only PML4 slot 0 is cleared: it is the only lower-half slot `boot.s` filled.
-pub fn drop_identity_map() {
-    let root = read_cr3();
-    walk::clear_root_slot::<Physmap>(root, 0);
-    // SAFETY: the caller must already be running from the kernel window with a
-    // physmap stack — which `boot.s`'s `high_entry` arranges before it calls
-    // `kmain`. Reloading CR3 flushes the now-stale identity translations.
-    unsafe { activate(root) };
 }
