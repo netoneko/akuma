@@ -139,4 +139,11 @@ pushed before it stopped).
 - **Cost (from `sessions.db`, session `20261024_9`):** 77.2 min wall, 142 LLM calls,
   16,057,961 input tokens (15,736,512 cache reads, 98.0%), 68,932 output tokens,
   largest context 181,081.
+- **Reconfigured (Sonnet, 10:30 UTC):** `goose-glm-serve` now defaults to
+  `glm-5.3-flash` at `GOOSE_THINKING_EFFORT=low` (was `glm-5.3`), on the box and in
+  `overlays/ryzen/goose-glm-serve`; service restarted by pid, herd brought it back.
+  Not yet verified: a probe still gets the 5-hour limit error, and **the limit
+  applies to flash as well** (it is per account, not per model), so the new default
+  can only be measured after the reset. Compare its tokens-per-stage against the
+  16.1M input / 69k output above.
 

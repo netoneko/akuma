@@ -4,6 +4,7 @@
 # an ssh session sees them. GOOSE_MODE=auto approves every tool call and
 # --dangerously-unauthenticated drops the key check: anything on the LAN can run
 # commands as root. Owner's call, 2026-10-24.
+# glm-5.3-flash at low effort: glm-5.3 spent the lowest tier's 5-hour quota in ~80 min.
 HOME=/root; export HOME
 . /etc/akuma-dev.env
 umask 077
@@ -12,7 +13,7 @@ mkdir -p /root/.config/goose
 printf "OPENAI_API_KEY: %s\n" "$(cat /root/.akuma/z.ai/token)" > /root/.config/goose/secrets.yaml
 GOOSE_DISABLE_KEYRING=1; export GOOSE_DISABLE_KEYRING
 GOOSE_PROVIDER=openai; export GOOSE_PROVIDER
-GOOSE_MODEL=${GOOSE_MODEL:-glm-5.3}; export GOOSE_MODEL
+GOOSE_MODEL=${GOOSE_MODEL:-glm-5.3-flash}; export GOOSE_MODEL
 GOOSE_THINKING_EFFORT=${GOOSE_THINKING_EFFORT:-low}; export GOOSE_THINKING_EFFORT
 GOOSE_MODE=auto; export GOOSE_MODE
 OPENAI_HOST=https://api.z.ai; export OPENAI_HOST
