@@ -656,6 +656,14 @@ name = "akuma-reclock"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-ring3-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-gdt",
+]
+
+[[package]]
 name = "akuma-rtw89"
 version = "0.1.0"
 
@@ -1247,6 +1255,7 @@ dependencies = [
  "akuma-idt-amd64",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-ring3-amd64",
  "akuma-ryzen-amd64",
  "akuma-trap-amd64",
  "akuma-vfs",

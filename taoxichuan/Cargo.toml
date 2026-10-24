@@ -50,6 +50,13 @@ akuma-ext2 = { path = "../crates/akuma-ext2" }
 akuma-vfs = { path = "../crates/akuma-vfs" }
 # cr0/cr2/cr3/cr4 reads (fault reports, the WP bit), `invlpg`, `park`.
 akuma-cpu = { path = "../crates/akuma-cpu" }
+# ---- The stage-2 crate line -------------------------------------------------
+#
+# Ring 3: the ELF slice parser, the Linux initial stack, the syscall MSR
+# setup and both crossings (`sysretq` in, the naked `syscall` stub back).
+# `PteProt`/`MemAttr` for the user mappings arrive via `akuma-boot-amd64`'s
+# `paging` re-export.
+akuma-ring3-amd64 = { path = "../crates/akuma-ring3-amd64" }
 
 [[bin]]
 name = "taoxichuan"

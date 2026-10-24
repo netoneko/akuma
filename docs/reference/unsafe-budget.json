@@ -95,6 +95,7 @@
     "crates/akuma-port": 4,
     "crates/akuma-primitives": 10,
     "crates/akuma-psci": 2,
+    "crates/akuma-ring3-amd64": 2,
     "crates/akuma-slot-table": 9,
     "crates/akuma-threading": 65,
     "crates/akuma-timer": 1,
