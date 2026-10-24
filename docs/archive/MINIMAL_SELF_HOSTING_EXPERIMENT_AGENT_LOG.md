@@ -297,3 +297,32 @@ Taoxichuan: stage 1 gate reached -- init spawn (userspace is stage 2)
   clean passes, exactly as the dev-cycle doc says; (3) the old dev log keeps
   previous boots appended, so fault-greps for the regression boot were scoped
   to that boot's segment of the file.
+
+### Stage 1 — metal track (goose-glm), finish — independent re-verification — 2026-10-24 — PASS
+
+The section above records one finish run; the same 01b brief was also executed
+independently to the end, and the two runs agree on every gate fact. The second
+pass contributed no source changes (the merge was already up to date and
+`511f4fdb` was already on `litter` when it started); what it did:
+
+- **Spec-checked the banner by script** (not by eye): the four cartouche lines
+  byte-identical to `511f4fdb^`; every byte in 0x20–0x7E; 15 lines, 67 columns
+  max; every literal ends in a `\n` escape (no real newlines inside `concat!`);
+  the commit's diff touches only the ART block and its doc comment.
+  `cargo clippy -p taoxichuan --target x86_64-unknown-none -- -D warnings`: clean.
+- **Re-ran the gate by hand — PASS.** Reinstalled the same 166,368-byte build
+  (md5 `6e82bcc6fc591c0472f1d4b5b8bbd258`) into `/boot/akuma-guest-dev` and did
+  the `vm-serve-mc` → `vm-dev` dance again: init spawn, banner, `stage 1 gate
+  reached`, guest halted with `exits=4355 ... exc=0`, 0 `[Fault]`/`PANIC`/
+  `[sig!]` lines. Evidence: `/root/dev-cycle/taoxichuan-s1/vm-dev-pass.log`
+  (746 lines — this copy was taken after `/var/log/herd/vm-dev.log` had
+  accumulated *both* boots, hence 2 × 373; the kernel's gate line is line 740
+  of that copy, and the fault-grep is 0 across both segments).
+- **Merge-regression boot repeated:** `akuma-amd64` rebuilt (33.3 s incremental
+  vs the 46.7 s cold build above; byte-identical output, md5 `2b9d36ef...`, the
+  same bytes that were already installed), booted to `AKUMA-GUEST-UP` →
+  `AKUMA-GUEST-DONE`, `exc=0`, zero fault lines
+  (`/root/dev-cycle/taoxichuan-s1/vm-dev-main-amd64.log`; the `-20261024`
+  sibling is a segment-trimmed copy of the same boot).
+- `vm-serve-mc` running at the end. Nothing above rewritten, nothing left
+  uncommitted.
