@@ -601,6 +601,10 @@ the binary and the reference output.
   roughly 40M input tokens at flash weight (an estimate from one data point).
 - **Also this stage:** the owner asked that every brief tell goose to commit and push every 20 minutes when something is
   uncommitted (stage 3 sat uncommitted ~45 min), and to gate all amd64-specific code; both are in the 3b brief.
+- **Update 22:05 IDT (Sonnet):** goose's 03b run (sent 21:44 after the 21:39 reset, driver exit 0, `end_turn`, ~19 min) added
+  only `RESULT.md` and the log section below (`3b930292`, docs only; no `taoxichuan/`, `crates/` or `Cargo.toml` change since
+  `6c4602b7`). The aarch64 results above therefore stand and were not re-run. Fast-forwarded to `litter/taoxichuan-s3`;
+  stage 4 (`taoxichuan-04-sshd.md`) sent at 22:04.
 
 ### Stage 3 — metal track (goose-glm), finish — 2026-10-24 — PASS
 
