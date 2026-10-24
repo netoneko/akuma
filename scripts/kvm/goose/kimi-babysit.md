@@ -31,7 +31,19 @@ dumps, no polling loops that print.
    One goose session per stage; never start a second prompt while one is running.
 3. **Fetch.** When the turn ends: `git fetch litter`, then look at `litter/taoxichuan-sN`
    (`git log --oneline -10`, `git diff --stat`). Read goose's `RESULT.md` and the gate log via the ryzen
-   (below) before you believe its PASS.
+   (below). Trust goose's metal PASS when `RESULT.md` and its log say PASS: good will and honest effort
+   between the two tracks is the working assumption (the owner's instruction), so read the evidence it
+   cites, do not re-run its gate. (The evidence rule under "Quota, hangs, and honesty" is for your own
+   claims.)
+3b. **Kick off the next stage BEFORE you validate.** goose-glm is idle and its quota is the scarce
+   resource: do not leave it waiting while you build and boot. As soon as step 3 shows the metal gate
+   passed and its driver has exited (`pgrep -f goose_acp_prompt` empty), write the next brief (step 1)
+   and send it in the background (step 2: `nohup python3 -I scripts/goose_acp_prompt.py ... &`, log to
+   `/tmp/goose-sN.log`), commit and push the brief to `origin` first so goose can fetch it, **then** do
+   step 4 while goose works. Section 1 of every brief says: "fetch `origin` again right before the final
+   gate run and merge any new supervisor commits", so a portability fix from step 5 reaches goose
+   mid-stage without a second prompt. If step 4 later finds a logic failure in the previous stage, it
+   becomes a "stage N-1b" section in the *next* brief, not a second concurrent prompt.
 4. **Validate on aarch64 and nothing else.** Merge the branch into `rust-org-il-experiment`, then:
    - **Compiles:** `scripts/build_taoxichuan_fc.sh` (output `taoxichuan-fc.bin`). If the stage added
      a feature or crate the script does not select, extend the script minimally.
@@ -106,6 +118,14 @@ Commit messages end with the attribution line your tooling gives you, if any.
 Every brief tells goose to **commit and push to `litter` frequently** (after each sub-task, not
 only at the end): the stage-1 quota cut left its last edit uncommitted and the work had to be
 recovered by hand.
+
+## Keep the turn open
+
+Your turn ending IS the loop stopping: nobody re-prompts you. While a goose driver is running or a
+stage is not signed off on both tracks, never end your turn with "I'll validate when it finishes".
+Wait inside the turn: one tool call per wait, `sleep 600; tail -n 5 /tmp/goose-sN.log; pgrep -f
+goose_acp_prompt` (a long sleep is one model call; many short ones burn quota re-reading context).
+Do your own work (step 4, the log, the next brief) between waits. End your turn only per "Stop".
 
 ## Stop
 
