@@ -434,6 +434,46 @@ that session's step 4 for stage 1, run after goose-glm's 01b finish landed on `l
 static musl hello runs, exit 0, output matches the host-built binary), brief
 `scripts/kvm/goose/taoxichuan-02-hello.md`.
 
+### Stage 2 — host track (Sonnet), aarch64 / Firecracker in Lima `fc` — PASS after one supervisor fix
+
+*2026-10-24 ~18:50 IDT, Sonnet (Kimi was gone; see Oversight change #2).* Merged `litter/taoxichuan-s2` @
+`9a948c78` into `rust-org-il-experiment` (`ed1de19d`, clean) while goose-glm was already working on stage 3
+(the next brief goes out before the aarch64 check, per the owner's ordering).
+
+- **Finding 1, fixed: the aarch64 kernel build broke.** goose added `crates/akuma-ring3-amd64` to the
+  workspace `default-members`, so `scripts/build_taoxichuan_fc.sh` (a plain `cargo build` at the root)
+  compiled its x86 `naked_asm!` for `aarch64-unknown-none`: 55 assembler errors (`sysretq`,
+  `mov rax, [rsp]`). The other amd64-only crates (`akuma-boot-amd64`, `akuma-comconsole`) are not in
+  `default-members`; this one was copied in with the arch-neutral crates. Fix: delete that one line from
+  `Cargo.toml` (supervisor-sized, step 5). The crate itself was not touched.
+- **Finding 2, left to goose (stage 3 brief section 1):** the crate's two `naked_asm!` functions carry no
+  `#[cfg(target_arch = "x86_64")]`. `cargo check -p akuma-ring3-amd64` passes on the Mac (check does not
+  assemble), `cargo test -p akuma-ring3-amd64` fails with 38 assembler errors. Same class as the stage 1
+  `boot.s` break, one level later: `cargo check` is not the aarch64 gate for a crate with inline asm; building
+  or testing it is.
+- **Compiles (aarch64):** `scripts/build_taoxichuan_fc.sh` -> `taoxichuan-fc.bin`, 662,792 B (byte count
+  unchanged from stage 1: the aarch64 kernel does not use the amd64 composition crates), 10 s.
+- **Boots (Lima `fc`, 1 vCPU, `--no-net`):** console 133 lines: `Akuma Kernel starting...` (line 11),
+  `[FS] Ext2 filesystem mounted at /` (76), `[Main] Starting userspace sshd (no supervisor)...` /
+  `sshd started (tid=8)` (116-117). `grep -c "Fault\|PANIC\|sig!"` = 0.
+- **Control:** same image with `--no-disk`: 80 lines, `[Block] Block device not found` (69), `Continuing without
+  filesystem...` (70), zero sshd starts, zero faults. A pass needs the disk.
+- **Honest limit:** stage 2's gate is "a static musl hello runs, exit 0, output matches the host-built
+  binary". The aarch64 track did **not** run a hello: its evidence is the static musl `sshd` running at EL0
+  from the same kind of ext2 root. That is a parity observation (musl userspace on a feature-set kernel
+  is already routine here), not the byte-compare; the byte-compare is the metal track's, and it passed
+  (SHA256 `7e96c998...`).
+- **Parity:** no disagreement between the hypervisors this stage. The two kernels differ on purpose: the
+  aarch64 one is the existing kernel by feature selection (every capability already there), the amd64 one is
+  composed from 14 crates and a 198,072 B image.
+- **goose-glm cost for stage 2** (`sessions.db`, session `20261024_26`, `glm-5.3-flash`, low effort): 85.9 min
+  wall, 169 calls, 19,015,708 input tokens (18,828,800 cache reads), 127,408 output, largest context 179,941.
+  That is more tokens than stage 1 (16.1M input, `glm-5.3`, which hit the 5-hour limit at 77 min) and it
+  did not hit the limit: the owner reads the z.ai quota meter as clearly cheaper per token on flash.
+  Stage 2 start to finish took about 90 min, ~30 of them reading before the first edit.
+- **Stage 3 started 18:48 IDT** (`taoxichuan-03-busybox.md`, narrowed by the owner to non-interactive
+  `busybox echo` and `busybox ls`; no ash, no pty).
+
 ### Stage 2 — metal track (goose-glm)
 
 *2026-10-24, `glm-5.3-flash` (low effort), branch `taoxichuan-s2` (head `f76ff171`
