@@ -568,3 +568,36 @@ scheduler", so decide early whether a script runs as a sequence of child tasks
 the kernel reaps synchronously. The ext2 image now also has a working
 `/bin/hello` for smoke tests, and `scripts/taoxichuan_hello.sh` rebuilds both
 the binary and the reference output.
+
+### Stage 3 — host track (Sonnet), aarch64 / Firecracker in Lima `fc` — PASS; metal track at the gate, paperwork pending
+
+*2026-10-24 ~20:00 IDT, Sonnet.* Gate narrowed by the owner: non-interactive `busybox echo` and `busybox ls`, no `ash`, no pty
+(brief `scripts/kvm/goose/taoxichuan-03-busybox.md`, sent 18:48 before the stage-2 aarch64 check, per the owner's ordering).
+
+- **Merge:** `litter/taoxichuan-s3` @ `6c4602b7` into `rust-org-il-experiment` (`e67714f6`), clean.
+- **goose's cfg gating is complete:** `cargo test -p akuma-ring3-amd64` on the Mac host (aarch64-apple-darwin): 8 passed.
+  This is the stage-2 finding closed: goose gated nine items first thing in stage 3, unprompted beyond the brief's one line.
+  No new amd64-only crate this stage (`akuma-fdtable` is the existing arch-neutral fd state machine), so the `default-members`
+  problem did not recur.
+- **Compiles / boots (aarch64):** `scripts/build_taoxichuan_fc.sh` -> 662,792 B (unchanged; the aarch64 kernel does not use the amd64
+  composition crates), 12 s. Firecracker boot in Lima `fc`, `--no-net`: 133 lines, banner (line 11), `Ext2 filesystem mounted`
+  (76), `sshd started` (117), zero `Fault|PANIC|sig!`. Control `--no-disk`: 80 lines, `Block device not found`, no sshd, zero faults.
+- **Honest limit (as in stage 2):** the aarch64 track runs a musl userspace (`sshd`) on the feature-set kernel; it did not run
+  `busybox echo`/`ls` and compare bytes. The byte-compare is the metal track's.
+- **Metal track, verified by the supervisor from the box (not goose's RESULT.md, which does not exist yet):** the last gate boot
+  printed `ls /bin` -> `busybox`, `hello`, `sh` (exit 0) and `echo hello-from-taoxichuan-stage-3` (exit 0), then
+  `Taoxichuan: stage 3 gate reached -- sequential tasks ran clean, outputs above` and `all programs done`. In
+  `/root/dev-cycle/taoxichuan-s3/refs/`: `ref-echo.out == guest-echo.out` and `ref-ls.out == guest-ls.out` (`cmp` identical;
+  SHA256 `137128a9...` and `ddec525c...` in `SHA256SUMS.ref`). 15 crates (14 + `akuma-fdtable`), `taoxichuan/src/main.rs`
+  1,790 lines, release binary 266,752 B (198,072 B at stage 2). Iterations on the way: `echo: out of memory`, then unhandled
+  syscalls 228 and 96, fixed by goose from the `-ENOSYS` arm's printed numbers.
+- **Stopped by quota, not by failure:** at 19:56 IDT z.ai answered `Usage limit reached for 5 hour. Your limit will reset at
+  2026-10-25 02:39:00` (China time, UTC+8 = **21:39 IDT**). goose-glm had no `RESULT.md`, no agent-log section, no
+  main-kernel regression boot and the services mid-cycle; the supervisor restored `vm-serve-mc` and disabled `vm-dev` (the brief's
+  own cleanup) and prepared `scripts/kvm/goose/taoxichuan-03b-finish.md` (the `01b` pattern), to be sent after the reset.
+- **Cost, stage 3 so far** (`sessions.db`, session `20261024_28`, `glm-5.3-flash` low): 66.3 min, 169 calls, 17,566,605 input
+  tokens (17,392,000 cache reads), 96,131 output, largest context 167,308. The window's stages together (stage 1 finish x2,
+  stage 2, stage 3) are about 38M input tokens; the owner read the z.ai meter at 90% at ~19:46 IDT, so the window is
+  roughly 40M input tokens at flash weight (an estimate from one data point).
+- **Also this stage:** the owner asked that every brief tell goose to commit and push every 20 minutes when something is
+  uncommitted (stage 3 sat uncommitted ~45 min), and to gate all amd64-specific code; both are in the 3b brief.
