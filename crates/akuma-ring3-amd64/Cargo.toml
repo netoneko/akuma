@@ -1,0 +1,17 @@
+[package]
+name = "akuma-ring3-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "Ring 3 for the minimal amd64 composition: ET_EXEC parsing, the initial user stack, the syscall/sysret transitions, and the syscall-entry stub"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `Msr::{Efer, Star, Lstar, Fmask}` — `akuma_cpu::msr` is the closed MSR set;
+# this crate adds no `wrmsr` of its own.
+akuma-cpu = { path = "../akuma-cpu" }
+# `star()`: `IA32_STAR` is derived from this table's row order, and `sysret`
+# derives user CS/SS from `STAR` in turn, so the transitions and the table
+# cannot drift apart.
+akuma-gdt = { path = "../akuma-gdt" }
