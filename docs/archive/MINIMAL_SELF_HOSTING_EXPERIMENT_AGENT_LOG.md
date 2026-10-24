@@ -392,3 +392,98 @@ that session's step 4 for stage 1, run after goose-glm's 01b finish landed on `l
 **Stage 1 counts: both tracks pass the gate.** Next: stage 2 (userspace works — a
 static musl hello runs, exit 0, output matches the host-built binary), brief
 `scripts/kvm/goose/taoxichuan-02-hello.md`.
+
+### Stage 2 — metal track (goose-glm)
+
+*2026-10-24, `glm-5.3-flash` (low effort), branch `taoxichuan-s2` (head `f76ff171`
+at the gate; paperwork commits after). Merge of `origin/rust-org-il-experiment`
+(`d59f0df1`) onto `taoxichuan-s1` was a clean fast-forward.*
+
+**What was composed.** One new crate, `crates/akuma-ring3-amd64` (one line pulled
+into `taoxichuan/Cargo.toml`, per the composition rule: extract first, then pull).
+It is the ring-3 crossing at minimum size, host-tested where pure:
+
+- `Image` — the `PT_LOAD` walk over the already-read image bytes, bounds-checked
+  throughout. This is `akuma-elf` without `akuma-mmu`: eager placement, no demand
+  paging, no interpreter, so pulling it does not pull the MMU.
+- `build_stack` — argc/argv/envp/auxv in the Linux order musl's `__init_libc`
+  walks; `AT_RANDOM` (deterministic canary — no entropy source, and the crate
+  says so) and `AT_EXECFN` are filled by the builder. 8 host tests cover the
+  parse (including truncated-hostile images) and the stack walk order.
+- `enable_syscalls` + a naked `syscall_entry` stub + `enter_user` — `EFER.SCE`,
+  `STAR` from `akuma_gdt::star()` (the row-order contract is the table's compile-
+  time assertions), `LSTAR`, `SFMASK=0x47700` (TF|IF|DF|IOPL|NT|AC; `syscall`
+  clears `IF` itself). The stub stashes the user RSP in a kernel static, builds
+  a `SyscallFrame` on the crate's own 16 KiB kernel stack, `call`s a registered
+  dispatcher, and `sysretq`s back. No `swapgs` anywhere — no per-CPU block.
+- The x86_64 nr/err/arch/mmap ABI tables. `akuma-syscalls-linux` is the
+  AArch64/asm-generic numbering (`write`=64); the amd64 kernel translates, and
+  so does this crate — stated in its docs.
+
+`taoxichuan/src/main.rs` grew the task: a fresh root page table sharing the
+kernel's upper half by PML4 copy (the kernel's own root keeps the identity map;
+the task's root has none — that retirement can happen when the lower half earns
+its keep), every `PT_LOAD` placed eagerly at its link address (USER_RO/RX/RW,
+`.bss` from the zeroed frames), the initial stack block copied into the top page,
+`brk`/`mmap` as fixed 1 MiB slabs registered up front so a user-pointer check is
+one range scan, `mov cr3` (the write stays unsafe at the call site, like
+`ctlreg`'s docs say), `sysretq`. Dispatcher: `write`/`writev` into
+`console::puts`, `exit_group` captured and printed, `brk`, `arch_prctl` through
+`akuma_cpu::msr::set_fs_base` (the closed wrmsr path — no new MSR writes),
+`set_tid_address`/`getpid`/`getuid` family, `ioctl`→`-ENOTTY`, everything else
+`-ENOSYS` with its number on the console. A ring-3 fault prints `[Fault] ring3 …`
+and parks the core — the kill path, not a triple fault. Unsafe budget updated via
+`check_unsafe_budget.py --update` (the new crate's sites carry their reasons).
+
+**The gate, and the one surprise.** Host side: `musl-gcc -static -no-pie` hello,
+output saved (`hello from taoxichuan ring 3\n`, 29 bytes). Guest side, first live
+boot after the clippy-green build — everything crossed (the KVM MSR trace shows
+EFER 0xd00→0xd01, STAR `0013000800000000`, LSTAR, FMASK, then musl's
+`arch_prctl(ARCH_SET_FS)` as `wrmsr c0000100 <- 0x405698`), exit code 0 captured
+… and **no hello line**. The surprise: musl's `__stdio_write` flushes through
+**`writev`, even for a single buffer** (the empty `wbase` head is a zero-length
+iovec). The table answered `-ENOSYS`; musl dropped the output and `main` still
+returned 0. `writev` added (`f76ff171`), and the very next boot:
+
+    hello from taoxichuan ring 3
+    Taoxichuan: hello exit code 0
+    Taoxichuan: stage 2 gate reached -- ring-3 ran, exited clean, output above
+
+`grep -c -e '\[Fault\]' -e PANIC -e '\[sig!\]'` over the boot's log segment
+(73 lines, `/root/dev-cycle/taoxichuan-s2/vm-dev-pass.log`): **0**. Byte-compare:
+guest line (CR stripped — `akuma-comconsole` emits CR-before-LF, its documented
+newline rule) vs host `reference.out`: **identical SHA256**
+(`7e96c99853398d7c8b6b2bbe5b97514e29f190f4fa9e30bbdd00af4455517f3c`). Stage-1
+gate lines still in the log verbatim (banner, `init spawn`, `stage 1 gate
+reached`); the banner now reads `-- stage 2`.
+
+**Merge regression, main amd64 kernel** (`kbuild -j 4 --features no-tests`,
+36 s, 11,089,888 B): booted twice as the same guest. First with the stage-2
+cmdline — the full kernel ran the same `/bin/hello` end to end (`-- running
+/bin/hello --` … `hello from taoxichuan ring 3` … `-- init exited --`,
+`exc=0`, log saved as `vm-dev-main-amd64-hello.log`); then with the original
+busybox cmdline — `AKUMA-GUEST-UP` → `AKUMA-GUEST-DONE`, zero fault lines
+(`vm-dev-main-amd64.log`). The same binary runs on both kernels; that is the
+parity evidence the experiment wanted. herd's generic `FAIL (banner=yes …)`
+marker appears on both clean boots, as documented in stage 1.
+
+**Ops notes.** The environment has no loop devices and no debugfs, so `/bin/hello`
+went onto the ext2 image (`/boot/akuma-dev-root.img`, backup kept) by a direct
+layout-exact Python edit (`ext2addfile.py` in the evidence dir): free inode +
+21 data blocks + 1 indirect, tail-entry split in `/bin`, free-count bookkeeping;
+read-back hash equals the source, busybox untouched. `herd enable` snapshots
+`available/` into `enabled/` — a conf edit after enabling needs a re-enable;
+cost one boot. `available/vm-dev.conf` is back on the stage-1 busybox cmdline;
+the gate boots used `init=/bin/hello`. `vm-serve-mc` running at the end.
+
+**For stage 3 (busybox ash):** the gap is breadth, not new machinery. The
+dispatcher's `-ENOSYS` prints its number — boot busybox once and the console
+lists exactly what ash needs (expect `rt_sigaction`/`rt_sigprocmask`,
+`gettimeofday`/`clock_gettime`, `read`/`readlink`/`newfstatat`, `openat` at
+minimum; musl's malloc already survives on the brk/mmap slabs). The syscall
+stub restores everything, so a task that faults dies loudly; but ash's
+`fork`+`wait` needs more than one task-static — the experiment pins "no
+scheduler", so decide early whether a script runs as a sequence of child tasks
+the kernel reaps synchronously. The ext2 image now also has a working
+`/bin/hello` for smoke tests, and `scripts/taoxichuan_hello.sh` rebuilds both
+the binary and the reference output.
