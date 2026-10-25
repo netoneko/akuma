@@ -848,3 +848,35 @@ driver exits (the Mac was busy: `./ck3` ~5 cores).
 form versus a name-based `--repository /pkgs add ca-certificates-bundle`; sshd's cosmetic `Unknown argument: /bin/sshd`;
 the 6A brief file was never committed (G1-G4 were reconstructed from `/pkgs/README`); a `hlt` idle path in the guest
 wait loop (the `vm-dev` fan problem).
+
+### Stage 6 — session B, host-track verification and the apk reference check (Sonnet), 2026-10-25 03:40-04:25 IDT
+
+**Merged tree, aarch64 (Lima `fc`, Firecracker).** Goose's driver exited at 03:40 (`taoxichuan-s4` @ `f4f119a2`, merged as `21705006`).
+`scripts/build_taoxichuan_fc.sh` -> `taoxichuan-fc.bin` 662,792 B (unchanged). Boot with disk: 163 lines, `Ext2 filesystem mounted`,
+`sshd started`, 0 `Fault|PANIC|sig!`. `--no-disk` control: 125 lines, `Block device not found`, no sshd, 0 faults. PASS.
+(Both runs write the guest-side `/tmp/akuma-fc-boot.log`, so fetch it with `limactl shell fc -- cat` between runs; a second run overwrites it.)
+
+**How apk is supposed to work (real Linux, the same Alpine 3.23 aarch64 `apk.static` 3.0.8-r0 and the same ca-certificates-bundle).**
+`apk.static --root R --initdb --no-network --no-cache --allow-untrusted add /abs/pkg.apk` and `... add ./pkg.apk` both work, but
+**only with `--force-non-repository`** when `--no-cache` is given: without it apk refuses ("You tried to add a non-repository
+package to system, but it would be lost on next reboot"). With it, both path forms install and `ca-certificates.crt` is
+`5961c0a3...3f568b`, the value in `EXPECTED.txt`. The name form (`add ca-certificates-bundle` with `--repository DIR`) fails on
+Linux too (no index), so it is **not** a way forward. Linux's error for a bad name is `unable to select packages: <name> (no such
+package)`, the same text Akuma printed. Note the package it named on Akuma was `apk.static`, not the path: the positional
+argument apk saw after `add` was its own program name, so the amd64 exec-replace / `build_stack` argv layout is the lead (an
+argv shifted by one, or argv[0] repeated), not a path-resolution bug. G2 hid this because `--version` ignores positionals.
+Both are hypotheses for the next session; neither is verified on the amd64 guest.
+
+**Static apk on the aarch64 kernel.** On the *stock* aarch64 kernel (`FC_FEATURES=devbox-smoltcp,no-tests`, Lima `fc`, a copy of
+`disk.img` plus the Alpine aarch64 `apk.static` and package, ssh on :4444): `--version` OK; the path-form install into a fresh
+root works in both `/abs/pkg.apk` and `cd /pkgs && ./pkg.apk` forms, and the installed `ca-certificates.crt` is `5961c0a3...3f568b`.
+Without `--force-non-repository` Akuma installed too, where Linux refuses (Akuma's `apk` does not detect the volatile root).
+**On the Taoxichuan aarch64 kernel itself it cannot be run**: that build has no network ("built without the smoltcp feature",
+`rx posted=0`, so no ssh) and `execve` is refused (`with_own_process_exclusive without the BKL — refused`, every exec from a
+test driver spawned as `/bin/sshd`), so there is no way to launch `apk.static` there. The result above is therefore evidence that
+apk-tools itself and the aarch64 syscall layer are fine; it says nothing about the amd64 Taoxichuan kernel.
+
+**For the next brief.** Add `--force-non-repository` to the G3 command (or explain the refusal); dump `argv` as the new image
+sees it before apk's parser runs (`apk.static --root / add <path>` should list exactly one positional); keep the Linux
+transcript above as the oracle. Ryzen was taken offline by the owner at ~03:45, so nothing is running there; `vm-dev` was
+already stopped by goose and `vm-serve-mc` restored.
