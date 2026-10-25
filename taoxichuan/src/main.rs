@@ -1113,6 +1113,7 @@ fn nr_name(nr: u64) -> &'static str {
         ring3::nr::FLOCK => "flock",
         ring3::nr::FCNTL => "fcntl",
         ring3::nr::FCHMOD => "fchmod",
+        ring3::nr::UTIMENSAT => "utimensat",
         ring3::nr::FCHOWNAT => "fchownat",
         ring3::nr::UMASK => "umask",
         ring3::nr::GETTIMEOFDAY => "gettimeofday",
@@ -1501,6 +1502,31 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 (false, _) => e(ring3::err::EBADF),
                 (_, Err(no)) => e(no),
                 (_, Ok(n)) => n,
+            }
+        }
+        ring3::nr::UTIMENSAT => {
+            // utimensat(2), apk's post-install "preserve mtime" pass — the
+            // last thing its install loop does, and an ENOSYS here is
+            // counted as a failed install. This kernel has no wall clock
+            // (the mount documents `|| 0`), so stamping is recorded-not:
+            // validate the target the way a real utimensat would, then
+            // succeed without touching the inode times.
+            let (dirfd, path_va) = (fr.arg1(), fr.arg2());
+            if path_va == 0 {
+                // futimens-on-fd form.
+                let known = fd_table().with(dirfd as u32, |_| true).is_some();
+                return if known { 0 } else { e(ring3::err::EBADF) };
+            }
+            let mut pbuf = [0u8; 128];
+            let Some(path) = user_str(path_va, &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            let Some(full) = resolve_at(dirfd, path) else {
+                return e(ring3::err::EBADF);
+            };
+            match root_fs().metadata(&resolve_effective(&full)) {
+                Ok(_) => 0,
+                Err(_) => e(ring3::err::ENOENT),
             }
         }
         ring3::nr::ACCESS => {
