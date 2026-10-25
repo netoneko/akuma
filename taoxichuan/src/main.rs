@@ -803,6 +803,7 @@ fn open_common(path: &str, flags: u64) -> u64 {
     // Stage 6: write access is served — apk unpacks with O_WRONLY|O_CREAT|
     // O_TRUNC. The description is an ext2 lookup (or create) — no VFS mount
     // table, one root.
+    let traced = path.starts_with("/tmp/"); // TRACE (s7d settle)
     let acc = flags & ring3::open::O_ACCMODE;
     // Stage 4: symlinks resolve (`/bin/sh` is one). A fresh O_CREAT file has
     // no links to resolve; `resolve_effective` passes such a path through.
@@ -863,8 +864,8 @@ fn open_common(path: &str, flags: u64) -> u64 {
     };
     let fd = table.alloc_fd_from(3, desc);
     // TRACE (s7d step-1 settle): where a shell redirect's file lands.
-    if path.starts_with("/tmp/") {
-        akuma_primitives::safe_print!(112, "  [o] open {} flags={:#x} -> {}\n", path, flags, fd);
+    if traced {
+        akuma_primitives::safe_print!(112, "  [o] open flags={:#x} -> {}\n", flags, fd);
     }
     if flags & ring3::open::O_CLOEXEC != 0 {
         table.set_cloexec(fd); // O_CLOEXEC: recorded, nothing execs yet
