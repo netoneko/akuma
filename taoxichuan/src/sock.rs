@@ -197,9 +197,56 @@ pub fn connect_arm(fd: u64, addr: u64, addrlen: u64) -> u64 {
     let Some(sa) = sockaddr_in_from_user(addr, addrlen) else {
         return crate::e(crate::err::EINVAL);
     };
-    match akuma_net::socket::socket_connect(idx, sa, fd_nonblock(fd)) {
+    // Dial non-blocking, then wait HERE, in the kernel, with a visible trace.
+    // The single-task guest's blocking wait (`wait_until` inside akuma-net)
+    // is opaque from the console; this loop prints the smoltcp socket state
+    // once a second until the handshake lands or dies. `EINPROGRESS` is the
+    // x86_64 value akuma-net answers for a non-blocking dial in flight.
+    const EINPROGRESS: i32 = 115;
+    match akuma_net::socket::socket_connect(idx, sa, true) {
         Ok(()) => 0,
+        Err(EINPROGRESS) => connect_wait(idx),
         Err(e) => net_err(e),
+    }
+}
+
+/// Poll a dial to completion, tracing the socket's smoltcp state once a
+/// second: state, remote endpoint, queue depths, and how much `poll()`
+/// actually moved (the poll counter's delta). A lap that never prints a
+/// changing state with a rising counter means the SYN is being emitted into
+/// a void; a frozen clock or a flat counter means the poll itself is stuck.
+fn connect_wait(idx: usize) -> u64 {
+    let start = crate::net::uptime_us();
+    let mut printed = start;
+    loop {
+        crate::net::netpoll();
+        let now = crate::net::uptime_us();
+        match akuma_net::socket::debug_stream_peek(idx) {
+            Some(d) if d.completed => return 0,
+            Some(d) if d.dead => return crate::e(crate::err::ECONNREFUSED),
+            Some(d) => {
+                if now.saturating_sub(printed) >= 1_000_000 {
+                    printed = now;
+                    let polls = akuma_net::smoltcp_net::poll_count();
+                    let (ip, port) = d.remote.unwrap_or(([0, 0, 0, 0], 0));
+                    akuma_primitives::safe_print!(
+                        96,
+                        "  [cx] t={}s state={} remote={}.{}.{}.{}:{} q={}/{} polls={}\n",
+                        now.saturating_sub(start) / 1_000_000,
+                        d.state,
+                        ip[0], ip[1], ip[2], ip[3],
+                        port,
+                        d.send_q, d.recv_q,
+                        polls
+                    );
+                }
+            }
+            None => return crate::e(crate::err::EBADF),
+        }
+        if now.saturating_sub(start) >= 15_000_000 {
+            return crate::e(crate::err::ETIMEDOUT);
+        }
+        core::hint::spin_loop();
     }
 }
 

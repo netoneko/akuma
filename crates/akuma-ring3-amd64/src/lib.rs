@@ -1057,6 +1057,10 @@ pub mod err {
     pub const EFAULT: u64 = 14;
     /// Invalid argument.
     pub const EINVAL: u64 = 22;
+    /// Connection timed out (a dial that outlived its wait).
+    pub const ETIMEDOUT: u64 = 110;
+    /// Connection refused (the dial's socket went `Closed` before it was up).
+    pub const ECONNREFUSED: u64 = 111;
     /// Inappropriate ioctl for device.
     pub const ENOTTY: u64 = 25;
     /// Function not implemented.

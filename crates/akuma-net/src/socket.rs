@@ -1094,6 +1094,76 @@ pub fn connect_outcome(waited: Result<(), i32>, state: Option<tcp::State>) -> Re
     }
 }
 
+/// Read-only peek at the stream socket behind a kernel socket index, for a
+/// kernel-side connect wait that wants to trace what the stack is doing
+/// (TAOXICHUAN's stage-7 connect trace). Nothing here mutates, prints, or
+/// allocates: one `NETWORK` read.
+#[cfg(feature = "smoltcp")]
+#[derive(Debug, Clone, Copy)]
+pub struct DebugStream {
+    /// smoltcp state name (`SynSent`, `Established`, `Closed`, ...).
+    pub state: &'static str,
+    /// The remote endpoint smoltcp is dialing / dialed, if any.
+    pub remote: Option<([u8; 4], u16)>,
+    /// Unsent and unreceived byte counts.
+    pub send_q: usize,
+    pub recv_q: usize,
+    /// A state a blocking connect treats as done (`connect_completed`).
+    pub completed: bool,
+    /// `Closed` — after a dial, a refusal or a local reset.
+    pub dead: bool,
+}
+
+#[cfg(feature = "smoltcp")]
+pub fn debug_stream_peek(idx: usize) -> Option<DebugStream> {
+    let h = with_table(|table| {
+        if let Some(Some(sock)) = table.get(idx)
+            && let SocketType::Stream(handle) = sock.inner
+        {
+            return Some(handle);
+        }
+        None
+    })?;
+    with_network(|net| {
+        smoltcp_net::tcp_get(&net.sockets, h, |s: &smoltcp::socket::tcp::Socket| {
+            let st = s.state();
+            DebugStream {
+                state: state_name(st),
+                remote: s.remote_endpoint().map(|ep| {
+                    let smoltcp::wire::IpAddress::Ipv4(a) = ep.addr else {
+                        return ([0, 0, 0, 0], ep.port);
+                    };
+                    (a.octets(), ep.port)
+                }),
+                send_q: s.send_queue(),
+                recv_q: s.recv_queue(),
+                completed: connect_completed(st),
+                dead: st == tcp::State::Closed,
+            }
+        })
+    })
+    .flatten()
+}
+
+/// `smoltcp::socket::tcp::State` as the name the state machine's docs use.
+#[cfg(feature = "smoltcp")]
+pub fn state_name(state: smoltcp::socket::tcp::State) -> &'static str {
+    use smoltcp::socket::tcp::State as S;
+    match state {
+        S::Closed => "Closed",
+        S::Listen => "Listen",
+        S::SynSent => "SynSent",
+        S::SynReceived => "SynReceived",
+        S::Established => "Established",
+        S::FinWait1 => "FinWait1",
+        S::FinWait2 => "FinWait2",
+        S::CloseWait => "CloseWait",
+        S::Closing => "Closing",
+        S::LastAck => "LastAck",
+        S::TimeWait => "TimeWait",
+    }
+}
+
 /// Whether `sock` already occupies `ip:port` in the same protocol's port space
 /// as `wants_tcp` (TCP and UDP are separate namespaces on real Linux, and
 /// stay separate here). A `Stream` socket that has only `bind()`-ed (not yet
