@@ -873,6 +873,13 @@ fn open_common(path: &str, flags: u64) -> u64 {
 /// (`write_at_by_inode`) extends the file as the offset passes its end, and
 /// the fd's size/cursor follow the bytes that landed.
 fn write_file_arm(fd: u64, buf: u64, len: u64) -> u64 {
+    let r = write_file_arm_inner(fd, buf, len);
+    // Stage-7 probe: which file writes move and which stall (H3's echo).
+    akuma_primitives::safe_print!(96, "  [w] fd={} len={} -> {}\n", fd, len, r);
+    r
+}
+
+fn write_file_arm_inner(fd: u64, buf: u64, len: u64) -> u64 {
     let mut chunk = [0u8; 1024];
     let mut total = 0u64;
     let mut res: Result<u64, u64> = Ok(0);
