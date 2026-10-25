@@ -1254,11 +1254,47 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::WRITEV => {
             // musl's stdio flush: `writev(fd, iov, iovcnt)`, 16-byte iovecs.
             let (fd, iov_va, iovcnt) = (fr.arg1(), fr.arg2(), fr.arg3());
-            if fd != 1 && fd != 2 {
-                return e(ring3::err::EBADF);
-            }
             if iovcnt == 0 || iovcnt > 1024 || !user_ok(iov_va, iovcnt * 16) {
                 return e(ring3::err::EFAULT);
+            }
+            // A socket fd goes through the socket send path. It used to be
+            // fds 1/2 only — EBADF for everything else — and busybox wget's
+            // HTTP request died exactly there: musl stdio flushes through
+            // writev, stdio swallows the EBADF into the stream's error flag,
+            // wget never checks it, and the guest then blocked forever in a
+            // read of a response to a request that had never left the machine.
+            if let Some(idx) = sock::fd_socket(fd) {
+                let mut data = alloc::vec::Vec::new();
+                let mut total = 0u64;
+                for i in 0..iovcnt {
+                    let mut iv = [0u8; 16];
+                    if !copy_from_user(&mut iv, iov_va + i * 16) {
+                        return e(ring3::err::EFAULT);
+                    }
+                    let (base, len) = (
+                        u64::from_le_bytes(iv[0..8].try_into().unwrap()),
+                        u64::from_le_bytes(iv[8..16].try_into().unwrap()),
+                    );
+                    if len > WRITE_LIMIT || !user_ok(base, len) {
+                        return e(ring3::err::EFAULT);
+                    }
+                    total += len;
+                    if total > WRITE_LIMIT {
+                        return e(ring3::err::EFAULT);
+                    }
+                    let off = data.len();
+                    data.resize(off + len as usize, 0);
+                    if !copy_from_user(&mut data[off..], base) {
+                        return e(ring3::err::EFAULT);
+                    }
+                }
+                return match sock::writev_socket(idx, &data, sock::fd_nonblock(fd)) {
+                    Ok(n) => n as u64,
+                    Err(err) => err,
+                };
+            }
+            if fd != 1 && fd != 2 {
+                return e(ring3::err::EBADF);
             }
             // The pipe branch of `write` applies per iovec: musl flushes a
             // buffered stdout as one writev, and a nested child's version
