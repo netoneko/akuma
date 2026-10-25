@@ -783,11 +783,7 @@ fn emit(buf_va: u64, len: u64) -> bool {
 /// the open description, take the lowest free fd slot. Absolute paths only,
 /// read-only access only: the root is read-only in spirit and this kernel has
 /// no write path to lie about.
-fn open_common(path_va: u64, flags: u64) -> u64 {
-    let mut pbuf = [0u8; 128];
-    let Some(path) = user_str(path_va, &mut pbuf) else {
-        return e(ring3::err::EFAULT);
-    };
+fn open_common(path: &str, flags: u64) -> u64 {
     if !path.starts_with('/') {
         return e(ring3::err::ENOENT); // nothing to resolve ".." against
     }
@@ -1647,21 +1643,29 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::OPENAT => {
-            // The one way in. Absolute paths only (`AT_FDCWD` only: there is
-            // no working directory), read-only access only: the root is
-            // read-only in spirit and this kernel has no write path to lie
-            // about. The description is an ext2 lookup now — no VFS mount
-            // table, one root.
+            // The one way in — now through the same dirfd resolution every
+            // other `at` arm uses: apk opens the db directory once and then
+            // opens the lock and the package files relative to that fd. (The
+            // old "absolute paths only, read-only" arm predated the write
+            // path and answered EBADF to exactly the calls the gate needs.)
             let (dirfd, path_va, flags) = (fr.arg1(), fr.arg2(), fr.arg3());
-            if dirfd != ring3::open::AT_FDCWD {
+            let mut pbuf = [0u8; 128];
+            let Some(path) = user_str(path_va, &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            let Some(full) = resolve_at(dirfd, path) else {
                 return e(ring3::err::EBADF);
-            }
-            open_common(path_va, flags)
+            };
+            open_common(&full, flags)
         }
         ring3::nr::OPEN => {
             // musl's `open()` on x86_64: the legacy number, no dirfd.
             let (path_va, flags) = (fr.arg1(), fr.arg2());
-            open_common(path_va, flags)
+            let mut pbuf = [0u8; 128];
+            let Some(path) = user_str(path_va, &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            open_common(path, flags)
         }
         ring3::nr::GETDENTS64 => {
             // `ls`'s walk: fill `linux_dirent64` records from the open
