@@ -462,19 +462,13 @@ static SYSCALL_STACK_TOP: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 /// `syscall` does not hand over a stack pointer in a register, and the user
 /// stack must not be touched before the kernel chooses to, so the stash is
 /// kernel memory. Single core, `IF` off: no other writer exists. An
-/// `UnsafeCell` behind a manual `Sync` because two writers exist on stage 4:
-/// the stub's asm, and the nested-task handoff (`user_rsp_stash`/
-/// `set_user_rsp_stash` below) — the cell changes nothing for the asm, which
-/// takes the address.
+/// `AtomicU64` because two writers exist on stage 4: the stub's asm, and
+/// the nested-task handoff (`user_rsp_stash`/`set_user_rsp_stash` below) —
+/// the atomic changes nothing for the asm, which takes the address and
+/// moves plain `mov`s (a `Relaxed` access is the same instruction), and it
+/// retires the manual `Sync`/volatile `unsafe` pair the cell needed.
 #[cfg(target_arch = "x86_64")]
-struct StashCell(core::cell::UnsafeCell<u64>);
-// SAFETY: the stash is syscall-path memory — one core, `IF` clear while it
-// is written (the stub, or the nested-task handoff). No cross-thread access
-// exists in a kernel with one core and no scheduler.
-#[cfg(target_arch = "x86_64")]
-unsafe impl Sync for StashCell {}
-#[cfg(target_arch = "x86_64")]
-static USER_RSP_STASH: StashCell = StashCell(core::cell::UnsafeCell::new(0));
+static USER_RSP_STASH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The kernel's dispatcher, stored as an address so the naked stub can `call`
 /// it through memory (a naked function has no Rust-level names to reach).
@@ -565,17 +559,17 @@ pub type Dispatcher = fn(&mut SyscallFrame) -> u64;
 #[cfg(target_arch = "x86_64")]
 #[must_use]
 pub fn user_rsp_stash() -> u64 {
-    // SAFETY: single core, `IF` clear inside the syscall path — the same
+    // Relaxed: single core, `IF` clear inside the syscall path — the same
     // discipline that owns every write to this static (the stub's own asm
-    // included).
-    unsafe { core::ptr::read_volatile(USER_RSP_STASH.0.get()) }
+    // included). The ordering carries no inter-core promise on purpose.
+    USER_RSP_STASH.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Redirect the stub's user-`RSP` stash (see [`user_rsp_stash`]).
 #[cfg(target_arch = "x86_64")]
 pub fn set_user_rsp_stash(v: u64) {
-    // SAFETY: as `user_rsp_stash`.
-    unsafe { core::ptr::write_volatile(USER_RSP_STASH.0.get(), v) }
+    // Relaxed: as `user_rsp_stash` — single-core scratch, no ordering promise.
+    USER_RSP_STASH.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// The stack top the stub switches to on the next `syscall`.
