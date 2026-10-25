@@ -434,6 +434,19 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
         rflags: 0x202,
         rsp: ti.rsp,
     };
+    // Lower the nested dispatch top BELOW this arm's live frame. Every child
+    // syscall re-enters at `set_syscall_stack_top`'s current value — the same
+    // region this frame occupies (the execve dispatch itself started there) —
+    // so the exec'd child's first deep syscall would rewrite this frame,
+    // `RET_RSP` included, and the exit `ret` would jump to whatever it found.
+    // `spawn_arm`'s tail restores the real top after `child_enter` returns;
+    // failure paths above never lowered it.
+    let rsp_here: u64;
+    core::arch::asm!("mov {}, rsp", out(reg) rsp_here, options(nomem));
+    // SAFETY: syscall-path discipline.
+    unsafe {
+        ring3::set_syscall_stack_top(rsp_here - 0x1000);
+    }
     let status = unsafe { child_enter(ti.root_pa, &ef) };
     // The exec'd child exited: `child_exit` recorded its status in the slot,
     // cleared the nesting, put task slot 0 back, and restored THIS frame's
