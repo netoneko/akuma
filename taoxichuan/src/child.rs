@@ -371,11 +371,12 @@ pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame) -> u64 {
         "mov qword ptr [rip + {s_r15}], r15",
         // The child's address space: kernel half survives (shared PML4).
         "mov cr3, rdi",
-        // The enter_user crossing, verbatim (`akuma-ring3-amd64`): the frame
-        // pointer is now RSI.
+        // The enter_user crossing, verbatim (`akuma-ring3-amd64`): every load
+        // is spent against the frame pointer RSI, and the frame's own RSI is
+        // restored only after the pointer's last use — loading it early made
+        // every later read dereference the child's (null) RSI instead.
         "mov rax, [rsi + 0x60]",
         "mov rdx, [rsi + 0x48]",
-        "mov rsi, [rsi + 0x50]",
         "mov rbp, [rsi + 0x20]",
         "mov r8,  [rsi + 0x38]",
         "mov r9,  [rsi + 0x40]",
@@ -389,6 +390,7 @@ pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame) -> u64 {
         "mov r10, [rsi + 0x30]",
         "mov rsp, [rsi + 0x78]",
         "mov rdi, [rsi + 0x58]",
+        "mov rsi, [rsi + 0x50]", // last: spends the frame pointer
         "sysretq",
         ret_rsp = sym RET_RSP,
         s_rbx = sym SAVE_RBX,
