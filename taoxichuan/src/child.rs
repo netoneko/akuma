@@ -264,10 +264,19 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     // image; the chain walker resolves it the same way `open` does.
     let effective = crate::resolve_effective(path);
     let Ok(image) = crate::root_fs().read_file(&effective) else {
+        // Say what failed. A silent ENOENT here reads on the client exactly
+        // like a missing binary, and cost three stages of diagnosis.
+        akuma_primitives::safe_print!(
+            192,
+            "[spawn] '{}' -> '{}': read failed\n",
+            path,
+            effective
+        );
         slots()[slot_idx].used = false;
         return crate::e(crate::err::ENOENT);
     };
     if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
+        akuma_primitives::safe_print!(160, "[spawn] '{}': not an ELF image\n", effective);
         slots()[slot_idx].used = false;
         return crate::e(crate::err::ENOENT);
     }
@@ -276,6 +285,7 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     crate::set_task_slot(1);
     let ti = crate::load_task(&argv, &env, &image);
     let Some(ti) = ti else {
+        akuma_primitives::safe_print!(160, "[spawn] '{}': load failed\n", effective);
         crate::set_task_slot(0);
         slots()[slot_idx].used = false;
         return crate::e(crate::err::ENOMEM);

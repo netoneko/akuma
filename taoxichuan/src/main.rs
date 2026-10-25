@@ -707,12 +707,19 @@ fn read_link_target(path: &str) -> Option<alloc::string::String> {
     if !fs.is_symlink(path) {
         return None;
     }
-    let raw = fs.read_file(path).ok()?;
-    alloc::string::String::from_utf8(raw).ok().map(|s| {
-        // Strip exactly one trailing newline, the convention for link text.
-        let s = s.trim_end_matches('\n');
-        alloc::string::String::from(s)
-    })
+    // `read_symlink`, never `read_file`: a fast symlink (every busybox link
+    // on the serve image — `/bin/sh`, `/bin/apk` — fits the 60-byte inline
+    // form) keeps its target in the inode's pointer-word window and has no
+    // data blocks. `read_file` handed those first target bytes to the block
+    // mapper as a bogus block number, the read failed, spawn answered ENOENT,
+    // and sshd fell back to built-in paws on every exec — three stages of
+    // gates quietly ran on shell builtins because of this one provider.
+    // `read_symlink` returns the target verbatim (`read_symlink_inode`
+    // handles both the fast inline form and the slow block form); strip one
+    // trailing newline only as belt-and-braces.
+    fs.read_symlink(path)
+        .ok()
+        .map(|s| alloc::string::String::from(s.trim_end_matches('\n')))
 }
 
 /// Resolve symlinks (bounded), returning the effective path to look up.
@@ -828,15 +835,14 @@ fn open_common(path_va: u64, flags: u64) -> u64 {
     } else {
         match fs.resolve_inode(&path) {
             Ok(inode) => {
-                let mut size = md.size;
-                if flags & ring3::open::O_TRUNC != 0 && acc != ring3::open::O_RDONLY {
-                    // ftruncate-to-zero at open: the writes that follow
-                    // expect to start from an empty file.
-                    if fs.truncate_by_inode(inode, 0).is_err() {
-                        return e(ring3::err::EIO);
-                    }
-                    size = 0;
+                // O_TRUNC is a decision, not just a size: fold it once so the
+                // `if` stays an expression and the side effect stays explicit.
+                let trunc = flags & ring3::open::O_TRUNC != 0
+                    && acc != ring3::open::O_RDONLY;
+                if trunc && fs.truncate_by_inode(inode, 0).is_err() {
+                    return e(ring3::err::EIO);
                 }
+                let size = if trunc { 0 } else { md.size };
                 OpenFile::File { inode, offset: 0, size }
             }
             Err(_) => return e(ring3::err::EIO),
@@ -879,7 +885,7 @@ fn write_file_arm(fd: u64, buf: u64, len: u64) -> u64 {
                     *size = (*size).max(*offset);
                     done += n as u64;
                     total += n as u64;
-                    if (n as usize) < want {
+                    if n < want {
                         break; // short write: stop where the disk stopped
                     }
                 }
@@ -909,7 +915,7 @@ fn resolve_at(dirfd: u64, path: &str) -> Option<alloc::string::String> {
         return Some(alloc::string::String::from(path));
     }
     if dirfd == ring3::open::AT_FDCWD {
-        return Some(alloc::format!("/{}", path));
+        return Some(alloc::format!("/{path}"));
     }
     let dir = fd_table().with(dirfd as u32, |d| match d {
         OpenFile::Dir { path, .. } => Some(path.clone()),
@@ -1022,7 +1028,7 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
         return e(ring3::err::EBADF);
     }
     let info = fd_table().with(fd as u32, |d| match d {
-        OpenFile::File { inode, size, .. } => Some((*inode as u64, *size, 0u8)),
+        OpenFile::File { inode, size, .. } => Some((u64::from(*inode), *size, 0u8)),
         OpenFile::Dir { .. } => Some((0, 0, 1)),
         _ => Some((0, 0, 2)),
     });
@@ -1046,18 +1052,18 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
 /// A fresh open description equal to `d` — `dup(2)`'s copy. The offset is
 /// *copied*, not shared (the table stores descriptions by value); nothing in
 /// the apk path reads through two fds sharing one offset.
-fn clone_desc(d: &OpenFile) -> Option<OpenFile> {
+fn clone_desc(d: &OpenFile) -> OpenFile {
     match d {
         OpenFile::File { inode, offset, size } => {
-            Some(OpenFile::File { inode: *inode, offset: *offset, size: *size })
+            OpenFile::File { inode: *inode, offset: *offset, size: *size }
         }
-        OpenFile::Dir { path, entries, cursor } => Some(OpenFile::Dir {
+        OpenFile::Dir { path, entries, cursor } => OpenFile::Dir {
             path: path.clone(),
             entries: entries.clone(),
             cursor: *cursor,
-        }),
-        OpenFile::Socket(i) => Some(OpenFile::Socket(*i)),
-        OpenFile::ChildOut(i) => Some(OpenFile::ChildOut(*i)),
+        },
+        OpenFile::Socket(i) => OpenFile::Socket(*i),
+        OpenFile::ChildOut(i) => OpenFile::ChildOut(*i),
     }
 }
 
@@ -1804,7 +1810,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::LSEEK => {
-            let (fd, off, whence) = (fr.arg1(), fr.arg2() as i64, fr.arg3());
+            let (fd, off, whence) = (fr.arg1(), fr.arg2().cast_signed(), fr.arg3());
             if fd <= 2 || fd as u32 >= SLOT_CEILING {
                 return e(ring3::err::EBADF);
             }
@@ -1813,8 +1819,8 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 OpenFile::File { offset, size, .. } => {
                     let base = match whence {
                         0 => 0i64,            // SEEK_SET
-                        1 => *offset as i64,  // SEEK_CUR
-                        2 => *size as i64,    // SEEK_END
+                        1 => (*offset).cast_signed(), // SEEK_CUR
+                        2 => (*size).cast_signed(),   // SEEK_END
                         _ => {
                             res = Err(ring3::err::EINVAL);
                             return;
@@ -1997,7 +2003,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 return e(ring3::err::EBADF);
             }
             let desc = fd_table().with(fd as u32, clone_desc);
-            let Some(Some(desc)) = desc else {
+            let Some(desc) = desc else {
                 return e(ring3::err::EBADF);
             };
             let mut table = fd_table();
