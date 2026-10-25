@@ -1258,6 +1258,10 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             if iovcnt == 0 || iovcnt > 1024 || !user_ok(iov_va, iovcnt * 16) {
                 return e(ring3::err::EFAULT);
             }
+            // The pipe branch of `write` applies per iovec: musl flushes a
+            // buffered stdout as one writev, and a nested child's version
+            // string belongs to the ssh session, not the console.
+            let piped = child::nested_active() && fd == 1;
             let mut total = 0u64;
             for i in 0..iovcnt {
                 let mut iv = [0u8; 16];
@@ -1268,7 +1272,14 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     u64::from_le_bytes(iv[0..8].try_into().unwrap()),
                     u64::from_le_bytes(iv[8..16].try_into().unwrap()),
                 );
-                if len > WRITE_LIMIT || !user_ok(base, len) || !emit(base, len) {
+                if len > WRITE_LIMIT || !user_ok(base, len) {
+                    return e(ring3::err::EFAULT);
+                }
+                if piped {
+                    if !child::child_write(base, len) {
+                        return e(ring3::err::EFAULT);
+                    }
+                } else if !emit(base, len) {
                     return e(ring3::err::EFAULT);
                 }
                 total += len;
