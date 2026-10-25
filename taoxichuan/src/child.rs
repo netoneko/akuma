@@ -446,10 +446,9 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) rsp_here, options(nomem));
     }
-    // SAFETY: syscall-path discipline.
-    unsafe {
-        ring3::set_syscall_stack_top(rsp_here - 0x1000);
-    }
+    // SAFETY: syscall-path discipline; `set_syscall_stack_top` is a plain
+    // atomic store the unsafe context of the arm already covers.
+    ring3::set_syscall_stack_top(rsp_here - 0x1000);
     let status = unsafe { child_enter(ti.root_pa, &ef) };
     // The exec'd child exited: `child_exit` recorded its status in the slot,
     // cleared the nesting, put task slot 0 back, and restored THIS frame's
