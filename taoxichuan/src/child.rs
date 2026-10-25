@@ -442,11 +442,11 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     // returns the closed payloads; a swept socket releases its kernel side
     // exactly as close does. `load_task` had reset all three collections.
     {
-        let mut t = crate::task();
+        let t = crate::task();
         t.fd_names = saved.0;
         t.fd_cloexec = saved.1;
         t.fd_nonblock = saved.2;
-        let mut table = crate::fd_table();
+        let table = crate::fd_table();
         for (_fd, payload) in table.sweep_cloexec() {
             if let crate::OpenFile::Socket(idx) = payload {
                 akuma_net::socket::remove_socket(idx);
