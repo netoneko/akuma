@@ -1,6 +1,6 @@
 # Minimal self-hosting kernel "Taoxichuan" — agent log
 
-**Status: in progress. Started 2026-10-24.**
+**Status: in progress. Started 2026-10-24. Stages 1-4 PASS; stage 6 (offline `apk`) session B: G1+G2 PASS, G3 in progress (2026-10-25 03:40 IDT).**
 
 Running log for the two-agent execution of
 [`MINIMAL_SELF_HOSTING_EXPERIMENT.md`](MINIMAL_SELF_HOSTING_EXPERIMENT.md).
@@ -803,3 +803,48 @@ kvm0 raises no NIC interrupt, so it needs a timer exit). `goose serve` did not s
 **Quota (from `sessions.db`).** Session A (`20261024_35`-ish) used the last ~18% of the window in ~31 min (full read
 unavailable after the stop). Window arithmetic: ~41M input tokens per 5 h; stage 4 part 1 burned it at ~60%/h with a 220k
 context, part 2 and the planning and 6A sessions at ~10-35%/h with fresh contexts.
+
+### Stage 6 — session B (`taoxichuan-06b-spawn-then-apk.md`), supervisor view (Sonnet), 2026-10-25 02:31-03:40 IDT (in progress)
+
+**Send.** Quota reset confirmed by a probe (`pong`) at ~02:30 after a `herd stop`/`herd start` of goose-glm; brief sent 02:31
+(`--name s6b`, log `/tmp/goose-s6b.log`). A delayed sender scripted for 02:45 was killed: the owner said the window had
+already reset (the 02:44 figure was the *previous* window's end; the quota meter had been reset by the owner's own session
+start). Lesson: probe first, do not schedule against a computed reset time.
+
+**Root cause of "sshd never spawned an external binary" (found by goose, four stacked layers, each hiding the next).**
+1. `read_link_target` (`taoxichuan/src/main.rs`) called `read_file` on a **fast symlink** (target stored in the inode's
+   pointer words, no data blocks): the first target bytes were fed to the block mapper as a block number, SPAWN returned
+   ENOENT, sshd fell back to built-in paws on every exec. Every busybox link on the image is a fast symlink. Fix:
+   `read_symlink` handles both forms (`be128b97`).
+2. `child_enter` (`child.rs`, naked asm) loaded `ef.rsi` early and kept dereferencing the loaded value (0): page fault
+   cr2=0x20 on the first real SPAWN. It had never executed before layer 1 was fixed. Fix: the verbatim `enter_user`
+   register order, frame `rsi` last (`e8c253d0`).
+3. `stat(2)` did not follow the final symlink, so busybox ash's PATH search saw `S_IFLNK|0777`, judged it "not a program"
+   and printed `Permission denied` **without calling fork or execve** (proved by the per-syscall child trace). Fix: STAT
+   resolves through `resolve_effective` like `newfstatat` (`36b126a8`).
+4. There was no `execve`; `sh -c '<one command>'` tail-call-execs. Added as **exec-replace in the nested child**
+   (`child.rs::exec_replace`). Two traps: the second crossing overwrites the shared save slots (snapshot them), and every
+   child syscall re-enters at the same nested stack top (lower it below the exec arm's own frame before crossing, or the
+   exec'd child's first deep syscall rewrites `[RET_RSP]`: `ret` to `rip=0`). `load_task` now resets `regions`/`n_regions`;
+   nested `writev` to fd 1 goes to the child pipe (musl flushes stdout as `writev`; `3c560be7`).
+
+**Gates.** G1 PASS (`ssh -p 2224 root@localhost 'sh -c "echo hi"'` -> `hi`, rc 0, no "failed to spawn" line). G2 PASS
+(`apk.static --version` -> `apk-tools 3.0.8-r0, compiled for x86_64.`; the 6A static-PIE loader base works, 18 startup
+mmaps). G3 first FAILED with a guest PANIC on the first install write (`range start index 18446744073709551608 out of
+range for slice of length 512`): `build_stack` sliced backwards from `buf.len()` and apk's long argv/env overran the
+512-byte initial stack block by one pointer word; fixed by making it a full page (`28dc8ba2`). Next, `OPENAT` still went
+through the read-only-era arm and answered EBADF to apk's open-the-db-dir-then-lock-relative-to-the-fd calls; it now goes
+through `resolve_at` (`f4f119a2`). G3 then reached apk's own error: **apk 3 does not resolve a `.apk` file path argument**
+("unable to select packages: apk.static (no such package)"). G4 not reached. Goose's `RESULT-B.md` (on the box in
+`/root/dev-cycle/taoxichuan-s6/`) is being rewritten as it continues.
+
+**Supervisor interventions.** None to the code. The aarch64 validation of the merged tree is pending until goose's
+driver exits (the Mac was busy: `./ck3` ~5 cores).
+
+**Quota.** 26% at 03:10, 37% at 03:20, 47% at 03:40 (~70 min in): ~40%/h early, ~60%/h at the 220k-context peak, back to
+~30%/h. Leaves enough to reach the 07:30 reset only if the burn stays near 30%/h.
+
+**Open.** `access`(21) arm; remove the temporary `[sc.c]` per-syscall trace before the clean gate boot; the `.apk` path
+form versus a name-based `--repository /pkgs add ca-certificates-bundle`; sshd's cosmetic `Unknown argument: /bin/sshd`;
+the 6A brief file was never committed (G1-G4 were reconstructed from `/pkgs/README`); a `hlt` idle path in the guest
+wait loop (the `vm-dev` fan problem).
