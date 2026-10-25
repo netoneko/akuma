@@ -1022,6 +1022,8 @@ pub mod err {
     pub const EPERM: u64 = 1;
     /// No such file or directory.
     pub const ENOENT: u64 = 2;
+    /// `ENOEXEC` — exec of a file that is not a runnable image.
+    pub const ENOEXEC: u64 = 8;
     /// I/O error (the filesystem refused a read the dispatcher asked for).
     pub const EIO: u64 = 5;
     /// No such device (mmap of something that is not anonymous or a device

@@ -1207,6 +1207,11 @@ fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result
 }
 
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
+    // TEMP s6b: trace every nested child syscall — ash's exec failure
+    // produced no [sc] unhandled line, so see what it actually calls.
+    if child::nested_active() {
+        akuma_primitives::safe_print!(96, "  [sc.c] {} ({:#x})\n", nr_name(fr.rax), fr.rax);
+    }
     match fr.rax {
         ring3::nr::WRITE => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
@@ -1503,7 +1508,13 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
-            match root_fs().metadata(path) {
+            // `stat(2)` follows the final symlink (lstat(6) is the one that
+            // names the link itself). ash's PATH search stats each candidate
+            // and refuses any that is not a regular file with an execute bit
+            // — a link's own S_IFLNK|0777 reads as "not a program", which is
+            // how every exec died as `Permission denied` before a fork was
+            // ever attempted.
+            match root_fs().metadata(&resolve_effective(path)) {
                 Ok(md) => match fill_stat64(
                     buf,
                     md.inode,
@@ -2088,6 +2099,18 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             0
         }
+        ring3::nr::EXECVE => {
+            // No fork exists to return to, so in the run-to-completion model
+            // an exec from the nested child IS the handoff: ash's tail-call
+            // exec of the one command in `sh -c` (busybox skips the fork for
+            // a trailing simple command), and every program line the gates
+            // run reaches the kernel this way. Outside a nested child there
+            // is no task this kernel could replace — say ENOSYS.
+            if !child::nested_active() {
+                return e(ring3::err::ENOSYS);
+            }
+            child::exec_replace(fr)
+        }
         other => {
             // Name the gap: a guest task hit a number this table does not
             // serve. The name first, then the raw number — each boot reads
@@ -2317,6 +2340,10 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     t.fd_nonblock = fdtable::FlagSet::new();
     t.exit = None;
     t.mmap_cur = MMAP_BASE;
+    // A fresh address space, a fresh region list: `user_ok` checks against
+    // exactly what THIS image mapped. Without the reset the 16 region slots
+    // fill across spawns and an exec would panic on the append.
+    t.n_regions = 0;
 
     // The task's root: a fresh page table whose upper half is the kernel's
     // (one PML4 copy shares every kernel subtree — physmap, device window,

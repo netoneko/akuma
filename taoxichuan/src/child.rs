@@ -180,60 +180,74 @@ fn read_user_string(va: u64) -> Option<String> {
     None
 }
 
+/// The SPAWN/EXECVE argument block: the two syscalls marshal `(path, argv,
+/// envp)` out of the calling task identically.
+struct SpawnArgs {
+    path: String,
+    argv: Vec<String>,
+    env: Vec<String>,
+}
+
+/// Marshal `(path, argv, envp)` from user memory. `Err` is the errno the arm
+/// returns (EFAULT for a bad pointer, ENOENT for a relative path — the
+/// spawner passes absolute paths, and ash resolves PATH itself before execve).
+fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs, u64> {
+    let mut pbuf = [0u8; 128];
+    let path = match crate::user_str(path_va, &mut pbuf) {
+        Some(p) => String::from(p),
+        None => return Err(crate::err::EFAULT),
+    };
+    if !path.starts_with('/') {
+        return Err(crate::err::ENOENT);
+    }
+    let argv_ptrs = match read_ptr_array(argv_va, ARGV_MAX) {
+        Some(p) => p,
+        None => return Err(crate::err::EFAULT),
+    };
+    let mut argv: Vec<String> = Vec::new();
+    for p in &argv_ptrs {
+        match read_user_string(*p) {
+            Some(s) => argv.push(s),
+            None => return Err(crate::err::EFAULT),
+        }
+    }
+    if argv.is_empty() {
+        argv.push(path.clone()); // Linux would EFAULT; a path-only spawn is kinder
+    }
+    let mut env: Vec<String> = Vec::new();
+    if envp_va != 0 {
+        let env_ptrs = match read_ptr_array(envp_va, ENV_MAX) {
+            Some(p) => p,
+            None => return Err(crate::err::EFAULT),
+        };
+        for p in &env_ptrs {
+            match read_user_string(*p) {
+                Some(s) => env.push(s),
+                None => return Err(crate::err::EFAULT),
+            }
+        }
+    }
+    Ok(SpawnArgs { path, argv, env })
+}
+
 /// Akuma's SPAWN (0x1000+301): `spawn(path, argv, envp, stdin_ptr, stdin_len, flags)`.
 ///
 /// Runs the child to completion inside the call (the model this module
 /// exists to state), then returns `pid | stdout_fd << 32` — the same packed
 /// word the full kernel's SPAWN returns, read by the same `spawn_full`.
 pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
-    let (path_va, argv_va, envp_va, _stdin_ptr, _stdin_len, flags) =
-        (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6());
     if nested_active() {
         return crate::e(crate::err::EPERM); // one level only; nothing nests a nest
     }
-    let mut pbuf = [0u8; 128];
-    let Some(path) = crate::user_str(path_va, &mut pbuf) else {
-        return crate::e(crate::err::EFAULT);
+    let args = match read_spawn_args(fr.arg1(), fr.arg2(), fr.arg3()) {
+        Ok(a) => a,
+        Err(no) => return crate::e(no),
     };
-    if !path.starts_with('/') {
-        return crate::e(crate::err::ENOENT);
-    }
-    let Some(argv_ptrs) = read_ptr_array(argv_va, ARGV_MAX) else {
-        return crate::e(crate::err::EFAULT);
-    };
-    let mut argv: Vec<&str> = Vec::new();
-    let mut argv_bufs: Vec<String> = Vec::new();
-    for p in &argv_ptrs {
-        let Some(s) = read_user_string(*p) else {
-            return crate::e(crate::err::EFAULT);
-        };
-        argv_bufs.push(s);
-    }
-    for s in &argv_bufs {
-        argv.push(s.as_str());
-    }
-    if argv.is_empty() {
-        argv.push(path); // Linux would EFAULT; a path-only spawn is kinder
-    }
-    let mut env: Vec<&str> = Vec::new();
-    let mut env_bufs: Vec<String> = Vec::new();
-    if envp_va != 0 {
-        let Some(env_ptrs) = read_ptr_array(envp_va, ENV_MAX) else {
-            return crate::e(crate::err::EFAULT);
-        };
-        for p in &env_ptrs {
-            let Some(s) = read_user_string(*p) else {
-                return crate::e(crate::err::EFAULT);
-            };
-            env_bufs.push(s);
-        }
-        for s in &env_bufs {
-            env.push(s.as_str());
-        }
-    }
     // `stdin` (sshd passes None for exec) and the pty/console flag bits are
     // accepted and ignored: there is no input path and no pty in this kernel.
-    let _ = flags;
+    let path: &str = &args.path;
+    let argv: Vec<&str> = args.argv.iter().map(String::as_str).collect();
+    let env: Vec<&str> = args.env.iter().map(String::as_str).collect();
 
     // A free slot and a pid, before anything expensive.
     let slot_idx = {
@@ -344,6 +358,123 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     };
     let fd = table.alloc_fd_from(3, crate::OpenFile::ChildOut(slot_idx));
     (u64::from(pid)) | ((u64::from(fd)) << 32)
+}
+
+// ---------------------------------------------------------------------------
+// Exec-replace: the nested child's execve.
+// ---------------------------------------------------------------------------
+
+/// The first-level (SPAWN) saved state, snapshotted across an exec-replace:
+/// the second [`child_enter`] overwrites the shared save slots with this
+/// (nested) call's registers, and [`spawn_arm`]'s resume needs the originals.
+static mut EXEC_RET_RSP: u64 = 0;
+static mut EXEC_RBX: u64 = 0;
+static mut EXEC_RBP: u64 = 0;
+static mut EXEC_R12: u64 = 0;
+static mut EXEC_R13: u64 = 0;
+static mut EXEC_R14: u64 = 0;
+static mut EXEC_R15: u64 = 0;
+
+/// The nested child's `execve` — the handoff of the run-to-completion model.
+///
+/// busybox ash runs `sh -c '<one command>'` by execing the command in place
+/// (the trailing-simple-command optimization skips the fork), and every
+/// program line the stage-6 gates run reaches the kernel this way. There is
+/// no fork to return to and no second runnable task: so exec REPLACES the
+/// running child's image — same slot, fresh root, fresh fd table — and when
+/// the exec'd image calls `exit_group`, [`child_exit`] returns here with its
+/// status, this frame restores the SPAWN-level state, and control flows back
+/// into [`spawn_arm`] exactly as if its own child had run to completion. The
+/// exec'd image's stdout lands in the same pipe; its status is the child's.
+///
+/// A failure BEFORE the crossing is an ordinary `execve` error the caller
+/// (ash) sees and reports; after the crossing there is no returning.
+pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
+    // SAFETY: syscall-path discipline (single core, IF clear).
+    unsafe {
+        EXEC_RET_RSP = core::ptr::read_volatile(&raw const RET_RSP);
+        EXEC_RBX = core::ptr::read_volatile(&raw const SAVE_RBX);
+        EXEC_RBP = core::ptr::read_volatile(&raw const SAVE_RBP);
+        EXEC_R12 = core::ptr::read_volatile(&raw const SAVE_R12);
+        EXEC_R13 = core::ptr::read_volatile(&raw const SAVE_R13);
+        EXEC_R14 = core::ptr::read_volatile(&raw const SAVE_R14);
+        EXEC_R15 = core::ptr::read_volatile(&raw const SAVE_R15);
+    }
+    let args = match read_spawn_args(fr.arg1(), fr.arg2(), fr.arg3()) {
+        Ok(a) => a,
+        Err(no) => return crate::e(no),
+    };
+    let effective = crate::resolve_effective(&args.path);
+    let Ok(image) = crate::root_fs().read_file(&effective) else {
+        akuma_primitives::safe_print!(
+            192,
+            "[exec] '{}' -> '{}': read failed\n",
+            args.path,
+            effective
+        );
+        return crate::e(crate::err::ENOENT);
+    };
+    if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
+        akuma_primitives::safe_print!(160, "[exec] '{}': not an ELF image\n", effective);
+        return crate::e(crate::err::ENOEXEC);
+    }
+    let argv: Vec<&str> = args.argv.iter().map(String::as_str).collect();
+    let env: Vec<&str> = args.env.iter().map(String::as_str).collect();
+    // The new image replaces the task: same slot, fresh root (the load runs
+    // on the CURRENT child's CR3, all its writes through the physmap — the
+    // same story as the SPAWN arm's load on the parent's CR3).
+    let Some(ti) = crate::load_task(&argv, &env, &image) else {
+        akuma_primitives::safe_print!(160, "[exec] '{}': load failed\n", effective);
+        return crate::e(crate::err::ENOMEM);
+    };
+    let ef = ring3::EntryFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
+        rdx: 0, rsi: 0, rdi: 0, rax: 0,
+        rip: ti.entry,
+        rflags: 0x202,
+        rsp: ti.rsp,
+    };
+    let status = unsafe { child_enter(ti.root_pa, &ef) };
+    // The exec'd child exited: `child_exit` recorded its status in the slot,
+    // cleared the nesting, put task slot 0 back, and restored THIS frame's
+    // registers and CR3 (the parent's). Hand control to `spawn_arm`'s
+    // continuation with the SPAWN-level registers, stack, and the exec'd
+    // child's status in EAX.
+    // SAFETY: the snapshot was taken at this arm's entry and is still live;
+    // `ret` pops the return address `spawn_arm`'s `child_enter` call pushed.
+    unsafe { exec_return((status & 0xFF) as u32) }
+}
+
+/// Restore the SPAWN-level saved state and `ret` into [`spawn_arm`].
+///
+/// # Safety
+/// Only valid at the tail of [`exec_replace`], after the second
+/// [`child_enter`] has returned here; the snapshot statics must be live and
+/// CR3 must already be the parent's (set by [`child_exit`]).
+#[cfg(target_arch = "x86_64")]
+unsafe fn exec_return(status: u32) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov rbx, [{rbx}]",
+            "mov rbp, [{rbp}]",
+            "mov r12, [{r12}]",
+            "mov r13, [{r13}]",
+            "mov r14, [{r14}]",
+            "mov r15, [{r15}]",
+            "mov rsp, [{rsp}]",
+            "mov eax, {st:e}",
+            "ret",
+            rbx = in(reg) core::ptr::addr_of!(EXEC_RBX),
+            rbp = in(reg) core::ptr::addr_of!(EXEC_RBP),
+            r12 = in(reg) core::ptr::addr_of!(EXEC_R12),
+            r13 = in(reg) core::ptr::addr_of!(EXEC_R13),
+            r14 = in(reg) core::ptr::addr_of!(EXEC_R14),
+            r15 = in(reg) core::ptr::addr_of!(EXEC_R15),
+            rsp = in(reg) core::ptr::addr_of!(EXEC_RET_RSP),
+            st = in(reg) u64::from(status),
+            options(noreturn),
+        )
+    }
 }
 
 /// Cross into the child and come back only when it exits.
