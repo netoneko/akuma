@@ -1,6 +1,6 @@
 # Minimal self-hosting kernel "Taoxichuan" — agent log
 
-**Status: in progress. Started 2026-10-24. Stages 1-4 PASS; stage 6 (offline `apk`) session B: G1+G2 PASS, G3 in progress (2026-10-25 03:40 IDT).**
+**Status: in progress. Started 2026-10-24. Stages 1-4 PASS; stage 6 (offline `apk add`) PASS on metal (G1-G4, 2026-10-25 05:35 IDT) and on the aarch64 host track.**
 
 Running log for the two-agent execution of
 [`MINIMAL_SELF_HOSTING_EXPERIMENT.md`](MINIMAL_SELF_HOSTING_EXPERIMENT.md).
@@ -880,3 +880,44 @@ apk-tools itself and the aarch64 syscall layer are fine; it says nothing about t
 sees it before apk's parser runs (`apk.static --root / add <path>` should list exactly one positional); keep the Linux
 transcript above as the oracle. Ryzen was taken offline by the owner at ~03:45, so nothing is running there; `vm-dev` was
 already stopped by goose and `vm-serve-mc` restored.
+
+### Stage 6 — session C (`taoxichuan-06c-apk-argv-and-install.md`), host track (Sonnet) — metal track PASS, offline `apk add` works
+
+Brief sent 04:22 IDT after the owner brought the ryzen back (GRUB entry 30 via `arm.sh 29`; herd `vm=true` entry), goose-glm probe `pong`.
+Goose ran 04:22-05:35 IDT (73 min, past the brief's 60-minute line, left running because it was committing real fixes) and wrote
+`/root/dev-cycle/taoxichuan-s6/RESULT-C.md`: **G1-G4 all PASS in one clean boot** (`taoxichuan-s4` @ `0b33595a`, kernel sha256
+`58353c90...47780`, fresh copy of `.orig` per boot, 0 `Fault|PANIC|sig!`).
+
+- **G3:** `apk.static --no-log --root / --no-network --no-cache --allow-untrusted --force-non-repository add
+  /pkgs/ca-certificates-bundle-20261020-r0.apk` -> `(1/1) Installing ca-certificates-bundle (20261020-r0)`, `OK: 174 KiB in 1 package`,
+  rc 0. (`--initdb` is rejected by apk 3 as a global option; the image's `/pkgs/README` still shows it.)
+- **G4:** guest-side `sha256sum /etc/ssl/certs/ca-certificates.crt` = `5961c0a3...3f568b` = `EXPECTED.txt`; the three symlinks exist and resolve.
+
+**The argv problem (the supervisor's first suspect, one level down).** `load_task` declared `full_argv: [&str; MAX_ARGV + 1]`
+pre-filled with `argv[0]` in every slot, copied only `argv.len()` entries over it and handed `&full_argv[..=n_args]` to
+`build_stack`: one slot past the prefix, so the exec'd image saw a trailing duplicate of `argv[0]`. apk 3's `add` parsed it as a
+package name ("unable to select packages: apk.static (no such package)"); G1 (the dup lands as `$0` after `-c`) and G2 (`--version`
+ignores positionals) could not notice. The same fix removed sshd's cosmetic `Unknown argument: /bin/sshd`. `MAX_ARGV` was 8 against a
+gate command of ~10 entries (the `.apk` path would have been dropped silently): now 16. Commit `ea2c5b2a`.
+
+**Two more bugs in the same boot.** (1) `write_file_arm` applied `*offset += n` per iteration and also wrote at `*offset + done`, so
+chunk 2 of a multi-chunk `write()` landed 1 KiB too far: apk's files came out as alternating 1 KiB data / 1 KiB zeros and 246,272 bytes
+instead of 178,791. Fix: capture the start offset once (`18a7b193`); the extracted file is now byte-identical to a host extraction.
+(2) `utimensat` was unhandled: apk's post-install "preserve mtime" pass counted ENOSYS as an error (rc 1 on a clean install). Arm added
+(validate target, succeed without stamping: no wall clock) and the number fixed: `nr::UTIMENSAT = 88` is asm-generic, x86_64 is **280**
+(`0b33595a`). `access`(21) also added, through `resolve_at`.
+
+**The detour (ops, not kernel; cost the middle hour).** After the argv fix the gate said `apk.static: not found` and `ls` lacked
+`/pkgs`, `/lib`, `/var`: it looked like ext2 directory corruption and cost a pass through parse/virtio instrumentation. The guest was
+booting the wrong disk: **`herd enable vm-dev` is a no-op when already enabled**, so `/etc/herd/enabled/vm-dev.conf` still held session B's
+end-of-session restore (the stage-4 ssh image). **Rule: edit both `/etc/herd/available/` and `/etc/herd/enabled/` (or disable+enable)
+and confirm the boot from the `guest disk:` line in `/var/log/herd/vm-dev.log`.** Also: verify large payloads by guest-side hashes, not
+by piping them out (a 246 KB `cat` over the ssh pipe came back with a 127-byte insertion).
+
+**Host track.** Merged (`e91c5bdc`), `scripts/build_taoxichuan_fc.sh` -> `taoxichuan-fc.bin` 662,792 B (unchanged), Lima `fc` boot with
+disk: 161 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`; `--no-disk` control: 125 lines, no sshd, 0 faults. PASS.
+
+**Still missing.** `ls` through a symlink to a directory (`ls /etc/ssl1.1/certs`) fails rc 1 (file symlinks resolve through two hops;
+look at `resolve_effective` + directory open); `dup2`/`dup3`(33) unhandled (busybox `dd` refuses); sshd logs `bridge_process: couldn't
+open stdin` per session; the next ladder step (stage 7+) has no brief. State left: `vm-dev` stopped + disabled, both confs restored,
+`vm-serve-mc` up. Nothing pushed to `origin` by goose; `litter` has `ea2c5b2a -> 18a7b193 -> 0b33595a`.
