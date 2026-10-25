@@ -444,6 +444,25 @@ fn no_clock() -> u64 {
 /// that never blocks on anything this kernel runs.
 static mut ROOT_FS: Option<akuma_ext2::Ext2Filesystem<Vda>> = None;
 
+/// The host address a TCP `connect` to the relay gateway's own IP (`10.0.2.2`)
+/// is rewritten to, parsed from the boot command line (`hostrelay=a.b.c.d`).
+///
+/// Why: the host gateway answers `10.0.2.2` itself — it is the gateway's own
+/// IP, and a SYN to one of its ports that is neither echo nor a forward slot
+/// is reset (`tcp_in`'s fall-through). Its outbound hold (`out_in`) only
+/// picks up destinations outside 10.0.2.0/24. Fixing that in the gateway means
+/// a host-kernel rebuild + box reboot, so the guest maps the gateway's address
+/// to the host's own address instead: the connection then leaves through the
+/// `vm_outbound` relay's out-of-subnet path, which dials the destination from
+/// the host's stack. Unset leaves `10.0.2.2` untouched (UDP — DHCP, the DNS
+/// proxy, echo — never touches this; it is a TCP-`connect`-only rewrite).
+static mut HOSTRELAY: Option<[u8; 4]> = None;
+
+fn hostrelay() -> Option<[u8; 4]> {
+    // SAFETY: written once at boot, before ring 3 exists; read-only after.
+    unsafe { (*core::ptr::addr_of!(HOSTRELAY)) }
+}
+
 /// The mounted root, for the dispatcher. Panics if called before the mount —
 /// which no caller does: the mount precedes the first ring-3 crossing.
 fn root_fs() -> &'static akuma_ext2::Ext2Filesystem<Vda> {
@@ -524,6 +543,9 @@ const SLOT_CEILING: u32 = 16;
 /// Stage 4 adds the two non-file kinds the sshd stage needs: a socket (the
 /// index into `akuma-net`'s socket table) and a spawned child's stdout (the
 /// index into `child.rs`'s spawn slots — the "pipe" of the child model).
+/// `Clone` for `dup2`/`dup3`: a dup copies the description (both names share
+/// the description's cursor, as POSIX file descriptions do).
+#[derive(Clone)]
 enum OpenFile {
     Dir {
         path: alloc::string::String,
@@ -1092,6 +1114,7 @@ fn fs_err(err: akuma_vfs::FsError) -> u64 {
 fn nr_name(nr: u64) -> &'static str {
     match nr {
         ring3::nr::READ => "read",
+        ring3::nr::SENDFILE => "sendfile",
         ring3::nr::WRITE => "write",
         ring3::nr::OPEN => "open",
         ring3::nr::CLOSE => "close",
@@ -2083,6 +2106,42 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             };
             u64::from(table.alloc_fd_from(3, desc))
         }
+        ring3::nr::DUP2 | ring3::nr::DUP3 => {
+            // dup2(33)/dup3(292). dup3's flags carry O_CLOEXEC and nothing
+            // else; dup2 takes none. The table's dup_to does the exact-slot
+            // copy, the displaced-description release and the nonblock bit.
+            const O_CLOEXEC: u64 = 0o2000000;
+            let (old, new) = (fr.arg1(), fr.arg2());
+            let flags = fr.arg3();
+            if nr == ring3::nr::DUP3 && flags & !O_CLOEXEC != 0 {
+                return e(ring3::err::EINVAL);
+            }
+            if old >= u64::from(SLOT_CEILING) || new >= u64::from(SLOT_CEILING) {
+                return e(ring3::err::EBADF);
+            }
+            match fd_table().dup_to(old as u32, new as u32, nr == ring3::nr::DUP3 && flags & O_CLOEXEC != 0) {
+                Ok(d) => {
+                    // Whatever `new` named is displaced: release a displaced
+                    // socket's kernel side exactly as close() does.
+                    if let Some(OpenFile::Socket(idx)) = d.displaced {
+                        akuma_net::socket::remove_socket(idx);
+                    }
+                    new
+                }
+                Err(fdtable::DupError::SameFd) => {
+                    // Pinned at the crate: dup3 answers EINVAL for old == new;
+                    // dup2 answers newfd once oldfd is open.
+                    if nr == ring3::nr::DUP3 {
+                        return e(ring3::err::EINVAL);
+                    }
+                    match fd_table().with(old as u32, |_| ()) {
+                        Some(()) => new,
+                        None => e(ring3::err::EBADF),
+                    }
+                }
+                Err(fdtable::DupError::BadFd) => e(ring3::err::EBADF),
+            }
+        }
         ring3::nr::MREMAP => {
             // musl's realloc on an mmapped chunk. Shrink keeps the address
             // (the slab never unmaps, so it stays valid); grow moves to a
@@ -2683,6 +2742,21 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // SAFETY: boot phase, one core, no ring 3 yet.
     unsafe {
         *core::ptr::addr_of_mut!(ROOT_FS) = Some(fs);
+    }
+
+    // Stage 7: the outbound alias. `hostrelay=a.b.c.d` on the command line says
+    // which of the host's own addresses `10.0.2.2` stands for in a TCP connect
+    // (see HOSTRELAY). Absent: no rewrite, the gateway keeps 10.0.2.2 to itself.
+    let mut relay_buf = [0u8; 32];
+    if let Some(v) = cmdline_token(hvm_start_info, "hostrelay=", &mut relay_buf) {
+        let n: Vec<u8> = v.split('.').filter_map(|p| p.parse::<u8>().ok()).collect();
+        if n.len() == 4 {
+            unsafe {
+                *core::ptr::addr_of_mut!(HOSTRELAY) = Some([n[0], n[1], n[2], n[3]]);
+            }
+        } else {
+            console::puts("  cmdline: hostrelay= not a.b.c.d; ignored\n");
+        }
     }
 
     // Stage 4: the network path — calibrate the TSC against the PIT, pull up
