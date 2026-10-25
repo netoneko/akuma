@@ -776,6 +776,9 @@ pub mod nr {
     /// `writev(2)` — musl's stdio flushes through this, even for a single
     /// buffer (the empty `wbase` head is one zero-length iovec).
     pub const WRITEV: u64 = 20;
+    /// `access(2)` — apk probes paths it may skip (the syslog socket, key
+    /// directories) with this before opening them.
+    pub const ACCESS: u64 = 21;
     /// `mmap(2)`.
     pub const MMAP: u64 = 9;
     /// `mprotect(2)`.
@@ -936,8 +939,10 @@ pub mod nr {
     pub const PR_LIMIT64: u64 = 302;
     /// `kill(2)`.
     pub const KILL: u64 = 62;
-    /// `utimensat(2)`.
-    pub const UTIMENSAT: u64 = 88;
+    /// `utimensat(2)` — 280 here, not the asm-generic 88 the aarch64 side
+    /// uses; the guest's utimensat arrived as 280 and died unhandled as
+    /// apk's "failed to preserve mtime" install error.
+    pub const UTIMENSAT: u64 = 280;
 
     // -- Stage 4: the socket family, the clock arms sshd's loop sleeps in,
     // -- and Akuma's private syscalls (0x1000 base on x86_64 — 300 is
