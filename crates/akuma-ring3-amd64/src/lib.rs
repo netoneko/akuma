@@ -770,6 +770,9 @@ pub mod nr {
     /// `writev(2)` — musl's stdio flushes through this, even for a single
     /// buffer (the empty `wbase` head is one zero-length iovec).
     pub const WRITEV: u64 = 20;
+    /// `readv(2)` — musl's stdio reads every stream through this (one user
+    /// buffer plus the stream's pending window as the second iovec).
+    pub const READV: u64 = 19;
     /// `access(2)` — apk probes paths it may skip (the syslog socket, key
     /// directories) with this before opening them.
     pub const ACCESS: u64 = 21;
