@@ -460,7 +460,7 @@ static mut HOSTRELAY: Option<[u8; 4]> = None;
 
 fn hostrelay() -> Option<[u8; 4]> {
     // SAFETY: written once at boot, before ring 3 exists; read-only after.
-    unsafe { (*core::ptr::addr_of!(HOSTRELAY)) }
+    unsafe { *core::ptr::addr_of!(HOSTRELAY) }
 }
 
 /// The mounted root, for the dispatcher. Panics if called before the mount —
@@ -2111,15 +2111,16 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // else; dup2 takes none. The table's dup_to does the exact-slot
             // copy, the displaced-description release and the nonblock bit.
             const O_CLOEXEC: u64 = 0o2000000;
+            let is_dup3 = fr.rax == ring3::nr::DUP3;
             let (old, new) = (fr.arg1(), fr.arg2());
             let flags = fr.arg3();
-            if nr == ring3::nr::DUP3 && flags & !O_CLOEXEC != 0 {
+            if is_dup3 && flags & !O_CLOEXEC != 0 {
                 return e(ring3::err::EINVAL);
             }
             if old >= u64::from(SLOT_CEILING) || new >= u64::from(SLOT_CEILING) {
                 return e(ring3::err::EBADF);
             }
-            match fd_table().dup_to(old as u32, new as u32, nr == ring3::nr::DUP3 && flags & O_CLOEXEC != 0) {
+            match fd_table().dup_to(old as u32, new as u32, is_dup3 && flags & O_CLOEXEC != 0) {
                 Ok(d) => {
                     // Whatever `new` named is displaced: release a displaced
                     // socket's kernel side exactly as close() does.
@@ -2131,7 +2132,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 Err(fdtable::DupError::SameFd) => {
                     // Pinned at the crate: dup3 answers EINVAL for old == new;
                     // dup2 answers newfd once oldfd is open.
-                    if nr == ring3::nr::DUP3 {
+                    if is_dup3 {
                         return e(ring3::err::EINVAL);
                     }
                     match fd_table().with(old as u32, |_| ()) {
