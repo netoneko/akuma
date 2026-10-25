@@ -39,7 +39,7 @@ fn net_err(e: i32) -> u64 {
 }
 
 /// The fd's socket index, or `ENOTSOCK`.
-fn fd_socket(fd: u64) -> Option<usize> {
+pub(crate) fn fd_socket(fd: u64) -> Option<usize> {
     fd_table().with(fd as u32, |d| match d {
         crate::OpenFile::Socket(idx) => Some(*idx),
         _ => None,
@@ -47,10 +47,23 @@ fn fd_socket(fd: u64) -> Option<usize> {
     .flatten()
 }
 
+/// `writev` on a socket fd: one send of the concatenated iovecs. The syscall
+/// return is already shaped (`net_err`'s negative errno on failure) because
+/// the dispatcher returns it directly.
+pub(crate) fn writev_socket(idx: usize, data: &[u8], nonblock: bool) -> Result<usize, u64> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    match akuma_net::socket::socket_send(idx, data, nonblock) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(net_err(e)),
+    }
+}
+
 use crate::fd_table;
 
 /// The fd's nonblock flag, straight from the fd table.
-fn fd_nonblock(fd: u64) -> bool {
+pub(crate) fn fd_nonblock(fd: u64) -> bool {
     fd_table().is_nonblock(fd as u32)
 }
 
@@ -187,8 +200,9 @@ pub fn accept_arm(fd: u64, addr: u64, addrlen_va: u64) -> u64 {
     }
 }
 
-/// `connect(fd, addr, addrlen)`. Served for completeness; nothing in the
-/// stage's path dials out (`vm_outbound` is a later stage's line).
+/// `connect(fd, addr, addrlen)`. Outbound TCP leaves through the gateway's
+/// `vm_outbound` relay: the guest dials the address it is given (the host's
+/// LAN address is the proven path) and the host makes the real connection.
 pub fn connect_arm(fd: u64, addr: u64, addrlen: u64) -> u64 {
     let Some(idx) = fd_socket(fd) else {
         return crate::e(crate::err::ENOTSOCK);
@@ -196,9 +210,82 @@ pub fn connect_arm(fd: u64, addr: u64, addrlen: u64) -> u64 {
     let Some(sa) = sockaddr_in_from_user(addr, addrlen) else {
         return crate::e(crate::err::EINVAL);
     };
-    match akuma_net::socket::socket_connect(idx, sa, fd_nonblock(fd)) {
+    // Dial non-blocking, then wait HERE, in the kernel, with a visible trace.
+    // The single-task guest's blocking wait (`wait_until` inside akuma-net)
+    // is opaque from the console; this loop prints the smoltcp socket state
+    // once a second until the handshake lands or dies. `EINPROGRESS` is the
+    // x86_64 value akuma-net answers for a non-blocking dial in flight.
+    const EINPROGRESS: i32 = 115;
+    akuma_primitives::safe_print!(
+        96,
+        "  [cx] connect_arm fd={} ip={}.{}.{}.{}:{}\n",
+        fd,
+        sa.ip[0], sa.ip[1], sa.ip[2], sa.ip[3], sa.port
+    );
+    let r = akuma_net::socket::socket_connect(idx, sa, true);
+    let rc = match r {
+        Ok(()) => 0i64,
+        Err(e) => -i64::from(e),
+    };
+    akuma_primitives::safe_print!(96, "  [cx] dial -> {}\n", rc as u64);
+    match r {
         Ok(()) => 0,
+        Err(EINPROGRESS) => connect_wait(idx),
         Err(e) => net_err(e),
+    }
+}
+
+/// Poll a dial to completion, tracing the socket's smoltcp state once a
+/// second: state, remote endpoint, queue depths, and how much `poll()`
+/// actually moved (the poll counter's delta). A lap that never prints a
+/// changing state with a rising counter means the SYN is being emitted into
+/// a void; a frozen clock or a flat counter means the poll itself is stuck.
+fn connect_wait(idx: usize) -> u64 {
+    let start = crate::net::uptime_us();
+    let mut printed = start;
+    akuma_primitives::safe_print!(96, "  [cx] wait enter idx={} t0={}\n", idx, start);
+    loop {
+        crate::net::netpoll();
+        // One line per lap: a missing follow-up pins the hang inside
+        // `netpoll`; a frozen `t=` pins it in the clock; silence after one
+        // `polled` pins it inside the peek's table/NETWORK locks.
+        akuma_primitives::safe_print!(96, "  [cx] polled t={}\n", crate::net::uptime_us().saturating_sub(start));
+        let now = crate::net::uptime_us();
+        match akuma_net::socket::debug_stream_peek(idx) {
+            Some(d) if d.completed => {
+                akuma_primitives::safe_print!(96, "  [cx] established t={}\n", now.saturating_sub(start));
+                return 0;
+            }
+            Some(d) if d.dead => {
+                akuma_primitives::safe_print!(96, "  [cx] dead {} t={}\n", d.state, now.saturating_sub(start));
+                return crate::e(crate::err::ECONNREFUSED);
+            }
+            Some(d) => {
+                if now.saturating_sub(printed) >= 1_000_000 {
+                    printed = now;
+                    let polls = akuma_net::smoltcp_net::poll_count();
+                    let (ip, port) = d.remote.unwrap_or(([0, 0, 0, 0], 0));
+                    akuma_primitives::safe_print!(
+                        96,
+                        "  [cx] t={}s state={} remote={}.{}.{}.{}:{} q={}/{} polls={}\n",
+                        now.saturating_sub(start) / 1_000_000,
+                        d.state,
+                        ip[0], ip[1], ip[2], ip[3],
+                        port,
+                        d.send_q, d.recv_q,
+                        polls
+                    );
+                }
+            }
+            None => {
+                akuma_primitives::safe_print!(96, "  [cx] peek None\n");
+                return crate::e(crate::err::EBADF);
+            }
+        }
+        if now.saturating_sub(start) >= 15_000_000 {
+            return crate::e(crate::err::ETIMEDOUT);
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -217,6 +304,16 @@ pub fn sendto_arm(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, dest_len:
         return crate::e(crate::err::EFAULT);
     }
     let nonblock = fd_nonblock(fd);
+    // Stage-7 probe: a TCP send whose payload opens an HTTP request.
+    if !akuma_net::socket::is_udp_socket(idx)
+        && len >= 4
+        && data[0] == b'G'
+        && data[1] == b'E'
+        && data[2] == b'T'
+        && data[3] == b' '
+    {
+        akuma_primitives::safe_print!(96, "  [cx] GET len={} ->\n", len);
+    }
     let r = if akuma_net::socket::is_udp_socket(idx) {
         let Some(sa) = sockaddr_in_from_user(dest, dest_len) else {
             return crate::e(crate::err::EINVAL);
@@ -225,6 +322,16 @@ pub fn sendto_arm(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, dest_len:
     } else {
         akuma_net::socket::socket_send(idx, &data, nonblock)
     };
+    if data.starts_with(b"GET ") {
+        akuma_primitives::safe_print!(
+            96,
+            "  [cx] GET <- {}\n",
+            match r {
+                Ok(n) => n as u64,
+                Err(e) => -i64::from(e) as u64,
+            }
+        );
+    }
     match r {
         Ok(n) => n as u64,
         Err(e) => net_err(e),
@@ -295,6 +402,13 @@ pub fn read_arm(fd: u64, buf: u64, len: u64) -> u64 {
     if len > WRITE_LIMIT || !crate::user_ok(buf, len) {
         return crate::e(crate::err::EFAULT);
     }
+    // Stage-7 probe: socket reads are where a wedged wget would sit; print
+    // the entry at most once a second (a monotone counter, not a clock).
+    static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let n = LAST.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n % 1000 == 0 {
+        akuma_primitives::safe_print!(96, "  [cx] sockread fd={} len={}\n", fd, len);
+    }
     let mut data = alloc::vec![0u8; len as usize];
     match akuma_net::socket::socket_recv(idx, &mut data, fd_nonblock(fd)) {
         Ok(n) => {
@@ -320,7 +434,22 @@ pub fn write_arm(fd: u64, buf: u64, len: u64) -> u64 {
     if !crate::copy_from_user(&mut data, buf) {
         return crate::e(crate::err::EFAULT);
     }
-    match akuma_net::socket::socket_send(idx, &data, fd_nonblock(fd)) {
+    // Stage-7 probe: the write(2) flavour of the HTTP request send.
+    if data.starts_with(b"GET ") {
+        akuma_primitives::safe_print!(96, "  [cx] GET(len={}) write ->\n", len);
+    }
+    let r = akuma_net::socket::socket_send(idx, &data, fd_nonblock(fd));
+    if data.starts_with(b"GET ") {
+        akuma_primitives::safe_print!(
+            96,
+            "  [cx] GET <- {}\n",
+            match r {
+                Ok(n) => n as u64,
+                Err(e) => -i64::from(e) as u64,
+            }
+        );
+    }
+    match r {
         Ok(n) => n as u64,
         Err(e) => net_err(e),
     }

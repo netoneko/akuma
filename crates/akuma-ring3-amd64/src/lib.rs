@@ -801,8 +801,13 @@ pub mod nr {
     pub const RT_SIGACTION: u64 = 13;
     /// `rt_sigprocmask(2)` — same no-op contract as `RT_SIGACTION`.
     pub const RT_SIGPROCMASK: u64 = 14;
-    /// `getpid(2)`.
-    pub const GETPID: u64 = 39;
+    /// `getpid(2)` — x86_64 38. (Was 39: an off-by-one that both starved the
+    /// real getpid of an arm — the guest logged `unhandled ? (38)` — and made
+    /// nr 39, `sendfile` on x86_64, answer the pid.)
+    pub const GETPID: u64 = 38;
+    /// `sendfile(2)` — x86_64 39; named so the unhandled arm prints it. There
+    /// is no arm: no page-cache read/write path to serve it through.
+    pub const SENDFILE: u64 = 39;
     /// `getuid(2)`.
     pub const GETUID: u64 = 102;
     /// `getgid(2)`.
@@ -1052,6 +1057,10 @@ pub mod err {
     pub const EFAULT: u64 = 14;
     /// Invalid argument.
     pub const EINVAL: u64 = 22;
+    /// Connection timed out (a dial that outlived its wait).
+    pub const ETIMEDOUT: u64 = 110;
+    /// Connection refused (the dial's socket went `Closed` before it was up).
+    pub const ECONNREFUSED: u64 = 111;
     /// Inappropriate ioctl for device.
     pub const ENOTTY: u64 = 25;
     /// Function not implemented.
