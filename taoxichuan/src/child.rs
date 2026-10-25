@@ -420,6 +420,17 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     }
     let argv: Vec<&str> = args.argv.iter().map(String::as_str).collect();
     let env: Vec<&str> = args.env.iter().map(String::as_str).collect();
+    // POSIX exec keeps open fds across the image swap (cloexec swept below).
+    // The tail-call exec IS how a non-builtin command runs under its shell's
+    // redirects — `sh -c 'sha256sum x > f'` opens f, dup2's it onto fd 1,
+    // then execs: with the fresh table `load_task` starts, the binding dies
+    // here and the exec'd program's stdout rides the session pipe instead of
+    // the file (the empty-file-with-rc-0 symptom one boot after the write
+    // side was fixed). Snapshot before the load, restore after.
+    let saved = {
+        let t = crate::task();
+        (t.fd_names.clone(), t.fd_cloexec.clone(), t.fd_nonblock.clone())
+    };
     // The new image replaces the task: same slot, fresh root (the load runs
     // on the CURRENT child's CR3, all its writes through the physmap — the
     // same story as the SPAWN arm's load on the parent's CR3).
@@ -427,6 +438,21 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
         akuma_primitives::safe_print!(160, "[exec] '{}': load failed\n", effective);
         return crate::e(crate::err::ENOMEM);
     };
+    // Restore the saved fds and sweep the cloexec ones — `sweep_cloexec`
+    // returns the closed payloads; a swept socket releases its kernel side
+    // exactly as close does. `load_task` had reset all three collections.
+    {
+        let mut t = crate::task();
+        t.fd_names = saved.0;
+        t.fd_cloexec = saved.1;
+        t.fd_nonblock = saved.2;
+        let mut table = crate::fd_table();
+        for (_fd, payload) in table.sweep_cloexec() {
+            if let crate::OpenFile::Socket(idx) = payload {
+                akuma_net::socket::remove_socket(idx);
+            }
+        }
+    }
     let ef = ring3::EntryFrame {
         r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
         rdx: 0, rsi: 0, rdi: 0, rax: 0,
