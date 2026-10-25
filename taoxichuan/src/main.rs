@@ -707,12 +707,19 @@ fn read_link_target(path: &str) -> Option<alloc::string::String> {
     if !fs.is_symlink(path) {
         return None;
     }
-    let raw = fs.read_file(path).ok()?;
-    alloc::string::String::from_utf8(raw).ok().map(|s| {
-        // Strip exactly one trailing newline, the convention for link text.
-        let s = s.trim_end_matches('\n');
-        alloc::string::String::from(s)
-    })
+    // `read_symlink`, never `read_file`: a fast symlink (every busybox link
+    // on the serve image — `/bin/sh`, `/bin/apk` — fits the 60-byte inline
+    // form) keeps its target in the inode's pointer-word window and has no
+    // data blocks. `read_file` handed those first target bytes to the block
+    // mapper as a bogus block number, the read failed, spawn answered ENOENT,
+    // and sshd fell back to built-in paws on every exec — three stages of
+    // gates quietly ran on shell builtins because of this one provider.
+    // `read_symlink` returns the target verbatim (`read_symlink_inode`
+    // handles both the fast inline form and the slow block form); strip one
+    // trailing newline only as belt-and-braces.
+    fs.read_symlink(path)
+        .ok()
+        .map(|s| alloc::string::String::from(s.trim_end_matches('\n')))
 }
 
 /// Resolve symlinks (bounded), returning the effective path to look up.
@@ -776,11 +783,7 @@ fn emit(buf_va: u64, len: u64) -> bool {
 /// the open description, take the lowest free fd slot. Absolute paths only,
 /// read-only access only: the root is read-only in spirit and this kernel has
 /// no write path to lie about.
-fn open_common(path_va: u64, flags: u64) -> u64 {
-    let mut pbuf = [0u8; 128];
-    let Some(path) = user_str(path_va, &mut pbuf) else {
-        return e(ring3::err::EFAULT);
-    };
+fn open_common(path: &str, flags: u64) -> u64 {
     if !path.starts_with('/') {
         return e(ring3::err::ENOENT); // nothing to resolve ".." against
     }
@@ -828,15 +831,14 @@ fn open_common(path_va: u64, flags: u64) -> u64 {
     } else {
         match fs.resolve_inode(&path) {
             Ok(inode) => {
-                let mut size = md.size;
-                if flags & ring3::open::O_TRUNC != 0 && acc != ring3::open::O_RDONLY {
-                    // ftruncate-to-zero at open: the writes that follow
-                    // expect to start from an empty file.
-                    if fs.truncate_by_inode(inode, 0).is_err() {
-                        return e(ring3::err::EIO);
-                    }
-                    size = 0;
+                // O_TRUNC is a decision, not just a size: fold it once so the
+                // `if` stays an expression and the side effect stays explicit.
+                let trunc = flags & ring3::open::O_TRUNC != 0
+                    && acc != ring3::open::O_RDONLY;
+                if trunc && fs.truncate_by_inode(inode, 0).is_err() {
+                    return e(ring3::err::EIO);
                 }
+                let size = if trunc { 0 } else { md.size };
                 OpenFile::File { inode, offset: 0, size }
             }
             Err(_) => return e(ring3::err::EIO),
@@ -879,7 +881,7 @@ fn write_file_arm(fd: u64, buf: u64, len: u64) -> u64 {
                     *size = (*size).max(*offset);
                     done += n as u64;
                     total += n as u64;
-                    if (n as usize) < want {
+                    if n < want {
                         break; // short write: stop where the disk stopped
                     }
                 }
@@ -909,7 +911,7 @@ fn resolve_at(dirfd: u64, path: &str) -> Option<alloc::string::String> {
         return Some(alloc::string::String::from(path));
     }
     if dirfd == ring3::open::AT_FDCWD {
-        return Some(alloc::format!("/{}", path));
+        return Some(alloc::format!("/{path}"));
     }
     let dir = fd_table().with(dirfd as u32, |d| match d {
         OpenFile::Dir { path, .. } => Some(path.clone()),
@@ -1022,7 +1024,7 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
         return e(ring3::err::EBADF);
     }
     let info = fd_table().with(fd as u32, |d| match d {
-        OpenFile::File { inode, size, .. } => Some((*inode as u64, *size, 0u8)),
+        OpenFile::File { inode, size, .. } => Some((u64::from(*inode), *size, 0u8)),
         OpenFile::Dir { .. } => Some((0, 0, 1)),
         _ => Some((0, 0, 2)),
     });
@@ -1046,18 +1048,18 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
 /// A fresh open description equal to `d` — `dup(2)`'s copy. The offset is
 /// *copied*, not shared (the table stores descriptions by value); nothing in
 /// the apk path reads through two fds sharing one offset.
-fn clone_desc(d: &OpenFile) -> Option<OpenFile> {
+fn clone_desc(d: &OpenFile) -> OpenFile {
     match d {
         OpenFile::File { inode, offset, size } => {
-            Some(OpenFile::File { inode: *inode, offset: *offset, size: *size })
+            OpenFile::File { inode: *inode, offset: *offset, size: *size }
         }
-        OpenFile::Dir { path, entries, cursor } => Some(OpenFile::Dir {
+        OpenFile::Dir { path, entries, cursor } => OpenFile::Dir {
             path: path.clone(),
             entries: entries.clone(),
             cursor: *cursor,
-        }),
-        OpenFile::Socket(i) => Some(OpenFile::Socket(*i)),
-        OpenFile::ChildOut(i) => Some(OpenFile::ChildOut(*i)),
+        },
+        OpenFile::Socket(i) => OpenFile::Socket(*i),
+        OpenFile::ChildOut(i) => OpenFile::ChildOut(*i),
     }
 }
 
@@ -1201,6 +1203,11 @@ fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result
 }
 
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
+    // TEMP s6b: trace every nested child syscall — ash's exec failure
+    // produced no [sc] unhandled line, so see what it actually calls.
+    if child::nested_active() {
+        akuma_primitives::safe_print!(96, "  [sc.c] {} ({:#x})\n", nr_name(fr.rax), fr.rax);
+    }
     match fr.rax {
         ring3::nr::WRITE => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
@@ -1247,6 +1254,10 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             if iovcnt == 0 || iovcnt > 1024 || !user_ok(iov_va, iovcnt * 16) {
                 return e(ring3::err::EFAULT);
             }
+            // The pipe branch of `write` applies per iovec: musl flushes a
+            // buffered stdout as one writev, and a nested child's version
+            // string belongs to the ssh session, not the console.
+            let piped = child::nested_active() && fd == 1;
             let mut total = 0u64;
             for i in 0..iovcnt {
                 let mut iv = [0u8; 16];
@@ -1257,7 +1268,14 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     u64::from_le_bytes(iv[0..8].try_into().unwrap()),
                     u64::from_le_bytes(iv[8..16].try_into().unwrap()),
                 );
-                if len > WRITE_LIMIT || !user_ok(base, len) || !emit(base, len) {
+                if len > WRITE_LIMIT || !user_ok(base, len) {
+                    return e(ring3::err::EFAULT);
+                }
+                if piped {
+                    if !child::child_write(base, len) {
+                        return e(ring3::err::EFAULT);
+                    }
+                } else if !emit(base, len) {
                     return e(ring3::err::EFAULT);
                 }
                 total += len;
@@ -1497,7 +1515,13 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
-            match root_fs().metadata(path) {
+            // `stat(2)` follows the final symlink (lstat(6) is the one that
+            // names the link itself). ash's PATH search stats each candidate
+            // and refuses any that is not a regular file with an execute bit
+            // — a link's own S_IFLNK|0777 reads as "not a program", which is
+            // how every exec died as `Permission denied` before a fork was
+            // ever attempted.
+            match root_fs().metadata(&resolve_effective(path)) {
                 Ok(md) => match fill_stat64(
                     buf,
                     md.inode,
@@ -1619,21 +1643,29 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::OPENAT => {
-            // The one way in. Absolute paths only (`AT_FDCWD` only: there is
-            // no working directory), read-only access only: the root is
-            // read-only in spirit and this kernel has no write path to lie
-            // about. The description is an ext2 lookup now — no VFS mount
-            // table, one root.
+            // The one way in — now through the same dirfd resolution every
+            // other `at` arm uses: apk opens the db directory once and then
+            // opens the lock and the package files relative to that fd. (The
+            // old "absolute paths only, read-only" arm predated the write
+            // path and answered EBADF to exactly the calls the gate needs.)
             let (dirfd, path_va, flags) = (fr.arg1(), fr.arg2(), fr.arg3());
-            if dirfd != ring3::open::AT_FDCWD {
+            let mut pbuf = [0u8; 128];
+            let Some(path) = user_str(path_va, &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            let Some(full) = resolve_at(dirfd, path) else {
                 return e(ring3::err::EBADF);
-            }
-            open_common(path_va, flags)
+            };
+            open_common(&full, flags)
         }
         ring3::nr::OPEN => {
             // musl's `open()` on x86_64: the legacy number, no dirfd.
             let (path_va, flags) = (fr.arg1(), fr.arg2());
-            open_common(path_va, flags)
+            let mut pbuf = [0u8; 128];
+            let Some(path) = user_str(path_va, &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            open_common(path, flags)
         }
         ring3::nr::GETDENTS64 => {
             // `ls`'s walk: fill `linux_dirent64` records from the open
@@ -1804,7 +1836,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::LSEEK => {
-            let (fd, off, whence) = (fr.arg1(), fr.arg2() as i64, fr.arg3());
+            let (fd, off, whence) = (fr.arg1(), fr.arg2().cast_signed(), fr.arg3());
             if fd <= 2 || fd as u32 >= SLOT_CEILING {
                 return e(ring3::err::EBADF);
             }
@@ -1813,8 +1845,8 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 OpenFile::File { offset, size, .. } => {
                     let base = match whence {
                         0 => 0i64,            // SEEK_SET
-                        1 => *offset as i64,  // SEEK_CUR
-                        2 => *size as i64,    // SEEK_END
+                        1 => (*offset).cast_signed(), // SEEK_CUR
+                        2 => (*size).cast_signed(),   // SEEK_END
                         _ => {
                             res = Err(ring3::err::EINVAL);
                             return;
@@ -1997,7 +2029,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 return e(ring3::err::EBADF);
             }
             let desc = fd_table().with(fd as u32, clone_desc);
-            let Some(Some(desc)) = desc else {
+            let Some(desc) = desc else {
                 return e(ring3::err::EBADF);
             };
             let mut table = fd_table();
@@ -2081,6 +2113,18 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 return e(ring3::err::EFAULT);
             }
             0
+        }
+        ring3::nr::EXECVE => {
+            // No fork exists to return to, so in the run-to-completion model
+            // an exec from the nested child IS the handoff: ash's tail-call
+            // exec of the one command in `sh -c` (busybox skips the fork for
+            // a trailing simple command), and every program line the gates
+            // run reaches the kernel this way. Outside a nested child there
+            // is no task this kernel could replace — say ENOSYS.
+            if !child::nested_active() {
+                return e(ring3::err::ENOSYS);
+            }
+            child::exec_replace(fr)
         }
         other => {
             // Name the gap: a guest task hit a number this table does not
@@ -2311,6 +2355,10 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     t.fd_nonblock = fdtable::FlagSet::new();
     t.exit = None;
     t.mmap_cur = MMAP_BASE;
+    // A fresh address space, a fresh region list: `user_ok` checks against
+    // exactly what THIS image mapped. Without the reset the 16 region slots
+    // fill across spawns and an exec would panic on the append.
+    t.n_regions = 0;
 
     // The task's root: a fresh page table whose upper half is the kernel's
     // (one PML4 copy shares every kernel subtree — physmap, device window,
@@ -2408,7 +2456,13 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     for (k, a) in argv[..n_args].iter().enumerate() {
         full_argv[k] = a;
     }
-    let mut block = [0u8; 512];
+    // One full page, not the old 512: `build_stack` lays the block out from
+    // `buf.len()` backwards and `apk`'s long argv/env (`--allow-untrusted add
+    // /pkgs/...` plus sshd's environment) overran 512 by exactly the 8 bytes
+    // of one pointer word — the underflowed slice index panicked the kernel
+    // on the first real install. The block still ends at `USER_STACK_TOP` and
+    // now fills the top page exactly, which the copy below already handles.
+    let mut block = [0u8; 4096];
     let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &full_argv[..=n_args], env, &aux);
 
     // SAFETY: the top stack page is a mapped task frame; the block ends at
