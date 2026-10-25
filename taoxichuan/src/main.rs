@@ -444,25 +444,6 @@ fn no_clock() -> u64 {
 /// that never blocks on anything this kernel runs.
 static mut ROOT_FS: Option<akuma_ext2::Ext2Filesystem<Vda>> = None;
 
-/// The host address a TCP `connect` to the relay gateway's own IP (`10.0.2.2`)
-/// is rewritten to, parsed from the boot command line (`hostrelay=a.b.c.d`).
-///
-/// Why: the host gateway answers `10.0.2.2` itself — it is the gateway's own
-/// IP, and a SYN to one of its ports that is neither echo nor a forward slot
-/// is reset (`tcp_in`'s fall-through). Its outbound hold (`out_in`) only
-/// picks up destinations outside 10.0.2.0/24. Fixing that in the gateway means
-/// a host-kernel rebuild + box reboot, so the guest maps the gateway's address
-/// to the host's own address instead: the connection then leaves through the
-/// `vm_outbound` relay's out-of-subnet path, which dials the destination from
-/// the host's stack. Unset leaves `10.0.2.2` untouched (UDP — DHCP, the DNS
-/// proxy, echo — never touches this; it is a TCP-`connect`-only rewrite).
-static mut HOSTRELAY: Option<[u8; 4]> = None;
-
-fn hostrelay() -> Option<[u8; 4]> {
-    // SAFETY: written once at boot, before ring 3 exists; read-only after.
-    unsafe { *core::ptr::addr_of!(HOSTRELAY) }
-}
-
 /// The mounted root, for the dispatcher. Panics if called before the mount —
 /// which no caller does: the mount precedes the first ring-3 crossing.
 fn root_fs() -> &'static akuma_ext2::Ext2Filesystem<Vda> {
@@ -2743,21 +2724,6 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // SAFETY: boot phase, one core, no ring 3 yet.
     unsafe {
         *core::ptr::addr_of_mut!(ROOT_FS) = Some(fs);
-    }
-
-    // Stage 7: the outbound alias. `hostrelay=a.b.c.d` on the command line says
-    // which of the host's own addresses `10.0.2.2` stands for in a TCP connect
-    // (see HOSTRELAY). Absent: no rewrite, the gateway keeps 10.0.2.2 to itself.
-    let mut relay_buf = [0u8; 32];
-    if let Some(v) = cmdline_token(hvm_start_info, "hostrelay=", &mut relay_buf) {
-        let n: Vec<u8> = v.split('.').filter_map(|p| p.parse::<u8>().ok()).collect();
-        if n.len() == 4 {
-            unsafe {
-                *core::ptr::addr_of_mut!(HOSTRELAY) = Some([n[0], n[1], n[2], n[3]]);
-            }
-        } else {
-            console::puts("  cmdline: hostrelay= not a.b.c.d; ignored\n");
-        }
     }
 
     // Stage 4: the network path — calibrate the TSC against the PIT, pull up

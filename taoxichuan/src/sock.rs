@@ -187,21 +187,15 @@ pub fn accept_arm(fd: u64, addr: u64, addrlen_va: u64) -> u64 {
     }
 }
 
-/// `connect(fd, addr, addrlen)`. Served for completeness; nothing in the
-/// stage's path dials out (`vm_outbound` is a later stage's line).
+/// `connect(fd, addr, addrlen)`. Outbound TCP leaves through the gateway's
+/// `vm_outbound` relay: the guest dials the address it is given (the host's
+/// LAN address is the proven path) and the host makes the real connection.
 pub fn connect_arm(fd: u64, addr: u64, addrlen: u64) -> u64 {
     let Some(idx) = fd_socket(fd) else {
         return crate::e(crate::err::ENOTSOCK);
     };
     let Some(sa) = sockaddr_in_from_user(addr, addrlen) else {
         return crate::e(crate::err::EINVAL);
-    };
-    // The outbound alias: a TCP connect to the gateway's own address is a
-    // connect to the host (`hostrelay=`); see HOSTRELAY. Everything else,
-    // including UDP paths, dials what the caller said.
-    let sa = match (sa.ip, crate::hostrelay()) {
-        ([10, 0, 2, 2], Some(host)) => SocketAddrV4::new(host, sa.port),
-        _ => sa,
     };
     match akuma_net::socket::socket_connect(idx, sa, fd_nonblock(fd)) {
         Ok(()) => 0,
