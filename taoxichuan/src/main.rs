@@ -862,6 +862,10 @@ fn open_common(path: &str, flags: u64) -> u64 {
         return e(ring3::err::EMFILE);
     };
     let fd = table.alloc_fd_from(3, desc);
+    // TRACE (s7d step-1 settle): where a shell redirect's file lands.
+    if path.starts_with("/tmp/") {
+        akuma_primitives::safe_print!(112, "  [o] open {} flags={:#x} -> {}\n", path, flags, fd);
+    }
     if flags & ring3::open::O_CLOEXEC != 0 {
         table.set_cloexec(fd); // O_CLOEXEC: recorded, nothing execs yet
     }
@@ -1866,6 +1870,14 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                         return e(ring3::err::EINVAL);
                     }
                     let Some(desc) = fd_table().with(fd as u32, clone_desc) else {
+                        // TRACE: the phantom-console case — fd 0/1/2 have no
+                        // table entry on this kernel, so the save fails here.
+                        akuma_primitives::safe_print!(
+                            96,
+                            "  [fc] F_DUPFD {} >= {}: EBADF (unbound src)\n",
+                            fd,
+                            arg
+                        );
                         return e(ring3::err::EBADF);
                     };
                     let mut table = fd_table();
@@ -1895,6 +1907,11 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // fds 0/1/2 are the console and hold no kernel reference to
             // release; closing them is the no-op Linux's stdio-close is.
             let fd = fr.arg1();
+            // TRACE (s7d step-1 settle): the redirect's close(1) and the
+            // save-slot cleanup (10).
+            if fd <= 2 || fd == 10 {
+                akuma_primitives::safe_print!(96, "  [c] close {}\n", fd);
+            }
             if fd <= 2 {
                 return 0;
             }
@@ -2330,6 +2347,8 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             match fd_table().dup_to(old as u32, new as u32, is_dup3 && flags & O_CLOEXEC != 0) {
                 Ok(d) => {
+                    // TRACE (s7d step-1 settle): the redirect bind step.
+                    akuma_primitives::safe_print!(96, "  [d] dup {}->{} ok\n", old, new);
                     // Whatever `new` named is displaced: release a displaced
                     // socket's kernel side exactly as close() does.
                     if let Some(OpenFile::Socket(idx)) = d.displaced {
@@ -2348,7 +2367,11 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                         None => e(ring3::err::EBADF),
                     }
                 }
-                Err(fdtable::DupError::BadFd) => e(ring3::err::EBADF),
+                Err(fdtable::DupError::BadFd) => {
+                    // TRACE: a failed bind is exactly what an empty redirect is.
+                    akuma_primitives::safe_print!(96, "  [d] dup {}->{} EBADF\n", old, new);
+                    e(ring3::err::EBADF)
+                }
             }
         }
         ring3::nr::MREMAP => {
