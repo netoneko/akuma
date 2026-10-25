@@ -446,7 +446,7 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
         t.fd_names = saved.0;
         t.fd_cloexec = saved.1;
         t.fd_nonblock = saved.2;
-        let table = crate::fd_table();
+        let mut table = crate::fd_table();
         for (_fd, payload) in table.sweep_cloexec() {
             if let crate::OpenFile::Socket(idx) = payload {
                 akuma_net::socket::remove_socket(idx);
