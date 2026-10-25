@@ -1,4 +1,4 @@
-# Taoxichuan stage 7, session C: close stage 7's gates in one clean boot (H1, H2, H3, regression)
+# Taoxichuan stage 7, session D (DRAFT - becomes the execution brief once session C's PLAN exists): close stage 7's gates in one clean boot (H1, H2, H3, regression) while executing the trim plan
 
 You are goose-glm, the metal track of `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md`, on the ryzen box. Session B
 (`taoxichuan-s4` @ `b7646dd9`) ended on the z.ai quota limit with no `RESULT-B.md`. Its work is committed. This session's job
@@ -20,7 +20,43 @@ open (`OpenFile::Null`) is implemented and not yet gated. Write-after-create (H3
    ext2 write side (inode/bitmap/size updates).
 4. `userspace/ext2probe` (create / sequential write / sequential read / list) and `userspace/abiprobe`: existing guest-side probes
    for exactly these paths; `docs/reference/userspace-layout.md` has their one-liners and build commands.
-5. Your own `RESULT-A.md` and the commit messages `git log --oneline -8` on the branch.
+5. The probes below (this is the fun part).
+6. Your own `RESULT-A.md` and the commit messages `git log --oneline -8` on the branch.
+
+## Probes you already have (use them, bend them, write your own)
+
+Small static C or musl programs that exercise exactly the syscalls these gates need, written for earlier hunts on the full Akuma
+kernel and runnable as plain ELFs in a guest. `docs/reference/userspace-layout.md` has one-liners for all of them; most are C and
+build with the repo's musl toolchain on the box (`userspace/build.sh --<name>-only`, or compile the single `.c` with
+`musl-gcc -static`). The Taoxichuan guest implements a subset of Linux, so a probe that dies on a missing syscall is itself a
+finding: the kernel's `[sc] unhandled` line names it.
+- `userspace/ext2probe/c/` - `fs_ops_cost.c` (create / seq write / seq read / list-dir / delete on ext2) and
+  `read_syscall_cost.c`; static musl, one binary for Linux and Akuma (the file side of H3). `build.sh` + a prebuilt
+  `x86_64/` directory are there.
+- `userspace/abiprobe/c/abi_write_probe.c` - every syscall that writes a kernel struct into a user buffer, checked byte for
+  byte against what real Linux produces; run the same binary on both and diff the reports. `build.sh --push-akuma PORT` pushes
+  a rebuilt probe into a running guest without a reboot.
+- `userspace/forktest/c_stress/` - ~100 pure-C musl-static control probes (open/dup/pipe/fd/clock/...): `ls` it and pick the ones
+  whose names match the gate.
+- `userspace/nettest/` - libcurl / `std::net` + `poll(2)` clients (needs more syscalls; a good stretch goal for stage 8).
+- `userspace/epollprobe`, `memprobe`, `futexprobe` - per-syscall behaviour and cost for the poll, memory and futex families.
+Write a 20-line probe of your own for anything the existing ones do not cover, and keep it under `scripts/kvm/goose/probes/`
+so the next session finds it. Explore: you are free to spend a boot or two on curiosity if a probe shows something odd.
+
+## Composition rule (mandatory; stages 1-4 had it, stages 6-7 lost it)
+`taoxichuan/` is a **composition root**, not a kernel written from scratch. At the start of stage 7 it was 4,450 hand-written lines
+(`main.rs` 2,928) next to 101 existing crates and a full amd64 kernel that already implements nearly every syscall you will meet.
+Before you write any syscall arm, subsystem or helper of more than about 20 lines:
+1. **Look first**: `grep -rn "<name>" crates/ amd64/src/` for the syscall or concept; skim `docs/reference/crate-safety.md` and
+   `ls crates/` for the crate that owns it (`akuma-syscalls-glue` and the `akuma-syscalls-*` family, `akuma-fdtable`, `akuma-vfs`,
+   `akuma-ext2`, `akuma-net`, `akuma-exec`, `akuma-ring3-amd64`, `akuma-svm-amd64`).
+2. **It exists in a crate**: add a path dependency and call it. Do not copy it.
+3. **It exists only in `amd64/src/`**: extract it into a crate first (`akuma-<thing>`, named for what it owns; keep `#![forbid(unsafe_code)]`
+   where it can, `scripts/check_unsafe_budget.py` gates new `unsafe`), make `amd64/` depend on the crate too, then depend on it from
+   `taoxichuan/`. One implementation, two consumers.
+4. **It exists nowhere**: write it, in a crate with host tests where the logic is pure, and say why in the RESULT file.
+In every RESULT file report, per arm or feature you added: *pulled* / *extracted* / *written new (why)*, and `wc -l taoxichuan/src/*.rs`
+at the start and the end. A session that closes a gate and makes `taoxichuan/src` smaller is better than one that closes it larger.
 
 ## Gates (every gate command's stdout goes to a file in `/root/dev-cycle/taoxichuan-s7/` and you `cat` it afterwards)
 - **H1:** listener on the box serving `index.html` containing `hello-from-host` on port 8123; over the exec-only ssh path
@@ -49,5 +85,5 @@ fine. Never push `origin`. Gate arch-specific code with `cfg`; keep amd64-only c
 
 ## When to stop
 All gates pass in one clean boot; or three boots on the same gate without new evidence; or the quota error. Count boots, not
-minutes. Then write `/root/dev-cycle/taoxichuan-s7/RESULT-C.md` (each gate with its captured output, the exact failing step with
+minutes. Then write `/root/dev-cycle/taoxichuan-s7/RESULT-C.md` (each gate with its captured output, per arm or feature *pulled / extracted / written new*, `wc -l taoxichuan/src/*.rs` before and after, the exact failing step with
 console evidence, what is next) and end the turn.

@@ -983,3 +983,30 @@ with no `RESULT-B.md`.
 - **Host track (Sonnet):** merged `litter/taoxichuan-s4` @ `b7646dd9` (`d546b3db`), `scripts/build_taoxichuan_fc.sh` ->
   `taoxichuan-fc.bin` 662,792 B (unchanged), Lima `fc` boot with disk: 162 lines, `Ext2 filesystem mounted`, `sshd started`,
   0 `Fault|PANIC|sig!`. PASS (the tree still builds and boots on aarch64; the amd64-only changes are in `taoxichuan/`).
+
+### Supervisor lapse — the composition rule was dropped from the briefs for stages 6-7 (found 2026-10-25, owner's question)
+
+**What happened.** The experiment's pinned composition rule (`MINIMAL_SELF_HOSTING_EXPERIMENT.md` § Process: pull as few crates as possible;
+extract into a crate first where the logic still lives in `amd64/src/`; the goal is a *composition root*, not a new kernel) was carried by
+the briefs for stages 1-4 and silently left out of 06a, 06b, 06c, 07, 07b and 07c-draft. The supervisor (Sonnet) wrote each brief from
+the previous session's result and never re-read the doc's pinned sections. The owner noticed from the size of the kernel source.
+
+**What it cost (measured, `git diff --numstat 29d4b562 b7646dd9`).** Stages 6-7 added **+1,198 net hand-written lines in `taoxichuan/`**
+(`main.rs` +911, `sock.rs` +129, `child.rs` +158; `taoxichuan/src` 3,268 -> 4,466) against **+252 in `crates/`** (`akuma-ring3-amd64` +170 loader,
+`akuma-net` +70 the connect-trace helper), **zero new crates, zero lines changed in `amd64/` or `src/`**: nothing was extracted, and
+`dup2`/`dup3`, `utimensat`, `access`, the `writev` family, `/dev/null`, the socket arms and the exec/argv work were all written again for a
+kernel whose full-amd64 sibling already had them. Two of the stage 7 bugs (`writev` served fds 1/2 only; `/dev/null` open returned EACCES)
+were such re-implementations, and the first took the better part of a 106-minute session to find ("Recurring bug classes" above).
+During the stage 7C planning session goose also noted that `taoxichuan/src/net.rs` hand-writes port `in`/`out`, which `CLAUDE.md` forbids
+(`akuma-port` owns port I/O).
+
+**Fix, and what was learned.**
+- `scripts/kvm/goose/BRIEF_TEMPLATE.md` now has a mandatory "Composition rule" section (look in `crates/` and `amd64/src/` first, depend or
+  extract, report *pulled / extracted / written new* and `wc -l taoxichuan/src/*.rs` before and after), and the protocol in the experiment doc
+  lists it as rule 5.
+- Stage 7C was converted into a **planning-only** session (`taoxichuan-07c-trim-plan.md`): inventory every arm against the existing crates, find
+  the smallest H1-preserving rewire, plan H2/H3 inside it; the execution brief (`taoxichuan-07d-trim-and-gates.md`) is written from that plan.
+- Process rule for the supervisor: **diff every brief against the template and the pinned doc sections before sending; verify each gate address
+  and command against a doc or a passing run** (the stage 7A `10.0.2.2` gate was the same class of lapse). Saved to the supervisor's memory.
+- Honest scope for the claim: stages 6-7 as run do not demonstrate "composed from existing crates"; they demonstrate a working but
+  hand-written kernel. The trim sessions are what recover the claim, and the line counts per session will show whether they do.
