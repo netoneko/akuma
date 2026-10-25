@@ -58,7 +58,16 @@ while [ $i -lt 3 ]; do
   [ $i -gt 0 ] && sleep 60
   rm -f "$OUT/boot_probe.out"
   /bin/ssh -p 2224 root@localhost 'echo __BOOT_OK__' >"$OUT/boot_probe.out" 2>>"$L"
-  if grep -q '__BOOT_OK__' "$OUT/boot_probe.out"; then ready=1; break; fi
+  if grep -q '__BOOT_OK__' "$OUT/boot_probe.out"; then
+    # herd re-parses on enable and QUEUES a start on the next config reload
+    # (within 20 s): a second guest can replace this one right after the first
+    # answer. Let that window pass, then confirm the survivor still answers.
+    sleep 25
+    rm -f "$OUT/boot_probe.out"
+    /bin/ssh -p 2224 root@localhost 'echo __BOOT_OK__' >"$OUT/boot_probe.out" 2>>"$L"
+    grep -q '__BOOT_OK__' "$OUT/boot_probe.out" && ready=1
+  fi
+  [ "$ready" = 1 ] && break
   i=$((i+1))
 done
 [ "$ready" = 1 ] || fail "no ssh round trip (see boot_dev.log)"
