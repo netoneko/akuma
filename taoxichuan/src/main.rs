@@ -1502,6 +1502,24 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 (_, Ok(n)) => n,
             }
         }
+        ring3::nr::ACCESS => {
+            // access(2), the legacy number. apk probes optional paths (the
+            // syslog socket, key and hook directories) with this — four
+            // calls per install — and skips what ENOENTs. Existence is the
+            // honest answer this kernel can give: the guest is single-user
+            // root, and every regular file the ext2 root holds is readable
+            // and executable to it (the R_OK/X_OK bits carry no extra
+            // information here).
+            let mut pbuf = [0u8; 128];
+            let Some(path) = user_str(fr.arg1(), &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            let full = resolve_at(ring3::open::AT_FDCWD, path).unwrap_or_default();
+            match root_fs().metadata(&resolve_effective(&full)) {
+                Ok(_) => 0,
+                Err(_) => e(ring3::err::ENOENT),
+            }
+        }
         ring3::nr::STAT => {
             // musl's `stat()` on x86_64: the legacy number, the 144-byte
             // `struct stat`. Everything the ext2 root knows is filled
@@ -2148,7 +2166,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
 const MAX_PROGRAMS: usize = 4;
 /// argv entries per program beyond `argv[0]`, and their byte budget each.
 /// The command line is 512 bytes total; 8×95 cannot overflow it.
-const MAX_ARGV: usize = 8;
+const MAX_ARGV: usize = 16;
 const ARG_LEN: usize = 96;
 
 #[derive(Clone, Copy)]
@@ -2451,11 +2469,16 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     aux[11] = (ring3::AT_HWCAP, 0);
     aux[12] = (ring3::AT_CLKTCK, 100);
     aux[13] = (ring3::AT_RANDOM, 0);
-    let mut full_argv: [&str; MAX_ARGV + 1] = [argv.first().copied().unwrap_or(""); MAX_ARGV + 1];
+    // `..n_args`, not `..=n_args`: the array is exactly argv-sized and the
+    // slice must be too. The old builder pre-filled every slot with argv[0]
+    // and then sliced one slot PAST the copied prefix (`..=`), so the new
+    // image's argv ended with a duplicate of argv[0] — apk 3's `add` then
+    // parsed that duplicate as a package name ("unable to select packages:
+    // apk.static (no such package)") while `--version` (G2) and `sh -c`
+    // (G1, the dup landed as $0) never noticed.
+    let mut full_argv: [&str; MAX_ARGV] = [""; MAX_ARGV];
     let n_args = argv.len().min(MAX_ARGV);
-    for (k, a) in argv[..n_args].iter().enumerate() {
-        full_argv[k] = a;
-    }
+    full_argv[..n_args].copy_from_slice(&argv[..n_args]);
     // One full page, not the old 512: `build_stack` lays the block out from
     // `buf.len()` backwards and `apk`'s long argv/env (`--allow-untrusted add
     // /pkgs/...` plus sshd's environment) overran 512 by exactly the 8 bytes
@@ -2463,7 +2486,14 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // on the first real install. The block still ends at `USER_STACK_TOP` and
     // now fills the top page exactly, which the copy below already handles.
     let mut block = [0u8; 4096];
-    let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &full_argv[..=n_args], env, &aux);
+    // TEMP s6c: the argv the new image will actually see, laid out by
+    // build_stack below — the G3 suspect was an argv off-by-one here.
+    akuma_primitives::safe_print!(192, "[argv] n={}:", n_args);
+    for a in &full_argv[..n_args] {
+        akuma_primitives::safe_print!(96, " {}", a);
+    }
+    akuma_primitives::safe_print!(64, "\n");
+    let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &full_argv[..n_args], env, &aux);
 
     // SAFETY: the top stack page is a mapped task frame; the block ends at
     // `USER_STACK_TOP`, so its bytes sit at `page_pa + (4096 - block.len())`.

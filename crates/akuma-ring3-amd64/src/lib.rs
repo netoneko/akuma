@@ -776,6 +776,9 @@ pub mod nr {
     /// `writev(2)` — musl's stdio flushes through this, even for a single
     /// buffer (the empty `wbase` head is one zero-length iovec).
     pub const WRITEV: u64 = 20;
+    /// `access(2)` — apk probes paths it may skip (the syslog socket, key
+    /// directories) with this before opening them.
+    pub const ACCESS: u64 = 21;
     /// `mmap(2)`.
     pub const MMAP: u64 = 9;
     /// `mprotect(2)`.
