@@ -442,7 +442,10 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     // `spawn_arm`'s tail restores the real top after `child_enter` returns;
     // failure paths above never lowered it.
     let rsp_here: u64;
-    core::arch::asm!("mov {}, rsp", out(reg) rsp_here, options(nomem));
+    // SAFETY: reads the current stack pointer, nothing else.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp_here, options(nomem));
+    }
     // SAFETY: syscall-path discipline.
     unsafe {
         ring3::set_syscall_stack_top(rsp_here - 0x1000);
