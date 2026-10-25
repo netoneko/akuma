@@ -868,6 +868,12 @@ fn write_file_arm(fd: u64, buf: u64, len: u64) -> u64 {
             res = Err(ring3::err::EBADF);
             return;
         };
+        // The write START offset, captured once: `*offset` advances per
+        // iteration below, so writing at `*offset + done` double-advanced
+        // every chunk after the first — a 2048-byte write landed its second
+        // 1024 bytes 1024 past the first (apk's file writes came out with
+        // alternating 1 KiB holes and an inflated size).
+        let start = *offset;
         let mut done = 0u64;
         while done < len {
             let want = ((len - done) as usize).min(chunk.len());
@@ -875,7 +881,7 @@ fn write_file_arm(fd: u64, buf: u64, len: u64) -> u64 {
                 res = Err(ring3::err::EFAULT);
                 return;
             }
-            match root_fs().write_at_by_inode(*inode, (*offset + done) as usize, &chunk[..want]) {
+            match root_fs().write_at_by_inode(*inode, (start + done) as usize, &chunk[..want]) {
                 Ok(n) if n > 0 => {
                     *offset += n as u64;
                     *size = (*size).max(*offset);
@@ -1203,11 +1209,6 @@ fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result
 }
 
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
-    // TEMP s6b: trace every nested child syscall — ash's exec failure
-    // produced no [sc] unhandled line, so see what it actually calls.
-    if child::nested_active() {
-        akuma_primitives::safe_print!(96, "  [sc.c] {} ({:#x})\n", nr_name(fr.rax), fr.rax);
-    }
     match fr.rax {
         ring3::nr::WRITE => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
@@ -2486,13 +2487,6 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // on the first real install. The block still ends at `USER_STACK_TOP` and
     // now fills the top page exactly, which the copy below already handles.
     let mut block = [0u8; 4096];
-    // TEMP s6c: the argv the new image will actually see, laid out by
-    // build_stack below — the G3 suspect was an argv off-by-one here.
-    akuma_primitives::safe_print!(192, "[argv] n={}:", n_args);
-    for a in &full_argv[..n_args] {
-        akuma_primitives::safe_print!(96, " {}", a);
-    }
-    akuma_primitives::safe_print!(64, "\n");
     let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &full_argv[..n_args], env, &aux);
 
     // SAFETY: the top stack page is a mapped task frame; the block ends at
