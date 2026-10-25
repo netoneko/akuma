@@ -2452,7 +2452,13 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     for (k, a) in argv[..n_args].iter().enumerate() {
         full_argv[k] = a;
     }
-    let mut block = [0u8; 512];
+    // One full page, not the old 512: `build_stack` lays the block out from
+    // `buf.len()` backwards and `apk`'s long argv/env (`--allow-untrusted add
+    // /pkgs/...` plus sshd's environment) overran 512 by exactly the 8 bytes
+    // of one pointer word — the underflowed slice index panicked the kernel
+    // on the first real install. The block still ends at `USER_STACK_TOP` and
+    // now fills the top page exactly, which the copy below already handles.
+    let mut block = [0u8; 4096];
     let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &full_argv[..=n_args], env, &aux);
 
     // SAFETY: the top stack page is a mapped task frame; the block ends at
