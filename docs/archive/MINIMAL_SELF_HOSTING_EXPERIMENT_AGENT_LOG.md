@@ -119,6 +119,32 @@ findings, recorded here, not averaged away.
   `http://192.168.1.159:3284/acp`; `/health` 200.
 - Lima `fc` VM on the Mac: Running (vz, aarch64, 4 CPU, 8 GiB).
 
+## Recurring bug classes (to be traced through the docs)
+
+**"The fd table's answer is special-cased to the three stdio fds" - the fd nonsense.** Owner's note, 2026-10-25: this class has
+resurfaced at least 4-5 times across the kernels, always looking like something else (a network hang, an `ar` failure, a pipe
+that never closes, a tty that is not one). The stage 7B instance: the Taoxichuan guest's `writev` served fds 1 and 2 only and
+answered `EBADF` for every other fd; musl stdio flushes through `writev`, so busybox `wget`'s HTTP request never left, stdio kept
+the error in the stream's flag, and `wget` blocked forever reading a reply to a request nobody sent. TCP connect, the gateway and
+the relay were all fine (`connect` returned in 52 ms; commit `6879eb47` on `litter/taoxichuan-s4`). The 7A session had called
+the same symptom "a stall in the guest/gateway handshake" for an hour: **a silent hang after a good connect is a missing or
+stdio-only arm until proven otherwise.**
+
+Earlier occurrences found so far (seeds, not yet audited; follow each link, then grep for the rest):
+- `docs/archive/BUG_FIX_LIST.md` ~l.177: `sys_writev` did not stop at a short write (the writev family's own history).
+- `docs/archive/BUG_FIX_LIST.md` ~l.1732, `AKUMA_AMD64_4B_FOLD_BATCH3B.md` ~l.77, `AKUMA_SELF_HOSTING_AMD64.md` ~l.879: `fstat` on a
+  socket fell to `_ => EBADF` on **both** kernels (no `Socket` arm in `fstat_fill`).
+- `docs/archive/BUG_FIX_LIST.md` ~l.2237: `isatty(0)` decided tty-ness from the process's I/O channel, not the fd table.
+- `docs/archive/AMD64_CONSOLE_NONBLOCK_READ.md` ~l.216: `FileDescriptor::DevTty` unmatched; only `Stdin`/`Stdout`/`Stderr` were.
+- `docs/archive/RUST_TOOLCHAIN.md` § 4d: the CLOEXEC-pipe `EBADF` on `recvmsg` over a socketpair.
+- This log, stage 3/4 (~l.829): nested `writev` to fd 1 going to the child pipe (musl flushes stdout as `writev`; `3c560be7`).
+
+**How to use this:** when a Taoxichuan (or amd64) program hangs or silently loses output after a successful `open`/`connect`, before
+instrumenting the stack, list the syscall arms that take an fd (`read`, `write`, `readv`, `writev`, `fstat`, `fcntl`, `ioctl`,
+`lseek`, `poll`) and check each for a `_ => EBADF`/stdio-only fall-through. Proper follow-up (not done): one audit pass over every
+fd-taking arm in `taoxichuan/src/main.rs` against `akuma-fdtable`'s vocabulary, so the kernel has one answer per fd kind; and the
+whole-docs trace the owner asked for (every mention, one table).
+
 ## Stage log
 
 ### Stage 1 — boot in KVM (gate: init spawn, banner, zero [Fault]/PANIC/[sig!])
@@ -921,3 +947,39 @@ disk: 161 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`
 look at `resolve_effective` + directory open); `dup2`/`dup3`(33) unhandled (busybox `dd` refuses); sshd logs `bridge_process: couldn't
 open stdin` per session; the next ladder step (stage 7+) has no brief. State left: `vm-dev` stopped + disabled, both confs restored,
 `vm-serve-mc` up. Nothing pushed to `origin` by goose; `litter` has `ea2c5b2a -> 18a7b193 -> 0b33595a`.
+
+### Stage 7 — sessions A and B (outbound TCP), 2026-10-25 — H1's cause found; session B stopped by the z.ai weekly limit
+
+**Session A** (`taoxichuan-07-outbound.md`, 53 min, 117 tool calls, 7.6M input tokens, `RESULT-A.md`): H1 failed, H3 passed, H2 partial.
+Its brief used the gateway's own address `10.0.2.2` as a host alias. That was the supervisor's mistake (no guest ever used it that way;
+`routable()` excludes the guest subnet by design), and it sent the agent to a "needs a host-kernel rebuild" dead end. The control run
+to the host's LAN IP worked through the unchanged relay. The host kernel (`43edbffc`) is identical to latest for `amd64/` and
+`crates/akuma-svm-amd64/`: nothing to rebuild.
+
+**Session B** (`taoxichuan-07b-outbound-docs-first.md`, the first brief with a read-first docs list, the LAN-IP gate and an
+event-based commit rule; 106 min, 275 tool calls, **27.8M input / 120k output tokens**, `litter` `11fe2194 -> 93fdc7c6 -> 1ee0dcdd ->
+6879eb47 -> 2c494d96 -> b7646dd9`). Ended by `Rate limit exceeded: Weekly/Monthly Limit Exhausted` (resets 2026-10-31 01:05 China time)
+with no `RESULT-B.md`.
+- **Root cause of H1 (goose's own trace, not a supervisor hint):** `writev` served fds 1/2 only and answered `EBADF` for everything
+  else. musl stdio flushes through `writev`, so busybox `wget`'s request never left, stdio swallowed the error and `wget` blocked
+  reading a reply to nothing. `connect` returned in 52 ms; the handshake, gateway and relay were fine. After `6879eb47` the relay
+  read `to_host=81 to_guest=201` and the host's `python -m http.server` logged `GET / HTTP/1.1 200`. The guest-side
+  `hello-from-host` was not captured in a clean gate boot (exec output needed long timeouts on a cold guest). The same hole existed
+  for regular files and was closed in `writev` too. See "Recurring bug classes" above.
+- **H2:** `/dev/null` open (`OpenFile::Null`, `2c494d96`); gate output not captured. **H3:** `echo x > /tmp/f` creates the file but
+  the bytes do not land; probes were being added to both file-write arms when the limit hit (`b7646dd9`, WIP committed by the supervisor at the stop).
+- **Metrics (`scripts/goose_session_stats.py`):** A: 117 calls, 59 before the first edit, 1 `docs/` read, 4 boots. B: 275 calls, 45
+  before the first edit, 11 `docs/` reads over 6 files (`kvm.md` 3, `KVM_OUTBOUND_NETWORKING.md` 3, `networking.md` 2), 76 source
+  reads, 9 boots, 5 commits and 5 pushes by the agent. The commit rule held (a commit after the first clean build, one per fix).
+  **What the numbers do not show:** that the docs sped anything up. The docs and a mid-session nudge both pointed at the NIC/rx
+  ring, which was wrong; the cause came from the agent's per-lap trace. B also cost 3.6x A's input tokens. Three things changed
+  between A and B (docs list, gate address, commit rule), so there is a difference, not a cause.
+- **Supervisor errors this stage:** the `10.0.2.2` gate (A); a progress report claiming a 5-minute cadence I could not keep between
+  turns (polling now happens inside the turn); a nudge that suggested the NIC when the bug was in the fd arm. Model used by goose
+  throughout: `glm-5.3-flash`, `thinking_effort: low` (checked in `sessions.db`).
+- **Ops state at the stop:** `vm-dev` stopped + disabled, both confs restored to the stage-4 conf, `vm-serve-mc` up, `:8123` listener
+  killed, goose-glm restarted. **Next (stage 7C, after the quota reset):** clean gate boot for H1 (guest prints `hello-from-host`),
+  H2 (`dd` to `/dev/null`), H3 (write-after-create), stage 6 G1-G3 regression; docs list only, no hints about the bug.
+- **Host track (Sonnet):** merged `litter/taoxichuan-s4` @ `b7646dd9` (`d546b3db`), `scripts/build_taoxichuan_fc.sh` ->
+  `taoxichuan-fc.bin` 662,792 B (unchanged), Lima `fc` boot with disk: 162 lines, `Ext2 filesystem mounted`, `sshd started`,
+  0 `Fault|PANIC|sig!`. PASS (the tree still builds and boots on aarch64; the amd64-only changes are in `taoxichuan/`).
