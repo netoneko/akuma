@@ -1074,7 +1074,7 @@ clean goose server.**
 **State.** Table stages 1-5 done; stage 6 (`apk add curl`) about half done (offline `apk add` + outbound TCP + all of stage 7's sub-gates green; `taoxichuan-s4` @ `fa8a1c53`
 merged into `rust-org-il-experiment`, pushed to `origin` at `defbd2c9`). Next: the rest-of-stage-6 plan (`TAOXICHUAN_STAGE6_REST_PLAN.md`): M0 mirror + reference (host only), M1 clock anchor
 (`epoch=` cmdline), M2 DNS, then trim step 2, M3 `apk update`, M4 `apk add curl`, trim step 3, M5 `PT_INTERP` + `curl --version`. Stages 7-12 of the table are not started and, on the pace here
-(~14 goose-hours for stages 1-5 plus offline 6, plus ~9 for stage 7's network work), 9-12 are out of reach for the talk on 2026-11-03. Owner's quota readings at the end: weekly reset
+(~14 goose-hours for stages 1-5 plus offline 6, plus ~9 for stage 7's network work), 9-12 will not be done by the talk on 2026-11-03; the owner's decision (2026-10-26) is to keep climbing regardless of the talk. Owner's quota readings at the end: weekly reset
 done at the start of the 26th, 5 h window 77% (sessions E-G cost ~6M tokens total). The supervisor loop, scripts and traps are in `scripts/kvm/goose/SUPERVISOR_RUNBOOK.md`.
 
 
@@ -1098,3 +1098,22 @@ It was written from memory, not copied from a passing run: the same class of lap
 
 **Host track (Sonnet), merged tree @ `cbb6f4be`:** `taoxichuan-fc.bin` 662,792 B (unchanged: the changes are amd64-only), Lima `fc` boot: 162 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`. PASS.
 A first boot showed 111 lines and stopped: a stale root-owned `firecracker` from the previous run was still alive (`pkill` as the Lima user fails, use `sudo pkill -9 firecracker`); the rerun was clean.
+
+
+### Stage 8 sessions I-J (2026-10-26): M2 DNS from the guest - D1 and D2 PASS
+
+**Result.** Brief `scripts/kvm/goose/taoxichuan-08i-dns.md` (session I, 297 tool calls, 28.8M input tokens, ended by the z.ai 5 h limit with no RESULT file) and its continuation
+`taoxichuan-08j-dns-continued.md` (session J, 77 calls, 2.4M input tokens, 28 min). `taoxichuan-s4` @ `49d418de`. Final battery on one clean boot:
+`PASS G1 G2 G3 G4 H1 H2 H3a H3b H3c C1 D1 D2`, `restarts=0`, `dns_answered 0 -> 2`, `dns_timeouts=0`, 0 `Fault|PANIC|sig!`. Details: `RESULT-J.md` on the box.
+- **Session I** (five commits): `devroot-ensure` puts `/etc/resolv.conf` and `/bin/nslookup` on the per-boot image copy through the `akuma-ext2` host write path (composition rule: pulled, not a hand
+  patcher; the `.orig` image stays untouched); connected-UDP send; `poll(2)` and `setsockopt`; `read(2)` on a datagram socket; and a `boot_dev.sh` fix (two boots had run a stale kernel).
+- **Session J found no bug.** A fresh boot of session I's own last kernel already printed the answers (A and AAAA, rcode 0). The "No answer" was the state before `f7e9aac5`, whose `read(2)` fix
+  was never re-tested because the quota ended the session. J removed the three temporary probe prints and a dead match arm (`taoxichuan/src` 4,811 -> 4,779), then ran the battery.
+- **Metrics:** `akuma-*` dependencies of `taoxichuan/Cargo.toml`: 16 direct path deps by `grep -c '^akuma-'` (the "18" carried in earlier briefs does not match the manifest under that count; correct the
+  briefs). Nothing written new in J, nothing extracted, nothing under `amd64/` or `src/` changed.
+- **Ops trap:** the vm-dev log appends across boots; attribute evidence per boot boundary, not per file.
+
+**Host track (Sonnet), merged tree @ `e98aef60`:** the merge conflicted once in `crates/akuma-net/src/socket.rs` (a doc comment on `DebugStream`, kept the already-split form). `taoxichuan-fc.bin` 662,792 B,
+Lima `fc` boot: 163 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`. PASS. (A read at 75 s saw 111 lines: the run lasts 120 s; wait for the firecracker process to exit before counting.)
+
+**Next:** trim step 2, then M3 `apk update`, M4 `apk add curl`, trim step 3, M5 `PT_INTERP` + `curl --version` (stage 6 of the table), then stages 7-12.
