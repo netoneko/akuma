@@ -1114,13 +1114,21 @@ fn fill_statfs(buf: u64) -> u64 {
     // bytes and always was) - this line is the only direct view of what apk's
     // free-space check reads, and it is what the Statfs gate greps.
     if !STATFS_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        // tstamp: the anchored wall clock at first statfs - the Statfs gate
+        // only accepts lines whose tstamp is at or after THIS boot's epoch
+        // (a previous boot's line always predates it), so mid-boot log
+        // rotation cannot misattribute the evidence.
+        let ts = akuma_primitives::clock::utc_time_us(net::uptime_us())
+            .unwrap_or(0)
+            / 1_000_000;
         akuma_primitives::safe_print!(
             128,
-            "[statfs] blocks={} bsize={} free={} bavail={} (real ext2 superblock)\n",
+            "[statfs] blocks={} bsize={} free={} bavail={} tstamp={} (real ext2 superblock)\n",
             st.total_blocks,
             st.block_size,
             st.free_blocks,
-            st.free_blocks
+            st.free_blocks,
+            ts
         );
     }
     let bs = st.block_size as i64;

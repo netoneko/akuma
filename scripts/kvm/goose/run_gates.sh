@@ -208,17 +208,21 @@ if [ "$GROUP" != main ]; then
 
   # Statfs: the one-time [statfs] console line (fill_statfs, once per boot)
   # is the only direct view of the real geometry - df cannot print here.
-  # Per-boot attribution: only the log region since this boot's
-  # "[vm-run] guest created" counts (the log may survive a boot unrotated).
-  BOOT_AT=$(grep -n '\[vm-run\] guest created' "$LOG" | tail -1 | cut -d: -f1)
-  if [ -n "$BOOT_AT" ] \
-     && sed -n "${BOOT_AT},\$p" "$LOG" | grep -q 'statfs. blocks=262144 bsize=4096'
-  then
-    STATLINE=$(sed -n "${BOOT_AT},\$p" "$LOG" | grep -o 'statfs. blocks=[0-9]* bsize=[0-9]* free=[0-9]*' | head -1)
-    vline Statfs 0 "vm-dev.log (${STATLINE})"
-  else
-    vline Statfs 1 "vm-dev.log (no [statfs] line this boot)"
-  fi
+  # Per-boot attribution: the line carries tstamp= (the anchored wall clock
+  # at first statfs); only a line at or after THIS boot's epoch (read from
+  # $OUT/epoch, C1's E) counts - a previous boot's line always predates it,
+  # so mid-boot rotation into .old cannot fake the evidence.
+  E=$(cat "$OUT/epoch")
+  rcST=1
+  STLINE=""
+  for t in $(grep -ho 'statfs. blocks=262144 bsize=4096 tstamp=[0-9]*' \
+      "$LOG" "$LOG.old" 2>/dev/null | cut -d= -f4); do
+    if [ "$t" -ge "$E" ] && [ "$t" -le "$((E + 2700))" ]; then
+      rcST=0
+      STLINE="tstamp=$t"
+    fi
+  done
+  vline Statfs "$rcST" "vm-dev.log(.old) (blocks=262144 bsize=4096 ${STLINE})"
 else
 rgroup G1 'g1=sh -c "echo hi"'
 vline G1 "$(agg "$RCS")" g1.console
