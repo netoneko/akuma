@@ -701,6 +701,21 @@ fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
     true
 }
 
+/// View a `repr(C)` plain-old-data wire struct as its own bytes, the form
+/// `copy_to_user` takes. Trim step 2 made this the shared shape: every struct
+/// the dispatcher now pulls from `akuma-syscalls-linux` goes out through here
+/// (sock.rs's sockaddr_in writer was the first local precedent).
+fn struct_bytes<T>(t: &T) -> &[u8] {
+    // SAFETY: every caller passes a `repr(C)` plain-old-data wire struct;
+    // viewing it as its own bytes is well defined.
+    unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(*t).cast::<u8>(),
+            core::mem::size_of::<T>(),
+        )
+    }
+}
+
 /// The ext2 lookup does not follow symlinks (a deliberate crate boundary:
 /// `akuma-ext2` resolves components, `akuma-vfs::path` owns the chain
 /// walker). The serve image's `/bin/sh` — what sshd's exec path spawns — is
@@ -1081,20 +1096,24 @@ fn fill_statfs(buf: u64) -> u64 {
     if !user_ok(buf, 120) {
         return e(ring3::err::EFAULT);
     }
-    let mut s = [0u8; 120];
-    let mut w = |i: usize, v: u64| s[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-    w(0, 0xEF53); // f_type
-    w(1, 4096); // f_bsize
-    w(2, 4096); // f_blocks (16 MiB / 4 KiB)
-    w(3, 2053); // f_bfree — the fresh image's free-block count
-    w(4, 2053); // f_bavail
-    w(5, 4096); // f_files
-    w(6, 2048); // f_ffree
-    // f_fsid (slot 7) stays zero; nothing reads it.
-    w(8, 255); // f_namelen
-    w(9, 4096); // f_frsize
-    w(10, 0); // f_flags: not read-only — this root writes now
-    if !copy_to_user(buf, &s) {
+    // Trim step 2: `akuma_syscalls_linux::Statfs`, whose 120-byte size the
+    // crate asserts (musl copies `f_spare` too). Same numbers the deleted
+    // slot-writer spelled; `f_fsid` stays zero, nothing reads it.
+    let s = akuma_syscalls_linux::Statfs {
+        f_type: 0xEF53,
+        f_bsize: 4096,
+        f_blocks: 4096, // 16 MiB / 4 KiB
+        f_bfree: 2053,  // the fresh image's free-block count
+        f_bavail: 2053,
+        f_files: 4096,
+        f_ffree: 2048,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: 0, // not read-only — this root writes now
+        f_spare: [0; 4],
+    };
+    if !copy_to_user(buf, struct_bytes(&s)) {
         return e(ring3::err::EFAULT);
     }
     0
@@ -1174,123 +1193,51 @@ fn fs_err(err: akuma_vfs::FsError) -> u64 {
 
 /// Reverse-map a syscall number to its name, for the unhandled arm — each
 /// boot then reads as a checklist instead of a table of bare numbers.
-fn nr_name(nr: u64) -> &'static str {
+/// Name a syscall for the console's unhandled-syscall line. Trim step 2,
+/// family 5: the Linux x86_64 names are `akuma_syscalls_abi`'s now — the same
+/// table rows `Syscall::from_x86_64` decodes — so this kernel's diagnostics
+/// cannot drift from the numbering table it shares with the full kernels.
+/// (The Debug spelling is CamelCase and one name per number, where the old
+/// hand table had lowercase and "poll/ppoll" merges: console evidence only,
+/// no bytes cross to the guest.) The three akuma-private numbers (0x1000+,
+/// above every real x86_64 number) keep their local names; anything neither
+/// table knows stays "?".
+fn nr_name(nr: u64) -> alloc::string::String {
     match nr {
-        ring3::nr::READ => "read",
-        ring3::nr::READV => "readv",
-        ring3::nr::SENDFILE => "sendfile",
-        ring3::nr::WRITE => "write",
-        ring3::nr::OPEN => "open",
-        ring3::nr::CLOSE => "close",
-        ring3::nr::STAT => "stat",
-        ring3::nr::FSTAT => "fstat",
-        ring3::nr::LSTAT => "lstat",
-        ring3::nr::LSEEK => "lseek",
-        ring3::nr::MMAP => "mmap",
-        ring3::nr::MPROTECT => "mprotect",
-        ring3::nr::MUNMAP => "munmap",
-        ring3::nr::MREMAP => "mremap",
-        ring3::nr::BRK => "brk",
-        ring3::nr::IOCTL => "ioctl",
-        ring3::nr::POLL => "poll/ppoll",
-        ring3::nr::DUP => "dup",
-        ring3::nr::NANOSLEEP => "nanosleep",
-        ring3::nr::GETPID => "getpid",
-        ring3::nr::UNAME => "uname",
-        ring3::nr::FLOCK => "flock",
-        ring3::nr::FCNTL => "fcntl",
-        ring3::nr::FCHMOD => "fchmod",
-        ring3::nr::UTIMENSAT => "utimensat",
-        ring3::nr::FCHOWNAT => "fchownat",
-        ring3::nr::UMASK => "umask",
-        ring3::nr::GETTIMEOFDAY => "gettimeofday",
-        ring3::nr::GETRUSAGE => "getrusage",
-        ring3::nr::GETCWD => "getcwd",
-        ring3::nr::READLINKAT => "readlinkat",
-        ring3::nr::SYSINFO => "sysinfo",
-        ring3::nr::FSTATFS => "fstatfs",
-        ring3::nr::STATFS => "statfs",
-        ring3::nr::UNLINKAT => "unlinkat",
-        ring3::nr::LINKAT => "linkat",
-        ring3::nr::SYMLINKAT => "symlinkat",
-        ring3::nr::RENAMEAT => "renameat",
-        ring3::nr::UTIMENSAT => "utimensat",
-        ring3::nr::MKDIRAT => "mkdirat",
-        ring3::nr::SOCKET => "socket",
-        ring3::nr::CONNECT => "connect",
-        ring3::nr::ACCEPT => "accept",
-        ring3::nr::SENDTO => "sendto",
-        ring3::nr::RECVFROM => "recvfrom",
-        ring3::nr::SENDMSG => "sendmsg",
-        ring3::nr::RECVMSG => "recvmsg",
-        ring3::nr::SHUTDOWN => "shutdown",
-        ring3::nr::BIND => "bind",
-        ring3::nr::LISTEN => "listen",
-        ring3::nr::GETSOCKNAME => "getsockname",
-        ring3::nr::GETPEERNAME => "getpeername",
-        ring3::nr::SETSOCKOPT => "setsockopt",
-        ring3::nr::GETSOCKOPT => "getsockopt",
-        ring3::nr::CLONE => "clone",
-        ring3::nr::EXECVE => "execve",
-        ring3::nr::EXIT => "exit",
-        ring3::nr::WAIT4 => "wait4",
-        ring3::nr::KILL => "kill",
-        ring3::nr::RT_SIGACTION => "rt_sigaction",
-        ring3::nr::RT_SIGPROCMASK => "rt_sigprocmask",
-        ring3::nr::PIPE2 => "pipe2",
-        ring3::nr::SELECT_PSELECT6 => "select/pselect6",
-        ring3::nr::SCHED_YIELD => "sched_yield",
-        ring3::nr::SET_TID_ADDRESS => "set_tid_address",
-        ring3::nr::GETDENTS64 => "getdents64",
-        ring3::nr::GETRANDOM => "getrandom",
-        ring3::nr::FACCESSAT => "faccessat",
-        ring3::nr::NEWFSTATAT => "newfstatat",
-        ring3::nr::CLOCK_GETTIME => "clock_gettime",
-        ring3::nr::CLOCK_NANOSLEEP => "clock_nanosleep",
-        ring3::nr::EXIT_GROUP => "exit_group",
-        ring3::nr::OPENAT => "openat",
-        ring3::nr::ARCH_PRCTL => "arch_prctl",
-        ring3::nr::GETTID => "gettid",
-        ring3::nr::SET_ROBUST_LIST => "set_robust_list",
-        ring3::nr::GETUID => "getuid",
-        ring3::nr::GETGID => "getgid",
-        ring3::nr::GETEUID => "geteuid",
-        ring3::nr::GETEGID => "getegid",
-        ring3::nr::GETPPID => "getppid",
-        ring3::nr::PR_LIMIT64 => "prlimit64",
-        ring3::nr::SIGALTSTACK => "sigaltstack",
-        ring3::nr::FUTEX => "futex",
-        ring3::nr::FCHDIR => "fchdir",
-        ring3::nr::CHDIR => "chdir",
-        ring3::nr::DUP2 | ring3::nr::DUP3 => "dup2/dup3",
-        ring3::nr::WAITPID => "akuma-waitpid",
-        ring3::nr::CLOSE_CHILD_STDIN => "akuma-close-child-stdin",
-        ring3::nr::UPTIME => "akuma-uptime",
-        _ => "?",
+        ring3::nr::WAITPID => return "akuma-waitpid".into(),
+        ring3::nr::CLOSE_CHILD_STDIN => return "akuma-close-child-stdin".into(),
+        ring3::nr::UPTIME => return "akuma-uptime".into(),
+        _ => {}
+    }
+    match akuma_syscalls_abi::Syscall::from_x86_64(nr) {
+        Some(s) => alloc::format!("{s:?}"),
+        None => "?".into(),
     }
 }
 
 /// Fill the x86_64 `struct stat` (144 bytes) at the task's `buf`: device
 /// numbers and all times zero (one disk, no clock), the rest from the
 /// arguments. `Err(errno)` on a bad task pointer.
-fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result<(), u64> {    if !user_ok(buf, 144) {
+///
+/// Trim step 2: the layout is `akuma_syscalls_abi::stat::X8664`'s now, with
+/// its `offset_of!` assertions (st_nlink 16, st_mode 24, st_size 48, ...) —
+/// the same hop amd64's glue runs (fill the asm-generic `Stat`, `to_x86_64`
+/// re-lays it). The literal offsets this used to spell are gone; the padding
+/// words and times stay zero, exactly as they were.
+fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result<(), u64> {
+    if !user_ok(buf, 144) {
         return Err(ring3::err::EFAULT);
     }
-    let mut st = [0u8; 144];
-    let le = |v: u64| v.to_le_bytes();
-    st[0..8].copy_from_slice(&le(0)); // st_dev
-    st[8..16].copy_from_slice(&le(inode)); // st_ino
-    st[16..24].copy_from_slice(&le(links)); // st_nlink
-    st[24..28].copy_from_slice(&mode.to_le_bytes()); // st_mode
-    st[28..32].copy_from_slice(&0u32.to_le_bytes()); // st_uid
-    st[32..36].copy_from_slice(&0u32.to_le_bytes()); // st_gid
-    st[40..48].copy_from_slice(&le(0)); // st_rdev
-    st[48..56].copy_from_slice(&le(size)); // st_size
-    st[56..64].copy_from_slice(&le(4096)); // st_blksize
-    st[64..72].copy_from_slice(&le(size.div_ceil(512))); // st_blocks
-    // st_atime/mtime/ctime + nsec (offsets 72..120): zero — no clock, as
-    // everywhere in this kernel; the unused tail (120..144) stays zero too.
-    if !copy_to_user(buf, &st) {
+    let st = akuma_syscalls_abi::stat::to_x86_64(&akuma_syscalls_linux::Stat {
+        st_ino: inode,
+        st_mode: mode,
+        st_nlink: links as u32,
+        st_size: size as i64,
+        st_blksize: 4096,
+        st_blocks: size.div_ceil(512) as i64,
+        ..Default::default()
+    });
+    if !copy_to_user(buf, struct_bytes(&st)) {
         return Err(ring3::err::EFAULT);
     }
     Ok(())
@@ -1948,34 +1895,41 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let mut scratch = [0u8; 1024];
             let mut used = 0usize;
             let mut res: Result<(), u64> = Ok(());
+            // Trim step 2: the `linux_dirent64` record shape is
+            // `akuma_syscalls_linux::dirent`'s — `reclen` is the crate's
+            // asserted alignment arithmetic and `encode` writes header, type,
+            // name, NUL and pad (the pad the scratch's zero-init used to be
+            // relied on for).
+            use akuma_syscalls_linux::dirent;
             let found = fd_table().update(fd as u32, |of| match of {
                 OpenFile::Dir { path: _, entries, cursor } => {
                     let cap = (len as usize).min(scratch.len());
                     while *cursor < entries.len() {
                         let ent = &entries[*cursor];
                         let name = ent.name.as_bytes();
-                        let reclen = (19 + name.len() + 1 + 7) & !7;
-                        if used + reclen > cap {
+                        let rl = dirent::reclen(name.len());
+                        if used + rl > cap {
                             if used == 0 {
                                 res = Err(ring3::err::EINVAL); // not even one fits
                             }
                             break;
                         }
-                        let rec = &mut scratch[used..used + reclen];
-                        rec[..8].copy_from_slice(&0u64.to_le_bytes());
-                        rec[8..16].copy_from_slice(&(*cursor as u64 + 1).to_le_bytes());
-                        rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
-                        rec[18] = if ent.is_dir {
-                            4 // DT_DIR
+                        let d_type = if ent.is_dir {
+                            dirent::DT_DIR
                         } else if ent.is_symlink {
-                            10 // DT_LNK
+                            dirent::DT_LNK
                         } else {
-                            8 // DT_REG
+                            dirent::DT_REG
                         };
-                        rec[19..19 + name.len()].copy_from_slice(name);
-                        rec[19 + name.len()] = 0;
+                        // `d_ino` is 0 — the listing carries names and kinds,
+                        // not inode numbers, and nothing on this path reads
+                        // them. `d_off` is the running cursor, a cookie that
+                        // only has to be monotonic within one open.
+                        let wrote =
+                            dirent::encode(&mut scratch[used..used + rl], 0, *cursor as i64 + 1, d_type, name);
+                        debug_assert!(wrote, "the window is exactly reclen(name)");
                         *cursor += 1;
-                        used += reclen;
+                        used += rl;
                     }
                 }
                 OpenFile::File { .. } | OpenFile::Socket(_) | OpenFile::ChildOut(_)
@@ -2022,10 +1976,14 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             if !user_ok(tp, 16) {
                 return e(ring3::err::EFAULT);
             }
-            let mut ts = [0u8; 16];
-            ts[0..8].copy_from_slice(&(us / 1_000_000).to_le_bytes());
-            ts[8..16].copy_from_slice(&((us % 1_000_000) * 1_000).to_le_bytes());
-            if !copy_to_user(tp, &ts) {
+            // Trim step 2: the wire shape is the crate's `Timespec`
+            // (`repr(C)`, 16 bytes), `from_bits` its word packing — the two
+            // u64 words musl reads go out unchanged.
+            let ts = akuma_syscalls_linux::time::Timespec::from_bits(
+                us / 1_000_000,
+                (us % 1_000_000) * 1_000,
+            );
+            if !copy_to_user(tp, struct_bytes(&ts)) {
                 return e(ring3::err::EFAULT);
             }
             0
@@ -2150,11 +2108,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::UNAME => {
-            // struct utsname: six NUL-terminated 65-byte fields. The release
-            // string is a plausible Linux one — apk prints it, nothing
-            // branches on it.
+            // struct utsname: six NUL-terminated 65-byte fields (the length
+            // is the crate's FIELD_LEN, which its own layout test pins). The
+            // release string is a plausible Linux one — apk prints it,
+            // nothing branches on it. Trim step 2: the field shape is
+            // `akuma_syscalls_linux::uts::Field` now — `set` zero-pads to
+            // exactly the 65 bytes the old `[0u8; 65]` literal did.
+            use akuma_syscalls_linux::uts;
             let buf = fr.arg1();
-            if !user_ok(buf, 65 * 6) {
+            if !user_ok(buf, (uts::FIELD_LEN * 6) as u64) {
                 return e(ring3::err::EFAULT);
             }
             let fields: [&[u8]; 6] = [
@@ -2165,12 +2127,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 b"x86_64\0",
                 b"(none)\0",
             ];
+            let mut out = [0u8; uts::FIELD_LEN * 6];
             for (i, f) in fields.iter().enumerate() {
-                let mut one = [0u8; 65];
-                one[..f.len()].copy_from_slice(f);
-                if !copy_to_user(buf + (i as u64) * 65, &one) {
-                    return e(ring3::err::EFAULT);
-                }
+                let mut one = uts::Field::empty();
+                let set = one.set(f);
+                debug_assert!(set.is_ok(), "utsname fields are under NAME_MAX");
+                out[i * uts::FIELD_LEN..(i + 1) * uts::FIELD_LEN].copy_from_slice(one.as_bytes());
+            }
+            if !copy_to_user(buf, &out) {
+                return e(ring3::err::EFAULT);
             }
             0
         }
@@ -2436,10 +2401,10 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 if !user_ok(tv, 16) {
                     return e(ring3::err::EFAULT);
                 }
-                let mut tvbuf = [0u8; 16];
-                tvbuf[0..8].copy_from_slice(&(us / 1_000_000).to_le_bytes());
-                tvbuf[8..16].copy_from_slice(&((us % 1_000_000) * 1_000).to_le_bytes());
-                if !copy_to_user(tv, &tvbuf) {
+                // Trim step 2: `Timeval` is the crate's shape (tv_usec, not
+                // tv_nsec — same clock, different second word).
+                let tvbuf = akuma_syscalls_linux::time::Timeval::from_bits(us / 1_000_000, us % 1_000_000);
+                if !copy_to_user(tv, struct_bytes(&tvbuf)) {
                     return e(ring3::err::EFAULT);
                 }
             } else if !user_ok(tv, 16) || !copy_to_user(tv, &[0u8; 16]) {

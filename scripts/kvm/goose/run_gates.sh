@@ -198,4 +198,38 @@ vline D2 "$(agg "$RCS")" d2.console
 D2_AFTER=$(dnsctr)
 note "dns_answered $D2_BEFORE -> $D2_AFTER"
 
+# W1 (stage 8 trim step 2): the guest's own wire-struct bytes must equal the
+# pre-refactor W0 baseline. The group is SELF-CONTAINED: it re-applies W0's
+# two /etc mutations first (G3's apk add - idempotent, exits 0 re-installed -
+# then H2's hostname echo, in that order, so the ext2 inode allocation sees
+# W0's sequence even if a mid-battery restart replaced the guest: 2026-10-26,
+# a W1 run on a post-restart guest without G3's install failed W1c on the
+# missing /etc/ssl). Probes are w0_capture.sh's; the busybox 1.35 in the serve
+# image has no `stat` applet (two execs exited 127 that day), so the nearest
+# applets stand in: ls -lin /etc/hostname (lstat -> fill_stat64: ino, nlink,
+# uid/gid, mode, size), df / (statfs), ls -l /etc (getdents64 + a stat per
+# entry), uname -a (utsname). Expected sha256 hashes, one line per probe in
+# this order: scripts/kvm/goose/w1_expected_hashes.txt (W0 recorded over three
+# fresh boots, identical in-boot second pass). Verdict per probe = guest-side
+# exit code (G3's pattern), not client capture.
+W1F=$REPO/scripts/kvm/goose/w1_expected_hashes.txt
+[ -f "$W1F" ] || fail_exit "no $W1F - W0 baseline missing"
+WA=$(sed -n 1p "$W1F"); WB=$(sed -n 2p "$W1F"); WC=$(sed -n 3p "$W1F"); WD=$(sed -n 4p "$W1F")
+rgroup W1 \
+  'w1m1=apk add --force-non-repository /pkgs/ca-certificates-bundle-20261020-r0.apk' \
+  'w1m2=sh -c "echo taoxi > /etc/hostname"' \
+  'w1r1=ls -lin /etc/hostname > /tmp/w1a' \
+  'w1r2=df / > /tmp/w1b' \
+  'w1r3=ls -l /etc > /tmp/w1c' \
+  'w1r4=uname -a > /tmp/w1d' \
+  'w1r5=sha256sum /tmp/w1a /tmp/w1b /tmp/w1c /tmp/w1d > /tmp/w1h' \
+  "w1a=grep -c $WA /tmp/w1h" \
+  "w1b=grep -c $WB /tmp/w1h" \
+  "w1c=grep -c $WC /tmp/w1h" \
+  "w1d=grep -c $WD /tmp/w1h"
+vline W1a "$(echo "$RCS" | cut -c8)" w1a.console
+vline W1b "$(echo "$RCS" | cut -c9)" w1b.console
+vline W1c "$(echo "$RCS" | cut -c10)" w1c.console
+vline W1d "$(echo "$RCS" | cut -c11)" w1d.console
+
 emit "GATES DONE restarts=$RESTARTED"
