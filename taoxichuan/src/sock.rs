@@ -677,6 +677,39 @@ pub fn getsockname_arm(fd: u64, addr_va: u64, addrlen_va: u64) -> u64 {
     0
 }
 
+/// `getpeername(fd, addr*, addrlen*)` — the connect(2) peer of a dgram fd
+/// (c-ares asks for it on the DNS socket; amd64 needed the same table row:
+/// docs/archive/AKUMA_AMD64_DNS_CONNECTED_UDP.md, BUG 4). Stream sockets
+/// answer their established remote.
+pub fn getpeername_arm(fd: u64, addr_va: u64, addrlen_va: u64) -> u64 {
+    const AF_INET: u16 = 2;
+    let Some(idx) = fd_socket(fd) else {
+        return crate::e(crate::err::ENOTSOCK);
+    };
+    let (ip, port) = if let Some(peer) = akuma_net::socket::socket_udp_peer(idx) {
+        (peer.ip().octets(), peer.port())
+    } else if let Some(d) = akuma_net::socket::debug_stream_peek(idx) {
+        match d.remote {
+            Some(remote) => remote,
+            None => return crate::e(crate::err::ENOTCONN),
+        }
+    } else {
+        return crate::e(crate::err::ENOTCONN);
+    };
+    let mut sa = [0u8; 16];
+    // sin_family is host byte order (see getsockname_arm).
+    sa[0..2].copy_from_slice(&AF_INET.to_ne_bytes());
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    sa[4..8].copy_from_slice(&ip);
+    if !crate::copy_to_user(addr_va, &sa) {
+        return crate::e(crate::err::EFAULT);
+    }
+    if addrlen_va != 0 && !crate::copy_to_user(addrlen_va, &16u32.to_le_bytes()) {
+        return crate::e(crate::err::EFAULT);
+    }
+    0
+}
+
 pub fn shutdown_arm(fd: u64, how: u64) -> u64 {    let Some(idx) = fd_socket(fd) else {
         return crate::e(crate::err::ENOTSOCK);
     };

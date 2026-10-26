@@ -2741,6 +2741,11 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // servers" and the transfer dies curl: (6) before dialing.
             sock::getsockname_arm(fr.arg1(), fr.arg2(), fr.arg3())
         }
+        ring3::nr::GETPEERNAME => {
+            // c-ares's next question after getsockname (same session; the
+            // amd64 box needed this row for the same caller).
+            sock::getpeername_arm(fr.arg1(), fr.arg2(), fr.arg3())
+        }
         other => {
             // Name the gap: a guest task hit a number this table does not
             // serve. The name first, then the raw number — each boot reads
