@@ -60,7 +60,8 @@ cp /boot/akuma-dev-root-apk.img.orig "$IMG_DST" || fail "fresh image copy"
 # symlink line in the SERVE list). The .orig is never touched.
 ENSURE=$REPO/userspace/target/x86_64-unknown-linux-musl/release/devroot-ensure
 [ -x "$ENSURE" ] || fail "no devroot-ensure binary (cargo build -p ext2probe --bin devroot-ensure --no-default-features --features host-probe --target x86_64-unknown-linux-musl --release, in userspace/)"
-"$ENSURE" "$IMG_DST" >>"$L" 2>&1 || fail "devroot-ensure""$REPO/scripts/install_kernel_amd64.sh" "$KERNEL" /boot/akuma-guest-dev >>"$L" 2>&1 \
+"$ENSURE" "$IMG_DST" >>"$L" 2>&1 || fail "devroot-ensure"
+"$REPO/scripts/install_kernel_amd64.sh" "$KERNEL" /boot/akuma-guest-dev >>"$L" 2>&1 \
   || fail "kernel install"
 herd start vm-dev >>"$L" 2>&1 || fail "herd start"
 
