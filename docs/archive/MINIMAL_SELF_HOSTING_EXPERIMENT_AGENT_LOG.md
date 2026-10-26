@@ -991,7 +991,7 @@ extract into a crate first where the logic still lives in `amd64/src/`; the goal
 the briefs for stages 1-4 and silently left out of 06a, 06b, 06c, 07, 07b and 07c-draft. The supervisor (Sonnet) wrote each brief from
 the previous session's result and never re-read the doc's pinned sections. The owner noticed from the size of the kernel source.
 
-**What it cost (measured, `git diff --numstat 29d4b562 b7646dd9`).** Stages 6-7 added **+1,198 net hand-written lines in `taoxichuan/`**
+**What it cost (measured, `git diff --numstat 29d4b562 b7646dd9`).** Stages 6-7 added **+1,198 net newly written lines in `taoxichuan/`**
 (`main.rs` +911, `sock.rs` +129, `child.rs` +158; `taoxichuan/src` 3,268 -> 4,466) against **+252 in `crates/`** (`akuma-ring3-amd64` +170 loader,
 `akuma-net` +70 the connect-trace helper), **zero new crates, zero lines changed in `amd64/` or `src/`**: nothing was extracted, and
 `dup2`/`dup3`, `utimensat`, `access`, the `writev` family, `/dev/null`, the socket arms and the exec/argv work were all written again for a
@@ -1009,4 +1009,60 @@ During the stage 7C planning session goose also noted that `taoxichuan/src/net.r
 - Process rule for the supervisor: **diff every brief against the template and the pinned doc sections before sending; verify each gate address
   and command against a doc or a passing run** (the stage 7A `10.0.2.2` gate was the same class of lapse). Saved to the supervisor's memory.
 - Honest scope for the claim: stages 6-7 as run do not demonstrate "composed from existing crates"; they demonstrate a working but
-  hand-written kernel. The trim sessions are what recover the claim, and the line counts per session will show whether they do.
+  a kernel the model wrote new instead of assembling it from crates. The trim sessions are what recover the claim, and the line counts per session will show whether they do.
+
+### Methodology pivot (2026-10-26): assemble from the leaf crates amd64 already uses; survey before every milestone
+
+*Terminology: every line in this experiment is written by the model (goose-glm); "newly written" means code the model wrote new, as opposed to code reused from an existing crate by dependency, extraction or a feature cut.*
+
+**Where the pivot comes from.** The owner's reading, after stage 7 session D: the minimal kernel should be built the way the amd64 kernel was built, by taking the
+existing crates and cutting them (seams or features) down to the requirement, not by growing `taoxichuan/src` with newly written code. That is the project's own method
+(`akuma-exec-core`, `akuma-sntp` cut out of `akuma-syscalls-time` "so this target could reach it without also needing that crate's `akuma-exec` dependency",
+`akuma-pipe`, `akuma-fdtable`, `akuma-syscalls-{poll,mem,net,sync}`), and it is why the amd64 kernel exists at all, so feasibility is not in question.
+
+**What the evidence shows we were doing instead.** `taoxichuan/Cargo.toml` has 17 `akuma-*` dependencies; `amd64/Cargo.toml` has about 70. The crates amd64 uses and
+Taoxichuan does not include exactly what the rest of stage 6 needs: `akuma-sntp` and `akuma-cmos-rtc` (clock), `akuma-syscalls-poll` (the `select`/`ppoll` apk waits on),
+`akuma-syscalls-mem`, `akuma-syscalls-net`, `akuma-syscalls-{linux,abi}` (wire structs), `akuma-pipe`, `akuma-exec-core`, `akuma-port`, `akuma-tty`. The stage-7 trim
+plan (session C) checked 11 crates and classed anything welded to `Process`/`akuma-exec` as "keep (no callable twin)"; it never considered cutting the weld, because the
+brief offered only *depend / extract into a new crate / write new*. `akuma-syscalls-glue` itself has 28 path dependencies and every one of its features is a syscall-family
+toggle; none makes `akuma-exec` optional, so that particular cut does not exist yet and someone has to make it (cost unmeasured). Session D then added ~160 lines of
+gate-forced surface (`readv`, `F_DUPFD`, exec-keeps-fds, traces), each correct, each the kind of thing the crates already carry.
+
+**What changes from here.**
+1. **Survey first.** Every plan starts with the `diff` of amd64's `akuma-*` dependencies against Taoxichuan's, and names, per milestone, which unused crate covers it
+   (BRIEF_TEMPLATE § Composition rule 3b; also sent to the running stage 7E session as a steer, since its brief predated this).
+2. **Cut, don't copy.** Where the useful logic is welded to the process model, the plan says whether a pure leaf crate (as `akuma-sntp`) or a cargo feature frees it and what that
+   costs; "keep (welded)" needs that justification, not a shrug.
+3. **Count it.** Per session: crates pulled / extracted / cut / written new, `taoxichuan/src` lines before and after, and the number of `akuma-*` dependencies (17 at the start
+   of this pivot; 4,608 lines after stage 7D). If the pivot works, dependencies go up and `taoxichuan/src` goes down.
+4. **Honest limit.** The write-it-new route got stages 1-6 (offline) and H1 working in ~14 goose-hours; the pivot trades some of that speed for the claim the experiment
+   exists to test. The next sessions (7E plan, then execution) are the first measurement of what that trade costs.
+
+### Stage 7 sessions D-G (2026-10-26): execution, tooling, verdict, plan - all of stage 7's gates green; the cost drop
+
+**Result.** After session D (trim steps 0-1 plus three gate-forced fd-family fixes: `readv`, `F_DUPFD`, exec keeps open fds; `taoxichuan-s4` @ `0ecb1611`), sessions E-G wrote the
+gate tooling, got the definitive verdict and closed the last failing gate. `scripts/kvm/goose/run_gates.sh` on `2f2520a4` printed **`PASS` for G1 G2 G3 G4 H1 H2 H3a H3b H3c in one boot,
+`restarts=0`**. The last fix was G4 (`lstat` resolved the *parent* through the symlink chain, `2f2520a4`), which made `taoxichuan/src` **smaller** (4,608 -> 4,581 lines; the collapse of a
+duplicated `LSTAT` arm). `taoxichuan/src` over the whole stage: 4,450 (start of 7D) -> 4,608 (after the gate-forced arms) -> 4,581. `akuma-*` dependencies: 18 (17 plus `akuma-net-nic`).
+Session G's plan for the rest of stage 6 (`docs/archive/TAOXICHUAN_STAGE6_REST_PLAN.md`) opens with the leaf-crate survey the pivot asked for: 60 amd64-only crates checked, the relevant ones
+named per milestone.
+
+**Cost (goose `sessions.db`, input tokens).** D: 218 tool calls, 25.2M, about 116k per call. E (tooling + the first battery): 53 calls, 1.4M, about 26k per call. F (two stalled starts and the
+G4 fix): about 75 calls, 2.4M. G (leak answer, ops, plan): about 60 calls, 1.7M. **E+F+G together about 6.1M against D's 25.2M**, with more closed. What changed: (1) one `boot_dev.sh` and one
+`run_gates.sh` instead of dozens of hand-driven boot/ssh calls (the gate/ops categories were about 45% of D's calls); (2) the brief's read cap (`| cut -c1-180 | head -60`; reading was 73% of D's
+carried context cost); (3) fresh contexts per job; (4) a mock-verified script before burning a boot.
+
+**What the tooling found (ops, all recorded for the next sessions).**
+- herd re-parses a conf only on `disable` then `enable`, and a config reload can create a **second guest** about 20 s after `enable` (session E); `boot_dev.sh` re-probes for the survivor.
+- The `vm-dev.conf.stage7-hostrelay` snapshot had been clobbered byte-identical to stage4 (no `vm_outbound`): the conf template is now tracked in git.
+- The ssh client capture loses output; evidence is console-first (`[SSH] Exit status`), and the host forward degrades near 30 connections per boot. Session G's read-only answer to "which side leaks":
+  the guest's close chain is complete in code (sshd drops the session, `close(fd)`, `sock::close_arm`, `remove_socket`) and one boot showed 15 accepts and 15 exits with the relay's two forward slots
+  reused 15 times and no refusals; so the ceiling is upstream of guest accept, host-side as RESULT-D said. **Not settled by a counter**: the status line has no forward-slot counter; the
+  settling experiment is `scripts/kvm/relay_stress.py` past 40 connections with a per-slot dump.
+
+**What the supervisor got wrong, and the goose-side hangs (an hour lost).** Session F stalled four times with no output. Causes found: (a) `herd stop goose-glm` kills only the wrapper, so
+`goose-cli-main` servers from earlier restarts survived and shared the session database ("Address in use" x241 in the log): stop must kill every `goose serve` pid; (b) the supervisor's own
+`python3 -` / heredoc invocations became interactive REPLs on this box's shell and hung for hours (three of them), and a copy of the WAL file by `cat` over a dead ssh left an unkillable `cat`;
+(c) sending the whole 8 KB brief as the *prompt* stalled the first model call of two sessions while the same text delivered as a file the agent reads in 60-line windows
+(`/root/dev-cycle/taoxichuan-s7/BRIEF-*.md`, a 3-line prompt) started at once. The practice from here: **brief as a file on the box, short prompt, `python3 file.py < /dev/null`, one
+clean goose server.**

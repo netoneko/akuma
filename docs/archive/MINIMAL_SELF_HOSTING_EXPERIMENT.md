@@ -119,7 +119,7 @@ the previous `RESULT` files). From stage 7B on every goose session follows this:
 5. **The composition rule travels in every brief** (template § "Composition rule"): look in `crates/` and `amd64/src/` before
    writing, depend on or extract rather than copy, and report pulled / extracted / written-new plus `taoxichuan/src` line counts
    per session. It was in briefs 01-04 and silently dropped from 06a on; by stage 7 the composition root had grown to 4,450
-   hand-written lines (`main.rs` 2,928). A rule stated once at the top of a doc is not a rule the agent sees; it has to be in the brief.
+   newly written lines (`main.rs` 2,928). A rule stated once at the top of a doc is not a rule the agent sees; it has to be in the brief.
 6. **Changes are one at a time where possible.** 7B changed three things at once (docs list, corrected gate, event-based
    commit rule), so its numbers against 7A show a difference, not a cause; say so in the log rather than crediting the docs.
    With one run per stage there is no statistics, only a record that makes the next brief better.
