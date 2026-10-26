@@ -1048,8 +1048,13 @@ fn lstat_path(path: &str, buf: u64) -> u64 {
     if name.is_empty() {
         stat_path(path, buf)
     } else {
+        // Linux resolves every component but the last: the parent may name
+        // a symlink (`/etc/ssl1.1/certs` -> `/etc/ssl/certs`), so it goes
+        // through the same chain walker `stat` uses; only the final name is
+        // then served from the resolved parent's listing, unfollowed.
+        let parent = resolve_effective(parent);
         let fs = root_fs();
-        let Ok(entries) = fs.read_dir(parent) else {
+        let Ok(entries) = fs.read_dir(&parent) else {
             return e(ring3::err::ENOENT);
         };
         let Some(ent) = entries.iter().find(|e| e.name == name) else {
@@ -1790,39 +1795,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
-            let Some(idx) = path.rfind('/') else {
-                return e(ring3::err::ENOENT);
-            };
-            let (parent, name) = (&path[..idx.max(1)], &path[idx + 1..]);
-            if name.is_empty() {
-                // The root itself (or a trailing slash): nothing to not-follow.
-                match root_fs().metadata(path) {
-                    Ok(md) => match fill_stat64(buf, md.inode, md.mode, md.size, 2) {
-                        Ok(()) => 0,
-                        Err(no) => e(no),
-                    },
-                    Err(_) => e(ring3::err::ENOENT),
-                }
-            } else {
-                let fs = root_fs();
-                let Ok(entries) = fs.read_dir(parent) else {
-                    return e(ring3::err::ENOENT);
-                };
-                let Some(ent) = entries.iter().find(|e| e.name == name) else {
-                    return e(ring3::err::ENOENT);
-                };
-                let mode = if ent.is_symlink {
-                    0o120777 // S_IFLNK | rwxrwxrwx: the convention for links
-                } else if ent.is_dir {
-                    0o40755
-                } else {
-                    0o100644
-                };
-                match fill_stat64(buf, 0, mode, ent.size, if ent.is_dir { 2 } else { 1 }) {
-                    Ok(()) => 0,
-                    Err(no) => e(no),
-                }
-            }
+            lstat_path(path, buf)
         }
         ring3::nr::FCNTL => {
             // The fd-flag commands only; the table owns the cloexec bit.
