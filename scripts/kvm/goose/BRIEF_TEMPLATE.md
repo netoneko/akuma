@@ -24,6 +24,9 @@ A WRONG row that changes the plan is reported to the owner as soon as you commit
 |---|---|---|---|
 | 1 | <e.g. the reference value is X> | `<command>` | <output> |
 
+## Symptom first (when a gate fails, before any source read or new probe)
+`grep -n -i "<the error text you saw>" docs/README.md docs/runbooks/*.md` and read the matching row and the archive doc it links. The symptom matrix records fixed bugs with the exact syscall sequence that exposed them; session Q spent three sessions and about 15M tokens re-finding what the row for `Could not contact DNS servers` (`docs/README.md`) and `docs/archive/AKUMA_AMD64_DNS_CONNECTED_UDP.md` already say (c-ares `connect`s a UDP socket and then `send`s, and calls `getsockname`/`getpeername`), and its three docs reads were all one `kvm.md` section. Write the matching rows (or "no row") in RESULT-X.md before you add a probe.
+
 ## Probe discovery (before you write any probe, gate or script)
 List what already exists that exercises this capability, and run the cheapest one first. Search, in this order, and write the hit list (path, what it checks, how to run it, what it printed) in RESULT-X.md: (1) `userspace/*probe*` and `userspace/forktest/c_stress/` (syscall behaviour, differential against Linux); (2) `scripts/*_suite.py` and
 `scripts/benchmarks/` (futex, epoll, mem suites run the same static binary on Linux and Akuma); (3) host tests in the crate that owns the logic (`cargo test -p <crate> --target $HOST`); (4) `scripts/kvm/goose/run_gates.sh` groups (reuse a gate's shape; do not invent a new verdict style); (5) a binary that already runs on the full amd64 kernel on this box (the **reference behaviour** for a gate can be measured there
