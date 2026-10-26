@@ -543,6 +543,7 @@ pub fn sendto_arm(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, dest_len:
         return crate::e(crate::err::EFAULT);
     }
     let nonblock = fd_nonblock(fd);
+    akuma_primitives::safe_print!(96, "  [tmp] sendto fd={} len={} dest={:#x} dlen={} udp={}\n", fd, len, dest, dest_len, akuma_net::socket::is_udp_socket(idx));
     // Stage-7 probe: a TCP send whose payload opens an HTTP request.
     if !akuma_net::socket::is_udp_socket(idx)
         && len >= 4
@@ -561,11 +562,18 @@ pub fn sendto_arm(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, dest_len:
             Some(sa) => sa,
             None if dest == 0 || dest_len == 0 => match akuma_net::socket::socket_udp_peer(idx) {
                 Some(sa) => sa,
-                None => return crate::e(crate::err::ENOTCONN),
+                None => {
+                    akuma_primitives::safe_print!(96, "  [tmp] sendto udp ENOTCONN fd={} idx={}\n", fd, idx);
+                    return crate::e(crate::err::ENOTCONN);
+                }
             },
             None => return crate::e(crate::err::EINVAL),
         };
-        akuma_net::socket::socket_send_udp(idx, &data, sa)
+        let r = akuma_net::socket::socket_send_udp(idx, &data, sa);
+        akuma_primitives::safe_print!(96, "  [tmp] sendto udp fd={} idx={} {}.{}.{}.{}:{} len={} rc={}\n",
+            fd, idx, sa.ip[0], sa.ip[1], sa.ip[2], sa.ip[3], sa.port, len,
+            match r { Ok(n) => n as u64, Err(e) => -i64::from(e) as u64 });
+        r
     } else {
         akuma_net::socket::socket_send(idx, &data, nonblock)
     };
@@ -618,6 +626,10 @@ pub fn recvfrom_arm(fd: u64, buf: u64, len: u64, _flags: u64, src: u64, src_len_
     } else {
         akuma_net::socket::socket_recv(idx, &mut data, nonblock)
     };
+    if akuma_net::socket::is_udp_socket(idx) {
+        akuma_primitives::safe_print!(96, "  [tmp] recvfrom udp fd={} nb={} len={} rc={}\n", fd, nonblock, len,
+            match r { Ok(n) => n as u64, Err(e) => -i64::from(e) as u64 });
+    }
     match r {
         Ok(n) => {
             if !crate::copy_to_user(buf, &data[..n]) {
@@ -728,8 +740,17 @@ pub fn write_arm(fd: u64, buf: u64, len: u64) -> u64 {
     // talk. Unconnected: ENOTCONN, the answer Linux gives. (stage 8, M2)
     let r = if akuma_net::socket::is_udp_socket(idx) {
         match akuma_net::socket::socket_udp_peer(idx) {
-            Some(sa) => akuma_net::socket::socket_send_udp(idx, &data, sa),
-            None => Err(crate::err::ENOTCONN as i32),
+            Some(sa) => {
+                let r = akuma_net::socket::socket_send_udp(idx, &data, sa);
+                akuma_primitives::safe_print!(96, "  [tmp] write udp fd={} idx={} {}.{}.{}.{}:{} len={} rc={}\n",
+                    fd, idx, sa.ip[0], sa.ip[1], sa.ip[2], sa.ip[3], sa.port, len,
+                    match r { Ok(n) => n as u64, Err(e) => -i64::from(e) as u64 });
+                r
+            }
+            None => {
+                akuma_primitives::safe_print!(96, "  [tmp] write udp ENOTCONN fd={} idx={}\n", fd, idx);
+                Err(crate::err::ENOTCONN as i32)
+            }
         }
     } else {
         akuma_net::socket::socket_send(idx, &data, fd_nonblock(fd))
