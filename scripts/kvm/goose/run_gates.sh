@@ -75,12 +75,22 @@ fail_exit() { emit "ABORT $*"; exit 1; }
 # gate <name> <cmd>: one exec, console-first verdict.
 # G_rc: 0 pass (console Exit status: 0), 1 fail (nonzero status), 2 unknown
 # (no exit line). G_dead: 1 if the console never showed the accepted conn.
+# The console slice must survive a log rotation mid-exec (herd re-parses on
+# enable and rotates; seen 2026-10-26 as 0-byte slices and a lost verdict):
+# if the active log SHRANK since "before", the rotation happened - take the
+# frozen .old's tail plus the fresh active log in full; else the plain delta.
 gate() {
   name=$1; cmd=$2
+  before_old=$(wc -c < "$LOG.old" 2>/dev/null || echo 0)
   before=$(wc -c < "$LOG")
   run_ssh "$cmd" >"$OUT/$name.client" 2>&1 </dev/null
   sleep "$PACE"   # console drain + connection pacing in one
-  tail -c +$((before+1)) "$LOG" >"$OUT/$name.console" 2>/dev/null
+  if [ "$(wc -c < "$LOG")" -lt "$before" ]; then
+    { tail -c +$((before_old+1)) "$LOG.old" 2>/dev/null; cat "$LOG"; } \
+      >"$OUT/$name.console" 2>/dev/null
+  else
+    tail -c +$((before+1)) "$LOG" >"$OUT/$name.console" 2>/dev/null
+  fi
   if grep -q 'Exit status: 0' "$OUT/$name.console"; then G_rc=0
   elif grep -q 'Exit status:' "$OUT/$name.console"; then G_rc=1
   else G_rc=2; fi
@@ -215,6 +225,41 @@ vline D2 "$(agg "$RCS")" d2.console
 D2_AFTER=$(dnsctr)
 note "dns_answered $D2_BEFORE -> $D2_AFTER"
 
+# A-group (stage 8 M3): `apk update` in the guest, signed (U1: the three
+# official alpine-devel keys ARE in /etc/apk/keys), against the frozen LAN
+# mirror - which is ALREADY up (started at the top of the battery; every
+# network-enabled apk exec needs it, see the note there). The group sits
+# right after D2 per the brief - and before W1's 11 execs, so the new gates
+# run at lower connection counts, clear of the ~30-connection forward
+# degradation.
+
+# A1: the repositories file is exactly the mirror line - put on the per-boot
+# COPY by boot_dev.sh through devroot-ensure; the .orig stays unmodified.
+# grep -cx: exit 0 iff one whole line matches (no comment lines left).
+rgroup A1 'a1=grep -cx http://192.168.1.159:8123/main /etc/apk/repositories'
+vline A1 "$(agg "$RCS")" a1.console
+
+# A2: ONE apk update, no flags - the guest's own repositories and keys.
+# Console exit 0 is the verdict; the mirror's request log gaining the index
+# GET is cross-checked host-side (a lost client capture cannot fake it).
+MLOG=/tmp/alpine-mirror-8123.log
+mreq() { grep -c 'GET /main/x86_64/APKINDEX.tar.gz' "$MLOG" 2>/dev/null; }
+A2_BEFORE=$(mreq)
+rgroup A2 'a2=apk update'
+rcA2=$(agg "$RCS")
+A2_AFTER=$(mreq)
+note "mirror APKINDEX GETs $A2_BEFORE -> $A2_AFTER"
+[ "${A2_AFTER:-0}" -le "${A2_BEFORE:-0}" ] && rcA2=1
+vline A2 "$rcA2" a2.console
+
+# A3: the downloaded bytes are the mirror's. Judge by content, not name -
+# the cache name's 8-hex is a hash of the repository URL, so the guest's
+# name differs from the Linux reference's (same sha256 does not).
+rgroup A3 \
+  'a3a=sha256sum /var/cache/apk/APKINDEX.*.tar.gz > /tmp/h' \
+  'a3b=grep -c c169fa06 /tmp/h'
+vline A3 "$(agg "$RCS")" "a3a.console a3b.console"
+
 # W1 (stage 8 trim step 2): the guest's own wire-struct bytes must equal the
 # pre-refactor W0 baseline. The group is SELF-CONTAINED: it re-applies W0's
 # two /etc mutations first (G3's apk add - idempotent, exits 0 re-installed -
@@ -248,38 +293,6 @@ vline W1a "$(echo "$RCS" | cut -c8)" w1a.console
 vline W1b "$(echo "$RCS" | cut -c9)" w1b.console
 vline W1c "$(echo "$RCS" | cut -c10)" w1c.console
 vline W1d "$(echo "$RCS" | cut -c11)" w1d.console
-
-# A-group (stage 8 M3): `apk update` in the guest, signed (U1: the three
-# official alpine-devel keys ARE in /etc/apk/keys), against the frozen LAN
-# mirror - which is ALREADY up (started at the top of the battery; every
-# network-enabled apk exec needs it, see the note there).
-
-# A1: the repositories file is exactly the mirror line - put on the per-boot
-# COPY by boot_dev.sh through devroot-ensure; the .orig stays unmodified.
-# grep -cx: exit 0 iff one whole line matches (no comment lines left).
-rgroup A1 'a1=grep -cx http://192.168.1.159:8123/main /etc/apk/repositories'
-vline A1 "$(agg "$RCS")" a1.console
-
-# A2: ONE apk update, no flags - the guest's own repositories and keys.
-# Console exit 0 is the verdict; the mirror's request log gaining the index
-# GET is cross-checked host-side (a lost client capture cannot fake it).
-MLOG=/tmp/alpine-mirror-8123.log
-mreq() { grep -c 'GET /main/x86_64/APKINDEX.tar.gz' "$MLOG" 2>/dev/null; }
-A2_BEFORE=$(mreq)
-rgroup A2 'a2=apk update'
-rcA2=$(agg "$RCS")
-A2_AFTER=$(mreq)
-note "mirror APKINDEX GETs $A2_BEFORE -> $A2_AFTER"
-[ "${A2_AFTER:-0}" -le "${A2_BEFORE:-0}" ] && rcA2=1
-vline A2 "$rcA2" a2.console
-
-# A3: the downloaded bytes are the mirror's. Judge by content, not name -
-# the cache name's 8-hex is a hash of the repository URL, so the guest's
-# name differs from the Linux reference's (same sha256 does not).
-rgroup A3 \
-  'a3a=sha256sum /var/cache/apk/APKINDEX.*.tar.gz > /tmp/h' \
-  'a3b=grep -c c169fa06 /tmp/h'
-vline A3 "$(agg "$RCS")" "a3a.console a3b.console"
 
 "$REPO/scripts/kvm/goose/mirror.sh" stop >>"$OUT/gates-E.err" 2>&1 || true
 
