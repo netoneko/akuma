@@ -28,6 +28,18 @@
 # (mirror.sh start verifies the manifest first and aborts the run on a
 # mismatch; stop at the end), and the downloaded index byte-equal to the
 # mirror's APKINDEX.tar.gz (guest-side sha grep, G3's pattern).
+# A3 (stage 8 M3) is the mirror cross-check pattern, B1-B4 (stage 8 M4)
+# reuse it (below).
+# B1-B4 (stage 8 M4): the M4 group runs as a SECOND boot (arg 2 = "b"): the
+# main battery is already at the ~30-connection forward ceiling, and the B
+# group's 10 execs belong on a fresh guest (apk add curl's 12.6 MB closure
+# would also change the disk state W1b's df hash covers). B1 ONE unflagged
+# `apk add curl` (the guest's own repositories and keys; the mirror is up
+# from the start of the battery) with the mirror request log cross-check;
+# B2 `grep -cx curl /etc/apk/world`; B3 the six reference sha256 prefixes as
+# guest-side greps (G3's pattern); B4 `apk verify curl` (apk's own integrity
+# check of what it unpacked). Nothing unpacked is EXECUTED (curl is a
+# dynamic PIE; the loader work is M5).
 # Pacing: 15 s between execs, one exec per ssh connection - the host forward
 # degrades at ~30 connections per boot. If an exec's console slice shows no
 # "[SSHD] Accepted connection" while port 2224 still accepted it, the forward
@@ -45,6 +57,7 @@ REPO=/src/github.com/netoneko/akuma
 OUT=/root/dev-cycle/taoxichuan-s7
 LOG=/var/log/herd/vm-dev.log
 KERNEL=${1:-/root/ktarget/x86_64-unknown-none/release/taoxichuan}
+GROUP=${2:-main}   # main = G1..W1 battery; b = the M4 apk-add-curl group
 SSHPORT=2224
 # The host ssh is akuma's own client (no -o flags, pubkey auth only); it must
 # be invoked unquoted-word-free, i.e. via this function, never via "$VAR".
@@ -150,6 +163,39 @@ vline() { # vline <gate> <rc> <evidence>
 }
 
 # --- the battery -------------------------------------------------------------
+if [ "$GROUP" != main ]; then
+  # B group (stage 8 M4), on its own boot: fresh disk, mirror already up
+  # (started above). One command per exec - sh cannot fork.
+  MLOG=/tmp/alpine-mirror-8123.log
+  breq() { grep -c 'GET /main/x86_64/' "$MLOG" 2>/dev/null; }
+  B1_BEFORE=$(breq)
+  rgroup B1 'b1=apk add curl'
+  rcB1=$(agg "$RCS")
+  B1_AFTER=$(breq)
+  note "mirror apk GETs $B1_BEFORE -> $B1_AFTER"
+  [ "${B1_AFTER:-0}" -le "${B1_BEFORE:-0}" ] && rcB1=1
+  vline B1 "$rcB1" b1.console
+
+  rgroup B2 'b2=grep -cx curl /etc/apk/world'
+  vline B2 "$(agg "$RCS")" b2.console
+
+  # B3: the unpacked bytes equal the Linux reference (guest-side hashes; the
+  # prefixes are RESULT-M's reference values). ld-musl: apk may replace the
+  # image's own with the same version's bytes - the hash is how we would SEE
+  # a replacement; nothing here is executed.
+  rgroup B3 \
+    'b3a=sha256sum /usr/bin/curl /usr/lib/libcurl.so.4.8.0 /usr/lib/libssl.so.3 /usr/lib/libcrypto.so.3 /usr/lib/libz.so.1.3.2 /lib/ld-musl-x86_64.so.1 > /tmp/h' \
+    'b3b=grep -c 9eb8284f /tmp/h' \
+    'b3c=grep -c 1ee39403 /tmp/h' \
+    'b3d=grep -c ed8d3040 /tmp/h' \
+    'b3e=grep -c bb2d86be /tmp/h' \
+    'b3f=grep -c ecc8b9df /tmp/h' \
+    'b3g=grep -c 095b047c /tmp/h'
+  vline B3 "$(agg "$RCS")" "b3a.console b3g.console"
+
+  rgroup B4 'b4=apk verify curl'
+  vline B4 "$(agg "$RCS")" b4.console
+else
 rgroup G1 'g1=sh -c "echo hi"'
 vline G1 "$(agg "$RCS")" g1.console
 
@@ -294,6 +340,11 @@ vline W1b "$(echo "$RCS" | cut -c9)" w1b.console
 vline W1c "$(echo "$RCS" | cut -c10)" w1c.console
 vline W1d "$(echo "$RCS" | cut -c11)" w1d.console
 
+fi  # GROUP=main
+
 "$REPO/scripts/kvm/goose/mirror.sh" stop >>"$OUT/gates-E.err" 2>&1 || true
 
-emit "GATES DONE restarts=$RESTARTED"
+case "$GROUP" in
+  main) emit "GATES DONE restarts=$RESTARTED" ;;
+  *)    emit "GATES DONE (group $GROUP) restarts=$RESTARTED" ;;
+esac
