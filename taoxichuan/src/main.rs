@@ -1089,27 +1089,61 @@ fn lstat_path(path: &str, buf: u64) -> u64 {
     }
 }
 
-/// Fill the x86_64 `struct statfs` (120 bytes): ext2's magic `0xEF53` and
-/// plausible counts — aarch64 measured that `ENOSYS` here made apk treat
-/// later operations as forbidden, so this arm must exist and look sane.
+/// Fill the x86_64 `struct statfs` (120 bytes) from the real ext2 superblock
+/// via `Filesystem::stats` (akuma-ext2): f_type 0xEF53 and the mount's actual
+/// block geometry — aarch64 measured that `ENOSYS` here made apk treat later
+/// operations as forbidden, and until M4 the fixed 16 MiB answer made apk's
+/// free-space check refuse the 12.6 MB curl closure on the 1 GiB image.
 fn fill_statfs(buf: u64) -> u64 {
     if !user_ok(buf, 120) {
         return e(ring3::err::EFAULT);
     }
     // Trim step 2: `akuma_syscalls_linux::Statfs`, whose 120-byte size the
-    // crate asserts (musl copies `f_spare` too). Same numbers the deleted
-    // slot-writer spelled; `f_fsid` stays zero, nothing reads it.
+    // crate asserts (musl copies `f_spare` too). Blocks are the superblock's
+    // own numbers; bavail = bfree (ext2's reserved-block count is not part of
+    // the shared `FsStats`). f_fsid stays zero, nothing reads it; f_files /
+    // f_ffree stay plausible (akuma-ext2 keeps the inode counts `pub(crate)`
+    // and neither df nor apk reads them without `df -i`).
+    let Ok(st) = root_fs().stats() else {
+        return e(ring3::err::EIO);
+    };
+    // M4: the real superblock numbers on the console, EVERY statfs call.
+    // Once-per-boot got rotated away before the gate could read it (herd
+    // REPLACES vm-dev.log.old mid-boot; observed twice 2026-10-26): a line
+    // per call lets the B gates read their OWN console slices, which gate()
+    // already collects rotation-proof. Bounded: init, apk's free-space
+    // checks, stray df attempts - single digits per boot.
+    // The guest has no procfs and this busybox build ignores /etc/mtab, so
+    // df can never print a row here (RESULT-M: the W1b df hash is the header
+    // line's bytes and always was) - this line is the only direct view of
+    // what apk's free-space check reads.
+    // tstamp: the anchored wall clock - the Statfs gate only accepts lines
+    // at or after THIS boot's epoch (a previous boot's line always predates
+    // it), so a stale line can never fake a PASS.
+    let ts = akuma_primitives::clock::utc_time_us(net::uptime_us())
+        .unwrap_or(0)
+        / 1_000_000;
+    akuma_primitives::safe_print!(
+        128,
+        "[statfs] blocks={} bsize={} free={} bavail={} tstamp={} (real ext2 superblock)\n",
+        st.total_blocks,
+        st.block_size,
+        st.free_blocks,
+        st.free_blocks,
+        ts
+    );
+    let bs = st.block_size as i64;
     let s = akuma_syscalls_linux::Statfs {
         f_type: 0xEF53,
-        f_bsize: 4096,
-        f_blocks: 4096, // 16 MiB / 4 KiB
-        f_bfree: 2053,  // the fresh image's free-block count
-        f_bavail: 2053,
+        f_bsize: bs,
+        f_blocks: st.total_blocks as i64,
+        f_bfree: st.free_blocks as i64,
+        f_bavail: st.free_blocks as i64,
         f_files: 4096,
         f_ffree: 2048,
         f_fsid: [0, 0],
         f_namelen: 255,
-        f_frsize: 4096,
+        f_frsize: bs,
         f_flags: 0, // not read-only — this root writes now
         f_spare: [0; 4],
     };
@@ -2155,6 +2189,32 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             fill_statfs(fr.arg2())
         }
         ring3::nr::FSTATFS => fill_statfs(fr.arg2()),
+        akuma_syscalls_linux::nr::FTRUNCATE => {
+            // M4: apk sizes what it unpacks/downloads with ftruncate on the
+            // fd (RESULT-L saw nr 77 land in the unhandled arm and the unpack
+            // still succeed on the write path's own sizing — G3, A3). The
+            // effect is akuma-ext2's `truncate_by_inode` (the same path
+            // SQLite's ftruncate-extends used); this is the marshalling only.
+            // The fd's cached `size` follows so reads see the new EOF.
+            let mut res: Result<(), u64> = Ok(());
+            let hit = fd_table().update(fr.arg1() as u32, |of| {
+                let OpenFile::File { inode, size, .. } = of else {
+                    res = Err(ring3::err::EINVAL); // Linux: not an O_WRONLY regular file
+                    return;
+                };
+                match root_fs().truncate_by_inode(*inode, fr.arg2()) {
+                    Ok(()) => *size = fr.arg2(),
+                    Err(_) => res = Err(ring3::err::EIO),
+                }
+            });
+            if !hit {
+                return e(ring3::err::EBADF);
+            }
+            match res {
+                Ok(()) => 0,
+                Err(no) => e(no),
+            }
+        }
         ring3::nr::FACCESSAT => {
             let (dirfd, mode) = (fr.arg1(), fr.arg3());
             if mode > 7 {
