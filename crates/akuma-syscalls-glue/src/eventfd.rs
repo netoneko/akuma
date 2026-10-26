@@ -1,5 +1,6 @@
-//! eventfd(2): the table, poller wake and refcount plumbing for the full
-//! kernel. The state machine itself (counter semantics, flag bits, readiness)
+//! eventfd(2): the table, poller wake and refcount plumbing for the full kernel.
+//!
+//! The state machine itself (counter semantics, flag bits, readiness)
 //! is `akuma-syscalls-eventfd` — extracted 2026-10-26 (composition step 3b:
 //! this file was welded to `akuma-exec`'s Process/threading, and the
 //! taoxichuan composition root needed the decisions without the weld). The
