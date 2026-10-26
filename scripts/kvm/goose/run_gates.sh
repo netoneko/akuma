@@ -61,6 +61,17 @@ fail_exit() { emit "ABORT $*"; exit 1; }
 [ -f "$LOG" ] || fail_exit "no console log $LOG - boot_dev.sh first"
 [ -f "$KERNEL" ] || fail_exit "no kernel ELF $KERNEL"
 
+# The frozen LAN mirror serves the WHOLE battery: the repositories line is
+# live in the image (devroot-ensure, stage-8 M3), so any network-enabled apk
+# exec dials :8123. With no listener the relay refuses the dial and NEVER
+# tells the guest (gw_refused counts up, resets stays 0) and the guest then
+# pins a vCPU at 100% forever - seen 2026-10-26: G3 hung ~13 min on both
+# boots, console silent, no Exit status. H1's own listener therefore moved
+# to :8124; the mirror owns :8123 for the whole run and is stopped at the
+# end. mirror.sh start verifies MANIFEST.sha256 first, aborting on mismatch.
+"$REPO/scripts/kvm/goose/mirror.sh" start >>"$OUT/gates-E.err" 2>&1 \
+  || fail_exit "mirror.sh start failed (manifest verify?)"
+
 # gate <name> <cmd>: one exec, console-first verdict.
 # G_rc: 0 pass (console Exit status: 0), 1 fail (nonzero status), 2 unknown
 # (no exit line). G_dead: 1 if the console never showed the accepted conn.
@@ -137,7 +148,7 @@ vline G2 "$(agg "$RCS")" g2.console
 
 # G3: offline apk add, then the hash as guest-side exit codes.
 rgroup G3 \
-  'g3a=apk add --force-non-repository /pkgs/ca-certificates-bundle-20261020-r0.apk' \
+  'g3a=apk add --no-network --force-non-repository /pkgs/ca-certificates-bundle-20261020-r0.apk' \
   'g3b=sha256sum /etc/ssl/certs/ca-certificates.crt > /tmp/h' \
   'g3c=grep -c 5961c0a3 /tmp/h'
 vline G3 "$(agg "$RCS")" "g3a.console g3b.console g3c.console"
@@ -146,13 +157,14 @@ rgroup G4 'g4=ls /etc/ssl1.1/certs'
 vline G4 "$(agg "$RCS")" g4.console
 
 # H1: host listener rooted at $OUT/www, guest fetches through the relay.
+# Port 8124: :8123 belongs to the frozen mirror for the whole battery now.
 mkdir -p "$OUT/www"
 [ -f "$OUT/www/index.html" ] || echo hello-from-host >"$OUT/www/index.html"
-(cd "$OUT/www" && exec python3 -m http.server 8123) >/dev/null 2>&1 &
+(cd "$OUT/www" && exec python3 -m http.server 8124) >/dev/null 2>&1 &
 LPID=$!
 sleep 1
 rgroup H1 \
-  'h1a=busybox wget -qO /tmp/h1 http://192.168.1.159:8123/' \
+  'h1a=busybox wget -qO /tmp/h1 http://192.168.1.159:8124/' \
   'h1b=grep -c hello-from-host /tmp/h1'
 kill $LPID 2>/dev/null
 vline H1 "$(agg "$RCS")" "h1a.console h1b.console"
@@ -221,7 +233,7 @@ W1F=$REPO/scripts/kvm/goose/w1_expected_hashes.txt
 [ -f "$W1F" ] || fail_exit "no $W1F - W0 baseline missing"
 WA=$(sed -n 1p "$W1F"); WB=$(sed -n 2p "$W1F"); WC=$(sed -n 3p "$W1F"); WD=$(sed -n 4p "$W1F")
 rgroup W1 \
-  'w1m1=apk add --force-non-repository /pkgs/ca-certificates-bundle-20261020-r0.apk' \
+  'w1m1=apk add --no-network --force-non-repository /pkgs/ca-certificates-bundle-20261020-r0.apk' \
   'w1m2=sh -c "echo taoxi > /etc/hostname"' \
   'w1r1=ls -lin /etc/hostname > /tmp/w1a' \
   'w1r2=df / > /tmp/w1b' \
@@ -239,11 +251,8 @@ vline W1d "$(echo "$RCS" | cut -c11)" w1d.console
 
 # A-group (stage 8 M3): `apk update` in the guest, signed (U1: the three
 # official alpine-devel keys ARE in /etc/apk/keys), against the frozen LAN
-# mirror. mirror.sh start verifies MANIFEST.sha256 first and aborts the run
-# on a mismatch; stopped at the end. It is NOT up during H1 above - H1's
-# own :8123 listener owns the port there.
-"$REPO/scripts/kvm/goose/mirror.sh" start >>"$OUT/gates-E.err" 2>&1 \
-  || fail_exit "mirror.sh start failed (manifest verify?)"
+# mirror - which is ALREADY up (started at the top of the battery; every
+# network-enabled apk exec needs it, see the note there).
 
 # A1: the repositories file is exactly the mirror line - put on the per-boot
 # COPY by boot_dev.sh through devroot-ensure; the .orig stays unmodified.
