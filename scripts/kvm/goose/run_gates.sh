@@ -13,9 +13,9 @@
 # H1 busybox wget from the host :8123 listener (started/stopped here, rooted at
 # $OUT/www); H2 dd /etc/hostname (created first - not in the image);
 # H3a sh -c 'echo x > /tmp/f'; H3b cat /tmp/f; H3c wc -c /tmp/f.
-# C1 (stage 8 M1): wall clock - guest `date +%s` must land in
-# [E, E+900] where E is the epoch boot_dev.sh injected into the vm_cmdline
-# (recorded in $OUT/epoch; substituted below).
+# C1 (stage 8 M1): wall clock - the guest's CLOCK_REALTIME (busybox awk
+# systime()) must land in [E, E+900] where E is the epoch boot_dev.sh
+# injected into the vm_cmdline (recorded in $OUT/epoch; substituted below).
 #
 # Pacing: 15 s between execs, one exec per ssh connection - the host forward
 # degrades at ~30 connections per boot. If an exec's console slice shows no
@@ -163,13 +163,15 @@ vline H3c "$(echo "$RCS" | cut -c3)" h3c.console
 
 # C1 (stage 8 M1): the wall clock. E is the anchor boot_dev.sh injected at
 # THIS boot (re-read here so a mid-battery restart contributes its fresh
-# anchor); the guest's busybox `date +%s` reads CLOCK_REALTIME. [ "$d" -ge E ]
-# proves the offset store is set (today's boot-relative seconds would be far
-# below a 2026 epoch), [ "$d" -le $((E+900)) ] bounds the drift.
+# anchor). The brief's form `sh -c 'd=$(date +%s); [ "$d" -ge E ] && ...'`
+# cannot run on this kernel: two commands joined by `;`/`&&` and the
+# $(date) substitution all need ash to fork, and there is no fork arm
+# ("can't fork: Function not implemented"). Single-command equivalent, same
+# console-exit-status verdict, same window: busybox awk's systime() reads
+# CLOCK_REALTIME, and one simple command tail-call-execs forklessly.
 [ -f "$OUT/epoch" ] || fail_exit "no $OUT/epoch - boot_dev.sh did not inject an anchor"
 E=$(cat "$OUT/epoch")
-c1body='d=$(date +%s); [ "$d" -ge '"$E"' ] && [ "$d" -le $(('"$E"'+900)) ]'
-rgroup C1 "c1=sh -c '$c1body'"
+rgroup C1 "c1=awk 'BEGIN{exit !(systime()>=$E && systime()<=$E+900)}'"
 vline C1 "$(agg "$RCS")" c1.console
 
 emit "GATES DONE restarts=$RESTARTED"
