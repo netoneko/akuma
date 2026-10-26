@@ -188,13 +188,16 @@ fn load_image<A: UserPages>(
         if phdr.p_type == PT_INTERP && phdr.p_filesz > 1 {
             let raw = src.read_at(phdr.p_offset as usize, phdr.p_filesz as usize)?;
             let bytes: &[u8] = raw.as_ref();
-            let path_bytes = if bytes.last() == Some(&0) {
-                &bytes[..bytes.len() - 1]
-            } else {
-                bytes
-            };
-            if let Ok(s) = core::str::from_utf8(path_bytes) {
-                interp_path = Some(String::from(s));
+            // The `p_filesz > 1` gate and the NUL strip are the shared
+            // `akuma-elf-exec` rule now — the same one taoxichuan's raw-byte
+            // scan rides — so a static-PIE's one-NUL `PT_INTERP` reads as
+            // "no interpreter" through every loader at once.
+            if let Some(path_bytes) =
+                akuma_elf_exec::interp_bytes(phdr.p_filesz as u64, bytes)
+            {
+                if let Ok(s) = core::str::from_utf8(path_bytes) {
+                    interp_path = Some(String::from(s));
+                }
             }
         }
     }

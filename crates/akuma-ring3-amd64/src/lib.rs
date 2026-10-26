@@ -786,6 +786,10 @@ pub mod nr {
     pub const BRK: u64 = 12;
     /// `ioctl(2)`.
     pub const IOCTL: u64 = 16;
+    /// `pread64(2)` — musl's ldso reads a library's ELF headers with it
+    /// (`map_library`) before mapping; an explicit offset, the fd position
+    /// untouched.
+    pub const PREAD64: u64 = 17;
     /// `stat(2)` — x86_64 keeps the legacy number, and musl's `stat()` maps
     /// to it (not `newfstatat`); busybox `ls` stats its argument to learn
     /// whether it is a directory.

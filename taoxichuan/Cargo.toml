@@ -57,6 +57,10 @@ akuma-cpu = { path = "../crates/akuma-cpu" }
 # `PteProt`/`MemAttr` for the user mappings arrive via `akuma-boot-amd64`'s
 # `paging` re-export.
 akuma-ring3-amd64 = { path = "../crates/akuma-ring3-amd64" }
+# The pure PT_INTERP / entry decisions (composition step 3/3b): the same
+# core akuma-elf (the amd64 kernel's loader) calls. This kernel maps the
+# interpreter itself; the crate only decides.
+akuma-elf-exec = { path = "../crates/akuma-elf-exec" }
 # ---- The stage-3 crate line -------------------------------------------------
 #
 # The fd *decisions* (lowest-free allocation, close, the flags sets), extracted

@@ -1591,16 +1591,32 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::IOCTL => e(ring3::err::ENOTTY), // the console is a serial line, not a tty
         ring3::nr::MMAP => {
             let (addr, len, prot, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
-            let _ = fr.arg5(); // fd: ignored for MAP_ANONYMOUS
+            let fd = fr.arg5();
+            let off = fr.arg6();
             if len == 0 {
                 return e(ring3::err::EINVAL);
             }
-            if flags & ring3::mmap::MAP_ANONYMOUS == 0 {
-                return e(ring3::err::ENODEV); // no file-backed mappings in this kernel
+            // M5: two kinds of mapping. MAP_ANONYMOUS — the only kind this
+            // kernel served before — and, now, MAP_PRIVATE of an open file:
+            // musl's ldso reserves a library's span anonymous and then
+            // re-maps each PT_LOAD over it MAP_FIXED from the library's fd
+            // (`map_library`). Zeroed pages filled from the inode at `off`
+            // is exactly that, minus COW (writes are private to this task
+            // because its address space dies with it).
+            let anon = flags & ring3::mmap::MAP_ANONYMOUS != 0;
+            let mut fnode: Option<u32> = None;
+            if !anon {
+                // `Some(Some(inode))` = a bound regular file; anything else
+                // (unbound, socket, dir, child pipe) has no file to map.
+                let mapped = fd_table().with(fd as u32, |d| match d {
+                    OpenFile::File { inode, .. } => Some(*inode),
+                    _ => None,
+                });
+                match mapped {
+                    Some(Some(node)) => fnode = Some(node),
+                    _ => return e(ring3::err::ENODEV),
+                }
             }
-            // fd is ignored for MAP_ANONYMOUS (Linux semantics): libakuma's
-            // mmap wrapper passes fd = 0, and the full kernel accepts it, so
-            // demanding -1 here rejected sshd's very first allocation.
             let t = task();
             let pages = (len + 0xFFF) & !0xFFF;
             let base = if flags & ring3::mmap::MAP_FIXED != 0
@@ -1630,9 +1646,45 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 if !paging::map_page_in(t.root_pa, page as usize, pa as u64, pte, MemAttr::WriteBack) {
                     return e(ring3::err::ENOMEM);
                 }
+                if let Some(node) = fnode {
+                    // File-backed private: fill this page straight from the
+                    // inode. A short read (the page runs past EOF) leaves
+                    // the zeroed tail — the same bytes a private mapping of
+                    // the file would have there.
+                    let foff = off + (page - base);
+                    let mut done = 0usize;
+                    while done < 4096 {
+                        let want = (4096 - done).min(1024);
+                        let mut chunk = [0u8; 1024];
+                        let got = match root_fs().read_at_by_inode(
+                            node,
+                            (foff + done as u64) as usize,
+                            &mut chunk[..want],
+                        ) {
+                            Ok(g) => g,
+                            Err(_) => return e(ring3::err::EIO),
+                        };
+                        if got == 0 {
+                            break;
+                        }
+                        // SAFETY: `pa` is this page's fresh frame and `done`
+                        // stays inside it; the physmap copy is the same walk
+                        // the exec path's copy makes.
+                        let dst = phys::phys_ptr::<u8>(pa as u64 + done as u64);
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, got);
+                        }
+                        done += got;
+                    }
+                }
                 page += 4096;
             }
-            t.mmap_cur = base + pages;
+            // Monotonic bump: a MAP_FIXED mapping lands inside an earlier
+            // reservation, BELOW `mmap_cur` — rewinding the cursor would
+            // hand its pages out twice.
+            if base + pages > t.mmap_cur {
+                t.mmap_cur = base + pages;
+            }
             base
         }
         ring3::nr::MUNMAP | ring3::nr::MPROTECT => {
@@ -1648,6 +1700,45 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::READ => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
             read_fd_arm(fd, buf, len)
+        }
+        ring3::nr::PREAD64 => {
+            // The ldso's library-header reads (and anything else that reads
+            // at an explicit offset): the fd's position is untouched —
+            // Linux's contract, and what a `map_library` that re-reads from
+            // offset 0 across a loop depends on.
+            let (fd, buf, len, off) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
+            if len > WRITE_LIMIT || !user_ok(buf, len) {
+                return e(ring3::err::EFAULT);
+            }
+            let mapped = fd_table().with(fd as u32, |d| match d {
+                OpenFile::File { inode, size, .. } => Some((*inode, *size)),
+                _ => None,
+            });
+            let Some(Some((node, size))) = mapped else {
+                // Unbound, a directory, a socket: no explicit-offset read.
+                return e(ring3::err::ESPIPE);
+            };
+            let mut total = 0u64;
+            let want = len.min(size.saturating_sub(off.min(size)));
+            while total < want {
+                let mut chunk = [0u8; 1024];
+                let n = ((want - total) as usize).min(chunk.len());
+                let got = match root_fs()
+                    .read_at_by_inode(node, (off + total) as usize, &mut chunk[..n])
+                {
+                    Ok(0) => break,
+                    Ok(g) => g,
+                    Err(_) => return e(ring3::err::EIO),
+                };
+                if !copy_to_user(buf + total, &chunk[..got]) {
+                    return e(ring3::err::EFAULT);
+                }
+                total += got as u64;
+                if got < n {
+                    break; // short read: end of file
+                }
+            }
+            total
         }
         ring3::nr::READV => {
             // musl's stdio reads EVERY stream through readv (one user
@@ -2789,6 +2880,107 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
         add_region(first, last);
     }
 
+    // M5: a `PT_INTERP` names the dynamic linker. The *decision* — including
+    // the one-NUL-byte static-PIE case — is the shared `akuma-elf-exec` rule
+    // (amd64's loader rides the same); the *mapping* is this kernel's page
+    // loop again. Placement: `INTERP_BASE` = 0x3000_0000, the base akuma-elf
+    // uses — above a static-PIE program at `PIE_BASE` (an image would have to
+    // be 512 MiB to reach it) and far below `MMAP_BASE`, so image and linker
+    // cannot meet. A hit here changes three auxv/cross facts at once: the
+    // entry ring 3 crosses is the linker's, `AT_BASE` is where it was placed,
+    // and `AT_ENTRY` stays the program's (already in the table below).
+    let (cross_entry, at_base) = match akuma_elf_exec::interp_path(image) {
+        Ok(Some(path)) => {
+            let ipath = core::str::from_utf8(path).ok()?;
+            // Read through the same bounded symlink chain as the program:
+            // Alpine's `/lib/ld-musl-x86_64.so.1` is a link, not a file.
+            let eff = resolve_effective(ipath);
+            let Ok(ldso) = root_fs().read_file(&eff) else {
+                console::puts("  exec: PT_INTERP unreadable: ");
+                console::puts(&eff);
+                console::puts("\n");
+                return None;
+            };
+            let mut segs = [akuma_elf_exec::LoadSeg { vaddr: 0, filesz: 0, memsz: 0, flags: 0 }; 8];
+            let Ok(n) =
+                akuma_elf_exec::load_segments(&ldso, akuma_elf_exec::INTERP_BASE, &mut segs)
+            else {
+                console::puts("  exec: interpreter refused by the exec core\n");
+                return None;
+            };
+            let mut hi = akuma_elf_exec::INTERP_BASE;
+            for seg in &segs[..n] {
+                let first = seg.vaddr & !0xFFF;
+                let last = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
+                let mut pva = first;
+                while pva < last {
+                    let pa = akuma_pmm::alloc_page_zeroed()?;
+                    let pte = if seg.flags & akuma_elf_exec::PF_X != 0 {
+                        PteProt::USER_RX
+                    } else if seg.flags & akuma_elf_exec::PF_W != 0 {
+                        PteProt::USER_RW
+                    } else {
+                        PteProt::USER_RO
+                    };
+                    if !paging::map_page_in(root, pva as usize, pa as u64, pte, MemAttr::WriteBack) {
+                        return None;
+                    }
+                    // The page's overlap with the segment's file-backed range.
+                    let from = pva.max(seg.vaddr);
+                    let to = (pva + 4096).min(seg.vaddr + seg.filesz);
+                    if from < to {
+                        let bytes = &ldso[(from - seg.vaddr) as usize..(to - seg.vaddr) as usize];
+                        // SAFETY: `pa` is this page's fresh frame; `from - pva`
+                        // stays inside it because `from >= pva` and
+                        // `to <= pva + 4096` — the program loop's argument.
+                        let dst = phys::phys_ptr::<u8>(pa as u64 + (from - pva));
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+                        }
+                    }
+                    if last > hi {
+                        hi = last;
+                    }
+                    pva += 4096;
+                }
+            }
+            add_region(akuma_elf_exec::INTERP_BASE, hi);
+            let Ok(ientry) = akuma_elf_exec::interp_entry(&ldso, akuma_elf_exec::INTERP_BASE) else {
+                console::puts("  exec: interpreter has no entry\n");
+                return None;
+            };
+            // Boot-2 diagnostic (M5): what the loader actually did, on the
+            // record, before the cross. Dropped once curl --version passes.
+            let eoff = (ientry - akuma_elf_exec::INTERP_BASE) as usize;
+            akuma_primitives::safe_print!(
+                192,
+                "  [exec] ldso '{}' len={} segs={} span=0x{:x} entry=0x{:x} at_base=0x{:x}\n",
+                eff,
+                ldso.len(),
+                n,
+                hi - akuma_elf_exec::INTERP_BASE,
+                ientry,
+                akuma_elf_exec::INTERP_BASE
+            );
+            akuma_primitives::safe_print!(
+                192,
+                "  [exec] ldso vec@entry={:02x?} s0=0x{:x}+0x{:x} s1=0x{:x}+0x{:x}\n",
+                &ldso[eoff..eoff + 12],
+                segs[0].vaddr,
+                segs[0].filesz,
+                segs[1].vaddr,
+                segs[1].filesz
+            );
+            (ientry, akuma_elf_exec::INTERP_BASE)
+        }
+        // Static or static-PIE: exactly the answer this loader always gave.
+        Ok(None) => (img.entry(), 0),
+        // A malformed phdr table the shared core refuses — the same refusal
+        // akuma-elf's parser would make. Not reachable for anything
+        // `ring3::Image::parse` accepted with a sane `e_phentsize`.
+        Err(_) => return None,
+    };
+
     // The stack, then the initial block on it. The block is < half a page and
     // ends at `USER_STACK_TOP`, so it lands entirely in the top page.
     let stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
@@ -2810,7 +3002,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // to fill.
     const AUX_N: usize = 14;
     let mut aux = [(0u64, 0u64); AUX_N];
-    aux[0] = (ring3::AT_BASE, 0); // no interpreter
+    aux[0] = (ring3::AT_BASE, at_base); // the interpreter's base, 0 if none
     aux[1] = (ring3::AT_PHDR, img.phdr_va());
     aux[2] = (ring3::AT_PHENT, img.phent());
     aux[3] = (ring3::AT_PHNUM, img.phnum());
@@ -2860,7 +3052,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     add_region(MMAP_BASE, MMAP_BASE + SLAB);
 
     let _ = placed;
-    Some(TaskImage { root_pa: root, entry: img.entry(), rsp })
+    Some(TaskImage { root_pa: root, entry: cross_entry, rsp })
 }
 
 /// Where a loaded task starts: the root for CR3, the entry, the stack.
