@@ -1075,6 +1075,9 @@ pub mod err {
     pub const EAFNOSUPPORT: u64 = 47;
     /// Socket operation on a non-socket (an fd that is not a socket fd).
     pub const ENOTSOCK: u64 = 88;
+    /// Transport endpoint is not connected (`write(2)`/`send(2)` on a UDP
+    /// socket that never saw a `connect(2)` — stage 8, M2).
+    pub const ENOTCONN: u64 = 107;
     /// File exists (`O_CREAT`/`mkdirat` on a path that is already there).
     pub const EEXIST: u64 = 17;
     /// Illegal seek (`lseek` on a pipe/socket fd).

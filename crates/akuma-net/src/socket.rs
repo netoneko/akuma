@@ -1096,8 +1096,9 @@ pub fn connect_outcome(waited: Result<(), i32>, state: Option<tcp::State>) -> Re
 
 /// Read-only peek at the stream socket behind a kernel socket index, for a
 /// kernel-side connect wait that wants to trace what the stack is doing
-/// (TAOXICHUAN's stage-7 connect trace). Nothing here mutates, prints, or
-/// allocates: one `NETWORK` read.
+/// (TAOXICHUAN's stage-7 connect trace).
+///
+/// Nothing here mutates, prints, or allocates: one `NETWORK` read.
 #[cfg(feature = "smoltcp")]
 #[derive(Debug, Clone, Copy)]
 pub struct DebugStream {
@@ -1115,6 +1116,7 @@ pub struct DebugStream {
 }
 
 #[cfg(feature = "smoltcp")]
+#[must_use]
 pub fn debug_stream_peek(idx: usize) -> Option<DebugStream> {
     let h = with_table(|table| {
         if let Some(Some(sock)) = table.get(idx)
@@ -1130,9 +1132,7 @@ pub fn debug_stream_peek(idx: usize) -> Option<DebugStream> {
             DebugStream {
                 state: state_name(st),
                 remote: s.remote_endpoint().map(|ep| {
-                    let smoltcp::wire::IpAddress::Ipv4(a) = ep.addr else {
-                        return ([0, 0, 0, 0], ep.port);
-                    };
+                    let smoltcp::wire::IpAddress::Ipv4(a) = ep.addr;
                     (a.octets(), ep.port)
                 }),
                 send_q: s.send_queue(),
@@ -1147,6 +1147,7 @@ pub fn debug_stream_peek(idx: usize) -> Option<DebugStream> {
 
 /// `smoltcp::socket::tcp::State` as the name the state machine's docs use.
 #[cfg(feature = "smoltcp")]
+#[must_use]
 pub fn state_name(state: smoltcp::socket::tcp::State) -> &'static str {
     use smoltcp::socket::tcp::State as S;
     match state {
@@ -1911,7 +1912,22 @@ pub fn is_udp_socket(idx: usize) -> bool {
 /// makes every hostname lookup read as a timeout no matter how fast the
 /// network answers.
 #[must_use]
+/// The connected UDP socket's `connect(2)` peer, if any. A `send(2)`/`write(2)`
+/// (and a `sendto(2)` with a null address) on a datagram socket goes to this;
+/// with none, the caller answers `ENOTCONN` the way Linux does.
 #[cfg(feature = "smoltcp")]
+pub fn socket_udp_peer(idx: usize) -> Option<SocketAddrV4> {
+    with_table(|table| {
+        if let Some(Some(KernelSocket { inner: SocketType::Datagram { peer, .. }, .. })) = table.get(idx) {
+            *peer
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(feature = "smoltcp")]
+#[must_use]
 pub fn socket_udp_recv_ready(idx: usize) -> bool {
     smoltcp_net::poll();
     matches!(smoltcp_handle_for(idx), Some((handle, true)) if smoltcp_net::udp_can_recv(handle))

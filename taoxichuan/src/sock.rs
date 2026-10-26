@@ -315,10 +315,35 @@ pub fn sendto_arm(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, dest_len:
         akuma_primitives::safe_print!(96, "  [cx] GET len={} ->\n", len);
     }
     let r = if akuma_net::socket::is_udp_socket(idx) {
-        let Some(sa) = sockaddr_in_from_user(dest, dest_len) else {
-            return crate::e(crate::err::EINVAL);
+        // A null destination is the `send(2)` shape (musl implements send as
+        // sendto(NULL, 0)): go to the connect(2) peer, ENOTCONN without one.
+        // Anything else unparseable is EINVAL, as before. (stage 8, M2)
+        let sa = match sockaddr_in_from_user(dest, dest_len) {
+            Some(sa) => sa,
+            None if dest == 0 || dest_len == 0 => match akuma_net::socket::socket_udp_peer(idx) {
+                Some(sa) => sa,
+                None => return crate::e(crate::err::ENOTCONN),
+            },
+            None => return crate::e(crate::err::EINVAL),
         };
-        akuma_net::socket::socket_send_udp(idx, &data, sa)
+        let r = akuma_net::socket::socket_send_udp(idx, &data, sa);        // s8i M2 probe (mirrors the [cx] GET print above): is the guest's
+        // first-ever UDP sendto reaching the arm, and what does the stack
+        // answer? Remove with the milestone.
+        akuma_primitives::safe_print!(
+            128,
+            "  [cx] UDP len={} dst={}.{}.{}.{}:{} -> {}\n",
+            len,
+            sa.ip[0] as u64,
+            sa.ip[1] as u64,
+            sa.ip[2] as u64,
+            sa.ip[3] as u64,
+            sa.port as u64,
+            match &r {
+                Ok(n) => *n as u64,
+                Err(e) => -*e as i64 as u64,
+            }
+        );
+        r
     } else {
         akuma_net::socket::socket_send(idx, &data, nonblock)
     };
@@ -438,8 +463,17 @@ pub fn write_arm(fd: u64, buf: u64, len: u64) -> u64 {
     if data.starts_with(b"GET ") {
         akuma_primitives::safe_print!(96, "  [cx] GET(len={}) write ->\n", len);
     }
-    let r = akuma_net::socket::socket_send(idx, &data, fd_nonblock(fd));
-    if data.starts_with(b"GET ") {
+    // A datagram socket's write(2)/send(2) goes to its connect(2) peer —
+    // the shape busybox `nslookup`, busybox `nc -u` and musl's resolver all
+    // talk. Unconnected: ENOTCONN, the answer Linux gives. (stage 8, M2)
+    let r = if akuma_net::socket::is_udp_socket(idx) {
+        match akuma_net::socket::socket_udp_peer(idx) {
+            Some(sa) => akuma_net::socket::socket_send_udp(idx, &data, sa),
+            None => Err(crate::err::ENOTCONN as i32),
+        }
+    } else {
+        akuma_net::socket::socket_send(idx, &data, fd_nonblock(fd))
+    };    if data.starts_with(b"GET ") {
         akuma_primitives::safe_print!(
             96,
             "  [cx] GET <- {}\n",
