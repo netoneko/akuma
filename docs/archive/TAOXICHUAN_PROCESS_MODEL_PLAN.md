@@ -4,7 +4,7 @@ Planning only: this session boots nothing and changes no kernel or crate source.
 deliverable is this document, on the pattern of `TAOXICHUAN_STAGE6_REST_PLAN.md`.
 The fact it starts from: `taoxichuan/` has no `fork`/`clone` — one process shape,
 `SPAWN` (run-to-completion nested child, `taoxichuan/src/child.rs`, 702 lines; one
-level only, `nested_active` → `EPERM`, `child.rs:244-245`). The amd64 kernel has the
+level only, `nested_active` → `EPERM`, `child.rs:239-240`). The amd64 kernel has the
 full machine — fork with CoW, a real process per thread, `execve`, `wait4`, pipes —
 and, the load-bearing discovery of this session, **it is not welded shut**: the amd64
 `sys_fork` is already a thin "fold" over `akuma_exec::process::fork_process`
@@ -17,7 +17,7 @@ twin". Every statement below was checked against the tree 2026-10-26 unless mark
 ## 1. Needs per stage
 
 Ground rules, checked: musl's `posix_spawn` is `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)`
-(`amd64/src/usermode.rs:2210-2226` names it as the arm every compile driver dies on);
+(`amd64/src/usermode.rs:2206-2213` names it as the arm every compile driver dies on);
 musl `system()`/`popen()` are built on `posix_spawn` (popen adds `pipe2` + `dup2` +
 `waitpid`) (U1: settle in §6). busybox ash forks for every non-final command of a
 `;` sequence, every pipeline member, and every subshell — `1ee0dcdd`, recorded in
@@ -34,8 +34,9 @@ musl `system()`/`popen()` are built on `posix_spawn` (popen adds `pipe2` + `dup2
 
 Served today and reusable as-is: `SPAWN` (`child.rs:238`), `EXECVE` (`exec_replace`,
 `child.rs:392`), `EXIT` (`child_exit`, `child.rs:585`), `DUP/DUP2/DUP3`, `FCNTL`
-(scope unchecked, U3), `GETPID/GETPPID`, `RT_SIGACTION/RT_SIGPROCMASK` accepted as
-no-ops (`main.rs:1993`).
+(`F_SETFD`/`FD_CLOEXEC` and `F_DUPFD`/`F_DUPFD_CLOEXEC`, `main.rs:1786-1837` — the
+busybox ash fd-saving calls, already there), `GETPID/GETPPID`, `RT_SIGACTION/RT_SIGPROCMASK`
+accepted as no-ops (`main.rs:1993`).
 
 ## 2. Inventory of the amd64 path
 
@@ -54,7 +55,7 @@ supply or adopt; the fork row is the prototype and the others follow its pattern
 | `pipe2` | `amd64/src/fd.rs:1087` → glue `pipe::sys_pipe2`; `MAX_PIPES` ledger `amd64/src/pipe.rs` (369) | `akuma-pipes` (397) + `akuma-pipe` (229), pure | pipe table with waiters; **not** deps of `akuma-exec` (enter via glue/fd arms) | 397+229+369 |
 | `dup`/`dup3`/`fcntl` | `amd64/src/fd.rs` (3,819) | `akuma-fdtable` (817) | `SharedFdTable::clone_deep_for_fork` (`akuma-exec` `process/fd.rs`, 858) | 3,819+817+858 |
 | `kill`/signals | `usermode.rs:1987` → `amd64/src/signal.rs sys_kill`; sigreturn asm `.Lsig_return` (the `AMD64_FORK_VS_THREADS_SEGV.md` fix) | amd64 in-tree + `akuma-exec` `process/signal.rs` (807, `SharedSignalTable`) | frame build/restore per kernel | 1,578+807 |
-| CoW fork share | `fork_share_memory` = `usermode.rs:3403` → `cow_share_and_demote_range` (`mod.rs:337`); write fault `amd64/src/idt.rs:776` | `akuma-cow` (140, pure decision) | page-table walk (`akuma-mmu` x86_64 side over `akuma-pagetable`+`akuma-pte-amd64`), frame ledger `akuma-user-space` (273) | 140+5124 |
+| CoW fork share | `fork_share_memory` = `usermode.rs:3429` → `cow_share_and_demote_range` (`mod.rs:337`); write fault `amd64/src/idt.rs:776` | `akuma-cow` (140, pure decision) | page-table walk (`akuma-mmu` x86_64 side over `akuma-pagetable`+`akuma-pte-amd64`), frame ledger `akuma-user-space` (273) | 140+5124 |
 | ExecRuntime glue | `amd64/src/exec_runtime.rs` — registration + hooks, "the `akuma-exec` runtime + config this target registers, and nothing else" | `akuma-exec` (consumer side) | **this is the file taoxichuan must write a twin of** | 642 |
 
 Note: `akuma-user-access` (1,091; EL0/user copy boundary) and `akuma-exec-core`
@@ -137,9 +138,9 @@ side is free).
 |---|---|---|
 | U1 | does `akuma-threading` schedule on taoxichuan's trap/timer plumbing (x86 arms proven only against amd64's IDT + LAPIC/tick)? | read `ThreadRuntime`/`X86ArchHooks` field lists (`crates/akuma-threading/src/lib.rs`, `amd64/src/sched.rs:34-62`); grep each callback's LAPIC/SGI dependence; write the taoxichuan twin on paper first |
 | U2 | which git transport the pinned cargo uses (libgit2 in-process vs `git` CLI child) — decides if stage 9 needs stage 8's fork at all | host: `strings $(command -v cargo) \| grep -m1 -i libgit2` |
-| U3 | `FCNTL` arm scope in taoxichuan (FD_CLOEXEC? F_DUPFD?) — git/cargo pass cloexec fds everywhere | `grep -n "FCNTL\|F_DUPFD\|FD_CLOEXEC" taoxichuan/src/main.rs` |
+| U3 | ~~`FCNTL` arm scope~~ **settled**: `F_SETFD`/`FD_CLOEXEC` + `F_DUPFD`/`F_DUPFD_CLOEXEC` are served (`main.rs:1786-1837`); only `F_GETFD`-of-a-bound-fd semantics need a boot-time glance | none needed |
 | U4 | does wait4 force `akuma-syscalls-glue` (and its `akuma-vfs-glue` fs arms) into taoxichuan? | read `glue/src/proc.rs:1072-1140` for its imports; if glue is too wide, taoxichuan re-implements wait4's ~40 lines against `akuma-exec`'s children API directly (copy, not extract) |
-| U5 | vfork (`CLONE_VM\|CLONE_VFORK`) with no parent suspension: git's helper protocol assumes child-exec-before-parent-resumes more strictly than Go did | read `usermode.rs:2210-2260` + `CLONE_AUDIT.md`; probe in M5 with a `posix_spawn`-heavy binary before M7 |
+| U5 | vfork (`CLONE_VM\|CLONE_VFORK`) with no parent suspension: git's helper protocol assumes child-exec-before-parent-resumes more strictly than Go did | read `usermode.rs:2206-2260` + `CLONE_AUDIT.md`; probe in M5 with a `posix_spawn`-heavy binary before M7 |
 | U6 | is "SIGCHLD never delivered" observationally OK for git/musl (zombie reaping is channel-based, not signal-based)? | read `children.rs` channel semantics + musl `wait` behavior; decide before M6 |
 | U7 | image/heap budget: +84-node dep tree into the microvm-sized image | host-side size check of the linked kernel at M4 start, zero boots |
 
