@@ -630,8 +630,38 @@ pub fn recvfrom_arm(fd: u64, buf: u64, len: u64, _flags: u64, src: u64, src_len_
 }
 
 /// `shutdown(fd, how)`.
-pub fn shutdown_arm(fd: u64, how: u64) -> u64 {
+/// `getsockname(fd, addr*, addrlen*)` (stage 8 session Q): c-ares calls it
+/// on its just-connected DNS socket and treats failure as "could not
+/// contact DNS servers". The answer is the socket's bound/ephemeral port
+/// with the interface's address standing in for an unbound 0.0.0.0 (a
+/// connected socket's getsockname shows the routed source, Linux's rule).
+pub fn getsockname_arm(fd: u64, addr_va: u64, addrlen_va: u64) -> u64 {
+    const AF_INET: u16 = 2;
     let Some(idx) = fd_socket(fd) else {
+        return crate::e(crate::err::ENOTSOCK);
+    };
+    let Some((bound_ip, port)) = akuma_net::socket::socket_local_addr(idx) else {
+        return crate::e(crate::err::EINVAL);
+    };
+    let ip = if bound_ip == [0, 0, 0, 0] {
+        akuma_net::smoltcp_net::iface::get_local_ip()
+    } else {
+        bound_ip
+    };
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&AF_INET.to_be_bytes());
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    sa[4..8].copy_from_slice(&ip);
+    if !crate::copy_to_user(addr_va, &sa) {
+        return crate::e(crate::err::EFAULT);
+    }
+    if addrlen_va != 0 && !crate::copy_to_user(addrlen_va, &16u32.to_le_bytes()) {
+        return crate::e(crate::err::EFAULT);
+    }
+    0
+}
+
+pub fn shutdown_arm(fd: u64, how: u64) -> u64 {    let Some(idx) = fd_socket(fd) else {
         return crate::e(crate::err::ENOTSOCK);
     };
     match akuma_net::socket::socket_shutdown(idx, how as i32) {

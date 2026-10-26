@@ -2735,6 +2735,12 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // ENOSYS onto `curl: (27) Out of memory` before resolving.
             eventfd2_arm(fr.arg1(), fr.arg2())
         }
+        ring3::nr::GETSOCKNAME => {
+            // c-ares's DNS-socket self-check (stage 8 session Q): without
+            // the source endpoint it answers "Could not contact DNS
+            // servers" and the transfer dies curl: (6) before dialing.
+            sock::getsockname_arm(fr.arg1(), fr.arg2(), fr.arg3())
+        }
         other => {
             // Name the gap: a guest task hit a number this table does not
             // serve. The name first, then the raw number — each boot reads
