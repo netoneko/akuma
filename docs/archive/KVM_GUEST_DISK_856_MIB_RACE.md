@@ -1,6 +1,19 @@
-# OPEN: the host reports a 1 GiB guest disk as 856 MiB (2026-10-26)
+# RESOLVED: the host reported a 1 GiB guest disk as 856 MiB (2026-10-26)
 
-**Status: open, not investigated.** Written down so another agent can reproduce it locally. Nothing here is a verified cause; hypotheses are marked.
+**Status: resolved 2026-10-26 — a start-order race in `scripts/kvm/goose/boot_dev.sh`, not a kernel or ext2 bug.**
+
+## Cause (verified)
+
+`boot_dev.sh` stopped `vm-dev` but left its conf enabled while it ran `cp` of the 1 GiB `.orig` and `devroot-ensure`'s read-1-GiB / write-tmp / rename rewrite (tens of seconds). herd starts an enabled-but-stopped service on its next reload tick (~20 s), so a guest started *mid-rewrite*, and `HostDisk::sectors()` (`file_size(path) / 512`) honestly reported whatever length the file had reached. A second boot printed **10 MiB** for the same path (a different instant of the same race), which is what ruled out a stale-inode or size-arithmetic bug; the doc's hypotheses 1-3 below are all wrong. The 16 MiB image copied too fast to show it. `ls -l` afterwards showed 1 GiB because the rewrite had finished by then.
+
+Ruled out: `akuma-ext2` (a host test writing 1 GiB sequentially in 1 MiB chunks reports the exact `metadata().size` at every step), `devroot-ensure` (run alone on a scratch copy on the box: 1,073,741,824 bytes out), and `emit_dec`.
+
+## Fix
+
+`boot_dev.sh` now runs `herd disable vm-dev` right after the stop, does the image copy, `devroot-ensure` and kernel install, and only then writes the confs, runs `herd enable` and `herd start`. Verified on the box: two consecutive `boot_dev.sh` runs both print `guest disk: /boot/akuma-dev-root-ssh.img, 1024 MiB`.
+
+## Original report (hypotheses superseded by the above)
+
 
 ## Symptom
 
@@ -35,7 +48,7 @@ So `file_size()` returned about 897.6 MB at the moment the VM started, for a fil
 2. `file_size()` or the ext2 inode size path mishandles a size past some threshold or a partially extended file.
 3. The copy was still in flight in a way `ls` hides (the size seen by `ls` came from a cache).
 
-## Not done yet
+## Not done yet (before the cause was found)
 
 - No second boot on the same image (to see whether 856 MiB repeats or becomes 1024 MiB).
 - No `sync` before `herd start vm-dev` (the cheapest test of hypothesis 1).

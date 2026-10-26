@@ -38,19 +38,14 @@ fail() { echo "BOOT FAIL $1"; exit 1; }
 T0=$(date +%s)
 herd stop vm-dev      >>"$L" 2>&1 || true
 herd stop vm-serve-mc >>"$L" 2>&1 || true
-# Stage 8 (M1): every boot gets a fresh wall-clock anchor. The tracked
-# template stays value-less; the epoch is appended to the vm_cmdline of BOTH
-# conf copies and recorded in $OUT/epoch for run_gates.sh's C1 substitution.
-EPOCH=$(date +%s)
-sed "s/^\(vm_cmdline = .*\)$/\1 epoch=$EPOCH/" "$TPL" > /etc/herd/available/vm-dev.conf \
-  || fail "cp available conf"
-sed "s/^\(vm_cmdline = .*\)$/\1 epoch=$EPOCH/" "$TPL" > /etc/herd/enabled/vm-dev.conf \
-  || fail "cp enabled conf"
-grep -q "epoch=$EPOCH" /etc/herd/available/vm-dev.conf || fail "epoch not in available conf"
-grep -q "epoch=$EPOCH" /etc/herd/enabled/vm-dev.conf   || fail "epoch not in enabled conf"
-echo "$EPOCH" > "$OUT/epoch"
+# The service must be DISABLED for the whole image rewrite below. herd starts
+# an enabled-but-stopped service on its next reload tick (~20 s), and the 1 GiB
+# copy + devroot-ensure rewrite now take longer than that: the guest then
+# opens the image mid-write and reads whatever size the file has reached
+# ('guest disk: ... 856 MiB' and '... 10 MiB' for a 1 GiB image,
+# docs/archive/KVM_GUEST_DISK_856_MIB_RACE.md). The 16 MiB image copied too
+# fast to show it.
 herd disable vm-dev >>"$L" 2>&1 || true
-herd enable vm-dev  >>"$L" 2>&1 || fail "herd enable"
 cp /boot/akuma-dev-root-apk.img.orig "$IMG_DST" || fail "fresh image copy"
 # Stage 8 (M2): the COPY gets the DNS prerequisites from the tree's own
 # host-tested ext2 writer (akuma-ext2 via ext2probe's host plumbing): the
@@ -63,6 +58,18 @@ ENSURE=$REPO/userspace/target/x86_64-unknown-linux-musl/release/devroot-ensure
 "$ENSURE" "$IMG_DST" >>"$L" 2>&1 || fail "devroot-ensure"
 "$REPO/scripts/install_kernel_amd64.sh" "$KERNEL" /boot/akuma-guest-dev >>"$L" 2>&1 \
   || fail "kernel install"
+# Stage 8 (M1): every boot gets a fresh wall-clock anchor. The tracked
+# template stays value-less; the epoch is appended to the vm_cmdline of BOTH
+# conf copies and recorded in $OUT/epoch for run_gates.sh's C1 substitution.
+EPOCH=$(date +%s)
+sed "s/^\(vm_cmdline = .*\)$/\1 epoch=$EPOCH/" "$TPL" > /etc/herd/available/vm-dev.conf \
+  || fail "cp available conf"
+sed "s/^\(vm_cmdline = .*\)$/\1 epoch=$EPOCH/" "$TPL" > /etc/herd/enabled/vm-dev.conf \
+  || fail "cp enabled conf"
+grep -q "epoch=$EPOCH" /etc/herd/available/vm-dev.conf || fail "epoch not in available conf"
+grep -q "epoch=$EPOCH" /etc/herd/enabled/vm-dev.conf   || fail "epoch not in enabled conf"
+echo "$EPOCH" > "$OUT/epoch"
+herd enable vm-dev  >>"$L" 2>&1 || fail "herd enable"
 herd start vm-dev >>"$L" 2>&1 || fail "herd start"
 
 # Readiness: a real ssh round trip, not console tea-leaves. The host's ssh is
