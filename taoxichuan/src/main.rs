@@ -2901,7 +2901,8 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                 console::puts("\n");
                 return None;
             };
-            let mut segs = [akuma_elf_exec::LoadSeg { vaddr: 0, filesz: 0, memsz: 0, flags: 0 }; 8];
+            let mut segs =
+                [akuma_elf_exec::LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 8];
             let Ok(n) =
                 akuma_elf_exec::load_segments(&ldso, akuma_elf_exec::INTERP_BASE, &mut segs)
             else {
@@ -2929,7 +2930,16 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                     let from = pva.max(seg.vaddr);
                     let to = (pva + 4096).min(seg.vaddr + seg.filesz);
                     if from < to {
-                        let bytes = &ldso[(from - seg.vaddr) as usize..(to - seg.vaddr) as usize];
+                        // `seg.offset` is `p_offset`: the file slice for
+                        // vaddr `v - p_vaddr` starts at
+                        // `p_offset + (v - p_vaddr)`, NOT at `v - p_vaddr`.
+                        // The whole-image Vec is indexed from the file's
+                        // start; the program loop above does not need this
+                        // because `img.segment_bytes(seg)` re-bases the slice
+                        // at the segment's own `p_offset`.
+                        let off = seg.offset + (from - seg.vaddr);
+                        let end = seg.offset + (to - seg.vaddr);
+                        let bytes = &ldso[off as usize..end as usize];
                         // SAFETY: `pa` is this page's fresh frame; `from - pva`
                         // stays inside it because `from >= pva` and
                         // `to <= pva + 4096` — the program loop's argument.
@@ -2949,28 +2959,6 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                 console::puts("  exec: interpreter has no entry\n");
                 return None;
             };
-            // Boot-2 diagnostic (M5): what the loader actually did, on the
-            // record, before the cross. Dropped once curl --version passes.
-            let eoff = (ientry - akuma_elf_exec::INTERP_BASE) as usize;
-            akuma_primitives::safe_print!(
-                192,
-                "  [exec] ldso '{}' len={} segs={} span=0x{:x} entry=0x{:x} at_base=0x{:x}\n",
-                eff,
-                ldso.len(),
-                n,
-                hi - akuma_elf_exec::INTERP_BASE,
-                ientry,
-                akuma_elf_exec::INTERP_BASE
-            );
-            akuma_primitives::safe_print!(
-                192,
-                "  [exec] ldso vec@entry={:02x?} s0=0x{:x}+0x{:x} s1=0x{:x}+0x{:x}\n",
-                &ldso[eoff..eoff + 12],
-                segs[0].vaddr,
-                segs[0].filesz,
-                segs[1].vaddr,
-                segs[1].filesz
-            );
             (ientry, akuma_elf_exec::INTERP_BASE)
         }
         // Static or static-PIE: exactly the answer this loader always gave.
