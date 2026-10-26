@@ -662,7 +662,10 @@ pub fn getsockname_arm(fd: u64, addr_va: u64, addrlen_va: u64) -> u64 {
         bound_ip
     };
     let mut sa = [0u8; 16];
-    sa[0..2].copy_from_slice(&AF_INET.to_be_bytes());
+    // sin_family is host byte order in Linux's sockaddr (only sin_port and
+    // the address are network order); c-ares sanity-checks the raw u16 and
+    // a big-endian answer reads 0x0200 != AF_INET on little-endian.
+    sa[0..2].copy_from_slice(&AF_INET.to_ne_bytes());
     sa[2..4].copy_from_slice(&port.to_be_bytes());
     sa[4..8].copy_from_slice(&ip);
     if !crate::copy_to_user(addr_va, &sa) {
