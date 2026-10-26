@@ -903,6 +903,9 @@ pub mod nr {
     pub const DUP2: u64 = 33;
     /// `dup3(2)`.
     pub const DUP3: u64 = 292;
+    /// `eventfd2(2)` — libcurl's multi-stack wakeup fd (stage 8 session Q).
+    /// The state machine lives in `akuma-syscalls-eventfd`.
+    pub const EVENTFD2: u64 = 290;
     /// `nanosleep` shares 35; `select(2)`.
     pub const SELECT_PSELECT6: u64 = 23;
     /// `sched_yield(2)`.

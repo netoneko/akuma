@@ -2065,11 +2065,28 @@ pub fn tcp_recv_snapshot(idx: usize) -> Option<TcpRecvSnapshot> {
     Some(snap)
 }
 
+/// The table facts a `getsockname(2)` arm reports: this socket's bound (or
+/// allocated ephemeral) port and its recorded bind address — `0.0.0.0`
+/// when nothing was bound. The caller decides what an unbound address
+/// means (taoxichuan substitutes the interface's address, the way Linux's
+/// connected-socket getsockname shows the routed source). Session Q:
+/// c-ares calls getsockname on its DNS socket and "Could not contact DNS
+/// servers" without an answer.
+#[must_use]
+pub fn socket_local_addr(idx: usize) -> Option<([u8; 4], u16)> {
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get(idx) {
+            sock.bind_port.map(|p| (sock.bind_ip, p))
+        } else {
+            None
+        }
+    })
+}
+
 /// Get the default peer for a connected UDP socket
 #[must_use]
 #[cfg(feature = "smoltcp")]
-pub fn udp_default_peer(idx: usize) -> Option<SocketAddrV4> {
-    with_table(|table| {
+pub fn udp_default_peer(idx: usize) -> Option<SocketAddrV4> {    with_table(|table| {
         if let Some(Some(KernelSocket { inner: SocketType::Datagram { peer, .. }, .. })) = table.get(idx) {
             *peer
         } else {

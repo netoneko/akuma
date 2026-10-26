@@ -1,0 +1,8 @@
+[package]
+name = "akuma-syscalls-eventfd"
+version = "0.1.0"
+edition = "2024"
+description = "The eventfd(2) state machine, pure: counter semantics, flag bits, readiness. Extracted from akuma-syscalls-glue's welded eventfd.rs so the taoxichuan composition root and the full kernel share one implementation."
+
+[lints]
+workspace = true
