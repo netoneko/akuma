@@ -1068,3 +1068,12 @@ carried context cost); (3) fresh contexts per job; (4) a mock-verified script be
 clean goose server.**
 - **Host track (Sonnet), merged tree `litter/taoxichuan-s4` @ `fa8a1c53` (merge `53e83e80`):** `scripts/build_taoxichuan_fc.sh` -> `taoxichuan-fc.bin` 662,792 B (unchanged: the
   stage 7 changes are all in the amd64-only `taoxichuan/` and `akuma-ring3-amd64`), Lima `fc` boot with disk: 162 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`. PASS.
+
+### Supervisor handoff (2026-10-26, end of the first supervisor context)
+
+**State.** Table stages 1-5 done; stage 6 (`apk add curl`) about half done (offline `apk add` + outbound TCP + all of stage 7's sub-gates green; `taoxichuan-s4` @ `fa8a1c53`
+merged into `rust-org-il-experiment`, pushed to `origin` at `defbd2c9`). Next: the rest-of-stage-6 plan (`TAOXICHUAN_STAGE6_REST_PLAN.md`): M0 mirror + reference (host only), M1 clock anchor
+(`epoch=` cmdline), M2 DNS, then trim step 2, M3 `apk update`, M4 `apk add curl`, trim step 3, M5 `PT_INTERP` + `curl --version`. Stages 7-12 of the table are not started and, on the pace here
+(~14 goose-hours for stages 1-5 plus offline 6, plus ~9 for stage 7's network work), 9-12 are out of reach for the talk on 2026-11-03. Owner's quota readings at the end: weekly reset
+done at the start of the 26th, 5 h window 77% (sessions E-G cost ~6M tokens total). The supervisor loop, scripts and traps are in `scripts/kvm/goose/SUPERVISOR_RUNBOOK.md`.
+
