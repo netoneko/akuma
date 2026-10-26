@@ -1117,3 +1117,25 @@ A first boot showed 111 lines and stopped: a stale root-owned `firecracker` from
 Lima `fc` boot: 163 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`. PASS. (A read at 75 s saw 111 lines: the run lasts 120 s; wait for the firecracker process to exit before counting.)
 
 **Next:** trim step 2, then M3 `apk update`, M4 `apk add curl`, trim step 3, M5 `PT_INTERP` + `curl --version` (stage 6 of the table), then stages 7-12.
+
+
+### Stage 8 session K (2026-10-26): trim step 2 - wire structs from the ABI crates, byte-identical - PASS
+
+**Result.** Brief `scripts/kvm/goose/taoxichuan-08k-wire-dedup.md`, goose session 110 min (10:47-12:37 UTC), 120 tool calls, 7.4M input tokens, `taoxichuan-s4` @ `694cddd5` (8 commits).
+Five families, one commit each (stat+statfs, getdents64, uname, time structs, `nr_name`). Final battery on one clean boot: `PASS G1 G2 G3 G4 H1 H2 H3a H3b H3c C1 D1 D2 W1a W1b W1c W1d`, `restarts=0`,
+0 `Fault|PANIC|sig!`. `taoxichuan/src` 4,779 -> 4,744 lines; `akuma-*` dependencies 16 -> 18 (`akuma-syscalls-linux`, `akuma-syscalls-abi`). Details: `RESULT-K.md` on the box.
+- **The plan's gate could not run.** The trim plan's step-2 gate is `abi_write_probe`, which `build.sh` builds with `aarch64-linux-musl-gcc`; the guest is x86_64. The supervisor replaced it with W0/W1: guest-side
+  sha256 of `ls -lin /etc/hostname`, `df /`, `ls -l /etc`, `uname -a`, recorded on the pre-refactor kernel over three fresh boots (identical hashes every time, so determinism was proved before it could accuse a
+  refactor) and committed in `scripts/kvm/goose/w1_expected_hashes.txt`. The busybox in the serve image has no `stat` applet (exit 127), hence the nearest applets. The file was not edited after W0 (supervisor-checked).
+- **Family 2 W1c FAIL was the gate, not the code.** The forward degraded, the script restarted the guest on a fresh image that never ran G3's `apk add`, so `/etc` had no `ssl` and the hash differed. W1 now
+  re-applies the two `/etc` mutations itself; family 2 then passed with `restarts=0` against the unchanged baseline.
+- **Cuts:** `nr_name` 95 -> 21 lines (the ABI crate's `Syscall::from_x86_64`; names are now CamelCase, console-only), getdents -13, uname -7, time -3; the stat family went up by about 22 lines of documentation
+  but lost the literal offset table. One local 5-line `struct_bytes()` helper was extracted once four wire structs went through it.
+- **Supervisor-visible lapse (goose):** one commit (`1e665116`) was pushed with the build red (E0308) because a chained command's grep matched "error" yet exited 0; fixed forward in `cd93f821` before any boot.
+- **Left un-pulled, for step 3's extraction pass:** nanosleep's timespec read, `sock.rs`'s timeout timevals, the iovec pairs. Candidates found by diffing `amd64/Cargo.toml` against `taoxichuan/Cargo.toml`
+  (not acted on): `akuma-vfs-glue`, `akuma-user-access`, `akuma-pipe`/`akuma-pipes`, `akuma-elf`, `akuma-syscalls-time`, `akuma-syscalls-poll`.
+- Host tests need `--target $HOST` here (the workspace `.cargo/config.toml` pins aarch64-unknown-none).
+
+**Host track (Sonnet), merged tree @ `d0de0601`:** one merge, no conflicts. `taoxichuan-fc.bin` 662,792 B (unchanged), Lima `fc` boot: 162 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`. PASS.
+
+**Next:** M3 `apk update` (repositories file + keys in the image, `vm-dev.conf.stage7-hostrelay`), then M4 `apk add curl`, trim step 3, M5 `PT_INTERP` + `curl --version`.
