@@ -1970,34 +1970,41 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let mut scratch = [0u8; 1024];
             let mut used = 0usize;
             let mut res: Result<(), u64> = Ok(());
+            // Trim step 2: the `linux_dirent64` record shape is
+            // `akuma_syscalls_linux::dirent`'s — `reclen` is the crate's
+            // asserted alignment arithmetic and `encode` writes header, type,
+            // name, NUL and pad (the pad the scratch's zero-init used to be
+            // relied on for).
+            use akuma_syscalls_linux::dirent;
             let found = fd_table().update(fd as u32, |of| match of {
                 OpenFile::Dir { path: _, entries, cursor } => {
                     let cap = (len as usize).min(scratch.len());
                     while *cursor < entries.len() {
                         let ent = &entries[*cursor];
                         let name = ent.name.as_bytes();
-                        let reclen = (19 + name.len() + 1 + 7) & !7;
-                        if used + reclen > cap {
+                        let rl = dirent::reclen(name.len());
+                        if used + rl > cap {
                             if used == 0 {
                                 res = Err(ring3::err::EINVAL); // not even one fits
                             }
                             break;
                         }
-                        let rec = &mut scratch[used..used + reclen];
-                        rec[..8].copy_from_slice(&0u64.to_le_bytes());
-                        rec[8..16].copy_from_slice(&(*cursor as u64 + 1).to_le_bytes());
-                        rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
-                        rec[18] = if ent.is_dir {
-                            4 // DT_DIR
+                        let d_type = if ent.is_dir {
+                            dirent::DT_DIR
                         } else if ent.is_symlink {
-                            10 // DT_LNK
+                            dirent::DT_LNK
                         } else {
-                            8 // DT_REG
+                            dirent::DT_REG
                         };
-                        rec[19..19 + name.len()].copy_from_slice(name);
-                        rec[19 + name.len()] = 0;
+                        // `d_ino` is 0 — the listing carries names and kinds,
+                        // not inode numbers, and nothing on this path reads
+                        // them. `d_off` is the running cursor, a cookie that
+                        // only has to be monotonic within one open.
+                        let wrote =
+                            dirent::encode(&mut scratch[used..used + rl], 0, *cursor as i64 + 1, d_type, name);
+                        debug_assert!(wrote, "the window is exactly reclen(name)");
                         *cursor += 1;
-                        used += reclen;
+                        used += rl;
                     }
                 }
                 OpenFile::File { .. } | OpenFile::Socket(_) | OpenFile::ChildOut(_)
