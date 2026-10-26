@@ -687,7 +687,7 @@ pub fn getpeername_arm(fd: u64, addr_va: u64, addrlen_va: u64) -> u64 {
         return crate::e(crate::err::ENOTSOCK);
     };
     let (ip, port) = if let Some(peer) = akuma_net::socket::socket_udp_peer(idx) {
-        (peer.ip().octets(), peer.port())
+        (peer.ip, peer.port)
     } else if let Some(d) = akuma_net::socket::debug_stream_peek(idx) {
         match d.remote {
             Some(remote) => remote,
