@@ -2949,6 +2949,28 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                 console::puts("  exec: interpreter has no entry\n");
                 return None;
             };
+            // Boot-2 diagnostic (M5): what the loader actually did, on the
+            // record, before the cross. Dropped once curl --version passes.
+            let eoff = (ientry - akuma_elf_exec::INTERP_BASE) as usize;
+            akuma_primitives::safe_print!(
+                192,
+                "  [exec] ldso '{}' len={} segs={} span=0x{:x} entry=0x{:x} at_base=0x{:x}\n",
+                eff,
+                ldso.len(),
+                n,
+                hi - akuma_elf_exec::INTERP_BASE,
+                ientry,
+                akuma_elf_exec::INTERP_BASE
+            );
+            akuma_primitives::safe_print!(
+                192,
+                "  [exec] ldso vec@entry={:02x?} s0=0x{:x}+0x{:x} s1=0x{:x}+0x{:x}\n",
+                &ldso[eoff..eoff + 12],
+                segs[0].vaddr,
+                segs[0].filesz,
+                segs[1].vaddr,
+                segs[1].filesz
+            );
             (ientry, akuma_elf_exec::INTERP_BASE)
         }
         // Static or static-PIE: exactly the answer this loader always gave.
