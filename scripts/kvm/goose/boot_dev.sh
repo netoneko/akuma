@@ -38,8 +38,17 @@ fail() { echo "BOOT FAIL $1"; exit 1; }
 T0=$(date +%s)
 herd stop vm-dev      >>"$L" 2>&1 || true
 herd stop vm-serve-mc >>"$L" 2>&1 || true
-cp "$TPL" /etc/herd/available/vm-dev.conf || fail "cp available conf"
-cp "$TPL" /etc/herd/enabled/vm-dev.conf   || fail "cp enabled conf"
+# Stage 8 (M1): every boot gets a fresh wall-clock anchor. The tracked
+# template stays value-less; the epoch is appended to the vm_cmdline of BOTH
+# conf copies and recorded in $OUT/epoch for run_gates.sh's C1 substitution.
+EPOCH=$(date +%s)
+sed "s/^\(vm_cmdline = .*\)$/\1 epoch=$EPOCH/" "$TPL" > /etc/herd/available/vm-dev.conf \
+  || fail "cp available conf"
+sed "s/^\(vm_cmdline = .*\)$/\1 epoch=$EPOCH/" "$TPL" > /etc/herd/enabled/vm-dev.conf \
+  || fail "cp enabled conf"
+grep -q "epoch=$EPOCH" /etc/herd/available/vm-dev.conf || fail "epoch not in available conf"
+grep -q "epoch=$EPOCH" /etc/herd/enabled/vm-dev.conf   || fail "epoch not in enabled conf"
+echo "$EPOCH" > "$OUT/epoch"
 herd disable vm-dev >>"$L" 2>&1 || true
 herd enable vm-dev  >>"$L" 2>&1 || fail "herd enable"
 cp /boot/akuma-dev-root-apk.img.orig "$IMG_DST" || fail "fresh image copy"
@@ -71,6 +80,17 @@ while [ $i -lt 3 ]; do
   i=$((i+1))
 done
 [ "$ready" = 1 ] || fail "no ssh round trip (see boot_dev.log)"
+
+# Stage 8 (M1): $OUT/epoch must describe the guest that ANSWERED, not the conf
+# we wrote: herd's reload tick can start the survivor from a spec parsed a
+# moment before our conf landed (seen live 2026-10-26: conf/boot_dev said
+# ...9265, the booted guest carried ...8780). The survivor's spec file
+# (/var/run/herd/vm-dev.vm) is the ground truth - sync the anchor from it.
+LIVE=$(sed -n 's/.* epoch=\([0-9]*\).*/\1/p' "$RUNF" 2>/dev/null | tail -1)
+case "$LIVE" in
+  ''|*[!0-9]*) fail "no epoch= in $RUNF (guest predates the anchor)" ;;
+  *) echo "$LIVE" > "$OUT/epoch" ;;
+esac
 
 grep -q '^outbound=1' "$RUNF" 2>/dev/null || fail "runfile missing outbound=1"
 grep -q "^disk=$IMG_DST" "$RUNF" 2>/dev/null || fail "runfile disk is not the apk image"
