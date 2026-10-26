@@ -54,7 +54,23 @@ pub(crate) fn writev_socket(idx: usize, data: &[u8], nonblock: bool) -> Result<u
     if data.is_empty() {
         return Ok(0);
     }
-    match akuma_net::socket::socket_send(idx, data, nonblock) {
+    let r = if akuma_net::socket::is_udp_socket(idx) {
+        // A datagram socket's writev goes to its connect(2) peer — the same
+        // contract as write(2) on a dgram fd. Routing it into `socket_send`
+        // (TCP) answered a silent errno and c-ares's query never left (its
+        // close-and-retry x3 reads "Could not contact DNS servers").
+        // (stage 8, session Q fix)
+        match akuma_net::socket::socket_udp_peer(idx) {
+            Some(sa) => akuma_net::socket::socket_send_udp(idx, data, sa),
+            None => Err(crate::err::ENOTCONN as i32),
+        }
+    } else {
+        akuma_net::socket::socket_send(idx, data, nonblock)
+    };
+    akuma_primitives::safe_print!(96, "  [tmp] writev idx={} udp={} len={} rc={}\n", idx,
+        akuma_net::socket::is_udp_socket(idx) as u64, data.len(),
+        match r { Ok(n) => n as u64, Err(e) => -i64::from(e) as u64 });
+    match r {
         Ok(n) => Ok(n),
         Err(e) => Err(net_err(e)),
     }
@@ -536,18 +552,25 @@ fn connect_wait(idx: usize) -> u64 {
 /// destination; UDP addresses the datagram with it.
 pub fn sendto_arm(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, dest_len: u64) -> u64 {
     const WRITE_LIMIT: u64 = crate::WRITE_LIMIT;
-    let Some(idx) = fd_socket(fd) else {
+    let sock = fd_socket(fd).map(|idx| (idx, akuma_net::socket::is_udp_socket(idx)));
+    akuma_primitives::safe_print!(96, "  [tmp] sendto fd={} idx={} udp={} len={} dest={:#x} dlen={}\n",
+        fd,
+        sock.map(|(i, _)| i).unwrap_or(usize::MAX),
+        sock.map(|(_, u)| u as u64).unwrap_or(9),
+        len, dest, dest_len);
+    let Some((idx, _is_udp)) = sock else {
         return crate::e(crate::err::ENOTSOCK);
     };
     if len > WRITE_LIMIT || !crate::user_ok(buf, len) {
+        akuma_primitives::safe_print!(96, "  [tmp] sendto EFAULT fd={} len={} buf={:#x}\n", fd, len, buf);
         return crate::e(crate::err::EFAULT);
     }
     let mut data = alloc::vec![0u8; len as usize];
     if !crate::copy_from_user(&mut data, buf) {
+        akuma_primitives::safe_print!(96, "  [tmp] sendto EFAULT-copy fd={} len={} buf={:#x}\n", fd, len, buf);
         return crate::e(crate::err::EFAULT);
     }
     let nonblock = fd_nonblock(fd);
-    akuma_primitives::safe_print!(96, "  [tmp] sendto fd={} idx={} len={} dest={:#x} dlen={} udp={}\n", fd, idx, len, dest, dest_len, akuma_net::socket::is_udp_socket(idx));
     // Stage-7 probe: a TCP send whose payload opens an HTTP request.
     if !akuma_net::socket::is_udp_socket(idx)
         && len >= 4

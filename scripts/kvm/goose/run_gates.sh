@@ -223,7 +223,7 @@ if [ "$GROUP" != main ]; then
   rcST=1
   STLINE=""
   stcheck() {
-    for t in $( { grep -ho 'statfs. blocks=262144 bsize=4096 tstamp=[0-9]*' "$@" 2>/dev/null | cut -d= -f4; grep -ho 'bsize=4096 bavail=[0-9]* tstamp=[0-9]*' "$@" 2>/dev/null | cut -d= -f3; } ); do
+    for t in $( { grep -ho 'statfs. blocks=262144 bsize=4096 tstamp=[0-9]*' "$@" 2>/dev/null | cut -d= -f4; grep -ho 'bsize=4096 free=[0-9]* bavail=[0-9]* tstamp=[0-9]*' "$@" 2>/dev/null | cut -d= -f4; } ); do
       if [ "$t" -ge "$E" ] && [ "$t" -le "$((E + 2700))" ]; then
         rcST=0
         STLINE="tstamp=$t"
