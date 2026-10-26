@@ -548,6 +548,15 @@ pub(crate) enum OpenFile {
     /// Stage 7 (H2): `/dev/null` used to be an EACCES ext2 lookup failure,
     /// which cost every `dd of=/dev/null` and plenty of applet noise.
     Null,
+    /// An eventfd: the index into `EVENTFDS` below. Stage 8 session Q —
+    /// libcurl's multi-stack creates one wakeup fd per transfer; without
+    /// the number served, `curl` dies `curl: (27) Out of memory` before it
+    /// resolves anything. The state machine is the extracted pure crate
+    /// `akuma-syscalls-eventfd` (composition step 3b: akuma-syscalls-glue's
+    /// eventfd.rs is welded to akuma-exec's Process/threading; the
+    /// decisions are not). A dup'd fd carries the same index; the slot
+    /// frees when any fd naming it closes.
+    EventFd(usize),
 }
 
 /// The one task: its root page table, the user ranges a pointer may name, the
@@ -1203,6 +1212,7 @@ fn clone_desc(d: &OpenFile) -> OpenFile {
         },
         OpenFile::Socket(i) => OpenFile::Socket(*i),
         OpenFile::ChildOut(i) => OpenFile::ChildOut(*i),
+        OpenFile::EventFd(i) => OpenFile::EventFd(*i),
         OpenFile::Null => OpenFile::Null,
     }
 }
@@ -1290,7 +1300,8 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
     }
     if (fd as u32) < SLOT_CEILING {
         // Stage 4: socket fds read through sock.rs; a spawned child's
-        // stdout fd drains its pipe (then EOF).
+        // stdout fd drains its pipe (then EOF); an eventfd answers its
+        // counter or EAGAIN (session Q — curl's wakeup fd).
         let mut slot_idx: usize = usize::MAX;
         let kind = fd_table().with(fd as u32, |d| match d {
             OpenFile::Socket(_) => 1,
@@ -1298,11 +1309,16 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
                 slot_idx = *slot;
                 2
             }
+            OpenFile::EventFd(slot) => {
+                slot_idx = *slot;
+                3
+            }
             _ => 0,
         });
         match kind {
             Some(1) => return sock::read_arm(fd, buf_va, len),
             Some(2) => return child::read_child_out(slot_idx, buf_va, len),
+            Some(3) => return eventfd_read_arm(slot_idx, buf_va),
             _ => {}
         }
         let mut chunk = [0u8; 512];
@@ -1341,11 +1357,11 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
                 }
                 res = Ok(total);
             }
-            // Socket and ChildOut fds were served above; the closure's
-            // match stays exhaustive so a new kind cannot silently fall
-            // through to the file path. Null reads are EOF — the default
-            // `Ok(0)` — which is the device's contract.
-            OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::Null => {}
+            // Socket, ChildOut and EventFd fds were served above; the
+            // closure's match stays exhaustive so a new kind cannot silently
+            // fall through to the file path. Null reads are EOF — the
+            // default `Ok(0)` — which is the device's contract.
+            OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::EventFd(_) | OpenFile::Null => {}
         });
         match (found, res) {
             (true, Err(no)) => return e(no),
@@ -1360,6 +1376,101 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// Stage 8 session Q: eventfd(2) — libcurl's multi-stack wakeup fd.
+// ---------------------------------------------------------------------------
+
+/// The eventfd slots (the `Socket(usize)` treatment: the state lives here,
+/// the fd carries the index; a dup'd fd names the same slot, and the slot
+/// frees when any fd naming it closes — the single-task guest has no
+/// forking parent to keep one alive past the close).
+static mut EVENTFDS: [Option<akuma_syscalls_eventfd::EventFd>; 4] =
+    [None, None, None, None];
+
+fn eventfds() -> &'static mut [Option<akuma_syscalls_eventfd::EventFd>; 4] {
+    // As `child::slots`: one task, run to completion, no other kernel
+    // context can touch the table mid-syscall.
+    unsafe { &mut *core::ptr::addr_of_mut!(EVENTFDS) }
+}
+
+/// `eventfd2(initval, flags)`. Flags outside Linux's three bits are EINVAL;
+/// `EFD_NONBLOCK` records the fd table's nonblock bit (the table owns that
+/// bit for every kind, so fcntl F_SETFL stays the one switch); `EFD_CLOEXEC`
+/// records the table's cloexec bit, nothing execs past it yet.
+fn eventfd2_arm(initval: u64, flags: u64) -> u64 {
+    let ef = match akuma_syscalls_eventfd::EventFd::new(initval as u32, flags as u32) {
+        Ok(ef) => ef,
+        Err(no) => return e(no as u64),
+    };
+    let slot = eventfds().iter().position(|s| s.is_none());
+    let Some(slot) = slot else {
+        return e(ring3::err::EMFILE);
+    };
+    eventfds()[slot] = Some(ef);
+    let mut table = fd_table();
+    let desc = OpenFile::EventFd(slot);
+    let fd = table.alloc_fd_from(3, desc);
+    if flags & u64::from(akuma_syscalls_eventfd::EFD_NONBLOCK) != 0 {
+        table.set_nonblock(fd);
+    }
+    if flags & u64::from(akuma_syscalls_eventfd::EFD_CLOEXEC) != 0 {
+        table.set_cloexec(fd);
+    }
+    u64::from(fd)
+}
+
+/// `read` on an eventfd fd: the 8-byte counter (or the semaphore's 1), or
+/// EAGAIN on an empty counter. A blocking read that could actually wait
+/// needs a second task to write the counter — this run-to-completion guest
+/// has none, so Linux's would-block answers EAGAIN here by construction
+/// (the fd's nonblock bit changes nothing: there is no waiter to park).
+fn eventfd_read_arm(idx: usize, buf_va: u64) -> u64 {
+    let Some(ef) = eventfds()[idx].as_mut() else {
+        return e(ring3::err::EBADF);
+    };
+    match ef.read() {
+        Ok(val) => {
+            if !copy_to_user(buf_va, &val.to_le_bytes()) {
+                return e(ring3::err::EFAULT);
+            }
+            8
+        }
+        Err(_) => e(ring3::err::EAGAIN),
+    }
+}
+
+/// `write` on an eventfd fd: copy the 8-byte value in, add it, return 8.
+fn eventfd_write_arm(idx: usize, buf_va: u64) -> u64 {
+    let mut b = [0u8; 8];
+    if !copy_from_user(&mut b, buf_va) {
+        return e(ring3::err::EFAULT);
+    }
+    eventfd_write_val(idx, u64::from_le_bytes(b))
+}
+
+/// The write itself (the value already gathered — writev's head bytes take
+/// this path too, matching Linux's first-8-bytes-of-the-gather rule).
+fn eventfd_write_val(idx: usize, val: u64) -> u64 {
+    let Some(ef) = eventfds()[idx].as_mut() else {
+        return e(ring3::err::EBADF);
+    };
+    match ef.write(val) {
+        Ok(()) => 8,
+        Err(no) => e(no as u64),
+    }
+}
+
+/// Close every fd naming `idx`: drop the slot (the single-task guest has no
+/// co-referring parent process — the Socket treatment).
+fn eventfd_close_slot(idx: usize) {
+    eventfds()[idx] = None;
+}
+
+/// poll/select readiness for an eventfd fd: readable while the counter is
+/// non-zero (sock.rs's `fd_events` asks through here).
+pub(crate) fn eventfd_can_read(idx: usize) -> bool {
+    eventfds()[idx].as_ref().is_some_and(|ef| ef.can_read())
+}
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     match fr.rax {
         ring3::nr::WRITE => {
@@ -1377,16 +1488,22 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // (stage 6 — the ext2 write path; apk unpacks through this),
             // and the null device (stage 7 — writes vanish, the count is
             // still the whole length).
+            let mut efd_idx: usize = usize::MAX;
             let kind = fd_table().with(fd as u32, |d| match d {
                 OpenFile::Socket(_) => 1,
                 OpenFile::File { .. } => 2,
                 OpenFile::Null => 3,
+                OpenFile::EventFd(slot) => {
+                    efd_idx = *slot;
+                    4
+                }
                 _ => 0,
             });
             match kind {
                 Some(1) => return sock::write_arm(fd, buf, len),
                 Some(2) => return write_file_arm(fd, buf, len),
                 Some(3) => return len,
+                Some(4) => return eventfd_write_arm(efd_idx, buf),
                 _ => {}
             }
             // Unbound: only 1/2 fall back — a nested child's fd 1 is the
@@ -1448,10 +1565,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     return e(ring3::err::EFAULT);
                 }
             }
+            let mut efd_idx: usize = usize::MAX;
             let kind = fd_table().with(fd as u32, |d| match d {
                 OpenFile::Socket(_) => 1,
                 OpenFile::File { .. } => 2,
                 OpenFile::Null => 3,
+                OpenFile::EventFd(slot) => {
+                    efd_idx = *slot;
+                    4
+                }
                 _ => 0,
             });
             match kind {
@@ -1466,6 +1588,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
                 Some(2) => return writev_file_arm(fd, &data),
                 Some(3) => return total, // /dev/null: gone, but accepted
+                // Linux's writev on an eventfd writes only the first 8
+                // bytes of the gather; libcurl's wakeup write(2) never
+                // comes through writev, but the number must not EBADF.
+                Some(4) => {
+                    let mut b = [0u8; 8];
+                    let n = data.len().min(8);
+                    b[..n].copy_from_slice(&data[..n]);
+                    return eventfd_write_val(efd_idx, u64::from_le_bytes(b));
+                }
                 _ => {}
             }
             if fd != 1 && fd != 2 {
@@ -1970,10 +2101,17 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 return e(ring3::err::EBADF);
             }
             // A socket fd releases its kernel side (the smoltcp handle)
-            // before the slot itself goes.
-            let is_sock =
-                fd_table().with(fd as u32, |d| matches!(d, OpenFile::Socket(_))).unwrap_or(false);
-            if is_sock {
+            // before the slot itself goes; an eventfd fd frees its slot
+            // the same way (session Q).
+            let fd_kind = fd_table().with(fd as u32, |d| match d {
+                OpenFile::Socket(_) => 1,
+                OpenFile::EventFd(slot) => {
+                    eventfd_close_slot(*slot);
+                    2
+                }
+                _ => 0,
+            });
+            if fd_kind == Some(1) {
                 sock::close_arm(fd);
             }
             match fd_table().close(fd as u32) {
@@ -2063,7 +2201,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                 }
                 OpenFile::File { .. } | OpenFile::Socket(_) | OpenFile::ChildOut(_)
-                | OpenFile::Null => {
+                | OpenFile::EventFd(_) | OpenFile::Null => {
                     res = Err(ring3::err::ENOTDIR);
                 }
             });
@@ -2589,6 +2727,13 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 return e(ring3::err::ENOSYS);
             }
             child::exec_replace(fr)
+        }
+        ring3::nr::EVENTFD2 => {
+            // libcurl's multi-stack wakeup fd (stage 8 session Q): created
+            // before any transfer starts, written by curl itself, polled
+            // for readability. Without the number served, curl mapped the
+            // ENOSYS onto `curl: (27) Out of memory` before resolving.
+            eventfd2_arm(fr.arg1(), fr.arg2())
         }
         other => {
             // Name the gap: a guest task hit a number this table does not

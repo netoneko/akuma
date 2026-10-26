@@ -12,6 +12,9 @@ akuma-exec = { path = "../akuma-exec" }
 akuma-isolation = { path = "../akuma-isolation" }
 akuma-mmu = { path = "../akuma-mmu" }
 akuma-net = { path = "../akuma-net", default-features = false }
+# eventfd's state machine (stage 8 session Q seam-cut): the counter/flag
+# decisions used by this crate's eventfd.rs, shared with taoxichuan.
+akuma-syscalls-eventfd = { path = "../akuma-syscalls-eventfd" }
 akuma-net-unix = { path = "../akuma-net-unix" }
 akuma-net-yarn = { path = "../akuma-net-yarn" }
 akuma-pipes = { path = "../akuma-pipes" }

@@ -85,6 +85,7 @@ default-members = [
     "crates/akuma-syscalls-mem",
     "crates/akuma-syscalls-net",
     "crates/akuma-syscalls-poll",
+    "crates/akuma-syscalls-eventfd",
     "crates/akuma-syscalls-sync",
     "crates/akuma-tty",
     "crates/akuma-syscalls-time",

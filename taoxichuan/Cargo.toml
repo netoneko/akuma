@@ -83,6 +83,10 @@ akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
 # hand-written - the crate doc records the exceptfds bug this class of hand
 # roll has already caused once in this tree.
 akuma-syscalls-poll = { path = "../crates/akuma-syscalls-poll" }
+# Stage 8 session Q: eventfd2 for libcurl's wakeup fd. The state machine is
+# the extracted pure crate (also under akuma-syscalls-glue now); this kernel
+# adds only the fd-table entry and the read/write/poll/close routing.
+akuma-syscalls-eventfd = { path = "../crates/akuma-syscalls-eventfd" }
 # ---- The stage-4 crate line -------------------------------------------------
 #
 # The network stack: the AF_INET socket table and the smoltcp interface

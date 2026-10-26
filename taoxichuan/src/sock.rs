@@ -119,10 +119,15 @@ fn fd_events(fd: i32, events: i16) -> i16 {
     if fd < 0 {
         return 0;
     }
+    let mut efd_idx: usize = usize::MAX;
     let kind = crate::fd_table().with(fd as u32, |d| match d {
         crate::OpenFile::Socket(_) => 1,
         crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
         crate::OpenFile::Null | crate::OpenFile::ChildOut(_) => 3,
+        crate::OpenFile::EventFd(slot) => {
+            efd_idx = *slot;
+            4
+        }
     });
     match kind {
         Some(1) => {
@@ -146,6 +151,19 @@ fn fd_events(fd: i32, events: i16) -> i16 {
         }
         Some(2) => POLLIN | POLLOUT,
         Some(3) => events & POLLOUT,
+        Some(4) => {
+            // An eventfd (session Q): readable while its counter is
+            // non-zero, always writable — `FdState::EventFd`'s answers,
+            // akuma-syscalls-poll's readiness vocabulary.
+            let mut revents: i16 = 0;
+            if crate::eventfd_can_read(efd_idx) && events & POLLIN != 0 {
+                revents |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                revents |= POLLOUT;
+            }
+            revents
+        }
         _ => {
             // Unbound: fd 1/2 are the console (write-only), the rest are bad.
             if fd <= 2 && events & POLLOUT != 0 {
