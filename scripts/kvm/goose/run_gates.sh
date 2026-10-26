@@ -206,23 +206,26 @@ if [ "$GROUP" != main ]; then
   rgroup B4 'b4=apk info -e curl'
   vline B4 "$(agg "$RCS")" b4.console
 
-  # Statfs: the one-time [statfs] console line (fill_statfs, once per boot)
-  # is the only direct view of the real geometry - df cannot print here.
-  # Per-boot attribution: the line carries tstamp= (the anchored wall clock
-  # at first statfs); only a line at or after THIS boot's epoch (read from
-  # $OUT/epoch, C1's E) counts - a previous boot's line always predates it,
-  # so mid-boot rotation into .old cannot fake the evidence.
+  # Statfs: [statfs] lines carry the real geometry + the anchored wall clock
+  # (tstamp); only a line at or after THIS boot's epoch ($OUT/epoch, C1's E)
+  # counts - a previous boot's line always predates it. The exec slices are
+  # tried first (gate() already collected them rotation-proof: the print
+  # fires on every statfs call now, and apk's own call belongs to b1), the
+  # live log pair is the fallback (init's own call, pre-sshd, may survive).
   E=$(cat "$OUT/epoch")
   rcST=1
   STLINE=""
-  for t in $(grep -ho 'statfs. blocks=262144 bsize=4096 tstamp=[0-9]*' \
-      "$LOG" "$LOG.old" 2>/dev/null | cut -d= -f4); do
-    if [ "$t" -ge "$E" ] && [ "$t" -le "$((E + 2700))" ]; then
-      rcST=0
-      STLINE="tstamp=$t"
-    fi
-  done
-  vline Statfs "$rcST" "vm-dev.log(.old) (blocks=262144 bsize=4096 ${STLINE})"
+  stcheck() {
+    for t in $(grep -ho 'statfs. blocks=262144 bsize=4096 tstamp=[0-9]*' "$@" 2>/dev/null | cut -d= -f4); do
+      if [ "$t" -ge "$E" ] && [ "$t" -le "$((E + 2700))" ]; then
+        rcST=0
+        STLINE="tstamp=$t"
+      fi
+    done
+  }
+  stcheck "$OUT/b1.console" "$OUT/b2.console" "$OUT/b3a.console" "$OUT/b4.console"
+  [ "$rcST" = 0 ] || stcheck "$LOG" "$LOG.old"
+  vline Statfs "$rcST" "b-slices or vm-dev.log(.old) (${STLINE:-no [statfs] in window})"
 else
 rgroup G1 'g1=sh -c "echo hi"'
 vline G1 "$(agg "$RCS")" g1.console

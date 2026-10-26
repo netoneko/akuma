@@ -1094,7 +1094,6 @@ fn lstat_path(path: &str, buf: u64) -> u64 {
 /// block geometry — aarch64 measured that `ENOSYS` here made apk treat later
 /// operations as forbidden, and until M4 the fixed 16 MiB answer made apk's
 /// free-space check refuse the 12.6 MB curl closure on the 1 GiB image.
-static STATFS_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 fn fill_statfs(buf: u64) -> u64 {
     if !user_ok(buf, 120) {
         return e(ring3::err::EFAULT);
@@ -1108,29 +1107,31 @@ fn fill_statfs(buf: u64) -> u64 {
     let Ok(st) = root_fs().stats() else {
         return e(ring3::err::EIO);
     };
-    // M4: once per boot, put the real superblock numbers on the console. The
-    // guest has no procfs and this busybox build ignores /etc/mtab, so df can
-    // never print a row here (RESULT-M: the W1b df hash is the header line's
-    // bytes and always was) - this line is the only direct view of what apk's
-    // free-space check reads, and it is what the Statfs gate greps.
-    if !STATFS_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        // tstamp: the anchored wall clock at first statfs - the Statfs gate
-        // only accepts lines whose tstamp is at or after THIS boot's epoch
-        // (a previous boot's line always predates it), so mid-boot log
-        // rotation cannot misattribute the evidence.
-        let ts = akuma_primitives::clock::utc_time_us(net::uptime_us())
-            .unwrap_or(0)
-            / 1_000_000;
-        akuma_primitives::safe_print!(
-            128,
-            "[statfs] blocks={} bsize={} free={} bavail={} tstamp={} (real ext2 superblock)\n",
-            st.total_blocks,
-            st.block_size,
-            st.free_blocks,
-            st.free_blocks,
-            ts
-        );
-    }
+    // M4: the real superblock numbers on the console, EVERY statfs call.
+    // Once-per-boot got rotated away before the gate could read it (herd
+    // REPLACES vm-dev.log.old mid-boot; observed twice 2026-10-26): a line
+    // per call lets the B gates read their OWN console slices, which gate()
+    // already collects rotation-proof. Bounded: init, apk's free-space
+    // checks, stray df attempts - single digits per boot.
+    // The guest has no procfs and this busybox build ignores /etc/mtab, so
+    // df can never print a row here (RESULT-M: the W1b df hash is the header
+    // line's bytes and always was) - this line is the only direct view of
+    // what apk's free-space check reads.
+    // tstamp: the anchored wall clock - the Statfs gate only accepts lines
+    // at or after THIS boot's epoch (a previous boot's line always predates
+    // it), so a stale line can never fake a PASS.
+    let ts = akuma_primitives::clock::utc_time_us(net::uptime_us())
+        .unwrap_or(0)
+        / 1_000_000;
+    akuma_primitives::safe_print!(
+        128,
+        "[statfs] blocks={} bsize={} free={} bavail={} tstamp={} (real ext2 superblock)\n",
+        st.total_blocks,
+        st.block_size,
+        st.free_blocks,
+        st.free_blocks,
+        ts
+    );
     let bs = st.block_size as i64;
     let s = akuma_syscalls_linux::Statfs {
         f_type: 0xEF53,
