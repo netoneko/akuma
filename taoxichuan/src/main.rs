@@ -2187,7 +2187,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // exactly the 65 bytes the old `[0u8; 65]` literal did.
             use akuma_syscalls_linux::uts;
             let buf = fr.arg1();
-            if !user_ok(buf, uts::FIELD_LEN * 6) {
+            if !user_ok(buf, (uts::FIELD_LEN * 6) as u64) {
                 return e(ring3::err::EFAULT);
             }
             let fields: [&[u8]; 6] = [
