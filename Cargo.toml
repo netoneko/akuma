@@ -26,6 +26,7 @@ default-members = [
     "crates/akuma-procfs",
     "crates/akuma-user-space",
     "crates/akuma-elf",
+    "crates/akuma-elf-exec",
     "crates/akuma-ext2",
     "crates/akuma-isolation",
     "crates/akuma-kacho",
