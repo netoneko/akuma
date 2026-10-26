@@ -2006,16 +2006,22 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         ring3::nr::CLOCK_GETTIME => {
             // Stage 4: the calibrated TSC gives both clocks real elapsed
-            // time (net.rs). CLOCK_REALTIME reports boot-relative seconds —
-            // there is still no wall clock behind this kernel, and nothing
-            // on this stage's path reads the absolute value (sshd's timers
-            // are all deltas); musl's `struct timespec` is two u64s.
+            // time (net.rs). Stage 8 (M1): CLOCK_REALTIME (id 0) adds the
+            // UTC offset store once a boot-time `epoch=` anchor installed
+            // one (akuma_primitives::clock::realtime_us falls back to the
+            // boot-relative reading, i.e. this arm's stage-4 behaviour,
+            // when no anchor exists: no epoch= token, no behaviour change).
+            // Every other clock id keeps its boot-relative meaning; musl's
+            // `struct timespec` is two u64s.
             let (clk, tp) = (fr.arg1(), fr.arg2());
-            let _ = clk;
+            let us = if clk == 0 {
+                akuma_primitives::clock::realtime_us(net::uptime_us())
+            } else {
+                net::uptime_us()
+            };
             if !user_ok(tp, 16) {
                 return e(ring3::err::EFAULT);
             }
-            let us = net::uptime_us();
             let mut ts = [0u8; 16];
             ts[0..8].copy_from_slice(&(us / 1_000_000).to_le_bytes());
             ts[8..16].copy_from_slice(&((us % 1_000_000) * 1_000).to_le_bytes());
@@ -2413,10 +2419,22 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::WAITPID => child::waitpid_arm(fr.arg1(), fr.arg2()),
         ring3::nr::CLOSE_CHILD_STDIN => child::close_stdin_arm(fr.arg1()),
         ring3::nr::GETTIMEOFDAY => {
-            // Same no-clock contract; struct timeval is two u64s, `tz` is
-            // optional and never filled.
+            // Same clock as CLOCK_GETTIME (stage 8, M1): with an `epoch=`
+            // anchor in the offset store, tv is wall time; without one
+            // utc_time_us answers None and today's all-zeros answer stands.
+            // Struct timeval is two u64s, `tz` is optional and never filled.
             let (tv, tz) = (fr.arg1(), fr.arg2());
-            if !user_ok(tv, 16) || !copy_to_user(tv, &[0u8; 16]) {
+            if let Some(us) = akuma_primitives::clock::utc_time_us(net::uptime_us()) {
+                if !user_ok(tv, 16) {
+                    return e(ring3::err::EFAULT);
+                }
+                let mut tvbuf = [0u8; 16];
+                tvbuf[0..8].copy_from_slice(&(us / 1_000_000).to_le_bytes());
+                tvbuf[8..16].copy_from_slice(&((us % 1_000_000) * 1_000).to_le_bytes());
+                if !copy_to_user(tv, &tvbuf) {
+                    return e(ring3::err::EFAULT);
+                }
+            } else if !user_ok(tv, 16) || !copy_to_user(tv, &[0u8; 16]) {
                 return e(ring3::err::EFAULT);
             }
             if tz != 0 && !user_ok(tz, 8) {
@@ -2965,6 +2983,32 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // init), and the spawn's evidence is that init's bytes are on the disk and
     // are an ELF. Loading and entering user mode is stage 2's line.
     banner();
+
+    // Stage 8 (M1): the wall clock anchor. `epoch=<unix seconds>` on the
+    // guest command line (boot_dev.sh injects a fresh one into both herd
+    // conf copies at every boot) is this kernel's one truth about wall
+    // time: it is stored as a UTC offset in the shared
+    // `akuma_primitives::clock` offset store — the same store ring 3's
+    // clock_settime would write on the metal kernel — anchored at the
+    // uptime sampled here. No token: the store stays unset and CLOCK_REALTIME
+    // / gettimeofday keep their stage-4 answers. This is *written new*
+    // (guest-cmdline policy): the metal's anchors are RTC/NTP mechanisms
+    // (`akuma-cmos-rtc`, `akuma-sntp`), neither reachable under this guest.
+    if let Some(e) = cmdline_token(hvm_start_info, "epoch=", &mut [0u8; 32]) {
+        match e.parse::<u64>() {
+            Ok(secs) => {
+                let at = net::uptime_us();
+                akuma_primitives::clock::set_utc_time_us(secs.saturating_mul(1_000_000), at);
+                akuma_primitives::safe_print!(
+                    96,
+                    "  [clock] epoch={} anchored at uptime={}us\n",
+                    secs,
+                    at
+                );
+            }
+            Err(_) => console::puts("  [clock] bad epoch= token, ignored\n"),
+        }
+    }
 
     let mut init_buf = [0u8; 512];
     let cmdline_str = cmdline(hvm_start_info, &mut init_buf);

@@ -38,8 +38,17 @@ fail() { echo "BOOT FAIL $1"; exit 1; }
 T0=$(date +%s)
 herd stop vm-dev      >>"$L" 2>&1 || true
 herd stop vm-serve-mc >>"$L" 2>&1 || true
-cp "$TPL" /etc/herd/available/vm-dev.conf || fail "cp available conf"
-cp "$TPL" /etc/herd/enabled/vm-dev.conf   || fail "cp enabled conf"
+# Stage 8 (M1): every boot gets a fresh wall-clock anchor. The tracked
+# template stays value-less; the epoch is appended to the vm_cmdline of BOTH
+# conf copies and recorded in $OUT/epoch for run_gates.sh's C1 substitution.
+EPOCH=$(date +%s)
+sed "s/^\(vm_cmdline = .*\)$/\1 epoch=$EPOCH/" "$TPL" > /etc/herd/available/vm-dev.conf \
+  || fail "cp available conf"
+sed "s/^\(vm_cmdline = .*\)$/\1 epoch=$EPOCH/" "$TPL" > /etc/herd/enabled/vm-dev.conf \
+  || fail "cp enabled conf"
+grep -q "epoch=$EPOCH" /etc/herd/available/vm-dev.conf || fail "epoch not in available conf"
+grep -q "epoch=$EPOCH" /etc/herd/enabled/vm-dev.conf   || fail "epoch not in enabled conf"
+echo "$EPOCH" > "$OUT/epoch"
 herd disable vm-dev >>"$L" 2>&1 || true
 herd enable vm-dev  >>"$L" 2>&1 || fail "herd enable"
 cp /boot/akuma-dev-root-apk.img.orig "$IMG_DST" || fail "fresh image copy"
