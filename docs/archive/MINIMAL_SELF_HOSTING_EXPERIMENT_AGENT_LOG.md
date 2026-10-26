@@ -1077,3 +1077,24 @@ merged into `rust-org-il-experiment`, pushed to `origin` at `defbd2c9`). Next: t
 (~14 goose-hours for stages 1-5 plus offline 6, plus ~9 for stage 7's network work), 9-12 are out of reach for the talk on 2026-11-03. Owner's quota readings at the end: weekly reset
 done at the start of the 26th, 5 h window 77% (sessions E-G cost ~6M tokens total). The supervisor loop, scripts and traps are in `scripts/kvm/goose/SUPERVISOR_RUNBOOK.md`.
 
+
+### Stage 8 session H (2026-10-26): M0 LAN mirror + Linux reference, M1 wall clock - both PASS
+
+**Result.** Brief `scripts/kvm/goose/taoxichuan-08-mirror-clock.md`, goose session 70 min (01:06-02:16 UTC), `taoxichuan-s4` @ `cbb6f4be` (4 commits, pushed to `litter`). Final battery on one clean
+boot: `PASS G1 G2 G3 G4 H1 H2 H3a H3b H3c C1`, `restarts=0`, no `Fault|PANIC|sig!`. Details: `RESULT-H.md` on the box.
+- **M0** (host only): 14-package curl closure frozen into `/srv/alpine-mirror` (15 files with the APKINDEX, `MANIFEST OK 15 files`), `mirror.sh` and `refroot.sh` written new; the reference root is built
+  with the guest image's own `apk.static` (3.0.8 static-PIE). U1: `/etc/apk/keys` is present (three alpine-devel keys) so the signed index works without `--allow-untrusted`. U2: no
+  `.post-install`/trigger scripts anywhere in the closure, so plan milestone M6 does not exist. U3: `curl` is a dynamically linked PIE, `PT_INTERP=/lib/ld-musl-x86_64.so.1`, so `curl --version` needs the loader work (M5).
+- **M1**: the offset store was **pulled** (`akuma_primitives::clock`, already a dependency); ~44 newly written lines in `taoxichuan/src/main.rs` (the `epoch=` anchor and the `CLOCK_REALTIME`/`gettimeofday` arms;
+  other clock ids unchanged). `taoxichuan/src` 4,581 -> 4,625; `akuma-*` dependencies 18 -> 18. `boot_dev.sh` injects `epoch=$(date +%s)` and re-syncs `$OUT/epoch` from `/var/run/herd/vm-dev.vm`.
+- **Metrics** (`goose_session_stats.py`): 194 tool calls (62 before the first edit), 11.1M input / 78k output tokens, 11 doc reads over 4 files (the plan five times), 36 source reads, 6 `vm-dev` boots (the script's
+  boot counter reads 0 for this session: it undercounts). 6 boots is two over the brief's cap of four, but each showed new evidence.
+
+**What the supervisor got wrong.** The brief's C1 command (`d=$(date +%s); [ ... ] && [ ... ]`) needs two forks, and the guest kernel has no `fork` for `sh` (`can't fork: Function not implemented`, exit 2).
+It was written from memory, not copied from a passing run: the same class of lapse as the stage 7A gate. Goose rewrote it as a single `awk systime()` command, which runs without forking.
+
+**What goose found.** (1) Herd's reload can start the answering guest from a spec parsed before the conf write landed, so the epoch the script recorded was not the one the guest carried; fixed by re-syncing from the survivor's spec.
+(2) A failed `kbuild` still led to a boot of the previous binary (boot 2); `boot_dev.sh` checks only that a kernel file exists. (3) Boot 1 printed no `[clock]` line and was not reproduced.
+
+**Host track (Sonnet), merged tree @ `cbb6f4be`:** `taoxichuan-fc.bin` 662,792 B (unchanged: the changes are amd64-only), Lima `fc` boot: 162 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`. PASS.
+A first boot showed 111 lines and stopped: a stale root-owned `firecracker` from the previous run was still alive (`pkill` as the Lima user fails, use `sudo pkill -9 firecracker`); the rerun was clean.
