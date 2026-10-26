@@ -65,6 +65,16 @@ akuma-ring3-amd64 = { path = "../crates/akuma-ring3-amd64" }
 # supplies the effects itself (an open description here is a path on the ext2
 # root, nothing to reference-count).
 akuma-fdtable = { path = "../crates/akuma-fdtable" }
+# ---- The stage-8 crate line (trim step 2) -----------------------------------
+#
+# The wire shapes the dispatcher used to hand-write byte by byte (`st[24..28]`
+# style offsets in fill_stat64, the table-writer statfs, the getdents64 record
+# encoder, the utsname fields, the timespec/timeval writers): the shared
+# Linux-ABI structs with their layout assertions, and the x86_64 number table.
+# The full kernels consume both; this kernel copies amd64's call shape (fill
+# the asm-generic struct, `stat::to_x86_64` re-lays it, bytes to the task).
+akuma-syscalls-linux = { path = "../crates/akuma-syscalls-linux" }
+akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
 # ---- The stage-4 crate line -------------------------------------------------
 #
 # The network stack: the AF_INET socket table and the smoltcp interface

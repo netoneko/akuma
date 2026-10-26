@@ -1081,20 +1081,32 @@ fn fill_statfs(buf: u64) -> u64 {
     if !user_ok(buf, 120) {
         return e(ring3::err::EFAULT);
     }
-    let mut s = [0u8; 120];
-    let mut w = |i: usize, v: u64| s[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-    w(0, 0xEF53); // f_type
-    w(1, 4096); // f_bsize
-    w(2, 4096); // f_blocks (16 MiB / 4 KiB)
-    w(3, 2053); // f_bfree — the fresh image's free-block count
-    w(4, 2053); // f_bavail
-    w(5, 4096); // f_files
-    w(6, 2048); // f_ffree
-    // f_fsid (slot 7) stays zero; nothing reads it.
-    w(8, 255); // f_namelen
-    w(9, 4096); // f_frsize
-    w(10, 0); // f_flags: not read-only — this root writes now
-    if !copy_to_user(buf, &s) {
+    // Trim step 2: `akuma_syscalls_linux::Statfs`, whose 120-byte size the
+    // crate asserts (musl copies `f_spare` too). Same numbers the deleted
+    // slot-writer spelled; `f_fsid` stays zero, nothing reads it.
+    let s = akuma_syscalls_linux::Statfs {
+        f_type: 0xEF53,
+        f_bsize: 4096,
+        f_blocks: 4096, // 16 MiB / 4 KiB
+        f_bfree: 2053,  // the fresh image's free-block count
+        f_bavail: 2053,
+        f_files: 4096,
+        f_ffree: 2048,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: 0, // not read-only — this root writes now
+        f_spare: [0; 4],
+    };
+    // SAFETY: `repr(C)` plain-old-data; viewing it as its own bytes is well
+    // defined (same precedent as fill_stat64 above).
+    let raw: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(s).cast::<u8>(),
+            core::mem::size_of::<akuma_syscalls_linux::Statfs>(),
+        )
+    };
+    if !copy_to_user(buf, raw) {
         return e(ring3::err::EFAULT);
     }
     0
@@ -1273,24 +1285,34 @@ fn nr_name(nr: u64) -> &'static str {
 /// Fill the x86_64 `struct stat` (144 bytes) at the task's `buf`: device
 /// numbers and all times zero (one disk, no clock), the rest from the
 /// arguments. `Err(errno)` on a bad task pointer.
-fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result<(), u64> {    if !user_ok(buf, 144) {
+///
+/// Trim step 2: the layout is `akuma_syscalls_abi::stat::X8664`'s now, with
+/// its `offset_of!` assertions (st_nlink 16, st_mode 24, st_size 48, ...) —
+/// the same hop amd64's glue runs (fill the asm-generic `Stat`, `to_x86_64`
+/// re-lays it). The literal offsets this used to spell are gone; the padding
+/// words and times stay zero, exactly as they were.
+fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result<(), u64> {
+    if !user_ok(buf, 144) {
         return Err(ring3::err::EFAULT);
     }
-    let mut st = [0u8; 144];
-    let le = |v: u64| v.to_le_bytes();
-    st[0..8].copy_from_slice(&le(0)); // st_dev
-    st[8..16].copy_from_slice(&le(inode)); // st_ino
-    st[16..24].copy_from_slice(&le(links)); // st_nlink
-    st[24..28].copy_from_slice(&mode.to_le_bytes()); // st_mode
-    st[28..32].copy_from_slice(&0u32.to_le_bytes()); // st_uid
-    st[32..36].copy_from_slice(&0u32.to_le_bytes()); // st_gid
-    st[40..48].copy_from_slice(&le(0)); // st_rdev
-    st[48..56].copy_from_slice(&le(size)); // st_size
-    st[56..64].copy_from_slice(&le(4096)); // st_blksize
-    st[64..72].copy_from_slice(&le(size.div_ceil(512))); // st_blocks
-    // st_atime/mtime/ctime + nsec (offsets 72..120): zero — no clock, as
-    // everywhere in this kernel; the unused tail (120..144) stays zero too.
-    if !copy_to_user(buf, &st) {
+    let st = akuma_syscalls_abi::stat::to_x86_64(&akuma_syscalls_linux::Stat {
+        st_ino: inode,
+        st_mode: mode,
+        st_nlink: links as u32,
+        st_size: size as i64,
+        st_blksize: 4096,
+        st_blocks: size.div_ceil(512) as i64,
+        ..Default::default()
+    });
+    // SAFETY: `repr(C)` plain-old-data; viewing it as its own bytes is well
+    // defined (sock.rs's sockaddr_in writer is the local precedent).
+    let raw: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(st).cast::<u8>(),
+            core::mem::size_of::<akuma_syscalls_abi::stat::X8664>(),
+        )
+    };
+    if !copy_to_user(buf, raw) {
         return Err(ring3::err::EFAULT);
     }
     Ok(())
