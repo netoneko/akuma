@@ -103,8 +103,11 @@ esac
 
 grep -q '^outbound=1' "$RUNF" 2>/dev/null || fail "runfile missing outbound=1"
 grep -q "^disk=$IMG_DST" "$RUNF" 2>/dev/null || fail "runfile disk is not the apk image"
-grep 'guest disk:' "$LOG" | tail -1 >>"$L"
-grep 'guest disk:' "$LOG" | tail -1 | grep -q "$IMG_DST" || fail "console guest disk line wrong"
+# The console log rotates when herd re-parses mid-boot (seen 2026-10-26: the
+# boot's own 'guest disk:' line landed in vm-dev.log.old while the check read
+# the fresh file). Search both sides of the last rotation for the line.
+grep -h 'guest disk:' "$LOG" "$LOG.old" 2>/dev/null | tail -1 | grep -q "$IMG_DST" \
+  || fail "console guest disk line wrong"
 
 READY=$(( $(date +%s) - T0 ))
 echo "BOOT OK disk=$IMG_DST outbound=1 ready_in=${READY}s"

@@ -75,6 +75,10 @@ akuma-fdtable = { path = "../crates/akuma-fdtable" }
 # the asm-generic struct, `stat::to_x86_64` re-lays it, bytes to the task).
 akuma-syscalls-linux = { path = "../crates/akuma-syscalls-linux" }
 akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
+# Stage 8 (M3): select(2)'s fd-set marshalling for apk's fetcher, pulled not
+# hand-written - the crate doc records the exceptfds bug this class of hand
+# roll has already caused once in this tree.
+akuma-syscalls-poll = { path = "../crates/akuma-syscalls-poll" }
 # ---- The stage-4 crate line -------------------------------------------------
 #
 # The network stack: the AF_INET socket table and the smoltcp interface

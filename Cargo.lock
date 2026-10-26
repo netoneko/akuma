@@ -1261,6 +1261,7 @@ dependencies = [
  "akuma-ryzen-amd64",
  "akuma-syscalls-abi",
  "akuma-syscalls-linux",
+ "akuma-syscalls-poll",
  "akuma-trap-amd64",
  "akuma-vfs",
  "akuma-virtio",

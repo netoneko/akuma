@@ -22,7 +22,12 @@
 # D2 (stage 8 M2): ONE `nslookup alpinelinux.org` with NO server argument,
 # so the guest's own configuration is used; verdict is the console exit
 # status, and the relay's dns_answered counter (vm-dev.log status line)
-# rising across the exec is a NOTE line, not the verdict.#
+# rising across the exec is a NOTE line, not the verdict.
+# A1/A2/A3 (stage 8 M3): the repositories file on the per-boot COPY
+# (devroot-ensure), ONE unflagged `apk update` against the frozen LAN mirror
+# (mirror.sh start verifies the manifest first and aborts the run on a
+# mismatch; stop at the end), and the downloaded index byte-equal to the
+# mirror's APKINDEX.tar.gz (guest-side sha grep, G3's pattern).
 # Pacing: 15 s between execs, one exec per ssh connection - the host forward
 # degrades at ~30 connections per boot. If an exec's console slice shows no
 # "[SSHD] Accepted connection" while port 2224 still accepted it, the forward
@@ -56,15 +61,36 @@ fail_exit() { emit "ABORT $*"; exit 1; }
 [ -f "$LOG" ] || fail_exit "no console log $LOG - boot_dev.sh first"
 [ -f "$KERNEL" ] || fail_exit "no kernel ELF $KERNEL"
 
+# The frozen LAN mirror serves the WHOLE battery: the repositories line is
+# live in the image (devroot-ensure, stage-8 M3), so any network-enabled apk
+# exec dials :8123. With no listener the relay refuses the dial and NEVER
+# tells the guest (gw_refused counts up, resets stays 0) and the guest then
+# pins a vCPU at 100% forever - seen 2026-10-26: G3 hung ~13 min on both
+# boots, console silent, no Exit status. H1's own listener therefore moved
+# to :8124; the mirror owns :8123 for the whole run and is stopped at the
+# end. mirror.sh start verifies MANIFEST.sha256 first, aborting on mismatch.
+"$REPO/scripts/kvm/goose/mirror.sh" start >>"$OUT/gates-E.err" 2>&1 \
+  || fail_exit "mirror.sh start failed (manifest verify?)"
+
 # gate <name> <cmd>: one exec, console-first verdict.
 # G_rc: 0 pass (console Exit status: 0), 1 fail (nonzero status), 2 unknown
 # (no exit line). G_dead: 1 if the console never showed the accepted conn.
+# The console slice must survive a log rotation mid-exec (herd re-parses on
+# enable and rotates; seen 2026-10-26 as 0-byte slices and a lost verdict):
+# if the active log SHRANK since "before", the rotation happened - take the
+# frozen .old's tail plus the fresh active log in full; else the plain delta.
 gate() {
   name=$1; cmd=$2
+  before_old=$(wc -c < "$LOG.old" 2>/dev/null || echo 0)
   before=$(wc -c < "$LOG")
   run_ssh "$cmd" >"$OUT/$name.client" 2>&1 </dev/null
   sleep "$PACE"   # console drain + connection pacing in one
-  tail -c +$((before+1)) "$LOG" >"$OUT/$name.console" 2>/dev/null
+  if [ "$(wc -c < "$LOG")" -lt "$before" ]; then
+    { tail -c +$((before_old+1)) "$LOG.old" 2>/dev/null; cat "$LOG"; } \
+      >"$OUT/$name.console" 2>/dev/null
+  else
+    tail -c +$((before+1)) "$LOG" >"$OUT/$name.console" 2>/dev/null
+  fi
   if grep -q 'Exit status: 0' "$OUT/$name.console"; then G_rc=0
   elif grep -q 'Exit status:' "$OUT/$name.console"; then G_rc=1
   else G_rc=2; fi
@@ -132,7 +158,7 @@ vline G2 "$(agg "$RCS")" g2.console
 
 # G3: offline apk add, then the hash as guest-side exit codes.
 rgroup G3 \
-  'g3a=apk add --force-non-repository /pkgs/ca-certificates-bundle-20261020-r0.apk' \
+  'g3a=apk add --no-network --force-non-repository /pkgs/ca-certificates-bundle-20261020-r0.apk' \
   'g3b=sha256sum /etc/ssl/certs/ca-certificates.crt > /tmp/h' \
   'g3c=grep -c 5961c0a3 /tmp/h'
 vline G3 "$(agg "$RCS")" "g3a.console g3b.console g3c.console"
@@ -141,13 +167,14 @@ rgroup G4 'g4=ls /etc/ssl1.1/certs'
 vline G4 "$(agg "$RCS")" g4.console
 
 # H1: host listener rooted at $OUT/www, guest fetches through the relay.
+# Port 8124: :8123 belongs to the frozen mirror for the whole battery now.
 mkdir -p "$OUT/www"
 [ -f "$OUT/www/index.html" ] || echo hello-from-host >"$OUT/www/index.html"
-(cd "$OUT/www" && exec python3 -m http.server 8123) >/dev/null 2>&1 &
+(cd "$OUT/www" && exec python3 -m http.server 8124) >/dev/null 2>&1 &
 LPID=$!
 sleep 1
 rgroup H1 \
-  'h1a=busybox wget -qO /tmp/h1 http://192.168.1.159:8123/' \
+  'h1a=busybox wget -qO /tmp/h1 http://192.168.1.159:8124/' \
   'h1b=grep -c hello-from-host /tmp/h1'
 kill $LPID 2>/dev/null
 vline H1 "$(agg "$RCS")" "h1a.console h1b.console"
@@ -198,6 +225,41 @@ vline D2 "$(agg "$RCS")" d2.console
 D2_AFTER=$(dnsctr)
 note "dns_answered $D2_BEFORE -> $D2_AFTER"
 
+# A-group (stage 8 M3): `apk update` in the guest, signed (U1: the three
+# official alpine-devel keys ARE in /etc/apk/keys), against the frozen LAN
+# mirror - which is ALREADY up (started at the top of the battery; every
+# network-enabled apk exec needs it, see the note there). The group sits
+# right after D2 per the brief - and before W1's 11 execs, so the new gates
+# run at lower connection counts, clear of the ~30-connection forward
+# degradation.
+
+# A1: the repositories file is exactly the mirror line - put on the per-boot
+# COPY by boot_dev.sh through devroot-ensure; the .orig stays unmodified.
+# grep -cx: exit 0 iff one whole line matches (no comment lines left).
+rgroup A1 'a1=grep -cx http://192.168.1.159:8123/main /etc/apk/repositories'
+vline A1 "$(agg "$RCS")" a1.console
+
+# A2: ONE apk update, no flags - the guest's own repositories and keys.
+# Console exit 0 is the verdict; the mirror's request log gaining the index
+# GET is cross-checked host-side (a lost client capture cannot fake it).
+MLOG=/tmp/alpine-mirror-8123.log
+mreq() { grep -c 'GET /main/x86_64/APKINDEX.tar.gz' "$MLOG" 2>/dev/null; }
+A2_BEFORE=$(mreq)
+rgroup A2 'a2=apk update'
+rcA2=$(agg "$RCS")
+A2_AFTER=$(mreq)
+note "mirror APKINDEX GETs $A2_BEFORE -> $A2_AFTER"
+[ "${A2_AFTER:-0}" -le "${A2_BEFORE:-0}" ] && rcA2=1
+vline A2 "$rcA2" a2.console
+
+# A3: the downloaded bytes are the mirror's. Judge by content, not name -
+# the cache name's 8-hex is a hash of the repository URL, so the guest's
+# name differs from the Linux reference's (same sha256 does not).
+rgroup A3 \
+  'a3a=sha256sum /var/cache/apk/APKINDEX.*.tar.gz > /tmp/h' \
+  'a3b=grep -c c169fa06 /tmp/h'
+vline A3 "$(agg "$RCS")" "a3a.console a3b.console"
+
 # W1 (stage 8 trim step 2): the guest's own wire-struct bytes must equal the
 # pre-refactor W0 baseline. The group is SELF-CONTAINED: it re-applies W0's
 # two /etc mutations first (G3's apk add - idempotent, exits 0 re-installed -
@@ -216,7 +278,7 @@ W1F=$REPO/scripts/kvm/goose/w1_expected_hashes.txt
 [ -f "$W1F" ] || fail_exit "no $W1F - W0 baseline missing"
 WA=$(sed -n 1p "$W1F"); WB=$(sed -n 2p "$W1F"); WC=$(sed -n 3p "$W1F"); WD=$(sed -n 4p "$W1F")
 rgroup W1 \
-  'w1m1=apk add --force-non-repository /pkgs/ca-certificates-bundle-20261020-r0.apk' \
+  'w1m1=apk add --no-network --force-non-repository /pkgs/ca-certificates-bundle-20261020-r0.apk' \
   'w1m2=sh -c "echo taoxi > /etc/hostname"' \
   'w1r1=ls -lin /etc/hostname > /tmp/w1a' \
   'w1r2=df / > /tmp/w1b' \
@@ -231,5 +293,7 @@ vline W1a "$(echo "$RCS" | cut -c8)" w1a.console
 vline W1b "$(echo "$RCS" | cut -c9)" w1b.console
 vline W1c "$(echo "$RCS" | cut -c10)" w1c.console
 vline W1d "$(echo "$RCS" | cut -c11)" w1d.console
+
+"$REPO/scripts/kvm/goose/mirror.sh" stop >>"$OUT/gates-E.err" 2>&1 || true
 
 emit "GATES DONE restarts=$RESTARTED"
