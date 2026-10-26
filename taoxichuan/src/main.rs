@@ -2179,11 +2179,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::UNAME => {
-            // struct utsname: six NUL-terminated 65-byte fields. The release
-            // string is a plausible Linux one — apk prints it, nothing
-            // branches on it.
+            // struct utsname: six NUL-terminated 65-byte fields (the length
+            // is the crate's FIELD_LEN, which its own layout test pins). The
+            // release string is a plausible Linux one — apk prints it,
+            // nothing branches on it. Trim step 2: the field shape is
+            // `akuma_syscalls_linux::uts::Field` now — `set` zero-pads to
+            // exactly the 65 bytes the old `[0u8; 65]` literal did.
+            use akuma_syscalls_linux::uts;
             let buf = fr.arg1();
-            if !user_ok(buf, 65 * 6) {
+            if !user_ok(buf, uts::FIELD_LEN * 6) {
                 return e(ring3::err::EFAULT);
             }
             let fields: [&[u8]; 6] = [
@@ -2194,12 +2198,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 b"x86_64\0",
                 b"(none)\0",
             ];
+            let mut out = [0u8; uts::FIELD_LEN * 6];
             for (i, f) in fields.iter().enumerate() {
-                let mut one = [0u8; 65];
-                one[..f.len()].copy_from_slice(f);
-                if !copy_to_user(buf + (i as u64) * 65, &one) {
-                    return e(ring3::err::EFAULT);
-                }
+                let mut one = uts::Field::empty();
+                let set = one.set(f);
+                debug_assert!(set.is_ok(), "utsname fields are under NAME_MAX");
+                out[i * uts::FIELD_LEN..(i + 1) * uts::FIELD_LEN].copy_from_slice(one.as_bytes());
+            }
+            if !copy_to_user(buf, &out) {
+                return e(ring3::err::EFAULT);
             }
             0
         }
