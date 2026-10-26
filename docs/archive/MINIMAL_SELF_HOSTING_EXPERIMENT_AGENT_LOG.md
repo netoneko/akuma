@@ -1166,3 +1166,28 @@ with a short prompt, per the runbook): 110 + 22 tool calls, 5.4M + 0.9M input to
 
 **Next:** M4 `apk add curl` (index proven; add exercises unpack and likely `ftruncate`/sendfile), then trim step 3 (net.rs hygiene, H1 as canary), then M5 `PT_INTERP` + `curl --version`. The relay RST fix is a
 candidate for its own small session before M4 or inside it.
+
+
+### Stage 8 session M (2026-10-26): M4 `apk add curl` in the guest - B1 B2 B3 B4 PASS
+
+**Result.** Brief `scripts/kvm/goose/taoxichuan-08m-apk-add-curl.md`. The first context died with the box (it reset at about 15:09 UTC, see below) after 46 tool calls / 1.0M input tokens; the resumed context ran 105 calls / 5.8M input tokens
+(15:30-17:17 UTC). `taoxichuan-s4` @ `9d39529a`. Final binary (`49521550`) passed the main battery (19 gates) in one boot and `B1 B2 B3 B4` in their own boot, both `restarts=0`, 0 `Fault|PANIC|sig!`. Details: `RESULT-M.md` on the box.
+- **M4:** one unflagged `apk add curl` against the frozen mirror, rc 0, `OK: 11.8 MiB in 14 packages`, 16 mirror GETs; `/etc/apk/world` gains `curl`; the six reference sha256 prefixes match, including `/usr/bin/curl 9eb8284f`, `libcurl 1ee39403`
+  and the image's own `/lib/ld-musl-x86_64.so.1 095b047c` (apk did not replace the loader with a different build). Nothing unpacked was executed (curl is a dynamic PIE; loader work is M5). No `.post-install`/trigger ran (U2 held).
+- **Deviation (B4):** the brief's `apk verify curl` takes `.apk` file paths and the cache does not keep fetched packages, so B4 became `apk info -e curl` (exit 0); B3's hashes carry the integrity check.
+- **Kernel changes** (`ef02ac68`): `fill_statfs` reads the real superblock through `Filesystem::stats` (`akuma-ext2`/`akuma-vfs`, pulled); a new `FTRUNCATE` (77) arm over `akuma-ext2`'s `truncate_by_inode` (pulled; about 20 lines of fd-table marshalling
+  written new); a per-call `[statfs]` console line (written new, observability). `taoxichuan/src` 4,891 -> 4,916 lines (the 4,856 in the earlier entry predates this session's start); `akuma-*` dependencies stay 19.
+- **FINDING - `W1b` never covered filesystem sizes.** The guest has no procfs and this busybox `df` enumerates mounts through `/proc/mounts`, so `df /` prints only its header line and exits 1 (a valid `/etc/mtab` changes nothing). `W1b`'s hash is the
+  sha256 of that one header line, so the brief's "W1b's hash changes on purpose" premise was wrong. The statfs substance is on the console instead: `[statfs] blocks=262144 bsize=4096 free=258285` on a fresh boot (exactly 1 GiB) and `free=255096` after the
+  unpack (about 12.4 MB consumed). The old fixed answer (2,053 free blocks, about 8 MiB) could not have held the 12.6 MB closure. `W1b` stays as a header-bytes canary until a procfs or a `df` substitute exists.
+- **FINDING (open, pre-M5) - `apk info -L curl` kills the guest.** apk NULL-writes in ring 3 (`[Fault] ring3 PageFault ... cr2=0x0 code=0x6 -- task killed`, after a 5.4 MB kernel-heap allocation), and a ring-3 fault parks the whole guest by design (no reaper at this stage). It may be the
+  same mmap path M5 must fix. Not fixed here.
+- **Open housekeeping:** the per-call `[statfs]` print is debug output and must be removed (or cmdline-gated) before the kernel is final; the automated Statfs verdict is unreliable because herd replaces `vm-dev.log.old` mid-boot (evidence-collection flakiness, not a statfs fault);
+  the relay still sends no RST for a refused dial (carried from session L).
+- **The box reset (about 15:09 UTC):** Akuma had been up about 5 hours and was running goose's kernel build; its klog ends with repeated `[bkls>] core=2 owner=6 spins=1048576 / 2097152 / 4194304` warnings (the ticket numbers advanced, so long BKL contention, not a deadlock),
+  then stops with no panic text; the machine came up on Pop (the GRUB default) at 17:09:02 local. Not diagnosed beyond that; it matches the BKL-stall class already in the notes. The goose session and its uncommitted work survived on disk; the supervisor rebooted into Akuma and resumed with a short prompt.
+- **Supervisor actions:** cancelled one session start when the other agent turned out to be using the same box (its `boot_dev.sh` fix, `9202d190`/`e3f4e2f3`, explained the 856 MiB reading: herd started the stopped service during the 1 GiB image rewrite); sent one steer to stop gate polishing once B1-B4 had passed.
+
+**Host track (Sonnet), merged tree @ `1df3ac77`:** one clean merge. `taoxichuan-fc.bin` 662,792 B (unchanged), Lima `fc` boot: 162 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`. PASS.
+
+**Next:** a planning-only session for the process model (fork/clone/execve/wait4/pipes, `scripts/kvm/goose/taoxichuan-08n-process-model-plan.md`), then trim step 3, then M5 (`PT_INTERP` + `curl --version`), with the `apk info -L` crash looked at first.
