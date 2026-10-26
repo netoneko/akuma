@@ -803,6 +803,7 @@ fn open_common(path: &str, flags: u64) -> u64 {
     // Stage 6: write access is served — apk unpacks with O_WRONLY|O_CREAT|
     // O_TRUNC. The description is an ext2 lookup (or create) — no VFS mount
     // table, one root.
+    let traced = path.starts_with("/tmp/"); // TRACE (s7d settle)
     let acc = flags & ring3::open::O_ACCMODE;
     // Stage 4: symlinks resolve (`/bin/sh` is one). A fresh O_CREAT file has
     // no links to resolve; `resolve_effective` passes such a path through.
@@ -862,6 +863,10 @@ fn open_common(path: &str, flags: u64) -> u64 {
         return e(ring3::err::EMFILE);
     };
     let fd = table.alloc_fd_from(3, desc);
+    // TRACE (s7d step-1 settle): where a shell redirect's file lands.
+    if traced {
+        akuma_primitives::safe_print!(112, "  [o] open flags={:#x} -> {}\n", flags, fd);
+    }
     if flags & ring3::open::O_CLOEXEC != 0 {
         table.set_cloexec(fd); // O_CLOEXEC: recorded, nothing execs yet
     }
@@ -932,6 +937,15 @@ fn write_file_arm_inner(fd: u64, buf: u64, len: u64) -> u64 {
 /// the fd used to fail EBADF there and stdio swallowed the error, which is
 /// why the file was created empty with a silent rc 1 (stage 7 session A).
 fn writev_file_arm(fd: u64, data: &[u8]) -> u64 {
+    let r = writev_file_arm_inner(fd, data);
+    // The writev twin of the [w] probe: which file writes ride writev
+    // (U1's settle — musl's stdio flushes through writev even for one
+    // buffer, ash's builtin echo flushes through write).
+    akuma_primitives::safe_print!(96, "  [wv] fd={} len={} -> {}\n", fd, data.len() as u64, r);
+    r
+}
+
+fn writev_file_arm_inner(fd: u64, data: &[u8]) -> u64 {
     let mut total = 0u64;
     let mut res: Result<u64, u64> = Ok(0);
     let found = fd_table().update(fd as u32, |of| {
@@ -1034,8 +1048,13 @@ fn lstat_path(path: &str, buf: u64) -> u64 {
     if name.is_empty() {
         stat_path(path, buf)
     } else {
+        // Linux resolves every component but the last: the parent may name
+        // a symlink (`/etc/ssl1.1/certs` -> `/etc/ssl/certs`), so it goes
+        // through the same chain walker `stat` uses; only the final name is
+        // then served from the resolved parent's listing, unfollowed.
+        let parent = resolve_effective(parent);
         let fs = root_fs();
-        let Ok(entries) = fs.read_dir(parent) else {
+        let Ok(entries) = fs.read_dir(&parent) else {
             return e(ring3::err::ENOENT);
         };
         let Some(ent) = entries.iter().find(|e| e.name == name) else {
@@ -1088,7 +1107,10 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
     if !user_ok(buf, 144) {
         return e(ring3::err::EFAULT);
     }
-    if fd <= 2 || fd as u32 >= SLOT_CEILING {
+    // Stage 7 step 1: the table decides, not the number — a bound fd 1/2
+    // (a dup'd file) stats itself; only an UNBOUND fd is EBADF (`with`
+    // answers None, and so does any fd at or past the ceiling).
+    if fd as u32 >= SLOT_CEILING {
         return e(ring3::err::EBADF);
     }
     let info = fd_table().with(fd as u32, |d| match d {
@@ -1155,6 +1177,7 @@ fn fs_err(err: akuma_vfs::FsError) -> u64 {
 fn nr_name(nr: u64) -> &'static str {
     match nr {
         ring3::nr::READ => "read",
+        ring3::nr::READV => "readv",
         ring3::nr::SENDFILE => "sendfile",
         ring3::nr::WRITE => "write",
         ring3::nr::OPEN => "open",
@@ -1273,6 +1296,89 @@ fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result
     Ok(())
 }
 
+/// The read body shared by `read` (2) and `readv` (2) — stage 7 step 1's
+/// table-first routing, extracted when readv needed the same per-kind
+/// dispatch musl's stdio read rides. One read of up to `len` bytes into
+/// the task buffer at `buf_va`. Bound fds are served by kind whatever
+/// their number; only an UNBOUND fd falls to the console rules (fd 0 is
+/// EOF — the console has no input path — every other unbound number is
+/// EBADF).
+fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
+    if len > WRITE_LIMIT || !user_ok(buf_va, len) {
+        return e(ring3::err::EFAULT);
+    }
+    if (fd as u32) < SLOT_CEILING {
+        // Stage 4: socket fds read through sock.rs; a spawned child's
+        // stdout fd drains its pipe (then EOF).
+        let mut slot_idx: usize = usize::MAX;
+        let kind = fd_table().with(fd as u32, |d| match d {
+            OpenFile::Socket(_) => 1,
+            OpenFile::ChildOut(slot) => {
+                slot_idx = *slot;
+                2
+            }
+            _ => 0,
+        });
+        match kind {
+            Some(1) => return sock::read_arm(fd, buf_va, len),
+            Some(2) => return child::read_child_out(slot_idx, buf_va, len),
+            _ => {}
+        }
+        let mut chunk = [0u8; 512];
+        let mut res: Result<u64, u64> = Ok(0);
+        let found = fd_table().update(fd as u32, |of| match of {
+            OpenFile::Dir { .. } => res = Err(ring3::err::EISDIR),
+            OpenFile::File { inode, offset, size } => {
+                let mut total = 0u64;
+                while total < len {
+                    let want = ((len - total) as usize).min(chunk.len());
+                    let have = size.saturating_sub(*offset) as usize;
+                    let n = want.min(have);
+                    if n == 0 {
+                        break;
+                    }
+                    match root_fs()
+                        .read_at_by_inode(*inode, *offset as usize, &mut chunk[..n])
+                    {
+                        Ok(0) => break,
+                        Ok(got) => {
+                            if !copy_to_user(buf_va + total, &chunk[..got]) {
+                                res = Err(ring3::err::EFAULT);
+                                return;
+                            }
+                            *offset += got as u64;
+                            total += got as u64;
+                            if got < n {
+                                break; // short read: end of file
+                            }
+                        }
+                        Err(_) => {
+                            res = Err(ring3::err::EIO);
+                            return;
+                        }
+                    }
+                }
+                res = Ok(total);
+            }
+            // Socket and ChildOut fds were served above; the closure's
+            // match stays exhaustive so a new kind cannot silently fall
+            // through to the file path. Null reads are EOF — the default
+            // `Ok(0)` — which is the device's contract.
+            OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::Null => {}
+        });
+        match (found, res) {
+            (true, Err(no)) => return e(no),
+            (true, Ok(n)) => return n,
+            // Unbound (found = false): the console rules below.
+            _ => {}
+        }
+    }
+    if fd != 0 {
+        return e(ring3::err::EBADF);
+    }
+    0
+}
+
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     match fr.rax {
         ring3::nr::WRITE => {
@@ -1280,26 +1386,16 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             if len > WRITE_LIMIT || !user_ok(buf, len) {
                 return e(ring3::err::EFAULT);
             }
-            // Stage 4: a nested child's fd 1 is the pipe (the buffer its
-            // parent drains through the ChildOut fd); everything else —
-            // sshd's own stdout/stderr included — is the console, as before.
-            if child::nested_active() && fd == 1 {
-                if !child::child_write(buf, len) {
-                    return e(ring3::err::EFAULT);
-                }
-                return len;
-            }
-            if fd == 1 || fd == 2 {
-                if !emit(buf, len) {
-                    return e(ring3::err::EFAULT);
-                }
-                return len;
-            }
+            // Stage 7 step 1 (H3): table-first routing, the order WRITEV
+            // has had since 6879eb47 — a bound fd is served by its kind
+            // whatever its number, so a shell redirect that dup2's a file
+            // onto fd 1 captures `echo`'s write(2) flush instead of
+            // leaking it to the console (the bytes-did-not-land symptom).
             // The only other writable kinds: a socket fd (sock.rs answers
-            // ENOTSOCK for anything else that is open, EBADF comes from the
-            // get below), a regular file fd (stage 6 — the ext2 write path;
-            // apk unpacks through this), and the null device (stage 7 —
-            // writes vanish, the count is still the whole length).
+            // ENOTSOCK for anything else that is open), a regular file fd
+            // (stage 6 — the ext2 write path; apk unpacks through this),
+            // and the null device (stage 7 — writes vanish, the count is
+            // still the whole length).
             let kind = fd_table().with(fd as u32, |d| match d {
                 OpenFile::Socket(_) => 1,
                 OpenFile::File { .. } => 2,
@@ -1312,7 +1408,23 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 Some(3) => return len,
                 _ => {}
             }
-            e(ring3::err::EBADF)
+            // Unbound: only 1/2 fall back — a nested child's fd 1 is the
+            // pipe (the buffer its parent drains through the ChildOut fd),
+            // sshd's own stdout/stderr are the console as before — and
+            // every other unbound number, fd 0 included, is EBADF.
+            if fd != 1 && fd != 2 {
+                return e(ring3::err::EBADF);
+            }
+            if child::nested_active() && fd == 1 {
+                if !child::child_write(buf, len) {
+                    return e(ring3::err::EFAULT);
+                }
+                return len;
+            }
+            if !emit(buf, len) {
+                return e(ring3::err::EFAULT);
+            }
+            len
         }
         ring3::nr::WRITEV => {
             // musl's stdio flush: `writev(fd, iov, iovcnt)`, 16-byte iovecs.
@@ -1548,83 +1660,50 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::READ => {
-            // fd 0: the console has no input path wired, so read(0) is EOF —
-            // the honest answer, not a hang. fds 1/2 are write-only. Any
-            // other number must name a file fd from `openat`; directories
-            // refuse with `EISDIR` the way Linux's read does.
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
-            if len > WRITE_LIMIT || !user_ok(buf, len) {
+            read_fd_arm(fd, buf, len)
+        }
+        ring3::nr::READV => {
+            // musl's stdio reads EVERY stream through readv (one user
+            // buffer plus the stream's pending window as the second
+            // iovec) — busybox wget's response read died ENOSYS right
+            // here, after the relay had already moved the response to
+            // the guest (the `unhandled ? (19)` that cost H1 its first
+            // completed connect). Same routing contract as read via
+            // read_fd_arm; the vector stops at the first short transfer
+            // (continuing past it would splice the stream — fs.md's
+            // readv rule), zero-length iovecs are skipped, and an error
+            // mid-vector returns the bytes that already moved.
+            let (fd, iov_va, iovcnt) = (fr.arg1(), fr.arg2(), fr.arg3());
+            if iovcnt == 0 || iovcnt > 1024 || !user_ok(iov_va, iovcnt * 16) {
                 return e(ring3::err::EFAULT);
             }
-            if fd == 0 {
-                return 0;
-            }
-            // Stage 4: socket fds read through sock.rs; a spawned child's
-            // stdout fd drains its pipe (then EOF).
-            if (fd as u32) < SLOT_CEILING {
-                let mut slot_idx: usize = usize::MAX;
-                let kind = fd_table().with(fd as u32, |d| match d {
-                    OpenFile::Socket(_) => 1,
-                    OpenFile::ChildOut(slot) => {
-                        slot_idx = *slot;
-                        2
-                    }
-                    _ => 0,
-                });
-                match kind {
-                    Some(1) => return sock::read_arm(fd, buf, len),
-                    Some(2) => return child::read_child_out(slot_idx, buf, len),
-                    _ => {}
+            let mut total = 0u64;
+            for i in 0..iovcnt {
+                let mut iv = [0u8; 16];
+                if !copy_from_user(&mut iv, iov_va + i * 16) {
+                    return e(ring3::err::EFAULT);
+                }
+                let (base, len) = (
+                    u64::from_le_bytes(iv[0..8].try_into().unwrap()),
+                    u64::from_le_bytes(iv[8..16].try_into().unwrap()),
+                );
+                if len > WRITE_LIMIT || !user_ok(base, len) {
+                    return e(ring3::err::EFAULT);
+                }
+                if len == 0 {
+                    continue;
+                }
+                let got = read_fd_arm(fd, base, len);
+                if got & 0x8000_0000_0000_0000 != 0 {
+                    return if total == 0 { got } else { total };
+                }
+                total += got;
+                if got < len {
+                    break;
                 }
             }
-            if fd == 1 || fd == 2 || fd as u32 >= SLOT_CEILING {
-                return e(ring3::err::EBADF);
-            }
-            let mut chunk = [0u8; 512];
-            let mut res: Result<u64, u64> = Ok(0);
-            let found = fd_table().update(fd as u32, |of| match of {
-                OpenFile::Dir { .. } => res = Err(ring3::err::EISDIR),
-                OpenFile::File { inode, offset, size } => {
-                    let mut total = 0u64;
-                    while total < len {
-                        let want = ((len - total) as usize).min(chunk.len());
-                        let have = size.saturating_sub(*offset) as usize;
-                        let n = want.min(have);
-                        if n == 0 {
-                            break;
-                        }
-                        match root_fs().read_at_by_inode(*inode, *offset as usize, &mut chunk[..n]) {
-                            Ok(0) => break,
-                            Ok(got) => {
-                                if !copy_to_user(buf + total, &chunk[..got]) {
-                                    res = Err(ring3::err::EFAULT);
-                                    return;
-                                }
-                                *offset += got as u64;
-                                total += got as u64;
-                                if got < n {
-                                    break; // short read: end of file
-                                }
-                            }
-                            Err(_) => {
-                                res = Err(ring3::err::EIO);
-                                return;
-                            }
-                        }
-                    }
-                    res = Ok(total);
-                }
-                // Socket and ChildOut fds were served above; the closure's
-                // match stays exhaustive so a new kind cannot silently fall
-                // through to the file path. Null reads are EOF — the default
-                // `Ok(0)` — which is the device's contract.
-                OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::Null => {}
-            });
-            match (found, res) {
-                (false, _) => e(ring3::err::EBADF),
-                (_, Err(no)) => e(no),
-                (_, Ok(n)) => n,
-            }
+            total
         }
         ring3::nr::UTIMENSAT => {
             // utimensat(2), apk's post-install "preserve mtime" pass — the
@@ -1716,39 +1795,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
-            let Some(idx) = path.rfind('/') else {
-                return e(ring3::err::ENOENT);
-            };
-            let (parent, name) = (&path[..idx.max(1)], &path[idx + 1..]);
-            if name.is_empty() {
-                // The root itself (or a trailing slash): nothing to not-follow.
-                match root_fs().metadata(path) {
-                    Ok(md) => match fill_stat64(buf, md.inode, md.mode, md.size, 2) {
-                        Ok(()) => 0,
-                        Err(no) => e(no),
-                    },
-                    Err(_) => e(ring3::err::ENOENT),
-                }
-            } else {
-                let fs = root_fs();
-                let Ok(entries) = fs.read_dir(parent) else {
-                    return e(ring3::err::ENOENT);
-                };
-                let Some(ent) = entries.iter().find(|e| e.name == name) else {
-                    return e(ring3::err::ENOENT);
-                };
-                let mode = if ent.is_symlink {
-                    0o120777 // S_IFLNK | rwxrwxrwx: the convention for links
-                } else if ent.is_dir {
-                    0o40755
-                } else {
-                    0o100644
-                };
-                match fill_stat64(buf, 0, mode, ent.size, if ent.is_dir { 2 } else { 1 }) {
-                    Ok(()) => 0,
-                    Err(no) => e(no),
-                }
-            }
+            lstat_path(path, buf)
         }
         ring3::nr::FCNTL => {
             // The fd-flag commands only; the table owns the cloexec bit.
@@ -1784,13 +1831,61 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                     0
                 }
-                _ => e(ring3::err::EINVAL),
+                0 | 1030 => {
+                    // F_DUPFD / F_DUPFD_CLOEXEC: busybox ash saves and
+                    // restores the stdio fds around a redirect through
+                    // these (fcntl(1, F_DUPFD, 10) before it closes fd 1)
+                    // — without them every `echo x > file` aborts rc 1
+                    // right after open+create: the file exists, the bytes
+                    // never come, nothing is printed. The table does the
+                    // lowest-free allocation and alloc always clears both
+                    // per-number bits; F_DUPFD_CLOEXEC then sets cloexec.
+                    if arg >= u64::from(SLOT_CEILING) {
+                        return e(ring3::err::EINVAL);
+                    }
+                    let Some(desc) = fd_table().with(fd as u32, clone_desc) else {
+                        // TRACE: the phantom-console case — fd 0/1/2 have no
+                        // table entry on this kernel, so the save fails here.
+                        akuma_primitives::safe_print!(
+                            96,
+                            "  [fc] F_DUPFD {} >= {}: EBADF (unbound src)\n",
+                            fd,
+                            arg
+                        );
+                        return e(ring3::err::EBADF);
+                    };
+                    let mut table = fd_table();
+                    let Some(slot) = table.free_below(arg as u32, SLOT_CEILING) else {
+                        return e(ring3::err::EMFILE);
+                    };
+                    let newfd = table.alloc_fd_from(slot, desc);
+                    if cmd == 1030 {
+                        table.set_cloexec(newfd);
+                    }
+                    u64::from(newfd)
+                }
+                other => {
+                    // Name the gap the way the syscall checklist does: an
+                    // fcntl command a guest really needed shows up here.
+                    akuma_primitives::safe_print!(
+                        96,
+                        "  [fc] fcntl cmd={} fd={}: EINVAL\n",
+                        other,
+                        fd
+                    );
+                    e(ring3::err::EINVAL)
+                }
             }
         }
         ring3::nr::CLOSE => {
             // fds 0/1/2 are the console and hold no kernel reference to
             // release; closing them is the no-op Linux's stdio-close is.
             let fd = fr.arg1();
+            // TRACE (s7d step-1 settle): the redirect's close(1) and the
+            // save-slot cleanup (10).
+            if fd <= 2 || fd == 10 {
+                akuma_primitives::safe_print!(96, "  [c] close {}\n", fd);
+            }
             if fd <= 2 {
                 return 0;
             }
@@ -2005,7 +2100,11 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         ring3::nr::LSEEK => {
             let (fd, off, whence) = (fr.arg1(), fr.arg2().cast_signed(), fr.arg3());
-            if fd <= 2 || fd as u32 >= SLOT_CEILING {
+            // Stage 7 step 1: the table decides, not the number — a bound
+            // fd 1/2 (a dup'd file) is served by its kind, seekable files
+            // seek and sockets answer ESPIPE; only an UNBOUND fd is EBADF
+            // (found = false leaves `res` at its EBADF init).
+            if fd as u32 >= SLOT_CEILING {
                 return e(ring3::err::EBADF);
             }
             let mut res: Result<u64, u64> = Err(ring3::err::EBADF);
@@ -2222,6 +2321,8 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             match fd_table().dup_to(old as u32, new as u32, is_dup3 && flags & O_CLOEXEC != 0) {
                 Ok(d) => {
+                    // TRACE (s7d step-1 settle): the redirect bind step.
+                    akuma_primitives::safe_print!(96, "  [d] dup {}->{} ok\n", old, new);
                     // Whatever `new` named is displaced: release a displaced
                     // socket's kernel side exactly as close() does.
                     if let Some(OpenFile::Socket(idx)) = d.displaced {
@@ -2240,7 +2341,11 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                         None => e(ring3::err::EBADF),
                     }
                 }
-                Err(fdtable::DupError::BadFd) => e(ring3::err::EBADF),
+                Err(fdtable::DupError::BadFd) => {
+                    // TRACE: a failed bind is exactly what an empty redirect is.
+                    akuma_primitives::safe_print!(96, "  [d] dup {}->{} EBADF\n", old, new);
+                    e(ring3::err::EBADF)
+                }
             }
         }
         ring3::nr::MREMAP => {
