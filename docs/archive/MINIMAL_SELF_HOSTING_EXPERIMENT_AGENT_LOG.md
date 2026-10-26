@@ -1139,3 +1139,30 @@ Five families, one commit each (stat+statfs, getdents64, uname, time structs, `n
 **Host track (Sonnet), merged tree @ `d0de0601`:** one merge, no conflicts. `taoxichuan-fc.bin` 662,792 B (unchanged), Lima `fc` boot: 162 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`. PASS.
 
 **Next:** M3 `apk update` (repositories file + keys in the image, `vm-dev.conf.stage7-hostrelay`), then M4 `apk add curl`, trim step 3, M5 `PT_INTERP` + `curl --version`.
+
+
+### Stage 8 session L (2026-10-26): M3 `apk update` from the guest - A1 A2 A3 PASS
+
+**Result.** Brief `scripts/kvm/goose/taoxichuan-08l-apk-update.md`, goose session 75 min (12:44-14:00 UTC) plus a 15 min close-out session (the first one hung on a model call after the gates passed and was restarted
+with a short prompt, per the runbook): 110 + 22 tool calls, 5.4M + 0.9M input tokens. `taoxichuan-s4` @ `7e3b422f`. Final battery on one clean boot:
+`PASS G1 G2 G3 G4 H1 H2 H3a H3b H3c C1 D1 D2 A1 A2 A3 W1a W1b W1c W1d`, `restarts=0`, 0 `Fault|PANIC|sig!`. Details: `RESULT-L.md` on the box.
+- **M3:** one unflagged `apk update` in the guest against `http://192.168.1.159:8123/main`, signed with the image's own three alpine-devel keys (no `--allow-untrusted`), rc 0; the mirror saw exactly one
+  `GET /main/x86_64/APKINDEX.tar.gz`, and the cached index hashes to `c169fa06...`, byte-equal to the mirror's. `/etc/apk/repositories` is written on the per-boot COPY by `devroot-ensure` (the `.orig` holds only an
+  "offline staging" comment line).
+- **The one kernel change** (`12aebebf`): a `select(2)` arm (x86_64 nr 23), because apk's fetcher blocks in `select`, which busybox wget (H1's client) never used. Pulled: fd-set arithmetic from
+  `akuma-syscalls-poll::fdset` (19th path dependency) and x86_64 `getpid` (39) from `akuma-syscalls-abi`; extracted in-kernel: readiness probing out of `poll_arm` into a shared `fd_events`.
+  `taoxichuan/src` 4,744 -> 4,856 lines (it grew: the milestone bought the fetcher's syscall surface).
+- **OPEN, found here: a refused outbound dial is never signalled to the guest.** With the repositories file live and no listener on :8123, the relay refuses the SYN (`gw_syns=9/10 gw_refused=9/10 resets=0`) but sends
+  the guest no RST, so the guest's connect/select never returns: vCPU pinned `c4=100%`, console silent, and the host ssh client burns 10 retries (~13 min) per exec. Goose worked around it in the gate scripts
+  only (mirror started first; H1's listener moved to :8124; genuinely-offline installs use `--no-network`). The relay itself (`amd64/src/kvm/relay.rs` / the gateway in `akuma-svm-amd64`) still needs to
+  answer a refused dial with an RST. Any apk or curl against a dead mirror will hang the guest until then.
+- **Other findings:** herd rotates `vm-dev.log` mid-boot (the old log holds the guest-disk line; `boot_dev.sh` now checks both sides, `4fc359de`); the host forward died early in about a third of the batteries over
+  sessions K and L (script restart-once recovers it, but a restarted run is `restarts=1` and needs a clean rerun for the gate); `[sc] unhandled Ftruncate (77)` and nr 40 (sendfile) were tolerated and are the likely
+  M4 arms.
+- **Supervisor actions:** killed a wedged `run_gates.sh` and its ssh client (not the VM) after the second G3 hang, then sent goose a facts-only steer; restarted goose and resent a short close-out prompt after
+  the final hang.
+
+**Host track (Sonnet), merged tree @ `6923d620`:** one clean merge. `taoxichuan-fc.bin` 662,792 B (unchanged), Lima `fc` boot: 162 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`. PASS.
+
+**Next:** M4 `apk add curl` (index proven; add exercises unpack and likely `ftruncate`/sendfile), then trim step 3 (net.rs hygiene, H1 as canary), then M5 `PT_INTERP` + `curl --version`. The relay RST fix is a
+candidate for its own small session before M4 or inside it.
