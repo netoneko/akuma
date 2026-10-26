@@ -1066,3 +1066,5 @@ carried context cost); (3) fresh contexts per job; (4) a mock-verified script be
 (c) sending the whole 8 KB brief as the *prompt* stalled the first model call of two sessions while the same text delivered as a file the agent reads in 60-line windows
 (`/root/dev-cycle/taoxichuan-s7/BRIEF-*.md`, a 3-line prompt) started at once. The practice from here: **brief as a file on the box, short prompt, `python3 file.py < /dev/null`, one
 clean goose server.**
+- **Host track (Sonnet), merged tree `litter/taoxichuan-s4` @ `fa8a1c53` (merge `53e83e80`):** `scripts/build_taoxichuan_fc.sh` -> `taoxichuan-fc.bin` 662,792 B (unchanged: the
+  stage 7 changes are all in the amd64-only `taoxichuan/` and `akuma-ring3-amd64`), Lima `fc` boot with disk: 162 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`. PASS.
