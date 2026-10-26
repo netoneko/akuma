@@ -16,6 +16,23 @@ network hang), `abiprobe`, `epollprobe`/`memprobe`/`futexprobe` (per-syscall cos
 Name the one that fits this gate, and how to build it (`userspace/build.sh --<name>-only`).
 (Docs are in the checkout under `docs/`; the front door is `docs/README.md`, its symptom matrix lists the right doc.)
 
+## Premises (examine these before you edit anything)
+Every claim this brief makes that you did not see pass on this box is a premise, and premises have been wrong in about one brief in two (a gate that needed `fork`, a probe that builds only for aarch64, an applet that is not in the image, a hash that never covered what it was named for,
+a loader described as welded that was already an adapter, syscalls described as served that were ENOSYS). The supervisor fills this table before sending and has run each check once; **your first job, before the first edit, is to re-run each check yourself and write one line per row in RESULT-X.md: HOLDS / WRONG (what you saw) / UNCHECKED.**
+A WRONG row that changes the plan is reported to the owner as soon as you commit, not discovered at the end. About 10 tool calls for the whole table.
+| # | premise | read-only check (exact command) | supervisor saw |
+|---|---|---|---|
+| 1 | <e.g. the reference value is X> | `<command>` | <output> |
+
+## Probe discovery (before you write any probe, gate or script)
+List what already exists that exercises this capability, and run the cheapest one first. Search, in this order, and write the hit list (path, what it checks, how to run it, what it printed) in RESULT-X.md: (1) `userspace/*probe*` and `userspace/forktest/c_stress/` (syscall behaviour, differential against Linux); (2) `scripts/*_suite.py` and
+`scripts/benchmarks/` (futex, epoll, mem suites run the same static binary on Linux and Akuma); (3) host tests in the crate that owns the logic (`cargo test -p <crate> --target $HOST`); (4) `scripts/kvm/goose/run_gates.sh` groups (reuse a gate's shape; do not invent a new verdict style); (5) a binary that already runs on the full amd64 kernel on this box (the **reference behaviour** for a gate can be measured there
+in one command, as `curl --version` was). A new probe is allowed only when this list says why none of the existing ones fits, and it goes into `userspace/` or `scripts/kvm/goose/`, never `/tmp`. When a gate fails, find the existing probe that isolates the failing syscall before reading kernel code.
+
+## Guest facts (verified; do not rediscover, and do not write gates that contradict them)
+No `fork`/`clone`: `sh` runs one simple command per ssh exec (no `;`, `&&`, `$(...)`, pipes). No procfs: `ps`/`df` print only their header. busybox 1.35 in the image has no `stat` applet. `apk.static` 3.0.8; static and static-PIE binaries run, dynamic ones do not yet. One core. The host forward degrades near 30 ssh connections per boot (use gate groups of 20 or fewer). The root image is 1 GiB;
+herd rotates `vm-dev.log` mid-boot. Update this block when a session proves a new fact.
+
 ## Composition rule (mandatory; stages 1-4 had it, stages 6-7 lost it)
 `taoxichuan/` is a **composition root**, not a kernel written from scratch. At the start of stage 7 it was 4,450 newly written lines
 (`main.rs` 2,928) next to 101 existing crates and a full amd64 kernel that already implements nearly every syscall you will meet.
@@ -52,7 +69,12 @@ at the start and the end. A session that closes a gate and makes `taoxichuan/src
 ## Commit rule (you have no clock)
 Commit and `git push litter taoxichuan-s4` after every boot cycle that taught you something and after every fix that builds.
 WIP commits are fine. Never push `origin`. Gate arch-specific code with `cfg`; keep amd64-only crates out of default-members.
+**Checkpoint at the first green host test, and again before every kernel build that touches more than one file**: the box has reset once under a long build and uncommitted work survived only because it was on disk.
+Anything you add only to see (a debug `safe_print!`, a probe line) carries the tag `[tmp]` in its text and is listed under "Remove before final" in RESULT-X.md.
+
+## Budget (measured: cost per call is about 19k tokens under 40 calls and about 105k over 130 calls, because every call re-sends the context)
+About <N> tool calls for this session, and at 90 calls without a commit the supervisor will nudge you. A 5-hour z.ai window is about 34M tokens and a week about 205M on this plan; one session should stay well under 10M. If you are past the call budget without the gate passing, write what you have and stop: a fresh context with a short continuation prompt is cheaper than a long one.
 
 ## When to stop
 Gate passes in a clean boot, or <N> boots with no new evidence, or the quota error. Count boots, not minutes. Write
-`/root/dev-cycle/<dir>/RESULT-<X>.md` (gates, exact failing step with console evidence, what is next) and end the turn.
+`/root/dev-cycle/<dir>/RESULT-<X>.md` (the premise table results, the probe hit list, gates, exact failing step with console evidence, what is next) and end the turn.

@@ -1206,3 +1206,34 @@ candidate for its own small session before M4 or inside it.
 
 **Host track:** doc-only commit, no code change, so no Lima boot was run for it.
 **Next:** the `apk info -L curl` NULL-write crash and trim step 3, then M5 (`PT_INTERP` + `curl --version`); the plan's M1/M2 (fd-table-first routing, then the `;` gate) can run in parallel since they touch different code.
+
+
+### Process review (2026-10-26): what the sessions since the methodology change tell us
+
+**Data.** `scripts/goose_session_stats.py` over the goose session database (31 sessions, stage 1 to session O; session H's 194 calls / 11.1M tokens are missing from the export) and the z.ai usage API (`scripts/kvm/goose/zai_usage.py`, new).
+Stage 4 through 7D (before the pivot) against the 15 sessions after it:
+
+| | before | after |
+|---|---|---|
+| sessions / tool calls | 10 / 1,474 | 15 / 1,224 |
+| input tokens | 141M | 68M (about 80M with H) |
+| tokens per call | about 96k | about 56k |
+| tokens per hour of active work | 15M | 6.6M |
+| a typical milestone | 20-28M | 5-11M |
+
+- **Quota calibration** (percent against tokens inside the window, plan "lite"): weekly cap about 205M tokens (window = reset minus 7 days; the reset is 2026-11-01 19:35 UTC, so the week started 2026-10-25 19:35 UTC, not "the start of the 26th" as the supervisor handoff above says), 5-hour cap about 34M. z.ai's counts match the goose database
+  (75M on 2026-10-26 by both), so the stats script is a usable proxy. At the old 15M/hour a 5-hour window was gone in about 2.3 hours (session I ended on that limit); at the recent 3-6M/hour it is not reached. That is the "5-hour windows are getting longer".
+- **Cost per call rises with session length**, because every call re-sends the context: about 19k tokens per call under 40 calls, 30k at 40-79, 59k at 80-129, about 105k at 130 or more. Six sessions of 130+ calls account for 71% of all tokens (149M of 209M); only one of them is after the pivot (session I, 28.8M, which chased a bug its own last commit had already fixed).
+- **The cheap milestones share a recipe:** a prebuilt gate script, a reference value measured before the session, one milestone, and a stop rule (`apk update` 6.3M, `apk add curl` 6.8M, wire dedup 7.4M, the process-model plan 1.5M).
+- **Briefs carry a wrong premise about one time in two,** and goose's survey or evidence caught every one: a gate that needed `fork` (H), a probe that builds only for aarch64 and an applet missing from the image (K), a gate order that made G3 dial a mirror that was not up (L), a `df` hash that never covered sizes (M), a loader described as welded that was already an adapter and ldso syscalls described as served that were ENOSYS (O).
+- **Hangs cost more than the work they interrupt:** the host forward died early in about a third of batteries and the ssh client's 10 retries cost about 13 minutes each time; a G3 hang cost about 40 minutes; one model call hung 8 minutes; the box reset once under a long kernel build (BKL spin warnings, then an abrupt reset to the Pop default).
+- **What worked:** baselines recorded over several fresh boots before they could accuse a change (W0); gate groups that re-create their own state; verdicts re-run on the exact final binary; host tests in a new leaf crate catching bugs before any boot; evidence attributed per boot boundary.
+- **Composition held:** `taoxichuan/src` 4,625 -> 4,916 lines while gaining DNS, `select`, `ftruncate`, real statfs and the stat/dirent/uname/time families; dependencies 16 -> 19; no new crate until session O's `akuma-elf-exec`.
+
+**Process improvements** (the first two are the owner's idea: examine assumptions, and put more weight on probe discovery):
+1. **Premise audit** (done: `BRIEF_TEMPLATE.md` "Premises"). Every brief carries a table of its premises, each with a read-only check the supervisor ran before sending. Goose's first job, before any edit, is to re-run each check and write HOLDS / WRONG / UNCHECKED per row in RESULT. A WRONG row that changes the plan is reported at once, not at the end.
+2. **Probe discovery** (done: `BRIEF_TEMPLATE.md` "Probe discovery"). Before writing any probe, gate or script, goose lists what already exists (`userspace/*probe*`, `scripts/*_suite.py`, host tests, `run_gates.sh` groups, and a binary that already runs on the full amd64 kernel on the box, which gives the reference behaviour in one command) and runs the cheapest first. A new probe needs a stated reason and goes into the repo.
+3. **Guest facts block** (done, in the template): no fork, no procfs, no `stat` applet, one core, the forward ceiling, the 1 GiB image. Briefs stop contradicting what is known.
+4. **Budget and checkpoints** (done, in the template): a call budget per session (the supervisor nudges at 90 calls without a commit), a checkpoint at the first green host test, `[tmp]` tags on temporary diagnostics with a "Remove before final" list (the per-call `[statfs]` print was left in the kernel for lack of one).
+5. **Quota in the metrics** (done: `zai_usage.py`): record the percent and token delta at the start and end of each session.
+6. **Not done yet:** a hard per-exec timeout in `run_gates.sh` (about 90 s) in place of the ssh client's retry loop, which would have saved roughly an hour; `run_gates.sh` groups of 20 execs or fewer so the forward ceiling never matters; one agent owning the box at a time (a lock file under `/root/dev-cycle`), because the other agent and goose shared it today; a differential check that `amd64` still builds after an extraction (session O's baseline comparison was done by hand).
