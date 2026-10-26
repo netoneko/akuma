@@ -98,7 +98,6 @@ pub fn poll_arm(fds_va: u64, nfds: u64, timeout_ms: i64) -> u64 {
                     crate::OpenFile::Socket(_) => 1,
                     crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
                     crate::OpenFile::Null | crate::OpenFile::ChildOut(_) => 3,
-                    _ => 0,
                 });
                 match kind {
                     Some(1) => {
@@ -114,17 +113,6 @@ pub fn poll_arm(fds_va: u64, nfds: u64, timeout_ms: i64) -> u64 {
                             if rout && events & POLLOUT != 0 {
                                 revents |= POLLOUT;
                             }
-                            // s8i M2 probe: what the waiter saw (remove with
-                            // the milestone)
-                            akuma_primitives::safe_print!(
-                                96,
-                                "  [cx] poll fd={} udp={} r={} w={} ev={}\n",
-                                fd,
-                                akuma_net::socket::is_udp_socket(idx) as u64,
-                                rin as u64,
-                                rout as u64,
-                                events as u64
-                            );
                         } else {
                             revents = POLLNVAL;
                         }
@@ -459,24 +447,7 @@ pub fn sendto_arm(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, dest_len:
             },
             None => return crate::e(crate::err::EINVAL),
         };
-        let r = akuma_net::socket::socket_send_udp(idx, &data, sa);        // s8i M2 probe (mirrors the [cx] GET print above): is the guest's
-        // first-ever UDP sendto reaching the arm, and what does the stack
-        // answer? Remove with the milestone.
-        akuma_primitives::safe_print!(
-            128,
-            "  [cx] UDP len={} dst={}.{}.{}.{}:{} -> {}\n",
-            len,
-            sa.ip[0] as u64,
-            sa.ip[1] as u64,
-            sa.ip[2] as u64,
-            sa.ip[3] as u64,
-            sa.port as u64,
-            match &r {
-                Ok(n) => *n as u64,
-                Err(e) => -*e as i64 as u64,
-            }
-        );
-        r
+        akuma_net::socket::socket_send_udp(idx, &data, sa)
     } else {
         akuma_net::socket::socket_send(idx, &data, nonblock)
     };
@@ -518,10 +489,7 @@ pub fn recvfrom_arm(fd: u64, buf: u64, len: u64, _flags: u64, src: u64, src_len_
             }
             Err(e) => Err(e),
         }
-        .inspect(|n| {
-            // s8i M2 probe: did the datagram land in the socket? (remove
-            // with the milestone)
-            akuma_primitives::safe_print!(96, "  [cx] UDP recv fd={} -> {}\n", fd, *n as u64);
+        .inspect(|_| {
             if src != 0 {
                 sockaddr_in_to_user(src, sa);
             }

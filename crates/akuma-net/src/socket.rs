@@ -1875,7 +1875,6 @@ pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(us
     }
 
     let (len, endpoint) = smoltcp_net::udp_socket_recv(handle, buf).map_err(|()| libc_errno::EIO)?;
-
     with_table(|table| {
         if let Some(Some(sock)) = table.get(idx) {
             sock.wake_all();
