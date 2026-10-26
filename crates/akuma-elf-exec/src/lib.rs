@@ -70,6 +70,11 @@ pub const PF_W: u32 = 2;
 pub struct LoadSeg {
     /// `p_vaddr` rebased by the caller's base (0 for an `ET_EXEC` image).
     pub vaddr: u64,
+    /// `p_offset`: where in the image this segment's file-backed bytes start.
+    /// A mapper indexing the whole image Vec must add this; indexing with the
+    /// vaddr-relative offset alone reads the wrong slice whenever
+    /// `p_offset != p_vaddr` — every Alpine dynamic binary's text segment.
+    pub offset: u64,
     /// File-backed bytes.
     pub filesz: u64,
     /// In-memory span (`memsz >= filesz`; the tail is zero-fill).
@@ -211,14 +216,14 @@ pub fn interp_path(image: &[u8]) -> Result<Option<&[u8]>, ExecErr> {
 /// TooManySegments`], not a silent truncation.
 pub fn load_segments(image: &[u8], base: u64, out: &mut [LoadSeg]) -> Result<usize, ExecErr> {
     let mut n = 0;
-    for (ty, _, filesz, vaddr, flags, memsz) in phdrs(image)? {
+    for (ty, offset, filesz, vaddr, flags, memsz) in phdrs(image)? {
         if ty != PT_LOAD {
             continue;
         }
         if n >= out.len() {
             return Err(ExecErr::TooManySegments);
         }
-        out[n] = LoadSeg { vaddr: vaddr.wrapping_add(base), filesz, memsz, flags };
+        out[n] = LoadSeg { vaddr: vaddr.wrapping_add(base), offset, filesz, memsz, flags };
         n += 1;
     }
     Ok(n)

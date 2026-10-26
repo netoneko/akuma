@@ -2905,7 +2905,8 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                 console::puts("\n");
                 return None;
             };
-            let mut segs = [akuma_elf_exec::LoadSeg { vaddr: 0, filesz: 0, memsz: 0, flags: 0 }; 8];
+            let mut segs =
+                [akuma_elf_exec::LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 8];
             let Ok(n) =
                 akuma_elf_exec::load_segments(&ldso, akuma_elf_exec::INTERP_BASE, &mut segs)
             else {
@@ -2939,7 +2940,16 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                     let from = pva.max(seg.vaddr);
                     let to = (pva + 4096).min(seg.vaddr + seg.filesz);
                     if from < to {
-                        let bytes = &ldso[(from - seg.vaddr) as usize..(to - seg.vaddr) as usize];
+                        // `seg.offset` is `p_offset`: the file slice for
+                        // vaddr `v - p_vaddr` starts at
+                        // `p_offset + (v - p_vaddr)`, NOT at `v - p_vaddr`.
+                        // The whole-image Vec is indexed from the file's
+                        // start; the program loop above does not need this
+                        // because `img.segment_bytes(seg)` re-bases the slice
+                        // at the segment's own `p_offset`.
+                        let off = seg.offset + (from - seg.vaddr);
+                        let end = seg.offset + (to - seg.vaddr);
+                        let bytes = &ldso[off as usize..end as usize];
                         // SAFETY: `pa` is this page's fresh frame; `from - pva`
                         // stays inside it because `from >= pva` and
                         // `to <= pva + 4096` — the program loop's argument.
@@ -2965,6 +2975,30 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                 }
             }
             add_region(akuma_elf_exec::INTERP_BASE, hi);
+            // [tmp] M5 boot-5: walk the child's tables for the entry page by
+            // hand, right after the mapping — which level disagrees with the
+            // frame the copy landed in (entry_pa above)? Removed with [tmp].
+            if entry_floor != 0 {
+                let va = entry_floor as usize;
+                // SAFETY: [tmp] physmap reads of the child's own tables.
+                let rd = |pa: u64, idx: usize| -> u64 {
+                    unsafe { phys::phys_ptr::<u64>(pa + ((idx as u64) << 3)).read_volatile() }
+                };
+                let m = 0x000f_ffff_ffff_f000u64;
+                let pml4e = rd(root, 0);
+                let pdpte = rd(pml4e & m, (va >> 30) & 511);
+                let pde = rd(pdpte & m, (va >> 21) & 511);
+                let pte = rd(pde & m, (va >> 12) & 511);
+                akuma_primitives::safe_print!(
+                    192,
+                    "  [exec] tmp walk root=0x{:x} pml4e=0x{:x} pdpte=0x{:x} pde=0x{:x} pte=0x{:x}\n",
+                    root,
+                    pml4e,
+                    pdpte,
+                    pde,
+                    pte
+                );
+            }
             let Ok(ientry) = akuma_elf_exec::interp_entry(&ldso, akuma_elf_exec::INTERP_BASE) else {
                 console::puts("  exec: interpreter has no entry\n");
                 return None;
