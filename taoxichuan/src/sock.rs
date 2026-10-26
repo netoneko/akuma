@@ -114,6 +114,17 @@ pub fn poll_arm(fds_va: u64, nfds: u64, timeout_ms: i64) -> u64 {
                             if rout && events & POLLOUT != 0 {
                                 revents |= POLLOUT;
                             }
+                            // s8i M2 probe: what the waiter saw (remove with
+                            // the milestone)
+                            akuma_primitives::safe_print!(
+                                96,
+                                "  [cx] poll fd={} udp={} r={} w={} ev={}\n",
+                                fd,
+                                akuma_net::socket::is_udp_socket(idx) as u64,
+                                rin as u64,
+                                rout as u64,
+                                events as u64
+                            );
                         } else {
                             revents = POLLNVAL;
                         }
@@ -507,7 +518,10 @@ pub fn recvfrom_arm(fd: u64, buf: u64, len: u64, _flags: u64, src: u64, src_len_
             }
             Err(e) => Err(e),
         }
-        .inspect(|_| {
+        .inspect(|n| {
+            // s8i M2 probe: did the datagram land in the socket? (remove
+            // with the milestone)
+            akuma_primitives::safe_print!(96, "  [cx] UDP recv fd={} -> {}\n", fd, *n as u64);
             if src != 0 {
                 sockaddr_in_to_user(src, sa);
             }
@@ -557,7 +571,15 @@ pub fn read_arm(fd: u64, buf: u64, len: u64) -> u64 {
         akuma_primitives::safe_print!(96, "  [cx] sockread fd={} len={}\n", fd, len);
     }
     let mut data = alloc::vec![0u8; len as usize];
-    match akuma_net::socket::socket_recv(idx, &mut data, fd_nonblock(fd)) {
+    // A datagram socket's read(2) is the queued datagram (no source address
+    // to report — that is what recvfrom(2) is for). (stage 8, M2)
+    let r = if akuma_net::socket::is_udp_socket(idx) {
+        akuma_net::socket::socket_recv_udp(idx, &mut data, fd_nonblock(fd))
+            .map(|(n, _sa)| n)
+    } else {
+        akuma_net::socket::socket_recv(idx, &mut data, fd_nonblock(fd))
+    };
+    match r {
         Ok(n) => {
             if !crate::copy_to_user(buf, &data[..n]) {
                 return crate::e(crate::err::EFAULT);
