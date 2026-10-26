@@ -373,6 +373,8 @@ pub fn socket_arm(domain: u64, ty: u64, _protocol: u64) -> u64 {
     if ty & SOCK_CLOEXEC != 0 {
         table.set_cloexec(fd);
     }
+    akuma_primitives::safe_print!(96, "  [tmp] socket fd={} idx={} kind={}\n", fd, idx,
+        if kind == SOCK_DGRAM { "udp" } else { "tcp" });
     u64::from(fd)
 }
 
@@ -461,6 +463,8 @@ pub fn connect_arm(fd: u64, addr: u64, addrlen: u64) -> u64 {
         fd,
         sa.ip[0], sa.ip[1], sa.ip[2], sa.ip[3], sa.port
     );
+    akuma_primitives::safe_print!(96, "  [tmp] connect fd={} idx={} udp={}\n", fd, idx,
+        akuma_net::socket::is_udp_socket(idx));
     let r = akuma_net::socket::socket_connect(idx, sa, true);
     let rc = match r {
         Ok(()) => 0i64,
@@ -543,7 +547,7 @@ pub fn sendto_arm(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, dest_len:
         return crate::e(crate::err::EFAULT);
     }
     let nonblock = fd_nonblock(fd);
-    akuma_primitives::safe_print!(96, "  [tmp] sendto fd={} len={} dest={:#x} dlen={} udp={}\n", fd, len, dest, dest_len, akuma_net::socket::is_udp_socket(idx));
+    akuma_primitives::safe_print!(96, "  [tmp] sendto fd={} idx={} len={} dest={:#x} dlen={} udp={}\n", fd, idx, len, dest, dest_len, akuma_net::socket::is_udp_socket(idx));
     // Stage-7 probe: a TCP send whose payload opens an HTTP request.
     if !akuma_net::socket::is_udp_socket(idx)
         && len >= 4
@@ -776,6 +780,7 @@ pub fn write_arm(fd: u64, buf: u64, len: u64) -> u64 {
 pub fn close_arm(fd: u64) {
     let idx = fd_socket(fd);
     if let Some(idx) = idx {
+        akuma_primitives::safe_print!(96, "  [tmp] close fd={} idx={}\n", fd, idx);
         akuma_net::socket::remove_socket(idx);
     }
 }
