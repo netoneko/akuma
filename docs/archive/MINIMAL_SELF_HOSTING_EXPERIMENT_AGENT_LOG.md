@@ -1191,3 +1191,18 @@ candidate for its own small session before M4 or inside it.
 **Host track (Sonnet), merged tree @ `1df3ac77`:** one clean merge. `taoxichuan-fc.bin` 662,792 B (unchanged), Lima `fc` boot: 162 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`. PASS.
 
 **Next:** a planning-only session for the process model (fork/clone/execve/wait4/pipes, `scripts/kvm/goose/taoxichuan-08n-process-model-plan.md`), then trim step 3, then M5 (`PT_INTERP` + `curl --version`), with the `apk info -L` crash looked at first.
+
+
+### Stage 8 session N (2026-10-26): the process-model PLAN for stages 8-12 (planning only)
+
+**Result.** Brief `scripts/kvm/goose/taoxichuan-08n-process-model-plan.md`, goose session 15 min (17:23-17:38 UTC), 58 tool calls, 1.5M input tokens, zero boots, zero source changes. Output: `docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md`
+(157 lines, seven sections, anchors and `cargo tree` counts checked in-tree; the supervisor spot-checked `sys_fork` at `amd64/src/usermode.rs:5520`, `fork_process` at `crates/akuma-exec/src/process/mod.rs:3194` and the 642-line `amd64/src/exec_runtime.rs`). `taoxichuan-s4` @ `d6d0d772`.
+- **Load-bearing discovery:** the amd64 fork path is not welded shut. `sys_fork` is already a thin fold over `akuma_exec::process::fork_process`; amd64's whole consumption cost is one registration file (`exec_runtime.rs`) plus a scheduler hookup (`X86ArchHooks` over `akuma-threading`). `akuma-mmu` is dual-arch.
+- **Recommended route:** pull `akuma-exec` whole (all pieces resolve for `x86_64-unknown-none`; node counts: exec 84, threading 40, mmu 29, pipe(s) 1-2, cow 1, exec-core 6). Fork/vfork/wait4/threads and pipes pulled; execve cut at the `install_image` seam keeping taoxichuan's eager loader; CoW deferred
+  (eager-copy fork through the `fork_share_memory` hook, since taoxichuan has no page-fault handler and `fault_trap` kills). One honest write-new exception: a SPAWN-shaped blocking fork (about 150-250 lines) as a temporary scaffold that lifts the one-command gate before the scheduler lands.
+- **Milestones:** M1 (about 10 lines) makes READ/WRITE/LSEEK/FSTAT consult the fd table first; M2 is the first gate that lifts the biggest limit: `sh -c 'echo x > /tmp/f; cat /tmp/f; wc -c /tmp/f'` prints `x` then `2`; M4 is the real fork (akuma-exec adoption); PT_INTERP sits at M5; M7 is the git-clone gate.
+- **Biggest unknown (U1):** whether `akuma-threading` schedules correctly when driven by taoxichuan's own trap and timer plumbing; its x86 arms have only run against amd64's IDT and tick. Settle on paper before M4 boots. Also U6 (wait4 over child channels with SIGCHLD never delivered) and U5 (vfork parent suspension for git's helper protocol).
+- **Bottom line:** stages 8-12 are reachable by composition, not reimplementation; the bulk is stage 8.
+
+**Host track:** doc-only commit, no code change, so no Lima boot was run for it.
+**Next:** the `apk info -L curl` NULL-write crash and trim step 3, then M5 (`PT_INTERP` + `curl --version`); the plan's M1/M2 (fd-table-first routing, then the `;` gate) can run in parallel since they touch different code.
