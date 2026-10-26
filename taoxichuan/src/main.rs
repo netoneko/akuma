@@ -1094,6 +1094,7 @@ fn lstat_path(path: &str, buf: u64) -> u64 {
 /// block geometry — aarch64 measured that `ENOSYS` here made apk treat later
 /// operations as forbidden, and until M4 the fixed 16 MiB answer made apk's
 /// free-space check refuse the 12.6 MB curl closure on the 1 GiB image.
+static STATFS_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 fn fill_statfs(buf: u64) -> u64 {
     if !user_ok(buf, 120) {
         return e(ring3::err::EFAULT);
@@ -1107,6 +1108,21 @@ fn fill_statfs(buf: u64) -> u64 {
     let Ok(st) = root_fs().stats() else {
         return e(ring3::err::EIO);
     };
+    // M4: once per boot, put the real superblock numbers on the console. The
+    // guest has no procfs and this busybox build ignores /etc/mtab, so df can
+    // never print a row here (RESULT-M: the W1b df hash is the header line's
+    // bytes and always was) - this line is the only direct view of what apk's
+    // free-space check reads, and it is what the Statfs gate greps.
+    if !STATFS_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        akuma_primitives::safe_print!(
+            128,
+            "[statfs] blocks={} bsize={} free={} bavail={} (real ext2 superblock)\n",
+            st.total_blocks,
+            st.block_size,
+            st.free_blocks,
+            st.free_blocks
+        );
+    }
     let bs = st.block_size as i64;
     let s = akuma_syscalls_linux::Statfs {
         f_type: 0xEF53,

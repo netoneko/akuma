@@ -37,9 +37,19 @@
 # `apk add curl` (the guest's own repositories and keys; the mirror is up
 # from the start of the battery) with the mirror request log cross-check;
 # B2 `grep -cx curl /etc/apk/world`; B3 the six reference sha256 prefixes as
-# guest-side greps (G3's pattern); B4 `apk verify curl` (apk's own integrity
-# check of what it unpacked). Nothing unpacked is EXECUTED (curl is a
-# dynamic PIE; the loader work is M5).
+# guest-side greps (G3's pattern); B4 `apk info -e curl` (the brief's
+# `apk verify curl` form fails here: this apk's verify takes .apk FILE paths,
+# and fetched packages do not persist in the cache - only APKINDEX does.
+# Unpack-time integrity is already B1's rc 0: apk checks member checksums
+# against the index while extracting; info -e proves the installed db
+# accounts for curl). Statfs: fill_statfs prints the real superblock numbers
+# once per boot - the guest has no procfs and this busybox ignores mtab, so
+# `df /` can never print a row (the W1b hash is the header line's bytes and
+# always was); the verdict greps this boot's console log.
+# NEVER gate `apk info -L` (or anything walking the installed db into one big
+# list): observed 2026-10-26 it NULL-writes in ring3 and a ring3 fault parks
+# the whole guest BY DESIGN (no reaper) - the boot dies.
+# Nothing unpacked is EXECUTED (dynamic PIE; the loader work is M5).
 # Pacing: 15 s between execs, one exec per ssh connection - the host forward
 # degrades at ~30 connections per boot. If an exec's console slice shows no
 # "[SSHD] Accepted connection" while port 2224 still accepted it, the forward
@@ -193,8 +203,22 @@ if [ "$GROUP" != main ]; then
     'b3g=grep -c 095b047c /tmp/h'
   vline B3 "$(agg "$RCS")" "b3a.console b3g.console"
 
-  rgroup B4 'b4=apk verify curl'
+  rgroup B4 'b4=apk info -e curl'
   vline B4 "$(agg "$RCS")" b4.console
+
+  # Statfs: the one-time [statfs] console line (fill_statfs, once per boot)
+  # is the only direct view of the real geometry - df cannot print here.
+  # Per-boot attribution: only the log region since this boot's
+  # "[vm-run] guest created" counts (the log may survive a boot unrotated).
+  BOOT_AT=$(grep -n '\[vm-run\] guest created' "$LOG" | tail -1 | cut -d: -f1)
+  if [ -n "$BOOT_AT" ] \
+     && sed -n "${BOOT_AT},\$p" "$LOG" | grep -q 'statfs. blocks=262144 bsize=4096'
+  then
+    STATLINE=$(sed -n "${BOOT_AT},\$p" "$LOG" | grep -o 'statfs. blocks=[0-9]* bsize=[0-9]* free=[0-9]*' | head -1)
+    vline Statfs 0 "vm-dev.log (${STATLINE})"
+  else
+    vline Statfs 1 "vm-dev.log (no [statfs] line this boot)"
+  fi
 else
 rgroup G1 'g1=sh -c "echo hi"'
 vline G1 "$(agg "$RCS")" g1.console
