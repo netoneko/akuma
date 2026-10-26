@@ -16,7 +16,13 @@
 # C1 (stage 8 M1): wall clock - the guest's CLOCK_REALTIME (busybox awk
 # systime()) must land in [E, E+900] where E is the epoch boot_dev.sh
 # injected into the vm_cmdline (recorded in $OUT/epoch; substituted below).
-#
+# D1 (stage 8 M2): the guest's own resolver configuration points at the
+# relay's DNS proxy - put there by the image/boot scripts (devroot-ensure
+# on the fresh copy; the .orig is never touched).
+# D2 (stage 8 M2): ONE `nslookup alpinelinux.org` with NO server argument,
+# so the guest's own configuration is used; verdict is the console exit
+# status, and the relay's dns_answered counter (vm-dev.log status line)
+# rising across the exec is a NOTE line, not the verdict.#
 # Pacing: 15 s between execs, one exec per ssh connection - the host forward
 # degrades at ~30 connections per boot. If an exec's console slice shows no
 # "[SSHD] Accepted connection" while port 2224 still accepted it, the forward
@@ -173,5 +179,23 @@ vline H3c "$(echo "$RCS" | cut -c3)" h3c.console
 E=$(cat "$OUT/epoch")
 rgroup C1 "c1=awk 'BEGIN{exit !(systime()>=$E && systime()<=$E+900)}'"
 vline C1 "$(agg "$RCS")" c1.console
+
+# D1 (stage 8 M2): the guest's resolver configuration, as the image/boot
+# scripts put it there. One simple command; exit 0 iff the relay's address
+# is in /etc/resolv.conf.
+rgroup D1 'd1=grep 10.0.2.3 /etc/resolv.conf'
+vline D1 "$(agg "$RCS")" d1.console
+
+# D2 (stage 8 M2): one lookup, no server argument - the guest's own
+# configuration answers. The verdict stays console-first; the relay's
+# dns_answered counter rising across the exec is recorded as a NOTE (the
+# counter lives in the log's status line, host side, so a lost guest
+# capture cannot blur it).
+dnsctr() { grep -o 'dns_answered=[0-9]*' "$LOG" | tail -1 | cut -d= -f2; }
+D2_BEFORE=$(dnsctr)
+rgroup D2 'd2=nslookup alpinelinux.org'
+vline D2 "$(agg "$RCS")" d2.console
+D2_AFTER=$(dnsctr)
+note "dns_answered $D2_BEFORE -> $D2_AFTER"
 
 emit "GATES DONE restarts=$RESTARTED"

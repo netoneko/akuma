@@ -62,6 +62,127 @@ pub(crate) fn writev_socket(idx: usize, data: &[u8], nonblock: bool) -> Result<u
 
 use crate::fd_table;
 
+/// `poll(fds, nfds, timeout_ms)`. The readiness wait musl's resolver and the
+/// busybox applets block on before their `recv`. Sockets ask akuma-net's
+/// per-protocol probes (`socket_udp_recv_ready`, `socket_tcp_ready`); regular
+/// files and directories are always ready both ways; the console and the
+/// child pipe are write-only; an unbound number is POLLNVAL, the way Linux
+/// answers a bad fd. Laps pump the NIC (`netpoll`) so a datagram that lands
+/// while polling is visible to the next probe. (stage 8, M2)
+pub fn poll_arm(fds_va: u64, nfds: u64, timeout_ms: i64) -> u64 {
+    const POLLIN: i16 = 0x0001;
+    const POLLOUT: i16 = 0x0004;
+    const POLLNVAL: i16 = 0x0020;
+    if nfds == 0 || nfds > 64 {
+        return crate::e(crate::err::EINVAL);
+    }
+    let mut fds = alloc::vec![0u8; (nfds as usize) * 8];
+    if !crate::copy_from_user(&mut fds, fds_va) {
+        return crate::e(crate::err::EFAULT);
+    }
+    let now = crate::net::uptime_us();
+    let deadline = if timeout_ms < 0 {
+        now + 60_000_000 // unbounded asks cap at a minute; nobody waits longer
+    } else {
+        now.saturating_add(timeout_ms as u64 * 1000)
+    };
+    loop {
+        let mut ready = 0u64;
+        for i in 0..nfds as usize {
+            let o = i * 8;
+            let fd = i32::from_le_bytes(fds[o..o + 4].try_into().expect("8-byte pollfd"));
+            let events = i16::from_le_bytes(fds[o + 4..o + 6].try_into().expect("8-byte pollfd"));
+            let mut revents: i16 = 0;
+            if fd >= 0 {
+                let kind = crate::fd_table().with(fd as u32, |d| match d {
+                    crate::OpenFile::Socket(_) => 1,
+                    crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
+                    crate::OpenFile::Null | crate::OpenFile::ChildOut(_) => 3,
+                });
+                match kind {
+                    Some(1) => {
+                        if let Some(idx) = fd_socket(fd as u64) {
+                            let (rin, rout) = if akuma_net::socket::is_udp_socket(idx) {
+                                (akuma_net::socket::socket_udp_recv_ready(idx), true)
+                            } else {
+                                akuma_net::socket::socket_tcp_ready(idx)
+                            };
+                            if rin && events & POLLIN != 0 {
+                                revents |= POLLIN;
+                            }
+                            if rout && events & POLLOUT != 0 {
+                                revents |= POLLOUT;
+                            }
+                        } else {
+                            revents = POLLNVAL;
+                        }
+                    }
+                    Some(2) => revents = POLLIN | POLLOUT,
+                    Some(3) => {
+                        if events & POLLOUT != 0 {
+                            revents |= POLLOUT;
+                        }
+                    }
+                    _ => {
+                        // Unbound: fd 1/2 are the console (write-only), the rest are bad.
+                        if fd <= 2 && events & POLLOUT != 0 {
+                            revents |= POLLOUT;
+                        } else if fd > 2 {
+                            revents = POLLNVAL;
+                        }
+                    }
+                }
+            }
+            if revents != 0 {
+                ready += 1;
+            }
+            fds[o + 6..o + 8].copy_from_slice(&revents.to_le_bytes());
+        }
+        if ready > 0 || crate::net::uptime_us() >= deadline {
+            if !crate::copy_to_user(fds_va, &fds) {
+                return crate::e(crate::err::EFAULT);
+            }
+            return ready;
+        }
+        crate::net::sleep_until(crate::net::uptime_us() + 1000);
+    }
+}
+
+/// `setsockopt(fd, level, opt, optval, optlen)`. The timeouts are real (they
+/// drive `KernelSocket`'s `rcvtimeo_us`/`sndtimeo_us`, the same values the
+/// blocking `recv`/`send` waits already honor); the socket options this stack
+/// has no behaviour behind (`SO_REUSEADDR`, `TCP_NODELAY`, buffer sizes) are
+/// accepted and ignored so a libc's boilerplate setup cannot fail a session.
+/// Anything else: ENOPROTOOPT. (stage 8, M2)
+pub fn setsockopt_arm(fd: u64, level: u64, opt: u64, optval_va: u64, optlen: u64) -> u64 {
+    const SOL_SOCKET: u64 = 1;
+    const SO_RCVTIMEO: u64 = 20;
+    const SO_SNDTIMEO: u64 = 21;
+    const IGNORED: [u64; 9] = [2, 3, 4, 5, 6, 7, 8, 9, 10]; // REUSEADDR..OOBINLINE
+    const IPPROTO_TCP: u64 = 6;
+    let Some(idx) = fd_socket(fd) else {
+        return crate::e(crate::err::ENOTSOCK);
+    };
+    if level == SOL_SOCKET && (opt == SO_RCVTIMEO || opt == SO_SNDTIMEO) {
+        if optlen < 16 {
+            return crate::e(crate::err::EINVAL);
+        }
+        let mut tv = [0u8; 16];
+        if !crate::copy_from_user(&mut tv, optval_va) {
+            return crate::e(crate::err::EFAULT);
+        }
+        let secs = u64::from_le_bytes(tv[0..8].try_into().expect("timeval"));
+        let usec = u64::from_le_bytes(tv[8..16].try_into().expect("timeval"));
+        let us = secs.saturating_mul(1_000_000).saturating_add(usec);
+        akuma_net::socket::set_socket_timeout(idx, opt == SO_RCVTIMEO, (us != 0).then_some(us));
+        return 0;
+    }
+    if (level == SOL_SOCKET && IGNORED.contains(&opt)) || level == IPPROTO_TCP {
+        return 0;
+    }
+    crate::e(crate::err::ENOPROTOOPT)
+}
+
 /// The fd's nonblock flag, straight from the fd table.
 pub(crate) fn fd_nonblock(fd: u64) -> bool {
     fd_table().is_nonblock(fd as u32)
@@ -315,8 +436,16 @@ pub fn sendto_arm(fd: u64, buf: u64, len: u64, _flags: u64, dest: u64, dest_len:
         akuma_primitives::safe_print!(96, "  [cx] GET len={} ->\n", len);
     }
     let r = if akuma_net::socket::is_udp_socket(idx) {
-        let Some(sa) = sockaddr_in_from_user(dest, dest_len) else {
-            return crate::e(crate::err::EINVAL);
+        // A null destination is the `send(2)` shape (musl implements send as
+        // sendto(NULL, 0)): go to the connect(2) peer, ENOTCONN without one.
+        // Anything else unparseable is EINVAL, as before. (stage 8, M2)
+        let sa = match sockaddr_in_from_user(dest, dest_len) {
+            Some(sa) => sa,
+            None if dest == 0 || dest_len == 0 => match akuma_net::socket::socket_udp_peer(idx) {
+                Some(sa) => sa,
+                None => return crate::e(crate::err::ENOTCONN),
+            },
+            None => return crate::e(crate::err::EINVAL),
         };
         akuma_net::socket::socket_send_udp(idx, &data, sa)
     } else {
@@ -410,7 +539,15 @@ pub fn read_arm(fd: u64, buf: u64, len: u64) -> u64 {
         akuma_primitives::safe_print!(96, "  [cx] sockread fd={} len={}\n", fd, len);
     }
     let mut data = alloc::vec![0u8; len as usize];
-    match akuma_net::socket::socket_recv(idx, &mut data, fd_nonblock(fd)) {
+    // A datagram socket's read(2) is the queued datagram (no source address
+    // to report — that is what recvfrom(2) is for). (stage 8, M2)
+    let r = if akuma_net::socket::is_udp_socket(idx) {
+        akuma_net::socket::socket_recv_udp(idx, &mut data, fd_nonblock(fd))
+            .map(|(n, _sa)| n)
+    } else {
+        akuma_net::socket::socket_recv(idx, &mut data, fd_nonblock(fd))
+    };
+    match r {
         Ok(n) => {
             if !crate::copy_to_user(buf, &data[..n]) {
                 return crate::e(crate::err::EFAULT);
@@ -438,8 +575,17 @@ pub fn write_arm(fd: u64, buf: u64, len: u64) -> u64 {
     if data.starts_with(b"GET ") {
         akuma_primitives::safe_print!(96, "  [cx] GET(len={}) write ->\n", len);
     }
-    let r = akuma_net::socket::socket_send(idx, &data, fd_nonblock(fd));
-    if data.starts_with(b"GET ") {
+    // A datagram socket's write(2)/send(2) goes to its connect(2) peer —
+    // the shape busybox `nslookup`, busybox `nc -u` and musl's resolver all
+    // talk. Unconnected: ENOTCONN, the answer Linux gives. (stage 8, M2)
+    let r = if akuma_net::socket::is_udp_socket(idx) {
+        match akuma_net::socket::socket_udp_peer(idx) {
+            Some(sa) => akuma_net::socket::socket_send_udp(idx, &data, sa),
+            None => Err(crate::err::ENOTCONN as i32),
+        }
+    } else {
+        akuma_net::socket::socket_send(idx, &data, fd_nonblock(fd))
+    };    if data.starts_with(b"GET ") {
         akuma_primitives::safe_print!(
             96,
             "  [cx] GET <- {}\n",

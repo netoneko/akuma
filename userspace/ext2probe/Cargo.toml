@@ -22,6 +22,14 @@ name = "ext2probe-host"
 path = "src/bin/host.rs"
 required-features = ["host-probe"]
 
+# Stage-8 M2: ensure a dev-root image copy carries the DNS prerequisites
+# (/etc/resolv.conf = the relay's resolver; /bin/nslookup -> busybox). Host
+# only, same feature set as ext2probe-host.
+[[bin]]
+name = "devroot-ensure"
+path = "src/bin/devroot_ensure.rs"
+required-features = ["host-probe"]
+
 # Runs the shared workload against the real OS filesystem (std::fs) — a
 # real-kernel reference point, e.g. in a Docker container.
 [[bin]]

@@ -247,6 +247,18 @@ impl HostFsOps {
         self.fs.sync().expect("sync");
     }
 
+    /// `symlink(target, path)`, tolerating an existing link (idempotent
+    /// re-runs). Stage-8 M2 uses this to put the `/bin/nslookup` name on a
+    /// dev-root image copy whose build predates the applet line in
+    /// `akuma_guest_rootfs.sh`'s SERVE list.
+    pub fn ensure_symlink(&self, path: &str, target: &str) -> bool {
+        match self.fs.create_symlink(path, target) {
+            Ok(()) => true,
+            Err(akuma_vfs::FsError::AlreadyExists) => false,
+            Err(e) => panic!("create_symlink({path} -> {target}): {e:?}"),
+        }
+    }
+
     /// Read `path` back and assert it is exactly `len` bytes, all == `byte`.
     /// Guards against a data-corrupting regression in the zero-fill / write path.
     pub fn verify(&self, path: &str, byte: u8, len: usize) {

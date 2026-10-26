@@ -1876,7 +1876,6 @@ pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(us
     }
 
     let (len, endpoint) = smoltcp_net::udp_socket_recv(handle, buf).map_err(|()| libc_errno::EIO)?;
-
     with_table(|table| {
         if let Some(Some(sock)) = table.get(idx) {
             sock.wake_all();
@@ -1913,7 +1912,22 @@ pub fn is_udp_socket(idx: usize) -> bool {
 /// makes every hostname lookup read as a timeout no matter how fast the
 /// network answers.
 #[must_use]
+/// The connected UDP socket's `connect(2)` peer, if any. A `send(2)`/`write(2)`
+/// (and a `sendto(2)` with a null address) on a datagram socket goes to this;
+/// with none, the caller answers `ENOTCONN` the way Linux does.
 #[cfg(feature = "smoltcp")]
+pub fn socket_udp_peer(idx: usize) -> Option<SocketAddrV4> {
+    with_table(|table| {
+        if let Some(Some(KernelSocket { inner: SocketType::Datagram { peer, .. }, .. })) = table.get(idx) {
+            *peer
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(feature = "smoltcp")]
+#[must_use]
 pub fn socket_udp_recv_ready(idx: usize) -> bool {
     smoltcp_net::poll();
     matches!(smoltcp_handle_for(idx), Some((handle, true)) if smoltcp_net::udp_can_recv(handle))
