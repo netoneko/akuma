@@ -206,6 +206,13 @@ if [ "$GROUP" != main ]; then
   rgroup B4 'b4=apk info -e curl'
   vline B4 "$(agg "$RCS")" b4.console
 
+  # B5 is an EVIDENCE CARRIER, not a gate: df / calls statfs("/") (the print
+  # fires on every call) even though this df can only print the header and
+  # exits 1 - its slice b5s.console then carries a [statfs] line collected by
+  # gate() itself, rotation-proof and (after any mid-group restart) belonging
+  # to the same boot the epoch is re-read from below. No vline on purpose.
+  rgroup B5 'b5s=df / > /tmp/s1'
+
   # Statfs: [statfs] lines carry the real geometry + the anchored wall clock
   # (tstamp); only a line at or after THIS boot's epoch ($OUT/epoch, C1's E)
   # counts - a previous boot's line always predates it. The exec slices are
@@ -223,7 +230,7 @@ if [ "$GROUP" != main ]; then
       fi
     done
   }
-  stcheck "$OUT/b1.console" "$OUT/b2.console" "$OUT/b3a.console" "$OUT/b4.console"
+  stcheck "$OUT/b5s.console" "$OUT/b1.console" "$OUT/b2.console" "$OUT/b3a.console" "$OUT/b4.console"
   [ "$rcST" = 0 ] || stcheck "$LOG" "$LOG.old"
   vline Statfs "$rcST" "b-slices or vm-dev.log(.old) (${STLINE:-no [statfs] in window})"
 else
