@@ -70,9 +70,6 @@ use crate::fd_table;
 /// answers a bad fd. Laps pump the NIC (`netpoll`) so a datagram that lands
 /// while polling is visible to the next probe. (stage 8, M2)
 pub fn poll_arm(fds_va: u64, nfds: u64, timeout_ms: i64) -> u64 {
-    const POLLIN: i16 = 0x0001;
-    const POLLOUT: i16 = 0x0004;
-    const POLLNVAL: i16 = 0x0020;
     if nfds == 0 || nfds > 64 {
         return crate::e(crate::err::EINVAL);
     }
@@ -92,47 +89,7 @@ pub fn poll_arm(fds_va: u64, nfds: u64, timeout_ms: i64) -> u64 {
             let o = i * 8;
             let fd = i32::from_le_bytes(fds[o..o + 4].try_into().expect("8-byte pollfd"));
             let events = i16::from_le_bytes(fds[o + 4..o + 6].try_into().expect("8-byte pollfd"));
-            let mut revents: i16 = 0;
-            if fd >= 0 {
-                let kind = crate::fd_table().with(fd as u32, |d| match d {
-                    crate::OpenFile::Socket(_) => 1,
-                    crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
-                    crate::OpenFile::Null | crate::OpenFile::ChildOut(_) => 3,
-                });
-                match kind {
-                    Some(1) => {
-                        if let Some(idx) = fd_socket(fd as u64) {
-                            let (rin, rout) = if akuma_net::socket::is_udp_socket(idx) {
-                                (akuma_net::socket::socket_udp_recv_ready(idx), true)
-                            } else {
-                                akuma_net::socket::socket_tcp_ready(idx)
-                            };
-                            if rin && events & POLLIN != 0 {
-                                revents |= POLLIN;
-                            }
-                            if rout && events & POLLOUT != 0 {
-                                revents |= POLLOUT;
-                            }
-                        } else {
-                            revents = POLLNVAL;
-                        }
-                    }
-                    Some(2) => revents = POLLIN | POLLOUT,
-                    Some(3) => {
-                        if events & POLLOUT != 0 {
-                            revents |= POLLOUT;
-                        }
-                    }
-                    _ => {
-                        // Unbound: fd 1/2 are the console (write-only), the rest are bad.
-                        if fd <= 2 && events & POLLOUT != 0 {
-                            revents |= POLLOUT;
-                        } else if fd > 2 {
-                            revents = POLLNVAL;
-                        }
-                    }
-                }
-            }
+            let revents = fd_events(fd, events);
             if revents != 0 {
                 ready += 1;
             }
@@ -141,6 +98,149 @@ pub fn poll_arm(fds_va: u64, nfds: u64, timeout_ms: i64) -> u64 {
         if ready > 0 || crate::net::uptime_us() >= deadline {
             if !crate::copy_to_user(fds_va, &fds) {
                 return crate::e(crate::err::EFAULT);
+            }
+            return ready;
+        }
+        crate::net::sleep_until(crate::net::uptime_us() + 1000);
+    }
+}
+
+/// The one readiness probe poll and select share: what `revents` does this fd
+/// answer, given the events the caller asked about? Sockets ask akuma-net's
+/// per-protocol probes (`socket_udp_recv_ready`, `socket_tcp_ready`); regular
+/// files and directories are always ready both ways; the console and the
+/// child pipe are write-only; an unbound number is POLLNVAL, the way Linux
+/// answers a bad fd. Extracted for stage 8 (M3)'s `select` arm — same
+/// answers, one table to keep true.
+fn fd_events(fd: i32, events: i16) -> i16 {
+    const POLLIN: i16 = 0x0001;
+    const POLLOUT: i16 = 0x0004;
+    const POLLNVAL: i16 = 0x0020;
+    if fd < 0 {
+        return 0;
+    }
+    let kind = crate::fd_table().with(fd as u32, |d| match d {
+        crate::OpenFile::Socket(_) => 1,
+        crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
+        crate::OpenFile::Null | crate::OpenFile::ChildOut(_) => 3,
+    });
+    match kind {
+        Some(1) => {
+            if let Some(idx) = fd_socket(fd as u64) {
+                let (rin, rout) = if akuma_net::socket::is_udp_socket(idx) {
+                    (akuma_net::socket::socket_udp_recv_ready(idx), true)
+                } else {
+                    akuma_net::socket::socket_tcp_ready(idx)
+                };
+                let mut revents: i16 = 0;
+                if rin && events & POLLIN != 0 {
+                    revents |= POLLIN;
+                }
+                if rout && events & POLLOUT != 0 {
+                    revents |= POLLOUT;
+                }
+                revents
+            } else {
+                POLLNVAL
+            }
+        }
+        Some(2) => POLLIN | POLLOUT,
+        Some(3) => events & POLLOUT,
+        _ => {
+            // Unbound: fd 1/2 are the console (write-only), the rest are bad.
+            if fd <= 2 && events & POLLOUT != 0 {
+                POLLOUT
+            } else if fd > 2 {
+                POLLNVAL
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// `select(nfds, readfds, writefds, exceptfds, timeout)`. The readiness wait
+/// apk's own fetcher blocks in — x86_64 musl's `select()` issues 23 directly
+/// (`src/select/select.c`'s `#ifdef SYS_select` branch), where busybox wget
+/// only ever polled. The fd-set bit arithmetic, the count-both-directions
+/// return and the overwrite report are `akuma-syscalls-poll::fdset`'s
+/// (host-tested; its crate doc records the received-but-never-written
+/// exceptfds set that once killed every `cargo fetch` in this tree); this
+/// arm only copies user memory, probes readiness through the same
+/// `fd_events` the poll arm answers from, and laps the NIC on the same 1 ms
+/// cadence. `exceptfds` comes back all-zero on purpose: this stack has no
+/// out-of-band data, and leaving a received set unwritten is the exact bug
+/// the crate doc warns about. Bad fds are silently skipped (Linux select has
+/// no POLLNVAL to report); a NULL timeout is unbounded, capped at a minute
+/// like poll's -1. (stage 8, M3)
+pub fn select_arm(nfds: u64, read_va: u64, write_va: u64, except_va: u64, tv_va: u64) -> u64 {
+    use akuma_syscalls_poll::fdset;
+    const POLLNVAL: i16 = 0x0020;
+    let nfds = nfds as usize;
+    if !fdset::nfds_ok(nfds) {
+        return crate::e(crate::err::EINVAL);
+    }
+    // Copy the caller's words in (whole words, the tail word partial —
+    // fdset::bytes bounds the copy to what nfds covers). NULL set = empty.
+    let mut ins = ([0u64; fdset::MAX_WORDS], [0u64; fdset::MAX_WORDS]);
+    for (va, words) in [(read_va, &mut ins.0), (write_va, &mut ins.1)] {
+        if va != 0 {
+            let mut buf = [0u8; fdset::MAX_WORDS * 8];
+            if !crate::copy_from_user(&mut buf[..fdset::bytes(nfds)], va) {
+                return crate::e(crate::err::EFAULT);
+            }
+            for (w, word) in words.iter_mut().enumerate().take(fdset::words(nfds)) {
+                *word = u64::from_le_bytes(buf[w * 8..w * 8 + 8].try_into().expect("word"));
+            }
+        }
+    }
+    let now = crate::net::uptime_us();
+    let deadline = if tv_va == 0 {
+        now + 60_000_000
+    } else {
+        // `struct timeval { i64 tv_sec, i64 tv_usec }` — 16 bytes.
+        let mut tv = [0u8; 16];
+        if !crate::copy_from_user(&mut tv, tv_va) {
+            return crate::e(crate::err::EFAULT);
+        }
+        let sec = i64::from_le_bytes(tv[0..8].try_into().expect("tv_sec"));
+        let usec = i64::from_le_bytes(tv[8..16].try_into().expect("tv_usec"));
+        if sec < 0 || !(0..1_000_000).contains(&usec) {
+            return crate::e(crate::err::EINVAL);
+        }
+        now.saturating_add(sec as u64 * 1_000_000 + usec as u64)
+    };
+    let mut outs = (
+        [0u64; fdset::MAX_WORDS],
+        [0u64; fdset::MAX_WORDS],
+        [0u64; fdset::MAX_WORDS],
+    );
+    loop {
+        let mut ready = 0u64;
+        for i in fdset::interests(&ins.0, &ins.1, nfds) {
+            // EPOLLIN/EPOLLOUT are POLLIN/POLLOUT's values, so the requested
+            // mask passes straight into the poll-shaped probe.
+            let rev = fd_events(i.fd as i32, i.requested() as i16);
+            if rev != 0 && rev != POLLNVAL {
+                ready += i.record(rev as u32, &mut outs.0, &mut outs.1);
+            }
+        }
+        if ready > 0 || crate::net::uptime_us() >= deadline {
+            let n = fdset::bytes(nfds);
+            for (va, words) in [
+                (read_va, &outs.0),
+                (write_va, &outs.1),
+                (except_va, &outs.2),
+            ] {
+                if va != 0 {
+                    let mut buf = [0u8; fdset::MAX_WORDS * 8];
+                    for (w, word) in words.iter().enumerate().take(fdset::words(nfds)) {
+                        buf[w * 8..w * 8 + 8].copy_from_slice(&word.to_le_bytes());
+                    }
+                    if !crate::copy_to_user(va, &buf[..n]) {
+                        return crate::e(crate::err::EFAULT);
+                    }
+                }
             }
             return ready;
         }

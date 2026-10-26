@@ -1545,7 +1545,12 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::SET_TID_ADDRESS => 1, // one task: the tid, and nothing to clear
-        ring3::nr::GETPID | ring3::nr::GETTID => u64::from(child::current_pid()),
+        // x86_64 musl sends 39 for getpid; ring3's hand table says 38 (its
+        // own archaeology). The ABI crate owns the x86_64 truth - answer both
+        // spellings so the fetcher's calls stop landing in the unhandled arm.
+        ring3::nr::GETTID | ring3::nr::GETPID | akuma_syscalls_abi::x86_64::GETPID => {
+            u64::from(child::current_pid())
+        }
         ring3::nr::GETPPID => 1, // everything here is the init task's child
         ring3::nr::GETUID | ring3::nr::GETEUID => 0,
         ring3::nr::GETGID | ring3::nr::GETEGID => 0,
@@ -2385,6 +2390,13 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         // `setsockopt` makes the timeouts real and tolerates the no-ops.
         ring3::nr::POLL => {
             sock::poll_arm(fr.arg1(), fr.arg2(), fr.arg3() as i64)
+        }
+        // Stage 8 (M3): x86_64 musl's select() issues 23 directly - the wait
+        // apk's fetcher blocks in where busybox wget polled. Same probe and
+        // lap cadence as POLL; the fd-set arithmetic is
+        // akuma-syscalls-poll::fdset's (see sock::select_arm).
+        ring3::nr::SELECT_PSELECT6 => {
+            sock::select_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5())
         }
         ring3::nr::SETSOCKOPT => {
             sock::setsockopt_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5())
