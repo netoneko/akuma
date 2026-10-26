@@ -22,7 +22,12 @@
 # D2 (stage 8 M2): ONE `nslookup alpinelinux.org` with NO server argument,
 # so the guest's own configuration is used; verdict is the console exit
 # status, and the relay's dns_answered counter (vm-dev.log status line)
-# rising across the exec is a NOTE line, not the verdict.#
+# rising across the exec is a NOTE line, not the verdict.
+# A1/A2/A3 (stage 8 M3): the repositories file on the per-boot COPY
+# (devroot-ensure), ONE unflagged `apk update` against the frozen LAN mirror
+# (mirror.sh start verifies the manifest first and aborts the run on a
+# mismatch; stop at the end), and the downloaded index byte-equal to the
+# mirror's APKINDEX.tar.gz (guest-side sha grep, G3's pattern).
 # Pacing: 15 s between execs, one exec per ssh connection - the host forward
 # degrades at ~30 connections per boot. If an exec's console slice shows no
 # "[SSHD] Accepted connection" while port 2224 still accepted it, the forward
@@ -231,5 +236,42 @@ vline W1a "$(echo "$RCS" | cut -c8)" w1a.console
 vline W1b "$(echo "$RCS" | cut -c9)" w1b.console
 vline W1c "$(echo "$RCS" | cut -c10)" w1c.console
 vline W1d "$(echo "$RCS" | cut -c11)" w1d.console
+
+# A-group (stage 8 M3): `apk update` in the guest, signed (U1: the three
+# official alpine-devel keys ARE in /etc/apk/keys), against the frozen LAN
+# mirror. mirror.sh start verifies MANIFEST.sha256 first and aborts the run
+# on a mismatch; stopped at the end. It is NOT up during H1 above - H1's
+# own :8123 listener owns the port there.
+"$REPO/scripts/kvm/goose/mirror.sh" start >>"$OUT/gates-E.err" 2>&1 \
+  || fail_exit "mirror.sh start failed (manifest verify?)"
+
+# A1: the repositories file is exactly the mirror line - put on the per-boot
+# COPY by boot_dev.sh through devroot-ensure; the .orig stays unmodified.
+# grep -cx: exit 0 iff one whole line matches (no comment lines left).
+rgroup A1 'a1=grep -cx http://192.168.1.159:8123/main /etc/apk/repositories'
+vline A1 "$(agg "$RCS")" a1.console
+
+# A2: ONE apk update, no flags - the guest's own repositories and keys.
+# Console exit 0 is the verdict; the mirror's request log gaining the index
+# GET is cross-checked host-side (a lost client capture cannot fake it).
+MLOG=/tmp/alpine-mirror-8123.log
+mreq() { grep -c 'GET /main/x86_64/APKINDEX.tar.gz' "$MLOG" 2>/dev/null; }
+A2_BEFORE=$(mreq)
+rgroup A2 'a2=apk update'
+rcA2=$(agg "$RCS")
+A2_AFTER=$(mreq)
+note "mirror APKINDEX GETs $A2_BEFORE -> $A2_AFTER"
+[ "${A2_AFTER:-0}" -le "${A2_BEFORE:-0}" ] && rcA2=1
+vline A2 "$rcA2" a2.console
+
+# A3: the downloaded bytes are the mirror's. Judge by content, not name -
+# the cache name's 8-hex is a hash of the repository URL, so the guest's
+# name differs from the Linux reference's (same sha256 does not).
+rgroup A3 \
+  'a3a=sha256sum /var/cache/apk/APKINDEX.*.tar.gz > /tmp/h' \
+  'a3b=grep -c c169fa06 /tmp/h'
+vline A3 "$(agg "$RCS")" "a3a.console a3b.console"
+
+"$REPO/scripts/kvm/goose/mirror.sh" stop >>"$OUT/gates-E.err" 2>&1 || true
 
 emit "GATES DONE restarts=$RESTARTED"
