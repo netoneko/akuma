@@ -52,7 +52,15 @@ echo "$EPOCH" > "$OUT/epoch"
 herd disable vm-dev >>"$L" 2>&1 || true
 herd enable vm-dev  >>"$L" 2>&1 || fail "herd enable"
 cp /boot/akuma-dev-root-apk.img.orig "$IMG_DST" || fail "fresh image copy"
-"$REPO/scripts/install_kernel_amd64.sh" "$KERNEL" /boot/akuma-guest-dev >>"$L" 2>&1 \
+# Stage 8 (M2): the COPY gets the DNS prerequisites from the tree's own
+# host-tested ext2 writer (akuma-ext2 via ext2probe's host plumbing): the
+# relay resolver in /etc/resolv.conf (the .orig already carries it from the
+# rootfs script's SERVE branch; re-asserted) and the /bin/nslookup name (the
+# applet is in the image's busybox, but this image build predates the
+# symlink line in the SERVE list). The .orig is never touched.
+ENSURE=$REPO/userspace/target/x86_64-unknown-linux-musl/release/devroot-ensure
+[ -x "$ENSURE" ] || fail "no devroot-ensure binary (cargo build -p ext2probe --bin devroot-ensure --no-default-features --features host-probe --target x86_64-unknown-linux-musl --release, in userspace/)"
+"$ENSURE" "$IMG_DST" >>"$L" 2>&1 || fail "devroot-ensure""$REPO/scripts/install_kernel_amd64.sh" "$KERNEL" /boot/akuma-guest-dev >>"$L" 2>&1 \
   || fail "kernel install"
 herd start vm-dev >>"$L" 2>&1 || fail "herd start"
 
