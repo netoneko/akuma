@@ -701,6 +701,21 @@ fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
     true
 }
 
+/// View a `repr(C)` plain-old-data wire struct as its own bytes, the form
+/// `copy_to_user` takes. Trim step 2 made this the shared shape: every struct
+/// the dispatcher now pulls from `akuma-syscalls-linux` goes out through here
+/// (sock.rs's sockaddr_in writer was the first local precedent).
+fn struct_bytes<T>(t: &T) -> &[u8] {
+    // SAFETY: every caller passes a `repr(C)` plain-old-data wire struct;
+    // viewing it as its own bytes is well defined.
+    unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(*t).cast::<u8>(),
+            core::mem::size_of::<T>(),
+        )
+    }
+}
+
 /// The ext2 lookup does not follow symlinks (a deliberate crate boundary:
 /// `akuma-ext2` resolves components, `akuma-vfs::path` owns the chain
 /// walker). The serve image's `/bin/sh` — what sshd's exec path spawns — is
@@ -1098,15 +1113,7 @@ fn fill_statfs(buf: u64) -> u64 {
         f_flags: 0, // not read-only — this root writes now
         f_spare: [0; 4],
     };
-    // SAFETY: `repr(C)` plain-old-data; viewing it as its own bytes is well
-    // defined (same precedent as fill_stat64 above).
-    let raw: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            core::ptr::addr_of!(s).cast::<u8>(),
-            core::mem::size_of::<akuma_syscalls_linux::Statfs>(),
-        )
-    };
-    if !copy_to_user(buf, raw) {
+    if !copy_to_user(buf, struct_bytes(&s)) {
         return e(ring3::err::EFAULT);
     }
     0
@@ -1304,15 +1311,7 @@ fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result
         st_blocks: size.div_ceil(512) as i64,
         ..Default::default()
     });
-    // SAFETY: `repr(C)` plain-old-data; viewing it as its own bytes is well
-    // defined (sock.rs's sockaddr_in writer is the local precedent).
-    let raw: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            core::ptr::addr_of!(st).cast::<u8>(),
-            core::mem::size_of::<akuma_syscalls_abi::stat::X8664>(),
-        )
-    };
-    if !copy_to_user(buf, raw) {
+    if !copy_to_user(buf, struct_bytes(&st)) {
         return Err(ring3::err::EFAULT);
     }
     Ok(())
@@ -2051,10 +2050,14 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             if !user_ok(tp, 16) {
                 return e(ring3::err::EFAULT);
             }
-            let mut ts = [0u8; 16];
-            ts[0..8].copy_from_slice(&(us / 1_000_000).to_le_bytes());
-            ts[8..16].copy_from_slice(&((us % 1_000_000) * 1_000).to_le_bytes());
-            if !copy_to_user(tp, &ts) {
+            // Trim step 2: the wire shape is the crate's `Timespec`
+            // (`repr(C)`, 16 bytes), `from_bits` its word packing — the two
+            // u64 words musl reads go out unchanged.
+            let ts = akuma_syscalls_linux::time::Timespec::from_bits(
+                us / 1_000_000,
+                (us % 1_000_000) * 1_000,
+            );
+            if !copy_to_user(tp, struct_bytes(&ts)) {
                 return e(ring3::err::EFAULT);
             }
             0
@@ -2472,10 +2475,10 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 if !user_ok(tv, 16) {
                     return e(ring3::err::EFAULT);
                 }
-                let mut tvbuf = [0u8; 16];
-                tvbuf[0..8].copy_from_slice(&(us / 1_000_000).to_le_bytes());
-                tvbuf[8..16].copy_from_slice(&((us % 1_000_000) * 1_000).to_le_bytes());
-                if !copy_to_user(tv, &tvbuf) {
+                // Trim step 2: `Timeval` is the crate's shape (tv_usec, not
+                // tv_nsec — same clock, different second word).
+                let tvbuf = akuma_syscalls_linux::time::Timeval::from_bits(us / 1_000_000, us % 1_000_000);
+                if !copy_to_user(tv, struct_bytes(&tvbuf)) {
                     return e(ring3::err::EFAULT);
                 }
             } else if !user_ok(tv, 16) || !copy_to_user(tv, &[0u8; 16]) {
