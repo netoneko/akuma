@@ -229,14 +229,17 @@ pub fn load_path(path: &str) -> Result<(UserAddressSpace, LoadedImage), &'static
 fn finish(
     loaded: akuma_elf::LoadedElf<UserAddressSpace>,
 ) -> Result<(UserAddressSpace, LoadedImage), &'static str> {
-    let entry = match loaded.interp {
-        // Ring 3 is entered in the linker, which brings the program up itself.
-        Some(ref interp) => interp.entry_point as u64,
-        None => loaded.entry_point as u64,
+    // The cross target is the shared decision (akuma-elf-exec): the linker's
+    // entry when an interpreter was mapped — ring 3 is entered in the linker,
+    // which brings the program up itself — else the program's.
+    let (entry, prog_entry) = {
+        let prog_entry = loaded.entry_point as u64;
+        let interp_entry = loaded.interp.as_ref().map_or(0, |i| i.entry_point as u64);
+        (
+            akuma_elf_exec::entry_to_cross(loaded.interp.is_some(), prog_entry, interp_entry),
+            prog_entry,
+        )
     };
-    // `AT_ENTRY` stays the *program's* entry: it is what the linker jumps to
-    // once it is done, and reporting the linker's own would loop.
-    let prog_entry = loaded.entry_point as u64;
 
     // The three refusals `place_image` made after placing an image, kept
     // because they cost no second parse — the answers are read back out of the

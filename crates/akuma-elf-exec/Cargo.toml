@@ -1,0 +1,14 @@
+[package]
+name = "akuma-elf-exec"
+version = "0.1.0"
+edition = "2024"
+description = "The pure exec decisions for an ELF image: PT_INTERP (incl. the one-NUL static-PIE case), rebased PT_LOAD placement facts, the entry to cross, with zero dependencies"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Deliberately none: this crate is the decision core both kernels call before
+# they do any mapping. Every effect (page tables, file reads, stack builds)
+# stays with the caller; keeping the crate dependency-free is what makes it
+# portable across them and testable on the host with plain core slices.

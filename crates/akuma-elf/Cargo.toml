@@ -33,5 +33,9 @@ akuma-mmap = { path = "../akuma-mmap" }
 akuma-mmu = { path = "../akuma-mmu" }
 # `enter_kernel`/`leave_kernel` around the interpreter's whole-file read.
 akuma-bkl = { path = "../akuma-bkl" }
+# The pure PT_INTERP / entry decisions — shared with the taoxichuan
+# composition root's loader (composition step 3/3b). One `p_filesz <= 1`
+# static-PIE rule, not two that can drift.
+akuma-elf-exec = { path = "../akuma-elf-exec" }
 elf = { version = "0.7", default-features = false }
 log = { version = "0.4", default-features = false }

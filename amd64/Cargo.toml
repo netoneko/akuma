@@ -342,6 +342,9 @@ akuma-boot = { path = "../crates/akuma-boot", default-features = false }
 # `akuma-syscalls-glue`; named here because this crate calls it, and because
 # `exec_runtime.rs` has to register its four VFS callbacks.
 akuma-elf = { path = "../crates/akuma-elf" }
+# The pure PT_INTERP / entry decisions, shared with taoxichuan (the
+# composition root). `finish()`'s cross-target decision rides the same fn.
+akuma-elf-exec = { path = "../crates/akuma-elf-exec" }
 # The virtio-blk driver, used unmodified. What this target supplies is the three
 # machine facts it cannot discover — where the transport is, how the slots are
 # spaced, and how to translate an address — via `akuma-primitives::addr`.

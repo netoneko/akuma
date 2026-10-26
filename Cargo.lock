@@ -96,6 +96,7 @@ dependencies = [
  "akuma-dmesg",
  "akuma-dwi2c",
  "akuma-elf",
+ "akuma-elf-exec",
  "akuma-exec",
  "akuma-exec-core",
  "akuma-ext2",
@@ -249,12 +250,17 @@ name = "akuma-elf"
 version = "0.1.0"
 dependencies = [
  "akuma-bkl",
+ "akuma-elf-exec",
  "akuma-mmap",
  "akuma-mmu",
  "akuma-primitives",
  "elf",
  "log",
 ]
+
+[[package]]
+name = "akuma-elf-exec"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-entry"
@@ -1250,6 +1256,7 @@ dependencies = [
  "akuma-boot-amd64",
  "akuma-comconsole",
  "akuma-cpu",
+ "akuma-elf-exec",
  "akuma-ext2",
  "akuma-fdtable",
  "akuma-gdt",
