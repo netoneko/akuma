@@ -527,7 +527,7 @@ const SLOT_CEILING: u32 = 16;
 /// `Clone` for `dup2`/`dup3`: a dup copies the description (both names share
 /// the description's cursor, as POSIX file descriptions do).
 #[derive(Clone)]
-enum OpenFile {
+pub(crate) enum OpenFile {
     Dir {
         path: alloc::string::String,
         entries: Vec<akuma_vfs::DirEntry>,
@@ -2415,7 +2415,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             sock::recvfrom_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6())
         }
         ring3::nr::SHUTDOWN => sock::shutdown_arm(fr.arg1(), fr.arg2()),
-        ring3::nr::SPAWN => child::spawn_arm(fr),
+        // Stage 8 (M2): the wait a DNS client blocks in, and the socket
+        // options a libc sets on the way. `poll` pumps the NIC each lap;
+        // `setsockopt` makes the timeouts real and tolerates the no-ops.
+        ring3::nr::POLL => {
+            sock::poll_arm(fr.arg1(), fr.arg2(), fr.arg3() as i64)
+        }
+        ring3::nr::SETSOCKOPT => {
+            sock::setsockopt_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5())
+        }        ring3::nr::SPAWN => child::spawn_arm(fr),
         ring3::nr::WAITPID => child::waitpid_arm(fr.arg1(), fr.arg2()),
         ring3::nr::CLOSE_CHILD_STDIN => child::close_stdin_arm(fr.arg1()),
         ring3::nr::GETTIMEOFDAY => {

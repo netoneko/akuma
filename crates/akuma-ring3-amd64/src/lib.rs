@@ -1078,6 +1078,9 @@ pub mod err {
     /// Transport endpoint is not connected (`write(2)`/`send(2)` on a UDP
     /// socket that never saw a `connect(2)` — stage 8, M2).
     pub const ENOTCONN: u64 = 107;
+    /// Protocol not available (`setsockopt(2)` for an option this stack has
+    /// no behaviour behind — stage 8, M2).
+    pub const ENOPROTOOPT: u64 = 92;
     /// File exists (`O_CREAT`/`mkdirat` on a path that is already there).
     pub const EEXIST: u64 = 17;
     /// Illegal seek (`lseek` on a pipe/socket fd).
