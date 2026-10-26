@@ -2889,10 +2889,6 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // cannot meet. A hit here changes three auxv/cross facts at once: the
     // entry ring 3 crosses is the linker's, `AT_BASE` is where it was placed,
     // and `AT_ENTRY` stays the program's (already in the table below).
-    // [tmp] M5 boot-4: hoisted so the load-end read-back after the auxv copy
-    // can see them. Removed with the rest of [tmp].
-    let mut entry_page_pa = 0u64;
-    let mut at_copy = [0u8; 8];
     let (cross_entry, at_base) = match akuma_elf_exec::interp_path(image) {
         Ok(Some(path)) => {
             let ipath = core::str::from_utf8(path).ok()?;
@@ -2914,12 +2910,6 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                 return None;
             };
             let mut hi = akuma_elf_exec::INTERP_BASE;
-            // [tmp] M5 boot-4 diagnostics: pin the entry page's frame at copy
-            // time and read it back twice (at copy, at load end). Decides
-            // copy-time vs late rot. Removed with the rest of [tmp].
-            let ientry_early =
-                akuma_elf_exec::interp_entry(&ldso, akuma_elf_exec::INTERP_BASE).unwrap_or(0);
-            let entry_floor = ientry_early & !0xFFF;
             for seg in &segs[..n] {
                 let first = seg.vaddr & !0xFFF;
                 let last = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
@@ -2958,16 +2948,6 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                             core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
                         }
                     }
-                    if pva == entry_floor {
-                        entry_page_pa = pa as u64;
-                        for (k, b) in at_copy.iter_mut().enumerate() {
-                            // SAFETY: [tmp] physmap read of the frame just mapped.
-                            *b = unsafe {
-                                phys::phys_ptr::<u8>(entry_page_pa + 0x185 + k as u64)
-                                    .read_volatile()
-                            };
-                        }
-                    }
                     if last > hi {
                         hi = last;
                     }
@@ -2975,56 +2955,10 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                 }
             }
             add_region(akuma_elf_exec::INTERP_BASE, hi);
-            // [tmp] M5 boot-5: walk the child's tables for the entry page by
-            // hand, right after the mapping — which level disagrees with the
-            // frame the copy landed in (entry_pa above)? Removed with [tmp].
-            if entry_floor != 0 {
-                let va = entry_floor as usize;
-                // SAFETY: [tmp] physmap reads of the child's own tables.
-                let rd = |pa: u64, idx: usize| -> u64 {
-                    unsafe { phys::phys_ptr::<u64>(pa + ((idx as u64) << 3)).read_volatile() }
-                };
-                let m = 0x000f_ffff_ffff_f000u64;
-                let pml4e = rd(root, 0);
-                let pdpte = rd(pml4e & m, (va >> 30) & 511);
-                let pde = rd(pdpte & m, (va >> 21) & 511);
-                let pte = rd(pde & m, (va >> 12) & 511);
-                akuma_primitives::safe_print!(
-                    192,
-                    "  [exec] tmp walk root=0x{:x} pml4e=0x{:x} pdpte=0x{:x} pde=0x{:x} pte=0x{:x}\n",
-                    root,
-                    pml4e,
-                    pdpte,
-                    pde,
-                    pte
-                );
-            }
             let Ok(ientry) = akuma_elf_exec::interp_entry(&ldso, akuma_elf_exec::INTERP_BASE) else {
                 console::puts("  exec: interpreter has no entry\n");
                 return None;
             };
-            // Boot-2 diagnostic (M5): what the loader actually did, on the
-            // record, before the cross. Dropped once curl --version passes.
-            let eoff = (ientry - akuma_elf_exec::INTERP_BASE) as usize;
-            akuma_primitives::safe_print!(
-                192,
-                "  [exec] ldso '{}' len={} segs={} span=0x{:x} entry=0x{:x} at_base=0x{:x}\n",
-                eff,
-                ldso.len(),
-                n,
-                hi - akuma_elf_exec::INTERP_BASE,
-                ientry,
-                akuma_elf_exec::INTERP_BASE
-            );
-            akuma_primitives::safe_print!(
-                192,
-                "  [exec] ldso vec@entry={:02x?} s0=0x{:x}+0x{:x} s1=0x{:x}+0x{:x}\n",
-                &ldso[eoff..eoff + 12],
-                segs[0].vaddr,
-                segs[0].filesz,
-                segs[1].vaddr,
-                segs[1].filesz
-            );
             (ientry, akuma_elf_exec::INTERP_BASE)
         }
         // Static or static-PIE: exactly the answer this loader always gave.
@@ -3094,27 +3028,6 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     let dst = phys::phys_ptr::<u8>(stack_top_pa + (4096 - block.len() as u64));
     unsafe {
         core::ptr::copy_nonoverlapping(block.as_ptr(), dst, block.len());
-    }
-
-    // [tmp] M5 boot-4 diagnostics: second read-back of the ldso entry page's
-    // frame after everything else load_task maps/writes. `at_copy` had the
-    // bytes right after the copy; if `at_end` differs, something between
-    // rotted the frame; if they agree with the child's cross read-back being
-    // wrong, the page tables lie. Removed with the rest of [tmp].
-    if entry_page_pa != 0 {
-        let mut at_end = [0u8; 8];
-        for (k, b) in at_end.iter_mut().enumerate() {
-            // SAFETY: [tmp] physmap read of the frame captured above.
-            *b = unsafe { phys::phys_ptr::<u8>(entry_page_pa + 0x185 + k as u64).read_volatile() };
-        }
-        akuma_primitives::safe_print!(
-            192,
-            "  [exec] tmp entry_pa=0x{:x} stack_top_pa=0x{:x} at_copy={:02x?} at_end={:02x?}\n",
-            entry_page_pa,
-            stack_top_pa,
-            at_copy,
-            at_end
-        );
     }
 
     // The heap slabs: `brk` above the image, `mmap` in its own window. Both

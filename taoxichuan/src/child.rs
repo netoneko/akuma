@@ -453,32 +453,6 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
             }
         }
     }
-    // Boot-2 diagnostic (M5): the cross facts as the child will see them,
-    // plus the ldso's first bytes read back THROUGH the child's page tables
-    // (a bad copy or a wrong frame shows here, before any theory).
-    {
-        let mut first = [0u8; 16];
-        let mut ok = true;
-        for (i, b) in first.iter_mut().enumerate() {
-            let Some(pa) = crate::paging::translate_in(ti.root_pa, (ti.entry as usize) + i) else {
-                ok = false;
-                break;
-            };
-            // SAFETY: physmap read of a frame the load just mapped.
-            *b = unsafe {
-                crate::phys::phys_ptr::<u8>(pa as u64 + (((ti.entry as usize) + i) & 0xFFF) as u64)
-                    .read_volatile()
-            };
-        }
-        akuma_primitives::safe_print!(
-            192,
-            "  [exec] cross rip=0x{:x} rsp=0x{:x} ldso@entry={:02x?} mapped={}\n",
-            ti.entry,
-            ti.rsp,
-            first,
-            ok
-        );
-    }
     let ef = ring3::EntryFrame {
         r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
         rdx: 0, rsi: 0, rdi: 0, rax: 0,
