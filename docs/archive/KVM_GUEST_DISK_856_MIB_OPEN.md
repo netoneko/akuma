@@ -40,7 +40,7 @@ So `file_size()` returned about 897.6 MB at the moment the VM started, for a fil
 - No second boot on the same image (to see whether 856 MiB repeats or becomes 1024 MiB).
 - No `sync` before `herd start vm-dev` (the cheapest test of hypothesis 1).
 - No direct call of `file_size()` on the grown file after a `sync`.
-- The gate battery on the 1 GiB image (`/root/dev-cycle/gates1g.out` on the box) had G1 G2 G3 G4 H1 H2 PASS when this was written; the rest had not finished.
+- The gate battery on the 1 GiB image (`/root/dev-cycle/gates1g.out` on the box) finished with PASS for all 19 gates (G1-D2, A1-A3, W1a-d), `restarts=0`, so the guest works on the grown filesystem despite the 856 MiB reading.
 
 ## Related (not the same issue)
 
