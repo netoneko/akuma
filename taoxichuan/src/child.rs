@@ -595,6 +595,13 @@ pub fn child_exit(code: u64) -> ! {
         *core::ptr::addr_of_mut!(NESTED_DEPTH) = 0;
         (core::ptr::read_volatile(&raw const PARENT_ROOT), s[slot_idx].status)
     };
+    // [tmp] wedge-Q5: did the child ever reach exit? (remove before final)
+    akuma_primitives::safe_print!(
+        96,
+        "[tmp] child exit slot={} status=0x{:x}\n",
+        core::ptr::read_volatile(&raw const NESTED_SLOT),
+        status
+    );
     crate::set_task_slot(0);
     let ret_rsp = unsafe { core::ptr::read_volatile(&raw const RET_RSP) };
     let (bx, bp, r12, r13, r14, r15) = unsafe {
