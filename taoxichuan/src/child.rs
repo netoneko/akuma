@@ -473,6 +473,10 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
         for (_fd, payload) in table.sweep_cloexec() {
             if let crate::OpenFile::Socket(idx) = payload {
                 akuma_net::socket::remove_socket(idx);
+            } else if let crate::OpenFile::Pipe(id, w) = payload {
+                // A swept pipe end drops its table reference, exactly as
+                // close does.
+                crate::pipes::release(id, w);
             }
         }
     }
@@ -600,6 +604,11 @@ pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame) -> u64 {
 /// [`spawn_arm`], via the saved rsp and the return address
 /// [`child_enter`]'s caller left.
 pub fn child_exit(code: u64) -> ! {
+    // M3: the exiting task's pipe ends die with it — the fork child's exit
+    // is what turns the last writer's close into the reader's EOF. Index
+    // payloads hold no kernel reference (the close arms' convention); only
+    // the counted pipe ends need the walk.
+    crate::pipes::release_open_fds();
     // Record first, while the Rust frame can still reach the slot table.
     // SAFETY: syscall-path discipline. Depth-aware (M2): depth 1 is the
     // spawned shell handing the machine back to sshd; depth 2 is a fork
@@ -717,12 +726,28 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
         }
     }
 
-    // A free slot and a pid, exactly as SPAWN takes them.
+    // A free slot and a pid, exactly as SPAWN takes them — except the slot:
+    // a fork child reuses a DEAD slot, never the spawn ring's blind next.
+    // With NSLOTS = 4, a four-fork pipeline wraps the ring onto the LIVE
+    // shell's slot and `SpawnSlot::new()` wipes the session buffer out of
+    // it (boot 3, gate P3: the second `wc -c`'s `2\n` vanished and the
+    // bridge reported the fork child's pid for the shell's slot). The
+    // blocking-fork model keeps at most the shell plus ONE child alive at
+    // any instant, so a dead slot always exists; NEXT_SLOT stays the spawn
+    // arm's own ring and is not advanced here.
     let slot_idx = {
         // SAFETY: syscall-path discipline.
         let s = slots();
-        let idx = unsafe { core::ptr::read_volatile(&raw const NEXT_SLOT) };
-        let idx = idx % NSLOTS;
+        let mut pick: Option<usize> = None;
+        for i in 0..NSLOTS {
+            if !s[i].running {
+                pick = Some(i);
+                break;
+            }
+        }
+        let Some(idx) = pick else {
+            return crate::e(ring3::err::EAGAIN);
+        };
         s[idx] = SpawnSlot::new();
         s[idx].used = true;
         let pid = unsafe {
@@ -733,9 +758,6 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
         };
         s[idx].pid = pid;
         s[idx].running = true;
-        unsafe {
-            *core::ptr::addr_of_mut!(NEXT_SLOT) = (idx + 1) % NSLOTS;
-        }
         idx
     };
     let ash_root = crate::task().root_pa;
@@ -754,6 +776,15 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     // payloads: this kernel's descriptions are indices (`File { inode }`,
     // `Socket(idx)`), the convention every close arm already runs on.
     let forked = crate::fd_table().fork_copy(|_| true);
+    // A pipe end is a *counted* kernel resource: every payload the child's
+    // table inherited needs one kernel-side reference taken on top of the
+    // clone (`fork_copy`'s own doc — "iterate the values"). The index
+    // payloads the old comment excused (File{inode}, Socket(idx)) stay free.
+    for d in forked.names.values() {
+        if let crate::OpenFile::Pipe(id, w) = d {
+            crate::pipes::clone_ref(*id, *w);
+        }
+    }
 
     // Task bookkeeping: the fork child owns slot 2 while it runs (1 stays
     // the shell's). Regions, brk/mmap cursors and the fd parts come from the
