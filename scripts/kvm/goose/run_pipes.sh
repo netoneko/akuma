@@ -75,8 +75,16 @@ verdict() {
   printf "$want" >"$OUT/$name.want"
   if [ "$G_rc" = 2 ]; then emit "UNKNOWN $name (no console exit line)"; return; fi
   if [ "$G_rc" = 1 ]; then emit "FAIL $name (nonzero exit; see $name.console)"; return; fi
-  if cmp -s "$OUT/$name.client" "$OUT/$name.want"; then emit "PASS $name"
-  else emit "FAIL $name (exit 0 but client bytes differ; od -c $name.client vs $name.want)"; fi
+  # The client's own bytes pollute a raw cmp: it always prints the stderr
+  # connect line ("[ssh] connecting to ...") and appends one newline at EOF
+  # (proof: pa-probe.client and the old green F1.client carry exactly those
+  # two additions behind correct guest bytes). The verdict below strips
+  # exactly those — first line and last (empty) line — and compares the
+  # remainder byte-exactly against the guest's expected output. The console
+  # exit line above stays the primary verdict, as in the closed run_gates.sh.
+  sed '$d' "$OUT/$name.client" | tail -n +2 >"$OUT/$name.payload" 2>/dev/null
+  if cmp -s "$OUT/$name.want" "$OUT/$name.payload"; then emit "PASS $name"
+  else emit "FAIL $name (exit 0 but client bytes differ; od -c $name.payload vs $name.want)"; fi
 }
 
 verdict P1 'hi\n'     "sh -c 'echo hi | cat'"

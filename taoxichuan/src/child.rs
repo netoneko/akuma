@@ -726,12 +726,28 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
         }
     }
 
-    // A free slot and a pid, exactly as SPAWN takes them.
+    // A free slot and a pid, exactly as SPAWN takes them — except the slot:
+    // a fork child reuses a DEAD slot, never the spawn ring's blind next.
+    // With NSLOTS = 4, a four-fork pipeline wraps the ring onto the LIVE
+    // shell's slot and `SpawnSlot::new()` wipes the session buffer out of
+    // it (boot 3, gate P3: the second `wc -c`'s `2\n` vanished and the
+    // bridge reported the fork child's pid for the shell's slot). The
+    // blocking-fork model keeps at most the shell plus ONE child alive at
+    // any instant, so a dead slot always exists; NEXT_SLOT stays the spawn
+    // arm's own ring and is not advanced here.
     let slot_idx = {
         // SAFETY: syscall-path discipline.
         let s = slots();
-        let idx = unsafe { core::ptr::read_volatile(&raw const NEXT_SLOT) };
-        let idx = idx % NSLOTS;
+        let mut pick: Option<usize> = None;
+        for i in 0..NSLOTS {
+            if !s[i].running {
+                pick = Some(i);
+                break;
+            }
+        }
+        let Some(idx) = pick else {
+            return crate::e(ring3::err::EAGAIN);
+        };
         s[idx] = SpawnSlot::new();
         s[idx].used = true;
         let pid = unsafe {
@@ -742,13 +758,6 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
         };
         s[idx].pid = pid;
         s[idx].running = true;
-        // [tmp] premise-6 evidence: how many forks one pipeline takes
-        // (evalpipe forks every member, builtins included). Remove before
-        // final.
-        akuma_primitives::safe_print!(160, "  [tmp] fork child pid={}\n", pid);
-        unsafe {
-            *core::ptr::addr_of_mut!(NEXT_SLOT) = (idx + 1) % NSLOTS;
-        }
         idx
     };
     let ash_root = crate::task().root_pa;
