@@ -284,9 +284,14 @@ fn park_until(deadline_us: u64) {
 
 /// One lap of a socket waiter with nothing to do. `wait_until` drives
 /// `poll()` itself at the top of every lap; this hook only has to burn a
-/// bounded moment before the next re-check.
+/// bounded moment before the next re-check. [Q5 fix-cand] pump here too:
+/// a waiter that reaches this hook between predicate laps (send buffer
+/// full, e.g. sshd's exit report with the relay slot unacked) must keep
+/// the only pump in the kernel alive, or the guest deadlocks with its
+/// NIC ring unposted and its TX frames unflushed (Q5 wedge).
 fn blocking_relax() {
     for _ in 0..64 {
+        netpoll();
         pause();
     }
 }
@@ -313,7 +318,12 @@ fn runtime() -> NetRuntime {
     NetRuntime {
         uptime_us,
         utc_seconds: || None, // no wall clock; nothing in akuma-net reads this hook
-        yield_now: pause,     // nothing to yield to: one task, one core
+        yield_now: || {
+            // [Q5 fix-cand] never a bare pause: every yield lap must keep
+            // the pump alive (see blocking_relax).
+            netpoll();
+            pause();
+        },
         blocking_relax,
         park_until,
         current_waker: noop_waker,
