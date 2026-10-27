@@ -322,6 +322,7 @@ fn serve(listener: TcpListener, ssh_config: config::SshdConfig) -> ! {
     loop {
         let mut did_work = false;
 
+        let mut reaped_any = false; // [tmp]
         // Reap first, so the slot a just-finished session freed is available to
         // the connection arriving on this same tick rather than the next one.
         while let Some(status) = wait_any() {

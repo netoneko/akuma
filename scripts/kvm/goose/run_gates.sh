@@ -106,7 +106,18 @@ gate() {
   name=$1; cmd=$2
   before_old=$(wc -c < "$LOG.old" 2>/dev/null || echo 0)
   before=$(wc -c < "$LOG")
-  run_ssh "$cmd" >"$OUT/$name.client" 2>&1 </dev/null
+  # Bounded client (session Q part 10): kill the ssh client BY PID after 45 s
+  # (never pkill by pattern); the verdict stays console-first, the client
+  # capture is a bonus.
+  /bin/ssh -p "$SSHPORT" root@localhost "$cmd" >"$OUT/$name.client" 2>&1 </dev/null &
+  spid=$!
+  n=0
+  while kill -0 "$spid" 2>/dev/null && [ "$n" -lt 45 ]; do sleep 1; n=$((n+1)); done
+  if kill -0 "$spid" 2>/dev/null; then
+    kill "$spid" 2>/dev/null
+    emit "NOTE $name: ssh client hit the 45 s bound (killed by pid)"
+  fi
+  wait "$spid" 2>/dev/null
   sleep "$PACE"   # console drain + connection pacing in one
   if [ "$(wc -c < "$LOG")" -lt "$before" ]; then
     { tail -c +$((before_old+1)) "$LOG.old" 2>/dev/null; cat "$LOG"; } \
