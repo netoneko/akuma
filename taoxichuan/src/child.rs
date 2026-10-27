@@ -495,7 +495,6 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) rsp_here, options(nomem));
     }
-    akuma_primitives::safe_print!(160, "[tmp] band rsp={:#x}\n", rsp_here);
     // SAFETY: syscall-path discipline; `set_syscall_stack_top` is a plain
     // atomic store the unsafe context of the arm already covers.
     ring3::set_syscall_stack_top(rsp_here - 0x1000);
