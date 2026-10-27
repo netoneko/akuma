@@ -443,7 +443,19 @@ pub fn canary_byte(i: u64) -> u8 {
 /// One kernel stack for the syscall path. One task, one core, interrupts off
 /// for the whole excursion — a single static is the honest shape, and the
 /// crate owns it so the stub's `mov rsp` cannot drift from the stack it names.
-pub const SYSCALL_STACK_SIZE: usize = 16 * 1024;
+///
+/// 32 KiB, sized by the depth-2 exec measurement (2026-10-27, session U):
+/// the taoxichuan run-to-completion crossing lowers the cursor once per
+/// level — spawn (STACK/2), fork (STACK/4), exec (`exec_replace`'s
+/// `rsp_here - 0x1000`) — and at 16 KiB the exec'd image's band landed
+/// ~0x400 BELOW the region bottom (T-0x2000 shell → T-0x3000 fork child →
+/// T-0x4400 exec < bottom T-0x4000), so every exec from a fork child
+/// dispatched in the statics under this array: prints went silent, then
+/// garbled (`[o] open flags=0x?`), then a ring-0 `#GP` in `core::fmt::write`
+/// (formatter pointer read from the clobbered neighborhood), then the
+/// session-teardown poisoning. At 32 KiB the same chain bottoms out at
+/// T-0x4400 of T-0x8000 — inside, with ~0x3C00 of room under the band.
+pub const SYSCALL_STACK_SIZE: usize = 32 * 1024;
 
 #[repr(align(16))]
 #[cfg(target_arch = "x86_64")]
