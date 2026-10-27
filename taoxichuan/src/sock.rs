@@ -314,6 +314,93 @@ pub fn setsockopt_arm(fd: u64, level: u64, opt: u64, optval_va: u64, optlen: u64
     crate::e(crate::err::ENOPROTOOPT)
 }
 
+/// `getsockopt(fd, level, optname, optval*, optlen*)` — the read side of
+/// [`setsockopt_arm`], and the row the standard non-blocking connect idiom
+/// cannot finish without: `curl` dials (the syscall answers EINPROGRESS),
+/// `poll`s for writability, then reads `SOL_SOCKET/SO_ERROR` for the dial's
+/// outcome. Without this row that read answered ENOSYS and curl threw away
+/// an established connection (`curl: (7)` with the dial already answered —
+/// stage 8 session Q). The answers mirror the glue's `sys_getsockopt`
+/// (crates/akuma-syscalls-glue/src/net.rs, the full kernels' getsockopt);
+/// the state behind them is `akuma_net::socket`'s — wiring, not a second
+/// opinion.
+pub fn getsockopt_arm(fd: u64, level: u64, opt: u64, optval_va: u64, optlen_va: u64) -> u64 {
+    const SOL_SOCKET: u64 = 1;
+    const SO_TYPE: u64 = 3;
+    const SO_ERROR: u64 = 4;
+    const SO_SNDBUF: u64 = 7;
+    const SO_RCVBUF: u64 = 8;
+    const SO_RCVTIMEO: u64 = 20;
+    const SO_SNDTIMEO: u64 = 21;
+
+    let Some(idx) = fd_socket(fd) else {
+        return crate::e(crate::err::ENOTSOCK);
+    };
+    // NULL buffer or zero length: a length-only query — success, nothing
+    // written back (the glue's answer for the same call shape).
+    if optval_va == 0 || optlen_va == 0 {
+        return 0;
+    }
+
+    // The timeouts read back as a 16-byte `struct timeval`, not the 4-byte
+    // int below — the shape `setsockopt_arm` accepts on the way in, and the
+    // readback that separates "honoured" from "accepted and dropped" (the
+    // glue's 2026-08-17 lesson). All-zero = no timeout, POSIX's "forever".
+    if level == SOL_SOCKET && (opt == SO_RCVTIMEO || opt == SO_SNDTIMEO) {
+        if !crate::user_ok(optval_va, 16) || !crate::user_ok(optlen_va, 4) {
+            return crate::e(crate::err::EFAULT);
+        }
+        let us = akuma_net::socket::socket_timeout(idx, opt == SO_RCVTIMEO).unwrap_or(0);
+        let tv = akuma_syscalls_linux::time::Timeval::from_bits(us / 1_000_000, us % 1_000_000);
+        if !crate::copy_to_user(optval_va, crate::struct_bytes(&tv))
+            || !crate::copy_to_user(optlen_va, &16u32.to_le_bytes())
+        {
+            return crate::e(crate::err::EFAULT);
+        }
+        return 0;
+    }
+
+    // IP/TCP-level options have no state this stack records; Linux's
+    // ENOPROTOOPT beats a lying zero for the ones callers actually check.
+    if level != SOL_SOCKET {
+        return crate::e(crate::err::ENOPROTOOPT);
+    }
+    if !crate::user_ok(optval_va, 4) || !crate::user_ok(optlen_va, 4) {
+        return crate::e(crate::err::EFAULT);
+    }
+    let val: u32 = match opt {
+        SO_ERROR => {
+            // The dial's outcome. `connect_arm` waits the handshake out in
+            // the kernel before returning, so by the time a caller reads
+            // this the stream is established (0), dead (ECONNREFUSED — the
+            // glue's answer for a refused dial; `connect_arm`'s own timeout
+            // already reported ETIMEDOUT to its caller), or not a stream
+            // (UDP/DNS: no error pending, 0).
+            match akuma_net::socket::debug_stream_peek(idx) {
+                Some(d) if d.dead => crate::err::ECONNREFUSED as u32,
+                _ => 0,
+            }
+        }
+        SO_TYPE => {
+            if akuma_net::socket::is_udp_socket(idx) {
+                2
+            } else {
+                1
+            }
+        }
+        SO_SNDBUF | SO_RCVBUF => 131072,
+        // SO_KEEPALIVE and the rest of the int-shaped SOL_SOCKET set: zero,
+        // Linux's answer for options this stack defaults off.
+        _ => 0,
+    };
+    if !crate::copy_to_user(optval_va, &val.to_le_bytes())
+        || !crate::copy_to_user(optlen_va, &4u32.to_le_bytes())
+    {
+        return crate::e(crate::err::EFAULT);
+    }
+    0
+}
+
 /// The fd's nonblock flag, straight from the fd table.
 pub(crate) fn fd_nonblock(fd: u64) -> bool {
     fd_table().is_nonblock(fd as u32)

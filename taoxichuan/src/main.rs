@@ -2689,7 +2689,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         ring3::nr::SETSOCKOPT => {
             sock::setsockopt_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5())
-        }        ring3::nr::SPAWN => child::spawn_arm(fr),
+        }
+        ring3::nr::GETSOCKOPT => {
+            // The non-blocking connect idiom's last mile (stage 8 session Q):
+            // curl polls a dial that answered EINPROGRESS writable, then reads
+            // SOL_SOCKET/SO_ERROR — without this row the ENOSYS answer threw
+            // the established dial away.
+            sock::getsockopt_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5())
+        }
+        ring3::nr::SPAWN => child::spawn_arm(fr),
         ring3::nr::WAITPID => child::waitpid_arm(fr.arg1(), fr.arg2()),
         ring3::nr::CLOSE_CHILD_STDIN => child::close_stdin_arm(fr.arg1()),
         ring3::nr::GETTIMEOFDAY => {
