@@ -599,7 +599,7 @@ pub fn child_exit(code: u64) -> ! {
     akuma_primitives::safe_print!(
         96,
         "[tmp] child exit slot={} status=0x{:x}\n",
-        core::ptr::read_volatile(&raw const NESTED_SLOT),
+        unsafe { core::ptr::read_volatile(&raw const NESTED_SLOT) },
         status
     );
     crate::set_task_slot(0);
