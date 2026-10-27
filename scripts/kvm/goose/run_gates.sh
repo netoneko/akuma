@@ -321,6 +321,19 @@ vline H3a "$(echo "$RCS" | cut -c1)" h3a.console
 vline H3b "$(echo "$RCS" | cut -c2)" h3b.console
 vline H3c "$(echo "$RCS" | cut -c3)" h3c.console
 
+# F1 (stage 8, process-model M2): the H3 one-liner in ONE exec - the shape
+# the fork-less kernel could never run (blocking fork + real wait4: ash
+# forks for the non-final `cat`, wc tail-execs; the bytes must land in the
+# file AND compose). PASS is the console Exit status: 0; the client capture
+# (x, then wc's `2 /tmp/f`) is the content cross-check, B6's pattern.
+rgroup F1 'f1=sh -c "echo x > /tmp/f; cat /tmp/f; wc -c /tmp/f"'
+vline F1 "$(agg "$RCS")" f1.console
+if grep -q '^x' "$OUT/f1.client" && grep -q '2 /tmp/f' "$OUT/f1.client"; then
+  note "F1 capture: x then 2 /tmp/f"
+else
+  vline F1page 1 f1.client
+fi
+
 # C1 (stage 8 M1): the wall clock. E is the anchor boot_dev.sh injected at
 # THIS boot (re-read here so a mid-battery restart contributes its fresh
 # anchor). The brief's form `sh -c 'd=$(date +%s); [ "$d" -ge E ] && ...'`
