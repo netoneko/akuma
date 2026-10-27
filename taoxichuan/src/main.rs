@@ -3549,7 +3549,6 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // steps this kernel has no caller for (per-CPU block, scheduler).
     gdt_init();
     idt_init();
-    lapic_init();
     // `CR0.WP`: a kernel *write* to a read-only page honours the page tables.
     // Without it, `.rodata` protection is a fiction and copy-on-write later
     // becomes impossible to reason about. The only CR0 bit this kernel sets.
@@ -3597,6 +3596,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     }
 
     // The root disk, and the ext2 root on it.
+    // session pb: after PMM/heap are up - map_device allocates page-table frames
+    lapic_init();
     if !blk_init(&machine.virtio) {
         console::puts("  [FATAL] no virtio block device -- the pinned root (ext2 on virtio-blk) cannot mount\n");
         halt();
