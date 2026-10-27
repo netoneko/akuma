@@ -5,7 +5,7 @@ nothing but a directory, and are built by two different scripts.
 
 | Probe | Directory | Client stack | Investigation | Build |
 |---|---|---|---|---|
-| `nettest` | `rust/` | libcurl (vendored, static OpenSSL + nghttp2) | cargo-vs-curl HTTPS divergence | `rust/build.sh` (Alpine docker) |
+| `nettest` | `rust/` | libcurl (vendored, static OpenSSL + nghttp2) | cargo-vs-curl HTTPS divergence | `rust/build.sh [x86_64\|aarch64]` (native cross-build, no Docker; `--docker` keeps the old container path) |
 | `nettest parkprobe` (mode) | `rust/` | fork/waitpid/kill + blocking TCP, no curl | SMP=1 `idle_halt` scheduler freeze acceptance ([`SECOND_LISTENER_SMP1_FREEZE.md`](../../docs/archive/SECOND_LISTENER_SMP1_FREEZE.md)) | `rust/build.sh` (Alpine docker) |
 | `nettest-connect` | `rust/connect/` | raw `connect(2)` + `poll`/`select`/`epoll` — no library at all | cargo-vs-curl HTTPS divergence | `rust/build-musl.sh` (host cross) |
 | `nettest-std` | `rust/stdlib/` | `std::net` + `poll(2)` + sync rustls — no runtime | delayed first byte | `rust/build-musl.sh` (host cross) |
@@ -103,7 +103,8 @@ probe's dependency line is copied verbatim from nca's
 `[workspace.dependencies]` for the same reason.
 
 The curl probe below has the opposite requirement (match apk/nightly cargo's
-libcurl), which is why it keeps its own container build.
+libcurl), which is why it builds libcurl and OpenSSL from source (vendored, as cargo
+does) instead of linking the host's; since 2026-10-27 that cross-build is native too.
 
 ### Building for the Taoxichuan (x86_64) guest — no Docker (2026-10-27)
 
@@ -117,8 +118,10 @@ cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 `build-musl.sh` itself is aarch64-only; the x86_64 build does not need it. **The
-libcurl `nettest` (`rust/build.sh`) is the exception: it still runs an Alpine arm64
-container, and a native x86_64 build of it is untested.** For a *curl* symptom in
+libcurl `nettest` (`rust/build.sh`) builds natively too since 2026-10-27**: `./build.sh`
+(x86_64, 1 min 15 s: libcurl + nghttp2 + OpenSSL 3.6.3 built from source with
+`x86_64-linux-musl-gcc`, static-PIE, 6.7 MB) or `./build.sh aarch64`; `--docker` keeps the
+old container path. Built, **not yet run in a guest**. For a *curl* symptom in
 the guest the better probe is the real `curl` that `apk add curl` installs: it is the
 exact binary under test. Pick the probe by the syscall sequence it exercises:
 
@@ -163,7 +166,9 @@ triggers the kernel bug.
 ## Build
 
 ```bash
-# Host: docker (Alpine arm64). Produces bootstrap/bin/nettest.
+# Host: native cross-build, no Docker (2026-10-27): ./build.sh [x86_64|aarch64].
+# Produces bootstrap/bin/x86_64/nettest (or bootstrap/bin/nettest for aarch64).
+# `./build.sh --docker` is the original Alpine arm64 container build.
 userspace/nettest/rust/build.sh
 ```
 

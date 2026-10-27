@@ -62,7 +62,7 @@ the pattern to copy.
 
 - **Rust probes** (`nettest/rust/{connect,stdlib,reqwest,unixsock}`): `cargo build --release --target x86_64-unknown-linux-musl`; no Docker (see `userspace/nettest/README.md`). Only the libcurl `nettest` uses a container.
 - **C probes on the Mac:** `x86_64-linux-musl-gcc` is installed beside the aarch64 one; `memprobe/c/build.sh` and `ext2probe/c/build.sh` build both architectures (x86_64 into `x86_64/`); `futexprobe` and `epollprobe` scripts are aarch64-only today.
-- **C probes on the Akuma box itself:** `gcc` (Alpine 15.2.0, native x86_64 musl), `tcc` and `make` are installed. `. /etc/akuma-dev.env; gcc -static -O2 -o X X.c` works (a 151 KB static probe compiled and ran 2026-10-27). **Without the env file `gcc` fails with `cannot execute 'cc1'`.** `linux-headers` is not installed: a probe that includes `<linux/futex.h>` or `<linux/fb.h>` needs `apk add linux-headers` first.
+- **C probes on the Akuma box itself:** `gcc` (Alpine 15.2.0, native x86_64 musl), `tcc` and `make` are installed. `. /etc/akuma-dev.env; gcc -static -O2 -o X X.c` works (a 151 KB static probe compiled and ran 2026-10-27). **Without the env file `gcc` fails with `cannot execute 'cc1'`.** `linux-headers` (7.0.0-r1) was installed on the box 2026-10-27 at the owner's request, ahead of the cargo work and possibly git; `/usr/include/linux/futex.h` and `fb.h` exist. A fresh box needs `apk add linux-headers` once (with `. /etc/akuma-dev.env` sourced).
 
 ### `userspace/amd64/` — a different world
 
