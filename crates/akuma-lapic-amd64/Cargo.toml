@@ -1,0 +1,17 @@
+[package]
+name = "akuma-lapic-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The LAPIC's timer face (xAPIC window, EOI, tick counter, periodic arm, 8254 PIT calibration, TSC rate/uptime), extracted from amd64/src/lapic.rs per the composition rule so the amd64 kernel and taoxichuan share one implementation. forbid(unsafe_code): every hardware access rides akuma-primitives' MmioWindow, akuma-port's PIT and akuma-cpu's rdtsc. x86_64-only, like the LAPIC itself"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The safe MMIO window (read/write are plain methods) and OnceCopy.
+akuma-primitives = { path = "../akuma-primitives" }
+# The 8254 PIT (channel-0 one-shot + read-back output line) — the only crate
+# that executes in/out.
+akuma-port = { path = "../akuma-port" }
+# `tsc::rdtsc`, the safe TSC read the calibration and uptime math ride on.
+akuma-cpu = { path = "../akuma-cpu" }
