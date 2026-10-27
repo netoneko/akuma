@@ -415,6 +415,7 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
         Err(no) => return crate::e(no),
     };
     let effective = crate::resolve_effective(&args.path);
+    akuma_primitives::safe_print!(160, "[tmp] exec_replace enter '{}'\n", effective);
     let Ok(image) = crate::root_fs().read_file(&effective) else {
         akuma_primitives::safe_print!(
             192,
@@ -486,6 +487,7 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     // atomic store the unsafe context of the arm already covers.
     ring3::set_syscall_stack_top(rsp_here - 0x1000);
     let status = unsafe { child_enter(ti.root_pa, &ef) };
+    akuma_primitives::safe_print!(160, "[tmp] exec_replace exit status={:#x}\n", status);
     // The exec'd child exited: `child_exit` recorded its status in the slot,
     // cleared the nesting, put task slot 0 back, and restored THIS frame's
     // registers and CR3 (the parent's). Hand control to `spawn_arm`'s
