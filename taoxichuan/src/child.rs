@@ -792,17 +792,33 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     // (its `child_exit` loads CR3 from it), `PARENT_STASH` must still point
     // at sshd's parked RSP for `spawn_arm`'s tail, and `NESTED_SLOT` must
     // name the shell's slot for its status. The callee-saved slots and
-    // `RET_RSP` are deliberately NOT saved here: `child_enter` overwrites
-    // them with the SHELL's crossing, which is exactly what must be live
-    // when the child exits — and the shell's own `child_exit` reads the very
-    // same slots, so they must still hold the shell's state afterwards.
-    let (sshd_root, sshd_stash, shell_slot, shell_stash, shell_top) = unsafe {
+    // `RET_RSP` must ALSO be saved here: `child_enter` overwrites them with
+    // this fork's crossing, and the child's `child_exit` consumes exactly
+    // that while this frame is still live — but what was there BEFORE the
+    // fork (the shell's exec crossing) must be back in place afterwards.
+    // The shell's own `child_exit` reads the same slots, and so does
+    // `exec_replace`, which snapshots them into the `EXEC_*` copies to wind
+    // the exec'd image's status back into `spawn_arm`: a fork that leaves
+    // its own crossing behind turns the next `sh -c '…; last'` tail-exec
+    // into a return through the fork's dead callee-saved registers (seen
+    // 2026-10-27: F1's tail-exec'd `wc` died on a zeroed ring-0 PageFault
+    // right after its first open — fork of `cat`, wait4, then exec).
+    let (sshd_root, sshd_stash, shell_slot, shell_stash, shell_top, cross) = unsafe {
         (
             core::ptr::read_volatile(&raw const PARENT_ROOT),
             core::ptr::read_volatile(&raw const PARENT_STASH),
             core::ptr::read_volatile(&raw const NESTED_SLOT),
             ring3::user_rsp_stash(),
             ring3::syscall_stack_top(),
+            (
+                core::ptr::read_volatile(&raw const RET_RSP),
+                core::ptr::read_volatile(&raw const SAVE_RBX),
+                core::ptr::read_volatile(&raw const SAVE_RBP),
+                core::ptr::read_volatile(&raw const SAVE_R12),
+                core::ptr::read_volatile(&raw const SAVE_R13),
+                core::ptr::read_volatile(&raw const SAVE_R14),
+                core::ptr::read_volatile(&raw const SAVE_R15),
+            ),
         )
     };
     // SAFETY: syscall-path discipline.
@@ -818,12 +834,20 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     let _code = unsafe { child_enter(root, &ef) };
     // The child exited into this frame: its status is in the slot, the task
     // slot is back to 1, CR3 is the shell's. Restore what the shell's own
-    // exit will need, hand the shell back its stack and stash, answer fork.
+    // exit (or its next exec's snapshot) will need, hand the shell back its
+    // stack and stash, answer fork.
     // SAFETY: syscall-path discipline.
     unsafe {
         *core::ptr::addr_of_mut!(NESTED_SLOT) = shell_slot;
         PARENT_ROOT = sshd_root;
         PARENT_STASH = sshd_stash;
+        *core::ptr::addr_of_mut!(RET_RSP) = cross.0;
+        *core::ptr::addr_of_mut!(SAVE_RBX) = cross.1;
+        *core::ptr::addr_of_mut!(SAVE_RBP) = cross.2;
+        *core::ptr::addr_of_mut!(SAVE_R12) = cross.3;
+        *core::ptr::addr_of_mut!(SAVE_R13) = cross.4;
+        *core::ptr::addr_of_mut!(SAVE_R14) = cross.5;
+        *core::ptr::addr_of_mut!(SAVE_R15) = cross.6;
         ring3::set_syscall_stack_top(shell_top);
         ring3::set_user_rsp_stash(shell_stash);
     }
