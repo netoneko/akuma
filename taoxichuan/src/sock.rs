@@ -137,6 +137,7 @@ fn fd_events(fd: i32, events: i16) -> i16 {
         crate::OpenFile::Socket(_) => 1,
         crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
         crate::OpenFile::Null | crate::OpenFile::ChildOut(_) => 3,
+        crate::OpenFile::Session => 3, // the session stdio: always ready
         crate::OpenFile::EventFd(slot) => {
             efd_idx = *slot;
             4

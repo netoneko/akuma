@@ -557,6 +557,20 @@ pub(crate) enum OpenFile {
     /// decisions are not). A dup'd fd carries the same index; the slot
     /// frees when any fd naming it closes.
     EventFd(usize),
+    /// The session's own stdio. Fds 0/1/2 of a spawned task start with NO
+    /// table entry — unbound reads/writes fall through to the session
+    /// fallback (console, or the nested child's pipe). But a redirect must
+    /// be able to SAVE such an fd before closing it (busybox ash:
+    /// `fcntl(1, F_DUPFD, 10)`) and put it back afterwards
+    /// (`dup2(10, 1)`); with no source description the save answered EBADF,
+    /// the redirect's `dup2(file, 1)` bound the file with nothing to
+    /// restore from, and every later write leaked into the file. A dup of
+    /// an unbound stdio fd therefore materializes this entry at its own
+    /// number first: every access through it falls through to the same
+    /// session fallback the unbound number had, so the save/restore dance
+    /// around a redirect lands on a real description. No kernel resource
+    /// sits behind it — displacing or closing it releases nothing.
+    Session,
 }
 
 /// The one task: its root page table, the user ranges a pointer may name, the
@@ -1215,6 +1229,19 @@ fn clone_desc(d: &OpenFile) -> OpenFile {
         OpenFile::ChildOut(i) => OpenFile::ChildOut(*i),
         OpenFile::EventFd(i) => OpenFile::EventFd(*i),
         OpenFile::Null => OpenFile::Null,
+        OpenFile::Session => OpenFile::Session,
+    }
+}
+
+/// Bind an unbound stdio fd (0/1/2 — the session's console or nested-child
+/// pipe) by materializing an `OpenFile::Session` entry at its own number,
+/// so a dup of it has a description to copy and a redirect's later
+/// `dup2(save, 1)` lands back on a real fd. `alloc_fd_from` inserts at the
+/// number itself when it is free — which it is, or there was nothing to
+/// bind — and clears its flags; the decisions stay in `akuma-fdtable`.
+fn bind_session_fd(fd: u64) {
+    if fd <= 2 && fd_table().with(fd as u32, |_| ()).is_none() {
+        fd_table().alloc_fd_from(fd as u32, OpenFile::Session);
     }
 }
 
@@ -1362,7 +1389,8 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
             // closure's match stays exhaustive so a new kind cannot silently
             // fall through to the file path. Null reads are EOF — the
             // default `Ok(0)` — which is the device's contract.
-            OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::EventFd(_) | OpenFile::Null => {}
+            OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::EventFd(_) | OpenFile::Null
+            | OpenFile::Session => {}
         });
         match (found, res) {
             (true, Err(no)) => return e(no),
@@ -2052,9 +2080,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     if arg >= u64::from(SLOT_CEILING) {
                         return e(ring3::err::EINVAL);
                     }
+                    // The redirect save: an unbound fd 1 has no description
+                    // to copy, so give it one first (see bind_session_fd) —
+                    // without it the save fails, the redirect binds the file
+                    // to fd 1 with nothing to restore from, and every later
+                    // write of the session leaks into the file.
+                    bind_session_fd(fd);
                     let Some(desc) = fd_table().with(fd as u32, clone_desc) else {
-                        // TRACE: the phantom-console case — fd 0/1/2 have no
-                        // table entry on this kernel, so the save fails here.
+                        // An unbound fd above 2: a genuine EBADF (dup of a
+                        // closed number), no materialization applies.
                         akuma_primitives::safe_print!(
                             96,
                             "  [fc] F_DUPFD {} >= {}: EBADF (unbound src)\n",
@@ -2202,7 +2236,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                 }
                 OpenFile::File { .. } | OpenFile::Socket(_) | OpenFile::ChildOut(_)
-                | OpenFile::EventFd(_) | OpenFile::Null => {
+                | OpenFile::EventFd(_) | OpenFile::Null | OpenFile::Session => {
                     res = Err(ring3::err::ENOTDIR);
                 }
             });
@@ -2558,9 +2592,13 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         ring3::nr::DUP => {
             let fd = fr.arg1();
-            if fd <= 2 || fd as u32 >= SLOT_CEILING {
+            if fd as u32 >= SLOT_CEILING {
                 return e(ring3::err::EBADF);
             }
+            // dup of a session stdio fd materializes its entry first (the
+            // F_DUPFD save rule); a dup of any other unbound number stays
+            // EBADF.
+            bind_session_fd(fd);
             let desc = fd_table().with(fd as u32, clone_desc);
             let Some(desc) = desc else {
                 return e(ring3::err::EBADF);
@@ -2585,6 +2623,11 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             if old >= u64::from(SLOT_CEILING) || new >= u64::from(SLOT_CEILING) {
                 return e(ring3::err::EBADF);
             }
+            // A dup2 whose SOURCE is an unbound stdio fd materializes its
+            // entry first (the F_DUPFD save rule) — ash's restore
+            // `dup2(10, 1)` needs the save slot, and a future
+            // `dup2(1, 5)` needs a source.
+            bind_session_fd(old);
             match fd_table().dup_to(old as u32, new as u32, is_dup3 && flags & O_CLOEXEC != 0) {
                 Ok(d) => {
                     // TRACE (s7d step-1 settle): the redirect bind step.
