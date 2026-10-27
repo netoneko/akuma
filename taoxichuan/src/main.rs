@@ -321,10 +321,6 @@ fn idt_init() {
             trap::register(kind, fault_trap);
         }
     }
-    // [tmp] wedge-Q8: the LAPIC-timer heartbeat rides the trap crate's Timer
-    // kind (the only one whose vector is a software choice), gate at HB_VECTOR.
-    trap::register(Kind::Timer, hb_tick);
-    IDT.set(HB_VECTOR, trap::entry(Kind::Timer));
     IDT.fill(double_fault as usize);
     IDT.set(2, vec_nmi as usize);
     IDT.set(4, vec_of as usize);
@@ -352,80 +348,9 @@ fn idt_init() {
 }
 
 // ---------------------------------------------------------------------------
-// [tmp] wedge-Q8: the LAPIC-timer heartbeat. The guest takes no interrupts
-// (no LAPIC driver, no raised lines) and a ring-3 spin never syscalls, so
-// nothing can sample where the vCPU spins — except a timer this kernel arms
-// itself. One periodic LAPIC-timer interrupt per second; the handler prints
-// the interrupted RIP, CS and RSP. The kernel keeps IF masked (boot.s's
-// legacy), ring 3 runs with IF set (spawn rflags 0x202), so every delivered
-// sample is a ring-3 RIP; a spin with IF=0 stops the samples entirely, which
-// is itself the answer. [tmp] instrument — remove before final.
-// ---------------------------------------------------------------------------
-
-/// The guest LAPIC's physical address (the VMM emulates this page; MMIO
-/// stores and loads through the mapping NPF-exit into `LapicDev`).
-const HB_LAPIC_PA: u64 = 0xFEE0_0000;
-/// The heartbeat's IDT vector — free: no `Kind` owns it, no stub is installed.
-const HB_VECTOR: u8 = 0x20;
-
-/// Samples delivered so far (printed, so the log can be diffed per second).
-static HB_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Map the LAPIC page into the device window and arm a 1 Hz periodic timer on
-/// [`HB_VECTOR`]: divider /1, initial count 1e9 (the emulated bus is 1 GHz).
-/// False when the map fails (no heartbeat; the boot continues).
-#[allow(static_mut_refs)]
-fn hb_init() -> bool {
-    if !map_device(HB_LAPIC_PA, 0x1000) {
-        console::puts("  [tmp] hb: LAPIC page map failed\n");
-        return false;
-    }
-    let lap = (phys::DEVMAP_BASE + HB_LAPIC_PA) as *mut u32;
-    // SAFETY: the mapping above covers the page; each write is one aligned
-    // dword to the emulated LAPIC. Values made runtime-shaped so every store
-    // compiles to a form the VMM's MMIO decoder knows (`mov reg->mem`).
-    unsafe {
-        let svr = (1u32 << 8) | 0xFF; // software-enable, spurious vector 0xFF
-        core::ptr::write_volatile(lap.offset(0x0F0 / 4), svr);
-        let div = 0b1011u32; // divide configuration: /1
-        core::ptr::write_volatile(lap.offset(0x3E0 / 4), div);
-        let lvt = u32::from(HB_VECTOR) | (1 << 17); // periodic mode, unmasked
-        core::ptr::write_volatile(lap.offset(0x320 / 4), lvt);
-        let count = 1_000_000_000u32; // one second at the 1 GHz emulated bus
-        core::ptr::write_volatile(lap.offset(0x380 / 4), count);
-    }
-    console::puts("  [tmp] hb: LAPIC timer armed, 1 Hz on vector 0x20\n");
-    true
-}
-
-/// The timer ISR: name the interrupted instruction once per second, then EOI
-/// (no EOI retires nothing, and the emulated LAPIC raises no further timer
-/// interrupts while the vector sits in service). IRQ-context safe: this runs
-/// only out of ring 3 (the kernel keeps IF masked), so it can never preempt
-/// a console write or itself (IF is clear inside the handler).
-fn hb_tick(t: &mut Trap<'_>) {
-    let n = HB_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-    akuma_primitives::safe_print!(
-        128,
-        "[tmp] hb#{} rip=0x{:016x} cs=0x{:04x} rsp=0x{:016x} ring={}\n",
-        n,
-        t.frame.rip,
-        t.frame.cs,
-        t.frame.rsp,
-        t.frame.cs & 3
-    );
-    // SAFETY: the LAPIC page was mapped by `hb_init` and never unmapped.
-    unsafe {
-        core::ptr::write_volatile(
-            ((phys::DEVMAP_BASE + HB_LAPIC_PA) as *mut u32).offset(0x0B0 / 4),
-            0,
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // virtio-blk: map the announced transports, hand the geometry to the driver.
 // ---------------------------------------------------------------------------
+
 const PAGE_SIZE: u64 = 4096;
 
 /// Map one device's register file into the device window, uncached — the
@@ -3437,10 +3362,6 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // guest with no NIC or no lease still boots; sshd will bind and simply
     // never answer, which is a legible failure, not a hang.
     let _ = net::net_init();
-
-    // [tmp] wedge-Q8: arm the 1 Hz LAPIC-timer heartbeat before the first
-    // ring-3 crossing, so every spawned program is sampled.
-    let _ = hb_init();
 
     // ---- The init-spawn point ------------------------------------------------
     //
