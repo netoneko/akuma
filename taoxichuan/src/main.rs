@@ -1473,10 +1473,6 @@ pub(crate) fn eventfd_can_read(idx: usize) -> bool {
     eventfds()[idx].as_ref().is_some_and(|ef| ef.can_read())
 }
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
-    // [tmp] name every dispatched syscall number — spin hunt for F1's wc
-    // (console shows the last nr entered when the core pegs). Remove before
-    // final; listed in RESULT-T.md.
-    akuma_primitives::safe_print!(64, "  [tmp nr] {}\n", fr.rax);
     match fr.rax {
         ring3::nr::WRITE => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
