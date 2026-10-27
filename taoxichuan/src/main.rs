@@ -576,9 +576,10 @@ struct Task {
     fd_nonblock: fdtable::FlagSet,
 }
 
-static mut TASKS: [Task; 2] = [Task::new(), Task::new()];
+static mut TASKS: [Task; 3] = [Task::new(), Task::new(), Task::new()];
 /// Which slot `task()` hands out: 0 is the boot's init task (sshd for this
-/// stage's gate), 1 is the child running inside a SPAWN (`child.rs`).
+/// stage's gate), 1 is the child running inside a SPAWN (`child.rs`), and 2
+/// is a fork child running inside that child (child.rs's M2 scaffold).
 static mut TASK_SLOT: usize = 0;
 
 impl Task {
@@ -609,7 +610,7 @@ fn set_task_slot(i: usize) {
 }
 
 /// Both slots, for the spawn path (it snapshots the parent's `root_pa`).
-fn task_slots() -> &'static mut [Task; 2] {
+fn task_slots() -> &'static mut [Task; 3] {
     // SAFETY: as `task`.
     unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
 }
@@ -2698,6 +2699,11 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             sock::getsockopt_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5())
         }
         ring3::nr::SPAWN => child::spawn_arm(fr),
+        // CLONE/FORK/VFORK + WAIT4 (stage 8, process-model M2): the blocking
+        // fork and the real reap — the arms busybox ash needs to run any
+        // non-final command of a list. child.rs's M2 scaffold.
+        ring3::nr::CLONE | 57 | 58 => child::fork_arm(fr),
+        ring3::nr::WAIT4 => child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
         ring3::nr::WAITPID => child::waitpid_arm(fr.arg1(), fr.arg2()),
         ring3::nr::CLOSE_CHILD_STDIN => child::close_stdin_arm(fr.arg1()),
         ring3::nr::GETTIMEOFDAY => {
@@ -2975,6 +2981,89 @@ fn task_done(code: u64) -> ! {
 /// (`child.rs`) — one loader, one placement story. Runs with the kernel
 /// half live (the physmap does all the copying); the caller chooses the
 /// CR3 moment.
+/// M2 (H3-f): the fork child's address space — an eager, flag-faithful copy
+/// of the caller's whole user half. No CoW on purpose: this kernel has no
+/// page-fault handler (a fault kills the task, the trap arm at the top of
+/// this file), and eager copy is what the ELF loader already does. The root
+/// is built the same way `load_task` builds one (kernel half copied from the
+/// live CR3, user half empty), then the caller's user page tables are cloned
+/// subtree-by-subtree with fresh leaf frames.
+///
+/// Every leaf keeps the parent PTE's own flag bits — RX text must stay RX
+/// (a RW mapping would be NX and the child would fault on its first
+/// instruction), RO data stays RO. Huge (PS) leaves are refused: the loader
+/// maps 4 KiB pages only, and refusing beats silently sharing a 2 MiB page.
+pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
+    let root_page = akuma_pmm::alloc_page_zeroed()?;
+    let root = root_page as u64;
+    let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
+    // SAFETY: both frames are PMM pages inside the physmap; the copy is a
+    // plain RAM write, and the new root is not live until fork's CR3 load.
+    unsafe {
+        let ktbl = phys::phys_ptr::<[u64; 512]>(kroot);
+        let utbl = phys::phys_ptr::<[u64; 512]>(root);
+        for i in 256..512 {
+            (*utbl)[i] = (*ktbl)[i];
+        }
+    }
+    let user_tree = unsafe { clone_user_tree(parent_root, 2)? };
+    // SAFETY: as above; splicing the clone into the empty user half.
+    unsafe {
+        let utbl = phys::phys_ptr::<[u64; 512]>(root);
+        let ctbl = phys::phys_ptr::<[u64; 512]>(user_tree);
+        for i in 0..256 {
+            (*utbl)[i] = (*ctbl)[i];
+        }
+    }
+    Some(root)
+}
+
+/// One page-table level of [`fork_share_memory`]'s clone: `depth` 2 is the
+/// PML4's user half, 0 the leaf PT whose entries name 4 KiB frames. Each
+/// present leaf gets a fresh zeroed frame with the parent's bytes and the
+/// parent entry's flag bits; each interior entry gets a cloned subtree.
+/// Single core, `IF` clear, the forking parent parked — the discipline that
+/// owns every other page-table touch in this kernel.
+///
+/// SAFETY: `table_pa` must be a PMM-resident page-table frame (physmap
+/// reachable), and the root that names it must not be the active CR3 (the
+/// fork copies the caller's own tables while the caller's root is still
+/// active but the copies are only ever read through the physmap).
+unsafe fn clone_user_tree(table_pa: u64, depth: u32) -> Option<u64> {
+    let out_page = akuma_pmm::alloc_page_zeroed()?;
+    let out = out_page as u64;
+    // SAFETY: contract above; every load/store is inside the physmap.
+    unsafe {
+        let src = phys::phys_ptr::<[u64; 512]>(table_pa);
+        let dst = phys::phys_ptr::<[u64; 512]>(out);
+        for i in 0..512 {
+            let entry = (*src)[i];
+            if entry & 1 == 0 {
+                continue; // not present
+            }
+            if depth == 0 {
+                let old = entry & 0x000f_ffff_ffff_f000;
+                let frame = akuma_pmm::alloc_page_zeroed()? as u64;
+                core::ptr::copy_nonoverlapping(
+                    phys::phys_ptr::<u8>(old),
+                    phys::phys_ptr::<u8>(frame),
+                    4096,
+                );
+                // The flag bits (present/RW/US/accessed/dirty/NX, 0-11 and
+                // 52-63) ride along verbatim; only the frame number is new.
+                (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | frame;
+            } else {
+                if entry & 0x080 != 0 {
+                    return None; // a huge page: see fork_share_memory's note
+                }
+                let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, depth - 1)?;
+                (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
+            }
+        }
+    }
+    Some(out)
+}
+
 fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     let img = ring3::Image::parse(image).ok()?;
     let t = task();

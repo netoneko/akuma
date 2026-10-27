@@ -47,11 +47,14 @@ pub struct SpawnSlot {
     pub status: u32,
     /// The pipe: the child's stdout, read out through the `ChildOut` fd.
     pub out: Vec<u8>,
+    /// M2 (fork): WAIT4 reaped this child — a second wait on the pid is
+    /// ECHILD, which is how a shell's job table closes the entry.
+    pub reaped: bool,
 }
 
 impl SpawnSlot {
     const fn new() -> Self {
-        Self { used: false, pid: 0, running: false, status: 0, out: Vec::new() }
+        Self { used: false, pid: 0, running: false, status: 0, out: Vec::new(), reaped: false }
     }
 }
 
@@ -70,6 +73,12 @@ static mut NEXT_SLOT: usize = 0;
 static mut NEXT_PID: u32 = 2; // 1 is sshd (the boot's init task)
 static mut NESTED_SLOT: usize = 0;
 static mut NESTED_DEPTH: u32 = 0;
+
+/// The slot whose `out` buffer carries the session's stdout: set by
+/// `spawn_arm`, never by the fork arm. A fork child (`cat` inside `sh -c`)
+/// inherits the SHELL's unbound fd 1, so its writes must land in the buffer
+/// sshd drains — its own slot would hold bytes nobody ever reads.
+static mut SPAWN_OUT_SLOT: usize = 0;
 
 /// -- saved parent state for the nested run (written by [`spawn_run`], read
 /// -- by the exit arm's asm tail). Single core, `IF` off: no other writer.
@@ -120,7 +129,7 @@ pub fn child_write(buf_va: u64, len: u64) -> bool {
         // SAFETY: syscall-path discipline.
         let slot = unsafe {
             let s = &mut *core::ptr::addr_of_mut!(SLOTS);
-            &mut s[core::ptr::read_volatile(&raw const NESTED_SLOT)]
+            &mut s[core::ptr::read_volatile(&raw const SPAWN_OUT_SLOT)]
         };
         if slot.out.len() < OUT_CAP {
             let take = n.min(OUT_CAP - slot.out.len());
@@ -313,6 +322,7 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
         PARENT_STACK_TOP = ring3::syscall_stack_top();
         PARENT_STASH = ring3::user_rsp_stash();
         *core::ptr::addr_of_mut!(NESTED_SLOT) = slot_idx;
+        *core::ptr::addr_of_mut!(SPAWN_OUT_SLOT) = slot_idx;
         *core::ptr::addr_of_mut!(NESTED_DEPTH) += 1;
         // The nested stack: the lower half of the syscall stack. The live
         // dispatch frames sit in the upper half — the SPAWN arm's depth from
@@ -584,18 +594,24 @@ pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame) -> u64 {
 /// [`child_enter`]'s caller left.
 pub fn child_exit(code: u64) -> ! {
     // Record first, while the Rust frame can still reach the slot table.
-    // SAFETY: syscall-path discipline.
+    // SAFETY: syscall-path discipline. Depth-aware (M2): depth 1 is the
+    // spawned shell handing the machine back to sshd; depth 2 is a fork
+    // child handing it back to the shell — same record, one level up.
     let (parent_root, status) = unsafe {
         let slot_idx = core::ptr::read_volatile(&raw const NESTED_SLOT);
         let s = &mut *core::ptr::addr_of_mut!(SLOTS);
         s[slot_idx].running = false;
         s[slot_idx].status = ((code & 0xFF) << 8) as u32;
         let t = &mut *core::ptr::addr_of_mut!(crate::TASKS);
-        t[1].exit = Some(code);
-        *core::ptr::addr_of_mut!(NESTED_DEPTH) = 0;
+        let depth = core::ptr::read_volatile(&raw const NESTED_DEPTH) as usize;
+        t[depth].exit = Some(code);
+        *core::ptr::addr_of_mut!(NESTED_DEPTH) = (depth - 1) as u32;
         (core::ptr::read_volatile(&raw const PARENT_ROOT), s[slot_idx].status)
     };
-    crate::set_task_slot(0);
+    // SAFETY: as above; `task()` now names the resuming parent
+    // (sshd at depth 1, the shell at depth 2).
+    let depth = unsafe { core::ptr::read_volatile(&raw const NESTED_DEPTH) } as usize;
+    crate::set_task_slot(depth);
     let ret_rsp = unsafe { core::ptr::read_volatile(&raw const RET_RSP) };
     let (bx, bp, r12, r13, r14, r15) = unsafe {
         (
@@ -640,6 +656,202 @@ pub fn child_exit(code: u64) -> ! {
 // ---------------------------------------------------------------------------
 // The wait family, as the bridge drives it.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// M2 scaffold: the blocking fork (the trim plan's H3-f) and a real WAIT4.
+//
+// The plan's owner-approved exception to the composition rule: a fork that
+// runs the child to completion INSIDE the fork call — the SPAWN shape, but
+// the child is the CALLER's own code, resumed at its current RIP with RAX 0
+// on an eager, flag-faithful copy of its memory (no CoW: there is no page
+// fault handler, and eager copy is what the loader already does), with the
+// fd table the extracted crate's own fork decision (`fdtable::FdTable::
+// fork_copy`), never a hand copy. FORK RETURNS THE CHILD'S PID in the
+// parent; the child's exit status is in the slot, and WAIT4 — now a real
+// arm — reports it. **THROWAWAY: M4 (akuma-exec adoption — real scheduler,
+// `fork_process`, parked parents) replaces this whole section.** Depth 2 is
+// the ceiling here: a fork of the fork child has no stack region left, and
+// a parked parent cannot pump a pipe, which is why M4 exists.
+// ---------------------------------------------------------------------------
+
+/// CLONE/FORK/VFORK (56/57/58): the M2 blocking fork. musl maps all three
+/// numbers to CLONE on x86_64 (`fork()` = `clone(SIGCHLD)`, `posix_spawn` =
+/// `clone(SIGCHLD|CLONE_VM|CLONE_VFORK)`); the raw FORK/VFORK numbers are
+/// served for completeness. Accepted flag sets: `SIGCHLD` alone (a real
+/// fork — the eager copy makes the child independent) and
+/// `SIGCHLD|CLONE_VM|CLONE_VFORK` (posix_spawn's shape; vfork's contract —
+/// the child touches nothing before exec — holds by construction, since the
+/// parent does not resume until the child has exited). Anything else
+/// (CLONE_THREAD and friends) is M4's scheduler, not this scaffold.
+pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
+    // Fork lives only inside the spawned shell: nothing forks the sshd task,
+    // and a fork inside a fork child has no stack region left (see above).
+    let depth = unsafe { core::ptr::read_volatile(&raw const NESTED_DEPTH) };
+    if depth != 1 {
+        return crate::e(crate::err::EPERM);
+    }
+    let flags = fr.arg1();
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_VFORK: u64 = 0x0000_4000;
+    const SIGCHLD: u64 = 17;
+    if flags & SIGCHLD == 0 || flags & !(CLONE_VM | CLONE_VFORK | SIGCHLD) != 0 {
+        return crate::e(ring3::err::EINVAL);
+    }
+
+    // A free slot and a pid, exactly as SPAWN takes them.
+    let slot_idx = {
+        // SAFETY: syscall-path discipline.
+        let s = slots();
+        let idx = unsafe { core::ptr::read_volatile(&raw const NEXT_SLOT) };
+        let idx = idx % NSLOTS;
+        s[idx] = SpawnSlot::new();
+        s[idx].used = true;
+        let pid = unsafe {
+            let p = &mut *core::ptr::addr_of_mut!(NEXT_PID);
+            let v = *p;
+            *p = p.wrapping_add(1);
+            v
+        };
+        s[idx].pid = pid;
+        s[idx].running = true;
+        unsafe {
+            *core::ptr::addr_of_mut!(NEXT_SLOT) = (idx + 1) % NSLOTS;
+        }
+        idx
+    };
+    let ash_root = crate::task().root_pa;
+
+    // The child's address space: an eager copy of every mapped user page of
+    // the shell's, each PTE keeping its own flags (RX text stays RX). Built
+    // while the parent's CR3 is still active — the walk reads the shell's
+    // tables and the copies go through the physmap, all kernel half.
+    let Some(root) = crate::fork_share_memory(ash_root) else {
+        slots()[slot_idx].used = false;
+        return crate::e(crate::err::ENOMEM);
+    };
+
+    // The child's fd table is `akuma-fdtable`'s own fork decision — not a
+    // hand copy. No kernel-side references to take on top of the cloned
+    // payloads: this kernel's descriptions are indices (`File { inode }`,
+    // `Socket(idx)`), the convention every close arm already runs on.
+    let forked = crate::fd_table().fork_copy(|_| true);
+
+    // Task bookkeeping: the fork child owns slot 2 while it runs (1 stays
+    // the shell's). Regions, brk/mmap cursors and the fd parts come from the
+    // shell's record; `user_ok` then answers for the child exactly as for
+    // the shell.
+    {
+        let t = crate::task();
+        let regions = t.regions;
+        let n_regions = t.n_regions;
+        let (brk_base, brk_cur, brk_end, mmap_cur) =
+            (t.brk_base, t.brk_cur, t.brk_end, t.mmap_cur);
+        let ct = &mut crate::task_slots()[2];
+        ct.root_pa = root;
+        ct.regions = regions;
+        ct.n_regions = n_regions;
+        ct.brk_base = brk_base;
+        ct.brk_cur = brk_cur;
+        ct.brk_end = brk_end;
+        ct.mmap_cur = mmap_cur;
+        ct.exit = None;
+        ct.fd_names = forked.names;
+        ct.fd_cloexec = forked.cloexec;
+        ct.fd_nonblock = forked.nonblock;
+    }
+    crate::set_task_slot(2);
+
+    // The child resumes the CALLER at its own RIP with every user register
+    // it had — RAX forced to 0, the fork child's answer. The user RSP rides
+    // the stub's stash (the shell's CLONE just wrote it); it is copied now,
+    // because the child's first syscall overwrites the stash with its own.
+    let ef = ring3::EntryFrame {
+        r15: fr.r15, r14: fr.r14, r13: fr.r13, r12: fr.r12,
+        rbp: fr.rbp, rbx: fr.rbx, r10: fr.r10, r8: fr.r8, r9: fr.r9,
+        rdx: fr.rdx, rsi: fr.rsi, rdi: fr.rdi,
+        rax: 0,
+        rip: fr.user_rip,
+        rflags: fr.user_rflags,
+        rsp: ring3::user_rsp_stash(),
+    };
+
+    // Snapshot what the OUTER crossing (sshd → shell) left in the single
+    // save slots: `PARENT_ROOT` must name sshd again before the SHELL exits
+    // (its `child_exit` loads CR3 from it), `PARENT_STASH` must still point
+    // at sshd's parked RSP for `spawn_arm`'s tail, and `NESTED_SLOT` must
+    // name the shell's slot for its status. The callee-saved slots and
+    // `RET_RSP` are deliberately NOT saved here: `child_enter` overwrites
+    // them with the SHELL's crossing, which is exactly what must be live
+    // when the child exits — and the shell's own `child_exit` reads the very
+    // same slots, so they must still hold the shell's state afterwards.
+    let (sshd_root, sshd_stash, shell_slot, shell_stash, shell_top) = unsafe {
+        (
+            core::ptr::read_volatile(&raw const PARENT_ROOT),
+            core::ptr::read_volatile(&raw const PARENT_STASH),
+            core::ptr::read_volatile(&raw const NESTED_SLOT),
+            ring3::user_rsp_stash(),
+            ring3::syscall_stack_top(),
+        )
+    };
+    // SAFETY: syscall-path discipline.
+    unsafe {
+        PARENT_ROOT = ash_root;
+        *core::ptr::addr_of_mut!(NESTED_SLOT) = slot_idx;
+        *core::ptr::addr_of_mut!(NESTED_DEPTH) += 1;
+        // The child's dispatch stack: one quarter below the shell's top. The
+        // shell's live fork frames sit just under ITS top, a few hundred
+        // bytes deep against a 4 KiB quarter, so the two can never meet.
+        ring3::set_syscall_stack_top(shell_top - (ring3::SYSCALL_STACK_SIZE / 4) as u64);
+    }
+    let _code = unsafe { child_enter(root, &ef) };
+    // The child exited into this frame: its status is in the slot, the task
+    // slot is back to 1, CR3 is the shell's. Restore what the shell's own
+    // exit will need, hand the shell back its stack and stash, answer fork.
+    // SAFETY: syscall-path discipline.
+    unsafe {
+        *core::ptr::addr_of_mut!(NESTED_SLOT) = shell_slot;
+        PARENT_ROOT = sshd_root;
+        PARENT_STASH = sshd_stash;
+        ring3::set_syscall_stack_top(shell_top);
+        ring3::set_user_rsp_stash(shell_stash);
+    }
+    let pid = slots()[slot_idx].pid;
+    u64::from(pid)
+}
+
+/// Linux WAIT4 (61): `wait4(pid, &status, options, rusage)` — the M2 answer,
+/// reading the same slot table `waitpid_arm` does. Returns the reaped
+/// child's pid with the status word written out; `ECHILD` for a pid that is
+/// not an unreaped child (including one already reaped — that is how a
+/// shell's job table closes its entry); `0` only where the ABI allows
+/// "nothing reaped" (WNOHANG on a running child — unreachable in this
+/// model, since a child completes inside its own fork call, but answered
+/// honestly). `rusage` is accepted and ignored: the gate's callers pass
+/// NULL, and zero-filled accounting is what this box has always given.
+pub fn wait4_arm(pid: u64, status_va: u64, _options: u64, _rusage_va: u64) -> u64 {
+    let want_pid = pid as u32;
+    let any = pid == u64::MAX || want_pid == 0; // -1, or "my process group"
+    let mut found: Option<(u32, u32)> = None;
+    // SAFETY: syscall-path discipline.
+    let s = slots();
+    for sl in s.iter_mut() {
+        if !sl.used || sl.reaped || sl.running || (!any && sl.pid != want_pid) {
+            continue;
+        }
+        found = Some((sl.pid, sl.status));
+        sl.reaped = true;
+        break;
+    }
+    let Some((child, status)) = found else {
+        return crate::e(ring3::err::ECHILD);
+    };
+    if status_va != 0
+        && (!crate::user_ok(status_va, 4) || !crate::copy_to_user(status_va, &status.to_le_bytes()))
+    {
+        return crate::e(crate::err::EFAULT);
+    }
+    u64::from(child)
+}
 
 /// Akuma's WAITPID (0x1000+303): `waitpid(pid, &status)`. Returns the pid
 /// with the status filled (reaped), 0 (still running — impossible here, but
