@@ -342,18 +342,7 @@ fn runtime() -> NetRuntime {
 
 /// One lap of the stack: drain the NIC into smoltcp, run its timers. The
 /// everything-path for inbound frames on this guest.
-// [tmp] wedge-Q5: does the pump keep laps during the stall? (remove before final)
-static NP_LAPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 pub fn netpoll() {
-    NP_LAPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if NP_LAPS.load(core::sync::atomic::Ordering::Relaxed) & 0x3FFF == 0 {
-        akuma_primitives::safe_print!(
-            96,
-            "[tmp] np lap={}\n",
-            NP_LAPS.load(core::sync::atomic::Ordering::Relaxed)
-        );
-    }
     let _ = akuma_net::smoltcp_net::poll();
 }
 

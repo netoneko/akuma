@@ -886,12 +886,7 @@ async fn bridge_process(
     // WEXITSTATUS, which is 0 for a signal death and so cannot be told apart
     // from a clean success. The only way out of this loop other than the reap is
     // a `?`, and those all mean the client is already gone.
-    let mut bridge_iters: u64 = 0; // [tmp] wedge-Q5 (remove before final)
     let status = loop {
-        bridge_iters += 1; // [tmp] wedge-Q5
-        if bridge_iters % 2_000_000 == 0 {
-            eprintln(&format!("[tmp] bridge iters={} pid={}", bridge_iters, pid));
-        }
         // 1. Shell exited → drain remaining stdout, then stop. Must apply the
         //    same cook_output() gating as the live loop below — this drain
         //    used to send raw bytes unconditionally, so which bytes of a PTY
@@ -1087,11 +1082,6 @@ async fn bridge_process(
 
     // Only now that the fds are released (so a write error can't leak them via
     // `?`) tell the client how the command ended.
-    // [tmp] wedge-Q5: the reap won — the report frame is in flight (remove before final)
-    eprintln(&format!(
-        "[tmp] bridge reaped pid={} status={:?}",
-        pid, status
-    ));
     send_exit_report(stream, session, status).await
 }
 
