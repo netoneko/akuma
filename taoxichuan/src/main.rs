@@ -365,8 +365,13 @@ fn idt_init() {
 /// The guest LAPIC's physical address (the VMM emulates this page; MMIO
 /// stores and loads through the mapping NPF-exit into `LapicDev`).
 const HB_LAPIC_PA: u64 = 0xFEE0_0000;
-/// The heartbeat's IDT vector — free: no `Kind` owns it, no stub is installed.
-const HB_VECTOR: u8 = 0x20;
+/// The heartbeat's IDT vector — 0x30, clear of every fixed `Kind` vector, of
+/// the stub vectors and of the PIC's BIOS-default ranges (8/0x70), and not
+/// the 0x20 the akuma kernel conventionally uses for its own timer under
+/// this VMM (the first instrumented boot with 0x20 died at the TSC
+/// calibrate, before the timer was even armed — vector choice is the
+/// difference this boot tests).
+const HB_VECTOR: u8 = 0x30;
 
 /// Samples delivered so far (printed, so the log can be diffed per second).
 static HB_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -394,7 +399,7 @@ fn hb_init() -> bool {
         let count = 1_000_000_000u32; // one second at the 1 GHz emulated bus
         core::ptr::write_volatile(lap.offset(0x380 / 4), count);
     }
-    console::puts("  [tmp] hb: LAPIC timer armed, 1 Hz on vector 0x20\n");
+    console::puts("  [tmp] hb: LAPIC timer armed, 1 Hz on vector 0x30\n");
     true
 }
 
