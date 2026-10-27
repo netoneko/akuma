@@ -1128,14 +1128,12 @@ async fn send_exit_report(
             wire::exit_status_payload(channel, status.exit_code())
         }
     };
-    println("[tmp] report: queueing exit-status"); // [tmp]
     send_packet(stream, &payload, session).await?;
 
     // The client returns once the channel closes, using the status recorded
     // above. EOF first, then CLOSE, so it knows no more data is coming.
     send_packet(stream, &wire::channel_eof_payload(channel), session).await?;
     send_packet(stream, &wire::channel_close_payload(channel), session).await?;
-    println("[tmp] report: eof+close queued, close-wait begin"); // [tmp]
 
     // Guard against a second send on a channel we've already closed.
     session.channel_open = false;
@@ -1154,16 +1152,11 @@ async fn send_exit_report(
     // other sessions nothing — see its doc comment.
     const CLOSE_WAIT_TICKS: u32 = 500;
     let mut scratch = [0u8; 512];
-    let mut peer_hung = false; // [tmp]
-    let mut saw_close_any = false; // [tmp]
     for _ in 0..CLOSE_WAIT_TICKS {
         match stream.try_read(&mut scratch) {
             // Peer hung up: the report necessarily reached it first (TCP is
             // ordered), so there is nothing left to flush.
-            Ok(0) => {
-                peer_hung = true; // [tmp]
-                break;
-            }
+            Ok(0) => break,
             Ok(n) => {
                 // Its CHANNEL_CLOSE may be in here; decrypt so we can stop as
                 // soon as it arrives instead of spinning to the bound.
@@ -1175,7 +1168,6 @@ async fn send_exit_report(
                     }
                 }
                 if saw_close {
-                    saw_close_any = true; // [tmp]
                     break;
                 }
             }
@@ -1183,10 +1175,6 @@ async fn send_exit_report(
         }
         crate::yield_now().await;
     }
-    println(&format!( // [tmp]
-        "[tmp] report: close-wait end peer_hung={} saw_close={}",
-        peer_hung, saw_close_any
-    ));
 
     Ok(())
 }

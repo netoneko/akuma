@@ -106,25 +106,34 @@ gate() {
   name=$1; cmd=$2
   before_old=$(wc -c < "$LOG.old" 2>/dev/null || echo 0)
   before=$(wc -c < "$LOG")
-  # Bounded client (session Q part 10): kill the ssh client BY PID after 45 s
-  # (never pkill by pattern); the verdict stays console-first, the client
-  # capture is a bonus.
+  # Bounded client that WAITS for the console verdict line (session Q part
+  # 11: the verdict is the console's `[SSH] Exit status` line, and killing a
+  # client before it appears is how the NEXT exec wedges - so the client is
+  # never killed before the line; the PID kill is the cap, not the rule).
+  # Polls the same rotation-proof slice the verdict reads. Cap 90 s; the
+  # 12.6 MB curl closure (Q11 b1: 95 s) gets 240.
+  conslice() {
+    if [ "$(wc -c < "$LOG")" -lt "$before" ]; then
+      { tail -c +$((before_old+1)) "$LOG.old" 2>/dev/null; cat "$LOG"; }
+    else
+      tail -c +$((before+1)) "$LOG" 2>/dev/null
+    fi
+  }
+  case "$name" in m4a|b1) CAP=240 ;; *) CAP=90 ;; esac
   /bin/ssh -p "$SSHPORT" root@localhost "$cmd" >"$OUT/$name.client" 2>&1 </dev/null &
   spid=$!
   n=0
-  while kill -0 "$spid" 2>/dev/null && [ "$n" -lt 45 ]; do sleep 1; n=$((n+1)); done
+  while kill -0 "$spid" 2>/dev/null && [ "$n" -lt "$CAP" ]; do
+    conslice 2>/dev/null | grep -q 'Exit status:' && break
+    sleep 1; n=$((n+1))
+  done
   if kill -0 "$spid" 2>/dev/null; then
     kill "$spid" 2>/dev/null
-    emit "NOTE $name: ssh client hit the 45 s bound (killed by pid)"
+    emit "NOTE $name: ssh client hit the ${CAP} s cap (killed by pid)"
   fi
   wait "$spid" 2>/dev/null
   sleep "$PACE"   # console drain + connection pacing in one
-  if [ "$(wc -c < "$LOG")" -lt "$before" ]; then
-    { tail -c +$((before_old+1)) "$LOG.old" 2>/dev/null; cat "$LOG"; } \
-      >"$OUT/$name.console" 2>/dev/null
-  else
-    tail -c +$((before+1)) "$LOG" >"$OUT/$name.console" 2>/dev/null
-  fi
+  conslice >"$OUT/$name.console" 2>/dev/null
   if grep -q 'Exit status: 0' "$OUT/$name.console"; then G_rc=0
   elif grep -q 'Exit status:' "$OUT/$name.console"; then G_rc=1
   else G_rc=2; fi
@@ -216,6 +225,16 @@ if [ "$GROUP" != main ]; then
 
   rgroup B4 'b4=apk info -e curl'
   vline B4 "$(agg "$RCS")" b4.console
+
+  # B6: the owner's curl-stage gate (2026-10-26): the guest's own curl
+  # fetches example.com through the relay; PASS is the console's
+  # `Exit status: 0` plus the real page in the capture (the sha256/hello.c
+  # form is dropped, RESULT-Q11).
+  rgroup B6 'b6=curl -sS https://example.com'
+  vline B6 "$(agg "$RCS")" b6.console
+  grep -q '<title>Example Domain</title>' "$OUT/b6.client" \
+    && note "B6 capture: Example Domain title present" \
+    || vline B6page 1 b6.client
 
   # B5 is an EVIDENCE CARRIER, not a gate: df / calls statfs("/") (the print
   # fires on every call) even though this df can only print the header and
@@ -354,6 +373,22 @@ rgroup A3 \
   'a3a=sha256sum /var/cache/apk/APKINDEX.*.tar.gz > /tmp/h' \
   'a3b=grep -c c169fa06 /tmp/h'
 vline A3 "$(agg "$RCS")" "a3a.console a3b.console"
+
+# M4 (stage 8 M4, the curl stage - closed out 2026-10-27): install the
+# guest's own curl, then the owner's curl-stage gate: example.com through
+# the relay. PASS is console-first - the exec's `[SSH] Exit status: 0` -
+# plus the real page in the client capture. The old sha256/hello.c form is
+# DROPPED (RESULT-Q11: `sh -c "sha256sum … > …out"` wedges the GUEST -
+# nested sh -c + redirect, c4=100% io=0; guest bug, open item, not the
+# relay).
+rgroup M4 \
+  'm4a=apk add curl' \
+  'm4b=curl -sS https://example.com'
+vline M4curl "$(echo "$RCS" | cut -c1)" m4a.console
+vline M4web "$(echo "$RCS" | cut -c2)" m4b.console
+grep -q '<title>Example Domain</title>' "$OUT/m4b.client" \
+  && note "M4web capture: Example Domain title present" \
+  || vline M4page 1 m4b.client
 
 # W1 (stage 8 trim step 2): the guest's own wire-struct bytes must equal the
 # pre-refactor W0 baseline. The group is SELF-CONTAINED: it re-applies W0's

@@ -797,16 +797,11 @@ pub fn getpeername_arm(fd: u64, addr_va: u64, addrlen_va: u64) -> u64 {
     0
 }
 
-pub fn shutdown_arm(fd: u64, how: u64) -> u64 {
-    akuma_primitives::safe_print!(96, "  [tmp] sock shutdown fd={} how={}\n", fd, how); // [tmp]
-    let Some(idx) = fd_socket(fd) else {
+pub fn shutdown_arm(fd: u64, how: u64) -> u64 {    let Some(idx) = fd_socket(fd) else {
         return crate::e(crate::err::ENOTSOCK);
     };
     match akuma_net::socket::socket_shutdown(idx, how as i32) {
-        Ok(()) => {
-            akuma_primitives::safe_print!(96, "  [tmp] sock shutdown done fd={}\n", fd); // [tmp]
-            0
-        }
+        Ok(()) => 0,
         Err(e) => net_err(e),
     }
 }
@@ -895,15 +890,7 @@ pub fn write_arm(fd: u64, buf: u64, len: u64) -> u64 {
 /// the slot itself.
 pub fn close_arm(fd: u64) {
     let idx = fd_socket(fd);
-    // [tmp] wedge-Q9: one line per close event, never per lap.
-    akuma_primitives::safe_print!(
-        96,
-        "  [tmp] sock close fd={} idx={}\n",
-        fd,
-        idx.map_or(u64::MAX, |i| i as u64)
-    );
     if let Some(idx) = idx {
         akuma_net::socket::remove_socket(idx);
-        akuma_primitives::safe_print!(96, "  [tmp] sock close done idx={}\n", idx); // [tmp]
     }
 }

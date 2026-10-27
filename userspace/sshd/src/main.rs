@@ -238,7 +238,6 @@ fn serve(listener: TcpListener, ssh_config: config::SshdConfig) -> ! {
 
     loop {
         let mut did_work = false;
-        let mut session_ended = false; // [tmp]
 
         match listener.try_accept() {
             Ok((stream, _addr)) => {
@@ -272,17 +271,11 @@ fn serve(listener: TcpListener, ssh_config: config::SshdConfig) -> ! {
         while i < sessions.len() {
             match sessions[i].as_mut().poll(&mut cx) {
                 Poll::Ready(()) => {
-                    println("[tmp] session ended: handle_connection returned"); // [tmp]
                     drop(sessions.swap_remove(i));
-                    println("[tmp] session future dropped (stream closed)"); // [tmp]
                     did_work = true;
-                    session_ended = true; // [tmp]
                 }
                 Poll::Pending => i += 1,
             }
-        }
-        if session_ended {
-            println("[tmp] accept loop resumes after session end"); // [tmp]
         }
 
         if !did_work {
@@ -322,7 +315,6 @@ fn serve(listener: TcpListener, ssh_config: config::SshdConfig) -> ! {
     loop {
         let mut did_work = false;
 
-        let mut reaped_any = false; // [tmp]
         // Reap first, so the slot a just-finished session freed is available to
         // the connection arriving on this same tick rather than the next one.
         while let Some(status) = wait_any() {
@@ -339,13 +331,6 @@ fn serve(listener: TcpListener, ssh_config: config::SshdConfig) -> ! {
                 ));
             }
             did_work = true;
-            reaped_any = true; // [tmp]
-        }
-        if reaped_any {
-            println(&format!( // [tmp]
-                "[tmp] reap done, accept loop resumes ({} live)",
-                live_sessions
-            ));
         }
 
         match listener.try_accept() {
@@ -373,9 +358,7 @@ fn serve(listener: TcpListener, ssh_config: config::SshdConfig) -> ! {
                             // `TcpListener`'s fd is closed by the kernel on our
                             // `exit()` anyway, but only after this session ends
                             // — which can be hours.
-                            println("[tmp] child: closing listener"); // [tmp]
                             close(listener.as_raw_fd());
-                            println("[tmp] child: listener closed"); // [tmp]
 
                             // The connection stays *non-blocking* even though
                             // this process now has only one session to serve.
@@ -391,7 +374,6 @@ fn serve(listener: TcpListener, ssh_config: config::SshdConfig) -> ! {
 
                             let ssh_stream = SshStream::new(stream);
                             block_on(protocol::handle_connection(ssh_stream, ssh_config.clone()));
-                            println("[tmp] child: handle_connection returned"); // [tmp]
                             exit(0);
                         }
                         Ok(ForkResult::Parent(pid)) => {
@@ -406,9 +388,7 @@ fn serve(listener: TcpListener, ssh_config: config::SshdConfig) -> ! {
                             // connection and, worse, leaves the parent holding a
                             // half of a connection it will never read, so the
                             // peer never sees a clean close.
-                            println("[tmp] parent: dropping accepted fd"); // [tmp]
                             drop(stream);
-                            println("[tmp] parent: accepted fd dropped"); // [tmp]
                         }
                         Err(e) => {
                             // ENOMEM here means the global process table or
