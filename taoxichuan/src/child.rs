@@ -674,15 +674,18 @@ pub fn child_exit(code: u64) -> ! {
 // a parked parent cannot pump a pipe, which is why M4 exists.
 // ---------------------------------------------------------------------------
 
-/// CLONE/FORK/VFORK (56/57/58): the M2 blocking fork. musl maps all three
-/// numbers to CLONE on x86_64 (`fork()` = `clone(SIGCHLD)`, `posix_spawn` =
-/// `clone(SIGCHLD|CLONE_VM|CLONE_VFORK)`); the raw FORK/VFORK numbers are
-/// served for completeness. Accepted flag sets: `SIGCHLD` alone (a real
-/// fork — the eager copy makes the child independent) and
-/// `SIGCHLD|CLONE_VM|CLONE_VFORK` (posix_spawn's shape; vfork's contract —
-/// the child touches nothing before exec — holds by construction, since the
-/// parent does not resume until the child has exited). Anything else
-/// (CLONE_THREAD and friends) is M4's scheduler, not this scaffold.
+/// CLONE/FORK/VFORK (56/57/58): the M2 blocking fork. On x86_64 musl issues
+/// `fork()` as `clone(SIGCHLD)` and `posix_spawn` as
+/// `clone(SIGCHLD|CLONE_VM|CLONE_VFORK)`, but **vfork as the raw SYS_vfork
+/// in assembly — no flags word at all** (`vfork.s`: `mov $58, %eax`), and
+/// busybox ash forks its non-final commands through exactly that, so the
+/// flags check keys on the number and FORK/VFORK are accepted bare. For
+/// CLONE: `SIGCHLD` alone (a real fork — the eager copy makes the child
+/// independent) and `SIGCHLD|CLONE_VM|CLONE_VFORK` (posix_spawn's shape;
+/// vfork's contract — the child touches nothing before exec — holds by
+/// construction, since the parent does not resume until the child has
+/// exited) are accepted; anything else (CLONE_THREAD and friends) is M4's
+/// scheduler, not this scaffold.
 pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     // Fork lives only inside the spawned shell: nothing forks the sshd task,
     // and a fork inside a fork child has no stack region left (see above).
@@ -690,12 +693,21 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     if depth != 1 {
         return crate::e(crate::err::EPERM);
     }
-    let flags = fr.arg1();
     const CLONE_VM: u64 = 0x0000_0100;
     const CLONE_VFORK: u64 = 0x0000_4000;
     const SIGCHLD: u64 = 17;
-    if flags & SIGCHLD == 0 || flags & !(CLONE_VM | CLONE_VFORK | SIGCHLD) != 0 {
-        return crate::e(ring3::err::EINVAL);
+    if fr.rax == ring3::nr::CLONE {
+        let flags = fr.arg1();
+        if flags & SIGCHLD == 0 || flags & !(CLONE_VM | CLONE_VFORK | SIGCHLD) != 0 {
+            // Name the flags: each boot reads as a checklist of what the
+            // caller asked for, not just that it was refused.
+            akuma_primitives::safe_print!(
+                160,
+                "  [fork] clone flags=0x{:x} refused (not SIGCHLD[|VM|VFORK])\n",
+                flags
+            );
+            return crate::e(ring3::err::EINVAL);
+        }
     }
 
     // A free slot and a pid, exactly as SPAWN takes them.
