@@ -3006,29 +3006,40 @@ pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
             (*utbl)[i] = (*ktbl)[i];
         }
     }
-    let user_tree = unsafe { clone_user_tree(parent_root, 2)? };
-    // SAFETY: as above; splicing the clone into the empty user half.
+    // Clone the USER half only, one PML4 subtree at a time. The kernel half
+    // is shared by the PML4 copy above and must NOT be walked: its physmap
+    // subtree names every physical address the 64 GiB window covers, holes
+    // included, and a leaf copy there would read frames above RAM.
+    // SAFETY: as above; the copies read the parent's (parked) tables and
+    // write the new root's, all through the physmap.
     unsafe {
-        let utbl = phys::phys_ptr::<[u64; 512]>(root);
-        let ctbl = phys::phys_ptr::<[u64; 512]>(user_tree);
+        let src = phys::phys_ptr::<[u64; 512]>(parent_root);
+        let dst = phys::phys_ptr::<[u64; 512]>(root);
         for i in 0..256 {
-            (*utbl)[i] = (*ctbl)[i];
+            let entry = (*src)[i];
+            if entry & 1 == 0 {
+                continue;
+            }
+            if entry & 0x080 != 0 {
+                return None; // a 1 GiB leaf: see fork_share_memory's note
+            }
+            let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2)?;
+            (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
         }
     }
     Some(root)
 }
 
-/// One page-table level of [`fork_share_memory`]'s clone: `depth` 2 is the
-/// PML4's user half, 0 the leaf PT whose entries name 4 KiB frames. Each
-/// present leaf gets a fresh zeroed frame with the parent's bytes and the
-/// parent entry's flag bits; each interior entry gets a cloned subtree.
-/// Single core, `IF` clear, the forking parent parked — the discipline that
-/// owns every other page-table touch in this kernel.
+/// One page-table level of [`fork_share_memory`]'s clone: `depth` counts the
+/// levels BELOW this table (2 = a PDPT, 0 = a leaf PT naming 4 KiB frames).
+/// Each present leaf gets a fresh zeroed frame with the parent's bytes and
+/// the parent entry's flag bits; each interior entry gets a cloned subtree;
+/// huge (PS) leaves are refused at any interior level. Single core, `IF`
+/// clear, the forking parent parked — the discipline that owns every other
+/// page-table touch in this kernel.
 ///
 /// SAFETY: `table_pa` must be a PMM-resident page-table frame (physmap
-/// reachable), and the root that names it must not be the active CR3 (the
-/// fork copies the caller's own tables while the caller's root is still
-/// active but the copies are only ever read through the physmap).
+/// reachable) whose table belongs to the USER half of a parked task's root.
 unsafe fn clone_user_tree(table_pa: u64, depth: u32) -> Option<u64> {
     let out_page = akuma_pmm::alloc_page_zeroed()?;
     let out = out_page as u64;
