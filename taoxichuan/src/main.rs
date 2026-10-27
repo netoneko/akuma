@@ -2089,12 +2089,6 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     let Some(desc) = fd_table().with(fd as u32, clone_desc) else {
                         // An unbound fd above 2: a genuine EBADF (dup of a
                         // closed number), no materialization applies.
-                        akuma_primitives::safe_print!(
-                            96,
-                            "  [fc] F_DUPFD {} >= {}: EBADF (unbound src)\n",
-                            fd,
-                            arg
-                        );
                         return e(ring3::err::EBADF);
                     };
                     let mut table = fd_table();
@@ -2107,15 +2101,9 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                     u64::from(newfd)
                 }
-                other => {
+                _other => {
                     // Name the gap the way the syscall checklist does: an
                     // fcntl command a guest really needed shows up here.
-                    akuma_primitives::safe_print!(
-                        96,
-                        "  [fc] fcntl cmd={} fd={}: EINVAL\n",
-                        other,
-                        fd
-                    );
                     e(ring3::err::EINVAL)
                 }
             }
@@ -2124,11 +2112,6 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // fds 0/1/2 are the console and hold no kernel reference to
             // release; closing them is the no-op Linux's stdio-close is.
             let fd = fr.arg1();
-            // TRACE (s7d step-1 settle): the redirect's close(1) and the
-            // save-slot cleanup (10).
-            if fd <= 2 || fd == 10 {
-                akuma_primitives::safe_print!(96, "  [c] close {}\n", fd);
-            }
             if fd <= 2 {
                 return 0;
             }
@@ -2630,8 +2613,6 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             bind_session_fd(old);
             match fd_table().dup_to(old as u32, new as u32, is_dup3 && flags & O_CLOEXEC != 0) {
                 Ok(d) => {
-                    // TRACE (s7d step-1 settle): the redirect bind step.
-                    akuma_primitives::safe_print!(96, "  [d] dup {}->{} ok\n", old, new);
                     // Whatever `new` named is displaced: release a displaced
                     // socket's kernel side exactly as close() does.
                     if let Some(OpenFile::Socket(idx)) = d.displaced {
@@ -2651,8 +2632,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                 }
                 Err(fdtable::DupError::BadFd) => {
-                    // TRACE: a failed bind is exactly what an empty redirect is.
-                    akuma_primitives::safe_print!(96, "  [d] dup {}->{} EBADF\n", old, new);
+                    // A failed bind is exactly what an empty redirect is.
                     e(ring3::err::EBADF)
                 }
             }
