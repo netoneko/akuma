@@ -377,13 +377,24 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
 /// The first-level (SPAWN) saved state, snapshotted across an exec-replace:
 /// the second [`child_enter`] overwrites the shared save slots with this
 /// (nested) call's registers, and [`spawn_arm`]'s resume needs the originals.
-static mut EXEC_RET_RSP: u64 = 0;
-static mut EXEC_RBX: u64 = 0;
-static mut EXEC_RBP: u64 = 0;
-static mut EXEC_R12: u64 = 0;
-static mut EXEC_R13: u64 = 0;
-static mut EXEC_R14: u64 = 0;
-static mut EXEC_R15: u64 = 0;
+/// SPAWN-level crossing state saved by `exec_replace` — one PER FRAME now,
+/// not the old single statics: test A nests two exec_replace levels (outer
+/// sh -> inner sh -> cat) plus a fork, and each level's snapshot overwrote
+/// the one shared set, so the outer `exec_return` restored a dead image's
+/// user registers into `spawn_arm`'s live Rust frame (the 16 KiB #GP shape,
+/// then the 32 KiB silent spin). A frame local lives above the deeper
+/// dispatch bands (deeper runs write strictly below it), so it is stable
+/// until its own `exec_return` consumes it.
+#[repr(C)]
+struct ExecSave {
+    ret_rsp: u64,
+    rbx: u64,
+    rbp: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
 
 /// The nested child's `execve` — the handoff of the run-to-completion model.
 ///
@@ -401,15 +412,17 @@ static mut EXEC_R15: u64 = 0;
 /// (ash) sees and reports; after the crossing there is no returning.
 pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     // SAFETY: syscall-path discipline (single core, IF clear).
-    unsafe {
-        EXEC_RET_RSP = core::ptr::read_volatile(&raw const RET_RSP);
-        EXEC_RBX = core::ptr::read_volatile(&raw const SAVE_RBX);
-        EXEC_RBP = core::ptr::read_volatile(&raw const SAVE_RBP);
-        EXEC_R12 = core::ptr::read_volatile(&raw const SAVE_R12);
-        EXEC_R13 = core::ptr::read_volatile(&raw const SAVE_R13);
-        EXEC_R14 = core::ptr::read_volatile(&raw const SAVE_R14);
-        EXEC_R15 = core::ptr::read_volatile(&raw const SAVE_R15);
-    }
+    let save = unsafe {
+        ExecSave {
+            ret_rsp: core::ptr::read_volatile(&raw const RET_RSP),
+            rbx: core::ptr::read_volatile(&raw const SAVE_RBX),
+            rbp: core::ptr::read_volatile(&raw const SAVE_RBP),
+            r12: core::ptr::read_volatile(&raw const SAVE_R12),
+            r13: core::ptr::read_volatile(&raw const SAVE_R13),
+            r14: core::ptr::read_volatile(&raw const SAVE_R14),
+            r15: core::ptr::read_volatile(&raw const SAVE_R15),
+        }
+    };
     let args = match read_spawn_args(fr.arg1(), fr.arg2(), fr.arg3()) {
         Ok(a) => a,
         Err(no) => return crate::e(no),
@@ -495,7 +508,7 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     // child's status in EAX.
     // SAFETY: the snapshot was taken at this arm's entry and is still live;
     // `ret` pops the return address `spawn_arm`'s `child_enter` call pushed.
-    unsafe { exec_return((status & 0xFF) as u32) }
+    unsafe { exec_return(&save, (status & 0xFF) as u32) }
 }
 
 /// Restore the SPAWN-level saved state and `ret` into [`spawn_arm`].
@@ -505,25 +518,19 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
 /// [`child_enter`] has returned here; the snapshot statics must be live and
 /// CR3 must already be the parent's (set by [`child_exit`]).
 #[cfg(target_arch = "x86_64")]
-unsafe fn exec_return(status: u32) -> ! {
+unsafe fn exec_return(save: &ExecSave, status: u32) -> ! {
     unsafe {
         core::arch::asm!(
-            "mov rbx, [{rbx}]",
-            "mov rbp, [{rbp}]",
-            "mov r12, [{r12}]",
-            "mov r13, [{r13}]",
-            "mov r14, [{r14}]",
-            "mov r15, [{r15}]",
-            "mov rsp, [{rsp}]",
+            "mov rbx, [rdi + 0x08]",
+            "mov rbp, [rdi + 0x10]",
+            "mov r12, [rdi + 0x18]",
+            "mov r13, [rdi + 0x20]",
+            "mov r14, [rdi + 0x28]",
+            "mov r15, [rdi + 0x30]",
+            "mov rsp, [rdi + 0x00]",
             "mov eax, {st:e}",
             "ret",
-            rbx = in(reg) core::ptr::addr_of!(EXEC_RBX),
-            rbp = in(reg) core::ptr::addr_of!(EXEC_RBP),
-            r12 = in(reg) core::ptr::addr_of!(EXEC_R12),
-            r13 = in(reg) core::ptr::addr_of!(EXEC_R13),
-            r14 = in(reg) core::ptr::addr_of!(EXEC_R14),
-            r15 = in(reg) core::ptr::addr_of!(EXEC_R15),
-            rsp = in(reg) core::ptr::addr_of!(EXEC_RET_RSP),
+            in("rdi") save,
             st = in(reg) u64::from(status),
             options(noreturn),
         )
