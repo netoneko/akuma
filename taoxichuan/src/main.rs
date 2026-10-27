@@ -89,6 +89,7 @@ extern crate alloc;
 
 mod child;
 mod net;
+mod pipes;
 mod sock;
 
 use akuma_boot_amd64::{mem, paging, phys};
@@ -544,6 +545,11 @@ pub(crate) enum OpenFile {
     /// A spawned child's stdout buffer: `child.rs`'s spawn-slot index.
     /// Drained by `read`, then EOF — a pipe that is just a buffer.
     ChildOut(usize),
+    /// A pipe end (M3): the `akuma-pipes` table's id and which end this fd
+    /// names. Unlike the index payloads, the id is a *counted* kernel
+    /// resource — every dup/fork copy bumps it (`pipes::clone_ref`), every
+    /// close/exit drops it (`pipes::release`), or EOF never arrives.
+    Pipe(u32, bool),
     /// The null device: reads are EOF, writes are discarded, seeks are no-ops.
     /// Stage 7 (H2): `/dev/null` used to be an EACCES ext2 lookup failure,
     /// which cost every `dd of=/dev/null` and plenty of applet noise.
@@ -1227,6 +1233,7 @@ fn clone_desc(d: &OpenFile) -> OpenFile {
         },
         OpenFile::Socket(i) => OpenFile::Socket(*i),
         OpenFile::ChildOut(i) => OpenFile::ChildOut(*i),
+        OpenFile::Pipe(id, w) => OpenFile::Pipe(*id, *w),
         OpenFile::EventFd(i) => OpenFile::EventFd(*i),
         OpenFile::Null => OpenFile::Null,
         OpenFile::Session => OpenFile::Session,
@@ -1331,6 +1338,7 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
         // stdout fd drains its pipe (then EOF); an eventfd answers its
         // counter or EAGAIN (session Q — curl's wakeup fd).
         let mut slot_idx: usize = usize::MAX;
+        let mut pipe_id: usize = usize::MAX;
         let kind = fd_table().with(fd as u32, |d| match d {
             OpenFile::Socket(_) => 1,
             OpenFile::ChildOut(slot) => {
@@ -1341,12 +1349,17 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
                 slot_idx = *slot;
                 3
             }
+            OpenFile::Pipe(id, false) => {
+                pipe_id = *id as usize;
+                4
+            }
             _ => 0,
         });
         match kind {
             Some(1) => return sock::read_arm(fd, buf_va, len),
             Some(2) => return child::read_child_out(slot_idx, buf_va, len),
             Some(3) => return eventfd_read_arm(slot_idx, buf_va),
+            Some(4) => return pipes::read_arm(pipe_id as u32, buf_va, len),
             _ => {}
         }
         let mut chunk = [0u8; 512];
@@ -1389,8 +1402,10 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
             // closure's match stays exhaustive so a new kind cannot silently
             // fall through to the file path. Null reads are EOF — the
             // default `Ok(0)` — which is the device's contract.
+            OpenFile::Pipe(_, true) => res = Err(ring3::err::EBADF),
             OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::EventFd(_) | OpenFile::Null
-            | OpenFile::Session => {}
+            | OpenFile::Session
+            | OpenFile::Pipe(_, false) => {}
         });
         match (found, res) {
             (true, Err(no)) => return e(no),
@@ -1518,6 +1533,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // and the null device (stage 7 — writes vanish, the count is
             // still the whole length).
             let mut efd_idx: usize = usize::MAX;
+            let mut pipe_id: usize = usize::MAX;
             let kind = fd_table().with(fd as u32, |d| match d {
                 OpenFile::Socket(_) => 1,
                 OpenFile::File { .. } => 2,
@@ -1526,6 +1542,10 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     efd_idx = *slot;
                     4
                 }
+                OpenFile::Pipe(id, true) => {
+                    pipe_id = *id as usize;
+                    5
+                }
                 _ => 0,
             });
             match kind {
@@ -1533,6 +1553,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 Some(2) => return write_file_arm(fd, buf, len),
                 Some(3) => return len,
                 Some(4) => return eventfd_write_arm(efd_idx, buf),
+                Some(5) => return pipes::write_arm(pipe_id as u32, buf, len),
                 _ => {}
             }
             // Unbound: only 1/2 fall back — a nested child's fd 1 is the
@@ -2095,11 +2116,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     let Some(slot) = table.free_below(arg as u32, SLOT_CEILING) else {
                         return e(ring3::err::EMFILE);
                     };
+                    // The copy is a real reference (as the DUP arm): a
+                    // cloned pipe end bumps the table's end count.
+                    if let OpenFile::Pipe(id, w) = &desc {
+                        pipes::clone_ref(*id, *w);
+                    }
                     let newfd = table.alloc_fd_from(slot, desc);
                     if cmd == 1030 {
                         table.set_cloexec(newfd);
-                    }
-                    u64::from(newfd)
+                    }                    u64::from(newfd)
                 }
                 _other => {
                     // Name the gap the way the syscall checklist does: an
@@ -2108,6 +2133,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
             }
         }
+        ring3::nr::PIPE2 => pipes::pipe2_arm(fr.arg1(), fr.arg2()),
         ring3::nr::CLOSE => {
             // fds 0/1/2 are the console and hold no kernel reference to
             // release; closing them is the no-op Linux's stdio-close is.
@@ -2126,6 +2152,12 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 OpenFile::EventFd(slot) => {
                     eventfd_close_slot(*slot);
                     2
+                }
+                OpenFile::Pipe(id, w) => {
+                    // A pipe end drops its table reference here — the last
+                    // writer's close is what makes the reader's EOF arrive.
+                    pipes::release(*id, *w);
+                    3
                 }
                 _ => 0,
             });
@@ -2222,6 +2254,12 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 | OpenFile::EventFd(_) | OpenFile::Null | OpenFile::Session => {
                     res = Err(ring3::err::ENOTDIR);
                 }
+                OpenFile::Pipe(_, false) => {
+                    // A read end is not writable: EBADF, Linux's answer for
+                    // an fd without write permission.
+                    res = Err(ring3::err::EBADF);
+                }
+                OpenFile::Pipe(_, true) => res = Err(ring3::err::ENOTDIR),
             });
             if !found {
                 return e(ring3::err::EBADF);
@@ -2586,6 +2624,11 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let Some(desc) = desc else {
                 return e(ring3::err::EBADF);
             };
+            // The copy is a real reference: a cloned pipe end bumps the
+            // table's count or the first close kills the other fd's end.
+            if let OpenFile::Pipe(id, w) = &desc {
+                pipes::clone_ref(*id, *w);
+            }
             let mut table = fd_table();
             let Some(_slot) = table.free_below(3, SLOT_CEILING) else {
                 return e(ring3::err::EMFILE);
@@ -2611,12 +2654,28 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // `dup2(10, 1)` needs the save slot, and a future
             // `dup2(1, 5)` needs a source.
             bind_session_fd(old);
+            let src_pipe = fd_table().with(old as u32, |d| {
+                if let OpenFile::Pipe(id, w) = d {
+                    Some((*id, *w))
+                } else {
+                    None
+                }
+            })
+            .flatten();
             match fd_table().dup_to(old as u32, new as u32, is_dup3 && flags & O_CLOEXEC != 0) {
                 Ok(d) => {
                     // Whatever `new` named is displaced: release a displaced
-                    // socket's kernel side exactly as close() does.
+                    // socket's kernel side exactly as close() does; a
+                    // displaced pipe end drops its table reference the same
+                    // way. The clone that dup_to made of the SOURCE is a
+                    // real reference too — the end count must follow it.
                     if let Some(OpenFile::Socket(idx)) = d.displaced {
                         akuma_net::socket::remove_socket(idx);
+                    } else if let Some(OpenFile::Pipe(id, w)) = d.displaced {
+                        pipes::release(id, w);
+                    }
+                    if let Some((id, w)) = src_pipe {
+                        pipes::clone_ref(id, w);
                     }
                     new
                 }

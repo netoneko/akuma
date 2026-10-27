@@ -137,6 +137,26 @@ fn fd_events(fd: i32, events: i16) -> i16 {
         crate::OpenFile::Socket(_) => 1,
         crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
         crate::OpenFile::Null | crate::OpenFile::ChildOut(_) => 3,
+        // A pipe end (M3): a read end is POLLIN while data or a finished
+        // writer's EOF stands; a write end is POLLOUT while there is room.
+        // The crate's own predicates — no second opinion, and no poller
+        // registered (nothing on this kernel blocks).
+        crate::OpenFile::Pipe(id, is_write) => {
+            let ready = if *is_write {
+                crate::pipes::writable(*id)
+            } else {
+                crate::pipes::readable(*id)
+            };
+            if ready {
+                if *is_write {
+                    POLLOUT
+                } else {
+                    POLLIN
+                }
+            } else {
+                0
+            }
+        }
         crate::OpenFile::Session => 3, // the session stdio: always ready
         crate::OpenFile::EventFd(slot) => {
             efd_idx = *slot;

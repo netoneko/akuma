@@ -99,6 +99,11 @@ akuma-syscalls-eventfd = { path = "../crates/akuma-syscalls-eventfd" }
 # no-interrupt, no-scheduler target makes of the park/wake hooks.
 akuma-net = { path = "../crates/akuma-net" }
 
+# Stage 8 M3: pipe2(2)'s table — end refcounts, the 64 KiB FIFO, the
+# read/write/EOF rules. Pulled, not written: host-tested, and the amd64
+# kernel consumes the same crate through its fd.rs.
+akuma-pipes = { path = "../crates/akuma-pipes" }
+
 [[bin]]
 name = "taoxichuan"
 path = "src/main.rs"
