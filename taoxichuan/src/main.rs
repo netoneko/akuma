@@ -557,6 +557,20 @@ pub(crate) enum OpenFile {
     /// decisions are not). A dup'd fd carries the same index; the slot
     /// frees when any fd naming it closes.
     EventFd(usize),
+    /// The session's own stdio. Fds 0/1/2 of a spawned task start with NO
+    /// table entry — unbound reads/writes fall through to the session
+    /// fallback (console, or the nested child's pipe). But a redirect must
+    /// be able to SAVE such an fd before closing it (busybox ash:
+    /// `fcntl(1, F_DUPFD, 10)`) and put it back afterwards
+    /// (`dup2(10, 1)`); with no source description the save answered EBADF,
+    /// the redirect's `dup2(file, 1)` bound the file with nothing to
+    /// restore from, and every later write leaked into the file. A dup of
+    /// an unbound stdio fd therefore materializes this entry at its own
+    /// number first: every access through it falls through to the same
+    /// session fallback the unbound number had, so the save/restore dance
+    /// around a redirect lands on a real description. No kernel resource
+    /// sits behind it — displacing or closing it releases nothing.
+    Session,
 }
 
 /// The one task: its root page table, the user ranges a pointer may name, the
@@ -576,9 +590,10 @@ struct Task {
     fd_nonblock: fdtable::FlagSet,
 }
 
-static mut TASKS: [Task; 2] = [Task::new(), Task::new()];
+static mut TASKS: [Task; 3] = [Task::new(), Task::new(), Task::new()];
 /// Which slot `task()` hands out: 0 is the boot's init task (sshd for this
-/// stage's gate), 1 is the child running inside a SPAWN (`child.rs`).
+/// stage's gate), 1 is the child running inside a SPAWN (`child.rs`), and 2
+/// is a fork child running inside that child (child.rs's M2 scaffold).
 static mut TASK_SLOT: usize = 0;
 
 impl Task {
@@ -609,7 +624,7 @@ fn set_task_slot(i: usize) {
 }
 
 /// Both slots, for the spawn path (it snapshots the parent's `root_pa`).
-fn task_slots() -> &'static mut [Task; 2] {
+fn task_slots() -> &'static mut [Task; 3] {
     // SAFETY: as `task`.
     unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
 }
@@ -1214,6 +1229,19 @@ fn clone_desc(d: &OpenFile) -> OpenFile {
         OpenFile::ChildOut(i) => OpenFile::ChildOut(*i),
         OpenFile::EventFd(i) => OpenFile::EventFd(*i),
         OpenFile::Null => OpenFile::Null,
+        OpenFile::Session => OpenFile::Session,
+    }
+}
+
+/// Bind an unbound stdio fd (0/1/2 — the session's console or nested-child
+/// pipe) by materializing an `OpenFile::Session` entry at its own number,
+/// so a dup of it has a description to copy and a redirect's later
+/// `dup2(save, 1)` lands back on a real fd. `alloc_fd_from` inserts at the
+/// number itself when it is free — which it is, or there was nothing to
+/// bind — and clears its flags; the decisions stay in `akuma-fdtable`.
+fn bind_session_fd(fd: u64) {
+    if fd <= 2 && fd_table().with(fd as u32, |_| ()).is_none() {
+        fd_table().alloc_fd_from(fd as u32, OpenFile::Session);
     }
 }
 
@@ -1361,7 +1389,8 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
             // closure's match stays exhaustive so a new kind cannot silently
             // fall through to the file path. Null reads are EOF — the
             // default `Ok(0)` — which is the device's contract.
-            OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::EventFd(_) | OpenFile::Null => {}
+            OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::EventFd(_) | OpenFile::Null
+            | OpenFile::Session => {}
         });
         match (found, res) {
             (true, Err(no)) => return e(no),
@@ -2051,15 +2080,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     if arg >= u64::from(SLOT_CEILING) {
                         return e(ring3::err::EINVAL);
                     }
+                    // The redirect save: an unbound fd 1 has no description
+                    // to copy, so give it one first (see bind_session_fd) —
+                    // without it the save fails, the redirect binds the file
+                    // to fd 1 with nothing to restore from, and every later
+                    // write of the session leaks into the file.
+                    bind_session_fd(fd);
                     let Some(desc) = fd_table().with(fd as u32, clone_desc) else {
-                        // TRACE: the phantom-console case — fd 0/1/2 have no
-                        // table entry on this kernel, so the save fails here.
-                        akuma_primitives::safe_print!(
-                            96,
-                            "  [fc] F_DUPFD {} >= {}: EBADF (unbound src)\n",
-                            fd,
-                            arg
-                        );
+                        // An unbound fd above 2: a genuine EBADF (dup of a
+                        // closed number), no materialization applies.
                         return e(ring3::err::EBADF);
                     };
                     let mut table = fd_table();
@@ -2072,15 +2101,9 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                     u64::from(newfd)
                 }
-                other => {
+                _other => {
                     // Name the gap the way the syscall checklist does: an
                     // fcntl command a guest really needed shows up here.
-                    akuma_primitives::safe_print!(
-                        96,
-                        "  [fc] fcntl cmd={} fd={}: EINVAL\n",
-                        other,
-                        fd
-                    );
                     e(ring3::err::EINVAL)
                 }
             }
@@ -2089,11 +2112,6 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // fds 0/1/2 are the console and hold no kernel reference to
             // release; closing them is the no-op Linux's stdio-close is.
             let fd = fr.arg1();
-            // TRACE (s7d step-1 settle): the redirect's close(1) and the
-            // save-slot cleanup (10).
-            if fd <= 2 || fd == 10 {
-                akuma_primitives::safe_print!(96, "  [c] close {}\n", fd);
-            }
             if fd <= 2 {
                 return 0;
             }
@@ -2201,7 +2219,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                 }
                 OpenFile::File { .. } | OpenFile::Socket(_) | OpenFile::ChildOut(_)
-                | OpenFile::EventFd(_) | OpenFile::Null => {
+                | OpenFile::EventFd(_) | OpenFile::Null | OpenFile::Session => {
                     res = Err(ring3::err::ENOTDIR);
                 }
             });
@@ -2557,9 +2575,13 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         ring3::nr::DUP => {
             let fd = fr.arg1();
-            if fd <= 2 || fd as u32 >= SLOT_CEILING {
+            if fd as u32 >= SLOT_CEILING {
                 return e(ring3::err::EBADF);
             }
+            // dup of a session stdio fd materializes its entry first (the
+            // F_DUPFD save rule); a dup of any other unbound number stays
+            // EBADF.
+            bind_session_fd(fd);
             let desc = fd_table().with(fd as u32, clone_desc);
             let Some(desc) = desc else {
                 return e(ring3::err::EBADF);
@@ -2584,10 +2606,13 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             if old >= u64::from(SLOT_CEILING) || new >= u64::from(SLOT_CEILING) {
                 return e(ring3::err::EBADF);
             }
+            // A dup2 whose SOURCE is an unbound stdio fd materializes its
+            // entry first (the F_DUPFD save rule) — ash's restore
+            // `dup2(10, 1)` needs the save slot, and a future
+            // `dup2(1, 5)` needs a source.
+            bind_session_fd(old);
             match fd_table().dup_to(old as u32, new as u32, is_dup3 && flags & O_CLOEXEC != 0) {
                 Ok(d) => {
-                    // TRACE (s7d step-1 settle): the redirect bind step.
-                    akuma_primitives::safe_print!(96, "  [d] dup {}->{} ok\n", old, new);
                     // Whatever `new` named is displaced: release a displaced
                     // socket's kernel side exactly as close() does.
                     if let Some(OpenFile::Socket(idx)) = d.displaced {
@@ -2607,8 +2632,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                 }
                 Err(fdtable::DupError::BadFd) => {
-                    // TRACE: a failed bind is exactly what an empty redirect is.
-                    akuma_primitives::safe_print!(96, "  [d] dup {}->{} EBADF\n", old, new);
+                    // A failed bind is exactly what an empty redirect is.
                     e(ring3::err::EBADF)
                 }
             }
@@ -2698,6 +2722,11 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             sock::getsockopt_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5())
         }
         ring3::nr::SPAWN => child::spawn_arm(fr),
+        // CLONE/FORK/VFORK + WAIT4 (stage 8, process-model M2): the blocking
+        // fork and the real reap — the arms busybox ash needs to run any
+        // non-final command of a list. child.rs's M2 scaffold.
+        ring3::nr::CLONE | 57 | 58 => child::fork_arm(fr),
+        ring3::nr::WAIT4 => child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
         ring3::nr::WAITPID => child::waitpid_arm(fr.arg1(), fr.arg2()),
         ring3::nr::CLOSE_CHILD_STDIN => child::close_stdin_arm(fr.arg1()),
         ring3::nr::GETTIMEOFDAY => {
@@ -2975,6 +3004,100 @@ fn task_done(code: u64) -> ! {
 /// (`child.rs`) — one loader, one placement story. Runs with the kernel
 /// half live (the physmap does all the copying); the caller chooses the
 /// CR3 moment.
+/// M2 (H3-f): the fork child's address space — an eager, flag-faithful copy
+/// of the caller's whole user half. No CoW on purpose: this kernel has no
+/// page-fault handler (a fault kills the task, the trap arm at the top of
+/// this file), and eager copy is what the ELF loader already does. The root
+/// is built the same way `load_task` builds one (kernel half copied from the
+/// live CR3, user half empty), then the caller's user page tables are cloned
+/// subtree-by-subtree with fresh leaf frames.
+///
+/// Every leaf keeps the parent PTE's own flag bits — RX text must stay RX
+/// (a RW mapping would be NX and the child would fault on its first
+/// instruction), RO data stays RO. Huge (PS) leaves are refused: the loader
+/// maps 4 KiB pages only, and refusing beats silently sharing a 2 MiB page.
+pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
+    let root_page = akuma_pmm::alloc_page_zeroed()?;
+    let root = root_page as u64;
+    let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
+    // SAFETY: both frames are PMM pages inside the physmap; the copy is a
+    // plain RAM write, and the new root is not live until fork's CR3 load.
+    unsafe {
+        let ktbl = phys::phys_ptr::<[u64; 512]>(kroot);
+        let utbl = phys::phys_ptr::<[u64; 512]>(root);
+        for i in 256..512 {
+            (*utbl)[i] = (*ktbl)[i];
+        }
+    }
+    // Clone the USER half only, one PML4 subtree at a time. The kernel half
+    // is shared by the PML4 copy above and must NOT be walked: its physmap
+    // subtree names every physical address the 64 GiB window covers, holes
+    // included, and a leaf copy there would read frames above RAM.
+    // SAFETY: as above; the copies read the parent's (parked) tables and
+    // write the new root's, all through the physmap.
+    unsafe {
+        let src = phys::phys_ptr::<[u64; 512]>(parent_root);
+        let dst = phys::phys_ptr::<[u64; 512]>(root);
+        for i in 0..256 {
+            let entry = (*src)[i];
+            if entry & 1 == 0 {
+                continue;
+            }
+            if entry & 0x080 != 0 {
+                return None; // a 1 GiB leaf: see fork_share_memory's note
+            }
+            let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2)?;
+            (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
+        }
+    }
+    Some(root)
+}
+
+/// One page-table level of [`fork_share_memory`]'s clone: `depth` counts the
+/// levels BELOW this table (2 = a PDPT, 0 = a leaf PT naming 4 KiB frames).
+/// Each present leaf gets a fresh zeroed frame with the parent's bytes and
+/// the parent entry's flag bits; each interior entry gets a cloned subtree;
+/// huge (PS) leaves are refused at any interior level. Single core, `IF`
+/// clear, the forking parent parked — the discipline that owns every other
+/// page-table touch in this kernel.
+///
+/// SAFETY: `table_pa` must be a PMM-resident page-table frame (physmap
+/// reachable) whose table belongs to the USER half of a parked task's root.
+unsafe fn clone_user_tree(table_pa: u64, depth: u32) -> Option<u64> {
+    let out_page = akuma_pmm::alloc_page_zeroed()?;
+    let out = out_page as u64;
+    // SAFETY: contract above; every load/store is inside the physmap.
+    unsafe {
+        let src = phys::phys_ptr::<[u64; 512]>(table_pa);
+        let dst = phys::phys_ptr::<[u64; 512]>(out);
+        for i in 0..512 {
+            let entry = (*src)[i];
+            if entry & 1 == 0 {
+                continue; // not present
+            }
+            if depth == 0 {
+                let old = entry & 0x000f_ffff_ffff_f000;
+                let frame = akuma_pmm::alloc_page_zeroed()? as u64;
+                core::ptr::copy_nonoverlapping(
+                    phys::phys_ptr::<u8>(old),
+                    phys::phys_ptr::<u8>(frame),
+                    4096,
+                );
+                // The flag bits (present/RW/US/accessed/dirty/NX, 0-11 and
+                // 52-63) ride along verbatim; only the frame number is new.
+                (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | frame;
+            } else {
+                if entry & 0x080 != 0 {
+                    return None; // a huge page: see fork_share_memory's note
+                }
+                let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, depth - 1)?;
+                (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
+            }
+        }
+    }
+    Some(out)
+}
+
 fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     let img = ring3::Image::parse(image).ok()?;
     let t = task();

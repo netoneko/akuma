@@ -71,9 +71,12 @@ def main():
     for row in lim["limits"]:
         if row["type"] != "TOKENS_LIMIT":
             continue
-        reset = dt.datetime.fromtimestamp(row["nextResetTime"] / 1000, UTC)
-        span = dt.timedelta(hours=5) if row["unit"] == 3 else dt.timedelta(days=7)
         label = "5h " if row["unit"] == 3 else "week"
+        span = dt.timedelta(hours=5) if row["unit"] == 3 else dt.timedelta(days=7)
+        if "nextResetTime" not in row:  # an idle window carries no reset time
+            out.append(f"{label}: {row['percentage']:3d}%  idle (no reset pending)")
+            continue
+        reset = dt.datetime.fromtimestamp(row["nextResetTime"] / 1000, UTC)
         tok, calls, per = window_tokens(reset - span, now)
         split = "  [" + ", ".join(f"{k} {v/1e6:.1f}M" for k, v in per.items() if v) + "]"
         out.append(f"{label}: {row['percentage']:3d}%  used {tok/1e6:6.1f}M tokens ({calls:.0f} calls)  resets {reset:%m-%d %H:%M}Z{split}")
