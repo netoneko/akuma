@@ -101,6 +101,15 @@ use akuma_trap_amd64::{InterruptStackFrame, Kind, Trap};
 use akuma_vfs::Filesystem;
 use akuma_boot_amd64::paging::{MemAttr, PteProt};
 use akuma_ring3_amd64 as ring3;
+
+// PB1 linkage proof (session pb): the two M4 crates must be *referenced*, or
+// the linker drops them and the size delta means nothing. `#[used]` makes the
+// fn pointers GC roots; no runtime call, no behaviour change.
+#[used]
+static _PB1_THREADING_REGISTER: fn(akuma_threading::ThreadRuntime, akuma_threading::ThreadConfig) =
+    akuma_threading::register;
+#[used]
+static _PB1_EXEC_INIT: fn(akuma_exec::ExecRuntime, akuma_exec::ExecConfig) = akuma_exec::init;
 use akuma_fdtable as fdtable;
 use alloc::vec::Vec;
 /// The heap. `#[global_allocator]` is a binary-level declaration; the crate
@@ -312,6 +321,62 @@ plain_stubs_code! {
     vec_sx  = 30;
 }
 
+/// The LAPIC timer's IDT body (session pb). One implementation, two consumers:
+/// the extracted crate counts the tick and acknowledges it; this kernel adds
+/// nothing yet. **No task switch**: a tick that fires while ring 3 runs (the
+/// only place IF is set — every kernel path runs with interrupts masked)
+/// returns to the same instruction. The switch lands with `fork_process`.
+fn timer_trap(_t: &mut Trap<'_>) {
+    akuma_lapic_amd64::on_tick();
+}
+
+/// The tick source (session pb): the extracted crate's timer face over the
+/// guest's xAPIC page. Mirrors amd64's `lapic::init` ordering — mask the
+/// legacy PICs, set `IA32_APIC_BASE.APIC_GLOBAL_ENABLE`, map the page
+/// device-uncached, then hand the (already-enabled) MSR value and the window
+/// to the crate, which software-enables the LAPIC, calibrates against the
+/// 8254 PIT and arms the periodic timer at `TIMER_VECTOR`.
+fn lapic_init() -> bool {
+    use akuma_cpu::msr::{self, Msr};
+    akuma_port::PIC.mask_all();
+    let base_msr = msr::read(Msr::ApicBase);
+    let base = base_msr & akuma_lapic_amd64::APIC_BASE_MASK;
+    if base == 0 {
+        akuma_primitives::safe_print!(96, "  [lapic] IA32_APIC_BASE reports no LAPIC\n");
+        return false;
+    }
+    // SAFETY: sets exactly one bit in an architectural MSR, leaving the
+    // address field as found — the same write amd64's `lapic::init` makes.
+    unsafe { msr::write(Msr::ApicBase, base_msr | akuma_lapic_amd64::APIC_GLOBAL_ENABLE) };
+    if !map_device(base, 4096) {
+        akuma_primitives::safe_print!(96, "  [lapic] could not map the LAPIC page\n");
+        return false;
+    }
+    // SAFETY: the page at DEVMAP_BASE+base is the LAPIC register file, mapped
+    // device-uncached just above for the kernel's lifetime, page-aligned.
+    let win = unsafe {
+        akuma_primitives::mmio::MmioWindow::new((akuma_boot_amd64::phys::DEVMAP_BASE + base) as usize, 4096)
+    };
+    match akuma_lapic_amd64::init(base_msr | akuma_lapic_amd64::APIC_GLOBAL_ENABLE, win) {
+        Ok(info) => {
+            akuma_primitives::safe_print!(
+                160,
+                "  lapic: id={} timer vector={} periodic; calibrated={} counts/tick={} tsc={} Hz\n",
+                info.id,
+                akuma_lapic_amd64::TIMER_VECTOR,
+                info.calibrated as u8,
+                info.timer_count,
+                info.tsc_hz
+            );
+            true
+        }
+        Err(()) => {
+            akuma_primitives::safe_print!(96, "  [lapic] init failed\n");
+            false
+        }
+    }
+}
+
 /// Fill and load the IDT: a reporter for every vector, the trap crate's stubs
 /// for every `Kind` (whose handlers are registered first — `Registered`
 /// panics naming itself if a stub fires with none, a boot-order bug rather
@@ -345,6 +410,12 @@ fn idt_init() {
             IDT.set(vector, entry);
         }
     }
+    // The LAPIC timer (session pb): `Kind::Timer`'s vector is a software
+    // choice; the extracted crate fixes it at TIMER_VECTOR (32) and
+    // `start_timer` programs the LVT with the same constant. Never a hand-set
+    // stub pointer: the trap crate's own entry, placed by `IDT.set`.
+    trap::register(Kind::Timer, timer_trap);
+    IDT.set(akuma_lapic_amd64::TIMER_VECTOR, trap::entry(Kind::Timer));
     IDT.load();
 }
 
@@ -3478,6 +3549,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // steps this kernel has no caller for (per-CPU block, scheduler).
     gdt_init();
     idt_init();
+    lapic_init();
     // `CR0.WP`: a kernel *write* to a read-only page honours the page tables.
     // Without it, `.rodata` protection is a fiction and copy-on-write later
     // becomes impossible to reason about. The only CR0 bit this kernel sets.

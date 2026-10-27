@@ -114,6 +114,7 @@ dependencies = [
  "akuma-isolation",
  "akuma-kacho",
  "akuma-kvm-abi",
+ "akuma-lapic-amd64",
  "akuma-locks-rw",
  "akuma-mmap",
  "akuma-mmu",
@@ -490,6 +491,15 @@ dependencies = [
 [[package]]
 name = "akuma-kvm-abi"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-lapic-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-port",
+ "akuma-primitives",
+]
 
 [[package]]
 name = "akuma-locks-rw"
@@ -1262,13 +1272,16 @@ dependencies = [
  "akuma-comconsole",
  "akuma-cpu",
  "akuma-elf-exec",
+ "akuma-exec",
  "akuma-ext2",
  "akuma-fdtable",
  "akuma-gdt",
  "akuma-idt-amd64",
+ "akuma-lapic-amd64",
  "akuma-net",
  "akuma-pipes",
  "akuma-pmm",
+ "akuma-port",
  "akuma-primitives",
  "akuma-ring3-amd64",
  "akuma-ryzen-amd64",
@@ -1276,6 +1289,7 @@ dependencies = [
  "akuma-syscalls-eventfd",
  "akuma-syscalls-linux",
  "akuma-syscalls-poll",
+ "akuma-threading",
  "akuma-trap-amd64",
  "akuma-vfs",
  "akuma-virtio",

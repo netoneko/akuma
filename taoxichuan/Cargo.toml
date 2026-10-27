@@ -103,6 +103,15 @@ akuma-net = { path = "../crates/akuma-net" }
 # read/write/EOF rules. Pulled, not written: host-tested, and the amd64
 # kernel consumes the same crate through its fd.rs.
 akuma-pipes = { path = "../crates/akuma-pipes" }
+# Stage 8 M4 session pb: the exec/threading ladder pulled for the preemption
+# foundation (linkage proved; the exec_runtime twin lands next session), and
+# the LAPIC timer face extracted from amd64/src/lapic.rs so both kernels share
+# one implementation. akuma-port rides along: this kernel now masks the legacy
+# PICs before arming the timer, exactly as amd64's lapic::init does.
+akuma-exec = { path = "../crates/akuma-exec" }
+akuma-threading = { path = "../crates/akuma-threading" }
+akuma-lapic-amd64 = { path = "../crates/akuma-lapic-amd64" }
+akuma-port = { path = "../crates/akuma-port" }
 
 [[bin]]
 name = "taoxichuan"
