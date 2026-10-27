@@ -123,13 +123,26 @@ gate() {
   /bin/ssh -p "$SSHPORT" root@localhost "$cmd" >"$OUT/$name.client" 2>&1 </dev/null &
   spid=$!
   n=0
+  saw_line=""
   while kill -0 "$spid" 2>/dev/null && [ "$n" -lt "$CAP" ]; do
-    conslice 2>/dev/null | grep -q 'Exit status:' && break
+    if conslice 2>/dev/null | grep -q 'Exit status:'; then saw_line=1; break; fi
     sleep 1; n=$((n+1))
   done
+  # The console line is the verdict, but the client still has to DRAIN the
+  # stdout the guest queued before it (the example.com page travels behind
+  # its own exit-status line): give the client a grace window to exit on its
+  # own - Q11's control got the page because its client died naturally.
+  if [ -n "$saw_line" ]; then
+    g=0
+    while kill -0 "$spid" 2>/dev/null && [ "$g" -lt 30 ]; do sleep 1; g=$((g+1)); done
+  fi
   if kill -0 "$spid" 2>/dev/null; then
     kill "$spid" 2>/dev/null
-    emit "NOTE $name: ssh client hit the ${CAP} s cap (killed by pid)"
+    if [ -n "$saw_line" ]; then
+      emit "NOTE $name: console exit line seen; client still up after 30 s grace (killed by pid)"
+    else
+      emit "NOTE $name: ssh client hit the ${CAP} s cap with NO console exit line (killed by pid)"
+    fi
   fi
   wait "$spid" 2>/dev/null
   sleep "$PACE"   # console drain + connection pacing in one
