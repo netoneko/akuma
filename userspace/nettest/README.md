@@ -105,6 +105,29 @@ probe's dependency line is copied verbatim from nca's
 The curl probe below has the opposite requirement (match apk/nightly cargo's
 libcurl), which is why it keeps its own container build.
 
+### Building for the Taoxichuan (x86_64) guest — no Docker (2026-10-27)
+
+The four host-cross probes (`connect`, `stdlib`, `reqwest`, `unixsock`) are plain
+cargo crates and build for the amd64 guest with the x86_64 musl target:
+
+```bash
+cd userspace/nettest/rust/connect          # or stdlib / reqwest / unixsock
+cargo build --release --target x86_64-unknown-linux-musl
+# -> target/x86_64-unknown-linux-musl/release/nettest-connect  (3.2 s, verified for `connect`)
+```
+
+`build-musl.sh` itself is aarch64-only; the x86_64 build does not need it. **The
+libcurl `nettest` (`rust/build.sh`) is the exception: it still runs an Alpine arm64
+container, and a native x86_64 build of it is untested.** For a *curl* symptom in
+the guest the better probe is the real `curl` that `apk add curl` installs: it is the
+exact binary under test. Pick the probe by the syscall sequence it exercises:
+
+| symptom | probe | exercises |
+|---|---|---|
+| non-blocking `connect`, `poll`/`select`/`epoll` readiness, `getsockopt(SO_ERROR)` | `nettest-connect` | raw `socket`/`connect`/`poll` — no library |
+| HTTPS with `std::net` and a pure-Rust TLS stack | `nettest-std` | `std::net` + `poll(2)` + rustls (musl's resolver: unconnected UDP) |
+| c-ares DNS (`connect` a UDP socket, then `send`; `getsockname`/`getpeername`) | the guest's own `curl`, or the replay probe in `docs/archive/AKUMA_AMD64_DNS_CONNECTED_UDP.md` | nothing else shares that sequence |
+
 ---
 
 # Part 2 — `nettest`: the cargo-vs-curl HTTPS divergence probe
