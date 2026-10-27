@@ -455,7 +455,16 @@ pub fn canary_byte(i: u64) -> u8 {
 /// (formatter pointer read from the clobbered neighborhood), then the
 /// session-teardown poisoning. At 32 KiB the same chain bottoms out at
 /// T-0x4400 of T-0x8000 — inside, with ~0x3C00 of room under the band.
-pub const SYSCALL_STACK_SIZE: usize = 32 * 1024;
+/// deeper still. At 64 KiB the whole M2 depth-2 exec chain (E1 exec at
+/// T-0x4600, E2 exec inside the fork child at T-0x7A00, the exec'd image's
+/// syscall band dispatched at its lowered top) bottoms ~0x2C00 above the
+/// floor: `spawn_arm` hands the child bands a top HALF the array down and
+/// `fork_arm` a further QUARTER down, so the fixed ~0x5400 of exec/fork
+/// lowering and frames must fit in SIZE/2 — at 32 KiB it did not (the E2
+/// band dispatched ~0xA00 BELOW the floor, pushing zeroed user registers
+/// into the read-only data under the array: a later indirect jump through
+/// the clobbered jump tables fetched rip=0).
+pub const SYSCALL_STACK_SIZE: usize = 64 * 1024;
 
 #[repr(align(16))]
 #[cfg(target_arch = "x86_64")]
