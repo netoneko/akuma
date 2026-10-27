@@ -2134,6 +2134,8 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::PIPE2 => pipes::pipe2_arm(fr.arg1(), fr.arg2()),
+        // 22 = pipe(2), musl's raw SYS_pipe (no flags argument to validate).
+        22 => pipes::pipe_arm(fr.arg1()),
         ring3::nr::CLOSE => {
             // fds 0/1/2 are the console and hold no kernel reference to
             // release; closing them is the no-op Linux's stdio-close is.

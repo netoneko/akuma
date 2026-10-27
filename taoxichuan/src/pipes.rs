@@ -38,6 +38,14 @@ fn table() -> &'static mut PipeTable<()> {
     unsafe { &mut *core::ptr::addr_of_mut!(PIPES) }
 }
 
+/// `pipe(fds)` — x86_64 22: musl's `pipe()` is the raw `SYS_pipe`, one
+/// argument, no flags word (boot 1: `[sc] unhandled ? (22)` then ash's
+/// `can't create pipe: Bad file descriptor`). The ring3 table has no name
+/// for the number; the dispatcher keys the arm on the literal.
+pub fn pipe_arm(fds_va: u64) -> u64 {
+    pipe2_arm(fds_va, 0)
+}
+
 /// `pipe2(fds, flags)` — x86_64 293. Read end at `fds[0]`, write end at
 /// `fds[1]`. amd64's `fd::sys_pipe2` is the shape this copies (its MAX_PIPES
 /// preamble is that kernel's policy; this kernel serves one shell per boot).
