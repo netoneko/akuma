@@ -1622,21 +1622,6 @@ pub(crate) fn eventfd_can_read(idx: usize) -> bool {
     eventfds()[idx].as_ref().is_some_and(|ef| ef.can_read())
 }
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
-    // [tmp] trace (remove before final): every syscall from the first spawn
-    // on, with the spawn-ring slot and the interrupted user rip. The boot
-    // task (NO_SLOT) stays silent so the boot console stays readable.
-    {
-        let cs = crate::exec_twin::current_slot();
-        if cs != crate::exec_twin::NO_SLOT {
-            akuma_primitives::safe_print!(
-                96,
-                "[tmp] sc slot={} nr={} rip={:#x}\n",
-                cs,
-                fr.rax,
-                fr.user_rip
-            );
-        }
-    }
     // M4 slice 3: the per-syscall capture `fork_process` step 6 consumes
     // (`get_saved_user_context` → the twin's `read_user_context`). The boot
     // task has no slot and skips; a slotted task pays one struct copy.
