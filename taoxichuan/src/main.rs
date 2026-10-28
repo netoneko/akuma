@@ -327,7 +327,10 @@ plain_stubs_code! {
 /// only place IF is set — every kernel path runs with interrupts masked)
 /// returns to the same instruction. The switch lands with `fork_process`.
 fn timer_trap(_t: &mut Trap<'_>) {
-    akuma_lapic_amd64::on_tick();
+    // The count is the twin's uptime clock (exec_twin::uptime_us); the trap
+    // itself needs nothing back — a tick returns to the same instruction. The
+    // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
+    let _ = akuma_lapic_amd64::on_tick();
 }
 
 /// The tick source (session pb): the extracted crate's timer face over the
@@ -370,7 +373,7 @@ fn lapic_init() -> bool {
             );
             true
         }
-        Err(()) => {
+        Err(akuma_lapic_amd64::NoApicBase) => {
             akuma_primitives::safe_print!(96, "  [lapic] init failed\n");
             false
         }
