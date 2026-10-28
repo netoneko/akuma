@@ -79,6 +79,20 @@ fn main() {
         println!("devroot-ensure: baked /bin/sshd = {} bytes from {src} (read back OK)", got);
     }
 
+    // M4 slice 3 (session pf): opt-in bake of the grandfork probe as
+    // /bin/grandfork, so PK2 runs from boot one. Same bake-don't-swap
+    // pattern as the sshd opt-in above. A NEW file gets DEFAULT_FILE_PERMS
+    // (0644, akuma-ext2/src/ext2.rs:752) — the guest kernel execs any
+    // readable ELF (load_task never checks the x bit), so 0644 is fine.
+    // Remove with the [tmp] set when slice 4 ships probes in the image.
+    if let Ok(src) = std::env::var("AKUMA_DEVROOT_BAKE_FORKPROBE") {
+        let gf = std::fs::read(&src).unwrap_or_else(|e| panic!("read {src}: {e}"));
+        ops.create_write("/bin/grandfork", &gf);
+        let got = ops.read_all("/bin/grandfork");
+        assert_eq!(got, gf.len(), "/bin/grandfork read-back size");
+        println!("devroot-ensure: baked /bin/grandfork = {} bytes from {src} (read back OK)", got);
+    }
+
     ops.sync();
     let image = ops.image_bytes();
     let tmp = format!("{path}.tmp");
