@@ -341,7 +341,25 @@ fn timer_trap(_t: &mut Trap<'_>) {
     // The count is the twin's uptime clock (exec_twin::uptime_us); the trap
     // itself needs nothing back — a tick returns to the same instruction. The
     // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
-    let _ = akuma_lapic_amd64::on_tick();
+    let n = akuma_lapic_amd64::on_tick();
+    // [tmp] trace (remove before final, session pf): every 256th tick (~2.6 s)
+    // name the machine's scheduling state. Boot pf-1 wedged at 100% vCPU with
+    // tick-only exits and no further guest syscalls after a wait4 WNOHANG
+    // return-0, and nothing in the console names who holds the core: this line
+    // does (current task slot + threading tid + crate thread stats).
+    if n % 256 == 0 {
+        let s = akuma_threading::thread_stats_full();
+        akuma_primitives::safe_print!(
+            96,
+            "[tmp] wd n={} slot={} tid={} rdy={} run={} wt={}\n",
+            n,
+            crate::exec_twin::current_slot() as u64,
+            akuma_threading::current_thread_id() as u64,
+            s.ready as u64,
+            s.running as u64,
+            s.waiting as u64
+        );
+    }
 }
 
 /// The tick source (session pb): the extracted crate's timer face over the
@@ -2917,18 +2935,16 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // to ring 3, so a stomp during the park shows up here as zeroed
             // slots before the sysret fires.
             let r = child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
+            // [tmp] pf-1 follow-up: opt= (arg4 — WNOHANG is bit 0) and the
+            // caller's slot, so the WNOHANG-0 return boot pf-1 died after is
+            // attributable (which task polled, with which flags).
             akuma_primitives::safe_print!(
                 96,
-                "[tmp] w4ret rip={:#x} fl={:#x} rax={:#x} rbx={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}\n",
-                fr.user_rip,
-                fr.user_rflags,
-                r,
-                fr.rbx,
-                fr.rbp,
-                fr.r12,
-                fr.r13,
-                fr.r14,
-                fr.r15
+                "[tmp] w4ret opt={:#x} slot={} rax={:#x} rip={:#x}\n",
+                fr.arg4(),
+                crate::exec_twin::current_slot() as u64,
+                r as u64,
+                fr.user_rip
             );
             r
         }

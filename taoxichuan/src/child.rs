@@ -782,7 +782,12 @@ fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
     // syscall stub stashed it (`user_rsp_stash`) and step 6's captured
     // context carries it into the child's UserContext.
     match akuma_exec::process::fork_process(child_pid, 0) {
-        Ok(pid) => u64::from(pid),
+        Ok(pid) => {
+            // [tmp] trace (remove before final, session pf): boot pf-1's wedge
+            // left "did wc's fork even happen?" open — name every real fork.
+            akuma_primitives::safe_print!(96, "[tmp] fork child pid={}\n", u64::from(pid));
+            u64::from(pid)
+        }
         // The refusal line is the evidence this slice hunts for; name the
         // message verbatim (the same discipline as spawn's read-failed
         // print).
