@@ -152,14 +152,11 @@ pub fn advance_tick() -> u64 {
     TICKS.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-/// `init` was handed an `IA32_APIC_BASE` value with no base address in it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NoApicBase;
-
 /// The minimal timer-vector body: count one tick and acknowledge it.
 ///
-/// Whatever else a tick does — reschedule requests, watchdog pets, one-shot credits —
-/// belongs to the consumer's wrapper, which is why this returns the new count.
+/// Whatever else a tick does — reschedule requests, watchdog pets, one-shot
+/// credits — belongs to the consumer's wrapper, which is why this returns the
+/// new count.
 #[must_use]
 pub fn on_tick() -> u64 {
     let t = advance_tick();
@@ -317,8 +314,10 @@ pub fn calibrate() -> bool {
 
 /// Run PIT channel 0 for `us` microseconds and spin until it expires.
 ///
-/// The measurement primitive the amd64 kernel's `clock_rate_check` self-test uses.
-/// `us` must be at most ~54.9 ms (the 16-bit channel's longest interval).
+/// The measurement primitive the amd64 kernel's `clock_rate_check` self-test
+/// uses. `us` must be at most ~54.9 ms (the 16-bit channel's longest
+/// interval). `false` means the arguments were out of range or the spin gave
+/// up — a caller that ignores that got no wait at all.
 #[must_use]
 pub fn pit_wait_us(us: u32) -> bool {
     const SPIN_LIMIT: u32 = 500_000_000;
@@ -382,6 +381,13 @@ pub fn tsc_uptime_us() -> Option<u64> {
 
 // ── init ────────────────────────────────────────────────────────────────────
 
+/// [`init`]'s one failure mode: the MSR value carries no LAPIC base.
+///
+/// Either the register reads 0 or only flags are set; a machine with no LAPIC
+/// has no tick and therefore no timer face, and `Err` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoApicBase;
+
 /// What [`init`] set up, for the caller's console line.
 #[derive(Clone, Copy)]
 pub struct TimerInfo {
@@ -425,4 +431,96 @@ pub fn init(base_msr_enabled: u64, win: MmioWindow) -> Result<TimerInfo, NoApicB
         timer_count: TIMER_COUNT.load(Ordering::Relaxed),
         tsc_hz: tsc_hz(),
     })
+}
+
+// ── host tests (pure parts only) ────────────────────────────────────────────
+//
+// Everything here is arithmetic over constants — the register map, the
+// `IA32_APIC_BASE` masking and the `NoApicBase` failure predicate. Nothing
+// touches [`MmioWindow`] (the mapped page) or the PIT: those need the guest,
+// and the guest gates are the boots this crate's consumers run.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // The crate is `#![no_std]`; the test harness links std anyway, and the
+    // `NoApicBase` debug-format test below names it explicitly.
+    extern crate std;
+
+    /// The xAPIC register map (Intel SDM Vol. 3 §10.4.4, dword offsets into
+    /// the 4 KiB page). A wrong offset here reads the wrong register on real
+    /// hardware, so the map itself is pinned.
+    #[test]
+    fn register_offsets_match_the_xapic_map() {
+        assert_eq!(REG_ID, 0x020);
+        assert_eq!(REG_EOI, 0x0B0);
+        assert_eq!(REG_SVR, 0x0F0);
+        assert_eq!(REG_LVT_TIMER, 0x320);
+        assert_eq!(REG_TIMER_INIT, 0x380);
+        assert_eq!(REG_TIMER_CUR, 0x390);
+        assert_eq!(REG_TIMER_DIV, 0x3E0);
+    }
+
+    /// The LVT timer layout: bit 17 periodic, bit 16 mask; the divider
+    /// encoding for divide-by-16 is `0b0011` (SDM §10.5.4).
+    #[test]
+    fn lvt_and_divide_bits() {
+        assert_eq!(LVT_TIMER_PERIODIC, 1 << 17);
+        assert_eq!(LVT_MASKED, 1 << 16);
+        assert_eq!(TIMER_DIV_16, 0b0011);
+    }
+
+    /// Vectors and the tick target: the tick is vector 32 (what taoxichuan's
+    /// IDT entry and amd64's agree on), the spurious vector is 0xFF with the
+    /// enable bit set beside it, and a tick is 10 ms.
+    #[test]
+    fn vectors_and_tick_target() {
+        assert_eq!(TIMER_VECTOR, 32);
+        assert_eq!(SPURIOUS_VECTOR, 0xFF);
+        assert_eq!(US_PER_TICK_TARGET, 10_000);
+    }
+
+    /// `APIC_BASE_MASK` keeps only the page's physical base: the global-enable
+    /// bit (11), the BSP flag (8) and the low 12 reserved flags must all fall
+    /// to the masking `init` does.
+    #[test]
+    fn apic_base_mask_keeps_only_the_base() {
+        let msr = 0xfee0_0000u64 | APIC_GLOBAL_ENABLE | (1 << 8) | 0b1111;
+        assert_eq!(msr & APIC_BASE_MASK, 0xfee0_0000);
+        // All-ones input masks to the mask itself: no upper reserved bits leak.
+        assert_eq!(u64::MAX & APIC_BASE_MASK, APIC_BASE_MASK);
+        assert_eq!(APIC_BASE_MASK, 0x000f_ffff_ffff_f000);
+    }
+
+    /// `init`'s failure predicate: a zero base — no LAPIC, or flags only — is
+    /// [`NoApicBase`], the single error the crate can produce. The happy path
+    /// needs a mapped page and is the guest's to prove.
+    #[test]
+    fn no_apic_base_is_the_zero_base_predicate() {
+        assert_eq!(0u64 & APIC_BASE_MASK, 0); // what init() tests
+        assert_eq!(APIC_GLOBAL_ENABLE & APIC_BASE_MASK, 0); // flags alone fail
+        let err = NoApicBase;
+        // Copy/eq derive: the caller can match and compare it.
+        assert_eq!(err, err);
+        assert_eq!(std::format!("{err:?}"), "NoApicBase");
+    }
+
+    /// The tick counter is pure arithmetic and safe on the host: advancing
+    /// counts and returns the new count. (`on_tick` is `advance_tick` + `eoi`,
+    /// and the `eoi` half needs the mapped LAPIC page — guest-only — which is
+    /// why its `#[must_use]` count has no host test.)
+    #[test]
+    fn tick_counter_counts() {
+        let a = super::advance_tick();
+        let b = super::advance_tick();
+        assert_eq!(b, a + 1);
+    }
+
+    /// `pit_wait_us`'s argument gate is pure: 0 and over-range refuse without
+    /// touching hardware. (A real wait needs the PIT — guest-only.)
+    #[test]
+    fn pit_wait_us_refuses_bad_ranges() {
+        assert!(!pit_wait_us(0));
+        assert!(!pit_wait_us(PIT_MAX_US + 1));
+    }
 }

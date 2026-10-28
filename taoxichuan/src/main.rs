@@ -88,6 +88,7 @@
 extern crate alloc;
 
 mod child;
+mod exec_twin;
 mod net;
 mod pipes;
 mod sock;
@@ -327,7 +328,10 @@ plain_stubs_code! {
 /// only place IF is set — every kernel path runs with interrupts masked)
 /// returns to the same instruction. The switch lands with `fork_process`.
 fn timer_trap(_t: &mut Trap<'_>) {
-    akuma_lapic_amd64::on_tick();
+    // The count is the twin's uptime clock (exec_twin::uptime_us); the trap
+    // itself needs nothing back — a tick returns to the same instruction. The
+    // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
+    let _ = akuma_lapic_amd64::on_tick();
 }
 
 /// The tick source (session pb): the extracted crate's timer face over the
@@ -370,7 +374,7 @@ fn lapic_init() -> bool {
             );
             true
         }
-        Err(_) => {
+        Err(akuma_lapic_amd64::NoApicBase) => {
             akuma_primitives::safe_print!(96, "  [lapic] init failed\n");
             false
         }
@@ -3598,6 +3602,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // The root disk, and the ext2 root on it.
     // session pb: after PMM/heap are up - map_device allocates page-table frames
     lapic_init();
+    // Session pc, slice 1: the exec/threading runtime twin. Registered here,
+    // not earlier: the LAPIC tick must exist before it can be anyone's clock
+    // (exec_twin's uptime_us is ticks × 10 ms), and PMM/heap must be up
+    // before the first allocation behind registration. Nothing shared runs
+    // before the first spawn, so this is also "before any syscall can reach
+    // the tables" (amd64's ordering rule).
+    exec_twin::init();
     if !blk_init(&machine.virtio) {
         console::puts("  [FATAL] no virtio block device -- the pinned root (ext2 on virtio-blk) cannot mount\n");
         halt();

@@ -58,7 +58,7 @@ impl SpawnSlot {
     }
 }
 
-const NSLOTS: usize = 4;
+pub const NSLOTS: usize = 4;
 /// Stdout ceiling per child: after this, writes are dropped (the paws
 /// fallback truncates at 1 MiB too). The gate's output is two orders below.
 const OUT_CAP: usize = 1024 * 1024;
@@ -71,27 +71,136 @@ static mut SLOTS: [SpawnSlot; NSLOTS] = [
 ];
 static mut NEXT_SLOT: usize = 0;
 static mut NEXT_PID: u32 = 2; // 1 is sshd (the boot's init task)
-static mut NESTED_SLOT: usize = 0;
-static mut NESTED_DEPTH: u32 = 0;
 
-/// The slot whose `out` buffer carries the session's stdout: set by
-/// `spawn_arm`, never by the fork arm. A fork child (`cat` inside `sh -c`)
-/// inherits the SHELL's unbound fd 1, so its writes must land in the buffer
-/// sshd drains — its own slot would hold bytes nobody ever reads.
-static mut SPAWN_OUT_SLOT: usize = 0;
+/// The parent-phase registers one crossing saves: what `child_enter`'s naked
+/// prologue stores and its exit-side consumers restore. `repr(C)` with the
+/// `ret_rsp` first — the asm addresses the record by offset, exactly the
+/// layout `exec_return`'s restore already walked (0x00 rsp, 0x08 rbx, 0x10
+/// rbp, 0x18 r12 … 0x30 r15).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CrossSave {
+    pub ret_rsp: u64,
+    pub rbx: u64,
+    pub rbp: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+}
 
-/// -- saved parent state for the nested run (written by [`spawn_run`], read
-/// -- by the exit arm's asm tail). Single core, `IF` off: no other writer.
-static mut PARENT_ROOT: u64 = 0;
-static mut PARENT_STACK_TOP: u64 = 0;
-static mut PARENT_STASH: u64 = 0;
-static mut RET_RSP: u64 = 0;
-static mut SAVE_RBX: u64 = 0;
-static mut SAVE_RBP: u64 = 0;
-static mut SAVE_R12: u64 = 0;
-static mut SAVE_R13: u64 = 0;
-static mut SAVE_R14: u64 = 0;
-static mut SAVE_R15: u64 = 0;
+impl CrossSave {
+    const fn new() -> Self {
+        Self { ret_rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0 }
+    }
+}
+
+/// One slot's kernel+trap stacks (the twin's `prepare_task_slot` answer,
+/// amd64's `Stacks` discipline): leaked once on first use, reused on every
+/// recycle — a slot given a fresh pair per spawn would turn the slot ring
+/// into a memory leak. Dormant until `fork_process` (slice 3) points a
+/// crossing at them; nothing indexes them today.
+struct SlotStacks {
+    kernel: &'static mut [u64],
+    trap: &'static mut [u64],
+}
+
+/// The per-slot machine state (slice 2): everything the crossing statics
+/// `NESTED_SLOT`/`NESTED_DEPTH`/`SPAWN_OUT_SLOT`/`PARENT_*`/`RET_RSP`/`SAVE_*`
+/// held, indexed by spawn-ring slot and read **through
+/// `exec_twin::current_slot()`** while a child runs. The plan's shape (§ 3):
+/// the moment two tasks can block, "the one task in the kernel" identity
+/// breaks, so the crossing state cannot live in shared statics — and the
+/// owner's rule is no new `static` "current task" anywhere: "who am I" is
+/// `current_slot()`, whose one-core stub is the sanctioned static.
+///
+/// Written only on the syscall path (single core, `IF` clear) or by
+/// `child_enter`'s asm prologue into `save`; read the same ways.
+struct SlotCross {
+    /// The parent's saved registers — `child_enter`'s asm writes here (the
+    /// record's address rides the crossing in `%rdx`).
+    save: CrossSave,
+    /// The parent's CR3 root, loaded by the exit tail (`child_exit`).
+    parent_root: u64,
+    /// The parent's syscall-stack top, restored by the resuming arm
+    /// (`spawn_arm` / `fork_arm` tails).
+    parent_stack_top: u64,
+    /// The parent's parked user RSP stash, likewise.
+    parent_stash: u64,
+    /// The crossing depth this slot's occupant runs at: 1 = spawned child,
+    /// 2 = its fork child. Was the shared `NESTED_DEPTH`; per-slot it is
+    /// inherited (+1) at the fork crossing.
+    depth: u32,
+    /// The `TASKS` slot the child runs in (1 = spawned, 2 = fork child):
+    /// which record `exit` lands in. Was implicit in the old depth read.
+    task_slot: usize,
+    /// The `TASKS` slot of whoever the crossing returns to (0 = sshd, 1 =
+    /// the shell): `child_exit`'s `set_task_slot`. Was `depth - 1`.
+    parent_task_slot: usize,
+    /// The spawn-ring slot that becomes current again on exit
+    /// (`exec_twin::NO_SLOT` for sshd): `child_exit`'s
+    /// `set_current_slot`. Was the `NESTED_SLOT` save/restore dance.
+    parent_slot: usize,
+    /// The slot whose `out` buffer carries this child's fd 1. Set to the
+    /// slot itself by `spawn_arm`; a fork child inherits its parent's — a
+    /// fork child's writes must land in the buffer sshd drains, never in its
+    /// own slot (boot-3 lesson, gate P3).
+    out_slot: usize,
+    /// This slot's stacks, once `prepare_task_slot` made them.
+    stacks: Option<SlotStacks>,
+    /// The ring-3 register capture the `write/read_user_context` hooks serve
+    /// — `None` until a capture is written, cleared on recycle.
+    uctx: Option<akuma_exec::process::UserContext>,
+    /// The stack tops `prepare_task_slot` answered with.
+    kstack_top: u64,
+    trap_stack_top: u64,
+}
+
+impl SlotCross {
+    const fn new() -> Self {
+        Self {
+            save: CrossSave::new(),
+            parent_root: 0,
+            parent_stack_top: 0,
+            parent_stash: 0,
+            depth: 0,
+            task_slot: 0,
+            parent_task_slot: 0,
+            parent_slot: crate::exec_twin::NO_SLOT,
+            out_slot: 0,
+            stacks: None,
+            uctx: None,
+            kstack_top: 0,
+            trap_stack_top: 0,
+        }
+    }
+}
+
+/// The per-slot table itself. SAFETY: single core, `IF` clear (syscall path
+/// or boot) — the discipline that owns every static in this module; the
+/// table is indexed by `exec_twin::current_slot()` while a child runs and by
+/// the resuming arm's own `slot_idx` after the crossing returns.
+static mut SLOT_STATE: [SlotCross; NSLOTS] =
+    [SlotCross::new(), SlotCross::new(), SlotCross::new(), SlotCross::new()];
+
+/// The crossing record of `slot`, for the syscall-path writers.
+///
+/// SAFETY: as `slots`.
+unsafe fn cross_mut(slot: usize) -> &'static mut SlotCross {
+    unsafe {
+        let st = &mut *core::ptr::addr_of_mut!(SLOT_STATE);
+        &mut st[slot]
+    }
+}
+
+/// `child_enter`'s asm destination for `slot` — a raw pointer, because the
+/// naked prologue takes it in `%rdx` and Rust must not see a reference to
+/// memory the asm writes behind its back.
+///
+/// SAFETY: as `slots`.
+unsafe fn save_ptr(slot: usize) -> *mut CrossSave {
+    unsafe { core::ptr::addr_of_mut!((*core::ptr::addr_of_mut!(SLOT_STATE))[slot].save) }
+}
 
 /// SAFETY: single core, `IF` clear (syscall path or boot) — the discipline
 /// that owns every static in this module.
@@ -102,23 +211,46 @@ fn slots() -> &'static mut [SpawnSlot; NSLOTS] {
 /// Is a nested child running right now? The `exit_group` arm's fork in the
 /// dispatcher.
 pub fn nested_active() -> bool {
-    // SAFETY: as `slots`.
-    unsafe { core::ptr::read_volatile(&raw const NESTED_DEPTH) > 0 }
+    crate::exec_twin::current_slot() != crate::exec_twin::NO_SLOT
 }
 
 /// The pid the current task should report (`getpid`): 1 for the boot task,
 /// the spawn slot's pid while the child runs.
 pub fn current_pid() -> u32 {
-    if nested_active() {
-        // SAFETY: as `slots`.
-        unsafe { slots()[core::ptr::read_volatile(&raw const NESTED_SLOT)].pid }
+    let cur = crate::exec_twin::current_slot();
+    if cur != crate::exec_twin::NO_SLOT {
+        // SAFETY: syscall-path discipline.
+        slots()[cur].pid
     } else {
         1
     }
 }
 
+/// The `ProcessHooks::pid_for_thread` / `find_pid_by_thread` arm: the pid a
+/// spawn-ring slot runs under today, `None` for an unused slot. The thread
+/// namespace on this kernel IS the spawn ring until `fork_process` (slice 3)
+/// replaces it — one table, one answer.
+pub fn pid_for_slot(idx: usize) -> Option<u32> {
+    let s = slots();
+    if idx < NSLOTS && s[idx].used {
+        Some(s[idx].pid)
+    } else {
+        None
+    }
+}
+
 /// The nested child's write to fd 1: into the pipe (the buffer).
 pub fn child_write(buf_va: u64, len: u64) -> bool {
+    let cur = crate::exec_twin::current_slot();
+    if cur == crate::exec_twin::NO_SLOT {
+        // Unreachable today: only a child's fd 1 lands here, and a child
+        // running means `current_slot` names one. A parent write to fd 1
+        // would be a dispatcher bug; refuse rather than write into slot 0's
+        // buffer (what the old default static would have done).
+        return false;
+    }
+    // SAFETY: syscall-path discipline.
+    let out_slot = unsafe { cross_mut(cur).out_slot };
     let mut chunk = [0u8; 512];
     let mut done = 0u64;
     while done < len {
@@ -129,7 +261,7 @@ pub fn child_write(buf_va: u64, len: u64) -> bool {
         // SAFETY: syscall-path discipline.
         let slot = unsafe {
             let s = &mut *core::ptr::addr_of_mut!(SLOTS);
-            &mut s[core::ptr::read_volatile(&raw const SPAWN_OUT_SLOT)]
+            &mut s[out_slot]
         };
         if slot.out.len() < OUT_CAP {
             let take = n.min(OUT_CAP - slot.out.len());
@@ -314,23 +446,31 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
         return crate::e(crate::err::ENOMEM);
     };
 
-    // Snapshot the parent and point the syscall machinery at the child.
-    // SAFETY: syscall-path discipline for the statics; `child_enter`'s
+    // Snapshot the parent and point the crossing machinery at the child —
+    // into the child's own per-slot record now (slice 2): the parent's CR3,
+    // stack top and stash, the depth/task/out answers, and `current_slot`
+    // naming the child from here until its `child_exit`.
+    // SAFETY: syscall-path discipline for the table; `child_enter`'s
     // contract for the crossing.
-    unsafe {
-        PARENT_ROOT = crate::task_slots()[0].root_pa;
-        PARENT_STACK_TOP = ring3::syscall_stack_top();
-        PARENT_STASH = ring3::user_rsp_stash();
-        *core::ptr::addr_of_mut!(NESTED_SLOT) = slot_idx;
-        *core::ptr::addr_of_mut!(SPAWN_OUT_SLOT) = slot_idx;
-        *core::ptr::addr_of_mut!(NESTED_DEPTH) += 1;
+    let (_, save) = unsafe {
+        let c = cross_mut(slot_idx);
+        c.parent_root = crate::task_slots()[0].root_pa;
+        c.parent_stack_top = ring3::syscall_stack_top();
+        c.parent_stash = ring3::user_rsp_stash();
+        c.depth = 1;
+        c.task_slot = 1;
+        c.parent_task_slot = 0;
+        c.parent_slot = crate::exec_twin::NO_SLOT;
+        c.out_slot = slot_idx;
+        crate::exec_twin::set_current_slot(slot_idx);
         // The nested stack: the lower half of the syscall stack. The live
         // dispatch frames sit in the upper half — the SPAWN arm's depth from
         // the top is a few hundred bytes, and the stub's per-syscall frame is
         // 128 — so the two halves cannot meet.
         let half = (ring3::SYSCALL_STACK_SIZE / 2) as u64;
-        ring3::set_syscall_stack_top(PARENT_STACK_TOP - half);
-    }
+        ring3::set_syscall_stack_top(c.parent_stack_top - half);
+        (c.parent_stack_top, save_ptr(slot_idx))
+    };
 
     let ef = ring3::EntryFrame {
         r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
@@ -339,19 +479,22 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
         rflags: 0x202,
         rsp: ti.rsp,
     };
-    let code = unsafe { child_enter(ti.root_pa, &ef) };
+    let code = unsafe { child_enter(ti.root_pa, &ef, save) };
     // `code` (the child's exit status) was recorded into the slot by the
     // exit arm before it returned here; SPAWN's own result is the packed
     // pid/fd word below.
     let _ = code;
 
     // Back in the parent, in every sense: registers and stack top restored
-    // by the exit arm, CR3 back, the stash pointing at the parent again.
+    // by the exit arm, CR3 back, `current_slot` back to the boot task (the
+    // exit tail's `set_current_slot(parent_slot)`). The stack top and stash
+    // come from the child's own record — the same values the snapshot put
+    // there, read back through the slot index this frame owns.
     // SAFETY: syscall-path discipline.
     unsafe {
-        *core::ptr::addr_of_mut!(NESTED_DEPTH) = 0;
-        ring3::set_syscall_stack_top(PARENT_STACK_TOP);
-        ring3::set_user_rsp_stash(PARENT_STASH);
+        let c = cross_mut(slot_idx);
+        ring3::set_syscall_stack_top(c.parent_stack_top);
+        ring3::set_user_rsp_stash(c.parent_stash);
     }
     let pid = slots()[slot_idx].pid;
 
@@ -375,7 +518,7 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// The first-level (SPAWN) saved state, snapshotted across an exec-replace:
-/// the second [`child_enter`] overwrites the shared save slots with this
+/// the second [`child_enter`] overwrites the slot's save record with this
 /// (nested) call's registers, and [`spawn_arm`]'s resume needs the originals.
 /// SPAWN-level crossing state saved by `exec_replace` — one PER FRAME now,
 /// not the old single statics: test A nests two exec_replace levels (outer
@@ -384,17 +527,11 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
 /// user registers into `spawn_arm`'s live Rust frame (the 16 KiB #GP shape,
 /// then the 32 KiB silent spin). A frame local lives above the deeper
 /// dispatch bands (deeper runs write strictly below it), so it is stable
-/// until its own `exec_return` consumes it.
-#[repr(C)]
-struct ExecSave {
-    ret_rsp: u64,
-    rbx: u64,
-    rbp: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
-}
+/// until its own `exec_return` consumes it. (Slice 2: the snapshot's SOURCE
+/// is the slot's per-slot `CrossSave` — the record `exec_replace`'s own
+/// crossing will overwrite; the fork arm no longer needs this dance at all,
+/// because its child has a record of its own.)
+type ExecSave = CrossSave;
 
 /// The nested child's `execve` — the handoff of the run-to-completion model.
 ///
@@ -411,18 +548,11 @@ struct ExecSave {
 /// A failure BEFORE the crossing is an ordinary `execve` error the caller
 /// (ash) sees and reports; after the crossing there is no returning.
 pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
+    // Snapshot THIS slot's crossing record — the values the sshd→shell
+    // crossing left, which the second `child_enter` below will overwrite
+    // (same slot: an exec replaces the image in place, slice 2 or not).
     // SAFETY: syscall-path discipline (single core, IF clear).
-    let save = unsafe {
-        ExecSave {
-            ret_rsp: core::ptr::read_volatile(&raw const RET_RSP),
-            rbx: core::ptr::read_volatile(&raw const SAVE_RBX),
-            rbp: core::ptr::read_volatile(&raw const SAVE_RBP),
-            r12: core::ptr::read_volatile(&raw const SAVE_R12),
-            r13: core::ptr::read_volatile(&raw const SAVE_R13),
-            r14: core::ptr::read_volatile(&raw const SAVE_R14),
-            r15: core::ptr::read_volatile(&raw const SAVE_R15),
-        }
-    };
+    let save = unsafe { *save_ptr(crate::exec_twin::current_slot()) };
     let args = match read_spawn_args(fr.arg1(), fr.arg2(), fr.arg3()) {
         Ok(a) => a,
         Err(no) => return crate::e(no),
@@ -505,7 +635,7 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     // SAFETY: syscall-path discipline; `set_syscall_stack_top` is a plain
     // atomic store the unsafe context of the arm already covers.
     ring3::set_syscall_stack_top(rsp_here - 0x1000);
-    let status = unsafe { child_enter(ti.root_pa, &ef) };
+    let status = unsafe { child_enter(ti.root_pa, &ef, save_ptr(crate::exec_twin::current_slot())) };
     // The exec'd child exited: `child_exit` recorded its status in the slot,
     // cleared the nesting, put task slot 0 back, and restored THIS frame's
     // registers and CR3 (the parent's). Hand control to `spawn_arm`'s
@@ -525,6 +655,12 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
 #[cfg(target_arch = "x86_64")]
 unsafe fn exec_return(save: &ExecSave, status: u32) -> ! {
     unsafe {
+        // Explicit register bindings for every callee-saved restore, for the
+        // reason `child_exit` spells out: an `in(reg)` input may be allocated
+        // to a register the template itself overwrites. Here the loads read
+        // the snapshot through `rdi` (bound explicitly), the callee-saveds
+        // are PLACED as the restore, and `rax` carries the status the `ret`
+        // hands back to `spawn_arm`.
         core::arch::asm!(
             "mov rbx, [rdi + 0x08]",
             "mov rbp, [rdi + 0x10]",
@@ -533,10 +669,9 @@ unsafe fn exec_return(save: &ExecSave, status: u32) -> ! {
             "mov r14, [rdi + 0x28]",
             "mov r15, [rdi + 0x30]",
             "mov rsp, [rdi + 0x00]",
-            "mov eax, {st:e}",
             "ret",
             in("rdi") save,
-            st = in(reg) u64::from(status),
+            in("rax") u64::from(status),
             options(noreturn),
         )
     }
@@ -545,26 +680,33 @@ unsafe fn exec_return(save: &ExecSave, status: u32) -> ! {
 /// Cross into the child and come back only when it exits.
 ///
 /// Naked because the whole body is the contract: save the parent-phase
-/// callee-saved registers and stack pointer, load `CR3`, then the
+/// callee-saved registers and stack pointer into the **caller-chosen
+/// per-slot record** (`save`, in `%rdx` — slice 2's replacement for the
+/// crossing statics the old `sym` operands named), load `CR3`, then the
 /// `enter_user` crossing. The exit arm reverses this exactly — restores the
-/// registers, moves `rsp` back to the saved value, and `ret`s, so this
-/// function *returns* the child's exit code into [`spawn_arm`].
+/// registers from the same record, moves `rsp` back to the saved value, and
+/// `ret`s, so this function *returns* the child's exit code into its
+/// caller (`spawn_arm`, `fork_arm`, `exec_replace`).
+///
+/// The stores must precede every clobber of `%rdx`: the crossing loads below
+/// spend it (`mov rdx, [rsi + 0x48]`) along with the frame pointer.
 ///
 /// # Safety
 /// `root` must be the child's page root (mapping the kernel half and the
-/// child's image), and `ef` a ring-3-enterable state in it.
+/// child's image), `ef` a ring-3-enterable state in it, and `save` the
+/// per-slot record the exit side will read (`save_ptr(slot)`).
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame) -> u64 {
+pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame, save: *mut CrossSave) -> u64 {
     core::arch::naked_asm!(
-        // Save the caller's (parent-phase) state first.
-        "mov qword ptr [rip + {ret_rsp}], rsp",
-        "mov qword ptr [rip + {s_rbx}], rbx",
-        "mov qword ptr [rip + {s_rbp}], rbp",
-        "mov qword ptr [rip + {s_r12}], r12",
-        "mov qword ptr [rip + {s_r13}], r13",
-        "mov qword ptr [rip + {s_r14}], r14",
-        "mov qword ptr [rip + {s_r15}], r15",
+        // Save the caller's (parent-phase) state into the slot record first.
+        "mov qword ptr [rdx + 0x00], rsp",
+        "mov qword ptr [rdx + 0x08], rbx",
+        "mov qword ptr [rdx + 0x10], rbp",
+        "mov qword ptr [rdx + 0x18], r12",
+        "mov qword ptr [rdx + 0x20], r13",
+        "mov qword ptr [rdx + 0x28], r14",
+        "mov qword ptr [rdx + 0x30], r15",
         // The child's address space: kernel half survives (shared PML4).
         "mov cr3, rdi",
         // The enter_user crossing, verbatim (`akuma-ring3-amd64`): every load
@@ -588,13 +730,6 @@ pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame) -> u64 {
         "mov rdi, [rsi + 0x58]",
         "mov rsi, [rsi + 0x50]", // last: spends the frame pointer
         "sysretq",
-        ret_rsp = sym RET_RSP,
-        s_rbx = sym SAVE_RBX,
-        s_rbp = sym SAVE_RBP,
-        s_r12 = sym SAVE_R12,
-        s_r13 = sym SAVE_R13,
-        s_r14 = sym SAVE_R14,
-        s_r15 = sym SAVE_R15,
     )
 }
 
@@ -615,64 +750,65 @@ pub fn child_exit(code: u64) -> ! {
     // payloads hold no kernel reference (the close arms' convention); only
     // the counted pipe ends need the walk.
     crate::pipes::release_open_fds();
-    // Record first, while the Rust frame can still reach the slot table.
+    // "Who am I" is `current_slot()` now (slice 2): the running child's own
+    // slot names its record, its status row, and the crossing back.
+    let cur = crate::exec_twin::current_slot();
+    // Record first, while the Rust frame can still reach the tables.
     // SAFETY: syscall-path discipline. Depth-aware (M2): depth 1 is the
     // spawned shell handing the machine back to sshd; depth 2 is a fork
-    // child handing it back to the shell — same record, one level up.
-    let (parent_root, status) = unsafe {
-        let slot_idx = core::ptr::read_volatile(&raw const NESTED_SLOT);
-        let s = &mut *core::ptr::addr_of_mut!(SLOTS);
-        s[slot_idx].running = false;
-        s[slot_idx].status = ((code & 0xFF) << 8) as u32;
+    // child handing it back to the shell — the record knows which.
+    let (parent_root, status, parent_task_slot, parent_slot) = unsafe {
+        let c = cross_mut(cur);
+        let s = slots();
+        s[cur].running = false;
+        s[cur].status = ((code & 0xFF) << 8) as u32;
         let t = &mut *core::ptr::addr_of_mut!(crate::TASKS);
-        let depth = core::ptr::read_volatile(&raw const NESTED_DEPTH) as usize;
-        t[depth].exit = Some(code);
-        *core::ptr::addr_of_mut!(NESTED_DEPTH) = (depth - 1) as u32;
-        (core::ptr::read_volatile(&raw const PARENT_ROOT), s[slot_idx].status)
+        t[c.task_slot].exit = Some(code);
+        (c.parent_root, s[cur].status, c.parent_task_slot, c.parent_slot)
     };
-    // SAFETY: as above; `task()` now names the resuming parent
-    // (sshd at depth 1, the shell at depth 2).
-    let depth = unsafe { core::ptr::read_volatile(&raw const NESTED_DEPTH) } as usize;
-    crate::set_task_slot(depth);
-    let ret_rsp = unsafe { core::ptr::read_volatile(&raw const RET_RSP) };
-    let (bx, bp, r12, r13, r14, r15) = unsafe {
-        (
-            core::ptr::read_volatile(&raw const SAVE_RBX),
-            core::ptr::read_volatile(&raw const SAVE_RBP),
-            core::ptr::read_volatile(&raw const SAVE_R12),
-            core::ptr::read_volatile(&raw const SAVE_R13),
-            core::ptr::read_volatile(&raw const SAVE_R14),
-            core::ptr::read_volatile(&raw const SAVE_R15),
-        )
-    };
-    // SAFETY: the values were saved by `child_enter` from the frame this
-    // restores; `ret` pops the return address that call pushed. After the
-    // `cr3` load this code is running in the parent's address space — both
-    // map the kernel half, so the registers land before the jump matters.
-    unsafe {
-        core::arch::asm!(
-            "mov cr3, {root}",
-            "mov rbx, {bx}",
-            "mov rbp, {bp}",
-            "mov r12, {r12}",
-            "mov r13, {r13}",
-            "mov r14, {r14}",
-            "mov r15, {r15}",
-            "mov rsp, {sp}",
-            "mov eax, {code:e}",
-            "ret",
-            root = in(reg) parent_root,
-            bx = in(reg) bx,
-            bp = in(reg) bp,
-            r12 = in(reg) r12,
-            r13 = in(reg) r13,
-            r14 = in(reg) r14,
-            r15 = in(reg) r15,
-            sp = in(reg) ret_rsp,
-            code = in(reg) u64::from(status),
-            options(noreturn),
-        )
-    }
+    crate::set_task_slot(parent_task_slot);
+    // The parent is current again: for a depth-1 exit that is the boot task
+    // (`NO_SLOT`), for a depth-2 exit the shell's slot — what the old
+    // decrement-`NESTED_DEPTH`-and-restore-`NESTED_SLOT` dance computed.
+    crate::exec_twin::set_current_slot(parent_slot);
+    // SAFETY: the record is live (this slot's own), the status is recorded,
+    // and the tail never returns to this frame.
+    unsafe { exit_cross(save_ptr(cur), parent_root, status) }
+}
+
+/// The exit tail's crossing back, naked because its whole body is the
+/// contract: restore the parent's callee-saved registers and stack pointer
+/// from the slot record, load the parent's CR3, put the status in `eax`, and
+/// `ret` into the resuming arm. Arguments arrive in `rdi`/`rsi`/`rdx` per
+/// the C ABI (`save`, `root`, `status`); everything the body writes is an
+/// argument register or the register being restored — there is **no operand
+/// allocation to get wrong**, which is the whole point of the naked form:
+/// boot 2 caught the inline-asm version of this tail letting LLVM allocate
+/// the `r13` input to the physical `rbx` the template's own first `mov`
+/// destroyed, so the resumed frame came back with a user address in `r13`.
+/// (`rbx`/`rbp` cannot be explicit inline-asm operands at all — LLVM
+/// reserves them — which closes the inline form off entirely.)
+///
+/// # Safety
+/// `save` must be this slot's own crossing record, `root` the parent's CR3,
+/// `status` the packed wait status; never returns.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn exit_cross(save: *mut CrossSave, root: u64, status: u32) -> ! {
+    core::arch::naked_asm!(
+        "mov rbp, [rdi + 0x10]",
+        "mov r12, [rdi + 0x18]",
+        "mov r13, [rdi + 0x20]",
+        "mov r14, [rdi + 0x28]",
+        "mov r15, [rdi + 0x30]",
+        "mov rbx, [rdi + 0x08]",
+        // CR3 before the stack switch: both spaces map the kernel half, so
+        // the record reads above and the rsp below are safe in either.
+        "mov cr3, rsi",
+        "mov rsp, [rdi + 0x00]",
+        "mov eax, edx",
+        "ret",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -711,8 +847,15 @@ pub fn child_exit(code: u64) -> ! {
 pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     // Fork lives only inside the spawned shell: nothing forks the sshd task,
     // and a fork inside a fork child has no stack region left (see above).
-    let depth = unsafe { core::ptr::read_volatile(&raw const NESTED_DEPTH) };
-    if depth != 1 {
+    // Per-slot (slice 2): the current slot's record carries the depth — the
+    // boot task's `NO_SLOT` and a fork child's depth 2 both refuse.
+    let cur = crate::exec_twin::current_slot();
+    let shell_depth = match cur {
+        crate::exec_twin::NO_SLOT => 0,
+        // SAFETY: syscall-path discipline.
+        _ => unsafe { cross_mut(cur).depth },
+    };
+    if shell_depth != 1 {
         return crate::e(crate::err::EPERM);
     }
     const CLONE_VM: u64 = 0x0000_0100;
@@ -831,69 +974,44 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
         rsp: ring3::user_rsp_stash(),
     };
 
-    // Snapshot what the OUTER crossing (sshd → shell) left in the single
-    // save slots: `PARENT_ROOT` must name sshd again before the SHELL exits
-    // (its `child_exit` loads CR3 from it), `PARENT_STASH` must still point
-    // at sshd's parked RSP for `spawn_arm`'s tail, and `NESTED_SLOT` must
-    // name the shell's slot for its status. The callee-saved slots and
-    // `RET_RSP` must ALSO be saved here: `child_enter` overwrites them with
-    // this fork's crossing, and the child's `child_exit` consumes exactly
-    // that while this frame is still live — but what was there BEFORE the
-    // fork (the shell's exec crossing) must be back in place afterwards.
-    // The shell's own `child_exit` reads the same slots, and so does
-    // `exec_replace`, which snapshots them into the `EXEC_*` copies to wind
-    // the exec'd image's status back into `spawn_arm`: a fork that leaves
-    // its own crossing behind turns the next `sh -c '…; last'` tail-exec
-    // into a return through the fork's dead callee-saved registers (seen
-    // 2026-10-27: F1's tail-exec'd `wc` died on a zeroed ring-0 PageFault
-    // right after its first open — fork of `cat`, wait4, then exec).
-    let (sshd_root, sshd_stash, shell_slot, shell_stash, shell_top, cross) = unsafe {
-        (
-            core::ptr::read_volatile(&raw const PARENT_ROOT),
-            core::ptr::read_volatile(&raw const PARENT_STASH),
-            core::ptr::read_volatile(&raw const NESTED_SLOT),
-            ring3::user_rsp_stash(),
-            ring3::syscall_stack_top(),
-            (
-                core::ptr::read_volatile(&raw const RET_RSP),
-                core::ptr::read_volatile(&raw const SAVE_RBX),
-                core::ptr::read_volatile(&raw const SAVE_RBP),
-                core::ptr::read_volatile(&raw const SAVE_R12),
-                core::ptr::read_volatile(&raw const SAVE_R13),
-                core::ptr::read_volatile(&raw const SAVE_R14),
-                core::ptr::read_volatile(&raw const SAVE_R15),
-            ),
-        )
-    };
+    // The fork child gets a per-slot crossing record of its own (slice 2) —
+    // which is why the old code's whole snapshot-and-restore dance around
+    // the shared statics is gone: the shell's sshd→shell record lives in
+    // `SLOT_STATE[cur]` and the fork never touches it, so the shell's own
+    // exit (or its next exec's snapshot) reads exactly what was always
+    // there. The child's record copies the shell's out_slot (a fork child's
+    // fd 1 writes land in the buffer sshd drains — never its own slot),
+    // inherits depth+1, and names the shell as the crossing back.
     // SAFETY: syscall-path discipline.
-    unsafe {
-        PARENT_ROOT = ash_root;
-        *core::ptr::addr_of_mut!(NESTED_SLOT) = slot_idx;
-        *core::ptr::addr_of_mut!(NESTED_DEPTH) += 1;
+    let (_, save) = unsafe {
+        let c = cross_mut(slot_idx);
+        c.save = CrossSave::new();
+        c.parent_root = ash_root;
+        c.parent_stack_top = ring3::syscall_stack_top();
+        c.parent_stash = ring3::user_rsp_stash();
+        c.depth = shell_depth + 1;
+        c.task_slot = 2;
+        c.parent_task_slot = 1;
+        c.parent_slot = cur;
+        c.out_slot = cross_mut(cur).out_slot;
+        crate::exec_twin::set_current_slot(slot_idx);
         // The child's dispatch stack: one quarter below the shell's top. The
         // shell's live fork frames sit just under ITS top, a few hundred
         // bytes deep against a 4 KiB quarter, so the two can never meet.
-        ring3::set_syscall_stack_top(shell_top - (ring3::SYSCALL_STACK_SIZE / 4) as u64);
-    }
-    let _code = unsafe { child_enter(root, &ef) };
+        ring3::set_syscall_stack_top(c.parent_stack_top - (ring3::SYSCALL_STACK_SIZE / 4) as u64);
+        (c.parent_stack_top, save_ptr(slot_idx))
+    };
+    let _code = unsafe { child_enter(root, &ef, save) };
     // The child exited into this frame: its status is in the slot, the task
-    // slot is back to 1, CR3 is the shell's. Restore what the shell's own
-    // exit (or its next exec's snapshot) will need, hand the shell back its
-    // stack and stash, answer fork.
+    // slot is back to 1, CR3 is the shell's, `current_slot` is the shell's
+    // slot again (the exit tail's `set_current_slot(parent_slot)`). Hand the
+    // shell back its stack and stash from the child's own record, answer
+    // fork.
     // SAFETY: syscall-path discipline.
     unsafe {
-        *core::ptr::addr_of_mut!(NESTED_SLOT) = shell_slot;
-        PARENT_ROOT = sshd_root;
-        PARENT_STASH = sshd_stash;
-        *core::ptr::addr_of_mut!(RET_RSP) = cross.0;
-        *core::ptr::addr_of_mut!(SAVE_RBX) = cross.1;
-        *core::ptr::addr_of_mut!(SAVE_RBP) = cross.2;
-        *core::ptr::addr_of_mut!(SAVE_R12) = cross.3;
-        *core::ptr::addr_of_mut!(SAVE_R13) = cross.4;
-        *core::ptr::addr_of_mut!(SAVE_R14) = cross.5;
-        *core::ptr::addr_of_mut!(SAVE_R15) = cross.6;
-        ring3::set_syscall_stack_top(shell_top);
-        ring3::set_user_rsp_stash(shell_stash);
+        let c = cross_mut(slot_idx);
+        ring3::set_syscall_stack_top(c.parent_stack_top);
+        ring3::set_user_rsp_stash(c.parent_stash);
     }
     let pid = slots()[slot_idx].pid;
     u64::from(pid)
@@ -991,4 +1109,83 @@ pub fn read_child_out(slot_idx: usize, buf_va: u64, len: u64) -> u64 {
 /// the dispatcher's nanosleep arms (kept here so `net.rs` stays device-only).
 pub fn sleep_us(us: u64) {
     net::sleep_until(net::uptime_us() + us);
+}
+
+// ---------------------------------------------------------------------------
+// The X86ArchHooks machine-state arms (session pc, slice 2).
+//
+// `prepare_task_slot` / `write_user_context` / `read_user_context`, over the
+// per-slot table above. Nothing calls them until `fork_process` (slice 3)
+// claims slots through the shared spawn path — they are landed now, per the
+// plan's slice 2, so the seam exists before its first customer.
+// ---------------------------------------------------------------------------
+
+/// The twin's stack sizes. The kernel stack matches the shared
+/// `SYSCALL_STACK` band's 64 KiB (the T-Y bug-3 number: depth-2 exec band on
+/// top of two crossing halves is what fits); the trap stack is amd64's 32
+/// KiB. Four slots × 96 KiB = 384 KiB, bounded by the ring, against 767 MiB
+/// of guest RAM.
+const KSTACK_WORDS: usize = akuma_ring3_amd64::SYSCALL_STACK_SIZE / 8;
+const TSTACK_WORDS: usize = 32 * 1024 / 8;
+
+/// Two fresh zeroed stacks, leaked: a slot's stacks must outlive the frame
+/// that made them, and a recycled slot reuses the pair it already owns
+/// (`SlotCross::stacks` is set once) — per-spawn leaks would turn the ring's
+/// recycling into a memory leak.
+fn leak_stacks() -> SlotStacks {
+    SlotStacks {
+        kernel: alloc::vec![0u64; KSTACK_WORDS].leak(),
+        trap: alloc::vec![0u64; TSTACK_WORDS].leak(),
+    }
+}
+
+/// `X86ArchHooks::prepare_task_slot`: give a freshly claimed slot its
+/// kernel+trap stacks and its default machine state, answer the kernel stack
+/// top. `None` = the slot is out of range or the stacks could not be made;
+/// the caller abandons the slot. The crossing record is dead until the next
+/// crossing writes it, and a recycled slot's saved user context is cleared —
+/// a recycled slot cannot inherit the previous occupant's capture.
+pub fn prepare_task_slot(slot: usize) -> Option<usize> {
+    if slot >= NSLOTS {
+        return None;
+    }
+    // SAFETY: syscall-path discipline (the claim path runs there in slice 3).
+    let c = unsafe { cross_mut(slot) };
+    if c.stacks.is_none() {
+        c.stacks = Some(leak_stacks());
+    }
+    let s = c.stacks.as_ref()?;
+    let ktop = (s.kernel.as_ptr() as usize + KSTACK_WORDS * 8) as u64;
+    let ttop = ((s.trap.as_ptr() as usize + TSTACK_WORDS * 8) & !0xf) as u64;
+    c.kstack_top = ktop;
+    c.trap_stack_top = ttop;
+    c.save = CrossSave::new();
+    c.uctx = None;
+    Some(ktop as usize)
+}
+
+/// `X86ArchHooks::write_user_context`: store a ring-3 register capture into
+/// `slot`'s machine state. Always called on a slot that is not running (the
+/// shared spawn path's INITIALIZING discipline), which is what makes writing
+/// another slot's state safe at all.
+pub fn write_user_context(slot: usize, ctx: &akuma_exec::process::UserContext) {
+    if slot >= NSLOTS {
+        return;
+    }
+    // SAFETY: syscall-path discipline; `slot` is not running.
+    unsafe { cross_mut(slot).uctx = Some(*ctx) };
+}
+
+/// `X86ArchHooks::read_user_context`: the exact mirror — `None` means the
+/// slot has never been given a capture, the same refusal amd64's table makes
+/// for a slot that never trapped (a child built from such a slot would
+/// launch at whatever the registers happened to hold).
+pub fn read_user_context(
+    slot: usize,
+) -> Option<akuma_exec::process::UserContext> {
+    if slot >= NSLOTS {
+        return None;
+    }
+    // SAFETY: syscall-path discipline.
+    unsafe { cross_mut(slot).uctx }
 }
