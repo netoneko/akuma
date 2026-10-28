@@ -75,12 +75,79 @@ pub fn uptime_us() -> u64 {
 
 // ── the X86ArchHooks bodies (the per-core machine effects) ──────────────────
 
-/// `X86ArchHooks::switch_to` — **lands with `fork_process` (slice 3)**, the
-/// plan's own placement: the switch is the thing `fork_process` adds, and
-/// nothing on this kernel can reach it before that (no threads exist, so no
-/// pick loop runs). Loud rather than silently wrong.
-fn switch_to(_from: usize, _to: usize) {
-    panic!("exec_twin: switch_to was called but the task switch lands with fork_process (slice 3)");
+/// `X86ArchHooks::switch_to` — **real (slice 3)**: the machine effects of a
+/// park-point switch. `akuma-threading`'s `x86_yield_now` has already named
+/// `next` current and will move the stacks itself (`x86_switch_context` is
+/// the crate's own x86 asm); what the machine still needs from the twin is
+/// the incoming task's syscall band and its CR3. tid 0 is the shell (its
+/// SPAWN crossing band, task record 1), 1..NSLOTS real children (leaked
+/// pairs, task record tid+1), anything else the idle thread (stack below,
+/// CR3 untouched — it runs on the kernel root). `from` needs nothing: the
+/// crate saves its context.
+fn switch_to(from: usize, to: usize) {
+    let _ = from;
+    akuma_ring3_amd64::set_syscall_stack_top(crate::child::sched_kstack_top(to));
+    let root = crate::child::sched_root_of(to);
+    if root != 0 {
+        // SAFETY: `root` is a PMM-resident page-table frame naming the
+        // incoming task's image and the shared kernel half — the same load
+        // every crossing here performs. Single core, IF clear, no TLB
+        // aliasing to flush (PCID unused, CR3 writes flush non-global).
+        unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+    }
+}
+
+/// The idle thread's tid: outside the spawn ring (children claim 1..NSLOTS,
+/// the shell is 0), so no array index collides. Its stack is leaked once,
+/// below; its CR3 is the kernel's (sched_root_of answers 0).
+pub const IDLE_TID: usize = crate::child::NSLOTS;
+
+static IDLE_STACK: spin_idle::Once<U64Arr> = spin_idle::Once::NEW;
+type U64Arr = alloc::boxed::Box<[u64; 2048]>;
+mod spin_idle {
+    //! One-shot init for the idle stack — `Once` without a lock dependency
+    //! (single core, IF clear at every caller).
+    pub struct Once<T>(core::cell::UnsafeCell<Option<T>>);
+    impl<T> Once<T> {
+        pub const NEW: Self = Once(core::cell::UnsafeCell::new(None));
+        /// SAFETY: single core, IF clear (the registration path).
+        pub fn call(&self, make: impl FnOnce() -> T) -> *mut T {
+            unsafe {
+                let p = &mut *self.0.get();
+                if p.is_none() {
+                    *p = Some(make());
+                }
+                p.as_mut().unwrap_unchecked()
+            }
+        }
+    }
+    // SAFETY: only touched from the single-core IF-clear path.
+    unsafe impl<T> Sync for Once<T> {}
+}
+
+extern "C" fn idle_main() -> ! {
+    // The idle loop: keep the tick alive (one `sti` window per lap — the
+    // clock is what timed parks and uptime read) and yield the moment
+    // anything becomes READY. Without the yield, a woken task would wait
+    // for... nothing: the waker only readies, it cannot switch.
+    loop {
+        crate::exec_twin::tick_window();
+        if akuma_threading::x86_runnable_exists() {
+            akuma_threading::x86_yield();
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Seed the idle thread once (from `init`): claim nothing — the tid is ours
+/// by const — seed the entry, publish READY.
+fn seed_idle() {
+    // SAFETY: single core, IF clear — the registration path owns the Once.
+    let stack: &'static mut [u64; 2048] =
+        unsafe { &mut *IDLE_STACK.call(|| alloc::boxed::Box::new([0u64; 2048])) };
+    let top = ((core::ptr::from_mut(stack) as *const u64 as usize) + 2048 * 8) & !0xf;
+    akuma_threading::x86_seed_entry(IDLE_TID, top, idle_main);
+    akuma_threading::x86_publish(IDLE_TID);
 }
 
 /// `X86ArchHooks::allow_tick` — the frozen-clock escape, real: open a
@@ -88,8 +155,18 @@ fn switch_to(_from: usize, _to: usize) {
 /// tick; this kernel has one now (session pb). Nothing calls it until
 /// blocking syscalls arrive (slice 3) — a kernel that runs IF=0 everywhere
 /// already gets its ticks in ring 3.
-fn allow_tick() {
-    // SAFETY: `sti`/`cli` are unconditionally executable at ring 0 and touch
+/// The idle loop's clock feeder — the same one-instruction window
+/// [`allow_tick`] opens, under a name the idle thread can reach.
+pub fn tick_window() {
+    // SAFETY: `sti`/`cli` at ring 0 touch no memory or stack; the window is
+    // one instruction wide and the tick handler is bounded, so the worst a
+    // tick in the window does is count.
+    unsafe {
+        core::arch::asm!("sti", "nop", "cli", options(nomem, nostack, preserves_flags));
+    }
+}
+
+fn allow_tick() {    // SAFETY: `sti`/`cli` are unconditionally executable at ring 0 and touch
     // no memory or stack; the window is one instruction wide and the tick
     // handler (`timer_trap`) is bounded and allocation-free, so the worst a
     // tick in the window does is count.
@@ -130,8 +207,10 @@ pub fn init() {
     // its reason, not a bare `false`.
     akuma_threading::register_process_hooks(process_hooks());
 
-    // The machine effects. `switch_to` still names its slice (the switch is
-    // `fork_process`'s); the per-slot state arms landed in slice 2.
+    // The machine effects. `switch_to` is real from slice 3; the per-slot
+    // state arms landed in slice 2. The idle thread is seeded last: READY
+    // from the first registration, it only ever gets the core when every
+    // real task is parked (its loop feeds the tick and yields on wakeups).
     akuma_threading::register_x86_arch_hooks(X86ArchHooks {
         switch_to,
         current_slot,
@@ -144,19 +223,20 @@ pub fn init() {
         read_user_context: crate::child::read_user_context,
         prepare_task_slot: crate::child::prepare_task_slot,
     });
+    seed_idle();
 }
 
 /// The spawn ring's width, for `can_run`'s bounds check.
 /// The idle answer: the boot task (`NO_SLOT` in the ring's naming). Nothing
 /// can call this until a picker exists (slice 3).
 fn idle_slot() -> usize {
-    NO_SLOT
+    IDLE_TID
 }
 
 /// Pinning: nothing pins yet, so any slot in the ring (or the boot task) can
 /// run. `can_run` returns `false` only where a real pinning table would.
 fn can_run(slot: usize) -> bool {
-    slot == NO_SLOT || slot < crate::child::NSLOTS
+    slot == NO_SLOT || slot <= crate::child::NSLOTS
 }
 
 /// The BKL's recursion depth is per-thread and the lock per-core; this
@@ -357,7 +437,12 @@ fn twin_bind_child_task(
 /// parent's TLS pointer in hardware, fork semantics.
 fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     let cur = crate::exec_twin::current_slot();
-    let root = crate::child::bind_root_of(cur);
+    // The task record (not the bind table) is the root's authority — a real
+    // child that has exec'd must enter on the NEW image's root.
+    if cur != crate::exec_twin::NO_SLOT && cur < crate::child::NSLOTS + 1 {
+        crate::set_task_slot(crate::child::sched_task_slot_of(cur));
+    }
+    let root = crate::child::sched_root_of(cur);
     if root != 0 {
         // SAFETY: `root` is a PMM-resident page-table frame naming the
         // child's image and the shared kernel half; the load is the same one
@@ -395,7 +480,7 @@ fn exec_config() -> ExecConfig {
     // shared syscalls run); the table exists so the day one does, the values
     // are already this kernel's truth.
     ExecConfig {
-        max_threads: 4, // the spawn ring's width is this kernel's thread truth
+        max_threads: 16, // the spawn ring + the idle thread + headroom
         reserved_threads: 0,
         kernel_stack_size: akuma_ring3_amd64::SYSCALL_STACK_SIZE,
         boot_stack_base: 0,

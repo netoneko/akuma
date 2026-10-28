@@ -671,7 +671,24 @@ struct Task {
     fd_nonblock: fdtable::FlagSet,
 }
 
-static mut TASKS: [Task; 3] = [Task::new(), Task::new(), Task::new()];
+static mut TASKS: [Task; 16] = [
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+];
 /// Which slot `task()` hands out: 0 is the boot's init task (sshd for this
 /// stage's gate), 1 is the child running inside a SPAWN (`child.rs`), and 2
 /// is a fork child running inside that child (child.rs's M2 scaffold).
@@ -695,17 +712,21 @@ impl Task {
     }
 }
 
-/// Switch which task slot the syscall path acts on (the SPAWN arm and the
-/// child exit, both in `child.rs`).
-fn set_task_slot(i: usize) {
+/// Switch which task slot the syscall path acts on (the SPAWN arm, the
+/// child exit, and slice 3's `twin_enter_user` — which points the record at
+/// the incoming real task).
+pub(crate) fn set_task_slot(i: usize) {
     // SAFETY: single core, `IF` clear — the same discipline as `task()`.
     unsafe {
         *core::ptr::addr_of_mut!(TASK_SLOT) = i;
     }
 }
 
-/// Both slots, for the spawn path (it snapshots the parent's `root_pa`).
-fn task_slots() -> &'static mut [Task; 3] {
+/// Every slot, for the spawn path and slice 3's real tasks: 0 is the boot's
+/// init task (sshd), 1 the shell inside its SPAWN crossing, and `tid + 1`
+/// (for threading tid `tid` >= 1) a real fork child — `bind_child_task`
+/// stamps it, `switch_to` reads its root.
+pub(crate) fn task_slots() -> &'static mut [Task; 16] {
     // SAFETY: as `task`.
     unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
 }
@@ -1769,6 +1790,13 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // `task_done` exactly as stage 3 left them.
             if child::nested_active() {
                 child::child_exit(code)
+            }
+            // Slice 3: a REAL fork child's exit is a task exit — status into
+            // the slot, its pipe references dropped, the wait4-parked parent
+            // woken, the threading slot terminated (never returns to the
+            // stub: `x86_finish_current` switches away for good).
+            else if child::is_real_task() {
+                child::task_exit_real(code)
             }
             // Stage 3: not a halt — the report and the next spawn (or the
             // final gate line) live in `task_done`. This arm never returns to
@@ -2894,12 +2922,14 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             0
         }
         ring3::nr::EXECVE => {
-            // No fork exists to return to, so in the run-to-completion model
-            // an exec from the nested child IS the handoff: ash's tail-call
-            // exec of the one command in `sh -c` (busybox skips the fork for
-            // a trailing simple command), and every program line the gates
-            // run reaches the kernel this way. Outside a nested child there
-            // is no task this kernel could replace — say ENOSYS.
+            // Slice 3: a REAL fork child (its own threading slot, published
+            // by `fork_process`) execs the way Linux does — its image is
+            // replaced, its fds survive, its thread keeps running. The M2
+            // nested-crossing arm below stays for the shell (the SPAWN
+            // crossing's tail-exec handoff).
+            if child::is_real_task() {
+                return child::exec_real_task(fr);
+            }
             if !child::nested_active() {
                 return e(ring3::err::ENOSYS);
             }

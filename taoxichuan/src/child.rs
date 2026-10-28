@@ -50,20 +50,43 @@ pub struct SpawnSlot {
     /// M2 (fork): WAIT4 reaped this child — a second wait on the pid is
     /// ECHILD, which is how a shell's job table closes the entry.
     pub reaped: bool,
+    /// Slice 3: the tid parked in WAIT4 for this child (`u32::MAX` = none).
+    /// The child's exit arm wakes it through the threading waker.
+    pub waiter: u32,
 }
 
 impl SpawnSlot {
     const fn new() -> Self {
-        Self { used: false, pid: 0, running: false, status: 0, out: Vec::new(), reaped: false }
+        Self {
+            used: false,
+            pid: 0,
+            running: false,
+            status: 0,
+            out: Vec::new(),
+            reaped: false,
+            waiter: u32::MAX,
+        }
     }
 }
 
-pub const NSLOTS: usize = 4;
+/// 12: the shell's own slot (0) plus eleven threading tids for real fork
+/// children — the crate claims tids from 1, and on this kernel the tid and
+/// the ring index are the SAME number by construction (`bind_child_task`
+/// stamps by tid; `switch_to`/`task()` index the same arrays).
+pub const NSLOTS: usize = 12;
 /// Stdout ceiling per child: after this, writes are dropped (the paws
 /// fallback truncates at 1 MiB too). The gate's output is two orders below.
 const OUT_CAP: usize = 1024 * 1024;
 
 static mut SLOTS: [SpawnSlot; NSLOTS] = [
+    SpawnSlot::new(),
+    SpawnSlot::new(),
+    SpawnSlot::new(),
+    SpawnSlot::new(),
+    SpawnSlot::new(),
+    SpawnSlot::new(),
+    SpawnSlot::new(),
+    SpawnSlot::new(),
     SpawnSlot::new(),
     SpawnSlot::new(),
     SpawnSlot::new(),
@@ -180,9 +203,20 @@ impl SlotCross {
 /// or boot) — the discipline that owns every static in this module; the
 /// table is indexed by `exec_twin::current_slot()` while a child runs and by
 /// the resuming arm's own `slot_idx` after the crossing returns.
-static mut SLOT_STATE: [SlotCross; NSLOTS] =
-    [SlotCross::new(), SlotCross::new(), SlotCross::new(), SlotCross::new()];
-
+static mut SLOT_STATE: [SlotCross; NSLOTS] = [
+    SlotCross::new(),
+    SlotCross::new(),
+    SlotCross::new(),
+    SlotCross::new(),
+    SlotCross::new(),
+    SlotCross::new(),
+    SlotCross::new(),
+    SlotCross::new(),
+    SlotCross::new(),
+    SlotCross::new(),
+    SlotCross::new(),
+    SlotCross::new(),
+];
 /// The crossing record of `slot`, for the syscall-path writers.
 ///
 /// SAFETY: as `slots`.
@@ -400,37 +434,178 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), 
     if tid >= bind.len() {
         return Err("taoxichuan: child tid outside the spawn ring");
     }
-    let slot_idx = {
+    // The tid IS this child's slot index (see NSLOTS). Stamp its SpawnSlot,
+    // give it its kernel+trap stacks (slice 2's leaked pairs, reused on
+    // recycle — `switch_to` points the syscall stub here), and copy the
+    // shell's task record into its own (`tid + 1`; 0 is sshd, 1 the shell):
+    // root from `fork_process`'s cloned address space, regions/brk/fds from
+    // the shell — the same snapshot the M2 arm makes, at bind time instead
+    // of fork time.
+    let slot_idx = tid;
+    {
         let s = slots();
-        let mut pick: Option<usize> = None;
-        for i in 0..NSLOTS {
-            if !s[i].used || s[i].reaped || !s[i].running {
-                pick = Some(i);
-                break;
-            }
-        }
-        let Some(idx) = pick else {
-            return Err("taoxichuan: spawn ring full");
-        };
-        s[idx] = SpawnSlot::new();
-        s[idx].used = true;
-        s[idx].running = true;
-        s[idx].pid = pid;
-        idx
-    };
+        s[slot_idx] = SpawnSlot::new();
+        s[slot_idx].used = true;
+        s[slot_idx].running = true;
+        s[slot_idx].pid = pid;
+    }
+    let _ = prepare_task_slot(slot_idx);
+    {
+        let t = crate::task();
+        let regions = t.regions;
+        let n_regions = t.n_regions;
+        let (brk_base, brk_cur, brk_end, mmap_cur) = (t.brk_base, t.brk_cur, t.brk_end, t.mmap_cur);
+        let fds = t.fd_names.clone();
+        let cloexec = t.fd_cloexec.clone();
+        let nonblock = t.fd_nonblock.clone();
+        let ct = &mut crate::task_slots()[slot_idx + 1];
+        ct.root_pa = root_pa;
+        ct.regions = regions;
+        ct.n_regions = n_regions;
+        ct.brk_base = brk_base;
+        ct.brk_cur = brk_cur;
+        ct.brk_end = brk_end;
+        ct.mmap_cur = mmap_cur;
+        ct.exit = None;
+        ct.fd_names = fds;
+        ct.fd_cloexec = cloexec;
+        ct.fd_nonblock = nonblock;
+    }
     bind[tid] = (tid, pid, root_pa);
-    let _ = slot_idx;
     Ok(())
 }
 
-/// The child root `bind_child_task` recorded for `tid` (0 = none) — the
-/// enter_user arm's CR3 source.
-pub(crate) fn bind_root_of(tid: usize) -> u64 {
-    if tid >= NSLOTS {
-        return 0;
+/// The kernel-stack top `switch_to` installs for `tid`: a real child's
+/// leaked pair (slice 2's `prepare_task_slot`), the shell's SPAWN crossing
+/// band (recorded at the crossing below), and anything else (the idle
+/// thread, out-of-range) — the current global, which for the idle task is
+/// simply left alone by the caller.
+pub(crate) fn sched_kstack_top(tid: usize) -> u64 {
+    if tid < NSLOTS {
+        // SAFETY: syscall-path discipline.
+        unsafe { core::ptr::read_volatile(&raw const SLOT_STATE[tid].kstack_top) }
+    } else {
+        ring3::syscall_stack_top()
+    }
+}
+
+/// The CR3 `switch_to` loads for `tid`: the task record's live root (exec
+/// updates it — a real child that exec'd must come back on the NEW image's
+/// root). 0 = leave CR3 alone (the idle thread runs on the kernel root).
+pub(crate) fn sched_task_slot_of(tid: usize) -> usize {
+    if tid == 0 { 1 } else { tid + 1 }
+}
+
+pub(crate) fn sched_root_of(tid: usize) -> u64 {
+    match tid {
+        0 => crate::task_slots()[1].root_pa, // the shell
+        t if t < NSLOTS => crate::task_slots()[t + 1].root_pa,
+        _ => 0,
+    }
+}
+
+/// A REAL fork child is on the CPU: a threading tid 1..NSLOTS whose
+/// SpawnSlot is stamped and running. The shell (tid 0, inside its SPAWN
+/// crossing) and the boot task are NOT — their exits keep the M2 paths.
+pub(crate) fn is_real_task() -> bool {
+    let cur = crate::exec_twin::current_slot();
+    if cur == crate::exec_twin::NO_SLOT || cur == 0 || cur >= NSLOTS {
+        return false;
     }
     // SAFETY: syscall-path discipline.
-    unsafe { core::ptr::read_volatile(&raw const CHILD_BIND[tid].2) }
+    let s = slots();
+    s[cur].used && s[cur].running
+}
+
+/// A real fork child's `exit_group`: status into the slot, the task's pipe
+/// references dropped (the sweep that turns the last writer close into the
+/// reader's EOF), the WAIT4-parked parent woken through the threading
+/// waker, then the threading slot terminated — `x86_finish_current` never
+/// returns (the dispatcher frame on this task's own band is abandoned, the
+/// same model `task_done` uses for the boot's tasks).
+pub fn task_exit_real(code: u64) -> ! {
+    let cur = crate::exec_twin::current_slot();
+    let waiter = {
+        // SAFETY: syscall-path discipline.
+        let s = slots();
+        s[cur].status = ((code & 0xFF) as u32) << 8;
+        s[cur].running = false;
+        s[cur].waiter
+    };
+    crate::pipes::release_open_fds();
+    if waiter != u32::MAX {
+        akuma_threading::get_waker_for_thread(waiter as usize).wake();
+    }
+    akuma_threading::x86_finish_current()
+}
+
+/// A real fork child's `execve`: replace the image in the child's OWN task
+/// record (`tid + 1`) and cross — the same load/snapshot/sweep the shell's
+/// `exec_replace` does, minus the crossing bookkeeping (a real child has no
+/// crossing to resume; its exit goes through [`task_exit_real`]). Never
+/// returns: `child_enter` loads the new root and sysrets.
+pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
+    let cur = crate::exec_twin::current_slot();
+    let args = match read_spawn_args(fr.arg1(), fr.arg2(), fr.arg3()) {
+        Ok(a) => a,
+        Err(no) => return crate::e(no),
+    };
+    let effective = crate::resolve_effective(&args.path);
+    let Ok(image) = crate::root_fs().read_file(&effective) else {
+        akuma_primitives::safe_print!(192, "[exec] '{}': read failed\n", effective);
+        return crate::e(crate::err::ENOENT);
+    };
+    if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
+        return crate::e(crate::err::ENOEXEC);
+    }
+    let argv: Vec<&str> = args.argv.iter().map(String::as_str).collect();
+    let env: Vec<&str> = args.env.iter().map(String::as_str).collect();
+    // POSIX exec keeps open fds across the image swap — snapshot, load,
+    // restore, sweep cloexec (the exec_replace discipline).
+    let saved = {
+        let t = crate::task();
+        (t.fd_names.clone(), t.fd_cloexec.clone(), t.fd_nonblock.clone())
+    };
+    let Some(ti) = crate::load_task(&argv, &env, &image) else {
+        return crate::e(crate::err::ENOMEM);
+    };
+    {
+        let t = crate::task();
+        t.fd_names = saved.0;
+        t.fd_cloexec = saved.1;
+        t.fd_nonblock = saved.2;
+        let mut table = crate::fd_table();
+        for (_fd, payload) in table.sweep_cloexec() {
+            if let crate::OpenFile::Socket(idx) = payload {
+                akuma_net::socket::remove_socket(idx);
+            } else if let crate::OpenFile::Pipe(id, w) = payload {
+                crate::pipes::release(id, w);
+            }
+        }
+    }
+    // The registered Process's shared root view goes stale with the old
+    // image — re-point it, as `exec_replace` does for the shell.
+    {
+        let pid = slots()[cur].pid;
+        if let Some(view) = akuma_mmu::UserAddressSpace::new_shared(ti.root_pa as usize) {
+            let _ = akuma_exec::process::table::with_process(pid, |p| {
+                p.address_space = akuma_exec::process::ProcAddressSpace::new(view);
+            });
+        }
+    }
+    let ef = ring3::EntryFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
+        rdx: 0, rsi: 0, rdi: 0, rax: 0,
+        rip: ti.entry,
+        rflags: 0x202,
+        rsp: ti.rsp,
+    };
+    // SAFETY: the crossing contract — `root` maps the new image plus the
+    // shared kernel half, `ef` is ring-3-enterable. A real child never runs
+    // `exit_cross`, so this crossing has no return side; the dead dispatcher
+    // frame on the task's own band is abandoned, bounded by exec counts.
+    let _ = unsafe { child_enter(ti.root_pa, &ef, save_ptr(cur)) };
+    unreachable!("exec_real_task: a real child's crossing returned")
 }
 
 /// The syscall-path capture `fork_process` step 6 consumes:
@@ -682,7 +857,8 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
         // the top is a few hundred bytes, and the stub's per-syscall frame is
         // 128 — so the two halves cannot meet.
         let half = (ring3::SYSCALL_STACK_SIZE / 2) as u64;
-        ring3::set_syscall_stack_top(c.parent_stack_top - half);
+        c.kstack_top = c.parent_stack_top - half;
+        ring3::set_syscall_stack_top(c.kstack_top);
         (c.parent_stack_top, save_ptr(slot_idx))
     };
 
@@ -1266,9 +1442,92 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
 /// model, since a child completes inside its own fork call, but answered
 /// honestly). `rusage` is accepted and ignored: the gate's callers pass
 /// NULL, and zero-filled accounting is what this box has always given.
-pub fn wait4_arm(pid: u64, status_va: u64, _options: u64, _rusage_va: u64) -> u64 {
+pub fn wait4_arm(pid: u64, status_va: u64, options: u64, _rusage_va: u64) -> u64 {
+    if REAL_FORK {
+        return wait4_real(pid, status_va, options);
+    }
+    let want_pid = pid as u32;    let any = pid == u64::MAX || want_pid == 0; // -1, or "my process group"
+    let mut found: Option<(u32, u32)> = None;
+    // SAFETY: syscall-path discipline.
+    let s = slots();
+    for sl in s.iter_mut() {
+        if !sl.used || sl.reaped || sl.running || (!any && sl.pid != want_pid) {
+            continue;
+        }
+        found = Some((sl.pid, sl.status));
+        sl.reaped = true;
+        break;
+    }
+    let Some((child, status)) = found else {
+        return crate::e(ring3::err::ECHILD);
+    };
+    if status_va != 0
+        && (!crate::user_ok(status_va, 4) || !crate::copy_to_user(status_va, &status.to_le_bytes()))
+    {
+        return crate::e(crate::err::EFAULT);
+    }
+    u64::from(child)
+}
+
+/// The REAL wait4 (slice 3): reap a dead child from the slot scan, or PARK
+/// the caller until one dies. The park is `schedule_blocking(u64::MAX)` —
+/// WAITING, then `x86_yield_now` hands the core to the next READY task (or
+/// the idle thread); the child's exit arm wakes the registered waiter
+/// through the threading waker, which makes this caller READY again, and
+/// the loop re-scans. WNOHANG answers 0 while the matched children still
+/// run. The boot task never parks (the bridge drives it through
+/// `waitpid_arm`); a WAIT4 that reaches it keeps the M2 scan.
+fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
     let want_pid = pid as u32;
     let any = pid == u64::MAX || want_pid == 0; // -1, or "my process group"
+    let wnohang = options & 1 != 0;
+    let my_tid = crate::exec_twin::current_slot();
+    if my_tid == crate::exec_twin::NO_SLOT || my_tid >= NSLOTS {
+        // Not a task that may park — answer without blocking.
+        return wait4_arm_blocking_scan(pid, status_va);
+    }
+    loop {
+        // SAFETY: syscall-path discipline.
+        let s = slots();
+        for sl in s.iter_mut() {
+            if !sl.used || sl.reaped || sl.running || (!any && sl.pid != want_pid) {
+                continue;
+            }
+            sl.waiter = u32::MAX;
+            sl.reaped = true;
+            let (child, status) = (sl.pid, sl.status);
+            if status_va != 0
+                && (!crate::user_ok(status_va, 4)
+                    || !crate::copy_to_user(status_va, &status.to_le_bytes()))
+            {
+                return crate::e(crate::err::EFAULT);
+            }
+            return u64::from(child);
+        }
+        let mut live = false;
+        for sl in s.iter_mut() {
+            if sl.used && !sl.reaped && sl.running && (any || sl.pid == want_pid) {
+                live = true;
+                sl.waiter = my_tid as u32;
+            }
+        }
+        if !live {
+            return crate::e(ring3::err::ECHILD);
+        }
+        if wnohang {
+            return 0;
+        }
+        akuma_threading::schedule_blocking(u64::MAX);
+        // Woken (or the deadline passthrough never fires at u64::MAX): the
+        // loop re-scans. Spurious wakes are fine — the scan decides.
+    }
+}
+
+/// The M2 body of [`wait4_arm`], kept for the boot task's non-blocking
+/// answer (the bridge's reaper never parks).
+fn wait4_arm_blocking_scan(pid: u64, status_va: u64) -> u64 {
+    let want_pid = pid as u32;
+    let any = pid == u64::MAX || want_pid == 0;
     let mut found: Option<(u32, u32)> = None;
     // SAFETY: syscall-path discipline.
     let s = slots();
