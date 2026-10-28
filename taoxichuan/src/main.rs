@@ -1720,12 +1720,24 @@ pub(crate) fn eventfd_can_read(idx: usize) -> bool {
 /// while the task still loops would indict answer DELIVERY, not the arms.
 /// Bounded: the first 12 write-syscall answers per boot regardless of value,
 /// then only zeros — the first 12 zeros, then every 65536th zero.
-fn wtrace(nr: u64, fd: u64, a3: u64, ans: u64) {
+fn wtrace(nr: u64, fd: u64, a3: u64, iov_va: u64, ans: u64) {
     use core::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
     static Z: AtomicU32 = AtomicU32::new(0);
     if crate::exec_twin::current_slot() == crate::exec_twin::NO_SLOT {
         return; // the boot task's writes are the probe banner, not the case
+    }
+    // The iovec lens, read PRE-call: rem in musl's __stdio_write is exactly
+    // their sum — the loop needs a 0 answer to a rem>0 writev.
+    let (mut l0, mut l1) = (0xFFFF_FFFFu64, 0xFFFF_FFFFu64);
+    if a3 >= 1 && a3 <= 2 {
+        let mut iv = [0u8; 16];
+        if copy_from_user(&mut iv, iov_va) {
+            l0 = u64::from_le_bytes(iv[8..16].try_into().unwrap());
+            if a3 == 2 && copy_from_user(&mut iv, iov_va + 16) {
+                l1 = u64::from_le_bytes(iv[8..16].try_into().unwrap());
+            }
+        }
     }
     let n = N.fetch_add(1, Ordering::Relaxed);
     let zero = if ans == 0 {
@@ -1733,35 +1745,33 @@ fn wtrace(nr: u64, fd: u64, a3: u64, ans: u64) {
     } else {
         0
     };
-    let kind = fd_table().with(fd as u32, |d| match d {
-        OpenFile::Socket(_) => b'S',
-        OpenFile::File { .. } => b'F',
-        OpenFile::Dir { .. } => b'D',
-        OpenFile::ChildOut(_) => b'C',
-        OpenFile::Pipe(..) => b'P',
-        OpenFile::Null => b'0',
-        OpenFile::EventFd(_) => b'E',
-        OpenFile::Session => b'M',
-    });
-    let kind = kind.unwrap_or(b'-');
     if n < 12 || (ans == 0 && (zero <= 12 || zero.is_multiple_of(65536))) {
         akuma_primitives::safe_print!(
             96,
-            "[tmp] wv nr={} fd={} a3={} kind={} ans={}\n",
+            "[tmp] wv nr={} fd={} a3={} l0={:#x} l1={:#x} br={} dlen={} ans={:#x}\n",
             nr,
             fd,
             a3,
-            u64::from(kind),
+            l0,
+            l1,
+            WBR.load(Ordering::Relaxed),
+            WLEN.load(Ordering::Relaxed),
             ans
         );
     }
 }
 
+/// The WRITEV arm's own branch marker (boot pg-2): which `Some(_)`/fallback
+/// produced the answer, and the gathered length. 0 = not this syscall.
+pub(crate) static WBR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub(crate) static WLEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
-    let (nr, fd, a3) = (fr.rax, fr.arg1(), fr.arg3());
+    let (nr, fd, a3, iov_va) = (fr.rax, fr.arg1(), fr.arg3(), fr.arg2());
+    WBR.store(0, core::sync::atomic::Ordering::Relaxed);
     let ans = dispatch_inner(fr);
     if nr == ring3::nr::WRITE || nr == ring3::nr::WRITEV {
-        wtrace(nr, fd, a3, ans);
+        wtrace(nr, fd, a3, iov_va, ans);
     }
     ans
 }
@@ -1892,9 +1902,14 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
                 _ => 0,
             });
+            WLEN.store(data.len() as u64, core::sync::atomic::Ordering::Relaxed);
             match kind {
-                Some(5) => return crate::pipes::write_arm_gathered(pipe_id as u32, &data),
+                Some(5) => {
+                    WBR.store(5, core::sync::atomic::Ordering::Relaxed);
+                    return crate::pipes::write_arm_gathered(pipe_id as u32, &data);
+                }
                 Some(1) => {
+                    WBR.store(1, core::sync::atomic::Ordering::Relaxed);
                     let Some(idx) = sock::fd_socket(fd) else {
                         return e(ring3::err::EBADF);
                     };
@@ -1903,12 +1918,19 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                         Err(err) => err,
                     };
                 }
-                Some(2) => return writev_file_arm(fd, &data),
-                Some(3) => return total, // /dev/null: gone, but accepted
+                Some(2) => {
+                    WBR.store(2, core::sync::atomic::Ordering::Relaxed);
+                    return writev_file_arm(fd, &data);
+                }
+                Some(3) => {
+                    WBR.store(3, core::sync::atomic::Ordering::Relaxed);
+                    return total; // /dev/null: gone, but accepted
+                }
                 // Linux's writev on an eventfd writes only the first 8
                 // bytes of the gather; libcurl's wakeup write(2) never
                 // comes through writev, but the number must not EBADF.
                 Some(4) => {
+                    WBR.store(4, core::sync::atomic::Ordering::Relaxed);
                     let mut b = [0u8; 8];
                     let n = data.len().min(8);
                     b[..n].copy_from_slice(&data[..n]);
@@ -1917,11 +1939,16 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 _ => {}
             }
             if fd != 1 && fd != 2 {
+                WBR.store(10, core::sync::atomic::Ordering::Relaxed);
                 return e(ring3::err::EBADF);
             }            // The pipe branch of `write` applies per iovec: musl flushes a
             // buffered stdout as one writev, and a nested child's version
             // string belongs to the ssh session, not the console.
             let piped = child::nested_active() && fd == 1;
+            WBR.store(
+                if piped { 12 } else { 11 },
+                core::sync::atomic::Ordering::Relaxed,
+            );
             let mut total = 0u64;
             for i in 0..iovcnt {
                 let mut iv = [0u8; 16];
