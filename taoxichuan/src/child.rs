@@ -475,7 +475,7 @@ pub(crate) fn capture_user_context(fr: &ring3::SyscallFrame) {
 /// by the twin's task record, and a second owner would double-free it (the
 /// exact bug amd64's 5b slice 4 note records for its own slice-1 shape).
 fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u64, tid: usize) {
-    let Ok(space) = akuma_mmu::UserAddressSpace::new_shared(root_pa as usize) else {
+    let Some(space) = akuma_mmu::UserAddressSpace::new_shared(root_pa as usize) else {
         akuma_primitives::safe_print!(128, "[spawn] root view for the process table failed\n");
         return;
     };
@@ -520,7 +520,7 @@ fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u
         spawner_pid: None,
         ctty: core::sync::atomic::AtomicU32::new(0),
         terminal_state: alloc::sync::Arc::new(spinning_top::Spinlock::new(
-            akuma_exec::process::terminal::TerminalState::default(),
+            akuma_tty::TerminalState::default(),
         )),
         box_id: 0,
         creds: alloc::sync::Arc::new(akuma_exec::process::SharedCreds::new(
@@ -544,7 +544,7 @@ fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u
         last_syscall: core::sync::atomic::AtomicU64::new(0),
         syscall_stats: akuma_exec::process::ProcessSyscallStats::new(),
     };
-    akuma_exec::process::register_process(pid, Box::new(proc));
+    akuma_exec::process::register_process(pid, alloc::boxed::Box::new(proc));
     // tid ↔ pid: `current_process_shared()`'s first lookup. tid is this ring
     // slot — the same number `current_slot()` answers from the crossing on.
     akuma_exec::process::thread_pid_map_insert(tid, pid);
@@ -553,7 +553,7 @@ fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u
 /// The NEW fork arm: `fork_process` over the registered shell. The child
 /// does NOT run here — the crate publishes it as a runnable thread and this
 /// arm returns the pid to the caller, exactly like Linux.
-fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
+fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
     // Fork lives only inside the spawned shell, the blocking arm's own rule:
     // the boot task has no registered Process, and a fork inside a fork
     // child has no stack region left.

@@ -384,7 +384,9 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
         rflags: 0x202,
         rsp: ctx.sp,
     };
-    akuma_ring3_amd64::enter_user(&ef)
+    // SAFETY: ring3's contract — an enterable ring-3 state, kernel IF clear,
+    // CR3 already the child's. `enter_user` is `!`: the child lives in ring 3.
+    unsafe { akuma_ring3_amd64::enter_user(&ef) }
 }
 
 fn exec_config() -> ExecConfig {

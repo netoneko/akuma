@@ -110,6 +110,8 @@ akuma-isolation = { path = "../crates/akuma-isolation" }
 akuma-mmu = { path = "../crates/akuma-mmu" }
 # The Process fields' lock type (amd64 and akuma-exec both build on it).
 spinning_top = "0.3"
+# TerminalState (the Process field's line-discipline cell) lives here.
+akuma-tty = { path = "../crates/akuma-tty" }
 # Stage 8 M4 session pb: the exec/threading ladder pulled for the preemption
 # foundation (linkage proved; the exec_runtime twin lands next session), and
 # the LAPIC timer face extracted from amd64/src/lapic.rs so both kernels share
