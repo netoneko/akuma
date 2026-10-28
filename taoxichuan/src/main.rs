@@ -1713,7 +1713,60 @@ fn eventfd_close_slot(idx: usize) {
 pub(crate) fn eventfd_can_read(idx: usize) -> bool {
     eventfds()[idx].as_ref().is_some_and(|ef| ef.can_read())
 }
+/// [tmp] trace (session pg, remove with the fix): the write-path evidence for
+/// the exec'd shell's writev spin. Sits at the dispatch RETURN point, so it
+/// names the answer the kernel COMPUTED — the loop case is exactly repeated
+/// zeros (the disassembly fact, PLAN-pg §1 F1), and a nonzero answer repeating
+/// while the task still loops would indict answer DELIVERY, not the arms.
+/// Bounded: the first 12 write-syscall answers per boot regardless of value,
+/// then only zeros — the first 12 zeros, then every 65536th zero.
+fn wtrace(nr: u64, fd: u64, a3: u64, ans: u64) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static Z: AtomicU32 = AtomicU32::new(0);
+    if crate::exec_twin::current_slot() == crate::exec_twin::NO_SLOT {
+        return; // the boot task's writes are the probe banner, not the case
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let zero = if ans == 0 {
+        Z.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        0
+    };
+    let kind = fd_table().with(fd as u32, |d| match d {
+        OpenFile::Socket(_) => b'S',
+        OpenFile::File { .. } => b'F',
+        OpenFile::Dir { .. } => b'D',
+        OpenFile::ChildOut(_) => b'C',
+        OpenFile::Pipe(..) => b'P',
+        OpenFile::Null => b'0',
+        OpenFile::EventFd(_) => b'E',
+        OpenFile::Session => b'M',
+    });
+    let kind = kind.unwrap_or(b'-');
+    if n < 12 || (ans == 0 && (zero <= 12 || zero.is_multiple_of(65536))) {
+        akuma_primitives::safe_print!(
+            96,
+            "[tmp] wv nr={} fd={} a3={} kind={} ans={}\n",
+            nr,
+            fd,
+            a3,
+            u64::from(kind),
+            ans
+        );
+    }
+}
+
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
+    let (nr, fd, a3) = (fr.rax, fr.arg1(), fr.arg3());
+    let ans = dispatch_inner(fr);
+    if nr == ring3::nr::WRITE || nr == ring3::nr::WRITEV {
+        wtrace(nr, fd, a3, ans);
+    }
+    ans
+}
+
+fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     // M4 slice 3: the per-syscall capture `fork_process` step 6 consumes
     // (`get_saved_user_context` → the twin's `read_user_context`). The boot
     // task has no slot and skips; a slotted task pays one struct copy.

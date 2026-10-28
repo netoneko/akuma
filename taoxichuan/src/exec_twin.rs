@@ -112,10 +112,10 @@ pub fn uptime_us() -> u64 {
 /// the crate saves its context.
 fn switch_to(from: usize, to: usize) {
     let _ = from;
-    // [tmp] trace (remove before final): every park-point switch, with the
-    // syscall-band top the stub will arm for the incoming task.
+    // (session pg: the per-switch `[tmp] sw to=` print lived here — at
+    // preemption scale it rotated the console log every ~30 s and ate the
+    // gate verdicts; removed before the first gate boot per PLAN-pg §5.)
     let top = crate::child::sched_kstack_top(to);
-    akuma_primitives::safe_print!(96, "[tmp] sw to={} top={:#x}\n", to, top);
     akuma_ring3_amd64::set_syscall_stack_top(top);
     // Session pf preemption: the incoming task's own ring-3 trap stack — a
     // preempting switch leaves the interrupted frame on the interrupted task's
@@ -471,12 +471,8 @@ fn twin_bind_child_task(
 /// parent's TLS pointer in hardware, fork semantics.
 fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     let cur = crate::exec_twin::current_slot();
-    akuma_primitives::safe_print!(
-        96,
-        "[tmp] enter tid={} rip={:#x}\n",
-        cur as u64,
-        ctx.pc
-    );
+    // (session pg: `[tmp] enter` print removed with the sw-to print — same
+    // pre-gate-boot readability pass, PLAN-pg §5.)
     // The task record (not the bind table) is the root's authority — a real
     // child that has exec'd must enter on the NEW image's root.
     if cur != crate::exec_twin::NO_SLOT && cur < crate::child::NSLOTS + 1 {
