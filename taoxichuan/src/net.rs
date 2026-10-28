@@ -352,11 +352,14 @@ pub fn netpoll() {
 pub fn net_init() -> bool {
     akuma_primitives::safe_print!(96, "  net: [1] calibrate begin\n");
     calibrate();
+    // Session pf (pf-5 died silently right here): raw, unbudgeted progress.
+    crate::raw_uart(b"[raw] tsc calibrated\n");
     akuma_primitives::safe_print!(96, "  net: [2] stack init begin\n");
     if akuma_net::init(runtime(), true).is_err() {
         akuma_comconsole::puts("  net: stack init failed -- no virtio-net device\n");
         return false;
     }
+    crate::raw_uart(b"[raw] stack up, dhcp loop\n");
     akuma_comconsole::puts("  net: smoltcp stack up, DHCP requested\n");
     let deadline = uptime_us() + 10_000_000; // 10 s
     while uptime_us() < deadline {

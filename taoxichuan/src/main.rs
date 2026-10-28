@@ -396,14 +396,14 @@ fn timer_trap(t: &mut Trap<'_>) {
         );
     }
     // M4 slice 3 preemption (session pf, plan §5): a tick that interrupted
-    // ring 3 may switch — the same `x86_yield` the park loop and the idle lap
-    // already run, on this handler's own (per-slot, `arm_trap_stack`) trap
-    // stack; the interrupted frame survives the stack switch, and `on_tick`
-    // has already EOI'd, so the LAPIC can deliver the next tick to whichever
-    // task runs after this returns. Nothing else is READY ⇒ a documented
-    // no-op. Kernel paths run IF-masked, so ring 0 is never switched here: a
-    // ring-0 tick lands only in the idle window, which self-yields.
-    if t.from_ring3() {
+    // ring 3 may switch — DISABLED pending the pf-5 boot death (silent VM
+    // exit right after "net: [1] calibrate begin", before any ring 3 or any
+    // switch: nothing written here runs pre-ring-3, so the active suspect is
+    // the from_ring3+x86_yield pair itself). Kept: the per-slot trap stacks
+    // and the WRITEV pipe arm (inert pre-ring-3); this gate returns to the
+    // build the moment the death is named or the remaining deltas are
+    // cleared.
+    if false && t.from_ring3() {
         akuma_threading::x86_yield();
     }
 }
@@ -3901,13 +3901,40 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
     halt();
 }
 
+/// Session pf: straight at the UART, no budget, no allocator — the panic
+/// path's first words, so a panicking kernel can never die silent again
+/// (pf-5's VM exit printed nothing).
+pub(crate) fn raw_uart(bytes: &[u8]) {
+    for &b in bytes {
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") 0x3f8u16, in("al") b, options(nostack, preserves_flags));
+        }
+    }
+}
+
+fn raw_dec(mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    raw_uart(&buf[i..]);
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    raw_uart(b"\n[PANIC] ");
     if let Some(loc) = info.location() {
-        akuma_primitives::safe_print!(192, "PANIC {}:{}\n", loc.file(), loc.line());
-    } else {
-        akuma_primitives::safe_print!(64, "PANIC <no location>\n");
+        raw_uart(loc.file().as_bytes());
+        raw_uart(b":");
+        raw_dec(loc.line() as u64);
     }
+    raw_uart(b"\n");
     akuma_primitives::safe_print!(256, "       {}\n", info.message());
     halt();
 }
