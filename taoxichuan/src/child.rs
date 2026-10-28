@@ -655,6 +655,12 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
 #[cfg(target_arch = "x86_64")]
 unsafe fn exec_return(save: &ExecSave, status: u32) -> ! {
     unsafe {
+        // Explicit register bindings for every callee-saved restore, for the
+        // reason `child_exit` spells out: an `in(reg)` input may be allocated
+        // to a register the template itself overwrites. Here the loads read
+        // the snapshot through `rdi` (bound explicitly), the callee-saveds
+        // are PLACED as the restore, and `rax` carries the status the `ret`
+        // hands back to `spawn_arm`.
         core::arch::asm!(
             "mov rbx, [rdi + 0x08]",
             "mov rbp, [rdi + 0x10]",
@@ -663,10 +669,9 @@ unsafe fn exec_return(save: &ExecSave, status: u32) -> ! {
             "mov r14, [rdi + 0x28]",
             "mov r15, [rdi + 0x30]",
             "mov rsp, [rdi + 0x00]",
-            "mov eax, {st:e}",
             "ret",
             in("rdi") save,
-            st = in(reg) u64::from(status),
+            in("rax") u64::from(status),
             options(noreturn),
         )
     }
@@ -772,27 +777,32 @@ pub fn child_exit(code: u64) -> ! {
     // pushed. After the `cr3` load this code is running in the parent's
     // address space — both map the kernel half, so the registers land before
     // the jump matters.
+    //
+    // The callee-saved restores are **explicit register bindings**
+    // (`in("rbx")` …), not `mov` statements fed by `in(reg)` inputs: an
+    // `in(reg)` input may be allocated to ANY register — boot 2 caught LLVM
+    // handing the `r13` input the physical `rbx`, which the template's own
+    // `mov rbx, …` destroyed first, so `r13` came back holding the parent's
+    // saved `rbx` (a user address) and the resumed frame faulted on its
+    // first `(%r13)` load. With the binding form the value IS in the named
+    // register before the block runs — the placement is the restore — and
+    // LLVM must keep the free inputs (`root`, `sp`) out of the bound ones.
+    // `rax` carries the exit status the same way: it is what the `ret`
+    // returns into the resuming arm.
     unsafe {
         core::arch::asm!(
             "mov cr3, {root}",
-            "mov rbx, {bx}",
-            "mov rbp, {bp}",
-            "mov r12, {r12}",
-            "mov r13, {r13}",
-            "mov r14, {r14}",
-            "mov r15, {r15}",
             "mov rsp, {sp}",
-            "mov eax, {code:e}",
             "ret",
             root = in(reg) parent_root,
-            bx = in(reg) save.rbx,
-            bp = in(reg) save.rbp,
-            r12 = in(reg) save.r12,
-            r13 = in(reg) save.r13,
-            r14 = in(reg) save.r14,
-            r15 = in(reg) save.r15,
             sp = in(reg) ret_rsp,
-            code = in(reg) u64::from(status),
+            in("rax") u64::from(status),
+            in("rbx") save.rbx,
+            in("rbp") save.rbp,
+            in("r12") save.r12,
+            in("r13") save.r13,
+            in("r14") save.r14,
+            in("r15") save.r15,
             options(noreturn),
         )
     }
