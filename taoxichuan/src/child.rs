@@ -874,6 +874,9 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     // The sched_* maps key on this: the shell's threading tid is its spawn
     // slot, and which slot that is varies across a boot's login spawns.
     crate::exec_twin::set_shell_tid(slot_idx);
+    // Timer preemption arms here (session pf): the first SPAWN crossing is
+    // the first moment a ring-3 tick has a legitimate switch target.
+    crate::PREEMPT_ARMED.store(true, core::sync::atomic::Ordering::Release);
 
     // Snapshot the parent and point the crossing machinery at the child —
     // into the child's own per-slot record now (slice 2): the parent's CR3,

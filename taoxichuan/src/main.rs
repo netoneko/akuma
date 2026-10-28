@@ -211,6 +211,14 @@ pub(crate) fn arm_trap_stack(slot: usize) {
     }
 }
 static mut TSS: akuma_gdt::Tss = akuma_gdt::Tss::new();
+
+/// Timer-preemption era flag (session pf, plan §5): set at the first SPAWN
+/// crossing — the tick switch runs only once user tasks exist. The pf-6
+/// bisect showed the switch killing pre-ring-3 boots deterministically, in a
+/// window with no legal switch target; before the first spawn there is
+/// nothing to preempt and the tick must not switch at all.
+pub(crate) static PREEMPT_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 static mut GDT: [u64; akuma_gdt::SLOTS] = [0; akuma_gdt::SLOTS];
 
 /// Build the GDT and TSS, load both. One core; the entries are byte-identical
@@ -403,10 +411,15 @@ fn timer_trap(t: &mut Trap<'_>) {
     // task runs after this returns. Nothing else is READY ⇒ a documented
     // no-op. Kernel paths run IF-masked, so ring 0 is never switched here: a
     // ring-0 tick lands only in the idle window, which self-yields.
-    // (Bisect note: boot 065ba70e = this gate off + everything else in ⇒
-    // BOOT OK 49 s; pf-5's death at "calibrate begin" either rides this gate
-    // or was a flake — the boot that follows this commit decides.)
-    if t.from_ring3() {
+    //
+    // **The user-era gate** (pf-6 bisect): pf-5/pf-6 died INSIDE net
+    // calibrate — pre-ring-3, pre-first-wd, deterministically with this gate
+    // live and never with it out — a window where no legal switch target
+    // exists. So the switch arms with the FIRST SPAWN crossing
+    // (`PREEMPT_ARMED`, set in `spawn_arm`): before it the machine is
+    // kernel-only and the tick behaves exactly like the boots that worked;
+    // after it, ring 3 exists and preemption is the point.
+    if t.from_ring3() && PREEMPT_ARMED.load(core::sync::atomic::Ordering::Acquire) {
         akuma_threading::x86_yield();
     }
 }
