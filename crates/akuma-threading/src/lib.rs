@@ -7808,6 +7808,20 @@ mod thread_contexts_invariant_tests {
     const RANGE_START: usize = 50;
     const RANGE_END: usize = 64; // exclusive; MAX_THREADS == 64
 
+    /// Canary slot for the context-stamp tests. No real switch runs in a host
+    /// test, so any writable `Context` field works: `x19` (the aarch64
+    /// callee-saved stamp) where that arch's wide `Context` exists, `rsp` on
+    /// x86_64 whose `Context` is `{magic, rsp}`. Arch-selected so the host
+    /// suite compiles on both (the 2026-10-28 pe session found the suite
+    /// x86_64-broken since the Context split).
+    #[cfg(test)]
+    fn stamp_slot(idx: usize) -> *mut u64 {
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::ptr::addr_of_mut!((*get_context_mut(idx)).x19) }
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::ptr::addr_of_mut!((*get_context_mut(idx)).rsp) }
+    }
+
     #[test]
     fn claim_free_slot_never_double_claims_under_contention() {
         const N_THREADS: usize = 8;
@@ -7832,10 +7846,10 @@ mod thread_contexts_invariant_tests {
                     // clobberer, then check our stamp is still intact.
                     let marker = (idx as u64) << 32 | t as u64;
                     unsafe {
-                        (*get_context_mut(idx)).x19 = marker;
+                        *stamp_slot(idx) = marker;
                     }
                     thread::yield_now();
-                    let seen = unsafe { (*get_context(idx)).x19 };
+                    let seen = unsafe { *stamp_slot(idx) };
                     if seen != marker {
                         mismatches.fetch_add(1, Ordering::SeqCst);
                     }
@@ -7877,7 +7891,7 @@ mod thread_contexts_invariant_tests {
                     let mut spins = 0u32;
                     loop {
                         if get_thread_state(idx) == thread_state::READY {
-                            let val = unsafe { (*get_context(idx)).x19 };
+                            let val = unsafe { *stamp_slot(idx) };
                             if val != marker {
                                 mismatch.store(1, Ordering::SeqCst);
                             }
@@ -7891,7 +7905,7 @@ mod thread_contexts_invariant_tests {
             };
 
             unsafe {
-                (*get_context_mut(idx)).x19 = marker;
+                *stamp_slot(idx) = marker;
             }
             mark_thread_ready(idx);
 
