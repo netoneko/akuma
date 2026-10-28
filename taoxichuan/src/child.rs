@@ -297,6 +297,23 @@ pub fn child_write(buf_va: u64, len: u64) -> bool {
     }
     // SAFETY: syscall-path discipline.
     let out_slot = unsafe { cross_mut(cur).out_slot };
+    // [tmp] trace (session pg): the first 3 fd-1 landings — which buffer do
+    // the child's writes actually take, and how full is it?
+    {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 3 {
+            let blen = unsafe { slots()[out_slot].out.len() } as u64;
+            akuma_primitives::safe_print!(
+                96,
+                "[tmp] cw cur={} out={} len={} buf={}\n",
+                cur as u64,
+                out_slot as u64,
+                len,
+                blen
+            );
+        }
+    }
     let mut chunk = [0u8; 512];
     let mut done = 0u64;
     while done < len {
@@ -485,16 +502,8 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), 
         ct.fd_nonblock = nonblock;
     }
     bind[tid] = (tid, pid, root_pa);
-    // Session pg (the gates' stdout bytes never reached the client): a REAL
-    // fork child's fd 1 writes must land in the buffer the bridge drains —
-    // the shell's `out_slot`, not this record's `CrossSave::new()` default
-    // (0 = a slot buffer nobody reads; `child_write` then silently dropped
-    // `cat`'s bytes at OUT_CAP and answered success). The blocking arm's own
-    // rule (`fork_arm_blocking`: `c.out_slot = cross_mut(cur).out_slot`,
-    // "a fork child's fd 1 writes land in the buffer sshd drains — never its
-    // own slot"). The bind runs inside the shell's fork syscall, so
-    // `current_slot()` is the shell here; its depth+1 is the grandchild
-    // gate's stamp (fork_arm_real: 1 = the shell, 2 = a fork child).
+    // [tmp] trace (session pg): the bind-time cross stamp — is the out_slot
+    // copy actually taken, and from whom?
     let shell = crate::exec_twin::current_slot();
     if shell != crate::exec_twin::NO_SLOT && shell < NSLOTS && tid < NSLOTS {
         // SAFETY: syscall-path discipline (the fork syscall, IF clear).
@@ -506,6 +515,14 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), 
         let c = unsafe { cross_mut(tid) };
         c.out_slot = out;
         c.depth = depth + 1;
+        akuma_primitives::safe_print!(
+            96,
+            "[tmp] bind tid={} shell={} out={} depth={}\n",
+            tid as u64,
+            shell as u64,
+            out as u64,
+            depth as u64 + 1
+        );
     }
     Ok(())
 }
@@ -1674,6 +1691,21 @@ pub fn read_child_out(slot_idx: usize, buf_va: u64, len: u64) -> u64 {
         return crate::e(crate::err::EBADF);
     };
     let n = (len as usize).min(slot.out.len());
+    // [tmp] trace (session pg): the first 3 drains — what does the bridge
+    // actually see in the buffer it polls?
+    {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 3 {
+            akuma_primitives::safe_print!(
+                96,
+                "[tmp] rco slot={} ask={} avail={}\n",
+                slot_idx as u64,
+                len,
+                slot.out.len() as u64
+            );
+        }
+    }
     if n == 0 {
         return 0; // drained: EOF, the same thing a real pipe reports
     }
