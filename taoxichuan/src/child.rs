@@ -385,8 +385,7 @@ fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs
 /// commit's default), `true` routes plain `fork` (57/58) through
 /// `fork_process` over the registered shell Process. `clone`/`vfork` keep
 /// the blocking arm on both settings — out of scope this slice.
-pub const REAL_FORK: bool = false;
-
+pub const REAL_FORK: bool = true;
 /// `fork_process`'s `bind_child_task` records: (tid, pid, root) — the twin's
 /// spawn-row. Indexed by tid; `root == 0` = free. SAFETY: syscall-path
 /// discipline (single core, IF clear), the rule that owns every static here.
