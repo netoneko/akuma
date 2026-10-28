@@ -181,7 +181,36 @@ const TRAP_STACK_SIZE: usize = 16 * 1024;
 #[repr(align(16))]
 struct TrapStack(#[allow(dead_code)] [u8; TRAP_STACK_SIZE]);
 
-static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);static mut TSS: akuma_gdt::Tss = akuma_gdt::Tss::new();
+static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);
+
+/// Per-slot ring-3 trap stacks (session pf preemption, plan §5): a ring-3 trap
+/// switches to the TSS `rsp0`, so a preempting timer switch must leave the
+/// interrupted frame on a stack the next ring-3 trap cannot clobber — one per
+/// slot. Indexed by the same numbers `switch_to` sees: shell slots `0..NSLOTS`,
+/// `NSLOTS` = the idle thread. `gdt_init` arms the global `TRAP_STACK` first
+/// (it serves every task's ring-3 traps until its first switch arms its own,
+/// and by then all other ring-3 tasks own their private stacks).
+static mut TRAP_STACKS: [TrapStack; crate::child::NSLOTS + 1] =
+    [const { TrapStack([0; TRAP_STACK_SIZE]) }; crate::child::NSLOTS + 1];
+
+/// Arm the ring-3 trap stack for slot `slot` — called from
+/// `exec_twin::switch_to`, the X86ArchHooks body, so the field travels with
+/// the task the way amd64's hook set travels it ("the ring-3 trap stack in
+/// the TSS"). Out-of-range slots keep whatever is armed.
+pub(crate) fn arm_trap_stack(slot: usize) {
+    if slot >= crate::child::NSLOTS + 1 {
+        return;
+    }
+    // SAFETY: single core, IF clear on every caller path (switch_to runs at a
+    // park/preemption point with interrupts masked); the statics are only
+    // touched through raw pointers, never references.
+    unsafe {
+        let top = (&raw const TRAP_STACKS[slot] as *const u8)
+            .add(TRAP_STACK_SIZE) as u64;
+        (*&raw mut TSS).set_rsp0(top);
+    }
+}
+static mut TSS: akuma_gdt::Tss = akuma_gdt::Tss::new();
 static mut GDT: [u64; akuma_gdt::SLOTS] = [0; akuma_gdt::SLOTS];
 
 /// Build the GDT and TSS, load both. One core; the entries are byte-identical
@@ -341,6 +370,9 @@ fn timer_trap(t: &mut Trap<'_>) {
     // The count is the twin's uptime clock (exec_twin::uptime_us); the trap
     // itself needs nothing back — a tick returns to the same instruction. The
     // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
+    // The count is the twin's uptime clock (exec_twin::uptime_us); the trap
+    // itself needs nothing back — a tick returns to the same instruction. The
+    // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
     let n = akuma_lapic_amd64::on_tick();
     // [tmp] trace (remove before final, session pf): every 256th tick (~2.6 s)
     // name the machine's scheduling state. Boot pf-2 answered "the shell
@@ -362,6 +394,17 @@ fn timer_trap(t: &mut Trap<'_>) {
             s.running as u64,
             s.waiting as u64
         );
+    }
+    // M4 slice 3 preemption (session pf, plan §5): a tick that interrupted
+    // ring 3 may switch — the same `x86_yield` the park loop and the idle lap
+    // already run, on this handler's own (per-slot, `arm_trap_stack`) trap
+    // stack; the interrupted frame survives the stack switch, and `on_tick`
+    // has already EOI'd, so the LAPIC can deliver the next tick to whichever
+    // task runs after this returns. Nothing else is READY ⇒ a documented
+    // no-op. Kernel paths run IF-masked, so ring 0 is never switched here: a
+    // ring-0 tick lands only in the idle window, which self-yields.
+    if t.from_ring3() {
+        akuma_threading::x86_yield();
     }
 }
 
@@ -1747,6 +1790,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
             }
             let mut efd_idx: usize = usize::MAX;
+            let mut pipe_id: usize = usize::MAX;
             let kind = fd_table().with(fd as u32, |d| match d {
                 OpenFile::Socket(_) => 1,
                 OpenFile::File { .. } => 2,
@@ -1755,9 +1799,20 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     efd_idx = *slot;
                     4
                 }
+                // M4 slice 3 (session pf, plan §5): the pipe arm writev fell
+                // through to the nested-child/console fallback — the WRITE arm
+                // has routed bound pipe fds since 6879eb47, WRITEV forgot the
+                // kind, and a pipeline member's stdio flush then bypassed the
+                // fix-B arms entirely (the pf-3 wedge: musl __stdio_write's
+                // writev retry loop on an answer that never drains).
+                OpenFile::Pipe(id, true) => {
+                    pipe_id = *id as usize;
+                    5
+                }
                 _ => 0,
             });
             match kind {
+                Some(5) => return crate::pipes::write_arm_gathered(pipe_id as u32, &data),
                 Some(1) => {
                     let Some(idx) = sock::fd_socket(fd) else {
                         return e(ring3::err::EBADF);

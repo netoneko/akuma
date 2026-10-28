@@ -187,6 +187,16 @@ pub fn write_arm(id: u32, buf_va: u64, len: u64) -> u64 {
     if !crate::copy_from_user(&mut data, buf_va) {
         return crate::e(ring3::err::EFAULT);
     }
+    write_arm_gathered(id, &data)
+}
+
+/// The writev flavour: the gather already happened in the syscall arm (musl's
+/// stdio flush arrives as one writev whose iovecs are one message), so this is
+/// `write_arm`'s park/EAGAIN/SIGPIPE contract over a kernel-side buffer. M4
+/// slice 3 (session pf): the WRITEV syscall arm now routes bound pipe fds here
+/// — it used to fall through to the nested-child/console fallback and never
+/// reached these arms at all.
+pub fn write_arm_gathered(id: u32, data: &[u8]) -> u64 {
     let mut done: usize = 0;
     loop {
         let (out, wakes) = table().write(id, &data[done..]);

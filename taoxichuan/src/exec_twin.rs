@@ -117,6 +117,10 @@ fn switch_to(from: usize, to: usize) {
     let top = crate::child::sched_kstack_top(to);
     akuma_primitives::safe_print!(96, "[tmp] sw to={} top={:#x}\n", to, top);
     akuma_ring3_amd64::set_syscall_stack_top(top);
+    // Session pf preemption: the incoming task's own ring-3 trap stack — a
+    // preempting switch leaves the interrupted frame on the interrupted task's
+    // stack, so the next ring-3 trap on any task must not land there.
+    crate::arm_trap_stack(to);
     let root = crate::child::sched_root_of(to);
     if root != 0 {
         // SAFETY: `root` is a PMM-resident page-table frame naming the
