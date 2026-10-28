@@ -32,9 +32,10 @@ The crates are in `crates/`; `ls crates/` and read each candidate crate's README
 | 5 | something in the archive says preempting a task that is inside a syscall is unsafe on this design | search the archive; report what it says and where |
 
 ## Rules
+- **Write early, append often.** Your 5-hour request quota can stop you without warning: the first attempt at this job hit it after 37 tool calls and left no file, so everything it had read was lost. After the premise checks, write `PLAN-kimi.md` with the premise rows and all the section headings, and update it after every batch of reads, even if a section only says what you know so far. Hard cap: 35 tool calls in total; at call 25 stop reading and finish the document with what you have.
 - **Read anything, run host-side cargo.** The whole repo is yours to read, including `amd64/src/` and every crate under `crates/`. Plan from what the crates really do: run their host tests and checks in this worktree (`cargo test -p <crate> --target $(rustc -vV | sed -n 's/host: //p')`, `cargo check -p <crate>`, `cargo doc -p <crate> --no-deps`) wherever it shows you an API or a behaviour you would otherwise be guessing at. Builds go to this worktree's own `target/`; that is fine. Say in the plan what you ran and what it showed.
 - **Write** exactly one file, `PLAN-kimi.md`, at the worktree root. No other source edits, no `git commit` / `push` / `reset`, no ssh, and do not touch the ryzen box (goose-glm is using it). Do not run any other agent.
-- Your quota is counted in requests: **batch several tool calls in one turn**, cap every read (`sed -n 'a,bp'`, `grep -n -m 20`), do not re-read a file you have read, and keep each cargo run to the crate you are asking about. Aim for about 60 tool calls in total.
+- Your quota is counted in requests: **batch several tool calls in one turn**, cap every read (`sed -n 'a,bp'`, `grep -n -m 20`), do not re-read a file you have read, and keep each cargo run to the crate you are asking about. Keep to the 35-call cap above.
 - Compose, do not invent: look in `crates/` and `docs/` first. A plan that says "write a new scheduler" without showing why no crate fits is the wrong plan.
 - If a doc contradicts this brief, the doc wins; say so in the plan.
 - When `PLAN-kimi.md` is complete, end your turn. Do not wait for anything.
