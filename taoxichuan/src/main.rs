@@ -419,7 +419,19 @@ fn timer_trap(t: &mut Trap<'_>) {
     // (`PREEMPT_ARMED`, set in `spawn_arm`): before it the machine is
     // kernel-only and the tick behaves exactly like the boots that worked;
     // after it, ring 3 exists and preemption is the point.
-    if t.from_ring3() && PREEMPT_ARMED.load(core::sync::atomic::Ordering::Acquire) {
+    //
+    // **The slotted-current gate** (pf-7's panic, named by the raw print):
+    // `akuma-threading:3652 THREAD_STATES[cur]` with cur = usize::MAX — after
+    // an exec'd shell's exit tears its slot down, a ring-3 tick can fire with
+    // NO_SLOT current; the crate's switch engine indexes by current tid, so a
+    // tick with no live slot must not switch (the same `may_park` discipline
+    // the pipe arms and `wait4_real` keep).
+    let slot = crate::exec_twin::current_slot();
+    if t.from_ring3()
+        && slot != crate::exec_twin::NO_SLOT
+        && slot < crate::child::NSLOTS
+        && PREEMPT_ARMED.load(core::sync::atomic::Ordering::Acquire)
+    {
         akuma_threading::x86_yield();
     }
 }
