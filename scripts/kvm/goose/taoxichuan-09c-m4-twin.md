@@ -7,7 +7,7 @@ Every shell command starts with `export TERM=dumb HOME=/root GIT_PAGER=cat; . /e
 
 ## The key fact
 Session pb gave the kernel a tick and linked `akuma-exec`/`akuma-threading`; nothing registers them or switches tasks. **The plan is `docs/archive/TAOXICHUAN_M4_SCHED_LITE_PLAN.md`: read §§ 1, 3 and 5 (slices 1 and 2) in full - it is your spec.**
-Owner's decisions stand: the kernel gets PREEMPTION (a later slice, 4) and the design is SMP-READY (slice 5): no `static` "current task" anywhere new - go through `current_slot()`/`set_current_slot()` stubs shaped as `fn()`.
+User's decisions stand: the kernel gets PREEMPTION (a later slice, 4) and the design is SMP-READY (slice 5): no `static` "current task" anywhere new - go through `current_slot()`/`set_current_slot()` stubs shaped as `fn()`.
 This session = plan slice 1 (twin runtime: register `ThreadRuntime`, `ThreadConfig`, `ProcessHooks`, `X86ArchHooks`, `ExecRuntime` per the § 1 tables; `uptime_us` = ticks x 10 ms; pipe hooks real - M3's `pipes.rs` table exists) and slice 2
 (per-slot kernel+trap stacks via `prepare_task_slot`, `write/read_user_context`; the crossing statics `RET_RSP`/`SAVE_*`/`SPAWN_OUT_SLOT`/`PARENT_*` and `NESTED_SLOT`/`NESTED_DEPTH` in `taoxichuan/src/child.rs` become per-slot state looked up through `current_slot()`).
 **Behaviour must not change: the M2 blocking fork and M3 pipes still ship underneath.** `fork_process`, `wait4` over channels, and any switch are slice 3 (next session). The T-Y bug 3 lesson (stack-band arithmetic, `SYSCALL_STACK` 64 KiB, depth-2 exec band) is

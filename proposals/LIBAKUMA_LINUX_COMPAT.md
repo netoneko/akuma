@@ -1,6 +1,6 @@
 # libakuma on plain Linux syscalls (idea, parked 2026-10-26)
 
-**Status: an idea that came out of the Taoxichuan experiment. Not scheduled.** The owner's call: it is the right thing to do on its own merits, but it is not on the path to the ladder, which wants real `git` (a preparation for later stages). Goose is left to find its own way to stage 8's git gate; revisit this if that stalls.
+**Status: an idea that came out of the Taoxichuan experiment. Not scheduled.** The user's call: it is the right thing to do on its own merits, but it is not on the path to the ladder, which wants real `git` (a preparation for later stages). Goose is left to find its own way to stage 8's git gate; revisit this if that stalls.
 
 ## Why it came up
 `userspace/scratch` (7,011 lines, a minimal git client over Smart HTTP, `libakuma` + `libakuma-tls` + `embedded-tls`) is a candidate for stage 8's `git clone` gate that would not need the process model: no fork, no `Command`, no OpenSSL, no dynamic loader.
@@ -22,7 +22,7 @@ Under `cfg(target_arch = "x86_64")` in `userspace/libakuma/src/lib.rs`:
 Keep the AArch64 path byte-identical (the Akuma-private calls stay there). A bigger version of the same idea is the one `libakuma` already hints at: grow `crates/akuma-syscalls-abi` to cover the 65 calls it uses.
 
 ## Why it is parked and not deleted
-- Real `git` is wanted for what follows (the owner said cargo does not need it for registry fetches, but a working `git` is a better preparation than a 7k-line client that only clones).
+- Real `git` is wanted for what follows (the user said cargo does not need it for registry fetches, but a working `git` is a better preparation than a 7k-line client that only clones).
 - It is not kernel work and it is the right thing to do anyway, so it stays small enough to do on its own later: roughly 80 lines of `libakuma` and two boots, or a short goose session.
 - Gate it with the zero-argument run first, then `scratch clone` from the mirror.
 

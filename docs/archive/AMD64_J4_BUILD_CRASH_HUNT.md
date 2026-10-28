@@ -147,7 +147,7 @@ compares against ryzen only after one of these:
 * **(recommended)** get `2d073ca0` into the audio branch — a merge of
   `origin/even-more-cats` (it adds `2d073ca0` and `0e331f5`; `sched.rs` differs
   only by that fix) — then build and install that on the box (`kinstall`, keep
-  `.good`). Committing it is the owner's call; nothing here does it. Then the
+  `.good`). Committing it is the user's call; nothing here does it. Then the
   box and ryzen differ only by the audio code, **or**
 * build `0e331f5` itself on the trashcan and boot *that*, **or**
 * run ryzen's rig on `97fd2d10` (change the clone's branch in `stage1.sh`; ryzen

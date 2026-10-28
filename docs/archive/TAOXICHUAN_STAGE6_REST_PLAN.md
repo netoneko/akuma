@@ -9,7 +9,7 @@ This plan covers exactly that; it supersedes the milestone rows M4–M6 of
 recipe (§7 there) and the process-model analysis (§5 there). Nothing here is verified until
 its mini-gate runs; unverified statements are marked (U#) and settled in §6.
 
-## 0. Leaf-crate survey first (the owner's rule)
+## 0. Leaf-crate survey first (the user's rule)
 
 `diff` of `akuma-*` dependencies: `amd64/Cargo.toml` lists **76**, `taoxichuan/Cargo.toml`
 lists **18** (`akuma-alloc amd64 boot-amd64 comconsole cpu ext2 fdtable gdt idt-amd64 net

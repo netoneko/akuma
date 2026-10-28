@@ -26,7 +26,7 @@ complains about the clock (a CMOS checksum error that waits for F1) after Akuma 
 * **The laptop** (`scripts/kvm/dev_cycle.py`) ships source in, starts and polls goose sessions, brings goose's commits back
   **as a ref only** (nothing is merged or pushed for it), and performs the clean reboot test: Akuma → Pop → Akuma, reading the CMOS
   on Pop and `dmesg` on Akuma on the way.
-* **The owner** decides what is merged. goose commits stay on `cmos-fix` inside Akuma until the owner pulls them with
+* **The user** decides what is merged. goose commits stay on `cmos-fix` inside Akuma until the user pulls them with
   `dev_cycle.py collect cmos-fix`.
 
 ## 2. Guest kernels: `/dev/kvm0`, not Firecracker
@@ -66,7 +66,7 @@ PASS for a guest boot is `AKUMA-GUEST-UP`, `ebce43017d2cb316ea45e08374de7315  /b
  8  dev_cycle.py status cmos   ◀─────────   (goose stops)
  9  dev_cycle.py reboot-test   ── clean reboot ──▶ Pop ── arm.sh 29 ──▶ Akuma    report → out/
 10  dev_cycle.py ask cmos report.txt        resumes the same session, reads the report, iterates or finishes
-11  dev_cycle.py collect cmos-fix           refs/akuma/cmos-fix for the owner to review
+11  dev_cycle.py collect cmos-fix           refs/akuma/cmos-fix for the user to review
 ```
 
 Commands (all from the repo root; output lands in `scripts/kvm/dev_cycle_out/`, git-ignored):
@@ -101,7 +101,7 @@ sockets beyond ssh.)
   systemd-boot + GRUB entry), and Akuma answers ssh about 30-60 s later. The laptop does this; goose never reboots.
 * **Pop never answering is a result, not a timeout to retry.** If the firmware stops at the CMOS error and waits for F1, Pop never
   comes up and a human must press F1. `reboot-test` reports exactly that and stops; do not loop it.
-* Never `pkill` by name (the owner's other VMs); kill by pid. Never pipe a long-running command into `grep -q`; send output to a file and poll.
+* Never `pkill` by name (the user's other VMs); kill by pid. Never pipe a long-running command into `grep -q`; send output to a file and poll.
 * Process listings: `ps` on Akuma shows threads as `{name}` rows; `kill -9 <pid>` the process row.
 * A leaked `goose`/`claude` after an ssh drop keeps running (hangup is not delivered): check `status` before starting another.
 
@@ -120,7 +120,7 @@ sockets beyond ssh.)
    `dmesg` lines for clock/cmos/rtc/exception/`[KVM]`.
 6. Verdict: PASS only if Pop returned, the CMOS checksum agrees, Akuma came back, and `dmesg` has no `EXCEPTION`/`panic`.
 
-**Acceptance for the CMOS task** (owner's rule, 2026-10-23): a clean reboot plus inspecting `dmesg` is enough to call the RTC
+**Acceptance for the CMOS task** (user's rule, 2026-10-23): a clean reboot plus inspecting `dmesg` is enough to call the RTC
 problem fixed, *unless the agent finds another cause besides the suspects below* — in which case it reports that too, with
 evidence, before anything is called fixed. A before/after CMOS dump from `dev_cycle.py cmos` (taken on Pop) is the objective
 evidence; run it once before the first Akuma test to know the starting state.
@@ -128,9 +128,9 @@ evidence; run it once before the first Akuma test to know the starting state.
 ## 6. The first task: the CMOS corruption (`scripts/kvm/goose/01-cmos.md`)
 
 **Symptom.** After Akuma runs, the next boot stops in firmware on a clock/CMOS error ("press F1 to proceed"); Linux then complains
-about the clock as well. The owner's guess: a reboot interrupts a write to the chip.
+about the clock as well. The user's guess: a reboot interrupts a write to the chip.
 
-**Suspects, owner's:**
+**Suspects, user's:**
 
 1. `write_rtc_from_sntp` (`amd64/src/clock.rs` → `akuma_cmos_rtc::write`, SNTP time written back to the RTC the way Linux's
    `sync_cmos_clock` does). It sets SET (status B bit 7), writes the date/time registers and the century (0x32), clears SET. A reset in
@@ -172,7 +172,7 @@ log) or into a byte the firmware does not cover; make the reset path write 0x0F 
 | 21:53 IDT | `reboot-test` (VMs stopped first) | **PASS.** Pop returned, CMOS classic checksum `OK` (`sum=05e8 stored=05e8`), regA=26 regB=02 regD=80 diag=02, 0x7F=0x59 (the old kernel's last guest exit), Akuma back on the fixed kernel, `dmesg` clean. (The first invocation lost its ssh to the dying box and crashed in the script; `--resume` carried on. Whether the firmware showed an F1 prompt on that reboot is not recorded.) |
 | 21:55 IDT | `reboot-test --keep-vms` (guests running at the reset) | **PASS, and the discriminating one.** The old kernel leaves 0x57/0x58 in 0x7F when reset during a guest run; 0x7F stayed 0x59, so the fixed kernel did not write it. CMOS checksum `OK`, Pop back, Akuma back, `clock: synced via SNTP` with no CMOS write line, no exceptions. |
 
-*Not proven:* that the firmware's own F1 complaint is gone for good (it is the owner's to confirm at the next cold boot, and a stored
+*Not proven:* that the firmware's own F1 complaint is gone for good (it is the user's to confirm at the next cold boot, and a stored
 checksum the firmware already distrusts may need one visit to its setup screen to be rewritten); a weak CMOS battery would look the same.
 goose's own note: after the one recovery the source of the corruption is gone.
 

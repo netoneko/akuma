@@ -4,7 +4,7 @@
 
 **Oversight note (2026-10-24):** the host track and goose supervision moved from
 Kimi to Claude Sonnet 5 after Kimi ran out of tokens (a bad subscription setting
-on the owner's side). The metal track is still goose + GLM.
+on the user's side). The metal track is still goose + GLM.
 
 Prepared as part of rust.org.il talk prep
 ([`RUST_ORG_IL_TALK.md`](RUST_ORG_IL_TALK.md)) — the talk's composability

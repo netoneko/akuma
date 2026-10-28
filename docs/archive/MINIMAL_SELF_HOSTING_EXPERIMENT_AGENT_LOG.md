@@ -8,7 +8,7 @@ The minimal kernel being composed is named **Taoxichuan**.
 
 **Oversight change (2026-10-24, afternoon).** The host track and the babysitting
 of goose-glm were first run by Kimi (Crush, `k3-256k`). Kimi ran out of tokens
-because of a bad subscription setting on the owner's side — not a model failure.
+because of a bad subscription setting on the user's side — not a model failure.
 Oversight moved to **Claude Sonnet 5 (Claude Code)**, which takes over the host
 track and supervises goose. The metal track is unchanged: still goose + GLM on
 the ryzen. The tracks below still say "Kimi/Crush" for what was done before the
@@ -16,8 +16,8 @@ handover; entries after it are marked *(Sonnet)*. Note for the open-weights
 claim: the host track is no longer open-weights from this point; the metal
 track still is.
 
-**Owner's note (2026-10-24, evening): the tooling was badly configured, and the owner is
-frustrated about it.** The owner says that is their own fault. Recorded here because it
+**User's note (2026-10-24, evening): the tooling was badly configured, and the user is
+frustrated about it.** The user says that is their own fault. Recorded here because it
 cost real tokens and time on both tracks and is easy to mistake for a model failure.
 Facts, as found *(Sonnet)*:
 
@@ -39,12 +39,12 @@ Facts, as found *(Sonnet)*:
   an ACP server on `127.0.0.1:3285`, secured with a key kept in `~/.akuma/goose/acp_secret_key`),
   and Sonnet watches both and takes over if Kimi's quota runs out.
 
-**Owner's note on the banner (2026-10-24, evening).** The owner was not a fan of goose-glm's
-skyline art (`511f4fdb`; the words stay, the owner approved those). They went to other
+**User's note on the banner (2026-10-24, evening).** The user was not a fan of goose-glm's
+skyline art (`511f4fdb`; the words stay, the user approved those). They went to other
 models for a redraw and report **deep disappointment with Mistral** and **mild disappointment
 with Gemini**. The new banner was made by Gemini; after many failed attempts to get Gemini
-to adjust it, the owner gave up and adjusted it by hand, and committed the result
-(`419fb968`, "better banner for taoxi kernel"). Recorded as the owner's opinion of those
+to adjust it, the user gave up and adjusted it by hand, and committed the result
+(`419fb968`, "better banner for taoxi kernel"). Recorded as the user's opinion of those
 models on this art task, outside the two tracks of the experiment; it says nothing about
 either model's coding.
 
@@ -53,7 +53,7 @@ Sonnet supervises again** *(Sonnet)*. Kimi's two supervisor stints, for the reco
 
 - *Crush, `k3-256k`, ~16:00-16:57:* took 26% of its 5-hour quota in about 23 minutes, hung on empty
   turns, and spent turns debugging a key that the Sonnet smoke test had swapped (see the tooling note).
-  Closed by the owner.
+  Closed by the user.
 - *goose, `k3-256k` low effort, session `20261024_3`, 17:04-~18:25:* **how far it got.** It merged
   goose-glm's finished stage 1 (`bd59f4aa`), ran the aarch64 check of the merged tree (build 662,792 B,
   Firecracker boot, zero faults, `--no-disk` control; `9418bdf1`, PASS), wrote and pushed the stage 2 brief
@@ -62,25 +62,25 @@ Sonnet supervises again** *(Sonnet)*. Kimi's two supervisor stints, for the reco
 - **Failure modes.** (1) It ended its turn right after sending stage 2 ("I'll validate when the turn ends"),
   twice, which stops the loop because nothing re-prompts a turn-based agent; fixed by moving the waiting
   into `scripts/kvm/goose/supervise-loop.sh`, which prompts it only when goose-glm's driver exits. (2) The
-  owner's instruction to send the next stage to goose-glm *before* validating the last one (so goose is
+  user's instruction to send the next stage to goose-glm *before* validating the last one (so goose is
   never idle) arrived after stage 2 had already gone out, so it was never exercised. (3) Quota ran out
-  (reported by the owner, ~18:23) before the stage-2 close; our logs show no 429 because Kimi was not
-  prompted again. The loop was stopped so it would not burn a prompt on the error. The owner, annoyed by
+  (reported by the user, ~18:23) before the stage-2 close; our logs show no 429 because Kimi was not
+  prompted again. The loop was stopped so it would not burn a prompt on the error. The user, annoyed by
   the run of failures, then **unsubscribed from Kimi**; Kimi does not come back in this experiment, and
   Sonnet is the supervisor from here (the host track is no longer open-weights from this point, as
   already noted for the first handover).
-- **The pull side is unreliable, and the owner knows:** Kimi learns what goose did by polling a log file and
+- **The pull side is unreliable, and the user knows:** Kimi learns what goose did by polling a log file and
   reading `RESULT.md` over ssh; a machine-readable status per stage, a detached driver launcher and a
   proper wait/notify channel between the two agents are the fix, to be done later.
 - **State at handover:** stage 1 passes on both tracks. Stage 2 is running on goose-glm (branch
   `taoxichuan-s2`, `92e9572b` pushed: the `akuma-ring3-amd64` crate; ~480 lines of uncommitted
   composition in `taoxichuan/src/main.rs` on the box; 11.7M input / 107k output tokens in the first
-  hour on `glm-5.3-flash`, and the owner reads the z.ai quota meter as clearly cheaper than the
+  hour on `glm-5.3-flash`, and the user reads the z.ai quota meter as clearly cheaper than the
   `glm-5.3` stage-1 run). Sonnet closes stage 2 when the driver exits: read `RESULT.md`, send the stage 3
   brief first, then the aarch64 check (plus `cargo check -p` of the new crate on the Mac: its
   `naked_asm!` is not `cfg`-gated for x86_64).
 
-Working rules carried over from the owner's last Crush session (the "wisdom"):
+Working rules carried over from the user's last Crush session (the "wisdom"):
 
 1. Every stage is a **separate goose prompt** (new ACP session); help it when
    stuck, but let it finish with KVM verification.
@@ -121,7 +121,7 @@ findings, recorded here, not averaged away.
 
 ## Recurring bug classes (to be traced through the docs)
 
-**"The fd table's answer is special-cased to the three stdio fds" - the fd nonsense.** Owner's note, 2026-10-25: this class has
+**"The fd table's answer is special-cased to the three stdio fds" - the fd nonsense.** User's note, 2026-10-25: this class has
 resurfaced at least 4-5 times across the kernels, always looking like something else (a network hang, an `ar` failure, a pipe
 that never closes, a tty that is not one). The stage 7B instance: the Taoxichuan guest's `writev` served fds 1 and 2 only and
 answered `EBADF` for every other fd; musl stdio flushes through `writev`, so busybox `wget`'s HTTP request never left, stdio kept
@@ -143,7 +143,7 @@ Earlier occurrences found so far (seeds, not yet audited; follow each link, then
 instrumenting the stack, list the syscall arms that take an fd (`read`, `write`, `readv`, `writev`, `fstat`, `fcntl`, `ioctl`,
 `lseek`, `poll`) and check each for a `_ => EBADF`/stdio-only fall-through. Proper follow-up (not done): one audit pass over every
 fd-taking arm in `taoxichuan/src/main.rs` against `akuma-fdtable`'s vocabulary, so the kernel has one answer per fd kind; and the
-whole-docs trace the owner asked for (every mention, one table).
+whole-docs trace the user asked for (every mention, one table).
 
 ## Stage log
 
@@ -300,13 +300,13 @@ pushed before it stopped).
 - After the merge the aarch64 `build_taoxichuan_fc.sh` image still builds (662,792 B).
 - Raw logs for the stage-1 entries: [`TAOXICHUAN_STAGE1_LOGS/`](TAOXICHUAN_STAGE1_LOGS/).
 
-#### Owner approval of the banner, and the next goose prompt (Sonnet, 2026-10-24)
+#### User approval of the banner, and the next goose prompt (Sonnet, 2026-10-24)
 
-- **Owner approval:** on seeing goose's Taoxichuan banner and boot text, the owner:
+- **User approval:** on seeing goose's Taoxichuan banner and boot text, the user:
   "yeah that's a nice vibe it got going there". The words stay. Direction for the art:
   keep the text, improve the ASCII picture into an old-timey Chinese skyline as it was
   for the emperor's kilns in Jingdezhen (JDZ). The banner meaning ("the kiln-fire
-  market") and the first UTF-8 art were goose's own invention; the owner's approval is
+  market") and the first UTF-8 art were goose's own invention; the user's approval is
   of the tone, not of a translation.
 - **Next prompt:** `scripts/kvm/goose/taoxichuan-01b-finish.md` - merge the supervisor's
   fixes, redraw the banner (ASCII only, <= 78 columns, kiln skyline, words unchanged,
@@ -452,7 +452,7 @@ that session's step 4 for stage 1, run after goose-glm's 01b finish landed on `l
     section above). Flash at low effort costs roughly a tenth of the input tokens
     of the `glm-5.3` run for a paperwork-sized task.
 - **Tooling note:** the duplicate 01b send (the `send_after_reset.py` leftover, see
-  the owner's note) ran to completion with no harm — its re-verification section is
+  the user's note) ran to completion with no harm — its re-verification section is
   its output. The supervisor now sends only when no `goose_acp_prompt` driver is
   alive.
 
@@ -464,7 +464,7 @@ static musl hello runs, exit 0, output matches the host-built binary), brief
 
 *2026-10-24 ~18:50 IDT, Sonnet (Kimi was gone; see Oversight change #2).* Merged `litter/taoxichuan-s2` @
 `9a948c78` into `rust-org-il-experiment` (`ed1de19d`, clean) while goose-glm was already working on stage 3
-(the next brief goes out before the aarch64 check, per the owner's ordering).
+(the next brief goes out before the aarch64 check, per the user's ordering).
 
 - **Finding 1, fixed: the aarch64 kernel build broke.** goose added `crates/akuma-ring3-amd64` to the
   workspace `default-members`, so `scripts/build_taoxichuan_fc.sh` (a plain `cargo build` at the root)
@@ -495,9 +495,9 @@ static musl hello runs, exit 0, output matches the host-built binary), brief
 - **goose-glm cost for stage 2** (`sessions.db`, session `20261024_26`, `glm-5.3-flash`, low effort): 85.9 min
   wall, 169 calls, 19,015,708 input tokens (18,828,800 cache reads), 127,408 output, largest context 179,941.
   That is more tokens than stage 1 (16.1M input, `glm-5.3`, which hit the 5-hour limit at 77 min) and it
-  did not hit the limit: the owner reads the z.ai quota meter as clearly cheaper per token on flash.
+  did not hit the limit: the user reads the z.ai quota meter as clearly cheaper per token on flash.
   Stage 2 start to finish took about 90 min, ~30 of them reading before the first edit.
-- **Stage 3 started 18:48 IDT** (`taoxichuan-03-busybox.md`, narrowed by the owner to non-interactive
+- **Stage 3 started 18:48 IDT** (`taoxichuan-03-busybox.md`, narrowed by the user to non-interactive
   `busybox echo` and `busybox ls`; no ash, no pty).
 
 ### Stage 2 — metal track (goose-glm)
@@ -597,8 +597,8 @@ the binary and the reference output.
 
 ### Stage 3 — host track (Sonnet), aarch64 / Firecracker in Lima `fc` — PASS; metal track at the gate, paperwork pending
 
-*2026-10-24 ~20:00 IDT, Sonnet.* Gate narrowed by the owner: non-interactive `busybox echo` and `busybox ls`, no `ash`, no pty
-(brief `scripts/kvm/goose/taoxichuan-03-busybox.md`, sent 18:48 before the stage-2 aarch64 check, per the owner's ordering).
+*2026-10-24 ~20:00 IDT, Sonnet.* Gate narrowed by the user: non-interactive `busybox echo` and `busybox ls`, no `ash`, no pty
+(brief `scripts/kvm/goose/taoxichuan-03-busybox.md`, sent 18:48 before the stage-2 aarch64 check, per the user's ordering).
 
 - **Merge:** `litter/taoxichuan-s3` @ `6c4602b7` into `rust-org-il-experiment` (`e67714f6`), clean.
 - **goose's cfg gating is complete:** `cargo test -p akuma-ring3-amd64` on the Mac host (aarch64-apple-darwin): 8 passed.
@@ -623,9 +623,9 @@ the binary and the reference output.
   own cleanup) and prepared `scripts/kvm/goose/taoxichuan-03b-finish.md` (the `01b` pattern), to be sent after the reset.
 - **Cost, stage 3 so far** (`sessions.db`, session `20261024_28`, `glm-5.3-flash` low): 66.3 min, 169 calls, 17,566,605 input
   tokens (17,392,000 cache reads), 96,131 output, largest context 167,308. The window's stages together (stage 1 finish x2,
-  stage 2, stage 3) are about 38M input tokens; the owner read the z.ai meter at 90% at ~19:46 IDT, so the window is
+  stage 2, stage 3) are about 38M input tokens; the user read the z.ai meter at 90% at ~19:46 IDT, so the window is
   roughly 40M input tokens at flash weight (an estimate from one data point).
-- **Also this stage:** the owner asked that every brief tell goose to commit and push every 20 minutes when something is
+- **Also this stage:** the user asked that every brief tell goose to commit and push every 20 minutes when something is
   uncommitted (stage 3 sat uncommitted ~45 min), and to gate all amd64-specific code; both are in the 3b brief.
 - **Update 22:05 IDT (Sonnet):** goose's 03b run (sent 21:44 after the 21:39 reset, driver exit 0, `end_turn`, ~19 min) added
   only `RESULT.md` and the log section below (`3b930292`, docs only; no `taoxichuan/`, `crates/` or `Cargo.toml` change since
@@ -710,15 +710,15 @@ does not have to rediscover it. Times are IDT; the box's own clock and `/var/log
   `fs: ext2 root mounted on /dev/vda`, then the log goes silent (no banner, no init spawn); `vm-dev`
   `last_exit=1`. This is the lead handed to the continuation brief.
 - 23:30:22 supervisor sent ACP `session/cancel` (connection and session ids are in the head of the driver log);
-  HTTP 202, turn ended `stopReason: cancelled` at 23:30:49 and the driver exited 0. Owner's call: 72% of the
+  HTTP 202, turn ended `stopReason: cancelled` at 23:30:49 and the driver exited 0. User's call: 72% of the
   window was spent and the remaining quota was better used on one named failure.
 - 23:30-23:33 supervisor: restored `vm-serve-mc` and disabled `vm-dev`, committed goose's uncommitted files on the
-  box as `e418fd61` (owner authorised it; no push), stopped and started `goose-glm` (new pid), wrote and sent
+  box as `e418fd61` (user authorised it; no push), stopped and started `goose-glm` (new pid), wrote and sent
   `taoxichuan-04b-continue.md` (about 25-30 min of work; commit and push every 10 min; PARTIAL result if not
   done).
 
 **Quota, measured from `sessions.db` (`scripts/kvm/goose_box_stats.py`, run through ssh as base64).** The
-window is about 41M input tokens (stage 4 plus 03b were 27.57M at 23:25 = 67%, the owner read 69%). Stage 4's burn
+window is about 41M input tokens (stage 4 plus 03b were 27.57M at 23:25 = 67%, the user read 69%). Stage 4's burn
 rate rose as its context grew: 6.9M in the first 35 min, 13.3M at 49 min (16M/h, context 190k), 26.4M at 80 min
 (+13.1M in 32 min = 25M/h, about 60% of a window per hour, context 220k). An earlier "5% an hour" estimate was
 wrong: it averaged over the cheap 03b run and idle time. Lesson: a long stage's cost per hour is dominated by
@@ -743,13 +743,13 @@ the context it re-reads on every call, so a window lasts about 2 h of stage-4-si
 - **The aarch64 path cannot reach goose's stage-4 code.** The aarch64 "Taoxichuan" kernel is the full Akuma
   kernel behind a feature; its Firecracker boot is green (662,792 B, 134 lines, 0 faults, sshd started; `--no-disk`
   control 80 lines) but an ssh attempt through the Lima tap (`guest-setup.sh` run, port 4444) did not connect
-  within the owner's patience, and it would have exercised the full kernel's sshd, not `net.rs`/`child.rs`.
+  within the user's patience, and it would have exercised the full kernel's sshd, not `net.rs`/`child.rs`.
   Left as is; the real test is the amd64 guest.
 
 **Side effects the next supervisor should know.** (1) To back up goose's work I ran `git add -N taoxichuan crates` on
 the box, which marked new files intent-to-add in the index (contents unchanged). Backups are in the supervisor's
 scratchpad, not in the repo. (2) `guest-setup.sh` created `tap0`, NAT and the 4444 forward inside the Lima VM `fc`.
-(3) Merged `litter/taoxichuan-s4` into `rust-org-il-experiment` locally (`78bdaf10`) mid-stage at the owner's request.
+(3) Merged `litter/taoxichuan-s4` into `rust-org-il-experiment` locally (`78bdaf10`) mid-stage at the user's request.
 
 ### Stage 4 — host track (Sonnet), aarch64 / Firecracker in Lima `fc` — PASS; metal track PASS (goose-glm, 04b)
 
@@ -767,7 +767,7 @@ the brief's lead was wrong and goose said so; (2) the real kernel bug: `mmap` de
 (`31b934fa`, `29d4b562`); (3) the gate recipe's `ssh -T` is OpenSSH syntax and the box has only the akuma client
 (`/bin/ssh -p 2224 root@localhost '<cmd>'`). Boot markers in `net_init` were left in (16 bytes).
 
-**Supervisor verification.** (a) From the Mac, a plain `ssh -p 2224 root@192.168.1.159 '<cmd>'` with the owner's key
+**Supervisor verification.** (a) From the Mac, a plain `ssh -p 2224 root@192.168.1.159 '<cmd>'` with the user's key
 succeeded on the first attempt after `herd start vm-dev`, so the relay is reachable from the LAN, not only
 from the box. (b) aarch64: merged `litter/taoxichuan-s4` as `16f79ff9`; the Taoxichuan-feature kernel is still **662,792 B**;
 `cargo test -p akuma-ring3-amd64` 8 passed; Firecracker boot with the disk is 132 console lines, 0
@@ -778,7 +778,7 @@ contain stage 4's `net.rs`/`child.rs`, so this shows no regression, not that sta
 **Open items found while using the guest (not gate failures).** `ls /bin` over ssh prints "ls: cannot access
 /bin" (stat/getdents on that path); the console prints `[sc] unhandled nr 4415` repeatedly (an unimplemented
 syscall number nobody has identified); `uname` answers `Akuma 0.1.0 Akuma-OS x86_64` for `-a` and plain `Akuma`
-for `-r` and `-m` (hardcoded in sshd/paws, per the owner; not a kernel matter); sshd tolerates `unhandled nr 258` (`set_robust_list`) and `nr 5`. Goose's stage-6 list: outbound
+for `-r` and `-m` (hardcoded in sshd/paws, per the user; not a kernel matter); sshd tolerates `unhandled nr 258` (`set_robust_list`) and `nr 5`. Goose's stage-6 list: outbound
 relay (`vm_outbound`) and DNS, `writev`/`readlink` class arms, a wall clock (`utc_seconds` is `None`), untested 1 MiB
 mmap/brk slabs.
 
@@ -788,7 +788,7 @@ tokens) was about 76% spent at the end. The restart paid for itself: a fresh 59k
 220k-context session per call. The `goose serve` idle spin did not reappear in this ~20-minute session
 (`GOOSE_SERVE_IDLE_SPIN.md`).
 
-**State left on the box.** `vm-dev` is running at the owner's request so they can ssh in (`vm-serve-mc` halted); restore with
+**State left on the box.** `vm-dev` is running at the user's request so they can ssh in (`vm-serve-mc` halted); restore with
 `herd stop vm-dev; herd disable vm-dev; herd start vm-serve-mc`. The next stage needs a quota refill (reset ~02:39 IDT) and a stage-5
 brief; none is written.
 
@@ -800,7 +800,7 @@ via `vm_outbound = true` and a host-local HTTP mirror, the clock from `epoch=` o
 M0-M7, 2-3 sessions. Supervisor concern recorded: the plan's host reference ran `apk.static` on the Akuma box itself, so a
 bug could be shared by reference and subject; the supervisor computes the reference on the Mac with plain `tar`.
 
-**Staging (supervisor).** Because the quota left (~20%) would be lost at the 02:44 reset, the owner asked for a no-network
+**Staging (supervisor).** Because the quota left (~20%) would be lost at the 02:44 reset, the user asked for a no-network
 variant: `/boot/akuma-dev-root-apk.img` = the stage-4 root (16 MiB, fsck-clean, 2,053 blocks free after) plus
 `/bin/apk.static` (apk-tools-static 3.0.8-r0, **static-PIE**, 5,470,888 B), `/pkgs/ca-certificates-bundle-20261020-r0.apk`
 (real, signed, no deps, no scripts), the Alpine release keys and apk config. Built on the Mac with e2fsprogs `debugfs -w`
@@ -820,7 +820,7 @@ been spawned from an ssh session in the Taoxichuan kernel**, which also explains
 experiment doc (output byte-equal, exec-only) is satisfied; "sshd spawns a real command" is not. Fix is the first item of the
 next brief (`taoxichuan-06b-spawn-then-apk.md`); G1 (`apk.static --version`) cannot pass before it.
 
-**Fans.** The owner's fans were the `vm-dev` guest, not goose: the Taoxichuan kernel's sleep loop polls the NIC and never halts
+**Fans.** The user's fans were the `vm-dev` guest, not goose: the Taoxichuan kernel's sleep loop polls the NIC and never halts
 its vCPU, so core 4 sat at 100% (`guest=99.8%` in the host's `[KVM] cpu:` line) while `vm-serve-mc`'s full kernel idles at ~7%.
 Rule: stop `vm-dev` when a session ends. A `hlt`/idle path in the guest's wait loop is a real follow-up (needs a wake source:
 kvm0 raises no NIC interrupt, so it needs a timer exit). `goose serve` did not spin after the stop/start restarts
@@ -833,8 +833,8 @@ context, part 2 and the planning and 6A sessions at ~10-35%/h with fresh context
 ### Stage 6 — session B (`taoxichuan-06b-spawn-then-apk.md`), supervisor view (Sonnet), 2026-10-25 02:31-03:40 IDT (in progress)
 
 **Send.** Quota reset confirmed by a probe (`pong`) at ~02:30 after a `herd stop`/`herd start` of goose-glm; brief sent 02:31
-(`--name s6b`, log `/tmp/goose-s6b.log`). A delayed sender scripted for 02:45 was killed: the owner said the window had
-already reset (the 02:44 figure was the *previous* window's end; the quota meter had been reset by the owner's own session
+(`--name s6b`, log `/tmp/goose-s6b.log`). A delayed sender scripted for 02:45 was killed: the user said the window had
+already reset (the 02:44 figure was the *previous* window's end; the quota meter had been reset by the user's own session
 start). Lesson: probe first, do not schedule against a computed reset time.
 
 **Root cause of "sshd never spawned an external binary" (found by goose, four stacked layers, each hiding the next).**
@@ -904,12 +904,12 @@ apk-tools itself and the aarch64 syscall layer are fine; it says nothing about t
 
 **For the next brief.** Add `--force-non-repository` to the G3 command (or explain the refusal); dump `argv` as the new image
 sees it before apk's parser runs (`apk.static --root / add <path>` should list exactly one positional); keep the Linux
-transcript above as the oracle. Ryzen was taken offline by the owner at ~03:45, so nothing is running there; `vm-dev` was
+transcript above as the oracle. Ryzen was taken offline by the user at ~03:45, so nothing is running there; `vm-dev` was
 already stopped by goose and `vm-serve-mc` restored.
 
 ### Stage 6 — session C (`taoxichuan-06c-apk-argv-and-install.md`), host track (Sonnet) — metal track PASS, offline `apk add` works
 
-Brief sent 04:22 IDT after the owner brought the ryzen back (GRUB entry 30 via `arm.sh 29`; herd `vm=true` entry), goose-glm probe `pong`.
+Brief sent 04:22 IDT after the user brought the ryzen back (GRUB entry 30 via `arm.sh 29`; herd `vm=true` entry), goose-glm probe `pong`.
 Goose ran 04:22-05:35 IDT (73 min, past the brief's 60-minute line, left running because it was committing real fixes) and wrote
 `/root/dev-cycle/taoxichuan-s6/RESULT-C.md`: **G1-G4 all PASS in one clean boot** (`taoxichuan-s4` @ `0b33595a`, kernel sha256
 `58353c90...47780`, fresh copy of `.orig` per boot, 0 `Fault|PANIC|sig!`).
@@ -984,12 +984,12 @@ with no `RESULT-B.md`.
   `taoxichuan-fc.bin` 662,792 B (unchanged), Lima `fc` boot with disk: 162 lines, `Ext2 filesystem mounted`, `sshd started`,
   0 `Fault|PANIC|sig!`. PASS (the tree still builds and boots on aarch64; the amd64-only changes are in `taoxichuan/`).
 
-### Supervisor lapse — the composition rule was dropped from the briefs for stages 6-7 (found 2026-10-25, owner's question)
+### Supervisor lapse — the composition rule was dropped from the briefs for stages 6-7 (found 2026-10-25, user's question)
 
 **What happened.** The experiment's pinned composition rule (`MINIMAL_SELF_HOSTING_EXPERIMENT.md` § Process: pull as few crates as possible;
 extract into a crate first where the logic still lives in `amd64/src/`; the goal is a *composition root*, not a new kernel) was carried by
 the briefs for stages 1-4 and silently left out of 06a, 06b, 06c, 07, 07b and 07c-draft. The supervisor (Sonnet) wrote each brief from
-the previous session's result and never re-read the doc's pinned sections. The owner noticed from the size of the kernel source.
+the previous session's result and never re-read the doc's pinned sections. The user noticed from the size of the kernel source.
 
 **What it cost (measured, `git diff --numstat 29d4b562 b7646dd9`).** Stages 6-7 added **+1,198 net newly written lines in `taoxichuan/`**
 (`main.rs` +911, `sock.rs` +129, `child.rs` +158; `taoxichuan/src` 3,268 -> 4,466) against **+252 in `crates/`** (`akuma-ring3-amd64` +170 loader,
@@ -1015,7 +1015,7 @@ During the stage 7C planning session goose also noted that `taoxichuan/src/net.r
 
 *Terminology: every line in this experiment is written by the model (goose-glm); "newly written" means code the model wrote new, as opposed to code reused from an existing crate by dependency, extraction or a feature cut.*
 
-**Where the pivot comes from.** The owner's reading, after stage 7 session D: the minimal kernel should be built the way the amd64 kernel was built, by taking the
+**Where the pivot comes from.** The user's reading, after stage 7 session D: the minimal kernel should be built the way the amd64 kernel was built, by taking the
 existing crates and cutting them (seams or features) down to the requirement, not by growing `taoxichuan/src` with newly written code. That is the project's own method
 (`akuma-exec-core`, `akuma-sntp` cut out of `akuma-syscalls-time` "so this target could reach it without also needing that crate's `akuma-exec` dependency",
 `akuma-pipe`, `akuma-fdtable`, `akuma-syscalls-{poll,mem,net,sync}`), and it is why the amd64 kernel exists at all, so feasibility is not in question.
@@ -1074,7 +1074,7 @@ clean goose server.**
 **State.** Table stages 1-5 done; stage 6 (`apk add curl`) about half done (offline `apk add` + outbound TCP + all of stage 7's sub-gates green; `taoxichuan-s4` @ `fa8a1c53`
 merged into `rust-org-il-experiment`, pushed to `origin` at `defbd2c9`). Next: the rest-of-stage-6 plan (`TAOXICHUAN_STAGE6_REST_PLAN.md`): M0 mirror + reference (host only), M1 clock anchor
 (`epoch=` cmdline), M2 DNS, then trim step 2, M3 `apk update`, M4 `apk add curl`, trim step 3, M5 `PT_INTERP` + `curl --version`. Stages 7-12 of the table are not started and, on the pace here
-(~14 goose-hours for stages 1-5 plus offline 6, plus ~9 for stage 7's network work), 9-12 will not be done by the talk on 2026-11-03; the owner's decision (2026-10-26) is to keep climbing regardless of the talk. Owner's quota readings at the end: weekly reset
+(~14 goose-hours for stages 1-5 plus offline 6, plus ~9 for stage 7's network work), 9-12 will not be done by the talk on 2026-11-03; the user's decision (2026-10-26) is to keep climbing regardless of the talk. User's quota readings at the end: weekly reset
 done at the start of the 26th, 5 h window 77% (sessions E-G cost ~6M tokens total). The supervisor loop, scripts and traps are in `scripts/kvm/goose/SUPERVISOR_RUNBOOK.md`.
 
 
@@ -1230,7 +1230,7 @@ Stage 4 through 7D (before the pivot) against the 15 sessions after it:
 - **What worked:** baselines recorded over several fresh boots before they could accuse a change (W0); gate groups that re-create their own state; verdicts re-run on the exact final binary; host tests in a new leaf crate catching bugs before any boot; evidence attributed per boot boundary.
 - **Composition held:** `taoxichuan/src` 4,625 -> 4,916 lines while gaining DNS, `select`, `ftruncate`, real statfs and the stat/dirent/uname/time families; dependencies 16 -> 19; no new crate until session O's `akuma-elf-exec`.
 
-**Process improvements** (the first two are the owner's idea: examine assumptions, and put more weight on probe discovery):
+**Process improvements** (the first two are the user's idea: examine assumptions, and put more weight on probe discovery):
 1. **Premise audit** (done: `BRIEF_TEMPLATE.md` "Premises"). Every brief carries a table of its premises, each with a read-only check the supervisor ran before sending. Goose's first job, before any edit, is to re-run each check and write HOLDS / WRONG / UNCHECKED per row in RESULT. A WRONG row that changes the plan is reported at once, not at the end.
 2. **Probe discovery** (done: `BRIEF_TEMPLATE.md` "Probe discovery"). Before writing any probe, gate or script, goose lists what already exists (`userspace/*probe*`, `scripts/*_suite.py`, host tests, `run_gates.sh` groups, and a binary that already runs on the full amd64 kernel on the box, which gives the reference behaviour in one command) and runs the cheapest first. A new probe needs a stated reason and goes into the repo.
 3. **Guest facts block** (done, in the template): no fork, no procfs, no `stat` applet, one core, the forward ceiling, the 1 GiB image. Briefs stop contradicting what is known.
@@ -1238,7 +1238,7 @@ Stage 4 through 7D (before the pivot) against the 15 sessions after it:
 5. **Quota in the metrics** (done: `zai_usage.py`): record the percent and token delta at the start and end of each session.
 6. **Not done yet:** a hard per-exec timeout in `run_gates.sh` (about 90 s) in place of the ssh client's retry loop, which would have saved roughly an hour; `run_gates.sh` groups of 20 execs or fewer so the forward ceiling never matters; one agent owning the box at a time (a lock file under `/root/dev-cycle`), because the other agent and goose shared it today; a differential check that `amd64` still builds after an extraction (session O's baseline comparison was done by hand).
 
-**Correction to the review above - the model split (owner's question, 2026-10-26).** The first calibration summed all models. The usage API reports per model: **16.1M tokens were GLM-5.3** (the more expensive model), all of them in two hours on 2026-10-24 (08:00-10:00 UTC), which is the stage 1 session (16.1M in the goose export); everything else, including both windows used for the caps, is GLM-5.3-Flash.
+**Correction to the review above - the model split (user's question, 2026-10-26).** The first calibration summed all models. The usage API reports per model: **16.1M tokens were GLM-5.3** (the more expensive model), all of them in two hours on 2026-10-24 (08:00-10:00 UTC), which is the stage 1 session (16.1M in the goose export); everything else, including both windows used for the caps, is GLM-5.3-Flash.
 The caps (weekly about 205M, 5-hour about 34M) are therefore Flash-only and unaffected, because the current windows hold no GLM-5.3 tokens. The "before the pivot" totals above include the 16.1M: Flash-only they are about 125M, or about 94k per call, so the fall in tokens per call (about 40%) and per milestone stands; in quota terms the pre-pivot period cost more than its token count suggests. `zai_usage.py` now prints the split per window.
 
 
@@ -1255,10 +1255,10 @@ The caps (weekly about 205M, 5-hour about 34M) are therefore Flash-only and unaf
 
 ### Host finding (2026-10-26): the KVM implementation has carried the whole experiment without a guest-caused host crash
 
-**Observation (owner's conclusion, recorded with the evidence behind it).** Since stage 1 on 2026-10-24 the experiment has been, without being designed as one, a soak test of the amd64 kernel's KVM (`/dev/kvm0`, `herd vm-dev`): 31 goose sessions up to session O (about 2,700 tool calls, `Process review` above) plus O2, each booting the Taoxichuan guest repeatedly on the ryzen box over roughly two and a half days. Guests died on purpose and by accident throughout (`Fault ring3 PageFault ... task killed`, halted guests, guests parked mid-authentication, `herd stop vm-dev` on a live guest), and no guest took the host kernel down.
-- **Owner's observation (2026-10-26):** in the whole experiment the owner has seen one connectivity issue and nothing remotely like a freeze of the guest or the host. The log agrees on the guest side: the hangs it records are in the transport (the host forward dying early in about a third of batteries, ssh-client retry loops, the relay never signalling a refused dial, boot 4's ssh-layer stall in session O), each with a live host and a console that kept answering; none is a frozen guest or host.
+**Observation (user's conclusion, recorded with the evidence behind it).** Since stage 1 on 2026-10-24 the experiment has been, without being designed as one, a soak test of the amd64 kernel's KVM (`/dev/kvm0`, `herd vm-dev`): 31 goose sessions up to session O (about 2,700 tool calls, `Process review` above) plus O2, each booting the Taoxichuan guest repeatedly on the ryzen box over roughly two and a half days. Guests died on purpose and by accident throughout (`Fault ring3 PageFault ... task killed`, halted guests, guests parked mid-authentication, `herd stop vm-dev` on a live guest), and no guest took the host kernel down.
+- **User's observation (2026-10-26):** in the whole experiment the user has seen one connectivity issue and nothing remotely like a freeze of the guest or the host. The log agrees on the guest side: the hangs it records are in the transport (the host forward dying early in about a third of batteries, ssh-client retry loops, the relay never signalling a refused dial, boot 4's ssh-layer stall in session O), each with a live host and a console that kept answering; none is a frozen guest or host.
 - **The one host reset in the period was not a guest event.** On 2026-10-26 at about 15:09 UTC Akuma reset to Pop while goose ran a long kernel build; klog ends in `[bkls>]` BKL-contention warnings with no panic text (entry for stage 8 session M above). That is the BKL-stall class in the notes, a host-side build load, and the klog does not implicate KVM. I did **not** establish whether a guest was running at that moment, so "not KVM" is the klog's reading, not a proof.
-- **OPEN QUESTION (owner, 2026-10-26): why did the box reboot at about 15:09 UTC?** To drill down later. What is known: Akuma had been up about 5 hours; goose was running a long kernel build; klog ends in repeated `[bkls>] core=2 owner=6 spins=1048576 / 2097152 / 4194304` warnings (ticket numbers advanced, so contention, not a deadlock) and then stops with no panic text; the machine came up on Pop (the GRUB default) at 17:09:02 local. Not known: whether a guest was running (`vm-dev`/`vm-serve-mc` state at that moment), whether the cause is the BKL-stall class in the notes or a hardware/firmware reset, and whether the klog was flushed (an abrupt reset leaves no panic text either way). Where to start: the preserved klog on the `nvme0n1p3` partition (mount read-only from Pop), Pop's boot records for the reset time, and `docs/reference/subsystems/smp-shared.md` for the BKL stall class.
+- **OPEN QUESTION (user, 2026-10-26): why did the box reboot at about 15:09 UTC?** To drill down later. What is known: Akuma had been up about 5 hours; goose was running a long kernel build; klog ends in repeated `[bkls>] core=2 owner=6 spins=1048576 / 2097152 / 4194304` warnings (ticket numbers advanced, so contention, not a deadlock) and then stops with no panic text; the machine came up on Pop (the GRUB default) at 17:09:02 local. Not known: whether a guest was running (`vm-dev`/`vm-serve-mc` state at that moment), whether the cause is the BKL-stall class in the notes or a hardware/firmware reset, and whether the klog was flushed (an abrupt reset leaves no panic text either way). Where to start: the preserved klog on the `nvme0n1p3` partition (mount read-only from Pop), Pop's boot records for the reset time, and `docs/reference/subsystems/smp-shared.md` for the BKL stall class.
 - **Host evidence checked 20:30 UTC:** uptime 5 h 02 min since that reset (covering sessions N, O and the first half of O2), `klog.log` 160 lines with 0 matches for `PANIC|BKL|spin|Fault`, all herd services `restarts=0` apart from deliberate `goose-glm` restarts. Session O alone booked 4 guest boots, two of them ending in guest faults. The exact guest-boot count over the whole experiment was not tallied (`vm-dev.log` rotates mid-boot), so "repeatedly" is a count of sessions, not of boots.
 - **What this does and does not show:** KVM held under a long run of guest faults, hangs and restarts, and the host kept serving ssh, goose and the relay. It is not a measurement of concurrent guests (kvm0 is exclusive, one guest at a time), of multi-day uptime (the reset above bounds it at 5 hours since), or of a hostile guest.
 
@@ -1279,7 +1279,7 @@ The caps (weekly about 205M, 5-hour about 34M) are therefore Flash-only and unaf
 
 ### Quota finding (2026-10-26): a full 5-hour window, a closed milestone, and no usage error
 
-**Observation (owner's conclusion; the numbers are below, with which are measured and which inferred).** The 5-hour window that ran 15:30-20:30 UTC on 2026-10-26 (plan "lite", cap about 34M tokens, all GLM-5.3-Flash) held the process-model plan (session N, 1.5M), session O (19.7M input tokens, 223 calls) and about nine tenths of session O2 (128 calls), and no `Usage limit reached` error came back at any point. That window delivered M5: the first dynamically linked program (`curl --version`) running on Taoxichuan, plus a new leaf crate, a loader shared with the amd64 kernel and the correction of a wrong diagnosis. Earlier in the experiment this much work would not have fitted: session I ended on the 5-hour limit, and at the old rate of about 15M tokens per active hour a window was gone in roughly 2.3 hours (`Process review` above).
+**Observation (user's conclusion; the numbers are below, with which are measured and which inferred).** The 5-hour window that ran 15:30-20:30 UTC on 2026-10-26 (plan "lite", cap about 34M tokens, all GLM-5.3-Flash) held the process-model plan (session N, 1.5M), session O (19.7M input tokens, 223 calls) and about nine tenths of session O2 (128 calls), and no `Usage limit reached` error came back at any point. That window delivered M5: the first dynamically linked program (`curl --version`) running on Taoxichuan, plus a new leaf crate, a loader shared with the amd64 kernel and the correction of a wrong diagnosis. Earlier in the experiment this much work would not have fitted: session I ended on the 5-hour limit, and at the old rate of about 15M tokens per active hour a window was gone in roughly 2.3 hours (`Process review` above).
 - **Measured:** `zai_usage.py` read 68% (23.6M tokens, 327 calls) at 19:18Z with the reset at 20:30Z; the next window read 0.6M at 20:42Z and 1.3M at 20:52Z; the weekly counter went 119.6M -> 130.1M across session O2 (about 10.5M), now 64% (130.8M of about 205M, reset 2026-11-01 19:35Z).
 - **Inferred, not measured:** no reading was taken just before the 20:30Z reset. Subtracting O2's post-reset share (about 0.6M) from its 10.5M and adding the 23.6M gives roughly **33M of 34M, about 97%**: the window closed with little margin, not with room to spare. The conclusion (no error hit) stands either way; the margin claim is an estimate. From here every session records the percentage at its start and end, so the next entry is measured.
 - **What changed between the two regimes** (not an experiment with a control; the data in the `Process review` supports the direction, not each cause separately): the premise table and probe discovery in every brief, one milestone per session with a stop rule, a call budget with a supervisor nudge, the continuation pattern (a fresh context that starts from the RESULT file, which finished the same defect in 128 calls and about 10M tokens after 223 calls and 19.7M in the long context), `[tmp]` tags so diagnostics get removed, and the `Monitor` poll replacing hand-timed checks.
@@ -1287,12 +1287,12 @@ The caps (weekly about 205M, 5-hour about 34M) are therefore Flash-only and unaf
 
 ### Idea parked (2026-10-26): libakuma on plain Linux syscalls, so `userspace/scratch` could be the stage 8 git client
 
-Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart HTTP) builds unchanged for `x86_64-unknown-none` (285 KB static) and uses only Linux-numbered calls on x86_64 except three Akuma-private ones (`RESOLVE_HOST`, `UPTIME`, `TIME`) that Taoxichuan would answer with ENOSYS. Not run in a guest. **Owner's decision: do not cut this corner now**; real `git` is the better preparation for later stages, goose is left to find its own route to the stage 8 gate, and the libakuma Linux-compat change is written down as an idea in `proposals/LIBAKUMA_LINUX_COMPAT.md` (findings, the change, the first test). Revisit if the git gate stalls.
+Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart HTTP) builds unchanged for `x86_64-unknown-none` (285 KB static) and uses only Linux-numbered calls on x86_64 except three Akuma-private ones (`RESOLVE_HOST`, `UPTIME`, `TIME`) that Taoxichuan would answer with ENOSYS. Not run in a guest. **User's decision: do not cut this corner now**; real `git` is the better preparation for later stages, goose is left to find its own route to the stage 8 gate, and the libakuma Linux-compat change is written down as an idea in `proposals/LIBAKUMA_LINUX_COMPAT.md` (findings, the change, the first test). Revisit if the git gate stalls.
 
 
 ### Process finding (2026-10-27): goose reads source and adds probes by default; the debugging docs already described the bug
 
-**Observation (owner's, from watching session Q: "it should really look more at the docs for debugging, there are clues all over the place").** The `curl` over HTTPS gate failed on `Could not resolve host ... (Could not contact DNS servers)`, and `docs/README.md` (symptom matrix, line 100) has a row for exactly that error: c-ares `connect()`s its UDP socket and then `send()`s, and calls `getsockname`/`getpeername`; fixed on amd64 on 2026-09-18, with the sequence and a 40-line replay probe in `docs/archive/AKUMA_AMD64_DNS_CONNECTED_UDP.md`. Taoxichuan hit the same chain again, one syscall per boot.
+**Observation (user's, from watching session Q: "it should really look more at the docs for debugging, there are clues all over the place").** The `curl` over HTTPS gate failed on `Could not resolve host ... (Could not contact DNS servers)`, and `docs/README.md` (symptom matrix, line 100) has a row for exactly that error: c-ares `connect()`s its UDP socket and then `send()`s, and calls `getsockname`/`getpeername`; fixed on amd64 on 2026-09-18, with the sequence and a 40-line replay probe in `docs/archive/AKUMA_AMD64_DNS_CONNECTED_UDP.md`. Taoxichuan hit the same chain again, one syscall per boot.
 - **Measured (goose session database, `gss.py`):** session Q, 165 calls: **3 docs reads, all one `kvm.md` section**, 38 source reads, 61 calls before the first edit. Session Q2, 100 calls: **0 docs reads**, 29 source reads. Neither opened `docs/README.md` or the DNS archive doc. Q's brief had dropped the template's pointer to the front door; that omission was the supervisor's.
 - **Indicative only (goose narration; Q3 and Q4 were not in the export yet):** Q3 mentioned the symptom row and an archive doc only after a supervisor steer pointing at them (`docs/README.md` line 100 and the DNS doc); Q4's continuation prompt said to grep the symptom matrix first, and its narration shows `README`, the symptom row and archive docs. After the steer, Q3/Q4 took curl from exit 6 (no DNS) to exit 7 (connect) to exit 0 on the HTTPS fetch in about 150 cumulative calls, each fix being a call named in that doc's sequence (`getsockname`, `getpeername`, the `sin_family` byte order, `getsockopt`/`SO_ERROR`).
 - **Cost of the miss:** Q and Q2 together were about 265 calls and about 15M tokens (the week counter 131.4M -> 146.0M across Q, Q2 and the start of Q3), most of it kernel-print probes and boots to rediscover the sequence.
@@ -1321,7 +1321,7 @@ Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart 
 - **Q6:** the candidate fix (`blocking_relax`/`yield_now` call `netpoll()`) did **not** fix it (identical counters `gw_tx=368 gw_rx=0 in_flight=369`). It also showed Q5's "pump died" model was partly wrong: `akuma-net`'s `wait_until` pumps `smoltcp_net::poll()` directly and never bumps the wrapper's lap counter, so silent lap prints do not prove a dead pump. Its attempt to swap an instrumented sshd in (wget + killall) failed.
 - **Q7:** baked the instrumented sshd into the image via `devroot-ensure` (`AKUMA_DEVROOT_BAKE_SSHD`, tagged `[tmp]`), and bisected the exec shape: post-fetch `cat /tmp/h` passes, **post-fetch `cat /tmp/h > /tmp/h2` wedges**, so the redirect alone is the trigger (pre-fetch redirects pass). sshd's bridge is cleared: every bridge reaped and printed its exit status. The server finishes the whole session, the client receives nothing (the exit report is queued and never flushed), and the guest then sits with LAPIC-only exits, `io=0` (netpoll never called) and the vCPU at 100% with `hlt=0`. The `np lap` print itself (16k io exits/s) flooded `vm-dev.log` and destroyed boot 1's capture; it is removed in `ba2a04f4`.
 - **Q8:** tried to find the spin site with a 1 Hz LAPIC-timer heartbeat sampling the interrupted RIP. **The premise was the supervisor's and it was wrong:** the Q8 prompt said the guest takes about 99 LAPIC timer interrupts a second. `irq=99` in the host's `[KVM] cpu:` line is the host's own tick landing inside guest execution (`machine.rs`: `ExitCode::Other(0x60|0x61) => c.irq += 1`); the guest takes no interrupts (no LAPIC driver, IF never unmasked, the emulated LAPIC is SVR-disabled). So the heartbeat meant building a timer from scratch, and the instrumented kernel then **dies at the TSC calibrate on three builds** (`net: [1] calibrate begin`, `vm-dev` exit 1) with the code never executed; goose's leading hypothesis is a codegen/layout perturbation exposing a latent bug (or trap-crate registration state), and the VMM's stop reason does not survive in `vm-dev.log`. Ops were restored cleanly.
-- **Process notes:** `boot_dev.sh` waits on `ssh echo __BOOT_OK__` against a guest that already exited (the known 10-retry loop; the supervisor killed the client by PID twice to unblock goose). A pre-existing helper trap: `/var/log/herd/sshd.log` is another service's console. The supervisor twice misread goose's narration (a `PASS/PASS` for `b1/q1` taken as the bisect shapes passing) and told the owner a reversal was possible; corrected the same turn. Read the RESULT file before saying anything about a verdict.
+- **Process notes:** `boot_dev.sh` waits on `ssh echo __BOOT_OK__` against a guest that already exited (the known 10-retry loop; the supervisor killed the client by PID twice to unblock goose). A pre-existing helper trap: `/var/log/herd/sshd.log` is another service's console. The supervisor twice misread goose's narration (a `PASS/PASS` for `b1/q1` taken as the bisect shapes passing) and told the user a reversal was possible; corrected the same turn. Read the RESULT file before saying anything about a verdict.
 - **Next (cheap and safe, no interrupt work):** start from `ba2a04f4`; add marker prints at session-teardown stages in the baked sshd (after `block_on(handle_connection)` returns, before and after `close`) and entry/exit prints in the kernel's socket close/shutdown path, with a once-per-event (not per-lap) rule; the last marker before silence localizes the spin. Then fix, strip the markers, `clippy` the touched crates, and the Q2 / E1/E2 / clean-boot main battery gates. If a RIP sample is still wanted, find out first why a registered-but-never-fired handler kills the calibrate (the VMM's fatal-stop set is in `machine.rs`).
 - **Quota:** with about 35M tokens left in the week (resets 2026-11-01 19:35Z) and Q-sized debugging at 5-15M per session, plan for two or three more sessions, not for the git stage, unless the wedge falls quickly.
 
@@ -1331,15 +1331,15 @@ Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart 
 **Result.** Goose session 20261027_12, 68 calls, one boot, about 3M tokens; `taoxichuan-s4` @ `2619a243` (two reverts of the Q8 heartbeat, `35dfe1a0` and `5f7bf7b8`, plus `[tmp]` per-event markers). No gate moved. Q2 still not passed.
 - **The race theory did not survive its own evidence** (the supervisor had asked for the timeline before any client change). Redirect-shape session (`cat /tmp/h > /tmp/h2`), client capped at 60 s: server-side complete, guest healthy, later sessions (`alive3`, `cat /tmp/h2`) served normally, `h2` holds the full file; the client's exit code 0 means it **received** the exit-status. The passing plain session's client, by contrast, left without it (`close-wait end peer_hung=true saw_close=false`). So "the client receives nothing" is not the wedge signature, and a client-only exit race does not explain the failure.
 - **Q7's guest spin (`io=0 hlt=0`, netpoll never called) did NOT reproduce.** Candidates for Q7's terminal state, neither proven: stacked hung-client zombies exhausting the port-22 forward slots (so new clients never reach the guest: no Auth line, guest innocent), or a real guest-side spin that this boot did not show.
-- **OPEN, host kernel, NOT licensed to change:** after the session, relay slot 0 froze (`up_pending=176`, `to_host` frozen, `host_send_blocked` climbing +500/s, `tcp_state=close_wait`) with no `[KVM] relay: host socket ... failed` line all boot. In `amd64/src/kvm/relay.rs::shuttle`, `socket_send` can EAGAIN forever and teardown requires `p.host_eof && p.guest_eof_passed && conn.is_closed()` while `guest_eof_passed` needs `p.up_len == 0`: a zombie slot with no error path and no bound. One defect, two plausible symptoms (a stuck client, slot exhaustion). A bound on the up-chunk (a retry cap and an abort in the `note_err` style) is the obvious fix but changes the host VMM kernel, which this experiment does not rebuild; **the owner's decision**.
+- **OPEN, host kernel, NOT licensed to change:** after the session, relay slot 0 froze (`up_pending=176`, `to_host` frozen, `host_send_blocked` climbing +500/s, `tcp_state=close_wait`) with no `[KVM] relay: host socket ... failed` line all boot. In `amd64/src/kvm/relay.rs::shuttle`, `socket_send` can EAGAIN forever and teardown requires `p.host_eof && p.guest_eof_passed && conn.is_closed()` while `guest_eof_passed` needs `p.up_len == 0`: a zombie slot with no error path and no bound. One defect, two plausible symptoms (a stuck client, slot exhaustion). A bound on the up-chunk (a retry cap and an abort in the `note_err` style) is the obvious fix but changes the host VMM kernel, which this experiment does not rebuild; **the user's decision**.
 - **Marker design lesson:** the first marker set landed in the `fork-sessions` serve loop, which `amd64/mkdisk.sh:172`'s feature set compiles out; markers must go in the live single-process loop. `net.rs` has only per-lap print sites, so it stayed printless (the Q7 flood).
 - **Next (Q10):** get the Q2 verdict from the console with bounded clients killed by PID (the verdict rule is the console's `Exit status`), q2a/q2 immediately after q1 on a fresh boot, relay slot state printed before each exec; then strip the markers, clippy, and the clean-boot E1/E2 and main battery.
 
 
 ### Stage 9, sessions Q10, Q11, R (2026-10-27): the curl stage closes on `curl -sS https://example.com`; the nested `sh -c` + redirect wedge is a GUEST bug, open
 
-**Result.** Q10 and Q11 (goose, about 70 calls) and R (about 40 calls, 2 boots). **Gate (owner's, replaces the sha256/hello.c body hash): `curl -sS https://example.com` in the guest prints the real page and the console shows `[SSH] Exit status: 0`.** Verified by the supervisor on the console in `vm-dev.log` (Q11) and by the R battery: `PASS M4curl`, `PASS M4web` (capture 705 B, `<title>Example Domain</title>`), 21/21 PASS, `GATES DONE restarts=0`, zero `Fault|PANIC|sig!` in the live log and the rotated one.
-- **Q11 (control, no client killed before its console exit line):** the wedge still reproduced on `sh -c "sha256sum /tmp/h > /tmp/h.out"`, while plain `sha256sum /tmp/h` exited 0 in 5 s. The abandoned-client theory is refuted; the shape (nested `sh -c` plus a redirect; console `Exec: /bin/sh ["-c", "sh -c \"sha256sum ...\""]`) is what triggers it, and the guest vCPU spins (`c4=100% io=0`). The owner's view, which the evidence supports: the relay is not the cause (the same curl works against Linux guests through the same relay), so this is a guest bug; the Q9 note that called the host relay slot pump "the owner's decision" is withdrawn as a diagnosis (the frozen slot is what the host shows when the guest never closes its side). Shapes (b) and (c) of the Q10 bisect were not run. **Open.**
+**Result.** Q10 and Q11 (goose, about 70 calls) and R (about 40 calls, 2 boots). **Gate (user's, replaces the sha256/hello.c body hash): `curl -sS https://example.com` in the guest prints the real page and the console shows `[SSH] Exit status: 0`.** Verified by the supervisor on the console in `vm-dev.log` (Q11) and by the R battery: `PASS M4curl`, `PASS M4web` (capture 705 B, `<title>Example Domain</title>`), 21/21 PASS, `GATES DONE restarts=0`, zero `Fault|PANIC|sig!` in the live log and the rotated one.
+- **Q11 (control, no client killed before its console exit line):** the wedge still reproduced on `sh -c "sha256sum /tmp/h > /tmp/h.out"`, while plain `sha256sum /tmp/h` exited 0 in 5 s. The abandoned-client theory is refuted; the shape (nested `sh -c` plus a redirect; console `Exec: /bin/sh ["-c", "sh -c \"sha256sum ...\""]`) is what triggers it, and the guest vCPU spins (`c4=100% io=0`). The user's view, which the evidence supports: the relay is not the cause (the same curl works against Linux guests through the same relay), so this is a guest bug; the Q9 note that called the host relay slot pump "the user's decision" is withdrawn as a diagnosis (the frozen slot is what the host shows when the guest never closes its side). Shapes (b) and (c) of the Q10 bisect were not run. **Open.**
 - **R:** `[tmp]` set stripped: `taoxichuan/src/sock.rs` and `userspace/sshd` main/protocol are byte-identical to `ba2a04f4`, so the Q9/Q10 edits there were probes only, no fixes. `run_gates.sh`: `gate()` waits for the console exit line (plus a 30 s drain grace) before any PID kill; the sha256 gate is replaced by M4curl/M4web (and B6 in the b group). Merged here as a plain diff of three files (`run_gates.sh`, `taoxichuan/src/net.rs`, `userspace/ext2probe/src/bin/devroot_ensure.rs`), not as a branch merge, so the `[tmp]` and heartbeat commits stay out of this history; the litter head is `cf4ea1c4`. `net.rs` keeps Q5's `netpoll()` in `blocking_relax` and `yield_now` (not a fix for the wedge, harmless and in the 21/21 run).
 - **Not yet verified:** the `GROUP=b` B6 boot. R's `apk add curl` attempt 1 hit its 240 s cap once on boot 1 (the script's designed single restart fired); boot 2 had none.
 - **Next:** stage 8 (git clone), per `TAOXICHUAN_PROCESS_MODEL_PLAN.md` M1 (fd dispatch order) and M2 (blocking fork plus a real `wait4`), with `GIT_MISSING_SYSCALLS.md` extracted into the brief. The nested `sh -c` + redirect spin is likely the same family (redirect and `sh` forking) and is revisited if it blocks a gate.
@@ -1351,7 +1351,7 @@ Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart 
 - **The four bugs, in order found.** (1) `cb19bcca` the fork's page-table clone walked the kernel half too and leaf-copied from frames above RAM (nested #PF at 0x30000000): clone only PML4 slots 0..256. (2) `0963376f` `fork_arm` did not save/restore the crossing statics, so a later in-place exec restored the fork's dead callee-saved registers. (3) `328ce120` + `c042dd01` + `a6822831`: `spawn_arm` and `fork_arm` lower the child's stack top by SIZE/2 and SIZE/4, which put the depth-2 exec band ~0xA00 BELOW the 32 KiB `SYSCALL_STACK` array into read-only data (a later indirect jump fetched rip=0); the array is now 64 KiB, and `exec_replace` keeps its saved registers per frame (`ExecSave`). 64 KiB scales the margin; it does not remove the layout limit, so a depth-3 exec would hit the floor again. (4) `260377ff` busybox ash saves fd 1 with `fcntl(1, F_DUPFD, 10)` around a redirect; fd 0/1/2 of the spawned shell have no table entry, the dup failed with EBADF, and the restore never ran, so cat/wc output leaked into the file. A dup of an unbound stdio fd now materializes `OpenFile::Session` through the `akuma-fdtable` API.
 - **A wrong theory, kept for the record:** session T blamed `wc` being a busybox symlink. The A/B (`cat` twice vs `wc` twice) showed the failure follows the SECOND exec in one shell, not the file.
 
-**The suite is closed, and why.** The 35-exec main battery takes 9-10 minutes without `apk add curl` and 25-30 with it (`PACE=15` s after every exec). The host forward dies near ~30 connections per boot, so a battery that long restarts the VM once and the gates after the restart (W1, `apk` state) then fail for state reasons, not kernel reasons. The restart moved with the connection count: at M4 with F1 in main, at M4 with F1 moved to the `b` group, at A2 with M4 removed. (An earlier note here called the connection-count theory refuted by the F1-moved run; it was not: main without F1 is still near the ceiling.) Owner's decision: this suite is finished and marked done; `apk add curl` / `curl example.com` (M4curl, M4web) count as passing from the earlier runs (R: 21/21 `restarts=0` on its second boot; run 2 of this session: both PASS) and leave the standing battery; the next stage starts a NEW small suite, with its own few gates on one boot. Rule adopted: once a stage has a few clean runs on record, its gates leave the standing battery; they run once more as a spot check before a merge to origin. Same for `git clone` and `cargo fetch` when they close. Not done: splitting `run_gates.sh` into boots of at most ~20 execs, and lowering `PACE` (15 s was set when the forward flaked; test, do not guess).
+**The suite is closed, and why.** The 35-exec main battery takes 9-10 minutes without `apk add curl` and 25-30 with it (`PACE=15` s after every exec). The host forward dies near ~30 connections per boot, so a battery that long restarts the VM once and the gates after the restart (W1, `apk` state) then fail for state reasons, not kernel reasons. The restart moved with the connection count: at M4 with F1 in main, at M4 with F1 moved to the `b` group, at A2 with M4 removed. (An earlier note here called the connection-count theory refuted by the F1-moved run; it was not: main without F1 is still near the ceiling.) User's decision: this suite is finished and marked done; `apk add curl` / `curl example.com` (M4curl, M4web) count as passing from the earlier runs (R: 21/21 `restarts=0` on its second boot; run 2 of this session: both PASS) and leave the standing battery; the next stage starts a NEW small suite, with its own few gates on one boot. Rule adopted: once a stage has a few clean runs on record, its gates leave the standing battery; they run once more as a spot check before a merge to origin. Same for `git clone` and `cargo fetch` when they close. Not done: splitting `run_gates.sh` into boots of at most ~20 execs, and lowering `PACE` (15 s was set when the forward flaked; test, do not guess).
 
 **Process findings.**
 - **Model-stream errors.** About a third of goose sessions died with `Network error: Stream decode error: error decoding response body` after 10-20 calls (11 times today), losing all context. The box's wifi data plane froze for about a minute at one sample (rx/tx counters identical, lap counter 28,787 -> 5,897), which correlates but is not proven to cause it. A retry wrapper (restart goose, resend the prompt, tell it to read `RESULT-*.md` and `git status` first, 9-minute silence watchdog) made sessions finish; every goose-written result still has to be verified on the console by the supervisor.
@@ -1360,7 +1360,7 @@ Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart 
 - **Tokenomics.** Today (T-Y) about 14M GLM-5.3-Flash tokens, about 6% of the weekly cap (week 1% -> 6%).
 - **Supervisor misreads, corrected openly:** claimed `ring3-amd64` was shared with the main amd64 kernel (only `taoxichuan` depends on it); read `tB`/`F1` consoles as empty when they held only host stats after a wedged boot; `strings` hid one-character client lines.
 
-**Open.** (a) `cargo build -p akuma-amd64 --target x86_64-unknown-none --release` fails (5 x E0425, `amd64/src/mem.rs:117`): this branch's `43edbffc` boot-kit extraction left a test-only function using `PHYSMAP_LIMIT`/`PAGE_SIZE`; it builds with `--features no-tests`, which metal kernels use. (b) `ring3-amd64`'s 64 KiB array and the extracted crates (`akuma-boot-amd64`, `akuma-comconsole`, `akuma-elf-exec`, `akuma-ring3-amd64`, `akuma-syscalls-eventfd`) get a proper review after the experiment, owner's call. (c) The `apk add curl` restart rate versus the pre-fork kernel was never measured (session Y was stopped by the owner's decision to skip it). (d) Pipes and the real process model (`TAOXICHUAN_PROCESS_MODEL_PLAN.md` M3/M4) are the next real work; M2's blocking fork is throwaway scaffolding by design. (e) The trashcan (HP box) was offline; an amd64 `--features no-tests` deploy is staged but not done.
+**Open.** (a) `cargo build -p akuma-amd64 --target x86_64-unknown-none --release` fails (5 x E0425, `amd64/src/mem.rs:117`): this branch's `43edbffc` boot-kit extraction left a test-only function using `PHYSMAP_LIMIT`/`PAGE_SIZE`; it builds with `--features no-tests`, which metal kernels use. (b) `ring3-amd64`'s 64 KiB array and the extracted crates (`akuma-boot-amd64`, `akuma-comconsole`, `akuma-elf-exec`, `akuma-ring3-amd64`, `akuma-syscalls-eventfd`) get a proper review after the experiment, user's call. (c) The `apk add curl` restart rate versus the pre-fork kernel was never measured (session Y was stopped by the user's decision to skip it). (d) Pipes and the real process model (`TAOXICHUAN_PROCESS_MODEL_PLAN.md` M3/M4) are the next real work; M2's blocking fork is throwaway scaffolding by design. (e) The trashcan (HP box) was offline; an amd64 `--features no-tests` deploy is staged but not done.
 
 ### Stage 8, session pa (2026-10-27): M3 pipes — `pipe2`/`pipe` + small pipelines; the new suite `run_pipes.sh` P1-P5 PASS
 
@@ -1374,7 +1374,7 @@ Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart 
 
 ### Stage 8, session pb (2026-10-28): M4 foundation — `akuma-exec`/`akuma-threading` linked, a PIT-calibrated LAPIC tick under ring 3, the SMP-ready sched-lite plan
 
-**Owner's decisions this session:** the kernel gets preemption (the cooperative-only design the supervisor first floated is withdrawn) and the design is SMP-ready, with booting extra cores a later slice. **Result.** (PB1) `akuma-exec` + `akuma-threading` link into `taoxichuan` (nm: 41 + 56 symbols; ELF 917,416 B); (PB3) `run_pipes.sh` P1-P5 and the F1 spot check still pass with the deps pulled; (PB5) `lapic: id=0 timer vector=32 periodic; calibrated=1 counts/tick=624937`, and one 200k-iteration ring-3 exec shows `[TICK pre] n=20337` -> `[TICK post] n=20361`, exit 0 (supervisor read the console, boot 2 starts at log line 12030 and the only `PANIC` is boot 1's at 12019); (PB4) `docs/archive/TAOXICHUAN_M4_SCHED_LITE_PLAN.md`: hook tables for `ThreadRuntime`/`ThreadConfig`/`ProcessHooks`/`X86ArchHooks`/`ExecRuntime`, the blocking syscalls and the switch in `timer_trap`, the `SYSCALL_STACK` interaction, the SMP list, the slice list. Merged as the net diff `f2b15e6c..c3a37692`. Lima aarch64 host-track boot: 163 lines (excluding `[WATCHDOG]`), mount + sshd, 0 faults. amd64 `cargo check --features no-tests` clean, clippy clean, unsafe budget ok.
+**User's decisions this session:** the kernel gets preemption (the cooperative-only design the supervisor first floated is withdrawn) and the design is SMP-ready, with booting extra cores a later slice. **Result.** (PB1) `akuma-exec` + `akuma-threading` link into `taoxichuan` (nm: 41 + 56 symbols; ELF 917,416 B); (PB3) `run_pipes.sh` P1-P5 and the F1 spot check still pass with the deps pulled; (PB5) `lapic: id=0 timer vector=32 periodic; calibrated=1 counts/tick=624937`, and one 200k-iteration ring-3 exec shows `[TICK pre] n=20337` -> `[TICK post] n=20361`, exit 0 (supervisor read the console, boot 2 starts at log line 12030 and the only `PANIC` is boot 1's at 12019); (PB4) `docs/archive/TAOXICHUAN_M4_SCHED_LITE_PLAN.md`: hook tables for `ThreadRuntime`/`ThreadConfig`/`ProcessHooks`/`X86ArchHooks`/`ExecRuntime`, the blocking syscalls and the switch in `timer_trap`, the `SYSCALL_STACK` interaction, the SMP list, the slice list. Merged as the net diff `f2b15e6c..c3a37692`. Lima aarch64 host-track boot: 163 lines (excluding `[WATCHDOG]`), mount + sshd, 0 faults. amd64 `cargo check --features no-tests` clean, clippy clean, unsafe budget ok.
 - **Extracted.** `crates/akuma-lapic-amd64` from `amd64/src/lapic.rs` (1121 -> 719 lines; amd64 re-exports it, the IPI face stays there). `forbid(unsafe_code)`, budget 0. **It has no host tests** (the moved code had only in-kernel suites): a gap to close before the SMP slice.
 - **Boot 1 panic:** `lapic_init` ran before the PMM/heap registration and `map_device` allocates page-table frames; moved after (`9dc684ef`).
 - **Premise corrections (goose):** `ThreadRuntime` has 4 IPI/IRQ-bound fields, not 2; `fork_process`'s subject is `ProcessImage`, not `Process`. `dd` does not exist on the guest (no `/dev` at all); a shell loop is the tick gate. Goose: about 81 calls, 2 of 3 boots, quota in the entry above this one's session.
@@ -1389,10 +1389,10 @@ Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart 
 
 ### Process finding (2026-10-28): this supervising session deviated from the plan — too many tips in briefs and steers, instead of pointing at docs and giving general instructions
 
-Recorded at the owner's request. The runbook (`scripts/kvm/goose/SUPERVISOR_RUNBOOK.md` § One milestone = one session) says the brief carries **no hints about the bug: docs and probes yes**, and the handoff for this session said goose reads docs rarely and source heavily, so *quote the relevant doc passage or the probe list*. The supervisor (Sonnet 5.5) did the opposite in three of four briefs and in some steers:
+Recorded at the user's request. The runbook (`scripts/kvm/goose/SUPERVISOR_RUNBOOK.md` § One milestone = one session) says the brief carries **no hints about the bug: docs and probes yes**, and the handoff for this session said goose reads docs rarely and source heavily, so *quote the relevant doc passage or the probe list*. The supervisor (Sonnet 5.5) did the opposite in three of four briefs and in some steers:
 - **Briefs pa, pb, pc** (`taoxichuan-09a-pipes.md`, `-09b-m4-deps.md`, `-09c-m4-twin.md`) carried source-level pointers (file and line ranges in `amd64/src/fd.rs`, `sched.rs`, `exec_runtime.rs`, `child.rs`, `akuma-threading`), pb and pc prescribed step lists, and pa named the answer: it told goose where reference counting belongs (`fork_copy` -> `clone_ref`, the `CLOSE` arm) and listed premise 8 as "the likely bug". Goose then confirmed exactly that. The premise table was meant to test the brief's claims, not to hand over the diagnosis.
 - **Steer 1 of pd** told goose what to build (register a `Process` for the shell and call `fork_process` behind the flag) when goose had already found the problem itself (premise 2, WRONG) and the brief already required the selectable flag. The earlier pa/pb/pc steers were process-only (commit, write `RESULT-*.md`, hold the push).
-- **Brief pd** was rewritten before sending, at the owner's instruction ("point to docs, not source, it will find the source"): goal, gates, docs, no line numbers, no decomposition.
+- **Brief pd** was rewritten before sending, at the user's instruction ("point to docs, not source, it will find the source"): goal, gates, docs, no line numbers, no decomposition.
 - **Where the plan was followed:** the composition-rule block stays in every brief (the template requires it); briefs went as files; sessions ran through `retry_goose.sh`; every result was verified on the console and with `od -c` by the supervisor, not from goose's narration.
 - **Outcome.** The tips did not change a gate verdict that the supervisor could see, but they made the briefs long (9 KB for pa) and made goose's results harder to credit to goose. Going forward: briefs name the goal, the gates and the docs; steers are about process (commit, RESULT file, push rule, budget), not design.
 
@@ -1404,14 +1404,14 @@ Recorded at the owner's request. The runbook (`scripts/kvm/goose/SUPERVISOR_RUNB
 - **Still open for the slice:** pipe park/wake (the dropped `_wakes` in `pipes.rs`), PK1 `yes | head -n 20000 | wc -l`, PK2 (`forkprobe`), and a SIGPIPE-default stand-in (`yes` needs to die on a broken pipe; today `-EPIPE` with no signals).
 - **Premise 4 caveat.** Goose marked `forkprobe` as speaking the Linux x86_64 ABI from `userspace-layout.md` alone; unproven until the probe runs.
 - **Supervisor errors, recorded.** (1) Goose's RESULT said ops were restored; they were not (`vm-dev` still enabled, `vm-serve-mc` halted: its final message was cut off at "Final bookkeeping:O"). The supervisor restored them by `herd disable vm-dev` + `herd start vm-serve-mc` after the session. (2) The supervisor ran **bare `herd`** on the box to read a usage line: `herd` with no arguments starts a second supervisor (`cannot listen on 127.0.0.1:7117`) which launched duplicate children (a second `goose serve`, `klogd`, `powersaved`). The supervisor killed them by PID; three entries (34096, 34098, 34100) still show in `ps` with 0:00 CPU after SIGKILL (parent gone, unreaped) and clear on the next reboot. Use `herd status`, never bare `herd`. (3) The two "finish at the next gate" steers to goose timed out without an ack, so it is unproven that goose read them; it stopped on its own stop rule.
-- **Process.** From the owner's feedback, the pd brief pointed at docs and the goal and left the code to goose; the one steer that gave design direction (register a `Process`, call `fork_process` behind the flag) was the same content the brief already required, and goose had already found the problem itself.
+- **Process.** From the user's feedback, the pd brief pointed at docs and the goal and left the code to goose; the one steer that gave design direction (register a `Process`, call `fork_process` behind the flag) was the same content the brief already required, and goose had already found the problem itself.
 - **Correction (same day): pd probably ended on the 5-hour quota cap, not only on its stop rule.** `zai_usage.py` right after the session read the 5 h window at 100% (36.1M tokens, 356 calls; resets 04:13Z) and the week at 30% (57.5M). Goose's final message ended with "Please retry if you think this is a transient or recoverable error." and its ops-restore step was cut off mid-word, which is how a quota refusal looks. Earlier this day the supervisor said the window was "fine" from the morning's 12% reading and did not re-check between sessions: pc alone cost about 16M tokens, pd about 15M. Check `zai_usage.py` between sessions, not only at the start and end of the day.
 
 ### Stage 8, session pe (2026-10-28): M4 slice 3 again, plan first — the real fork child, `wait4` park, wake, switch back and reap WORK on three boots; the client verdict and pipes are not done
 
 Plan and result are archived beside this log: [`TAOXICHUAN_M4_SLICE3_PE_PLAN.md`](TAOXICHUAN_M4_SLICE3_PE_PLAN.md), [`TAOXICHUAN_M4_SLICE3_PE_RESULT.md`](TAOXICHUAN_M4_SLICE3_PE_RESULT.md). Branch: `litter/taoxichuan-s4` at `983dc1c5` (local ref `taoxichuan-pe-wip`). **Not merged to `rust-org-il-experiment`**: `REAL_FORK` defaults to `true` in that tree, it still carries `[tmp]` prints, and the pipe arms are still the M2 ones, so merging would break P1-P5 exactly as pd's branch would have.
 
-**Brief and method.** Brief `taoxichuan-09e-m4-fork-plan-first.md`: goal, gates, docs and probes, no source pointers and no diagnosis; the owner's instruction was a plan from the pd checkpoint first. Goose wrote `PLAN-pe.md` after about 74 calls of docs and source, before any build or boot. Doc use for the final attempt (`gss.py`): 186 calls, 33 before the first edit (session Q: 61), 7 docs reads over 5 files, 38 source reads, 24.6M input tokens; the two earlier attempts are not in that figure.
+**Brief and method.** Brief `taoxichuan-09e-m4-fork-plan-first.md`: goal, gates, docs and probes, no source pointers and no diagnosis; the user's instruction was a plan from the pd checkpoint first. Goose wrote `PLAN-pe.md` after about 74 calls of docs and source, before any build or boot. Doc use for the final attempt (`gss.py`): 186 calls, 33 before the first edit (session Q: 61), 7 docs reads over 5 files, 38 source reads, 24.6M input tokens; the two earlier attempts are not in that figure.
 
 **What the plan found, and the boots proved.** (1) pd's `rip=0` was the EXIT arm sending a real child's `exit_group` into the M2 `child_exit` (`nested_active()` is true for the child) and returning through a never-initialised crossing save; fix A reorders the test, fix A' makes `is_real_task()` a real discriminator (a bind-time bit). (2) A second, independent cause behind the next fault: the `sched_*` maps hardcoded the shell as threading tid 0, but its crate tid is its spawn-ring slot, so the wake switched back under a stale record; fix C keys on the live shell tid. pd's two hypotheses (`enter_user`, `wait4_real`) were killed on paper by the plan and never needed reopening. On the surviving consoles (checked by the supervisor in `vm-dev.log` and `.old`, three boots): `enter tid=1` -> `exit tid=1 code=0 wake=2` -> `sw to=2` -> `w4ret rax=0x5` (the child's pid) -> `rax=0` (the reap), no `Fault|PANIC|sig!` in those ranges. The M2 path with the flag off stays green (F1 exact, P1-P5 pass, boot B).
 
@@ -1420,17 +1420,17 @@ Plan and result are archived beside this log: [`TAOXICHUAN_M4_SLICE3_PE_PLAN.md`
 **Traps found (goose).** `boot_dev.sh` given a repo-relative path installs an old artifact: boot 1 was void, verify the install line's size/md5 against the fresh `/root/ktarget` artifact. `vm-dev.log` rotates at about 250 KB and whole-log fault greps match older boots' lines: attribute faults by a per-boot log mark.
 
 **Supervisor findings, recorded openly.**
-- **The watchdog was wrong.** `retry_goose.sh` killed a live boot battery on a flat 9 minutes of log silence (try 1 at 712 s and try 2), and the driver logged neither thinking chunks nor a running tool. The owner's question exposed it. Fixed: the driver writes an `alive:` heartbeat while the model streams `agent_thought_chunk` (hundreds per 30 s were being dropped), and `retry_goose2.sh` allows 30 minutes while the last event is an unfinished tool call and passes `--budget 43200`.
+- **The watchdog was wrong.** `retry_goose.sh` killed a live boot battery on a flat 9 minutes of log silence (try 1 at 712 s and try 2), and the driver logged neither thinking chunks nor a running tool. The user's question exposed it. Fixed: the driver writes an `alive:` heartbeat while the model streams `agent_thought_chunk` (hundreds per 30 s were being dropped), and `retry_goose2.sh` allows 30 minutes while the last event is an unfinished tool call and passes `--budget 43200`.
 - **The driver's 3-hour turn budget** (its default) ended the log on a live session; the goose server kept the turn running without a listener (the database call count kept rising) and the session finished normally. Found by reading the log tail, then confirmed through `watch_session.py`.
 - **A box reset** about 56 calls into the first attempt (both addresses down, Akuma came back by itself); nothing was lost because the plan was to be committed before any build. Cause not determined.
 - Smaller: the progress monitor read a stale log through a glob (fixed to the newest log); a second monitor kept running on the old log until stopped; goose did not push to `litter` after its boots although the brief said to (the supervisor pushed from the box at the end).
 - **Process kept:** no source pointers in the brief; the only steer was the brief's own 60-call process nudge; every claim above was checked against a console or the git state.
-- **Quota:** 5 h window 9%, week 49% (95.4M tokens) after the session; the owner said to run it into the ground.
+- **Quota:** 5 h window 9%, week 49% (95.4M tokens) after the session; the user said to run it into the ground.
 
-### Owner's decision (2026-10-28, during session pf): no more time or tokens on a cooperative kernel on a single core
+### User's decision (2026-10-28, during session pf): no more time or tokens on a cooperative kernel on a single core
 
-**The statement, as the owner put it:** they are personally not willing to waste time and tokens on a cooperative kernel on a single core.
+**The statement, as the user put it:** they are personally not willing to waste time and tokens on a cooperative kernel on a single core.
 
-**Context.** Session pf's first Fix B boot completed F1's `echo` and `cat` through the new path (fork, run, exit, wake, reap) and then wedged: the guest at 100% CPU, no system calls, the network starved, only timer ticks arriving. Goose's working theory is a task spinning in ring 3 on a kernel that has no timer preemption, so nothing else (the net thread, sshd) can run; it had named this the same event as pe's "ssh channel stalls after about two connections per boot", which pe had read as a channel problem. The pe brief's line "timer preemption is the NEXT slice (switch only where a task parks, never in ring 0) - do not reopen" had put the gates first and preemption second. The owner's pb decision (preemption, SMP-ready design) already stood; what changes here is the order.
+**Context.** Session pf's first Fix B boot completed F1's `echo` and `cat` through the new path (fork, run, exit, wake, reap) and then wedged: the guest at 100% CPU, no system calls, the network starved, only timer ticks arriving. Goose's working theory is a task spinning in ring 3 on a kernel that has no timer preemption, so nothing else (the net thread, sshd) can run; it had named this the same event as pe's "ssh channel stalls after about two connections per boot", which pe had read as a channel problem. The pe brief's line "timer preemption is the NEXT slice (switch only where a task parks, never in ring 0) - do not reopen" had put the gates first and preemption second. The user's pb decision (preemption, SMP-ready design) already stood; what changes here is the order.
 
-**What changes.** If the watchdog boot confirms the theory, goose is told to plan and build timer-driven preemption inside this session instead of stopping to report it, with a design that is SMP-ready, and to learn how it is done from the two kernels in this repo that already preempt and run SMP (the amd64 and aarch64 Akuma kernels, through the process and threading crates taoxichuan already depends on) and pull rather than copy. The gates (F1, P1-P5, PK1, PK2 with `REAL_FORK` on) are unchanged; preemption is what is expected to let them pass. Relayed to the running goose session as steer 2 of pf by the supervisor, marked as the owner's decision and as superseding the brief. The cost of reordering is recorded here, not hidden: the next evidence for or against the cooperative theory is the watchdog boot, so if that boot shows a different holder of the core (a pick or map bug rather than a ring-3 spin), the preemption work does not start and this entry is corrected by date.
+**What changes.** If the watchdog boot confirms the theory, goose is told to plan and build timer-driven preemption inside this session instead of stopping to report it, with a design that is SMP-ready, and to learn how it is done from the two kernels in this repo that already preempt and run SMP (the amd64 and aarch64 Akuma kernels, through the process and threading crates taoxichuan already depends on) and pull rather than copy. The gates (F1, P1-P5, PK1, PK2 with `REAL_FORK` on) are unchanged; preemption is what is expected to let them pass. Relayed to the running goose session as steer 2 of pf by the supervisor, marked as the user's decision and as superseding the brief. The cost of reordering is recorded here, not hidden: the next evidence for or against the cooperative theory is the watchdog boot, so if that boot shows a different holder of the core (a pick or map bug rather than a ring-3 spin), the preemption work does not start and this entry is corrected by date.

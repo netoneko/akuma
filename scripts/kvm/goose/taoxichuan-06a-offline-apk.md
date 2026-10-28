@@ -2,7 +2,7 @@
 
 You are goose-glm, the metal track of the experiment in `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md`, on the ryzen
 box. Stage 4 passed and you planned stage 6 (`docs/archive/TAOXICHUAN_STAGE6_PLAN.md`, `taoxichuan-s4` @ `f61ca77e`).
-The owner wants you to use what is left of this quota window (roughly 15-18% at best; it resets at 02:39 IDT and
+The user wants you to use what is left of this quota window (roughly 15-18% at best; it resets at 02:39 IDT and
 unused quota is lost) on a variant that **needs no networking**: the supervisor has put `apk.static` and a real package
 on a disk image, so every syscall apk makes while starting and unpacking gets exercised without the relay, DNS,
 a mirror or TLS. You may stop at any point: a precise PARTIAL result with everything committed is a good outcome.
@@ -36,7 +36,7 @@ sections 1, 2 and 5 and the M3/M4/M5 rows; do not re-derive them. You are on `gl
 3. Boot dance, every time: `herd stop vm-serve-mc; herd enable vm-dev; herd start vm-dev`, read
    `/var/log/herd/vm-dev.log`, then `herd stop vm-dev; herd disable vm-dev; herd start vm-serve-mc`. One kvm0 VM at a
    time. **Do not leave `vm-dev` running when you finish:** the Taoxichuan guest never halts its vCPU (its sleep loop
-   polls the NIC), so it pins a host core at 100% and the owner's fans spin. Never `pkill` by name; never touch
+   polls the NIC), so it pins a host core at 100% and the user's fans spin. Never `pkill` by name; never touch
    `/boot/akuma-guest`, `/boot/akuma-dev-root-ssh.img` or `/root/.config/goose`.
 4. Gates, over `/bin/ssh -p 2224 root@localhost '<cmd>'` (exec-only; the akuma client has no `-T`), in order:
    - **G1** `/bin/apk.static --version` prints a version line, exit 0. First blocker: the ET_DYN static-PIE loader

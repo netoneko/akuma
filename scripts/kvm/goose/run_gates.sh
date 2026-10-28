@@ -239,7 +239,7 @@ if [ "$GROUP" != main ]; then
   rgroup B4 'b4=apk info -e curl'
   vline B4 "$(agg "$RCS")" b4.console
 
-  # B6: the owner's curl-stage gate (2026-10-26): the guest's own curl
+  # B6: the user's curl-stage gate (2026-10-26): the guest's own curl
   # fetches example.com through the relay; PASS is the console's
   # `Exit status: 0` plus the real page in the capture (the sha256/hello.c
   # form is dropped, RESULT-Q11).
@@ -312,7 +312,7 @@ rgroup H2 \
   'h2b=dd if=/etc/hostname of=/dev/null'
 vline H2 "$(agg "$RCS")" "h2a.console h2b.console"
 
-# H3: the owner-approved 3-exec split (no fork arm => no one-line ";" form).
+# H3: the user-approved 3-exec split (no fork arm => no one-line ";" form).
 rgroup H3 \
   'h3a=sh -c "echo x > /tmp/f"' \
   'h3b=cat /tmp/f' \
@@ -401,7 +401,7 @@ rgroup A3 \
 vline A3 "$(agg "$RCS")" "a3a.console a3b.console"
 
 # M4 (stage 8 M4, the curl stage - closed out 2026-10-27): install the
-# guest's own curl, then the owner's curl-stage gate: example.com through
+# guest's own curl, then the user's curl-stage gate: example.com through
 # the relay. PASS is console-first - the exec's `[SSH] Exit status: 0` -
 # plus the real page in the client capture. The old sha256/hello.c form is
 # DROPPED (RESULT-Q11: `sh -c "sha256sum … > …out"` wedges the GUEST -

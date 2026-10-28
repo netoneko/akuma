@@ -5,7 +5,7 @@
 ## Symptom
 
 On the ryzen (Akuma, bare metal, AMD Ryzen 7 8845HS), the fans run constantly, including between builds
-and while no stage is compiling. The owner's words: "it's been like this for a while even without a build"
+and while no stage is compiling. The user's words: "it's been like this for a while even without a build"
 and "for unknown reason it becomes a processor hog while it waits."
 
 ## What was measured (22:5x IDT, Taoxichuan stage 4 running, goose idle between tool calls)
@@ -60,7 +60,7 @@ used to find the busy core. Aggregate and cpu4-7 looked sane. Separate accountin
 
 ## Workaround
 
-`herd restart goose-glm` (the owner's choice: do it **between** sessions, never mid-stage, because the
+`herd restart goose-glm` (the user's choice: do it **between** sessions, never mid-stage, because the
 supervisor's ACP driver loses its session). After a restart, re-sample for a minute to see whether the
 spin returns on its own, then again after the next session starts and ends. That one comparison already
 separates "spins when idle" from "spins only with an open client".

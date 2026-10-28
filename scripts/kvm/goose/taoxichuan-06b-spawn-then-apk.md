@@ -35,7 +35,7 @@ Every shell command starts with `export TERM=dumb HOME=/root GIT_PAGER=cat; . /e
 2. Once `ssh ... 'sh -c "echo hi"'` really spawns `/bin/sh` (not the in-process fallback; the log line must be gone),
    run **G1-G4** from the 6A brief. `apk.static` is static-PIE; your ET_DYN base is untested against it.
 3. Same rules as 6A: fresh image copy per boot, restore `vm-dev.conf` and **stop `vm-dev` when you finish** (the Taoxichuan
-   guest never halts its vCPU and pins a host core at 100%; the owner's fans spin), commit and `git push litter
+   guest never halts its vCPU and pins a host core at 100%; the user's fans spin), commit and `git push litter
    taoxichuan-s4` every 10 minutes, zero faults in a passing boot, never push `origin`, gate arch-specific code.
 
 ## When to stop

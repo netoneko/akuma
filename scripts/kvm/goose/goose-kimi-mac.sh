@@ -27,7 +27,7 @@ GOOSE_MODEL=${GOOSE_MODEL:-k3-256k}; export GOOSE_MODEL
 GOOSE_THINKING_EFFORT=${GOOSE_THINKING_EFFORT:-low}; export GOOSE_THINKING_EFFORT
 OPENAI_HOST=https://api.kimi.com; export OPENAI_HOST
 OPENAI_BASE_PATH=coding/v1/chat/completions; export OPENAI_BASE_PATH
-# `serve` is secured with the owner's key (clients send it as X-Secret-Key; the driver scripts take
+# `serve` is secured with the user's key (clients send it as X-Secret-Key; the driver scripts take
 # GOOSE_ACP_KEY_FILE=~/.akuma/goose/acp_secret_key).
 KEYFILE=${GOOSE_ACP_KEY_FILE:-$HOME/.akuma/goose/acp_secret_key}
 if [ -r "$KEYFILE" ]; then GOOSE_SERVER__SECRET_KEY=$(cat "$KEYFILE"); export GOOSE_SERVER__SECRET_KEY; fi

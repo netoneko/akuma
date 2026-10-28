@@ -57,7 +57,7 @@ commits are fine). Stage 3 sat uncommitted for most of an hour and a quota stop 
    with the outputs, the byte-compare result, the surprises (the `out of memory` and `unhandled nr 228/96`
    iterations), and your own cost if you can see it. Do not rewrite other sections.
 4. Write `/root/dev-cycle/taoxichuan-s3/RESULT.md`: PASS/FAIL against the narrowed gate (`busybox echo` +
-   `busybox ls`, non-interactive; no ash/pty - the owner's decision), branch + commit, how it was booted, crate
+   `busybox ls`, non-interactive; no ash/pty - the user's decision), branch + commit, how it was booted, crate
    count and image size, and what you would tell the stage-4 prompt: sshd, exec-only, which means a network path
    (virtio-net or the Realtek), sockets, `fork`-or-not for sshd's per-connection child, `/dev/null` and
    `/dev/urandom`, and the host key. Be concrete about which of those exist in the minimal kernel today.

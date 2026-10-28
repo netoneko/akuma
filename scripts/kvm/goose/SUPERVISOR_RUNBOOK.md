@@ -2,7 +2,7 @@
 
 Read first: `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md` (§ Process, § Session protocol), the TOP of
 `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md` plus its last sections (stage 7 D-G, methodology pivot, supervisor lapse), and
-`scripts/kvm/goose/BRIEF_TEMPLATE.md`. Repo rules: never `git reset`/rebase/rewrite history; the owner has authorised commit + push to `origin rust-org-il-experiment`
+`scripts/kvm/goose/BRIEF_TEMPLATE.md`. Repo rules: never `git reset`/rebase/rewrite history; the user has authorised commit + push to `origin rust-org-il-experiment`
 for this work (never `litter`, goose pushes that), and force-removal of worktrees. Never launch sub-agents. Never use `python3 -` / heredoc python on the box.
 
 ## Setup
@@ -21,7 +21,7 @@ for this work (never `litter`, goose pushes that), and force-removal of worktree
 3. **One clean goose server before every session**: `herd stop goose-glm` kills only the wrapper; also `kill -9` every pid whose `ps` line has `goose serve`, then `herd start goose-glm`, wait ~10 s,
    run the probe (`pong`), THEN send. Never send while a driver (`goose_acp_prompt.py`) is alive. Never run goose/crush wrappers on the box (they overwrite the shared secrets).
 4. Poll inside the turn (a turn that ends cannot wake itself): sleep ~280 s, then `grep -c tool_call LOG`, `git log --oneline -3` and `ls /root/dev-cycle/taoxichuan-s7 | grep RESULT` on the box,
-   goose's last narration (`grep "agent:" LOG | tail -50 | sed 's/.*agent: //' | tr '\n' ' '`), or `watch_session.py SESSION_ID` on the box for the db view. Report to the owner every ~5 min.
+   goose's last narration (`grep "agent:" LOG | tail -50 | sed 's/.*agent: //' | tr '\n' ' '`), or `watch_session.py SESSION_ID` on the box for the db view. Report to the user every ~5 min.
    A silent stretch > 7 min with no running process = the model call hung: restart (step 3) and resend; do not wait it out.
 5. When it ends (driver gone, `RESULT-*.md` present): read the result, `git fetch litter taoxichuan-s4`, merge into `rust-org-il-experiment`, `scripts/build_taoxichuan_fc.sh`,
    `FC_KERNEL=taoxichuan-fc.bin overlays/devbox-firecracker/run.sh --no-net` (Lima `fc`; console in `/tmp/akuma-fc-boot.log` inside Lima: `limactl shell fc -- cat`), expect ~162 lines, `Ext2 filesystem mounted`,
@@ -34,4 +34,4 @@ for this work (never `litter`, goose pushes that), and force-removal of worktree
 - herd re-parses a conf only on `disable` then `enable`; a reload can start a second guest; truth is `/var/run/herd/vm-dev.vm`. kvm0 is exclusive (`vm-serve-mc` halted while `vm-dev` runs); restore at the end.
 - The ssh client capture loses output and the forward degrades near 30 connections per boot: judge by the console (`[SSH] Exit status`), `run_gates.sh` does this.
 - `grep` on the Mac is ugrep (binary detection): use `-a` on logs. `git push litter` on the box needs `. /etc/akuma-dev.env`.
-- The owner reports quota percentages (5 h window, weekly); a fresh-context session costs ~1-3M input tokens, a long one 20M+. z.ai weekly resets are manual.
+- The user reports quota percentages (5 h window, weekly); a fresh-context session costs ~1-3M input tokens, a long one 20M+. z.ai weekly resets are manual.

@@ -35,7 +35,7 @@ loader has; (5) milestones with a mini-gate command each, boots and token estima
 (6) at most five unknowns with their read-only settle. Do not describe unverified fixes as facts.
 
 
-## Addition from the owner (applies to Job 3): the leaf-crate survey comes first
+## Addition from the user (applies to Job 3): the leaf-crate survey comes first
 `diff` the `akuma-*` dependencies of `amd64/Cargo.toml` against `taoxichuan/Cargo.toml` (taoxichuan has 17; amd64 about 70). For every milestone of the rest of stage 6, name which of the crates
 amd64 uses and Taoxichuan does not covers it (candidates: `akuma-sntp` and `akuma-cmos-rtc` for the clock, `akuma-syscalls-poll` for select/ppoll, `akuma-syscalls-mem`, `akuma-syscalls-net`,
 `akuma-syscalls-{linux,abi}` wire types, `akuma-pipe`, `akuma-exec-core`, `akuma-port`, `akuma-tty`). The last plan checked 11 crates; check them all, cheaply (`grep -n "^//!" crates/<name>/src/lib.rs | head -8`

@@ -48,7 +48,7 @@ at the start and the end. A session that closes a gate and makes `taoxichuan/src
   - **H1** with a listener serving `hello-from-host` on port 8123, the guest's `busybox wget -qO- http://192.168.1.159:8123/` prints
     `hello-from-host` and the relay counters in `/var/log/herd/vm-dev.log` show `to_host`/`to_guest` above 0.
   - **H2** `dd if=/etc/hostname of=/dev/null` exits 0.
-  - **H3 (split into three execs, per the owner's decision)**: `sh -c 'echo x > /tmp/f'` rc 0; then `cat /tmp/f` prints `x`; then
+  - **H3 (split into three execs, per the user's decision)**: `sh -c 'echo x > /tmp/f'` rc 0; then `cat /tmp/f` prints `x`; then
     `wc -c /tmp/f` prints `2`. The one-line `;` form is out of scope (no `fork`/`clone` arm exists).
   - Zero `Fault|PANIC|sig!` in the console log of a passing boot.
 - The plan's unknowns U1-U3 settle in this boot: read the existing `[w]` write probe's output for which call `echo` rides, and report it.

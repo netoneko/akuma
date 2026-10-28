@@ -9,7 +9,7 @@ Every shell command starts with `export TERM=dumb HOME=/root GIT_PAGER=cat; . /e
 ## The key fact
 M2's blocking fork and M3's pipes are throwaway-shaped: a fork child runs to completion inside `fork`, so a pipeline whose writer outlives one read, or `git clone`'s helper pump, can never work.
 The real fix is plan M4 (`docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md` §§ 4-6): adopt `akuma-exec` (`fork_process`, `wait4` over child channels) on `akuma-threading`.
-**Owner's decisions: the kernel gets PREEMPTION (no cooperative-only design: nothing in the git/cargo ladder works without it), and the design must be SMP-READY, with SMP itself a follow-on slice** (the tree has
+**User's decisions: the kernel gets PREEMPTION (no cooperative-only design: nothing in the git/cargo ladder works without it), and the design must be SMP-READY, with SMP itself a follow-on slice** (the tree has
 `akuma-bkl`, `akuma-slot-table`; the amd64 per-cpu and AP bring-up code is `amd64/src/smp.rs`, NOT a crate (extract per rule 3 when the SMP slice comes); survey `ls crates/` before writing anything). So: no `static` current-slot, per-core state behind the hooks `akuma-threading` already asks for (`X86ArchHooks::current_slot`, `idle_slot`, `can_run`), BKL via `akuma-bkl`.
 Booting extra cores is NOT this session; the plan document must say what it needs (AP startup path, per-cpu `%gs`, IPIs) and which crates already provide it.
 `taoxichuan` has no timer today (`grep -n -i "lapic\|timer\|preempt" taoxichuan/src/*.rs` finds nothing relevant). amd64's tick is `amd64/src/lapic.rs` (1,121 lines, NOT a crate: `init`, `start_timer`,

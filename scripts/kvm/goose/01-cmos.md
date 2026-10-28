@@ -9,7 +9,7 @@ After Akuma has run on this laptop, the next boot stops in FIRMWARE (before any 
 continue. Linux (Pop) then also complains about the clock. Something Akuma does leaves the CMOS (the 128 bytes behind ports
 0x70/0x71, with the RTC in the first 14) in a state the firmware's checksum rejects. Nobody has found the cause yet.
 
-## Suspects the owner already has (look at each, with evidence from the code, then say yes/no/maybe)
+## Suspects the user already has (look at each, with evidence from the code, then say yes/no/maybe)
 1. `write_rtc_from_sntp` in `amd64/src/clock.rs` and `crates/akuma-cmos-rtc/src/lib.rs` `write()`: it sets SET (status B bit 7),
    writes the date registers and the century (0x32), clears SET. A reset between "set" and "clear" leaves the RTC halted with SET=1.
 2. `crumb()` in `amd64/src/kvm.rs`: writes a step number into CMOS byte **0x7F** during the SVM rehearsal and `kvmtest` paths. Byte
@@ -17,7 +17,7 @@ continue. Linux (Pop) then also complains about the clock. Something Akuma does 
 3. The reboot itself: `reboot -f` (the `sc-reboot` syscall, `crates/akuma-boot`) can land in the middle of a CMOS access (index
    written, data not yet; or the SET window above).
 
-## Things nobody has looked at (check these too; the owner wants to know about any other cause)
+## Things nobody has looked at (check these too; the user wants to know about any other cause)
 * The classic CMOS checksum covers bytes 0x10-0x2D and is stored in 0x2E-0x2F; byte 0x0E is the diagnostic status (bit 6 = bad
   checksum, bit 7 = power lost), byte 0x0F is the shutdown status the firmware reads after a reset. Does any Akuma write touch
   those, or does the reset path leave 0x0F in a state the firmware misreads?

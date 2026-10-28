@@ -19,7 +19,7 @@ Name the one that fits this gate, and how to build it (`userspace/build.sh --<na
 ## Premises (examine these before you edit anything)
 Every claim this brief makes that you did not see pass on this box is a premise, and premises have been wrong in about one brief in two (a gate that needed `fork`, a probe that builds only for aarch64, an applet that is not in the image, a hash that never covered what it was named for,
 a loader described as welded that was already an adapter, syscalls described as served that were ENOSYS). The supervisor fills this table before sending and has run each check once; **your first job, before the first edit, is to re-run each check yourself and write one line per row in RESULT-X.md: HOLDS / WRONG (what you saw) / UNCHECKED.**
-A WRONG row that changes the plan is reported to the owner as soon as you commit, not discovered at the end. About 10 tool calls for the whole table.
+A WRONG row that changes the plan is reported to the user as soon as you commit, not discovered at the end. About 10 tool calls for the whole table.
 | # | premise | read-only check (exact command) | supervisor saw |
 |---|---|---|---|
 | 1 | <e.g. the reference value is X> | `<command>` | <output> |

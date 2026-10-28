@@ -2,11 +2,11 @@
 
 You are goose-glm, the metal track of the experiment in `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md`, on the
 ryzen box. Stage 4 passed (`taoxichuan-s4` @ `29d4b562`): an ssh round trip into the Taoxichuan guest runs
-`echo` and `cat` with byte-equal output. The owner wants the NEXT stage planned now, with the little quota left in this
+`echo` and `cat` with byte-equal output. The user wants the NEXT stage planned now, with the little quota left in this
 window, and executed after the quota refills (about 02:39 IDT). **Your only deliverable is a plan document.**
 
 **This is a short job: aim for 10-15 minutes and a small context.** Read selectively; do not read whole large files. Do not
-edit any Rust, do not run `kbuild`, do not boot a VM (`vm-dev` is running for the owner to ssh into: leave it and
+edit any Rust, do not run `kbuild`, do not boot a VM (`vm-dev` is running for the user to ssh into: leave it and
 `vm-serve-mc` exactly as they are; do not run `herd` at all). Do not touch `/root/.config/goose`.
 
 Every shell command starts with `export TERM=dumb HOME=/root GIT_PAGER=cat; . /etc/akuma-dev.env`. Checkout:
@@ -45,7 +45,7 @@ directory support on that path); `[sc] unhandled nr 4415` repeats on the console
 5. **Process model.** apk runs scripts (`.post-install`, triggers) and may `fork`/`execve`. The kernel runs spawned children
    to completion with no `fork`. State exactly where that breaks for `apk add curl` and the smallest change that works;
    do not propose a scheduler unless nothing smaller does.
-6. **Milestones with mini-gates.** Split the stage into steps each ending in something the owner can see over ssh (for
+6. **Milestones with mini-gates.** Split the stage into steps each ending in something the user can see over ssh (for
    example: outbound TCP to the host works; DNS resolves a name; `apk --version` runs; `apk update` fetches the index; `apk add
    curl` unpacks; `curl --version` runs). For each: what to build, which files, the gate command, a rough count of
    boot cycles, and the risk.
@@ -53,7 +53,7 @@ directory support on that path); `[sc] unhandled nr 4415` repeats on the console
    with (package file list, sizes, checksums), and the exact commands.
 8. **Token and time estimate per milestone, and the order to run them in.** The window is about 41M input tokens and the
    cost per call grows with the context (a 220k-token context burned about 60% of a window per hour; a fresh 59k context
-   a tenth of that). Propose session boundaries (where the owner should stop and restart goose with a fresh context) and
+   a tenth of that). Propose session boundaries (where the user should stop and restart goose with a fresh context) and
    which milestones fit one session. Name the cheapest first milestone to run when the quota refills.
 9. **Unknowns and what would kill the plan.** At most five, each with the experiment that would settle it.
 
