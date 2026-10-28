@@ -302,7 +302,7 @@ pub fn child_write(buf_va: u64, len: u64) -> bool {
     {
         use core::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 3 {
+        if N.fetch_add(1, Ordering::Relaxed) < 12 {
             let blen = unsafe { slots()[out_slot].out.len() } as u64;
             akuma_primitives::safe_print!(
                 96,
@@ -675,7 +675,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     // shared kernel half, `ef` is ring-3-enterable. A real child never runs
     // `exit_cross`, so this crossing has no return side; the dead dispatcher
     // frame on the task's own band is abandoned, bounded by exec counts.
-    let _ = unsafe { child_enter(ti.root_pa, &ef, save_ptr(cur)) };
+    let _ = unsafe { child_enter(ti.root_pa, &ef, core::ptr::addr_of_mut!(EXEC_SAVE)) };
     unreachable!("exec_real_task: a real child's crossing returned")
 }
 
@@ -1126,7 +1126,7 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     // SAFETY: syscall-path discipline; `set_syscall_stack_top` is a plain
     // atomic store the unsafe context of the arm already covers.
     ring3::set_syscall_stack_top(rsp_here - 0x1000);
-    let status = unsafe { child_enter(ti.root_pa, &ef, save_ptr(crate::exec_twin::current_slot())) };
+    let status = unsafe { child_enter(ti.root_pa, &ef, core::ptr::addr_of_mut!(EXEC_SAVE)) };
     // The exec'd child exited: `child_exit` recorded its status in the slot,
     // cleared the nesting, put task slot 0 back, and restored THIS frame's
     // registers and CR3 (the parent's). Hand control to `spawn_arm`'s
@@ -1224,9 +1224,18 @@ pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame, save: *m
     )
 }
 
-/// The nested child's `exit_group`: record the status, hand the machine back
-/// to the parent, and return into [`spawn_arm`].
-///
+/// The exec crossing's scratch save (session pg): `child_enter` stores the
+/// caller's dead frame somewhere, and the M2 exec arm used to pass
+/// `save_ptr(cur)` — the SPAWN crossing's saved sshd frame. An inner exec
+/// (`sh -c "sh -c …"`, ash exec'ing the last command in place — every gate
+/// command) then lost sshd's resume frame: the image's `child_exit` ran
+/// `exit_cross` into the exec's dead save and sshd never resumed — no drain,
+/// no `[SSH] Exit status`, a hung session. The exec's save is write-only by
+/// construction (execve never returns to the exec'ing image), so ONE global
+/// scratch is enough: single core, IF clear, and two exec crossings can never
+/// be in flight at once.
+static mut EXEC_SAVE: CrossSave = CrossSave::new();
+
 /// Runs on the nested stack region, in the CHILD's address space, called
 /// from the dispatcher's exit arm — which is why this is `!` from Rust's
 /// point of view: it never returns *to the dispatcher*. It returns to
@@ -1696,7 +1705,7 @@ pub fn read_child_out(slot_idx: usize, buf_va: u64, len: u64) -> u64 {
     {
         use core::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 3 {
+        if N.fetch_add(1, Ordering::Relaxed) < 12 {
             akuma_primitives::safe_print!(
                 96,
                 "[tmp] rco slot={} ask={} avail={}\n",
