@@ -1783,20 +1783,27 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let code = fr.arg1() & 0xFF; // what wait(2) would see
             let t = task();
             t.exit = Some(code);
+            // Slice 3 FIRST: a REAL fork child's exit is a task exit — status
+            // into the slot, its pipe references dropped, the wait4-parked
+            // parent woken, the threading slot terminated (never returns to
+            // the stub: `x86_finish_current` switches away for good). This
+            // test must outrank `nested_active()`: a real child runs at its
+            // own slot (1..NSLOTS), which made `nested_active()` true for it
+            // too and sent its exit_group down the M2 coroutine path — whose
+            // `exit_cross` restores a CrossSave `bind_child_task` never wrote
+            // and `ret`s through a zeroed return address (session pe: pd's
+            // deterministic rip=0).
+            if child::is_real_task() {
+                child::task_exit_real(code)
+            }
             // Stage 4: a nested child's exit does NOT reach the reaper — it
             // hands the machine back to the parent (`child.rs`'s model:
             // run-to-completion inside the SPAWN syscall, coroutine-style
             // return). The boot's own sequential tasks still chain through
-            // `task_done` exactly as stage 3 left them.
-            if child::nested_active() {
+            // `task_done` exactly as stage 3 left it. This arm is now the
+            // SHELL's exit only (slot 0): every fork child is a real task.
+            else if child::nested_active() {
                 child::child_exit(code)
-            }
-            // Slice 3: a REAL fork child's exit is a task exit — status into
-            // the slot, its pipe references dropped, the wait4-parked parent
-            // woken, the threading slot terminated (never returns to the
-            // stub: `x86_finish_current` switches away for good).
-            else if child::is_real_task() {
-                child::task_exit_real(code)
             }
             // Stage 3: not a halt — the report and the next spawn (or the
             // final gate line) live in `task_done`. This arm never returns to
