@@ -187,24 +187,25 @@ pub fn write_arm(id: u32, buf_va: u64, len: u64) -> u64 {
         let (out, wakes) = table().write(id, &data[done..]);
         fire(wakes);
         match out {
-            WriteOutcome::Wrote(n) if n > 0 => {
-                done += n;
-                if done == data.len() {
-                    return done as u64;
+            WriteOutcome::Wrote(n) => {
+                if n > 0 {
+                    done += n;
+                    if done == data.len() {
+                        return done as u64;
+                    }
+                    // short accept: the buffer filled — next lap parks on it
+                } else {
+                    // Full. `check_set_writer` true here means the readers
+                    // vanished between the write and the check (room cannot
+                    // have appeared): EPIPE, not EAGAIN.
+                    let Some(tid) = may_park() else {
+                        return crate::e(ring3::err::EAGAIN);
+                    };
+                    if table().check_set_writer(id, tid, ()) {
+                        return crate::e(EPIPE);
+                    }
+                    park_once();
                 }
-                // short accept: the buffer filled — next lap parks on it
-            }
-            WriteOutcome::Wrote(0) => {
-                // Full. `check_set_writer` true here means the readers
-                // vanished between the write and the check (room cannot
-                // have appeared): EPIPE, not EAGAIN.
-                let Some(tid) = may_park() else {
-                    return crate::e(ring3::err::EAGAIN);
-                };
-                if table().check_set_writer(id, tid, ()) {
-                    return crate::e(EPIPE);
-                }
-                park_once();
             }
             WriteOutcome::BrokenPipe | WriteOutcome::NoSuchPipe => {
                 if crate::child::is_real_task() {
@@ -257,9 +258,9 @@ pub fn writable(id: u32) -> bool {
 /// victim of exactly the dropped wake.
 pub fn release(id: u32, is_write: bool) {
     let wakes = if is_write {
-        table().close_write(id)
+        table().close_write(id).1
     } else {
-        table().close_read(id)
+        table().close_read(id).1
     };
     fire(wakes);
 }
