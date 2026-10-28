@@ -135,6 +135,21 @@ pub fn write_arm(id: u32, buf_va: u64, len: u64) -> u64 {
     }
 }
 
+/// The `ExecRuntime::pipe_write` arm (session pc, slice 1): write into a
+/// pipe by id from **kernel** memory, without raising `SIGPIPE` — the
+/// caller is never the pipe's own process (akuma-exec's stdin pump is the
+/// only reader today, and nothing reaches it until `fork_process`). The
+/// kernel-slice twin of `write_arm`, which copies from the user first.
+pub fn write_no_sigpipe(id: u32, data: &[u8]) -> Result<usize, i32> {
+    let (out, _wakes) = table().write(id, data);
+    match out {
+        // A full pipe answers Ok(0) — the short write that tells the pump
+        // the reader is applying backpressure (the hook's own contract).
+        WriteOutcome::Wrote(n) => Ok(n),
+        WriteOutcome::BrokenPipe | WriteOutcome::NoSuchPipe => Err(-1),
+    }
+}
+
 /// One more descriptor names this end — `dup`/`dup2`/`fcntl(F_DUPFD)`, and
 /// `fork_arm`'s walk over `fork_copy`'s payloads.
 pub fn clone_ref(id: u32, is_write: bool) {

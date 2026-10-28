@@ -117,6 +117,19 @@ pub fn current_pid() -> u32 {
     }
 }
 
+/// The `ProcessHooks::pid_for_thread` / `find_pid_by_thread` arm: the pid a
+/// spawn-ring slot runs under today, `None` for an unused slot. The thread
+/// namespace on this kernel IS the spawn ring until `fork_process` (slice 3)
+/// replaces it — one table, one answer.
+pub(crate) fn pid_for_slot(idx: usize) -> Option<u32> {
+    let s = slots();
+    if idx < NSLOTS && s[idx].used {
+        Some(s[idx].pid)
+    } else {
+        None
+    }
+}
+
 /// The nested child's write to fd 1: into the pipe (the buffer).
 pub fn child_write(buf_va: u64, len: u64) -> bool {
     let mut chunk = [0u8; 512];

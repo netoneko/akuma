@@ -88,6 +88,7 @@
 extern crate alloc;
 
 mod child;
+mod exec_twin;
 mod net;
 mod pipes;
 mod sock;
@@ -3601,6 +3602,13 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // The root disk, and the ext2 root on it.
     // session pb: after PMM/heap are up - map_device allocates page-table frames
     lapic_init();
+    // Session pc, slice 1: the exec/threading runtime twin. Registered here,
+    // not earlier: the LAPIC tick must exist before it can be anyone's clock
+    // (exec_twin's uptime_us is ticks × 10 ms), and PMM/heap must be up
+    // before the first allocation behind registration. Nothing shared runs
+    // before the first spawn, so this is also "before any syscall can reach
+    // the tables" (amd64's ordering rule).
+    exec_twin::init();
     if !blk_init(&machine.virtio) {
         console::puts("  [FATAL] no virtio block device -- the pinned root (ext2 on virtio-blk) cannot mount\n");
         halt();
