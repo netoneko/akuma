@@ -66,6 +66,30 @@ pub fn set_current_slot(slot: usize) {
     }
 }
 
+/// The threading tid the CURRENT M2 shell is registered under. The shell's
+/// tid is its spawn-ring slot (child.rs registers with `tid = slot_idx`), so
+/// this is written at every SPAWN crossing — the M2 model has one live shell
+/// at a time. The switch_to doc's older "tid 0 is the shell" held only for a
+/// boot whose first login spawn landed on slot 0; the sched_* maps key on
+/// this recorded tid now (session pe boot D/E: the wake switched the shell
+/// back under `sched_root_of(2)` = a stale fork-child record, and the shell
+/// resumed on an exec-swept address space whose stack pages read zero).
+static mut SHELL_THREAD_TID: usize = 0;
+
+/// The spawn crossing names the shell's threading tid. SAFETY: syscall-path
+/// discipline (single core, IF clear), as `CURRENT`.
+pub fn set_shell_tid(tid: usize) {
+    unsafe {
+        *core::ptr::addr_of_mut!(SHELL_THREAD_TID) = tid;
+    }
+}
+
+/// SAFETY: as [`set_shell_tid`].
+#[must_use]
+pub fn shell_tid() -> usize {
+    unsafe { core::ptr::read_volatile(&raw const SHELL_THREAD_TID) }
+}
+
 /// The twin's clock: ticks × 10 ms. `saturating_mul` so a ~584-million-year
 /// uptime wraps to "forever" instead of truncating into the past.
 #[must_use]
@@ -79,11 +103,13 @@ pub fn uptime_us() -> u64 {
 /// park-point switch. `akuma-threading`'s `x86_yield_now` has already named
 /// `next` current and will move the stacks itself (`x86_switch_context` is
 /// the crate's own x86 asm); what the machine still needs from the twin is
-/// the incoming task's syscall band and its CR3. tid 0 is the shell (its
-/// SPAWN crossing band, task record 1), 1..NSLOTS real children (leaked
-/// pairs, task record tid+1), anything else the idle thread (stack below,
-/// CR3 untouched — it runs on the kernel root). `from` needs nothing: the
-/// crate saves its context.
+/// the incoming task's syscall band and its CR3. The shell is threading tid
+/// `shell_tid()` — its spawn-ring slot, written at every SPAWN crossing (it
+/// was once hardcoded 0, which only held for a boot's first login spawn) —
+/// with its SPAWN crossing band and task record 1; 1..NSLOTS real children
+/// (leaked pairs, task record tid+1); anything else the idle thread (stack
+/// below, CR3 untouched — it runs on the kernel root). `from` needs nothing:
+/// the crate saves its context.
 fn switch_to(from: usize, to: usize) {
     let _ = from;
     // [tmp] trace (remove before final): every park-point switch, with the

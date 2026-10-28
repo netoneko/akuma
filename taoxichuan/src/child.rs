@@ -506,14 +506,20 @@ pub(crate) fn sched_kstack_top(tid: usize) -> u64 {
 /// updates it — a real child that exec'd must come back on the NEW image's
 /// root). 0 = leave CR3 alone (the idle thread runs on the kernel root).
 pub(crate) fn sched_task_slot_of(tid: usize) -> usize {
-    if tid == 0 { 1 } else { tid + 1 }
+    if tid == crate::exec_twin::shell_tid() {
+        1
+    } else {
+        tid + 1
+    }
 }
 
 pub(crate) fn sched_root_of(tid: usize) -> u64 {
-    match tid {
-        0 => crate::task_slots()[1].root_pa, // the shell
-        t if t < NSLOTS => crate::task_slots()[t + 1].root_pa,
-        _ => 0,
+    if tid == crate::exec_twin::shell_tid() {
+        crate::task_slots()[1].root_pa // the shell
+    } else if tid < NSLOTS {
+        crate::task_slots()[tid + 1].root_pa
+    } else {
+        0
     }
 }
 
@@ -860,6 +866,9 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     // `fork_process` finds a caller. tid = this ring slot — the same number
     // `current_slot()` answers once the crossing below names the child.
     register_shell_process(slots()[slot_idx].pid, path, ti.root_pa, ti.entry, ti.rsp, slot_idx);
+    // The sched_* maps key on this: the shell's threading tid is its spawn
+    // slot, and which slot that is varies across a boot's login spawns.
+    crate::exec_twin::set_shell_tid(slot_idx);
 
     // Snapshot the parent and point the crossing machinery at the child —
     // into the child's own per-slot record now (slice 2): the parent's CR3,
