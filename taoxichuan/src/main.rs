@@ -1591,6 +1591,10 @@ pub(crate) fn eventfd_can_read(idx: usize) -> bool {
     eventfds()[idx].as_ref().is_some_and(|ef| ef.can_read())
 }
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
+    // M4 slice 3: the per-syscall capture `fork_process` step 6 consumes
+    // (`get_saved_user_context` → the twin's `read_user_context`). The boot
+    // task has no slot and skips; a slotted task pays one struct copy.
+    crate::child::capture_user_context(fr);
     match fr.rax {
         ring3::nr::WRITE => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
@@ -3152,6 +3156,40 @@ fn task_done(code: u64) -> ! {
 /// (a RW mapping would be NX and the child would fault on its first
 /// instruction), RO data stays RO. Huge (PS) leaves are refused: the loader
 /// maps 4 KiB pages only, and refusing beats silently sharing a 2 MiB page.
+pub(crate) fn clone_user_half(parent_root: u64, dst_root: u64) -> Option<()> {
+    // The `fork_share_memory` pass, INTO a root that already exists —
+    // `fork_process` step 1 handed the child a fresh `UserAddressSpace` and
+    // the hook fills it. The kernel half copies wholesale from the live CR3
+    // (the same upper-half copy `load_task` gives every task root — the
+    // fresh root from the crate shares only amd64's trio 256/257/511, and
+    // this kernel's convention is the full upper half). The user half clones
+    // the parent's subtrees leaf-by-leaf through `clone_user_tree`.
+    // SAFETY: both roots are PMM-resident page-table frames inside the
+    // physmap; the forking parent is parked and this kernel is single-core
+    // with IF clear — the discipline that owns every page-table touch here.
+    unsafe {
+        let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
+        let ktbl = phys::phys_ptr::<[u64; 512]>(kroot);
+        let dst = phys::phys_ptr::<[u64; 512]>(dst_root);
+        for i in 256..512 {
+            (*dst)[i] = (*ktbl)[i];
+        }
+        let src = phys::phys_ptr::<[u64; 512]>(parent_root);
+        for i in 0..256 {
+            let entry = (*src)[i];
+            if entry & 1 == 0 {
+                continue;
+            }
+            if entry & 0x080 != 0 {
+                return None; // a 1 GiB leaf: see fork_share_memory's note
+            }
+            let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2)?;
+            (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
+        }
+    }
+    Some(())
+}
+
 pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
     let root_page = akuma_pmm::alloc_page_zeroed()?;
     let root = root_page as u64;

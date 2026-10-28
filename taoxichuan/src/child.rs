@@ -376,6 +376,217 @@ fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs
 /// Runs the child to completion inside the call (the model this module
 /// exists to state), then returns `pid | stdout_fd << 32` — the same packed
 /// word the full kernel's SPAWN returns, read by the same `spawn_full`.
+// ---------------------------------------------------------------------------
+// M4 slice 3: the real fork — premise 2's build-out
+// ---------------------------------------------------------------------------
+
+/// The M2 blocking fork stays selectable until the new path passes every
+/// gate: `false` keeps the run-to-completion arm for every fork (this
+/// commit's default), `true` routes plain `fork` (57/58) through
+/// `fork_process` over the registered shell Process. `clone`/`vfork` keep
+/// the blocking arm on both settings — out of scope this slice.
+pub const REAL_FORK: bool = false;
+
+/// `fork_process`'s `bind_child_task` records: (tid, pid, root) — the twin's
+/// spawn-row. Indexed by tid; `root == 0` = free. SAFETY: syscall-path
+/// discipline (single core, IF clear), the rule that owns every static here.
+static mut CHILD_BIND: [(usize, u32, u64); NSLOTS] = [(0, 0, 0); NSLOTS];
+
+/// `ExecRuntime::bind_child_task`'s twin: stamp the child's spawn-row. The
+/// crate publishes the child's thread right after this returns, so a full
+/// ring must come back as an error the fork reports, not a panic.
+pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), &'static str> {
+    // SAFETY: syscall-path discipline.
+    let bind = unsafe { &mut *core::ptr::addr_of_mut!(CHILD_BIND) };
+    if tid >= bind.len() {
+        return Err("taoxichuan: child tid outside the spawn ring");
+    }
+    let slot_idx = {
+        let s = slots();
+        let mut pick: Option<usize> = None;
+        for i in 0..NSLOTS {
+            if !s[i].used || s[i].reaped || !s[i].running {
+                pick = Some(i);
+                break;
+            }
+        }
+        let Some(idx) = pick else {
+            return Err("taoxichuan: spawn ring full");
+        };
+        s[idx] = SpawnSlot::new();
+        s[idx].used = true;
+        s[idx].running = true;
+        s[idx].pid = pid;
+        idx
+    };
+    bind[tid] = (tid, pid, root_pa);
+    let _ = slot_idx;
+    Ok(())
+}
+
+/// The child root `bind_child_task` recorded for `tid` (0 = none) — the
+/// enter_user arm's CR3 source.
+pub(crate) fn bind_root_of(tid: usize) -> u64 {
+    if tid >= NSLOTS {
+        return 0;
+    }
+    // SAFETY: syscall-path discipline.
+    unsafe { core::ptr::read_volatile(&raw const CHILD_BIND[tid].2) }
+}
+
+/// The syscall-path capture `fork_process` step 6 consumes:
+/// `get_saved_user_context(parent_tid)` resolves through the threading crate
+/// to `X86ArchHooks::read_user_context` — this twin's per-slot record
+/// (slice 2), written here. One plain copy per syscall on a slotted task;
+/// the boot task (NO_SLOT) skips.
+pub(crate) fn capture_user_context(fr: &ring3::SyscallFrame) {
+    let slot = crate::exec_twin::current_slot();
+    if slot == crate::exec_twin::NO_SLOT || slot >= NSLOTS {
+        return;
+    }
+    // `UserContext::regs` is the syscall_entry push order: [rdi, rsi, rdx,
+    // r10, r8, r9, rbx, rbp, r12, r13, r14, r15] (akuma-exec-core).
+    let ctx = akuma_exec::process::UserContext {
+        regs: [
+            fr.rdi, fr.rsi, fr.rdx, fr.r10, fr.r8, fr.r9, fr.rbx, fr.rbp, fr.r12, fr.r13,
+            fr.r14, fr.r15,
+        ],
+        sp: ring3::user_rsp_stash(),
+        pc: fr.user_rip,
+        // The FS base rides the MSR across the fork (sysret does not touch
+        // it): the child inherits the parent's TLS pointer in hardware, the
+        // same answer a real fork gives. 0 here means "not tracked".
+        fs_base: 0,
+        gs_base: 0,
+        rax: fr.rax,
+    };
+    write_user_context(slot, &ctx);
+}
+
+/// The exec'd shell, registered as an `akuma-exec` `Process` — premise 2's
+/// build-out: `fork_process` opens with `current_process_shared()`, which
+/// resolves thread→pid→`PROCESS_TABLE`, so the shell must be in both before
+/// it can fork anything. The literal is amd64's own bootstrap registration
+/// (`usermode.rs:4651`) adapted field for field: this kernel's answers where
+/// amd64 names its own subsystems — no channel (the session pipe is the
+/// twin's own mechanism), a fresh default TerminalState (nothing reads it),
+/// the stdio triple for the shared exit path's allocator-safety rule, and a
+/// `new_shared` view of the shell's live root — the address space is OWNED
+/// by the twin's task record, and a second owner would double-free it (the
+/// exact bug amd64's 5b slice 4 note records for its own slice-1 shape).
+fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u64, tid: usize) {
+    let Ok(space) = akuma_mmu::UserAddressSpace::new_shared(root_pa as usize) else {
+        akuma_primitives::safe_print!(128, "[spawn] root view for the process table failed\n");
+        return;
+    };
+    let proc = akuma_exec::process::Process {
+        pid,
+        pgid: pid,
+        tgid: pid, // group leader = self, amd64's own answer
+        state: akuma_exec::process::AtomicProcessState::new(
+            akuma_exec::process::ProcessState::Ready,
+        ),
+        address_space: akuma_exec::process::ProcAddressSpace::new(space),
+        parent_pid: 1, // sshd, the boot's init task (NEXT_PID starts at 2)
+        brk: core::sync::atomic::AtomicUsize::new(0),
+        initial_brk: core::sync::atomic::AtomicUsize::new(0),
+        entry_point: core::sync::atomic::AtomicUsize::new(entry as usize),
+        // The twin's own Task record owns brk/mmap/stack truth; these scalars
+        // feed shared readers only.
+        memory: akuma_exec::process::ProcessMemory::new(0, 0, 0, 0),
+        process_info_phys: core::sync::atomic::AtomicUsize::new(0), // no info page
+        image: spinning_top::Spinlock::new(akuma_exec::process::ProcessImage {
+            name: String::from(name),
+            exe: String::from(name),
+            args: Vec::new(),
+            context: akuma_exec::process::UserContext::new(entry as usize, rsp as usize),
+        }),
+        cwd: String::from("/"),
+        root: String::from("/"),
+        stdin: alloc::sync::Arc::new(spinning_top::Spinlock::new(
+            akuma_exec::process::StdioBuffer::new(),
+        )),
+        stdout: alloc::sync::Arc::new(spinning_top::Spinlock::new(
+            akuma_exec::process::StdioBuffer::new(),
+        )),
+        exited: core::sync::atomic::AtomicBool::new(false),
+        exit_code: core::sync::atomic::AtomicI32::new(0),
+        dynamic_page_tables: Vec::new(),
+        mmap_regions: akuma_exec::process::AssistedSpinlock::new(Vec::new()),
+        lazy_regions: spinning_top::Spinlock::new(akuma_exec::process::LazyRegionMap::new()),
+        // stdio triple: `alloc_fd`'s from-0 safety + the shared exit path.
+        fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::with_stdio()),
+        thread_id: Some(tid),
+        spawner_pid: None,
+        ctty: core::sync::atomic::AtomicU32::new(0),
+        terminal_state: alloc::sync::Arc::new(spinning_top::Spinlock::new(
+            akuma_exec::process::terminal::TerminalState::default(),
+        )),
+        box_id: 0,
+        creds: alloc::sync::Arc::new(akuma_exec::process::SharedCreds::new(
+            akuma_exec::process::Creds::ROOT,
+        )),
+        namespace: akuma_isolation::global_namespace(),
+        channel: None,
+        delegate_pid: None,
+        grabbed_by: None,
+        clear_child_tid: core::sync::atomic::AtomicU64::new(0),
+        robust_list_head: 0,
+        robust_list_len: 0,
+        signal_actions: alloc::sync::Arc::new(akuma_exec::process::SharedSignalTable::new()),
+        signal_mask: 0,
+        fault_mutex: spinning_top::Spinlock::new(alloc::collections::BTreeMap::new()),
+        sigaltstack_sp: core::sync::atomic::AtomicU64::new(0),
+        sigaltstack_flags: core::sync::atomic::AtomicI32::new(2), // SS_DISABLE
+        sigaltstack_size: core::sync::atomic::AtomicU64::new(0),
+        start_time_us: (akuma_exec::runtime::runtime().uptime_us)(),
+        current_syscall: core::sync::atomic::AtomicU64::new(!0),
+        last_syscall: core::sync::atomic::AtomicU64::new(0),
+        syscall_stats: akuma_exec::process::ProcessSyscallStats::new(),
+    };
+    akuma_exec::process::register_process(pid, Box::new(proc));
+    // tid ↔ pid: `current_process_shared()`'s first lookup. tid is this ring
+    // slot — the same number `current_slot()` answers from the crossing on.
+    akuma_exec::process::thread_pid_map_insert(tid, pid);
+}
+
+/// The NEW fork arm: `fork_process` over the registered shell. The child
+/// does NOT run here — the crate publishes it as a runnable thread and this
+/// arm returns the pid to the caller, exactly like Linux.
+fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
+    // Fork lives only inside the spawned shell, the blocking arm's own rule:
+    // the boot task has no registered Process, and a fork inside a fork
+    // child has no stack region left.
+    let cur = crate::exec_twin::current_slot();
+    let shell_depth = match cur {
+        crate::exec_twin::NO_SLOT => 0,
+        // SAFETY: syscall-path discipline.
+        _ => unsafe { cross_mut(cur).depth },
+    };
+    if shell_depth != 1 {
+        return crate::e(crate::err::EPERM);
+    }
+    let child_pid = unsafe {
+        let p = &mut *core::ptr::addr_of_mut!(NEXT_PID);
+        let v = *p;
+        *p = p.wrapping_add(1);
+        v
+    };
+    // stack_ptr = 0: the child resumes at the parent's saved user RSP — the
+    // syscall stub stashed it (`user_rsp_stash`) and step 6's captured
+    // context carries it into the child's UserContext.
+    match akuma_exec::process::fork_process(child_pid, 0) {
+        Ok(pid) => u64::from(pid),
+        // The refusal line is the evidence this slice hunts for; name the
+        // message verbatim (the same discipline as spawn's read-failed
+        // print).
+        Err(msg) => {
+            akuma_primitives::safe_print!(192, "[forkp] refused: {}\n", msg);
+            crate::e(ring3::err::EAGAIN)
+        }
+    }
+}
+
 pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     if nested_active() {
         return crate::e(crate::err::EPERM); // one level only; nothing nests a nest
@@ -445,6 +656,10 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
         slots()[slot_idx].used = false;
         return crate::e(crate::err::ENOMEM);
     };
+    // Premise 2's build-out: register the shell as an akuma-exec Process so
+    // `fork_process` finds a caller. tid = this ring slot — the same number
+    // `current_slot()` answers once the crossing below names the child.
+    register_shell_process(slots()[slot_idx].pid, path, ti.root_pa, ti.entry, ti.rsp, slot_idx);
 
     // Snapshot the parent and point the crossing machinery at the child —
     // into the child's own per-slot record now (slice 2): the parent's CR3,
@@ -610,6 +825,21 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
                 // A swept pipe end drops its table reference, exactly as
                 // close does.
                 crate::pipes::release(id, w);
+            }
+        }
+    }
+    // The shell's registered Process named the PRE-exec root in its shared
+    // view; `fork_process` would clone from the dead image. Re-point the
+    // view at the fresh root — the same move amd64's execve makes
+    // (`replace_image` swaps the address space under the same lock).
+    {
+        let cur = crate::exec_twin::current_slot();
+        if cur != crate::exec_twin::NO_SLOT {
+            let pid = slots()[cur].pid;
+            if let Some(view) = akuma_mmu::UserAddressSpace::new_shared(ti.root_pa as usize) {
+                let _ = akuma_exec::process::table::with_process(pid, |p| {
+                    p.address_space = akuma_exec::process::ProcAddressSpace::new(view);
+                });
             }
         }
     }
@@ -845,6 +1075,17 @@ unsafe extern "C" fn exit_cross(save: *mut CrossSave, root: u64, status: u32) ->
 /// exited) are accepted; anything else (CLONE_THREAD and friends) is M4's
 /// scheduler, not this scaffold.
 pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
+    if REAL_FORK && fr.rax != ring3::nr::CLONE {
+        // The new path: plain fork (57/58) through `fork_process` over the
+        // registered shell Process. `clone`/`vfork` keep the M2 arm — out of
+        // scope this slice.
+        return fork_arm_real(fr);
+    }
+    fork_arm_blocking(fr)
+}
+
+/// The M2 blocking arm, unchanged and selectable via [`REAL_FORK`].
+fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
     // Fork lives only inside the spawned shell: nothing forks the sshd task,
     // and a fork inside a fork child has no stack region left (see above).
     // Per-slot (slice 2): the current slot's record carries the depth — the

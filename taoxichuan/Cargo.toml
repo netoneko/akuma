@@ -103,6 +103,13 @@ akuma-net = { path = "../crates/akuma-net" }
 # read/write/EOF rules. Pulled, not written: host-tested, and the amd64
 # kernel consumes the same crate through its fd.rs.
 akuma-pipes = { path = "../crates/akuma-pipes" }
+# M4 slice 3 (session pd): the fork pull's remaining halves — the isolation
+# namespace every Process field carries, and the x86 UserAddressSpace walker
+# fork_process builds the child's address space with.
+akuma-isolation = { path = "../crates/akuma-isolation" }
+akuma-mmu = { path = "../crates/akuma-mmu" }
+# The Process fields' lock type (amd64 and akuma-exec both build on it).
+spinning_top = "0.3"
 # Stage 8 M4 session pb: the exec/threading ladder pulled for the preemption
 # foundation (linkage proved; the exec_runtime twin lands next session), and
 # the LAPIC timer face extracted from amd64/src/lapic.rs so both kernels share

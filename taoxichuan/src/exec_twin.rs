@@ -310,27 +310,81 @@ fn exec_runtime() -> ExecRuntime {
         // one-path helper; unwired until a consumer exists (slice 3).
         file_size: |_path| Err("taoxichuan: file_size not wired (unreachable until fork_process)"),
 
-        // ── stubs that name the slice that lands them ─────────────────────
-        // The whole ring-3 lifecycle arm — taoxichuan's `child_enter`
-        // crossing is its germ, absorbed when `fork_process` lands (slice 3).
-        enter_user: |&_ctx| {
-            panic!(
-                "exec_twin: ExecRuntime::enter_user was called but the fork/exec seam lands in slice 3"
-            )
-        },
-        // The fork memory pass. taoxichuan's eager copy exists
-        // (`crate::fork_share_memory` over a root), but this hook's shape
-        // speaks `Process`, which this kernel does not build — wired with
-        // `fork_process` (slice 3).
-        fork_share_memory: |_parent, _child| {
-            Err("taoxichuan: fork_share_memory lands with fork_process (slice 3)")
-        },
-        // The child's CR3 + spawn-row binding — the twin's slot binding, same
-        // slice (nothing claims a slot before then).
-        bind_child_task: |_tid, _child, _kind| {
-            Err("taoxichuan: bind_child_task lands with fork_process (slice 3)")
-        },
+        // ── slice 3 arms (session pd) — the fork seam, wired ───────────────
+        // The child's ring-3 entry: the bind table names the CR3, the
+        // captured UserContext becomes an EntryFrame, `ring3::enter_user`
+        // sysrets. Never returns (the child lives in ring 3; its syscalls
+        // come back through the dispatcher).
+        enter_user: twin_enter_user,
+        // The fork memory pass: the twin's proven eager-copy walk, INTO the
+        // child's fresh `UserAddressSpace` root.
+        fork_share_memory: twin_fork_share_memory,
+        // The child's CR3 + spawn-row binding — the twin's slot binding.
+        bind_child_task: |tid, child, _kind| twin_bind_child_task(tid, child),
     }
+}
+
+/// `ExecRuntime::fork_share_memory` — the twin's eager copy, INTO the child
+/// address space `fork_process` step 1 built. The parent's live root (the
+/// shell's, through its shared view) is walked leaf-by-leaf by the twin's
+/// own proven cloner; the child's fresh root gets the kernel half and the
+/// cloned user subtrees. Ledger note: the copied frames are the twin's, not
+/// the crate ledger's — a child `Process::drop` frees only what it tracked.
+/// Bounded by the gate's fork counts; named in RESULT-pd.md.
+fn twin_fork_share_memory(
+    parent: &akuma_exec::process::Process,
+    child: &mut akuma_exec::process::Process,
+) -> Result<(), &'static str> {
+    let src = parent.address_space.l0_phys() as u64;
+    let dst = child.address_space.get_mut().l0_phys() as u64;
+    crate::clone_user_half(src, dst).ok_or("taoxichuan: user-half clone failed")
+}
+
+/// `ExecRuntime::bind_child_task` — the twin's spawn-row: which pid, which
+/// root, which spawn-ring slot. The crate publishes the thread next.
+fn twin_bind_child_task(
+    tid: usize,
+    child: &akuma_exec::process::Process,
+) -> Result<(), &'static str> {
+    let root = child.address_space.l0_phys() as u64;
+    crate::child::bind_child_task(tid, child.pid, root)
+}
+
+/// `ExecRuntime::enter_user` — the child's first and only crossing into ring
+/// 3. The bind table names the CR3 (loaded here: sysret does not touch it);
+/// the captured context becomes an EntryFrame; `ring3::enter_user` sysrets
+/// and never returns. The FS base rides the MSR — the child inherits the
+/// parent's TLS pointer in hardware, fork semantics.
+fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
+    let cur = crate::exec_twin::current_slot();
+    let root = crate::child::bind_root_of(cur);
+    if root != 0 {
+        // SAFETY: `root` is a PMM-resident page-table frame naming the
+        // child's image and the shared kernel half; the load is the same one
+        // `child_enter` performs at every crossing.
+        unsafe {
+            core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags))
+        };
+    }
+    let ef = akuma_ring3_amd64::EntryFrame {
+        r15: ctx.regs[11],
+        r14: ctx.regs[10],
+        r13: ctx.regs[9],
+        r12: ctx.regs[8],
+        rbp: ctx.regs[7],
+        rbx: ctx.regs[6],
+        r10: ctx.regs[3],
+        r8: ctx.regs[4],
+        r9: ctx.regs[5],
+        rdx: ctx.regs[2],
+        rsi: ctx.regs[1],
+        rdi: ctx.regs[0],
+        rax: ctx.rax,
+        rip: ctx.pc,
+        rflags: 0x202,
+        rsp: ctx.sp,
+    };
+    akuma_ring3_amd64::enter_user(&ef)
 }
 
 fn exec_config() -> ExecConfig {
