@@ -2926,7 +2926,27 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         // fork and the real reap — the arms busybox ash needs to run any
         // non-final command of a list. child.rs's M2 scaffold.
         ring3::nr::CLONE | 57 | 58 => child::fork_arm(fr),
-        ring3::nr::WAIT4 => child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
+        ring3::nr::WAIT4 => {
+            // [tmp] trace (remove before final): the full frame at the wait4
+            // arm's return — this is the frame the stub tail pops to get back
+            // to ring 3, so a stomp during the park shows up here as zeroed
+            // slots before the sysret fires.
+            let r = child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
+            akuma_primitives::safe_print!(
+                96,
+                "[tmp] w4ret rip={:#x} fl={:#x} rax={:#x} rbx={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}\n",
+                fr.user_rip,
+                fr.user_rflags,
+                r,
+                fr.rbx,
+                fr.rbp,
+                fr.r12,
+                fr.r13,
+                fr.r14,
+                fr.r15
+            );
+            r
+        }
         ring3::nr::WAITPID => child::waitpid_arm(fr.arg1(), fr.arg2()),
         ring3::nr::CLOSE_CHILD_STDIN => child::close_stdin_arm(fr.arg1()),
         ring3::nr::GETTIMEOFDAY => {
