@@ -396,14 +396,17 @@ fn timer_trap(t: &mut Trap<'_>) {
         );
     }
     // M4 slice 3 preemption (session pf, plan §5): a tick that interrupted
-    // ring 3 may switch — DISABLED pending the pf-5 boot death (silent VM
-    // exit right after "net: [1] calibrate begin", before any ring 3 or any
-    // switch: nothing written here runs pre-ring-3, so the active suspect is
-    // the from_ring3+x86_yield pair itself). Kept: the per-slot trap stacks
-    // and the WRITEV pipe arm (inert pre-ring-3); this gate returns to the
-    // build the moment the death is named or the remaining deltas are
-    // cleared.
-    if false && t.from_ring3() {
+    // ring 3 may switch — the same `x86_yield` the park loop and the idle lap
+    // already run, on this handler's own (per-slot, `arm_trap_stack`) trap
+    // stack; the interrupted frame survives the stack switch, and `on_tick`
+    // has already EOI'd, so the LAPIC can deliver the next tick to whichever
+    // task runs after this returns. Nothing else is READY ⇒ a documented
+    // no-op. Kernel paths run IF-masked, so ring 0 is never switched here: a
+    // ring-0 tick lands only in the idle window, which self-yields.
+    // (Bisect note: boot 065ba70e = this gate off + everything else in ⇒
+    // BOOT OK 49 s; pf-5's death at "calibrate begin" either rides this gate
+    // or was a flake — the boot that follows this commit decides.)
+    if t.from_ring3() {
         akuma_threading::x86_yield();
     }
 }
