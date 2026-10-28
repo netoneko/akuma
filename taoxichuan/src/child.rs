@@ -232,7 +232,7 @@ static mut SLOT_STATE: [SlotCross; NSLOTS] = [
 /// The crossing record of `slot`, for the syscall-path writers.
 ///
 /// SAFETY: as `slots`.
-unsafe fn cross_mut(slot: usize) -> &'static mut SlotCross {
+pub(crate) unsafe fn cross_mut(slot: usize) -> &'static mut SlotCross {
     unsafe {
         let st = &mut *core::ptr::addr_of_mut!(SLOT_STATE);
         &mut st[slot]
@@ -485,6 +485,28 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), 
         ct.fd_nonblock = nonblock;
     }
     bind[tid] = (tid, pid, root_pa);
+    // Session pg (the gates' stdout bytes never reached the client): a REAL
+    // fork child's fd 1 writes must land in the buffer the bridge drains —
+    // the shell's `out_slot`, not this record's `CrossSave::new()` default
+    // (0 = a slot buffer nobody reads; `child_write` then silently dropped
+    // `cat`'s bytes at OUT_CAP and answered success). The blocking arm's own
+    // rule (`fork_arm_blocking`: `c.out_slot = cross_mut(cur).out_slot`,
+    // "a fork child's fd 1 writes land in the buffer sshd drains — never its
+    // own slot"). The bind runs inside the shell's fork syscall, so
+    // `current_slot()` is the shell here; its depth+1 is the grandchild
+    // gate's stamp (fork_arm_real: 1 = the shell, 2 = a fork child).
+    let shell = crate::exec_twin::current_slot();
+    if shell != crate::exec_twin::NO_SLOT && shell < NSLOTS && tid < NSLOTS {
+        // SAFETY: syscall-path discipline (the fork syscall, IF clear).
+        let (out, depth) = {
+            let sc = unsafe { cross_mut(shell) };
+            (sc.out_slot, sc.depth)
+        };
+        // SAFETY: as above; `tid` was just bound inside the spawn ring.
+        let c = unsafe { cross_mut(tid) };
+        c.out_slot = out;
+        c.depth = depth + 1;
+    }
     Ok(())
 }
 
@@ -769,7 +791,11 @@ fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
         // SAFETY: syscall-path discipline.
         _ => unsafe { cross_mut(cur).depth },
     };
-    if shell_depth != 1 {
+    // Session pg: depth 2 (a REAL fork child forking again — grandfork's
+    // rungs 2-5, the `( ls; ls )` class this slice exists to fix) forks for
+    // real now that the child is its own thread with its own band and the
+    // bind hook stamps its depth; deeper generations stay refused.
+    if shell_depth != 1 && shell_depth != 2 {
         return crate::e(crate::err::EPERM);
     }
     let child_pid = unsafe {
