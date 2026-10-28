@@ -1,7 +1,7 @@
 """Steer the turn that is running in an EXISTING session of the ryzen `goose serve` (unauthenticated).
 
 Usage: python3 -I scripts/goose_acp_steer.py SESSION_ID TEXT_FILE [CWD] [--marker TAG] [--wait SECS]
-Env:   GOOSE_ACP (default http://192.168.1.159:3284/acp)
+Env:   GOOSE_ACP (default http://192.168.1.159:3284/acp), GOOSE_ACP_KEY_FILE (secured servers, e.g. Kimi on the Mac)
 
 `session/prompt` into a session that already has an active run is refused ("use _goose/unstable/session/steer"),
 and steer wants `expectedRunId`. The server names the active run in the error to a steer with a wrong id, so this
@@ -33,6 +33,9 @@ import urllib.request
 
 H = os.environ.get("GOOSE_ACP", "http://192.168.1.159:3284/acp")
 HDR = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
+# A secured `goose serve` (GOOSE_SERVER__SECRET_KEY, the Mac Kimi one) wants this header; the ryzen one is unauthenticated.
+if os.environ.get("GOOSE_ACP_KEY_FILE"):
+    HDR["x-secret-key"] = open(os.path.expanduser(os.environ["GOOSE_ACP_KEY_FILE"])).read().strip()
 
 _args = sys.argv[1:]
 
@@ -88,6 +91,8 @@ def post(body, conn=None, sess=None, tries=3):
 def stream(conn, sess=None):
     """Keep an SSE stream open, reconnecting after read timeouts and drops, until `done`."""
     h = {"accept": "text/event-stream", "acp-connection-id": conn}
+    if "x-secret-key" in HDR:
+        h["x-secret-key"] = HDR["x-secret-key"]
     if sess:
         h["acp-session-id"] = sess
     while not done.is_set():
