@@ -29,6 +29,11 @@ const RESOLV: &[u8] = b"nameserver 10.0.2.3\n";
 const REPOSITORIES: &[u8] = b"http://192.168.1.159:8123/main\n";
 const NSLOOKUP: &str = "/bin/nslookup";
 const NSLOOKUP_TARGET: &str = "busybox";
+// Session pg: PK1's pipeline is `yes | head -n 20000 | wc -l` and the image's
+// SERVE list has no yes link either — the inner sh answered `yes: not found`
+// (exit 127) with the kernel-side pipeline chain itself green (boot pg-6).
+const YES: &str = "/bin/yes";
+const YES_TARGET: &str = "busybox";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -62,6 +67,11 @@ fn main() {
         println!("devroot-ensure: {NSLOOKUP} -> {NSLOOKUP_TARGET} created");
     } else {
         println!("devroot-ensure: {NSLOOKUP} already present");
+    }
+    if ops.ensure_symlink(YES, YES_TARGET) {
+        println!("devroot-ensure: {YES} -> {YES_TARGET} created");
+    } else {
+        println!("devroot-ensure: {YES} already present");
     }
 
     // [tmp] wedge-Q7 (remove with the [tmp] set): opt-in bake of an
