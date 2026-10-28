@@ -427,6 +427,9 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
         Ok(a) => a,
         Err(no) => return crate::e(no),
     };
+    // PB5 evidence (session pb): the tick count before the new image's first
+    // ring-3 instruction; "[TICK post]" at child_exit brackets the run.
+    akuma_primitives::safe_print!(96, "[TICK pre] n={}\n", akuma_lapic_amd64::ticks());
     let effective = crate::resolve_effective(&args.path);
     let Ok(image) = crate::root_fs().read_file(&effective) else {
         akuma_primitives::safe_print!(
@@ -604,6 +607,9 @@ pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame) -> u64 {
 /// [`spawn_arm`], via the saved rsp and the return address
 /// [`child_enter`]'s caller left.
 pub fn child_exit(code: u64) -> ! {
+    // PB5 evidence (session pb): the tick count after the child's last ring-3
+    // stretch. The matching "[TICK pre]" line is at the exec crossing below.
+    akuma_primitives::safe_print!(96, "[TICK post] n={}\n", akuma_lapic_amd64::ticks());
     // M3: the exiting task's pipe ends die with it — the fork child's exit
     // is what turns the last writer's close into the reader's EOF. Index
     // payloads hold no kernel reference (the close arms' convention); only

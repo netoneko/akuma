@@ -282,6 +282,7 @@ akuma-bkl = { path = "../crates/akuma-bkl" }
 akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
 # Shared boot self-test harness. Gives the tally the amd64 target lacked: a
 # [FAIL] used to print and the boot then finished announcing success.
+akuma-lapic-amd64 = { path = "../crates/akuma-lapic-amd64" }
 akuma-selftest = { path = "../crates/akuma-selftest" }
 # The framebuffer text console. The bare-metal reference machine has no UART at
 # all, so on a GRUB boot this is the only way the kernel can say anything.
