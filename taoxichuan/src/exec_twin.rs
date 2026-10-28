@@ -117,6 +117,22 @@ fn switch_to(from: usize, to: usize) {
     // gate verdicts; removed before the first gate boot per PLAN-pg §5.)
     let top = crate::child::sched_kstack_top(to);
     akuma_ring3_amd64::set_syscall_stack_top(top);
+    // Session pg fix (the exec'd shell's writev loop, boot pg-2's
+    // l0=0 l1=0 br=11 dlen=0 ans=0): the dispatcher's `task()` is
+    // `TASKS[TASK_SLOT]` — every syscall's fd table, root_pa and regions
+    // source. Crossings set TASK_SLOT (`twin_enter_user`), but a park-resume
+    // of ANOTHER task followed by a tick switch back left it naming the
+    // resumer's record: the fork child then ran with another task's root_pa,
+    // its writev gather read zeros out of the wrong address space, and musl's
+    // `__stdio_write` spun forever on the 0 answer. Keep it in step with the
+    // CR3 loaded below — the same discipline the sched maps already follow
+    // (session pe boot D/E: the shell resumed under a stale record whose
+    // stack pages read zero). The idle thread (tid >= NSLOTS) runs kernel
+    // code only and leaves the previous task's slot armed, exactly as it
+    // leaves CR3.
+    if to < crate::child::NSLOTS {
+        crate::set_task_slot(crate::child::sched_task_slot_of(to));
+    }
     // Session pf preemption: the incoming task's own ring-3 trap stack — a
     // preempting switch leaves the interrupted frame on the interrupted task's
     // stack, so the next ring-3 trap on any task must not land there.
