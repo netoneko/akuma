@@ -6,12 +6,13 @@ Read first: `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md` (§ Process, § Se
 for this work (never `litter`, goose pushes that), and force-removal of worktrees. Never launch sub-agents. Never use `python3 -` / heredoc python on the box.
 
 ## Setup
-- Box (ryzen, Akuma): `ssh -p 2222 root@192.168.1.159` through `scripts/kvm/goose/ak.sh '<cmd>'` (the `ssh` CLI may be blocked; run it from a script). If the box is on Pop:
+- Box (ryzen, Akuma): `ssh -p 2222 root@192.168.1.159` through `python3 scripts/kvm/goose/ak.py '<cmd>'` (Python; no kill timeout; `--stdin` sends stdin; if the box moved on DHCP it is found by its fixed MAC through `overlays/ryzen/wifi-ssh.py`). `ak.sh` is the older shell form that `retry_goose2.sh` still calls. If the box is on Pop:
   `python3 -I scripts/utils/hpbox.py rzr 'cd /home/netoneko/github.com/netoneko/akuma && sh overlays/ryzen/arm.sh 29'` boots Akuma (GRUB entry 30). The box has no tty: no `-o` flags on its own ssh.
 - On the box, helper scripts live in `/tmp` and vanish on reboot: re-create `/tmp/gss.py` from `scripts/goose_session_stats.py` and `/tmp/watch.py` from `scripts/kvm/goose/watch_session.py`
   (`ak.sh 'cat > /tmp/x.py' < file`; run with `python3 /tmp/x.py ARGS < /dev/null`).
 - goose: `goose serve` on `192.168.1.159:3284` (herd service `goose-glm`, model `glm-5.3-flash`, low effort), driven from the Mac by `scripts/goose_acp_probe.py` (pong test) and
-  `scripts/goose_acp_prompt.py BRIEF --out LOG --name X` (log has the `session:` id). Mid-turn corrections: `scripts/goose_acp_steer.py SESSION_ID TEXT_FILE`.
+  `scripts/goose_acp_prompt.py BRIEF --out LOG --name X` (log has the `session:` id). Mid-turn corrections: `python3 scripts/kvm/goose/steer.py SESSION_ID TEXT_FILE` - it sends the steer with a marker, exits nonzero with `NOT DELIVERED` on any failure, requires the message to be in goose's session database, and reports `consumed=yes|no` (the agent reads steers at its next turn; ask again with `--check-only TAG`). Never wrap it in a short `timeout`: a silent kill was once read as "sent" and two steers never arrived.
+  Watchdog: `retry_goose2.sh` (not `retry_goose.sh`) - model silence 540 s, but 1800 s while the last log event is an unfinished tool call, plus `alive:` heartbeat lines while the model streams thinking, and a 12 h turn budget.
 
 ## One milestone = one session
 1. Write the brief from `BRIEF_TEMPLATE.md` (key fact, read-first docs/probes, composition rule 1-4 incl. 3b, gates with exact commands, cost rules, ops traps, event-based commit rule,
