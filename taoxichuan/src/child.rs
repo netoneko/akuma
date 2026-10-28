@@ -53,6 +53,17 @@ pub struct SpawnSlot {
     /// Slice 3: the tid parked in WAIT4 for this child (`u32::MAX` = none).
     /// The child's exit arm wakes it through the threading waker.
     pub waiter: u32,
+    /// Slice 3 (session pe): this slot's child is a REAL fork child —
+    /// published by `fork_process` with its own threading slot — as opposed
+    /// to an M2 spawned child, which also occupies a slot (`used`+`running`+
+    /// `current_slot`, spawn_arm stamps the same triple) but must reach
+    /// `child_exit`. Boot A's wedge: the unqualified slot test read true for
+    /// the session's second SPAWN child (slot 1; the first always lands on
+    /// slot 0, which the test's `cur == 0` guard excludes) and routed its
+    /// exit_group into `task_exit_real`, which abandoned sshd mid-syscall.
+    /// Only `bind_child_task` sets this, so the reset in `new()` clears any
+    /// previous occupant's bit.
+    pub real: bool,
 }
 
 impl SpawnSlot {
@@ -65,6 +76,7 @@ impl SpawnSlot {
             out: Vec::new(),
             reaped: false,
             waiter: u32::MAX,
+            real: false,
         }
     }
 }
@@ -448,6 +460,7 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), 
         s[slot_idx].used = true;
         s[slot_idx].running = true;
         s[slot_idx].pid = pid;
+        s[slot_idx].real = true;
     }
     let _ = prepare_task_slot(slot_idx);
     {
@@ -514,7 +527,13 @@ pub(crate) fn is_real_task() -> bool {
     }
     // SAFETY: syscall-path discipline.
     let s = slots();
-    s[cur].used && s[cur].running
+    // `real` is the whole discriminator, not an optimization: the M2 spawn
+    // path stamps the same used/running/current_slot triple for its
+    // run-to-completion children (spawn_arm), so without the bind-time bit
+    // this test misreads every SPAWN child from the ring's second slot on as
+    // a real fork child — boot A wedged the machine exactly there (session
+    // pe; the field's doc has the full chain).
+    s[cur].used && s[cur].running && s[cur].real
 }
 
 /// A real fork child's `exit_group`: status into the slot, the task's pipe
