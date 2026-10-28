@@ -229,6 +229,16 @@ fn fault_trap(t: &mut Trap<'_>) {
     // task to keep running; what matters for the gate is that this prints
     // `[Fault]` and stops instead of triple-faulting into guest silence.
     if t.from_ring3() {
+        // [tmp] trace (remove before final): the crossing state at the moment
+        // of a ring-3 task death — whose slot was current, what the stub's
+        // stack-top global and the user-rsp stash held.
+        akuma_primitives::safe_print!(
+            192,
+            "[tmp] fault ctx slot={} top={:#x} stash={:#x}\n",
+            crate::exec_twin::current_slot(),
+            ring3::syscall_stack_top(),
+            ring3::user_rsp_stash()
+        );
         akuma_primitives::safe_print!(
             192,
             "[Fault] ring3 {:?} rip=0x{:016x} rsp=0x{:016x} cr2=0x{:016x} code=0x{:x} -- task killed\n",
@@ -1612,6 +1622,21 @@ pub(crate) fn eventfd_can_read(idx: usize) -> bool {
     eventfds()[idx].as_ref().is_some_and(|ef| ef.can_read())
 }
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
+    // [tmp] trace (remove before final): every syscall from the first spawn
+    // on, with the spawn-ring slot and the interrupted user rip. The boot
+    // task (NO_SLOT) stays silent so the boot console stays readable.
+    {
+        let cs = crate::exec_twin::current_slot();
+        if cs != crate::exec_twin::NO_SLOT {
+            akuma_primitives::safe_print!(
+                96,
+                "[tmp] sc slot={} nr={} rip={:#x}\n",
+                cs,
+                fr.rax,
+                fr.user_rip
+            );
+        }
+    }
     // M4 slice 3: the per-syscall capture `fork_process` step 6 consumes
     // (`get_saved_user_context` → the twin's `read_user_context`). The boot
     // task has no slot and skips; a slotted task pays one struct copy.

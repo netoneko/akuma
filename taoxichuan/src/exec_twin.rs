@@ -86,7 +86,11 @@ pub fn uptime_us() -> u64 {
 /// crate saves its context.
 fn switch_to(from: usize, to: usize) {
     let _ = from;
-    akuma_ring3_amd64::set_syscall_stack_top(crate::child::sched_kstack_top(to));
+    // [tmp] trace (remove before final): every park-point switch, with the
+    // syscall-band top the stub will arm for the incoming task.
+    let top = crate::child::sched_kstack_top(to);
+    akuma_primitives::safe_print!(96, "[tmp] sw to={} top={:#x}\n", to, top);
+    akuma_ring3_amd64::set_syscall_stack_top(top);
     let root = crate::child::sched_root_of(to);
     if root != 0 {
         // SAFETY: `root` is a PMM-resident page-table frame naming the
