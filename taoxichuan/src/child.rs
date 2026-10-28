@@ -757,55 +757,58 @@ pub fn child_exit(code: u64) -> ! {
     // SAFETY: syscall-path discipline. Depth-aware (M2): depth 1 is the
     // spawned shell handing the machine back to sshd; depth 2 is a fork
     // child handing it back to the shell — the record knows which.
-    let (parent_root, status, parent_task_slot, parent_slot, save) = unsafe {
+    let (parent_root, status, parent_task_slot, parent_slot) = unsafe {
         let c = cross_mut(cur);
         let s = slots();
         s[cur].running = false;
         s[cur].status = ((code & 0xFF) << 8) as u32;
         let t = &mut *core::ptr::addr_of_mut!(crate::TASKS);
         t[c.task_slot].exit = Some(code);
-        (c.parent_root, s[cur].status, c.parent_task_slot, c.parent_slot, c.save)
+        (c.parent_root, s[cur].status, c.parent_task_slot, c.parent_slot)
     };
     crate::set_task_slot(parent_task_slot);
     // The parent is current again: for a depth-1 exit that is the boot task
     // (`NO_SLOT`), for a depth-2 exit the shell's slot — what the old
     // decrement-`NESTED_DEPTH`-and-restore-`NESTED_SLOT` dance computed.
     crate::exec_twin::set_current_slot(parent_slot);
-    let ret_rsp = save.ret_rsp;
-    // SAFETY: the values were saved by `child_enter` into this slot's record
-    // from the frame this restores; `ret` pops the return address that call
-    // pushed. After the `cr3` load this code is running in the parent's
-    // address space — both map the kernel half, so the registers land before
-    // the jump matters.
-    //
-    // The callee-saved restores are **explicit register bindings**
-    // (`in("rbx")` …), not `mov` statements fed by `in(reg)` inputs: an
-    // `in(reg)` input may be allocated to ANY register — boot 2 caught LLVM
-    // handing the `r13` input the physical `rbx`, which the template's own
-    // `mov rbx, …` destroyed first, so `r13` came back holding the parent's
-    // saved `rbx` (a user address) and the resumed frame faulted on its
-    // first `(%r13)` load. With the binding form the value IS in the named
-    // register before the block runs — the placement is the restore — and
-    // LLVM must keep the free inputs (`root`, `sp`) out of the bound ones.
-    // `rax` carries the exit status the same way: it is what the `ret`
-    // returns into the resuming arm.
-    unsafe {
-        core::arch::asm!(
-            "mov cr3, {root}",
-            "mov rsp, {sp}",
-            "ret",
-            root = in(reg) parent_root,
-            sp = in(reg) ret_rsp,
-            in("rax") u64::from(status),
-            in("rbx") save.rbx,
-            in("rbp") save.rbp,
-            in("r12") save.r12,
-            in("r13") save.r13,
-            in("r14") save.r14,
-            in("r15") save.r15,
-            options(noreturn),
-        )
-    }
+    // SAFETY: the record is live (this slot's own), the status is recorded,
+    // and the tail never returns to this frame.
+    unsafe { exit_cross(save_ptr(cur), parent_root, status) }
+}
+
+/// The exit tail's crossing back, naked because its whole body is the
+/// contract: restore the parent's callee-saved registers and stack pointer
+/// from the slot record, load the parent's CR3, put the status in `eax`, and
+/// `ret` into the resuming arm. Arguments arrive in `rdi`/`rsi`/`rdx` per
+/// the C ABI (`save`, `root`, `status`); everything the body writes is an
+/// argument register or the register being restored — there is **no operand
+/// allocation to get wrong**, which is the whole point of the naked form:
+/// boot 2 caught the inline-asm version of this tail letting LLVM allocate
+/// the `r13` input to the physical `rbx` the template's own first `mov`
+/// destroyed, so the resumed frame came back with a user address in `r13`.
+/// (`rbx`/`rbp` cannot be explicit inline-asm operands at all — LLVM
+/// reserves them — which closes the inline form off entirely.)
+///
+/// # Safety
+/// `save` must be this slot's own crossing record, `root` the parent's CR3,
+/// `status` the packed wait status; never returns.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn exit_cross(save: *mut CrossSave, root: u64, status: u32) -> ! {
+    core::arch::naked_asm!(
+        "mov rbp, [rdi + 0x10]",
+        "mov r12, [rdi + 0x18]",
+        "mov r13, [rdi + 0x20]",
+        "mov r14, [rdi + 0x28]",
+        "mov r15, [rdi + 0x30]",
+        "mov rbx, [rdi + 0x08]",
+        // CR3 before the stack switch: both spaces map the kernel half, so
+        // the record reads above and the rsp below are safe in either.
+        "mov cr3, rsi",
+        "mov rsp, [rdi + 0x00]",
+        "mov eax, edx",
+        "ret",
+    )
 }
 
 // ---------------------------------------------------------------------------
