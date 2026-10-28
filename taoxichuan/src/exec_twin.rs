@@ -83,25 +83,6 @@ fn switch_to(_from: usize, _to: usize) {
     panic!("exec_twin: switch_to was called but the task switch lands with fork_process (slice 3)");
 }
 
-/// `X86ArchHooks::prepare_task_slot` — **lands with the per-slot state
-/// (slice 2)**; until then nothing can claim a slot, so a call is a boot-order
-/// bug and says so.
-fn prepare_task_slot(_slot: usize) -> Option<usize> {
-    panic!("exec_twin: prepare_task_slot was called but per-slot state lands in slice 2");
-}
-
-/// `X86ArchHooks::write_user_context` — **lands with the per-slot state
-/// (slice 2)**; see `prepare_task_slot`.
-fn write_user_context(_slot: usize, _ctx: &akuma_exec::process::UserContext) {
-    panic!("exec_twin: write_user_context was called but per-slot state lands in slice 2");
-}
-
-/// `X86ArchHooks::read_user_context` — **lands with the per-slot state
-/// (slice 2)**; see `prepare_task_slot`.
-fn read_user_context(_slot: usize) -> Option<akuma_exec::process::UserContext> {
-    panic!("exec_twin: read_user_context was called but per-slot state lands in slice 2");
-}
-
 /// `X86ArchHooks::allow_tick` — the frozen-clock escape, real: open a
 /// one-instruction interrupt window, then mask again. Meaningless without a
 /// tick; this kernel has one now (session pb). Nothing calls it until
@@ -149,7 +130,8 @@ pub fn init() {
     // its reason, not a bare `false`.
     akuma_threading::register_process_hooks(process_hooks());
 
-    // The machine effects. Stubs panic — see each fn.
+    // The machine effects. `switch_to` still names its slice (the switch is
+    // `fork_process`'s); the per-slot state arms landed in slice 2.
     akuma_threading::register_x86_arch_hooks(X86ArchHooks {
         switch_to,
         current_slot,
@@ -158,20 +140,15 @@ pub fn init() {
         can_run,
         transfer_lock_depth,
         allow_tick,
-        write_user_context,
-        read_user_context,
-        prepare_task_slot,
+        write_user_context: crate::child::write_user_context,
+        read_user_context: crate::child::read_user_context,
+        prepare_task_slot: crate::child::prepare_task_slot,
     });
 }
 
 /// The spawn ring's width, for `can_run`'s bounds check.
-// (One number, re-declared rather than widening `child::NSLOTS`'s visibility
-// for a hook nothing calls until slice 3.)
-const RING_SLOTS: usize = 4;
-
-/// The idle answer: the boot task. Nothing can call this until a picker
-/// exists (slice 3); the honest statement is that this core's "somewhere to
-/// go" is sshd, which the ring names [`NO_SLOT`].
+/// The idle answer: the boot task (`NO_SLOT` in the ring's naming). Nothing
+/// can call this until a picker exists (slice 3).
 fn idle_slot() -> usize {
     NO_SLOT
 }
@@ -179,7 +156,7 @@ fn idle_slot() -> usize {
 /// Pinning: nothing pins yet, so any slot in the ring (or the boot task) can
 /// run. `can_run` returns `false` only where a real pinning table would.
 fn can_run(slot: usize) -> bool {
-    slot == NO_SLOT || slot < RING_SLOTS
+    slot == NO_SLOT || slot < crate::child::NSLOTS
 }
 
 /// The BKL's recursion depth is per-thread and the lock per-core; this
