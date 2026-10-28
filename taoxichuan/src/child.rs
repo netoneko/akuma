@@ -534,6 +534,13 @@ pub fn task_exit_real(code: u64) -> ! {
     };
     crate::pipes::release_open_fds();
     if waiter != u32::MAX {
+        akuma_primitives::safe_print!(
+            96,
+            "[tmp] exit tid={} code={} wake={}\n",
+            cur as u64,
+            code,
+            waiter as u64
+        );
         akuma_threading::get_waker_for_thread(waiter as usize).wake();
     }
     akuma_threading::x86_finish_current()
@@ -1517,7 +1524,13 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
         if wnohang {
             return 0;
         }
+        // The stub's stash is a GLOBAL — every task's syscall entry overwrites
+        // it, so the parked task's own user RSP must be saved across the
+        // park and restored before its syscall returns (the stub tail reads
+        // the global, not a per-task copy).
+        let stash = ring3::user_rsp_stash();
         akuma_threading::schedule_blocking(u64::MAX);
+        ring3::set_user_rsp_stash(stash);
         // Woken (or the deadline passthrough never fires at u64::MAX): the
         // loop re-scans. Spurious wakes are fine — the scan decides.
     }

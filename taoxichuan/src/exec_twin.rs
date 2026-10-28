@@ -437,6 +437,12 @@ fn twin_bind_child_task(
 /// parent's TLS pointer in hardware, fork semantics.
 fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     let cur = crate::exec_twin::current_slot();
+    akuma_primitives::safe_print!(
+        96,
+        "[tmp] enter tid={} rip={:#x}\n",
+        cur as u64,
+        ctx.pc
+    );
     // The task record (not the bind table) is the root's authority — a real
     // child that has exec'd must enter on the NEW image's root.
     if cur != crate::exec_twin::NO_SLOT && cur < crate::child::NSLOTS + 1 {
