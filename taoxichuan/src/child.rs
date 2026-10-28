@@ -1561,9 +1561,15 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
         // it, so the parked task's own user RSP must be saved across the
         // park and restored before its syscall returns (the stub tail reads
         // the global, not a per-task copy).
+        // [tmp] trace (remove before final, session pf): pf-2 died right after
+        // a wait4 return of 0 with the caller never syscalling again — name
+        // the park (and the wake-back), so "never parked" vs "parked and
+        // spuriously resumed" is decidable from one console.
+        akuma_primitives::safe_print!(96, "[tmp] w4park slot={} pid={:#x} opt={:#x}\n", my_tid as u64, pid, options);
         let stash = ring3::user_rsp_stash();
         akuma_threading::schedule_blocking(u64::MAX);
         ring3::set_user_rsp_stash(stash);
+        akuma_primitives::safe_print!(96, "[tmp] w4resume slot={}\n", my_tid as u64);
         // Woken (or the deadline passthrough never fires at u64::MAX): the
         // loop re-scans. Spurious wakes are fine — the scan decides.
     }
