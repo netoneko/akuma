@@ -1,0 +1,38 @@
+# Gaps — what the kernel does not do yet
+
+Ranked by what blocks the ladder (`../README.md` § Status). Each entry names
+the probe that shows it. Known-open items from the M4 slice work are listed
+first.
+
+## Open on the current slice
+
+| # | gap | the probe that shows it |
+|---|---|---|
+| G1 | **PK2 open** (M4 slice-3 PH) | `docs/archive/TAOXICHUAN_M4_SLICE3_PH_RESULT.md` — the PK2 gate does not pass |
+| G2 | **Rare boot stall** | a boot that stops before the banner with no `[Fault]`; intermittent, not yet root-caused (same PH result doc) |
+| G3 | **No task switch on the tick** — `switch_to` panics | a second runnable task (fork with a parked parent) reaches `exec_twin::switch_to`; today nothing can (`reference/scheduling.md`) |
+| G4 | **Blocking fork is the whole concurrency story** (M2, THROWAWAY) | a pipeline whose writer outlives its reader's fork, or a fork of a fork child: `EPERM`. Depth 2 is the ceiling |
+| G5 | **No pump while a child runs** | TCP state stalls during a long-running spawned child; frames move again at its exit (`reference/devices.md` § the pump) |
+
+## Pinned exclusions (deliberate, load-bearing — not bugs)
+
+| exclusion | why | what lifts it |
+|---|---|---|
+| No scheduler | one core, nothing yields to | M4 slice 3 (`fork_process`) |
+| No BKL | every crate builds without `smp-shared`; no-ops are *correct* for one core | SMP slice 5 |
+| No pty, no signals, no users | the ladder has not needed them | a stage that does |
+| No PCI | Firecracker-style virtio-mmio is the pinned machine | a second machine |
+| No VFS mount table | one ext2 root | a second filesystem |
+| No page-fault handler → no CoW, no lazy mmap | a fault kills the task; eager copy is the honest answer | a fault path that demotes instead of kills |
+| No `munmap`/`mprotect` effects | slabs live as long as the task | a task that outlives its mappings |
+| No W^X | `PROT_EXEC` widens to RWX | a policy layer with a caller |
+| No stdin path | the console is write-only; CLOSE_CHILD_STDIN is a no-op success | an input device + a reader |
+| No wall clock on inodes | mount clock is `|| 0`; `utimensat` validates, does not stamp | `epoch=` anchoring reaching ext2 |
+| Identity map kept | the lower-half handoff has no customer | never required; per-task roots already lack it |
+
+## Ladder gaps (not started)
+
+| stage | target | notes |
+|---|---|---|
+| 8 | `git clone` | brief: `scripts/kvm/goose/taoxichuan-09j-stage8-git-clone.md` |
+| 9–12 | cargo fetch → rustc → cargo → fixed point | the agent log's gap list; tcc already compiles and runs a C program in the guest (agent log, "First compiler probes") |
