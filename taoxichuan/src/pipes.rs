@@ -65,12 +65,7 @@ fn park_once() {
 /// parked (a WAITING slot is not claimable, so it cannot be recycled under
 /// us) — the same bounded staleness `waiter` has.
 fn fire(wakes: akuma_pipes::Wakes<()>) {
-    // [tmp] trace (remove before final, session pf): prove whether fix B's
-    // fires are truly inert on F1's path (the pf-1 theory) or not.
-    wakes.fire(|tid, ()| {
-        akuma_primitives::safe_print!(64, "[tmp] pipe wake tid={}\n", tid as u64);
-        akuma_threading::get_waker_for_thread(tid).wake();
-    });
+    wakes.fire(|tid, ()| akuma_threading::get_waker_for_thread(tid).wake());
 }
 
 /// Every live pipe (the `EVENTFDS` pattern: one task runs at a time; the
