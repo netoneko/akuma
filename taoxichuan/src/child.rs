@@ -1739,7 +1739,7 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
                 192,
                 "[tmp] w4 reap c={} po={} by={}/{}\n",
                 child,
-                po,
+                parent_of(child),
                 my_tid,
                 my_pid
             );
