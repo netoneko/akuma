@@ -41,6 +41,11 @@ if [ "$MODE" = apk ]; then
   sh "$REPO/scripts/kvm/goose/mirror.sh" start >/dev/null 2>&1
   trap 'sh "$REPO/scripts/kvm/goose/mirror.sh" stop >/dev/null 2>&1' INT TERM EXIT
 fi
+# The heavy exec rides every run: the cheap gates are sub-tick and never
+# reproduce the stall (pl's first baseline: 4/4 clean), while every apk exec
+# in the saved logs stalled. mirror.sh runs for gates mode too.
+sh "$REPO/scripts/kvm/goose/mirror.sh" start >/dev/null 2>&1
+trap 'sh "$REPO/scripts/kvm/goose/mirror.sh" stop >/dev/null 2>&1' INT TERM EXIT
 
 clean=0; total=0; k=0
 while [ "$k" -lt "$N" ]; do
@@ -55,7 +60,8 @@ while [ "$k" -lt "$N" ]; do
   else
     set -- "F1:echo x > /tmp/f; cat /tmp/f; wc -c /tmp/f" \
            "PK1:yes | head -n 20000 | wc -l" \
-           "P1:echo hi | cat"
+           "P1:echo hi | cat" \
+           "APK:apk add git"
   fi
   verdict=""
   for spec in "$@"; do

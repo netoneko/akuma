@@ -397,7 +397,14 @@ fn timer_trap(t: &mut Trap<'_>) {
     // tick with no live slot must not switch (the same `may_park` discipline
     // the pipe arms and `wait4_real` keep).
     let slot = crate::exec_twin::current_slot();
-    if t.from_ring3()
+    // [tmp] pl-1 DIAGNOSTIC (remove before final): the preemption switch, off.
+    // H1 (PLAN-pl.md §3): the tick's x86_yield landing inside the only
+    // multi-tick ring-3 stretch (the exec'd child) breaks the crossing's
+    // resume state. This const removes ONLY the switch; on_tick and netpoll
+    // are untouched.
+    const PREEMPT_SWITCH_OFF: bool = true;
+    if !PREEMPT_SWITCH_OFF
+        && t.from_ring3()
         && slot != crate::exec_twin::NO_SLOT
         && slot < crate::child::NSLOTS
         && PREEMPT_ARMED.load(core::sync::atomic::Ordering::Acquire)
