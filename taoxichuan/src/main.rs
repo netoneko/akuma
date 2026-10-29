@@ -3147,7 +3147,21 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // nested-crossing arm below stays for the shell (the SPAWN
             // crossing's tail-exec handoff).
             if child::is_real_task() {
-                return child::exec_real_task(fr);
+                // [tmp] trace (session ph, boot ph-2): the REAL fork child's
+                // exec — entry, and the return (a return here is a FAILURE;
+                // success replaces the image and never comes back).
+                static XV_N: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                if XV_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                    akuma_primitives::safe_print!(
+                        96,
+                        "[tmp] xv in sl={}\n",
+                        crate::exec_twin::current_slot() as u64
+                    );
+                }
+                let r = child::exec_real_task(fr);
+                akuma_primitives::safe_print!(96, "[tmp] xv ret={:#x}\n", r);
+                return r;
             }
             if !child::nested_active() {
                 return e(ring3::err::ENOSYS);

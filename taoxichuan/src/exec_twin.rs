@@ -181,6 +181,13 @@ extern "C" fn idle_main() -> ! {
     // anything becomes READY. Without the yield, a woken task would wait
     // for... nothing: the waker only readies, it cannot switch.
     loop {
+        // M4 slice 3 (session ph): the NIC pump lives here too. The other
+        // pump sites are cooperative (socket waiters, sshd's serve loop);
+        // an all-parked system — the P1 wedge, every task WAITING — used to
+        // leave the NIC unposted and the relay deaf (rx_starved climbing,
+        // gw_frames frozen) with nobody to blame. The idle lap is the
+        // everything-path's last resort, one poll per lap.
+        crate::net::netpoll();
         crate::exec_twin::tick_window();
         if akuma_threading::x86_runnable_exists() {
             akuma_threading::x86_yield();
