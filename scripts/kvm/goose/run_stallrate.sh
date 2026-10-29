@@ -65,10 +65,16 @@ while [ "$k" -lt "$N" ]; do
     /bin/ssh -p "$SSHPORT" root@localhost "$cmd" >"$OUT/$g-stallrate$k.client" 2>&1 </dev/null &
     spid=$!
     n=0; saw=""
-    while kill -0 "$spid" 2>/dev/null && [ "$n" -lt 90 ]; do
+    # Wait for the console line, not for the client: the guest prints the exit
+    # line a beat before the client finishes draining (run_fork's lesson).
+    while [ "$n" -lt 90 ]; do
       if conslice "$g_old" "$g_mark" 2>/dev/null | grep -q 'Exit status:'; then saw=1; break; fi
       sleep 1; n=$((n+1))
     done
+    if [ -n "$saw" ]; then
+      g2=0
+      while kill -0 "$spid" 2>/dev/null && [ "$g2" -lt 30 ]; do sleep 1; g2=$((g2+1)); done
+    fi
     win=$(conslice "$g_old" "$g_mark" 2>/dev/null)
     if [ -n "$saw" ] && echo "$win" | grep -q 'Exit status: 0'; then
       echo "  $g CLEAN"
