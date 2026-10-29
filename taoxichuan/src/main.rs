@@ -181,7 +181,44 @@ const TRAP_STACK_SIZE: usize = 16 * 1024;
 #[repr(align(16))]
 struct TrapStack(#[allow(dead_code)] [u8; TRAP_STACK_SIZE]);
 
-static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);static mut TSS: akuma_gdt::Tss = akuma_gdt::Tss::new();
+static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);
+
+/// Per-slot ring-3 trap stacks (session pf preemption, plan §5): a ring-3 trap
+/// switches to the TSS `rsp0`, so a preempting timer switch must leave the
+/// interrupted frame on a stack the next ring-3 trap cannot clobber — one per
+/// slot. Indexed by the same numbers `switch_to` sees: shell slots `0..NSLOTS`,
+/// `NSLOTS` = the idle thread. `gdt_init` arms the global `TRAP_STACK` first
+/// (it serves every task's ring-3 traps until its first switch arms its own,
+/// and by then all other ring-3 tasks own their private stacks).
+static mut TRAP_STACKS: [TrapStack; crate::child::NSLOTS + 1] =
+    [const { TrapStack([0; TRAP_STACK_SIZE]) }; crate::child::NSLOTS + 1];
+
+/// Arm the ring-3 trap stack for slot `slot` — called from
+/// `exec_twin::switch_to`, the X86ArchHooks body, so the field travels with
+/// the task the way amd64's hook set travels it ("the ring-3 trap stack in
+/// the TSS"). Out-of-range slots keep whatever is armed.
+pub(crate) fn arm_trap_stack(slot: usize) {
+    if slot >= crate::child::NSLOTS + 1 {
+        return;
+    }
+    // SAFETY: single core, IF clear on every caller path (switch_to runs at a
+    // park/preemption point with interrupts masked); the statics are only
+    // touched through raw pointers, never references.
+    unsafe {
+        let top = (&raw const TRAP_STACKS[slot] as *const u8)
+            .add(TRAP_STACK_SIZE) as u64;
+        (*&raw mut TSS).set_rsp0(top);
+    }
+}
+static mut TSS: akuma_gdt::Tss = akuma_gdt::Tss::new();
+
+/// Timer-preemption era flag (session pf, plan §5): set at the first SPAWN
+/// crossing — the tick switch runs only once user tasks exist. The pf-6
+/// bisect showed the switch killing pre-ring-3 boots deterministically, in a
+/// window with no legal switch target; before the first spawn there is
+/// nothing to preempt and the tick must not switch at all.
+pub(crate) static PREEMPT_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 static mut GDT: [u64; akuma_gdt::SLOTS] = [0; akuma_gdt::SLOTS];
 
 /// Build the GDT and TSS, load both. One core; the entries are byte-identical
@@ -327,11 +364,58 @@ plain_stubs_code! {
 /// nothing yet. **No task switch**: a tick that fires while ring 3 runs (the
 /// only place IF is set — every kernel path runs with interrupts masked)
 /// returns to the same instruction. The switch lands with `fork_process`.
-fn timer_trap(_t: &mut Trap<'_>) {
+fn timer_trap(t: &mut Trap<'_>) {
     // The count is the twin's uptime clock (exec_twin::uptime_us); the trap
     // itself needs nothing back — a tick returns to the same instruction. The
     // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
-    let _ = akuma_lapic_amd64::on_tick();
+    // The count is the twin's uptime clock (exec_twin::uptime_us); the trap
+    // itself needs nothing back — a tick returns to the same instruction. The
+    // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
+    let n = akuma_lapic_amd64::on_tick();
+    let _ = n;
+    // M4 slice 3 preemption (session pf, plan §5): a tick that interrupted
+    // ring 3 may switch — the same `x86_yield` the park loop and the idle lap
+    // already run, on this handler's own (per-slot, `arm_trap_stack`) trap
+    // stack; the interrupted frame survives the stack switch, and `on_tick`
+    // has already EOI'd, so the LAPIC can deliver the next tick to whichever
+    // task runs after this returns. Nothing else is READY ⇒ a documented
+    // no-op. Kernel paths run IF-masked, so ring 0 is never switched here: a
+    // ring-0 tick lands only in the idle window, which self-yields.
+    //
+    // **The user-era gate** (pf-6 bisect): pf-5/pf-6 died INSIDE net
+    // calibrate — pre-ring-3, pre-first-wd, deterministically with this gate
+    // live and never with it out — a window where no legal switch target
+    // exists. So the switch arms with the FIRST SPAWN crossing
+    // (`PREEMPT_ARMED`, set in `spawn_arm`): before it the machine is
+    // kernel-only and the tick behaves exactly like the boots that worked;
+    // after it, ring 3 exists and preemption is the point.
+    //
+    // **The slotted-current gate** (pf-7's panic, named by the raw print):
+    // `akuma-threading:3652 THREAD_STATES[cur]` with cur = usize::MAX — after
+    // an exec'd shell's exit tears its slot down, a ring-3 tick can fire with
+    // NO_SLOT current; the crate's switch engine indexes by current tid, so a
+    // tick with no live slot must not switch (the same `may_park` discipline
+    // the pipe arms and `wait4_real` keep).
+    let slot = crate::exec_twin::current_slot();
+    if t.from_ring3()
+        && slot != crate::exec_twin::NO_SLOT
+        && slot < crate::child::NSLOTS
+        && PREEMPT_ARMED.load(core::sync::atomic::Ordering::Acquire)
+    {
+        akuma_threading::x86_yield();
+    }
+    // **The netpoll backstop** (session ph, boot ph-5's P2 stall): the guest's
+    // other pumps are all task-context (sshd's serve-loop sleep, the DHCP
+    // wait, the NetRuntime hooks) — and a ring-3 resident with NO_SLOT (the
+    // boot image's init: wd's slot/tid=u64::MAX lines, permanent in every
+    // gate window) can hold the core for seconds, because the gate above
+    // must not switch it. Boot ph-5's P battery saw exactly that shape:
+    // ~10 s with gw_frames_from_guest frozen (the stack stopped talking)
+    // until the client's handshake watchdog gave up — KVM_RELAY_SYN_STALL's
+    // symptom row. One drained lap per tick caps any such window at ~10 ms:
+    // the by-construction servicing the other kernels get from their
+    // interrupt face. netpoll guards itself (NET_UP/IN_LAP); see net.rs.
+    crate::net::netpoll();
 }
 
 /// The tick source (session pb): the extracted crate's timer face over the
@@ -648,7 +732,24 @@ struct Task {
     fd_nonblock: fdtable::FlagSet,
 }
 
-static mut TASKS: [Task; 3] = [Task::new(), Task::new(), Task::new()];
+static mut TASKS: [Task; 16] = [
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+    Task::new(),
+];
 /// Which slot `task()` hands out: 0 is the boot's init task (sshd for this
 /// stage's gate), 1 is the child running inside a SPAWN (`child.rs`), and 2
 /// is a fork child running inside that child (child.rs's M2 scaffold).
@@ -672,17 +773,21 @@ impl Task {
     }
 }
 
-/// Switch which task slot the syscall path acts on (the SPAWN arm and the
-/// child exit, both in `child.rs`).
-fn set_task_slot(i: usize) {
+/// Switch which task slot the syscall path acts on (the SPAWN arm, the
+/// child exit, and slice 3's `twin_enter_user` — which points the record at
+/// the incoming real task).
+pub(crate) fn set_task_slot(i: usize) {
     // SAFETY: single core, `IF` clear — the same discipline as `task()`.
     unsafe {
         *core::ptr::addr_of_mut!(TASK_SLOT) = i;
     }
 }
 
-/// Both slots, for the spawn path (it snapshots the parent's `root_pa`).
-fn task_slots() -> &'static mut [Task; 3] {
+/// Every slot, for the spawn path and slice 3's real tasks: 0 is the boot's
+/// init task (sshd), 1 the shell inside its SPAWN crossing, and `tid + 1`
+/// (for threading tid `tid` >= 1) a real fork child — `bind_child_task`
+/// stamps it, `switch_to` reads its root.
+pub(crate) fn task_slots() -> &'static mut [Task; 16] {
     // SAFETY: as `task`.
     unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
 }
@@ -975,10 +1080,7 @@ fn open_common(path: &str, flags: u64) -> u64 {
 /// (`write_at_by_inode`) extends the file as the offset passes its end, and
 /// the fd's size/cursor follow the bytes that landed.
 fn write_file_arm(fd: u64, buf: u64, len: u64) -> u64 {
-    let r = write_file_arm_inner(fd, buf, len);
-    // Stage-7 probe: which file writes move and which stall (H3's echo).
-    akuma_primitives::safe_print!(96, "  [w] fd={} len={} -> {}\n", fd, len, r);
-    r
+    write_file_arm_inner(fd, buf, len)
 }
 
 fn write_file_arm_inner(fd: u64, buf: u64, len: u64) -> u64 {
@@ -1034,12 +1136,7 @@ fn write_file_arm_inner(fd: u64, buf: u64, len: u64) -> u64 {
 /// the fd used to fail EBADF there and stdio swallowed the error, which is
 /// why the file was created empty with a silent rc 1 (stage 7 session A).
 fn writev_file_arm(fd: u64, data: &[u8]) -> u64 {
-    let r = writev_file_arm_inner(fd, data);
-    // The writev twin of the [w] probe: which file writes ride writev
-    // (U1's settle — musl's stdio flushes through writev even for one
-    // buffer, ash's builtin echo flushes through write).
-    akuma_primitives::safe_print!(96, "  [wv] fd={} len={} -> {}\n", fd, data.len() as u64, r);
-    r
+    writev_file_arm_inner(fd, data)
 }
 
 fn writev_file_arm_inner(fd: u64, data: &[u8]) -> u64 {
@@ -1322,30 +1419,6 @@ fn fs_err(err: akuma_vfs::FsError) -> u64 {
     }
 }
 
-/// Reverse-map a syscall number to its name, for the unhandled arm — each
-/// boot then reads as a checklist instead of a table of bare numbers.
-/// Name a syscall for the console's unhandled-syscall line. Trim step 2,
-/// family 5: the Linux x86_64 names are `akuma_syscalls_abi`'s now — the same
-/// table rows `Syscall::from_x86_64` decodes — so this kernel's diagnostics
-/// cannot drift from the numbering table it shares with the full kernels.
-/// (The Debug spelling is CamelCase and one name per number, where the old
-/// hand table had lowercase and "poll/ppoll" merges: console evidence only,
-/// no bytes cross to the guest.) The three akuma-private numbers (0x1000+,
-/// above every real x86_64 number) keep their local names; anything neither
-/// table knows stays "?".
-fn nr_name(nr: u64) -> alloc::string::String {
-    match nr {
-        ring3::nr::WAITPID => return "akuma-waitpid".into(),
-        ring3::nr::CLOSE_CHILD_STDIN => return "akuma-close-child-stdin".into(),
-        ring3::nr::UPTIME => return "akuma-uptime".into(),
-        _ => {}
-    }
-    match akuma_syscalls_abi::Syscall::from_x86_64(nr) {
-        Some(s) => alloc::format!("{s:?}"),
-        None => "?".into(),
-    }
-}
-
 /// Fill the x86_64 `struct stat` (144 bytes) at the task's `buf`: device
 /// numbers and all times zero (one disk, no clock), the rest from the
 /// arguments. `Err(errno)` on a bad task pointer.
@@ -1568,6 +1641,14 @@ pub(crate) fn eventfd_can_read(idx: usize) -> bool {
     eventfds()[idx].as_ref().is_some_and(|ef| ef.can_read())
 }
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
+    dispatch_inner(fr)
+}
+
+fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
+    // M4 slice 3: the per-syscall capture `fork_process` step 6 consumes
+    // (`get_saved_user_context` → the twin's `read_user_context`). The boot
+    // task has no slot and skips; a slotted task pays one struct copy.
+    crate::child::capture_user_context(fr);
     match fr.rax {
         ring3::nr::WRITE => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
@@ -1668,6 +1749,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
             }
             let mut efd_idx: usize = usize::MAX;
+            let mut pipe_id: usize = usize::MAX;
             let kind = fd_table().with(fd as u32, |d| match d {
                 OpenFile::Socket(_) => 1,
                 OpenFile::File { .. } => 2,
@@ -1676,9 +1758,22 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     efd_idx = *slot;
                     4
                 }
+                // M4 slice 3 (session pf, plan §5): the pipe arm writev fell
+                // through to the nested-child/console fallback — the WRITE arm
+                // has routed bound pipe fds since 6879eb47, WRITEV forgot the
+                // kind, and a pipeline member's stdio flush then bypassed the
+                // fix-B arms entirely (the pf-3 wedge: musl __stdio_write's
+                // writev retry loop on an answer that never drains).
+                OpenFile::Pipe(id, true) => {
+                    pipe_id = *id as usize;
+                    5
+                }
                 _ => 0,
             });
             match kind {
+                Some(5) => {
+                    return crate::pipes::write_arm_gathered(pipe_id as u32, &data);
+                }
                 Some(1) => {
                     let Some(idx) = sock::fd_socket(fd) else {
                         return e(ring3::err::EBADF);
@@ -1688,8 +1783,12 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                         Err(err) => err,
                     };
                 }
-                Some(2) => return writev_file_arm(fd, &data),
-                Some(3) => return total, // /dev/null: gone, but accepted
+                Some(2) => {
+                    return writev_file_arm(fd, &data);
+                }
+                Some(3) => {
+                    return total; // /dev/null: gone, but accepted
+                }
                 // Linux's writev on an eventfd writes only the first 8
                 // bytes of the gather; libcurl's wakeup write(2) never
                 // comes through writev, but the number must not EBADF.
@@ -1735,12 +1834,26 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             let code = fr.arg1() & 0xFF; // what wait(2) would see
             let t = task();
             t.exit = Some(code);
+            // Slice 3 FIRST: a REAL fork child's exit is a task exit — status
+            // into the slot, its pipe references dropped, the wait4-parked
+            // parent woken, the threading slot terminated (never returns to
+            // the stub: `x86_finish_current` switches away for good). This
+            // test must outrank `nested_active()`: a real child runs at its
+            // own slot (1..NSLOTS), which made `nested_active()` true for it
+            // too and sent its exit_group down the M2 coroutine path — whose
+            // `exit_cross` restores a CrossSave `bind_child_task` never wrote
+            // and `ret`s through a zeroed return address (session pe: pd's
+            // deterministic rip=0).
+            if child::is_real_task() {
+                child::task_exit_real(code)
+            }
             // Stage 4: a nested child's exit does NOT reach the reaper — it
             // hands the machine back to the parent (`child.rs`'s model:
             // run-to-completion inside the SPAWN syscall, coroutine-style
             // return). The boot's own sequential tasks still chain through
-            // `task_done` exactly as stage 3 left them.
-            if child::nested_active() {
+            // `task_done` exactly as stage 3 left it. This arm is now the
+            // SHELL's exit only (slot 0): every fork child is a real task.
+            else if child::nested_active() {
                 child::child_exit(code)
             }
             // Stage 3: not a halt — the report and the next spawn (or the
@@ -1784,7 +1897,17 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     // `akuma_cpu::msr::set_fs_base` is the closed wrmsr path,
                     // canonical-check included.
                     match akuma_cpu::msr::set_fs_base(addr) {
-                        Ok(()) => 0,
+                        Ok(()) => {
+                            // Session pi: keep the per-slot shadow in step —
+                            // this MSR is per-core and `switch_to` installs
+                            // the shadow, so a runtime TLS change must land
+                            // in both or the next park-resume rolls back.
+                            crate::child::set_slot_fs(
+                                crate::exec_twin::current_slot(),
+                                addr,
+                            );
+                            0
+                        }
                         Err(_) => e(ring3::err::ERANGE),
                     }
                 }
@@ -1802,11 +1925,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                     0
                 }
-                other => {
-                    // Name the gap: an arch code this table does not serve.
-                    // (The *syscall-level* checklist arm is at the bottom of
-                    // the dispatcher's own match.)
-                    akuma_primitives::safe_print!(160, "  [sc] arch_prctl code {}\n", other);
+                _other => {
                     e(ring3::err::ENOSYS)
                 }
             }
@@ -2867,12 +2986,14 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             0
         }
         ring3::nr::EXECVE => {
-            // No fork exists to return to, so in the run-to-completion model
-            // an exec from the nested child IS the handoff: ash's tail-call
-            // exec of the one command in `sh -c` (busybox skips the fork for
-            // a trailing simple command), and every program line the gates
-            // run reaches the kernel this way. Outside a nested child there
-            // is no task this kernel could replace — say ENOSYS.
+            // Slice 3: a REAL fork child (its own threading slot, published
+            // by `fork_process`) execs the way Linux does — its image is
+            // replaced, its fds survive, its thread keeps running. The M2
+            // nested-crossing arm below stays for the shell (the SPAWN
+            // crossing's tail-exec handoff).
+            if child::is_real_task() {
+                return child::exec_real_task(fr);
+            }
             if !child::nested_active() {
                 return e(ring3::err::ENOSYS);
             }
@@ -2896,11 +3017,9 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // amd64 box needed this row for the same caller).
             sock::getpeername_arm(fr.arg1(), fr.arg2(), fr.arg3())
         }
-        other => {
-            // Name the gap: a guest task hit a number this table does not
-            // serve. The name first, then the raw number — each boot reads
-            // as a checklist of exactly what is still missing.
-            akuma_primitives::safe_print!(160, "  [sc] unhandled {} ({})\n", nr_name(other), other);
+        _other => {
+            // A guest task hit a number this table does not serve; the errno
+            // is the answer (the arch-level checklist arm is above).
             e(ring3::err::ENOSYS)
         }
     }
@@ -3129,6 +3248,40 @@ fn task_done(code: u64) -> ! {
 /// (a RW mapping would be NX and the child would fault on its first
 /// instruction), RO data stays RO. Huge (PS) leaves are refused: the loader
 /// maps 4 KiB pages only, and refusing beats silently sharing a 2 MiB page.
+pub(crate) fn clone_user_half(parent_root: u64, dst_root: u64) -> Option<()> {
+    // The `fork_share_memory` pass, INTO a root that already exists —
+    // `fork_process` step 1 handed the child a fresh `UserAddressSpace` and
+    // the hook fills it. The kernel half copies wholesale from the live CR3
+    // (the same upper-half copy `load_task` gives every task root — the
+    // fresh root from the crate shares only amd64's trio 256/257/511, and
+    // this kernel's convention is the full upper half). The user half clones
+    // the parent's subtrees leaf-by-leaf through `clone_user_tree`.
+    // SAFETY: both roots are PMM-resident page-table frames inside the
+    // physmap; the forking parent is parked and this kernel is single-core
+    // with IF clear — the discipline that owns every page-table touch here.
+    unsafe {
+        let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
+        let ktbl = phys::phys_ptr::<[u64; 512]>(kroot);
+        let dst = phys::phys_ptr::<[u64; 512]>(dst_root);
+        for i in 256..512 {
+            (*dst)[i] = (*ktbl)[i];
+        }
+        let src = phys::phys_ptr::<[u64; 512]>(parent_root);
+        for i in 0..256 {
+            let entry = (*src)[i];
+            if entry & 1 == 0 {
+                continue;
+            }
+            if entry & 0x080 != 0 {
+                return None; // a 1 GiB leaf: see fork_share_memory's note
+            }
+            let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2)?;
+            (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
+        }
+    }
+    Some(())
+}
+
 pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
     let root_page = akuma_pmm::alloc_page_zeroed()?;
     let root = root_page as u64;
@@ -3699,13 +3852,40 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
     halt();
 }
 
+/// Session pf: straight at the UART, no budget, no allocator — the panic
+/// path's first words, so a panicking kernel can never die silent again
+/// (pf-5's VM exit printed nothing).
+pub(crate) fn raw_uart(bytes: &[u8]) {
+    for &b in bytes {
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") 0x3f8u16, in("al") b, options(nostack, preserves_flags));
+        }
+    }
+}
+
+fn raw_dec(mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    raw_uart(&buf[i..]);
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    raw_uart(b"\n[PANIC] ");
     if let Some(loc) = info.location() {
-        akuma_primitives::safe_print!(192, "PANIC {}:{}\n", loc.file(), loc.line());
-    } else {
-        akuma_primitives::safe_print!(64, "PANIC <no location>\n");
+        raw_uart(loc.file().as_bytes());
+        raw_uart(b":");
+        raw_dec(loc.line() as u64);
     }
+    raw_uart(b"\n");
     akuma_primitives::safe_print!(256, "       {}\n", info.message());
     halt();
 }

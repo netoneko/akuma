@@ -645,7 +645,7 @@ fn connect_wait(idx: usize) -> u64 {
         if now.saturating_sub(start) >= 15_000_000 {
             return crate::e(crate::err::ETIMEDOUT);
         }
-        core::hint::spin_loop();
+        crate::net::wait_lap();
     }
 }
 

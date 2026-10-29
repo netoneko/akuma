@@ -29,6 +29,11 @@ const RESOLV: &[u8] = b"nameserver 10.0.2.3\n";
 const REPOSITORIES: &[u8] = b"http://192.168.1.159:8123/main\n";
 const NSLOOKUP: &str = "/bin/nslookup";
 const NSLOOKUP_TARGET: &str = "busybox";
+// Session pg: PK1's pipeline is `yes | head -n 20000 | wc -l` and the image's
+// SERVE list has no yes link either — the inner sh answered `yes: not found`
+// (exit 127) with the kernel-side pipeline chain itself green (boot pg-6).
+const YES: &str = "/bin/yes";
+const YES_TARGET: &str = "busybox";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -62,6 +67,40 @@ fn main() {
         println!("devroot-ensure: {NSLOOKUP} -> {NSLOOKUP_TARGET} created");
     } else {
         println!("devroot-ensure: {NSLOOKUP} already present");
+    }
+    if ops.ensure_symlink(YES, YES_TARGET) {
+        println!("devroot-ensure: {YES} -> {YES_TARGET} created");
+    } else {
+        println!("devroot-ensure: {YES} already present");
+    }
+
+    // [tmp] wedge-Q7 (remove with the [tmp] set): opt-in bake of an
+    // instrumented /bin/sshd (RESULT-Q6 §4 item 1: bake, don't swap). When
+    // AKUMA_DEVROOT_BAKE_SSHD points at a built sshd (the one carrying the
+    // bridge iters/reaped prints), overwrite the image's /bin/sshd with it so
+    // the instrument serves from boot one — no wget/killall/respawn question.
+    // The file already exists in the image (755), so create_write truncates in
+    // place and the mode survives; read-back assert proves the landing.
+    if let Ok(src) = std::env::var("AKUMA_DEVROOT_BAKE_SSHD") {
+        let sshd = std::fs::read(&src).unwrap_or_else(|e| panic!("read {src}: {e}"));
+        ops.create_write("/bin/sshd", &sshd);
+        let got = ops.read_all("/bin/sshd");
+        assert_eq!(got, sshd.len(), "/bin/sshd read-back size");
+        println!("devroot-ensure: baked /bin/sshd = {} bytes from {src} (read back OK)", got);
+    }
+
+    // M4 slice 3 (session pf): opt-in bake of the grandfork probe as
+    // /bin/grandfork, so PK2 runs from boot one. Same bake-don't-swap
+    // pattern as the sshd opt-in above. A NEW file gets DEFAULT_FILE_PERMS
+    // (0644, akuma-ext2/src/ext2.rs:752) — the guest kernel execs any
+    // readable ELF (load_task never checks the x bit), so 0644 is fine.
+    // Remove with the [tmp] set when slice 4 ships probes in the image.
+    if let Ok(src) = std::env::var("AKUMA_DEVROOT_BAKE_FORKPROBE") {
+        let gf = std::fs::read(&src).unwrap_or_else(|e| panic!("read {src}: {e}"));
+        ops.create_write("/bin/grandfork", &gf);
+        let got = ops.read_all("/bin/grandfork");
+        assert_eq!(got, gf.len(), "/bin/grandfork read-back size");
+        println!("devroot-ensure: baked /bin/grandfork = {} bytes from {src} (read back OK)", got);
     }
 
     // Opt-in bake (wedge-Q7) of an

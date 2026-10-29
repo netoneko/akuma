@@ -1277,7 +1277,9 @@ dependencies = [
  "akuma-fdtable",
  "akuma-gdt",
  "akuma-idt-amd64",
+ "akuma-isolation",
  "akuma-lapic-amd64",
+ "akuma-mmu",
  "akuma-net",
  "akuma-pipes",
  "akuma-pmm",
@@ -1291,8 +1293,10 @@ dependencies = [
  "akuma-syscalls-poll",
  "akuma-threading",
  "akuma-trap-amd64",
+ "akuma-tty",
  "akuma-vfs",
  "akuma-virtio",
+ "spinning_top",
 ]
 
 [[package]]

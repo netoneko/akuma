@@ -2,7 +2,7 @@
 
 Twin of the `exec_runtime.rs` / `sched.rs` registrations (amd64 side), written after
 session pb linked `akuma-exec` + `akuma-threading` (PB1) and gave taoxichuan a tick
-(`akuma-lapic-amd64`, PB5). User's decisions: **preemption, not cooperative-only**
+(`akuma-lapic-amd64`, PB5). Owner's decisions: **preemption, not cooperative-only**
 (nothing in the git/cargo ladder works without it), and the design is **SMP-ready**
 with SMP itself a follow-on slice. Every claim not read in source this session is
 marked **UNCHECKED**.

@@ -66,6 +66,30 @@ pub fn set_current_slot(slot: usize) {
     }
 }
 
+/// The threading tid the CURRENT M2 shell is registered under. The shell's
+/// tid is its spawn-ring slot (child.rs registers with `tid = slot_idx`), so
+/// this is written at every SPAWN crossing — the M2 model has one live shell
+/// at a time. The switch_to doc's older "tid 0 is the shell" held only for a
+/// boot whose first login spawn landed on slot 0; the sched_* maps key on
+/// this recorded tid now (session pe boot D/E: the wake switched the shell
+/// back under `sched_root_of(2)` = a stale fork-child record, and the shell
+/// resumed on an exec-swept address space whose stack pages read zero).
+static mut SHELL_THREAD_TID: usize = 0;
+
+/// The spawn crossing names the shell's threading tid. SAFETY: syscall-path
+/// discipline (single core, IF clear), as `CURRENT`.
+pub fn set_shell_tid(tid: usize) {
+    unsafe {
+        *core::ptr::addr_of_mut!(SHELL_THREAD_TID) = tid;
+    }
+}
+
+/// SAFETY: as [`set_shell_tid`].
+#[must_use]
+pub fn shell_tid() -> usize {
+    unsafe { core::ptr::read_volatile(&raw const SHELL_THREAD_TID) }
+}
+
 /// The twin's clock: ticks × 10 ms. `saturating_mul` so a ~584-million-year
 /// uptime wraps to "forever" instead of truncating into the past.
 #[must_use]
@@ -75,12 +99,128 @@ pub fn uptime_us() -> u64 {
 
 // ── the X86ArchHooks bodies (the per-core machine effects) ──────────────────
 
-/// `X86ArchHooks::switch_to` — **lands with `fork_process` (slice 3)**, the
-/// plan's own placement: the switch is the thing `fork_process` adds, and
-/// nothing on this kernel can reach it before that (no threads exist, so no
-/// pick loop runs). Loud rather than silently wrong.
-fn switch_to(_from: usize, _to: usize) {
-    panic!("exec_twin: switch_to was called but the task switch lands with fork_process (slice 3)");
+/// `X86ArchHooks::switch_to` — **real (slice 3)**: the machine effects of a
+/// park-point switch. `akuma-threading`'s `x86_yield_now` has already named
+/// `next` current and will move the stacks itself (`x86_switch_context` is
+/// the crate's own x86 asm); what the machine still needs from the twin is
+/// the incoming task's syscall band and its CR3. The shell is threading tid
+/// `shell_tid()` — its spawn-ring slot, written at every SPAWN crossing (it
+/// was once hardcoded 0, which only held for a boot's first login spawn) —
+/// with its SPAWN crossing band and task record 1; 1..NSLOTS real children
+/// (leaked pairs, task record tid+1); anything else the idle thread (stack
+/// below, CR3 untouched — it runs on the kernel root). `from` needs nothing:
+/// the crate saves its context.
+fn switch_to(from: usize, to: usize) {
+    let _ = from;
+    // (session pg: the per-switch `[tmp] sw to=` print lived here — at
+    // preemption scale it rotated the console log every ~30 s and ate the
+    // gate verdicts; removed before the first gate boot per PLAN-pg §5.)
+    let top = crate::child::sched_kstack_top(to);
+    akuma_ring3_amd64::set_syscall_stack_top(top);
+    // Session pg fix (the exec'd shell's writev loop, boot pg-2's
+    // l0=0 l1=0 br=11 dlen=0 ans=0): the dispatcher's `task()` is
+    // `TASKS[TASK_SLOT]` — every syscall's fd table, root_pa and regions
+    // source. Crossings set TASK_SLOT (`twin_enter_user`), but a park-resume
+    // of ANOTHER task followed by a tick switch back left it naming the
+    // resumer's record: the fork child then ran with another task's root_pa,
+    // its writev gather read zeros out of the wrong address space, and musl's
+    // `__stdio_write` spun forever on the 0 answer. Keep it in step with the
+    // CR3 loaded below — the same discipline the sched maps already follow
+    // (session pe boot D/E: the shell resumed under a stale record whose
+    // stack pages read zero). The idle thread (tid >= NSLOTS) runs kernel
+    // code only and leaves the previous task's slot armed, exactly as it
+    // leaves CR3.
+    if to < crate::child::NSLOTS {
+        crate::set_task_slot(crate::child::sched_task_slot_of(to));
+    }
+    // Session pf preemption: the incoming task's own ring-3 trap stack — a
+    // preempting switch leaves the interrupted frame on the interrupted task's
+    // stack, so the next ring-3 trap on any task must not land there.
+    crate::arm_trap_stack(to);
+    let root = crate::child::sched_root_of(to);
+    if root != 0 {
+        // SAFETY: `root` is a PMM-resident page-table frame naming the
+        // incoming task's image and the shared kernel half — the same load
+        // every crossing here performs. Single core, IF clear, no TLB
+        // aliasing to flush (PCID unused, CR3 writes flush non-global).
+        unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+    }
+    // Session pi: restore the incoming task's own fs. The MSR is per-core
+    // and every switch used to leave it holding the OUTGOING side's (or any
+    // earlier task's) TLS pointer — the parked-resume defect that only
+    // grandfork (the first image with its own TLS) could surface. One wrmsr
+    // per switch, incoming slot's shadow; the idle thread (to >= NSLOTS)
+    // runs kernel code only and is skipped.
+    let _ = akuma_cpu::msr::set_fs_base(crate::child::slot_fs_of(to));
+}
+
+/// The idle thread's tid: outside the spawn ring (children claim 1..NSLOTS,
+/// the shell is 0), so no array index collides. Its stack is leaked once,
+/// below; its CR3 is the kernel's (sched_root_of answers 0).
+pub const IDLE_TID: usize = crate::child::NSLOTS;
+
+static IDLE_STACK: spin_idle::Once<U64Arr> = spin_idle::Once::NEW;
+type U64Arr = alloc::boxed::Box<[u64; 2048]>;
+mod spin_idle {
+    //! One-shot init for the idle stack — `Once` without a lock dependency
+    //! (single core, IF clear at every caller).
+    pub struct Once<T>(core::cell::UnsafeCell<Option<T>>);
+    impl<T> Once<T> {
+        pub const NEW: Self = Once(core::cell::UnsafeCell::new(None));
+        /// SAFETY: single core, IF clear (the registration path).
+        pub fn call(&self, make: impl FnOnce() -> T) -> *mut T {
+            unsafe {
+                let p = &mut *self.0.get();
+                if p.is_none() {
+                    *p = Some(make());
+                }
+                p.as_mut().unwrap_unchecked()
+            }
+        }
+    }
+    // SAFETY: only touched from the single-core IF-clear path.
+    unsafe impl<T> Sync for Once<T> {}
+}
+
+extern "C" fn idle_main() -> ! {
+    // The idle loop: keep the tick alive (one `sti` window per lap — the
+    // clock is what timed parks and uptime read) and yield the moment
+    // anything becomes READY. Without the yield, a woken task would wait
+    // for... nothing: the waker only readies, it cannot switch.
+    // Session pj (pi's HI1, closed at the contract level): when NOTHING is
+    // runnable, HALT — `net::wait_lap` (sti;hlt;cli), the same lap every
+    // parked waiter has used since ph. This is the one idle-contract clause
+    // the other kernels all have and this kernel lacked (amd64
+    // machine.rs:517 "A halted processor wakes when something can be offered
+    // to it"; kernel-glue idle_halt: without it the idle thread pins the
+    // host vCPU at 100%). The relay thread shares this vCPU's ONE pinned
+    // host core, and only a halted vCPU ever hands that core back — a
+    // spinning idle lap's netpoll cannot receive what the starved relay
+    // cannot run to deliver. The 100 Hz tick wakes the halt; the yield
+    // check stays after the lap.
+    loop {
+        // The NIC pump: one poll per lap (per tick-wake now). The idle lap
+        // is the everything-path's last resort — an all-parked system used
+        // to leave the NIC unposted and the relay deaf.
+        crate::net::netpoll();
+        crate::exec_twin::tick_window();
+        if akuma_threading::x86_runnable_exists() {
+            akuma_threading::x86_yield();
+        } else {
+            crate::net::wait_lap();
+        }
+    }
+}
+
+/// Seed the idle thread once (from `init`): claim nothing — the tid is ours
+/// by const — seed the entry, publish READY.
+fn seed_idle() {
+    // SAFETY: single core, IF clear — the registration path owns the Once.
+    let stack: &'static mut [u64; 2048] =
+        unsafe { &mut *IDLE_STACK.call(|| alloc::boxed::Box::new([0u64; 2048])) };
+    let top = ((core::ptr::from_mut(stack) as *const u64 as usize) + 2048 * 8) & !0xf;
+    akuma_threading::x86_seed_entry(IDLE_TID, top, idle_main);
+    akuma_threading::x86_publish(IDLE_TID);
 }
 
 /// `X86ArchHooks::allow_tick` — the frozen-clock escape, real: open a
@@ -88,8 +228,18 @@ fn switch_to(_from: usize, _to: usize) {
 /// tick; this kernel has one now (session pb). Nothing calls it until
 /// blocking syscalls arrive (slice 3) — a kernel that runs IF=0 everywhere
 /// already gets its ticks in ring 3.
-fn allow_tick() {
-    // SAFETY: `sti`/`cli` are unconditionally executable at ring 0 and touch
+/// The idle loop's clock feeder — the same one-instruction window
+/// [`allow_tick`] opens, under a name the idle thread can reach.
+pub fn tick_window() {
+    // SAFETY: `sti`/`cli` at ring 0 touch no memory or stack; the window is
+    // one instruction wide and the tick handler is bounded, so the worst a
+    // tick in the window does is count.
+    unsafe {
+        core::arch::asm!("sti", "nop", "cli", options(nomem, nostack, preserves_flags));
+    }
+}
+
+fn allow_tick() {    // SAFETY: `sti`/`cli` are unconditionally executable at ring 0 and touch
     // no memory or stack; the window is one instruction wide and the tick
     // handler (`timer_trap`) is bounded and allocation-free, so the worst a
     // tick in the window does is count.
@@ -130,8 +280,10 @@ pub fn init() {
     // its reason, not a bare `false`.
     akuma_threading::register_process_hooks(process_hooks());
 
-    // The machine effects. `switch_to` still names its slice (the switch is
-    // `fork_process`'s); the per-slot state arms landed in slice 2.
+    // The machine effects. `switch_to` is real from slice 3; the per-slot
+    // state arms landed in slice 2. The idle thread is seeded last: READY
+    // from the first registration, it only ever gets the core when every
+    // real task is parked (its loop feeds the tick and yields on wakeups).
     akuma_threading::register_x86_arch_hooks(X86ArchHooks {
         switch_to,
         current_slot,
@@ -144,19 +296,20 @@ pub fn init() {
         read_user_context: crate::child::read_user_context,
         prepare_task_slot: crate::child::prepare_task_slot,
     });
+    seed_idle();
 }
 
 /// The spawn ring's width, for `can_run`'s bounds check.
 /// The idle answer: the boot task (`NO_SLOT` in the ring's naming). Nothing
 /// can call this until a picker exists (slice 3).
 fn idle_slot() -> usize {
-    NO_SLOT
+    IDLE_TID
 }
 
 /// Pinning: nothing pins yet, so any slot in the ring (or the boot task) can
 /// run. `can_run` returns `false` only where a real pinning table would.
 fn can_run(slot: usize) -> bool {
-    slot == NO_SLOT || slot < crate::child::NSLOTS
+    slot == NO_SLOT || slot <= crate::child::NSLOTS
 }
 
 /// The BKL's recursion depth is per-thread and the lock per-core; this
@@ -310,27 +463,102 @@ fn exec_runtime() -> ExecRuntime {
         // one-path helper; unwired until a consumer exists (slice 3).
         file_size: |_path| Err("taoxichuan: file_size not wired (unreachable until fork_process)"),
 
-        // ── stubs that name the slice that lands them ─────────────────────
-        // The whole ring-3 lifecycle arm — taoxichuan's `child_enter`
-        // crossing is its germ, absorbed when `fork_process` lands (slice 3).
-        enter_user: |&_ctx| {
-            panic!(
-                "exec_twin: ExecRuntime::enter_user was called but the fork/exec seam lands in slice 3"
-            )
-        },
-        // The fork memory pass. taoxichuan's eager copy exists
-        // (`crate::fork_share_memory` over a root), but this hook's shape
-        // speaks `Process`, which this kernel does not build — wired with
-        // `fork_process` (slice 3).
-        fork_share_memory: |_parent, _child| {
-            Err("taoxichuan: fork_share_memory lands with fork_process (slice 3)")
-        },
-        // The child's CR3 + spawn-row binding — the twin's slot binding, same
-        // slice (nothing claims a slot before then).
-        bind_child_task: |_tid, _child, _kind| {
-            Err("taoxichuan: bind_child_task lands with fork_process (slice 3)")
-        },
+        // ── slice 3 arms (session pd) — the fork seam, wired ───────────────
+        // The child's ring-3 entry: the bind table names the CR3, the
+        // captured UserContext becomes an EntryFrame, `ring3::enter_user`
+        // sysrets. Never returns (the child lives in ring 3; its syscalls
+        // come back through the dispatcher).
+        enter_user: twin_enter_user,
+        // The fork memory pass: the twin's proven eager-copy walk, INTO the
+        // child's fresh `UserAddressSpace` root.
+        fork_share_memory: twin_fork_share_memory,
+        // The child's CR3 + spawn-row binding — the twin's slot binding.
+        bind_child_task: |tid, child, _kind| twin_bind_child_task(tid, child),
     }
+}
+
+/// `ExecRuntime::fork_share_memory` — the twin's eager copy, INTO the child
+/// address space `fork_process` step 1 built. The parent's live root (the
+/// shell's, through its shared view) is walked leaf-by-leaf by the twin's
+/// own proven cloner; the child's fresh root gets the kernel half and the
+/// cloned user subtrees. Ledger note: the copied frames are the twin's, not
+/// the crate ledger's — a child `Process::drop` frees only what it tracked.
+/// Bounded by the gate's fork counts; named in RESULT-pd.md.
+fn twin_fork_share_memory(
+    parent: &akuma_exec::process::Process,
+    child: &mut akuma_exec::process::Process,
+) -> Result<(), &'static str> {
+    let src = parent.address_space.l0_phys() as u64;
+    let dst = child.address_space.get_mut().l0_phys() as u64;
+    crate::clone_user_half(src, dst).ok_or("taoxichuan: user-half clone failed")
+}
+
+/// `ExecRuntime::bind_child_task` — the twin's spawn-row: which pid, which
+/// root, which spawn-ring slot. The crate publishes the thread next.
+fn twin_bind_child_task(
+    tid: usize,
+    child: &akuma_exec::process::Process,
+) -> Result<(), &'static str> {
+    let root = child.address_space.l0_phys() as u64;
+    crate::child::bind_child_task(tid, child.pid, root)
+}
+
+/// `ExecRuntime::enter_user` — the child's first and only crossing into ring
+/// 3. The bind table names the CR3 (loaded here: sysret does not touch it);
+/// the captured context becomes an EntryFrame; `ring3::enter_user` sysrets
+/// and never returns. The FS base rides the MSR — the child inherits the
+/// parent's TLS pointer in hardware, fork semantics.
+fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
+    let cur = crate::exec_twin::current_slot();
+    // (session pg: `[tmp] enter` print removed with the sw-to print — same
+    // pre-gate-boot readability pass, PLAN-pg §5.)
+    // The task record (not the bind table) is the root's authority — a real
+    // child that has exec'd must enter on the NEW image's root.
+    if cur != crate::exec_twin::NO_SLOT && cur < crate::child::NSLOTS + 1 {
+        crate::set_task_slot(crate::child::sched_task_slot_of(cur));
+    }
+    let root = crate::child::sched_root_of(cur);
+    if root != 0 {
+        // SAFETY: `root` is a PMM-resident page-table frame naming the
+        // child's image and the shared kernel half; the load is the same one
+        // `child_enter` performs at every crossing.
+        unsafe {
+            core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags))
+        };
+    }
+    let ef = akuma_ring3_amd64::EntryFrame {
+        r15: ctx.regs[11],
+        r14: ctx.regs[10],
+        r13: ctx.regs[9],
+        r12: ctx.regs[8],
+        rbp: ctx.regs[7],
+        rbx: ctx.regs[6],
+        r10: ctx.regs[3],
+        r8: ctx.regs[4],
+        r9: ctx.regs[5],
+        rdx: ctx.regs[2],
+        rsi: ctx.regs[1],
+        rdi: ctx.regs[0],
+        rax: ctx.rax,
+        rip: ctx.pc,
+        rflags: 0x202,
+        rsp: ctx.sp,
+    };
+    // SAFETY: ring3's contract — an enterable ring-3 state, kernel IF clear,
+    // CR3 already the child's. `enter_user` is `!`: the child lives in ring 3.
+    // Session pi: install the CAPTURED fs before entry. This crossing used to
+    // leave IA32_FS_BASE holding the last-ran task's TLS pointer — the fork
+    // "inheritance" was whatever the one core's MSR happened to hold, which
+    // is also the shape every not-via-child_enter entry got (boot pi-2's PK2
+    // crash carried the shell's 0x713198 into a fresh CR3 with NO fs wrmsr
+    // exit in its whole window). A captured 0 (an exec'd image's record) is
+    // the clean start the amd64 kernel hands its images; a captured parent
+    // value is the real-fork inheritance (capture_user_context reads the
+    // live MSR in the parent's context). One MSR write per Process entry —
+    // entries are per fork/spawn, never per tick.
+    let _ = akuma_cpu::msr::set_fs_base(ctx.fs_base);
+    crate::child::set_slot_fs(cur, ctx.fs_base);
+    unsafe { akuma_ring3_amd64::enter_user(&ef) }
 }
 
 fn exec_config() -> ExecConfig {
@@ -339,7 +567,7 @@ fn exec_config() -> ExecConfig {
     // shared syscalls run); the table exists so the day one does, the values
     // are already this kernel's truth.
     ExecConfig {
-        max_threads: 4, // the spawn ring's width is this kernel's thread truth
+        max_threads: 16, // the spawn ring + the idle thread + headroom
         reserved_threads: 0,
         kernel_stack_size: akuma_ring3_amd64::SYSCALL_STACK_SIZE,
         boot_stack_base: 0,

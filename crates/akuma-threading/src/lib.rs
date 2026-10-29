@@ -3246,6 +3246,43 @@ pub fn x86_abandon(slot: usize) {
     }
 }
 
+/// Reserve a slot number for an identity that is not a pool thread.
+///
+/// The M2 spawn crossing (taoxichuan) runs its child on the crossing's own
+/// band and keys its ring records on the spawn-ring slot index — a number
+/// the fork path ALSO hands out as a threading tid. Without a reservation
+/// the pool's `claim_free_slot` sees the number FREE and gives it to the
+/// next fork child, which then stomps the live shell's cross record, SpawnSlot
+/// and fd table (boot ph-2: `bind tid=2 shell=2`, echo's EPIPE, cat parked
+/// forever on a destroyed pipe). `INITIALIZING` is never picked by a scheduler
+/// and never reusable; the reserve is permanent for this boot, which is the
+/// point — a crossing identity is not a thread that exits.
+pub fn reserve_slot(slot: usize) -> bool {
+    if slot >= MAX_THREADS {
+        return false;
+    }
+    // A TERMINATED slot is equally takeable: its thread is dead by
+    // definition, and the fork path's own recycler would otherwise hand the
+    // number right back out from under the crossing (boot ph-4: session 3's
+    // reserve of ring slot 3 refused against session 2's TERMINATED child,
+    // the fork claim reclaimed it, and the session shell collided with its
+    // own first child again).
+    for state in [thread_state::FREE, thread_state::TERMINATED] {
+        if THREAD_STATES[slot]
+            .compare_exchange(
+                state,
+                thread_state::INITIALIZING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Mark the running thread terminated and switch away for good.
 ///
 /// Never returns: the picker only takes `READY`/`RUNNING`, so once the state is
@@ -7808,6 +7845,20 @@ mod thread_contexts_invariant_tests {
     const RANGE_START: usize = 50;
     const RANGE_END: usize = 64; // exclusive; MAX_THREADS == 64
 
+    /// Canary slot for the context-stamp tests. No real switch runs in a host
+    /// test, so any writable `Context` field works: `x19` (the aarch64
+    /// callee-saved stamp) where that arch's wide `Context` exists, `rsp` on
+    /// x86_64 whose `Context` is `{magic, rsp}`. Arch-selected so the host
+    /// suite compiles on both (the 2026-10-28 pe session found the suite
+    /// x86_64-broken since the Context split).
+    #[cfg(test)]
+    fn stamp_slot(idx: usize) -> *mut u64 {
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::ptr::addr_of_mut!((*get_context_mut(idx)).x19) }
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::ptr::addr_of_mut!((*get_context_mut(idx)).rsp) }
+    }
+
     #[test]
     fn claim_free_slot_never_double_claims_under_contention() {
         const N_THREADS: usize = 8;
@@ -7832,10 +7883,10 @@ mod thread_contexts_invariant_tests {
                     // clobberer, then check our stamp is still intact.
                     let marker = (idx as u64) << 32 | t as u64;
                     unsafe {
-                        (*get_context_mut(idx)).x19 = marker;
+                        *stamp_slot(idx) = marker;
                     }
                     thread::yield_now();
-                    let seen = unsafe { (*get_context(idx)).x19 };
+                    let seen = unsafe { *stamp_slot(idx) };
                     if seen != marker {
                         mismatches.fetch_add(1, Ordering::SeqCst);
                     }
@@ -7877,7 +7928,7 @@ mod thread_contexts_invariant_tests {
                     let mut spins = 0u32;
                     loop {
                         if get_thread_state(idx) == thread_state::READY {
-                            let val = unsafe { (*get_context(idx)).x19 };
+                            let val = unsafe { *stamp_slot(idx) };
                             if val != marker {
                                 mismatch.store(1, Ordering::SeqCst);
                             }
@@ -7891,7 +7942,7 @@ mod thread_contexts_invariant_tests {
             };
 
             unsafe {
-                (*get_context_mut(idx)).x19 = marker;
+                *stamp_slot(idx) = marker;
             }
             mark_thread_ready(idx);
 
