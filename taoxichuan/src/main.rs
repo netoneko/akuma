@@ -531,31 +531,8 @@ fn root_fs() -> &'static akuma_ext2::Ext2Filesystem<Vda> {
 // its own: the last thing on the console before the machine would hand over.
 // ---------------------------------------------------------------------------
 
-/// ASCII only, on purpose: the guest console's host-side relay sanitises
-/// non-ASCII bytes to `?`, and the gate's evidence is this log.
-///
-/// The picture: Jingdezhen as the emperor's kilns knew it -- the Chang in
-/// front (junks on the water, kiln-fire glow on the current), hills behind,
-/// and along the bank the egg-shaped hulu kilns with tall chimneys breathing
-/// smoke, a house with upturned eaves, and a pagoda. The crates kernel sits
-/// on the bank in the middle of it, where the wharf shed would be.
-const ART: &str = concat!(
-    "     ~      _       _                      ~      _         _  ~\n",
-    "    ( )   __/ \\_______/ \\__/ \\            ( )   ___/ \\______/ (_)\n",
-    "      |                    /--\\             |                  |\n",
-    "   .-----.       ,^.      //[]\\\\         .-----.              .--.\n",
-    "  ( |^^| )      /___\\     | [] |        ( |^^| )             ( () )\n",
-    "   '-----'      |___|    /|____|\\        '-----'              '--'\n",
-    "  +------------------------------------------------------+\n",
-    "  |   Taoxichuan  --  tao xi chuan, the kiln-fire market  |\n",
-    "  |   A kernel composed from Akuma's crates, one stage   |\n",
-    "  |   at a time, fired in Akuma's own kiln: booted under |\n",
-    "  |   Akuma's hypervisor, on Akuma's metal.              |\n",
-    "  +------------------------------------------------------+\n",
-    "  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~\n",
-    "        |\\                            |\\\n",
-    "   ~*~\\__|_\\______   ~  ~  ~  ~   ~*~\\__|_\\______   ~  ~  ~  ~  ~\n",
-);
+/// The banner is `banner.txt`, the user's own art, included verbatim.
+const ART: &str = include_str!("banner.txt");
 
 fn banner() {
     console::puts("\n");
