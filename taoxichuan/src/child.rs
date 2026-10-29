@@ -588,13 +588,6 @@ pub fn task_exit_real(code: u64) -> ! {
     };
     crate::pipes::release_open_fds();
     if waiter != u32::MAX {
-        akuma_primitives::safe_print!(
-            192,
-            "[tmp] exit pid=<slot{}> code={} wake={}\n",
-            cur,
-            code,
-            waiter
-        );
         akuma_threading::get_waker_for_thread(waiter as usize).wake();
     }
     akuma_threading::x86_finish_current()
@@ -911,13 +904,6 @@ fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
             // reapers consult the map for the crate's is_child_of_group
             // decision: wait* on a non-child is ECHILD and never blocks.
             stamp_child_parent(pid, slots()[cur].pid);
-            akuma_primitives::safe_print!(
-                192,
-                "[tmp] stamp c={} p={} slot={}\n",
-                pid,
-                slots()[cur].pid,
-                cur
-            );
             u64::from(pid)
         }
         // The refusal line is the evidence this slice hunts for; name the
@@ -931,7 +917,6 @@ fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
 }
 
 pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
-    akuma_primitives::safe_print!(192, "[tmp] spawn enter\n");
     if nested_active() {
         return crate::e(crate::err::EPERM); // one level only; nothing nests a nest
     }
@@ -992,7 +977,6 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     // `/bin/sh` (what the exec path spawns) is a symlink on the serve
     // image; the chain walker resolves it the same way `open` does.
     let effective = crate::resolve_effective(path);
-    akuma_primitives::safe_print!(192, "[tmp] spawn resolved -> {}\n", effective);
     let Ok(image) = crate::root_fs().read_file(&effective) else {
         // Say what failed. A silent ENOENT here reads on the client exactly
         // like a missing binary, and cost three stages of diagnosis.
@@ -1735,14 +1719,6 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
             sl.waiter = u32::MAX;
             sl.reaped = true;
             let (child, status) = (sl.pid, sl.status);
-            akuma_primitives::safe_print!(
-                192,
-                "[tmp] w4 reap c={} po={} by={}/{}\n",
-                child,
-                parent_of(child),
-                my_tid,
-                my_pid
-            );
             if status_va != 0
                 && (!crate::user_ok(status_va, 4)
                     || !crate::copy_to_user(status_va, &status.to_le_bytes()))
@@ -1764,13 +1740,6 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
             }
         }
         if !live {
-            akuma_primitives::safe_print!(
-                192,
-                "[tmp] w4 ECHILD my={}/{} pid=<{}>\n",
-                my_tid,
-                my_pid,
-                want_pid
-            );
             return crate::e(ring3::err::ECHILD);
         }
         if wnohang {
@@ -1785,14 +1754,6 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
         ring3::set_user_rsp_stash(stash);
         // Woken (or the deadline passthrough never fires at u64::MAX): the
         // loop re-scans. Spurious wakes are fine — the scan decides.
-        akuma_primitives::safe_print!(
-            192,
-            "[tmp] w4 wake my={}/{} live_fs=0x{:x} shadow=0x{:x}\n",
-            my_tid,
-            my_pid,
-            akuma_cpu::msr::read(akuma_cpu::msr::Msr::FsBase),
-            slot_fs_of(my_tid)
-        );
     }
 }
 
