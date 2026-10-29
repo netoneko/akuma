@@ -174,3 +174,166 @@ registration sequence (S1) — keep it as taoxichuan-local code first.
 | `X86ArchHooks.switch_to` | CR3 + FPU + stacks | five effects, **no FPU save** | keep; FPU is R6, not this switch |
 | `X86ArchHooks.can_run` | pinning-aware | "any ring slot, the boot task, or idle" | after S1 the boot task is a Process; keep answering true on one core |
 | `X86ArchHooks.allow_tick`/`tick_window` | one-instruction sti window | same | keep |
+
+## 3. Target architecture (one page)
+
+Taoxichuan becomes what amd64 is: **crates own every process/scheduling decision;
+`taoxichuan/src/` is only target glue** (trap entry, CR3/fs effects, device arms).
+
+1. **init is the first `Process`, with a real slot.** At boot, the first ring-3
+   program is registered like amd64's `run_init`: `register_process(pid=1)` with a
+   claimed threading slot published `READY`, `reserve_pid_floor(2)` so children get
+   pid >= 2, and the twin's `bind_child_task` reduced to binding CR3 + pool slot
+   (`exec_twin.rs:487+`). From then on `fork`, `execve`, `wait4` work from init —
+   today they answer `EPERM`/`ENOSYS` from the boot task (`child.rs:868-886`;
+   syscalls.md "Known deliberate gaps"), which is the only reason sshd needs private
+   `SPAWN`. The tick's `PREEMPT_ARMED` and slotted-current gates (scheduling.md)
+   are re-derived: `PREEMPT_ARMED` dies when there is no NO_SLOT ring-3 resident
+   left (S4); the slotted-current gate stays until it provably cannot fire.
+2. **sshd is a Linux-spawning user program.** Built with `libakuma`'s `linux-abi`
+   feature: session shell = `pipe2` + `fork` + `dup3` + `execve`
+   (`libakuma/src/lib.rs:2196-2230`), collection = `wait4(WNOHANG)` (`:2493-2513`).
+   `SPAWN` (0x1301), `WAITPID` (0x1303), `CLOSE_CHILD_STDIN` (0x1326) and the M2
+   blocking-fork arm are **deleted** (`child.rs:919-1454` plus the dispatcher
+   arms); `clone` keeps working for musl `posix_spawn` by routing
+   `CLONE_VM|CLONE_VFORK|SIGCHLD` through `fork_process` with the child-stack
+   argument — amd64's shape (`usermode.rs:5585`), not the M2 body. pty-less
+   behaviour is unchanged (no pty in this kernel; linux-abi `spawn_full` ignores
+   the flag bits, `libakuma/src/lib.rs:2196-2201`).
+3. **Syscall numbers come from the ABI crate.** The legacy x86_64 numbers
+   (mkdir 83, rename 82, unlink 87, rmdir 84, readlink 89, chmod 90, chown 92/94,
+   symlink 88, ...) are served the amd64 way, not by new private arms: the legacy
+   table lists x86-only numbers, translates each to its `Syscall::*`
+   (`akuma-syscalls-abi`), and routes into the `akuma-syscalls-glue` family
+   dispatch, which calls back through the twin's `ExecRuntime` hooks (ext2, fd
+   table, console). amd64's smoke test — "no number is in both tables"
+   (`usermode.rs:7506-7517`) — is adopted as a boot self-check. A number
+   taoxichuan cannot serve yet still prints `unhandled <Name> (<nr>)` (the
+   checklist rule, syscalls.md).
+4. **Dispatcher shape.** Of `dispatch_inner`'s ~175 arms over ~90 table rows
+   (syscalls.md): the fd/net/fs rows already call crates and stay (marshaling is
+   target glue); ~30 fs/stat/dirent/time/uts/poll rows become `akuma-syscalls-*`
+   family calls as stages need them; exactly four private rows die (SPAWN, WAITPID,
+   CLOSE_CHILD_STDIN, M2 clone); `execve` stays as an `akuma-exec` call.
+   `getpid`/`getppid`/`gettid` re-point at the process table (today: literals —
+   the "1: one task" rows in syscalls.md — no longer true once children are real
+   processes).
+5. **Scheduling.** The pool (`akuma-threading`) owns runnability: every task —
+   init, children, sshd, idle — is a pool slot moved `INITIALIZING -> READY ->
+   RUNNING -> (WAITING)`; the tick preempts ring 3 via `x86_yield` (already live);
+   parked waits are `WAITING` slots woken by the crate's waker; the idle thread
+   halts and gains the retired-reclaim drain. Nothing hand-rolled remains except
+   `switch_to`'s five machine effects (CR3, syscall band, trap stack, TASK_SLOT,
+   fs shadow) — the same set amd64's `hook_switch_to` has, minus FPU (R6).
+
+## 4. Slices
+
+Conventions for every slice: gates that must stay green — F1, PK1, PK2, P1-P5
+(`run_fork.sh`/`run_pipes.sh`), `apk add curl` + curl HTTPS (stage 7), sshd +
+`sh -c` over ssh (stage 4); a stall on an apk boot before S3 is retried (pl: it
+needs the box's KVM timing; harness `scripts/kvm/goose/run_stallrate.sh`), never
+scored a FAIL; every slice carries a `REAL_FORK`-style const so the old path stays
+selectable until its gate passes, and the deleting commit comes only after the
+green run; ops restore after any boot (the brief's list). Budget rule: ~100 tool
+calls per slice, one executor session each.
+
+### S0 — baseline battery on the merge tree (~15 calls, no code)
+- Files: none. Run the full battery once on the `rust-org-il-experiment` tip;
+  record per-gate console lines as the reference verdicts.
+- Gate: battery green; note the apk-stall rate (expect pl's ~1-in-3 on the box).
+
+### S1 — init is a Process (~40 calls)
+- Touch: `exec_twin.rs` (`init()`: add `reserve_pid_floor(2)` + registration of
+  the first program as pid 1 — new ~80 L mirroring `register_exec_process(1, ...)`
+  fields, `usermode.rs:8890-8902`); `child.rs` (`register_shell_process` becomes
+  the init path; `fork_arm_real`'s depth gate: depth 0 now legal for pid 1);
+  `main.rs` (`spawn()`/`run_program`: register + publish before entering ring 3).
+- Rollback: `const INIT_AS_PROCESS: bool = true` — false restores today's
+  unregistered boot spawn.
+- Gate: battery green; new console line `[init] registered pid=1 slot=<n>`; F1
+  still green from the shell (same rung as today, now via the process table).
+- Host test: none (kernel glue). One boot.
+
+### S2 — wait4 becomes the crate-owned park/wake (~50 calls)
+- Touch: `child.rs` — replace `wait4_real`/`wait4_arm_blocking_scan`/`waitpid_arm`
+  bodies (~140 L) with the amd64 `sys_waitpid` shape over
+  `akuma_exec::process::find_process`/`is_child_of`/`exited` (read
+  `crates/akuma-exec/src/process/` for the exact channel/waiter API first — names
+  UNCHECKED in this plan); `task_exit_real` slims to publish-exit + wake;
+  `exec_twin.rs` `ProcessHooks.pid_for_thread` re-points at the crate table;
+  **delete `PARENT_OF`** (`child.rs:643-664`, ~25 L) — the crate's `parent_pid` is
+  the only link (amd64 `usermode.rs:6165-6172`).
+- Keep: the boot-task scan arm until S4 (the M-gates/bridge reaper path).
+- Rollback: `const WAIT_VIA_CRATE: bool = true`.
+- Gate: PK1 (`20000\n`), P1-P5, F1 green; grandfork step 5 -> exit 8 (ECHILD);
+  one `[tmp]` print at the first park/wake pair, removed the same session.
+- Host test: none in-kernel; the crate's own wait tests (akuma-exec
+  children.rs tests :1859-1941, per pj's RESULT) are the reference for the
+  expected answers.
+
+### S3 — sshd goes linux-abi; the M2 crossing dies (~60 calls; the stall slice)
+- Touch (userspace): the taoxichuan image's sshd build enables
+  `libakuma/linux-abi` (feature wiring point UNCHECKED — see Q1); rebuild the
+  userspace image.
+- Touch (kernel): behind `const SSHD_LINUX_ABI`, delete `spawn_arm`,
+  `exec_replace`, `exec_return`, `child_enter`, `child_exit`, `exit_cross`
+  (~535 L), the SPAWN/WAITPID/CLOSE_CHILD_STDIN arms, `read_child_out` +
+  the `ChildOut` fd kind (~150 L with `pipes.rs`/`main.rs` side effects), and the
+  M2 clone body (clone re-routed to `fork_process(child_pid, child_stack)`,
+  `usermode.rs:5585` shape; keep the flags check). `nested_active`, depth stamps,
+  syscall-band splitting all die with the crossing.
+- Order inside the slice: (1) add the clone-through-fork_process arm and boot it
+  (gate: forktest + apk green with sshd still on SPAWN); (2) switch sshd to
+  linux-abi, boot (gate: ssh `sh -c`, apk add curl, curl HTTPS — **the first boot
+  with no M2 crossing on the apk path**); (3) delete the dead arms + update
+  `syscalls.md` rows in the same commit.
+- Rollback: rebuild with the const off + the sshd feature off (both switches are
+  build-time).
+- Gate: the stage-4 ssh gate plus the stage-6/7 gates; a `[tmp]`-free console.
+- Host test: `cargo test -p libakuma --target $HOST` still passes (its spawn
+  cfg-gated code is guest-only, but the build must not regress).
+
+### S4 — boot programs become fork/exec children; the boot-task arms die (~40 calls)
+- Touch: `main.rs` — `run_program` forks+execs each `Prog` from the registered
+  init and waits via the S2 wait; delete `task_done`'s chain-boot and
+  `wait4_arm_blocking_scan` (~150 L); `child.rs` loses `is_real_task` and the
+  boot-task special cases; re-derive the tick gates (PREEMPT_ARMED deleted if no
+  NO_SLOT ring-3 resident remains — check the boot path still has one between
+  kmain and init's registration; if it does, keep the gate with the reason).
+- Rollback: `const INIT_FORKS_PROGS: bool = true`.
+- Gate: stage 1-3 console lines (`stage 1 gate reached`, `hello exit code 0`,
+  `stage 3 gate reached`) + the full battery.
+- Host test: none. One boot.
+
+### S5 — ELF loading onto `akuma-elf-exec` (~50 calls; stage-8 enabler)
+- Touch: `main.rs::load_task` (~240 L) re-based on `akuma-elf-exec`'s decisions +
+  `akuma-elf` parsing, keeping taoxichuan's mapping (physmap writes, stack build)
+  — amd64's `loader.rs` (713 L) is the reference shape; gains the PT_INTERP rule
+  the crate exists for (stage-8 `git` is likely dynamic — UNCHECKED).
+- Rollback: `const LOAD_VIA_CRATE: bool = true`.
+- Gate: `hello exit code 0`, F1, apk add curl, curl HTTPS.
+- Host test: none (taoxichuan is a no_std bin, per pj's RESULT); the crate's own
+  tests cover the decisions.
+
+### S6 — dispatcher two-table shape (~40 calls; stage-9 enabler)
+- Touch: `main.rs::dispatch_inner` — add the `Syscall::from_x86_64` fallback arm +
+  the x86-only legacy table with `to_glue`-style translation (start with the
+  mkdir/rename/unlink/rmdir/readlink/symlink/chmod/chown families where the twin's
+  hooks already answer); adopt amd64's disjointness self-check as a boot line;
+  delete any arm it provably duplicates.
+- Rollback: `const GLUE_DISPATCH: bool = true`.
+- Gate: battery + the new self-check line + one mkdir-via-83 probe program
+  (the `userspace/forkprobe` pattern).
+
+### S7 — sweep (~25 calls)
+- `grep -n 'SpawnSlot\|CrossSave\|EXEC_SAVE\|PARENT_OF\|SPAWN' taoxichuan/src/`
+  -> expect only hooks; update `taoxichuan/docs/reference/{processes,scheduling,syscalls}.md`,
+  the five diagrams, `gaps.md` (G1 dies with PK2's M2 scaffolding; G3 "no pump
+  while a spawned child runs" is crossing-shaped and should die with S3), and the
+  `switch-to-crates.md` doc. Delete any now-unused ring type.
+
+**Cut order if only half fits:** drop S6, then S5 (both are stage-8/9 enablers);
+fold S7's doc updates into the S3/S4 commits. The thesis set is S0-S3: after S3,
+taoxichuan has no private process machinery left on any path userspace exercises
+(init, fork, exec, wait, pipes, fds) — any remaining ring types are dead code that
+S7 removes.
