@@ -1242,11 +1242,12 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     }
     // SAFETY: syscall-path discipline; `set_syscall_stack_top` is a plain
     // atomic store the unsafe context of the arm already covers.
-    ring3::set_syscall_stack_top(rsp_here - 0x1000);
-    // The same stale-fs rule as exec_real_task's crossing: a fresh image
+    ring3::set_syscall_stack_top(rsp_here - 0x1000);    // The same stale-fs rule as exec_real_task's crossing: a fresh image
     // starts with fs = 0, never the outgoing task's TLS pointer.
     let _ = akuma_cpu::msr::set_fs_base(0);
     set_slot_fs(crate::exec_twin::current_slot(), 0);
+    // [tmp] pl-3 (remove before final): arm the crossing's syscall trace.
+    CROSSING_TRACE.store(1, core::sync::atomic::Ordering::Release);
     let status = unsafe { child_enter(ti.root_pa, &ef, core::ptr::addr_of_mut!(EXEC_SAVE)) };
     // [tmp] pl-2 (remove before final): rung 4 — the crossing RESUMED (the
     // exit arm restored this frame). A boot whose last ladder line is
@@ -1361,6 +1362,13 @@ pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame, save: *m
 /// be in flight at once.
 static mut EXEC_SAVE: CrossSave = CrossSave::new();
 
+/// [tmp] pl-3 (remove before final): the crossing's syscall trace. 0 =
+/// disarmed; 1..=80 = armed, counting the exec'd child's first 80 syscalls.
+/// Armed by `exec_replace` right before the crossing, disarmed at
+/// `child_exit` — the dispatch's print names every syscall the child makes,
+/// and the LAST printed nr is the syscall it vanished in.
+pub(crate) static CROSSING_TRACE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 /// Runs on the nested stack region, in the CHILD's address space, called
 /// from the dispatcher's exit arm — which is why this is `!` from Rust's
 /// point of view: it never returns *to the dispatcher*. It returns to
