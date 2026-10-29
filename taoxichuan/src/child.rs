@@ -1782,7 +1782,7 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
             "[tmp] w4 wake my={}/{} live_fs=0x{:x} shadow=0x{:x}\n",
             my_tid,
             my_pid,
-            akuma_cpu::msr::Msr::read(akuma_cpu::msr::Msr::IA32_FS_BASE),
+            akuma_cpu::msr::read(akuma_cpu::msr::Msr::FsBase),
             slot_fs_of(my_tid)
         );
     }
