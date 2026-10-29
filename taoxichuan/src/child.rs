@@ -630,6 +630,37 @@ pub(crate) fn set_slot_fs(slot: usize, v: u64) {
     }
 }
 
+/// Session pi (grandfork step 5): child pid -> parent pid, stamped at
+/// `fork_arm_real` and consulted by the wait4 reapers. The slot table is
+/// GLOBAL — before this map, any task's `wait4(-1)` could reap (or park on)
+/// an UNRELATED task's zombie: grandfork step 2 deliberately leaves an
+/// un-reaped grandchild, and step 5's own childless `wait4(-1)` returned
+/// that orphan instead of ECHILD (exit 5). Unstamped pids (0 = the M2 spawn
+/// path's children) stay visible to everyone, so the M-gate semantics do
+/// not move. Bounded ring; pid reuse just overwrites an entry.
+static mut PARENT_OF: [(u32, u32); 32] = [(0, 0); 32];
+
+pub(crate) fn stamp_child_parent(child: u32, parent: u32) {
+    // SAFETY: single core, IF-clear syscall-path caller (fork arm).
+    let p = unsafe { &mut *core::ptr::addr_of_mut!(PARENT_OF) };
+    p[child as usize % p.len()] = (child, parent);
+}
+
+/// 0 = unknown (an M2-spawned child, or the map's ring moved past it).
+pub(crate) fn parent_of(child: u32) -> u32 {
+    // SAFETY: single core, IF-clear syscall-path caller (wait4 arms).
+    let p = unsafe { &*core::ptr::addr_of_mut!(PARENT_OF) };
+    let mut i = 0;
+    while i < p.len() {
+        let (c, par) = p[i];
+        if c == child && child != 0 {
+            return par;
+        }
+        i += 1;
+    }
+    0
+}
+
 pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     let cur = crate::exec_twin::current_slot();
     let args = match read_spawn_args(fr.arg1(), fr.arg2(), fr.arg3()) {
@@ -865,7 +896,16 @@ fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
     // syscall stub stashed it (`user_rsp_stash`) and step 6's captured
     // context carries it into the child's UserContext.
     match akuma_exec::process::fork_process(child_pid, 0) {
-        Ok(pid) => u64::from(pid),
+        Ok(pid) => {
+            // Session pj wiring of pi's PARENT_OF: the child's parent is THIS
+            // task's pid — the slot ROW's pid, never the slot index (slots are
+            // reused across successive children — pi4's console shows tid=10/11
+            // alternating for pids 29..37; pids are monotonic). The wait4
+            // reapers consult the map for the crate's is_child_of_group
+            // decision: wait* on a non-child is ECHILD and never blocks.
+            stamp_child_parent(pid, slots()[cur].pid);
+            u64::from(pid)
+        }
         // The refusal line is the evidence this slice hunts for; name the
         // message verbatim (the same discipline as spawn's read-failed
         // print).
@@ -1653,11 +1693,23 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
         // Not a task that may park — answer without blocking.
         return wait4_arm_blocking_scan(pid, status_va);
     }
+    // Session pj: the caller's OWN pid (the slot row's — never the slot index,
+    // slots are reused). This is the crate's is_child_of_group waiter side:
+    // wait* reaps only children registered to THIS pid, answers ECHILD for a
+    // stranger's, and never parks on one (akuma-exec children.rs:42).
+    let my_pid = slots()[my_tid].pid;
     loop {
         // SAFETY: syscall-path discipline.
         let s = slots();
         for sl in s.iter_mut() {
             if !sl.used || sl.reaped || sl.running || (!any && sl.pid != want_pid) {
+                continue;
+            }
+            // Not my child (a stamped row naming another parent — grandfork
+            // step 2's un-reaped orphan): the crate's ECHILD answer, reached
+            // by skipping the candidate here and in the live scan below.
+            let po = parent_of(sl.pid);
+            if po != 0 && po != my_pid {
                 continue;
             }
             sl.waiter = u32::MAX;
@@ -1674,8 +1726,11 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
         let mut live = false;
         for sl in s.iter_mut() {
             if sl.used && !sl.reaped && sl.running && (any || sl.pid == want_pid) {
-                live = true;
-                sl.waiter = my_tid as u32;
+                let po = parent_of(sl.pid);
+                if po == 0 || po == my_pid {
+                    live = true;
+                    sl.waiter = my_tid as u32;
+                }
             }
         }
         if !live {
@@ -1706,6 +1761,18 @@ fn wait4_arm_blocking_scan(pid: u64, status_va: u64) -> u64 {
     let s = slots();
     for sl in s.iter_mut() {
         if !sl.used || sl.reaped || sl.running || (!any && sl.pid != want_pid) {
+            continue;
+        }
+        // Session pj: a STAMPED row names a parent — and this arm's callers
+        // (the boot task behind NO_SLOT, kernel-side drivers) own no stamped
+        // children (the fork depth gate refuses forks outside the spawned
+        // shell). Skip: an orphan whose parent died stays unreapable here —
+        // the crate reparents orphans to init (children.rs:310), but this
+        // kernel has no init reaper, so unreapable is the honest no-init
+        // answer (one slot row per abandoned grandchild, harmless at
+        // NSLOTS=12). Unstamped rows (spawn-path children, the shell) stay
+        // visible: the M-gates and the bridge's reaper do not move.
+        if parent_of(sl.pid) != 0 {
             continue;
         }
         found = Some((sl.pid, sl.status));
