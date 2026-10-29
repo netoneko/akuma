@@ -654,6 +654,18 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
         rflags: 0x202,
         rsp: ti.rsp,
     };
+    // The incoming image's first instructions must not see the OUTGOING
+    // task's fs: the MSR rides the crossing (sysret does not touch it), and
+    // a depth-2 exec (ash execs the pipeline's last command in place)
+    // otherwise enters the new image with the shell's TLS base still set —
+    // boot ph-7's PK2: grandfork's first stack-guard read (fs:0x28) hit the
+    // shell's busybox bss at 0x7131c0, unmapped in the fresh CR3, and the
+    // task died before musl could run its own arch_prctl. The fork path's
+    // inheritance is deliberate (same image, the capture's comment below);
+    // the exec path's is not (a new image) — 0, the same clean start a
+    // depth-1 exec gets from the boot crossing, and what the amd64 kernel's
+    // exec hands its images (grandfork passes there).
+    let _ = akuma_cpu::msr::set_fs_base(0);
     // SAFETY: the crossing contract — `root` maps the new image plus the
     // shared kernel half, `ef` is ring-3-enterable. A real child never runs
     // `exit_cross`, so this crossing has no return side; the dead dispatcher
@@ -1127,6 +1139,9 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     // SAFETY: syscall-path discipline; `set_syscall_stack_top` is a plain
     // atomic store the unsafe context of the arm already covers.
     ring3::set_syscall_stack_top(rsp_here - 0x1000);
+    // The same stale-fs rule as exec_real_task's crossing: a fresh image
+    // starts with fs = 0, never the outgoing task's TLS pointer.
+    let _ = akuma_cpu::msr::set_fs_base(0);
     let status = unsafe { child_enter(ti.root_pa, &ef, core::ptr::addr_of_mut!(EXEC_SAVE)) };
     // The exec'd child exited: `child_exit` recorded its status in the slot,
     // cleared the nesting, put task slot 0 back, and restored THIS frame's
