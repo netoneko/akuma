@@ -337,3 +337,106 @@ fold S7's doc updates into the S3/S4 commits. The thesis set is S0-S3: after S3,
 taoxichuan has no private process machinery left on any path userspace exercises
 (init, fork, exec, wait, pipes, fds) — any remaining ring types are dead code that
 S7 removes.
+
+## 5. Risks and unknowns (each with the cheapest resolution)
+
+Hazards grepped in `docs/archive/` + `docs/reference/subsystems/` as instructed;
+each row names where it is recorded.
+
+| # | risk / unknown | recorded at | cheapest resolution |
+|---|---|---|---|
+| R1 | **Stale thread slot on bind** — a bind that seeds only one of proc_slot/thread_slot lets `enter_ring3` read the previous occupant's slot and walk into thread-exit teardown for a process that never ran (triple fault) | `docs/archive/BUG_FIX_LIST.md:2343` | code read at S1: taoxichuan's `bind_child_task` (`child.rs:443`) must stamp both; assert in the hook |
+| R2 | **Stale trap frame across a preempting switch** — a tick that switches must leave the interrupted frame on the interrupted task's own stack, or the next ring-3 trap lands on a foreign stack | `taoxichuan/docs/reference/scheduling.md` § two gates (`arm_trap_stack`); `docs/archive/CONTEXT_SWITCH_BUGS.md:49,97` (IRQs stay masked through the switch) | already paid for in slice 3; S2's new park must use the same `x86_yield` path — code read + the PK battery |
+| R3 | **Switch while IRQs masked / stale CR3** — switching onto a dead fork-child's CR3 (exec-swept, zero pages) kills the resumed task; single-core reload discipline: CR3 per switch, 0 = leave for idle | `docs/archive/TAOXICHUAN_M4_SLICE3_PE_RESULT.md:161`; `taoxichuan/docs/reference/scheduling.md` § switch_to | S2: the exit path must tear the slot down before the slot number is reusable (pool `TERMINATED → FREE` cooldown is the crate's job — verify `x86_reaps` runs, amd64 needed a reaper for exactly this, `amd64/src/sched.rs:1421-1426`) |
+| R4 | **fd-table refcounts on fork** — the first post-fork close destroyed a pipe under two live fds until the counted-`clone_ref` walk existed; the pipeline deadlock family came from this | `taoxichuan/docs/reference/processes.md` § real fork; `docs/archive/TAOXICHUAN_M4_SLICE3_PH_RESULT.md` | already crate-owned (`akuma-fdtable` fork_copy + `pipes.rs:247` clone_ref); S3's clone reroute must keep taking the counted refs — P1–P5 are the gate |
+| R5 | **TLS/fs base on exec** — a depth-2 exec entered the new image with the outgoing task's TLS pointer; `fs:0x28` stack-guard read hit unmapped bss (PK2) | `taoxichuan/docs/reference/processes.md` § fs discipline; `RESULT-pj.md` pi findings | keep the exec-zeroes-fs rule verbatim through S3/S5; gate: PK2 |
+| R6 | **FPU/SSE state is not saved across switches** (amd64 `FxArea` fxsave/fxrstor, `sched.rs:116-278`; taoxichuan `switch_to` has no FPU arm) — if ring 3 uses SSE today, preemption can corrupt FPU users; today's gates passing suggests either no FPU use or laziness UNCHECKED | gap, not yet recorded | one host-free probe: read `fault_trap` (`main.rs:262`) for a `#NM` arm + check CR0.TS at boot (one boot); if ring 3 touches SSE, an FxArea slice must precede S5 (stage 9 rustc needs it regardless). Not a blocker for S0–S4 on current evidence |
+| R7 | **Orphan reaping** — the crate reparents orphans to init (`crates/akuma-exec` children.rs:310, per pj); today taoxichuan honestly leaves them unreapable (no init). Once init is a Process (S1) that answer becomes a leak: abandoned grandchildren pile up one slot each | `taoxichuan/docs/reference/processes.md` § wait4 is parent-owned; `RESULT-pj.md` step-5 story | S1 registers init's Process; S2 gives init a real wait loop it can park in — the boot program list wait (S4) is the reaper's first customer; idle-drain (amd64 `sched.rs:1418`) folds into S4 |
+| R8 | **INITIALIZING-slot poison** — anything published READY with half-built context is unpickable-by-design but wakeable-by-bug; the M2 SPAWN child's pool slot stays INITIALIZING forever today (the supervisor's stall pointer) | `docs/reference/subsystems/scheduler.md:28-32`; pl pointer | S2/S3 code read: the new publish path must move INITIALIZING→READY exactly once, after the trap frame + CR3 + fs shadow are written; PK/F1 gates catch a wrong order as a first-tick fault |
+| R9 | **linux-abi is unwritten-into anywhere** — S3 is the tree's first consumer of `libakuma/linux-abi` `spawn_full`; compile errors or ABI mismatches (x86_64 numbers at `libakuma/src/lib.rs:322`) are untested ground | premise 6 | S3 step 0: build sshd with the feature for the amd64-style target or on host (`cargo check`) before the boot; if it breaks, the fallback is a taoxichuan-local `posix_spawn`-shaped helper in libakuma (compose from the same five syscalls) — same syscall set, no kernel change |
+| R10 | **The boot task's NO_SLOT residency window** — between kmain and init's registration there is still ring-3-free kernel time; the slotted-current tick gate must survive until S4 proves no resident remains | `taoxichuan/docs/reference/scheduling.md` § two gates | S4: keep the gate; delete only with the proof line in the commit message |
+| R11 | **Stall interference with gating** — until S3, apk-path boots can still stall (~1-in-3 on this box, KVM-timing dependent); a slice's green gate could be drowned in retries | `RESULT-pl.md` (closed, no fix); brief 09m (supervisor: 10/10 clean under QEMU TCG) | the supervisor's local QEMU loop is the arbiter for any verdict a stall muddies; on the box, use `run_stallrate.sh`'s window discipline and retry |
+
+## 6. Cost estimate (executor tool calls)
+
+| slice | calls | of which boots | notes |
+|---|---|---|---|
+| S0 | ~15 | 1 battery | reference verdicts |
+| S1 | ~40 | 1–2 | registration glue |
+| S2 | ~50 | 2 | + one boot per `[tmp]` add/remove |
+| S3 | ~60 | 3 | userspace rebuild ×2, kernel boots ×2–3 |
+| S4 | ~40 | 1–2 | |
+| S5 | ~50 | 1–2 | loader re-base |
+| S6 | ~40 | 1–2 | + probe program |
+| S7 | ~25 | 0 | docs + dead code |
+| **total** | **~320** | **~10–13 boots** | ≈ 3 executor sessions of ~100 calls |
+
+Cut to half (~160): S0 (assume pj's green battery), S6, S5, and fold S7 into
+S3/S4 — leaving S1+S2+S3 ≈ 150 calls with boots ≈ 6–7. The thesis survives that
+cut; stage 8 (`git clone`) loses its loader upgrade (dynamic-git risk, R6-class).
+
+## 7. Docs read, and questions for the user
+
+Read (in order): `taoxichuan/docs/README.md`, `gaps.md`, `reference/processes.md`,
+`reference/scheduling.md`, `reference/syscalls.md`, `runbooks/gates.md`;
+`/root/dev-cycle/taoxichuan-s7/RESULT-pl.md`, `RESULT-pj.md` (+ pi/pf findings
+carried there); `docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md`,
+`docs/archive/TAOXICHUAN_M4_SCHED_LITE_PLAN.md` (hook tables);
+`docs/reference/subsystems/scheduler.md` (§ threading model, slot state machine),
+`scripts/check_unsafe_budget.py` (sites-not-lines; new crates start at budget 0);
+`userspace/sshd/Cargo.toml`, `userspace/libakuma/src/lib.rs` (`linux-abi`,
+`spawn_full`, `waitpid_status`, `spawn_pty`); `amd64/src/`: `exec_runtime.rs`
+(all), `usermode.rs` windows (`sys_fork`, `sys_execve`, `sys_waitpid`,
+`AKUMA_PRIVATE_BASE`, `run_init`, `X86_ONLY`), `sched.rs` windows
+(`preempt_if_needed`, `idle_loop`, hook table), `lapic.rs::on_tick`, `boot.rs`
+(late_init); crates' top docs: `akuma-slot-table`, `akuma-scheduler` (the
+simulator), `akuma-threading`, `akuma-elf-exec`. UNCHECKED (not read):
+`taoxichuan/src/sock.rs`/`net.rs` internals (not process-model),
+`crates/akuma-exec/src/process/` module files (only their names and the pj-cited
+children.rs line ranges), `taoxichuan/src/main.rs::dispatch_inner` arm-by-arm
+(counted, not read), `userspace/libakuma/src/syscall/proc.rs` (SPAWN_FLAG_PTY
+producer side), amd64 `fd.rs`/`mm.rs` bodies, `PLAN-pj.md` (superseded by its
+RESULT).
+
+Questions for the user:
+
+- **Q1 (S3 blocker).** Where should `libakuma`'s `linux-abi` feature be switched
+  on for the taoxichuan image — `userspace/sshd/Cargo.toml` default, the
+  taoxichuan image build script, or a `--features` flag in the build incantation?
+  No build in the tree enables it today (premise 6); the plan needs the one
+  wiring point you want.
+- **Q2 (S3 scope).** Must `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)` (musl
+  `posix_spawn`) keep working at S3 for stage 8 (`git`'s helpers are fork+exec,
+  but compile drivers and some helpers use `posix_spawn` —
+  `TAOXICHUAN_PROCESS_MODEL_PLAN.md` § 1)? The plan assumes yes and keeps a
+  clone-through-`fork_process` arm; confirm, or S3 deletes clone entirely.
+- **Q3 (R6).** Is ring 3 expected to touch SSE/FPU on taoxichuan today (CR0.TS
+  state at boot)? If yes, an FxArea slice must be inserted before S5 (and ideally
+  before S2, since a preempted FPU user corrupts on any switch).
+- **Q4 (S1 shape).** Is "the first boot-list program is registered as pid 1"
+  acceptable init, or do you want a dedicated `/sbin/init` userspace binary now
+  (amd64's `herd`-as-init shape)? The plan assumes the former (no new userspace).
+- **Q5 (gating).** For verdicts the box's apk stall muddies (S0–S3), is the
+  supervisor's QEMU TCG loop the arbiter of record, with `run_stallrate.sh`
+  retries on the box only for regression *rate*?
+
+## 8. The stall (one paragraph)
+
+**The switch removes the stall by construction — but only at S3, and every slice
+before S3 still boots the fragile path, so the stall must be tolerated, not
+assumed fixed, until S3's gate passes.** After S3 there is no run-inside-the-
+syscall child and no suspended spawn-parent frame: the parent's wait is a
+registered thread park (`WAITING` in the pool, woken by the crate's child-exit
+wake — the amd64 `sys_waitpid` shape), and the child is an ordinary published
+slot the tick and `x86_yield` already pick up. pl's lost thing — the crossing
+back from the spawn child into the suspended `CrossSave`/`EXEC_SAVE` frame,
+which `[TICK post]`/`EXE resumed` never reached — has no counterpart in that
+design; likewise pj-7's shape (the SPAWN parking with nothing to wake it)
+disappears because nothing parks outside the pool's woken states. The
+supervisor's pointer is consistent and explains the today-shape: an M2 SPAWN
+child's pool slot stays `INITIALIZING` (reserved, never published READY —
+`scheduler.md:28-32` says the pool will not pick such a slot), so even the
+switching tick cannot rescue a crossing that loses its resume; under
+`fork_process` children are published runnable, so the class dies with S3.
+Until then: S0–S2 gate on the same SPAWN path and must treat a stall as a retry
+(R11), never as their own failure.
