@@ -163,3 +163,107 @@ calls (rough; a call ≈ one tool round-trip incl. build/boot loops).
   architectures' numbers were checked.
 - The census's benign tail (`ioctl` ENOTTY, ENOENT probes, `stat`(4)/`poll`(7)/
   `open`(2) legacy) needs the fold table or tolerant arms, not new subsystems.
+
+## 3. The order (smallest steps first; each gate is a console line or an exit code)
+
+| step | what | gate (supervisor-runnable, no box needed) | calls |
+|---|---|---|---|
+| S1 | Split `SLAB`: `MMAP_SLAB` = min(1 GiB, RAM/2), `BRK_SLAB` = min(512 MiB, RAM/4) (main.rs:642,3591,1976–1982,2891) | `rustc --version` as init with `LD_LIBRARY_PATH` set exits **0** printing `rustc 1.100.0-nightly …` (already measured at a 1 GiB slab — this makes it the tree's answer, not a local hack) | 4 |
+| S2 | The independent ENOSYS tail, one arm per commit: `membarrier` (crate decode + `mfence`), `sigaltstack` (glue decode + slot state), `madvise` (crate decode, no-op effect), legacy fold table (extract `akuma-syscalls-abi::legacy`, fold 89/82/83/84/87/88/90/92/94 into the local `*at` arms), real `mprotect` (PTE flip in the task's own root) | after each: the `rustc --version` `[err]` trace loses exactly one line; final: `tcc -run hello.c` **prints** (mprotect gate); `git clone` from init stops listing legacy ENOSYSs and fails only at fork | 14 |
+| S3 | pm's S1 (init = registered Process, pid floor) — prerequisite, not this plan's code | `fork` from init returns a pid (the git-clone fork refusal clears); pm's own battery | (pm) |
+| S4 | clone-thread → `akuma_exec::process::clone_thread`; futex effects shim over `akuma-syscalls-sync`; `set_robust_list` + clear_child_tid wake; `exit_group` ordering comes with the crate | (a) guest C probe: `pthread_create` + `pthread_join` + `futex` wake built with tcc prints `ok` (P3); (b) `rustc --version` stops dying at the ctrlc thread; (c) **`rustc hello.rs -o hello && ./hello` prints `hello`** (needs S5 if the handshake is ENOSYS — try first without it, probe P2 says which) | 70 |
+| S5 | AF_UNIX spawn handshake: glue `unixsock` + fd kind + `close_range` | `rustc hello.rs -o hello` succeeds with the standard spawn path (trace shows `socketpair`/`sendmsg`/`recvmsg` served); `./hello` prints | 34 |
+| S6 | cargo's batch: `pwrite64`/`pwritev2`/`fsync`/`fdatasync` (ext2), `linkat` (new ext2 op), `chdir`/`getcwd`, long argv + `E2BIG`, `sched_getaffinity` (extract), `getpriority`/`setpriority` (new), `prlimit64`/`getrusage` | `cargo build` of a one-file crate gets past the SQLite warnings; every `[err]` line in the trace is identified before the next row is added (the amd64 discipline) | 40 |
+| S7 | Writable `MAP_SHARED` + `msync` writeback (glue + dirty-PTE walk) | **`cargo build` exit 0 and `./target/debug/hello` is non-empty and prints** — the zero-binary archive failure is the gate that must not pass silently | 60 |
+| S8 | Signals: glue dispositions + x86 sigframe extraction into `akuma-threading` + tkill/tgkill delivery | a cargo build completes without a wedged worker; the `[err]` trace shows `tkill` served ~10.4k times (P6) | 80 |
+| S9 | Fixed point (stage 12): kernel builds in guest | out of scope here — needs the memory model (demand paging or much more RAM) | — |
+
+**Cut line.** If only half the budget lands: S1–S4 (+S5 if S4's hello gate needs the
+handshake). That is the thesis — a real `rustc` starting threads and parking them —
+and every row in S6+ is additive on top.
+
+## 4. Probes for the supervisor (each: exact command, expected output, what it decides)
+
+The supervisor's loop: guest = ext2 root (Alpine minirootfs + musl-dev + libgcc +
+nightly-x86_64-unknown-linux-musl `1.100.0-nightly (420ed2a0c)`), `init=<path>
+initargs=<csv>`, the kernel prints one `[err]` line per failing syscall. No boots by
+me; all of these run on the Mac.
+
+| # | probe | expected / decision |
+|---|---|---|
+| P1 | **The `rustc hello.rs` census.** Boot `init=<rustc shim> initargs=hello.rs,-o,hello,out` (env per P7), capture the whole console. Count distinct syscalls and every `[err]` line up to the first hard stop. | Decides which of §2b/§2c rows fire before the thread wall and in what order (the census in the brief is `--version` only). Compare against §2d's amd64 list: any new number is checked against `akuma-syscalls-abi` before an arm exists. |
+| P2 | **Separate codegen from link.** Same boot, `initargs=--emit=metadata,hello.rs` (no linker). | If it succeeds at the thread wall (i.e. fails only on `clone`), the post-S4 gate `rustc --emit=metadata hello.rs` proves threads/futex without the S5 handshake; if it fails earlier, the census names what. Decides whether S5 gates S4's hello. |
+| P3 | **A pthread+futex program, tcc-built in guest.** Once S4 lands: `tcc -run` (or compile-then-run) a C file doing `pthread_create` ×2, a `pthread_mutex` lock/unlock (⇒ futex WAIT/WAKE private), `pthread_join`, printing `ok` per step. | The futex/clone wiring's first gate — fails before any rustc run is wasted. A lost wake hangs (timeout needed: alarm(30) + `abort`). Expected: `ok`×4, exit 0. |
+| P4 | **Memory of the compile.** At S1's slab sizes, boot with `-m 3072` and `-m 6144`; run the P1 census; record the peak from the kernel's region high-water prints (add a one-line print if absent — it is a diagnostic, not a kernel change) and whether `[OOM]` fires. | Decides whether `hello.rs` fits 3 GiB (archive: rustc wants ≥2 GB) and how much headroom the eager linker fork needs. Decides the RAM recommendation for the gates and whether the fork-copy row hurts wall-clock enough to matter for the gate. |
+| P5 | **The linker's output path.** After S6 but *before* S7: `rustc hello.rs -o hello; ls -la hello; ./hello`. Also `rust-lld --version` directly if present. | If the binary is **0 bytes while cargo/rustc reports success** — the archive's recorded failure — S7 is confirmed as the blocker and cannot be cut. If lld falls back to `write()` when MAP_SHARED fails, S7 demotes below S8. |
+| P7 | **What initargs can carry.** Boot `init=/bin/env initargs=A=1,B=2` (busybox env). | Prints whether initargs arrive as env, argv, or nothing — decides how `LD_LIBRARY_PATH`/`$HOME`/`$PATH` get seeded (§2a last row) and whether the shim needs a wrapper script. |
+| P6 | **The signal storm count.** During the first full `cargo build` (post-S7): count `tkill`/`tgkill` lines in the trace. | The archive says ~10,400 `tkill(SIGUSR1)`; the real number sizes S8 (delivery) vs honest-ENOSYS. If the build completes with ENOSYS tkill, S8 demotes to "musl cancellation correctness" rather than a cargo blocker. |
+
+(Order P7 → P1 → P2 → P4 first: none need kernel changes. P3 waits on S4; P5/P6 wait
+on S6.)
+
+## 5. Risks and unknowns (cheapest resolution each)
+
+| risk | why it bites | cheapest resolution |
+|---|---|---|
+| **Memory** — rustc ≥2 GB (archive), 3 GiB QEMU rehearsal, eager fork doubles peak at the linker spawn | `[OOM]` = halt; no pressure ladder | P4 measures it. Mitigations in order: bigger `-m` (TCG tolerates 6 GiB), `--emit=metadata` split gates, `akuma-fpcache` shared file frames (route A, a crate), demand paging only at stage 12. Do **not** start the mmap-model rewrite for this. |
+| **The zero-byte linker output** (§7d archive) — cargo reports success | the fixed-point gate lies | P5 names it before S7 is cut. The writeback machinery exists in glue — this is effects work, not design work. |
+| **Signal storm** ~10.4k tkill; musl pthread cancellation needs RT signal delivery | a wedged worker looks like a slow build | P6 counts. Honest ENOSYS carried amd64's early builds; delivery lands at S8 with the x86 frame extraction. `PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md` and `GIT_CLONE_STALE_ITIMER_SIGALRM.md` are the two archive incidents to re-read before S8 (stale-hazard check: they describe the *old* scheduler's starvation, not the slot pool's). |
+| **Stale archive hazards on futex/threads** | the archive's futex/thread docs (FUTEX_REQUEUE_LOST_WAKEUP, THREAD_*, §7g missed wakeup) predate `akuma-syscalls-sync` | grep the archive before writing any futex code; the crate's host tests supersede the war stories. The §7g missed-wakeup class is closed by `prepare_block`-before-membership-test (futex.rs:17–34) — preserve that ordering in the taoxichuan shim verbatim. |
+| **Double work: local arms vs glue fold** (pm S6) | S2's local mprotect/madvise arms could be rewritten at S6 | written as thin arms over the crate decisions from day one, so the S6 fold is a dispatch-table change, not a rewrite. Each local arm's comment names its glue successor. |
+| **argv/env silent truncation** (amd64 defect 1 shape) | build scripts pass ~5 KB args; a silent cut is a wrong-answer-not-error | E2BIG first (fail loud), then raise caps; probe P1 verifies the real arg lengths. |
+| **`getpriority` ENOSYS-as-pointer crash** (archive §7j) | the build unit SIGSEGVs | the D row returns a real value, and its host test pins the return convention. Cheap; do it with S6, not after a crash. |
+| **PK2 + rare boot stall still open** (gaps G1/G2) | more slots + more waits stress the open items | sequence the gates so a stall is attributable: S4 lands after pm's own PK gates; if the rare stall reproduces, stop and bisect there, not in futex code. |
+| **G3: no pump while a spawned child runs** | a long rustc compile may starve TCP (stage-9 cargo fetch) | out of this plan's path (fetch is stage 9, this is 10–11); noted for the network session. |
+
+## 6. Cost estimate
+
+| step | calls | cumulative |
+|---|---|---|
+| S1 slab | 4 | 4 |
+| S2 independent tail | 14 | 18 |
+| S3 pm S1 | (pm's ~30) | 48 |
+| S4 threads+futex | 70 | 118 |
+| S5 AF_UNIX handshake | 34 | 152 |
+| S6 cargo fs batch | 40 | 192 |
+| S7 MAP_SHARED writeback | 60 | 252 |
+| S8 signals | 80 | 332 |
+
+≈330 executor calls ≈ 3–4 sessions. **Cut at 165 calls:** S1–S5 (rustc hello runs;
+cargo waits). **Cut at 60:** S1–S2 + pm S1 (rustc --version clean, fork from init
+works) — the smallest state that unblocks every later row.
+
+## 7. Docs read this session
+
+`taoxichuan/docs/README.md`; `reference/syscalls.md` (whole table);
+`reference/memory.md`; `reference/processes.md`; `reference/switch-to-crates.md`;
+`reference/rust-toolchain.md` (the doc corrected in this commit);
+`taoxichuan/docs/gaps.md` (head); `CLAUDE.md` syscall-family paragraph (:89–116);
+`docs/archive/AKUMA_EXTRACT_MMAP.md` (§1, §7); `docs/archive/RUST_TOOLCHAIN_AMD64.md`
+(:242–640: the missing-numbers tables, cargo's batch, session 5 lazy/shared frames);
+`docs/archive/AKUMA_SELF_HOSTING.md` (§1.4 RAM, §7 section map); the family-crate
+sources `akuma-syscalls-sync/src` (module list), `akuma-syscalls-mem/src` (incl.
+membarrier.rs header), `akuma-syscalls-glue/src/{mem,signal,proc,fs,unixsock,lib}.rs`
+(arm lines cited in §2), `akuma-mmap/src/region.rs` (FileBacking:203),
+`akuma-exec/src/process/mod.rs` (fork_process:3194, clone_thread:3546, set_cwd:1192,
+mmap_regions:797), `amd64/src/{futex,thread,signal,usermode,mm}.rs` (the wiring
+examples cited in §2), `scripts/kvm/akuma_rehearse.sh:61` (RAM).
+
+### Questions for the user the docs cannot answer
+
+1. **Slab now vs process memory model first?** S1 grows the constants (an hour of
+   work, honest about being a stop). The alternative — pulling `akuma-exec`'s
+   `MmapRegion`/per-process space into taoxichuan now — kills the slab row
+   permanently but couples stage 10 to a memory-model rewrite mid-ladder. I planned
+   constants now, model at stage 12; say if you want it the other way.
+2. **Is `cargo build`'s gate allowed to use a vendored/offline crate?** Stage 9
+   (`cargo fetch`) needs the network (eventfd2 is served; HTTPS + G3 pump is the
+   network session's problem). If the stage-10 gate must build *the fetched* tree,
+   the order inside S6 changes (staging first). The amd64 path staged with
+   `git archive | tar` + `cargo vendor` (RUST_TOOLCHAIN_AMD64.md:496).
+3. **Signals before or after MAP_SHARED?** I put MAP_SHARED (S7) first because the
+   linker gate is load-bearing and the archive says early builds survived honest
+   ENOSYS signals; if you expect to run a pthread-heavy workload sooner, swap S7/S8.
+4. **Does the weekly token budget cover pm's S1 landing first?** Every §2b row is
+   AFTER-PM; if pm slips, the only deliverable is S1+S2, and this plan's cut lines
+   should move up a level.
