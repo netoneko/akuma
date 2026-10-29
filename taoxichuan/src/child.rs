@@ -870,12 +870,31 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     let argv: Vec<&str> = args.argv.iter().map(String::as_str).collect();
     let env: Vec<&str> = args.env.iter().map(String::as_str).collect();
 
-    // A free slot and a pid, before anything expensive.
+    // A free slot and a pid, before anything expensive. Session ph: the ring
+    // number is RESERVED in the threading pool FIRST (the fork children's
+    // tids come from the same pool — an unreserved number is handed to a
+    // fork child, which then binds this shell's cross record/SpawnSlot/fd
+    // table; boots ph-2/ph-4). A refused number (neither FREE nor TERMINATED
+    // — i.e. already reserved by an earlier crossing) is skipped: the next
+    // index is tried, NSLOTS tries in total, never the blind-next wrap onto
+    // a live ring (the M2 lesson, boot 3 gate P3).
     let slot_idx = {
         // SAFETY: syscall-path discipline.
         let s = slots();
-        let idx = unsafe { core::ptr::read_volatile(&raw const NEXT_SLOT) };
-        let idx = idx % NSLOTS;
+        let mut idx = unsafe { core::ptr::read_volatile(&raw const NEXT_SLOT) };
+        let mut idx = idx % NSLOTS;
+        let mut tries = 0;
+        loop {
+            if akuma_threading::reserve_slot(idx) {
+                break;
+            }
+            idx = (idx + 1) % NSLOTS;
+            tries += 1;
+            if tries >= NSLOTS {
+                akuma_primitives::safe_print!(160, "  [spawn] every ring slot already reserved\n");
+                return crate::e(crate::err::EAGAIN);
+            }
+        }
         s[idx] = SpawnSlot::new();
         s[idx].used = true;
         let pid = unsafe {
@@ -932,18 +951,6 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     // The sched_* maps key on this: the shell's threading tid is its spawn
     // slot, and which slot that is varies across a boot's login spawns.
     crate::exec_twin::set_shell_tid(slot_idx);
-    // Session ph (boot ph-2): RESERVE the number in the threading pool —
-    // the fork children's tids come from `spawn_user_thread_initializing`,
-    // and an unreserved number is handed to the next concurrent fork child,
-    // which then binds THE SHELL'S cross record/SpawnSlot/fd table (P1's
-    // second child: `bind tid=2 shell=2` — echo EPIPE, cat parked forever).
-    if !akuma_threading::reserve_slot(slot_idx) {
-        akuma_primitives::safe_print!(
-            160,
-            "  [spawn] ring slot {} already claimed in the thread pool\n",
-            slot_idx as u64
-        );
-    }
     // Timer preemption arms here (session pf): the first SPAWN crossing is
     // the first moment a ring-3 tick has a legitimate switch target.
     crate::PREEMPT_ARMED.store(true, core::sync::atomic::Ordering::Release);

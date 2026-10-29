@@ -3261,14 +3261,26 @@ pub fn reserve_slot(slot: usize) -> bool {
     if slot >= MAX_THREADS {
         return false;
     }
-    THREAD_STATES[slot]
-        .compare_exchange(
-            thread_state::FREE,
-            thread_state::INITIALIZING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        )
-        .is_ok()
+    // A TERMINATED slot is equally takeable: its thread is dead by
+    // definition, and the fork path's own recycler would otherwise hand the
+    // number right back out from under the crossing (boot ph-4: session 3's
+    // reserve of ring slot 3 refused against session 2's TERMINATED child,
+    // the fork claim reclaimed it, and the session shell collided with its
+    // own first child again).
+    for state in [thread_state::FREE, thread_state::TERMINATED] {
+        if THREAD_STATES[slot]
+            .compare_exchange(
+                state,
+                thread_state::INITIALIZING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Mark the running thread terminated and switch away for good.
