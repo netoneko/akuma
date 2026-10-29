@@ -297,23 +297,6 @@ pub fn child_write(buf_va: u64, len: u64) -> bool {
     }
     // SAFETY: syscall-path discipline.
     let out_slot = unsafe { cross_mut(cur).out_slot };
-    // [tmp] trace (session pg): the first 3 fd-1 landings — which buffer do
-    // the child's writes actually take, and how full is it?
-    {
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 12 {
-            let blen = unsafe { slots()[out_slot].out.len() } as u64;
-            akuma_primitives::safe_print!(
-                96,
-                "[tmp] cw cur={} out={} len={} buf={}\n",
-                cur as u64,
-                out_slot as u64,
-                len,
-                blen
-            );
-        }
-    }
     let mut chunk = [0u8; 512];
     let mut done = 0u64;
     while done < len {
@@ -517,8 +500,8 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), 
         }
     }
     bind[tid] = (tid, pid, root_pa);
-    // [tmp] trace (session pg): the bind-time cross stamp — is the out_slot
-    // copy actually taken, and from whom?
+    // The out_slot/depth stamp (session pg): the fork child writes into the
+    // SAME session buffer its parent had — the bridge drains the shell's.
     let shell = crate::exec_twin::current_slot();
     if shell != crate::exec_twin::NO_SLOT && shell < NSLOTS && tid < NSLOTS {
         // SAFETY: syscall-path discipline (the fork syscall, IF clear).
@@ -530,14 +513,6 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), 
         let c = unsafe { cross_mut(tid) };
         c.out_slot = out;
         c.depth = depth + 1;
-        akuma_primitives::safe_print!(
-            96,
-            "[tmp] bind tid={} shell={} out={} depth={}\n",
-            tid as u64,
-            shell as u64,
-            out as u64,
-            depth as u64 + 1
-        );
     }
     Ok(())
 }
@@ -613,13 +588,6 @@ pub fn task_exit_real(code: u64) -> ! {
     };
     crate::pipes::release_open_fds();
     if waiter != u32::MAX {
-        akuma_primitives::safe_print!(
-            96,
-            "[tmp] exit tid={} code={} wake={}\n",
-            cur as u64,
-            code,
-            waiter as u64
-        );
         akuma_threading::get_waker_for_thread(waiter as usize).wake();
     }
     akuma_threading::x86_finish_current()
@@ -840,12 +808,7 @@ fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
     // syscall stub stashed it (`user_rsp_stash`) and step 6's captured
     // context carries it into the child's UserContext.
     match akuma_exec::process::fork_process(child_pid, 0) {
-        Ok(pid) => {
-            // [tmp] trace (remove before final, session pf): boot pf-1's wedge
-            // left "did wc's fork even happen?" open — name every real fork.
-            akuma_primitives::safe_print!(96, "[tmp] fork child pid={}\n", u64::from(pid));
-            u64::from(pid)
-        }
+        Ok(pid) => u64::from(pid),
         // The refusal line is the evidence this slice hunts for; name the
         // message verbatim (the same discipline as spawn's read-failed
         // print).
@@ -1650,15 +1613,9 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
         // it, so the parked task's own user RSP must be saved across the
         // park and restored before its syscall returns (the stub tail reads
         // the global, not a per-task copy).
-        // [tmp] trace (remove before final, session pf): pf-2 died right after
-        // a wait4 return of 0 with the caller never syscalling again — name
-        // the park (and the wake-back), so "never parked" vs "parked and
-        // spuriously resumed" is decidable from one console.
-        akuma_primitives::safe_print!(96, "[tmp] w4park slot={} pid={:#x} opt={:#x}\n", my_tid as u64, pid, options);
         let stash = ring3::user_rsp_stash();
         akuma_threading::schedule_blocking(u64::MAX);
         ring3::set_user_rsp_stash(stash);
-        akuma_primitives::safe_print!(96, "[tmp] w4resume slot={}\n", my_tid as u64);
         // Woken (or the deadline passthrough never fires at u64::MAX): the
         // loop re-scans. Spurious wakes are fine — the scan decides.
     }
@@ -1734,21 +1691,6 @@ pub fn read_child_out(slot_idx: usize, buf_va: u64, len: u64) -> u64 {
         return crate::e(crate::err::EBADF);
     };
     let n = (len as usize).min(slot.out.len());
-    // [tmp] trace (session pg): the first 3 drains — what does the bridge
-    // actually see in the buffer it polls?
-    {
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 12 {
-            akuma_primitives::safe_print!(
-                96,
-                "[tmp] rco slot={} ask={} avail={}\n",
-                slot_idx as u64,
-                len,
-                slot.out.len() as u64
-            );
-        }
-    }
     if n == 0 {
         return 0; // drained: EOF, the same thing a real pipe reports
     }

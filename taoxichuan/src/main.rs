@@ -266,16 +266,6 @@ fn fault_trap(t: &mut Trap<'_>) {
     // task to keep running; what matters for the gate is that this prints
     // `[Fault]` and stops instead of triple-faulting into guest silence.
     if t.from_ring3() {
-        // [tmp] trace (remove before final): the crossing state at the moment
-        // of a ring-3 task death — whose slot was current, what the stub's
-        // stack-top global and the user-rsp stash held.
-        akuma_primitives::safe_print!(
-            192,
-            "[tmp] fault ctx slot={} top={:#x} stash={:#x}\n",
-            crate::exec_twin::current_slot(),
-            ring3::syscall_stack_top(),
-            ring3::user_rsp_stash()
-        );
         akuma_primitives::safe_print!(
             192,
             "[Fault] ring3 {:?} rip=0x{:016x} rsp=0x{:016x} cr2=0x{:016x} code=0x{:x} -- task killed\n",
@@ -382,27 +372,7 @@ fn timer_trap(t: &mut Trap<'_>) {
     // itself needs nothing back — a tick returns to the same instruction. The
     // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
     let n = akuma_lapic_amd64::on_tick();
-    // [tmp] trace (remove before final, session pf): every 256th tick (~2.6 s)
-    // name the machine's scheduling state. Boot pf-2 answered "the shell
-    // (slot 2) holds the core, one thread READY never picked, nobody
-    // WAITING" — this pass adds the interrupted RIP and its privilege level,
-    // so a ring-3 spin shows as pl=3 rip in user text, a kernel-side
-    // stuck-runner as pl=0 rip in kernel text.
-    if n % 256 == 0 {
-        let s = akuma_threading::thread_stats_full();
-        akuma_primitives::safe_print!(
-            96,
-            "[tmp] wd n={} pl={} rip={:#x} slot={} tid={} rdy={} run={} wt={}\n",
-            n,
-            t.frame.cs & 3,
-            t.frame.rip,
-            crate::exec_twin::current_slot() as u64,
-            akuma_threading::current_thread_id() as u64,
-            s.ready as u64,
-            s.running as u64,
-            s.waiting as u64
-        );
-    }
+    let _ = n;
     // M4 slice 3 preemption (session pf, plan §5): a tick that interrupted
     // ring 3 may switch — the same `x86_yield` the park loop and the idle lap
     // already run, on this handler's own (per-slot, `arm_trap_stack`) trap
@@ -1121,10 +1091,7 @@ fn open_common(path: &str, flags: u64) -> u64 {
 /// (`write_at_by_inode`) extends the file as the offset passes its end, and
 /// the fd's size/cursor follow the bytes that landed.
 fn write_file_arm(fd: u64, buf: u64, len: u64) -> u64 {
-    let r = write_file_arm_inner(fd, buf, len);
-    // Stage-7 probe: which file writes move and which stall (H3's echo).
-    akuma_primitives::safe_print!(96, "  [w] fd={} len={} -> {}\n", fd, len, r);
-    r
+    write_file_arm_inner(fd, buf, len)
 }
 
 fn write_file_arm_inner(fd: u64, buf: u64, len: u64) -> u64 {
@@ -1180,12 +1147,7 @@ fn write_file_arm_inner(fd: u64, buf: u64, len: u64) -> u64 {
 /// the fd used to fail EBADF there and stdio swallowed the error, which is
 /// why the file was created empty with a silent rc 1 (stage 7 session A).
 fn writev_file_arm(fd: u64, data: &[u8]) -> u64 {
-    let r = writev_file_arm_inner(fd, data);
-    // The writev twin of the [w] probe: which file writes ride writev
-    // (U1's settle — musl's stdio flushes through writev even for one
-    // buffer, ash's builtin echo flushes through write).
-    akuma_primitives::safe_print!(96, "  [wv] fd={} len={} -> {}\n", fd, data.len() as u64, r);
-    r
+    writev_file_arm_inner(fd, data)
 }
 
 fn writev_file_arm_inner(fd: u64, data: &[u8]) -> u64 {
@@ -1468,30 +1430,6 @@ fn fs_err(err: akuma_vfs::FsError) -> u64 {
     }
 }
 
-/// Reverse-map a syscall number to its name, for the unhandled arm — each
-/// boot then reads as a checklist instead of a table of bare numbers.
-/// Name a syscall for the console's unhandled-syscall line. Trim step 2,
-/// family 5: the Linux x86_64 names are `akuma_syscalls_abi`'s now — the same
-/// table rows `Syscall::from_x86_64` decodes — so this kernel's diagnostics
-/// cannot drift from the numbering table it shares with the full kernels.
-/// (The Debug spelling is CamelCase and one name per number, where the old
-/// hand table had lowercase and "poll/ppoll" merges: console evidence only,
-/// no bytes cross to the guest.) The three akuma-private numbers (0x1000+,
-/// above every real x86_64 number) keep their local names; anything neither
-/// table knows stays "?".
-fn nr_name(nr: u64) -> alloc::string::String {
-    match nr {
-        ring3::nr::WAITPID => return "akuma-waitpid".into(),
-        ring3::nr::CLOSE_CHILD_STDIN => return "akuma-close-child-stdin".into(),
-        ring3::nr::UPTIME => return "akuma-uptime".into(),
-        _ => {}
-    }
-    match akuma_syscalls_abi::Syscall::from_x86_64(nr) {
-        Some(s) => alloc::format!("{s:?}"),
-        None => "?".into(),
-    }
-}
-
 /// Fill the x86_64 `struct stat` (144 bytes) at the task's `buf`: device
 /// numbers and all times zero (one disk, no clock), the rest from the
 /// arguments. `Err(errno)` on a bad task pointer.
@@ -1713,67 +1651,8 @@ fn eventfd_close_slot(idx: usize) {
 pub(crate) fn eventfd_can_read(idx: usize) -> bool {
     eventfds()[idx].as_ref().is_some_and(|ef| ef.can_read())
 }
-/// [tmp] trace (session pg, remove with the fix): the write-path evidence for
-/// the exec'd shell's writev spin. Sits at the dispatch RETURN point, so it
-/// names the answer the kernel COMPUTED — the loop case is exactly repeated
-/// zeros (the disassembly fact, PLAN-pg §1 F1), and a nonzero answer repeating
-/// while the task still loops would indict answer DELIVERY, not the arms.
-/// Bounded: the first 12 write-syscall answers per boot regardless of value,
-/// then only zeros — the first 12 zeros, then every 65536th zero.
-fn wtrace(nr: u64, fd: u64, a3: u64, iov_va: u64, ans: u64) {
-    use core::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(0);
-    static Z: AtomicU32 = AtomicU32::new(0);
-    if crate::exec_twin::current_slot() == crate::exec_twin::NO_SLOT {
-        return; // the boot task's writes are the probe banner, not the case
-    }
-    // The iovec lens, read PRE-call: rem in musl's __stdio_write is exactly
-    // their sum — the loop needs a 0 answer to a rem>0 writev.
-    let (mut l0, mut l1) = (0xFFFF_FFFFu64, 0xFFFF_FFFFu64);
-    if a3 >= 1 && a3 <= 2 {
-        let mut iv = [0u8; 16];
-        if copy_from_user(&mut iv, iov_va) {
-            l0 = u64::from_le_bytes(iv[8..16].try_into().unwrap());
-            if a3 == 2 && copy_from_user(&mut iv, iov_va + 16) {
-                l1 = u64::from_le_bytes(iv[8..16].try_into().unwrap());
-            }
-        }
-    }
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let zero = if ans == 0 {
-        Z.fetch_add(1, Ordering::Relaxed) + 1
-    } else {
-        0
-    };
-    if n < 12 || (ans == 0 && (zero <= 12 || zero.is_multiple_of(65536))) {
-        akuma_primitives::safe_print!(
-            96,
-            "[tmp] wv nr={} fd={} a3={} l0={:#x} l1={:#x} br={} dlen={} ans={:#x}\n",
-            nr,
-            fd,
-            a3,
-            l0,
-            l1,
-            WBR.load(Ordering::Relaxed),
-            WLEN.load(Ordering::Relaxed),
-            ans
-        );
-    }
-}
-
-/// The WRITEV arm's own branch marker (boot pg-2): which `Some(_)`/fallback
-/// produced the answer, and the gathered length. 0 = not this syscall.
-pub(crate) static WBR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-pub(crate) static WLEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
-    let (nr, fd, a3, iov_va) = (fr.rax, fr.arg1(), fr.arg3(), fr.arg2());
-    WBR.store(0, core::sync::atomic::Ordering::Relaxed);
-    let ans = dispatch_inner(fr);
-    if nr == ring3::nr::WRITE || nr == ring3::nr::WRITEV {
-        wtrace(nr, fd, a3, iov_va, ans);
-    }
-    ans
+    dispatch_inner(fr)
 }
 
 fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
@@ -1902,14 +1781,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
                 _ => 0,
             });
-            WLEN.store(data.len() as u64, core::sync::atomic::Ordering::Relaxed);
             match kind {
                 Some(5) => {
-                    WBR.store(5, core::sync::atomic::Ordering::Relaxed);
                     return crate::pipes::write_arm_gathered(pipe_id as u32, &data);
                 }
                 Some(1) => {
-                    WBR.store(1, core::sync::atomic::Ordering::Relaxed);
                     let Some(idx) = sock::fd_socket(fd) else {
                         return e(ring3::err::EBADF);
                     };
@@ -1919,18 +1795,15 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     };
                 }
                 Some(2) => {
-                    WBR.store(2, core::sync::atomic::Ordering::Relaxed);
                     return writev_file_arm(fd, &data);
                 }
                 Some(3) => {
-                    WBR.store(3, core::sync::atomic::Ordering::Relaxed);
                     return total; // /dev/null: gone, but accepted
                 }
                 // Linux's writev on an eventfd writes only the first 8
                 // bytes of the gather; libcurl's wakeup write(2) never
                 // comes through writev, but the number must not EBADF.
                 Some(4) => {
-                    WBR.store(4, core::sync::atomic::Ordering::Relaxed);
                     let mut b = [0u8; 8];
                     let n = data.len().min(8);
                     b[..n].copy_from_slice(&data[..n]);
@@ -1939,16 +1812,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 _ => {}
             }
             if fd != 1 && fd != 2 {
-                WBR.store(10, core::sync::atomic::Ordering::Relaxed);
                 return e(ring3::err::EBADF);
             }            // The pipe branch of `write` applies per iovec: musl flushes a
             // buffered stdout as one writev, and a nested child's version
             // string belongs to the ssh session, not the console.
             let piped = child::nested_active() && fd == 1;
-            WBR.store(
-                if piped { 12 } else { 11 },
-                core::sync::atomic::Ordering::Relaxed,
-            );
             let mut total = 0u64;
             for i in 0..iovcnt {
                 let mut iv = [0u8; 16];
@@ -2058,11 +1926,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                     0
                 }
-                other => {
-                    // Name the gap: an arch code this table does not serve.
-                    // (The *syscall-level* checklist arm is at the bottom of
-                    // the dispatcher's own match.)
-                    akuma_primitives::safe_print!(160, "  [sc] arch_prctl code {}\n", other);
+                _other => {
                     e(ring3::err::ENOSYS)
                 }
             }
@@ -3095,25 +2959,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         // fork and the real reap — the arms busybox ash needs to run any
         // non-final command of a list. child.rs's M2 scaffold.
         ring3::nr::CLONE | 57 | 58 => child::fork_arm(fr),
-        ring3::nr::WAIT4 => {
-            // [tmp] trace (remove before final): the full frame at the wait4
-            // arm's return — this is the frame the stub tail pops to get back
-            // to ring 3, so a stomp during the park shows up here as zeroed
-            // slots before the sysret fires.
-            let r = child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
-            // [tmp] pf-2 follow-up: pf-2's opt= printed arg4 — that is
-            // rusage, not options. wait4's options are arg3 (WNOHANG = bit 0);
-            // print the right register and name the caller's slot.
-            akuma_primitives::safe_print!(
-                96,
-                "[tmp] w4ret opt={:#x} slot={} rax={:#x} rip={:#x}\n",
-                fr.arg3(),
-                crate::exec_twin::current_slot() as u64,
-                r as u64,
-                fr.user_rip
-            );
-            r
-        }
+        ring3::nr::WAIT4 => child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
         ring3::nr::WAITPID => child::waitpid_arm(fr.arg1(), fr.arg2()),
         ring3::nr::CLOSE_CHILD_STDIN => child::close_stdin_arm(fr.arg1()),
         ring3::nr::GETTIMEOFDAY => {
@@ -3147,21 +2993,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // nested-crossing arm below stays for the shell (the SPAWN
             // crossing's tail-exec handoff).
             if child::is_real_task() {
-                // [tmp] trace (session ph, boot ph-2): the REAL fork child's
-                // exec — entry, and the return (a return here is a FAILURE;
-                // success replaces the image and never comes back).
-                static XV_N: core::sync::atomic::AtomicU32 =
-                    core::sync::atomic::AtomicU32::new(0);
-                if XV_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
-                    akuma_primitives::safe_print!(
-                        96,
-                        "[tmp] xv in sl={}\n",
-                        crate::exec_twin::current_slot() as u64
-                    );
-                }
-                let r = child::exec_real_task(fr);
-                akuma_primitives::safe_print!(96, "[tmp] xv ret={:#x}\n", r);
-                return r;
+                return child::exec_real_task(fr);
             }
             if !child::nested_active() {
                 return e(ring3::err::ENOSYS);
@@ -3186,11 +3018,9 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // amd64 box needed this row for the same caller).
             sock::getpeername_arm(fr.arg1(), fr.arg2(), fr.arg3())
         }
-        other => {
-            // Name the gap: a guest task hit a number this table does not
-            // serve. The name first, then the raw number — each boot reads
-            // as a checklist of exactly what is still missing.
-            akuma_primitives::safe_print!(160, "  [sc] unhandled {} ({})\n", nr_name(other), other);
+        _other => {
+            // A guest task hit a number this table does not serve; the errno
+            // is the answer (the arch-level checklist arm is above).
             e(ring3::err::ENOSYS)
         }
     }

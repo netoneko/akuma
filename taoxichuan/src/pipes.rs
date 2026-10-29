@@ -101,12 +101,6 @@ pub fn pipe2_arm(fds_va: u64, flags: u64) -> u64 {
         return crate::e(ring3::err::EFAULT);
     }
     let id = table().create();
-    // [tmp] trace (session ph, boot ph-2): the fresh pipe's id — links the
-    // surgery traces to the create.
-    static PP_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if PP_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 4 {
-        akuma_primitives::safe_print!(96, "[tmp] pp id={}\n", id as u64);
-    }
     let mut fds = crate::fd_table();
     let Some(rslot) = fds.free_below(3, crate::SLOT_CEILING) else {
         table().close_read(id);
@@ -158,18 +152,6 @@ pub fn read_arm(id: u32, buf_va: u64, len: u64) -> u64 {
             };
             if table().check_set_reader(id, tid, ()) {
                 break;
-            }
-            // [tmp] trace (session ph, boot ph-2): the reader park — id and
-            // tid name the parked pipeline member; a park here with no later
-            // wake is the lost-wakeup shape.
-            static RP_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-            if RP_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
-                akuma_primitives::safe_print!(
-                    96,
-                    "[tmp] rp id={} tid={}\n",
-                    id as u64,
-                    tid as u64
-                );
             }
             park_once();
             continue;
@@ -236,19 +218,6 @@ pub fn write_arm_gathered(id: u32, data: &[u8]) -> u64 {
                 }
             }
             WriteOutcome::BrokenPipe | WriteOutcome::NoSuchPipe => {
-                // [tmp] trace (session ph, boot ph-2): WHICH of the two, and
-                // for whom — echo died here with 13<<8; the parked-forever
-                // reader (cat) needs the id to name its pipe.
-                static WP_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-                if WP_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
-                    akuma_primitives::safe_print!(
-                        96,
-                        "[tmp] wp id={} out={:?} sl={}\n",
-                        id as u64,
-                        out,
-                        crate::exec_twin::current_slot() as u64
-                    );
-                }
                 if crate::child::is_real_task() {
                     crate::child::task_exit_real(13 << 8);
                 }
@@ -276,18 +245,6 @@ pub fn write_no_sigpipe(id: u32, data: &[u8]) -> Result<usize, i32> {
 /// One more descriptor names this end — `dup`/`dup2`/`fcntl(F_DUPFD)`, and
 /// `fork_arm`'s walk over `fork_copy`'s payloads.
 pub fn clone_ref(id: u32, is_write: bool) {
-    // [tmp] trace (session ph, boot ph-2): every dup/fork-copy bump, with the
-    // caller's slot — the fd surgery of a pipeline's fork children.
-    static CL_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if CL_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 24 {
-        akuma_primitives::safe_print!(
-            96,
-            "[tmp] cln id={} w={} sl={}\n",
-            id as u64,
-            is_write as u64,
-            crate::exec_twin::current_slot() as u64
-        );
-    }
     table().clone_ref(id, is_write);
 }
 
@@ -310,18 +267,6 @@ pub fn writable(id: u32) -> bool {
 /// own `close_read` doc names `busybox yes | busybox head -n 1` as the
 /// victim of exactly the dropped wake.
 pub fn release(id: u32, is_write: bool) {
-    // [tmp] trace (session ph, boot ph-2): every close-side drop — the last
-    // read ref destroying the entry under a parked writer is the theory.
-    static RL_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if RL_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 24 {
-        akuma_primitives::safe_print!(
-            96,
-            "[tmp] rel id={} w={} sl={}\n",
-            id as u64,
-            is_write as u64,
-            crate::exec_twin::current_slot() as u64
-        );
-    }
     let wakes = if is_write {
         table().close_write(id).1
     } else {
