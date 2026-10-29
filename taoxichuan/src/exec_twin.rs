@@ -212,7 +212,7 @@ extern "C" fn idle_main() -> ! {
         } else {
             laps += 1;
             if laps == next {
-                akuma_primitives::safe_print!("[tmp] idle laps={}\n", laps);
+                akuma_primitives::safe_print!(192, "[tmp] idle laps={}\n", laps);
                 next = next.saturating_mul(2);
             }
         }
