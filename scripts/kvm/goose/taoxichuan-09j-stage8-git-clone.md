@@ -6,10 +6,10 @@ You are goose-glm, the metal track of `docs/archive/MINIMAL_SELF_HOSTING_EXPERIM
 ## The goal
 The ladder's stage 8: **`git clone` over HTTPS works in the Taoxichuan guest; `git log` and `git fsck` agree with a host-side clone of the same repo.** The process model (real fork, `wait4`, pipes, timer preemption) is done as far as F1, PK1, P1-P5 go; stage 7 (`curl -sS https://example.com`) is done. git forks a transport helper (`git-remote-https`) and pumps it through pipes, the shape the process model was built for.
 Pick a small fixed public repo and a fixed ref (write it in the plan, with its expected `git log --oneline | wc -l` and HEAD id taken from a host-side clone). Gate: console `[SSH] Exit status: 0` for the clone, then `git log --oneline | wc -l` and `git rev-parse HEAD` equal the host's, and `git fsck` exits 0, all in the same boot; zero `Fault|PANIC|sig!` in the boot's own window.
-Three phases (0 the stall, 1 plan, 2 execute).
+Two phases.
 
-## Phase 0 - the stall (cap: about 25 tool calls, before the git work)
-Session pj left one open defect: in 2 of 7 boots the battery stalls after `[SSH] Exec:` because the spawn parks and nothing wakes it (a lost wake in the exec crossing; tick alive, relay owns the core). `RESULT-pj.md` "What is next" names the instrument sites. A git clone is many execs and pipes in one boot, so an unreliable boot will cost you more than this fix. Plan it, fix it from evidence, and state your stall rate over at least 3 consecutive full batteries (F1, PK1, PK2, P1-P5). If 25 calls pass without a cause, record what you learned in `taoxichuan/docs/gaps.md` and go on to Phase 1; do not let it eat the session.
+## Precondition
+Session pl (brief 09l) fixes the spawn-park stall first. Confirm it: read `RESULT-pl.md`; if its final stall rate is not 10 clean of 10, say so in your plan and use its harness before every battery, and expect the stall to cost you boots.
 
 ## Phase 1 - plan (before any edit or boot)
 Write `PLAN-pk.md` and commit it. It must contain, from reading and not from guessing:
