@@ -1920,7 +1920,17 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     // `akuma_cpu::msr::set_fs_base` is the closed wrmsr path,
                     // canonical-check included.
                     match akuma_cpu::msr::set_fs_base(addr) {
-                        Ok(()) => 0,
+                        Ok(()) => {
+                            // Session pi: keep the per-slot shadow in step —
+                            // this MSR is per-core and `switch_to` installs
+                            // the shadow, so a runtime TLS change must land
+                            // in both or the next park-resume rolls back.
+                            crate::child::set_slot_fs(
+                                crate::exec_twin::current_slot(),
+                                addr,
+                            );
+                            0
+                        }
                         Err(_) => e(ring3::err::ERANGE),
                     }
                 }

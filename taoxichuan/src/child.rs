@@ -598,6 +598,38 @@ pub fn task_exit_real(code: u64) -> ! {
 /// `exec_replace` does, minus the crossing bookkeeping (a real child has no
 /// crossing to resume; its exit goes through [`task_exit_real`]). Never
 /// returns: `child_enter` loads the new root and sysrets.
+/// Per-slot IA32_FS_BASE shadow (session pi): the MSR is per-CORE, this
+/// kernel multiplexes every task onto that one core, and `switch_to` never
+/// restored it — a parked task resumed with the LAST-RAN task's TLS pointer.
+/// Invisible for three stages because every busybox process shares the same
+/// TLS address (deterministic layout); grandfork is the first image with its
+/// own TLS, and its parent's wait4 resume ran with the shell's 0x713198 in
+/// the MSR (boot pi-3: seven child entries printed the correct 0x100051b8,
+/// the parent's next guard read still took fs+0x28 to the shell's bss).
+/// `switch_to` installs the incoming task's shadow; `arch_prctl` and the
+/// crossings keep it in step. Plain `static mut`: single core, every access
+/// on the IF-clear syscall/scheduler path (the TASK_SLOT discipline).
+static mut SLOT_FS: [u64; NSLOTS] = [0; NSLOTS];
+
+/// The slot's fs_base (what `switch_to` installs). A slot >= NSLOTS is the
+/// idle thread: kernel-only, no TLS, and the answer 0 is never installed.
+pub(crate) fn slot_fs_of(slot: usize) -> u64 {
+    if slot < NSLOTS {
+        // SAFETY: single core, IF-clear callers (see SLOT_FS).
+        unsafe { SLOT_FS[slot] }
+    } else {
+        0
+    }
+}
+
+/// Stamp the slot's fs_base (crossings and the `arch_prctl` SET_FS arm).
+pub(crate) fn set_slot_fs(slot: usize, v: u64) {
+    if slot < NSLOTS {
+        // SAFETY: single core, IF-clear callers (see SLOT_FS).
+        unsafe { SLOT_FS[slot] = v; }
+    }
+}
+
 pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     let cur = crate::exec_twin::current_slot();
     let args = match read_spawn_args(fr.arg1(), fr.arg2(), fr.arg3()) {
@@ -666,6 +698,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     // depth-1 exec gets from the boot crossing, and what the amd64 kernel's
     // exec hands its images (grandfork passes there).
     let _ = akuma_cpu::msr::set_fs_base(0);
+    set_slot_fs(cur, 0);
     // SAFETY: the crossing contract — `root` maps the new image plus the
     // shared kernel half, `ef` is ring-3-enterable. A real child never runs
     // `exit_cross`, so this crossing has no return side; the dead dispatcher
@@ -976,6 +1009,15 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
         rflags: 0x202,
         rsp: ti.rsp,
     };
+    // Session pi: the spawn crossing hands the fresh image a deterministic
+    // fs (0 — what the exec crossings give, what amd64 hands its images) and
+    // stamps the shadow so the child's first park-resume re-installs 0 until
+    // musl's own arch_prctl names its TLS. The MSR here held WHATEVER ran
+    // last on the core — for three stages that leftover happened to be the
+    // previous shell's TLS, which busybox's own arch_prctl always replaced
+    // before its first fs-relative read.
+    let _ = akuma_cpu::msr::set_fs_base(0);
+    set_slot_fs(slot_idx, 0);
     let code = unsafe { child_enter(ti.root_pa, &ef, save) };
     // `code` (the child's exit status) was recorded into the slot by the
     // exit arm before it returned here; SPAWN's own result is the packed
@@ -1150,6 +1192,7 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     // The same stale-fs rule as exec_real_task's crossing: a fresh image
     // starts with fs = 0, never the outgoing task's TLS pointer.
     let _ = akuma_cpu::msr::set_fs_base(0);
+    set_slot_fs(crate::exec_twin::current_slot(), 0);
     let status = unsafe { child_enter(ti.root_pa, &ef, core::ptr::addr_of_mut!(EXEC_SAVE)) };
     // The exec'd child exited: `child_exit` recorded its status in the slot,
     // cleared the nesting, put task slot 0 back, and restored THIS frame's
@@ -1536,8 +1579,13 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
         ring3::set_syscall_stack_top(c.parent_stack_top - (ring3::SYSCALL_STACK_SIZE / 4) as u64);
         (c.parent_stack_top, save_ptr(slot_idx))
     };
+    // Session pi: the M2 fork child inherits the shell's fs (same-image
+    // semantics — the MSR already holds it at this crossing, the capture
+    // comment below); stamp the shadow so its park-resumes re-install it.
+    set_slot_fs(slot_idx, slot_fs_of(cur));
     let _code = unsafe { child_enter(root, &ef, save) };
     // The child exited into this frame: its status is in the slot, the task
+    // slot is back to 1, CR3 is the shell's, `current_slot` is the shell's
     // slot is back to 1, CR3 is the shell's, `current_slot` is the shell's
     // slot again (the exit tail's `set_current_slot(parent_slot)`). Hand the
     // shell back its stack and stash from the child's own record, answer

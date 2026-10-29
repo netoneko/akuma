@@ -145,6 +145,13 @@ fn switch_to(from: usize, to: usize) {
         // aliasing to flush (PCID unused, CR3 writes flush non-global).
         unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
     }
+    // Session pi: restore the incoming task's own fs. The MSR is per-core
+    // and every switch used to leave it holding the OUTGOING side's (or any
+    // earlier task's) TLS pointer — the parked-resume defect that only
+    // grandfork (the first image with its own TLS) could surface. One wrmsr
+    // per switch, incoming slot's shadow; the idle thread (to >= NSLOTS)
+    // runs kernel code only and is skipped.
+    let _ = akuma_cpu::msr::set_fs_base(crate::child::slot_fs_of(to));
 }
 
 /// The idle thread's tid: outside the spawn ring (children claim 1..NSLOTS,
@@ -572,6 +579,7 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
         ctx.pc
     );
     let _ = akuma_cpu::msr::set_fs_base(ctx.fs_base);
+    crate::child::set_slot_fs(cur, ctx.fs_base);
     unsafe { akuma_ring3_amd64::enter_user(&ef) }
 }
 
