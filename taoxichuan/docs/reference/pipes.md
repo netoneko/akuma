@@ -1,7 +1,8 @@
 # Pipes — pipe(2)/pipe2(2) over the pulled crate
 
 **Stability: B** (the crate is host-tested and shared with the amd64 kernel;
-the glue here is small and stable since stage 8 M3).
+the glue is small, but it grew the park/wake arms in M4 slice 3 — verify
+blocking behaviour against a current boot).
 
 Everything that *decides* lives in
 [`crates/akuma-pipes`](../../../crates/akuma-pipes): end refcounts, the 64 KiB
@@ -37,20 +38,24 @@ under a live end. The load-bearing sweep is the exiting **fork child**'s — a
 pipeline member's exit is what turns the last writer's close into the reader's
 EOF.
 
-## Semantics on a run-to-completion kernel
+## Semantics across the two child models
 
-- Wakes are `()` dropped on the floor: nothing blocks (the M2 fork finishes
-  the writer before the reader is forked; the scheduler that could block is
-  M4's). No poller is ever registered.
-- An empty pipe with live writers would block on Linux; here it reads as 0 —
-  the same answer a blocking read gives once the buffer drains and the last
-  writer closes. The two states are indistinguishable **by construction**.
+- **A slotted task parks.** Since M4 slice 3 the arms park exactly as
+  `wait4_real` does: the caller registers under its task slot
+  (`exec_twin::current_slot()` — the same tid space as the reap waiter), and
+  every `Wakes` an op returns is fired through the threading waker. A
+  pipeline of real fork children blocks and wakes like Linux.
+- **The boot task (`NO_SLOT`) keeps the M3 answers**: it drives the bridge
+  and may never park, so for it an empty pipe still reads 0 and a full one
+  still answers `EAGAIN` — the run-to-completion semantics the M2 spawn model
+  relies on, indistinguishable from the drained-buffer states **by
+  construction**.
 - `BrokenPipe` is `EPIPE` (32, named locally — the shared err table's only
   other EPIPE user is the SIGPIPE path, which is out of scope). A full buffer
   that accepted nothing is `EAGAIN`.
 - `write_no_sigpipe` is the kernel-memory twin for the `ExecRuntime::pipe_write`
-  hook (akuma-exec's stdin pump — unreachable until `fork_process`): a full
-  pipe answers `Ok(0)`, the short write that reports backpressure.
+  hook (akuma-exec's stdin pump): a full pipe answers `Ok(0)`, the short
+  write that reports backpressure.
 - `pipe` (x86_64 22, musl's raw `SYS_pipe`) is `pipe2(fds, 0)`; the dispatcher
   keys the arm on the literal because the ring3 table has no name for it.
 - poll/select readiness uses the crate's own predicates (`readable`/

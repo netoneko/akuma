@@ -98,12 +98,12 @@ close, dup_to, fork_copy, the flag sets; this kernel supplies the effects).
 | 52 | getpeername | `getpeername_arm` (sock.rs) | akuma-net | UDP connect peer / stream remote |
 | 54 | setsockopt | `setsockopt_arm` (sock.rs) | akuma-net timeouts | RCVTIMEO/SNDTIMEO real; REUSEADDR…/TCP_* accepted-ignored; else ENOPROTOOPT |
 | 55 | getsockopt | `getsockopt_arm` (sock.rs) | akuma-net | SO_ERROR is the dial's outcome (the nonblocking-connect idiom) |
-| 56 | clone | `fork_arm` (child.rs) | M2 blocking fork | SIGCHLD[|VM|VFORK] only; else EINVAL with flags printed |
-| 57 | fork | `fork_arm` (child.rs) | M2 blocking fork | bare (no flags word) |
-| 58 | vfork | `fork_arm` (child.rs) | M2 blocking fork | bare; contract holds by construction |
-| 59 | execve | `exec_replace` (child.rs) | exec-replace | nested child only; else ENOSYS |
+| 56 | clone | `fork_arm` → M2 arm (child.rs) | M2 blocking fork | SIGCHLD[|VM|VFORK] only; else EINVAL with flags printed |
+| 57 | fork | `fork_arm_real` (child.rs) | akuma-exec `fork_process` | real fork: child published runnable with own slot + band; depth ≤3; stamps `PARENT_OF` |
+| 58 | vfork | `fork_arm_real` (child.rs) | as fork | bare; contract holds by construction |
+| 59 | execve | `exec_real_task` / `exec_replace` (child.rs) | exec-replace | a real child replaces in place (fds survive); the M2 nested arm serves the shell's tail-exec; both crossings zero fs ([`processes.md`](processes.md) § fs) |
 | 60 | exit | dispatch (main.rs) | task_done / child_exit | code & 0xFF |
-| 61 | wait4 | `wait4_arm` (child.rs) | spawn ring | reaps; double-wait = ECHILD; rusage ignored |
+| 61 | wait4 | `wait4_arm` (child.rs) | spawn ring + `PARENT_OF` | parent-owned: reaps only own stamped children, ECHILD for a stranger's or none; parks on own running children; WNOHANG → 0; rusage ignored |
 | 63 | uname | dispatch (main.rs) | syscalls-linux uts::Field | "Linux taoxichuan 6.6.0-akuma … x86_64" |
 | 72 | fcntl | dispatch (main.rs) | akuma-fdtable | F_GETFD/F_SETFD/F_GETFL(=0)/F_SETFL(O_NONBLOCK)/F_DUPFD/F_DUPFD_CLOEXEC |
 | 73 | flock | dispatch (main.rs) | — | 0: one task, nothing contends |
@@ -146,7 +146,7 @@ close, dup_to, fork_copy, the flag sets; this kernel supplies the effects).
 
 Known deliberate gaps that answer ENOSYS or no-op rather than fail startup:
 `rt_sigaction`/`rt_sigprocmask` (no delivery), `munmap`/`mprotect` (slabs),
-`linkat` (no ext2 arm), `execve` outside a nested child, `ioctl` (ENOTTY).
+`linkat` (no ext2 arm), `execve` outside any task context, `ioctl` (ENOTTY).
 Everything else prints its name and ENOSYS.
 
 ## Background

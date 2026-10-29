@@ -68,8 +68,11 @@ fast path. The console-emit path additionally refuses non-UTF-8 chunks with a
 
 ## fork's memory: eager, flag-faithful copy, no CoW
 
-`fork_share_memory(parent_root)` (main.rs) builds the M2 fork child's address
-space: a fresh root (kernel half shared by the same PML4 copy), then a
+`fork_share_memory(parent_root)` (main.rs) builds a fork child's address
+space — the M2 arm calls it directly, and the real fork reaches the same walk
+through the twin's `ExecRuntime::fork_share_memory` hook
+([`processes.md`](processes.md)): a fresh root (kernel half shared by the
+same PML4 copy), then a
 subtree-by-subtree clone of the parent's **user half only**, each leaf a fresh
 zeroed frame with the parent's 4 KiB copied in and **the parent PTE's own flag
 bits preserved** (RX text stays RX; a RW mapping of text would be NX and the
