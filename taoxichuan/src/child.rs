@@ -500,6 +500,21 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), 
         ct.fd_names = fds;
         ct.fd_cloexec = cloexec;
         ct.fd_nonblock = nonblock;
+        // Session ph (boot ph-3): the clone above must take the COUNTED pipe
+        // references with it — the M2 arm's own rule ("a pipe end is a
+        // *counted* kernel resource: every payload the child's table
+        // inherited needs one kernel-side reference taken on top of the
+        // clone"). Without the walk, ash's first post-fork close of its own
+        // copies drove the entry's refcount to zero and DESTROYED the pipe
+        // while both children still held cloned fds: echo wrote into
+        // `NoSuchPipe` and died by the SIGPIPE stand-in; the pipeline
+        // delivered nothing (boot ph-3 trace: pp id=1, then no cln until the
+        // children's own dup2s, then wp id=1 out=NoSuchPipe).
+        for d in ct.fd_names.values() {
+            if let crate::OpenFile::Pipe(id, w) = d {
+                crate::pipes::clone_ref(*id, *w);
+            }
+        }
     }
     bind[tid] = (tid, pid, root_pa);
     // [tmp] trace (session pg): the bind-time cross stamp — is the out_slot
