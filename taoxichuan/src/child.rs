@@ -794,8 +794,12 @@ fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
     // Session pg: depth 2 (a REAL fork child forking again — grandfork's
     // rungs 2-5, the `( ls; ls )` class this slice exists to fix) forks for
     // real now that the child is its own thread with its own band and the
-    // bind hook stamps its depth; deeper generations stay refused.
-    if shell_depth != 1 && shell_depth != 2 {
+    // bind hook stamps its depth; deeper generations stay refused. Session
+    // ph flattens the ceiling to 3: grandfork's rungs 3-5 fork at depth 3
+    // (the grandchild generation), and under the REAL path a fork child owns
+    // a threading stack and a syscall band of its own, so the M2 "no stack
+    // region left" ceiling no longer binds.
+    if shell_depth != 1 && shell_depth != 2 && shell_depth != 3 {
         return crate::e(crate::err::EPERM);
     }
     let child_pid = unsafe {
