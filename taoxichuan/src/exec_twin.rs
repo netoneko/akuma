@@ -554,6 +554,24 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     };
     // SAFETY: ring3's contract — an enterable ring-3 state, kernel IF clear,
     // CR3 already the child's. `enter_user` is `!`: the child lives in ring 3.
+    // Session pi: install the CAPTURED fs before entry. This crossing used to
+    // leave IA32_FS_BASE holding the last-ran task's TLS pointer — the fork
+    // "inheritance" was whatever the one core's MSR happened to hold, which
+    // is also the shape every not-via-child_enter entry got (boot pi-2's PK2
+    // crash carried the shell's 0x713198 into a fresh CR3 with NO fs wrmsr
+    // exit in its whole window). A captured 0 (an exec'd image's record) is
+    // the clean start the amd64 kernel hands its images; a captured parent
+    // value is the real-fork inheritance (capture_user_context reads the
+    // live MSR in the parent's context). One MSR write per Process entry —
+    // entries are per fork/spawn, never per tick.
+    akuma_primitives::safe_print!(
+        160,
+        "[tmp] enter_user cur={} fs=0x{:x} rip=0x{:x}\n",
+        cur,
+        ctx.fs_base,
+        ctx.pc
+    );
+    let _ = akuma_cpu::msr::set_fs_base(ctx.fs_base);
     unsafe { akuma_ring3_amd64::enter_user(&ef) }
 }
 

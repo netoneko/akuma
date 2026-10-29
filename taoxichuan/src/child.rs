@@ -696,7 +696,15 @@ pub(crate) fn capture_user_context(fr: &ring3::SyscallFrame) {
         // The FS base rides the MSR across the fork (sysret does not touch
         // it): the child inherits the parent's TLS pointer in hardware, the
         // same answer a real fork gives. 0 here means "not tracked".
-        fs_base: 0,
+        // Session pi: 0 was written UNCONDITIONALLY — "not tracked" was every
+        // sample — so twin_enter_user had no parent value to install and the
+        // child inherited WHATEVER the one core's MSR held when it first
+        // entered (the last-ran task's TLS; boot pi-2's PK2: grandfork's own
+        // arch_prctl won the race on ph-9 and lost it on ph-7/pi-2 with the
+        // shell's 0x713198 still in the MSR). Capture the LIVE MSR: this runs
+        // in the forking parent's context, before any switch, so IA32_FS_BASE
+        // IS the parent's TLS pointer.
+        fs_base: akuma_cpu::msr::read(akuma_cpu::msr::Msr::FsBase),
         gs_base: 0,
         rax: fr.rax,
     };
