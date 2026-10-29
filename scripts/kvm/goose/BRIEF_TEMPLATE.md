@@ -59,6 +59,9 @@ Before you write any syscall arm, subsystem or helper of more than about 20 line
 In every RESULT file report, per arm or feature you added: *pulled* / *extracted* / *written new (why)*, and `wc -l taoxichuan/src/*.rs`
 at the start and the end. A session that closes a gate and makes `taoxichuan/src` smaller is better than one that closes it larger.
 
+## Docs (mandatory; the kernel's own documentation lives in `docs/taoxichuan/`)
+Read `docs/taoxichuan/README.md` first: it lists the reference docs, the status table and the doc rules. Before you end the turn, in the same commits as the code: update the `reference/` doc of every subsystem you touched (current behaviour and invariants only, with the crate that owns each decision), add a row to `reference/syscalls.md` for every syscall arm you added or changed, redraw (mermaid, one figure per file under `diagrams/`) any figure whose behaviour you changed, update the status table, and put what the kernel still cannot do in `gaps.md` with the probe that shows it. A fix that has no doc change says so in RESULT in one line.
+
 ## Gates
 - <ID>: <exact command> -> <exact expected output>. Source of the command/address: <doc or passing run>.
 - Zero `Fault|PANIC|sig!` in a passing boot; re-run the previous stage's gates once at the end.

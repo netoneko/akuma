@@ -437,6 +437,7 @@ anything reached only from `akuma_exec::init`). When the archive says *fixed*, a
 
 | Subsystem | Doc | Grade |
 |---|---|---|
+| Taoxichuan (the minimal composed kernel: boot, process model, scheduling, syscall table, gaps) | [`taoxichuan/README.md`](taoxichuan/README.md) | **C** |
 | Boot / MMU / DTB | [`reference/subsystems/boot.md`](reference/subsystems/boot.md) | B |
 | KVM (SVM hypervisor, Linux/Akuma guests, `/dev/kvm0`, `vm = true`) | [`reference/subsystems/kvm.md`](reference/subsystems/kvm.md) | **C** |
 | Memory (PMM, heap, COW) | [`reference/subsystems/memory.md`](reference/subsystems/memory.md) | **C** |
