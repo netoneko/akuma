@@ -116,7 +116,7 @@ close, dup_to, fork_copy, the flag sets; this kernel supplies the effects).
 | 110 | getppid | dispatch (main.rs) | — | 1: everything is the init task's child |
 | 137 | statfs | dispatch STATFS (main.rs) | akuma-ext2 `stats()` (real superblock) | prints a `[statfs]` evidence line per call |
 | 138 | fstatfs | `fill_statfs` (main.rs) | same | same |
-| 158 | arch_prctl | dispatch (main.rs) | akuma-cpu msr (canonical-checked) | ARCH_SET_FS/GET_FS only |
+| 158 | arch_prctl | dispatch (main.rs) | akuma-cpu msr (canonical-checked) | ARCH_SET_FS/GET_FS; SET_FS also stamps the slot's fs shadow ([`processes.md`](processes.md) § fs) |
 | 186 | gettid | dispatch (main.rs) | — | 1: one task |
 | 217 | getdents64 | dispatch (main.rs) | syscalls-linux dirent over the open-time cached listing | d_ino = 0; d_off is a monotonic cookie |
 | 218 | set_tid_address | dispatch (main.rs) | — | 1; nothing to clear |

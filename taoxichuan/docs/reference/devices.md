@@ -68,9 +68,8 @@ table — no `unsafe`) over
 [`crates/akuma-net-nic`](../../../crates/akuma-net-nic) (the virtio-net device
 and its DMA arenas — every `unsafe` in networking). `src/net.rs` supplies the
 twelve `NetRuntime` function pointers: the TSC clock, the RDRAND RNG, and the
-no-op collapses a one-core, no-interrupt, no-scheduler target makes of the
-park/wake hooks — each written out with its reason, the same collapses amd64
-makes.
+halting answers a one-core, no-NIC-interrupt target makes of the park/wake
+hooks — each written out with its reason, the same collapses amd64 makes.
 
 ```mermaid
 flowchart TD
@@ -80,18 +79,33 @@ flowchart TD
         C["poll/select laps (sock.rs)"] --> P
         D["connect_wait (sock.rs)<br/>dial tracing"] --> P
         E["NetRuntime yield/relax/park hooks"] --> P
+        F["idle_main lap (exec_twin)<br/>when nothing is runnable"] --> P
+        G["tick backstop (timer_trap)<br/>one drained lap per tick"] --> P
     end
-    P["netpoll() = smoltcp_net::poll()"] --> NIC["virtio-net rings (akuma-net-nic)"]
+    P["netpoll() = smoltcp_net::poll()<br/>guarded: NET_UP (stack exists) + IN_LAP (no nesting)"] --> NIC["virtio-net rings (akuma-net-nic)"]
 ```
 
 The guest has no IOAPIC and kvm0 never raises the NIC's interrupt line:
 **frames arrive only when somebody calls `netpoll`.** Every path a task can
 block on pumps it — the nanosleep arm is what keeps TCP alive while sshd
-idles. Nothing pumps while a spawned child runs to completion inside its SPAWN
-syscall; that is accepted (the child model), not hidden —
-[`processes.md`](processes.md). The one gap worth knowing: the Q5 wedge was a
-waiter reaching a backstop that did not pump — every yield/relax/park hook now
-pumps.
+idles. Two non-task pumps close the holes a taskless or spinning guest leaves:
+the **idle lap** (an all-parked system used to leave the NIC unposted and the
+relay deaf) and the **tick backstop** (a ring-3 spinner the switch gate must
+not preempt used to silence the stack for seconds — one drained lap per tick
+caps the window at ~10 ms; [`scheduling.md`](scheduling.md)).
+
+**The wait loops halt.** Every wait path (`sleep_until`, `park_until`,
+`blocking_relax`, `yield_now`, the DHCP wait, `connect_wait`, and the idle
+lap) ends its lap in `net::wait_lap` — `sti; hlt; cli`: IF open for exactly
+one `hlt`, the 100 Hz tick always wakes it. The relay thread shares this
+vCPU's one pinned host core, and only a halted vCPU hands that core back; a
+pause-spinning guest pegs the core and starves the relay it is waiting on
+(boot ph-6's P3 stall: frozen `gw_frames`/`rx_starved` behind `hlt=0` with
+the guest core at 100%). The one bare-`pause` survivor is deliberate: the
+PIT calibration gate poll, where an `hlt` would skew the TSC window being
+measured. Nothing pumps while a spawned child runs to completion inside its
+SPAWN syscall; that is accepted (the child model), not hidden —
+[`processes.md`](processes.md).
 
 DHCP is waited on at boot (10 s, pumping); a guest with no lease still boots —
 sshd binds and never answers, a legible failure rather than a hang. Outbound
