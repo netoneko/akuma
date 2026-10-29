@@ -404,6 +404,18 @@ fn timer_trap(t: &mut Trap<'_>) {
     {
         akuma_threading::x86_yield();
     }
+    // **The netpoll backstop** (session ph, boot ph-5's P2 stall): the guest's
+    // other pumps are all task-context (sshd's serve-loop sleep, the DHCP
+    // wait, the NetRuntime hooks) — and a ring-3 resident with NO_SLOT (the
+    // boot image's init: wd's slot/tid=u64::MAX lines, permanent in every
+    // gate window) can hold the core for seconds, because the gate above
+    // must not switch it. Boot ph-5's P battery saw exactly that shape:
+    // ~10 s with gw_frames_from_guest frozen (the stack stopped talking)
+    // until the client's handshake watchdog gave up — KVM_RELAY_SYN_STALL's
+    // symptom row. One drained lap per tick caps any such window at ~10 ms:
+    // the by-construction servicing the other kernels get from their
+    // interrupt face. netpoll guards itself (NET_UP/IN_LAP); see net.rs.
+    crate::net::netpoll();
 }
 
 /// The tick source (session pb): the extracted crate's timer face over the

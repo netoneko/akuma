@@ -342,8 +342,23 @@ fn runtime() -> NetRuntime {
 
 /// One lap of the stack: drain the NIC into smoltcp, run its timers. The
 /// everything-path for inbound frames on this guest.
+///
+/// Bring-up and reentrancy guard (session ph): the tick backstop calls this
+/// from interrupt context while the task-context pumps (sshd's serve loop,
+/// the DHCP wait, the NetRuntime hooks) may be inside it, and a tick can
+/// fire before the stack exists. One lap at a time; a no-op until
+/// `net_init` brought the stack up.
+static NET_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static IN_LAP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 pub fn netpoll() {
+    if !NET_UP.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if IN_LAP.swap(true, core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let _ = akuma_net::smoltcp_net::poll();
+    IN_LAP.store(false, core::sync::atomic::Ordering::Release);
 }
 
 /// Calibration, then the stack itself (probe virtio-net, bring up smoltcp,
@@ -359,6 +374,7 @@ pub fn net_init() -> bool {
         akuma_comconsole::puts("  net: stack init failed -- no virtio-net device\n");
         return false;
     }
+    NET_UP.store(true, core::sync::atomic::Ordering::Release);
     crate::raw_uart(b"[raw] stack up, dhcp loop\n");
     akuma_comconsole::puts("  net: smoltcp stack up, DHCP requested\n");
     let deadline = uptime_us() + 10_000_000; // 10 s
