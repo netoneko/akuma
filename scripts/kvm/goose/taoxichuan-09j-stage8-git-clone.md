@@ -6,17 +6,21 @@ You are goose-glm, the metal track of `docs/archive/MINIMAL_SELF_HOSTING_EXPERIM
 ## The goal
 The ladder's stage 8: **`git clone` over HTTPS works in the Taoxichuan guest; `git log` and `git fsck` agree with a host-side clone of the same repo.** The process model (real fork, `wait4`, pipes, timer preemption) is done as far as F1, PK1, P1-P5 go; stage 7 (`curl -sS https://example.com`) is done. git forks a transport helper (`git-remote-https`) and pumps it through pipes, the shape the process model was built for.
 Pick a small fixed public repo and a fixed ref (write it in the plan, with its expected `git log --oneline | wc -l` and HEAD id taken from a host-side clone). Gate: console `[SSH] Exit status: 0` for the clone, then `git log --oneline | wc -l` and `git rev-parse HEAD` equal the host's, and `git fsck` exits 0, all in the same boot; zero `Fault|PANIC|sig!` in the boot's own window.
-Two phases.
+Three phases (0 the stall, 1 plan, 2 execute).
+
+## Phase 0 - the stall (cap: about 25 tool calls, before the git work)
+Session pj left one open defect: in 2 of 7 boots the battery stalls after `[SSH] Exec:` because the spawn parks and nothing wakes it (a lost wake in the exec crossing; tick alive, relay owns the core). `RESULT-pj.md` "What is next" names the instrument sites. A git clone is many execs and pipes in one boot, so an unreliable boot will cost you more than this fix. Plan it, fix it from evidence, and state your stall rate over at least 3 consecutive full batteries (F1, PK1, PK2, P1-P5). If 25 calls pass without a cause, record what you learned in `taoxichuan/docs/gaps.md` and go on to Phase 1; do not let it eat the session.
 
 ## Phase 1 - plan (before any edit or boot)
 Write `PLAN-pk.md` and commit it. It must contain, from reading and not from guessing:
 1. **How git gets into the image.** Stage 6 did `apk add curl` (see the agent log's stage 6 and 9 sections); find how, and what `apk add git` adds (packages, dynamic libraries, helper binaries). Cost it in boots.
-2. **The known syscall gaps.** `docs/archive/GIT_MISSING_SYSCALLS.md` (704 lines; read it in windows) lists what git needed on the aarch64 kernel before clone worked, and `docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md` another. For each item say whether Taoxichuan already answers it (grep the arms and the crates), is missing it, or it does not apply. Rank the missing ones by how early git needs them.
+2. **The known syscall gaps.** `docs/archive/GIT_MISSING_SYSCALLS.md` (704 lines; read it in windows) lists what git needed on the aarch64 kernel before clone worked, and `docs/archive/GIT_CLONE_STALE_ITIMER_SIGALRM.md` another. For each item say whether Taoxichuan already answers it (start from `taoxichuan/docs/reference/syscalls.md`, then confirm in the arms and the crates), is missing it, or it does not apply. Rank the missing ones by how early git needs them.
 3. **The amd64 and aarch64 precedent.** How those kernels serve the same syscalls, and which crate decides each; pull a crate's decision rather than re-derive it (composition rule below).
 4. **Premises** (HOLDS / WRONG / UNCHECKED, about 6 calls): the tree builds and the F1/PK1/P1-P5 battery is still green; `/dev/null` is available to a guest process (earlier notes say the guest has no `/dev`); the guest can resolve and reach the clone host; the image has room for git (disk size); `git --version` runs.
 Then run: one boot per missing item, from the first failure, reading the console and `docs/README.md` symptom matrix and archive for the error text BEFORE source.
 
 ## Docs to read first (in order; `sed -n` windows of 60 lines or less)
+0. **The kernel's own docs, first**: `taoxichuan/docs/README.md` (status, layout, rules), then `taoxichuan/docs/reference/processes.md`, `pipes.md`, `syscalls.md` and `taoxichuan/docs/gaps.md`. They were written by another model from the source and may be wrong in places: when the code and a doc disagree, the code wins, and you fix the doc in the same commit (that is part of the Docs section below).
 1. `RESULT-pj.md`, `docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md` (M1, M2 and what is said about git's helper pump), `docs/archive/TAOXICHUAN_M4_SCHED_LITE_PLAN.md`.
 2. The two git docs above; `docs/README.md` symptom matrix.
 3. The agent log's sections on stage 7 (curl HTTPS) for the network path that already works.
