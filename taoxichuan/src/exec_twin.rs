@@ -180,6 +180,14 @@ extern "C" fn idle_main() -> ! {
     // clock is what timed parks and uptime read) and yield the moment
     // anything becomes READY. Without the yield, a woken task would wait
     // for... nothing: the waker only readies, it cannot switch.
+    // [tmp] pi instrument (HI1): count CONSECUTIVE idle laps (reset on any
+    // yield). The other kernels halt here (machine.rs:517 offer-wake,
+    // kernel-glue idle_halt); if this loop is the residual spinner, the
+    // counter climbing with hlt=0 + rx_starved names it. Print rate is
+    // exponentially backed off (1M, 2M, 4M... laps) so it cannot rotate the
+    // log; one END line names the window length on the way out.
+    let mut laps: u64 = 0;
+    let mut next: u64 = 1 << 20;
     loop {
         // M4 slice 3 (session ph): the NIC pump lives here too. The other
         // pump sites are cooperative (socket waiters, sshd's serve loop);
@@ -190,7 +198,23 @@ extern "C" fn idle_main() -> ! {
         crate::net::netpoll();
         crate::exec_twin::tick_window();
         if akuma_threading::x86_runnable_exists() {
+            if laps >= next {
+                akuma_primitives::safe_print!(
+                    192,
+                    "[tmp] idle END laps={} next={}\n",
+                    laps,
+                    next
+                );
+            }
+            laps = 0;
+            next = 1 << 20;
             akuma_threading::x86_yield();
+        } else {
+            laps += 1;
+            if laps == next {
+                akuma_primitives::safe_print!("[tmp] idle laps={}\n", laps);
+                next = next.saturating_mul(2);
+            }
         }
         core::hint::spin_loop();
     }
