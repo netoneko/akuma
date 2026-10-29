@@ -31,6 +31,20 @@ VERD="$OUT/gates-P.txt"
 emit() { echo "$*"; echo "$*" >>"$VERD"; }
 [ -f "$LOG" ] || { emit "ABORT no console log $LOG - boot_dev.sh first"; exit 1; }
 
+# This boot's mark (pi, premise 4): fault attribution must reflect THIS boot's
+# window only - the log keeps older boots' lines across ~250 KB rotations, and
+# the old whole-log grep held a previous boot's fault line through clean boots.
+bmark_old=$(wc -c < "$LOG.old" 2>/dev/null || echo 0)
+bmark=$(wc -c < "$LOG")
+echo "$bmark" > "$OUT/logmark-p.txt"
+bconslice() {
+  if [ "$(wc -c < "$LOG")" -lt "$bmark" ]; then
+    { tail -c +$((bmark_old+1)) "$LOG.old" 2>/dev/null; cat "$LOG"; }
+  else
+    tail -c +$((bmark+1)) "$LOG" 2>/dev/null
+  fi
+}
+
 # gate <name> <cmd>: one exec; G_rc 0 pass / 1 nonzero exit / 2 no exit line. Same slice logic as
 # run_gates.sh (survives a log rotation mid-exec); the client is never killed before the console
 # line appears (killing it early is how the NEXT exec wedges).
@@ -93,8 +107,8 @@ verdict P3 '2\n2\n'   "sh -c 'echo a | wc -c; echo b | wc -c'"
 verdict P4 'hi\n'     "sh -c 'echo hi | cat > /tmp/p; cat /tmp/p'"
 verdict P5 'done\n'   "sh -c 'echo x | true; echo done'"
 
-if grep -a -E 'Fault|PANIC|sig!' "$LOG" >"$OUT/gates-P.faults" 2>/dev/null && [ -s "$OUT/gates-P.faults" ]; then
-  emit "FAIL faults ($(wc -l < "$OUT/gates-P.faults") lines in the console; see gates-P.faults)"
+if bconslice | grep -a -E 'Fault|PANIC|sig!' >"$OUT/gates-P.faults" 2>/dev/null && [ -s "$OUT/gates-P.faults" ]; then
+  emit "FAIL faults ($(wc -l < "$OUT/gates-P.faults") lines since this boot's mark; see gates-P.faults)"
 else
-  emit "PASS no-faults"
+  emit "PASS no-faults (since logmark-p.txt)"
 fi
