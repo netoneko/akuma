@@ -69,6 +69,26 @@ fn pause() {
     core::hint::spin_loop();
 }
 
+/// One WAIT lap that hands the host core back: the vCPU halts (a VM exit)
+/// until the next interrupt. The relay thread shares this core with the
+/// vCPU — the one-pinned-core note in KVM_RELAY_SYN_STALL.md — so a guest
+/// that only pause()-spins pegs the core and the relay starves: boot
+/// ph-6's P3 stall showed ~10 s of frozen gw_frames/rx delivery behind
+/// `hlt=0` and the host's guest core at 100%. `sti; hlt; cli` opens IF
+/// for exactly one instruction, so the LAPIC tick (armed before any
+/// caller) always wakes the lap. Wait loops only: the calibrator's PIT
+/// gate poll keeps the bare pause (an hlt would skew the TSC window).
+#[inline]
+pub fn wait_lap() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: no memory access; IF is open for the one hlt instruction and
+    // restored right after; the only unmasked source is the tick, whose
+    // handler is reentrant with every caller of this fn.
+    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) }
+    #[cfg(not(target_arch = "x86_64"))]
+    core::hint::spin_loop();
+}
+
 /// Read the timestamp counter.
 #[cfg(target_arch = "x86_64")]
 fn rdtsc() -> u64 {
@@ -278,7 +298,7 @@ pub fn rng_fill(buf: &mut [u8]) {
 fn park_until(deadline_us: u64) {
     while uptime_us() < deadline_us {
         netpoll();
-        pause();
+        wait_lap();
     }
 }
 
@@ -292,7 +312,7 @@ fn park_until(deadline_us: u64) {
 fn blocking_relax() {
     for _ in 0..64 {
         netpoll();
-        pause();
+        wait_lap();
     }
 }
 
@@ -322,7 +342,7 @@ fn runtime() -> NetRuntime {
             // [Q5 fix-cand] never a bare pause: every yield lap must keep
             // the pump alive (see blocking_relax).
             netpoll();
-            pause();
+            wait_lap();
         },
         blocking_relax,
         park_until,
@@ -392,7 +412,7 @@ pub fn net_init() -> bool {
             );
             return true;
         }
-        pause();
+        wait_lap();
     }
     akuma_comconsole::puts("  net: DHCP not answered in 10 s -- continuing unaddressed\n");
     false
@@ -404,6 +424,6 @@ pub fn net_init() -> bool {
 pub fn sleep_until(deadline_us: u64) {
     while uptime_us() < deadline_us {
         netpoll();
-        pause();
+        wait_lap();
     }
 }
