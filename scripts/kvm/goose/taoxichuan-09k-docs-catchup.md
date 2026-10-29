@@ -1,11 +1,11 @@
-# Taoxichuan: write the kernel's own documentation (`docs/taoxichuan/`), with diagrams - no kernel changes this session
+# Taoxichuan: write the kernel's own documentation (`taoxichuan/docs/`), with diagrams - no kernel changes this session
 
 You are goose-glm, the metal track of `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md`, on the ryzen box. Your tree is the tip of `taoxichuan-s4` (`git log --oneline -3` first). **Keep your context small.** Checkout `/src/github.com/netoneko/akuma`.
 Every shell command starts with `export TERM=dumb HOME=/root GIT_PAGER=cat; . /etc/akuma-dev.env`. This session does not boot anything and does not edit `taoxichuan/src/` or any crate; it writes documentation only.
 
 ## The goal
 The kernel has grown to about 8,000 lines in `taoxichuan/src/` across seven stages and eight sessions, and its documentation is the archive: incident write-ups and session results. Nothing says what the kernel IS now. The user wants it the way Akuma itself is documented: its own folder, a front door, one reference per subsystem, diagrams, all kept current by you from now on so that you (and the next session) can read the docs instead of re-reading the source.
-`docs/taoxichuan/README.md` exists (the user's supervisor seeded it): read it first. It names the folder layout, the status table, the five figures and the doc rules. **Fill it in**:
+`taoxichuan/docs/README.md` exists (the user's supervisor seeded it): read it first. It names the folder layout, the status table, the five figures and the doc rules. **Fill it in**:
 1. `reference/boot.md`, `memory.md`, `processes.md`, `scheduling.md`, `pipes.md`, `syscalls.md`, `devices.md` - what is true of the code now, with the crate that owns each decision linked (`crates/<name>`).
 2. `diagrams/` - the five figures in the README, as mermaid, each under 40 lines, each checked against the source (a diagram that contradicts the code is worse than none). `docs/reference/subsystems/memory.md` shows the repo's mermaid style.
 3. `reference/syscalls.md` - one row per syscall arm the dispatcher serves (`grep -n "ring3::nr::" taoxichuan/src/main.rs` and the files in `taoxichuan/src/`): number, name, which crate decides it (or "local"), what it does today in one line, known divergences from Linux. Rows for what is answered `ENOSYS` or accepted-and-ignored (for example `mprotect`, `munmap`, `fchmod`) say so plainly.
