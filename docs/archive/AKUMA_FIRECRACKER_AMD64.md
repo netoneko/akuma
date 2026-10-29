@@ -2381,9 +2381,12 @@ second runtime-helper object for x86_64 — upstream's own `lib/Makefile` builds
 x86_64's `libtcc1.a` from `libtcc1.o` alone (`X86_64_O = libtcc1.o
 $(COMMON_O)`), where arm64 additionally needs `lib-arm64.o` for varargs/cache
 helpers x86_64's calling convention has no use for. Output tar renamed
-per-arch (`dist/libtcc1-x86_64.tar`, `dist/libtcc1.tar` unchanged) so an
+per-arch (`dist/libtcc1-amd64.tar`, `dist/libtcc1.tar` unchanged) so an
 x86_64 build run can never clobber the file `userspace/build.sh`'s aarch64
 pipeline reads by that exact literal name.
+(Renamed 2026-10-29: the archive was written as `libtcc1-x86_64.tar` when this was first
+landed; the repo's policy is amd64 unless a toolchain spelling forces x86_64, so
+`build.rs` and `amd64/mkdisk.sh` now use `libtcc1-amd64.tar`.)
 
 **`src/setjmp_x86_64.S`** (new; the old `setjmp.S` renamed
 `setjmp_aarch64.S`): System V callee-saved integer registers (`rbx rbp r12-15
@@ -2442,7 +2445,7 @@ through this module instead with no other change. It supplies:
 **`amd64/mkdisk.sh`** builds tcc the same way it already builds
 `paws`/`httpd`/`sshd` — `cargo build --manifest-path tcc/Cargo.toml --target
 x86_64-unknown-none --release` (`--manifest-path`, not `-p tcc`: that crate is
-not a workspace member) — and stages the binary plus `libtcc1-x86_64.tar`'s
+not a workspace member) — and stages the binary plus `libtcc1-amd64.tar`'s
 contents (`libtcc1.a` + tcc's ten internal headers) under `/usr/lib/tcc`.
 
 **No musl static libc is staged on amd64 at all** — unlike the AArch64 image,

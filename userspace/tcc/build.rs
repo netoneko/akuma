@@ -304,11 +304,13 @@ fn main() {
     // `dist/libtcc1.tar` (no arch suffix) is a name `userspace/build.sh` reads
     // literally — it is the AArch64 pipeline's only consumer, so that exact
     // path must keep meaning "the aarch64 archive" and never get overwritten
-    // by an x86_64 build run afterwards. x86_64's own copy gets its own name;
+    // by an amd64 build run afterwards. The amd64 copy gets its own name
+    // (`libtcc1-amd64.tar`: amd64, not x86_64, is the repo's name for the
+    // architecture unless a toolchain spelling forces the other);
     // `amd64/mkdisk.sh` reads it by that name.
     let dist_dir = manifest_dir.join("dist");
     fs::create_dir_all(&dist_dir).unwrap();
-    let dist_name = if is_x86_64 { "libtcc1-x86_64.tar" } else { "libtcc1.tar" };
+    let dist_name = if is_x86_64 { "libtcc1-amd64.tar" } else { "libtcc1.tar" };
     fs::copy(&libtcc1_archive_path, dist_dir.join(dist_name)).unwrap();
     println!("cargo:warning=libtcc1 archive created at {}", dist_dir.join(dist_name).display());
 }
