@@ -187,43 +187,28 @@ extern "C" fn idle_main() -> ! {
     // clock is what timed parks and uptime read) and yield the moment
     // anything becomes READY. Without the yield, a woken task would wait
     // for... nothing: the waker only readies, it cannot switch.
-    // [tmp] pi instrument (HI1): count CONSECUTIVE idle laps (reset on any
-    // yield). The other kernels halt here (machine.rs:517 offer-wake,
-    // kernel-glue idle_halt); if this loop is the residual spinner, the
-    // counter climbing with hlt=0 + rx_starved names it. Print rate is
-    // exponentially backed off (1M, 2M, 4M... laps) so it cannot rotate the
-    // log; one END line names the window length on the way out.
-    let mut laps: u64 = 0;
-    let mut next: u64 = 1 << 20;
+    // Session pj (pi's HI1, closed at the contract level): when NOTHING is
+    // runnable, HALT — `net::wait_lap` (sti;hlt;cli), the same lap every
+    // parked waiter has used since ph. This is the one idle-contract clause
+    // the other kernels all have and this kernel lacked (amd64
+    // machine.rs:517 "A halted processor wakes when something can be offered
+    // to it"; kernel-glue idle_halt: without it the idle thread pins the
+    // host vCPU at 100%). The relay thread shares this vCPU's ONE pinned
+    // host core, and only a halted vCPU ever hands that core back — a
+    // spinning idle lap's netpoll cannot receive what the starved relay
+    // cannot run to deliver. The 100 Hz tick wakes the halt; the yield
+    // check stays after the lap.
     loop {
-        // M4 slice 3 (session ph): the NIC pump lives here too. The other
-        // pump sites are cooperative (socket waiters, sshd's serve loop);
-        // an all-parked system — the P1 wedge, every task WAITING — used to
-        // leave the NIC unposted and the relay deaf (rx_starved climbing,
-        // gw_frames frozen) with nobody to blame. The idle lap is the
-        // everything-path's last resort, one poll per lap.
+        // The NIC pump: one poll per lap (per tick-wake now). The idle lap
+        // is the everything-path's last resort — an all-parked system used
+        // to leave the NIC unposted and the relay deaf.
         crate::net::netpoll();
         crate::exec_twin::tick_window();
         if akuma_threading::x86_runnable_exists() {
-            if laps >= next {
-                akuma_primitives::safe_print!(
-                    192,
-                    "[tmp] idle END laps={} next={}\n",
-                    laps,
-                    next
-                );
-            }
-            laps = 0;
-            next = 1 << 20;
             akuma_threading::x86_yield();
         } else {
-            laps += 1;
-            if laps == next {
-                akuma_primitives::safe_print!(192, "[tmp] idle laps={}\n", laps);
-                next = next.saturating_mul(2);
-            }
+            crate::net::wait_lap();
         }
-        core::hint::spin_loop();
     }
 }
 
@@ -571,13 +556,6 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     // value is the real-fork inheritance (capture_user_context reads the
     // live MSR in the parent's context). One MSR write per Process entry —
     // entries are per fork/spawn, never per tick.
-    akuma_primitives::safe_print!(
-        160,
-        "[tmp] enter_user cur={} fs=0x{:x} rip=0x{:x}\n",
-        cur,
-        ctx.fs_base,
-        ctx.pc
-    );
     let _ = akuma_cpu::msr::set_fs_base(ctx.fs_base);
     crate::child::set_slot_fs(cur, ctx.fs_base);
     unsafe { akuma_ring3_amd64::enter_user(&ef) }
