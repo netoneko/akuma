@@ -310,6 +310,20 @@ fn park_until(deadline_us: u64) {
 /// the only pump in the kernel alive, or the guest deadlocks with its
 /// NIC ring unposted and its TX frames unflushed (Q5 wedge).
 fn blocking_relax() {
+    // [tmp] pl-2 (remove before final): a socket waiter entering its poll
+    // laps names itself (capped) — the "halted but pumping" shape.
+    static BR_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    {
+        let n = BR_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 30 {
+            akuma_primitives::safe_print!(
+                96,
+                "[tmp] BRELAX n={} slot={}\n",
+                n,
+                crate::exec_twin::current_slot()
+            );
+        }
+    }
     for _ in 0..64 {
         netpoll();
         wait_lap();
@@ -422,6 +436,22 @@ pub fn net_init() -> bool {
 /// NIC every lap. This is the sshd serve loop's `sleep_ms(1)` — which makes
 /// it, not any daemon, the thing that keeps TCP alive between events.
 pub fn sleep_until(deadline_us: u64) {
+    // [tmp] pl-2 (remove before final): a FAR sleep names itself (capped) —
+    // the 1 ms serve-loop laps must not print; a far park that never returns
+    // is exactly the flatline shape.
+    static FAR_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let now0 = uptime_us();
+    if deadline_us > now0 + 100_000 {
+        let n = FAR_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 30 {
+            akuma_primitives::safe_print!(
+                96,
+                "[tmp] SLEEPFAR n={} us={}\n",
+                n,
+                deadline_us - now0
+            );
+        }
+    }
     while uptime_us() < deadline_us {
         netpoll();
         wait_lap();

@@ -579,6 +579,10 @@ pub(crate) fn is_real_task() -> bool {
 /// same model `task_done` uses for the boot's tasks).
 pub fn task_exit_real(code: u64) -> ! {
     let cur = crate::exec_twin::current_slot();
+    // [tmp] pl-2 (remove before final): every real-child exit names itself —
+    // an exit arriving here for a SPAWN slot (the crossing's slot) is H3's
+    // misroute, caught red-handed.
+    akuma_primitives::safe_print!(96, "[tmp] TASKX slot={} code={}\n", cur, code);
     let waiter = {
         // SAFETY: syscall-path discipline.
         let s = slots();
@@ -1004,6 +1008,8 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
         slots()[slot_idx].used = false;
         return crate::e(crate::err::ENOMEM);
     };
+    // [tmp] pl-2 (remove before final): the SPAWN ladder's loaded rung.
+    akuma_primitives::safe_print!(96, "[tmp] SPAWN loaded slot={}\n", slot_idx);
     // Premise 2's build-out: register the shell as an akuma-exec Process so
     // `fork_process` finds a caller. tid = this ring slot — the same number
     // `current_slot()` answers once the crossing below names the child.
@@ -1149,6 +1155,10 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
         );
         return crate::e(crate::err::ENOENT);
     };
+    // [tmp] pl-2 (remove before final): the exec load ladder, rung 1 — the
+    // image bytes are in hand; the next rungs are "loaded" below and
+    // child_exit's "[TICK post]".
+    akuma_primitives::safe_print!(96, "[tmp] EXE rd len={}\n", image.len());
     if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
         akuma_primitives::safe_print!(160, "[exec] '{}': not an ELF image\n", effective);
         return crate::e(crate::err::ENOEXEC);
@@ -1173,6 +1183,10 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
         akuma_primitives::safe_print!(160, "[exec] '{}': load failed\n", effective);
         return crate::e(crate::err::ENOMEM);
     };
+    // [tmp] pl-2 (remove before final): rung 2 — the new image is mapped; the
+    // crossing is next. If a boot dies after "rd" but before "loaded", the
+    // load path (ext2/virtio) is the site.
+    akuma_primitives::safe_print!(96, "[tmp] EXE loaded entry={:#x}\n", ti.entry);
     // Restore the saved fds and sweep the cloexec ones — `sweep_cloexec`
     // returns the closed payloads; a swept socket releases its kernel side
     // exactly as close does. `load_task` had reset all three collections.
@@ -1234,6 +1248,10 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     let _ = akuma_cpu::msr::set_fs_base(0);
     set_slot_fs(crate::exec_twin::current_slot(), 0);
     let status = unsafe { child_enter(ti.root_pa, &ef, core::ptr::addr_of_mut!(EXEC_SAVE)) };
+    // [tmp] pl-2 (remove before final): rung 4 — the crossing RESUMED (the
+    // exit arm restored this frame). A boot whose last ladder line is
+    // "[TICK post]" died between the child's exit and this restore.
+    akuma_primitives::safe_print!(96, "[tmp] EXE resumed code={}\n", status);
     // The exec'd child exited: `child_exit` recorded its status in the slot,
     // cleared the nesting, put task slot 0 back, and restored THIS frame's
     // registers and CR3 (the parent's). Hand control to `spawn_arm`'s
@@ -1750,6 +1768,8 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
         // park and restored before its syscall returns (the stub tail reads
         // the global, not a per-task copy).
         let stash = ring3::user_rsp_stash();
+        // [tmp] pl-2 (remove before final): the wait4 park names its slot.
+        akuma_primitives::safe_print!(96, "[tmp] W4PARK slot={}\n", my_tid);
         akuma_threading::schedule_blocking(u64::MAX);
         ring3::set_user_rsp_stash(stash);
         // Woken (or the deadline passthrough never fires at u64::MAX): the

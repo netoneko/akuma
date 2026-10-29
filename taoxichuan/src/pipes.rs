@@ -55,6 +55,12 @@ fn may_park() -> Option<usize> {
 /// that every syscall entry overwrites, so the parked task's own stash must
 /// survive the park and be restored before its syscall returns.
 fn park_once() {
+    // [tmp] pl-2 (remove before final): every blocking pipe op names its slot.
+    akuma_primitives::safe_print!(
+        96,
+        "[tmp] PIPEPARK slot={}\n",
+        crate::exec_twin::current_slot()
+    );
     let stash = ring3::user_rsp_stash();
     akuma_threading::schedule_blocking(u64::MAX);
     ring3::set_user_rsp_stash(stash);
