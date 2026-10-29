@@ -917,6 +917,18 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     // The sched_* maps key on this: the shell's threading tid is its spawn
     // slot, and which slot that is varies across a boot's login spawns.
     crate::exec_twin::set_shell_tid(slot_idx);
+    // Session ph (boot ph-2): RESERVE the number in the threading pool —
+    // the fork children's tids come from `spawn_user_thread_initializing`,
+    // and an unreserved number is handed to the next concurrent fork child,
+    // which then binds THE SHELL'S cross record/SpawnSlot/fd table (P1's
+    // second child: `bind tid=2 shell=2` — echo EPIPE, cat parked forever).
+    if !akuma_threading::reserve_slot(slot_idx) {
+        akuma_primitives::safe_print!(
+            160,
+            "  [spawn] ring slot {} already claimed in the thread pool\n",
+            slot_idx as u64
+        );
+    }
     // Timer preemption arms here (session pf): the first SPAWN crossing is
     // the first moment a ring-3 tick has a legitimate switch target.
     crate::PREEMPT_ARMED.store(true, core::sync::atomic::Ordering::Release);

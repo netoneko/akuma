@@ -3246,6 +3246,31 @@ pub fn x86_abandon(slot: usize) {
     }
 }
 
+/// Reserve a slot number for an identity that is not a pool thread.
+///
+/// The M2 spawn crossing (taoxichuan) runs its child on the crossing's own
+/// band and keys its ring records on the spawn-ring slot index — a number
+/// the fork path ALSO hands out as a threading tid. Without a reservation
+/// the pool's `claim_free_slot` sees the number FREE and gives it to the
+/// next fork child, which then stomps the live shell's cross record, SpawnSlot
+/// and fd table (boot ph-2: `bind tid=2 shell=2`, echo's EPIPE, cat parked
+/// forever on a destroyed pipe). `INITIALIZING` is never picked by a scheduler
+/// and never reusable; the reserve is permanent for this boot, which is the
+/// point — a crossing identity is not a thread that exits.
+pub fn reserve_slot(slot: usize) -> bool {
+    if slot >= MAX_THREADS {
+        return false;
+    }
+    THREAD_STATES[slot]
+        .compare_exchange(
+            thread_state::FREE,
+            thread_state::INITIALIZING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+}
+
 /// Mark the running thread terminated and switch away for good.
 ///
 /// Never returns: the picker only takes `READY`/`RUNNING`, so once the state is
