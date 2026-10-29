@@ -931,6 +931,7 @@ fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
 }
 
 pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
+    akuma_primitives::safe_print!(192, "[tmp] spawn enter\n");
     if nested_active() {
         return crate::e(crate::err::EPERM); // one level only; nothing nests a nest
     }
@@ -991,6 +992,7 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     // `/bin/sh` (what the exec path spawns) is a symlink on the serve
     // image; the chain walker resolves it the same way `open` does.
     let effective = crate::resolve_effective(path);
+    akuma_primitives::safe_print!(192, "[tmp] spawn resolved -> {}\n", effective);
     let Ok(image) = crate::root_fs().read_file(&effective) else {
         // Say what failed. A silent ENOENT here reads on the client exactly
         // like a missing binary, and cost three stages of diagnosis.
@@ -1719,11 +1721,15 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
             if !sl.used || sl.reaped || sl.running || (!any && sl.pid != want_pid) {
                 continue;
             }
-            // Not my child (a stamped row naming another parent — grandfork
-            // step 2's un-reaped orphan): the crate's ECHILD answer, reached
-            // by skipping the candidate here and in the live scan below.
-            let po = parent_of(sl.pid);
-            if po != 0 && po != my_pid {
+            // Not my child: the crate's is_child_of_group answer, reached by
+            // skipping the candidate here and in the live scan below. The
+            // parked arm's callers are REAL tasks — every child they could
+            // own went through fork_arm_real and is STAMPED (spawn rows are
+            // the sshd's, and the spawn model never waits: their rows are
+            // zombies nobody reaps — pj-4's instrument caught step 5's
+            // wait(0) reaping PK1's left-behind shell, po=0). A caller's own
+            // pid is never 0, so po==0 skips too.
+            if parent_of(sl.pid) != my_pid {
                 continue;
             }
             sl.waiter = u32::MAX;
@@ -1748,8 +1754,10 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
         let mut live = false;
         for sl in s.iter_mut() {
             if sl.used && !sl.reaped && sl.running && (any || sl.pid == want_pid) {
-                let po = parent_of(sl.pid);
-                if po == 0 || po == my_pid {
+                // Live = MY OWN child (stamped mine): a real task parks only
+                // for real children; a stranger's running child — spawn rows
+                // included — neither parks me nor takes my waiter stamp.
+                if parent_of(sl.pid) == my_pid {
                     live = true;
                     sl.waiter = my_tid as u32;
                 }
