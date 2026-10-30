@@ -1743,6 +1743,85 @@ fn writev_file_arm_inner(fd: u64, data: &[u8]) -> u64 {
     }
 }
 
+/// `sendfile(out, in, &off, count)` and `copy_file_range(in, &off_in, out,
+/// &off_out, len, flags)`: copy up to `count` bytes from a regular file to a
+/// regular file or a pipe, 4 KiB at a time through a kernel buffer. An offset
+/// pointer means "positional": that fd's own offset is left alone and the
+/// pointer is advanced instead (Linux's contract). busybox `cp` tries these
+/// before it falls back, and its fallback was not there ("cp: can't create
+/// ...: Function not implemented").
+fn copy_range_arm(in_fd: u64, in_off_va: u64, out_fd: u64, out_off_va: u64, count: u64) -> u64 {
+    const CAP: u64 = 8 * 1024 * 1024;
+    let Some(Some((ino, fd_off))) = fd_table().with(in_fd as u32, |d| match d {
+        OpenFile::File { inode, offset, .. } => Some((*inode, *offset)),
+        _ => None,
+    }) else {
+        return e(ring3::err::EBADF);
+    };
+    let Some(Some((kind, dst))) = fd_table().with(out_fd as u32, |d| match d {
+        OpenFile::File { inode, .. } => Some((1u8, *inode)),
+        OpenFile::Pipe(id, true) => Some((2u8, *id)),
+        _ => None,
+    }) else {
+        return e(ring3::err::EBADF);
+    };
+    let mut word = [0u8; 8];
+    let read_off = if in_off_va == 0 {
+        fd_off
+    } else if user_ok(in_off_va, 8) && copy_from_user(&mut word, in_off_va) {
+        u64::from_le_bytes(word)
+    } else {
+        return e(ring3::err::EFAULT);
+    };
+    let write_off = if out_off_va == 0 {
+        0
+    } else if user_ok(out_off_va, 8) && copy_from_user(&mut word, out_off_va) {
+        u64::from_le_bytes(word)
+    } else {
+        return e(ring3::err::EFAULT);
+    };
+    let want = count.min(CAP);
+    let mut total = 0u64;
+    let mut buf = [0u8; 4096];
+    while total < want {
+        let n = ((want - total) as usize).min(buf.len());
+        let got = match root_fs().read_at_by_inode(ino, (read_off + total) as usize, &mut buf[..n]) {
+            Ok(g) => g,
+            Err(_) => return if total > 0 { total } else { e(ring3::err::EIO) },
+        };
+        if got == 0 {
+            break;
+        }
+        let put = match kind {
+            1 if out_off_va != 0 => root_fs()
+                .write_at_by_inode(dst, (write_off + total) as usize, &buf[..got])
+                .map_or_else(|_| e(ring3::err::EIO), |w| w as u64),
+            1 => writev_file_arm(out_fd, &buf[..got]),
+            _ => pipes::write_arm_gathered(dst, &buf[..got]),
+        };
+        if (put as i64) < 0 {
+            return if total > 0 { total } else { put };
+        }
+        total += put;
+        if put < got as u64 {
+            break;
+        }
+    }
+    if in_off_va != 0 {
+        let _ = copy_to_user(in_off_va, &(read_off + total).to_le_bytes());
+    } else {
+        let _ = fd_table().update(in_fd as u32, |of| {
+            if let OpenFile::File { offset, .. } = of {
+                *offset += total;
+            }
+        });
+    }
+    if out_off_va != 0 {
+        let _ = copy_to_user(out_off_va, &(write_off + total).to_le_bytes());
+    }
+    total
+}
+
 /// Stage 6: dirfd-relative path resolution. Absolute paths pass through; a
 /// relative path resolves against an open directory fd's path (apk opens the
 /// db / cache directory and then passes its fd to `openat`/`renameat`); a
@@ -2983,6 +3062,9 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::MPROTECT => mprotect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::MUNMAP => munmap_arm(fr.arg1(), fr.arg2()),
         26 => msync_arm(fr.arg1(), fr.arg2()),
+        // x86_64 sendfile = 40, copy_file_range = 326 (neither is in the shared ABI table yet).
+        40 => copy_range_arm(fr.arg2(), fr.arg3(), fr.arg1(), 0, fr.arg4()),
+        326 => copy_range_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5()),
         ring3::nr::READ => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
             read_fd_arm(fd, buf, len)
