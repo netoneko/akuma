@@ -271,5 +271,16 @@ days - re-count with `git ls-tree -d --name-only $(git merge-base main HEAD) cra
   point - is not recorded yet. Memory for the same compile: Linux 447 MiB, Akuma 1,356 MiB,
   taoxichuan at least 2,460 MiB (eager file mmap).
 
-**Linux comparison:** pending — `scripts/linux_audit_surface.sh` (firecracker / minimal /
+**Linux comparison** (Linux 6.18, built 2026-10-30; method in `AUDIT_SURFACE_METHODOLOGY.md`)
+
+- Guest: taoxichuan **84,761** audit lines; Linux trimmed to the same job (tinyconfig +
+  kvm_guest + taoxichuan's features) **836,651** (9.9x); Linux as Firecracker ships it
+  **1,868,016** (22x).
+- Host: akuma-amd64 **151,235**; Linux `x86_64_defconfig` + KVM **2,362,283** (15.6x).
+- Stack (host + guest, shared lines counted once): Akuma **158,909**; Linux **2,391,510** with
+  the minimal guest (15x), **2,861,309** with Firecracker's (18x), before counting the VMM.
+- Linux's minimal guest has more lines in `include/linux` headers alone (136,437) than
+  taoxichuan's whole image.
+- Not a risk comparison: Linux's lines have decades of review by many people; these numbers are
+  how much reading each stack asks of someone who wants to vouch for it. — `scripts/linux_audit_surface.sh` (firecracker / minimal /
 host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.

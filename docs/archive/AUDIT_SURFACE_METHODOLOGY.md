@@ -173,8 +173,31 @@ Rust: `scripts/cloc_akuma.py --audit taoxichuan akuma-amd64 akuma-aarch64`, `--f
 nightly-2026-09-19. Linux: `scripts/linux_audit_surface.sh {minimal,firecracker,host} 6.18`, run
 natively on the ryzen's Pop!_OS (`NATIVE=1`, gcc 11, `-j8` under `nice 19`).
 
-**Linux: pending.** The three 6.18 builds were running when this was written; their rows, and the
-Linux host + guest union, go here.
+| kernel | audit lines | whole compiled files |
+|---|---:|---:|
+| **taoxichuan** (guest) | **84,761** | 127,706 |
+| Linux 6.18 `minimal` guest (tinyconfig + kvm_guest + taoxichuan's features) | **836,651** | 981,911 |
+| Linux 6.18 `firecracker` guest (Firecracker's CI config) | **1,868,016** | 1,978,869 |
+| **akuma-amd64** (the KVM host) | **151,235** | 229,957 |
+| Linux 6.18 `host` (x86_64_defconfig + KVM, TUN, vhost-net built in) | **2,362,283** | 2,520,657 |
+
+| stack (host + guest, line-level union) | audit lines |
+|---|---:|
+| **akuma-amd64 + taoxichuan** | **158,909** |
+| Linux host + `minimal` guest | **2,391,510** |
+| Linux host + `firecracker` guest | **2,861,309** (+ the Firecracker VMM, not counted) |
+
+- The guest: Linux trimmed to taoxichuan's job is **9.9x** taoxichuan; Linux as Firecracker
+  ships it is **22x**.
+- The stack: **15x** with the minimal Linux guest, **18x** with Firecracker's, before the VMM.
+- Linux's minimal guest spends 136,437 audit lines on `include/linux` headers alone and 103,501 on
+  `arch/x86` - each more than taoxichuan's whole image.
+- `#if CONFIG_` resolution removes 15% of the minimal guest's compiled lines and 5-6% of the
+  firecracker and host builds, against a third for the Rust kernels' `#[cfg]`: Linux's
+  per-config pruning happens mostly at the file level (Kbuild), Rust's mostly inside files.
+- The Linux host + firecracker union shares 1,368,990 lines; Akuma's shares 77,090.
+- Build-time host code: Linux 22-25k lines (Kbuild's host programs) against 31.7-50.8k for the
+  Rust kernels (proc-macros, `syn` above all).
 
 ### Stacks (Rust, line-level union)
 
