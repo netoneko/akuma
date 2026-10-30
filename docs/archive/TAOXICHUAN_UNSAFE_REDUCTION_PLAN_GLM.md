@@ -290,3 +290,30 @@ in-situ reads: main.rs (137-150, 205-245, 328-440, 628-652, 1105-1125, 1183-1190
 5. **Q5:** for `spin_idle::Once` → `akuma_primitives::OnceCopy`: acceptable if `OnceCopy` gains a
    `get_or_init`-style accessor (one new safe method in a forbid-carrying crate), or keep the
    local Once with its 1 `unsafe impl Sync`?
+
+## Status 2026-10-30 (Claude, after the plan): 131 -> 73 sites in `taoxichuan/src`
+
+Gate first: `scripts/check_unsafe_budget.py` now scans `taoxichuan/src` (budget seeded at 131, ratcheted to 73).
+
+Two deviations from the plan, both because the survey found the piece already existed:
+
+- **No `akuma-per-slot` crate.** `akuma_primitives::cell::BorrowCell` is that cell (one writer or many readers by CAS,
+  a violation is a panic naming the bug). Class A tables moved onto it: `PROGRAMS` (with its count, current index and
+  exit codes), `PIPES`, `EVENTFDS`, `ROOT_FS`, `INFLIGHT`, `TASK_OF`, `CHILD_BIND`, `PARENT_OF`, `OWNED_ROOT`,
+  `PENDING_ROOT`, `SLOT_FS`. The `trace-err` rings (syscall, futex, mmap events) share a new safe `ring::Ring<T, N>`.
+  The plain scalars (`CURRENT`, `SHELL_THREAD_TID`, `NEXT_SLOT`, `TASK_SLOT`) are `AtomicUsize`, not `BorrowCell`: two
+  atomic RMWs per `get` is the wrong price on the syscall path.
+- **`phys::Frame`, not `TableFrame`/`Frame`/`Pte`.** One type in `akuma-boot-amd64::phys`: bounds-checked volatile/raw-copy
+  accessors (`entry`/`set_entry`/`read_bytes`/`write_bytes`/`copy_page_from`) that never form a reference into the frame, so
+  they are safe, and one `unsafe fn from_pa` carrying the contract (RAM that no Rust object lives in). `Frame::alloc_zeroed`
+  is safe (a fresh PMM frame is nobody's). It took the page-table clone/free walks, `leaf_entry`/`cow_*`, the loader's
+  segment/stack copies, `copy_from_user`/`copy_to_user` and the mmap file fill. `akuma-boot-amd64` went 4 -> 10 sites.
+- Also: `pause`/`sti;hlt;cli`/`rdtsc` in `net.rs` moved to `core::hint::spin_loop`, `akuma_cpu::park::wfi`, `akuma_cpu::tsc`;
+  the `sockaddr_in` marshalling is plain byte arithmetic.
+
+Verified after every step: the TCG battery and `cow_leak_gate.py --cycles 20` (delta 0, cowrefs 0), clippy +-`trace-err` clean.
+
+Not done (and why): `TASKS`/`SLOTS`/`SLOT_STATE` hand out `&'static mut` that code holds across calls and the naked crossing
+asm re-enters, so they need a borrow-by-closure rewrite of ~100 call sites, not a type swap; the PIT calibration's
+channel-2/port-B `in`/`out` need `akuma-port` to grow that device; `GDT`/`TSS`/`TRAP_STACKS`, the naked stubs and `mov cr3`
+are the irreducible D2 class. Remaining counts by file: child.rs 36, main.rs ~25, exec_twin.rs 11, net.rs 5, sock.rs 0.

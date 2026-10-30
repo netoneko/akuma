@@ -70,11 +70,13 @@ fn fire(wakes: akuma_pipes::Wakes<()>) {
 
 /// Every live pipe (the `EVENTFDS` pattern: one task runs at a time; the
 /// syscall path is the only accessor).
-static mut PIPES: PipeTable<()> = PipeTable::new();
+static PIPES: akuma_primitives::cell::BorrowCell<PipeTable<()>> =
+    akuma_primitives::cell::BorrowCell::new(PipeTable::new());
 
-// SAFETY: syscall-path discipline (single core, IF clear), as `EVENTFDS`.
-fn table() -> &'static mut PipeTable<()> {
-    unsafe { &mut *core::ptr::addr_of_mut!(PIPES) }
+/// Run `f` on the pipe table. One call per operation: nothing holds the table
+/// across a park, a user copy or a wake.
+fn table<R>(f: impl FnOnce(&mut PipeTable<()>) -> R) -> R {
+    PIPES.with_mut(f)
 }
 
 /// `pipe(fds)` — x86_64 22: musl's `pipe()` is the raw `SYS_pipe`, one
@@ -100,16 +102,16 @@ pub fn pipe2_arm(fds_va: u64, flags: u64) -> u64 {
     if !crate::user_ok(fds_va, 8) {
         return crate::e(ring3::err::EFAULT);
     }
-    let id = table().create();
+    let id = table(akuma_pipes::PipeTable::create);
     let mut fds = crate::fd_table();
     let Some(rslot) = fds.free_below(3, crate::SLOT_CEILING) else {
-        table().close_read(id);
+        table(|t| t.close_read(id));
         return crate::e(ring3::err::EMFILE);
     };
     let rfd = fds.alloc_fd_from(rslot, OpenFile::Pipe(id, false));
     let Some(wslot) = fds.free_below(3, crate::SLOT_CEILING) else {
         let _ = fds.close(rfd);
-        table().close_read(id);
+        table(|t| t.close_read(id));
         return crate::e(ring3::err::EMFILE);
     };
     let wfd = fds.alloc_fd_from(wslot, OpenFile::Pipe(id, true));
@@ -147,19 +149,19 @@ pub fn socketpair_arm(domain: u64, ty: u64, sv_va: u64) -> u64 {
     if !crate::user_ok(sv_va, 8) {
         return crate::e(ring3::err::EFAULT);
     }
-    let a = table().create(); // end X writes, end Y reads
-    let b = table().create(); // end Y writes, end X reads
+    let a = table(akuma_pipes::PipeTable::create); // end X writes, end Y reads
+    let b = table(akuma_pipes::PipeTable::create); // end Y writes, end X reads
     let mut fds = crate::fd_table();
     let Some(xslot) = fds.free_below(3, crate::SLOT_CEILING) else {
-        table().close_read(a);
-        table().close_read(b);
+        table(|t| t.close_read(a));
+        table(|t| t.close_read(b));
         return crate::e(ring3::err::EMFILE);
     };
     let x = fds.alloc_fd_from(xslot, OpenFile::Pair(b, a));
     let Some(yslot) = fds.free_below(3, crate::SLOT_CEILING) else {
         let _ = fds.close(x);
-        table().close_read(a);
-        table().close_read(b);
+        table(|t| t.close_read(a));
+        table(|t| t.close_read(b));
         return crate::e(ring3::err::EMFILE);
     };
     let y = fds.alloc_fd_from(yslot, OpenFile::Pair(a, b));
@@ -189,7 +191,7 @@ pub fn read_arm(id: u32, buf_va: u64, len: u64) -> u64 {
     let mut total: u64 = 0;
     while total < len {
         let want = ((len - total) as usize).min(chunk.len());
-        let (res, wakes) = table().read(id, &mut chunk[..want]);
+        let (res, wakes) = table(|t| t.read(id, &mut chunk[..want]));
         fire(wakes);
         if res.bytes == 0 {
             // Empty. EOF (no writers, or the pipe is gone) and "data just
@@ -200,7 +202,7 @@ pub fn read_arm(id: u32, buf_va: u64, len: u64) -> u64 {
             let Some(tid) = may_park() else {
                 break;
             };
-            if table().check_set_reader(id, tid, ()) {
+            if table(|t| t.check_set_reader(id, tid, ())) {
                 break;
             }
             park_once();
@@ -247,7 +249,7 @@ pub fn write_arm(id: u32, buf_va: u64, len: u64) -> u64 {
 pub fn write_arm_gathered(id: u32, data: &[u8]) -> u64 {
     let mut done: usize = 0;
     loop {
-        let (out, wakes) = table().write(id, &data[done..]);
+        let (out, wakes) = table(|t| t.write(id, &data[done..]));
         fire(wakes);
         match out {
             WriteOutcome::Wrote(n) => {
@@ -264,7 +266,7 @@ pub fn write_arm_gathered(id: u32, data: &[u8]) -> u64 {
                     let Some(tid) = may_park() else {
                         return crate::e(ring3::err::EAGAIN);
                     };
-                    if table().check_set_writer(id, tid, ()) {
+                    if table(|t| t.check_set_writer(id, tid, ())) {
                         return crate::e(EPIPE);
                     }
                     park_once();
@@ -286,7 +288,7 @@ pub fn write_arm_gathered(id: u32, data: &[u8]) -> u64 {
 /// only reader today, and nothing reaches it until `fork_process`). The
 /// kernel-slice twin of `write_arm`, which copies from the user first.
 pub fn write_no_sigpipe(id: u32, data: &[u8]) -> Result<usize, i32> {
-    let (out, _wakes) = table().write(id, data);
+    let (out, _wakes) = table(|t| t.write(id, data));
     match out {
         // A full pipe answers Ok(0) — the short write that tells the pump
         // the reader is applying backpressure (the hook's own contract).
@@ -298,19 +300,19 @@ pub fn write_no_sigpipe(id: u32, data: &[u8]) -> Result<usize, i32> {
 /// One more descriptor names this end — `dup`/`dup2`/`fcntl(F_DUPFD)`, and
 /// `fork_arm`'s walk over `fork_copy`'s payloads.
 pub fn clone_ref(id: u32, is_write: bool) {
-    table().clone_ref(id, is_write);
+    table(|t| t.clone_ref(id, is_write));
 }
 
 /// `poll(2)`'s readiness answers for a pipe end (`sock.rs`'s select arm) —
 /// the crate's own predicates, no second opinion.
 #[must_use]
 pub fn readable(id: u32) -> bool {
-    table().readable(id)
+    table(|t| t.readable(id))
 }
 
 #[must_use]
 pub fn writable(id: u32) -> bool {
-    table().writable(id)
+    table(|t| t.writable(id))
 }
 
 /// Drop the reference one descriptor held — `close`, a displaced `dup2`
@@ -321,9 +323,9 @@ pub fn writable(id: u32) -> bool {
 /// victim of exactly the dropped wake.
 pub fn release(id: u32, is_write: bool) {
     let wakes = if is_write {
-        table().close_write(id).1
+        table(|t| t.close_write(id)).1
     } else {
-        table().close_read(id).1
+        table(|t| t.close_read(id)).1
     };
     fire(wakes);
 }

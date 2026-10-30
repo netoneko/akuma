@@ -95,6 +95,8 @@ mod exec_twin;
 mod futex;
 mod net;
 mod pipes;
+#[cfg(feature = "trace-err")]
+mod ring;
 mod sock;
 
 use akuma_boot_amd64::{mem, paging, phys};
@@ -328,20 +330,35 @@ pub(crate) fn cow_stats() -> (usize, usize, usize, usize) {
 
 /// The 4 KiB leaf entry for `va` in `root`'s user half, if every level is
 /// present and none is a huge page.
-fn leaf_entry(root: u64, va: u64) -> Option<*mut u64> {
-    let mut table = root & PTE_ADDR;
+fn leaf_entry(root: u64, va: u64) -> Option<Pte> {
+    // SAFETY: `root` is a user root (a task's `root_pa` or the live CR3): a
+    // page-table frame.
+    let mut table = unsafe { phys::Frame::from_pa(root & PTE_ADDR) };
     for shift in [39u32, 30, 21] {
-        let idx = ((va >> shift) & 0x1FF) as usize;
-        // SAFETY: `table` is a page-table frame this walk reached from a
-        // present entry of a user root; the physmap maps all RAM.
-        let e = unsafe { (*phys::phys_ptr::<[u64; 512]>(table))[idx] };
+        let e = table.entry(((va >> shift) & 0x1FF) as usize);
         if e & 1 == 0 || (shift != 39 && e & 0x80 != 0) {
             return None;
         }
-        table = e & PTE_ADDR;
+        // SAFETY: a present, non-huge entry names the next-level table frame.
+        table = unsafe { phys::Frame::from_pa(e & PTE_ADDR) };
     }
-    // SAFETY: as above; the pointer stays inside the leaf table frame.
-    Some(unsafe { phys::phys_ptr::<[u64; 512]>(table).cast::<u64>().add(((va >> 12) & 0x1FF) as usize) })
+    Some(Pte { table, idx: ((va >> 12) & 0x1FF) as usize })
+}
+
+/// One leaf entry: the table frame and the slot in it.
+struct Pte {
+    table: phys::Frame,
+    idx: usize,
+}
+
+impl Pte {
+    fn read(&self) -> u64 {
+        self.table.entry(self.idx)
+    }
+
+    fn write(&self, v: u64) {
+        self.table.set_entry(self.idx, v);
+    }
 }
 
 /// THE copy-on-write break: re-read the live PTE for `va` in `root`, ask
@@ -356,8 +373,7 @@ fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
     let Some(slot) = leaf_entry(root, va) else {
         return CowAction::Fault;
     };
-    // SAFETY: `slot` points into a live leaf table (see `leaf_entry`).
-    let pte = unsafe { slot.read() };
+    let pte = slot.read();
     if pte & 1 == 0 {
         return CowAction::Fault;
     }
@@ -375,21 +391,18 @@ fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
         }
         CowAction::Fault => {}
         CowAction::TakeInPlace => {
-            // SAFETY: as above.
-            unsafe { slot.write((pte | PTE_W) & !PTE_COW) };
+            slot.write((pte | PTE_W) & !PTE_COW);
             akuma_cpu::tlb::invlpg(va as usize);
             COW_TAKE.fetch_add(1, Relaxed);
         }
         CowAction::Copy => {
-            let Some(new) = akuma_pmm::alloc_page_zeroed() else {
+            let Some(new) = phys::Frame::alloc_zeroed() else {
                 // Out of frames: the caller's kill path reports it.
                 return CowAction::Fault;
             };
-            // SAFETY: both frames are PMM pages inside the physmap; `slot` as above.
-            unsafe {
-                core::ptr::copy_nonoverlapping(phys::phys_ptr::<u8>(old), phys::phys_ptr::<u8>(new as u64), 4096);
-                slot.write(((pte & !PTE_ADDR) | PTE_W | new as u64) & !PTE_COW);
-            }
+            // SAFETY: `old` is the frame this present leaf maps.
+            new.copy_page_from(unsafe { phys::Frame::from_pa(old) });
+            slot.write(((pte & !PTE_ADDR) | PTE_W | new.pa()) & !PTE_COW);
             akuma_cpu::tlb::invlpg(va as usize);
             // Drops this space's count on the old frame (frees it only if it
             // was somehow the last holder).
@@ -406,8 +419,7 @@ fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
 /// target stack/heap/scratch).
 fn cow_prepare_write(root: u64, va: u64) {
     if let Some(slot) = leaf_entry(root, va & !0xFFF) {
-        // SAFETY: see `leaf_entry`.
-        let pte = unsafe { slot.read() };
+        let pte = slot.read();
         if pte & 1 != 0 && pte & PTE_W == 0 && pte & PTE_COW != 0 {
             let _ = cow_resolve(root, va);
         }
@@ -421,14 +433,12 @@ fn cow_privatize(root: u64, va: u64) -> bool {
     let Some(slot) = leaf_entry(root, va) else {
         return true;
     };
-    // SAFETY: see `leaf_entry`.
-    let pte = unsafe { slot.read() };
+    let pte = slot.read();
     if pte & 1 == 0 || akuma_pmm::cow_ref_get((pte & PTE_ADDR) as usize) < 2 {
         return true;
     }
     // Force the Copy arm for a share the PTE does not mark.
-    // SAFETY: as above.
-    unsafe { slot.write((pte & !PTE_W) | PTE_COW) };
+    slot.write((pte & !PTE_W) | PTE_COW);
     !matches!(cow_resolve(root, va), akuma_cow::CowAction::Fault)
 }
 
@@ -793,13 +803,13 @@ fn no_clock() -> u64 {
 /// same discipline `task()` documents. `Ext2Filesystem` is `Send + Sync`
 /// (`akuma-vfs`'s `Filesystem` supertraits); the interior lock is a spinlock
 /// that never blocks on anything this kernel runs.
-static mut ROOT_FS: Option<akuma_ext2::Ext2Filesystem<Vda>> = None;
+static ROOT_FS: akuma_primitives::cell::BorrowCell<Option<&'static akuma_ext2::Ext2Filesystem<Vda>>> =
+    akuma_primitives::cell::BorrowCell::new(None);
 
 /// The mounted root, for the dispatcher. Panics if called before the mount —
 /// which no caller does: the mount precedes the first ring-3 crossing.
 fn root_fs() -> &'static akuma_ext2::Ext2Filesystem<Vda> {
-    // SAFETY: see above; the Option is always Some past `kmain`'s mount.
-    unsafe { (&*core::ptr::addr_of!(ROOT_FS)).as_ref().unwrap() }
+    ROOT_FS.get().expect("root_fs before the mount")
 }
 // ---------------------------------------------------------------------------
 // The banner — printed at the init-spawn point, where the full kernel prints
@@ -825,6 +835,8 @@ fn banner() {
 /// places. 16 pages — far more than musl's startup touches, and cheap.
 const USER_STACK_TOP: u64 = 0x0000_7000_0000_0000;
 const USER_STACK_PAGES: u64 = 16;
+/// Pages at the stack top that hold the argv/envp/auxv block `load_task` builds.
+pub(crate) const ARG_BLOCK_PAGES: usize = 12;
 /// `brk` and anonymous `mmap` each get a fixed slab, registered as user
 /// regions up front so every user-pointer check is one range scan. Stage 6:
 /// Sized by what the heaviest guest needs, not by what hello needs: rustc's
@@ -1002,7 +1014,7 @@ static mut TASKS: [Task; crate::child::NSLOTS + 1] = [const { Task::new() }; cra
 /// Which slot `task()` hands out: 0 is the boot's init task (sshd for this
 /// stage's gate), 1 is the child running inside a SPAWN (`child.rs`), and 2
 /// is a fork child running inside that child (child.rs's M2 scaffold).
-static mut TASK_SLOT: usize = 0;
+static TASK_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 impl Task {
     const fn new() -> Self {
@@ -1098,18 +1110,11 @@ fn my_tid() -> u64 {
 /// `--features trace-err`: the last 128 mmap-slab events (kind, start, end), so
 /// a fault can name the unmap/replace that took its page away.
 #[cfg(feature = "trace-err")]
-static mut MM_EVENTS: [(u8, u64, u64); 128] = [(0, 0, 0); 128];
-#[cfg(feature = "trace-err")]
-static mut MM_HEAD: usize = 0;
+static MM_EVENTS: ring::Ring<(u8, u64, u64), 128> = ring::Ring::new((0, 0, 0));
 
 #[cfg(feature = "trace-err")]
 fn mm_event(kind: u8, start: u64, end: u64) {
-    // SAFETY: syscall-path discipline (single core, IF clear).
-    unsafe {
-        let head = &mut *core::ptr::addr_of_mut!(MM_HEAD);
-        (*core::ptr::addr_of_mut!(MM_EVENTS))[*head % 128] = (kind, start, end);
-        *head += 1;
-    }
+    MM_EVENTS.push((kind, start, end));
 }
 #[cfg(not(feature = "trace-err"))]
 fn mm_event(_kind: u8, _start: u64, _end: u64) {}
@@ -1118,17 +1123,14 @@ fn mm_event(_kind: u8, _start: u64, _end: u64) {}
 /// MAP_FIXED release, 3 mremap shrink, 4 mremap move-free, 5 mmap, 6 mremap-grow).
 #[cfg(feature = "trace-err")]
 fn mm_dump_for(va: u64) {
-    // SAFETY: syscall/fault path, single core.
-    unsafe {
-        let head = *core::ptr::addr_of!(MM_HEAD);
-        let ev = &*core::ptr::addr_of!(MM_EVENTS);
+    MM_EVENTS.view(|head, ev| {
         for i in 0..128 {
             let (k, s, e) = ev[(head + i) % 128];
             if k != 0 && s <= va && va < e {
                 akuma_primitives::safe_print!(96, "[mm] kind={} 0x{:x}..0x{:x} covers fault\n", k, s, e);
             }
         }
-    }
+    });
 }
 
 /// Unmap every present page of `[start, end)` in `root` and give its frame
@@ -1180,11 +1182,8 @@ fn shared_writeback(t: &mut Task, lo: u64, hi: u64, forget: bool) {
                     if file_off < fsize {
                         let n = (fsize - file_off).min(4096) as usize;
                         let mut page = [0u8; 4096];
-                        // SAFETY: `pa` is a mapped user frame inside the physmap
-                        // and `n <= 4096` stays within it.
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(phys::phys_ptr::<u8>(pa), page.as_mut_ptr(), n);
-                        }
+                        // SAFETY: `translate_in` named a mapped user frame.
+                        unsafe { phys::Frame::from_pa(pa) }.read_bytes(0, &mut page[..n]);
                         let _ = root_fs().write_at_by_inode(ino, file_off as usize, &page[..n]);
                     }
                 }
@@ -1284,10 +1283,10 @@ fn sigprocmask_arm(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> u64 {
     if oldset != 0 && (!user_ok(oldset, 8) || !copy_to_user(oldset, &cur.to_le_bytes())) {
         return e(ring3::err::EFAULT);
     }
-    if set != 0 {
-        if let Ok(m) = akuma_syscalls_signal::procmask(how, cur, Some(u64::from_le_bytes(new)), sigsetsize) {
-            task().sigmask = m;
-        }
+    if set != 0
+        && let Ok(m) = akuma_syscalls_signal::procmask(how, cur, Some(u64::from_le_bytes(new)), sigsetsize)
+    {
+        task().sigmask = m;
     }
     0
 }
@@ -1372,15 +1371,11 @@ fn membarrier_arm(cmd: u64) -> u64 {
 /// the incoming real task).
 /// Which task record the syscall path acts on now.
 pub(crate) fn task_slot_index() -> usize {
-    // SAFETY: as `task`.
-    unsafe { core::ptr::read_volatile(&raw const TASK_SLOT) }
+    TASK_SLOT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn set_task_slot(i: usize) {
-    // SAFETY: single core, `IF` clear — the same discipline as `task()`.
-    unsafe {
-        *core::ptr::addr_of_mut!(TASK_SLOT) = i;
-    }
+    TASK_SLOT.store(i, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Every slot, for the spawn path and slice 3's real tasks: 0 is the boot's
@@ -1402,7 +1397,7 @@ fn task() -> &'static mut Task {
     // interrupts-off discipline of this kernel, and the pointer is never
     // published anywhere else.
     unsafe {
-        let slot = core::ptr::read_volatile(&raw const TASK_SLOT);
+        let slot = TASK_SLOT.load(core::sync::atomic::Ordering::Relaxed);
         &mut (*core::ptr::addr_of_mut!(TASKS))[slot]
     }
 }
@@ -1450,12 +1445,8 @@ fn copy_from_user(dst: &mut [u8], src_va: u64) -> bool {
         let Some(pa) = paging::translate_in(root, (va & !0xFFF) as usize) else {
             return false;
         };
-        // SAFETY: `pa + off` is a PMM frame inside the physmap (alloc_page's
-        // contract), and `n` stays within the frame by construction.
-        let src = phys::phys_ptr::<u8>(pa + (va & 0xFFF));
-        unsafe {
-            core::ptr::copy_nonoverlapping(src, dst[done..].as_mut_ptr(), n);
-        }
+        // SAFETY: `translate_in` named a mapped task frame.
+        unsafe { phys::Frame::from_pa(pa) }.read_bytes((va & 0xFFF) as usize, &mut dst[done..done + n]);
         done += n;
     }
     true
@@ -1476,14 +1467,10 @@ fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
         let Some(pa) = paging::translate_in(root, (va & !0xFFF) as usize) else {
             return false;
         };
-        // SAFETY: `pa + off` is a PMM frame inside the physmap (alloc_page's
-        // contract), `n` stays within the frame by construction, and the page
-        // is a task page this kernel mapped RW (or RO, for image bytes —
-        // every caller writes only into stack/heap/scratch regions).
-        let dst = phys::phys_ptr::<u8>(pa + (va & 0xFFF));
-        unsafe {
-            core::ptr::copy_nonoverlapping(src[done..].as_ptr(), dst, n);
-        }
+        // SAFETY: `translate_in` named a mapped task frame, one this kernel mapped
+        // RW (or RO, for image bytes — every caller writes only into
+        // stack/heap/scratch regions).
+        unsafe { phys::Frame::from_pa(pa) }.write_bytes((va & 0xFFF) as usize, &src[done..done + n]);
         done += n;
     }
     true
@@ -2348,13 +2335,12 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
 /// the fd carries the index; a dup'd fd names the same slot, and the slot
 /// frees when any fd naming it closes — the single-task guest has no
 /// forking parent to keep one alive past the close).
-static mut EVENTFDS: [Option<akuma_syscalls_eventfd::EventFd>; 4] =
-    [None, None, None, None];
+static EVENTFDS: akuma_primitives::cell::BorrowCell<[Option<akuma_syscalls_eventfd::EventFd>; 4]> =
+    akuma_primitives::cell::BorrowCell::new([None, None, None, None]);
 
-fn eventfds() -> &'static mut [Option<akuma_syscalls_eventfd::EventFd>; 4] {
-    // As `child::slots`: one task, run to completion, no other kernel
-    // context can touch the table mid-syscall.
-    unsafe { &mut *core::ptr::addr_of_mut!(EVENTFDS) }
+/// Run `f` on the eventfd table; nothing holds it across a user copy.
+fn eventfds<R>(f: impl FnOnce(&mut [Option<akuma_syscalls_eventfd::EventFd>; 4]) -> R) -> R {
+    EVENTFDS.with_mut(f)
 }
 
 /// `eventfd2(initval, flags)`. Flags outside Linux's three bits are EINVAL;
@@ -2366,11 +2352,14 @@ fn eventfd2_arm(initval: u64, flags: u64) -> u64 {
         Ok(ef) => ef,
         Err(no) => return e(no as u64),
     };
-    let slot = eventfds().iter().position(core::option::Option::is_none);
+    let slot = eventfds(|t| {
+        let slot = t.iter().position(core::option::Option::is_none)?;
+        t[slot] = Some(ef);
+        Some(slot)
+    });
     let Some(slot) = slot else {
         return e(ring3::err::EMFILE);
     };
-    eventfds()[slot] = Some(ef);
     let mut table = fd_table();
     let desc = OpenFile::EventFd(slot);
     let fd = table.alloc_fd_from(3, desc);
@@ -2389,10 +2378,10 @@ fn eventfd2_arm(initval: u64, flags: u64) -> u64 {
 /// has none, so Linux's would-block answers EAGAIN here by construction
 /// (the fd's nonblock bit changes nothing: there is no waiter to park).
 fn eventfd_read_arm(idx: usize, buf_va: u64) -> u64 {
-    let Some(ef) = eventfds()[idx].as_mut() else {
+    let Some(res) = eventfds(|t| t[idx].as_mut().map(akuma_syscalls_eventfd::EventFd::read)) else {
         return e(ring3::err::EBADF);
     };
-    match ef.read() {
+    match res {
         Ok(val) => {
             if !copy_to_user(buf_va, &val.to_le_bytes()) {
                 return e(ring3::err::EFAULT);
@@ -2415,10 +2404,10 @@ fn eventfd_write_arm(idx: usize, buf_va: u64) -> u64 {
 /// The write itself (the value already gathered — writev's head bytes take
 /// this path too, matching Linux's first-8-bytes-of-the-gather rule).
 fn eventfd_write_val(idx: usize, val: u64) -> u64 {
-    let Some(ef) = eventfds()[idx].as_mut() else {
+    let Some(res) = eventfds(|t| t[idx].as_mut().map(|ef| ef.write(val))) else {
         return e(ring3::err::EBADF);
     };
-    match ef.write(val) {
+    match res {
         Ok(()) => 8,
         Err(no) => e(no as u64),
     }
@@ -2427,13 +2416,13 @@ fn eventfd_write_val(idx: usize, val: u64) -> u64 {
 /// Close every fd naming `idx`: drop the slot (the single-task guest has no
 /// co-referring parent process — the Socket treatment).
 fn eventfd_close_slot(idx: usize) {
-    eventfds()[idx] = None;
+    eventfds(|t| t[idx] = None);
 }
 
 /// poll/select readiness for an eventfd fd: readable while the counter is
 /// non-zero (sock.rs's `fd_events` asks through here).
 pub(crate) fn eventfd_can_read(idx: usize) -> bool {
-    eventfds()[idx].as_ref().is_some_and(akuma_syscalls_eventfd::EventFd::can_read)
+    eventfds(|t| t[idx].as_ref().is_some_and(akuma_syscalls_eventfd::EventFd::can_read))
 }
 /// One bit per syscall number below 512 already named by `nosys_note`.
 static NOSYS_SEEN: [core::sync::atomic::AtomicU64; 8] =
@@ -2464,29 +2453,17 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         let rip = fr.user_rip;
         let islot = exec_twin::current_slot();
         if islot < child::NSLOTS {
-            // SAFETY: syscall-path discipline (single core, IF clear).
-            unsafe { (*core::ptr::addr_of_mut!(INFLIGHT))[islot] = (nr, a1, a2, a3) };
+            INFLIGHT.with_mut(|t| t[islot] = (nr, a1, a2, a3));
         }
         if nr == 202 {
-            // SAFETY: as above.
-            unsafe {
-                let h = &mut *core::ptr::addr_of_mut!(FXHEAD);
-                (*core::ptr::addr_of_mut!(FXRING))[*h % 160] = (islot as i32, a2, a1, a3, u64::MAX - 1);
-                *h += 1;
-            }
+            FXRING.push((islot as i32, a2, a1, a3, u64::MAX - 1));
         }
         let r = dispatch_inner(fr);
         if islot < child::NSLOTS {
-            // SAFETY: as above.
-            unsafe { (*core::ptr::addr_of_mut!(INFLIGHT))[islot].0 = 0 };
+            INFLIGHT.with_mut(|t| t[islot].0 = 0);
         }
         if nr == 202 {
-            // SAFETY: as above.
-            unsafe {
-                let h = &mut *core::ptr::addr_of_mut!(FXHEAD);
-                (*core::ptr::addr_of_mut!(FXRING))[*h % 160] = (islot as i32, a2, a1, a3, r);
-                *h += 1;
-            }
+            FXRING.push((islot as i32, a2, a1, a3, r));
         }
         trace_err(nr, r, a1, a2, a3);
         trace_ring(nr, r, a1, a2, a3, rip);
@@ -2500,29 +2477,23 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
 #[cfg(feature = "trace-err")]
 const N: usize = 1024;
 #[cfg(feature = "trace-err")]
-static mut RING: [(i32, u64, u64, u64, u64, u64, u64); N] = [(0, 0, 0, 0, 0, 0, 0); N];
-#[cfg(feature = "trace-err")]
-static mut HEAD: usize = 0;
+static RING: ring::Ring<(i32, u64, u64, u64, u64, u64, u64), N> = ring::Ring::new((0, 0, 0, 0, 0, 0, 0));
 /// Every futex call in global order: `(slot, op, uaddr, val_or_count, result)`.
 #[cfg(feature = "trace-err")]
-static mut FXRING: [(i32, u64, u64, u64, u64); 160] = [(0, 0, 0, 0, 0); 160];
-#[cfg(feature = "trace-err")]
-static mut FXHEAD: usize = 0;
+static FXRING: ring::Ring<(i32, u64, u64, u64, u64), 160> = ring::Ring::new((0, 0, 0, 0, 0));
 
 /// The syscall each slot is in RIGHT NOW (`nr`, three args; `nr == 0` = none):
 /// a parked thread is inside one that has not returned, which the ring cannot show.
 #[cfg(feature = "trace-err")]
-static mut INFLIGHT: [(u64, u64, u64, u64); child::NSLOTS + 1] = [(0, 0, 0, 0); child::NSLOTS + 1];
+static INFLIGHT: akuma_primitives::cell::BorrowCell<[(u64, u64, u64, u64); child::NSLOTS + 1]> =
+    akuma_primitives::cell::BorrowCell::new([(0, 0, 0, 0); child::NSLOTS + 1]);
 
 /// The idle thread calls this when nothing has run for a while: every live
 /// slot's last `per` syscalls, so a hang shows what each thread was waiting on.
 #[cfg(feature = "trace-err")]
 pub(crate) fn trace_hang_dump(per: usize) {
     akuma_primitives::safe_print!(64, "[hang] idle for 20 s; last futex calls, oldest first (ret=PENDING: entry):\n");
-    // SAFETY: idle thread, single core, IF clear between laps.
-    unsafe {
-        let ring = &*core::ptr::addr_of!(FXRING);
-        let head = *core::ptr::addr_of!(FXHEAD);
+    FXRING.view(|head, ring| {
         for i in 0..160 {
             let (sl, op, ua, v, r) = ring[(head + i) % 160];
             if op != 0 || ua != 0 {
@@ -2533,17 +2504,14 @@ pub(crate) fn trace_hang_dump(per: usize) {
                 }
             }
         }
-    }
+    });
     akuma_primitives::safe_print!(64, "[hang] last syscalls per slot:\n");
-    // SAFETY: idle thread, single core, IF clear between laps.
-    unsafe {
-        let ring = &*core::ptr::addr_of!(RING);
-        let head = *core::ptr::addr_of!(HEAD);
+    RING.view(|head, ring| {
         for slot in 0..child::NSLOTS {
             if !child::slot_in_use(slot) {
                 continue;
             }
-            let (inr, ix, iy, iz) = (*core::ptr::addr_of!(INFLIGHT))[slot];
+            let (inr, ix, iy, iz) = INFLIGHT.with(|t| t[slot]);
             if inr != 0 {
                 akuma_primitives::safe_print!(
                     112, "[hang] s{} IN nr={} a=0x{:x},0x{:x},0x{:x}\n", slot, inr, ix, iy, iz
@@ -2564,7 +2532,7 @@ pub(crate) fn trace_hang_dump(per: usize) {
                 }
             }
         }
-    }
+    });
 }
 
 /// `--features trace-err`: the last 96 syscalls of every task, dumped when a
@@ -2575,63 +2543,53 @@ pub(crate) fn trace_hang_dump(per: usize) {
 fn trace_ring(nr: u64, r: u64, a1: u64, a2: u64, a3: u64, rip: u64) {
     static DUMPED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     let slot = crate::exec_twin::current_slot() as i32;
-    // SAFETY: syscall-path discipline (single core, IF clear).
-    unsafe {
-        let ring = &mut *core::ptr::addr_of_mut!(RING);
-        let head = &mut *core::ptr::addr_of_mut!(HEAD);
-        ring[*head % N] = (slot, nr, a1, a2, a3, r, rip);
-        *head += 1;
-        // What a task says on stderr (a panic/abort message), capped: the
-        // evidence the next line of the console would otherwise lose.
-        if nr == 1 && a1 == 2 && r > 0 {
-            static SEEN_ERR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-            if SEEN_ERR.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 120 {
-                let mut b = [0u8; 120];
-                let n = (r as usize).min(b.len());
-                if copy_from_user(&mut b[..n], a2) {
-                    let txt = core::str::from_utf8(&b[..n]).unwrap_or("<non-utf8>");
-                    akuma_primitives::safe_print!(160, "[stderr] s{}: {}\n", slot, txt.trim_end());
-                }
-            }
-        }
-        if nr == 200 {
-            akuma_primitives::safe_print!(64, "[ring] tkill by s{}; its last syscalls:\n", slot);
-            for i in 0..N {
-                let (sl, n, x, y, z, ret, rp) = ring[(*head + i) % N];
-                if n != 0 && sl == slot && i + 40 >= N {
-                    akuma_primitives::safe_print!(
-                        112, "[ring] nr={} a=0x{:x},0x{:x},0x{:x} -> {} rip=0x{:x}\n",
-                        n, x, y, z, ret as i64, rp
-                    );
-                }
-            }
-        }
-        // std's CLOEXEC error pipe: 4 bytes errno (big endian) + b"NOEX".
-        if nr == 1 && a3 == 8 && r == 8 {
-            let mut b = [0u8; 8];
-            if copy_from_user(&mut b, a2) && &b[4..] == b"NOEX"
-                && DUMPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3
-            {
-                akuma_primitives::safe_print!(
-                    64, "[ring] exec failed in s{} errno={}; its last syscalls:\n",
-                    slot, u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-                );
-                let mut shown = 0;
-                for i in 0..N {
-                    let (sl, n, x, y, z, ret, rp) = ring[(*head + i) % N];
-                    if n != 0 && sl == slot && i + 60 >= N {
-                        shown += 1;
-                        akuma_primitives::safe_print!(
-                            112,
-                            "[ring] nr={} a=0x{:x},0x{:x},0x{:x} -> {} rip=0x{:x}\n",
-                            n, x, y, z, ret as i64, rp
-                        );
-                    }
-                }
-                let _ = shown;
+    RING.push((slot, nr, a1, a2, a3, r, rip));
+    // What a task says on stderr (a panic/abort message), capped: the
+    // evidence the next line of the console would otherwise lose.
+    if nr == 1 && a1 == 2 && r > 0 {
+        static SEEN_ERR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+        if SEEN_ERR.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 120 {
+            let mut b = [0u8; 120];
+            let n = (r as usize).min(b.len());
+            if copy_from_user(&mut b[..n], a2) {
+                let txt = core::str::from_utf8(&b[..n]).unwrap_or("<non-utf8>");
+                akuma_primitives::safe_print!(160, "[stderr] s{}: {}\n", slot, txt.trim_end());
             }
         }
     }
+    if nr == 200 {
+        akuma_primitives::safe_print!(64, "[ring] tkill by s{}; its last syscalls:\n", slot);
+        ring_dump_slot(slot, 40);
+    }
+    // std's CLOEXEC error pipe: 4 bytes errno (big endian) + b"NOEX".
+    if nr == 1 && a3 == 8 && r == 8 {
+        let mut b = [0u8; 8];
+        if copy_from_user(&mut b, a2) && &b[4..] == b"NOEX"
+            && DUMPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3
+        {
+            akuma_primitives::safe_print!(
+                64, "[ring] exec failed in s{} errno={}; its last syscalls:\n",
+                slot, u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            );
+            ring_dump_slot(slot, 60);
+        }
+    }
+}
+
+/// Print `slot`'s entries among the newest `last` of the syscall ring, oldest first.
+#[cfg(feature = "trace-err")]
+fn ring_dump_slot(slot: i32, last: usize) {
+    RING.view(|head, ring| {
+        for i in 0..N {
+            let (sl, n, x, y, z, ret, rp) = ring[(head + i) % N];
+            if n != 0 && sl == slot && i + last >= N {
+                akuma_primitives::safe_print!(
+                    112, "[ring] nr={} a=0x{:x},0x{:x},0x{:x} -> {} rip=0x{:x}\n",
+                    n, x, y, z, ret as i64, rp
+                );
+            }
+        }
+    });
 }
 
 /// `--features trace-err`: name every syscall that answered a negative errno
@@ -3072,10 +3030,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             };
             let mut page = base & !0xFFF;
             while page < base + pages {
-                let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
+                let Some(frame) = phys::Frame::alloc_zeroed() else {
                     return e(ring3::err::ENOMEM);
                 };
-                if !paging::map_page_in(t.root_pa, page as usize, pa as u64, pte, MemAttr::WriteBack) {
+                if !paging::map_page_in(t.root_pa, page as usize, frame.pa(), pte, MemAttr::WriteBack) {
                     return e(ring3::err::ENOMEM);
                 }
                 if let Some(node) = fnode {
@@ -3099,13 +3057,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                         if got == 0 {
                             break;
                         }
-                        // SAFETY: `pa` is this page's fresh frame and `done`
-                        // stays inside it; the physmap copy is the same walk
-                        // the exec path's copy makes.
-                        let dst = phys::phys_ptr::<u8>(pa as u64 + done as u64);
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, got);
-                        }
+                        frame.write_bytes(done, &chunk[..got]);
                         done += got;
                     }
                 }
@@ -4380,10 +4332,23 @@ fn str_until_nul(buf: &[u8]) -> &str {
     core::str::from_utf8(&buf[..end]).unwrap_or("")
 }
 
-static mut PROGRAMS: [Prog; MAX_PROGRAMS] = [Prog::new(); MAX_PROGRAMS];
-static mut N_PROGRAMS: usize = 0;
-static mut CURRENT: usize = 0;
-static mut EXIT_CODES: [u64; MAX_PROGRAMS] = [0; MAX_PROGRAMS];
+/// The boot program list, how many entries it holds, which one runs now, and
+/// each one's exit code. Written by `parse_programs` before ring 3 exists, then
+/// by the reaper; read in whole copies so no borrow outlives a call.
+struct Programs {
+    list: [Prog; MAX_PROGRAMS],
+    count: usize,
+    current: usize,
+    exit_codes: [u64; MAX_PROGRAMS],
+}
+
+static PROGRAMS: akuma_primitives::cell::BorrowCell<Programs> =
+    akuma_primitives::cell::BorrowCell::new(Programs {
+        list: [Prog::new(); MAX_PROGRAMS],
+        count: 0,
+        current: 0,
+        exit_codes: [0; MAX_PROGRAMS],
+    });
 
 /// Fill the program list from the boot command line: `init=`/`initargs=`
 /// name the first program (the stage-1/2 token pair, unchanged), each
@@ -4412,13 +4377,11 @@ fn parse_programs(cmdline: &str) {
         } else {
             (None, None)
         };
-        // SAFETY: the program statics, boot-phase only — no ring 3 exists
-        // while this runs, same discipline as every other boot static.
-        let progs = unsafe { &mut *core::ptr::addr_of_mut!(PROGRAMS) };
         if idx >= MAX_PROGRAMS {
             break;
         }
-        let p = &mut progs[idx];
+        PROGRAMS.with_mut(|t| {
+        let p = &mut t.list[idx];
         if let Some(v) = set_path {
             store_slot(&mut p.path, v);
         }
@@ -4438,12 +4401,12 @@ fn parse_programs(cmdline: &str) {
                 }
             }
         }
+        });
     }
-    // SAFETY: boot-phase only, see above.
-    unsafe {
-        N_PROGRAMS = idx + 1;
-        CURRENT = 0;
-    }
+    PROGRAMS.with_mut(|t| {
+        t.count = idx + 1;
+        t.current = 0;
+    });
 }
 
 fn store_slot(dst: &mut [u8], s: &str) {
@@ -4457,28 +4420,24 @@ fn store_slot(dst: &mut [u8], s: &str) {
 /// stage-1 gate was pinned on (they are per-program now: two tasks, two spawn
 /// lines). Never returns.
 fn run_program(i: usize) -> ! {
-    // SAFETY: boot statics; `CURRENT` is read by the dispatcher's reaper, and
-    // every write here precedes the first crossing of the program it names.
-    let (path, n_args) = unsafe {
-        CURRENT = i;
-        let progs = &*core::ptr::addr_of!(PROGRAMS);
-        (progs[i].path_str(), progs[i].n_args)
-    };
+    // `current` is read by the dispatcher's reaper, and this write precedes the
+    // first crossing of the program it names. The entry is copied out so no
+    // borrow of the table outlives the call.
+    let prog = PROGRAMS.with_mut(|t| {
+        t.current = i;
+        t.list[i]
+    });
+    let (path, n_args) = (prog.path_str(), prog.n_args);
     console::puts("Taoxichuan: init spawn -- init=");
     console::puts(path);
     if n_args > 0 {
         console::puts(" argv=[");
-        // SAFETY: boot statics, see above.
-        let args: [&str; MAX_ARGV] = unsafe {
-            let progs = &*core::ptr::addr_of!(PROGRAMS);
-            let mut a = [""; MAX_ARGV];
-            for (k, slot) in a.iter_mut().enumerate() {
-                if k < n_args {
-                    *slot = progs[i].arg_str(k);
-                }
+        let mut args = [""; MAX_ARGV];
+        for (k, slot) in args.iter_mut().enumerate() {
+            if k < n_args {
+                *slot = prog.arg_str(k);
             }
-            a
-        };
+        }
         for (k, a) in args.iter().enumerate() {
             if k >= n_args {
                 break;
@@ -4506,7 +4465,7 @@ fn run_program(i: usize) -> ! {
     console::puts("\n");
     console::puts("Taoxichuan: stage 1 gate reached -- init spawn (userspace is stage 2)\n");
 
-    spawn(path, &image)
+    spawn(&prog, &image)
 }
 
 /// The dispatcher's reaper, in place of stage 2's `halt()`: report the exit,
@@ -4515,12 +4474,11 @@ fn run_program(i: usize) -> ! {
 /// stub parked is abandoned with the task (the stub restarts at its top on
 /// the next task's first syscall).
 fn task_done(code: u64) -> ! {
-    // SAFETY: boot statics; single core, IF clear, no other reader.
-    let (i, n, path) = unsafe {
-        EXIT_CODES[CURRENT] = code;
-        let progs = &*core::ptr::addr_of!(PROGRAMS);
-        (CURRENT, N_PROGRAMS, progs[CURRENT].path_str())
-    };
+    let (i, n, prog) = PROGRAMS.with_mut(|t| {
+        t.exit_codes[t.current] = code;
+        (t.current, t.count, t.list[t.current])
+    });
+    let path = prog.path_str();
     // The stage-2 gate's own evidence lines, verbatim, on the boot that
     // re-checks that gate; every other program gets the generic line.
     if path == "/bin/hello" {
@@ -4540,7 +4498,7 @@ fn task_done(code: u64) -> ! {
     if i + 1 < n {
         run_program(i + 1);
     }
-    let all_zero = unsafe { EXIT_CODES[..n].iter().all(|&c| c == 0) };
+    let all_zero = PROGRAMS.with(|t| t.exit_codes[..n].iter().all(|&c| c == 0));
     if n >= 2 && all_zero {
         // The stage-3 gate's own line: two kernel-reaped tasks, both clean.
         console::puts("Taoxichuan: stage 3 gate reached -- sequential tasks ran clean, outputs above\n");
@@ -4575,85 +4533,65 @@ pub(crate) fn clone_user_half(parent_root: u64, dst_root: u64) -> Option<()> {
     // fresh root from the crate shares only amd64's trio 256/257/511, and
     // this kernel's convention is the full upper half). The user half clones
     // the parent's subtrees leaf-by-leaf through `clone_user_tree`.
-    // SAFETY: both roots are PMM-resident page-table frames inside the
-    // physmap; the forking parent is parked and this kernel is single-core
-    // with IF clear — the discipline that owns every page-table touch here.
-    unsafe {
-        let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
-        let ktbl = phys::phys_ptr::<[u64; 512]>(kroot);
-        let dst = phys::phys_ptr::<[u64; 512]>(dst_root);
-        for i in 256..512 {
-            (*dst)[i] = (*ktbl)[i];
+    // SAFETY: both roots are PMM-resident page-table frames; the forking parent
+    // is parked and this kernel is single-core with IF clear — the discipline
+    // that owns every page-table touch here.
+    let (src, dst) = unsafe { (phys::Frame::from_pa(parent_root), phys::Frame::from_pa(dst_root)) };
+    copy_kernel_half(dst);
+    clone_user_half_into(src, dst)
+}
+
+/// The kernel half of every task root is the live CR3's: one PML4 copy shares
+/// every kernel subtree (physmap, device window, kernel image).
+fn copy_kernel_half(dst: phys::Frame) {
+    // SAFETY: CR3 holds the live PML4 frame.
+    let k = unsafe { phys::Frame::from_pa(akuma_cpu::ctlreg::cr3() & PTE_ADDR) };
+    for i in 256..512 {
+        dst.set_entry(i, k.entry(i));
+    }
+}
+
+/// Clone the user half of `src` (a parked parent's PML4) into `dst`, one PML4
+/// subtree at a time through [`clone_user_tree`]. On failure everything this
+/// pass linked into `dst` is released; the root frame itself stays the caller's.
+fn clone_user_half_into(src: phys::Frame, dst: phys::Frame) -> Option<()> {
+    for i in 0..256 {
+        let entry = src.entry(i);
+        if entry & 1 == 0 {
+            continue;
         }
-        let src = phys::phys_ptr::<[u64; 512]>(parent_root);
-        for i in 0..256 {
-            let entry = (*src)[i];
-            if entry & 1 == 0 {
-                continue;
-            }
-            if entry & 0x080 != 0 {
-                return None; // a 1 GiB leaf: see fork_share_memory's note
-            }
-            let Some(sub) = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2, (i as u64) << 39) else {
-                // Give back what this pass already linked into `dst`: the root
-                // frame itself stays the caller's.
-                for j in 0..i {
-                    if (*dst)[j] & 1 != 0 {
-                        free_subtree((*dst)[j] & PTE_ADDR, 2);
-                        (*dst)[j] = 0;
-                    }
+        if entry & 0x080 != 0 {
+            return None; // a 1 GiB leaf: see fork_share_memory's note
+        }
+        let Some(sub) = clone_user_tree(entry & PTE_ADDR, 2, (i as u64) << 39) else {
+            for j in 0..i {
+                if dst.entry(j) & 1 != 0 {
+                    free_subtree(dst.entry(j) & PTE_ADDR, 2);
+                    dst.set_entry(j, 0);
                 }
-                return None;
-            };
-            (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
-        }
+            }
+            return None;
+        };
+        dst.set_entry(i, (entry & !PTE_ADDR) | sub);
     }
     Some(())
 }
 
 pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
-    let root_page = akuma_pmm::alloc_page_zeroed()?;
-    let root = root_page as u64;
-    let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
-    // SAFETY: both frames are PMM pages inside the physmap; the copy is a
-    // plain RAM write, and the new root is not live until fork's CR3 load.
-    unsafe {
-        let ktbl = phys::phys_ptr::<[u64; 512]>(kroot);
-        let utbl = phys::phys_ptr::<[u64; 512]>(root);
-        for i in 256..512 {
-            (*utbl)[i] = (*ktbl)[i];
-        }
+    let root = phys::Frame::alloc_zeroed()?;
+    // The kernel half is shared by the PML4 copy and must NOT be walked: its
+    // physmap subtree names every physical address the 64 GiB window covers,
+    // holes included, and a leaf copy there would read frames above RAM. The
+    // new root is not live until fork's CR3 load.
+    copy_kernel_half(root);
+    // SAFETY: the forking parent is parked and its root is a page-table frame;
+    // single core, IF clear.
+    let src = unsafe { phys::Frame::from_pa(parent_root) };
+    if clone_user_half_into(src, root).is_none() {
+        akuma_pmm::free_page(root.pa() as usize, akuma_primitives::preempt::current_tid() as u32);
+        return None;
     }
-    // Clone the USER half only, one PML4 subtree at a time. The kernel half
-    // is shared by the PML4 copy above and must NOT be walked: its physmap
-    // subtree names every physical address the 64 GiB window covers, holes
-    // included, and a leaf copy there would read frames above RAM.
-    // SAFETY: as above; the copies read the parent's (parked) tables and
-    // write the new root's, all through the physmap.
-    unsafe {
-        let src = phys::phys_ptr::<[u64; 512]>(parent_root);
-        let dst = phys::phys_ptr::<[u64; 512]>(root);
-        for i in 0..256 {
-            let entry = (*src)[i];
-            if entry & 1 == 0 {
-                continue;
-            }
-            if entry & 0x080 != 0 {
-                return None; // a 1 GiB leaf: see fork_share_memory's note
-            }
-            let Some(sub) = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2, (i as u64) << 39) else {
-                for j in 0..i {
-                    if (*dst)[j] & 1 != 0 {
-                        free_subtree((*dst)[j] & PTE_ADDR, 2);
-                    }
-                }
-                akuma_pmm::free_page(root as usize, akuma_primitives::preempt::current_tid() as u32);
-                return None;
-            };
-            (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
-        }
-    }
-    Some(root)
+    Some(root.pa())
 }
 
 /// One page-table level of [`fork_share_memory`]'s clone: `depth` counts the
@@ -4674,57 +4612,52 @@ pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
 /// On failure the partial subtree is released (through `free_page`, so the
 /// counts taken so far are dropped) — a refused fork leaks nothing.
 ///
-/// SAFETY: `table_pa` must be a PMM-resident page-table frame (physmap
-/// reachable) whose table belongs to the USER half of a parked task's root.
-unsafe fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
-    let out_page = akuma_pmm::alloc_page_zeroed()?;
-    let out = out_page as u64;
+/// `table_pa` must be a PMM-resident page-table frame whose table belongs to the
+/// USER half of a parked task's root (every caller reads it from a present entry
+/// of one).
+fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
+    let dst = phys::Frame::alloc_zeroed()?;
+    let out = dst.pa();
     let shift = 12 + 9 * depth;
-    // SAFETY: contract above; every load/store is inside the physmap.
-    unsafe {
-        let src = phys::phys_ptr::<[u64; 512]>(table_pa);
-        let dst = phys::phys_ptr::<[u64; 512]>(out);
-        for i in 0..512 {
-            let entry = (*src)[i];
-            if entry & 1 == 0 {
-                continue; // not present
-            }
-            let va = va_base | ((i as u64) << shift);
-            if depth == 0 {
-                let old = entry & PTE_ADDR;
-                if in_shared_span(va) {
-                    let Some(frame) = akuma_pmm::alloc_page_zeroed() else {
-                        free_subtree(out, depth);
-                        return None;
-                    };
-                    core::ptr::copy_nonoverlapping(
-                        phys::phys_ptr::<u8>(old),
-                        phys::phys_ptr::<u8>(frame as u64),
-                        4096,
-                    );
-                    (*dst)[i] = (entry & !PTE_ADDR) | frame as u64;
-                } else {
-                    akuma_pmm::cow_ref_inc(old as usize);
-                    let mut e = entry;
-                    if entry & PTE_W != 0 {
-                        e = (entry & !PTE_W) | PTE_COW;
-                        (*src)[i] = e;
-                        akuma_cpu::tlb::invlpg(va as usize);
-                    }
-                    (*dst)[i] = e;
-                    COW_SHARED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                }
-            } else {
-                if entry & 0x080 != 0 {
-                    free_subtree(out, depth);
-                    return None; // a huge page: see fork_share_memory's note
-                }
-                let Some(sub) = clone_user_tree(entry & PTE_ADDR, depth - 1, va) else {
+    // SAFETY: contract above.
+    let src = unsafe { phys::Frame::from_pa(table_pa) };
+    for i in 0..512 {
+        let entry = src.entry(i);
+        if entry & 1 == 0 {
+            continue; // not present
+        }
+        let va = va_base | ((i as u64) << shift);
+        if depth == 0 {
+            let old = entry & PTE_ADDR;
+            if in_shared_span(va) {
+                let Some(frame) = phys::Frame::alloc_zeroed() else {
                     free_subtree(out, depth);
                     return None;
                 };
-                (*dst)[i] = (entry & !PTE_ADDR) | sub;
+                // SAFETY: `old` is the frame this present leaf maps.
+                frame.copy_page_from(unsafe { phys::Frame::from_pa(old) });
+                dst.set_entry(i, (entry & !PTE_ADDR) | frame.pa());
+            } else {
+                akuma_pmm::cow_ref_inc(old as usize);
+                let mut e = entry;
+                if entry & PTE_W != 0 {
+                    e = (entry & !PTE_W) | PTE_COW;
+                    src.set_entry(i, e);
+                    akuma_cpu::tlb::invlpg(va as usize);
+                }
+                dst.set_entry(i, e);
+                COW_SHARED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
+        } else {
+            if entry & 0x080 != 0 {
+                free_subtree(out, depth);
+                return None; // a huge page: see fork_share_memory's note
+            }
+            let Some(sub) = clone_user_tree(entry & PTE_ADDR, depth - 1, va) else {
+                free_subtree(out, depth);
+                return None;
+            };
+            dst.set_entry(i, (entry & !PTE_ADDR) | sub);
         }
     }
     Some(out)
@@ -4744,9 +4677,10 @@ fn in_shared_span(va: u64) -> bool {
 /// half-built tree, unreachable from any live root.
 fn free_subtree(table_pa: u64, depth: u32) {
     let tid = akuma_primitives::preempt::current_tid() as u32;
-    // SAFETY: the frame is a PMM page inside the physmap, owned by the caller.
-    let table = unsafe { &*phys::phys_ptr::<[u64; 512]>(table_pa) };
-    for &e in table {
+    // SAFETY: the frame is a PMM page-table frame owned by the caller.
+    let table = unsafe { phys::Frame::from_pa(table_pa) };
+    for i in 0..512 {
+        let e = table.entry(i);
         if e & 1 == 0 {
             continue;
         }
@@ -4781,19 +4715,10 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // (one PML4 copy shares every kernel subtree — physmap, device window,
     // kernel image), whose lower half holds only the task. The kernel's own
     // root keeps its identity map; the task's root simply has none.
-    let root_page = akuma_pmm::alloc_page_zeroed()?;
-    let root = root_page as u64;
-    let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
-    // SAFETY: both frames are PMM/established pages inside the physmap; the
-    // copies are plain RAM writes through the physmap, and the task's tables
-    // are not live until the CR3 load below.
-    unsafe {
-        let ktbl = phys::phys_ptr::<[u64; 512]>(kroot);
-        let utbl = phys::phys_ptr::<[u64; 512]>(root);
-        for i in 256..512 {
-            (*utbl)[i] = (*ktbl)[i];
-        }
-    }
+    // The task's tables are not live until the CR3 load below.
+    let root_frame = phys::Frame::alloc_zeroed()?;
+    copy_kernel_half(root_frame);
+    let root = root_frame.pa();
     t.root_pa = root;
 
     // Place every PT_LOAD at its link address, page by page: fresh zeroed
@@ -4811,8 +4736,8 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
         let file = img.segment_bytes(seg);
         let mut pva = first;
         while pva < last {
-            let pa = akuma_pmm::alloc_page_zeroed()?;
-            if !paging::map_page_in(root, pva as usize, pa as u64, pte, MemAttr::WriteBack) {
+            let frame = phys::Frame::alloc_zeroed()?;
+            if !paging::map_page_in(root, pva as usize, frame.pa(), pte, MemAttr::WriteBack) {
                 return None;
             }
             // The page's overlap with the segment's file-backed range.
@@ -4820,12 +4745,9 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
             let to = (pva + 4096).min(seg.vaddr + seg.filesz);
             if from < to {
                 let src = &file[(from - seg.vaddr) as usize..(to - seg.vaddr) as usize];
-                // SAFETY: `pa` is this page's fresh frame; `from - pva` stays
-                // inside it because `from >= pva` and `to <= pva + 4096`.
-                let dst = phys::phys_ptr::<u8>(pa as u64 + (from - pva));
-                unsafe {
-                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
-                }
+                // `from - pva` stays inside the frame because `from >= pva` and
+                // `to <= pva + 4096` (`write_bytes` checks it anyway).
+                frame.write_bytes((from - pva) as usize, src);
             }
             placed += 1;
             pva += 4096;
@@ -4868,7 +4790,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                 let last = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
                 let mut pva = first;
                 while pva < last {
-                    let pa = akuma_pmm::alloc_page_zeroed()?;
+                    let frame = phys::Frame::alloc_zeroed()?;
                     let pte = if seg.flags & akuma_elf_exec::PF_X != 0 {
                         PteProt::USER_RX
                     } else if seg.flags & akuma_elf_exec::PF_W != 0 {
@@ -4876,7 +4798,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                     } else {
                         PteProt::USER_RO
                     };
-                    if !paging::map_page_in(root, pva as usize, pa as u64, pte, MemAttr::WriteBack) {
+                    if !paging::map_page_in(root, pva as usize, frame.pa(), pte, MemAttr::WriteBack) {
                         return None;
                     }
                     // The page's overlap with the segment's file-backed range.
@@ -4893,13 +4815,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                         let off = seg.offset + (from - seg.vaddr);
                         let end = seg.offset + (to - seg.vaddr);
                         let bytes = &ldso[off as usize..end as usize];
-                        // SAFETY: `pa` is this page's fresh frame; `from - pva`
-                        // stays inside it because `from >= pva` and
-                        // `to <= pva + 4096` — the program loop's argument.
-                        let dst = phys::phys_ptr::<u8>(pa as u64 + (from - pva));
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
-                        }
+                        frame.write_bytes((from - pva) as usize, bytes);
                     }
                     if last > hi {
                         hi = last;
@@ -4925,12 +4841,12 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // The stack, then the initial block on it. The block is < half a page and
     // ends at `USER_STACK_TOP`, so it lands entirely in the top page.
     let stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
-    let mut stack_pas = [0u64; USER_STACK_PAGES as usize];
+    let mut stack_frames = [None::<phys::Frame>; USER_STACK_PAGES as usize];
     let mut pva = stack_base;
     while pva < USER_STACK_TOP {
-        let pa = akuma_pmm::alloc_page_zeroed()?;
-        stack_pas[((pva - stack_base) / 4096) as usize] = pa as u64;
-        if !paging::map_page_in(root, pva as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
+        let frame = phys::Frame::alloc_zeroed()?;
+        stack_frames[((pva - stack_base) / 4096) as usize] = Some(frame);
+        if !paging::map_page_in(root, pva as usize, frame.pa(), PteProt::USER_RW, MemAttr::WriteBack) {
             return None;
         }
         pva += 4096;
@@ -4973,17 +4889,14 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // of one pointer word — the underflowed slice index panicked the kernel
     // on the first real install. The block still ends at `USER_STACK_TOP` and
     // now fills the top page exactly, which the copy below already handles.
-    const BLOCK_PAGES: usize = 8;
+    const BLOCK_PAGES: usize = ARG_BLOCK_PAGES;
     let mut block = alloc::vec![0u8; BLOCK_PAGES * 4096];
     let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &full_argv[..n_args], env, &aux);
 
-    // SAFETY: the top stack page is a mapped task frame; the block ends at
-    // `USER_STACK_TOP`, so its bytes sit at `page_pa + (4096 - block.len())`.
+    // The block ends at `USER_STACK_TOP`, so it fills the top `BLOCK_PAGES` pages.
     for k in 0..BLOCK_PAGES {
-        let pa = stack_pas[USER_STACK_PAGES as usize - BLOCK_PAGES + k];
-        let dst = phys::phys_ptr::<u8>(pa);
-        unsafe {
-            core::ptr::copy_nonoverlapping(block.as_ptr().add(k * 4096), dst, 4096);
+        if let Some(frame) = stack_frames[USER_STACK_PAGES as usize - BLOCK_PAGES + k] {
+            frame.write_bytes(0, &block[k * 4096..(k + 1) * 4096]);
         }
     }
 
@@ -5014,47 +4927,49 @@ pub(crate) fn free_user_root(root: u64) -> usize {
     }
     let tid = akuma_primitives::preempt::current_tid() as u32;
     let mut n = 0usize;
-    // SAFETY: every frame named is a page-table frame this walk reached from a
-    // present, non-large entry of a root the loader built; the physmap maps all RAM.
-    unsafe fn table(pa: u64) -> &'static [u64; 512] {
-        unsafe { &*phys::phys_ptr::<[u64; 512]>(pa) }
-    }
-    // SAFETY: as above.
-    unsafe {
-        let l4 = table(root);
-        for &e4 in &l4[..256] {
-            if e4 & PRESENT == 0 {
+    // Every frame named below is a page-table frame this walk reached from a
+    // present, non-large entry of a root the loader built.
+    let table = |pa: u64| {
+        // SAFETY: as above.
+        unsafe { phys::Frame::from_pa(pa) }
+    };
+    let l4 = table(root);
+    for i4 in 0..256 {
+        let e4 = l4.entry(i4);
+        if e4 & PRESENT == 0 {
+            continue;
+        }
+        let p3 = e4 & ADDR;
+        for i3 in 0..512 {
+            let e3 = table(p3).entry(i3);
+            if e3 & PRESENT == 0 {
                 continue;
             }
-            let p3 = e4 & ADDR;
-            for &e3 in table(p3) {
-                if e3 & PRESENT == 0 {
+            if e3 & LARGE != 0 {
+                continue; // never built by the loader; not ours to guess
+            }
+            let p2 = e3 & ADDR;
+            for i2 in 0..512 {
+                let e2 = table(p2).entry(i2);
+                if e2 & PRESENT == 0 || e2 & LARGE != 0 {
                     continue;
                 }
-                if e3 & LARGE != 0 {
-                    continue; // never built by the loader; not ours to guess
-                }
-                let p2 = e3 & ADDR;
-                for &e2 in table(p2) {
-                    if e2 & PRESENT == 0 || e2 & LARGE != 0 {
-                        continue;
+                let p1 = e2 & ADDR;
+                for i1 in 0..512 {
+                    let e1 = table(p1).entry(i1);
+                    if e1 & PRESENT != 0 {
+                        akuma_pmm::free_page((e1 & ADDR) as usize, tid);
+                        n += 1;
                     }
-                    let p1 = e2 & ADDR;
-                    for &e1 in table(p1) {
-                        if e1 & PRESENT != 0 {
-                            akuma_pmm::free_page((e1 & ADDR) as usize, tid);
-                            n += 1;
-                        }
-                    }
-                    akuma_pmm::free_page(p1 as usize, tid);
-                    n += 1;
                 }
-                akuma_pmm::free_page(p2 as usize, tid);
+                akuma_pmm::free_page(p1 as usize, tid);
                 n += 1;
             }
-            akuma_pmm::free_page(p3 as usize, tid);
+            akuma_pmm::free_page(p2 as usize, tid);
             n += 1;
         }
+        akuma_pmm::free_page(p3 as usize, tid);
+        n += 1;
     }
     akuma_pmm::free_page(root as usize, tid);
     n + 1
@@ -5069,16 +4984,13 @@ pub struct TaskImage {
 
 /// Load the image, build the task's address space, and cross. Never returns:
 /// the task ends in the dispatcher's `exit` or the trap handler's `[Fault]`.
-fn spawn(path: &str, image: &[u8]) -> ! {
+fn spawn(p: &Prog, image: &[u8]) -> ! {
+    let path = p.path_str();
     if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
         akuma_primitives::safe_print!(160, "  init: ELF refused: bad magic\n");
         halt();
     }
-    // SAFETY: boot statics; read before the crossing that consumes the copy.
-    let (argv, n_args, envv, n_env) = unsafe {
-        let progs = &*core::ptr::addr_of!(PROGRAMS);
-        let cur = CURRENT;
-        let p = &progs[cur];
+    let (argv, n_args, envv, n_env) = {
         let mut a: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
         for k in 0..p.n_args {
             a[k + 1] = p.arg_str(k);
@@ -5219,10 +5131,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     console::puts("  fs:   ext2 root mounted on /dev/vda\n");
     // Publish the mount for the dispatcher's fd syscalls (`ROOT_FS` above);
     // from here on the local binding is dead.
-    // SAFETY: boot phase, one core, no ring 3 yet.
-    unsafe {
-        *core::ptr::addr_of_mut!(ROOT_FS) = Some(fs);
-    }
+    // The mount lives for the rest of the boot: leak it to a `'static` borrow.
+    ROOT_FS.set(Some(alloc::boxed::Box::leak(alloc::boxed::Box::new(fs))));
 
     // Stage 4: the network path — calibrate the TSC against the PIT, pull up
     // smoltcp on virtio-net, wait (bounded, pumping the NIC) for DHCP. A

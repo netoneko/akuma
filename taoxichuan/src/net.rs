@@ -62,10 +62,6 @@ fn inb(port: u16) -> u8 {
 /// One spin-loop hint.
 #[inline]
 fn pause() {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: a hint instruction, no state.
-    unsafe { core::arch::asm!("pause", options(nomem, nostack, preserves_flags)) }
-    #[cfg(not(target_arch = "x86_64"))]
     core::hint::spin_loop();
 }
 
@@ -80,30 +76,15 @@ fn pause() {
 /// gate poll keeps the bare pause (an hlt would skew the TSC window).
 #[inline]
 pub fn wait_lap() {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: no memory access; IF is open for the one hlt instruction and
-    // restored right after; the only unmasked source is the tick, whose
-    // handler is reentrant with every caller of this fn.
-    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) }
-    #[cfg(not(target_arch = "x86_64"))]
-    core::hint::spin_loop();
+    // `sti; hlt; cli`: IF is open for the one hlt and restored right after; the
+    // only unmasked source is the tick, whose handler is reentrant with every
+    // caller of this fn.
+    akuma_cpu::park::wfi();
 }
 
 /// Read the timestamp counter.
-#[cfg(target_arch = "x86_64")]
 fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    // SAFETY: reads a counter register.
-    unsafe {
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
-    }
-    (u64::from(hi) << 32) | u64::from(lo)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn rdtsc() -> u64 {
-    0
+    akuma_cpu::tsc::rdtsc()
 }
 
 // ---------------------------------------------------------------------------

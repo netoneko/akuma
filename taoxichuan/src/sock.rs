@@ -451,14 +451,11 @@ fn sockaddr_in_from_user(ptr: u64, len: u64) -> Option<SocketAddrV4> {
     if !crate::copy_from_user(&mut raw, ptr) {
         return None;
     }
-    // SAFETY: `SockAddrIn` is `repr(C)` plain-old-data — four integer fields
-    // and a padding array, no pointers, no niches — so any 16 bytes are a
-    // valid value of it.
-    let sa: SockAddrIn = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) };
-    if sa.sin_family != AF_INET as u16 {
+    // sin_family (native), sin_port (big-endian), sin_addr (the IP octets).
+    if u16::from_ne_bytes([raw[0], raw[1]]) != AF_INET as u16 {
         return None;
     }
-    Some(sa.to_addr())
+    Some(SocketAddrV4::new([raw[4], raw[5], raw[6], raw[7]], u16::from_be_bytes([raw[2], raw[3]])))
 }
 
 /// Write a `struct sockaddr_in` to the task's memory; returns its length.
@@ -466,16 +463,11 @@ fn sockaddr_in_to_user(ptr: u64, addr: SocketAddrV4) -> usize {
     if ptr == 0 {
         return 0;
     }
-    let sa = SockAddrIn::from_addr(&addr);
-    // SAFETY: `repr(C)` plain-old-data; viewing it as its own bytes is well
-    // defined.
-    let raw: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            core::ptr::addr_of!(sa).cast::<u8>(),
-            core::mem::size_of::<SockAddrIn>(),
-        )
-    };
-    if !crate::copy_to_user(ptr, raw) {
+    let mut raw = [0u8; core::mem::size_of::<SockAddrIn>()];
+    raw[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+    raw[2..4].copy_from_slice(&addr.port.to_be_bytes());
+    raw[4..8].copy_from_slice(&addr.ip);
+    if !crate::copy_to_user(ptr, &raw) {
         return 0;
     }
     raw.len()
