@@ -484,6 +484,70 @@ static CHILD_BIND: akuma_primitives::cell::BorrowCell<[(usize, u32, u64); NSLOTS
 /// `ExecRuntime::bind_child_task`'s twin: stamp the child's spawn-row. The
 /// crate publishes the child's thread right after this returns, so a full
 /// ring must come back as an error the fork reports, not a panic.
+/// The pool slot init runs on.
+static INIT_TID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+/// Init's entry point and initial stack, for [`init_thread_entry`].
+static INIT_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static INIT_RSP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A kernel stack for init's thread context (the context switch's own; the syscall and trap bands come from
+/// `prepare_task_slot`). Leaked once: init lives until the machine stops.
+const INIT_STACK_WORDS: usize = 4096;
+
+/// First instruction of init's pool thread: cross into ring 3 at the image's entry. The crate's switch hook has already named
+/// this slot current, loaded its band and CR3 from the bind record, so this is the same entry a fork child takes.
+extern "C" fn init_thread_entry() -> ! {
+    // The crate does not name a freshly seeded thread current: until this line the boot thread's slot (0) is still the answer,
+    // and init's first syscalls would run against task record 0 while a tick later switches them onto its own record.
+    crate::exec_twin::set_current_slot(INIT_TID.load(core::sync::atomic::Ordering::Relaxed));
+    let ctx = akuma_exec::process::UserContext::new(
+        INIT_ENTRY.load(core::sync::atomic::Ordering::Relaxed) as usize,
+        INIT_RSP.load(core::sync::atomic::Ordering::Relaxed) as usize,
+    );
+    crate::exec_twin::enter_user_ctx(&ctx)
+}
+
+/// Run the loaded boot program as pid 1 on a real pool thread and park the boot thread, the shape of amd64's
+/// `run_init`. The thread is claimed, stamped in the ring (`bind_child_task`: the same row a fork child gets, with the task
+/// record copied from the one `load_task` filled), registered as a `Process` (so `fork_process` finds a caller), seeded to enter
+/// ring 3 and published. The boot thread then waits for init to finish and reports its status like any boot program.
+pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
+    let Some(tid) = akuma_threading::x86_claim_slot() else {
+        akuma_primitives::safe_print!(96, "  [init] no pool slot for init\n");
+        crate::halt();
+    };
+    if let Err(msg) = bind_child_task(tid, 1, ti.root_pa, false) {
+        akuma_primitives::safe_print!(160, "  [init] bind refused: {}\n", msg);
+        crate::halt();
+    }
+    // Depth 1: the same standing the SPAWNed shell has, which `fork_arm_real`'s gate reads.
+    with_cross(tid, |c| c.depth = 1);
+    register_shell_process(1, path, ti.root_pa, ti.entry, ti.rsp, tid);
+    INIT_TID.store(tid, core::sync::atomic::Ordering::Relaxed);
+    INIT_ENTRY.store(ti.entry, core::sync::atomic::Ordering::Relaxed);
+    INIT_RSP.store(ti.rsp, core::sync::atomic::Ordering::Relaxed);
+    let stack: &'static mut [u64; INIT_STACK_WORDS] =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new([0u64; INIT_STACK_WORDS]));
+    let top = stack.as_mut_ptr() as usize + INIT_STACK_WORDS * 8;
+    akuma_threading::x86_seed_entry(tid, top, init_thread_entry);
+    // The boot thread becomes pool slot 0 (the pool hands out 1.., amd64's `x86_adopt_running_thread(0)`): it is about to
+    // block, and a thread the pool has never heard of has no slot to park.
+    let _ = prepare_task_slot(0);
+    akuma_threading::x86_adopt_running_thread(0);
+    crate::exec_twin::set_current_slot(0);
+    akuma_threading::x86_publish(tid);
+    crate::PREEMPT_ARMED.store(true, core::sync::atomic::Ordering::Release);
+    akuma_primitives::safe_print!(96, "[init] pid 1 on pool slot {}\n", tid);
+    // The boot thread: sleep a tick at a time until init's row stops running, then finish as the boot program's exit.
+    loop {
+        let (running, status) = SLOTS.with(|s| (s[tid].running, s[tid].status));
+        if !running {
+            crate::task_done(u64::from(status >> 8));
+        }
+        akuma_threading::schedule_blocking(crate::exec_twin::uptime_us() + 10_000);
+    }
+}
+
 pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> Result<(), &'static str> {
     if tid >= NSLOTS {
         return Err("taoxichuan: child tid outside the spawn ring");
@@ -1713,10 +1777,10 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     if fr.rax == ring3::nr::CLONE && fr.arg1() & CLONE_THREAD != 0 {
         return clone_thread_arm(fr);
     }
-    if REAL_FORK && (fr.rax != ring3::nr::CLONE || fr.arg1() & 0x100 != 0) {
-        // The new path: plain fork (57/58) through `fork_process` over the
-        // registered shell Process. `clone`/`vfork` keep the M2 arm — out of
-        // scope this slice.
+    if REAL_FORK {
+        // The real path: fork (57), vfork (58) and every non-thread `clone` - libakuma's `fork()` under `linux-abi` issues
+        // `clone(SIGCHLD)` - through `fork_process` over the registered Process. `fork_arm_real` takes a vfork-style
+        // child stack from `clone`'s `CLONE_VM` form itself.
         return fork_arm_real(fr);
     }
     fork_arm_blocking(fr)

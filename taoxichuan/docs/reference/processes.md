@@ -220,3 +220,14 @@ pipeline deadlock root causes, the real fork, parked wait4),
 - **The spawn crossing marks its pool slot RUNNING around `child_enter` and TERMINATED after.** Without it the picker never takes the slot (`INITIALIZING`), and the first preempting tick parked the spawn forever (deterministic under TCG).
 - **Sockets** are closed by the last fd referencing them across all task records (`sock::socket_refs`); an exiting task releases its sockets.
 - **Known limit:** enough spawns in one boot leak a kernel+trap band each until a claim picks a slot at or above the ring (`"Failed to allocate x86 task stacks"`); the 12-slot ring failed after ~15 spawns, the 48-slot ring scales the same leak (not re-measured). It dies with the ring in `switch-to-crates.md` S3.
+
+## Init is pid 1 on a pool thread
+
+The first boot program (`init=`) does not run on the boot stack. `spawn()` loads it, then `child::start_init_thread` claims a pool slot
+(`x86_claim_slot`, tid >= 1), stamps its ring row and task record the way a fork child's are (`bind_child_task`, record `tid + 1`, depth
+1), registers a `Process` with pid 1 (`register_shell_process`, so `fork_process` finds a caller), seeds the thread to cross into ring 3
+at the image's entry and publishes it. The boot thread is adopted as pool slot 0 (`x86_adopt_running_thread(0)`, as amd64 does) and
+parks in a loop that reports init's exit through `task_done`. Consequences: init can `fork`/`clone` (every non-thread `clone` is
+`fork_arm_real`) and is preempted by the tick, so `sshd` built with `fork-sessions` + `libakuma/linux-abi` runs one forked process per ssh
+session; the private SPAWN model (the cooperative sshd) is no longer reachable from init. The fresh thread names its own slot current
+before crossing (`init_thread_entry`): the crate does not do it for a seeded entry. Slice S1 of `switch-to-crates.md`.

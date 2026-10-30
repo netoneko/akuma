@@ -589,6 +589,12 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     unsafe { akuma_ring3_amd64::enter_user(&ef) }
 }
 
+/// Enter ring 3 for the thread running now from a captured context: [`twin_enter_user`] for the init thread, which has no
+/// parent to fork it (`child::start_init_thread`).
+pub(crate) fn enter_user_ctx(ctx: &akuma_exec::process::UserContext) -> ! {
+    twin_enter_user(ctx)
+}
+
 fn exec_config() -> ExecConfig {
     // Mirrors amd64's `config()` where the fact is the machine's, this
     // kernel's numbers where they are ours. Nothing reads these today (no

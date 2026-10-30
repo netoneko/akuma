@@ -4639,7 +4639,7 @@ fn run_program(i: usize) -> ! {
 /// syscall stack inside the dying task's dispatcher frame; the stack the
 /// stub parked is abandoned with the task (the stub restarts at its top on
 /// the next task's first syscall).
-fn task_done(code: u64) -> ! {
+pub(crate) fn task_done(code: u64) -> ! {
     let (i, n, prog) = PROGRAMS.with_mut(|t| {
         t.exit_codes[t.current] = code;
         (t.current, t.count, t.list[t.current])
@@ -5197,6 +5197,10 @@ fn spawn(p: &Prog, image: &[u8]) -> ! {
     console::puts("Taoxichuan: entering ring 3 -- ");
     console::puts(path);
     console::puts("\n");
+    // Init is pid 1 on a real pool thread (a tid >= 1, a ring row, a registered `Process`), the way amd64's `run_init`
+    // starts it, not on the boot stack: that is what lets it `fork`/`clone` and be preempted, so `sshd` runs one forked process
+    // per session (`docs/reference/switch-to-crates.md` S1). The boot thread parks in `start_init_thread` and reports init's exit.
+    child::start_init_thread(path, &ti);
     // SAFETY: one documented control-register write; interrupts are masked,
     // one core, and the root was built entirely before this line.
     unsafe {
