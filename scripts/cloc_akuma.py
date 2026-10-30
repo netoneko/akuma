@@ -1983,7 +1983,13 @@ def linux_audit(srctree: str, objtree: str):
     for obj, files in linux_cmd_files(objtree):
         bucket = host if obj.startswith(LINUX_HOST_PREFIXES) else image
         for f in files:
+            # A relative dep is usually objtree-relative (generated headers), but
+            # some rules (objtool's `arch/x86/decode.c`) record a srctree-relative one.
             full = os.path.normpath(f if os.path.isabs(f) else os.path.join(objtree, f))
+            if not os.path.isabs(f) and not os.path.exists(full):
+                full = os.path.normpath(os.path.join(srctree, f))
+            if not os.path.isfile(full):
+                continue
             if os.path.splitext(full)[1] in LINUX_LANGS and full.startswith((srctree, objtree)):
                 bucket.add(full)
     host -= image
