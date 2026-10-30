@@ -40,3 +40,70 @@ what Rust was sold as, not on specific functions or technical problems.
   [`MINIMAL_SELF_HOSTING_EXPERIMENT.md`](MINIMAL_SELF_HOSTING_EXPERIMENT.md) —
   has a "Measurements to take before the talk" checklist; its numbers are
   derived until re-measured on a clean tag.
+
+## Facts to consider (measured 2026-10-30)
+
+Information, not a storyline. Measured on `rust-org-il-experiment` @ `9f1e333f` plus the
+working tree (which held uncommitted taoxichuan work by another agent), with
+`scripts/cloc_akuma.py --audit` — method in
+[`AUDIT_SURFACE_METHODOLOGY.md`](AUDIT_SURFACE_METHODOLOGY.md). "Audit lines" = code lines
+rustc read for the exact build, minus `#[cfg]`-false and test-only items; comments and blanks
+never count. Re-measure on a clean tag before quoting: the taoxichuan numbers move daily.
+
+**Composition**
+
+- taoxichuan adds **7,674 lines** on top of an Akuma host: akuma-amd64 alone is 151,235 audit
+  lines, the two together 158,909. **91%** of taoxichuan's live lines (77,090 of 84,761) are
+  already live in the host, including all 41,748 of its third-party lines.
+- taoxichuan's own crate is **7.8%** of its image (6,652 of 84,761); the rest is 54 workspace
+  crates and 22 crates.io crates.
+- The aarch64 kernel's own crate is **80** live lines; everything else is composed.
+- A third of what the compiler reads is compiled out: 127,706 lines in, 84,761 live. smoltcp
+  alone loses 47% (IPv6, 6LoWPAN, 802.15.4 sit in the same files).
+
+**`unsafe`**
+
+- **zerocopy has more `unsafe` lines (743) than all 54 workspace crates in the guest together
+  (738).** Akuma names zerocopy in exactly two function signatures
+  (`crates/akuma-virtio/src/transport.rs`, `read_config_space`/`write_config_space`), whose
+  four trait bounds virtio-drivers' `Transport` trait requires. The linked ELF has **0**
+  zerocopy symbols: it is all generic code, inlined. (Fair note: that `unsafe` is the crate's
+  purpose, transmute proofs in one place, checked with Kani and Miri.)
+- Third-party code is **49%** of the guest's lines and **67%** of its `unsafe` lines (1,872 of
+  2,812).
+- The allocator (`akuma-alloc`, 267 `unsafe` lines) has more `unsafe` than the kernel crate
+  (taoxichuan, 202).
+- A crate named `safe-mmio` contributes **168** `unsafe` lines (via virtio-drivers).
+- 41 of the guest's 77 crates have zero `unsafe` lines; together they hold 41,476 of the
+  84,761 lines.
+
+**Dead weight and oddities**
+
+- A **device-tree parser** is in the x86 PVH guest, which has no device tree: `fdt` (914 lines)
+  arrives through `akuma-mmu -> akuma-fdt`. 0 symbols in the ELF (the linker drops it), but it
+  is still source in the image's dependency set.
+- **Two `bitflags` major versions** ship in one image: 1.3.2 via smoltcp, 2.13.1 via
+  virtio-drivers. virtio-drivers also brings `thiserror` into a `no_std` kernel.
+- **`syn` alone (20,716 lines) is 3x taoxichuan's own code**, and never runs in the guest. All
+  build-time host code (proc-macros, build scripts, their dependencies) is 31,743 lines, 37% the
+  size of the image.
+
+**The experiment** (git and
+[`MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md`](MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md))
+
+- 200 commits to `taoxichuan/` in 6.3 days (2026-10-24 to 10-30). Own code grew 2,246 -> 6,964
+  production lines while direct `akuma-*` dependencies went 16 -> 34.
+- `git blame` of `taoxichuan/src` at HEAD (non-blank, non-comment lines): 68.5% from commits
+  named after goose sessions (s1...s8q, slices 1-3) that carry the user's identity and no AI
+  trailer (git alone cannot prove they are goose-glm's); 31.4% from Claude Sonnet 5.5 commits,
+  2,057 of them written on 10-30 alone; 32% of today's lines date from day one (10-24).
+- Cost per tool call grows with session length: about 19k tokens under 40 calls, about 105k at
+  130+. Six long sessions burned 71% of all tokens.
+- Cost per milestone fell from 20-28M tokens to 5-11M after the methodology change; the
+  cheapest was the process-model plan at 1.5M.
+- About one brief in two carried a wrong premise, and goose's survey caught every one.
+- The KVM host carried ~2,700 tool calls' worth of guest boots, faults and kills with no
+  guest-caused host crash (to 2026-10-26).
+
+**Linux comparison:** pending — `scripts/linux_audit_surface.sh` (firecracker / minimal /
+host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.
