@@ -2574,7 +2574,7 @@ fn trace_err(nr: u64, r: u64, a1: u64, a2: u64, a3: u64) {
     // EFAULT is never capped away: it is the answer a bad user range gets.
     let always = v == -14;
     if (-4095..0).contains(&v) && v != -11 && v != -2 && v != -10 && v != -25
-        && v != -38 && v != -47 && v != -110
+        && v != -47 && v != -110
         && (always
             || (nr as usize) < SEEN.len()
                 && SEEN[nr as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 40)
