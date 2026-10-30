@@ -211,7 +211,12 @@ adds one for a single driver. It is opened by the kernel's own `openat` arm like
   (`akuma_vm_spec::arena`, first fit, zeroed when carved). **A request that does not fit is refused**
   (`[KVM] linux: refused: guest RAM does not fit the kvmmem= reserve`), never retried from the page
   allocator; without `kvmmem=` the page allocator is used, as it always was. Guest RAM is bounded at
-  1 GiB by the nested page table (one directory of 2 MiB leaves) and the Akuma guest needs ≥ 768 MiB.
+  4 GiB by the nested page table (`akuma_svm_amd64::rammap`): the map is flat to 3 GiB, then it splits
+  the way a PC's does at the PCI hole — the 3..4 GiB band holds the device windows (virtio-mmio at
+  `0xD000_0000`, the local APIC page at `0xFEE0_0000`) and stays unmapped, and RAM past 3 GiB moves
+  above 4 GiB. The NPT allocates one directory page of 512 2 MiB leaves per GiB that holds RAM (at
+  4 GiB: four directories, 16 KiB more than the one page of the 1 GiB NPT), the PVH memory map reports
+  the two extents with the window as the gap, and the Akuma guest needs ≥ 768 MiB.
 - **Cores (`kvmcores=<list>`, spec `vm_cores`).** `kvmcores` is the machine's allowed set (default core 0), `vm_cores`
   the VM's own mask (default: everything allowed); `akuma_vm_spec::cores::place` puts virtual processor `i` on the
   `i`-th usable core of the intersection (wrapping: processors sharing a core take turns, as before placement). The
@@ -258,7 +263,7 @@ core keeps it until its next switch-out, after which it can only be placed elsew
 | `vm_type` | `kvm` (default) or `firecracker` (reserved: parses, the service is not loaded; a Firecracker VM runs as an ordinary `command =` service against `/dev/kvm`, see above) |
 | `vm_kernel`, `vm_cmdline` | kernel image (an Akuma ELF), the guest command line tail (rest of the line) |
 | `vm_cores` | host cores for the vCPUs (`2,4`), within `kvmcores=` |
-| `vm_ram_mib`, `vm_vcpus` | 16–1024 (default 768), 1–4 (default 1) |
+| `vm_ram_mib`, `vm_vcpus` | 16–4096 (default 768), 1–4 (default 1); above 3 GiB the guest's RAM is two extents around the device window (`0xC000_0000`–`0x1_0000_0000`), which the memory map reports |
 | `vm_disk`, `vm_disk_ram` | image path, or `/dev/nvme0n1p<N>` (that partition in place; never with `vm_disk_ram`); empty: the machine's second virtio-blk. `vm_disk_ram` copies an image into RAM at start |
 | `vm_forward` | `host:guest`, repeatable up to four |
 | `vm_outbound` | `true`: the guest's TCP connections and DNS queries leave through the host (default off: no route out) |
@@ -321,7 +326,10 @@ what is unconfirmed: [`../../archive/AKUMA_FIRECRACKER_KVM.md`](../../archive/AK
 - **Guest RAM is a slice of the `kvmmem=` reserve, remapped into the VMM.** `SET_USER_MEMORY_REGION` carves a 2 MiB-aligned
   slice (zeroed), copies the VMM's range into it and moves the VMM's PTEs onto it; the leaves are *borrowed* (not in the
   frame ledger, no share count: `munmap`/exit/`fork` never free them) and the NPT is the same 2 MiB-leaf table `kvm0` builds.
-  No `kvmmem=` or no room: `ENOMEM`. Guest RAM <= 1 GiB, regions 2 MiB aligned, a slot is set once, no dirty logging.
+  No `kvmmem=` or no room: `ENOMEM`. Guest RAM is bounded as `kvm0`'s is — up to 4 GiB, laid out by
+  `akuma_svm_amd64::rammap`: a slot may sit below or above the 3..4 GiB device window, never in or across it
+  (ending exactly at the window's base is RAM up to the window, and allowed); regions 2 MiB aligned, a slot is set
+  once, no dirty logging. The NPT allocates one directory page per GiB a slot covers, built once at the first `RUN`.
   **A VMM that forks after `CREATE_VM` is logged** (`[kvmapi] WARNING`), not prevented: the child would CoW-share frames
   the guest writes through.
 - **`KVM_RUN` is the VMM thread's syscall.** The thread is pinned for the run to its vCPU's core (`sched::repin_current`; SVM enabled on

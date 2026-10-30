@@ -4,7 +4,8 @@
 the M2 blocking arm still serves `clone`, and both shapes share one ring).
 
 Two process mechanisms coexist, both indexed by the same spawn ring
-(`SpawnSlot`, `NSLOTS = 12` — the shell's slot 0 plus eleven threading tids;
+(`SpawnSlot`, `NSLOTS = 48` — the shell's slot 0 plus 47 threading tids;
+the ring was 12 until the first `cargo build` filled it, now 48:
 on this kernel **the tid and the ring index are the same number by
 construction**: `bind_child_task` stamps by tid, `switch_to`/`task()` index
 the same arrays):
@@ -137,7 +138,7 @@ stranger's, and never parks on one.**
   M-gates and the bridge's reaper do not move. An orphan whose parent died is
   unreapable here: the crate reparents to init, and this kernel has no init
   reaper — the honest no-init answer (one slot row per abandoned grandchild,
-  harmless at NSLOTS=12).
+  harmless at the 48-slot ring).
 - A second wait on a reaped pid is ECHILD (how a shell's job table closes the
   entry). WNOHANG answers 0 while the matched children still run.
 - Across the park, the task's user RSP is saved and restored by hand: the
@@ -178,6 +179,28 @@ shadow). The one-clock rule: `uptime_us` is `akuma_lapic_amd64::ticks()` ×
 10 ms for both tables, so the scheduler and `akuma-exec` cannot disagree about
 what time it is.
 
+## Session ids, the execve argument contract, and the fd floor
+
+- **Every task is its own session and group leader**: `setsid` succeeds and
+  returns the pid, `getsid`/`getpgid` answer the pid, `setpgid` accepts and
+  does nothing worth recording — there is no job control. `git` daemonises
+  with `setsid` and used to die with "Function not implemented" (112 served
+  2026-10-30). `getppid` is 1, `gettid` is the threading slot.
+- **The `execve` argument block** (`read_spawn_args`,
+  [`memory.md`](memory.md) § allocation): 448 `argv` / 256 `envp` entries, one
+  string up to 32 KiB, `argv + envp <= 512`, and a total-bytes guard —
+  every overrun answers `E2BIG`, as Linux's does; a non-UTF-8 argument still
+  answers `EFAULT` because the loader path carries `&str`. One heavy `rustc`
+  call carries 344 arguments and a 5,192-byte string; the loader's argument
+  block is 12 pages.
+- **The fd floor honours closed std fds**: a task that `close(0)`s and has not
+  re-bound the slot remembers it (`Task.std_closed`, copied on fork), and
+  `new_fd_min()` hands the lowest closed std fd out first, else 3 — so
+  `close(0); open("/dev/null")` returns 0, which busybox ash's every
+  background job (`cmd &`) depends on. `open`, `socket`, `accept`, `pipe2` and
+  `socketpair` all allocate from there; a re-bound std fd closes like any
+  other fd.
+
 ## Background
 
 `docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md` (the model),
@@ -196,4 +219,4 @@ pipeline deadlock root causes, the real fork, parked wait4),
 - **Faults.** A ring-3 fault in a real fork child or thread ends that task alone with wait status SIGSEGV (`rc=139`); the shell and the boot task still halt (they have no slot to reap through).
 - **The spawn crossing marks its pool slot RUNNING around `child_enter` and TERMINATED after.** Without it the picker never takes the slot (`INITIALIZING`), and the first preempting tick parked the spawn forever (deterministic under TCG).
 - **Sockets** are closed by the last fd referencing them across all task records (`sock::socket_refs`); an exiting task releases its sockets.
-- **Known limit:** after about 15 spawns in one boot `fork` can fail with "Failed to allocate x86 task stacks" (the claim picks a slot at or above the 12-slot ring); it dies with the ring in `switch-to-crates.md` S3.
+- **Known limit:** enough spawns in one boot leak a kernel+trap band each until a claim picks a slot at or above the ring (`"Failed to allocate x86 task stacks"`); the 12-slot ring failed after ~15 spawns, the 48-slot ring scales the same leak (not re-measured). It dies with the ring in `switch-to-crates.md` S3.

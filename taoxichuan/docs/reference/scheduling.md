@@ -119,6 +119,19 @@ instead of a bare `pause`/`spin_loop` (session ph: boot ph-6's P3 stall was
 constraint). The one exception is deliberate: the calibrator's PIT gate poll
 keeps the bare pause, because an `hlt` would skew the TSC window it measures.
 
+## The wall clock
+
+`net::calibrate` measures the TSC against the 8254 PIT (a 50 ms poll of the
+port 0x61 gate). When the gate never moves — a KVM machine has **no PIT
+behind port 0x61** — `net::use_lapic_rate` takes the rate the LAPIC timer
+calibration already measured (`akuma-lapic-amd64::tsc_hz()`); the fixed
+2,500 cyc/us guess remains only for a kernel where the LAPIC crate has not
+run. On the 3.79 GHz ryzen the guess alone ran the wall clock 1.52x fast; a
+current boot prints `calibrated <N> cyc/us` and `sleep 20` measures 20 s.
+Both the tick clock and the syscall-answer clock above are TSC-derived; the
+extraction plan (`docs/archive/TAOXICHUAN_CRATE_EXTRACTION_PLAN.md`, X2)
+moves both onto one `akuma-primitives::clock` source set at init.
+
 ## The hooks
 
 `exec_twin` registers `X86ArchHooks`; all slice-2/3 arms are real now:

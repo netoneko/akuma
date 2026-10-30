@@ -1340,6 +1340,152 @@ pub mod tables {
     }
 }
 
+/// Where a guest's RAM sits in guest-physical space, and what the nested page table
+/// needs to cover it.
+///
+/// Up to 3 GiB a guest is laid out flat, as it always was: guest-physical `g` is host
+/// frame `base + g`. A bigger guest cannot be flat: the band 3..4 GiB holds the device
+/// windows (the virtio-mmio page at `0xD000_0000`, the local APIC page at `0xFEE0_0000`),
+/// and RAM laid across the band would map over them. So the map splits the way a real
+/// PC's splits at the PCI hole: RAM past 3 GiB moves above 4 GiB and the band stays
+/// unmapped. The nested page table follows the map: one directory page of 512 2 MiB
+/// leaves per GiB of guest-physical space, allocated only for the GiBs that hold RAM —
+/// the window's GiB gets no directory, so a guest that touches it takes a nested page
+/// fault and the run stops there, naming the address.
+///
+/// Everything here is pure: the map and the leaf placement are decisions, host-tested;
+/// the kernel's `FreshFrame` allocation and the `VMRUN` itself stay in `amd64/src/kvm*`.
+pub mod rammap {
+    use crate::npt::leaf_2m;
+
+    /// 2 MiB leaf size (and the alignment of every RAM extent).
+    pub const LEAF: u64 = 1 << 21;
+    /// What one directory page of 512 leaves covers.
+    pub const DIR_COVER: u64 = 1 << 30;
+    /// The device window: the virtio-mmio page at `0xD000_0000` and the local APIC page
+    /// at `0xFEE0_0000` both sit in `[WINDOW, WINDOW + DIR_COVER)`.
+    pub const WINDOW: u64 = 3 << 30;
+    /// The most RAM [`plan`] lays out: 3 GiB below the window and 1 GiB above it.
+    pub const MAX_BYTES: u64 = 4 << 30;
+    /// Directory slots the NPT over [`MAX_BYTES`] needs (three below the window, the
+    /// window's, one above); at most four are ever allocated — the window's stays absent.
+    pub const MAX_DIRS: usize = 5;
+
+    /// One RAM extent in guest-physical space (2 MiB aligned).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Range {
+        pub gpa: u64,
+        pub bytes: u64,
+    }
+
+    /// The RAM shape for one guest: [`low`](Map::low) is never empty, [`high`](Map::high)
+    /// is empty unless the RAM crossed the window.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Map {
+        pub low: Range,
+        pub high: Range,
+        /// The whole RAM (`low.bytes + high.bytes`).
+        pub bytes: u64,
+    }
+
+    /// The map for `bytes` of guest RAM (a 2 MiB multiple, at most [`MAX_BYTES`]): flat
+    /// at 0 up to the window, then `[0, 3 GiB)` and `[4 GiB, 4 GiB + bytes - 3 GiB)`.
+    #[must_use]
+    pub const fn plan(bytes: u64) -> Option<Map> {
+        if bytes == 0 || bytes % LEAF != 0 || bytes > MAX_BYTES {
+            return None;
+        }
+        if bytes <= WINDOW {
+            Some(Map { low: Range { gpa: 0, bytes }, high: Range { gpa: 0, bytes: 0 }, bytes })
+        } else {
+            Some(Map {
+                low: Range { gpa: 0, bytes: WINDOW },
+                high: Range { gpa: WINDOW + DIR_COVER, bytes: bytes - WINDOW },
+                bytes,
+            })
+        }
+    }
+
+    /// The PDPT slot (the GiB of guest-physical space) `gpa` falls in.
+    #[must_use]
+    pub const fn slot(gpa: u64) -> usize {
+        (gpa >> 30) as usize
+    }
+
+    impl Map {
+        /// The top of guest-physical RAM: the handoff pages sit under this.
+        #[must_use]
+        pub const fn top(&self) -> u64 {
+            if self.high.bytes != 0 { self.high.gpa + self.high.bytes } else { self.low.bytes }
+        }
+
+        /// The host-physical address of guest-physical `gpa` in the contiguous block at
+        /// `base`: identity below the window, then the block continues above it. None in
+        /// the window or past RAM.
+        #[must_use]
+        pub const fn host(&self, base: u64, gpa: u64) -> Option<u64> {
+            if gpa < self.low.bytes {
+                Some(base + gpa)
+            } else if self.high.bytes != 0
+                && gpa >= self.high.gpa
+                && gpa - self.high.gpa < self.high.bytes
+            {
+                Some(base + self.low.bytes + (gpa - self.high.gpa))
+            } else {
+                None
+            }
+        }
+
+        /// Does any 2 MiB leaf of the GiB whose base is `gpa` map RAM? Ranges start
+        /// GiB-aligned, so the answer is whether the base itself is in a range.
+        #[must_use]
+        pub const fn covers(&self, gpa: u64) -> bool {
+            self.host(0, gpa).is_some()
+        }
+    }
+
+    /// A little-endian `u64` into a table page (the crate's `wr64` names a whole VMCB
+    /// page; a directory page here is just bytes).
+    fn wr64(buf: &mut [u8], off: usize, v: u64) {
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Fill one directory page — the PDPT slot `dir` — with the 2 MiB leaves of `m`
+    /// backed by the block at `base`. Entries of the window and of GiBs the map does not
+    /// reach stay zero (absent).
+    pub fn fill_directory(buf: &mut [u8], m: Map, base: u64, dir: usize) {
+        for i in 0..512 {
+            let gpa = ((dir as u64) << 30) | ((i as u64) << 21);
+            if let Some(host) = m.host(base, gpa) {
+                wr64(buf, i * 8, leaf_2m(host));
+            }
+        }
+    }
+
+    /// Fill one directory page — the PDPT slot `dir` — with the 2 MiB leaves of a
+    /// guest-memory slot `[gpa, gpa + bytes)` backed at `host` (the `/dev/kvm` API path,
+    /// whose slots carry their own base). False for an unaligned or empty range, or one
+    /// that crosses the device window: the window is devices', not RAM's. The slot table
+    /// (`akuma_kvm_abi::slots`) refuses the same shapes before a slot is ever recorded,
+    /// so this only defends the leaf writer.
+    #[must_use]
+    pub fn fill_slot_directory(buf: &mut [u8], dir: usize, gpa: u64, bytes: u64, host: u64) -> bool {
+        if bytes == 0 || !gpa.is_multiple_of(LEAF) || !bytes.is_multiple_of(LEAF) {
+            return false;
+        }
+        if gpa < WINDOW + DIR_COVER && gpa + bytes > WINDOW {
+            return false;
+        }
+        for i in 0..512 {
+            let g = ((dir as u64) << 30) | ((i as u64) << 21);
+            if g >= gpa && g - gpa < bytes {
+                wr64(buf, i * 8, leaf_2m(host + (g - gpa)));
+            }
+        }
+        true
+    }
+}
+
 /// The ELF64 image, as far as a loader needs to see it: the `PT_LOAD`
 /// segments and the note that names a PVH 32-bit entry point.
 ///
@@ -1915,27 +2061,36 @@ pub mod pvh {
 
     /// Where the handoff blobs live in guest RAM: one 4-KiB page each,
     /// packed directly under `top_gpa` (the top of guest RAM), above
-    /// anything a loader places.
+    /// anything a loader places. The RAM extents the memory map reports
+    /// stop short of them.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Layout {
         pub cmdline_gpa: u64,
         pub memmap_gpa: u64,
         pub start_gpa: u64,
-        /// The RAM extent the memory map reports.
+        /// The low RAM extent the memory map reports.
         pub ram_base: u64,
         pub ram_len: u64,
+        /// The RAM extent above the device window (`rammap::WINDOW`); `ram_hi_len == 0`
+        /// when the guest has none (RAM of 3 GiB or less is one flat extent).
+        pub ram_hi_base: u64,
+        pub ram_hi_len: u64,
     }
 
-    /// The layout: three pages under `top_gpa`, one RAM entry covering
-    /// `[ram_base, ram_base + ram_len)`.
+    /// The layout: three pages under `top_gpa`, RAM entries covering
+    /// `[ram_base, ram_base + ram_len)` and — when the RAM crossed the device window —
+    /// `[ram_hi_base, ram_hi_base + ram_hi_len)`. `top_gpa` is the top of the *upper*
+    /// extent when there is one; every handoff page and the ACPI page sit under it.
     #[must_use]
-    pub const fn plan(top_gpa: u64, ram_base: u64, ram_len: u64) -> Layout {
+    pub const fn plan(top_gpa: u64, ram_base: u64, ram_len: u64, ram_hi_base: u64, ram_hi_len: u64) -> Layout {
         Layout {
             cmdline_gpa: top_gpa - 0x3000,
             memmap_gpa: top_gpa - 0x2000,
             start_gpa: top_gpa - 0x1000,
             ram_base,
             ram_len,
+            ram_hi_base,
+            ram_hi_len,
         }
     }
 
@@ -1953,28 +2108,41 @@ pub mod pvh {
         wr32(buf, F_RESERVED, 0);
     }
 
-    /// Write the one-entry memory map into the `memmap_gpa` page.
+    /// Write the memory map into the `memmap_gpa` page: the RAM entry (two when the
+    /// RAM crossed the device window), low extent first. Later entries (`add_acpi`)
+    /// come after these.
     pub fn write_memmap(buf: &mut [u8], l: &Layout) {
         wr64(buf, E_ADDR, l.ram_base);
         wr64(buf, E_SIZE, l.ram_len);
         wr32(buf, E_TYPE, MEMMAP_RAM);
         wr32(buf, E_RESERVED, 0);
+        let entries = if l.ram_hi_len == 0 {
+            1
+        } else {
+            wr64(buf, MEMMAP_ENTRY_SIZE + E_ADDR, l.ram_hi_base);
+            wr64(buf, MEMMAP_ENTRY_SIZE + E_SIZE, l.ram_hi_len);
+            wr32(buf, MEMMAP_ENTRY_SIZE + E_TYPE, MEMMAP_RAM);
+            wr32(buf, MEMMAP_ENTRY_SIZE + E_RESERVED, 0);
+            2
+        };
+        wr32(buf, F_ENTRIES, entries);
     }
 
     /// `hvm_memmap_table_entry.type` = ACPI tables (reclaimable).
     pub const MEMMAP_ACPI: u32 = 3;
 
-    /// Add an ACPI-tables entry `[gpa, gpa + len)` as entry 1 of the memory map.
-    ///
-    /// Also points `start_buf`'s `rsdp_paddr` at `rsdp_gpa`; the start_info then
-    /// reports two entries. Entry 0 ([`write_memmap`]'s RAM) must not overlap it.
+    /// Add an ACPI-tables entry `[gpa, gpa + len)` after the RAM entries of the memory
+    /// map (which names its own entry count), and point `start_buf`'s `rsdp_paddr` at
+    /// `rsdp_gpa`. The RAM entries must not overlap it.
     pub fn add_acpi(start_buf: &mut [u8], memmap_buf: &mut [u8], rsdp_gpa: u64, gpa: u64, len: u64) {
-        wr64(memmap_buf, MEMMAP_ENTRY_SIZE + E_ADDR, gpa);
-        wr64(memmap_buf, MEMMAP_ENTRY_SIZE + E_SIZE, len);
-        wr32(memmap_buf, MEMMAP_ENTRY_SIZE + E_TYPE, MEMMAP_ACPI);
-        wr32(memmap_buf, MEMMAP_ENTRY_SIZE + E_RESERVED, 0);
+        let n = rd32(memmap_buf, F_ENTRIES) as usize;
+        let at = n * MEMMAP_ENTRY_SIZE;
+        wr64(memmap_buf, at + E_ADDR, gpa);
+        wr64(memmap_buf, at + E_SIZE, len);
+        wr32(memmap_buf, at + E_TYPE, MEMMAP_ACPI);
+        wr32(memmap_buf, at + E_RESERVED, 0);
         wr64(start_buf, F_RSDP, rsdp_gpa);
-        wr32(start_buf, F_ENTRIES, 2);
+        wr32(start_buf, F_ENTRIES, (n + 1) as u32);
     }
 
     /// Write the NUL-terminated command line into the `cmdline_gpa` page;
@@ -1986,6 +2154,10 @@ pub mod pvh {
         buf[..cmdline.len()].copy_from_slice(cmdline.as_bytes());
         buf[cmdline.len()] = 0;
         true
+    }
+
+    fn rd32(buf: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(buf[off..off + 4].try_into().expect("a u32 sits inside the page"))
     }
 
     fn wr32(buf: &mut [u8], off: usize, v: u32) {
@@ -3085,7 +3257,7 @@ mod tests {
         assert_eq!(pvh::START_SIZE, 56);
         assert_eq!(pvh::MEMMAP_ENTRY_SIZE, 24);
 
-        let l = pvh::plan(0x1000_0000, 0, 0xFF00_0000);
+        let l = pvh::plan(0x1000_0000, 0, 0xFF00_0000, 0, 0);
         assert_eq!(l.cmdline_gpa, 0x1000_0000 - 0x3000);
         assert_eq!(l.memmap_gpa, 0x1000_0000 - 0x2000);
         assert_eq!(l.start_gpa, 0x1000_0000 - 0x1000);
@@ -3141,7 +3313,7 @@ mod tests {
             }
         }
 
-        let l = pvh::plan(0x0800_0000, 0, 0x0800_0000 - 0x3000);
+        let l = pvh::plan(0x0800_0000, 0, 0x0800_0000 - 0x3000, 0, 0);
         let mut g = Guest {
             pages: [(l.start_gpa, [0; 4096]), (l.memmap_gpa, [0; 4096]), (l.cmdline_gpa, [0; 4096])],
         };
@@ -3188,7 +3360,7 @@ mod tests {
                 })
             }
         }
-        let l = pvh::plan(TOP, 0, TOP - 0x4000);
+        let l = pvh::plan(TOP, 0, TOP - 0x4000, 0, 0);
         let acpi_gpa = TOP - 0x4000;
         #[allow(clippy::large_stack_arrays, reason = "four guest pages in a test")]
         let mut g = Guest {
@@ -3221,5 +3393,141 @@ mod tests {
         let d = dsdt(&g, &rsdp).expect("DSDT through the FADT");
         assert_eq!(&d.signature, b"DSDT");
         assert_eq!(d.addr, acpi_gpa + acpi::DSDT_OFF as u64);
+    }
+
+    /// The RAM map: flat below the device window, split above it, and refused
+    /// elsewhere (`plan` is the decision the kernel's RAM and NPT builders both take).
+    #[test]
+    fn the_ram_map_splits_at_the_window_and_refuses_the_rest() {
+        assert_eq!(rammap::plan(0), None);
+        assert_eq!(rammap::plan((2 << 20) + 4096), None, "not a 2 MiB multiple");
+        assert_eq!(rammap::plan(rammap::MAX_BYTES + (2 << 20)), None, "past the ceiling");
+
+        let flat = rammap::plan(768 << 20).expect("the default guest lays out flat");
+        assert_eq!(flat.low.bytes, 768 << 20);
+        assert_eq!(flat.high.bytes, 0, "below the window there is one extent");
+        assert_eq!(rammap::plan(3 << 30).expect("3 GiB exactly").high.bytes, 0, "the window untouched");
+
+        let holed = rammap::plan((3 << 30) + (2 << 20)).expect("just over the window");
+        assert_eq!(holed.low.bytes, 3 << 30);
+        assert_eq!((holed.high.gpa, holed.high.bytes), (4 << 30, 2 << 20), "the excess moves above 4 GiB");
+
+        let m = rammap::plan(rammap::MAX_BYTES).expect("the ceiling lays out");
+        const BASE: u64 = 0x1_0000_0000;
+        assert_eq!(m.host(BASE, 0), Some(BASE));
+        assert_eq!(m.host(BASE, (3 << 30) - 1), Some(BASE + (3 << 30) - 1));
+        assert_eq!(m.host(BASE, 3 << 30), None, "the window is not RAM");
+        assert_eq!(m.host(BASE, (4 << 30) - 1), None);
+        assert_eq!(m.host(BASE, 4 << 30), Some(BASE + (3 << 30)), "the block continues above the window");
+        assert_eq!(m.host(BASE, m.top() - 1), Some(BASE + (4 << 30) - 1));
+        assert_eq!(m.host(BASE, m.top()), None, "past RAM");
+    }
+
+    /// The NPT for a 4096 MiB guest, walked the way the MMU walks it: every 2 MiB leaf
+    /// of the map maps exactly once to the right host frame, and the device window maps
+    /// nothing at all.
+    #[test]
+    #[allow(clippy::large_stack_arrays, reason = "seven synthetic table pages in a test")]
+    fn the_npt_maps_every_leaf_of_a_4096_mib_guest_and_nothing_in_the_window() {
+        const BASE: u64 = 0x1_0000_0000;
+        let m = rammap::plan(rammap::MAX_BYTES).expect("4096 MiB lays out");
+
+        #[allow(clippy::large_stack_arrays, reason = "seven synthetic table pages in a test")]
+        struct Pages([(u64, [u8; 4096]); 7]);
+        impl tables::PageSource for Pages {
+            fn read(&self, table_pa: u64, off: usize) -> u64 {
+                let (_, page) =
+                    self.0.iter().find(|(pa, _)| *pa == table_pa).expect("the walk stays in the table pages");
+                u64::from_le_bytes(page[off..off + 8].try_into().expect("an entry inside the page"))
+            }
+        }
+
+        #[allow(clippy::large_stack_arrays, reason = "seven synthetic table pages in a test")]
+        let mut pages = Pages([
+            (0, [0u8; 4096]),
+            (0x1000, [0u8; 4096]),
+            (0x2000, [0u8; 4096]),
+            (0x3000, [0u8; 4096]),
+            (0x4000, [0u8; 4096]),
+            (0x5000, [0u8; 4096]),
+            (0x6000, [0u8; 4096]),
+        ]);
+        wr64(&mut pages.0[0].1, 0, npt::pointer(0x1000));
+        for d in 0..rammap::MAX_DIRS {
+            let base_gpa = (d as u64) << 30;
+            if !m.covers(base_gpa) {
+                continue; // the device window's GiB: no directory, so nothing maps there
+            }
+            let dir = &mut pages.0[2 + d].1;
+            rammap::fill_directory(dir, m, BASE, d);
+            wr64(&mut pages.0[1].1, d * 8, npt::pointer((0x2000 + d * 0x1000) as u64));
+        }
+
+        let mut seen = [false; 2048]; // 4096 MiB / 2 MiB leaves
+        for gpa in (0..(5 << 30)).step_by(2 << 20) {
+            match tables::walk(&pages, 0, gpa) {
+                Ok(leaf) => {
+                    assert_eq!(leaf.shift, 21, "a 2 MiB leaf at {gpa:#x}");
+                    let host = m.host(BASE, gpa).expect("only RAM leaves walk to a leaf");
+                    assert_eq!(leaf.pa(gpa), host, "the right host frame at {gpa:#x}");
+                    let idx = ((host - BASE) >> 21) as usize;
+                    assert!(!seen[idx], "block offset {idx} mapped twice");
+                    seen[idx] = true;
+                }
+                Err(_) => assert!((3 << 30..4 << 30).contains(&gpa), "unmapped outside the window at {gpa:#x}"),
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "every one of the 2048 leaves mapped exactly once");
+    }
+
+    /// The `/dev/kvm` API path's leaf writer: a slot above the device window fills only
+    /// its own leaves, and a slot that crosses (or sits in) the window is refused.
+    #[test]
+    fn a_slot_across_the_device_window_is_refused() {
+        let mut page = [0u8; 4096];
+        assert!(!rammap::fill_slot_directory(&mut page, 0, (3 << 30) - (4 << 20), 6 << 20, 0), "ends inside the window");
+        assert!(!rammap::fill_slot_directory(&mut page, 0, (3 << 30) - (2 << 20), 4 << 20, 0), "crosses the window");
+        assert!(!rammap::fill_slot_directory(&mut page, 0, 3 << 30, 2 << 20, 0), "inside the window");
+        assert!(rammap::fill_slot_directory(&mut page, 0, (3 << 30) - (2 << 20), 2 << 20, 0), "up to the window's edge is RAM");
+        assert!(!rammap::fill_slot_directory(&mut page, 0, (2 << 20) + 4096, 2 << 20, 0), "unaligned");
+        assert!(!rammap::fill_slot_directory(&mut page, 0, 0, 0, 0), "empty");
+
+        assert!(rammap::fill_slot_directory(&mut page, 4, 4 << 30, 2 << 20, 0x2_0000_0000));
+        let e0 = u64::from_le_bytes(page[0..8].try_into().unwrap());
+        assert_eq!(e0 & !0xFFF, 0x2_0000_0000, "gpa 4 GiB maps the slot's base");
+        assert_eq!(u64::from_le_bytes(page[8..16].try_into().unwrap()), 0, "past the slot's size stays absent");
+    }
+
+    /// The memory map for a 4096 MiB guest: two RAM entries around the device window,
+    /// summing to the RAM less the handoff pages, with the window as the named gap —
+    /// and the ACPI entry appended after both.
+    #[test]
+    fn the_memory_map_for_4096_mib_names_the_hole_and_sums_to_the_ram() {
+        const RAM: u64 = 4096 << 20;
+        let m = rammap::plan(RAM).expect("lays out");
+        let top = m.top();
+        let l = pvh::plan(top, 0, m.low.bytes, m.high.gpa, m.high.bytes - 0x3000);
+
+        let mut page = [0u8; 4096];
+        pvh::write_memmap(&mut page, &l);
+        let entry = |page: &[u8], i: usize| {
+            let at = i * 24;
+            (
+                u64::from_le_bytes(page[at..at + 8].try_into().unwrap()),
+                u64::from_le_bytes(page[at + 8..at + 16].try_into().unwrap()),
+                u32::from_le_bytes(page[at + 16..at + 20].try_into().unwrap()),
+            )
+        };
+        assert_eq!(&page[0x30..0x34], &2u32.to_le_bytes(), "two RAM entries");
+        assert_eq!(entry(&page, 0), (0, 3 << 30, 1));
+        assert_eq!(entry(&page, 1), (4 << 30, (1 << 30) - 0x3000, 1));
+        assert_eq!(entry(&page, 0).1 + entry(&page, 1).1, RAM - 0x3000, "usable RAM: the size less the handoff pages");
+        assert_eq!(entry(&page, 1).0 - (entry(&page, 0).0 + entry(&page, 0).1), 1 << 30, "the gap is exactly the device window");
+
+        let mut start = [0u8; 4096];
+        pvh::write_start(&mut start, &l);
+        pvh::add_acpi(&mut start, &mut page, 0xDEAD_0000, top - 0x4000, 0x1000);
+        assert_eq!(&start[0x30..0x34], &3u32.to_le_bytes(), "the ACPI entry came after both RAM entries");
+        assert_eq!(entry(&page, 2), (top - 0x4000, 0x1000, 3));
     }
 }

@@ -69,11 +69,11 @@ close, dup_to, fork_copy, the flag sets; this kernel supplies the effects).
 | 7 | poll | `poll_arm` (sock.rs) | `fd_events` probe; NIC pumped per lap | ≤64 fds; timeout caps at 60 s |
 | 8 | lseek | dispatch LSEEK (main.rs) | fdtable kind | files seek; dirs move the cursor; others ESPIPE |
 | 9 | mmap | dispatch MMAP (main.rs) | this kernel (placement) | anon + MAP_PRIVATE file fill; no CoW |
-| 10 | mprotect | dispatch (main.rs) | — | accepted no-op |
-| 11 | munmap | dispatch (main.rs) | — | accepted no-op (slabs outlive the task) |
+| 10 | mprotect | `mprotect_arm` (main.rs) | PTE re-map under the W^X rule; `cow_privatize` before a shared frame goes RW | real (2026-10-30); `PROT_NONE` still not enforced ([`gaps.md`](../gaps.md)) |
+| 11 | munmap | `munmap_arm` (main.rs) | `release_pages` returns the span and drops its frames; the brk/mmap cursors survive | real (2026-10-30); slabs outlive the task |
 | 12 | brk | dispatch BRK (main.rs) | this kernel | grows by mapping; shrink is bookkeeping; failure returns the old break |
-| 13 | rt_sigaction | dispatch (main.rs) | — | accepted no-op: no signal delivery exists to register against |
-| 14 | rt_sigprocmask | dispatch (main.rs) | — | accepted no-op, same reason |
+| 13 | rt_sigaction | `sigaction_arm` (main.rs) | `akuma-syscalls-signal` `SigTable`/wire: validates, stores, replies | real record-keeping; still no delivery |
+| 14 | rt_sigprocmask | `sigprocmask_arm` (main.rs) | the mask word is kept and read back; algebra = `akuma_syscalls_signal::procmask` | real (2026-10-30); SIGKILL/SIGSTOP unblockable; still no delivery |
 | 16 | ioctl | dispatch (main.rs) | — | `ENOTTY`: the console is a serial line, not a tty |
 | 17 | pread64 | dispatch (main.rs) | akuma-ext2 `read_at_by_inode` | fd position untouched (Linux contract) |
 | 19 | readv | dispatch READV (main.rs) | routes per iovec through `read_fd_arm` | stops at the first short transfer; error mid-vector returns bytes already moved |
@@ -119,7 +119,7 @@ close, dup_to, fork_copy, the flag sets; this kernel supplies the effects).
 | 158 | arch_prctl | dispatch (main.rs) | akuma-cpu msr (canonical-checked) | ARCH_SET_FS/GET_FS; SET_FS also stamps the slot's fs shadow ([`processes.md`](processes.md) § fs) |
 | 186 | gettid | dispatch (main.rs) | — | 1: one task |
 | 217 | getdents64 | dispatch (main.rs) | syscalls-linux dirent over the open-time cached listing | d_ino = 0; d_off is a monotonic cookie |
-| 218 | set_tid_address | dispatch (main.rs) | — | 1; nothing to clear |
+| 218 | set_tid_address | dispatch (main.rs) | stores the clear-child-tid word in the task's shared record | a thread's `exit` zeroes the word and wakes its joiner |
 | 228 | clock_gettime | dispatch (main.rs) | primitives::clock over TSC | REALTIME adds the epoch anchor; others boot-relative |
 | 230 | clock_nanosleep | dispatch (main.rs) | as nanosleep | both spellings, incl. the raw (sec, nanos) register pair |
 | 231 | exit_group | dispatch (main.rs) | as exit | nested child returns to the parent; boot tasks chain the program list |
@@ -139,14 +139,47 @@ close, dup_to, fork_copy, the flag sets; this kernel supplies the effects).
 | 292 | dup3 | dispatch (main.rs) | akuma-fdtable `dup_to` | O_CLOEXEC only; old==new → EINVAL |
 | 293 | pipe2 | `pipe2_arm` (pipes.rs) | akuma-pipes | O_CLOEXEC recorded; O_NONBLOCK recorded and vacuous |
 | 318 | getrandom | dispatch (main.rs) | net::rng_fill | RDRAND (checked via CPUID), SplitMix64 fallback, boot says which |
+| 46 | sendmsg | `sendmsg_arm` (sock.rs) | msghdr/iovec marshal (56-byte x86_64 layout) → akuma-net | full; no control messages |
+| 47 | recvmsg | `recvmsg_arm` (sock.rs) | same marshal back | source address for UDP; MSG_TRUNC on the small UDP buffers |
+| 53 | socketpair | `socketpair_arm` (pipes.rs) | akuma-pipes over the unix domain | AF_UNIX SOCK_STREAM; the dynamic linker's `cc` spawn needs it |
+| 74 | fsync | dispatch (main.rs) | akuma-vfs/ext2 | EBADF-checked; the ext2 write path is write-through, so the flush itself is a no-op (git's pack/idx fsync) |
+| 75 | fdatasync | dispatch (main.rs) | as fsync | same |
+| 80 | chdir | `chdir_to` (main.rs) | akuma-vfs walk; the cwd lives on the task record | inherited by fork children, reset to / on exec |
+| 81 | fchdir | `chdir_to` (main.rs) | fd must be a directory description | full |
+| 97 | getrlimit | `PRLIMIT64 \| 97` arm (main.rs) | RLIMIT_STACK = the 8 MiB stack ceiling; everything else unlimited | what musl's thread probes read |
+| 131 | sigaltstack | `sigaltstack_arm` (main.rs) | SS_DISABLE/MINSIGSTKSZ recorded per task | full record/reply; nothing dispatches on it yet |
+| 166 | sync | dispatch (main.rs) | `root_fs().sync()` | accepted; write-through makes it a no-op |
+| 200 | tkill | `tkill_arm` (main.rs) | no delivery: a blocked poll/pipe read of that thread answers EINTR | what cargo's jobserver needs; signal 0 probes |
+| 202 | futex | `futex::sys_futex` (futex.rs) | `akuma-syscalls-sync` WaiterTable/op algebra | WAIT/WAKE/WAIT_BITSET/REQUEUE/WAKE_OP, private + shared, timeouts |
+| 234 | tgkill | `tkill_arm` (main.rs) | as tkill | same |
+| 203 | sched_getaffinity | dispatch (main.rs) | one CPU, mask = 1 | the toolchain's thread-count probe |
+| 302 | prlimit64 | `PRLIMIT64 \| 97` arm (main.rs) | as getrlimit; sets accepted-ignored | musl's pthread stack sizing |
+| 306 | syncfs | dispatch (main.rs) | `root_fs().sync()` | as sync |
+| 331 | membarrier | `membarrier_arm` (main.rs) | `akuma-syscalls-mem::membarrier` command probing | queries served; no global barrier needed on one core |
 | 0x1000+301 | akuma SPAWN | `spawn_arm` (child.rs) | the child model | run-to-completion; returns pid \| stdout_fd<<32 |
 | 0x1000+303 | akuma WAITPID | `waitpid_arm` (child.rs) | spawn ring | 0 for unknown-but-plausible ("still running") |
 | 0x1000+319 | akuma UPTIME | dispatch (main.rs) | net::uptime_us | µs since boot |
 | 0x1000+326 | akuma CLOSE_CHILD_STDIN | `close_stdin_arm` (child.rs) | — | success without effect (no stdin path exists) |
 
+The legacy x86-only numbers (mkdir 83, rename 82, rmdir 84, unlink 87,
+`chmod` 90, `chown` 92/94, `symlink` 88, `readlink` 89, `unlink` …) are folded
+to their `*at` spellings by `akuma-syscalls-abi::legacy::fold` at the top of
+`dispatch_inner` (main.rs:2699); legacy `open`/`stat`/`lstat` resolve against
+the task's cwd. The rows above list only the canonical numbers.
+
+## Still missing (the `unhandled <Name>` checklist, confirmed against `dispatch_inner` 2026-10-30)
+
+| numbers | family | what unblocks it |
+|---|---|---|
+| 213/232/233/281/291 | epoll (`epoll_create*`, `epoll_ctl`, `epoll_wait`, `epoll_pwait*`) | the epoll brief (`scripts/kvm/goose/epoll-babysit.md`); `userspace/epollprobe` is written for it |
+| 157 | `prctl` | musl thread setup beyond the stack probes |
+| 326 | `statx` | coreutils' detailed stat paths |
+| 40 | `sendfile` | cp/mv fast paths in the guest |
+| 265 | `linkat` | no hardlink arm on the ext2 trait yet |
+| 98 | `getrusage` | shells' `times`/`time` reporting |
+
 Known deliberate gaps that answer ENOSYS or no-op rather than fail startup:
-`rt_sigaction`/`rt_sigprocmask` (no delivery), `munmap`/`mprotect` (slabs),
-`linkat` (no ext2 arm), `execve` outside any task context, `ioctl` (ENOTTY).
+`execve` outside any task context, `ioctl` (ENOTTY), `PROT_NONE` (not enforced).
 Everything else prints its name and ENOSYS.
 
 ## Background
@@ -156,7 +189,3 @@ pulled, not hand-written), `docs/reference/subsystems/syscalls/` (the full
 kernels' per-family docs these arms mirror),
 `docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md` (why the number table is
 a crate).
-
-
-## Changes 2026-10-30
-New rows: `futex` (202), `clone` with `CLONE_THREAD` (56), `set_tid_address` (218, stores the clear-on-exit word), `socketpair` (53), `chdir` (80), `fchdir` (81), `fsync`/`fdatasync`/`sync`/`syncfs`, `mprotect` (real), `sigaltstack`, `membarrier`; the legacy numbers 82/83/84/86/87/88/89/90/92/94 are folded to `*at` calls by `akuma-syscalls-abi::legacy` at the top of the dispatcher. `open`/`stat`/`lstat` (legacy 2/4/6) now resolve against the task's cwd. `unlinkat` reads its flags from the THIRD argument (it read the fourth, so `rmdir` never worked). `open(O_CREAT)` in a missing directory answers ENOENT (git's `objects/xx` retry depends on it). `fstat` reports FIFO for pipes, socket for sockets/socketpairs and char device for null/random. Writes to fd 2 from a session program join the session stream (they went to the serial console). `[nosys] nr=N` prints once per unserved number; `--features trace-err` adds `[err] sN nr=X -E a=...` for every failing syscall.

@@ -53,8 +53,12 @@ the 8254 PIT. Details and the no-switch rule: [`scheduling.md`](scheduling.md).
 A TSC calibrated once at boot against **PIT channel 2** through ports
 0x42/0x43/0x61 — the one device kvm0 emulates well enough for the gate/OUT
 handshake. Every step is bounded (`pit_present` probes the port-B gate bit;
-the OUT-pin wait has a spin budget): a missing PIT costs one guessed clock
-(2500 cycles/µs) and a console line, never a hang. Timers that drift make TCP
+the OUT-pin wait has a spin budget): a missing PIT — kvm0's case, there is
+no PIT behind port 0x61 — costs one bounded poll, never a hang, and the rate
+comes from `net::use_lapic_rate`: `akuma-lapic-amd64::tsc_hz()`, measured by
+the LAPIC timer calibration a moment earlier. The fixed 2,500 cycles/µs guess
+survives only for a kernel where that has not run. The rule lives in
+[`scheduling.md`](scheduling.md) § the wall clock. Timers that drift make TCP
 slower, not wrong.
 
 `uptime_us()` = TSC / rate. `epoch=` on the command line anchors the UTC
