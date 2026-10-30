@@ -440,3 +440,7 @@ switching tick cannot rescue a crossing that loses its resume; under
 `fork_process` children are published runnable, so the class dies with S3.
 Until then: S0–S2 gate on the same SPAWN path and must treat a stall as a retry
 (R11), never as their own failure.
+
+## Decisions by the user (2026-10-30; supervisor recorded, glm's text above is unchanged)
+- Q1: `linux-abi` is a **cargo feature** (sshd and herd). Q2: keep `clone` through `fork_process`; move it to not-implemented if it breaks. Q3: FPU/SSE save is needed (add an FxArea slice before S5). Q5: the supervisor's QEMU TCG loop is the arbiter; metal confirmation runs in the background afterwards.
+- **Q4 replaces S1's shape: init is `herd`**, built with `libakuma/linux-abi` (fork+pipe2+dup3+execve, no private syscalls), with non-Linux-compatible parts switched off by the same feature in herd if it has none. So pid 1 is a real userspace program started by the kernel, registered as a `Process`; the "first boot-list program is pid 1" and "dedicated /sbin/init" options are closed. S1's gate becomes: herd starts as pid 1 and forks a child; the boot program list shrinks to "start herd". Executor reads `userspace/herd` for its non-Linux calls first (SPAWN-class and Akuma-private uses) and plans them into S1/S3.
