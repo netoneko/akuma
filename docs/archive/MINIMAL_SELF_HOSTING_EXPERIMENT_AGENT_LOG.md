@@ -1930,3 +1930,7 @@ decision back ("the classifier denied it, you run it"), and when herd rejected `
 treating the 1 GiB guest-RAM cap as the next piece of work. The user, who "knows what is possible", pointed out the host kernel can be changed, rebuilt and rebooted. Plan as
 decided: glm writes the crate-extraction plan and the doc refresh (`taoxichuan-10-extraction-plan-and-docs.md`), then lifts the cap in `akuma-vm-spec` / the NPT builder
 (`taoxichuan-11-kvm-guest-ram-cap.md`); the supervisor builds the host kernel on the ryzen, reboots, runs the metal fixed point, and glm then starts on eventfd/epoll.
+
+### 2026-10-31: the fixed point on bare metal
+
+K1 == K2 (`6facda34cbf9ef3cb318dae4ce09ab04`, 1,458,104 bytes) under Akuma's own hypervisor on the ryzen, 3 GiB / 4 vCPUs, about 5.5 minutes per build. K1 is also byte-identical to the Linux-KVM K1. Details and the four things it needed (guest RAM above 1 GiB, herd's compiled-in cap, the relay's DNS proxy, an on-box image): [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md) § Bare-metal run. Decisions: user - "get to the fixed point today", switch sshd to the forking one, always-on init as a process, run glm's extraction plan; supervisor - run the guest through `herd vm-run`, extract K1 with `debugfs`.

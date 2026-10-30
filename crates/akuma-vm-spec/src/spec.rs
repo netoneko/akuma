@@ -7,7 +7,9 @@ pub const MAX_PATH: usize = 128;
 pub const MAX_CMDLINE: usize = 192;
 /// Most port forwards one spec carries.
 pub const MAX_FORWARDS: usize = 4;
-/// Guest RAM bounds (MiB). The ceiling is the nested page table: four directories of 2 MiB
+/// Guest RAM bounds (MiB).
+///
+/// The ceiling is the nested page table: four directories of 2 MiB
 /// leaves cover 4 GiB — three below the device window (`0xC000_0000`..`0x1_0000_0000`, where
 /// the virtio-mmio and local-APIC pages sit) and one above it, so guest RAM splits around the
 /// window the way a PC's RAM splits at the PCI hole (`akuma_svm_amd64::rammap` owns the map).

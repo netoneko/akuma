@@ -1,4 +1,4 @@
-# Taoxichuan: the self-hosting fixed point (2026-10-30)
+# Taoxichuan: the self-hosting fixed point (2026-10-30; bare-metal run 2026-10-31)
 
 **Result.** The taoxichuan kernel compiles itself, and what it compiles reproduces:
 
@@ -42,3 +42,22 @@ It establishes that the toolchain-in-guest can rebuild the kernel that hosts it,
 (Linux host). It does **not** establish: the same on bare metal (the metal validation run is next), reproducibility across different toolchains (K0 != K1),
 or that the produced kernel passes the full gate suite beyond booting and building (K1 hosted the K2 build, which is a substantial workload: ~100 rustc/cargo/git
 processes, threads, pipes, the network).
+
+## Bare-metal run (2026-10-31)
+
+The same fixed point on the ryzen under **Akuma's own hypervisor** (`/dev/kvm0`, AMD SVM, nested paging), not Linux KVM:
+
+| generation | built by | md5 | bytes | wall time |
+|---|---|---|---|---|
+| K1 | a guest running K0 (3 GiB, 4 vCPUs on cores 4-7) | `6facda34cbf9ef3cb318dae4ce09ab04` | 1,458,104 | 5m22s |
+| K2 | a guest running K1 (same image, same commit `6af48c06`, same paths) | `6facda34cbf9ef3cb318dae4ce09ab04` | 1,458,104 | 5m18s |
+
+K1 here is byte-identical to the K1 of the Linux-KVM run above, so the result is also reproducible across host hypervisors. K1 was pulled out of the guest's disk image with `debugfs dump` (the guest sshd's large output is lossy), shipped as `/boot/akuma-guest-tx2`, and booted as the guest kernel for K2.
+
+What it needed beyond the KVM run:
+* **Guest RAM above 1 GiB.** The host kernel capped guest RAM at 1 GiB (one nested-page-table directory); lifted to 4 GiB by glm (`KVM_GUEST_RAM_CAP_LIFTED.md`), with a rebuilt host kernel and a rebuilt `herd` (its `vm_ram_mib` cap was compiled in). herd's PID-1 daemon only reloads its own binary on reboot, so the guest was run with `herd vm-run <spec>` directly.
+* **DNS.** The host relay answers DNS only at `10.0.2.3:53`; the image's `/etc/resolv.conf` named public resolvers.
+* **A toolchain image built on the box**, not shipped over wifi: staged from the box's own root and populated with `debugfs -f` (`mke2fs -d` fails there on xattrs).
+* **One ssh session at a time.** The cooperative sshd serves a single session, and the relay holds only two forwarded connections, so a second ssh (a status poll) is refused or times out while a long command runs. The build was started as one long foreground ssh and observed through the host-side console log.
+
+Not shown: that K1/K2 pass anything beyond booting and building; a second toolchain (K0 != K1 still stands).

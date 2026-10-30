@@ -1392,7 +1392,7 @@ pub mod rammap {
     /// at 0 up to the window, then `[0, 3 GiB)` and `[4 GiB, 4 GiB + bytes - 3 GiB)`.
     #[must_use]
     pub const fn plan(bytes: u64) -> Option<Map> {
-        if bytes == 0 || bytes % LEAF != 0 || bytes > MAX_BYTES {
+        if bytes == 0 || !bytes.is_multiple_of(LEAF) || bytes > MAX_BYTES {
             return None;
         }
         if bytes <= WINDOW {
@@ -1462,7 +1462,9 @@ pub mod rammap {
         }
     }
 
-    /// Fill one directory page — the PDPT slot `dir` — with the 2 MiB leaves of a
+    /// Fill one directory page of the nested page table with a slot's 2 MiB leaves.
+    ///
+    /// The directory page is the PDPT slot `dir`; the leaves back the
     /// guest-memory slot `[gpa, gpa + bytes)` backed at `host` (the `/dev/kvm` API path,
     /// whose slots carry their own base). False for an unaligned or empty range, or one
     /// that crosses the device window: the window is devices', not RAM's. The slot table
@@ -2059,7 +2061,9 @@ pub mod pvh {
     const E_TYPE: usize = 0x10;
     const E_RESERVED: usize = 0x14;
 
-    /// Where the handoff blobs live in guest RAM: one 4-KiB page each,
+    /// Where the handoff blobs live in guest RAM.
+    ///
+    /// One 4-KiB page each,
     /// packed directly under `top_gpa` (the top of guest RAM), above
     /// anything a loader places. The RAM extents the memory map reports
     /// stop short of them.
@@ -2077,7 +2081,9 @@ pub mod pvh {
         pub ram_hi_len: u64,
     }
 
-    /// The layout: three pages under `top_gpa`, RAM entries covering
+    /// The layout of the handoff pages and the RAM entries.
+    ///
+    /// Three pages under `top_gpa`, RAM entries covering
     /// `[ram_base, ram_base + ram_len)` and — when the RAM crossed the device window —
     /// `[ram_hi_base, ram_hi_base + ram_hi_len)`. `top_gpa` is the top of the *upper*
     /// extent when there is one; every handoff page and the ACPI page sit under it.
