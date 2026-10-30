@@ -1889,3 +1889,11 @@ harmless `[nosys] nr=157` (`prctl(PR_SET_NAME)`, thread naming). **Taoxichuan se
 without it because none of those is an async-Rust program - **we forgot the epoll** (user, 2026-10-30). Full Akuma amd64 runs
 goose because it has the whole family, including the `EPOLLET` re-arm fix (`AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md`); the
 decisions are in `akuma-syscalls-poll` and the wait loop in `akuma-net-yarn`, both ready to pull. Not fixed here.
+
+### 2026-10-30 (night): the fixed point
+
+The taoxichuan guest (3 GiB, KVM on the ryzen) compiles the taoxichuan kernel inside itself, and the result is stable: K1 (built in a guest running a Mac-built K0) and
+K2 (built in a guest running K1) are **byte-identical**, md5 `6facda34cbf9ef3cb318dae4ce09ab04`, 1,458,104 bytes, from commit `6af48c06`. K1 booted and hosted the K2 build.
+Procedure, the numbers and six pitfalls: [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md). The path there needed an `execve` argument-size fix, a thread-exit
+process-table leak, a 16 GiB mmap slab, a fast guest clock, `close(0)`/`open`, W^X, and a flat CoW share table ([`TAOXICHUAN_BUGS_FOUND_2026_10_30.md`](TAOXICHUAN_BUGS_FOUND_2026_10_30.md)).
+Memory for the same compile: Linux 447 MiB, Akuma 1,356 MiB, taoxichuan >= 2,460 MiB. Next: bare-metal validation; and goose needs epoll (entry above).
