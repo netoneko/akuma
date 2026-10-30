@@ -18,7 +18,8 @@
 #   ssh -p 2224 root@192.168.1.126 'uname -a'
 #
 # Env: TX_BRANCH (default rust-org-il-experiment), TX_FEATURES (no-tests,trace-err),
-#      TX_PORT (2224), TX_MEM (3072), TX_DISK (/dev/nvme0n1p3), TX_SMP (1).
+#      TX_PORT (2224), TX_MEM (3072), TX_DISK (/dev/nvme0n1p3), TX_SMP (1),
+#      TX_APPEND (extra kernel command line, e.g. "mmdbg=0").
 set -eu
 
 REPO=${TX_REPO:-/root/akuma}
@@ -66,7 +67,7 @@ boot() {
     stop
     if mountpoint -q /mnt/p3 2>/dev/null; then umount /mnt/p3; fi
     # Same virtio-mmio slots as the TCG rig (runqemu_s1e.sh): blk at 0, net at 1.
-    local cl="init=/bin/sshd initargs=--port,22"
+    local cl="init=/bin/sshd initargs=--port,22 ${TX_APPEND:-}"
     for i in 0 1 2 3; do
         cl="$cl virtio_mmio.device=512@$(printf '0x%x' $((0xfeb00000 + i * 512))):$((5 + i))"
     done

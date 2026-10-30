@@ -701,8 +701,13 @@ const MAX_SHARED: usize = 8;
 /// errnos `akuma_ring3_amd64::err` does not carry.
 pub(crate) const EINTR: u64 = 4;
 pub(crate) const ESRCH: u64 = 3;
-/// TEMP bisect mask: 1 = munmap frees+holes, 2 = MAP_FIXED releases, 4 = mremap frees/moves.
-const MMDBG: u32 = 7;
+/// Bisect mask for the mmap-slab rework, set from the kernel command line
+/// (`mmdbg=N`, default 7): 1 = munmap frees + records holes, 2 = MAP_FIXED
+/// releases what it replaces, 4 = mremap frees/moves the old range.
+static MMDBG_V: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(7);
+fn mmdbg() -> u32 {
+    MMDBG_V.load(core::sync::atomic::Ordering::Relaxed)
+}
 /// `brk` sits above the image at `PIE_BASE` (0x1000_0000); the dynamic linker
 /// is placed at `INTERP_BASE` (0x3000_0000), so the brk window must stay under
 /// 512 MiB less the image: 256 MiB, not the 512 the plan first named.
@@ -1159,7 +1164,7 @@ fn munmap_arm(addr: u64, len: u64) -> u64 {
     if addr < MMAP_BASE || end > MMAP_BASE + MMAP_SLAB {
         return 0;
     }
-    if MMDBG & 1 == 0 {
+    if mmdbg() & 1 == 0 {
         return 0;
     }
     let t = task();
@@ -2795,7 +2800,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 // Replacing whatever was there (musl's ldso maps each PT_LOAD
                 // over its anonymous reservation): the old frames go back, and
                 // the range leaves the hole table.
-                if MMDBG & 2 != 0 {
+                if mmdbg() & 2 != 0 {
                     mm_event(2, addr, addr + pages);
                     release_pages(t.root_pa, addr, addr + pages);
                     carve_hole(t, addr, addr + pages);
@@ -3830,7 +3835,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let t = task();
             let in_slab = old >= MMAP_BASE && old + old_pages <= MMAP_BASE + MMAP_SLAB;
             if new_pages <= old_pages {
-                if in_slab && new_pages < old_pages && MMDBG & 4 != 0 {
+                if in_slab && new_pages < old_pages && mmdbg() & 4 != 0 {
                     mm_event(3, old + new_pages, old + old_pages);
                     release_pages(t.root_pa, old + new_pages, old + old_pages);
                     add_hole(t, old + new_pages, old + old_pages);
@@ -3879,7 +3884,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
                 done += n as u64;
             }
-            if in_slab && MMDBG & 4 != 0 {
+            if in_slab && mmdbg() & 4 != 0 {
                 mm_event(4, old, old + old_pages);
                 release_pages(t.root_pa, old, old + old_pages);
                 add_hole(t, old, old + old_pages);
@@ -4914,6 +4919,9 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // / gettimeofday keep their stage-4 answers. This is *written new*
     // (guest-cmdline policy): the metal's anchors are RTC/NTP mechanisms
     // (`akuma-cmos-rtc`, `akuma-sntp`), neither reachable under this guest.
+    if let Some(n) = cmdline_token(hvm_start_info, "mmdbg=", &mut [0u8; 8]).and_then(|v| v.parse::<u32>().ok()) {
+        MMDBG_V.store(n, core::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(e) = cmdline_token(hvm_start_info, "epoch=", &mut [0u8; 32]) {
         match e.parse::<u64>() {
             Ok(secs) => {
