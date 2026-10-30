@@ -126,8 +126,10 @@ usage API; full method and tables in the agent log, "GLM tokenomics from the goo
   192-203M) and ~35M per 5 hours - which sits between z.ai's own Lite estimates for Flash with no
   off-peak discount (146M/week) and with all of it (292M), although 97% of the calls were
   off-peak. z.ai's docs apply the off-peak rate to Flash (current plan 50%; legacy V2 plans 0.4x
-  off-peak / 1.2x peak); the user's experience is that Flash gets no discount. Unresolved; a
-  legacy-V2 subscription would use different arithmetic from the credit formula used here.
+  off-peak / 1.2x peak); **the user has never seen off-peak Flash tokens in the z.ai interface**,
+  with development running around the clock. With no discount, this mix costs ~69 credits per
+  million, ~145M tokens per 10,000-credit week, below the ~195M measured. Unresolved; a legacy
+  plan, or a weekly allowance other than 10,000 credits, would not follow the formula used here.
 - The worker was **GLM-5.3-Flash**, which the user rates a bit below Sonnet level; the
   supervisor and executor was Claude Sonnet 5.5.
 - A refined-process milestone (after the 2026-10-26 methodology change) costs **1.6-46M tokens,
