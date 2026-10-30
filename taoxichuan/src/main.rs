@@ -689,6 +689,10 @@ const USER_STACK_PAGES: u64 = 16;
 /// the range is far from PIE code (`PIE_BASE`) and the stack. The bounds are
 /// constants for now; the per-process memory model comes with stage 12.
 const MMAP_SLAB: u64 = 0x4000_0000;
+/// Hole-table size per task (see `Task::holes`).
+const MAX_HOLES: usize = 64;
+/// TEMP bisect mask: 1 = munmap frees+holes, 2 = MAP_FIXED releases, 4 = mremap frees/moves.
+const MMDBG: u32 = 7;
 /// `brk` sits above the image at `PIE_BASE` (0x1000_0000); the dynamic linker
 /// is placed at `INTERP_BASE` (0x3000_0000), so the brk window must stay under
 /// 512 MiB less the image: 256 MiB, not the 512 the plan first named.
@@ -804,6 +808,23 @@ struct Task {
     /// no-ops), so this only has to read back what the task set - rustc and
     /// musl's thread start install one and check the answer.
     sigalt: akuma_syscalls_linux::StackT,
+    /// `rt_sigaction`'s table, one kernel `struct sigaction` per signal 1..=64
+    /// as four words `[handler, flags, restorer, mask]`. Nothing is ever
+    /// delivered, so this only has to read back what the task installed:
+    /// musl's `signal()` returns the OLD handler from `oldact`, and std's
+    /// child-side `signal(SIGPIPE, SIG_DFL)` fails the whole spawn when that
+    /// reads back as `SIG_ERR` (-1) - which is what an unwritten `oldact`
+    /// (stack garbage) did.
+    sigact: [[u64; 4]; 65],
+    /// `rt_sigprocmask`'s word (shared by a task's threads - imprecise, and
+    /// harmless without delivery).
+    sigmask: u64,
+    /// Unmapped holes below `mmap_cur` in the mmap slab, sorted by nothing,
+    /// merged when they touch: `munmap` records them, `mmap` reuses them
+    /// first-fit before bumping the cursor. Full table: the hole is leaked
+    /// (the frames are still freed).
+    holes: [(u64, u64); MAX_HOLES],
+    n_holes: usize,
     /// The working directory ("" = `/`): what a relative path and `getcwd`
     /// resolve against. Inherited by a fork child, reset by a fresh spawn,
     /// kept across `execve`. Resolution is `akuma_vfs::resolve_path`.
@@ -831,6 +852,10 @@ impl Task {
             brk_end: 0,
             mmap_cur: MMAP_BASE,
             sigalt: SIGALT_OFF,
+            sigact: [[0; 4]; 65],
+            sigmask: 0,
+            holes: [(0, 0); MAX_HOLES],
+            n_holes: 0,
             cwd: alloc::string::String::new(),
             exit: None,
             fd_names: fdtable::Names::new(),
@@ -899,6 +924,198 @@ fn my_tid() -> u64 {
     } else {
         u64::from(child::current_pid())
     }
+}
+
+/// Unmap every present page of `[start, end)` in `root` and give its frame
+/// back (`free_page` honours a CoW count). Pages that were never faulted in
+/// are skipped.
+fn release_pages(root: u64, start: u64, end: u64) {
+    let tid = akuma_primitives::preempt::current_tid() as u32;
+    let mut va = start;
+    while va < end {
+        if let Some(pa) = paging::unmap_page_in(root, va as usize) {
+            akuma_pmm::free_page(pa as usize, tid);
+        }
+        va += 4096;
+    }
+}
+
+/// Record `[start, end)` of the mmap slab as unmapped: lower the cursor when
+/// the hole touches it, else add it to the hole table, merging with any hole
+/// it overlaps or abuts.
+fn add_hole(t: &mut Task, mut start: u64, mut end: u64) {
+    if end > t.mmap_cur {
+        end = t.mmap_cur;
+    }
+    if start >= end {
+        return;
+    }
+    // Absorb every hole this one touches (a loop: one merge can bridge two).
+    loop {
+        let mut merged = false;
+        let mut i = 0;
+        while i < t.n_holes {
+            let (s, e) = t.holes[i];
+            if s <= end && e >= start {
+                start = start.min(s);
+                end = end.max(e);
+                t.n_holes -= 1;
+                t.holes[i] = t.holes[t.n_holes];
+                merged = true;
+            } else {
+                i += 1;
+            }
+        }
+        if !merged {
+            break;
+        }
+    }
+    if end == t.mmap_cur {
+        t.mmap_cur = start;
+    } else if t.n_holes < MAX_HOLES {
+        t.holes[t.n_holes] = (start, end);
+        t.n_holes += 1;
+    }
+}
+
+/// Take `[start, end)` out of the hole table (a `MAP_FIXED` landed there).
+fn carve_hole(t: &mut Task, start: u64, end: u64) {
+    let mut i = 0;
+    while i < t.n_holes {
+        let (s, e) = t.holes[i];
+        if s >= end || e <= start {
+            i += 1;
+        } else if s >= start && e <= end {
+            t.n_holes -= 1;
+            t.holes[i] = t.holes[t.n_holes];
+        } else if s < start && e > end {
+            t.holes[i] = (s, start);
+            if t.n_holes < MAX_HOLES {
+                t.holes[t.n_holes] = (end, e);
+                t.n_holes += 1;
+            }
+            i += 1;
+        } else if s < start {
+            t.holes[i] = (s, start);
+            i += 1;
+        } else {
+            t.holes[i] = (end, e);
+            i += 1;
+        }
+    }
+}
+
+/// A fresh `bytes`-long (page multiple) range of the mmap slab: first-fit from
+/// the holes, else the bump cursor. `None` when the slab is exhausted.
+fn mmap_alloc(t: &mut Task, bytes: u64) -> Option<u64> {
+    for i in 0..t.n_holes {
+        let (s, e) = t.holes[i];
+        if e - s >= bytes {
+            if e - s == bytes {
+                t.n_holes -= 1;
+                t.holes[i] = t.holes[t.n_holes];
+            } else {
+                t.holes[i] = (s + bytes, e);
+            }
+            return Some(s);
+        }
+    }
+    let base = (t.mmap_cur + 0xF) & !0xF;
+    if base + bytes > MMAP_BASE + MMAP_SLAB {
+        return None;
+    }
+    t.mmap_cur = base + bytes;
+    Some(base)
+}
+
+/// `munmap(addr, len)` for the mmap slab: free the frames, record the hole.
+/// Ranges outside the slab (the brk area, a stack) are accepted and ignored.
+fn munmap_arm(addr: u64, len: u64) -> u64 {
+    if addr & 0xFFF != 0 || len == 0 {
+        return e(ring3::err::EINVAL);
+    }
+    let Some(bytes) = len.checked_add(0xFFF).map(|l| l & !0xFFF) else {
+        return e(ring3::err::EINVAL);
+    };
+    let Some(end) = addr.checked_add(bytes) else {
+        return e(ring3::err::EINVAL);
+    };
+    if addr < MMAP_BASE || end > MMAP_BASE + MMAP_SLAB {
+        return 0;
+    }
+    if MMDBG & 1 == 0 {
+        return 0;
+    }
+    let t = task();
+    release_pages(t.root_pa, addr, end);
+    add_hole(t, addr, end);
+    0
+}
+
+/// `rt_sigaction(sig, act, oldact, sigsetsize)`. No signal is ever delivered,
+/// so the handler is recorded and read back, nothing more - but the read-back
+/// must be real: `oldact` is what musl's `signal()` returns.
+fn sigaction_arm(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
+    const SIGKILL: u64 = 9;
+    const SIGSTOP: u64 = 19;
+    if sigsetsize != 8 || sig == 0 || sig > 64 {
+        return e(ring3::err::EINVAL);
+    }
+    if act != 0 && (sig == SIGKILL || sig == SIGSTOP) {
+        return e(ring3::err::EINVAL);
+    }
+    let mut new = [0u8; 32];
+    if act != 0 && (!user_ok(act, 32) || !copy_from_user(&mut new, act)) {
+        return e(ring3::err::EFAULT);
+    }
+    let slot = &mut task().sigact[sig as usize];
+    if oldact != 0 {
+        let mut old = [0u8; 32];
+        for (i, w) in slot.iter().enumerate() {
+            old[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        if !user_ok(oldact, 32) || !copy_to_user(oldact, &old) {
+            return e(ring3::err::EFAULT);
+        }
+    }
+    if act != 0 {
+        for (i, w) in slot.iter_mut().enumerate() {
+            *w = u64::from_le_bytes(new[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+        }
+    }
+    0
+}
+
+/// `rt_sigprocmask(how, set, oldset, sigsetsize)`: the mask word is kept and
+/// read back (musl's `pthread_sigmask`/`__block_all_sigs` restore what they
+/// read); SIGKILL and SIGSTOP can never be blocked.
+fn sigprocmask_arm(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> u64 {
+    const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
+    if sigsetsize != 8 {
+        return e(ring3::err::EINVAL);
+    }
+    let mut new = [0u8; 8];
+    if set != 0 {
+        if how > 2 {
+            return e(ring3::err::EINVAL);
+        }
+        if !user_ok(set, 8) || !copy_from_user(&mut new, set) {
+            return e(ring3::err::EFAULT);
+        }
+    }
+    let cur = task().sigmask;
+    if oldset != 0 && (!user_ok(oldset, 8) || !copy_to_user(oldset, &cur.to_le_bytes())) {
+        return e(ring3::err::EFAULT);
+    }
+    if set != 0 {
+        let bits = u64::from_le_bytes(new) & !UNBLOCKABLE;
+        task().sigmask = match how {
+            0 => cur | bits,
+            1 => cur & !bits,
+            _ => bits,
+        };
+    }
+    0
 }
 
 /// `sigaltstack`'s disabled state: what a task that never set one reads back.
@@ -1122,6 +1339,13 @@ fn read_link_target(path: &str) -> Option<alloc::string::String> {
 fn resolve_effective(path: &str) -> alloc::string::String {
     akuma_vfs::resolve_symlink_chain(path, 8, read_link_target)
 }
+
+/// Bytes a syscall arm reserves for a path argument. 128 was the original
+/// size and cargo's build-script objects
+/// (`target/debug/build/<crate>/<hash>/out/<name>.<name>.<hash>-cgu.0.rcgu.o`)
+/// are longer: `open` answered EFAULT and rustc reported "could not write
+/// output ... Bad address".
+const PATH_BUF: usize = 1024;
 
 /// Read a NUL-terminated path from the task at `src_va` into `buf`, returning
 /// the `&str` it held. `None` (`-EFAULT` at the call site) on a bad byte or
@@ -1428,7 +1652,7 @@ fn resolve_at(dirfd: u64, path: &str) -> Option<alloc::string::String> {
 /// and hand it to `f`. `EBADF` for a non-directory dirfd, `EFAULT` for a bad
 /// task pointer. The `at` family's shared front half.
 fn path_at(path_arg: u64, dirfd: u64, f: impl FnOnce(&str) -> u64) -> u64 {
-    let mut pbuf = [0u8; 128];
+    let mut pbuf = [0u8; PATH_BUF];
     let Some(path) = user_str(path_arg, &mut pbuf) else {
         return e(ring3::err::EFAULT);
     };
@@ -1929,12 +2153,63 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     #[cfg(feature = "trace-err")]
     {
         let (nr, a1, a2, a3) = (fr.rax, fr.rdi, fr.rsi, fr.rdx);
+        if nr == 59 {
+            let mut pb = [0u8; 160];
+            let p = user_str(a1, &mut pb).unwrap_or("<bad>");
+            akuma_primitives::safe_print!(224, "[execve] s{} path={}\n", crate::exec_twin::current_slot() as i64, p);
+        }
+        let rip = fr.user_rip;
         let r = dispatch_inner(fr);
         trace_err(nr, r, a1, a2, a3);
+        trace_ring(nr, r, a1, a2, a3, rip);
         return r;
     }
     #[cfg(not(feature = "trace-err"))]
     dispatch_inner(fr)
+}
+
+/// `--features trace-err`: the last 96 syscalls of every task, dumped when a
+/// task writes the 4-byte value 17 (std's CLOEXEC error pipe reporting EEXIST).
+/// Debug aid for "could not execute process"; the dump is the evidence.
+#[cfg(feature = "trace-err")]
+fn trace_ring(nr: u64, r: u64, a1: u64, a2: u64, a3: u64, rip: u64) {
+    const N: usize = 1024;
+    static mut RING: [(i32, u64, u64, u64, u64, u64, u64); N] = [(0, 0, 0, 0, 0, 0, 0); N];
+    static mut HEAD: usize = 0;
+    static DUMPED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    let slot = crate::exec_twin::current_slot() as i32;
+    // SAFETY: syscall-path discipline (single core, IF clear).
+    unsafe {
+        let ring = &mut *core::ptr::addr_of_mut!(RING);
+        let head = &mut *core::ptr::addr_of_mut!(HEAD);
+        ring[*head % N] = (slot, nr, a1, a2, a3, r, rip);
+        *head += 1;
+        // std's CLOEXEC error pipe: 4 bytes errno (big endian) + b"NOEX".
+        if nr == 1 && a3 == 8 && r == 8 {
+            let mut b = [0u8; 8];
+            if copy_from_user(&mut b, a2) && &b[4..] == b"NOEX"
+                && DUMPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3
+            {
+                akuma_primitives::safe_print!(
+                    64, "[ring] exec failed in s{} errno={}; its last syscalls:\n",
+                    slot, u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+                );
+                let mut shown = 0;
+                for i in 0..N {
+                    let (sl, n, x, y, z, ret, rp) = ring[(*head + i) % N];
+                    if n != 0 && sl == slot && i + 60 >= N {
+                        shown += 1;
+                        akuma_primitives::safe_print!(
+                            112,
+                            "[ring] nr={} a=0x{:x},0x{:x},0x{:x} -> {} rip=0x{:x}\n",
+                            n, x, y, z, ret as i64, rp
+                        );
+                    }
+                }
+                let _ = shown;
+            }
+        }
+    }
 }
 
 /// `--features trace-err`: name every syscall that answered a negative errno
@@ -1942,10 +2217,19 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
 /// gap-finding view `[nosys]` is the always-on half of.
 #[cfg(feature = "trace-err")]
 fn trace_err(nr: u64, r: u64, a1: u64, a2: u64, a3: u64) {
-    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    // Capped PER syscall number (40 lines each): one global cap let a polling
+    // loop's ETIMEDOUT or a path walk's readlink EINVAL use the whole budget
+    // before the failing execve was ever reached.
+    static SEEN: [core::sync::atomic::AtomicU8; 512] =
+        [const { core::sync::atomic::AtomicU8::new(0) }; 512];
     let v = r as i64;
+    // EFAULT is never capped away: it is the answer a bad user range gets.
+    let always = v == -14;
     if (-4095..0).contains(&v) && v != -11 && v != -2 && v != -10 && v != -25
-        && SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3000
+        && v != -38 && v != -47 && v != -110
+        && (always
+            || (nr as usize) < SEEN.len()
+                && SEEN[nr as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 40)
     {
         akuma_primitives::safe_print!(96, "[err] s{} nr={} {} a=0x{:x},0x{:x},0x{:x}\n", crate::exec_twin::current_slot() as i64, nr, v, a1, a2, a3);
     }
@@ -2340,13 +2624,20 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 && addr >= MMAP_BASE
                 && addr + pages <= MMAP_BASE + MMAP_SLAB
             {
+                // Replacing whatever was there (musl's ldso maps each PT_LOAD
+                // over its anonymous reservation): the old frames go back, and
+                // the range leaves the hole table.
+                if MMDBG & 2 != 0 {
+                    release_pages(t.root_pa, addr, addr + pages);
+                    carve_hole(t, addr, addr + pages);
+                }
                 addr
             } else {
-                (t.mmap_cur + 0xF) & !0xF
+                match mmap_alloc(t, pages) {
+                    Some(b) => b,
+                    None => return e(ring3::err::ENOMEM),
+                }
             };
-            if base + pages > MMAP_BASE + MMAP_SLAB {
-                return e(ring3::err::ENOMEM);
-            }
             // Anonymous memory is RW; exec is honoured by widening, at the
             // cost of W^X — a task that maps RWX here tells the kernel it
             // wants it, and there is no W^X policy layer to argue with.
@@ -2396,23 +2687,15 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
                 page += 4096;
             }
-            // Monotonic bump: a MAP_FIXED mapping lands inside an earlier
-            // reservation, BELOW `mmap_cur` — rewinding the cursor would
-            // hand its pages out twice.
+            // A MAP_FIXED mapping lands inside an earlier reservation, BELOW
+            // `mmap_cur`: only a mapping above the cursor moves it.
             if base + pages > t.mmap_cur {
                 t.mmap_cur = base + pages;
             }
             base
         }
         ring3::nr::MPROTECT => mprotect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
-        ring3::nr::MUNMAP => {
-            // Unmap is a no-op (the slabs live as long as the task).
-            if fr.arg1() & 0xFFF != 0 {
-                e(ring3::err::EINVAL)
-            } else {
-                0
-            }
-        }
+        ring3::nr::MUNMAP => munmap_arm(fr.arg1(), fr.arg2()),
         ring3::nr::READ => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
             read_fd_arm(fd, buf, len)
@@ -2554,7 +2837,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 let known = fd_table().with(dirfd as u32, |_| true).is_some();
                 return if known { 0 } else { e(ring3::err::EBADF) };
             }
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2574,7 +2857,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // root, and every regular file the ext2 root holds is readable
             // and executable to it (the R_OK/X_OK bits carry no extra
             // information here).
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(fr.arg1(), &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2593,7 +2876,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if !user_ok(buf, 144) {
                 return e(ring3::err::EFAULT);
             }
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2628,7 +2911,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if !user_ok(buf, 144) {
                 return e(ring3::err::EFAULT);
             }
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2776,7 +3059,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // old "absolute paths only, read-only" arm predated the write
             // path and answered EBADF to exactly the calls the gate needs.)
             let (dirfd, path_va, flags) = (fr.arg1(), fr.arg2(), fr.arg3());
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2788,7 +3071,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::OPEN => {
             // musl's `open()` on x86_64: the legacy number, no dirfd.
             let (path_va, flags) = (fr.arg1(), fr.arg2());
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2876,13 +3159,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             used as u64
         }
-        ring3::nr::RT_SIGACTION | ring3::nr::RT_SIGPROCMASK => {
-            // No signal delivery exists: nothing can ever be delivered, so a
-            // handler registration or a mask change is accepted as the no-op
-            // it is here. musl's startup installs both before `main` —
-            // failing them would fail a program that can never be signalled.
-            0
-        }
+        ring3::nr::RT_SIGACTION => sigaction_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
+        ring3::nr::RT_SIGPROCMASK => sigprocmask_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
         ring3::nr::CLOCK_GETTIME => {
             // Stage 4: the calibrated TSC gives both clocks real elapsed
             // time (net.rs). Stage 8 (M1): CLOCK_REALTIME (id 0) adds the
@@ -2968,7 +3246,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if !user_ok(buf, 144) {
                 return e(ring3::err::EFAULT);
             }
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -3065,7 +3343,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             0
         }
         ring3::nr::STATFS => {
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(fr.arg1(), &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -3168,8 +3446,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         ring3::nr::RENAMEAT => {
             let (od, old_va, nd, new_va) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
-            let mut ob = [0u8; 128];
-            let mut nb = [0u8; 128];
+            let mut ob = [0u8; PATH_BUF];
+            let mut nb = [0u8; PATH_BUF];
             let Some(old) = user_str(old_va, &mut ob) else {
                 return e(ring3::err::EFAULT);
             };
@@ -3186,8 +3464,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         ring3::nr::SYMLINKAT => {
             let (target_va, dirfd, link_va) = (fr.arg1(), fr.arg2(), fr.arg3());
-            let mut tb = [0u8; 128];
-            let mut lb = [0u8; 128];
+            let mut tb = [0u8; PATH_BUF];
+            let mut lb = [0u8; PATH_BUF];
             let Some(target) = user_str(target_va, &mut tb) else {
                 return e(ring3::err::EFAULT);
             };
@@ -3243,7 +3521,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             n
         }
         ring3::nr::CHDIR => {
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(fr.arg1(), &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -3350,29 +3628,51 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::MREMAP => {
-            // musl's realloc on an mmapped chunk. Shrink keeps the address
-            // (the slab never unmaps, so it stays valid); grow moves to a
-            // fresh region at the mmap cursor and copies the overlap —
-            // MAYMOVE semantics, which the caller accepts by using the
-            // returned address. MREMAP_FIXED is refused: no fixed targets.
+            // musl's realloc on an mmapped chunk. Shrink frees the tail; grow
+            // extends in place when the range ends at the slab cursor, else
+            // moves (MAYMOVE, which the caller accepts by using the returned
+            // address), copies the overlap and frees the old range.
+            // MREMAP_FIXED is refused: no fixed targets.
             let (old, old_sz, new_sz, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
-            if new_sz == 0 || flags & 2 != 0 {
+            if new_sz == 0 || flags & 2 != 0 || old & 0xFFF != 0 {
                 return e(ring3::err::EINVAL);
             }
             if old_sz == 0 || !user_ok(old, old_sz) {
                 return e(ring3::err::EFAULT);
             }
-            if new_sz <= old_sz {
+            let old_pages = (old_sz + 0xFFF) & !0xFFF;
+            let new_pages = (new_sz + 0xFFF) & !0xFFF;
+            let t = task();
+            let in_slab = old >= MMAP_BASE && old + old_pages <= MMAP_BASE + MMAP_SLAB;
+            if new_pages <= old_pages {
+                if in_slab && new_pages < old_pages && MMDBG & 4 != 0 {
+                    release_pages(t.root_pa, old + new_pages, old + old_pages);
+                    add_hole(t, old + new_pages, old + old_pages);
+                }
                 return old;
             }
-            let pages = (new_sz + 0xFFF) & !0xFFF;
-            let t = task();
-            let base = (t.mmap_cur + 0xF) & !0xF;
-            if base + pages > MMAP_BASE + MMAP_SLAB {
-                return e(ring3::err::ENOMEM);
+            // In place: the range is the topmost thing in the slab.
+            if in_slab && old + old_pages == t.mmap_cur
+                && old + new_pages <= MMAP_BASE + MMAP_SLAB
+            {
+                let mut page = old + old_pages;
+                while page < old + new_pages {
+                    let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
+                        return e(ring3::err::ENOMEM);
+                    };
+                    if !paging::map_page_in(t.root_pa, page as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
+                        return e(ring3::err::ENOMEM);
+                    }
+                    page += 4096;
+                }
+                t.mmap_cur = old + new_pages;
+                return old;
             }
+            let Some(base) = mmap_alloc(t, new_pages) else {
+                return e(ring3::err::ENOMEM);
+            };
             let mut page = base & !0xFFF;
-            while page < base + pages {
+            while page < base + new_pages {
                 let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
                     return e(ring3::err::ENOMEM);
                 };
@@ -3393,7 +3693,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
                 done += n as u64;
             }
-            t.mmap_cur = base + pages;
+            if in_slab && MMDBG & 4 != 0 {
+                release_pages(t.root_pa, old, old + old_pages);
+                add_hole(t, old, old + old_pages);
+            }
             base
         }
         // Akuma private: libakuma's sshd/sh ask for uptime; the clock arm's
@@ -3935,7 +4238,14 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     t.fd_nonblock = fdtable::FlagSet::new();
     t.exit = None;
     t.mmap_cur = MMAP_BASE;
+    t.n_holes = 0;
     t.sigalt = SIGALT_OFF;
+    // execve: caught handlers go back to SIG_DFL, ignored ones stay ignored.
+    for a in t.sigact.iter_mut() {
+        if a[0] != 1 {
+            *a = [0; 4];
+        }
+    }
     // A fresh address space, a fresh region list: `user_ok` checks against
     // exactly what THIS image mapped. Without the reset the 16 region slots
     // fill across spawns and an exec would panic on the append.

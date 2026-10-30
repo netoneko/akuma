@@ -493,8 +493,16 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: boo
         let cloexec = t.fd_cloexec.clone();
         let nonblock = t.fd_nonblock.clone();
         let cwd = t.cwd.clone();
+        let (sigact, sigmask) = (t.sigact, t.sigmask);
+        let (holes, n_holes) = (t.holes, t.n_holes);
         let ct = &mut crate::task_slots()[slot_idx + 1];
         ct.cwd = cwd;
+        // fork: handlers and the mask are inherited (a child that resets
+        // SIGPIPE reads back what its parent had installed).
+        ct.sigact = sigact;
+        ct.sigmask = sigmask;
+        ct.holes = holes;
+        ct.n_holes = n_holes;
         ct.root_pa = root_pa;
         ct.regions = regions;
         ct.n_regions = n_regions;
