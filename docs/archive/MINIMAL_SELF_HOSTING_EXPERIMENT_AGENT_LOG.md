@@ -1671,3 +1671,9 @@ Not yet run on the ryzen: `-j4` in a 3 GB guest.
 ### 2026-10-30: two more glm plans (user asked; planned by goose-glm on the Mac, unreviewed by the user yet)
 `TAOXICHUAN_EFFICIENCY_PLAN_GLM.md`: lessons from amd64/AArch64 - top slices: demand-paged mmap, then the fpcache for RO file pages (both aimed at -j4 in a 3 GB guest), syscall-floor audit, read(2) stage profiler, wake budget/parked netpoll.
 `TAOXICHUAN_AMD64_EXTRACTION_PLAN_GLM.md`: shared crates - `akuma-mmap::holes`, `akuma-syscalls-signal`, `akuma-user-tree` (CoW share/free plans), sockaddr marshalling into `akuma-syscalls-net`, `akuma-fpu-amd64`; child table/dispatcher left to pm S1-S7.
+
+### 2026-10-30 (evening): extraction slices 1-2 done, unsafe-reduction plan
+`akuma_mmap::HoleSet` (fe29eb00) and `akuma-syscalls-signal` (dae17630) landed, both verified on ryzen/KVM (`-j4`, 3 GiB, 3m06-3m09) and the TCG battery.
+`TAOXICHUAN_UNSAFE_REDUCTION_PLAN_GLM.md` (user asked; glm, 26 tool calls): ~131 real sites in 7 classes; first finding - `scripts/check_unsafe_budget.py` does not
+scan `taoxichuan/src`, so the gate is blind there until its slice 0/1 adds the path. Proposed `akuma-per-slot` (borrow-word cells for the `static mut` tables, ~71 sites),
+`TableFrame`/`Frame` views in `akuma-boot-amd64::phys` (~21 + 2 sites), adoption of existing `akuma-cpu`/`akuma-port` wrappers for the safe-to-execute asm.
