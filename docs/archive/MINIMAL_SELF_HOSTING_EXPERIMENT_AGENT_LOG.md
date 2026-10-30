@@ -1677,3 +1677,59 @@ Not yet run on the ryzen: `-j4` in a 3 GB guest.
 `TAOXICHUAN_UNSAFE_REDUCTION_PLAN_GLM.md` (user asked; glm, 26 tool calls): ~131 real sites in 7 classes; first finding - `scripts/check_unsafe_budget.py` does not
 scan `taoxichuan/src`, so the gate is blind there until its slice 0/1 adds the path. Proposed `akuma-per-slot` (borrow-word cells for the `static mut` tables, ~71 sites),
 `TableFrame`/`Frame` views in `akuma-boot-amd64::phys` (~21 + 2 sites), adoption of existing `akuma-cpu`/`akuma-port` wrappers for the safe-to-execute asm.
+
+### 2026-10-30 (supervisor): GLM tokenomics from the goose ledger
+
+**Source.** goose's `sessions.db` on the Akuma root (`/dev/nvme0n1p3`), copied from a read-only mount (separate mountpoint,
+unmounted at once; a QEMU guest was reading p3 through its overlay at the time) to `/root/linux-audit/goose-sessions.db` on
+the ryzen's Pop side. Its `usage_ledger` table records every model call: input, cache-read and output tokens per model. It
+agrees with the z.ai usage API's daily totals to within 0.1M (10-28: 124.1M ledger, 124.0M API), so it is the whole of the
+experiment's GLM use. The 115M z.ai records on 10-20/21 are not in it (another machine). Credits use z.ai's published formula
+(`docs.z.ai/devpack/overview`): Flash (fresh input x 2.3 + cached x 0.56 + output x 8) / 10,000, GLM-5.3 (6.9, 1.7, 24), half
+rate outside Mon-Fri 06:00-10:00 UTC. API prices from `docs.z.ai/guides/overview/pricing`: Flash $0.15 / $0.03 cached / $0.50
+output per million, GLM-5.3 $1.4 / $0.26 / $4.4.
+
+| UTC day | calls | tokens | credits (formula) | API $ |
+|---|---:|---:|---:|---:|
+| 10-16 | 96 | 5.5M | 180 | 0.20 |
+| 10-23 | 79 | 4.1M | 144 | 0.16 |
+| 10-24 | 1,002 | 96.1M | 4,053 | 7.62 |
+| 10-25 | 1,144 | 106.4M | 3,335 | 3.65 |
+| 10-26 | 1,750 | 116.3M | 3,775 | 4.17 |
+| 10-27 | 1,116 | 57.4M | 2,591 | 2.51 |
+| 10-28 | 1,137 | 125.0M | 3,996 | 4.40 |
+| 10-29 | 634 | 57.1M | 2,110 | 2.13 |
+| 10-30 | 31 | 1.5M | 67 | 0.08 |
+| **total** | **6,989** | **569.4M** | **20,251** | **24.91** |
+
+- **Mix:** 98.3% of input tokens were cache reads; output 0.4-1.8% of tokens per day. 222 of 6,989 calls were in peak hours.
+- **The quota charges more than the formula.** The formula gives 35.6 credits per million tokens for this mix and timing. The
+  quota readings in this log (95.4M = 49%, 130.1M = 64%, and 23.0M = 12% on 10-30) give ~50 credits per million, about
+  200M Flash tokens per Lite week (10,000 credits). The user's account of the week agrees with the readings, not the formula:
+  the experiment used **3 weekly resets** of the Lite plan, and 569.4M x 50 / 10,000 = 2.85 weeks. Not explained here; the
+  off-peak discount not applying as documented would account for most of it.
+- **Refined-process milestones** (sessions from 10-26, grouped by milestone from the ledger's session names and times):
+
+| milestone | tokens | API $ |
+|---|---:|---:|
+| plans N / pm / pn | 1.6 / 2.4 / 2.0M | 0.07 / 0.10 / 0.09 |
+| pipes (pa) | 4.8M | 0.20 |
+| `apk update` (L) | 6.3M | 0.26 |
+| `apk add curl` (M) | 7.0M | 0.29 |
+| wire dedup (K) | 7.5M | 0.27 |
+| M0 mirror + M1 wall clock (H) | 11.2M | 0.40 |
+| blocking fork + `wait4` (M2, 21 short sessions) | 20.4M | 0.94 |
+| the stall, report only (pl) | 23.3M | 0.88 |
+| dynamic PIE (O, O2) | 28.3M | 0.97 |
+| DNS (I, J) | 31.3M | 1.06 |
+| curl over HTTPS (Q-R, 13 sessions) | 46.4M | 1.84 |
+| M4 preemption on one core (pb-ph, stopped by the user) | 159.1M | 5.65 |
+
+  Median execution milestone about 16M tokens, $0.60, 8% of a Lite week. M4 alone is 80% of a Lite week and more than the ten
+  refined milestones above it together (186M).
+- **Pacing.** The refined days ran at 57-125M tokens a day, so a Lite week (~200M) lasted two to three days; hence the resets.
+  One Lite month is ~866M tokens. A median-cost replay of the whole ladder (25-30 milestones, ~400-480M) fits in it at ~28M a
+  day, one 5-hour window daily; a worst-case one (~40M per milestone, 1.0-1.2B) does not. On the API the median replay is
+  about $15-20.
+- **Not in these numbers:** the Claude supervisor's tokens (briefs, steering, console verification), and since the 10-29 switch
+  Claude executing the rustc, cargo, git clone and CoW-fork milestones. No GLM cost exists for that class of milestone.

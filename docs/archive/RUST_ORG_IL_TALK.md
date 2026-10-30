@@ -105,5 +105,35 @@ never count. Re-measure on a clean tag before quoting: the taoxichuan numbers mo
 - The KVM host carried ~2,700 tool calls' worth of guest boots, faults and kills with no
   guest-caused host crash (to 2026-10-26).
 
+**Tokenomics** (goose's `usage_ledger` from the Akuma partition, cross-checked against the z.ai
+usage API; full method and tables in the agent log, "GLM tokenomics from the goose ledger")
+
+- The whole experiment's GLM work: **6,989 calls, 569.4M tokens** (16.1M GLM-5.3 on day one, the
+  rest GLM-5.3-Flash). The ledger matches z.ai's own daily totals to within 0.1M.
+- **98.3%** of input tokens were cache hits; output was 0.4-1.8% of tokens. An agent mostly
+  re-reads its own context.
+- At z.ai's pay-as-you-go API prices the whole experiment is **$24.91**. Two hours of GLM-5.3 on
+  day one are $4.86 of that: 20% of the cost for 3% of the tokens.
+- On the $18/month Lite plan it took **3 weekly quota resets**. The quota readings imply ~50
+  credits per million tokens (about 200M Flash tokens per Lite week); 569M x 50 = 2.85 weeks.
+- z.ai's published credit formula, with this cache rate and the calls' timing (only 222 of 6,989
+  were in peak hours, the rest at the documented 50% off-peak rate), predicts **~36** credits per
+  million. The quota charged about 40% more than the formula says.
+- A refined-process milestone (after the 2026-10-26 methodology change) costs **1.6-46M tokens,
+  $0.07-1.84** at API prices: `apk update` 6.3M ($0.26), `apk add curl` 7.0M, dynamic PIE 28.3M
+  ($0.97), curl over HTTPS 46.4M ($1.84). The median execution milestone is about 16M, $0.60.
+- One problem cost more than ten milestones: preemption on a single core (M4) took **159M tokens**,
+  80% of a Lite week, against 186M for the ten refined milestones around it. The user stopped it.
+- Cost per call grows with context: a 130+-call session averages ~105k tokens per call, a sub-40
+  one ~19k.
+- Pacing beats bursting: the refined days ran 57-125M tokens a day, so a Lite week lasted two or
+  three days. One Lite month holds ~866M tokens, enough for a median-cost replay of the whole
+  ladder (25-30 milestones, ~400-480M) at about 28M a day, one 5-hour window daily.
+- The same median replay on the pay-as-you-go API is about **$15-20**, less than one Lite month,
+  with no caps.
+- Not counted anywhere above: the Claude supervisor (briefs, verification) and, since the
+  2026-10-29 switch, Claude executing (rustc, cargo, git clone, CoW fork). There is no measured GLM
+  cost for that hardest class of milestone.
+
 **Linux comparison:** pending — `scripts/linux_audit_surface.sh` (firecracker / minimal /
 host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.
