@@ -260,8 +260,47 @@ static IDT: idt_lib::Idt = idt_lib::Idt::new();
 /// this kernel is a bug in this kernel; there is no userspace to deliver it to
 /// and no scheduler to defer it through, so the honest report is the full
 /// frame and a halt. The `[Fault]` token is the gate's vocabulary.
+/// How far a user stack may grow below its initial pages: 8 MiB, the Linux
+/// default `ulimit -s`. cargo's main thread goes deeper than the 64 KiB
+/// every image starts with.
+const STACK_MAX: u64 = 8 << 20;
+
+/// A not-present fault just under a task's stack region is the stack growing:
+/// map the zeroed pages between the fault and the region, widen the region,
+/// and let the instruction retry. False for any other fault.
+fn grow_user_stack(cr2: u64) -> bool {
+    let limit = USER_STACK_TOP - STACK_MAX;
+    if cr2 >= USER_STACK_TOP || cr2 < limit {
+        return false;
+    }
+    let tk = task();
+    let Some(ri) = tk.regions[..tk.n_regions].iter().position(|&(_, e)| e == USER_STACK_TOP) else {
+        return false;
+    };
+    let lo = tk.regions[ri].0;
+    if cr2 >= lo {
+        return false;
+    }
+    let first = cr2 & !0xFFF;
+    let mut page = lo;
+    while page > first {
+        page -= 4096;
+        let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
+            return false;
+        };
+        if !paging::map_page_in(tk.root_pa, page as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
+            return false;
+        }
+    }
+    tk.regions[ri].0 = first;
+    true
+}
+
 fn fault_trap(t: &mut Trap<'_>) {
     let code = t.error_code.unwrap_or(0);
+    if t.from_ring3() && code & 1 == 0 && grow_user_stack(akuma_cpu::ctlreg::cr2()) {
+        return;
+    }
     // Stage 2: a fault *from ring 3* is the task's death, not the kernel's —
     // say which, and park. There is no scheduler to reap through and no other
     // task to keep running; what matters for the gate is that this prints
@@ -1361,6 +1400,32 @@ fn writev_file_arm_inner(fd: u64, data: &[u8]) -> u64 {
 /// relative path at `AT_FDCWD` resolves against `/` — this kernel has no
 /// working directory, and every task it boots runs at the root. `None` means
 /// the caller sees `EBADF` (a non-directory fd where a dirfd was required).
+/// A whole file for the ELF loader. `Filesystem::read_file` refuses anything
+/// over 16 MiB ("use read_at"), and cargo is 47 MB, cc1 38 MB: past that,
+/// read it in 1 MiB steps through the inode. One heap block of the file's
+/// size either way - the loader wants the image as a slice.
+pub(crate) fn read_image(path: &str) -> Result<Vec<u8>, akuma_vfs::FsError> {
+    let fs = root_fs();
+    let md = fs.metadata(path)?;
+    if md.size <= 16 * 1024 * 1024 {
+        return fs.read_file(path);
+    }
+    let ino = fs.resolve_inode(path)?;
+    let mut data: Vec<u8> = Vec::new();
+    data.try_reserve_exact(md.size as usize).map_err(|_| akuma_vfs::FsError::NoSpace)?;
+    data.resize(md.size as usize, 0);
+    let mut off = 0usize;
+    while off < data.len() {
+        let end = (off + (1 << 20)).min(data.len());
+        let n = fs.read_at_by_inode(ino, off, &mut data[off..end])?;
+        if n == 0 {
+            return Err(akuma_vfs::FsError::Internal);
+        }
+        off += n;
+    }
+    Ok(data)
+}
+
 fn resolve_at(dirfd: u64, path: &str) -> Option<alloc::string::String> {
     if path.starts_with('/') {
         return Some(alloc::string::String::from(path));
@@ -2374,8 +2439,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // at an explicit offset): the fd's position is untouched —
             // Linux's contract, and what a `map_library` that re-reads from
             // offset 0 across a loop depends on.
-            let (fd, buf, len, off) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
-            if len > WRITE_LIMIT || !user_ok(buf, len) {
+            let (fd, buf, len, off) = (fr.arg1(), fr.arg2(), fr.arg3().min(WRITE_LIMIT), fr.arg4());
+            if !user_ok(buf, len) {
                 return e(ring3::err::EFAULT);
             }
             let mapped = fd_table().with(fd as u32, |d| match d {
@@ -2408,6 +2473,48 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             total
         }
+        akuma_syscalls_abi::x86_64::PWRITE64 => {
+            // Write at an explicit offset; the fd's position is untouched
+            // (SQLite, the toolchain's lock files). The file grows as needed.
+            let (fd, buf, len, off) = (fr.arg1(), fr.arg2(), fr.arg3().min(WRITE_LIMIT), fr.arg4());
+            if !user_ok(buf, len) {
+                return e(ring3::err::EFAULT);
+            }
+            let mapped = fd_table().with(fd as u32, |d| match d {
+                OpenFile::File { inode, .. } => Some(*inode),
+                _ => None,
+            });
+            let Some(Some(node)) = mapped else {
+                return e(ring3::err::ESPIPE);
+            };
+            let mut done = 0u64;
+            while done < len {
+                let mut chunk = [0u8; 1024];
+                let n = ((len - done) as usize).min(chunk.len());
+                if !copy_from_user(&mut chunk[..n], buf + done) {
+                    return e(ring3::err::EFAULT);
+                }
+                match root_fs().write_at_by_inode(node, (off + done) as usize, &chunk[..n]) {
+                    Ok(w) if w > 0 => done += w as u64,
+                    _ => return e(ring3::err::EIO),
+                }
+            }
+            fd_table().update(fd as u32, |of| {
+                if let OpenFile::File { size, .. } = of {
+                    *size = (*size).max(off + done);
+                }
+            });
+            done
+        }
+        akuma_syscalls_abi::x86_64::SCHED_YIELD => {
+            if crate::exec_twin::current_slot() < child::NSLOTS && akuma_threading::x86_runnable_exists() {
+                let stash = ring3::user_rsp_stash();
+                akuma_threading::x86_yield();
+                ring3::set_user_rsp_stash(stash);
+            }
+            0
+        }
+        akuma_syscalls_abi::x86_64::FCHOWN => 0, // everything is root already
         ring3::nr::READV => {
             // musl's stdio reads EVERY stream through readv (one user
             // buffer plus the stream's pending window as the second
@@ -2565,6 +2672,17 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     0
                 }
                 3 => 0, // F_GETFL: O_RDONLY, the only access mode served
+                // Record locks (SQLite's, cargo's global cache tracker): one
+                // task group on one core never contends, so every lock is
+                // granted and a query finds the range unlocked (l_type =
+                // F_UNLCK, the first field of `struct flock`).
+                5 | 36 => {
+                    if !copy_to_user(arg, &2u16.to_le_bytes()) {
+                        return e(ring3::err::EFAULT);
+                    }
+                    0
+                }
+                6 | 7 | 37 | 38 => 0,
                 4 => {
                     // F_SETFL: the one flag with a behaviour behind it is
                     // O_NONBLOCK — recorded in the fd table, read by the
@@ -2974,7 +3092,17 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             fill_statfs(fr.arg2())
         }
         ring3::nr::FSTATFS => fill_statfs(fr.arg2()),
-        akuma_syscalls_linux::nr::FTRUNCATE => {
+        akuma_syscalls_abi::x86_64::TRUNCATE => {
+            // truncate(path, len): the by-name twin of the ftruncate below.
+            let len = fr.arg2();
+            path_at(fr.arg1(), ring3::open::AT_FDCWD, |p| {
+                match root_fs().truncate(&resolve_effective(p), len) {
+                    Ok(()) => 0,
+                    Err(err) => e(fs_err(err)),
+                }
+            })
+        }
+        akuma_syscalls_abi::x86_64::FTRUNCATE => {
             // M4: apk sizes what it unpacks/downloads with ftruncate on the
             // fd (RESULT-L saw nr 77 land in the unhandled arm and the unpack
             // still succeed on the write path's own sizing — G3, A3). The
@@ -3410,6 +3538,28 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             } else {
                 e(ring3::err::EBADF)
             }
+        }
+        // One CPU, no limits: what the toolchain's thread-count and stack
+        // probes read. RLIMIT_STACK reports the 8 MiB the stack may grow to.
+        akuma_syscalls_abi::x86_64::SCHED_GETAFFINITY => {
+            let (len, mask) = (fr.arg2(), fr.arg3());
+            if len < 8 || !copy_to_user(mask, &1u64.to_le_bytes()) {
+                return e(ring3::err::EINVAL);
+            }
+            8
+        }
+        akuma_syscalls_abi::x86_64::PRLIMIT64 | 97 => {
+            let (res, old) = if fr.rax == 97 { (fr.arg1(), fr.arg2()) } else { (fr.arg2(), fr.arg4()) };
+            if old != 0 {
+                let cur = if res == 3 { STACK_MAX } else { u64::MAX };
+                let mut b = [0u8; 16];
+                b[..8].copy_from_slice(&cur.to_le_bytes());
+                b[8..].copy_from_slice(&u64::MAX.to_le_bytes());
+                if !copy_to_user(old, &b) {
+                    return e(ring3::err::EFAULT);
+                }
+            }
+            0
         }
         akuma_syscalls_abi::x86_64::SYNC | akuma_syscalls_abi::x86_64::SYNCFS => {
             let _ = root_fs().sync();
@@ -3879,7 +4029,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
             // Read through the same bounded symlink chain as the program:
             // Alpine's `/lib/ld-musl-x86_64.so.1` is a link, not a file.
             let eff = resolve_effective(ipath);
-            let Ok(ldso) = root_fs().read_file(&eff) else {
+            let Ok(ldso) = read_image(&eff) else {
                 console::puts("  exec: PT_INTERP unreadable: ");
                 console::puts(&eff);
                 console::puts("\n");

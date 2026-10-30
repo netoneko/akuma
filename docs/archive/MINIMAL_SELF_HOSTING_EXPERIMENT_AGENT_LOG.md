@@ -1599,3 +1599,17 @@ Also learned: `cc1` (38 MB) cannot be exec'd, `exec` reads the whole image and t
 - Debug scaffolding used to find these (per-syscall print after an exec, a pool-state dump in the idle lap, argv dumps) is NOT in the commit; `trace-err` skips ENOENT/ECHILD/ENOTTY noise now so its 3000-line cap lasts a whole link.
 
 Known remaining gaps seen in the same run: `prctl`(157), `sched_getaffinity`(204), `prlimit64`(302) and `getrlimit`(97) answer ENOSYS (rustc and ld shrug), `getrusage`(98), `statx`/`newfstatat`(326), `sendfile`(40); `cc1` (38 MB) cannot be exec'd (the exec path reads the whole image). Next, by the user: cargo.
+
+### 2026-10-30 (supervisor): MILESTONE - `cargo build` of a hello project runs on taoxichuan (TCG)
+
+`cargo build` (nightly 1.100, `-j1`, offline, no dependencies) compiles and links `cg` in 19.7 s of TCG time inside the guest and `./target/debug/cg` prints `hello from cargo on taoxichuan`. The user asked for cargo as soon as rustc worked; the supervisor took it straight on. What cargo needed that rustc did not:
+
+- **Executables over 16 MiB.** `Filesystem::read_file` refuses files over 16 MiB (its own comment: "use read_at"); cargo is 47 MB, cc1 38 MB. The exec path reads them in 1 MiB steps through the inode (`read_image`), still into one heap block because the loader wants a slice. A lazy-mapped loader would be the real answer for large binaries.
+- **A growing stack.** Every image started with a fixed 64 KiB of stack and cargo's main thread went past it (`[Fault]` at rsp == cr2). A not-present fault just under the stack region now maps the pages down to the fault, up to 8 MiB (`STACK_MAX`, reported as RLIMIT_STACK).
+- **`fcntl` record locks** (`F_GETLK`/`F_SETLK`/`F_SETLKW` and the OFD variants): answered granted; SQLite (cargo's global cache tracker) reported error 3850 (`IOERR_LOCK`) on the EINVAL.
+- **`ftruncate` was matched under the AArch64 number** (46, which is `sendmsg` on x86_64): x86 77 was ENOSYS, so `Cargo.lock` could not be written. `truncate` (76) added too.
+- **`pwrite64`** (SQLite again, error 778), **`sched_yield`**, `fchown`, **`sched_getaffinity`** (one CPU), **`getrlimit`/`prlimit64`** (unlimited, 8 MiB stack).
+
+Still unserved and seen: `statx`/`newfstatat` (326), `sendfile` (40), `linkat` (265, cargo falls back to copying), `tkill` (200), `getrusage` (98), `prctl` (157), `copy_file_range`-style fast paths. Not yet tried: a build with dependencies (needs a vendored crate, user answer 7), `cargo build -j4`, HTTPS fetch from crates.io.
+
+**State when the supervisor session was handed over (2026-10-30, still TCG):** the first `cargo build` of a hello project works, but a second cargo invocation in the same boot dies of exhaustion (`fork` EAGAIN: `Failed to allocate x86 task stacks` / `Failed to create address space` / `user-half clone failed`, then `memory allocation failed`). Cause not yet confirmed: nothing in taoxichuan frees an exited task's user address space, kernel stacks or ring slot (`rustc` maps the 312 MB `librustc_driver.so` by copying, so a handful of leaked runs eat the 3 GB). `exec_real_task` itself leaked the executable image and argv until it dropped them before the crossing (fixed). Next: measure `akuma_pmm::free_count()` across an exit, free the address space on `wait4` reap, then rerun build/run/release in one boot.

@@ -30,7 +30,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use akuma_ring3_amd64 as ring3;
-use akuma_vfs::Filesystem;
 
 use crate::net;
 
@@ -804,9 +803,12 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
         Err(no) => return crate::e(no),
     };
     let effective = crate::resolve_effective(&args.path);
-    let Ok(image) = crate::root_fs().read_file(&effective) else {
-        akuma_primitives::safe_print!(192, "[exec] '{}': read failed\n", effective);
-        return crate::e(crate::err::ENOENT);
+    let image = match crate::read_image(&effective) {
+        Ok(i) => i,
+        Err(err) => {
+            akuma_primitives::safe_print!(192, "[exec] '{}': read failed ({:?})\n", effective, err);
+            return crate::e(crate::err::ENOENT);
+        }
     };
     if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
         return crate::e(crate::err::ENOEXEC);
@@ -869,6 +871,14 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     // exec hands its images (grandfork passes there).
     let _ = akuma_cpu::msr::set_fs_base(0);
     set_slot_fs(cur, 0);
+    // This function never returns, so nothing local is ever dropped: the
+    // executable image (47 MB for cargo) and the argument strings would leak
+    // from the kernel heap on every exec. Free them before the crossing.
+    drop(argv);
+    drop(env);
+    drop(args);
+    drop(image);
+    drop(effective);
     // SAFETY: the crossing contract — `root` maps the new image plus the
     // shared kernel half, `ef` is ring-3-enterable. A real child never runs
     // `exit_cross`, so this crossing has no return side; the dead dispatcher
@@ -1124,7 +1134,7 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     // `/bin/sh` (what the exec path spawns) is a symlink on the serve
     // image; the chain walker resolves it the same way `open` does.
     let effective = crate::resolve_effective(path);
-    let Ok(image) = crate::root_fs().read_file(&effective) else {
+    let Ok(image) = crate::read_image(&effective) else {
         // Say what failed. A silent ENOENT here reads on the client exactly
         // like a missing binary, and cost three stages of diagnosis.
         akuma_primitives::safe_print!(
@@ -1297,7 +1307,7 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     // ring-3 instruction; "[TICK post]" at child_exit brackets the run.
     akuma_primitives::safe_print!(96, "[TICK pre] n={}\n", akuma_lapic_amd64::ticks());
     let effective = crate::resolve_effective(&args.path);
-    let Ok(image) = crate::root_fs().read_file(&effective) else {
+    let Ok(image) = crate::read_image(&effective) else {
         akuma_primitives::safe_print!(
             192,
             "[exec] '{}' -> '{}': read failed\n",
