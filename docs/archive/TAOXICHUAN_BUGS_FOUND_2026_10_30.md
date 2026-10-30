@@ -160,9 +160,11 @@ Pinned by a differential test (40 seeds x 4000 random inc/dec over addresses tha
 test (25 chunks, not 100k nodes), and the existing `cow_refcount_tests`. Cost: 32 KiB of `.bss` for the pointer array (RAM, not image). Shared with the AArch64 kernel;
 that kernel was not run here. Leak gate on taoxichuan: delta 0, `shared=15520 copied=320 taken=320`, unchanged.
 
-## 12. `open("/dev/null")` after `close(0)` does not return 0 - OPEN
+## 12. `open("/dev/null")` after `close(0)` did not return 0 - FIXED
 
 busybox ash starts every `&` background job with `close(0); if (open("/dev/null", O_RDONLY) != 0) error("can't open '/dev/null'")`: it relies on POSIX's lowest-free-fd rule.
 `open_common` serves `/dev/null` with `alloc_fd_from(3, ..)` because fds 0-2 are implicit console slots, so the open returns 3 and every `cmd &` in a script prints
 `/bin/sh: can't open '/dev/null': <stale errno>` (and the job does not run). Reproduced on TCG with `(echo b > /dev/null 2>&1 &)`. Found when a launcher used `nohup ... &` inside the guest.
-Not a regression (the allocation rule is old). The fix is to let a *closed* std fd be reallocated: remember `close(0..2)` per task and allocate the lowest free fd from 0.
+Not a regression (the allocation rule is old). **Fix:** `Task.std_closed` remembers which of fds 0-2 the task closed and has not re-bound (copied on fork); `new_fd_min()` returns the lowest such fd, else 3, and
+`open`, `socket`, `accept`, `pipe2` and `socketpair` allocate from there, so `close(0); open("/dev/null")` returns 0. A re-bound std fd closes like any other (the `close` arm only short-circuits an *unbound* one).
+Checked on TCG: `(echo b > /dev/null 2>&1 &)`, `exec 0<&-; cat /dev/null`, and a backgrounded `sleep` all run without the error; battery and leak gate (delta 0) green.

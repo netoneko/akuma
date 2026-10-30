@@ -484,7 +484,7 @@ pub fn socket_arm(domain: u64, ty: u64, _protocol: u64) -> u64 {
         akuma_net::socket::remove_socket(idx);
         return crate::e(crate::err::EMFILE);
     };
-    let fd = table.alloc_fd_from(3, crate::OpenFile::Socket(idx));
+    let fd = table.alloc_fd_from(crate::new_fd_min(), crate::OpenFile::Socket(idx));
     if ty & SOCK_NONBLOCK != 0 {
         table.set_nonblock(fd);
     }
@@ -535,7 +535,7 @@ pub fn accept_arm(fd: u64, addr: u64, addrlen_va: u64) -> u64 {
                 akuma_net::socket::remove_socket(new_idx);
                 return crate::e(crate::err::EMFILE);
             };
-            let new_fd = table.alloc_fd_from(3, crate::OpenFile::Socket(new_idx));
+            let new_fd = table.alloc_fd_from(crate::new_fd_min(), crate::OpenFile::Socket(new_idx));
             // The listener's nonblock flag should carry to the child — the
             // same inheritance Linux does with accept4 on a nonblocking
             // listener, and what sshd relies on not to set per-connection.

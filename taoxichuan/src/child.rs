@@ -502,6 +502,7 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         let fds = t.fd_names.clone();
         let cloexec = t.fd_cloexec.clone();
         let nonblock = t.fd_nonblock.clone();
+        let std_closed = t.std_closed;
         let cwd = t.cwd.clone();
         let (sigact, sigmask) = (t.sigact, t.sigmask);
         let holes = t.holes;
@@ -525,6 +526,7 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         ct.fd_names = fds;
         ct.fd_cloexec = cloexec;
         ct.fd_nonblock = nonblock;
+        ct.std_closed = std_closed;
         // Session ph (boot ph-3): the clone above must take the COUNTED pipe
         // references with it — the M2 arm's own rule ("a pipe end is a
         // *counted* kernel resource: every payload the child's table
@@ -1804,6 +1806,7 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
         let (brk_base, brk_cur, brk_end, mmap_cur) =
             (t.brk_base, t.brk_cur, t.brk_end, t.mmap_cur);
         let cwd = t.cwd.clone();
+        let std_closed = t.std_closed;
         let ct = &mut crate::task_slots()[2];
         ct.cwd = cwd;
         ct.root_pa = root;
@@ -1817,6 +1820,7 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
         ct.fd_names = forked.names;
         ct.fd_cloexec = forked.cloexec;
         ct.fd_nonblock = forked.nonblock;
+        ct.std_closed = std_closed;
     }
     crate::set_task_slot(2);
 

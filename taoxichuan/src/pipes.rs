@@ -104,12 +104,12 @@ pub fn pipe2_arm(fds_va: u64, flags: u64) -> u64 {
     }
     let id = table(akuma_pipes::PipeTable::create);
     let mut fds = crate::fd_table();
-    let Some(rslot) = fds.free_below(3, crate::SLOT_CEILING) else {
+    let Some(rslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
         table(|t| t.close_read(id));
         return crate::e(ring3::err::EMFILE);
     };
     let rfd = fds.alloc_fd_from(rslot, OpenFile::Pipe(id, false));
-    let Some(wslot) = fds.free_below(3, crate::SLOT_CEILING) else {
+    let Some(wslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
         let _ = fds.close(rfd);
         table(|t| t.close_read(id));
         return crate::e(ring3::err::EMFILE);
@@ -152,13 +152,13 @@ pub fn socketpair_arm(domain: u64, ty: u64, sv_va: u64) -> u64 {
     let a = table(akuma_pipes::PipeTable::create); // end X writes, end Y reads
     let b = table(akuma_pipes::PipeTable::create); // end Y writes, end X reads
     let mut fds = crate::fd_table();
-    let Some(xslot) = fds.free_below(3, crate::SLOT_CEILING) else {
+    let Some(xslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
         table(|t| t.close_read(a));
         table(|t| t.close_read(b));
         return crate::e(ring3::err::EMFILE);
     };
     let x = fds.alloc_fd_from(xslot, OpenFile::Pair(b, a));
-    let Some(yslot) = fds.free_below(3, crate::SLOT_CEILING) else {
+    let Some(yslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
         let _ = fds.close(x);
         table(|t| t.close_read(a));
         table(|t| t.close_read(b));

@@ -1052,6 +1052,10 @@ struct Task {
     fd_names: fdtable::Names<OpenFile>,
     fd_cloexec: fdtable::FlagSet,
     fd_nonblock: fdtable::FlagSet,
+    /// Bit n set: the task closed std fd n (0..=2) and it has not been re-bound. The std fds are implicit console
+    /// slots, so without this `close(0); open(..)` could never return 0 and POSIX's lowest-free-fd rule fails
+    /// (busybox ash starts every `cmd &` with exactly that sequence; `docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md` §12).
+    std_closed: u8,
 }
 
 static mut TASKS: [Task; crate::child::NSLOTS + 1] = [const { Task::new() }; crate::child::NSLOTS + 1];
@@ -1082,6 +1086,7 @@ impl Task {
             fd_names: fdtable::Names::new(),
             fd_cloexec: fdtable::FlagSet::new(),
             fd_nonblock: fdtable::FlagSet::new(),
+            std_closed: 0,
         }
     }
 }
@@ -1645,6 +1650,13 @@ fn emit(buf_va: u64, len: u64) -> bool {
 /// the open description, take the lowest free fd slot. Absolute paths only,
 /// read-only access only: the root is read-only in spirit and this kernel has
 /// no write path to lie about.
+/// The lowest fd a new descriptor may take: a std fd (0..=2) the task closed and has not re-bound, else 3.
+/// (`alloc_fd_from` then returns the lowest free number from there.)
+pub(crate) fn new_fd_min() -> u32 {
+    let closed = task().std_closed;
+    (0u32..3).find(|&n| closed & (1 << n) != 0 && fd_table().with(n, |_| ()).is_none()).unwrap_or(3)
+}
+
 fn open_common(path: &str, flags: u64) -> u64 {
     if !path.starts_with('/') {
         return e(ring3::err::ENOENT); // nothing to resolve ".." against
@@ -1652,11 +1664,11 @@ fn open_common(path: &str, flags: u64) -> u64 {
     // Stage 7 (H2): the null device, before the ext2 lookup — the root has
     // no char-device layer, and the lookup answered EACCES for /dev/null.
     if path == "/dev/null" {
-        let fd = fd_table().alloc_fd_from(3, OpenFile::Null);
+        let fd = fd_table().alloc_fd_from(new_fd_min(), OpenFile::Null);
         return u64::from(fd);
     }
     if path == "/dev/urandom" || path == "/dev/random" {
-        let fd = fd_table().alloc_fd_from(3, OpenFile::Random);
+        let fd = fd_table().alloc_fd_from(new_fd_min(), OpenFile::Random);
         return u64::from(fd);
     }
     // Stage 6: write access is served — apk unpacks with O_WRONLY|O_CREAT|
@@ -1733,7 +1745,7 @@ fn open_common(path: &str, flags: u64) -> u64 {
     let Some(_slot) = table.free_below(3, SLOT_CEILING) else {
         return e(ring3::err::EMFILE);
     };
-    let fd = table.alloc_fd_from(3, desc);
+    let fd = table.alloc_fd_from(new_fd_min(), desc);
     // TRACE (s7d step-1 settle): where a shell redirect's file lands.
     if traced {
         akuma_primitives::safe_print!(112, "  [o] open flags={:#x} -> {}\n", flags, fd);
@@ -2420,7 +2432,7 @@ fn eventfd2_arm(initval: u64, flags: u64) -> u64 {
     };
     let mut table = fd_table();
     let desc = OpenFile::EventFd(slot);
-    let fd = table.alloc_fd_from(3, desc);
+    let fd = table.alloc_fd_from(new_fd_min(), desc);
     if flags & u64::from(akuma_syscalls_eventfd::EFD_NONBLOCK) != 0 {
         table.set_nonblock(fd);
     }
@@ -3480,7 +3492,12 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // release; closing them is the no-op Linux's stdio-close is.
             let fd = fr.arg1();
             if fd <= 2 {
-                return 0;
+                // A std fd that was re-bound (dup2, or an open that took the slot) closes like any other.
+                let bound = fd_table().with(fd as u32, |_| ()).is_some();
+                task().std_closed |= 1 << fd;
+                if !bound {
+                    return 0;
+                }
             }
             if fd as u32 >= SLOT_CEILING {
                 return e(ring3::err::EBADF);
@@ -4040,7 +4057,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let Some(_slot) = table.free_below(3, SLOT_CEILING) else {
                 return e(ring3::err::EMFILE);
             };
-            u64::from(table.alloc_fd_from(3, desc))
+            u64::from(table.alloc_fd_from(new_fd_min(), desc))
         }
         ring3::nr::DUP2 | ring3::nr::DUP3 => {
             // dup2(33)/dup3(292). dup3's flags carry O_CLOEXEC and nothing
