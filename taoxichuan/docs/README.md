@@ -31,10 +31,15 @@ docs live next to the kernel they describe so a session touching
 | 6 `apk add curl` | done | agent log, stage 6 |
 | 7 `curl -sS https://example.com` | done | agent log, stage 7 |
 | M4 process model (real fork, wait4, pipes, preemption) | F1, PK1, P1–P5 green; PK2 and a rare boot stall open | `docs/archive/TAOXICHUAN_M4_SLICE3_PH_RESULT.md` |
-| self-hosting fixed point (guest builds this kernel; K1 == K2) | **done**, KVM on the ryzen; bare metal next | `docs/archive/TAOXICHUAN_FIXED_POINT.md` |
-| 8 `git clone` | not started | `scripts/kvm/goose/taoxichuan-09j-stage8-git-clone.md` |
+| self-hosting fixed point (guest builds this kernel; K1 == K2) | **done**; the bare-metal fixed-point run is in flight on kvm0 | `docs/archive/TAOXICHUAN_FIXED_POINT.md` |
+| 8 `git clone` | done in its fixed-point form: a sparse HTTPS fetch from GitHub inside the guest (no key, ~9 s); sshd's binary-stdin caveat is G7 | `docs/archive/TAOXICHUAN_FIXED_POINT.md` § procedure; [`gaps.md`](gaps.md) |
 | tcc compiles and runs a C program in the guest | works (compile to a file, then run it) | agent log, "First compiler probes" |
-| 9–12 cargo fetch, rustc, cargo, fixed point | not started — `rustc --version` loads at a 1 GiB slab and dies on its first thread `clone`; the measured census and the order of work are in [`reference/rust-syscalls.md`](reference/rust-syscalls.md) + `PLAN-pn.md` | [`reference/rust-syscalls.md`](reference/rust-syscalls.md); [`gaps.md`](gaps.md); [`reference/rust-toolchain.md`](reference/rust-toolchain.md) (inventory) |
+| 9–12 cargo fetch, rustc, cargo, fixed point | **done** (2026-10-30, K1 == K2 byte for byte at 3 GiB, `-j4`); walls left: the `-j8` crash (G8), epoll (G9), sshd binary stdin (G7) | [`reference/rust-syscalls.md`](reference/rust-syscalls.md); [`gaps.md`](gaps.md); `docs/archive/TAOXICHUAN_FIXED_POINT.md` |
+
+The next composition step — what moves from `taoxichuan/src/` into the
+shared crates, and in what order — is planned in
+`../docs/archive/TAOXICHUAN_CRATE_EXTRACTION_PLAN.md`; it extends
+[`reference/switch-to-crates.md`](reference/switch-to-crates.md).
 
 ## Figures every session must keep true (draw them, do not just describe them)
 
