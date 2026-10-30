@@ -60,6 +60,8 @@ akuma-mmap = { path = "../crates/akuma-mmap" }
 akuma-syscalls-signal = { path = "../crates/akuma-syscalls-signal" }
 # The FPU save area's sizes, offsets and power-on image (shared with the amd64 kernel).
 akuma-fpu-amd64 = { path = "../crates/akuma-fpu-amd64" }
+# The CoW fork's per-entry decisions (skip/refuse/descend/copy/share) and free order, host-tested on a fake tree.
+akuma-user-tree = { path = "../crates/akuma-user-tree" }
 # sockaddr_in decode/encode and the net_err convention (shared with the amd64 kernel).
 akuma-syscalls-net = { path = "../crates/akuma-syscalls-net" }
 # ---- The stage-2 crate line -------------------------------------------------

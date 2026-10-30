@@ -101,6 +101,7 @@ sequenceDiagram
   `IA32_FS_BASE` (`capture_user_context` runs in the parent's context, before
   any switch) — a fork child inherits its parent's TLS, the same answer a real
   fork gives. `twin_enter_user` installs `ctx.fs_base` on every entry.
+- **A thread owns a `Process` row, and its exit must retire it.** `clone_thread` registers a real `Process` per thread. Only `reap_process` (a group *leader*, on its parent's `wait4`) used to unregister one, so a thread's own `exit` and `exit_group`'s `kill_siblings` leaked a process-table entry each; a `cargo build` of this kernel reached `Process table full` at pid ~345. Now `retire_thread_process` runs on both paths and `clone_thread_arm` calls `drain_retired()` at syscall *entry* (never at teardown: reclaim runs `Process::drop` and the exiting thread is still on its row) - the amd64 kernel's fix for the same family. `[reap]` lines print `procs=<active>/<retired>`; the count plateaus (peak 30 over the whole build). [`archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md`](../../../docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md) §7.
 - The fd table clone in `bind_child_task` takes the **counted pipe
   references** with it (one `clone_ref` per cloned `Pipe` payload — the M2
   arm's own rule; without the walk, the first post-fork close destroyed the

@@ -4562,26 +4562,38 @@ fn copy_kernel_half(dst: phys::Frame) {
 /// subtree at a time through [`clone_user_tree`]. On failure everything this
 /// pass linked into `dst` is released; the root frame itself stays the caller's.
 fn clone_user_half_into(src: phys::Frame, dst: phys::Frame) -> Option<()> {
+    use akuma_user_tree::{ClonePlan, SharedSpans, X86_64};
     for i in 0..256 {
         let entry = src.entry(i);
-        if entry & 1 == 0 {
-            continue;
-        }
-        if entry & 0x080 != 0 {
-            return None; // a 1 GiB leaf: see fork_share_memory's note
-        }
-        let Some(sub) = clone_user_tree(entry & PTE_ADDR, 2, (i as u64) << 39) else {
-            for j in 0..i {
-                if dst.entry(j) & 1 != 0 {
-                    free_subtree(dst.entry(j) & PTE_ADDR, 2);
-                    dst.set_entry(j, 0);
-                }
+        // PML4 entries sit three levels above the leaves.
+        match X86_64.plan_clone(3, entry, false, SharedSpans::Copy) {
+            ClonePlan::Skip => {}
+            ClonePlan::Descend { table } => {
+                let Some(sub) = clone_user_tree(table, 2, (i as u64) << 39) else {
+                    release_cloned_prefix(dst, i);
+                    return None;
+                };
+                dst.set_entry(i, X86_64.relink(entry, sub));
             }
-            return None;
-        };
-        dst.set_entry(i, (entry & !PTE_ADDR) | sub);
+            // A 1 GiB leaf: see fork_share_memory's note. Release what this pass linked first.
+            ClonePlan::Refuse | ClonePlan::CopyLeaf { .. } | ClonePlan::ShareLeaf { .. } => {
+                release_cloned_prefix(dst, i);
+                return None;
+            }
+        }
     }
     Some(())
+}
+
+/// Give back the first `upto` user PML4 slots a failed clone pass linked into `dst`; the root frame
+/// itself stays the caller's.
+fn release_cloned_prefix(dst: phys::Frame, upto: usize) {
+    for j in 0..upto {
+        if let Some(akuma_user_tree::FreeStep::Table(t)) = akuma_user_tree::X86_64.plan_free(3, dst.entry(j)) {
+            free_subtree(t, 2);
+            dst.set_entry(j, 0);
+        }
+    }
 }
 
 pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
@@ -4623,6 +4635,7 @@ pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
 /// USER half of a parked task's root (every caller reads it from a present entry
 /// of one).
 fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
+    use akuma_user_tree::{ClonePlan, SharedSpans, X86_64};
     let dst = phys::Frame::alloc_zeroed()?;
     let out = dst.pa();
     let shift = 12 + 9 * depth;
@@ -4630,41 +4643,42 @@ fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
     let src = unsafe { phys::Frame::from_pa(table_pa) };
     for i in 0..512 {
         let entry = src.entry(i);
-        if entry & 1 == 0 {
-            continue; // not present
-        }
         let va = va_base | ((i as u64) << shift);
-        if depth == 0 {
-            let old = entry & PTE_ADDR;
-            if in_shared_span(va) {
+        // The decisions (skip / refuse / descend / copy / share-and-demote) are `akuma-user-tree`'s, host-tested
+        // against a fake tree; this loop performs them. A writable `MAP_SHARED` file span is copied (`SharedSpans::Copy`).
+        let plan = X86_64.plan_clone(depth, entry, depth == 0 && in_shared_span(va), SharedSpans::Copy);
+        match plan {
+            ClonePlan::Skip => {}
+            ClonePlan::Refuse => {
+                free_subtree(out, depth);
+                return None; // a huge page: see fork_share_memory's note
+            }
+            ClonePlan::Descend { table } => {
+                let Some(sub) = clone_user_tree(table, depth - 1, va) else {
+                    free_subtree(out, depth);
+                    return None;
+                };
+                dst.set_entry(i, X86_64.relink(entry, sub));
+            }
+            ClonePlan::CopyLeaf { old } => {
                 let Some(frame) = phys::Frame::alloc_zeroed() else {
                     free_subtree(out, depth);
                     return None;
                 };
                 // SAFETY: `old` is the frame this present leaf maps.
                 frame.copy_page_from(unsafe { phys::Frame::from_pa(old) });
-                dst.set_entry(i, (entry & !PTE_ADDR) | frame.pa());
-            } else {
-                akuma_pmm::cow_ref_inc(old as usize);
-                let mut e = entry;
-                if entry & PTE_W != 0 {
-                    e = (entry & !PTE_W) | PTE_COW;
-                    src.set_entry(i, e);
+                dst.set_entry(i, X86_64.relink(entry, frame.pa()));
+            }
+            ClonePlan::ShareLeaf { frame, parent_entry, child_entry, demoted } => {
+                akuma_pmm::cow_ref_inc(frame as usize);
+                if demoted {
+                    // The parent's entry changes: its TLB may hold the page writable.
+                    src.set_entry(i, parent_entry);
                     akuma_cpu::tlb::invlpg(va as usize);
                 }
-                dst.set_entry(i, e);
+                dst.set_entry(i, child_entry);
                 COW_SHARED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
-        } else {
-            if entry & 0x080 != 0 {
-                free_subtree(out, depth);
-                return None; // a huge page: see fork_share_memory's note
-            }
-            let Some(sub) = clone_user_tree(entry & PTE_ADDR, depth - 1, va) else {
-                free_subtree(out, depth);
-                return None;
-            };
-            dst.set_entry(i, (entry & !PTE_ADDR) | sub);
         }
     }
     Some(out)
@@ -4683,18 +4697,15 @@ fn in_shared_span(va: u64) -> bool {
 /// SAFETY-adjacent contract: `table_pa` is a table frame of the caller's own
 /// half-built tree, unreachable from any live root.
 fn free_subtree(table_pa: u64, depth: u32) {
+    use akuma_user_tree::{FreeStep, X86_64};
     let tid = akuma_primitives::preempt::current_tid() as u32;
     // SAFETY: the frame is a PMM page-table frame owned by the caller.
     let table = unsafe { phys::Frame::from_pa(table_pa) };
     for i in 0..512 {
-        let e = table.entry(i);
-        if e & 1 == 0 {
-            continue;
-        }
-        if depth == 0 {
-            akuma_pmm::free_page((e & PTE_ADDR) as usize, tid);
-        } else {
-            free_subtree(e & PTE_ADDR, depth - 1);
+        match X86_64.plan_free(depth, table.entry(i)) {
+            None => {}
+            Some(FreeStep::Leaf(f)) => akuma_pmm::free_page(f as usize, tid),
+            Some(FreeStep::Table(t)) => free_subtree(t, depth - 1),
         }
     }
     akuma_pmm::free_page(table_pa as usize, tid);

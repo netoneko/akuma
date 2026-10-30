@@ -8,9 +8,9 @@
 flowchart BT
     subgraph user["task's lower half (its own root page table)"]
         U1["ELF image PT_LOADs at link addresses<br/>(static) or PIE_BASE = 0x1000_0000"]
-        U2["brk slab: image_end … +64 MiB<br/>(SLAB = 0x0400_0000)"]
+        U2["brk slab: image_end … +256 MiB<br/>(BRK_SLAB = 0x1000_0000)"]
         U3["interpreter (PT_INTERP): INTERP_BASE = 0x3000_0000<br/>(akuma-elf-exec)"]
-        U4["mmap slab: 0x0000_6000_0000_0000 … +64 MiB"]
+        U4["mmap slab: 0x0000_6000_0000_0000 … +16 GiB<br/>(MMAP_SLAB = 0x4_0000_0000, address space only)"]
         U5["stack: 16 pages below 0x0000_7000_0000_0000"]
     end
     subgraph kernel["upper half (shared by PML4 slots 256..512 copy)"]
@@ -46,6 +46,7 @@ Canonical mermaid source: [`../diagrams/memory-map.md`](../diagrams/memory-map.m
   regular file (zeroed frames filled from the inode at `off` — musl ldso's
   `map_library` shape; no CoW, private because the address space dies with the
   task). `PROT_EXEC` widens the mapping to RWX — there is no W^X policy layer.
+  The slab is 16 GiB of *reserved address space* (a page costs memory when mapped, not when reserved); at 1 GiB one `rustc` ran out of it — it maps a 311 MB `librustc_driver` and a ~17 MB stack per codegen thread — and musl reported the failed stack `mmap` as `EAGAIN` ("failed to spawn work thread"). Memory is the next wall: the fill is still eager (see `gaps.md`).
   `MAP_FIXED` is honoured only inside the mmap slab; the bump cursor never
   rewinds past it. `mremap` grows by moving to a fresh region (MAYMOVE;
   `MREMAP_FIXED` refused). `munmap`/`mprotect` are accepted no-ops (the slabs

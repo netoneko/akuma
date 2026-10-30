@@ -66,6 +66,7 @@ clones the repo from GitHub over HTTPS (public repo, 9 s sparse clone). Cause no
 
 - `git` in the guest prints `fatal: setsid failed: Function not implemented` after `git sparse-checkout set`; the clone and checkout
   still succeed. `setsid` (syscall 112) is unserved (`[nosys]` list).
+- **ssh starves during the in-guest build.** While the guest compiles its own kernel, new ssh connections fail with "Connection timed out during banner exchange" and a held session drops with "Timeout, server not responding", although the build is progressing (the console keeps moving, `[reap]` pids climb). The guest has one vCPU and four `rustc`; sshd is simply not scheduled promptly. Poll the console, not ssh, for completion. Not investigated (scheduling policy, `docs/reference/scheduling.md`).
 - `TRAMP-MISMATCH tid=N THREAD_PID_MAP=… but table scan found …` is printed repeatedly during the big builds. It says it uses the map's
   value and the builds pass; left as is.
 - The `-j4` wedge of the first 3 GiB attempt and one local TCG run (CoW doc) has still not recurred in 5 + 5 clean runs.

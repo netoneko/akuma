@@ -236,3 +236,10 @@ pairs and the decode agrees for families 0..=40. Both `sock.rs` files adopted it
 **Slice 5 (§2.5) DONE:** `akuma-fpu-amd64` (sizes, offsets, `initial_legacy`/`initial_xsave`, `effective_mxcsr_mask`, `sanitize`, `SaveFormat`). 10 host tests; the power-on image is
 pinned to the exact bytes both kernels hand-wrote, and the xsave image is pinned to "legacy image + XSTATE_BV". taoxichuan's `fx_init` and amd64's `FxArea::initial`/`sanitize` consume it.
 Compile-checked for amd64 (`cargo check -p akuma-amd64 --release --features no-tests`); not run on the amd64 kernel here.
+**Slice 3 (§2.3) DONE (2026-10-30):** `akuma-user-tree` (`PteLayout::{plan_clone, plan_free, demote, relink}`, `ClonePlan`, `FreeStep`, `SharedSpans::{Copy, ShareFrames}`; empty `[dependencies]`, `cargo tree -i akuma-exec` finds nothing).
+Q2 answered in the code: plans are returned by value, one per entry, never a `Vec`. 10 host tests run the plans through a fake tree with per-frame reference counts, including: clone is zero-sum
+(no new leaf frame, each shared frame +1), demote touches exactly the writable leaves, freeing the clone and then the parent returns every reference and table (the host twin of `cow_leak_gate.py`'s
+`delta=0`), and an out-of-frames failure injected at **every** allocation point leaves every reference as it was. The `SharedSpans` divergence is pinned both ways. taoxichuan's
+`clone_user_tree`, `clone_user_half_into` and `free_subtree` perform the plans (counters unchanged: `shared=15520 copied=320 taken=320`, leak delta 0); amd64 does not switch its walk (as planned).
+Side effect: the old PML4-level "huge page" refusal returned without releasing the subtrees already cloned; the shared failure path (`release_cloned_prefix`) now does.
+All three extraction slices of this plan that were still open (3, 4, 5) are done; the remaining `Q`s are the uaccess adoption (S6) and amd64 adopting `akuma-syscalls-signal`.

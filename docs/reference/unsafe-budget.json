@@ -72,6 +72,7 @@
     "crates/akuma-usb",
     "crates/akuma-usb-storage",
     "crates/akuma-user-space",
+    "crates/akuma-user-tree",
     "crates/akuma-vfs",
     "crates/akuma-vfs-glue",
     "crates/akuma-vm-spec",

@@ -61,6 +61,7 @@ dependencies = [
  "akuma-timer",
  "akuma-tty",
  "akuma-uart",
+ "akuma-user-tree",
  "akuma-vfs",
  "akuma-vfs-glue",
  "akuma-virtio",
@@ -937,6 +938,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-user-tree"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-vfs"
 version = "0.1.0"
 dependencies = [
@@ -1313,6 +1318,7 @@ dependencies = [
  "akuma-threading",
  "akuma-trap-amd64",
  "akuma-tty",
+ "akuma-user-tree",
  "akuma-vfs",
  "akuma-virtio",
  "spinning_top",
