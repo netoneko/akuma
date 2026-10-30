@@ -1886,13 +1886,26 @@ fn path_at(path_arg: u64, dirfd: u64, f: impl FnOnce(&str) -> u64) -> u64 {
     f(&full)
 }
 
+/// The inode number `stat` reports. ext2's `metadata()` leaves `Metadata::inode`
+/// at 0, and an all-zero `(st_dev, st_ino)` makes every file look like every
+/// other: busybox `cp -r` keeps a table of (dev, ino) it has already copied and
+/// HARD-LINKED the second source onto the first (a `Cargo.toml` that held
+/// `main.rs`'s bytes). `resolve_inode` is the real number.
+fn stat_ino(path: &str, from_metadata: u64) -> u64 {
+    if from_metadata != 0 {
+        from_metadata
+    } else {
+        root_fs().resolve_inode(path).map_or(0, u64::from)
+    }
+}
+
 /// `stat` semantics over a fully-resolved path (symlinks followed by the
 /// caller's `resolve_effective`).
 fn stat_path(path: &str, buf: u64) -> u64 {
     match root_fs().metadata(path) {
         Ok(md) => match fill_stat64(
             buf,
-            md.inode,
+            stat_ino(path, md.inode),
             md.mode,
             md.size,
             u64::from(md.links.unwrap_or(if md.is_dir { 2 } else { 1 })),
@@ -3259,7 +3272,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             match root_fs().metadata(&resolve_effective(&abs)) {
                 Ok(md) => match fill_stat64(
                     buf,
-                    md.inode,
+                    stat_ino(&resolve_effective(&abs), md.inode),
                     md.mode,
                     md.size,
                     u64::from(md.links.unwrap_or(if md.is_dir { 2 } else { 1 })),
