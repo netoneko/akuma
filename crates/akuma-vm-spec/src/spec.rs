@@ -7,10 +7,13 @@ pub const MAX_PATH: usize = 128;
 pub const MAX_CMDLINE: usize = 192;
 /// Most port forwards one spec carries.
 pub const MAX_FORWARDS: usize = 4;
-/// Guest RAM bounds (MiB). The ceiling is the nested page table: one page directory of
-/// 2 MiB leaves maps 1 GiB. An Akuma guest also needs 768 (its fixed 512 MiB heap).
+/// Guest RAM bounds (MiB). The ceiling is the nested page table: four directories of 2 MiB
+/// leaves cover 4 GiB — three below the device window (`0xC000_0000`..`0x1_0000_0000`, where
+/// the virtio-mmio and local-APIC pages sit) and one above it, so guest RAM splits around the
+/// window the way a PC's RAM splits at the PCI hole (`akuma_svm_amd64::rammap` owns the map).
+/// An Akuma guest also needs 768 (its fixed 512 MiB heap).
 pub const MIN_RAM_MIB: u32 = 16;
-pub const MAX_RAM_MIB: u32 = 1024;
+pub const MAX_RAM_MIB: u32 = 4096;
 pub const DEFAULT_RAM_MIB: u32 = 768;
 /// Virtual processors: all take turns on one host core, so more is latency, not compute.
 pub const MAX_VCPUS: u8 = 4;
