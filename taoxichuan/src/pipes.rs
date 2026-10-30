@@ -204,6 +204,9 @@ pub fn read_arm(id: u32, buf_va: u64, len: u64) -> u64 {
                 break;
             }
             park_once();
+            if akuma_threading::take_thread_interrupted(tid) {
+                return if total > 0 { total } else { crate::e(crate::EINTR) };
+            }
             continue;
         }
         if !crate::copy_to_user(buf_va + total, &chunk[..res.bytes]) {

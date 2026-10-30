@@ -114,6 +114,10 @@ pub fn poll_arm(fds_va: u64, nfds: u64, timeout_ms: i64) -> u64 {
             }
             return ready;
         }
+        let slot = crate::exec_twin::current_slot();
+        if slot < crate::child::NSLOTS && akuma_threading::take_thread_interrupted(slot) {
+            return crate::e(crate::EINTR);
+        }
         crate::net::sleep_until(crate::net::uptime_us() + 1000);
     }
 }

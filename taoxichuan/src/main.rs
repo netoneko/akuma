@@ -696,6 +696,9 @@ const USER_STACK_PAGES: u64 = 16;
 const MMAP_SLAB: u64 = 0x4000_0000;
 /// Hole-table size per task (see `Task::holes`).
 const MAX_HOLES: usize = 64;
+/// errnos `akuma_ring3_amd64::err` does not carry.
+pub(crate) const EINTR: u64 = 4;
+pub(crate) const ESRCH: u64 = 3;
 /// TEMP bisect mask: 1 = munmap frees+holes, 2 = MAP_FIXED releases, 4 = mremap frees/moves.
 const MMDBG: u32 = 7;
 /// `brk` sits above the image at `PIE_BASE` (0x1000_0000); the dynamic linker
@@ -1161,6 +1164,28 @@ fn sigprocmask_arm(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> u64 {
             1 => cur & !bits,
             _ => bits,
         };
+    }
+    0
+}
+
+/// `tkill(tid, sig)` / `tgkill(tgid, tid, sig)`. No signal is delivered on this
+/// kernel, so a signal's only effect is the one thing a thread can observe
+/// without a handler running: its blocked `poll`/pipe `read` returns `EINTR`.
+/// That is exactly what the jobserver crate relies on - cargo sends `SIGUSR1`
+/// to its helper thread to pull it out of a blocking wait and then joins it
+/// (the ENOSYS this answered before left cargo hung forever after any error).
+/// `tid` is the threading slot (what `clone` returned). Signal 0 only probes.
+fn tkill_arm(tid: u64, sig: u64) -> u64 {
+    if sig > 64 {
+        return e(ring3::err::EINVAL);
+    }
+    let tid = tid as usize;
+    if tid >= child::NSLOTS || !child::slot_in_use(tid) {
+        return e(ESRCH);
+    }
+    if sig != 0 {
+        akuma_threading::set_thread_interrupted(tid);
+        akuma_threading::get_waker_for_thread(tid).wake();
     }
     0
 }
@@ -3930,6 +3955,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             0
         }
         akuma_syscalls_abi::x86_64::SIGALTSTACK => sigaltstack_arm(fr.arg1(), fr.arg2()),
+        akuma_syscalls_abi::x86_64::TKILL => tkill_arm(fr.arg1(), fr.arg2()),
+        akuma_syscalls_abi::x86_64::TGKILL => tkill_arm(fr.arg2(), fr.arg3()),
         akuma_syscalls_abi::x86_64::MEMBARRIER => membarrier_arm(fr.arg1()),
         other => {
             // A guest task hit a number this table does not serve; the errno

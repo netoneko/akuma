@@ -438,6 +438,11 @@ fn task_of(slot: usize) -> usize {
     unsafe { core::ptr::read_volatile(&raw const TASK_OF[slot]) }
 }
 
+/// Is ring slot `slot` an occupied task or thread (the target of a `tkill`)?
+pub fn slot_in_use(slot: usize) -> bool {
+    slot < NSLOTS && slots()[slot].used
+}
+
 /// Is the running task a `CLONE_THREAD` sibling?
 pub fn is_thread_task() -> bool {
     let cur = crate::exec_twin::current_slot();
