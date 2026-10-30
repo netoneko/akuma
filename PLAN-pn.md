@@ -267,3 +267,6 @@ examples cited in §2), `scripts/kvm/akuma_rehearse.sh:61` (RAM).
 4. **Does the weekly token budget cover pm's S1 landing first?** Every §2b row is
    AFTER-PM; if pm slips, the only deliverable is S1+S2, and this plan's cut lines
    should move up a level.
+
+## Correction after S1 (supervisor, 2026-10-30)
+S1's gate as written (`rustc --version` exit 0) cannot hold before S4: with the slab split the guest gets past the loader and `rustc` dies at `Unable to install ctrlc handler: ... code: 11` (the `clone` -> EAGAIN) with exit 101. A/B on the same image and command line (QEMU TCG, `init=rustc initargs=--version initenv=LD_LIBRARY_PATH=...`): 64 MiB slabs -> `Error loading shared library librustc_driver-...so: Out of memory`, exit 127; `MMAP_SLAB` 1 GiB / `BRK_SLAB` 256 MiB -> runs to the ctrlc panic, exit 101. `BRK_SLAB` is 256 MiB, not 512: the brk window starts above the image at `PIE_BASE` (0x1000_0000) and must stay under `INTERP_BASE` (0x3000_0000). The S1 gate is therefore "no `Out of memory` from the loader; the first failure is the ctrlc thread". Also new: `initenv=`/`thenenv=` boot tokens (comma list of KEY=value) so init can carry an environment.

@@ -636,10 +636,16 @@ const USER_STACK_TOP: u64 = 0x0000_7000_0000_0000;
 const USER_STACK_PAGES: u64 = 16;
 /// `brk` and anonymous `mmap` each get a fixed slab, registered as user
 /// regions up front so every user-pointer check is one range scan. Stage 6:
-/// 64 MiB each — apk.static's musl heap (realloc→mremap traffic) blew past
-/// the old 1 MiB on the aarch64 bring-up; the cost is only pages actually
-/// touched, and the range is far from PIE code (`PIE_BASE`) and the stack.
-const SLAB: u64 = 0x0400_0000;
+/// Sized by what the heaviest guest needs, not by what hello needs: rustc's
+/// `--version` maps ~1 GiB of address space (measured; 64 MiB made it
+/// `ENOMEM` before it printed). The cost is only pages actually touched, and
+/// the range is far from PIE code (`PIE_BASE`) and the stack. The bounds are
+/// constants for now; the per-process memory model comes with stage 12.
+const MMAP_SLAB: u64 = 0x4000_0000;
+/// `brk` sits above the image at `PIE_BASE` (0x1000_0000); the dynamic linker
+/// is placed at `INTERP_BASE` (0x3000_0000), so the brk window must stay under
+/// 512 MiB less the image: 256 MiB, not the 512 the plan first named.
+const BRK_SLAB: u64 = 0x1000_0000;
 const MMAP_BASE: u64 = 0x0000_6000_0000_0000;
 /// Cap on one `write(2)`: the console is a serial line, not a disk.
 const WRITE_LIMIT: u64 = 1 << 20;
@@ -1973,13 +1979,13 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let pages = (len + 0xFFF) & !0xFFF;
             let base = if flags & ring3::mmap::MAP_FIXED != 0
                 && addr >= MMAP_BASE
-                && addr + pages <= MMAP_BASE + SLAB
+                && addr + pages <= MMAP_BASE + MMAP_SLAB
             {
                 addr
             } else {
                 (t.mmap_cur + 0xF) & !0xF
             };
-            if base + pages > MMAP_BASE + SLAB {
+            if base + pages > MMAP_BASE + MMAP_SLAB {
                 return e(ring3::err::ENOMEM);
             }
             // Anonymous memory is RW; exec is honoured by widening, at the
@@ -2888,7 +2894,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let pages = (new_sz + 0xFFF) & !0xFFF;
             let t = task();
             let base = (t.mmap_cur + 0xF) & !0xF;
-            if base + pages > MMAP_BASE + SLAB {
+            if base + pages > MMAP_BASE + MMAP_SLAB {
                 return e(ring3::err::ENOMEM);
             }
             let mut page = base & !0xFFF;
@@ -3039,12 +3045,17 @@ const MAX_PROGRAMS: usize = 4;
 /// The command line is 512 bytes total; 8×95 cannot overflow it.
 const MAX_ARGV: usize = 16;
 const ARG_LEN: usize = 96;
+/// Environment entries per program (`initenv=`/`thenenv=`, comma-separated,
+/// `KEY=value` with no comma or space in the value).
+const MAX_ENV: usize = 8;
 
 #[derive(Clone, Copy)]
 struct Prog {
     path: [u8; ARG_LEN],
     args: [[u8; ARG_LEN]; MAX_ARGV],
     n_args: usize,
+    env: [[u8; ARG_LEN]; MAX_ENV],
+    n_env: usize,
 }
 
 impl Prog {
@@ -3053,7 +3064,14 @@ impl Prog {
             path: [0; ARG_LEN],
             args: [[0; ARG_LEN]; MAX_ARGV],
             n_args: 0,
+            env: [[0; ARG_LEN]; MAX_ENV],
+            n_env: 0,
         }
+    }
+
+    /// One environment entry.
+    fn env_str(&self, i: usize) -> &str {
+        str_until_nul(&self.env[i])
     }
 
     /// argv[0], as the string it was stored as.
@@ -3086,15 +3104,22 @@ static mut EXIT_CODES: [u64; MAX_PROGRAMS] = [0; MAX_PROGRAMS];
 fn parse_programs(cmdline: &str) {
     let mut idx = 0usize;
     for token in cmdline.split_ascii_whitespace() {
+        let mut set_env = None;
         let (set_path, set_args) = if let Some(v) = token.strip_prefix("init=") {
             (Some(v), None)
         } else if let Some(v) = token.strip_prefix("initargs=") {
             (None, Some(v))
+        } else if let Some(v) = token.strip_prefix("initenv=") {
+            set_env = Some(v);
+            (None, None)
         } else if let Some(v) = token.strip_prefix("then=") {
             idx += 1;
             (Some(v), None)
         } else if let Some(v) = token.strip_prefix("thenargs=") {
             (None, Some(v))
+        } else if let Some(v) = token.strip_prefix("thenenv=") {
+            set_env = Some(v);
+            (None, None)
         } else {
             (None, None)
         };
@@ -3113,6 +3138,14 @@ fn parse_programs(cmdline: &str) {
                 if p.n_args < MAX_ARGV {
                     store_slot(&mut p.args[p.n_args], a);
                     p.n_args += 1;
+                }
+            }
+        }
+        if let Some(v) = set_env {
+            for a in v.split(',').take(MAX_ENV) {
+                if p.n_env < MAX_ENV {
+                    store_slot(&mut p.env[p.n_env], a);
+                    p.n_env += 1;
                 }
             }
         }
@@ -3588,9 +3621,9 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     let brk0 = (img.image_end() + 0xFFF) & !0xFFF;
     t.brk_base = brk0;
     t.brk_cur = brk0;
-    t.brk_end = brk0 + SLAB;
+    t.brk_end = brk0 + BRK_SLAB;
     add_region(brk0, t.brk_end);
-    add_region(MMAP_BASE, MMAP_BASE + SLAB);
+    add_region(MMAP_BASE, MMAP_BASE + MMAP_SLAB);
 
     let _ = placed;
     Some(TaskImage { root_pa: root, entry: cross_entry, rsp })
@@ -3611,7 +3644,7 @@ fn spawn(path: &str, image: &[u8]) -> ! {
         halt();
     }
     // SAFETY: boot statics; read before the crossing that consumes the copy.
-    let (argv, n_args) = unsafe {
+    let (argv, n_args, envv, n_env) = unsafe {
         let progs = &*core::ptr::addr_of!(PROGRAMS);
         let cur = CURRENT;
         let p = &progs[cur];
@@ -3622,9 +3655,13 @@ fn spawn(path: &str, image: &[u8]) -> ! {
         let n = p.n_args;
         let mut owned: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
         owned[1..=n].copy_from_slice(&a[1..=n]);
-        (owned, n)
+        let mut env: [&str; MAX_ENV] = [""; MAX_ENV];
+        for k in 0..p.n_env {
+            env[k] = p.env_str(k);
+        }
+        (owned, n, env, p.n_env)
     };
-    let Some(ti) = load_task(&argv[..=n_args], &[], image) else {
+    let Some(ti) = load_task(&argv[..=n_args], &envv[..n_env], image) else {
         akuma_primitives::safe_print!(160, "  init: task load failed\n");
         halt();
     };
