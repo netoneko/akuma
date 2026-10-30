@@ -39,7 +39,7 @@ fn net_err(e: i32) -> u64 {
 }
 
 /// The fd's socket index, or `ENOTSOCK`.
-pub(crate) fn fd_socket(fd: u64) -> Option<usize> {
+pub fn fd_socket(fd: u64) -> Option<usize> {
     fd_table().with(fd as u32, |d| match d {
         crate::OpenFile::Socket(idx) => Some(*idx),
         _ => None,
@@ -50,7 +50,7 @@ pub(crate) fn fd_socket(fd: u64) -> Option<usize> {
 /// `writev` on a socket fd: one send of the concatenated iovecs. The syscall
 /// return is already shaped (`net_err`'s negative errno on failure) because
 /// the dispatcher returns it directly.
-pub(crate) fn writev_socket(idx: usize, data: &[u8], nonblock: bool) -> Result<usize, u64> {
+pub fn writev_socket(idx: usize, data: &[u8], nonblock: bool) -> Result<usize, u64> {
     if data.is_empty() {
         return Ok(0);
     }
@@ -434,7 +434,7 @@ pub fn getsockopt_arm(fd: u64, level: u64, opt: u64, optval_va: u64, optlen_va: 
 }
 
 /// The fd's nonblock flag, straight from the fd table.
-pub(crate) fn fd_nonblock(fd: u64) -> bool {
+pub fn fd_nonblock(fd: u64) -> bool {
     fd_table().is_nonblock(fd as u32)
 }
 
@@ -851,7 +851,7 @@ pub fn read_arm(fd: u64, buf: u64, len: u64) -> u64 {
     // the entry at most once a second (a monotone counter, not a clock).
     static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     let n = LAST.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if n % 1000 == 0 {
+    if n.is_multiple_of(1000) {
         akuma_primitives::safe_print!(96, "  [cx] sockread fd={} len={}\n", fd, len);
     }
     let mut data = alloc::vec![0u8; len as usize];
@@ -935,7 +935,7 @@ pub fn close_arm(fd: u64) {
 }
 
 /// How many open fds, across every task record, name socket `idx`.
-pub(crate) fn socket_refs(idx: usize) -> usize {
+pub fn socket_refs(idx: usize) -> usize {
     crate::task_slots()
         .iter()
         .map(|t| {

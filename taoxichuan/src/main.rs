@@ -84,6 +84,9 @@
 // Same allow as akuma-boot-amd64: several entry-point docs open with a long
 // paragraph on purpose (the why lives in the first block).
 #![allow(clippy::too_long_first_doc_paragraph)]
+// The Linux ABI is `u64` registers read as signed errno-style values and back;
+// every `as i64`/`as i32` in the syscall arms is that conversion on purpose.
+#![allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 
 extern crate alloc;
 
@@ -199,15 +202,18 @@ static mut TRAP_STACKS: [TrapStack; crate::child::NSLOTS + 1] =
 /// the task the way amd64's hook set travels it ("the ring-3 trap stack in
 /// the TSS"). Out-of-range slots keep whatever is armed.
 pub(crate) fn arm_trap_stack(slot: usize) {
-    if slot >= crate::child::NSLOTS + 1 {
+    if slot > crate::child::NSLOTS {
         return;
     }
     // SAFETY: single core, IF clear on every caller path (switch_to runs at a
     // park/preemption point with interrupts masked); the statics are only
     // touched through raw pointers, never references.
     unsafe {
-        let top = (&raw const TRAP_STACKS[slot] as *const u8)
+        let top = (&raw const TRAP_STACKS[slot]).cast::<u8>()
             .add(TRAP_STACK_SIZE) as u64;
+        // A raw-pointer deref on purpose: `TSS.set_rsp0` would take a `&mut` of the
+        // static. clippy's `deref_addrof` suggestion breaks this line.
+        #[allow(clippy::deref_addrof)]
         (*&raw mut TSS).set_rsp0(top);
     }
 }
@@ -492,23 +498,20 @@ fn lapic_init() -> bool {
     let win = unsafe {
         akuma_primitives::mmio::MmioWindow::new((akuma_boot_amd64::phys::DEVMAP_BASE + base) as usize, 4096)
     };
-    match akuma_lapic_amd64::init(base_msr | akuma_lapic_amd64::APIC_GLOBAL_ENABLE, win) {
-        Ok(info) => {
-            akuma_primitives::safe_print!(
-                160,
-                "  lapic: id={} timer vector={} periodic; calibrated={} counts/tick={} tsc={} Hz\n",
-                info.id,
-                akuma_lapic_amd64::TIMER_VECTOR,
-                info.calibrated as u8,
-                info.timer_count,
-                info.tsc_hz
-            );
-            true
-        }
-        Err(akuma_lapic_amd64::NoApicBase) => {
-            akuma_primitives::safe_print!(96, "  [lapic] init failed\n");
-            false
-        }
+    if let Ok(info) = akuma_lapic_amd64::init(base_msr | akuma_lapic_amd64::APIC_GLOBAL_ENABLE, win) {
+        akuma_primitives::safe_print!(
+            160,
+            "  lapic: id={} timer vector={} periodic; calibrated={} counts/tick={} tsc={} Hz\n",
+            info.id,
+            akuma_lapic_amd64::TIMER_VECTOR,
+            u8::from(info.calibrated),
+            info.timer_count,
+            info.tsc_hz
+        );
+        true
+    } else {
+        akuma_primitives::safe_print!(96, "  [lapic] init failed\n");
+        false
     }
 }
 
@@ -786,8 +789,8 @@ impl OpenFile {
     /// dup, fork, exec sweep or close adds or drops a reference for.
     pub(crate) fn pipe_ends(&self) -> ([(u32, bool); 2], usize) {
         match self {
-            OpenFile::Pipe(id, w) => ([(*id, *w), (0, false)], 1),
-            OpenFile::Pair(r, w) => ([(*r, false), (*w, true)], 2),
+            Self::Pipe(id, w) => ([(*id, *w), (0, false)], 1),
+            Self::Pair(r, w) => ([(*r, false), (*w, true)], 2),
             _ => ([(0, false); 2], 0),
         }
     }
@@ -884,6 +887,7 @@ fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
     if len > u64::MAX / 2 || !user_ok(addr, pages * 4096) {
         return e(ring3::err::ENOMEM);
     }
+    #[allow(clippy::verbose_bit_mask)] // PROT_NONE is spelled as the bits it lacks
     if prot & 7 == 0 {
         return 0;
     }
@@ -1431,19 +1435,16 @@ fn open_common(path: &str, flags: u64) -> u64 {
         Err(_) if flags & ring3::open::O_CREAT != 0 && acc != ring3::open::O_RDONLY => {
             // Create empty; the fd's writes fill it. `write_file` on a
             // missing path allocates the inode and the directory entry.
-            match fs.write_file(&path, &[]) {
-                Ok(()) => fs.metadata(&path).ok(),
-                Err(_) => {
-                    // A missing parent is ENOENT, not EACCES: git's object
-                    // writer creates `objects/xx/tmp_obj_*`, and ONLY an
-                    // ENOENT sends it to `mkdir objects/xx` and a retry.
-                    let parent = path.rsplit_once('/').map_or("/", |(d, _)| if d.is_empty() { "/" } else { d });
-                    return match fs.metadata(parent) {
-                        Err(_) => e(ring3::err::ENOENT),
-                        Ok(m) if !m.is_dir => e(ring3::err::ENOTDIR),
-                        Ok(_) => e(ring3::err::EACCES),
-                    };
-                }
+            if fs.write_file(&path, &[]) == Ok(()) { fs.metadata(&path).ok() } else {
+                // A missing parent is ENOENT, not EACCES: git's object
+                // writer creates `objects/xx/tmp_obj_*`, and ONLY an
+                // ENOENT sends it to `mkdir objects/xx` and a retry.
+                let parent = path.rsplit_once('/').map_or("/", |(d, _)| if d.is_empty() { "/" } else { d });
+                return match fs.metadata(parent) {
+                    Err(_) => e(ring3::err::ENOENT),
+                    Ok(m) if !m.is_dir => e(ring3::err::ENOTDIR),
+                    Ok(_) => e(ring3::err::EACCES),
+                };
             }
         }
         Err(_) => return e(ring3::err::ENOENT),
@@ -1714,7 +1715,7 @@ fn lstat_path(path: &str, buf: u64) -> u64 {
             // The listing carries no permission bits; ask for the file's own
             // (an executable must stat as one - `access(X_OK)` and `which`).
             let full = if parent == "/" { alloc::format!("/{name}") } else { alloc::format!("{parent}/{name}") };
-            fs.metadata(&full).map(|m| m.mode).unwrap_or(0o100644)
+            fs.metadata(&full).map_or(0o100644, |m| m.mode)
         };
         match fill_stat64(buf, 0, mode, ent.size, if ent.is_dir { 2 } else { 1 }) {
             Ok(()) => 0,
@@ -1766,7 +1767,7 @@ fn fill_statfs(buf: u64) -> u64 {
         st.free_blocks,
         ts
     );
-    let bs = st.block_size as i64;
+    let bs = i64::from(st.block_size);
     let s = akuma_syscalls_linux::Statfs {
         f_type: 0xEF53,
         f_bsize: bs,
@@ -2063,7 +2064,7 @@ fn eventfd2_arm(initval: u64, flags: u64) -> u64 {
         Ok(ef) => ef,
         Err(no) => return e(no as u64),
     };
-    let slot = eventfds().iter().position(|s| s.is_none());
+    let slot = eventfds().iter().position(core::option::Option::is_none);
     let Some(slot) = slot else {
         return e(ring3::err::EMFILE);
     };
@@ -2130,7 +2131,7 @@ fn eventfd_close_slot(idx: usize) {
 /// poll/select readiness for an eventfd fd: readable while the counter is
 /// non-zero (sock.rs's `fd_events` asks through here).
 pub(crate) fn eventfd_can_read(idx: usize) -> bool {
-    eventfds()[idx].as_ref().is_some_and(|ef| ef.can_read())
+    eventfds()[idx].as_ref().is_some_and(akuma_syscalls_eventfd::EventFd::can_read)
 }
 /// One bit per syscall number below 512 already named by `nosys_note`.
 static NOSYS_SEEN: [core::sync::atomic::AtomicU64; 8] =
@@ -2162,7 +2163,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         let r = dispatch_inner(fr);
         trace_err(nr, r, a1, a2, a3);
         trace_ring(nr, r, a1, a2, a3, rip);
-        return r;
+        r
     }
     #[cfg(not(feature = "trace-err"))]
     dispatch_inner(fr)
@@ -2172,6 +2173,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
 /// task writes the 4-byte value 17 (std's CLOEXEC error pipe reporting EEXIST).
 /// Debug aid for "could not execute process"; the dump is the evidence.
 #[cfg(feature = "trace-err")]
+#[allow(clippy::many_single_char_names)] // register-argument names
 fn trace_ring(nr: u64, r: u64, a1: u64, a2: u64, a3: u64, rip: u64) {
     const N: usize = 1024;
     static mut RING: [(i32, u64, u64, u64, u64, u64, u64); N] = [(0, 0, 0, 0, 0, 0, 0); N];
@@ -2184,6 +2186,31 @@ fn trace_ring(nr: u64, r: u64, a1: u64, a2: u64, a3: u64, rip: u64) {
         let head = &mut *core::ptr::addr_of_mut!(HEAD);
         ring[*head % N] = (slot, nr, a1, a2, a3, r, rip);
         *head += 1;
+        // What a task says on stderr (a panic/abort message), capped: the
+        // evidence the next line of the console would otherwise lose.
+        if nr == 1 && a1 == 2 && r > 0 {
+            static SEEN_ERR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+            if SEEN_ERR.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 120 {
+                let mut b = [0u8; 120];
+                let n = (r as usize).min(b.len());
+                if copy_from_user(&mut b[..n], a2) {
+                    let txt = core::str::from_utf8(&b[..n]).unwrap_or("<non-utf8>");
+                    akuma_primitives::safe_print!(160, "[stderr] s{}: {}\n", slot, txt.trim_end());
+                }
+            }
+        }
+        if nr == 200 {
+            akuma_primitives::safe_print!(64, "[ring] tkill by s{}; its last syscalls:\n", slot);
+            for i in 0..N {
+                let (sl, n, x, y, z, ret, rp) = ring[(*head + i) % N];
+                if n != 0 && sl == slot && i + 40 >= N {
+                    akuma_primitives::safe_print!(
+                        112, "[ring] nr={} a=0x{:x},0x{:x},0x{:x} -> {} rip=0x{:x}\n",
+                        n, x, y, z, ret as i64, rp
+                    );
+                }
+            }
+        }
         // std's CLOEXEC error pipe: 4 bytes errno (big endian) + b"NOEX".
         if nr == 1 && a3 == 8 && r == 8 {
             let mut b = [0u8; 8];
@@ -2245,6 +2272,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     // `AT_FDCWD`; the fold is `akuma_syscalls_abi::legacy`, the same table
     // amd64 dispatches through. Rewritten in the frame so the one `*at` arm
     // below serves both spellings.
+    #[allow(clippy::tuple_array_conversions)] // destructuring assignment into the frame's registers
     if let Some((call, a)) = akuma_syscalls_abi::legacy::fold(
         fr.rax,
         [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()],
@@ -3587,7 +3615,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // `dup2(10, 1)` needs the save slot, and a future
             // `dup2(1, 5)` needs a source.
             bind_session_fd(old);
-            let src_pipe = fd_table().with(old as u32, |d| d.pipe_ends());
+            let src_pipe = fd_table().with(old as u32, OpenFile::pipe_ends);
             match fd_table().dup_to(old as u32, new as u32, is_dup3 && flags & O_CLOEXEC != 0) {
                 Ok(d) => {
                     // Whatever `new` named is displaced: release a displaced
@@ -4241,7 +4269,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     t.n_holes = 0;
     t.sigalt = SIGALT_OFF;
     // execve: caught handlers go back to SIG_DFL, ignored ones stay ignored.
-    for a in t.sigact.iter_mut() {
+    for a in &mut t.sigact {
         if a[0] != 1 {
             *a = [0; 4];
         }
@@ -4561,6 +4589,7 @@ fn spawn(path: &str, image: &[u8]) -> ! {
         let mut owned: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
         owned[1..=n].copy_from_slice(&a[1..=n]);
         let mut env: [&str; MAX_ENV] = [""; MAX_ENV];
+        #[allow(clippy::needless_range_loop)] // `k` also indexes `p`
         for k in 0..p.n_env {
             env[k] = p.env_str(k);
         }
@@ -4825,7 +4854,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     if let Some(loc) = info.location() {
         raw_uart(loc.file().as_bytes());
         raw_uart(b":");
-        raw_dec(loc.line() as u64);
+        raw_dec(u64::from(loc.line()));
     }
     raw_uart(b"\n");
     akuma_primitives::safe_print!(256, "       {}\n", info.message());

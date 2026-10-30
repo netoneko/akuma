@@ -26,17 +26,17 @@ use alloc::vec::Vec;
 /// (P5 tolerates the EPIPE death); name the number where it is used.
 const EPIPE: u64 = 32;
 
-/// M4 slice 3 (session pf, Fix B): the arms park. The M3 header said "Wakes
-/// are `()` and dropped on the floor — nothing on this kernel blocks"; that
-/// ended when `wait4_real` proved a task can park on its own band and be
-/// woken back (boots G/H/I, session pe). What remains of the M3 rule is the
-/// tid discipline: a parked caller is registered under its TASK SLOT
-/// (`exec_twin::current_slot()` — the same tid space as `wait4_real`'s
-/// `waiter`), and every `Wakes` an op returns is fired through the threading
-/// waker, exactly as `task_exit_real` wakes the reap-waiter. The one-step
-/// `check_set_*` forms are the crate's anti-TOCTOU shape: probe-and-register
-/// is one table step, so a wake landing between "empty" and "registering"
-/// cannot be lost.
+// M4 slice 3 (session pf, Fix B): the arms park. The M3 header said "Wakes
+// are `()` and dropped on the floor — nothing on this kernel blocks"; that
+// ended when `wait4_real` proved a task can park on its own band and be
+// woken back (boots G/H/I, session pe). What remains of the M3 rule is the
+// tid discipline: a parked caller is registered under its TASK SLOT
+// (`exec_twin::current_slot()` — the same tid space as `wait4_real`'s
+// `waiter`), and every `Wakes` an op returns is fired through the threading
+// waker, exactly as `task_exit_real` wakes the reap-waiter. The one-step
+// `check_set_*` forms are the crate's anti-TOCTOU shape: probe-and-register
+// is one table step, so a wake landing between "empty" and "registering"
+// cannot be lost.
 
 /// May this caller park at all? The boot task (`NO_SLOT`) drives the bridge
 /// and the exec pump — the machine's only guaranteed-runner — so it keeps
@@ -122,8 +122,8 @@ pub fn pipe2_arm(fds_va: u64, flags: u64) -> u64 {
         fds.set_nonblock(wfd);
     }
     let mut out = [0u8; 8];
-    out[..4].copy_from_slice(&(rfd as u32).to_ne_bytes());
-    out[4..].copy_from_slice(&(wfd as u32).to_ne_bytes());
+    out[..4].copy_from_slice(&rfd.to_ne_bytes());
+    out[4..].copy_from_slice(&wfd.to_ne_bytes());
     if !crate::copy_to_user(fds_va, &out) {
         return crate::e(ring3::err::EFAULT);
     }
@@ -172,8 +172,8 @@ pub fn socketpair_arm(domain: u64, ty: u64, sv_va: u64) -> u64 {
         }
     }
     let mut out = [0u8; 8];
-    out[..4].copy_from_slice(&(x as u32).to_ne_bytes());
-    out[4..].copy_from_slice(&(y as u32).to_ne_bytes());
+    out[..4].copy_from_slice(&x.to_ne_bytes());
+    out[4..].copy_from_slice(&y.to_ne_bytes());
     if !crate::copy_to_user(sv_va, &out) {
         return crate::e(ring3::err::EFAULT);
     }

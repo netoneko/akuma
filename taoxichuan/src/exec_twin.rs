@@ -166,7 +166,8 @@ mod spin_idle {
     //! (single core, IF clear at every caller).
     pub struct Once<T>(core::cell::UnsafeCell<Option<T>>);
     impl<T> Once<T> {
-        pub const NEW: Self = Once(core::cell::UnsafeCell::new(None));
+        #[allow(clippy::declare_interior_mutable_const)] // a const only to initialise `static`s
+        pub const NEW: Self = Self(core::cell::UnsafeCell::new(None));
         /// SAFETY: single core, IF clear (the registration path).
         pub fn call(&self, make: impl FnOnce() -> T) -> *mut T {
             unsafe {
@@ -530,7 +531,7 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
         // child's image and the shared kernel half; the load is the same one
         // `child_enter` performs at every crossing.
         unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags))
+            core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
         };
     }
     let ef = akuma_ring3_amd64::EntryFrame {

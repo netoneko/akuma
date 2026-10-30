@@ -36,6 +36,7 @@ use crate::net;
 /// One reaped-or-running child. Slots recycle round-robin: sshd serves
 /// sessions one bridge at a time in practice, and four cover even the
 /// `max_sessions` stall case without unbounded kernel memory.
+#[allow(clippy::struct_excessive_bools)] // one flag per independent slot fact; a bitset would hide them
 pub struct SpawnSlot {
     pub used: bool,
     pub pid: u32,
@@ -145,7 +146,7 @@ struct SlotStacks {
 ///
 /// Written only on the syscall path (single core, `IF` clear) or by
 /// `child_enter`'s asm prologue into `save`; read the same ways.
-struct SlotCross {
+pub struct SlotCross {
     /// The parent's saved registers — `child_enter`'s asm writes here (the
     /// record's address rides the crossing in `%rdx`).
     save: CrossSave,
@@ -213,7 +214,7 @@ static mut SLOT_STATE: [SlotCross; NSLOTS] = [const { SlotCross::new() }; NSLOTS
 /// The crossing record of `slot`, for the syscall-path writers.
 ///
 /// SAFETY: as `slots`.
-pub(crate) unsafe fn cross_mut(slot: usize) -> &'static mut SlotCross {
+pub unsafe fn cross_mut(slot: usize) -> &'static mut SlotCross {
     unsafe {
         let st = &mut *core::ptr::addr_of_mut!(SLOT_STATE);
         &mut st[slot]
@@ -403,11 +404,11 @@ fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs
     Ok(SpawnArgs { path, argv, env })
 }
 
-/// Akuma's SPAWN (0x1000+301): `spawn(path, argv, envp, stdin_ptr, stdin_len, flags)`.
-///
-/// Runs the child to completion inside the call (the model this module
-/// exists to state), then returns `pid | stdout_fd << 32` — the same packed
-/// word the full kernel's SPAWN returns, read by the same `spawn_full`.
+// Akuma's SPAWN (0x1000+301): `spawn(path, argv, envp, stdin_ptr, stdin_len, flags)`.
+//
+// Runs the child to completion inside the call (the model this module
+// exists to state), then returns `pid | stdout_fd << 32` — the same packed
+// word the full kernel's SPAWN returns, read by the same `spawn_full`.
 // ---------------------------------------------------------------------------
 // M4 slice 3: the real fork — premise 2's build-out
 // ---------------------------------------------------------------------------
@@ -438,7 +439,7 @@ fn task_of(slot: usize) -> usize {
 }
 
 /// Is the running task a `CLONE_THREAD` sibling?
-pub(crate) fn is_thread_task() -> bool {
+pub fn is_thread_task() -> bool {
     let cur = crate::exec_twin::current_slot();
     cur != crate::exec_twin::NO_SLOT && cur < NSLOTS && slots()[cur].used && slots()[cur].thread
 }
@@ -451,7 +452,7 @@ static mut CHILD_BIND: [(usize, u32, u64); NSLOTS] = [(0, 0, 0); NSLOTS];
 /// `ExecRuntime::bind_child_task`'s twin: stamp the child's spawn-row. The
 /// crate publishes the child's thread right after this returns, so a full
 /// ring must come back as an error the fork reports, not a panic.
-pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> Result<(), &'static str> {
+pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> Result<(), &'static str> {
     // SAFETY: syscall-path discipline.
     let bind = unsafe { &mut *core::ptr::addr_of_mut!(CHILD_BIND) };
     if tid >= bind.len() {
@@ -554,7 +555,7 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: boo
 /// band (recorded at the crossing below), and anything else (the idle
 /// thread, out-of-range) — the current global, which for the idle task is
 /// simply left alone by the caller.
-pub(crate) fn sched_kstack_top(tid: usize) -> u64 {
+pub fn sched_kstack_top(tid: usize) -> u64 {
     if tid < NSLOTS {
         // SAFETY: syscall-path discipline.
         unsafe { core::ptr::read_volatile(&raw const SLOT_STATE[tid].kstack_top) }
@@ -566,7 +567,7 @@ pub(crate) fn sched_kstack_top(tid: usize) -> u64 {
 /// The CR3 `switch_to` loads for `tid`: the task record's live root (exec
 /// updates it — a real child that exec'd must come back on the NEW image's
 /// root). 0 = leave CR3 alone (the idle thread runs on the kernel root).
-pub(crate) fn sched_task_slot_of(tid: usize) -> usize {
+pub fn sched_task_slot_of(tid: usize) -> usize {
     if tid == crate::exec_twin::shell_tid() {
         1
     } else if tid < NSLOTS {
@@ -576,7 +577,7 @@ pub(crate) fn sched_task_slot_of(tid: usize) -> usize {
     }
 }
 
-pub(crate) fn sched_root_of(tid: usize) -> u64 {
+pub fn sched_root_of(tid: usize) -> u64 {
     if tid == crate::exec_twin::shell_tid() {
         crate::task_slots()[1].root_pa // the shell
     } else if tid < NSLOTS {
@@ -589,7 +590,7 @@ pub(crate) fn sched_root_of(tid: usize) -> u64 {
 /// A REAL fork child is on the CPU: a threading tid 1..NSLOTS whose
 /// SpawnSlot is stamped and running. The shell (tid 0, inside its SPAWN
 /// crossing) and the boot task are NOT — their exits keep the M2 paths.
-pub(crate) fn is_real_task() -> bool {
+pub fn is_real_task() -> bool {
     let cur = crate::exec_twin::current_slot();
     if cur == crate::exec_twin::NO_SLOT || cur == 0 || cur >= NSLOTS {
         return false;
@@ -710,7 +711,7 @@ fn clone_thread_arm(fr: &ring3::SyscallFrame) -> u64 {
     }
     let (flags, stack, ptid, ctid, tls) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5());
     match akuma_exec::process::clone_thread(stack, tls, ptid, ctid, flags) {
-        Ok(tid) => tid as u64,
+        Ok(tid) => u64::from(tid),
         Err(msg) => {
             akuma_primitives::safe_print!(160, "[clone] thread refused: {}\n", msg);
             crate::e(ring3::err::EAGAIN)
@@ -738,7 +739,7 @@ static mut SLOT_FS: [u64; NSLOTS] = [0; NSLOTS];
 
 /// The slot's fs_base (what `switch_to` installs). A slot >= NSLOTS is the
 /// idle thread: kernel-only, no TLS, and the answer 0 is never installed.
-pub(crate) fn slot_fs_of(slot: usize) -> u64 {
+pub fn slot_fs_of(slot: usize) -> u64 {
     if slot < NSLOTS {
         // SAFETY: single core, IF-clear callers (see SLOT_FS).
         unsafe { SLOT_FS[slot] }
@@ -748,7 +749,7 @@ pub(crate) fn slot_fs_of(slot: usize) -> u64 {
 }
 
 /// Stamp the slot's fs_base (crossings and the `arch_prctl` SET_FS arm).
-pub(crate) fn set_slot_fs(slot: usize, v: u64) {
+pub fn set_slot_fs(slot: usize, v: u64) {
     if slot < NSLOTS {
         // SAFETY: single core, IF-clear callers (see SLOT_FS).
         unsafe { SLOT_FS[slot] = v; }
@@ -765,14 +766,14 @@ pub(crate) fn set_slot_fs(slot: usize, v: u64) {
 /// not move. Bounded ring; pid reuse just overwrites an entry.
 static mut PARENT_OF: [(u32, u32); 256] = [(0, 0); 256];
 
-pub(crate) fn stamp_child_parent(child: u32, parent: u32) {
+pub fn stamp_child_parent(child: u32, parent: u32) {
     // SAFETY: single core, IF-clear syscall-path caller (fork arm).
     let p = unsafe { &mut *core::ptr::addr_of_mut!(PARENT_OF) };
     p[child as usize % p.len()] = (child, parent);
 }
 
 /// 0 = unknown (an M2-spawned child, or the map's ring moved past it).
-pub(crate) fn parent_of(child: u32) -> u32 {
+pub fn parent_of(child: u32) -> u32 {
     // SAFETY: single core, IF-clear syscall-path caller (wait4 arms).
     let p = unsafe { &*core::ptr::addr_of_mut!(PARENT_OF) };
     let mut i = 0;
@@ -890,7 +891,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
 /// to `X86ArchHooks::read_user_context` — this twin's per-slot record
 /// (slice 2), written here. One plain copy per syscall on a slotted task;
 /// the boot task (NO_SLOT) skips.
-pub(crate) fn capture_user_context(fr: &ring3::SyscallFrame) {
+pub fn capture_user_context(fr: &ring3::SyscallFrame) {
     let slot = crate::exec_twin::current_slot();
     if slot == crate::exec_twin::NO_SLOT || slot >= NSLOTS {
         return;
@@ -1108,7 +1109,7 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     let slot_idx = {
         // SAFETY: syscall-path discipline.
         let s = slots();
-        let mut idx = unsafe { core::ptr::read_volatile(&raw const NEXT_SLOT) };
+        let idx = unsafe { core::ptr::read_volatile(&raw const NEXT_SLOT) };
         let mut idx = idx % NSLOTS;
         let mut tries = 0;
         loop {
@@ -1701,6 +1702,7 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
         // SAFETY: syscall-path discipline.
         let s = slots();
         let mut pick: Option<usize> = None;
+        #[allow(clippy::needless_range_loop)] // `i` is the slot number, not just an index
         for i in 0..NSLOTS {
             if !s[i].running {
                 pick = Some(i);
