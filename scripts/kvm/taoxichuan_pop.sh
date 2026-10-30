@@ -36,10 +36,13 @@ export PATH=$HOME/.cargo/bin:$PATH
 
 build() {
     git -C "$REPO" fetch -q origin "$BRANCH"
+    # FETCH_HEAD is per-worktree: resolve it in the main repo, hand over the sha.
+    local sha
+    sha=$(git -C "$REPO" rev-parse FETCH_HEAD)
     if [ -d "$WT/.git" ] || [ -f "$WT/.git" ]; then
-        git -C "$WT" checkout -q --detach FETCH_HEAD
+        git -C "$WT" checkout -q --detach "$sha"
     else
-        git -C "$REPO" worktree add -q --detach "$WT" FETCH_HEAD
+        git -C "$REPO" worktree add -q --detach "$WT" "$sha"
     fi
     echo "checked out $(git -C "$WT" log --oneline -1)"
     (cd "$WT/taoxichuan" &&
