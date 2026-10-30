@@ -1950,7 +1950,11 @@ fn lstat_path(path: &str, buf: u64) -> u64 {
             let full = if parent == "/" { alloc::format!("/{name}") } else { alloc::format!("{parent}/{name}") };
             fs.metadata(&full).map_or(0o100644, |m| m.mode)
         };
-        match fill_stat64(buf, 0, mode, ent.size, if ent.is_dir { 2 } else { 1 }) {
+        // The entry's own inode (see `stat_ino`: an all-zero (dev, ino) made
+        // busybox `cp -r` hard-link distinct files together).
+        let full = if parent == "/" { alloc::format!("/{name}") } else { alloc::format!("{parent}/{name}") };
+        let ino = fs.resolve_inode(&full).map_or(0, u64::from);
+        match fill_stat64(buf, ino, mode, ent.size, if ent.is_dir { 2 } else { 1 }) {
             Ok(()) => 0,
             Err(no) => e(no),
         }
