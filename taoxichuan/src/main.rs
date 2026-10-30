@@ -3854,10 +3854,17 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::LINKAT => {
-            // No hardlink arm on the ext2 trait yet; apk only needs it for
-            // packages that ship hard-linked files. The checklist print
-            // above will say if this one is real.
-            e(ring3::err::ENOSYS)
+            // `linkat(olddirfd, old, newdirfd, new, flags)`; the legacy `link`
+            // folds here with AT_FDCWD for both. Flags (AT_SYMLINK_FOLLOW) are
+            // accepted and ignored: a hard link names the inode the path names.
+            let (odir, opath, ndir, npath) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
+            path_at(opath, odir, |old| {
+                let old = resolve_effective(old);
+                path_at(npath, ndir, |new| match root_fs().link(&old, &resolve_effective(new)) {
+                    Ok(()) => 0,
+                    Err(err) => e(fs_err(err)),
+                })
+            })
         }
         ring3::nr::FCHMODAT => {
             // The mode bits are real (ext2's chmod): ld chmods its output
