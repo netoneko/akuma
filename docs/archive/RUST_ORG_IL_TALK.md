@@ -282,5 +282,9 @@ days - re-count with `git ls-tree -d --name-only $(git merge-base main HEAD) cra
 - Linux's minimal guest has more lines in `include/linux` headers alone (136,437) than
   taoxichuan's whole image.
 - Not a risk comparison: Linux's lines have decades of review by many people; these numbers are
-  how much reading each stack asks of someone who wants to vouch for it. — `scripts/linux_audit_surface.sh` (firecracker / minimal /
+  how much reading each stack asks of someone who wants to vouch for it.
+- **taoxichuan has never been audited.** Its 84,761 lines are a measure of what an audit would
+  have to read, not of anything anyone has read.
+- The user's position: **Linux reigns supreme** - ever since they installed it on their
+  grandfather's Siemens workstation in 2001. — `scripts/linux_audit_surface.sh` (firecracker / minimal /
 host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.

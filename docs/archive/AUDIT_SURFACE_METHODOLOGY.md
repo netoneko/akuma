@@ -196,6 +196,9 @@ natively on the ryzen's Pop!_OS (`NATIVE=1`, gcc 11, `-j8` under `nice 19`).
   firecracker and host builds, against a third for the Rust kernels' `#[cfg]`: Linux's
   per-config pruning happens mostly at the file level (Kbuild), Rust's mostly inside files.
 - The Linux host + firecracker union shares 1,368,990 lines; Akuma's shares 77,090.
+- **None of the Akuma kernels has been audited, taoxichuan included.** Its numbers are the size of
+  the reading an audit would take, not a claim that the reading was done; Linux's lines have had
+  decades of it.
 - Build-time host code: Linux 22-25k lines (Kbuild's host programs) against 31.7-50.8k for the
   Rust kernels (proc-macros, `syn` above all).
 
