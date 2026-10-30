@@ -359,6 +359,28 @@ inline).
 | Linux ABI | Partial | 245 x86_64 syscalls dispatched (measured at `7861bff`) | 198 on amd64; runs rustc and cargo |
 | Verification target | Little | The framework (Verus) | Pure crates - a future possibility; practical tests today |
 
+**Linux ABI coverage on x86_64** (counted 2026-10-30 from each kernel's dispatch: Asterinas
+`kernel/core/src/syscall/arch/x86.rs` at `7861bff`; Akuma amd64 = `akuma-syscalls-abi` rows + amd64's
+native arms + legacy folds; taoxichuan = `dispatch_inner`'s arms + legacy folds, without the 38 its
+wrong `GETPID` constant answers - see `SYSCALL_CONSTANT_AUDIT_2026_10_30.md`). Dispatched calls,
+not completeness: some handlers on every side are partial.
+
+| | taoxichuan | Akuma amd64 | Asterinas |
+|---|---:|---:|---:|
+| syscalls dispatched | 120 | 198 | 245 |
+| share of Linux 6.18's 383 | 31% | 52% | 64% |
+
+- Akuma amd64 serves 71% of Asterinas's set (174 of 245); 88% of Akuma's set is also in Asterinas.
+  Together they cover 269 (70% of Linux). Asterinas-only: namespaces, cgroups, inotify, xattrs,
+  POSIX timers, the new mount API; Akuma-only: SysV message queues, Linux AIO, the clock setters.
+- taoxichuan serves 60% of Akuma amd64's set and 48% of Asterinas's; **98% of taoxichuan's calls
+  are in each of the other two** - a near-pure ladder, taoxichuan (120) inside Akuma amd64 (198)
+  inside Asterinas (245). taoxichuan-only against Akuma amd64: `sendfile`, `getrlimit` (the minimal
+  kernel got them first); against Asterinas: `membarrier`, `copy_file_range`.
+- **taoxichuan builds itself, runs `cargo -j4`, git, HTTPS curl and apk on 31% of Linux's x86_64
+  syscalls** (the experiment brief had estimated 70-90 calls for self-hosting).
+- Akuma's AArch64 kernel dispatches 201 of the 325 asm-generic calls (62%).
+
 What userspace buys over a unikernel: fault containment, a smaller exploit blast radius,
 enforcement points, multi-process workloads (`cargo -j4`) and unmodified binaries that can be
 signed separately from the kernel. What it costs: syscall-crossing overhead, and complexity (CoW
