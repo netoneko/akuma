@@ -121,8 +121,15 @@ usage API; full method and tables in the agent log, "GLM tokenomics from the goo
   million. Part of the gap is the model split and part is outside the ledger: the GLM-5.3 day
   costs ~1,000 credits more than Flash would (~0.1 Lite week), and 10-20/21's 115M Flash tokens
   (another machine) add ~0.4 week if they fell inside the reset weeks, bringing the formula to
-  ~2.4 of the user's 3 weeks. **Not all of it:** the three quota readings were taken in
-  Flash-only windows and still show ~50 credits per million against the formula's ~36.
+  ~2.4 of the user's 3 weeks. **Not all of it:** the quota readings were taken in Flash-only
+  windows and are consistently token-based - ~195M Flash tokens per Lite week (five readings,
+  192-203M) and ~35M per 5 hours - which sits between z.ai's own Lite estimates for Flash with no
+  off-peak discount (146M/week) and with all of it (292M), although 97% of the calls were
+  off-peak. z.ai's docs apply the off-peak rate to Flash (current plan 50%; legacy V2 plans 0.4x
+  off-peak / 1.2x peak); the user's experience is that Flash gets no discount. Unresolved; a
+  legacy-V2 subscription would use different arithmetic from the credit formula used here.
+- The worker was **GLM-5.3-Flash**, which the user rates a bit below Sonnet level; the
+  supervisor and executor was Claude Sonnet 5.5.
 - A refined-process milestone (after the 2026-10-26 methodology change) costs **1.6-46M tokens,
   $0.07-1.84** at API prices: `apk update` 6.3M ($0.26), `apk add curl` 7.0M, dynamic PIE 28.3M
   ($0.97), curl over HTTPS 46.4M ($1.84). The median execution milestone is about 16M, $0.60.

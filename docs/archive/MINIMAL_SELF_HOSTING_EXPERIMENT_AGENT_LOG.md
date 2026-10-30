@@ -1710,8 +1710,12 @@ output per million, GLM-5.3 $1.4 / $0.26 / $4.4.
   point): GLM-5.3's day-one 16.1M tokens cost ~1,540 credits (off-peak Saturday), ~1,000 more than the same tokens on Flash
   (~0.1 week, already inside the formula's 20,251); 10-20/21's 115M Flash tokens are not in this ledger and add ~4,100
   credits (~0.4 week) if they fell inside the reset weeks - ~2.4 weeks by the formula against 3. Not all of it: the three
-  readings above were taken in Flash-only windows and still give ~50 credits per million against ~36; the off-peak discount
-  not applying as documented would account for most of that.
+  readings above were taken in Flash-only windows and still give ~50 credits per million against ~36. Corrected the same
+  day: the readings are token-based and consistent (~195M Flash tokens per Lite week over five readings, ~35M per 5 hours),
+  between z.ai's own Lite estimates for Flash with no off-peak discount (146M/week) and with the full discount (292M), so
+  neither "no discount" nor "the documented discount" fits. z.ai's docs (devpack overview, the GLM-5.3-Flash page, the
+  2026-07-30 plan revision: legacy V2 Flash 0.4x off-peak / 1.2x peak) all apply an off-peak rate to Flash; the user's
+  experience is that Flash gets none. Unresolved; a legacy-V2 subscription would not follow the credit formula at all.
 - **Refined-process milestones** (sessions from 10-26, grouped by milestone from the ledger's session names and times):
 
 | milestone | tokens | API $ |
