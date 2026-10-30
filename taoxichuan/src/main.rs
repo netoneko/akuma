@@ -696,6 +696,8 @@ const USER_STACK_PAGES: u64 = 16;
 const MMAP_SLAB: u64 = 0x4000_0000;
 /// Hole-table size per task (see `Task::holes`).
 const MAX_HOLES: usize = 64;
+/// Writable shared file mappings tracked per task (see `Task::shared`).
+const MAX_SHARED: usize = 8;
 /// errnos `akuma_ring3_amd64::err` does not carry.
 pub(crate) const EINTR: u64 = 4;
 pub(crate) const ESRCH: u64 = 3;
@@ -830,6 +832,13 @@ struct Task {
     /// The path of the running image, what `readlink("/proc/self/exe")`
     /// answers (rust-lld's wrapper and `std::env::current_exe` ask).
     exe: alloc::string::String,
+    /// Writable `MAP_SHARED` file mappings: `(base, len, inode, file offset,
+    /// file size at map time)`. The pages are private frames filled from the
+    /// file (there is no page cache), so they are copied back on `munmap`,
+    /// `msync`, exec and exit - what `rust-lld`'s `FileOutputBuffer` needs to
+    /// leave a real ELF behind (`docs/archive/AKUMA_SELF_HOSTING.md`).
+    shared: [(u64, u64, u32, u64, u64); MAX_SHARED],
+    n_shared: usize,
     /// Unmapped holes below `mmap_cur` in the mmap slab, sorted by nothing,
     /// merged when they touch: `munmap` records them, `mmap` reuses them
     /// first-fit before bumping the cursor. Full table: the hole is leaked
@@ -866,6 +875,8 @@ impl Task {
             sigact: [[0; 4]; 65],
             sigmask: 0,
             exe: alloc::string::String::new(),
+            shared: [(0, 0, 0, 0, 0); MAX_SHARED],
+            n_shared: 0,
             holes: [(0, 0); MAX_HOLES],
             n_holes: 0,
             cwd: alloc::string::String::new(),
@@ -1077,6 +1088,62 @@ fn mmap_alloc(t: &mut Task, bytes: u64) -> Option<u64> {
     Some(base)
 }
 
+/// Copy the pages of every writable `MAP_SHARED` file mapping that overlap
+/// `[lo, hi)` back to their files (clamped to the file's size at map time),
+/// and with `forget` drop the records wholly inside the range.
+#[allow(clippy::many_single_char_names)] // s/e are the clipped range
+fn shared_writeback(t: &mut Task, lo: u64, hi: u64, forget: bool) {
+    let mut i = 0;
+    while i < t.n_shared {
+        let (base, len, ino, off, fsize) = t.shared[i];
+        let (s, e) = (base.max(lo), (base + len).min(hi));
+        if s < e {
+            let mut va = s & !0xFFF;
+            while va < e {
+                if let Some(pa) = paging::translate_in(t.root_pa, va as usize) {
+                    let file_off = off + (va - base);
+                    if file_off < fsize {
+                        let n = (fsize - file_off).min(4096) as usize;
+                        let mut page = [0u8; 4096];
+                        // SAFETY: `pa` is a mapped user frame inside the physmap
+                        // and `n <= 4096` stays within it.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(phys::phys_ptr::<u8>(pa), page.as_mut_ptr(), n);
+                        }
+                        let _ = root_fs().write_at_by_inode(ino, file_off as usize, &page[..n]);
+                    }
+                }
+                va += 4096;
+            }
+            if forget && s == base && e == base + len {
+                t.n_shared -= 1;
+                t.shared[i] = t.shared[t.n_shared];
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Write back every shared file mapping the running task still holds (exit,
+/// exec): the mapping dies with the address space.
+pub(crate) fn shared_flush_all() {
+    let t = task();
+    if t.n_shared != 0 {
+        shared_writeback(t, 0, u64::MAX, true);
+    }
+}
+
+/// `msync(addr, len, flags)`: the POSIX flush point lld uses.
+fn msync_arm(addr: u64, len: u64) -> u64 {
+    if addr & 0xFFF != 0 {
+        return e(ring3::err::EINVAL);
+    }
+    let t = task();
+    shared_writeback(t, addr, addr.saturating_add(len), false);
+    0
+}
+
 /// `munmap(addr, len)` for the mmap slab: free the frames, record the hole.
 /// Ranges outside the slab (the brk area, a stack) are accepted and ignored.
 fn munmap_arm(addr: u64, len: u64) -> u64 {
@@ -1096,6 +1163,7 @@ fn munmap_arm(addr: u64, len: u64) -> u64 {
         return 0;
     }
     let t = task();
+    shared_writeback(t, addr, end, true);
     mm_event(1, addr, end);
     release_pages(t.root_pa, addr, end);
     add_hole(t, addr, end);
@@ -2702,15 +2770,19 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // because its address space dies with it).
             let anon = flags & ring3::mmap::MAP_ANONYMOUS != 0;
             let mut fnode: Option<u32> = None;
+            let mut fsize = 0u64;
             if !anon {
                 // `Some(Some(inode))` = a bound regular file; anything else
                 // (unbound, socket, dir, child pipe) has no file to map.
                 let mapped = fd_table().with(fd as u32, |d| match d {
-                    OpenFile::File { inode, .. } => Some(*inode),
+                    OpenFile::File { inode, size, .. } => Some((*inode, *size)),
                     _ => None,
                 });
                 match mapped {
-                    Some(Some(node)) => fnode = Some(node),
+                    Some(Some((node, size))) => {
+                        fnode = Some(node);
+                        fsize = size;
+                    }
                     _ => return e(ring3::err::ENODEV),
                 }
             }
@@ -2789,10 +2861,22 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if base + pages > t.mmap_cur {
                 t.mmap_cur = base + pages;
             }
+            if let Some(node) = fnode {
+                const MAP_SHARED: u64 = 0x1;
+                if flags & MAP_SHARED != 0 && prot & ring3::mmap::PROT_WRITE != 0 {
+                    if t.n_shared < MAX_SHARED {
+                        t.shared[t.n_shared] = (base, pages, node, off, fsize);
+                        t.n_shared += 1;
+                    } else {
+                        akuma_primitives::safe_print!(96, "[mmap] shared-file table full: writes to this mapping are lost\n");
+                    }
+                }
+            }
             base
         }
         ring3::nr::MPROTECT => mprotect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::MUNMAP => munmap_arm(fr.arg1(), fr.arg2()),
+        26 => msync_arm(fr.arg1(), fr.arg2()),
         ring3::nr::READ => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
             read_fd_arm(fd, buf, len)
@@ -4344,6 +4428,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     t.exit = None;
     t.mmap_cur = MMAP_BASE;
     t.n_holes = 0;
+    t.n_shared = 0;
     t.sigalt = SIGALT_OFF;
     // execve: caught handlers go back to SIG_DFL, ignored ones stay ignored.
     for a in &mut t.sigact {

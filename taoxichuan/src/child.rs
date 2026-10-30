@@ -632,6 +632,8 @@ pub fn task_die_segv() -> ! {
 }
 
 fn task_exit_status(status: u32) -> ! {
+    // A shared file mapping persists at exit (rust-lld never munmaps its output).
+    crate::shared_flush_all();
     let cur = crate::exec_twin::current_slot();
     // The group's leader slot: `cur` itself unless a thread is the one
     // calling `exit_group`, in which case the leader's status and waiter are
@@ -813,6 +815,8 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     }
     let argv: Vec<&str> = args.argv.iter().map(String::as_str).collect();
     let env: Vec<&str> = args.env.iter().map(String::as_str).collect();
+    // The image about to be replaced may hold shared file mappings.
+    crate::shared_flush_all();
     // POSIX exec keeps open fds across the image swap — snapshot, load,
     // restore, sweep cloexec (the exec_replace discipline).
     let saved = {
