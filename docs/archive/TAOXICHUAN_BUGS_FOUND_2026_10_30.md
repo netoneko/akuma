@@ -150,3 +150,19 @@ Now `cow_prepare_write` returns whether the write may proceed and `copy_to_user`
 against the glue's old formula kept verbatim) found a real difference in the crate: `SIG_UNBLOCK` used `cur & !(set & !UNBLOCKABLE)`, leaving a stray SIGKILL/SIGSTOP bit in `cur` set forever; it is `cur & !set`, as the glue always had.
 Glue's `rt_sigaction` was **not** switched: it is looser than the crate's `check` (a wrong `sigsetsize` silently zeroes the mask instead of `EINVAL`; a *query* of SIGKILL/SIGSTOP is refused), and changing that
 would change the AArch64 kernel's behaviour. A pinned divergence, not an accident.
+
+## 11. `COW_REFCOUNTS` was a `BTreeMap` (one heap node per shared frame) - FIXED
+
+`akuma-pmm`'s share-count table was `Spinlock<BTreeMap<usize, u16>>`: a fork of a 100k-page process made 100k heap allocations while holding the lock. It is now
+`cow_table::CowTable`: a fixed array of 4096 chunk pointers, each chunk 4096 `u16` counters covering 16 MiB of physical address space, allocated on the first share in
+its range and freed with its last count; addresses at or above 64 GiB fall back to a map, so the type is total. A share costs no allocation unless it opens a chunk.
+Pinned by a differential test (40 seeds x 4000 random inc/dec over addresses that straddle a chunk edge and the 64 GiB cutoff) against the old map's exact bodies, a 100k-share
+test (25 chunks, not 100k nodes), and the existing `cow_refcount_tests`. Cost: 32 KiB of `.bss` for the pointer array (RAM, not image). Shared with the AArch64 kernel;
+that kernel was not run here. Leak gate on taoxichuan: delta 0, `shared=15520 copied=320 taken=320`, unchanged.
+
+## 12. `open("/dev/null")` after `close(0)` does not return 0 - OPEN
+
+busybox ash starts every `&` background job with `close(0); if (open("/dev/null", O_RDONLY) != 0) error("can't open '/dev/null'")`: it relies on POSIX's lowest-free-fd rule.
+`open_common` serves `/dev/null` with `alloc_fd_from(3, ..)` because fds 0-2 are implicit console slots, so the open returns 3 and every `cmd &` in a script prints
+`/bin/sh: can't open '/dev/null': <stale errno>` (and the job does not run). Reproduced on TCG with `(echo b > /dev/null 2>&1 &)`. Found when a launcher used `nohup ... &` inside the guest.
+Not a regression (the allocation rule is old). The fix is to let a *closed* std fd be reallocated: remember `close(0..2)` per task and allocate the lowest free fd from 0.

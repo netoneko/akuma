@@ -9,7 +9,7 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1476
+- **Total distinct fixes counted:** 1477
 - **Docs contributing at least one fix:** 407
 - **Subsystem categories:** 15
 
@@ -27,7 +27,7 @@ from several subsystems under one write-up.
 | VFS & Filesystem | 134 | 9.1% | 40 |
 | Boot & Drivers | 141 | 9.6% | 22 |
 | Signals & Exceptions | 40 | 2.7% | 15 |
-| Misc / Cross-cutting | 65 | 4.4% | 20 |
+| Misc / Cross-cutting | 66 | 4.5% | 20 |
 | Console & Terminal | 58 | 3.9% | 18 |
 | Containers | 55 | 3.7% | 10 |
 | **Total** | **1470** | **100.0%** | **406** |
@@ -2079,7 +2079,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_METAL_CONTROL_RUN.md
 - Emulating a trapped `MRS` with `rt == 31` on AArch64 wrote word 31 of the trap frame (`sp_el0`) instead of discarding the result as `XZR`, as the read side already did
 
-## Misc / Cross-cutting (65 fixes, 20 docs)
+## Misc / Cross-cutting (66 fixes, 20 docs)
 
 ### docs/archive/AKUMA_KVM.md
 (The SVM phases — trivial guest, permission maps + AP hook, the 12-probe consistency ladder, the long-mode metal PASS, the two-level translation phase — are capability, not fixes; the ladder is an instrument, not a defect. These are the two defects the phases surfaced.)
@@ -2204,6 +2204,7 @@ aren't recorded anywhere else.)
 - the guest clock ran 1.52x fast under KVM: with no PIT behind port 0x61 the TSC rate fell back to a fixed 2.5 GHz guess while the LAPIC calibration, a line earlier, had measured the real 3.793 GHz; it now uses `tsc_hz()` from the LAPIC (a TCG guest, where the guess made the clock 2.5x slow, is fixed too)
 - `copy_to_user` wrote through the physmap into an unmarked read-only page that several spaces held (and, when the CoW break failed for lack of a frame, discarded the failure and wrote into the still-shared frame), corrupting the other holder; both now answer `EFAULT`
 - `SIG_UNBLOCK` in `akuma-syscalls-signal` left a stray SIGKILL/SIGSTOP bit in the mask forever (`cur & !(set & !UNBLOCKABLE)` instead of `cur & !set`), found by the differential test against the glue formula it replaced
+- `akuma-pmm`'s CoW share-count table was a `BTreeMap` (a heap node per shared frame, so forking a 100k-page process made 100k allocations under the lock); it is a lazily-chunked flat table, differential-tested against the old map
 - the 1 GiB per-process mmap slab answered `ENOMEM` to `rustc`'s thread-stack `mmap` (it maps a 311 MB `librustc_driver` plus a ~17 MB stack per codegen thread), which musl reports as `EAGAIN` ("failed to spawn work thread", an ICE) with 2 GiB of RAM free; the slab is 16 GiB of reserved address space
 
 ## Console & Terminal (58 fixes, 18 docs)
