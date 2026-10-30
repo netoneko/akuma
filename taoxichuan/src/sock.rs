@@ -133,6 +133,7 @@ fn fd_events(fd: i32, events: i16) -> i16 {
         return 0;
     }
     let mut efd_idx: usize = usize::MAX;
+    let mut pipe_rev: i16 = 0;
     let kind = crate::fd_table().with(fd as u32, |d| match d {
         crate::OpenFile::Socket(_) => 1,
         crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
@@ -147,15 +148,24 @@ fn fd_events(fd: i32, events: i16) -> i16 {
             } else {
                 crate::pipes::readable(*id)
             };
-            if ready {
-                if *is_write {
-                    POLLOUT
-                } else {
-                    POLLIN
-                }
-            } else {
+            // The readiness rides OUT of the closure in `pipe_rev`: this arm
+            // used to return POLLIN/POLLOUT as the KIND, and POLLOUT (4) is
+            // the eventfd kind - polling a pipe's write end indexed the
+            // eventfd table with usize::MAX and panicked the kernel (found
+            // when rustc polled its jobserver pipe, 2026-10-30).
+            pipe_rev = if !ready {
                 0
-            }
+            } else if *is_write {
+                POLLOUT
+            } else {
+                POLLIN
+            };
+            5
+        }
+        crate::OpenFile::Pair(rd, wr) => {
+            pipe_rev = (if crate::pipes::readable(*rd) { POLLIN } else { 0 })
+                | (if crate::pipes::writable(*wr) { POLLOUT } else { 0 });
+            5
         }
         crate::OpenFile::Session => 3, // the session stdio: always ready
         crate::OpenFile::EventFd(slot) => {
@@ -185,6 +195,7 @@ fn fd_events(fd: i32, events: i16) -> i16 {
         }
         Some(2) => POLLIN | POLLOUT,
         Some(3) => events & POLLOUT,
+        Some(5) => pipe_rev & events,
         Some(4) => {
             // An eventfd (session Q): readable while its counter is
             // non-zero, always writable — `FdState::EventFd`'s answers,

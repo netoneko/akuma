@@ -700,6 +700,11 @@ pub(crate) enum OpenFile {
     /// resource — every dup/fork copy bumps it (`pipes::clone_ref`), every
     /// close/exit drops it (`pipes::release`), or EOF never arrives.
     Pipe(u32, bool),
+    /// One end of a `socketpair(AF_UNIX)`: a read-from pipe id and a
+    /// write-to pipe id, so a single fd is bidirectional. Both are counted
+    /// pipe ends exactly like `Pipe`'s (`pipe_ends`). Message boundaries of
+    /// `SOCK_SEQPACKET` are not kept: it is a byte stream.
+    Pair(u32, u32),
     /// The null device: reads are EOF, writes are discarded, seeks are no-ops.
     /// Stage 7 (H2): `/dev/null` used to be an EACCES ext2 lookup failure,
     /// which cost every `dd of=/dev/null` and plenty of applet noise.
@@ -731,6 +736,18 @@ pub(crate) enum OpenFile {
     /// around a redirect lands on a real description. No kernel resource
     /// sits behind it — displacing or closing it releases nothing.
     Session,
+}
+
+impl OpenFile {
+    /// The counted pipe ends this description holds (0, 1 or 2): what a
+    /// dup, fork, exec sweep or close adds or drops a reference for.
+    pub(crate) fn pipe_ends(&self) -> ([(u32, bool); 2], usize) {
+        match self {
+            OpenFile::Pipe(id, w) => ([(*id, *w), (0, false)], 1),
+            OpenFile::Pair(r, w) => ([(*r, false), (*w, true)], 2),
+            _ => ([(0, false); 2], 0),
+        }
+    }
 }
 
 /// The one task: its root page table, the user ranges a pointer may name, the
@@ -1515,7 +1532,7 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
         // `fstat_size(0)` and only trusts the byte count for a REGULAR file -
         // a pipe that stats as one made every piped pack "junk at the end".
         OpenFile::Pipe(..) | OpenFile::ChildOut(_) => Some((0, 0, 3)),
-        OpenFile::Socket(_) => Some((0, 0, 4)),
+        OpenFile::Socket(_) | OpenFile::Pair(..) => Some((0, 0, 4)),
         OpenFile::Null | OpenFile::Random => Some((0, 0, 5)),
         _ => Some((0, 0, 2)),
     });
@@ -1555,6 +1572,7 @@ fn clone_desc(d: &OpenFile) -> OpenFile {
         OpenFile::Socket(i) => OpenFile::Socket(*i),
         OpenFile::ChildOut(i) => OpenFile::ChildOut(*i),
         OpenFile::Pipe(id, w) => OpenFile::Pipe(*id, *w),
+        OpenFile::Pair(r, w) => OpenFile::Pair(*r, *w),
         OpenFile::EventFd(i) => OpenFile::EventFd(*i),
         OpenFile::Null => OpenFile::Null,
         OpenFile::Random => OpenFile::Random,
@@ -1651,6 +1669,10 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
                 pipe_id = *id as usize;
                 4
             }
+            OpenFile::Pair(rd, _) => {
+                pipe_id = *rd as usize;
+                4
+            }
             OpenFile::Random => 5,
             _ => 0,
         });
@@ -1708,7 +1730,7 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
             // default `Ok(0)` — which is the device's contract.
             OpenFile::Pipe(_, true) => res = Err(ring3::err::EBADF),
             OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::EventFd(_) | OpenFile::Null
-            | OpenFile::Random | OpenFile::Session
+            | OpenFile::Random | OpenFile::Session | OpenFile::Pair(..)
             | OpenFile::Pipe(_, false) => {}
         });
         match (found, res) {
@@ -1909,6 +1931,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     pipe_id = *id as usize;
                     5
                 }
+                OpenFile::Pair(_, wr) => {
+                    pipe_id = *wr as usize;
+                    5
+                }
                 _ => 0,
             });
             match kind {
@@ -1926,7 +1952,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if fd != 1 && fd != 2 {
                 return e(ring3::err::EBADF);
             }
-            if child::nested_active() && fd == 1 {
+            // stderr of a session's programs joins the session stream (one
+            // buffer, as on a pty): fd 2 used to fall to the console, so
+            // `ls /nonexistent`, git's `fatal:` and rustc's errors never
+            // reached the ssh client.
+            if child::nested_active() {
                 if !child::child_write(buf, len) {
                     return e(ring3::err::EFAULT);
                 }
@@ -1998,6 +2028,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     pipe_id = *id as usize;
                     5
                 }
+                OpenFile::Pair(_, wr) => {
+                    pipe_id = *wr as usize;
+                    5
+                }
                 _ => 0,
             });
             match kind {
@@ -2035,7 +2069,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }            // The pipe branch of `write` applies per iovec: musl flushes a
             // buffered stdout as one writev, and a nested child's version
             // string belongs to the ssh session, not the console.
-            let piped = child::nested_active() && fd == 1;
+            let piped = child::nested_active();
             let mut total = 0u64;
             for i in 0..iovcnt {
                 let mut iv = [0u8; 16];
@@ -2532,8 +2566,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     };
                     // The copy is a real reference (as the DUP arm): a
                     // cloned pipe end bumps the table's end count.
-                    if let OpenFile::Pipe(id, w) = &desc {
-                        pipes::clone_ref(*id, *w);
+                    {
+                        let (ends, n) = desc.pipe_ends();
+                        for (id, w) in &ends[..n] {
+                            pipes::clone_ref(*id, *w);
+                        }
                     }
                     let newfd = table.alloc_fd_from(slot, desc);
                     if cmd == 1030 {
@@ -2573,6 +2610,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     // A pipe end drops its table reference here — the last
                     // writer's close is what makes the reader's EOF arrive.
                     pipes::release(*id, *w);
+                    3
+                }
+                OpenFile::Pair(r, w) => {
+                    pipes::release(*r, false);
+                    pipes::release(*w, true);
                     3
                 }
                 _ => 0,
@@ -2667,7 +2709,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                 }
                 OpenFile::File { .. } | OpenFile::Socket(_) | OpenFile::ChildOut(_)
-                | OpenFile::EventFd(_) | OpenFile::Null | OpenFile::Random | OpenFile::Session => {
+                | OpenFile::EventFd(_) | OpenFile::Null | OpenFile::Random | OpenFile::Session
+                | OpenFile::Pair(..) => {
                     res = Err(ring3::err::ENOTDIR);
                 }
                 OpenFile::Pipe(_, false) => {
@@ -3072,8 +3115,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             };
             // The copy is a real reference: a cloned pipe end bumps the
             // table's count or the first close kills the other fd's end.
-            if let OpenFile::Pipe(id, w) = &desc {
-                pipes::clone_ref(*id, *w);
+            {
+                let (ends, n) = desc.pipe_ends();
+                for (id, w) in &ends[..n] {
+                    pipes::clone_ref(*id, *w);
+                }
             }
             let mut table = fd_table();
             let Some(_slot) = table.free_below(3, SLOT_CEILING) else {
@@ -3100,14 +3146,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // `dup2(10, 1)` needs the save slot, and a future
             // `dup2(1, 5)` needs a source.
             bind_session_fd(old);
-            let src_pipe = fd_table().with(old as u32, |d| {
-                if let OpenFile::Pipe(id, w) = d {
-                    Some((*id, *w))
-                } else {
-                    None
-                }
-            })
-            .flatten();
+            let src_pipe = fd_table().with(old as u32, |d| d.pipe_ends());
             match fd_table().dup_to(old as u32, new as u32, is_dup3 && flags & O_CLOEXEC != 0) {
                 Ok(d) => {
                     // Whatever `new` named is displaced: release a displaced
@@ -3117,11 +3156,16 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     // real reference too — the end count must follow it.
                     if let Some(OpenFile::Socket(idx)) = d.displaced {
                         akuma_net::socket::remove_socket(idx);
-                    } else if let Some(OpenFile::Pipe(id, w)) = d.displaced {
-                        pipes::release(id, w);
+                    } else if let Some(disp) = &d.displaced {
+                        let (ends, n) = disp.pipe_ends();
+                        for (id, w) in &ends[..n] {
+                            pipes::release(*id, *w);
+                        }
                     }
-                    if let Some((id, w)) = src_pipe {
-                        pipes::clone_ref(id, w);
+                    if let Some((ends, n)) = src_pipe {
+                        for (id, w) in &ends[..n] {
+                            pipes::clone_ref(*id, *w);
+                        }
                     }
                     new
                 }
@@ -3192,7 +3236,9 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         // Akuma private: libakuma's sshd/sh ask for uptime; the clock arm's
         // elapsed-time source, in microseconds.
         ring3::nr::UPTIME => net::uptime_us(),
-        ring3::nr::SOCKET => sock::socket_arm(fr.arg1(), fr.arg2(), fr.arg3()),        ring3::nr::BIND => sock::bind_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        akuma_syscalls_abi::x86_64::SOCKETPAIR => pipes::socketpair_arm(fr.arg1(), fr.arg2(), fr.arg4()),
+        ring3::nr::SOCKET => sock::socket_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+               ring3::nr::BIND => sock::bind_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::LISTEN => sock::listen_arm(fr.arg1(), fr.arg2()),
         ring3::nr::ACCEPT => sock::accept_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::CONNECT => sock::connect_arm(fr.arg1(), fr.arg2(), fr.arg3()),

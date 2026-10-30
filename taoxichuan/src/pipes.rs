@@ -130,6 +130,56 @@ pub fn pipe2_arm(fds_va: u64, flags: u64) -> u64 {
     0
 }
 
+/// `socketpair(AF_UNIX, type, 0, sv)`: two pipes cross-wired so each fd reads
+/// one and writes the other. A byte stream - `SOCK_SEQPACKET` message
+/// boundaries are not kept (Rust's `Command::spawn` only needs the pair to
+/// carry a few bytes and to hang up when the other end closes).
+pub fn socketpair_arm(domain: u64, ty: u64, sv_va: u64) -> u64 {
+    const AF_UNIX: u64 = 1;
+    const SOCK_CLOEXEC: u64 = 0o2_000_000;
+    const SOCK_NONBLOCK: u64 = 0o4000;
+    if domain != AF_UNIX {
+        return crate::e(ring3::err::EAFNOSUPPORT);
+    }
+    if !matches!(ty & 0xf, 1 | 2 | 5) {
+        return crate::e(ring3::err::EINVAL);
+    }
+    if !crate::user_ok(sv_va, 8) {
+        return crate::e(ring3::err::EFAULT);
+    }
+    let a = table().create(); // end X writes, end Y reads
+    let b = table().create(); // end Y writes, end X reads
+    let mut fds = crate::fd_table();
+    let Some(xslot) = fds.free_below(3, crate::SLOT_CEILING) else {
+        table().close_read(a);
+        table().close_read(b);
+        return crate::e(ring3::err::EMFILE);
+    };
+    let x = fds.alloc_fd_from(xslot, OpenFile::Pair(b, a));
+    let Some(yslot) = fds.free_below(3, crate::SLOT_CEILING) else {
+        let _ = fds.close(x);
+        table().close_read(a);
+        table().close_read(b);
+        return crate::e(ring3::err::EMFILE);
+    };
+    let y = fds.alloc_fd_from(yslot, OpenFile::Pair(a, b));
+    for fd in [x, y] {
+        if ty & SOCK_CLOEXEC != 0 {
+            fds.set_cloexec(fd);
+        }
+        if ty & SOCK_NONBLOCK != 0 {
+            fds.set_nonblock(fd);
+        }
+    }
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&(x as u32).to_ne_bytes());
+    out[4..].copy_from_slice(&(y as u32).to_ne_bytes());
+    if !crate::copy_to_user(sv_va, &out) {
+        return crate::e(ring3::err::EFAULT);
+    }
+    0
+}
+
 /// `read` on a pipe **read** end. Drains in 512-byte chunks like the file
 /// path. Empty-with-live-writers PARKS the caller (M4 slice 3) until a
 /// writer's wake or the last close; a caller that may not park (the boot
@@ -285,6 +335,10 @@ pub fn release_open_fds() {
     while let Some((_fd, d)) = t.pop_lowest() {
         match d {
             OpenFile::Pipe(id, w) => release(id, w),
+            OpenFile::Pair(r, w) => {
+                release(r, false);
+                release(w, true);
+            }
             // The exit drops the task's socket references; the last one out
             // releases the connection (this used to leak every socket).
             OpenFile::Socket(idx) if crate::sock::socket_refs(idx) == 0 => {

@@ -55,3 +55,9 @@ legacy `open`(2)/`stat`(4)/`poll`(7)/`readlink`(89), `ioctl` (ENOTTY), then `clo
 
 Every item names its crate route in `PLAN-pn.md` §2; the order with gates and
 per-step costs is `PLAN-pn.md` §3.
+
+
+## Status 2026-10-30 (supervisor's QEMU loop; code wins over the tables above)
+Served since this page was written, each with the A/B or gate that showed it: the legacy path numbers (`akuma-syscalls-abi::legacy`, one fold for amd64 and this kernel), real `mprotect` (PTE re-map; `PROT_NONE` stays a no-op), `sigaltstack` (per-task record), `membarrier` (decode from `akuma-syscalls-mem`), `chdir`/`fchdir`/`getcwd` with a per-task cwd, `futex` (effects in `futex.rs` over `akuma-syscalls-sync`), `clone(CLONE_THREAD)` through `akuma_exec::process::clone_thread` (threads share their creator's task record, `TASK_OF`), `set_tid_address`/`gettid`, `fsync`/`fdatasync`/`sync`/`syncfs` (`fs.sync()`), `/dev/urandom`, `socketpair(AF_UNIX)` (two cross-wired pipes: a byte stream, not `SEQPACKET` messages), 1 GiB mmap / 256 MiB brk slabs, argv/env up to 128 strings of 4 KiB.
+Measured: `rustc --version` exits 0 from an ssh shell; `rustc hello.rs` reaches the link step (all codegen runs); `git clone git://...` completes. `[nosys]` still printed: `sendfile` (40), `mount`/`umount2` (165/166, apk's busybox trigger), `sched_getaffinity` (204), `prctl` (157). Not served: `sendmsg`/`recvmsg` with `SCM_RIGHTS` on a socketpair, signals beyond no-ops (S8), writable `MAP_SHARED` + `msync` (S7: without it a linker writes a 0-byte output while cargo reports success), `linkat` (ext2 op), `pwrite64`/`pwritev2` coverage for cargo.
+A program run AS init (`init=.../rustc`) cannot create a thread: init is not a registered Process (`pm` S1).

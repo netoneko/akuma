@@ -187,3 +187,12 @@ pipeline deadlock root causes, the real fork, parked wait4),
 `docs/archive/TAOXICHUAN_M4_SLICE3_VERDICT_PLAN.md`,
 `docs/archive/AKUMA_AMD64_STALE_FALSE_HOOKS.md` (the false-hook lesson),
 `docs/archive/KVM_RELAY_SYN_STALL.md` (the shared-host-core constraint).
+
+
+## Threads, pids and faults (2026-10-30)
+- **Threads.** `clone(CLONE_THREAD)` calls `akuma_exec::process::clone_thread`, which publishes a runnable slot through the same bind hook as `fork`; for a thread the hook records `TASK_OF[slot]` = the creator's task record, so regions, brk/mmap cursors, the fd table and the cwd are one copy. `exit` (60) from a thread zeroes and wakes its `clear_child_tid` word (what `pthread_join` waits on) and ends that thread; `exit_group` ends the whole group, and a thread calling it hands the status to the group leader's waiter. A thread is `SpawnSlot.thread = true` and never appears as a reapable child.
+- **One pid allocator.** Every pid, fork child or thread, comes from `akuma_exec::process::allocate_pid` (floor 2). A private counter here once issued the same pid as a thread and collapsed two table rows.
+- **Faults.** A ring-3 fault in a real fork child or thread ends that task alone with wait status SIGSEGV (`rc=139`); the shell and the boot task still halt (they have no slot to reap through).
+- **The spawn crossing marks its pool slot RUNNING around `child_enter` and TERMINATED after.** Without it the picker never takes the slot (`INITIALIZING`), and the first preempting tick parked the spawn forever (deterministic under TCG).
+- **Sockets** are closed by the last fd referencing them across all task records (`sock::socket_refs`); an exiting task releases its sockets.
+- **Known limit:** after about 15 spawns in one boot `fork` can fail with "Failed to allocate x86 task stacks" (the claim picks a slot at or above the 12-slot ring); it dies with the ring in `switch-to-crates.md` S3.

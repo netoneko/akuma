@@ -333,9 +333,9 @@ pub fn child_write(buf_va: u64, len: u64) -> bool {
 /// argv/envp read-back budget: pointer slots scanned per array, and the byte
 /// budget per string. The SPAWN callers pass `argv <= 4`, `env <= 8`; the
 /// budgets bound a malicious or confused caller, not the honest case.
-const ARGV_MAX: usize = 16;
-const ENV_MAX: usize = 16;
-const STR_MAX: usize = 256;
+const ARGV_MAX: usize = 128;
+const ENV_MAX: usize = 128;
+const STR_MAX: usize = 4096;
 
 /// Read a NUL-terminated pointer array (argv/envp shape) from the task.
 fn read_ptr_array(arr_va: u64, max: usize) -> Option<Vec<u64>> {
@@ -531,7 +531,8 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: boo
         // delivered nothing (boot ph-3 trace: pp id=1, then no cln until the
         // children's own dup2s, then wp id=1 out=NoSuchPipe).
         for d in ct.fd_names.values() {
-            if let crate::OpenFile::Pipe(id, w) = d {
+            let (ends, n) = d.pipe_ends();
+            for (id, w) in &ends[..n] {
                 crate::pipes::clone_ref(*id, *w);
             }
         }
@@ -825,8 +826,11 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
         for (_fd, payload) in table.sweep_cloexec() {
             if let crate::OpenFile::Socket(idx) = payload {
                 akuma_net::socket::remove_socket(idx);
-            } else if let crate::OpenFile::Pipe(id, w) = payload {
-                crate::pipes::release(id, w);
+            } else {
+                let (ends, n) = payload.pipe_ends();
+                for (id, w) in &ends[..n] {
+                    crate::pipes::release(*id, *w);
+                }
             }
         }
     }
@@ -1325,10 +1329,13 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
         for (_fd, payload) in table.sweep_cloexec() {
             if let crate::OpenFile::Socket(idx) = payload {
                 akuma_net::socket::remove_socket(idx);
-            } else if let crate::OpenFile::Pipe(id, w) = payload {
+            } else {
                 // A swept pipe end drops its table reference, exactly as
                 // close does.
-                crate::pipes::release(id, w);
+                let (ends, n) = payload.pipe_ends();
+                for (id, w) in &ends[..n] {
+                    crate::pipes::release(*id, *w);
+                }
             }
         }
     }
@@ -1687,7 +1694,8 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
     // clone (`fork_copy`'s own doc — "iterate the values"). The index
     // payloads the old comment excused (File{inode}, Socket(idx)) stay free.
     for d in forked.names.values() {
-        if let crate::OpenFile::Pipe(id, w) = d {
+        let (ends, n) = d.pipe_ends();
+        for (id, w) in &ends[..n] {
             crate::pipes::clone_ref(*id, *w);
         }
     }

@@ -10,6 +10,9 @@ first.
 |---|---|---|
 | G1 | **PK2 open** (M4 slice-3 PH) | `docs/archive/TAOXICHUAN_M4_SLICE3_PH_RESULT.md` — the PK2 gate does not pass |
 | G2 | **Rare boot stall** | a boot that stops before the banner with no `[Fault]`; intermittent, not yet root-caused (same PH result doc) |
+| G4 | **Init is not a Process**: a program run as init cannot fork or create a thread (EPERM); `pm` S1, with herd as pid 1 (the user's Q4) | `init=/usr/local/rust/bin/rustc` dies at the ctrlc handler thread |
+| G5 | **No linker yet**: `rustc hello.rs` reaches `cc` and the spawn needed `socketpair` (added 2026-10-30; the link itself is being retried) | `rustc -C codegen-units=1 hello.rs -o hello` over ssh |
+| G6 | **HTTPS `git clone` / TLS in the guest** untested | `git clone https://...` |
 | G3 | **No pump while a spawned child runs** | TCP state stalls during a long-running spawned child; frames move again at its exit (`reference/devices.md` § the pump) |
 
 ## Pinned exclusions (deliberate, load-bearing — not bugs)

@@ -156,3 +156,7 @@ pulled, not hand-written), `docs/reference/subsystems/syscalls/` (the full
 kernels' per-family docs these arms mirror),
 `docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md` (why the number table is
 a crate).
+
+
+## Changes 2026-10-30
+New rows: `futex` (202), `clone` with `CLONE_THREAD` (56), `set_tid_address` (218, stores the clear-on-exit word), `socketpair` (53), `chdir` (80), `fchdir` (81), `fsync`/`fdatasync`/`sync`/`syncfs`, `mprotect` (real), `sigaltstack`, `membarrier`; the legacy numbers 82/83/84/86/87/88/89/90/92/94 are folded to `*at` calls by `akuma-syscalls-abi::legacy` at the top of the dispatcher. `open`/`stat`/`lstat` (legacy 2/4/6) now resolve against the task's cwd. `unlinkat` reads its flags from the THIRD argument (it read the fourth, so `rmdir` never worked). `open(O_CREAT)` in a missing directory answers ENOENT (git's `objects/xx` retry depends on it). `fstat` reports FIFO for pipes, socket for sockets/socketpairs and char device for null/random. Writes to fd 2 from a session program join the session stream (they went to the serial console). `[nosys] nr=N` prints once per unserved number; `--features trace-err` adds `[err] sN nr=X -E a=...` for every failing syscall.
