@@ -65,13 +65,14 @@ if [ ! -d "$SRC" ]; then
     git clone -q --depth 1 --branch "v$VER" https://github.com/torvalds/linux "$SRC.partial"
     mv "$SRC.partial" "$SRC"
 fi
+if [ "$MODE" = count ]; then
+    # Every tree already configured and built for this version (it has an
+    # autoconf.h): each alone, then their unions.
+    trees=$(for d in "$W"/out-"$VER"-*; do [ -f "$d/include/generated/autoconf.h" ] && echo "$d"; done | sort)
+    exec python3 "$S/cloc_akuma.py" --linux "$SRC" $trees --top 25
+fi
 mkdir -p "$O"
 mk() { make -s -C "$SRC" O="$O" ARCH=x86_64 CROSS_COMPILE="$CROSS" "$@"; }
-
-if [ "$MODE" = count ]; then
-    # Every tree already built for this version: each alone, then their unions.
-    exec python3 "$S/cloc_akuma.py" --linux "$SRC" $(ls -d "$W"/out-"$VER"-* | sort) --top 25
-fi
 
 if [ "$MODE" = host ]; then
     mk x86_64_defconfig

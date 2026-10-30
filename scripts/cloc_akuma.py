@@ -1952,9 +1952,9 @@ def linux_cmd_files(objtree: str):
             yield obj, files
 
 
-def linux_unifdef_defs(srctree: str, objtree: str) -> str:
-    """A `unifdef -f` file: CONFIG_ symbols the build set are #define'd, every
-    other Kconfig symbol in the tree #undef'd."""
+def linux_unifdef_defs(srctree: str, objtree: str):
+    """(defined, undefined): CONFIG_ symbols the build set, with their values,
+    and every other Kconfig symbol in the tree (plus its `_MODULE` twin)."""
     defined: dict = {}
     for ln in open(os.path.join(objtree, "include", "generated", "autoconf.h"), encoding="utf-8"):
         parts = ln.split(None, 2)
@@ -1967,16 +1967,14 @@ def linux_unifdef_defs(srctree: str, objtree: str) -> str:
             if fn.startswith("Kconfig"):
                 txt = open(os.path.join(dirpath, fn), encoding="utf-8", errors="replace").read()
                 every.update("CONFIG_" + s for s in _KCONFIG_SYM.findall(txt))
-    lines = [f"#define {k} {v}" for k, v in sorted(defined.items())]
-    for sym in sorted(every - set(defined)):
-        lines.append(f"#undef {sym}")
-        lines.append(f"#undef {sym}_MODULE")
-    return "\n".join(lines) + "\n"
+    undefined = set()
+    for sym in every - set(defined):
+        undefined.add(sym)
+        undefined.add(sym + "_MODULE")
+    return defined, undefined
 
 
 def linux_audit(srctree: str, objtree: str):
-    import tempfile
-
     srctree, objtree = os.path.abspath(srctree), os.path.abspath(objtree)
     image: set = set()
     host: set = set()
@@ -1994,9 +1992,8 @@ def linux_audit(srctree: str, objtree: str):
                 bucket.add(full)
     host -= image
 
-    with tempfile.NamedTemporaryFile("w", suffix=".h", delete=False) as fh:
-        fh.write(linux_unifdef_defs(srctree, objtree))
-        defs = fh.name
+    defined, undefined = linux_unifdef_defs(srctree, objtree)
+    directive_syms = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef|elif)\b.*$", re.M)
 
     def area(full):
         if full.startswith(objtree + os.sep) and not full.startswith(srctree + os.sep):
@@ -2017,10 +2014,17 @@ def linux_audit(srctree: str, objtree: str):
             if bucket_name == "image":
                 pre = "\n".join(_IS_ENABLED.sub(r"defined(\1)", ln) if ln.lstrip().startswith("#") else ln
                                 for ln in text.split("\n"))
-                r = subprocess.run(["unifdef", "-b", "-k", "-f", defs], input=pre,
-                                   capture_output=True, text=True, errors="replace")
+                # Hand unifdef only the CONFIG_ symbols this file's directives test:
+                # one ~30k-line definitions file per call made a 6.18 tree take hours.
+                syms = set(re.findall(r"\bCONFIG_[A-Za-z0-9_]+", " ".join(directive_syms.findall(pre))))
+                args = [f"-D{k}={defined[k]}" for k in sorted(syms) if k in defined]
+                args += [f"-U{k}" for k in sorted(syms) if k in undefined]
+                r = None
+                if args or re.search(r"^\s*#\s*(?:if|elif)\s+[01]\b", pre, re.M):
+                    r = subprocess.run(["unifdef", "-b", "-k", *args], input=pre,
+                                       capture_output=True, text=True, errors="replace")
                 live_set: set = set()
-                if r.returncode in (0, 1):  # 1 = "changed", not an error
+                if r is not None and r.returncode in (0, 1):  # 1 = "changed", not an error
                     # `-b` blanks removed lines instead of deleting them, so line
                     # numbers stay comparable across configs of the same tree.
                     live = count_text(r.stdout, full, spec, True, filename_tests=False,
@@ -2033,7 +2037,6 @@ def linux_audit(srctree: str, objtree: str):
             agg[0] += 1
             agg[1] += whole
             agg[2] += live
-    os.unlink(defs)
     return rows, lines
 
 
