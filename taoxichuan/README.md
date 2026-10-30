@@ -12,6 +12,48 @@ arms' copy loops.
 The experiment brief is `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md`; its
 running log is `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md`.
 
+## The fixed point
+
+The kernel compiles itself on bare metal, and what it compiles is byte-identical to itself
+([`docs/archive/TAOXICHUAN_FIXED_POINT.md`](../docs/archive/TAOXICHUAN_FIXED_POINT.md)):
+
+```text
+                    THE TAOXICHUAN FIXED POINT   (2026-10-31)
+        a kernel that compiles itself - and what it compiles is itself
+
+   THE MAC                      THE RYZEN: bare metal, Akuma's own hypervisor (AMD SVM)
+  +-----------+  boots in   +------------------------------+
+  |  source   |------------>|  guest running  K0           |
+  | 6af48c06  |             |  rustc + cargo + git inside  |
+  +-----+-----+             |  3 GiB RAM . 4 vCPUs         |
+        |                   +--------------+---------------+
+        | cargo build                      |
+        v                                  | git fetch 6af48c06
+  +-----------+                            | cargo build -j4        5m 22s
+  |    K0     |                            v
+  | 9ef4f064  |                      +-----------+  boots in  +------------------------------+
+  | 1,458,520 |                      |    K1     |----------->|  guest running  K1           |
+  +-----------+                      | 6facda34  |            |  the SAME build, again       |
+   different compiler (gnu nightly)  | 1,458,104 |            |  same commit, same paths     |
+   so K0 != K1, and that is fine     +-----+-----+            +--------------+---------------+
+                                           |                                |
+                                           |                                | 5m 18s
+                                           |                                v
+                                           |                          +-----------+
+                                           |                          |    K2     |
+                                           |                          | 6facda34  |
+                                           |                          | 1,458,104 |
+                                           |                          +-----+-----+
+                                           |                                |
+                                           +-----------  K1 == K2  <--------+
+
+              md5  6facda34cbf9ef3cb318dae4ce09ab04   (byte for byte)
+
+     the kernel that hosts the build is not an input of what the build makes:
+     two different kernels (K0, then K1) ran two builds and produced the same bytes.
+     K1 is also identical to the K1 built earlier under Linux KVM on the same ryzen.
+```
+
 ## What it boots as
 
 A kvm0/Firecracker-style **PVH guest**, single vCPU, virtio-mmio only (no PCI

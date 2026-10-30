@@ -1934,3 +1934,48 @@ decided: glm writes the crate-extraction plan and the doc refresh (`taoxichuan-1
 ### 2026-10-31: the fixed point on bare metal
 
 K1 == K2 (`6facda34cbf9ef3cb318dae4ce09ab04`, 1,458,104 bytes) under Akuma's own hypervisor on the ryzen, 3 GiB / 4 vCPUs, about 5.5 minutes per build. K1 is also byte-identical to the Linux-KVM K1. Details and the four things it needed (guest RAM above 1 GiB, herd's compiled-in cap, the relay's DNS proxy, an on-box image): [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md) § Bare-metal run. Decisions: user - "get to the fixed point today", switch sshd to the forking one, always-on init as a process, run glm's extraction plan; supervisor - run the guest through `herd vm-run`, extract K1 with `debugfs`.
+
+### 2026-10-31: the crowning achievement - K1 == K2 on bare metal
+
+```text
+                    THE TAOXICHUAN FIXED POINT   (2026-10-31)
+        a kernel that compiles itself - and what it compiles is itself
+
+   THE MAC                      THE RYZEN: bare metal, Akuma's own hypervisor (AMD SVM)
+  +-----------+  boots in   +------------------------------+
+  |  source   |------------>|  guest running  K0           |
+  | 6af48c06  |             |  rustc + cargo + git inside  |
+  +-----+-----+             |  3 GiB RAM . 4 vCPUs         |
+        |                   +--------------+---------------+
+        | cargo build                      |
+        v                                  | git fetch 6af48c06
+  +-----------+                            | cargo build -j4        5m 22s
+  |    K0     |                            v
+  | 9ef4f064  |                      +-----------+  boots in  +------------------------------+
+  | 1,458,520 |                      |    K1     |----------->|  guest running  K1           |
+  +-----------+                      | 6facda34  |            |  the SAME build, again       |
+   different compiler (gnu nightly)  | 1,458,104 |            |  same commit, same paths     |
+   so K0 != K1, and that is fine     +-----+-----+            +--------------+---------------+
+                                           |                                |
+                                           |                                | 5m 18s
+                                           |                                v
+                                           |                          +-----------+
+                                           |                          |    K2     |
+                                           |                          | 6facda34  |
+                                           |                          | 1,458,104 |
+                                           |                          +-----+-----+
+                                           |                                |
+                                           +-----------  K1 == K2  <--------+
+
+              md5  6facda34cbf9ef3cb318dae4ce09ab04   (byte for byte)
+
+     the kernel that hosts the build is not an input of what the build makes:
+     two different kernels (K0, then K1) ran two builds and produced the same bytes.
+     K1 is also identical to the K1 built earlier under Linux KVM on the same ryzen.
+```
+
+**What it took.**
+* **407 commits** on `rust-org-il-experiment` from its merge-base with `main` to the fixed-point commit `6af48c06` (`git rev-list --count $(git merge-base main HEAD)..6af48c06`); **206** of them touched `taoxichuan/`. 449 on the branch by the time the bare-metal run was documented (`85bd22ab`). 406 carry the user's identity (the user drives all commits); 1 is goose-glm's.
+* **Time:** the branch's first commit is 2026-10-23 22:24 +0300 (19:24 UTC); the metal K2 build finished 2026-10-30 23:37 UTC. That is **7 days 4 hours 13 minutes** from the first commit of the branch to the fixed point on bare metal. The first commit under `taoxichuan/` is 2026-10-24 09:50 UTC, so the kernel itself went from its first line to compiling itself in **6 days 13 hours 47 minutes** (the Linux-KVM fixed point came a few hours earlier, on 2026-10-30).
+* **Size at the fixed point:** `taoxichuan/src` is 10,350 lines over ~37 `akuma-*` path crates; the kernel image is 1,458,104 bytes.
+* **Wall time per build** on metal with 4 vCPUs: 5m22s (K1), 5m18s (K2).
