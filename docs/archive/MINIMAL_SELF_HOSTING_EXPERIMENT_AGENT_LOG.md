@@ -1848,3 +1848,24 @@ Two directions the user named, noted with the prior work that maps onto them. No
   - *AutoVerus* (Microsoft Research, OOPSLA 2025): LLM agents draft, refine and debug Verus proofs against the verifier's
     errors; correct proofs for over 90% of 150 benchmark tasks. A verifier is the kind of mechanical oracle this experiment
     found a weaker model does well with, which makes proofs for small pure crates a plausible job for goose + GLM.
+
+### 2026-10-30 (to check, user's note): Go on Taoxichuan
+
+**Check Go next.** On the full Akuma kernel, Go started working in the same stretch in which cargo became able to build the
+kernel: `go build` has worked on-target since 2026-08-17 (`GO_COMPILE_CRASH_DEBUGGING.md`, `GOLANG_MISSING_SYSCALLS.md`), a
+few weeks after the first in-VM kernel builds. Taoxichuan now runs `cargo build -j4`, so the same may be true here, and it
+is cheap to find out: a static Go hello, then `go build` of a small module, in the guest. What the Go runtime leans on that a
+Rust std binary does not, per the archive: signals as preemption (`SIGURG` via `tgkill`, delivered on `sigaltstack`), a
+signal return that restores the *whole* register and FP file (amd64 got this wrong until `27924603`: returning through
+`sysretq` clobbered `RCX`/`R11`, and Go's startup died), `epoll` for the netpoller, `waitid`/pidfd for `os/exec`
+(`FORKTEST_GO_HANG_FIX.md`, `GO_FORK_EXEC_FIXES.md`), and a large reserved address space (`GO_BINARY_VA_SPACE.md`).
+Taoxichuan saves x87/SSE per context switch since 10-30; whether its signal-return path preserves the same state is the
+first thing to look at.
+
+### 2026-10-30 (future possibility): kernels preconfigured for a language runtime
+
+The tokio idea above, generalised (user's): a set of crates, selected with cargo features, that together provide exactly what
+one language runtime needs - Rust std with tokio, or the Go runtime - so a composition root depends on one crate and gets a
+preconfigured minimal kernel for that language. The runtime's syscall census (strace on Linux, as for rustc in stage 9)
+becomes a feature list; Linux-differential suites (`epoll_suite.py --linux` and its siblings) become the conformance gate;
+`scripts/cloc_akuma.py --audit` reports what each runtime's kernel costs to review.

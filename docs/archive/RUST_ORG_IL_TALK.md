@@ -213,5 +213,38 @@ usage API; full method and tables in the agent log, "GLM tokenomics from the goo
   task set at build time in ~2,000 lines; AutoVerus has LLM agents writing Verus proofs (>90% of
   150 tasks). Details in the agent log, 2026-10-30.
 
+**Rust features that make composition, hardening and verification possible** (counted
+2026-10-30)
+
+- **Cargo features + `#[cfg]`**: capabilities are selected at compile time. The root kernel gates
+  8 syscall families behind `sc-*` features; the `extreme` profile compiles paths out of 8 crates;
+  `no-tests` removes the boot suite. `--audit` shows a third of the lines rustc reads for
+  taoxichuan are `#[cfg]`-dead in that build.
+- **Build-script cfgs, checked**: 13 `kernel_*` cfgs (`kernel_smp_shared`,
+  `kernel_profile_extreme`, the `kernel_no_bkl_*` phases) are emitted by `build.rs`, and
+  `rustc-check-cfg` catches a misspelled one.
+- **`#![forbid(unsafe_code)]`**: **79 of 107 crates** carry it; it cannot be switched off locally,
+  so `unsafe` lives in a few leaf crates (`akuma-cpu`, `akuma-port`, `akuma-dma`) with one stated
+  contract each, and `scripts/check_unsafe_budget.py` gates its growth.
+- **`no_std` crates that also build for the host**: the same code runs in the kernel and under
+  `cargo test` (2,763 host tests); pure decision crates return effects instead of performing them
+  (`akuma-fdtable`), which is what makes them testable, and later provable.
+- **The dependency graph as the carving tool**: taoxichuan is a `Cargo.toml` of 34 `akuma-*` path
+  dependencies; rustc's dep-info gives the exact files compiled, which is how the audit counts.
+- **Ownership for hardware**: `FrameLease` guards for DMA buffers, `DmaArray<E, N, Align>` with a
+  borrow word, `#[must_use]` on PSCI calls.
+- **Traits and generics as seams**: `NetRuntime`, `Filesystem`, virtio's `Transport`;
+  `akuma-locks-rw-cell` is generic over `T` so `akuma-ext2` could take `forbid(unsafe)`.
+- **Macros for single-source tables**: one `syscall_table!` row generates the enum and both
+  architectures' decode and encode, so a transposed syscall number can only be transposed once.
+- **LTO and linker GC**: composed-in code that is never called costs nothing at run time (`fdt` and
+  `zerocopy` have 0 symbols in taoxichuan's ELF).
+- **The same tools apply to verification**: Kani, Miri and Verus all work on ordinary Rust crates,
+  and the pure crates are already shaped for them.
+- Future possibility: **crate sets preconfigured for a language runtime** (Rust std + tokio, or
+  Go), selected with cargo features from the runtime's syscall census. Go is the next thing to try
+  on taoxichuan: on the full kernel it started working in the same stretch as cargo building the
+  kernel.
+
 **Linux comparison:** pending — `scripts/linux_audit_surface.sh` (firecracker / minimal /
 host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.
