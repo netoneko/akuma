@@ -2301,7 +2301,16 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             akuma_primitives::safe_print!(224, "[execve] s{} path={}\n", crate::exec_twin::current_slot() as i64, p);
         }
         let rip = fr.user_rip;
+        let islot = exec_twin::current_slot();
+        if islot < child::NSLOTS {
+            // SAFETY: syscall-path discipline (single core, IF clear).
+            unsafe { (*core::ptr::addr_of_mut!(INFLIGHT))[islot] = (nr, a1, a2, a3) };
+        }
         let r = dispatch_inner(fr);
+        if islot < child::NSLOTS {
+            // SAFETY: as above.
+            unsafe { (*core::ptr::addr_of_mut!(INFLIGHT))[islot].0 = 0 };
+        }
         trace_err(nr, r, a1, a2, a3);
         trace_ring(nr, r, a1, a2, a3, rip);
         r
@@ -2317,6 +2326,10 @@ const N: usize = 1024;
 static mut RING: [(i32, u64, u64, u64, u64, u64, u64); N] = [(0, 0, 0, 0, 0, 0, 0); N];
 #[cfg(feature = "trace-err")]
 static mut HEAD: usize = 0;
+/// The syscall each slot is in RIGHT NOW (`nr`, three args; `nr == 0` = none):
+/// a parked thread is inside one that has not returned, which the ring cannot show.
+#[cfg(feature = "trace-err")]
+static mut INFLIGHT: [(u64, u64, u64, u64); child::NSLOTS + 1] = [(0, 0, 0, 0); child::NSLOTS + 1];
 
 /// The idle thread calls this when nothing has run for a while: every live
 /// slot's last `per` syscalls, so a hang shows what each thread was waiting on.
@@ -2330,6 +2343,12 @@ pub(crate) fn trace_hang_dump(per: usize) {
         for slot in 0..child::NSLOTS {
             if !child::slot_in_use(slot) {
                 continue;
+            }
+            let (inr, ix, iy, iz) = (*core::ptr::addr_of!(INFLIGHT))[slot];
+            if inr != 0 {
+                akuma_primitives::safe_print!(
+                    112, "[hang] s{} IN nr={} a=0x{:x},0x{:x},0x{:x}\n", slot, inr, ix, iy, iz
+                );
             }
             let mut shown = 0;
             for i in (0..N).rev() {
