@@ -1667,3 +1667,7 @@ glm planned (`TAOXICHUAN_COW_FORK_PLAN_GLM.md`, 21 tool calls); implementation a
 fork, writable ones demoted RO + PTE bit 9, one break path (`cow_resolve`) for the write fault, `copy_to_user` and `mprotect`.
 `scripts/kvm/goose/cow_leak_gate.py`: 60 fork rounds, free pages back to baseline exactly (654000), `cowrefs=0`. Battery and the one-boot cargo trio green on TCG.
 Not yet run on the ryzen: `-j4` in a 3 GB guest.
+
+### 2026-10-30: two more glm plans (user asked; planned by goose-glm on the Mac, unreviewed by the user yet)
+`TAOXICHUAN_EFFICIENCY_PLAN_GLM.md`: lessons from amd64/AArch64 - top slices: demand-paged mmap, then the fpcache for RO file pages (both aimed at -j4 in a 3 GB guest), syscall-floor audit, read(2) stage profiler, wake budget/parked netpoll.
+`TAOXICHUAN_AMD64_EXTRACTION_PLAN_GLM.md`: shared crates - `akuma-mmap::holes`, `akuma-syscalls-signal`, `akuma-user-tree` (CoW share/free plans), sockaddr marshalling into `akuma-syscalls-net`, `akuma-fpu-amd64`; child table/dispatcher left to pm S1-S7.
