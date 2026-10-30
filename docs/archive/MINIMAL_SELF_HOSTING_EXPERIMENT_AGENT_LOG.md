@@ -1914,3 +1914,11 @@ SME/TSME.
      its data no-execute) in the nested page tables.
    - Then even a guest kernel exploit cannot patch kernel code. Windows calls this HVCI/VBS. Few hobby kernels can do it,
      because few own their own hypervisor.
+
+### 2026-10-30 (late): note on the supervisor's habits (user, recorded at their request)
+
+The supervisor (Sonnet) insisted on moving files and disk images to the ryzen over wifi (a 2.4 GB toolchain image, gzip-compressed to 400 MB, through an ssh
+stdin pipe) although the link makes that impractical (the user: "this link is absolute garbage it will never finish"). The box already had the sources, the Rust
+toolchain and `mke2fs`/`debugfs`; the right move was to clone from the repo and build the image on the box, or reuse the image glm was already using. The upload was
+killed and the image is now built on the box (`mke2fs -d` fails there with ENOSYS on xattrs, so it is populated with a `debugfs -f` command file). Rule: **never push
+bulk data to the box over wifi; build on it.** The metal fixed-point guest gets 4 vCPUs (user, 2026-10-30).
