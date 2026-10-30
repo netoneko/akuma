@@ -103,26 +103,30 @@ pub fn pipe2_arm(fds_va: u64, flags: u64) -> u64 {
         return crate::e(ring3::err::EFAULT);
     }
     let id = table(akuma_pipes::PipeTable::create);
-    let mut fds = crate::fd_table();
-    let Some(rslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
+    let closed = crate::with_task(|t| t.std_closed);
+    let Some((rfd, wfd)) = crate::with_fds(|fds| {
+        let floor = crate::new_fd_min_in(fds, closed);
+        let rslot = fds.free_below(floor, crate::SLOT_CEILING)?;
+        let rfd = fds.alloc_fd_from(rslot, OpenFile::Pipe(id, false));
+        let floor = crate::new_fd_min_in(fds, closed);
+        let Some(wslot) = fds.free_below(floor, crate::SLOT_CEILING) else {
+            let _ = fds.close(rfd);
+            return None;
+        };
+        let wfd = fds.alloc_fd_from(wslot, OpenFile::Pipe(id, true));
+        if flags & O_CLOEXEC != 0 {
+            fds.set_cloexec(rfd);
+            fds.set_cloexec(wfd);
+        }
+        if flags & O_NONBLOCK != 0 {
+            fds.set_nonblock(rfd);
+            fds.set_nonblock(wfd);
+        }
+        Some((rfd, wfd))
+    }) else {
         table(|t| t.close_read(id));
         return crate::e(ring3::err::EMFILE);
     };
-    let rfd = fds.alloc_fd_from(rslot, OpenFile::Pipe(id, false));
-    let Some(wslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
-        let _ = fds.close(rfd);
-        table(|t| t.close_read(id));
-        return crate::e(ring3::err::EMFILE);
-    };
-    let wfd = fds.alloc_fd_from(wslot, OpenFile::Pipe(id, true));
-    if flags & O_CLOEXEC != 0 {
-        fds.set_cloexec(rfd);
-        fds.set_cloexec(wfd);
-    }
-    if flags & O_NONBLOCK != 0 {
-        fds.set_nonblock(rfd);
-        fds.set_nonblock(wfd);
-    }
     let mut out = [0u8; 8];
     out[..4].copy_from_slice(&rfd.to_ne_bytes());
     out[4..].copy_from_slice(&wfd.to_ne_bytes());
@@ -151,28 +155,31 @@ pub fn socketpair_arm(domain: u64, ty: u64, sv_va: u64) -> u64 {
     }
     let a = table(akuma_pipes::PipeTable::create); // end X writes, end Y reads
     let b = table(akuma_pipes::PipeTable::create); // end Y writes, end X reads
-    let mut fds = crate::fd_table();
-    let Some(xslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
+    let closed = crate::with_task(|t| t.std_closed);
+    let Some((x, y)) = crate::with_fds(|fds| {
+        let floor = crate::new_fd_min_in(fds, closed);
+        let xslot = fds.free_below(floor, crate::SLOT_CEILING)?;
+        let x = fds.alloc_fd_from(xslot, OpenFile::Pair(b, a));
+        let floor = crate::new_fd_min_in(fds, closed);
+        let Some(yslot) = fds.free_below(floor, crate::SLOT_CEILING) else {
+            let _ = fds.close(x);
+            return None;
+        };
+        let y = fds.alloc_fd_from(yslot, OpenFile::Pair(a, b));
+        for fd in [x, y] {
+            if ty & SOCK_CLOEXEC != 0 {
+                fds.set_cloexec(fd);
+            }
+            if ty & SOCK_NONBLOCK != 0 {
+                fds.set_nonblock(fd);
+            }
+        }
+        Some((x, y))
+    }) else {
         table(|t| t.close_read(a));
         table(|t| t.close_read(b));
         return crate::e(ring3::err::EMFILE);
     };
-    let x = fds.alloc_fd_from(xslot, OpenFile::Pair(b, a));
-    let Some(yslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
-        let _ = fds.close(x);
-        table(|t| t.close_read(a));
-        table(|t| t.close_read(b));
-        return crate::e(ring3::err::EMFILE);
-    };
-    let y = fds.alloc_fd_from(yslot, OpenFile::Pair(a, b));
-    for fd in [x, y] {
-        if ty & SOCK_CLOEXEC != 0 {
-            fds.set_cloexec(fd);
-        }
-        if ty & SOCK_NONBLOCK != 0 {
-            fds.set_nonblock(fd);
-        }
-    }
     let mut out = [0u8; 8];
     out[..4].copy_from_slice(&x.to_ne_bytes());
     out[4..].copy_from_slice(&y.to_ne_bytes());
@@ -335,9 +342,9 @@ pub fn release(id: u32, is_write: bool) {
 /// exit is what turns the last writer close into the reader's EOF, so this is
 /// the load-bearing sweep; depth 1 (the shell) normally closed its own copies
 /// already, and this is the safety net.
+#[allow(clippy::redundant_closure_for_method_calls)] // `pop_lowest` is higher-ranked over the table's lifetime: no fn item fits `with_fds`
 pub fn release_open_fds() {
-    let mut t = crate::fd_table();
-    while let Some((_fd, d)) = t.pop_lowest() {
+    while let Some((_fd, d)) = crate::with_fds(|t| t.pop_lowest()) {
         match d {
             OpenFile::Pipe(id, w) => release(id, w),
             OpenFile::Pair(r, w) => {

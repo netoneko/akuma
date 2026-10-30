@@ -36,9 +36,11 @@ use akuma_syscalls_net::sockaddr::{self, net_err};
 
 /// The fd's socket index, or `ENOTSOCK`.
 pub fn fd_socket(fd: u64) -> Option<usize> {
-    fd_table().with(fd as u32, |d| match d {
-        crate::OpenFile::Socket(idx) => Some(*idx),
-        _ => None,
+    crate::with_fds(|t| {
+        t.with(fd as u32, |d| match d {
+            crate::OpenFile::Socket(idx) => Some(*idx),
+            _ => None,
+        })
     })
     .flatten()
 }
@@ -69,7 +71,6 @@ pub fn writev_socket(idx: usize, data: &[u8], nonblock: bool) -> Result<usize, u
     }
 }
 
-use crate::fd_table;
 
 /// `poll(fds, nfds, timeout_ms)`. The readiness wait musl's resolver and the
 /// busybox applets block on before their `recv`. Sockets ask akuma-net's
@@ -134,7 +135,7 @@ fn fd_events(fd: i32, events: i16) -> i16 {
     }
     let mut efd_idx: usize = usize::MAX;
     let mut pipe_rev: i16 = 0;
-    let kind = crate::fd_table().with(fd as u32, |d| match d {
+    let kind = crate::with_fds(|t| t.with(fd as u32, |d| match d {
         crate::OpenFile::Socket(_) => 1,
         crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
         crate::OpenFile::Null | crate::OpenFile::Random | crate::OpenFile::ChildOut(_) => 3,
@@ -172,7 +173,7 @@ fn fd_events(fd: i32, events: i16) -> i16 {
             efd_idx = *slot;
             4
         }
-    });
+    }));
     match kind {
         Some(1) => {
             if let Some(idx) = fd_socket(fd as u64) {
@@ -435,7 +436,7 @@ pub fn getsockopt_arm(fd: u64, level: u64, opt: u64, optval_va: u64, optlen_va: 
 
 /// The fd's nonblock flag, straight from the fd table.
 pub fn fd_nonblock(fd: u64) -> bool {
-    fd_table().is_nonblock(fd as u32)
+    crate::with_fds(|t| t.is_nonblock(fd as u32))
 }
 
 /// Read a `struct sockaddr_in` from the task's memory (rules: `akuma-syscalls-net::sockaddr`).
@@ -479,18 +480,21 @@ pub fn socket_arm(domain: u64, ty: u64, _protocol: u64) -> u64 {
     let Some(idx) = akuma_net::socket::alloc_socket(kind) else {
         return crate::e(crate::err::EMFILE);
     };
-    let mut table = crate::fd_table();
-    let Some(_probe) = table.free_below(3, crate::SLOT_CEILING) else {
+    let min = crate::new_fd_min();
+    let Some(fd) = crate::with_fds(|table| {
+        let _probe = table.free_below(3, crate::SLOT_CEILING)?;
+        let fd = table.alloc_fd_from(min, crate::OpenFile::Socket(idx));
+        if ty & SOCK_NONBLOCK != 0 {
+            table.set_nonblock(fd);
+        }
+        if ty & SOCK_CLOEXEC != 0 {
+            table.set_cloexec(fd);
+        }
+        Some(fd)
+    }) else {
         akuma_net::socket::remove_socket(idx);
         return crate::e(crate::err::EMFILE);
     };
-    let fd = table.alloc_fd_from(crate::new_fd_min(), crate::OpenFile::Socket(idx));
-    if ty & SOCK_NONBLOCK != 0 {
-        table.set_nonblock(fd);
-    }
-    if ty & SOCK_CLOEXEC != 0 {
-        table.set_cloexec(fd);
-    }
     u64::from(fd)
 }
 
@@ -530,18 +534,22 @@ pub fn accept_arm(fd: u64, addr: u64, addrlen_va: u64) -> u64 {
     };
     match akuma_net::socket::socket_accept(idx, fd_nonblock(fd)) {
         Ok((new_idx, peer)) => {
-            let mut table = crate::fd_table();
-            let Some(_probe) = table.free_below(3, crate::SLOT_CEILING) else {
-                akuma_net::socket::remove_socket(new_idx);
-                return crate::e(crate::err::EMFILE);
-            };
-            let new_fd = table.alloc_fd_from(crate::new_fd_min(), crate::OpenFile::Socket(new_idx));
+            let min = crate::new_fd_min();
             // The listener's nonblock flag should carry to the child — the
             // same inheritance Linux does with accept4 on a nonblocking
             // listener, and what sshd relies on not to set per-connection.
-            if fd_nonblock(fd) {
-                table.set_nonblock(new_fd);
-            }
+            let inherit_nonblock = fd_nonblock(fd);
+            let Some(new_fd) = crate::with_fds(|table| {
+                let _probe = table.free_below(3, crate::SLOT_CEILING)?;
+                let new_fd = table.alloc_fd_from(min, crate::OpenFile::Socket(new_idx));
+                if inherit_nonblock {
+                    table.set_nonblock(new_fd);
+                }
+                Some(new_fd)
+            }) else {
+                akuma_net::socket::remove_socket(new_idx);
+                return crate::e(crate::err::EMFILE);
+            };
             if addrlen_va != 0 && crate::user_ok(addrlen_va, 4) {
                 let _ = crate::copy_to_user(addrlen_va, &(16u32).to_le_bytes());
             }
@@ -922,15 +930,16 @@ pub fn close_arm(fd: u64) {
 
 /// How many open fds, across every task record, name socket `idx`.
 pub fn socket_refs(idx: usize) -> usize {
-    crate::task_slots()
-        .iter()
-        .map(|t| {
-            t.fd_names
-                .values()
-                .filter(|d| matches!(d, crate::OpenFile::Socket(i) if *i == idx))
-                .count()
-        })
-        .sum()
+    crate::with_tasks(|ts| {
+        ts.iter()
+            .map(|t| {
+                t.fd_names
+                    .values()
+                    .filter(|d| matches!(d, crate::OpenFile::Socket(i) if *i == idx))
+                    .count()
+            })
+            .sum()
+    })
 }
 
 /// The kernel `struct msghdr` and `struct iovec` words `sendmsg`/`recvmsg`
