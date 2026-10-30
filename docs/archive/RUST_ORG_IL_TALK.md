@@ -102,8 +102,15 @@ never count. Re-measure on a clean tag before quoting: the taoxichuan numbers mo
 - Cost per milestone fell from 20-28M tokens to 5-11M after the methodology change; the
   cheapest was the process-model plan at 1.5M.
 - About one brief in two carried a wrong premise, and goose's survey caught every one.
-- The KVM host carried ~2,700 tool calls' worth of guest boots, faults and kills with no
-  guest-caused host crash (to 2026-10-26).
+- **A week of testing on a hypervisor built by the same model.** Akuma's KVM (written with
+  GLM-5.3-Flash, per the user; the z.ai dashboard puts the week before the experiment at ~200M
+  tokens) hosted the metal track 10-24 -> 10-29: 2,700+ goose tool calls' worth of guest boots,
+  deliberate guest faults, hangs, kills and `herd stop` on live guests, with **zero guest-caused
+  host crashes**. The incidents in that week: two host resets not traced to KVM (10-26, BKL
+  contention under a long in-host kernel build; 10-28, unexplained, Akuma recovered by itself) and
+  two wifi data-plane freezes on 10-27 (rtw89, after a group rekey; the driver missed the dead
+  link). Otherwise the ryzen's own wifi driver carried a week of ssh, git and package mirroring.
+  After 10-29 the runs moved to QEMU TCG on the Mac and Linux KVM on Pop.
 
 **Tokenomics** (goose's `usage_ledger` from the Akuma partition, cross-checked against the z.ai
 usage API; full method and tables in the agent log, "GLM tokenomics from the goose ledger")
