@@ -9,14 +9,14 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1478
-- **Docs contributing at least one fix:** 407
+- **Total distinct fixes counted:** 1479
+- **Docs contributing at least one fix:** 408
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
 | Syscall / ABI Compatibility Audits | 242 | 16.5% | 33 |
-| Memory & Virtual Memory | 176 | 12.0% | 57 |
+| Memory & Virtual Memory | 177 | 12.0% | 58 |
 | Scheduler & Process Management | 139 | 9.5% | 43 |
 | SMP & Locking | 136 | 9.3% | 56 |
 | Networking | 94 | 6.4% | 35 |
@@ -323,7 +323,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `EPOLLONESHOT` was masked off as a registration bit and never acted on, so Bun's one-shot writability poll on stdout/stderr (always writable here) returned the same event forever and `claude` spun (318 M syscalls in 72 s), starving its UI of keyboard input; `InterestList` disarms a one-shot entry once it reports, until `EPOLL_CTL_MOD` or a re-ADD
 - `FileDescriptor::EpollFd` had no readiness arm and fell into `Unmodelled` (ready for whatever was asked), so an `epoll_wait` over an inner epoll returned at once forever and Claude Code spun at ~2 M syscalls/s; an inner epoll is `EPOLLIN`-ready only while its own list has something pending (`Entry::would_report`, which records no edge, depth-bounded at 4)
 
-## Memory & Virtual Memory (176 fixes, 57 docs)
+## Memory & Virtual Memory (177 fixes, 58 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -616,6 +616,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/AMD64_UNSAFE_REDUCTION_TRAP_MSR.md
 - A loaded-segment page whose map failed was never freed; the owned, not-yet-published `phys::FreshFrame` (freed on `Drop`, handed on with `publish()`) replaces the raw physmap view
 - The test program's failure arm freed a frame the address space already tracked; the same `FreshFrame` ownership removes it
+
+### docs/archive/KVM_GUEST_RAM_CAP_LIFTED.md
+- Guest RAM was capped at 1 GiB by the NPT's single directory page of 2 MiB leaves, echoed by `MAX_RAM_MIB = 1024` in the spec crate and `GPA_LIMIT = 1 << 30` in the memslot table, so any bigger VM was refused before boot (the self-hosting fixed point needs 3 GiB); the layout is now `akuma_svm_amd64::rammap` — flat to 3 GiB, then the PC shape: the 3..4 GiB device window (virtio-mmio, local APIC) stays unmapped and excess RAM moves above 4 GiB, with the NPT growing one directory page per RAM-holding GiB, the PVH memory map reporting both extents, and memslots refused in/across the window
 
 ## Scheduler & Process Management (139 fixes, 43 docs)
 
