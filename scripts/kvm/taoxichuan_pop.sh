@@ -18,7 +18,7 @@
 #   ssh -p 2224 root@192.168.1.126 'uname -a'
 #
 # Env: TX_BRANCH (default rust-org-il-experiment), TX_FEATURES (no-tests,trace-err),
-#      TX_PORT (2224), TX_MEM (3072), TX_DISK (/dev/nvme0n1p3), TX_SMP (1),
+#      TX_PORT (2224), TX_MEM (8192), TX_DISK (/dev/nvme0n1p3), TX_SMP (1),
 #      TX_APPEND (extra kernel command line, e.g. "mmdbg=0").
 set -eu
 
@@ -28,7 +28,7 @@ TARGET=${TX_TARGET:-/root/tx-target}
 BRANCH=${TX_BRANCH:-rust-org-il-experiment}
 FEATURES=${TX_FEATURES:-no-tests,trace-err}
 PORT=${TX_PORT:-2224}
-MEM=${TX_MEM:-3072}
+MEM=${TX_MEM:-8192}
 SMP=${TX_SMP:-1}
 DISK=${TX_DISK:-/dev/nvme0n1p3}
 RUN=${TX_RUN:-/root/tx-run}
