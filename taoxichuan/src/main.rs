@@ -814,24 +814,7 @@ struct Task {
     fd_nonblock: fdtable::FlagSet,
 }
 
-static mut TASKS: [Task; 16] = [
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-];
+static mut TASKS: [Task; crate::child::NSLOTS + 1] = [const { Task::new() }; crate::child::NSLOTS + 1];
 /// Which slot `task()` hands out: 0 is the boot's init task (sshd for this
 /// stage's gate), 1 is the child running inside a SPAWN (`child.rs`), and 2
 /// is a fork child running inside that child (child.rs's M2 scaffold).
@@ -991,7 +974,7 @@ pub(crate) fn set_task_slot(i: usize) {
 /// init task (sshd), 1 the shell inside its SPAWN crossing, and `tid + 1`
 /// (for threading tid `tid` >= 1) a real fork child — `bind_child_task`
 /// stamps it, `switch_to` reads its root.
-pub(crate) fn task_slots() -> &'static mut [Task; 16] {
+pub(crate) fn task_slots() -> &'static mut [Task; crate::child::NSLOTS + 1] {
     // SAFETY: as `task`.
     unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
 }
@@ -4181,6 +4164,66 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     Some(TaskImage { root_pa: root, entry: cross_entry, rsp })
 }
 
+/// Free a lower-half address space the loader built by hand: every leaf frame
+/// (through `free_page`, so a CoW-shared frame only drops its count), every
+/// page-table frame, and the root. The upper half is the kernel's, shared
+/// with every root, and is never touched. Returns the pages released
+/// (leaves + tables + root). The root must not be the active CR3.
+pub(crate) fn free_user_root(root: u64) -> usize {
+    const PRESENT: u64 = 1;
+    const LARGE: u64 = 1 << 7;
+    const ADDR: u64 = 0x000f_ffff_ffff_f000;
+    if root == 0 || root == (akuma_cpu::ctlreg::cr3() & ADDR) {
+        return 0;
+    }
+    let tid = akuma_primitives::preempt::current_tid() as u32;
+    let mut n = 0usize;
+    // SAFETY: every frame named is a page-table frame this walk reached from a
+    // present, non-large entry of a root the loader built; the physmap maps all RAM.
+    unsafe fn table(pa: u64) -> &'static [u64; 512] {
+        unsafe { &*phys::phys_ptr::<[u64; 512]>(pa) }
+    }
+    // SAFETY: as above.
+    unsafe {
+        let l4 = table(root);
+        for &e4 in &l4[..256] {
+            if e4 & PRESENT == 0 {
+                continue;
+            }
+            let p3 = e4 & ADDR;
+            for &e3 in table(p3) {
+                if e3 & PRESENT == 0 {
+                    continue;
+                }
+                if e3 & LARGE != 0 {
+                    continue; // never built by the loader; not ours to guess
+                }
+                let p2 = e3 & ADDR;
+                for &e2 in table(p2) {
+                    if e2 & PRESENT == 0 || e2 & LARGE != 0 {
+                        continue;
+                    }
+                    let p1 = e2 & ADDR;
+                    for &e1 in table(p1) {
+                        if e1 & PRESENT != 0 {
+                            akuma_pmm::free_page((e1 & ADDR) as usize, tid);
+                            n += 1;
+                        }
+                    }
+                    akuma_pmm::free_page(p1 as usize, tid);
+                    n += 1;
+                }
+                akuma_pmm::free_page(p2 as usize, tid);
+                n += 1;
+            }
+            akuma_pmm::free_page(p3 as usize, tid);
+            n += 1;
+        }
+    }
+    akuma_pmm::free_page(root as usize, tid);
+    n + 1
+}
+
 /// Where a loaded task starts: the root for CR3, the entry, the stack.
 pub struct TaskImage {
     pub root_pa: u64,
@@ -4310,7 +4353,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // no processes, no page cache and no retired list (each is a `|| 0`).
     if !mem::init(&machine, false, akuma_pmm::PmmHooks {
         heap_reclaim: || 0,
-        drain_retired: || 0,
+        drain_retired: akuma_exec::process::reclaim::drain_retired_under_pressure,
         evict_clean_file_pages: |_| 0,
         shrink_page_cache: |_| 0,
     }) {
