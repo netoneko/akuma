@@ -207,7 +207,8 @@ usage API; full method and tables in the agent log, "GLM tokenomics from the goo
   an epoll-parked reactor) are already found and fixed.
 
 - Future possibility (not a plan): harden by composition - compile capabilities out (read-only
-  disk, a census-built syscall allow-list) and filter the rest by user id - and verify the pure
+  disk, a census-built syscall allow-list, no dynamic library loading), lock execution to signed
+  binaries verified by a signed kernel, and filter the rest by user id - and verify the pure
   crates with fuzzing, Kani/Verus and Miri. Precedents: Firecracker's Kani harnesses found a real
   virtio-boundary bug; Asterinas confines `unsafe` to one core crate (~14% TCB); Hubris fixes its
   task set at build time in ~2,000 lines; AutoVerus has LLM agents writing Verus proofs (>90% of

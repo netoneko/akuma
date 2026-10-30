@@ -1828,7 +1828,11 @@ Two directions the user named, noted with the prior work that maps onto them. No
   allow-list built from an app's census, so an unlisted call has no code behind it; runtime syscall filtering by user id for
   what cannot be compiled out; an egress allow-list in the socket table; W^X; and an agent locked in a `box` inside a KVM
   guest when two walls are wanted. `scripts/cloc_akuma.py --audit` already measures the first two, because it evaluates
-  features: a capability compiled out is a line count that went down.
+  features: a capability compiled out is a line count that went down. Two more (user's, added the same day): **no dynamic
+  library loading** - compile out `PT_INTERP` handling (the `akuma-elf-exec` path that maps the ldso) so only static
+  binaries run, which also removes `LD_PRELOAD`-style injection; and **execution locked to signed binaries, verified by a
+  signed kernel** - `execve` refuses an image whose signature does not check against a key built into the kernel, and the
+  kernel image is itself signed and checked by whatever boots it (the host's VMM for a guest, the bootloader on metal).
 - **Static analysis, fuzzing and formal verification of components.** The pure crates are natural targets: guest-facing
   device models and the MMIO decoder in `akuma-svm-amd64`, `akuma-ext2` and `akuma-elf` on hostile input, the syscall decode
   crates (the two `akuma-syscalls-mem` overflows were found by host tests by luck), `akuma-cow`'s three-input decision,
