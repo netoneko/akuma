@@ -67,7 +67,9 @@ boot() {
     stop
     if mountpoint -q /mnt/p3 2>/dev/null; then umount /mnt/p3; fi
     # Same virtio-mmio slots as the TCG rig (runqemu_s1e.sh): blk at 0, net at 1.
-    local cl="init=/bin/sshd initargs=--port,22 ${TX_APPEND:-}"
+    # `epoch=` anchors the guest wall clock (no RTC read yet): TLS refuses a
+    # certificate "not yet valid" when the guest believes it is 1970.
+    local cl="init=/bin/sshd initargs=--port,22 epoch=$(date +%s) ${TX_APPEND:-}"
     for i in 0 1 2 3; do
         cl="$cl virtio_mmio.device=512@$(printf '0x%x' $((0xfeb00000 + i * 512))):$((5 + i))"
     done
