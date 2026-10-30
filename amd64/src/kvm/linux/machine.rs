@@ -1023,8 +1023,23 @@ pub fn run(nrips: bool, vm: &Vm) {
     // (`akuma-ryzen-amd64`'s `find_rsdp`), so its page sits at the window's start, as
     // Firecracker's does, inside the RAM entry and with no entry of its own.
     let acpi_by_scan = guest.is_akuma();
-    let acpi_gpa = if acpi_by_scan { BIOS_RSDP_GPA } else { ram_bytes - 0x4000 };
-    let l = pvh::plan(ram_bytes, 0, if acpi && !acpi_by_scan { acpi_gpa } else { ram_bytes - 0x3000 });
+    // The guest-physical RAM map (`svm::rammap`): flat to 3 GiB, then the PC shape — the
+    // device window (virtio-mmio, local APIC) stays unmapped and excess RAM moves above
+    // 4 GiB. The handoff pages sit under the top of RAM; the ACPI page, when the map
+    // announces it, one page under them; each reported RAM extent stops short of all of it.
+    let Some(m) = svm::rammap::plan(ram_bytes) else {
+        p("[KVM] linux: refused: RAM is not a 2 MiB multiple of at most 4 GiB\n");
+        return;
+    };
+    let top = m.top();
+    let acpi_gpa = if acpi_by_scan { BIOS_RSDP_GPA } else { top - 0x4000 };
+    let keep = if acpi && !acpi_by_scan { 0x4000 } else { 0x3000 };
+    let (ram_len, hi_base, hi_len) = if m.high.bytes == 0 {
+        (ram_bytes - keep, 0, 0)
+    } else {
+        (m.low.bytes, m.high.gpa, m.high.bytes - keep)
+    };
+    let l = pvh::plan(top, 0, ram_len, hi_base, hi_len);
     scratch.bytes_mut().fill(0);
     // The guest is told the host's TSC rate rather than left to calibrate it through trapped
     // port reads: a poll loop whose every iteration is a VM exit measures the exits, not the

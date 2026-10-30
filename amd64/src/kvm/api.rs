@@ -116,26 +116,44 @@ static VM: Spinlock<Option<Vm>> = Spinlock::new(None);
 /// The in-kernel PIT/PIC/LAPIC, created by `CREATE_IRQCHIP`.
 static PLAT: Spinlock<Option<Platform>> = Spinlock::new(None);
 
-/// The nested page table over the memslots: PML4 -> PDPT -> PD of 2 MiB leaves, built at the first `RUN`.
+/// The nested page table over the memslots: PML4 -> PDPT -> directories of 2 MiB leaves,
+/// built at the first `RUN`. Slots may sit below or above the 3..4 GiB device window
+/// (`slots::check` refuses in/crossing it); a directory is allocated per GiB that holds a
+/// slot, so at most four are ever allocated — the window's GiB maps nothing.
 struct Npt {
     pml4: FreshFrame,
     _pdpt: FreshFrame,
-    _pd: FreshFrame,
+    _dirs: [Option<FreshFrame>; akuma_svm_amd64::rammap::MAX_DIRS],
 }
 
 fn build_npt(slots: &Table) -> Option<Npt> {
     let mut pml4 = FreshFrame::alloc_zeroed()?;
     let mut pdpt = FreshFrame::alloc_zeroed()?;
-    let mut pd = FreshFrame::alloc_zeroed()?;
+    let mut dirs = [const { None }; akuma_svm_amd64::rammap::MAX_DIRS];
     akuma_svm_amd64::wr64(pml4.bytes_mut(), 0, akuma_svm_amd64::npt::pointer(pdpt.pa() as u64));
-    akuma_svm_amd64::wr64(pdpt.bytes_mut(), 0, akuma_svm_amd64::npt::pointer(pd.pa() as u64));
-    for s in slots.iter() {
-        for i in 0..(s.region.size >> 21) {
-            let idx = ((s.region.gpa >> 21) + i) as usize;
-            akuma_svm_amd64::wr64(pd.bytes_mut(), idx * 8, akuma_svm_amd64::npt::leaf_2m(s.slice_off + (i << 21)));
+    for d in 0..akuma_svm_amd64::rammap::MAX_DIRS {
+        let base = (d as u64) << 30;
+        // A directory only for a GiB some slot actually covers; the window's GiB (and
+        // any GiB past the top) stays pointer-free in the PDPT.
+        if !slots.iter().any(|s| s.region.gpa < base + (1 << 30) && base < s.region.gpa + s.region.size) {
+            continue;
         }
+        let mut page = FreshFrame::alloc_zeroed()?;
+        for s in slots.iter() {
+            // `check` already refused a window-crossing or misaligned slot; the leaf
+            // writer's refusal is a belt-and-braces no-op here.
+            let _ = akuma_svm_amd64::rammap::fill_slot_directory(
+                page.bytes_mut(),
+                d,
+                s.region.gpa,
+                s.region.size,
+                s.slice_off,
+            );
+        }
+        akuma_svm_amd64::wr64(pdpt.bytes_mut(), d * 8, akuma_svm_amd64::npt::pointer(page.pa() as u64));
+        dirs[d] = Some(page);
     }
-    Some(Npt { pml4, _pdpt: pdpt, _pd: pd })
+    Some(Npt { pml4, _pdpt: pdpt, _dirs: dirs })
 }
 
 fn irq_off<T>(f: impl FnOnce() -> T) -> T {
