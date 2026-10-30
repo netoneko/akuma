@@ -1280,6 +1280,7 @@ dependencies = [
  "akuma-idt-amd64",
  "akuma-isolation",
  "akuma-lapic-amd64",
+ "akuma-mmap",
  "akuma-mmu",
  "akuma-net",
  "akuma-pipes",

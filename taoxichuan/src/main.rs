@@ -987,8 +987,7 @@ struct Task {
     /// merged when they touch: `munmap` records them, `mmap` reuses them
     /// first-fit before bumping the cursor. Full table: the hole is leaked
     /// (the frames are still freed).
-    holes: [(u64, u64); MAX_HOLES],
-    n_holes: usize,
+    holes: akuma_mmap::HoleSet<MAX_HOLES>,
     /// The working directory ("" = `/`): what a relative path and `getcwd`
     /// resolve against. Inherited by a fork child, reset by a fresh spawn,
     /// kept across `execve`. Resolution is `akuma_vfs::resolve_path`.
@@ -1021,8 +1020,7 @@ impl Task {
             exe: alloc::string::String::new(),
             shared: [(0, 0, 0, 0, 0); MAX_SHARED],
             n_shared: 0,
-            holes: [(0, 0); MAX_HOLES],
-            n_holes: 0,
+            holes: akuma_mmap::HoleSet::new(),
             cwd: alloc::string::String::new(),
             exit: None,
             fd_names: fdtable::Names::new(),
@@ -1149,90 +1147,20 @@ fn release_pages(root: u64, start: u64, end: u64) {
 
 /// Record `[start, end)` of the mmap slab as unmapped: lower the cursor when
 /// the hole touches it, else add it to the hole table, merging with any hole
-/// it overlaps or abuts.
-fn add_hole(t: &mut Task, mut start: u64, mut end: u64) {
-    if end > t.mmap_cur {
-        end = t.mmap_cur;
-    }
-    if start >= end {
-        return;
-    }
-    // Absorb every hole this one touches (a loop: one merge can bridge two).
-    loop {
-        let mut merged = false;
-        let mut i = 0;
-        while i < t.n_holes {
-            let (s, e) = t.holes[i];
-            if s <= end && e >= start {
-                start = start.min(s);
-                end = end.max(e);
-                t.n_holes -= 1;
-                t.holes[i] = t.holes[t.n_holes];
-                merged = true;
-            } else {
-                i += 1;
-            }
-        }
-        if !merged {
-            break;
-        }
-    }
-    if end == t.mmap_cur {
-        t.mmap_cur = start;
-    } else if t.n_holes < MAX_HOLES {
-        t.holes[t.n_holes] = (start, end);
-        t.n_holes += 1;
-    }
+/// it overlaps or abuts. The algebra is `akuma_mmap::HoleSet`.
+fn add_hole(t: &mut Task, start: u64, end: u64) {
+    t.holes.add(&mut t.mmap_cur, start, end);
 }
 
 /// Take `[start, end)` out of the hole table (a `MAP_FIXED` landed there).
 fn carve_hole(t: &mut Task, start: u64, end: u64) {
-    let mut i = 0;
-    while i < t.n_holes {
-        let (s, e) = t.holes[i];
-        if s >= end || e <= start {
-            i += 1;
-        } else if s >= start && e <= end {
-            t.n_holes -= 1;
-            t.holes[i] = t.holes[t.n_holes];
-        } else if s < start && e > end {
-            t.holes[i] = (s, start);
-            if t.n_holes < MAX_HOLES {
-                t.holes[t.n_holes] = (end, e);
-                t.n_holes += 1;
-            }
-            i += 1;
-        } else if s < start {
-            t.holes[i] = (s, start);
-            i += 1;
-        } else {
-            t.holes[i] = (end, e);
-            i += 1;
-        }
-    }
+    t.holes.carve(start, end);
 }
 
 /// A fresh `bytes`-long (page multiple) range of the mmap slab: first-fit from
 /// the holes, else the bump cursor. `None` when the slab is exhausted.
 fn mmap_alloc(t: &mut Task, bytes: u64) -> Option<u64> {
-    for i in 0..t.n_holes {
-        let (s, e) = t.holes[i];
-        if e - s >= bytes {
-            if e - s == bytes {
-                t.n_holes -= 1;
-                t.holes[i] = t.holes[t.n_holes];
-            } else {
-                t.holes[i] = (s + bytes, e);
-            }
-            return Some(s);
-        }
-    }
-    let base = (t.mmap_cur + 0xF) & !0xF;
-    if base + bytes > MMAP_BASE + MMAP_SLAB {
-        return None;
-    }
-    t.mmap_cur = base + bytes;
-    Some(base)
+    t.holes.alloc(&mut t.mmap_cur, MMAP_BASE + MMAP_SLAB, bytes)
 }
 
 /// Copy the pages of every writable `MAP_SHARED` file mapping that overlap
@@ -4858,7 +4786,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     t.fd_nonblock = fdtable::FlagSet::new();
     t.exit = None;
     t.mmap_cur = MMAP_BASE;
-    t.n_holes = 0;
+    t.holes.clear();
     t.n_shared = 0;
     t.sigalt = SIGALT_OFF;
     // execve: caught handlers go back to SIG_DFL, ignored ones stay ignored.

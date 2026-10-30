@@ -220,3 +220,8 @@ CoW and mmap symbol sites.
   session (~6 calls).
 - Q6 (ordering): pm (switch-to-crates) and this plan both touch `taoxichuan/src/main.rs` (pm S1
   init-registration, glm S1–S3). Interleave pm-first, glm-first, or strictly alternate slices?
+
+---
+**Status (2026-10-30, supervisor):** slice 1 (§2.1) DONE - `akuma_mmap::HoleSet<N>` (`crates/akuma-mmap/src/holes.rs`, 10 host tests incl. a page-bitmap model check),
+taoxichuan's `add_hole`/`carve_hole`/`mmap_alloc` are thin wrappers over it; `Task::holes`/`n_holes` became one `HoleSet<64>`. Battery, leak gate unchanged.
+Chose the extension of `akuma-mmap` (empty deps kept) as the plan preferred. Behaviour pinned verbatim: swap-remove order, first-fit in table order, drop-when-full.
