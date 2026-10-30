@@ -21,8 +21,9 @@ pub const EINVAL: i32 = 22;
 /// `u64::MAX - 1` with EAGAIN (a fresh read must always be able to clear it).
 const COUNTER_MAX: u64 = u64::MAX - 1;
 
-/// One eventfd: an 8-byte counter with read/write/semaphore semantics and
-/// the flags `eventfd2` was created with. The owning kernel keeps this in
+/// One eventfd: an 8-byte counter with read/write/semaphore semantics.
+///
+/// It also carries the flags `eventfd2` was created with. The owning kernel keeps this in
 /// its descriptor table; `dup`'d names share one of these by construction
 /// there (an index or a shared cell), never by copying — a copied counter
 /// would fork the state, which Linux never does.
@@ -42,20 +43,24 @@ impl EventFd {
         Ok(Self { counter: u64::from(initval), flags })
     }
 
+    #[must_use]
     pub fn flags(&self) -> u32 {
         self.flags
     }
 
+    #[must_use]
     pub fn is_nonblock(&self) -> bool {
         self.flags & EFD_NONBLOCK != 0
     }
 
     /// A read is ready exactly while the counter is non-zero.
+    #[must_use]
     pub fn can_read(&self) -> bool {
         self.counter > 0
     }
 
     /// A write is always ready short of the counter ceiling.
+    #[must_use]
     pub fn can_write(&self) -> bool {
         self.counter < COUNTER_MAX
     }

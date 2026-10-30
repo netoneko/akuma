@@ -71,7 +71,7 @@ the gap between them is the duplication the shared-crate extraction has not yet
 absorbed.
 
 Usage:
-    scripts/cloc_akuma.py                      # defaults to src/ crates/ amd64/src/
+    scripts/cloc_akuma.py                      # defaults to src/ crates/ amd64/src/ taoxichuan/src/
     scripts/cloc_akuma.py src crates --by-file
     scripts/cloc_akuma.py --json
     scripts/cloc_akuma.py --all-languages      # also C, asm, shell, TOML, Markdown, ...
@@ -83,9 +83,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 
@@ -102,12 +104,16 @@ class LangSpec:
     nested_blocks: bool = False
     strings: tuple = ('"',)
     rust: bool = False
+    c_chars: bool = False  # `'x'` is a character literal (C); Rust's `'` is handled separately
 
 
 RUST = LangSpec("Rust", rust=True, nested_blocks=True)
-C_LIKE = LangSpec("C")
-HEADER = LangSpec("C/C++ Header")
+C_LIKE = LangSpec("C", c_chars=True)
+HEADER = LangSpec("C/C++ Header", c_chars=True)
 ASM = LangSpec("Assembly", line_comments=("//", ";", "#"), blocks=(("/*", "*/"),))
+#: A `.S` file that the C preprocessor runs over first (Linux): `#` starts a
+#: directive, not a comment, and `;` separates instructions.
+CPP_ASM = LangSpec("Assembly", line_comments=("//",), blocks=(("/*", "*/"),))
 HASH = lambda name: LangSpec(name, line_comments=("#",), blocks=())  # noqa: E731
 PLAIN = lambda name: LangSpec(name, line_comments=(), blocks=())  # noqa: E731
 
@@ -248,13 +254,41 @@ def cfg_is_test_only(inner: str, kernel_gate: bool) -> bool:
     return _eval_cfg(node, tests_on) is not False and _eval_cfg(node, tests_off) is False
 
 
-def attr_is_test_gate(inner: str, kernel_gate: bool) -> bool:
-    """`inner` is the text between `#[` and `]`."""
+class CfgWorld:
+    """The exact cfg set one rustc invocation saw, as a CLOSED world.
+
+    rustc has no "unknown" cfg: an atom it was not given is false. So once the
+    whole set is known — the target's `--print cfg`, the unit's resolved
+    features, its build script's `cargo:rustc-cfg` lines — every predicate
+    evaluates to True or False, and an item whose `#[cfg]` is False is not in
+    the image. The one None is an atom this parser could not read (`?`): that
+    item is kept, so a parse failure over-counts rather than hiding code.
+
+    Passed to `scan` in place of the `kernel_gate` bool; `attr_is_test_gate`
+    then answers "is this item compiled out of THIS build" instead of "is it
+    test-only in every build".
+    """
+
+    def __init__(self, atoms):
+        self.atoms = frozenset(atoms)
+
+    def get(self, key):
+        if key[0] == "?":
+            return None
+        return key in self.atoms
+
+
+def attr_is_test_gate(inner: str, kernel_gate) -> bool:
+    """`inner` is the text between `#[` and `]`. `kernel_gate` is a bool (the
+    two-world test analysis) or a `CfgWorld` (one exact build)."""
     inner = inner.strip()
     bare = inner.rsplit("::", 1)[-1]
     if bare in ("test", "bench"):
         return True
     if inner.startswith("cfg(") and inner.endswith(")"):
+        if isinstance(kernel_gate, CfgWorld):
+            toks = _tokenize_cfg(inner[4:-1])
+            return bool(toks) and _eval_cfg(_parse_cfg(toks, 0)[0], kernel_gate) is False
         return cfg_is_test_only(inner[4:-1], kernel_gate)
     return False
 
@@ -384,7 +418,9 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
     i, n = 0, len(text)
     line = 1
     depth = 0
-    # Open test spans: dicts of start line / brace depth / whether `{` was seen.
+    pdepth = 0  # `(` / `[` nesting, so a `,` inside a call or a type list is not a field's end
+    # Open test spans: dicts of start line / brace depth / paren depth / whether `{`
+    # was seen / kind ("item" ends at `;`/`}`; "expr" also at its list's `,`).
     spans: list = []
     pending_test = False  # a test attribute is waiting for its item
     pending_line = 0  # line the gating attribute started on
@@ -416,10 +452,33 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
     def start_item():
         # The gating attribute belongs to the test, so the span starts there.
         nonlocal pending_test, pending_line, awaiting_item
-        spans.append({"start": pending_line or line, "depth": depth, "brace": False})
+        spans.append({"start": pending_line or line, "depth": depth, "pdepth": pdepth,
+                      "brace": False, "kind": None})
         pending_test = False
         pending_line = 0
         awaiting_item = True
+
+    def close_unbraced(ends_at_comma: bool) -> None:
+        """Close gated spans that ended without `;` or `{..}`.
+
+        A gated *item* ends at `;` or its closing brace. A gated struct field,
+        enum variant, match arm or fn parameter ends at the `,` after it, or at
+        the bracket that closes the list it sits in. Before this, such a span
+        stayed open to end of file: harmless while only `#[cfg(test)]` gated
+        anything (tests rarely gate a field), wrong by hundreds of lines once
+        `--audit` gates on `feature`/`target_arch`, which kernels put on match
+        arms constantly.
+        """
+        nonlocal awaiting_item
+        while spans and not spans[-1]["brace"]:
+            sp = spans[-1]
+            outer = sp["depth"] > depth or (sp["depth"] == depth and sp["pdepth"] > pdepth)
+            comma = (ends_at_comma and sp["kind"] == "expr"
+                     and sp["depth"] == depth and sp["pdepth"] == pdepth)
+            if not (outer or comma):
+                break
+            close_span(spans.pop())
+        awaiting_item = any(not sp["brace"] for sp in spans)
 
     while i < n:
         c = text[i]
@@ -574,6 +633,17 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
             i += 1
             continue
 
+        if spec.c_chars and c == "'":
+            # A C character literal. Without this, `'"'` opened a string that ran
+            # to the next real `"` and swallowed whatever lay between.
+            j = i + 1
+            while j < n and text[j] not in "'\n":
+                j += 2 if text[j] == "\\" else 1
+            # An apostrophe in a `.S` comment-free line is not a literal: stop at
+            # the newline without consuming it, so the line count stays right.
+            i = j + 1 if j < n and text[j] == "'" else j
+            continue
+
         if spec.rust and c == "'":
             # char literal, or a lifetime we should just walk past
             if i + 1 < n and text[i + 1] == "\\":
@@ -594,6 +664,10 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
             while j < n and _is_ident_char(text[j]):
                 j += 1
             last_ident = text[i:j]
+            if (spans and awaiting_item and spans[-1]["kind"] is None
+                    and spans[-1]["depth"] == depth and spans[-1]["pdepth"] == pdepth
+                    and last_ident != "pub"):
+                spans[-1]["kind"] = "item" if last_ident in ITEM_KEYWORDS else "expr"
             if last_ident != "unsafe" and unsafe_pending:
                 # `unsafe fn` / `unsafe impl` / `unsafe trait` / `unsafe extern`.
                 # In edition 2024 an `unsafe fn` body is NOT itself an unsafe
@@ -635,6 +709,7 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
 
         if c == "}":
             depth = max(0, depth - 1)
+            close_unbraced(False)
             while spans and spans[-1]["brace"] and spans[-1]["depth"] == depth:
                 close_span(spans.pop())
             while unsafe_spans and unsafe_spans[-1]["depth"] == depth:
@@ -646,12 +721,31 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
         if c == "(":
             # `#[unsafe(no_mangle)]` — an attribute, not a context.
             unsafe_pending = False
+            pdepth += 1
+            i += 1
+            continue
+
+        if c == "[":
+            pdepth += 1
+            i += 1
+            continue
+
+        if c in ")]":
+            pdepth = max(0, pdepth - 1)
+            close_unbraced(False)
+            i += 1
+            continue
+
+        if c == ",":
+            close_unbraced(True)
             i += 1
             continue
 
         if c == ";":
             unsafe_pending = False
-            if spans and awaiting_item and not spans[-1]["brace"] and spans[-1]["depth"] == depth:
+            # `pdepth` too: the `;` in `[u8; 4]` does not end the item.
+            if (spans and awaiting_item and not spans[-1]["brace"] and spans[-1]["depth"] == depth
+                    and spans[-1]["pdepth"] == pdepth):
                 close_span(spans.pop())
                 awaiting_item = any(not sp["brace"] for sp in spans)
             i += 1
@@ -669,6 +763,13 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
     return code, comment, test, all_file_test, unsafe_lines, unsafe_span, arches
 
 
+#: First word of a gated span that makes it an ITEM (ends at `;` or its block),
+#: as opposed to a field / variant / arm / argument (also ends at its `,`).
+ITEM_KEYWORDS = {
+    "fn", "impl", "struct", "enum", "trait", "mod", "type", "const", "static", "use",
+    "extern", "unsafe", "async", "macro_rules", "union", "let", "auto", "default",
+}
+
 #: A crate-level `#![forbid(unsafe_code)]`, at the start of a line so a mention
 #: inside a doc comment ("carries `#![forbid(unsafe_code)]`") does not match.
 FORBID_RE = re.compile(r"^\s*#!\[forbid\([^)]*\bunsafe_code\b", re.M)
@@ -685,7 +786,11 @@ def count_file(path: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> Fi
     return count_text(text, relpath, spec, kernel_gate)
 
 
-def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> FileCount:
+def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate,
+               filename_tests: bool = True, live: set = None, live_unsafe: set = None) -> FileCount:
+    """Count one file. `live` / `live_unsafe`, when given, collect the line
+    numbers of production code (and of production code inside `unsafe`) — what
+    `--audit` unions across kernels, since a crate two kernels share is read once."""
     nlines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
     code, comment, test, inner_test, unsafe_lines, unsafe_span, arches = scan(
         text, spec, kernel_gate
@@ -693,7 +798,7 @@ def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> Fi
 
     fc = FileCount(path=relpath, lang=spec.name)
     fc.arches = arches
-    fc.whole_file_test = is_test_path(relpath) or inner_test
+    fc.whole_file_test = (filename_tests and is_test_path(relpath)) or inner_test
     fc.forbids_unsafe = FORBID_RE.search(text) is not None and os.path.basename(
         relpath
     ) in ("lib.rs", "main.rs")
@@ -715,6 +820,10 @@ def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate: bool) -> Fi
                     fc.test_unsafe_code += 1
                 else:
                     fc.unsafe_code += 1
+                    if live_unsafe is not None:
+                        live_unsafe.add(ln)
+            if live is not None and not is_test:
+                live.add(ln)
             bucket = "test_code" if is_test else "code"
         elif ln in comment:
             bucket = "test_comment" if is_test else "comment"
@@ -1151,7 +1260,7 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
         # port's `unsafe` is the one being driven down.
         def root_of(comp: str) -> str:
             parts = comp.split(os.sep)
-            return os.sep.join(parts[:2] if parts[0] == "amd64" else parts[:1]) + os.sep
+            return os.sep.join(parts[:2] if parts[0] in ("amd64", "taoxichuan") else parts[:1]) + os.sep
 
         scopes = [("crates/", crates)]
         for root in sorted({root_of(c) for c in bins}, key=lambda r: (r != "src/", r)):
@@ -1199,9 +1308,67 @@ def path_deps(manifest: str) -> set:
     return found
 
 
+_TREE_LINE = re.compile(r"^(\S+) v(\S+)(?: \(([^)]*)\))?")
+
+
+def cargo_tree(pkg: str, triple: str, features: str = "", default: bool = True):
+    """Packages cargo links into `pkg` for `triple`: [(name, version, abs_path_or_None)].
+
+    `cargo tree` resolves features for THIS package alone (`cargo metadata`
+    unifies them across the whole workspace, which can switch on optional
+    dependencies another member wanted), applies target-specific dependency
+    tables, and with `no-proc-macro` drops host-only crates (`syn`, `quote`).
+    None if cargo cannot answer.
+    """
+    cmd = ["cargo", "tree", "-p", pkg, "--target", triple, "-e", "normal,no-proc-macro",
+           "--prefix", "none", "--offline"]
+    if not default:
+        cmd.append("--no-default-features")
+    if features:
+        cmd += ["--features", features]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    seen: set = set()
+    for line in out.splitlines():
+        m = _TREE_LINE.match(line.strip())
+        if not m:
+            continue
+        loc = m.group(3) or ""
+        seen.add((m.group(1), m.group(2), loc if loc.startswith("/") else None))
+    return sorted(seen)
+
+
+#: manifest -> (cargo package, target triple) for the kernels `linked_crates` can ask cargo about.
+KERNEL_PACKAGES = {
+    "Cargo.toml": ("akuma", "aarch64-unknown-none"),
+    os.path.join("amd64", "Cargo.toml"): ("akuma-amd64", "x86_64-unknown-none"),
+    os.path.join("taoxichuan", "Cargo.toml"): ("taoxichuan", "x86_64-unknown-none"),
+}
+
+
 def linked_crates(root_manifest: str) -> set:
-    """Transitive closure of path dependencies from a kernel's manifest, as
-    repo-relative crate directories (the root manifest's own dir excluded)."""
+    """Workspace crate directories a kernel links, as repo-relative paths (the
+    kernel's own dir excluded).
+
+    Asks `cargo tree` (feature- and target-aware) for the kernels in
+    KERNEL_PACKAGES. The fallback, and the walk for any other manifest, reads
+    `path = ".."` lines out of Cargo.toml text, which cannot see features or
+    that a crate is only needed for another architecture — it over-counts
+    (taoxichuan: 29 crates by text, 27 by cargo) — so it is a fallback only.
+    """
+    kp = KERNEL_PACKAGES.get(root_manifest)
+    if kp:
+        tree = cargo_tree(*kp)
+        if tree:
+            root = os.path.abspath(".")
+            own = os.path.abspath(os.path.dirname(root_manifest))
+            dirs = set()
+            for _name, _ver, path in tree:
+                if path and os.path.abspath(path) not in (own, root):
+                    dirs.add(os.path.relpath(path, root))
+            return dirs
     seen: set = set()
     todo = list(path_deps(root_manifest))
     while todo:
@@ -1248,6 +1415,8 @@ def platform_buckets(files: list) -> dict:
             buckets.setdefault("aarch64 bin", []).append(comp)
         elif comp == "amd64" or comp.startswith("amd64" + os.sep):
             buckets.setdefault("amd64 bin", []).append(comp)
+        elif comp == "taoxichuan" or comp.startswith("taoxichuan" + os.sep):
+            buckets.setdefault("taoxichuan bin", []).append(comp)
         elif have_graph and comp in a64 and comp in x64:
             buckets.setdefault("shared crates", []).append(comp)
         elif have_graph and comp in x64:
@@ -1296,7 +1465,7 @@ def print_platform_report(files: list, W: int) -> None:
         f"{'unsafe':>8}{'enforced':>10}"
     )
     print(rule(W))
-    order = ("aarch64 bin", "amd64 bin", "aarch64-only crates",
+    order = ("aarch64 bin", "amd64 bin", "taoxichuan bin", "aarch64-only crates",
              "amd64-only crates", "shared crates")
     for name in order:
         if name not in by_bucket:
@@ -1321,6 +1490,24 @@ def print_platform_report(files: list, W: int) -> None:
             tot.merge(agg)
         print(f"{label:<24}{tot.files:>8}{tot.code:>11}{tot.test_code:>11}{tot.unsafe_sites:>8}")
 
+    # The minimal self-hosting kernel (`taoxichuan/`, docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md):
+    # its footprint is its own source plus the closure of its path dependencies, which sit in
+    # whichever bucket above they belong to, so it cannot be a sum of buckets.
+    if "taoxichuan bin" in by_bucket:
+        linked = linked_crates(os.path.join("taoxichuan", "Cargo.toml"))
+        tx = Agg()
+        tx.merge(by_bucket["taoxichuan bin"])
+        n_crates = 0
+        seen_comps: set = set()
+        for fc in files:
+            comp = component_of(fc.path)
+            if comp in linked:
+                tx.add(fc)
+                seen_comps.add(comp)
+        n_crates = len(seen_comps)
+        print(f"{'taoxichuan kernel links':<24}{tx.files:>8}{tx.code:>11}{tx.test_code:>11}{tx.unsafe_sites:>8}")
+        print(f"  ({n_crates} of {len(linked)} linked crates counted, plus taoxichuan/src itself)")
+
     for name in ("aarch64-only crates", "amd64-only crates"):
         if name in members:
             crates = sorted(members[name])
@@ -1330,6 +1517,663 @@ def print_platform_report(files: list, W: int) -> None:
     print("sum to more than the tree. Attribution comes from each kernel's")
     print("Cargo path-dependency closure; crates neither kernel reaches fall")
     print("back to #[cfg(target_arch = ..)] attributes (cfg!() not parsed).")
+    print(rule(W))
+
+
+#: kernel name -> (manifest, target triple). The triple is what `cargo metadata
+#: --filter-platform` resolves target-specific dependencies against.
+EXTERNAL_KERNELS = {
+    "aarch64": ("Cargo.toml", "aarch64-unknown-none"),
+    "amd64": (os.path.join("amd64", "Cargo.toml"), "x86_64-unknown-none"),
+    "taoxichuan": (os.path.join("taoxichuan", "Cargo.toml"), "x86_64-unknown-none"),
+}
+
+
+def external_closure(manifest: str, triple: str):
+    """crates.io / git packages a kernel links, as [(name, version, src_dir)].
+
+    Asks `cargo tree` (offline: the registry is already unpacked for the
+    build) for the kernel package's NORMAL dependency edges, so
+    build- and dev-dependencies are out, features are resolved for that package
+    alone, and proc-macro crates go with everything only they pull in (syn,
+    quote, ...): they run on the host and none of their code is in the image.
+    Returns None if cargo cannot answer.
+    """
+    kp = KERNEL_PACKAGES.get(manifest)
+    tree = cargo_tree(kp[0], triple) if kp else None
+    if tree is None:
+        return None
+    try:
+        meta = json.loads(subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--offline", "--filter-platform", triple],
+            capture_output=True, text=True, timeout=120, check=True,
+        ).stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    where = {(p["name"], p["version"]): os.path.dirname(p["manifest_path"])
+             for p in meta["packages"] if p["source"]}
+    # `cargo tree` says WHICH crates link (feature-correct); `metadata` only says where their source is.
+    return sorted(
+        (n, v, os.path.join(where[(n, v)], "src"))
+        for n, v, path in tree if path is None and (n, v) in where
+    )
+
+
+def print_external_report(kernel_gate: bool, W: int) -> None:
+    """Code linked from external libraries, per kernel.
+
+    Each external crate's `src/` is counted whole: this is an UPPER bound on
+    what is compiled in, because cargo features and `#[cfg]`s prune code this
+    counter does not evaluate (virtio-drivers' optional transports, zerocopy's
+    derive support). It is the amount of third-party source a reviewer would
+    have to trust, which is the number the experiment wants.
+    """
+    print()
+    print(rule(W))
+    print("External libraries linked (normal deps, proc-macros excluded; crate src/ counted whole)")
+    print(rule(W))
+    for kernel, (manifest, triple) in EXTERNAL_KERNELS.items():
+        if not os.path.exists(manifest):
+            continue
+        deps = external_closure(manifest, triple)
+        if deps is None:
+            print(f"{kernel}: cargo metadata unavailable (offline registry missing?)")
+            continue
+        tot = Agg()
+        rows_ = []
+        for name, ver, src in deps:
+            if not os.path.isdir(src):
+                continue
+            files, _ = walk([src], kernel_gate)
+            a = Agg()
+            for fc in files:
+                a.add(fc)
+            tot.merge(a)
+            rows_.append((a.code, f"{name} {ver}", a))
+        print(f"{kernel} ({triple}): {len(rows_)} crates")
+        print(f"  {'crate':<30}{'files':>8}{'prod code':>11}{'test code':>11}{'unsafe':>8}")
+        for _, label, a in sorted(rows_, key=lambda r: -r[0]):
+            print(f"  {label:<30}{a.files:>8}{a.code:>11}{a.test_code:>11}{a.unsafe_sites:>8}")
+        print(f"  {'TOTAL':<30}{tot.files:>8}{tot.code:>11}{tot.test_code:>11}{tot.unsafe_sites:>8}")
+        print(rule(W))
+
+
+# ---------------------------------------------------------------------------
+# audit: the source a reviewer must read to trust one kernel image
+# ---------------------------------------------------------------------------
+#
+# Methodology and the reasons for it: docs/archive/AUDIT_SURFACE_METHODOLOGY.md.
+#
+# Every other report in this script counts DIRECTORIES. That answers "how big is
+# the tree" and over-states "how much is in the kernel" three ways: a crate's
+# whole `src/` counts although `mod` declarations under an inactive `#[cfg]`
+# never reach the compiler; items gated on another arch or an unselected
+# feature count; and crates.io code is either ignored or (`--external`) counted
+# whole. `--audit` asks the compiler instead:
+#
+#   1. FILES — `cargo check --message-format=json` for the kernel's exact
+#      package / target / features. Every compiled unit names its output dir,
+#      and rustc wrote `<crate>-<hash>.d` there: the list of files it read.
+#      `check`, not `build`: same resolution, same dep-info, and it does not
+#      overwrite the kernel ELF someone is about to boot.
+#   2. LINES — each file is scanned against that unit's CfgWorld: the target's
+#      `rustc --print cfg`, the unit's resolved features, its build script's
+#      `rustc-cfg`s. An item whose `#[cfg]` is false is not in the image.
+#   3. PROVENANCE — each unit is the kernel itself, a workspace crate, or a
+#      third-party (registry/git) crate; host units (proc-macros, build scripts
+#      and their dependencies) are a separate build-time bucket.
+
+#: name -> (manifest, cargo package, target triple, features, default features on).
+#: `no-tests` everywhere: the image a guest boots carries no boot self-tests.
+AUDIT_KERNELS = {
+    "taoxichuan": (os.path.join("taoxichuan", "Cargo.toml"), "taoxichuan",
+                   "x86_64-unknown-none", "no-tests", True),
+    "akuma-amd64": (os.path.join("amd64", "Cargo.toml"), "akuma-amd64",
+                    "x86_64-unknown-none", "no-tests", True),
+    "akuma-aarch64": ("Cargo.toml", "akuma", "aarch64-unknown-none", "no-tests", True),
+}
+
+#: Extensions a dep-info line can name that are code a reviewer reads. `.s` arrives
+#: via `global_asm!(include_str!(..))`; anything else (`banner.txt`, JSON tables)
+#: is data and is reported only as a count.
+AUDIT_LANGS = {".rs": RUST, ".s": ASM, ".S": ASM, ".c": C_LIKE, ".h": HEADER}
+
+
+def _rustflags(triple: str) -> list:
+    """`[target.<triple>].rustflags` from `.cargo/config.toml` — they can set cfgs."""
+    try:
+        import tomllib
+        with open(os.path.join(".cargo", "config.toml"), "rb") as fh:
+            cfg = tomllib.load(fh)
+    except (OSError, ImportError, ValueError):
+        return []
+    return list(cfg.get("target", {}).get(triple, {}).get("rustflags", []))
+
+
+def _parse_cfg_line(line: str):
+    """`key` or `key="value"` (a `--print cfg` line, or a build script's
+    `rustc-cfg`) -> the (key, value) atom `_eval_cfg` looks up."""
+    if "=" in line:
+        k, v = line.split("=", 1)
+        return (k.strip(), v.strip().strip('"'))
+    return (line.strip(), None)
+
+
+_PRINT_CFG_CACHE: dict = {}
+
+
+def target_cfgs(triple, panic_abort: bool) -> set:
+    """`rustc --print cfg` for `triple` (None = host) with debug assertions off;
+    the per-unit `debug_assertions` atom is added from the unit's profile."""
+    key = (triple, panic_abort)
+    if key not in _PRINT_CFG_CACHE:
+        cmd = ["rustc", "--print", "cfg", "-C", "debug-assertions=off"]
+        if triple:
+            cmd += ["--target", triple] + _rustflags(triple)
+        if panic_abort:
+            cmd += ["-C", "panic=abort"]
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+        _PRINT_CFG_CACHE[key] = {_parse_cfg_line(ln) for ln in out.splitlines() if ln.strip()}
+    return _PRINT_CFG_CACHE[key]
+
+
+def read_dep_info(path: str) -> list:
+    """Source files a rustc `.d` file names (first rule's prerequisites)."""
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return []
+    first = text.replace("\\\n", " ").split("\n", 1)[0]
+    _, _, deps = first.partition(": ")
+    # Paths with spaces are written `a\ b`.
+    return [p.replace("\0", " ") for p in deps.replace("\\ ", "\0").split()]
+
+
+@dataclass
+class AuditUnit:
+    name: str          # crate name as rustc saw it
+    package: str       # cargo package id
+    origin: str        # "kernel" | "workspace" | "third-party" | "build-time"
+    world: CfgWorld
+    files: list        # absolute source paths from dep-info
+
+
+def audit_units(manifest: str, pkg: str, triple: str, features: str, default: bool):
+    """The compiled units of one kernel, from `cargo check --message-format=json`."""
+    cmd = ["cargo", "check", "--release", "--manifest-path", manifest, "-p", pkg,
+           "--target", triple, "--message-format=json"]
+    if features:
+        cmd += ["--features", features]
+    if not default:
+        cmd.append("--no-default-features")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = "\n".join(proc.stderr.strip().splitlines()[-5:])
+        raise SystemExit(f"error: `{' '.join(cmd)}` failed:\n{tail}")
+
+    msgs = [json.loads(ln) for ln in proc.stdout.splitlines() if ln.startswith("{")]
+    bs_cfgs: dict = {}
+    for m in msgs:
+        if m["reason"] == "build-script-executed":
+            bs_cfgs[m["package_id"]] = {_parse_cfg_line(c) for c in m.get("cfgs", [])}
+
+    kernel_dir = os.path.abspath(os.path.dirname(manifest) or ".")
+    target_marker = os.sep + triple + os.sep
+    units = []
+    for m in msgs:
+        if m["reason"] != "compiler-artifact" or not m["filenames"]:
+            continue
+        kinds = m["target"]["kind"]
+        out_dir = os.path.dirname(m["filenames"][0])
+        host = target_marker not in m["filenames"][0] or "proc-macro" in kinds \
+            or "custom-build" in kinds
+        atoms = set(target_cfgs(None if host else triple, panic_abort=not host))
+        if m["profile"].get("debug_assertions"):
+            atoms.add(("debug_assertions", None))
+        atoms |= {("feature", f) for f in m["features"]}
+        atoms |= bs_cfgs.get(m["package_id"], set())
+        files: list = []
+        for d in sorted(glob.glob(os.path.join(out_dir, "*.d"))):
+            files += read_dep_info(d)
+        pid = m["package_id"]
+        if host:
+            origin = "build-time"
+        elif os.path.dirname(os.path.abspath(m["manifest_path"])) == kernel_dir:
+            origin = "kernel"
+        elif pid.startswith("path+"):
+            origin = "workspace"
+        else:
+            origin = "third-party"
+        units.append(AuditUnit(m["target"]["name"], pid, origin, CfgWorld(atoms),
+                               list(dict.fromkeys(files))))
+    return units
+
+
+@dataclass
+class AuditRow:
+    """One crate's audit surface. `whole_*` is every line of every compiled file
+    (what a file-level count like Linux's `.cmd` lists can see); `code` is what
+    survives the unit's cfg evaluation and test gating."""
+    crate: str
+    origin: str
+    files: int = 0
+    whole_code: int = 0
+    code: int = 0
+    unsafe_code: int = 0
+    unsafe_sites: int = 0
+    asm_code: int = 0
+    data_files: int = 0
+
+
+def audit_kernel(name: str):
+    manifest, pkg, triple, features, default = AUDIT_KERNELS[name]
+    units = audit_units(manifest, pkg, triple, features, default)
+    rows: list = []
+    seen: set = set()  # a file compiled by two units (lib + bin of one package) counts once
+    #: path -> (origin, live code lines, live unsafe lines): the line-level view
+    #: `audit_union` intersects across kernels.
+    lines: dict = {}
+    for u in units:
+        row = AuditRow(u.name, u.origin)
+        for f in u.files:
+            ext = os.path.splitext(f)[1]
+            spec = AUDIT_LANGS.get(ext)
+            if f in seen or not os.path.isfile(f):
+                continue
+            seen.add(f)
+            if spec is None:
+                row.data_files += 1
+                continue
+            text = open(f, encoding="utf-8", errors="replace").read()
+            # Dep-info already says this file is compiled, so its NAME says nothing
+            # about tests: `filename_tests=False`.
+            live, live_unsafe = set(), set()
+            fc = count_text(text, f, spec, u.world, filename_tests=False,
+                            live=live, live_unsafe=live_unsafe)
+            if u.origin != "build-time":
+                lines[f] = (u.origin, live, live_unsafe)
+            row.files += 1
+            row.whole_code += fc.code + fc.test_code
+            row.code += fc.code
+            row.unsafe_code += fc.unsafe_code
+            row.unsafe_sites += fc.unsafe_sites
+            if not spec.rust:
+                row.asm_code += fc.code
+        if row.files or row.data_files:
+            rows.append(row)
+    return (manifest, pkg, triple, features, default), rows, lines
+
+
+def audit_union(a: dict, b: dict):
+    """Line-level union and intersection of two kernels' runtime images.
+
+    A file both kernels compile is read once; a line live in either build is in
+    the union, a line live in both is in the intersection. Lines, not files: the
+    same `ext2.rs` under two feature sets has two different live sets.
+    Returns {origin: [union, shared, union_unsafe, shared_unsafe]} plus "total".
+    """
+    out: dict = {}
+    for path in set(a) | set(b):
+        ea, eb = a.get(path), b.get(path)
+        origin = (ea or eb)[0]
+        la, lb = (ea[1] if ea else set()), (eb[1] if eb else set())
+        ua, ub = (ea[2] if ea else set()), (eb[2] if eb else set())
+        for key in (origin, "total"):
+            acc = out.setdefault(key, [0, 0, 0, 0])
+            acc[0] += len(la | lb)
+            acc[1] += len(la & lb)
+            acc[2] += len(ua | ub)
+            acc[3] += len(ua & ub)
+    return out
+
+
+AUDIT_ORIGINS = ("kernel", "workspace", "third-party")
+
+
+def print_audit_report(names: list, top: int, as_json: bool) -> None:
+    results = {n: audit_kernel(n) for n in names}
+    if as_json:
+        out = {}
+        for n, (cfg, rows, _lines) in results.items():
+            out[n] = {"manifest": cfg[0], "package": cfg[1], "triple": cfg[2],
+                      "features": cfg[3], "default_features": cfg[4],
+                      "crates": [vars(r) for r in rows]}
+        print(json.dumps(out, indent=2))
+        return
+
+    W = 86
+    hdr = (f"  {'':<26}{'crates':>7}{'files':>7}{'whole':>9}{'audit':>9}"
+           f"{'unsafe':>8}{'sites':>7}{'asm':>7}")
+    summary = []
+    for n, ((manifest, pkg, triple, features, default), rows, _lines) in results.items():
+        print(rule(W))
+        feat = features + ("" if default else " (no default features)")
+        print(f"{n}: {pkg} for {triple}, features [{feat or 'default'}]")
+        print(rule(W))
+        print(hdr)
+
+        def line(label, rs):
+            a = AuditRow(label, "")
+            for r in rs:
+                for f in ("files", "whole_code", "code", "unsafe_code", "unsafe_sites", "asm_code"):
+                    setattr(a, f, getattr(a, f) + getattr(r, f))
+            print(f"  {label:<26}{len(rs):>7}{a.files:>7}{a.whole_code:>9}{a.code:>9}"
+                  f"{a.unsafe_code:>8}{a.unsafe_sites:>7}{a.asm_code:>7}")
+            return a
+
+        image = [r for r in rows if r.origin in AUDIT_ORIGINS]
+        for origin in AUDIT_ORIGINS:
+            line(origin, [r for r in image if r.origin == origin])
+        print("  " + rule(W - 2))
+        tot = line("RUNTIME IMAGE", image)
+        line("build-time (host)", [r for r in rows if r.origin == "build-time"])
+        summary.append((n, tot, sum(1 for r in image if r.origin == "third-party")))
+        if top:
+            print()
+            print(f"  largest {top} crates in the image by audit lines:")
+            for r in sorted(image, key=lambda r: -r.code)[:top]:
+                print(f"    {r.crate:<34}{r.origin:<13}{r.code:>8}{r.unsafe_code:>8}")
+        print()
+
+    if len(summary) > 1:
+        print(rule(W))
+        print(f"  {'kernel':<26}{'audit lines':>12}{'unsafe lines':>14}{'whole files':>13}")
+        print(rule(W))
+        for n, tot, _ in summary:
+            print(f"  {n:<26}{tot.code:>12}{tot.unsafe_code:>14}{tot.whole_code:>13}")
+        print(rule(W))
+        # A stack (a host kernel and the guest it runs) is audited once per line:
+        # the crates two kernels share are read once.
+        print()
+        print(f"  pairs: lines live in either (union) / in both (shared){'':>6}unsafe")
+        print(f"  {'':<36}{'union':>10}{'shared':>10}{'union':>10}{'shared':>9}")
+        names_ = list(results)
+        for i, x in enumerate(names_):
+            for y in names_[i + 1:]:
+                u = audit_union(results[x][2], results[y][2])
+                print(f"  {x + ' + ' + y:<36}{u['total'][0]:>10}{u['total'][1]:>10}"
+                      f"{u['total'][2]:>10}{u['total'][3]:>9}")
+                for origin in AUDIT_ORIGINS:
+                    v = u.get(origin, [0, 0, 0, 0])
+                    print(f"    {origin:<34}{v[0]:>10}{v[1]:>10}{v[2]:>10}{v[3]:>9}")
+        print(rule(W))
+    print("whole  = code lines of every file rustc read (comparable to a C file-level count)")
+    print("audit  = whole minus #[cfg]-false items for this build and test-only items")
+    print("unsafe = audit lines inside `unsafe` blocks; sites = `unsafe` keywords")
+    print("asm    = audit lines that are assembly (global_asm! include_str! files)")
+    print("Comments and blanks are never counted. Method: docs/archive/AUDIT_SURFACE_METHODOLOGY.md")
+
+
+# ---------------------------------------------------------------------------
+# audit, Linux: the same question asked of a built Linux tree
+# ---------------------------------------------------------------------------
+#
+# The Rust audit's two steps have direct Kbuild equivalents, so the numbers
+# compare like with like:
+#
+#   FILES — every object Kbuild compiled leaves `.<obj>.cmd` beside it, whose
+#     `source_<obj>` and `deps_<obj>` lines are gcc's own `-MD` list of what it
+#     read: rustc's dep-info, in make syntax. Built with `make vmlinux`, so only
+#     what links into the kernel image (no modules, no bzImage real-mode setup,
+#     which a PVH/Firecracker guest does not run). Host programs Kbuild builds
+#     for itself (`scripts/`, `tools/`, `arch/*/tools/`) are the build-time
+#     bucket, like proc-macros and build scripts.
+#   LINES — `#if`/`#ifdef` on CONFIG_ symbols is resolved with `unifdef` against
+#     the build's `autoconf.h`, every other Kconfig symbol undefined: Linux's
+#     `#[cfg]`. `IS_ENABLED(CONFIG_X)` in a directive is rewritten to
+#     `defined(CONFIG_X)` first (no modules are built, so builtin == enabled);
+#     in C statements it is left alone, as `cfg!()` is on the Rust side —
+#     both branches are compiled and type-checked. Conditionals on anything
+#     else (`__ASSEMBLY__`, compiler macros) are kept: an over-count.
+
+LINUX_LANGS = {".c": C_LIKE, ".h": HEADER, ".S": CPP_ASM}
+LINUX_HOST_PREFIXES = ("scripts/", "tools/", "arch/x86/tools/", "arch/arm64/tools/", "usr/")
+_KCONFIG_SYM = re.compile(r"^\s*(?:menu)?config\s+([A-Za-z0-9_]+)", re.M)
+_IS_ENABLED = re.compile(r"\b(?:IS_ENABLED|IS_BUILTIN|IS_REACHABLE)\s*\(\s*(CONFIG_[A-Za-z0-9_]+)\s*\)")
+
+
+def linux_cmd_files(objtree: str):
+    """Yield (object, [files]) for every `.cmd` naming a source."""
+    for dirpath, dirnames, filenames in os.walk(objtree):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for fn in filenames:
+            if not (fn.startswith(".") and fn.endswith(".cmd")):
+                continue
+            text = open(os.path.join(dirpath, fn), encoding="utf-8", errors="replace").read()
+            if "source_" not in text:
+                continue
+            files = []
+            for m in re.finditer(r"^(?:source|deps)_\S+\s*:=\s*((?:.*\\\n)*.*)$", text, re.M):
+                for tok in m.group(1).replace("\\\n", " ").split():
+                    if tok.startswith("$(") or tok.endswith(")"):
+                        continue  # `$(wildcard include/config/..)`: Kconfig stamps, not sources
+                    files.append(tok)
+            obj = os.path.relpath(os.path.join(dirpath, fn[1:-4]), objtree)
+            yield obj, files
+
+
+def linux_unifdef_defs(srctree: str, objtree: str):
+    """(defined, undefined): CONFIG_ symbols the build set, with their values,
+    and every other Kconfig symbol in the tree (plus its `_MODULE` twin)."""
+    defined: dict = {}
+    for ln in open(os.path.join(objtree, "include", "generated", "autoconf.h"), encoding="utf-8"):
+        parts = ln.split(None, 2)
+        if len(parts) == 3 and parts[0] == "#define" and parts[1].startswith("CONFIG_"):
+            defined[parts[1]] = parts[2].strip()
+    every: set = set()
+    for dirpath, dirnames, filenames in os.walk(srctree):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for fn in filenames:
+            if fn.startswith("Kconfig"):
+                txt = open(os.path.join(dirpath, fn), encoding="utf-8", errors="replace").read()
+                every.update("CONFIG_" + s for s in _KCONFIG_SYM.findall(txt))
+    undefined = set()
+    for sym in every - set(defined):
+        undefined.add(sym)
+        undefined.add(sym + "_MODULE")
+    return defined, undefined
+
+
+def linux_audit(srctree: str, objtree: str):
+    srctree, objtree = os.path.abspath(srctree), os.path.abspath(objtree)
+    image: set = set()
+    host: set = set()
+    for obj, files in linux_cmd_files(objtree):
+        bucket = host if obj.startswith(LINUX_HOST_PREFIXES) else image
+        for f in files:
+            # A relative dep is usually objtree-relative (generated headers), but
+            # some rules (objtool's `arch/x86/decode.c`) record a srctree-relative one.
+            full = os.path.normpath(f if os.path.isabs(f) else os.path.join(objtree, f))
+            if not os.path.isabs(f) and not os.path.exists(full):
+                full = os.path.normpath(os.path.join(srctree, f))
+            if not os.path.isfile(full):
+                continue
+            if os.path.splitext(full)[1] in LINUX_LANGS and full.startswith((srctree, objtree)):
+                bucket.add(full)
+    host -= image
+
+    defined, undefined = linux_unifdef_defs(srctree, objtree)
+    directive_syms = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef|elif)\b.*$", re.M)
+
+    def area(full):
+        if full.startswith(objtree + os.sep) and not full.startswith(srctree + os.sep):
+            return "(generated)"
+        rel = os.path.relpath(full, srctree).split(os.sep)
+        if rel[0] in ("arch", "drivers", "include", "fs", "net") and len(rel) > 2:
+            return os.path.join(rel[0], rel[1])
+        return rel[0]
+
+    rows: dict = {}
+    lines: dict = {}  # image file -> live code line numbers, for unions across configs
+    for bucket_name, files in (("image", image), ("build-time", host)):
+        for full in sorted(files):
+            spec = LINUX_LANGS[os.path.splitext(full)[1]]
+            text = open(full, encoding="utf-8", errors="replace").read()
+            whole = count_text(text, full, spec, True, filename_tests=False).code
+            live = whole
+            if bucket_name == "image":
+                pre = "\n".join(_IS_ENABLED.sub(r"defined(\1)", ln) if ln.lstrip().startswith("#") else ln
+                                for ln in text.split("\n"))
+                # Hand unifdef only the CONFIG_ symbols this file's directives test:
+                # one ~30k-line definitions file per call made a 6.18 tree take hours.
+                syms = set(re.findall(r"\bCONFIG_[A-Za-z0-9_]+", " ".join(directive_syms.findall(pre))))
+                args = [f"-D{k}={defined[k]}" for k in sorted(syms) if k in defined]
+                args += [f"-U{k}" for k in sorted(syms) if k in undefined]
+                r = None
+                if args or re.search(r"^\s*#\s*(?:if|elif)\s+[01]\b", pre, re.M):
+                    r = subprocess.run(["unifdef", "-b", "-k", *args], input=pre,
+                                       capture_output=True, text=True, errors="replace")
+                live_set: set = set()
+                if r is not None and r.returncode in (0, 1):  # 1 = "changed", not an error
+                    # `-b` blanks removed lines instead of deleting them, so line
+                    # numbers stay comparable across configs of the same tree.
+                    live = count_text(r.stdout, full, spec, True, filename_tests=False,
+                                      live=live_set).code
+                else:
+                    count_text(text, full, spec, True, filename_tests=False, live=live_set)
+                lines[full] = live_set
+            key = (bucket_name, area(full) if bucket_name == "image" else "build-time")
+            agg = rows.setdefault(key, [0, 0, 0])
+            agg[0] += 1
+            agg[1] += whole
+            agg[2] += live
+    return rows, lines
+
+
+def print_linux_audit(srctree: str, objtrees: list, top: int, as_json: bool) -> None:
+    """Each tree alone, then (given several) the line-level union of every pair:
+    a host and a guest built from one source tree share most of `kernel/`,
+    `mm/` and `include/`, and a reviewer reads a shared line once."""
+    per = {}
+    for objtree in objtrees:
+        rows, lines = linux_audit(srctree, objtree)
+        per[objtree] = lines
+        print_linux_tree(objtree, rows, top, as_json)
+    if len(objtrees) > 1 and not as_json:
+        W = 70
+        print(f"  pairs: lines live in either (union) / in both (shared)")
+        print(f"  {'':<44}{'union':>12}{'shared':>12}")
+        for i, x in enumerate(objtrees):
+            for y in objtrees[i + 1:]:
+                a, b = per[x], per[y]
+                union = shared = 0
+                for path in set(a) | set(b):
+                    la, lb = a.get(path, set()), b.get(path, set())
+                    union += len(la | lb)
+                    shared += len(la & lb)
+                label = os.path.basename(x.rstrip(os.sep)) + " + " + os.path.basename(y.rstrip(os.sep))
+                print(f"  {label:<44}{union:>12}{shared:>12}")
+        print(rule(W))
+
+
+def print_linux_tree(objtree: str, rows: dict, top: int, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps([{"bucket": b, "area": a, "files": v[0], "whole_code": v[1], "code": v[2]}
+                          for (b, a), v in sorted(rows.items())], indent=2))
+        return
+    W = 70
+    img = [(a, v) for (b, a), v in rows.items() if b == "image"]
+    tot = [sum(v[i] for _, v in img) for i in range(3)]
+    bt = rows.get(("build-time", "build-time"), [0, 0, 0])
+    print(rule(W))
+    print(f"Linux audit surface: {objtree}")
+    print(rule(W))
+    print(f"  {'':<34}{'files':>8}{'whole':>12}{'audit':>12}")
+    for a, v in sorted(img, key=lambda kv: -kv[1][2])[: top or len(img)]:
+        print(f"  {a:<34}{v[0]:>8}{v[1]:>12}{v[2]:>12}")
+    print("  " + rule(W - 2))
+    print(f"  {'RUNTIME IMAGE (vmlinux)':<34}{tot[0]:>8}{tot[1]:>12}{tot[2]:>12}")
+    print(f"  {'build-time (host programs)':<34}{bt[0]:>8}{bt[1]:>12}{bt[2]:>12}")
+    print(rule(W))
+    print("whole = code lines of every file gcc read for vmlinux (Kbuild .cmd deps)")
+    print("audit = whole after unifdef against autoconf.h (CONFIG_ conditionals only)")
+
+
+def elf_symbol_bytes(elf: str):
+    """{crate: bytes} of defined symbols in an UNSTRIPPED ELF, via `rust-nm`.
+
+    A symbol is attributed to the crate named first in its demangled path
+    (`<smoltcp::X as T>::f` -> smoltcp). Code inlined into a caller is the
+    caller's, so this UNDER-counts small helper crates and generics; a crate
+    with zero bytes is genuinely absent or fully inlined. The extreme-size
+    profile strips symbols, so build with CARGO_PROFILE_EXTREME_SIZE_STRIP=none.
+    """
+    try:
+        out = subprocess.run(["rust-nm", "-S", "--demangle", "--defined-only", elf],
+                             capture_output=True, text=True, timeout=120, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    ident = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)::")
+    sz: dict = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            size = int(parts[1], 16)
+        except ValueError:
+            continue
+        name = re.sub(r"^[<&*\[\(\)\]\s]*(mut |dyn |const )?", "", parts[3].strip())
+        m = ident.match(name)
+        sz[m.group(1) if m else "(unattributed)"] = sz.get(m.group(1) if m else "(unattributed)", 0) + size
+    return sz
+
+
+def print_elf_report(elf: str, pkg: str, triple: str, features: str, default: bool,
+                     kernel_gate: bool, W: int) -> None:
+    """Source lines vs bytes actually in the image, per linked crate.
+
+    The line-count footprint above is "what the dependency graph links"; this
+    is "what the linker kept". They differ a lot: a crate can be in the graph
+    and contribute nothing once LTO drops what nothing calls.
+    """
+    sz = elf_symbol_bytes(elf)
+    tree = cargo_tree(pkg, triple, features, default)
+    if sz is None or tree is None:
+        print(f"--elf: need `rust-nm` and `cargo tree` ({elf})")
+        return
+    print()
+    print(rule(W))
+    print(f"Image check: {elf}")
+    print(f"  graph = cargo tree -p {pkg} --target {triple}"
+          + ("" if default else " --no-default-features") + (f" --features {features}" if features else ""))
+    print(rule(W))
+    print(f"{'crate':<30}{'kind':>6}{'prod lines':>12}{'image bytes':>13}")
+    rows_ = []
+    tot = {"ws": [0, 0, 0, 0], "ext": [0, 0, 0, 0]}  # lines, bytes, crates, crates-with-bytes
+    root = os.path.abspath(".")
+    for name, ver, path in tree:
+        if path and os.path.abspath(path) in (root, os.path.abspath(os.path.join(root, pkg))):
+            continue
+        kind = "ws" if path else "ext"
+        src = os.path.join(path, "src") if path else None
+        if src is None:
+            m = next((d for d in glob.glob(os.path.expanduser(f"~/.cargo/registry/src/*/{name}-{ver}/src"))), None)
+            src = m
+        lines = 0
+        if src and os.path.isdir(src):
+            files, _ = walk([src], kernel_gate)
+            lines = sum(fc.code for fc in files) if files and hasattr(files[0], "code") else 0
+            if not lines:
+                a = Agg()
+                for fc in files:
+                    a.add(fc)
+                lines = a.code
+        b = sz.get(name.replace("-", "_"), 0)
+        rows_.append((name, kind, lines, b))
+        t = tot[kind]
+        t[0] += lines
+        t[1] += b
+        t[2] += 1
+        t[3] += 1 if b else 0
+    for name, kind, lines, b in sorted(rows_, key=lambda r: (-r[3], -r[2])):
+        print(f"{name:<30}{kind:>6}{lines:>12}{b:>13}" + ("   <- 0 B in image" if not b else ""))
+    print(rule(W))
+    for label, key in (("workspace crates", "ws"), ("external crates", "ext")):
+        l, b, n, nb = tot[key]
+        print(f"{label:<22}{n:>4} in graph, {nb:>3} with bytes in image; {l:>7} lines counted, {b:>8} B in image")
+    print(f"{'rest of image':<22}core+alloc {sz.get('core', 0) + sz.get('alloc', 0)} B, "
+          f"unattributed {sz.get('(unattributed)', 0)} B")
     print(rule(W))
 
 
@@ -1743,12 +2587,12 @@ def emit_json(files: list, paths: list) -> None:
 # `amd64/src`, not `amd64`: the bin's directory also holds `mkdisk.sh`, `Cargo.toml`,
 # a README and linker/boot scaffolding, which this counter would report as code.
 # The platform split keys on the `amd64/` prefix, so the narrower root changes nothing there.
-DEFAULT_PATHS = ["src", "crates", os.path.join("amd64", "src")]
+DEFAULT_PATHS = ["src", "crates", os.path.join("amd64", "src"), os.path.join("taoxichuan", "src")]
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("paths", nargs="*", default=DEFAULT_PATHS, help="files/dirs (default: src crates amd64/src)")
+    ap.add_argument("paths", nargs="*", default=DEFAULT_PATHS, help="files/dirs (default: src crates amd64/src taoxichuan/src)")
     ap.add_argument("--by-file", action="store_true", help="per-file table")
     ap.add_argument("--top", type=int, default=15, help="show N largest files (0 = off)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1767,6 +2611,25 @@ def main() -> int:
         action="store_true",
         help="also count C, assembly, shell, TOML, Markdown, JSON, ... (default: Rust only)",
     )
+    ap.add_argument(
+        "--external",
+        action="store_true",
+        help="also count the crates.io/git libraries each kernel links (via `cargo metadata`, offline)",
+    )
+    ap.add_argument("--elf", metavar="PATH",
+                    help="check the linked-crate set against an UNSTRIPPED kernel ELF (symbol bytes per crate)")
+    ap.add_argument("--elf-package", default="akuma", help="cargo package the ELF was built from (default akuma)")
+    ap.add_argument("--elf-triple", default="aarch64-unknown-none")
+    ap.add_argument("--elf-features", default="", help="features the ELF was built with")
+    ap.add_argument("--elf-no-default-features", action="store_true")
+    ap.add_argument("--audit", nargs="*", metavar="KERNEL", choices=list(AUDIT_KERNELS),
+                    help="audit surface: the lines compiled into each kernel image, from rustc "
+                         f"dep-info + cfg evaluation (default: taoxichuan akuma-amd64; "
+                         f"choices: {', '.join(AUDIT_KERNELS)})")
+    ap.add_argument("--linux", nargs="+", metavar="TREE",
+                    help="SRCTREE OBJTREE [OBJTREE ...]: audit surface of BUILT Linux trees "
+                         "(`make O=OBJTREE vmlinux`), each alone and pairwise unions; "
+                         "see scripts/linux_audit_surface.sh")
     ap.add_argument("--rev", help="count this git revision's tree instead of the working tree")
     ap.add_argument("--vs", metavar="REV",
                     help="also count REV and print the delta REV -> (--rev or working tree)")
@@ -1775,6 +2638,16 @@ def main() -> int:
     RUST_ONLY = not args.all_languages
     if args.self_test:
         return self_test()
+
+    if args.linux:
+        if len(args.linux) < 2:
+            ap.error("--linux needs SRCTREE and at least one OBJTREE")
+        print_linux_audit(args.linux[0], args.linux[1:], args.top, args.json)
+        return 0
+
+    if args.audit is not None:
+        print_audit_report(args.audit or ["taoxichuan", "akuma-amd64"], args.top, args.json)
+        return 0
 
     paths = args.paths or DEFAULT_PATHS
     kernel_gate = not args.no_kernel_test_gate
@@ -1806,6 +2679,11 @@ def main() -> int:
         emit_json(files, paths)
     else:
         print_report(files, paths, ignored, args.by_file, args.top)
+        if args.external:
+            print_external_report(kernel_gate, 78)
+        if args.elf:
+            print_elf_report(args.elf, args.elf_package, args.elf_triple, args.elf_features,
+                             not args.elf_no_default_features, kernel_gate, 78)
     return 0
 
 

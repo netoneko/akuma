@@ -20,6 +20,7 @@
     "crates/akuma-firecracker",
     "crates/akuma-fpcache",
     "crates/akuma-fpcache-rw",
+    "crates/akuma-fpu-amd64",
     "crates/akuma-gdt",
     "crates/akuma-hda",
     "crates/akuma-hid",
@@ -63,6 +64,7 @@
     "crates/akuma-syscalls-mem",
     "crates/akuma-syscalls-net",
     "crates/akuma-syscalls-poll",
+    "crates/akuma-syscalls-signal",
     "crates/akuma-syscalls-sync",
     "crates/akuma-syscalls-time",
     "crates/akuma-touchpad",
@@ -70,6 +72,7 @@
     "crates/akuma-usb",
     "crates/akuma-usb-storage",
     "crates/akuma-user-space",
+    "crates/akuma-user-tree",
     "crates/akuma-vfs",
     "crates/akuma-vfs-glue",
     "crates/akuma-vm-spec",
@@ -78,9 +81,9 @@
     "crates/akuma-xhci"
   ],
   "unsafe_sites": {
-    "amd64/src": 85,
+    "amd64/src": 83,
     "crates/akuma-alloc": 24,
-    "crates/akuma-boot-amd64": 4,
+    "crates/akuma-boot-amd64": 10,
     "crates/akuma-cpu": 65,
     "crates/akuma-dma": 17,
     "crates/akuma-el0-entry": 4,
@@ -91,7 +94,7 @@
     "crates/akuma-idt-amd64": 1,
     "crates/akuma-locks-rw-cell": 8,
     "crates/akuma-mmu": 20,
-    "crates/akuma-net-nic": 12,
+    "crates/akuma-net-nic": 13,
     "crates/akuma-not-even-once": 5,
     "crates/akuma-pagetable": 5,
     "crates/akuma-pmm": 3,
@@ -106,6 +109,7 @@
     "crates/akuma-trap-amd64": 2,
     "crates/akuma-uart": 1,
     "crates/akuma-user-access": 20,
-    "crates/akuma-virtio": 12
+    "crates/akuma-virtio": 12,
+    "taoxichuan/src": 55
   }
 }

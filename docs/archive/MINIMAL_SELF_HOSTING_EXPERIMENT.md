@@ -4,7 +4,7 @@
 
 **Oversight note (2026-10-24):** the host track and goose supervision moved from
 Kimi to Claude Sonnet 5 after Kimi ran out of tokens (a bad subscription setting
-on the owner's side). The metal track is still goose + GLM.
+on the user's side). The metal track is still goose + GLM.
 
 Prepared as part of rust.org.il talk prep
 ([`RUST_ORG_IL_TALK.md`](RUST_ORG_IL_TALK.md)) — the talk's composability
@@ -99,6 +99,30 @@ harness names what the other's silence hid. Using open-weight models on both
 tracks is load-bearing: if the minimal kernel can be composed by the same
 class of open tools the talk claims the whole stack is buildable with, that
 is the claim, demonstrated.
+
+## Session protocol (pinned, 2026-10-25)
+
+Stages 1-6 were run as a ladder, not as an experiment: briefs differed in shape, nobody wrote down what a session cost, and
+two briefs carried supervisor mistakes (stage 7A's gate used the gateway's own address `10.0.2.2` as a host alias, which no
+guest ever did, and sent the agent down a dead end; the agent read almost none of the KVM docs because the briefs only named
+the previous `RESULT` files). From stage 7B on every goose session follows this:
+
+1. **One brief shape** (`scripts/kvm/goose/BRIEF_TEMPLATE.md`): the key fact the agent must not rediscover, a *read-first*
+   list of specific doc sections (the agent greps source files by habit and does not find `docs/` by itself), gates with the
+   exact command and expected output, ops traps, an **event-based** commit rule, and a stop rule counted in boots.
+2. **Before sending, the supervisor checks the brief against the docs**: every address, key and command in a gate must appear
+   in a doc or a passing run. A gate invented from memory is the supervisor's bug.
+3. **The agent has no clock.** Rules are tied to events it can see (a boot, a build, a fix), never to minutes.
+4. **Same numbers for every session**, from `scripts/goose_session_stats.py` (run on the box against goose's `sessions.db`):
+   tool calls, calls before the first edit, input/output tokens, `docs/` reads and which files, source reads, `vm-dev`
+   boots, commits and pushes. They go in the agent log under the session's section.
+5. **The composition rule travels in every brief** (template § "Composition rule"): look in `crates/` and `amd64/src/` before
+   writing, depend on or extract rather than copy, and report pulled / extracted / written-new plus `taoxichuan/src` line counts
+   per session. It was in briefs 01-04 and silently dropped from 06a on; by stage 7 the composition root had grown to 4,450
+   newly written lines (`main.rs` 2,928). A rule stated once at the top of a doc is not a rule the agent sees; it has to be in the brief.
+6. **Changes are one at a time where possible.** 7B changed three things at once (docs list, corrected gate, event-based
+   commit rule), so its numbers against 7A show a difference, not a cause; say so in the log rather than crediting the docs.
+   With one run per stage there is no statistics, only a record that makes the next brief better.
 
 ## Exclusions (also pinned)
 

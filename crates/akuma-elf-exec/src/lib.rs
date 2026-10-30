@@ -347,12 +347,16 @@ mod tests {
         );
         let mut segs = [LoadSeg {
             vaddr: 0,
+            offset: 0,
             filesz: 0,
             memsz: 0,
             flags: 0,
         }; 4];
         let k = load_segments(&buf[..n], 0x3000_0000, &mut segs).unwrap();
         assert_eq!(k, 2);
+        // The file offset is the segment's own `p_offset`, never derived from the (rebased)
+        // vaddr: indexing the image by vaddr was the M5 crash on musl's ldso.
+        assert_eq!((segs[0].offset, segs[1].offset), (0, 0x1000));
         assert_eq!(segs[0].vaddr, 0x3000_0000);
         assert_eq!(segs[0].memsz, 0x1000);
         assert_eq!(segs[1].vaddr, 0x3000_2000);
@@ -368,7 +372,7 @@ mod tests {
             0x1000,
             &[(PT_LOAD, 0, 0x10, 0, 5, 0x10), (PT_LOAD, 0, 0x10, 0x2000, 6, 0x10)],
         );
-        let mut segs = [LoadSeg { vaddr: 0, filesz: 0, memsz: 0, flags: 0 }; 1];
+        let mut segs = [LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 1];
         assert_eq!(load_segments(&buf[..n], 0, &mut segs), Err(ExecErr::TooManySegments));
     }
 

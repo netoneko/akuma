@@ -84,13 +84,19 @@
 // Same allow as akuma-boot-amd64: several entry-point docs open with a long
 // paragraph on purpose (the why lives in the first block).
 #![allow(clippy::too_long_first_doc_paragraph)]
+// The Linux ABI is `u64` registers read as signed errno-style values and back;
+// every `as i64`/`as i32` in the syscall arms is that conversion on purpose.
+#![allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 
 extern crate alloc;
 
 mod child;
 mod exec_twin;
+mod futex;
 mod net;
 mod pipes;
+#[cfg(feature = "trace-err")]
+mod ring;
 mod sock;
 
 use akuma_boot_amd64::{mem, paging, phys};
@@ -198,15 +204,18 @@ static mut TRAP_STACKS: [TrapStack; crate::child::NSLOTS + 1] =
 /// the task the way amd64's hook set travels it ("the ring-3 trap stack in
 /// the TSS"). Out-of-range slots keep whatever is armed.
 pub(crate) fn arm_trap_stack(slot: usize) {
-    if slot >= crate::child::NSLOTS + 1 {
+    if slot > crate::child::NSLOTS {
         return;
     }
     // SAFETY: single core, IF clear on every caller path (switch_to runs at a
     // park/preemption point with interrupts masked); the statics are only
     // touched through raw pointers, never references.
     unsafe {
-        let top = (&raw const TRAP_STACKS[slot] as *const u8)
+        let top = (&raw const TRAP_STACKS[slot]).cast::<u8>()
             .add(TRAP_STACK_SIZE) as u64;
+        // A raw-pointer deref on purpose: `TSS.set_rsp0` would take a `&mut` of the
+        // static. clippy's `deref_addrof` suggestion breaks this line.
+        #[allow(clippy::deref_addrof)]
         (*&raw mut TSS).set_rsp0(top);
     }
 }
@@ -259,8 +268,231 @@ static IDT: idt_lib::Idt = idt_lib::Idt::new();
 /// this kernel is a bug in this kernel; there is no userspace to deliver it to
 /// and no scheduler to defer it through, so the honest report is the full
 /// frame and a halt. The `[Fault]` token is the gate's vocabulary.
+/// How far a user stack may grow below its initial pages: 8 MiB, the Linux
+/// default `ulimit -s`. cargo's main thread goes deeper than the 64 KiB
+/// every image starts with.
+const STACK_MAX: u64 = 8 << 20;
+
+/// A not-present fault just under a task's stack region is the stack growing:
+/// map the zeroed pages between the fault and the region, widen the region,
+/// and let the instruction retry. False for any other fault.
+fn grow_user_stack(cr2: u64) -> bool {
+    let limit = USER_STACK_TOP - STACK_MAX;
+    if cr2 >= USER_STACK_TOP || cr2 < limit {
+        return false;
+    }
+    let tk = task();
+    let Some(ri) = tk.regions[..tk.n_regions].iter().position(|&(_, e)| e == USER_STACK_TOP) else {
+        return false;
+    };
+    let lo = tk.regions[ri].0;
+    if cr2 >= lo {
+        return false;
+    }
+    let first = cr2 & !0xFFF;
+    let mut page = lo;
+    while page > first {
+        page -= 4096;
+        let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
+            return false;
+        };
+        if !paging::map_page_in(tk.root_pa, page as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
+            return false;
+        }
+    }
+    tk.regions[ri].0 = first;
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Copy-on-write fork: shared leaf frames, the bit-9 marker, one break path.
+// ---------------------------------------------------------------------------
+
+/// x86 leaf PTE bits. Bit 9 is an AVL bit the MMU ignores: a page that was
+/// writable when `fork` shared it is demoted to read-only and marked, so a
+/// write fault can tell "break the share" from "this page is read-only"
+/// (`mprotect(PROT_READ)`, text) — `akuma_cow::CowFault::marked`.
+const PTE_W: u64 = 1 << 1;
+const PTE_COW: u64 = 1 << 9;
+/// The x86 dirty bit: the CPU sets it on a user store, the kernel sets it on its own stores into user pages
+/// (`copy_to_user`). It is what "written since mapping" means for the W^X policy.
+const PTE_D: u64 = 1 << 6;
+
+/// W^X (`akuma_syscalls_mem::wx`): no page is writable and executable, and a page written since it was
+/// mapped cannot be made executable. On by default; `wx=0` on the kernel command line turns it off for a
+/// guest that needs a JIT. Stricter than Linux on purpose.
+static WX_ENFORCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+fn wx_on() -> bool {
+    WX_ENFORCE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Has the page at `va` in `root` been written since it was mapped (user store or kernel store)?
+fn page_written(root: u64, va: u64) -> bool {
+    leaf_entry(root, va & !0xFFF).is_some_and(|pte| pte.read() & PTE_D != 0)
+}
+
+/// Record that the kernel stored into the user page at `va` - the CPU sets the dirty bit for a user store,
+/// nothing sets it for ours.
+fn mark_written(root: u64, va: u64) {
+    if let Some(pte) = leaf_entry(root, va & !0xFFF) {
+        let v = pte.read();
+        if v & 1 != 0 && v & PTE_D == 0 {
+            pte.write(v | PTE_D);
+        }
+    }
+}
+const PTE_ADDR: u64 = 0x000f_ffff_ffff_f000;
+
+static COW_SHARED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static COW_COPY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static COW_TAKE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static COW_RETRY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `(shared, copied, taken-in-place, retried)` since boot, for the reap lines.
+#[cfg_attr(not(feature = "trace-err"), allow(dead_code))]
+pub(crate) fn cow_stats() -> (usize, usize, usize, usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (COW_SHARED.load(Relaxed), COW_COPY.load(Relaxed), COW_TAKE.load(Relaxed), COW_RETRY.load(Relaxed))
+}
+
+/// The 4 KiB leaf entry for `va` in `root`'s user half, if every level is
+/// present and none is a huge page.
+fn leaf_entry(root: u64, va: u64) -> Option<Pte> {
+    // SAFETY: `root` is a user root (a task's `root_pa` or the live CR3): a
+    // page-table frame.
+    let mut table = unsafe { phys::Frame::from_pa(root & PTE_ADDR) };
+    for shift in [39u32, 30, 21] {
+        let e = table.entry(((va >> shift) & 0x1FF) as usize);
+        if e & 1 == 0 || (shift != 39 && e & 0x80 != 0) {
+            return None;
+        }
+        // SAFETY: a present, non-huge entry names the next-level table frame.
+        table = unsafe { phys::Frame::from_pa(e & PTE_ADDR) };
+    }
+    Some(Pte { table, idx: ((va >> 12) & 0x1FF) as usize })
+}
+
+/// One leaf entry: the table frame and the slot in it.
+struct Pte {
+    table: phys::Frame,
+    idx: usize,
+}
+
+impl Pte {
+    fn read(&self) -> u64 {
+        self.table.entry(self.idx)
+    }
+
+    fn write(&self, v: u64) {
+        self.table.set_entry(self.idx, v);
+    }
+}
+
+/// THE copy-on-write break: re-read the live PTE for `va` in `root`, ask
+/// `akuma_cow::decide`, and carry the answer out. The write-fault arm and the
+/// kernel's own user-memory writers both come through here — one break path.
+/// Single core, `IF` clear (a trap or a syscall): nothing races the walk.
+/// `invlpg` after every PTE write is the whole shootdown.
+fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
+    use akuma_cow::CowAction;
+    use core::sync::atomic::Ordering::Relaxed;
+    let va = va & !0xFFF;
+    let Some(slot) = leaf_entry(root, va) else {
+        return CowAction::Fault;
+    };
+    let pte = slot.read();
+    if pte & 1 == 0 {
+        return CowAction::Fault;
+    }
+    let old = pte & PTE_ADDR;
+    let action = akuma_cow::CowFault {
+        pte_writable: pte & PTE_W != 0,
+        marked: pte & PTE_COW != 0,
+        refs: akuma_pmm::cow_ref_get(old as usize),
+    }
+    .decide();
+    match action {
+        CowAction::Retry => {
+            COW_RETRY.fetch_add(1, Relaxed);
+            akuma_cpu::tlb::invlpg(va as usize);
+        }
+        CowAction::Fault => {}
+        CowAction::TakeInPlace => {
+            slot.write((pte | PTE_W) & !PTE_COW);
+            akuma_cpu::tlb::invlpg(va as usize);
+            COW_TAKE.fetch_add(1, Relaxed);
+        }
+        CowAction::Copy => {
+            let Some(new) = phys::Frame::alloc_zeroed() else {
+                // Out of frames: the caller's kill path reports it.
+                return CowAction::Fault;
+            };
+            // SAFETY: `old` is the frame this present leaf maps.
+            new.copy_page_from(unsafe { phys::Frame::from_pa(old) });
+            slot.write(((pte & !PTE_ADDR) | PTE_W | new.pa()) & !PTE_COW);
+            akuma_cpu::tlb::invlpg(va as usize);
+            // Drops this space's count on the old frame (frees it only if it
+            // was somehow the last holder).
+            akuma_pmm::free_page(old as usize, akuma_primitives::preempt::current_tid() as u32);
+            COW_COPY.fetch_add(1, Relaxed);
+        }
+    }
+    action
+}
+
+/// Before the kernel writes into the user page at `va` (through the physmap, which never faults): decide
+/// whether the write may happen. `false` is `EFAULT`, as on Linux, where a kernel write to a page the user
+/// could not write faults.
+///
+/// * A marked read-only page is a CoW share: break it first. If the break cannot get a frame the write is
+///   refused - it used to be attempted anyway, into the still-shared frame, corrupting the other holder.
+/// * An UNMARKED read-only page that several spaces hold (shared text, or an `mprotect(PROT_READ)` page after a
+///   fork) must not be written: the write would land in every holder. Refused.
+/// * An unshared read-only page is left writable to the kernel (the only holder is the one asking).
+fn cow_prepare_write(root: u64, va: u64) -> bool {
+    let Some(slot) = leaf_entry(root, va & !0xFFF) else {
+        return true; // not mapped: the translate that follows reports it
+    };
+    let pte = slot.read();
+    if pte & 1 == 0 || pte & PTE_W != 0 {
+        return true;
+    }
+    if pte & PTE_COW != 0 {
+        return !matches!(cow_resolve(root, va), akuma_cow::CowAction::Fault);
+    }
+    akuma_pmm::cow_ref_get((pte & PTE_ADDR) as usize) < 2
+}
+
+/// `mprotect` is about to make `va` writable: a frame several spaces hold
+/// (marked or not — a shared read-only text page is unmarked) must be private
+/// first, or the write lands in every holder.
+fn cow_privatize(root: u64, va: u64) -> bool {
+    let Some(slot) = leaf_entry(root, va) else {
+        return true;
+    };
+    let pte = slot.read();
+    if pte & 1 == 0 || akuma_pmm::cow_ref_get((pte & PTE_ADDR) as usize) < 2 {
+        return true;
+    }
+    // Force the Copy arm for a share the PTE does not mark.
+    slot.write((pte & !PTE_W) | PTE_COW);
+    !matches!(cow_resolve(root, va), akuma_cow::CowAction::Fault)
+}
+
 fn fault_trap(t: &mut Trap<'_>) {
     let code = t.error_code.unwrap_or(0);
+    if t.from_ring3() && code & 1 == 0 && grow_user_stack(akuma_cpu::ctlreg::cr2()) {
+        return;
+    }
+    // A user write to a present page: the copy-on-write arm. Present + write
+    // + user (error code bits 0-2). The live PTE decides, never the error
+    // code (`cow_resolve` re-reads it); only `Fault` falls through to the kill.
+    if t.from_ring3() && code & 7 == 7 {
+        let root = akuma_cpu::ctlreg::cr3() & PTE_ADDR;
+        if cow_resolve(root, akuma_cpu::ctlreg::cr2()).resolves() {
+            return;
+        }
+    }
     // Stage 2: a fault *from ring 3* is the task's death, not the kernel's —
     // say which, and park. There is no scheduler to reap through and no other
     // task to keep running; what matters for the gate is that this prints
@@ -275,6 +507,15 @@ fn fault_trap(t: &mut Trap<'_>) {
             akuma_cpu::ctlreg::cr2(),
             code
         );
+        #[cfg(feature = "trace-err")]
+        mm_dump_for(akuma_cpu::ctlreg::cr2());
+        // A real fork child or thread dies alone (SIGSEGV status to its
+        // waiter); the machine runs on. The shell and the boot task are the
+        // M2 shapes with no slot to reap through: those halt as before.
+        if child::is_real_task() {
+            akuma_primitives::safe_print!(64, "[Fault] slot {} killed (SIGSEGV)\n", exec_twin::current_slot());
+            child::task_die_segv();
+        }
         halt();
     }
     akuma_primitives::safe_print!(
@@ -397,14 +638,7 @@ fn timer_trap(t: &mut Trap<'_>) {
     // tick with no live slot must not switch (the same `may_park` discipline
     // the pipe arms and `wait4_real` keep).
     let slot = crate::exec_twin::current_slot();
-    // [tmp] pl-1 DIAGNOSTIC (remove before final): the preemption switch, off.
-    // H1 (PLAN-pl.md §3): the tick's x86_yield landing inside the only
-    // multi-tick ring-3 stretch (the exec'd child) breaks the crossing's
-    // resume state. This const removes ONLY the switch; on_tick and netpoll
-    // are untouched.
-    const PREEMPT_SWITCH_OFF: bool = true;
-    if !PREEMPT_SWITCH_OFF
-        && t.from_ring3()
+    if t.from_ring3()
         && slot != crate::exec_twin::NO_SLOT
         && slot < crate::child::NSLOTS
         && PREEMPT_ARMED.load(core::sync::atomic::Ordering::Acquire)
@@ -452,23 +686,20 @@ fn lapic_init() -> bool {
     let win = unsafe {
         akuma_primitives::mmio::MmioWindow::new((akuma_boot_amd64::phys::DEVMAP_BASE + base) as usize, 4096)
     };
-    match akuma_lapic_amd64::init(base_msr | akuma_lapic_amd64::APIC_GLOBAL_ENABLE, win) {
-        Ok(info) => {
-            akuma_primitives::safe_print!(
-                160,
-                "  lapic: id={} timer vector={} periodic; calibrated={} counts/tick={} tsc={} Hz\n",
-                info.id,
-                akuma_lapic_amd64::TIMER_VECTOR,
-                info.calibrated as u8,
-                info.timer_count,
-                info.tsc_hz
-            );
-            true
-        }
-        Err(akuma_lapic_amd64::NoApicBase) => {
-            akuma_primitives::safe_print!(96, "  [lapic] init failed\n");
-            false
-        }
+    if let Ok(info) = akuma_lapic_amd64::init(base_msr | akuma_lapic_amd64::APIC_GLOBAL_ENABLE, win) {
+        akuma_primitives::safe_print!(
+            160,
+            "  lapic: id={} timer vector={} periodic; calibrated={} counts/tick={} tsc={} Hz\n",
+            info.id,
+            akuma_lapic_amd64::TIMER_VECTOR,
+            u8::from(info.calibrated),
+            info.timer_count,
+            info.tsc_hz
+        );
+        true
+    } else {
+        akuma_primitives::safe_print!(96, "  [lapic] init failed\n");
+        false
     }
 }
 
@@ -609,44 +840,21 @@ fn no_clock() -> u64 {
 /// same discipline `task()` documents. `Ext2Filesystem` is `Send + Sync`
 /// (`akuma-vfs`'s `Filesystem` supertraits); the interior lock is a spinlock
 /// that never blocks on anything this kernel runs.
-static mut ROOT_FS: Option<akuma_ext2::Ext2Filesystem<Vda>> = None;
+static ROOT_FS: akuma_primitives::cell::BorrowCell<Option<&'static akuma_ext2::Ext2Filesystem<Vda>>> =
+    akuma_primitives::cell::BorrowCell::new(None);
 
 /// The mounted root, for the dispatcher. Panics if called before the mount —
 /// which no caller does: the mount precedes the first ring-3 crossing.
 fn root_fs() -> &'static akuma_ext2::Ext2Filesystem<Vda> {
-    // SAFETY: see above; the Option is always Some past `kmain`'s mount.
-    unsafe { (&*core::ptr::addr_of!(ROOT_FS)).as_ref().unwrap() }
+    ROOT_FS.get().expect("root_fs before the mount")
 }
 // ---------------------------------------------------------------------------
 // The banner — printed at the init-spawn point, where the full kernel prints
 // its own: the last thing on the console before the machine would hand over.
 // ---------------------------------------------------------------------------
 
-/// ASCII only, on purpose: the guest console's host-side relay sanitises
-/// non-ASCII bytes to `?`, and the gate's evidence is this log.
-///
-/// The picture: Jingdezhen as the emperor's kilns knew it -- the Chang in
-/// front (junks on the water, kiln-fire glow on the current), hills behind,
-/// and along the bank the egg-shaped hulu kilns with tall chimneys breathing
-/// smoke, a house with upturned eaves, and a pagoda. The crates kernel sits
-/// on the bank in the middle of it, where the wharf shed would be.
-const ART: &str = concat!(
-    "     ~      _       _                      ~      _         _  ~\n",
-    "    ( )   __/ \\_______/ \\__/ \\            ( )   ___/ \\______/ (_)\n",
-    "      |                    /--\\             |                  |\n",
-    "   .-----.       ,^.      //[]\\\\         .-----.              .--.\n",
-    "  ( |^^| )      /___\\     | [] |        ( |^^| )             ( () )\n",
-    "   '-----'      |___|    /|____|\\        '-----'              '--'\n",
-    "  +------------------------------------------------------+\n",
-    "  |   Taoxichuan  --  tao xi chuan, the kiln-fire market  |\n",
-    "  |   A kernel composed from Akuma's crates, one stage   |\n",
-    "  |   at a time, fired in Akuma's own kiln: booted under |\n",
-    "  |   Akuma's hypervisor, on Akuma's metal.              |\n",
-    "  +------------------------------------------------------+\n",
-    "  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~  ~\n",
-    "        |\\                            |\\\n",
-    "   ~*~\\__|_\\______   ~  ~  ~  ~   ~*~\\__|_\\______   ~  ~  ~  ~  ~\n",
-);
+/// The banner is `banner.txt`, the user's own art, included verbatim.
+const ART: &str = include_str!("banner.txt");
 
 fn banner() {
     console::puts("\n");
@@ -664,12 +872,41 @@ fn banner() {
 /// places. 16 pages — far more than musl's startup touches, and cheap.
 const USER_STACK_TOP: u64 = 0x0000_7000_0000_0000;
 const USER_STACK_PAGES: u64 = 16;
+/// Pages at the stack top that hold the argv/envp/auxv block `load_task` builds.
+pub(crate) const ARG_BLOCK_PAGES: usize = 12;
 /// `brk` and anonymous `mmap` each get a fixed slab, registered as user
 /// regions up front so every user-pointer check is one range scan. Stage 6:
-/// 64 MiB each — apk.static's musl heap (realloc→mremap traffic) blew past
-/// the old 1 MiB on the aarch64 bring-up; the cost is only pages actually
-/// touched, and the range is far from PIE code (`PIE_BASE`) and the stack.
-const SLAB: u64 = 0x0400_0000;
+/// Sized by what the heaviest guest needs, not by what hello needs: rustc's
+/// `--version` maps ~1 GiB of address space (measured; 64 MiB made it
+/// `ENOMEM` before it printed). The cost is only pages actually touched, and
+/// the range is far from PIE code (`PIE_BASE`) and the stack. The bounds are
+/// constants for now; the per-process memory model comes with stage 12.
+///
+/// 16 GiB since 2026-10-30: compiling this kernel in the guest needs more than 1 GiB of
+/// address space in ONE rustc - it maps the 311 MB `librustc_driver`, a ~17 MB stack per
+/// codegen thread and every dependency's rlib - and the old 1 GiB slab answered `ENOMEM` to
+/// the stack `mmap`, which musl's `pthread_create` reports as `EAGAIN` ("failed to spawn work
+/// thread", an ICE) with 2 GiB of RAM still free (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md`).
+/// Address space only: a page costs memory when it is mapped, not when it is reserved.
+const MMAP_SLAB: u64 = 0x4_0000_0000;
+/// Hole-table size per task (see `Task::holes`).
+const MAX_HOLES: usize = 64;
+/// Writable shared file mappings tracked per task (see `Task::shared`).
+const MAX_SHARED: usize = 8;
+/// errnos `akuma_ring3_amd64::err` does not carry.
+pub(crate) const EINTR: u64 = 4;
+pub(crate) const ESRCH: u64 = 3;
+/// Bisect mask for the mmap-slab rework, set from the kernel command line
+/// (`mmdbg=N`, default 7): 1 = munmap frees + records holes, 2 = MAP_FIXED
+/// releases what it replaces, 4 = mremap frees/moves the old range.
+static MMDBG_V: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(7);
+fn mmdbg() -> u32 {
+    MMDBG_V.load(core::sync::atomic::Ordering::Relaxed)
+}
+/// `brk` sits above the image at `PIE_BASE` (0x1000_0000); the dynamic linker
+/// is placed at `INTERP_BASE` (0x3000_0000), so the brk window must stay under
+/// 512 MiB less the image: 256 MiB, not the 512 the plan first named.
+const BRK_SLAB: u64 = 0x1000_0000;
 const MMAP_BASE: u64 = 0x0000_6000_0000_0000;
 /// Cap on one `write(2)`: the console is a serial line, not a disk.
 const WRITE_LIMIT: u64 = 1 << 20;
@@ -678,7 +915,7 @@ const WRITE_LIMIT: u64 = 1 << 20;
 /// shape for this stage. fds 0/1/2 are the console (write-only) and never
 /// enter the table; 3..SLOT_CEILING is what `openat` may hand out. The
 /// *decisions* (lowest free, close, the flag sets) are `akuma-fdtable`'s.
-const SLOT_CEILING: u32 = 16;
+const SLOT_CEILING: u32 = 1024;
 
 /// One open description: what an fd in the table names. A directory caches
 /// its `read_dir` listing at open time (this kernel's `getdents64`
@@ -716,10 +953,19 @@ pub(crate) enum OpenFile {
     /// resource — every dup/fork copy bumps it (`pipes::clone_ref`), every
     /// close/exit drops it (`pipes::release`), or EOF never arrives.
     Pipe(u32, bool),
+    /// One end of a `socketpair(AF_UNIX)`: a read-from pipe id and a
+    /// write-to pipe id, so a single fd is bidirectional. Both are counted
+    /// pipe ends exactly like `Pipe`'s (`pipe_ends`). Message boundaries of
+    /// `SOCK_SEQPACKET` are not kept: it is a byte stream.
+    Pair(u32, u32),
     /// The null device: reads are EOF, writes are discarded, seeks are no-ops.
     /// Stage 7 (H2): `/dev/null` used to be an EACCES ext2 lookup failure,
     /// which cost every `dd of=/dev/null` and plenty of applet noise.
     Null,
+    /// `/dev/urandom` and `/dev/random`: reads are `net::rng_fill`, writes
+    /// are discarded. git's `mkstemp` (`csprng_bytes`) opens it when it can
+    /// not use `getrandom`, and `git add`/`clone` die without a temp file.
+    Random,
     /// An eventfd: the index into `EVENTFDS` below. Stage 8 session Q —
     /// libcurl's multi-stack creates one wakeup fd per transfer; without
     /// the number served, `curl` dies `curl: (27) Out of memory` before it
@@ -745,6 +991,18 @@ pub(crate) enum OpenFile {
     Session,
 }
 
+impl OpenFile {
+    /// The counted pipe ends this description holds (0, 1 or 2): what a
+    /// dup, fork, exec sweep or close adds or drops a reference for.
+    pub(crate) fn pipe_ends(&self) -> ([(u32, bool); 2], usize) {
+        match self {
+            Self::Pipe(id, w) => ([(*id, *w), (0, false)], 1),
+            Self::Pair(r, w) => ([(*r, false), (*w, true)], 2),
+            _ => ([(0, false); 2], 0),
+        }
+    }
+}
+
 /// The one task: its root page table, the user ranges a pointer may name, the
 /// heap cursors, its fd table's three `akuma-fdtable` parts, and the exit
 /// code once captured.
@@ -756,34 +1014,55 @@ struct Task {
     brk_cur: u64,
     brk_end: u64,
     mmap_cur: u64,
+    /// `sigaltstack(2)`'s record: signals are not delivered yet (the arms are
+    /// no-ops), so this only has to read back what the task set - rustc and
+    /// musl's thread start install one and check the answer.
+    sigalt: akuma_syscalls_linux::StackT,
+    /// `rt_sigaction`'s table, one kernel `struct sigaction` per signal 1..=64
+    /// as four words `[handler, flags, restorer, mask]`. Nothing is ever
+    /// delivered, so this only has to read back what the task installed:
+    /// musl's `signal()` returns the OLD handler from `oldact`, and std's
+    /// child-side `signal(SIGPIPE, SIG_DFL)` fails the whole spawn when that
+    /// reads back as `SIG_ERR` (-1) - which is what an unwritten `oldact`
+    /// (stack garbage) did.
+    sigact: akuma_syscalls_signal::SigTable,
+    /// `rt_sigprocmask`'s word (shared by a task's threads - imprecise, and
+    /// harmless without delivery).
+    sigmask: u64,
+    /// The path of the running image, what `readlink("/proc/self/exe")`
+    /// answers (rust-lld's wrapper and `std::env::current_exe` ask).
+    exe: alloc::string::String,
+    /// Writable `MAP_SHARED` file mappings: `(base, len, inode, file offset,
+    /// file size at map time)`. The pages are private frames filled from the
+    /// file (there is no page cache), so they are copied back on `munmap`,
+    /// `msync`, exec and exit - what `rust-lld`'s `FileOutputBuffer` needs to
+    /// leave a real ELF behind (`docs/archive/AKUMA_SELF_HOSTING.md`).
+    shared: [(u64, u64, u32, u64, u64); MAX_SHARED],
+    n_shared: usize,
+    /// Unmapped holes below `mmap_cur` in the mmap slab, sorted by nothing,
+    /// merged when they touch: `munmap` records them, `mmap` reuses them
+    /// first-fit before bumping the cursor. Full table: the hole is leaked
+    /// (the frames are still freed).
+    holes: akuma_mmap::HoleSet<MAX_HOLES>,
+    /// The working directory ("" = `/`): what a relative path and `getcwd`
+    /// resolve against. Inherited by a fork child, reset by a fresh spawn,
+    /// kept across `execve`. Resolution is `akuma_vfs::resolve_path`.
+    cwd: alloc::string::String,
     exit: Option<u64>,
     fd_names: fdtable::Names<OpenFile>,
     fd_cloexec: fdtable::FlagSet,
     fd_nonblock: fdtable::FlagSet,
+    /// Bit n set: the task closed std fd n (0..=2) and it has not been re-bound. The std fds are implicit console
+    /// slots, so without this `close(0); open(..)` could never return 0 and POSIX's lowest-free-fd rule fails
+    /// (busybox ash starts every `cmd &` with exactly that sequence; `docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md` §12).
+    std_closed: u8,
 }
 
-static mut TASKS: [Task; 16] = [
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-    Task::new(),
-];
+static mut TASKS: [Task; crate::child::NSLOTS + 1] = [const { Task::new() }; crate::child::NSLOTS + 1];
 /// Which slot `task()` hands out: 0 is the boot's init task (sshd for this
 /// stage's gate), 1 is the child running inside a SPAWN (`child.rs`), and 2
 /// is a fork child running inside that child (child.rs's M2 scaffold).
-static mut TASK_SLOT: usize = 0;
+static TASK_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 impl Task {
     const fn new() -> Self {
@@ -795,29 +1074,375 @@ impl Task {
             brk_cur: 0,
             brk_end: 0,
             mmap_cur: MMAP_BASE,
+            sigalt: SIGALT_OFF,
+            sigact: akuma_syscalls_signal::SigTable::new(),
+            sigmask: 0,
+            exe: alloc::string::String::new(),
+            shared: [(0, 0, 0, 0, 0); MAX_SHARED],
+            n_shared: 0,
+            holes: akuma_mmap::HoleSet::new(),
+            cwd: alloc::string::String::new(),
             exit: None,
             fd_names: fdtable::Names::new(),
             fd_cloexec: fdtable::FlagSet::new(),
             fd_nonblock: fdtable::FlagSet::new(),
+            std_closed: 0,
         }
+    }
+}
+
+/// `mprotect(addr, len, prot)`: re-map each present page of the range with
+/// the requested `R/W/X` (anonymous memory is eagerly mapped here, so a page
+/// either has a frame or is not part of the task). This is what makes
+/// `tcc -run` and every JIT work: the code is written RW, then flipped to RX,
+/// and a page mapped RW-non-exec faults on the fetch.
+///
+/// `PROT_NONE` stays a no-op: guard pages are not enforced, and unmapping the
+/// frame would lose the contents a later `mprotect(RW)` must give back.
+fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
+    if addr & 0xFFF != 0 {
+        return e(ring3::err::EINVAL);
+    }
+    if len == 0 {
+        return 0;
+    }
+    let pages = len.div_ceil(4096);
+    if len > u64::MAX / 2 || !user_ok(addr, pages * 4096) {
+        return e(ring3::err::ENOMEM);
+    }
+    #[allow(clippy::verbose_bit_mask)] // PROT_NONE is spelled as the bits it lacks
+    if prot & 7 == 0 {
+        return 0;
+    }
+    let want = PteProt { write: prot & ring3::mmap::PROT_WRITE != 0, exec: prot & ring3::mmap::PROT_EXEC != 0, user: true };
+    let root = task().root_pa;
+    // W^X: decided for the whole range before any page changes, so a refusal leaves it as it was.
+    if wx_on()
+        && let Some(no) = akuma_syscalls_mem::wx::check_range(prot, |i| page_written(root, addr + i * 4096), pages).errno()
+    {
+        return e(no);
+    }
+    for i in 0..pages {
+        let va = (addr + i * 4096) as usize;
+        // The remap below builds a fresh PTE; carry "written" across it or the policy forgets.
+        let was_written = page_written(root, va as u64);
+        if want.write && !cow_privatize(root, va as u64) {
+            return e(ring3::err::ENOMEM);
+        }
+        let Some(pa) = paging::translate_in(root, va) else {
+            continue;
+        };
+        let _ = paging::unmap_page_in(root, va);
+        if !paging::map_page_in(root, va, pa, want, MemAttr::WriteBack) {
+            return e(ring3::err::ENOMEM);
+        }
+        if was_written {
+            mark_written(root, va as u64);
+        }
+    }
+    0
+}
+
+/// Make `full` (absolute, already resolved) the task's working directory if
+/// it names a directory.
+fn chdir_to(full: alloc::string::String) -> u64 {
+    match root_fs().metadata(&resolve_effective(&full)) {
+        Ok(st) if st.is_dir => {
+            task().cwd = if full == "/" { alloc::string::String::new() } else { full };
+            0
+        }
+        Ok(_) => e(ring3::err::ENOTDIR),
+        Err(no) => e(fs_err(no)),
+    }
+}
+
+/// The calling thread's tid: its threading slot for a `CLONE_THREAD` sibling
+/// (the number `clone` handed back and `CLONE_CHILD_SETTID` wrote), the pid
+/// for everyone else.
+fn my_tid() -> u64 {
+    if child::is_thread_task() {
+        exec_twin::current_slot() as u64
+    } else {
+        u64::from(child::current_pid())
+    }
+}
+
+/// `--features trace-err`: the last 128 mmap-slab events (kind, start, end), so
+/// a fault can name the unmap/replace that took its page away.
+#[cfg(feature = "trace-err")]
+static MM_EVENTS: ring::Ring<(u8, u64, u64), 128> = ring::Ring::new((0, 0, 0));
+
+#[cfg(feature = "trace-err")]
+fn mm_event(kind: u8, start: u64, end: u64) {
+    MM_EVENTS.push((kind, start, end));
+}
+#[cfg(not(feature = "trace-err"))]
+fn mm_event(_kind: u8, _start: u64, _end: u64) {}
+
+/// Print every recorded slab event that covers `va` (kinds: 1 munmap, 2
+/// MAP_FIXED release, 3 mremap shrink, 4 mremap move-free, 5 mmap, 6 mremap-grow).
+#[cfg(feature = "trace-err")]
+fn mm_dump_for(va: u64) {
+    MM_EVENTS.view(|head, ev| {
+        for i in 0..128 {
+            let (k, s, e) = ev[(head + i) % 128];
+            if k != 0 && s <= va && va < e {
+                akuma_primitives::safe_print!(96, "[mm] kind={} 0x{:x}..0x{:x} covers fault\n", k, s, e);
+            }
+        }
+    });
+}
+
+/// Unmap every present page of `[start, end)` in `root` and give its frame
+/// back (`free_page` honours a CoW count). Pages that were never faulted in
+/// are skipped.
+fn release_pages(root: u64, start: u64, end: u64) {
+    let tid = akuma_primitives::preempt::current_tid() as u32;
+    let mut va = start;
+    while va < end {
+        if let Some(pa) = paging::unmap_page_in(root, va as usize) {
+            akuma_pmm::free_page(pa as usize, tid);
+        }
+        va += 4096;
+    }
+}
+
+/// Record `[start, end)` of the mmap slab as unmapped: lower the cursor when
+/// the hole touches it, else add it to the hole table, merging with any hole
+/// it overlaps or abuts. The algebra is `akuma_mmap::HoleSet`.
+fn add_hole(t: &mut Task, start: u64, end: u64) {
+    t.holes.add(&mut t.mmap_cur, start, end);
+}
+
+/// Take `[start, end)` out of the hole table (a `MAP_FIXED` landed there).
+fn carve_hole(t: &mut Task, start: u64, end: u64) {
+    t.holes.carve(start, end);
+}
+
+/// A fresh `bytes`-long (page multiple) range of the mmap slab: first-fit from
+/// the holes, else the bump cursor. `None` when the slab is exhausted.
+fn mmap_alloc(t: &mut Task, bytes: u64) -> Option<u64> {
+    t.holes.alloc(&mut t.mmap_cur, MMAP_BASE + MMAP_SLAB, bytes)
+}
+
+/// Copy the pages of every writable `MAP_SHARED` file mapping that overlap
+/// `[lo, hi)` back to their files (clamped to the file's size at map time),
+/// and with `forget` drop the records wholly inside the range.
+#[allow(clippy::many_single_char_names)] // s/e are the clipped range
+fn shared_writeback(t: &mut Task, lo: u64, hi: u64, forget: bool) {
+    let mut i = 0;
+    while i < t.n_shared {
+        let (base, len, ino, off, fsize) = t.shared[i];
+        let (s, e) = (base.max(lo), (base + len).min(hi));
+        if s < e {
+            let mut va = s & !0xFFF;
+            while va < e {
+                if let Some(pa) = paging::translate_in(t.root_pa, va as usize) {
+                    let file_off = off + (va - base);
+                    if file_off < fsize {
+                        let n = (fsize - file_off).min(4096) as usize;
+                        let mut page = [0u8; 4096];
+                        // SAFETY: `translate_in` named a mapped user frame.
+                        unsafe { phys::Frame::from_pa(pa) }.read_bytes(0, &mut page[..n]);
+                        let _ = root_fs().write_at_by_inode(ino, file_off as usize, &page[..n]);
+                    }
+                }
+                va += 4096;
+            }
+            if forget && s == base && e == base + len {
+                t.n_shared -= 1;
+                t.shared[i] = t.shared[t.n_shared];
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Write back every shared file mapping the running task still holds (exit,
+/// exec): the mapping dies with the address space.
+pub(crate) fn shared_flush_all() {
+    let t = task();
+    if t.n_shared != 0 {
+        shared_writeback(t, 0, u64::MAX, true);
+    }
+}
+
+/// `msync(addr, len, flags)`: the POSIX flush point lld uses.
+fn msync_arm(addr: u64, len: u64) -> u64 {
+    if addr & 0xFFF != 0 {
+        return e(ring3::err::EINVAL);
+    }
+    let t = task();
+    shared_writeback(t, addr, addr.saturating_add(len), false);
+    0
+}
+
+/// `munmap(addr, len)` for the mmap slab: free the frames, record the hole.
+/// Ranges outside the slab (the brk area, a stack) are accepted and ignored.
+fn munmap_arm(addr: u64, len: u64) -> u64 {
+    if addr & 0xFFF != 0 || len == 0 {
+        return e(ring3::err::EINVAL);
+    }
+    let Some(bytes) = len.checked_add(0xFFF).map(|l| l & !0xFFF) else {
+        return e(ring3::err::EINVAL);
+    };
+    let Some(end) = addr.checked_add(bytes) else {
+        return e(ring3::err::EINVAL);
+    };
+    if addr < MMAP_BASE || end > MMAP_BASE + MMAP_SLAB {
+        return 0;
+    }
+    if mmdbg() & 1 == 0 {
+        return 0;
+    }
+    let t = task();
+    shared_writeback(t, addr, end, true);
+    mm_event(1, addr, end);
+    release_pages(t.root_pa, addr, end);
+    add_hole(t, addr, end);
+    0
+}
+
+/// `rt_sigaction(sig, act, oldact, sigsetsize)`. No signal is ever delivered,
+/// so the handler is recorded and read back, nothing more - but the read-back
+/// must be real: `oldact` is what musl's `signal()` returns.
+fn sigaction_arm(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
+    use akuma_syscalls_signal::{SIGACTION_WIRE, SigTable, from_wire, to_wire};
+    if SigTable::check(sig, act != 0, sigsetsize).is_err() {
+        return e(ring3::err::EINVAL);
+    }
+    let mut new = [0u8; SIGACTION_WIRE];
+    if act != 0 && (!user_ok(act, 32) || !copy_from_user(&mut new, act)) {
+        return e(ring3::err::EFAULT);
+    }
+    let table = &mut task().sigact;
+    if oldact != 0 && (!user_ok(oldact, 32) || !copy_to_user(oldact, &to_wire(&table.get(sig)))) {
+        return e(ring3::err::EFAULT);
+    }
+    if act != 0 {
+        let _ = table.replace(sig, from_wire(&new));
+    }
+    0
+}
+
+/// `rt_sigprocmask(how, set, oldset, sigsetsize)`: the mask word is kept and
+/// read back (musl's `pthread_sigmask`/`__block_all_sigs` restore what they
+/// read); SIGKILL and SIGSTOP can never be blocked. The algebra is
+/// `akuma_syscalls_signal::procmask`.
+fn sigprocmask_arm(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> u64 {
+    let mut new = [0u8; 8];
+    // The checks that come before any user access (size, then `how` with a set).
+    if akuma_syscalls_signal::procmask(how, 0, (set != 0).then_some(0), sigsetsize).is_err() {
+        return e(ring3::err::EINVAL);
+    }
+    if set != 0 && (!user_ok(set, 8) || !copy_from_user(&mut new, set)) {
+        return e(ring3::err::EFAULT);
+    }
+    let cur = task().sigmask;
+    if oldset != 0 && (!user_ok(oldset, 8) || !copy_to_user(oldset, &cur.to_le_bytes())) {
+        return e(ring3::err::EFAULT);
+    }
+    if set != 0
+        && let Ok(m) = akuma_syscalls_signal::procmask(how, cur, Some(u64::from_le_bytes(new)), sigsetsize)
+    {
+        task().sigmask = m;
+    }
+    0
+}
+
+/// `tkill(tid, sig)` / `tgkill(tgid, tid, sig)`. No signal is delivered on this
+/// kernel, so a signal's only effect is the one thing a thread can observe
+/// without a handler running: its blocked `poll`/pipe `read` returns `EINTR`.
+/// That is exactly what the jobserver crate relies on - cargo sends `SIGUSR1`
+/// to its helper thread to pull it out of a blocking wait and then joins it
+/// (the ENOSYS this answered before left cargo hung forever after any error).
+/// `tid` is the threading slot (what `clone` returned). Signal 0 only probes.
+fn tkill_arm(tid: u64, sig: u64) -> u64 {
+    if sig > 64 {
+        return e(ring3::err::EINVAL);
+    }
+    let tid = tid as usize;
+    if tid >= child::NSLOTS || !child::slot_in_use(tid) {
+        return e(ESRCH);
+    }
+    if sig != 0 {
+        akuma_threading::set_thread_interrupted(tid);
+        akuma_threading::get_waker_for_thread(tid).wake();
+    }
+    0
+}
+
+/// `sigaltstack`'s disabled state: what a task that never set one reads back.
+const SIGALT_OFF: akuma_syscalls_linux::StackT =
+    akuma_syscalls_linux::StackT { sp: 0, flags: SS_DISABLE, _pad: 0, size: 0 };
+const SS_DISABLE: i32 = 2;
+/// `MINSIGSTKSZ`: a stack smaller than this is `ENOMEM`.
+const MINSIGSTKSZ: u64 = 2048;
+
+/// `sigaltstack(ss, old)`: read back the task's record, then replace it. The
+/// 24-byte `stack_t` is the same layout on both ABIs (`akuma-syscalls-linux`).
+fn sigaltstack_arm(ss: u64, old: u64) -> u64 {
+    if old != 0 {
+        let cur = task().sigalt;
+        if !user_ok(old, 24) || !copy_to_user(old, struct_bytes(&cur)) {
+            return e(ring3::err::EFAULT);
+        }
+    }
+    if ss != 0 {
+        let mut b = [0u8; 24];
+        if !user_ok(ss, 24) || !copy_from_user(&mut b, ss) {
+            return e(ring3::err::EFAULT);
+        }
+        let sp = u64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
+        let flags = i32::from_le_bytes(b[8..12].try_into().unwrap_or([0; 4]));
+        let size = u64::from_le_bytes(b[16..24].try_into().unwrap_or([0; 8]));
+        // SS_ONSTACK (1) cannot be set by the caller, and only SS_AUTODISARM
+        // (1 << 31) may ride along with the mode.
+        if flags & !(SS_DISABLE | i32::MIN) != 0 {
+            return e(ring3::err::EINVAL);
+        }
+        task().sigalt = if flags & SS_DISABLE != 0 {
+            SIGALT_OFF
+        } else if size < MINSIGSTKSZ {
+            return e(ring3::err::ENOMEM);
+        } else {
+            akuma_syscalls_linux::StackT { sp, flags, _pad: 0, size }
+        };
+    }
+    0
+}
+
+/// `membarrier(cmd, flags, cpu)`: the decode is `akuma-syscalls-mem`'s; the
+/// one effect, a full fence, is one core's `SeqCst` fence.
+fn membarrier_arm(cmd: u64) -> u64 {
+    use akuma_syscalls_mem::membarrier::{Command, command};
+    match command(cmd as u32) {
+        Command::Barrier => {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            0
+        }
+        other => other.immediate_result().unwrap_or(0),
     }
 }
 
 /// Switch which task slot the syscall path acts on (the SPAWN arm, the
 /// child exit, and slice 3's `twin_enter_user` — which points the record at
 /// the incoming real task).
+/// Which task record the syscall path acts on now.
+pub(crate) fn task_slot_index() -> usize {
+    TASK_SLOT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn set_task_slot(i: usize) {
-    // SAFETY: single core, `IF` clear — the same discipline as `task()`.
-    unsafe {
-        *core::ptr::addr_of_mut!(TASK_SLOT) = i;
-    }
+    TASK_SLOT.store(i, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Every slot, for the spawn path and slice 3's real tasks: 0 is the boot's
 /// init task (sshd), 1 the shell inside its SPAWN crossing, and `tid + 1`
 /// (for threading tid `tid` >= 1) a real fork child — `bind_child_task`
 /// stamps it, `switch_to` reads its root.
-pub(crate) fn task_slots() -> &'static mut [Task; 16] {
+pub(crate) fn task_slots() -> &'static mut [Task; crate::child::NSLOTS + 1] {
     // SAFETY: as `task`.
     unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
 }
@@ -832,7 +1457,7 @@ fn task() -> &'static mut Task {
     // interrupts-off discipline of this kernel, and the pointer is never
     // published anywhere else.
     unsafe {
-        let slot = core::ptr::read_volatile(&raw const TASK_SLOT);
+        let slot = TASK_SLOT.load(core::sync::atomic::Ordering::Relaxed);
         &mut (*core::ptr::addr_of_mut!(TASKS))[slot]
     }
 }
@@ -880,12 +1505,8 @@ fn copy_from_user(dst: &mut [u8], src_va: u64) -> bool {
         let Some(pa) = paging::translate_in(root, (va & !0xFFF) as usize) else {
             return false;
         };
-        // SAFETY: `pa + off` is a PMM frame inside the physmap (alloc_page's
-        // contract), and `n` stays within the frame by construction.
-        let src = phys::phys_ptr::<u8>(pa + (va & 0xFFF));
-        unsafe {
-            core::ptr::copy_nonoverlapping(src, dst[done..].as_mut_ptr(), n);
-        }
+        // SAFETY: `translate_in` named a mapped task frame.
+        unsafe { phys::Frame::from_pa(pa) }.read_bytes((va & 0xFFF) as usize, &mut dst[done..done + n]);
         done += n;
     }
     true
@@ -902,17 +1523,17 @@ fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
         let va = dst_va + done as u64;
         let page_rem = 4096 - (va & 0xFFF) as usize;
         let n = page_rem.min(src.len() - done);
+        if !cow_prepare_write(root, va) {
+            return false;
+        }
         let Some(pa) = paging::translate_in(root, (va & !0xFFF) as usize) else {
             return false;
         };
-        // SAFETY: `pa + off` is a PMM frame inside the physmap (alloc_page's
-        // contract), `n` stays within the frame by construction, and the page
-        // is a task page this kernel mapped RW (or RO, for image bytes —
-        // every caller writes only into stack/heap/scratch regions).
-        let dst = phys::phys_ptr::<u8>(pa + (va & 0xFFF));
-        unsafe {
-            core::ptr::copy_nonoverlapping(src[done..].as_ptr(), dst, n);
-        }
+        // SAFETY: `translate_in` named a mapped task frame, one this kernel mapped
+        // RW (or RO, for image bytes — every caller writes only into
+        // stack/heap/scratch regions).
+        unsafe { phys::Frame::from_pa(pa) }.write_bytes((va & 0xFFF) as usize, &src[done..done + n]);
+        mark_written(root, va);
         done += n;
     }
     true
@@ -965,6 +1586,13 @@ fn read_link_target(path: &str) -> Option<alloc::string::String> {
 fn resolve_effective(path: &str) -> alloc::string::String {
     akuma_vfs::resolve_symlink_chain(path, 8, read_link_target)
 }
+
+/// Bytes a syscall arm reserves for a path argument. 128 was the original
+/// size and cargo's build-script objects
+/// (`target/debug/build/<crate>/<hash>/out/<name>.<name>.<hash>-cgu.0.rcgu.o`)
+/// are longer: `open` answered EFAULT and rustc reported "could not write
+/// output ... Bad address".
+const PATH_BUF: usize = 1024;
 
 /// Read a NUL-terminated path from the task at `src_va` into `buf`, returning
 /// the `&str` it held. `None` (`-EFAULT` at the call site) on a bad byte or
@@ -1022,6 +1650,13 @@ fn emit(buf_va: u64, len: u64) -> bool {
 /// the open description, take the lowest free fd slot. Absolute paths only,
 /// read-only access only: the root is read-only in spirit and this kernel has
 /// no write path to lie about.
+/// The lowest fd a new descriptor may take: a std fd (0..=2) the task closed and has not re-bound, else 3.
+/// (`alloc_fd_from` then returns the lowest free number from there.)
+pub(crate) fn new_fd_min() -> u32 {
+    let closed = task().std_closed;
+    (0u32..3).find(|&n| closed & (1 << n) != 0 && fd_table().with(n, |_| ()).is_none()).unwrap_or(3)
+}
+
 fn open_common(path: &str, flags: u64) -> u64 {
     if !path.starts_with('/') {
         return e(ring3::err::ENOENT); // nothing to resolve ".." against
@@ -1029,7 +1664,11 @@ fn open_common(path: &str, flags: u64) -> u64 {
     // Stage 7 (H2): the null device, before the ext2 lookup — the root has
     // no char-device layer, and the lookup answered EACCES for /dev/null.
     if path == "/dev/null" {
-        let fd = fd_table().alloc_fd_from(3, OpenFile::Null);
+        let fd = fd_table().alloc_fd_from(new_fd_min(), OpenFile::Null);
+        return u64::from(fd);
+    }
+    if path == "/dev/urandom" || path == "/dev/random" {
+        let fd = fd_table().alloc_fd_from(new_fd_min(), OpenFile::Random);
         return u64::from(fd);
     }
     // Stage 6: write access is served — apk unpacks with O_WRONLY|O_CREAT|
@@ -1046,9 +1685,16 @@ fn open_common(path: &str, flags: u64) -> u64 {
         Err(_) if flags & ring3::open::O_CREAT != 0 && acc != ring3::open::O_RDONLY => {
             // Create empty; the fd's writes fill it. `write_file` on a
             // missing path allocates the inode and the directory entry.
-            match fs.write_file(&path, &[]) {
-                Ok(()) => fs.metadata(&path).ok(),
-                Err(_) => return e(ring3::err::EACCES),
+            if fs.write_file(&path, &[]) == Ok(()) { fs.metadata(&path).ok() } else {
+                // A missing parent is ENOENT, not EACCES: git's object
+                // writer creates `objects/xx/tmp_obj_*`, and ONLY an
+                // ENOENT sends it to `mkdir objects/xx` and a retry.
+                let parent = path.rsplit_once('/').map_or("/", |(d, _)| if d.is_empty() { "/" } else { d });
+                return match fs.metadata(parent) {
+                    Err(_) => e(ring3::err::ENOENT),
+                    Ok(m) if !m.is_dir => e(ring3::err::ENOTDIR),
+                    Ok(_) => e(ring3::err::EACCES),
+                };
             }
         }
         Err(_) => return e(ring3::err::ENOENT),
@@ -1085,7 +1731,12 @@ fn open_common(path: &str, flags: u64) -> u64 {
                     return e(ring3::err::EIO);
                 }
                 let size = if trunc { 0 } else { md.size };
-                OpenFile::File { inode, offset: 0, size }
+                // O_APPEND (0x400): writes land at the end. The description
+                // starts there (`echo b >> f`, cargo's manifest edits); it is
+                // not re-seeked per write, so a second writer on a shared
+                // description can still interleave.
+                let offset = if flags & 0x400 != 0 { size } else { 0 };
+                OpenFile::File { inode, offset, size }
             }
             Err(_) => return e(ring3::err::EIO),
         }
@@ -1094,7 +1745,7 @@ fn open_common(path: &str, flags: u64) -> u64 {
     let Some(_slot) = table.free_below(3, SLOT_CEILING) else {
         return e(ring3::err::EMFILE);
     };
-    let fd = table.alloc_fd_from(3, desc);
+    let fd = table.alloc_fd_from(new_fd_min(), desc);
     // TRACE (s7d step-1 settle): where a shell redirect's file lands.
     if traced {
         akuma_primitives::safe_print!(112, "  [o] open flags={:#x} -> {}\n", flags, fd);
@@ -1206,18 +1857,124 @@ fn writev_file_arm_inner(fd: u64, data: &[u8]) -> u64 {
     }
 }
 
+/// `sendfile(out, in, &off, count)` and `copy_file_range(in, &off_in, out,
+/// &off_out, len, flags)`: copy up to `count` bytes from a regular file to a
+/// regular file or a pipe, 4 KiB at a time through a kernel buffer. An offset
+/// pointer means "positional": that fd's own offset is left alone and the
+/// pointer is advanced instead (Linux's contract). busybox `cp` tries these
+/// before it falls back, and its fallback was not there ("cp: can't create
+/// ...: Function not implemented").
+fn copy_range_arm(in_fd: u64, in_off_va: u64, out_fd: u64, out_off_va: u64, count: u64) -> u64 {
+    const CAP: u64 = 8 * 1024 * 1024;
+    let Some(Some((ino, fd_off))) = fd_table().with(in_fd as u32, |d| match d {
+        OpenFile::File { inode, offset, .. } => Some((*inode, *offset)),
+        _ => None,
+    }) else {
+        return e(ring3::err::EBADF);
+    };
+    let Some(Some((kind, dst))) = fd_table().with(out_fd as u32, |d| match d {
+        OpenFile::File { inode, .. } => Some((1u8, *inode)),
+        OpenFile::Pipe(id, true) => Some((2u8, *id)),
+        _ => None,
+    }) else {
+        return e(ring3::err::EBADF);
+    };
+    let mut word = [0u8; 8];
+    let read_off = if in_off_va == 0 {
+        fd_off
+    } else if user_ok(in_off_va, 8) && copy_from_user(&mut word, in_off_va) {
+        u64::from_le_bytes(word)
+    } else {
+        return e(ring3::err::EFAULT);
+    };
+    let write_off = if out_off_va == 0 {
+        0
+    } else if user_ok(out_off_va, 8) && copy_from_user(&mut word, out_off_va) {
+        u64::from_le_bytes(word)
+    } else {
+        return e(ring3::err::EFAULT);
+    };
+    let want = count.min(CAP);
+    let mut total = 0u64;
+    let mut buf = [0u8; 4096];
+    while total < want {
+        let n = ((want - total) as usize).min(buf.len());
+        let got = match root_fs().read_at_by_inode(ino, (read_off + total) as usize, &mut buf[..n]) {
+            Ok(g) => g,
+            Err(_) => return if total > 0 { total } else { e(ring3::err::EIO) },
+        };
+        if got == 0 {
+            break;
+        }
+        let put = match kind {
+            1 if out_off_va != 0 => root_fs()
+                .write_at_by_inode(dst, (write_off + total) as usize, &buf[..got])
+                .map_or_else(|_| e(ring3::err::EIO), |w| w as u64),
+            1 => writev_file_arm(out_fd, &buf[..got]),
+            _ => pipes::write_arm_gathered(dst, &buf[..got]),
+        };
+        if (put as i64) < 0 {
+            return if total > 0 { total } else { put };
+        }
+        total += put;
+        if put < got as u64 {
+            break;
+        }
+    }
+    if in_off_va != 0 {
+        let _ = copy_to_user(in_off_va, &(read_off + total).to_le_bytes());
+    } else {
+        let _ = fd_table().update(in_fd as u32, |of| {
+            if let OpenFile::File { offset, .. } = of {
+                *offset += total;
+            }
+        });
+    }
+    if out_off_va != 0 {
+        let _ = copy_to_user(out_off_va, &(write_off + total).to_le_bytes());
+    }
+    total
+}
+
 /// Stage 6: dirfd-relative path resolution. Absolute paths pass through; a
 /// relative path resolves against an open directory fd's path (apk opens the
 /// db / cache directory and then passes its fd to `openat`/`renameat`); a
 /// relative path at `AT_FDCWD` resolves against `/` — this kernel has no
 /// working directory, and every task it boots runs at the root. `None` means
 /// the caller sees `EBADF` (a non-directory fd where a dirfd was required).
+/// A whole file for the ELF loader. `Filesystem::read_file` refuses anything
+/// over 16 MiB ("use read_at"), and cargo is 47 MB, cc1 38 MB: past that,
+/// read it in 1 MiB steps through the inode. One heap block of the file's
+/// size either way - the loader wants the image as a slice.
+pub(crate) fn read_image(path: &str) -> Result<Vec<u8>, akuma_vfs::FsError> {
+    let fs = root_fs();
+    let md = fs.metadata(path)?;
+    if md.size <= 16 * 1024 * 1024 {
+        return fs.read_file(path);
+    }
+    let ino = fs.resolve_inode(path)?;
+    let mut data: Vec<u8> = Vec::new();
+    data.try_reserve_exact(md.size as usize).map_err(|_| akuma_vfs::FsError::NoSpace)?;
+    data.resize(md.size as usize, 0);
+    let mut off = 0usize;
+    while off < data.len() {
+        let end = (off + (1 << 20)).min(data.len());
+        let n = fs.read_at_by_inode(ino, off, &mut data[off..end])?;
+        if n == 0 {
+            return Err(akuma_vfs::FsError::Internal);
+        }
+        off += n;
+    }
+    Ok(data)
+}
+
 fn resolve_at(dirfd: u64, path: &str) -> Option<alloc::string::String> {
     if path.starts_with('/') {
         return Some(alloc::string::String::from(path));
     }
     if dirfd == ring3::open::AT_FDCWD {
-        return Some(alloc::format!("/{path}"));
+        let cwd = task().cwd.as_str();
+        return Some(akuma_vfs::resolve_path(if cwd.is_empty() { "/" } else { cwd }, path));
     }
     let dir = fd_table().with(dirfd as u32, |d| match d {
         OpenFile::Dir { path, .. } => Some(path.clone()),
@@ -1230,7 +1987,7 @@ fn resolve_at(dirfd: u64, path: &str) -> Option<alloc::string::String> {
 /// and hand it to `f`. `EBADF` for a non-directory dirfd, `EFAULT` for a bad
 /// task pointer. The `at` family's shared front half.
 fn path_at(path_arg: u64, dirfd: u64, f: impl FnOnce(&str) -> u64) -> u64 {
-    let mut pbuf = [0u8; 128];
+    let mut pbuf = [0u8; PATH_BUF];
     let Some(path) = user_str(path_arg, &mut pbuf) else {
         return e(ring3::err::EFAULT);
     };
@@ -1243,13 +2000,26 @@ fn path_at(path_arg: u64, dirfd: u64, f: impl FnOnce(&str) -> u64) -> u64 {
     f(&full)
 }
 
+/// The inode number `stat` reports. ext2's `metadata()` leaves `Metadata::inode`
+/// at 0, and an all-zero `(st_dev, st_ino)` makes every file look like every
+/// other: busybox `cp -r` keeps a table of (dev, ino) it has already copied and
+/// HARD-LINKED the second source onto the first (a `Cargo.toml` that held
+/// `main.rs`'s bytes). `resolve_inode` is the real number.
+fn stat_ino(path: &str, from_metadata: u64) -> u64 {
+    if from_metadata != 0 {
+        from_metadata
+    } else {
+        root_fs().resolve_inode(path).map_or(0, u64::from)
+    }
+}
+
 /// `stat` semantics over a fully-resolved path (symlinks followed by the
 /// caller's `resolve_effective`).
 fn stat_path(path: &str, buf: u64) -> u64 {
     match root_fs().metadata(path) {
         Ok(md) => match fill_stat64(
             buf,
-            md.inode,
+            stat_ino(path, md.inode),
             md.mode,
             md.size,
             u64::from(md.links.unwrap_or(if md.is_dir { 2 } else { 1 })),
@@ -1289,9 +2059,16 @@ fn lstat_path(path: &str, buf: u64) -> u64 {
         } else if ent.is_dir {
             0o40755
         } else {
-            0o100644
+            // The listing carries no permission bits; ask for the file's own
+            // (an executable must stat as one - `access(X_OK)` and `which`).
+            let full = if parent == "/" { alloc::format!("/{name}") } else { alloc::format!("{parent}/{name}") };
+            fs.metadata(&full).map_or(0o100644, |m| m.mode)
         };
-        match fill_stat64(buf, 0, mode, ent.size, if ent.is_dir { 2 } else { 1 }) {
+        // The entry's own inode (see `stat_ino`: an all-zero (dev, ino) made
+        // busybox `cp -r` hard-link distinct files together).
+        let full = if parent == "/" { alloc::format!("/{name}") } else { alloc::format!("{parent}/{name}") };
+        let ino = fs.resolve_inode(&full).map_or(0, u64::from);
+        match fill_stat64(buf, ino, mode, ent.size, if ent.is_dir { 2 } else { 1 }) {
             Ok(()) => 0,
             Err(no) => e(no),
         }
@@ -1341,7 +2118,7 @@ fn fill_statfs(buf: u64) -> u64 {
         st.free_blocks,
         ts
     );
-    let bs = st.block_size as i64;
+    let bs = i64::from(st.block_size);
     let s = akuma_syscalls_linux::Statfs {
         f_type: 0xEF53,
         f_bsize: bs,
@@ -1378,6 +2155,12 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
     let info = fd_table().with(fd as u32, |d| match d {
         OpenFile::File { inode, size, .. } => Some((u64::from(*inode), *size, 0u8)),
         OpenFile::Dir { .. } => Some((0, 0, 1)),
+        // The type bits are what callers decide on: git's `index-pack` asks
+        // `fstat_size(0)` and only trusts the byte count for a REGULAR file -
+        // a pipe that stats as one made every piped pack "junk at the end".
+        OpenFile::Pipe(..) | OpenFile::ChildOut(_) => Some((0, 0, 3)),
+        OpenFile::Socket(_) | OpenFile::Pair(..) => Some((0, 0, 4)),
+        OpenFile::Null | OpenFile::Random => Some((0, 0, 5)),
         _ => Some((0, 0, 2)),
     });
     let Some(Some((inode, size, kind))) = info else {
@@ -1389,6 +2172,9 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
             Err(_) => (0o100644, 1),
         },
         1 => (0o40755, 2),
+        3 => (0o10600, 1),  // S_IFIFO
+        4 => (0o140777, 1), // S_IFSOCK
+        5 => (0o20666, 1),  // S_IFCHR
         _ => (0o100600, 1),
     };
     match fill_stat64(buf, inode, mode, size, links) {
@@ -1413,8 +2199,10 @@ fn clone_desc(d: &OpenFile) -> OpenFile {
         OpenFile::Socket(i) => OpenFile::Socket(*i),
         OpenFile::ChildOut(i) => OpenFile::ChildOut(*i),
         OpenFile::Pipe(id, w) => OpenFile::Pipe(*id, *w),
+        OpenFile::Pair(r, w) => OpenFile::Pair(*r, *w),
         OpenFile::EventFd(i) => OpenFile::EventFd(*i),
         OpenFile::Null => OpenFile::Null,
+        OpenFile::Random => OpenFile::Random,
         OpenFile::Session => OpenFile::Session,
     }
 }
@@ -1484,8 +2272,24 @@ fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result
 /// their number; only an UNBOUND fd falls to the console rules (fd 0 is
 /// EOF — the console has no input path — every other unbound number is
 /// EBADF).
+/// The (read, write) pipe ids of a socketpair end, or None for any other fd.
+fn pair_ends(fd: u64) -> Option<(u32, u32)> {
+    if (fd as u32) >= SLOT_CEILING {
+        return None;
+    }
+    fd_table()
+        .with(fd as u32, |d| match d {
+            OpenFile::Pair(r, w) => Some((*r, *w)),
+            _ => None,
+        })
+        .flatten()
+}
+
 fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
-    if len > WRITE_LIMIT || !user_ok(buf_va, len) {
+    // A transfer larger than the bound is a short one (legal for read(2));
+    // ld asks for megabytes in one call and used to get EFAULT.
+    let len = len.min(WRITE_LIMIT);
+    if !user_ok(buf_va, len) {
         return e(ring3::err::EFAULT);
     }
     if (fd as u32) < SLOT_CEILING {
@@ -1508,13 +2312,31 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
                 pipe_id = *id as usize;
                 4
             }
+            OpenFile::Pair(rd, _) => {
+                pipe_id = *rd as usize;
+                4
+            }
+            OpenFile::Random => 5,
             _ => 0,
         });
         match kind {
+            Some(5) => {
+                let mut tmp = alloc::vec![0u8; len as usize];
+                net::rng_fill(&mut tmp);
+                return if copy_to_user(buf_va, &tmp) { len } else { e(ring3::err::EFAULT) };
+            }
             Some(1) => return sock::read_arm(fd, buf_va, len),
             Some(2) => return child::read_child_out(slot_idx, buf_va, len),
             Some(3) => return eventfd_read_arm(slot_idx, buf_va),
-            Some(4) => return pipes::read_arm(pipe_id as u32, buf_va, len),
+            Some(4) => {
+                // O_NONBLOCK: an empty pipe/socketpair with live writers answers
+                // EAGAIN instead of parking (curl's and c-ares' wakeup pair read
+                // would otherwise block forever and hang cargo's index fetch).
+                if fd_table().is_nonblock(fd as u32) && !pipes::readable(pipe_id as u32) {
+                    return e(ring3::err::EAGAIN);
+                }
+                return pipes::read_arm(pipe_id as u32, buf_va, len);
+            }
             _ => {}
         }
         let mut chunk = [0u8; 512];
@@ -1559,7 +2381,7 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
             // default `Ok(0)` — which is the device's contract.
             OpenFile::Pipe(_, true) => res = Err(ring3::err::EBADF),
             OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::EventFd(_) | OpenFile::Null
-            | OpenFile::Session
+            | OpenFile::Random | OpenFile::Session | OpenFile::Pair(..)
             | OpenFile::Pipe(_, false) => {}
         });
         match (found, res) {
@@ -1583,13 +2405,12 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
 /// the fd carries the index; a dup'd fd names the same slot, and the slot
 /// frees when any fd naming it closes — the single-task guest has no
 /// forking parent to keep one alive past the close).
-static mut EVENTFDS: [Option<akuma_syscalls_eventfd::EventFd>; 4] =
-    [None, None, None, None];
+static EVENTFDS: akuma_primitives::cell::BorrowCell<[Option<akuma_syscalls_eventfd::EventFd>; 4]> =
+    akuma_primitives::cell::BorrowCell::new([None, None, None, None]);
 
-fn eventfds() -> &'static mut [Option<akuma_syscalls_eventfd::EventFd>; 4] {
-    // As `child::slots`: one task, run to completion, no other kernel
-    // context can touch the table mid-syscall.
-    unsafe { &mut *core::ptr::addr_of_mut!(EVENTFDS) }
+/// Run `f` on the eventfd table; nothing holds it across a user copy.
+fn eventfds<R>(f: impl FnOnce(&mut [Option<akuma_syscalls_eventfd::EventFd>; 4]) -> R) -> R {
+    EVENTFDS.with_mut(f)
 }
 
 /// `eventfd2(initval, flags)`. Flags outside Linux's three bits are EINVAL;
@@ -1601,14 +2422,17 @@ fn eventfd2_arm(initval: u64, flags: u64) -> u64 {
         Ok(ef) => ef,
         Err(no) => return e(no as u64),
     };
-    let slot = eventfds().iter().position(|s| s.is_none());
+    let slot = eventfds(|t| {
+        let slot = t.iter().position(core::option::Option::is_none)?;
+        t[slot] = Some(ef);
+        Some(slot)
+    });
     let Some(slot) = slot else {
         return e(ring3::err::EMFILE);
     };
-    eventfds()[slot] = Some(ef);
     let mut table = fd_table();
     let desc = OpenFile::EventFd(slot);
-    let fd = table.alloc_fd_from(3, desc);
+    let fd = table.alloc_fd_from(new_fd_min(), desc);
     if flags & u64::from(akuma_syscalls_eventfd::EFD_NONBLOCK) != 0 {
         table.set_nonblock(fd);
     }
@@ -1624,10 +2448,10 @@ fn eventfd2_arm(initval: u64, flags: u64) -> u64 {
 /// has none, so Linux's would-block answers EAGAIN here by construction
 /// (the fd's nonblock bit changes nothing: there is no waiter to park).
 fn eventfd_read_arm(idx: usize, buf_va: u64) -> u64 {
-    let Some(ef) = eventfds()[idx].as_mut() else {
+    let Some(res) = eventfds(|t| t[idx].as_mut().map(akuma_syscalls_eventfd::EventFd::read)) else {
         return e(ring3::err::EBADF);
     };
-    match ef.read() {
+    match res {
         Ok(val) => {
             if !copy_to_user(buf_va, &val.to_le_bytes()) {
                 return e(ring3::err::EFAULT);
@@ -1650,10 +2474,10 @@ fn eventfd_write_arm(idx: usize, buf_va: u64) -> u64 {
 /// The write itself (the value already gathered — writev's head bytes take
 /// this path too, matching Linux's first-8-bytes-of-the-gather rule).
 fn eventfd_write_val(idx: usize, val: u64) -> u64 {
-    let Some(ef) = eventfds()[idx].as_mut() else {
+    let Some(res) = eventfds(|t| t[idx].as_mut().map(|ef| ef.write(val))) else {
         return e(ring3::err::EBADF);
     };
-    match ef.write(val) {
+    match res {
         Ok(()) => 8,
         Err(no) => e(no as u64),
     }
@@ -1662,16 +2486,203 @@ fn eventfd_write_val(idx: usize, val: u64) -> u64 {
 /// Close every fd naming `idx`: drop the slot (the single-task guest has no
 /// co-referring parent process — the Socket treatment).
 fn eventfd_close_slot(idx: usize) {
-    eventfds()[idx] = None;
+    eventfds(|t| t[idx] = None);
 }
 
 /// poll/select readiness for an eventfd fd: readable while the counter is
 /// non-zero (sock.rs's `fd_events` asks through here).
 pub(crate) fn eventfd_can_read(idx: usize) -> bool {
-    eventfds()[idx].as_ref().is_some_and(|ef| ef.can_read())
+    eventfds(|t| t[idx].as_ref().is_some_and(akuma_syscalls_eventfd::EventFd::can_read))
 }
+/// One bit per syscall number below 512 already named by `nosys_note`.
+static NOSYS_SEEN: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Name an unserved syscall number on the console, once per number.
+fn nosys_note(nr: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if nr >= 512 {
+        akuma_primitives::safe_print!(64, "[nosys] nr={}\n", nr);
+        return;
+    }
+    let bit = 1u64 << (nr & 63);
+    if NOSYS_SEEN[(nr >> 6) as usize].fetch_or(bit, Relaxed) & bit == 0 {
+        akuma_primitives::safe_print!(64, "[nosys] nr={}\n", nr);
+    }
+}
+
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
+    #[cfg(feature = "trace-err")]
+    {
+        let (nr, a1, a2, a3) = (fr.rax, fr.rdi, fr.rsi, fr.rdx);
+        if nr == 59 {
+            let mut pb = [0u8; 160];
+            let p = user_str(a1, &mut pb).unwrap_or("<bad>");
+            akuma_primitives::safe_print!(224, "[execve] s{} path={}\n", crate::exec_twin::current_slot() as i64, p);
+        }
+        let rip = fr.user_rip;
+        let islot = exec_twin::current_slot();
+        if islot < child::NSLOTS {
+            INFLIGHT.with_mut(|t| t[islot] = (nr, a1, a2, a3));
+        }
+        if nr == 202 {
+            FXRING.push((islot as i32, a2, a1, a3, u64::MAX - 1));
+        }
+        let r = dispatch_inner(fr);
+        if islot < child::NSLOTS {
+            INFLIGHT.with_mut(|t| t[islot].0 = 0);
+        }
+        if nr == 202 {
+            FXRING.push((islot as i32, a2, a1, a3, r));
+        }
+        trace_err(nr, r, a1, a2, a3);
+        trace_ring(nr, r, a1, a2, a3, rip);
+        r
+    }
+    #[cfg(not(feature = "trace-err"))]
     dispatch_inner(fr)
+}
+
+/// The syscall ring `trace_ring` fills and `trace_hang_dump` reads.
+#[cfg(feature = "trace-err")]
+const N: usize = 1024;
+#[cfg(feature = "trace-err")]
+static RING: ring::Ring<(i32, u64, u64, u64, u64, u64, u64), N> = ring::Ring::new((0, 0, 0, 0, 0, 0, 0));
+/// Every futex call in global order: `(slot, op, uaddr, val_or_count, result)`.
+#[cfg(feature = "trace-err")]
+static FXRING: ring::Ring<(i32, u64, u64, u64, u64), 160> = ring::Ring::new((0, 0, 0, 0, 0));
+
+/// The syscall each slot is in RIGHT NOW (`nr`, three args; `nr == 0` = none):
+/// a parked thread is inside one that has not returned, which the ring cannot show.
+#[cfg(feature = "trace-err")]
+static INFLIGHT: akuma_primitives::cell::BorrowCell<[(u64, u64, u64, u64); child::NSLOTS + 1]> =
+    akuma_primitives::cell::BorrowCell::new([(0, 0, 0, 0); child::NSLOTS + 1]);
+
+/// The idle thread calls this when nothing has run for a while: every live
+/// slot's last `per` syscalls, so a hang shows what each thread was waiting on.
+#[cfg(feature = "trace-err")]
+pub(crate) fn trace_hang_dump(per: usize) {
+    akuma_primitives::safe_print!(64, "[hang] idle for 20 s; last futex calls, oldest first (ret=PENDING: entry):\n");
+    FXRING.view(|head, ring| {
+        for i in 0..160 {
+            let (sl, op, ua, v, r) = ring[(head + i) % 160];
+            if op != 0 || ua != 0 {
+                if r == u64::MAX - 1 {
+                    akuma_primitives::safe_print!(96, "[hang] fx s{} op=0x{:x} @0x{:x} v=0x{:x} PENDING\n", sl, op, ua, v);
+                } else {
+                    akuma_primitives::safe_print!(96, "[hang] fx s{} op=0x{:x} @0x{:x} v=0x{:x} -> {}\n", sl, op, ua, v, r as i64);
+                }
+            }
+        }
+    });
+    akuma_primitives::safe_print!(64, "[hang] last syscalls per slot:\n");
+    RING.view(|head, ring| {
+        for slot in 0..child::NSLOTS {
+            if !child::slot_in_use(slot) {
+                continue;
+            }
+            let (inr, ix, iy, iz) = INFLIGHT.with(|t| t[slot]);
+            if inr != 0 {
+                akuma_primitives::safe_print!(
+                    112, "[hang] s{} IN nr={} a=0x{:x},0x{:x},0x{:x}\n", slot, inr, ix, iy, iz
+                );
+            }
+            let mut shown = 0;
+            for i in (0..N).rev() {
+                if shown >= per {
+                    break;
+                }
+                let (sl, n, x, y, z, ret, rp) = ring[(head + i) % N];
+                if n != 0 && sl == slot as i32 {
+                    shown += 1;
+                    akuma_primitives::safe_print!(
+                        112, "[hang] s{} nr={} a=0x{:x},0x{:x},0x{:x} -> {} rip=0x{:x}\n",
+                        slot, n, x, y, z, ret as i64, rp
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// `--features trace-err`: the last 96 syscalls of every task, dumped when a
+/// task writes the 4-byte value 17 (std's CLOEXEC error pipe reporting EEXIST).
+/// Debug aid for "could not execute process"; the dump is the evidence.
+#[cfg(feature = "trace-err")]
+#[allow(clippy::many_single_char_names)] // register-argument names
+fn trace_ring(nr: u64, r: u64, a1: u64, a2: u64, a3: u64, rip: u64) {
+    static DUMPED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    let slot = crate::exec_twin::current_slot() as i32;
+    RING.push((slot, nr, a1, a2, a3, r, rip));
+    // What a task says on stderr (a panic/abort message), capped: the
+    // evidence the next line of the console would otherwise lose.
+    if nr == 1 && a1 == 2 && r > 0 {
+        static SEEN_ERR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+        if SEEN_ERR.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 120 {
+            let mut b = [0u8; 120];
+            let n = (r as usize).min(b.len());
+            if copy_from_user(&mut b[..n], a2) {
+                let txt = core::str::from_utf8(&b[..n]).unwrap_or("<non-utf8>");
+                akuma_primitives::safe_print!(160, "[stderr] s{}: {}\n", slot, txt.trim_end());
+            }
+        }
+    }
+    if nr == 200 {
+        akuma_primitives::safe_print!(64, "[ring] tkill by s{}; its last syscalls:\n", slot);
+        ring_dump_slot(slot, 40);
+    }
+    // std's CLOEXEC error pipe: 4 bytes errno (big endian) + b"NOEX".
+    if nr == 1 && a3 == 8 && r == 8 {
+        let mut b = [0u8; 8];
+        if copy_from_user(&mut b, a2) && &b[4..] == b"NOEX"
+            && DUMPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3
+        {
+            akuma_primitives::safe_print!(
+                64, "[ring] exec failed in s{} errno={}; its last syscalls:\n",
+                slot, u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            );
+            ring_dump_slot(slot, 60);
+        }
+    }
+}
+
+/// Print `slot`'s entries among the newest `last` of the syscall ring, oldest first.
+#[cfg(feature = "trace-err")]
+fn ring_dump_slot(slot: i32, last: usize) {
+    RING.view(|head, ring| {
+        for i in 0..N {
+            let (sl, n, x, y, z, ret, rp) = ring[(head + i) % N];
+            if n != 0 && sl == slot && i + last >= N {
+                akuma_primitives::safe_print!(
+                    112, "[ring] nr={} a=0x{:x},0x{:x},0x{:x} -> {} rip=0x{:x}\n",
+                    n, x, y, z, ret as i64, rp
+                );
+            }
+        }
+    });
+}
+
+/// `--features trace-err`: name every syscall that answered a negative errno
+/// (`[err] nr=N -E`), capped so a polling loop cannot flood the console. The
+/// gap-finding view `[nosys]` is the always-on half of.
+#[cfg(feature = "trace-err")]
+fn trace_err(nr: u64, r: u64, a1: u64, a2: u64, a3: u64) {
+    // Capped PER syscall number (40 lines each): one global cap let a polling
+    // loop's ETIMEDOUT or a path walk's readlink EINVAL use the whole budget
+    // before the failing execve was ever reached.
+    static SEEN: [core::sync::atomic::AtomicU8; 512] =
+        [const { core::sync::atomic::AtomicU8::new(0) }; 512];
+    let v = r as i64;
+    // EFAULT is never capped away: it is the answer a bad user range gets.
+    let always = v == -14;
+    if (-4095..0).contains(&v) && v != -11 && v != -2 && v != -10 && v != -25
+        && v != -47 && v != -110
+        && (always
+            || (nr as usize) < SEEN.len()
+                && SEEN[nr as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 40)
+    {
+        akuma_primitives::safe_print!(96, "[err] s{} nr={} {} a=0x{:x},0x{:x},0x{:x}\n", crate::exec_twin::current_slot() as i64, nr, v, a1, a2, a3);
+    }
 }
 
 fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
@@ -1679,10 +2690,23 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     // (`get_saved_user_context` → the twin's `read_user_context`). The boot
     // task has no slot and skips; a slotted task pays one struct copy.
     crate::child::capture_user_context(fr);
+    // The x86-only legacy path spellings (rename/mkdir/rmdir/link/unlink/
+    // symlink/readlink/chmod/chown/lchown) mean the `*at` call with
+    // `AT_FDCWD`; the fold is `akuma_syscalls_abi::legacy`, the same table
+    // amd64 dispatches through. Rewritten in the frame so the one `*at` arm
+    // below serves both spellings.
+    #[allow(clippy::tuple_array_conversions)] // destructuring assignment into the frame's registers
+    if let Some((call, a)) = akuma_syscalls_abi::legacy::fold(
+        fr.rax,
+        [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()],
+    ) {
+        fr.rax = call.to_x86_64();
+        (fr.rdi, fr.rsi, fr.rdx, fr.r10, fr.r8, fr.r9) = (a[0], a[1], a[2], a[3], a[4], a[5]);
+    }
     match fr.rax {
         ring3::nr::WRITE => {
-            let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
-            if len > WRITE_LIMIT || !user_ok(buf, len) {
+            let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3().min(WRITE_LIMIT));
+            if !user_ok(buf, len) {
                 return e(ring3::err::EFAULT);
             }
             // Stage 7 step 1 (H3): table-first routing, the order WRITEV
@@ -1700,13 +2724,17 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let kind = fd_table().with(fd as u32, |d| match d {
                 OpenFile::Socket(_) => 1,
                 OpenFile::File { .. } => 2,
-                OpenFile::Null => 3,
+                OpenFile::Null | OpenFile::Random => 3,
                 OpenFile::EventFd(slot) => {
                     efd_idx = *slot;
                     4
                 }
                 OpenFile::Pipe(id, true) => {
                     pipe_id = *id as usize;
+                    5
+                }
+                OpenFile::Pair(_, wr) => {
+                    pipe_id = *wr as usize;
                     5
                 }
                 _ => 0,
@@ -1726,7 +2754,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if fd != 1 && fd != 2 {
                 return e(ring3::err::EBADF);
             }
-            if child::nested_active() && fd == 1 {
+            // stderr of a session's programs joins the session stream (one
+            // buffer, as on a pty): fd 2 used to fall to the console, so
+            // `ls /nonexistent`, git's `fatal:` and rustc's errors never
+            // reached the ssh client.
+            if child::nested_active() {
                 if !child::child_write(buf, len) {
                     return e(ring3::err::EFAULT);
                 }
@@ -1765,17 +2797,20 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     u64::from_le_bytes(iv[0..8].try_into().unwrap()),
                     u64::from_le_bytes(iv[8..16].try_into().unwrap()),
                 );
-                if len > WRITE_LIMIT || !user_ok(base, len) {
+                // Past the bound the write is a short one (legal for writev);
+                // ld flushes its whole output image in one call.
+                let len = len.min(WRITE_LIMIT - total);
+                if !user_ok(base, len) {
                     return e(ring3::err::EFAULT);
                 }
                 total += len;
-                if total > WRITE_LIMIT {
-                    return e(ring3::err::EFAULT);
-                }
                 let off = data.len();
                 data.resize(off + len as usize, 0);
                 if !copy_from_user(&mut data[off..], base) {
                     return e(ring3::err::EFAULT);
+                }
+                if total >= WRITE_LIMIT {
+                    break;
                 }
             }
             let mut efd_idx: usize = usize::MAX;
@@ -1783,7 +2818,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let kind = fd_table().with(fd as u32, |d| match d {
                 OpenFile::Socket(_) => 1,
                 OpenFile::File { .. } => 2,
-                OpenFile::Null => 3,
+                OpenFile::Null | OpenFile::Random => 3,
                 OpenFile::EventFd(slot) => {
                     efd_idx = *slot;
                     4
@@ -1796,6 +2831,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 // writev retry loop on an answer that never drains).
                 OpenFile::Pipe(id, true) => {
                     pipe_id = *id as usize;
+                    5
+                }
+                OpenFile::Pair(_, wr) => {
+                    pipe_id = *wr as usize;
                     5
                 }
                 _ => 0,
@@ -1835,7 +2874,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }            // The pipe branch of `write` applies per iovec: musl flushes a
             // buffered stdout as one writev, and a nested child's version
             // string belongs to the ssh session, not the console.
-            let piped = child::nested_active() && fd == 1;
+            let piped = child::nested_active();
             let mut total = 0u64;
             for i in 0..iovcnt {
                 let mut iv = [0u8; 16];
@@ -1875,6 +2914,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // and `ret`s through a zeroed return address (session pe: pd's
             // deterministic rip=0).
             if child::is_real_task() {
+                // `exit` (60) from a thread ends that thread only; everything
+                // else (exit_group, a lone process's exit) ends the group.
+                if fr.rax == ring3::nr::EXIT && child::is_thread_task() {
+                    child::task_exit_thread()
+                }
                 child::task_exit_real(code)
             }
             // Stage 4: a nested child's exit does NOT reach the reaper — it
@@ -1946,12 +2990,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                         return e(ring3::err::EFAULT);
                     }
                     let v = akuma_cpu::msr::read(akuma_cpu::msr::Msr::FsBase);
-                    // SAFETY: `addr` passed `user_ok` — a mapped task page;
-                    // the physmap translation is the same walk the copy above
-                    // makes.
-                    let dst = phys::phys_ptr::<u64>(paging::translate_in(task().root_pa, addr as usize).unwrap_or(0) + (addr & 0xFFF));
-                    unsafe {
-                        dst.write_volatile(v);
+                    if !copy_to_user(addr, &v.to_ne_bytes()) {
+                        return e(ring3::err::EFAULT);
                     }
                     0
                 }
@@ -1960,23 +3000,60 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
             }
         }
-        ring3::nr::SET_TID_ADDRESS => 1, // one task: the tid, and nothing to clear
+        ring3::nr::SET_TID_ADDRESS => {
+            // The word the kernel zeroes and futex-wakes at this thread's exit.
+            if let Some(p) = akuma_exec::process::current_process_shared() {
+                p.clear_child_tid.store(fr.arg1(), core::sync::atomic::Ordering::Release);
+            }
+            my_tid()
+        }
+        akuma_syscalls_abi::x86_64::FUTEX => {
+            futex::sys_futex(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6())
+        }
         // x86_64 musl sends 39 for getpid; ring3's hand table says 38 (its
         // own archaeology). The ABI crate owns the x86_64 truth - answer both
         // spellings so the fetcher's calls stop landing in the unhandled arm.
-        ring3::nr::GETTID | ring3::nr::GETPID | akuma_syscalls_abi::x86_64::GETPID => {
+        ring3::nr::GETTID => my_tid(),
+        ring3::nr::GETPID | akuma_syscalls_abi::x86_64::GETPID => u64::from(child::current_pid()),
+        ring3::nr::GETPPID => 1, // everything here is the init task's child
+        // Session and process-group identity. There is no controlling terminal and no job control here, so each
+        // task is its own session and group leader: `setsid` succeeds and reports the new session id (the pid),
+        // `getsid`/`getpgid` answer the pid, `setpgid` accepts. `git` daemonises with `setsid` and used to die
+        // with "fatal: setsid failed: Function not implemented".
+        akuma_syscalls_abi::x86_64::SETSID | akuma_syscalls_abi::x86_64::GETSID | akuma_syscalls_abi::x86_64::GETPGID => {
             u64::from(child::current_pid())
         }
-        ring3::nr::GETPPID => 1, // everything here is the init task's child
+        akuma_syscalls_abi::x86_64::SETPGID => 0,
         ring3::nr::GETUID | ring3::nr::GETEUID => 0,
         ring3::nr::GETGID | ring3::nr::GETEGID => 0,
-        ring3::nr::IOCTL => e(ring3::err::ENOTTY), // the console is a serial line, not a tty
+        ring3::nr::IOCTL => {
+            // FIONBIO (Rust std's read2 on a child's pipes): the same bit as
+            // fcntl F_SETFL O_NONBLOCK. Everything else: no tty here.
+            const FIONBIO: u64 = 0x5421;
+            let fd = fr.arg1();
+            if fr.arg2() == FIONBIO && fd > 2 && (fd as u32) < SLOT_CEILING {
+                let mut v = [0u8; 4];
+                if !user_ok(fr.arg3(), 4) || !copy_from_user(&mut v, fr.arg3()) {
+                    return e(ring3::err::EFAULT);
+                }
+                if u32::from_ne_bytes(v) != 0 {
+                    fd_table().set_nonblock(fd as u32);
+                } else {
+                    fd_table().clear_nonblock(fd as u32);
+                }
+                return 0;
+            }
+            e(ring3::err::ENOTTY) // the console is a serial line, not a tty
+        }
         ring3::nr::MMAP => {
             let (addr, len, prot, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
             let fd = fr.arg5();
             let off = fr.arg6();
             if len == 0 {
                 return e(ring3::err::EINVAL);
+            }
+            if wx_on() && let Some(no) = akuma_syscalls_mem::wx::check_prot(prot).errno() {
+                return e(no);
             }
             // M5: two kinds of mapping. MAP_ANONYMOUS — the only kind this
             // kernel served before — and, now, MAP_PRIVATE of an open file:
@@ -1987,15 +3064,19 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // because its address space dies with it).
             let anon = flags & ring3::mmap::MAP_ANONYMOUS != 0;
             let mut fnode: Option<u32> = None;
+            let mut fsize = 0u64;
             if !anon {
                 // `Some(Some(inode))` = a bound regular file; anything else
                 // (unbound, socket, dir, child pipe) has no file to map.
                 let mapped = fd_table().with(fd as u32, |d| match d {
-                    OpenFile::File { inode, .. } => Some(*inode),
+                    OpenFile::File { inode, size, .. } => Some((*inode, *size)),
                     _ => None,
                 });
                 match mapped {
-                    Some(Some(node)) => fnode = Some(node),
+                    Some(Some((node, size))) => {
+                        fnode = Some(node);
+                        fsize = size;
+                    }
                     _ => return e(ring3::err::ENODEV),
                 }
             }
@@ -2003,29 +3084,40 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let pages = (len + 0xFFF) & !0xFFF;
             let base = if flags & ring3::mmap::MAP_FIXED != 0
                 && addr >= MMAP_BASE
-                && addr + pages <= MMAP_BASE + SLAB
+                && addr + pages <= MMAP_BASE + MMAP_SLAB
             {
+                // Replacing whatever was there (musl's ldso maps each PT_LOAD
+                // over its anonymous reservation): the old frames go back, and
+                // the range leaves the hole table.
+                if mmdbg() & 2 != 0 {
+                    mm_event(2, addr, addr + pages);
+                    release_pages(t.root_pa, addr, addr + pages);
+                    carve_hole(t, addr, addr + pages);
+                }
                 addr
             } else {
-                (t.mmap_cur + 0xF) & !0xF
+                match mmap_alloc(t, pages) {
+                    Some(b) => b,
+                    None => return e(ring3::err::ENOMEM),
+                }
             };
-            if base + pages > MMAP_BASE + SLAB {
-                return e(ring3::err::ENOMEM);
-            }
-            // Anonymous memory is RW; exec is honoured by widening, at the
-            // cost of W^X — a task that maps RWX here tells the kernel it
-            // wants it, and there is no W^X policy layer to argue with.
-            let pte = if prot & ring3::mmap::PROT_EXEC != 0 {
-                PteProt::USER_RWX
-            } else {
+            // Mappings are RW (the kernel fills them), except that exec is exec: with W^X on, a
+            // `PROT_EXEC` mapping is RX - `W|X` was refused above, so it asked for no write - and a
+            // page can only become executable if the program never wrote it. With `wx=0` the old
+            // widening to RWX is back.
+            let pte = if prot & ring3::mmap::PROT_EXEC == 0 {
                 PteProt::USER_RW
+            } else if wx_on() {
+                PteProt::USER_RX
+            } else {
+                PteProt::USER_RWX
             };
             let mut page = base & !0xFFF;
             while page < base + pages {
-                let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
+                let Some(frame) = phys::Frame::alloc_zeroed() else {
                     return e(ring3::err::ENOMEM);
                 };
-                if !paging::map_page_in(t.root_pa, page as usize, pa as u64, pte, MemAttr::WriteBack) {
+                if !paging::map_page_in(t.root_pa, page as usize, frame.pa(), pte, MemAttr::WriteBack) {
                     return e(ring3::err::ENOMEM);
                 }
                 if let Some(node) = fnode {
@@ -2049,36 +3141,36 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                         if got == 0 {
                             break;
                         }
-                        // SAFETY: `pa` is this page's fresh frame and `done`
-                        // stays inside it; the physmap copy is the same walk
-                        // the exec path's copy makes.
-                        let dst = phys::phys_ptr::<u8>(pa as u64 + done as u64);
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, got);
-                        }
+                        frame.write_bytes(done, &chunk[..got]);
                         done += got;
                     }
                 }
                 page += 4096;
             }
-            // Monotonic bump: a MAP_FIXED mapping lands inside an earlier
-            // reservation, BELOW `mmap_cur` — rewinding the cursor would
-            // hand its pages out twice.
+            // A MAP_FIXED mapping lands inside an earlier reservation, BELOW
+            // `mmap_cur`: only a mapping above the cursor moves it.
             if base + pages > t.mmap_cur {
                 t.mmap_cur = base + pages;
             }
+            if let Some(node) = fnode {
+                const MAP_SHARED: u64 = 0x1;
+                if flags & MAP_SHARED != 0 && prot & ring3::mmap::PROT_WRITE != 0 {
+                    if t.n_shared < MAX_SHARED {
+                        t.shared[t.n_shared] = (base, pages, node, off, fsize);
+                        t.n_shared += 1;
+                    } else {
+                        akuma_primitives::safe_print!(96, "[mmap] shared-file table full: writes to this mapping are lost\n");
+                    }
+                }
+            }
             base
         }
-        ring3::nr::MUNMAP | ring3::nr::MPROTECT => {
-            // Unmap is a no-op (the slabs live as long as the task); mprotect
-            // is accepted and ignored — nothing in this kernel enforces
-            // per-page protection changes after placement.
-            if fr.arg1() & 0xFFF != 0 {
-                e(ring3::err::EINVAL)
-            } else {
-                0
-            }
-        }
+        ring3::nr::MPROTECT => mprotect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        ring3::nr::MUNMAP => munmap_arm(fr.arg1(), fr.arg2()),
+        26 => msync_arm(fr.arg1(), fr.arg2()),
+        // x86_64 sendfile = 40, copy_file_range = 326 (neither is in the shared ABI table yet).
+        40 => copy_range_arm(fr.arg2(), fr.arg3(), fr.arg1(), 0, fr.arg4()),
+        326 => copy_range_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5()),
         ring3::nr::READ => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
             read_fd_arm(fd, buf, len)
@@ -2088,8 +3180,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // at an explicit offset): the fd's position is untouched —
             // Linux's contract, and what a `map_library` that re-reads from
             // offset 0 across a loop depends on.
-            let (fd, buf, len, off) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
-            if len > WRITE_LIMIT || !user_ok(buf, len) {
+            let (fd, buf, len, off) = (fr.arg1(), fr.arg2(), fr.arg3().min(WRITE_LIMIT), fr.arg4());
+            if !user_ok(buf, len) {
                 return e(ring3::err::EFAULT);
             }
             let mapped = fd_table().with(fd as u32, |d| match d {
@@ -2122,6 +3214,48 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             total
         }
+        akuma_syscalls_abi::x86_64::PWRITE64 => {
+            // Write at an explicit offset; the fd's position is untouched
+            // (SQLite, the toolchain's lock files). The file grows as needed.
+            let (fd, buf, len, off) = (fr.arg1(), fr.arg2(), fr.arg3().min(WRITE_LIMIT), fr.arg4());
+            if !user_ok(buf, len) {
+                return e(ring3::err::EFAULT);
+            }
+            let mapped = fd_table().with(fd as u32, |d| match d {
+                OpenFile::File { inode, .. } => Some(*inode),
+                _ => None,
+            });
+            let Some(Some(node)) = mapped else {
+                return e(ring3::err::ESPIPE);
+            };
+            let mut done = 0u64;
+            while done < len {
+                let mut chunk = [0u8; 1024];
+                let n = ((len - done) as usize).min(chunk.len());
+                if !copy_from_user(&mut chunk[..n], buf + done) {
+                    return e(ring3::err::EFAULT);
+                }
+                match root_fs().write_at_by_inode(node, (off + done) as usize, &chunk[..n]) {
+                    Ok(w) if w > 0 => done += w as u64,
+                    _ => return e(ring3::err::EIO),
+                }
+            }
+            fd_table().update(fd as u32, |of| {
+                if let OpenFile::File { size, .. } = of {
+                    *size = (*size).max(off + done);
+                }
+            });
+            done
+        }
+        akuma_syscalls_abi::x86_64::SCHED_YIELD => {
+            if crate::exec_twin::current_slot() < child::NSLOTS && akuma_threading::x86_runnable_exists() {
+                let stash = ring3::user_rsp_stash();
+                akuma_threading::x86_yield();
+                ring3::set_user_rsp_stash(stash);
+            }
+            0
+        }
+        akuma_syscalls_abi::x86_64::FCHOWN => 0, // everything is root already
         ring3::nr::READV => {
             // musl's stdio reads EVERY stream through readv (one user
             // buffer plus the stream's pending window as the second
@@ -2147,7 +3281,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     u64::from_le_bytes(iv[0..8].try_into().unwrap()),
                     u64::from_le_bytes(iv[8..16].try_into().unwrap()),
                 );
-                if len > WRITE_LIMIT || !user_ok(base, len) {
+                let len = len.min(WRITE_LIMIT);
+                if !user_ok(base, len) {
                     return e(ring3::err::EFAULT);
                 }
                 if len == 0 {
@@ -2177,7 +3312,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 let known = fd_table().with(dirfd as u32, |_| true).is_some();
                 return if known { 0 } else { e(ring3::err::EBADF) };
             }
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2197,7 +3332,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // root, and every regular file the ext2 root holds is readable
             // and executable to it (the R_OK/X_OK bits carry no extra
             // information here).
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(fr.arg1(), &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2216,7 +3351,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if !user_ok(buf, 144) {
                 return e(ring3::err::EFAULT);
             }
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2226,10 +3361,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // — a link's own S_IFLNK|0777 reads as "not a program", which is
             // how every exec died as `Permission denied` before a fork was
             // ever attempted.
-            match root_fs().metadata(&resolve_effective(path)) {
+            let abs = resolve_at(ring3::open::AT_FDCWD, path).unwrap_or_default();
+            match root_fs().metadata(&resolve_effective(&abs)) {
                 Ok(md) => match fill_stat64(
                     buf,
-                    md.inode,
+                    stat_ino(&resolve_effective(&abs), md.inode),
                     md.mode,
                     md.size,
                     u64::from(md.links.unwrap_or(if md.is_dir { 2 } else { 1 })),
@@ -2250,11 +3386,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if !user_ok(buf, 144) {
                 return e(ring3::err::EFAULT);
             }
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
-            lstat_path(path, buf)
+            lstat_path(&resolve_at(ring3::open::AT_FDCWD, path).unwrap_or_default(), buf)
         }
         ring3::nr::FCNTL => {
             // The fd-flag commands only; the table owns the cloexec bit.
@@ -2277,6 +3413,17 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     0
                 }
                 3 => 0, // F_GETFL: O_RDONLY, the only access mode served
+                // Record locks (SQLite's, cargo's global cache tracker): one
+                // task group on one core never contends, so every lock is
+                // granted and a query finds the range unlocked (l_type =
+                // F_UNLCK, the first field of `struct flock`).
+                5 | 36 => {
+                    if !copy_to_user(arg, &2u16.to_le_bytes()) {
+                        return e(ring3::err::EFAULT);
+                    }
+                    0
+                }
+                6 | 7 | 37 | 38 => 0,
                 4 => {
                     // F_SETFL: the one flag with a behaviour behind it is
                     // O_NONBLOCK — recorded in the fd table, read by the
@@ -2319,8 +3466,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     };
                     // The copy is a real reference (as the DUP arm): a
                     // cloned pipe end bumps the table's end count.
-                    if let OpenFile::Pipe(id, w) = &desc {
-                        pipes::clone_ref(*id, *w);
+                    {
+                        let (ends, n) = desc.pipe_ends();
+                        for (id, w) in &ends[..n] {
+                            pipes::clone_ref(*id, *w);
+                        }
                     }
                     let newfd = table.alloc_fd_from(slot, desc);
                     if cmd == 1030 {
@@ -2342,7 +3492,12 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // release; closing them is the no-op Linux's stdio-close is.
             let fd = fr.arg1();
             if fd <= 2 {
-                return 0;
+                // A std fd that was re-bound (dup2, or an open that took the slot) closes like any other.
+                let bound = fd_table().with(fd as u32, |_| ()).is_some();
+                task().std_closed |= 1 << fd;
+                if !bound {
+                    return 0;
+                }
             }
             if fd as u32 >= SLOT_CEILING {
                 return e(ring3::err::EBADF);
@@ -2362,6 +3517,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     pipes::release(*id, *w);
                     3
                 }
+                OpenFile::Pair(r, w) => {
+                    pipes::release(*r, false);
+                    pipes::release(*w, true);
+                    3
+                }
                 _ => 0,
             });
             if fd_kind == Some(1) {
@@ -2379,7 +3539,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // old "absolute paths only, read-only" arm predated the write
             // path and answered EBADF to exactly the calls the gate needs.)
             let (dirfd, path_va, flags) = (fr.arg1(), fr.arg2(), fr.arg3());
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2391,11 +3551,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::OPEN => {
             // musl's `open()` on x86_64: the legacy number, no dirfd.
             let (path_va, flags) = (fr.arg1(), fr.arg2());
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
-            open_common(path, flags)
+            open_common(&resolve_at(ring3::open::AT_FDCWD, path).unwrap_or_default(), flags)
         }
         ring3::nr::GETDENTS64 => {
             // `ls`'s walk: fill `linux_dirent64` records from the open
@@ -2454,7 +3614,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                 }
                 OpenFile::File { .. } | OpenFile::Socket(_) | OpenFile::ChildOut(_)
-                | OpenFile::EventFd(_) | OpenFile::Null | OpenFile::Session => {
+                | OpenFile::EventFd(_) | OpenFile::Null | OpenFile::Random | OpenFile::Session
+                | OpenFile::Pair(..) => {
                     res = Err(ring3::err::ENOTDIR);
                 }
                 OpenFile::Pipe(_, false) => {
@@ -2478,13 +3639,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             used as u64
         }
-        ring3::nr::RT_SIGACTION | ring3::nr::RT_SIGPROCMASK => {
-            // No signal delivery exists: nothing can ever be delivered, so a
-            // handler registration or a mask change is accepted as the no-op
-            // it is here. musl's startup installs both before `main` —
-            // failing them would fail a program that can never be signalled.
-            0
-        }
+        ring3::nr::RT_SIGACTION => sigaction_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
+        ring3::nr::RT_SIGPROCMASK => sigprocmask_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
         ring3::nr::CLOCK_GETTIME => {
             // Stage 4: the calibrated TSC gives both clocks real elapsed
             // time (net.rs). Stage 8 (M1): CLOCK_REALTIME (id 0) adds the
@@ -2570,7 +3726,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if !user_ok(buf, 144) {
                 return e(ring3::err::EFAULT);
             }
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2667,7 +3823,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             0
         }
         ring3::nr::STATFS => {
-            let mut pbuf = [0u8; 128];
+            let mut pbuf = [0u8; PATH_BUF];
             let Some(path) = user_str(fr.arg1(), &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2677,7 +3833,17 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             fill_statfs(fr.arg2())
         }
         ring3::nr::FSTATFS => fill_statfs(fr.arg2()),
-        akuma_syscalls_linux::nr::FTRUNCATE => {
+        akuma_syscalls_abi::x86_64::TRUNCATE => {
+            // truncate(path, len): the by-name twin of the ftruncate below.
+            let len = fr.arg2();
+            path_at(fr.arg1(), ring3::open::AT_FDCWD, |p| {
+                match root_fs().truncate(&resolve_effective(p), len) {
+                    Ok(()) => 0,
+                    Err(err) => e(fs_err(err)),
+                }
+            })
+        }
+        akuma_syscalls_abi::x86_64::FTRUNCATE => {
             // M4: apk sizes what it unpacks/downloads with ftruncate on the
             // fd (RESULT-L saw nr 77 land in the unhandled arm and the unpack
             // still succeed on the write path's own sizing — G3, A3). The
@@ -2721,7 +3887,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if bufsz == 0 || !user_ok(buf, bufsz) {
                 return e(ring3::err::EFAULT);
             }
-            path_at(fr.arg2(), dirfd, |p| match root_fs().read_symlink(p) {
+            path_at(fr.arg2(), dirfd, |p| match if p == "/proc/self/exe" && !task().exe.is_empty() {
+                Ok(task().exe.clone())
+            } else {
+                root_fs().read_symlink(p)
+            } {
                 Ok(t) => {
                     let bytes = t.as_bytes();
                     let n = (bytes.len() as u64).min(bufsz);
@@ -2742,7 +3912,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             })
         }
         ring3::nr::UNLINKAT => {
-            let (dirfd, flags) = (fr.arg1(), fr.arg4());
+            // `unlinkat(dirfd, path, flags)`: the flags are the THIRD argument
+            // (this read arg4, so `rmdir` never saw AT_REMOVEDIR - found when
+            // the legacy fold routed `rmdir`(84) here, 2026-10-30).
+            let (dirfd, flags) = (fr.arg1(), fr.arg3());
             path_at(fr.arg2(), dirfd, |p| {
                 let r = if flags & ring3::open::AT_REMOVEDIR != 0 {
                     root_fs().remove_dir(p)
@@ -2757,8 +3930,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         ring3::nr::RENAMEAT => {
             let (od, old_va, nd, new_va) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
-            let mut ob = [0u8; 128];
-            let mut nb = [0u8; 128];
+            let mut ob = [0u8; PATH_BUF];
+            let mut nb = [0u8; PATH_BUF];
             let Some(old) = user_str(old_va, &mut ob) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2775,8 +3948,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         ring3::nr::SYMLINKAT => {
             let (target_va, dirfd, link_va) = (fr.arg1(), fr.arg2(), fr.arg3());
-            let mut tb = [0u8; 128];
-            let mut lb = [0u8; 128];
+            let mut tb = [0u8; PATH_BUF];
+            let mut lb = [0u8; PATH_BUF];
             let Some(target) = user_str(target_va, &mut tb) else {
                 return e(ring3::err::EFAULT);
             };
@@ -2792,27 +3965,72 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::LINKAT => {
-            // No hardlink arm on the ext2 trait yet; apk only needs it for
-            // packages that ship hard-linked files. The checklist print
-            // above will say if this one is real.
-            e(ring3::err::ENOSYS)
+            // `linkat(olddirfd, old, newdirfd, new, flags)`; the legacy `link`
+            // folds here with AT_FDCWD for both. Flags (AT_SYMLINK_FOLLOW) are
+            // accepted and ignored: a hard link names the inode the path names.
+            let (odir, opath, ndir, npath) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
+            path_at(opath, odir, |old| {
+                let old = resolve_effective(old);
+                path_at(npath, ndir, |new| match root_fs().link(&old, &resolve_effective(new)) {
+                    Ok(()) => 0,
+                    Err(err) => e(fs_err(err)),
+                })
+            })
         }
-        ring3::nr::FCHMOD | ring3::nr::FCHMODAT => 0, // root's mode is the mode
+        ring3::nr::FCHMODAT => {
+            // The mode bits are real (ext2's chmod): ld chmods its output
+            // executable, and an exec of a file without the bit is refused.
+            let (dirfd, mode) = (fr.arg1(), fr.arg3() as u32 & 0o7777);
+            path_at(fr.arg2(), dirfd, |p| {
+                match root_fs().chmod(&resolve_effective(p), mode) {
+                    Ok(()) => 0,
+                    Err(err) => e(fs_err(err)),
+                }
+            })
+        }
+        ring3::nr::FCHMOD => 0, // no path behind an open fd here; path chmod is the real one
         ring3::nr::FCHOWNAT => 0,                    // everything is root already
         ring3::nr::UMASK => 0o022,                   // conventional; no files inherit it
         ring3::nr::FLOCK => 0,                       // one task: nothing contends
         ring3::nr::GETCWD => {
             let (buf, size) = (fr.arg1(), fr.arg2());
-            if size < 2 {
+            let cwd = task().cwd.clone();
+            let cwd = if cwd.is_empty() { alloc::string::String::from("/") } else { cwd };
+            let n = cwd.len() as u64 + 1;
+            if size < n {
                 return e(ring3::err::ERANGE);
             }
-            if !user_ok(buf, 2) {
+            if !user_ok(buf, n) {
                 return e(ring3::err::EFAULT);
             }
-            if !copy_to_user(buf, b"/\0") {
+            let mut out = alloc::vec::Vec::with_capacity(n as usize);
+            out.extend_from_slice(cwd.as_bytes());
+            out.push(0);
+            if !copy_to_user(buf, &out) {
                 return e(ring3::err::EFAULT);
             }
-            2
+            n
+        }
+        ring3::nr::CHDIR => {
+            let mut pbuf = [0u8; PATH_BUF];
+            let Some(path) = user_str(fr.arg1(), &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            let Some(full) = resolve_at(ring3::open::AT_FDCWD, path) else {
+                return e(ring3::err::ENOENT);
+            };
+            chdir_to(full)
+        }
+        ring3::nr::FCHDIR => {
+            let dir = fd_table().with(fr.arg1() as u32, |d| match d {
+                OpenFile::Dir { path, .. } => Some(path.clone()),
+                _ => None,
+            });
+            match dir {
+                Some(Some(p)) => chdir_to(p),
+                Some(None) => e(ring3::err::ENOTDIR),
+                None => e(ring3::err::EBADF),
+            }
         }
         ring3::nr::DUP => {
             let fd = fr.arg1();
@@ -2829,14 +4047,17 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             };
             // The copy is a real reference: a cloned pipe end bumps the
             // table's count or the first close kills the other fd's end.
-            if let OpenFile::Pipe(id, w) = &desc {
-                pipes::clone_ref(*id, *w);
+            {
+                let (ends, n) = desc.pipe_ends();
+                for (id, w) in &ends[..n] {
+                    pipes::clone_ref(*id, *w);
+                }
             }
             let mut table = fd_table();
             let Some(_slot) = table.free_below(3, SLOT_CEILING) else {
                 return e(ring3::err::EMFILE);
             };
-            u64::from(table.alloc_fd_from(3, desc))
+            u64::from(table.alloc_fd_from(new_fd_min(), desc))
         }
         ring3::nr::DUP2 | ring3::nr::DUP3 => {
             // dup2(33)/dup3(292). dup3's flags carry O_CLOEXEC and nothing
@@ -2857,14 +4078,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // `dup2(10, 1)` needs the save slot, and a future
             // `dup2(1, 5)` needs a source.
             bind_session_fd(old);
-            let src_pipe = fd_table().with(old as u32, |d| {
-                if let OpenFile::Pipe(id, w) = d {
-                    Some((*id, *w))
-                } else {
-                    None
-                }
-            })
-            .flatten();
+            let src_pipe = fd_table().with(old as u32, OpenFile::pipe_ends);
             match fd_table().dup_to(old as u32, new as u32, is_dup3 && flags & O_CLOEXEC != 0) {
                 Ok(d) => {
                     // Whatever `new` named is displaced: release a displaced
@@ -2874,11 +4088,16 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     // real reference too — the end count must follow it.
                     if let Some(OpenFile::Socket(idx)) = d.displaced {
                         akuma_net::socket::remove_socket(idx);
-                    } else if let Some(OpenFile::Pipe(id, w)) = d.displaced {
-                        pipes::release(id, w);
+                    } else if let Some(disp) = &d.displaced {
+                        let (ends, n) = disp.pipe_ends();
+                        for (id, w) in &ends[..n] {
+                            pipes::release(*id, *w);
+                        }
                     }
-                    if let Some((id, w)) = src_pipe {
-                        pipes::clone_ref(id, w);
+                    if let Some((ends, n)) = src_pipe {
+                        for (id, w) in &ends[..n] {
+                            pipes::clone_ref(*id, *w);
+                        }
                     }
                     new
                 }
@@ -2900,29 +4119,52 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         ring3::nr::MREMAP => {
-            // musl's realloc on an mmapped chunk. Shrink keeps the address
-            // (the slab never unmaps, so it stays valid); grow moves to a
-            // fresh region at the mmap cursor and copies the overlap —
-            // MAYMOVE semantics, which the caller accepts by using the
-            // returned address. MREMAP_FIXED is refused: no fixed targets.
+            // musl's realloc on an mmapped chunk. Shrink frees the tail; grow
+            // extends in place when the range ends at the slab cursor, else
+            // moves (MAYMOVE, which the caller accepts by using the returned
+            // address), copies the overlap and frees the old range.
+            // MREMAP_FIXED is refused: no fixed targets.
             let (old, old_sz, new_sz, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
-            if new_sz == 0 || flags & 2 != 0 {
+            if new_sz == 0 || flags & 2 != 0 || old & 0xFFF != 0 {
                 return e(ring3::err::EINVAL);
             }
             if old_sz == 0 || !user_ok(old, old_sz) {
                 return e(ring3::err::EFAULT);
             }
-            if new_sz <= old_sz {
+            let old_pages = (old_sz + 0xFFF) & !0xFFF;
+            let new_pages = (new_sz + 0xFFF) & !0xFFF;
+            let t = task();
+            let in_slab = old >= MMAP_BASE && old + old_pages <= MMAP_BASE + MMAP_SLAB;
+            if new_pages <= old_pages {
+                if in_slab && new_pages < old_pages && mmdbg() & 4 != 0 {
+                    mm_event(3, old + new_pages, old + old_pages);
+                    release_pages(t.root_pa, old + new_pages, old + old_pages);
+                    add_hole(t, old + new_pages, old + old_pages);
+                }
                 return old;
             }
-            let pages = (new_sz + 0xFFF) & !0xFFF;
-            let t = task();
-            let base = (t.mmap_cur + 0xF) & !0xF;
-            if base + pages > MMAP_BASE + SLAB {
-                return e(ring3::err::ENOMEM);
+            // In place: the range is the topmost thing in the slab.
+            if in_slab && old + old_pages == t.mmap_cur
+                && old + new_pages <= MMAP_BASE + MMAP_SLAB
+            {
+                let mut page = old + old_pages;
+                while page < old + new_pages {
+                    let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
+                        return e(ring3::err::ENOMEM);
+                    };
+                    if !paging::map_page_in(t.root_pa, page as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
+                        return e(ring3::err::ENOMEM);
+                    }
+                    page += 4096;
+                }
+                t.mmap_cur = old + new_pages;
+                return old;
             }
+            let Some(base) = mmap_alloc(t, new_pages) else {
+                return e(ring3::err::ENOMEM);
+            };
             let mut page = base & !0xFFF;
-            while page < base + pages {
+            while page < base + new_pages {
                 let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
                     return e(ring3::err::ENOMEM);
                 };
@@ -2943,16 +4185,36 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
                 done += n as u64;
             }
-            t.mmap_cur = base + pages;
+            if in_slab && mmdbg() & 4 != 0 {
+                mm_event(4, old, old + old_pages);
+                release_pages(t.root_pa, old, old + old_pages);
+                add_hole(t, old, old + old_pages);
+            }
             base
         }
         // Akuma private: libakuma's sshd/sh ask for uptime; the clock arm's
         // elapsed-time source, in microseconds.
         ring3::nr::UPTIME => net::uptime_us(),
-        ring3::nr::SOCKET => sock::socket_arm(fr.arg1(), fr.arg2(), fr.arg3()),        ring3::nr::BIND => sock::bind_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        akuma_syscalls_abi::x86_64::SOCKETPAIR => pipes::socketpair_arm(fr.arg1(), fr.arg2(), fr.arg4()),
+        ring3::nr::SOCKET => sock::socket_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+               ring3::nr::BIND => sock::bind_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::LISTEN => sock::listen_arm(fr.arg1(), fr.arg2()),
         ring3::nr::ACCEPT => sock::accept_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::CONNECT => sock::connect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        ring3::nr::SENDTO if pair_ends(fr.arg1()).is_some() => {
+            // A socketpair end is two pipes; send/recv are write/read on it.
+            let (_, wr) = pair_ends(fr.arg1()).unwrap_or((0, 0));
+            if fr.arg3() > WRITE_LIMIT || !user_ok(fr.arg2(), fr.arg3()) {
+                return e(ring3::err::EFAULT);
+            }
+            pipes::write_arm(wr, fr.arg2(), fr.arg3())
+        }
+        ring3::nr::RECVFROM if pair_ends(fr.arg1()).is_some() => {
+            read_fd_arm(fr.arg1(), fr.arg2(), fr.arg3())
+        }
+        ring3::nr::SHUTDOWN | ring3::nr::SETSOCKOPT if pair_ends(fr.arg1()).is_some() => 0,
+        akuma_syscalls_abi::x86_64::SENDMSG => sock::sendmsg_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        akuma_syscalls_abi::x86_64::RECVMSG => sock::recvmsg_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::SENDTO => {
             sock::sendto_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), 16)
         }
@@ -3047,9 +4309,53 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // amd64 box needed this row for the same caller).
             sock::getpeername_arm(fr.arg1(), fr.arg2(), fr.arg3())
         }
-        _other => {
+        // The ext2 write path is write-through (every `write_at_by_inode`
+        // reaches the block device before it returns), so a flush has nothing
+        // left to do: git's `fsync` on every pack/idx/loose object was ENOSYS.
+        akuma_syscalls_abi::x86_64::FSYNC | akuma_syscalls_abi::x86_64::FDATASYNC => {
+            if fd_table().with(fr.arg1() as u32, |_| ()).is_some() {
+                let _ = root_fs().sync();
+                0
+            } else {
+                e(ring3::err::EBADF)
+            }
+        }
+        // One CPU, no limits: what the toolchain's thread-count and stack
+        // probes read. RLIMIT_STACK reports the 8 MiB the stack may grow to.
+        akuma_syscalls_abi::x86_64::SCHED_GETAFFINITY => {
+            let (len, mask) = (fr.arg2(), fr.arg3());
+            if len < 8 || !copy_to_user(mask, &1u64.to_le_bytes()) {
+                return e(ring3::err::EINVAL);
+            }
+            8
+        }
+        akuma_syscalls_abi::x86_64::PRLIMIT64 | 97 => {
+            let (res, old) = if fr.rax == 97 { (fr.arg1(), fr.arg2()) } else { (fr.arg2(), fr.arg4()) };
+            if old != 0 {
+                let cur = if res == 3 { STACK_MAX } else { u64::MAX };
+                let mut b = [0u8; 16];
+                b[..8].copy_from_slice(&cur.to_le_bytes());
+                b[8..].copy_from_slice(&u64::MAX.to_le_bytes());
+                if !copy_to_user(old, &b) {
+                    return e(ring3::err::EFAULT);
+                }
+            }
+            0
+        }
+        akuma_syscalls_abi::x86_64::SYNC | akuma_syscalls_abi::x86_64::SYNCFS => {
+            let _ = root_fs().sync();
+            0
+        }
+        akuma_syscalls_abi::x86_64::SIGALTSTACK => sigaltstack_arm(fr.arg1(), fr.arg2()),
+        akuma_syscalls_abi::x86_64::TKILL => tkill_arm(fr.arg1(), fr.arg2()),
+        akuma_syscalls_abi::x86_64::TGKILL => tkill_arm(fr.arg2(), fr.arg3()),
+        akuma_syscalls_abi::x86_64::MEMBARRIER => membarrier_arm(fr.arg1()),
+        other => {
             // A guest task hit a number this table does not serve; the errno
-            // is the answer (the arch-level checklist arm is above).
+            // is the answer (the arch-level checklist arm is above). The
+            // first hit of each number is named on the console, so a probe
+            // run (`rustc`, `git`, `cargo`) yields the gap list for free.
+            nosys_note(other);
             e(ring3::err::ENOSYS)
         }
     }
@@ -3069,12 +4375,17 @@ const MAX_PROGRAMS: usize = 4;
 /// The command line is 512 bytes total; 8×95 cannot overflow it.
 const MAX_ARGV: usize = 16;
 const ARG_LEN: usize = 96;
+/// Environment entries per program (`initenv=`/`thenenv=`, comma-separated,
+/// `KEY=value` with no comma or space in the value).
+const MAX_ENV: usize = 8;
 
 #[derive(Clone, Copy)]
 struct Prog {
     path: [u8; ARG_LEN],
     args: [[u8; ARG_LEN]; MAX_ARGV],
     n_args: usize,
+    env: [[u8; ARG_LEN]; MAX_ENV],
+    n_env: usize,
 }
 
 impl Prog {
@@ -3083,7 +4394,14 @@ impl Prog {
             path: [0; ARG_LEN],
             args: [[0; ARG_LEN]; MAX_ARGV],
             n_args: 0,
+            env: [[0; ARG_LEN]; MAX_ENV],
+            n_env: 0,
         }
+    }
+
+    /// One environment entry.
+    fn env_str(&self, i: usize) -> &str {
+        str_until_nul(&self.env[i])
     }
 
     /// argv[0], as the string it was stored as.
@@ -3103,10 +4421,23 @@ fn str_until_nul(buf: &[u8]) -> &str {
     core::str::from_utf8(&buf[..end]).unwrap_or("")
 }
 
-static mut PROGRAMS: [Prog; MAX_PROGRAMS] = [Prog::new(); MAX_PROGRAMS];
-static mut N_PROGRAMS: usize = 0;
-static mut CURRENT: usize = 0;
-static mut EXIT_CODES: [u64; MAX_PROGRAMS] = [0; MAX_PROGRAMS];
+/// The boot program list, how many entries it holds, which one runs now, and
+/// each one's exit code. Written by `parse_programs` before ring 3 exists, then
+/// by the reaper; read in whole copies so no borrow outlives a call.
+struct Programs {
+    list: [Prog; MAX_PROGRAMS],
+    count: usize,
+    current: usize,
+    exit_codes: [u64; MAX_PROGRAMS],
+}
+
+static PROGRAMS: akuma_primitives::cell::BorrowCell<Programs> =
+    akuma_primitives::cell::BorrowCell::new(Programs {
+        list: [Prog::new(); MAX_PROGRAMS],
+        count: 0,
+        current: 0,
+        exit_codes: [0; MAX_PROGRAMS],
+    });
 
 /// Fill the program list from the boot command line: `init=`/`initargs=`
 /// name the first program (the stage-1/2 token pair, unchanged), each
@@ -3116,25 +4447,30 @@ static mut EXIT_CODES: [u64; MAX_PROGRAMS] = [0; MAX_PROGRAMS];
 fn parse_programs(cmdline: &str) {
     let mut idx = 0usize;
     for token in cmdline.split_ascii_whitespace() {
+        let mut set_env = None;
         let (set_path, set_args) = if let Some(v) = token.strip_prefix("init=") {
             (Some(v), None)
         } else if let Some(v) = token.strip_prefix("initargs=") {
             (None, Some(v))
+        } else if let Some(v) = token.strip_prefix("initenv=") {
+            set_env = Some(v);
+            (None, None)
         } else if let Some(v) = token.strip_prefix("then=") {
             idx += 1;
             (Some(v), None)
         } else if let Some(v) = token.strip_prefix("thenargs=") {
             (None, Some(v))
+        } else if let Some(v) = token.strip_prefix("thenenv=") {
+            set_env = Some(v);
+            (None, None)
         } else {
             (None, None)
         };
-        // SAFETY: the program statics, boot-phase only — no ring 3 exists
-        // while this runs, same discipline as every other boot static.
-        let progs = unsafe { &mut *core::ptr::addr_of_mut!(PROGRAMS) };
         if idx >= MAX_PROGRAMS {
             break;
         }
-        let p = &mut progs[idx];
+        PROGRAMS.with_mut(|t| {
+        let p = &mut t.list[idx];
         if let Some(v) = set_path {
             store_slot(&mut p.path, v);
         }
@@ -3146,12 +4482,20 @@ fn parse_programs(cmdline: &str) {
                 }
             }
         }
+        if let Some(v) = set_env {
+            for a in v.split(',').take(MAX_ENV) {
+                if p.n_env < MAX_ENV {
+                    store_slot(&mut p.env[p.n_env], a);
+                    p.n_env += 1;
+                }
+            }
+        }
+        });
     }
-    // SAFETY: boot-phase only, see above.
-    unsafe {
-        N_PROGRAMS = idx + 1;
-        CURRENT = 0;
-    }
+    PROGRAMS.with_mut(|t| {
+        t.count = idx + 1;
+        t.current = 0;
+    });
 }
 
 fn store_slot(dst: &mut [u8], s: &str) {
@@ -3165,28 +4509,24 @@ fn store_slot(dst: &mut [u8], s: &str) {
 /// stage-1 gate was pinned on (they are per-program now: two tasks, two spawn
 /// lines). Never returns.
 fn run_program(i: usize) -> ! {
-    // SAFETY: boot statics; `CURRENT` is read by the dispatcher's reaper, and
-    // every write here precedes the first crossing of the program it names.
-    let (path, n_args) = unsafe {
-        CURRENT = i;
-        let progs = &*core::ptr::addr_of!(PROGRAMS);
-        (progs[i].path_str(), progs[i].n_args)
-    };
+    // `current` is read by the dispatcher's reaper, and this write precedes the
+    // first crossing of the program it names. The entry is copied out so no
+    // borrow of the table outlives the call.
+    let prog = PROGRAMS.with_mut(|t| {
+        t.current = i;
+        t.list[i]
+    });
+    let (path, n_args) = (prog.path_str(), prog.n_args);
     console::puts("Taoxichuan: init spawn -- init=");
     console::puts(path);
     if n_args > 0 {
         console::puts(" argv=[");
-        // SAFETY: boot statics, see above.
-        let args: [&str; MAX_ARGV] = unsafe {
-            let progs = &*core::ptr::addr_of!(PROGRAMS);
-            let mut a = [""; MAX_ARGV];
-            for (k, slot) in a.iter_mut().enumerate() {
-                if k < n_args {
-                    *slot = progs[i].arg_str(k);
-                }
+        let mut args = [""; MAX_ARGV];
+        for (k, slot) in args.iter_mut().enumerate() {
+            if k < n_args {
+                *slot = prog.arg_str(k);
             }
-            a
-        };
+        }
         for (k, a) in args.iter().enumerate() {
             if k >= n_args {
                 break;
@@ -3214,7 +4554,7 @@ fn run_program(i: usize) -> ! {
     console::puts("\n");
     console::puts("Taoxichuan: stage 1 gate reached -- init spawn (userspace is stage 2)\n");
 
-    spawn(path, &image)
+    spawn(&prog, &image)
 }
 
 /// The dispatcher's reaper, in place of stage 2's `halt()`: report the exit,
@@ -3223,12 +4563,11 @@ fn run_program(i: usize) -> ! {
 /// stub parked is abandoned with the task (the stub restarts at its top on
 /// the next task's first syscall).
 fn task_done(code: u64) -> ! {
-    // SAFETY: boot statics; single core, IF clear, no other reader.
-    let (i, n, path) = unsafe {
-        EXIT_CODES[CURRENT] = code;
-        let progs = &*core::ptr::addr_of!(PROGRAMS);
-        (CURRENT, N_PROGRAMS, progs[CURRENT].path_str())
-    };
+    let (i, n, prog) = PROGRAMS.with_mut(|t| {
+        t.exit_codes[t.current] = code;
+        (t.current, t.count, t.list[t.current])
+    });
+    let path = prog.path_str();
     // The stage-2 gate's own evidence lines, verbatim, on the boot that
     // re-checks that gate; every other program gets the generic line.
     if path == "/bin/hello" {
@@ -3248,7 +4587,7 @@ fn task_done(code: u64) -> ! {
     if i + 1 < n {
         run_program(i + 1);
     }
-    let all_zero = unsafe { EXIT_CODES[..n].iter().all(|&c| c == 0) };
+    let all_zero = PROGRAMS.with(|t| t.exit_codes[..n].iter().all(|&c| c == 0));
     if n >= 2 && all_zero {
         // The stage-3 gate's own line: two kernel-reaped tasks, both clean.
         console::puts("Taoxichuan: stage 3 gate reached -- sequential tasks ran clean, outputs above\n");
@@ -3266,18 +4605,15 @@ fn task_done(code: u64) -> ! {
 /// (`child.rs`) — one loader, one placement story. Runs with the kernel
 /// half live (the physmap does all the copying); the caller chooses the
 /// CR3 moment.
-/// M2 (H3-f): the fork child's address space — an eager, flag-faithful copy
-/// of the caller's whole user half. No CoW on purpose: this kernel has no
-/// page-fault handler (a fault kills the task, the trap arm at the top of
-/// this file), and eager copy is what the ELF loader already does. The root
-/// is built the same way `load_task` builds one (kernel half copied from the
-/// live CR3, user half empty), then the caller's user page tables are cloned
-/// subtree-by-subtree with fresh leaf frames.
-///
-/// Every leaf keeps the parent PTE's own flag bits — RX text must stay RX
-/// (a RW mapping would be NX and the child would fault on its first
-/// instruction), RO data stays RO. Huge (PS) leaves are refused: the loader
-/// maps 4 KiB pages only, and refusing beats silently sharing a 2 MiB page.
+/// M2 (H3-f), copy-on-write since 2026-10-30: the fork child's address space.
+/// The child's user page tables are cloned subtree-by-subtree, but the LEAF
+/// frames are shared with the parent (`clone_user_tree`): a writable leaf is
+/// demoted to read-only + `PTE_COW` in both tables, a read-only leaf is shared
+/// as is, and the first write by either side faults into `cow_resolve`
+/// (`fault_trap`), which copies or takes the frame in place. Only writable
+/// `MAP_SHARED` file mappings are still copied eagerly. The root is built the
+/// same way `load_task` builds one (kernel half copied from the live CR3, user
+/// half empty). Huge (PS) leaves are refused. `docs/reference/memory.md`.
 pub(crate) fn clone_user_half(parent_root: u64, dst_root: u64) -> Option<()> {
     // The `fork_share_memory` pass, INTO a root that already exists —
     // `fork_process` step 1 handed the child a fresh `UserAddressSpace` and
@@ -3286,112 +4622,175 @@ pub(crate) fn clone_user_half(parent_root: u64, dst_root: u64) -> Option<()> {
     // fresh root from the crate shares only amd64's trio 256/257/511, and
     // this kernel's convention is the full upper half). The user half clones
     // the parent's subtrees leaf-by-leaf through `clone_user_tree`.
-    // SAFETY: both roots are PMM-resident page-table frames inside the
-    // physmap; the forking parent is parked and this kernel is single-core
-    // with IF clear — the discipline that owns every page-table touch here.
-    unsafe {
-        let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
-        let ktbl = phys::phys_ptr::<[u64; 512]>(kroot);
-        let dst = phys::phys_ptr::<[u64; 512]>(dst_root);
-        for i in 256..512 {
-            (*dst)[i] = (*ktbl)[i];
-        }
-        let src = phys::phys_ptr::<[u64; 512]>(parent_root);
-        for i in 0..256 {
-            let entry = (*src)[i];
-            if entry & 1 == 0 {
-                continue;
+    // SAFETY: both roots are PMM-resident page-table frames; the forking parent
+    // is parked and this kernel is single-core with IF clear — the discipline
+    // that owns every page-table touch here.
+    let (src, dst) = unsafe { (phys::Frame::from_pa(parent_root), phys::Frame::from_pa(dst_root)) };
+    copy_kernel_half(dst);
+    clone_user_half_into(src, dst)
+}
+
+/// The kernel half of every task root is the live CR3's: one PML4 copy shares
+/// every kernel subtree (physmap, device window, kernel image).
+fn copy_kernel_half(dst: phys::Frame) {
+    // SAFETY: CR3 holds the live PML4 frame.
+    let k = unsafe { phys::Frame::from_pa(akuma_cpu::ctlreg::cr3() & PTE_ADDR) };
+    for i in 256..512 {
+        dst.set_entry(i, k.entry(i));
+    }
+}
+
+/// Clone the user half of `src` (a parked parent's PML4) into `dst`, one PML4
+/// subtree at a time through [`clone_user_tree`]. On failure everything this
+/// pass linked into `dst` is released; the root frame itself stays the caller's.
+fn clone_user_half_into(src: phys::Frame, dst: phys::Frame) -> Option<()> {
+    use akuma_user_tree::{ClonePlan, SharedSpans, X86_64};
+    for i in 0..256 {
+        let entry = src.entry(i);
+        // PML4 entries sit three levels above the leaves.
+        match X86_64.plan_clone(3, entry, false, SharedSpans::Copy) {
+            ClonePlan::Skip => {}
+            ClonePlan::Descend { table } => {
+                let Some(sub) = clone_user_tree(table, 2, (i as u64) << 39) else {
+                    release_cloned_prefix(dst, i);
+                    return None;
+                };
+                dst.set_entry(i, X86_64.relink(entry, sub));
             }
-            if entry & 0x080 != 0 {
-                return None; // a 1 GiB leaf: see fork_share_memory's note
+            // A 1 GiB leaf: see fork_share_memory's note. Release what this pass linked first.
+            ClonePlan::Refuse | ClonePlan::CopyLeaf { .. } | ClonePlan::ShareLeaf { .. } => {
+                release_cloned_prefix(dst, i);
+                return None;
             }
-            let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2)?;
-            (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
         }
     }
     Some(())
 }
 
+/// Give back the first `upto` user PML4 slots a failed clone pass linked into `dst`; the root frame
+/// itself stays the caller's.
+fn release_cloned_prefix(dst: phys::Frame, upto: usize) {
+    for j in 0..upto {
+        if let Some(akuma_user_tree::FreeStep::Table(t)) = akuma_user_tree::X86_64.plan_free(3, dst.entry(j)) {
+            free_subtree(t, 2);
+            dst.set_entry(j, 0);
+        }
+    }
+}
+
 pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
-    let root_page = akuma_pmm::alloc_page_zeroed()?;
-    let root = root_page as u64;
-    let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
-    // SAFETY: both frames are PMM pages inside the physmap; the copy is a
-    // plain RAM write, and the new root is not live until fork's CR3 load.
-    unsafe {
-        let ktbl = phys::phys_ptr::<[u64; 512]>(kroot);
-        let utbl = phys::phys_ptr::<[u64; 512]>(root);
-        for i in 256..512 {
-            (*utbl)[i] = (*ktbl)[i];
-        }
+    let root = phys::Frame::alloc_zeroed()?;
+    // The kernel half is shared by the PML4 copy and must NOT be walked: its
+    // physmap subtree names every physical address the 64 GiB window covers,
+    // holes included, and a leaf copy there would read frames above RAM. The
+    // new root is not live until fork's CR3 load.
+    copy_kernel_half(root);
+    // SAFETY: the forking parent is parked and its root is a page-table frame;
+    // single core, IF clear.
+    let src = unsafe { phys::Frame::from_pa(parent_root) };
+    if clone_user_half_into(src, root).is_none() {
+        akuma_pmm::free_page(root.pa() as usize, akuma_primitives::preempt::current_tid() as u32);
+        return None;
     }
-    // Clone the USER half only, one PML4 subtree at a time. The kernel half
-    // is shared by the PML4 copy above and must NOT be walked: its physmap
-    // subtree names every physical address the 64 GiB window covers, holes
-    // included, and a leaf copy there would read frames above RAM.
-    // SAFETY: as above; the copies read the parent's (parked) tables and
-    // write the new root's, all through the physmap.
-    unsafe {
-        let src = phys::phys_ptr::<[u64; 512]>(parent_root);
-        let dst = phys::phys_ptr::<[u64; 512]>(root);
-        for i in 0..256 {
-            let entry = (*src)[i];
-            if entry & 1 == 0 {
-                continue;
-            }
-            if entry & 0x080 != 0 {
-                return None; // a 1 GiB leaf: see fork_share_memory's note
-            }
-            let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2)?;
-            (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
-        }
-    }
-    Some(root)
+    Some(root.pa())
 }
 
 /// One page-table level of [`fork_share_memory`]'s clone: `depth` counts the
-/// levels BELOW this table (2 = a PDPT, 0 = a leaf PT naming 4 KiB frames).
-/// Each present leaf gets a fresh zeroed frame with the parent's bytes and
-/// the parent entry's flag bits; each interior entry gets a cloned subtree;
-/// huge (PS) leaves are refused at any interior level. Single core, `IF`
-/// clear, the forking parent parked — the discipline that owns every other
-/// page-table touch in this kernel.
+/// levels BELOW this table (2 = a PDPT, 0 = a leaf PT naming 4 KiB frames) and
+/// `va_base` is the address the table's first entry covers.
 ///
-/// SAFETY: `table_pa` must be a PMM-resident page-table frame (physmap
-/// reachable) whose table belongs to the USER half of a parked task's root.
-unsafe fn clone_user_tree(table_pa: u64, depth: u32) -> Option<u64> {
-    let out_page = akuma_pmm::alloc_page_zeroed()?;
-    let out = out_page as u64;
-    // SAFETY: contract above; every load/store is inside the physmap.
-    unsafe {
-        let src = phys::phys_ptr::<[u64; 512]>(table_pa);
-        let dst = phys::phys_ptr::<[u64; 512]>(out);
-        for i in 0..512 {
-            let entry = (*src)[i];
-            if entry & 1 == 0 {
-                continue; // not present
+/// Leaves are SHARED, not copied (copy-on-write): the child's entry names the
+/// parent's frame, `cow_ref_inc` counts the second holder, and a writable
+/// leaf is demoted to read-only + `PTE_COW` in BOTH tables (the parent's
+/// `invlpg`'d — a stale writable translation would write straight into the
+/// shared frame, silently). A leaf that was already read-only keeps its flags
+/// (text stays RX; no marker, so a write to it is still a kill). The one
+/// exception is a writable `MAP_SHARED` file mapping (`t.shared`): those stay
+/// eager per-process copies, the writeback model they run under. Interior
+/// entries get a cloned subtree; huge (PS) leaves are refused. Single core,
+/// `IF` clear, the forking parent parked.
+///
+/// On failure the partial subtree is released (through `free_page`, so the
+/// counts taken so far are dropped) — a refused fork leaks nothing.
+///
+/// `table_pa` must be a PMM-resident page-table frame whose table belongs to the
+/// USER half of a parked task's root (every caller reads it from a present entry
+/// of one).
+fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
+    use akuma_user_tree::{ClonePlan, SharedSpans, X86_64};
+    let dst = phys::Frame::alloc_zeroed()?;
+    let out = dst.pa();
+    let shift = 12 + 9 * depth;
+    // SAFETY: contract above.
+    let src = unsafe { phys::Frame::from_pa(table_pa) };
+    for i in 0..512 {
+        let entry = src.entry(i);
+        let va = va_base | ((i as u64) << shift);
+        // The decisions (skip / refuse / descend / copy / share-and-demote) are `akuma-user-tree`'s, host-tested
+        // against a fake tree; this loop performs them. A writable `MAP_SHARED` file span is copied (`SharedSpans::Copy`).
+        let plan = X86_64.plan_clone(depth, entry, depth == 0 && in_shared_span(va), SharedSpans::Copy);
+        match plan {
+            ClonePlan::Skip => {}
+            ClonePlan::Refuse => {
+                free_subtree(out, depth);
+                return None; // a huge page: see fork_share_memory's note
             }
-            if depth == 0 {
-                let old = entry & 0x000f_ffff_ffff_f000;
-                let frame = akuma_pmm::alloc_page_zeroed()? as u64;
-                core::ptr::copy_nonoverlapping(
-                    phys::phys_ptr::<u8>(old),
-                    phys::phys_ptr::<u8>(frame),
-                    4096,
-                );
-                // The flag bits (present/RW/US/accessed/dirty/NX, 0-11 and
-                // 52-63) ride along verbatim; only the frame number is new.
-                (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | frame;
-            } else {
-                if entry & 0x080 != 0 {
-                    return None; // a huge page: see fork_share_memory's note
+            ClonePlan::Descend { table } => {
+                let Some(sub) = clone_user_tree(table, depth - 1, va) else {
+                    free_subtree(out, depth);
+                    return None;
+                };
+                dst.set_entry(i, X86_64.relink(entry, sub));
+            }
+            ClonePlan::CopyLeaf { old } => {
+                let Some(frame) = phys::Frame::alloc_zeroed() else {
+                    free_subtree(out, depth);
+                    return None;
+                };
+                // SAFETY: `old` is the frame this present leaf maps.
+                frame.copy_page_from(unsafe { phys::Frame::from_pa(old) });
+                dst.set_entry(i, X86_64.relink(entry, frame.pa()));
+            }
+            ClonePlan::ShareLeaf { frame, parent_entry, child_entry, demoted } => {
+                akuma_pmm::cow_ref_inc(frame as usize);
+                if demoted {
+                    // The parent's entry changes: its TLB may hold the page writable.
+                    src.set_entry(i, parent_entry);
+                    akuma_cpu::tlb::invlpg(va as usize);
                 }
-                let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, depth - 1)?;
-                (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
+                dst.set_entry(i, child_entry);
+                COW_SHARED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
     }
     Some(out)
+}
+
+/// Is `va` inside a writable `MAP_SHARED` file mapping of the running task?
+fn in_shared_span(va: u64) -> bool {
+    let t = task();
+    t.shared[..t.n_shared].iter().any(|&(base, len, ..)| va >= base && va < base + len)
+}
+
+/// Release a page-table subtree built by [`clone_user_tree`]: `depth` levels
+/// below `table_pa` (0 = a leaf table). Leaves go through `free_page` (a
+/// shared frame only loses a count); the tables are never shared.
+///
+/// SAFETY-adjacent contract: `table_pa` is a table frame of the caller's own
+/// half-built tree, unreachable from any live root.
+fn free_subtree(table_pa: u64, depth: u32) {
+    use akuma_user_tree::{FreeStep, X86_64};
+    let tid = akuma_primitives::preempt::current_tid() as u32;
+    // SAFETY: the frame is a PMM page-table frame owned by the caller.
+    let table = unsafe { phys::Frame::from_pa(table_pa) };
+    for i in 0..512 {
+        match X86_64.plan_free(depth, table.entry(i)) {
+            None => {}
+            Some(FreeStep::Leaf(f)) => akuma_pmm::free_page(f as usize, tid),
+            Some(FreeStep::Table(t)) => free_subtree(t, depth - 1),
+        }
+    }
+    akuma_pmm::free_page(table_pa as usize, tid);
 }
 
 fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
@@ -3402,6 +4801,11 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     t.fd_nonblock = fdtable::FlagSet::new();
     t.exit = None;
     t.mmap_cur = MMAP_BASE;
+    t.holes.clear();
+    t.n_shared = 0;
+    t.sigalt = SIGALT_OFF;
+    // execve: caught handlers go back to SIG_DFL, ignored ones stay ignored.
+    t.sigact.reset_for_exec();
     // A fresh address space, a fresh region list: `user_ok` checks against
     // exactly what THIS image mapped. Without the reset the 16 region slots
     // fill across spawns and an exec would panic on the append.
@@ -3411,19 +4815,10 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // (one PML4 copy shares every kernel subtree — physmap, device window,
     // kernel image), whose lower half holds only the task. The kernel's own
     // root keeps its identity map; the task's root simply has none.
-    let root_page = akuma_pmm::alloc_page_zeroed()?;
-    let root = root_page as u64;
-    let kroot = akuma_cpu::ctlreg::cr3() & 0x000f_ffff_ffff_f000;
-    // SAFETY: both frames are PMM/established pages inside the physmap; the
-    // copies are plain RAM writes through the physmap, and the task's tables
-    // are not live until the CR3 load below.
-    unsafe {
-        let ktbl = phys::phys_ptr::<[u64; 512]>(kroot);
-        let utbl = phys::phys_ptr::<[u64; 512]>(root);
-        for i in 256..512 {
-            (*utbl)[i] = (*ktbl)[i];
-        }
-    }
+    // The task's tables are not live until the CR3 load below.
+    let root_frame = phys::Frame::alloc_zeroed()?;
+    copy_kernel_half(root_frame);
+    let root = root_frame.pa();
     t.root_pa = root;
 
     // Place every PT_LOAD at its link address, page by page: fresh zeroed
@@ -3441,8 +4836,8 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
         let file = img.segment_bytes(seg);
         let mut pva = first;
         while pva < last {
-            let pa = akuma_pmm::alloc_page_zeroed()?;
-            if !paging::map_page_in(root, pva as usize, pa as u64, pte, MemAttr::WriteBack) {
+            let frame = phys::Frame::alloc_zeroed()?;
+            if !paging::map_page_in(root, pva as usize, frame.pa(), pte, MemAttr::WriteBack) {
                 return None;
             }
             // The page's overlap with the segment's file-backed range.
@@ -3450,12 +4845,9 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
             let to = (pva + 4096).min(seg.vaddr + seg.filesz);
             if from < to {
                 let src = &file[(from - seg.vaddr) as usize..(to - seg.vaddr) as usize];
-                // SAFETY: `pa` is this page's fresh frame; `from - pva` stays
-                // inside it because `from >= pva` and `to <= pva + 4096`.
-                let dst = phys::phys_ptr::<u8>(pa as u64 + (from - pva));
-                unsafe {
-                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
-                }
+                // `from - pva` stays inside the frame because `from >= pva` and
+                // `to <= pva + 4096` (`write_bytes` checks it anyway).
+                frame.write_bytes((from - pva) as usize, src);
             }
             placed += 1;
             pva += 4096;
@@ -3478,7 +4870,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
             // Read through the same bounded symlink chain as the program:
             // Alpine's `/lib/ld-musl-x86_64.so.1` is a link, not a file.
             let eff = resolve_effective(ipath);
-            let Ok(ldso) = root_fs().read_file(&eff) else {
+            let Ok(ldso) = read_image(&eff) else {
                 console::puts("  exec: PT_INTERP unreadable: ");
                 console::puts(&eff);
                 console::puts("\n");
@@ -3498,7 +4890,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                 let last = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
                 let mut pva = first;
                 while pva < last {
-                    let pa = akuma_pmm::alloc_page_zeroed()?;
+                    let frame = phys::Frame::alloc_zeroed()?;
                     let pte = if seg.flags & akuma_elf_exec::PF_X != 0 {
                         PteProt::USER_RX
                     } else if seg.flags & akuma_elf_exec::PF_W != 0 {
@@ -3506,7 +4898,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                     } else {
                         PteProt::USER_RO
                     };
-                    if !paging::map_page_in(root, pva as usize, pa as u64, pte, MemAttr::WriteBack) {
+                    if !paging::map_page_in(root, pva as usize, frame.pa(), pte, MemAttr::WriteBack) {
                         return None;
                     }
                     // The page's overlap with the segment's file-backed range.
@@ -3523,13 +4915,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                         let off = seg.offset + (from - seg.vaddr);
                         let end = seg.offset + (to - seg.vaddr);
                         let bytes = &ldso[off as usize..end as usize];
-                        // SAFETY: `pa` is this page's fresh frame; `from - pva`
-                        // stays inside it because `from >= pva` and
-                        // `to <= pva + 4096` — the program loop's argument.
-                        let dst = phys::phys_ptr::<u8>(pa as u64 + (from - pva));
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
-                        }
+                        frame.write_bytes((from - pva) as usize, bytes);
                     }
                     if last > hi {
                         hi = last;
@@ -3555,14 +4941,12 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // The stack, then the initial block on it. The block is < half a page and
     // ends at `USER_STACK_TOP`, so it lands entirely in the top page.
     let stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
-    let mut stack_top_pa = 0u64;
+    let mut stack_frames = [None::<phys::Frame>; USER_STACK_PAGES as usize];
     let mut pva = stack_base;
     while pva < USER_STACK_TOP {
-        let pa = akuma_pmm::alloc_page_zeroed()?;
-        if pva + 4096 == USER_STACK_TOP {
-            stack_top_pa = pa as u64;
-        }
-        if !paging::map_page_in(root, pva as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
+        let frame = phys::Frame::alloc_zeroed()?;
+        stack_frames[((pva - stack_base) / 4096) as usize] = Some(frame);
+        if !paging::map_page_in(root, pva as usize, frame.pa(), PteProt::USER_RW, MemAttr::WriteBack) {
             return None;
         }
         pva += 4096;
@@ -3594,23 +4978,26 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // parsed that duplicate as a package name ("unable to select packages:
     // apk.static (no such package)") while `--version` (G2) and `sh -c`
     // (G1, the dup landed as $0) never noticed.
-    let mut full_argv: [&str; MAX_ARGV] = [""; MAX_ARGV];
-    let n_args = argv.len().min(MAX_ARGV);
-    full_argv[..n_args].copy_from_slice(&argv[..n_args]);
+    // No fixed argv/env caps here: the block below is sized in pages. rustc's
+    // linker line is ~50 arguments and `collect2` hands `ld` all of them (the
+    // old 16-entry copy truncated it: `ld: no input files`).
+    let full_argv: &[&str] = argv;
+    let n_args = argv.len();
     // One full page, not the old 512: `build_stack` lays the block out from
     // `buf.len()` backwards and `apk`'s long argv/env (`--allow-untrusted add
     // /pkgs/...` plus sshd's environment) overran 512 by exactly the 8 bytes
     // of one pointer word — the underflowed slice index panicked the kernel
     // on the first real install. The block still ends at `USER_STACK_TOP` and
     // now fills the top page exactly, which the copy below already handles.
-    let mut block = [0u8; 4096];
+    const BLOCK_PAGES: usize = ARG_BLOCK_PAGES;
+    let mut block = alloc::vec![0u8; BLOCK_PAGES * 4096];
     let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &full_argv[..n_args], env, &aux);
 
-    // SAFETY: the top stack page is a mapped task frame; the block ends at
-    // `USER_STACK_TOP`, so its bytes sit at `page_pa + (4096 - block.len())`.
-    let dst = phys::phys_ptr::<u8>(stack_top_pa + (4096 - block.len() as u64));
-    unsafe {
-        core::ptr::copy_nonoverlapping(block.as_ptr(), dst, block.len());
+    // The block ends at `USER_STACK_TOP`, so it fills the top `BLOCK_PAGES` pages.
+    for k in 0..BLOCK_PAGES {
+        if let Some(frame) = stack_frames[USER_STACK_PAGES as usize - BLOCK_PAGES + k] {
+            frame.write_bytes(0, &block[k * 4096..(k + 1) * 4096]);
+        }
     }
 
     // The heap slabs: `brk` above the image, `mmap` in its own window. Both
@@ -3618,12 +5005,74 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     let brk0 = (img.image_end() + 0xFFF) & !0xFFF;
     t.brk_base = brk0;
     t.brk_cur = brk0;
-    t.brk_end = brk0 + SLAB;
+    t.brk_end = brk0 + BRK_SLAB;
     add_region(brk0, t.brk_end);
-    add_region(MMAP_BASE, MMAP_BASE + SLAB);
+    add_region(MMAP_BASE, MMAP_BASE + MMAP_SLAB);
 
     let _ = placed;
     Some(TaskImage { root_pa: root, entry: cross_entry, rsp })
+}
+
+/// Free a lower-half address space the loader built by hand: every leaf frame
+/// (through `free_page`, so a CoW-shared frame only drops its count), every
+/// page-table frame, and the root. The upper half is the kernel's, shared
+/// with every root, and is never touched. Returns the pages released
+/// (leaves + tables + root). The root must not be the active CR3.
+pub(crate) fn free_user_root(root: u64) -> usize {
+    const PRESENT: u64 = 1;
+    const LARGE: u64 = 1 << 7;
+    const ADDR: u64 = 0x000f_ffff_ffff_f000;
+    if root == 0 || root == (akuma_cpu::ctlreg::cr3() & ADDR) {
+        return 0;
+    }
+    let tid = akuma_primitives::preempt::current_tid() as u32;
+    let mut n = 0usize;
+    // Every frame named below is a page-table frame this walk reached from a
+    // present, non-large entry of a root the loader built.
+    let table = |pa: u64| {
+        // SAFETY: as above.
+        unsafe { phys::Frame::from_pa(pa) }
+    };
+    let l4 = table(root);
+    for i4 in 0..256 {
+        let e4 = l4.entry(i4);
+        if e4 & PRESENT == 0 {
+            continue;
+        }
+        let p3 = e4 & ADDR;
+        for i3 in 0..512 {
+            let e3 = table(p3).entry(i3);
+            if e3 & PRESENT == 0 {
+                continue;
+            }
+            if e3 & LARGE != 0 {
+                continue; // never built by the loader; not ours to guess
+            }
+            let p2 = e3 & ADDR;
+            for i2 in 0..512 {
+                let e2 = table(p2).entry(i2);
+                if e2 & PRESENT == 0 || e2 & LARGE != 0 {
+                    continue;
+                }
+                let p1 = e2 & ADDR;
+                for i1 in 0..512 {
+                    let e1 = table(p1).entry(i1);
+                    if e1 & PRESENT != 0 {
+                        akuma_pmm::free_page((e1 & ADDR) as usize, tid);
+                        n += 1;
+                    }
+                }
+                akuma_pmm::free_page(p1 as usize, tid);
+                n += 1;
+            }
+            akuma_pmm::free_page(p2 as usize, tid);
+            n += 1;
+        }
+        akuma_pmm::free_page(p3 as usize, tid);
+        n += 1;
+    }
+    akuma_pmm::free_page(root as usize, tid);
+    n + 1
 }
 
 /// Where a loaded task starts: the root for CR3, the entry, the stack.
@@ -3635,16 +5084,13 @@ pub struct TaskImage {
 
 /// Load the image, build the task's address space, and cross. Never returns:
 /// the task ends in the dispatcher's `exit` or the trap handler's `[Fault]`.
-fn spawn(path: &str, image: &[u8]) -> ! {
+fn spawn(p: &Prog, image: &[u8]) -> ! {
+    let path = p.path_str();
     if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
         akuma_primitives::safe_print!(160, "  init: ELF refused: bad magic\n");
         halt();
     }
-    // SAFETY: boot statics; read before the crossing that consumes the copy.
-    let (argv, n_args) = unsafe {
-        let progs = &*core::ptr::addr_of!(PROGRAMS);
-        let cur = CURRENT;
-        let p = &progs[cur];
+    let (argv, n_args, envv, n_env) = {
         let mut a: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
         for k in 0..p.n_args {
             a[k + 1] = p.arg_str(k);
@@ -3652,9 +5098,14 @@ fn spawn(path: &str, image: &[u8]) -> ! {
         let n = p.n_args;
         let mut owned: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
         owned[1..=n].copy_from_slice(&a[1..=n]);
-        (owned, n)
+        let mut env: [&str; MAX_ENV] = [""; MAX_ENV];
+        #[allow(clippy::needless_range_loop)] // `k` also indexes `p`
+        for k in 0..p.n_env {
+            env[k] = p.env_str(k);
+        }
+        (owned, n, env, p.n_env)
     };
-    let Some(ti) = load_task(&argv[..=n_args], &[], image) else {
+    let Some(ti) = load_task(&argv[..=n_args], &envv[..n_env], image) else {
         akuma_primitives::safe_print!(160, "  init: task load failed\n");
         halt();
     };
@@ -3751,7 +5202,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // no processes, no page cache and no retired list (each is a `|| 0`).
     if !mem::init(&machine, false, akuma_pmm::PmmHooks {
         heap_reclaim: || 0,
-        drain_retired: || 0,
+        drain_retired: akuma_exec::process::reclaim::drain_retired_under_pressure,
         evict_clean_file_pages: |_| 0,
         shrink_page_cache: |_| 0,
     }) {
@@ -3780,10 +5231,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     console::puts("  fs:   ext2 root mounted on /dev/vda\n");
     // Publish the mount for the dispatcher's fd syscalls (`ROOT_FS` above);
     // from here on the local binding is dead.
-    // SAFETY: boot phase, one core, no ring 3 yet.
-    unsafe {
-        *core::ptr::addr_of_mut!(ROOT_FS) = Some(fs);
-    }
+    // The mount lives for the rest of the boot: leak it to a `'static` borrow.
+    ROOT_FS.set(Some(alloc::boxed::Box::leak(alloc::boxed::Box::new(fs))));
 
     // Stage 4: the network path — calibrate the TSC against the PIT, pull up
     // smoltcp on virtio-net, wait (bounded, pumping the NIC) for DHCP. A
@@ -3811,6 +5260,12 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // / gettimeofday keep their stage-4 answers. This is *written new*
     // (guest-cmdline policy): the metal's anchors are RTC/NTP mechanisms
     // (`akuma-cmos-rtc`, `akuma-sntp`), neither reachable under this guest.
+    if let Some(n) = cmdline_token(hvm_start_info, "mmdbg=", &mut [0u8; 8]).and_then(|v| v.parse::<u32>().ok()) {
+        MMDBG_V.store(n, core::sync::atomic::Ordering::Relaxed);
+    }
+    if cmdline_token(hvm_start_info, "wx=", &mut [0u8; 4]) == Some("0") {
+        WX_ENFORCE.store(false, core::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(e) = cmdline_token(hvm_start_info, "epoch=", &mut [0u8; 32]) {
         match e.parse::<u64>() {
             Ok(secs) => {
@@ -3887,9 +5342,7 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
 /// (pf-5's VM exit printed nothing).
 pub(crate) fn raw_uart(bytes: &[u8]) {
     for &b in bytes {
-        unsafe {
-            core::arch::asm!("out dx, al", in("dx") 0x3f8u16, in("al") b, options(nostack, preserves_flags));
-        }
+        akuma_port::COM1.write(akuma_port::UartReg::Data, b);
     }
 }
 
@@ -3913,7 +5366,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     if let Some(loc) = info.location() {
         raw_uart(loc.file().as_bytes());
         raw_uart(b":");
-        raw_dec(loc.line() as u64);
+        raw_dec(u64::from(loc.line()));
     }
     raw_uart(b"\n");
     akuma_primitives::safe_print!(256, "       {}\n", info.message());

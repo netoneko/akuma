@@ -82,3 +82,4 @@ pub mod madvise;
 pub mod membarrier;
 pub mod mmap;
 pub mod mremap;
+pub mod wx;

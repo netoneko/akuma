@@ -54,6 +54,7 @@ dependencies = [
  "akuma-syscalls-log",
  "akuma-syscalls-mem",
  "akuma-syscalls-poll",
+ "akuma-syscalls-signal",
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
  "akuma-timer",
@@ -105,6 +106,7 @@ dependencies = [
  "akuma-fdtable",
  "akuma-fpcache",
  "akuma-fpcache-rw",
+ "akuma-fpu-amd64",
  "akuma-gdt",
  "akuma-hda",
  "akuma-hid",
@@ -388,6 +390,10 @@ dependencies = [
 
 [[package]]
 name = "akuma-fpcache-rw"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-fpu-amd64"
 version = "0.1.0"
 
 [[package]]
@@ -766,6 +772,7 @@ dependencies = [
  "akuma-syscalls-mem",
  "akuma-syscalls-net",
  "akuma-syscalls-poll",
+ "akuma-syscalls-signal",
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
  "akuma-timer",
@@ -813,6 +820,7 @@ dependencies = [
 name = "akuma-syscalls-net"
 version = "0.1.0"
 dependencies = [
+ "akuma-net",
  "akuma-syscalls-linux",
 ]
 
@@ -823,6 +831,10 @@ dependencies = [
  "akuma-primitives",
  "akuma-syscalls-linux",
 ]
+
+[[package]]
+name = "akuma-syscalls-signal"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-syscalls-sync"
@@ -923,6 +935,10 @@ dependencies = [
  "akuma-primitives",
  "spinning_top",
 ]
+
+[[package]]
+name = "akuma-user-tree"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-vfs"
@@ -1270,15 +1286,18 @@ dependencies = [
  "akuma-alloc",
  "akuma-boot-amd64",
  "akuma-comconsole",
+ "akuma-cow",
  "akuma-cpu",
  "akuma-elf-exec",
  "akuma-exec",
  "akuma-ext2",
  "akuma-fdtable",
+ "akuma-fpu-amd64",
  "akuma-gdt",
  "akuma-idt-amd64",
  "akuma-isolation",
  "akuma-lapic-amd64",
+ "akuma-mmap",
  "akuma-mmu",
  "akuma-net",
  "akuma-pipes",
@@ -1290,10 +1309,15 @@ dependencies = [
  "akuma-syscalls-abi",
  "akuma-syscalls-eventfd",
  "akuma-syscalls-linux",
+ "akuma-syscalls-mem",
+ "akuma-syscalls-net",
  "akuma-syscalls-poll",
+ "akuma-syscalls-signal",
+ "akuma-syscalls-sync",
  "akuma-threading",
  "akuma-trap-amd64",
  "akuma-tty",
+ "akuma-user-tree",
  "akuma-vfs",
  "akuma-virtio",
  "spinning_top",

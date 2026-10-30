@@ -47,23 +47,18 @@ pub const NO_SLOT: usize = usize::MAX;
 /// The one sanctioned "which slot is running" static on this kernel. Every
 /// other per-task value lives in `child.rs`'s per-slot table, indexed
 /// **through here**.
-static mut CURRENT: usize = NO_SLOT;
+static CURRENT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(NO_SLOT);
 
 /// The spawn-ring slot of the child running now, or [`NO_SLOT`] for the boot
 /// task. One-core stub; the SMP slice puts `%gs` behind this body.
 #[must_use]
 pub fn current_slot() -> usize {
-    // SAFETY: single core, IF clear (syscall path or boot) — the discipline
-    // that owns this module's static, as `child.rs`'s.
-    unsafe { core::ptr::read_volatile(&raw const CURRENT) }
+    CURRENT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Record the slot running now. Called on every crossing in and out.
 pub fn set_current_slot(slot: usize) {
-    // SAFETY: as `current_slot`.
-    unsafe {
-        *core::ptr::addr_of_mut!(CURRENT) = slot;
-    }
+    CURRENT.store(slot, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// The threading tid the CURRENT M2 shell is registered under. The shell's
@@ -74,20 +69,16 @@ pub fn set_current_slot(slot: usize) {
 /// this recorded tid now (session pe boot D/E: the wake switched the shell
 /// back under `sched_root_of(2)` = a stale fork-child record, and the shell
 /// resumed on an exec-swept address space whose stack pages read zero).
-static mut SHELL_THREAD_TID: usize = 0;
+static SHELL_THREAD_TID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// The spawn crossing names the shell's threading tid. SAFETY: syscall-path
-/// discipline (single core, IF clear), as `CURRENT`.
+/// The spawn crossing names the shell's threading tid.
 pub fn set_shell_tid(tid: usize) {
-    unsafe {
-        *core::ptr::addr_of_mut!(SHELL_THREAD_TID) = tid;
-    }
+    SHELL_THREAD_TID.store(tid, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// SAFETY: as [`set_shell_tid`].
 #[must_use]
 pub fn shell_tid() -> usize {
-    unsafe { core::ptr::read_volatile(&raw const SHELL_THREAD_TID) }
+    SHELL_THREAD_TID.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// The twin's clock: ticks × 10 ms. `saturating_mul` so a ~584-million-year
@@ -111,7 +102,7 @@ pub fn uptime_us() -> u64 {
 /// below, CR3 untouched — it runs on the kernel root). `from` needs nothing:
 /// the crate saves its context.
 fn switch_to(from: usize, to: usize) {
-    let _ = from;
+    fx_save(from);
     // (session pg: the per-switch `[tmp] sw to=` print lived here — at
     // preemption scale it rotated the console log every ~30 s and ate the
     // gate verdicts; removed before the first gate boot per PLAN-pg §5.)
@@ -152,35 +143,64 @@ fn switch_to(from: usize, to: usize) {
     // per switch, incoming slot's shadow; the idle thread (to >= NSLOTS)
     // runs kernel code only and is skipped.
     let _ = akuma_cpu::msr::set_fs_base(crate::child::slot_fs_of(to));
+    fx_restore(to);
+}
+
+/// One task's `fxsave` image: x87/MMX/SSE state. The kernel is soft-float, so
+/// at a switch the registers still hold the OUTGOING task's user values, and
+/// without this every preemption or park handed them to whichever task ran
+/// next - LLVM's vector code in rustc's codegen threads then computed garbage
+/// (an out-of-range index that spelled "loss", a `free()` of a misaligned
+/// pointer). XSAVE/AVX is never enabled here, so the legacy area is the whole
+/// state (`docs/archive/AMD64_SMP_BRINGUP.md` has the amd64 twin of this).
+#[repr(C, align(16))]
+struct FxArea([u8; akuma_fpu_amd64::LEGACY_SIZE]);
+
+/// The power-on x87/SSE state (`akuma-fpu-amd64`: `FCW = 0x037F`, `MXCSR = 0x1F80`,
+/// every SSE exception masked; all-zero would unmask them and the first `divss` traps).
+const fn fx_init() -> FxArea {
+    FxArea(akuma_fpu_amd64::initial_legacy())
+}
+
+/// One area per ring slot plus the idle thread (`IDLE_TID`). Single core, IF
+/// clear at every switch; the CPU reads and writes an area through its raw
+/// pointer (`BorrowCell::as_ptr`), Rust code only ever replaces one whole.
+static FX: [akuma_primitives::cell::BorrowCell<FxArea>; crate::child::NSLOTS + 1] =
+    [const { akuma_primitives::cell::BorrowCell::new(fx_init()) }; crate::child::NSLOTS + 1];
+
+fn fx_save(slot: usize) {
+    if slot <= crate::child::NSLOTS {
+        // SAFETY: `FX[slot]` is a 16-byte-aligned 512-byte area; `fxsave64`
+        // writes exactly that and touches no flags.
+        unsafe {
+            core::arch::asm!("fxsave64 [{}]", in(reg) FX[slot].as_ptr().cast::<u8>(), options(nostack, preserves_flags));
+        }
+    }
+}
+
+fn fx_restore(slot: usize) {
+    if slot <= crate::child::NSLOTS {
+        // SAFETY: as `fx_save`; every area holds either `fx_init()` or an
+        // image `fxsave64` wrote, both valid `fxrstor64` inputs.
+        unsafe {
+            core::arch::asm!("fxrstor64 [{}]", in(reg) FX[slot].as_ptr().cast_const().cast::<u8>(), options(nostack, preserves_flags, readonly));
+        }
+    }
+}
+
+/// A slot is being given to a new task: it starts from the power-on state, not
+/// the previous occupant's registers.
+pub fn fx_reset(slot: usize) {
+    if slot <= crate::child::NSLOTS {
+        // The claim path (IF clear); the slot is not running.
+        FX[slot].set(fx_init());
+    }
 }
 
 /// The idle thread's tid: outside the spawn ring (children claim 1..NSLOTS,
 /// the shell is 0), so no array index collides. Its stack is leaked once,
 /// below; its CR3 is the kernel's (sched_root_of answers 0).
 pub const IDLE_TID: usize = crate::child::NSLOTS;
-
-static IDLE_STACK: spin_idle::Once<U64Arr> = spin_idle::Once::NEW;
-type U64Arr = alloc::boxed::Box<[u64; 2048]>;
-mod spin_idle {
-    //! One-shot init for the idle stack — `Once` without a lock dependency
-    //! (single core, IF clear at every caller).
-    pub struct Once<T>(core::cell::UnsafeCell<Option<T>>);
-    impl<T> Once<T> {
-        pub const NEW: Self = Once(core::cell::UnsafeCell::new(None));
-        /// SAFETY: single core, IF clear (the registration path).
-        pub fn call(&self, make: impl FnOnce() -> T) -> *mut T {
-            unsafe {
-                let p = &mut *self.0.get();
-                if p.is_none() {
-                    *p = Some(make());
-                }
-                p.as_mut().unwrap_unchecked()
-            }
-        }
-    }
-    // SAFETY: only touched from the single-core IF-clear path.
-    unsafe impl<T> Sync for Once<T> {}
-}
 
 extern "C" fn idle_main() -> ! {
     // The idle loop: keep the tick alive (one `sti` window per lap — the
@@ -198,6 +218,8 @@ extern "C" fn idle_main() -> ! {
     // spinning idle lap's netpoll cannot receive what the starved relay
     // cannot run to deliver. The 100 Hz tick wakes the halt; the yield
     // check stays after the lap.
+    #[cfg(feature = "trace-err")]
+    let mut idle_laps = 0u32;
     loop {
         // The NIC pump: one poll per lap (per tick-wake now). The idle lap
         // is the everything-path's last resort — an all-parked system used
@@ -205,9 +227,20 @@ extern "C" fn idle_main() -> ! {
         crate::net::netpoll();
         crate::exec_twin::tick_window();
         if akuma_threading::x86_runnable_exists() {
+            #[cfg(feature = "trace-err")]
+            {
+                idle_laps = 0;
+            }
             akuma_threading::x86_yield();
         } else {
             crate::net::wait_lap();
+            #[cfg(feature = "trace-err")]
+            {
+                idle_laps += 1;
+                if idle_laps == 2000 {
+                    crate::trace_hang_dump(4);
+                }
+            }
         }
     }
 }
@@ -215,9 +248,8 @@ extern "C" fn idle_main() -> ! {
 /// Seed the idle thread once (from `init`): claim nothing — the tid is ours
 /// by const — seed the entry, publish READY.
 fn seed_idle() {
-    // SAFETY: single core, IF clear — the registration path owns the Once.
-    let stack: &'static mut [u64; 2048] =
-        unsafe { &mut *IDLE_STACK.call(|| alloc::boxed::Box::new([0u64; 2048])) };
+    // Called once from `init`; the stack is leaked for the life of the kernel.
+    let stack: &'static mut [u64; 2048] = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u64; 2048]));
     let top = ((core::ptr::from_mut(stack) as *const u64 as usize) + 2048 * 8) & !0xf;
     akuma_threading::x86_seed_entry(IDLE_TID, top, idle_main);
     akuma_threading::x86_publish(IDLE_TID);
@@ -231,26 +263,15 @@ fn seed_idle() {
 /// The idle loop's clock feeder — the same one-instruction window
 /// [`allow_tick`] opens, under a name the idle thread can reach.
 pub fn tick_window() {
-    // SAFETY: `sti`/`cli` at ring 0 touch no memory or stack; the window is
-    // one instruction wide and the tick handler is bounded, so the worst a
+    // One instruction wide, and the tick handler is bounded, so the worst a
     // tick in the window does is count.
-    unsafe {
-        core::arch::asm!("sti", "nop", "cli", options(nomem, nostack, preserves_flags));
-    }
+    akuma_cpu::park::irq_window();
 }
 
-fn allow_tick() {    // SAFETY: `sti`/`cli` are unconditionally executable at ring 0 and touch
-    // no memory or stack; the window is one instruction wide and the tick
-    // handler (`timer_trap`) is bounded and allocation-free, so the worst a
-    // tick in the window does is count.
-    unsafe {
-        core::arch::asm!(
-            "sti",
-            "nop",
-            "cli",
-            options(nomem, nostack, preserves_flags)
-        );
-    }
+fn allow_tick() {
+    // The window is one instruction wide and the tick handler (`timer_trap`) is
+    // bounded and allocation-free, so the worst a tick in the window does is count.
+    akuma_cpu::park::irq_window();
 }
 
 // ── registration ────────────────────────────────────────────────────────────
@@ -297,6 +318,7 @@ pub fn init() {
         prepare_task_slot: crate::child::prepare_task_slot,
     });
     seed_idle();
+    akuma_exec::process::reserve_pid_floor(2);
 }
 
 /// The spawn ring's width, for `can_run`'s bounds check.
@@ -473,7 +495,7 @@ fn exec_runtime() -> ExecRuntime {
         // child's fresh `UserAddressSpace` root.
         fork_share_memory: twin_fork_share_memory,
         // The child's CR3 + spawn-row binding — the twin's slot binding.
-        bind_child_task: |tid, child, _kind| twin_bind_child_task(tid, child),
+        bind_child_task: |tid, child, kind| twin_bind_child_task(tid, child, kind),
     }
 }
 
@@ -498,9 +520,15 @@ fn twin_fork_share_memory(
 fn twin_bind_child_task(
     tid: usize,
     child: &akuma_exec::process::Process,
+    kind: akuma_exec::process::ChildKind,
 ) -> Result<(), &'static str> {
     let root = child.address_space.l0_phys() as u64;
-    crate::child::bind_child_task(tid, child.pid, root)
+    crate::child::bind_child_task(
+        tid,
+        child.pid,
+        root,
+        kind == akuma_exec::process::ChildKind::Thread,
+    )
 }
 
 /// `ExecRuntime::enter_user` — the child's first and only crossing into ring
@@ -523,7 +551,7 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
         // child's image and the shared kernel half; the load is the same one
         // `child_enter` performs at every crossing.
         unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags))
+            core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
         };
     }
     let ef = akuma_ring3_amd64::EntryFrame {

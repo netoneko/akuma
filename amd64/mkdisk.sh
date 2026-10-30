@@ -151,13 +151,13 @@ fi
 # is its own root — see `userspace/Cargo.toml`'s comment on the
 # submodule-backed crates), hence `--manifest-path` rather than `-p tcc`.
 # `TCC_LIBTCC1` is the runtime archive + tcc's own internal headers
-# (`libtcc1-x86_64.tar` — named apart from aarch64's `libtcc1.tar` so one
+# (`libtcc1-amd64.tar` — named apart from aarch64's `libtcc1.tar` so one
 # arch's build can never clobber the other's, see `userspace/tcc/build.rs`).
 TCC=""
 TCC_LIBTCC1=""
 if (cd userspace && cargo build -q --manifest-path tcc/Cargo.toml --target x86_64-unknown-none --release 2>/dev/null); then
     TCC=$(find userspace/tcc/target/x86_64-unknown-none/release -maxdepth 1 -name tcc -type f | head -1)
-    [ -f userspace/tcc/dist/libtcc1-x86_64.tar ] && TCC_LIBTCC1="userspace/tcc/dist/libtcc1-x86_64.tar"
+    [ -f userspace/tcc/dist/libtcc1-amd64.tar ] && TCC_LIBTCC1="userspace/tcc/dist/libtcc1-amd64.tar"
 fi
 
 # sshd, WITHOUT `fork-sessions` (a default feature): this target has no `fork`,

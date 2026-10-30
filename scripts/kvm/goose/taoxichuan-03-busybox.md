@@ -21,9 +21,9 @@ aarch64 Mac, and your `akuma-ring3-amd64` naked asm is currently NOT gated: gate
 two-line change), and `cargo clippy -p <crate> --target x86_64-unknown-none -- -D warnings` green for every
 crate you touch.
 
-## 2. Stage 3 deliverable (the owner narrowed the pinned gate)
+## 2. Stage 3 deliverable (the user narrowed the pinned gate)
 
-The experiment doc pins "`ash` runs a script". **The owner dropped that for now: no interactive shell, no
+The experiment doc pins "`ash` runs a script". **The user dropped that for now: no interactive shell, no
 pty, no terminal handling.** The gate is:
 
 > The guest runs `busybox echo <a fixed string>` and `busybox ls <a fixed directory on the ext2 root>` as
@@ -81,5 +81,5 @@ size (198,072 B) at the end of this stage in RESULT.md.
    image size, and what you would tell the stage-4 prompt (sshd, exec-only: needs a network path and sockets).
 
 You are on `glm-5.3-flash` at low effort. Explore as much as you need; the 5-hour quota is the budget and the
-owner wants to see how far it goes. Work autonomously until the gate passes or you are genuinely blocked; then
+user wants to see how far it goes. Work autonomously until the gate passes or you are genuinely blocked; then
 write the result file, commit, push, and end the turn.

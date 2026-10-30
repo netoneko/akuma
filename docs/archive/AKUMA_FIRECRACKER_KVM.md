@@ -129,7 +129,7 @@ RAM), 32-bit flat protected mode (`CR0=0x11`, no paging, flat code/data selector
 
 ### 2. The hard parts, sized
 
-**(a) Guest memory is the VMM's own memory: DECIDED (owner, 2026-10-23) - reserved slice, remapped.**
+**(a) Guest memory is the VMM's own memory: DECIDED (user, 2026-10-23) - reserved slice, remapped.**
 Firecracker `mmap`s anonymous memory and passes it as `uaddr`. Rather than pin scattered frames behind a
 4 KiB NPT, the shim **gates Firecracker to the `kvmmem=` reserve**: at `SET_USER_MEMORY_REGION` it takes a
 2 MiB-aligned slice of the arena (`akuma_vm_spec::arena`, the kvm0 allocator), copies the range's current
@@ -215,13 +215,13 @@ which already exists). Phase 3 slices, each ending in a TCG rehearsal and a doc 
    unsafe budget and allocation audit, the herd-managed kvm0 VM re-verified after a Firecracker run.
 5. *Metal*: ryzen (build on Pop, entry 29/30 recipe), then NetBSD MICROVM.
 
-### 4. Open questions for the owner
+### 4. Open questions for the user
 
 1. Approve Option 1 and the v1 exclusivity rule (Firecracker VM xor kvm0 VM)?
 2. Accept `--no-seccomp` as the supported mode for v1?
 3. ~~Accept "no munmap/mprotect of a live guest-RAM slot"~~ superseded: guest RAM is a borrowed reserve slice (a).
 
-**Owner's answers (2026-10-23): guest RAM is a slice of the `kvmmem=` reserve remapped into the VMM's address space (borrowed frames, kvm0's arena); fork is logged to dmesg; the protocol is learned from the syscall inputs (no Firecracker source read). Phase 3 approved.**
+**User's answers (2026-10-23): guest RAM is a slice of the `kvmmem=` reserve remapped into the VMM's address space (borrowed frames, kvm0's arena); fork is logged to dmesg; the protocol is learned from the syscall inputs (no Firecracker source read). Phase 3 approved.**
 
 ## Phase 3: progress log
 
@@ -530,7 +530,7 @@ suspects stay the host kernel's own CMOS writes (SNTP clock sync, `crumb()` brea
 
 ## Before the KVM work is finished
 
-In the owner's order of importance (2026-10-23), nothing below is done:
+In the user's order of importance (2026-10-23), nothing below is done:
 
 1. **CPU affinity** (built and rehearsed on TCG 2026-10-23, § *CPU affinity: built and rehearsed*; metal result: § *CPU affinity on the ryzen*). (a) Place the vCPU threads of a `/dev/kvm` VM on chosen cores the way `kvm0` places its vCPUs
    (`vm_cores`, `kvmcores=`, `sched::reserve_cores`): a herd key on a `command =` service (a `cpus = 4-7` style list) handed to
@@ -547,4 +547,4 @@ In the owner's order of importance (2026-10-23), nothing below is done:
 8. NetBSD `MICROVM` as the second guest; a Linux guest (needs the I/O APIC).
 9. Lift the one-VM exclusivity with `/dev/kvm0` (both own SVM and the reserved cores); a herd service shape for a
    Firecracker VM (`command = firecracker ...`, restart policy) once affinity exists.
-10. **Investigate the clock checksum error the ryzen reported when booting Linux (Pop) after Akuma runs** (2026-10-23, reported by the owner, not yet looked at): suspects are what Akuma writes to the CMOS/RTC (the SNTP clock sync, the `crumb()` breadcrumbs in CMOS byte 0x7F that `kvm` uses) and a `reboot -f`/watchdog reset mid-write.
+10. **Investigate the clock checksum error the ryzen reported when booting Linux (Pop) after Akuma runs** (2026-10-23, reported by the user, not yet looked at): suspects are what Akuma writes to the CMOS/RTC (the SNTP clock sync, the `crumb()` breadcrumbs in CMOS byte 0x7F that `kvm` uses) and a `reboot -f`/watchdog reset mid-write.

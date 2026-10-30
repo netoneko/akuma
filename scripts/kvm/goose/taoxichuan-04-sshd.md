@@ -92,6 +92,6 @@ RESULT.md.
    size, and what you would tell the stage-6 prompt (`apk add curl`: the guest needs outbound networking through
    `vm_outbound = true`, DNS, TLS, an apk index, and `fork`/`wait` in earnest for `apk` and `tar`).
 
-You are on `glm-5.3-flash` at low effort. Explore as much as you need; the quota is the budget and the owner wants
+You are on `glm-5.3-flash` at low effort. Explore as much as you need; the quota is the budget and the user wants
 to see how far it goes. Work autonomously until the gate passes or you are genuinely blocked; then write the result
 file, commit, push, and end the turn.

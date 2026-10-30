@@ -1,0 +1,24 @@
+# Taoxichuan stage 8, session pq: confirm the supervisor's TCG results on the metal (no new code)
+
+You are goose-glm on the ryzen box. The supervisor (Claude, on the Mac) fixed and built several things under QEMU TCG; the user wants them **confirmed on the metal (KVM on the box), in the background**. This session writes **no kernel code**: it builds the branch tip, boots it, runs fixed checks, and reports. Keep your context small (`sed -n` windows of 60 lines or less).
+Every shell command starts with `export TERM=dumb HOME=/root GIT_PAGER=cat; . /etc/akuma-dev.env`. Checkout `/src/github.com/netoneko/akuma`. Box log times are UTC. Never push `origin`.
+
+## Setup
+`git status` first; commit or stash leftovers (branch `taoxichuan-s4`, dirty submodules are normal). Then `git fetch litter rust-org-il-experiment taoxichuan-s4`, `git checkout -B metal-confirm litter/rust-org-il-experiment` (tip `49de01f2` or later; it has NO `[tmp]` prints), and bring in the harness only: `git checkout litter/taoxichuan-s4 -- scripts/kvm/goose/run_stallrate.sh`. Build: `kbuild -p taoxichuan -j 4 --features no-tests`. Read `taoxichuan/docs/README.md` only if you need orientation; the code wins over any doc.
+
+## What changed since your last session (so you know what you are testing)
+1. **The spawn crossing marks its pool slot RUNNING around `child_enter` and TERMINATED after** (`child.rs`, `spawn_arm`). Under TCG the preemption switch made every ssh exec hang after `[SSH] Exec:` before this (the child ran on a slot the picker never takes). pl's box stall reproduced with the switch OFF, so this may or may not be the box's stall - that is exactly the question.
+2. Threads: `clone(CLONE_THREAD)` through `akuma_exec::process::clone_thread`, `futex`, one pid allocator (the crate's), a ring-3 fault now kills that task alone (status SIGSEGV) instead of halting the machine.
+3. Sockets are closed by the last reference (git dups its socket), `/dev/urandom`, `fsync`, `fstat` types (FIFO/socket/char), `open(O_CREAT)` in a missing directory is ENOENT, `chdir`/`getcwd`, real `mprotect`, `sigaltstack`, `membarrier`, the legacy `rmdir`/`mkdir`/`link`/`symlink`/`readlink`/`chmod` numbers via `akuma-syscalls-abi::legacy`, `unlinkat` flags, 1 GiB mmap / 256 MiB brk slabs.
+Console lines `[nosys] nr=N` (once per unserved syscall number) and, with `--features no-tests,trace-err`, `[err] sN nr=N -E a=...` (failing syscalls) exist for diagnosis; the plain build prints only `[nosys]`.
+
+## Checks, in this order (each is a console `[SSH] Exit status` plus client bytes read with `od -c`; at most 8 execs per boot; `PACE=15`)
+1. **The battery that was green before**: F1 (`sh -c 'echo x > /tmp/f; cat /tmp/f; wc -c /tmp/f'` -> `x\n2 /tmp/f\n`), PK1 (`yes | head -n 20000 | wc -l` -> `20000\n`), P1-P5 (`run_pipes.sh`), in one clean boot. Report any difference from RESULT-pj.
+2. **The stall rate.** `run_stallrate.sh 8 apk` (one `apk add git` per boot against the frozen mirror, `mirror.sh start` first). The baseline is pl's: 3 of 6 valid boots stalled. Report CLEAN/STALL counts for the new kernel and save every stalled window as `STALLq-bootK.console`. If it stalls, do NOT start a new investigation: record the last console lines and the `[nosys]`/`[err]` context and stop that check.
+3. **git over the git protocol** (needs the stall to be absent or rare; use the clean boots). On the host: make a small repo (a few files, two commits, one 1 MB file) and serve it: `git daemon --reuseaddr --export-all --base-path=/root/dev-cycle/taoxichuan-s7/gsrv --listen=0.0.0.0 --port=9418 /root/dev-cycle/taoxichuan-s7/gsrv &` (record the pid and kill it at the end). In the guest, after `apk add git`: `git clone git://192.168.1.159:9418/r.git /tmp/c1 > /tmp/g.out 2>&1; echo rc=$?; cat /tmp/g.out`, then `git -C /tmp/c1 log --oneline | wc -l` (= your commit count) and `md5sum` of the big file against the host's. Three clones in three boots; report each.
+4. **Threads**: not testable without a compiler in the image; skip. (The clone's sideband thread is the thread test.)
+
+## Rules
+Debug prints you add carry `[tmp]` and are removed before you end; you commit nothing except `PLAN`/`RESULT` notes, and you push nothing but those to `litter` (`git push litter metal-confirm`). Write `/root/dev-cycle/taoxichuan-s7/RESULT-pq.md` after every boot (premise rows first: tip hash, kbuild md5, the install line of `boot_dev.sh`), with the verdict table at the end: check, boots, CLEAN/STALL, evidence file.
+**Restore the ops last and verify them**: `herd stop vm-dev`, stage4 conf `/root/dev-cycle/taoxichuan-s6/vm-dev.conf.stage4` into BOTH `/etc/herd/available/` and `/etc/herd/enabled/`, `herd disable vm-dev`, `herd start vm-serve-mc`, `mirror.sh stop`, kill your `git daemon`, then `herd status` (never bare `herd`). Never run python from stdin on this box.
+Budget: about 60 tool calls and 12 boots. Stop on: all four checks reported, 12 boots, or a quota error.

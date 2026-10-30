@@ -24,7 +24,7 @@
 //! `wait_until`, which pumps the stack itself. There is no third path.
 
 use akuma_net::socket::socket_const::{AF_INET, SOCK_DGRAM, SOCK_STREAM};
-use akuma_net::socket::{SockAddrIn, SocketAddrV4};
+use akuma_net::socket::SocketAddrV4;
 
 /// `SOCK_STREAM`/`SOCK_DGRAM` are the low bits of `type`, which also
 /// carries `SOCK_NONBLOCK`/`SOCK_CLOEXEC`.
@@ -32,14 +32,10 @@ const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 
-/// Map `akuma-net`'s errno (a positive `i32`) to the kernel's negative
-/// return — the same convention as every other arm.
-fn net_err(e: i32) -> u64 {
-    (-i64::from(e)) as u64
-}
+use akuma_syscalls_net::sockaddr::{self, net_err};
 
 /// The fd's socket index, or `ENOTSOCK`.
-pub(crate) fn fd_socket(fd: u64) -> Option<usize> {
+pub fn fd_socket(fd: u64) -> Option<usize> {
     fd_table().with(fd as u32, |d| match d {
         crate::OpenFile::Socket(idx) => Some(*idx),
         _ => None,
@@ -50,7 +46,7 @@ pub(crate) fn fd_socket(fd: u64) -> Option<usize> {
 /// `writev` on a socket fd: one send of the concatenated iovecs. The syscall
 /// return is already shaped (`net_err`'s negative errno on failure) because
 /// the dispatcher returns it directly.
-pub(crate) fn writev_socket(idx: usize, data: &[u8], nonblock: bool) -> Result<usize, u64> {
+pub fn writev_socket(idx: usize, data: &[u8], nonblock: bool) -> Result<usize, u64> {
     if data.is_empty() {
         return Ok(0);
     }
@@ -114,6 +110,10 @@ pub fn poll_arm(fds_va: u64, nfds: u64, timeout_ms: i64) -> u64 {
             }
             return ready;
         }
+        let slot = crate::exec_twin::current_slot();
+        if slot < crate::child::NSLOTS && akuma_threading::take_thread_interrupted(slot) {
+            return crate::e(crate::EINTR);
+        }
         crate::net::sleep_until(crate::net::uptime_us() + 1000);
     }
 }
@@ -133,10 +133,11 @@ fn fd_events(fd: i32, events: i16) -> i16 {
         return 0;
     }
     let mut efd_idx: usize = usize::MAX;
+    let mut pipe_rev: i16 = 0;
     let kind = crate::fd_table().with(fd as u32, |d| match d {
         crate::OpenFile::Socket(_) => 1,
         crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
-        crate::OpenFile::Null | crate::OpenFile::ChildOut(_) => 3,
+        crate::OpenFile::Null | crate::OpenFile::Random | crate::OpenFile::ChildOut(_) => 3,
         // A pipe end (M3): a read end is POLLIN while data or a finished
         // writer's EOF stands; a write end is POLLOUT while there is room.
         // The crate's own predicates — no second opinion, and no poller
@@ -147,15 +148,24 @@ fn fd_events(fd: i32, events: i16) -> i16 {
             } else {
                 crate::pipes::readable(*id)
             };
-            if ready {
-                if *is_write {
-                    POLLOUT
-                } else {
-                    POLLIN
-                }
-            } else {
+            // The readiness rides OUT of the closure in `pipe_rev`: this arm
+            // used to return POLLIN/POLLOUT as the KIND, and POLLOUT (4) is
+            // the eventfd kind - polling a pipe's write end indexed the
+            // eventfd table with usize::MAX and panicked the kernel (found
+            // when rustc polled its jobserver pipe, 2026-10-30).
+            pipe_rev = if !ready {
                 0
-            }
+            } else if *is_write {
+                POLLOUT
+            } else {
+                POLLIN
+            };
+            5
+        }
+        crate::OpenFile::Pair(rd, wr) => {
+            pipe_rev = (if crate::pipes::readable(*rd) { POLLIN } else { 0 })
+                | (if crate::pipes::writable(*wr) { POLLOUT } else { 0 });
+            5
         }
         crate::OpenFile::Session => 3, // the session stdio: always ready
         crate::OpenFile::EventFd(slot) => {
@@ -185,6 +195,7 @@ fn fd_events(fd: i32, events: i16) -> i16 {
         }
         Some(2) => POLLIN | POLLOUT,
         Some(3) => events & POLLOUT,
+        Some(5) => pipe_rev & events,
         Some(4) => {
             // An eventfd (session Q): readable while its counter is
             // non-zero, always writable — `FdState::EventFd`'s answers,
@@ -423,27 +434,21 @@ pub fn getsockopt_arm(fd: u64, level: u64, opt: u64, optval_va: u64, optlen_va: 
 }
 
 /// The fd's nonblock flag, straight from the fd table.
-pub(crate) fn fd_nonblock(fd: u64) -> bool {
+pub fn fd_nonblock(fd: u64) -> bool {
     fd_table().is_nonblock(fd as u32)
 }
 
-/// Read a `struct sockaddr_in` from the task's memory.
+/// Read a `struct sockaddr_in` from the task's memory (rules: `akuma-syscalls-net::sockaddr`).
 fn sockaddr_in_from_user(ptr: u64, len: u64) -> Option<SocketAddrV4> {
-    if len < core::mem::size_of::<SockAddrIn>() as u64 {
+    if len < sockaddr::SOCKADDR_IN_LEN as u64 {
         return None;
     }
-    let mut raw = [0u8; core::mem::size_of::<SockAddrIn>()];
+    let mut raw = [0u8; sockaddr::SOCKADDR_IN_LEN];
     if !crate::copy_from_user(&mut raw, ptr) {
         return None;
     }
-    // SAFETY: `SockAddrIn` is `repr(C)` plain-old-data — four integer fields
-    // and a padding array, no pointers, no niches — so any 16 bytes are a
-    // valid value of it.
-    let sa: SockAddrIn = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) };
-    if sa.sin_family != AF_INET as u16 {
-        return None;
-    }
-    Some(sa.to_addr())
+    let (ip, port) = sockaddr::decode_sockaddr_in(len, &raw).ok()?;
+    Some(SocketAddrV4::new(ip, port))
 }
 
 /// Write a `struct sockaddr_in` to the task's memory; returns its length.
@@ -451,16 +456,8 @@ fn sockaddr_in_to_user(ptr: u64, addr: SocketAddrV4) -> usize {
     if ptr == 0 {
         return 0;
     }
-    let sa = SockAddrIn::from_addr(&addr);
-    // SAFETY: `repr(C)` plain-old-data; viewing it as its own bytes is well
-    // defined.
-    let raw: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            core::ptr::addr_of!(sa).cast::<u8>(),
-            core::mem::size_of::<SockAddrIn>(),
-        )
-    };
-    if !crate::copy_to_user(ptr, raw) {
+    let raw = sockaddr::encode_sockaddr_in(addr.ip, addr.port);
+    if !crate::copy_to_user(ptr, &raw) {
         return 0;
     }
     raw.len()
@@ -487,7 +484,7 @@ pub fn socket_arm(domain: u64, ty: u64, _protocol: u64) -> u64 {
         akuma_net::socket::remove_socket(idx);
         return crate::e(crate::err::EMFILE);
     };
-    let fd = table.alloc_fd_from(3, crate::OpenFile::Socket(idx));
+    let fd = table.alloc_fd_from(crate::new_fd_min(), crate::OpenFile::Socket(idx));
     if ty & SOCK_NONBLOCK != 0 {
         table.set_nonblock(fd);
     }
@@ -538,7 +535,7 @@ pub fn accept_arm(fd: u64, addr: u64, addrlen_va: u64) -> u64 {
                 akuma_net::socket::remove_socket(new_idx);
                 return crate::e(crate::err::EMFILE);
             };
-            let new_fd = table.alloc_fd_from(3, crate::OpenFile::Socket(new_idx));
+            let new_fd = table.alloc_fd_from(crate::new_fd_min(), crate::OpenFile::Socket(new_idx));
             // The listener's nonblock flag should carry to the child — the
             // same inheritance Linux does with accept4 on a nonblocking
             // listener, and what sshd relies on not to set per-connection.
@@ -840,7 +837,7 @@ pub fn read_arm(fd: u64, buf: u64, len: u64) -> u64 {
     // the entry at most once a second (a monotone counter, not a clock).
     static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     let n = LAST.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if n % 1000 == 0 {
+    if n.is_multiple_of(1000) {
         akuma_primitives::safe_print!(96, "  [cx] sockread fd={} len={}\n", fd, len);
     }
     let mut data = alloc::vec![0u8; len as usize];
@@ -912,6 +909,121 @@ pub fn write_arm(fd: u64, buf: u64, len: u64) -> u64 {
 pub fn close_arm(fd: u64) {
     let idx = fd_socket(fd);
     if let Some(idx) = idx {
-        akuma_net::socket::remove_socket(idx);
+        // `dup`, `fork` and `CLONE_FILES` all copy the fd without the socket
+        // behind it knowing; closing ONE of several fds must not destroy the
+        // connection (git dups its socket, closes the copy, and its sideband
+        // thread then read the closed handle: EBADF). The fd being closed is
+        // still in the table here, so "one reference" is "the last".
+        if socket_refs(idx) <= 1 {
+            akuma_net::socket::remove_socket(idx);
+        }
     }
+}
+
+/// How many open fds, across every task record, name socket `idx`.
+pub fn socket_refs(idx: usize) -> usize {
+    crate::task_slots()
+        .iter()
+        .map(|t| {
+            t.fd_names
+                .values()
+                .filter(|d| matches!(d, crate::OpenFile::Socket(i) if *i == idx))
+                .count()
+        })
+        .sum()
+}
+
+/// The kernel `struct msghdr` and `struct iovec` words `sendmsg`/`recvmsg`
+/// read: `name`, `namelen`, `iov`, `iovlen`, then control (never used here).
+const MSGHDR_LEN: usize = 56;
+const MSG_MAX_IOV: u64 = 16;
+
+fn read_msghdr(msg_va: u64) -> Option<([u8; MSGHDR_LEN], u64, u64)> {
+    let mut h = [0u8; MSGHDR_LEN];
+    if !crate::user_ok(msg_va, MSGHDR_LEN as u64) || !crate::copy_from_user(&mut h, msg_va) {
+        return None;
+    }
+    let iov = u64::from_le_bytes(h[16..24].try_into().ok()?);
+    let iovlen = u64::from_le_bytes(h[24..32].try_into().ok()?);
+    Some((h, iov, iovlen))
+}
+
+fn read_iovec(iov_va: u64, i: u64) -> Option<(u64, u64)> {
+    let mut v = [0u8; 16];
+    if !crate::copy_from_user(&mut v, iov_va + i * 16) {
+        return None;
+    }
+    Some((
+        u64::from_le_bytes(v[0..8].try_into().ok()?),
+        u64::from_le_bytes(v[8..16].try_into().ok()?),
+    ))
+}
+
+/// `sendmsg(fd, &msghdr, flags)`: c-ares' and most resolvers' send. Each
+/// iovec goes out through `sendto_arm` with the header's destination; control
+/// data is ignored. A datagram socket with several iovecs sends several
+/// datagrams (not Linux's one gathered one - nothing common relies on it).
+pub fn sendmsg_arm(fd: u64, msg_va: u64, flags: u64) -> u64 {
+    let Some((h, iov, iovlen)) = read_msghdr(msg_va) else {
+        return crate::e(crate::err::EFAULT);
+    };
+    if iovlen > MSG_MAX_IOV {
+        return crate::e(crate::err::EINVAL);
+    }
+    let name = u64::from_le_bytes(h[0..8].try_into().unwrap_or([0; 8]));
+    let namelen = u64::from(u32::from_le_bytes(h[8..12].try_into().unwrap_or([0; 4])));
+    let mut total = 0u64;
+    for i in 0..iovlen {
+        let Some((base, len)) = read_iovec(iov, i) else {
+            return crate::e(crate::err::EFAULT);
+        };
+        if len == 0 {
+            continue;
+        }
+        let r = sendto_arm(fd, base, len, flags, name, namelen);
+        if (r as i64) < 0 {
+            return if total > 0 { total } else { r };
+        }
+        total += r;
+        if r < len {
+            break;
+        }
+    }
+    total
+}
+
+/// `recvmsg(fd, &msghdr, flags)`: one receive into the first non-empty iovec
+/// through `recvfrom_arm` (the source address lands in `msg_name`, its length
+/// in `msg_namelen`); `msg_controllen` and `msg_flags` are cleared. A
+/// datagram is not split across several iovecs.
+pub fn recvmsg_arm(fd: u64, msg_va: u64, flags: u64) -> u64 {
+    let Some((h, iov, iovlen)) = read_msghdr(msg_va) else {
+        return crate::e(crate::err::EFAULT);
+    };
+    if iovlen > MSG_MAX_IOV {
+        return crate::e(crate::err::EINVAL);
+    }
+    let name = u64::from_le_bytes(h[0..8].try_into().unwrap_or([0; 8]));
+    let mut target = None;
+    for i in 0..iovlen {
+        match read_iovec(iov, i) {
+            Some((base, len)) if len > 0 => {
+                target = Some((base, len));
+                break;
+            }
+            Some(_) => {}
+            None => return crate::e(crate::err::EFAULT),
+        }
+    }
+    let Some((base, len)) = target else {
+        return 0;
+    };
+    // `msg_namelen` is a u32 at offset 8 of the header: recvfrom's `src_len`.
+    let name_len_va = if name != 0 { msg_va + 8 } else { 0 };
+    let r = recvfrom_arm(fd, base, len, flags, name, name_len_va);
+    if (r as i64) >= 0 {
+        let _ = crate::copy_to_user(msg_va + 40, &0u64.to_le_bytes()); // msg_controllen
+        let _ = crate::copy_to_user(msg_va + 48, &0u32.to_le_bytes()); // msg_flags
+    }
+    r
 }

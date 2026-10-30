@@ -21,7 +21,7 @@ logs_*.txt
 akuma_*.bin
 akuma_*.elf
 akuma-fc.bin
-
+taoxichuan-fc.bin
 
 # dev-cycle laptop-side artifacts (bundles, reports)
 scripts/kvm/dev_cycle_out/

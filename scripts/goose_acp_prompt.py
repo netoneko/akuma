@@ -63,6 +63,22 @@ def post(body, conn=None, sess=None, timeout=60):
     return r.headers.get("acp-connection-id"), r.read()
 
 
+quiet_kinds = {}   # update kinds that are not logged line by line (thinking chunks, plans, usage)
+quiet_last_log = 0.0
+
+
+def note_quiet(kind):
+    """The model is producing output we do not print (GLM thinks for minutes before a message
+    chunk). Log a heartbeat line at most every 30 s so a log-silence watchdog sees it."""
+    global quiet_last_log
+    quiet_kinds[kind] = quiet_kinds.get(kind, 0) + 1
+    now = time.time()
+    if now - quiet_last_log >= 30:
+        quiet_last_log = now
+        log("alive: " + ", ".join(f"{k} x{n}" for k, n in sorted(quiet_kinds.items())))
+        quiet_kinds.clear()
+
+
 def record(m):
     with lock:
         msgs.append(m)
@@ -70,6 +86,8 @@ def record(m):
         if m.get("method") == "session/update":
             u = m["params"]["update"]
             kind = u.get("sessionUpdate")
+            if kind not in ("agent_message_chunk", "tool_call", "tool_call_update"):
+                note_quiet(str(kind))
             if kind == "agent_message_chunk":
                 t = u.get("content", {}).get("text", "")
                 if t.strip():

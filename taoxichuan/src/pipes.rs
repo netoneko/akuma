@@ -26,17 +26,17 @@ use alloc::vec::Vec;
 /// (P5 tolerates the EPIPE death); name the number where it is used.
 const EPIPE: u64 = 32;
 
-/// M4 slice 3 (session pf, Fix B): the arms park. The M3 header said "Wakes
-/// are `()` and dropped on the floor — nothing on this kernel blocks"; that
-/// ended when `wait4_real` proved a task can park on its own band and be
-/// woken back (boots G/H/I, session pe). What remains of the M3 rule is the
-/// tid discipline: a parked caller is registered under its TASK SLOT
-/// (`exec_twin::current_slot()` — the same tid space as `wait4_real`'s
-/// `waiter`), and every `Wakes` an op returns is fired through the threading
-/// waker, exactly as `task_exit_real` wakes the reap-waiter. The one-step
-/// `check_set_*` forms are the crate's anti-TOCTOU shape: probe-and-register
-/// is one table step, so a wake landing between "empty" and "registering"
-/// cannot be lost.
+// M4 slice 3 (session pf, Fix B): the arms park. The M3 header said "Wakes
+// are `()` and dropped on the floor — nothing on this kernel blocks"; that
+// ended when `wait4_real` proved a task can park on its own band and be
+// woken back (boots G/H/I, session pe). What remains of the M3 rule is the
+// tid discipline: a parked caller is registered under its TASK SLOT
+// (`exec_twin::current_slot()` — the same tid space as `wait4_real`'s
+// `waiter`), and every `Wakes` an op returns is fired through the threading
+// waker, exactly as `task_exit_real` wakes the reap-waiter. The one-step
+// `check_set_*` forms are the crate's anti-TOCTOU shape: probe-and-register
+// is one table step, so a wake landing between "empty" and "registering"
+// cannot be lost.
 
 /// May this caller park at all? The boot task (`NO_SLOT`) drives the bridge
 /// and the exec pump — the machine's only guaranteed-runner — so it keeps
@@ -55,12 +55,6 @@ fn may_park() -> Option<usize> {
 /// that every syscall entry overwrites, so the parked task's own stash must
 /// survive the park and be restored before its syscall returns.
 fn park_once() {
-    // [tmp] pl-2 (remove before final): every blocking pipe op names its slot.
-    akuma_primitives::safe_print!(
-        96,
-        "[tmp] PIPEPARK slot={}\n",
-        crate::exec_twin::current_slot()
-    );
     let stash = ring3::user_rsp_stash();
     akuma_threading::schedule_blocking(u64::MAX);
     ring3::set_user_rsp_stash(stash);
@@ -76,11 +70,13 @@ fn fire(wakes: akuma_pipes::Wakes<()>) {
 
 /// Every live pipe (the `EVENTFDS` pattern: one task runs at a time; the
 /// syscall path is the only accessor).
-static mut PIPES: PipeTable<()> = PipeTable::new();
+static PIPES: akuma_primitives::cell::BorrowCell<PipeTable<()>> =
+    akuma_primitives::cell::BorrowCell::new(PipeTable::new());
 
-// SAFETY: syscall-path discipline (single core, IF clear), as `EVENTFDS`.
-fn table() -> &'static mut PipeTable<()> {
-    unsafe { &mut *core::ptr::addr_of_mut!(PIPES) }
+/// Run `f` on the pipe table. One call per operation: nothing holds the table
+/// across a park, a user copy or a wake.
+fn table<R>(f: impl FnOnce(&mut PipeTable<()>) -> R) -> R {
+    PIPES.with_mut(f)
 }
 
 /// `pipe(fds)` — x86_64 22: musl's `pipe()` is the raw `SYS_pipe`, one
@@ -106,16 +102,16 @@ pub fn pipe2_arm(fds_va: u64, flags: u64) -> u64 {
     if !crate::user_ok(fds_va, 8) {
         return crate::e(ring3::err::EFAULT);
     }
-    let id = table().create();
+    let id = table(akuma_pipes::PipeTable::create);
     let mut fds = crate::fd_table();
-    let Some(rslot) = fds.free_below(3, crate::SLOT_CEILING) else {
-        table().close_read(id);
+    let Some(rslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
+        table(|t| t.close_read(id));
         return crate::e(ring3::err::EMFILE);
     };
     let rfd = fds.alloc_fd_from(rslot, OpenFile::Pipe(id, false));
-    let Some(wslot) = fds.free_below(3, crate::SLOT_CEILING) else {
+    let Some(wslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
         let _ = fds.close(rfd);
-        table().close_read(id);
+        table(|t| t.close_read(id));
         return crate::e(ring3::err::EMFILE);
     };
     let wfd = fds.alloc_fd_from(wslot, OpenFile::Pipe(id, true));
@@ -128,9 +124,59 @@ pub fn pipe2_arm(fds_va: u64, flags: u64) -> u64 {
         fds.set_nonblock(wfd);
     }
     let mut out = [0u8; 8];
-    out[..4].copy_from_slice(&(rfd as u32).to_ne_bytes());
-    out[4..].copy_from_slice(&(wfd as u32).to_ne_bytes());
+    out[..4].copy_from_slice(&rfd.to_ne_bytes());
+    out[4..].copy_from_slice(&wfd.to_ne_bytes());
     if !crate::copy_to_user(fds_va, &out) {
+        return crate::e(ring3::err::EFAULT);
+    }
+    0
+}
+
+/// `socketpair(AF_UNIX, type, 0, sv)`: two pipes cross-wired so each fd reads
+/// one and writes the other. A byte stream - `SOCK_SEQPACKET` message
+/// boundaries are not kept (Rust's `Command::spawn` only needs the pair to
+/// carry a few bytes and to hang up when the other end closes).
+pub fn socketpair_arm(domain: u64, ty: u64, sv_va: u64) -> u64 {
+    const AF_UNIX: u64 = 1;
+    const SOCK_CLOEXEC: u64 = 0o2_000_000;
+    const SOCK_NONBLOCK: u64 = 0o4000;
+    if domain != AF_UNIX {
+        return crate::e(ring3::err::EAFNOSUPPORT);
+    }
+    if !matches!(ty & 0xf, 1 | 2 | 5) {
+        return crate::e(ring3::err::EINVAL);
+    }
+    if !crate::user_ok(sv_va, 8) {
+        return crate::e(ring3::err::EFAULT);
+    }
+    let a = table(akuma_pipes::PipeTable::create); // end X writes, end Y reads
+    let b = table(akuma_pipes::PipeTable::create); // end Y writes, end X reads
+    let mut fds = crate::fd_table();
+    let Some(xslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
+        table(|t| t.close_read(a));
+        table(|t| t.close_read(b));
+        return crate::e(ring3::err::EMFILE);
+    };
+    let x = fds.alloc_fd_from(xslot, OpenFile::Pair(b, a));
+    let Some(yslot) = fds.free_below(crate::new_fd_min(), crate::SLOT_CEILING) else {
+        let _ = fds.close(x);
+        table(|t| t.close_read(a));
+        table(|t| t.close_read(b));
+        return crate::e(ring3::err::EMFILE);
+    };
+    let y = fds.alloc_fd_from(yslot, OpenFile::Pair(a, b));
+    for fd in [x, y] {
+        if ty & SOCK_CLOEXEC != 0 {
+            fds.set_cloexec(fd);
+        }
+        if ty & SOCK_NONBLOCK != 0 {
+            fds.set_nonblock(fd);
+        }
+    }
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&x.to_ne_bytes());
+    out[4..].copy_from_slice(&y.to_ne_bytes());
+    if !crate::copy_to_user(sv_va, &out) {
         return crate::e(ring3::err::EFAULT);
     }
     0
@@ -145,7 +191,7 @@ pub fn read_arm(id: u32, buf_va: u64, len: u64) -> u64 {
     let mut total: u64 = 0;
     while total < len {
         let want = ((len - total) as usize).min(chunk.len());
-        let (res, wakes) = table().read(id, &mut chunk[..want]);
+        let (res, wakes) = table(|t| t.read(id, &mut chunk[..want]));
         fire(wakes);
         if res.bytes == 0 {
             // Empty. EOF (no writers, or the pipe is gone) and "data just
@@ -156,10 +202,13 @@ pub fn read_arm(id: u32, buf_va: u64, len: u64) -> u64 {
             let Some(tid) = may_park() else {
                 break;
             };
-            if table().check_set_reader(id, tid, ()) {
+            if table(|t| t.check_set_reader(id, tid, ())) {
                 break;
             }
             park_once();
+            if akuma_threading::take_thread_interrupted(tid) {
+                return if total > 0 { total } else { crate::e(crate::EINTR) };
+            }
             continue;
         }
         if !crate::copy_to_user(buf_va + total, &chunk[..res.bytes]) {
@@ -200,7 +249,7 @@ pub fn write_arm(id: u32, buf_va: u64, len: u64) -> u64 {
 pub fn write_arm_gathered(id: u32, data: &[u8]) -> u64 {
     let mut done: usize = 0;
     loop {
-        let (out, wakes) = table().write(id, &data[done..]);
+        let (out, wakes) = table(|t| t.write(id, &data[done..]));
         fire(wakes);
         match out {
             WriteOutcome::Wrote(n) => {
@@ -217,7 +266,7 @@ pub fn write_arm_gathered(id: u32, data: &[u8]) -> u64 {
                     let Some(tid) = may_park() else {
                         return crate::e(ring3::err::EAGAIN);
                     };
-                    if table().check_set_writer(id, tid, ()) {
+                    if table(|t| t.check_set_writer(id, tid, ())) {
                         return crate::e(EPIPE);
                     }
                     park_once();
@@ -239,7 +288,7 @@ pub fn write_arm_gathered(id: u32, data: &[u8]) -> u64 {
 /// only reader today, and nothing reaches it until `fork_process`). The
 /// kernel-slice twin of `write_arm`, which copies from the user first.
 pub fn write_no_sigpipe(id: u32, data: &[u8]) -> Result<usize, i32> {
-    let (out, _wakes) = table().write(id, data);
+    let (out, _wakes) = table(|t| t.write(id, data));
     match out {
         // A full pipe answers Ok(0) — the short write that tells the pump
         // the reader is applying backpressure (the hook's own contract).
@@ -251,19 +300,19 @@ pub fn write_no_sigpipe(id: u32, data: &[u8]) -> Result<usize, i32> {
 /// One more descriptor names this end — `dup`/`dup2`/`fcntl(F_DUPFD)`, and
 /// `fork_arm`'s walk over `fork_copy`'s payloads.
 pub fn clone_ref(id: u32, is_write: bool) {
-    table().clone_ref(id, is_write);
+    table(|t| t.clone_ref(id, is_write));
 }
 
 /// `poll(2)`'s readiness answers for a pipe end (`sock.rs`'s select arm) —
 /// the crate's own predicates, no second opinion.
 #[must_use]
 pub fn readable(id: u32) -> bool {
-    table().readable(id)
+    table(|t| t.readable(id))
 }
 
 #[must_use]
 pub fn writable(id: u32) -> bool {
-    table().writable(id)
+    table(|t| t.writable(id))
 }
 
 /// Drop the reference one descriptor held — `close`, a displaced `dup2`
@@ -274,9 +323,9 @@ pub fn writable(id: u32) -> bool {
 /// victim of exactly the dropped wake.
 pub fn release(id: u32, is_write: bool) {
     let wakes = if is_write {
-        table().close_write(id).1
+        table(|t| t.close_write(id)).1
     } else {
-        table().close_read(id).1
+        table(|t| t.close_read(id)).1
     };
     fire(wakes);
 }
@@ -289,8 +338,18 @@ pub fn release(id: u32, is_write: bool) {
 pub fn release_open_fds() {
     let mut t = crate::fd_table();
     while let Some((_fd, d)) = t.pop_lowest() {
-        if let OpenFile::Pipe(id, w) = d {
-            release(id, w);
+        match d {
+            OpenFile::Pipe(id, w) => release(id, w),
+            OpenFile::Pair(r, w) => {
+                release(r, false);
+                release(w, true);
+            }
+            // The exit drops the task's socket references; the last one out
+            // releases the connection (this used to leak every socket).
+            OpenFile::Socket(idx) if crate::sock::socket_refs(idx) == 0 => {
+                akuma_net::socket::remove_socket(idx);
+            }
+            _ => {}
         }
     }
 }

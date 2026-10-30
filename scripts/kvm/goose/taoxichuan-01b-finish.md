@@ -3,7 +3,7 @@
 You are goose-glm, the metal track of the experiment in
 `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md`, on the ryzen box. Your last session got
 Taoxichuan to the stage-1 gate (`init spawn`, banner, zero faults) and then your 5-hour quota ran
-out before the paperwork. The owner liked what you wrote. This prompt finishes stage 1; stage 2
+out before the paperwork. The user liked what you wrote. This prompt finishes stage 1; stage 2
 is a separate prompt later - do not build ahead.
 
 Every shell command starts with
@@ -28,7 +28,7 @@ From now on, keep any new `asm!`/`global_asm!`/port I/O in the new crates behind
 
 ## 2. The banner: keep the words, improve the picture
 
-The owner approved the text and tone of your banner ("a nice vibe"). **Keep every word of it
+The user approved the text and tone of your banner ("a nice vibe"). **Keep every word of it
 exactly as it is now** (the four text lines, "Taoxichuan 0.1.0 (Akuma/amd64 crates) x86_64 -- stage 1",
 and the `Taoxichuan:` status lines). Change only the ASCII art around the text:
 

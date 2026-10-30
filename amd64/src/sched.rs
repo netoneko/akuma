@@ -113,31 +113,31 @@ pub const MAX_TASKS: usize = akuma_primitives::preempt::MAX_THREADS;
 /// (`smp::XCR0_ENABLED`). 64-byte aligned as `xsave64` requires.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-pub struct FxArea([u8; 832]);
+pub struct FxArea([u8; akuma_fpu_amd64::XSAVE_SIZE]);
 
 impl FxArea {
     /// Bytes of the image, in `xsave` standard-format layout: 512 legacy
     /// (`fxsave`), the 64-byte header at 512, `ymm` upper halves at 576.
-    pub const SIZE: usize = 832;
+    pub const SIZE: usize = akuma_fpu_amd64::XSAVE_SIZE;
     /// `MXCSR`'s offset in the legacy area.
-    const MXCSR: usize = 24;
+    const MXCSR: usize = akuma_fpu_amd64::MXCSR;
     /// `MXCSR_MASK`'s offset in the legacy area — written by `fxsave`; `0`
     /// means the pre-SSE2 default mask applies.
-    const MXCSR_MASK: usize = 28;
+    const MXCSR_MASK: usize = akuma_fpu_amd64::MXCSR_MASK;
     /// `XSTATE_BV`'s offset: which components the image holds.
-    const XSTATE_BV: usize = 512;
+    const XSTATE_BV: usize = akuma_fpu_amd64::XSTATE_BV;
     /// `XCOMP_BV`'s offset: must be 0 for the standard (non-compacted) form.
-    const XCOMP_BV: usize = 520;
+    const XCOMP_BV: usize = akuma_fpu_amd64::XCOMP_BV;
     /// The header's reserved tail, which `xrstor` requires to be zero.
-    const HEADER_RESERVED: core::ops::Range<usize> = 528..576;
+    const HEADER_RESERVED: core::ops::Range<usize> = akuma_fpu_amd64::HEADER_RESERVED;
     /// Default `MXCSR_MASK` when the CPU reports 0 (Intel SDM, `FXRSTOR`).
-    const MXCSR_MASK_DEFAULT: u32 = 0xFFBF;
+    const MXCSR_MASK_DEFAULT: u32 = akuma_fpu_amd64::MXCSR_MASK_DEFAULT;
 
     /// An all-zero image. Not a valid *state* to load — `MXCSR` 0 unmasks every
     /// SSE exception — but the right starting point for an `xsave`, whose
     /// header must not carry a previous image's bits.
     pub const fn zeroed() -> Self {
-        Self([0; 832])
+        Self([0; akuma_fpu_amd64::XSAVE_SIZE])
     }
 
     /// The state a guest or a fresh program starts with ([`FxArea::initial`]).
@@ -156,13 +156,7 @@ impl FxArea {
     /// nothing wrong. `XSTATE_BV` (header offset 0) says x87+SSE are live so
     /// `xrstor` loads the values above; AVX is in its init state (all zero).
     const fn initial() -> Self {
-        let mut a = [0u8; 832];
-        a[0] = 0x7F;
-        a[1] = 0x03;
-        a[24] = 0x80;
-        a[25] = 0x1F;
-        a[512] = 0b11;
-        Self(a)
+        Self(akuma_fpu_amd64::initial_xsave())
     }
 
     /// Make an image a ring-3 program handed back through `rt_sigreturn` safe
@@ -177,17 +171,11 @@ impl FxArea {
     /// only the program that supplied it. Linux's `restore_sigcontext` filters
     /// the same four (`validate_user_xstate_header`, the `mxcsr` mask).
     pub fn sanitize(&mut self) {
-        let mask = mxcsr_mask();
-        let mxcsr = u32::from_le_bytes(self.0[Self::MXCSR..Self::MXCSR + 4].try_into().unwrap()) & mask;
-        self.0[Self::MXCSR..Self::MXCSR + 4].copy_from_slice(&mxcsr.to_le_bytes());
-        self.0[Self::MXCSR_MASK..Self::MXCSR_MASK + 4].copy_from_slice(&mask.to_le_bytes());
-        if smp::XSAVE_ON.load(Ordering::Relaxed) {
-            let bv = u64::from_le_bytes(self.0[Self::XSTATE_BV..Self::XSTATE_BV + 8].try_into().unwrap())
-                & smp::XCR0_ENABLED;
-            self.0[Self::XSTATE_BV..Self::XSTATE_BV + 8].copy_from_slice(&bv.to_le_bytes());
-            self.0[Self::XCOMP_BV..Self::XCOMP_BV + 8].fill(0);
-            self.0[Self::HEADER_RESERVED].fill(0);
-        }
+        akuma_fpu_amd64::sanitize(
+            &mut self.0,
+            mxcsr_mask(),
+            akuma_fpu_amd64::SaveFormat::select(smp::XSAVE_ON.load(Ordering::Relaxed)),
+        );
     }
 }
 

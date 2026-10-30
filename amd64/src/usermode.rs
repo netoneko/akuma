@@ -1455,6 +1455,12 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
     // `akuma_syscalls_abi`'s table first; if the call has an asm-generic number,
     // it belongs in the `match call` below, where the AArch64 kernel's
     // implementation can eventually serve it.
+    // The ten legacy path spellings (82/83/84/86/87/88/89/90/92/94) are
+    // `AT_FDCWD` folds owned by `akuma_syscalls_abi::legacy` - one table for
+    // this kernel and Taoxichuan; the symlink/utimensat history is its doc.
+    if let Some((call, args)) = akuma_syscalls_abi::legacy::fold(nr, [a1, a2, a3, a4, a5, a6]) {
+        return to_glue(call, args);
+    }
     match nr {
         // x86_64 158: the TLS-base primitive. No aarch64 number, and no
         // equivalent either — `arch_prctl(ARCH_SET_FS)` is what `set_tpidr_el0`
@@ -1500,53 +1506,6 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // neither existed.
         22 => return crate::fd::sys_pipe2(a1, 0),
         33 => return crate::fd::sys_dup2(a1, a2),
-        // The legacy, non-`at` path calls — x86_64 82/83/84/87/88/89 — as thin
-        // `AT_FDCWD` shims. `rmdir` (84) is `unlinkat` with `AT_REMOVEDIR`
-        // (0x200). Since 4b step 2 batch 1 the `*at` arms live in glue, so the
-        // shims hand it the asm-generic number (`to_glue` owns the hop) with
-        // `AT_FDCWD` in the dirfd slots — `AT_FDCWD` is -100 in both ABIs.
-        // `AKUMA_AMD64_4B_FOLD_BATCH1.md` records the divergences the fold
-        // adopted.
-        82 => return to_glue(Syscall::Renameat, [AT_FDCWD, a1, AT_FDCWD, a2, 0, 0]),
-        83 => return to_glue(Syscall::Mkdirat, [AT_FDCWD, a1, a2, 0, 0, 0]),
-        84 => return to_glue(Syscall::Unlinkat, [AT_FDCWD, a1, 0x200, 0, 0, 0]),
-        87 => return to_glue(Syscall::Unlinkat, [AT_FDCWD, a1, 0, 0, 0, 0]),
-        // `symlink(target, linkpath)` — x86_64 88.
-        //
-        // **This arm used to call `sys_utimensat`.** Its comment read
-        // "`utimensat` (280) / `futimens` (88)", and there is no `futimens`
-        // syscall in Linux at all — libc implements it as `utimensat(fd, NULL,
-        // times, 0)`. x86_64 88 is `symlink`, sitting between `unlink` (87) and
-        // `readlink` (89), both of which are correct shims two lines up. So
-        // `ln -s` handed its *link path* to `utimensat` as a `struct
-        // timespec[2]` pointer. Found 2026-09-07 while widening
-        // `akuma-syscalls-abi` for C1 — exactly the wrong-answer-not-a-compile-
-        // error class that widening exists to prevent, one layer up from the
-        // aarch64/x86_64 crossing.
-        //
-        // `symlinkat(target, newdirfd, linkpath)` takes the dirfd *second*.
-        88 => return to_glue(Syscall::Symlinkat, [a1, AT_FDCWD, a2, 0, 0, 0]),
-        // `link(old, new)` — x86_64 86. No asm-generic twin; `linkat` with
-        // both dirfds `AT_FDCWD` and no flags, which is exactly `link`'s
-        // meaning (the source is not followed). Had no arm at all, so busybox
-        // `ln` answered `ENOSYS` on this target.
-        86 => return to_glue(Syscall::Linkat, [AT_FDCWD, a1, AT_FDCWD, a2, 0, 0]),
-        // `readlink(path, buf, size)` — x86_64 89. Was a flat EINVAL while no
-        // symlink could exist; `symlinkat` made package symlinks real.
-        89 => return to_glue(Syscall::Readlinkat, [AT_FDCWD, a1, a2, a3, 0, 0]),
-        // `chmod(path, mode)` — x86_64 90. No asm-generic twin (`fchmodat` is
-        // the modern spelling), so per rule 2 it is an `AT_FDCWD` shim. It was
-        // `ENOSYS` for the whole life of the port and `git clone` chmods every
-        // file it writes (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
-        90 => return to_glue(Syscall::Fchmodat, [AT_FDCWD, a1, a2, 0, 0, 0]),
-        // `chown(path, uid, gid)` / `lchown` — x86_64 92/94. No asm-generic
-        // twins, so `AT_FDCWD` shims onto `fchownat`; `lchown` passes
-        // `AT_SYMLINK_NOFOLLOW` (0x100). `fchown` (93) is a real row now — it
-        // used to be shimmed here with the fd as a dirfd and a NULL path, which
-        // was harmless only while `fchownat` returned 0 for everything.
-        // `tar`/`apk` chown every file they unpack.
-        92 => return to_glue(Syscall::Fchownat, [AT_FDCWD, a1, a2, a3, 0, 0]),
-        94 => return to_glue(Syscall::Fchownat, [AT_FDCWD, a1, a2, a3, 0x100, 0]),
         // `fork` (57) / `vfork` (58) — a real eager-copy fork; see `sys_fork`
         // (`vfork` gets the same, its "don't touch the parent" contract is moot
         // once the address space is copied). asm-generic has neither: `clone`

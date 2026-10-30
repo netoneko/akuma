@@ -390,6 +390,9 @@ host-test.
 | `akuma-rump` | device-independent orchestration for the rump raw-L2 path |
 | `akuma-scheduler` | discrete-event simulator for placement / netpoll wake policy |
 | `akuma-syscalls` | the shape of a syscall excursion (prologue/epilogue decisions, identity-slot model) |
+| `akuma-user-tree` | the CoW fork's per-entry decisions over a 4-level user tree (skip / refuse / descend / copy / share-and-demote), the free order, and the `SharedSpans` policy; plans only, no walker |
+| `akuma-fpu-amd64` | the amd64 FPU save area as pure byte algebra: `fxsave`/`xsave` sizes and offsets, the power-on image, and the `sanitize` rule that makes a program-supplied image safe to `xrstor` |
+| `akuma-syscalls-signal` | the signal bookkeeping: the `rt_sigaction` table and its wire image, execve reset, `rt_sigprocmask` algebra (no delivery) |
 | `akuma-syscalls-sync` | the futex family: op decode, waiter table, deadline algebra, `WAKE_OP`, wait-loop outcome |
 | `akuma-syscalls-poll` | the epoll/poll/select family: the fd-state → event-bits readiness map, the interest list and its `epoll_ctl` errno set, the `EPOLLET` armed-state decision, the `ppoll`/`pselect6` wire marshalling |
 | `akuma-tty` | termios vocabulary, session line discipline, Unix98 pty state machine |

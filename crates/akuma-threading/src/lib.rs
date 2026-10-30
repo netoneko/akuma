@@ -5505,6 +5505,23 @@ pub fn on_cpu_flag(tid: usize) -> bool {
     tid < MAX_THREADS && ON_CPU[tid].load(Ordering::SeqCst) != 0
 }
 
+/// Release `slot`'s [`ON_CPU`] gate after its occupant ran to completion *in
+/// place* and control came back to the caller's own stack on the same core.
+///
+/// Taoxichuan's spawn crossing (`child_enter`) runs a child on a ring slot
+/// without the scheduler ever switching away from it for good: the gate the
+/// switch path raised is only lowered by the next switch's tail, which never
+/// comes for a slot whose last "switch" was the return into its parent. The
+/// slot then sits `TERMINATED` but `ON_CPU`, which [`slot_reusable`] refuses
+/// forever - one ring slot burned per command, and `x86_claim_slot` out of
+/// slots after a dozen. **Only call this when the occupant is dead and no core
+/// is executing on its stacks.**
+pub fn x86_release_on_cpu(slot: usize) {
+    if slot < MAX_THREADS {
+        ON_CPU[slot].store(0, Ordering::SeqCst);
+    }
+}
+
 /// Test/diagnostic accessor: how many [`ON_CPU`] gates are set. Bounded by the
 /// number of cores on a healthy system (each core runs exactly one thread, plus
 /// at most one not-yet-cleared outgoing gate per core mid-switch).

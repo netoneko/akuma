@@ -312,7 +312,7 @@ rgroup H2 \
   'h2b=dd if=/etc/hostname of=/dev/null'
 vline H2 "$(agg "$RCS")" "h2a.console h2b.console"
 
-# H3: the owner-approved 3-exec split (no fork arm => no one-line ";" form).
+# H3: the user-approved 3-exec split (no fork arm => no one-line ";" form).
 rgroup H3 \
   'h3a=sh -c "echo x > /tmp/f"' \
   'h3b=cat /tmp/f' \

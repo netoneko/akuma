@@ -423,6 +423,8 @@ akuma-kacho = { path = "../crates/akuma-kacho" }
 # The formats are shared either way, and the formats are where a divergence is
 # invisible: `ps` finds `utime` by counting to field 14 of a 44-field line.
 akuma-procfs = { path = "../crates/akuma-procfs" }
+# The FPU save area's sizes, offsets, power-on image and `sanitize` rule (shared with taoxichuan).
+akuma-fpu-amd64 = { path = "../crates/akuma-fpu-amd64" }
 # The per-process frame ledger — which physical frames a process holds and how
 # many VAs map each, with the two-counts rule and 14 host tests. Replaced this
 # target's `FrameSet`, a 2048-entry flat array with no refcounts whose ceiling

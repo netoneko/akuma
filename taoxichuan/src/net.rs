@@ -38,34 +38,9 @@ use akuma_net::NetRuntime;
 // build fails at compile time instead of at instruction decode.
 // ---------------------------------------------------------------------------
 
-/// Write one byte to an x86 I/O port.
-#[cfg(target_arch = "x86_64")]
-fn outb(port: u16, val: u8) {
-    // SAFETY: a device port this module owns the use of (the PIT block
-    // below); kernel-only, no side effects outside the timer.
-    unsafe {
-        core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
-    }
-}
-
-/// Read one byte from an x86 I/O port.
-#[cfg(target_arch = "x86_64")]
-fn inb(port: u16) -> u8 {
-    let val: u8;
-    // SAFETY: as `outb` — the PIT block only.
-    unsafe {
-        core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags));
-    }
-    val
-}
-
 /// One spin-loop hint.
 #[inline]
 fn pause() {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: a hint instruction, no state.
-    unsafe { core::arch::asm!("pause", options(nomem, nostack, preserves_flags)) }
-    #[cfg(not(target_arch = "x86_64"))]
     core::hint::spin_loop();
 }
 
@@ -80,30 +55,15 @@ fn pause() {
 /// gate poll keeps the bare pause (an hlt would skew the TSC window).
 #[inline]
 pub fn wait_lap() {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: no memory access; IF is open for the one hlt instruction and
-    // restored right after; the only unmasked source is the tick, whose
-    // handler is reentrant with every caller of this fn.
-    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) }
-    #[cfg(not(target_arch = "x86_64"))]
-    core::hint::spin_loop();
+    // `sti; hlt; cli`: IF is open for the one hlt and restored right after; the
+    // only unmasked source is the tick, whose handler is reentrant with every
+    // caller of this fn.
+    akuma_cpu::park::wfi();
 }
 
 /// Read the timestamp counter.
-#[cfg(target_arch = "x86_64")]
 fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    // SAFETY: reads a counter register.
-    unsafe {
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
-    }
-    (u64::from(hi) << 32) | u64::from(lo)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn rdtsc() -> u64 {
-    0
+    akuma_cpu::tsc::rdtsc()
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +73,7 @@ fn rdtsc() -> u64 {
 /// TSC increments per microsecond; 0 until [`calibrate`] has run.
 static TSC_PER_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Whether the PIT was there to calibrate against (`pit_present` measured
+/// Whether the PIT was there to calibrate against (`SYSTEM_CONTROL_B.present()` measured
 /// port 0x61 answering, and the window closed before the TSC drift could).
 static TSC_CALIBRATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -124,11 +84,6 @@ static TSC_CALIBRATED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// the rate is a guess.
 const TSC_PER_US_GUESS: u64 = 2_500;
 
-/// The PIT ports: channel 2 count/gate, mode register, and port B (gate
-/// enable in bit 0, the channel's OUT pin readable in bit 5).
-const PIT_CH2: u16 = 0x42;
-const PIT_MODE: u16 = 0x43;
-const PIT_PORT_B: u16 = 0x61;
 /// The 8254's crystal frequency, Hz.
 const PIT_HZ: u64 = 1_193_182;
 /// Calibration window: ~50 ms of PIT counts (short enough to not slow the
@@ -146,26 +101,36 @@ const OUT_WAIT_BUDGET: u32 = 20_000_000;
 /// port B, then the OUT pin polled until the count expires. `tsc / elapsed`
 /// is the rate. Every step is bounded so a missing PIT costs one guessed
 /// clock, never a hang.
-fn calibrate() {
-    if !pit_present() {
+/// No usable PIT: take the TSC rate the LAPIC timer calibration already measured
+/// (`akuma_lapic_amd64::tsc_hz`, which runs before this), and only guess if that has not run.
+///
+/// The fixed guess alone made every guest clock wrong by `real / 2500`: under KVM there is no PIT
+/// behind port 0x61, the host TSC is ~3.8 GHz, and the "3m09" a build printed took 129 s on the
+/// host - 1.5x fast (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md` section 3).
+fn use_lapic_rate(why: &str) {
+    let hz = akuma_lapic_amd64::tsc_hz();
+    if hz >= 1_000_000 {
+        let per_us = hz / 1_000_000;
+        TSC_PER_US.store(per_us, core::sync::atomic::Ordering::Relaxed);
+        TSC_CALIBRATED.store(true, core::sync::atomic::Ordering::Relaxed);
+        akuma_primitives::safe_print!(96, "  net: {why} -- TSC rate from the LAPIC calibration: {} cyc/us\n", per_us);
+    } else {
         TSC_PER_US.store(TSC_PER_US_GUESS, core::sync::atomic::Ordering::Relaxed);
-        akuma_primitives::safe_print!(
-            96,
-            "  net: no PIT behind port 0x61 -- TSC rate is a guess ({TSC_PER_US_GUESS}/us)\n"
-        );
+        akuma_primitives::safe_print!(96, "  net: {why} -- TSC rate is a guess ({TSC_PER_US_GUESS}/us)\n");
+    }
+}
+
+fn calibrate() {
+    if !akuma_port::SYSTEM_CONTROL_B.present() {
+        use_lapic_rate("no PIT behind port 0x61");
         return;
     }
-    // Program channel 2: mode 0, lobyte/hibyte, the count.
-    outb(PIT_MODE, 0b1011_0000);
-    let count = PIT_COUNT as u16;
-    outb(PIT_CH2, count as u8);
-    outb(PIT_CH2, (count >> 8) as u8);
-    // Gate on (bit 0), speaker off (bit 1) — the channel starts counting.
-    let pb = inb(PIT_PORT_B);
-    outb(PIT_PORT_B, (pb & 0xFD) | 0x01);
+    // Channel 2, mode 0, the count; then raise its gate (speaker off) so it starts down, and poll OUT.
+    akuma_port::PIT.load_channel2_oneshot(PIT_COUNT as u16);
+    let saved = akuma_port::SYSTEM_CONTROL_B.begin_channel2();
     let t0 = rdtsc();
     let mut guard = 0u32;
-    while inb(PIT_PORT_B) & 0x20 == 0 {
+    while !akuma_port::SYSTEM_CONTROL_B.channel2_output_high() {
         pause();
         guard += 1;
         if guard > OUT_WAIT_BUDGET {
@@ -173,14 +138,9 @@ fn calibrate() {
         }
     }
     let t1 = rdtsc();
-    // Gate off.
-    outb(PIT_PORT_B, pb & 0xFC);
+    akuma_port::SYSTEM_CONTROL_B.end_channel2(saved);
     if guard > OUT_WAIT_BUDGET || t1 <= t0 {
-        TSC_PER_US.store(TSC_PER_US_GUESS, core::sync::atomic::Ordering::Relaxed);
-        akuma_primitives::safe_print!(
-            96,
-            "  net: PIT output never rose -- TSC rate is a guess ({TSC_PER_US_GUESS}/us)\n"
-        );
+        use_lapic_rate("PIT output never rose");
         return;
     }
     let elapsed_us = (u64::from(PIT_COUNT) * 1_000_000) / PIT_HZ;
@@ -190,24 +150,6 @@ fn calibrate() {
     akuma_primitives::safe_print!(96, "  net: TSC calibrated vs PIT: {} cyc/us\n", per_us);
 }
 
-/// Does port B answer at all? A write of the gate bit read back is the
-/// cheapest honest probe; a bus with no device behind it reads back what the
-/// last write to any port left, which this kernel never does — so a stuck
-/// value reads as "no PIT", the safe answer (a guessed clock, one line).
-#[cfg(target_arch = "x86_64")]
-fn pit_present() -> bool {
-    let orig = inb(PIT_PORT_B);
-    let flipped = orig ^ 0x01;
-    outb(PIT_PORT_B, flipped);
-    let readback = inb(PIT_PORT_B);
-    outb(PIT_PORT_B, orig);
-    readback & 0x01 == flipped & 0x01
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn pit_present() -> bool {
-    false
-}
 
 /// Microseconds since boot (the calibrated TSC), the stack's one clock.
 pub fn uptime_us() -> u64 {
@@ -310,20 +252,6 @@ fn park_until(deadline_us: u64) {
 /// the only pump in the kernel alive, or the guest deadlocks with its
 /// NIC ring unposted and its TX frames unflushed (Q5 wedge).
 fn blocking_relax() {
-    // [tmp] pl-2 (remove before final): a socket waiter entering its poll
-    // laps names itself (capped) — the "halted but pumping" shape.
-    static BR_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    {
-        let n = BR_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 30 {
-            akuma_primitives::safe_print!(
-                96,
-                "[tmp] BRELAX n={} slot={}\n",
-                n,
-                crate::exec_twin::current_slot()
-            );
-        }
-    }
     for _ in 0..64 {
         netpoll();
         wait_lap();
@@ -436,24 +364,22 @@ pub fn net_init() -> bool {
 /// NIC every lap. This is the sshd serve loop's `sleep_ms(1)` — which makes
 /// it, not any daemon, the thing that keeps TCP alive between events.
 pub fn sleep_until(deadline_us: u64) {
-    // [tmp] pl-2 (remove before final): a FAR sleep names itself (capped) —
-    // the 1 ms serve-loop laps must not print; a far park that never returns
-    // is exactly the flatline shape.
-    static FAR_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let now0 = uptime_us();
-    if deadline_us > now0 + 100_000 {
-        let n = FAR_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 30 {
-            akuma_primitives::safe_print!(
-                96,
-                "[tmp] SLEEPFAR n={} us={}\n",
-                n,
-                deadline_us - now0
-            );
-        }
-    }
     while uptime_us() < deadline_us {
         netpoll();
-        wait_lap();
+        // A slotted task polling in the kernel is IF-masked, so the tick never
+        // preempts it: if another task is READY (rustc's gcc child, forked
+        // while this one waited on its pipes) it would starve forever. Hand
+        // over the core, keeping the syscall stub's user-rsp stash across it.
+        let slot = crate::exec_twin::current_slot();
+        if slot != crate::exec_twin::NO_SLOT
+            && slot < crate::child::NSLOTS
+            && akuma_threading::x86_runnable_exists()
+        {
+            let stash = akuma_ring3_amd64::user_rsp_stash();
+            akuma_threading::x86_yield();
+            akuma_ring3_amd64::set_user_rsp_stash(stash);
+        } else {
+            wait_lap();
+        }
     }
 }

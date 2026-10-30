@@ -11,3 +11,8 @@ workspace = true
 # Just the ABI shapes: SIZEOF_IFREQ, IFNAMSIZ, ARPHRD_ETHER. A dependency-free
 # leaf, so this crate stays one too.
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+
+[dev-dependencies]
+# The differential test decodes/encodes the same bytes through `akuma-net`'s `SockAddrIn` -
+# the struct the old code reinterpreted - so the new byte arithmetic is checked against it.
+akuma-net = { path = "../akuma-net" }

@@ -965,7 +965,7 @@ pub static XSAVE_ON: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 /// `XCR0` value this kernel enables: x87 (bit 0), SSE (1), AVX (2). Its
 /// `xsave` area is 832 bytes (512 legacy + 64 header + 256 `ymm` upper
 /// halves), which `sched.rs::XsArea` is sized for. AVX-512 state is left off.
-pub const XCR0_ENABLED: u64 = 0b111;
+pub const XCR0_ENABLED: u64 = akuma_fpu_amd64::XCR0_ENABLED;
 
 /// Turn on `CR4.OSXSAVE` and set `XCR0` to [`XCR0_ENABLED`], if cpuid says the
 /// part has XSAVE and AVX. Per core (CR4 and XCR0 are), so the BSP and every AP

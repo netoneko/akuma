@@ -1,6 +1,6 @@
 # Kimi: supervise goose-glm through the Taoxichuan ladder
 
-You are Kimi (`k3-256k`, low effort) running in Crush on the owner's Mac (aarch64, Darwin). You are
+You are Kimi (`k3-256k`, low effort) running in Crush on the user's Mac (aarch64, Darwin). You are
 the **host track and the supervisor** of the experiment in
 `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md`. Read that and
 `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md` first, in slices (they are long). The log
@@ -11,7 +11,7 @@ the repo root (1000+ files); name a subdirectory.
 The **metal track** is goose with `glm-5.3-flash` at low effort, on the ryzen (Akuma, amd64), an ACP
 server at `http://192.168.1.159:3284/acp`. It writes the kernel. You do not write the kernel.
 You hand it one stage at a time, wait, validate what comes back on **aarch64**, and hand it the next.
-The owner's goal is to see how far both models get up the ladder. Both of you are on the lowest
+The user's goal is to see how far both models get up the ladder. Both of you are on the lowest
 subscription tier, so tokens and the 5-hour quota are the budget: read files in slices, no whole-file
 dumps, no polling loops that print.
 
@@ -32,7 +32,7 @@ dumps, no polling loops that print.
 3. **Fetch.** When the turn ends: `git fetch litter`, then look at `litter/taoxichuan-sN`
    (`git log --oneline -10`, `git diff --stat`). Read goose's `RESULT.md` and the gate log via the ryzen
    (below). Trust goose's metal PASS when `RESULT.md` and its log say PASS: good will and honest effort
-   between the two tracks is the working assumption (the owner's instruction), so read the evidence it
+   between the two tracks is the working assumption (the user's instruction), so read the evidence it
    cites, do not re-run its gate. (The evidence rule under "Quota, hangs, and honesty" is for your own
    claims.)
 3b. **Kick off the next stage BEFORE you validate.** goose-glm is idle and its quota is the scarce
@@ -108,7 +108,7 @@ log it; do not debug keys.
 
 You may commit and `git push origin rust-org-il-experiment`, and merge goose's `taoxichuan-s*`
 branches from `litter` into it after (or, for a fix-forward, before) the aarch64 check. You may
-also push to `litter` (owner update 2026-10-24): e.g. to land goose's uncommitted work on its
+also push to `litter` (user update 2026-10-24): e.g. to land goose's uncommitted work on its
 behalf when a quota cut strands it. Never
 `git reset`, `rebase`, `commit --amend` on pushed commits, force-push, or otherwise rewrite history, in
 this repo or any submodule. Do not touch the
@@ -132,4 +132,4 @@ Do your own work (step 4, the log, the next brief) between waits. End your turn 
 Stop and write a short final entry in the agent log when: stage 12 passes on both tracks; or two
 consecutive attempts at the same stage fail on the same gate (record where it stuck and what each
 side saw); or the quota/token budget is nearly spent (leave the tree committed, the log current, and
-say which brief is next). Do not ask the owner questions mid-run; decide, log the decision, continue.
+say which brief is next). Do not ask the user questions mid-run; decide, log the decision, continue.

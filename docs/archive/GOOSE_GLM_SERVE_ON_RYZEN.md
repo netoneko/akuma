@@ -15,7 +15,7 @@ client, for collaborating experiments) can drive over the network.
 - `HOME=/root` and `cd /root`, so git, logs (`/root/.local/state/goose/logs`),
   sessions and config are where an ssh session sees them.
 - `GOOSE_MODE=auto` (every tool call approved) and `--dangerously-unauthenticated`
-  (no secret key). **Anyone on the LAN can run commands as root.** The owner chose
+  (no secret key). **Anyone on the LAN can run commands as root.** The user chose
   this on 2026-10-24; first the service ran with a key
   (`GOOSE_SERVER__SECRET_KEY`), which is one flag to bring back.
 
