@@ -774,6 +774,7 @@ dependencies = [
  "akuma-syscalls-mem",
  "akuma-syscalls-net",
  "akuma-syscalls-poll",
+ "akuma-syscalls-signal",
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
  "akuma-timer",

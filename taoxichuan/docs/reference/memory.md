@@ -49,9 +49,10 @@ Canonical mermaid source: [`../diagrams/memory-map.md`](../diagrams/memory-map.m
   The slab is 16 GiB of *reserved address space* (a page costs memory when mapped, not when reserved); at 1 GiB one `rustc` ran out of it — it maps a 311 MB `librustc_driver` and a ~17 MB stack per codegen thread — and musl reported the failed stack `mmap` as `EAGAIN` ("failed to spawn work thread"). Memory is the next wall: the fill is still eager (see `gaps.md`).
   `MAP_FIXED` is honoured only inside the mmap slab; the bump cursor never
   rewinds past it. `mremap` grows by moving to a fresh region (MAYMOVE;
-  `MREMAP_FIXED` refused). `munmap`/`mprotect` are accepted no-ops (the slabs
-  live as long as the task; nothing enforces per-page protection after
-  placement).
+  `MREMAP_FIXED` refused). `munmap` returns address space (hole table); `mprotect`
+  re-maps the PTEs (`PROT_NONE` stays a no-op) under the W^X rule of
+  `docs/archive/TAOXICHUAN_WX_POLICY.md`: `W+X` is refused and `PROT_EXEC` is
+  refused on a page written since it was mapped (`EACCES`; `wx=0` turns it off).
 
 ## The user-pointer rule
 

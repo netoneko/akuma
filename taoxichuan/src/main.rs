@@ -314,6 +314,33 @@ fn grow_user_stack(cr2: u64) -> bool {
 /// (`mprotect(PROT_READ)`, text) — `akuma_cow::CowFault::marked`.
 const PTE_W: u64 = 1 << 1;
 const PTE_COW: u64 = 1 << 9;
+/// The x86 dirty bit: the CPU sets it on a user store, the kernel sets it on its own stores into user pages
+/// (`copy_to_user`). It is what "written since mapping" means for the W^X policy.
+const PTE_D: u64 = 1 << 6;
+
+/// W^X (`akuma_syscalls_mem::wx`): no page is writable and executable, and a page written since it was
+/// mapped cannot be made executable. On by default; `wx=0` on the kernel command line turns it off for a
+/// guest that needs a JIT. Stricter than Linux on purpose.
+static WX_ENFORCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+fn wx_on() -> bool {
+    WX_ENFORCE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Has the page at `va` in `root` been written since it was mapped (user store or kernel store)?
+fn page_written(root: u64, va: u64) -> bool {
+    leaf_entry(root, va & !0xFFF).is_some_and(|pte| pte.read() & PTE_D != 0)
+}
+
+/// Record that the kernel stored into the user page at `va` - the CPU sets the dirty bit for a user store,
+/// nothing sets it for ours.
+fn mark_written(root: u64, va: u64) {
+    if let Some(pte) = leaf_entry(root, va & !0xFFF) {
+        let v = pte.read();
+        if v & 1 != 0 && v & PTE_D == 0 {
+            pte.write(v | PTE_D);
+        }
+    }
+}
 const PTE_ADDR: u64 = 0x000f_ffff_ffff_f000;
 
 static COW_SHARED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -413,17 +440,27 @@ fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
     action
 }
 
-/// Before the kernel writes into the user page at `va` (through the physmap,
-/// which never faults): if it is a marked read-only page, break the share
-/// first. An unmarked read-only page is left alone (text; the writers only
-/// target stack/heap/scratch).
-fn cow_prepare_write(root: u64, va: u64) {
-    if let Some(slot) = leaf_entry(root, va & !0xFFF) {
-        let pte = slot.read();
-        if pte & 1 != 0 && pte & PTE_W == 0 && pte & PTE_COW != 0 {
-            let _ = cow_resolve(root, va);
-        }
+/// Before the kernel writes into the user page at `va` (through the physmap, which never faults): decide
+/// whether the write may happen. `false` is `EFAULT`, as on Linux, where a kernel write to a page the user
+/// could not write faults.
+///
+/// * A marked read-only page is a CoW share: break it first. If the break cannot get a frame the write is
+///   refused - it used to be attempted anyway, into the still-shared frame, corrupting the other holder.
+/// * An UNMARKED read-only page that several spaces hold (shared text, or an `mprotect(PROT_READ)` page after a
+///   fork) must not be written: the write would land in every holder. Refused.
+/// * An unshared read-only page is left writable to the kernel (the only holder is the one asking).
+fn cow_prepare_write(root: u64, va: u64) -> bool {
+    let Some(slot) = leaf_entry(root, va & !0xFFF) else {
+        return true; // not mapped: the translate that follows reports it
+    };
+    let pte = slot.read();
+    if pte & 1 == 0 || pte & PTE_W != 0 {
+        return true;
     }
+    if pte & PTE_COW != 0 {
+        return !matches!(cow_resolve(root, va), akuma_cow::CowAction::Fault);
+    }
+    akuma_pmm::cow_ref_get((pte & PTE_ADDR) as usize) < 2
 }
 
 /// `mprotect` is about to make `va` writable: a frame several spaces hold
@@ -1074,8 +1111,16 @@ fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
     }
     let want = PteProt { write: prot & ring3::mmap::PROT_WRITE != 0, exec: prot & ring3::mmap::PROT_EXEC != 0, user: true };
     let root = task().root_pa;
+    // W^X: decided for the whole range before any page changes, so a refusal leaves it as it was.
+    if wx_on()
+        && let Some(no) = akuma_syscalls_mem::wx::check_range(prot, |i| page_written(root, addr + i * 4096), pages).errno()
+    {
+        return e(no);
+    }
     for i in 0..pages {
         let va = (addr + i * 4096) as usize;
+        // The remap below builds a fresh PTE; carry "written" across it or the policy forgets.
+        let was_written = page_written(root, va as u64);
         if want.write && !cow_privatize(root, va as u64) {
             return e(ring3::err::ENOMEM);
         }
@@ -1085,6 +1130,9 @@ fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
         let _ = paging::unmap_page_in(root, va);
         if !paging::map_page_in(root, va, pa, want, MemAttr::WriteBack) {
             return e(ring3::err::ENOMEM);
+        }
+        if was_written {
+            mark_written(root, va as u64);
         }
     }
     0
@@ -1470,7 +1518,9 @@ fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
         let va = dst_va + done as u64;
         let page_rem = 4096 - (va & 0xFFF) as usize;
         let n = page_rem.min(src.len() - done);
-        cow_prepare_write(root, va);
+        if !cow_prepare_write(root, va) {
+            return false;
+        }
         let Some(pa) = paging::translate_in(root, (va & !0xFFF) as usize) else {
             return false;
         };
@@ -1478,6 +1528,7 @@ fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
         // RW (or RO, for image bytes — every caller writes only into
         // stack/heap/scratch regions).
         unsafe { phys::Frame::from_pa(pa) }.write_bytes((va & 0xFFF) as usize, &src[done..done + n]);
+        mark_written(root, va);
         done += n;
     }
     true
@@ -2953,6 +3004,14 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::GETTID => my_tid(),
         ring3::nr::GETPID | akuma_syscalls_abi::x86_64::GETPID => u64::from(child::current_pid()),
         ring3::nr::GETPPID => 1, // everything here is the init task's child
+        // Session and process-group identity. There is no controlling terminal and no job control here, so each
+        // task is its own session and group leader: `setsid` succeeds and reports the new session id (the pid),
+        // `getsid`/`getpgid` answer the pid, `setpgid` accepts. `git` daemonises with `setsid` and used to die
+        // with "fatal: setsid failed: Function not implemented".
+        akuma_syscalls_abi::x86_64::SETSID | akuma_syscalls_abi::x86_64::GETSID | akuma_syscalls_abi::x86_64::GETPGID => {
+            u64::from(child::current_pid())
+        }
+        akuma_syscalls_abi::x86_64::SETPGID => 0,
         ring3::nr::GETUID | ring3::nr::GETEUID => 0,
         ring3::nr::GETGID | ring3::nr::GETEGID => 0,
         ring3::nr::IOCTL => {
@@ -2980,6 +3039,9 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let off = fr.arg6();
             if len == 0 {
                 return e(ring3::err::EINVAL);
+            }
+            if wx_on() && let Some(no) = akuma_syscalls_mem::wx::check_prot(prot).errno() {
+                return e(no);
             }
             // M5: two kinds of mapping. MAP_ANONYMOUS — the only kind this
             // kernel served before — and, now, MAP_PRIVATE of an open file:
@@ -3027,13 +3089,16 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     None => return e(ring3::err::ENOMEM),
                 }
             };
-            // Anonymous memory is RW; exec is honoured by widening, at the
-            // cost of W^X — a task that maps RWX here tells the kernel it
-            // wants it, and there is no W^X policy layer to argue with.
-            let pte = if prot & ring3::mmap::PROT_EXEC != 0 {
-                PteProt::USER_RWX
-            } else {
+            // Mappings are RW (the kernel fills them), except that exec is exec: with W^X on, a
+            // `PROT_EXEC` mapping is RX - `W|X` was refused above, so it asked for no write - and a
+            // page can only become executable if the program never wrote it. With `wx=0` the old
+            // widening to RWX is back.
+            let pte = if prot & ring3::mmap::PROT_EXEC == 0 {
                 PteProt::USER_RW
+            } else if wx_on() {
+                PteProt::USER_RX
+            } else {
+                PteProt::USER_RWX
             };
             let mut page = base & !0xFFF;
             while page < base + pages {
@@ -5180,6 +5245,9 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // (`akuma-cmos-rtc`, `akuma-sntp`), neither reachable under this guest.
     if let Some(n) = cmdline_token(hvm_start_info, "mmdbg=", &mut [0u8; 8]).and_then(|v| v.parse::<u32>().ok()) {
         MMDBG_V.store(n, core::sync::atomic::Ordering::Relaxed);
+    }
+    if cmdline_token(hvm_start_info, "wx=", &mut [0u8; 4]) == Some("0") {
+        WX_ENFORCE.store(false, core::sync::atomic::Ordering::Relaxed);
     }
     if let Some(e) = cmdline_token(hvm_start_info, "epoch=", &mut [0u8; 32]) {
         match e.parse::<u64>() {

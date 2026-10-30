@@ -243,3 +243,7 @@ Q2 answered in the code: plans are returned by value, one per entry, never a `Ve
 `clone_user_tree`, `clone_user_half_into` and `free_subtree` perform the plans (counters unchanged: `shared=15520 copied=320 taken=320`, leak delta 0); amd64 does not switch its walk (as planned).
 Side effect: the old PML4-level "huge page" refusal returned without releasing the subtrees already cloned; the shared failure path (`release_cloned_prefix`) now does.
 All three extraction slices of this plan that were still open (3, 4, 5) are done; the remaining `Q`s are the uaccess adoption (S6) and amd64 adopting `akuma-syscalls-signal`.
+
+**amd64 adopts `akuma-syscalls-signal` (2026-10-30), the part that is equivalent:** the signal-mask algebra lives in `akuma-syscalls-glue` (shared with the AArch64 kernel; `amd64/src/signal.rs` is delivery only), and
+`sys_rt_sigprocmask` now calls `akuma_syscalls_signal::procmask`, pinned by an exhaustive differential test against the formula it replaced (which found and fixed a `SIG_UNBLOCK` difference in the crate). `rt_sigaction` was **not** switched:
+glue is looser than the crate's `check` (wrong `sigsetsize` silently zeroes the mask; querying SIGKILL/SIGSTOP is refused) and aligning it would change the AArch64 kernel; recorded as a pinned divergence.

@@ -9,7 +9,7 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1473
+- **Total distinct fixes counted:** 1476
 - **Docs contributing at least one fix:** 407
 - **Subsystem categories:** 15
 
@@ -27,7 +27,7 @@ from several subsystems under one write-up.
 | VFS & Filesystem | 134 | 9.1% | 40 |
 | Boot & Drivers | 141 | 9.6% | 22 |
 | Signals & Exceptions | 40 | 2.7% | 15 |
-| Misc / Cross-cutting | 62 | 4.2% | 20 |
+| Misc / Cross-cutting | 65 | 4.4% | 20 |
 | Console & Terminal | 58 | 3.9% | 18 |
 | Containers | 55 | 3.7% | 10 |
 | **Total** | **1470** | **100.0%** | **406** |
@@ -2079,7 +2079,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_METAL_CONTROL_RUN.md
 - Emulating a trapped `MRS` with `rt == 31` on AArch64 wrote word 31 of the trap frame (`sp_el0`) instead of discarding the result as `XZR`, as the read side already did
 
-## Misc / Cross-cutting (62 fixes, 20 docs)
+## Misc / Cross-cutting (65 fixes, 20 docs)
 
 ### docs/archive/AKUMA_KVM.md
 (The SVM phases — trivial guest, permission maps + AP hook, the 12-probe consistency ladder, the long-mode metal PASS, the two-level translation phase — are capability, not fixes; the ladder is an instrument, not a defect. These are the two defects the phases surfaced.)
@@ -2201,6 +2201,9 @@ aren't recorded anywhere else.)
 ### docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md
 - `execve` answered `EFAULT` ("Bad address") for any call with more than 128 `argv` or `envp` entries or a string over 4096 bytes, because the pointer-array reader mapped "too many" to `None` and the caller mapped `None` to `EFAULT`; cargo's heaviest `rustc` call for this kernel has 344 arguments and a 5192-byte one, so the in-guest build died at its first big crate. The caps are 448/256/32 KiB, an oversize block answers `E2BIG`, and the argument block is 12 pages
 - A thread's own `exit` and `exit_group`'s `kill_siblings` freed the ring slot but never unregistered the thread's `Process` (only a group leader's `wait4` did), so every thread leaked a process-table entry and a `cargo build` reached `Process table full (256 slots, 0 reclaimable RETIRED)` at pid ~345 with a gigabyte free; thread exit now retires the row and `clone_thread` drains at syscall entry, the amd64 kernel's fix for the same family
+- the guest clock ran 1.52x fast under KVM: with no PIT behind port 0x61 the TSC rate fell back to a fixed 2.5 GHz guess while the LAPIC calibration, a line earlier, had measured the real 3.793 GHz; it now uses `tsc_hz()` from the LAPIC (a TCG guest, where the guess made the clock 2.5x slow, is fixed too)
+- `copy_to_user` wrote through the physmap into an unmarked read-only page that several spaces held (and, when the CoW break failed for lack of a frame, discarded the failure and wrote into the still-shared frame), corrupting the other holder; both now answer `EFAULT`
+- `SIG_UNBLOCK` in `akuma-syscalls-signal` left a stray SIGKILL/SIGSTOP bit in the mask forever (`cur & !(set & !UNBLOCKABLE)` instead of `cur & !set`), found by the differential test against the glue formula it replaced
 - the 1 GiB per-process mmap slab answered `ENOMEM` to `rustc`'s thread-stack `mmap` (it maps a 311 MB `librustc_driver` plus a ~17 MB stack per codegen thread), which musl reports as `EAGAIN` ("failed to spawn work thread", an ICE) with 2 GiB of RAM free; the slab is 16 GiB of reserved address space
 
 ## Console & Terminal (58 fixes, 18 docs)

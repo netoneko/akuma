@@ -127,13 +127,28 @@ const OUT_WAIT_BUDGET: u32 = 20_000_000;
 /// port B, then the OUT pin polled until the count expires. `tsc / elapsed`
 /// is the rate. Every step is bounded so a missing PIT costs one guessed
 /// clock, never a hang.
+/// No usable PIT: take the TSC rate the LAPIC timer calibration already measured
+/// (`akuma_lapic_amd64::tsc_hz`, which runs before this), and only guess if that has not run.
+///
+/// The fixed guess alone made every guest clock wrong by `real / 2500`: under KVM there is no PIT
+/// behind port 0x61, the host TSC is ~3.8 GHz, and the "3m09" a build printed took 129 s on the
+/// host - 1.5x fast (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md` section 3).
+fn use_lapic_rate(why: &str) {
+    let hz = akuma_lapic_amd64::tsc_hz();
+    if hz >= 1_000_000 {
+        let per_us = hz / 1_000_000;
+        TSC_PER_US.store(per_us, core::sync::atomic::Ordering::Relaxed);
+        TSC_CALIBRATED.store(true, core::sync::atomic::Ordering::Relaxed);
+        akuma_primitives::safe_print!(96, "  net: {why} -- TSC rate from the LAPIC calibration: {} cyc/us\n", per_us);
+    } else {
+        TSC_PER_US.store(TSC_PER_US_GUESS, core::sync::atomic::Ordering::Relaxed);
+        akuma_primitives::safe_print!(96, "  net: {why} -- TSC rate is a guess ({TSC_PER_US_GUESS}/us)\n");
+    }
+}
+
 fn calibrate() {
     if !pit_present() {
-        TSC_PER_US.store(TSC_PER_US_GUESS, core::sync::atomic::Ordering::Relaxed);
-        akuma_primitives::safe_print!(
-            96,
-            "  net: no PIT behind port 0x61 -- TSC rate is a guess ({TSC_PER_US_GUESS}/us)\n"
-        );
+        use_lapic_rate("no PIT behind port 0x61");
         return;
     }
     // Program channel 2: mode 0, lobyte/hibyte, the count.
@@ -157,11 +172,7 @@ fn calibrate() {
     // Gate off.
     outb(PIT_PORT_B, pb & 0xFC);
     if guard > OUT_WAIT_BUDGET || t1 <= t0 {
-        TSC_PER_US.store(TSC_PER_US_GUESS, core::sync::atomic::Ordering::Relaxed);
-        akuma_primitives::safe_print!(
-            96,
-            "  net: PIT output never rose -- TSC rate is a guess ({TSC_PER_US_GUESS}/us)\n"
-        );
+        use_lapic_rate("PIT output never rose");
         return;
     }
     let elapsed_us = (u64::from(PIT_COUNT) * 1_000_000) / PIT_HZ;

@@ -156,7 +156,9 @@ pub fn procmask(how: u64, cur: u64, new: Option<u64>, sigsetsize: u64) -> Result
     let bits = set & !UNBLOCKABLE;
     Ok(match how {
         0 => cur | bits,
-        1 => cur & !bits,
+        // UNBLOCK clears whatever it is asked to, SIGKILL/SIGSTOP included: they are never *set* by this
+        // function, and a stray bit (a mask installed some other way) must still be removable.
+        1 => cur & !set,
         _ => bits,
     })
 }

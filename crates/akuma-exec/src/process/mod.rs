@@ -3771,12 +3771,26 @@ pub fn resolve_thread_process(tid: usize) -> Option<Pid> {
     if let (Some(m), Some(s)) = (map_pid, scan_pid)
         && m != s
     {
-        crate::safe_print!(128,
-            "[TRAMP-MISMATCH] tid={} THREAD_PID_MAP={} but table scan found {} — using {}\n",
-            tid, m, s, m);
+        // Bounded: the map is authoritative and the disagreement is benign (teardown leaves `thread_id`
+        // set on purpose), but a big build produces one per thread start, and on a serial console that is
+        // minutes of output. The first reports name the class; the tally is `TRAMP_MISMATCH_TOTAL`.
+        let n = TRAMP_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if n < TRAMP_MISMATCH_REPORTS {
+            crate::safe_print!(128,
+                "[TRAMP-MISMATCH] tid={} THREAD_PID_MAP={} but table scan found {} — using {}\n",
+                tid, m, s, m);
+            if n + 1 == TRAMP_MISMATCH_REPORTS {
+                crate::safe_print!(96, "[TRAMP-MISMATCH] further reports suppressed (tally: TRAMP_MISMATCH_TOTAL)\n");
+            }
+        }
     }
     map_pid.or(scan_pid)
 }
+
+/// Disagreements between `THREAD_PID_MAP` and the table scan seen by [`resolve_thread_process`], and how
+/// many are printed.
+static TRAMP_MISMATCH_TOTAL: AtomicU64 = AtomicU64::new(0);
+const TRAMP_MISMATCH_REPORTS: u64 = 16;
 
 /// How many [`entry_point_trampoline`] bail-outs have been reported, and the
 /// ceiling on reports. Bounded because the failure that produces one tends to

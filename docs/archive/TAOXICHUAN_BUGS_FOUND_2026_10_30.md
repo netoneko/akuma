@@ -26,8 +26,8 @@ Rigs: Mac TCG (battery, `cow_leak_gate.py`), ryzen/KVM via `scripts/kvm/taoxichu
 - **Why the `-j4` serde/serde_json/fastrand builds never hit it.** Their crates have few dependencies; the argument and environment
   size of a `rustc` call grows with the dependency list, so only a larger crate crosses the caps.
 - **Verified:** the isolated 200-variable case failed before the fix. With the final fix the in-guest build executes the `rustc` calls that
-  died before and runs on to the failure in section 7. A 400-variable test exceeds the new 256 cap by design and still answers EFAULT
-  rather than `E2BIG` (the pointer-array reader maps "too many" to `None`); cosmetic, not changed.
+  died before and runs on to the failure in section 7. Follow-up (same day): "too many entries" and "a string longer than `STR_MAX`" now answer `E2BIG` too
+  (`read_ptr_array`/`read_user_string` return the errno); a non-UTF-8 argument still answers `EFAULT` (the loader path carries `&str`).
 
 ## 2. `-j8` crates.io build fails — UNEXPLAINED
 
@@ -49,11 +49,14 @@ Same serde + serde_json + fastrand project, fresh boot each time.
 - `-j4` is unaffected: 5 of 5 fresh-boot runs at 3 GiB passed on the unsafe-reduced kernel, ~129 s wall each, free pages back to
   baseline and `cowrefs=0` after each, no `BorrowCell` overlap panic.
 
-## 3. The guest wall clock runs about 1.5x fast — OPEN, not investigated
+## 3. The guest wall clock ran about 1.5x fast — FIXED
 
-The identical build is "3m 09s" by the guest's `cargo`/`time` and 128-130 s by the host's `date`. Every guest-side duration in the
-docs (including the 3m03-3m52 `-j4` figures in the CoW doc) is guest time. The TSC rate is calibrated against the PIT
-(`net.rs`); the likely source is the PIT window under KVM. Compare guest figures with each other, not with a host stopwatch.
+The identical build was "3m 09s" by the guest's `cargo`/`time` and 128-130 s by the host's `date`. **Cause:** `net::calibrate` measures the TSC against the PIT, and under KVM
+there is no PIT behind port 0x61 (`net: no PIT behind port 0x61 -- TSC rate is a guess (2500/us)` in the boot log), so the clock ran at a fixed guess of
+2.5 GHz on a 3.793 GHz TSC: 3793/2500 = 1.52 fast. The LAPIC timer calibration, a line earlier, had already measured the real rate
+(`tsc=3795651900 Hz`). **Fix:** with no PIT, `net::use_lapic_rate` takes `akuma_lapic_amd64::tsc_hz()`; the fixed guess is only for a kernel where that has not run.
+Now `calibrated 3793 cyc/us` on the ryzen (host `cpu MHz` 3793.029) and `sleep 20` measures 20 s; on TCG it is 996 cyc/us, where the guess would have run the clock 2.5x *slow*.
+Every guest-side duration written before 2026-10-30 (including the 3m03-3m52 `-j4` figures in the CoW doc and the 11m41s in section 6) is on the old, fast clock.
 
 ## 4. The guest sshd corrupts binary stdin — OPEN
 
@@ -64,11 +67,11 @@ clones the repo from GitHub over HTTPS (public repo, 9 s sparse clone). Cause no
 
 ## 5. Smaller findings
 
-- `git` in the guest prints `fatal: setsid failed: Function not implemented` after `git sparse-checkout set`; the clone and checkout
-  still succeed. `setsid` (syscall 112) is unserved (`[nosys]` list).
+- `git` in the guest printed `fatal: setsid failed: Function not implemented`; `setsid` (112) was unserved. **Fixed:** `setsid`/`getsid`/`getpgid` answer the pid (each task is its own
+  session and group leader, there is no job control), `setpgid` accepts.
 - **ssh starves during the in-guest build.** While the guest compiles its own kernel, new ssh connections fail with "Connection timed out during banner exchange" and a held session drops with "Timeout, server not responding", although the build is progressing (the console keeps moving, `[reap]` pids climb). The guest has one vCPU and four `rustc`; sshd is simply not scheduled promptly. Poll the console, not ssh, for completion. Not investigated (scheduling policy, `docs/reference/scheduling.md`).
-- `TRAMP-MISMATCH tid=N THREAD_PID_MAP=… but table scan found …` is printed repeatedly during the big builds. It says it uses the map's
-  value and the builds pass; left as is.
+- `TRAMP-MISMATCH tid=N THREAD_PID_MAP=… but table scan found …` was printed once per thread start (hundreds of lines on a serial console during a build). It is a benign
+  diagnostic (the map is authoritative; teardown leaves `thread_id` set on purpose), so it is now capped at 16 lines then one "further reports suppressed" (`akuma-exec`, shared with AArch64; tally in `TRAMP_MISMATCH_TOTAL`).
 - The `-j4` wedge of the first 3 GiB attempt and one local TCG run (CoW doc) has still not recurred in 5 + 5 clean runs.
 - `scripts/kvm/taoxichuan_pop.sh` defaulted to 8192 MiB, which hides leaks; it now defaults to 3072.
 
@@ -133,3 +136,17 @@ the item matters, not a profile of it.
 - **Related, not fixed:** the 16-entry-order `nr=9 -12` failures also hide that the slab is shared by a process's threads, and a mapping is
   populated eagerly (section 6) - so address space was the first wall, and RAM is the next one.
 
+
+## 9. A kernel write into a shared read-only page was not intercepted - FIXED
+
+`copy_to_user` writes through the physmap, which never faults, so it needs its own CoW check (`cow_prepare_write`). That check had two holes:
+1. an **unmarked** read-only page held by several spaces (shared text, or an `mprotect(PROT_READ)` page after a fork) was written through, landing in every holder;
+2. when the CoW break itself failed (no frame), the result was discarded (`let _ = cow_resolve(..)`) and the write went ahead into the still-shared frame.
+Now `cow_prepare_write` returns whether the write may proceed and `copy_to_user` answers `EFAULT` (as Linux does for a kernel write to a page the user could not write) in both cases; an *unshared* read-only page stays writable to the kernel.
+
+## 10. `rt_sigprocmask` algebra shared with the AArch64 glue; one crate bug found by the differential test
+
+`akuma-syscalls-glue`'s `sys_rt_sigprocmask` now calls `akuma_syscalls_signal::procmask` (it inlined the same formula). The new differential test (exhaustive over `how` 0..6 x 10 masks x 10 masks,
+against the glue's old formula kept verbatim) found a real difference in the crate: `SIG_UNBLOCK` used `cur & !(set & !UNBLOCKABLE)`, leaving a stray SIGKILL/SIGSTOP bit in `cur` set forever; it is `cur & !set`, as the glue always had.
+Glue's `rt_sigaction` was **not** switched: it is looser than the crate's `check` (a wrong `sigsetsize` silently zeroes the mask instead of `EINVAL`; a *query* of SIGKILL/SIGSTOP is refused), and changing that
+would change the AArch64 kernel's behaviour. A pinned divergence, not an accident.

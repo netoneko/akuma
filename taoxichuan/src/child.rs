@@ -324,39 +324,43 @@ const E2BIG: u64 = 7;
 const ARG_BYTES_MAX: usize = crate::ARG_BLOCK_PAGES * 4096 - 2048;
 
 /// Read a NUL-terminated pointer array (argv/envp shape) from the task.
-fn read_ptr_array(arr_va: u64, max: usize) -> Option<Vec<u64>> {
+///
+/// `Err` is the errno: `EFAULT` for a pointer that is not user memory, `E2BIG` for more than `max`
+/// entries before the terminating NULL (Linux answers `E2BIG` for an oversize block, never `EFAULT`).
+fn read_ptr_array(arr_va: u64, max: usize) -> Result<Vec<u64>, u64> {
     let mut out = Vec::new();
     for i in 0..max {
         let mut slot = [0u8; 8];
         if !crate::copy_from_user(&mut slot, arr_va + (i as u64) * 8) {
-            return None;
+            return Err(crate::err::EFAULT);
         }
         let p = u64::from_le_bytes(slot);
         if p == 0 {
-            return Some(out);
+            return Ok(out);
         }
         out.push(p);
         if !crate::user_ok(p, 1) {
-            return None;
+            return Err(crate::err::EFAULT);
         }
     }
-    None // unterminated: refuse rather than guess
+    Err(E2BIG) // unterminated within the cap
 }
 
-/// Read one NUL-terminated string from the task.
-fn read_user_string(va: u64) -> Option<String> {
+/// Read one NUL-terminated string from the task. `Err` is `EFAULT` (unreadable, or not UTF-8, which this
+/// kernel's `&str` argument path cannot carry) or `E2BIG` (no NUL within `STR_MAX` bytes).
+fn read_user_string(va: u64) -> Result<String, u64> {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < STR_MAX {
         let mut one = [0u8; 1];
         if !crate::copy_from_user(&mut one, va + buf.len() as u64) {
-            return None;
+            return Err(crate::err::EFAULT);
         }
         if one[0] == 0 {
-            return String::from_utf8(buf).ok();
+            return String::from_utf8(buf).map_err(|_| crate::err::EFAULT);
         }
         buf.push(one[0]);
     }
-    None
+    Err(E2BIG)
 }
 
 /// The SPAWN/EXECVE argument block: the two syscalls marshal `(path, argv,
@@ -384,31 +388,19 @@ fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs
         Some(p) => p,
         None => return Err(crate::err::ENOENT),
     };
-    let argv_ptrs = match read_ptr_array(argv_va, ARGV_MAX) {
-        Some(p) => p,
-        None => return Err(crate::err::EFAULT),
-    };
+    let argv_ptrs = read_ptr_array(argv_va, ARGV_MAX)?;
     let mut argv: Vec<String> = Vec::new();
     for p in &argv_ptrs {
-        match read_user_string(*p) {
-            Some(s) => argv.push(s),
-            None => return Err(crate::err::EFAULT),
-        }
+        argv.push(read_user_string(*p)?);
     }
     if argv.is_empty() {
         argv.push(path.clone()); // Linux would EFAULT; a path-only spawn is kinder
     }
     let mut env: Vec<String> = Vec::new();
     if envp_va != 0 {
-        let env_ptrs = match read_ptr_array(envp_va, ENV_MAX) {
-            Some(p) => p,
-            None => return Err(crate::err::EFAULT),
-        };
+        let env_ptrs = read_ptr_array(envp_va, ENV_MAX)?;
         for p in &env_ptrs {
-            match read_user_string(*p) {
-                Some(s) => env.push(s),
-                None => return Err(crate::err::EFAULT),
-            }
+            env.push(read_user_string(*p)?);
         }
     }
     if argv.len() + env.len() > MAX_STRS {

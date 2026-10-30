@@ -26,8 +26,8 @@ first.
 | No VFS mount table | one ext2 root | a second filesystem |
 | No lazy mmap (CoW fork exists) | `fork` shares leaf frames copy-on-write (`fault_trap` → `cow_resolve`, 2026-10-30), but `mmap` still populates every page at call time, anonymous and file-backed alike. Building this kernel in the guest peaked at >= 2,460 MiB against Linux's 447 MiB for the same compile, because each `rustc` pays for its whole 311 MB `librustc_driver` mapping | demand paging in the fault path (`archive/TAOXICHUAN_EFFICIENCY_PLAN_GLM.md`, top item) |
 | `register_process` is infallible | a genuine 256-live-process workload still panics `Process table full` instead of answering `EAGAIN` (the thread-exit leak that reached it is fixed) | a `Result` through the spawn callers (`reference/subsystems/memory.md` OPEN item) |
-| No `munmap`/`mprotect` effects | slabs live as long as the task | a task that outlives its mappings |
-| No W^X | `PROT_EXEC` widens to RWX | a policy layer with a caller |
+| `PROT_NONE` is not enforced | `munmap` returns address space and `mprotect` re-maps PTEs, but `PROT_NONE` stays a no-op, so a guard page is still readable | a PTE-level none |
+| W^X is enforced (stricter than Linux) | `W+X` refused; `PROT_EXEC` refused on any page written since mapping; `wx=0` restores the old RWX widening. No JIT can run | see `archive/TAOXICHUAN_WX_POLICY.md` |
 | No stdin path | the console is write-only; CLOSE_CHILD_STDIN is a no-op success | an input device + a reader |
 | No wall clock on inodes | mount clock is `|| 0`; `utimensat` validates, does not stamp | `epoch=` anchoring reaching ext2 |
 | Identity map kept | the lower-half handoff has no customer | never required; per-task roots already lack it |

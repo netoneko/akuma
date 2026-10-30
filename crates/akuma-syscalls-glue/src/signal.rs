@@ -86,8 +86,6 @@ pub fn signal_is_fatal_default(sig: u32) -> bool {
 /// oldset: pointer to store old signal mask
 /// sigsetsize: size of signal set (must be 8)
 pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigsetsize: usize) -> u64 {
-    use akuma_syscalls_linux::signal::sigmask_how::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
-
     if sigsetsize != 8 {
         return EINVAL;
     }
@@ -109,13 +107,10 @@ pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigset
             return EFAULT;
         }
 
-        // SIGKILL (9) and SIGSTOP (19) cannot be blocked
-        let unblockable = (1u64 << 8) | (1u64 << 18);
-        let updated = match how {
-            SIG_BLOCK => cur | (new_mask & !unblockable),
-            SIG_UNBLOCK => cur & !new_mask,
-            SIG_SETMASK => new_mask & !unblockable,
-            _ => return EINVAL,
+        // The algebra (SIGKILL/SIGSTOP cannot be blocked; an unknown `how` is EINVAL) is
+        // `akuma-syscalls-signal`'s, shared with the taoxichuan kernel.
+        let Ok(updated) = akuma_syscalls_signal::procmask(u64::from(how), cur, Some(new_mask), sigsetsize as u64) else {
+            return EINVAL;
         };
         akuma_exec::threading::set_thread_signal_mask(updated);
     }

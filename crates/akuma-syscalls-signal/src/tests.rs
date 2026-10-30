@@ -123,3 +123,42 @@ fn block_then_unblock_restores() {
         assert_eq!(procmask(1, blocked, Some(set), SIGSET_SIZE), Ok(cur));
     }
 }
+
+/// `rt_sigprocmask` before the AArch64/amd64 glue adopted this crate: the formula it inlined, kept here
+/// verbatim as the oracle. Exhaustive over `how` (including invalid values) and over masks that exercise
+/// the unblockable bits (8 = SIGKILL, 18 = SIGSTOP) alone and with company.
+#[test]
+fn procmask_matches_the_glue_formula_it_replaced() {
+    fn old(how: u64, cur: u64, new_mask: u64) -> Result<u64, ()> {
+        let unblockable = (1u64 << 8) | (1u64 << 18);
+        Ok(match how {
+            0 => cur | (new_mask & !unblockable),
+            1 => cur & !new_mask,
+            2 => new_mask & !unblockable,
+            _ => return Err(()),
+        })
+    }
+    let masks = [
+        0u64,
+        1,
+        1 << 8,
+        1 << 18,
+        (1 << 8) | (1 << 18),
+        0xFFFF_FFFF_FFFF_FFFF,
+        0x0000_0000_0004_0100,
+        0x8000_0000_0000_0001,
+        0x5555_5555_5555_5555,
+        0xAAAA_AAAA_AAAA_AAAA,
+    ];
+    for how in 0..6u64 {
+        for &cur in &masks {
+            for &new in &masks {
+                assert_eq!(
+                    procmask(how, cur, Some(new), 8).map_err(|_| ()),
+                    old(how, cur, new),
+                    "how {how} cur {cur:#x} new {new:#x}"
+                );
+            }
+        }
+    }
+}
