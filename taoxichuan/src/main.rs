@@ -822,6 +822,9 @@ struct Task {
     /// `rt_sigprocmask`'s word (shared by a task's threads - imprecise, and
     /// harmless without delivery).
     sigmask: u64,
+    /// The path of the running image, what `readlink("/proc/self/exe")`
+    /// answers (rust-lld's wrapper and `std::env::current_exe` ask).
+    exe: alloc::string::String,
     /// Unmapped holes below `mmap_cur` in the mmap slab, sorted by nothing,
     /// merged when they touch: `munmap` records them, `mmap` reuses them
     /// first-fit before bumping the cursor. Full table: the hole is leaked
@@ -857,6 +860,7 @@ impl Task {
             sigalt: SIGALT_OFF,
             sigact: [[0; 4]; 65],
             sigmask: 0,
+            exe: alloc::string::String::new(),
             holes: [(0, 0); MAX_HOLES],
             n_holes: 0,
             cwd: alloc::string::String::new(),
@@ -3435,7 +3439,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if bufsz == 0 || !user_ok(buf, bufsz) {
                 return e(ring3::err::EFAULT);
             }
-            path_at(fr.arg2(), dirfd, |p| match root_fs().read_symlink(p) {
+            path_at(fr.arg2(), dirfd, |p| match if p == "/proc/self/exe" && !task().exe.is_empty() {
+                Ok(task().exe.clone())
+            } else {
+                root_fs().read_symlink(p)
+            } {
                 Ok(t) => {
                     let bytes = t.as_bytes();
                     let n = (bytes.len() as u64).min(bufsz);

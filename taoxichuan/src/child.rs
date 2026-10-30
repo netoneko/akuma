@@ -496,6 +496,7 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         let cwd = t.cwd.clone();
         let (sigact, sigmask) = (t.sigact, t.sigmask);
         let (holes, n_holes) = (t.holes, t.n_holes);
+        let exe = t.exe.clone();
         let ct = &mut crate::task_slots()[slot_idx + 1];
         ct.cwd = cwd;
         // fork: handlers and the mask are inherited (a child that resets
@@ -503,6 +504,7 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         ct.sigact = sigact;
         ct.sigmask = sigmask;
         ct.holes = holes;
+        ct.exe = exe;
         ct.n_holes = n_holes;
         ct.root_pa = root_pa;
         ct.regions = regions;
@@ -816,6 +818,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     let Some(ti) = crate::load_task(&argv, &env, &image) else {
         return crate::e(crate::err::ENOMEM);
     };
+    crate::task().exe = effective.clone();
     {
         let t = crate::task();
         t.fd_names = saved.0;
@@ -1179,6 +1182,7 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     };
     // A fresh session starts at `/`; the slot's Task outlives the last shell.
     crate::task().cwd.clear();
+    crate::task().exe = effective;
     // Premise 2's build-out: register the shell as an akuma-exec Process so
     // `fork_process` finds a caller. tid = this ring slot — the same number
     // `current_slot()` answers once the crossing below names the child.
@@ -1359,6 +1363,7 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
         akuma_primitives::safe_print!(160, "[exec] '{}': load failed\n", effective);
         return crate::e(crate::err::ENOMEM);
     };
+    crate::task().exe = effective;
     // The replaced image's root is dead weight once the crossing below loads
     // the new CR3; it is still the live CR3 here, so it waits for a sweep.
     park_root(old_root);
