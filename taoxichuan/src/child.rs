@@ -818,7 +818,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     let Some(ti) = crate::load_task(&argv, &env, &image) else {
         return crate::e(crate::err::ENOMEM);
     };
-    crate::task().exe = effective.clone();
+    crate::task().exe.clone_from(&effective);
     {
         let t = crate::task();
         t.fd_names = saved.0;

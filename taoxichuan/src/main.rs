@@ -321,6 +321,8 @@ fn fault_trap(t: &mut Trap<'_>) {
             akuma_cpu::ctlreg::cr2(),
             code
         );
+        #[cfg(feature = "trace-err")]
+        mm_dump_for(akuma_cpu::ctlreg::cr2());
         // A real fork child or thread dies alone (SIGSEGV status to its
         // waiter); the machine runs on. The shell and the boot task are the
         // M2 shapes with no slot to reap through: those halt as before.
@@ -934,6 +936,42 @@ fn my_tid() -> u64 {
     }
 }
 
+/// `--features trace-err`: the last 128 mmap-slab events (kind, start, end), so
+/// a fault can name the unmap/replace that took its page away.
+#[cfg(feature = "trace-err")]
+static mut MM_EVENTS: [(u8, u64, u64); 128] = [(0, 0, 0); 128];
+#[cfg(feature = "trace-err")]
+static mut MM_HEAD: usize = 0;
+
+#[cfg(feature = "trace-err")]
+fn mm_event(kind: u8, start: u64, end: u64) {
+    // SAFETY: syscall-path discipline (single core, IF clear).
+    unsafe {
+        let head = &mut *core::ptr::addr_of_mut!(MM_HEAD);
+        (*core::ptr::addr_of_mut!(MM_EVENTS))[*head % 128] = (kind, start, end);
+        *head += 1;
+    }
+}
+#[cfg(not(feature = "trace-err"))]
+fn mm_event(_kind: u8, _start: u64, _end: u64) {}
+
+/// Print every recorded slab event that covers `va` (kinds: 1 munmap, 2
+/// MAP_FIXED release, 3 mremap shrink, 4 mremap move-free, 5 mmap, 6 mremap-grow).
+#[cfg(feature = "trace-err")]
+fn mm_dump_for(va: u64) {
+    // SAFETY: syscall/fault path, single core.
+    unsafe {
+        let head = *core::ptr::addr_of!(MM_HEAD);
+        let ev = &*core::ptr::addr_of!(MM_EVENTS);
+        for i in 0..128 {
+            let (k, s, e) = ev[(head + i) % 128];
+            if k != 0 && s <= va && va < e {
+                akuma_primitives::safe_print!(96, "[mm] kind={} 0x{:x}..0x{:x} covers fault\n", k, s, e);
+            }
+        }
+    }
+}
+
 /// Unmap every present page of `[start, end)` in `root` and give its frame
 /// back (`free_page` honours a CoW count). Pages that were never faulted in
 /// are skipped.
@@ -1055,6 +1093,7 @@ fn munmap_arm(addr: u64, len: u64) -> u64 {
         return 0;
     }
     let t = task();
+    mm_event(1, addr, end);
     release_pages(t.root_pa, addr, end);
     add_hole(t, addr, end);
     0
@@ -2660,6 +2699,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 // over its anonymous reservation): the old frames go back, and
                 // the range leaves the hole table.
                 if MMDBG & 2 != 0 {
+                    mm_event(2, addr, addr + pages);
                     release_pages(t.root_pa, addr, addr + pages);
                     carve_hole(t, addr, addr + pages);
                 }
@@ -3682,6 +3722,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let in_slab = old >= MMAP_BASE && old + old_pages <= MMAP_BASE + MMAP_SLAB;
             if new_pages <= old_pages {
                 if in_slab && new_pages < old_pages && MMDBG & 4 != 0 {
+                    mm_event(3, old + new_pages, old + old_pages);
                     release_pages(t.root_pa, old + new_pages, old + old_pages);
                     add_hole(t, old + new_pages, old + old_pages);
                 }
@@ -3730,6 +3771,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 done += n as u64;
             }
             if in_slab && MMDBG & 4 != 0 {
+                mm_event(4, old, old + old_pages);
                 release_pages(t.root_pa, old, old + old_pages);
                 add_hole(t, old, old + old_pages);
             }
