@@ -60,7 +60,8 @@ Canonical mermaid source: [`../diagrams/memory-map.md`](../diagrams/memory-map.m
 
 Every user pointer a syscall touches passes `user_ok(va, len)`: `[va, va+len)`
 must lie inside one of the task's registered regions (the image segments, the
-two 64 MiB slabs, the stack, the interpreter span — 16 slots, registered at
+the 64 MiB brk slab, the 16 GiB mmap slab, the stack, the interpreter span —
+16 slots, registered at
 load). Then `copy_from_user`/`copy_to_user` walk the task's **own root page
 table** one page at a time and move bytes through the physmap. The region
 check is the gate; a page that fails to translate mid-copy is the backstop

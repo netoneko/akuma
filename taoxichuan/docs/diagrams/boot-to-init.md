@@ -16,7 +16,7 @@ flowchart TD
     J --> K["exec_twin::init — register ExecRuntime / ThreadRuntime /<br/>ProcessHooks / X86ArchHooks (akuma-exec, akuma-threading)"]
     K --> L["blk_init — map virtio-mmio window, akuma-virtio block up"]
     L --> M["ext2 mount on device 0 (akuma-ext2, BlockDevice = Vda)<br/>published as ROOT_FS"]
-    M --> N["net::net_init — TSC calibration vs PIT, smoltcp up<br/>(akuma-net over akuma-net-nic), DHCP wait ≤10 s"]
+    M --> N["net::net_init — TSC calibration vs PIT (no PIT →<br/>lapic tsc_hz), smoltcp up (akuma-net over akuma-net-nic),<br/>DHCP wait ≤10 s"]
     N --> O["banner (src/banner.txt, verbatim)<br/>epoch= cmdline token → UTC offset store (akuma-primitives::clock)"]
     O --> P["parse_programs: init=/initargs=, then=/thenargs=<br/>(≤4 programs, fixed slots)"]
     P --> Q["run_program(0): read init off ext2, verify ELF magic"]

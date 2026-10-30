@@ -8,7 +8,7 @@ flowchart BT
         U1["ELF image PT_LOADs at link addresses<br/>(static) or PIE_BASE = 0x1000_0000"]
         U2["brk slab: image_end … +64 MiB<br/>(SLAB = 0x0400_0000)"]
         U3["interpreter (PT_INTERP): INTERP_BASE = 0x3000_0000<br/>(akuma-elf-exec)"]
-        U4["mmap slab: 0x0000_6000_0000_0000 … +64 MiB"]
+        U4["mmap slab: 0x0000_6000_0000_0000 … +16 GiB<br/>(MMAP_SLAB = 0x4_0000_0000, address space only)"]
         U5["stack: 16 pages below 0x0000_7000_0000_0000"]
     end
     subgraph kernel["upper half (shared by PML4 slots 256..512 copy)"]
