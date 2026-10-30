@@ -274,6 +274,9 @@ days - re-count with `git ls-tree -d --name-only $(git merge-base main HEAD) cra
 
 **Linux comparison** (Linux 6.18, built 2026-10-30; method in `AUDIT_SURFACE_METHODOLOGY.md`)
 
+> Of course Linux works better and was written by smart people. It's a big plus if you are not an
+> idiot. However,
+
 - Guest: taoxichuan **84,761** audit lines; Linux trimmed to the same job (tinyconfig +
   kvm_guest + taoxichuan's features) **836,651** (9.9x); Linux as Firecracker ships it
   **1,868,016** (22x).
@@ -289,3 +292,104 @@ days - re-count with `git ls-tree -d --name-only $(git merge-base main HEAD) cra
 - The user's position: **Linux reigns supreme** - ever since they installed it on their
   grandfather's Siemens workstation in 2001. — `scripts/linux_audit_surface.sh` (firecracker / minimal /
 host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.
+
+## Hardening by composition: ideas and positioning (2026-10-30)
+
+Summary written for the talk; numbers checked against the measurements above (corrections noted
+inline).
+
+### Layered walls (each optional, each stops something different)
+
+- **Box with its own syscall profile.** The cheapest wall. It narrows what the app can reach, but
+  it shares the kernel, so a bug in an allowed syscall still escapes it.
+- **Ring 3 process.** Contains faults and exploits to the task, and gives enforcement points:
+  user-id filtering, an egress allow-list, `copy_to_user` validation and a signature check at
+  `execve`.
+- **KVM guest.** Stops a kernel bug from touching the host. The guest runs on Akuma KVM, Linux
+  KVM, Firecracker or TCG.
+
+### Compile-time hardening
+
+- Read-only disk image with no ext2 write paths.
+- Syscall table as an allow-list built from the app's census, so an unlisted call has no code
+  behind it.
+- No dynamic library loading: compile out `PT_INTERP`, which also removes `LD_PRELOAD`-style
+  injection.
+- Execution locked to signed binaries, verified by a signed kernel. A guest is checked by the
+  host's VMM, bare metal by the bootloader.
+- W^X (taoxichuan has had it since `075de2ec`), an egress allow-list in the socket table, and
+  per-user-id filtering for what cannot be compiled out.
+
+### Syscall middleware (a layer stack on the boundary)
+
+- **Layers:** record, allow-list, egress and quotas, path rewriting, ABI emulation shims (NetBSD),
+  fault injection, deterministic time.
+- **Shape:** a tower-style `Service` over decoded syscalls, with pure crates that get host tests
+  and differential suites.
+- **Constraints:** layers are inside the TCB, so there must be a single dispatch entry. Blocking
+  calls (`futex`, `epoll_wait`, `wait4`) do not wrap cleanly, so start with layers that decide
+  before the call and observe after it.
+
+### Dev and ship from one composition root
+
+- Develop on a permissive debug kernel with record, trace and fault-injection layers.
+- Run real workloads to produce the census.
+- Ship a second build with the allow-list from the census, debug layers compiled out and unneeded
+  families absent.
+- Sign it. Only that kernel is accepted in production.
+- **Risks:** a census covers only exercised paths, so use a log-and-allow stage before deny.
+  Tracing can hide timing bugs, so keep layers off scheduler and futex paths. Debug and shipped
+  builds must differ only in features.
+- taoxichuan's `trace-err` feature is the proto-version of this.
+
+### Crate-compatibility and runtime kernels
+
+- `akuma-syscalls-tokio`: a crate that pulls in exactly the syscall families tokio needs. Tokio
+  already runs on Akuma, and the `EPOLLET` re-arm and eventfd-wake quirks are fixed.
+- Generalised: preconfigured kernels per language runtime (Rust with tokio, Go), with an strace
+  census as the feature list and Linux-differential suites as the conformance gate.
+
+### Comparison with other models
+
+| | Unikernel | Framekernel (Asterinas) | Akuma composition |
+|---|---|---|---|
+| Surface reduction | Build only the needed OS pieces | Not the main point | Allow-list from census, capabilities compiled out |
+| App/kernel isolation | None inside the image | Services separate from the app | Ring 3, optional box and KVM |
+| Where `unsafe` lives | Everywhere in the image | One privileged framework (OSTD) | Leaf crates, some in the composition root |
+| Linux ABI | Partial | 245 x86_64 syscalls dispatched (measured at `7861bff`) | 198 on amd64; runs rustc and cargo |
+| Verification target | Little | The framework (Verus) | Pure crates - a future possibility; practical tests today |
+
+What userspace buys over a unikernel: fault containment, a smaller exploit blast radius,
+enforcement points, multi-process workloads (`cargo -j4`) and unmodified binaries that can be
+signed separately from the kernel. What it costs: syscall-crossing overhead, and complexity (CoW
+fork, mmap, the process table), which is where the bugs and the `unsafe` cluster.
+
+**Positioning:** Akuma takes the unikernel's pick-only-what-you-need build, keeps a monolithic
+kernel's Linux ABI and process model, and is moving toward a framekernel-style `unsafe` boundary.
+The `unsafe` confinement is by convention, not proof, so do not claim a TCB equivalent to
+Asterinas's.
+
+### Numbers for the slides
+
+- **Production lines and `unsafe` sites:** the AArch64 bin crate has 136 lines and 0 `unsafe`
+  sites. taoxichuan has about 6,900 lines, with `unsafe` sites going 131 -> 67 -> 55 (HEAD
+  `16936a0a`; re-measure before quoting). The amd64 bin has 83.
+- **Audit surface (Linux 6.18):** taoxichuan's guest is 84,761 audit lines against 836,651 for a
+  trimmed Linux guest (9.9x) and 1,868,016 for Firecracker's (22x). The host is 151,235 against
+  2,362,283 (15.6x). The whole stack is 158,909 against 2.4-2.9M (15-18x), before counting the
+  Firecracker VMM.
+- **Memory for the same compile:** Linux 447 MiB, Akuma 1,356 MiB, taoxichuan at least 2,460 MiB
+  (eager file mmap).
+- **Caveat:** these are sizes of the reading an audit would take. None of the Akuma kernels has
+  been audited.
+
+### Ownership and portability
+
+- Full ownership down to KVM closes the signing chain, gives one debugging surface across guest
+  and host, and allows the 158,909-line whole-stack figure. It also means owning the audit burden,
+  with firmware, microcode and the CPU's virtualisation hardware still below the stack.
+- The guest also runs on Linux KVM, Firecracker and TCG, so the claims are reproducible by others
+  and host bugs separate from guest bugs. On a Linux host the total stack is about 2.4M lines
+  again, so show two rows: full ownership (Akuma on Akuma) and guest only (taoxichuan on any KVM).
+- **Ready-made line:** "It works in practice" (self-hosted build, `cargo -j4`, leak gate), then
+  the architecture.
