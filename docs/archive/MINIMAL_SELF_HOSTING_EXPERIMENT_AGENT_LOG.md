@@ -1792,3 +1792,29 @@ Cross-check: Claude's ~12 executed milestones at GLM's refined median (16M) give
 factor is assumed; the refined process was itself Claude-supervised; the Lite quota's ~50 credits per million (against the
 formula's ~36) is unexplained. **User's assessment:** the experiment was flawed and ultimately inconclusive, but the initial
 claim - an open model can build your own stack in a short time for little money - still looks plausible on these numbers.
+
+### 2026-10-30 (user's conclusions, recorded by the supervisor): the harness, the open combo, and the next frontier
+
+- **The harness is not accounted for.** Every number in this log is a model's tokens and calls; nothing separates what
+  GLM-5.3-Flash contributed from what goose contributed (its tool loop, context handling, retries, the ACP server). There is
+  no way to account for the harness with the data collected.
+- **The open combination did complex kernel work.** goose (open source) with GLM-5.3-Flash (open weights) took Taoxichuan
+  from boot to an HTTPS `curl` in the guest: userspace, busybox, sshd, offline and online `apk`, outbound TCP, DNS, dynamic
+  linking, blocking fork, pipes, plus the extractions that went with them - and it ran on Akuma itself on the metal track,
+  against Akuma's own KVM, which the same model wrote.
+- **With more composable components extracted into crates, the same combination should be able to build specified,
+  stripped-down kernels** - a kernel for an agent, or for one Rust application - by picking and wiring crates rather than
+  writing a kernel. The user's assessment, not a measured result.
+- **Next frontier, after the experiment: crate-compatibility kernels, e.g. `akuma-syscalls-tokio`.** A crate that pulls in
+  and sets up the syscall families a Rust crate ecosystem needs, so a composition root can say "this kernel runs tokio" and
+  get exactly that. Tokio is the obvious first target because it already works on Akuma: goose (the harness of this
+  experiment), `kot` (axum/hyper) and `nettest-reqwest` (tokio + hyper + reqwest + rustls) run on amd64, and the
+  tokio-specific kernel behaviour is already found and fixed - `EPOLLET` re-arm on every socket path
+  (`AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md`), the eventfd wake of a reactor parked in `epoll_pwait`
+  (`AKUMA_AMD64_AGENT_STAGING_AND_ACCOUNTING.md`). The families it would pull are mostly extracted already: readiness and
+  epoll (`akuma-syscalls-poll`, `akuma-net-yarn`), eventfd (`akuma-syscalls-eventfd`), futex (`akuma-syscalls-sync`),
+  threads (`akuma-exec`, `akuma-threading`), sockets (`akuma-net`, `akuma-syscalls-net`), clocks and timers
+  (`akuma-syscalls-time`), signals (`akuma-syscalls-signal`), memory (`akuma-syscalls-mem`), pipes (`akuma-pipes`).
+  Open: how "what tokio needs" is stated (a census of a tokio binary under strace on Linux, as stage 9's census did for
+  rustc), whether the shape is one crate with features or a composition-root template, and the gate (a tokio server and
+  client binary, unmodified, in a KVM guest).

@@ -193,5 +193,18 @@ usage API; full method and tables in the agent log, "GLM tokenomics from the goo
   the initial claim - that your own stack can be built by open models in a short time for little
   money - still looks plausible on these numbers.
 
+**The open combination and what comes next** (the user's conclusions; agent log, 2026-10-30)
+
+- No way to account for the harness: every number is the model's; goose's own contribution is not
+  separable.
+- goose (open source) + GLM-5.3-Flash (open weights) did complex kernel work: boot to HTTPS `curl`
+  in the guest, on Akuma's own KVM, which the same model wrote; goose itself ran on Akuma.
+- With more composable crates extracted, the same combination should be able to build specified,
+  stripped-down kernels - for an agent, or for one Rust application.
+- Next frontier idea: **crate-compatibility kernels**, e.g. `akuma-syscalls-tokio`, which pulls and
+  sets up the syscall families tokio needs. Tokio already runs on Akuma (goose, `kot` on
+  axum/hyper, reqwest + rustls), and its kernel-facing quirks (`EPOLLET` re-arm, the eventfd wake of
+  an epoll-parked reactor) are already found and fixed.
+
 **Linux comparison:** pending — `scripts/linux_audit_surface.sh` (firecracker / minimal /
 host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.
