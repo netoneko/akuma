@@ -2314,10 +2314,26 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
             // SAFETY: syscall-path discipline (single core, IF clear).
             unsafe { (*core::ptr::addr_of_mut!(INFLIGHT))[islot] = (nr, a1, a2, a3) };
         }
+        if nr == 202 {
+            // SAFETY: as above.
+            unsafe {
+                let h = &mut *core::ptr::addr_of_mut!(FXHEAD);
+                (*core::ptr::addr_of_mut!(FXRING))[*h % 160] = (islot as i32, a2, a1, a3, u64::MAX - 1);
+                *h += 1;
+            }
+        }
         let r = dispatch_inner(fr);
         if islot < child::NSLOTS {
             // SAFETY: as above.
             unsafe { (*core::ptr::addr_of_mut!(INFLIGHT))[islot].0 = 0 };
+        }
+        if nr == 202 {
+            // SAFETY: as above.
+            unsafe {
+                let h = &mut *core::ptr::addr_of_mut!(FXHEAD);
+                (*core::ptr::addr_of_mut!(FXRING))[*h % 160] = (islot as i32, a2, a1, a3, r);
+                *h += 1;
+            }
         }
         trace_err(nr, r, a1, a2, a3);
         trace_ring(nr, r, a1, a2, a3, rip);
@@ -2334,6 +2350,12 @@ const N: usize = 1024;
 static mut RING: [(i32, u64, u64, u64, u64, u64, u64); N] = [(0, 0, 0, 0, 0, 0, 0); N];
 #[cfg(feature = "trace-err")]
 static mut HEAD: usize = 0;
+/// Every futex call in global order: `(slot, op, uaddr, val_or_count, result)`.
+#[cfg(feature = "trace-err")]
+static mut FXRING: [(i32, u64, u64, u64, u64); 160] = [(0, 0, 0, 0, 0); 160];
+#[cfg(feature = "trace-err")]
+static mut FXHEAD: usize = 0;
+
 /// The syscall each slot is in RIGHT NOW (`nr`, three args; `nr == 0` = none):
 /// a parked thread is inside one that has not returned, which the ring cannot show.
 #[cfg(feature = "trace-err")]
@@ -2343,7 +2365,23 @@ static mut INFLIGHT: [(u64, u64, u64, u64); child::NSLOTS + 1] = [(0, 0, 0, 0); 
 /// slot's last `per` syscalls, so a hang shows what each thread was waiting on.
 #[cfg(feature = "trace-err")]
 pub(crate) fn trace_hang_dump(per: usize) {
-    akuma_primitives::safe_print!(64, "[hang] idle for 20 s; last syscalls per slot:\n");
+    akuma_primitives::safe_print!(64, "[hang] idle for 20 s; last futex calls, oldest first (ret=PENDING: entry):\n");
+    // SAFETY: idle thread, single core, IF clear between laps.
+    unsafe {
+        let ring = &*core::ptr::addr_of!(FXRING);
+        let head = *core::ptr::addr_of!(FXHEAD);
+        for i in 0..160 {
+            let (sl, op, ua, v, r) = ring[(head + i) % 160];
+            if op != 0 || ua != 0 {
+                if r == u64::MAX - 1 {
+                    akuma_primitives::safe_print!(96, "[hang] fx s{} op=0x{:x} @0x{:x} v=0x{:x} PENDING\n", sl, op, ua, v);
+                } else {
+                    akuma_primitives::safe_print!(96, "[hang] fx s{} op=0x{:x} @0x{:x} v=0x{:x} -> {}\n", sl, op, ua, v, r as i64);
+                }
+            }
+        }
+    }
+    akuma_primitives::safe_print!(64, "[hang] last syscalls per slot:\n");
     // SAFETY: idle thread, single core, IF clear between laps.
     unsafe {
         let ring = &*core::ptr::addr_of!(RING);
