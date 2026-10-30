@@ -732,6 +732,10 @@ struct Task {
     brk_cur: u64,
     brk_end: u64,
     mmap_cur: u64,
+    /// `sigaltstack(2)`'s record: signals are not delivered yet (the arms are
+    /// no-ops), so this only has to read back what the task set - rustc and
+    /// musl's thread start install one and check the answer.
+    sigalt: akuma_syscalls_linux::StackT,
     exit: Option<u64>,
     fd_names: fdtable::Names<OpenFile>,
     fd_cloexec: fdtable::FlagSet,
@@ -771,11 +775,102 @@ impl Task {
             brk_cur: 0,
             brk_end: 0,
             mmap_cur: MMAP_BASE,
+            sigalt: SIGALT_OFF,
             exit: None,
             fd_names: fdtable::Names::new(),
             fd_cloexec: fdtable::FlagSet::new(),
             fd_nonblock: fdtable::FlagSet::new(),
         }
+    }
+}
+
+/// `mprotect(addr, len, prot)`: re-map each present page of the range with
+/// the requested `R/W/X` (anonymous memory is eagerly mapped here, so a page
+/// either has a frame or is not part of the task). This is what makes
+/// `tcc -run` and every JIT work: the code is written RW, then flipped to RX,
+/// and a page mapped RW-non-exec faults on the fetch.
+///
+/// `PROT_NONE` stays a no-op: guard pages are not enforced, and unmapping the
+/// frame would lose the contents a later `mprotect(RW)` must give back.
+fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
+    if addr & 0xFFF != 0 {
+        return e(ring3::err::EINVAL);
+    }
+    if len == 0 {
+        return 0;
+    }
+    let pages = len.div_ceil(4096);
+    if len > u64::MAX / 2 || !user_ok(addr, pages * 4096) {
+        return e(ring3::err::ENOMEM);
+    }
+    if prot & 7 == 0 {
+        return 0;
+    }
+    let want = PteProt { write: prot & ring3::mmap::PROT_WRITE != 0, exec: prot & ring3::mmap::PROT_EXEC != 0, user: true };
+    let root = task().root_pa;
+    for i in 0..pages {
+        let va = (addr + i * 4096) as usize;
+        let Some(pa) = paging::translate_in(root, va) else {
+            continue;
+        };
+        let _ = paging::unmap_page_in(root, va);
+        if !paging::map_page_in(root, va, pa, want, MemAttr::WriteBack) {
+            return e(ring3::err::ENOMEM);
+        }
+    }
+    0
+}
+
+/// `sigaltstack`'s disabled state: what a task that never set one reads back.
+const SIGALT_OFF: akuma_syscalls_linux::StackT =
+    akuma_syscalls_linux::StackT { sp: 0, flags: SS_DISABLE, _pad: 0, size: 0 };
+const SS_DISABLE: i32 = 2;
+/// `MINSIGSTKSZ`: a stack smaller than this is `ENOMEM`.
+const MINSIGSTKSZ: u64 = 2048;
+
+/// `sigaltstack(ss, old)`: read back the task's record, then replace it. The
+/// 24-byte `stack_t` is the same layout on both ABIs (`akuma-syscalls-linux`).
+fn sigaltstack_arm(ss: u64, old: u64) -> u64 {
+    if old != 0 {
+        let cur = task().sigalt;
+        if !user_ok(old, 24) || !copy_to_user(old, struct_bytes(&cur)) {
+            return e(ring3::err::EFAULT);
+        }
+    }
+    if ss != 0 {
+        let mut b = [0u8; 24];
+        if !user_ok(ss, 24) || !copy_from_user(&mut b, ss) {
+            return e(ring3::err::EFAULT);
+        }
+        let sp = u64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
+        let flags = i32::from_le_bytes(b[8..12].try_into().unwrap_or([0; 4]));
+        let size = u64::from_le_bytes(b[16..24].try_into().unwrap_or([0; 8]));
+        // SS_ONSTACK (1) cannot be set by the caller, and only SS_AUTODISARM
+        // (1 << 31) may ride along with the mode.
+        if flags & !(SS_DISABLE | i32::MIN) != 0 {
+            return e(ring3::err::EINVAL);
+        }
+        task().sigalt = if flags & SS_DISABLE != 0 {
+            SIGALT_OFF
+        } else if size < MINSIGSTKSZ {
+            return e(ring3::err::ENOMEM);
+        } else {
+            akuma_syscalls_linux::StackT { sp, flags, _pad: 0, size }
+        };
+    }
+    0
+}
+
+/// `membarrier(cmd, flags, cpu)`: the decode is `akuma-syscalls-mem`'s; the
+/// one effect, a full fence, is one core's `SeqCst` fence.
+fn membarrier_arm(cmd: u64) -> u64 {
+    use akuma_syscalls_mem::membarrier::{Command, command};
+    match command(cmd as u32) {
+        Command::Barrier => {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            0
+        }
+        other => other.immediate_result().unwrap_or(0),
     }
 }
 
@@ -1646,6 +1741,23 @@ fn eventfd_close_slot(idx: usize) {
 pub(crate) fn eventfd_can_read(idx: usize) -> bool {
     eventfds()[idx].as_ref().is_some_and(|ef| ef.can_read())
 }
+/// One bit per syscall number below 512 already named by `nosys_note`.
+static NOSYS_SEEN: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Name an unserved syscall number on the console, once per number.
+fn nosys_note(nr: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if nr >= 512 {
+        akuma_primitives::safe_print!(64, "[nosys] nr={}\n", nr);
+        return;
+    }
+    let bit = 1u64 << (nr & 63);
+    if NOSYS_SEEN[(nr >> 6) as usize].fetch_or(bit, Relaxed) & bit == 0 {
+        akuma_primitives::safe_print!(64, "[nosys] nr={}\n", nr);
+    }
+}
+
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     dispatch_inner(fr)
 }
@@ -1655,6 +1767,18 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     // (`get_saved_user_context` → the twin's `read_user_context`). The boot
     // task has no slot and skips; a slotted task pays one struct copy.
     crate::child::capture_user_context(fr);
+    // The x86-only legacy path spellings (rename/mkdir/rmdir/link/unlink/
+    // symlink/readlink/chmod/chown/lchown) mean the `*at` call with
+    // `AT_FDCWD`; the fold is `akuma_syscalls_abi::legacy`, the same table
+    // amd64 dispatches through. Rewritten in the frame so the one `*at` arm
+    // below serves both spellings.
+    if let Some((call, a)) = akuma_syscalls_abi::legacy::fold(
+        fr.rax,
+        [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()],
+    ) {
+        fr.rax = call.to_x86_64();
+        (fr.rdi, fr.rsi, fr.rdx, fr.r10, fr.r8, fr.r9) = (a[0], a[1], a[2], a[3], a[4], a[5]);
+    }
     match fr.rax {
         ring3::nr::WRITE => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
@@ -2045,10 +2169,9 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             base
         }
-        ring3::nr::MUNMAP | ring3::nr::MPROTECT => {
-            // Unmap is a no-op (the slabs live as long as the task); mprotect
-            // is accepted and ignored — nothing in this kernel enforces
-            // per-page protection changes after placement.
+        ring3::nr::MPROTECT => mprotect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        ring3::nr::MUNMAP => {
+            // Unmap is a no-op (the slabs live as long as the task).
             if fr.arg1() & 0xFFF != 0 {
                 e(ring3::err::EINVAL)
             } else {
@@ -2718,7 +2841,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             })
         }
         ring3::nr::UNLINKAT => {
-            let (dirfd, flags) = (fr.arg1(), fr.arg4());
+            // `unlinkat(dirfd, path, flags)`: the flags are the THIRD argument
+            // (this read arg4, so `rmdir` never saw AT_REMOVEDIR - found when
+            // the legacy fold routed `rmdir`(84) here, 2026-10-30).
+            let (dirfd, flags) = (fr.arg1(), fr.arg3());
             path_at(fr.arg2(), dirfd, |p| {
                 let r = if flags & ring3::open::AT_REMOVEDIR != 0 {
                     root_fs().remove_dir(p)
@@ -3023,9 +3149,14 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // amd64 box needed this row for the same caller).
             sock::getpeername_arm(fr.arg1(), fr.arg2(), fr.arg3())
         }
-        _other => {
+        akuma_syscalls_abi::x86_64::SIGALTSTACK => sigaltstack_arm(fr.arg1(), fr.arg2()),
+        akuma_syscalls_abi::x86_64::MEMBARRIER => membarrier_arm(fr.arg1()),
+        other => {
             // A guest task hit a number this table does not serve; the errno
-            // is the answer (the arch-level checklist arm is above).
+            // is the answer (the arch-level checklist arm is above). The
+            // first hit of each number is named on the console, so a probe
+            // run (`rustc`, `git`, `cargo`) yields the gap list for free.
+            nosys_note(other);
             e(ring3::err::ENOSYS)
         }
     }
@@ -3405,6 +3536,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     t.fd_nonblock = fdtable::FlagSet::new();
     t.exit = None;
     t.mmap_cur = MMAP_BASE;
+    t.sigalt = SIGALT_OFF;
     // A fresh address space, a fresh region list: `user_ok` checks against
     // exactly what THIS image mapped. Without the reset the 16 region slots
     // fill across spawns and an exec would panic on the append.

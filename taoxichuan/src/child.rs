@@ -1058,7 +1058,15 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     // before its first fs-relative read.
     let _ = akuma_cpu::msr::set_fs_base(0);
     set_slot_fs(slot_idx, 0);
+    // The crossing runs the child ON this slot's number, so the pool must say
+    // so: `reserve_slot` leaves it INITIALIZING, which the picker never
+    // takes, and a tick that preempts the child then switches away from a
+    // slot it can never pick again - the spawn parks after `[SSH] Exec:`
+    // forever (supervisor, 2026-10-30; QEMU TCG, deterministic with the
+    // switch on, absent with it off).
+    akuma_threading::set_thread_state(slot_idx, 2);
     let code = unsafe { child_enter(ti.root_pa, &ef, save) };
+    akuma_threading::set_thread_state(slot_idx, 3);
     // `code` (the child's exit status) was recorded into the slot by the
     // exit arm before it returned here; SPAWN's own result is the packed
     // pid/fd word below.
