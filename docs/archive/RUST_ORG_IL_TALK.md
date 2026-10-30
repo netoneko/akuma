@@ -206,5 +206,12 @@ usage API; full method and tables in the agent log, "GLM tokenomics from the goo
   axum/hyper, reqwest + rustls), and its kernel-facing quirks (`EPOLLET` re-arm, the eventfd wake of
   an epoll-parked reactor) are already found and fixed.
 
+- Future possibility (not a plan): harden by composition - compile capabilities out (read-only
+  disk, a census-built syscall allow-list) and filter the rest by user id - and verify the pure
+  crates with fuzzing, Kani/Verus and Miri. Precedents: Firecracker's Kani harnesses found a real
+  virtio-boundary bug; Asterinas confines `unsafe` to one core crate (~14% TCB); Hubris fixes its
+  task set at build time in ~2,000 lines; AutoVerus has LLM agents writing Verus proofs (>90% of
+  150 tasks). Details in the agent log, 2026-10-30.
+
 **Linux comparison:** pending — `scripts/linux_audit_surface.sh` (firecracker / minimal /
 host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.

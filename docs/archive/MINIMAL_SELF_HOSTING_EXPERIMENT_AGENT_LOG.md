@@ -1818,3 +1818,33 @@ claim - an open model can build your own stack in a short time for little money 
   Open: how "what tokio needs" is stated (a census of a tokio binary under strace on Linux, as stage 9's census did for
   rustc), whether the shape is one crate with features or a composition-root template, and the gate (a tokio server and
   client binary, unmodified, in a KVM guest).
+
+### 2026-10-30 (future possibility, not a plan): pushing verification, composability and compatibility further
+
+Two directions the user named, noted with the prior work that maps onto them. Nothing here is scheduled.
+
+- **Practical hardening by composition.** Compile capabilities out instead of denying them at runtime: a read-only disk (no
+  ext2 write paths in the image, and a read-only virtio-blk device on the host side); the syscall table as a compile-time
+  allow-list built from an app's census, so an unlisted call has no code behind it; runtime syscall filtering by user id for
+  what cannot be compiled out; an egress allow-list in the socket table; W^X; and an agent locked in a `box` inside a KVM
+  guest when two walls are wanted. `scripts/cloc_akuma.py --audit` already measures the first two, because it evaluates
+  features: a capability compiled out is a line count that went down.
+- **Static analysis, fuzzing and formal verification of components.** The pure crates are natural targets: guest-facing
+  device models and the MMIO decoder in `akuma-svm-amd64`, `akuma-ext2` and `akuma-elf` on hostile input, the syscall decode
+  crates (the two `akuma-syscalls-mem` overflows were found by host tests by luck), `akuma-cow`'s three-input decision,
+  `akuma-fdtable` and `akuma-mmap::HoleSet` invariants, Miri over the crates that must hold `unsafe`, cargo-vet for the
+  third-party half of the image. Existing footholds: 2,763 host tests, two exhaustive model checkers (`bkl_model.rs`,
+  `akuma-locks-rw/src/model.rs`), differential tests (`akuma-tty`, `akuma-net-yarn`), Linux-differential suites
+  (`epoll_suite.py --linux`), four hand-rolled wifi fuzzers. Not used anywhere yet: Kani, cargo-fuzz, proptest, Miri.
+- **Prior work worth knowing:**
+  - *Firecracker + Kani* (AWS, 2023): bounded model checking of the virtio boundary found a real bug (a guest-placed queue
+    overlapping the MMIO region crashed the VMM on boot); 27 harnesses run in CI in ~15 minutes. The closest analogue to
+    verifying `akuma-svm-amd64`.
+  - *Asterinas* (USENIX ATC '25): a Linux-ABI-compatible "framekernel" in Rust that confines all `unsafe` to one core
+    library (OSTD), giving a memory-safety TCB of ~14% of the code, with Verus verification under way. The same policy as
+    Akuma's leaf `unsafe` crates (`akuma-cpu`, `akuma-port`, `akuma-dma`), taken to a single crate.
+  - *Hubris* (Oxide): the task set is fixed at build time, there is no dynamic resource allocation, and the kernel is
+    ~2,000 lines. The far end of "a kernel composed for one job", and the precedent for a compile-time syscall allow-list.
+  - *AutoVerus* (Microsoft Research, OOPSLA 2025): LLM agents draft, refine and debug Verus proofs against the verifier's
+    errors; correct proofs for over 90% of 150 benchmark tasks. A verifier is the kind of mechanical oracle this experiment
+    found a weaker model does well with, which makes proofs for small pure crates a plausible job for goose + GLM.
