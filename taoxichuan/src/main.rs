@@ -2310,15 +2310,51 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     dispatch_inner(fr)
 }
 
+/// The syscall ring `trace_ring` fills and `trace_hang_dump` reads.
+#[cfg(feature = "trace-err")]
+const N: usize = 1024;
+#[cfg(feature = "trace-err")]
+static mut RING: [(i32, u64, u64, u64, u64, u64, u64); N] = [(0, 0, 0, 0, 0, 0, 0); N];
+#[cfg(feature = "trace-err")]
+static mut HEAD: usize = 0;
+
+/// The idle thread calls this when nothing has run for a while: every live
+/// slot's last `per` syscalls, so a hang shows what each thread was waiting on.
+#[cfg(feature = "trace-err")]
+pub(crate) fn trace_hang_dump(per: usize) {
+    akuma_primitives::safe_print!(64, "[hang] idle for 20 s; last syscalls per slot:\n");
+    // SAFETY: idle thread, single core, IF clear between laps.
+    unsafe {
+        let ring = &*core::ptr::addr_of!(RING);
+        let head = *core::ptr::addr_of!(HEAD);
+        for slot in 0..child::NSLOTS {
+            if !child::slot_in_use(slot) {
+                continue;
+            }
+            let mut shown = 0;
+            for i in (0..N).rev() {
+                if shown >= per {
+                    break;
+                }
+                let (sl, n, x, y, z, ret, rp) = ring[(head + i) % N];
+                if n != 0 && sl == slot as i32 {
+                    shown += 1;
+                    akuma_primitives::safe_print!(
+                        112, "[hang] s{} nr={} a=0x{:x},0x{:x},0x{:x} -> {} rip=0x{:x}\n",
+                        slot, n, x, y, z, ret as i64, rp
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// `--features trace-err`: the last 96 syscalls of every task, dumped when a
 /// task writes the 4-byte value 17 (std's CLOEXEC error pipe reporting EEXIST).
 /// Debug aid for "could not execute process"; the dump is the evidence.
 #[cfg(feature = "trace-err")]
 #[allow(clippy::many_single_char_names)] // register-argument names
 fn trace_ring(nr: u64, r: u64, a1: u64, a2: u64, a3: u64, rip: u64) {
-    const N: usize = 1024;
-    static mut RING: [(i32, u64, u64, u64, u64, u64, u64); N] = [(0, 0, 0, 0, 0, 0, 0); N];
-    static mut HEAD: usize = 0;
     static DUMPED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     let slot = crate::exec_twin::current_slot() as i32;
     // SAFETY: syscall-path discipline (single core, IF clear).

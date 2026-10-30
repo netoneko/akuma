@@ -254,6 +254,8 @@ extern "C" fn idle_main() -> ! {
     // spinning idle lap's netpoll cannot receive what the starved relay
     // cannot run to deliver. The 100 Hz tick wakes the halt; the yield
     // check stays after the lap.
+    #[cfg(feature = "trace-err")]
+    let mut idle_laps = 0u32;
     loop {
         // The NIC pump: one poll per lap (per tick-wake now). The idle lap
         // is the everything-path's last resort — an all-parked system used
@@ -261,9 +263,20 @@ extern "C" fn idle_main() -> ! {
         crate::net::netpoll();
         crate::exec_twin::tick_window();
         if akuma_threading::x86_runnable_exists() {
+            #[cfg(feature = "trace-err")]
+            {
+                idle_laps = 0;
+            }
             akuma_threading::x86_yield();
         } else {
             crate::net::wait_lap();
+            #[cfg(feature = "trace-err")]
+            {
+                idle_laps += 1;
+                if idle_laps == 2000 {
+                    crate::trace_hang_dump(4);
+                }
+            }
         }
     }
 }
