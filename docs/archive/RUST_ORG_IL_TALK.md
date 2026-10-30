@@ -253,5 +253,23 @@ usage API; full method and tables in the agent log, "GLM tokenomics from the goo
   on taoxichuan: on the full kernel it started working in the same stretch as cargo building the
   kernel.
 
+**Extraction on this branch** (snapshot 2026-10-30; more extractions are expected in the next few
+days - re-count with `git ls-tree -d --name-only $(git merge-base main HEAD) crates/` against HEAD)
+
+- **9 new crates** since the main merge-base (10-24): 98 -> 107. 2,812 production lines and 980
+  test lines; 7 of the 9 carry `forbid(unsafe_code)` (not `akuma-boot-amd64`, `akuma-ring3-amd64`).
+  `akuma-boot-amd64`, `akuma-comconsole`, `akuma-ring3-amd64` (10-24), `akuma-elf-exec`,
+  `akuma-syscalls-eventfd` (10-26), `akuma-lapic-amd64` (10-28), `akuma-fpu-amd64`,
+  `akuma-syscalls-signal`, `akuma-user-tree` (10-30). Plus new modules in existing crates:
+  `akuma-mmap::HoleSet`, `akuma-syscalls-abi::legacy`, `akuma-syscalls-net::sockaddr`.
+- **Extraction flowed back**: all 9 are linked by taoxichuan, and 4 (`akuma-boot-amd64`,
+  `akuma-elf-exec`, `akuma-lapic-amd64`, `akuma-fpu-amd64`) are already consumed by the full amd64
+  kernel; `sockaddr` took amd64's `unsafe` from 85 to 83.
+- 9 of taoxichuan's 34 `akuma-*` dependencies did not exist a week ago.
+- **taoxichuan builds taoxichuan** (`a99870a5`, 2026-10-30): a 3 GiB KVM guest compiles its own
+  kernel in 11m41s (1,433,608-byte binary). Booting the produced ELF again - the stage 12 fixed
+  point - is not recorded yet. Memory for the same compile: Linux 447 MiB, Akuma 1,356 MiB,
+  taoxichuan at least 2,460 MiB (eager file mmap).
+
 **Linux comparison:** pending — `scripts/linux_audit_surface.sh` (firecracker / minimal /
 host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.
