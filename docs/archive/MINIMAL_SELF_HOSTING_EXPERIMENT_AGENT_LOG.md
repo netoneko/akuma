@@ -1706,8 +1706,12 @@ output per million, GLM-5.3 $1.4 / $0.26 / $4.4.
 - **The quota charges more than the formula.** The formula gives 35.6 credits per million tokens for this mix and timing. The
   quota readings in this log (95.4M = 49%, 130.1M = 64%, and 23.0M = 12% on 10-30) give ~50 credits per million, about
   200M Flash tokens per Lite week (10,000 credits). The user's account of the week agrees with the readings, not the formula:
-  the experiment used **3 weekly resets** of the Lite plan, and 569.4M x 50 / 10,000 = 2.85 weeks. Not explained here; the
-  off-peak discount not applying as documented would account for most of it.
+  the experiment used **3 weekly resets** of the Lite plan, and 569.4M x 50 / 10,000 = 2.85 weeks. Partly explained (user's
+  point): GLM-5.3's day-one 16.1M tokens cost ~1,540 credits (off-peak Saturday), ~1,000 more than the same tokens on Flash
+  (~0.1 week, already inside the formula's 20,251); 10-20/21's 115M Flash tokens are not in this ledger and add ~4,100
+  credits (~0.4 week) if they fell inside the reset weeks - ~2.4 weeks by the formula against 3. Not all of it: the three
+  readings above were taken in Flash-only windows and still give ~50 credits per million against ~36; the off-peak discount
+  not applying as documented would account for most of that.
 - **Refined-process milestones** (sessions from 10-26, grouped by milestone from the ledger's session names and times):
 
 | milestone | tokens | API $ |
