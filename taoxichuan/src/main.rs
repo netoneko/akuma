@@ -969,7 +969,7 @@ struct Task {
     /// child-side `signal(SIGPIPE, SIG_DFL)` fails the whole spawn when that
     /// reads back as `SIG_ERR` (-1) - which is what an unwritten `oldact`
     /// (stack garbage) did.
-    sigact: [[u64; 4]; 65],
+    sigact: akuma_syscalls_signal::SigTable,
     /// `rt_sigprocmask`'s word (shared by a task's threads - imprecise, and
     /// harmless without delivery).
     sigmask: u64,
@@ -1015,7 +1015,7 @@ impl Task {
             brk_end: 0,
             mmap_cur: MMAP_BASE,
             sigalt: SIGALT_OFF,
-            sigact: [[0; 4]; 65],
+            sigact: akuma_syscalls_signal::SigTable::new(),
             sigmask: 0,
             exe: alloc::string::String::new(),
             shared: [(0, 0, 0, 0, 0); MAX_SHARED],
@@ -1249,64 +1249,45 @@ fn munmap_arm(addr: u64, len: u64) -> u64 {
 /// so the handler is recorded and read back, nothing more - but the read-back
 /// must be real: `oldact` is what musl's `signal()` returns.
 fn sigaction_arm(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
-    const SIGKILL: u64 = 9;
-    const SIGSTOP: u64 = 19;
-    if sigsetsize != 8 || sig == 0 || sig > 64 {
+    use akuma_syscalls_signal::{SIGACTION_WIRE, SigTable, from_wire, to_wire};
+    if SigTable::check(sig, act != 0, sigsetsize).is_err() {
         return e(ring3::err::EINVAL);
     }
-    if act != 0 && (sig == SIGKILL || sig == SIGSTOP) {
-        return e(ring3::err::EINVAL);
-    }
-    let mut new = [0u8; 32];
+    let mut new = [0u8; SIGACTION_WIRE];
     if act != 0 && (!user_ok(act, 32) || !copy_from_user(&mut new, act)) {
         return e(ring3::err::EFAULT);
     }
-    let slot = &mut task().sigact[sig as usize];
-    if oldact != 0 {
-        let mut old = [0u8; 32];
-        for (i, w) in slot.iter().enumerate() {
-            old[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
-        }
-        if !user_ok(oldact, 32) || !copy_to_user(oldact, &old) {
-            return e(ring3::err::EFAULT);
-        }
+    let table = &mut task().sigact;
+    if oldact != 0 && (!user_ok(oldact, 32) || !copy_to_user(oldact, &to_wire(&table.get(sig)))) {
+        return e(ring3::err::EFAULT);
     }
     if act != 0 {
-        for (i, w) in slot.iter_mut().enumerate() {
-            *w = u64::from_le_bytes(new[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
-        }
+        let _ = table.replace(sig, from_wire(&new));
     }
     0
 }
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)`: the mask word is kept and
 /// read back (musl's `pthread_sigmask`/`__block_all_sigs` restore what they
-/// read); SIGKILL and SIGSTOP can never be blocked.
+/// read); SIGKILL and SIGSTOP can never be blocked. The algebra is
+/// `akuma_syscalls_signal::procmask`.
 fn sigprocmask_arm(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> u64 {
-    const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
-    if sigsetsize != 8 {
+    let mut new = [0u8; 8];
+    // The checks that come before any user access (size, then `how` with a set).
+    if akuma_syscalls_signal::procmask(how, 0, (set != 0).then_some(0), sigsetsize).is_err() {
         return e(ring3::err::EINVAL);
     }
-    let mut new = [0u8; 8];
-    if set != 0 {
-        if how > 2 {
-            return e(ring3::err::EINVAL);
-        }
-        if !user_ok(set, 8) || !copy_from_user(&mut new, set) {
-            return e(ring3::err::EFAULT);
-        }
+    if set != 0 && (!user_ok(set, 8) || !copy_from_user(&mut new, set)) {
+        return e(ring3::err::EFAULT);
     }
     let cur = task().sigmask;
     if oldset != 0 && (!user_ok(oldset, 8) || !copy_to_user(oldset, &cur.to_le_bytes())) {
         return e(ring3::err::EFAULT);
     }
     if set != 0 {
-        let bits = u64::from_le_bytes(new) & !UNBLOCKABLE;
-        task().sigmask = match how {
-            0 => cur | bits,
-            1 => cur & !bits,
-            _ => bits,
-        };
+        if let Ok(m) = akuma_syscalls_signal::procmask(how, cur, Some(u64::from_le_bytes(new)), sigsetsize) {
+            task().sigmask = m;
+        }
     }
     0
 }
@@ -4790,11 +4771,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     t.n_shared = 0;
     t.sigalt = SIGALT_OFF;
     // execve: caught handlers go back to SIG_DFL, ignored ones stay ignored.
-    for a in &mut t.sigact {
-        if a[0] != 1 {
-            *a = [0; 4];
-        }
-    }
+    t.sigact.reset_for_exec();
     // A fresh address space, a fresh region list: `user_ok` checks against
     // exactly what THIS image mapped. Without the reset the 16 region slots
     // fill across spawns and an exec would panic on the append.

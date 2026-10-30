@@ -63,6 +63,7 @@
     "crates/akuma-syscalls-mem",
     "crates/akuma-syscalls-net",
     "crates/akuma-syscalls-poll",
+    "crates/akuma-syscalls-signal",
     "crates/akuma-syscalls-sync",
     "crates/akuma-syscalls-time",
     "crates/akuma-touchpad",

@@ -54,6 +54,7 @@ dependencies = [
  "akuma-syscalls-log",
  "akuma-syscalls-mem",
  "akuma-syscalls-poll",
+ "akuma-syscalls-signal",
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
  "akuma-timer",
@@ -825,6 +826,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-syscalls-signal"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-syscalls-sync"
 version = "0.1.0"
 dependencies = [
@@ -1294,6 +1299,7 @@ dependencies = [
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
  "akuma-syscalls-poll",
+ "akuma-syscalls-signal",
  "akuma-syscalls-sync",
  "akuma-threading",
  "akuma-trap-amd64",

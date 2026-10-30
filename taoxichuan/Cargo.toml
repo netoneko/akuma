@@ -56,6 +56,8 @@ akuma-cpu = { path = "../crates/akuma-cpu" }
 akuma-cow = { path = "../crates/akuma-cow" }
 # The mmap slab's hole table (first-fit under the bump cursor), host-tested.
 akuma-mmap = { path = "../crates/akuma-mmap" }
+# rt_sigaction's table and rt_sigprocmask's algebra, host-tested.
+akuma-syscalls-signal = { path = "../crates/akuma-syscalls-signal" }
 # ---- The stage-2 crate line -------------------------------------------------
 #
 # Ring 3: the ELF slice parser, the Linux initial stack, the syscall MSR

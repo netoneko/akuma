@@ -225,3 +225,6 @@ CoW and mmap symbol sites.
 **Status (2026-10-30, supervisor):** slice 1 (§2.1) DONE - `akuma_mmap::HoleSet<N>` (`crates/akuma-mmap/src/holes.rs`, 10 host tests incl. a page-bitmap model check),
 taoxichuan's `add_hole`/`carve_hole`/`mmap_alloc` are thin wrappers over it; `Task::holes`/`n_holes` became one `HoleSet<64>`. Battery, leak gate unchanged.
 Chose the extension of `akuma-mmap` (empty deps kept) as the plan preferred. Behaviour pinned verbatim: swap-remove order, first-fit in table order, drop-when-full.
+**Slice 2 (§2.2) DONE:** `akuma-syscalls-signal` (`SigTable`, wire image, `check`, `reset_for_exec`, `procmask`; zero dependencies - errors are a closed enum the
+caller maps to errno, so it needs no ABI crate; forbid(unsafe), budget 0; 10 host tests incl. an exhaustive differential of `check` against the old inline rule).
+taoxichuan's `sigaction_arm`/`sigprocmask_arm`/exec reset use it. amd64's `signal.rs` has NOT adopted it yet (no amd64 gate was run).

@@ -1,0 +1,13 @@
+[package]
+name = "akuma-syscalls-signal"
+version = "0.1.0"
+edition = "2024"
+description = "The signal family's pure bookkeeping: the per-task rt_sigaction table (read-back, execve reset, fork inheritance by value), its 32-byte wire image, and rt_sigprocmask's mask algebra with the errno decisions. Delivery stays in the kernels."
+
+[lints]
+workspace = true
+
+# No dependencies, by design: the table and the mask algebra are arithmetic on
+# words. Errors are a closed enum the caller maps to its own errno table, so
+# this crate needs no ABI crate and nothing can drift against one.
+[dependencies]
