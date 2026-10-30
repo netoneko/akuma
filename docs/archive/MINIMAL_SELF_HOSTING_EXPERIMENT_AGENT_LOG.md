@@ -1661,3 +1661,9 @@ Left open: the ledger bookkeeping of a disowned fork-child `Process` leaks a lit
 Tooling that earned its keep: a **hang dump** in `trace-err` (after 20 s of idle: every live slot's in-flight syscall, last syscalls and the global futex order), a per-syscall-number cap on the `[err]` trace, the `mmdbg=` and `TX_APPEND` knobs, and the KVM rig's persistent overlay (a project staged once survives kernel rebuilds).
 
 **What is not done / known:** fork still copies the whole address space eagerly (no CoW), which is why `-j4` needs the 8 GiB guest (`-m 3072` runs out of memory with four rustc + rust-lld at once); one vCPU, so `-j4` shows concurrency, not speed; the guest clock comes from the command line; remaining `[nosys]`: getrusage 98, prctl 157, mount/umount2 165/166, preadv2 328; the hole allocator and the sigaction table should become crates with host tests; a lazy-mapped loader for executables over 16 MiB; the HTTP-served tarball is only needed for the vendored variant now.
+
+## 2026-10-30: copy-on-write fork (decided: user asked; planned by goose-glm on the Mac, implemented by the supervisor)
+glm planned (`TAOXICHUAN_COW_FORK_PLAN_GLM.md`, 21 tool calls); implementation and gate in `TAOXICHUAN_COW_FORK.md`. Leaf frames are shared at
+fork, writable ones demoted RO + PTE bit 9, one break path (`cow_resolve`) for the write fault, `copy_to_user` and `mprotect`.
+`scripts/kvm/goose/cow_leak_gate.py`: 60 fork rounds, free pages back to baseline exactly (654000), `cowrefs=0`. Battery and the one-boot cargo trio green on TCG.
+Not yet run on the ryzen: `-j4` in a 3 GB guest.

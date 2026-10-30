@@ -66,23 +66,52 @@ This kernel never dereferences a user pointer — there is no `uaccess`
 fast path. The console-emit path additionally refuses non-UTF-8 chunks with a
 `[tty] write: non-utf8 bytes elided` line rather than silently mangling them.
 
-## fork's memory: eager, flag-faithful copy, no CoW
+## fork's memory: copy-on-write
 
 `fork_share_memory(parent_root)` (main.rs) builds a fork child's address
 space — the M2 arm calls it directly, and the real fork reaches the same walk
 through the twin's `ExecRuntime::fork_share_memory` hook
-([`processes.md`](processes.md)): a fresh root (kernel half shared by the
-same PML4 copy), then a
-subtree-by-subtree clone of the parent's **user half only**, each leaf a fresh
-zeroed frame with the parent's 4 KiB copied in and **the parent PTE's own flag
-bits preserved** (RX text stays RX; a RW mapping of text would be NX and the
-child would fault on its first instruction). The kernel half is never walked —
-its physmap subtree names every physical address the window covers, holes
-included. Huge (PS) leaves are refused rather than silently shared.
+([`processes.md`](processes.md)) via `clone_user_half`: a fresh root (kernel
+half shared by the same PML4 copy), then a subtree-by-subtree clone of the
+parent's **user half only**. The page tables are copied; the **leaf frames are
+shared**:
 
-There is deliberately no copy-on-write: this kernel has no page-fault handler
-(a fault kills the task), so there is nothing to break CoW on. Eager copy is
-what the ELF loader already does.
+- every present 4 KiB leaf takes one `cow_ref_inc` (the first share inserts 2:
+  parent + child); the kernel half is never walked;
+- a **writable** leaf is demoted to read-only in *both* tables and marked with
+  PTE bit 9 (`PTE_COW`, an MMU-ignored AVL bit); the parent's translation is
+  `invlpg`'d, because a stale writable entry would write into the shared frame
+  with no fault. A read-only leaf (text, `.rodata`, `mprotect(READ)`) is shared
+  with its flags verbatim and **no** marker, so a write to it is still a kill;
+- a writable `MAP_SHARED` file mapping (`t.shared`) is the exception: those
+  pages are copied eagerly, the per-process-copy-plus-writeback model they run
+  under;
+- huge (PS) leaves are refused. A refused or failed fork releases what it had
+  built through `free_page`, so it leaks nothing.
+
+**One break path**, `cow_resolve(root, va)`: re-read the live PTE, ask
+`akuma_cow::decide` (`pte_writable` → `Retry`; unmarked → `Fault`; share count
+≤ 1 → `TakeInPlace`; else `Copy`), carry it out, `invlpg`. Three callers:
+
+- `fault_trap`, for a ring-3 fault with error code present+write+user (stack
+  growth is tried first; only `Fault` falls through to the kill);
+- `copy_to_user` — the kernel writes user pages through the physmap, which
+  never faults, so it calls `cow_prepare_write` on each destination page first;
+- `mprotect` to a writable mapping calls `cow_privatize`: a frame held by two
+  spaces becomes private before the PTE is re-mapped RW (marked or not — a
+  shared text page is unmarked).
+
+Teardown needed no new code: every release site (`free_user_root`,
+`release_pages`, the exec/reap parking) goes through `akuma_pmm::free_page`,
+which only drops a count while the frame is shared. The gate is
+`scripts/kvm/goose/cow_leak_gate.py`: an idle machine's free-page count after
+N fork/exec/exit rounds must equal the baseline **exactly**, with
+`cow_ref_count() == 0`. The reap lines (`trace-err`) print `cowrefs=` and
+`cow=(shared, copied, taken, retried)`.
+
+Known limits: a kernel write into a read-only page that is shared but *not*
+marked (text) is not intercepted — no caller does that. Incident, plan and
+measurements: `docs/archive/TAOXICHUAN_COW_FORK.md`.
 
 ## Allocation on syscall paths
 

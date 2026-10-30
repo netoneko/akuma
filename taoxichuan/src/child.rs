@@ -2080,13 +2080,15 @@ fn release_spawn_image(pid: u32) {
     let _ = pend;
     if cfg!(feature = "trace-err") {
         akuma_primitives::safe_print!(
-        96,
-        "[spawn-reap] pid={} pages={} free {} -> {} heap={}K\n",
+        160,
+        "[spawn-reap] pid={} pages={} free {} -> {} heap={}K cowrefs={} cow={:?}\n",
         pid,
         pages,
         before,
         akuma_exec::pmm::free_count(),
-        akuma_alloc::allocated_bytes() / 1024
+        akuma_alloc::allocated_bytes() / 1024,
+        akuma_pmm::cow_ref_count(),
+        crate::cow_stats()
     );
     }
 }
@@ -2122,15 +2124,17 @@ fn reap_process(slot: usize, pid: u32) {
     pages += akuma_mmu::drain_pending_ttbr_frees();
     if cfg!(feature = "trace-err") {
         akuma_primitives::safe_print!(
-        128,
-        "[reap] pid={} retired={} drained={} root={} free {} -> {} heap={}K\n",
+        192,
+        "[reap] pid={} retired={} drained={} root={} free {} -> {} heap={}K cowrefs={} cow={:?}\n",
         pid,
         retired,
         drained,
         pages,
         before,
         akuma_exec::pmm::free_count(),
-        akuma_alloc::allocated_bytes() / 1024
+        akuma_alloc::allocated_bytes() / 1024,
+        akuma_pmm::cow_ref_count(),
+        crate::cow_stats()
     );
     }
 }

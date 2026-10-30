@@ -1270,6 +1270,7 @@ dependencies = [
  "akuma-alloc",
  "akuma-boot-amd64",
  "akuma-comconsole",
+ "akuma-cow",
  "akuma-cpu",
  "akuma-elf-exec",
  "akuma-exec",

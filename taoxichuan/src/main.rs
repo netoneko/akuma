@@ -302,10 +302,149 @@ fn grow_user_stack(cr2: u64) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// Copy-on-write fork: shared leaf frames, the bit-9 marker, one break path.
+// ---------------------------------------------------------------------------
+
+/// x86 leaf PTE bits. Bit 9 is an AVL bit the MMU ignores: a page that was
+/// writable when `fork` shared it is demoted to read-only and marked, so a
+/// write fault can tell "break the share" from "this page is read-only"
+/// (`mprotect(PROT_READ)`, text) — `akuma_cow::CowFault::marked`.
+const PTE_W: u64 = 1 << 1;
+const PTE_COW: u64 = 1 << 9;
+const PTE_ADDR: u64 = 0x000f_ffff_ffff_f000;
+
+static COW_SHARED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static COW_COPY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static COW_TAKE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static COW_RETRY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `(shared, copied, taken-in-place, retried)` since boot, for the reap lines.
+#[cfg_attr(not(feature = "trace-err"), allow(dead_code))]
+pub(crate) fn cow_stats() -> (usize, usize, usize, usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (COW_SHARED.load(Relaxed), COW_COPY.load(Relaxed), COW_TAKE.load(Relaxed), COW_RETRY.load(Relaxed))
+}
+
+/// The 4 KiB leaf entry for `va` in `root`'s user half, if every level is
+/// present and none is a huge page.
+fn leaf_entry(root: u64, va: u64) -> Option<*mut u64> {
+    let mut table = root & PTE_ADDR;
+    for shift in [39u32, 30, 21] {
+        let idx = ((va >> shift) & 0x1FF) as usize;
+        // SAFETY: `table` is a page-table frame this walk reached from a
+        // present entry of a user root; the physmap maps all RAM.
+        let e = unsafe { (*phys::phys_ptr::<[u64; 512]>(table))[idx] };
+        if e & 1 == 0 || (shift != 39 && e & 0x80 != 0) {
+            return None;
+        }
+        table = e & PTE_ADDR;
+    }
+    // SAFETY: as above; the pointer stays inside the leaf table frame.
+    Some(unsafe { phys::phys_ptr::<[u64; 512]>(table).cast::<u64>().add(((va >> 12) & 0x1FF) as usize) })
+}
+
+/// THE copy-on-write break: re-read the live PTE for `va` in `root`, ask
+/// `akuma_cow::decide`, and carry the answer out. The write-fault arm and the
+/// kernel's own user-memory writers both come through here — one break path.
+/// Single core, `IF` clear (a trap or a syscall): nothing races the walk.
+/// `invlpg` after every PTE write is the whole shootdown.
+fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
+    use akuma_cow::CowAction;
+    use core::sync::atomic::Ordering::Relaxed;
+    let va = va & !0xFFF;
+    let Some(slot) = leaf_entry(root, va) else {
+        return CowAction::Fault;
+    };
+    // SAFETY: `slot` points into a live leaf table (see `leaf_entry`).
+    let pte = unsafe { slot.read() };
+    if pte & 1 == 0 {
+        return CowAction::Fault;
+    }
+    let old = pte & PTE_ADDR;
+    let action = akuma_cow::CowFault {
+        pte_writable: pte & PTE_W != 0,
+        marked: pte & PTE_COW != 0,
+        refs: akuma_pmm::cow_ref_get(old as usize),
+    }
+    .decide();
+    match action {
+        CowAction::Retry => {
+            COW_RETRY.fetch_add(1, Relaxed);
+            akuma_cpu::tlb::invlpg(va as usize);
+        }
+        CowAction::Fault => {}
+        CowAction::TakeInPlace => {
+            // SAFETY: as above.
+            unsafe { slot.write((pte | PTE_W) & !PTE_COW) };
+            akuma_cpu::tlb::invlpg(va as usize);
+            COW_TAKE.fetch_add(1, Relaxed);
+        }
+        CowAction::Copy => {
+            let Some(new) = akuma_pmm::alloc_page_zeroed() else {
+                // Out of frames: the caller's kill path reports it.
+                return CowAction::Fault;
+            };
+            // SAFETY: both frames are PMM pages inside the physmap; `slot` as above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(phys::phys_ptr::<u8>(old), phys::phys_ptr::<u8>(new as u64), 4096);
+                slot.write(((pte & !PTE_ADDR) | PTE_W | new as u64) & !PTE_COW);
+            }
+            akuma_cpu::tlb::invlpg(va as usize);
+            // Drops this space's count on the old frame (frees it only if it
+            // was somehow the last holder).
+            akuma_pmm::free_page(old as usize, akuma_primitives::preempt::current_tid() as u32);
+            COW_COPY.fetch_add(1, Relaxed);
+        }
+    }
+    action
+}
+
+/// Before the kernel writes into the user page at `va` (through the physmap,
+/// which never faults): if it is a marked read-only page, break the share
+/// first. An unmarked read-only page is left alone (text; the writers only
+/// target stack/heap/scratch).
+fn cow_prepare_write(root: u64, va: u64) {
+    if let Some(slot) = leaf_entry(root, va & !0xFFF) {
+        // SAFETY: see `leaf_entry`.
+        let pte = unsafe { slot.read() };
+        if pte & 1 != 0 && pte & PTE_W == 0 && pte & PTE_COW != 0 {
+            let _ = cow_resolve(root, va);
+        }
+    }
+}
+
+/// `mprotect` is about to make `va` writable: a frame several spaces hold
+/// (marked or not — a shared read-only text page is unmarked) must be private
+/// first, or the write lands in every holder.
+fn cow_privatize(root: u64, va: u64) -> bool {
+    let Some(slot) = leaf_entry(root, va) else {
+        return true;
+    };
+    // SAFETY: see `leaf_entry`.
+    let pte = unsafe { slot.read() };
+    if pte & 1 == 0 || akuma_pmm::cow_ref_get((pte & PTE_ADDR) as usize) < 2 {
+        return true;
+    }
+    // Force the Copy arm for a share the PTE does not mark.
+    // SAFETY: as above.
+    unsafe { slot.write((pte & !PTE_W) | PTE_COW) };
+    !matches!(cow_resolve(root, va), akuma_cow::CowAction::Fault)
+}
+
 fn fault_trap(t: &mut Trap<'_>) {
     let code = t.error_code.unwrap_or(0);
     if t.from_ring3() && code & 1 == 0 && grow_user_stack(akuma_cpu::ctlreg::cr2()) {
         return;
+    }
+    // A user write to a present page: the copy-on-write arm. Present + write
+    // + user (error code bits 0-2). The live PTE decides, never the error
+    // code (`cow_resolve` re-reads it); only `Fault` falls through to the kill.
+    if t.from_ring3() && code & 7 == 7 {
+        let root = akuma_cpu::ctlreg::cr3() & PTE_ADDR;
+        if cow_resolve(root, akuma_cpu::ctlreg::cr2()).resolves() {
+            return;
+        }
     }
     // Stage 2: a fault *from ring 3* is the task's death, not the kernel's —
     // say which, and park. There is no scheduler to reap through and no other
@@ -920,6 +1059,9 @@ fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
     let root = task().root_pa;
     for i in 0..pages {
         let va = (addr + i * 4096) as usize;
+        if want.write && !cow_privatize(root, va as u64) {
+            return e(ring3::err::ENOMEM);
+        }
         let Some(pa) = paging::translate_in(root, va) else {
             continue;
         };
@@ -1421,6 +1563,7 @@ fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
         let va = dst_va + done as u64;
         let page_rem = 4096 - (va & 0xFFF) as usize;
         let n = page_rem.min(src.len() - done);
+        cow_prepare_write(root, va);
         let Some(pa) = paging::translate_in(root, (va & !0xFFF) as usize) else {
             return false;
         };
@@ -2905,12 +3048,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                         return e(ring3::err::EFAULT);
                     }
                     let v = akuma_cpu::msr::read(akuma_cpu::msr::Msr::FsBase);
-                    // SAFETY: `addr` passed `user_ok` — a mapped task page;
-                    // the physmap translation is the same walk the copy above
-                    // makes.
-                    let dst = phys::phys_ptr::<u64>(paging::translate_in(task().root_pa, addr as usize).unwrap_or(0) + (addr & 0xFFF));
-                    unsafe {
-                        dst.write_volatile(v);
+                    if !copy_to_user(addr, &v.to_ne_bytes()) {
+                        return e(ring3::err::EFAULT);
                     }
                     0
                 }
@@ -4505,18 +4644,15 @@ fn task_done(code: u64) -> ! {
 /// (`child.rs`) — one loader, one placement story. Runs with the kernel
 /// half live (the physmap does all the copying); the caller chooses the
 /// CR3 moment.
-/// M2 (H3-f): the fork child's address space — an eager, flag-faithful copy
-/// of the caller's whole user half. No CoW on purpose: this kernel has no
-/// page-fault handler (a fault kills the task, the trap arm at the top of
-/// this file), and eager copy is what the ELF loader already does. The root
-/// is built the same way `load_task` builds one (kernel half copied from the
-/// live CR3, user half empty), then the caller's user page tables are cloned
-/// subtree-by-subtree with fresh leaf frames.
-///
-/// Every leaf keeps the parent PTE's own flag bits — RX text must stay RX
-/// (a RW mapping would be NX and the child would fault on its first
-/// instruction), RO data stays RO. Huge (PS) leaves are refused: the loader
-/// maps 4 KiB pages only, and refusing beats silently sharing a 2 MiB page.
+/// M2 (H3-f), copy-on-write since 2026-10-30: the fork child's address space.
+/// The child's user page tables are cloned subtree-by-subtree, but the LEAF
+/// frames are shared with the parent (`clone_user_tree`): a writable leaf is
+/// demoted to read-only + `PTE_COW` in both tables, a read-only leaf is shared
+/// as is, and the first write by either side faults into `cow_resolve`
+/// (`fault_trap`), which copies or takes the frame in place. Only writable
+/// `MAP_SHARED` file mappings are still copied eagerly. The root is built the
+/// same way `load_task` builds one (kernel half copied from the live CR3, user
+/// half empty). Huge (PS) leaves are refused. `docs/reference/memory.md`.
 pub(crate) fn clone_user_half(parent_root: u64, dst_root: u64) -> Option<()> {
     // The `fork_share_memory` pass, INTO a root that already exists —
     // `fork_process` step 1 handed the child a fresh `UserAddressSpace` and
@@ -4544,7 +4680,17 @@ pub(crate) fn clone_user_half(parent_root: u64, dst_root: u64) -> Option<()> {
             if entry & 0x080 != 0 {
                 return None; // a 1 GiB leaf: see fork_share_memory's note
             }
-            let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2)?;
+            let Some(sub) = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2, (i as u64) << 39) else {
+                // Give back what this pass already linked into `dst`: the root
+                // frame itself stays the caller's.
+                for j in 0..i {
+                    if (*dst)[j] & 1 != 0 {
+                        free_subtree((*dst)[j] & PTE_ADDR, 2);
+                        (*dst)[j] = 0;
+                    }
+                }
+                return None;
+            };
             (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
         }
     }
@@ -4581,7 +4727,15 @@ pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
             if entry & 0x080 != 0 {
                 return None; // a 1 GiB leaf: see fork_share_memory's note
             }
-            let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2)?;
+            let Some(sub) = clone_user_tree(entry & 0x000f_ffff_ffff_f000, 2, (i as u64) << 39) else {
+                for j in 0..i {
+                    if (*dst)[j] & 1 != 0 {
+                        free_subtree((*dst)[j] & PTE_ADDR, 2);
+                    }
+                }
+                akuma_pmm::free_page(root as usize, akuma_primitives::preempt::current_tid() as u32);
+                return None;
+            };
             (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
         }
     }
@@ -4589,18 +4743,29 @@ pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
 }
 
 /// One page-table level of [`fork_share_memory`]'s clone: `depth` counts the
-/// levels BELOW this table (2 = a PDPT, 0 = a leaf PT naming 4 KiB frames).
-/// Each present leaf gets a fresh zeroed frame with the parent's bytes and
-/// the parent entry's flag bits; each interior entry gets a cloned subtree;
-/// huge (PS) leaves are refused at any interior level. Single core, `IF`
-/// clear, the forking parent parked — the discipline that owns every other
-/// page-table touch in this kernel.
+/// levels BELOW this table (2 = a PDPT, 0 = a leaf PT naming 4 KiB frames) and
+/// `va_base` is the address the table's first entry covers.
+///
+/// Leaves are SHARED, not copied (copy-on-write): the child's entry names the
+/// parent's frame, `cow_ref_inc` counts the second holder, and a writable
+/// leaf is demoted to read-only + `PTE_COW` in BOTH tables (the parent's
+/// `invlpg`'d — a stale writable translation would write straight into the
+/// shared frame, silently). A leaf that was already read-only keeps its flags
+/// (text stays RX; no marker, so a write to it is still a kill). The one
+/// exception is a writable `MAP_SHARED` file mapping (`t.shared`): those stay
+/// eager per-process copies, the writeback model they run under. Interior
+/// entries get a cloned subtree; huge (PS) leaves are refused. Single core,
+/// `IF` clear, the forking parent parked.
+///
+/// On failure the partial subtree is released (through `free_page`, so the
+/// counts taken so far are dropped) — a refused fork leaks nothing.
 ///
 /// SAFETY: `table_pa` must be a PMM-resident page-table frame (physmap
 /// reachable) whose table belongs to the USER half of a parked task's root.
-unsafe fn clone_user_tree(table_pa: u64, depth: u32) -> Option<u64> {
+unsafe fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
     let out_page = akuma_pmm::alloc_page_zeroed()?;
     let out = out_page as u64;
+    let shift = 12 + 9 * depth;
     // SAFETY: contract above; every load/store is inside the physmap.
     unsafe {
         let src = phys::phys_ptr::<[u64; 512]>(table_pa);
@@ -4610,27 +4775,74 @@ unsafe fn clone_user_tree(table_pa: u64, depth: u32) -> Option<u64> {
             if entry & 1 == 0 {
                 continue; // not present
             }
+            let va = va_base | ((i as u64) << shift);
             if depth == 0 {
-                let old = entry & 0x000f_ffff_ffff_f000;
-                let frame = akuma_pmm::alloc_page_zeroed()? as u64;
-                core::ptr::copy_nonoverlapping(
-                    phys::phys_ptr::<u8>(old),
-                    phys::phys_ptr::<u8>(frame),
-                    4096,
-                );
-                // The flag bits (present/RW/US/accessed/dirty/NX, 0-11 and
-                // 52-63) ride along verbatim; only the frame number is new.
-                (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | frame;
+                let old = entry & PTE_ADDR;
+                if in_shared_span(va) {
+                    let Some(frame) = akuma_pmm::alloc_page_zeroed() else {
+                        free_subtree(out, depth);
+                        return None;
+                    };
+                    core::ptr::copy_nonoverlapping(
+                        phys::phys_ptr::<u8>(old),
+                        phys::phys_ptr::<u8>(frame as u64),
+                        4096,
+                    );
+                    (*dst)[i] = (entry & !PTE_ADDR) | frame as u64;
+                } else {
+                    akuma_pmm::cow_ref_inc(old as usize);
+                    let mut e = entry;
+                    if entry & PTE_W != 0 {
+                        e = (entry & !PTE_W) | PTE_COW;
+                        (*src)[i] = e;
+                        akuma_cpu::tlb::invlpg(va as usize);
+                    }
+                    (*dst)[i] = e;
+                    COW_SHARED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
             } else {
                 if entry & 0x080 != 0 {
+                    free_subtree(out, depth);
                     return None; // a huge page: see fork_share_memory's note
                 }
-                let sub = clone_user_tree(entry & 0x000f_ffff_ffff_f000, depth - 1)?;
-                (*dst)[i] = (entry & !0x000f_ffff_ffff_f000) | sub;
+                let Some(sub) = clone_user_tree(entry & PTE_ADDR, depth - 1, va) else {
+                    free_subtree(out, depth);
+                    return None;
+                };
+                (*dst)[i] = (entry & !PTE_ADDR) | sub;
             }
         }
     }
     Some(out)
+}
+
+/// Is `va` inside a writable `MAP_SHARED` file mapping of the running task?
+fn in_shared_span(va: u64) -> bool {
+    let t = task();
+    t.shared[..t.n_shared].iter().any(|&(base, len, ..)| va >= base && va < base + len)
+}
+
+/// Release a page-table subtree built by [`clone_user_tree`]: `depth` levels
+/// below `table_pa` (0 = a leaf table). Leaves go through `free_page` (a
+/// shared frame only loses a count); the tables are never shared.
+///
+/// SAFETY-adjacent contract: `table_pa` is a table frame of the caller's own
+/// half-built tree, unreachable from any live root.
+fn free_subtree(table_pa: u64, depth: u32) {
+    let tid = akuma_primitives::preempt::current_tid() as u32;
+    // SAFETY: the frame is a PMM page inside the physmap, owned by the caller.
+    let table = unsafe { &*phys::phys_ptr::<[u64; 512]>(table_pa) };
+    for &e in table {
+        if e & 1 == 0 {
+            continue;
+        }
+        if depth == 0 {
+            akuma_pmm::free_page((e & PTE_ADDR) as usize, tid);
+        } else {
+            free_subtree(e & PTE_ADDR, depth - 1);
+        }
+    }
+    akuma_pmm::free_page(table_pa as usize, tid);
 }
 
 fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {

@@ -52,6 +52,8 @@ akuma-ext2 = { path = "../crates/akuma-ext2" }
 akuma-vfs = { path = "../crates/akuma-vfs" }
 # cr0/cr2/cr3/cr4 reads (fault reports, the WP bit), `invlpg`, `park`.
 akuma-cpu = { path = "../crates/akuma-cpu" }
+# The copy-on-write write-fault decision (live PTE writable? marked? share count?).
+akuma-cow = { path = "../crates/akuma-cow" }
 # ---- The stage-2 crate line -------------------------------------------------
 #
 # Ring 3: the ELF slice parser, the Linux initial stack, the syscall MSR
