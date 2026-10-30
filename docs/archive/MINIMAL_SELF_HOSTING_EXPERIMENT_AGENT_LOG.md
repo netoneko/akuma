@@ -1897,3 +1897,20 @@ K2 (built in a guest running K1) are **byte-identical**, md5 `6facda34cbf9ef3cb3
 Procedure, the numbers and six pitfalls: [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md). The path there needed an `execve` argument-size fix, a thread-exit
 process-table leak, a 16 GiB mmap slab, a fast guest clock, `close(0)`/`open`, W^X, and a flat CoW share table ([`TAOXICHUAN_BUGS_FOUND_2026_10_30.md`](TAOXICHUAN_BUGS_FOUND_2026_10_30.md)).
 Memory for the same compile: Linux 447 MiB, Akuma 1,356 MiB, taoxichuan >= 2,460 MiB. Next: bare-metal validation; and goose needs epoll (entry above).
+
+### What to do next (2026-10-30, user's pick): two hardware-backed hardening items for the ryzen (Ryzen 7 8845HS, Zen 4)
+
+Only these two; the rest of the CPU's features (TPM sealing, SKINIT, shadow stacks, protection keys) are not worth it while
+both kernels are experimental. There is no secure enclave on this part: no SGX equivalent, no SEV/SEV-SNP (EPYC-only), no
+SME/TSME.
+
+1. **SMEP / SMAP / UMIP (present): cheap, for Taoxichuan.**
+   - These stop the kernel from executing user pages (SMEP) or touching them outside explicit copy windows (SMAP); UMIP hides
+     descriptor-table instructions from ring 3.
+   - Akuma amd64 already turns on SMAP, SMEP and `CR0.WP` (`amd64/src/boot.rs`, `uaccess::init_smap`). No CR4 setup was found
+     in Taoxichuan. Under KVM with `-cpu host` the guest gets these too, so it is the cheapest hardening win available.
+2. **NPT-enforced guest kernel W^X (SVM + nested paging, present): the closest thing to an enclave that can be built here.**
+   - Because Akuma owns the hypervisor, after a guest boots it can mark the guest kernel's code pages read+execute-only (and
+     its data no-execute) in the nested page tables.
+   - Then even a guest kernel exploit cannot patch kernel code. Windows calls this HVCI/VBS. Few hobby kernels can do it,
+     because few own their own hypervisor.
