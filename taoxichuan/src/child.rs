@@ -2268,6 +2268,7 @@ pub fn prepare_task_slot(slot: usize) -> Option<usize> {
     c.trap_stack_top = ttop;
     c.save = CrossSave::new();
     c.uctx = None;
+    crate::exec_twin::fx_reset(slot);
     Some(ktop as usize)
 }
 

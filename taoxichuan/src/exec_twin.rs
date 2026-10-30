@@ -111,7 +111,7 @@ pub fn uptime_us() -> u64 {
 /// below, CR3 untouched — it runs on the kernel root). `from` needs nothing:
 /// the crate saves its context.
 fn switch_to(from: usize, to: usize) {
-    let _ = from;
+    fx_save(from);
     // (session pg: the per-switch `[tmp] sw to=` print lived here — at
     // preemption scale it rotated the console log every ~30 s and ate the
     // gate verdicts; removed before the first gate boot per PLAN-pg §5.)
@@ -152,6 +152,61 @@ fn switch_to(from: usize, to: usize) {
     // per switch, incoming slot's shadow; the idle thread (to >= NSLOTS)
     // runs kernel code only and is skipped.
     let _ = akuma_cpu::msr::set_fs_base(crate::child::slot_fs_of(to));
+    fx_restore(to);
+}
+
+/// One task's `fxsave` image: x87/MMX/SSE state. The kernel is soft-float, so
+/// at a switch the registers still hold the OUTGOING task's user values, and
+/// without this every preemption or park handed them to whichever task ran
+/// next - LLVM's vector code in rustc's codegen threads then computed garbage
+/// (an out-of-range index that spelled "loss", a `free()` of a misaligned
+/// pointer). XSAVE/AVX is never enabled here, so the legacy area is the whole
+/// state (`docs/archive/AMD64_SMP_BRINGUP.md` has the amd64 twin of this).
+#[repr(C, align(16))]
+struct FxArea([u8; 512]);
+
+/// The power-on x87/SSE state: `FCW = 0x037F`, `MXCSR = 0x1F80` (every SSE
+/// exception masked). All-zero would unmask them and the first `divss` traps.
+const fn fx_init() -> FxArea {
+    let mut a = [0u8; 512];
+    a[0] = 0x7F;
+    a[1] = 0x03;
+    a[24] = 0x80;
+    a[25] = 0x1F;
+    FxArea(a)
+}
+
+/// One area per ring slot plus the idle thread (`IDLE_TID`). SAFETY: single
+/// core, IF clear at every switch; only ever touched through raw pointers.
+static mut FX: [FxArea; crate::child::NSLOTS + 1] = [const { fx_init() }; crate::child::NSLOTS + 1];
+
+fn fx_save(slot: usize) {
+    if slot <= crate::child::NSLOTS {
+        // SAFETY: `FX[slot]` is a 16-byte-aligned 512-byte area; `fxsave64`
+        // writes exactly that and touches no flags.
+        unsafe {
+            core::arch::asm!("fxsave64 [{}]", in(reg) (&raw mut FX[slot]).cast::<u8>(), options(nostack, preserves_flags));
+        }
+    }
+}
+
+fn fx_restore(slot: usize) {
+    if slot <= crate::child::NSLOTS {
+        // SAFETY: as `fx_save`; every area holds either `fx_init()` or an
+        // image `fxsave64` wrote, both valid `fxrstor64` inputs.
+        unsafe {
+            core::arch::asm!("fxrstor64 [{}]", in(reg) (&raw const FX[slot]).cast::<u8>(), options(nostack, preserves_flags, readonly));
+        }
+    }
+}
+
+/// A slot is being given to a new task: it starts from the power-on state, not
+/// the previous occupant's registers.
+pub fn fx_reset(slot: usize) {
+    if slot <= crate::child::NSLOTS {
+        // SAFETY: single core, IF clear (the claim path); the slot is not running.
+        unsafe { (&raw mut FX[slot]).write(fx_init()) };
+    }
 }
 
 /// The idle thread's tid: outside the spawn ring (children claim 1..NSLOTS,
