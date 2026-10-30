@@ -4013,6 +4013,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             read_fd_arm(fr.arg1(), fr.arg2(), fr.arg3())
         }
         ring3::nr::SHUTDOWN | ring3::nr::SETSOCKOPT if pair_ends(fr.arg1()).is_some() => 0,
+        akuma_syscalls_abi::x86_64::SENDMSG => sock::sendmsg_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        akuma_syscalls_abi::x86_64::RECVMSG => sock::recvmsg_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::SENDTO => {
             sock::sendto_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), 16)
         }

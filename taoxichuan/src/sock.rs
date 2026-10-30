@@ -950,3 +950,98 @@ pub fn socket_refs(idx: usize) -> usize {
         })
         .sum()
 }
+
+/// The kernel `struct msghdr` and `struct iovec` words `sendmsg`/`recvmsg`
+/// read: `name`, `namelen`, `iov`, `iovlen`, then control (never used here).
+const MSGHDR_LEN: usize = 56;
+const MSG_MAX_IOV: u64 = 16;
+
+fn read_msghdr(msg_va: u64) -> Option<([u8; MSGHDR_LEN], u64, u64)> {
+    let mut h = [0u8; MSGHDR_LEN];
+    if !crate::user_ok(msg_va, MSGHDR_LEN as u64) || !crate::copy_from_user(&mut h, msg_va) {
+        return None;
+    }
+    let iov = u64::from_le_bytes(h[16..24].try_into().ok()?);
+    let iovlen = u64::from_le_bytes(h[24..32].try_into().ok()?);
+    Some((h, iov, iovlen))
+}
+
+fn read_iovec(iov_va: u64, i: u64) -> Option<(u64, u64)> {
+    let mut v = [0u8; 16];
+    if !crate::copy_from_user(&mut v, iov_va + i * 16) {
+        return None;
+    }
+    Some((
+        u64::from_le_bytes(v[0..8].try_into().ok()?),
+        u64::from_le_bytes(v[8..16].try_into().ok()?),
+    ))
+}
+
+/// `sendmsg(fd, &msghdr, flags)`: c-ares' and most resolvers' send. Each
+/// iovec goes out through `sendto_arm` with the header's destination; control
+/// data is ignored. A datagram socket with several iovecs sends several
+/// datagrams (not Linux's one gathered one - nothing common relies on it).
+pub fn sendmsg_arm(fd: u64, msg_va: u64, flags: u64) -> u64 {
+    let Some((h, iov, iovlen)) = read_msghdr(msg_va) else {
+        return crate::e(crate::err::EFAULT);
+    };
+    if iovlen > MSG_MAX_IOV {
+        return crate::e(crate::err::EINVAL);
+    }
+    let name = u64::from_le_bytes(h[0..8].try_into().unwrap_or([0; 8]));
+    let namelen = u64::from(u32::from_le_bytes(h[8..12].try_into().unwrap_or([0; 4])));
+    let mut total = 0u64;
+    for i in 0..iovlen {
+        let Some((base, len)) = read_iovec(iov, i) else {
+            return crate::e(crate::err::EFAULT);
+        };
+        if len == 0 {
+            continue;
+        }
+        let r = sendto_arm(fd, base, len, flags, name, namelen);
+        if (r as i64) < 0 {
+            return if total > 0 { total } else { r };
+        }
+        total += r;
+        if r < len {
+            break;
+        }
+    }
+    total
+}
+
+/// `recvmsg(fd, &msghdr, flags)`: one receive into the first non-empty iovec
+/// through `recvfrom_arm` (the source address lands in `msg_name`, its length
+/// in `msg_namelen`); `msg_controllen` and `msg_flags` are cleared. A
+/// datagram is not split across several iovecs.
+pub fn recvmsg_arm(fd: u64, msg_va: u64, flags: u64) -> u64 {
+    let Some((h, iov, iovlen)) = read_msghdr(msg_va) else {
+        return crate::e(crate::err::EFAULT);
+    };
+    if iovlen > MSG_MAX_IOV {
+        return crate::e(crate::err::EINVAL);
+    }
+    let name = u64::from_le_bytes(h[0..8].try_into().unwrap_or([0; 8]));
+    let mut target = None;
+    for i in 0..iovlen {
+        match read_iovec(iov, i) {
+            Some((base, len)) if len > 0 => {
+                target = Some((base, len));
+                break;
+            }
+            Some(_) => {}
+            None => return crate::e(crate::err::EFAULT),
+        }
+    }
+    let Some((base, len)) = target else {
+        return 0;
+    };
+    // `msg_namelen` is a u32 at offset 8 of the header: recvfrom's `src_len`.
+    let name_len_va = if name != 0 { msg_va + 8 } else { 0 };
+    let r = recvfrom_arm(fd, base, len, flags, name, name_len_va);
+    if (r as i64) >= 0 {
+        let _ = crate::copy_to_user(msg_va + 40, &0u64.to_le_bytes()); // msg_controllen
+        let _ = crate::copy_to_user(msg_va + 48, &0u32.to_le_bytes()); // msg_flags
+    }
+    r
+}
