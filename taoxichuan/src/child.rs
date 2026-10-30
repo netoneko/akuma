@@ -648,6 +648,11 @@ fn task_exit_status(status: u32) -> ! {
         s[lead].running = false;
         s[lead].waiter
     };
+    // The zombie keeps its ring row (status!) until the parent's wait4: without
+    // this hold `x86_claim_slot` hands the TERMINATED slot to the next fork and
+    // `SpawnSlot::new()` erases the status, so the waiter gets ECHILD (cargo
+    // -j4). `reap_process`'s `unregister_process` releases it.
+    akuma_exec::process::hold_exited_thread_slot(slots()[lead].pid, lead);
     crate::pipes::release_open_fds();
     if waiter != u32::MAX {
         akuma_threading::get_waker_for_thread(waiter as usize).wake();
