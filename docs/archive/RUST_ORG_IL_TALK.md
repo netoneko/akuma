@@ -141,6 +141,19 @@ usage API; full method and tables in the agent log, "GLM tokenomics from the goo
   tokens, 3x 264-363M, 4x 352-484M (about 630M if the slowdown lands in long sessions, the M4
   pattern). That is 0.9-2.4 Lite weeks, $6-17 on the API. **At 2x slower GLM would spend fewer
   tokens than Claude did**, because each of its calls carries a quarter of the context.
+- **What the supervisor's tokens bought** (each Claude call classified by its tools; keyword
+  rules, good to a few points). Supervising goose (10-24 -> 10-29 18:00Z, 816M): **38% polling**
+  (1,083 "nothing changed" reports at a 5-minute interval plus 230 sleeps/Monitors, 312M),
+  ~30% real supervision (goose logs, steering, briefs, merges, verification), **16% Claude's own
+  coding**. Executing (after the switch, 406M): **~76% coding** (reading source 40%, editing 20.5%,
+  build/test and boot waits 16%), supervision 2.4%.
+- **The "nothing changed" polls alone (257M tokens) are 45% of everything GLM spent on the
+  experiment (569M).** Each re-sent ~237k tokens of context: about 2.8M tokens an hour to report
+  that nothing happened, for ~90 hours.
+- **Per milestone, supervising GLM cost Claude more than doing the work itself:** ~50M Claude
+  tokens per supervised GLM milestone (10-26 -> 10-29, on top of GLM's own ~32M) against ~34M per
+  milestone when Claude executed (and those were the harder ones). Token counts, not money: a
+  Claude token and a GLM-Flash token are priced differently.
 
 **Linux comparison:** pending — `scripts/linux_audit_surface.sh` (firecracker / minimal /
 host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.

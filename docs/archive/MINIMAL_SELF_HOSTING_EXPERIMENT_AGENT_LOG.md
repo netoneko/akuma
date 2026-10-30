@@ -1741,3 +1741,20 @@ deduped by message id).** Supervisor tokens per UTC day, 10-24 -> 10-30: 160M, 8
 call. Extrapolated to GLM doing the same work at 2-4x the tool calls and the refined process's 56-77k tokens per call:
 176-242M (2x), 264-363M (3x), 352-484M (4x), ~630M if the slowdown comes as long sessions; 0.9-3.1 Lite weeks, $6-23 on the
 API. An extrapolation, not a measurement: no GLM run exists for this class of milestone.
+
+**What the supervisor's tokens bought (same day).** Every Claude call from 10-24 to 10-30 classified by its tool calls
+(keyword rules on tool names and shell commands; edits made through shell heredocs counted as edits; good to a few points):
+
+| | supervising goose (10-24 -> 10-29 18:00Z) | executing (10-29 18:00Z -> 10-30) |
+|---|---:|---:|
+| calls / tokens | 3,471 / 816M | 1,380 / 406M |
+| polling: text-only "nothing changed" reports + sleep/Monitor | **38%** (1,313 calls, 312M) | 9% (boot waits) |
+| supervision: goose logs, steering, RESULT/BRIEF, merges, usage checks | 22% | 2% |
+| briefs and docs written, docs and plans read | 13% | 9% |
+| verification on the box, git | 9% | 5% |
+| Claude's own coding: read source, edit, build/test | **16%** | **67%** (76% with boot waits) |
+
+The 1,083 text-only turns are the 5-minute polls, each re-sending ~237k tokens of context; they total 257M, 45% of GLM's
+whole-experiment spend. Waking on the driver's exit instead (`scripts/kvm/goose/supervise-loop.sh`, one wake per goose
+session, ~150) would have saved roughly 200M. Per milestone: ~50M Claude tokens per supervised GLM milestone (10-26 ->
+10-29) against ~34M per Claude-executed one.
