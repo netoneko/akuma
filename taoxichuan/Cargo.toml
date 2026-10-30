@@ -14,6 +14,8 @@ workspace = true
 # has none yet; the feature exists so the pinned build command
 # (`kbuild -j 4 --features no-tests`) is the same for every kernel.
 no-tests = []
+# Name every syscall that answers a negative errno on the console (`[err] nr=N -E`).
+trace-err = []
 
 [dependencies]
 # ---- The stage-1 crate lines, in boot order ---------------------------------

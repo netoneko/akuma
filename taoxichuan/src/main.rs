@@ -736,6 +736,10 @@ struct Task {
     /// no-ops), so this only has to read back what the task set - rustc and
     /// musl's thread start install one and check the answer.
     sigalt: akuma_syscalls_linux::StackT,
+    /// The working directory ("" = `/`): what a relative path and `getcwd`
+    /// resolve against. Inherited by a fork child, reset by a fresh spawn,
+    /// kept across `execve`. Resolution is `akuma_vfs::resolve_path`.
+    cwd: alloc::string::String,
     exit: Option<u64>,
     fd_names: fdtable::Names<OpenFile>,
     fd_cloexec: fdtable::FlagSet,
@@ -776,6 +780,7 @@ impl Task {
             brk_end: 0,
             mmap_cur: MMAP_BASE,
             sigalt: SIGALT_OFF,
+            cwd: alloc::string::String::new(),
             exit: None,
             fd_names: fdtable::Names::new(),
             fd_cloexec: fdtable::FlagSet::new(),
@@ -819,6 +824,19 @@ fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
         }
     }
     0
+}
+
+/// Make `full` (absolute, already resolved) the task's working directory if
+/// it names a directory.
+fn chdir_to(full: alloc::string::String) -> u64 {
+    match root_fs().metadata(&resolve_effective(&full)) {
+        Ok(st) if st.is_dir => {
+            task().cwd = if full == "/" { alloc::string::String::new() } else { full };
+            0
+        }
+        Ok(_) => e(ring3::err::ENOTDIR),
+        Err(no) => e(fs_err(no)),
+    }
 }
 
 /// `sigaltstack`'s disabled state: what a task that never set one reads back.
@@ -1288,7 +1306,8 @@ fn resolve_at(dirfd: u64, path: &str) -> Option<alloc::string::String> {
         return Some(alloc::string::String::from(path));
     }
     if dirfd == ring3::open::AT_FDCWD {
-        return Some(alloc::format!("/{path}"));
+        let cwd = task().cwd.as_str();
+        return Some(akuma_vfs::resolve_path(if cwd.is_empty() { "/" } else { cwd }, path));
     }
     let dir = fd_table().with(dirfd as u32, |d| match d {
         OpenFile::Dir { path, .. } => Some(path.clone()),
@@ -1759,7 +1778,29 @@ fn nosys_note(nr: u64) {
 }
 
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
+    #[cfg(feature = "trace-err")]
+    {
+        let nr = fr.rax;
+        let r = dispatch_inner(fr);
+        trace_err(nr, r);
+        return r;
+    }
+    #[cfg(not(feature = "trace-err"))]
     dispatch_inner(fr)
+}
+
+/// `--features trace-err`: name every syscall that answered a negative errno
+/// (`[err] nr=N -E`), capped so a polling loop cannot flood the console. The
+/// gap-finding view `[nosys]` is the always-on half of.
+#[cfg(feature = "trace-err")]
+fn trace_err(nr: u64, r: u64) {
+    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let v = r as i64;
+    if (-4095..0).contains(&v) && v != -11
+        && SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3000
+    {
+        akuma_primitives::safe_print!(64, "[err] s{} nr={} {}\n", crate::exec_twin::current_slot() as i64, nr, v);
+    }
 }
 
 fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
@@ -2325,7 +2366,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // — a link's own S_IFLNK|0777 reads as "not a program", which is
             // how every exec died as `Permission denied` before a fork was
             // ever attempted.
-            match root_fs().metadata(&resolve_effective(path)) {
+            let abs = resolve_at(ring3::open::AT_FDCWD, path).unwrap_or_default();
+            match root_fs().metadata(&resolve_effective(&abs)) {
                 Ok(md) => match fill_stat64(
                     buf,
                     md.inode,
@@ -2353,7 +2395,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
-            lstat_path(path, buf)
+            lstat_path(&resolve_at(ring3::open::AT_FDCWD, path).unwrap_or_default(), buf)
         }
         ring3::nr::FCNTL => {
             // The fd-flag commands only; the table owns the cloexec bit.
@@ -2494,7 +2536,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let Some(path) = user_str(path_va, &mut pbuf) else {
                 return e(ring3::err::EFAULT);
             };
-            open_common(path, flags)
+            open_common(&resolve_at(ring3::open::AT_FDCWD, path).unwrap_or_default(), flags)
         }
         ring3::nr::GETDENTS64 => {
             // `ls`'s walk: fill `linux_dirent64` records from the open
@@ -2905,16 +2947,43 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::FLOCK => 0,                       // one task: nothing contends
         ring3::nr::GETCWD => {
             let (buf, size) = (fr.arg1(), fr.arg2());
-            if size < 2 {
+            let cwd = task().cwd.clone();
+            let cwd = if cwd.is_empty() { alloc::string::String::from("/") } else { cwd };
+            let n = cwd.len() as u64 + 1;
+            if size < n {
                 return e(ring3::err::ERANGE);
             }
-            if !user_ok(buf, 2) {
+            if !user_ok(buf, n) {
                 return e(ring3::err::EFAULT);
             }
-            if !copy_to_user(buf, b"/\0") {
+            let mut out = alloc::vec::Vec::with_capacity(n as usize);
+            out.extend_from_slice(cwd.as_bytes());
+            out.push(0);
+            if !copy_to_user(buf, &out) {
                 return e(ring3::err::EFAULT);
             }
-            2
+            n
+        }
+        ring3::nr::CHDIR => {
+            let mut pbuf = [0u8; 128];
+            let Some(path) = user_str(fr.arg1(), &mut pbuf) else {
+                return e(ring3::err::EFAULT);
+            };
+            let Some(full) = resolve_at(ring3::open::AT_FDCWD, path) else {
+                return e(ring3::err::ENOENT);
+            };
+            chdir_to(full)
+        }
+        ring3::nr::FCHDIR => {
+            let dir = fd_table().with(fr.arg1() as u32, |d| match d {
+                OpenFile::Dir { path, .. } => Some(path.clone()),
+                _ => None,
+            });
+            match dir {
+                Some(Some(p)) => chdir_to(p),
+                Some(None) => e(ring3::err::ENOTDIR),
+                None => e(ring3::err::EBADF),
+            }
         }
         ring3::nr::DUP => {
             let fd = fr.arg1();

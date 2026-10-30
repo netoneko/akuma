@@ -471,7 +471,9 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), 
         let fds = t.fd_names.clone();
         let cloexec = t.fd_cloexec.clone();
         let nonblock = t.fd_nonblock.clone();
+        let cwd = t.cwd.clone();
         let ct = &mut crate::task_slots()[slot_idx + 1];
+        ct.cwd = cwd;
         ct.root_pa = root_pa;
         ct.regions = regions;
         ct.n_regions = n_regions;
@@ -1004,6 +1006,8 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
         slots()[slot_idx].used = false;
         return crate::e(crate::err::ENOMEM);
     };
+    // A fresh session starts at `/`; the slot's Task outlives the last shell.
+    crate::task().cwd.clear();
     // Premise 2's build-out: register the shell as an akuma-exec Process so
     // `fork_process` finds a caller. tid = this ring slot — the same number
     // `current_slot()` answers once the crossing below names the child.
@@ -1571,7 +1575,9 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
         let n_regions = t.n_regions;
         let (brk_base, brk_cur, brk_end, mmap_cur) =
             (t.brk_base, t.brk_cur, t.brk_end, t.mmap_cur);
+        let cwd = t.cwd.clone();
         let ct = &mut crate::task_slots()[2];
+        ct.cwd = cwd;
         ct.root_pa = root;
         ct.regions = regions;
         ct.n_regions = n_regions;
