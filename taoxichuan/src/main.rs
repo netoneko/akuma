@@ -5342,9 +5342,7 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
 /// (pf-5's VM exit printed nothing).
 pub(crate) fn raw_uart(bytes: &[u8]) {
     for &b in bytes {
-        unsafe {
-            core::arch::asm!("out dx, al", in("dx") 0x3f8u16, in("al") b, options(nostack, preserves_flags));
-        }
+        akuma_port::COM1.write(akuma_port::UartReg::Data, b);
     }
 }
 

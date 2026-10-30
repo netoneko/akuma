@@ -60,10 +60,11 @@ fn names_are_unique() {
 /// The architectural addresses, pinned. A typo here is a different device.
 #[test]
 fn the_architectural_addresses_are_what_the_pc_says() {
-    let pins: [(&str, u16); 10] = [
+    let pins: [(&str, u16); 11] = [
         ("pic-master-mask", 0x21),
         ("pit", 0x40),
         ("i8042-data", 0x60),
+        ("system-control-b", 0x61),
         ("i8042-status-command", 0x64),
         ("cmos", 0x70),
         ("pic-slave-mask", 0xA1),
@@ -298,4 +299,71 @@ fn nothing_ever_touches_a_port_the_registry_does_not_list() {
         "debugcon", "uart-com1", "pci-config-address", "reset-control", "pci-config-data",
     ];
     assert_within(&take_log(), &all);
+}
+
+// ---- PIT channel 2 and system control port B -----------------------------
+
+#[test]
+fn loading_channel_2_is_command_then_low_then_high() {
+    reset();
+    PIT.load_channel2_oneshot(0xE90B);
+    let log = take_log();
+    // 0b1011_0000: channel 2, lobyte/hibyte, mode 0, binary.
+    assert_eq!(log, [w(0x43, 0xB0), w(0x42, 0x0B), w(0x42, 0xE9)]);
+    assert_within(&log, &["pit"]);
+}
+
+#[test]
+fn begin_channel_2_raises_the_gate_and_mutes_the_speaker_keeping_every_other_bit() {
+    reset();
+    queue_read(0x61, 0b1100_1110); // NMI-enable bits 2-3 set, speaker (bit 1) on, gate off, plus status bits
+    let saved = SYSTEM_CONTROL_B.begin_channel2();
+    assert_eq!(saved, 0b1100_1110);
+    let log = take_log();
+    assert_eq!(log, [r(0x61, 0b1100_1110), w(0x61, 0b1100_1101)], "gate on, speaker off, bits 2-3 and 6-7 untouched");
+    assert_within(&log, &["system-control-b"]);
+}
+
+#[test]
+fn end_channel_2_restores_only_the_gate_and_speaker_bits() {
+    reset();
+    queue_read(0x61, 0b0010_1101); // gate on, speaker off, OUT high, NMI bits set
+    SYSTEM_CONTROL_B.end_channel2(0b0000_0010); // the speaker was ON before we started
+    let log = take_log();
+    assert_eq!(log, [r(0x61, 0b0010_1101), w(0x61, 0b0010_1110)], "gate lowered, speaker restored, OUT/NMI bits as read");
+}
+
+#[test]
+fn channel_2_output_is_bit_5() {
+    reset();
+    queue_read(0x61, 0x00);
+    queue_read(0x61, 0x20);
+    assert!(!SYSTEM_CONTROL_B.channel2_output_high());
+    assert!(SYSTEM_CONTROL_B.channel2_output_high());
+}
+
+#[test]
+fn port_b_presence_is_a_gate_flip_that_reads_back_and_restores() {
+    reset();
+    queue_read(0x61, 0b0000_0100); // original
+    queue_read(0x61, 0b0000_0101); // reads back the flipped gate: a device is there
+    assert!(SYSTEM_CONTROL_B.present());
+    assert_eq!(take_log(), [r(0x61, 4), w(0x61, 5), r(0x61, 5), w(0x61, 4)]);
+    reset();
+    queue_read(0x61, 0b0000_0100);
+    queue_read(0x61, 0b0000_0100); // stuck: the write did not take
+    assert!(!SYSTEM_CONTROL_B.present());
+}
+
+#[test]
+fn no_method_of_port_b_ever_writes_the_nmi_or_status_bits() {
+    reset();
+    queue_read(0x61, 0xFF);
+    let _ = SYSTEM_CONTROL_B.begin_channel2();
+    queue_read(0x61, 0x00);
+    SYSTEM_CONTROL_B.end_channel2(0xFF);
+    for op in take_log().into_iter().filter(|o| o.write) {
+        // Bits 2-3 (NMI enables) and 6-7 (status) of every write are exactly what a read returned: nothing invented.
+        assert!(op.value & 0b0000_1100 == 0b0000_1100 || op.value & 0b0000_1100 == 0, "{op:?}");
+    }
 }

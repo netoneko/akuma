@@ -317,3 +317,14 @@ Not done (and why): `TASKS`/`SLOTS`/`SLOT_STATE` hand out `&'static mut` that co
 asm re-enters, so they need a borrow-by-closure rewrite of ~100 call sites, not a type swap; the PIT calibration's
 channel-2/port-B `in`/`out` need `akuma-port` to grow that device; `GDT`/`TSS`/`TRAP_STACKS`, the naked stubs and `mov cr3`
 are the irreducible D2 class. Remaining counts by file: child.rs 36, main.rs ~25, exec_twin.rs 11, net.rs 5, sock.rs 0.
+
+### Update 2026-10-30 (evening): 67 -> 55 sites in `taoxichuan/src`
+
+* **Port I/O is `akuma-port`'s.** The PIT calibration's `in`/`out` helpers (2 sites in `net.rs`) are gone: `akuma-port` gained `PIT.load_channel2_oneshot` and a registered
+  `SYSTEM_CONTROL_B` device (port 0x61) whose only writes are bits 0-1 (the NMI-enable and status bits cannot be touched by any method; 6 new host tests, `RANGES` 11 -> 12, the
+  overlap test still passes). The panic path's raw UART write is `COM1.write`.
+* **`SLOT_STATE` is a `BorrowCell`.** Eight `unsafe { cross_mut(..) }` sites became `with_cross(slot, |c| ..)`; `save_ptr` keeps one raw pointer for the naked asm, and the M2
+  nested-spawn crossings (which hold the record across `child_enter`, so a closure cannot) keep an `unsafe fn cross_mut` that bypasses the cell.
+* **Still not reducible without a rewrite:** `slots()` hands out a long-lived `&'static mut [SpawnSlot; NSLOTS]` at ~100 call sites; `TASKS`/`task()` the same; `GDT`/`TSS`/trap stacks,
+  `mov cr3`, `fxsave`/`fxrstor`, the naked `child_enter`/`exit_cross`, `enter_user` and `cli; hlt` are the irreducible class (a `cli; hlt` wrapper is not in `akuma-cpu` because halting the
+  machine is not "safe to execute" in the repo's sense).

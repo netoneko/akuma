@@ -206,19 +206,28 @@ impl SlotCross {
     }
 }
 
-/// The per-slot table itself. SAFETY: single core, `IF` clear (syscall path
-/// or boot) — the discipline that owns every static in this module; the
-/// table is indexed by `exec_twin::current_slot()` while a child runs and by
-/// the resuming arm's own `slot_idx` after the crossing returns.
-static mut SLOT_STATE: [SlotCross; NSLOTS] = [const { SlotCross::new() }; NSLOTS];
-/// The crossing record of `slot`, for the syscall-path writers.
+/// The per-slot table itself, indexed by `exec_twin::current_slot()` while a child runs and by the resuming
+/// arm's own `slot_idx` after the crossing returns. A [`BorrowCell`]: the Rust side reaches it only through
+/// [`with_cross`], so two overlapping borrows of the table are a panic naming the bug. The one thing the cell cannot
+/// see is the naked `child_enter`/`exit_cross` asm writing `save` through [`save_ptr`]; no closure is ever open
+/// across a crossing.
+static SLOT_STATE: akuma_primitives::cell::BorrowCell<[SlotCross; NSLOTS]> =
+    akuma_primitives::cell::BorrowCell::new([const { SlotCross::new() }; NSLOTS]);
+
+/// The crossing record of `slot` as a raw `&mut`, for the M2 nested-spawn crossings that hold it across
+/// the `child_enter` asm (which a closure cannot do). Bypasses the cell, so it must not be live while a
+/// [`with_cross`] closure is.
 ///
-/// SAFETY: as `slots`.
-pub unsafe fn cross_mut(slot: usize) -> &'static mut SlotCross {
-    unsafe {
-        let st = &mut *core::ptr::addr_of_mut!(SLOT_STATE);
-        &mut st[slot]
-    }
+/// SAFETY: syscall-path discipline (single core, `IF` clear); `slot < NSLOTS`; no [`with_cross`] closure open.
+unsafe fn cross_mut(slot: usize) -> &'static mut SlotCross {
+    assert!(slot < NSLOTS, "cross_mut: slot out of range");
+    // SAFETY: the caller's contract; the cell's `value` sits at offset 0 and `slot` is in range.
+    unsafe { &mut (*SLOT_STATE.as_ptr())[slot] }
+}
+
+/// Run `f` on the crossing record of `slot` (the syscall-path readers and writers).
+pub fn with_cross<R>(slot: usize, f: impl FnOnce(&mut SlotCross) -> R) -> R {
+    SLOT_STATE.with_mut(|st| f(&mut st[slot]))
 }
 
 /// `child_enter`'s asm destination for `slot` — a raw pointer, because the
@@ -227,7 +236,9 @@ pub unsafe fn cross_mut(slot: usize) -> &'static mut SlotCross {
 ///
 /// SAFETY: as `slots`.
 unsafe fn save_ptr(slot: usize) -> *mut CrossSave {
-    unsafe { core::ptr::addr_of_mut!((*core::ptr::addr_of_mut!(SLOT_STATE))[slot].save) }
+    assert!(slot < NSLOTS, "save_ptr: slot out of range");
+    // SAFETY: `as_ptr` points at the array; `slot` is in range (asserted); this forms a pointer, no reference.
+    unsafe { core::ptr::addr_of_mut!((*SLOT_STATE.as_ptr())[slot].save) }
 }
 
 /// SAFETY: single core, `IF` clear (syscall path or boot) — the discipline
@@ -277,8 +288,7 @@ pub fn child_write(buf_va: u64, len: u64) -> bool {
         // buffer (what the old default static would have done).
         return false;
     }
-    // SAFETY: syscall-path discipline.
-    let out_slot = unsafe { cross_mut(cur).out_slot };
+    let out_slot = with_cross(cur, |c| c.out_slot);
     let mut chunk = [0u8; 512];
     let mut done = 0u64;
     while done < len {
@@ -549,15 +559,12 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
     // SAME session buffer its parent had — the bridge drains the shell's.
     let shell = crate::exec_twin::current_slot();
     if shell != crate::exec_twin::NO_SLOT && shell < NSLOTS && tid < NSLOTS {
-        // SAFETY: syscall-path discipline (the fork syscall, IF clear).
-        let (out, depth) = {
-            let sc = unsafe { cross_mut(shell) };
-            (sc.out_slot, sc.depth)
-        };
-        // SAFETY: as above; `tid` was just bound inside the spawn ring.
-        let c = unsafe { cross_mut(tid) };
-        c.out_slot = out;
-        c.depth = depth + 1;
+        let (out, depth) = with_cross(shell, |sc| (sc.out_slot, sc.depth));
+        // `tid` was just bound inside the spawn ring.
+        with_cross(tid, |c| {
+            c.out_slot = out;
+            c.depth = depth + 1;
+        });
     }
     Ok(())
 }
@@ -569,8 +576,7 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
 /// simply left alone by the caller.
 pub fn sched_kstack_top(tid: usize) -> u64 {
     if tid < NSLOTS {
-        // SAFETY: syscall-path discipline.
-        unsafe { core::ptr::read_volatile(&raw const SLOT_STATE[tid].kstack_top) }
+        SLOT_STATE.with(|st| st[tid].kstack_top)
     } else {
         ring3::syscall_stack_top()
     }
@@ -1068,8 +1074,7 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
     let cur = crate::exec_twin::current_slot();
     let shell_depth = match cur {
         crate::exec_twin::NO_SLOT => 0,
-        // SAFETY: syscall-path discipline.
-        _ => unsafe { cross_mut(cur).depth },
+        _ => with_cross(cur, |c| c.depth),
     };
     // Session pg: depth 2 (a REAL fork child forking again — grandfork's
     // rungs 2-5, the `( ls; ls )` class this slice exists to fix) forks for
@@ -1715,8 +1720,7 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
     let cur = crate::exec_twin::current_slot();
     let shell_depth = match cur {
         crate::exec_twin::NO_SLOT => 0,
-        // SAFETY: syscall-path discipline.
-        _ => unsafe { cross_mut(cur).depth },
+        _ => with_cross(cur, |c| c.depth),
     };
     if shell_depth != 1 {
         return crate::e(crate::err::EPERM);
@@ -2293,18 +2297,20 @@ pub fn prepare_task_slot(slot: usize) -> Option<usize> {
     if slot >= NSLOTS {
         return None;
     }
-    // SAFETY: syscall-path discipline (the claim path runs there in slice 3).
-    let c = unsafe { cross_mut(slot) };
-    if c.stacks.is_none() {
-        c.stacks = Some(leak_stacks());
-    }
-    let s = c.stacks.as_ref()?;
-    let ktop = (s.kernel.as_ptr() as usize + KSTACK_WORDS * 8) as u64;
-    let ttop = ((s.trap.as_ptr() as usize + TSTACK_WORDS * 8) & !0xf) as u64;
-    c.kstack_top = ktop;
-    c.trap_stack_top = ttop;
-    c.save = CrossSave::new();
-    c.uctx = None;
+    // The claim path (syscall context in slice 3).
+    let ktop = with_cross(slot, |c| {
+        if c.stacks.is_none() {
+            c.stacks = Some(leak_stacks());
+        }
+        let s = c.stacks.as_ref()?;
+        let ktop = (s.kernel.as_ptr() as usize + KSTACK_WORDS * 8) as u64;
+        let ttop = ((s.trap.as_ptr() as usize + TSTACK_WORDS * 8) & !0xf) as u64;
+        c.kstack_top = ktop;
+        c.trap_stack_top = ttop;
+        c.save = CrossSave::new();
+        c.uctx = None;
+        Some(ktop)
+    })?;
     crate::exec_twin::fx_reset(slot);
     Some(ktop as usize)
 }
@@ -2317,8 +2323,8 @@ pub fn write_user_context(slot: usize, ctx: &akuma_exec::process::UserContext) {
     if slot >= NSLOTS {
         return;
     }
-    // SAFETY: syscall-path discipline; `slot` is not running.
-    unsafe { cross_mut(slot).uctx = Some(*ctx) };
+    // `slot` is not running.
+    with_cross(slot, |c| c.uctx = Some(*ctx));
 }
 
 /// `X86ArchHooks::read_user_context`: the exact mirror — `None` means the
@@ -2331,6 +2337,5 @@ pub fn read_user_context(
     if slot >= NSLOTS {
         return None;
     }
-    // SAFETY: syscall-path discipline.
-    unsafe { cross_mut(slot).uctx }
+    with_cross(slot, |c| c.uctx)
 }

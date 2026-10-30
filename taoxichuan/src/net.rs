@@ -38,27 +38,6 @@ use akuma_net::NetRuntime;
 // build fails at compile time instead of at instruction decode.
 // ---------------------------------------------------------------------------
 
-/// Write one byte to an x86 I/O port.
-#[cfg(target_arch = "x86_64")]
-fn outb(port: u16, val: u8) {
-    // SAFETY: a device port this module owns the use of (the PIT block
-    // below); kernel-only, no side effects outside the timer.
-    unsafe {
-        core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
-    }
-}
-
-/// Read one byte from an x86 I/O port.
-#[cfg(target_arch = "x86_64")]
-fn inb(port: u16) -> u8 {
-    let val: u8;
-    // SAFETY: as `outb` — the PIT block only.
-    unsafe {
-        core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags));
-    }
-    val
-}
-
 /// One spin-loop hint.
 #[inline]
 fn pause() {
@@ -94,7 +73,7 @@ fn rdtsc() -> u64 {
 /// TSC increments per microsecond; 0 until [`calibrate`] has run.
 static TSC_PER_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Whether the PIT was there to calibrate against (`pit_present` measured
+/// Whether the PIT was there to calibrate against (`SYSTEM_CONTROL_B.present()` measured
 /// port 0x61 answering, and the window closed before the TSC drift could).
 static TSC_CALIBRATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -105,11 +84,6 @@ static TSC_CALIBRATED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// the rate is a guess.
 const TSC_PER_US_GUESS: u64 = 2_500;
 
-/// The PIT ports: channel 2 count/gate, mode register, and port B (gate
-/// enable in bit 0, the channel's OUT pin readable in bit 5).
-const PIT_CH2: u16 = 0x42;
-const PIT_MODE: u16 = 0x43;
-const PIT_PORT_B: u16 = 0x61;
 /// The 8254's crystal frequency, Hz.
 const PIT_HZ: u64 = 1_193_182;
 /// Calibration window: ~50 ms of PIT counts (short enough to not slow the
@@ -147,21 +121,16 @@ fn use_lapic_rate(why: &str) {
 }
 
 fn calibrate() {
-    if !pit_present() {
+    if !akuma_port::SYSTEM_CONTROL_B.present() {
         use_lapic_rate("no PIT behind port 0x61");
         return;
     }
-    // Program channel 2: mode 0, lobyte/hibyte, the count.
-    outb(PIT_MODE, 0b1011_0000);
-    let count = PIT_COUNT as u16;
-    outb(PIT_CH2, count as u8);
-    outb(PIT_CH2, (count >> 8) as u8);
-    // Gate on (bit 0), speaker off (bit 1) — the channel starts counting.
-    let pb = inb(PIT_PORT_B);
-    outb(PIT_PORT_B, (pb & 0xFD) | 0x01);
+    // Channel 2, mode 0, the count; then raise its gate (speaker off) so it starts down, and poll OUT.
+    akuma_port::PIT.load_channel2_oneshot(PIT_COUNT as u16);
+    let saved = akuma_port::SYSTEM_CONTROL_B.begin_channel2();
     let t0 = rdtsc();
     let mut guard = 0u32;
-    while inb(PIT_PORT_B) & 0x20 == 0 {
+    while !akuma_port::SYSTEM_CONTROL_B.channel2_output_high() {
         pause();
         guard += 1;
         if guard > OUT_WAIT_BUDGET {
@@ -169,8 +138,7 @@ fn calibrate() {
         }
     }
     let t1 = rdtsc();
-    // Gate off.
-    outb(PIT_PORT_B, pb & 0xFC);
+    akuma_port::SYSTEM_CONTROL_B.end_channel2(saved);
     if guard > OUT_WAIT_BUDGET || t1 <= t0 {
         use_lapic_rate("PIT output never rose");
         return;
@@ -182,24 +150,6 @@ fn calibrate() {
     akuma_primitives::safe_print!(96, "  net: TSC calibrated vs PIT: {} cyc/us\n", per_us);
 }
 
-/// Does port B answer at all? A write of the gate bit read back is the
-/// cheapest honest probe; a bus with no device behind it reads back what the
-/// last write to any port left, which this kernel never does — so a stuck
-/// value reads as "no PIT", the safe answer (a guessed clock, one line).
-#[cfg(target_arch = "x86_64")]
-fn pit_present() -> bool {
-    let orig = inb(PIT_PORT_B);
-    let flipped = orig ^ 0x01;
-    outb(PIT_PORT_B, flipped);
-    let readback = inb(PIT_PORT_B);
-    outb(PIT_PORT_B, orig);
-    readback & 0x01 == flipped & 0x01
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn pit_present() -> bool {
-    false
-}
 
 /// Microseconds since boot (the calibrated TSC), the stack's one clock.
 pub fn uptime_us() -> u64 {
