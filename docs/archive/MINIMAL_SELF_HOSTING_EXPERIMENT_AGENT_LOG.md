@@ -1873,3 +1873,19 @@ one language runtime needs - Rust std with tokio, or the Go runtime - so a compo
 preconfigured minimal kernel for that language. The runtime's syscall census (strace on Linux, as for rustc in stage 9)
 becomes a feature list; Linux-differential suites (`epoll_suite.py --linux` and its siblings) become the conformance gate;
 `scripts/cloc_akuma.py --audit` reports what each runtime's kernel costs to review.
+
+### 2026-10-30 (late): goose + GLM on Taoxichuan - blocked: no epoll
+
+**Tried:** the current kernel (built 22:04 on the ryzen for the main rig, sha256 `15c78af5...`, copied frozen) in a second,
+independent guest (`scripts/kvm/taoxichuan_pop_side.sh`, port 2234, so the agent on the main guest was not disturbed), on a
+new minimal image (`scripts/kvm/taoxichuan_goose_image.sh`): sshd, busybox and 304 applet links, goose (static-pie), the CA
+bundle, and a GLM goose config mirroring `scripts/kvm/goose/goose-glm-mac.sh`.
+
+**Result:** the guest boots and answers ssh - `uname -a` gives `Linux taoxichuan 6.6.0-akuma #1 SMP akuma-taoxichuan x86_64
+Linux` - but `goose --version` panics in 0.16 s: `Failed to build Tokio runtime: Os { code: 38 ... "Function not
+implemented" }`. The console names the call: `[nosys] nr=291` (`epoll_create1`, where mio starts tokio's reactor), after a
+harmless `[nosys] nr=157` (`prctl(PR_SET_NAME)`, thread naming). **Taoxichuan serves no epoll call at all** (213, 232, 233,
+281, 291, 441 are all absent from its 120); `eventfd2` (290), tokio's waker, is there. The ladder got to cargo, git and curl
+without it because none of those is an async-Rust program - **we forgot the epoll** (user, 2026-10-30). Full Akuma amd64 runs
+goose because it has the whole family, including the `EPOLLET` re-arm fix (`AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md`); the
+decisions are in `akuma-syscalls-poll` and the wait loop in `akuma-net-yarn`, both ready to pull. Not fixed here.
