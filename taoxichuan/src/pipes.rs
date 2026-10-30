@@ -283,8 +283,14 @@ pub fn release(id: u32, is_write: bool) {
 pub fn release_open_fds() {
     let mut t = crate::fd_table();
     while let Some((_fd, d)) = t.pop_lowest() {
-        if let OpenFile::Pipe(id, w) = d {
-            release(id, w);
+        match d {
+            OpenFile::Pipe(id, w) => release(id, w),
+            // The exit drops the task's socket references; the last one out
+            // releases the connection (this used to leak every socket).
+            OpenFile::Socket(idx) if crate::sock::socket_refs(idx) == 0 => {
+                akuma_net::socket::remove_socket(idx);
+            }
+            _ => {}
         }
     }
 }

@@ -1292,6 +1292,7 @@ dependencies = [
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
  "akuma-syscalls-poll",
+ "akuma-syscalls-sync",
  "akuma-threading",
  "akuma-trap-amd64",
  "akuma-tty",

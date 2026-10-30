@@ -64,6 +64,10 @@ pub struct SpawnSlot {
     /// Only `bind_child_task` sets this, so the reset in `new()` clears any
     /// previous occupant's bit.
     pub real: bool,
+    /// A `CLONE_THREAD` sibling: shares its creator's task record
+    /// (`TASK_OF`), owns no fds or address space of its own, and exits without
+    /// a status for a parent to reap.
+    pub thread: bool,
 }
 
 impl SpawnSlot {
@@ -77,6 +81,7 @@ impl SpawnSlot {
             reaped: false,
             waiter: u32::MAX,
             real: false,
+            thread: false,
         }
     }
 }
@@ -105,7 +110,10 @@ static mut SLOTS: [SpawnSlot; NSLOTS] = [
     SpawnSlot::new(),
 ];
 static mut NEXT_SLOT: usize = 0;
-static mut NEXT_PID: u32 = 2; // 1 is sshd (the boot's init task)
+// Pids come from `akuma_exec::process::allocate_pid` (floor 2: 1 is sshd,
+// the boot's init task) - ONE allocator, because `clone_thread` draws its
+// thread Processes' pids from the crate's counter and a second counter here
+// issued the same pid twice (a thread and a fork child sharing a table row).
 
 /// The parent-phase registers one crossing saves: what `child_enter`'s naked
 /// prologue stores and its exit-side consumers restore. `repr(C)` with the
@@ -432,6 +440,23 @@ fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs
 /// `fork_process` over the registered shell Process. `clone`/`vfork` keep
 /// the blocking arm on both settings — out of scope this slice.
 pub const REAL_FORK: bool = true;
+/// The task record each ring slot runs against: `slot + 1` for a process, the
+/// creator's record for a `CLONE_THREAD` sibling - which is how threads share
+/// regions, brk/mmap cursors, the fd table and the cwd with no second copy to
+/// keep coherent. SAFETY: syscall-path discipline.
+static mut TASK_OF: [usize; NSLOTS] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+fn task_of(slot: usize) -> usize {
+    // SAFETY: syscall-path discipline.
+    unsafe { core::ptr::read_volatile(&raw const TASK_OF[slot]) }
+}
+
+/// Is the running task a `CLONE_THREAD` sibling?
+pub(crate) fn is_thread_task() -> bool {
+    let cur = crate::exec_twin::current_slot();
+    cur != crate::exec_twin::NO_SLOT && cur < NSLOTS && slots()[cur].used && slots()[cur].thread
+}
+
 /// `fork_process`'s `bind_child_task` records: (tid, pid, root) — the twin's
 /// spawn-row. Indexed by tid; `root == 0` = free. SAFETY: syscall-path
 /// discipline (single core, IF clear), the rule that owns every static here.
@@ -440,7 +465,7 @@ static mut CHILD_BIND: [(usize, u32, u64); NSLOTS] = [(0, 0, 0); NSLOTS];
 /// `ExecRuntime::bind_child_task`'s twin: stamp the child's spawn-row. The
 /// crate publishes the child's thread right after this returns, so a full
 /// ring must come back as an error the fork reports, not a panic.
-pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), &'static str> {
+pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> Result<(), &'static str> {
     // SAFETY: syscall-path discipline.
     let bind = unsafe { &mut *core::ptr::addr_of_mut!(CHILD_BIND) };
     if tid >= bind.len() {
@@ -461,9 +486,19 @@ pub(crate) fn bind_child_task(tid: usize, pid: u32, root_pa: u64) -> Result<(), 
         s[slot_idx].running = true;
         s[slot_idx].pid = pid;
         s[slot_idx].real = true;
+        s[slot_idx].thread = is_thread;
     }
     let _ = prepare_task_slot(slot_idx);
-    {
+    if is_thread {
+        // A thread runs against its creator's record: nothing to copy, and
+        // nothing to clone-ref (the fd table is the creator's own).
+        // SAFETY: syscall-path discipline.
+        unsafe { TASK_OF[slot_idx] = crate::task_slot_index() };
+    } else {
+        // SAFETY: syscall-path discipline.
+        unsafe { TASK_OF[slot_idx] = slot_idx + 1 };
+    }
+    if !is_thread {
         let t = crate::task();
         let regions = t.regions;
         let n_regions = t.n_regions;
@@ -539,6 +574,8 @@ pub(crate) fn sched_kstack_top(tid: usize) -> u64 {
 pub(crate) fn sched_task_slot_of(tid: usize) -> usize {
     if tid == crate::exec_twin::shell_tid() {
         1
+    } else if tid < NSLOTS {
+        task_of(tid)
     } else {
         tid + 1
     }
@@ -548,7 +585,7 @@ pub(crate) fn sched_root_of(tid: usize) -> u64 {
     if tid == crate::exec_twin::shell_tid() {
         crate::task_slots()[1].root_pa // the shell
     } else if tid < NSLOTS {
-        crate::task_slots()[tid + 1].root_pa
+        crate::task_slots()[task_of(tid)].root_pa
     } else {
         0
     }
@@ -580,19 +617,110 @@ pub(crate) fn is_real_task() -> bool {
 /// returns (the dispatcher frame on this task's own band is abandoned, the
 /// same model `task_done` uses for the boot's tasks).
 pub fn task_exit_real(code: u64) -> ! {
+    task_exit_status(((code & 0xFF) as u32) << 8)
+}
+
+/// A real task killed by a fault: the group dies with wait status SIGSEGV
+/// (11), the parent's `wait4` sees `WIFSIGNALED` as on Linux, and the machine
+/// keeps running. Only for a real fork child or thread; the shell and the
+/// boot task keep the halting report.
+pub fn task_die_segv() -> ! {
+    task_exit_status(11)
+}
+
+fn task_exit_status(status: u32) -> ! {
     let cur = crate::exec_twin::current_slot();
+    // The group's leader slot: `cur` itself unless a thread is the one
+    // calling `exit_group`, in which case the leader's status and waiter are
+    // the process's. Every other thread of the group dies here (Linux's
+    // `exit_group`): purged from the futex table and terminated.
+    let lead = group_leader(cur);
+    kill_siblings(cur, lead);
     let waiter = {
         // SAFETY: syscall-path discipline.
         let s = slots();
-        s[cur].status = ((code & 0xFF) as u32) << 8;
-        s[cur].running = false;
-        s[cur].waiter
+        s[lead].status = status;
+        s[lead].running = false;
+        s[lead].waiter
     };
     crate::pipes::release_open_fds();
     if waiter != u32::MAX {
         akuma_threading::get_waker_for_thread(waiter as usize).wake();
     }
+    if lead != cur {
+        crate::futex::purge_task(lead);
+        akuma_threading::mark_thread_terminated(lead);
+    }
     akuma_threading::x86_finish_current()
+}
+
+/// The slot that owns the process `cur` belongs to: the one non-thread slot
+/// running against the same task record. `cur` when it is not a thread.
+fn group_leader(cur: usize) -> usize {
+    if cur >= NSLOTS || !slots()[cur].thread {
+        return cur;
+    }
+    let rec = task_of(cur);
+    (0..NSLOTS)
+        .find(|&s| s != cur && slots()[s].used && !slots()[s].thread && task_of(s) == rec)
+        .unwrap_or(cur)
+}
+
+/// `exit_group`: end every thread of `cur`'s group except `cur` and `lead`
+/// (the caller finishes those itself).
+fn kill_siblings(cur: usize, lead: usize) {
+    let rec = task_of(cur);
+    for s in 0..NSLOTS {
+        if s != cur && s != lead && slots()[s].used && slots()[s].thread && task_of(s) == rec {
+            crate::futex::purge_task(s);
+            slots()[s].running = false;
+            slots()[s].used = false;
+            slots()[s].thread = false;
+            akuma_threading::mark_thread_terminated(s);
+        }
+    }
+}
+
+/// A thread's `exit` (60): only this thread ends. `CLONE_CHILD_CLEARTID`
+/// (what `pthread_join` waits on): the tid word is zeroed and its futex
+/// woken before the slot is terminated.
+pub fn task_exit_thread() -> ! {
+    let cur = crate::exec_twin::current_slot();
+    if let Some(p) = akuma_exec::process::current_process_shared() {
+        let addr = p.clear_child_tid.swap(0, core::sync::atomic::Ordering::AcqRel);
+        if addr != 0 {
+            let _ = crate::copy_to_user(addr, &0u32.to_ne_bytes());
+            let _ = crate::futex::wake_key(p.tgid, addr as usize, 1);
+        }
+    }
+    crate::futex::purge_task(cur);
+    // The slot leaves the table: a thread has no status for a parent to reap
+    // and must never look like a child to a `wait4` scan.
+    let s = slots();
+    s[cur].running = false;
+    s[cur].used = false;
+    s[cur].thread = false;
+    s[cur].real = false;
+    akuma_threading::x86_finish_current()
+}
+
+/// `clone(CLONE_THREAD|CLONE_VM|...)`: another thread of the caller's group
+/// through `akuma_exec::process::clone_thread`, which shares the address
+/// space and publishes a runnable slot; the bind hook gives it the creator's
+/// task record. Returns the thread's tid (its threading slot).
+fn clone_thread_arm(fr: &ring3::SyscallFrame) -> u64 {
+    let cur = crate::exec_twin::current_slot();
+    if cur == crate::exec_twin::NO_SLOT {
+        return crate::e(ring3::err::EPERM); // the boot task has no Process to clone
+    }
+    let (flags, stack, ptid, ctid, tls) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5());
+    match akuma_exec::process::clone_thread(stack, tls, ptid, ctid, flags) {
+        Ok(tid) => tid as u64,
+        Err(msg) => {
+            akuma_primitives::safe_print!(160, "[clone] thread refused: {}\n", msg);
+            crate::e(ring3::err::EAGAIN)
+        }
+    }
 }
 
 /// A real fork child's `execve`: replace the image in the child's OWN task
@@ -801,7 +929,7 @@ fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u
             akuma_exec::process::ProcessState::Ready,
         ),
         address_space: akuma_exec::process::ProcAddressSpace::new(space),
-        parent_pid: 1, // sshd, the boot's init task (NEXT_PID starts at 2)
+        parent_pid: 1, // sshd, the boot's init task (the pid floor is 2)
         brk: core::sync::atomic::AtomicUsize::new(0),
         initial_brk: core::sync::atomic::AtomicUsize::new(0),
         entry_point: core::sync::atomic::AtomicUsize::new(entry as usize),
@@ -888,12 +1016,7 @@ fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
     if shell_depth != 1 && shell_depth != 2 && shell_depth != 3 {
         return crate::e(crate::err::EPERM);
     }
-    let child_pid = unsafe {
-        let p = &mut *core::ptr::addr_of_mut!(NEXT_PID);
-        let v = *p;
-        *p = p.wrapping_add(1);
-        v
-    };
+    let child_pid = akuma_exec::process::allocate_pid();
     // stack_ptr = 0: the child resumes at the parent's saved user RSP — the
     // syscall stub stashed it (`user_rsp_stash`) and step 6's captured
     // context carries it into the child's UserContext.
@@ -954,17 +1077,22 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
             tries += 1;
             if tries >= NSLOTS {
                 akuma_primitives::safe_print!(160, "  [spawn] every ring slot already reserved\n");
+                for i in 0..NSLOTS {
+                    akuma_primitives::safe_print!(
+                        96,
+                        "    ring slot {}: pool state {} used={} thread={}\n",
+                        i,
+                        akuma_threading::get_thread_state(i),
+                        slots()[i].used,
+                        slots()[i].thread
+                    );
+                }
                 return crate::e(crate::err::EAGAIN);
             }
         }
         s[idx] = SpawnSlot::new();
         s[idx].used = true;
-        let pid = unsafe {
-            let p = &mut *core::ptr::addr_of_mut!(NEXT_PID);
-            let v = *p;
-            *p = p.wrapping_add(1);
-            v
-        };
+        let pid = akuma_exec::process::allocate_pid();
         s[idx].pid = pid;
         s[idx].running = true;
         unsafe {
@@ -1464,6 +1592,10 @@ unsafe extern "C" fn exit_cross(save: *mut CrossSave, root: u64, status: u32) ->
 /// exited) are accepted; anything else (CLONE_THREAD and friends) is M4's
 /// scheduler, not this scaffold.
 pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
+    const CLONE_THREAD: u64 = 0x0001_0000;
+    if fr.rax == ring3::nr::CLONE && fr.arg1() & CLONE_THREAD != 0 {
+        return clone_thread_arm(fr);
+    }
     if REAL_FORK && fr.rax != ring3::nr::CLONE {
         // The new path: plain fork (57/58) through `fork_process` over the
         // registered shell Process. `clone`/`vfork` keep the M2 arm — out of
@@ -1529,12 +1661,7 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
         };
         s[idx] = SpawnSlot::new();
         s[idx].used = true;
-        let pid = unsafe {
-            let p = &mut *core::ptr::addr_of_mut!(NEXT_PID);
-            let v = *p;
-            *p = p.wrapping_add(1);
-            v
-        };
+        let pid = akuma_exec::process::allocate_pid();
         s[idx].pid = pid;
         s[idx].running = true;
         idx

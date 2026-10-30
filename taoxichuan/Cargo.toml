@@ -87,6 +87,8 @@ akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
 akuma-syscalls-poll = { path = "../crates/akuma-syscalls-poll" }
 # pn S2: membarrier's command decode (the barrier itself is an effect here).
 akuma-syscalls-mem = { path = "../crates/akuma-syscalls-mem" }
+# pn S4: futex decisions (op decode, key namespace, waiter table, deadline).
+akuma-syscalls-sync = { path = "../crates/akuma-syscalls-sync" }
 # Stage 8 session Q: eventfd2 for libcurl's wakeup fd. The state machine is
 # the extracted pure crate (also under akuma-syscalls-glue now); this kernel
 # adds only the fd-table entry and the read/write/poll/close routing.

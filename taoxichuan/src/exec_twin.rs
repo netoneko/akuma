@@ -297,6 +297,7 @@ pub fn init() {
         prepare_task_slot: crate::child::prepare_task_slot,
     });
     seed_idle();
+    akuma_exec::process::reserve_pid_floor(2);
 }
 
 /// The spawn ring's width, for `can_run`'s bounds check.
@@ -473,7 +474,7 @@ fn exec_runtime() -> ExecRuntime {
         // child's fresh `UserAddressSpace` root.
         fork_share_memory: twin_fork_share_memory,
         // The child's CR3 + spawn-row binding — the twin's slot binding.
-        bind_child_task: |tid, child, _kind| twin_bind_child_task(tid, child),
+        bind_child_task: |tid, child, kind| twin_bind_child_task(tid, child, kind),
     }
 }
 
@@ -498,9 +499,15 @@ fn twin_fork_share_memory(
 fn twin_bind_child_task(
     tid: usize,
     child: &akuma_exec::process::Process,
+    kind: akuma_exec::process::ChildKind,
 ) -> Result<(), &'static str> {
     let root = child.address_space.l0_phys() as u64;
-    crate::child::bind_child_task(tid, child.pid, root)
+    crate::child::bind_child_task(
+        tid,
+        child.pid,
+        root,
+        kind == akuma_exec::process::ChildKind::Thread,
+    )
 }
 
 /// `ExecRuntime::enter_user` — the child's first and only crossing into ring

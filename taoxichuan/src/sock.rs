@@ -136,7 +136,7 @@ fn fd_events(fd: i32, events: i16) -> i16 {
     let kind = crate::fd_table().with(fd as u32, |d| match d {
         crate::OpenFile::Socket(_) => 1,
         crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
-        crate::OpenFile::Null | crate::OpenFile::ChildOut(_) => 3,
+        crate::OpenFile::Null | crate::OpenFile::Random | crate::OpenFile::ChildOut(_) => 3,
         // A pipe end (M3): a read end is POLLIN while data or a finished
         // writer's EOF stands; a write end is POLLOUT while there is room.
         // The crate's own predicates — no second opinion, and no poller
@@ -912,6 +912,26 @@ pub fn write_arm(fd: u64, buf: u64, len: u64) -> u64 {
 pub fn close_arm(fd: u64) {
     let idx = fd_socket(fd);
     if let Some(idx) = idx {
-        akuma_net::socket::remove_socket(idx);
+        // `dup`, `fork` and `CLONE_FILES` all copy the fd without the socket
+        // behind it knowing; closing ONE of several fds must not destroy the
+        // connection (git dups its socket, closes the copy, and its sideband
+        // thread then read the closed handle: EBADF). The fd being closed is
+        // still in the table here, so "one reference" is "the last".
+        if socket_refs(idx) <= 1 {
+            akuma_net::socket::remove_socket(idx);
+        }
     }
+}
+
+/// How many open fds, across every task record, name socket `idx`.
+pub(crate) fn socket_refs(idx: usize) -> usize {
+    crate::task_slots()
+        .iter()
+        .map(|t| {
+            t.fd_names
+                .values()
+                .filter(|d| matches!(d, crate::OpenFile::Socket(i) if *i == idx))
+                .count()
+        })
+        .sum()
 }

@@ -89,6 +89,7 @@ extern crate alloc;
 
 mod child;
 mod exec_twin;
+mod futex;
 mod net;
 mod pipes;
 mod sock;
@@ -275,6 +276,13 @@ fn fault_trap(t: &mut Trap<'_>) {
             akuma_cpu::ctlreg::cr2(),
             code
         );
+        // A real fork child or thread dies alone (SIGSEGV status to its
+        // waiter); the machine runs on. The shell and the boot task are the
+        // M2 shapes with no slot to reap through: those halt as before.
+        if child::is_real_task() {
+            akuma_primitives::safe_print!(64, "[Fault] slot {} killed (SIGSEGV)\n", exec_twin::current_slot());
+            child::task_die_segv();
+        }
         halt();
     }
     akuma_primitives::safe_print!(
@@ -696,6 +704,10 @@ pub(crate) enum OpenFile {
     /// Stage 7 (H2): `/dev/null` used to be an EACCES ext2 lookup failure,
     /// which cost every `dd of=/dev/null` and plenty of applet noise.
     Null,
+    /// `/dev/urandom` and `/dev/random`: reads are `net::rng_fill`, writes
+    /// are discarded. git's `mkstemp` (`csprng_bytes`) opens it when it can
+    /// not use `getrandom`, and `git add`/`clone` die without a temp file.
+    Random,
     /// An eventfd: the index into `EVENTFDS` below. Stage 8 session Q —
     /// libcurl's multi-stack creates one wakeup fd per transfer; without
     /// the number served, `curl` dies `curl: (27) Out of memory` before it
@@ -839,6 +851,17 @@ fn chdir_to(full: alloc::string::String) -> u64 {
     }
 }
 
+/// The calling thread's tid: its threading slot for a `CLONE_THREAD` sibling
+/// (the number `clone` handed back and `CLONE_CHILD_SETTID` wrote), the pid
+/// for everyone else.
+fn my_tid() -> u64 {
+    if child::is_thread_task() {
+        exec_twin::current_slot() as u64
+    } else {
+        u64::from(child::current_pid())
+    }
+}
+
 /// `sigaltstack`'s disabled state: what a task that never set one reads back.
 const SIGALT_OFF: akuma_syscalls_linux::StackT =
     akuma_syscalls_linux::StackT { sp: 0, flags: SS_DISABLE, _pad: 0, size: 0 };
@@ -895,6 +918,12 @@ fn membarrier_arm(cmd: u64) -> u64 {
 /// Switch which task slot the syscall path acts on (the SPAWN arm, the
 /// child exit, and slice 3's `twin_enter_user` — which points the record at
 /// the incoming real task).
+/// Which task record the syscall path acts on now.
+pub(crate) fn task_slot_index() -> usize {
+    // SAFETY: as `task`.
+    unsafe { core::ptr::read_volatile(&raw const TASK_SLOT) }
+}
+
 pub(crate) fn set_task_slot(i: usize) {
     // SAFETY: single core, `IF` clear — the same discipline as `task()`.
     unsafe {
@@ -1121,6 +1150,10 @@ fn open_common(path: &str, flags: u64) -> u64 {
         let fd = fd_table().alloc_fd_from(3, OpenFile::Null);
         return u64::from(fd);
     }
+    if path == "/dev/urandom" || path == "/dev/random" {
+        let fd = fd_table().alloc_fd_from(3, OpenFile::Random);
+        return u64::from(fd);
+    }
     // Stage 6: write access is served — apk unpacks with O_WRONLY|O_CREAT|
     // O_TRUNC. The description is an ext2 lookup (or create) — no VFS mount
     // table, one root.
@@ -1137,7 +1170,17 @@ fn open_common(path: &str, flags: u64) -> u64 {
             // missing path allocates the inode and the directory entry.
             match fs.write_file(&path, &[]) {
                 Ok(()) => fs.metadata(&path).ok(),
-                Err(_) => return e(ring3::err::EACCES),
+                Err(_) => {
+                    // A missing parent is ENOENT, not EACCES: git's object
+                    // writer creates `objects/xx/tmp_obj_*`, and ONLY an
+                    // ENOENT sends it to `mkdir objects/xx` and a retry.
+                    let parent = path.rsplit_once('/').map_or("/", |(d, _)| if d.is_empty() { "/" } else { d });
+                    return match fs.metadata(parent) {
+                        Err(_) => e(ring3::err::ENOENT),
+                        Ok(m) if !m.is_dir => e(ring3::err::ENOTDIR),
+                        Ok(_) => e(ring3::err::EACCES),
+                    };
+                }
             }
         }
         Err(_) => return e(ring3::err::ENOENT),
@@ -1468,6 +1511,12 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
     let info = fd_table().with(fd as u32, |d| match d {
         OpenFile::File { inode, size, .. } => Some((u64::from(*inode), *size, 0u8)),
         OpenFile::Dir { .. } => Some((0, 0, 1)),
+        // The type bits are what callers decide on: git's `index-pack` asks
+        // `fstat_size(0)` and only trusts the byte count for a REGULAR file -
+        // a pipe that stats as one made every piped pack "junk at the end".
+        OpenFile::Pipe(..) | OpenFile::ChildOut(_) => Some((0, 0, 3)),
+        OpenFile::Socket(_) => Some((0, 0, 4)),
+        OpenFile::Null | OpenFile::Random => Some((0, 0, 5)),
         _ => Some((0, 0, 2)),
     });
     let Some(Some((inode, size, kind))) = info else {
@@ -1479,6 +1528,9 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
             Err(_) => (0o100644, 1),
         },
         1 => (0o40755, 2),
+        3 => (0o10600, 1),  // S_IFIFO
+        4 => (0o140777, 1), // S_IFSOCK
+        5 => (0o20666, 1),  // S_IFCHR
         _ => (0o100600, 1),
     };
     match fill_stat64(buf, inode, mode, size, links) {
@@ -1505,6 +1557,7 @@ fn clone_desc(d: &OpenFile) -> OpenFile {
         OpenFile::Pipe(id, w) => OpenFile::Pipe(*id, *w),
         OpenFile::EventFd(i) => OpenFile::EventFd(*i),
         OpenFile::Null => OpenFile::Null,
+        OpenFile::Random => OpenFile::Random,
         OpenFile::Session => OpenFile::Session,
     }
 }
@@ -1598,9 +1651,15 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
                 pipe_id = *id as usize;
                 4
             }
+            OpenFile::Random => 5,
             _ => 0,
         });
         match kind {
+            Some(5) => {
+                let mut tmp = alloc::vec![0u8; len as usize];
+                net::rng_fill(&mut tmp);
+                return if copy_to_user(buf_va, &tmp) { len } else { e(ring3::err::EFAULT) };
+            }
             Some(1) => return sock::read_arm(fd, buf_va, len),
             Some(2) => return child::read_child_out(slot_idx, buf_va, len),
             Some(3) => return eventfd_read_arm(slot_idx, buf_va),
@@ -1649,7 +1708,7 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
             // default `Ok(0)` — which is the device's contract.
             OpenFile::Pipe(_, true) => res = Err(ring3::err::EBADF),
             OpenFile::Socket(_) | OpenFile::ChildOut(_) | OpenFile::EventFd(_) | OpenFile::Null
-            | OpenFile::Session
+            | OpenFile::Random | OpenFile::Session
             | OpenFile::Pipe(_, false) => {}
         });
         match (found, res) {
@@ -1780,9 +1839,9 @@ fn nosys_note(nr: u64) {
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     #[cfg(feature = "trace-err")]
     {
-        let nr = fr.rax;
+        let (nr, a1, a2, a3) = (fr.rax, fr.rdi, fr.rsi, fr.rdx);
         let r = dispatch_inner(fr);
-        trace_err(nr, r);
+        trace_err(nr, r, a1, a2, a3);
         return r;
     }
     #[cfg(not(feature = "trace-err"))]
@@ -1793,13 +1852,13 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
 /// (`[err] nr=N -E`), capped so a polling loop cannot flood the console. The
 /// gap-finding view `[nosys]` is the always-on half of.
 #[cfg(feature = "trace-err")]
-fn trace_err(nr: u64, r: u64) {
+fn trace_err(nr: u64, r: u64, a1: u64, a2: u64, a3: u64) {
     static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let v = r as i64;
     if (-4095..0).contains(&v) && v != -11
         && SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3000
     {
-        akuma_primitives::safe_print!(64, "[err] s{} nr={} {}\n", crate::exec_twin::current_slot() as i64, nr, v);
+        akuma_primitives::safe_print!(96, "[err] s{} nr={} {} a=0x{:x},0x{:x},0x{:x}\n", crate::exec_twin::current_slot() as i64, nr, v, a1, a2, a3);
     }
 }
 
@@ -1841,7 +1900,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let kind = fd_table().with(fd as u32, |d| match d {
                 OpenFile::Socket(_) => 1,
                 OpenFile::File { .. } => 2,
-                OpenFile::Null => 3,
+                OpenFile::Null | OpenFile::Random => 3,
                 OpenFile::EventFd(slot) => {
                     efd_idx = *slot;
                     4
@@ -1924,7 +1983,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let kind = fd_table().with(fd as u32, |d| match d {
                 OpenFile::Socket(_) => 1,
                 OpenFile::File { .. } => 2,
-                OpenFile::Null => 3,
+                OpenFile::Null | OpenFile::Random => 3,
                 OpenFile::EventFd(slot) => {
                     efd_idx = *slot;
                     4
@@ -2016,6 +2075,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // and `ret`s through a zeroed return address (session pe: pd's
             // deterministic rip=0).
             if child::is_real_task() {
+                // `exit` (60) from a thread ends that thread only; everything
+                // else (exit_group, a lone process's exit) ends the group.
+                if fr.rax == ring3::nr::EXIT && child::is_thread_task() {
+                    child::task_exit_thread()
+                }
                 child::task_exit_real(code)
             }
             // Stage 4: a nested child's exit does NOT reach the reaper — it
@@ -2101,13 +2165,21 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
             }
         }
-        ring3::nr::SET_TID_ADDRESS => 1, // one task: the tid, and nothing to clear
+        ring3::nr::SET_TID_ADDRESS => {
+            // The word the kernel zeroes and futex-wakes at this thread's exit.
+            if let Some(p) = akuma_exec::process::current_process_shared() {
+                p.clear_child_tid.store(fr.arg1(), core::sync::atomic::Ordering::Release);
+            }
+            my_tid()
+        }
+        akuma_syscalls_abi::x86_64::FUTEX => {
+            futex::sys_futex(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6())
+        }
         // x86_64 musl sends 39 for getpid; ring3's hand table says 38 (its
         // own archaeology). The ABI crate owns the x86_64 truth - answer both
         // spellings so the fetcher's calls stop landing in the unhandled arm.
-        ring3::nr::GETTID | ring3::nr::GETPID | akuma_syscalls_abi::x86_64::GETPID => {
-            u64::from(child::current_pid())
-        }
+        ring3::nr::GETTID => my_tid(),
+        ring3::nr::GETPID | akuma_syscalls_abi::x86_64::GETPID => u64::from(child::current_pid()),
         ring3::nr::GETPPID => 1, // everything here is the init task's child
         ring3::nr::GETUID | ring3::nr::GETEUID => 0,
         ring3::nr::GETGID | ring3::nr::GETEGID => 0,
@@ -2595,7 +2667,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                 }
                 OpenFile::File { .. } | OpenFile::Socket(_) | OpenFile::ChildOut(_)
-                | OpenFile::EventFd(_) | OpenFile::Null | OpenFile::Session => {
+                | OpenFile::EventFd(_) | OpenFile::Null | OpenFile::Random | OpenFile::Session => {
                     res = Err(ring3::err::ENOTDIR);
                 }
                 OpenFile::Pipe(_, false) => {
@@ -3217,6 +3289,21 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // c-ares's next question after getsockname (same session; the
             // amd64 box needed this row for the same caller).
             sock::getpeername_arm(fr.arg1(), fr.arg2(), fr.arg3())
+        }
+        // The ext2 write path is write-through (every `write_at_by_inode`
+        // reaches the block device before it returns), so a flush has nothing
+        // left to do: git's `fsync` on every pack/idx/loose object was ENOSYS.
+        akuma_syscalls_abi::x86_64::FSYNC | akuma_syscalls_abi::x86_64::FDATASYNC => {
+            if fd_table().with(fr.arg1() as u32, |_| ()).is_some() {
+                let _ = root_fs().sync();
+                0
+            } else {
+                e(ring3::err::EBADF)
+            }
+        }
+        akuma_syscalls_abi::x86_64::SYNC | akuma_syscalls_abi::x86_64::SYNCFS => {
+            let _ = root_fs().sync();
+            0
         }
         akuma_syscalls_abi::x86_64::SIGALTSTACK => sigaltstack_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::MEMBARRIER => membarrier_arm(fr.arg1()),
