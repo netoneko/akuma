@@ -228,3 +228,11 @@ Chose the extension of `akuma-mmap` (empty deps kept) as the plan preferred. Beh
 **Slice 2 (§2.2) DONE:** `akuma-syscalls-signal` (`SigTable`, wire image, `check`, `reset_for_exec`, `procmask`; zero dependencies - errors are a closed enum the
 caller maps to errno, so it needs no ABI crate; forbid(unsafe), budget 0; 10 host tests incl. an exhaustive differential of `check` against the old inline rule).
 taoxichuan's `sigaction_arm`/`sigprocmask_arm`/exec reset use it. amd64's `signal.rs` has NOT adopted it yet (no amd64 gate was run).
+
+**Slice 4 (§2.4) DONE (2026-10-30):** `akuma_syscalls_net::sockaddr` (`decode_sockaddr_in`, `encode_sockaddr_in`, `net_err`, `SockaddrError`). 7 host tests including
+a differential against `akuma-net`'s `SockAddrIn` (the struct both kernels used to reinterpret with `unsafe`): the encode is byte-identical for 45 address/port
+pairs and the decode agrees for families 0..=40. Both `sock.rs` files adopted it (taoxichuan's was already unsafe-free by byte code; amd64 lost its `read_unaligned` and
+`from_raw_parts`: `amd64/src` 85 -> 83), and the three `net_err` copies are gone. `sockaddr_un` and `setsockopt` decode tables were not moved.
+**Slice 5 (§2.5) DONE:** `akuma-fpu-amd64` (sizes, offsets, `initial_legacy`/`initial_xsave`, `effective_mxcsr_mask`, `sanitize`, `SaveFormat`). 10 host tests; the power-on image is
+pinned to the exact bytes both kernels hand-wrote, and the xsave image is pinned to "legacy image + XSTATE_BV". taoxichuan's `fx_init` and amd64's `FxArea::initial`/`sanitize` consume it.
+Compile-checked for amd64 (`cargo check -p akuma-amd64 --release --features no-tests`); not run on the amd64 kernel here.

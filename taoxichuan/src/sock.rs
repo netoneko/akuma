@@ -24,7 +24,7 @@
 //! `wait_until`, which pumps the stack itself. There is no third path.
 
 use akuma_net::socket::socket_const::{AF_INET, SOCK_DGRAM, SOCK_STREAM};
-use akuma_net::socket::{SockAddrIn, SocketAddrV4};
+use akuma_net::socket::SocketAddrV4;
 
 /// `SOCK_STREAM`/`SOCK_DGRAM` are the low bits of `type`, which also
 /// carries `SOCK_NONBLOCK`/`SOCK_CLOEXEC`.
@@ -32,11 +32,7 @@ const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 
-/// Map `akuma-net`'s errno (a positive `i32`) to the kernel's negative
-/// return — the same convention as every other arm.
-fn net_err(e: i32) -> u64 {
-    (-i64::from(e)) as u64
-}
+use akuma_syscalls_net::sockaddr::{self, net_err};
 
 /// The fd's socket index, or `ENOTSOCK`.
 pub fn fd_socket(fd: u64) -> Option<usize> {
@@ -442,20 +438,17 @@ pub fn fd_nonblock(fd: u64) -> bool {
     fd_table().is_nonblock(fd as u32)
 }
 
-/// Read a `struct sockaddr_in` from the task's memory.
+/// Read a `struct sockaddr_in` from the task's memory (rules: `akuma-syscalls-net::sockaddr`).
 fn sockaddr_in_from_user(ptr: u64, len: u64) -> Option<SocketAddrV4> {
-    if len < core::mem::size_of::<SockAddrIn>() as u64 {
+    if len < sockaddr::SOCKADDR_IN_LEN as u64 {
         return None;
     }
-    let mut raw = [0u8; core::mem::size_of::<SockAddrIn>()];
+    let mut raw = [0u8; sockaddr::SOCKADDR_IN_LEN];
     if !crate::copy_from_user(&mut raw, ptr) {
         return None;
     }
-    // sin_family (native), sin_port (big-endian), sin_addr (the IP octets).
-    if u16::from_ne_bytes([raw[0], raw[1]]) != AF_INET as u16 {
-        return None;
-    }
-    Some(SocketAddrV4::new([raw[4], raw[5], raw[6], raw[7]], u16::from_be_bytes([raw[2], raw[3]])))
+    let (ip, port) = sockaddr::decode_sockaddr_in(len, &raw).ok()?;
+    Some(SocketAddrV4::new(ip, port))
 }
 
 /// Write a `struct sockaddr_in` to the task's memory; returns its length.
@@ -463,10 +456,7 @@ fn sockaddr_in_to_user(ptr: u64, addr: SocketAddrV4) -> usize {
     if ptr == 0 {
         return 0;
     }
-    let mut raw = [0u8; core::mem::size_of::<SockAddrIn>()];
-    raw[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
-    raw[2..4].copy_from_slice(&addr.port.to_be_bytes());
-    raw[4..8].copy_from_slice(&addr.ip);
+    let raw = sockaddr::encode_sockaddr_in(addr.ip, addr.port);
     if !crate::copy_to_user(ptr, &raw) {
         return 0;
     }

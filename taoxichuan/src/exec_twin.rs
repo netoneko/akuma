@@ -154,17 +154,12 @@ fn switch_to(from: usize, to: usize) {
 /// pointer). XSAVE/AVX is never enabled here, so the legacy area is the whole
 /// state (`docs/archive/AMD64_SMP_BRINGUP.md` has the amd64 twin of this).
 #[repr(C, align(16))]
-struct FxArea([u8; 512]);
+struct FxArea([u8; akuma_fpu_amd64::LEGACY_SIZE]);
 
-/// The power-on x87/SSE state: `FCW = 0x037F`, `MXCSR = 0x1F80` (every SSE
-/// exception masked). All-zero would unmask them and the first `divss` traps.
+/// The power-on x87/SSE state (`akuma-fpu-amd64`: `FCW = 0x037F`, `MXCSR = 0x1F80`,
+/// every SSE exception masked; all-zero would unmask them and the first `divss` traps).
 const fn fx_init() -> FxArea {
-    let mut a = [0u8; 512];
-    a[0] = 0x7F;
-    a[1] = 0x03;
-    a[24] = 0x80;
-    a[25] = 0x1F;
-    FxArea(a)
+    FxArea(akuma_fpu_amd64::initial_legacy())
 }
 
 /// One area per ring slot plus the idle thread (`IDLE_TID`). Single core, IF

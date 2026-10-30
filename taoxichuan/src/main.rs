@@ -844,7 +844,14 @@ pub(crate) const ARG_BLOCK_PAGES: usize = 12;
 /// `ENOMEM` before it printed). The cost is only pages actually touched, and
 /// the range is far from PIE code (`PIE_BASE`) and the stack. The bounds are
 /// constants for now; the per-process memory model comes with stage 12.
-const MMAP_SLAB: u64 = 0x4000_0000;
+///
+/// 16 GiB since 2026-10-30: compiling this kernel in the guest needs more than 1 GiB of
+/// address space in ONE rustc - it maps the 311 MB `librustc_driver`, a ~17 MB stack per
+/// codegen thread and every dependency's rlib - and the old 1 GiB slab answered `ENOMEM` to
+/// the stack `mmap`, which musl's `pthread_create` reports as `EAGAIN` ("failed to spawn work
+/// thread", an ICE) with 2 GiB of RAM still free (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md`).
+/// Address space only: a page costs memory when it is mapped, not when it is reserved.
+const MMAP_SLAB: u64 = 0x4_0000_0000;
 /// Hole-table size per task (see `Task::holes`).
 const MAX_HOLES: usize = 64;
 /// Writable shared file mappings tracked per task (see `Task::shared`).

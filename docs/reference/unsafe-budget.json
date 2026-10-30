@@ -20,6 +20,7 @@
     "crates/akuma-firecracker",
     "crates/akuma-fpcache",
     "crates/akuma-fpcache-rw",
+    "crates/akuma-fpu-amd64",
     "crates/akuma-gdt",
     "crates/akuma-hda",
     "crates/akuma-hid",
@@ -79,7 +80,7 @@
     "crates/akuma-xhci"
   ],
   "unsafe_sites": {
-    "amd64/src": 85,
+    "amd64/src": 83,
     "crates/akuma-alloc": 24,
     "crates/akuma-boot-amd64": 10,
     "crates/akuma-cpu": 65,
@@ -92,7 +93,7 @@
     "crates/akuma-idt-amd64": 1,
     "crates/akuma-locks-rw-cell": 8,
     "crates/akuma-mmu": 20,
-    "crates/akuma-net-nic": 12,
+    "crates/akuma-net-nic": 13,
     "crates/akuma-not-even-once": 5,
     "crates/akuma-pagetable": 5,
     "crates/akuma-pmm": 3,

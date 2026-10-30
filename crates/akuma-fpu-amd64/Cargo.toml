@@ -1,0 +1,10 @@
+[package]
+name = "akuma-fpu-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The amd64 FPU save area as pure byte algebra: fxsave/xsave sizes and offsets, the power-on image, and the rule that makes a user-supplied image safe to xrstor. No asm, no statics: both amd64 kernels keep the instructions and the per-slot storage."
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -703,12 +703,31 @@ fn kill_siblings(cur: usize, lead: usize) {
     for s in 0..NSLOTS {
         if s != cur && s != lead && slots()[s].used && slots()[s].thread && task_of(s) == rec {
             crate::futex::purge_task(s);
+            let pid = slots()[s].pid;
             slots()[s].running = false;
             slots()[s].used = false;
             slots()[s].thread = false;
             akuma_threading::mark_thread_terminated(s);
+            retire_thread_process(pid);
         }
     }
+}
+
+/// Take a dead thread's registered `Process` out of the process table.
+///
+/// `clone_thread` registers a real `Process` per thread (so `current_process` answers
+/// per thread), and nothing but `reap_process` - which runs for a group LEADER, on its
+/// parent's `wait4` - ever unregistered one. A thread's own `exit` and `exit_group`'s
+/// `kill_siblings` freed the ring slot and left the `Process` ACTIVE for the rest of the
+/// boot, so every thread leaked a table entry: a `cargo build` of this kernel (cargo plus
+/// four `rustc`, each with a pool of threads) reached 256 live entries and panicked
+/// "Process table full" (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md` §7).
+///
+/// Retire only: the `Process` is freed by the next `drain_retired` (reap, idle loop, memory
+/// pressure), never here, because the exiting thread is still running on it. A thread's
+/// address space is the leader's shared view, so dropping it frees no frames.
+fn retire_thread_process(pid: u32) {
+    let _ = akuma_exec::process::unregister_process(pid);
 }
 
 /// A thread's `exit` (60): only this thread ends. `CLONE_CHILD_CLEARTID`
@@ -727,10 +746,12 @@ pub fn task_exit_thread() -> ! {
     // The slot leaves the table: a thread has no status for a parent to reap
     // and must never look like a child to a `wait4` scan.
     let s = slots();
+    let pid = s[cur].pid;
     s[cur].running = false;
     s[cur].used = false;
     s[cur].thread = false;
     s[cur].real = false;
+    retire_thread_process(pid);
     akuma_threading::x86_finish_current()
 }
 
@@ -744,6 +765,12 @@ fn clone_thread_arm(fr: &ring3::SyscallFrame) -> u64 {
         return crate::e(ring3::err::EPERM); // the boot task has no Process to clone
     }
     let (flags, stack, ptid, ctid, tls) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5());
+    // Demand-driven drain at syscall ENTRY, before anything is claimed: every thread owns
+    // a `Process` row, `retire_thread_process` only retires it, and this is the one path
+    // that consumes rows, so it pays for collecting them. Not at thread teardown: reclaim
+    // runs `Process::drop`, and the exiting thread is still running on its own row
+    // (`docs/archive/AKUMA_AMD64_THREAD_LIFECYCLE.md` §3 - the same fix on the amd64 kernel).
+    let _ = akuma_exec::process::reclaim::drain_retired();
     match akuma_exec::process::clone_thread(stack, tls, ptid, ctid, flags) {
         Ok(tid) => u64::from(tid),
         Err(msg) => {
@@ -2116,8 +2143,8 @@ fn reap_process(slot: usize, pid: u32) {
     pages += akuma_mmu::drain_pending_ttbr_frees();
     if cfg!(feature = "trace-err") {
         akuma_primitives::safe_print!(
-        192,
-        "[reap] pid={} retired={} drained={} root={} free {} -> {} heap={}K cowrefs={} cow={:?}\n",
+        224,
+        "[reap] pid={} retired={} drained={} root={} free {} -> {} heap={}K cowrefs={} cow={:?} procs={}/{}\n",
         pid,
         retired,
         drained,
@@ -2126,7 +2153,9 @@ fn reap_process(slot: usize, pid: u32) {
         akuma_exec::pmm::free_count(),
         akuma_alloc::allocated_bytes() / 1024,
         akuma_pmm::cow_ref_count(),
-        crate::cow_stats()
+        crate::cow_stats(),
+        akuma_exec::process::table::process_count(),
+        akuma_exec::process::table::retired_process_count()
     );
     }
 }

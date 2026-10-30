@@ -33,6 +33,7 @@ dependencies = [
  "akuma-fdt",
  "akuma-firecracker",
  "akuma-fpcache",
+ "akuma-fpu-amd64",
  "akuma-gic",
  "akuma-isolation",
  "akuma-kacho",
@@ -106,6 +107,7 @@ dependencies = [
  "akuma-fdtable",
  "akuma-fpcache",
  "akuma-fpcache-rw",
+ "akuma-fpu-amd64",
  "akuma-gdt",
  "akuma-hda",
  "akuma-hid",
@@ -389,6 +391,10 @@ dependencies = [
 
 [[package]]
 name = "akuma-fpcache-rw"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-fpu-amd64"
 version = "0.1.0"
 
 [[package]]
@@ -814,6 +820,7 @@ dependencies = [
 name = "akuma-syscalls-net"
 version = "0.1.0"
 dependencies = [
+ "akuma-net",
  "akuma-syscalls-linux",
 ]
 
@@ -1281,6 +1288,7 @@ dependencies = [
  "akuma-exec",
  "akuma-ext2",
  "akuma-fdtable",
+ "akuma-fpu-amd64",
  "akuma-gdt",
  "akuma-idt-amd64",
  "akuma-isolation",
@@ -1298,6 +1306,7 @@ dependencies = [
  "akuma-syscalls-eventfd",
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
+ "akuma-syscalls-net",
  "akuma-syscalls-poll",
  "akuma-syscalls-signal",
  "akuma-syscalls-sync",

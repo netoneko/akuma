@@ -9,8 +9,8 @@ from several subsystems under one write-up.
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1470
-- **Docs contributing at least one fix:** 406
+- **Total distinct fixes counted:** 1473
+- **Docs contributing at least one fix:** 407
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
@@ -27,7 +27,7 @@ from several subsystems under one write-up.
 | VFS & Filesystem | 134 | 9.1% | 40 |
 | Boot & Drivers | 141 | 9.6% | 22 |
 | Signals & Exceptions | 40 | 2.7% | 15 |
-| Misc / Cross-cutting | 59 | 4.0% | 19 |
+| Misc / Cross-cutting | 62 | 4.2% | 20 |
 | Console & Terminal | 58 | 3.9% | 18 |
 | Containers | 55 | 3.7% | 10 |
 | **Total** | **1470** | **100.0%** | **406** |
@@ -2079,7 +2079,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_METAL_CONTROL_RUN.md
 - Emulating a trapped `MRS` with `rt == 31` on AArch64 wrote word 31 of the trap frame (`sp_el0`) instead of discarding the result as `XZR`, as the read side already did
 
-## Misc / Cross-cutting (59 fixes, 19 docs)
+## Misc / Cross-cutting (62 fixes, 20 docs)
 
 ### docs/archive/AKUMA_KVM.md
 (The SVM phases — trivial guest, permission maps + AP hook, the 12-probe consistency ladder, the long-mode metal PASS, the two-level translation phase — are capability, not fixes; the ladder is an instrument, not a defect. These are the two defects the phases surfaced.)
@@ -2197,6 +2197,11 @@ aren't recorded anywhere else.)
 - The Akuma guest *scans* for the ACPI RSDP (the kernel ignores `hvm_start_info.rsdp_paddr`), so the first SMP run reported `acpi: none found` although the table was valid; the table page now sits at `0xE0000`, the BIOS window's first address.
 - A stepped-over `HLT` left the interrupt shadow set: `sti; hlt; cli` intercepts `HLT` inside the one-instruction shadow `STI` opens, the handler advanced RIP but left the bit in the VMCB, and the next entry delivered nothing; every place the hypervisor completes an instruction now clears it.
 - The host's Gentoo box re-set the hostname to `localhost` from its OpenRC `conf.d/hostname`, so the herd oneshot that names a guest was not enough; the guests are `akuma-kvm`/`akuma-gentoo` and the host `akuma-ryzen`, split by hostname service.
+
+### docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md
+- `execve` answered `EFAULT` ("Bad address") for any call with more than 128 `argv` or `envp` entries or a string over 4096 bytes, because the pointer-array reader mapped "too many" to `None` and the caller mapped `None` to `EFAULT`; cargo's heaviest `rustc` call for this kernel has 344 arguments and a 5192-byte one, so the in-guest build died at its first big crate. The caps are 448/256/32 KiB, an oversize block answers `E2BIG`, and the argument block is 12 pages
+- A thread's own `exit` and `exit_group`'s `kill_siblings` freed the ring slot but never unregistered the thread's `Process` (only a group leader's `wait4` did), so every thread leaked a process-table entry and a `cargo build` reached `Process table full (256 slots, 0 reclaimable RETIRED)` at pid ~345 with a gigabyte free; thread exit now retires the row and `clone_thread` drains at syscall entry, the amd64 kernel's fix for the same family
+- the 1 GiB per-process mmap slab answered `ENOMEM` to `rustc`'s thread-stack `mmap` (it maps a 311 MB `librustc_driver` plus a ~17 MB stack per codegen thread), which musl reports as `EAGAIN` ("failed to spawn work thread", an ICE) with 2 GiB of RAM free; the slab is 16 GiB of reserved address space
 
 ## Console & Terminal (58 fixes, 18 docs)
 

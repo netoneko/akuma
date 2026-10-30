@@ -78,7 +78,7 @@ clones the repo from GitHub over HTTPS (public repo, 9 s sparse clone). Cause no
 | Where | Limit | Result |
 |---|---|---|
 | Linux (ryzen Pop OS host, nightly-2026-09-19) | cgroup `MemoryMax=3G`, `MemorySwapMax=0` | 10 s, **peak 447 MiB** (`memory.peak`, includes page cache), 0 OOM kills |
-| Taoxichuan guest on KVM (nightly-2026-09-29, musl host toolchain) | 3072 MiB RAM | **does not finish.** Attempt 1: `execve` EFAULT (section 1). Attempt 2 (128 → 256 caps only): same, ~4m00 guest. Attempt 3 (final fix): kernel panic, process table full (section 7) |
+| Taoxichuan guest on KVM (nightly-2026-09-29, musl host toolchain) | 3072 MiB RAM | **PASS after the fixes in sections 1, 7 and 8**: 11m41s on the guest clock (~8 min real), 1,433,608-byte kernel, **peak >= 2,460 MiB used** (lowest free seen at a reap line: 156,787 pages = 612 MiB; a floor, sampled only when a process exits), process table peaked at 30 entries. Before the fixes: `execve` EFAULT (section 1), then "Process table full" (section 7), then an `rustc` ICE from the 1 GiB mmap slab (section 8) |
 | **Akuma amd64** (full kernel, `e5e23d61`, Firecracker/KVM on the ryzen, 4 vCPU, 3072 MiB) | 3072 MiB RAM | **PASS**, `kbuild -c -j4 -p taoxichuan --features no-tests`, 35 s guest clock (~24 s real), **peak 1,356 MiB used** (MemTotal 3,144,704 kB, lowest MemFree 1,756,584 kB, sampled every 2 s from `/proc/meminfo`), idle 531 MiB used before the build, so the build added ~821 MiB |
 
 So the memory comparison for the same compile is: **Linux 447 MiB peak (cgroup, page cache included) vs Akuma 1,356 MiB peak
@@ -92,22 +92,43 @@ The taoxichuan guest has no `/proc/meminfo`. Its idle is the same order: 654,000
 before any work. Both kernels sitting at ~0.5 GiB idle suggests a fixed kernel reservation (heap) rather than a per-process cost; **not
 verified**. That idle floor is the first thing to account for when asking why Akuma's peak is higher than Linux's.
 
-So there is **no taoxichuan-guest baseline yet**: it cannot finish the build (section 7), and with no `/proc/meminfo` its peak would have to be
-read from the reap lines' `free A -> B`. Free memory was ~1.1-2.4 GiB at each of its failures, so memory is not what stops it.
+**The memory ranking for the same compile is Linux 447 MiB < Akuma 1,356 MiB < taoxichuan guest >= 2,460 MiB.** The taoxichuan figure is
+5.5x Linux's. Its likely cause is that file-backed private `mmap` is populated eagerly (every page copied out of the inode at `mmap` time,
+`taoxichuan/src/main.rs`'s mmap arm), so each `rustc` pays for its whole 311 MB `librustc_driver` mapping instead of the pages it touches
+- the "demand-paged mmap" item at the top of `TAOXICHUAN_EFFICIENCY_PLAN_GLM.md`. Not measured separately; the number is the evidence that
+the item matters, not a profile of it.
 
-## 7. Kernel panic: "Process table full (256 slots, 0 reclaimable RETIRED)" — OPEN
+## 7. Kernel panic: "Process table full (256 slots, 0 reclaimable RETIRED)" - a thread-exit leak - FIXED
 
-- **Symptom.** In the in-guest taoxichuan build (3 GiB, `-j4`), right after `[execve] s18 path=/usr/local/rust/bin/rustc`:
-  `[PANIC] crates/akuma-exec/src/process/table.rs:73 Process table full (256 slots, 0 reclaimable RETIRED)`; ssh then reports
-  "server not responding". pids had reached ~345 (`THREAD_PID_MAP=345`).
-- **What it is.** `register_process` has `MAX_PROCESSES = 256` slots and panics when none is free. The known-open item is written in
-  that function and in `docs/reference/subsystems/memory.md` ("OPEN: a full process table still panics the kernel"). Zero RETIRED
-  entries means the 256 are live or unreaped, not waiting for the collector.
-- **Why this build hits it.** This kernel registers a real `Process` per thread (`bind_child_task`, the clone fold), and cargo plus four
-  concurrent `rustc` (each with several codegen/jobserver threads) is the first workload here with that many live at once. The
-  serde/serde_json/fastrand `-j4` builds stay below 256.
-- **Not yet established:** how many of the 256 are genuinely live versus leaked (a thread or zombie whose `Process` is never unregistered
-  would also fill the table over a long build). Count live processes against `reap_process`/`unregister_process` calls in a run before
-  raising the constant, which is a shared `akuma-exec` value that also sizes the AArch64 kernel.
-- **Next steps.** (1) Log table occupancy at each reap on the `trace-err` build. (2) If occupancy is leaked, fix the leak. (3) If it is
-  real, make `register_process` fallible so fork/clone answer `EAGAIN`, as the in-source comment already asks.
+- **Symptom.** In the in-guest taoxichuan build, `[PANIC] crates/akuma-exec/src/process/table.rs:73 Process table full (256 slots, 0
+  reclaimable RETIRED)` at pid ~345, then ssh "server not responding". With free memory ~1 GiB.
+- **Measured, not guessed.** `[reap]` lines now carry `procs=<active>/<retired>`. Before the fix the active count climbed monotonically
+  with pid (pid 3 -> 1, 130 -> 94, 205 -> 180, 323 -> 249) while only 83 `[reap]` lines had appeared for 300+ pids: a leak, with 0 retired
+  entries, so not a starved collector.
+- **Cause.** `clone_thread` registers a real `Process` per thread. The only code that unregistered one was `reap_process`, which runs for a
+  group *leader* on its parent's `wait4`. A thread's own `exit` (`task_exit_thread`) and `exit_group`'s `kill_siblings` freed the ring slot
+  and left the `Process` ACTIVE for the rest of the boot. Cargo plus four `rustc` (each with a pool of codegen threads) is the first
+  workload here with enough thread churn to fill 256.
+- **It had been found before.** `AKUMA_AMD64_THREAD_LIFECYCLE.md` §3 is the same family on the amd64 kernel: "every `pthread_create` registers a
+  `Process` row ... none of the drain sites is on the thread path". Its fix is the model used here: thread teardown *retires* the row, and
+  `clone_thread` *drains at syscall entry*, before claiming anything - never at teardown, because reclaim runs `Process::drop` and the exiting
+  thread is still running on its own row. (Reading that doc first would have saved the instrumentation round; the user pointed at it.)
+- **Fix** (`taoxichuan/src/child.rs`): `retire_thread_process(pid)` in `task_exit_thread` and `kill_siblings`; `drain_retired()` at the top
+  of `clone_thread_arm`.
+- **Result.** The count plateaus: pid 3 -> 1, 32 -> 6, 129 -> 20, 208 -> 22, 295 -> 23, peak 30 over the whole 11-minute build. No panic.
+- **Still open:** `register_process` is infallible (the note in `table.rs` and `docs/reference/subsystems/memory.md`); a genuine 256-live
+  workload would still panic instead of answering `EAGAIN`.
+- **Flake seen once, not explained:** one local `cow_leak_gate.py` run failed at round ~10 with "no `[spawn-reap]` line after `sh -c 'true; true'`" on
+  the build that retired thread Processes (before the clone-entry drain); two reruns of the same binary passed 20/20, and every later run has.
+
+## 8. `rustc` ICE "failed to spawn work thread" - the 1 GiB mmap slab - FIXED
+
+- **Symptom.** With sections 1 and 7 fixed, `rustc` panicked compiling `taoxichuan` itself: `failed to spawn work thread: Os { code: 11,
+  kind: WouldBlock }`. The console shows `mmap` answering ENOMEM (`nr=9 -12`, lengths 17 MB and 311 MB) with ~2.2 GiB of RAM free, and **no**
+  `[clone] thread refused` line, so the refusal was musl's `pthread_create` failing on its stack `mmap`.
+- **Cause.** `MMAP_SLAB` was 1 GiB of *address space* per process. One `rustc` maps the 311 MB `librustc_driver`, a ~17 MB stack per codegen
+  thread and every dependency's rlib, which together exceed 1 GiB. The constant's own comment says "rustc `--version` maps ~1 GiB".
+- **Fix.** `MMAP_SLAB` = 16 GiB (`0x4_0000_0000`); it is only a reserved range, far below the stack at `0x7000_0000_0000`.
+- **Related, not fixed:** the 16-entry-order `nr=9 -12` failures also hide that the slab is shared by a process's threads, and a mapping is
+  populated eagerly (section 6) - so address space was the first wall, and RAM is the next one.
+
