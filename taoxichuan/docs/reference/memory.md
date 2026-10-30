@@ -45,7 +45,9 @@ Canonical mermaid source: [`../diagrams/memory-map.md`](../diagrams/memory-map.m
 - `mmap` serves `MAP_ANONYMOUS` (zeroed frames) and `MAP_PRIVATE` of an open
   regular file (zeroed frames filled from the inode at `off` — musl ldso's
   `map_library` shape; no CoW, private because the address space dies with the
-  task). `PROT_EXEC` widens the mapping to RWX — there is no W^X policy layer.
+  task). `W+X` is refused at `mmap` too: the W^X decision is
+  [`crates/akuma-syscalls-mem`](../../../crates/akuma-syscalls-mem) `wx::check_prot`,
+  called at the top of both the `mmap` and `mprotect` arms (`wx=0` turns it off).
   The slab is 16 GiB of *reserved address space* (a page costs memory when mapped, not when reserved); at 1 GiB one `rustc` ran out of it — it maps a 311 MB `librustc_driver` and a ~17 MB stack per codegen thread — and musl reported the failed stack `mmap` as `EAGAIN` ("failed to spawn work thread"). Memory is the next wall: the fill is still eager (see `gaps.md`).
   `MAP_FIXED` is honoured only inside the mmap slab; the bump cursor never
   rewinds past it. `mremap` grows by moving to a fresh region (MAYMOVE;
@@ -79,7 +81,11 @@ parent's **user half only**. The page tables are copied; the **leaf frames are
 shared**:
 
 - every present 4 KiB leaf takes one `cow_ref_inc` (the first share inserts 2:
-  parent + child); the kernel half is never walked;
+  parent + child); the kernel half is never walked. The counts live in
+  [`crates/akuma-pmm`](../../../crates/akuma-pmm) `cow_table::CowTable` — a fixed
+  array of 4096-entry chunks (one per 16 MiB of physical space, allocated on the
+  first share in its range), so a 100k-page fork costs no per-frame allocation
+  (it was a `BTreeMap`, one heap node per shared frame);
 - a **writable** leaf is demoted to read-only in *both* tables and marked with
   PTE bit 9 (`PTE_COW`, an MMU-ignored AVL bit); the parent's translation is
   `invlpg`'d, because a stale writable entry would write into the shared frame
@@ -98,7 +104,11 @@ shared**:
 - `fault_trap`, for a ring-3 fault with error code present+write+user (stack
   growth is tried first; only `Fault` falls through to the kill);
 - `copy_to_user` — the kernel writes user pages through the physmap, which
-  never faults, so it calls `cow_prepare_write` on each destination page first;
+  never faults, so it calls `cow_prepare_write` on each destination page first
+  and answers `EFAULT` (as Linux does for a kernel write to a page the user
+  could not write) when the break is needed and fails, or when the page is
+  read-only and shared but *unmarked* (shared text, or `mprotect(PROT_READ)`
+  after a fork) — an unshared read-only page stays kernel-writable;
 - `mprotect` to a writable mapping calls `cow_privatize`: a frame held by two
   spaces becomes private before the PTE is re-mapped RW (marked or not — a
   shared text page is unmarked).
@@ -111,16 +121,21 @@ N fork/exec/exit rounds must equal the baseline **exactly**, with
 `cow_ref_count() == 0`. The reap lines (`trace-err`) print `cowrefs=` and
 `cow=(shared, copied, taken, retried)`.
 
-Known limits: a kernel write into a read-only page that is shared but *not*
-marked (text) is not intercepted — no caller does that. Incident, plan and
-measurements: `docs/archive/TAOXICHUAN_COW_FORK.md`.
+Known limits: a shared read-only page stays read-only to ring 3 (a write
+kills, by design — there is no user-text self-modification). Incident, plan and
+measurements: `docs/archive/TAOXICHUAN_COW_FORK.md`; the two `cow_prepare_write`
+holes closed on 2026-10-30 are §9 of
+`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md`.
 
 ## Allocation on syscall paths
 
 The fd and socket arms allocate (`Vec` gathers for writev/sendto, the child
 pipe buffer, path `String`s). The caps that keep that bounded: 1 MiB per
 `write`/`read` call (`WRITE_LIMIT`), 1 MiB of child stdout (`OUT_CAP`), 128 B
-path buffers, 16-entry argv/env read-back, 64 KiB per pipe. Out of memory is
+path buffers, 64 KiB per pipe, and the execve argument block: 448 `argv` /
+256 `envp` entries, 32 KiB per string, `argv + envp <= 512` and a total-bytes
+guard — every overrun answers `E2BIG`, never `EFAULT` (2026-10-30; one heavy
+`rustc` call carries 344 arguments and a 5,192-byte argument). Out of memory is
 `[OOM]` + halt: there is no pressure ladder on a kernel with no processes to
 kill.
 
