@@ -131,9 +131,16 @@ usage API; full method and tables in the agent log, "GLM tokenomics from the goo
   ladder (25-30 milestones, ~400-480M) at about 28M a day, one 5-hour window daily.
 - The same median replay on the pay-as-you-go API is about **$15-20**, less than one Lite month,
   with no caps.
-- Not counted anywhere above: the Claude supervisor (briefs, verification) and, since the
-  2026-10-29 switch, Claude executing (rustc, cargo, git clone, CoW fork). There is no measured GLM
-  cost for that hardest class of milestone.
+- **The supervisor out-consumed the worker.** Claude Code transcripts (`~/.claude-personal`, usage
+  fields only): 1,221M Claude Sonnet 5.5 tokens on 10-24 -> 10-30 against GLM's 569M, 2.1x, and
+  more than GLM on every single day; 10-30 alone was 340M (GLM's busiest day: 125M).
+- **Claude executing** (10-29 18:00Z -> 10-30, 20 active hours, ~12 milestones from pn S1 to the
+  CoW fork and the unsafe cut, 32 commits): 1,380 model calls, 1,571 tool calls, **406M tokens**.
+  Its average call carried **294k** tokens of context; GLM's carries 56-77k.
+- **The same work by GLM at 2-4x Claude's tool calls** (56-77k tokens per call): 2x 176-242M
+  tokens, 3x 264-363M, 4x 352-484M (about 630M if the slowdown lands in long sessions, the M4
+  pattern). That is 0.9-2.4 Lite weeks, $6-17 on the API. **At 2x slower GLM would spend fewer
+  tokens than Claude did**, because each of its calls carries a quarter of the context.
 
 **Linux comparison:** pending — `scripts/linux_audit_surface.sh` (firecracker / minimal /
 host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.

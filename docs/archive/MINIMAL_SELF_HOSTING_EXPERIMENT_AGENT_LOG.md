@@ -1733,3 +1733,11 @@ output per million, GLM-5.3 $1.4 / $0.26 / $4.4.
   about $15-20.
 - **Not in these numbers:** the Claude supervisor's tokens (briefs, steering, console verification), and since the 10-29 switch
   Claude executing the rustc, cargo, git clone and CoW-fork milestones. No GLM cost exists for that class of milestone.
+
+**The Claude side (same day, from the Claude Code transcripts in `~/.claude-personal`, usage fields only; streamed chunks
+deduped by message id).** Supervisor tokens per UTC day, 10-24 -> 10-30: 160M, 84M, 211M, 198M, 116M, 112M, 340M; total
+**1,221M against GLM's 569M**, more than GLM on every day (cache reads 98-99%). The execution stretch after the 10-29 switch
+(18:00Z -> 10-30, 20 active hours, ~12 milestones, 32 commits): 1,380 model calls, 1,571 tool calls, 406M tokens, ~294k per
+call. Extrapolated to GLM doing the same work at 2-4x the tool calls and the refined process's 56-77k tokens per call:
+176-242M (2x), 264-363M (3x), 352-484M (4x), ~630M if the slowdown comes as long sessions; 0.9-3.1 Lite weeks, $6-23 on the
+API. An extrapolation, not a measurement: no GLM run exists for this class of milestone.
