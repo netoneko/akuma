@@ -659,6 +659,15 @@ fn task_exit_status(status: u32) -> ! {
     akuma_threading::x86_finish_current()
 }
 
+/// The pid of the thread GROUP slot `slot` belongs to: the registered
+/// `Process`'s `tgid` (a `clone_thread` Process carries its leader's), else the
+/// slot's own pid. Children are stamped with and matched against this, so a
+/// child forked by one thread can be waited on by another.
+fn group_pid(slot: usize) -> u32 {
+    let pid = slots()[slot].pid;
+    akuma_exec::process::table::with_process(pid, |p| p.tgid).unwrap_or(pid)
+}
+
 /// The slot that owns the process `cur` belongs to: the one non-thread slot
 /// running against the same task record. `cur` when it is not a thread.
 fn group_leader(cur: usize) -> usize {
@@ -1068,7 +1077,7 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
             // decision: wait* on a non-child is ECHILD and never blocks.
             // A child belongs to the thread GROUP: cargo forks from a job thread
             // and another thread waits on it (`wait4` compares group pids).
-            stamp_child_parent(pid, slots()[group_leader(cur)].pid);
+            stamp_child_parent(pid, group_pid(cur));
             u64::from(pid)
         }
         // The refusal line is the evidence this slice hunts for; name the
@@ -1908,7 +1917,7 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
     // slots are reused). This is the crate's is_child_of_group waiter side:
     // wait* reaps only children registered to THIS pid, answers ECHILD for a
     // stranger's, and never parks on one (akuma-exec children.rs:42).
-    let my_pid = slots()[group_leader(my_tid)].pid;
+    let my_pid = group_pid(my_tid);
     loop {
         // SAFETY: syscall-path discipline.
         let s = slots();
