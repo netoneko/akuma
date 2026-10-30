@@ -233,14 +233,21 @@ usage API; full method and tables in the agent log, "GLM tokenomics from the goo
   dependencies; rustc's dep-info gives the exact files compiled, which is how the audit counts.
 - **Ownership for hardware**: `FrameLease` guards for DMA buffers, `DmaArray<E, N, Align>` with a
   borrow word, `#[must_use]` on PSCI calls.
-- **Traits and generics as seams**: `NetRuntime`, `Filesystem`, virtio's `Transport`;
-  `akuma-locks-rw-cell` is generic over `T` so `akuma-ext2` could take `forbid(unsafe)`.
+- **Dependency injection through traits**: a crate states what it needs as a trait (or a callback
+  table) and the composition root supplies it - `akuma-net`'s `NetRuntime` (taoxichuan plugs in a
+  TSC clock, an RDRAND RNG and no-op park/wake), the `Filesystem` trait `akuma-ext2` implements,
+  virtio's `Transport`. So a crate can be swapped for a replacement, a better one or an
+  experimental one without touching its users; generics do the same at zero cost
+  (`akuma-locks-rw-cell` is generic over `T`, which is what let `akuma-ext2` take
+  `forbid(unsafe)`).
 - **Macros for single-source tables**: one `syscall_table!` row generates the enum and both
   architectures' decode and encode, so a transposed syscall number can only be transposed once.
 - **LTO and linker GC**: composed-in code that is never called costs nothing at run time (`fdt` and
   `zerocopy` have 0 symbols in taoxichuan's ELF).
-- **The same tools apply to verification**: Kani, Miri and Verus all work on ordinary Rust crates,
-  and the pure crates are already shaped for them.
+- **Practical tests, not formal tools**: the tree uses no Kani, Miri or Verus and has not needed
+  them; correctness comes from host tests, exhaustive model checkers written as tests, differential
+  tests, and the same static binaries run on Linux and Akuma. The formal tools remain available
+  for ordinary Rust crates if a component ever needs them.
 - Future possibility: **crate sets preconfigured for a language runtime** (Rust std + tokio, or
   Go), selected with cargo features from the runtime's syscall census. Go is the next thing to try
   on taoxichuan: on the full kernel it started working in the same stretch as cargo building the
