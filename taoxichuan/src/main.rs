@@ -2118,7 +2118,15 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
             Some(1) => return sock::read_arm(fd, buf_va, len),
             Some(2) => return child::read_child_out(slot_idx, buf_va, len),
             Some(3) => return eventfd_read_arm(slot_idx, buf_va),
-            Some(4) => return pipes::read_arm(pipe_id as u32, buf_va, len),
+            Some(4) => {
+                // O_NONBLOCK: an empty pipe/socketpair with live writers answers
+                // EAGAIN instead of parking (curl's and c-ares' wakeup pair read
+                // would otherwise block forever and hang cargo's index fetch).
+                if fd_table().is_nonblock(fd as u32) && !pipes::readable(pipe_id as u32) {
+                    return e(ring3::err::EAGAIN);
+                }
+                return pipes::read_arm(pipe_id as u32, buf_va, len);
+            }
             _ => {}
         }
         let mut chunk = [0u8; 512];
