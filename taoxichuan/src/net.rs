@@ -424,6 +424,20 @@ pub fn net_init() -> bool {
 pub fn sleep_until(deadline_us: u64) {
     while uptime_us() < deadline_us {
         netpoll();
-        wait_lap();
+        // A slotted task polling in the kernel is IF-masked, so the tick never
+        // preempts it: if another task is READY (rustc's gcc child, forked
+        // while this one waited on its pipes) it would starve forever. Hand
+        // over the core, keeping the syscall stub's user-rsp stash across it.
+        let slot = crate::exec_twin::current_slot();
+        if slot != crate::exec_twin::NO_SLOT
+            && slot < crate::child::NSLOTS
+            && akuma_threading::x86_runnable_exists()
+        {
+            let stash = akuma_ring3_amd64::user_rsp_stash();
+            akuma_threading::x86_yield();
+            akuma_ring3_amd64::set_user_rsp_stash(stash);
+        } else {
+            wait_lap();
+        }
     }
 }

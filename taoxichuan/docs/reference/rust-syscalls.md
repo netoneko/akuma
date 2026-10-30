@@ -61,3 +61,13 @@ per-step costs is `PLAN-pn.md` §3.
 Served since this page was written, each with the A/B or gate that showed it: the legacy path numbers (`akuma-syscalls-abi::legacy`, one fold for amd64 and this kernel), real `mprotect` (PTE re-map; `PROT_NONE` stays a no-op), `sigaltstack` (per-task record), `membarrier` (decode from `akuma-syscalls-mem`), `chdir`/`fchdir`/`getcwd` with a per-task cwd, `futex` (effects in `futex.rs` over `akuma-syscalls-sync`), `clone(CLONE_THREAD)` through `akuma_exec::process::clone_thread` (threads share their creator's task record, `TASK_OF`), `set_tid_address`/`gettid`, `fsync`/`fdatasync`/`sync`/`syncfs` (`fs.sync()`), `/dev/urandom`, `socketpair(AF_UNIX)` (two cross-wired pipes: a byte stream, not `SEQPACKET` messages), 1 GiB mmap / 256 MiB brk slabs, argv/env up to 128 strings of 4 KiB.
 Measured: `rustc --version` exits 0 from an ssh shell; `rustc hello.rs` reaches the link step (all codegen runs); `git clone git://...` completes. `[nosys]` still printed: `sendfile` (40), `mount`/`umount2` (165/166, apk's busybox trigger), `sched_getaffinity` (204), `prctl` (157). Not served: `sendmsg`/`recvmsg` with `SCM_RIGHTS` on a socketpair, signals beyond no-ops (S8), writable `MAP_SHARED` + `msync` (S7: without it a linker writes a 0-byte output while cargo reports success), `linkat` (ext2 op), `pwrite64`/`pwritev2` coverage for cargo.
 A program run AS init (`init=.../rustc`) cannot create a thread: init is not a registered Process (`pm` S1).
+
+
+## rustc links and runs (2026-10-30)
+
+`rustc hello.rs -o hello && ./hello` works in the guest (TCG): musl `posix_spawn`
+(`clone(CLONE_VM|CLONE_VFORK)`, entered at the child's stack through `fork_process`), the
+spawn-error pipe as a `socketpair` (`send`/`recv` on it), `ioctl(FIONBIO)`, a polling task yields
+to a READY child, execve of any argv/env length (an 8-page initial stack), 1024 fd slots,
+`read`/`write`/`readv`/`writev` past 1 MiB as short transfers, real `chmod`, relative execve
+paths. Incident record: `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md`.

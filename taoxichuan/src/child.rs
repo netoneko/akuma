@@ -387,14 +387,19 @@ struct SpawnArgs {
 /// returns (EFAULT for a bad pointer, ENOENT for a relative path — the
 /// spawner passes absolute paths, and ash resolves PATH itself before execve).
 fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs, u64> {
-    let mut pbuf = [0u8; 128];
+    let mut pbuf = [0u8; 512];
     let path = match crate::user_str(path_va, &mut pbuf) {
         Some(p) => String::from(p),
         None => return Err(crate::err::EFAULT),
     };
-    if !path.starts_with('/') {
+    if path.is_empty() {
         return Err(crate::err::ENOENT);
     }
+    // execve resolves a relative path against the cwd (`./hello`).
+    let path = match crate::resolve_at(ring3::open::AT_FDCWD, &path) {
+        Some(p) => p,
+        None => return Err(crate::err::ENOENT),
+    };
     let argv_ptrs = match read_ptr_array(argv_va, ARGV_MAX) {
         Some(p) => p,
         None => return Err(crate::err::EFAULT),
@@ -999,7 +1004,7 @@ fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u
 /// The NEW fork arm: `fork_process` over the registered shell. The child
 /// does NOT run here — the crate publishes it as a runnable thread and this
 /// arm returns the pid to the caller, exactly like Linux.
-fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
+fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
     // Fork lives only inside the spawned shell, the blocking arm's own rule:
     // the boot task has no registered Process, and a fork inside a fork
     // child has no stack region left.
@@ -1017,14 +1022,22 @@ fn fork_arm_real(_fr: &ring3::SyscallFrame) -> u64 {
     // (the grandchild generation), and under the REAL path a fork child owns
     // a threading stack and a syscall band of its own, so the M2 "no stack
     // region left" ceiling no longer binds.
-    if shell_depth != 1 && shell_depth != 2 && shell_depth != 3 {
+    if !(1..=8).contains(&shell_depth) {
         return crate::e(crate::err::EPERM);
     }
     let child_pid = akuma_exec::process::allocate_pid();
     // stack_ptr = 0: the child resumes at the parent's saved user RSP — the
     // syscall stub stashed it (`user_rsp_stash`) and step 6's captured
     // context carries it into the child's UserContext.
-    match akuma_exec::process::fork_process(child_pid, 0) {
+    // A vfork-style clone (CLONE_VM, musl posix_spawn) hands the child its own
+    // stack in rsi and its __clone stub pops fn/arg from it, so the child must
+    // resume there; a plain fork keeps the parent's rsp (0).
+    let child_stack = if fr.rax == ring3::nr::CLONE && fr.arg1() & 0x100 != 0 {
+        fr.arg2()
+    } else {
+        0
+    };
+    match akuma_exec::process::fork_process(child_pid, child_stack) {
         Ok(pid) => {
             // Session pj wiring of pi's PARENT_OF: the child's parent is THIS
             // task's pid — the slot ROW's pid, never the slot index (slots are
@@ -1603,7 +1616,7 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     if fr.rax == ring3::nr::CLONE && fr.arg1() & CLONE_THREAD != 0 {
         return clone_thread_arm(fr);
     }
-    if REAL_FORK && fr.rax != ring3::nr::CLONE {
+    if REAL_FORK && (fr.rax != ring3::nr::CLONE || fr.arg1() & 0x100 != 0) {
         // The new path: plain fork (57/58) through `fork_process` over the
         // registered shell Process. `clone`/`vfork` keep the M2 arm — out of
         // scope this slice.

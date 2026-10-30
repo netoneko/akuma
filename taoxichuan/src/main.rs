@@ -662,7 +662,7 @@ const WRITE_LIMIT: u64 = 1 << 20;
 /// shape for this stage. fds 0/1/2 are the console (write-only) and never
 /// enter the table; 3..SLOT_CEILING is what `openat` may hand out. The
 /// *decisions* (lowest free, close, the flag sets) are `akuma-fdtable`'s.
-const SLOT_CEILING: u32 = 16;
+const SLOT_CEILING: u32 = 1024;
 
 /// One open description: what an fd in the table names. A directory caches
 /// its `read_dir` listing at open time (this kernel's `getdents64`
@@ -1439,7 +1439,10 @@ fn lstat_path(path: &str, buf: u64) -> u64 {
         } else if ent.is_dir {
             0o40755
         } else {
-            0o100644
+            // The listing carries no permission bits; ask for the file's own
+            // (an executable must stat as one - `access(X_OK)` and `which`).
+            let full = if parent == "/" { alloc::format!("/{name}") } else { alloc::format!("{parent}/{name}") };
+            fs.metadata(&full).map(|m| m.mode).unwrap_or(0o100644)
         };
         match fill_stat64(buf, 0, mode, ent.size, if ent.is_dir { 2 } else { 1 }) {
             Ok(()) => 0,
@@ -1645,8 +1648,24 @@ fn fill_stat64(buf: u64, inode: u64, mode: u32, size: u64, links: u64) -> Result
 /// their number; only an UNBOUND fd falls to the console rules (fd 0 is
 /// EOF — the console has no input path — every other unbound number is
 /// EBADF).
+/// The (read, write) pipe ids of a socketpair end, or None for any other fd.
+fn pair_ends(fd: u64) -> Option<(u32, u32)> {
+    if (fd as u32) >= SLOT_CEILING {
+        return None;
+    }
+    fd_table()
+        .with(fd as u32, |d| match d {
+            OpenFile::Pair(r, w) => Some((*r, *w)),
+            _ => None,
+        })
+        .flatten()
+}
+
 fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
-    if len > WRITE_LIMIT || !user_ok(buf_va, len) {
+    // A transfer larger than the bound is a short one (legal for read(2));
+    // ld asks for megabytes in one call and used to get EFAULT.
+    let len = len.min(WRITE_LIMIT);
+    if !user_ok(buf_va, len) {
         return e(ring3::err::EFAULT);
     }
     if (fd as u32) < SLOT_CEILING {
@@ -1877,7 +1896,7 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
 fn trace_err(nr: u64, r: u64, a1: u64, a2: u64, a3: u64) {
     static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let v = r as i64;
-    if (-4095..0).contains(&v) && v != -11
+    if (-4095..0).contains(&v) && v != -11 && v != -2 && v != -10 && v != -25
         && SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3000
     {
         akuma_primitives::safe_print!(96, "[err] s{} nr={} {} a=0x{:x},0x{:x},0x{:x}\n", crate::exec_twin::current_slot() as i64, nr, v, a1, a2, a3);
@@ -1903,8 +1922,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     }
     match fr.rax {
         ring3::nr::WRITE => {
-            let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
-            if len > WRITE_LIMIT || !user_ok(buf, len) {
+            let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3().min(WRITE_LIMIT));
+            if !user_ok(buf, len) {
                 return e(ring3::err::EFAULT);
             }
             // Stage 7 step 1 (H3): table-first routing, the order WRITEV
@@ -1995,17 +2014,20 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     u64::from_le_bytes(iv[0..8].try_into().unwrap()),
                     u64::from_le_bytes(iv[8..16].try_into().unwrap()),
                 );
-                if len > WRITE_LIMIT || !user_ok(base, len) {
+                // Past the bound the write is a short one (legal for writev);
+                // ld flushes its whole output image in one call.
+                let len = len.min(WRITE_LIMIT - total);
+                if !user_ok(base, len) {
                     return e(ring3::err::EFAULT);
                 }
                 total += len;
-                if total > WRITE_LIMIT {
-                    return e(ring3::err::EFAULT);
-                }
                 let off = data.len();
                 data.resize(off + len as usize, 0);
                 if !copy_from_user(&mut data[off..], base) {
                     return e(ring3::err::EFAULT);
+                }
+                if total >= WRITE_LIMIT {
+                    break;
                 }
             }
             let mut efd_idx: usize = usize::MAX;
@@ -2217,7 +2239,25 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::GETPPID => 1, // everything here is the init task's child
         ring3::nr::GETUID | ring3::nr::GETEUID => 0,
         ring3::nr::GETGID | ring3::nr::GETEGID => 0,
-        ring3::nr::IOCTL => e(ring3::err::ENOTTY), // the console is a serial line, not a tty
+        ring3::nr::IOCTL => {
+            // FIONBIO (Rust std's read2 on a child's pipes): the same bit as
+            // fcntl F_SETFL O_NONBLOCK. Everything else: no tty here.
+            const FIONBIO: u64 = 0x5421;
+            let fd = fr.arg1();
+            if fr.arg2() == FIONBIO && fd > 2 && (fd as u32) < SLOT_CEILING {
+                let mut v = [0u8; 4];
+                if !user_ok(fr.arg3(), 4) || !copy_from_user(&mut v, fr.arg3()) {
+                    return e(ring3::err::EFAULT);
+                }
+                if u32::from_ne_bytes(v) != 0 {
+                    fd_table().set_nonblock(fd as u32);
+                } else {
+                    fd_table().clear_nonblock(fd as u32);
+                }
+                return 0;
+            }
+            e(ring3::err::ENOTTY) // the console is a serial line, not a tty
+        }
         ring3::nr::MMAP => {
             let (addr, len, prot, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
             let fd = fr.arg5();
@@ -2393,7 +2433,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     u64::from_le_bytes(iv[0..8].try_into().unwrap()),
                     u64::from_le_bytes(iv[8..16].try_into().unwrap()),
                 );
-                if len > WRITE_LIMIT || !user_ok(base, len) {
+                let len = len.min(WRITE_LIMIT);
+                if !user_ok(base, len) {
                     return e(ring3::err::EFAULT);
                 }
                 if len == 0 {
@@ -3056,7 +3097,18 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // above will say if this one is real.
             e(ring3::err::ENOSYS)
         }
-        ring3::nr::FCHMOD | ring3::nr::FCHMODAT => 0, // root's mode is the mode
+        ring3::nr::FCHMODAT => {
+            // The mode bits are real (ext2's chmod): ld chmods its output
+            // executable, and an exec of a file without the bit is refused.
+            let (dirfd, mode) = (fr.arg1(), fr.arg3() as u32 & 0o7777);
+            path_at(fr.arg2(), dirfd, |p| {
+                match root_fs().chmod(&resolve_effective(p), mode) {
+                    Ok(()) => 0,
+                    Err(err) => e(fs_err(err)),
+                }
+            })
+        }
+        ring3::nr::FCHMOD => 0, // no path behind an open fd here; path chmod is the real one
         ring3::nr::FCHOWNAT => 0,                    // everything is root already
         ring3::nr::UMASK => 0o022,                   // conventional; no files inherit it
         ring3::nr::FLOCK => 0,                       // one task: nothing contends
@@ -3242,6 +3294,18 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::LISTEN => sock::listen_arm(fr.arg1(), fr.arg2()),
         ring3::nr::ACCEPT => sock::accept_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::CONNECT => sock::connect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        ring3::nr::SENDTO if pair_ends(fr.arg1()).is_some() => {
+            // A socketpair end is two pipes; send/recv are write/read on it.
+            let (_, wr) = pair_ends(fr.arg1()).unwrap_or((0, 0));
+            if fr.arg3() > WRITE_LIMIT || !user_ok(fr.arg2(), fr.arg3()) {
+                return e(ring3::err::EFAULT);
+            }
+            pipes::write_arm(wr, fr.arg2(), fr.arg3())
+        }
+        ring3::nr::RECVFROM if pair_ends(fr.arg1()).is_some() => {
+            read_fd_arm(fr.arg1(), fr.arg2(), fr.arg3())
+        }
+        ring3::nr::SHUTDOWN | ring3::nr::SETSOCKOPT if pair_ends(fr.arg1()).is_some() => 0,
         ring3::nr::SENDTO => {
             sock::sendto_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), 16)
         }
@@ -3892,13 +3956,11 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // The stack, then the initial block on it. The block is < half a page and
     // ends at `USER_STACK_TOP`, so it lands entirely in the top page.
     let stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
-    let mut stack_top_pa = 0u64;
+    let mut stack_pas = [0u64; USER_STACK_PAGES as usize];
     let mut pva = stack_base;
     while pva < USER_STACK_TOP {
         let pa = akuma_pmm::alloc_page_zeroed()?;
-        if pva + 4096 == USER_STACK_TOP {
-            stack_top_pa = pa as u64;
-        }
+        stack_pas[((pva - stack_base) / 4096) as usize] = pa as u64;
         if !paging::map_page_in(root, pva as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
             return None;
         }
@@ -3931,23 +3993,29 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // parsed that duplicate as a package name ("unable to select packages:
     // apk.static (no such package)") while `--version` (G2) and `sh -c`
     // (G1, the dup landed as $0) never noticed.
-    let mut full_argv: [&str; MAX_ARGV] = [""; MAX_ARGV];
-    let n_args = argv.len().min(MAX_ARGV);
-    full_argv[..n_args].copy_from_slice(&argv[..n_args]);
+    // No fixed argv/env caps here: the block below is sized in pages. rustc's
+    // linker line is ~50 arguments and `collect2` hands `ld` all of them (the
+    // old 16-entry copy truncated it: `ld: no input files`).
+    let full_argv: &[&str] = argv;
+    let n_args = argv.len();
     // One full page, not the old 512: `build_stack` lays the block out from
     // `buf.len()` backwards and `apk`'s long argv/env (`--allow-untrusted add
     // /pkgs/...` plus sshd's environment) overran 512 by exactly the 8 bytes
     // of one pointer word — the underflowed slice index panicked the kernel
     // on the first real install. The block still ends at `USER_STACK_TOP` and
     // now fills the top page exactly, which the copy below already handles.
-    let mut block = [0u8; 4096];
+    const BLOCK_PAGES: usize = 8;
+    let mut block = alloc::vec![0u8; BLOCK_PAGES * 4096];
     let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &full_argv[..n_args], env, &aux);
 
     // SAFETY: the top stack page is a mapped task frame; the block ends at
     // `USER_STACK_TOP`, so its bytes sit at `page_pa + (4096 - block.len())`.
-    let dst = phys::phys_ptr::<u8>(stack_top_pa + (4096 - block.len() as u64));
-    unsafe {
-        core::ptr::copy_nonoverlapping(block.as_ptr(), dst, block.len());
+    for k in 0..BLOCK_PAGES {
+        let pa = stack_pas[USER_STACK_PAGES as usize - BLOCK_PAGES + k];
+        let dst = phys::phys_ptr::<u8>(pa);
+        unsafe {
+            core::ptr::copy_nonoverlapping(block.as_ptr().add(k * 4096), dst, 4096);
+        }
     }
 
     // The heap slabs: `brk` above the image, `mmap` in its own window. Both

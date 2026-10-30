@@ -341,7 +341,7 @@ pub const AT_BASE: u64 = 7;
 /// Most `argv`+`envp` strings whose addresses the builder will remember.
 /// The composed kernel passes one argv entry and no env; the bound is a
 /// sanity check, not a resource decision.
-const MAX_STRS: usize = 32;
+const MAX_STRS: usize = 512;
 
 /// Lay out the initial user stack into `buf`, whose **last** byte is the last
 /// byte of the stack page at `stack_top` (i.e. `buf` is the tail of the stack,
