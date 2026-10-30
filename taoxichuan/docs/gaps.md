@@ -14,6 +14,9 @@ first.
 | G5 | **No linker yet**: `rustc hello.rs` reaches `cc` and the spawn needed `socketpair` (added 2026-10-30; the link itself is being retried) | `rustc -C codegen-units=1 hello.rs -o hello` over ssh |
 | G6 | **HTTPS `git clone` / TLS in the guest** untested | `git clone https://...` |
 | G3 | **No pump while a spawned child runs** | TCP state stalls during a long-running spawned child; frames move again at its exit (`reference/devices.md` § the pump) |
+| G7 | **The guest sshd corrupts binary stdin and truncates large stdout** | `gzip -c x \| ssh guest 'tar xz'` → `gzip: invalid magic`; `base64 <1.4 MB file>` over ssh arrives truncated — pull binaries in `sed -n 'a,bp'` chunks and verify the md5 (`TAOXICHUAN_FIXED_POINT.md` § pitfalls) |
+| G8 | **`-j8` in-guest build fails; `-j4` is clean** | 3 GiB: `mmap` ENOMEM, free pages 0, OOM by frame exhaustion; 8 GiB: `#GP` in the dynamic linker, unexplained — `cargo build -j8 -p <small crate>` in the guest reproduces; `-j4` passed 5/5 fresh boots (`TAOXICHUAN_BUGS_FOUND_2026_10_30.md` §2) |
+| G9 | **No epoll** (`epoll_create` 213, `epoll_ctl` 233, `epoll_wait` 232, `epoll_pwait` 281/291) | any event loop: `userspace/epollprobe`, or watch `[nosys] nr=232` on a boot; the unserved list is in [`reference/syscalls.md`](reference/syscalls.md) § still missing — the epoll brief is `scripts/kvm/goose/epoll-babysit.md` (a separate, later task) |
 
 ## Pinned exclusions (deliberate, load-bearing — not bugs)
 
@@ -42,7 +45,7 @@ first.
 ### The rustc syscall list
 
 Scored against `docs/archive/RUST_TOOLCHAIN.md` in
-[`reference/rust-toolchain.md`](reference/rust-toolchain.md): **7 of 10
-served (70%)**; the missing 30% is the AF_UNIX family (`socketpair`,
-`recvmsg`/`sendmsg`) plus `close_range`, which is the stage-9 blocker in
-dependency order.
+[`reference/rust-toolchain.md`](reference/rust-toolchain.md): the AF_UNIX
+family (`socketpair`, `sendmsg`/`recvmsg`) is **served** as of 2026-10-30
+(two cross-wired pipes; no `SCM_RIGHTS`), which moves the named blockers to
+`close_range` and the epoll family (G9) — rescore the census before stage 9.
