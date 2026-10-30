@@ -31,3 +31,8 @@ marker bit local to `main.rs`).
 - Kernel writes into a shared read-only **unmarked** page are not intercepted (no caller does that).
 - vfork-style `clone(CLONE_VM)` and threads were not re-audited beyond the battery; they share a root and never run the share loop.
 - `COW_REFCOUNTS` is a `BTreeMap`: a fork of a 100k-page image allocates ~100k heap nodes until the frames are released.
+
+## Found while setting up the -j4 run: O_APPEND was ignored
+`echo b >> f` overwrote from offset 0 (file ended up as the last line only), so a `printf ... >> Cargo.toml` destroyed the manifest
+("missing either a `[package]` or a `[workspace]`"). `openat` now starts an `O_APPEND` (0x400) description at the end of the file
+(`taoxichuan/src/main.rs`, the `resolve_inode` arm). Not re-seeked per write: two writers sharing one description can still interleave.

@@ -1765,7 +1765,12 @@ fn open_common(path: &str, flags: u64) -> u64 {
                     return e(ring3::err::EIO);
                 }
                 let size = if trunc { 0 } else { md.size };
-                OpenFile::File { inode, offset: 0, size }
+                // O_APPEND (0x400): writes land at the end. The description
+                // starts there (`echo b >> f`, cargo's manifest edits); it is
+                // not re-seeked per write, so a second writer on a shared
+                // description can still interleave.
+                let offset = if flags & 0x400 != 0 { size } else { 0 };
+                OpenFile::File { inode, offset, size }
             }
             Err(_) => return e(ring3::err::EIO),
         }
