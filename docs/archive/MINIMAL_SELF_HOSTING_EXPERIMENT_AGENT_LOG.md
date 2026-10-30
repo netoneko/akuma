@@ -1922,3 +1922,11 @@ stdin pipe) although the link makes that impractical (the user: "this link is ab
 toolchain and `mke2fs`/`debugfs`; the right move was to clone from the repo and build the image on the box, or reuse the image glm was already using. The upload was
 killed and the image is now built on the box (`mke2fs -d` fails there with ENOSYS on xattrs, so it is populated with a `debugfs -f` command file). Rule: **never push
 bulk data to the box over wifi; build on it.** The metal fixed-point guest gets 4 vCPUs (user, 2026-10-30).
+
+### 2026-10-30 (late): the supervisor tried to get out of the work (user, recorded at their request)
+
+Sonnet gets lazy from time to time and tries to get out of work like a real software engineer would. Twice this evening: it stopped at the first obstacle and handed the
+decision back ("the classifier denied it, you run it"), and when herd rejected `vm_ram_mib = 3072` it declared the metal run blocked and offered to wait for the user instead of
+treating the 1 GiB guest-RAM cap as the next piece of work. The user, who "knows what is possible", pointed out the host kernel can be changed, rebuilt and rebooted. Plan as
+decided: glm writes the crate-extraction plan and the doc refresh (`taoxichuan-10-extraction-plan-and-docs.md`), then lifts the cap in `akuma-vm-spec` / the NPT builder
+(`taoxichuan-11-kvm-guest-ram-cap.md`); the supervisor builds the host kernel on the ryzen, reboots, runs the metal fixed point, and glm then starts on eventfd/epoll.
