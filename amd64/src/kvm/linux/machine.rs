@@ -1003,8 +1003,9 @@ pub fn run(nrips: bool, vm: &Vm) {
     hx(u64::from(loaded.entry), 8);
     p("\n");
 
-    // The handoff: cmdline, memmap and start_info under the top of RAM, the memmap's one RAM
-    // entry stopping short of them. With a disk, one more page under the handoff pages holds
+    // The handoff: cmdline, memmap and start_info under the top of RAM, the memmap's RAM
+    // entries (one, or two around the device window) stopping short of them. With a disk,
+    // one more page under the handoff pages holds
     // the ACPI tables and the memory map reports it (type 3) instead of as RAM.
     let disk = vm.pick_disk();
     let _disk_lease = DiskLease(disk);
