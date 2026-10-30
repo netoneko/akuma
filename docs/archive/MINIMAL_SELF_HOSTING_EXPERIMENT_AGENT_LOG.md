@@ -1758,3 +1758,22 @@ The 1,083 text-only turns are the 5-minute polls, each re-sending ~237k tokens o
 whole-experiment spend. Waking on the driver's exit instead (`scripts/kvm/goose/supervise-loop.sh`, one wake per goose
 session, ~150) would have saved roughly 200M. Per milestone: ~50M Claude tokens per supervised GLM milestone (10-26 ->
 10-29) against ~34M per Claude-executed one.
+
+**EXTRAPOLATION (same day; not a measurement): the project on GLM alone, supervision not counted.** The user does not count
+the supervision tokens: with a proper process (event-driven waiting, briefs that hold) supervision is unnecessary or much
+cheaper. Claude's coding model calls from the classification above - executing stretch 1,056 (read source, edit, build/test,
+boot waits) or 1,207 with the commits and doc updates the process requires, plus 589 coding calls during the supervision era -
+are 1,645-1,796. At the user's assumed 2-4x as many calls for GLM, and the refined process's 56-77k tokens per call:
+
+| GLM slower by | GLM calls | GLM tokens | + GLM's actual 569M | Lite weeks | API $ (total) |
+|---|---:|---:|---:|---:|---:|
+| 2x | 3,290-3,592 | 184-277M | 753-846M | 3.8-4.2 | 32-35 |
+| 3x | 4,935-5,388 | 276-415M | 845-984M | 4.2-4.9 | 35-40 |
+| 4x | 6,580-7,184 | 368-553M | 937M-1.12B | 4.7-5.6 | 38-45 |
+
+Cross-check: Claude's ~12 executed milestones at GLM's refined median (16M) give ~192M, inside the 2x row. One Lite month is
+~866M, so at 2x the whole project so far fits in about one $18 month of GLM quota, learning phase included.
+**Why it stays an extrapolation:** no GLM run exists for the rustc / cargo / threads / CoW-fork class of milestone; the 2-4x
+factor is assumed; the refined process was itself Claude-supervised; the Lite quota's ~50 credits per million (against the
+formula's ~36) is unexplained. **User's assessment:** the experiment was flawed and ultimately inconclusive, but the initial
+claim - an open model can build your own stack in a short time for little money - still looks plausible on these numbers.

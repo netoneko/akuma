@@ -154,6 +154,21 @@ usage API; full method and tables in the agent log, "GLM tokenomics from the goo
   tokens per supervised GLM milestone (10-26 -> 10-29, on top of GLM's own ~32M) against ~34M per
   milestone when Claude executed (and those were the harder ones). Token counts, not money: a
   Claude token and a GLM-Flash token are priced differently.
+- **EXTRAPOLATION, not a measurement - the whole project on GLM alone, supervision not counted**
+  (the user's position: with a proper process supervision is unnecessary or much cheaper). Claude's
+  coding calls only (read source, edit, build/test, boot waits; plus the commits and docs the
+  process requires): 1,645-1,796 model calls. Redone by GLM at 2-4x as many calls and 56-77k tokens
+  per call: **184-553M GLM tokens**. Two independent methods agree at the low end: 2x gives
+  184-277M, and Claude's ~12 milestones at GLM's refined median (16M each) give ~192M.
+  Added to GLM's actual 569M (learning phase included): **753M-1.12B tokens, 3.8-5.6 Lite weeks,
+  $32-45 on the pay-as-you-go API**; at 2x that is **about one $18 Lite month (~866M)**.
+- **What keeps it an extrapolation:** no GLM run exists for the hardest class of milestone (rustc,
+  cargo, threads, CoW fork - Claude executed those); the 2-4x factor is the user's assumption, not
+  a measurement; the refined process was itself Claude-supervised; and the Lite quota charged ~40%
+  more per token than z.ai's published formula, unexplained.
+- **The user's assessment (2026-10-30):** the experiment was flawed and ultimately inconclusive, but
+  the initial claim - that your own stack can be built by open models in a short time for little
+  money - still looks plausible on these numbers.
 
 **Linux comparison:** pending — `scripts/linux_audit_surface.sh` (firecracker / minimal /
 host configs of 6.18) is building; numbers go in `AUDIT_SURFACE_METHODOLOGY.md` and here.
