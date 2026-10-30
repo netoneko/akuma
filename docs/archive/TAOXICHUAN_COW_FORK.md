@@ -36,3 +36,13 @@ marker bit local to `main.rs`).
 `echo b >> f` overwrote from offset 0 (file ended up as the last line only), so a `printf ... >> Cargo.toml` destroyed the manifest
 ("missing either a `[package]` or a `[workspace]`"). `openat` now starts an `O_APPEND` (0x400) description at the end of the file
 (`taoxichuan/src/main.rs`, the `resolve_inode` arm). Not re-seeked per write: two writers sharing one description can still interleave.
+
+## Ryzen/KVM verification of `-j4` in a 3 GiB guest (2026-10-30, Pop OS, `scripts/kvm/taoxichuan_pop.sh`)
+`cargo build -j4` of serde + serde_json + fastrand straight from crates.io, cold registry, `trace-err` kernel:
+- pre-CoW `4428104c`, 8 GiB: pass, 3m06. CoW `537cf220`, 8 GiB: pass, 3m03. CoW + O_APPEND `3839b9a7`, 8 GiB: pass, 3m07.
+- `3839b9a7` at **3072 MiB**: pass x5 (3m06-3m52); the last reap line shows free pages back at 654005 (baseline 654000), 1,006,482 frames
+  shared and 2,107 copied over the run. So the 8 GiB requirement is gone.
+- **Unexplained, not reproduced:** the very first attempt at 3072 MiB on KVM, and one on local TCG, wedged mid-build (`[hang] idle for 20 s`,
+  every thread parked in futex 202 with timeouts, `cowrefs` ~14k, ssh dropped with "server not responding"). 0 of the next 5 runs hung.
+  Both wedged runs used `cargo new` + `printf >> Cargo.toml`; two passing runs used the same shape (edition 2024), so that is not it.
+  If it recurs, the `[hang] fx` futex trace in the console is the starting point.

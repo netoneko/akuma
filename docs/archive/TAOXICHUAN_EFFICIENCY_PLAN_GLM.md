@@ -1,3 +1,5 @@
+> **Correction (user, 2026-10-30): the read(2) stage profiler already exists as a crate** - table row 5 and slice 4 below are redundant; use the crate instead of porting `read_profile.rs`.
+
 # Taoxichuan: what to learn from the amd64 and AArch64 kernels to be more efficient
 
 **PLAN — GLM planning session, 2026-10-30. Planning only; no code changed.**
