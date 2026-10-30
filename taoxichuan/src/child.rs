@@ -1066,7 +1066,9 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
             // alternating for pids 29..37; pids are monotonic). The wait4
             // reapers consult the map for the crate's is_child_of_group
             // decision: wait* on a non-child is ECHILD and never blocks.
-            stamp_child_parent(pid, slots()[cur].pid);
+            // A child belongs to the thread GROUP: cargo forks from a job thread
+            // and another thread waits on it (`wait4` compares group pids).
+            stamp_child_parent(pid, slots()[group_leader(cur)].pid);
             u64::from(pid)
         }
         // The refusal line is the evidence this slice hunts for; name the
@@ -1906,7 +1908,7 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
     // slots are reused). This is the crate's is_child_of_group waiter side:
     // wait* reaps only children registered to THIS pid, answers ECHILD for a
     // stranger's, and never parks on one (akuma-exec children.rs:42).
-    let my_pid = slots()[my_tid].pid;
+    let my_pid = slots()[group_leader(my_tid)].pid;
     loop {
         // SAFETY: syscall-path discipline.
         let s = slots();
