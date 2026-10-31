@@ -210,6 +210,14 @@ pub fn read_arm(id: u32, buf_va: u64, len: u64, nonblock: bool) -> u64 {
             // contract, and what mio's nonblocking pipe reads expect). A
             // partial read stays short; only a NOTHING-yet read is EAGAIN.
             if nonblock {
+                // Empty can mean EOF as well as "writers still live": `readable` is true for a pipe a
+                // blocking read would not wait on (data, or every writer gone), and nothing was read
+                // here, so true is EOF - which is `0`, not `EAGAIN`. Answering `EAGAIN` for EOF made a
+                // non-blocking reader (cargo's `read2`) poll, read, and retry for ever
+                // (`docs/archive/TAOXICHUAN_CARGO_STALL_REGRESSION.md`).
+                if table(|t| t.readable(id)) {
+                    break;
+                }
                 return if total > 0 { total } else { crate::e(ring3::err::EAGAIN) };
             }
             let Some(tid) = may_park() else {

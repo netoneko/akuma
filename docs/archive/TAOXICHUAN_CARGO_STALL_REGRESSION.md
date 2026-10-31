@@ -1,6 +1,6 @@
 # Taoxichuan: `cargo build` stalls after the first `rustc -vV` (regression hunt, 2026-10-31)
 
-**Status: OPEN - cause not found; first bad commit bracketed to four commits.** Stability: C.
+**Status: FIXED 2026-10-31** (`taoxichuan/src/pipes.rs`, `read_arm`). Found by bisect plus a two-way split of the first bad commit. Stability: C.
 
 ## Symptom
 In the self-hosting guest (p3 root, `/usr/local/rust`, `HOME=/root`), `cargo build --release --target x86_64-unknown-none -p taoxichuan --features no-tests,trace-err -j4`
@@ -19,6 +19,17 @@ A periodic dump (`trace-err` builds; `main.rs`'s tick handler and `sock.rs`'s `p
 (`exit_group`) are exited children awaiting reap: `INFLIGHT` is set at syscall entry and an exiting task never clears it, so that line is stale, not a hang.
 `timeout=-1` takes `poll_arm`'s unbounded branch (a 60 s cap plus the thread-interrupt check); a user-visible `-1` is the only argument cargo's loop passes.
 
+## Root cause and fix
+The first bad commit is **`cf44f840`** (`glm`'s WIP snapshot); `8faf6580`, `3f5069cc`, `db199554`, `51533d4d` and `eadfee8c` all build the tree (40-45 `rustc` launches). Its delta is two things: the epoll edge-drain hooks after every
+read/write, and `O_NONBLOCK` handling in `pipes::read_arm` / `write_arm`. On top of the then-current tree, disabling only the non-blocking branches restored cargo (46 `rustc` launches); disabling only the hooks did not (33,513 polls, one `rustc`).
+
+`read_arm`'s `res.bytes == 0` means "empty, writers still live" **or EOF (every writer gone)**. The new branch answered `EAGAIN` for both. Cargo's `read2` sets both child pipes `O_NONBLOCK` and loops poll -> read: `poll` correctly reports the
+finished pipe readable (EOF is readable), `read` answered `EAGAIN` ("not yet"), so the loop polled again for ever. Fix: on a non-blocking read of an empty pipe, `readable(id)` (true when a blocking read would not wait) means EOF, which is `0`; only a pipe
+that is empty with live writers is `EAGAIN`. The write side did not need it: `table.write` reports vanished readers as `BrokenPipe` before the "full" branch. Verified: with the fix, `bis_run.sh` shows 46 `rustc` launches and a progressing build.
+
+(The earlier reading of the ring - polls with no `read` between - was misleading: the ring is read last-first and the spin is hundreds of polls per second, so a `read` that returns `EAGAIN` between them is easy to miss. The poll dump
+showing `5:1->1[R] 7:1->1[R]` was right: both child pipes were at EOF.)
+
 ## Not the cause (each tested)
 * **SMP.** The same stall at `smp=1`, and on the kernel from the start of the session (`1c89a293`, before any SMP commit). The SMP, `rt_sigsuspend`, sshd-keepalive and
   extraction work all landed after the regression exists.
@@ -34,16 +45,17 @@ A periodic dump (`trace-err` builds; `main.rs`'s tick handler and `sock.rs`'s `p
 | `6af48c06` | the fixed point (K0, cooperative sshd) | many, 3 in parallel | good |
 | `eadfee8c` | init is pid 1 on a pool thread; sshd forks per session | 40 | good |
 | `51533d4d` | the epoll family + `prctl` | 41 | good |
-| `cf44f840` | `glm` WIP: edge-trigger drain hooks, **O_NONBLOCK pipe read/write**, `console_session` | 1 | **bad** |
+| `3f5069cc`, `db199554`, `8faf6580` | init's output, boot session fd 1/2, the merge | 45 / 41 / 40 | good |
+| `cf44f840` | `glm` WIP: edge-trigger drain hooks + **O_NONBLOCK pipe read/write** | 1 | **bad** (first) |
 | `d6ee7d97` | threading: fresh-thread trampoline releases the outgoing `ON_CPU` gate | 1 | bad |
 | `68575856` | epoll reports a listener's accept edge | 1 | bad |
 | `1c89a293`, HEAD | eventfd re-arm; this session | 1 | bad |
 
-First bad commit is one of `3f5069cc`, `db199554`, the merge `8faf6580`, `cf44f840` - **`3f5069cc`/`db199554`/`8faf6580` are not yet built or tested individually.**
+`3f5069cc` 45, `db199554` 41, the merge `8faf6580` 40 `rustc` launches: all good, so the first bad commit is `cf44f840` itself.
 `git diff 51533d4d cf44f840 -- taoxichuan/src/pipes.rs` gives `read_arm(.., nonblock)` / `write_arm(.., nonblock)`: a non-blocking pipe read of an empty pipe now answers
 `EAGAIN` instead of parking, and a full non-blocking write likewise. Cargo's `read2` puts both child pipes into `O_NONBLOCK` and then polls.
 
-## Leading hypotheses (none proven)
+## Hypotheses considered before the split (superseded)
 1. The new `nonblock` argument is read from the wrong place for the `read` arms cargo reaches (the `a1`/`fd` bookkeeping of the drain hook shares the syscall site), so a
    non-blocking `read` is answered before it reaches the pipe, or it never issues - but then a `read` would still be in the syscall ring. It is not. **This does not explain the
    missing `read`.**
@@ -51,7 +63,10 @@ First bad commit is one of `3f5069cc`, `db199554`, the merge `8faf6580`, `cf44f8
    token pipe and a shutdown pipe, and revents it never consumes. `poll_arm` also returns `EINTR` from `take_thread_interrupted`, which `cf44f840`'s hooks interact with.
 3. A fork/spawn change leaves the parent holding an end it should have closed, so a pipe never reports its state the way the loop expects.
 
-## Next
+## Next (done / left)
+Done: named the commit, fixed. Left: a regression test - a pipe-EOF-with-O_NONBLOCK case in `epollops`/`pollhup` (the `pollhup` probe sets no `O_NONBLOCK`, which is why it passed); the full in-guest `-j4` build on 4 CPUs as the SMP gate.
+
+Original plan:
 Build and test `3f5069cc`, `db199554`, `8faf6580` to name the commit; run `outputprobe.rs` (std `Command::output()` of `rustc -vV`, written, not yet run - the guest's `rustc`
 compile of it produced no output) and the jobserver path; compare the syscall ring against the good kernel at the same point.
 
