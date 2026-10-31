@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU16, Ordering};
 #[cfg(feature = "smoltcp")]
 use core::task::Waker;
 #[cfg(feature = "smoltcp")]
-use spinning_top::Spinlock;
+use akuma_primitives::spin_report::Spinlock;
 
 #[cfg(feature = "smoltcp")]
 use crate::smoltcp_net::{self, SocketHandle, with_network};
@@ -387,7 +387,7 @@ fn alloc_ephemeral_port() -> u16 {
 /// uses this pattern for the same problem (`docs/archive/VEC_AUDIT.md` #2).
 #[cfg(feature = "smoltcp")]
 static SOCKET_TABLE: Spinlock<[Option<KernelSocket>; MAX_SOCKETS]> =
-    Spinlock::new([const { None }; MAX_SOCKETS]);
+    Spinlock::reporting("SOCKTBL", [const { None }; MAX_SOCKETS]);
 
 #[cfg(feature = "smoltcp")]
 pub(crate) fn with_table<F, R>(f: F) -> R

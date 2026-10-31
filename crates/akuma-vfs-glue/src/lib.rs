@@ -31,7 +31,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use spinning_top::Spinlock;
+use akuma_primitives::spin_report::Spinlock;
 
 // Re-export everything from the crate so existing `use crate::*` keeps working.
 pub use akuma_vfs::{
@@ -46,17 +46,17 @@ pub use akuma_isolation::Namespace;
 // Mount Table (kernel-side global)
 // ============================================================================
 
-static MOUNT_TABLE: Spinlock<Option<akuma_vfs::MountTable>> = Spinlock::new(None);
+static MOUNT_TABLE: Spinlock<Option<akuma_vfs::MountTable>> = Spinlock::reporting("MOUNT", None);
 
 // ============================================================================
 // Per-box Namespaces
 // ============================================================================
 
-static BOX_NAMESPACES: Spinlock<BTreeMap<u64, Arc<Namespace>>> = Spinlock::new(BTreeMap::new());
+static BOX_NAMESPACES: Spinlock<BTreeMap<u64, Arc<Namespace>>> = Spinlock::reporting("BOXNS", BTreeMap::new());
 
 /// Per-thread namespace override for ELF loading during spawn.
 /// When set, `with_fs` uses this namespace instead of the calling process's.
-static SPAWN_NS_OVERRIDE: Spinlock<BTreeMap<usize, Arc<Namespace>>> = Spinlock::new(BTreeMap::new());
+static SPAWN_NS_OVERRIDE: Spinlock<BTreeMap<usize, Arc<Namespace>>> = Spinlock::reporting("SPAWNSO", BTreeMap::new());
 
 /// Set a namespace override for the current thread. All `with_fs` calls
 /// on this thread will resolve through the given namespace until cleared.
@@ -246,7 +246,7 @@ pub fn sync_all_filesystems() -> Result<(), FsError> {
 /// `Weak`, not `Arc`, so a registration cannot pin an unmounted filesystem forever.
 const MAX_REAPABLE_MOUNTS: usize = 4;
 static REAPABLE_MOUNTS: Spinlock<[Option<Weak<dyn Filesystem>>; MAX_REAPABLE_MOUNTS]> =
-    Spinlock::new([const { None }; MAX_REAPABLE_MOUNTS]);
+    Spinlock::reporting("REAPMNT", [const { None }; MAX_REAPABLE_MOUNTS]);
 
 /// Record a mount for the sweep, reusing a slot whose filesystem has been dropped.
 ///
@@ -1060,7 +1060,7 @@ fn resolve_same_mount(
 // ============================================================================
 
 /// Legacy in-memory symlink table (fallback for filesystems that don't support symlinks)
-static SYMLINKS: Spinlock<Option<BTreeMap<String, String>>> = Spinlock::new(None);
+static SYMLINKS: Spinlock<Option<BTreeMap<String, String>>> = Spinlock::reporting("SYMLNK", None);
 
 pub fn create_symlink(link_path: &str, target: &str) -> Result<(), FsError> {
     // Try on-disk first via the mounted filesystem
@@ -1310,8 +1310,8 @@ pub fn set_framebuffer_present(present: bool) {
 /// AArch64 target) should not have to name a hook it can only answer "none" to.
 /// Unregistered, `/proc/power` does not exist — not an empty file, which a
 /// reader would take for "no battery" when the truth is "no way to know".
-static POWER_RENDER: spinning_top::Spinlock<Option<fn(&mut [u8]) -> usize>> =
-    spinning_top::Spinlock::new(None);
+static POWER_RENDER: akuma_primitives::spin_report::Spinlock<Option<fn(&mut [u8]) -> usize>> =
+    akuma_primitives::spin_report::Spinlock::reporting("PWREND", None);
 
 /// Register the `/proc/power` renderer: fills the buffer, returns bytes written.
 /// Must not allocate (it runs on every read) and must tolerate a short buffer.

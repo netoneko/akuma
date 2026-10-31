@@ -18,7 +18,7 @@ use akuma_syscalls_sync::deadline;
 use akuma_syscalls_sync::key;
 use akuma_syscalls_sync::op::{self, Action};
 use akuma_syscalls_sync::table::{Key, MATCH_ANY, WaiterId, WaiterTable};
-use spinning_top::Spinlock;
+use akuma_primitives::spin_report::Spinlock;
 
 use crate::ring3::err;
 
@@ -32,7 +32,10 @@ impl WaiterId for Waiter {
     }
 }
 
-static WAITERS: Spinlock<WaiterTable<Waiter>> = Spinlock::new(WaiterTable::new());
+/// Tagged ("FUTEX") so a stuck spin names itself — see spin_report.rs: a
+/// bare spinning_top lock wedged with IF masked produces zero VM exits, no
+/// tick, no print: this is the only witness such a wedge can ever produce.
+static WAITERS: Spinlock<WaiterTable<Waiter>> = Spinlock::reporting("FUTEX", WaiterTable::new());
 
 /// The namespace half of this caller's keys: the thread group (`tgid`) for a
 /// private word, as the crate decides; the pid of the calling process stands

@@ -43,6 +43,7 @@ pub mod addr;
 pub mod cell;
 pub mod clock;
 pub mod rng;
+pub mod spin_report;
 pub mod cpu;
 pub mod console;
 pub mod errno;

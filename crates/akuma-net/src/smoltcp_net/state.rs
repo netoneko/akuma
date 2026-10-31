@@ -126,7 +126,8 @@ pub struct NetworkState {
 }
 
 /// Global network stack protected by a Spinlock.
-pub(crate) static NETWORK: Spinlock<Option<NetworkState>> = Spinlock::new(None);
+pub(crate) static NETWORK: akuma_primitives::spin_report::Spinlock<Option<NetworkState>> =
+    akuma_primitives::spin_report::Spinlock::reporting("NETWORK", None);
 
 // ============================================================================
 // NETWORK lock holder tracking (instrumentation for the SSH stall watchdog
