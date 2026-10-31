@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 int main(int argc, char **argv) {
     int o[2], e[2];
     if (pipe(o) || pipe(e)) { perror("pipe"); return 2; }
@@ -19,6 +20,11 @@ int main(int argc, char **argv) {
         _exit(127);
     }
     close(o[1]); close(e[1]);
+    /* Rust's read2 and cargo's put both pipes in O_NONBLOCK before polling. A non-blocking read of a pipe whose
+     * writers are gone must be 0 (EOF), never EAGAIN: with EAGAIN the loop polls (EOF is readable), reads, and
+     * retries for ever - the cargo stall of 2026-10-31 (docs/archive/TAOXICHUAN_CARGO_STALL_REGRESSION.md). */
+    fcntl(o[0], F_SETFL, fcntl(o[0], F_GETFL) | O_NONBLOCK);
+    fcntl(e[0], F_SETFL, fcntl(e[0], F_GETFL) | O_NONBLOCK);
     struct pollfd fds[2] = {{o[0], POLLIN, 0}, {e[0], POLLIN, 0}};
     int open_[2] = {1, 1};
     for (int it = 0; it < 40 && (open_[0] || open_[1]); it++) {
@@ -29,6 +35,7 @@ int main(int argc, char **argv) {
             char b[256];
             ssize_t r = read(fds[i].fd, b, sizeof b);
             printf("  fd%d read=%zd errno=%d\n", i, r, r < 0 ? errno : 0);
+            if (r < 0 && errno == EAGAIN && (fds[i].revents & (POLLHUP | POLLIN)) && it > 3) { /* readable yet "not yet" */ }
             if (r == 0) { open_[i] = 0; fds[i].fd = -1; }
         }
     }

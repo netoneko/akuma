@@ -38,4 +38,17 @@ over ssh repeated three or four times per boot on several boots; a triple fault 
 because `-d int` does not exist under KVM.
 
 ## Measurements
-(filled in below when the in-guest `-j4` build has run on 1 and 4 cores)
+In-guest `cargo build --release -p taoxichuan -j4` (Linux KVM guest on the ryzen, same kernel `kb-fix` = `5108b5e5`):
+
+| CPUs | wall | result | artifact md5 |
+|---|---|---|---|
+| 1 | 7m14s | EXIT=0, 0 console faults | `38852d540d8af420ac894544916cc2a1` |
+| 4 | 13m11s | built (the `EXIT=255` is the ssh client, not cargo), 30 fault-ish console lines | `38852d540d8af420ac894544916cc2a1` |
+
+Same bytes on 1 and 4 CPUs: the build is deterministic. **Four CPUs are 1.8x slower than one** - the big kernel lock is the bottleneck (the 4-CPU run
+logged 20 "stuck" lock reports), so SMP here buys correctness of the parallel ring-3 path, not speed yet. The next step is finer-grained locking.
+
+Metal (ryzen, Akuma host `5108b5e5b` on entry 29 = the "entry 30" label, `smp=8`, `kvmctl kvmmem=4096`): the host kernel built on the ryzen with the shared
+`akuma-sched-amd64` boots, joins wifi, enables SVM on cores 1-7. Taoxichuan as a 4-vCPU guest (`vm_vcpus = 4`, `smp=4` on the guest cmdline): the first
+boot stopped on a nested page fault at `0xfee00020` - Akuma's SVM model starts a non-boot vCPU with `IA32_APIC_BASE` enable clear for a plain guest, and
+`ap_entry64` read the APIC ID before enabling it. Fixed by setting the bit in `ap_entry64`; then `smp: 4 cpus online`, ssh round trip OK, state running.

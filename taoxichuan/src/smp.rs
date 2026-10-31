@@ -515,6 +515,15 @@ fn wait_online(idx: usize) -> bool {
 /// run here" (GDT/TSS, per-CPU block, IDT, SSE, syscall MSRs) and halts it.
 extern "C" fn ap_entry64(idx: u64) -> ! {
     let idx = idx as usize;
+    // Hardware leaves a started core's APIC enabled; a hypervisor's model may
+    // not (Akuma's SVM guest starts non-boot vCPUs with the bit clear), and the
+    // ID read just below would fault on an unmapped page. Set it, as the BSP does.
+    {
+        use akuma_cpu::msr::{self, Msr};
+        // SAFETY: sets exactly one bit in an architectural MSR, leaving the
+        // address field as found - the write `lapic_init` makes on the BSP.
+        unsafe { msr::write(Msr::ApicBase, msr::read(Msr::ApicBase) | akuma_lapic_amd64::APIC_GLOBAL_ENABLE) };
+    }
     // The AP boot root's identity slot is no longer needed: nothing low runs.
     crate::gdt_init_cpu(idx);
     let _ = akuma_ring3_amd64::install_percpu(idx, akuma_lapic_amd64::apic_id());
