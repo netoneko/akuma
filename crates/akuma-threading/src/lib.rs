@@ -2768,7 +2768,23 @@ akuma_threading_x86_thread_entry_trampoline:
      * closure_ptr and rbx = the boxed-closure trampoline fn pointer at
      * exactly the stack slots this switch's `pop`s read them from. `jmp`,
      * not `call`: the trampoline is `fn(*mut ()) -> !` and never returns, so
-     * there is no return address to arrange. */
+     * there is no return address to arrange.
+     *
+     * First scheduler entry of a never-yet-run thread (ON_CPU's doc: the
+     * outgoing tid's gate "is cleared by rust_switch_finished ... at the
+     * task's first scheduler entry" — the AArch64 vector asm does it right
+     * after `mov sp, x0`). This trampoline IS that first entry on this
+     * target: a fresh task never returns to x86_switch_context's tail, so
+     * its `rust_switch_finished()` never runs for us. Without the call here
+     * the OUTGOING thread's ON_CPU gate stays latched forever, and pickers
+     * and `x86_runnable_exists` skip gated threads — the preempted thread
+     * can never be scheduled again. Seen on Taoxichuan stage 12: the first
+     * `sleep_until` park yielded (per its own contract) to the freshly
+     * seeded idle thread, the gate on the parker latched, idle saw nothing
+     * runnable and halted, and the whole guest wedged on its first timed
+     * poll (2026-10-31). Stack alignment: rsp == entry_slot here, 16-byte
+     * aligned, exactly the pre-`call` ABI state. */
+    call rust_switch_finished
     mov rdi, r12
     jmp rbx
 "#
@@ -3751,6 +3767,20 @@ fn x86_yield_now() -> bool {
     let core = bkl::current_core_id() as usize;
     if core < MAX_CORES {
         PER_CORE_OFFCPU[core].store(cur, Ordering::SeqCst);
+    }
+    {
+        use core::sync::atomic::AtomicU32;
+        static SW: AtomicU32 = AtomicU32::new(0);
+        let n = SW.fetch_add(1, Ordering::Relaxed);
+        if n < 40 {
+            safe_print!(
+                96,
+                "[sw] {}->{} state{} \n",
+                cur,
+                next,
+                THREAD_STATES[cur].load(Ordering::Relaxed)
+            );
+        }
     }
     (hooks.transfer_lock_depth)(cur, next);
     (hooks.set_current_slot)(next);
