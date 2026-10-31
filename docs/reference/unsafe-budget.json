@@ -101,7 +101,7 @@
     "crates/akuma-port": 4,
     "crates/akuma-primitives": 10,
     "crates/akuma-psci": 2,
-    "crates/akuma-ring3-amd64": 2,
+    "crates/akuma-ring3-amd64": 3,
     "crates/akuma-slot-table": 9,
     "crates/akuma-threading": 65,
     "crates/akuma-timer": 1,
@@ -110,6 +110,6 @@
     "crates/akuma-uart": 1,
     "crates/akuma-user-access": 20,
     "crates/akuma-virtio": 12,
-    "taoxichuan/src": 55
+    "taoxichuan/src": 56
   }
 }
