@@ -686,14 +686,26 @@ pub fn set_syscall_stack_top(v: u64) {
 #[cfg(target_arch = "x86_64")]
 pub fn enable_syscalls(dispatcher: Dispatcher) {
     DISPATCH.store(dispatcher as usize, core::sync::atomic::Ordering::Relaxed);
+    enable_syscalls_this_core();
+}
+
+/// The per-core half of [`enable_syscalls`]: this core's `EFER.SCE`, `STAR`,
+/// `LSTAR`, `SFMASK`, and its syscall stack top. An AP calls it after
+/// [`install_percpu`]; the dispatcher is global and already stored.
+#[cfg(target_arch = "x86_64")]
+pub fn enable_syscalls_this_core() {
     // The BSP's block: callers that never ran `install_percpu` still get one.
     if msr::read(Msr::GsBase) == 0 {
         let _ = install_percpu(0, 0);
     }
-    this_cpu().syscall_top.store(
-        (&raw const SYSCALL_STACK) as usize as u64 + SYSCALL_STACK_SIZE as u64,
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    // Only the BSP has the static boot band; an AP gets its stack top from
+    // the first task it switches to (`set_syscall_stack_top`).
+    if cpu_index() == 0 {
+        this_cpu().syscall_top.store(
+            (&raw const SYSCALL_STACK) as usize as u64 + SYSCALL_STACK_SIZE as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
     // SCE: the `syscall` instruction itself. Without it, `syscall` is `#GP`.
     let efer = msr::read(Msr::Efer) | 1;
     // SAFETY: the documented contract of each MSR write; the values are this

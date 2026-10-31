@@ -98,6 +98,7 @@ mod net;
 mod pipes;
 #[cfg(feature = "trace-err")]
 mod ring;
+mod smp;
 mod sock;
 
 use akuma_boot_amd64::{mem, paging, phys};
@@ -188,7 +189,9 @@ const TRAP_STACK_SIZE: usize = 16 * 1024;
 #[repr(align(16))]
 struct TrapStack(#[allow(dead_code)] [u8; TRAP_STACK_SIZE]);
 
-static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);
+/// One boot trap stack per CPU (`smp::MAX_CPUS`): each core's TSS `rsp0` until
+/// its first switch arms a per-slot stack.
+static mut TRAP_STACK: [TrapStack; smp::MAX_CPUS] = [const { TrapStack([0; TRAP_STACK_SIZE]) }; smp::MAX_CPUS];
 
 /// Per-slot ring-3 trap stacks (session pf preemption, plan §5): a ring-3 trap
 /// switches to the TSS `rsp0`, so a preempting timer switch must leave the
@@ -217,10 +220,12 @@ pub(crate) fn arm_trap_stack(slot: usize) {
         // A raw-pointer deref on purpose: `TSS.set_rsp0` would take a `&mut` of the
         // static. clippy's `deref_addrof` suggestion breaks this line.
         #[allow(clippy::deref_addrof)]
-        (*&raw mut TSS).set_rsp0(top);
+        (*(&raw mut TSS[ring3::cpu_index()])).set_rsp0(top);
     }
 }
-static mut TSS: akuma_gdt::Tss = akuma_gdt::Tss::new();
+/// One TSS and one GDT per CPU: `ltr` marks a TSS descriptor busy, so two
+/// cores cannot share either.
+static mut TSS: [akuma_gdt::Tss; smp::MAX_CPUS] = [const { akuma_gdt::Tss::new() }; smp::MAX_CPUS];
 
 /// Timer-preemption era flag (session pf, plan §5): set at the first SPAWN
 /// crossing — the tick switch runs only once user tasks exist. The pf-6
@@ -229,19 +234,25 @@ static mut TSS: akuma_gdt::Tss = akuma_gdt::Tss::new();
 /// nothing to preempt and the tick must not switch at all.
 pub(crate) static PREEMPT_ARMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-static mut GDT: [u64; akuma_gdt::SLOTS] = [0; akuma_gdt::SLOTS];
+static mut GDT: [[u64; akuma_gdt::SLOTS]; smp::MAX_CPUS] = [[0; akuma_gdt::SLOTS]; smp::MAX_CPUS];
 
 /// Build the GDT and TSS, load both. One core; the entries are byte-identical
 /// to `boot.s`'s at the same selectors, so `CS`/`SS` stay valid across the
 /// `lgdt` and nothing needs a far return.
 fn gdt_init() {
-    // SAFETY: interrupts are masked from `boot.s` until this kernel chooses
-    // otherwise, and nothing else touches these statics (one core). Reached
-    // only through raw pointers, never references.
+    gdt_init_cpu(0);
+}
+
+/// [`gdt_init`] for core `cpu`: its own GDT row, TSS and boot trap stack.
+/// Each core touches only its own index.
+pub(crate) fn gdt_init_cpu(cpu: usize) {
+    // SAFETY: interrupts are masked on the calling core and only core `cpu`
+    // touches index `cpu` of these statics. Reached only through raw
+    // pointers, never references to the whole array.
     unsafe {
-        let tss = &raw mut TSS;
-        (*tss).set_rsp0((&raw mut TRAP_STACK).cast::<u8>().add(TRAP_STACK_SIZE) as u64);
-        let gdt = &raw mut GDT;
+        let tss = &raw mut TSS[cpu];
+        (*tss).set_rsp0((&raw mut TRAP_STACK[cpu]).cast::<u8>().add(TRAP_STACK_SIZE) as u64);
+        let gdt = &raw mut GDT[cpu];
         *gdt = akuma_gdt::table(tss as u64);
         #[repr(C, packed)]
         struct Gdtr {
@@ -702,6 +713,34 @@ fn lapic_init() -> bool {
     } else {
         akuma_primitives::safe_print!(96, "  [lapic] init failed\n");
         false
+    }
+}
+
+/// Load the (already filled) IDT on THIS core — an AP's `lidt`.
+pub(crate) fn idt_load() {
+    IDT.load();
+}
+
+/// The control-register state every core needs: `CR0.WP`, SSE legal for ring 3
+/// (`boot.s` sets the BSP's in long mode; the AP trampoline does not).
+pub(crate) fn enable_cpu_features() {
+    // SAFETY: setting architectural bits on this core; the same values the
+    // BSP runs with.
+    unsafe {
+        core::arch::asm!(
+            "mov {t}, cr0",
+            "and {t}, -5",
+            "or {t}, 2",
+            "or {t}, {wp}",
+            "mov cr0, {t}",
+            "mov {t}, cr4",
+            "or {t}, {sse}",
+            "mov cr4, {t}",
+            t = out(reg) _,
+            wp = in(reg) 1u64 << 16,
+            sse = in(reg) (1u64 << 9) | (1u64 << 10),
+            options(nostack)
+        );
     }
 }
 
@@ -5449,6 +5488,16 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // guest with no NIC or no lease still boots; sshd will bind and simply
     // never answer, which is a legible failure, not a hang.
     let _ = net::net_init();
+
+    // SMP (stage S-b): `smp=N` starts N-1 application processors; absent or 1
+    // keeps the single-core kernel byte-for-byte (the default until S-d is green).
+    let smp_cap = cmdline_token(hvm_start_info, "smp=", &mut [0u8; 8])
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1);
+    if smp_cap > 1 {
+        smp::start_secondaries(smp_cap);
+        akuma_primitives::safe_print!(64, "  smp: {} of {} requested\n", smp::online_cpus(), smp_cap);
+    }
 
     // ---- The init-spawn point ------------------------------------------------
     //
