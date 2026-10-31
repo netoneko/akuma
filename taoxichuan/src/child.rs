@@ -266,6 +266,15 @@ pub fn nested_active() -> bool {
     crate::exec_twin::current_slot() != crate::exec_twin::NO_SLOT
 }
 
+/// The calling task's session is the BOOT session (`out_slot == usize::MAX`,
+/// stamped by `start_init_thread`): its unbound fd 1/2 writes emit to the
+/// console — nothing drains a spawn-slot buffer for it. Only meaningful
+/// while `nested_active()`; the write arms short-circuit on that first.
+pub fn console_session() -> bool {
+    let cur = crate::exec_twin::current_slot();
+    cur != crate::exec_twin::NO_SLOT && with_cross(cur, |c| c.out_slot == usize::MAX)
+}
+
 /// The pid the current task should report (`getpid`): 1 for the boot task,
 /// the spawn slot's pid while the child runs.
 pub fn current_pid() -> u32 {
@@ -521,7 +530,16 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
         crate::halt();
     }
     // Depth 1: the same standing the SPAWNed shell has, which `fork_arm_real`'s gate reads.
-    with_cross(tid, |c| c.depth = 1);
+    // out_slot = usize::MAX marks the BOOT session (stage 12): no spawn-slot
+    // buffer sits behind it and nothing drains one — the boot program and its
+    // fork children write their unbound fd 1/2 straight to the console (the
+    // write arm's `console_session` rule). A SPAWN crossing always stamps a
+    // real slot (its parent drains it through the ChildOut fd), so the
+    // sentinel never collides; fork children inherit it by the usual copy.
+    with_cross(tid, |c| {
+        c.depth = 1;
+        c.out_slot = usize::MAX;
+    });
     register_shell_process(1, path, ti.root_pa, ti.entry, ti.rsp, tid);
     INIT_TID.store(tid, core::sync::atomic::Ordering::Relaxed);
     INIT_ENTRY.store(ti.entry, core::sync::atomic::Ordering::Relaxed);
