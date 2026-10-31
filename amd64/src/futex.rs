@@ -39,11 +39,10 @@
 //! difference between free and not. `enqueue` allocates once per wait, and
 //! `wake` returns a `Vec` sized by how many waiters it actually took.
 
-use akuma_syscalls_linux::flags::futex as f;
+use akuma_syscalls_sync::body;
 use akuma_syscalls_sync::deadline;
 use akuma_syscalls_sync::key::{self, Namespace};
-use akuma_syscalls_sync::op::{self, Action};
-use akuma_syscalls_sync::table::{Key, MATCH_ANY, WaiterId, WaiterTable};
+use akuma_syscalls_sync::table::{Key, WaiterId, WaiterTable};
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -118,42 +117,57 @@ fn namespace(is_private: bool) -> u32 {
     ns.tgid()
 }
 
+/// This kernel's side of `akuma_syscalls_sync::body::Kernel`.
+struct Amd64;
+
+impl body::Kernel for Amd64 {
+    type W = Waiter;
+    fn table<R>(&self, f: impl FnOnce(&mut WaiterTable<Waiter>) -> R) -> R {
+        f(&mut WAITERS.lock())
+    }
+    fn namespace(&self, is_private: bool) -> u32 {
+        namespace(is_private)
+    }
+    fn read_u32(&self, uaddr: u64) -> Option<u32> {
+        crate::uaccess::read_val::<u32>(uaddr)
+    }
+    fn write_u32(&self, uaddr: u64, v: u32) -> bool {
+        crate::uaccess::write_val::<u32>(uaddr, v)
+    }
+    fn read_timespec(&self, uaddr: u64) -> Option<(i64, i64)> {
+        crate::uaccess::read_val::<[i64; 2]>(uaddr).map(|[s, n]| (s, n))
+    }
+    fn now_us(&self) -> u64 {
+        crate::net::uptime_us()
+    }
+    fn utc_us(&self, _now_us: u64) -> Option<u64> {
+        crate::clock::utc_seconds().map(|s| s.saturating_mul(1_000_000))
+    }
+    fn resume(&self, woken: &[Waiter]) {
+        resume(woken);
+    }
+    /// A wake that found nobody is **not by itself a bug** (an uncontended
+    /// mutex unlock calls `FUTEX_WAKE` anyway); the *ratio* is the diagnostic -
+    /// see [`dump_waiters`].
+    fn woke(&self, n: usize) {
+        WAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+        if n == 0 {
+            WAKE_EMPTY.fetch_add(1, Ordering::Relaxed);
+        } else {
+            WOKEN_TOTAL.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+    fn wait(&self, uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u64 {
+        wait(uaddr, val, bitset, deadline_at, private)
+    }
+}
+
 /// `futex(uaddr, op, val, timeout, uaddr2, val3)` — x86_64 202.
 ///
-/// The sixth argument is why `syscall_entry` passes `a6`: until this syscall
-/// existed nothing needed one, and `FUTEX_WAIT_BITSET`'s `val3` is not
-/// optional — Rust's `std` emits it for *every* timed wait.
+/// The sixth argument is why `syscall_entry` passes `a6`: `FUTEX_WAIT_BITSET`'s
+/// `val3` is not optional - Rust's `std` emits it for *every* timed wait.
 pub fn sys_futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64) -> u64 {
-    let opi = (op as u32).cast_signed();
-    let private = op & (f::FUTEX_PRIVATE_FLAG as u64) != 0;
-    let val3 = val3 as u32;
-    let val = val as u32;
-
-    // `uaddr_mapped` is a *probe*, and the crate is explicit that it must be
-    // one the kernel performs: reading user memory can demand-page. A
-    // successful 4-byte read is exactly `validate_user_ptr(uaddr, 4)`.
-    let mapped = crate::uaccess::read_val::<u32>(uaddr).is_some();
-
-    match op::decode(opi, val3, uaddr as usize, mapped) {
-        Action::Return(v) => v,
-        Action::Wait { bitset } => {
-            let deadline = if timeout == 0 {
-                deadline::NEVER
-            } else {
-                let Some([sec, nsec]) = crate::uaccess::read_val::<[i64; 2]>(timeout) else {
-                    return errno::EFAULT;
-                };
-                let us = (sec.max(0).cast_unsigned())
-                    .saturating_mul(1_000_000)
-                    .saturating_add(nsec.max(0).cast_unsigned() / 1000);
-                deadline::deadline_us(opi, us, crate::net::uptime_us(), crate::clock::utc_seconds().map(|s| s.saturating_mul(1_000_000)))
-            };
-            wait(uaddr, val, bitset, deadline, private)
-        }
-        Action::Wake { mask } => wake(uaddr, val, mask, private),
-        Action::Requeue { compare } => requeue(uaddr, uaddr2, val, timeout, compare, private),
-        Action::WakeOp => wake_op(uaddr, uaddr2, val, timeout, val3, private),
-    }
+    body::sys_futex(&Amd64, uaddr, op, val, timeout, uaddr2, val3)
 }
 
 fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u64 {
@@ -294,27 +308,6 @@ fn queued_key(t: &WaiterTable<Waiter>, tgid: u32, tid: usize) -> Option<Key> {
         .map(|(k, _)| *k)
 }
 
-fn wake(uaddr: u64, val: u32, mask: u32, private: bool) -> u64 {
-    let key: Key = (namespace(private), uaddr as usize);
-    let woken = WAITERS.lock().wake(key, val, mask);
-    WAKE_CALLS.fetch_add(1, Ordering::Relaxed);
-    if woken.is_empty() {
-        // A wake that found nobody. **Not by itself a bug** — the overwhelmingly
-        // common case is an uncontended mutex unlock, where musl calls
-        // `FUTEX_WAKE` because it cannot know there is no waiter. It earns a
-        // counter because the *ratio* is the diagnostic: a process whose threads
-        // are all parked while empty wakes keep arriving is a key mismatch (the
-        // waiter is queued under a different `(tgid, uaddr)` than the waker
-        // computes), which looks identical from `ps` to a userspace deadlock and
-        // is a kernel bug where the other is not.
-        WAKE_EMPTY.fetch_add(1, Ordering::Relaxed);
-    } else {
-        WOKEN_TOTAL.fetch_add(woken.len() as u64, Ordering::Relaxed);
-    }
-    resume(&woken);
-    woken.len() as u64
-}
-
 /// `FUTEX_WAKE` calls, calls that found no waiter, waiters actually woken, and
 /// `FUTEX_WAIT` enqueues. See [`dump_waiters`] for how to read them.
 static WAKE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -404,70 +397,6 @@ fn resume(woken: &[Waiter]) {
     }
 }
 
-/// `FUTEX_REQUEUE` / `FUTEX_CMP_REQUEUE`. `timeout` is reinterpreted as
-/// `val2` (the requeue cap) — Linux overloads the argument for this op.
-fn requeue(
-    uaddr: u64,
-    uaddr2: u64,
-    val: u32,
-    val2: u64,
-    compare: Option<u32>,
-    private: bool,
-) -> u64 {
-    if let Some(expect) = compare {
-        let Some(cur) = crate::uaccess::read_val::<u32>(uaddr) else {
-            return errno::EFAULT;
-        };
-        if cur != expect {
-            return errno::EAGAIN;
-        }
-    }
-    let tgid = namespace(private);
-    let (woken, moved) = WAITERS.lock().requeue(
-        (tgid, uaddr as usize),
-        (tgid, uaddr2 as usize),
-        val,
-        val2.min(u64::from(u32::MAX)) as u32,
-    );
-    resume(&woken);
-    // The requeued waiters are deliberately **not** resumed: they were moved to
-    // another key, not woken, and they are still queued. Waking them would be
-    // harmless (each re-tests its own membership and parks again) but it would
-    // undo the whole point of a requeue, which is that a broadcast does not
-    // stampede every waiter onto one lock.
-    //
-    // Linux reports woken + requeued for `CMP_REQUEUE`, and woken alone for the
-    // deprecated `REQUEUE`. Both callers in practice (musl's
-    // `pthread_cond_broadcast`, Rust's `Condvar::notify_all`) use `CMP_`.
-    (woken.len() + moved.len()) as u64
-}
-
-/// `FUTEX_WAKE_OP`: read-modify-write `*uaddr2`, wake on `uaddr`, and wake on
-/// `uaddr2` too if the *old* value satisfies the comparison.
-fn wake_op(uaddr: u64, uaddr2: u64, val: u32, val2: u64, val3: u32, private: bool) -> u64 {
-    let decoded = akuma_syscalls_sync::wakeop::WakeOp::decode(val3);
-    let Some(oldval) = crate::uaccess::read_val::<u32>(uaddr2) else {
-        return errno::EFAULT;
-    };
-    let Some(newval) = decoded.apply(oldval) else {
-        return errno::ENOSYS;
-    };
-    if !crate::uaccess::write_val::<u32>(uaddr2, newval) {
-        return errno::EFAULT;
-    }
-    let tgid = namespace(private);
-    let first = WAITERS.lock().wake((tgid, uaddr as usize), val, MATCH_ANY);
-    resume(&first);
-    let mut n = first.len();
-    if decoded.compare(oldval) {
-        let cap = val2.min(u64::from(u32::MAX)) as u32;
-        let second = WAITERS.lock().wake((tgid, uaddr2 as usize), cap, MATCH_ANY);
-        resume(&second);
-        n += second.len();
-    }
-    n as u64
-}
-
 /// Wake up to `count` waiters on `(tgid, uaddr)`, for `akuma-exec`'s
 /// `futex_wake` runtime hook.
 ///
@@ -485,9 +414,7 @@ fn wake_op(uaddr: u64, uaddr2: u64, val: u32, val2: u64, val3: u32, private: boo
 /// which is the only reading of it that is not a silent no-op.
 pub fn wake_key(tgid: u32, uaddr: usize, count: i32) -> usize {
     let n = if count < 0 { u32::MAX } else { count.cast_unsigned() };
-    let woken = WAITERS.lock().wake((tgid, uaddr), n, MATCH_ANY);
-    resume(&woken);
-    woken.len()
+    body::wake_key(&Amd64, tgid, uaddr, n)
 }
 
 /// Drop every queue entry naming task slot `task`.
