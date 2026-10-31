@@ -2657,34 +2657,45 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         if nr == 202 {
             FXRING.push((islot as i32, a2, a1, a3, r));
         }
-        // Stage 12: the EPOLLET drain hooks, ONE site because the hook
-        // belongs to the fd, not to the syscall (`read` alone has eight
-        // arms). A successful read or EAGAIN clears the fd's IN edge, a
-        // short write or EAGAIN clears its OUT edge (x86_64 numbers:
-        // 44 sendto, 45 recvfrom, 46 sendmsg, 47 recvmsg). `reset_edge`
-        // touches edge-triggered entries only; a level entry never consults
-        // the mask. sendmsg carries no length argument, so it clears on
-        // EAGAIN only — a caller the next write EAGAINs re-arms anyway.
-        let v = r as i64;
-        match nr {
-            0 | 19 | 45 | 47 => {
-                if v >= 0 || v == -11 {
-                    crate::epoll::on_fd_drained(a1);
-                }
-            }
-            1 | 20 | 44 | 46 => {
-                if v < 0 || v < a3 as i64 {
-                    crate::epoll::on_fd_write_blocked(a1);
-                }
-            }
-            _ => {}
-        }
+        epoll_edge_hooks(nr, a1, a3, r);
         trace_err(nr, r, a1, a2, a3);
         trace_ring(nr, r, a1, a2, a3, rip);
         r
     }
     #[cfg(not(feature = "trace-err"))]
-    dispatch_inner(fr)
+    {
+        let (nr, a1, a3) = (fr.rax, fr.rdi, fr.rdx);
+        let r = dispatch_inner(fr);
+        epoll_edge_hooks(nr, a1, a3, r);
+        r
+    }
+}
+
+/// The EPOLLET drain hooks, ONE site for every build (they once lived only under
+/// `trace-err`, so a plain kernel never cleared an edge).
+fn epoll_edge_hooks(nr: u64, a1: u64, a3: u64, r: u64) {
+    // Stage 12: the EPOLLET drain hooks, ONE site because the hook
+    // belongs to the fd, not to the syscall (`read` alone has eight
+    // arms). A successful read or EAGAIN clears the fd's IN edge, a
+    // short write or EAGAIN clears its OUT edge (x86_64 numbers:
+    // 44 sendto, 45 recvfrom, 46 sendmsg, 47 recvmsg). `reset_edge`
+    // touches edge-triggered entries only; a level entry never consults
+    // the mask. sendmsg carries no length argument, so it clears on
+    // EAGAIN only — a caller the next write EAGAINs re-arms anyway.
+    let v = r as i64;
+    match nr {
+        0 | 19 | 45 | 47 => {
+            if v >= 0 || v == -11 {
+                crate::epoll::on_fd_drained(a1);
+            }
+        }
+        1 | 20 | 44 | 46 => {
+            if v < 0 || v < a3 as i64 {
+                crate::epoll::on_fd_write_blocked(a1);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The syscall ring `trace_ring` fills and `trace_hang_dump` reads.
