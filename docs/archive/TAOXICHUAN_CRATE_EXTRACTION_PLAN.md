@@ -287,7 +287,9 @@ cited above landed 2026-10-30), `docs/archive/TAOXICHUAN_FIXED_POINT.md`
 | X1 futex | `akuma_syscalls_sync::body::Kernel` + `sys_futex`/`wake`/`requeue`/`wake_op`/`wake_key`; amd64 (`Amd64`) and Taoxichuan (`Tx`) implement the trait once, keep the table lock, user reads, waker and their own park loops; +3 host tests (45 pass). `taoxichuan/src/futex.rs` 201 -> 160 lines | `ee6c93c5` |
 | init (idle threads) | `akuma_sched_amd64::mark_idle`: daemon, idle, pinned, no space, no trap stack - used by amd64's `register_idle_task` and Taoxichuan's AP/BSP idle adoption. The claim/adopt calls stay in the kernels (the crate has no `akuma-threading` dependency, on purpose) | `aafa308a`, `e7661570` |
 
-Not started: X3 user-access, X4-X10. The nested-crossing retirement (S3) is still open.
+| X3 user access | new `akuma-user-walk` (`forbid(unsafe)`, no deps, 5 host tests): `in_regions` (the `user_ok` rule), `copy_from`/`copy_to` (page chunking), `read_cstr` (page-chunked, stops at NUL, so a string ending before a hole succeeds; `user_str` and `read_user_string` were byte-at-a-time), `read_ptr_array`. Taoxichuan keeps `TaskWalk: Walk` (physmap frame access + `cow_prepare_write`). The existing `akuma-user-access` is the SMAP/fault-recovery copy asm and stays amd64/aarch64's; the two share a range rule, not a copy | `57cda68d` |
+
+Not started: X4-X10. The nested-crossing retirement (S3) is still open.
 
 Verification on the ryzen (bare metal, Akuma host entry 29 = "KVM herd", `smp=8`), host kernel `e7661570` built on the ryzen:
 * host boots, 7 APs online, wifi + sshd up;
@@ -295,3 +297,5 @@ Verification on the ryzen (bare metal, Akuma host entry 29 = "KVM herd", `smp=8`
 * Taoxichuan guest (the same commit) as a 4-vCPU `kvm0` guest: `smp: 4 cpus online`, ssh round trip OK, no `[Fault]`/`PANIC`.
 
 Honest limits: the guest's `/bin/sh` does not spawn on this metal image **with the pre-session guest kernel too** (`sh -c "echo hi"` over ssh: 0/10 on both), so most of `run_gates.sh` is not a usable oracle there (it passes/fails on the shell fallback); that is an environment gap to chase separately. The guest's own futex path is exercised only by sshd and `apk.static --version` (G2 passes on the new kernel) - the in-guest `-j4` build (Linux KVM on the ryzen, `build_run.py`) was not re-run for X1.
+
+Metal re-check after X3 (host `e7661570` unchanged, guest `57cda68d`, 4 vCPUs, `smp: 4 cpus online`): `run_gates.sh` G1-G4, H1-H3c, F1, C1, D1, D2, A1-A3, M4curl, M4web, W1b-d PASS, no `[Fault]`/`PANIC`, host survived the whole run. W1a FAILs on every run since the patched image (it hashes `ls -lin /etc/hostname`, whose inode/mtime depend on the image, not on the kernel).
