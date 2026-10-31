@@ -1977,6 +1977,51 @@ pub fn socket_tcp_ready(idx: usize) -> (bool, bool) {
     .unwrap_or((false, false))
 }
 
+/// The two EOF facts the epoll readiness map needs for a TCP socket (stage
+/// 12, taoxichuan's `FdState::Tcp`): `(dead, peer_closed)`.
+///
+/// `dead` is the socket fully closed **after** having been connected
+/// (`was_connected && !is_active()`) — the HUP-only answer that keeps a
+/// waiter from parking forever on a connection that will never progress.
+/// `peer_closed` is the peer's FIN seen (`!may_recv()` after the handshake
+/// completed — the guard that keeps `SynSent` from announcing a half-close,
+/// `docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md`). Mirrors
+/// `akuma-syscalls-glue/src/net.rs`'s `socket_is_dead_tcp` /
+/// `socket_peer_closed_tcp`; lives here because the smoltcp handles and the
+/// `was_connected` latch are this crate's private state.
+#[cfg(feature = "smoltcp")]
+#[must_use]
+pub fn socket_tcp_eof(idx: usize) -> (bool, bool) {
+    smoltcp_net::poll();
+    let Some((handle, false)) = smoltcp_handle_for(idx) else {
+        return (false, false);
+    };
+    let was_connected = with_table(|table| {
+        let sock = table.get_mut(idx)?.as_mut()?;
+        if !sock.was_connected
+            && with_network(|net| {
+                smoltcp_net::tcp_get(&net.sockets, handle, |s| tcp_reached_established(s.state()))
+            })
+            .flatten()
+            .unwrap_or(false)
+        {
+            sock.was_connected = true;
+        }
+        Some(sock.was_connected)
+    })
+    .unwrap_or(false);
+    with_network(|net| {
+        smoltcp_net::tcp_get(&net.sockets, handle, |socket| {
+            (
+                (was_connected && !socket.is_active()),
+                (!socket.may_recv() && tcp_reached_established(socket.state())),
+            )
+        })
+    })
+    .flatten()
+    .unwrap_or((false, false))
+}
+
 /// Everything a "this read keeps returning at once" report needs about one TCP
 /// socket, read without polling or changing anything.
 ///

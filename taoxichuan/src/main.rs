@@ -91,6 +91,7 @@
 extern crate alloc;
 
 mod child;
+mod epoll;
 mod exec_twin;
 mod futex;
 mod net;
@@ -976,6 +977,16 @@ pub(crate) enum OpenFile {
     /// decisions are not). A dup'd fd carries the same index; the slot
     /// frees when any fd naming it closes.
     EventFd(usize),
+    /// An epoll instance: the index into `epoll.rs`'s `EPOLLS` table (stage
+    /// 12). The decisions are the pulled pure crates
+    /// (`akuma-syscalls-poll`'s interest list and readiness map,
+    /// `akuma-net-yarn`'s wait machine); this kernel adds the fd-table
+    /// entry, the 12-byte packed x86_64 event copies, and the probe that
+    /// maps this kernel's `OpenFile` kinds onto the crate's `FdState`. A
+    /// dup'd fd carries the same index; fork strips the entry from the
+    /// child's table (Linux's epoll fork rule — the instance stays the
+    /// creator's), so the slot frees only on the owner's close.
+    Epoll(usize),
     /// The session's own stdio. Fds 0/1/2 of a spawned task start with NO
     /// table entry — unbound reads/writes fall through to the session
     /// fallback (console, or the nested child's pipe). But a redirect must
@@ -1429,10 +1440,54 @@ fn sigaltstack_arm(ss: u64, old: u64) -> u64 {
     0
 }
 
+/// `prctl(option, ...)`. The one option anything on this guest issues is
+/// `PR_SET_NAME` (15) — a Rust/tokio program names its threads at startup;
+/// it printed `[nosys] nr=157` ahead of the epoll failure and is harmless,
+/// but a live name makes the console traces readable, so the name is kept
+/// in a fixed per-slot array (no allocation). `PR_GET_NAME` reads it back;
+/// every other option is EINVAL, Linux's answer for an unknown option —
+/// NOT a blanket 0, which would mask an option a future binary relies on.
+fn prctl_arm(option: u64, arg2: u64) -> u64 {
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    const NAME_LEN: usize = 16;
+    static SLOT_NAMES: akuma_primitives::cell::BorrowCell<[[u8; NAME_LEN]; crate::child::NSLOTS]> =
+        akuma_primitives::cell::BorrowCell::new([[0; NAME_LEN]; crate::child::NSLOTS]);
+    let slot = crate::exec_twin::current_slot();
+    match option {
+        PR_SET_NAME => {
+            let mut name = [0u8; NAME_LEN];
+            // Musl copies up to 16 bytes; a short name just NUL-pads here.
+            if arg2 != 0 && !copy_from_user(&mut name, arg2) {
+                return e(ring3::err::EFAULT);
+            }
+            if slot < crate::child::NSLOTS {
+                SLOT_NAMES.with_mut(|t| t[slot] = name);
+            }
+            0
+        }
+        PR_GET_NAME => {
+            if arg2 == 0 || !crate::user_ok(arg2, NAME_LEN as u64) {
+                return e(ring3::err::EFAULT);
+            }
+            let name = if slot < crate::child::NSLOTS {
+                SLOT_NAMES.with(|t| t[slot])
+            } else {
+                [0u8; NAME_LEN]
+            };
+            if copy_to_user(arg2, &name) {
+                0
+            } else {
+                e(ring3::err::EFAULT)
+            }
+        }
+        _ => e(ring3::err::EINVAL),
+    }
+}
+
 /// `membarrier(cmd, flags, cpu)`: the decode is `akuma-syscalls-mem`'s; the
 /// one effect, a full fence, is one core's `SeqCst` fence.
-fn membarrier_arm(cmd: u64) -> u64 {
-    use akuma_syscalls_mem::membarrier::{Command, command};
+fn membarrier_arm(cmd: u64) -> u64 {    use akuma_syscalls_mem::membarrier::{Command, command};
     match command(cmd as u32) {
         Command::Barrier => {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -2243,6 +2298,7 @@ fn clone_desc(d: &OpenFile) -> OpenFile {
         OpenFile::Pipe(id, w) => OpenFile::Pipe(*id, *w),
         OpenFile::Pair(r, w) => OpenFile::Pair(*r, *w),
         OpenFile::EventFd(i) => OpenFile::EventFd(*i),
+        OpenFile::Epoll(i) => OpenFile::Epoll(*i),
         OpenFile::Null => OpenFile::Null,
         OpenFile::Random => OpenFile::Random,
         OpenFile::Session => OpenFile::Session,
@@ -2821,7 +2877,14 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // buffer, as on a pty): fd 2 used to fall to the console, so
             // `ls /nonexistent`, git's `fatal:` and rustc's errors never
             // reached the ssh client.
-            if child::session_buffer_active() {
+            // The BOOT session (stage 12): `start_init_thread` stamps its
+            // cross `out_slot = usize::MAX` — no spawn-slot buffer sits
+            // behind it and nothing drains one, so the boot program and its
+            // fork children write fd 1/2 straight to the console. (eadfee8c's
+            // init-on-a-pool-thread silently routed `GOOSE-TEST-START` into
+            // SLOTS[0] and nothing read it back — the gate's console evidence
+            // vanished with the old boot-stack model.)
+            if child::nested_active() && !child::console_session() {
                 if !child::child_write(buf, len) {
                     return e(ring3::err::EFAULT);
                 }
@@ -2937,7 +3000,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }            // The pipe branch of `write` applies per iovec: musl flushes a
             // buffered stdout as one writev, and a nested child's version
             // string belongs to the ssh session, not the console.
-            let piped = child::session_buffer_active();
+            let piped = child::nested_active() && !child::console_session();
             let mut total = 0u64;
             for i in 0..iovcnt {
                 let mut iv = [0u8; 16];
@@ -3584,6 +3647,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     eventfd_close_slot(*slot);
                     2
                 }
+                OpenFile::Epoll(slot) => {
+                    crate::epoll::epoll_close_slot(*slot);
+                    2
+                }
                 OpenFile::Pipe(id, w) => {
                     // A pipe end drops its table reference here — the last
                     // writer's close is what makes the reader's EOF arrive.
@@ -3688,7 +3755,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
                 OpenFile::File { .. } | OpenFile::Socket(_) | OpenFile::ChildOut(_)
                 | OpenFile::EventFd(_) | OpenFile::Null | OpenFile::Random | OpenFile::Session
-                | OpenFile::Pair(..) => {
+                | OpenFile::Pair(..) | OpenFile::Epoll(_) => {
                     res = Err(ring3::err::ENOTDIR);
                 }
                 OpenFile::Pipe(_, false) => {
@@ -4375,6 +4442,23 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // ENOSYS onto `curl: (27) Out of memory` before resolving.
             eventfd2_arm(fr.arg1(), fr.arg2())
         }
+        // ── Stage 12: the epoll family (goose is a tokio/mio program; it
+        //    died `[nosys] nr=291` → `Failed to build Tokio runtime`) ──
+        akuma_syscalls_abi::x86_64::EPOLL_CREATE1 => epoll::epoll_create1_arm(fr.arg1()),
+        // `epoll_create(213)`: musl narrows to create1 with flags=0; serve
+        // the legacy number by the same narrowing the amd64 kernel makes.
+        213 => epoll::epoll_create1_arm(0),
+        akuma_syscalls_abi::x86_64::EPOLL_CTL => {
+            epoll::epoll_ctl_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4())
+        }
+        akuma_syscalls_abi::x86_64::EPOLL_PWAIT => {
+            // args 5/6 (sigmask, sigsetsize) accepted and discarded — the
+            // pinned divergence the reference doc records for the family.
+            epoll::epoll_pwait_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4())
+        }
+        // `epoll_wait(232)`: the legacy spelling narrows to pwait with a
+        // null sigmask (the same shape `poll`(7) narrows to ppoll by).
+        232 => epoll::epoll_pwait_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
         ring3::nr::GETSOCKNAME => {
             // c-ares's DNS-socket self-check (stage 8 session Q): without
             // the source endpoint it answers "Could not contact DNS
@@ -4427,6 +4511,9 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         akuma_syscalls_abi::x86_64::TKILL => tkill_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::TGKILL => tkill_arm(fr.arg2(), fr.arg3()),
         akuma_syscalls_abi::x86_64::MEMBARRIER => membarrier_arm(fr.arg1()),
+        // `prctl(157)`: PR_SET_NAME (a tokio program names its threads;
+        // the guest's first `[nosys]` line today), PR_GET_NAME, EINVAL else.
+        akuma_syscalls_abi::x86_64::PRCTL => prctl_arm(fr.arg1(), fr.arg2()),
         other => {
             // A guest task hit a number this table does not serve; the errno
             // is the answer (the arch-level checklist arm is above). The

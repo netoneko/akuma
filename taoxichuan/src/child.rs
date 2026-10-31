@@ -266,11 +266,13 @@ pub fn nested_active() -> bool {
     crate::exec_twin::current_slot() != crate::exec_twin::NO_SLOT
 }
 
-/// Do unbound stdout/stderr (fd 1/2 with no description) land in the SPAWN session buffer? Only in the old model, where the
-/// boot task is sshd and the shell it SPAWNs is a coroutine whose output sshd drains through a `ChildOut` fd. With init running as
-/// a pool thread (`start_init_thread`) nothing drains that buffer: the console is the answer, for init and for everything it forks.
-pub fn session_buffer_active() -> bool {
-    INIT_TID.load(core::sync::atomic::Ordering::Relaxed) == usize::MAX && nested_active()
+/// The calling task's session is the BOOT session (`out_slot == usize::MAX`,
+/// stamped by `start_init_thread`): its unbound fd 1/2 writes emit to the
+/// console — nothing drains a spawn-slot buffer for it. Only meaningful
+/// while `nested_active()`; the write arms short-circuit on that first.
+pub fn console_session() -> bool {
+    let cur = crate::exec_twin::current_slot();
+    cur != crate::exec_twin::NO_SLOT && with_cross(cur, |c| c.out_slot == usize::MAX)
 }
 
 /// The pid the current task should report (`getpid`): 1 for the boot task,
@@ -528,7 +530,16 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
         crate::halt();
     }
     // Depth 1: the same standing the SPAWNed shell has, which `fork_arm_real`'s gate reads.
-    with_cross(tid, |c| c.depth = 1);
+    // out_slot = usize::MAX marks the BOOT session (stage 12): no spawn-slot
+    // buffer sits behind it and nothing drains one — the boot program and its
+    // fork children write their unbound fd 1/2 straight to the console (the
+    // write arm's `console_session` rule). A SPAWN crossing always stamps a
+    // real slot (its parent drains it through the ChildOut fd), so the
+    // sentinel never collides; fork children inherit it by the usual copy.
+    with_cross(tid, |c| {
+        c.depth = 1;
+        c.out_slot = usize::MAX;
+    });
     register_shell_process(1, path, ti.root_pa, ti.entry, ti.rsp, tid);
     INIT_TID.store(tid, core::sync::atomic::Ordering::Relaxed);
     INIT_ENTRY.store(ti.entry, core::sync::atomic::Ordering::Relaxed);
@@ -621,6 +632,12 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         ct.brk_end = brk_end;
         ct.mmap_cur = mmap_cur;
         ct.exit = None;
+        // Linux's epoll fork rule (poll.md): an epoll fd is STRIPPED from
+        // the child's table — the instance stays the creator's, and the
+        // child's exec cloexec sweep cannot free it out from under the
+        // reactor thread that created it.
+        let mut fds = fds;
+        fds.retain(|_, d| !matches!(d, crate::OpenFile::Epoll(_)));
         ct.fd_names = fds;
         ct.fd_cloexec = cloexec;
         ct.fd_nonblock = nonblock;
@@ -1864,7 +1881,10 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
     // hand copy. No kernel-side references to take on top of the cloned
     // payloads: this kernel's descriptions are indices (`File { inode }`,
     // `Socket(idx)`), the convention every close arm already runs on.
-    let forked = crate::with_fds(|t| t.fork_copy(|_| true));
+    // The predicate is Linux's epoll fork rule (stage 12): the child never
+    // inherits an epoll fd — the instance stays the creator's, and a
+    // child's close/exec sweep must not free it.
+    let forked = crate::with_fds(|t| t.fork_copy(|d| !matches!(d, crate::OpenFile::Epoll(_))));
     // A pipe end is a *counted* kernel resource: every payload the child's
     // table inherited needs one kernel-side reference taken on top of the
     // clone (`fork_copy`'s own doc — "iterate the values"). The index
@@ -2298,6 +2318,19 @@ pub fn waitpid_arm(pid: u64, status_va: u64) -> u64 {
 /// was delivered.
 pub fn close_stdin_arm(_pid: u64) -> u64 {
     0
+}
+
+/// poll(2) readiness for a ChildOut fd: `(has_data, gone)` — the buffer's
+/// two facts, asked by `sock.rs::fd_events` and `epoll.rs::fd_state`. `gone`
+/// is the child no longer running: a running child with an empty buffer is
+/// "nothing yet", a gone child with an empty buffer is EOF (the read path's
+/// `Ok(0)`), and that difference is the whole point — without it a
+/// poll/epoll waiter can never see the EOF edge (`epoll.rs` maps it to
+/// `ChildStdout { channel_gone, has_data }`, whose gone arm is the HUP).
+pub(crate) fn child_out_state(slot_idx: usize) -> (bool, bool) {
+    with_slots(|s| {
+        s.get(slot_idx).map_or((false, true), |slot| (!slot.out.is_empty(), !slot.running))
+    })
 }
 
 /// Drain the pipe behind `slot_idx` into the task's buffer: up to
