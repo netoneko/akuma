@@ -278,3 +278,20 @@ E2BIG, the clock, the CoW write holes and the thread-exit leak — every fix
 cited above landed 2026-10-30), `docs/archive/TAOXICHUAN_FIXED_POINT.md`
 (the K1 == K2 result these extractions must not disturb),
 `CLAUDE.md` § Layout (the composition rules applied above).
+
+## Status 2026-10-31 (extracted and verified on metal)
+
+| step | done | commit |
+|---|---|---|
+| X2 clock/rng | `splitmix_fill`/`fill_from_words` in `akuma-primitives::rng` | earlier |
+| X1 futex | `akuma_syscalls_sync::body::Kernel` + `sys_futex`/`wake`/`requeue`/`wake_op`/`wake_key`; amd64 (`Amd64`) and Taoxichuan (`Tx`) implement the trait once, keep the table lock, user reads, waker and their own park loops; +3 host tests (45 pass). `taoxichuan/src/futex.rs` 201 -> 160 lines | `ee6c93c5` |
+| init (idle threads) | `akuma_sched_amd64::mark_idle`: daemon, idle, pinned, no space, no trap stack - used by amd64's `register_idle_task` and Taoxichuan's AP/BSP idle adoption. The claim/adopt calls stay in the kernels (the crate has no `akuma-threading` dependency, on purpose) | `aafa308a`, `e7661570` |
+
+Not started: X3 user-access, X4-X10. The nested-crossing retirement (S3) is still open.
+
+Verification on the ryzen (bare metal, Akuma host entry 29 = "KVM herd", `smp=8`), host kernel `e7661570` built on the ryzen:
+* host boots, 7 APs online, wifi + sshd up;
+* a clean `kbuild -c -j 4 -p taoxichuan` (rustc + cargo jobserver, the futex-heaviest thing the box does) three times: EXIT=0, 27-30 s, the same artifact md5 `933fe65d3252e5460e2eafaed06f72b5` each time;
+* Taoxichuan guest (the same commit) as a 4-vCPU `kvm0` guest: `smp: 4 cpus online`, ssh round trip OK, no `[Fault]`/`PANIC`.
+
+Honest limits: the guest's `/bin/sh` does not spawn on this metal image **with the pre-session guest kernel too** (`sh -c "echo hi"` over ssh: 0/10 on both), so most of `run_gates.sh` is not a usable oracle there (it passes/fails on the shell fallback); that is an environment gap to chase separately. The guest's own futex path is exercised only by sshd and `apk.static --version` (G2 passes on the new kernel) - the in-guest `-j4` build (Linux KVM on the ryzen, `build_run.py`) was not re-run for X1.
