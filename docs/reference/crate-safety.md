@@ -1,6 +1,21 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — *2026-10-22 (evening): one crate added, **`akuma-vm-spec`** (forbids, 0 sites; the VM spec shared by herd and the kernel) — the headline below is not regenerated.* Regenerated 2026-10-21 (second run of the day) with
+**Grade: A** — regenerated 2026-10-31 with `python3 scripts/cloc_akuma.py src crates`:
+**79 of 108 crates** forbid `unsafe`. 89341 of 90651 production lines (98.6%) sit
+outside any `unsafe` block; 363 production sites across `crates/`, 0 inside
+enforced crates; `src/` is down to 136 production lines (the `bin`) and 0
+production sites. Twelve crates arrived since the 2026-10-21 run, most of them
+pulled out for the Taoxichuan kernel. Nine forbid from their first commit:
+`akuma-vm-spec`, `akuma-kvm-abi`, `akuma-comconsole`, `akuma-elf-exec`,
+`akuma-syscalls-eventfd`, `akuma-lapic-amd64`, `akuma-syscalls-signal`,
+`akuma-fpu-amd64` and `akuma-user-tree`. Three cannot, because they *are* the
+machine edge: `akuma-boot-amd64` (10 sites), `akuma-ring3-amd64` (8) and
+`akuma-sched-amd64` (52 — the context switch and FP save/restore, moved out of
+`amd64/src/sched.rs`, which is not counted here). The 2026-10-16 **Open** item
+below is closed: `akuma-net-rtl8169`, `akuma-usb` and `akuma-pci` each read 0
+sites now.
+
+The run before, 2026-10-21 (second run of the day), was
 `python3 scripts/cloc_akuma.py src crates` after the **`akuma-mmu` safe facade**
 ([`AKUMA_MMU_SAFE_FACADE.md`](../archive/AKUMA_MMU_SAFE_FACADE.md)): the four public
 `unsafe fn`s went safe or were deleted, the shootdown-hook transmutes became
@@ -59,7 +74,7 @@ lives in `amd64/` and is not counted here (`overlays/ryzen/`,
 [`AKUMA_AMD64_ON_RYZEN_LAPTOP.md`](../archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md)
 § 9). Most of the other six new forbidding crates since 2026-09-06
 (`akuma-fbcon`, `akuma-pty`, `akuma-hda`, …) arrived without a regeneration.
-**Open:** the script flags one `unsafe` site each inside three forbidding crates
+**Open (closed 2026-10-31, all three read 0):** the script flagged one `unsafe` site each inside three forbidding crates
 (`akuma-net-rtl8169`, `akuma-usb`, `akuma-pci`). `forbid` would not compile a
 real one, so these are counter hits, probably the word in a comment. They have
 not been chased.

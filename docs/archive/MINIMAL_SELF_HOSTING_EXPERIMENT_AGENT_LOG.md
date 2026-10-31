@@ -1979,3 +1979,47 @@ K1 == K2 (`6facda34cbf9ef3cb318dae4ce09ab04`, 1,458,104 bytes) under Akuma's own
 * **Time:** the branch's first commit is 2026-10-23 22:24 +0300 (19:24 UTC); the metal K2 build finished 2026-10-30 23:37 UTC. That is **7 days 4 hours 13 minutes** from the first commit of the branch to the fixed point on bare metal. The first commit under `taoxichuan/` is 2026-10-24 09:50 UTC, so the kernel itself went from its first line to compiling itself in **6 days 13 hours 47 minutes** (the Linux-KVM fixed point came a few hours earlier, on 2026-10-30).
 * **Size at the fixed point:** `taoxichuan/src` is 10,350 lines over ~37 `akuma-*` path crates; the kernel image is 1,458,104 bytes.
 * **Wall time per build** on metal with 4 vCPUs: 5m22s (K1), 5m18s (K2).
+
+### 2026-10-31: development pace - speed running 7 months of kernel development in a week
+
+**The claim (user's):** Taoxichuan speed-ran about **7 months of kernel development in a week**. The milestones that took Akuma
+about that long - compiling itself, and real SMP - are where Taoxichuan got in 7 days, because most of the work had already been
+done in Akuma and arrived as crates.
+
+**Akuma's months** (dates from `git log main`):
+
+| Milestone | Date | Time from Akuma's first commit (2025-11-27) | Commits on `main` by then |
+|---|---|---|---|
+| First commit | 2025-11-27 | - | 1 |
+| The kernel compiles itself in-VM and the result boots | 2026-06-19 | ~6.7 months | ~1,358 |
+| Shared-kernel SMP, M0-M4 (cores online, BKL, processes across cores, migration) | 2026-07-19 | ~7.7 months | - |
+| `smp-shared` in the default feature set | 2026-08-10 | ~8.5 months | ~1,775 |
+
+Self-hosting alone took about 7 months, and getting it *stable* took two more (20/20 clean builds by 2026-08-16,
+[`AKUMA_SELF_HOSTING.md`](AKUMA_SELF_HOSTING.md)). SMP came in the same stretch, and most of its cost was the races it exposed in
+fork, exit, futex, CoW and the scheduler (`docs/archive/BUG_FIX_LIST.md`).
+
+**Taoxichuan's week:** 7 days 4 hours from the branch's first commit to K1 == K2 on bare metal, 407 commits (see the entry above).
+
+**Why it was a week and not months.** Taoxichuan is ~10,350 lines of composition over ~37 `akuma-*` crates. The ABI tables,
+ext2, the network stack, the mmap and CoW decisions, the fd table, the futex and signal logic, and the process and threading
+crates came in already debugged. In Akuma, each of those had cost months of live-VM hunts on one core and then on several.
+When Taoxichuan hit a bug, the fix was usually already written down in `docs/archive/`: four of the defects behind the
+crates.io `git clone` + `cargo build` milestone were already there (entry of 2026-10-30). Most of the bugs on the way to the
+fixed point ([`TAOXICHUAN_BUGS_FOUND_2026_10_30.md`](TAOXICHUAN_BUGS_FOUND_2026_10_30.md)) were limits and leaks in
+Taoxichuan's own glue. The first one, `execve` refusing large argument blocks, is the same wall Akuma's own self-host hit on
+2026-06-19 (the 1 KB argv cap), with the same fix: Linux's limits and `E2BIG`. One was a bug in a shared crate,
+found by a differential test (item 10), and one (`-j8`, item 2) is still unexplained. What was rewritten was the glue.
+
+**What the claim does not say.** Taoxichuan still schedules on one vCPU. The fixed-point guest had 4 vCPUs, but Taoxichuan does not run SMP itself.
+What it got from Akuma's SMP months is crates that were fixed under real cross-core races, not an SMP scheduler of its own.
+It is also not as complete as Akuma: no epoll yet (goose is blocked on it), and the same compile takes about 1.8x Akuma's
+memory (entry "the fixed point" above).
+
+**What's next: can a custom kernel that ships only what your app needs be built in a day?** If the first kernel composed from
+Akuma's crates took a week, and most of that week went to filling gaps in the crates rather than writing new kernel code, how
+short does the next one get? Take one application (a tokio service, a Go binary, an nginx). Record its syscalls on Linux, turn
+that census into a feature list over the crates, compose a kernel that serves exactly that list and nothing else, and gate it
+with the Linux-differential suites. Can that be done in one day, and what is still missing when it cannot? This is the
+"kernels preconfigured for a language runtime" idea (entry of 2026-10-30) with a deadline attached. The second application
+would show whether the week was a one-off or the new cost of a kernel.

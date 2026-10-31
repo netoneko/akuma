@@ -74,8 +74,8 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `sysreg::set_tpidr_el0` (`docs/archive/SYSCALL_UNSAFE_CLEANUP.md` §6). To time a code path use
   `sysreg::cntvct_el0_ordered()` — a bare counter read is unordered against the
   work it measures and once made an 8 KB copy measure as 0 ns.
-  **59 of the 79 carry `#![forbid(unsafe_code)]`** (2026-10-06) — which crates, and why the
-  other 20 cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
+  **79 of the 108 carry `#![forbid(unsafe_code)]`** (2026-10-31) — which crates, and why the
+  other 29 cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
   with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).
   **`src/syscall/` carries the ban too** (2026-08-31), as a module attribute in
   its `mod.rs` — the first one outside `crates/`, and the reason the crate tally
