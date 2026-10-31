@@ -30,4 +30,4 @@ mod platform;
 
 pub use fx::{FxArea, XCR0_ENABLED, XSAVE_ON, fpu_reset_live, fpu_restore_live, fpu_save_live, mxcsr_mask};
 pub use machine::{Machine, Stacks};
-pub use platform::{Platform, can_run, prepare_task_slot, reserve_cores, reserved_cores, switch_to, NO_CPU};
+pub use platform::{Platform, can_run, mark_idle, prepare_task_slot, reserve_cores, reserved_cores, switch_to, NO_CPU};

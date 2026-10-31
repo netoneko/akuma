@@ -872,22 +872,14 @@ pub fn init() {
 /// leaves it alone. Called by the boot core, under the BKL, before the core is
 /// started.
 pub fn register_idle_task(cpu: usize) -> Option<usize> {
-    let slot = threading::x86_claim_slot()?;
     // This path does not go through `prepare_task_slot`, so it clears the
     // per-occupant counters itself. Low slots have usually been through the
-    // boot self-tests by the time SMP bring-up runs.
+    // boot self-tests by the time SMP bring-up runs. Under the BKL; the slot is
+    // INITIALIZING, so nothing can schedule it. Adopted rather than published
+    // (the crate's `register_idle`): it is a context that already exists.
+    let slot = threading::x86_claim_slot()?;
     reset_slot_counters(slot);
-    // Under the BKL; the slot is INITIALIZING, so nothing can schedule it.
-    let m = &MACHINE[slot];
-    m.daemon.store(true, Ordering::Relaxed);
-    m.idle.store(true, Ordering::Relaxed);
-    m.pinned.store(cpu as u32, Ordering::Relaxed);
-    m.space_root.store(0, Ordering::Relaxed);
-    m.trap_stack_top.store(0, Ordering::Relaxed);
-    // Adopted rather than published: this is a context that already exists and
-    // is about to be running, not one the scheduler will enter through a seeded
-    // stack frame. `x86_adopt_running_thread` latches `ON_CPU` for it, which is
-    // what stops a peer core picking up a stack its own core is executing.
+    akuma_sched_amd64::mark_idle(&MACHINE[slot], cpu);
     threading::x86_adopt_running_thread(slot);
     Some(slot)
 }

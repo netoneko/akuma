@@ -78,13 +78,17 @@ impl Platform for Tx {
     }
 }
 
-/// Mark core `cpu`'s idle thread: never picked by a scan, pinned to its core.
+/// Mark core `cpu`'s idle thread (the crate's rule; see `akuma_sched_amd64::mark_idle`).
 pub fn mark_idle(tid: usize, cpu: usize) {
     if let Some(m) = MACHINE.get(tid) {
-        m.idle.store(true, Ordering::Relaxed);
-        m.daemon.store(true, Ordering::Relaxed);
-        m.pinned.store(cpu as u32, Ordering::Relaxed);
+        akuma_sched_amd64::mark_idle(m, cpu);
     }
+}
+
+/// Core `cpu`'s idle thread is the context it is about to run: mark and adopt it.
+pub fn adopt_idle(tid: usize, cpu: usize) {
+    mark_idle(tid, cpu);
+    akuma_threading::x86_adopt_running_thread(tid);
 }
 
 /// Reset a claimed slot's FP state to the power-on image (`prepare_task_slot`).

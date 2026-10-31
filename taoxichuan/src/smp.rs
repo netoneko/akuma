@@ -470,8 +470,7 @@ pub fn start_secondaries(cap: usize) -> usize {
         // a stack this core is executing; its running slot is preset.
         LAPIC_OF[idx].store(id, Ordering::Relaxed);
         let idle = crate::exec_twin::idle_tid(idx);
-        crate::sched::mark_idle(idle, idx);
-        akuma_threading::x86_adopt_running_thread(idle);
+        crate::sched::adopt_idle(idle, idx);
         akuma_ring3_amd64::preset_cpu_slot(idx, idle as u64);
         mailbox_write(AP_MB_CR3, root);
         mailbox_write(AP_MB_STACK, (stack_top - 8) as u64);

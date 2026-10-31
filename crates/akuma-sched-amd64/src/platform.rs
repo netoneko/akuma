@@ -230,3 +230,14 @@ pub fn prepare_task_slot<P: Platform>(slot: usize) -> Option<usize> {
     m.fx.set(FxArea::initial());
     Some(stack_top)
 }
+
+/// Mark `m` as core `cpu`'s idle thread: a daemon the boot need not wait for,
+/// never picked by a scan (`idle`), pinned to its core, with no address space
+/// and no trap stack of its own (it runs kernel code on the kernel root).
+pub fn mark_idle<U>(m: &Machine<U>, cpu: usize) {
+    m.daemon.store(true, Ordering::Relaxed);
+    m.idle.store(true, Ordering::Relaxed);
+    m.pinned.store(cpu as u32, Ordering::Relaxed);
+    m.space_root.store(0, Ordering::Relaxed);
+    m.trap_stack_top.store(0, Ordering::Relaxed);
+}
