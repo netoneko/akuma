@@ -276,6 +276,7 @@ akuma-vm-spec = { path = "../crates/akuma-vm-spec" }
 akuma-kvm-abi = { path = "../crates/akuma-kvm-abi" }
 # The Big Kernel Lock (`smp.rs`'s `bkl_enter`/`bkl_leave` forward here).
 akuma-bkl = { path = "../crates/akuma-bkl" }
+akuma-sched-amd64 = { path = "../crates/akuma-sched-amd64" }
 # Syscall identity across architectures. Proposal item 5's shape, and the amd64
 # port is why it exists: `akuma-syscalls-linux::nr` is asm-generic (aarch64)
 # numbering, and x86_64 Linux numbers everything differently.

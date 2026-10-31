@@ -136,6 +136,7 @@ dependencies = [
  "akuma-pte-amd64",
  "akuma-rtw89",
  "akuma-ryzen-amd64",
+ "akuma-sched-amd64",
  "akuma-selftest",
  "akuma-sntp",
  "akuma-svm-amd64",
@@ -696,6 +697,16 @@ version = "0.1.0"
 [[package]]
 name = "akuma-ryzen-amd64"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-sched-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-fpu-amd64",
+ "akuma-primitives",
+ "akuma-vm-spec",
+]
 
 [[package]]
 name = "akuma-scheduler"

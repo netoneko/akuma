@@ -81,7 +81,7 @@
     "crates/akuma-xhci"
   ],
   "unsafe_sites": {
-    "amd64/src": 83,
+    "amd64/src": 80,
     "crates/akuma-alloc": 24,
     "crates/akuma-boot-amd64": 10,
     "crates/akuma-cpu": 65,
@@ -102,6 +102,7 @@
     "crates/akuma-primitives": 10,
     "crates/akuma-psci": 2,
     "crates/akuma-ring3-amd64": 3,
+    "crates/akuma-sched-amd64": 6,
     "crates/akuma-slot-table": 9,
     "crates/akuma-threading": 65,
     "crates/akuma-timer": 1,
