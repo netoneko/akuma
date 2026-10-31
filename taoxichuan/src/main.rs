@@ -2821,7 +2821,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // buffer, as on a pty): fd 2 used to fall to the console, so
             // `ls /nonexistent`, git's `fatal:` and rustc's errors never
             // reached the ssh client.
-            if child::nested_active() {
+            if child::session_buffer_active() {
                 if !child::child_write(buf, len) {
                     return e(ring3::err::EFAULT);
                 }
@@ -2937,7 +2937,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }            // The pipe branch of `write` applies per iovec: musl flushes a
             // buffered stdout as one writev, and a nested child's version
             // string belongs to the ssh session, not the console.
-            let piped = child::nested_active();
+            let piped = child::session_buffer_active();
             let mut total = 0u64;
             for i in 0..iovcnt {
                 let mut iv = [0u8; 16];

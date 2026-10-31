@@ -266,6 +266,13 @@ pub fn nested_active() -> bool {
     crate::exec_twin::current_slot() != crate::exec_twin::NO_SLOT
 }
 
+/// Do unbound stdout/stderr (fd 1/2 with no description) land in the SPAWN session buffer? Only in the old model, where the
+/// boot task is sshd and the shell it SPAWNs is a coroutine whose output sshd drains through a `ChildOut` fd. With init running as
+/// a pool thread (`start_init_thread`) nothing drains that buffer: the console is the answer, for init and for everything it forks.
+pub fn session_buffer_active() -> bool {
+    INIT_TID.load(core::sync::atomic::Ordering::Relaxed) == usize::MAX && nested_active()
+}
+
 /// The pid the current task should report (`getpid`): 1 for the boot task,
 /// the spawn slot's pid while the child runs.
 pub fn current_pid() -> u32 {
@@ -538,10 +545,11 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
     akuma_threading::x86_publish(tid);
     crate::PREEMPT_ARMED.store(true, core::sync::atomic::Ordering::Release);
     akuma_primitives::safe_print!(96, "[init] pid 1 on pool slot {}\n", tid);
-    // The boot thread: sleep a tick at a time until init's row stops running, then finish as the boot program's exit.
+    // The boot thread: a timed sleep (an unbounded park starves init's startup) that init's exit also wakes by event
+    // (`task_exit_status`); on wake, finish as the boot program's exit.
     loop {
         let (running, status) = SLOTS.with(|s| (s[tid].running, s[tid].status));
-        if !running {
+            if !running {
             crate::task_done(u64::from(status >> 8));
         }
         akuma_threading::schedule_blocking(crate::exec_twin::uptime_us() + 10_000);
@@ -741,6 +749,11 @@ fn task_exit_status(status: u32) -> ! {
     // `SpawnSlot::new()` erases the status, so the waiter gets ECHILD (cargo
     // -j4). `reap_process`'s `unregister_process` releases it.
     akuma_exec::process::hold_exited_thread_slot(lead_pid, lead);
+    // Init's exit is what the parked boot thread waits for (`start_init_thread`): wake it by event, slot 0, rather than leave it
+    // to a timed sleep that nothing is guaranteed to service once init's thread has switched away for good.
+    if lead == INIT_TID.load(core::sync::atomic::Ordering::Relaxed) {
+        akuma_threading::get_waker_for_thread(0).wake();
+    }
     crate::pipes::release_open_fds();
     if waiter != u32::MAX {
         akuma_threading::get_waker_for_thread(waiter as usize).wake();
