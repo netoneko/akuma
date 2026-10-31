@@ -32,5 +32,11 @@ ANOTHER thread, and does the ET armed-state decision re-arm it after the waker i
 `init=/bin/busybox initargs=sh,/etc/tp.sh` (the previous session's `runqemu_new.sh` rig). On the ryzen the same probe works through the host relay against any
 reachable HTTP URL (`nettest-reqwest get http://example.com/`).
 
-**Status.** Open at the time of writing; handed to glm (stage 12). Not the same as the `goose run` spin (one vCPU at 100%, no output), which may be this bug
+**Fix (2026-10-31, confirmed on TCG).** The hypothesis held: mio's waker eventfd is written on every wake and never read between wakes, so the counter stays
+non-zero and a rising-edge-only model reports the first wake and loses the rest. `epoll::on_eventfd_written(slot)` (called from `eventfd_write_val`) clears the remembered
+`EPOLLIN` of every edge-triggered entry naming that eventfd (`InterestList::reset_edge`), so the next scan reports a fresh edge - Linux's `wake_up_poll` on every
+`eventfd_write`. Results with the same probe: GET 24,968 ms -> 53 ms; sweep 1/2/3 s -> 1062/2053/3056 ms (about 55 ms overhead, all OK, were all failing); POST 24,972 ms -> 59 ms.
+goose-glm arrived at the same fix independently on the ryzen (`d528564d`, not yet pushed when the box went offline).
+
+**Status (history).** Was open at the time of the finding; handed to glm (stage 12). Not the same as the `goose run` spin (one vCPU at 100%, no output), which may be this bug
 seen from a worker that waits with an infinite timeout - the probe has a timeout, goose does not.

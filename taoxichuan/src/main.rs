@@ -2597,7 +2597,10 @@ fn eventfd_write_val(idx: usize, val: u64) -> u64 {
         return e(ring3::err::EBADF);
     };
     match res {
-        Ok(()) => 8,
+        Ok(()) => {
+            epoll::on_eventfd_written(idx);
+            8
+        }
         Err(no) => e(no as u64),
     }
 }

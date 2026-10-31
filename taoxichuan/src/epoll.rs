@@ -485,6 +485,39 @@ pub(crate) fn on_fd_drained(fd: u64) {
     });
 }
 
+/// The eventfd write hook: Linux wakes an edge-triggered waiter on EVERY `eventfd_write` (`wake_up_poll` in `eventfd_write`), not only on the
+/// empty-to-nonempty transition. mio's waker writes its eventfd to wake the reactor and never reads it between wakes, so the counter stays non-zero: with
+/// only the "not ready -> ready" edge the first wake is delivered and every later one is lost, and a tokio multi-thread runtime (one worker when
+/// `sched_getaffinity` says one CPU) parks its worker in `epoll_wait` until the timeout fires. For every instance's edge-triggered entry naming the eventfd
+/// slot `efd`, clear the remembered `EPOLLIN` so the next scan reports a fresh edge (`docs/archive/TAOXICHUAN_TOKIO_MULTI_EPOLL_FINDING.md`).
+pub(crate) fn on_eventfd_written(efd: usize) {
+    for ep in 0..4 {
+        let mut fds = [0u32; SNAP_MAX];
+        let n = epolls(|t| {
+            let Some(list) = t[ep].as_ref() else { return 0 };
+            let mut n = 0;
+            for fd in list.fds() {
+                if n == SNAP_MAX {
+                    break;
+                }
+                fds[n] = fd;
+                n += 1;
+            }
+            n
+        });
+        for &fd in &fds[..n] {
+            let names_it = crate::with_fds(|t| t.with(fd, |d| matches!(d, crate::OpenFile::EventFd(s) if *s == efd))).unwrap_or(false);
+            if names_it {
+                epolls(|t| {
+                    if let Some(list) = t[ep].as_mut() {
+                        list.reset_edge(fd, akuma_syscalls_linux::flags::epoll::EPOLLIN);
+                    }
+                });
+            }
+        }
+    }
+}
+
 /// The write-side hook (amd64's `epoll_on_fd_write_blocked`): a short write
 /// **or** an EAGAIN on `fd` witnesses the OUT readiness going away. A caller
 /// that filled the buffer and waits for `EPOLLOUT` would otherwise wait
