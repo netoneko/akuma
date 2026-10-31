@@ -1118,7 +1118,8 @@ static TASKS: akuma_primitives::cell::BorrowCell<[Task; crate::child::NSLOTS + 1
 /// Which slot `task()` hands out: 0 is the boot's init task (sshd for this
 /// stage's gate), 1 is the child running inside a SPAWN (`child.rs`), and 2
 /// is a fork child running inside that child (child.rs's M2 scaffold).
-static TASK_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static TASK_SLOT: [core::sync::atomic::AtomicUsize; smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; smp::MAX_CPUS];
 
 impl Task {
     const fn new() -> Self {
@@ -1541,11 +1542,11 @@ fn membarrier_arm(cmd: u64) -> u64 {    use akuma_syscalls_mem::membarrier::{Com
 /// the incoming real task).
 /// Which task record the syscall path acts on now.
 pub(crate) fn task_slot_index() -> usize {
-    TASK_SLOT.load(core::sync::atomic::Ordering::Relaxed)
+    TASK_SLOT[ring3::cpu_index()].load(core::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn set_task_slot(i: usize) {
-    TASK_SLOT.store(i, core::sync::atomic::Ordering::Relaxed);
+    TASK_SLOT[ring3::cpu_index()].store(i, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Every slot, for the spawn path and slice 3's real tasks: 0 is the boot's
@@ -5412,6 +5413,9 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // `ring3::set_syscall_stack_top` reads `gs:[24]`. GS_BASE is the block,
     // KERNEL_GS_BASE the (absent) program's; every ring-3 entry `swapgs`es.
     let _ = ring3::install_percpu(0, 0);
+    // The boot task runs on no spawn slot: the per-CPU slot word starts at 0,
+    // which is a ring slot, so say NO_SLOT explicitly.
+    exec_twin::set_current_slot(exec_twin::NO_SLOT);
     idt_init();
     // `CR0.WP`: a kernel *write* to a read-only page honours the page tables.
     // Without it, `.rodata` protection is a fiction and copy-on-write later

@@ -44,21 +44,18 @@ use akuma_vfs::Filesystem as _;
 /// never collide with it.
 pub const NO_SLOT: usize = usize::MAX;
 
-/// The one sanctioned "which slot is running" static on this kernel. Every
-/// other per-task value lives in `child.rs`'s per-slot table, indexed
-/// **through here**.
-static CURRENT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(NO_SLOT);
-
-/// The spawn-ring slot of the child running now, or [`NO_SLOT`] for the boot
-/// task. One-core stub; the SMP slice puts `%gs` behind this body.
+/// The spawn-ring slot of the task THIS core runs, or [`NO_SLOT`] for the boot
+/// task: the per-CPU block's `slot` word (`gs:[32]`, `akuma-ring3-amd64`), one
+/// per core. Every other per-task value lives in `child.rs`'s per-slot table,
+/// indexed **through here**.
 #[must_use]
 pub fn current_slot() -> usize {
-    CURRENT.load(core::sync::atomic::Ordering::Relaxed)
+    akuma_ring3_amd64::cpu_slot() as usize
 }
 
-/// Record the slot running now. Called on every crossing in and out.
+/// Record the slot THIS core runs now. Called on every crossing in and out.
 pub fn set_current_slot(slot: usize) {
-    CURRENT.store(slot, core::sync::atomic::Ordering::Relaxed);
+    akuma_ring3_amd64::set_cpu_slot(slot as u64);
 }
 
 /// The threading tid the CURRENT M2 shell is registered under. The shell's
@@ -202,6 +199,14 @@ pub fn fx_reset(slot: usize) {
 /// below; its CR3 is the kernel's (sched_root_of answers 0).
 pub const IDLE_TID: usize = crate::child::NSLOTS;
 
+/// Core `cpu`'s idle thread: `IDLE_TID + cpu`, all above the spawn ring, so no
+/// per-slot array indexed by a ring slot collides (the `sched_*_of` maps
+/// already treat every tid >= NSLOTS as "kernel-only idle").
+#[must_use]
+pub const fn idle_tid(cpu: usize) -> usize {
+    IDLE_TID + cpu
+}
+
 extern "C" fn idle_main() -> ! {
     // The idle loop: keep the tick alive (one `sti` window per lap — the
     // clock is what timed parks and uptime read) and yield the moment
@@ -325,12 +330,16 @@ pub fn init() {
 /// The idle answer: the boot task (`NO_SLOT` in the ring's naming). Nothing
 /// can call this until a picker exists (slice 3).
 fn idle_slot() -> usize {
-    IDLE_TID
+    idle_tid(akuma_ring3_amd64::cpu_index())
 }
 
 /// Pinning: nothing pins yet, so any slot in the ring (or the boot task) can
 /// run. `can_run` returns `false` only where a real pinning table would.
 fn can_run(slot: usize) -> bool {
+    if slot > crate::child::NSLOTS {
+        // An idle thread belongs to its own core and no other.
+        return slot == idle_tid(akuma_ring3_amd64::cpu_index());
+    }
     slot == NO_SLOT || slot <= crate::child::NSLOTS
 }
 
