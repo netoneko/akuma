@@ -58,7 +58,7 @@ pub fn wait_lap() {
     // `sti; hlt; cli`: IF is open for the one hlt and restored right after; the
     // only unmasked source is the tick, whose handler is reentrant with every
     // caller of this fn.
-    akuma_cpu::park::wfi();
+    crate::smp::bkl_unlocked(akuma_cpu::park::wfi);
 }
 
 /// Read the timestamp counter.

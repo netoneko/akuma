@@ -229,7 +229,9 @@ extern "C" fn idle_main() -> ! {
         // The NIC pump: one poll per lap (per tick-wake now). The idle lap
         // is the everything-path's last resort — an all-parked system used
         // to leave the NIC unposted and the relay deaf.
+        crate::smp::bkl_enter();
         crate::net::netpoll();
+        crate::smp::bkl_leave();
         crate::exec_twin::tick_window();
         if akuma_threading::x86_runnable_exists() {
             #[cfg(feature = "trace-err")]
@@ -345,7 +347,9 @@ fn can_run(slot: usize) -> bool {
 
 /// The BKL's recursion depth is per-thread and the lock per-core; this
 /// kernel takes no BKL yet (no threads), so there is no depth to move.
-fn transfer_lock_depth(_from: usize, _to: usize) {}
+fn transfer_lock_depth(from: usize, to: usize) {
+    crate::smp::transfer_depth(from, to);
+}
 
 fn thread_runtime() -> ThreadRuntime {
     ThreadRuntime {
@@ -595,6 +599,8 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     // entries are per fork/spawn, never per tick.
     let _ = akuma_cpu::msr::set_fs_base(ctx.fs_base);
     crate::child::set_slot_fs(cur, ctx.fs_base);
+    // Ring 3 runs without the kernel lock.
+    let _ = crate::smp::bkl_leave_all();
     unsafe { akuma_ring3_amd64::enter_user(&ef) }
 }
 

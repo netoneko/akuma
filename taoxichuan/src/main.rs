@@ -493,6 +493,17 @@ fn cow_privatize(root: u64, va: u64) -> bool {
 }
 
 fn fault_trap(t: &mut Trap<'_>) {
+    let user = t.from_ring3();
+    if user {
+        smp::bkl_enter();
+    }
+    fault_trap_locked(t);
+    if user {
+        smp::bkl_leave();
+    }
+}
+
+fn fault_trap_locked(t: &mut Trap<'_>) {
     let code = t.error_code.unwrap_or(0);
     if t.from_ring3() && code & 1 == 0 && grow_user_stack(akuma_cpu::ctlreg::cr2()) {
         return;
@@ -619,14 +630,25 @@ plain_stubs_code! {
 /// only place IF is set — every kernel path runs with interrupts masked)
 /// returns to the same instruction. The switch lands with `fork_process`.
 fn timer_trap(t: &mut Trap<'_>) {
+    smp::bkl_enter();
+    timer_trap_locked(t);
+    smp::bkl_leave();
+}
+
+fn timer_trap_locked(t: &mut Trap<'_>) {
     // The count is the twin's uptime clock (exec_twin::uptime_us); the trap
     // itself needs nothing back — a tick returns to the same instruction. The
     // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
     // The count is the twin's uptime clock (exec_twin::uptime_us); the trap
     // itself needs nothing back — a tick returns to the same instruction. The
     // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
-    let n = akuma_lapic_amd64::on_tick();
-    let _ = n;
+    // Only the boot core advances the clock; an AP's tick just acknowledges.
+    if ring3::cpu_index() == 0 {
+        let n = akuma_lapic_amd64::on_tick();
+        let _ = n;
+    } else {
+        akuma_lapic_amd64::eoi();
+    }
     // M4 slice 3 preemption (session pf, plan §5): a tick that interrupted
     // ring 3 may switch — the same `x86_yield` the park loop and the idle lap
     // already run, on this handler's own (per-slot, `arm_trap_stack`) trap
@@ -2673,7 +2695,16 @@ fn nosys_note(nr: u64) {
     }
 }
 
+/// The syscall landing: every ring 3 -> kernel entry holds the big kernel lock
+/// until the matching return to ring 3 (nesting if this core already owns it).
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
+    smp::bkl_enter();
+    let r = dispatch_locked(fr);
+    smp::bkl_leave();
+    r
+}
+
+fn dispatch_locked(fr: &mut ring3::SyscallFrame) -> u64 {
     #[cfg(feature = "trace-err")]
     {
         let (nr, a1, a2, a3) = (fr.rax, fr.rdi, fr.rsi, fr.rdx);
@@ -5382,6 +5413,7 @@ fn spawn(p: &Prog, image: &[u8]) -> ! {
     };
     // SAFETY: the address space maps the kernel half (shared PML4 entries)
     // and the task's pages; `ef` names image-placed code on the built stack.
+    let _ = smp::bkl_leave_all();
     unsafe { ring3::enter_user(&ef) }
 }
 
@@ -5416,6 +5448,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // The boot task runs on no spawn slot: the per-CPU slot word starts at 0,
     // which is a ring slot, so say NO_SLOT explicitly.
     exec_twin::set_current_slot(exec_twin::NO_SLOT);
+    // The BSP boots holding the kernel lock (no AP exists yet to contend).
+    smp::bkl_enter();
     idt_init();
     // `CR0.WP`: a kernel *write* to a read-only page honours the page tables.
     // Without it, `.rodata` protection is a fiction and copy-on-write later

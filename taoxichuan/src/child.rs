@@ -1041,6 +1041,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     // shared kernel half, `ef` is ring-3-enterable. A real child never runs
     // `exit_cross`, so this crossing has no return side; the dead dispatcher
     // frame on the task's own band is abandoned, bounded by exec counts.
+    let _ = crate::smp::bkl_leave_all();
     let _ = unsafe { child_enter(ti.root_pa, &ef, core::ptr::addr_of_mut!(EXEC_SAVE)) };
     unreachable!("exec_real_task: a real child's crossing returned")
 }
@@ -1401,6 +1402,7 @@ pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     // forever (supervisor, 2026-10-30; QEMU TCG, deterministic with the
     // switch on, absent with it off).
     akuma_threading::set_thread_state(slot_idx, 2);
+    let _ = crate::smp::bkl_leave_all();
     let code = unsafe { child_enter(ti.root_pa, &ef, save) };
     akuma_threading::set_thread_state(slot_idx, 3);
     akuma_threading::x86_release_on_cpu(slot_idx);
@@ -1584,6 +1586,7 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     // starts with fs = 0, never the outgoing task's TLS pointer.
     let _ = akuma_cpu::msr::set_fs_base(0);
     set_slot_fs(crate::exec_twin::current_slot(), 0);
+    let _ = crate::smp::bkl_leave_all();
     let status = unsafe { child_enter(ti.root_pa, &ef, core::ptr::addr_of_mut!(EXEC_SAVE)) };
     // The exec'd child exited: `child_exit` recorded its status in the slot,
     // cleared the nesting, put task slot 0 back, and restored THIS frame's
@@ -1968,6 +1971,7 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
     // semantics — the MSR already holds it at this crossing, the capture
     // comment below); stamp the shadow so its park-resumes re-install it.
     set_slot_fs(slot_idx, slot_fs_of(cur));
+    let _ = crate::smp::bkl_leave_all();
     let _code = unsafe { child_enter(root, &ef, save) };
     // The child exited into this frame: its status is in the slot, the task
     // slot is back to 1, CR3 is the shell's, `current_slot` is the shell's
@@ -2419,6 +2423,7 @@ pub fn prepare_task_slot(slot: usize) -> Option<usize> {
         Some(ktop)
     })?;
     crate::exec_twin::fx_reset(slot);
+    crate::smp::born_locked(slot);
     Some(ktop as usize)
 }
 

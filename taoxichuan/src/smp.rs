@@ -14,7 +14,7 @@
 //! no task. Stage S-c gives them the picker.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use akuma_boot_amd64::phys::phys_ptr;
 
@@ -42,6 +42,125 @@ unsafe extern "C" {
 }
 
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
+
+// ── the big kernel lock ─────────────────────────────────────────────────────
+//
+// Ring 3 runs in parallel; every kernel entry holds this lock, so the kernel's
+// statics stay single-writer (`BorrowCell`s keep working: they become a check
+// that the lock is held). Re-entrant by owner core - a tick that lands while
+// this core already holds it nests - and the *depth* is per thread: a switch
+// leaves the lock with the core and hands the depth over (`transfer_depth`),
+// except that a thread of depth 0 (an idle thread, a task in ring 3) runs
+// with the lock released.
+
+const NO_OWNER: usize = usize::MAX;
+static BKL_OWNER: AtomicUsize = AtomicUsize::new(NO_OWNER);
+/// The owner's recursion depth (only the owner writes it).
+static BKL_DEPTH: AtomicU32 = AtomicU32::new(0);
+/// Per-thread (tid-indexed) depth, saved at a switch away.
+const THREAD_SLOTS: usize = 128;
+static THREAD_DEPTH: [AtomicU32; THREAD_SLOTS] = [const { AtomicU32::new(0) }; THREAD_SLOTS];
+
+fn me() -> usize {
+    akuma_ring3_amd64::cpu_index()
+}
+
+/// Take the lock (or nest, if this core already owns it).
+pub fn bkl_enter() {
+    let cpu = me();
+    if BKL_OWNER.load(Ordering::Relaxed) == cpu {
+        BKL_DEPTH.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let mut spins = 0u64;
+    while BKL_OWNER
+        .compare_exchange_weak(NO_OWNER, cpu, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+        spins += 1;
+        if spins == 400_000_000 {
+            akuma_primitives::safe_print!(
+                96,
+                "[BKL] cpu {} stuck: owner cpu {}\n",
+                cpu,
+                BKL_OWNER.load(Ordering::Relaxed) as i64
+            );
+        }
+    }
+    BKL_DEPTH.store(1, Ordering::Relaxed);
+}
+
+/// Leave one level; release at zero. A no-op from a core that does not own it.
+pub fn bkl_leave() {
+    if BKL_OWNER.load(Ordering::Relaxed) != me() {
+        return;
+    }
+    let d = BKL_DEPTH.load(Ordering::Relaxed);
+    if d > 1 {
+        BKL_DEPTH.store(d - 1, Ordering::Relaxed);
+    } else {
+        BKL_DEPTH.store(0, Ordering::Relaxed);
+        BKL_OWNER.store(NO_OWNER, Ordering::Release);
+    }
+}
+
+/// Release completely (ring 3 is next, or a halt), returning the depth held.
+pub fn bkl_leave_all() -> u32 {
+    if BKL_OWNER.load(Ordering::Relaxed) != me() {
+        return 0;
+    }
+    let d = BKL_DEPTH.swap(0, Ordering::Relaxed);
+    BKL_OWNER.store(NO_OWNER, Ordering::Release);
+    d
+}
+
+/// Take the lock back at depth `d` (from [`bkl_leave_all`]); `d == 0` is a no-op.
+pub fn bkl_restore(d: u32) {
+    if d == 0 {
+        return;
+    }
+    bkl_enter();
+    BKL_DEPTH.store(d, Ordering::Relaxed);
+}
+
+/// Run `f` with the lock released (a halt, a spin that waits on another core).
+pub fn bkl_unlocked<R>(f: impl FnOnce() -> R) -> R {
+    let d = bkl_leave_all();
+    let r = f();
+    bkl_restore(d);
+    r
+}
+
+/// `X86ArchHooks::transfer_lock_depth`: called on the outgoing core with `from`
+/// still current. Saves this core's depth into `from`, loads `to`'s.
+pub fn transfer_depth(from: usize, to: usize) {
+    let held = if BKL_OWNER.load(Ordering::Relaxed) == me() {
+        BKL_DEPTH.load(Ordering::Relaxed)
+    } else {
+        0
+    };
+    if let Some(t) = THREAD_DEPTH.get(from) {
+        t.store(held, Ordering::Relaxed);
+    }
+    let want = THREAD_DEPTH.get(to).map_or(0, |t| t.load(Ordering::Relaxed));
+    if want == 0 {
+        let _ = bkl_leave_all();
+    } else if held == 0 {
+        bkl_enter();
+        BKL_DEPTH.store(want, Ordering::Relaxed);
+    } else {
+        BKL_DEPTH.store(want, Ordering::Relaxed);
+    }
+}
+
+/// A freshly claimed kernel thread is born holding the lock at depth 1 (its
+/// entry code is kernel code until it crosses to ring 3).
+pub fn born_locked(tid: usize) {
+    if let Some(t) = THREAD_DEPTH.get(tid) {
+        t.store(1, Ordering::Relaxed);
+    }
+}
 static AP_UP: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
 /// CPUs running the kernel: the BSP plus every AP that reported in.
