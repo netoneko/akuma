@@ -11,7 +11,6 @@
 //! (`exec_twin::idle_tid`). Every idle machine is marked `idle` and pinned to its core, so the crate's `can_run`
 //! never offers it to a picker and `idle_slot` is the only way onto it.
 
-use core::sync::atomic::Ordering;
 
 use akuma_sched_amd64::{Machine, Platform};
 
