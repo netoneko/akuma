@@ -188,6 +188,10 @@ pending generations itself, so sender-waits-for-spinner cannot deadlock.
   finished task's root while a peer frees its page tables is a triple fault.
 - Every idle thread is pinned to its core, including the boot core's (`NSLOTS`
   itself): unpinned, an AP ran on the BSP's idle stack.
+- An AP sets `IA32_APIC_BASE` enable itself before its first APIC access
+  (`smp::ap_entry64`): hardware leaves it set, but Akuma's SVM model starts a
+  non-boot vCPU with it clear and the ID read faults (nested page fault at
+  `0xfee00020`). A guest needs `smp=N` on its cmdline *and* `vm_vcpus = N`.
 - The park sites save/restore the user-`RSP` stash around a park
   (`pipes::park_once`, `futex::wait`): a parked task can resume on another core.
 

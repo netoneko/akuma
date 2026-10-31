@@ -23,7 +23,7 @@ first.
 | exclusion | why | what lifts it |
 |---|---|---|
 | No scheduler beyond the slice-3 switch | `switch_to`/the switching tick/parked waits landed (M4 slice 3), priorities and timeslices did not | a stage that needs them |
-| One big kernel lock, no fine-grained locking | `smp=N` runs N cores under one lock (`scheduling.md` § SMP); only ring 3 runs in parallel. Default stays `smp=1` until the in-guest `-j4` build is measured on it | a measured BKL bottleneck |
+| One big kernel lock, no fine-grained locking | `smp=N` runs N cores under one lock (`scheduling.md` § SMP); only ring 3 runs in parallel. Default stays `smp=1`: the in-guest `-j4` build is 1.8x *slower* on 4 CPUs (13m11s vs 7m14s, same md5; `docs/archive/TAOXICHUAN_SMP.md` § Measurements). Runs 4 vCPUs on metal | finer-grained locking |
 | No wake IPI | an idle core learns of new work at its next 10 ms tick | the wake-latency measurement |
 | No pty, no signals, no users | the ladder has not needed them | a stage that does |
 | No PCI | Firecracker-style virtio-mmio is the pinned machine | a second machine |
