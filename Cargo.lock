@@ -1300,6 +1300,7 @@ dependencies = [
  "akuma-mmap",
  "akuma-mmu",
  "akuma-net",
+ "akuma-net-yarn",
  "akuma-pipes",
  "akuma-pmm",
  "akuma-port",

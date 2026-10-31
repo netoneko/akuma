@@ -613,6 +613,12 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         ct.brk_end = brk_end;
         ct.mmap_cur = mmap_cur;
         ct.exit = None;
+        // Linux's epoll fork rule (poll.md): an epoll fd is STRIPPED from
+        // the child's table — the instance stays the creator's, and the
+        // child's exec cloexec sweep cannot free it out from under the
+        // reactor thread that created it.
+        let mut fds = fds;
+        fds.retain(|_, d| !matches!(d, crate::OpenFile::Epoll(_)));
         ct.fd_names = fds;
         ct.fd_cloexec = cloexec;
         ct.fd_nonblock = nonblock;
@@ -1851,7 +1857,10 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
     // hand copy. No kernel-side references to take on top of the cloned
     // payloads: this kernel's descriptions are indices (`File { inode }`,
     // `Socket(idx)`), the convention every close arm already runs on.
-    let forked = crate::with_fds(|t| t.fork_copy(|_| true));
+    // The predicate is Linux's epoll fork rule (stage 12): the child never
+    // inherits an epoll fd — the instance stays the creator's, and a
+    // child's close/exec sweep must not free it.
+    let forked = crate::with_fds(|t| t.fork_copy(|d| !matches!(d, crate::OpenFile::Epoll(_))));
     // A pipe end is a *counted* kernel resource: every payload the child's
     // table inherited needs one kernel-side reference taken on top of the
     // clone (`fork_copy`'s own doc — "iterate the values"). The index
@@ -2285,6 +2294,19 @@ pub fn waitpid_arm(pid: u64, status_va: u64) -> u64 {
 /// was delivered.
 pub fn close_stdin_arm(_pid: u64) -> u64 {
     0
+}
+
+/// poll(2) readiness for a ChildOut fd: `(has_data, gone)` — the buffer's
+/// two facts, asked by `sock.rs::fd_events` and `epoll.rs::fd_state`. `gone`
+/// is the child no longer running: a running child with an empty buffer is
+/// "nothing yet", a gone child with an empty buffer is EOF (the read path's
+/// `Ok(0)`), and that difference is the whole point — without it a
+/// poll/epoll waiter can never see the EOF edge (`epoll.rs` maps it to
+/// `ChildStdout { channel_gone, has_data }`, whose gone arm is the HUP).
+pub(crate) fn child_out_state(slot_idx: usize) -> (bool, bool) {
+    with_slots(|s| {
+        s.get(slot_idx).map_or((false, true), |slot| (!slot.out.is_empty(), !slot.running))
+    })
 }
 
 /// Drain the pipe behind `slot_idx` into the task's buffer: up to

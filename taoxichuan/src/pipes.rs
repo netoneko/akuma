@@ -317,6 +317,15 @@ pub fn readable(id: u32) -> bool {
     table(|t| t.readable(id))
 }
 
+/// Has the last writer of this end gone — the fact `epoll.rs`'s
+/// `FdState::PipeRead` reports as `EPOLLHUP` once the buffer is drained (the
+/// EOF edge; `readable` folds "has bytes" and "at EOF" into one true, so the
+/// hup fact has to be separate). A missing pipe counts as gone: it reads EOF.
+#[must_use]
+pub fn read_hup(id: u32) -> bool {
+    table(|t| t.counts(id).is_none_or(|(_, writers)| writers == 0))
+}
+
 #[must_use]
 pub fn writable(id: u32) -> bool {
     table(|t| t.writable(id))

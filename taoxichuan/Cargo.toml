@@ -97,6 +97,12 @@ akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
 # hand-written - the crate doc records the exceptfds bug this class of hand
 # roll has already caused once in this tree.
 akuma-syscalls-poll = { path = "../crates/akuma-syscalls-poll" }
+# Stage 12: the epoll family's WAIT LOOP, pulled not hand-written — yarn's
+# `WaitMachine` under `WaitPolicy::epoll` decides each lap's park deadline,
+# the inclusive zero-timeout and the timeout-before-signal tie-break; this
+# kernel supplies the effects (probe, sleep_until park, EINTR check). A leaf
+# crate: zero dependencies of its own.
+akuma-net-yarn = { path = "../crates/akuma-net-yarn" }
 # pn S2: membarrier's command decode (the barrier itself is an effect here).
 akuma-syscalls-mem = { path = "../crates/akuma-syscalls-mem" }
 # pn S4: futex decisions (op decode, key namespace, waiter table, deadline).

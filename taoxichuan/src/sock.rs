@@ -134,11 +134,22 @@ fn fd_events(fd: i32, events: i16) -> i16 {
         return 0;
     }
     let mut efd_idx: usize = usize::MAX;
+    let mut eslot: usize = usize::MAX;
+    let mut cout: usize = usize::MAX;
     let mut pipe_rev: i16 = 0;
     let kind = crate::with_fds(|t| t.with(fd as u32, |d| match d {
         crate::OpenFile::Socket(_) => 1,
         crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
-        crate::OpenFile::Null | crate::OpenFile::Random | crate::OpenFile::ChildOut(_) => 3,
+        crate::OpenFile::Null | crate::OpenFile::Random => 3,
+        // A spawned child's stdout buffer (stage 12 fix): READABLE while it
+        // holds bytes or the child is gone (EOF reads as readable), HUP once
+        // gone and drained. This arm used to sit in the write-only group
+        // above, so a poller asking POLLIN on a child's stdout got 0 forever
+        // — exactly what goose's `Command::output` asks next.
+        crate::OpenFile::ChildOut(i) => {
+            cout = *i;
+            6
+        }
         // A pipe end (M3): a read end is POLLIN while data or a finished
         // writer's EOF stands; a write end is POLLOUT while there is room.
         // The crate's own predicates — no second opinion, and no poller
@@ -173,6 +184,13 @@ fn fd_events(fd: i32, events: i16) -> i16 {
             efd_idx = *slot;
             4
         }
+        // An epoll fd (stage 12): readable exactly while its interest list
+        // has something that would report — `FdState::Epoll`'s answer, the
+        // crate's own decision, depth-capped inside `epoll_pending`.
+        crate::OpenFile::Epoll(slot) => {
+            eslot = *slot;
+            7
+        }
     }));
     match kind {
         Some(1) => {
@@ -197,6 +215,28 @@ fn fd_events(fd: i32, events: i16) -> i16 {
         Some(2) => POLLIN | POLLOUT,
         Some(3) => events & POLLOUT,
         Some(5) => pipe_rev & events,
+        Some(6) => {
+            // ChildOut: data or EOF is POLLIN (masked); gone-and-drained is
+            // POLLHUP (unmaskable, the EOF edge poll(2) can see).
+            const POLLHUP: i16 = 0x0010;
+            let (has_data, gone) = crate::child::child_out_state(cout);
+            let mut rev: i16 = 0;
+            if (has_data || gone) && events & POLLIN != 0 {
+                rev |= POLLIN;
+            }
+            if gone && !has_data {
+                rev |= POLLHUP;
+            }
+            rev
+        }
+        Some(7) => {
+            // Epoll-in-poll: readable while pending, never writable.
+            if events & POLLIN != 0 && crate::epoll::epoll_pending(eslot, 0) {
+                POLLIN
+            } else {
+                0
+            }
+        }
         Some(4) => {
             // An eventfd (session Q): readable while its counter is
             // non-zero, always writable — `FdState::EventFd`'s answers,
