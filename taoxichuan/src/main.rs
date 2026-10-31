@@ -5369,6 +5369,10 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // GDT, then IDT, then WP — the order of `boot::early_init`, minus the
     // steps this kernel has no caller for (per-CPU block, scheduler).
     gdt_init();
+    // This core's per-CPU block, BEFORE the IDT: a handler that runs
+    // `ring3::set_syscall_stack_top` reads `gs:[24]`. GS_BASE is the block,
+    // KERNEL_GS_BASE the (absent) program's; every ring-3 entry `swapgs`es.
+    let _ = ring3::install_percpu(0, 0);
     idt_init();
     // `CR0.WP`: a kernel *write* to a read-only page honours the page tables.
     // Without it, `.rodata` protection is a fiction and copy-on-write later

@@ -472,24 +472,97 @@ struct SyscallStack(#[allow(dead_code)] [u8; SYSCALL_STACK_SIZE]);
 #[cfg(target_arch = "x86_64")]
 static SYSCALL_STACK: SyscallStack = SyscallStack([0; SYSCALL_STACK_SIZE]);
 
-/// The stack top the stub switches to. Fixed at first use: `enable_syscalls`
-/// stores it (a static's address is a link-time fact, but casting one to an
-/// integer is not const-evaluable, so the value is written at runtime rather
-/// than computed in a `static` initializer).
+/// One core's block, reached through `%gs` in ring 0. **Layout is the contract
+/// of the naked stub and of `akuma_cpu::percpu`**: `gs:[8]` the user `RSP`
+/// stash, `gs:[16]` the syscall stack top, `gs:[24]` the core index (u32),
+/// `gs:[32]` the running slot. Replaces the two single-core statics
+/// (`USER_RSP_STASH`, `SYSCALL_STACK_TOP`) this crate used to keep.
+///
+/// Invariant (the amd64 kernel's, `amd64/src/smp.rs`): in ring 0 `GS_BASE` is
+/// this core's block and `KERNEL_GS_BASE` is the program's; the stub, the
+/// IDT stubs and [`enter_user`] `swapgs` at every ring crossing.
 #[cfg(target_arch = "x86_64")]
-static SYSCALL_STACK_TOP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[repr(C, align(64))]
+pub struct PerCpu {
+    self_ptr: core::sync::atomic::AtomicU64,
+    user_rsp: core::sync::atomic::AtomicU64,
+    syscall_top: core::sync::atomic::AtomicU64,
+    index: core::sync::atomic::AtomicU32,
+    lapic_id: core::sync::atomic::AtomicU32,
+    slot: core::sync::atomic::AtomicU64,
+}
 
-/// Where the stub parked the interrupted user `RSP` before switching away.
-/// `syscall` does not hand over a stack pointer in a register, and the user
-/// stack must not be touched before the kernel chooses to, so the stash is
-/// kernel memory. Single core, `IF` off: no other writer exists. An
-/// `AtomicU64` because two writers exist on stage 4: the stub's asm, and
-/// the nested-task handoff (`user_rsp_stash`/`set_user_rsp_stash` below) —
-/// the atomic changes nothing for the asm, which takes the address and
-/// moves plain `mov`s (a `Relaxed` access is the same instruction), and it
-/// retires the manual `Sync`/volatile `unsafe` pair the cell needed.
 #[cfg(target_arch = "x86_64")]
-static USER_RSP_STASH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const _: () = {
+    assert!(core::mem::offset_of!(PerCpu, self_ptr) == 0);
+    assert!(core::mem::offset_of!(PerCpu, user_rsp) == 8);
+    assert!(core::mem::offset_of!(PerCpu, syscall_top) == 16);
+    assert!(core::mem::offset_of!(PerCpu, index) == 24);
+    assert!(core::mem::offset_of!(PerCpu, slot) == 32);
+};
+
+/// Most cores the per-CPU table holds.
+pub const MAX_CPUS: usize = 16;
+
+#[cfg(target_arch = "x86_64")]
+impl PerCpu {
+    const fn new() -> Self {
+        Self {
+            self_ptr: core::sync::atomic::AtomicU64::new(0),
+            user_rsp: core::sync::atomic::AtomicU64::new(0),
+            syscall_top: core::sync::atomic::AtomicU64::new(0),
+            index: core::sync::atomic::AtomicU32::new(0),
+            lapic_id: core::sync::atomic::AtomicU32::new(0),
+            slot: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+static PERCPU: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
+
+/// Point THIS core's `%gs` at `PERCPU[idx]` (and its program half at 0).
+/// Call once per core before any [`user_rsp_stash`]-family accessor, with
+/// interrupts off. Returns false for an `idx` past [`MAX_CPUS`].
+#[cfg(target_arch = "x86_64")]
+pub fn install_percpu(idx: usize, lapic_id: u32) -> bool {
+    let Some(block) = PERCPU.get(idx) else { return false };
+    let addr = core::ptr::from_ref::<PerCpu>(block) as u64;
+    block.self_ptr.store(addr, core::sync::atomic::Ordering::Relaxed);
+    block.index.store(idx as u32, core::sync::atomic::Ordering::Relaxed);
+    block.lapic_id.store(lapic_id, core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: GS_BASE is this core's per-CPU base: a `static`, valid for the
+    // kernel's life; nothing reads `gs:` before this returns.
+    unsafe { msr::write(Msr::GsBase, addr) };
+    let _ = msr::set_user_gs_base(0);
+    true
+}
+
+/// This core's index (`gs:[24]`).
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn cpu_index() -> usize {
+    akuma_cpu::percpu::core_id() as usize
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn this_cpu() -> &'static PerCpu {
+    &PERCPU[cpu_index()]
+}
+
+/// The slot this core runs now (`gs:[32]`).
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn cpu_slot() -> u64 {
+    this_cpu().slot.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record the slot this core runs now.
+#[cfg(target_arch = "x86_64")]
+pub fn set_cpu_slot(v: u64) {
+    this_cpu().slot.store(v, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// The kernel's dispatcher, stored as an address so the naked stub can `call`
 /// it through memory (a naked function has no Rust-level names to reach).
@@ -583,21 +656,21 @@ pub fn user_rsp_stash() -> u64 {
     // Relaxed: single core, `IF` clear inside the syscall path — the same
     // discipline that owns every write to this static (the stub's own asm
     // included). The ordering carries no inter-core promise on purpose.
-    USER_RSP_STASH.load(core::sync::atomic::Ordering::Relaxed)
+    this_cpu().user_rsp.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Redirect the stub's user-`RSP` stash (see [`user_rsp_stash`]).
 #[cfg(target_arch = "x86_64")]
 pub fn set_user_rsp_stash(v: u64) {
     // Relaxed: as `user_rsp_stash` — single-core scratch, no ordering promise.
-    USER_RSP_STASH.store(v, core::sync::atomic::Ordering::Relaxed);
+    this_cpu().user_rsp.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// The stack top the stub switches to on the next `syscall`.
 #[cfg(target_arch = "x86_64")]
 #[must_use]
 pub fn syscall_stack_top() -> u64 {
-    SYSCALL_STACK_TOP.load(core::sync::atomic::Ordering::Relaxed)
+    this_cpu().syscall_top.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Point the stub's kernel stack at a lower region for a nested run. The
@@ -605,7 +678,7 @@ pub fn syscall_stack_top() -> u64 {
 /// stack's base and the current top untouched (the live dispatch frames).
 #[cfg(target_arch = "x86_64")]
 pub fn set_syscall_stack_top(v: u64) {
-    SYSCALL_STACK_TOP.store(v, core::sync::atomic::Ordering::Relaxed);
+    this_cpu().syscall_top.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Install `dispatcher` and point `EFER.SCE`/`STAR`/`LSTAR`/`SFMASK` at the
@@ -613,7 +686,11 @@ pub fn set_syscall_stack_top(v: u64) {
 #[cfg(target_arch = "x86_64")]
 pub fn enable_syscalls(dispatcher: Dispatcher) {
     DISPATCH.store(dispatcher as usize, core::sync::atomic::Ordering::Relaxed);
-    SYSCALL_STACK_TOP.store(
+    // The BSP's block: callers that never ran `install_percpu` still get one.
+    if msr::read(Msr::GsBase) == 0 {
+        let _ = install_percpu(0, 0);
+    }
+    this_cpu().syscall_top.store(
         (&raw const SYSCALL_STACK) as usize as u64 + SYSCALL_STACK_SIZE as u64,
         core::sync::atomic::Ordering::Relaxed,
     );
@@ -682,10 +759,10 @@ pub extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
         // In: RAX = nr, RCX = user RIP, R11 = user RFLAGS, RSP = user RSP
         // (not switched), args in RDI RSI RDX R10 R8 R9. `IF` is clear.
-        // No `swapgs`: this kernel has no per-CPU block, so `%gs` means
-        // nothing to ring 0 and there is nothing to swap.
-        "mov qword ptr [rip + {stash}], rsp",
-        "mov rsp, qword ptr [rip + {top}]",
+        // `swapgs`: ring 0's `%gs` is this core's per-CPU block from here.
+        "swapgs",
+        "mov qword ptr gs:[8], rsp",
+        "mov rsp, qword ptr gs:[16]",
         // 15 pushes (120 bytes) on top of 8 bytes of alignment padding:
         // 16-aligned at the call, frame at [rsp] matching `SyscallFrame`.
         "sub rsp, 8",
@@ -726,10 +803,9 @@ pub extern "C" fn syscall_entry() {
         "mov rax, [rsp]",
         // Back to the user stack — from the stash, not from the frame: the
         // user stack was never touched.
-        "mov rsp, qword ptr [rip + {stash}]",
+        "mov rsp, qword ptr gs:[8]",
+        "swapgs",
         "sysretq",
-        stash = sym USER_RSP_STASH,
-        top = sym SYSCALL_STACK_TOP,
         dispatch = sym DISPATCH,
     );
 }
@@ -771,6 +847,7 @@ pub unsafe extern "C" fn enter_user(f: &EntryFrame) -> ! {
         "mov r10, [rdi + 0x30]",
         "mov rsp, [rdi + 0x78]", // rsp: the user stack (rdi still points at the frame)
         "mov rdi, [rdi + 0x58]", // last: spends the frame pointer
+        "swapgs",                // ring 0 -> ring 3: GS_BASE becomes the program's
         "sysretq",
     );
 }

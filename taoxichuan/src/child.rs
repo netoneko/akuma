@@ -1678,6 +1678,7 @@ pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame, save: *m
         "mov rsp, [rsi + 0x78]",
         "mov rdi, [rsi + 0x58]",
         "mov rsi, [rsi + 0x50]", // last: spends the frame pointer
+        "swapgs",                // ring 0 -> ring 3 (see `akuma-ring3-amd64`'s per-CPU block)
         "sysretq",
     )
 }
