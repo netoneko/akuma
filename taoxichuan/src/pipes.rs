@@ -193,7 +193,7 @@ pub fn socketpair_arm(domain: u64, ty: u64, sv_va: u64) -> u64 {
 /// path. Empty-with-live-writers PARKS the caller (M4 slice 3) until a
 /// writer's wake or the last close; a caller that may not park (the boot
 /// task) still gets the M3 answer, 0.
-pub fn read_arm(id: u32, buf_va: u64, len: u64) -> u64 {
+pub fn read_arm(id: u32, buf_va: u64, len: u64, nonblock: bool) -> u64 {
     let mut chunk = [0u8; 512];
     let mut total: u64 = 0;
     while total < len {
@@ -206,6 +206,12 @@ pub fn read_arm(id: u32, buf_va: u64, len: u64) -> u64 {
             // block (the read below/next lap sees which); false ⇒ this
             // caller is the pipe's registered reader — park until a write
             // or a close wakes it, then re-read.
+            // Stage 12: O_NONBLOCK answers EAGAIN instead of parking (Linux's
+            // contract, and what mio's nonblocking pipe reads expect). A
+            // partial read stays short; only a NOTHING-yet read is EAGAIN.
+            if nonblock {
+                return if total > 0 { total } else { crate::e(ring3::err::EAGAIN) };
+            }
             let Some(tid) = may_park() else {
                 break;
             };
@@ -233,18 +239,21 @@ pub fn read_arm(id: u32, buf_va: u64, len: u64) -> u64 {
 /// slice 3) until a reader's wake; the boot task gets the M3 EAGAIN. A
 /// full-blocking `write(2)` returns only when everything is written, so a
 /// partial acceptance loops instead of answering short (musl/ash retry
-/// either way). `BrokenPipe` is EPIPE — and for a REAL task only, the
+/// either way). With `nonblock` (stage 12: the fd table's O_NONBLOCK bit,
+/// which this arm never consulted) a full buffer answers what Linux answers:
+/// the short count when something was accepted, EAGAIN when nothing was.
+/// `BrokenPipe` is EPIPE — and for a REAL task only, the
 /// documented SIGPIPE-default stand-in: the task dies by its own exit arm
 /// with 13<<8, which is what Linux's default SIGPIPE disposition does to a
 /// pipeline member (`yes` after `head` closes). M2 children and the boot
 /// task keep the bare EPIPE (P5 tolerates it; no signals exist here).
-pub fn write_arm(id: u32, buf_va: u64, len: u64) -> u64 {
+pub fn write_arm(id: u32, buf_va: u64, len: u64, nonblock: bool) -> u64 {
     let mut data = Vec::new();
     data.resize(len as usize, 0);
     if !crate::copy_from_user(&mut data, buf_va) {
         return crate::e(ring3::err::EFAULT);
     }
-    write_arm_gathered(id, &data)
+    write_arm_gathered(id, &data, nonblock)
 }
 
 /// The writev flavour: the gather already happened in the syscall arm (musl's
@@ -253,7 +262,7 @@ pub fn write_arm(id: u32, buf_va: u64, len: u64) -> u64 {
 /// slice 3 (session pf): the WRITEV syscall arm now routes bound pipe fds here
 /// — it used to fall through to the nested-child/console fallback and never
 /// reached these arms at all.
-pub fn write_arm_gathered(id: u32, data: &[u8]) -> u64 {
+pub fn write_arm_gathered(id: u32, data: &[u8], nonblock: bool) -> u64 {
     let mut done: usize = 0;
     loop {
         let (out, wakes) = table(|t| t.write(id, &data[done..]));
@@ -270,6 +279,15 @@ pub fn write_arm_gathered(id: u32, data: &[u8]) -> u64 {
                     // Full. `check_set_writer` true here means the readers
                     // vanished between the write and the check (room cannot
                     // have appeared): EPIPE, not EAGAIN.
+                    if nonblock {
+                        // Stage 12: O_NONBLOCK — the short count already
+                        // accepted, or EAGAIN when nothing was.
+                        return if done > 0 {
+                            done as u64
+                        } else {
+                            crate::e(ring3::err::EAGAIN)
+                        };
+                    }
                     let Some(tid) = may_park() else {
                         return crate::e(ring3::err::EAGAIN);
                     };

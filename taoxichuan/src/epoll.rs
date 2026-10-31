@@ -458,3 +458,36 @@ pub(crate) fn fd_state(fd: i32, requested: u32, depth: u32) -> FdState {
 pub(crate) fn epoll_close_slot(slot: usize) {
     epolls(|t| t[slot] = None);
 }
+
+/// The drain hook (amd64's `epoll_on_fd_drained`; poll.md's table): a
+/// successful read **or** an EAGAIN on `fd` witnesses the IN readiness going
+/// away, so the next arrival counts as a fresh edge — for every instance's
+/// entry, edge-triggered ones only (`reset_edge`'s own guard). Without it a
+/// reader that drained and let the peer write again waits forever: the scan
+/// recorded the old IN as already-reported and nothing re-arms it (the exact
+/// hang `epollops`' et_in_rearms_after_drain probes).
+pub(crate) fn on_fd_drained(fd: u64) {
+    let fd = fd as u32;
+    epolls(|t| {
+        for slot in t.iter_mut() {
+            if let Some(list) = slot {
+                list.reset_edge(fd, akuma_syscalls_linux::flags::epoll::EPOLLIN);
+            }
+        }
+    });
+}
+
+/// The write-side hook (amd64's `epoll_on_fd_write_blocked`): a short write
+/// **or** an EAGAIN on `fd` witnesses the OUT readiness going away. A caller
+/// that filled the buffer and waits for `EPOLLOUT` would otherwise wait
+/// forever — the intermittent half of the same incident class.
+pub(crate) fn on_fd_write_blocked(fd: u64) {
+    let fd = fd as u32;
+    epolls(|t| {
+        for slot in t.iter_mut() {
+            if let Some(list) = slot {
+                list.reset_edge(fd, akuma_syscalls_linux::flags::epoll::EPOLLOUT);
+            }
+        }
+    });
+}

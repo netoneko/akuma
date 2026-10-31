@@ -2006,7 +2006,7 @@ fn copy_range_arm(in_fd: u64, in_off_va: u64, out_fd: u64, out_off_va: u64, coun
                 .write_at_by_inode(dst, (write_off + total) as usize, &buf[..got])
                 .map_or_else(|_| e(ring3::err::EIO), |w| w as u64),
             1 => writev_file_arm(out_fd, &buf[..got]),
-            _ => pipes::write_arm_gathered(dst, &buf[..got]),
+            _ => pipes::write_arm_gathered(dst, &buf[..got], false),
         };
         if (put as i64) < 0 {
             return if total > 0 { total } else { put };
@@ -2434,7 +2434,7 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
                 if with_fds(|t| t.is_nonblock(fd as u32)) && !pipes::readable(pipe_id as u32) {
                     return e(ring3::err::EAGAIN);
                 }
-                return pipes::read_arm(pipe_id as u32, buf_va, len);
+                return pipes::read_arm(pipe_id as u32, buf_va, len, sock::fd_nonblock(fd));
             }
             _ => {}
         }
@@ -2654,6 +2654,28 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
         if nr == 202 {
             FXRING.push((islot as i32, a2, a1, a3, r));
         }
+        // Stage 12: the EPOLLET drain hooks, ONE site because the hook
+        // belongs to the fd, not to the syscall (`read` alone has eight
+        // arms). A successful read or EAGAIN clears the fd's IN edge, a
+        // short write or EAGAIN clears its OUT edge (x86_64 numbers:
+        // 44 sendto, 45 recvfrom, 46 sendmsg, 47 recvmsg). `reset_edge`
+        // touches edge-triggered entries only; a level entry never consults
+        // the mask. sendmsg carries no length argument, so it clears on
+        // EAGAIN only — a caller the next write EAGAINs re-arms anyway.
+        let v = r as i64;
+        match nr {
+            0 | 19 | 45 | 47 => {
+                if v >= 0 || v == -11 {
+                    crate::epoll::on_fd_drained(a1);
+                }
+            }
+            1 | 20 | 44 | 46 => {
+                if v < 0 || v < a3 as i64 {
+                    crate::epoll::on_fd_write_blocked(a1);
+                }
+            }
+            _ => {}
+        }
         trace_err(nr, r, a1, a2, a3);
         trace_ring(nr, r, a1, a2, a3, rip);
         r
@@ -2863,7 +2885,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 Some(2) => return write_file_arm(fd, buf, len),
                 Some(3) => return len,
                 Some(4) => return eventfd_write_arm(efd_idx, buf),
-                Some(5) => return pipes::write_arm(pipe_id as u32, buf, len),
+                Some(5) => return pipes::write_arm(pipe_id as u32, buf, len, sock::fd_nonblock(fd)),
                 _ => {}
             }
             // Unbound: only 1/2 fall back — a nested child's fd 1 is the
@@ -2967,7 +2989,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }));
             match kind {
                 Some(5) => {
-                    return crate::pipes::write_arm_gathered(pipe_id as u32, &data);
+                    return crate::pipes::write_arm_gathered(pipe_id as u32, &data, sock::fd_nonblock(fd));
                 }
                 Some(1) => {
                     let Some(idx) = sock::fd_socket(fd) else {
@@ -4351,7 +4373,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if fr.arg3() > WRITE_LIMIT || !user_ok(fr.arg2(), fr.arg3()) {
                 return e(ring3::err::EFAULT);
             }
-            pipes::write_arm(wr, fr.arg2(), fr.arg3())
+            pipes::write_arm(wr, fr.arg2(), fr.arg3(), sock::fd_nonblock(fr.arg1()))
         }
         ring3::nr::RECVFROM if pair_ends(fr.arg1()).is_some() => {
             read_fd_arm(fr.arg1(), fr.arg2(), fr.arg3())
