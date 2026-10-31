@@ -649,6 +649,13 @@ fn timer_trap_locked(t: &mut Trap<'_>) {
     if ring3::cpu_index() == 0 {
         let n = akuma_lapic_amd64::on_tick();
         let _ = n;
+        // Trace builds: every 30 s of uptime (eight times) dump each slot's last
+        // syscalls - the hang dump below only fires from an IDLE core, which a
+        // livelocked (spinning) guest never reaches.
+        #[cfg(feature = "trace-err")]
+        if n % 3000 == 2999 && n < 3000 * 8 && t.from_ring3() {
+            trace_hang_dump(6);
+        }
     } else {
         akuma_lapic_amd64::eoi();
     }
