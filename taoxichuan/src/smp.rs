@@ -76,6 +76,11 @@ pub fn kernel_root() -> u64 {
 
 const NO_OWNER: usize = usize::MAX;
 static BKL_OWNER: AtomicUsize = AtomicUsize::new(NO_OWNER);
+/// The ticket lock behind it: cores are served in the order they asked. An unfair
+/// spin lock lets cores that re-enter in a tight loop (four compilers making
+/// syscalls) starve one that asks rarely - sshd's socket service among them.
+static BKL_NEXT: AtomicU32 = AtomicU32::new(0);
+static BKL_SERVING: AtomicU32 = AtomicU32::new(0);
 /// The owner's recursion depth (only the owner writes it).
 static BKL_DEPTH: AtomicU32 = AtomicU32::new(0);
 /// Per-thread (tid-indexed) depth, saved at a switch away.
@@ -93,11 +98,9 @@ pub fn bkl_enter() {
         BKL_DEPTH.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    let ticket = BKL_NEXT.fetch_add(1, Ordering::Relaxed);
     let mut spins = 0u64;
-    while BKL_OWNER
-        .compare_exchange_weak(NO_OWNER, cpu, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    while BKL_SERVING.load(Ordering::Acquire) != ticket {
         core::hint::spin_loop();
         service_pending();
         spins += 1;
@@ -110,7 +113,15 @@ pub fn bkl_enter() {
             );
         }
     }
+    BKL_OWNER.store(cpu, Ordering::Relaxed);
     BKL_DEPTH.store(1, Ordering::Relaxed);
+}
+
+/// Hand the lock to the next ticket.
+fn bkl_release() {
+    BKL_DEPTH.store(0, Ordering::Relaxed);
+    BKL_OWNER.store(NO_OWNER, Ordering::Relaxed);
+    BKL_SERVING.fetch_add(1, Ordering::Release);
 }
 
 /// Leave one level; release at zero. A no-op from a core that does not own it.
@@ -122,8 +133,7 @@ pub fn bkl_leave() {
     if d > 1 {
         BKL_DEPTH.store(d - 1, Ordering::Relaxed);
     } else {
-        BKL_DEPTH.store(0, Ordering::Relaxed);
-        BKL_OWNER.store(NO_OWNER, Ordering::Release);
+        bkl_release();
     }
 }
 
@@ -132,8 +142,8 @@ pub fn bkl_leave_all() -> u32 {
     if BKL_OWNER.load(Ordering::Relaxed) != me() {
         return 0;
     }
-    let d = BKL_DEPTH.swap(0, Ordering::Relaxed);
-    BKL_OWNER.store(NO_OWNER, Ordering::Release);
+    let d = BKL_DEPTH.load(Ordering::Relaxed);
+    bkl_release();
     d
 }
 
