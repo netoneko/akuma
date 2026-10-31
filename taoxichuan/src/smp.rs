@@ -312,6 +312,46 @@ pub fn shootdown() {
     }
 }
 
+// ── the wake IPI ────────────────────────────────────────────────────────────
+//
+// A thread readied on one core while a peer sits in `hlt` used to wait for that
+// peer's next 10 ms tick. A core announces it is about to halt ([`park_halt`]);
+// a wake kicks one halted core with [`WAKE_VECTOR`], whose handler only
+// acknowledges - arriving ends the `hlt`, and the idle lap re-runs the picker.
+
+/// The wake IPI's vector (shares the shootdown stub: its `service_pending` is
+/// a no-op when nothing is pending).
+pub const WAKE_VECTOR: u8 = 34;
+static HALTED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Halt this core until something wakes it - the tick, a device, or a wake IPI -
+/// with the kernel lock released. Does not halt if work is already visible.
+pub fn park_halt() {
+    let me = akuma_ring3_amd64::cpu_index();
+    bkl_unlocked(|| {
+        HALTED[me].store(true, Ordering::SeqCst);
+        if !akuma_threading::x86_runnable_exists() {
+            akuma_cpu::park::wfi();
+        }
+        HALTED[me].store(false, Ordering::SeqCst);
+    });
+}
+
+/// Kick one halted core other than this one (the `trigger_sgi` hook: a wake
+/// just made a thread READY). A no-op on one core or when none is halted.
+pub fn kick_halted_core() {
+    if online_cpus() <= 1 {
+        return;
+    }
+    let me = akuma_ring3_amd64::cpu_index();
+    for idx in 0..MAX_CPUS {
+        if idx != me && HALTED[idx].load(Ordering::SeqCst) && (idx == 0 || AP_UP[idx].load(Ordering::Acquire)) {
+            akuma_lapic_amd64::send_fixed(LAPIC_OF[idx].load(Ordering::Relaxed), WAKE_VECTOR);
+            return;
+        }
+    }
+}
+
 /// CPUs running the kernel: the BSP plus every AP that reported in.
 #[must_use]
 pub fn online_cpus() -> usize {

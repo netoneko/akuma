@@ -369,7 +369,7 @@ fn transfer_lock_depth(from: usize, to: usize) {
 fn thread_runtime() -> ThreadRuntime {
     ThreadRuntime {
         uptime_us,
-        trigger_sgi: |_| {},
+        trigger_sgi: |_| crate::smp::kick_halted_core(),
         wake_core: |_| {},
         wake_remote_idle: || false,
         // ThreadRuntime's own EOI is dead on x86 (amd64's reason: the real

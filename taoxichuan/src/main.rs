@@ -810,6 +810,7 @@ fn idt_init() {
     IDT.set(akuma_lapic_amd64::TIMER_VECTOR, trap::entry(Kind::Timer));
     // The TLB-shootdown IPI (a ring-agnostic stub: `swapgs` on a ring-3 origin).
     IDT.set(smp::SHOOT_VECTOR, smp::shootdown_entry_addr());
+    IDT.set(smp::WAKE_VECTOR, smp::shootdown_entry_addr());
     IDT.load();
 }
 
@@ -1399,6 +1400,8 @@ fn munmap_arm(addr: u64, len: u64) -> u64 {
     with_task(|t| add_hole(t, addr, end));
     0
 }
+
+const RT_SIGSUSPEND: u64 = 130;
 
 /// `rt_sigaction(sig, act, oldact, sigsetsize)`. No signal is ever delivered,
 /// so the handler is recorded and read back, nothing more - but the read-back
@@ -3898,6 +3901,13 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         ring3::nr::RT_SIGACTION => sigaction_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
         ring3::nr::RT_SIGPROCMASK => sigprocmask_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
+        // x86_64 130. No signal is delivered here, so "a signal arrived" has two observable
+        // causes: a `tkill` (the thread's interrupt bit) and a child's death (SIGCHLD).
+        RT_SIGSUSPEND => {
+            let (a1, a2) = (fr.arg1(), fr.arg2());
+            child::sigsuspend_arm(fr, a1, a2)
+        }
+        15 => child::sigreturn_arm(fr),
         ring3::nr::CLOCK_GETTIME => {
             // Stage 4: the calibrated TSC gives both clocks real elapsed
             // time (net.rs). Stage 8 (M1): CLOCK_REALTIME (id 0) adds the

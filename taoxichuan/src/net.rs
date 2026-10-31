@@ -58,7 +58,7 @@ pub fn wait_lap() {
     // `sti; hlt; cli`: IF is open for the one hlt and restored right after; the
     // only unmasked source is the tick, whose handler is reentrant with every
     // caller of this fn.
-    crate::smp::bkl_unlocked(akuma_cpu::park::wfi);
+    crate::smp::park_halt();
 }
 
 /// Read the timestamp counter.
@@ -175,51 +175,43 @@ fn has_rdrand() -> bool {
 /// comparison does not depend on which one ran.
 fn weak_fill(buf: &mut [u8]) {
     static STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    let tsc = rdtsc();
-    let mut x = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, core::sync::atomic::Ordering::Relaxed) ^ tsc;
-    for chunk in buf.chunks_mut(8) {
-        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = x;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        let n = chunk.len();
-        chunk.copy_from_slice(&z.to_le_bytes()[..n]);
-    }
+    let seed = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, core::sync::atomic::Ordering::Relaxed) ^ rdtsc();
+    akuma_primitives::rng::splitmix_fill(seed, buf);
 }
 
-/// Fill `buf` from `RDRAND`, retrying transient failures ten times (Intel's
-/// own recommendation); falls back to [`weak_fill`] when the CPU lacks the
-/// instruction. Registered as both the `NetRuntime` hook (TCP ISNs) and the
-/// `getrandom(2)` arm (`sshd`'s key exchange reads it).
+/// One word from `RDRAND`, retrying transient failures ten times (Intel's own
+/// recommendation); `None` when the hardware stays out of entropy.
+#[cfg(target_arch = "x86_64")]
+fn rdrand_word() -> Option<u64> {
+    for _ in 0..10 {
+        let mut value: u64 = 0;
+        let mut ok: u8 = 0;
+        // SAFETY: `rdrand` writes a general register and sets CF; no memory,
+        // no stack.
+        unsafe {
+            core::arch::asm!(
+                "rdrand {v}", "setc {ok}",
+                v = out(reg) value, ok = out(reg_byte) ok,
+                options(nomem, nostack),
+            );
+        }
+        if ok != 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Fill `buf` from `RDRAND`; falls back to [`weak_fill`] when the CPU lacks the
+/// instruction, and for the tail if the hardware runs out of entropy (stated
+/// weak). Registered as both the `NetRuntime` hook (TCP ISNs) and the
+/// `getrandom(2)` arm (`sshd`'s key exchange reads it). The fill loop is
+/// `akuma_primitives::rng`'s; the instruction and this policy stay here.
 pub fn rng_fill(buf: &mut [u8]) {
     #[cfg(target_arch = "x86_64")]
     if has_rdrand() {
-        let mut i = 0;
-        while i < buf.len() {
-            let mut value: u64 = 0;
-            let mut ok: u8 = 0;
-            for _ in 0..10 {
-                // SAFETY: `rdrand` writes a general register and sets CF; no
-                // memory, no stack.
-                unsafe {
-                    core::arch::asm!(
-                        "rdrand {v}", "setc {ok}",
-                        v = out(reg) value, ok = out(reg_byte) ok,
-                        options(nomem, nostack),
-                    );
-                }
-                if ok != 0 {
-                    break;
-                }
-            }
-            if ok == 0 {
-                weak_fill(&mut buf[i..]); // out of entropy: stated-weak tail
-                return;
-            }
-            let n = (buf.len() - i).min(8);
-            buf[i..i + n].copy_from_slice(&value.to_le_bytes()[..n]);
-            i += n;
+        if let Err(filled) = akuma_primitives::rng::fill_from_words(buf, rdrand_word) {
+            weak_fill(&mut buf[filled..]);
         }
         return;
     }

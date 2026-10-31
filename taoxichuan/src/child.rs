@@ -2109,6 +2109,194 @@ fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
     }
 }
 
+/// `rt_sigsuspend(mask, sigsetsize)` - x86_64 130: replace the signal mask and sleep until a
+/// signal arrives, then restore it and answer `EINTR`, always.
+///
+/// This kernel delivers no signal, so a sleeper can only be woken by the two things a signal
+/// would have meant here: a `tkill` (the thread's interrupt bit, [`crate::tkill_arm`]) and a
+/// child's death (`SIGCHLD`) - busybox ash's `wait` builtin parks in exactly this call and
+/// re-polls `wait4(WNOHANG)` after it, which is why the `ENOSYS` this answered before made
+/// `cmd & ...; wait` spin forever. The child side is wait4's: a live child of this process gets
+/// this task's slot stamped as its `waiter`, so its exit wakes the sleeper.
+pub fn sigsuspend_arm(fr: &mut ring3::SyscallFrame, mask_va: u64, sigsetsize: u64) -> u64 {
+    if sigsetsize != 8 {
+        return crate::e(ring3::err::EINVAL);
+    }
+    let mut b = [0u8; 8];
+    if !crate::user_ok(mask_va, 8) || !crate::copy_from_user(&mut b, mask_va) {
+        return crate::e(ring3::err::EFAULT);
+    }
+    let me = crate::exec_twin::current_slot();
+    if me == crate::exec_twin::NO_SLOT || me >= NSLOTS {
+        // A task that may not park (the boot task) cannot sleep: report the interruption.
+        return crate::e(crate::EINTR);
+    }
+    // SIGKILL (9) and SIGSTOP (19) can never be blocked.
+    let unblockable = (1u64 << 8) | (1u64 << 18);
+    let new = u64::from_le_bytes(b) & !unblockable;
+    let old = crate::with_task(|t| core::mem::replace(&mut t.sigmask, new));
+    let my_pid = group_pid(me);
+    let mut child_died = false;
+    loop {
+        if akuma_threading::take_thread_interrupted(me) {
+            #[cfg(feature = "trace-err")]
+            sigsuspend_note(b'I', me, 0, 0);
+            break;
+        }
+        // A child of mine that has exited and is not yet reaped is the SIGCHLD that already
+        // arrived; a live one gets this slot as its waiter so its exit wakes the sleep.
+        let dead = with_slots(|s| {
+            let mut dead = None;
+            for (i, sl) in s.iter_mut().enumerate() {
+                if !sl.used || sl.reaped || parent_of(sl.pid) != my_pid {
+                    continue;
+                }
+                if sl.running {
+                    sl.waiter = me as u32;
+                } else {
+                    dead = Some((i, sl.pid));
+                }
+            }
+            dead
+        });
+        if let Some((_i, _pid)) = dead {
+            #[cfg(feature = "trace-err")]
+            sigsuspend_note(b'D', me, _i, _pid);
+            child_died = true;
+            break;
+        }
+        let stash = ring3::user_rsp_stash();
+        akuma_threading::schedule_blocking(u64::MAX);
+        ring3::set_user_rsp_stash(stash);
+    }
+    // SIGCHLD with a real handler: run it before this call returns (ash's `wait` sets a flag
+    // there and sleeps again until it is set). The mask during the call is the temporary one.
+    if child_died && deliver_sigchld(fr, new, old) {
+        return crate::e(crate::EINTR);
+    }
+    crate::with_task(|t| t.sigmask = old);
+    crate::e(crate::EINTR)
+}
+
+const SIGCHLD: u64 = 17;
+const SA_RESTORER: u64 = 0x0400_0000;
+const SA_NODEFER: u64 = 0x4000_0000;
+const SA_SIGINFO: u64 = 4;
+/// The registers `rt_sigreturn` puts back, in `pack_frame` order.
+const FRAME_WORDS: usize = 15;
+/// What the signal frame holds above the restorer slot: the saved registers, the user `rsp`
+/// at the interruption, the mask to restore.
+const SIGFRAME_BYTES: usize = FRAME_WORDS * 8 + 16;
+
+fn pack_frame(f: &ring3::SyscallFrame) -> [u64; FRAME_WORDS] {
+    [
+        f.r15, f.r14, f.r13, f.r12, f.rbp, f.rbx, f.r9, f.r8, f.r10, f.rdx, f.rsi, f.rdi, f.rax, f.user_rip,
+        f.user_rflags,
+    ]
+}
+
+fn unpack_frame(f: &mut ring3::SyscallFrame, w: &[u64; FRAME_WORDS]) {
+    f.r15 = w[0];
+    f.r14 = w[1];
+    f.r13 = w[2];
+    f.r12 = w[3];
+    f.rbp = w[4];
+    f.rbx = w[5];
+    f.r9 = w[6];
+    f.r8 = w[7];
+    f.r10 = w[8];
+    f.rdx = w[9];
+    f.rsi = w[10];
+    f.rdi = w[11];
+    f.rax = w[12];
+    f.user_rip = w[13];
+    f.user_rflags = w[14];
+}
+
+/// Push a signal frame for `SIGCHLD` and redirect the syscall's return into its handler. `false`
+/// when there is nothing to run (default/ignored disposition, blocked, or the user stack is not
+/// writable), in which case nothing was changed. The frame, from the handler's `rsp` up:
+/// `[restorer][saved registers][user rsp][mask to restore]`; the restorer's `rt_sigreturn`
+/// finds the saved block at its `rsp`. The kernel reads the block back itself, so its layout is
+/// private to [`deliver_sigchld`] and [`sigreturn_arm`].
+fn deliver_sigchld(fr: &mut ring3::SyscallFrame, cur_mask: u64, restore_mask: u64) -> bool {
+    use akuma_syscalls_signal::{SIG_DFL, SIG_IGN};
+    let act = crate::with_task(|t| t.sigact.get(SIGCHLD));
+    let (handler, flags, restorer, sa_mask) = (act[0], act[1], act[2], act[3]);
+    if handler == SIG_DFL || handler == SIG_IGN || flags & SA_RESTORER == 0 || flags & SA_SIGINFO != 0 {
+        return false;
+    }
+    if cur_mask & (1 << (SIGCHLD - 1)) != 0 {
+        return false;
+    }
+    let user_rsp = ring3::user_rsp_stash();
+    // Below the red zone, 16-aligned, then one word lower so the handler sees rsp = 8 (mod 16),
+    // as after a `call`.
+    let Some(top) = user_rsp.checked_sub(128 + SIGFRAME_BYTES as u64 + 8) else {
+        return false;
+    };
+    let at = (top & !0xF) - 8;
+    let mut buf = [0u8; 8 + SIGFRAME_BYTES];
+    buf[..8].copy_from_slice(&restorer.to_le_bytes());
+    let words = pack_frame(fr);
+    for (i, w) in words.iter().enumerate() {
+        buf[8 + i * 8..16 + i * 8].copy_from_slice(&w.to_le_bytes());
+    }
+    // Resume value of the interrupted call is EINTR.
+    let rax_at = 8 + 12 * 8;
+    buf[rax_at..rax_at + 8].copy_from_slice(&crate::e(crate::EINTR).to_le_bytes());
+    let tail = 8 + FRAME_WORDS * 8;
+    buf[tail..tail + 8].copy_from_slice(&user_rsp.to_le_bytes());
+    buf[tail + 8..tail + 16].copy_from_slice(&restore_mask.to_le_bytes());
+    if !crate::user_ok(at, buf.len() as u64) || !crate::copy_to_user(at, &buf) {
+        return false;
+    }
+    let during = cur_mask | sa_mask | if flags & SA_NODEFER == 0 { 1 << (SIGCHLD - 1) } else { 0 };
+    crate::with_task(|t| t.sigmask = during & !((1u64 << 8) | (1u64 << 18)));
+    fr.user_rip = handler;
+    fr.rdi = SIGCHLD;
+    fr.rsi = 0;
+    fr.rdx = 0;
+    ring3::set_user_rsp_stash(at);
+    true
+}
+
+/// `rt_sigreturn` - x86_64 15: the restorer's call after a handler returned. The user `rsp` is
+/// just past the restorer slot, where [`deliver_sigchld`] put the saved block.
+pub fn sigreturn_arm(fr: &mut ring3::SyscallFrame) -> u64 {
+    let at = ring3::user_rsp_stash();
+    let mut buf = [0u8; SIGFRAME_BYTES];
+    if !crate::user_ok(at, buf.len() as u64) || !crate::copy_from_user(&mut buf, at) {
+        return crate::e(ring3::err::EFAULT);
+    }
+    let mut words = [0u64; FRAME_WORDS];
+    for (i, w) in words.iter_mut().enumerate() {
+        *w = u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    }
+    let tail = FRAME_WORDS * 8;
+    let user_rsp = u64::from_le_bytes(buf[tail..tail + 8].try_into().unwrap_or([0; 8]));
+    let mask = u64::from_le_bytes(buf[tail + 8..tail + 16].try_into().unwrap_or([0; 8]));
+    // Never trust a user-built frame with a kernel address or odd flags.
+    const USER_TOP: u64 = 0x0000_8000_0000_0000;
+    if words[13] >= USER_TOP || user_rsp >= USER_TOP {
+        return crate::e(ring3::err::EFAULT);
+    }
+    words[14] = (words[14] & 0x0000_0CD5) | 0x202;
+    unpack_frame(fr, &words);
+    ring3::set_user_rsp_stash(user_rsp);
+    crate::with_task(|t| t.sigmask = mask & !((1u64 << 8) | (1u64 << 18)));
+    // The dispatcher stores this in RAX: the interrupted call's own result.
+    words[12]
+}
+
+#[cfg(feature = "trace-err")]
+fn sigsuspend_note(why: u8, me: usize, slot: usize, pid: u32) {
+    static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 24 {
+        akuma_primitives::safe_print!(96, "[sigsuspend] {} me={} slot={} pid={} my_pid={}\n", why as char, me, slot, pid, group_pid(me));
+    }
+}
+
 /// Page-table roots the twin built by hand for an exec'd image
 /// (`exec_real_task`'s loader maps raw frames), per slot. The registered
 /// `Process` only holds a `new_shared` view of such a root, so

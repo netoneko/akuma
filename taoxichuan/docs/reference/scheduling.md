@@ -139,19 +139,61 @@ moves both onto one `akuma-primitives::clock` source set at init.
 | hook | today |
 |---|---|
 | `switch_to` | **real** — the five machine effects above |
-| `current_slot` / `set_current_slot` | one-core static; the SMP slice puts `%gs` behind the body, never the callers |
-| `idle_slot` | `IDLE_TID` (= `NSLOTS`) |
-| `can_run` | any ring slot, the boot task, or the idle thread (nothing pins) |
+| `current_slot` / `set_current_slot` | the per-CPU block's `slot` word (`gs:[32]`) - one per core |
+| `idle_slot` | `idle_tid(cpu)` = `NSLOTS + cpu`: one idle thread per core |
+| `can_run` | any ring slot or the boot task on any core; an idle thread only on its own core |
 | `allow_tick` / `tick_window` | the one-instruction `sti` window — the frozen-clock escape and the idle loop's clock feeder |
 | `prepare_task_slot` / `write_user_context` / `read_user_context` | per-slot leaked stacks (64 KiB kernel + 32 KiB trap, made once, reused on recycle) and the ring-3 register capture; the fork capture reads the **live** fs MSR |
-| `transfer_lock_depth` | no-op: no BKL is taken (one core, no BKL compiled in) |
+| `transfer_lock_depth` | `smp::transfer_depth`: saves this core's big-lock depth into the outgoing thread, loads the incoming thread's (0 = run without the lock) |
 
 `ExecConfig`/`ThreadConfig` carry this kernel's truths (stack sizes = the 64
 KiB syscall band, `max_threads` = the ring width + idle, canaries off with the
 boot-stack bounds 0).
 
+## SMP (2026-10-31)
+
+`smp=N` on the command line starts N-1 application processors (default 1: the
+single-core kernel, byte-for-byte). Design: **one big kernel lock**
+(`smp.rs`), the shape of the metal kernel's `smp-shared`. Ring 3 runs in
+parallel on every core; every kernel entry holds the lock, so the kernel's
+statics stay single-writer and the `BorrowCell`s stay a check, not a lock.
+Diagram: [`../diagrams/smp.md`](../diagrams/smp.md).
+
+**Per-CPU block** (`akuma-ring3-amd64::PerCpu`, one per core, `%gs` in ring 0):
+`gs:[8]` the user-`RSP` stash, `gs:[16]` the syscall stack top, `gs:[24]` the
+core index, `gs:[32]` the running slot. The invariant is amd64's: in ring 0
+`GS_BASE` is the block and `KERNEL_GS_BASE` is the program's; the syscall stub,
+the IDT stubs and `enter_user`/`child_enter` `swapgs` at every ring crossing.
+Per-core as well: GDT row, TSS, boot trap stack (`gdt_init_cpu`), the dispatcher's
+task record (`TASK_SLOT[cpu]`), LAPIC timer (only the boot core advances the
+clock), idle thread.
+
+**The lock**: taken at the syscall landing (`dispatch`), a ring-3 fault and every
+tick; released (`bkl_leave_all`) before each ring-3 entry and around every halt
+(`net::wait_lap`). Re-entrant by owner core. The *depth* is per thread: a
+switch leaves the lock with the core and `transfer_lock_depth` hands the depth
+over, so an idle thread (depth 0) runs without it and a task born by
+`prepare_task_slot` starts at depth 1. The idle lap takes the lock for the
+NIC poll and for the pick + switch (the switch hooks read the shared slot
+tables).
+
+**TLB shootdown** (`smp::shootdown`, vector 33): sent after a CoW copy, an
+unmap (`release_pages`), an `mprotect`, and a fork's demotion of the parent's
+live PTEs; the handler reloads CR3 and acknowledges a generation; the sender
+waits for every online core. A core spinning IRQ-masked for the lock services
+pending generations itself, so sender-waits-for-spinner cannot deadlock.
+
+**Rules learned the hard way**
+- An idle core runs on the *kernel* root (`switch_to` loads it): sitting on a
+  finished task's root while a peer frees its page tables is a triple fault.
+- Every idle thread is pinned to its core, including the boot core's (`NSLOTS`
+  itself): unpinned, an AP ran on the BSP's idle stack.
+- The park sites save/restore the user-`RSP` stash around a park
+  (`pipes::park_once`, `futex::wait`): a parked task can resume on another core.
+
 ## Background
 
+`docs/archive/TAOXICHUAN_SMP.md` (the incident record),
 `docs/archive/TAOXICHUAN_M4_SCHED_LITE_PLAN.md` (slices, the `%gs` decision),
 `docs/archive/TAOXICHUAN_M4_SLICE3_PE_PLAN.md` …
 `docs/archive/TAOXICHUAN_M4_SLICE3_PH_RESULT.md` (the switch, the gates, the
