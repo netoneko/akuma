@@ -2924,9 +2924,12 @@ fn trace_err(nr: u64, r: u64, a1: u64, a2: u64, a3: u64) {
         [const { core::sync::atomic::AtomicU8::new(0) }; 512];
     let v = r as i64;
     // EFAULT is never capped away: it is the answer a bad user range gets.
-    let always = v == -14;
-    if (-4095..0).contains(&v) && v != -11 && v != -2 && v != -10 && v != -25
-        && v != -47 && v != -110
+    let always = v == -14 || nr == ring3::nr::SPAWN;
+    // SPAWN's answer is never filtered: it sits above `SEEN`'s 512 numbers (the private base), so its EPERM from a
+    // pool-thread init was invisible here for a week.
+    let spawn = nr == ring3::nr::SPAWN;
+    if (-4095..0).contains(&v) && (spawn || (v != -11 && v != -2 && v != -10 && v != -25
+        && v != -47 && v != -110))
         && (always
             || (nr as usize) < SEEN.len()
                 && SEEN[nr as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 40)

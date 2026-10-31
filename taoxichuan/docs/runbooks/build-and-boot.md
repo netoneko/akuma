@@ -43,6 +43,10 @@ BOOT FAIL <reason>
 Detail log: `/root/dev-cycle/taoxichuan-s7/boot_dev.log`; guest console:
 `/var/log/herd/vm-dev.log`.
 
+**The guest image's `/bin/sshd` must be the `linux-abi` build** (`sshd-fork-linuxabi`). A cooperative sshd uses the private
+`SPAWN`, which a pool-thread init refuses (`[spawn] refused` on the console, `/bin/sh failed to spawn` on the client). Patch the
+`.orig` with a loop mount on the ryzen under Pop (`docs/archive/TAOXICHUAN_METAL_SH_SPAWN_EPERM.md`).
+
 ## Verify
 
 - `BOOT OK` and an ssh round trip to the guest.

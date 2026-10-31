@@ -1248,7 +1248,11 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
 
 pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
     if nested_active() {
-        return crate::e(crate::err::EPERM); // one level only; nothing nests a nest
+        // One level only; nothing nests a nest. Init is a pool thread since slice S1, so a cooperative
+        // sshd (the private SPAWN user) lands here on its first exec: say so instead of a bare EPERM that
+        // reads as "/bin/sh failed to spawn" (the metal image shipped such an sshd for a week).
+        akuma_primitives::safe_print!(160, "[spawn] refused: the caller is pool slot {} - build sshd with libakuma/linux-abi (fork+execve)\n", crate::exec_twin::current_slot());
+        return crate::e(crate::err::EPERM);
     }
     let args = match read_spawn_args(fr.arg1(), fr.arg2(), fr.arg3()) {
         Ok(a) => a,
