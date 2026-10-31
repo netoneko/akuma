@@ -138,10 +138,10 @@ moves both onto one `akuma-primitives::clock` source set at init.
 
 | hook | today |
 |---|---|
-| `switch_to` | **real** — the five machine effects above |
+| `switch_to` | `akuma_sched_amd64::switch_to::<sched::Tx>` - root, trap stack, FS/GS, FP state (the crate's body, shared with the metal kernel); the syscall band and task record in `Tx::after_install` |
 | `current_slot` / `set_current_slot` | the per-CPU block's `slot` word (`gs:[32]`) - one per core |
 | `idle_slot` | `idle_tid(cpu)` = `NSLOTS + cpu`: one idle thread per core |
-| `can_run` | any ring slot or the boot task on any core; an idle thread only on its own core |
+| `can_run` | the crate's: an idle machine is never picked (it is reached through `idle_slot`); everything else by pin / affinity, none set here |
 | `allow_tick` / `tick_window` | the one-instruction `sti` window — the frozen-clock escape and the idle loop's clock feeder |
 | `prepare_task_slot` / `write_user_context` / `read_user_context` | per-slot leaked stacks (64 KiB kernel + 32 KiB trap, made once, reused on recycle) and the ring-3 register capture; the fork capture reads the **live** fs MSR |
 | `transfer_lock_depth` | `smp::transfer_depth`: saves this core's big-lock depth into the outgoing thread, loads the incoming thread's (0 = run without the lock) |

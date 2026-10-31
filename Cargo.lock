@@ -1318,6 +1318,7 @@ dependencies = [
  "akuma-primitives",
  "akuma-ring3-amd64",
  "akuma-ryzen-amd64",
+ "akuma-sched-amd64",
  "akuma-syscalls-abi",
  "akuma-syscalls-eventfd",
  "akuma-syscalls-linux",

@@ -98,6 +98,7 @@ mod net;
 mod pipes;
 #[cfg(feature = "trace-err")]
 mod ring;
+mod sched;
 mod smp;
 mod sock;
 
@@ -203,24 +204,27 @@ static mut TRAP_STACK: [TrapStack; smp::MAX_CPUS] = [const { TrapStack([0; TRAP_
 static mut TRAP_STACKS: [TrapStack; crate::child::NSLOTS + 1] =
     [const { TrapStack([0; TRAP_STACK_SIZE]) }; crate::child::NSLOTS + 1];
 
-/// Arm the ring-3 trap stack for slot `slot` — called from
-/// `exec_twin::switch_to`, the X86ArchHooks body, so the field travels with
-/// the task the way amd64's hook set travels it ("the ring-3 trap stack in
-/// the TSS"). Out-of-range slots keep whatever is armed.
-pub(crate) fn arm_trap_stack(slot: usize) {
-    if slot > crate::child::NSLOTS {
-        return;
-    }
-    // SAFETY: single core, IF clear on every caller path (switch_to runs at a
-    // park/preemption point with interrupts masked); the statics are only
-    // touched through raw pointers, never references.
+/// Where a ring-3 trap lands while slot `slot` runs: its own per-slot stack (a preempting switch leaves the
+/// interrupted frame on the interrupted task's stack, so the next ring-3 trap on any task must not land there),
+/// or - for an idle thread, which never traps from ring 3 - this core's boot stack.
+pub(crate) fn trap_top_for(slot: usize) -> u64 {
+    // SAFETY: only the address of a static is taken; nothing is read through it.
     unsafe {
-        let top = (&raw const TRAP_STACKS[slot]).cast::<u8>()
-            .add(TRAP_STACK_SIZE) as u64;
-        // A raw-pointer deref on purpose: `TSS.set_rsp0` would take a `&mut` of the
-        // static. clippy's `deref_addrof` suggestion breaks this line.
-        #[allow(clippy::deref_addrof)]
-        (*(&raw mut TSS[ring3::cpu_index()])).set_rsp0(top);
+        if slot <= crate::child::NSLOTS {
+            (&raw const TRAP_STACKS[slot]).cast::<u8>().add(TRAP_STACK_SIZE) as u64
+        } else {
+            (&raw const TRAP_STACK[ring3::cpu_index()]).cast::<u8>().add(TRAP_STACK_SIZE) as u64
+        }
+    }
+}
+
+/// Point THIS core's TSS `rsp0` at `top`.
+pub(crate) fn set_tss_rsp0(top: u64) {
+    // SAFETY: each core touches only its own TSS, IF clear on every caller path (a switch); reached
+    // through a raw pointer, never a reference to the whole array.
+    #[allow(clippy::deref_addrof)]
+    unsafe {
+        (*&raw mut TSS[ring3::cpu_index()]).set_rsp0(top);
     }
 }
 /// One TSS and one GDT per CPU: `ltr` marks a TSS descriptor busy, so two

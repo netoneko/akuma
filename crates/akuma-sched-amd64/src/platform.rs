@@ -33,6 +33,10 @@ pub trait Platform: 'static {
     type User: 'static;
     /// Bytes in each kernel / trap stack.
     const STACK_SIZE: usize;
+    /// Reload `CR3` even when the incoming root equals the active one. A kernel that can prove a root
+    /// frame was not freed and reissued (the metal kernel's freed-L0 ring) skips the write; one that
+    /// cannot must keep it, because it doubles as the flush a recycled root frame needs.
+    const RELOAD_SAME_ROOT: bool = false;
 
     /// The machine table, indexed by `akuma-threading` thread slot.
     fn machines() -> &'static [Machine<Self::User>];
@@ -126,7 +130,7 @@ pub fn switch_to<P: Platform>(from: usize, to: usize) {
         to_m.space_root.store(0, Ordering::Relaxed);
         want = P::kernel_root();
     }
-    if want != P::active_root() {
+    if P::RELOAD_SAME_ROOT || want != P::active_root() {
         // SAFETY: `want` is the kernel root or a thread's recorded root, both live PML4s
         // sharing the kernel half; a freed root was refused above.
         unsafe { P::activate(want) };

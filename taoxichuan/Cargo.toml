@@ -144,6 +144,8 @@ akuma-tty = { path = "../crates/akuma-tty" }
 akuma-exec = { path = "../crates/akuma-exec" }
 akuma-threading = { path = "../crates/akuma-threading" }
 akuma-lapic-amd64 = { path = "../crates/akuma-lapic-amd64" }
+# The machine half of the scheduler (switch / can_run / FP state), shared with the metal kernel.
+akuma-sched-amd64 = { path = "../crates/akuma-sched-amd64" }
 akuma-port = { path = "../crates/akuma-port" }
 
 [[bin]]

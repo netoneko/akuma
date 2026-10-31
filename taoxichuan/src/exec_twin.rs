@@ -87,118 +87,15 @@ pub fn uptime_us() -> u64 {
 
 // ── the X86ArchHooks bodies (the per-core machine effects) ──────────────────
 
-/// `X86ArchHooks::switch_to` — **real (slice 3)**: the machine effects of a
-/// park-point switch. `akuma-threading`'s `x86_yield_now` has already named
-/// `next` current and will move the stacks itself (`x86_switch_context` is
-/// the crate's own x86 asm); what the machine still needs from the twin is
-/// the incoming task's syscall band and its CR3. The shell is threading tid
-/// `shell_tid()` — its spawn-ring slot, written at every SPAWN crossing (it
-/// was once hardcoded 0, which only held for a boot's first login spawn) —
-/// with its SPAWN crossing band and task record 1; 1..NSLOTS real children
-/// (leaked pairs, task record tid+1); anything else the idle thread (stack
-/// below, CR3 untouched — it runs on the kernel root). `from` needs nothing:
-/// the crate saves its context.
+/// `X86ArchHooks::switch_to`: the shared body is `akuma-sched-amd64`'s (root, trap stack, FS/GS, FP state); what is
+/// this kernel's - the incoming task's syscall band and task record - is [`crate::sched::Tx`]'s `after_install`.
 fn switch_to(from: usize, to: usize) {
-    fx_save(from);
-    // (session pg: the per-switch `[tmp] sw to=` print lived here — at
-    // preemption scale it rotated the console log every ~30 s and ate the
-    // gate verdicts; removed before the first gate boot per PLAN-pg §5.)
-    let top = crate::child::sched_kstack_top(to);
-    akuma_ring3_amd64::set_syscall_stack_top(top);
-    // Session pg fix (the exec'd shell's writev loop, boot pg-2's
-    // l0=0 l1=0 br=11 dlen=0 ans=0): the dispatcher's `task()` is
-    // `TASKS[TASK_SLOT]` — every syscall's fd table, root_pa and regions
-    // source. Crossings set TASK_SLOT (`twin_enter_user`), but a park-resume
-    // of ANOTHER task followed by a tick switch back left it naming the
-    // resumer's record: the fork child then ran with another task's root_pa,
-    // its writev gather read zeros out of the wrong address space, and musl's
-    // `__stdio_write` spun forever on the 0 answer. Keep it in step with the
-    // CR3 loaded below — the same discipline the sched maps already follow
-    // (session pe boot D/E: the shell resumed under a stale record whose
-    // stack pages read zero). The idle thread (tid >= NSLOTS) runs kernel
-    // code only and leaves the previous task's slot armed, exactly as it
-    // leaves CR3.
-    if to < crate::child::NSLOTS {
-        crate::set_task_slot(crate::child::sched_task_slot_of(to));
-    }
-    // Session pf preemption: the incoming task's own ring-3 trap stack — a
-    // preempting switch leaves the interrupted frame on the interrupted task's
-    // stack, so the next ring-3 trap on any task must not land there.
-    crate::arm_trap_stack(to);
-    let root = crate::child::sched_root_of(to);
-    if root != 0 {
-        // SAFETY: `root` is a PMM-resident page-table frame naming the
-        // incoming task's image and the shared kernel half — the same load
-        // every crossing here performs. Single core, IF clear, no TLB
-        // aliasing to flush (PCID unused, CR3 writes flush non-global).
-        unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
-    } else if to >= crate::child::NSLOTS && crate::smp::kernel_root() != 0 {
-        // An idle thread runs on the kernel root. Leaving the outgoing task's
-        // root loaded was harmless on one core; with two, the other core can
-        // reap that task and free its page tables under this one.
-        // SAFETY: the boot PML4, live for the kernel's lifetime, maps the
-        // kernel half every thread runs on.
-        unsafe { core::arch::asm!("mov cr3, {}", in(reg) crate::smp::kernel_root(), options(nostack, preserves_flags)) };
-    }
-    // Session pi: restore the incoming task's own fs. The MSR is per-core
-    // and every switch used to leave it holding the OUTGOING side's (or any
-    // earlier task's) TLS pointer — the parked-resume defect that only
-    // grandfork (the first image with its own TLS) could surface. One wrmsr
-    // per switch, incoming slot's shadow; the idle thread (to >= NSLOTS)
-    // runs kernel code only and is skipped.
-    let _ = akuma_cpu::msr::set_fs_base(crate::child::slot_fs_of(to));
-    fx_restore(to);
+    akuma_sched_amd64::switch_to::<crate::sched::Tx>(from, to);
 }
 
-/// One task's `fxsave` image: x87/MMX/SSE state. The kernel is soft-float, so
-/// at a switch the registers still hold the OUTGOING task's user values, and
-/// without this every preemption or park handed them to whichever task ran
-/// next - LLVM's vector code in rustc's codegen threads then computed garbage
-/// (an out-of-range index that spelled "loss", a `free()` of a misaligned
-/// pointer). XSAVE/AVX is never enabled here, so the legacy area is the whole
-/// state (`docs/archive/AMD64_SMP_BRINGUP.md` has the amd64 twin of this).
-#[repr(C, align(16))]
-struct FxArea([u8; akuma_fpu_amd64::LEGACY_SIZE]);
-
-/// The power-on x87/SSE state (`akuma-fpu-amd64`: `FCW = 0x037F`, `MXCSR = 0x1F80`,
-/// every SSE exception masked; all-zero would unmask them and the first `divss` traps).
-const fn fx_init() -> FxArea {
-    FxArea(akuma_fpu_amd64::initial_legacy())
-}
-
-/// One area per ring slot plus the idle thread (`IDLE_TID`). Single core, IF
-/// clear at every switch; the CPU reads and writes an area through its raw
-/// pointer (`BorrowCell::as_ptr`), Rust code only ever replaces one whole.
-static FX: [akuma_primitives::cell::BorrowCell<FxArea>; crate::child::NSLOTS + 1] =
-    [const { akuma_primitives::cell::BorrowCell::new(fx_init()) }; crate::child::NSLOTS + 1];
-
-fn fx_save(slot: usize) {
-    if slot <= crate::child::NSLOTS {
-        // SAFETY: `FX[slot]` is a 16-byte-aligned 512-byte area; `fxsave64`
-        // writes exactly that and touches no flags.
-        unsafe {
-            core::arch::asm!("fxsave64 [{}]", in(reg) FX[slot].as_ptr().cast::<u8>(), options(nostack, preserves_flags));
-        }
-    }
-}
-
-fn fx_restore(slot: usize) {
-    if slot <= crate::child::NSLOTS {
-        // SAFETY: as `fx_save`; every area holds either `fx_init()` or an
-        // image `fxsave64` wrote, both valid `fxrstor64` inputs.
-        unsafe {
-            core::arch::asm!("fxrstor64 [{}]", in(reg) FX[slot].as_ptr().cast_const().cast::<u8>(), options(nostack, preserves_flags, readonly));
-        }
-    }
-}
-
-/// A slot is being given to a new task: it starts from the power-on state, not
-/// the previous occupant's registers.
+/// Reset a claimed slot's FP state (the claim path; the slot is not running).
 pub fn fx_reset(slot: usize) {
-    if slot <= crate::child::NSLOTS {
-        // The claim path (IF clear); the slot is not running.
-        FX[slot].set(fx_init());
-    }
+    crate::sched::reset_fx(slot);
 }
 
 /// The idle thread's tid: outside the spawn ring (children claim 1..NSLOTS,
@@ -256,8 +153,12 @@ pub(crate) extern "C" fn idle_main() -> ! {
             #[cfg(feature = "trace-err")]
             {
                 idle_laps += 1;
-                if idle_laps == 2000 {
+                // One core, under the kernel lock: the dump borrows the syscall ring and the in-flight table,
+                // and every idle core reaches this lap count at about the same time.
+                if idle_laps == 2000 && akuma_ring3_amd64::cpu_index() == 0 {
+                    crate::smp::bkl_enter();
                     crate::trace_hang_dump(4);
+                    crate::smp::bkl_leave();
                 }
             }
         }
@@ -270,6 +171,7 @@ fn seed_idle() {
     // Called once from `init`; the stack is leaked for the life of the kernel.
     let stack: &'static mut [u64; 2048] = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u64; 2048]));
     let top = ((core::ptr::from_mut(stack) as *const u64 as usize) + 2048 * 8) & !0xf;
+    crate::sched::mark_idle(IDLE_TID, 0);
     akuma_threading::x86_seed_entry(IDLE_TID, top, idle_main);
     akuma_threading::x86_publish(IDLE_TID);
 }
@@ -350,14 +252,7 @@ fn idle_slot() -> usize {
 /// Pinning: nothing pins yet, so any slot in the ring (or the boot task) can
 /// run. `can_run` returns `false` only where a real pinning table would.
 fn can_run(slot: usize) -> bool {
-    if slot >= crate::child::NSLOTS {
-        // An idle thread belongs to its own core and no other (the BSP's is
-        // `NSLOTS` itself: unpinned, an AP could pick it and run on the stack
-        // the BSP is using).
-        return slot == idle_tid(akuma_ring3_amd64::cpu_index());
-    }
-    // Every ring slot (and the boot task's NO_SLOT) may run on any core.
-    true
+    akuma_sched_amd64::can_run::<crate::sched::Tx>(slot)
 }
 
 /// The BKL's recursion depth is per-thread and the lock per-core; this

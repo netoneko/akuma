@@ -91,6 +91,12 @@ fn me() -> usize {
     akuma_ring3_amd64::cpu_index()
 }
 
+/// Does this core own the kernel lock? (A diagnostic for the switch.)
+#[must_use]
+pub fn lock_held() -> bool {
+    BKL_OWNER.load(Ordering::Relaxed) == me()
+}
+
 /// Take the lock (or nest, if this core already owns it).
 pub fn bkl_enter() {
     let cpu = me();
@@ -464,6 +470,7 @@ pub fn start_secondaries(cap: usize) -> usize {
         // a stack this core is executing; its running slot is preset.
         LAPIC_OF[idx].store(id, Ordering::Relaxed);
         let idle = crate::exec_twin::idle_tid(idx);
+        crate::sched::mark_idle(idle, idx);
         akuma_threading::x86_adopt_running_thread(idle);
         akuma_ring3_amd64::preset_cpu_slot(idx, idle as u64);
         mailbox_write(AP_MB_CR3, root);
