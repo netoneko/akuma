@@ -20,6 +20,13 @@ directly. Candidates, in order: the `EPOLLOUT` edge of a non-blocking `connect` 
 registered from a different thread than the waiter is not in the snapshot the waiter scans, or `fd_state` for a connecting/connected TCP socket answers not-ready
 because `netpoll()` returned early (its `IN_LAP` guard) while another thread's lap was in flight.
 
+**Leading hypothesis (added later, from `sched_getaffinity`).** The kernel answers one CPU (`main.rs`: mask `1`, returns 8 = bytes), so tokio's
+multi-thread runtime starts exactly ONE worker. The main thread then reaches the worker only through mio's waker - an `eventfd` the worker's `epoll_wait`
+watches - and the current-thread runtime, which never needs that cross-thread wake, is the case that works. A waker eventfd that is never reported readable (or
+reported once and then lost under `EPOLLET`) is exactly "zero events for the whole timeout". It is the same class as `AKUMA_AMD64_EPOLL_EVENTFD_FOLD.md` /
+the amd64 "mio waker eventfd reported only the 1st EPOLLET" stall. Check first: does `fd_state` for `OpenFile::EventFd` report readable after a `write(efd, 1)` from
+ANOTHER thread, and does the ET armed-state decision re-arm it after the waker is `read`? A probe: two threads, one `epoll_wait` on an eventfd, the other writes it.
+
 **Reproduce (TCG, no ryzen).** Build the probe: `ARCH=x86_64 userspace/nettest/rust/build-musl.sh reqwest`. Put it in the fork-sshd test image as
 `/bin/nettest-reqwest` with `scripts/kvm/goose/tokio_probe_guest.sh` as `/etc/tp.sh`, run `scripts/net_delay_server.py --port 18080` on the Mac and boot
 `init=/bin/busybox initargs=sh,/etc/tp.sh` (the previous session's `runqemu_new.sh` rig). On the ryzen the same probe works through the host relay against any
