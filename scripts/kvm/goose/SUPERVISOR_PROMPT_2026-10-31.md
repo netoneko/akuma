@@ -101,10 +101,25 @@ so it works on top of your staged commits.
 * herd (PID 1) reloads its own binary only on reboot; `herd enable/disable` re-parses confs. `zsh`: never `echo ====` (it is a command).
 * `docs/` conventions: a bug fix gets an `archive/` doc; `reference/` gets the invariant. Console output uses `safe_print!`.
 
+## State at the time this prompt was written (2026-10-31 ~02:15)
+
+* Init-as-pid-1 + forking sshd: **committed and pushed (`eadfee8c`), validated on metal** (guest kernel built on the Mac, `--features
+  no-tests,trace-err`; guest image with `/root/tx/sshd-fork-linuxabi`): `[init] pid 1 on pool slot 1`, ssh works, **two simultaneous ssh
+  sessions work** (the old single-session limit is gone). TCG battery (`battery_fork.sh`) green.
+* **glm is already running stage 12 (epoll + eventfd)**: brief `scripts/kvm/goose/taoxichuan-12-epoll-eventfd.md` (delivered to
+  `/root/dev-cycle/taoxichuan-s8/BRIEF-X12.md`, session log `$SCRATCH/goose-x12.log` of the previous session, name `x12`). Its dev cycle is
+  `sh /root/tx/gdev.sh` on the box (rebuilds the guest kernel, boots it on a fresh copy of `/root/tx/rs.goose.orig` - the guest image
+  with the 150 MB goose binary, `/etc/goose-test.sh` = `goose --version` and `/etc/goose-run.sh` = `goose run` with the GLM key - and
+  prints the console); `scripts/kvm/goose/gdev.sh` is a copy. **glm owns kvm0 while that brief runs - do not boot guests meanwhile.**
+  Gates E1 (`goose --version` -> 1.52.0), E2 (epollprobe differential), E3 (`goose run` -> `uname -a` through GLM over TLS).
+  The user's goal: `goose run uname -a` working on Taoxichuan today.
+* The vm-serve-mc herd service is disabled and `/boot/akuma-guest-tx*` / `/root/tx/rs*.img` are mine; glm uses `/boot/akuma-guest-dev`.
+* Extractions (Job A) have NOT started; nothing in `crates/` changed for them.
+
 ## First steps
 
-1. `git status`, `git log --oneline -5`, read the files above. Check the box (`ak.py 'uname -a; herd status'`): if it is on Pop, arm entry 30.
-2. If the init-as-process work is not yet committed (`git log --oneline -3 -- taoxichuan/src/child.rs`), finish it first: build the fork
-   sshd image, run `battery_fork.sh`, commit, push, then **validate on metal** (build the metal guest image with the fork sshd, boot it,
-   confirm two simultaneous ssh sessions and a `cargo build` still finishes - that is the sshd fix's real test).
-3. Start Job A's first extraction; send Job B's brief to glm; report to the user every ~5 minutes while glm works.
+1. `git status`, `git log --oneline -5`, read the files above; check glm (`ps | grep goose_acp_prompt`, `tail` its log, `git log` on the
+   box checkout `/src/github.com/netoneko/akuma`, `ls /root/dev-cycle/taoxichuan-s8 | grep RESULT-X12`). Babysit it every ~5 min.
+2. While it works, do Job A's first extraction (X2). Do NOT run guests on kvm0 until glm's session ends; verify on the TCG rig instead.
+3. When glm reports: merge `litter/taoxichuan-s4`, rebuild, run the battery, then validate on metal and try the E3 gate yourself.
+4. Then: the real init (herd + `linux-abi` + a `taoxi` feature), then more of Job A.
