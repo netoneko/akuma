@@ -220,22 +220,12 @@ extern "C" fn idle_main() -> ! {
     // check stays after the lap.
     #[cfg(feature = "trace-err")]
     let mut idle_laps = 0u32;
-    let mut dbg_laps: u32 = 0;
     loop {
         // The NIC pump: one poll per lap (per tick-wake now). The idle lap
         // is the everything-path's last resort — an all-parked system used
         // to leave the NIC unposted and the relay deaf.
         crate::net::netpoll();
         crate::exec_twin::tick_window();
-        if dbg_laps < 10 {
-            dbg_laps += 1;
-            akuma_primitives::safe_print!(
-                96,
-                "[idle] lap {} run?={}\n",
-                dbg_laps,
-                akuma_threading::x86_runnable_exists()
-            );
-        }
         if akuma_threading::x86_runnable_exists() {
             #[cfg(feature = "trace-err")]
             {

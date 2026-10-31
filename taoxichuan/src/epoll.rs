@@ -415,6 +415,14 @@ pub(crate) fn fd_state(fd: i32, requested: u32, depth: u32) -> FdState {
                     can_recv: akuma_net::socket::socket_udp_recv_ready(idx),
                     can_send: true,
                 }
+            } else if let Some(accept_ready) = akuma_net::socket::listener_ready(idx) {
+                // A LISTENER: EPOLLIN means "a connection is in the backlog",
+                // never data — `socket_tcp_ready` skips listeners
+                // (`smoltcp_handle_for` answers None for them), so without
+                // this arm an epoll-driven server never saw its accept edge
+                // (epollops `listener_reports_epollin`). HUP/ERR: a listener
+                // does not close its peers, dead stays false.
+                FdState::Tcp { dead: false, can_recv: accept_ready, can_send: false, peer_closed: false }
             } else {
                 let (dead, peer_closed) = akuma_net::socket::socket_tcp_eof(idx);
                 let (can_recv, can_send) = akuma_net::socket::socket_tcp_ready(idx);

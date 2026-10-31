@@ -364,22 +364,7 @@ pub fn net_init() -> bool {
 /// NIC every lap. This is the sshd serve loop's `sleep_ms(1)` — which makes
 /// it, not any daemon, the thing that keeps TCP alive between events.
 pub fn sleep_until(deadline_us: u64) {
-    use core::sync::atomic::{AtomicU32, Ordering};
-    static LAPS: AtomicU32 = AtomicU32::new(0);
-    let start = uptime_us();
-    let laps = LAPS.fetch_add(1, Ordering::Relaxed);
-    if laps < 12 {
-        akuma_primitives::safe_print!(
-            96,
-            "[slp] enter dl-now={}us slot={} run?={}\n",
-            deadline_us.saturating_sub(start),
-            crate::exec_twin::current_slot(),
-            akuma_threading::x86_runnable_exists()
-        );
-    }
-    let mut n: u32 = 0;
     while uptime_us() < deadline_us {
-        n += 1;
         netpoll();
         // A slotted task polling in the kernel is IF-masked, so the tick never
         // preempts it: if another task is READY (rustc's gcc child, forked
@@ -390,25 +375,11 @@ pub fn sleep_until(deadline_us: u64) {
             && slot < crate::child::NSLOTS
             && akuma_threading::x86_runnable_exists()
         {
-            if laps < 12 && n < 4 {
-                akuma_primitives::safe_print!(96, "[slp] yield lap={} slot={}\n", n, slot);
-            }
             let stash = akuma_ring3_amd64::user_rsp_stash();
             akuma_threading::x86_yield();
             akuma_ring3_amd64::set_user_rsp_stash(stash);
         } else {
-            if laps < 12 && n < 4 {
-                akuma_primitives::safe_print!(96, "[slp] wfi lap={} slot={}\n", n, slot);
-            }
             wait_lap();
         }
-    }
-    if laps < 12 {
-        akuma_primitives::safe_print!(
-            96,
-            "[slp] exit laps={} now-start={}us\n",
-            n,
-            uptime_us().saturating_sub(start)
-        );
     }
 }

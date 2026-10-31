@@ -3768,20 +3768,6 @@ fn x86_yield_now() -> bool {
     if core < MAX_CORES {
         PER_CORE_OFFCPU[core].store(cur, Ordering::SeqCst);
     }
-    {
-        use core::sync::atomic::AtomicU32;
-        static SW: AtomicU32 = AtomicU32::new(0);
-        let n = SW.fetch_add(1, Ordering::Relaxed);
-        if n < 40 {
-            safe_print!(
-                96,
-                "[sw] {}->{} state{} \n",
-                cur,
-                next,
-                THREAD_STATES[cur].load(Ordering::Relaxed)
-            );
-        }
-    }
     (hooks.transfer_lock_depth)(cur, next);
     (hooks.set_current_slot)(next);
     // Every machine effect, with `cur` still current and before the stack moves.
