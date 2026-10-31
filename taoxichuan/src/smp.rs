@@ -51,6 +51,10 @@ static ONLINE: AtomicUsize = AtomicUsize::new(1);
 /// page tables underneath it.
 static KERNEL_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+pub fn record_bsp_lapic_id(id: u32) {
+    LAPIC_OF[0].store(id, Ordering::Relaxed);
+}
+
 pub fn record_kernel_root() {
     KERNEL_ROOT.store(akuma_boot_amd64::paging::active_root(), Ordering::Relaxed);
 }
@@ -95,6 +99,7 @@ pub fn bkl_enter() {
         .is_err()
     {
         core::hint::spin_loop();
+        service_pending();
         spins += 1;
         if spins == 400_000_000 {
             akuma_primitives::safe_print!(
@@ -179,6 +184,133 @@ pub fn born_locked(tid: usize) {
     }
 }
 static AP_UP: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+// ── TLB shootdown ───────────────────────────────────────────────────────────
+//
+// `invlpg` and a CR3 reload are core-local. A mapping removed or tightened on
+// one core stays usable on a peer that cached it until the peer is told, so
+// the sender (always inside the kernel lock) sends [`SHOOT_VECTOR`] to every
+// other online core, whose handler reloads CR3 and acknowledges a generation;
+// the sender waits for every acknowledgement before it frees a frame or
+// returns to ring 3. The handler takes no lock. A core spinning IRQ-masked in
+// [`bkl_enter`] cannot take the IPI, so the spin services pending generations
+// itself ([`service_pending`]) - without that, sender-waits-for-spinner and
+// spinner-waits-for-sender is a deadlock.
+
+/// The IDT vector of the shootdown IPI (the timer is 32).
+pub const SHOOT_VECTOR: u8 = 33;
+static SHOOT_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SHOOT_PENDING: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+static SHOOT_ACKED: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+/// LAPIC id of each started core, for the IPI destination.
+static LAPIC_OF: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+
+/// Service a pending shootdown on THIS core: a full non-global flush.
+pub fn service_pending() {
+    let me = akuma_ring3_amd64::cpu_index();
+    let pending = SHOOT_PENDING[me].load(Ordering::Acquire);
+    if pending == 0 || pending <= SHOOT_ACKED[me].load(Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: rewriting CR3 with its own value is the architectural full
+    // non-global flush; the root stays valid.
+    unsafe { core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _, options(nostack)) };
+    SHOOT_ACKED[me].store(pending, Ordering::Release);
+}
+
+/// The vector-33 handler body (called from [`shootdown_entry`]).
+#[unsafe(no_mangle)]
+extern "C" fn shootdown_dispatch(_frame: *const u8) {
+    service_pending();
+    akuma_lapic_amd64::eoi();
+}
+
+core::arch::global_asm!(
+    r#"
+    .section .text
+.global shootdown_entry
+shootdown_entry:
+    test qword ptr [rsp + 8], 3
+    jz 1f
+    swapgs
+1:
+    push rbp
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    sub rsp, 8
+    cld
+    lea rdi, [rsp + 88]
+    call shootdown_dispatch
+    add rsp, 8
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    pop rbp
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
+    iretq
+"#
+);
+
+unsafe extern "C" {
+    fn shootdown_entry();
+}
+
+/// The entry stub's address, for `IDT.set(SHOOT_VECTOR, ..)`.
+#[must_use]
+pub fn shootdown_entry_addr() -> usize {
+    shootdown_entry as usize
+}
+
+/// Make every other online core drop its cached user translations, and wait
+/// until each has. The caller holds the kernel lock. A no-op on one core.
+pub fn shootdown() {
+    if online_cpus() <= 1 {
+        return;
+    }
+    let me = akuma_ring3_amd64::cpu_index();
+    let generation = SHOOT_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    for idx in 0..MAX_CPUS {
+        if idx != me && (idx == 0 || AP_UP[idx].load(Ordering::Acquire)) {
+            SHOOT_PENDING[idx].store(generation, Ordering::Release);
+        }
+    }
+    for idx in 0..MAX_CPUS {
+        if idx != me && (idx == 0 || AP_UP[idx].load(Ordering::Acquire)) {
+            akuma_lapic_amd64::send_fixed(LAPIC_OF[idx].load(Ordering::Relaxed), SHOOT_VECTOR);
+        }
+    }
+    let mut spins = 0u64;
+    for idx in 0..MAX_CPUS {
+        if idx == me || !(idx == 0 || AP_UP[idx].load(Ordering::Acquire)) {
+            continue;
+        }
+        while SHOOT_ACKED[idx].load(Ordering::Acquire) < generation {
+            core::hint::spin_loop();
+            spins += 1;
+            if spins == 400_000_000 {
+                akuma_primitives::safe_print!(96, "[shootdown] cpu {} never acknowledged gen {}\n", idx, generation);
+            }
+        }
+    }
+}
 
 /// CPUs running the kernel: the BSP plus every AP that reported in.
 #[must_use]
@@ -280,6 +412,7 @@ pub fn start_secondaries(cap: usize) -> usize {
         // The AP's idle thread: a context that exists and is about to run.
         // Adopted (ON_CPU latched) before the core starts so no peer picks up
         // a stack this core is executing; its running slot is preset.
+        LAPIC_OF[idx].store(id, Ordering::Relaxed);
         let idle = crate::exec_twin::idle_tid(idx);
         akuma_threading::x86_adopt_running_thread(idle);
         akuma_ring3_amd64::preset_cpu_slot(idx, idle as u64);

@@ -444,6 +444,9 @@ fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
             new.copy_page_from(unsafe { phys::Frame::from_pa(old) });
             slot.write(((pte & !PTE_ADDR) | PTE_W | new.pa()) & !PTE_COW);
             akuma_cpu::tlb::invlpg(va as usize);
+            // A peer running a thread of this space may still map the old
+            // frame: tell it before the old frame's count drops.
+            smp::shootdown();
             // Drops this space's count on the old frame (frees it only if it
             // was somehow the last holder).
             akuma_pmm::free_page(old as usize, akuma_primitives::preempt::current_tid() as u32);
@@ -805,6 +808,8 @@ fn idt_init() {
     // stub pointer: the trap crate's own entry, placed by `IDT.set`.
     trap::register(Kind::Timer, timer_trap);
     IDT.set(akuma_lapic_amd64::TIMER_VECTOR, trap::entry(Kind::Timer));
+    // The TLB-shootdown IPI (a ring-agnostic stub: `swapgs` on a ring-3 origin).
+    IDT.set(smp::SHOOT_VECTOR, smp::shootdown_entry_addr());
     IDT.load();
 }
 
@@ -1219,6 +1224,8 @@ fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
             mark_written(root, va as u64);
         }
     }
+    // A tightened protection must reach peers' TLBs before the call returns.
+    smp::shootdown();
     0
 }
 
@@ -1285,6 +1292,9 @@ fn release_pages(root: u64, start: u64, end: u64) {
         }
         va += 4096;
     }
+    // Peers may still hold translations for the frames just freed: no frame is
+    // reused before they have dropped them (the kernel lock is held throughout).
+    smp::shootdown();
 }
 
 /// Record `[start, end)` of the mmap slab as unmapped: lower the cursor when
@@ -4963,6 +4973,10 @@ pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
         akuma_pmm::free_page(root.pa() as usize, akuma_primitives::preempt::current_tid() as u32);
         return None;
     }
+    // The fork demoted the PARENT's live writable leaves: a peer running another
+    // thread of the parent's space must not keep writing through a stale
+    // writable translation (a write into the shared frame, silently).
+    smp::shootdown();
     Some(root.pa())
 }
 
@@ -5501,6 +5515,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // The root disk, and the ext2 root on it.
     // session pb: after PMM/heap are up - map_device allocates page-table frames
     lapic_init();
+    smp::record_bsp_lapic_id(akuma_lapic_amd64::apic_id());
     // Session pc, slice 1: the exec/threading runtime twin. Registered here,
     // not earlier: the LAPIC tick must exist before it can be anyone's clock
     // (exec_twin's uptime_us is ticks × 10 ms), and PMM/heap must be up
