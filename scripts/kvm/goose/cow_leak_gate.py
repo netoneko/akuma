@@ -13,7 +13,7 @@ Protocol: one `echo` command is the BASELINE (B0). Then `--cycles` rounds each o
   2. fork+write+exit       sh -c 'x=parent; (x=child; echo in-sub=$x); echo after=$x'   (forces a Copy break; checked)
   3. fork+exit untouched   sh -c '(exit 0); (exit 0)'
 then one final `echo`. PASS needs, exactly: final B == B0 (no tolerance: an idle machine returns every frame),
-cowrefs == 0 at the end (no shared-frame entry outlives its holders), the isolation output correct in every round,
+cowrefs back at the baseline's value at the end (0 under the spawn model; no shared-frame entry outlives its holders), the isolation output correct in every round,
 `cow=` shared > 0 and copied > 0 (the gate exercised CoW, it did not just pass vacuously), and no `[Fault]`/`PANIC`.
 A silent probe (no spawn-reap line) is a FAIL, never a pass.
 """
@@ -26,7 +26,7 @@ ap.add_argument("--port", default="2224")
 ap.add_argument("--cycles", type=int, default=20)
 a = ap.parse_args()
 
-REAP = re.compile(r"\[spawn-reap\] .*free (\d+) -> (\d+) .*cowrefs=(\d+) cow=\((\d+), (\d+), (\d+), (\d+)\)")
+REAP = re.compile(r"\[(?:spawn-)?reap\] .*free (\d+) -> (\d+) .*cowrefs=(\d+) cow=\((\d+), (\d+), (\d+), (\d+)\)")
 
 def run(cmd, timeout=120):
     r = subprocess.run(["ssh", "-i", a.key, "-p", a.port, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
@@ -44,9 +44,16 @@ def one(cmd):
     for _ in range(100):
         got = last_reap()
         if len(got) > n0:
-            return rc, out, got[-1]
+            # The fork-session model prints one [reap] per process (the session's child, then the session):
+            # let the burst settle so the last line is the idle machine's.
+            while True:
+                time.sleep(1.5)
+                more = last_reap()
+                if len(more) == len(got):
+                    return rc, out, more[-1]
+                got = more
         time.sleep(0.3)
-    print("FAIL: no [spawn-reap] line after:", cmd); sys.exit(1)
+    print("FAIL: no [reap]/[spawn-reap] line after:", cmd); sys.exit(1)
 
 rc, out, base = one("echo baseline")
 b0 = int(base[1]); print("baseline free=%d cowrefs=%s" % (b0, base[2]))
@@ -65,6 +72,7 @@ bf, refs = int(fin[1]), int(fin[2]); sh, cp = int(fin[3]), int(fin[4])
 con = open(a.console, "rb").read().decode("latin1")
 fault = "[Fault]" in con or "PANIC" in con
 print("final    free=%d cowrefs=%d shared=%d copied=%d taken=%s retried=%s fault=%s" % (bf, refs, sh, cp, fin[5], fin[6], fault))
-ok = bf == b0 and refs == 0 and sh > 0 and cp > 0 and bad == 0 and not fault
+refs0 = int(base[2])  # 0 under the spawn model; the idle machine's own shared frames under fork sessions
+ok = bf == b0 and refs == refs0 and sh > 0 and cp > 0 and bad == 0 and not fault
 print("[cow-leak-gate] base=%d end=%d delta=%d %s" % (b0, bf, bf - b0, "PASS" if ok else "FAIL"))
 sys.exit(0 if ok else 1)

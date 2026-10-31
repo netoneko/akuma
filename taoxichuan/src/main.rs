@@ -329,11 +329,7 @@ fn grow_user_stack(cr2: u64) -> bool {
 /// writable when `fork` shared it is demoted to read-only and marked, so a
 /// write fault can tell "break the share" from "this page is read-only"
 /// (`mprotect(PROT_READ)`, text) — `akuma_cow::CowFault::marked`.
-const PTE_W: u64 = 1 << 1;
-const PTE_COW: u64 = 1 << 9;
-/// The x86 dirty bit: the CPU sets it on a user store, the kernel sets it on its own stores into user pages
-/// (`copy_to_user`). It is what "written since mapping" means for the W^X policy.
-const PTE_D: u64 = 1 << 6;
+use akuma_pte_amd64::{ADDR_MASK as PTE_ADDR, COW as PTE_COW, D as PTE_D, RW as PTE_W};
 
 /// W^X (`akuma_syscalls_mem::wx`): no page is writable and executable, and a page written since it was
 /// mapped cannot be made executable. On by default; `wx=0` on the kernel command line turns it off for a
@@ -358,7 +354,6 @@ fn mark_written(root: u64, va: u64) {
         }
     }
 }
-const PTE_ADDR: u64 = 0x000f_ffff_ffff_f000;
 
 static COW_SHARED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static COW_COPY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -425,7 +420,7 @@ fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
     let action = akuma_cow::CowFault {
         pte_writable: pte & PTE_W != 0,
         marked: pte & PTE_COW != 0,
-        refs: akuma_pmm::cow_ref_get(old as usize),
+        refs: share_count(pte),
     }
     .decide();
     match action {
@@ -470,28 +465,32 @@ fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
 ///   fork) must not be written: the write would land in every holder. Refused.
 /// * An unshared read-only page is left writable to the kernel (the only holder is the one asking).
 fn cow_prepare_write(root: u64, va: u64) -> bool {
+    use akuma_cow::KernelWrite;
     let Some(slot) = leaf_entry(root, va & !0xFFF) else {
         return true; // not mapped: the translate that follows reports it
     };
     let pte = slot.read();
-    if pte & 1 == 0 || pte & PTE_W != 0 {
-        return true;
+    match akuma_cow::kernel_write(pte & 1 != 0, pte & PTE_W != 0, pte & PTE_COW != 0, share_count(pte)) {
+        KernelWrite::Allow => true,
+        KernelWrite::Break => !matches!(cow_resolve(root, va), akuma_cow::CowAction::Fault),
+        KernelWrite::Refuse => false,
     }
-    if pte & PTE_COW != 0 {
-        return !matches!(cow_resolve(root, va), akuma_cow::CowAction::Fault);
-    }
-    akuma_pmm::cow_ref_get((pte & PTE_ADDR) as usize) < 2
+}
+
+/// The PMM share count for the frame a PTE names, as `akuma-cow` takes it.
+fn share_count(pte: u64) -> u16 {
+    akuma_pmm::cow_ref_get((pte & PTE_ADDR) as usize)
 }
 
 /// `mprotect` is about to make `va` writable: a frame several spaces hold
-/// (marked or not — a shared read-only text page is unmarked) must be private
+/// (marked or not - a shared read-only text page is unmarked) must be private
 /// first, or the write lands in every holder.
 fn cow_privatize(root: u64, va: u64) -> bool {
     let Some(slot) = leaf_entry(root, va) else {
         return true;
     };
     let pte = slot.read();
-    if pte & 1 == 0 || akuma_pmm::cow_ref_get((pte & PTE_ADDR) as usize) < 2 {
+    if !akuma_cow::needs_private_copy(pte & 1 != 0, share_count(pte)) {
         return true;
     }
     // Force the Copy arm for a share the PTE does not mark.

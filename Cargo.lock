@@ -1320,6 +1320,7 @@ dependencies = [
  "akuma-pmm",
  "akuma-port",
  "akuma-primitives",
+ "akuma-pte-amd64",
  "akuma-ring3-amd64",
  "akuma-ryzen-amd64",
  "akuma-sched-amd64",

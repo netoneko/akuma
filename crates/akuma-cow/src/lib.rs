@@ -136,5 +136,41 @@ impl CowAction {
     }
 }
 
+/// What a **kernel** store into a user page (through the physmap, which never faults) may do. The CPU
+/// would have raised the fault for a user store; the kernel must decide the same thing itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KernelWrite {
+    /// Store directly: not mapped (the translate that follows reports it), already writable, or read-only
+    /// with a single holder (nobody else can observe the store).
+    Allow,
+    /// A marked CoW share: break it first ([`CowFault::decide`]), then store.
+    Break,
+    /// Read-only on purpose and held by several spaces (shared text, or an `mprotect(PROT_READ)` page after a
+    /// fork): the store would land in every holder. Refuse - `EFAULT`, as Linux's faulting kernel write.
+    Refuse,
+}
+
+/// Decide a kernel store from the live PTE's state. `present` is the P bit; `refs` the PMM share count.
+#[must_use]
+pub const fn kernel_write(present: bool, writable: bool, marked: bool, refs: u16) -> KernelWrite {
+    if !present || writable {
+        return KernelWrite::Allow;
+    }
+    if marked {
+        return KernelWrite::Break;
+    }
+    if refs < 2 { KernelWrite::Allow } else { KernelWrite::Refuse }
+}
+
+/// `mprotect` is about to make a page writable: must the frame be made private first?
+///
+/// True when it is present and several spaces hold it, marked or not (a shared read-only text page is
+/// unmarked) - the write would otherwise land in every holder. The caller then forces the Copy arm by
+/// marking the entry.
+#[must_use]
+pub const fn needs_private_copy(present: bool, refs: u16) -> bool {
+    present && refs >= 2
+}
+
 #[cfg(test)]
 mod tests;
