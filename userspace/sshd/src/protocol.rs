@@ -244,9 +244,11 @@ fn lifetime_expired_error(message: &'static str) -> NetError {
 /// the session if the probe could not go out, so an error here never needs
 /// to race the reaper.
 async fn send_idle_probe(stream: &mut SshStream, session: &mut SshSession) {
-    println("[SSH] idle: sending client-alive probe");
+    // No console line per probe: with a 30 s interval every quiet session would
+    // print one every half minute. A failed send is still logged below, and a
+    // teardown names itself.
     session.watch.note_probe_sent();
-    let payload = wire::global_request_payload(b"keepalive@akuma.os");
+    let payload = wire::global_request_payload(b"keepalive@openssh.com");
     if let Err(e) = send_packet(stream, &payload, session).await {
         eprintln(&format!("[SSH] idle: probe send failed: {:?}", e));
     }

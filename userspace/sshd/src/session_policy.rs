@@ -42,7 +42,7 @@ pub const DEFAULT_LOGIN_GRACE_MS: u64 = 120_000;
 /// Deliberately on by default (OpenSSH ships this off): a machine whose only
 /// remote way back is ssh must not let vanished peers occupy session slots
 /// forever. See [`idle_probe_due`] / [`idle_dead`].
-pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 30_000;
 
 /// How long an unanswered client-alive probe is tolerated before the session
 /// is declared dead — the `ClientAliveCountMax` analog, expressed as one
