@@ -166,7 +166,7 @@ impl akuma_sched_amd64::Platform for Amd64 {
     fn set_current_uctx(user: *mut UserCtx) {
         smp::set_current_uctx(user);
     }
-    fn user_bases(user: &UserCtx) -> (u64, u64) {
+    fn user_bases(_slot: usize, user: &UserCtx) -> (u64, u64) {
         (user.fs_base, user.gs_base)
     }
     fn l0_recently_freed(l0: u64) -> bool {

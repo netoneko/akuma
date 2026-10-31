@@ -59,8 +59,22 @@ pub trait Platform: 'static {
     fn set_kernel_stack(top: u64);
     /// Publish `user` as the record the syscall path addresses on this core.
     fn set_current_uctx(user: *mut Self::User);
-    /// `(IA32_FS_BASE, user GS base)` for a thread.
-    fn user_bases(user: &Self::User) -> (u64, u64);
+    /// `(IA32_FS_BASE, user GS base)` for a thread (`slot` is the thread, `user` its record).
+    fn user_bases(slot: usize, user: &Self::User) -> (u64, u64);
+
+    /// The page-table root `slot` runs in, given the one its machine record holds (`0` =
+    /// the kernel's). A kernel that derives the root from its own task record (so an `exec`
+    /// that swaps it needs no second write) overrides this.
+    fn space_root_of(_slot: usize, recorded: u64) -> u64 {
+        recorded
+    }
+    /// Where a ring-3 trap on this core lands while `slot` runs, given the machine record's.
+    fn trap_top_of(_slot: usize, recorded: u64) -> u64 {
+        recorded
+    }
+    /// Per-kernel machine state the shared body cannot know (a syscall band, a dispatcher's
+    /// task record), installed after the common state and before the FP switch.
+    fn after_install(_from: usize, _to: usize) {}
 
     /// Was the page-table root with this frame recently freed? (`akuma-mmu`'s freed-L0 ring.)
     /// A switch refuses to install one.
@@ -103,7 +117,7 @@ pub fn switch_to<P: Platform>(from: usize, to: usize) {
     let table = P::machines();
     let (from_m, to_m) = (&table[from], &table[to]);
 
-    let mut want = match to_m.space_root.load(Ordering::Relaxed) {
+    let mut want = match P::space_root_of(to, to_m.space_root.load(Ordering::Relaxed)) {
         0 => P::kernel_root(),
         root => root,
     };
@@ -118,12 +132,12 @@ pub fn switch_to<P: Platform>(from: usize, to: usize) {
         unsafe { P::activate(want) };
     }
 
-    P::set_kernel_stack(to_m.trap_stack_top.load(Ordering::Relaxed));
+    P::set_kernel_stack(P::trap_top_of(to, to_m.trap_stack_top.load(Ordering::Relaxed)));
     P::set_current_uctx(to_m.uctx.as_ptr());
 
-    let (fs, gs) = to_m.uctx.with(|u| P::user_bases(u));
+    let (fs, gs) = to_m.uctx.with(|u| P::user_bases(to, u));
     if fs == 0
-        && from_m.uctx.with(|u| P::user_bases(u).0) != 0
+        && from_m.uctx.with(|u| P::user_bases(from, u).0) != 0
         && !to_m.idle.load(Ordering::Relaxed)
     {
         P::stale_fs_window();
@@ -135,6 +149,7 @@ pub fn switch_to<P: Platform>(from: usize, to: usize) {
         P::switch_without_lock(from, to);
     }
     P::check_stacks(from, to);
+    P::after_install(from, to);
 
     let fx_out = from_m.fx.as_ptr();
     let fx_in = to_m.fx.as_ptr().cast_const();

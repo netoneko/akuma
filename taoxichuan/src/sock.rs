@@ -106,6 +106,8 @@ pub fn poll_arm(fds_va: u64, nfds: u64, timeout_ms: i64) -> u64 {
             fds[o + 6..o + 8].copy_from_slice(&revents.to_le_bytes());
         }
         if ready > 0 || crate::net::uptime_us() >= deadline {
+            #[cfg(feature = "trace-err")]
+            poll_note(&fds, nfds as usize, ready);
             if !crate::copy_to_user(fds_va, &fds) {
                 return crate::e(crate::err::EFAULT);
             }
@@ -117,6 +119,52 @@ pub fn poll_arm(fds_va: u64, nfds: u64, timeout_ms: i64) -> u64 {
         }
         crate::net::sleep_until(crate::net::uptime_us() + 1000);
     }
+}
+
+/// Trace builds: what a `poll` answered, `fd:events->revents` per entry, the first sixteen answers
+/// of a boot then one in 4096 - enough to see a spinning poller without flooding the console.
+#[cfg(feature = "trace-err")]
+fn poll_note(fds: &[u8], nfds: usize, ready: u64) {
+    static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n == 100 {
+        // While the syscall ring still holds what led up to a spin.
+        crate::trace_hang_dump(40);
+    }
+    if n >= 16 && n % 4096 != 0 {
+        return;
+    }
+    let mut line = akuma_primitives::console::StackWriter::<160>::new();
+    let _ = core::fmt::write(&mut line, format_args!("[poll#{}] s{} ready={}", n, crate::exec_twin::current_slot() as i64, ready));
+    for i in 0..nfds.min(6) {
+        let o = i * 8;
+        let fd = i32::from_le_bytes(fds[o..o + 4].try_into().unwrap_or([0; 4]));
+        let ev = i16::from_le_bytes(fds[o + 4..o + 6].try_into().unwrap_or([0; 2]));
+        let rev = i16::from_le_bytes(fds[o + 6..o + 8].try_into().unwrap_or([0; 2]));
+        let _ = core::fmt::write(&mut line, format_args!(" {}:{:x}->{:x}{}", fd, ev, rev, fd_tag(fd)));
+    }
+    let _ = core::fmt::write(&mut line, format_args!("\n"));
+    line.flush();
+}
+
+/// A short tag for what descriptor `fd` is, for [`poll_note`]: `[R<id>]` pipe read end, `[W<id>]` pipe
+/// write end, `[S]` socketpair, `[E]` eventfd, `[K]` socket, `[C]` child stdout, `[F]` file, `[?]` other.
+#[cfg(feature = "trace-err")]
+fn fd_tag(fd: i32) -> &'static str {
+    if fd < 0 {
+        return "";
+    }
+    crate::with_fds(|t| t.with(fd as u32, |d| match d {
+        crate::OpenFile::Pipe(_, false) => "[R]",
+        crate::OpenFile::Pipe(_, true) => "[W]",
+        crate::OpenFile::Pair(..) => "[S]",
+        crate::OpenFile::EventFd(_) => "[E]",
+        crate::OpenFile::Socket(_) => "[K]",
+        crate::OpenFile::ChildOut(_) => "[C]",
+        crate::OpenFile::File { .. } => "[F]",
+        _ => "[?]",
+    }))
+    .unwrap_or("[-]")
 }
 
 /// The one readiness probe poll and select share: what `revents` does this fd
