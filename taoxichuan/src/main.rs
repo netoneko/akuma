@@ -5497,6 +5497,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         halt();
     }
 
+    smp::record_kernel_root();
     // The root disk, and the ext2 root on it.
     // session pb: after PMM/heap are up - map_device allocates page-table frames
     lapic_init();

@@ -28,7 +28,9 @@ const AP_MB_CR3: u64 = AP_TRAMPOLINE_PA + 0xF00;
 const AP_MB_STACK: u64 = AP_TRAMPOLINE_PA + 0xF08;
 const AP_MB_ENTRY: u64 = AP_TRAMPOLINE_PA + 0xF10;
 const AP_MB_INDEX: u64 = AP_TRAMPOLINE_PA + 0xF18;
-const AP_STACK_SIZE: usize = 32 * 1024;
+/// An AP's boot stack is also its idle thread's: it runs `netpoll` (smoltcp) and
+/// takes ticks that nest another `netpoll`, so it is far deeper than amd64's 32 KiB.
+const AP_STACK_SIZE: usize = 128 * 1024;
 const PTE_P_RW: u64 = 0x3;
 /// Microseconds to wait after INIT, and the budget (spins) for an AP to report.
 const AP_INIT_DELAY_US: u64 = 10_000;
@@ -42,6 +44,21 @@ unsafe extern "C" {
 }
 
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
+
+/// The kernel's own PML4 (the boot root, recorded before any user space is
+/// loaded). A core with nothing to run switches to it: an idle core must not
+/// sit on a task's root, because another core can reap that task and free the
+/// page tables underneath it.
+static KERNEL_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn record_kernel_root() {
+    KERNEL_ROOT.store(akuma_boot_amd64::paging::active_root(), Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn kernel_root() -> u64 {
+    KERNEL_ROOT.load(Ordering::Relaxed)
+}
 
 // ── the big kernel lock ─────────────────────────────────────────────────────
 //
@@ -260,6 +277,12 @@ pub fn start_secondaries(cap: usize) -> usize {
         }
         let stack = alloc::vec![0u8; AP_STACK_SIZE].leak();
         let stack_top = (stack.as_ptr() as usize + AP_STACK_SIZE) & !0xf;
+        // The AP's idle thread: a context that exists and is about to run.
+        // Adopted (ON_CPU latched) before the core starts so no peer picks up
+        // a stack this core is executing; its running slot is preset.
+        let idle = crate::exec_twin::idle_tid(idx);
+        akuma_threading::x86_adopt_running_thread(idle);
+        akuma_ring3_amd64::preset_cpu_slot(idx, idle as u64);
         mailbox_write(AP_MB_CR3, root);
         mailbox_write(AP_MB_STACK, (stack_top - 8) as u64);
         #[allow(function_casts_as_integer)]
@@ -310,8 +333,9 @@ extern "C" fn ap_entry64(idx: u64) -> ! {
     akuma_lapic_amd64::software_enable(0xFF);
     akuma_ring3_amd64::enable_syscalls_this_core();
     AP_UP[idx].store(true, Ordering::Release);
-    loop {
-        // SAFETY: halting a core that has nothing to run (S-b); IF is clear.
-        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
-    }
+    // S-c: this core joins the scheduler. Its tick is armed (the BSP alone
+    // advances the clock - `timer_trap`), and its idle thread is the one the
+    // BSP adopted for it: the same loop the BSP's idle thread runs.
+    akuma_lapic_amd64::start_timer();
+    crate::exec_twin::idle_main()
 }

@@ -551,6 +551,15 @@ fn this_cpu() -> &'static PerCpu {
     &PERCPU[cpu_index()]
 }
 
+/// Set core `idx`'s running slot from ANOTHER core (the BSP presets an AP's idle
+/// slot before it starts). Not for a core's own bookkeeping: use [`set_cpu_slot`].
+#[cfg(target_arch = "x86_64")]
+pub fn preset_cpu_slot(idx: usize, slot: u64) {
+    if let Some(b) = PERCPU.get(idx) {
+        b.slot.store(slot, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The slot this core runs now (`gs:[32]`).
 #[cfg(target_arch = "x86_64")]
 #[must_use]

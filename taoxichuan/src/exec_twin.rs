@@ -132,6 +132,13 @@ fn switch_to(from: usize, to: usize) {
         // every crossing here performs. Single core, IF clear, no TLB
         // aliasing to flush (PCID unused, CR3 writes flush non-global).
         unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+    } else if to >= crate::child::NSLOTS && crate::smp::kernel_root() != 0 {
+        // An idle thread runs on the kernel root. Leaving the outgoing task's
+        // root loaded was harmless on one core; with two, the other core can
+        // reap that task and free its page tables under this one.
+        // SAFETY: the boot PML4, live for the kernel's lifetime, maps the
+        // kernel half every thread runs on.
+        unsafe { core::arch::asm!("mov cr3, {}", in(reg) crate::smp::kernel_root(), options(nostack, preserves_flags)) };
     }
     // Session pi: restore the incoming task's own fs. The MSR is per-core
     // and every switch used to leave it holding the OUTGOING side's (or any
@@ -207,7 +214,7 @@ pub const fn idle_tid(cpu: usize) -> usize {
     IDLE_TID + cpu
 }
 
-extern "C" fn idle_main() -> ! {
+pub(crate) extern "C" fn idle_main() -> ! {
     // The idle loop: keep the tick alive (one `sti` window per lap — the
     // clock is what timed parks and uptime read) and yield the moment
     // anything becomes READY. Without the yield, a woken task would wait
@@ -238,7 +245,12 @@ extern "C" fn idle_main() -> ! {
             {
                 idle_laps = 0;
             }
+            // The pick and the switch hooks read the kernel's shared slot and
+            // task tables: they run under the kernel lock (the switch hands
+            // the depth to whichever thread runs next, and back).
+            crate::smp::bkl_enter();
             akuma_threading::x86_yield();
+            crate::smp::bkl_leave();
         } else {
             crate::net::wait_lap();
             #[cfg(feature = "trace-err")]
@@ -338,11 +350,14 @@ fn idle_slot() -> usize {
 /// Pinning: nothing pins yet, so any slot in the ring (or the boot task) can
 /// run. `can_run` returns `false` only where a real pinning table would.
 fn can_run(slot: usize) -> bool {
-    if slot > crate::child::NSLOTS {
-        // An idle thread belongs to its own core and no other.
+    if slot >= crate::child::NSLOTS {
+        // An idle thread belongs to its own core and no other (the BSP's is
+        // `NSLOTS` itself: unpinned, an AP could pick it and run on the stack
+        // the BSP is using).
         return slot == idle_tid(akuma_ring3_amd64::cpu_index());
     }
-    slot == NO_SLOT || slot <= crate::child::NSLOTS
+    // Every ring slot (and the boot task's NO_SLOT) may run on any core.
+    true
 }
 
 /// The BKL's recursion depth is per-thread and the lock per-core; this
