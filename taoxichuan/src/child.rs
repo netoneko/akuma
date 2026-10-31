@@ -356,39 +356,22 @@ const ARG_BYTES_MAX: usize = crate::ARG_BLOCK_PAGES * 4096 - 2048;
 /// `Err` is the errno: `EFAULT` for a pointer that is not user memory, `E2BIG` for more than `max`
 /// entries before the terminating NULL (Linux answers `E2BIG` for an oversize block, never `EFAULT`).
 fn read_ptr_array(arr_va: u64, max: usize) -> Result<Vec<u64>, u64> {
-    let mut out = Vec::new();
-    for i in 0..max {
-        let mut slot = [0u8; 8];
-        if !crate::copy_from_user(&mut slot, arr_va + (i as u64) * 8) {
-            return Err(crate::err::EFAULT);
-        }
-        let p = u64::from_le_bytes(slot);
-        if p == 0 {
-            return Ok(out);
-        }
-        out.push(p);
-        if !crate::user_ok(p, 1) {
-            return Err(crate::err::EFAULT);
-        }
-    }
-    Err(E2BIG) // unterminated within the cap
+    use akuma_user_walk::Fault;
+    akuma_user_walk::read_ptr_array(&crate::task_walk(), arr_va, max, crate::user_ok).map_err(|f| match f {
+        Fault::Bad => crate::err::EFAULT,
+        Fault::TooLong => E2BIG, // unterminated within the cap
+    })
 }
 
 /// Read one NUL-terminated string from the task. `Err` is `EFAULT` (unreadable, or not UTF-8, which this
 /// kernel's `&str` argument path cannot carry) or `E2BIG` (no NUL within `STR_MAX` bytes).
 fn read_user_string(va: u64) -> Result<String, u64> {
-    let mut buf: Vec<u8> = Vec::new();
-    while buf.len() < STR_MAX {
-        let mut one = [0u8; 1];
-        if !crate::copy_from_user(&mut one, va + buf.len() as u64) {
-            return Err(crate::err::EFAULT);
-        }
-        if one[0] == 0 {
-            return String::from_utf8(buf).map_err(|_| crate::err::EFAULT);
-        }
-        buf.push(one[0]);
-    }
-    Err(E2BIG)
+    use akuma_user_walk::Fault;
+    let bytes = akuma_user_walk::read_cstr(&crate::task_walk(), va, STR_MAX).map_err(|f| match f {
+        Fault::Bad => crate::err::EFAULT,
+        Fault::TooLong => E2BIG,
+    })?;
+    String::from_utf8(bytes).map_err(|_| crate::err::EFAULT)
 }
 
 /// The SPAWN/EXECVE argument block: the two syscalls marshal `(path, argv,

@@ -1634,16 +1634,7 @@ fn add_region(start: u64, end: u64) {
 /// The check that makes `write(1, ptr, len)` honest: a bogus pointer is
 /// `-EFAULT`, not a kernel fault.
 fn user_ok(va: u64, len: u64) -> bool {
-    if len == 0 {
-        return true;
-    }
-    let Some(end) = va.checked_add(len) else {
-        return false;
-    };
-    if end > 0x0000_8000_0000_0000 {
-        return false; // the user half only
-    }
-    with_task(|t| t.regions[..t.n_regions].iter().any(|&(s, e)| va >= s && end <= e))
+    with_task(|t| akuma_user_walk::in_regions(&t.regions[..t.n_regions], va, len))
 }
 
 /// errno returns are the negated value in `RAX` — plain wrapping arithmetic
@@ -1652,52 +1643,50 @@ fn e(code: u64) -> u64 {
     0u64.wrapping_sub(code)
 }
 
-/// Copy `dst.len()` bytes from the task's address space at `src_va`, one page
-/// at a time through the physmap. False (`-EFAULT`) when a page does not
-/// translate — the regions check above should make that unreachable, so it is
-/// a backstop, not the gate.
-fn copy_from_user(dst: &mut [u8], src_va: u64) -> bool {
-    let root = task_root();
-    let mut done = 0usize;
-    while done < dst.len() {
-        let va = src_va + done as u64;
-        let page_rem = 4096 - (va & 0xFFF) as usize;
-        let n = page_rem.min(dst.len() - done);
-        let Some(pa) = paging::translate_in(root, (va & !0xFFF) as usize) else {
+/// The current task's pages, reached one at a time through the physmap: the effect half of
+/// `akuma-user-walk` (the chunking, the string/array readers and the range rule are the crate's).
+struct TaskWalk {
+    root: u64,
+}
+
+impl akuma_user_walk::Walk for TaskWalk {
+    fn read_page(&self, va: u64, out: &mut [u8]) -> bool {
+        let Some(pa) = paging::translate_in(self.root, (va & !0xFFF) as usize) else {
             return false;
         };
         // SAFETY: `translate_in` named a mapped task frame.
-        unsafe { phys::Frame::from_pa(pa) }.read_bytes((va & 0xFFF) as usize, &mut dst[done..done + n]);
-        done += n;
+        unsafe { phys::Frame::from_pa(pa) }.read_bytes((va & 0xFFF) as usize, out);
+        true
     }
-    true
-}
-
-/// Copy `src` into the task's address space at `dst_va`, one page at a time
-/// through the physmap — `copy_from_user`'s mirror, for syscalls that fill
-/// user buffers (`getdents64`, `read`). False (`-EFAULT`) when a page does
-/// not translate; the regions check is the gate, this is the backstop.
-fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
-    let root = task_root();
-    let mut done = 0usize;
-    while done < src.len() {
-        let va = dst_va + done as u64;
-        let page_rem = 4096 - (va & 0xFFF) as usize;
-        let n = page_rem.min(src.len() - done);
-        if !cow_prepare_write(root, va) {
+    fn write_page(&self, va: u64, src: &[u8]) -> bool {
+        if !cow_prepare_write(self.root, va) {
             return false;
         }
-        let Some(pa) = paging::translate_in(root, (va & !0xFFF) as usize) else {
+        let Some(pa) = paging::translate_in(self.root, (va & !0xFFF) as usize) else {
             return false;
         };
-        // SAFETY: `translate_in` named a mapped task frame, one this kernel mapped
-        // RW (or RO, for image bytes — every caller writes only into
-        // stack/heap/scratch regions).
-        unsafe { phys::Frame::from_pa(pa) }.write_bytes((va & 0xFFF) as usize, &src[done..done + n]);
-        mark_written(root, va);
-        done += n;
+        // SAFETY: `translate_in` named a mapped task frame, one this kernel mapped RW (or RO, for image
+        // bytes - every caller writes only into stack/heap/scratch regions).
+        unsafe { phys::Frame::from_pa(pa) }.write_bytes((va & 0xFFF) as usize, src);
+        mark_written(self.root, va);
+        true
     }
-    true
+}
+
+fn task_walk() -> TaskWalk {
+    TaskWalk { root: task_root() }
+}
+
+/// Copy `dst.len()` bytes from the task's address space at `src_va`. False (`-EFAULT`) when a page does not
+/// translate - the regions check should make that unreachable, so it is a backstop, not the gate.
+fn copy_from_user(dst: &mut [u8], src_va: u64) -> bool {
+    akuma_user_walk::copy_from(&task_walk(), dst, src_va)
+}
+
+/// Copy `src` into the task's address space at `dst_va` - `copy_from_user`'s mirror, for syscalls that fill
+/// user buffers (`getdents64`, `read`). False (`-EFAULT`) when a page does not translate.
+fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
+    akuma_user_walk::copy_to(&task_walk(), dst_va, src)
 }
 
 /// View a `repr(C)` plain-old-data wire struct as its own bytes, the form
@@ -1759,17 +1748,9 @@ const PATH_BUF: usize = 1024;
 /// the `&str` it held. `None` (`-EFAULT` at the call site) on a bad byte or
 /// no terminator inside `buf.len()`.
 fn user_str(src_va: u64, buf: &mut [u8]) -> Option<&str> {
-    for i in 0..buf.len() {
-        let mut one = [0u8; 1];
-        if !copy_from_user(&mut one, src_va + i as u64) {
-            return None;
-        }
-        if one[0] == 0 {
-            return core::str::from_utf8(&buf[..i]).ok();
-        }
-        buf[i] = one[0];
-    }
-    None
+    let s = akuma_user_walk::read_cstr(&task_walk(), src_va, buf.len()).ok()?;
+    buf[..s.len()].copy_from_slice(&s);
+    core::str::from_utf8(&buf[..s.len()]).ok()
 }
 
 /// Run `f` on the task's fd table as one `akuma-fdtable` view. The task record is borrowed for the duration, so `f`
