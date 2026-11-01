@@ -13,8 +13,10 @@ fixed point's K2 guest on the ryzen.
 `uname` moved from a Taoxichuan arm to `akuma-syscalls-glue` in the first glue batch (`74962ae5`, cleanup step 2c).
 The arm had answered `Linux` / `taoxichuan` / `6.6.0-akuma` / `#1 SMP akuma-taoxichuan`; glue's `sys_uname` copies one
 compile-time `UTSNAME` (`Akuma`, `akuma`, glue's release, the build's sha and profile), so every kernel on glue
-answers Akuma. Nothing checks `uname` (the battery does not), so the change went unnoticed. A Linux-ABI kernel should
-say `Linux`: build systems, `./configure` and runtime checks branch on `uname -s`.
+answers Akuma. The change was recorded at the time, as intended: the 2c batch-A row of the cleanup plan says "`uname` now
+says `Akuma akuma 0.0.8 <sha>-release x86_64`, as amd64 and AArch64 do". Nothing tests `uname` (the battery does not), and
+nobody questioned it until the user did. A Linux-ABI kernel should say `Linux`: build systems, `./configure` and runtime
+checks branch on `uname -s`.
 
 ## Fix
 

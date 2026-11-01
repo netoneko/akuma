@@ -2318,6 +2318,14 @@ unnoticed because nothing sends stdin: every battery line, goose and the fixed p
 input. Fix: the spawn hands back the write end of a real stdin pipe
 ([`TAOXICHUAN_SSH_STDIN_PUMP.md`](TAOXICHUAN_SSH_STDIN_PUMP.md)).
 
+**The thread that was killed and kept running** (cleanup, Opus, B7): Taoxichuan's `exit_group` ended its sibling
+threads by marking them TERMINATED. A sibling running on another core does not read that mark: it ran on, parked in a
+`futex` and overwrote its own TERMINATED with WAITING (`[REVIVE]`), with its `Process` already retired, and the next
+`tokioprobe` faulted with the kernel lock stuck. It hid for weeks because Taoxichuan's own futex happened not to park on
+that path; moving `futex` onto the shared one (same scheduler, different timing) showed it on the first `smp=4` run.
+Fix: a running sibling gets a kill *request* and ends itself at its next kernel entry, and the exiting thread waits for
+it ([`TAOXICHUAN_EXIT_GROUP_RUNNING_SIBLING.md`](TAOXICHUAN_EXIT_GROUP_RUNNING_SIBLING.md)).
+
 The same day had a cousin: a timed park on an idle core never expired. The wake pass that readies an expired sleeper ran
 only inside the switch, and the idle loop switched only for threads that were already ready. The old `nanosleep` spun
 instead of parking, which hid it ([`TAOXICHUAN_ONE_CLOCK_TIME_FOLD.md`](TAOXICHUAN_ONE_CLOCK_TIME_FOLD.md)).
@@ -2335,3 +2343,20 @@ Honorable mentions, named by the user (pointers to where each was met, not a ful
   an sshd running as init (a pool thread) had every `SPAWN` of `/bin/sh` refused with `EPERM`, silently
   ([`TAOXICHUAN_METAL_SH_SPAWN_EPERM.md`](TAOXICHUAN_METAL_SH_SPAWN_EPERM.md)). The fork depth ceiling removed in
   `c1c885c5` had the same shape: a limit left over from the old crossing that real forks did not need.
+
+### 2026-11-01 (evening): talk notes from the cleanup (user: "so much cool shit to talk about at rust meetup")
+
+- **The kernel that built itself, answering GLM.** A6: Taoxichuan's fixed point at `8909a603` under Akuma's own
+  hypervisor on the ryzen, K1 == K2 (`26d1ead2...`). K2, the kernel Taoxichuan built inside a Taoxichuan guest, then
+  booted as the box's guest and the user talked to GLM through goose in it: Rust on the metal (Akuma), Rust in the guest
+  (Taoxichuan), the agent's tool calls running inside both (`scripts/kvm/taoxichuan/goose_glm.sh`;
+  [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md), the A6 row).
+- **An extraction can change who a kernel says it is.** Moving `uname` onto the shared glue (`74962ae5`) made Taoxichuan
+  answer `Akuma akuma 0.0.8`; the step's row recorded it as matching the other kernels, and nothing tests `uname`. GLM,
+  asked what kernel it runs on, said Akuma. Now the kernel registers its identity:
+  `Linux taoxichuan 0.1.0-<sha>-taoxichuan` ([`TAOXICHUAN_UNAME_SAYS_AKUMA.md`](TAOXICHUAN_UNAME_SAYS_AKUMA.md)).
+- **The costliest clones are not spelled `.clone()`.** Clippy's clone lints found nothing in two kernels and 105 crates;
+  reading found a whole `FileDescriptor` (path, inode pin, a directory's cached listing) copied with `.cloned()` on every
+  `write(2)` on amd64. The copy budget counts `.cloned()`, `.to_vec()` and the fd copiers for that reason
+  ([`CLONE_AND_MUT_BUDGETS.md`](CLONE_AND_MUT_BUDGETS.md), [`CLONE_AUDIT_2026_11_01.md`](CLONE_AUDIT_2026_11_01.md)).
+- **A refactor that changes timing finds the race the old code hid**: the killed-thread entry under classic blunders.
