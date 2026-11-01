@@ -992,6 +992,13 @@ fn mount_vfs_glue(fs: alloc::sync::Arc<akuma_ext2::Ext2Filesystem<Vda>>) {
     // until this flag is set. AArch64's `fs::init` sets it; this kernel mounts
     // ext2 itself, as amd64 does, and sets it at the same point.
     akuma_vfs_glue::fs::mark_initialized();
+    // `/proc`: the shared `ProcFilesystem`, rendering `akuma-exec`'s process
+    // table (`<pid>/exe`, which musl's `$ORIGIN` expansion reads; `meminfo`;
+    // `<pid>/fd`). Glue's `readlinkat` and friends answer through it.
+    let proc_fs = alloc::sync::Arc::new(akuma_vfs_glue::proc::ProcFilesystem::new());
+    if akuma_vfs_glue::mount_with("/proc", Some("proc"), 0, proc_fs).is_err() {
+        console::puts("  fs:   /proc mount failed\n");
+    }
     // A thread that dies holding a VFS lock has it released at its slot's
     // TERMINATED -> FREE transition (amd64's `install_reap_hooks`).
     akuma_threading::set_slot_reap_callback(akuma_vfs_glue::reap_dead_thread);
@@ -1081,9 +1088,10 @@ fn inode_size(inode: u32) -> Option<u64> {
     root_fs().metadata_by_inode(inode).ok().map(|md| md.size)
 }
 
-/// The one task: its root page table, the user ranges a pointer may name, the
-/// heap cursors, its fd table's three `akuma-fdtable` parts, and the exit
-/// code once captured.
+/// A task's memory record: its root page table, the user ranges a pointer may
+/// name, the heap and mmap cursors, its shared mappings, and the exit code
+/// once captured. Descriptors, cwd and signal state are the registered
+/// `akuma-exec` Process's.
 struct Task {
     root_pa: u64,
     regions: [(u64, u64); 16],
@@ -1092,9 +1100,6 @@ struct Task {
     brk_cur: u64,
     brk_end: u64,
     mmap_cur: u64,
-    /// The path of the running image, what `readlink("/proc/self/exe")`
-    /// answers (rust-lld's wrapper and `std::env::current_exe` ask).
-    exe: alloc::string::String,
     /// Writable `MAP_SHARED` file mappings: `(base, len, inode, file offset,
     /// file size at map time)`. The pages are private frames filled from the
     /// file (there is no page cache), so they are copied back on `munmap`,
@@ -1132,7 +1137,6 @@ impl Task {
             brk_cur: 0,
             brk_end: 0,
             mmap_cur: MMAP_BASE,
-            exe: alloc::string::String::new(),
             shared: [(0, 0, 0, 0, 0); MAX_SHARED],
             n_shared: 0,
             holes: akuma_mmap::HoleSet::new(),

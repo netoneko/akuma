@@ -394,7 +394,7 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         TASK_OF.with_mut(|t| t[slot_idx] = slot_idx + 1);
     }
     if !is_thread {
-        let (regions, n_regions, brk_base, brk_cur, brk_end, mmap_cur, holes, exe) =
+        let (regions, n_regions, brk_base, brk_cur, brk_end, mmap_cur, holes) =
             crate::with_task(|t| {
                 (
                     t.regions,
@@ -404,12 +404,10 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
                     t.brk_end,
                     t.mmap_cur,
                     t.holes,
-                    t.exe.clone(),
                 )
             });
         crate::with_task_slot(slot_idx + 1, |ct| {
         ct.holes = holes;
-        ct.exe = exe;
         ct.root_pa = root_pa;
         ct.regions = regions;
         ct.n_regions = n_regions;
@@ -771,10 +769,18 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     let Some(ti) = crate::load_task(&argv, &env, &image) else {
         return crate::e(crate::err::ENOMEM);
     };
-    crate::with_task(|t| t.exe.clone_from(&effective));
     // POSIX exec keeps open fds across the image swap; close-on-exec ones go,
     // each released through the runtime hooks (the table is the process's).
     if let Some(p) = akuma_exec::process::current_process_shared() {
+        // `/proc/<pid>/exe` (procfs renders `image.exe`): musl's loader expands
+        // `$ORIGIN` in a RUNPATH through it — rustc finds `librustc_driver`
+        // in `$ORIGIN/../lib` — and fork inherits it.
+        {
+            let mut img = p.image.lock();
+            img.exe.clone_from(&effective);
+            img.name = String::from(effective.rsplit('/').next().unwrap_or(&effective));
+            img.args = args.argv.clone();
+        }
         p.close_cloexec_fds_releasing();
         // execve: caught handlers go back to the default, ignored ones stay
         // ignored (the handler addresses named the old image).

@@ -7,6 +7,8 @@
   tcg_rig.py stop                  stop this rig's QEMU (by its pidfile only - never by pattern)
   tcg_rig.py battery [goose]       the regression battery on the running guest; `goose` adds the GLM prompt
                                    (needs goose + its config on the image); exits 1 if any line differs from BATTERY
+  tcg_rig.py battery toolchain     on the Rust toolchain image: rustc and a cargo build with a build script, with
+                                   no LD_LIBRARY_PATH (the loader must find librustc_driver through $ORIGIN)
 
 Environment: TX_DISK (the base ext2 image, required for boot; the guest never writes it - writes land in
 TX_RUN/overlay.qcow2, and `boot fresh` discards them), TX_KEY (ssh private key for the image's
@@ -120,13 +122,24 @@ BATTERY = [
     ("apk", "apk add git 2>&1 | tail -1", 300, "9 errors; 15 MiB in 19 packages"),
     ("git", "git --version", 60, "git version 2.54.0"),
 ]
+# The toolchain image's PATH, and deliberately no LD_LIBRARY_PATH: rustc's RUNPATH is `$ORIGIN/../lib`, which musl's
+# loader expands through readlink("/proc/self/exe") - a kernel that cannot answer that fails here and nowhere else.
+RUSTENV = "export HOME=/root PATH=/usr/local/rust/bin:/usr/bin:/bin; "
+TOOLCHAIN = [
+    ("rustc", RUSTENV + "rustc --version | cut -d' ' -f1", 120, "rustc"),
+    ("cargo-build", RUSTENV + "rm -rf /tmp/demo && cd /tmp && cargo new --vcs none --bin demo >/dev/null 2>&1 && cd demo"
+     ' && printf "fn main() { println!(\\"built {}\\", env!(\\"BS\\")); }\\n" > src/main.rs'
+     ' && printf "fn main() { println!(\\"cargo:rustc-env=BS=ok\\"); }\\n" > build.rs'
+     " && cargo build -j2 --offline >/dev/null 2>&1 && ./target/debug/demo", 1500, "built ok"),
+]
 GOOSE = ("goose", ". /etc/goose.env; cd /root; timeout 400 goose run --no-session -t "
          "'Reply with exactly the word PONG and nothing else. Do not use tools.' 2>&1 | tail -1", 460, "PONG")
 
 
-def battery(with_goose):
+def battery(extra):
     bad = 0
-    for name, cmd, timeout, want in BATTERY + ([GOOSE] if with_goose else []):
+    lines = TOOLCHAIN if extra == "toolchain" else BATTERY + ([GOOSE] if extra == "goose" else [])
+    for name, cmd, timeout, want in lines:
         rc, out, _ = ssh(cmd, timeout)
         got = out.strip()
         ok = rc == 0 and got == want
@@ -149,7 +162,7 @@ def main():
     elif cmd == "stop":
         stop()
     elif cmd == "battery":
-        battery(len(sys.argv) > 2 and sys.argv[2] == "goose")
+        battery(sys.argv[2] if len(sys.argv) > 2 else "")
     elif cmd == "run":
         rc, out, err = ssh(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 120)
         print(f"rc={rc}")
