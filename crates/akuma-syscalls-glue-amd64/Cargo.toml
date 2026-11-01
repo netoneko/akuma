@@ -1,0 +1,22 @@
+[package]
+name = "akuma-syscalls-glue-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The x86_64 syscall ABI over akuma-syscalls-glue for the file-descriptor family: open-flag and struct-stat translation, the legacy x86-only numbers, dup2's rule, poll/select timeouts, chunked large reads. Shared by the amd64 kernel and Taoxichuan."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The bodies. Its feature set is the consumer's (amd64 and Taoxichuan both build it
+# `default-features = false, features = ["smoltcp"]`); this crate adds none.
+akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false }
+# The vocabulary: which x86_64 number is which call, the open-flag permutation and
+# the asm-generic -> x86_64 `struct stat` translation.
+akuma-syscalls-abi = { path = "../akuma-syscalls-abi" }
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+# The current process's descriptor table (is this fd a regular file?).
+akuma-exec = { path = "../akuma-exec" }
+akuma-vfs-glue = { path = "../akuma-vfs-glue" }
+# User memory: the x86_64 `struct stat` and select's `timeval`.
+akuma-user-access = { path = "../akuma-user-access" }

@@ -695,8 +695,55 @@ pub fn task_exit_real(code: u64) -> ! {
 /// (11), the parent's `wait4` sees `WIFSIGNALED` as on Linux, and the machine
 /// keeps running. Only for a real fork child or thread; the shell and the
 /// boot task keep the halting report.
+/// `akuma-threading`'s slot-purge hook: thread `tid` has just been marked
+/// TERMINATED. When `akuma-exec` ended its process rather than this kernel's
+/// exit path — a fatal signal's default action inside `akuma-syscalls-glue`
+/// (SIGPIPE on a pipe with no reader runs glue's `sys_exit_group`, which kills
+/// the group, the caller included) — the ring row still says `running` and
+/// the parent's `wait4` would sleep forever. Record the status, clear
+/// `running` and wake the waiter, as `task_exit_status` does. This kernel's own
+/// exits clear `running` first, so for them this is only the futex purge.
+/// Bridges the two wait models until `wait4` is `akuma-exec`'s (pm S2).
+pub fn on_thread_terminated(tid: usize) {
+    crate::futex::purge_task(tid);
+    if tid >= NSLOTS {
+        return;
+    }
+    let pid = slot_pid(tid);
+    let Some(code) = akuma_exec::process::lookup_process_shared(pid)
+        .filter(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed))
+        .map(|p| p.exit_code.load(core::sync::atomic::Ordering::Relaxed))
+    else {
+        return;
+    };
+    // A negative code is "killed by that signal" (status = the signal number).
+    let status = if code < 0 { code.unsigned_abs() & 0x7F } else { ((code as u32) & 0xFF) << 8 };
+    let waiter = with_slots(|s| {
+        if !s[tid].used || !s[tid].running {
+            return u32::MAX;
+        }
+        s[tid].running = false;
+        s[tid].status = status;
+        s[tid].waiter
+    });
+    if waiter != u32::MAX {
+        akuma_threading::get_waker_for_thread(waiter as usize).wake();
+    }
+}
+
 pub fn task_die_segv() -> ! {
     task_exit_status(11)
+}
+
+/// The exiting process's descriptors, closed now rather than when its
+/// zombie is reaped: a pipe's EOF is its last writer's close, so a pipeline's
+/// reader would otherwise wait on a parent that waits on it. Each release goes
+/// through the runtime hooks (the tables are glue's). Callers have already
+/// stopped every thread that shares the table (`kill_siblings`).
+fn close_process_fds() {
+    if let Some(p) = akuma_exec::process::current_process_shared() {
+        p.fds.close_all();
+    }
 }
 
 fn task_exit_status(status: u32) -> ! {
@@ -724,7 +771,7 @@ fn task_exit_status(status: u32) -> ! {
     if lead == INIT_TID.load(core::sync::atomic::Ordering::Relaxed) {
         akuma_threading::get_waker_for_thread(0).wake();
     }
-    crate::pipes::release_open_fds();
+    close_process_fds();
     if waiter != u32::MAX {
         akuma_threading::get_waker_for_thread(waiter as usize).wake();
     }
@@ -907,7 +954,11 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
         Ok(a) => a,
         Err(no) => return crate::e(no),
     };
-    let effective = crate::resolve_effective(&args.path);
+    // Relative to the process's cwd (`Process.cwd`, which glue's `chdir` writes), then symlinks.
+    let Ok(absolute) = akuma_syscalls_glue::fs::resolve_path_at(-100, &args.path) else {
+        return crate::e(crate::err::ENOENT);
+    };
+    let effective = crate::resolve_effective(&absolute);
     let image = match crate::read_image(&effective) {
         Ok(i) => i,
         Err(err) => {
@@ -922,29 +973,15 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     let env: Vec<&str> = args.env.iter().map(String::as_str).collect();
     // The image about to be replaced may hold shared file mappings.
     crate::shared_flush_all();
-    // POSIX exec keeps open fds across the image swap — snapshot, load,
-    // restore, sweep cloexec (the exec_replace discipline).
-    let saved = crate::with_task(|t| (t.fd_names.clone(), t.fd_cloexec.clone(), t.fd_nonblock.clone()));
     let old_root = crate::task_root();
     let Some(ti) = crate::load_task(&argv, &env, &image) else {
         return crate::e(crate::err::ENOMEM);
     };
     crate::with_task(|t| t.exe.clone_from(&effective));
-    let swept = crate::with_task(|t| {
-        t.fd_names = saved.0;
-        t.fd_cloexec = saved.1;
-        t.fd_nonblock = saved.2;
-        crate::fdtable::FdTable::of(&mut t.fd_names, &mut t.fd_cloexec, &mut t.fd_nonblock).sweep_cloexec()
-    });
-    for (_fd, payload) in swept {
-        if let crate::OpenFile::Socket(idx) = payload {
-            crate::sock::release_unnamed(idx);
-        } else {
-            let (ends, n) = payload.pipe_ends();
-            for (id, w) in &ends[..n] {
-                crate::pipes::release(*id, *w);
-            }
-        }
+    // POSIX exec keeps open fds across the image swap; close-on-exec ones go,
+    // each released through the runtime hooks (the table is the process's).
+    if let Some(p) = akuma_exec::process::current_process_shared() {
+        p.close_cloexec_fds_releasing();
     }
     // The registered Process's shared root view goes stale with the old
     // image — re-point it, as `exec_replace` does for the shell.
@@ -1285,7 +1322,7 @@ pub fn child_exit(code: u64) -> ! {
     // is what turns the last writer's close into the reader's EOF. Index
     // payloads hold no kernel reference (the close arms' convention); only
     // the counted pipe ends need the walk.
-    crate::pipes::release_open_fds();
+    close_process_fds();
     // "Who am I" is `current_slot()` now (slice 2): the running child's own
     // slot names its record, its status row, and the crossing back.
     let cur = crate::exec_twin::current_slot();

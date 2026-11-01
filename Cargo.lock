@@ -797,6 +797,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-syscalls-glue-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-exec",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-glue",
+ "akuma-syscalls-linux",
+ "akuma-user-access",
+ "akuma-vfs-glue",
+]
+
+[[package]]
 name = "akuma-syscalls-ipc"
 version = "0.1.0"
 dependencies = [
@@ -1327,6 +1339,7 @@ dependencies = [
  "akuma-syscalls-abi",
  "akuma-syscalls-eventfd",
  "akuma-syscalls-glue",
+ "akuma-syscalls-glue-amd64",
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
  "akuma-syscalls-net",

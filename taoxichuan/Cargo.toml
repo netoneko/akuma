@@ -158,7 +158,10 @@ akuma-port = { path = "../crates/akuma-port" }
 # from `dispatch_inner` to `handle_syscall` the way amd64's did. Same feature
 # set amd64 builds it with. Its user copies are `akuma-user-access`'s, whose
 # fault recovery (`user_copy_fixup`) this kernel's page-fault handler consults.
-akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp"] }
+akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp", "sc-epoll", "sc-eventfd"] }
+# The x86_64 ABI over glue for the fd family (open flags, struct stat, the
+# legacy numbers), shared with amd64.
+akuma-syscalls-glue-amd64 = { path = "../crates/akuma-syscalls-glue-amd64" }
 akuma-user-access = { path = "../crates/akuma-user-access" }
 
 [[bin]]

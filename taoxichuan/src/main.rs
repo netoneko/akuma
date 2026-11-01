@@ -972,6 +972,15 @@ fn mount_vfs_glue(fs: alloc::sync::Arc<akuma_ext2::Ext2Filesystem<Vda>>) {
         dev_mouse_has_events: || false,
         dev_tun_has_frame: || false,
     });
+    // A process `akuma-exec` ends (a fatal signal's default action inside glue)
+    // must still reach this kernel's `wait4`: see `child::on_thread_terminated`.
+    akuma_threading::set_slot_purge_callback(child::on_thread_terminated);
+    // Glue's pipe wakes go to the slot by number, with a fresh handle — the
+    // waker amd64 registers (`pipe::wake_sink` -> `sched::wake`). The handle a
+    // parked writer recorded is not trusted to still name its slot.
+    akuma_syscalls_glue::pipe::set_wake_sink(|tid, _handle| {
+        akuma_exec::threading::wake_by_handle(akuma_exec::threading::wake_handle_for_thread(tid));
+    });
     // Glue's `getrandom` reads the primitives hook; this kernel's source is
     // `net::rng_fill` (RDRAND, SplitMix64 fallback), which always fills.
     akuma_primitives::rng::set_rng_hook(|b| {
@@ -983,6 +992,13 @@ fn mount_vfs_glue(fs: alloc::sync::Arc<akuma_ext2::Ext2Filesystem<Vda>>) {
         console::puts("  [FATAL] could not mount the ext2 root into the shared mount table\n");
         halt();
     }
+    // The front door (`akuma_vfs_glue::fs`) answers "not found" for every path
+    // until this flag is set. AArch64's `fs::init` sets it; this kernel mounts
+    // ext2 itself, as amd64 does, and sets it at the same point.
+    akuma_vfs_glue::fs::mark_initialized();
+    // A thread that dies holding a VFS lock has it released at its slot's
+    // TERMINATED -> FREE transition (amd64's `install_reap_hooks`).
+    akuma_threading::set_slot_reap_callback(akuma_vfs_glue::reap_dead_thread);
 }
 // ---------------------------------------------------------------------------
 // The banner — printed at the init-spawn point, where the full kernel prints
@@ -1147,6 +1163,21 @@ impl OpenFile {
             _ => ([(0, false); 2], 0),
         }
     }
+}
+
+/// The ext2 inode behind `fd` in the current process's descriptor table, if
+/// it names a regular file: the pin `openat` recorded, or the path resolved
+/// now for a descriptor opened without one. One mount, so the number is the
+/// root's.
+fn fd_inode(fd: u64) -> Option<u32> {
+    use akuma_exec::process::FileDescriptor;
+    let kf = akuma_exec::process::current_process_shared()?.with_fd(fd as u32, |d| match d {
+        FileDescriptor::File(f) => Some(f.clone()),
+        _ => None,
+    })??;
+    let inode = if kf.inode() != 0 { kf.inode() } else { root_fs().resolve_inode(&kf.path).ok()? };
+    let md = root_fs().metadata_by_inode(inode).ok()?;
+    (!md.is_dir).then_some(inode)
 }
 
 /// A regular file's current length, as ext2 has it — one size per inode, the
@@ -2061,85 +2092,6 @@ fn writev_file_arm_inner(fd: u64, data: &[u8]) -> u64 {
     }
 }
 
-/// `sendfile(out, in, &off, count)` and `copy_file_range(in, &off_in, out,
-/// &off_out, len, flags)`: copy up to `count` bytes from a regular file to a
-/// regular file or a pipe, 4 KiB at a time through a kernel buffer. An offset
-/// pointer means "positional": that fd's own offset is left alone and the
-/// pointer is advanced instead (Linux's contract). busybox `cp` tries these
-/// before it falls back, and its fallback was not there ("cp: can't create
-/// ...: Function not implemented").
-fn copy_range_arm(in_fd: u64, in_off_va: u64, out_fd: u64, out_off_va: u64, count: u64) -> u64 {
-    const CAP: u64 = 8 * 1024 * 1024;
-    let Some(Some((ino, fd_off))) = with_fds(|t| t.with(in_fd as u32, |d| match d {
-        OpenFile::File { inode, offset, .. } => Some((*inode, *offset)),
-        _ => None,
-    })) else {
-        return e(ring3::err::EBADF);
-    };
-    let Some(Some((kind, dst))) = with_fds(|t| t.with(out_fd as u32, |d| match d {
-        OpenFile::File { inode, .. } => Some((1u8, *inode)),
-        OpenFile::Pipe(id, true) => Some((2u8, *id)),
-        _ => None,
-    })) else {
-        return e(ring3::err::EBADF);
-    };
-    let mut word = [0u8; 8];
-    let read_off = if in_off_va == 0 {
-        fd_off
-    } else if user_ok(in_off_va, 8) && copy_from_user(&mut word, in_off_va) {
-        u64::from_le_bytes(word)
-    } else {
-        return e(ring3::err::EFAULT);
-    };
-    let write_off = if out_off_va == 0 {
-        0
-    } else if user_ok(out_off_va, 8) && copy_from_user(&mut word, out_off_va) {
-        u64::from_le_bytes(word)
-    } else {
-        return e(ring3::err::EFAULT);
-    };
-    let want = count.min(CAP);
-    let mut total = 0u64;
-    let mut buf = [0u8; 4096];
-    while total < want {
-        let n = ((want - total) as usize).min(buf.len());
-        let got = match root_fs().read_at_by_inode(ino, (read_off + total) as usize, &mut buf[..n]) {
-            Ok(g) => g,
-            Err(_) => return if total > 0 { total } else { e(ring3::err::EIO) },
-        };
-        if got == 0 {
-            break;
-        }
-        let put = match kind {
-            1 if out_off_va != 0 => root_fs()
-                .write_at_by_inode(dst, (write_off + total) as usize, &buf[..got])
-                .map_or_else(|_| e(ring3::err::EIO), |w| w as u64),
-            1 => writev_file_arm(out_fd, &buf[..got]),
-            _ => pipes::write_arm_gathered(dst, &buf[..got], false),
-        };
-        if (put as i64) < 0 {
-            return if total > 0 { total } else { put };
-        }
-        total += put;
-        if put < got as u64 {
-            break;
-        }
-    }
-    if in_off_va != 0 {
-        let _ = copy_to_user(in_off_va, &(read_off + total).to_le_bytes());
-    } else {
-        let _ = with_fds(|t| t.update(in_fd as u32, |of| {
-            if let OpenFile::File { offset, .. } = of {
-                *offset += total;
-            }
-        }));
-    }
-    if out_off_va != 0 {
-        let _ = copy_to_user(out_off_va, &(write_off + total).to_le_bytes());
-    }
-    total
-}
-
 /// Stage 6: dirfd-relative path resolution. Absolute paths pass through; a
 /// relative path resolves against an open directory fd's path (apk opens the
 /// db / cache directory and then passes its fd to `openat`/`renameat`); a
@@ -2732,9 +2684,16 @@ fn nosys_note(nr: u64) {
 /// The syscall landing: every ring 3 -> kernel entry holds the big kernel lock
 /// until the matching return to ring 3 (nesting if this core already owns it).
 fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
+    // The syscall stub parks the caller's user RSP in a per-CPU stash and
+    // reloads it on the way out. Any switch inside the call (every blocking
+    // wait — `akuma-syscalls-glue`'s park in `recv`/`poll`/a pipe read
+    // included) lets the next thread's syscall overwrite it, so it is saved
+    // here and restored before the return, for every call at once.
+    let stash = ring3::user_rsp_stash();
     smp::bkl_enter();
     let r = dispatch_locked(fr);
     smp::bkl_leave();
+    ring3::set_user_rsp_stash(stash);
     r
 }
 
@@ -2948,6 +2907,61 @@ fn trace_err(nr: u64, r: u64, a1: u64, a2: u64, a3: u64) {
     }
 }
 
+/// `write`/`writev` on a `Stdout`/`Stderr`/`DevTty` descriptor of a process
+/// with no I/O channel of its own: the console. Glue would buffer it in a
+/// channel nothing drains here; init (sshd) and every process forked from it
+/// write their stdio this way. `None` for
+/// every other call, so the fd layer serves it.
+fn console_stdio_write(nr: u64, a: [u64; 6]) -> Option<u64> {
+    use akuma_exec::process::FileDescriptor as F;
+    let (fd, iov, cnt) = match nr {
+        akuma_syscalls_abi::x86_64::WRITE => (a[0], 0, 0),
+        akuma_syscalls_abi::x86_64::WRITEV => (a[0], a[1], a[2]),
+        _ => return None,
+    };
+    // `Process.channel`, not `current_channel()`: the latter falls back to the
+    // per-thread exit channel every forked child is registered with for its
+    // parent's wait, and glue would buffer the child's stdout there, unread.
+    let p = akuma_exec::process::current_process_shared()?;
+    if p.channel.is_some() {
+        return None;
+    }
+    if !p.with_fd(fd as u32, |d| matches!(d, F::Stdout | F::Stderr | F::DevTty))? {
+        return None;
+    }
+    let emit = |base: u64, len: u64| -> u64 {
+        let mut chunk = [0u8; 256];
+        let mut done = 0u64;
+        while done < len {
+            let n = ((len - done) as usize).min(chunk.len());
+            if akuma_user_access::copy_from_user(&mut chunk[..n], base + done).is_err() {
+                return if done == 0 { e(ring3::err::EFAULT) } else { done };
+            }
+            for &b in &chunk[..n] {
+                console::putb(b);
+            }
+            done += n as u64;
+        }
+        done
+    };
+    if nr == akuma_syscalls_abi::x86_64::WRITE {
+        return Some(emit(a[1], a[2].min(WRITE_LIMIT)));
+    }
+    let mut total = 0u64;
+    for i in 0..cnt.min(1024) {
+        let mut entry = [0u64; 2];
+        if akuma_user_access::read_user_into(&mut entry, iov + i * 16).is_err() {
+            return Some(if total == 0 { e(ring3::err::EFAULT) } else { total });
+        }
+        let n = emit(entry[0], entry[1].min(WRITE_LIMIT));
+        if n.cast_signed() < 0 {
+            return Some(if total == 0 { n } else { total });
+        }
+        total += n;
+    }
+    Some(total)
+}
+
 /// Whether `akuma-syscalls-glue` serves `call` on this kernel. One place, so
 /// the folded set is readable at a glance and a batch is one diff here.
 const fn served_by_glue(call: akuma_syscalls_abi::Syscall) -> bool {
@@ -2979,6 +2993,23 @@ const fn served_by_glue(call: akuma_syscalls_abi::Syscall) -> bool {
             | S::Getrusage
             | S::Getgroups
             | S::Times
+            // Sockets (step 2b, with the fd table): AF_INET and AF_UNIX are
+            // glue's; `sockaddr` and `msghdr` have one layout on both ABIs.
+            | S::Socket
+            | S::Bind
+            | S::Listen
+            | S::Accept
+            | S::Accept4
+            | S::Connect
+            | S::Sendto
+            | S::Recvfrom
+            | S::Sendmsg
+            | S::Recvmsg
+            | S::Setsockopt
+            | S::Getsockopt
+            | S::Shutdown
+            | S::Getsockname
+            | S::Getpeername
     )
 }
 
@@ -3010,6 +3041,18 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     {
         let args = [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()];
         return akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args);
+    }
+    // The fd family over the process's `akuma-exec` table (step 2b): the
+    // x86_64 ABI layer amd64 uses too, after the one local intercept — stdio
+    // of a process with no channel goes to the console.
+    {
+        let args = [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()];
+        if let Some(r) = console_stdio_write(fr.rax, args) {
+            return r;
+        }
+        if let Some(r) = akuma_syscalls_glue_amd64::dispatch(fr.rax, args) {
+            return r;
+        }
     }
     match fr.rax {
         ring3::nr::WRITE => {
@@ -3371,14 +3414,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let mut fnode: Option<u32> = None;
             let mut fsize = 0u64;
             if !anon {
-                // `Some(Some(inode))` = a bound regular file; anything else
-                // (unbound, socket, dir, child pipe) has no file to map.
-                let mapped = with_fds(|t| t.with(fd as u32, |d| match d {
-                    OpenFile::File { inode, .. } => Some(*inode),
-                    _ => None,
-                }));
-                match mapped {
-                    Some(Some(node)) => {
+                // A regular file in the process's table; anything else
+                // (unbound, socket, pipe, directory) has no file to map.
+                match fd_inode(fd) {
+                    Some(node) => {
                         fnode = Some(node);
                         fsize = inode_size(node).unwrap_or(0);
                     }
@@ -3481,9 +3520,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::MPROTECT => mprotect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         ring3::nr::MUNMAP => munmap_arm(fr.arg1(), fr.arg2()),
         26 => msync_arm(fr.arg1(), fr.arg2()),
-        // x86_64 sendfile = 40, copy_file_range = 326 (neither is in the shared ABI table yet).
-        40 => copy_range_arm(fr.arg2(), fr.arg3(), fr.arg1(), 0, fr.arg4()),
-        326 => copy_range_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5()),
         ring3::nr::READ => {
             let (fd, buf, len) = (fr.arg1(), fr.arg2(), fr.arg3());
             read_fd_arm(fd, buf, len)

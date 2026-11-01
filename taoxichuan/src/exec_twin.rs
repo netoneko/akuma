@@ -347,10 +347,13 @@ fn exec_runtime() -> ExecRuntime {
         resolve_symlinks: crate::resolve_effective,
         // The pipes: M3's table already exists, and its two lifecycle arms
         // plus the kernel-memory write are exactly what these hooks ask for.
-        pipe_close_write: |id| crate::pipes::release(id, true),
-        pipe_close_read: |id| crate::pipes::release(id, false),
-        pipe_clone_ref: crate::pipes::clone_ref,
-        pipe_write: crate::pipes::write_no_sigpipe,
+        // The descriptor table is `akuma-exec`'s, and every table behind it is
+        // `akuma-syscalls-glue`'s (TAOXICHUAN_CLEANUP_PLAN.md step 2b): one id
+        // space per kind, released when the last descriptor naming it drops.
+        pipe_close_write: akuma_syscalls_glue::pipe::pipe_close_write,
+        pipe_close_read: akuma_syscalls_glue::pipe::pipe_close_read,
+        pipe_clone_ref: akuma_syscalls_glue::pipe::pipe_clone_ref,
+        pipe_write: akuma_syscalls_glue::pipe::pipe_write_no_sigpipe,
         // The AF_INET socket table is real (stage 4); the fd-table mirror
         // these two serve (`SharedFdTable`) is not built here, but the arms
         // are the same functions this kernel's own close/fork paths run.
@@ -373,22 +376,22 @@ fn exec_runtime() -> ExecRuntime {
         exec_bkl_drop_enabled: || false,
         // No process table: nothing `akuma-exec` knows about can exit.
         on_process_exit: |_pid| {},
-        // No itimers, futexes, eventfds-in-tables, AF_UNIX, epoll, pidfds,
-        // audio, ptys or flock on this target yet — each arm's subsystem has
-        // no table here to release from, and the first one that arrives wires
-        // its row (amd64 wired each exactly when its syscall landed).
+        // No itimers, futexes-in-tables, pidfds, audio or ptys on this target
+        // yet — each arm's subsystem has no table here to release from, and
+        // the first one that arrives wires its row (amd64 wired each exactly
+        // when its syscall landed).
         check_itimers: || {},
         futex_wake: |_, _, _| {},
-        eventfd_close: |_| {},
-        eventfd_clone_ref: |_| {},
-        unix_sock_close: |_| {},
-        unix_sock_clone_ref: |_| {},
-        epoll_destroy: |_| {},
+        eventfd_close: akuma_syscalls_glue::eventfd::eventfd_close,
+        eventfd_clone_ref: akuma_syscalls_glue::eventfd::eventfd_clone_ref,
+        unix_sock_close: akuma_syscalls_glue::unixsock::unix_sock_close,
+        unix_sock_clone_ref: akuma_syscalls_glue::unixsock::unix_sock_clone_ref,
+        epoll_destroy: akuma_syscalls_glue::poll::epoll_destroy,
         pidfd_close: |_| {},
         dsp_close: || {},
         pty_clone_ref: |_, _| {},
         pty_close: |_, _| {},
-        flock_release: |_, _, _| {},
+        flock_release: akuma_syscalls_glue::flock::flock_release,
         // No box/container namespace registry; `None` is what AArch64 answers
         // with the feature off.
         get_box_namespace: |_| None,

@@ -58,6 +58,7 @@
     "crates/akuma-syscalls-abi",
     "crates/akuma-syscalls-eventfd",
     "crates/akuma-syscalls-glue",
+    "crates/akuma-syscalls-glue-amd64",
     "crates/akuma-syscalls-ipc",
     "crates/akuma-syscalls-linux",
     "crates/akuma-syscalls-log",
@@ -112,6 +113,6 @@
     "crates/akuma-uart": 1,
     "crates/akuma-user-access": 20,
     "crates/akuma-virtio": 12,
-    "taoxichuan/src": 58
+    "taoxichuan/src": 43
   }
 }

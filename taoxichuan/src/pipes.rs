@@ -315,21 +315,6 @@ pub fn write_arm_gathered(id: u32, data: &[u8], nonblock: bool) -> u64 {
     }
 }
 
-/// The `ExecRuntime::pipe_write` arm (session pc, slice 1): write into a
-/// pipe by id from **kernel** memory, without raising `SIGPIPE` — the
-/// caller is never the pipe's own process (akuma-exec's stdin pump is the
-/// only reader today, and nothing reaches it until `fork_process`). The
-/// kernel-slice twin of `write_arm`, which copies from the user first.
-pub fn write_no_sigpipe(id: u32, data: &[u8]) -> Result<usize, i32> {
-    let (out, _wakes) = table(|t| t.write(id, data));
-    match out {
-        // A full pipe answers Ok(0) — the short write that tells the pump
-        // the reader is applying backpressure (the hook's own contract).
-        WriteOutcome::Wrote(n) => Ok(n),
-        WriteOutcome::BrokenPipe | WriteOutcome::NoSuchPipe => Err(-1),
-    }
-}
-
 /// One more descriptor names this end — `dup`/`dup2`/`fcntl(F_DUPFD)`, and
 /// `fork_arm`'s walk over `fork_copy`'s payloads.
 pub fn clone_ref(id: u32, is_write: bool) {
@@ -370,26 +355,4 @@ pub fn release(id: u32, is_write: bool) {
         table(|t| t.close_read(id)).1
     };
     fire(wakes);
-}
-
-/// The exiting task's fds die with it (`child_exit`): drop every pipe
-/// reference its table holds. Depth 2 is the fork child — a pipeline member's
-/// exit is what turns the last writer close into the reader's EOF, so this is
-/// the load-bearing sweep; depth 1 (the shell) normally closed its own copies
-/// already, and this is the safety net.
-#[allow(clippy::redundant_closure_for_method_calls)] // `pop_lowest` is higher-ranked over the table's lifetime: no fn item fits `with_fds`
-pub fn release_open_fds() {
-    while let Some((_fd, d)) = crate::with_fds(|t| t.pop_lowest()) {
-        match d {
-            OpenFile::Pipe(id, w) => release(id, w),
-            OpenFile::Pair(r, w) => {
-                release(r, false);
-                release(w, true);
-            }
-            // The exit drops the task's socket references; the last one out
-            // releases the connection (this used to leak every socket).
-            OpenFile::Socket(idx) => crate::sock::release_unnamed(idx),
-            _ => {}
-        }
-    }
 }

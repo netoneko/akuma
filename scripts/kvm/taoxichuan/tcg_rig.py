@@ -12,7 +12,8 @@ Environment: TX_DISK (the base ext2 image, required for boot; the guest never wr
 TX_RUN/overlay.qcow2, and `boot fresh` discards them), TX_KEY (ssh private key for the image's
 authorized_keys), TX_RUN (default $TMPDIR/tx-tcg), TX_PORT (default 2244), TX_MEM (3072), TX_SMP (1),
 TX_TARGET (cargo target dir, default target/), TX_KERNEL (default TX_TARGET/x86_64-unknown-none/release/taoxichuan),
-TX_APPEND (extra cmdline).
+TX_APPEND (extra cmdline), TX_INIT (default `init=/bin/sshd initargs=--port,22`; with another init, `boot` cannot
+wait for ssh - read the console).
 
 The cmdline carries `epoch=<host unix seconds>`: microvm has no RTC, and without the anchor the guest's clock
 reads 1970 and every TLS client refuses certificates as "not valid yet" (rustls says so; busybox ssl_client
@@ -76,7 +77,8 @@ def boot(fresh):
             os.remove(OVERLAY)
         subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", "-b", os.path.abspath(disk), "-F", "raw", OVERLAY],
                        check=True)
-    cl = f"init=/bin/sshd initargs=--port,22 epoch={int(time.time())} {os.environ.get('TX_APPEND', '')}".strip()
+    init = os.environ.get("TX_INIT", "init=/bin/sshd initargs=--port,22")
+    cl = f"{init} epoch={int(time.time())} {os.environ.get('TX_APPEND', '')}".strip()
     for i in range(4):
         cl += f" virtio_mmio.device=512@{0xfeb00000 + i * 512:#x}:{5 + i}"
     open(os.path.join(RUN, "console.log"), "w").close()
@@ -89,6 +91,9 @@ def boot(fresh):
                     "-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{PORT}-:22",
                     "-device", "virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1",
                     "-pidfile", PIDFILE, "-daemonize"], check=True)
+    if "TX_INIT" in os.environ:
+        print(f"BOOTED (no ssh wait with TX_INIT) console={RUN}/console.log")
+        return
     t0 = time.time()
     while time.time() - t0 < 180:
         rc, out, _ = ssh("echo ready", 40)
