@@ -553,7 +553,12 @@ akuma-locks-rw = { path = "../crates/akuma-locks-rw" }
 # without that registration the first syscall folded into glue panics in
 # `akuma_exec::runtime::config()`, which is a `Registered` cell.
 akuma-exec = { path = "../crates/akuma-exec" }
-akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp"] }
+# `exec`: box's `SPAWN_EXT` (private 315) is glue's `sys_spawn_ext`, which loads
+# through `akuma-exec`'s ELF loader. Row 8 of the tokio dependency analysis
+# (`3e2bb725`) put that path behind the feature and left it off here, so every
+# `box run` answered "failed to spawn" until 2026-11-01. Taoxichuan has no box
+# and keeps it off.
+akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp", "exec"] }
 
 [[bin]]
 name = "akuma-amd64"
