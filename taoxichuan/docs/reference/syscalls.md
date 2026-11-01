@@ -39,6 +39,19 @@ Canonical mermaid source: [`../diagrams/syscall-path.md`](../diagrams/syscall-pa
 - A user pointer is only ever touched through `user_ok` + the physmap copy
   pair ([`memory.md`](memory.md) § the user-pointer rule).
 
+## Glue first
+
+After the x86-only legacy fold, `dispatch_inner` asks `served_by_glue(call)`
+(`main.rs`): a call in that set goes to `akuma_syscalls_glue::handle_syscall`
+by its asm-generic number (`Syscall::to_aarch64`), the same bodies amd64 and
+AArch64 run, and has no arm of its own below. Rows in the table further down
+for calls in that set are historical until the sweep (cleanup plan step 2i).
+Glue writes user memory directly, so the page-fault handler breaks CoW for a
+ring-0 write to a present user page and resumes a faulting copy at
+`akuma_user_access::user_copy_fixup`. A folded call whose glue body reads state
+this kernel keeps privately (its fd table, its task record) is not folded until
+that state moves: the fd table is step 2b.
+
 ## fd routing is table-first
 
 `read`/`write`/`writev`/`readv`/`lseek`/`fstat` route on the fd's **kind in

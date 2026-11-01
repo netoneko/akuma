@@ -154,6 +154,12 @@ akuma-sched-amd64 = { path = "../crates/akuma-sched-amd64" }
 akuma-user-walk = { path = "../crates/akuma-user-walk" }
 akuma-pte-amd64 = { path = "../crates/akuma-pte-amd64" }
 akuma-port = { path = "../crates/akuma-port" }
+# The shared syscall bodies (TAOXICHUAN_CLEANUP_PLAN.md step 2c): arms move
+# from `dispatch_inner` to `handle_syscall` the way amd64's did. Same feature
+# set amd64 builds it with. Its user copies are `akuma-user-access`'s, whose
+# fault recovery (`user_copy_fixup`) this kernel's page-fault handler consults.
+akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp"] }
+akuma-user-access = { path = "../crates/akuma-user-access" }
 
 [[bin]]
 name = "taoxichuan"

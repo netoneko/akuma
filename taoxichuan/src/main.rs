@@ -514,12 +514,25 @@ fn fault_trap_locked(t: &mut Trap<'_>) {
     if t.from_ring3() && code & 1 == 0 && grow_user_stack(akuma_cpu::ctlreg::cr2()) {
         return;
     }
-    // A user write to a present page: the copy-on-write arm. Present + write
-    // + user (error code bits 0-2). The live PTE decides, never the error
-    // code (`cow_resolve` re-reads it); only `Fault` falls through to the kill.
-    if t.from_ring3() && code & 7 == 7 {
+    // A write to a present user page, from EITHER ring: the copy-on-write
+    // arm. Present + write (error code bits 0-1); ring 0 counts because
+    // `akuma-syscalls-glue`'s arms write user memory directly through
+    // `akuma-user-access` (`CR0.WP` makes that fault on a shared page), and
+    // a kernel write into a forked child's buffer must break the share, not
+    // fail. The live PTE decides, never the error code (`cow_resolve` re-reads
+    // it); only `Fault` falls through.
+    let cr2 = akuma_cpu::ctlreg::cr2();
+    if code & 3 == 3 && cr2 < 0x0000_8000_0000_0000 {
         let root = akuma_cpu::ctlreg::cr3() & PTE_ADDR;
-        if cow_resolve(root, akuma_cpu::ctlreg::cr2()).resolves() {
+        if cow_resolve(root, cr2).resolves() {
+            return;
+        }
+    }
+    // A ring-0 fault inside `akuma-user-access`'s copy loop is a bad user
+    // pointer: resume at its `EFAULT` trampoline (amd64's `idt.rs` arm 2).
+    if !t.from_ring3() {
+        if let Some(fixup) = akuma_user_access::user_copy_fixup(t.frame.rip) {
+            t.frame.rip = fixup;
             return;
         }
     }
@@ -943,6 +956,27 @@ fn mount_vfs_glue(fs: alloc::sync::Arc<akuma_ext2::Ext2Filesystem<Vda>>) {
         fpcache_init: |_| {},
         // `/proc` is not mounted here, so nothing asks for map rows.
         pid_map_rows: |_| None,
+    });
+    // `akuma-syscalls-glue`'s own table: the wall clock and the core count are
+    // real answers; there is no rump kernel, console poller, mouse or tap
+    // device here (amd64's `boot::install_shared_sinks` registers the same set).
+    akuma_syscalls_glue::set_hooks(akuma_syscalls_glue::SyscallHooks {
+        box_is_rump: |_| false,
+        mark_box_rump: |_| {},
+        attach_server: |_, _| {},
+        intercept_box_syscall: |_, _| None,
+        rump_socket_readable: |_| false,
+        utc_time_us: || akuma_primitives::clock::utc_time_us(net::uptime_us()),
+        probed_core_count: smp::online_cpus,
+        poll_console_state: |_| None,
+        dev_mouse_has_events: || false,
+        dev_tun_has_frame: || false,
+    });
+    // Glue's `getrandom` reads the primitives hook; this kernel's source is
+    // `net::rng_fill` (RDRAND, SplitMix64 fallback), which always fills.
+    akuma_primitives::rng::set_rng_hook(|b| {
+        net::rng_fill(b);
+        true
     });
     akuma_vfs_glue::init();
     if akuma_vfs_glue::mount_with("/", Some("/dev/vda"), 0, fs).is_err() {
@@ -1593,18 +1627,6 @@ fn prctl_arm(option: u64, arg2: u64) -> u64 {
             }
         }
         _ => e(ring3::err::EINVAL),
-    }
-}
-
-/// `membarrier(cmd, flags, cpu)`: the decode is `akuma-syscalls-mem`'s; the
-/// one effect, a full fence, is one core's `SeqCst` fence.
-fn membarrier_arm(cmd: u64) -> u64 {    use akuma_syscalls_mem::membarrier::{Command, command};
-    match command(cmd as u32) {
-        Command::Barrier => {
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            0
-        }
-        other => other.immediate_result().unwrap_or(0),
     }
 }
 
@@ -2935,6 +2957,40 @@ fn trace_err(nr: u64, r: u64, a1: u64, a2: u64, a3: u64) {
     }
 }
 
+/// Whether `akuma-syscalls-glue` serves `call` on this kernel. One place, so
+/// the folded set is readable at a glance and a batch is one diff here.
+const fn served_by_glue(call: akuma_syscalls_abi::Syscall) -> bool {
+    use akuma_syscalls_abi::Syscall as S;
+    matches!(
+        call,
+        // Batch A (leaf tier): identity, host names, limits, randomness,
+        // whole-filesystem sync. No fd table, no task record.
+        S::Uname
+            | S::Sethostname
+            | S::Setdomainname
+            | S::Getpid
+            | S::Getppid
+            | S::Gettid
+            | S::Getuid
+            | S::Geteuid
+            | S::Getgid
+            | S::Getegid
+            | S::Getsid
+            | S::Setsid
+            | S::Getpgid
+            | S::Setpgid
+            | S::SchedGetaffinity
+            | S::Getrandom
+            | S::Membarrier
+            | S::Sync
+            | S::Syncfs
+            | S::Sysinfo
+            | S::Getrusage
+            | S::Getgroups
+            | S::Times
+    )
+}
+
 fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     // M4 slice 3: the per-syscall capture `fork_process` step 6 consumes
     // (`get_saved_user_context` → the twin's `read_user_context`). The boot
@@ -2952,6 +3008,17 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     ) {
         fr.rax = call.to_x86_64();
         (fr.rdi, fr.rsi, fr.rdx, fr.r10, fr.r8, fr.r9) = (a[0], a[1], a[2], a[3], a[4], a[5]);
+    }
+    // The arms `akuma-syscalls-glue` serves: the bodies both other kernels
+    // run, reached by their asm-generic number (`to_aarch64`), exactly as
+    // amd64's `to_glue`. The list grows batch by batch
+    // (TAOXICHUAN_CLEANUP_PLAN.md step 2c); an arm that moves here is deleted
+    // from the match below in the same change.
+    if let Some(call) = akuma_syscalls_abi::Syscall::from_x86_64(fr.rax)
+        && served_by_glue(call)
+    {
+        let args = [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()];
+        return akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args);
     }
     match fr.rax {
         ring3::nr::WRITE => {
@@ -3269,19 +3336,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         // x86_64 musl sends 39 for getpid; ring3's hand table says 38 (its
         // own archaeology). The ABI crate owns the x86_64 truth - answer both
         // spellings so the fetcher's calls stop landing in the unhandled arm.
-        ring3::nr::GETTID => my_tid(),
-        ring3::nr::GETPID | akuma_syscalls_abi::x86_64::GETPID => u64::from(child::current_pid()),
-        ring3::nr::GETPPID => 1, // everything here is the init task's child
         // Session and process-group identity. There is no controlling terminal and no job control here, so each
         // task is its own session and group leader: `setsid` succeeds and reports the new session id (the pid),
         // `getsid`/`getpgid` answer the pid, `setpgid` accepts. `git` daemonises with `setsid` and used to die
         // with "fatal: setsid failed: Function not implemented".
-        akuma_syscalls_abi::x86_64::SETSID | akuma_syscalls_abi::x86_64::GETSID | akuma_syscalls_abi::x86_64::GETPGID => {
-            u64::from(child::current_pid())
-        }
-        akuma_syscalls_abi::x86_64::SETPGID => 0,
-        ring3::nr::GETUID | ring3::nr::GETEUID => 0,
-        ring3::nr::GETGID | ring3::nr::GETEGID => 0,
         ring3::nr::IOCTL => {
             // FIONBIO (Rust std's read2 on a child's pipes): the same bit as
             // fcntl F_SETFL O_NONBLOCK. Everything else: no tty here.
@@ -3978,22 +4036,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             child::sleep_us(total_us);
             0
         }
-        ring3::nr::GETRANDOM => {
-            // `getrandom(buf, len, flags)` — sshd's key exchange reads this.
-            // net.rs's RDRAND-backed fill; a CPU without the instruction
-            // gets the stated-weak source and the boot console says so.
-            let (buf, len) = (fr.arg1(), fr.arg2());
-            if len > WRITE_LIMIT || !user_ok(buf, len) {
-                return e(ring3::err::EFAULT);
-            }
-            let mut tmp = alloc::vec![0u8; len as usize];
-            net::rng_fill(&mut tmp);
-            if !copy_to_user(buf, &tmp) {
-                return e(ring3::err::EFAULT);
-            }
-            len
-        }
-        // ---- Stage 6, phase A: apk.static startup ----------------------
         ring3::nr::FSTAT => fstat_fd(fr.arg1(), fr.arg2()),
         ring3::nr::NEWFSTATAT => {
             // musl's stat()/fstatat() on x86_64: the *at number for all of
@@ -4065,38 +4107,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 Ok(v) => v,
                 Err(no) => e(no),
             }
-        }
-        ring3::nr::UNAME => {
-            // struct utsname: six NUL-terminated 65-byte fields (the length
-            // is the crate's FIELD_LEN, which its own layout test pins). The
-            // release string is a plausible Linux one — apk prints it,
-            // nothing branches on it. Trim step 2: the field shape is
-            // `akuma_syscalls_linux::uts::Field` now — `set` zero-pads to
-            // exactly the 65 bytes the old `[0u8; 65]` literal did.
-            use akuma_syscalls_linux::uts;
-            let buf = fr.arg1();
-            if !user_ok(buf, (uts::FIELD_LEN * 6) as u64) {
-                return e(ring3::err::EFAULT);
-            }
-            let fields: [&[u8]; 6] = [
-                b"Linux\0",
-                b"taoxichuan\0",
-                b"6.6.0-akuma\0",
-                b"#1 SMP akuma-taoxichuan\0",
-                b"x86_64\0",
-                b"(none)\0",
-            ];
-            let mut out = [0u8; uts::FIELD_LEN * 6];
-            for (i, f) in fields.iter().enumerate() {
-                let mut one = uts::Field::empty();
-                let set = one.set(f);
-                debug_assert!(set.is_ok(), "utsname fields are under NAME_MAX");
-                out[i * uts::FIELD_LEN..(i + 1) * uts::FIELD_LEN].copy_from_slice(one.as_bytes());
-            }
-            if !copy_to_user(buf, &out) {
-                return e(ring3::err::EFAULT);
-            }
-            0
         }
         ring3::nr::STATFS => {
             let mut pbuf = [0u8; PATH_BUF];
@@ -4619,13 +4629,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         // One CPU, no limits: what the toolchain's thread-count and stack
         // probes read. RLIMIT_STACK reports the 8 MiB the stack may grow to.
-        akuma_syscalls_abi::x86_64::SCHED_GETAFFINITY => {
-            let (len, mask) = (fr.arg2(), fr.arg3());
-            if len < 8 || !copy_to_user(mask, &1u64.to_le_bytes()) {
-                return e(ring3::err::EINVAL);
-            }
-            8
-        }
         akuma_syscalls_abi::x86_64::PRLIMIT64 | 97 => {
             let (res, old) = if fr.rax == 97 { (fr.arg1(), fr.arg2()) } else { (fr.arg2(), fr.arg4()) };
             if old != 0 {
@@ -4639,14 +4642,9 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             0
         }
-        akuma_syscalls_abi::x86_64::SYNC | akuma_syscalls_abi::x86_64::SYNCFS => {
-            let _ = root_fs().sync();
-            0
-        }
         akuma_syscalls_abi::x86_64::SIGALTSTACK => sigaltstack_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::TKILL => tkill_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::TGKILL => tkill_arm(fr.arg2(), fr.arg3()),
-        akuma_syscalls_abi::x86_64::MEMBARRIER => membarrier_arm(fr.arg1()),
         // `prctl(157)`: PR_SET_NAME (a tokio program names its threads;
         // the guest's first `[nosys]` line today), PR_GET_NAME, EINVAL else.
         akuma_syscalls_abi::x86_64::PRCTL => prctl_arm(fr.arg1(), fr.arg2()),
