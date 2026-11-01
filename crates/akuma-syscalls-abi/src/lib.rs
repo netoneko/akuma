@@ -457,6 +457,9 @@ syscall_table! {
     Exit       => EXIT       = 60,  nr::EXIT;
     ExitGroup  => EXIT_GROUP = 231, nr::EXIT_GROUP;
     Wait4      => WAIT4      = 61,  nr::WAIT4;
+    /// x86_64 247, asm-generic 95. Taoxichuan serves it through glue (2026-11-01);
+    /// amd64 answers `ENOSYS`, as it did before the row.
+    Waitid     => WAITID     = 247, nr::WAITID;
     SchedYield => SCHED_YIELD = 24, nr::SCHED_YIELD;
     /// x86_64 202 is `futex` and asm-generic 202 is `accept` — the crossing
     /// that would turn a park into a socket accept.

@@ -1,6 +1,6 @@
 //! Processes on this kernel: the slot table every forked task and thread
 //! occupies, `clone`/`fork`/`vfork` through `akuma-exec`'s `fork_process`,
-//! `execve`, exit and `wait4`, init's thread, the two signal arms this kernel
+//! `execve` and exit (`wait4` is glue's, over the child channels), init's thread, the two signal arms this kernel
 //! keeps (`rt_sigsuspend`, `rt_sigreturn`), and the machine-state arms
 //! (`X86ArchHooks`) the shared scheduler calls.
 //!
@@ -22,14 +22,6 @@ pub struct SpawnSlot {
     pub pid: u32,
     /// The task has not exited yet (set at bind, cleared at exit).
     pub running: bool,
-    /// Linux wait status (`code << 8`), what `waitpid_status` relays.
-    pub status: u32,
-    /// WAIT4 reaped this child: a second wait on the pid is ECHILD, which is
-    /// how a shell's job table closes the entry.
-    pub reaped: bool,
-    /// Slice 3: the tid parked in WAIT4 for this child (`u32::MAX` = none).
-    /// The child's exit arm wakes it through the threading waker.
-    pub waiter: u32,
     /// Set only by `bind_child_task`: the slot holds a task `fork_process`
     /// published. With the private SPAWN path gone every occupied slot gets
     /// it, and `is_real_task` still reads it, so a slot whose bind has not
@@ -48,9 +40,6 @@ impl SpawnSlot {
             used: false,
             pid: 0,
             running: false,
-            status: 0,
-            reaped: false,
-            waiter: u32::MAX,
             real: false,
             thread: false,
         }
@@ -65,7 +54,7 @@ pub const NSLOTS: usize = 48;
 
 /// The spawn ring's rows. A [`BorrowCell`](akuma_primitives::cell::BorrowCell): the only way in is [`with_slots`] (or the one-field
 /// readers below), so two overlapping borrows are a panic naming the bug, and no closure ever calls out to anything that
-/// reaches the table again — `reap_process`, `schedule_blocking` and every print run with the borrow closed.
+/// reaches the table again — `schedule_blocking` and every print run with the borrow closed.
 static SLOTS: akuma_primitives::cell::BorrowCell<[SpawnSlot; NSLOTS]> =
     akuma_primitives::cell::BorrowCell::new([const { SpawnSlot::new() }; NSLOTS]);
 // Pids come from `akuma_exec::process::allocate_pid` (floor 2: 1 is sshd,
@@ -322,13 +311,18 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
     // The boot thread: a timed sleep (an unbounded park starves init's startup) that init's exit also wakes by event
     // (`task_exit_status`); on wake, finish as the boot program's exit.
     loop {
-        let (running, status) = SLOTS.with(|s| (s[tid].running, s[tid].status));
-            if !running {
-            crate::task_done(u64::from(status >> 8));
+        let code = INIT_EXIT.load(core::sync::atomic::Ordering::Acquire);
+        if code != INIT_RUNNING {
+            crate::task_done(code);
         }
         akuma_threading::schedule_blocking(crate::net::uptime_us() + 10_000);
     }
 }
+
+/// Init's exit code as the boot report shows it (`128 + signal` for a signal death), or
+/// [`INIT_RUNNING`]. Init has no parent to `wait4` for it, so its exit is recorded here.
+static INIT_EXIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(INIT_RUNNING);
+const INIT_RUNNING: u64 = u64::MAX;
 
 pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> Result<(), &'static str> {
     if tid >= NSLOTS {
@@ -430,58 +424,41 @@ pub fn is_real_task() -> bool {
     SLOTS.with(|s| s[cur].used && s[cur].running && s[cur].real)
 }
 
-/// A real fork child's `exit_group`: status into the slot, the task's pipe
-/// references dropped (the sweep that turns the last writer close into the
-/// reader's EOF), the WAIT4-parked parent woken through the threading
-/// waker, then the threading slot terminated — `x86_finish_current` never
-/// returns (the dispatcher frame on this task's own band is abandoned, the
-/// same model `task_done` uses for the boot's tasks).
+/// A forked task's `exit_group` (or a lone process's `exit`): the whole group
+/// ends with exit code `code & 0xFF`. Never returns.
 pub fn task_exit_real(code: u64) -> ! {
-    task_exit_status(((code & 0xFF) as u32) << 8)
+    task_exit_code((code & 0xFF) as i32)
 }
 
-/// A real task killed by a fault: the group dies with wait status SIGSEGV
-/// (11), the parent's `wait4` sees `WIFSIGNALED` as on Linux, and the machine
-/// keeps running. Only for a real fork child or thread; the shell and the
-/// boot task keep the halting report.
 /// `akuma-threading`'s slot-purge hook: thread `tid` has just been marked
-/// TERMINATED. When `akuma-exec` ended its process rather than this kernel's
-/// exit path — a fatal signal's default action inside `akuma-syscalls-glue`
-/// (SIGPIPE on a pipe with no reader runs glue's `sys_exit_group`, which kills
-/// the group, the caller included) — the ring row still says `running` and
-/// the parent's `wait4` would sleep forever. Record the status, clear
-/// `running` and wake the waiter, as `task_exit_status` does. This kernel's own
-/// exits clear `running` first, so for them this is only the futex purge.
-/// Bridges the two wait models until `wait4` is `akuma-exec`'s (pm S2).
+/// TERMINATED, by this kernel's exit path or by `akuma-exec` (a fatal signal's
+/// default action inside `akuma-syscalls-glue`: SIGPIPE on a pipe with no
+/// reader runs glue's `sys_exit_group`). Purge its futex waits; for the last
+/// thread of a process, clear the row's `running` and hand its page-table root
+/// to [`zombie_root`], so glue's reap can never drop it.
 pub fn on_thread_terminated(tid: usize) {
     crate::futex::purge_task(tid);
     if tid >= NSLOTS {
         return;
     }
     let pid = slot_pid(tid);
-    let Some(code) = akuma_exec::process::lookup_process_shared(pid)
-        .filter(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed))
-        .map(|p| p.exit_code.load(core::sync::atomic::Ordering::Relaxed))
-    else {
+    let Some(p) = akuma_exec::process::lookup_process_shared(pid) else {
         return;
     };
-    // A negative code is "killed by that signal" (status = the signal number).
-    let status = if code < 0 { code.unsigned_abs() & 0x7F } else { ((code as u32) & 0xFF) << 8 };
-    let waiter = with_slots(|s| {
-        if !s[tid].used || !s[tid].running {
-            return u32::MAX;
-        }
-        s[tid].running = false;
-        s[tid].status = status;
-        s[tid].waiter
-    });
-    if waiter != u32::MAX {
-        akuma_threading::get_waker_for_thread(waiter as usize).wake();
+    if p.pid != p.tgid || !p.exited.load(core::sync::atomic::Ordering::Relaxed) {
+        return; // a thread (its space is the leader's), or a process still running
+    }
+    let was_running = with_slots(|s| core::mem::replace(&mut s[tid].running, false));
+    if was_running || OWNED_ROOT.with(|t| t[tid]) != 0 {
+        zombie_root(tid, pid);
     }
 }
 
+/// A forked task killed by a fault: the group dies with wait status SIGSEGV
+/// (11), the parent's `wait4` sees `WIFSIGNALED` as on Linux, and the machine
+/// keeps running.
 pub fn task_die_segv() -> ! {
-    task_exit_status(11)
+    task_exit_code(-11)
 }
 
 /// The exiting process's descriptors, closed now rather than when its
@@ -495,49 +472,49 @@ fn close_process_fds() {
     }
 }
 
-fn task_exit_status(status: u32) -> ! {
+/// End the caller's whole process with `code`: an exit code (0..=255), or
+/// `-signal` for a death by signal, the form glue's `encode_wait_status` reads.
+///
+/// The exit is published the way `akuma-exec` publishes every exit: the
+/// `Process` is marked a zombie, and `publish_child_exit` marks the child
+/// channel `fork_process` registered (waking a parent parked in glue's
+/// `wait4`) and raises SIGCHLD on the parent. Glue's `wait4` reaps it.
+fn task_exit_code(code: i32) -> ! {
     // A shared file mapping persists at exit (rust-lld never munmaps its output).
     crate::shared_flush_all();
     let cur = crate::exec_twin::current_slot();
     // The group's leader slot: `cur` itself unless a thread is the one
-    // calling `exit_group`, in which case the leader's status and waiter are
-    // the process's. Every other thread of the group dies here (Linux's
-    // `exit_group`): purged from the futex table and terminated.
+    // calling `exit_group`. Every other thread of the group dies here
+    // (Linux's `exit_group`): purged from the futex table and terminated.
     let lead = group_leader(cur);
     kill_siblings(cur, lead);
-    let (waiter, lead_pid) = with_slots(|s| {
-        s[lead].status = status;
+    let lead_pid = with_slots(|s| {
         s[lead].running = false;
-        (s[lead].waiter, s[lead].pid)
+        s[lead].pid
     });
-    // The zombie keeps its ring row (status!) until the parent's wait4: without
-    // this hold `x86_claim_slot` hands the TERMINATED slot to the next fork and
-    // `SpawnSlot::new()` erases the status, so the waiter gets ECHILD (cargo
-    // -j4). `reap_process`'s `unregister_process` releases it.
+    // The zombie keeps its thread slot until the parent's wait4: without this
+    // hold `x86_claim_slot` hands the TERMINATED slot to the next fork while the
+    // pid is still waitable. Glue's reap (`unregister_process`) releases it.
     akuma_exec::process::hold_exited_thread_slot(lead_pid, lead);
-    // Init's exit is what the parked boot thread waits for (`start_init_thread`): wake it by event, slot 0, rather than leave it
-    // to a timed sleep that nothing is guaranteed to service once init's thread has switched away for good.
-    if lead == INIT_TID.load(core::sync::atomic::Ordering::Relaxed) {
-        akuma_threading::get_waker_for_thread(0).wake();
+    if let Some(p) = akuma_exec::process::lookup_process_shared(lead_pid) {
+        p.exit_code.store(code, core::sync::atomic::Ordering::Relaxed);
+        p.state.store(akuma_exec::process::ProcessState::Zombie(code));
+        p.exited.store(true, core::sync::atomic::Ordering::Release);
     }
     close_process_fds();
-    if waiter != u32::MAX {
-        akuma_threading::get_waker_for_thread(waiter as usize).wake();
+    zombie_root(lead, lead_pid);
+    // Init has no parent to wait for it: the parked boot thread reports it.
+    if lead == INIT_TID.load(core::sync::atomic::Ordering::Relaxed) {
+        let shown = if code < 0 { 128 + u64::from(code.unsigned_abs()) } else { code as u64 };
+        INIT_EXIT.store(shown, core::sync::atomic::Ordering::Release);
+        akuma_threading::get_waker_for_thread(0).wake();
     }
+    akuma_exec::process::publish_child_exit(lead_pid, code);
     if lead != cur {
         crate::futex::purge_task(lead);
         akuma_threading::mark_thread_terminated(lead);
     }
     akuma_threading::x86_finish_current()
-}
-
-/// The pid of the thread GROUP slot `slot` belongs to: the registered
-/// `Process`'s `tgid` (a `clone_thread` Process carries its leader's), else the
-/// slot's own pid. Children are stamped with and matched against this, so a
-/// child forked by one thread can be waited on by another.
-fn group_pid(slot: usize) -> u32 {
-    let pid = slot_pid(slot);
-    akuma_exec::process::table::with_process(pid, |p| p.tgid).unwrap_or(pid)
 }
 
 /// The slot that owns the process `cur` belongs to: the one non-thread slot
@@ -574,7 +551,7 @@ fn kill_siblings(cur: usize, lead: usize) {
 /// Take a dead thread's registered `Process` out of the process table.
 ///
 /// `clone_thread` registers a real `Process` per thread (so `current_process` answers
-/// per thread), and nothing but `reap_process` - which runs for a group LEADER, on its
+/// per thread), and nothing but the reap - which runs for a group LEADER, on its
 /// parent's `wait4` - ever unregistered one. A thread's own `exit` and `exit_group`'s
 /// `kill_siblings` freed the ring slot and left the `Process` ACTIVE for the rest of the
 /// boot, so every thread leaked a table entry: a `cargo build` of this kernel (cargo plus
@@ -629,7 +606,7 @@ fn clone_thread_arm(fr: &ring3::SyscallFrame) -> u64 {
     // that consumes rows, so it pays for collecting them. Not at thread teardown: reclaim
     // runs `Process::drop`, and the exiting thread is still running on its own row
     // (`docs/archive/AKUMA_AMD64_THREAD_LIFECYCLE.md` §3 - the same fix on the amd64 kernel).
-    let _ = akuma_exec::process::reclaim::drain_retired();
+    collect();
     match akuma_exec::process::clone_thread(stack, tls, ptid, ctid, flags) {
         Ok(tid) => u64::from(tid),
         Err(msg) => {
@@ -673,28 +650,6 @@ pub fn set_slot_fs(slot: usize, v: u64) {
     if slot < NSLOTS {
         SLOT_FS.with_mut(|t| t[slot] = v);
     }
-}
-
-/// Session pi (grandfork step 5): child pid -> parent pid, stamped at
-/// `fork_arm_real` and consulted by the wait4 reapers. The slot table is
-/// GLOBAL — before this map, any task's `wait4(-1)` could reap (or park on)
-/// an UNRELATED task's zombie: grandfork step 2 deliberately leaves an
-/// un-reaped grandchild, and step 5's own childless `wait4(-1)` returned
-/// that orphan instead of ECHILD (exit 5). Unstamped pids (0 = the M2 spawn
-/// path's children) stay visible to everyone, so the M-gate semantics do
-/// not move. Bounded ring; pid reuse just overwrites an entry.
-static PARENT_OF: akuma_primitives::cell::BorrowCell<[(u32, u32); 256]> = akuma_primitives::cell::BorrowCell::new([(0, 0); 256]);
-
-pub fn stamp_child_parent(child: u32, parent: u32) {
-    PARENT_OF.with_mut(|p| p[child as usize % 256] = (child, parent));
-}
-
-/// 0 = unknown (an M2-spawned child, or the map's ring moved past it).
-pub fn parent_of(child: u32) -> u32 {
-    if child == 0 {
-        return 0;
-    }
-    PARENT_OF.with(|p| p.iter().find(|&&(c, _)| c == child).map_or(0, |&(_, par)| par))
 }
 
 pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
@@ -927,6 +882,7 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
     if cur == crate::exec_twin::NO_SLOT {
         return crate::e(crate::err::EPERM);
     }
+    collect();
     let child_pid = akuma_exec::process::allocate_pid();
     // stack_ptr = 0: the child resumes at the parent's saved user RSP — the
     // syscall stub stashed it (`user_rsp_stash`) and step 6's captured
@@ -941,15 +897,8 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
     };
     match akuma_exec::process::fork_process(child_pid, child_stack) {
         Ok(pid) => {
-            // Session pj wiring of pi's PARENT_OF: the child's parent is THIS
-            // task's pid — the slot ROW's pid, never the slot index (slots are
-            // reused across successive children — pi4's console shows tid=10/11
-            // alternating for pids 29..37; pids are monotonic). The wait4
-            // reapers consult the map for the crate's is_child_of_group
-            // decision: wait* on a non-child is ECHILD and never blocks.
-            // A child belongs to the thread GROUP: cargo forks from a job thread
-            // and another thread waits on it (`wait4` compares group pids).
-            stamp_child_parent(pid, group_pid(cur));
+            // `fork_process` registered the child's exit channel under its
+            // parent; glue's `wait4` finds it there (`is_child_of_group`).
             u64::from(pid)
         }
         // The refusal line is the evidence this slice hunts for; name the
@@ -958,18 +907,17 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
         Err(msg) => {
             akuma_primitives::safe_print!(192, "[forkp] refused: {}\n", msg);
             for i in 0..NSLOTS {
-                let (used, running, reaped, thread, real, rpid) =
-                    SLOTS.with(|t| (t[i].used, t[i].running, t[i].reaped, t[i].thread, t[i].real, t[i].pid));
+                let (used, running, thread, real, rpid) =
+                    SLOTS.with(|t| (t[i].used, t[i].running, t[i].thread, t[i].real, t[i].pid));
                 akuma_primitives::safe_print!(
                     128,
-                    "  ring {}: pool={} oncpu={} held={} used={} running={} reaped={} thread={} real={} pid={}\n",
+                    "  ring {}: pool={} oncpu={} held={} used={} running={} thread={} real={} pid={}\n",
                     i,
                     akuma_threading::get_thread_state(i),
                     akuma_threading::on_cpu_flag(i),
                     akuma_threading::slot_held_by(i),
                     used,
                     running,
-                    reaped,
                     thread,
                     real,
                     rpid
@@ -1002,109 +950,6 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     fork_arm_real(fr)
 }
 
-/// Linux WAIT4 (61): `wait4(pid, &status, options, rusage)` — the M2 answer,
-/// reading the same slot table `waitpid_arm` does. Returns the reaped
-/// child's pid with the status word written out; `ECHILD` for a pid that is
-/// not an unreaped child (including one already reaped — that is how a
-/// shell's job table closes its entry); `0` only where the ABI allows
-/// "nothing reaped" (WNOHANG on a running child — unreachable in this
-/// model, since a child completes inside its own fork call, but answered
-/// honestly). `rusage` is accepted and ignored: the gate's callers pass
-/// NULL, and zero-filled accounting is what this box has always given.
-pub fn wait4_arm(pid: u64, status_va: u64, options: u64, _rusage_va: u64) -> u64 {
-    wait4_real(pid, status_va, options)
-}
-
-/// The REAL wait4 (slice 3): reap a dead child from the slot scan, or PARK
-/// the caller until one dies. The park is `schedule_blocking(u64::MAX)` —
-/// WAITING, then `x86_yield_now` hands the core to the next READY task (or
-/// the idle thread); the child's exit arm wakes the registered waiter
-/// through the threading waker, which makes this caller READY again, and
-/// the loop re-scans. WNOHANG answers 0 while the matched children still
-/// run. The boot task never parks (the bridge drives it through
-/// `waitpid_arm`); a WAIT4 that reaches it keeps the M2 scan.
-fn wait4_real(pid: u64, status_va: u64, options: u64) -> u64 {
-    let want_pid = pid as u32;
-    let any = pid == u64::MAX || want_pid == 0; // -1, or "my process group"
-    let wnohang = options & 1 != 0;
-    let my_tid = crate::exec_twin::current_slot();
-    if my_tid == crate::exec_twin::NO_SLOT || my_tid >= NSLOTS {
-        // Not a task that may park — answer without blocking.
-        return wait4_arm_blocking_scan(pid, status_va);
-    }
-    // Session pj: the caller's OWN pid (the slot row's — never the slot index,
-    // slots are reused). This is the crate's is_child_of_group waiter side:
-    // wait* reaps only children registered to THIS pid, answers ECHILD for a
-    // stranger's, and never parks on one (akuma-exec children.rs:42).
-    let my_pid = group_pid(my_tid);
-    loop {
-        // The scan runs with the ring borrowed, so it only DECIDES: marking the row and
-        // noting (index, pid, status). `reap_process` reads the ring itself and runs after.
-        let reaped = with_slots(|s| {
-            for (sidx, sl) in s.iter_mut().enumerate() {
-                if !sl.used || sl.reaped || sl.running || (!any && sl.pid != want_pid) {
-                    continue;
-                }
-            // Not my child: the crate's is_child_of_group answer, reached by
-            // skipping the candidate here and in the live scan below. The
-            // parked arm's callers are REAL tasks — every child they could
-            // own went through fork_arm_real and is STAMPED (spawn rows are
-            // the sshd's, and the spawn model never waits: their rows are
-            // zombies nobody reaps — pj-4's instrument caught step 5's
-            // wait(0) reaping PK1's left-behind shell, po=0). A caller's own
-            // pid is never 0, so po==0 skips too.
-            if parent_of(sl.pid) != my_pid {
-                continue;
-            }
-            sl.waiter = u32::MAX;
-            sl.reaped = true;
-            return Some((sidx, sl.pid, sl.status));
-            }
-            None
-        });
-        if let Some((sidx, child, status)) = reaped {
-            reap_process(sidx, child);
-            if status_va != 0
-                && (!crate::user_ok(status_va, 4)
-                    || !crate::copy_to_user(status_va, &status.to_le_bytes()))
-            {
-                return crate::e(crate::err::EFAULT);
-            }
-            return u64::from(child);
-        }
-        let live = with_slots(|s| {
-            let mut live = false;
-            for sl in s.iter_mut() {
-                if sl.used && !sl.reaped && sl.running && (any || sl.pid == want_pid) {
-                    // Live = MY OWN child (stamped mine): a real task parks only
-                    // for real children; a stranger's running child — spawn rows
-                    // included — neither parks me nor takes my waiter stamp.
-                    if parent_of(sl.pid) == my_pid {
-                        live = true;
-                        sl.waiter = my_tid as u32;
-                    }
-                }
-            }
-            live
-        });
-        if !live {
-            return crate::e(ring3::err::ECHILD);
-        }
-        if wnohang {
-            return 0;
-        }
-        // The stub's stash is a GLOBAL — every task's syscall entry overwrites
-        // it, so the parked task's own user RSP must be saved across the
-        // park and restored before its syscall returns (the stub tail reads
-        // the global, not a per-task copy).
-        let stash = ring3::user_rsp_stash();
-        akuma_threading::schedule_blocking(u64::MAX);
-        ring3::set_user_rsp_stash(stash);
-        // Woken (or the deadline passthrough never fires at u64::MAX): the
-        // loop re-scans. Spurious wakes are fine — the scan decides.
-    }
-}
-
 /// `rt_sigsuspend(mask, sigsetsize)` - x86_64 130: replace the signal mask and sleep until a
 /// signal arrives, then restore it and answer `EINTR`, always.
 ///
@@ -1132,33 +977,19 @@ pub fn sigsuspend_arm(fr: &mut ring3::SyscallFrame, mask_va: u64, sigsetsize: u6
     let new = u64::from_le_bytes(b) & !unblockable;
     let old = akuma_exec::threading::thread_signal_mask();
     akuma_exec::threading::set_thread_signal_mask(new);
-    let my_pid = group_pid(me);
     let mut child_died = false;
     loop {
         if akuma_threading::take_thread_interrupted(me) {
             #[cfg(feature = "trace-err")]
-            sigsuspend_note(b'I', me, 0, 0);
+            sigsuspend_note(b'I', me);
             break;
         }
-        // A child of mine that has exited and is not yet reaped is the SIGCHLD that already
-        // arrived; a live one gets this slot as its waiter so its exit wakes the sleep.
-        let dead = with_slots(|s| {
-            let mut dead = None;
-            for (i, sl) in s.iter_mut().enumerate() {
-                if !sl.used || sl.reaped || parent_of(sl.pid) != my_pid {
-                    continue;
-                }
-                if sl.running {
-                    sl.waiter = me as u32;
-                } else {
-                    dead = Some((i, sl.pid));
-                }
-            }
-            dead
-        });
-        if let Some((_i, _pid)) = dead {
+        // A child's exit pends SIGCHLD on a thread of its parent's group and
+        // wakes it (`publish_child_exit`); this kernel delivers no other signal.
+        if akuma_threading::pending_signals_raw(me) & (1 << (SIGCHLD - 1)) != 0 {
+            akuma_threading::clear_pending_signal(me, SIGCHLD as u32);
             #[cfg(feature = "trace-err")]
-            sigsuspend_note(b'D', me, _i, _pid);
+            sigsuspend_note(b'D', me);
             child_died = true;
             break;
         }
@@ -1295,10 +1126,10 @@ pub fn sigreturn_arm(fr: &mut ring3::SyscallFrame) -> u64 {
 }
 
 #[cfg(feature = "trace-err")]
-fn sigsuspend_note(why: u8, me: usize, slot: usize, pid: u32) {
+fn sigsuspend_note(why: u8, me: usize) {
     static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     if N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 24 {
-        akuma_primitives::safe_print!(96, "[sigsuspend] {} me={} slot={} pid={} my_pid={}\n", why as char, me, slot, pid, group_pid(me));
+        akuma_primitives::safe_print!(96, "[sigsuspend] {} me={} pid={}\n", why as char, me, slot_pid(me));
     }
 }
 
@@ -1379,89 +1210,71 @@ fn sweep_parked_roots() -> usize {
     pages
 }
 
-/// A reaped real child's `Process` leaves the table and its memory comes
-/// back. `unregister_process` retires the row and the drain (cooldown 0 on
-/// this kernel, `exec_twin`) drops it — `UserAddressSpace::drop` returns the
-/// frames of a fork-cloned space the child never replaced, and the retire
-/// closure marks the thread slot TERMINATED so `x86_claim_slot` can reuse it.
-/// An exec'd image's root is the twin's own (see [`OWNED_ROOT`]): freed here.
-/// Without this every exited child kept its whole address space for the rest
-/// of the boot (the second `cargo` of a boot died of it).
-fn reap_process(slot: usize, pid: u32) {
-    let before = akuma_exec::pmm::free_count();
+/// Page-table roots of exited processes, by pid, until their reap.
+///
+/// A fork child's address space is the twin's eager clone, every frame of which
+/// the `Process`'s `UserAddressSpace` ledger never saw (see [`disown_space`]), so
+/// the twin frees it and the `Process` must not. At the exit the `Process` is
+/// handed a non-owning view of the same root and the root is recorded here;
+/// after glue's `wait4` has unregistered the pid, [`collect`] frees it.
+const ZOMBIE_ROOTS: usize = 64;
+static ZOMBIE_ROOT: akuma_primitives::cell::BorrowCell<[(u32, u64); ZOMBIE_ROOTS]> =
+    akuma_primitives::cell::BorrowCell::new([(0, 0); ZOMBIE_ROOTS]);
+
+/// Record process `pid`'s root (slot `slot` is its leader) for [`collect`].
+/// The root the leader last ran on: its exec'd image, or, never exec'd, the
+/// fork clone in its task record. Idempotent: the exit path and the purge hook
+/// both call it.
+fn zombie_root(slot: usize, pid: u32) {
     let own = OWNED_ROOT.with_mut(|t| core::mem::replace(&mut t[slot], 0));
-    // The root the child last ran on: its exec'd image, or - never exec'd -
-    // the fork clone in its task record. A thread shares its creator's.
-    let root = if own != 0 {
-        own
-    } else if SLOTS.with(|s| s[slot].thread) {
-        0
-    } else {
-        crate::task_root_of(task_of(slot))
-    };
-    if root != 0 {
-        let _ = disown_space(pid, root);
-        park_root(root);
+    let root = if own != 0 { own } else { crate::task_root_of(task_of(slot)) };
+    if root == 0 || ZOMBIE_ROOT.with(|z| z.iter().any(|&(p, _)| p == pid)) {
+        return;
     }
-    let retired = akuma_exec::process::unregister_process(pid);
-    let drained = akuma_exec::process::reclaim::drain_retired();
-    let mut pages = sweep_parked_roots();
-    pages += akuma_mmu::drain_pending_ttbr_frees();
-    if cfg!(feature = "trace-err") {
-        akuma_primitives::safe_print!(
-        224,
-        "[reap] pid={} retired={} drained={} root={} free {} -> {} heap={}K cowrefs={} cow={:?} procs={}/{}\n",
-        pid,
-        retired,
-        drained,
-        pages,
-        before,
-        akuma_exec::pmm::free_count(),
-        akuma_alloc::allocated_bytes() / 1024,
-        akuma_pmm::cow_ref_count(),
-        crate::cow_stats(),
-        akuma_exec::process::table::process_count(),
-        akuma_exec::process::table::retired_process_count()
-    );
+    let _ = disown_space(pid, root);
+    let stored = ZOMBIE_ROOT.with_mut(|z| {
+        z.iter_mut().find(|e| e.0 == 0).map(|e| *e = (pid, root)).is_some()
+    });
+    if !stored {
+        // Full: a leaked image beats freeing a root a zombie's view still names.
+        akuma_primitives::safe_print!(96, "[reap] zombie-root table full: pid {} leaks its image\n", pid);
     }
 }
 
-/// The M2 body of [`wait4_arm`], kept for the boot task's non-blocking
-/// answer (the bridge's reaper never parks).
-fn wait4_arm_blocking_scan(pid: u64, status_va: u64) -> u64 {
-    let want_pid = pid as u32;
-    let any = pid == u64::MAX || want_pid == 0;
-    let found = with_slots(|s| {
-        for sl in s.iter_mut() {
-            if !sl.used || sl.reaped || sl.running || (!any && sl.pid != want_pid) {
-                continue;
-            }
-        // Session pj: a STAMPED row names a parent — and this arm's callers
-        // (the boot task behind NO_SLOT, kernel-side drivers) own no stamped
-        // children (the fork depth gate refuses forks outside the spawned
-        // shell). Skip: an orphan whose parent died stays unreapable here —
-        // the crate reparents orphans to init (children.rs:310), but this
-        // kernel has no init reaper, so unreapable is the honest no-init
-        // answer (one slot row per abandoned grandchild, harmless at
-        // NSLOTS=12). Unstamped rows (spawn-path children, the shell) stay
-        // visible: the M-gates and the bridge's reaper do not move.
-        if parent_of(sl.pid) != 0 {
-            continue;
+/// Free what reaped processes left: the roots of pids no longer in the process
+/// table (glue's `wait4` unregistered them), retired `Process` rows, and parked
+/// roots. Run after every `wait4`/`waitid` and at fork/clone entry; cheap when
+/// there is nothing to do.
+pub fn collect() {
+    let before = akuma_exec::pmm::free_count();
+    let mut reaped = 0;
+    for i in 0..ZOMBIE_ROOTS {
+        let (pid, root) = ZOMBIE_ROOT.with(|z| z[i]);
+        if pid != 0 && akuma_exec::process::lookup_process_shared(pid).is_none() {
+            ZOMBIE_ROOT.with_mut(|z| z[i] = (0, 0));
+            park_root(root);
+            reaped += 1;
         }
-        sl.reaped = true;
-        return Some((sl.pid, sl.status));
-        }
-        None
-    });
-    let Some((child, status)) = found else {
-        return crate::e(ring3::err::ECHILD);
-    };
-    if status_va != 0
-        && (!crate::user_ok(status_va, 4) || !crate::copy_to_user(status_va, &status.to_le_bytes()))
-    {
-        return crate::e(crate::err::EFAULT);
     }
-    u64::from(child)
+    let drained = akuma_exec::process::reclaim::drain_retired();
+    let mut pages = sweep_parked_roots();
+    pages += akuma_mmu::drain_pending_ttbr_frees();
+    if cfg!(feature = "trace-err") && reaped != 0 {
+        akuma_primitives::safe_print!(
+            224,
+            "[reap] reaped={} drained={} root={} free {} -> {} heap={}K cowrefs={} cow={:?} procs={}/{}\n",
+            reaped,
+            drained,
+            pages,
+            before,
+            akuma_exec::pmm::free_count(),
+            akuma_alloc::allocated_bytes() / 1024,
+            akuma_pmm::cow_ref_count(),
+            crate::cow_stats(),
+            akuma_exec::process::table::process_count(),
+            akuma_exec::process::table::retired_process_count()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

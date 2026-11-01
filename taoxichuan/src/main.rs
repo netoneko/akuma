@@ -1856,6 +1856,11 @@ const fn served_by_glue(call: akuma_syscalls_abi::Syscall) -> bool {
             | S::ClockNanosleep
             | S::Prlimit64
             | S::Getrlimit
+            // Reaping (step A1): the child channels `fork_process` registers,
+            // which this kernel's exit publishes to. `child::collect` frees
+            // what a reap leaves after each call.
+            | S::Wait4
+            | S::Waitid
             // Sockets (step 2b, with the fd table): AF_INET and AF_UNIX are
             // glue's; `sockaddr` and `msghdr` have one layout on both ABIs.
             | S::Socket
@@ -1903,7 +1908,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         && served_by_glue(call)
     {
         let args = [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()];
-        return akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args);
+        let r = akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args);
+        if matches!(call, akuma_syscalls_abi::Syscall::Wait4 | akuma_syscalls_abi::Syscall::Waitid) {
+            child::collect();
+        }
+        return r;
     }
     // The fd family over the process's `akuma-exec` table (step 2b): the
     // x86_64 ABI layer amd64 uses too, after the one local intercept — stdio
@@ -2236,7 +2245,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         // fork and the real reap — the arms busybox ash needs to run any
         // non-final command of a list. child.rs's M2 scaffold.
         akuma_syscalls_abi::x86_64::CLONE | ring3::nr::FORK | ring3::nr::VFORK => child::fork_arm(fr),
-        akuma_syscalls_abi::x86_64::WAIT4 => child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
         akuma_syscalls_abi::x86_64::EXECVE => {
             // A fork child (its own threading slot, published by
             // `fork_process`) execs the way Linux does — its image is

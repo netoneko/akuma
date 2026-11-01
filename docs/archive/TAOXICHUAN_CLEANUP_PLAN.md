@@ -139,6 +139,32 @@ commit, and the battery decides.
 Each step records the kernel's line and `unsafe` counts before and after in the status table below. Each step is one commit
 (or a short series), pushed when its gates pass.
 
+## Phase 2.5: the process model, then the rest (decided 2026-11-01)
+
+Agreed with the user after reading both x86 kernels' process code. Two kernels keep two private process models around
+the shared layers (`akuma-threading`'s tids, `akuma-sched-amd64`'s `Machine` table, `akuma-exec`'s `Process` table and
+child channels), both leftovers of models that predate `akuma-exec` owning processes: amd64's `PROC_SLOTS`/`THREADS`,
+Taoxichuan's `SpawnSlot`/`TASK_OF`/`PARENT_OF`/`SLOT_STATE`. `akuma-exec` is already large, so nothing here adds to
+it: per-process bookkeeping goes to what it already has, pure decisions to a new family crate, per-thread machine state
+to the arch crate behind `X86ArchHooks`.
+
+| step | what |
+|---|---|
+| A1 | `wait4`/`waitid` to glue: exit publishes through `akuma_exec::process::publish_child_exit`; root teardown moves to the exit (disown) and after the reap (sweep); `rt_sigsuspend` wakes on the pending SIGCHLD. Deleted: `SpawnSlot`'s status/waiter/reaped, `PARENT_OF`, the private wait4. (`kill` waits for signal delivery, B9: glue's takes the AArch64 hard-kill path.) |
+| A2 | thread vs leader from `Process.tgid`: the slot's `thread`/`real` bits and `TASK_OF`'s thread case go |
+| A3 | new pure crate `akuma-syscalls-proc`: clone flag decode, the exit sequence, exec's argument rules; Taoxichuan, then amd64 |
+| A4 | exec in two shared halves (pre-load: marshal, resolve, ELF check; commit: image record, close-on-exec, signal reset); loaders stay per kernel until B8 |
+| A5 | one amd64 slot table: `akuma-sched-amd64` implements all of `X86ArchHooks` (`Machine` gains stacks, user context, FS shadow; `Platform` narrowed; `hooks::<P>()`); Taoxichuan first (`SLOT_STATE`, `SLOT_FS`, `SpawnSlot` go), amd64 behind its 819 self-tests |
+| A6 | fixed point on the ryzen, plus `cow_leak_gate` |
+| B7 | one x86 `futex` from both kernels |
+| B8 | the basic x86 address-space crate (`TASKS`, slab/holes, the mm syscalls); `load_task` onto `akuma-elf-exec` (2g) |
+| B9 | tokio gaps: `madvise`, `pidfd_open`, signal delivery beyond SIGCHLD (`kill` with it); amd64's `rt_sigsuspend` |
+| B10 | syscall census: TCG trace mode, then `strace -f -c` on the ryzen |
+| B11 | the tokio crate (table + hooks + features), Taoxichuan its first consumer; gates and the cost report |
+| B12 | AArch64's slot table out of `akuma-threading`'s `cfg` blocks behind the same interface |
+| B13 | docs sweep (2i), `crate-safety.md` regenerated; `BUG_FIX_LIST.md` at branch close |
+| B14 | fixed point again |
+
 ## Phase 3: a tokio kernel
 
 The dependency and syscall-surface analysis for this phase is
@@ -203,6 +229,7 @@ passes `epoch=`. Without it the guest clock reads 1970 and every TLS client refu
 | X2: one clock, the time family on glue | (this commit) | 6,643 -> 6,548 (includes a `trace-err` netpoll lap timer, `[netlap]`, +35); audit 78,423 -> 78,352 | **The TSC is the only clock** (`net::calibrate` before `exec_twin::init`; `ExecRuntime`/`ThreadRuntime` read `net::uptime_us`), so `clock_gettime`/`clock_getres`/`clock_settime`/`adjtimex`/`clock_adjtime`/`nanosleep`/`clock_nanosleep`/`prlimit64`/`getrlimit` are glue's, and `gettimeofday`/`time` (x86-only) are `akuma-syscalls-glue-amd64`'s. `clock_getres` was a tokio gap. Found on the way: a timed park on an idle core never expired (the idle loop yielded only for READY threads; the wake pass is inside `x86_yield`), which the old spinning `nanosleep` hid; the idle loop now also yields on `wake_is_due`. `unsafe` 35 -> 34. Battery 10/10 + goose, toolchain gate, 0 faults. Record: `TAOXICHUAN_ONE_CLOCK_TIME_FOLD.md` |
 | sshd stdin pump (userspace) | (this commit) | taoxichuan/src unchanged | **Piping stdin into an ssh session hung** (`ssh host 'cat > f' < file`): the `linux-abi` spawn piped only stdout, so the child kept sshd's fd 0, and the pump wrote `/proc/<pid>/fd/0` and sent its EOF through `CLOSE_CHILD_STDIN`, deleted in 2e. `SpawnResult::stdin_fd` now carries the write end of a real stdin pipe; plain `spawn` gives its child EOF. 6 B - 1.5 MB arrive, md5 round trip, battery 10/10 + goose. Record: `TAOXICHUAN_SSH_STDIN_PUMP.md` |
 | syscall-number audit fixed; SPAWN residue removed | `bb5e79bd` + (this commit) | 6,548 -> 6,456 | **SPAWN:** the trace special case, ring3's `SPAWN`/`WAITPID`/`CLOSE_CHILD_STDIN`, the dead `shell_tid()` branches and the docs that still described the crossing. **Audit** (`SYSCALL_CONSTANT_AUDIT_2026_10_30.md`, findings 1-5): `akuma-ring3-amd64::nr` 93 -> 4 constants, Taoxichuan dispatches by `akuma_syscalls_abi::x86_64`; `nr::KILL` is Linux's 129 and Akuma's 302 is `AKUMA_KILL`; `Msync` and `RtSigsuspend` rows. AArch64 kernel byte-identical before/after. Battery 9/9, tokioprobe PASS |
+| A1: `wait4`/`waitid` are glue's | (this commit) | 6,456 -> 6,276 | Taoxichuan's exit publishes as `akuma-exec` does (zombie state, `publish_child_exit`: the child channel `fork_process` registered, SIGCHLD on the parent), and `wait4`/`waitid` are glue's (`Waitid` abi row). A fork child's root is handed to a zombie-root table at the exit (the `Process` gets a non-owning view, so glue's reap drops no frames) and freed by `child::collect` after each reap and at fork/clone entry. `rt_sigsuspend` wakes on the pending SIGCHLD. Deleted: `SpawnSlot`'s status/waiter/reaped, `PARENT_OF`, the private wait4 and its boot-task scan, `reap_process`, `group_pid`. Battery 10/10 + goose, toolchain, tokioprobe, 64 KiB stdin, exit codes through `wait $!`; free memory flat over 60 fork/reap cycles |
 
 ## Background
 

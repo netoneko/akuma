@@ -2512,10 +2512,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // row added to `akuma-syscalls-abi` without its arm here used to fall
         // in silently (`brk` did, and earlier `fchdir`), where an undecoded
         // number at least prints `no row for`.
-        // A row since 2026-11-01 (Taoxichuan serves it); this kernel has no
+        // Rows since 2026-11-01 (Taoxichuan serves them); this kernel has no
         // route to glue's yet and answers `ENOSYS`, as it did undecoded.
         // `Msync` never gets here: 26 is routed above, before the decode.
-        Syscall::RtSigsuspend | Syscall::Msync => errno::ENOSYS,
+        Syscall::RtSigsuspend | Syscall::Msync | Syscall::Waitid => errno::ENOSYS,
         _ => {
             akuma_primitives::safe_print!(
                 160,
