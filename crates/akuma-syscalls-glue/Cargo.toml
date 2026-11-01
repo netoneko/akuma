@@ -33,6 +33,8 @@ akuma-syscalls-mem = { path = "../akuma-syscalls-mem" }
 akuma-reclock = { path = "../akuma-reclock" }
 akuma-syscalls-poll = { path = "../akuma-syscalls-poll" }
 akuma-syscalls-sync = { path = "../akuma-syscalls-sync" }
+# The process family's pure decisions (clone kinds, exit scope, wait status, execve's budget).
+akuma-syscalls-proc = { path = "../akuma-syscalls-proc" }
 akuma-syscalls-time = { path = "../akuma-syscalls-time" }
 # The counter frequency, for `read-profile`'s histogram buckets only.
 akuma-timer = { path = "../akuma-timer", optional = true }

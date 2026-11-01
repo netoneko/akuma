@@ -517,6 +517,8 @@ akuma-syscalls-poll = { path = "../crates/akuma-syscalls-poll" }
 # the crate's own stated design: "the kernel performs every effect", and here
 # the effect is parking a thread on a scheduler the two targets do not share.
 akuma-syscalls-sync = { path = "../crates/akuma-syscalls-sync" }
+# The process family's pure decisions (clone kinds, exit scope, wait status, execve's budget).
+akuma-syscalls-proc = { path = "../crates/akuma-syscalls-proc" }
 # The user-copy primitive: `copy_from_user_safe` and its x86_64 `rep movsb`
 # loop, plus `user_copy_fixup`, which `idt.rs`'s page-fault path consults to
 # turn a fault inside that loop into a returned EFAULT instead of a halt. The

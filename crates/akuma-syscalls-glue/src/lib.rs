@@ -143,6 +143,8 @@ pub mod pipe;
 pub mod pty;
 pub mod poll;
 pub mod proc;
+/// `execve`'s argument reading and its process-side commit, shared by the x86 kernels.
+pub mod execve;
 mod cred;
 pub mod perm;
 /// AF_UNIX sockets — the kernel half.

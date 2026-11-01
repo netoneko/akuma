@@ -76,12 +76,7 @@ pub fn vfork_waiters_contains_for_test(child_pid: u32) -> bool {
 /// Linux `wait*status`: normal exit is `(code & 0xff) << 8` (WIFEXITED / WEXITSTATUS).
 /// Negative `code` is treated as stopped-by-signal: low 7 bits = signal number.
 pub fn encode_wait_status(code: i32) -> u32 {
-    if code < 0 {
-        
-        (-code) as u32 & 0x7F
-    } else {
-        ((code as u32) & 0xFF) << 8
-    }
+    akuma_syscalls_proc::exit::wait_status(code)
 }
 
 pub(super) fn sys_set_tpidr_el0(address: u64) -> u64 {

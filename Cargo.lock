@@ -151,6 +151,7 @@ dependencies = [
  "akuma-syscalls-mem",
  "akuma-syscalls-net",
  "akuma-syscalls-poll",
+ "akuma-syscalls-proc",
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
  "akuma-threading",
@@ -785,6 +786,7 @@ dependencies = [
  "akuma-syscalls-mem",
  "akuma-syscalls-net",
  "akuma-syscalls-poll",
+ "akuma-syscalls-proc",
  "akuma-syscalls-signal",
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
@@ -855,6 +857,13 @@ name = "akuma-syscalls-poll"
 version = "0.1.0"
 dependencies = [
  "akuma-primitives",
+ "akuma-syscalls-linux",
+]
+
+[[package]]
+name = "akuma-syscalls-proc"
+version = "0.1.0"
+dependencies = [
  "akuma-syscalls-linux",
 ]
 
@@ -1345,6 +1354,7 @@ dependencies = [
  "akuma-syscalls-glue-amd64",
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
+ "akuma-syscalls-proc",
  "akuma-syscalls-sync",
  "akuma-threading",
  "akuma-trap-amd64",

@@ -92,6 +92,7 @@ default-members = [
     "crates/akuma-fpu-amd64",
     "crates/akuma-user-tree",
     "crates/akuma-syscalls-sync",
+    "crates/akuma-syscalls-proc",
     "crates/akuma-tty",
     "crates/akuma-syscalls-time",
     "crates/akuma-timer",

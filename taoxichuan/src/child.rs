@@ -125,83 +125,15 @@ const ARGV_MAX: usize = 448;
 const ENV_MAX: usize = 256;
 const MAX_STRS: usize = 512;
 const STR_MAX: usize = 32 * 1024;
-/// Linux's `E2BIG`: the argument block does not fit the initial stack.
-const E2BIG: u64 = 7;
 /// The loader lays argv/envp/auxv out in a block of `ARG_BLOCK_PAGES` pages;
 /// leave room for the pointer vectors, auxv and alignment.
 const ARG_BYTES_MAX: usize = crate::ARG_BLOCK_PAGES * 4096 - 2048;
 
-/// Read a NUL-terminated pointer array (argv/envp shape) from the task.
-///
-/// `Err` is the errno: `EFAULT` for a pointer that is not user memory, `E2BIG` for more than `max`
-/// entries before the terminating NULL (Linux answers `E2BIG` for an oversize block, never `EFAULT`).
-fn read_ptr_array(arr_va: u64, max: usize) -> Result<Vec<u64>, u64> {
-    use akuma_user_walk::Fault;
-    akuma_user_walk::read_ptr_array(&crate::task_walk(), arr_va, max, crate::user_ok).map_err(|f| match f {
-        Fault::Bad => crate::err::EFAULT,
-        Fault::TooLong => E2BIG, // unterminated within the cap
-    })
-}
-
-/// Read one NUL-terminated string from the task. `Err` is `EFAULT` (unreadable, or not UTF-8, which this
-/// kernel's `&str` argument path cannot carry) or `E2BIG` (no NUL within `STR_MAX` bytes).
-fn read_user_string(va: u64) -> Result<String, u64> {
-    use akuma_user_walk::Fault;
-    let bytes = akuma_user_walk::read_cstr(&crate::task_walk(), va, STR_MAX).map_err(|f| match f {
-        Fault::Bad => crate::err::EFAULT,
-        Fault::TooLong => E2BIG,
-    })?;
-    String::from_utf8(bytes).map_err(|_| crate::err::EFAULT)
-}
-
-/// `execve`'s `(path, argv, envp)`, marshalled out of the calling task.
+/// `execve`'s `(path, argv, envp)` as this kernel's loader takes them.
 struct ExecArgs {
     path: String,
     argv: Vec<String>,
     env: Vec<String>,
-}
-
-/// Marshal `(path, argv, envp)` from user memory. `Err` is the errno the arm
-/// returns: EFAULT for a bad pointer, ENOENT for an empty or unresolvable path.
-/// A relative path resolves against `Process.cwd`; ash resolves `PATH` itself.
-fn read_exec_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<ExecArgs, u64> {
-    let mut pbuf = [0u8; 512];
-    let path = match crate::user_str(path_va, &mut pbuf) {
-        Some(p) => String::from(p),
-        None => return Err(crate::err::EFAULT),
-    };
-    if path.is_empty() {
-        return Err(crate::err::ENOENT);
-    }
-    // execve resolves a relative path against the cwd (`./hello`): the
-    // process's (`Process.cwd`, which glue's `chdir` writes).
-    let Ok(path) = akuma_syscalls_glue::fs::resolve_path_at(-100, &path) else {
-        return Err(crate::err::ENOENT);
-    };
-    let argv_ptrs = read_ptr_array(argv_va, ARGV_MAX)?;
-    let mut argv: Vec<String> = Vec::new();
-    for p in &argv_ptrs {
-        argv.push(read_user_string(*p)?);
-    }
-    if argv.is_empty() {
-        argv.push(path.clone()); // Linux would EFAULT; a path-only exec is kinder
-    }
-    let mut env: Vec<String> = Vec::new();
-    if envp_va != 0 {
-        let env_ptrs = read_ptr_array(envp_va, ENV_MAX)?;
-        for p in &env_ptrs {
-            env.push(read_user_string(*p)?);
-        }
-    }
-    if argv.len() + env.len() > MAX_STRS {
-        return Err(E2BIG);
-    }
-    // Strings plus one pointer each (+ argc, the NULs of both vectors, auxv slack).
-    let total: usize = argv.iter().chain(env.iter()).map(|s| s.len() + 1 + 8).sum();
-    if total > ARG_BYTES_MAX {
-        return Err(E2BIG);
-    }
-    Ok(ExecArgs { path, argv, env })
 }
 
 // ---------------------------------------------------------------------------
@@ -646,10 +578,25 @@ pub fn set_slot_fs(slot: usize, v: u64) {
 
 pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     let cur = crate::exec_twin::current_slot();
-    let args = match read_exec_args(fr.arg1(), fr.arg2(), fr.arg3()) {
-        Ok(a) => a,
-        Err(no) => return crate::e(no),
+    let mut budget = akuma_syscalls_proc::exec::Budget::new(MAX_STRS, STR_MAX, ARG_BYTES_MAX);
+    let req = match akuma_syscalls_glue::execve::read_request(
+        fr.arg1(),
+        fr.arg2(),
+        fr.arg3(),
+        ARGV_MAX,
+        ENV_MAX,
+        &mut budget,
+    ) {
+        Ok(r) => r,
+        Err(r) => return r,
     };
+    // This kernel's loader takes `&str`: an argument that is not UTF-8 cannot
+    // reach it (the answer this path has always given).
+    let utf8 = |v: Vec<Vec<u8>>| v.into_iter().map(String::from_utf8).collect::<Result<Vec<String>, _>>();
+    let (Ok(argv_s), Ok(env_s)) = (utf8(req.argv), utf8(req.envp)) else {
+        return crate::e(crate::err::EFAULT);
+    };
+    let args = ExecArgs { path: req.path, argv: argv_s, env: env_s };
     let effective = crate::resolve_effective(&args.path);
     let image = match crate::read_image(&effective) {
         Ok(i) => i,
@@ -671,24 +618,11 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     };
     // POSIX exec keeps open fds across the image swap; close-on-exec ones go,
     // each released through the runtime hooks (the table is the process's).
+    // The process side (`/proc/self/exe`, which musl's `$ORIGIN` expansion
+    // reads; close-on-exec; caught handlers reset) is glue's, shared with amd64.
     if let Some(p) = akuma_exec::process::current_process_shared() {
-        // `/proc/<pid>/exe` (procfs renders `image.exe`): musl's loader expands
-        // `$ORIGIN` in a RUNPATH through it — rustc finds `librustc_driver`
-        // in `$ORIGIN/../lib` — and fork inherits it.
-        {
-            let mut img = p.image.lock();
-            img.exe.clone_from(&effective);
-            img.name = String::from(effective.rsplit('/').next().unwrap_or(&effective));
-            img.args = args.argv.clone();
-        }
-        p.close_cloexec_fds_releasing();
-        // execve: caught handlers go back to the default, ignored ones stay
-        // ignored (the handler addresses named the old image).
-        for a in p.signal_actions.actions.lock().iter_mut() {
-            if matches!(a.handler, akuma_exec::process::SignalHandler::UserFn(_)) {
-                *a = akuma_exec::process::SignalAction::default();
-            }
-        }
+        let argv_bytes: Vec<Vec<u8>> = args.argv.iter().map(|a| a.clone().into_bytes()).collect();
+        akuma_syscalls_glue::execve::commit(&p, &effective, &argv_bytes);
     }
     // The registered Process's shared root view goes stale with the old
     // image — re-point it, as `exec_replace` does for the shell.
@@ -866,7 +800,10 @@ fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u
 /// The NEW fork arm: `fork_process` over the registered shell. The child
 /// does NOT run here — the crate publishes it as a runnable thread and this
 /// arm returns the pid to the caller, exactly like Linux.
-fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
+/// Fork the caller through `fork_process`. `child_stack` 0: the child resumes
+/// on the parent's stack (a fork); otherwise on that stack (a `posix_spawn`
+/// child, whose `__clone` stub pops its function and argument from it).
+fn fork_arm_real(child_stack: u64) -> u64 {
     // The boot task has no registered Process to fork. Any other task forks
     // for real, however deep: each child has its own thread and stacks (the
     // M2 crossing's depth ceiling went with the crossing).
@@ -876,17 +813,6 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
     }
     collect();
     let child_pid = akuma_exec::process::allocate_pid();
-    // stack_ptr = 0: the child resumes at the parent's saved user RSP — the
-    // syscall stub stashed it (`user_rsp_stash`) and step 6's captured
-    // context carries it into the child's UserContext.
-    // A vfork-style clone (CLONE_VM, musl posix_spawn) hands the child its own
-    // stack in rsi and its __clone stub pops fn/arg from it, so the child must
-    // resume there; a plain fork keeps the parent's rsp (0).
-    let child_stack = if fr.rax == akuma_syscalls_abi::x86_64::CLONE && fr.arg1() & 0x100 != 0 {
-        fr.arg2()
-    } else {
-        0
-    };
     match akuma_exec::process::fork_process(child_pid, child_stack) {
         Ok(pid) => {
             // `fork_process` registered the child's exit channel under its
@@ -929,14 +855,20 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
 /// clone is a thread (`clone_thread_arm`); every other one is a fork through
 /// `fork_process` (`fork_arm_real`).
 pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
-    const CLONE_THREAD: u64 = 0x0001_0000;
-    if fr.rax == akuma_syscalls_abi::x86_64::CLONE && fr.arg1() & CLONE_THREAD != 0 {
-        return clone_thread_arm(fr);
+    use akuma_syscalls_proc::clone::{self, Kind};
+    let kind = if fr.rax == akuma_syscalls_abi::x86_64::CLONE {
+        match clone::decode(fr.arg1(), fr.arg2()) {
+            Ok(k) => k,
+            Err(clone::Invalid) => return crate::e(crate::err::EINVAL),
+        }
+    } else {
+        Kind::Fork // fork (57) and vfork (58)
+    };
+    match kind {
+        Kind::Thread => clone_thread_arm(fr),
+        Kind::SpawnFork { child_stack } => fork_arm_real(child_stack),
+        Kind::Fork => fork_arm_real(0),
     }
-    // fork (57), vfork (58) and every non-thread `clone` - libakuma's `fork()` under `linux-abi` issues
-    // `clone(SIGCHLD)` - through `fork_process` over the registered Process. `fork_arm_real` takes a vfork-style
-    // child stack from `clone`'s `CLONE_VM` form itself.
-    fork_arm_real(fr)
 }
 
 /// `rt_sigsuspend(mask, sigsetsize)` - x86_64 130: replace the signal mask and sleep until a

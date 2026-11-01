@@ -1916,7 +1916,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             // A non-main thread's is not — it must leave ring 3 without
             // touching `EXIT_STATUS`, the fd table or the spawn record, all of
             // which belong to the process it is only one thread of.
-            if crate::thread::current_is_main() {
+            let scope = akuma_syscalls_proc::exit::scope(false, !crate::thread::current_is_main());
+            if scope == akuma_syscalls_proc::exit::Scope::Group {
                 EXIT_STATUS.store(a1, Ordering::Relaxed);
             }
             mark_leave();
@@ -2157,11 +2158,19 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             // x86_64's argument order is its own: `(flags, child_stack,
             // parent_tid, child_tid, tls)` — `tls` **last**, after `child_tid`,
             // where most architectures put it fourth.
-            if a1 & clone_flags::CLONE_VM != 0 {
+            // The decision is `akuma_syscalls_proc::clone::decode`, shared with
+            // Taoxichuan; it also answers Linux's `EINVAL` for `CLONE_THREAD`
+            // without `CLONE_SIGHAND`/`CLONE_VM` (2026-11-01).
+            use akuma_syscalls_proc::clone::{self as clone_decode, Kind};
+            let kind = match clone_decode::decode(a1, a2) {
+                Ok(k) => k,
+                Err(clone_decode::Invalid) => return errno::EINVAL,
+            };
+            if let Kind::Thread = kind {
                 // `CLONE_VM|CLONE_THREAD` — a thread (`crate::thread`).
-                if a1 & clone_flags::CLONE_THREAD != 0 {
-                    return crate::thread::sys_clone_thread(a1, a2, a3, a4, a5);
-                }
+                return crate::thread::sys_clone_thread(a1, a2, a3, a4, a5);
+            }
+            if let Kind::SpawnFork { child_stack } = kind {
                 // **`CLONE_VM` without `CLONE_THREAD` — musl's `posix_spawn`
                 // child** (`clone(CLONE_VM|CLONE_VFORK|SIGCHLD)`, a separate
                 // stack, no `CLONE_SETTLS`). It was `ENOSYS` here for the whole
@@ -2198,7 +2207,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 // cause was none of that: each child's exit is a `SIGCHLD`,
                 // and a tick-time signal used to return through `sysretq`
                 // with `RCX = RIP` (`docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`).
-                return sys_spawn_clone(a2);
+                return sys_spawn_clone(child_stack);
             }
             sys_fork()
         }
@@ -4300,7 +4309,8 @@ pub fn alloc_pid() -> u32 {
 /// `CLONE_SETTLS` — pairs with an x86_64-specific *argument position*, so
 /// keeping the two facts in one file is worth more than the deduplication.
 pub mod clone_flags {
-    pub const CLONE_VM: u64 = 0x0000_0100;
+    // `CLONE_VM` left 2026-11-01: the thread/spawn/fork decision is
+    // `akuma_syscalls_proc::clone::decode` now.
     pub const CLONE_THREAD: u64 = 0x0001_0000;
     pub const CLONE_SETTLS: u64 = 0x0008_0000;
     // `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`
@@ -4926,21 +4936,32 @@ fn user_cstr(ptr: u64, max: usize) -> Option<alloc::vec::Vec<u8>> {
 /// (`no input files`, `cannot open output file a.out`) with nothing pointing
 /// at the kernel. `E2BIG` is what Linux answers and is impossible to
 /// misattribute.
-fn user_strv(ptr: u64, max: usize) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
-    // The initial stack is where every one of these strings lands
-    // ([`loader::build_stack`]), so it is the honest ceiling on their total
-    // size. Refusing here rather than there keeps the kernel from copying
+/// One `execve`'s argument budget, across argv and envp together
+/// (`akuma_syscalls_proc::exec`): the initial stack is where every string lands
+/// ([`loader::build_stack`]), so half of it is the honest ceiling on their total.
+fn exec_arg_budget() -> akuma_syscalls_proc::exec::Budget {
+    akuma_syscalls_proc::exec::Budget::new(
+        loader::MAX_ARGV + loader::MAX_ENVP,
+        akuma_config::MAX_ARG_STRLEN,
+        ELF_STACK_PAGES * 4096 / 2,
+    )
+}
+
+fn user_strv(
+    ptr: u64,
+    max: usize,
+    budget: &mut akuma_syscalls_proc::exec::Budget,
+) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
+    // `budget` ([`exec_arg_budget`]) is charged as each string is read.
+    // Refusing here rather than at the stack build keeps the kernel from copying
     // megabytes out of ring 3 to build an argv that cannot be placed — and
     // `build_stack` still has its own `rsp < base` check, because this one is
     // about the copy and that one is about the arithmetic.
-    const ARG_BYTES_MAX: usize = ELF_STACK_PAGES * 4096 / 2;
-
     let mut out = alloc::vec::Vec::new();
     if ptr == 0 {
         return Some(out);
     }
     let entry = |i: usize| crate::uaccess::read_val::<u64>(ptr + (i as u64) * 8).unwrap_or(0);
-    let mut bytes = 0usize;
     for i in 0..max {
         // A bad array pointer ends the list, like a NULL entry would.
         let p = entry(i);
@@ -4960,10 +4981,7 @@ fn user_strv(ptr: u64, max: usize) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>
         // `MAX_ARG_STRLEN` is the shared cap glue uses, so the two kernels
         // refuse the same argument rather than one of them mangling it.
         let s = user_cstr(p, akuma_config::MAX_ARG_STRLEN)?;
-        bytes = bytes.saturating_add(s.len() + 1);
-        if bytes > ARG_BYTES_MAX {
-            return None;
-        }
+        budget.charge(s.len()).ok()?;
         out.push(s);
     }
     // `max` entries and still no terminator: the caller has more to say than
@@ -5081,28 +5099,21 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {    use crate
         return errno::ENOSYS;
     }
 
-    let Some(path_bytes) = user_cstr(path_ptr, 256) else {
-        return errno::EFAULT;
+    // The path against the process's `cwd`, and argv/envp under one budget:
+    // glue's `execve::read_request`, shared with Taoxichuan (2026-11-01).
+    let mut budget = exec_arg_budget();
+    let req = match akuma_syscalls_glue::execve::read_request(
+        path_ptr,
+        argv_ptr,
+        envp_ptr,
+        loader::MAX_ARGV,
+        loader::MAX_ENVP,
+        &mut budget,
+    ) {
+        Ok(r) => r,
+        Err(r) => return r,
     };
-    let Ok(path) = core::str::from_utf8(&path_bytes) else {
-        return errno::EINVAL;
-    };
-    // Against the process's own directory — see [`process_relative_path`].
-    let path = process_relative_path(path);
-
-    let argv_owned = {
-        let Some(mut v) = user_strv(argv_ptr, loader::MAX_ARGV) else {
-            return crate::fd::errno::E2BIG;
-        };
-        if v.is_empty() {
-            v.push(path_bytes.clone());
-        }
-        v
-    };
-    let Some(envp_owned) = user_strv(envp_ptr, loader::MAX_ENVP) else {
-        return crate::fd::errno::E2BIG;
-    };
-
+    let (path, argv_owned, envp_owned) = (req.path, req.argv, req.envp);
     do_execve(slot, path, argv_owned, envp_owned)
 }
 
@@ -5380,11 +5391,8 @@ fn do_execve(
     // `argv[0]` would be a name the caller chose rather than something that
     // opens. `/proc/<pid>/exe` reports `exe`, which only this line and spawn
     // write — `name` is the `comm` that `prctl(PR_SET_NAME)` may rename later.
-    {
-        let mut img = proc.image.lock();
-        img.exe.clone_from(&new_name);
-        img.name = new_name;
-    }
+    // (`/proc` identity and the close-on-exec sweep are glue's
+    // `execve::commit`, below, shared with Taoxichuan.)
 
     // Image replacement committed — *now* close the close-on-exec descriptors.
     // POSIX's point of no return: a successful `execve` closes every
@@ -5408,7 +5416,9 @@ fn do_execve(
     // `execve` was written (`akuma-syscalls-glue`'s `sys_execve`); the sweep is
     // shared code and this call site is what was missing.
     // `docs/archive/AMD64_TRASHCAN_ISSUES.md` §1.
-    proc.close_cloexec_fds_releasing();
+    let new_args_bytes: alloc::vec::Vec<alloc::vec::Vec<u8>> =
+        new_args.iter().map(|a| a.clone().into_bytes()).collect();
+    akuma_syscalls_glue::execve::commit(&proc, &new_name, &new_args_bytes);
 
     // A new program in an existing slot starts with a clean group: a stale
     // `exit_group` flag from the image just replaced would kill its first
@@ -5753,8 +5763,9 @@ pub fn sys_spawn(
     };
 
     // argv[0] defaults to the path if the caller passed none.
+    let mut budget = exec_arg_budget();
     let argv_owned = {
-        let Some(mut v) = user_strv(argv_ptr, loader::MAX_ARGV) else {
+        let Some(mut v) = user_strv(argv_ptr, loader::MAX_ARGV, &mut budget) else {
             return crate::fd::errno::E2BIG;
         };
         if v.is_empty() {
@@ -5767,7 +5778,7 @@ pub fn sys_spawn(
     // any spawned child on this target, so anything reading `TERM`, `PATH`,
     // `HOME` or `TZ` got nothing. `sys_execve` has always honoured it through
     // the same loader entry point; this is that call, with the same caps.
-    let Some(envp_owned) = user_strv(envp_ptr, loader::MAX_ENVP) else {
+    let Some(envp_owned) = user_strv(envp_ptr, loader::MAX_ENVP, &mut budget) else {
         return crate::fd::errno::E2BIG;
     };
     let argv_refs: alloc::vec::Vec<&[u8]> =

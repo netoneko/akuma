@@ -1943,7 +1943,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if child::is_real_task() {
                 // `exit` (60) from a thread ends that thread only; everything
                 // else (exit_group, a lone process's exit) ends the group.
-                if fr.rax == akuma_syscalls_abi::x86_64::EXIT && child::is_thread_task() {
+                let scope = akuma_syscalls_proc::exit::scope(
+                    fr.rax == akuma_syscalls_abi::x86_64::EXIT_GROUP,
+                    child::is_thread_task(),
+                );
+                if scope == akuma_syscalls_proc::exit::Scope::Thread {
                     child::task_exit_thread()
                 }
                 child::task_exit_real(code)
