@@ -77,7 +77,7 @@ current kernel, for `e7661570`, for `8cd638d8` (before the futex-body extraction
 environment's safety check and needs the owner's go-ahead); until it is, in-guest builds on the p3 root are not a valid regression oracle.
 Lesson for the drill-down: run the metal gates with p3 mounted **read-only** from the host side where possible, and fsck p3 after any watchdog reset.
 
-## Resolved: the in-guest `-j4` stall was the disk, confirmed without writing p3 (2026-11-01)
+## (SUPERSEDED - see Correction below and `TAOXICHUAN_J4_BKL_CONVOY.md`) The in-guest `-j4` stall was the disk, confirmed without writing p3 (2026-11-01)
 p3 itself needs no repair for the rig, because every guest boots it through a qcow2 overlay. Repair the *overlay*:
 `qemu-img create -f qcow2 -b /dev/nvme0n1p3 -F raw ov.qcow2 && qemu-nbd -c /dev/nbd0 ov.qcow2 && e2fsck -fy /dev/nbd0 && qemu-nbd -d /dev/nbd0`,
 then copy it to `$TX_RUN/overlay.qcow2` and run `TX_FRESH=keep python3 scripts/kvm/taoxichuan/build_run.py KERNEL 4`
@@ -103,7 +103,9 @@ three cores sit in `smp::bkl_enter+0x9c` (the ticket spin); the fourth, the owne
 being handed over, so this is starvation/convoy, **not a deadlock**. The owner's stack is `sock::poll_arm -> net::sleep_until -> netpoll()/x86_yield`:
 `poll`/`ppoll` waits are 1 ms laps of `sleep_until`, and every lap runs a full smoltcp `poll` (loopback included) **with the BKL held**, so several pollers
 (sshd's serve loop, cargo/rustc waiting on pipes) keep the lock busy in network polling while the cores that want it for `execve`/`mmap` spin.
-Not yet answered: why it is intermittent (the same pre-X5 kernel passed 3 of 6 builds), and which loopback TCP socket makes `seq_to_transmit`/`dispatch`
+Not yet answered: why it is intermittent (the pre-X5 kernel passed 3 of 5 builds; tally in `TAOXICHUAN_J4_BKL_CONVOY.md`), and which loopback TCP socket makes `seq_to_transmit`/`dispatch`
 dominate each lap. Candidate fixes, none tried: run `netpoll()` outside the BKL when the lap is only waiting (`bkl_unlocked` around the yield/`wait_lap`, take the lock
 only for the lap itself); poll_arm sleeping on a deadline with the lock released; bounding the lap's drain budget. Measure with `BR_N` pairs and `info registers -a`
 (`build_run.py` opens `/root/mon<N>`); watch `BKL_SERVING` from the monitor (`x/1wx` on the symbol) for the hand-over rate.
+
+The guest-side stall is written up in [`TAOXICHUAN_J4_BKL_CONVOY.md`](TAOXICHUAN_J4_BKL_CONVOY.md); this file keeps only the *host* wedge and the p3 collateral damage.
