@@ -2,6 +2,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use akuma_exec_core::process::UserContext;
 use crate::{FxArea, Machine, Stacks, XCR0_ENABLED, XSAVE_ON};
 
 /// "Any core": a `pinned` word with no pin.
@@ -69,10 +70,12 @@ pub trait Platform: 'static {
     /// The page-table root `slot` runs in, given the one its machine record holds (`0` =
     /// the kernel's). A kernel that derives the root from its own task record (so an `exec`
     /// that swaps it needs no second write) overrides this.
+    #[must_use]
     fn space_root_of(_slot: usize, recorded: u64) -> u64 {
         recorded
     }
     /// Where a ring-3 trap on this core lands while `slot` runs, given the machine record's.
+    #[must_use]
     fn trap_top_of(_slot: usize, recorded: u64) -> u64 {
         recorded
     }
@@ -82,10 +85,12 @@ pub trait Platform: 'static {
 
     /// Was the page-table root with this frame recently freed? (`akuma-mmu`'s freed-L0 ring.)
     /// A switch refuses to install one.
+    #[must_use]
     fn l0_recently_freed(_l0: u64) -> bool {
         false
     }
     /// Does this core hold the kernel lock? (Diagnostic.)
+    #[must_use]
     fn lock_held() -> bool {
         true
     }
@@ -102,6 +107,45 @@ pub trait Platform: 'static {
     fn check_stacks(_from: usize, _to: usize) {}
     /// A slot just got its stacks (first use or recycle): paint canaries, reset counters.
     fn slot_prepared(_slot: usize, _stacks: &Stacks) {}
+
+    // ── the rest of `akuma_threading::X86ArchHooks` ([`hooks`]) ──────────────────────
+
+    /// Record the slot this core runs now (the per-core block that [`Self::current_task`]
+    /// reads).
+    fn set_current_task(slot: usize);
+    /// This core's idle thread: where a core goes when the running thread cannot continue
+    /// and nothing else can run.
+    fn idle_task() -> usize;
+    /// Hand the kernel lock's recursion depth from `from` to `to`; the lock stays with the
+    /// core. Nothing to move for a kernel whose lock depth is per core.
+    fn transfer_lock_depth(_from: usize, _to: usize) {}
+    /// Open a one-instruction interrupt window, then mask again (the frozen-clock escape).
+    fn allow_tick();
+    /// Store a ring-3 register capture into `slot`'s user context. `slot` is not running.
+    /// The kernel's own format: its syscall entry decides what [`Self::User`] holds.
+    fn write_user_context(slot: usize, ctx: &UserContext);
+    /// `slot`'s ring-3 register capture, or `None` when the slot has never had one.
+    fn read_user_context(slot: usize) -> Option<UserContext>;
+}
+
+/// The whole `X86ArchHooks` table for platform `P`: the switch, `can_run` and
+/// `prepare_task_slot` are this crate's, the rest `P`'s. A kernel registers it in one line
+/// (`akuma_threading::register_x86_arch_hooks(akuma_sched_amd64::hooks::<P>())`), so the
+/// table cannot be assembled differently by two kernels.
+#[must_use]
+pub fn hooks<P: Platform>() -> akuma_threading::X86ArchHooks {
+    akuma_threading::X86ArchHooks {
+        switch_to: switch_to::<P>,
+        current_slot: P::current_task,
+        set_current_slot: P::set_current_task,
+        idle_slot: P::idle_task,
+        can_run: can_run::<P>,
+        transfer_lock_depth: P::transfer_lock_depth,
+        allow_tick: P::allow_tick,
+        write_user_context: P::write_user_context,
+        read_user_context: P::read_user_context,
+        prepare_task_slot: prepare_task_slot::<P>,
+    }
 }
 
 /// `X86ArchHooks::switch_to`: install `to`'s machine state on this core, with `from` still
@@ -206,6 +250,7 @@ pub fn can_run<P: Platform>(slot: usize) -> bool {
 /// A recycled slot reuses the stacks it already owns. Every field the picker or the switch
 /// reads is reset here, so a slot cannot inherit the previous occupant's `space_root`, `pinned`
 /// core or user context; `affinity` is inherited from the *creating* thread, as on Linux.
+#[must_use]
 pub fn prepare_task_slot<P: Platform>(slot: usize) -> Option<usize> {
     let table = P::machines();
     let m = table.get(slot)?;

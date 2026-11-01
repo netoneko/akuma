@@ -7,8 +7,13 @@ description = "The machine half of the amd64 scheduler: the per-slot machine tab
 [lints]
 workspace = true
 
-[dependencies]
+# The crate is `#![cfg(target_arch = "x86_64")]`: on the host it is empty, and these would be
+# unused dependencies.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-fpu-amd64 = { path = "../akuma-fpu-amd64" }
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-affinity = { path = "../akuma-affinity" }
+# The hook table `hooks::<P>()` builds, and the user-context type it carries.
+akuma-threading = { path = "../akuma-threading" }
+akuma-exec-core = { path = "../akuma-exec-core" }

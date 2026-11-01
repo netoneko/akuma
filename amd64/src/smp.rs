@@ -326,7 +326,7 @@ pub fn need_resched() -> bool {
 //   tracked a per-core recursion depth and transferred it between tasks on a
 //   switch; `KernelLock` is reentrant by owner core, so a nested `enter_kernel`
 //   is a no-op and there is no depth to transfer (`sched.rs`'s
-//   `hook_transfer_lock_depth` is a no-op now, and `Machine::bkl_depth` is
+//   `Platform::transfer_lock_depth` is a no-op now, and `Machine::bkl_depth` is
 //   gone). Every `bkl_enter` on this target arrives *from ring 3* and every
 //   `bkl_leave` goes *to* it — verified site by site — so "depth > 1" never
 //   existed; what the depth simulated ("a task born in kernel code holds

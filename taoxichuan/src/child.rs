@@ -50,45 +50,6 @@ static SLOTS: akuma_primitives::cell::BorrowCell<[SpawnSlot; NSLOTS]> =
 // thread Processes' pids from the crate's counter and a second counter here
 // issued the same pid twice (a thread and a fork child sharing a table row).
 
-/// One slot's kernel+trap stacks (the twin's `prepare_task_slot` answer,
-/// amd64's `Stacks` discipline): leaked once on first use, reused on every
-/// recycle — a slot given a fresh pair per spawn would turn the slot ring
-/// into a memory leak. Dormant until `fork_process` (slice 3) points a
-/// crossing at them; nothing indexes them today.
-struct SlotStacks {
-    kernel: &'static mut [u64],
-    trap: &'static mut [u64],
-}
-
-/// The per-slot machine state, indexed by ring slot: the slot's leaked
-/// stacks and the ring-3 register capture `fork_process` consumes. Reached
-/// only through [`with_slot_state`] (a `BorrowCell`: two overlapping borrows
-/// are a panic naming the bug).
-pub struct SlotState {
-    /// This slot's stacks, once `prepare_task_slot` made them.
-    stacks: Option<SlotStacks>,
-    /// The ring-3 register capture the `write/read_user_context` hooks serve
-    /// — `None` until a capture is written, cleared on recycle.
-    uctx: Option<akuma_exec::process::UserContext>,
-    /// The stack tops `prepare_task_slot` answered with.
-    kstack_top: u64,
-    trap_stack_top: u64,
-}
-
-impl SlotState {
-    const fn new() -> Self {
-        Self { stacks: None, uctx: None, kstack_top: 0, trap_stack_top: 0 }
-    }
-}
-
-static SLOT_STATE: akuma_primitives::cell::BorrowCell<[SlotState; NSLOTS]> =
-    akuma_primitives::cell::BorrowCell::new([const { SlotState::new() }; NSLOTS]);
-
-/// Run `f` on the machine state of `slot`.
-pub fn with_slot_state<R>(slot: usize, f: impl FnOnce(&mut SlotState) -> R) -> R {
-    SLOT_STATE.with_mut(|st| f(&mut st[slot]))
-}
-
 /// Run `f` on the spawn ring. Panics on a nested call, which is the point.
 fn with_slots<R>(f: impl FnOnce(&mut [SpawnSlot; NSLOTS]) -> R) -> R {
     SLOTS.with_mut(f)
@@ -222,13 +183,13 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
     INIT_TID.store(tid, core::sync::atomic::Ordering::Relaxed);
     INIT_ENTRY.store(ti.entry, core::sync::atomic::Ordering::Relaxed);
     INIT_RSP.store(ti.rsp, core::sync::atomic::Ordering::Relaxed);
-    let stack: &'static mut [u64; INIT_STACK_WORDS] =
-        alloc::boxed::Box::leak(alloc::boxed::Box::new([0u64; INIT_STACK_WORDS]));
+    // Straight onto the heap: `Box::new([0; N])` builds the 32 KiB array on this stack first.
+    let stack: &'static mut [u64] = alloc::boxed::Box::leak(alloc::vec![0u64; INIT_STACK_WORDS].into_boxed_slice());
     let top = stack.as_mut_ptr() as usize + INIT_STACK_WORDS * 8;
     akuma_threading::x86_seed_entry(tid, top, init_thread_entry);
     // The boot thread becomes pool slot 0 (the pool hands out 1.., amd64's `x86_adopt_running_thread(0)`): it is about to
     // block, and a thread the pool has never heard of has no slot to park.
-    let _ = prepare_task_slot(0);
+    let _ = akuma_sched_amd64::prepare_task_slot::<crate::sched::Tx>(0);
     akuma_threading::x86_adopt_running_thread(0);
     crate::exec_twin::set_current_slot(0);
     akuma_threading::x86_publish(tid);
@@ -268,7 +229,7 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         s[slot_idx].running = true;
         s[slot_idx].pid = pid;
     });
-    let _ = prepare_task_slot(slot_idx);
+    let _ = akuma_sched_amd64::prepare_task_slot::<crate::sched::Tx>(slot_idx);
     if is_thread {
         // A thread runs against its creator's record: nothing to copy, and
         // nothing to clone-ref (the fd table is the creator's own).
@@ -312,7 +273,7 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
 /// global, which the caller leaves alone.
 pub fn sched_kstack_top(tid: usize) -> u64 {
     if tid < NSLOTS {
-        SLOT_STATE.with(|st| st[tid].kstack_top)
+        crate::sched::kstack_top(tid).unwrap_or_else(ring3::syscall_stack_top)
     } else {
         ring3::syscall_stack_top()
     }
@@ -540,42 +501,6 @@ fn clone_thread_arm(fr: &ring3::SyscallFrame) -> u64 {
     }
 }
 
-/// A real fork child's `execve`: replace the image in the child's OWN task
-/// record (`tid + 1`) and cross — the same load/snapshot/sweep the shell's
-/// `exec_replace` does, minus the crossing bookkeeping (a real child has no
-/// crossing to resume; its exit goes through [`task_exit_real`]). Never
-/// returns: `child_enter` loads the new root and sysrets.
-/// Per-slot IA32_FS_BASE shadow (session pi): the MSR is per-CORE, this
-/// kernel multiplexes every task onto that one core, and `switch_to` never
-/// restored it — a parked task resumed with the LAST-RAN task's TLS pointer.
-/// Invisible for three stages because every busybox process shares the same
-/// TLS address (deterministic layout); grandfork is the first image with its
-/// own TLS, and its parent's wait4 resume ran with the shell's 0x713198 in
-/// the MSR (boot pi-3: seven child entries printed the correct 0x100051b8,
-/// the parent's next guard read still took fs+0x28 to the shell's bss).
-/// `switch_to` installs the incoming task's shadow; `arch_prctl` and the
-/// crossings keep it in step. Plain `static mut`: single core, every access
-/// on the IF-clear syscall/scheduler path (the TASK_SLOT discipline).
-static SLOT_FS: akuma_primitives::cell::BorrowCell<[u64; NSLOTS]> =
-    akuma_primitives::cell::BorrowCell::new([0; NSLOTS]);
-
-/// The slot's fs_base (what `switch_to` installs). A slot >= NSLOTS is the
-/// idle thread: kernel-only, no TLS, and the answer 0 is never installed.
-pub fn slot_fs_of(slot: usize) -> u64 {
-    if slot < NSLOTS {
-        SLOT_FS.with(|t| t[slot])
-    } else {
-        0
-    }
-}
-
-/// Stamp the slot's fs_base (crossings and the `arch_prctl` SET_FS arm).
-pub fn set_slot_fs(slot: usize, v: u64) {
-    if slot < NSLOTS {
-        SLOT_FS.with_mut(|t| t[slot] = v);
-    }
-}
-
 pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     let cur = crate::exec_twin::current_slot();
     let mut budget = akuma_syscalls_proc::exec::Budget::new(MAX_STRS, STR_MAX, ARG_BYTES_MAX);
@@ -622,7 +547,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     // reads; close-on-exec; caught handlers reset) is glue's, shared with amd64.
     if let Some(p) = akuma_exec::process::current_process_shared() {
         let argv_bytes: Vec<Vec<u8>> = args.argv.iter().map(|a| a.clone().into_bytes()).collect();
-        akuma_syscalls_glue::execve::commit(&p, &effective, &argv_bytes);
+        akuma_syscalls_glue::execve::commit(p, &effective, &argv_bytes);
     }
     // The registered Process's shared root view goes stale with the old
     // image — re-point it, as `exec_replace` does for the shell.
@@ -659,7 +584,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     // depth-1 exec gets from the boot crossing, and what the amd64 kernel's
     // exec hands its images (grandfork passes there).
     let _ = akuma_cpu::msr::set_fs_base(0);
-    set_slot_fs(cur, 0);
+    crate::sched::set_slot_fs(cur, 0);
     // This function never returns, so nothing local is ever dropped: the
     // executable image (47 MB for cargo) and the argument strings would leak
     // from the kernel heap on every exec. Free them before the crossing.
@@ -707,7 +632,7 @@ pub fn capture_user_context(fr: &ring3::SyscallFrame) {
         gs_base: 0,
         rax: fr.rax,
     };
-    write_user_context(slot, &ctx);
+    <crate::sched::Tx as akuma_sched_amd64::Platform>::write_user_context(slot, &ctx);
 }
 
 /// The exec'd shell, registered as an `akuma-exec` `Process` — premise 2's
@@ -1196,85 +1121,4 @@ pub fn collect() {
             akuma_exec::process::table::retired_process_count()
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// The X86ArchHooks machine-state arms (session pc, slice 2).
-//
-// `prepare_task_slot` / `write_user_context` / `read_user_context`, over the
-// per-slot table above. Nothing calls them until `fork_process` (slice 3)
-// claims slots through the shared spawn path — they are landed now, per the
-// plan's slice 2, so the seam exists before its first customer.
-// ---------------------------------------------------------------------------
-
-/// The twin's stack sizes. The kernel stack matches the shared
-/// `SYSCALL_STACK` band's 64 KiB (the T-Y bug-3 number: depth-2 exec band on
-/// top of two crossing halves is what fits); the trap stack is amd64's 32
-/// KiB. Four slots × 96 KiB = 384 KiB, bounded by the ring, against 767 MiB
-/// of guest RAM.
-const KSTACK_WORDS: usize = akuma_ring3_amd64::SYSCALL_STACK_SIZE / 8;
-const TSTACK_WORDS: usize = 32 * 1024 / 8;
-
-/// Two fresh zeroed stacks, leaked: a slot's stacks must outlive the frame
-/// that made them, and a recycled slot reuses the pair it already owns
-/// (`SlotCross::stacks` is set once) — per-spawn leaks would turn the ring's
-/// recycling into a memory leak.
-fn leak_stacks() -> SlotStacks {
-    SlotStacks {
-        kernel: alloc::vec![0u64; KSTACK_WORDS].leak(),
-        trap: alloc::vec![0u64; TSTACK_WORDS].leak(),
-    }
-}
-
-/// `X86ArchHooks::prepare_task_slot`: give a freshly claimed slot its
-/// kernel+trap stacks and its default machine state, answer the kernel stack
-/// top. `None` = the slot is out of range or the stacks could not be made;
-/// the caller abandons the slot. The crossing record is dead until the next
-/// crossing writes it, and a recycled slot's saved user context is cleared —
-/// a recycled slot cannot inherit the previous occupant's capture.
-pub fn prepare_task_slot(slot: usize) -> Option<usize> {
-    if slot >= NSLOTS {
-        return None;
-    }
-    // The claim path (syscall context in slice 3).
-    let ktop = with_slot_state(slot, |c| {
-        if c.stacks.is_none() {
-            c.stacks = Some(leak_stacks());
-        }
-        let s = c.stacks.as_ref()?;
-        let ktop = (s.kernel.as_ptr() as usize + KSTACK_WORDS * 8) as u64;
-        let ttop = ((s.trap.as_ptr() as usize + TSTACK_WORDS * 8) & !0xf) as u64;
-        c.kstack_top = ktop;
-        c.trap_stack_top = ttop;
-        c.uctx = None;
-        Some(ktop)
-    })?;
-    crate::exec_twin::fx_reset(slot);
-    crate::smp::born_locked(slot);
-    Some(ktop as usize)
-}
-
-/// `X86ArchHooks::write_user_context`: store a ring-3 register capture into
-/// `slot`'s machine state. Always called on a slot that is not running (the
-/// shared spawn path's INITIALIZING discipline), which is what makes writing
-/// another slot's state safe at all.
-pub fn write_user_context(slot: usize, ctx: &akuma_exec::process::UserContext) {
-    if slot >= NSLOTS {
-        return;
-    }
-    // `slot` is not running.
-    with_slot_state(slot, |c| c.uctx = Some(*ctx));
-}
-
-/// `X86ArchHooks::read_user_context`: the exact mirror — `None` means the
-/// slot has never been given a capture, the same refusal amd64's table makes
-/// for a slot that never trapped (a child built from such a slot would
-/// launch at whatever the registers happened to hold).
-pub fn read_user_context(
-    slot: usize,
-) -> Option<akuma_exec::process::UserContext> {
-    if slot >= NSLOTS {
-        return None;
-    }
-    with_slot_state(slot, |c| c.uctx)
 }

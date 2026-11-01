@@ -81,7 +81,7 @@ stranger's, and never parks on one.**
 ## The fs discipline (per-slot TLS shadow)
 
 `IA32_FS_BASE` is per-**core**, and this kernel multiplexes every task onto
-one core — so fs is carried per-slot state (`SLOT_FS[NSLOTS]`):
+one core — so fs is carried per-slot state (the `fs` field of the slot's user record in `akuma-sched-amd64`'s `Machine` table, `sched::set_slot_fs`; it was a separate `SLOT_FS` array until A5):
 
 - `switch_to` installs the incoming task's shadow (one wrmsr per switch; the
   idle thread is skipped — kernel-only, no TLS).

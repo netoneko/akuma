@@ -51,12 +51,17 @@ are the 10-30 builds (that tree did not change). The day's work is the status ta
 
 **The three numbers**
 
-| what an auditor would read | audit lines | 10-30 |
-|---|---:|---:|
-| **taoxichuan alone** (the guest image) | **78,351** | 84,761 |
-| of which taoxichuan's own crate | 3,907 | 6,652 |
-| **taoxichuan on an Akuma host** (akuma-amd64 + taoxichuan, shared lines once) | **140,576** | 158,909 |
-| **taoxichuan on a Linux host** (Linux 6.18 `x86_64_defconfig` + KVM, 2,362,283, + taoxichuan; nothing shared) | **2,440,634** | 2,447,044 |
+| what an auditor would read | audit lines | after A5 | 10-30 |
+|---|---:|---:|---:|
+| **taoxichuan alone** (the guest image) | **78,351** | 78,223 | 84,761 |
+| of which taoxichuan's own crate | 3,907 | 3,672 | 6,652 |
+| **taoxichuan on an Akuma host** (akuma-amd64 + taoxichuan, shared lines once) | **140,576** | 141,339 | 158,909 |
+| **taoxichuan on a Linux host** (Linux 6.18 `x86_64_defconfig` + KVM, 2,362,283, + taoxichuan; nothing shared) | **2,440,634** | 2,440,506 | 2,447,044 |
+
+"After A5" is the same measurement on the A5 commit (the process-model steps A1-A5 of the cleanup plan). Taoxichuan
+now adds 5,088 lines to an Akuma host (73,135 of its 78,223, 93.5%, are already live there). The Akuma-host total
+went *up* because akuma-amd64 did (135,167 -> 136,251): `e2d3bdc1` turned glue's `exec` back on there to fix `box
+run`, not anything Taoxichuan did. Unsafe lines: 1,669 for Taoxichuan alone, 789 of them third-party.
 
 - Taoxichuan adds **5,409** lines to an Akuma host (135,167 alone). **93%** of its live lines (72,942 of
   78,351) are already live in the host.

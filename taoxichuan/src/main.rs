@@ -527,11 +527,11 @@ fn fault_trap_locked(t: &mut Trap<'_>) {
     }
     // A ring-0 fault inside `akuma-user-access`'s copy loop is a bad user
     // pointer: resume at its `EFAULT` trampoline (amd64's `idt.rs` arm 2).
-    if !t.from_ring3() {
-        if let Some(fixup) = akuma_user_access::user_copy_fixup(t.frame.rip) {
-            t.frame.rip = fixup;
-            return;
-        }
+    if !t.from_ring3()
+        && let Some(fixup) = akuma_user_access::user_copy_fixup(t.frame.rip)
+    {
+        t.frame.rip = fixup;
+        return;
     }
     // Stage 2: a fault *from ring 3* is the task's death, not the kernel's —
     // say which, and park. There is no scheduler to reap through and no other
@@ -651,7 +651,7 @@ fn timer_trap(t: &mut Trap<'_>) {
     smp::bkl_leave();
 }
 
-fn timer_trap_locked(t: &mut Trap<'_>) {
+fn timer_trap_locked(t: &Trap<'_>) {
     // The tick count is not the clock (that is the TSC, `net::uptime_us`); it
     // paces preemption and the trace dumps below. Only the boot core counts;
     // an AP's tick just acknowledges.
@@ -1495,7 +1495,8 @@ fn resolve_effective(path: &str) -> alloc::string::String {
 
 /// Read a NUL-terminated path from the task at `src_va` into `buf`, returning
 /// the `&str` it held. `None` (`-EFAULT` at the call site) on a bad byte or
-/// no terminator inside `buf.len()`.
+/// no terminator inside `buf.len()`. Only the `trace-err` `execve` line reads one.
+#[cfg(feature = "trace-err")]
 fn user_str(src_va: u64, buf: &mut [u8]) -> Option<&str> {
     let s = akuma_user_walk::read_cstr(&task_walk(), src_va, buf.len()).ok()?;
     buf[..s.len()].copy_from_slice(&s);
@@ -1998,7 +1999,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                             // this MSR is per-core and `switch_to` installs
                             // the shadow, so a runtime TLS change must land
                             // in both or the next park-resume rolls back.
-                            crate::child::set_slot_fs(
+                            crate::sched::set_slot_fs(
                                 crate::exec_twin::current_slot(),
                                 addr,
                             );

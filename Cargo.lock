@@ -707,8 +707,10 @@ version = "0.1.0"
 dependencies = [
  "akuma-affinity",
  "akuma-cpu",
+ "akuma-exec-core",
  "akuma-fpu-amd64",
  "akuma-primitives",
+ "akuma-threading",
 ]
 
 [[package]]

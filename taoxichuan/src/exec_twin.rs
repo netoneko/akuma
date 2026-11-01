@@ -36,7 +36,7 @@
 //! them and no new `static` current-task is added anywhere else.
 
 use akuma_exec::{ExecConfig, ExecRuntime};
-use akuma_threading::{ProcessHooks, ThreadConfig, ThreadRuntime, X86ArchHooks};
+use akuma_threading::{ProcessHooks, ThreadConfig, ThreadRuntime};
 // `read_file` on the ext2 root is the `akuma_vfs::Filesystem` trait method —
 // child.rs imports the trait for the same reason.
 use akuma_vfs::Filesystem as _;
@@ -62,17 +62,6 @@ pub fn set_current_slot(slot: usize) {
 
 // ── the X86ArchHooks bodies (the per-core machine effects) ──────────────────
 
-/// `X86ArchHooks::switch_to`: the shared body is `akuma-sched-amd64`'s (root, trap stack, FS/GS, FP state); what is
-/// this kernel's - the incoming task's syscall band and task record - is [`crate::sched::Tx`]'s `after_install`.
-fn switch_to(from: usize, to: usize) {
-    akuma_sched_amd64::switch_to::<crate::sched::Tx>(from, to);
-}
-
-/// Reset a claimed slot's FP state (the claim path; the slot is not running).
-pub fn fx_reset(slot: usize) {
-    crate::sched::reset_fx(slot);
-}
-
 /// The idle thread's tid: outside the spawn ring (children claim 1..NSLOTS,
 /// the shell is 0), so no array index collides. Its stack is leaked once,
 /// below; its CR3 is the kernel's (sched_root_of answers 0).
@@ -86,7 +75,7 @@ pub const fn idle_tid(cpu: usize) -> usize {
     IDLE_TID + cpu
 }
 
-pub(crate) extern "C" fn idle_main() -> ! {
+pub extern "C" fn idle_main() -> ! {
     // The idle loop: keep the tick alive (one `sti` window per lap — the
     // clock is what timed parks and uptime read) and yield the moment
     // anything becomes READY. Without the yield, a woken task would wait
@@ -170,12 +159,6 @@ pub fn tick_window() {
     akuma_cpu::park::irq_window();
 }
 
-fn allow_tick() {
-    // The window is one instruction wide and the tick handler (`timer_trap`) is
-    // bounded and allocation-free, so the worst a tick in the window does is count.
-    akuma_cpu::park::irq_window();
-}
-
 // ── registration ────────────────────────────────────────────────────────────
 
 /// Register all four tables. Called once from `kernel_main`, right after
@@ -205,39 +188,9 @@ pub fn init() {
     // state arms landed in slice 2. The idle thread is seeded last: READY
     // from the first registration, it only ever gets the core when every
     // real task is parked (its loop feeds the tick and yields on wakeups).
-    akuma_threading::register_x86_arch_hooks(X86ArchHooks {
-        switch_to,
-        current_slot,
-        set_current_slot,
-        idle_slot,
-        can_run,
-        transfer_lock_depth,
-        allow_tick,
-        write_user_context: crate::child::write_user_context,
-        read_user_context: crate::child::read_user_context,
-        prepare_task_slot: crate::child::prepare_task_slot,
-    });
+    akuma_threading::register_x86_arch_hooks(akuma_sched_amd64::hooks::<crate::sched::Tx>());
     seed_idle();
     akuma_exec::process::reserve_pid_floor(2);
-}
-
-/// The spawn ring's width, for `can_run`'s bounds check.
-/// The idle answer: the boot task (`NO_SLOT` in the ring's naming). Nothing
-/// can call this until a picker exists (slice 3).
-fn idle_slot() -> usize {
-    idle_tid(akuma_ring3_amd64::cpu_index())
-}
-
-/// Pinning: nothing pins yet, so any slot in the ring (or the boot task) can
-/// run. `can_run` returns `false` only where a real pinning table would.
-fn can_run(slot: usize) -> bool {
-    akuma_sched_amd64::can_run::<crate::sched::Tx>(slot)
-}
-
-/// The BKL's recursion depth is per-thread and the lock per-core; this
-/// kernel takes no BKL yet (no threads), so there is no depth to move.
-fn transfer_lock_depth(from: usize, to: usize) {
-    crate::smp::transfer_depth(from, to);
 }
 
 fn thread_runtime() -> ThreadRuntime {
@@ -480,14 +433,14 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     // live MSR in the parent's context). One MSR write per Process entry —
     // entries are per fork/spawn, never per tick.
     let _ = akuma_cpu::msr::set_fs_base(ctx.fs_base);
-    crate::child::set_slot_fs(cur, ctx.fs_base);
+    crate::sched::set_slot_fs(cur, ctx.fs_base);
     enter_user_on(root, &ef)
 }
 
 /// Load `root` (when non-zero) and `sysret` into `ef` with the kernel lock
 /// released: the one way a task enters ring 3 here — a new thread or fork
 /// child ([`twin_enter_user`]) and an `execve`'s new image.
-pub(crate) fn enter_user_on(root: u64, ef: &akuma_ring3_amd64::EntryFrame) -> ! {
+pub fn enter_user_on(root: u64, ef: &akuma_ring3_amd64::EntryFrame) -> ! {
     if root != 0 {
         // SAFETY: `root` is a PMM-resident page-table frame naming the task's
         // image and the shared kernel half this code runs on.
@@ -504,7 +457,7 @@ pub(crate) fn enter_user_on(root: u64, ef: &akuma_ring3_amd64::EntryFrame) -> ! 
 
 /// Enter ring 3 for the thread running now from a captured context: [`twin_enter_user`] for the init thread, which has no
 /// parent to fork it (`child::start_init_thread`).
-pub(crate) fn enter_user_ctx(ctx: &akuma_exec::process::UserContext) -> ! {
+pub fn enter_user_ctx(ctx: &akuma_exec::process::UserContext) -> ! {
     twin_enter_user(ctx)
 }
 

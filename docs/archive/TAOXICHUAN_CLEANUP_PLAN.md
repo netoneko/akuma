@@ -157,6 +157,7 @@ to the arch crate behind `X86ArchHooks`.
 | A5 | one amd64 slot table: `akuma-sched-amd64` implements all of `X86ArchHooks` (`Machine` gains stacks, user context, FS shadow; `Platform` narrowed; `hooks::<P>()`); Taoxichuan first (`SLOT_STATE`, `SLOT_FS`, `SpawnSlot` go), amd64 behind its 819 self-tests |
 | A6 | fixed point on the ryzen, plus `cow_leak_gate` |
 | B7 | one x86 `futex` from both kernels |
+| B7b | containers off in Taoxichuan: `akuma-isolation` is an unconditional dependency of `akuma-exec`, glue and `vfs-glue`, so every kernel on them carried the box half (`Namespace`, `box_registry`, `mount`, `subdir_fs`, `overlay_fs`; 1,145 of Taoxichuan's image audit lines) without anyone choosing it. Credentials and DAC (`creds`, `dac`) stay unconditional - a Linux ABI needs them; the box half goes behind a `containers` feature that amd64 and AArch64 turn on |
 | B8 | the basic x86 address-space crate (`TASKS`, slab/holes, the mm syscalls); `load_task` onto `akuma-elf-exec` (2g) |
 | B9 | tokio gaps: `madvise`, `pidfd_open`, signal delivery beyond SIGCHLD (`kill` with it); amd64's `rt_sigsuspend` |
 | B10 | syscall census: TCG trace mode, then `strace -f -c` on the ryzen |
@@ -164,6 +165,20 @@ to the arch crate behind `X86ArchHooks`.
 | B12 | AArch64's slot table out of `akuma-threading`'s `cfg` blocks behind the same interface |
 | B13 | docs sweep (2i), `crate-safety.md` regenerated; `BUG_FIX_LIST.md` at branch close |
 | B14 | fixed point again |
+
+Alongside: `.clone()` and `mut` budgets on the `unsafe` budget's model (`scripts/check_unsafe_budget.py`), after an
+audit of unneeded clones in both x86 kernels and their linked crates.
+
+**After B14: an `unsafe` pass** (decided 2026-11-01). Not before: the steps above delete code and move state, and
+both change where `unsafe` sits. Levers, as discussed (482 production sites across amd64, Taoxichuan and their
+crates; 789 of Taoxichuan's 1,669 image `unsafe` lines are third-party):
+
+- change the type, not the location: `akuma-threading`'s ~25 `get_context(_mut)` raw-pointer derefs onto a
+  per-slot `BorrowCell`, the shape A5 gave the user context;
+- `lock_api` (276 image lines) out of `akuma-exec`, onto `akuma-bkl`'s own locks; `heapless` is smoltcp's and stays;
+- dedupe what repeats in `amd64/src` (22 `asm!`, the `CR3` writes, volatile reads `MmioWindow`/`DmaArray` cover);
+- measure `unsafe` *outside* named contract crates (`akuma-cpu`, `-port`, `-dma`, `-user-access`, `-alloc`, ...) as
+  the number to drive to zero, rather than the total.
 
 ## Phase 3: a tokio kernel
 
@@ -231,7 +246,8 @@ passes `epoch=`. Without it the guest clock reads 1970 and every TLS client refu
 | syscall-number audit fixed; SPAWN residue removed | `bb5e79bd` + (this commit) | 6,548 -> 6,456 | **SPAWN:** the trace special case, ring3's `SPAWN`/`WAITPID`/`CLOSE_CHILD_STDIN`, the dead `shell_tid()` branches and the docs that still described the crossing. **Audit** (`SYSCALL_CONSTANT_AUDIT_2026_10_30.md`, findings 1-5): `akuma-ring3-amd64::nr` 93 -> 4 constants, Taoxichuan dispatches by `akuma_syscalls_abi::x86_64`; `nr::KILL` is Linux's 129 and Akuma's 302 is `AKUMA_KILL`; `Msync` and `RtSigsuspend` rows. AArch64 kernel byte-identical before/after. Battery 9/9, tokioprobe PASS |
 | A1: `wait4`/`waitid` are glue's | `0a34636b` | 6,456 -> 6,276 | Taoxichuan's exit publishes as `akuma-exec` does (zombie state, `publish_child_exit`: the child channel `fork_process` registered, SIGCHLD on the parent), and `wait4`/`waitid` are glue's (`Waitid` abi row). A fork child's root is handed to a zombie-root table at the exit (the `Process` gets a non-owning view, so glue's reap drops no frames) and freed by `child::collect` after each reap and at fork/clone entry. `rt_sigsuspend` wakes on the pending SIGCHLD. Deleted: `SpawnSlot`'s status/waiter/reaped, `PARENT_OF`, the private wait4 and its boot-task scan, `reap_process`, `group_pid`. Battery 10/10 + goose, toolchain, tokioprobe, 64 KiB stdin, exit codes through `wait $!`; free memory flat over 60 fork/reap cycles |
 | A2: thread vs leader from `tgid` | `e5dc33fe` | 6,276 -> 6,265 | The slot's `thread` and `real` bits are gone: `is_thread_task`, `group_leader` and `kill_siblings` read the `Process`'s `tgid` (a `clone_thread` Process carries its leader's pid); `real` had become identical to `used` with the private SPAWN path gone. `TASK_OF` stays: it maps a slot to its memory record, which B8 replaces. Battery 10/10 + goose, toolchain, tokioprobe with 4 workers, free memory flat |
-| A3 + A4: `akuma-syscalls-proc`; exec's shared halves | (this commit) | 6,265 -> 6,201 | New pure crate `akuma-syscalls-proc` (`forbid`, 5 host tests): `clone::decode` (thread / posix_spawn-style / fork, with Linux's `EINVAL` for `CLONE_THREAD` without `CLONE_SIGHAND`/`CLONE_VM`), `exit::scope` (the leader-`exit` divergence pinned) and `exit::wait_status` (glue's encoder delegates to it), `exec::Budget`. New glue module `execve`: `read_request` (path against `cwd`, argv/envp as bytes under the budget, `EFAULT` for a bad pointer in both kernels) and `commit` (`/proc` identity, close-on-exec, handler reset). Both x86 kernels use all of it; their private argv readers and image updates are gone. amd64's `comm` is now the basename, as on Linux. Taoxichuan: battery 10/10 + goose, toolchain, tokioprobe, exec checks. amd64: self-tests 819/819, exec checks over ssh, box suite |
+| A3 + A4: `akuma-syscalls-proc`; exec's shared halves | `e755113c` | 6,265 -> 6,201 | New pure crate `akuma-syscalls-proc` (`forbid`, 5 host tests): `clone::decode` (thread / posix_spawn-style / fork, with Linux's `EINVAL` for `CLONE_THREAD` without `CLONE_SIGHAND`/`CLONE_VM`), `exit::scope` (the leader-`exit` divergence pinned) and `exit::wait_status` (glue's encoder delegates to it), `exec::Budget`. New glue module `execve`: `read_request` (path against `cwd`, argv/envp as bytes under the budget, `EFAULT` for a bad pointer in both kernels) and `commit` (`/proc` identity, close-on-exec, handler reset). Both x86 kernels use all of it; their private argv readers and image updates are gone. amd64's `comm` is now the basename, as on Linux. Taoxichuan: battery 10/10 + goose, toolchain, tokioprobe, exec checks. amd64: self-tests 819/819, exec checks over ssh, box suite |
+| A5: one amd64 slot table | (this commit) | 6,201 -> 6,055 | `akuma_sched_amd64::hooks::<P>()` builds the whole `X86ArchHooks` table: the switch, `can_run` and `prepare_task_slot` are the crate's, and `Platform` gained the rest (`set_current_task`, `idle_task`, `transfer_lock_depth`, `allow_tick`, user-context read/write). Both x86 kernels register it in one line. Taoxichuan's slot state moved into the crate's `Machine` table (`TxUser`: the ring-3 capture and the FS base): `SLOT_STATE`, `SlotStacks`, `SLOT_FS`, its own `prepare_task_slot` and user-context hooks and six wrapper functions are gone. `SpawnSlot` is down to `used`/`pid`/`running` (its pid can come from `akuma-exec`'s `pid_for_thread` later). Taoxichuan: battery 10/10 + goose, toolchain, tokioprobe at `smp=1` (4 workers) and `smp=4`. amd64: self-tests 819/819 in 12 of 15 runs; 3 failed the thread probe with exit status 0, against 0 of 5 before A5. The hook table holds the same functions as before, so this looks like a timing race the new layout exposes; logged as a flake: `AMD64_THREADPROBE_EXIT_ZERO_FLAKE.md`. Also: Taoxichuan's clippy is clean (`user_str` was dead code without `trace-err`, which `dead_code = "deny"` failed; init's 32 KiB stack no longer passes through the boot stack), and `akuma-sched-amd64`'s dependencies are x86_64-only |
 
 ## Background
 

@@ -231,31 +231,25 @@ impl akuma_sched_amd64::Platform for Amd64 {
         paint_canary(stacks.trap);
         reset_slot_counters(slot);
     }
+    fn set_current_task(slot: usize) {
+        smp::set_current_task(slot);
+    }
+    fn idle_task() -> usize {
+        smp::idle_task()
+    }
+    // `transfer_lock_depth`: the default no-op. Since 5b the BKL is `akuma_bkl`'s,
+    // reentrant by owner core, so the lock stays with the core across a switch and
+    // there is no per-thread depth to move.
+    fn allow_tick() {
+        allow_tick();
+    }
+    fn write_user_context(slot: usize, ctx: &UserContext) {
+        write_user_context(slot, ctx);
+    }
+    fn read_user_context(slot: usize) -> Option<UserContext> {
+        read_user_context(slot)
+    }
 }
-
-// ---------------------------------------------------------------------------
-// The hooks: everything `akuma-threading` cannot do for itself on this target
-// ---------------------------------------------------------------------------
-
-/// `X86ArchHooks::switch_to`: the shared body is `akuma_sched_amd64::switch_to`; this kernel's
-/// facts and diagnostics are [`Amd64`]'s.
-fn hook_switch_to(from: usize, to: usize) {
-    akuma_sched_amd64::switch_to::<Amd64>(from, to);
-}
-
-/// Hand the kernel lock's recursion depth from the outgoing thread to the
-/// incoming one. The lock itself stays with this core.
-///
-/// A no-op since 5b: the BKL is `akuma_bkl`'s, reentrant by owner core, so
-/// there is no depth to transfer — the lock stays with the core across the
-/// switch and the bookkeeping this hook used to move does not exist. The hook
-/// is kept because `akuma-threading`'s `X86ArchHooks` requires it.
-fn hook_transfer_lock_depth(_from: usize, _to: usize) {}
-
-fn hook_can_run(slot: usize) -> bool {
-    akuma_sched_amd64::can_run::<Amd64>(slot)
-}
-
 
 /// Reserve the cores in `mask` (bit `c` = core `c`; bit 0 is ignored); 0 releases them all.
 pub fn reserve_cores(mask: u64) {
@@ -314,7 +308,7 @@ pub fn repin_current(cpu: usize) -> bool {
 /// switch-in will install — the x86 half of the address-space free gate.
 ///
 /// `Machine::space_root` is this target's saved `TTBR0`: an off-CPU slot holds
-/// one, [`hook_switch_to`] writes it to `CR3` verbatim, and no per-core registry
+/// one, `akuma_sched_amd64::switch_to` writes it to `CR3` verbatim, and no per-core registry
 /// can see it (`akuma_mmu::any_core_on_l0` only knows what a core is running
 /// *now*). Freeing an L0 under such a reference is the ssh-wedge crash — the
 /// frame comes back as something else, PML4 slot 511 stops naming the kernel's
@@ -427,18 +421,9 @@ fn register_hooks() {
         note_current_expected_l0: threading::note_current_expected_l0,
         current_thread_is_terminated: threading::current_thread_is_terminated,
     });
-    threading::register_x86_arch_hooks(threading::X86ArchHooks {
-        switch_to: hook_switch_to,
-        current_slot: smp::current_task,
-        set_current_slot: smp::set_current_task,
-        idle_slot: smp::idle_task,
-        can_run: hook_can_run,
-        transfer_lock_depth: hook_transfer_lock_depth,
-        allow_tick,
-        write_user_context,
-        read_user_context,
-        prepare_task_slot,
-    });
+    // The whole table is `akuma_sched_amd64::hooks`: the switch, `can_run` and
+    // `prepare_task_slot` are the crate's, the rest [`Amd64`]'s `Platform` methods.
+    threading::register_x86_arch_hooks(akuma_sched_amd64::hooks::<Amd64>());
 
     // The scheduler also wants a clock and a console. The other four fields are
     // the AArch64 GIC's vocabulary, and on this target they are **no-ops with a
@@ -1443,7 +1428,7 @@ fn yield_tag_name(tag: u32) -> &'static str {
 /// `ON_CPU` argument rests on. `0` is the expected value.
 /// How many times each slot has been switched **in**, and by which core last.
 ///
-/// Written in [`hook_switch_to`], the single point every resume passes through
+/// Written in `akuma_sched_amd64::switch_to`, the single point every resume passes through
 /// — a kernel thread's first entry, a ring-3 thread's, and every one after. A
 /// slot with `SWITCH_INS == 0` has therefore never executed a single
 /// instruction, which is the distinction `ps` cannot draw: its `TIME` column is
@@ -1586,7 +1571,7 @@ gated={} gated_dead={}\n",
         let (hits, skip_gate, skip_pin) = akuma_threading::x86_slot_pick_counts(slot);
         let (wake, woken, slot_gen) = akuma_threading::x86_slot_wait_debug(slot);
         let core = LAST_CORE[slot].load(Ordering::Relaxed);
-        // Under the BKL, the same discipline `hook_can_run` uses; `slot` is in
+        // Under the BKL, the same discipline `akuma_sched_amd64::can_run` uses; `slot` is in
         // range by the loop bound.
         let (root, daemon, idle, pinned) = {
             let m = &MACHINE[slot];
@@ -1620,7 +1605,7 @@ sc={} scn={} gen={} root=0x{:x} daemon={} idle={} pin={} park={}:{} pid={:?}\n",
 }
 
 /// Switches into a non-idle task with no TLS base of its own, from one that had
-/// one — the window the unconditional `%fs` restore in [`hook_switch_to`]
+/// one — the window the unconditional `%fs` restore in `akuma_sched_amd64::switch_to`
 /// closes. Diagnostics only; reported by the boot suite.
 static STALE_FS_WINDOWS: AtomicU64 = AtomicU64::new(0);
 
@@ -1640,7 +1625,7 @@ pub fn switches_without_bkl() -> u64 {
 }
 
 /// Switch-ins whose slot named a page-table root the PMM already has back — the
-/// F8 tripwire in [`hook_switch_to`]. `0` is the expected value.
+/// F8 tripwire in `akuma_sched_amd64::switch_to`. `0` is the expected value.
 ///
 /// A non-zero count means the address-space free gate let an L0 go while a task
 /// slot was still carrying it, and the switch **demoted** the slot to the kernel
@@ -1699,7 +1684,7 @@ fn check_canaries(slot: usize, when: &str) {
 /// The running task's `UserCtx` slot, if this core has published one.
 fn current_uctx_cell() -> Option<&'static BorrowCell<UserCtx>> {
     // Null before the first switch on a core (and for nothing else): the pointer
-    // is always `MACHINE[slot].uctx.as_ptr()` (`hook_switch_to`, `init`), so the
+    // is always `MACHINE[slot].uctx.as_ptr()` (`akuma_sched_amd64::switch_to`, `init`), so the
     // slot's own cell *is* the thing it names — reached by index, not dereferenced.
     if smp::current_uctx().is_null() {
         return None;
@@ -1751,7 +1736,7 @@ pub fn set_task_space_root(task_slot: usize, root: u64) {
 }
 
 /// The page-table root a task slot will be given on its next switch-in — the
-/// value [`hook_switch_to`] writes to `CR3`, `0` meaning [`kernel_root`].
+/// value `akuma_sched_amd64::switch_to` writes to `CR3`, `0` meaning [`kernel_root`].
 ///
 /// A **diagnostic** reader, for the fatal-exception dump and the freed-root
 /// tripwire: a `CR3` that names a torn-down address space is invisible in the
