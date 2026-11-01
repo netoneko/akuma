@@ -1016,6 +1016,18 @@ pub fn close_arm(fd: u64) {
     }
 }
 
+/// An fd naming socket `idx` has already left its table (`dup2` displaced it,
+/// an exec swept it as close-on-exec, an exit popped it): release the
+/// connection only if no fd in any task still names it. A forked child's copy
+/// is one of those names — releasing unconditionally let a session shell's
+/// `exec 4<file` (a `dup2` over its inherited copy of sshd's socket) close
+/// sshd's own connection (`TAOXICHUAN_CLEANUP_PLAN.md` step 1e).
+pub fn release_unnamed(idx: usize) {
+    if socket_refs(idx) == 0 {
+        akuma_net::socket::remove_socket(idx);
+    }
+}
+
 /// How many open fds, across every task record, name socket `idx`.
 pub fn socket_refs(idx: usize) -> usize {
     crate::with_tasks(|ts| {

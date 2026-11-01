@@ -5,6 +5,8 @@
   tcg_rig.py boot [fresh]          boot TX_DISK through a qcow2 overlay; waits for an ssh round trip
   tcg_rig.py run 'CMD' [TIMEOUT]   run CMD in the guest over ssh (prints rc, stdout, stderr tail)
   tcg_rig.py stop                  stop this rig's QEMU (by its pidfile only - never by pattern)
+  tcg_rig.py battery [goose]       the regression battery on the running guest; `goose` adds the GLM prompt
+                                   (needs goose + its config on the image); exits 1 if any line differs from BATTERY
 
 Environment: TX_DISK (the base ext2 image, required for boot; the guest never writes it - writes land in
 TX_RUN/overlay.qcow2, and `boot fresh` discards them), TX_KEY (ssh private key for the image's
@@ -97,6 +99,40 @@ def boot(fresh):
     sys.exit(f"BOOT FAIL no ssh round trip in 180 s (console: {RUN}/console.log)")
 
 
+# (name, command, timeout, expected stdout). The expected values are the 2026-11-01 baseline; `apk add git`'s
+# "9 errors" are pre-existing trigger-script failures (exit 127), recorded in the 2026-10-30 battery too.
+BATTERY = [
+    ("quick", "echo q", 40, "q"),
+    ("F1", 'sh -c "echo x > /tmp/f; cat /tmp/f; wc -c /tmp/f"', 60, "x\n2 /tmp/f"),
+    ("PK1", "yes | head -n 20000 | wc -l", 90, "20000"),
+    ("fs", "rm -rf /tmp/l /tmp/d; ln -s /tmp/f /tmp/l; readlink /tmp/l; mkdir /tmp/d; rmdir /tmp/d && echo rmdir-ok",
+     60, "/tmp/f\nrmdir-ok"),
+    ("append", "printf a > /tmp/ap; printf b >> /tmp/ap; printf c >> /tmp/ap; cat /tmp/ap; echo; tail -c 2 /tmp/ap",
+     60, "abc\nbc"),
+    # A session shell's dup2 over its inherited copy of sshd's socket must not close sshd's connection.
+    ("dup2-sock", "exec 4</etc/hostname; echo after; cat <&4 >/dev/null; echo ok", 60, "after\nok"),
+    ("pipeline", "seq 1 500 | sort -rn | head -n 1", 60, "500"),
+    ("apk", "apk add git 2>&1 | tail -1", 300, "9 errors; 15 MiB in 19 packages"),
+    ("git", "git --version", 60, "git version 2.54.0"),
+]
+GOOSE = ("goose", ". /etc/goose.env; cd /root; timeout 400 goose run --no-session -t "
+         "'Reply with exactly the word PONG and nothing else. Do not use tools.' 2>&1 | tail -1", 460, "PONG")
+
+
+def battery(with_goose):
+    bad = 0
+    for name, cmd, timeout, want in BATTERY + ([GOOSE] if with_goose else []):
+        rc, out, _ = ssh(cmd, timeout)
+        got = out.strip()
+        ok = rc == 0 and got == want
+        bad += not ok
+        print(f"{'PASS' if ok else 'FAIL'} {name}" + ("" if ok else f" rc={rc} got={got[-200:]!r}"))
+    faults = sum(1 for line in open(os.path.join(RUN, "console.log"), "rb")
+                 if b"[Fault]" in line or b"PANIC" in line)
+    print(f"{'PASS' if faults == 0 else 'FAIL'} console faults={faults}")
+    sys.exit(1 if bad or faults else 0)
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
@@ -107,6 +143,8 @@ def main():
         boot(len(sys.argv) > 2 and sys.argv[2] == "fresh")
     elif cmd == "stop":
         stop()
+    elif cmd == "battery":
+        battery(len(sys.argv) > 2 and sys.argv[2] == "goose")
     elif cmd == "run":
         rc, out, err = ssh(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 120)
         print(f"rc={rc}")

@@ -62,6 +62,13 @@ starting ([`TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md`](../../../docs/archive/TAO
 appenders on separate descriptions can interleave. That is a known difference
 from Linux.
 
+**A socket's connection goes with its last name.** `fork`, `dup` and
+`CLONE_FILES` copy socket fds without the socket knowing, so every path that
+removes a socket fd from a table (`close`, a `dup2` displacing it, an exec's
+close-on-exec sweep, exit) releases the connection only when no fd in any task
+still names it (`sock::release_unnamed`, `close_arm`). Releasing on the first
+removal let a session shell's `exec 4<file` close sshd's own connection.
+
 fd slots are fixed: 16 per task (`SLOT_CEILING`), 3–15 allocatable
 ([`crates/akuma-fdtable`](../../../crates/akuma-fdtable) owns lowest-free,
 close, dup_to, fork_copy, the flag sets; this kernel supplies the effects).

@@ -99,8 +99,12 @@ information`) was the same certificate check reported with less detail.
 Over ssh, `exec 4</tmp/x` in the session's `/bin/sh -c` made the session's sshd fail `recvfrom(4)` with `EBADF` and tear the session
 down (`[SSHD] Session pid 29: socket read failed ... Bad file descriptor`; console also shows `bridge_process: couldn't open stdin for
 pid 29` before it). The same redirect one shell level deeper (`sh -c "exec 9<..."`) did not affect sshd. So the forked child's fd
-changes reached the parent sshd's fd 4. Cause not investigated. It is not the goose blocker, but it is a fork/fd-table isolation
-problem.
+changes reached the parent sshd's fd 4.
+
+**Fixed 2026-11-01** (cleanup plan step 1e). The tables were never shared. `dup2` displacing a socket called `remove_socket`
+unconditionally, so the child's `dup2(3, 4)` over its inherited copy of sshd's socket destroyed the connection that sshd's own fd 4
+still named. Both exec close-on-exec sweeps had the same unconditional release. All of them now go through `sock::release_unnamed`,
+which releases only when no fd in any task names the socket, the rule `close()` and the exit sweep already followed.
 
 ## Rig (local, no ryzen)
 

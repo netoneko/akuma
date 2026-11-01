@@ -388,9 +388,7 @@ pub fn release_open_fds() {
             }
             // The exit drops the task's socket references; the last one out
             // releases the connection (this used to leak every socket).
-            OpenFile::Socket(idx) if crate::sock::socket_refs(idx) == 0 => {
-                akuma_net::socket::remove_socket(idx);
-            }
+            OpenFile::Socket(idx) => crate::sock::release_unnamed(idx),
             _ => {}
         }
     }

@@ -4336,13 +4336,14 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let src_pipe = with_fds(|t| t.with(old as u32, OpenFile::pipe_ends));
             match with_fds(|t| t.dup_to(old as u32, new as u32, is_dup3 && flags & O_CLOEXEC != 0)) {
                 Ok(d) => {
-                    // Whatever `new` named is displaced: release a displaced
-                    // socket's kernel side exactly as close() does; a
-                    // displaced pipe end drops its table reference the same
-                    // way. The clone that dup_to made of the SOURCE is a
-                    // real reference too — the end count must follow it.
+                    // Whatever `new` named is displaced: a displaced socket
+                    // drops one name (the connection goes only with the last,
+                    // as for close()); a displaced pipe end drops its table
+                    // reference the same way. The clone that dup_to made of
+                    // the SOURCE is a real reference too — the end count must
+                    // follow it.
                     if let Some(OpenFile::Socket(idx)) = d.displaced {
-                        akuma_net::socket::remove_socket(idx);
+                        sock::release_unnamed(idx);
                     } else if let Some(disp) = &d.displaced {
                         let (ends, n) = disp.pipe_ends();
                         for (id, w) in &ends[..n] {

@@ -968,7 +968,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     });
     for (_fd, payload) in swept {
         if let crate::OpenFile::Socket(idx) = payload {
-            akuma_net::socket::remove_socket(idx);
+            crate::sock::release_unnamed(idx);
         } else {
             let (ends, n) = payload.pipe_ends();
             for (id, w) in &ends[..n] {
@@ -1522,7 +1522,7 @@ pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
     });
     for (_fd, payload) in swept {
         if let crate::OpenFile::Socket(idx) = payload {
-            akuma_net::socket::remove_socket(idx);
+            crate::sock::release_unnamed(idx);
         } else {
             // A swept pipe end drops its table reference, exactly as
             // close does.

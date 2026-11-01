@@ -57,7 +57,7 @@ intermittently on every kernel tested.
 | 1b | Run `goose run` again on TCG. Expect the next SQLite wall to be one of amd64's (`F_GETLK`, record locks, `MAP_SHARED` coherence of `-shm`), unless Taoxichuan already gets them right | **done**: no further SQLite wall; the next wall was the rig's 1970 clock (`epoch=`, now in `tcg_rig.py`) |
 | 1c | goose's TLS to z.ai (rustls), then a tool call (`developer` extension: fork + exec of a shell) | **done** on TCG: PONG in about 8 s; the shell tool ran `uname -a` and a redirect |
 | 1d | The same on the ryzen (KVM), against the metal image | |
-| 1e | Side bug: a session shell's `exec 4<file` closed sshd's fd 4 (fork/fd-table isolation). Retest after phase 2's S2–S4, then fix whatever is still there | |
+| 1e | Side bug: a session shell's `exec 4<file` closed sshd's fd 4. Not table sharing: `dup2` displacing a socket, and both exec close-on-exec sweeps, released the connection unconditionally, although the parent's fd still named it. Now `sock::release_unnamed` (last name only) | **done** 2026-11-01; `battery` has a `dup2-sock` line |
 
 ## Phase 2: the rest of the duplicates
 
@@ -137,7 +137,9 @@ passes `epoch=`. Without it the guest clock reads 1970 and every TLS client refu
 | step | commit | lines before -> after | notes |
 |---|---|---|---|
 | plan | - | 12,131 | this file |
-| 1a–1c | (this commit) | 12,131 -> 12,137 | the size is the inode's; `tcg_rig.py`; goose + GLM prompt and tool call pass on TCG |
+| 1a–1c | `c0a921a2` | 12,131 -> 12,137 | the size is the inode's; `tcg_rig.py`; goose + GLM prompt and tool call pass on TCG |
+| plan | `9c44ba87` | - | phase 2 replays amd64's glue adoption instead of per-family crates |
+| 1e | (this commit) | 12,137 -> 12,144 | socket released by its last name only (`dup2`, exec sweeps); `tcg_rig.py battery [goose]`: 10/10 PASS, 0 faults |
 
 ## Background
 
