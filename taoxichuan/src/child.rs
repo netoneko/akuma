@@ -322,7 +322,7 @@ pub fn task_exit_real(code: u64) -> ! {
 /// thread of a process, clear the row's `running` and hand its page-table root
 /// to [`zombie_root`], so glue's reap can never drop it.
 pub fn on_thread_terminated(tid: usize) {
-    crate::futex::purge_task(tid);
+    akuma_syscalls_glue::futex_purge_tid(tid);
     if tid >= NSLOTS {
         return;
     }
@@ -396,7 +396,7 @@ fn task_exit_code(code: i32) -> ! {
     }
     akuma_exec::process::publish_child_exit(lead_pid, code);
     if lead != cur {
-        crate::futex::purge_task(lead);
+        akuma_syscalls_glue::futex_purge_tid(lead);
         akuma_threading::mark_thread_terminated(lead);
     }
     akuma_threading::x86_finish_current()
@@ -418,21 +418,89 @@ fn group_leader(cur: usize) -> usize {
 /// `exit_group`: end every thread of `cur`'s group except `cur` and `lead`
 /// (the caller finishes those itself). A thread is a slot whose `Process` has
 /// the group's `tgid` and a pid of its own.
+///
+/// A sibling that is not executing (parked, or ready to run) is ended here. One
+/// RUNNING on another core cannot be: marking it TERMINATED does not stop it, and
+/// it ran on in a dying process - parked in a `futex` it overwrote its own
+/// TERMINATED with WAITING (`[REVIVE]`), with its `Process` already retired. So it
+/// gets a kill request instead, ends itself at its next kernel entry or exit
+/// ([`finish_killed`]: the syscall dispatcher and the ring-3 tick), and this
+/// caller waits for that with the lock released, because the group's teardown
+/// after this must not run under a thread still in ring 3.
+/// `docs/archive/TAOXICHUAN_EXIT_GROUP_RUNNING_SIBLING.md`.
 fn kill_siblings(cur: usize, lead: usize) {
     let tgid = slot_tgid(cur);
-    for s in 0..NSLOTS {
+    let mut asked = [0u32; NSLOTS]; // the pid asked to end, per slot; 0 = none
+    for (s, ask) in asked.iter_mut().enumerate() {
         let spid = slot_pid(s);
         if s == cur || s == lead || !slot_in_use(s) || spid == tgid || slot_tgid(s) != tgid {
             continue;
         }
-        crate::futex::purge_task(s);
-        with_slots(|t| {
-            t[s].running = false;
-            t[s].used = false;
-        });
-        akuma_threading::mark_thread_terminated(s);
-        retire_thread_process(spid);
+        if akuma_threading::get_thread_state(s) == akuma_threading::thread_state::RUNNING {
+            akuma_threading::request_thread_kill(s);
+            *ask = spid;
+            continue;
+        }
+        end_sibling(s, spid);
     }
+    // Ring 3 reaches the kernel at least once a tick, so this is ~10 ms per sibling;
+    // the bound is for a thread that never does (stuck with the lock released).
+    let start = crate::net::uptime_us();
+    while asked.iter().any(|&p| p != 0) {
+        for (s, p) in asked.iter_mut().enumerate() {
+            // Gone: terminated, or the slot already belongs to someone else.
+            if *p != 0 && (akuma_threading::is_thread_terminated(s) || slot_pid(s) != *p) {
+                *p = 0;
+            }
+        }
+        if crate::net::uptime_us().saturating_sub(start) > 2_000_000 {
+            for (s, p) in asked.iter_mut().enumerate().filter(|(_, p)| **p != 0) {
+                akuma_primitives::safe_print!(96, "[exit_group] slot {} never reached the kernel; ended in place\n", s);
+                end_sibling(s, *p);
+                *p = 0;
+            }
+            break;
+        }
+        crate::smp::bkl_unlocked(|| {
+            for _ in 0..2000 {
+                core::hint::spin_loop();
+            }
+        });
+    }
+}
+
+/// End sibling slot `s` (pid `spid`) of an exiting group where it stands: it is
+/// not executing, so it never runs again.
+fn end_sibling(s: usize, spid: u32) {
+    let _ = akuma_threading::take_kill_request_via_tid(s);
+    akuma_syscalls_glue::futex_purge_tid(s);
+    with_slots(|t| {
+        t[s].running = false;
+        t[s].used = false;
+    });
+    akuma_threading::mark_thread_terminated(s);
+    retire_thread_process(spid);
+}
+
+/// Did `exit_group` ask the running thread to end ([`kill_siblings`])?
+pub fn kill_requested() -> bool {
+    let cur = crate::exec_twin::current_slot();
+    cur < NSLOTS && akuma_threading::has_pending_kill(cur)
+}
+
+/// End the running thread at a kill request: no exit status (its group's
+/// exiting thread publishes that), no clear-child-tid wake (the group is going).
+pub fn finish_killed() -> ! {
+    let cur = crate::exec_twin::current_slot();
+    let _ = akuma_threading::take_kill_request_via_tid(cur);
+    akuma_syscalls_glue::futex_purge_tid(cur);
+    let pid = with_slots(|s| {
+        s[cur].running = false;
+        s[cur].used = false;
+        s[cur].pid
+    });
+    retire_thread_process(pid);
+    akuma_threading::x86_finish_current()
 }
 
 /// Take a dead thread's registered `Process` out of the process table.
@@ -461,10 +529,10 @@ pub fn task_exit_thread() -> ! {
         let addr = p.clear_child_tid.swap(0, core::sync::atomic::Ordering::AcqRel);
         if addr != 0 {
             let _ = crate::copy_to_user(addr, &0u32.to_ne_bytes());
-            let _ = crate::futex::wake_key(p.tgid, addr as usize, 1);
+            akuma_syscalls_glue::futex_wake(p.tgid, addr as usize, 1);
         }
     }
-    crate::futex::purge_task(cur);
+    akuma_syscalls_glue::futex_purge_tid(cur);
     // The slot leaves the table: a thread has no status for a parent to reap
     // and must never look like a child to a `wait4` scan.
     let pid = with_slots(|s| {

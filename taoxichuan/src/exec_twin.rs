@@ -313,12 +313,12 @@ fn exec_runtime() -> ExecRuntime {
         exec_bkl_drop_enabled: || false,
         // No process table: nothing `akuma-exec` knows about can exit.
         on_process_exit: |_pid| {},
-        // No itimers, futexes-in-tables, pidfds, audio or ptys on this target
-        // yet — each arm's subsystem has no table here to release from, and
-        // the first one that arrives wires its row (amd64 wired each exactly
-        // when its syscall landed).
+        // No itimers, pidfds, audio or ptys on this target yet — each arm's
+        // subsystem has no table here to release from, and the first one that
+        // arrives wires its row (amd64 wired each exactly when its syscall
+        // landed). The futex table is glue's, the one `futex` serves.
         check_itimers: || {},
-        futex_wake: |_, _, _| {},
+        futex_wake: akuma_syscalls_glue::futex_wake,
         eventfd_close: akuma_syscalls_glue::eventfd::eventfd_close,
         eventfd_clone_ref: akuma_syscalls_glue::eventfd::eventfd_clone_ref,
         unix_sock_close: akuma_syscalls_glue::unixsock::unix_sock_close,

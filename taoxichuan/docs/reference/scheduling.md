@@ -191,8 +191,9 @@ pending generations itself, so sender-waits-for-spinner cannot deadlock.
   (`smp::ap_entry64`): hardware leaves it set, but Akuma's SVM model starts a
   non-boot vCPU with it clear and the ID read faults (nested page fault at
   `0xfee00020`). A guest needs `smp=N` on its cmdline *and* `vm_vcpus = N`.
-- The park sites save/restore the user-`RSP` stash around a park
-  (`pipes::park_once`, `futex::wait`): a parked task can resume on another core.
+- The syscall dispatcher (`main.rs` `dispatch`) saves and restores the user-`RSP` stash around every call, so
+  any park inside one (glue's `futex`, `nanosleep`, a pipe or socket wait) is covered: a parked task can resume
+  on another core.
 
 ## Background
 

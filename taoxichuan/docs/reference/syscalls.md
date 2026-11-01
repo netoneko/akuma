@@ -63,7 +63,7 @@ descriptors (pipes, eventfd, epoll, AF_UNIX, flock) are `akuma-syscalls-glue`'s;
 4. `akuma_syscalls_glue_amd64::dispatch` — the rest of the fd family: the x86_64
    ABI over glue (open flags, `struct stat`, the legacy numbers, `dup2`, poll/select
    timeouts, chunked reads), shared with amd64.
-5. The local arms: memory, process, signals, futex, clocks, exec.
+5. The local arms: memory, process, signals, exec.
 
 `sendfile` and `copy_file_range` answer `ENOSYS` (glue has neither; busybox and
 Rust's `fs::copy` fall back to `read`/`write`).
@@ -183,7 +183,7 @@ Rows of the table below for calls served by glue are historical until the sweep
 | 131 | sigaltstack | `sigaltstack_arm` (main.rs) | SS_DISABLE/MINSIGSTKSZ recorded per task | full record/reply; nothing dispatches on it yet |
 | 166 | sync | dispatch (main.rs) | `root_fs().sync()` | accepted; write-through makes it a no-op |
 | 200 | tkill | `tkill_arm` (main.rs) | no delivery: a blocked poll/pipe read of that thread answers EINTR | what cargo's jobserver needs; signal 0 probes |
-| 202 | futex | `futex::sys_futex` (futex.rs) | `akuma-syscalls-sync` WaiterTable/op algebra | WAIT/WAKE/WAIT_BITSET/REQUEUE/WAKE_OP, private + shared, timeouts |
+| 202 | futex | glue (`served_by_glue`) | glue's `(tgid, uaddr)` table over `akuma-syscalls-sync`; parks on `akuma-threading`; the thread exit's clear-child-tid wake and slot purge are glue's `futex_wake`/`futex_purge_tid` | WAIT/WAKE/WAIT_BITSET/REQUEUE/WAKE_OP, private + shared, timeouts, `EINTR` on a pending signal |
 | 234 | tgkill | `tkill_arm` (main.rs) | as tkill | same |
 | 203 | sched_getaffinity | glue (`served_by_glue`) | `probed_core_count` hook = `smp::online_cpus` | the toolchain's and tokio's thread-count probe; `smp=N` reports N |
 | 302 | prlimit64 | glue | as getrlimit; sets accepted-ignored | musl's pthread stack sizing |

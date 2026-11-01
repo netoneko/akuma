@@ -92,8 +92,6 @@ akuma-syscalls-linux = { path = "../crates/akuma-syscalls-linux" }
 akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
 # pn S2: membarrier's command decode (the barrier itself is an effect here).
 akuma-syscalls-mem = { path = "../crates/akuma-syscalls-mem" }
-# pn S4: futex decisions (op decode, key namespace, waiter table, deadline).
-akuma-syscalls-sync = { path = "../crates/akuma-syscalls-sync" }
 # The process family's pure decisions (clone kinds, exit scope, wait status, execve's budget).
 akuma-syscalls-proc = { path = "../crates/akuma-syscalls-proc" }
 # ---- The stage-4 crate line -------------------------------------------------

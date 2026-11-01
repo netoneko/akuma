@@ -92,7 +92,6 @@ extern crate alloc;
 
 mod child;
 mod exec_twin;
-mod futex;
 mod net;
 #[cfg(feature = "trace-err")]
 mod ring;
@@ -667,6 +666,11 @@ fn timer_trap_locked(t: &Trap<'_>) {
         }
     } else {
         akuma_lapic_amd64::eoi();
+    }
+    // A sibling `exit_group` asked to end, caught in a ring-3 loop that makes no
+    // syscall: the tick is its kernel entry (`child::kill_siblings` waits for it).
+    if t.from_ring3() && child::kill_requested() {
+        child::finish_killed();
     }
     // M4 slice 3 preemption (session pf, plan §5): a tick that interrupted
     // ring 3 may switch — the same `x86_yield` the park loop and the idle lap
@@ -1566,7 +1570,15 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     // here and restored before the return, for every call at once.
     let stash = ring3::user_rsp_stash();
     smp::bkl_enter();
+    // A sibling `exit_group` asked to end leaves here, at entry or on the way back
+    // to ring 3, rather than running on in a dying process (`child::kill_siblings`).
+    if child::kill_requested() {
+        child::finish_killed();
+    }
     let r = dispatch_locked(fr);
+    if child::kill_requested() {
+        child::finish_killed();
+    }
     smp::bkl_leave();
     ring3::set_user_rsp_stash(stash);
     r
@@ -1879,6 +1891,10 @@ const fn served_by_glue(call: akuma_syscalls_abi::Syscall) -> bool {
             | S::Shutdown
             | S::Getsockname
             | S::Getpeername
+            // `futex`: glue's, the one AArch64 runs (the `(tgid, uaddr)` table, the
+            // park on `akuma-threading`, `EINTR` on a pending signal). Its private key
+            // is `read_current_pid`, the thread group's, as this kernel's was.
+            | S::Futex
     )
 }
 
@@ -2022,9 +2038,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     e(ring3::err::ENOSYS)
                 }
             }
-        }
-        akuma_syscalls_abi::x86_64::FUTEX => {
-            futex::sys_futex(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6())
         }
         akuma_syscalls_abi::x86_64::MMAP => {
             let (addr, len, prot, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
