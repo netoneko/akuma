@@ -956,13 +956,17 @@ fn mount_vfs_glue(fs: alloc::sync::Arc<akuma_ext2::Ext2Filesystem<Vda>>) {
     });
     // `uname` is glue's, which answers `Akuma` unless a kernel names itself. This one is a
     // Linux-ABI kernel and programs branch on `uname -s`; it said `Linux`/`taoxichuan` until
-    // the arm moved to glue (`74962ae5`), and does again, with the build in `version`.
-    akuma_syscalls_glue::proc::set_uts_identity(akuma_syscalls_glue::proc::UtsIdentity {
-        sysname: "Linux",
-        nodename: "taoxichuan",
-        release: "6.6.0-akuma",
-        version: akuma_syscalls_glue::version::BUILD_ID,
-    });
+    // the arm moved to glue (`74962ae5`), and does again. The release is this crate's own
+    // version and commit, `<version>-<sha>-taoxichuan` (not a borrowed Linux number).
+    {
+        use akuma_syscalls_glue::{proc, version};
+        proc::set_uts_identity(proc::UtsIdentity {
+            sysname: proc::uts_join(&["Linux"]),
+            nodename: proc::uts_join(&["taoxichuan"]),
+            release: proc::uts_join(&[env!("CARGO_PKG_VERSION"), "-", version::GIT_SHA, "-taoxichuan"]),
+            version: proc::uts_join(&[version::BUILD_ID]),
+        });
+    }
     // `akuma-syscalls-glue`'s own table: the wall clock and the core count are
     // real answers; there is no rump kernel, console poller, mouse or tap
     // device here (amd64's `boot::install_shared_sinks` registers the same set).

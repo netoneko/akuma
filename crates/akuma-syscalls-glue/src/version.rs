@@ -120,6 +120,9 @@ pub(super) fn sys_akuma_get_version() -> u64 {
     AKUMA_VERSION
 }
 
+/// The abbreviated git sha the kernel was built from, as text (`COMMIT` is its value).
+pub const GIT_SHA: &str = env!("AKUMA_GIT_SHA");
+
 /// **The build identity — `uname -v`**: `<git-sha>-<profile>`, e.g.
 /// `2a81b72d-release-smp-shared`.
 ///

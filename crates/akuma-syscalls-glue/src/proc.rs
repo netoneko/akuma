@@ -248,12 +248,14 @@ static DOMAINNAME: Spinlock<Option<akuma_syscalls_linux::uts::Field>> = Spinlock
 /// `machine` stays the compiled architecture's. Glue answers `Akuma` for a kernel that sets none - the AArch64 kernel and amd64 - and one that does gets its own
 /// name back: Taoxichuan said `Linux`/`taoxichuan` until its `uname` arm moved here
 /// (`74962ae5`), and then reported Akuma's. A field longer than 64 bytes is cut.
+/// Fields are whole `utsname` fields, so a kernel can assemble one at run time with no
+/// allocation ([`uts_join`]).
 #[derive(Clone, Copy, Debug)]
 pub struct UtsIdentity {
-    pub sysname: &'static str,
-    pub nodename: &'static str,
-    pub release: &'static str,
-    pub version: &'static str,
+    pub sysname: akuma_syscalls_linux::uts::Field,
+    pub nodename: akuma_syscalls_linux::uts::Field,
+    pub release: akuma_syscalls_linux::uts::Field,
+    pub version: akuma_syscalls_linux::uts::Field,
 }
 
 static IDENTITY: Spinlock<Option<UtsIdentity>> = Spinlock::new(None);
@@ -264,10 +266,20 @@ pub fn set_uts_identity(id: UtsIdentity) {
     *IDENTITY.lock() = Some(id);
 }
 
-fn uts_field_of(name: &str) -> akuma_syscalls_linux::uts::Field {
+/// One `utsname` field from `parts` joined end to end, cut at 64 bytes (no allocation).
+#[must_use]
+pub fn uts_join(parts: &[&str]) -> akuma_syscalls_linux::uts::Field {
+    let mut buf = [0u8; akuma_syscalls_linux::uts::NAME_MAX];
+    let mut n = 0;
+    for b in parts.iter().flat_map(|p| p.bytes()) {
+        if n == buf.len() {
+            break;
+        }
+        buf[n] = b;
+        n += 1;
+    }
     let mut f = akuma_syscalls_linux::uts::Field::empty();
-    let b = name.as_bytes();
-    let _ = f.set(&b[..b.len().min(akuma_syscalls_linux::uts::NAME_MAX)]);
+    let _ = f.set(&buf[..n]);
     f
 }
 
@@ -281,7 +293,7 @@ pub(super) fn sys_uname(buf: u64) -> u64 {
     let id = *IDENTITY.lock();
     if let Some(id) = id {
         for (index, name) in [(0usize, id.sysname), (1, id.nodename), (2, id.release), (3, id.version)] {
-            if copy_to_user(buf + (index * UTS_FIELD_LEN) as u64, uts_field_of(name).as_bytes()).is_err() {
+            if copy_to_user(buf + (index * UTS_FIELD_LEN) as u64, name.as_bytes()).is_err() {
                 return EFAULT;
             }
         }

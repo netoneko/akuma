@@ -22,11 +22,14 @@ Glue has `proc::UtsIdentity` and `proc::set_uts_identity`: a kernel registers it
 `release` and `version` at init, and `sys_uname` writes them over the defaults field by field (whole fields, so a shorter
 name leaves no tail). `machine` stays the compiled architecture's, and `sethostname`/`setdomainname` still override.
 A kernel that registers nothing keeps glue's answer, so the AArch64 kernel and amd64 are unchanged. Taoxichuan
-registers `Linux` / `taoxichuan` / `6.6.0-akuma` / `version::BUILD_ID`.
+registers `Linux` / `taoxichuan` / `<version>-<sha>-taoxichuan` / `version::BUILD_ID`. The release was first restored as
+the old arm's `6.6.0-akuma`, a Linux-looking number with no recorded reason; at the user's call it is now honest: the
+crate's own `Cargo.toml` version and the commit (glue's `version::GIT_SHA`), assembled at init with `proc::uts_join`
+(no allocation). The AArch64 kernel and amd64 move to the same shape later.
 
 ## Verified
 
-Mac TCG rig: `uname -a` is `Linux taoxichuan 6.6.0-akuma 98b7455f-release x86_64`, `uname -s` is `Linux`, `hostname`
+Mac TCG rig: `uname -a` is `Linux taoxichuan 0.1.0-7bbf0c2c-taoxichuan 7bbf0c2c-release x86_64`, `uname -s` is `Linux`, `hostname`
 is `taoxichuan` and `hostname tx2` then `uname -n` answers `tx2`. Battery 9/9, 0 faults. Glue host clippy, AArch64
 release and amd64 builds clean.
 

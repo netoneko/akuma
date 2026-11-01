@@ -135,7 +135,7 @@ Rows of the table below for calls served by glue are historical until the sweep
 | 59 | execve | `exec_real_task` / `exec_replace` (child.rs) | exec-replace | a real child replaces in place (fds survive); the M2 nested arm serves the shell's tail-exec; both crossings zero fs ([`processes.md`](processes.md) § fs) |
 | 60 | exit | dispatch (main.rs) | task_done / child_exit | code & 0xFF |
 | 61 | wait4 | `wait4_arm` (child.rs) | spawn ring + `PARENT_OF` | parent-owned: reaps only own stamped children, ECHILD for a stranger's or none; parks on own running children; WNOHANG → 0; rusage ignored |
-| 63 | uname | dispatch (main.rs) | syscalls-linux uts::Field | "Linux taoxichuan 6.6.0-akuma … x86_64" |
+| 63 | uname | glue (`served_by_glue`), identity registered at init (`proc::set_uts_identity`) | syscalls-linux uts::Field | "Linux taoxichuan `<version>-<sha>-taoxichuan` `<sha>-<profile>` x86_64" |
 | 72 | fcntl | dispatch (main.rs) | akuma-fdtable | F_GETFD/F_SETFD/F_GETFL(=0)/F_SETFL(O_NONBLOCK)/F_DUPFD/F_DUPFD_CLOEXEC |
 | 73 | flock | dispatch (main.rs) | — | 0: one task, nothing contends |
 | 77 | ftruncate | dispatch (main.rs) | akuma-ext2 `truncate_by_inode` | every description sees the new size (it is the inode's) |
