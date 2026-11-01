@@ -289,7 +289,9 @@ cited above landed 2026-10-30), `docs/archive/TAOXICHUAN_FIXED_POINT.md`
 
 | X3 user access | new `akuma-user-walk` (`forbid(unsafe)`, no deps, 5 host tests): `in_regions` (the `user_ok` rule), `copy_from`/`copy_to` (page chunking), `read_cstr` (page-chunked, stops at NUL, so a string ending before a hole succeeds; `user_str` and `read_user_string` were byte-at-a-time), `read_ptr_array`. Taoxichuan keeps `TaskWalk: Walk` (physmap frame access + `cow_prepare_write`). The existing `akuma-user-access` is the SMAP/fault-recovery copy asm and stays amd64/aarch64's; the two share a range rule, not a copy | `57cda68d` |
 
-Not started: X4-X10. The nested-crossing retirement (S3) is still open.
+| X4 pte/cow (policy half) | `akuma_cow::kernel_write` (Allow/Break/Refuse) and `needs_private_copy` replace the inline PTE-bit tests in `cow_prepare_write` / `cow_privatize` (+2 host tests); Taoxichuan's `PTE_W/COW/D/ADDR` are `akuma-pte-amd64`'s (+ `D`). The effect trio (`cow_resolve`) is **not** shared: amd64's break holds the owner's address-space lock, keeps a ledger and decs the count on take-in-place, Taoxichuan's does none of that - a shared `PteIo` trait would hide those differences, so the plan's X4 effect extraction is dropped | `1f15d09b` |
+
+Not started: X5-X10. The nested-crossing retirement (S3) is still open.
 
 Verification on the ryzen (bare metal, Akuma host entry 29 = "KVM herd", `smp=8`), host kernel `e7661570` built on the ryzen:
 * host boots, 7 APs online, wifi + sshd up;
@@ -299,3 +301,5 @@ Verification on the ryzen (bare metal, Akuma host entry 29 = "KVM herd", `smp=8`
 Honest limits: the guest's `/bin/sh` does not spawn on this metal image **with the pre-session guest kernel too** (`sh -c "echo hi"` over ssh: 0/10 on both), so most of `run_gates.sh` is not a usable oracle there (it passes/fails on the shell fallback); that is an environment gap to chase separately. The guest's own futex path is exercised only by sshd and `apk.static --version` (G2 passes on the new kernel) - the in-guest `-j4` build (Linux KVM on the ryzen, `build_run.py`) was not re-run for X1.
 
 Metal re-check after X3 (host `e7661570` unchanged, guest `57cda68d`, 4 vCPUs, `smp: 4 cpus online`): `run_gates.sh` G1-G4, H1-H3c, F1, C1, D1, D2, A1-A3, M4curl, M4web, W1b-d PASS, no `[Fault]`/`PANIC`, host survived the whole run. W1a FAILs on every run since the patched image (it hashes `ls -lin /etc/hostname`, whose inode/mtime depend on the image, not on the kernel).
+
+X4 verification (Pop KVM): `gate2.py` smp=4 9/9 and smp=1 6/6, 0 faults; `cow_leak_gate.py` (now reads the fork-session `[reap]` lines, cowrefs compared to the baseline) PASS delta 0, 23744 shared / 1374 copied. The in-guest `-j4` build could not be used as a gate: see the p3 corruption note in `HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD.md` (it stalls on every kernel, including the pre-session one, until p3 is repaired).

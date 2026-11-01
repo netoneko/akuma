@@ -66,3 +66,13 @@ so it is a lock-ordering/livelock shape, not CPU saturation.
 
 ## Verification status
 Evidence is the six runs above plus the klog tails; no fix attempted, no A/B beyond the host-kernel control. Nothing in `reference/` changed.
+
+## Collateral damage: each watchdog reset can corrupt p3 (found 2026-11-01)
+Akuma mounts p3 (the ext2 root, no journal) read-write; a watchdog reset mid-write leaves it dirty. After the two resets above
+`e2fsck -fn /dev/nvme0n1p3` (Pop, unmounted, read-only check) reports **HTREE directory errors and corrupted directory blocks under
+`/root/.cargo/registry/src/...`**. The Pop KVM rig uses p3 as the base of its guest disk, and from then on **every** in-guest `-j4`
+build stalled in `rust-lld` with `[BKL] cpu N stuck: owner cpu M` climbing (123-180 reports, 25-50 minutes, no `[Fault]`) - for the
+current kernel, for `e7661570`, for `8cd638d8` (before the futex-body extraction) and for `kb-fix` (`5108b5e5`), which had built the same tree in
+13m11s the day before. A stall that follows the disk, not the kernel, is the disk. Not repaired yet (`e2fsck -fp` was refused by the
+environment's safety check and needs the owner's go-ahead); until it is, in-guest builds on the p3 root are not a valid regression oracle.
+Lesson for the drill-down: run the metal gates with p3 mounted **read-only** from the host side where possible, and fsck p3 after any watchdog reset.
