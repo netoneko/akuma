@@ -1338,7 +1338,6 @@ dependencies = [
  "akuma-syscalls-glue-amd64",
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
- "akuma-syscalls-signal",
  "akuma-syscalls-sync",
  "akuma-threading",
  "akuma-trap-amd64",

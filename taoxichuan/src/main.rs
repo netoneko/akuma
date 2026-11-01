@@ -1092,21 +1092,6 @@ struct Task {
     brk_cur: u64,
     brk_end: u64,
     mmap_cur: u64,
-    /// `sigaltstack(2)`'s record: signals are not delivered yet (the arms are
-    /// no-ops), so this only has to read back what the task set - rustc and
-    /// musl's thread start install one and check the answer.
-    sigalt: akuma_syscalls_linux::StackT,
-    /// `rt_sigaction`'s table, one kernel `struct sigaction` per signal 1..=64
-    /// as four words `[handler, flags, restorer, mask]`. Nothing is ever
-    /// delivered, so this only has to read back what the task installed:
-    /// musl's `signal()` returns the OLD handler from `oldact`, and std's
-    /// child-side `signal(SIGPIPE, SIG_DFL)` fails the whole spawn when that
-    /// reads back as `SIG_ERR` (-1) - which is what an unwritten `oldact`
-    /// (stack garbage) did.
-    sigact: akuma_syscalls_signal::SigTable,
-    /// `rt_sigprocmask`'s word (shared by a task's threads - imprecise, and
-    /// harmless without delivery).
-    sigmask: u64,
     /// The path of the running image, what `readlink("/proc/self/exe")`
     /// answers (rust-lld's wrapper and `std::env::current_exe` ask).
     exe: alloc::string::String,
@@ -1147,9 +1132,6 @@ impl Task {
             brk_cur: 0,
             brk_end: 0,
             mmap_cur: MMAP_BASE,
-            sigalt: SIGALT_OFF,
-            sigact: akuma_syscalls_signal::SigTable::new(),
-            sigmask: 0,
             exe: alloc::string::String::new(),
             shared: [(0, 0, 0, 0, 0); MAX_SHARED],
             n_shared: 0,
@@ -1372,55 +1354,6 @@ fn munmap_arm(addr: u64, len: u64) -> u64 {
 
 const RT_SIGSUSPEND: u64 = 130;
 
-/// `rt_sigaction(sig, act, oldact, sigsetsize)`. No signal is ever delivered,
-/// so the handler is recorded and read back, nothing more - but the read-back
-/// must be real: `oldact` is what musl's `signal()` returns.
-fn sigaction_arm(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
-    use akuma_syscalls_signal::{SIGACTION_WIRE, SigTable, from_wire, to_wire};
-    if SigTable::check(sig, act != 0, sigsetsize).is_err() {
-        return e(ring3::err::EINVAL);
-    }
-    let mut new = [0u8; SIGACTION_WIRE];
-    if act != 0 && (!user_ok(act, 32) || !copy_from_user(&mut new, act)) {
-        return e(ring3::err::EFAULT);
-    }
-    if oldact != 0 {
-        let old = with_task(|t| t.sigact.get(sig));
-        if !user_ok(oldact, 32) || !copy_to_user(oldact, &to_wire(&old)) {
-            return e(ring3::err::EFAULT);
-        }
-    }
-    if act != 0 {
-        let _ = with_task(|t| t.sigact.replace(sig, from_wire(&new)));
-    }
-    0
-}
-
-/// `rt_sigprocmask(how, set, oldset, sigsetsize)`: the mask word is kept and
-/// read back (musl's `pthread_sigmask`/`__block_all_sigs` restore what they
-/// read); SIGKILL and SIGSTOP can never be blocked. The algebra is
-/// `akuma_syscalls_signal::procmask`.
-fn sigprocmask_arm(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> u64 {
-    let mut new = [0u8; 8];
-    // The checks that come before any user access (size, then `how` with a set).
-    if akuma_syscalls_signal::procmask(how, 0, (set != 0).then_some(0), sigsetsize).is_err() {
-        return e(ring3::err::EINVAL);
-    }
-    if set != 0 && (!user_ok(set, 8) || !copy_from_user(&mut new, set)) {
-        return e(ring3::err::EFAULT);
-    }
-    let cur = with_task(|t| t.sigmask);
-    if oldset != 0 && (!user_ok(oldset, 8) || !copy_to_user(oldset, &cur.to_le_bytes())) {
-        return e(ring3::err::EFAULT);
-    }
-    if set != 0
-        && let Ok(m) = akuma_syscalls_signal::procmask(how, cur, Some(u64::from_le_bytes(new)), sigsetsize)
-    {
-        with_task(|t| t.sigmask = m);
-    }
-    0
-}
-
 /// `tkill(tid, sig)` / `tgkill(tgid, tid, sig)`. No signal is delivered on this
 /// kernel, so a signal's only effect is the one thing a thread can observe
 /// without a handler running: its blocked `poll`/pipe `read` returns `EINTR`.
@@ -1439,40 +1372,6 @@ fn tkill_arm(tid: u64, sig: u64) -> u64 {
     if sig != 0 {
         akuma_threading::set_thread_interrupted(tid);
         akuma_threading::get_waker_for_thread(tid).wake();
-    }
-    0
-}
-
-/// `sigaltstack`'s disabled state: what a task that never set one reads back.
-const SIGALT_OFF: akuma_syscalls_linux::StackT =
-    akuma_syscalls_linux::StackT { sp: 0, flags: SS_DISABLE, _pad: 0, size: 0 };
-use akuma_syscalls_signal::SS_DISABLE;
-
-/// `sigaltstack(ss, old)`: read back the task's record, then replace it. The
-/// 24-byte `stack_t` is the same layout on both ABIs (`akuma-syscalls-linux`).
-fn sigaltstack_arm(ss: u64, old: u64) -> u64 {
-    if old != 0 {
-        let cur = with_task(|t| t.sigalt);
-        if !user_ok(old, 24) || !copy_to_user(old, struct_bytes(&cur)) {
-            return e(ring3::err::EFAULT);
-        }
-    }
-    if ss != 0 {
-        let mut b = [0u8; 24];
-        if !user_ok(ss, 24) || !copy_from_user(&mut b, ss) {
-            return e(ring3::err::EFAULT);
-        }
-        let sp = u64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
-        let flags = i32::from_le_bytes(b[8..12].try_into().unwrap_or([0; 4]));
-        let size = u64::from_le_bytes(b[16..24].try_into().unwrap_or([0; 8]));
-        use akuma_syscalls_signal::{AltStackChange, AltStackError, altstack_change};
-        let new = match altstack_change(flags, size) {
-            Ok(AltStackChange::Disable) => SIGALT_OFF,
-            Ok(AltStackChange::Install) => akuma_syscalls_linux::StackT { sp, flags, _pad: 0, size },
-            Err(AltStackError::Inval) => return e(ring3::err::EINVAL),
-            Err(AltStackError::NoMem) => return e(ring3::err::ENOMEM),
-        };
-        with_task(|t| t.sigalt = new);
     }
     0
 }
@@ -2011,6 +1910,11 @@ const fn served_by_glue(call: akuma_syscalls_abi::Syscall) -> bool {
             | S::Getrusage
             | S::Getgroups
             | S::Times
+            // Signal dispositions and masks (one table: glue's `tkill` and
+            // SIGPIPE read it, and Rust programs ignore SIGPIPE through it).
+            | S::RtSigaction
+            | S::RtSigprocmask
+            | S::Sigaltstack
             // Sockets (step 2b, with the fd table): AF_INET and AF_UNIX are
             // glue's; `sockaddr` and `msghdr` have one layout on both ABIs.
             | S::Socket
@@ -2318,8 +2222,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             0
         }
-        ring3::nr::RT_SIGACTION => sigaction_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
-        ring3::nr::RT_SIGPROCMASK => sigprocmask_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
         // x86_64 130. No signal is delivered here, so "a signal arrived" has two observable
         // causes: a `tkill` (the thread's interrupt bit) and a child's death (SIGCHLD).
         RT_SIGSUSPEND => {
@@ -2521,7 +2423,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             0
         }
-        akuma_syscalls_abi::x86_64::SIGALTSTACK => sigaltstack_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::TKILL => tkill_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::TGKILL => tkill_arm(fr.arg2(), fr.arg3()),
         // `prctl(157)`: PR_SET_NAME (a tokio program names its threads;
@@ -2959,9 +2860,6 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
         t.mmap_cur = MMAP_BASE;
         t.holes.clear();
         t.n_shared = 0;
-        t.sigalt = SIGALT_OFF;
-        // execve: caught handlers go back to SIG_DFL, ignored ones stay ignored.
-        t.sigact.reset_for_exec();
         // A fresh address space, a fresh region list: `user_ok` checks against
         // exactly what THIS image mapped. Without the reset the 16 region slots
         // fill across spawns and an exec would panic on the append.

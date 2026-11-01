@@ -61,8 +61,6 @@ akuma-cpu = { path = "../crates/akuma-cpu" }
 akuma-cow = { path = "../crates/akuma-cow" }
 # The mmap slab's hole table (first-fit under the bump cursor), host-tested.
 akuma-mmap = { path = "../crates/akuma-mmap" }
-# rt_sigaction's table and rt_sigprocmask's algebra, host-tested.
-akuma-syscalls-signal = { path = "../crates/akuma-syscalls-signal" }
 # The FPU save area's sizes, offsets and power-on image (shared with the amd64 kernel).
 akuma-fpu-amd64 = { path = "../crates/akuma-fpu-amd64" }
 # The CoW fork's per-entry decisions (skip/refuse/descend/copy/share) and free order, host-tested on a fake tree.

@@ -504,7 +504,7 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         TASK_OF.with_mut(|t| t[slot_idx] = slot_idx + 1);
     }
     if !is_thread {
-        let (regions, n_regions, brk_base, brk_cur, brk_end, mmap_cur, sigact, sigmask, holes, exe) =
+        let (regions, n_regions, brk_base, brk_cur, brk_end, mmap_cur, holes, exe) =
             crate::with_task(|t| {
                 (
                     t.regions,
@@ -513,17 +513,11 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
                     t.brk_cur,
                     t.brk_end,
                     t.mmap_cur,
-                    t.sigact,
-                    t.sigmask,
                     t.holes,
                     t.exe.clone(),
                 )
             });
         crate::with_task_slot(slot_idx + 1, |ct| {
-        // fork: handlers and the mask are inherited (a child that resets
-        // SIGPIPE reads back what its parent had installed).
-        ct.sigact = sigact;
-        ct.sigmask = sigmask;
         ct.holes = holes;
         ct.exe = exe;
         ct.root_pa = root_pa;
@@ -903,6 +897,13 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     // each released through the runtime hooks (the table is the process's).
     if let Some(p) = akuma_exec::process::current_process_shared() {
         p.close_cloexec_fds_releasing();
+        // execve: caught handlers go back to the default, ignored ones stay
+        // ignored (the handler addresses named the old image).
+        for a in p.signal_actions.actions.lock().iter_mut() {
+            if matches!(a.handler, akuma_exec::process::SignalHandler::UserFn(_)) {
+                *a = akuma_exec::process::SignalAction::default();
+            }
+        }
     }
     // The registered Process's shared root view goes stale with the old
     // image — re-point it, as `exec_replace` does for the shell.
@@ -1477,7 +1478,8 @@ pub fn sigsuspend_arm(fr: &mut ring3::SyscallFrame, mask_va: u64, sigsetsize: u6
     // SIGKILL (9) and SIGSTOP (19) can never be blocked.
     let unblockable = (1u64 << 8) | (1u64 << 18);
     let new = u64::from_le_bytes(b) & !unblockable;
-    let old = crate::with_task(|t| core::mem::replace(&mut t.sigmask, new));
+    let old = akuma_exec::threading::thread_signal_mask();
+    akuma_exec::threading::set_thread_signal_mask(new);
     let my_pid = group_pid(me);
     let mut child_died = false;
     loop {
@@ -1517,7 +1519,7 @@ pub fn sigsuspend_arm(fr: &mut ring3::SyscallFrame, mask_va: u64, sigsetsize: u6
     if child_died && deliver_sigchld(fr, new, old) {
         return crate::e(crate::EINTR);
     }
-    crate::with_task(|t| t.sigmask = old);
+    akuma_exec::threading::set_thread_signal_mask(old);
     crate::e(crate::EINTR)
 }
 
@@ -1563,10 +1565,18 @@ fn unpack_frame(f: &mut ring3::SyscallFrame, w: &[u64; FRAME_WORDS]) {
 /// finds the saved block at its `rsp`. The kernel reads the block back itself, so its layout is
 /// private to [`deliver_sigchld`] and [`sigreturn_arm`].
 fn deliver_sigchld(fr: &mut ring3::SyscallFrame, cur_mask: u64, restore_mask: u64) -> bool {
-    use akuma_syscalls_signal::{SIG_DFL, SIG_IGN};
-    let act = crate::with_task(|t| t.sigact.get(SIGCHLD));
-    let (handler, flags, restorer, sa_mask) = (act[0], act[1], act[2], act[3]);
-    if handler == SIG_DFL || handler == SIG_IGN || flags & SA_RESTORER == 0 || flags & SA_SIGINFO != 0 {
+    // The disposition is the process's, in `akuma-exec`'s table (glue's
+    // `rt_sigaction` writes it).
+    let Some(act) = akuma_exec::process::current_process_shared()
+        .map(|p| p.signal_actions.actions.lock()[(SIGCHLD - 1) as usize])
+    else {
+        return false;
+    };
+    let akuma_exec::process::SignalHandler::UserFn(handler) = act.handler else {
+        return false;
+    };
+    let (handler, flags, restorer, sa_mask) = (handler as u64, act.flags, act.restorer as u64, act.mask);
+    if flags & SA_RESTORER == 0 || flags & SA_SIGINFO != 0 {
         return false;
     }
     if cur_mask & (1 << (SIGCHLD - 1)) != 0 {
@@ -1595,7 +1605,7 @@ fn deliver_sigchld(fr: &mut ring3::SyscallFrame, cur_mask: u64, restore_mask: u6
         return false;
     }
     let during = cur_mask | sa_mask | if flags & SA_NODEFER == 0 { 1 << (SIGCHLD - 1) } else { 0 };
-    crate::with_task(|t| t.sigmask = during & !((1u64 << 8) | (1u64 << 18)));
+    akuma_exec::threading::set_thread_signal_mask(during);
     fr.user_rip = handler;
     fr.rdi = SIGCHLD;
     fr.rsi = 0;
@@ -1627,7 +1637,7 @@ pub fn sigreturn_arm(fr: &mut ring3::SyscallFrame) -> u64 {
     words[14] = (words[14] & 0x0000_0CD5) | 0x202;
     unpack_frame(fr, &words);
     ring3::set_user_rsp_stash(user_rsp);
-    crate::with_task(|t| t.sigmask = mask & !((1u64 << 8) | (1u64 << 18)));
+    akuma_exec::threading::set_thread_signal_mask(mask);
     // The dispatcher stores this in RAX: the interrupted call's own result.
     words[12]
 }
