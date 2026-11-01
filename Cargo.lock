@@ -964,6 +964,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-user-layout"
+version = "0.1.0"
+dependencies = [
+ "akuma-mmap",
+ "akuma-user-walk",
+]
+
+[[package]]
 name = "akuma-user-space"
 version = "0.1.0"
 dependencies = [
@@ -1361,6 +1369,7 @@ dependencies = [
  "akuma-trap-amd64",
  "akuma-tty",
  "akuma-user-access",
+ "akuma-user-layout",
  "akuma-user-tree",
  "akuma-user-walk",
  "akuma-vfs",

@@ -1,0 +1,14 @@
+[package]
+name = "akuma-user-layout"
+version = "0.1.0"
+edition = "2024"
+description = "The layout half of a user address space on a kernel that maps eagerly: the regions a user pointer may name, the brk window, the mmap slab with its bump cursor and hole table, and the writable shared-file mappings to copy back - plus the brk/mmap/munmap/mremap decisions over them. No page tables, frames or files: the kernel performs every effect. Extracted from Taoxichuan's Task record."
+
+[lints]
+workspace = true
+
+[dependencies]
+# `HoleSet`: the slab's free-hole algebra (first-fit reuse, merge, cursor lowering).
+akuma-mmap = { path = "../akuma-mmap" }
+# `in_regions`: the one user-pointer range check, shared with the page walkers.
+akuma-user-walk = { path = "../akuma-user-walk" }

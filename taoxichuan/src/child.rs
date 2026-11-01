@@ -238,27 +238,12 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         TASK_OF.with_mut(|t| t[slot_idx] = slot_idx + 1);
     }
     if !is_thread {
-        let (regions, n_regions, brk_base, brk_cur, brk_end, mmap_cur, holes) =
-            crate::with_task(|t| {
-                (
-                    t.regions,
-                    t.n_regions,
-                    t.brk_base,
-                    t.brk_cur,
-                    t.brk_end,
-                    t.mmap_cur,
-                    t.holes,
-                )
-            });
+        // The child's layout is the parent's, minus the shared file mappings: its copies of
+        // those pages are private, and writing them back would put its bytes in the file.
+        let layout = crate::with_task(|t| t.layout.fork());
         crate::with_task_slot(slot_idx + 1, |ct| {
-        ct.holes = holes;
         ct.root_pa = root_pa;
-        ct.regions = regions;
-        ct.n_regions = n_regions;
-        ct.brk_base = brk_base;
-        ct.brk_cur = brk_cur;
-        ct.brk_end = brk_end;
-        ct.mmap_cur = mmap_cur;
+        ct.layout = layout;
         ct.exit = None;
         // The descriptors are the registered Process's: `fork_process` deep-cloned
         // its table (pipe and socket references taken, epoll fds stripped).

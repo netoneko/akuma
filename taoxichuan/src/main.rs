@@ -289,20 +289,11 @@ pub(crate) const STACK_MAX: u64 = 8 << 20;
 /// map the zeroed pages between the fault and the region, widen the region,
 /// and let the instruction retry. False for any other fault.
 fn grow_user_stack(cr2: u64) -> bool {
-    let limit = USER_STACK_TOP - STACK_MAX;
-    if cr2 >= USER_STACK_TOP || cr2 < limit {
-        return false;
-    }
-    let Some((root, ri, lo)) = with_task(|tk| {
-        let ri = tk.regions[..tk.n_regions].iter().position(|&(_, e)| e == USER_STACK_TOP)?;
-        Some((tk.root_pa, ri, tk.regions[ri].0))
-    }) else {
+    let Some((root, (first, lo))) =
+        with_task(|tk| Some((tk.root_pa, tk.layout.growth_below(USER_STACK_TOP, STACK_MAX, cr2)?)))
+    else {
         return false;
     };
-    if cr2 >= lo {
-        return false;
-    }
-    let first = cr2 & !0xFFF;
     let mut page = lo;
     while page > first {
         page -= 4096;
@@ -313,8 +304,7 @@ fn grow_user_stack(cr2: u64) -> bool {
             return false;
         }
     }
-    with_task(|tk| tk.regions[ri].0 = first);
-    true
+    with_task(|tk| tk.layout.extend_down(USER_STACK_TOP, first))
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,32 +1092,18 @@ fn inode_size(inode: u32) -> Option<u64> {
     root_fs().metadata_by_inode(inode).ok().map(|md| md.size)
 }
 
-/// A task's memory record: its root page table, the user ranges a pointer may
-/// name, the heap and mmap cursors, its shared mappings, and the exit code
-/// once captured. Descriptors, cwd and signal state are the registered
-/// `akuma-exec` Process's.
+/// A task's memory record: its root page table, its layout (the user ranges a pointer may
+/// name, the brk window, the mmap slab and its holes, the writable shared file mappings -
+/// `akuma-user-layout`, whose decisions the memory arms below act on), and the exit code once
+/// captured. Descriptors, cwd and signal state are the registered `akuma-exec` Process's.
 struct Task {
     root_pa: u64,
-    regions: [(u64, u64); 16],
-    n_regions: usize,
-    brk_base: u64,
-    brk_cur: u64,
-    brk_end: u64,
-    mmap_cur: u64,
-    /// Writable `MAP_SHARED` file mappings: `(base, len, inode, file offset,
-    /// file size at map time)`. The pages are private frames filled from the
-    /// file (there is no page cache), so they are copied back on `munmap`,
-    /// `msync`, exec and exit - what `rust-lld`'s `FileOutputBuffer` needs to
-    /// leave a real ELF behind (`docs/archive/AKUMA_SELF_HOSTING.md`).
-    shared: [(u64, u64, u32, u64, u64); MAX_SHARED],
-    n_shared: usize,
-    /// Unmapped holes below `mmap_cur` in the mmap slab, sorted by nothing,
-    /// merged when they touch: `munmap` records them, `mmap` reuses them
-    /// first-fit before bumping the cursor. Full table: the hole is leaked
-    /// (the frames are still freed).
-    holes: akuma_mmap::HoleSet<MAX_HOLES>,
+    layout: UserLayout,
     exit: Option<u64>,
 }
+
+/// 16 user regions, [`MAX_HOLES`] slab holes, [`MAX_SHARED`] shared file mappings.
+type UserLayout = akuma_user_layout::Layout<16, MAX_HOLES, MAX_SHARED>;
 
 /// The task records. A [`BorrowCell`](akuma_primitives::cell::BorrowCell): reached only through [`with_task`] /
 /// [`with_task_slot`] / [`with_tasks`] / [`task_root_of`], so two overlapping borrows are a panic naming the bug. A closure
@@ -1143,19 +1119,7 @@ static TASK_SLOT: [core::sync::atomic::AtomicUsize; smp::MAX_CPUS] =
 
 impl Task {
     const fn new() -> Self {
-        Self {
-            root_pa: 0,
-            regions: [(0, 0); 16],
-            n_regions: 0,
-            brk_base: 0,
-            brk_cur: 0,
-            brk_end: 0,
-            mmap_cur: MMAP_BASE,
-            shared: [(0, 0, 0, 0, 0); MAX_SHARED],
-            n_shared: 0,
-            holes: akuma_mmap::HoleSet::new(),
-            exit: None,
-        }
+        Self { root_pa: 0, layout: UserLayout::new(MMAP_BASE, MMAP_SLAB), exit: None }
     }
 }
 
@@ -1256,24 +1220,6 @@ fn release_pages(root: u64, start: u64, end: u64) {
     smp::shootdown();
 }
 
-/// Record `[start, end)` of the mmap slab as unmapped: lower the cursor when
-/// the hole touches it, else add it to the hole table, merging with any hole
-/// it overlaps or abuts. The algebra is `akuma_mmap::HoleSet`.
-fn add_hole(t: &mut Task, start: u64, end: u64) {
-    t.holes.add(&mut t.mmap_cur, start, end);
-}
-
-/// Take `[start, end)` out of the hole table (a `MAP_FIXED` landed there).
-fn carve_hole(t: &mut Task, start: u64, end: u64) {
-    t.holes.carve(start, end);
-}
-
-/// A fresh `bytes`-long (page multiple) range of the mmap slab: first-fit from
-/// the holes, else the bump cursor. `None` when the slab is exhausted.
-fn mmap_alloc(t: &mut Task, bytes: u64) -> Option<u64> {
-    t.holes.alloc(&mut t.mmap_cur, MMAP_BASE + MMAP_SLAB, bytes)
-}
-
 /// Copy the pages of every writable `MAP_SHARED` file mapping that overlap
 /// `[lo, hi)` back to their files (clamped to the file's size at map time),
 /// and with `forget` drop the records wholly inside the range.
@@ -1281,10 +1227,9 @@ fn mmap_alloc(t: &mut Task, bytes: u64) -> Option<u64> {
 fn shared_writeback(lo: u64, hi: u64, forget: bool) {
     // The records and the root are copied out and the task borrow is closed for the whole walk: the loop does file I/O
     // and `read_bytes`, and nothing in it may find the record borrowed. The (possibly shortened) table goes back at the end.
-    let (root_pa, mut shared, mut n_shared) = with_task(|t| (t.root_pa, t.shared, t.n_shared));
-    let mut i = 0;
-    while i < n_shared {
-        let (base, len, ino, off, fsize) = shared[i];
+    let (root_pa, layout) = with_task(|t| (t.root_pa, t.layout));
+    for f in layout.shared() {
+        let (base, len, ino, off, fsize) = (f.base, f.len, f.inode, f.offset, f.size);
         let (s, e) = (base.max(lo), (base + len).min(hi));
         if s < e {
             let mut va = s & !0xFFF;
@@ -1301,26 +1246,17 @@ fn shared_writeback(lo: u64, hi: u64, forget: bool) {
                 }
                 va += 4096;
             }
-            if forget && s == base && e == base + len {
-                n_shared -= 1;
-                shared[i] = shared[n_shared];
-                continue;
-            }
         }
-        i += 1;
     }
     if forget {
-        with_task(|t| {
-            t.shared = shared;
-            t.n_shared = n_shared;
-        });
+        with_task(|t| t.layout.forget_shared_within(lo, hi));
     }
 }
 
 /// Write back every shared file mapping the running task still holds (exit,
 /// exec): the mapping dies with the address space.
 pub(crate) fn shared_flush_all() {
-    if with_task(|t| t.n_shared) != 0 {
+    if with_task(|t| !t.layout.shared().is_empty()) {
         shared_writeback(0, u64::MAX, true);
     }
 }
@@ -1337,25 +1273,18 @@ fn msync_arm(addr: u64, len: u64) -> u64 {
 /// `munmap(addr, len)` for the mmap slab: free the frames, record the hole.
 /// Ranges outside the slab (the brk area, a stack) are accepted and ignored.
 fn munmap_arm(addr: u64, len: u64) -> u64 {
-    if addr & 0xFFF != 0 || len == 0 {
-        return e(ring3::err::EINVAL);
-    }
-    let Some(bytes) = len.checked_add(0xFFF).map(|l| l & !0xFFF) else {
-        return e(ring3::err::EINVAL);
+    let (addr, end) = match with_task(|t| t.layout.munmap(addr, len)) {
+        Err(_) => return e(ring3::err::EINVAL),
+        Ok(None) => return 0,
+        Ok(Some(r)) => r,
     };
-    let Some(end) = addr.checked_add(bytes) else {
-        return e(ring3::err::EINVAL);
-    };
-    if addr < MMAP_BASE || end > MMAP_BASE + MMAP_SLAB {
-        return 0;
-    }
     if mmdbg() & 1 == 0 {
         return 0;
     }
     shared_writeback(addr, end, true);
     mm_event(1, addr, end);
     release_pages(task_root(), addr, end);
-    with_task(|t| add_hole(t, addr, end));
+    with_task(|t| t.layout.release(addr, end));
     0
 }
 
@@ -1412,17 +1341,16 @@ pub(crate) fn task_root() -> u64 {
 }
 
 fn add_region(start: u64, end: u64) {
-    with_task(|t| {
-        t.regions[t.n_regions] = (start, end);
-        t.n_regions += 1;
-    });
+    if !with_task(|t| t.layout.add_region(start, end)) {
+        akuma_primitives::safe_print!(96, "[exec] region table full: [{:#x}, {:#x}) is not user memory\n", start, end);
+    }
 }
 
 /// Is `[va, va+len)` fully inside a region this kernel mapped for the task?
 /// The check that makes `write(1, ptr, len)` honest: a bogus pointer is
 /// `-EFAULT`, not a kernel fault.
 fn user_ok(va: u64, len: u64) -> bool {
-    with_task(|t| akuma_user_walk::in_regions(&t.regions[..t.n_regions], va, len))
+    with_task(|t| t.layout.user_ok(va, len))
 }
 
 /// errno returns are the negated value in `RAX` — plain wrapping arithmetic
@@ -1991,15 +1919,13 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         akuma_syscalls_abi::x86_64::BRK => {
             let want = fr.arg1();
-            let (brk_base, brk_end, brk_cur, root) = with_task(|t| (t.brk_base, t.brk_end, t.brk_cur, t.root_pa));
-            if want < brk_base || want >= brk_end {
-                return brk_cur; // failure: Linux returns the *old* break
+            let (plan, brk_cur, root) = with_task(|t| (t.layout.brk_plan(want), t.layout.brk(), t.root_pa));
+            // Linux's failure value is the *old* break; a shrink is bookkeeping only (no unmap).
+            if plan == akuma_user_layout::Brk::Refuse {
+                return brk_cur;
             }
-            if want > brk_cur {
-                // Grow: map fresh zeroed pages. Shrink is a bookkeeping move
-                // (no unmap) — a `printf`-and-exit task never asks for it.
-                let mut page = brk_cur & !0xFFF;
-                let end = (want + 0xFFF) & !0xFFF;
+            if let akuma_user_layout::Brk::Grow { from, to: end } = plan {
+                let mut page = from;
                 while page < end {
                     let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
                         return brk_cur;
@@ -2010,7 +1936,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     page += 4096;
                 }
             }
-            with_task(|t| t.brk_cur = want);
+            with_task(|t| t.layout.set_brk(want));
             want
         }
         ring3::nr::ARCH_PRCTL => {
@@ -2084,22 +2010,21 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
             }
             let root = task_root();
-            let pages = (len + 0xFFF) & !0xFFF;
-            let base = if flags & ring3::mmap::MAP_FIXED != 0
-                && addr >= MMAP_BASE
-                && addr + pages <= MMAP_BASE + MMAP_SLAB
-            {
+            let Some(pages) = akuma_user_layout::page_span(len) else {
+                return e(ring3::err::ENOMEM);
+            };
+            let base = if flags & ring3::mmap::MAP_FIXED != 0 && with_task(|t| t.layout.in_slab(addr, pages)) {
                 // Replacing whatever was there (musl's ldso maps each PT_LOAD
                 // over its anonymous reservation): the old frames go back, and
                 // the range leaves the hole table.
                 if mmdbg() & 2 != 0 {
                     mm_event(2, addr, addr + pages);
                     release_pages(root, addr, addr + pages);
-                    with_task(|t| carve_hole(t, addr, addr + pages));
+                    with_task(|t| t.layout.carve(addr, addr + pages));
                 }
                 addr
             } else {
-                match with_task(|t| mmap_alloc(t, pages)) {
+                match with_task(|t| t.layout.alloc(pages)) {
                     Some(b) => b,
                     None => return e(ring3::err::ENOMEM),
                 }
@@ -2152,23 +2077,12 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             // A MAP_FIXED mapping lands inside an earlier reservation, BELOW
             // `mmap_cur`: only a mapping above the cursor moves it.
-            with_task(|t| {
-                if base + pages > t.mmap_cur {
-                    t.mmap_cur = base + pages;
-                }
-            });
+            with_task(|t| t.layout.note_mapped(base + pages));
             if let Some(node) = fnode {
                 const MAP_SHARED: u64 = 0x1;
                 if flags & MAP_SHARED != 0 && prot & ring3::mmap::PROT_WRITE != 0 {
-                    let recorded = with_task(|t| {
-                        if t.n_shared < MAX_SHARED {
-                            t.shared[t.n_shared] = (base, pages, node, off, fsize);
-                            t.n_shared += 1;
-                            true
-                        } else {
-                            false
-                        }
-                    });
+                    let f = akuma_user_layout::SharedFile { base, len: pages, inode: node, offset: off, size: fsize };
+                    let recorded = with_task(|t| t.layout.add_shared(f));
                     if !recorded {
                         akuma_primitives::safe_print!(96, "[mmap] shared-file table full: writes to this mapping are lost\n");
                     }
@@ -2207,25 +2121,26 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if old_sz == 0 || !user_ok(old, old_sz) {
                 return e(ring3::err::EFAULT);
             }
-            let old_pages = (old_sz + 0xFFF) & !0xFFF;
-            let new_pages = (new_sz + 0xFFF) & !0xFFF;
             let root = task_root();
-            let mmap_cur = with_task(|t| t.mmap_cur);
-            let in_slab = old >= MMAP_BASE && old + old_pages <= MMAP_BASE + MMAP_SLAB;
-            if new_pages <= old_pages {
-                if in_slab && new_pages < old_pages && mmdbg() & 4 != 0 {
-                    mm_event(3, old + new_pages, old + old_pages);
-                    release_pages(root, old + new_pages, old + old_pages);
-                    with_task(|t| add_hole(t, old + new_pages, old + old_pages));
+            let Ok(plan) = with_task(|t| t.layout.mremap(old, old_sz, new_sz)) else {
+                return e(ring3::err::EINVAL);
+            };
+            // Both page-rounded; `mremap` above refused a size that does not round.
+            let (old_pages, new_pages) = (old_sz.div_ceil(4096) * 4096, new_sz.div_ceil(4096) * 4096);
+            if let akuma_user_layout::Mremap::Shrink { release } = plan {
+                if let Some((lo, hi)) = release
+                    && mmdbg() & 4 != 0
+                {
+                    mm_event(3, lo, hi);
+                    release_pages(root, lo, hi);
+                    with_task(|t| t.layout.release(lo, hi));
                 }
                 return old;
             }
             // In place: the range is the topmost thing in the slab.
-            if in_slab && old + old_pages == mmap_cur
-                && old + new_pages <= MMAP_BASE + MMAP_SLAB
-            {
-                let mut page = old + old_pages;
-                while page < old + new_pages {
+            if let akuma_user_layout::Mremap::InPlace { from, to } = plan {
+                let mut page = from;
+                while page < to {
                     let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
                         return e(ring3::err::ENOMEM);
                     };
@@ -2234,10 +2149,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     }
                     page += 4096;
                 }
-                with_task(|t| t.mmap_cur = old + new_pages);
+                with_task(|t| t.layout.note_mapped(to));
                 return old;
             }
-            let Some(base) = with_task(|t| mmap_alloc(t, new_pages)) else {
+            let release_old = matches!(plan, akuma_user_layout::Mremap::Move { release_old: true });
+            let Some(base) = with_task(|t| t.layout.alloc(new_pages)) else {
                 return e(ring3::err::ENOMEM);
             };
             let mut page = base & !0xFFF;
@@ -2262,10 +2178,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
                 done += n as u64;
             }
-            if in_slab && mmdbg() & 4 != 0 {
+            if release_old && mmdbg() & 4 != 0 {
                 mm_event(4, old, old + old_pages);
                 release_pages(root, old, old + old_pages);
-                with_task(|t| add_hole(t, old, old + old_pages));
+                with_task(|t| t.layout.release(old, old + old_pages));
             }
             base
         }
@@ -2567,7 +2483,7 @@ fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
 
 /// Is `va` inside a writable `MAP_SHARED` file mapping of the running task?
 fn in_shared_span(va: u64) -> bool {
-    with_task(|t| t.shared[..t.n_shared].iter().any(|&(base, len, ..)| va >= base && va < base + len))
+    with_task(|t| t.layout.in_shared(va))
 }
 
 /// Release a page-table subtree built by [`clone_user_tree`]: `depth` levels
@@ -2595,13 +2511,9 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     let img = ring3::Image::parse(image).ok()?;
     with_task(|t| {
         t.exit = None;
-        t.mmap_cur = MMAP_BASE;
-        t.holes.clear();
-        t.n_shared = 0;
         // A fresh address space, a fresh region list: `user_ok` checks against
-        // exactly what THIS image mapped. Without the reset the 16 region slots
-        // fill across spawns and an exec would panic on the append.
-        t.n_regions = 0;
+        // exactly what THIS image mapped.
+        t.layout.reset_for_exec();
     });
 
     // The task's root: a fresh page table whose upper half is the kernel's
@@ -2796,11 +2708,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // The heap slabs: `brk` above the image, `mmap` in its own window. Both
     // registered now, so a pointer check is one scan.
     let brk0 = (img.image_end() + 0xFFF) & !0xFFF;
-    with_task(|t| {
-        t.brk_base = brk0;
-        t.brk_cur = brk0;
-        t.brk_end = brk0 + BRK_SLAB;
-    });
+    with_task(|t| t.layout.set_brk_window(brk0, BRK_SLAB));
     add_region(brk0, brk0 + BRK_SLAB);
     add_region(MMAP_BASE, MMAP_BASE + MMAP_SLAB);
 

@@ -125,6 +125,8 @@ akuma-lapic-amd64 = { path = "../crates/akuma-lapic-amd64" }
 # The machine half of the scheduler (switch / can_run / FP state), shared with the metal kernel.
 akuma-sched-amd64 = { path = "../crates/akuma-sched-amd64" }
 akuma-user-walk = { path = "../crates/akuma-user-walk" }
+# A task's layout: regions, the brk window, the mmap slab and its holes, shared file mappings.
+akuma-user-layout = { path = "../crates/akuma-user-layout" }
 akuma-pte-amd64 = { path = "../crates/akuma-pte-amd64" }
 akuma-port = { path = "../crates/akuma-port" }
 # The shared syscall bodies (TAOXICHUAN_CLEANUP_PLAN.md step 2c): arms move

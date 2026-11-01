@@ -70,7 +70,7 @@
   "crates/akuma-syscalls": 6,
   "crates/akuma-syscalls-abi": 2,
   "crates/akuma-syscalls-eventfd": 7,
-  "crates/akuma-syscalls-glue": 466,
+  "crates/akuma-syscalls-glue": 469,
   "crates/akuma-syscalls-glue-amd64": 7,
   "crates/akuma-syscalls-ipc": 19,
   "crates/akuma-syscalls-linux": 25,
@@ -91,6 +91,7 @@
   "crates/akuma-usb": 23,
   "crates/akuma-usb-storage": 2,
   "crates/akuma-user-access": 29,
+  "crates/akuma-user-layout": 15,
   "crates/akuma-user-space": 4,
   "crates/akuma-user-walk": 12,
   "crates/akuma-vfs": 58,
@@ -101,5 +102,5 @@
   "crates/akuma-wifi": 49,
   "crates/akuma-wpa": 75,
   "crates/akuma-xhci": 27,
-  "taoxichuan/src": 146
+  "taoxichuan/src": 138
 }
