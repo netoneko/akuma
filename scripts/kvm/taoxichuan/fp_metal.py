@@ -2,7 +2,8 @@
 """fp_metal.py K0 SHA - Taoxichuan's self-hosting fixed point on the ryzen under Akuma's own hypervisor.
 
 K0 is a Taoxichuan kernel built on the Mac from SHA (`--features no-tests,trace-err`); SHA must be pushed, because
-the guest fetches it from GitHub. For each generation n = 1, 2: boot K(n-1) as a `herd vm-run` guest on a fresh copy
+the guest fetches it from GitHub, and is expanded to all 40 digits here (GitHub serves a commit to a shallow fetch
+only by its full name; a short one fails the guest's fetch). For each generation n = 1, 2: boot K(n-1) as a `herd vm-run` guest on a fresh copy
 of the toolchain image, build SHA inside it, pull K(n) out of the guest's disk with `debugfs dump` (the guest sshd's
 large output is lossy), and finally require K1 == K2 byte for byte (docs/archive/TAOXICHUAN_FIXED_POINT.md).
 
@@ -138,6 +139,12 @@ def main(argv):
         print(__doc__)
         return 2
     k0, sha = argv
+    try:
+        sha = subprocess.run(["git", "rev-parse", "--verify", "-q", f"{sha}^{{commit}}"], capture_output=True,
+                             text=True, check=True).stdout.strip()
+    except subprocess.CalledProcessError:
+        print(f"fp_metal: {sha} is not a commit here", file=sys.stderr)
+        return 2
     log(f"fixed point of {sha}, K0 {k0}, {VCPUS} vCPUs, {RAM} MiB")
     k1, m1 = generation(1, k0, sha)
     k2, m2 = generation(2, k1, sha)
