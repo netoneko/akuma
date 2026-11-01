@@ -19,10 +19,12 @@
 //! `akuma_exec::runtime::register`, and `ThreadRuntime` + `ThreadConfig` +
 //! `ProcessHooks` + `X86ArchHooks` through `akuma_threading`'s register fns.
 //!
-//! The one-clock rule: [`uptime_us`] is `akuma_lapic_amd64::ticks()` ×
-//! `US_PER_TICK_TARGET` — the PIT-calibrated LAPIC tick IS the clock, and
-//! both tables get the same function so the scheduler and `akuma-exec`
-//! cannot disagree about what time it is (amd64's reason, verbatim).
+//! The one-clock rule: both tables get `crate::net::uptime_us` (the
+//! calibrated TSC), so the scheduler, `akuma-exec`, `akuma_primitives::clock`
+//! (glue's time syscalls), futex deadlines and smoltcp cannot disagree about
+//! what time it is (amd64's reason, verbatim). Until 2026-11-01 these tables
+//! read the LAPIC tick (10 ms steps) while the time syscalls read the TSC;
+//! one clock is what let those syscalls move to glue.
 //!
 //! Slot space, until `fork_process` (slice 3) unifies it with
 //! `akuma-threading`'s: the spawn ring (`child.rs`'s `SpawnSlot` indices) —
@@ -71,13 +73,6 @@ static SHELL_THREAD_TID: core::sync::atomic::AtomicUsize = core::sync::atomic::A
 #[must_use]
 pub fn shell_tid() -> usize {
     SHELL_THREAD_TID.load(core::sync::atomic::Ordering::Relaxed)
-}
-
-/// The twin's clock: ticks × 10 ms. `saturating_mul` so a ~584-million-year
-/// uptime wraps to "forever" instead of truncating into the past.
-#[must_use]
-pub fn uptime_us() -> u64 {
-    akuma_lapic_amd64::ticks().saturating_mul(u64::from(akuma_lapic_amd64::US_PER_TICK_TARGET))
 }
 
 // ── the X86ArchHooks bodies (the per-core machine effects) ──────────────────
@@ -132,7 +127,13 @@ pub(crate) extern "C" fn idle_main() -> ! {
         crate::net::netpoll();
         crate::smp::bkl_leave();
         crate::exec_twin::tick_window();
-        if akuma_threading::x86_runnable_exists() {
+        // A sleeper whose deadline has passed is still WAITING: only the wake
+        // pass inside `x86_yield` readies it. So a due deadline is a reason to
+        // yield too, or a timed park (glue's `nanosleep`, a `poll`/`epoll`
+        // timeout) on an otherwise idle core never expires. amd64's wait
+        // loops ask the same question (`amd64/src/net.rs`).
+        let due = akuma_threading::wake_is_due(akuma_threading::x86_earliest_wake_time(), crate::net::uptime_us());
+        if due || akuma_threading::x86_runnable_exists() {
             #[cfg(feature = "trace-err")]
             {
                 idle_laps = 0;
@@ -200,10 +201,8 @@ pub fn init() {
     // ExecRuntime first: its registration also points `akuma_primitives`'
     // shared `safe_print!` sink and clock hook at this kernel (the console
     // hook is the same `console::puts` `kernel_main` already set, so the
-    // print side is a no-op there; the clock hook switches the primitives'
-    // diagnostic timestamps to the tick clock — taoxichuan's own time
-    // syscalls keep reading `net::uptime_us` explicitly, so nothing else
-    // moves).
+    // print side is a no-op there; the clock hook is the TSC, which glue's
+    // time syscalls read).
     akuma_exec::runtime::register(exec_runtime(), exec_config());
 
     // The scheduler's platform table + tuning knobs. The four IPI/IRQ-bound
@@ -258,7 +257,7 @@ fn transfer_lock_depth(from: usize, to: usize) {
 
 fn thread_runtime() -> ThreadRuntime {
     ThreadRuntime {
-        uptime_us,
+        uptime_us: crate::net::uptime_us,
         trigger_sgi: |_| crate::smp::kick_halted_core(),
         wake_core: |_| {},
         wake_remote_idle: || false,
@@ -315,7 +314,7 @@ fn process_hooks() -> ProcessHooks {
 fn exec_runtime() -> ExecRuntime {
     ExecRuntime {
         // ── real ──────────────────────────────────────────────────────────
-        uptime_us,
+        uptime_us: crate::net::uptime_us,
         // IF discipline is already this kernel's rule (the syscall
         // instruction masks; nothing in the kernel unmasks), so these are
         // the honest `cli`/`sti` pair, same shape as amd64's `daif` calls.
@@ -538,7 +537,9 @@ fn exec_config() -> ExecConfig {
         default_thread_stack_size: akuma_ring3_amd64::SYSCALL_STACK_SIZE,
         system_thread_stack_size: akuma_ring3_amd64::SYSCALL_STACK_SIZE,
         user_thread_stack_size: akuma_ring3_amd64::SYSCALL_STACK_SIZE,
-        user_stack_size: akuma_ring3_amd64::SYSCALL_STACK_SIZE,
+        // What glue's `prlimit64(RLIMIT_STACK)` reports (nothing else reads it on
+        // this kernel: the loader is its own): the 8 MiB the main stack may grow to.
+        user_stack_size: crate::STACK_MAX as usize,
         enable_stack_canaries: false,
         stack_canary: 0,
         canary_words: 0,

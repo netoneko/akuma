@@ -461,6 +461,9 @@ syscall_table! {
     SetTidAddress => SET_TID_ADDRESS = 218, nr::SET_TID_ADDRESS;
     SetRobustList => SET_ROBUST_LIST = 273, nr::SET_ROBUST_LIST;
     Prlimit64  => PRLIMIT64  = 302, nr::PRLIMIT64;
+    /// musl reaches it only when `prlimit64` answers `ENOSYS`; a program that
+    /// issues it by hand gets glue's `prlimit64(0, …)` answer.
+    Getrlimit  => GETRLIMIT  = 97,  nr::GETRLIMIT;
 
     // ── identity ───────────────────────────────────────────────────────────
     // What these *return* on the amd64 target is a separate question from what

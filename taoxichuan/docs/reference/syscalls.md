@@ -115,7 +115,7 @@ Rows of the table below for calls served by glue are historical until the sweep
 | 25 | mremap | dispatch (main.rs) | this kernel | MAYMOVE grow copies; shrink keeps the address; MREMAP_FIXED refused |
 | 32 | dup | dispatch DUP (main.rs) | akuma-fdtable | materializes `Session` for stdio; pipe ends get `clone_ref` |
 | 33 | dup2 | dispatch (main.rs) | akuma-fdtable `dup_to` | displaced sockets/pipes released; old==new → newfd if open |
-| 35 | nanosleep | dispatch (main.rs) | child::sleep_us over the TSC clock | ≤60 s per call; pumps the NIC each lap |
+| 35 | nanosleep | glue (`served_by_glue`) | `akuma-syscalls-time` park on the TSC clock | no cap; a `tkill` wakes it with EINTR; both spellings (pointer, raw sec/nanos) |
 | 39 | getpid | dispatch (main.rs) | child::current_pid | also matched at 38 (ring3 table archaeology) |
 | 41 | socket | `socket_arm` (sock.rs) | akuma-net socket table | AF_INET, STREAM/DGRAM; NONBLOCK/CLOEXEC stick |
 | 42 | connect | `connect_arm` (sock.rs) | akuma-net; kernel-side wait with `[cx]` trace | 15 s cap; ETIMEDOUT/ECONNREFUSED |
@@ -142,7 +142,8 @@ Rows of the table below for calls served by glue are historical until the sweep
 | 79 | getcwd | dispatch (main.rs) | — | always "/"; no working directory exists |
 | 91 | fchmod | dispatch (main.rs) | — | 0: root's mode is the mode |
 | 95 | umask | dispatch (main.rs) | — | 0o022, conventional; nothing inherits it |
-| 96 | gettimeofday | dispatch (main.rs) | primitives::clock over TSC | wall time with an `epoch=` anchor, else zeros |
+| 96 | gettimeofday | `akuma-syscalls-glue-amd64` (x86-only number) | primitives::clock over TSC | wall time with an `epoch=` anchor, else boot-relative |
+| 201 | time | `akuma-syscalls-glue-amd64` (x86-only number) | as gettimeofday | seconds; also written through `tloc` |
 | 102/104/107/108 | getuid/getgid/geteuid/getegid | dispatch (main.rs) | — | 0 |
 | 110 | getppid | dispatch (main.rs) | — | 1: everything is the init task's child |
 | 137 | statfs | dispatch STATFS (main.rs) | akuma-ext2 `stats()` (real superblock) | prints a `[statfs]` evidence line per call |
@@ -151,8 +152,9 @@ Rows of the table below for calls served by glue are historical until the sweep
 | 186 | gettid | dispatch (main.rs) | — | 1: one task |
 | 217 | getdents64 | dispatch (main.rs) | syscalls-linux dirent over the open-time cached listing | d_ino = 0; d_off is a monotonic cookie |
 | 218 | set_tid_address | dispatch (main.rs) | stores the clear-child-tid word in the task's shared record | a thread's `exit` zeroes the word and wakes its joiner |
-| 228 | clock_gettime | dispatch (main.rs) | primitives::clock over TSC | REALTIME adds the epoch anchor; others boot-relative |
-| 230 | clock_nanosleep | dispatch (main.rs) | as nanosleep | both spellings, incl. the raw (sec, nanos) register pair |
+| 228 | clock_gettime | glue (`served_by_glue`) | `akuma-syscalls-time` over the TSC clock | REALTIME adds the epoch anchor; others boot-relative |
+| 229 | clock_getres | glue | `akuma-syscalls-time` | 1 ns |
+| 230 | clock_nanosleep | glue | as nanosleep | `TIMER_ABSTIME` on REALTIME and MONOTONIC |
 | 231 | exit_group | dispatch (main.rs) | as exit | nested child returns to the parent; boot tasks chain the program list |
 | 257 | openat | dispatch (main.rs) | `resolve_at` + open_common | dirfd-relative; AT_FDCWD resolves at "/" |
 | 258 | mkdirat | dispatch (main.rs) | akuma-ext2 `create_dir` | mode accepted and ignored |
@@ -177,14 +179,14 @@ Rows of the table below for calls served by glue are historical until the sweep
 | 75 | fdatasync | dispatch (main.rs) | as fsync | same |
 | 80 | chdir | `chdir_to` (main.rs) | akuma-vfs walk; the cwd lives on the task record | inherited by fork children, reset to / on exec |
 | 81 | fchdir | `chdir_to` (main.rs) | fd must be a directory description | full |
-| 97 | getrlimit | `PRLIMIT64 \| 97` arm (main.rs) | RLIMIT_STACK = the 8 MiB stack ceiling; everything else unlimited | what musl's thread probes read |
+| 97 | getrlimit | glue (`prlimit64(0, …)`) | RLIMIT_STACK = `ExecConfig::user_stack_size` (8 MiB); NOFILE 1024; the rest unlimited | what musl's thread probes read |
 | 131 | sigaltstack | `sigaltstack_arm` (main.rs) | SS_DISABLE/MINSIGSTKSZ recorded per task | full record/reply; nothing dispatches on it yet |
 | 166 | sync | dispatch (main.rs) | `root_fs().sync()` | accepted; write-through makes it a no-op |
 | 200 | tkill | `tkill_arm` (main.rs) | no delivery: a blocked poll/pipe read of that thread answers EINTR | what cargo's jobserver needs; signal 0 probes |
 | 202 | futex | `futex::sys_futex` (futex.rs) | `akuma-syscalls-sync` WaiterTable/op algebra | WAIT/WAKE/WAIT_BITSET/REQUEUE/WAKE_OP, private + shared, timeouts |
 | 234 | tgkill | `tkill_arm` (main.rs) | as tkill | same |
 | 203 | sched_getaffinity | dispatch (main.rs) | one CPU, mask = 1 | the toolchain's thread-count probe |
-| 302 | prlimit64 | `PRLIMIT64 \| 97` arm (main.rs) | as getrlimit; sets accepted-ignored | musl's pthread stack sizing |
+| 302 | prlimit64 | glue | as getrlimit; sets accepted-ignored | musl's pthread stack sizing |
 | 306 | syncfs | dispatch (main.rs) | `root_fs().sync()` | as sync |
 | 331 | membarrier | `membarrier_arm` (main.rs) | `akuma-syscalls-mem::membarrier` command probing | queries served; no global barrier needed on one core |
 | 0x1000+301 | akuma SPAWN | `spawn_arm` (child.rs) | the child model | run-to-completion; returns pid \| stdout_fd<<32 |

@@ -2,7 +2,7 @@
 name = "akuma-syscalls-glue-amd64"
 version = "0.1.0"
 edition = "2024"
-description = "The x86_64 syscall ABI over akuma-syscalls-glue for the file-descriptor family: open-flag and struct-stat translation, the legacy x86-only numbers, dup2's rule, poll/select timeouts, chunked large reads. Shared by the amd64 kernel and Taoxichuan."
+description = "The x86_64 syscall ABI over akuma-syscalls-glue for the file-descriptor family and the x86-only time calls: open-flag and struct-stat translation, the legacy x86-only numbers (gettimeofday and time among them), dup2's rule, poll/select timeouts, chunked large reads. Shared by the amd64 kernel and Taoxichuan."
 
 [lints]
 workspace = true
@@ -20,3 +20,6 @@ akuma-exec = { path = "../akuma-exec" }
 akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 # User memory: the x86_64 `struct stat` and select's `timeval`.
 akuma-user-access = { path = "../akuma-user-access" }
+# The wall clock `gettimeofday`/`time` read: the same anchor and uptime hook glue's
+# `clock_gettime` reads, so the three cannot disagree.
+akuma-primitives = { path = "../akuma-primitives" }

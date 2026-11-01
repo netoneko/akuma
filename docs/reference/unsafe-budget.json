@@ -115,6 +115,6 @@
     "crates/akuma-uart": 1,
     "crates/akuma-user-access": 20,
     "crates/akuma-virtio": 17,
-    "taoxichuan/src": 35
+    "taoxichuan/src": 34
   }
 }

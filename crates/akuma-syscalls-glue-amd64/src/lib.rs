@@ -6,10 +6,11 @@
 //! and the rest that the AArch64 kernel runs. An x86_64 caller differs from an
 //! asm-generic one in exactly the places this crate handles:
 //!
-//! - **Numbers.** Ten calls exist only on x86_64 (`open` 2, `stat` 4, `lstat` 6,
+//! - **Numbers.** Eleven fd calls exist only on x86_64 (`open` 2, `stat` 4, `lstat` 6,
 //!   `poll` 7, `access` 21, `pipe` 22, `select` 23, `dup2` 33, `creat` 85,
 //!   `epoll_create` 213, `epoll_wait` 232); each is its `*at`/`p*` successor
-//!   with fixed arguments. The path-only legacy calls are
+//!   with fixed arguments. Two time calls do too (`gettimeofday` 96, `time` 201),
+//!   served here from the wall clock glue's `clock_gettime` reads. The path-only legacy calls are
 //!   `akuma_syscalls_abi::legacy::fold`'s, applied by the caller first.
 //! - **Open flags.** Four `open(2)` bits are permuted between the ABIs
 //!   (`akuma_syscalls_abi::open_flags`); handing glue the x86_64 bits opens a
@@ -84,6 +85,8 @@ pub fn dispatch(nr: u64, a: [u64; 6]) -> Option<u64> {
         33 => Some(dup2(a[0], a[1])),
         // creat(path, mode) = open(path, O_CREAT | O_WRONLY | O_TRUNC, mode), x86_64 bits.
         85 => Some(openat(AT_FDCWD, a[0], 0o100 | 0o1 | 0o1000, a[1])),
+        96 => Some(gettimeofday(a[0])),
+        201 => Some(time(a[0])),
         213 => Some(to_glue(Syscall::EpollCreate1, [0; 6])),
         232 => Some(to_glue(Syscall::EpollPwait, [a[0], a[1], a[2], a[3], 0, 0])),
         _ => None,
@@ -379,6 +382,29 @@ pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u
     glue::flat(glue::poll::pselect6_timeout_us(nfds as usize, readfds, writefds, exceptfds, deadline))
 }
 
+/// `gettimeofday(tv, tz)`: the wall clock glue's `clock_gettime(CLOCK_REALTIME)`
+/// reads (boot-relative until something anchors it). `tz` is never filled; every
+/// real caller passes NULL.
+#[must_use]
+pub fn gettimeofday(tv: u64) -> u64 {
+    if tv == 0 {
+        return 0;
+    }
+    let us = akuma_primitives::clock::realtime_us(akuma_primitives::clock::uptime_us());
+    let tv_val = akuma_syscalls_linux::time::Timeval::from_bits(us / 1_000_000, us % 1_000_000);
+    if akuma_user_access::write_user_val(tv, &tv_val).is_ok() { 0 } else { EFAULT }
+}
+
+/// `time(tloc)`: wall-clock seconds, also written through `tloc` when it is not NULL.
+#[must_use]
+pub fn time(tloc: u64) -> u64 {
+    let secs = akuma_primitives::clock::realtime_us(akuma_primitives::clock::uptime_us()) / 1_000_000;
+    if tloc != 0 && akuma_user_access::write_user_val(tloc, &secs).is_err() {
+        return EFAULT;
+    }
+    secs
+}
+
 /// A `struct timeval` as microseconds, or `None` when it is not a valid one.
 const fn timeval_us(sec: i64, usec: i64) -> Option<u64> {
     if sec < 0 || usec < 0 || usec >= 1_000_000 {
@@ -437,7 +463,7 @@ mod tests {
     fn legacy_numbers_are_not_in_the_asm_generic_table() {
         // dispatch()'s first match owns these; none may also have a Syscall row,
         // or the order of the two matches would decide which arm serves it.
-        for nr in [2u64, 4, 6, 7, 21, 22, 23, 33, 85, 213, 232] {
+        for nr in [2u64, 4, 6, 7, 21, 22, 23, 33, 85, 96, 201, 213, 232] {
             assert!(Syscall::from_x86_64(nr).is_none(), "x86_64 {nr} has a Syscall row");
         }
     }

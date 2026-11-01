@@ -78,7 +78,6 @@ hooks — each written out with its reason, the same collapses amd64 makes.
 ```mermaid
 flowchart TD
     subgraph who pumps the NIC
-        A["nanosleep arm<br/>(sshd's 1 ms serve tick)"] --> P
         B["wait_until laps (akuma-net)<br/>blocking socket calls"] --> P
         C["poll/select/epoll waits (akuma-syscalls-glue)"] --> P
         E["NetRuntime yield/relax/park hooks"] --> P
@@ -90,14 +89,14 @@ flowchart TD
 
 The guest has no IOAPIC and kvm0 never raises the NIC's interrupt line:
 **frames arrive only when somebody calls `netpoll`.** Every path a task can
-block on pumps it — the nanosleep arm is what keeps TCP alive while sshd
-idles. Two non-task pumps close the holes a taskless or spinning guest leaves:
+block on pumps it, and a task that sleeps (glue's `nanosleep`) parks, so the
+idle lap pumps for it. Two non-task pumps close the holes a taskless or spinning guest leaves:
 the **idle lap** (an all-parked system used to leave the NIC unposted and the
 relay deaf) and the **tick backstop** (a ring-3 spinner the switch gate must
 not preempt used to silence the stack for seconds — one drained lap per tick
 caps the window at ~10 ms; [`scheduling.md`](scheduling.md)).
 
-**The wait loops halt.** Every wait path (`sleep_until`, `park_until`,
+**The wait loops halt.** Every wait path (`park_until`,
 `blocking_relax`, `yield_now`, the DHCP wait, `connect_wait`, and the idle
 lap) ends its lap in `net::wait_lap` — `sti; hlt; cli`: IF open for exactly
 one `hlt`, the 100 Hz tick always wakes it. The relay thread shares this

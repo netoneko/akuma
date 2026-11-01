@@ -9,6 +9,6 @@ flowchart LR
     CAL -.->|"gate never moves<br/>(KVM: no PIT)"| LAP["use_lapic_rate:<br/>akuma-lapic-amd64::tsc_hz()"]
     CAL --> LVT["xAPIC LVT timer, periodic<br/>vector 32 (TIMER_VECTOR)<br/>akuma-lapic-amd64"]
     LVT -->|tick| TT["timer_trap (main.rs)<br/>akuma_lapic_amd64::on_tick() → count"]
-    TT --> CLK["exec_twin::uptime_us = ticks × 10 ms<br/>one clock for ExecRuntime + ThreadRuntime"]
+    CAL --> CLK["net::calibrate → net::uptime_us (TSC)<br/>one clock: ExecRuntime, ThreadRuntime, primitives::clock"]
     TT -.->|returns to the same instruction| R3["ring 3 (the only place IF is set)"]
 ```

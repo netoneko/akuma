@@ -283,7 +283,7 @@ static IDT: idt_lib::Idt = idt_lib::Idt::new();
 /// How far a user stack may grow below its initial pages: 8 MiB, the Linux
 /// default `ulimit -s`. cargo's main thread goes deeper than the 64 KiB
 /// every image starts with.
-const STACK_MAX: u64 = 8 << 20;
+pub(crate) const STACK_MAX: u64 = 8 << 20;
 
 /// A not-present fault just under a task's stack region is the stack growing:
 /// map the zeroed pages between the fault and the region, widen the region,
@@ -651,13 +651,9 @@ fn timer_trap(t: &mut Trap<'_>) {
 }
 
 fn timer_trap_locked(t: &mut Trap<'_>) {
-    // The count is the twin's uptime clock (exec_twin::uptime_us); the trap
-    // itself needs nothing back — a tick returns to the same instruction. The
-    // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
-    // The count is the twin's uptime clock (exec_twin::uptime_us); the trap
-    // itself needs nothing back — a tick returns to the same instruction. The
-    // `let _` is the sanctioned discard of the crate's `#[must_use]` count.
-    // Only the boot core advances the clock; an AP's tick just acknowledges.
+    // The tick count is not the clock (that is the TSC, `net::uptime_us`); it
+    // paces preemption and the trace dumps below. Only the boot core counts;
+    // an AP's tick just acknowledges.
     if ring3::cpu_index() == 0 {
         let n = akuma_lapic_amd64::on_tick();
         let _ = n;
@@ -1467,21 +1463,6 @@ fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
     akuma_user_walk::copy_to(&task_walk(), dst_va, src)
 }
 
-/// View a `repr(C)` plain-old-data wire struct as its own bytes, the form
-/// `copy_to_user` takes. Trim step 2 made this the shared shape: every struct
-/// the dispatcher now pulls from `akuma-syscalls-linux` goes out through here
-/// (sock.rs's sockaddr_in writer was the first local precedent).
-fn struct_bytes<T>(t: &T) -> &[u8] {
-    // SAFETY: every caller passes a `repr(C)` plain-old-data wire struct;
-    // viewing it as its own bytes is well defined.
-    unsafe {
-        core::slice::from_raw_parts(
-            core::ptr::addr_of!(*t).cast::<u8>(),
-            core::mem::size_of::<T>(),
-        )
-    }
-}
-
 /// The ext2 lookup does not follow symlinks (a deliberate crate boundary:
 /// `akuma-ext2` resolves components, `akuma-vfs::path` owns the chain
 /// walker). The serve image's `/bin/sh` — what sshd's exec path spawns — is
@@ -1867,6 +1848,20 @@ const fn served_by_glue(call: akuma_syscalls_abi::Syscall) -> bool {
             // which this kernel's thread exit reads).
             | S::Prctl
             | S::SetTidAddress
+            // The time family, over the one clock (the calibrated TSC,
+            // registered as `akuma_primitives::clock`'s hook by `exec_twin`).
+            // `nanosleep` parks through the scheduler and wakes early on a
+            // `tkill` (`EINTR`); `prlimit64`'s `RLIMIT_STACK` is
+            // `ExecConfig::user_stack_size`, the 8 MiB the stack may grow to.
+            | S::ClockGettime
+            | S::ClockGetres
+            | S::ClockSettime
+            | S::Adjtimex
+            | S::ClockAdjtime
+            | S::Nanosleep
+            | S::ClockNanosleep
+            | S::Prlimit64
+            | S::Getrlimit
             // Sockets (step 2b, with the fd table): AF_INET and AF_UNIX are
             // glue's; `sockaddr` and `msghdr` have one layout on both ABIs.
             | S::Socket
@@ -2165,67 +2160,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             child::sigsuspend_arm(fr, a1, a2)
         }
         15 => child::sigreturn_arm(fr),
-        ring3::nr::CLOCK_GETTIME => {
-            // Stage 4: the calibrated TSC gives both clocks real elapsed
-            // time (net.rs). Stage 8 (M1): CLOCK_REALTIME (id 0) adds the
-            // UTC offset store once a boot-time `epoch=` anchor installed
-            // one (akuma_primitives::clock::realtime_us falls back to the
-            // boot-relative reading, i.e. this arm's stage-4 behaviour,
-            // when no anchor exists: no epoch= token, no behaviour change).
-            // Every other clock id keeps its boot-relative meaning; musl's
-            // `struct timespec` is two u64s.
-            let (clk, tp) = (fr.arg1(), fr.arg2());
-            let us = if clk == 0 {
-                akuma_primitives::clock::realtime_us(net::uptime_us())
-            } else {
-                net::uptime_us()
-            };
-            if !user_ok(tp, 16) {
-                return e(ring3::err::EFAULT);
-            }
-            // Trim step 2: the wire shape is the crate's `Timespec`
-            // (`repr(C)`, 16 bytes), `from_bits` its word packing — the two
-            // u64 words musl reads go out unchanged.
-            let ts = akuma_syscalls_linux::time::Timespec::from_bits(
-                us / 1_000_000,
-                (us % 1_000_000) * 1_000,
-            );
-            if !copy_to_user(tp, struct_bytes(&ts)) {
-                return e(ring3::err::EFAULT);
-            }
-            0
-        }
-        ring3::nr::NANOSLEEP | ring3::nr::CLOCK_NANOSLEEP => {
-            // The serve loop's tick: `sleep_ms(1)` lands here, and every lap
-            // pumps the NIC (net.rs) — this arm is what keeps TCP alive
-            // while sshd idles. Both spellings accepted, the same sniff the
-            // full kernel makes: `a0` below one page is the raw
-            // (seconds, nanos) register pair libakuma's non-linux-abi path
-            // sends; anything above is a `*const timespec`.
-            let (a0, a1, a2, a3) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
-            let (sec, nanos) = if a0 < 4096 {
-                (a0, a1)
-            } else {
-                let mut ts = [0u8; 16];
-                if !user_ok(a0, 16) || !copy_from_user(&mut ts, a0) {
-                    return e(ring3::err::EFAULT);
-                }
-                (
-                    u64::from_le_bytes(ts[0..8].try_into().unwrap()),
-                    u64::from_le_bytes(ts[8..16].try_into().unwrap()),
-                )
-            };
-            let _ = (a2, a3);
-            // Cap: a task may sleep at most 60 s per call. Nothing on this
-            // kernel can signal a sleeper awake, so an unbounded request
-            // would be an unbounded stall of the whole machine.
-            let total_us = sec
-                .saturating_mul(1_000_000)
-                .saturating_add(nanos / 1_000)
-                .min(60_000_000);
-            child::sleep_us(total_us);
-            0
-        }
         ring3::nr::MREMAP => {
             // musl's realloc on an mmapped chunk. Shrink frees the tail; grow
             // extends in place when the range ends at the slab cursor, else
@@ -2309,30 +2243,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         // non-final command of a list. child.rs's M2 scaffold.
         ring3::nr::CLONE | 57 | 58 => child::fork_arm(fr),
         ring3::nr::WAIT4 => child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
-        ring3::nr::GETTIMEOFDAY => {
-            // Same clock as CLOCK_GETTIME (stage 8, M1): with an `epoch=`
-            // anchor in the offset store, tv is wall time; without one
-            // utc_time_us answers None and today's all-zeros answer stands.
-            // Struct timeval is two u64s, `tz` is optional and never filled.
-            let (tv, tz) = (fr.arg1(), fr.arg2());
-            if let Some(us) = akuma_primitives::clock::utc_time_us(net::uptime_us()) {
-                if !user_ok(tv, 16) {
-                    return e(ring3::err::EFAULT);
-                }
-                // Trim step 2: `Timeval` is the crate's shape (tv_usec, not
-                // tv_nsec — same clock, different second word).
-                let tvbuf = akuma_syscalls_linux::time::Timeval::from_bits(us / 1_000_000, us % 1_000_000);
-                if !copy_to_user(tv, struct_bytes(&tvbuf)) {
-                    return e(ring3::err::EFAULT);
-                }
-            } else if !user_ok(tv, 16) || !copy_to_user(tv, &[0u8; 16]) {
-                return e(ring3::err::EFAULT);
-            }
-            if tz != 0 && !user_ok(tz, 8) {
-                return e(ring3::err::EFAULT);
-            }
-            0
-        }
         ring3::nr::EXECVE => {
             // Slice 3: a REAL fork child (its own threading slot, published
             // by `fork_process`) execs the way Linux does — its image is
@@ -2343,21 +2253,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 return child::exec_real_task(fr);
             }
             e(ring3::err::ENOSYS)
-        }
-        // One CPU, no limits: what the toolchain's thread-count and stack
-        // probes read. RLIMIT_STACK reports the 8 MiB the stack may grow to.
-        akuma_syscalls_abi::x86_64::PRLIMIT64 | 97 => {
-            let (res, old) = if fr.rax == 97 { (fr.arg1(), fr.arg2()) } else { (fr.arg2(), fr.arg4()) };
-            if old != 0 {
-                let cur = if res == 3 { STACK_MAX } else { u64::MAX };
-                let mut b = [0u8; 16];
-                b[..8].copy_from_slice(&cur.to_le_bytes());
-                b[8..].copy_from_slice(&u64::MAX.to_le_bytes());
-                if !copy_to_user(old, &b) {
-                    return e(ring3::err::EFAULT);
-                }
-            }
-            0
         }
         akuma_syscalls_abi::x86_64::TKILL => tkill_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::TGKILL => tkill_arm(fr.arg2(), fr.arg3()),
@@ -3077,10 +2972,14 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // session pb: after PMM/heap are up - map_device allocates page-table frames
     lapic_init();
     smp::record_bsp_lapic_id(akuma_lapic_amd64::apic_id());
+    // The one clock (the TSC, `net::uptime_us`): calibrated before anything
+    // registers it, so it never jumps backwards under a deadline. After
+    // `lapic_init`, whose own TSC measurement is the fallback when there is
+    // no PIT (KVM, `microvm`).
+    net::calibrate();
     // Session pc, slice 1: the exec/threading runtime twin. Registered here,
-    // not earlier: the LAPIC tick must exist before it can be anyone's clock
-    // (exec_twin's uptime_us is ticks × 10 ms), and PMM/heap must be up
-    // before the first allocation behind registration. Nothing shared runs
+    // not earlier: the clock must be calibrated before it is anyone's clock,
+    // and PMM/heap must be up before the first allocation behind registration. Nothing shared runs
     // before the first spawn, so this is also "before any syscall can reach
     // the tables" (amd64's ordering rule).
     exec_twin::init();
@@ -3102,8 +3001,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // The mount lives for the rest of the boot: leak the `Arc` to a `'static` borrow.
     ROOT_FS.set(Some(&**alloc::boxed::Box::leak(alloc::boxed::Box::new(fs))));
 
-    // Stage 4: the network path — calibrate the TSC against the PIT, pull up
-    // smoltcp on virtio-net, wait (bounded, pumping the NIC) for DHCP. A
+    // Stage 4: the network path — pull up smoltcp on virtio-net, wait (bounded, pumping the NIC) for DHCP. A
     // guest with no NIC or no lease still boots; sshd will bind and simply
     // never answer, which is a legible failure, not a hang.
     let _ = net::net_init();

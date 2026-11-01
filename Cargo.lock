@@ -803,6 +803,7 @@ name = "akuma-syscalls-glue-amd64"
 version = "0.1.0"
 dependencies = [
  "akuma-exec",
+ "akuma-primitives",
  "akuma-syscalls-abi",
  "akuma-syscalls-glue",
  "akuma-syscalls-linux",

@@ -31,8 +31,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use akuma_ring3_amd64 as ring3;
 
-use crate::net;
-
 /// One reaped-or-running child. Slots recycle round-robin: sshd serves
 /// sessions one bridge at a time in practice, and four cover even the
 /// `max_sessions` stall case without unbounded kernel memory.
@@ -361,7 +359,7 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
             if !running {
             crate::task_done(u64::from(status >> 8));
         }
-        akuma_threading::schedule_blocking(crate::exec_twin::uptime_us() + 10_000);
+        akuma_threading::schedule_blocking(crate::net::uptime_us() + 10_000);
     }
 }
 
@@ -1535,12 +1533,6 @@ fn wait4_arm_blocking_scan(pid: u64, status_va: u64) -> u64 {
         return crate::e(crate::err::EFAULT);
     }
     u64::from(child)
-}
-
-/// The `net` module's clock is the only time source; re-exported read for
-/// the dispatcher's nanosleep arms (kept here so `net.rs` stays device-only).
-pub fn sleep_us(us: u64) {
-    net::sleep_until(net::uptime_us() + us);
 }
 
 // ---------------------------------------------------------------------------

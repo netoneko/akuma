@@ -23,12 +23,11 @@
 //! # Pumping the NIC
 //!
 //! The guest has no IOAPIC and kvm0 never raises the NIC's interrupt line:
-//! frames arrive only when somebody calls [`netpoll`]. Every path a task can
-//! block on goes through here — the `nanosleep` arms drive it per lap (this
-//! is what runs sshd's serve loop), and `wait_until`'s laps drive it from
-//! inside `akuma-net` while a blocking socket call waits. Nothing drives it
-//! while a spawned child runs to completion inside its SPAWN syscall; that
-//! is accepted (the stage's child model), not hidden — see `child.rs`.
+//! frames arrive only when somebody calls [`netpoll`]. The idle thread drives
+//! it once per lap, the timer tick once per tick, and `wait_until`'s laps
+//! drive it from inside `akuma-net` while a blocking socket call waits. A
+//! sleeping task (glue's `nanosleep`) parks, so the core idles and the idle
+//! lap pumps.
 
 use akuma_net::NetRuntime;
 
@@ -97,6 +96,11 @@ const OUT_WAIT_BUDGET: u32 = 20_000_000;
 
 /// Calibrate the TSC against PIT channel 2, polled — no interrupts involved.
 ///
+/// Called once, from `kernel_main`, after `lapic_init` (whose own calibration is the
+/// fallback rate) and **before** `exec_twin::init` registers [`uptime_us`] as the
+/// kernel's clock: registered first, the clock would read `rdtsc / 1` until this ran
+/// and then jump backwards under every deadline already computed against it.
+///
 /// Channel 2 in mode 0 (interrupt-on-terminal-count), gate enabled through
 /// port B, then the OUT pin polled until the count expires. `tsc / elapsed`
 /// is the rate. Every step is bounded so a missing PIT costs one guessed
@@ -120,7 +124,7 @@ fn use_lapic_rate(why: &str) {
     }
 }
 
-fn calibrate() {
+pub fn calibrate() {
     if !akuma_port::SYSTEM_CONTROL_B.present() {
         use_lapic_rate("no PIT behind port 0x61");
         return;
@@ -151,7 +155,9 @@ fn calibrate() {
 }
 
 
-/// Microseconds since boot (the calibrated TSC), the stack's one clock.
+/// Microseconds since boot (the calibrated TSC): the kernel's one clock. The
+/// scheduler, `akuma-exec`, `akuma_primitives::clock` (so glue's time syscalls),
+/// futex deadlines and smoltcp all read this function (`exec_twin::init`).
 pub fn uptime_us() -> u64 {
     let per_us = TSC_PER_US.load(core::sync::atomic::Ordering::Relaxed).max(1);
     rdtsc() / per_us
@@ -311,19 +317,51 @@ pub fn netpoll() {
     if IN_LAP.swap(true, core::sync::atomic::Ordering::Acquire) {
         return;
     }
+    #[cfg(feature = "trace-err")]
+    let t0 = uptime_us();
     let _ = akuma_net::smoltcp_net::poll();
+    #[cfg(feature = "trace-err")]
+    lap_note(uptime_us().saturating_sub(t0));
     IN_LAP.store(false, core::sync::atomic::Ordering::Release);
 }
 
-/// Calibration, then the stack itself (probe virtio-net, bring up smoltcp,
-/// start DHCP). Then the DHCP wait: bounded, pumping the NIC, so the guest
+/// Trace builds: how long the stack's laps take. A lap runs with the kernel lock held, so a slow
+/// one is a stall for every core that wants the lock (docs/archive/TAOXICHUAN_J4_BKL_CONVOY.md).
+/// One line a second when anything ran: `laps` (all), `slow` (over 2 ms), `max_us`, `sum_us`.
+#[cfg(feature = "trace-err")]
+fn lap_note(dur_us: u64) {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAPS: AtomicU64 = AtomicU64::new(0);
+    static SLOW: AtomicU64 = AtomicU64::new(0);
+    static MAX: AtomicU64 = AtomicU64::new(0);
+    static SUM: AtomicU64 = AtomicU64::new(0);
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    LAPS.fetch_add(1, Relaxed);
+    SUM.fetch_add(dur_us, Relaxed);
+    if dur_us > 2_000 {
+        SLOW.fetch_add(1, Relaxed);
+    }
+    MAX.fetch_max(dur_us, Relaxed);
+    let now = uptime_us();
+    let next = NEXT.load(Relaxed);
+    if now >= next && NEXT.compare_exchange(next, now + 1_000_000, Relaxed, Relaxed).is_ok() {
+        akuma_primitives::safe_print!(
+            128,
+            "[netlap] laps={} slow={} max_us={} sum_us={}\n",
+            LAPS.swap(0, Relaxed),
+            SLOW.swap(0, Relaxed),
+            MAX.swap(0, Relaxed),
+            SUM.swap(0, Relaxed)
+        );
+    }
+}
+
+/// The stack itself (probe virtio-net, bring up smoltcp, start DHCP); the
+/// clock was calibrated earlier ([`calibrate`], before `exec_twin::init`).
+/// Then the DHCP wait: bounded, pumping the NIC, so the guest
 /// has its address before init asks the socket layer for a port.
 pub fn net_init() -> bool {
-    akuma_primitives::safe_print!(96, "  net: [1] calibrate begin\n");
-    calibrate();
-    // Session pf (pf-5 died silently right here): raw, unbudgeted progress.
-    crate::raw_uart(b"[raw] tsc calibrated\n");
-    akuma_primitives::safe_print!(96, "  net: [2] stack init begin\n");
+    akuma_primitives::safe_print!(96, "  net: stack init begin\n");
     if akuma_net::init(runtime(), true).is_err() {
         akuma_comconsole::puts("  net: stack init failed -- no virtio-net device\n");
         return false;
@@ -350,28 +388,4 @@ pub fn net_init() -> bool {
     }
     akuma_comconsole::puts("  net: DHCP not answered in 10 s -- continuing unaddressed\n");
     false
-}
-
-/// Nanosleep the only way this kernel can: a bounded loop that pumps the
-/// NIC every lap. This is the sshd serve loop's `sleep_ms(1)` — which makes
-/// it, not any daemon, the thing that keeps TCP alive between events.
-pub fn sleep_until(deadline_us: u64) {
-    while uptime_us() < deadline_us {
-        netpoll();
-        // A slotted task polling in the kernel is IF-masked, so the tick never
-        // preempts it: if another task is READY (rustc's gcc child, forked
-        // while this one waited on its pipes) it would starve forever. Hand
-        // over the core, keeping the syscall stub's user-rsp stash across it.
-        let slot = crate::exec_twin::current_slot();
-        if slot != crate::exec_twin::NO_SLOT
-            && slot < crate::child::NSLOTS
-            && akuma_threading::x86_runnable_exists()
-        {
-            let stash = akuma_ring3_amd64::user_rsp_stash();
-            akuma_threading::x86_yield();
-            akuma_ring3_amd64::set_user_rsp_stash(stash);
-        } else {
-            wait_lap();
-        }
-    }
 }

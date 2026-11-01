@@ -10,7 +10,7 @@ flowchart LR
     PIT["8254 PIT ch2 (ports 0x42/0x43/0x61)<br/>calibration reference"] -->|50 ms window| CAL["calibrate (lapic_init)<br/>counts/tick, tsc_hz"]
     CAL --> LVT["xAPIC LVT timer, periodic<br/>vector 32 (TIMER_VECTOR)<br/>akuma-lapic-amd64"]
     LVT -->|tick| TT["timer_trap (main.rs)"]
-    TT --> CLK["on_tick → count<br/>exec_twin::uptime_us = ticks × 10 ms"]
+    CAL --> CLK["net::calibrate → net::uptime_us (TSC)<br/>one clock: ExecRuntime, ThreadRuntime, primitives::clock"]
     TT --> G{"from ring 3 AND slot<br/>slotted (not NO_SLOT)<br/>AND PREEMPT_ARMED?"}
     G -->|yes| Y["akuma_threading::x86_yield()<br/>→ switch_to on the per-slot trap stack"]
     G -->|no| R["return to the same instruction"]
@@ -111,7 +111,7 @@ wakes it; the yield check stays after the lap.
 
 ## The wait loops halt too
 
-Every guest wait path — `sleep_until`, `park_until`, `blocking_relax`,
+Every guest wait path — `park_until`, `blocking_relax`,
 `yield_now`, the DHCP wait, `connect_wait` — laps through `net::wait_lap`
 instead of a bare `pause`/`spin_loop` (session ph: boot ph-6's P3 stall was
 ~10 s of frozen relay counters behind `hlt=0` with the host's guest core at
