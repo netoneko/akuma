@@ -13,7 +13,10 @@ workspace = true
 # The same opt-in `akuma-amd64` has: compile any boot self-tests out. Stage 1
 # has none yet; the feature exists so the pinned build command
 # (`kbuild -j 4 --features no-tests`) is the same for every kernel.
-no-tests = []
+# Also drops the shared crates' own boot self-tests (glue's and akuma-exec's
+# `no-tests`): code this kernel never runs, and audit lines it carried
+# (AKUMA_SYSCALLS_TOKIO_DEP_ANALYSIS.md measured -516).
+no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
 # Name every syscall that answers a negative errno on the console (`[err] nr=N -E`).
 trace-err = []
 
