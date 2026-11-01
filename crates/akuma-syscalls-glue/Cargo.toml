@@ -9,7 +9,7 @@ akuma-bkl = { path = "../akuma-bkl" }
 akuma-config = { path = "../akuma-config" }
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-exec = { path = "../akuma-exec" }
-akuma-isolation = { path = "../akuma-isolation" }
+akuma-isolation = { path = "../akuma-isolation", default-features = false }
 akuma-mmu = { path = "../akuma-mmu" }
 akuma-net = { path = "../akuma-net", default-features = false }
 # eventfd's state machine (stage 8 session Q seam-cut): the counter/flag
@@ -70,7 +70,7 @@ no-tests = []
 extreme = []
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
 sc-aio = []
-sc-containers = []
+sc-containers = ["akuma-isolation/containers"]
 sc-epoll = []
 sc-pidfd = []
 sc-timerfd = []

@@ -7,6 +7,15 @@ description = "Process isolation primitives: mount namespaces, network namespace
 [lints]
 workspace = true
 
+[features]
+# The box half's filesystems: `subdir_fs` (a box's root jail) and `overlay_fs`.
+# On by default so this crate's own tests cover them; every kernel-side consumer
+# depends with `default-features = false` and turns it on through its
+# `sc-containers`, so a kernel without containers (Taoxichuan, `extreme-size`)
+# does not compile them.
+default = ["containers"]
+containers = []
+
 [dependencies]
 akuma-vfs = { path = "../akuma-vfs" }
 # `Pid` and `with_irqs_disabled`, both for the box registry (moved here from

@@ -10,7 +10,7 @@ akuma-config = { path = "../akuma-config" }
 # The filesystem traits, path helpers and `MountTable` this layer instantiates.
 akuma-vfs = { path = "../akuma-vfs" }
 # `Namespace` — the per-box mount view `with_fs` resolves through.
-akuma-isolation = { path = "../akuma-isolation" }
+akuma-isolation = { path = "../akuma-isolation", default-features = false }
 # Process/thread state `/proc` reports on, and the ext2 backing store's inode pins.
 akuma-exec = { path = "../akuma-exec" }
 akuma-ext2 = { path = "../akuma-ext2" }
@@ -66,7 +66,7 @@ akuma-syscalls-ipc = { path = "../akuma-syscalls-ipc", optional = true }
 # --no-default-features and must not gain a byte of container, reboot-sync or
 # SysV-IPC code from the crate split.
 sc-sysv-ipc = ["dep:akuma-syscalls-ipc"]
-sc-containers = []
+sc-containers = ["akuma-isolation/containers"]
 # Discriminates extreme-size from size in build.rs; forwarded from the bin.
 extreme = []
 sc-reboot = []

@@ -686,7 +686,7 @@ fs-cache = ["akuma-ext2/fs-cache"]
 # Tier 1 — pure dead weight, no akuma-exec callbacks.
 sc-aio          = ["akuma-syscalls-glue/sc-aio"]
 sc-sysv-ipc     = ["dep:akuma-syscalls-ipc", "akuma-vfs-glue/sc-sysv-ipc", "akuma-syscalls-glue/sc-sysv-ipc"]
-sc-containers   = ["akuma-vfs-glue/sc-containers", "akuma-syscalls-glue/sc-containers"]
+sc-containers   = ["akuma-vfs-glue/sc-containers", "akuma-syscalls-glue/sc-containers", "akuma-isolation/containers"]
 sc-timerfd      = ["akuma-syscalls-glue/sc-timerfd"]
 # Tier 2 — each needs a no-op ExecRuntime callback stub when off (see main.rs).
 sc-eventfd      = ["akuma-syscalls-glue/sc-eventfd", "akuma-kernel-glue/sc-eventfd"]
@@ -824,7 +824,7 @@ akuma-rump = { path = "crates/akuma-rump", optional = true }
 # (src/syscall/reboot.rs); the PSCI SMC call itself stays in smp_shared.rs.
 # Named `-boot`, not `-reboot`: a natural future home for src/boot.rs's logic too.
 akuma-boot = { path = "crates/akuma-boot", optional = true }
-akuma-isolation = { path = "crates/akuma-isolation" }
+akuma-isolation = { path = "crates/akuma-isolation", default-features = false }
 # Machine description read from the FDT at run time. Required, not optional:
 # Firecracker's GIC redistributor base moves with `vcpu_count`, so no
 # compile-time constant can address it (docs/reference/firecracker/README.md
