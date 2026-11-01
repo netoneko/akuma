@@ -1,67 +1,32 @@
-# Pipes — pipe(2)/pipe2(2) over the pulled crate
+# Pipes — `akuma-syscalls-glue`'s
 
-**Stability: B** (the crate is host-tested and shared with the amd64 kernel;
-the glue is small, but it grew the park/wake arms in M4 slice 3 — verify
-blocking behaviour against a current boot).
+**Stability: B** (the bodies are glue's, shared with amd64 and AArch64; this
+kernel's part is the wiring, verified by the battery's pipeline and `PK1` lines).
 
-Everything that *decides* lives in
-[`crates/akuma-pipes`](../../../crates/akuma-pipes): end refcounts, the 64 KiB
-FIFO, the read/write/EOF rules. `src/pipes.rs` is what a composition root
-owns: the one `PipeTable<()>` instance, the `OpenFile::Pipe(id, is_write)`
-payload, and the copy loops (~110 lines).
+Since the cleanup plan's step 2b (2026-11-01) a pipe on this kernel is glue's:
+`pipe`/`pipe2` create it in glue's one `akuma_pipes::PipeTable`, the descriptors
+are `FileDescriptor::PipeRead`/`PipeWrite` in the process's `SharedFdTable`, and
+`read`/`write`/`poll` are glue's arms (through `akuma-syscalls-glue-amd64`).
+What this kernel supplies:
 
-```mermaid
-flowchart LR
-    subgraph task fd table (akuma-fdtable decisions)
-        R["fd → Pipe(id, false)"] 
-        W["fd → Pipe(id, true)"]
-    end
-    R <-->|read / EOF| T["akuma-pipes PipeTable<br/>id → 64 KiB FIFO + end refcounts"]
-    W -->|write / EPIPE / EAGAIN| T
-```
+- **Release hooks** (`exec_twin.rs`): `pipe_close_read`/`pipe_close_write`/
+  `pipe_clone_ref`/`pipe_write` are glue's own, so a fork's deep clone takes a
+  reference per end, and every close, `dup2` displacement, close-on-exec sweep
+  and exit drops one.
+- **The wake sink** (`main.rs`, beside the vfs-glue mount): a parked reader or
+  writer is woken by slot number with a fresh handle — amd64's `pipe::wake_sink`.
+- **Exit closes the table before the reap** (`child::close_process_fds`): a
+  pipeline's reader gets EOF when its last writer *exits*, not when the writer's
+  parent gets round to `wait4`.
+- **SIGPIPE**: a write with no reader left raises SIGPIPE, whose default action
+  ends the writer inside glue; the slot-purge hook reports that to `wait4`
+  (`child::on_thread_terminated`).
 
-This figure is small enough to live only here (no `diagrams/` source).
-
-## The refcount rule this kernel keeps by hand
-
-One table reference per descriptor naming an end, because an `OpenFile` here
-is a plain value (indices), not a handle:
-
-- `pipe2` starts the pair at 1/1.
-- `dup`/`dup2`/`dup3`/`fcntl(F_DUPFD)` and the fork arm's walk over
-  `fork_copy`'s payloads each add one (`pipes::clone_ref`).
-- `close`, a displaced `dup2` target, exec's cloexec sweep, and a task's exit
-  (`child_exit` → `release_open_fds`) each drop theirs (`pipes::release`).
-
-Miss fork or the exit and EOF never arrives; miss a dup and the pipe dies
-under a live end. The load-bearing sweep is the exiting **fork child**'s — a
-pipeline member's exit is what turns the last writer's close into the reader's
-EOF.
-
-## Semantics across the two child models
-
-- **A slotted task parks.** Since M4 slice 3 the arms park exactly as
-  `wait4_real` does: the caller registers under its task slot
-  (`exec_twin::current_slot()` — the same tid space as the reap waiter), and
-  every `Wakes` an op returns is fired through the threading waker. A
-  pipeline of real fork children blocks and wakes like Linux.
-- **The boot task (`NO_SLOT`) keeps the M3 answers**: it drives the bridge
-  and may never park, so for it an empty pipe still reads 0 and a full one
-  still answers `EAGAIN` — the run-to-completion semantics the M2 spawn model
-  relies on, indistinguishable from the drained-buffer states **by
-  construction**.
-- `BrokenPipe` is `EPIPE` (32, named locally — the shared err table's only
-  other EPIPE user is the SIGPIPE path, which is out of scope). A full buffer
-  that accepted nothing is `EAGAIN`.
-- `write_no_sigpipe` is the kernel-memory twin for the `ExecRuntime::pipe_write`
-  hook (akuma-exec's stdin pump): a full pipe answers `Ok(0)`, the short
-  write that reports backpressure.
-- `pipe` (x86_64 22, musl's raw `SYS_pipe`) is `pipe2(fds, 0)`; the dispatcher
-  keys the arm on the literal because the ring3 table has no name for it.
-- poll/select readiness uses the crate's own predicates (`readable`/
-  `writable`) — no second opinion.
+The refcount and EOF rules themselves are `akuma-pipes`' (host-tested).
 
 ## Background
 
-`docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md` (stage 8 M3),
-`scripts/kvm/goose/taoxichuan-09a-pipes.md` (the session brief).
+[`TAOXICHUAN_CLEANUP_PLAN.md`](../../../docs/archive/TAOXICHUAN_CLEANUP_PLAN.md)
+(step 2b: the move, and the `yes | head` hang the SIGPIPE bridge fixes);
+`docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md` (stage 8 M3, the
+pipes this replaced).

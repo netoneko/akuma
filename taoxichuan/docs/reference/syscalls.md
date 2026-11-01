@@ -39,52 +39,52 @@ Canonical mermaid source: [`../diagrams/syscall-path.md`](../diagrams/syscall-pa
 - A user pointer is only ever touched through `user_ok` + the physmap copy
   pair ([`memory.md`](memory.md) § the user-pointer rule).
 
-## Glue first
+## The descriptor table and the fd family are shared code
 
-After the x86-only legacy fold, `dispatch_inner` asks `served_by_glue(call)`
-(`main.rs`): a call in that set goes to `akuma_syscalls_glue::handle_syscall`
-by its asm-generic number (`Syscall::to_aarch64`), the same bodies amd64 and
-AArch64 run, and has no arm of its own below. Rows in the table further down
-for calls in that set are historical until the sweep (cleanup plan step 2i).
+Every descriptor lives in the calling process's `akuma-exec` `SharedFdTable`
+(`Process.fds`): `fork_process` deep-clones it (pipe and socket references taken,
+epoll fds stripped), `clone_thread` shares it (`CLONE_FILES`), exec sweeps its
+close-on-exec entries (`close_cloexec_fds_releasing`), and exit closes it
+(`child::close_process_fds`, after the siblings are stopped — a pipe's EOF is its
+last writer's close, so it cannot wait for the reap). The tables behind the
+descriptors (pipes, eventfd, epoll, AF_UNIX, flock) are `akuma-syscalls-glue`'s;
+`exec_twin.rs` points the runtime's release hooks at them.
+
+`dispatch_inner` asks, in order:
+
+1. `akuma_syscalls_abi::legacy::fold` — the x86-only path calls become `*at`.
+2. `served_by_glue(call)` — identity, host names, limits, randomness, sync, and
+   every socket call (AF_INET and AF_UNIX): `akuma_syscalls_glue::handle_syscall`
+   by the asm-generic number.
+3. `console_stdio_write` — a `write`/`writev` on `Stdout`/`Stderr`/`DevTty` from a
+   process with no I/O channel of its own (`Process.channel`, not
+   `current_channel()`, which falls back to a forked child's *exit* channel) goes
+   to the console.
+4. `akuma_syscalls_glue_amd64::dispatch` — the rest of the fd family: the x86_64
+   ABI over glue (open flags, `struct stat`, the legacy numbers, `dup2`, poll/select
+   timeouts, chunked reads), shared with amd64.
+5. The local arms: memory, process, signals, futex, clocks, exec.
+
+`sendfile` and `copy_file_range` answer `ENOSYS` (glue has neither; busybox and
+Rust's `fs::copy` fall back to `read`/`write`).
+
 Glue writes user memory directly, so the page-fault handler breaks CoW for a
 ring-0 write to a present user page and resumes a faulting copy at
-`akuma_user_access::user_copy_fixup`. A folded call whose glue body reads state
-this kernel keeps privately (its fd table, its task record) is not folded until
-that state moves: the fd table is step 2b.
+`akuma_user_access::user_copy_fixup`. Glue's waits switch threads, so `dispatch`
+saves and restores the syscall stub's user-RSP stash around every call. A fatal
+signal's default action inside glue (SIGPIPE on a broken pipe) ends the process
+through `akuma-exec`; the slot-purge hook (`child::on_thread_terminated`) records
+its status for this kernel's `wait4` until `wait4` is `akuma-exec`'s (pm S2).
 
-## fd routing is table-first
+**A file's size is the inode's, never the description's** — now by construction:
+glue reads the inode. Before the table moved, a per-descriptor copy made SQLite's
+second connection read its WAL short
+([`TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md`](../../../docs/archive/TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md)).
+**A socket goes with its last name**: `akuma-net` reference-counts it
+(`socket_clone_ref` / `remove_socket`).
 
-`read`/`write`/`writev`/`readv`/`lseek`/`fstat` route on the fd's **kind in
-the table**, not its number: a bound fd is served by its kind whatever the
-number, so a shell redirect that dup2's a file onto fd 1 captures the flush.
-Only an *unbound* fd falls to the session rules: unbound 1/2 are the console
-write-only (or the nested child's pipe for fd 1 while a child runs), unbound 0
-reads EOF, any other unbound number is `EBADF`. A dup of an unbound stdio fd
-materializes an `OpenFile::Session` entry at its own number first, so ash's
-save/restore dance around a redirect (`fcntl(1, F_DUPFD, 10)` … `dup2(10, 1)`)
-lands on a real description.
-
-**A file's size is the inode's, never the description's.** `OpenFile::File`
-holds an inode and a cursor and nothing else; `read`, `pread64`, `fstat`,
-`lseek(SEEK_END)` and file-backed `mmap` ask ext2 for the length at the call.
-Two opens of one file must see each other's writes: SQLite's connections read
-WAL frames another connection just appended, and a per-fd copy of the size
-made that a short read (`SQLITE_IOERR_SHORT_READ`, 522) and kept goose from
-starting ([`TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md`](../../../docs/archive/TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md)).
-`O_APPEND` still positions once, at `open`, not before every write, so two
-appenders on separate descriptions can interleave. That is a known difference
-from Linux.
-
-**A socket's connection goes with its last name.** `fork`, `dup` and
-`CLONE_FILES` copy socket fds without the socket knowing, so every path that
-removes a socket fd from a table (`close`, a `dup2` displacing it, an exec's
-close-on-exec sweep, exit) releases the connection only when no fd in any task
-still names it (`sock::release_unnamed`, `close_arm`). Releasing on the first
-removal let a session shell's `exec 4<file` close sshd's own connection.
-
-fd slots are fixed: 16 per task (`SLOT_CEILING`), 3–15 allocatable
-([`crates/akuma-fdtable`](../../../crates/akuma-fdtable) owns lowest-free,
-close, dup_to, fork_copy, the flag sets; this kernel supplies the effects).
+Rows of the table below for calls served by glue are historical until the sweep
+(cleanup plan step 2i).
 
 ## The table
 

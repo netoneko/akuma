@@ -80,8 +80,7 @@ flowchart TD
     subgraph who pumps the NIC
         A["nanosleep arm<br/>(sshd's 1 ms serve tick)"] --> P
         B["wait_until laps (akuma-net)<br/>blocking socket calls"] --> P
-        C["poll/select laps (sock.rs)"] --> P
-        D["connect_wait (sock.rs)<br/>dial tracing"] --> P
+        C["poll/select/epoll waits (akuma-syscalls-glue)"] --> P
         E["NetRuntime yield/relax/park hooks"] --> P
         F["idle_main lap (exec_twin)<br/>when nothing is runnable"] --> P
         G["tick backstop (timer_trap)<br/>one drained lap per tick"] --> P

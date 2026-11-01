@@ -45,8 +45,6 @@ pub struct SpawnSlot {
     pub running: bool,
     /// Linux wait status (`code << 8`), what `waitpid_status` relays.
     pub status: u32,
-    /// The pipe: the child's stdout, read out through the `ChildOut` fd.
-    pub out: Vec<u8>,
     /// M2 (fork): WAIT4 reaped this child — a second wait on the pid is
     /// ECHILD, which is how a shell's job table closes the entry.
     pub reaped: bool,
@@ -77,7 +75,6 @@ impl SpawnSlot {
             pid: 0,
             running: false,
             status: 0,
-            out: Vec::new(),
             reaped: false,
             waiter: u32::MAX,
             real: false,
@@ -91,9 +88,6 @@ impl SpawnSlot {
 /// the ring index are the SAME number by construction (`bind_child_task`
 /// stamps by tid; `switch_to`/`task()` index the same arrays).
 pub const NSLOTS: usize = 48;
-/// Stdout ceiling per child: after this, writes are dropped (the paws
-/// fallback truncates at 1 MiB too). The gate's output is two orders below.
-const OUT_CAP: usize = 1024 * 1024;
 
 /// The spawn ring's rows. A [`BorrowCell`](akuma_primitives::cell::BorrowCell): the only way in is [`with_slots`] (or the one-field
 /// readers below), so two overlapping borrows are a panic naming the bug, and no closure ever calls out to anything that
@@ -242,15 +236,6 @@ pub fn nested_active() -> bool {
     crate::exec_twin::current_slot() != crate::exec_twin::NO_SLOT
 }
 
-/// The calling task's session is the BOOT session (`out_slot == usize::MAX`,
-/// stamped by `start_init_thread`): its unbound fd 1/2 writes emit to the
-/// console — nothing drains a spawn-slot buffer for it. Only meaningful
-/// while `nested_active()`; the write arms short-circuit on that first.
-pub fn console_session() -> bool {
-    let cur = crate::exec_twin::current_slot();
-    cur != crate::exec_twin::NO_SLOT && with_cross(cur, |c| c.out_slot == usize::MAX)
-}
-
 /// The pid the current task should report (`getpid`): 1 for the boot task,
 /// the spawn slot's pid while the child runs.
 pub fn current_pid() -> u32 {
@@ -272,36 +257,6 @@ pub fn pid_for_slot(idx: usize) -> Option<u32> {
     } else {
         None
     }
-}
-
-/// The nested child's write to fd 1: into the pipe (the buffer).
-pub fn child_write(buf_va: u64, len: u64) -> bool {
-    let cur = crate::exec_twin::current_slot();
-    if cur == crate::exec_twin::NO_SLOT {
-        // Unreachable today: only a child's fd 1 lands here, and a child
-        // running means `current_slot` names one. A parent write to fd 1
-        // would be a dispatcher bug; refuse rather than write into slot 0's
-        // buffer (what the old default static would have done).
-        return false;
-    }
-    let out_slot = with_cross(cur, |c| c.out_slot);
-    let mut chunk = [0u8; 512];
-    let mut done = 0u64;
-    while done < len {
-        let n = (len - done).min(chunk.len() as u64) as usize;
-        if !crate::copy_from_user(&mut chunk[..n], buf_va + done) {
-            return false;
-        }
-        with_slots(|s| {
-            let slot = &mut s[out_slot];
-            if slot.out.len() < OUT_CAP {
-                let take = n.min(OUT_CAP - slot.out.len());
-                slot.out.extend_from_slice(&chunk[..take]);
-            }
-        });
-        done += n as u64;
-    }
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -370,10 +325,10 @@ fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs
     if path.is_empty() {
         return Err(crate::err::ENOENT);
     }
-    // execve resolves a relative path against the cwd (`./hello`).
-    let path = match crate::resolve_at(ring3::open::AT_FDCWD, &path) {
-        Some(p) => p,
-        None => return Err(crate::err::ENOENT),
+    // execve resolves a relative path against the cwd (`./hello`): the
+    // process's (`Process.cwd`, which glue's `chdir` writes).
+    let Ok(path) = akuma_syscalls_glue::fs::resolve_path_at(-100, &path) else {
+        return Err(crate::err::ENOENT);
     };
     let argv_ptrs = read_ptr_array(argv_va, ARGV_MAX)?;
     let mut argv: Vec<String> = Vec::new();
@@ -549,7 +504,7 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         TASK_OF.with_mut(|t| t[slot_idx] = slot_idx + 1);
     }
     if !is_thread {
-        let (regions, n_regions, brk_base, brk_cur, brk_end, mmap_cur, fds, cloexec, nonblock, std_closed, cwd, sigact, sigmask, holes, exe) =
+        let (regions, n_regions, brk_base, brk_cur, brk_end, mmap_cur, sigact, sigmask, holes, exe) =
             crate::with_task(|t| {
                 (
                     t.regions,
@@ -558,11 +513,6 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
                     t.brk_cur,
                     t.brk_end,
                     t.mmap_cur,
-                    t.fd_names.clone(),
-                    t.fd_cloexec.clone(),
-                    t.fd_nonblock.clone(),
-                    t.std_closed,
-                    t.cwd.clone(),
                     t.sigact,
                     t.sigmask,
                     t.holes,
@@ -570,7 +520,6 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
                 )
             });
         crate::with_task_slot(slot_idx + 1, |ct| {
-        ct.cwd = cwd;
         // fork: handlers and the mask are inherited (a child that resets
         // SIGPIPE reads back what its parent had installed).
         ct.sigact = sigact;
@@ -585,32 +534,8 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         ct.brk_end = brk_end;
         ct.mmap_cur = mmap_cur;
         ct.exit = None;
-        // Linux's epoll fork rule (poll.md): an epoll fd is STRIPPED from
-        // the child's table — the instance stays the creator's, and the
-        // child's exec cloexec sweep cannot free it out from under the
-        // reactor thread that created it.
-        let mut fds = fds;
-        fds.retain(|_, d| !matches!(d, crate::OpenFile::Epoll(_)));
-        ct.fd_names = fds;
-        ct.fd_cloexec = cloexec;
-        ct.fd_nonblock = nonblock;
-        ct.std_closed = std_closed;
-        // Session ph (boot ph-3): the clone above must take the COUNTED pipe
-        // references with it — the M2 arm's own rule ("a pipe end is a
-        // *counted* kernel resource: every payload the child's table
-        // inherited needs one kernel-side reference taken on top of the
-        // clone"). Without the walk, ash's first post-fork close of its own
-        // copies drove the entry's refcount to zero and DESTROYED the pipe
-        // while both children still held cloned fds: echo wrote into
-        // `NoSuchPipe` and died by the SIGPIPE stand-in; the pipeline
-        // delivered nothing (boot ph-3 trace: pp id=1, then no cln until the
-        // children's own dup2s, then wp id=1 out=NoSuchPipe).
-        for d in ct.fd_names.values() {
-            let (ends, n) = d.pipe_ends();
-            for (id, w) in &ends[..n] {
-                crate::pipes::clone_ref(*id, *w);
-            }
-        }
+        // The descriptors are the registered Process's: `fork_process` deep-cloned
+        // its table (pipe and socket references taken, epoll fds stripped).
         });
     }
     CHILD_BIND.with_mut(|b| b[tid] = (tid, pid, root_pa));
@@ -954,11 +879,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
         Ok(a) => a,
         Err(no) => return crate::e(no),
     };
-    // Relative to the process's cwd (`Process.cwd`, which glue's `chdir` writes), then symlinks.
-    let Ok(absolute) = akuma_syscalls_glue::fs::resolve_path_at(-100, &args.path) else {
-        return crate::e(crate::err::ENOENT);
-    };
-    let effective = crate::resolve_effective(&absolute);
+    let effective = crate::resolve_effective(&args.path);
     let image = match crate::read_image(&effective) {
         Ok(i) => i,
         Err(err) => {
