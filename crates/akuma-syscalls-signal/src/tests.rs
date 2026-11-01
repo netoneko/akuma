@@ -162,3 +162,17 @@ fn procmask_matches_the_glue_formula_it_replaced() {
         }
     }
 }
+
+#[test]
+fn altstack_flag_rules() {
+    // Disable wins over any size, autodisarm may ride along.
+    assert_eq!(altstack_change(SS_DISABLE, 0), Ok(AltStackChange::Disable));
+    assert_eq!(altstack_change(SS_DISABLE | i32::MIN, 0), Ok(AltStackChange::Disable));
+    // SS_ONSTACK (1) and unknown bits are refused before the size is looked at.
+    assert_eq!(altstack_change(1, 1 << 20), Err(AltStackError::Inval));
+    assert_eq!(altstack_change(4, 1 << 20), Err(AltStackError::Inval));
+    // Enabled: the MINSIGSTKSZ boundary is inclusive.
+    assert_eq!(altstack_change(0, MINSIGSTKSZ - 1), Err(AltStackError::NoMem));
+    assert_eq!(altstack_change(0, MINSIGSTKSZ), Ok(AltStackChange::Install));
+    assert_eq!(altstack_change(i32::MIN, MINSIGSTKSZ), Ok(AltStackChange::Install));
+}

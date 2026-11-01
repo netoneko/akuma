@@ -7,13 +7,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import hpbox
 K, SMP = sys.argv[1], sys.argv[2]
 INIT = sys.argv[3] if len(sys.argv) > 3 else "/root/tx/sshd-fork-linuxabi"
+# BR_N (default 5) picks the rig slot: run dir /root/tx-run<N>, ssh port 2220+N, target /root/tx-target-sig<suffix>. Distinct N run in parallel.
+N = os.environ.get("BR_N", "5")
+PORT = 2220 + int(N)
+TGT = "/root/tx-target-sig" if N == "5" else f"/root/tx-target-sig{N}"
 P = os.path.dirname(os.path.abspath(__file__))
 data = open(K, "rb").read()
-d = "/root/tx-target-sig/x86_64-unknown-none/release/taoxichuan"
+d = f"{TGT}/x86_64-unknown-none/release/taoxichuan"
 subprocess.run(hpbox.RZ_ROOT + [f"mkdir -p {os.path.dirname(d)} && cat > {d}.new && chmod +x {d}.new && mv {d}.new {d}"], input=data, check=True, timeout=300)
-hpbox.ryzen_root("for r in 3 4 5 6; do TX_RUN=/root/tx-run$r bash /root/tx-pop.sh stop; done; sleep 1", timeout=60)
-print(hpbox.ryzen_root(f"TX_TARGET=/root/tx-target-sig TX_PORT=2225 TX_RUN=/root/tx-run5 TX_SMP={SMP} TX_APPEND=smp={SMP} TX_MEM=3072 TX_INIT={INIT} bash /root/tx-pop.sh boot {os.environ.get('TX_FRESH', 'fresh')}; sleep 25", timeout=120)[1].strip(), flush=True)
-SSH = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-p", "2225", "root@192.168.1.126"]
+hpbox.ryzen_root(f"TX_RUN=/root/tx-run{N} bash /root/tx-pop.sh stop; sleep 1", timeout=60)
+print(hpbox.ryzen_root(f"TX_TARGET={TGT} TX_PORT={PORT} TX_RUN=/root/tx-run{N} TX_SMP={SMP} TX_APPEND=smp={SMP} TX_MEM=3072 TX_QEMU_EXTRA='-monitor unix:/root/mon{N},server,nowait' TX_INIT={INIT} bash /root/tx-pop.sh boot {os.environ.get('TX_FRESH', 'fresh')}; sleep 25", timeout=120)[1].strip(), flush=True)
+SSH = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-p", str(PORT), "root@192.168.1.126"]
 
 def run(c, t=120):
     for _ in range(3):
@@ -43,4 +47,4 @@ for i in range(120):
         break
     if i % 4 == 0:
         print(int(time.time() - t0), "s:", tail.replace("\n", " | ")[-120:], flush=True)
-print("faults on console:", hpbox.ryzen_root("grep -acE 'Fault|PANIC|BADFRAME|stuck|never ack' /root/tx-run5/console.log", timeout=60)[1].strip())
+print("faults on console:", hpbox.ryzen_root(f"grep -acE 'Fault|PANIC|BADFRAME|stuck|never ack' /root/tx-run{N}/console.log", timeout=60)[1].strip())

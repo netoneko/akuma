@@ -291,7 +291,11 @@ cited above landed 2026-10-30), `docs/archive/TAOXICHUAN_FIXED_POINT.md`
 
 | X4 pte/cow (policy half) | `akuma_cow::kernel_write` (Allow/Break/Refuse) and `needs_private_copy` replace the inline PTE-bit tests in `cow_prepare_write` / `cow_privatize` (+2 host tests); Taoxichuan's `PTE_W/COW/D/ADDR` are `akuma-pte-amd64`'s (+ `D`). The effect trio (`cow_resolve`) is **not** shared: amd64's break holds the owner's address-space lock, keeps a ledger and decs the count on take-in-place, Taoxichuan's does none of that - a shared `PteIo` trait would hide those differences, so the plan's X4 effect extraction is dropped | `1f15d09b` |
 
-Not started: X5-X10. The nested-crossing retirement (S3) is still open.
+| X5 signal/eventfd (table + altstack rule) | `akuma_syscalls_eventfd::EventFdTable<N>` (lowest-free `create` with flags-before-fullness, `read`/`write`/`can_read`/`close`, empty or out-of-range slot = `None`; +3 host tests) replaces the hand-rolled `[Option<EventFd>; 4]` bookkeeping; `akuma_syscalls_signal::altstack_change` (+ `SS_DISABLE`, `MINSIGSTKSZ`, `AltStackChange`, `AltStackError`; +1 host test) holds `sigaltstack`'s flag/size rule. No other kernel carried a copy of either (amd64's eventfd is `akuma-syscalls-glue`'s `BTreeMap`, welded to `Process`), so this buys tests, not deduplication; the plan's ~250-line estimate was for a marshal half that does not exist outside this kernel. `sigaction`/`sigprocmask`/`tkill`/`membarrier` were already thin over crate decisions and are unchanged | (this commit) |
+
+X5 verification: host tests (eventfd 9, signal 12) and clippy clean; `gate2.py` smp=4 9/9, 0 faults. The in-guest `-j4` build is **intermittent on both the X5 kernel and the pre-X5 control**, so it did not gate X5 (see `HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD.md`, "Correction").
+
+Not started: X6-X10. The nested-crossing retirement (S3) is still open.
 
 Verification on the ryzen (bare metal, Akuma host entry 29 = "KVM herd", `smp=8`), host kernel `e7661570` built on the ryzen:
 * host boots, 7 APs online, wifi + sshd up;

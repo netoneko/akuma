@@ -86,3 +86,12 @@ e2fsck on the overlay fixed 2 invalid HTREE roots, 4 corrupted directories (one 
 Result with the X4 kernel (`target/.../taoxichuan`, 4 vCPUs): `-j4` build **10m29s, artifact md5 `38852d54...` (identical to the kb-fix artifact)**, 12 `[BKL] stuck`
 lines (vs 123-180 on the corrupted disk), no `[Fault]`. So there is no CoW/X1-X4 regression; the host watchdog resets are the only open item here.
 The real p3 is still unrepaired and still carries the corruption; the owner decides whether to `e2fsck` it.
+
+## Correction (2026-11-01, later): the stall is NOT explained by the disk
+The "Resolved" section above rested on one passing run. After p3 itself was repaired (`e2fsck -fp` stopped at a corrupt directory, `-fy` finished it; clean on re-check) and
+fresh overlays were used, the same pre-X5 control kernel (1591736 bytes, in-guest tree pinned to one commit) gave: ECHILD (`No child process`, os error 10) from cargo's
+spawn at ~200 s; a spin at `execve rust-lld` (4 vCPUs at ~394% CPU, console frozen, `[BKL] stuck` 84+ and climbing, sshd unreachable); then two passes
+(4 vCPUs 13m45s, 1 vCPU 8m22s, artifact md5 `38852d54...` both). The X5 kernel gave one rustc `#GP` (ring 3, `rip=0x300469d8`, slot 4) and one `rust-lld` spin.
+So: a nondeterministic fork/exec/BKL fault exists on the pre-X5 kernel too, at 4 vCPUs (1 vCPU not yet seen to fail), independent of the fsck. Disk corruption may have
+made it more likely; it is not the whole story. `build_run.py` now takes `BR_N` (parallel rig slots) and opens a QEMU monitor at `/root/mon<N>` so a wedged guest's
+registers can be read with `info registers -a`.

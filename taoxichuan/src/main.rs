@@ -1487,9 +1487,7 @@ fn tkill_arm(tid: u64, sig: u64) -> u64 {
 /// `sigaltstack`'s disabled state: what a task that never set one reads back.
 const SIGALT_OFF: akuma_syscalls_linux::StackT =
     akuma_syscalls_linux::StackT { sp: 0, flags: SS_DISABLE, _pad: 0, size: 0 };
-const SS_DISABLE: i32 = 2;
-/// `MINSIGSTKSZ`: a stack smaller than this is `ENOMEM`.
-const MINSIGSTKSZ: u64 = 2048;
+use akuma_syscalls_signal::SS_DISABLE;
 
 /// `sigaltstack(ss, old)`: read back the task's record, then replace it. The
 /// 24-byte `stack_t` is the same layout on both ABIs (`akuma-syscalls-linux`).
@@ -1508,17 +1506,12 @@ fn sigaltstack_arm(ss: u64, old: u64) -> u64 {
         let sp = u64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
         let flags = i32::from_le_bytes(b[8..12].try_into().unwrap_or([0; 4]));
         let size = u64::from_le_bytes(b[16..24].try_into().unwrap_or([0; 8]));
-        // SS_ONSTACK (1) cannot be set by the caller, and only SS_AUTODISARM
-        // (1 << 31) may ride along with the mode.
-        if flags & !(SS_DISABLE | i32::MIN) != 0 {
-            return e(ring3::err::EINVAL);
-        }
-        let new = if flags & SS_DISABLE != 0 {
-            SIGALT_OFF
-        } else if size < MINSIGSTKSZ {
-            return e(ring3::err::ENOMEM);
-        } else {
-            akuma_syscalls_linux::StackT { sp, flags, _pad: 0, size }
+        use akuma_syscalls_signal::{AltStackChange, AltStackError, altstack_change};
+        let new = match altstack_change(flags, size) {
+            Ok(AltStackChange::Disable) => SIGALT_OFF,
+            Ok(AltStackChange::Install) => akuma_syscalls_linux::StackT { sp, flags, _pad: 0, size },
+            Err(AltStackError::Inval) => return e(ring3::err::EINVAL),
+            Err(AltStackError::NoMem) => return e(ring3::err::ENOMEM),
         };
         with_task(|t| t.sigalt = new);
     }
@@ -2587,11 +2580,11 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
 /// the fd carries the index; a dup'd fd names the same slot, and the slot
 /// frees when any fd naming it closes — the single-task guest has no
 /// forking parent to keep one alive past the close).
-static EVENTFDS: akuma_primitives::cell::BorrowCell<[Option<akuma_syscalls_eventfd::EventFd>; 4]> =
-    akuma_primitives::cell::BorrowCell::new([None, None, None, None]);
+static EVENTFDS: akuma_primitives::cell::BorrowCell<akuma_syscalls_eventfd::EventFdTable<4>> =
+    akuma_primitives::cell::BorrowCell::new(akuma_syscalls_eventfd::EventFdTable::new());
 
 /// Run `f` on the eventfd table; nothing holds it across a user copy.
-fn eventfds<R>(f: impl FnOnce(&mut [Option<akuma_syscalls_eventfd::EventFd>; 4]) -> R) -> R {
+fn eventfds<R>(f: impl FnOnce(&mut akuma_syscalls_eventfd::EventFdTable<4>) -> R) -> R {
     EVENTFDS.with_mut(f)
 }
 
@@ -2600,17 +2593,9 @@ fn eventfds<R>(f: impl FnOnce(&mut [Option<akuma_syscalls_eventfd::EventFd>; 4])
 /// bit for every kind, so fcntl F_SETFL stays the one switch); `EFD_CLOEXEC`
 /// records the table's cloexec bit, nothing execs past it yet.
 fn eventfd2_arm(initval: u64, flags: u64) -> u64 {
-    let ef = match akuma_syscalls_eventfd::EventFd::new(initval as u32, flags as u32) {
-        Ok(ef) => ef,
+    let slot = match eventfds(|t| t.create(initval as u32, flags as u32)) {
+        Ok(slot) => slot,
         Err(no) => return e(no as u64),
-    };
-    let slot = eventfds(|t| {
-        let slot = t.iter().position(core::option::Option::is_none)?;
-        t[slot] = Some(ef);
-        Some(slot)
-    });
-    let Some(slot) = slot else {
-        return e(ring3::err::EMFILE);
     };
     let desc = OpenFile::EventFd(slot);
     let min = new_fd_min();
@@ -2633,7 +2618,7 @@ fn eventfd2_arm(initval: u64, flags: u64) -> u64 {
 /// has none, so Linux's would-block answers EAGAIN here by construction
 /// (the fd's nonblock bit changes nothing: there is no waiter to park).
 fn eventfd_read_arm(idx: usize, buf_va: u64) -> u64 {
-    let Some(res) = eventfds(|t| t[idx].as_mut().map(akuma_syscalls_eventfd::EventFd::read)) else {
+    let Some(res) = eventfds(|t| t.read(idx)) else {
         return e(ring3::err::EBADF);
     };
     match res {
@@ -2659,7 +2644,7 @@ fn eventfd_write_arm(idx: usize, buf_va: u64) -> u64 {
 /// The write itself (the value already gathered — writev's head bytes take
 /// this path too, matching Linux's first-8-bytes-of-the-gather rule).
 fn eventfd_write_val(idx: usize, val: u64) -> u64 {
-    let Some(res) = eventfds(|t| t[idx].as_mut().map(|ef| ef.write(val))) else {
+    let Some(res) = eventfds(|t| t.write(idx, val)) else {
         return e(ring3::err::EBADF);
     };
     match res {
@@ -2674,13 +2659,13 @@ fn eventfd_write_val(idx: usize, val: u64) -> u64 {
 /// Close every fd naming `idx`: drop the slot (the single-task guest has no
 /// co-referring parent process — the Socket treatment).
 fn eventfd_close_slot(idx: usize) {
-    eventfds(|t| t[idx] = None);
+    eventfds(|t| t.close(idx));
 }
 
 /// poll/select readiness for an eventfd fd: readable while the counter is
 /// non-zero (sock.rs's `fd_events` asks through here).
 pub(crate) fn eventfd_can_read(idx: usize) -> bool {
-    eventfds(|t| t[idx].as_ref().is_some_and(akuma_syscalls_eventfd::EventFd::can_read))
+    eventfds(|t| t.can_read(idx))
 }
 /// One bit per syscall number below 512 already named by `nosys_note`.
 static NOSYS_SEEN: [core::sync::atomic::AtomicU64; 8] =

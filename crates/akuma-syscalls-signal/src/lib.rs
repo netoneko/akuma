@@ -40,6 +40,45 @@ pub enum SigError {
     Inval,
 }
 
+/// `stack_t.ss_flags` disable bit.
+pub const SS_DISABLE: i32 = 2;
+/// `MINSIGSTKSZ`: an enabled alternate stack smaller than this is `ENOMEM`.
+pub const MINSIGSTKSZ: u64 = 2048;
+
+/// What `sigaltstack(ss, ..)` was asked to do, once the flags are checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AltStackChange {
+    /// `SS_DISABLE`: the task goes back to having no alternate stack.
+    Disable,
+    /// Install the caller's `{sp, flags, size}` as given.
+    Install,
+}
+
+/// The two ways `sigaltstack` refuses a new stack (the caller maps them to errno).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AltStackError {
+    /// `EINVAL`: a flag the caller may not set.
+    Inval,
+    /// `ENOMEM`: enabled, but smaller than `MINSIGSTKSZ`.
+    NoMem,
+}
+
+/// `sigaltstack`'s decision on a new `stack_t`. `SS_ONSTACK` (1) is the
+/// kernel's to report and the caller's to never set; only `SS_AUTODISARM`
+/// (`1 << 31`) may ride along with the mode. `SS_DISABLE` wins over `size`.
+pub fn altstack_change(flags: i32, size: u64) -> Result<AltStackChange, AltStackError> {
+    if flags & !(SS_DISABLE | i32::MIN) != 0 {
+        return Err(AltStackError::Inval);
+    }
+    if flags & SS_DISABLE != 0 {
+        Ok(AltStackChange::Disable)
+    } else if size < MINSIGSTKSZ {
+        Err(AltStackError::NoMem)
+    } else {
+        Ok(AltStackChange::Install)
+    }
+}
+
 /// One kernel `struct sigaction`: `[handler, flags, restorer, mask]`.
 pub type SigAction = [u64; 4];
 
