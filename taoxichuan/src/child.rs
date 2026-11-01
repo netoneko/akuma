@@ -231,17 +231,6 @@ pub fn nested_active() -> bool {
     crate::exec_twin::current_slot() != crate::exec_twin::NO_SLOT
 }
 
-/// The pid the current task should report (`getpid`): 1 for the boot task,
-/// the spawn slot's pid while the child runs.
-pub fn current_pid() -> u32 {
-    let cur = crate::exec_twin::current_slot();
-    if cur != crate::exec_twin::NO_SLOT {
-        slot_pid(cur)
-    } else {
-        1
-    }
-}
-
 /// The `ProcessHooks::pid_for_thread` / `find_pid_by_thread` arm: the pid a
 /// spawn-ring slot runs under today, `None` for an unused slot. The thread
 /// namespace on this kernel IS the spawn ring until `fork_process` (slice 3)

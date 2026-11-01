@@ -1195,17 +1195,6 @@ fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
     0
 }
 
-/// The calling thread's tid: its threading slot for a `CLONE_THREAD` sibling
-/// (the number `clone` handed back and `CLONE_CHILD_SETTID` wrote), the pid
-/// for everyone else.
-fn my_tid() -> u64 {
-    if child::is_thread_task() {
-        exec_twin::current_slot() as u64
-    } else {
-        u64::from(child::current_pid())
-    }
-}
-
 /// `--features trace-err`: the last 128 mmap-slab events (kind, start, end), so
 /// a fault can name the unmap/replace that took its page away.
 #[cfg(feature = "trace-err")]
@@ -1374,51 +1363,6 @@ fn tkill_arm(tid: u64, sig: u64) -> u64 {
         akuma_threading::get_waker_for_thread(tid).wake();
     }
     0
-}
-
-/// `prctl(option, ...)`. The one option anything on this guest issues is
-/// `PR_SET_NAME` (15) — a Rust/tokio program names its threads at startup;
-/// it printed `[nosys] nr=157` ahead of the epoll failure and is harmless,
-/// but a live name makes the console traces readable, so the name is kept
-/// in a fixed per-slot array (no allocation). `PR_GET_NAME` reads it back;
-/// every other option is EINVAL, Linux's answer for an unknown option —
-/// NOT a blanket 0, which would mask an option a future binary relies on.
-fn prctl_arm(option: u64, arg2: u64) -> u64 {
-    const PR_SET_NAME: u64 = 15;
-    const PR_GET_NAME: u64 = 16;
-    const NAME_LEN: usize = 16;
-    static SLOT_NAMES: akuma_primitives::cell::BorrowCell<[[u8; NAME_LEN]; crate::child::NSLOTS]> =
-        akuma_primitives::cell::BorrowCell::new([[0; NAME_LEN]; crate::child::NSLOTS]);
-    let slot = crate::exec_twin::current_slot();
-    match option {
-        PR_SET_NAME => {
-            let mut name = [0u8; NAME_LEN];
-            // Musl copies up to 16 bytes; a short name just NUL-pads here.
-            if arg2 != 0 && !copy_from_user(&mut name, arg2) {
-                return e(ring3::err::EFAULT);
-            }
-            if slot < crate::child::NSLOTS {
-                SLOT_NAMES.with_mut(|t| t[slot] = name);
-            }
-            0
-        }
-        PR_GET_NAME => {
-            if arg2 == 0 || !crate::user_ok(arg2, NAME_LEN as u64) {
-                return e(ring3::err::EFAULT);
-            }
-            let name = if slot < crate::child::NSLOTS {
-                SLOT_NAMES.with(|t| t[slot])
-            } else {
-                [0u8; NAME_LEN]
-            };
-            if copy_to_user(arg2, &name) {
-                0
-            } else {
-                e(ring3::err::EFAULT)
-            }
-        }
-        _ => e(ring3::err::EINVAL),
-    }
 }
 
 /// Switch which task slot the syscall path acts on (the SPAWN arm, the
@@ -1915,6 +1859,10 @@ const fn served_by_glue(call: akuma_syscalls_abi::Syscall) -> bool {
             | S::RtSigaction
             | S::RtSigprocmask
             | S::Sigaltstack
+            // Thread naming and the exit-time tid clear (`Process.clear_child_tid`,
+            // which this kernel's thread exit reads).
+            | S::Prctl
+            | S::SetTidAddress
             // Sockets (step 2b, with the fd table): AF_INET and AF_UNIX are
             // glue's; `sockaddr` and `msghdr` have one layout on both ABIs.
             | S::Socket
@@ -2076,13 +2024,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     e(ring3::err::ENOSYS)
                 }
             }
-        }
-        ring3::nr::SET_TID_ADDRESS => {
-            // The word the kernel zeroes and futex-wakes at this thread's exit.
-            if let Some(p) = akuma_exec::process::current_process_shared() {
-                p.clear_child_tid.store(fr.arg1(), core::sync::atomic::Ordering::Release);
-            }
-            my_tid()
         }
         akuma_syscalls_abi::x86_64::FUTEX => {
             futex::sys_futex(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6())
@@ -2425,9 +2366,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         akuma_syscalls_abi::x86_64::TKILL => tkill_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::TGKILL => tkill_arm(fr.arg2(), fr.arg3()),
-        // `prctl(157)`: PR_SET_NAME (a tokio program names its threads;
-        // the guest's first `[nosys]` line today), PR_GET_NAME, EINVAL else.
-        akuma_syscalls_abi::x86_64::PRCTL => prctl_arm(fr.arg1(), fr.arg2()),
         other => {
             // A guest task hit a number this table does not serve; the errno
             // is the answer (the arch-level checklist arm is above). The
