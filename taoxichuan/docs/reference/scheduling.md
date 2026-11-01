@@ -33,7 +33,7 @@ Canonical mermaid source: [`../diagrams/scheduling.md`](../diagrams/scheduling.m
   per-slot trap stack (`arm_trap_stack` — a preempting switch leaves the
   interrupted frame on the interrupted task's stack, so the next ring-3 trap
   on any task must not land there). Two gates, both paid for:
-  - **The user-era gate** (`PREEMPT_ARMED`, set at the first SPAWN crossing):
+  - **The user-era gate** (`PREEMPT_ARMED`, set when init's thread is published):
     before it the machine is kernel-only and a switching tick died inside net
     calibrate — no legal switch target exists.
   - **The slotted-current gate**: after an exec'd shell's exit tears its slot
@@ -71,10 +71,9 @@ moves the stacks itself; the twin adds, in order:
 2. `TASK_SLOT = sched_task_slot_of(to)` — the dispatcher's `task()` must name
    the incoming task's record, or a resumed task runs its syscalls against the
    *previous* task's fd table and root (the exec'd shell's writev loop reading
-   zeros out of the wrong address space, boot pg-2). The shell is threading
-   tid `shell_tid()` — its spawn-ring slot, written at every SPAWN crossing
-   (it was once hardcoded 0, which only held for a boot's first login spawn);
-   real children are task record `tid + 1`. The idle thread (tid ≥ NSLOTS) is
+   zeros out of the wrong address space, boot pg-2). Task `tid` runs against
+   record `tid + 1` (a `CLONE_THREAD` sibling against its creator's); the boot
+   thread is tid 0, record 1. The idle thread (tid ≥ NSLOTS) is
    excluded — kernel-only, leaves the previous task's slot armed, exactly as
    it leaves CR3,
 3. the incoming task's **trap stack** (`arm_trap_stack`),

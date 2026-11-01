@@ -189,10 +189,7 @@ Rows of the table below for calls served by glue are historical until the sweep
 | 302 | prlimit64 | glue | as getrlimit; sets accepted-ignored | musl's pthread stack sizing |
 | 306 | syncfs | dispatch (main.rs) | `root_fs().sync()` | as sync |
 | 331 | membarrier | `membarrier_arm` (main.rs) | `akuma-syscalls-mem::membarrier` command probing | queries served; no global barrier needed on one core |
-| 0x1000+301 | akuma SPAWN | `spawn_arm` (child.rs) | the child model | run-to-completion; returns pid \| stdout_fd<<32 |
-| 0x1000+303 | akuma WAITPID | `waitpid_arm` (child.rs) | spawn ring | 0 for unknown-but-plausible ("still running") |
 | 0x1000+319 | akuma UPTIME | dispatch (main.rs) | net::uptime_us | µs since boot |
-| 0x1000+326 | akuma CLOSE_CHILD_STDIN | `close_stdin_arm` (child.rs) | — | success without effect (no stdin path exists) |
 
 The legacy x86-only numbers (mkdir 83, rename 82, rmdir 84, unlink 87,
 `chmod` 90, `chown` 92/94, `symlink` 88, `readlink` 89, `unlink` …) are folded

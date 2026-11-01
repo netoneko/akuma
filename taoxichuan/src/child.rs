@@ -1,64 +1,40 @@
-//! Stage 4: the child model — a pipe that is just a buffer.
+//! Processes on this kernel: the slot table every forked task and thread
+//! occupies, `clone`/`fork`/`vfork` through `akuma-exec`'s `fork_process`,
+//! `execve`, exit and `wait4`, init's thread, the two signal arms this kernel
+//! keeps (`rt_sigsuspend`, `rt_sigreturn`), and the machine-state arms
+//! (`X86ArchHooks`) the shared scheduler calls.
 //!
-//! The one design decision of the stage. `sshd`'s exec path spawns
-//! `/bin/sh -c <cmd>` (Akuma's SPAWN syscall), then bridges the child's
-//! stdout to the ssh channel while polling `waitpid` for the exit. The full
-//! kernel answers that with fork, a real pipe, and a scheduler. This kernel
-//! has none of those, pinned exclusions all — so the honest minimal model is:
-//!
-//! **A spawned child runs to completion inside the SPAWN syscall.** Its
-//! stdout lands in a kernel buffer (the "pipe" — there is no reader to
-//! block, so a `Vec<u8>` is the whole semantics); SPAWN returns the pid and
-//! a `ChildOut` fd; the child's exit status is recorded and `waitpid`-able
-//! from the moment SPAWN returns. The parent (sshd) sees exactly the
-//! protocol it expects — an fd to drain, a pid to reap — and the kernel
-//! never needs a second runnable task: at every instant either the parent
-//! is in the kernel running the child, or the parent is in ring 3 and the
-//! child does not exist.
-//!
-//! The mechanics (one core, `IF` clear, one kernel stack): SPAWN saves the
-//! parent's parked user `RSP`, the syscall stack top, and the callee-saved
-//! registers; points the syscall stack at a lower region; loads the child's
-//! address space and `sysretq`s into it. The child's syscalls dispatch on
-//! the nested stack region. Its `exit_group` does **not** chain the cmdline
-//! reaper (`task_done`) — it records the status, switches `CR3` back to the
-//! parent's root, restores the saved registers, and `ret`s straight back
-//! into the SPAWN arm, coroutine-style. The parent's syscall then completes
-//! normally: the stub finds its own stash, and the parent is back in ring 3
-//! holding a pid that has already exited.
+//! This file began as the stage-4 child model, where Akuma's private `SPAWN` ran
+//! a child to completion inside the syscall. That path, its syscall and its
+//! crossing are gone (`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`, step 2e): every
+//! process here is a fork child of init.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use akuma_ring3_amd64 as ring3;
 
-/// One reaped-or-running child. Slots recycle round-robin: sshd serves
-/// sessions one bridge at a time in practice, and four cover even the
-/// `max_sessions` stall case without unbounded kernel memory.
+/// One ring slot: a forked task or a `CLONE_THREAD` sibling, from
+/// `bind_child_task` until it is reaped. The slot index is the task's
+/// threading tid.
 #[allow(clippy::struct_excessive_bools)] // one flag per independent slot fact; a bitset would hide them
 pub struct SpawnSlot {
     pub used: bool,
     pub pid: u32,
-    /// Always false by the time SPAWN returns — a slot's child runs to
-    /// completion inside the syscall. Kept so the state machine is honest.
+    /// The task has not exited yet (set at bind, cleared at exit).
     pub running: bool,
     /// Linux wait status (`code << 8`), what `waitpid_status` relays.
     pub status: u32,
-    /// M2 (fork): WAIT4 reaped this child — a second wait on the pid is
-    /// ECHILD, which is how a shell's job table closes the entry.
+    /// WAIT4 reaped this child: a second wait on the pid is ECHILD, which is
+    /// how a shell's job table closes the entry.
     pub reaped: bool,
     /// Slice 3: the tid parked in WAIT4 for this child (`u32::MAX` = none).
     /// The child's exit arm wakes it through the threading waker.
     pub waiter: u32,
-    /// Slice 3 (session pe): this slot's child is a REAL fork child —
-    /// published by `fork_process` with its own threading slot — as opposed
-    /// to an M2 spawned child, which also occupies a slot (`used`+`running`+
-    /// `current_slot`, spawn_arm stamps the same triple) but must reach
-    /// `child_exit`. Boot A's wedge: the unqualified slot test read true for
-    /// the session's second SPAWN child (slot 1; the first always lands on
-    /// slot 0, which the test's `cur == 0` guard excludes) and routed its
-    /// exit_group into `task_exit_real`, which abandoned sshd mid-syscall.
-    /// Only `bind_child_task` sets this, so the reset in `new()` clears any
-    /// previous occupant's bit.
+    /// Set only by `bind_child_task`: the slot holds a task `fork_process`
+    /// published. With the private SPAWN path gone every occupied slot gets
+    /// it, and `is_real_task` still reads it, so a slot whose bind has not
+    /// completed never counts. The reset in `new()` clears any previous
+    /// occupant's bit.
     pub real: bool,
     /// A `CLONE_THREAD` sibling: shares its creator's task record
     /// (`TASK_OF`), owns no fds or address space of its own, and exits without
@@ -159,12 +135,9 @@ pub fn pid_for_slot(idx: usize) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
-// The SPAWN arm.
+// `execve`'s argument block.
 // ---------------------------------------------------------------------------
 
-/// argv/envp read-back budget: pointer slots scanned per array, and the byte
-/// budget per string. The SPAWN callers pass `argv <= 4`, `env <= 8`; the
-/// budgets bound a malicious or confused caller, not the honest case.
 /// Entry caps. `ring3::build_stack` holds 512 strings in all (argv + envp), so
 /// the exec path refuses a larger sum with `E2BIG`. Cargo's heaviest `rustc`
 /// call for this kernel has 344 arguments, one of 5192 bytes, ~19.6 KB of
@@ -204,18 +177,17 @@ fn read_user_string(va: u64) -> Result<String, u64> {
     String::from_utf8(bytes).map_err(|_| crate::err::EFAULT)
 }
 
-/// The SPAWN/EXECVE argument block: the two syscalls marshal `(path, argv,
-/// envp)` out of the calling task identically.
-struct SpawnArgs {
+/// `execve`'s `(path, argv, envp)`, marshalled out of the calling task.
+struct ExecArgs {
     path: String,
     argv: Vec<String>,
     env: Vec<String>,
 }
 
 /// Marshal `(path, argv, envp)` from user memory. `Err` is the errno the arm
-/// returns (EFAULT for a bad pointer, ENOENT for a relative path — the
-/// spawner passes absolute paths, and ash resolves PATH itself before execve).
-fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs, u64> {
+/// returns: EFAULT for a bad pointer, ENOENT for an empty or unresolvable path.
+/// A relative path resolves against `Process.cwd`; ash resolves `PATH` itself.
+fn read_exec_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<ExecArgs, u64> {
     let mut pbuf = [0u8; 512];
     let path = match crate::user_str(path_va, &mut pbuf) {
         Some(p) => String::from(p),
@@ -235,7 +207,7 @@ fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs
         argv.push(read_user_string(*p)?);
     }
     if argv.is_empty() {
-        argv.push(path.clone()); // Linux would EFAULT; a path-only spawn is kinder
+        argv.push(path.clone()); // Linux would EFAULT; a path-only exec is kinder
     }
     let mut env: Vec<String> = Vec::new();
     if envp_va != 0 {
@@ -252,14 +224,9 @@ fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs
     if total > ARG_BYTES_MAX {
         return Err(E2BIG);
     }
-    Ok(SpawnArgs { path, argv, env })
+    Ok(ExecArgs { path, argv, env })
 }
 
-// Akuma's SPAWN (0x1000+301): `spawn(path, argv, envp, stdin_ptr, stdin_len, flags)`.
-//
-// Runs the child to completion inside the call (the model this module
-// exists to state), then returns `pid | stdout_fd << 32` — the same packed
-// word the full kernel's SPAWN returns, read by the same `spawn_full`.
 // ---------------------------------------------------------------------------
 // M4 slice 3: the real fork — premise 2's build-out
 // ---------------------------------------------------------------------------
@@ -422,11 +389,9 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
     Ok(())
 }
 
-/// The kernel-stack top `switch_to` installs for `tid`: a real child's
-/// leaked pair (slice 2's `prepare_task_slot`), the shell's SPAWN crossing
-/// band (recorded at the crossing below), and anything else (the idle
-/// thread, out-of-range) — the current global, which for the idle task is
-/// simply left alone by the caller.
+/// The kernel-stack top `switch_to` installs for `tid`: a slot's leaked pair
+/// (`prepare_task_slot`); anything else (the idle threads) gets the current
+/// global, which the caller leaves alone.
 pub fn sched_kstack_top(tid: usize) -> u64 {
     if tid < NSLOTS {
         SLOT_STATE.with(|st| st[tid].kstack_top)
@@ -439,9 +404,7 @@ pub fn sched_kstack_top(tid: usize) -> u64 {
 /// updates it — a real child that exec'd must come back on the NEW image's
 /// root). 0 = leave CR3 alone (the idle thread runs on the kernel root).
 pub fn sched_task_slot_of(tid: usize) -> usize {
-    if tid == crate::exec_twin::shell_tid() {
-        1
-    } else if tid < NSLOTS {
+    if tid < NSLOTS {
         task_of(tid)
     } else {
         tid + 1
@@ -449,29 +412,21 @@ pub fn sched_task_slot_of(tid: usize) -> usize {
 }
 
 pub fn sched_root_of(tid: usize) -> u64 {
-    if tid == crate::exec_twin::shell_tid() {
-        crate::task_root_of(1) // the shell
-    } else if tid < NSLOTS {
+    if tid < NSLOTS {
         crate::task_root_of(task_of(tid))
     } else {
         0
     }
 }
 
-/// A REAL fork child is on the CPU: a threading tid 1..NSLOTS whose
-/// SpawnSlot is stamped and running. The shell (tid 0, inside its SPAWN
-/// crossing) and the boot task are NOT — their exits keep the M2 paths.
+/// A forked task is on the CPU: a threading tid 1..NSLOTS whose slot is
+/// stamped, running and bound. The boot thread (tid 0) and the idle threads
+/// are not.
 pub fn is_real_task() -> bool {
     let cur = crate::exec_twin::current_slot();
     if cur == crate::exec_twin::NO_SLOT || cur == 0 || cur >= NSLOTS {
         return false;
     }
-    // `real` is the whole discriminator, not an optimization: the M2 spawn
-    // path stamps the same used/running/current_slot triple for its
-    // run-to-completion children (spawn_arm), so without the bind-time bit
-    // this test misreads every SPAWN child from the ring's second slot on as
-    // a real fork child — boot A wedged the machine exactly there (session
-    // pe; the field's doc has the full chain).
     SLOTS.with(|s| s[cur].used && s[cur].running && s[cur].real)
 }
 
@@ -744,7 +699,7 @@ pub fn parent_of(child: u32) -> u32 {
 
 pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     let cur = crate::exec_twin::current_slot();
-    let args = match read_spawn_args(fr.arg1(), fr.arg2(), fr.arg3()) {
+    let args = match read_exec_args(fr.arg1(), fr.arg2(), fr.arg3()) {
         Ok(a) => a,
         Err(no) => return crate::e(no),
     };
@@ -1026,42 +981,16 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Exec-replace: the nested child's execve.
+// fork, vfork and clone.
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// The wait family, as the bridge drives it.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// M2 scaffold: the blocking fork (the trim plan's H3-f) and a real WAIT4.
-//
-// The plan's owner-approved exception to the composition rule: a fork that
-// runs the child to completion INSIDE the fork call — the SPAWN shape, but
-// the child is the CALLER's own code, resumed at its current RIP with RAX 0
-// on an eager, flag-faithful copy of its memory (no CoW: there is no page
-// fault handler, and eager copy is what the loader already does), with the
-// fd table the extracted crate's own fork decision (`fdtable::FdTable::
-// fork_copy`), never a hand copy. FORK RETURNS THE CHILD'S PID in the
-// parent; the child's exit status is in the slot, and WAIT4 — now a real
-// arm — reports it. **THROWAWAY: M4 (akuma-exec adoption — real scheduler,
-// `fork_process`, parked parents) replaces this whole section.** Depth 2 is
-// the ceiling here: a fork of the fork child has no stack region left, and
-// a parked parent cannot pump a pipe, which is why M4 exists.
-// ---------------------------------------------------------------------------
-
-/// CLONE/FORK/VFORK (56/57/58): the M2 blocking fork. On x86_64 musl issues
-/// `fork()` as `clone(SIGCHLD)` and `posix_spawn` as
-/// `clone(SIGCHLD|CLONE_VM|CLONE_VFORK)`, but **vfork as the raw SYS_vfork
-/// in assembly — no flags word at all** (`vfork.s`: `mov $58, %eax`), and
-/// busybox ash forks its non-final commands through exactly that, so the
-/// flags check keys on the number and FORK/VFORK are accepted bare. For
-/// CLONE: `SIGCHLD` alone (a real fork — the eager copy makes the child
-/// independent) and `SIGCHLD|CLONE_VM|CLONE_VFORK` (posix_spawn's shape;
-/// vfork's contract — the child touches nothing before exec — holds by
-/// construction, since the parent does not resume until the child has
-/// exited) are accepted; anything else (CLONE_THREAD and friends) is M4's
-/// scheduler, not this scaffold.
+/// CLONE/FORK/VFORK (56/57/58). On x86_64 musl issues `fork()` as
+/// `clone(SIGCHLD)` and `posix_spawn` as `clone(SIGCHLD|CLONE_VM|CLONE_VFORK)`,
+/// but **vfork as the raw SYS_vfork in assembly, no flags word at all**
+/// (`vfork.s`: `mov $58, %eax`), and busybox ash forks its non-final commands
+/// through exactly that, so FORK/VFORK are accepted bare. A `CLONE_THREAD`
+/// clone is a thread (`clone_thread_arm`); every other one is a fork through
+/// `fork_process` (`fork_arm_real`).
 pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     const CLONE_THREAD: u64 = 0x0001_0000;
     if fr.rax == ring3::nr::CLONE && fr.arg1() & CLONE_THREAD != 0 {

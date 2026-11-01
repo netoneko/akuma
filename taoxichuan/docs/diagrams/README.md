@@ -10,7 +10,6 @@ better, edit here and paste into the reference doc.
 |---|---|---|
 | Boot to init | [boot-to-init.md](boot-to-init.md) | `reference/boot.md` |
 | The syscall path | [syscall-path.md](syscall-path.md) | `reference/syscalls.md` |
-| Process model | [process-model.md](process-model.md) | `reference/processes.md` |
 | Scheduling | [scheduling.md](scheduling.md) | `reference/scheduling.md` |
 | Memory map | [memory-map.md](memory-map.md) | `reference/memory.md` |
 

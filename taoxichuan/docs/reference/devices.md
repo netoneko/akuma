@@ -105,9 +105,7 @@ pause-spinning guest pegs the core and starves the relay it is waiting on
 (boot ph-6's P3 stall: frozen `gw_frames`/`rx_starved` behind `hlt=0` with
 the guest core at 100%). The one bare-`pause` survivor is deliberate: the
 PIT calibration gate poll, where an `hlt` would skew the TSC window being
-measured. Nothing pumps while a spawned child runs to completion inside its
-SPAWN syscall; that is accepted (the child model), not hidden —
-[`processes.md`](processes.md).
+measured.
 
 DHCP is waited on at boot (10 s, pumping); a guest with no lease still boots —
 sshd binds and never answers, a legible failure rather than a hang. Outbound

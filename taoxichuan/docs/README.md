@@ -45,7 +45,7 @@ shared crates, and in what order — is planned in
 
 1. **Boot to init** — [`reference/boot.md`](reference/boot.md) § boot order; source [`diagrams/boot-to-init.md`](diagrams/boot-to-init.md).
 2. **The syscall path** — [`reference/syscalls.md`](reference/syscalls.md) § the crossing; source [`diagrams/syscall-path.md`](diagrams/syscall-path.md).
-3. **Process model** — [`reference/processes.md`](reference/processes.md); source [`diagrams/process-model.md`](diagrams/process-model.md).
+3. **Process model** — [`reference/processes.md`](reference/processes.md).
 4. **Scheduling** — [`reference/scheduling.md`](reference/scheduling.md); source [`diagrams/scheduling.md`](diagrams/scheduling.md).
 5. **Memory map** — [`reference/memory.md`](reference/memory.md); source [`diagrams/memory-map.md`](diagrams/memory-map.md).
 

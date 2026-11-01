@@ -1,81 +1,18 @@
-# Processes — the child model, the crossing, and the spawn ring
+# Processes — fork, exec, wait4 and the slot table
 
-**Stability: C** (the M4 slice-3 real-fork/preemption path landed recently;
-the M2 blocking arm still serves `clone`, and both shapes share one ring).
+**Stability: C** (the fork/preemption path landed recently).
 
-Two process mechanisms coexist, both indexed by the same spawn ring
-(`SpawnSlot`, `NSLOTS = 48` — the shell's slot 0 plus 47 threading tids;
-the ring was 12 until the first `cargo build` filled it, now 48:
-on this kernel **the tid and the ring index are the same number by
-construction**: `bind_child_task` stamps by tid, `switch_to`/`task()` index
-the same arrays):
+Every process is a fork child of init, through `akuma_exec::process::fork_process`. The child does **not**
+run inside the call: the crate publishes it as a runnable thread with its own threading slot, leaked kernel
+and trap stacks and a task record, and the arm returns the pid to the caller, as Linux does. Each one
+occupies a row of the slot table (`SpawnSlot`, `NSLOTS = 48`). On this kernel **the tid and the row index
+are the same number by construction**: `bind_child_task` stamps by tid, and `switch_to`/`task()` index the
+same arrays.
 
-1. **The M2 spawn/blocked-fork model** — a child runs to completion *inside*
-   the SPAWN (or blocking-fork) syscall. Its stdout lands in a kernel buffer
-   (the "pipe" — there is no reader to block, so a `Vec<u8>` is the whole
-   semantics); SPAWN returns the pid and a `ChildOut` fd; the exit status is
-   recorded and `waitpid`/`wait4`-able from the moment SPAWN returns.
-2. **The real fork** (`REAL_FORK = true`): plain `fork`/`vfork` (57/58) go
-   through `akuma_exec::process::fork_process` over the shell's registered
-   `Process`. The child does **not** run inside the call — the crate
-   publishes it as a runnable thread with its own threading slot, leaked
-   kernel+trap stacks and task record, and the arm returns the pid to the
-   caller, exactly like Linux. `clone` keeps the M2 blocking arm.
-
-## The SPAWN crossing (M2 model)
-
-```mermaid
-sequenceDiagram
-    participant P as parent (sshd, ring 3)
-    participant K as kernel syscall path (IF=0)
-    participant C as child (ring 3)
-    P->>K: SPAWN(path, argv, envp, …)
-    Note over K: marshal args; reserve ring slot in the threading pool<br/>(FREE or TERMINATED, NSLOTS tries, never blind-next);<br/>load_task on the PARENT's CR3 (all writes via physmap)
-    Note over K: slot record ← parent CR3, syscall-stack top,<br/>user-rsp stash, depth=1, out_slot=slot;<br/>register shell Process; PREEMPT_ARMED = true
-    K->>K: set_current_slot(slot); lower syscall-stack top by half;<br/>fs = 0 (a fresh image never inherits the outgoing TLS)
-    K->>C: child_enter (naked): save parent callee-saved regs + rsp<br/>into the slot's CrossSave, mov cr3, sysretq
-    loop child syscalls
-        C->>K: syscall → dispatch on the nested stack band
-        K-->>C: sysretq with the answer
-    end
-    C->>K: exit_group(code)
-    Note over K: child_exit: record status (code<<8) in the slot,<br/>release the task's pipe ends, set_current_slot(parent)
-    K->>K: exit_cross (naked): restore regs from CrossSave,<br/>mov cr3 (parent), mov eax, status, ret
-    K-->>P: SPAWN returns pid | stdout_fd<<32
-```
-
-Canonical mermaid source: [`../diagrams/process-model.md`](../diagrams/process-model.md).
-
-- `child_enter` and `exit_cross` are **naked** functions: their whole bodies
-  are the register contract. The inline-asm version of the exit tail once let
-  LLVM allocate an input onto a register the template itself overwrote —
-  `rbx`/`rbp` cannot be explicit inline-asm operands at all, which closed the
-  inline form off entirely (child.rs documents the incident on the function).
-- The syscall stack is split: the M2 child dispatches on the **lower half** of
-  the parent's 64 KiB band (a blocking-fork child at a quarter below the
-  shell's top). Real fork children get their own leaked 64 KiB band via
-  `prepare_task_slot`.
-- `CrossSave` is `repr(C)`, addressed by offset from asm (0x00 rsp, 0x08 rbx,
-  … 0x30 r15). Per-slot records (`SLOT_STATE`) replaced the shared crossing
-  statics: "who am I" is `exec_twin::current_slot()`, the one sanctioned
-  current-task static; the SMP slice puts `%gs` behind it and changes no
-  caller.
-- **The ring slot is reserved in the threading pool before anything
-  expensive** (`akuma_threading::reserve_slot`: FREE→INITIALIZING, accepting
-  TERMINATED so a dead fork child's number can be reclaimed, NSLOTS tries,
-  never the blind-next wrap onto a live ring). An unreserved number used to be
-  handed to a fork child, which then bound the shell's own cross record — the
-  pipeline deadlock of boots ph-2/ph-4.
-- The exec'd shell is registered as an `akuma-exec` `Process`
-  (`register_shell_process`, amd64's bootstrap registration adapted field for
-  field): `fork_process` opens with `current_process_shared()`, so the shell
-  must be in the process table and the tid↔pid map before it can fork. Its
-  address space is a `new_shared` **view** — the twin's task record owns the
-  root; a second owner would double-free it. `exec_replace`/`exec_real_task`
-  re-point the view at the fresh root after the image swap.
-- The first SPAWN crossing arms timer preemption (`PREEMPT_ARMED`) — the
-  first moment a ring-3 tick has a legitimate switch target
-  ([`scheduling.md`](scheduling.md)).
+Until cleanup step 2e (2026-11-01) a second mechanism coexisted with this one: Akuma's private `SPAWN`
+ran a child to completion *inside* the syscall, through a naked-asm crossing on a split syscall stack.
+That crossing, `SPAWN`/`WAITPID`/`CLOSE_CHILD_STDIN`, `exec_replace` and the blocking `clone` are deleted
+(`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`); git history before `f821ddda` has the code and its diagram.
 
 ## The real fork (slice 3) and the park/wake wait4
 
@@ -85,7 +22,7 @@ sequenceDiagram
     participant K as kernel
     participant Ch as fork child (own tid, own band)
     participant Id as idle thread
-    Sh->>K: fork() (57/58, REAL_FORK)
+    Sh->>K: fork() (57/58, or clone without CLONE_THREAD)
     K->>K: fork_process (crate): clone address space, capture context<br/>(LIVE fs_base); bind_child_task stamps SpawnSlot,<br/>task record tid+1, counted pipe refs, out_slot/depth
     Note over K: stamp_child_parent(child pid → shell pid)
     K-->>Sh: child pid — the child is RUNNABLE, not running
@@ -103,20 +40,15 @@ sequenceDiagram
   any switch) — a fork child inherits its parent's TLS, the same answer a real
   fork gives. `twin_enter_user` installs `ctx.fs_base` on every entry.
 - **A thread owns a `Process` row, and its exit must retire it.** `clone_thread` registers a real `Process` per thread. Only `reap_process` (a group *leader*, on its parent's `wait4`) used to unregister one, so a thread's own `exit` and `exit_group`'s `kill_siblings` leaked a process-table entry each; a `cargo build` of this kernel reached `Process table full` at pid ~345. Now `retire_thread_process` runs on both paths and `clone_thread_arm` calls `drain_retired()` at syscall *entry* (never at teardown: reclaim runs `Process::drop` and the exiting thread is still on its row) - the amd64 kernel's fix for the same family. `[reap]` lines print `procs=<active>/<retired>`; the count plateaus (peak 30 over the whole build). [`archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md`](../../../docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md) §7.
-- The fd table clone in `bind_child_task` takes the **counted pipe
-  references** with it (one `clone_ref` per cloned `Pipe` payload — the M2
-  arm's own rule; without the walk, the first post-fork close destroyed the
-  pipe under two live cloned fds).
-- A fork child's fd-1 writes land in the buffer sshd drains (`out_slot`
-  inherited), never its own slot; depth is stamped parent+1.
-- Fork depth ceiling is **3** (the shell at 1, its children 2, grandchildren
-  3): under the real path a fork child owns a threading stack and a syscall
-  band of its own, so the M2 "no stack region left" ceiling no longer binds.
-  Deeper stays `EPERM`.
-- The `real` bit on the slot is the discriminator between a real fork child
-  (set only by `bind_child_task`) and an M2 spawn child (same
-  used/running/current triple): an exit routes to `task_exit_real` only for
-  the former.
+- The fd table is `akuma-exec`'s `SharedFdTable`: `fork_process` deep-clones
+  it, with each descriptor kind's reference rules (pipe ends, sockets), so
+  `bind_child_task` copies no fds.
+- There is no fork depth ceiling: a fork child owns a threading stack and a
+  syscall band of its own. Only the boot task (no registered process) is
+  refused (`c1c885c5`; sshd -> session -> sh -> cargo -> rustc -> cc ->
+  collect2 -> ld is eight deep).
+- The `real` bit on the slot is set only by `bind_child_task`; an exit routes
+  to `task_exit_real` only when it is set.
 
 ## wait4 is parent-owned
 
@@ -154,8 +86,8 @@ one core — so fs is carried per-slot state (`SLOT_FS[NSLOTS]`):
 - `switch_to` installs the incoming task's shadow (one wrmsr per switch; the
   idle thread is skipped — kernel-only, no TLS).
 - `arch_prctl(ARCH_SET_FS)` and every crossing keep the shadow in step.
-- **The exec crossings zero fs** (`exec_replace`'s and `exec_real_task`'s, and
-  the spawn crossing hands images a deterministic `fs = 0`): the MSR rides the
+- **Exec zeroes fs** (`exec_real_task`, and the boot spawn hands init a
+  deterministic `fs = 0`): the MSR rides the
   `sysretq` crossing untouched, so without the zero a depth-2 exec entered the
   new image with the *outgoing* task's TLS pointer — grandfork's first
   stack-guard read (`fs:0x28`) hit the exec'd shell's busybox bss, unmapped in
@@ -216,10 +148,7 @@ pipeline deadlock root causes, the real fork, parked wait4),
 ## Threads, pids and faults (2026-10-30)
 - **Threads.** `clone(CLONE_THREAD)` calls `akuma_exec::process::clone_thread`, which publishes a runnable slot through the same bind hook as `fork`; for a thread the hook records `TASK_OF[slot]` = the creator's task record, so regions, brk/mmap cursors, the fd table and the cwd are one copy. `exit` (60) from a thread zeroes and wakes its `clear_child_tid` word (what `pthread_join` waits on) and ends that thread; `exit_group` ends the whole group, and a thread calling it hands the status to the group leader's waiter. A thread is `SpawnSlot.thread = true` and never appears as a reapable child.
 - **One pid allocator.** Every pid, fork child or thread, comes from `akuma_exec::process::allocate_pid` (floor 2). A private counter here once issued the same pid as a thread and collapsed two table rows.
-- **Faults.** A ring-3 fault in a real fork child or thread ends that task alone with wait status SIGSEGV (`rc=139`); the shell and the boot task still halt (they have no slot to reap through).
-- **The spawn crossing marks its pool slot RUNNING around `child_enter` and TERMINATED after.** Without it the picker never takes the slot (`INITIALIZING`), and the first preempting tick parked the spawn forever (deterministic under TCG).
-- **Sockets** are closed by the last fd referencing them across all task records (`sock::socket_refs`); an exiting task releases its sockets.
-- **Known limit:** enough spawns in one boot leak a kernel+trap band each until a claim picks a slot at or above the ring (`"Failed to allocate x86 task stacks"`); the 12-slot ring failed after ~15 spawns, the 48-slot ring scales the same leak (not re-measured). It dies with the ring in `switch-to-crates.md` S3.
+- **Faults.** A ring-3 fault in a fork child or thread ends that task alone with wait status SIGSEGV (`rc=139`); the boot task still halts (it has no slot to reap through).
 
 ## Init is pid 1 on a pool thread
 
@@ -229,5 +158,5 @@ The first boot program (`init=`) does not run on the boot stack. `spawn()` loads
 at the image's entry and publishes it. The boot thread is adopted as pool slot 0 (`x86_adopt_running_thread(0)`, as amd64 does) and
 parks in a loop that reports init's exit through `task_done`. Consequences: init can `fork`/`clone` (every non-thread `clone` is
 `fork_arm_real`) and is preempted by the tick, so `sshd` built with `fork-sessions` + `libakuma/linux-abi` runs one forked process per ssh
-session; the private SPAWN model (the cooperative sshd) is no longer reachable from init: `spawn_arm` answers `EPERM` and prints `[spawn] refused`. The fresh thread names its own slot current
+session. A cooperative sshd (Akuma's private `SPAWN`) gets `ENOSYS`: that syscall no longer exists here. The fresh thread names its own slot current
 before crossing (`init_thread_entry`): the crate does not do it for a seeded entry. Slice S1 of `switch-to-crates.md`.

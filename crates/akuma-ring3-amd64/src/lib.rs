@@ -1105,14 +1105,10 @@ pub mod nr {
     pub const GETRANDOM: u64 = 318;
     /// Akuma's private syscall base on x86_64.
     pub const AKUMA_PRIVATE_BASE: u64 = 0x1000;
-    /// Akuma SPAWN: `spawn(path, argv, envp, stdin, stdin_len, flags)` —
-    /// returns the packed `pid | stdout_fd << 32` word.
-    pub const SPAWN: u64 = AKUMA_PRIVATE_BASE + 301;
-    /// Akuma WAITPID: `waitpid(pid, &status)` — pid when reaped, 0 while
-    /// running.
-    pub const WAITPID: u64 = AKUMA_PRIVATE_BASE + 303;
-    /// Akuma CLOSE_CHILD_STDIN: deliver EOF to a spawned child's stdin.
-    pub const CLOSE_CHILD_STDIN: u64 = AKUMA_PRIVATE_BASE + 326;
+    // SPAWN (+301), WAITPID (+303) and CLOSE_CHILD_STDIN (+326) were here until
+    // 2026-11-01. Taoxichuan, this crate's one consumer, stopped serving them in
+    // its cleanup step 2e (`f821ddda`): sshd and everything on its image are
+    // `libakuma/linux-abi` builds that fork and exec.
     /// Akuma UPTIME: boot-relative time (libakuma's sshd/sh ask for it; the
     /// aarch64 offsets cannot be reused below 0x1000+301 on x86_64).
     pub const UPTIME: u64 = AKUMA_PRIVATE_BASE + 319;

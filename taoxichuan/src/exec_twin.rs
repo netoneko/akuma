@@ -55,24 +55,9 @@ pub fn current_slot() -> usize {
     akuma_ring3_amd64::cpu_slot() as usize
 }
 
-/// Record the slot THIS core runs now. Called on every crossing in and out.
+/// Record the slot THIS core runs now: on every switch-in, and at boot.
 pub fn set_current_slot(slot: usize) {
     akuma_ring3_amd64::set_cpu_slot(slot as u64);
-}
-
-/// The threading tid the CURRENT M2 shell is registered under. The shell's
-/// tid is its spawn-ring slot (child.rs registers with `tid = slot_idx`), so
-/// this is written at every SPAWN crossing — the M2 model has one live shell
-/// at a time. The switch_to doc's older "tid 0 is the shell" held only for a
-/// boot whose first login spawn landed on slot 0; the sched_* maps key on
-/// this recorded tid now (session pe boot D/E: the wake switched the shell
-/// back under `sched_root_of(2)` = a stale fork-child record, and the shell
-/// resumed on an exec-swept address space whose stack pages read zero).
-static SHELL_THREAD_TID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-#[must_use]
-pub fn shell_tid() -> usize {
-    SHELL_THREAD_TID.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 // ── the X86ArchHooks bodies (the per-core machine effects) ──────────────────

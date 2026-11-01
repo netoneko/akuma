@@ -227,8 +227,9 @@ pub(crate) fn set_tss_rsp0(top: u64) {
 /// cores cannot share either.
 static mut TSS: [akuma_gdt::Tss; smp::MAX_CPUS] = [const { akuma_gdt::Tss::new() }; smp::MAX_CPUS];
 
-/// Timer-preemption era flag (session pf, plan §5): set at the first SPAWN
-/// crossing — the tick switch runs only once user tasks exist. The pf-6
+/// Timer-preemption era flag (session pf, plan §5): set when init's thread is
+/// published (`child::start_init_thread`) — the tick switch runs only once user
+/// tasks exist. The pf-6
 /// bisect showed the switch killing pre-ring-3 boots deterministically, in a
 /// window with no legal switch target; before the first spawn there is
 /// nothing to preempt and the tick must not switch at all.
@@ -679,8 +680,8 @@ fn timer_trap_locked(t: &mut Trap<'_>) {
     // **The user-era gate** (pf-6 bisect): pf-5/pf-6 died INSIDE net
     // calibrate — pre-ring-3, pre-first-wd, deterministically with this gate
     // live and never with it out — a window where no legal switch target
-    // exists. So the switch arms with the FIRST SPAWN crossing
-    // (`PREEMPT_ARMED`, set in `spawn_arm`): before it the machine is
+    // exists. So the switch arms when init's thread is published
+    // (`PREEMPT_ARMED`, set in `child::start_init_thread`): before it the machine is
     // kernel-only and the tick behaves exactly like the boots that worked;
     // after it, ring 3 exists and preemption is the point.
     //
@@ -1117,9 +1118,9 @@ struct Task {
 /// the page-table walkers and every `child::` entry run with the borrow CLOSED — read what you need out, drop the borrow, then call.
 static TASKS: akuma_primitives::cell::BorrowCell<[Task; crate::child::NSLOTS + 1]> =
     akuma_primitives::cell::BorrowCell::new([const { Task::new() }; crate::child::NSLOTS + 1]);
-/// Which slot `task()` hands out: 0 is the boot's init task (sshd for this
-/// stage's gate), 1 is the child running inside a SPAWN (`child.rs`), and 2
-/// is a fork child running inside that child (child.rs's M2 scaffold).
+/// Which task record the syscall path on each core acts on: the running
+/// thread's slot, set on every switch-in (`sched.rs`, `exec_twin`); 0 is the
+/// boot thread.
 static TASK_SLOT: [core::sync::atomic::AtomicUsize; smp::MAX_CPUS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; smp::MAX_CPUS];
 
@@ -1365,9 +1366,6 @@ fn tkill_arm(tid: u64, sig: u64) -> u64 {
     0
 }
 
-/// Switch which task slot the syscall path acts on (the SPAWN arm, the
-/// child exit, and slice 3's `twin_enter_user` — which points the record at
-/// the incoming real task).
 /// Which task record the syscall path acts on now.
 pub(crate) fn task_slot_index() -> usize {
     TASK_SLOT[ring3::cpu_index()].load(core::sync::atomic::Ordering::Relaxed)
@@ -1739,12 +1737,9 @@ fn trace_err(nr: u64, r: u64, a1: u64, a2: u64, a3: u64) {
         [const { core::sync::atomic::AtomicU8::new(0) }; 512];
     let v = r as i64;
     // EFAULT is never capped away: it is the answer a bad user range gets.
-    let always = v == -14 || nr == ring3::nr::SPAWN;
-    // SPAWN's answer is never filtered: it sits above `SEEN`'s 512 numbers (the private base), so its EPERM from a
-    // pool-thread init was invisible here for a week.
-    let spawn = nr == ring3::nr::SPAWN;
-    if (-4095..0).contains(&v) && (spawn || (v != -11 && v != -2 && v != -10 && v != -25
-        && v != -47 && v != -110))
+    let always = v == -14;
+    if (-4095..0).contains(&v) && v != -11 && v != -2 && v != -10 && v != -25
+        && v != -47 && v != -110
         && (always
             || (nr as usize) < SEEN.len()
                 && SEEN[nr as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 40)
@@ -2244,11 +2239,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         ring3::nr::CLONE | 57 | 58 => child::fork_arm(fr),
         ring3::nr::WAIT4 => child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
         ring3::nr::EXECVE => {
-            // Slice 3: a REAL fork child (its own threading slot, published
-            // by `fork_process`) execs the way Linux does — its image is
-            // replaced, its fds survive, its thread keeps running. The M2
-            // nested-crossing arm below stays for the shell (the SPAWN
-            // crossing's tail-exec handoff).
+            // A fork child (its own threading slot, published by
+            // `fork_process`) execs the way Linux does — its image is
+            // replaced, its fds survive, its thread keeps running. The boot
+            // thread has no process to replace.
             if child::is_real_task() {
                 return child::exec_real_task(fr);
             }
@@ -2385,8 +2379,8 @@ pub(crate) fn task_done(code: u64) -> ! {
 /// it, heap slabs registered, the fd table reset. Returns where to cross:
 /// the root to load into CR3, the entry, the initial `rsp`.
 ///
-/// Shared by the boot spawn (`spawn`) and the SPAWN syscall's child
-/// (`child.rs`) — one loader, one placement story. Runs with the kernel
+/// Shared by the boot spawn (`spawn`) and `execve` (`child.rs`) — one loader,
+/// one placement story. Runs with the kernel
 /// half live (the physmap does all the copying); the caller chooses the
 /// CR3 moment.
 /// M2 (H3-f), copy-on-write since 2026-10-30: the fork child's address space.
