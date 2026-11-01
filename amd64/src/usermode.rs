@@ -2678,10 +2678,10 @@ fn affinity_slot(tid: u64) -> Option<usize> {
 }
 
 /// `sched_setaffinity(tid, len, mask)`: the request is decoded and clipped by
-/// `akuma_vm_spec::affinity`; `sched::set_affinity` stores it and moves the caller if needed.
+/// `akuma_affinity`; `sched::set_affinity` stores it and moves the caller if needed.
 fn sys_sched_setaffinity(tid: u64, len: u64, mask_ptr: u64) -> u64 {
     use crate::fd::errno;
-    use akuma_vm_spec::affinity;
+    use akuma_affinity as affinity;
     const MAX: usize = 128;
     let len = len as usize;
     if len < 8 {
@@ -2708,7 +2708,7 @@ fn sys_sched_getaffinity(tid: u64, len: u64, mask_ptr: u64) -> u64 {
         return errno::EINVAL;
     }
     let Some(slot) = affinity_slot(tid) else { return errno::ESRCH };
-    let mask = akuma_vm_spec::affinity::report(crate::sched::affinity_of(slot), crate::smp::online_cpus());
+    let mask = akuma_affinity::report(crate::sched::affinity_of(slot), crate::smp::online_cpus());
     if !crate::uaccess::write_bytes(mask_ptr, &mask.to_le_bytes()) {
         return errno::EFAULT;
     }

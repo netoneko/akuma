@@ -1,5 +1,6 @@
 {
   "forbids": [
+    "crates/akuma-affinity",
     "crates/akuma-bkl",
     "crates/akuma-boot",
     "crates/akuma-cmos-rtc",
@@ -113,6 +114,6 @@
     "crates/akuma-uart": 1,
     "crates/akuma-user-access": 20,
     "crates/akuma-virtio": 12,
-    "taoxichuan/src": 37
+    "taoxichuan/src": 35
   }
 }

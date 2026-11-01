@@ -21,8 +21,7 @@ use crate::smp;
 // The walker half: constants, translations, map/unmap — one implementation,
 // shared with the composed kernels that pull `akuma-boot-amd64`.
 pub use akuma_boot_amd64::paging::{
-    MemAttr, PageFaultCode, Physmap, PteProt, active_root, map_device_window, map_page,
-    map_page_in, translate, translate_in, unmap_page, unmap_page_in,
+    MemAttr, PageFaultCode, PteProt, active_root, map_device_window, map_page, translate, unmap_page,
 };
 
 /// Switch the active address space, publishing the transition to

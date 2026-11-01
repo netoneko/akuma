@@ -72,6 +72,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-affinity"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-alloc"
 version = "0.1.0"
 dependencies = [
@@ -85,6 +89,7 @@ dependencies = [
 name = "akuma-amd64"
 version = "0.0.8"
 dependencies = [
+ "akuma-affinity",
  "akuma-alloc",
  "akuma-bkl",
  "akuma-boot",
@@ -702,10 +707,10 @@ version = "0.1.0"
 name = "akuma-sched-amd64"
 version = "0.1.0"
 dependencies = [
+ "akuma-affinity",
  "akuma-cpu",
  "akuma-fpu-amd64",
  "akuma-primitives",
- "akuma-vm-spec",
 ]
 
 [[package]]
@@ -993,7 +998,6 @@ dependencies = [
  "akuma-syscalls-ipc",
  "akuma-syscalls-log",
  "akuma-syscalls-net",
- "akuma-timer",
  "akuma-vfs",
  "akuma-virtio",
  "spinning_top",

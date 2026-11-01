@@ -184,7 +184,7 @@ pub fn switch_to<P: Platform>(from: usize, to: usize) {
 
 /// `X86ArchHooks::can_run`: may this core run `slot`? An idle thread is never chosen by the
 /// picker (a core goes idle through `idle_slot`); everything else is the pin / affinity /
-/// reserved-core decision (`akuma_vm_spec::affinity::can_run`).
+/// reserved-core decision (`akuma_affinity::can_run`).
 pub fn can_run<P: Platform>(slot: usize) -> bool {
     let cpu = P::cpu_index() as u32;
     let m = &P::machines()[slot];
@@ -192,7 +192,7 @@ pub fn can_run<P: Platform>(slot: usize) -> bool {
         return false;
     }
     let pinned = m.pinned.load(Ordering::Relaxed);
-    akuma_vm_spec::affinity::can_run(
+    akuma_affinity::can_run(
         (pinned != NO_CPU).then_some(pinned),
         m.affinity.load(Ordering::Relaxed),
         RESERVED_CORES.load(Ordering::Relaxed),

@@ -1,10 +1,13 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-10-31 with `python3 scripts/cloc_akuma.py src crates`:
-**79 of 108 crates** forbid `unsafe`. 89341 of 90651 production lines (98.6%) sit
+**Grade: A** — regenerated 2026-11-01 with `python3 scripts/cloc_akuma.py src crates`:
+**82 of 111 crates** forbid `unsafe`. 89916 of 91226 production lines (98.6%) sit
 outside any `unsafe` block; 363 production sites across `crates/`, 0 inside
 enforced crates; `src/` is down to 136 production lines (the `bin`) and 0
-production sites. Twelve crates arrived since the 2026-10-21 run, most of them
+production sites. Three crates arrived since the 2026-10-31 run, all forbidding:
+`akuma-syscalls-glue-amd64` (the x86_64 ABI layer under Taoxichuan's dispatch),
+`akuma-affinity` (the scheduler's CPU-mask decisions, out of `akuma-vm-spec`) and
+`akuma-user-walk` (page-walk user copies). The 2026-10-31 run read: twelve crates arrived since the 2026-10-21 run, most of them
 pulled out for the Taoxichuan kernel. Nine forbid from their first commit:
 `akuma-vm-spec`, `akuma-kvm-abi`, `akuma-comconsole`, `akuma-elf-exec`,
 `akuma-syscalls-eventfd`, `akuma-lapic-amd64`, `akuma-syscalls-signal`,

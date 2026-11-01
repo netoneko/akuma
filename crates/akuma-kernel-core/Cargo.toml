@@ -25,7 +25,7 @@ akuma-uart = { path = "../akuma-uart" }
 akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 log = { version = "0.4", default-features = false }
 spinning_top = "0.3"
-smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
+smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 
 [features]
 # See akuma-kernel-glue's `pmm-instr`: gates the `fpcache::len` re-export.

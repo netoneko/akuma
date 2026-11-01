@@ -82,7 +82,7 @@ pub struct Machine<U> {
     /// The only core allowed to run this thread, or [`crate::NO_CPU`].
     pub pinned: AtomicU32,
     /// The cores this thread may use (bit `c` = core `c`), or 0 for any. Inherited by every
-    /// slot this thread creates; the decision is `akuma_vm_spec::affinity::can_run`.
+    /// slot this thread creates; the decision is `akuma_affinity::can_run`.
     pub affinity: AtomicU64,
 }
 

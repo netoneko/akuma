@@ -8,7 +8,7 @@ use akuma_kvm_abi::fdargs::{Ioeventfd, Irqfd};
 use akuma_kvm_abi::runpage::{self, Exit};
 use akuma_kvm_abi::slots::Table;
 use akuma_kvm_abi::state::{
-    CPUID_ENTRY_LEN, CpuidEntry, Dtable, FPU_LEN, LIST_HDR, MSR_ENTRY_LEN, MsrEntry, Regs, Segment, Sregs,
+    CPUID_ENTRY_LEN, CpuidEntry, Dtable, FPU_LEN, MSR_ENTRY_LEN, MsrEntry, Regs, Segment, Sregs,
 };
 use akuma_svm_amd64 as svm;
 use akuma_svm_amd64::{ExitCode, Seg, SegAttr, Vmcb, ctrl, eventinj, exitinfo, mmio, save, tables};
@@ -179,31 +179,6 @@ impl Vcpu {
         v.set_rsp(r.rsp);
         v.set_rip(r.rip);
         v.set_rflags(r.rflags | 2);
-    }
-
-    pub(super) fn get_regs(&mut self) -> Regs {
-        let g = self.regs;
-        let v = self.vmcb();
-        Regs {
-            rax: v.rax(),
-            rbx: g.rbx,
-            rcx: g.rcx,
-            rdx: g.rdx,
-            rsi: g.rsi,
-            rdi: g.rdi,
-            rsp: v.rsp(),
-            rbp: g.rbp,
-            r8: g.r8,
-            r9: g.r9,
-            r10: g.r10,
-            r11: g.r11,
-            r12: g.r12,
-            r13: g.r13,
-            r14: g.r14,
-            r15: g.r15,
-            rip: v.rip(),
-            rflags: v.rflags(),
-        }
     }
 
     pub(super) fn set_sregs(&mut self, s: &Sregs, plat: &mut Platform) {
@@ -404,7 +379,7 @@ fn placed_core(id: usize) -> Option<usize> {
         return None;
     }
     let online = crate::smp::online_cpus();
-    let allowed = if kvm == 1 { akuma_vm_spec::affinity::online_mask(online) } else { kvm };
+    let allowed = if kvm == 1 { akuma_affinity::online_mask(online) } else { kvm };
     let placed = akuma_vm_spec::cores::place(wanted, allowed, |c| (c as usize) < online, id + 1)?;
     Some(usize::from(*placed.get(id.min(akuma_vm_spec::cores::MAX_PLACED - 1))?))
 }

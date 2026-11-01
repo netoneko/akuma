@@ -267,7 +267,7 @@ pub fn affinity_of(slot: usize) -> u64 {
     MACHINE.get(slot).map_or(0, |m| m.affinity.load(Ordering::Relaxed))
 }
 
-/// Set the affinity mask of task `slot` (already normalised by `akuma_vm_spec::affinity::effective`).
+/// Set the affinity mask of task `slot` (already normalised by `akuma_affinity::effective`).
 /// If `slot` is the running thread and stands on a core the mask excludes, it moves now (parks until
 /// a picker on an allowed core hands it back); any other thread leaves at its next switch-out.
 /// False if the running thread could not be moved.

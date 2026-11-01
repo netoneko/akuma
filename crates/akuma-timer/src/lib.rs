@@ -340,7 +340,7 @@ pub fn uptime_us() -> u64 {
 ///
 /// SAFETY: the caller (bin crate, at boot) guarantees the MMU maps the PL031
 /// window before `Rtc::new` is handed this address.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub mod rtc {
     use arm_pl031::Rtc;
 

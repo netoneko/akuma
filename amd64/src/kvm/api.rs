@@ -348,32 +348,6 @@ fn set_cpuid2(h: Handle, arg: u64) -> u64 {
     with_vcpu(h.vcpu, |vc, _| if vc.set_cpuid(&buf[..len], n) { 0 } else { errno::E2BIG })
 }
 
-/// Slice-1 check, logged: the bytes at guest-physical 0x201000 (the PVH entry the VMM loaded the kernel
-/// to) read through the slice and through the VMM's own mapping must agree, and not be zero.
-fn check_shared_memory() {
-    const GPA: u64 = 0x20_1000;
-    let (pa, ua) = irq_off(|| {
-        VM.lock().as_ref().map_or((None, None), |v| (v.slots.slice_offset(GPA), v.slots.user_addr(GPA)))
-    });
-    let (Some(pa), Some(ua)) = (pa, ua) else {
-        serial::puts("[kvmapi] shared-memory check: no slot at 0x201000\n");
-        return;
-    };
-    let mut via_slice = [0u8; 16];
-    let mut via_vmm = [0u8; 16];
-    let a = akuma_mmu::copy_from_phys(pa as usize, &mut via_slice);
-    let b = crate::uaccess::read_bytes(ua, &mut via_vmm);
-    serial::puts("[kvmapi] shared-memory check @0x201000: slice=");
-    for x in via_slice {
-        serial::put_hexn(u64::from(x), 2);
-    }
-    serial::puts(" vmm=");
-    for x in via_vmm {
-        serial::put_hexn(u64::from(x), 2);
-    }
-    serial::puts(if a && b && via_slice == via_vmm && via_slice != [0u8; 16] { " SAME\n" } else { " DIFFERENT\n" });
-}
-
 fn with_vm(f: impl FnOnce(&mut Vm) -> u64) -> u64 {
     irq_off(|| VM.lock().as_mut().map_or(errno::EINVAL, f))
 }

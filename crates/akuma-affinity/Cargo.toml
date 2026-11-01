@@ -1,0 +1,10 @@
+[package]
+name = "akuma-affinity"
+version = "0.1.0"
+edition = "2024"
+description = "Per-thread CPU affinity, the pure half of sched_setaffinity/sched_getaffinity: decode and clip a user mask, report one, and decide whether a thread may run on a core (pin, mask, reserved cores). no_std, no dependencies."
+
+[lints]
+workspace = true
+
+[dependencies]

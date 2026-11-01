@@ -34,7 +34,8 @@ akuma-reclock = { path = "../akuma-reclock" }
 akuma-syscalls-poll = { path = "../akuma-syscalls-poll" }
 akuma-syscalls-sync = { path = "../akuma-syscalls-sync" }
 akuma-syscalls-time = { path = "../akuma-syscalls-time" }
-akuma-timer = { path = "../akuma-timer" }
+# The counter frequency, for `read-profile`'s histogram buckets only.
+akuma-timer = { path = "../akuma-timer", optional = true }
 akuma-vfs = { path = "../akuma-vfs" }
 akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 akuma-virtio = { path = "../akuma-virtio" }
@@ -42,7 +43,7 @@ akuma-virtio = { path = "../akuma-virtio" }
 akuma-boot = { path = "../akuma-boot", optional = true }
 akuma-syscalls-ipc = { path = "../akuma-syscalls-ipc", optional = true }
 spinning_top = "0.3"
-smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
+smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 log = { version = "0.4", default-features = false }
 
 [features]
@@ -73,7 +74,7 @@ sc-pidfd = []
 sc-timerfd = []
 sc-eventfd = []
 rump = []
-read-profile = []
+read-profile = ["dep:akuma-timer"]
 
 [lints]
 workspace = true

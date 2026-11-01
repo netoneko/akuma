@@ -70,6 +70,7 @@ default-members = [
     "crates/akuma-sntp",
     "crates/akuma-svm-amd64",
     "crates/akuma-vm-spec",
+    "crates/akuma-affinity",
     "crates/akuma-kvm-abi",
     "crates/akuma-cmos-rtc",
     "crates/akuma-syscalls",
@@ -837,7 +838,7 @@ spinning_top = "0.3"
 # `std`; no `max_level_*` feature here on purpose — filtering is the sink's job,
 # and a compile-time cap cannot be undone at runtime.
 log = { version = "0.4", default-features = false }
-smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
+smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 virtio-drivers = { version = "0.13", default-features = false }
 akuma-timer = { path = "crates/akuma-timer" }
 # Time syscalls (clock_gettime/settime, itimers, adjtimex) and the boot-time

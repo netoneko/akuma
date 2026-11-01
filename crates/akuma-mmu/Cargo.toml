@@ -41,10 +41,6 @@ akuma-pagetable = { path = "../akuma-pagetable" }
 # functions, so the trivially-dischargeable `unsafe` blocks live in one crate
 # instead of at every call site. Zero dependencies of its own.
 akuma-cpu = { path = "../akuma-cpu" }
-# The FDT reader. Here rather than only at the boot call site so that `locate`'s
-# "this pointer is mapped" obligation is discharged against the boot identity
-# map by the crate that owns it — see `with_boot_identity_fdt`.
-akuma-fdt = { path = "../akuma-fdt" }
 # irq masking, the console, phys_to_virt/virt_to_phys.
 akuma-primitives = { path = "../akuma-primitives" }
 # PhysFrame, PAGE_SIZE/PAGE_SHIFT, and the `flags`/`user_flags` PTE vocabulary.
@@ -60,3 +56,11 @@ akuma-bkl = { path = "../akuma-bkl" }
 spinning_top = "0.3"
 # Three `log::debug!` sites on the address-space free path ([FORK-DBG], [MMU]).
 log = { version = "0.4", default-features = false }
+
+# AArch64 only: an amd64 kernel boots without a device tree, and compiling the
+# reader into one costs ~1,000 audit lines it never reaches.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+# The FDT reader. Here rather than only at the boot call site so that `locate`'s
+# "this pointer is mapped" obligation is discharged against the boot identity
+# map by the crate that owns it — see `with_boot_identity_fdt`.
+akuma-fdt = { path = "../akuma-fdt" }

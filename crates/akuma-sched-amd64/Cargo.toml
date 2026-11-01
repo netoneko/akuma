@@ -11,4 +11,4 @@ workspace = true
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-fpu-amd64 = { path = "../akuma-fpu-amd64" }
 akuma-cpu = { path = "../akuma-cpu" }
-akuma-vm-spec = { path = "../akuma-vm-spec" }
+akuma-affinity = { path = "../akuma-affinity" }

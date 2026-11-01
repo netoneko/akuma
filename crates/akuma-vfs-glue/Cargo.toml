@@ -41,7 +41,6 @@ akuma-primitives = { path = "../akuma-primitives" }
 # deleted in 4b batch 2c. **One `/proc` implementation serves both kernels**
 # (docs/archive/AKUMA_PROC_TREE_UNIFICATION.md).
 akuma-procfs = { path = "../akuma-procfs" }
-akuma-timer = { path = "../akuma-timer" }
 # `/proc/net/tcp` lists the socket table. `default-features = false` matches the
 # binary: the rump-only devbox compiles smoltcp out and still needs this crate.
 akuma-net = { path = "../akuma-net", default-features = false }

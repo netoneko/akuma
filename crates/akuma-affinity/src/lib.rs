@@ -1,8 +1,14 @@
 //! Per-thread CPU affinity: the pure half of `sched_setaffinity` / `sched_getaffinity`.
 //!
-//! A mask is a `u64` (bit `c` = core `c`; [`crate::cores::MAX_CORE`] is 63), `0` meaning "no
+//! A mask is a `u64` (bit `c` = core `c`; core 63 is the highest), `0` meaning "no
 //! preference". The scheduler stores one per thread; this module decides what a request means
 //! and whether a thread may run on a core. The effect (storing, migrating) stays in `sched.rs`.
+//!
+//! It was `akuma_vm_spec::affinity` until 2026-11-01: the scheduler (`akuma-sched-amd64`'s `can_run`)
+//! is its consumer, and a kernel that runs no VMs compiled the whole VM vocabulary to reach it.
+
+#![no_std]
+#![forbid(unsafe_code)]
 
 /// Why a `sched_setaffinity` request is refused (`EINVAL` both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

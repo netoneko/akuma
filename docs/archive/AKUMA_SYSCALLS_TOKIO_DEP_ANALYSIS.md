@@ -350,6 +350,11 @@ the code that would leave. The real change will be a little smaller, because eac
 | 10 | Replace virtio-drivers with in-tree split-ring blk + net drivers (precedents: `crates/akuma-virtio/src/rng.rs`, `crates/akuma-net-nic/src/virtio_rings.rs`) | high / medium (DMA `unsafe` moves in-tree, budget grows) | −14,521 third-party, +~1,200 in-tree = −13,300 est. | → ~73,800 |
 | 11 | No DHCP (static-address guests) | low / low for that composition | −1,193 est. | → ~72,600 |
 
+**Measured 2026-11-01 (rows 2-4 done, `TAOXICHUAN_CLEANUP_PLAN.md` status table):** 100,530 -> **97,853** (-2,677 against
+-2,322 estimated). Row 2 was five manifests, not four (the root package's too): -983. Row 3 took `akuma-timer` out of the
+image as well, because its two other users never needed it (`akuma-vfs-glue` named it unused; glue only under `read-profile`):
+-1,208. Row 4 became a new crate, `akuma-affinity`: -486.
+
 Headline: about **88,600** with steps 1–8, keeping `process` + `signal` (−12%). About **75,000** if step 10 is also done
 (−26%). The floor of this design, everything above, is about **72,600**. What remains at the floor (estimates, from §3b/§3c minus the rows above):
 
