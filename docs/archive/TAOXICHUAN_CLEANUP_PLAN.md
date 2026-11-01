@@ -64,17 +64,41 @@ intermittently on every kernel tested.
 The order follows dependencies and risk. The pm slices (`taoxichuan/docs/reference/switch-to-crates.md`) and the X list
 (`TAOXICHUAN_CRATE_EXTRACTION_PLAN.md`) are one programme here.
 
+**The lever is `akuma-syscalls-glue`, not more per-family crates (decided 2026-11-01, after reading 2a).** The X list proposed
+pulling each family's pure decisions into its own crate, so each kernel would keep its own arms over them. Starting on X6 showed
+why that stalls. There are three `setsockopt`/`getsockopt` implementations (glue's, amd64's native `setsockopt`, Taoxichuan's),
+and glue's carries lessons the other two lack: OpenSSH's `IP_OPTIONS` length-0 rule and the connect-timeout `ETIMEDOUT` for
+`SO_ERROR`. amd64 only reaches glue's version because its descriptors live in `akuma-exec`'s registered `SharedFdTable`.
+Taoxichuan keeps its own `OpenFile` table, so glue cannot see its fds, and every family it serves is a private copy.
+
+amd64 solved exactly this in 2026-09, and the route is recorded:
+- `AKUMA_AMD64_C1_STEP4A_VFS_ADOPTION.md`: its private mount table gave way to `akuma-vfs-glue`'s. That step comes first, because
+  a folded arm resolving through an empty mount table answers `ENOENT` for every path, silently.
+- `AKUMA_AMD64_4B_PREREQUISITES.md`: the open-flag permutation, now `akuma_syscalls_abi::open_flags`.
+- `AKUMA_AMD64_4B_FLIP.md`: one registered `SharedFdTable` per process, with the reference rules for pipe ends and sockets.
+- `AKUMA_AMD64_4B_FOLD_BATCH*.md`: the arms moved in batches, each gated by a boot.
+
+Taoxichuan has the prerequisites amd64 had to build. It already registers every task as an `akuma-exec` process, and it already
+depends on `akuma-syscalls-abi` (`legacy`, `open_flags`, `stat`). So phase 2 replays amd64's sequence; X6 and X7 as separate
+crates are dropped.
+
 | step | source | what | expected deletion |
 |---|---|---|---:|
-| 2a | X6 | socket marshal: `msghdr`/iovec, `setsockopt`/`getsockopt` option algebra into `akuma-syscalls-net`; `ring.rs` into `akuma-primitives` | ~300 |
-| 2b | pm S2 | `wait4` through `akuma-exec`'s park/wake over the process table; delete `PARENT_OF` and the private wait scans | ~165 |
-| 2c | pm S3 | delete the M2 crossing, the spawn-slot ring and the private syscalls (sshd is already `linux-abi`); `clone` through `fork_process` | ~700 |
-| 2d | pm S4 | boot programs become fork+exec children of init | ~150 |
-| 2e | X7 | the file-description model (`OpenFile`, open/read/write/stat/getdents/poll probes) onto `akuma-syscalls-glue`'s fs arms, the way amd64's `fd.rs` uses them. This also removes phase 1a's bug class | ~1,500 |
-| 2f | pm S6 | `dispatch_inner` becomes the two-table shape (x86_64 legacy fold, then `akuma-syscalls-abi` names into the families), like `amd64/src/usermode.rs` | most of 1,747 |
+| 2a | amd64 C1 4a | mount the ext2 root into `akuma-vfs-glue`; `root_fs()` callers go through it. Add `akuma-vfs-glue` and `akuma-syscalls-glue` as dependencies, and check they build for `x86_64-unknown-none` the way amd64 builds them | small |
+| 2b | amd64 4b flip | `OpenFile` and Taoxichuan's fd table give way to `akuma-exec-core`'s `FileDescriptor` in each process's registered `SharedFdTable`; pipes, sockets, eventfd and epoll keep their reference rules | ~400 |
+| 2c | amd64 4b batches | fold arms into `akuma_syscalls_glue::handle_syscall` (`to_aarch64` numbers, `open_flags`/`stat` translation), batch by batch: path-only `*at`, then open/close/read/write/lseek/stat/getdents, then sockets (X6 for free), poll/select/epoll, pipes, then the rest. `dispatch_inner` shrinks to the legacy x86 table plus the arms that are genuinely this kernel's (pm S6) | most of 1,747 + ~1,000 of `sock.rs`/`pipes.rs`/`epoll.rs` |
+| 2d | pm S2 | `wait4` through `akuma-exec`'s park/wake over the process table; delete `PARENT_OF` and the private wait scans | ~165 |
+| 2e | pm S3 | delete the M2 crossing, the spawn-slot ring and the private syscalls (sshd is already `linux-abi`); `clone` through `fork_process` | ~700 |
+| 2f | pm S4 | boot programs become fork+exec children of init | ~150 |
 | 2g | X8 / pm S5 | `load_task` onto `akuma-elf-exec` | ~200 |
-| 2h | X9, X10 | slab/hole placement into `akuma-mmap`; thread/root lifetime into `akuma-exec`; the FPU save pair into `akuma-fpu-amd64` | ~300 |
+| 2h | X9, X10 | slab/hole placement into `akuma-mmap`; thread/root lifetime into `akuma-exec`; the FPU save pair into `akuma-fpu-amd64`; `ring.rs` into `akuma-primitives` | ~300 |
 | 2i | pm S7 | sweep: `taoxichuan/docs/`, diagrams, dead types; regenerate `crate-safety.md` with `scripts/cloc_akuma.py` | rest |
+
+Risks carried over from amd64: glue takes the BKL-shaped guards (`NetBklGuard`) and expects the exec runtime hooks
+Taoxichuan's `exec_twin.rs` registers. Check those before 2c's first batch, not after. A per-family divergence that
+Taoxichuan has and glue lacks (its `O_APPEND`-at-open, its `sendmsg` per-iovec datagrams, `ENOPROTOOPT` for unknown socket
+options) is resolved toward glue's answer, which is the one the other two kernels run. Each such change is named in that batch's
+commit, and the battery decides.
 
 Each step records the kernel's line and `unsafe` counts before and after in the status table below. Each step is one commit
 (or a short series), pushed when its gates pass.
