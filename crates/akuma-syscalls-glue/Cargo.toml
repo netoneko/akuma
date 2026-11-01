@@ -14,7 +14,7 @@ akuma-mmu = { path = "../akuma-mmu" }
 akuma-net = { path = "../akuma-net", default-features = false }
 # eventfd's state machine (stage 8 session Q seam-cut): the counter/flag
 # decisions used by this crate's eventfd.rs, shared with taoxichuan.
-akuma-syscalls-eventfd = { path = "../akuma-syscalls-eventfd" }
+akuma-syscalls-eventfd = { path = "../akuma-syscalls-eventfd", optional = true }
 akuma-net-unix = { path = "../akuma-net-unix" }
 akuma-net-yarn = { path = "../akuma-net-yarn" }
 akuma-pipes = { path = "../akuma-pipes" }
@@ -54,7 +54,7 @@ log = { version = "0.4", default-features = false }
 #
 # **The bin must therefore use `default-features = false`** — same as it does for
 # `akuma-net` — or an `extreme-size` build would silently gain smoltcp.
-default = ["smoltcp"]
+default = ["smoltcp", "exec"]
 
 # Every one is forwarded from the bin, which owns the real definitions.
 sc-reboot = ["dep:akuma-boot"]
@@ -72,8 +72,12 @@ sc-containers = []
 sc-epoll = []
 sc-pidfd = []
 sc-timerfd = []
-sc-eventfd = []
+sc-eventfd = ["dep:akuma-syscalls-eventfd"]
 rump = []
+# `execve` and Akuma's native `SPAWN`/`SPAWN_EXT`, which load through
+# `akuma-exec`'s ELF loader. The amd64 kernels load binaries themselves and
+# leave it off (the calls are then `ENOSYS` here); the AArch64 kernel enables it.
+exec = ["akuma-exec/elf-loader"]
 read-profile = ["dep:akuma-timer"]
 
 [lints]

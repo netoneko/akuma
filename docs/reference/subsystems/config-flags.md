@@ -88,6 +88,16 @@ re-add what they need. `Cargo.toml:361-369`.
 | `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. **In `default`**, so any build that doesn't pass `--no-default-features` has it. Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)`. Observe it via the `[FSCACHE]` PSTATS line. Not combinable with `extreme`. | `Cargo.toml:356` |
 | `no-tests` | Drops boot self-test suites; sets `akuma-net/small-sockets`. | `Cargo.toml:125` |
 
+### Crate features the amd64 kernels leave off
+
+Not bin features: each is a crate's own, turned on by the AArch64 kernel's manifests and left off by `akuma-amd64` and
+Taoxichuan, which load binaries with their own loaders and reach `akuma-exec` only through `Process::install_image`.
+
+| Feature | Effect | Source |
+|---|---|---|
+| `akuma-exec/elf-loader` | The ELF loader: the `akuma-elf` (+ `elf`) dependency and its `elf_loader` re-export, `Process::from_elf*`, `replace_image*`, the `spawn_process*` / `exec*` helpers, and `embedded-io-async`. Off, `ImageInstall::deferred_segments` takes an uninhabited `DeferredLazySegment`, so it can only be `&[]`. Turned on by the bin, `akuma-kernel-glue` (herd/sshd/rump spawns) and `akuma-exceptions` (`INTERP_BASE`). Off saves Taoxichuan ~5,400 audit lines. | `crates/akuma-exec/Cargo.toml` |
+| `akuma-syscalls-glue/exec` | `execve` and the native `SPAWN`/`SPAWN_EXT` (and their helpers); forwards `akuma-exec/elf-loader`. In glue's `default`, and named explicitly by the bin (which uses `default-features = false`). Off, the three numbers fall to `ENOSYS`. | `crates/akuma-syscalls-glue/Cargo.toml` |
+
 `userspace-sshd` and `many-sessions` are documented under
 [Networking stack](#networking-stack) above, alongside the other
 sshd-related features.

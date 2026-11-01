@@ -46,7 +46,8 @@ akuma-primitives = { path = "../akuma-primitives" }
 # user access (copy_to/from_user), the BKL protocol and `akuma-mmu` — the
 # state every fault arm reads or repairs. The one upward dependency the
 # handlers cannot lose.
-akuma-exec = { path = "../akuma-exec" }
+# `elf-loader`: the fault path names the loader's `INTERP_BASE`.
+akuma-exec = { path = "../akuma-exec", features = ["elf-loader"] }
 # The BKL drop/skip policy decisions (`fault_bkl_drop_enabled`, the per-syscall
 # opt-out bitmap, ...). Read directly, not through `akuma_exec::bkl`.
 akuma-bkl = { path = "../akuma-bkl" }

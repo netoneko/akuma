@@ -800,6 +800,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MUNMAP => mem::sys_munmap(args[0] as usize, args[1] as usize),
         nr::CLONE => proc::sys_clone(args[0], args[1], args[2], args[3], args[4]),
         nr::CLONE3 => proc::sys_clone3(args[0], args[1] as usize),
+        #[cfg(feature = "exec")]
         nr::EXECVE => proc::sys_execve(args[0], args[1], args[2]),
         nr::UPTIME => time::sys_uptime(),
         // The floor control: no arguments read, no user memory touched, no
@@ -821,6 +822,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::RENAMEAT2 => flat(fs::sys_renameat2(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32)),
         nr::STATX => flat(fs::sys_statx(args[0] as i32, args[1], args[2] as u32, args[3] as u32, args[4])),
         nr::READLINKAT => flat(fs::sys_readlinkat(args[0] as i32, args[1], args[2], args[3] as usize)),
+        #[cfg(feature = "exec")]
         nr::SPAWN => flat(proc::sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5])),
         nr::KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
         #[cfg(feature = "sc-reboot")]
@@ -839,6 +841,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLEAR_SCREEN => term::sys_clear_screen(),
         nr::POLL_INPUT_EVENT => term::sys_poll_input_event(args[0], args[1] as usize, args[2]),
         nr::GET_CPU_STATS => term::sys_get_cpu_stats(args[0], args[1] as usize),
+        #[cfg(feature = "exec")]
         nr::SPAWN_EXT => flat(proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5])),
         nr::SET_BOX_STACK => proc::sys_set_box_stack(args[0], args[1]),
         nr::CLOSE_CHILD_STDIN => proc::sys_close_child_stdin(args[0] as u32),

@@ -1,3 +1,6 @@
+// Without `elf-loader` the loading half of this file compiles out; its imports stay.
+#![cfg_attr(not(feature = "elf-loader"), allow(unused_imports))]
+
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -8,7 +11,16 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering
 use akuma_tty as terminal;
 use spinning_top::Spinlock;
 
-use crate::elf_loader::{self, DeferredLazySegment, ElfError, LoadedWithStack};
+#[cfg(feature = "elf-loader")]
+use crate::elf_loader::{self, ElfError, LoadedWithStack};
+#[cfg(feature = "elf-loader")]
+pub use crate::elf_loader::DeferredLazySegment;
+/// Without the loader nothing defers a segment: the type cannot be constructed,
+/// so [`ImageInstall::deferred_segments`] is always `&[]`.
+#[cfg(not(feature = "elf-loader"))]
+pub struct DeferredLazySegment {
+    _never: core::convert::Infallible,
+}
 use crate::mmu;
 use crate::runtime::{runtime, config, track_frame, FrameSource, PhysFrame};
 use crate::process::types::{ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo, Pid};
@@ -18,6 +30,7 @@ use super::{
     SharedSignalTable, StdioBuffer, UserContext,
 };
 
+#[cfg(feature = "elf-loader")]
 /// True if some OTHER process shares `tgid` — a live CLONE_THREAD sibling of `pid`.
 fn has_thread_group_siblings(pid: Pid, tgid: Pid) -> bool {
     let mut found = false;
@@ -27,6 +40,7 @@ fn has_thread_group_siblings(pid: Pid, tgid: Pid) -> bool {
     found
 }
 
+#[cfg(feature = "elf-loader")]
 /// POSIX execve destroys every other thread in the calling process's thread group
 /// before the image is replaced. Without this, a CLONE_THREAD sibling (e.g. a
 /// still-parked rayon/thread-pool worker) keeps running under the address space
@@ -78,6 +92,7 @@ pub fn set_eager_path_loads() {
 /// Passing the choice as a value is what lets one implementation serve both
 /// `Process` constructors and both image replacers — each of the four used to be
 /// copy-pasted per source.
+#[cfg(feature = "elf-loader")]
 enum ImageSource<'a> {
     /// An image already resident in the kernel heap.
     Bytes(&'a [u8]),
@@ -86,6 +101,7 @@ enum ImageSource<'a> {
     Path { path: &'a str, file_size: usize },
 }
 
+#[cfg(feature = "elf-loader")]
 impl ImageSource<'_> {
     /// Load the image and build its initial user stack.
     fn load(
@@ -114,6 +130,10 @@ impl ImageSource<'_> {
 /// `segments` is empty for an eagerly-mapped image (`LoadedWithStack::
 /// deferred_segments` is a property of the mapping strategy, not of the caller),
 /// so this is a no-op on that path rather than a branch either caller has to make.
+#[cfg(not(feature = "elf-loader"))]
+const fn push_deferred_regions(_lazy: &mut LazyRegionMap, _segments: &[DeferredLazySegment]) {}
+
+#[cfg(feature = "elf-loader")]
 fn push_deferred_regions(lazy: &mut LazyRegionMap, segments: &[DeferredLazySegment]) {
     for seg in segments {
         let source = match &seg.file_source {
@@ -164,16 +184,19 @@ pub struct ImageInstall<'a> {
 }
 
 impl Process {
+    #[cfg(feature = "elf-loader")]
     /// Replace current process image with a new ELF binary (execve core)
     pub fn replace_image(&self, elf_data: &[u8], args: &[String], env: &[String]) -> Result<(), String> {
         self.replace_image_from(ImageSource::Bytes(elf_data), args, env)
     }
 
+    #[cfg(feature = "elf-loader")]
     /// Replace current process image using on-demand loading from a file path.
     pub fn replace_image_from_path(&self, path: &str, file_size: usize, args: &[String], env: &[String]) -> Result<(), String> {
         self.replace_image_from(ImageSource::Path { path, file_size }, args, env)
     }
 
+    #[cfg(feature = "elf-loader")]
     /// The execve core, shared by both public replacers.
     ///
     /// `&self`, not `&mut self` (`AKUMA_EXEC_AUDIT.md` §6.E group 2b): the
@@ -360,16 +383,19 @@ impl Process {
         Ok(())
     }
 
+    #[cfg(feature = "elf-loader")]
     /// Create a new process from ELF data
     pub fn from_elf(name: &str, args: &[String], env: &[String], elf_data: &[u8], interp_prefix: Option<&str>) -> Result<Self, ElfError> {
         Self::from_image(name, ImageSource::Bytes(elf_data), args, env, interp_prefix)
     }
 
+    #[cfg(feature = "elf-loader")]
     /// Create a process from a large ELF file on disk, loading segments on demand.
     pub fn from_elf_path(name: &str, path: &str, file_size: usize, args: &[String], env: &[String], interp_prefix: Option<&str>) -> Result<Self, ElfError> {
         Self::from_image(name, ImageSource::Path { path, file_size }, args, env, interp_prefix)
     }
 
+    #[cfg(feature = "elf-loader")]
     /// The constructor both public entry points run.
     fn from_image(name: &str, source: ImageSource<'_>, args: &[String], env: &[String], interp_prefix: Option<&str>) -> Result<Self, ElfError> {
         {

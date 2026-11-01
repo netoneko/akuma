@@ -762,7 +762,8 @@ akuma-net-unix = { path = "crates/akuma-net-unix" }
 akuma-net-yarn = { path = "crates/akuma-net-yarn" }
 # virtio Hal + MMIO probe + the block/rng/audio drivers.
 akuma-virtio = { path = "crates/akuma-virtio" }
-akuma-exec = { path = "crates/akuma-exec" }
+# `elf-loader`: this kernel loads binaries through `akuma-exec` (execve, spawn).
+akuma-exec = { path = "crates/akuma-exec", features = ["elf-loader"] }
 # The exception path: vector table, EL0/EL1 trap handlers, EL0 syscall entry,
 # CoW breaks, demand paging, signal delivery. Extracted from
 # `src/exceptions.rs` 2026-09-01 — `docs/archive/AKUMA_EXCEPTIONS_EXTRACTION.md`.
@@ -860,7 +861,7 @@ akuma-syscalls = { path = "crates/akuma-syscalls" }
 
 # The syscall dispatcher and its families. Was `src/syscall/` — see
 # docs/archive/SRC_SYSCALL_EXTRACTION.md.
-akuma-syscalls-glue = { path = "crates/akuma-syscalls-glue", default-features = false }
+akuma-syscalls-glue = { path = "crates/akuma-syscalls-glue", default-features = false, features = ["exec"] }
 
 # Per-pid syscall trace rings behind `/proc/<pid>/syscalls`. Split out of
 # `src/syscall/` so `src/vfs/proc.rs` can read them without `src/vfs/` depending

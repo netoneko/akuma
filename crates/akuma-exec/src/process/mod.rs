@@ -1249,6 +1249,7 @@ impl Process {
         (runtime().enter_user)(&ctx)
     }
 
+    #[cfg(feature = "elf-loader")]
     /// Prepare process for execution (internal helper)
     ///
     /// Sets up process state and writes process info to the info page.

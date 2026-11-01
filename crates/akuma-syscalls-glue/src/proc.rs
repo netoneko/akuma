@@ -745,6 +745,7 @@ pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
     sys_clone_pidfd(flags, stack, cl_args.parent_tid, cl_args.tls, cl_args.child_tid, cl_args.pidfd)
 }
 
+#[cfg(feature = "exec")]
 pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let path = match copy_from_user_str(path_ptr, 1024) {
@@ -813,6 +814,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     do_execve(resolved_path, args, env)
 }
 
+#[cfg(feature = "exec")]
 pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
     // Execute permission (`EACCES`). Root passes on any file with some x bit;
     // see `akuma_isolation::dac::may`. Set-user-ID bits are never honoured:
@@ -1008,6 +1010,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     ret.unwrap_or(ESRCH)
 }
 
+#[cfg(feature = "exec")]
 fn exec_shebang(script_path: String, file_data: Vec<u8>, original_args: Vec<String>, env: Vec<String>) -> u64 {
     // Parse everything we need out of `file_data` into OWNED strings first:
     // this function recurses into do_execve, whose successful exec erets and
@@ -1655,6 +1658,7 @@ const _: () = {
     assert!(core::mem::offset_of!(SpawnOptions, cred_flags) == 108);
 };
 
+#[cfg(feature = "exec")]
 /// The credentials a `SPAWN_EXT` asks for, checked against the caller's: the
 /// caller's own, lowered by `setgroups`/`setgid`/`setuid` in the order a
 /// privilege-dropping wrapper makes them. `None` = not requested (inherit).
@@ -1691,6 +1695,7 @@ fn spawn_creds(o: &SpawnOptions) -> Result<Option<akuma_isolation::creds::Creds>
     Ok(Some(c))
 }
 
+#[cfg(feature = "exec")]
 pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
     if ptr == 0 { return Vec::new(); }
     let mut args = Vec::new();
@@ -1711,10 +1716,12 @@ pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
     args
 }
 
+#[cfg(feature = "exec")]
 /// Spawn flag bits (Akuma's own SPAWN ABI, arg6). Keep in sync with
 /// `libakuma::SPAWN_FLAG_PTY`.
 const SPAWN_FLAG_PTY: u64 = 1;
 
+#[cfg(feature = "exec")]
 pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_len: usize, flags: u64) -> SysResult {
     // arg6 carries spawn flags. Bit 0 (SPAWN_FLAG_PTY) marks the child's stdin
     // as a terminal so the kernel line discipline runs (sshd sets it for an
@@ -1759,6 +1766,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     Err(ENOMEM)
 }
 
+#[cfg(feature = "exec")]
 /// The size of `SpawnOptions` before `env_ptr`/`env_len` were appended.
 ///
 /// A `/bin/box` or `/bin/herd` on disk can be older than the kernel booting it —
@@ -1768,6 +1776,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
 /// stack and use it as an `envp` pointer.
 const SPAWN_OPTIONS_V1_SIZE: usize = 72;
 
+#[cfg(feature = "exec")]
 /// `SPAWN_EXT(path, options, options_len)`.
 ///
 /// `options_len` is the size of the caller's `SpawnOptions`. Zero means "the

@@ -12,17 +12,24 @@ leak-instr = ["akuma-mmu/leak-instr"]
 # `pmm` module's boot-suite forwarders are gated on that cfg, and without this
 # they compile out of a crate the bin then cannot find them in.
 no-tests = []
+# The ELF loader (`akuma-elf`, and the `elf` crate under it): `Process::from_elf*`,
+# `replace_image*`, the `spawn_process*` / `exec*` helpers built on them, and the
+# `elf_loader` re-export. Off, the amd64 kernels, which load binaries their own
+# way and reach only `install_image`, compile ~4,600 fewer audit lines.
+# Enabled by the AArch64 kernel's crates (`akuma-syscalls-glue/exec`,
+# `akuma-kernel-glue`, `akuma-exceptions`, the bin).
+elf-loader = ["dep:akuma-elf", "dep:embedded-io-async"]
 # Profile discriminator forwarded from the bin crate's `extreme` feature
 # (build_extreme_size.sh). Lets this crate's build.rs emit
 # `cfg(kernel_profile_extreme)` so threading can trim the warm-stack floor and
 # right-size kernel stacks for the extreme low-memory target. NOT a syscall gate.
-extreme = ["akuma-primitives/extreme", "akuma-elf/extreme", "akuma-threading/extreme", "akuma-el0-entry/extreme"]
+extreme = ["akuma-primitives/extreme", "akuma-elf?/extreme", "akuma-threading/extreme", "akuma-el0-entry/extreme"]
 
 # Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared` feature.
 # Lets this crate's build.rs emit `cfg(kernel_smp_shared)` so the Big Kernel Lock
 # (`bkl`) is active; with it off, `bkl` compiles to zero-overhead no-ops and the
 # default/other builds are unaffected. See docs/reference/subsystems/smp-shared.md.
-smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared", "akuma-elf/smp-shared", "akuma-threading/smp-shared", "akuma-el0-entry/smp-shared"]
+smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared", "akuma-elf?/smp-shared", "akuma-threading/smp-shared", "akuma-el0-entry/smp-shared"]
 
 # Disable BKL usage for network operations (Phase 2 testing).
 # When enabled, network syscalls skip BKL acquisition and use the new
@@ -86,7 +93,7 @@ akuma-mmu = { path = "../akuma-mmu" }
 # The ELF loader, extracted 2026-08-30 (AKUMA_EXEC_SPLIT_AGAIN.md §3.2).
 # Re-exported as `akuma_exec::elf_loader`; this crate registers its four VFS
 # hooks in `init`.
-akuma-elf = { path = "../akuma-elf" }
+akuma-elf = { path = "../akuma-elf", optional = true }
 akuma-pmm = { path = "../akuma-pmm" }
 # Region bookkeeping: `MmapRegion`, `PhysFrame`, the CoW-inherit and munmap-detach
 # algebra, and the PTE permission vocabulary. Sits BELOW this crate so a future
@@ -114,4 +121,4 @@ lock_api = "0.4"
 log = { version = "0.4", default-features = false }
 akuma-tty = { path = "../akuma-tty" }
 akuma-isolation = { path = "../akuma-isolation" }
-embedded-io-async = { version = "0.6", default-features = false }
+embedded-io-async = { version = "0.6", default-features = false, optional = true }
