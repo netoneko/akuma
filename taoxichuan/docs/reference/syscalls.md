@@ -51,6 +51,17 @@ materializes an `OpenFile::Session` entry at its own number first, so ash's
 save/restore dance around a redirect (`fcntl(1, F_DUPFD, 10)` … `dup2(10, 1)`)
 lands on a real description.
 
+**A file's size is the inode's, never the description's.** `OpenFile::File`
+holds an inode and a cursor and nothing else; `read`, `pread64`, `fstat`,
+`lseek(SEEK_END)` and file-backed `mmap` ask ext2 for the length at the call.
+Two opens of one file must see each other's writes: SQLite's connections read
+WAL frames another connection just appended, and a per-fd copy of the size
+made that a short read (`SQLITE_IOERR_SHORT_READ`, 522) and kept goose from
+starting ([`TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md`](../../../docs/archive/TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md)).
+`O_APPEND` still positions once, at `open`, not before every write, so two
+appenders on separate descriptions can interleave. That is a known difference
+from Linux.
+
 fd slots are fixed: 16 per task (`SLOT_CEILING`), 3–15 allocatable
 ([`crates/akuma-fdtable`](../../../crates/akuma-fdtable) owns lowest-free,
 close, dup_to, fork_copy, the flag sets; this kernel supplies the effects).
@@ -107,7 +118,7 @@ close, dup_to, fork_copy, the flag sets; this kernel supplies the effects).
 | 63 | uname | dispatch (main.rs) | syscalls-linux uts::Field | "Linux taoxichuan 6.6.0-akuma … x86_64" |
 | 72 | fcntl | dispatch (main.rs) | akuma-fdtable | F_GETFD/F_SETFD/F_GETFL(=0)/F_SETFL(O_NONBLOCK)/F_DUPFD/F_DUPFD_CLOEXEC |
 | 73 | flock | dispatch (main.rs) | — | 0: one task, nothing contends |
-| 77 | ftruncate | dispatch (main.rs) | akuma-ext2 `truncate_by_inode` | fd's cached size follows |
+| 77 | ftruncate | dispatch (main.rs) | akuma-ext2 `truncate_by_inode` | every description sees the new size (it is the inode's) |
 | 79 | getcwd | dispatch (main.rs) | — | always "/"; no working directory exists |
 | 91 | fchmod | dispatch (main.rs) | — | 0: root's mode is the mode |
 | 95 | umask | dispatch (main.rs) | — | 0o022, conventional; nothing inherits it |

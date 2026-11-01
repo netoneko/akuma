@@ -1016,10 +1016,13 @@ pub(crate) enum OpenFile {
         entries: Vec<akuma_vfs::DirEntry>,
         cursor: usize,
     },
+    /// No size: the file's length is the inode's ([`inode_size`]), asked at
+    /// each read, seek and stat. A per-description copy went stale as soon as
+    /// another description of the same file wrote, and SQLite's second
+    /// connection then read the WAL short (`TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md`).
     File {
         inode: u32,
         offset: u64,
-        size: u64,
     },
     /// A TCP/UDP socket: `akuma_net`'s socket-table index. `sock.rs` serves
     /// every access through it.
@@ -1090,6 +1093,13 @@ impl OpenFile {
             _ => ([(0, false); 2], 0),
         }
     }
+}
+
+/// A regular file's current length, as ext2 has it — one size per inode, the
+/// way Linux keeps it, so every description of the file agrees. `None` when the
+/// inode cannot be read (the callers answer as for an empty file or `EIO`).
+fn inode_size(inode: u32) -> Option<u64> {
+    root_fs().metadata_by_inode(inode).ok().map(|md| md.size)
 }
 
 /// The one task: its root page table, the user ranges a pointer may name, the
@@ -1879,7 +1889,7 @@ fn open_common(path: &str, flags: u64) -> u64 {
                 // not re-seeked per write, so a second writer on a shared
                 // description can still interleave.
                 let offset = if flags & 0x400 != 0 { size } else { 0 };
-                OpenFile::File { inode, offset, size }
+                OpenFile::File { inode, offset }
             }
             Err(_) => return e(ring3::err::EIO),
         }
@@ -1950,12 +1960,11 @@ fn write_file_arm_inner(fd: u64, buf: u64, len: u64) -> u64 {
             }
         }
     }
-    // The fd's cursor and size follow the bytes that landed, even when a later chunk failed.
+    // The fd's cursor follows the bytes that landed, even when a later chunk failed.
     let _ = with_fds(|t| {
         t.update(fd as u32, |of| {
-            if let OpenFile::File { offset, size, .. } = of {
+            if let OpenFile::File { offset, .. } = of {
                 *offset += done;
-                *size = (*size).max(*offset);
             }
         })
     });
@@ -1978,7 +1987,7 @@ fn writev_file_arm_inner(fd: u64, data: &[u8]) -> u64 {
     let mut total = 0u64;
     let mut res: Result<u64, u64> = Ok(0);
     let found = with_fds(|t| t.update(fd as u32, |of| {
-        let OpenFile::File { inode, offset, size } = of else {
+        let OpenFile::File { inode, offset } = of else {
             res = Err(ring3::err::EBADF);
             return;
         };
@@ -1989,7 +1998,6 @@ fn writev_file_arm_inner(fd: u64, data: &[u8]) -> u64 {
             match root_fs().write_at_by_inode(*inode, (start + done as u64) as usize, &data[done..]) {
                 Ok(n) if n > 0 => {
                     *offset += n as u64;
-                    *size = (*size).max(*offset);
                     done += n;
                     total += n as u64;
                     if n < want {
@@ -2309,7 +2317,7 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
         return e(ring3::err::EBADF);
     }
     let info = with_fds(|t| t.with(fd as u32, |d| match d {
-        OpenFile::File { inode, size, .. } => Some((u64::from(*inode), *size, 0u8)),
+        OpenFile::File { inode, .. } => Some((u64::from(*inode), 0, 0u8)),
         OpenFile::Dir { .. } => Some((0, 0, 1)),
         // The type bits are what callers decide on: git's `index-pack` asks
         // `fstat_size(0)` and only trusts the byte count for a REGULAR file -
@@ -2322,16 +2330,16 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
     let Some(Some((inode, size, kind))) = info else {
         return e(ring3::err::EBADF);
     };
-    let (mode, links) = match kind {
+    let (mode, links, size) = match kind {
         0 => match root_fs().metadata_by_inode(inode as u32) {
-            Ok(md) => (md.mode, u64::from(md.links.unwrap_or(1))),
-            Err(_) => (0o100644, 1),
+            Ok(md) => (md.mode, u64::from(md.links.unwrap_or(1)), md.size),
+            Err(_) => (0o100644, 1, size),
         },
-        1 => (0o40755, 2),
-        3 => (0o10600, 1),  // S_IFIFO
-        4 => (0o140777, 1), // S_IFSOCK
-        5 => (0o20666, 1),  // S_IFCHR
-        _ => (0o100600, 1),
+        1 => (0o40755, 2, size),
+        3 => (0o10600, 1, size),  // S_IFIFO
+        4 => (0o140777, 1, size), // S_IFSOCK
+        5 => (0o20666, 1, size),  // S_IFCHR
+        _ => (0o100600, 1, size),
     };
     match fill_stat64(buf, inode, mode, size, links) {
         Ok(()) => 0,
@@ -2344,9 +2352,7 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
 /// the apk path reads through two fds sharing one offset.
 fn clone_desc(d: &OpenFile) -> OpenFile {
     match d {
-        OpenFile::File { inode, offset, size } => {
-            OpenFile::File { inode: *inode, offset: *offset, size: *size }
-        }
+        OpenFile::File { inode, offset } => OpenFile::File { inode: *inode, offset: *offset },
         OpenFile::Dir { path, entries, cursor } => OpenFile::Dir {
             path: path.clone(),
             entries: entries.clone(),
@@ -2501,14 +2507,14 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
         // inode, and neither may find the task record borrowed. The cursor goes back at the end.
         enum Snap {
             Dir,
-            File { inode: u32, offset: u64, size: u64 },
+            File { inode: u32, offset: u64 },
             WriteOnly,
             Other,
         }
         let snap = with_fds(|t| {
             t.with(fd as u32, |of| match of {
                 OpenFile::Dir { .. } => Snap::Dir,
-                OpenFile::File { inode, offset, size } => Snap::File { inode: *inode, offset: *offset, size: *size },
+                OpenFile::File { inode, offset } => Snap::File { inode: *inode, offset: *offset },
                 OpenFile::Pipe(_, true) => Snap::WriteOnly,
                 // Socket, ChildOut and EventFd fds were served above; Null reads are EOF - the default `Ok(0)` - which
                 // is the device's contract.
@@ -2519,7 +2525,10 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
             Some(Snap::Dir) => return e(ring3::err::EISDIR),
             Some(Snap::WriteOnly) => return e(ring3::err::EBADF),
             Some(Snap::Other) => return 0,
-            Some(Snap::File { inode, offset, size }) => {
+            Some(Snap::File { inode, offset }) => {
+                let Some(size) = inode_size(inode) else {
+                    return e(ring3::err::EIO);
+                };
                 let mut chunk = [0u8; 512];
                 let mut total = 0u64;
                 let mut cursor = offset;
@@ -3293,13 +3302,13 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 // `Some(Some(inode))` = a bound regular file; anything else
                 // (unbound, socket, dir, child pipe) has no file to map.
                 let mapped = with_fds(|t| t.with(fd as u32, |d| match d {
-                    OpenFile::File { inode, size, .. } => Some((*inode, *size)),
+                    OpenFile::File { inode, .. } => Some(*inode),
                     _ => None,
                 }));
                 match mapped {
-                    Some(Some((node, size))) => {
+                    Some(Some(node)) => {
                         fnode = Some(node);
-                        fsize = size;
+                        fsize = inode_size(node).unwrap_or(0);
                     }
                     _ => return e(ring3::err::ENODEV),
                 }
@@ -3417,12 +3426,15 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 return e(ring3::err::EFAULT);
             }
             let mapped = with_fds(|t| t.with(fd as u32, |d| match d {
-                OpenFile::File { inode, size, .. } => Some((*inode, *size)),
+                OpenFile::File { inode, .. } => Some(*inode),
                 _ => None,
             }));
-            let Some(Some((node, size))) = mapped else {
+            let Some(Some(node)) = mapped else {
                 // Unbound, a directory, a socket: no explicit-offset read.
                 return e(ring3::err::ESPIPE);
+            };
+            let Some(size) = inode_size(node) else {
+                return e(ring3::err::EIO);
             };
             let mut total = 0u64;
             let want = len.min(size.saturating_sub(off.min(size)));
@@ -3472,11 +3484,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     _ => return e(ring3::err::EIO),
                 }
             }
-            with_fds(|t| t.update(fd as u32, |of| {
-                if let OpenFile::File { size, .. } = of {
-                    *size = (*size).max(off + done);
-                }
-            }));
             done
         }
         akuma_syscalls_abi::x86_64::SCHED_YIELD => {
@@ -4002,11 +4009,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             let mut res: Result<u64, u64> = Err(ring3::err::EBADF);
             with_fds(|t| t.update(fd as u32, |d| match d {
-                OpenFile::File { offset, size, .. } => {
+                OpenFile::File { inode, offset } => {
                     let base = match whence {
                         0 => 0i64,            // SEEK_SET
                         1 => (*offset).cast_signed(), // SEEK_CUR
-                        2 => (*size).cast_signed(),   // SEEK_END
+                        2 => inode_size(*inode).unwrap_or(0).cast_signed(), // SEEK_END
                         _ => {
                             res = Err(ring3::err::EINVAL);
                             return;
@@ -4095,16 +4102,15 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // still succeed on the write path's own sizing — G3, A3). The
             // effect is akuma-ext2's `truncate_by_inode` (the same path
             // SQLite's ftruncate-extends used); this is the marshalling only.
-            // The fd's cached `size` follows so reads see the new EOF.
+            // Every description of the file sees the new EOF: the size is the inode's.
             let mut res: Result<(), u64> = Ok(());
             let hit = with_fds(|t| t.update(fr.arg1() as u32, |of| {
-                let OpenFile::File { inode, size, .. } = of else {
+                let OpenFile::File { inode, .. } = of else {
                     res = Err(ring3::err::EINVAL); // Linux: not an O_WRONLY regular file
                     return;
                 };
-                match root_fs().truncate_by_inode(*inode, fr.arg2()) {
-                    Ok(()) => *size = fr.arg2(),
-                    Err(_) => res = Err(ring3::err::EIO),
+                if root_fs().truncate_by_inode(*inode, fr.arg2()).is_err() {
+                    res = Err(ring3::err::EIO);
                 }
             }));
             if !hit {
