@@ -149,10 +149,6 @@ pub struct SlotCross {
     save: CrossSave,
     /// The parent's CR3 root, loaded by the exit tail (`child_exit`).
     parent_root: u64,
-    /// The crossing depth this slot's occupant runs at: 1 = spawned child,
-    /// 2 = its fork child. Was the shared `NESTED_DEPTH`; per-slot it is
-    /// inherited (+1) at the fork crossing.
-    depth: u32,
     /// The `TASKS` slot the child runs in (1 = spawned, 2 = fork child):
     /// which record `exit` lands in. Was implicit in the old depth read.
     task_slot: usize,
@@ -183,7 +179,6 @@ impl SlotCross {
         Self {
             save: CrossSave::new(),
             parent_root: 0,
-            depth: 0,
             task_slot: 0,
             parent_task_slot: 0,
             parent_slot: crate::exec_twin::NO_SLOT,
@@ -444,10 +439,7 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
     // write arm's `console_session` rule). A SPAWN crossing always stamps a
     // real slot (its parent drains it through the ChildOut fd), so the
     // sentinel never collides; fork children inherit it by the usual copy.
-    with_cross(tid, |c| {
-        c.depth = 1;
-        c.out_slot = usize::MAX;
-    });
+    with_cross(tid, |c| c.out_slot = usize::MAX);
     register_shell_process(1, path, ti.root_pa, ti.entry, ti.rsp, tid);
     INIT_TID.store(tid, core::sync::atomic::Ordering::Relaxed);
     INIT_ENTRY.store(ti.entry, core::sync::atomic::Ordering::Relaxed);
@@ -537,12 +529,9 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
     // SAME session buffer its parent had — the bridge drains the shell's.
     let shell = crate::exec_twin::current_slot();
     if shell != crate::exec_twin::NO_SLOT && shell < NSLOTS && tid < NSLOTS {
-        let (out, depth) = with_cross(shell, |sc| (sc.out_slot, sc.depth));
+        let out = with_cross(shell, |sc| sc.out_slot);
         // `tid` was just bound inside the spawn ring.
-        with_cross(tid, |c| {
-            c.out_slot = out;
-            c.depth = depth + 1;
-        });
+        with_cross(tid, |c| c.out_slot = out);
     }
     Ok(())
 }
@@ -1086,23 +1075,11 @@ fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u
 /// does NOT run here — the crate publishes it as a runnable thread and this
 /// arm returns the pid to the caller, exactly like Linux.
 fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
-    // Fork lives only inside the spawned shell, the blocking arm's own rule:
-    // the boot task has no registered Process, and a fork inside a fork
-    // child has no stack region left.
+    // The boot task has no registered Process to fork. Any other task forks
+    // for real, however deep: each child has its own thread and stacks (the
+    // M2 crossing's depth ceiling went with the crossing).
     let cur = crate::exec_twin::current_slot();
-    let shell_depth = match cur {
-        crate::exec_twin::NO_SLOT => 0,
-        _ => with_cross(cur, |c| c.depth),
-    };
-    // Session pg: depth 2 (a REAL fork child forking again — grandfork's
-    // rungs 2-5, the `( ls; ls )` class this slice exists to fix) forks for
-    // real now that the child is its own thread with its own band and the
-    // bind hook stamps its depth; deeper generations stay refused. Session
-    // ph flattens the ceiling to 3: grandfork's rungs 3-5 fork at depth 3
-    // (the grandchild generation), and under the REAL path a fork child owns
-    // a threading stack and a syscall band of its own, so the M2 "no stack
-    // region left" ceiling no longer binds.
-    if !(1..=8).contains(&shell_depth) {
+    if cur == crate::exec_twin::NO_SLOT {
         return crate::e(crate::err::EPERM);
     }
     let child_pid = akuma_exec::process::allocate_pid();
