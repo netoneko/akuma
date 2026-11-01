@@ -22,16 +22,6 @@ pub struct SpawnSlot {
     pub pid: u32,
     /// The task has not exited yet (set at bind, cleared at exit).
     pub running: bool,
-    /// Set only by `bind_child_task`: the slot holds a task `fork_process`
-    /// published. With the private SPAWN path gone every occupied slot gets
-    /// it, and `is_real_task` still reads it, so a slot whose bind has not
-    /// completed never counts. The reset in `new()` clears any previous
-    /// occupant's bit.
-    pub real: bool,
-    /// A `CLONE_THREAD` sibling: shares its creator's task record
-    /// (`TASK_OF`), owns no fds or address space of its own, and exits without
-    /// a status for a parent to reap.
-    pub thread: bool,
 }
 
 impl SpawnSlot {
@@ -40,8 +30,6 @@ impl SpawnSlot {
             used: false,
             pid: 0,
             running: false,
-            real: false,
-            thread: false,
         }
     }
 }
@@ -245,8 +233,14 @@ pub fn slot_in_use(slot: usize) -> bool {
 
 /// Is the running task a `CLONE_THREAD` sibling?
 pub fn is_thread_task() -> bool {
-    let cur = crate::exec_twin::current_slot();
-    cur != crate::exec_twin::NO_SLOT && cur < NSLOTS && SLOTS.with(|s| s[cur].used && s[cur].thread)
+    akuma_exec::process::current_process_shared().is_some_and(|p| p.pid != p.tgid)
+}
+
+/// The thread group of the task in slot `slot`: its `Process`'s `tgid` (a
+/// `clone_thread` Process carries its leader's pid), else its own pid.
+fn slot_tgid(slot: usize) -> u32 {
+    let pid = slot_pid(slot);
+    akuma_exec::process::table::with_process(pid, |p| p.tgid).unwrap_or(pid)
 }
 
 /// `fork_process`'s `bind_child_task` records: (tid, pid, root) — the twin's
@@ -341,8 +335,6 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         s[slot_idx].used = true;
         s[slot_idx].running = true;
         s[slot_idx].pid = pid;
-        s[slot_idx].real = true;
-        s[slot_idx].thread = is_thread;
     });
     let _ = prepare_task_slot(slot_idx);
     if is_thread {
@@ -421,7 +413,7 @@ pub fn is_real_task() -> bool {
     if cur == crate::exec_twin::NO_SLOT || cur == 0 || cur >= NSLOTS {
         return false;
     }
-    SLOTS.with(|s| s[cur].used && s[cur].running && s[cur].real)
+    SLOTS.with(|s| s[cur].used && s[cur].running)
 }
 
 /// A forked task's `exit_group` (or a lone process's `exit`): the whole group
@@ -517,34 +509,36 @@ fn task_exit_code(code: i32) -> ! {
     akuma_threading::x86_finish_current()
 }
 
-/// The slot that owns the process `cur` belongs to: the one non-thread slot
-/// running against the same task record. `cur` when it is not a thread.
+/// The slot that owns the process `cur` belongs to: the slot whose pid is the
+/// group's `tgid`. `cur` when it is the leader (or the leader is gone).
 fn group_leader(cur: usize) -> usize {
-    if cur >= NSLOTS || !SLOTS.with(|s| s[cur].thread) {
+    if cur >= NSLOTS {
         return cur;
     }
-    let rec = task_of(cur);
-    (0..NSLOTS)
-        .find(|&s| s != cur && SLOTS.with(|t| t[s].used && !t[s].thread) && task_of(s) == rec)
-        .unwrap_or(cur)
+    let tgid = slot_tgid(cur);
+    if slot_pid(cur) == tgid {
+        return cur;
+    }
+    (0..NSLOTS).find(|&s| s != cur && slot_in_use(s) && slot_pid(s) == tgid).unwrap_or(cur)
 }
 
 /// `exit_group`: end every thread of `cur`'s group except `cur` and `lead`
-/// (the caller finishes those itself).
+/// (the caller finishes those itself). A thread is a slot whose `Process` has
+/// the group's `tgid` and a pid of its own.
 fn kill_siblings(cur: usize, lead: usize) {
-    let rec = task_of(cur);
+    let tgid = slot_tgid(cur);
     for s in 0..NSLOTS {
-        if s != cur && s != lead && SLOTS.with(|t| t[s].used && t[s].thread) && task_of(s) == rec {
-            crate::futex::purge_task(s);
-            let pid = with_slots(|t| {
-                t[s].running = false;
-                t[s].used = false;
-                t[s].thread = false;
-                t[s].pid
-            });
-            akuma_threading::mark_thread_terminated(s);
-            retire_thread_process(pid);
+        let spid = slot_pid(s);
+        if s == cur || s == lead || !slot_in_use(s) || spid == tgid || slot_tgid(s) != tgid {
+            continue;
         }
+        crate::futex::purge_task(s);
+        with_slots(|t| {
+            t[s].running = false;
+            t[s].used = false;
+        });
+        akuma_threading::mark_thread_terminated(s);
+        retire_thread_process(spid);
     }
 }
 
@@ -583,8 +577,6 @@ pub fn task_exit_thread() -> ! {
     let pid = with_slots(|s| {
         s[cur].running = false;
         s[cur].used = false;
-        s[cur].thread = false;
-        s[cur].real = false;
         s[cur].pid
     });
     retire_thread_process(pid);
@@ -907,19 +899,16 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
         Err(msg) => {
             akuma_primitives::safe_print!(192, "[forkp] refused: {}\n", msg);
             for i in 0..NSLOTS {
-                let (used, running, thread, real, rpid) =
-                    SLOTS.with(|t| (t[i].used, t[i].running, t[i].thread, t[i].real, t[i].pid));
+                let (used, running, rpid) = SLOTS.with(|t| (t[i].used, t[i].running, t[i].pid));
                 akuma_primitives::safe_print!(
                     128,
-                    "  ring {}: pool={} oncpu={} held={} used={} running={} thread={} real={} pid={}\n",
+                    "  ring {}: pool={} oncpu={} held={} used={} running={} pid={}\n",
                     i,
                     akuma_threading::get_thread_state(i),
                     akuma_threading::on_cpu_flag(i),
                     akuma_threading::slot_held_by(i),
                     used,
                     running,
-                    thread,
-                    real,
                     rpid
                 );
             }
