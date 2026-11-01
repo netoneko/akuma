@@ -243,10 +243,48 @@ static UTSNAME: [u8; UTS_LEN] = {
 static NODENAME: Spinlock<Option<akuma_syscalls_linux::uts::Field>> = Spinlock::new(None);
 static DOMAINNAME: Spinlock<Option<akuma_syscalls_linux::uts::Field>> = Spinlock::new(None);
 
+/// A kernel's own `uname` identity: `sysname`, the default `nodename`, `release`, `version`.
+///
+/// `machine` stays the compiled architecture's. Glue answers `Akuma` for a kernel that sets none - the AArch64 kernel and amd64 - and one that does gets its own
+/// name back: Taoxichuan said `Linux`/`taoxichuan` until its `uname` arm moved here
+/// (`74962ae5`), and then reported Akuma's. A field longer than 64 bytes is cut.
+#[derive(Clone, Copy, Debug)]
+pub struct UtsIdentity {
+    pub sysname: &'static str,
+    pub nodename: &'static str,
+    pub release: &'static str,
+    pub version: &'static str,
+}
+
+static IDENTITY: Spinlock<Option<UtsIdentity>> = Spinlock::new(None);
+
+/// Register this kernel's [`UtsIdentity`] (once, at init). `sethostname` still overrides
+/// the nodename afterwards.
+pub fn set_uts_identity(id: UtsIdentity) {
+    *IDENTITY.lock() = Some(id);
+}
+
+fn uts_field_of(name: &str) -> akuma_syscalls_linux::uts::Field {
+    let mut f = akuma_syscalls_linux::uts::Field::empty();
+    let b = name.as_bytes();
+    let _ = f.set(&b[..b.len().min(akuma_syscalls_linux::uts::NAME_MAX)]);
+    f
+}
+
 pub(super) fn sys_uname(buf: u64) -> u64 {
     if !validate_user_ptr(buf, UTS_LEN) { return EFAULT; }
     if copy_to_user(buf, &UTSNAME).is_err() {
         return EFAULT;
+    }
+    // A kernel's own identity over glue's defaults, field by field (whole 65-byte fields,
+    // so a shorter name leaves no tail of the default).
+    let id = *IDENTITY.lock();
+    if let Some(id) = id {
+        for (index, name) in [(0usize, id.sysname), (1, id.nodename), (2, id.release), (3, id.version)] {
+            if copy_to_user(buf + (index * UTS_FIELD_LEN) as u64, uts_field_of(name).as_bytes()).is_err() {
+                return EFAULT;
+            }
+        }
     }
     // Overlay the two writable fields. Copied out under the lock and written
     // after it drops: `copy_to_user` can fault.
