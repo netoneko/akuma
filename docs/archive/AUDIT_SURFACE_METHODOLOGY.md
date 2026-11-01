@@ -167,6 +167,28 @@ different live sets. A Linux `.cmd` path and a rustc dep-info path both name the
 `unifdef -b` blanks removed lines instead of deleting them, so line numbers stay comparable
 across configs of one tree.
 
+## Results (2026-11-01, after the first day of Taoxichuan cleanup)
+
+Rust: `scripts/cloc_akuma.py --audit taoxichuan akuma-amd64`, `--features no-tests`, at `15ff2709`
+(clean tree). Linux: the 2026-10-30 builds below, unchanged. akuma-aarch64 was not re-measured.
+
+| | audit lines | 10-30 |
+|---|---:|---:|
+| **taoxichuan** (guest) | **78,351** | 84,761 |
+| kernel crate / workspace crates / third-party | 3,907 / 52,583 (70) / 21,861 (15) | 6,652 / 36,361 / 41,748 |
+| inside `unsafe` | 1,669 | 2,812 |
+| build-time (host) | 419 | 31,743 |
+| **akuma-amd64** (host) | **135,167** | 151,235 |
+| **akuma-amd64 + taoxichuan** (union; shared 72,942) | **140,576** | 158,909 |
+| taoxichuan on a Linux 6.18 host (2,362,283 + 78,351; nothing shared) | 2,440,634 | 2,447,044 |
+
+- Ratios against Linux: guest 10.7x (minimal) / 23.8x (Firecracker); host 17.5x; stack 17x / 20x.
+- Most of the drop is third-party: the in-tree virtio drivers replaced virtio-drivers and its
+  dependencies (`AKUMA_VIRTIO_IN_TREE.md`, -14k), and with them the only proc-macros that brought `syn`
+  into the build (`enumn`, `thiserror-impl`, `zerocopy-derive`). The rest is `#[cfg]` features (one ELF loader, smoltcp DNS off, aarch64-only `fdt`) and the
+  phase-2 deletions in `taoxichuan/src` (`TAOXICHUAN_CLEANUP_PLAN.md`). Taoxichuan's workspace count rose
+  (36k -> 53k) because the fd, socket and signal families it used to carry privately are now glue's.
+
 ## Results (2026-10-30)
 
 Rust: `scripts/cloc_akuma.py --audit taoxichuan akuma-amd64 akuma-aarch64`, `--features no-tests`,

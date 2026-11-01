@@ -41,6 +41,70 @@ what Rust was sold as, not on specific functions or technical problems.
   has a "Measurements to take before the talk" checklist; its numbers are
   derived until re-measured on a clean tag.
 
+## Facts re-measured 2026-11-01 (after the first day of cleanup)
+
+Supersedes the audit figures in the 10-30 section below for anything quoted on a slide; the 10-30
+section stays as the "before". Measured on `rust-org-il-experiment` @ `15ff2709`, clean tree,
+`scripts/cloc_akuma.py --audit taoxichuan akuma-amd64`, `--features no-tests`. Linux 6.18 figures
+are the 10-30 builds (that tree did not change). The day's work is the status table of
+[`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md).
+
+**The three numbers**
+
+| what an auditor would read | audit lines | 10-30 |
+|---|---:|---:|
+| **taoxichuan alone** (the guest image) | **78,351** | 84,761 |
+| of which taoxichuan's own crate | 3,907 | 6,652 |
+| **taoxichuan on an Akuma host** (akuma-amd64 + taoxichuan, shared lines once) | **140,576** | 158,909 |
+| **taoxichuan on a Linux host** (Linux 6.18 `x86_64_defconfig` + KVM, 2,362,283, + taoxichuan; nothing shared) | **2,440,634** | 2,447,044 |
+
+- Taoxichuan adds **5,409** lines to an Akuma host (135,167 alone). **93%** of its live lines (72,942 of
+  78,351) are already live in the host.
+- Its own crate is **5%** of its image. The other 95% is 70 workspace crates and 15 crates.io crates.
+- Against Linux: the guest is **10.7x** smaller than Linux trimmed to the same job (836,651) and
+  **23.8x** smaller than Linux as Firecracker ships it (1,868,016). The host is **17.5x**. The whole Akuma
+  stack is **17x** smaller than Linux host + minimal Linux guest (2,391,510), **20x** with Firecracker's
+  guest, before the VMM. On a Linux host, the stack is 17x the all-Akuma one: Linux's host alone is
+  30x taoxichuan.
+
+**What moved in a day (each one a commit, `TAOXICHUAN_CLEANUP_PLAN.md`)**
+
+- **virtio-drivers left every kernel's image** (`56d121bc`). An in-tree split-ring driver
+  (`akuma-virtqueue` plus about 500 lines in `akuma-virtio`) replaced 14,521 third-party lines
+  (virtio-drivers, zerocopy, safe-mmio, bitflags 2, thiserror): -13,981 net.
+  The 10-30 fact "zerocopy has more `unsafe` lines than all workspace crates together" is gone with it.
+- **Build-time host code went from 31,743 lines to 419.** `syn` arrived only through the virtio
+  stack's proc-macros (`enumn`, `thiserror-impl`, `zerocopy-derive`; `cargo tree -i syn` at `3e2bb725`).
+  It is no longer in the build, and "`syn` alone is 3x taoxichuan" no longer holds.
+- **The device-tree parser left the x86 guest** (`a4cd34b2`): `fdt` is aarch64-only now.
+- One ELF loader, not two (`3e2bb725`, -5,449). Smoltcp's unused DNS socket off (-983).
+- Third-party code went from 49% of the image to **28%** (21,861 lines), and from 67% of its `unsafe`
+  lines to **47%** (789 of 1,669).
+- Largest crates in the guest now: smoltcp 11,030, `akuma-syscalls-glue` 10,734, `akuma-exec` 5,254,
+  then taoxichuan itself at 3,907.
+- `taoxichuan/src`: 12,131 lines when the cleanup began, 6,548 at `15ff2709`.
+
+**Still true:** none of these kernels has been audited. These are sizes of the reading an audit would
+take.
+
+**Runs on it (1 day after the cutover):** goose + GLM (a prompt and a tool call), `apk add git`,
+`rustc` + `cargo build`, `tokioprobe` (multi-thread runtime, `tokio::process`, HTTPS through rustls) at
+`smp=1` and `smp=4`, and the fixed point K1 == K2 (`3e2bb725`, ryzen, SMP=1).
+
+## Classic blunders (the user's list, being compiled)
+
+Recorded as they come up in the "classic blunders" entry of
+[`MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md`](MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md). Each one
+fails silently: nothing errors, something just waits.
+
+- **The ssh stdin pump** (2026-11-01): sshd wrote a child's stdin into a descriptor the child was not
+  reading, and sent EOF through a syscall the kernel no longer had
+  ([`TAOXICHUAN_SSH_STDIN_PUMP.md`](TAOXICHUAN_SSH_STDIN_PUMP.md)).
+- **A timed sleep that never expired on an idle core** (same day): the wake pass ran only inside the
+  switch, and the idle loop switched only for threads already ready
+  ([`TAOXICHUAN_ONE_CLOCK_TIME_FOLD.md`](TAOXICHUAN_ONE_CLOCK_TIME_FOLD.md)).
+- Honorable mentions: `wait4(-1)`, the networking pumps, an init its children cannot fork from.
+
 ## Facts to consider (measured 2026-10-30)
 
 Information, not a storyline. Measured on `rust-org-il-experiment` @ `9f1e333f` plus the
@@ -395,11 +459,13 @@ Asterinas's.
 
 - **Production lines and `unsafe` sites:** the AArch64 bin crate has 136 lines and 0 `unsafe`
   sites. taoxichuan has about 6,900 lines, with `unsafe` sites going 131 -> 67 -> 55 (HEAD
-  `16936a0a`; re-measure before quoting). The amd64 bin has 83.
-- **Audit surface (Linux 6.18):** taoxichuan's guest is 84,761 audit lines against 836,651 for a
-  trimmed Linux guest (9.9x) and 1,868,016 for Firecracker's (22x). The host is 151,235 against
-  2,362,283 (15.6x). The whole stack is 158,909 against 2.4-2.9M (15-18x), before counting the
-  Firecracker VMM.
+  `16936a0a`). After the cleanup (2026-11-01 @ `15ff2709`): 6,548 lines and **34** `unsafe` sites.
+  The amd64 bin has 83.
+- **Audit surface (Linux 6.18; re-measured 2026-11-01 @ `15ff2709`):** taoxichuan's guest is 78,351
+  audit lines against 836,651 for a trimmed Linux guest (10.7x) and 1,868,016 for Firecracker's
+  (23.8x). The host is 135,167 against 2,362,283 (17.5x). The whole stack is 140,576 against
+  2.4-2.9M (17-20x), before counting the Firecracker VMM. Taoxichuan on a Linux host: 2,440,634.
+  (10-30: 84,761 / 151,235 / 158,909.)
 - **Memory for the same compile:** Linux 447 MiB, Akuma 1,356 MiB, taoxichuan at least 2,460 MiB
   (eager file mmap).
 - **Caveat:** these are sizes of the reading an audit would take. None of the Akuma kernels has
@@ -408,10 +474,11 @@ Asterinas's.
 ### Ownership and portability
 
 - Full ownership down to KVM closes the signing chain, gives one debugging surface across guest
-  and host, and allows the 158,909-line whole-stack figure. It also means owning the audit burden,
+  and host, and allows the 140,576-line whole-stack figure (158,909 on 10-30). It also means owning the audit burden,
   with firmware, microcode and the CPU's virtualisation hardware still below the stack.
 - The guest also runs on Linux KVM, Firecracker and TCG, so the claims are reproducible by others
   and host bugs separate from guest bugs. On a Linux host the total stack is about 2.4M lines
-  again, so show two rows: full ownership (Akuma on Akuma) and guest only (taoxichuan on any KVM).
+  again (2,440,634 on 11-01), so show two rows: full ownership (Akuma on Akuma, 140,576) and guest
+  only (taoxichuan on any KVM, 78,351).
 - **Ready-made line:** "It works in practice" (self-hosted build, `cargo -j4`, leak gate), then
   the architecture.
