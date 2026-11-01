@@ -960,10 +960,24 @@ pub fn sleep_ms(milliseconds: u64) {
     nanosleep_for(secs, nanos);
 }
 
-// returns microseconds, not milliseconds
+/// Microseconds since boot (not milliseconds).
+///
+/// Under `linux-abi` it is `clock_gettime(CLOCK_MONOTONIC)`, which a Linux kernel serves
+/// boot-relative: no private call. The native build keeps Akuma's `UPTIME`.
 #[inline(never)]
 pub fn uptime() -> u64 {
-    syscall(syscall::UPTIME, 0, 0, 0, 0, 0, 0)
+    #[cfg(feature = "linux-abi")]
+    {
+        let mut ts = Timespec::default();
+        if clock_gettime(CLOCK_MONOTONIC, &mut ts) != 0 {
+            return 0;
+        }
+        (ts.tv_sec as u64).saturating_mul(1_000_000) + (ts.tv_nsec as u64) / 1_000
+    }
+    #[cfg(not(feature = "linux-abi"))]
+    {
+        syscall(syscall::UPTIME, 0, 0, 0, 0, 0, 0)
+    }
 }
 
 /// Get current Unix timestamp (microseconds since 1970-01-01 00:00:00 UTC)
