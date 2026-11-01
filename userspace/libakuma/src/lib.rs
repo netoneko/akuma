@@ -181,7 +181,8 @@ pub mod syscall {
         /// the number is reserved but the call returns `ENOSYS`.
         pub const CONSOLE_NOTIFY: u64 = 322;
         pub const SPAWN: u64 = 301;
-        pub const KILL: u64 = 302;
+        /// Akuma-private `kill(pid, sig)` (Linux `kill` is not in this table).
+        pub const AKUMA_KILL: u64 = 302;
         pub const WAITPID: u64 = 303;
         pub const TIME: u64 = 305;
         pub const CLOSE_CHILD_STDIN: u64 = 326;
@@ -275,7 +276,8 @@ pub mod syscall {
         /// feature (default-on); `/bin/wall` is the front end.
         pub const CONSOLE_NOTIFY: u64 = AKUMA_PRIVATE_BASE + 322;
         pub const SPAWN: u64 = AKUMA_PRIVATE_BASE + 301;
-        pub const KILL: u64 = AKUMA_PRIVATE_BASE + 302;
+        /// Akuma-private `kill(pid, sig)` (Linux `kill` is not in this table).
+        pub const AKUMA_KILL: u64 = AKUMA_PRIVATE_BASE + 302;
         pub const WAITPID: u64 = AKUMA_PRIVATE_BASE + 303;
         pub const TIME: u64 = AKUMA_PRIVATE_BASE + 305;
         pub const CLOSE_CHILD_STDIN: u64 = AKUMA_PRIVATE_BASE + 326;
@@ -2314,7 +2316,7 @@ fn pipe_cloexec() -> Option<(i32, i32)> {
     already caused at least 3 call sites to believe they were killing a \
     child when they were not (docs/archive/LIBAKUMA_AUDIT.md item 11)")]
 pub fn kill(pid: u32) -> i32 {
-    syscall(syscall::KILL, pid as u64, 0, 0, 0, 0, 0) as i32
+    syscall(syscall::AKUMA_KILL, pid as u64, 0, 0, 0, 0, 0) as i32
 }
 
 /// Send signal `sig` to `pid`. Returns 0 on success, negative errno on error.
@@ -2322,7 +2324,7 @@ pub fn kill(pid: u32) -> i32 {
 /// `sig = 0` only probes for the process's existence without delivering
 /// anything — the same contract as Linux, and what [`kill`] hardcodes.
 pub fn kill_signal(pid: u32, sig: u32) -> i32 {
-    syscall(syscall::KILL, pid as u64, sig as u64, 0, 0, 0, 0) as i32
+    syscall(syscall::AKUMA_KILL, pid as u64, sig as u64, 0, 0, 0, 0) as i32
 }
 
 /// `SIGINT` — terminal interrupt (Ctrl-C). Catchable.

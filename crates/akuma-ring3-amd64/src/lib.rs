@@ -880,237 +880,26 @@ pub unsafe extern "C" fn enter_user(f: &EntryFrame) -> ! {
 // different table; the full kernel translates per arch, and so does this.)
 // ---------------------------------------------------------------------------
 
-/// Syscall numbers, x86_64.
+/// The x86_64 syscall numbers `akuma-syscalls-abi` cannot hold: x86-only
+/// calls with no asm-generic twin, and Akuma's private block. Every other
+/// number is `akuma_syscalls_abi::x86_64::*`, one row per call with both
+/// architectures' numbers and round-trip tests.
+///
+/// Until 2026-11-01 this was a second, 93-entry x86_64 table, and it drifted:
+/// `GETPID = 38` (`setitimer`; getpid is 39) and `SENDFILE = 39`, plus the
+/// misleading `SELECT_PSELECT6` and `PR_LIMIT64`
+/// (`docs/archive/SYSCALL_CONSTANT_AUDIT_2026_10_30.md`).
 pub mod nr {
-    /// `read(2)`.
-    pub const READ: u64 = 0;
-    /// `write(2)`.
-    pub const WRITE: u64 = 1;
-    /// `writev(2)` — musl's stdio flushes through this, even for a single
-    /// buffer (the empty `wbase` head is one zero-length iovec).
-    pub const WRITEV: u64 = 20;
-    /// `readv(2)` — musl's stdio reads every stream through this (one user
-    /// buffer plus the stream's pending window as the second iovec).
-    pub const READV: u64 = 19;
-    /// `access(2)` — apk probes paths it may skip (the syslog socket, key
-    /// directories) with this before opening them.
-    pub const ACCESS: u64 = 21;
-    /// `mmap(2)`.
-    pub const MMAP: u64 = 9;
-    /// `mprotect(2)`.
-    pub const MPROTECT: u64 = 10;
-    /// `munmap(2)`.
-    pub const MUNMAP: u64 = 11;
-    /// `brk(2)`.
-    pub const BRK: u64 = 12;
-    /// `ioctl(2)`.
-    pub const IOCTL: u64 = 16;
-    /// `pread64(2)` — musl's ldso reads a library's ELF headers with it
-    /// (`map_library`) before mapping; an explicit offset, the fd position
-    /// untouched.
-    pub const PREAD64: u64 = 17;
-    /// `stat(2)` — x86_64 keeps the legacy number, and musl's `stat()` maps
-    /// to it (not `newfstatat`); busybox `ls` stats its argument to learn
-    /// whether it is a directory.
-    pub const STAT: u64 = 4;
-    /// `close(2)` — the fd-table counterpart to `openat`'s allocation.
-    pub const CLOSE: u64 = 3;
-    /// `rt_sigaction(2)` — accepted and recorded-not: this kernel has no
-    /// signal delivery, so a registration has nothing to attach to. Returning
-    /// success for a no-op is what lets musl's startup proceed.
-    pub const RT_SIGACTION: u64 = 13;
-    /// `rt_sigprocmask(2)` — same no-op contract as `RT_SIGACTION`.
-    pub const RT_SIGPROCMASK: u64 = 14;
-    /// `getpid(2)` — x86_64 38. (Was 39: an off-by-one that both starved the
-    /// real getpid of an arm — the guest logged `unhandled ? (38)` — and made
-    /// nr 39, `sendfile` on x86_64, answer the pid.)
-    pub const GETPID: u64 = 38;
-    /// `sendfile(2)` — x86_64 39; named so the unhandled arm prints it. There
-    /// is no arm: no page-cache read/write path to serve it through.
-    pub const SENDFILE: u64 = 39;
-    /// `getuid(2)`.
-    pub const GETUID: u64 = 102;
-    /// `getgid(2)`.
-    pub const GETGID: u64 = 104;
-    /// `geteuid(2)`.
-    pub const GETEUID: u64 = 107;
-    /// `getegid(2)`.
-    pub const GETEGID: u64 = 108;
-    /// `exit(2)` — ends the calling thread; the only thread.
-    pub const EXIT: u64 = 60;
-    /// `arch_prctl(2)` — x86_64-specific: the FS/GS bases.
+    /// `arch_prctl(2)`: x86-only (musl's `__init_tp` sets the TLS base with it).
     pub const ARCH_PRCTL: u64 = 158;
-    /// `set_tid_address(2)`.
-    pub const SET_TID_ADDRESS: u64 = 218;
-    /// `clock_gettime(2)` — zeroed: this kernel has no clock (the host
-    /// tracks no wall time either), and the applets that call it only want
-    /// *a* time, not a true one.
-    pub const CLOCK_GETTIME: u64 = 228;
-    /// `gettimeofday(2)` — same contract as `CLOCK_GETTIME`.
-    pub const GETTIMEOFDAY: u64 = 96;
-    /// `getdents64(2)` — the directory read `ls` walks a directory with.
-    pub const GETDENTS64: u64 = 217;
-    /// `openat(2)` — the one path in; `dirfd` must be `AT_FDCWD` (absolute
-    /// paths only: this kernel has no working directory).
-    pub const OPENAT: u64 = 257;
-    /// `open(2)` — x86_64 keeps the legacy number, and musl's `open()` maps
-    /// to it; same contract as `OPENAT` minus the dirfd.
-    pub const OPEN: u64 = 2;
-    /// `lstat(2)` — legacy number; musl's `lstat()` maps to it. Does not
-    /// follow a final symlink.
-    pub const LSTAT: u64 = 6;
-    /// `fcntl(2)` — only the fd-flag commands busybox issues are served.
-    pub const FCNTL: u64 = 72;
-    /// `exit_group(2)` — musl's `exit(3)` calls this.
-    pub const EXIT_GROUP: u64 = 231;
-
-    // -- Stage 6, phase A: what apk.static needs to start (all x86_64
-    // -- numbers; the aarch64 crate keeps the generic numbering).
-
-    /// `fstat(2)` — x86_64's legacy number (aarch64 uses 80).
-    pub const FSTAT: u64 = 5;
-    /// `lseek(2)` — x86_64's legacy number (aarch64: 62).
-    pub const LSEEK: u64 = 8;
-    /// `uname(2)` (aarch64: 160).
-    pub const UNAME: u64 = 63;
-    /// `getcwd(2)` (aarch64: 17).
-    pub const GETCWD: u64 = 79;
-    /// `dup(2)` (aarch64: 23).
-    pub const DUP: u64 = 32;
-    /// `flock(2)` — stub: success, nothing locks (one task).
-    pub const FLOCK: u64 = 73;
-    /// `umask(2)` — stub: reports the conventional `0o022`.
-    pub const UMASK: u64 = 95;
-    /// `mremap(2)` — musl `realloc` on mmapped chunks.
-    pub const MREMAP: u64 = 25;
-    /// `statfs(2)` (aarch64: 43).
-    pub const STATFS: u64 = 137;
-    /// `fstatfs(2)` (aarch64: 44) — apk treats ENOSYS here as "forbidden".
-    pub const FSTATFS: u64 = 138;
-    /// `fchmod(2)` — stub: root's mode is the mode.
-    pub const FCHMOD: u64 = 91;
-
-    // -- Stage 6, phase C: unpack + commit (the *at family, x86_64).
-
-    /// `mkdirat(2)` (aarch64: 34).
-    pub const MKDIRAT: u64 = 258;
-    /// `newfstatat(2)` — musl's stat()/fstatat() on x86_64 (aarch64: 79).
-    pub const NEWFSTATAT: u64 = 262;
-    /// `unlinkat(2)` (aarch64: 35).
-    pub const UNLINKAT: u64 = 263;
-    /// `renameat(2)` (aarch64: 38).
-    pub const RENAMEAT: u64 = 264;
-    /// `linkat(2)` — apk 3 prefers it for hard-linked package files.
-    pub const LINKAT: u64 = 265;
-    /// `symlinkat(2)` (aarch64: 36).
-    pub const SYMLINKAT: u64 = 266;
-    /// `readlinkat(2)` (aarch64: 78).
-    pub const READLINKAT: u64 = 267;
-    /// `fchmodat(2)` — stub like `FCHMOD`.
-    pub const FCHMODAT: u64 = 268;
-    /// `fchownat(2)` — stub: everything is root already.
-    pub const FCHOWNAT: u64 = 260;
-    /// `faccessat(2)` (aarch64: 48).
-    pub const FACCESSAT: u64 = 269;
-
-    // -- Stage 6 checklist: numbers the unhandled arm may still print, named
-    // -- so a boot log reads as a plan. Most have no arm yet.
-
-    /// `poll(2)` (ppoll is 271).
-    pub const POLL: u64 = 7;
-    /// `dup2(2)` (dup3 is 292).
-    pub const DUP2: u64 = 33;
-    /// `dup3(2)`.
-    pub const DUP3: u64 = 292;
-    /// `eventfd2(2)` — libcurl's multi-stack wakeup fd (stage 8 session Q).
-    /// The state machine lives in `akuma-syscalls-eventfd`.
-    pub const EVENTFD2: u64 = 290;
-    /// `nanosleep` shares 35; `select(2)`.
-    pub const SELECT_PSELECT6: u64 = 23;
-    /// `sched_yield(2)`.
-    pub const SCHED_YIELD: u64 = 24;
-    /// `sendmsg(2)`.
-    pub const SENDMSG: u64 = 46;
-    /// `recvmsg(2)`.
-    pub const RECVMSG: u64 = 47;
-    /// `clone(2)` — phase D contingency (install scripts).
-    pub const CLONE: u64 = 56;
-    /// `execve(2)` — phase D contingency.
-    pub const EXECVE: u64 = 59;
-    /// `wait4(2)` — phase D contingency.
-    pub const WAIT4: u64 = 61;
-    /// `chdir(2)` (fchdir is 81).
-    pub const CHDIR: u64 = 80;
-    /// `fchdir(2)`.
-    pub const FCHDIR: u64 = 81;
-    /// `getrusage(2)`.
-    pub const GETRUSAGE: u64 = 98;
-    /// `sysinfo(2)`.
-    pub const SYSINFO: u64 = 99;
-    /// `sigaltstack(2)`.
-    pub const SIGALTSTACK: u64 = 131;
-    /// `pipe2(2)` — phase D contingency.
-    pub const PIPE2: u64 = 293;
-    /// `futex(2)`.
-    pub const FUTEX: u64 = 202;
-    /// `getsockname(2)`.
-    pub const GETSOCKNAME: u64 = 51;
-    /// `getpeername(2)`.
-    pub const GETPEERNAME: u64 = 52;
-    /// `setsockopt(2)`.
-    pub const SETSOCKOPT: u64 = 54;
-    /// `getsockopt(2)`.
-    pub const GETSOCKOPT: u64 = 55;
-    /// `set_robust_list(2)` — tolerated ENOSYS by sshd already.
-    pub const SET_ROBUST_LIST: u64 = 273;
-    /// `prlimit64(2)`.
-    pub const PR_LIMIT64: u64 = 302;
-    /// `kill(2)`.
-    pub const KILL: u64 = 62;
-    /// `utimensat(2)` — 280 here, not the asm-generic 88 the aarch64 side
-    /// uses; the guest's utimensat arrived as 280 and died unhandled as
-    /// apk's "failed to preserve mtime" install error.
-    pub const UTIMENSAT: u64 = 280;
-
-    // -- Stage 4: the socket family, the clock arms sshd's loop sleeps in,
-    // -- and Akuma's private syscalls (0x1000 base on x86_64 — 300 is
-    // -- `getcpu` here, so the AArch64 offsets cannot be reused; see
-    // -- `libakuma`'s numbering note).
-
-    /// `nanosleep(2)`.
-    pub const NANOSLEEP: u64 = 35;
-    /// `clock_nanosleep(2)`.
-    pub const CLOCK_NANOSLEEP: u64 = 230;
-    /// `socket(2)`.
-    pub const SOCKET: u64 = 41;
-    /// `connect(2)`.
-    pub const CONNECT: u64 = 42;
-    /// `accept(2)`.
-    pub const ACCEPT: u64 = 43;
-    /// `sendto(2)`.
-    pub const SENDTO: u64 = 44;
-    /// `recvfrom(2)`.
-    pub const RECVFROM: u64 = 45;
-    /// `shutdown(2)`.
-    pub const SHUTDOWN: u64 = 48;
-    /// `bind(2)`.
-    pub const BIND: u64 = 49;
-    /// `listen(2)`.
-    pub const LISTEN: u64 = 50;
-    /// `getppid(2)`.
-    pub const GETPPID: u64 = 110;
-    /// `gettid(2)`.
-    pub const GETTID: u64 = 186;
-    /// `getrandom(2)`.
-    pub const GETRANDOM: u64 = 318;
+    /// `fork(2)` and `vfork(2)`: x86-only. musl issues `vfork` as the raw
+    /// number with no flags word.
+    pub const FORK: u64 = 57;
+    pub const VFORK: u64 = 58;
     /// Akuma's private syscall base on x86_64.
     pub const AKUMA_PRIVATE_BASE: u64 = 0x1000;
-    // SPAWN (+301), WAITPID (+303) and CLOSE_CHILD_STDIN (+326) were here until
-    // 2026-11-01. Taoxichuan, this crate's one consumer, stopped serving them in
-    // its cleanup step 2e (`f821ddda`): sshd and everything on its image are
-    // `libakuma/linux-abi` builds that fork and exec.
-    /// Akuma UPTIME: boot-relative time (libakuma's sshd/sh ask for it; the
-    /// aarch64 offsets cannot be reused below 0x1000+301 on x86_64).
+    /// Akuma UPTIME: boot-relative time in microseconds (libakuma asks for it;
+    /// the aarch64 offsets cannot be reused below 0x1000 on x86_64).
     pub const UPTIME: u64 = AKUMA_PRIVATE_BASE + 319;
 }
 

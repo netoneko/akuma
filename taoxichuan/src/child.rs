@@ -934,7 +934,7 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
     // A vfork-style clone (CLONE_VM, musl posix_spawn) hands the child its own
     // stack in rsi and its __clone stub pops fn/arg from it, so the child must
     // resume there; a plain fork keeps the parent's rsp (0).
-    let child_stack = if fr.rax == ring3::nr::CLONE && fr.arg1() & 0x100 != 0 {
+    let child_stack = if fr.rax == akuma_syscalls_abi::x86_64::CLONE && fr.arg1() & 0x100 != 0 {
         fr.arg2()
     } else {
         0
@@ -993,7 +993,7 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
 /// `fork_process` (`fork_arm_real`).
 pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     const CLONE_THREAD: u64 = 0x0001_0000;
-    if fr.rax == ring3::nr::CLONE && fr.arg1() & CLONE_THREAD != 0 {
+    if fr.rax == akuma_syscalls_abi::x86_64::CLONE && fr.arg1() & CLONE_THREAD != 0 {
         return clone_thread_arm(fr);
     }
     // fork (57), vfork (58) and every non-thread `clone` - libakuma's `fork()` under `linux-abi` issues

@@ -1346,7 +1346,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             319 => crate::net::uptime_us(),
             326 => sys_close_child_stdin(a1),
             // `kill(pid, sig)` — Akuma-private 302, what libakuma's
-            // `kill_signal` issues. Glue's `nr::KILL` arm is the same
+            // `kill_signal` issues. Glue's `nr::AKUMA_KILL` arm is the same
             // `proc::sys_kill` that Linux `kill` (62, `Syscall::Kill` below)
             // reaches, so the two spellings deliver identically.
             //
@@ -1357,7 +1357,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             // (`docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6 item 7).
             // sshd's session-teardown SIGHUP/SIGTERM is now real too, which is
             // the Linux behaviour.
-            302 => to_glue_raw(akuma_syscalls_linux::nr::KILL, [a1, a2, 0, 0, 0, 0]),
+            302 => to_glue_raw(akuma_syscalls_linux::nr::AKUMA_KILL, [a1, a2, 0, 0, 0, 0]),
             // `console_notify(ptr, len)` — Akuma-private 322, feature
             // `console-notify` (default-on for this target). Prints a
             // caller-supplied line straight to the framebuffer/serial console,
@@ -1633,10 +1633,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
     // is asm-generic. Handing it `1` meaning `write` would find the *wrong*
     // handler rather than none — so the vocabulary hop happens once, here,
     // through a table whose two halves are round-trip tested against each other.
-    // x86_64 nr 26 is `msync` — routed **before** the shared table because
-    // asm-generic has no msync number at all, and a fake aarch64 twin in the
-    // abi table would break its "a variant only exists if it has a number on
-    // both architectures" invariant to carry a lie. See `mm::sys_msync` for
+    // x86_64 nr 26 is `msync` — routed **before** the shared table to this
+    // kernel's own `mm::sys_msync` rather than glue's. (asm-generic does have
+    // msync, 227: `Syscall::Msync` is a row since 2026-11-01, and a comment
+    // here said otherwise until then.) See `mm::sys_msync` for
     // what it does and `MmapRegion::shared_write` for why it exists at all:
     // it is the flush `memmap2::MmapMut::flush` compiles to, and without it a
     // writable `MAP_SHARED` mapping could not be trusted at close.
@@ -2512,6 +2512,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // row added to `akuma-syscalls-abi` without its arm here used to fall
         // in silently (`brk` did, and earlier `fchdir`), where an undecoded
         // number at least prints `no row for`.
+        // A row since 2026-11-01 (Taoxichuan serves it); this kernel has no
+        // route to glue's yet and answers `ENOSYS`, as it did undecoded.
+        // `Msync` never gets here: 26 is routed above, before the decode.
+        Syscall::RtSigsuspend | Syscall::Msync => errno::ENOSYS,
         _ => {
             akuma_primitives::safe_print!(
                 160,

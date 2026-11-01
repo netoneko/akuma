@@ -824,7 +824,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::READLINKAT => flat(fs::sys_readlinkat(args[0] as i32, args[1], args[2], args[3] as usize)),
         #[cfg(feature = "exec")]
         nr::SPAWN => flat(proc::sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5])),
-        nr::KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
+        nr::AKUMA_KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
         #[cfg(feature = "sc-reboot")]
         nr::REBOOT => reboot::sys_reboot(args[0] as u32, args[1] as u32, args[2] as u32),
         nr::WAITPID => proc::sys_waitpid(args[0] as u32, args[1]),
@@ -884,7 +884,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRESUID => cred::sys_getres(args[0], args[1], args[2], false),
         nr::GETRESGID => cred::sys_getres(args[0], args[1], args[2], true),
         nr::GETGROUPS => cred::sys_getgroups(args[0] as i32, args[1]),
-        nr::KILL_LINUX => proc::sys_kill(args[0] as u32, args[1] as u32),
+        nr::KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
         nr::SETPGID => proc::sys_setpgid(args[0] as u32, args[1] as u32),
         nr::GETPGID => proc::sys_getpgid(args[0] as u32),
         nr::SETSID => proc::sys_setsid(),

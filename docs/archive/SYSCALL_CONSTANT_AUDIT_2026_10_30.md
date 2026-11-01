@@ -1,6 +1,7 @@
 # Syscall-number constant audit — 2026-10-30
 
-**Status: report only. Nothing here is fixed yet (the user's call: fix later).**
+**Status: fixed 2026-11-01** (findings 1-4 and the Taoxichuan half of 5; see "Fixed" at the end). The
+report below is as written on 10-30.
 Tree: `rust-org-il-experiment` @ `6af48c06`. Tool: `scripts/audit_syscall_constants.py`.
 
 ## Why
@@ -111,6 +112,34 @@ round-trip tests, which is the gap finding 1 fell through.
 Re-run the script; findings 1-4 should be gone, and class A should report 0 apart from the
 intentional private `KILL` (or none, if it is renamed). Inputs: see the script's docstring
 (the Linux tables were taken from the 6.18 tree on the ryzen, `/root/linux-audit/linux-6.18`).
+
+## Fixed (2026-11-01)
+
+Re-run after the fix: class A (wrong number) **0**, class B (private or misleading name on a real number)
+**0**. The 12 class D/E hits left are the false positives listed above (private-offset arms, the
+`sendmsg`/`recvmsg` pair, the cross-arch warnings in the abi table, `exit(241)`, the `nr == 1` trace check).
+
+- **Findings 1, 2 and 4: the third x86_64 table is gone.** `akuma-ring3-amd64::nr` (93 constants, Taoxichuan's
+  dispatch) is down to the four numbers `akuma-syscalls-abi` cannot hold: `ARCH_PRCTL` 158 and `FORK`/`VFORK`
+  57/58 (x86-only), plus Akuma's private `UPTIME`. Every other arm in Taoxichuan names
+  `akuma_syscalls_abi::x86_64::*`. `GETPID = 38`, `SENDFILE = 39`, `SELECT_PSELECT6` and `PR_LIMIT64` went with
+  the table. Taoxichuan no longer had a `GETPID` arm by then (glue serves `getpid`), so `setitimer` (38) already
+  answered `ENOSYS`; the wrong constant was a trap waiting for its next user.
+- **Finding 3: `KILL` means Linux `kill` everywhere.** `akuma-syscalls-linux::nr::KILL` was Akuma's private 302
+  and `KILL_LINUX` was 129; they are now `AKUMA_KILL` (302) and `KILL` (129), and libakuma's two tables say
+  `AKUMA_KILL`. The swap was checked by listing every use first: a missed `nr::KILL` would have silently become
+  129, and `akuma_private_syscalls_stay_in_their_block` would have failed on it.
+- **Finding 5, Taoxichuan:** its literal arms (`26` msync, `15` rt_sigreturn, a local `RT_SIGSUSPEND = 130`,
+  `57 | 58`) are named constants. `msync` and `rt_sigsuspend` gained abi rows (26/227, 130/133). amd64 keeps its
+  31 literal x86-only arms (all correct); its comment claiming asm-generic has no `msync` was wrong and is
+  corrected. amd64 answers `rt_sigsuspend` `ENOSYS`, as before, now through an explicit arm.
+
+Verified: the AArch64 kernel built after the change is **byte-identical** to the one before (`md5` of the whole
+ELF), so the renames moved no number it dispatches. Taoxichuan battery 9/9 on TCG, tokioprobe PASS, busybox
+`wait` (rt_sigsuspend) returns. amd64 boot self-tests on TCG: all 819 pass, the `kill:` group and the
+`dispatch:` hop checks among them. Host tests of `akuma-syscalls-abi`, `-linux`, `-glue-amd64`, `akuma-ring3-amd64`.
+Builds: Taoxichuan, amd64 with and without `no-tests`, AArch64 default and `extreme-size`, sshd (three
+variants), herd, box, paws.
 
 ## Background
 

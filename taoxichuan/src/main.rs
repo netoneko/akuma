@@ -1342,7 +1342,6 @@ fn munmap_arm(addr: u64, len: u64) -> u64 {
     0
 }
 
-const RT_SIGSUSPEND: u64 = 130;
 
 /// `tkill(tid, sig)` / `tgkill(tgid, tid, sig)`. No signal is delivered on this
 /// kernel, so a signal's only effect is the one thing a thread can observe
@@ -1919,7 +1918,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         }
     }
     match fr.rax {
-        ring3::nr::EXIT | ring3::nr::EXIT_GROUP => {
+        akuma_syscalls_abi::x86_64::EXIT | akuma_syscalls_abi::x86_64::EXIT_GROUP => {
             let code = fr.arg1() & 0xFF; // what wait(2) would see
             with_task(|t| t.exit = Some(code));
             // Slice 3 FIRST: a REAL fork child's exit is a task exit — status
@@ -1935,7 +1934,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if child::is_real_task() {
                 // `exit` (60) from a thread ends that thread only; everything
                 // else (exit_group, a lone process's exit) ends the group.
-                if fr.rax == ring3::nr::EXIT && child::is_thread_task() {
+                if fr.rax == akuma_syscalls_abi::x86_64::EXIT && child::is_thread_task() {
                     child::task_exit_thread()
                 }
                 child::task_exit_real(code)
@@ -1947,7 +1946,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // from the stack top on the next task's first syscall).
             task_done(code)
         }
-        ring3::nr::BRK => {
+        akuma_syscalls_abi::x86_64::BRK => {
             let want = fr.arg1();
             let (brk_base, brk_end, brk_cur, root) = with_task(|t| (t.brk_base, t.brk_end, t.brk_cur, t.root_pa));
             if want < brk_base || want >= brk_end {
@@ -2013,7 +2012,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         akuma_syscalls_abi::x86_64::FUTEX => {
             futex::sys_futex(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6())
         }
-        ring3::nr::MMAP => {
+        akuma_syscalls_abi::x86_64::MMAP => {
             let (addr, len, prot, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
             let fd = fr.arg5();
             let off = fr.arg6();
@@ -2137,9 +2136,9 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             base
         }
-        ring3::nr::MPROTECT => mprotect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
-        ring3::nr::MUNMAP => munmap_arm(fr.arg1(), fr.arg2()),
-        26 => msync_arm(fr.arg1(), fr.arg2()),
+        akuma_syscalls_abi::x86_64::MPROTECT => mprotect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
+        akuma_syscalls_abi::x86_64::MUNMAP => munmap_arm(fr.arg1(), fr.arg2()),
+        akuma_syscalls_abi::x86_64::MSYNC => msync_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::SCHED_YIELD => {
             if crate::exec_twin::current_slot() < child::NSLOTS && akuma_threading::x86_runnable_exists() {
                 let stash = ring3::user_rsp_stash();
@@ -2150,12 +2149,12 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         // x86_64 130. No signal is delivered here, so "a signal arrived" has two observable
         // causes: a `tkill` (the thread's interrupt bit) and a child's death (SIGCHLD).
-        RT_SIGSUSPEND => {
+        akuma_syscalls_abi::x86_64::RT_SIGSUSPEND => {
             let (a1, a2) = (fr.arg1(), fr.arg2());
             child::sigsuspend_arm(fr, a1, a2)
         }
-        15 => child::sigreturn_arm(fr),
-        ring3::nr::MREMAP => {
+        akuma_syscalls_abi::x86_64::RT_SIGRETURN => child::sigreturn_arm(fr),
+        akuma_syscalls_abi::x86_64::MREMAP => {
             // musl's realloc on an mmapped chunk. Shrink frees the tail; grow
             // extends in place when the range ends at the slab cursor, else
             // moves (MAYMOVE, which the caller accepts by using the returned
@@ -2236,9 +2235,9 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         // CLONE/FORK/VFORK + WAIT4 (stage 8, process-model M2): the blocking
         // fork and the real reap — the arms busybox ash needs to run any
         // non-final command of a list. child.rs's M2 scaffold.
-        ring3::nr::CLONE | 57 | 58 => child::fork_arm(fr),
-        ring3::nr::WAIT4 => child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
-        ring3::nr::EXECVE => {
+        akuma_syscalls_abi::x86_64::CLONE | ring3::nr::FORK | ring3::nr::VFORK => child::fork_arm(fr),
+        akuma_syscalls_abi::x86_64::WAIT4 => child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
+        akuma_syscalls_abi::x86_64::EXECVE => {
             // A fork child (its own threading slot, published by
             // `fork_process`) execs the way Linux does — its image is
             // replaced, its fds survive, its thread keeps running. The boot
