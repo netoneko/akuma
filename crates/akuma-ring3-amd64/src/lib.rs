@@ -881,7 +881,9 @@ pub unsafe extern "C" fn enter_user(f: &EntryFrame) -> ! {
 // ---------------------------------------------------------------------------
 
 /// The x86_64 syscall numbers `akuma-syscalls-abi` cannot hold: x86-only
-/// calls with no asm-generic twin, and Akuma's private block. Every other
+/// calls with no asm-generic twin. (Akuma's private block went 2026-11-02:
+/// Taoxichuan serves no private call; libakuma's `linux-abi` build reads its
+/// uptime from `CLOCK_MONOTONIC`.) Every other
 /// number is `akuma_syscalls_abi::x86_64::*`, one row per call with both
 /// architectures' numbers and round-trip tests.
 ///
@@ -896,11 +898,6 @@ pub mod nr {
     /// number with no flags word.
     pub const FORK: u64 = 57;
     pub const VFORK: u64 = 58;
-    /// Akuma's private syscall base on x86_64.
-    pub const AKUMA_PRIVATE_BASE: u64 = 0x1000;
-    /// Akuma UPTIME: boot-relative time in microseconds (libakuma asks for it;
-    /// the aarch64 offsets cannot be reused below 0x1000 on x86_64).
-    pub const UPTIME: u64 = AKUMA_PRIVATE_BASE + 319;
 }
 
 /// `openat(2)` flag bits (x86_64) and `dirfd` special values.

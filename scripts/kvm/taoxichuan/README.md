@@ -19,3 +19,7 @@ root through `scripts/utils/hpbox.py`; the guest is `scripts/kvm/taoxichuan_pop.
 Traps (each cost time): the guest's `sh -c "...$?..."` is expanded by the OUTER shell - use plain commands; ssh stdin into the guest is lossy - send
 scripts on the command line; musl probes must be built in an Alpine container (`docker run alpine:3.20`), a glibc-static binary segfaults for no kernel reason;
 use `wget`, not `curl`, in the guest; never `git stash` with pathspecs here (it can silently stash nothing and `pop` an older entry).
+An image's `/bin/sshd` must be the `linux-abi` build from `bc598644` or later: Taoxichuan serves no private syscall since
+then, and an older sshd's `uptime()` (Akuma's private UPTIME) gets `ENOSYS`, which breaks its timeouts. Build it with
+`cd userspace && cargo build -p sshd --release --target x86_64-unknown-none --features libakuma/linux-abi`, then
+`debugfs -w` it in (`rm /bin/sshd`, `write`, `set_inode_field /bin/sshd mode 0100755`, uid/gid 0) while the guest is down.

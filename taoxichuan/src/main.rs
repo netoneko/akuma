@@ -2177,9 +2177,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             base
         }
-        // Akuma private: libakuma's sshd/sh ask for uptime; the clock arm's
-        // elapsed-time source, in microseconds.
-        ring3::nr::UPTIME => net::uptime_us(),
         // CLONE/FORK/VFORK + WAIT4 (stage 8, process-model M2): the blocking
         // fork and the real reap — the arms busybox ash needs to run any
         // non-final command of a list. child.rs's M2 scaffold.
