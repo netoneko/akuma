@@ -2373,23 +2373,19 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3: the program list, and the sequential kernel-reaped tasks.
+// Init: the one boot program.
 // ---------------------------------------------------------------------------
 
-/// Programs the boot will run, one after another, each to `exit`. The gate
-/// needs two (busybox echo, busybox ls); the list is the general shape and
-/// the command line fills it (`init=`/`initargs=`, then `then=`/`thenargs=`
-/// per follow-up). Fixed slots, no heap: the dispatcher's reaper reads these
-/// after the task that booted them is gone.
-const MAX_PROGRAMS: usize = 4;
-/// argv entries per program beyond `argv[0]`, and their byte budget each.
-/// The command line is 512 bytes total; 8×95 cannot overflow it.
+/// argv entries beyond `argv[0]`, and each one's byte budget. The command
+/// line is 512 bytes total.
 const MAX_ARGV: usize = 16;
 const ARG_LEN: usize = 96;
-/// Environment entries per program (`initenv=`/`thenenv=`, comma-separated,
-/// `KEY=value` with no comma or space in the value).
+/// Environment entries (`initenv=`, comma-separated `KEY=value`, no comma or
+/// space in a value).
 const MAX_ENV: usize = 8;
 
+/// The init program from the command line (`init=`, `initargs=`, `initenv=`).
+/// Fixed slots, no heap: parsed before ring 3 exists, read again when init exits.
 #[derive(Clone, Copy)]
 struct Prog {
     path: [u8; ARG_LEN],
@@ -2401,13 +2397,7 @@ struct Prog {
 
 impl Prog {
     const fn new() -> Self {
-        Self {
-            path: [0; ARG_LEN],
-            args: [[0; ARG_LEN]; MAX_ARGV],
-            n_args: 0,
-            env: [[0; ARG_LEN]; MAX_ENV],
-            n_env: 0,
-        }
+        Self { path: [0; ARG_LEN], args: [[0; ARG_LEN]; MAX_ARGV], n_args: 0, env: [[0; ARG_LEN]; MAX_ENV], n_env: 0 }
     }
 
     /// One environment entry.
@@ -2432,80 +2422,32 @@ fn str_until_nul(buf: &[u8]) -> &str {
     core::str::from_utf8(&buf[..end]).unwrap_or("")
 }
 
-/// The boot program list, how many entries it holds, which one runs now, and
-/// each one's exit code. Written by `parse_programs` before ring 3 exists, then
-/// by the reaper; read in whole copies so no borrow outlives a call.
-struct Programs {
-    list: [Prog; MAX_PROGRAMS],
-    count: usize,
-    current: usize,
-    exit_codes: [u64; MAX_PROGRAMS],
-}
+static INIT: akuma_primitives::cell::BorrowCell<Prog> = akuma_primitives::cell::BorrowCell::new(Prog::new());
 
-static PROGRAMS: akuma_primitives::cell::BorrowCell<Programs> =
-    akuma_primitives::cell::BorrowCell::new(Programs {
-        list: [Prog::new(); MAX_PROGRAMS],
-        count: 0,
-        current: 0,
-        exit_codes: [0; MAX_PROGRAMS],
-    });
-
-/// Fill the program list from the boot command line: `init=`/`initargs=`
-/// name the first program (the stage-1/2 token pair, unchanged), each
-/// `then=`/`thenargs=` pair appends one. `initargs`/`thenargs` are
-/// comma-separated (the stage-1 busybox line's convention,
-/// `initargs=sh,/etc/guest.sh`).
-fn parse_programs(cmdline: &str) {
-    let mut idx = 0usize;
-    for token in cmdline.split_ascii_whitespace() {
-        let mut set_env = None;
-        let (set_path, set_args) = if let Some(v) = token.strip_prefix("init=") {
-            (Some(v), None)
-        } else if let Some(v) = token.strip_prefix("initargs=") {
-            (None, Some(v))
-        } else if let Some(v) = token.strip_prefix("initenv=") {
-            set_env = Some(v);
-            (None, None)
-        } else if let Some(v) = token.strip_prefix("then=") {
-            idx += 1;
-            (Some(v), None)
-        } else if let Some(v) = token.strip_prefix("thenargs=") {
-            (None, Some(v))
-        } else if let Some(v) = token.strip_prefix("thenenv=") {
-            set_env = Some(v);
-            (None, None)
-        } else {
-            (None, None)
-        };
-        if idx >= MAX_PROGRAMS {
-            break;
-        }
-        PROGRAMS.with_mut(|t| {
-        let p = &mut t.list[idx];
-        if let Some(v) = set_path {
-            store_slot(&mut p.path, v);
-        }
-        if let Some(v) = set_args {
-            for a in v.split(',').take(MAX_ARGV) {
-                if p.n_args < MAX_ARGV {
-                    store_slot(&mut p.args[p.n_args], a);
-                    p.n_args += 1;
+/// Fill [`INIT`] from the boot command line. `initargs`/`initenv` are
+/// comma-separated (`initargs=sh,/etc/guest.sh`). A sequence of programs is a
+/// shell script run as init: init is a real process, it can fork.
+fn parse_init(cmdline: &str) {
+    INIT.with_mut(|p| {
+        for token in cmdline.split_ascii_whitespace() {
+            if let Some(v) = token.strip_prefix("init=") {
+                store_slot(&mut p.path, v);
+            } else if let Some(v) = token.strip_prefix("initargs=") {
+                for a in v.split(',') {
+                    if p.n_args < MAX_ARGV {
+                        store_slot(&mut p.args[p.n_args], a);
+                        p.n_args += 1;
+                    }
+                }
+            } else if let Some(v) = token.strip_prefix("initenv=") {
+                for a in v.split(',') {
+                    if p.n_env < MAX_ENV {
+                        store_slot(&mut p.env[p.n_env], a);
+                        p.n_env += 1;
+                    }
                 }
             }
         }
-        if let Some(v) = set_env {
-            for a in v.split(',').take(MAX_ENV) {
-                if p.n_env < MAX_ENV {
-                    store_slot(&mut p.env[p.n_env], a);
-                    p.n_env += 1;
-                }
-            }
-        }
-        });
-    }
-    PROGRAMS.with_mut(|t| {
-        t.count = idx + 1;
-        t.current = 0;
     });
 }
 
@@ -2516,93 +2458,29 @@ fn store_slot(dst: &mut [u8], s: &str) {
     dst[n] = 0;
 }
 
-/// Spawn program `i` from the list, printing the spawn-evidence lines the
-/// stage-1 gate was pinned on (they are per-program now: two tasks, two spawn
-/// lines). Never returns.
-fn run_program(i: usize) -> ! {
-    // `current` is read by the dispatcher's reaper, and this write precedes the
-    // first crossing of the program it names. The entry is copied out so no
-    // borrow of the table outlives the call.
-    let prog = PROGRAMS.with_mut(|t| {
-        t.current = i;
-        t.list[i]
-    });
-    let (path, n_args) = (prog.path_str(), prog.n_args);
+/// Load init and start it on its pool thread. Never returns.
+fn run_init() -> ! {
+    let prog = INIT.with(|p| *p);
+    let path = prog.path_str();
     console::puts("Taoxichuan: init spawn -- init=");
     console::puts(path);
-    if n_args > 0 {
-        console::puts(" argv=[");
-        let mut args = [""; MAX_ARGV];
-        for (k, slot) in args.iter_mut().enumerate() {
-            if k < n_args {
-                *slot = prog.arg_str(k);
-            }
-        }
-        for (k, a) in args.iter().enumerate() {
-            if k >= n_args {
-                break;
-            }
-            if k > 0 {
-                console::puts(",");
-            }
-            console::puts(a);
-        }
-        console::puts("]");
-    }
     console::puts("\n");
-
-    let fs = root_fs();
-    if !fs.exists(path) {
+    let Ok(image) = root_fs().read_file(path) else {
         console::puts("  init: NOT on the mounted root\n");
         halt();
-    }
-    let image = fs.read_file(path).unwrap_or_default();
-    let elf = image.len() >= 4 && image[..4] == [0x7f, b'E', b'L', b'F'];
-    console::puts("  init: ");
-    console::put_dec(image.len() as u64);
-    console::puts(" bytes on the ext2 root, ELF magic ");
-    console::puts(if elf { "ok" } else { "MISSING" });
-    console::puts("\n");
-    console::puts("Taoxichuan: stage 1 gate reached -- init spawn (userspace is stage 2)\n");
-
+    };
     spawn(&prog, &image)
 }
 
-/// The dispatcher's reaper, in place of stage 2's `halt()`: report the exit,
-/// then either spawn the next program or close the boot out. Runs on the
-/// syscall stack inside the dying task's dispatcher frame; the stack the
-/// stub parked is abandoned with the task (the stub restarts at its top on
-/// the next task's first syscall).
+/// Init exited (`child::start_init_thread` reports it from the parked boot
+/// thread): say so and stop.
 pub(crate) fn task_done(code: u64) -> ! {
-    let (i, n, prog) = PROGRAMS.with_mut(|t| {
-        t.exit_codes[t.current] = code;
-        (t.current, t.count, t.list[t.current])
-    });
-    let path = prog.path_str();
-    // The stage-2 gate's own evidence lines, verbatim, on the boot that
-    // re-checks that gate; every other program gets the generic line.
-    if path == "/bin/hello" {
-        console::puts("Taoxichuan: hello exit code ");
-        console::put_dec(code);
-        console::puts("\n");
-        if code == 0 {
-            console::puts("Taoxichuan: stage 2 gate reached -- ring-3 ran, exited clean, output above\n");
-        }
-    } else {
-        console::puts("Taoxichuan: exit code ");
-        console::put_dec(code);
-        console::puts(" from ");
-        console::puts(path);
-        console::puts("\n");
-    }
-    if i + 1 < n {
-        run_program(i + 1);
-    }
-    let all_zero = PROGRAMS.with(|t| t.exit_codes[..n].iter().all(|&c| c == 0));
-    if n >= 2 && all_zero {
-        // The stage-3 gate's own line: two kernel-reaped tasks, both clean.
-        console::puts("Taoxichuan: stage 3 gate reached -- sequential tasks ran clean, outputs above\n");
-    }
+    let prog = INIT.with(|p| *p);
+    console::puts("Taoxichuan: exit code ");
+    console::put_dec(code);
+    console::puts(" from ");
+    console::puts(prog.path_str());
+    console::puts("\n");
     console::puts("Taoxichuan: all programs done\n");
     halt();
 }
@@ -3111,27 +2989,7 @@ fn spawn(p: &Prog, image: &[u8]) -> ! {
     // Init is pid 1 on a real pool thread (a tid >= 1, a ring row, a registered `Process`), the way amd64's `run_init`
     // starts it, not on the boot stack: that is what lets it `fork`/`clone` and be preempted, so `sshd` runs one forked process
     // per session (`docs/reference/switch-to-crates.md` S1). The boot thread parks in `start_init_thread` and reports init's exit.
-    child::start_init_thread(path, &ti);
-    // SAFETY: one documented control-register write; interrupts are masked,
-    // one core, and the root was built entirely before this line.
-    unsafe {
-        core::arch::asm!(
-            "mov cr3, {r}",
-            r = in(reg) ti.root_pa,
-            options(nostack, preserves_flags)
-        );
-    }
-    let ef = ring3::EntryFrame {
-        r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
-        rdx: 0, rsi: 0, rdi: 0, rax: 0,
-        rip: ti.entry,
-        rflags: 0x202, // IF set, reserved bit 1 set
-        rsp: ti.rsp,
-    };
-    // SAFETY: the address space maps the kernel half (shared PML4 entries)
-    // and the task's pages; `ef` names image-placed code on the built stack.
-    let _ = smp::bkl_leave_all();
-    unsafe { ring3::enter_user(&ef) }
+    child::start_init_thread(path, &ti)
 }
 
 // ---------------------------------------------------------------------------
@@ -3309,16 +3167,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         console::puts("Taoxichuan: stage 1 gate NOT reached (no init)\n");
         halt();
     }
-    // Stage 3: the whole program list comes off the command line here
-    // (`init=`/`initargs=` for the first program, `then=`/`thenargs=` for
-    // each follow-up), so the dispatcher's reaper never parses anything
-    // after a task is live.
-    parse_programs(cmdline_str);
-
-    // Stage 2: the spawn is real now. Load, cross, and the task's own exit
-    // (or its fault) is the next line on this console; stage 3 chains the
-    // next program from there.
-    run_program(0);
+    parse_init(cmdline_str);
+    run_init();
 }
 
 /// The multiboot2 entry — called by `boot.s` when GRUB's magic says the info

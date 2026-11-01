@@ -35,8 +35,8 @@ flowchart TD
     L --> M["ext2 mount on device 0 (akuma-ext2, BlockDevice = Vda)<br/>published as ROOT_FS"]
     M --> N["net::net_init — TSC calibration vs PIT, smoltcp up<br/>(akuma-net over akuma-net-nic), DHCP wait ≤10 s"]
     N --> O["banner (src/banner.txt, verbatim)<br/>epoch= cmdline token → UTC offset store (akuma-primitives::clock)"]
-    O --> P["parse_programs: init=/initargs=, then=/thenargs=<br/>(≤4 programs, fixed slots)"]
-    P --> Q["run_program(0): read init off ext2, verify ELF magic"]
+    O --> P["parse_init: init=/initargs=/initenv=<br/>(one program, fixed slots)"]
+    P --> Q["run_init: read init off ext2, start it as pid 1 on a pool thread"]
     Q --> R["spawn → load_task → ring3::enter_user<br/>ring 3, IF set"]
 ```
 
@@ -77,7 +77,6 @@ stage greps it). Tokens this kernel reads:
 | token | consumer |
 |---|---|
 | `init=` / `initargs=` | first program; args are comma-separated |
-| `then=` / `thenargs=` | each follow-up program (up to 4 total) |
 | `epoch=` | wall-clock anchor: unix seconds → `akuma_primitives::clock::set_utc_time_us`, anchored at the uptime sampled at banner time. Written new (guest-cmdline policy): the metal's anchors are RTC/NTP mechanisms this guest cannot reach |
 
 ## Background

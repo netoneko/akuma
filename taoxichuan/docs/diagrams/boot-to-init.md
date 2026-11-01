@@ -18,7 +18,7 @@ flowchart TD
     L --> M["ext2 mount on device 0 (akuma-ext2, BlockDevice = Vda)<br/>published as ROOT_FS"]
     M --> N["net::net_init — TSC calibration vs PIT (no PIT →<br/>lapic tsc_hz), smoltcp up (akuma-net over akuma-net-nic),<br/>DHCP wait ≤10 s"]
     N --> O["banner (src/banner.txt, verbatim)<br/>epoch= cmdline token → UTC offset store (akuma-primitives::clock)"]
-    O --> P["parse_programs: init=/initargs=, then=/thenargs=<br/>(≤4 programs, fixed slots)"]
-    P --> Q["run_program(0): read init off ext2, verify ELF magic"]
+    O --> P["parse_init: init=/initargs=/initenv=<br/>(one program, fixed slots)"]
+    P --> Q["run_init: read init off ext2, start it as pid 1 on a pool thread"]
     Q --> R["spawn → load_task → ring3::enter_user<br/>ring 3, IF set"]
 ```
