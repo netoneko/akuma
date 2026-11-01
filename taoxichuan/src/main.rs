@@ -927,6 +927,29 @@ static ROOT_FS: akuma_primitives::cell::BorrowCell<Option<&'static akuma_ext2::E
 fn root_fs() -> &'static akuma_ext2::Ext2Filesystem<Vda> {
     ROOT_FS.get().expect("root_fs before the mount")
 }
+
+/// Install `akuma-vfs-glue`'s hooks, create its mount table and mount the
+/// ext2 root at `/` — amd64's `fs::init_vfs` + `mount_root_on`, minus what this
+/// kernel does not build (no audio, no file-page cache, no `/proc` yet). Halts
+/// on failure: a root the shared arms cannot resolve answers `ENOENT` for every
+/// path, silently (`AKUMA_AMD64_C1_STEP4A_VFS_ADOPTION.md` § 1).
+fn mount_vfs_glue(fs: alloc::sync::Arc<akuma_ext2::Ext2Filesystem<Vda>>) {
+    akuma_vfs_glue::set_hooks(akuma_vfs_glue::VfsGlueHooks {
+        audio_is_available: || false,
+        fs_exists: akuma_vfs_glue::exists,
+        probed_core_count: smp::online_cpus,
+        utc_time_us: || akuma_primitives::clock::utc_time_us(net::uptime_us()),
+        // No file-page cache on this kernel: mmap populates eagerly.
+        fpcache_init: |_| {},
+        // `/proc` is not mounted here, so nothing asks for map rows.
+        pid_map_rows: |_| None,
+    });
+    akuma_vfs_glue::init();
+    if akuma_vfs_glue::mount_with("/", Some("/dev/vda"), 0, fs).is_err() {
+        console::puts("  [FATAL] could not mount the ext2 root into the shared mount table\n");
+        halt();
+    }
+}
 // ---------------------------------------------------------------------------
 // The banner — printed at the init-spawn point, where the full kernel prints
 // its own: the last thing on the console before the machine would hand over.
@@ -5527,11 +5550,15 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         console::puts("  fs:   /dev/vda holds no readable ext2 image\n");
         halt();
     };
+    // One instance, two names: `akuma-vfs-glue`'s mount table holds it at `/`
+    // (what `akuma-syscalls-glue`'s arms resolve through), and `ROOT_FS` holds
+    // a `'static` borrow of the same `Arc` for the arms still served here. Two
+    // instances would be two block caches and two locks over one disk.
+    let fs = alloc::sync::Arc::new(fs);
+    mount_vfs_glue(fs.clone());
     console::puts("  fs:   ext2 root mounted on /dev/vda\n");
-    // Publish the mount for the dispatcher's fd syscalls (`ROOT_FS` above);
-    // from here on the local binding is dead.
-    // The mount lives for the rest of the boot: leak it to a `'static` borrow.
-    ROOT_FS.set(Some(alloc::boxed::Box::leak(alloc::boxed::Box::new(fs))));
+    // The mount lives for the rest of the boot: leak the `Arc` to a `'static` borrow.
+    ROOT_FS.set(Some(&**alloc::boxed::Box::leak(alloc::boxed::Box::new(fs))));
 
     // Stage 4: the network path — calibrate the TSC against the PIT, pull up
     // smoltcp on virtio-net, wait (bounded, pumping the NIC) for DHCP. A

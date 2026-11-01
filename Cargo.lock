@@ -1338,6 +1338,7 @@ dependencies = [
  "akuma-user-tree",
  "akuma-user-walk",
  "akuma-vfs",
+ "akuma-vfs-glue",
  "akuma-virtio",
  "spinning_top",
 ]

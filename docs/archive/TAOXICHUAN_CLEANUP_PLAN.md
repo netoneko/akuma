@@ -139,7 +139,8 @@ passes `epoch=`. Without it the guest clock reads 1970 and every TLS client refu
 | plan | - | 12,131 | this file |
 | 1a–1c | `c0a921a2` | 12,131 -> 12,137 | the size is the inode's; `tcg_rig.py`; goose + GLM prompt and tool call pass on TCG |
 | plan | `9c44ba87` | - | phase 2 replays amd64's glue adoption instead of per-family crates |
-| 1e | (this commit) | 12,137 -> 12,144 | socket released by its last name only (`dup2`, exec sweeps); `tcg_rig.py battery [goose]`: 10/10 PASS, 0 faults |
+| 1e | `a29b690d` | 12,137 -> 12,144 | socket released by its last name only (`dup2`, exec sweeps); `tcg_rig.py battery [goose]`: 10/10 PASS, 0 faults |
+| 2a | (this commit) | 12,144 -> 12,169 | `akuma-vfs-glue` mount table created, its hooks installed, the ext2 root mounted at `/` as the same `Arc` `root_fs()` borrows. Nothing resolves through it yet. Image +32 KB (1,592,120 -> 1,624,112 bytes); battery 9/9 PASS, 0 faults |
 
 ## Background
 
