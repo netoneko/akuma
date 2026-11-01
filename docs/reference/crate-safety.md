@@ -909,3 +909,23 @@ is mechanical.
 3. `cargo clippy -p <name> --target $HOST -- -D warnings` and
    `cargo test -p <name> --target $HOST`.
 4. Add a row above.
+
+## Budgets: `unsafe`, copies and `mut`
+
+Three per-component counts, each with a gate that fails on growth (a component with no
+entry starts at 0) and a `--update` that writes the increase into a budget file, so the
+increase is reviewed beside the code that needed it. A decrease never fails and `--update`
+ratchets it down. All three are counted by `scripts/cloc_akuma.py`'s lexer, in production
+code only (not comments, strings, `#[cfg(test)]` items or test files).
+
+| measure | gate | budget | counts |
+|---|---|---|---|
+| `unsafe` | `scripts/check_unsafe_budget.py` | `unsafe-budget.json` | `unsafe` keyword sites; also that a `forbid` crate still forbids |
+| copies | `scripts/check_budgets.py copy` | `copy-budget.json` | `.clone()`, `.cloned()`, `.to_vec()`, `.to_owned()`, `.to_string()` calls, and calls to the whole-`FileDescriptor` copiers `get_fd(`/`table_get(` |
+| `mut` | `scripts/check_budgets.py mut` | `mut-budget.json` | `mut` keywords: `let mut`, `&mut`, `mut self`, `static mut` |
+
+The copy measure is wider than `.clone()` on purpose: the costliest copies in the tree were a
+whole `FileDescriptor` copied with `.cloned()` on the syscall path, and a `.clone()`-only count
+would not move when they are fixed. A copy that must stay (an `Arc` handed out of a locked
+static, a snapshot taken under a lock before I/O) is a reason in the budget diff, not a
+violation. Background: [`../archive/CLONE_AND_MUT_BUDGETS.md`](../archive/CLONE_AND_MUT_BUDGETS.md).

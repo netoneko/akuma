@@ -353,6 +353,12 @@ class FileCount:
     #: towards "shared", which is the honest direction — a crate classified
     #: arch-only has provably no code for the other arch.
     arches: set = field(default_factory=set)
+    #: Copying calls (`COPY_METHODS`, `FD_COPIERS`) in production / test code.
+    copy_sites: int = 0
+    test_copy_sites: int = 0
+    #: `mut` keywords (`let mut`, `&mut`, `mut self`, `static mut`) in production / test code.
+    mut_sites: int = 0
+    test_mut_sites: int = 0
 
     @property
     def lines(self) -> int:
@@ -408,6 +414,18 @@ def classify_asm_lines(body: str, first_line: int, code: set, comment: set) -> N
             in_block = True
 
 
+#: Method calls that copy their receiver: the clone budget's sites
+#: (`scripts/check_budgets.py`). `.clone()` alone undercounts: the costliest copies in
+#: the tree were `.cloned()` of a whole fd and `.to_vec()` of a buffer
+#: (`docs/archive/CLONE_AND_MUT_BUDGETS.md`). Counted when called (`name(`) after a
+#: `.` or `::`, so `Clone::clone(&x)` counts and a field named `clone` does not.
+COPY_METHODS = frozenset({"clone", "cloned", "to_vec", "to_owned", "to_string"})
+#: This tree's whole-`FileDescriptor` copiers: every call is a copy of the
+#: descriptor (its path, and a directory's cached listing). Their definitions
+#: (`fn get_fd(`) are not counted.
+FD_COPIERS = frozenset({"get_fd", "table_get"})
+
+
 def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
     """Classify every line of `text`. Returns (code, comment, test) line-number sets."""
     code: set = set()
@@ -427,6 +445,8 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
     awaiting_item = False  # currently inside a test-gated item's header
     last_ident = ""  # most recent identifier token
     unsafe_lines: list = []  # line of each `unsafe` token lexed in code context
+    copy_lines: list = []  # line of each copying call (`COPY_METHODS`, `FD_COPIERS`) in code context
+    mut_lines: list = []  # line of each `mut` keyword in code context
     # Lines lying inside an `unsafe { .. }` block, plus the declaration line of an
     # `unsafe fn`/`impl`/`trait`. A set, so nested blocks overlap harmlessly.
     unsafe_span: set = set()
@@ -663,7 +683,21 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
             j = i
             while j < n and _is_ident_char(text[j]):
                 j += 1
-            last_ident = text[i:j]
+            prev_ident, last_ident = last_ident, text[i:j]
+            if spec.rust:
+                if last_ident == "mut":
+                    mut_lines.append(line)
+                elif last_ident in COPY_METHODS or last_ident in FD_COPIERS:
+                    k = j
+                    while k < n and text[k] in " \t":
+                        k += 1
+                    called = k < n and text[k] == "("
+                    via = text[i - 1] if i > 0 else ""
+                    if called and (
+                        (last_ident in COPY_METHODS and via in ".:")
+                        or (last_ident in FD_COPIERS and prev_ident != "fn")
+                    ):
+                        copy_lines.append(line)
             if (spans and awaiting_item and spans[-1]["kind"] is None
                     and spans[-1]["depth"] == depth and spans[-1]["pdepth"] == pdepth
                     and last_ident != "pub"):
@@ -760,7 +794,7 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
         for ln in range(sp["start"], line + 1):
             unsafe_span.add(ln)
 
-    return code, comment, test, all_file_test, unsafe_lines, unsafe_span, arches
+    return code, comment, test, all_file_test, unsafe_lines, unsafe_span, arches, copy_lines, mut_lines
 
 
 #: First word of a gated span that makes it an ITEM (ends at `;` or its block),
@@ -792,7 +826,7 @@ def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate,
     numbers of production code (and of production code inside `unsafe`) — what
     `--audit` unions across kernels, since a crate two kernels share is read once."""
     nlines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
-    code, comment, test, inner_test, unsafe_lines, unsafe_span, arches = scan(
+    code, comment, test, inner_test, unsafe_lines, unsafe_span, arches, copy_lines, mut_lines = scan(
         text, spec, kernel_gate
     )
 
@@ -807,6 +841,10 @@ def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate,
             fc.test_unsafe_sites += 1
         else:
             fc.unsafe_sites += 1
+    for lines_, prod, tst in ((copy_lines, "copy_sites", "test_copy_sites"), (mut_lines, "mut_sites", "test_mut_sites")):
+        for ln in lines_:
+            f = tst if fc.whole_file_test or ln in test else prod
+            setattr(fc, f, getattr(fc, f) + 1)
 
     for ln in range(1, nlines + 1):
         is_test = fc.whole_file_test or ln in test
@@ -1011,6 +1049,10 @@ class Agg:
     test_unsafe_sites: int = 0
     unsafe_code: int = 0
     test_unsafe_code: int = 0
+    copy_sites: int = 0
+    test_copy_sites: int = 0
+    mut_sites: int = 0
+    test_mut_sites: int = 0
     #: True once this component's crate root carried `#![forbid(unsafe_code)]`.
     #: See `FileCount.forbids_unsafe` for why only the root counts.
     forbids_unsafe: bool = False
@@ -1023,7 +1065,8 @@ class Agg:
         self.unsafe_code += fc.unsafe_code
         self.test_unsafe_code += fc.test_unsafe_code
         self.forbids_unsafe = self.forbids_unsafe or fc.forbids_unsafe
-        for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code"):
+        for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code",
+                  "copy_sites", "test_copy_sites", "mut_sites", "test_mut_sites"):
             setattr(self, f, getattr(self, f) + getattr(fc, f))
 
     def merge(self, other: "Agg"):
@@ -1036,7 +1079,8 @@ class Agg:
         self.unsafe_code += other.unsafe_code
         self.test_unsafe_code += other.test_unsafe_code
         self.forbids_unsafe = self.forbids_unsafe or other.forbids_unsafe
-        for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code"):
+        for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code",
+                  "copy_sites", "test_copy_sites", "mut_sites", "test_mut_sites"):
             setattr(self, f, getattr(self, f) + getattr(other, f))
 
     @property
@@ -2329,10 +2373,31 @@ UNSAFE_CASES = [
 ]
 
 
+#: (name, source, production copy sites, production `mut` sites) for the budgets'
+#: counters - each a case a grep for the word gets wrong.
+COPY_MUT_CASES = [
+    ("method calls count", "fn f(a: &V) -> V {\n    let b = a.clone();\n    b.to_vec(); x.cloned(); s.to_string(); t.to_owned();\n    b\n}\n", 5, 0),
+    ("`Clone::clone(&x)` counts", "fn f() { let y = Clone::clone(&x); }\n", 1, 0),
+    ("a field or binding named clone does not", "fn f() { let clone = s.clone; g(clone); }\n", 0, 0),
+    ("words in strings and comments do not", "// x.clone() and let mut\nfn f() { p(\"a.clone() mut\"); }\n", 0, 0),
+    ("fd copiers: calls count, the definition does not",
+     "fn get_fd(&self, fd: u32) -> Option<F> { None }\nfn g(p: &P) { p.get_fd(3); table_get(4); }\n", 2, 0),
+    ("every `mut` keyword counts", "fn f(mut a: u8, b: &mut u8) { let mut c = 0; static mut D: u8 = 0; }\n", 0, 4),
+    ("test-gated code is not production", "#[cfg(test)]\nmod tests {\n    fn t() { let mut v = x.clone(); }\n}\n", 0, 0),
+]
+
+
 def self_test() -> int:
     """Check the unsafe counter against cases a grep gets wrong. Returns exit code."""
     spec = EXT_LANGS[".rs"]
     failures = 0
+    for name, src, want_copy, want_mut in COPY_MUT_CASES:
+        fc = count_text(src, "probe.rs", spec, True)
+        ok = (fc.copy_sites, fc.mut_sites) == (want_copy, want_mut)
+        failures += 0 if ok else 1
+        print(f"  {'ok  ' if ok else 'FAIL'} {name}")
+        if not ok:
+            print(f"       want copy={want_copy} mut={want_mut}, got copy={fc.copy_sites} mut={fc.mut_sites}")
     for name, src, want_sites, want_lines in UNSAFE_CASES:
         fc = count_text(src, "probe.rs", spec, True)
         got = (fc.unsafe_sites, fc.unsafe_code)
@@ -2543,6 +2608,10 @@ def emit_json(files: list, paths: list) -> None:
             "safe_code": agg.safe_code,
             "test_unsafe_sites": agg.test_unsafe_sites,
             "forbids_unsafe": agg.forbids_unsafe,
+            "copy_sites": agg.copy_sites,
+            "test_copy_sites": agg.test_copy_sites,
+            "mut_sites": agg.mut_sites,
+            "test_mut_sites": agg.test_mut_sites,
         }
 
     by_platform: dict = {}
