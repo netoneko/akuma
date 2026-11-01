@@ -68,11 +68,6 @@ pub fn set_current_slot(slot: usize) {
 /// resumed on an exec-swept address space whose stack pages read zero).
 static SHELL_THREAD_TID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// The spawn crossing names the shell's threading tid.
-pub fn set_shell_tid(tid: usize) {
-    SHELL_THREAD_TID.store(tid, core::sync::atomic::Ordering::Relaxed);
-}
-
 #[must_use]
 pub fn shell_tid() -> usize {
     SHELL_THREAD_TID.load(core::sync::atomic::Ordering::Relaxed)

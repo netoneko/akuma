@@ -160,7 +160,6 @@ fn fd_tag(fd: i32) -> &'static str {
         crate::OpenFile::Pair(..) => "[S]",
         crate::OpenFile::EventFd(_) => "[E]",
         crate::OpenFile::Socket(_) => "[K]",
-        crate::OpenFile::ChildOut(_) => "[C]",
         crate::OpenFile::File { .. } => "[F]",
         _ => "[?]",
     }))
@@ -183,7 +182,6 @@ fn fd_events(fd: i32, events: i16) -> i16 {
     }
     let mut efd_idx: usize = usize::MAX;
     let mut eslot: usize = usize::MAX;
-    let mut cout: usize = usize::MAX;
     let mut pipe_rev: i16 = 0;
     let kind = crate::with_fds(|t| t.with(fd as u32, |d| match d {
         crate::OpenFile::Socket(_) => 1,
@@ -194,10 +192,6 @@ fn fd_events(fd: i32, events: i16) -> i16 {
         // gone and drained. This arm used to sit in the write-only group
         // above, so a poller asking POLLIN on a child's stdout got 0 forever
         // — exactly what goose's `Command::output` asks next.
-        crate::OpenFile::ChildOut(i) => {
-            cout = *i;
-            6
-        }
         // A pipe end (M3): a read end is POLLIN while data or a finished
         // writer's EOF stands; a write end is POLLOUT while there is room.
         // The crate's own predicates — no second opinion, and no poller
@@ -263,20 +257,6 @@ fn fd_events(fd: i32, events: i16) -> i16 {
         Some(2) => POLLIN | POLLOUT,
         Some(3) => events & POLLOUT,
         Some(5) => pipe_rev & events,
-        Some(6) => {
-            // ChildOut: data or EOF is POLLIN (masked); gone-and-drained is
-            // POLLHUP (unmaskable, the EOF edge poll(2) can see).
-            const POLLHUP: i16 = 0x0010;
-            let (has_data, gone) = crate::child::child_out_state(cout);
-            let mut rev: i16 = 0;
-            if (has_data || gone) && events & POLLIN != 0 {
-                rev |= POLLIN;
-            }
-            if gone && !has_data {
-                rev |= POLLHUP;
-            }
-            rev
-        }
         Some(7) => {
             // Epoll-in-poll: readable while pending, never writable.
             if events & POLLIN != 0 && crate::epoll::epoll_pending(eslot, 0) {

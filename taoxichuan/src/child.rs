@@ -100,7 +100,6 @@ const OUT_CAP: usize = 1024 * 1024;
 /// reaches the table again — `reap_process`, `schedule_blocking` and every print run with the borrow closed.
 static SLOTS: akuma_primitives::cell::BorrowCell<[SpawnSlot; NSLOTS]> =
     akuma_primitives::cell::BorrowCell::new([const { SpawnSlot::new() }; NSLOTS]);
-static NEXT_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 // Pids come from `akuma_exec::process::allocate_pid` (floor 2: 1 is sshd,
 // the boot's init task) - ONE allocator, because `clone_thread` draws its
 // thread Processes' pids from the crate's counter and a second counter here
@@ -156,11 +155,6 @@ pub struct SlotCross {
     save: CrossSave,
     /// The parent's CR3 root, loaded by the exit tail (`child_exit`).
     parent_root: u64,
-    /// The parent's syscall-stack top, restored by the resuming arm
-    /// (`spawn_arm` / `fork_arm` tails).
-    parent_stack_top: u64,
-    /// The parent's parked user RSP stash, likewise.
-    parent_stash: u64,
     /// The crossing depth this slot's occupant runs at: 1 = spawned child,
     /// 2 = its fork child. Was the shared `NESTED_DEPTH`; per-slot it is
     /// inherited (+1) at the fork crossing.
@@ -195,8 +189,6 @@ impl SlotCross {
         Self {
             save: CrossSave::new(),
             parent_root: 0,
-            parent_stack_top: 0,
-            parent_stash: 0,
             depth: 0,
             task_slot: 0,
             parent_task_slot: 0,
@@ -217,17 +209,6 @@ impl SlotCross {
 /// across a crossing.
 static SLOT_STATE: akuma_primitives::cell::BorrowCell<[SlotCross; NSLOTS]> =
     akuma_primitives::cell::BorrowCell::new([const { SlotCross::new() }; NSLOTS]);
-
-/// The crossing record of `slot` as a raw `&mut`, for the M2 nested-spawn crossings that hold it across
-/// the `child_enter` asm (which a closure cannot do). Bypasses the cell, so it must not be live while a
-/// [`with_cross`] closure is.
-///
-/// SAFETY: syscall-path discipline (single core, `IF` clear); `slot < NSLOTS`; no [`with_cross`] closure open.
-unsafe fn cross_mut(slot: usize) -> &'static mut SlotCross {
-    assert!(slot < NSLOTS, "cross_mut: slot out of range");
-    // SAFETY: the caller's contract; the cell's `value` sits at offset 0 and `slot` is in range.
-    unsafe { &mut (*SLOT_STATE.as_ptr())[slot] }
-}
 
 /// Run `f` on the crossing record of `slot` (the syscall-path readers and writers).
 pub fn with_cross<R>(slot: usize, f: impl FnOnce(&mut SlotCross) -> R) -> R {
@@ -253,11 +234,6 @@ fn with_slots<R>(f: impl FnOnce(&mut [SpawnSlot; NSLOTS]) -> R) -> R {
 /// The pid in ring row `slot`.
 fn slot_pid(slot: usize) -> u32 {
     SLOTS.with(|s| s[slot].pid)
-}
-
-/// Mark ring row `slot` used or free.
-fn set_slot_used(slot: usize, used: bool) {
-    with_slots(|s| s[slot].used = used);
 }
 
 /// Is a nested child running right now? The `exit_group` arm's fork in the
@@ -434,12 +410,6 @@ fn read_spawn_args(path_va: u64, argv_va: u64, envp_va: u64) -> Result<SpawnArgs
 // M4 slice 3: the real fork — premise 2's build-out
 // ---------------------------------------------------------------------------
 
-/// The M2 blocking fork stays selectable until the new path passes every
-/// gate: `false` keeps the run-to-completion arm for every fork (this
-/// commit's default), `true` routes plain `fork` (57/58) through
-/// `fork_process` over the registered shell Process. `clone`/`vfork` keep
-/// the blocking arm on both settings — out of scope this slice.
-pub const REAL_FORK: bool = true;
 /// The task record each ring slot runs against: `slot + 1` for a process, the
 /// creator's record for a `CLONE_THREAD` sibling - which is how threads share
 /// regions, brk/mmap cursors, the fd table and the cwd with no second copy to
@@ -1229,392 +1199,9 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
     }
 }
 
-pub fn spawn_arm(fr: &ring3::SyscallFrame) -> u64 {
-    if nested_active() {
-        // One level only; nothing nests a nest. Init is a pool thread since slice S1, so a cooperative
-        // sshd (the private SPAWN user) lands here on its first exec: say so instead of a bare EPERM that
-        // reads as "/bin/sh failed to spawn" (the metal image shipped such an sshd for a week).
-        akuma_primitives::safe_print!(160, "[spawn] refused: the caller is pool slot {} - build sshd with libakuma/linux-abi (fork+execve)\n", crate::exec_twin::current_slot());
-        return crate::e(crate::err::EPERM);
-    }
-    let args = match read_spawn_args(fr.arg1(), fr.arg2(), fr.arg3()) {
-        Ok(a) => a,
-        Err(no) => return crate::e(no),
-    };
-    // `stdin` (sshd passes None for exec) and the pty/console flag bits are
-    // accepted and ignored: there is no input path and no pty in this kernel.
-    let path: &str = &args.path;
-    let argv: Vec<&str> = args.argv.iter().map(String::as_str).collect();
-    let env: Vec<&str> = args.env.iter().map(String::as_str).collect();
-
-    // A free slot and a pid, before anything expensive. Session ph: the ring
-    // number is RESERVED in the threading pool FIRST (the fork children's
-    // tids come from the same pool — an unreserved number is handed to a
-    // fork child, which then binds this shell's cross record/SpawnSlot/fd
-    // table; boots ph-2/ph-4). A refused number (neither FREE nor TERMINATED
-    // — i.e. already reserved by an earlier crossing) is skipped: the next
-    // index is tried, NSLOTS tries in total, never the blind-next wrap onto
-    // a live ring (the M2 lesson, boot 3 gate P3).
-    let slot_idx = {
-        let mut idx = NEXT_SLOT.load(core::sync::atomic::Ordering::Relaxed) % NSLOTS;
-        let mut tries = 0;
-        loop {
-            if akuma_threading::reserve_slot(idx) {
-                break;
-            }
-            idx = (idx + 1) % NSLOTS;
-            tries += 1;
-            if tries >= NSLOTS {
-                akuma_primitives::safe_print!(160, "  [spawn] every ring slot already reserved\n");
-                for i in 0..NSLOTS {
-                    akuma_primitives::safe_print!(
-                        96,
-                        "    ring slot {}: pool state {} used={} thread={}\n",
-                        i,
-                        akuma_threading::get_thread_state(i),
-                        SLOTS.with(|t| t[i].used),
-                        SLOTS.with(|t| t[i].thread)
-                    );
-                }
-                return crate::e(crate::err::EAGAIN);
-            }
-        }
-        let pid = akuma_exec::process::allocate_pid();
-        with_slots(|s| {
-            s[idx] = SpawnSlot::new();
-            s[idx].used = true;
-            s[idx].pid = pid;
-            s[idx].running = true;
-        });
-        NEXT_SLOT.store((idx + 1) % NSLOTS, core::sync::atomic::Ordering::Relaxed);
-        idx
-    };
-
-    // Load the image while the PARENT's CR3 is still active: everything the
-    // load touches (ext2 root, PMM, page tables) lives in the kernel half,
-    // and the copy loop writes the child's frames through the physmap.
-    // `/bin/sh` (what the exec path spawns) is a symlink on the serve
-    // image; the chain walker resolves it the same way `open` does.
-    let effective = crate::resolve_effective(path);
-    let Ok(image) = crate::read_image(&effective) else {
-        // Say what failed. A silent ENOENT here reads on the client exactly
-        // like a missing binary, and cost three stages of diagnosis.
-        akuma_primitives::safe_print!(
-            192,
-            "[spawn] '{}' -> '{}': read failed\n",
-            path,
-            effective
-        );
-        set_slot_used(slot_idx, false);
-        return crate::e(crate::err::ENOENT);
-    };
-    if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
-        akuma_primitives::safe_print!(160, "[spawn] '{}': not an ELF image\n", effective);
-        set_slot_used(slot_idx, false);
-        return crate::e(crate::err::ENOENT);
-    }
-
-    // The child owns task slot 1 while it runs.
-    crate::set_task_slot(1);
-    let ti = crate::load_task(&argv, &env, &image);
-    let Some(ti) = ti else {
-        akuma_primitives::safe_print!(160, "[spawn] '{}': load failed\n", effective);
-        crate::set_task_slot(0);
-        set_slot_used(slot_idx, false);
-        return crate::e(crate::err::ENOMEM);
-    };
-    // A fresh session starts at `/`; the slot's Task outlives the last shell.
-    crate::with_task(|t| {
-        t.cwd.clear();
-        t.exe = effective;
-    });
-    // Premise 2's build-out: register the shell as an akuma-exec Process so
-    // `fork_process` finds a caller. tid = this ring slot — the same number
-    // `current_slot()` answers once the crossing below names the child.
-    register_shell_process(slot_pid(slot_idx), path, ti.root_pa, ti.entry, ti.rsp, slot_idx);
-    // The sched_* maps key on this: the shell's threading tid is its spawn
-    // slot, and which slot that is varies across a boot's login spawns.
-    crate::exec_twin::set_shell_tid(slot_idx);
-    // Timer preemption arms here (session pf): the first SPAWN crossing is
-    // the first moment a ring-3 tick has a legitimate switch target.
-    crate::PREEMPT_ARMED.store(true, core::sync::atomic::Ordering::Release);
-
-    // Snapshot the parent and point the crossing machinery at the child —
-    // into the child's own per-slot record now (slice 2): the parent's CR3,
-    // stack top and stash, the depth/task/out answers, and `current_slot`
-    // naming the child from here until its `child_exit`.
-    // SAFETY: syscall-path discipline for the table; `child_enter`'s
-    // contract for the crossing.
-    let (_, save) = unsafe {
-        let c = cross_mut(slot_idx);
-        c.parent_root = crate::task_root_of(0);
-        c.parent_stack_top = ring3::syscall_stack_top();
-        c.parent_stash = ring3::user_rsp_stash();
-        c.depth = 1;
-        c.task_slot = 1;
-        c.parent_task_slot = 0;
-        c.parent_slot = crate::exec_twin::NO_SLOT;
-        c.out_slot = slot_idx;
-        crate::exec_twin::set_current_slot(slot_idx);
-        // The nested stack: the lower half of the syscall stack. The live
-        // dispatch frames sit in the upper half — the SPAWN arm's depth from
-        // the top is a few hundred bytes, and the stub's per-syscall frame is
-        // 128 — so the two halves cannot meet.
-        let half = (ring3::SYSCALL_STACK_SIZE / 2) as u64;
-        c.kstack_top = c.parent_stack_top - half;
-        ring3::set_syscall_stack_top(c.kstack_top);
-        (c.parent_stack_top, save_ptr(slot_idx))
-    };
-
-    let ef = ring3::EntryFrame {
-        r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
-        rdx: 0, rsi: 0, rdi: 0, rax: 0,
-        rip: ti.entry,
-        rflags: 0x202,
-        rsp: ti.rsp,
-    };
-    // Session pi: the spawn crossing hands the fresh image a deterministic
-    // fs (0 — what the exec crossings give, what amd64 hands its images) and
-    // stamps the shadow so the child's first park-resume re-installs 0 until
-    // musl's own arch_prctl names its TLS. The MSR here held WHATEVER ran
-    // last on the core — for three stages that leftover happened to be the
-    // previous shell's TLS, which busybox's own arch_prctl always replaced
-    // before its first fs-relative read.
-    let _ = akuma_cpu::msr::set_fs_base(0);
-    set_slot_fs(slot_idx, 0);
-    // The crossing runs the child ON this slot's number, so the pool must say
-    // so: `reserve_slot` leaves it INITIALIZING, which the picker never
-    // takes, and a tick that preempts the child then switches away from a
-    // slot it can never pick again - the spawn parks after `[SSH] Exec:`
-    // forever (supervisor, 2026-10-30; QEMU TCG, deterministic with the
-    // switch on, absent with it off).
-    akuma_threading::set_thread_state(slot_idx, 2);
-    let _ = crate::smp::bkl_leave_all();
-    let code = unsafe { child_enter(ti.root_pa, &ef, save) };
-    akuma_threading::set_thread_state(slot_idx, 3);
-    akuma_threading::x86_release_on_cpu(slot_idx);
-    // `code` (the child's exit status) was recorded into the slot by the
-    // exit arm before it returned here; SPAWN's own result is the packed
-    // pid/fd word below.
-    let _ = code;
-
-    // Back in the parent, in every sense: registers and stack top restored
-    // by the exit arm, CR3 back, `current_slot` back to the boot task (the
-    // exit tail's `set_current_slot(parent_slot)`). The stack top and stash
-    // come from the child's own record — the same values the snapshot put
-    // there, read back through the slot index this frame owns.
-    // SAFETY: syscall-path discipline.
-    unsafe {
-        let c = cross_mut(slot_idx);
-        ring3::set_syscall_stack_top(c.parent_stack_top);
-        ring3::set_user_rsp_stash(c.parent_stash);
-    }
-    let pid = slot_pid(slot_idx);
-    release_spawn_image(pid);
-
-    // The ChildOut fd the parent drains. Spawned children do not inherit fd
-    // tables (nothing here forks) — the fd is made fresh in the parent's own
-    // table, which is the current slot again.
-    let Some(fd) = crate::with_fds(|table| {
-        let _probe = table.free_below(3, crate::SLOT_CEILING)?;
-        Some(table.alloc_fd_from(3, crate::OpenFile::ChildOut(slot_idx)))
-    }) else {
-        // No fd slot: the output is dropped, but the child DID run and the
-        // pid is real — Linux would have handed out the fd or failed the
-        // spawn. Failing the spawn now would lie about the child; report it
-        // with fd 0 (never a valid fd) and let the bridge log the miss.
-        return u64::from(pid);
-    };
-    (u64::from(pid)) | ((u64::from(fd)) << 32)
-}
-
 // ---------------------------------------------------------------------------
 // Exec-replace: the nested child's execve.
 // ---------------------------------------------------------------------------
-
-/// The first-level (SPAWN) saved state, snapshotted across an exec-replace:
-/// the second [`child_enter`] overwrites the slot's save record with this
-/// (nested) call's registers, and [`spawn_arm`]'s resume needs the originals.
-/// SPAWN-level crossing state saved by `exec_replace` — one PER FRAME now,
-/// not the old single statics: test A nests two exec_replace levels (outer
-/// sh -> inner sh -> cat) plus a fork, and each level's snapshot overwrote
-/// the one shared set, so the outer `exec_return` restored a dead image's
-/// user registers into `spawn_arm`'s live Rust frame (the 16 KiB #GP shape,
-/// then the 32 KiB silent spin). A frame local lives above the deeper
-/// dispatch bands (deeper runs write strictly below it), so it is stable
-/// until its own `exec_return` consumes it. (Slice 2: the snapshot's SOURCE
-/// is the slot's per-slot `CrossSave` — the record `exec_replace`'s own
-/// crossing will overwrite; the fork arm no longer needs this dance at all,
-/// because its child has a record of its own.)
-type ExecSave = CrossSave;
-
-/// The nested child's `execve` — the handoff of the run-to-completion model.
-///
-/// busybox ash runs `sh -c '<one command>'` by execing the command in place
-/// (the trailing-simple-command optimization skips the fork), and every
-/// program line the stage-6 gates run reaches the kernel this way. There is
-/// no fork to return to and no second runnable task: so exec REPLACES the
-/// running child's image — same slot, fresh root, fresh fd table — and when
-/// the exec'd image calls `exit_group`, [`child_exit`] returns here with its
-/// status, this frame restores the SPAWN-level state, and control flows back
-/// into [`spawn_arm`] exactly as if its own child had run to completion. The
-/// exec'd image's stdout lands in the same pipe; its status is the child's.
-///
-/// A failure BEFORE the crossing is an ordinary `execve` error the caller
-/// (ash) sees and reports; after the crossing there is no returning.
-pub fn exec_replace(fr: &ring3::SyscallFrame) -> u64 {
-    // Snapshot THIS slot's crossing record — the values the sshd→shell
-    // crossing left, which the second `child_enter` below will overwrite
-    // (same slot: an exec replaces the image in place, slice 2 or not).
-    // SAFETY: syscall-path discipline (single core, IF clear).
-    let save = unsafe { *save_ptr(crate::exec_twin::current_slot()) };
-    let args = match read_spawn_args(fr.arg1(), fr.arg2(), fr.arg3()) {
-        Ok(a) => a,
-        Err(no) => return crate::e(no),
-    };
-    // PB5 evidence (session pb): the tick count before the new image's first
-    // ring-3 instruction; "[TICK post]" at child_exit brackets the run.
-    akuma_primitives::safe_print!(96, "[TICK pre] n={}\n", akuma_lapic_amd64::ticks());
-    let effective = crate::resolve_effective(&args.path);
-    let Ok(image) = crate::read_image(&effective) else {
-        akuma_primitives::safe_print!(
-            192,
-            "[exec] '{}' -> '{}': read failed\n",
-            args.path,
-            effective
-        );
-        return crate::e(crate::err::ENOENT);
-    };
-    if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
-        akuma_primitives::safe_print!(160, "[exec] '{}': not an ELF image\n", effective);
-        return crate::e(crate::err::ENOEXEC);
-    }
-    let argv: Vec<&str> = args.argv.iter().map(String::as_str).collect();
-    let env: Vec<&str> = args.env.iter().map(String::as_str).collect();
-    // POSIX exec keeps open fds across the image swap (cloexec swept below).
-    // The tail-call exec IS how a non-builtin command runs under its shell's
-    // redirects — `sh -c 'sha256sum x > f'` opens f, dup2's it onto fd 1,
-    // then execs: with the fresh table `load_task` starts, the binding dies
-    // here and the exec'd program's stdout rides the session pipe instead of
-    // the file (the empty-file-with-rc-0 symptom one boot after the write
-    // side was fixed). Snapshot before the load, restore after.
-    let saved = crate::with_task(|t| (t.fd_names.clone(), t.fd_cloexec.clone(), t.fd_nonblock.clone()));
-    // The new image replaces the task: same slot, fresh root (the load runs
-    // on the CURRENT child's CR3, all its writes through the physmap — the
-    // same story as the SPAWN arm's load on the parent's CR3).
-    let old_root = crate::task_root();
-    let Some(ti) = crate::load_task(&argv, &env, &image) else {
-        akuma_primitives::safe_print!(160, "[exec] '{}': load failed\n", effective);
-        return crate::e(crate::err::ENOMEM);
-    };
-    crate::with_task(|t| t.exe = effective);
-    // The replaced image's root is dead weight once the crossing below loads
-    // the new CR3; it is still the live CR3 here, so it waits for a sweep.
-    park_root(old_root);
-    // Restore the saved fds and sweep the cloexec ones — `sweep_cloexec`
-    // returns the closed payloads; a swept socket releases its kernel side
-    // exactly as close does. `load_task` had reset all three collections.
-    let swept = crate::with_task(|t| {
-        t.fd_names = saved.0;
-        t.fd_cloexec = saved.1;
-        t.fd_nonblock = saved.2;
-        crate::fdtable::FdTable::of(&mut t.fd_names, &mut t.fd_cloexec, &mut t.fd_nonblock).sweep_cloexec()
-    });
-    for (_fd, payload) in swept {
-        if let crate::OpenFile::Socket(idx) = payload {
-            crate::sock::release_unnamed(idx);
-        } else {
-            // A swept pipe end drops its table reference, exactly as
-            // close does.
-            let (ends, n) = payload.pipe_ends();
-            for (id, w) in &ends[..n] {
-                crate::pipes::release(*id, *w);
-            }
-        }
-    }
-    // The shell's registered Process named the PRE-exec root in its shared
-    // view; `fork_process` would clone from the dead image. Re-point the
-    // view at the fresh root — the same move amd64's execve makes
-    // (`replace_image` swaps the address space under the same lock).
-    {
-        let cur = crate::exec_twin::current_slot();
-        if cur != crate::exec_twin::NO_SLOT {
-            let pid = slot_pid(cur);
-            if let Some(view) = akuma_mmu::UserAddressSpace::new_shared(ti.root_pa as usize) {
-                let _ = akuma_exec::process::table::with_process(pid, |p| {
-                    p.address_space = akuma_exec::process::ProcAddressSpace::new(view);
-                });
-            }
-        }
-    }
-    let ef = ring3::EntryFrame {
-        r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
-        rdx: 0, rsi: 0, rdi: 0, rax: 0,
-        rip: ti.entry,
-        rflags: 0x202,
-        rsp: ti.rsp,
-    };
-    // Lower the nested dispatch top BELOW this arm's live frame. Every child
-    // syscall re-enters at `set_syscall_stack_top`'s current value — the same
-    // region this frame occupies (the execve dispatch itself started there) —
-    // so the exec'd child's first deep syscall would rewrite this frame,
-    // `RET_RSP` included, and the exit `ret` would jump to whatever it found.
-    // `spawn_arm`'s tail restores the real top after `child_enter` returns;
-    // failure paths above never lowered it.
-    let rsp_here: u64;
-    // SAFETY: reads the current stack pointer, nothing else.
-    unsafe {
-        core::arch::asm!("mov {}, rsp", out(reg) rsp_here, options(nomem));
-    }
-    // SAFETY: syscall-path discipline; `set_syscall_stack_top` is a plain
-    // atomic store the unsafe context of the arm already covers.
-    ring3::set_syscall_stack_top(rsp_here - 0x1000);
-    // The same stale-fs rule as exec_real_task's crossing: a fresh image
-    // starts with fs = 0, never the outgoing task's TLS pointer.
-    let _ = akuma_cpu::msr::set_fs_base(0);
-    set_slot_fs(crate::exec_twin::current_slot(), 0);
-    let _ = crate::smp::bkl_leave_all();
-    let status = unsafe { child_enter(ti.root_pa, &ef, core::ptr::addr_of_mut!(EXEC_SAVE)) };
-    // The exec'd child exited: `child_exit` recorded its status in the slot,
-    // cleared the nesting, put task slot 0 back, and restored THIS frame's
-    // registers and CR3 (the parent's). Hand control to `spawn_arm`'s
-    // continuation with the SPAWN-level registers, stack, and the exec'd
-    // child's status in EAX.
-    // SAFETY: the snapshot was taken at this arm's entry and is still live;
-    // `ret` pops the return address `spawn_arm`'s `child_enter` call pushed.
-    unsafe { exec_return(&save, (status & 0xFF) as u32) }
-}
-
-/// Restore the SPAWN-level saved state and `ret` into [`spawn_arm`].
-///
-/// # Safety
-/// Only valid at the tail of [`exec_replace`], after the second
-/// [`child_enter`] has returned here; the snapshot statics must be live and
-/// CR3 must already be the parent's (set by [`child_exit`]).
-#[cfg(target_arch = "x86_64")]
-unsafe fn exec_return(save: &ExecSave, status: u32) -> ! {
-    unsafe {
-        // Explicit register bindings for every callee-saved restore, for the
-        // reason `child_exit` spells out: an `in(reg)` input may be allocated
-        // to a register the template itself overwrites. Here the loads read
-        // the snapshot through `rdi` (bound explicitly), the callee-saveds
-        // are PLACED as the restore, and `rax` carries the status the `ret`
-        // hands back to `spawn_arm`.
-        core::arch::asm!(
-            "mov rbx, [rdi + 0x08]",
-            "mov rbp, [rdi + 0x10]",
-            "mov r12, [rdi + 0x18]",
-            "mov r13, [rdi + 0x20]",
-            "mov r14, [rdi + 0x28]",
-            "mov r15, [rdi + 0x30]",
-            "mov rsp, [rdi + 0x00]",
-            "ret",
-            in("rdi") save,
-            in("rax") u64::from(status),
-            options(noreturn),
-        )
-    }
-}
 
 /// Cross into the child and come back only when it exits.
 ///
@@ -1798,182 +1385,10 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     if fr.rax == ring3::nr::CLONE && fr.arg1() & CLONE_THREAD != 0 {
         return clone_thread_arm(fr);
     }
-    if REAL_FORK {
-        // The real path: fork (57), vfork (58) and every non-thread `clone` - libakuma's `fork()` under `linux-abi` issues
-        // `clone(SIGCHLD)` - through `fork_process` over the registered Process. `fork_arm_real` takes a vfork-style
-        // child stack from `clone`'s `CLONE_VM` form itself.
-        return fork_arm_real(fr);
-    }
-    fork_arm_blocking(fr)
-}
-
-/// The M2 blocking arm, unchanged and selectable via [`REAL_FORK`].
-fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
-    // Fork lives only inside the spawned shell: nothing forks the sshd task,
-    // and a fork inside a fork child has no stack region left (see above).
-    // Per-slot (slice 2): the current slot's record carries the depth — the
-    // boot task's `NO_SLOT` and a fork child's depth 2 both refuse.
-    let cur = crate::exec_twin::current_slot();
-    let shell_depth = match cur {
-        crate::exec_twin::NO_SLOT => 0,
-        _ => with_cross(cur, |c| c.depth),
-    };
-    if shell_depth != 1 {
-        return crate::e(crate::err::EPERM);
-    }
-    const CLONE_VM: u64 = 0x0000_0100;
-    const CLONE_VFORK: u64 = 0x0000_4000;
-    const SIGCHLD: u64 = 17;
-    if fr.rax == ring3::nr::CLONE {
-        let flags = fr.arg1();
-        if flags & SIGCHLD == 0 || flags & !(CLONE_VM | CLONE_VFORK | SIGCHLD) != 0 {
-            // Name the flags: each boot reads as a checklist of what the
-            // caller asked for, not just that it was refused.
-            akuma_primitives::safe_print!(
-                160,
-                "  [fork] clone flags=0x{:x} refused (not SIGCHLD[|VM|VFORK])\n",
-                flags
-            );
-            return crate::e(ring3::err::EINVAL);
-        }
-    }
-
-    // A free slot and a pid, exactly as SPAWN takes them — except the slot:
-    // a fork child reuses a DEAD slot, never the spawn ring's blind next.
-    // With NSLOTS = 4, a four-fork pipeline wraps the ring onto the LIVE
-    // shell's slot and `SpawnSlot::new()` wipes the session buffer out of
-    // it (boot 3, gate P3: the second `wc -c`'s `2\n` vanished and the
-    // bridge reported the fork child's pid for the shell's slot). The
-    // blocking-fork model keeps at most the shell plus ONE child alive at
-    // any instant, so a dead slot always exists; NEXT_SLOT stays the spawn
-    // arm's own ring and is not advanced here.
-    let Some(slot_idx) = SLOTS.with(|s| s.iter().position(|r| !r.running)) else {
-        return crate::e(ring3::err::EAGAIN);
-    };
-    let pid = akuma_exec::process::allocate_pid();
-    with_slots(|s| {
-        s[slot_idx] = SpawnSlot::new();
-        s[slot_idx].used = true;
-        s[slot_idx].pid = pid;
-        s[slot_idx].running = true;
-    });
-    let ash_root = crate::task_root();
-
-    // The child's address space: an eager copy of every mapped user page of
-    // the shell's, each PTE keeping its own flags (RX text stays RX). Built
-    // while the parent's CR3 is still active — the walk reads the shell's
-    // tables and the copies go through the physmap, all kernel half.
-    let Some(root) = crate::fork_share_memory(ash_root) else {
-        set_slot_used(slot_idx, false);
-        return crate::e(crate::err::ENOMEM);
-    };
-
-    // The child's fd table is `akuma-fdtable`'s own fork decision — not a
-    // hand copy. No kernel-side references to take on top of the cloned
-    // payloads: this kernel's descriptions are indices (`File { inode }`,
-    // `Socket(idx)`), the convention every close arm already runs on.
-    // The predicate is Linux's epoll fork rule (stage 12): the child never
-    // inherits an epoll fd — the instance stays the creator's, and a
-    // child's close/exec sweep must not free it.
-    let forked = crate::with_fds(|t| t.fork_copy(|d| !matches!(d, crate::OpenFile::Epoll(_))));
-    // A pipe end is a *counted* kernel resource: every payload the child's
-    // table inherited needs one kernel-side reference taken on top of the
-    // clone (`fork_copy`'s own doc — "iterate the values"). The index
-    // payloads the old comment excused (File{inode}, Socket(idx)) stay free.
-    for d in forked.names.values() {
-        let (ends, n) = d.pipe_ends();
-        for (id, w) in &ends[..n] {
-            crate::pipes::clone_ref(*id, *w);
-        }
-    }
-
-    // Task bookkeeping: the fork child owns slot 2 while it runs (1 stays
-    // the shell's). Regions, brk/mmap cursors and the fd parts come from the
-    // shell's record; `user_ok` then answers for the child exactly as for
-    // the shell.
-    {
-        let (regions, n_regions, brk_base, brk_cur, brk_end, mmap_cur, cwd, std_closed) = crate::with_task(|t| {
-            (t.regions, t.n_regions, t.brk_base, t.brk_cur, t.brk_end, t.mmap_cur, t.cwd.clone(), t.std_closed)
-        });
-        crate::with_task_slot(2, |ct| {
-        ct.cwd = cwd;
-        ct.root_pa = root;
-        ct.regions = regions;
-        ct.n_regions = n_regions;
-        ct.brk_base = brk_base;
-        ct.brk_cur = brk_cur;
-        ct.brk_end = brk_end;
-        ct.mmap_cur = mmap_cur;
-        ct.exit = None;
-        ct.fd_names = forked.names;
-        ct.fd_cloexec = forked.cloexec;
-        ct.fd_nonblock = forked.nonblock;
-        ct.std_closed = std_closed;
-        });
-    }
-    crate::set_task_slot(2);
-
-    // The child resumes the CALLER at its own RIP with every user register
-    // it had — RAX forced to 0, the fork child's answer. The user RSP rides
-    // the stub's stash (the shell's CLONE just wrote it); it is copied now,
-    // because the child's first syscall overwrites the stash with its own.
-    let ef = ring3::EntryFrame {
-        r15: fr.r15, r14: fr.r14, r13: fr.r13, r12: fr.r12,
-        rbp: fr.rbp, rbx: fr.rbx, r10: fr.r10, r8: fr.r8, r9: fr.r9,
-        rdx: fr.rdx, rsi: fr.rsi, rdi: fr.rdi,
-        rax: 0,
-        rip: fr.user_rip,
-        rflags: fr.user_rflags,
-        rsp: ring3::user_rsp_stash(),
-    };
-
-    // The fork child gets a per-slot crossing record of its own (slice 2) —
-    // which is why the old code's whole snapshot-and-restore dance around
-    // the shared statics is gone: the shell's sshd→shell record lives in
-    // `SLOT_STATE[cur]` and the fork never touches it, so the shell's own
-    // exit (or its next exec's snapshot) reads exactly what was always
-    // there. The child's record copies the shell's out_slot (a fork child's
-    // fd 1 writes land in the buffer sshd drains — never its own slot),
-    // inherits depth+1, and names the shell as the crossing back.
-    // SAFETY: syscall-path discipline.
-    let (_, save) = unsafe {
-        let c = cross_mut(slot_idx);
-        c.save = CrossSave::new();
-        c.parent_root = ash_root;
-        c.parent_stack_top = ring3::syscall_stack_top();
-        c.parent_stash = ring3::user_rsp_stash();
-        c.depth = shell_depth + 1;
-        c.task_slot = 2;
-        c.parent_task_slot = 1;
-        c.parent_slot = cur;
-        c.out_slot = cross_mut(cur).out_slot;
-        crate::exec_twin::set_current_slot(slot_idx);
-        // The child's dispatch stack: one quarter below the shell's top. The
-        // shell's live fork frames sit just under ITS top, a few hundred
-        // bytes deep against a 4 KiB quarter, so the two can never meet.
-        ring3::set_syscall_stack_top(c.parent_stack_top - (ring3::SYSCALL_STACK_SIZE / 4) as u64);
-        (c.parent_stack_top, save_ptr(slot_idx))
-    };
-    // Session pi: the M2 fork child inherits the shell's fs (same-image
-    // semantics — the MSR already holds it at this crossing, the capture
-    // comment below); stamp the shadow so its park-resumes re-install it.
-    set_slot_fs(slot_idx, slot_fs_of(cur));
-    let _ = crate::smp::bkl_leave_all();
-    let _code = unsafe { child_enter(root, &ef, save) };
-    // The child exited into this frame: its status is in the slot, the task
-    // slot is back to 1, CR3 is the shell's, `current_slot` is the shell's
-    // slot is back to 1, CR3 is the shell's, `current_slot` is the shell's
-    // slot again (the exit tail's `set_current_slot(parent_slot)`). Hand the
-    // shell back its stack and stash from the child's own record, answer
-    // fork.
-    // SAFETY: syscall-path discipline.
-    unsafe {
-        let c = cross_mut(slot_idx);
-        ring3::set_syscall_stack_top(c.parent_stack_top);
-        ring3::set_user_rsp_stash(c.parent_stash);
-    }
-    let pid = slot_pid(slot_idx);
-    u64::from(pid)
+    // fork (57), vfork (58) and every non-thread `clone` - libakuma's `fork()` under `linux-abi` issues
+    // `clone(SIGCHLD)` - through `fork_process` over the registered Process. `fork_arm_real` takes a vfork-style
+    // child stack from `clone`'s `CLONE_VM` form itself.
+    fork_arm_real(fr)
 }
 
 /// Linux WAIT4 (61): `wait4(pid, &status, options, rusage)` — the M2 answer,
@@ -1986,24 +1401,7 @@ fn fork_arm_blocking(fr: &ring3::SyscallFrame) -> u64 {
 /// honestly). `rusage` is accepted and ignored: the gate's callers pass
 /// NULL, and zero-filled accounting is what this box has always given.
 pub fn wait4_arm(pid: u64, status_va: u64, options: u64, _rusage_va: u64) -> u64 {
-    if REAL_FORK {
-        return wait4_real(pid, status_va, options);
-    }
-    let want_pid = pid as u32;    let any = pid == u64::MAX || want_pid == 0; // -1, or "my process group"
-    let found = with_slots(|s| {
-        let sl = s.iter_mut().find(|sl| sl.used && !sl.reaped && !sl.running && (any || sl.pid == want_pid))?;
-        sl.reaped = true;
-        Some((sl.pid, sl.status))
-    });
-    let Some((child, status)) = found else {
-        return crate::e(ring3::err::ECHILD);
-    };
-    if status_va != 0
-        && (!crate::user_ok(status_va, 4) || !crate::copy_to_user(status_va, &status.to_le_bytes()))
-    {
-        return crate::e(crate::err::EFAULT);
-    }
-    u64::from(child)
+    wait4_real(pid, status_va, options)
 }
 
 /// The REAL wait4 (slice 3): reap a dead child from the slot scan, or PARK
@@ -2361,33 +1759,6 @@ fn sweep_parked_roots() -> usize {
     pages
 }
 
-/// A spawn crossing came home: the shell image it ran (task slot 1's current
-/// root) and its registered `Process` row are dead. Back on the parent's CR3.
-fn release_spawn_image(pid: u32) {
-    let before = akuma_exec::pmm::free_count();
-    let root = crate::with_task_slot(1, |t| core::mem::replace(&mut t.root_pa, 0));
-    park_root(root);
-    let _ = akuma_exec::process::unregister_process(pid);
-    let _ = akuma_exec::process::reclaim::drain_retired();
-    let mut pages = sweep_parked_roots();
-    let pend = akuma_mmu::pending_ttbr_free_stats();
-    pages += akuma_mmu::drain_pending_ttbr_frees();
-    let _ = pend;
-    if cfg!(feature = "trace-err") {
-        akuma_primitives::safe_print!(
-        160,
-        "[spawn-reap] pid={} pages={} free {} -> {} heap={}K cowrefs={} cow={:?}\n",
-        pid,
-        pages,
-        before,
-        akuma_exec::pmm::free_count(),
-        akuma_alloc::allocated_bytes() / 1024,
-        akuma_pmm::cow_ref_count(),
-        crate::cow_stats()
-    );
-    }
-}
-
 /// A reaped real child's `Process` leaves the table and its memory comes
 /// back. `unregister_process` retires the row and the drain (cooldown 0 on
 /// this kernel, `exec_twin`) drops it — `UserAddressSpace::drop` returns the
@@ -2471,72 +1842,6 @@ fn wait4_arm_blocking_scan(pid: u64, status_va: u64) -> u64 {
         return crate::e(crate::err::EFAULT);
     }
     u64::from(child)
-}
-
-/// Akuma's WAITPID (0x1000+303): `waitpid(pid, &status)`. Returns the pid
-/// with the status filled (reaped), 0 (still running — impossible here, but
-/// the honest answer for an unknown-but-plausible pid is the ABI's, not an
-/// error), or negative (no such child).
-pub fn waitpid_arm(pid: u64, status_va: u64) -> u64 {
-    let pid = pid as u32;
-    let found = SLOTS.with(|s| s.iter().find(|sl| sl.used && sl.pid == pid).map(|sl| sl.status));
-    let Some(status) = found else {
-        return 0; // "still running": the bridge polls until teardown
-    };
-    if status_va != 0
-        && (!crate::user_ok(status_va, 4) || !crate::copy_to_user(status_va, &status.to_le_bytes()))
-    {
-        return crate::e(crate::err::EFAULT);
-    }
-    u64::from(pid)
-}
-
-/// Akuma's CLOSE_CHILD_STDIN (0x1000+326): deliver EOF to the child's
-/// stdin. There is no stdin path here — the buffer model has no reader to
-/// signal, and a command that read stdin would already have seen EOF.
-/// Success is the honest answer: from the bridge's point of view the EOF
-/// was delivered.
-pub fn close_stdin_arm(_pid: u64) -> u64 {
-    0
-}
-
-/// poll(2) readiness for a ChildOut fd: `(has_data, gone)` — the buffer's
-/// two facts, asked by `sock.rs::fd_events` and `epoll.rs::fd_state`. `gone`
-/// is the child no longer running: a running child with an empty buffer is
-/// "nothing yet", a gone child with an empty buffer is EOF (the read path's
-/// `Ok(0)`), and that difference is the whole point — without it a
-/// poll/epoll waiter can never see the EOF edge (`epoll.rs` maps it to
-/// `ChildStdout { channel_gone, has_data }`, whose gone arm is the HUP).
-pub(crate) fn child_out_state(slot_idx: usize) -> (bool, bool) {
-    with_slots(|s| {
-        s.get(slot_idx).map_or((false, true), |slot| (!slot.out.is_empty(), !slot.running))
-    })
-}
-
-/// Drain the pipe behind `slot_idx` into the task's buffer: up to
-/// `len` bytes from the front, then (buffer empty, child long gone) EOF.
-pub fn read_child_out(slot_idx: usize, buf_va: u64, len: u64) -> u64 {
-    if len == 0 || !crate::user_ok(buf_va, len) {
-        return crate::e(crate::err::EFAULT);
-    }
-    let drained = with_slots(|s| {
-        let slot = s.get_mut(slot_idx)?;
-        let n = (len as usize).min(slot.out.len());
-        let head: Vec<u8> = slot.out[..n].to_vec();
-        slot.out.drain(..n);
-        Some(head)
-    });
-    let Some(head) = drained else {
-        return crate::e(crate::err::EBADF);
-    };
-    let n = head.len();
-    if n == 0 {
-        return 0; // drained: EOF, the same thing a real pipe reports
-    }
-    if !crate::copy_to_user(buf_va, &head) {
-        return crate::e(crate::err::EFAULT);
-    }
-    n as u64
 }
 
 /// The `net` module's clock is the only time source; re-exported read for

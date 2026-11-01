@@ -370,7 +370,6 @@ pub(crate) fn fd_state(fd: i32, requested: u32, depth: u32) -> FdState {
         return FdState::Missing;
     }
     let mut sidx = usize::MAX;
-    let mut cout = usize::MAX;
     let mut efd = usize::MAX;
     let mut eslot = usize::MAX;
     let mut pipe = (0u32, false);
@@ -383,10 +382,6 @@ pub(crate) fn fd_state(fd: i32, requested: u32, depth: u32) -> FdState {
             }
             crate::OpenFile::File { .. } | crate::OpenFile::Dir { .. } => 2,
             crate::OpenFile::Null | crate::OpenFile::Random | crate::OpenFile::Session => 3,
-            crate::OpenFile::ChildOut(i) => {
-                cout = *i;
-                4
-            }
             crate::OpenFile::Pipe(id, is_write) => {
                 pipe = (*id, *is_write);
                 5
@@ -431,10 +426,6 @@ pub(crate) fn fd_state(fd: i32, requested: u32, depth: u32) -> FdState {
         }
         Some(2) => FdState::Unmodelled,
         Some(3) => FdState::Sink,
-        Some(4) => {
-            let (has_data, gone) = crate::child::child_out_state(cout);
-            FdState::ChildStdout { channel_gone: gone, has_data }
-        }
         Some(5) => {
             if pipe.1 {
                 FdState::PipeWrite { can_write: crate::pipes::writable(pipe.0) }

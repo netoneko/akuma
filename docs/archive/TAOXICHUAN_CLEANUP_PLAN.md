@@ -94,6 +94,26 @@ crates are dropped.
 | 2h | X9, X10 | slab/hole placement into `akuma-mmap`; thread/root lifetime into `akuma-exec`; the FPU save pair into `akuma-fpu-amd64`; `ring.rs` into `akuma-primitives` | ~300 |
 | 2i | pm S7 | sweep: `taoxichuan/docs/`, diagrams, dead types; regenerate `crate-safety.md` with `scripts/cloc_akuma.py` | rest |
 
+**2b and 2c's fd families are one step (decided 2026-11-01, after batch A).** Inventory: about 70 `with_fds` sites and 130
+`OpenFile` references, almost all inside the arms glue already implements (read/write/open/stat/dup/pipe/socket/poll/epoll/
+eventfd/…). Porting them to the shared table and then deleting them is wasted work. And four `OpenFile` kinds are backed by
+Taoxichuan's own tables (pipes, eventfd, epoll, socketpair-as-two-pipes), where glue keeps its own. amd64's lesson is that two
+instances are two id spaces: a folded `close` closed the wrong pipe. So the table flips and the whole fd family folds in one change:
+
+- **Already in place:** every registered process has `fds: Arc<SharedFdTable>` built `with_stdio()`, and `fork_process`
+  deep-clones it. Glue writes `Stdout`/`Stderr` through the process channel or the console. Glue's pipe waits wake through
+  `akuma-exec`'s `WakeHandle`, which the threading twin implements.
+- **Folds to glue:** read/write/readv/writev/pread64/pwrite64, open/openat/close/lseek, fstat/newfstatat/stat/lstat/statfs/fstatfs,
+  getdents64, fcntl, dup/dup2/dup3, pipe2, socketpair, all socket calls, poll/ppoll/select/pselect6, epoll_*, eventfd2,
+  truncate/ftruncate, fsync/fdatasync, flock, utimensat, faccessat/access, the `*at` path calls, fchmod*/fchown*, umask,
+  getcwd/chdir/fchdir, ioctl, copy_file_range, sendfile.
+- **Stays local but reads the shared table:** file-backed `mmap` (fd -> `KernelFile` `(mount_id, inode)`), exec's close-on-exec sweep,
+  the exit sweep, the private `SPAWN` (`ChildOut` becomes `FileDescriptor::ChildStdout` until S3 deletes it), and every local path
+  user that needs the cwd (exec), which moves to `Process.cwd`.
+- **Deleted:** `OpenFile`, `with_fds`, the `Task` fd fields, most of `sock.rs`, `pipes.rs`, `epoll.rs`, and the fd arms in `main.rs`.
+- **Gate:** the battery + goose, plus the epoll/eventfd/tokio probe (`nettest-reqwest`, both runtimes) and `apk add`. Then the ryzen
+  fixed point before anything else lands on top.
+
 Risks carried over from amd64: glue takes the BKL-shaped guards (`NetBklGuard`) and expects the exec runtime hooks
 Taoxichuan's `exec_twin.rs` registers. Check those before 2c's first batch, not after. A per-family divergence that
 Taoxichuan has and glue lacks (its `O_APPEND`-at-open, its `sendmsg` per-iovec datagrams, `ENOPROTOOPT` for unknown socket
@@ -141,7 +161,8 @@ passes `epoch=`. Without it the guest clock reads 1970 and every TLS client refu
 | plan | `9c44ba87` | - | phase 2 replays amd64's glue adoption instead of per-family crates |
 | 1e | `a29b690d` | 12,137 -> 12,144 | socket released by its last name only (`dup2`, exec sweeps); `tcg_rig.py battery [goose]`: 10/10 PASS, 0 faults |
 | 2a | `dcfe2c20` | 12,144 -> 12,169 | `akuma-vfs-glue` mount table created, its hooks installed, the ext2 root mounted at `/` as the same `Arc` `root_fs()` borrows. Nothing resolves through it yet. Image +32 KB (1,592,120 -> 1,624,112 bytes); battery 9/9 PASS, 0 faults |
-| 2c-0 + batch A | (this commit) | 12,169 -> 12,167 | **Glue is live on Taoxichuan.** Prerequisites: `akuma-syscalls-glue` + `akuma-user-access` deps; glue's `SyscallHooks` and the RNG hook registered beside the vfs-glue mount; the page-fault handler gains amd64's two ring-0 arms (a write to a present user page breaks CoW from **either** ring, since glue writes user memory directly under `CR0.WP`; a fault inside the shared copy loop resumes at `user_copy_fixup`'s `EFAULT` trampoline). `served_by_glue` is the folded set, checked after the legacy fold. Batch A: `uname`, `sethostname`/`setdomainname` (new), `getpid`/`getppid`/`gettid`, the uid/gid four, `getsid`/`setsid`/`getpgid`/`setpgid`, `sched_getaffinity`, `getrandom`, `membarrier`, `sync`/`syncfs`, plus `sysinfo`/`getrusage`/`getgroups`/`times` (new). Stubs that got real answers: `getppid` was always 1, `getsid`/`getpgid` echoed the pid, `sched_getaffinity` reported one CPU. `uname` now says `Akuma akuma 0.0.8 <sha>-release x86_64`, as amd64 and AArch64 do. `prlimit64` stays local: glue answers `RLIMIT_STACK` from `ExecConfig.user_stack_size` (64 KiB here), which `fork_process` also uses to size the stack copy; revisit at 2e. Image 1.62 -> 2.63 MB: glue is linked whole the first time an arm uses it, and the deletions are what pay it back. Battery 9/9 + goose, 0 faults. `free` stops at `/proc/meminfo` (no `/proc` mounted; was ENOSYS earlier) |
+| 2c-0 + batch A | `74962ae5` | 12,169 -> 12,167 | **Glue is live on Taoxichuan.** Prerequisites: `akuma-syscalls-glue` + `akuma-user-access` deps; glue's `SyscallHooks` and the RNG hook registered beside the vfs-glue mount; the page-fault handler gains amd64's two ring-0 arms (a write to a present user page breaks CoW from **either** ring, since glue writes user memory directly under `CR0.WP`; a fault inside the shared copy loop resumes at `user_copy_fixup`'s `EFAULT` trampoline). `served_by_glue` is the folded set, checked after the legacy fold. Batch A: `uname`, `sethostname`/`setdomainname` (new), `getpid`/`getppid`/`gettid`, the uid/gid four, `getsid`/`setsid`/`getpgid`/`setpgid`, `sched_getaffinity`, `getrandom`, `membarrier`, `sync`/`syncfs`, plus `sysinfo`/`getrusage`/`getgroups`/`times` (new). Stubs that got real answers: `getppid` was always 1, `getsid`/`getpgid` echoed the pid, `sched_getaffinity` reported one CPU. `uname` now says `Akuma akuma 0.0.8 <sha>-release x86_64`, as amd64 and AArch64 do. `prlimit64` stays local: glue answers `RLIMIT_STACK` from `ExecConfig.user_stack_size` (64 KiB here), which `fork_process` also uses to size the stack copy; revisit at 2e. Image 1.62 -> 2.63 MB: glue is linked whole the first time an arm uses it, and the deletions are what pay it back. Battery 9/9 + goose, 0 faults. `free` stops at `/proc/meminfo` (no `/proc` mounted; was ENOSYS earlier) |
+| 2e (S3, first half) | (this commit) | 12,167 -> 11,408 | **The private spawn path is deleted.** `SPAWN`, `WAITPID`, `CLOSE_CHILD_STDIN` (nothing on the image uses them: sshd is the `linux-abi` build), `exec_replace` and `exec_return` (reachable only from a `SPAWN` child), `fork_arm_blocking` and the `REAL_FORK` switch (true since session pq), `fork_share_memory`, `release_spawn_image`, the `ChildOut` fd kind with its read, poll and epoll arms, and the crossing record's two parent-resume fields. Done before the fd flip because every one of these copied or swept fds. Found by the compiler: the crate denies dead code, so removing the three dispatch arms named the rest. `child.rs` 2,628 -> 1,933. Battery 9/9 + goose, 0 faults; clippy 18 warnings (was 19) |
 
 ## Background
 

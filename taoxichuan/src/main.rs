@@ -1084,9 +1084,6 @@ pub(crate) enum OpenFile {
     /// A TCP/UDP socket: `akuma_net`'s socket-table index. `sock.rs` serves
     /// every access through it.
     Socket(usize),
-    /// A spawned child's stdout buffer: `child.rs`'s spawn-slot index.
-    /// Drained by `read`, then EOF — a pipe that is just a buffer.
-    ChildOut(usize),
     /// A pipe end (M3): the `akuma-pipes` table's id and which end this fd
     /// names. Unlike the index payloads, the id is a *counted* kernel
     /// resource — every dup/fork copy bumps it (`pipes::clone_ref`), every
@@ -2367,7 +2364,7 @@ fn fstat_fd(fd: u64, buf: u64) -> u64 {
         // The type bits are what callers decide on: git's `index-pack` asks
         // `fstat_size(0)` and only trusts the byte count for a REGULAR file -
         // a pipe that stats as one made every piped pack "junk at the end".
-        OpenFile::Pipe(..) | OpenFile::ChildOut(_) => Some((0, 0, 3)),
+        OpenFile::Pipe(..) => Some((0, 0, 3)),
         OpenFile::Socket(_) | OpenFile::Pair(..) => Some((0, 0, 4)),
         OpenFile::Null | OpenFile::Random => Some((0, 0, 5)),
         _ => Some((0, 0, 2)),
@@ -2404,7 +2401,6 @@ fn clone_desc(d: &OpenFile) -> OpenFile {
             cursor: *cursor,
         },
         OpenFile::Socket(i) => OpenFile::Socket(*i),
-        OpenFile::ChildOut(i) => OpenFile::ChildOut(*i),
         OpenFile::Pipe(id, w) => OpenFile::Pipe(*id, *w),
         OpenFile::Pair(r, w) => OpenFile::Pair(*r, *w),
         OpenFile::EventFd(i) => OpenFile::EventFd(*i),
@@ -2509,10 +2505,6 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
         let mut pipe_id: usize = usize::MAX;
         let kind = with_fds(|t| t.with(fd as u32, |d| match d {
             OpenFile::Socket(_) => 1,
-            OpenFile::ChildOut(slot) => {
-                slot_idx = *slot;
-                2
-            }
             OpenFile::EventFd(slot) => {
                 slot_idx = *slot;
                 3
@@ -2535,7 +2527,6 @@ fn read_fd_arm(fd: u64, buf_va: u64, len: u64) -> u64 {
                 return if copy_to_user(buf_va, &tmp) { len } else { e(ring3::err::EFAULT) };
             }
             Some(1) => return sock::read_arm(fd, buf_va, len),
-            Some(2) => return child::read_child_out(slot_idx, buf_va, len),
             Some(3) => return eventfd_read_arm(slot_idx, buf_va),
             Some(4) => {
                 // O_NONBLOCK: an empty pipe/socketpair with live writers answers
@@ -3940,7 +3931,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                         used += rl;
                     }
                 }
-                OpenFile::File { .. } | OpenFile::Socket(_) | OpenFile::ChildOut(_)
+                OpenFile::File { .. } | OpenFile::Socket(_)
                 | OpenFile::EventFd(_) | OpenFile::Null | OpenFile::Random | OpenFile::Session
                 | OpenFile::Pair(..) | OpenFile::Epoll(_) => {
                     res = Err(ring3::err::ENOTDIR);
@@ -4535,14 +4526,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // the established dial away.
             sock::getsockopt_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5())
         }
-        ring3::nr::SPAWN => child::spawn_arm(fr),
         // CLONE/FORK/VFORK + WAIT4 (stage 8, process-model M2): the blocking
         // fork and the real reap — the arms busybox ash needs to run any
         // non-final command of a list. child.rs's M2 scaffold.
         ring3::nr::CLONE | 57 | 58 => child::fork_arm(fr),
         ring3::nr::WAIT4 => child::wait4_arm(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
-        ring3::nr::WAITPID => child::waitpid_arm(fr.arg1(), fr.arg2()),
-        ring3::nr::CLOSE_CHILD_STDIN => child::close_stdin_arm(fr.arg1()),
         ring3::nr::GETTIMEOFDAY => {
             // Same clock as CLOCK_GETTIME (stage 8, M1): with an `epoch=`
             // anchor in the offset store, tv is wall time; without one
@@ -4576,10 +4564,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             if child::is_real_task() {
                 return child::exec_real_task(fr);
             }
-            if !child::nested_active() {
-                return e(ring3::err::ENOSYS);
-            }
-            child::exec_replace(fr)
+            e(ring3::err::ENOSYS)
         }
         ring3::nr::EVENTFD2 => {
             // libcurl's multi-stack wakeup fd (stage 8 session Q): created
@@ -4974,27 +4959,6 @@ fn release_cloned_prefix(dst: phys::Frame, upto: usize) {
             dst.set_entry(j, 0);
         }
     }
-}
-
-pub(crate) fn fork_share_memory(parent_root: u64) -> Option<u64> {
-    let root = phys::Frame::alloc_zeroed()?;
-    // The kernel half is shared by the PML4 copy and must NOT be walked: its
-    // physmap subtree names every physical address the 64 GiB window covers,
-    // holes included, and a leaf copy there would read frames above RAM. The
-    // new root is not live until fork's CR3 load.
-    copy_kernel_half(root);
-    // SAFETY: the forking parent is parked and its root is a page-table frame;
-    // single core, IF clear.
-    let src = unsafe { phys::Frame::from_pa(parent_root) };
-    if clone_user_half_into(src, root).is_none() {
-        akuma_pmm::free_page(root.pa() as usize, akuma_primitives::preempt::current_tid() as u32);
-        return None;
-    }
-    // The fork demoted the PARENT's live writable leaves: a peer running another
-    // thread of the parent's space must not keep writing through a stale
-    // writable translation (a write into the shared frame, silently).
-    smp::shootdown();
-    Some(root.pa())
 }
 
 /// One page-table level of [`fork_share_memory`]'s clone: `depth` counts the

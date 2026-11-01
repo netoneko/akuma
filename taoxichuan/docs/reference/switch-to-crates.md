@@ -63,7 +63,7 @@ kind of code in `amd64/src/sched.rs` and `exec_runtime.rs`).
 | S0 | baseline battery on the merge tree | — | full battery green | — |
 | S1 | init registered as pid 1 with a real slot (twin of `run_init`) | 0 | battery + `[init] registered pid=1` | `INIT_AS_PROCESS` |
 | S2 | wait4 → crate-owned park/wake over the process table; `PARENT_OF` deleted | ~165 L | PK1, P1-P5, F1, grandfork step 5 = ECHILD | `WAIT_VIA_CRATE` |
-| S3 | sshd → `linux-abi`; the M2 crossing and the private syscalls die; clone → `fork_process` | ~700 L | ssh `sh -c`, apk add curl, curl HTTPS — first crossing-free apk boot | `SSHD_LINUX_ABI` |
+| S3 | sshd → `linux-abi`; the M2 crossing and the private syscalls die; clone → `fork_process` | ~700 L | ssh `sh -c`, apk add curl, curl HTTPS — first crossing-free apk boot | `SSHD_LINUX_ABI` — **2026-11-01: the private `SPAWN`/`WAITPID`/`CLOSE_CHILD_STDIN`, `exec_replace`, the blocking fork, `ChildOut` and `REAL_FORK` are deleted (−765 L, `TAOXICHUAN_CLEANUP_PLAN.md`); the slot ring and the crossing records real tasks still use remain** |
 | S4 | boot programs become fork+exec children of init; boot-task arms die; `PREEMPT_ARMED` re-derived | ~150 L | stage 1-3 lines + battery | `INIT_FORKS_PROGS` |
 | S5 | `load_task` re-based on `akuma-elf-exec`'s decisions (PT_INTERP; stage-8 enabler) | ~200 L net | hello, F1, apk, curl | `LOAD_VIA_CRATE` |
 | S6 | dispatcher two-table shape via `akuma-syscalls-abi` + glue (stage-9 enabler) | duplicated arms | battery + disjointness self-check | `GLUE_DISPATCH` |
