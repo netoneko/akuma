@@ -185,7 +185,7 @@ Rows of the table below for calls served by glue are historical until the sweep
 | 200 | tkill | `tkill_arm` (main.rs) | no delivery: a blocked poll/pipe read of that thread answers EINTR | what cargo's jobserver needs; signal 0 probes |
 | 202 | futex | `futex::sys_futex` (futex.rs) | `akuma-syscalls-sync` WaiterTable/op algebra | WAIT/WAKE/WAIT_BITSET/REQUEUE/WAKE_OP, private + shared, timeouts |
 | 234 | tgkill | `tkill_arm` (main.rs) | as tkill | same |
-| 203 | sched_getaffinity | dispatch (main.rs) | one CPU, mask = 1 | the toolchain's thread-count probe |
+| 203 | sched_getaffinity | glue (`served_by_glue`) | `probed_core_count` hook = `smp::online_cpus` | the toolchain's and tokio's thread-count probe; `smp=N` reports N |
 | 302 | prlimit64 | glue | as getrlimit; sets accepted-ignored | musl's pthread stack sizing |
 | 306 | syncfs | dispatch (main.rs) | `root_fs().sync()` | as sync |
 | 331 | membarrier | `membarrier_arm` (main.rs) | `akuma-syscalls-mem::membarrier` command probing | queries served; no global barrier needed on one core |

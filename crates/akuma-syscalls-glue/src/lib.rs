@@ -1003,16 +1003,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             let cpusetsize = args[1] as usize;
             if cpusetsize >= CPU_SET_WORD_BYTES && validate_user_ptr(mask_ptr as u64, cpusetsize) {
                 let mut kernel_mask = alloc::vec![0u8; cpusetsize];
-                // CPUs the process may run on. On the real shared-kernel SMP
-                // build that is the DTB-reported core count (BSP + secondaries,
-                // all online after `bringup_secondaries`); single-core builds
-                // report 1. The old code hardcoded `1`, so `busybox nproc` and
-                // cargo's `num_cpus` always saw one CPU and `cargo build`
-                // defaulted to `-j1` even on an SMP=2+ kernel.
-                #[cfg(kernel_smp_shared)]
+                // CPUs the process may run on: the kernel's `probed_core_count`
+                // hook. The AArch64 shared-kernel SMP build answers the
+                // DTB-reported core count (BSP + secondaries, all online after
+                // `bringup_secondaries`) and its single-core builds answer 1;
+                // Taoxichuan answers its online count. The old code hardcoded
+                // `1`, so `busybox nproc` and cargo's `num_cpus` always saw one
+                // CPU and `cargo build` defaulted to `-j1` even on an SMP=2+
+                // kernel. Until 2026-11-01 the hook was read only under
+                // `kernel_smp_shared`, which Taoxichuan does not build glue
+                // with, so tokio started one worker there at `smp=4`.
                 let nr_cpus: usize = crate::hooks::probed_core_count();
-                #[cfg(not(kernel_smp_shared))]
-                let nr_cpus: usize = 1;
                 let mask: u64 = if nr_cpus >= CPU_SET_BITS_PER_WORD {
                     u64::MAX
                 } else {
@@ -1393,7 +1394,7 @@ pub fn set_hooks(h: SyscallHooks) {
 }
 
 /// Which of these has a caller depends on the feature set — the rump five need
-/// `rump`, `probed_core_count` needs `smp-shared` — so the parity surface is
+/// `rump` — so the parity surface is
 /// deliberately wider than any single configuration uses. Same argument the
 /// virtio-audio stub carried: the syscall layer compiles unchanged either way.
 #[allow(dead_code)]
