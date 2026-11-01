@@ -182,6 +182,7 @@ mod imp {
         let device = probe::probe_with(probe::device_id::SOUND, |i, transport| {
             crate::safe_print!(48, "[SND] Found virtio-snd at slot {}\n", i);
 
+            let transport = SteppedMmioTransport::over(&transport)?;
             let Ok(mut snd) = VirtIOSound::<VirtioHal, SteppedMmioTransport<'static>>::new(transport) else {
                 akuma_primitives::console::print_str("[SND] Failed to init virtio-snd device\n");
                 return None;

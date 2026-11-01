@@ -78,6 +78,7 @@
     "crates/akuma-user-walk",
     "crates/akuma-vfs",
     "crates/akuma-vfs-glue",
+    "crates/akuma-virtqueue",
     "crates/akuma-vm-spec",
     "crates/akuma-wifi",
     "crates/akuma-wpa",
@@ -113,7 +114,7 @@
     "crates/akuma-trap-amd64": 2,
     "crates/akuma-uart": 1,
     "crates/akuma-user-access": 20,
-    "crates/akuma-virtio": 12,
+    "crates/akuma-virtio": 17,
     "taoxichuan/src": 35
   }
 }

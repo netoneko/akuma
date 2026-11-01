@@ -8,16 +8,16 @@ description = "Shared virtio scaffolding for no_std kernels: the DMA HAL, MMIO d
 workspace = true
 
 [dependencies]
-# The `Hal` trait this crate implements, plus the transport/device types the
-# probe helper and the drivers are written against. Must stay on the same
-# version the kernel and akuma-net use, or the `Hal` impl here does not satisfy
-# *their* `virtio_drivers::Hal` bound — the types would be from distinct crates.
-virtio-drivers = { version = "0.13", default-features = false }
+# virtio-sound only (`sound`): blk and net are driven in-tree over
+# `akuma-virtqueue`. With it go zerocopy, safe-mmio, bitflags 2 and thiserror.
+virtio-drivers = { version = "0.13", default-features = false, optional = true }
+# The split virtqueue, the register map and the blk/net wire formats.
+akuma-virtqueue = { path = "../akuma-virtqueue" }
 spinning_top = "0.3"
 # Only for the `Transport` trait bounds on read/write_config_space, which
 # virtio-drivers 0.13 states in terms of zerocopy traits. Must match the version
 # virtio-drivers itself uses, or the bounds refer to different traits.
-zerocopy = { version = "0.8", default-features = false }
+zerocopy = { version = "0.8", default-features = false, optional = true }
 # The DMA `Hal` needs kernel phys<->virt translation, the probe needs the virtio
 # MMIO window base, and `block` needs `PreemptGuard`. All three used to come from
 # `akuma-exec`, which meant `akuma-net -> akuma-virtio -> akuma-exec` kept the net
@@ -30,7 +30,7 @@ akuma-dma = { path = "../akuma-dma" }
 # The virtio-snd driver. Off by default: it needs virtio-drivers' `alloc`
 # feature, which gates that crate's `sound` module. Forwarded from the kernel's
 # own `sound` feature.
-sound = ["virtio-drivers/alloc"]
+sound = ["dep:virtio-drivers", "virtio-drivers/alloc", "dep:zerocopy"]
 
 # The machine has no virtio-sound device, so `sound` must be *subtracted* even
 # though it is in the kernel's default feature set.

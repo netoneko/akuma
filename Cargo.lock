@@ -68,7 +68,6 @@ dependencies = [
  "smoltcp",
  "spinning_top",
  "talc",
- "virtio-drivers",
 ]
 
 [[package]]
@@ -569,7 +568,6 @@ dependencies = [
  "log",
  "smoltcp",
  "spinning_top",
- "virtio-drivers",
 ]
 
 [[package]]
@@ -584,7 +582,6 @@ dependencies = [
  "akuma-virtio",
  "smoltcp",
  "spinning_top",
- "virtio-drivers",
 ]
 
 [[package]]
@@ -1009,10 +1006,15 @@ version = "0.1.0"
 dependencies = [
  "akuma-dma",
  "akuma-primitives",
+ "akuma-virtqueue",
  "spinning_top",
  "virtio-drivers",
  "zerocopy",
 ]
+
+[[package]]
+name = "akuma-virtqueue"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-vm-spec"

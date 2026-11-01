@@ -102,11 +102,9 @@ akuma-net-nic = { path = "../akuma-net-nic" }
 # incident-driven rules have host tests instead of only a devbox boot.
 # See crates/akuma-net-yarn/src/lib.rs.
 akuma-net-yarn = { path = "../akuma-net-yarn" }
-# The shared `Hal` impl and MMIO probe. Both used to be duplicated here — see
-# akuma-virtio's hal.rs for why this crate no longer carries its own.
+# The virtio-net driver and the MMIO probe (`smoltcp_net::init` finds NIC0).
 akuma-virtio = { path = "../akuma-virtio" }
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
-virtio-drivers = { version = "0.13", default-features = false }
 embedded-io-async = { version = "0.6", default-features = false }
 spinning_top = "0.3"
 # NOT `max_level_off`: that feature elides every `log::` macro at COMPILE time,

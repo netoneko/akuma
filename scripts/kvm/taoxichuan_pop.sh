@@ -86,6 +86,7 @@ boot() {
     qemu-system-x86_64 -M microvm,accel=kvm -enable-kvm -cpu host -smp "$SMP" -m "$MEM" \
         -kernel "$KERNEL" -append "$cl" -nodefaults -no-reboot -display none \
         -serial "file:$RUN/console.log" \
+        -global virtio-mmio.force-legacy=false \
         -drive "file=$OVERLAY,format=qcow2,if=none,id=d0,cache=unsafe" \
         -device virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0 \
         -netdev "user,id=n0,hostfwd=tcp::$PORT-:22" \

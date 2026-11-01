@@ -35,9 +35,8 @@ akuma-cpu = { path = "../akuma-cpu" }
 akuma-rump = { path = "../akuma-rump", optional = true }
 akuma-net-rtl8169 = { path = "../akuma-net-rtl8169", optional = true }
 spinning_top = "0.3"
-# The shared virtio Hal + MMIO probe.
+# The virtio-net driver (`akuma_virtio::net::NetRaw`) and the MMIO probe.
 akuma-virtio = { path = "../akuma-virtio" }
-virtio-drivers = { version = "0.13", default-features = false }
 # This crate owns the `smoltcp::phy::Device` impls, so it depends on smoltcp.
 # That is deliberate — see the crate docs' "Why smoltcp is here".
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"] }

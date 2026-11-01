@@ -10,7 +10,7 @@
 //! | counter family | what it isolates |
 //! |---|---|
 //! | `rx_*`   | posting a receive buffer (an MMIO notify → vmexit) and completing one |
-//! | `tx_*`   | `VirtIONetRaw::send`, which is `add_notify_wait_pop` — a **blocking** spin until the host consumes the descriptor, executed with `NETWORK` held and IRQs masked |
+//! | `tx_*`   | `NetRaw::send`, which is `add_notify_wait_pop` — a **blocking** spin until the host consumes the descriptor, executed with `NETWORK` held and IRQs masked |
 //! | `poll_*` | a whole `smoltcp_net::poll()`, so device time can be subtracted from stack time |
 //! | `relax_*`| how often a blocked socket parked in `blocking_relax` (WFI), whose only wakeup is the timer tick — there is no virtio-net IRQ |
 //!
@@ -56,7 +56,7 @@ pub struct NicStat {
     pub tx_pkts: u64,
     /// Bytes in those frames.
     pub tx_bytes: u64,
-    /// Cumulative µs blocked inside `VirtIONetRaw::send`. **This is the one to
+    /// Cumulative µs blocked inside `NetRaw::send`. **This is the one to
     /// watch**: it is spent with `NETWORK` held and IRQs masked.
     pub tx_us: u64,
     /// Worst single `send` in µs.

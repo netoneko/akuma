@@ -1,5 +1,5 @@
-//! Shared virtio scaffolding: the DMA HAL, MMIO device probing, and the
-//! virtio-mmio device drivers.
+//! Shared virtio scaffolding: MMIO device probing, the virtio-mmio transport,
+//! and the device drivers.
 //!
 //! This crate exists to hold the pieces every virtio consumer needs, which were
 //! previously duplicated between the kernel bin crate and `akuma-net` —
@@ -38,29 +38,36 @@ macro_rules! impl_display {
     };
 }
 
-pub mod hal;
+pub mod mmio;
 pub mod probe;
+mod ring;
+
+// `virtio-drivers`, its `Hal` and the stepped-status wrapper around its
+// transport: kept only for virtio-sound. Without `sound`, neither it nor
+// `zerocopy`/`safe-mmio`/`bitflags` 2/`thiserror` is compiled.
+#[cfg(feature = "sound")]
+pub mod hal;
+#[cfg(feature = "sound")]
 pub mod transport;
 
 // The virtio-mmio device drivers. These lived in the kernel bin crate until they
-// followed the `Hal` and the probe loop they all shared into this one.
+// followed the probe loop they all shared into this one. `block` and `net` are
+// driven in-tree over `akuma-virtqueue` (2026-11-01).
 pub mod block;
+pub mod net;
 pub mod rng;
 pub mod audio;
 
+#[cfg(feature = "sound")]
 pub use hal::VirtioHal;
 pub use probe::{device_id, num_slots, slot_addr, slot_addrs};
 
-/// The virtio-mmio transport every driver in this tree is built on.
+/// The virtio-mmio transport every in-tree driver is built on.
 ///
-/// A thin wrapper over `virtio_drivers`' `MmioTransport` that steps the device
-/// status register one milestone at a time, because Firecracker validates the
-/// virtio 1.0 §3.1.1 sequence strictly while QEMU does not. Read
-/// `transport`'s module header before changing anything here.
-/// `'static` because the MMIO region is the kernel's permanent device mapping —
-/// virtio-drivers 0.13's `MmioTransport` borrows that region rather than holding
-/// a raw pointer, and it outlives every driver built on it.
-pub type VirtioTransport = transport::SteppedMmioTransport<'static>;
+/// Its status writes step one milestone at a time, because Firecracker validates
+/// the virtio 1.0 §3.1.1 sequence strictly while QEMU does not.
+pub type VirtioTransport = mmio::Transport;
+#[cfg(feature = "sound")]
 pub use transport::SteppedMmioTransport;
 
 /// The tree's one heap-free print macro, re-exported so this crate's

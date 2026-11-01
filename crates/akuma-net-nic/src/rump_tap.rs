@@ -7,7 +7,7 @@
 //! TCP/IP stack over it.
 //!
 //! This module is the **hardware** half: it implements [`akuma_rump::RawNic`]
-//! over virtio-drivers' `VirtIONetRaw` (real DMA via [`akuma_virtio::VirtioHal`]) and owns the
+//! over `akuma_virtio::net::NetRaw` (real DMA into the caller's frame buffers) and owns the
 //! global instance. The **device-independent** orchestration — NIC selection,
 //! the RX two-phase state machine, the malformed-length bounds guard — lives in
 //! the `akuma-rump` crate, where it is unit-tested on the host with a mock NIC.
@@ -19,16 +19,14 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use spinning_top::Spinlock;
-use virtio_drivers::device::net::VirtIONetRaw;
-use akuma_virtio::VirtioTransport;
-use akuma_virtio::VirtioHal;
+use akuma_virtio::net::NetRaw;
 use akuma_rump::{NicError, RawNic, TapNic};
 
 /// The real raw NIC: a virtio-net device driven without buffer management.
-/// Wraps the `unsafe` `VirtIONetRaw` calls in the safe [`RawNic`] trait so the
+/// Wraps the `unsafe` `NetRaw` calls in the safe [`RawNic`] trait so the
 /// `akuma-rump` orchestration (and its host tests) need no virtio knowledge.
 struct VirtioRawNic {
-    inner: VirtIONetRaw<VirtioHal, VirtioTransport, 16>,
+    inner: NetRaw,
 }
 
 impl VirtioRawNic {
@@ -78,7 +76,7 @@ pub fn init() -> Result<[u8; 6], &'static str> {
 pub fn init_at(addr: usize) -> Result<[u8; 6], &'static str> {
     let transport = akuma_virtio::probe::transport_at_slot(addr)
         .ok_or("tap: not a virtio-mmio slot, or transport init failed")?;
-    let inner = VirtIONetRaw::new(transport).map_err(|_| "tap: VirtIONetRaw init failed")?;
+    let inner = NetRaw::new(transport).map_err(|_| "tap: virtio-net init failed")?;
 
     let nic = VirtioRawNic { inner };
     let mac = nic.mac();

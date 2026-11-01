@@ -16,10 +16,10 @@ use akuma_net_nic::ExternalDevice;
 pub fn init(enable_dhcp: bool) -> Result<(), &'static str> {
     crate::safe_print!(64, "[SmolNet] Initializing network stack...\n");
 
-    let mut found_device: Option<VirtIONetRaw<VirtioHal, VirtioTransport, 16>> = None;
+    let mut found_device: Option<NetRaw> = None;
     if let Some((i, transport)) = akuma_virtio::probe::probe(akuma_virtio::device_id::NET) {
         crate::safe_print!(64, "[SmolNet] Found virtio-net at slot {i}\n");
-        if let Ok(dev) = VirtIONetRaw::new(transport) {
+        if let Ok(dev) = NetRaw::new(transport) {
             // Record the slot and its MMIO base for the IRQ handler before the
             // device is moved into `NETWORK` — afterwards it is only reachable
             // under the lock, which IRQ context must not take.

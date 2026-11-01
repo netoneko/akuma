@@ -1,0 +1,10 @@
+[package]
+name = "akuma-virtqueue"
+version = "0.1.0"
+edition = "2024"
+description = "The driver side of virtio over MMIO, pure: the virtio-mmio v2 register map and status handshake, feature negotiation, the split virtqueue (descriptor free list, available/used rings, index wrap, chain recycling) over a memory trait, and the virtio-blk / virtio-net wire formats. no_std, no dependencies, no unsafe; host-tested against a simulated device. akuma-virtio performs it on real device memory."
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -194,15 +194,16 @@ relied on for years — see `docs/archive/GICD_IROUTER_ALIASING.md`.
 ### 3.6 The virtio status handshake must be stepped
 
 Firecracker validates every write to the virtio MMIO status register against an
-exact-match transition table; QEMU just ORs the bits. `virtio-drivers` writes
-`ACKNOWLEDGE|DRIVER` in one store, which Firecracker rejects, leaving the device
-at `INIT` forever — no queues, no I/O, and a failure that presents as an ext2
+exact-match transition table; QEMU just ORs the bits. A driver that writes
+`ACKNOWLEDGE|DRIVER` in one store (as `virtio-drivers` does) is rejected, leaving the
+device at `INIT` forever — no queues, no I/O, and a failure that presents as an ext2
 hang because config reads still work.
 
-All drivers therefore go through **`akuma_virtio::VirtioTransport`**
-(`crates/akuma-virtio/src/transport.rs`), which steps the status register one
-milestone at a time. Never construct a bare `MmioTransport` for a device driver;
-read that module's header first.
+Block and net go through **`akuma_virtio::mmio::Transport`**
+(`crates/akuma-virtio/src/mmio.rs`), which writes `status::through(step)` for each
+milestone in `akuma_virtqueue::status::STEPS`. The sound driver, the one user of
+`virtio-drivers` left, goes through `SteppedMmioTransport`
+(`crates/akuma-virtio/src/transport.rs`). Never write the status register any other way.
 
 ### 3.7 The `entropy` device is not optional
 
@@ -370,9 +371,10 @@ Never write a literal upper bound for a kernel-address test.
   See `docs/archive/AKUMA_FIRECRACKER_KVM.md` §5.1. This is the only thing between
   here and an SSH session: ext2 mounts, the boot suite passes 290/0/0, userspace
   runs, and herd starts `/bin/sshd`.
-- **`virtio-drivers` must stay at 0.13+.** 0.7.5 sizes the virtio-net header by
-  `MRG_RXBUF` (10 bytes) rather than `VERSION_1` (12), which shifts every frame two
-  bytes left under Firecracker. QEMU tolerated it; Firecracker does not.
+- **The virtio-net header is 12 bytes, because `VERSION_1` is negotiated**
+  (`akuma_virtqueue::net::HEADER_LEN`), not 10 as without `MRG_RXBUF` on a legacy
+  device. `virtio-drivers` 0.7.5 got this wrong and shifted every frame two bytes
+  under Firecracker; the in-tree driver states it once.
 - ~~**Networking untested.**~~ `VIRTIO_INTID_BASE = 32` is exercised: the
   verified boot above took a DHCP lease and carried an SSH session, both of
   which require virtio-net interrupts to be delivered at that base.

@@ -358,6 +358,9 @@ Row 8 (one ELF loader, by gating `akuma-exec`'s loader and glue's `execve`/spawn
 97,853 -> **92,404** (-5,449, against -4,000 to -4,600 estimated; `embedded-io-async` went with it). Rows 5-7 and 9-11 are not done;
 9-11 are set aside for discussion. Note for row 5: `procfs` cannot go for Taoxichuan as composed - musl expands rustc's `$ORIGIN`
 RUNPATH through `readlink("/proc/self/exe")` (found by the fixed point, `43d79b7c`).
+Row 10 (in-tree virtio-blk + virtio-net, `AKUMA_VIRTIO_IN_TREE.md`), done for **every** kernel rather than Taoxichuan alone:
+92,404 -> **78,423** (-13,981 against -13,300 estimated; the in-tree drivers are `akuma-virtqueue` + about 500 lines in
+`akuma-virtio`). `virtio-drivers` remains only behind AArch64's `sound`.
 
 Headline: about **88,600** with steps 1–8, keeping `process` + `signal` (−12%). About **75,000** if step 10 is also done
 (−26%). The floor of this design, everything above, is about **72,600**. What remains at the floor (estimates, from §3b/§3c minus the rows above):

@@ -7,7 +7,7 @@
 //!
 //! # What was wrong with one buffer
 //!
-//! `VirtIONetRaw::send` — the only thing a single TX buffer permits — is
+//! `NetRaw::send` — the only thing a single TX buffer permits — is
 //! `VirtQueue::add_notify_wait_pop`:
 //!
 //! ```text
@@ -60,7 +60,7 @@ use crate::nic::Nic;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Bytes per frame slot: the 1514-byte MTU plus the virtio net header, rounded
-/// up. Also the minimum `VirtIONetRaw` will accept for a receive buffer
+/// up. Also the minimum `NetRaw` will accept for a receive buffer
 /// (`MIN_BUFFER_LEN` is 1526).
 pub const FRAME_BUF: usize = 2048;
 

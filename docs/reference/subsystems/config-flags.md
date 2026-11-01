@@ -83,7 +83,7 @@ re-add what they need. `Cargo.toml:361-369`.
 
 | Feature | Effect | Source |
 |---|---|---|
-| `sound` | virtio-sound output (`/dev/dsp`). | `Cargo.toml:321` |
+| `sound` | virtio-sound output (`/dev/dsp`). The only thing that still compiles `virtio-drivers` (and `zerocopy`, `safe-mmio`, `bitflags` 2, `thiserror`): block and net are driven in-tree (`archive/AKUMA_VIRTIO_IN_TREE.md`). | `Cargo.toml` |
 | `extreme` | Profile discriminator for build.rs (tighter IMAGE_SIZE/stack). | `Cargo.toml:337` |
 | `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. **In `default`**, so any build that doesn't pass `--no-default-features` has it. Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)`. Observe it via the `[FSCACHE]` PSTATS line. Not combinable with `extreme`. | `Cargo.toml:356` |
 | `no-tests` | Drops boot self-test suites; sets `akuma-net/small-sockets`. | `Cargo.toml:125` |

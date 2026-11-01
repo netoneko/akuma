@@ -71,6 +71,7 @@ default-members = [
     "crates/akuma-svm-amd64",
     "crates/akuma-vm-spec",
     "crates/akuma-affinity",
+    "crates/akuma-virtqueue",
     "crates/akuma-kvm-abi",
     "crates/akuma-cmos-rtc",
     "crates/akuma-syscalls",
@@ -639,10 +640,11 @@ sc-reboot = ["dep:akuma-boot", "akuma-vfs-glue/sc-reboot", "akuma-syscalls-glue/
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp", "akuma-syscalls-glue/smoltcp", "akuma-kernel-core/smoltcp", "akuma-kernel-glue/smoltcp"]
 
 # virtio-sound output driver (src/audio.rs + /dev/dsp). Enabled by default;
-# dropped by the size/extreme profiles' `--no-default-features` builds. Pulls in
-# virtio-drivers' `alloc` feature, which gates its `sound` module. Designed to be
-# small/bounded enough to opt back into `extreme` (4 MB) via `--features sound`.
-sound = ["virtio-drivers/alloc", "akuma-virtio/sound", "akuma-kernel-glue/sound"]
+# dropped by the size/extreme profiles' `--no-default-features` builds. The one
+# thing that still compiles `virtio-drivers` (through `akuma-virtio/sound`): blk
+# and net are driven in-tree. Designed to be small/bounded enough to opt back
+# into `extreme` (4 MB) via `--features sound`.
+sound = ["akuma-virtio/sound", "akuma-kernel-glue/sound"]
 
 # Use the legacy GICv2 MMIO interrupt-controller driver (src/gic.rs) instead of
 # the default GICv3 driver (src/gic_v3.rs). GICv2 works under QEMU TCG
@@ -840,7 +842,6 @@ spinning_top = "0.3"
 # and a compile-time cap cannot be undone at runtime.
 log = { version = "0.4", default-features = false }
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
-virtio-drivers = { version = "0.13", default-features = false }
 akuma-timer = { path = "crates/akuma-timer" }
 # Time syscalls (clock_gettime/settime, itimers, adjtimex) and the boot-time
 # SNTP fallback for platforms with no RTC (Firecracker) — extracted from

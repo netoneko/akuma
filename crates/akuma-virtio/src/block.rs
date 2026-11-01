@@ -2,13 +2,24 @@
 //!
 //! Provides a block device driver for virtio-blk devices with a generic
 //! sector-based read/write API suitable for filesystem implementations.
+//!
+//! The device is driven in-tree since 2026-11-01 (it was `virtio-drivers`'
+//! `VirtIOBlk`): one request at a time, three descriptors (header, data,
+//! status), busy-polled to completion. The ring, the header and the status
+//! byte are `DmaArray` statics indexed by the device's registration slot; the
+//! data is the caller's buffer, which outlives the request because the request
+//! is waited for before the call returns.
 
 
 use spinning_top::Spinlock;
-use virtio_drivers::device::blk::VirtIOBlk;
-use crate::transport::SteppedMmioTransport;
 
-use crate::hal::VirtioHal;
+use akuma_dma::DmaArray;
+use akuma_dma::align::A64;
+use akuma_virtqueue::{Buf, Layout, blk};
+
+use crate::mmio::Transport;
+use crate::ring::{Queue, Ring, phys_of};
+
 use crate::probe;
 
 // ============================================================================
@@ -16,7 +27,7 @@ use crate::probe;
 // ============================================================================
 
 /// Sector size in bytes (standard for VirtIO block devices)
-pub const SECTOR_SIZE: usize = 512;
+pub const SECTOR_SIZE: usize = blk::SECTOR_SIZE;
 
 
 // ============================================================================
@@ -50,23 +61,79 @@ impl_display!(BlockError {
 // VirtIO Block Device Wrapper
 // ============================================================================
 
+/// Entries in a block device's queue. One request is in flight at a time and
+/// takes three descriptors; eight leaves room and is accepted by every VMM.
+const QUEUE_SIZE: usize = 8;
+/// 16-bit cells of ring memory a queue of [`QUEUE_SIZE`] needs.
+const RING_WORDS: usize = Layout::new(QUEUE_SIZE).words();
+/// Where the status byte sits in a device's request statics, after the header.
+const STATUS_AT: usize = blk::HEADER_LEN;
+
+/// Each registered device's queue memory, by registration slot.
+static RINGS: [Ring<RING_WORDS>; MAX_BLOCK_DEVICES] = [const { Ring::new() }; MAX_BLOCK_DEVICES];
+/// Each registered device's request header (16 bytes) and status byte.
+static REQUESTS: [DmaArray<u8, 32, A64>; MAX_BLOCK_DEVICES] = [const { DmaArray::new() }; MAX_BLOCK_DEVICES];
+
 /// VirtIO block device wrapper.
 ///
-/// `VirtIOBlk` needs `&mut self` for read/write; the per-device Spinlock in
-/// `BLOCK_DEVICES` hands that out, so no interior mutability is needed.
+/// A request needs `&mut self`; the per-device Spinlock in `BLOCK_DEVICES`
+/// hands that out, so no interior mutability is needed.
 pub struct VirtioBlockDevice {
-    inner: VirtIOBlk<VirtioHal, SteppedMmioTransport<'static>>,
+    transport: Transport,
+    queue: Queue<QUEUE_SIZE, RING_WORDS>,
+    /// Which of [`RINGS`] and [`REQUESTS`] is this device's.
+    index: usize,
     capacity_sectors: u64,
+    read_only: bool,
 }
 
 impl VirtioBlockDevice {
-    /// Create a new VirtIO block device wrapper
-    fn new(inner: VirtIOBlk<VirtioHal, SteppedMmioTransport<'static>>) -> Self {
-        let capacity_sectors = inner.capacity();
-        Self {
-            inner,
-            capacity_sectors,
+    /// Bring the device in `transport` up on the first unclaimed ring. A ring a
+    /// failed device was given stays claimed: that device may still hold its
+    /// address.
+    fn new(mut transport: Transport) -> Result<Self, BlockError> {
+        let (index, ring) = RINGS
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| r.claim().map(|r| (i, r)))
+            .ok_or(BlockError::NotFound)?;
+        let features = transport.begin(blk::F_RO).map_err(|_| BlockError::NotFound)?;
+        let queue = Queue::setup(&mut transport, 0, ring).map_err(|_| BlockError::NotFound)?;
+        transport.driver_ok();
+        let capacity_sectors = transport.config_u64(blk::CAPACITY);
+        Ok(Self { transport, queue, index, capacity_sectors, read_only: features & blk::F_RO != 0 })
+    }
+
+    /// One request, waited for: `kind` at `sector`, over `len` bytes at `data`.
+    ///
+    /// Does not return until the device has completed the request, which is what
+    /// lets the caller's buffer be used as the data descriptor directly.
+    fn request(&mut self, kind: u32, sector: u64, data: *const u8, len: usize) -> Result<(), ()> {
+        let Ok(len) = u32::try_from(len) else { return Err(()) };
+        let req = &REQUESTS[self.index];
+        for (i, b) in blk::header(kind, sector).into_iter().enumerate() {
+            req.set(i, b);
         }
+        // Anything but S_OK reads as failure if the device never writes it.
+        req.set(STATUS_AT, 0xff);
+        #[allow(clippy::cast_possible_truncation)]
+        let bufs = [
+            Buf { addr: phys_of(req.addr() as *const u8), len: blk::HEADER_LEN as u32, device_writes: false },
+            Buf { addr: phys_of(data), len, device_writes: kind == blk::T_IN },
+            Buf { addr: phys_of(req.addr_of(STATUS_AT) as *const u8), len: 1, device_writes: true },
+        ];
+        let head = self.queue.submit(&self.transport, &bufs).map_err(|_| ())?;
+        // Spin until *this* request is back. With one request in flight nothing
+        // else can complete; an element the queue refuses (a device naming a
+        // head it was never given) frees nothing and is skipped.
+        loop {
+            match self.queue.sq.pop_used(self.queue.mem) {
+                Some(Ok((h, _))) if h == head => break,
+                Some(_) => {}
+                None => core::hint::spin_loop(),
+            }
+        }
+        if req.get(STATUS_AT) == blk::S_OK { Ok(()) } else { Err(()) }
     }
 
     /// Get the capacity in sectors (512-byte blocks)
@@ -93,17 +160,17 @@ impl VirtioBlockDevice {
         }
 
         let num_sectors = buf.len() / SECTOR_SIZE;
-        if sector + num_sectors as u64 > self.capacity_sectors {
+        if !blk::in_range(sector, num_sectors as u64, self.capacity_sectors) {
             crate::safe_print!(96, "[Block] read_sectors: sector {}+{} > capacity {}\n",
                 sector, num_sectors, self.capacity_sectors);
             return Err(BlockError::InvalidOffset);
         }
 
-        let inner = &mut self.inner;
-
-        if let Err(e) = inner.read_blocks(sector as usize, buf) {
-            crate::safe_print!(96, "[Block] read_blocks FAILED: sector={}, len={}, err={:?}\n",
-                sector, buf.len(), e);
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if self.request(blk::T_IN, sector, buf.as_mut_ptr(), buf.len()).is_err() {
+            crate::safe_print!(96, "[Block] read FAILED: sector={}, len={}\n", sector, buf.len());
             return Err(BlockError::ReadError);
         }
 
@@ -122,17 +189,20 @@ impl VirtioBlockDevice {
         }
 
         let num_sectors = buf.len() / SECTOR_SIZE;
-        if sector + num_sectors as u64 > self.capacity_sectors {
+        if !blk::in_range(sector, num_sectors as u64, self.capacity_sectors) {
             crate::safe_print!(96, "[Block] write_sectors: sector {}+{} > capacity {}\n",
                 sector, num_sectors, self.capacity_sectors);
             return Err(BlockError::InvalidOffset);
         }
 
-        let inner = &mut self.inner;
-
-        if let Err(e) = inner.write_blocks(sector as usize, buf) {
-            crate::safe_print!(96, "[Block] write_blocks FAILED: sector={}, len={}, err={:?}\n",
-                sector, buf.len(), e);
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if self.read_only {
+            return Err(BlockError::WriteError);
+        }
+        if self.request(blk::T_OUT, sector, buf.as_ptr(), buf.len()).is_err() {
+            crate::safe_print!(96, "[Block] write FAILED: sector={}, len={}\n", sector, buf.len());
             return Err(BlockError::WriteError);
         }
 
@@ -270,7 +340,7 @@ pub fn init() -> Result<(), BlockError> {
     let mut registered = 0usize;
 
     // Find virtio-blk devices. `probe_each` visits every matching slot; a slot
-    // whose `VirtIOBlk::new` fails is logged and skipped, not fatal.
+    // whose device fails to come up is logged and skipped, not fatal.
     probe::probe_each(probe::device_id::BLOCK, |i, transport| {
         if registered >= MAX_BLOCK_DEVICES {
             crate::safe_print!(96, "[Block] slot {i}: device table full ({MAX_BLOCK_DEVICES}), ignoring\n");
@@ -280,12 +350,11 @@ pub fn init() -> Result<(), BlockError> {
         log("[Block] Found virtio-blk at slot ");
         crate::safe_print!(32, "{}\n", i);
 
-        let Ok(blk) = VirtIOBlk::<VirtioHal, SteppedMmioTransport<'static>>::new(transport) else {
+        let Ok(device) = VirtioBlockDevice::new(transport) else {
             log("[Block] Failed to init virtio device\n");
             return true; // keep scanning
         };
 
-        let device = VirtioBlockDevice::new(blk);
         log("[Block] Registered ");
         crate::safe_print!(
             96,

@@ -89,6 +89,9 @@ def boot(fresh):
                     "-kernel", KERNEL, "-append", cl, "-nodefaults", "-no-reboot", "-display", "none",
                     "-serial", f"file:{RUN}/console.log",
                     "-drive", f"file={OVERLAY},format=qcow2,if=none,id=d0",
+                    # QEMU's virtio-mmio defaults to the legacy (v1) transport; the kernel's
+                    # in-tree drivers speak only v2, as Firecracker and kvm0 do.
+                    "-global", "virtio-mmio.force-legacy=false",
                     "-device", "virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0",
                     "-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{PORT}-:22",
                     "-device", "virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1",

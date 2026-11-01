@@ -1,10 +1,13 @@
 # Crate safety: which crates forbid `unsafe`
 
 **Grade: A** — regenerated 2026-11-01 with `python3 scripts/cloc_akuma.py src crates`:
-**82 of 111 crates** forbid `unsafe`. 89916 of 91226 production lines (98.6%) sit
-outside any `unsafe` block; 363 production sites across `crates/`, 0 inside
+**83 of 112 crates** forbid `unsafe`. 90656 of 91971 production lines (98.6%) sit
+outside any `unsafe` block; 368 production sites across `crates/`, 0 inside
 enforced crates; `src/` is down to 136 production lines (the `bin`) and 0
-production sites. Three crates arrived since the 2026-10-31 run, all forbidding:
+production sites. `akuma-virtqueue` (the split virtqueue and virtio-mmio protocol,
+pure) arrived later the same day and forbids; with it `akuma-virtio` went 12 -> 17
+sites, the device contracts that used to sit inside `virtio-drivers`
+(`archive/AKUMA_VIRTIO_IN_TREE.md`). Three crates arrived since the 2026-10-31 run, all forbidding:
 `akuma-syscalls-glue-amd64` (the x86_64 ABI layer under Taoxichuan's dispatch),
 `akuma-affinity` (the scheduler's CPU-mask decisions, out of `akuma-vm-spec`) and
 `akuma-user-walk` (page-walk user copies). The 2026-10-31 run read: twelve crates arrived since the 2026-10-21 run, most of them
