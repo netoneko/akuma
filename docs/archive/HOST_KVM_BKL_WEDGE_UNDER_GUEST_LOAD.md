@@ -95,3 +95,15 @@ spawn at ~200 s; a spin at `execve rust-lld` (4 vCPUs at ~394% CPU, console froz
 So: a nondeterministic fork/exec/BKL fault exists on the pre-X5 kernel too, at 4 vCPUs (1 vCPU not yet seen to fail), independent of the fsck. Disk corruption may have
 made it more likely; it is not the whole story. `build_run.py` now takes `BR_N` (parallel rig slots) and opens a QEMU monitor at `/root/mon<N>` so a wedged guest's
 registers can be read with `info registers -a`.
+
+## Where the guest wedge sits (2026-11-01, QEMU monitor on two wedged 4-vCPU guests, X5 kernel)
+Both X5 runs spun at `execve rust-lld` (console frozen ~40 min, 186 `[BKL] stuck`, ~394% host CPU, no `[Fault]`). `info registers -a` over several samples:
+three cores sit in `smp::bkl_enter+0x9c` (the ticket spin); the fourth, the owner (`BKL_OWNER`, read from guest memory), moves between `Interface::poll`
+(`seq_to_transmit`, `dispatch`), `switch_to`, `can_run` and `memcpy`. `BKL_SERVING` advanced **8 tickets in ~43 s** with a single hold of ~30 s: the lock is
+being handed over, so this is starvation/convoy, **not a deadlock**. The owner's stack is `sock::poll_arm -> net::sleep_until -> netpoll()/x86_yield`:
+`poll`/`ppoll` waits are 1 ms laps of `sleep_until`, and every lap runs a full smoltcp `poll` (loopback included) **with the BKL held**, so several pollers
+(sshd's serve loop, cargo/rustc waiting on pipes) keep the lock busy in network polling while the cores that want it for `execve`/`mmap` spin.
+Not yet answered: why it is intermittent (the same pre-X5 kernel passed 3 of 6 builds), and which loopback TCP socket makes `seq_to_transmit`/`dispatch`
+dominate each lap. Candidate fixes, none tried: run `netpoll()` outside the BKL when the lap is only waiting (`bkl_unlocked` around the yield/`wait_lap`, take the lock
+only for the lap itself); poll_arm sleeping on a deadline with the lock released; bounding the lap's drain budget. Measure with `BR_N` pairs and `info registers -a`
+(`build_run.py` opens `/root/mon<N>`); watch `BKL_SERVING` from the monitor (`x/1wx` on the symbol) for the hand-over rate.
