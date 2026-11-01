@@ -76,3 +76,13 @@ current kernel, for `e7661570`, for `8cd638d8` (before the futex-body extraction
 13m11s the day before. A stall that follows the disk, not the kernel, is the disk. Not repaired yet (`e2fsck -fp` was refused by the
 environment's safety check and needs the owner's go-ahead); until it is, in-guest builds on the p3 root are not a valid regression oracle.
 Lesson for the drill-down: run the metal gates with p3 mounted **read-only** from the host side where possible, and fsck p3 after any watchdog reset.
+
+## Resolved: the in-guest `-j4` stall was the disk, confirmed without writing p3 (2026-11-01)
+p3 itself needs no repair for the rig, because every guest boots it through a qcow2 overlay. Repair the *overlay*:
+`qemu-img create -f qcow2 -b /dev/nvme0n1p3 -F raw ov.qcow2 && qemu-nbd -c /dev/nbd0 ov.qcow2 && e2fsck -fy /dev/nbd0 && qemu-nbd -d /dev/nbd0`,
+then copy it to `$TX_RUN/overlay.qcow2` and run `TX_FRESH=keep python3 scripts/kvm/taoxichuan/build_run.py KERNEL 4`
+(`TX_FRESH` defaults to `fresh`, which recreates the overlay and so discards the repair).
+e2fsck on the overlay fixed 2 invalid HTREE roots, 4 corrupted directories (one holding a garbage entry in a cargo target dir) and ~300 unattached inodes.
+Result with the X4 kernel (`target/.../taoxichuan`, 4 vCPUs): `-j4` build **10m29s, artifact md5 `38852d54...` (identical to the kb-fix artifact)**, 12 `[BKL] stuck`
+lines (vs 123-180 on the corrupted disk), no `[Fault]`. So there is no CoW/X1-X4 regression; the host watchdog resets are the only open item here.
+The real p3 is still unrepaired and still carries the corruption; the owner decides whether to `e2fsck` it.

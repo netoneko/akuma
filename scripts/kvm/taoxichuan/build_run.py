@@ -12,7 +12,7 @@ data = open(K, "rb").read()
 d = "/root/tx-target-sig/x86_64-unknown-none/release/taoxichuan"
 subprocess.run(hpbox.RZ_ROOT + [f"mkdir -p {os.path.dirname(d)} && cat > {d}.new && chmod +x {d}.new && mv {d}.new {d}"], input=data, check=True, timeout=300)
 hpbox.ryzen_root("for r in 3 4 5 6; do TX_RUN=/root/tx-run$r bash /root/tx-pop.sh stop; done; sleep 1", timeout=60)
-print(hpbox.ryzen_root(f"TX_TARGET=/root/tx-target-sig TX_PORT=2225 TX_RUN=/root/tx-run5 TX_SMP={SMP} TX_APPEND=smp={SMP} TX_MEM=3072 TX_INIT={INIT} bash /root/tx-pop.sh boot fresh; sleep 25", timeout=120)[1].strip(), flush=True)
+print(hpbox.ryzen_root(f"TX_TARGET=/root/tx-target-sig TX_PORT=2225 TX_RUN=/root/tx-run5 TX_SMP={SMP} TX_APPEND=smp={SMP} TX_MEM=3072 TX_INIT={INIT} bash /root/tx-pop.sh boot {os.environ.get('TX_FRESH', 'fresh')}; sleep 25", timeout=120)[1].strip(), flush=True)
 SSH = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-p", "2225", "root@192.168.1.126"]
 
 def run(c, t=120):
