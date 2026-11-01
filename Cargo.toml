@@ -93,6 +93,7 @@ default-members = [
     "crates/akuma-user-tree",
     "crates/akuma-syscalls-sync",
     "crates/akuma-syscalls-proc",
+    "crates/akuma-runtime-tokio",
     "crates/akuma-user-layout",
     "crates/akuma-tty",
     "crates/akuma-syscalls-time",

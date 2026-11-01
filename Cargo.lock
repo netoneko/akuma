@@ -699,6 +699,18 @@ name = "akuma-rump"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-runtime-tokio"
+version = "0.1.0"
+dependencies = [
+ "akuma-exec",
+ "akuma-primitives",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-glue",
+ "akuma-syscalls-glue-amd64",
+ "akuma-vfs-glue",
+]
+
+[[package]]
 name = "akuma-ryzen-amd64"
 version = "0.1.0"
 
@@ -1358,6 +1370,7 @@ dependencies = [
  "akuma-primitives",
  "akuma-pte-amd64",
  "akuma-ring3-amd64",
+ "akuma-runtime-tokio",
  "akuma-ryzen-amd64",
  "akuma-sched-amd64",
  "akuma-syscalls-abi",

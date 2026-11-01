@@ -939,15 +939,18 @@ fn root_fs() -> &'static akuma_ext2::Ext2Filesystem<Vda> {
 /// on failure: a root the shared arms cannot resolve answers `ENOENT` for every
 /// path, silently (`AKUMA_AMD64_C1_STEP4A_VFS_ADOPTION.md` § 1).
 fn mount_vfs_glue(fs: alloc::sync::Arc<akuma_ext2::Ext2Filesystem<Vda>>) {
-    akuma_vfs_glue::set_hooks(akuma_vfs_glue::VfsGlueHooks {
-        audio_is_available: || false,
-        fs_exists: akuma_vfs_glue::exists,
-        probed_core_count: smp::online_cpus,
+    // The tokio surface: glue's and `akuma-vfs-glue`'s hooks with a tokio kernel's answers
+    // (no rump, console poller, mouse, tun, audio or file-page cache), the pipe wake sink and
+    // the RNG. This kernel supplies its clock, its cores, RDRAND (SplitMix64 fallback, always
+    // fills) and the sweep after a reap.
+    akuma_runtime_tokio::install(akuma_runtime_tokio::Kernel {
         utc_time_us: || akuma_primitives::clock::utc_time_us(net::uptime_us()),
-        // No file-page cache on this kernel: mmap populates eagerly.
-        fpcache_init: |_| {},
-        // `/proc` is not mounted here, so nothing asks for map rows.
-        pid_map_rows: |_| None,
+        online_cpus: smp::online_cpus,
+        rng_fill: |b| {
+            net::rng_fill(b);
+            true
+        },
+        after_reap: child::collect,
     });
     // `uname` is glue's, which answers `Akuma` unless a kernel names itself. This one is a
     // Linux-ABI kernel and programs branch on `uname -s`; it said `Linux`/`taoxichuan` until
@@ -962,36 +965,9 @@ fn mount_vfs_glue(fs: alloc::sync::Arc<akuma_ext2::Ext2Filesystem<Vda>>) {
             version: proc::uts_join(&[version::BUILD_ID]),
         });
     }
-    // `akuma-syscalls-glue`'s own table: the wall clock and the core count are
-    // real answers; there is no rump kernel, console poller, mouse or tap
-    // device here (amd64's `boot::install_shared_sinks` registers the same set).
-    akuma_syscalls_glue::set_hooks(akuma_syscalls_glue::SyscallHooks {
-        box_is_rump: |_| false,
-        mark_box_rump: |_| {},
-        attach_server: |_, _| {},
-        intercept_box_syscall: |_, _| None,
-        rump_socket_readable: |_| false,
-        utc_time_us: || akuma_primitives::clock::utc_time_us(net::uptime_us()),
-        probed_core_count: smp::online_cpus,
-        poll_console_state: |_| None,
-        dev_mouse_has_events: || false,
-        dev_tun_has_frame: || false,
-    });
     // A process `akuma-exec` ends (a fatal signal's default action inside glue)
     // must still reach this kernel's `wait4`: see `child::on_thread_terminated`.
     akuma_threading::set_slot_purge_callback(child::on_thread_terminated);
-    // Glue's pipe wakes go to the slot by number, with a fresh handle — the
-    // waker amd64 registers (`pipe::wake_sink` -> `sched::wake`). The handle a
-    // parked writer recorded is not trusted to still name its slot.
-    akuma_syscalls_glue::pipe::set_wake_sink(|tid, _handle| {
-        akuma_exec::threading::wake_by_handle(akuma_exec::threading::wake_handle_for_thread(tid));
-    });
-    // Glue's `getrandom` reads the primitives hook; this kernel's source is
-    // `net::rng_fill` (RDRAND, SplitMix64 fallback), which always fills.
-    akuma_primitives::rng::set_rng_hook(|b| {
-        net::rng_fill(b);
-        true
-    });
     akuma_vfs_glue::init();
     if akuma_vfs_glue::mount_with("/", Some("/dev/vda"), 0, fs).is_err() {
         console::puts("  [FATAL] could not mount the ext2 root into the shared mount table\n");
@@ -1748,89 +1724,6 @@ fn console_stdio_write(nr: u64, a: [u64; 6]) -> Option<u64> {
     Some(total)
 }
 
-/// Whether `akuma-syscalls-glue` serves `call` on this kernel. One place, so
-/// the folded set is readable at a glance and a batch is one diff here.
-const fn served_by_glue(call: akuma_syscalls_abi::Syscall) -> bool {
-    use akuma_syscalls_abi::Syscall as S;
-    matches!(
-        call,
-        // Batch A (leaf tier): identity, host names, limits, randomness,
-        // whole-filesystem sync. No fd table, no task record.
-        S::Uname
-            | S::Sethostname
-            | S::Setdomainname
-            | S::Getpid
-            | S::Getppid
-            | S::Gettid
-            | S::Getuid
-            | S::Geteuid
-            | S::Getgid
-            | S::Getegid
-            | S::Getsid
-            | S::Setsid
-            | S::Getpgid
-            | S::Setpgid
-            | S::SchedGetaffinity
-            | S::Getrandom
-            | S::Membarrier
-            | S::Sync
-            | S::Syncfs
-            | S::Sysinfo
-            | S::Getrusage
-            | S::Getgroups
-            | S::Times
-            // Signal dispositions and masks (one table: glue's `tkill` and
-            // SIGPIPE read it, and Rust programs ignore SIGPIPE through it).
-            | S::RtSigaction
-            | S::RtSigprocmask
-            | S::Sigaltstack
-            // Thread naming and the exit-time tid clear (`Process.clear_child_tid`,
-            // which this kernel's thread exit reads).
-            | S::Prctl
-            | S::SetTidAddress
-            // The time family, over the one clock (the calibrated TSC,
-            // registered as `akuma_primitives::clock`'s hook by `exec_twin`).
-            // `nanosleep` parks through the scheduler and wakes early on a
-            // `tkill` (`EINTR`); `prlimit64`'s `RLIMIT_STACK` is
-            // `ExecConfig::user_stack_size`, the 8 MiB the stack may grow to.
-            | S::ClockGettime
-            | S::ClockGetres
-            | S::ClockSettime
-            | S::Adjtimex
-            | S::ClockAdjtime
-            | S::Nanosleep
-            | S::ClockNanosleep
-            | S::Prlimit64
-            | S::Getrlimit
-            // Reaping (step A1): the child channels `fork_process` registers,
-            // which this kernel's exit publishes to. `child::collect` frees
-            // what a reap leaves after each call.
-            | S::Wait4
-            | S::Waitid
-            // Sockets (step 2b, with the fd table): AF_INET and AF_UNIX are
-            // glue's; `sockaddr` and `msghdr` have one layout on both ABIs.
-            | S::Socket
-            | S::Bind
-            | S::Listen
-            | S::Accept
-            | S::Accept4
-            | S::Connect
-            | S::Sendto
-            | S::Recvfrom
-            | S::Sendmsg
-            | S::Recvmsg
-            | S::Setsockopt
-            | S::Getsockopt
-            | S::Shutdown
-            | S::Getsockname
-            | S::Getpeername
-            // `futex`: glue's, the one AArch64 runs (the `(tgid, uaddr)` table, the
-            // park on `akuma-threading`, `EINTR` on a pending signal). Its private key
-            // is `read_current_pid`, the thread group's, as this kernel's was.
-            | S::Futex
-    )
-}
-
 fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     // M4 slice 3: the per-syscall capture `fork_process` step 6 consumes
     // (`get_saved_user_context` → the twin's `read_user_context`). The boot
@@ -1849,30 +1742,16 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         fr.rax = call.to_x86_64();
         (fr.rdi, fr.rsi, fr.rdx, fr.r10, fr.r8, fr.r9) = (a[0], a[1], a[2], a[3], a[4], a[5]);
     }
-    // The arms `akuma-syscalls-glue` serves: the bodies both other kernels
-    // run, reached by their asm-generic number (`to_aarch64`), exactly as
-    // amd64's `to_glue`. The list grows batch by batch
-    // (TAOXICHUAN_CLEANUP_PLAN.md step 2c); an arm that moves here is deleted
-    // from the match below in the same change.
-    if let Some(call) = akuma_syscalls_abi::Syscall::from_x86_64(fr.rax)
-        && served_by_glue(call)
-    {
-        let args = [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()];
-        let r = akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args);
-        if matches!(call, akuma_syscalls_abi::Syscall::Wait4 | akuma_syscalls_abi::Syscall::Waitid) {
-            child::collect();
-        }
-        return r;
-    }
-    // The fd family over the process's `akuma-exec` table (step 2b): the
-    // x86_64 ABI layer amd64 uses too, after the one local intercept — stdio
-    // of a process with no channel goes to the console.
+    // The tokio surface (`akuma-runtime-tokio`): its allow-list to glue by the asm-generic
+    // number, the fd family to the x86_64 ABI layer amd64 uses too. One local intercept
+    // first: stdio of a process with no channel goes to the console (`write`/`writev` only,
+    // neither of which is on the allow-list, so the order changes no routing).
     {
         let args = [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()];
         if let Some(r) = console_stdio_write(fr.rax, args) {
             return r;
         }
-        if let Some(r) = akuma_syscalls_glue_amd64::dispatch(fr.rax, args) {
+        if let Some(r) = akuma_runtime_tokio::dispatch(fr.rax, args) {
             return r;
         }
     }

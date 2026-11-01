@@ -137,6 +137,8 @@ akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features
 # The x86_64 ABI over glue for the fd family (open flags, struct stat, the
 # legacy numbers), shared with amd64.
 akuma-syscalls-glue-amd64 = { path = "../crates/akuma-syscalls-glue-amd64" }
+# The tokio surface: the allow-list, the hooks and the dispatch to glue (Phase 3).
+akuma-runtime-tokio = { path = "../crates/akuma-runtime-tokio", features = ["process"] }
 akuma-user-access = { path = "../crates/akuma-user-access" }
 
 [[bin]]

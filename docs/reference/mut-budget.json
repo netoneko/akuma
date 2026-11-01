@@ -60,6 +60,7 @@
   "crates/akuma-ring3-amd64": 10,
   "crates/akuma-rtw89": 126,
   "crates/akuma-rump": 65,
+  "crates/akuma-runtime-tokio": 1,
   "crates/akuma-ryzen-amd64": 24,
   "crates/akuma-sched-amd64": 10,
   "crates/akuma-scheduler": 28,
