@@ -55,6 +55,16 @@ build with a build script), 0 console faults. In the guest: `sleep 2` measured 2
 the fork and exec; `ulimit -s` 8192. Host tests of `akuma-syscalls-abi` and `akuma-syscalls-glue-amd64`; amd64
 (`no-tests`) and the AArch64 default build compile.
 
+`userspace/tokioprobe` (staged with `debugfs` onto a copy of the goose image): `RESULT PASS` at SMP=1 (one worker),
+and at `smp=4` with one worker (what `sched_getaffinity` reports) and with `TOKIOPROBE_WORKERS=4`. That covers the
+multi-thread runtime, `tokio::process` with SIGCHLD, and HTTPS through rustls, with 0 faults.
+
+Found while staging the probe, and **not caused by this change**: piping data into an ssh exec session
+(`ssh host 'cat > f' < file`) hangs on Taoxichuan. sshd logs "no inbound bytes" while `cat` waits on stdin. The kernel
+before this change (`56d121bc`) hangs at every size tried (6 B, 4 KiB, 64 KiB); this one passed 6 B and hung at
+4 KiB. busybox `cat`'s `sendfile` answering `ENOSYS` (the known gap) comes before the hang and falls back to
+`read`/`write`. Open; the rig stages files with `debugfs` instead.
+
 Open: not run on the ryzen under KVM, where the TSC rate comes from the LAPIC calibration rather than the PIT. The
 fixed point was not rerun; this change does not touch exec, fork or mm.
 
