@@ -2166,7 +2166,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 Ok(k) => k,
                 Err(clone_decode::Invalid) => return errno::EINVAL,
             };
-            if let Kind::Thread = kind {
+            if kind == Kind::Thread {
                 // `CLONE_VM|CLONE_THREAD` — a thread (`crate::thread`).
                 return crate::thread::sys_clone_thread(a1, a2, a3, a4, a5);
             }
@@ -5418,7 +5418,7 @@ fn do_execve(
     // `docs/archive/AMD64_TRASHCAN_ISSUES.md` §1.
     let new_args_bytes: alloc::vec::Vec<alloc::vec::Vec<u8>> =
         new_args.iter().map(|a| a.clone().into_bytes()).collect();
-    akuma_syscalls_glue::execve::commit(&proc, &new_name, &new_args_bytes);
+    akuma_syscalls_glue::execve::commit(proc, &new_name, &new_args_bytes);
 
     // A new program in an existing slot starts with a clean group: a stale
     // `exit_group` flag from the image just replaced would kill its first
@@ -6461,7 +6461,7 @@ pub fn spawn_stale_group_state_test(t: &mut Suite) {
         t.check("stale group: a free spawn slot to poison", false);
         return;
     };
-    crate::thread::set_group_exit_status(next, (-(SIGTERM as i32)) as u32);
+    crate::thread::set_group_exit_status(next, (-(SIGTERM.cast_signed())).cast_unsigned());
     crate::thread::set_group_exiting(next);
 
     let path = b"/bin/hello\0";

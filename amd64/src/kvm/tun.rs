@@ -176,15 +176,12 @@ pub fn read_frame(b: &mut [u8; BUF]) -> Result<usize, u64> {
         }
     })
     .flatten();
-    match got {
-        Some(n) => {
-            READS.fetch_add(1, Ordering::Relaxed);
-            Ok(n)
-        }
-        None => {
-            EAGAINS.fetch_add(1, Ordering::Relaxed);
-            Err(errno::EAGAIN)
-        }
+    if let Some(n) = got {
+        READS.fetch_add(1, Ordering::Relaxed);
+        Ok(n)
+    } else {
+        EAGAINS.fetch_add(1, Ordering::Relaxed);
+        Err(errno::EAGAIN)
     }
 }
 
@@ -281,7 +278,7 @@ pub fn readv(iov: u64, cnt: usize) -> u64 {
 pub fn ioctl(req: u32, arg: u64) -> u64 {
     let r = ioctl_inner(req, arg);
     if IOCTLS.fetch_add(1, Ordering::Relaxed) < 16 {
-        akuma_primitives::safe_print!(96, "[tun] ioctl {:#x} arg={:#x} -> {}\n", req, arg, r as i64);
+        akuma_primitives::safe_print!(96, "[tun] ioctl {:#x} arg={:#x} -> {}\n", req, arg, r.cast_signed());
     }
     r
 }
@@ -380,7 +377,7 @@ extern "C" fn pump_daemon() -> ! {
         if busy {
             crate::sched::yield_now();
         } else {
-            crate::sched::block_until_deadline(crate::net::uptime_us() + crate::lapic::US_PER_TICK_TARGET as u64);
+            crate::sched::block_until_deadline(crate::net::uptime_us() + u64::from(crate::lapic::US_PER_TICK_TARGET));
         }
     }
 }

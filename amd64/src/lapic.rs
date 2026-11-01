@@ -476,7 +476,7 @@ pub fn arm_deadline() {
         timer::arm_oneshot(counts as u32);
         ONESHOT[crate::smp::cpu_index()].store(true, Ordering::Relaxed);
         ONESHOT_ARMS.fetch_add(1, Ordering::Relaxed);
-    })
+    });
 }
 
 /// Make this core's next timer interrupt arrive in `us` microseconds, if that is

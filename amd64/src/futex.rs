@@ -135,7 +135,7 @@ impl body::Kernel for Amd64 {
         crate::uaccess::write_val::<u32>(uaddr, v)
     }
     fn read_timespec(&self, uaddr: u64) -> Option<(i64, i64)> {
-        crate::uaccess::read_val::<[i64; 2]>(uaddr).map(|[s, n]| (s, n))
+        crate::uaccess::read_val::<[i64; 2]>(uaddr).map(<(i64, i64)>::from)
     }
     fn now_us(&self) -> u64 {
         crate::net::uptime_us()

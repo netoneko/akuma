@@ -504,12 +504,12 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
         match code {
             ExitCode::Cpuid => {
                 let (leaf, sub) = (v.rax() as u32, vc.regs.rcx as u32);
-                let [a, b, c, d] = vc.cpuid_lookup(leaf, sub);
+                let [eax, ebx, ecx, edx] = vc.cpuid_lookup(leaf, sub);
                 let mut v = Vmcb::new(vc.vmcb.bytes_mut());
-                v.set_rax(u64::from(a));
-                vc.regs.rbx = u64::from(b);
-                vc.regs.rcx = u64::from(c);
-                vc.regs.rdx = u64::from(d);
+                v.set_rax(u64::from(eax));
+                vc.regs.rbx = u64::from(ebx);
+                vc.regs.rcx = u64::from(ecx);
+                vc.regs.rdx = u64::from(edx);
                 let next = next_rip(&v, nrips, 2);
                 v.complete_instruction(next);
             }
@@ -538,18 +538,15 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
                 let ticks = io_ticks();
                 if io.is_in {
                     let mine = with_plat(plat, |p| p.io_in(io.port, ticks));
-                    match mine {
-                        Some(val) => {
-                            let val = u64::from(val) & io.mask();
-                            let rax = v.rax();
-                            v.set_rax(if io.size == 4 { val } else { (rax & !io.mask()) | val });
-                            v.complete_instruction(next);
-                        }
-                        None => {
-                            vc.pending = Pending::IoIn { size: io.size, next };
-                            runpage::set_io(vc.page(), runpage::IO_IN, io.size, io.port, 0);
-                            return 0;
-                        }
+                    if let Some(val) = mine {
+                        let val = u64::from(val) & io.mask();
+                        let rax = v.rax();
+                        v.set_rax(if io.size == 4 { val } else { (rax & !io.mask()) | val });
+                        v.complete_instruction(next);
+                    } else {
+                        vc.pending = Pending::IoIn { size: io.size, next };
+                        runpage::set_io(vc.page(), runpage::IO_IN, io.size, io.port, 0);
+                        return 0;
                     }
                 } else {
                     let val = (v.rax() & io.mask()) as u32;
@@ -760,7 +757,7 @@ fn idle(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, ev: &Events) -> Option
             return None;
         }
         let deadline = due.unwrap_or(now + 1_000).min(now + 1_000);
-        if IDLE_TURNS.load(core::sync::atomic::Ordering::Relaxed) % 4000 == 0 {
+        if IDLE_TURNS.load(core::sync::atomic::Ordering::Relaxed).is_multiple_of(4000) {
             let st = with_plat(plat, |p| p.irq_state(id, now));
             akuma_primitives::safe_print!(160, "[kvmapi] irq state pic={:#x} imr={:#x}/{:#x} lapic={:#x} ppr={:#x} lvt_timer={:#x} count={:#x} extint={}\n", st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]);
         }
@@ -846,7 +843,7 @@ fn idle_note(vc: &mut Vcpu, now: u64, due: Option<u64>, can_wake: bool) {
     }
     // The lost-interrupt signature: halted with IF set and nothing that could ever wake the guest.
     let stuck = due.is_none() && !can_wake;
-    if n > 4000 * 6 && !(stuck && !TRACE_DUMPED.load(Ordering::Relaxed)) {
+    if n > 4000 * 6 && (!stuck || TRACE_DUMPED.load(Ordering::Relaxed)) {
         return;
     }
     let (rip, rflags) = {
