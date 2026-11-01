@@ -1701,8 +1701,17 @@ output per million, GLM-5.3 $1.4 / $0.26 / $4.4.
 | 10-27 | 1,116 | 57.4M | 2,591 | 2.51 |
 | 10-28 | 1,137 | 125.0M | 3,996 | 4.40 |
 | 10-29 | 634 | 57.1M | 2,110 | 2.13 |
-| 10-30 | 31 | 1.5M | 67 | 0.08 |
-| **total** | **6,989** | **569.4M** | **20,251** | **24.91** |
+| 10-30 | 408 | 18.8M | ~643 | ~0.69 |
+| 10-31 | 519 | 46.3M | ~1,583 | ~1.69 |
+| 11-01 | 24 | 0.06M | ~2 | ~0.00 |
+| **total** | **7,909** | **633.1M** | **~22,412** | **~27.21** |
+
+*Updated 2026-11-01, after the experiment ended.* The ledger was read at about 02Z on 10-30 and held 31 calls / 1.5M for
+that day; the rows from 10-30 on are the z.ai usage API's (`zai_usage.py`'s endpoint, hourly buckets summed per UTC day),
+which agreed with the ledger to within 0.2M on every earlier day it was checked against (10-26 116.0M, 10-28 124.0M, 10-29
+56.9M). The API gives no fresh/cached/output split, so their credits and API $ are estimates at the ledger's Flash-only
+average for 10-25 -> 10-29 (34.2 credits and $0.0365 per million). The totals as read at the snapshot were 6,989 calls,
+569.4M, 20,251 credits, $24.91. What the new rows were: the final entry of this log.
 
 - **Mix:** 98.3% of input tokens were cache reads; output 0.4-1.8% of tokens per day. 222 of 6,989 calls were in peak hours.
 - **The quota charges more than the formula.** The formula gives 35.6 credits per million tokens for this mix and timing. The
@@ -1733,15 +1742,18 @@ output per million, GLM-5.3 $1.4 / $0.26 / $4.4.
 | `apk add curl` (M) | 7.0M | 0.29 |
 | wire dedup (K) | 7.5M | 0.27 |
 | M0 mirror + M1 wall clock (H) | 11.2M | 0.40 |
+| extraction plan X10 + reference-docs refresh + guest RAM cap 1 -> 4 GiB (X11), 10-30 21-22Z | 14.2M | ~0.52 |
 | blocking fork + `wait4` (M2, 21 short sessions) | 20.4M | 0.94 |
 | the stall, report only (pl) | 23.3M | 0.88 |
 | dynamic PIE (O, O2) | 28.3M | 0.97 |
 | DNS (I, J) | 31.3M | 1.06 |
+| epoll family + `prctl` (stage 12, 10-31 00-04Z; stopped on the 5 h quota, merged by the supervisor) | 46.3M | ~1.69 |
 | curl over HTTPS (Q-R, 13 sessions) | 46.4M | 1.84 |
 | M4 preemption on one core (pb-ph, stopped by the user) | 159.1M | 5.65 |
 
-  Median execution milestone about 16M tokens, $0.60, 8% of a Lite week. M4 alone is 80% of a Lite week and more than the ten
-  refined milestones above it together (186M).
+  Median execution milestone about 17M tokens, $0.63, 9% of a Lite week (about 16M over the ten that existed at the 10-30
+  reading; the two rows marked `~` were added 2026-11-01 from the z.ai API). M4 alone is 80% of a Lite week; the ten refined
+  milestones above it at the 10-30 reading were 186M together, the twelve now are 247M.
 - **Pacing.** The refined days ran at 57-125M tokens a day, so a Lite week (~200M) lasted two to three days; hence the resets.
   One Lite month is ~866M tokens. A median-cost replay of the whole ladder (25-30 milestones, ~400-480M) fits in it at ~28M a
   day, one 5-hour window daily; a worst-case one (~40M per milestone, 1.0-1.2B) does not. On the API the median replay is
@@ -1755,7 +1767,9 @@ deduped by message id).** Supervisor tokens per UTC day, 10-24 -> 10-30: 160M, 8
 (18:00Z -> 10-30, 20 active hours, ~12 milestones, 32 commits): 1,380 model calls, 1,571 tool calls, 406M tokens, ~294k per
 call. Extrapolated to GLM doing the same work at 2-4x the tool calls and the refined process's 56-77k tokens per call:
 176-242M (2x), 264-363M (3x), 352-484M (4x), ~630M if the slowdown comes as long sessions; 0.9-3.1 Lite weeks, $6-23 on the
-API. An extrapolation, not a measurement: no GLM run exists for this class of milestone.
+API. An extrapolation, not a measurement: no GLM run exists for this class of milestone. *Correction 2026-11-01:* 10-30's
+340M was that day up to the reading; the whole day was 695M (570M Sonnet, 125M Opus), and the experiment's Claude total is
+1,943M. Final figures by phase: the last entry of this log.
 
 **What the supervisor's tokens bought (same day).** Every Claude call from 10-24 to 10-30 classified by its tool calls
 (keyword rules on tool names and shell commands; edits made through shell heredocs counted as edits; good to a few points):
@@ -1787,7 +1801,9 @@ are 1,645-1,796. At the user's assumed 2-4x as many calls for GLM, and the refin
 | 4x | 6,580-7,184 | 368-553M | 937M-1.12B | 4.7-5.6 | 38-45 |
 
 Cross-check: Claude's ~12 executed milestones at GLM's refined median (16M) give ~192M, inside the 2x row. One Lite month is
-~866M, so at 2x the whole project so far fits in about one $18 month of GLM quota, learning phase included.
+~866M, so at 2x the whole project so far fits in about one $18 month of GLM quota, learning phase included. *Superseded
+2026-11-01:* this table stops at the 10-30 reading; re-run over the whole experiment (last entry of this log) the 2x row is
+0.91-1.06B, about 1.1-1.2 Lite months.
 **Why it stays an extrapolation:** no GLM run exists for the rustc / cargo / threads / CoW-fork class of milestone; the 2-4x
 factor is assumed; the refined process was itself Claude-supervised; the Lite quota's ~50 credits per million (against the
 formula's ~36) is unexplained. **User's assessment:** the experiment was flawed and ultimately inconclusive, but the initial
@@ -2023,3 +2039,267 @@ that census into a feature list over the crates, compose a kernel that serves ex
 with the Linux-differential suites. Can that be done in one day, and what is still missing when it cannot? This is the
 "kernels preconfigured for a language runtime" idea (entry of 2026-10-30) with a deadline attached. The second application
 would show whether the week was a one-off or the new cost of a kernel.
+
+### 2026-11-01: goose + GLM on Taoxichuan, checked again - epoll is no longer the wall; the session database is
+
+Local QEMU/TCG, kernel at `c362f165`, goose 1.52.0 (the release binary the ryzen uses), GLM config from
+`scripts/kvm/taoxichuan_goose_image.sh`. `goose --version` now prints `1.52.0` and exits 0. On 2026-10-30 it panicked on
+`epoll_create1`; the epoll family and the eventfd edge re-arm fixed that. `goose run` still never reaches GLM. It stops at
+`Could not create session: ... (code: 522) disk I/O error`, before any network I/O. That is `SQLITE_IOERR_SHORT_READ` on a WAL
+frame. Each Taoxichuan fd keeps its own file size from `open`, so a second SQLite connection reads the WAL short. A two-fd
+`pwrite`/`pread` probe confirms it (`fstat(b).size=0 pread(b)=0` after `pwrite(a, 10 bytes)`). Open. Whether goose's TLS to z.ai
+works is still unknown. Details, probe and rig: [`TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md`](TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md).
+The "no epoll yet (goose is blocked on it)" line in the 2026-10-31 pace entry above is out of date as of this entry.
+
+### 2026-11-01: the experiment is over; Taoxichuan cleanup moves to Opus (user's decision, recorded at their request)
+
+The experiment's question - can a minimal kernel build itself - was answered on 2026-10-30 and again on bare metal on 2026-10-31
+(K1 == K2 byte for byte, [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md)). With the fixed point achieved, the user is switching to
+Opus to clean up Taoxichuan from here on: the remaining crate extraction ([`TAOXICHUAN_CRATE_EXTRACTION_PLAN.md`](TAOXICHUAN_CRATE_EXTRACTION_PLAN.md))
+and the bugs the extraction work turned up. This is a change of working mode - from reaching the milestone to consolidating it - not a new milestone.
+
+State handed over, so the next session starts from facts:
+
+* **Extraction:** X1-X5 and the idle-marking step are done (X5 at `5cb7c69b`); X6-X10 are not started. The plan's gates that rely on the in-guest `-j4`
+  build (X5, X9, X10) are unreliable until the item below is understood.
+* **Open bug:** the in-guest `-j4` build stalls intermittently on the same kernel (a 4-vCPU BKL convoy of `poll` laps, plus an `ECHILD` and a ring-3 `#GP`
+  seen once each). Mechanism located, trigger and fix not: [`TAOXICHUAN_J4_BKL_CONVOY.md`](TAOXICHUAN_J4_BKL_CONVOY.md). An earlier "it was the p3 disk" conclusion
+  was wrong and is marked superseded in [`HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD.md`](HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD.md).
+* **Rig:** p3 was repaired (`e2fsck`, 2026-11-01); `scripts/kvm/taoxichuan/build_run.py` runs parallel slots (`BR_N`) with a QEMU monitor, and `wedge_sample.py` reads a wedged guest.
+* **Not decided here:** the host KVM wedge ([`HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD.md`](HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD.md)) and goose's SQLite stale-fd-size bug
+  ([`TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md`](TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md)) remain open.
+
+### 2026-11-01: final tokenomics (supersedes the 10-30 figures; user asked)
+
+The 10-30 tokenomics entry was read partway through 10-30, before the Linux-KVM and bare-metal fixed points and the day and a
+half of consolidation after them. These are the whole experiment's figures: from the branch's first session (10-24) to the
+user's "the experiment is over" (11-01 11:35Z). The cleanup on Opus after that is counted separately and excluded.
+
+**Sources.** GLM: the goose ledger up to its 10-30 reading, then the z.ai usage API (hourly buckets per model; the daily
+table in the 10-30 entry is updated in place). Claude: the Claude Code transcripts in `~/.claude-personal` and
+`~/.claude-work`, usage fields only, streamed chunks deduped by message id, **only entries whose `gitBranch` is
+`rust-org-il-experiment`** (the 10-30 entry counted every akuma transcript, which is why its supervision-era figure is 816M
+and this one's is 793M). The two counting scripts were throwaway (a session scratchpad) and are not in the tree.
+
+**GLM after the 10-30 reading** (all GLM-5.3-Flash; API $ estimated at the ledger's Flash average, $0.0365 per million):
+
+| UTC hours | work | tokens | API $ |
+|---|---|---:|---:|
+| 10-30 12-14Z | the Mac planning sessions (unsafe-reduction and CoW plans) | 3.0M | ~0.11 |
+| 10-30 21-22Z | extraction plan X10, `taoxichuan/docs` refresh, guest RAM cap 1 -> 4 GiB (X11) | 14.2M | ~0.52 |
+| 10-31 00-04Z | stage 12: the epoll family + `prctl`; stopped on the 5-hour quota at ~02:15, the supervisor merged it | 46.3M | ~1.69 |
+| 11-01 11-13Z | goose running **inside** Taoxichuan, talking to GLM (24 calls) | 0.06M | ~0.00 |
+| | **added since the reading** | **63.6M** | **~2.32** |
+
+**GLM total: 633.1M tokens, 7,909 calls, ~$27.2 at API prices, ~3.2 Lite weeks** at the readings' ~50 credits per million
+(was 569.4M, $24.91, 2.85 weeks). The quota meter on 11-01 13:21Z: the week that started at the 10-29 16:36Z reset is at 42%
+(83.7M), i.e. ~199M per Lite week, consistent with the earlier calibration. Epoll was GLM's last execution milestone and cost
+about what DNS (31M) and dynamic PIE (28M) did.
+
+**Claude, by phase** (calls / tokens):
+
+| phase | Sonnet | Opus |
+|---|---:|---:|
+| A: supervising goose (10-24 -> 10-29 18:00Z) | 3,418 / 793M | - |
+| B: executing, rustc -> cargo -> git clone -> CoW fork -> K1 == K2 on Linux KVM and on metal (-> 10-30 23:37Z) | 1,868 / 617M | 321 / 125M (the cloc-script session) |
+| C: consolidation - Taoxichuan SMP, X1-X5, the cargo-stall bisect, supervising GLM's epoll, the -j4 BKL convoy (-> 11-01 11:35Z) | 998 / 401M | 63 / 7M (log entries) |
+| **experiment total** | **6,284 / 1,812M** | **384 / 131M** |
+| *excluded: Taoxichuan cleanup on Opus (11-01 11:35Z ->)* | *23 / 5M* | *469 / 203M* |
+
+**Claude total: 1,943M, 3.1x GLM's 633M** (2.1x at the 10-30 reading). The growth is phases B and C, which have no GLM
+counterpart except epoll.
+
+**User prompts.** The user typed **390 prompts to Sonnet** during the experiment: 297 in phase A, 63 in B, 30 in C, plus 4
+`/compact`. Counted: user turns in the main transcripts on this branch; not counted: tool results, task and Monitor
+notifications, compaction summaries, slash commands, subagent traffic, and turns a resumed session copied from its
+predecessor (deduped by timestamp and text). Typed prompts averaged ~17 words; 17 carried a pasted handoff. Over the same
+period the user sent 51 prompts to Opus on this branch (45 of them in the cloc-script session). That is **~5M Claude tokens
+and 16 Sonnet model calls per typed prompt** on average, but the split is the finding: **11.5 calls per prompt while
+supervising goose, 30-33 while executing** - each prompt bought ~2.7x more autonomous work after the 10-29 switch.
+
+**EXTRAPOLATION, re-run over the whole experiment (not a measurement): the project on GLM alone, supervision not counted.**
+The executing stretch's tool-call classification (10-30 entry) was not re-run; its coding share (67%, 76% with boot waits) is
+applied to phases B+C's 2,866 Sonnet calls (1,920-2,178) plus the 589 coding calls of the supervision era: 2,509-2,767
+coding calls (was 1,645-1,796). Same assumptions as before: GLM needs 2-4x the calls, at the refined process's 56-77k tokens
+per call; API $ at $0.0365 per million on top of the actual $27.2.
+
+| GLM slower by | GLM calls | GLM tokens | + GLM's actual 633M | Lite weeks | API $ (total) |
+|---|---:|---:|---:|---:|---:|
+| 2x | 5,018-5,534 | 281-426M | 0.91-1.06B | 4.6-5.3 | 38-43 |
+| 3x | 7,527-8,301 | 421-639M | 1.05-1.27B | 5.3-6.4 | 43-51 |
+| 4x | 10,036-11,068 | 562-852M | 1.20-1.49B | 6.0-7.4 | 48-58 |
+
+At 2x the project no longer fits in one Lite month (~866M): it is about 1.1-1.2 months, ~$19-22 of quota. Caveats on top of
+the 10-30 ones: phase C's share of coding is assumed equal to B's, though C held more debugging, supervision of GLM's epoll
+session and log-writing; SMP on Taoxichuan had a GLM brief (`taoxichuan-13-smp.md`) but Claude did it, so there is still no GLM
+run for that class either. The user's 10-30 assessment is unchanged by these numbers: the experiment was flawed and inconclusive,
+but "an open model can build your own stack in a short time for little money" still looks plausible.
+
+**Plan fit and timeline (educated guess, not a measurement; user asked).** Which z.ai plan the project would need on GLM
+alone, for an operator on a normal week instead of the user's actual hours.
+
+*Inputs.*
+- **Plan caps:** from `docs.z.ai/devpack/overview` (Lite 2,000 / 10,000 credits per 5 h / week, Pro 12,000 / 60,000, Max
+  28,000 / 140,000). Scaled by this account's measured ~50 credits per million, a week is ~200M tokens on Lite, ~1.2B on Pro
+  and ~2.8B on Max; a 5-hour window is ~34M, ~205M and ~480M.
+- **Prices:** the docs state only "starting at 18 USD per month" (Lite). Pro $80 and Max $168 a month are from third-party
+  pages (October 2026; older pages list $72 / $160); the subscribe page did not load.
+- **GLM's pace:** z.ai's hourly buckets show 98 active agent-hours over the experiment, 6.4M tokens per hour on average
+  (5.5M median, 14M p90, 18M max); the refined process alone averaged 5.5M per hour.
+- **The user's hours:** from prompt timestamps (prompts less than 90 min apart form one stretch, +15 min each), ~77 engaged
+  hours over 8.5 days with no day off, ~9 a day; a floor, since reading output leaves no timestamp. 19% of prompts were
+  sent between midnight and 6 am local time; the busiest hours were 19-23.
+- **The assumed operator:** 40 hours a week over 5 days. GLM runs while they work, plus one unattended session each evening
+  (the continuation waiter that worked for session ph), so **50-60 agent-hours a week per agent**.
+- **One agent vs two:** Lite's 5-hour window (~34M) holds one agent at the median rate and none at p90, so Lite is
+  single-agent. Two agents on Pro peak at ~140M per 5 h at p90, inside ~205M. Two agents are not twice as fast: the ladder
+  is mostly serial (boot -> sshd -> apk -> network -> fork -> dynamic linking -> rustc -> cargo -> threads -> git -> fixed
+  point, about three quarters of the work). The second agent takes the plans and premise checks off the critical path and
+  runs the independent work: epoll, the extractions, SMP once threads exist, docs and test batteries. Assumed speed-up
+  1.3-1.5x.
+- **Calendar weeks:** on Lite, the weekly cap decides (tokens / 200M); on Pro, agent-hours / (50-60 x speed-up) decide.
+  One month is taken as 4.3 weeks.
+
+*Table 1 - as it happened:* GLM's actual 633M (pre-pivot learning phase and M4 included) plus the remainder at refined rates
+(the re-run extrapolation above). Agent-hours = the 98 actual + the remainder at 5.5M per hour.
+
+| GLM slower by | GLM tokens | agent-hours | Lite (1 agent) | Pro, 1 agent | Pro, 2 agents |
+|---|---:|---:|---|---|---|
+| 2x | 0.91-1.06B | 149-175 | 4.6-5.3 weeks, $36 | 2.5-3.5 weeks, $80 | 1.7-2.7 weeks, $80 |
+| 3x | 1.05-1.27B | 175-214 | 5.3-6.4 weeks, $36 | 2.9-4.3 weeks, $80 | 1.9-3.3 weeks, $80 |
+| 4x | 1.20-1.49B | 200-253 | 6.0-7.4 weeks, $36 | 3.3-5.1 weeks, $80-160 | 2.2-3.9 weeks, $80 |
+
+For reference, what actually happened: 8.5 days; GLM on Lite with weekly resets (633M, ~3.2 Lite weeks of quota); Claude on
+top (1,943M); the user at ~77+ engaged hours.
+
+*Table 2 - adjusted, the refined process from day one:* the pre-pivot calls re-priced at the refined 56k tokens per call
+instead of ~88k (233M -> ~148M, -85M; a lower bound on the saving, since the pivot also shortened sessions), and M4's
+cooperative single-core attempt (159M) dropped as a dead end a replay would not take. 5.5M tokens per agent-hour throughout.
+Milestone cross-check: ~35-40 milestones on the ladder now (fixed points, SMP, epoll and X1-X5 included) at the refined
+median of ~17M is 0.6-0.7B, consistent with the 2x row.
+
+| GLM slower by | GLM tokens | agent-hours | Lite (1 agent) | Pro, 1 agent | Pro, 2 agents |
+|---|---:|---:|---|---|---|
+| 2x | 0.67-0.81B | 122-147 | 3.4-4.1 weeks, $18 | 2.0-2.9 weeks, $80 | 1.3-2.2 weeks, $80 |
+| 3x | 0.81-1.03B | 147-187 | 4.1-5.2 weeks, $18-36 | 2.5-3.7 weeks, $80 | 1.7-2.8 weeks, $80 |
+| 4x | 0.95-1.24B | 173-225 | 4.8-6.2 weeks, $36 | 2.9-4.5 weeks, $80-160 | 1.9-3.5 weeks, $80 |
+
+Max ($168) fits no row better than Pro: its extra room only matters with about four or more concurrent agents, and the
+ladder has no work for that many.
+
+*Supposed timeline, Table 2 at 2x (~0.75B, ~137 agent-hours).* Hours per phase at 5.5M per hour:
+- stages 1-7 (boot, hello, busybox, sshd, offline `apk`, outbound TCP): ~150M, ~27 h;
+- stage 8 without M4 (mirror, clock, DNS, wire dedup, `apk update` / `apk add curl`, dynamic PIE, HTTPS curl, blocking fork,
+  pipes, the stall report, plans): ~192M from the ledger, ~35 h;
+- stage 9 and the fixed points (rustc, cargo, threads/futex, git clone, crates.io `-j4`, CoW fork, K1 == K2 on Linux KVM,
+  the RAM cap, K1 == K2 on metal): ~230M, ~42 h (65% of the extrapolated remainder, B's share of B+C's Sonnet calls);
+- consolidation (epoll at its actual 46M, X1-X5, SMP, extraction plan, docs): ~180M, ~33 h.
+
+| | 1 agent (Pro or Lite, 55 agent-h/week) | 2 agents (Pro) |
+|---|---|---|
+| week 1 | stages 1-7 by Wednesday; stage 8 from Wednesday (mirror, clock, DNS, `apk`) | A: stages 1-7, then stage 8. B: writes each next plan and premise table ahead of A; epoll as soon as outbound TCP lands |
+| week 2 | rest of stage 8 by Monday; stage 9 and both fixed points by Friday | A: rest of stage 8, stage 9, fixed points (~Wednesday-Thursday). B: X1-X5 extractions, SMP once threads land, docs and test batteries |
+| week 3 | consolidation: epoll, X1-X5, SMP, docs (done ~Wednesday) | (done, or the tail of SMP) |
+| total | ~2.5 weeks; on Lite the weekly cap stretches the same work to ~4 weeks | ~1.7-2 weeks |
+
+At 4x everything stretches about 1.5x: one agent ~3.5-4 weeks, two agents ~2.5-3. With two agents the binding limit is
+probably the operator, who has to review two streams of output in a 40-hour week, not the quota.
+
+**User's assessment (2026-11-01, recorded at their request).** The experiment still holds water even though its result is
+inconclusive: there is enough supporting evidence to believe a project like this can be done at a reasonable pace with open
+models. The user is just not patient enough to do it that way themselves.
+
+The evidence for the claim, from this log:
+- goose + GLM-5.3-Flash took Taoxichuan from boot to an HTTPS `curl`, through dynamic linking, blocking fork, pipes and DNS,
+  and later delivered epoll and the guest RAM-cap lift on Akuma's own hypervisor;
+- the refined process cut tokens per call by ~40%, and its median milestone cost ~17M tokens (~$0.63);
+- the continuation pattern finished a defect in half the calls a long context needed;
+- goose talking to GLM ran inside Taoxichuan itself (11-01).
+
+The evidence against, or not yet tested:
+- no GLM run exists for the rustc / cargo / threads / SMP class of milestone, and the 2-4x factor is assumed;
+- GLM's one long dead end (M4, 159M) shows how a milestone can go wrong without a stop rule;
+- every refined GLM session was Claude-supervised.
+
+**User's note on local hosting (2026-11-01, recorded at their request).** Unfortunately no model that can reasonably be
+hosted locally produces this many tokens a month at a reasonable hardware cost, so "open models" here still means open
+weights served by a provider (z.ai), not a model on the user's own machine. For whoever checks this later, what a local
+setup would have to sustain, from this log's figures (one agent, refined process):
+- **Volume:** ~0.7-1.2B tokens a month (Table 2).
+- **Rate:** ~5.5M tokens per agent-hour on average, 14M at p90, which is ~1,500 tokens/s of input on average and ~3,900 at
+  p90. 98% of that input is a cached prefix.
+- **Fresh work per hour:** ~95k fresh input tokens and 22-99k output tokens (output was 0.4-1.8% of tokens per day), i.e.
+  ~6-27 output tokens/s sustained.
+- **Context:** contexts up to ~180k tokens (stage 2's largest).
+- **Quality:** a model at least as capable as GLM-5.3-Flash, since the whole estimate assumes that model.
+
+A second agent doubles everything except the context length.
+
+**The user's prompts to Sonnet, categorized (2026-11-01; user asked).**
+
+*Method.* All 390 typed Sonnet prompts of the experiment (see "User prompts" above) were read by the supervisor (Opus) and
+each was given one primary category. That is one reader's judgement in a single pass, so a borderline prompt could fall in a
+neighbouring row; counts may shift by a few. Phases are as in the Claude table: A supervising goose, B executing to the
+fixed point, C consolidation.
+
+| category | prompts | share | A | B | C |
+|---|---:|---:|---:|---:|---:|
+| direction / scope decision | 61 | 15.6% | 35 | 19 | 7 |
+| ops / infra / tooling (ryzen up or down, images, scripts, handoff prompts) | 58 | 14.9% | 43 | 12 | 3 |
+| status check ("how is it doing") | 51 | 13.1% | 44 | 3 | 4 |
+| go-ahead / permission / "keep going" | 39 | 10.0% | 26 | 11 | 2 |
+| reaction / comment | 37 | 9.5% | 32 | 4 | 1 |
+| quota and tokens | 32 | 8.2% | 32 | 0 | 0 |
+| how GLM should be steered (point at docs and probes, no tips, plan first, test-suite scope) | 31 | 7.9% | 29 | 1 | 1 |
+| question to understand something | 28 | 7.2% | 19 | 6 | 3 |
+| "record this in the log / docs" | 21 | 5.4% | 17 | 2 | 2 |
+| **bug hint / likely cause** | **16** | **4.1%** | **5** | **5** | **6** |
+| correcting the agent (lazy, wasted time, too many tips) | 8 | 2.1% | 7 | 0 | 1 |
+| off-topic (crush docs, links) | 8 | 2.1% | 8 | 0 | 0 |
+
+Separately, 18 prompts (16 of them in phase A) pointed at something that already existed: docs, probes, crates, the archive,
+other kernels.
+
+*The bug hints, and what they turned out to be.* 16 prompts, 14 distinct hints (the sshd ABI one spans three prompts).
+
+| prompt | when | the user's hint | outcome (source) | verdict |
+|---|---|---|---|---|
+| 045 | 10-24 | "that's a classic problem, did it get the solution from docs?" | recognition of a known problem, no cause named | not scored |
+| 119 | 10-25 | "host side already worked for other kernels" (no host-kernel rebuild needed) | outbound worked through the unchanged host relay (stage 7 entry) | right |
+| 212 | 10-27 | "I doubt the issue is the relay, the same curl works on Linux" | Q9 blamed the host relay; Q10-R found the wedge was a guest bug | right |
+| 271 | 10-28 | "grep the archive and check how other kernels handled it" | a pointer, not a cause; pg's comparison did not explain the loop, its own instrumentation found three bugs | not scored |
+| 292 | 10-29 | "increase the mmap memory cap ourselves" for `rustc --version` | 64 MiB slabs ran out of memory loading `librustc_driver` (pn entry) | right |
+| 303 | 10-29 | "I would assume lost wakeup is to blame" for the stall | the child sat in a ring slot still marked INITIALIZING and was never scheduled (pn S2 entry): never runnable rather than a lost wakeup | partly |
+| 308-310 | 10-29 | "I thought sshd was Linux compatible ... pretty sure linux-abi is default" | the image's sshd was the akuma-ABI build; the same image fault broke `/bin/sh` on metal on 10-31 | right |
+| 318 | 10-29 | "pump loop sounds very plausible" | the stall was the INITIALIZING slot | not the cause |
+| 369 | 10-31 | "I wonder if number 8 is significant" | not settled in this log | not scored |
+| 375 | 10-31 | "fix rt_sigsuspend, it seems important" | busybox ash's `wait` hung without it (rt_sigsuspend commit) | right |
+| 376 | 10-31 | "ssh is probably failing because it outputs nothing and the connection drops" | sshd keepalive shipped for long silent commands | right |
+| 379 | 10-31 | "probably touched by GLM's edits, find which commit broke the build" | bisect landed on `cf44f840`, GLM's epoll drain hooks (an empty-pipe read returned EAGAIN, not EOF); the "interrupt" detail was wrong | right |
+| 382 | 10-31 | "fix /bin/sh first, probably init wiring is faulty" | spawning from the pool-thread init was refused because of the image's cooperative sshd | partly |
+| 385 | 11-01 | "it used to pass not long ago, cow has a long history of bugs" | the trail led to a BKL convoy, CoW not implicated; trigger still open (`TAOXICHUAN_J4_BKL_CONVOY.md`) | not the cause (so far) |
+
+*"Usually right", in numbers.* 11 of the 14 hints have an outcome in this log or the git history; 3 are not scored (a
+recognition, a pointer, an unsettled one).
+
+| counting | right | rate |
+|---|---:|---:|
+| strict: only "right" counts | 7 of 11 | 64% |
+| partly right counted as half | 8 of 11 | **73%** |
+| lenient: right or partly right | 9 of 11 | 82% |
+
+So **about 70%, with a wide margin**: on 11 hints the strict rate's 95% interval (Wilson) is roughly 35-85%. One verdict can
+still move: 385 stays "not the cause" only while the -j4 trigger is unknown. The 119 verdict leans on the stage-7 entry's
+account that the unchanged relay worked, not on a direct test of the user's claim.
+
+*What it shows.*
+- **Hints rose as the role changed:** 1.7% of the user's prompts while supervising GLM (held back on purpose under the
+  no-tips rule; the 18 resource pointers were the allowed form of help), 8% while Claude executed, 20% in consolidation.
+  **The user's reading (recorded at their request):** the hints went up as they lost patience with the grueling process,
+  not only because the role changed. The rise tracks the user's own fatigue, the same reason they give for the 10-29 switch
+  to Claude executing (the user's note of 10-30 under "The pivot": "too tired to keep up the GLM grind"). The later phases' hint rate therefore measures the operator
+  running out of patience as much as what a phase needed, and should not be read as the help a fresh operator would give.
+- **About a third of the supervising phase kept the loop going rather than steering the work:** status checks, quota
+  readings and reactions are 108 of 297 phase-A prompts (36%). Nearly all of it disappeared after the 10-29 switch.
+- **The operator's memory of Akuma was a resource the tokenomics does not count.** A correct hint saves a hunt: the sshd ABI,
+  the mmap cap and the bisect target each named in one line what a session would otherwise have instrumented for.
