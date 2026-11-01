@@ -1731,6 +1731,13 @@ pub fn sys_dup(oldfd: u32) -> u64 {
     akuma_exec::process::clone_fd_refs(&entry);
     let newfd = proc.alloc_fd(entry);
     proc.clear_cloexec(newfd);
+    // `O_NONBLOCK` belongs to the open file description on Linux, so the dup shares it. Here
+    // it is keyed by fd number, so the dup gets a copy: without it tokio's signal driver, which
+    // drains a `try_clone()` (a dup) of its non-blocking socketpair until `EAGAIN`, parked
+    // forever on the second read (`docs/archive/DUP_LOST_O_NONBLOCK.md`).
+    if proc.is_nonblock(oldfd) {
+        proc.set_nonblock(newfd);
+    }
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(128, "[syscall] dup(oldfd={}) = {}\n", oldfd, newfd);
     }
@@ -3248,6 +3255,10 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
             let new_fd = proc.alloc_fd_from(arg as u32, entry);
             if cmd == F_DUPFD_CLOEXEC {
                 proc.set_cloexec(new_fd);
+            }
+            // The dup carries `O_NONBLOCK`, as `sys_dup` (the description's flag on Linux).
+            if proc.is_nonblock(fd) {
+                proc.set_nonblock(new_fd);
             }
             u64::from(new_fd)
         }

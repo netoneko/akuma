@@ -1,5 +1,5 @@
 {
-  "amd64/src": 1372,
+  "amd64/src": 1368,
   "crates/akuma-alloc": 26,
   "crates/akuma-bkl": 33,
   "crates/akuma-boot-amd64": 22,
@@ -61,7 +61,7 @@
   "crates/akuma-rtw89": 126,
   "crates/akuma-rump": 65,
   "crates/akuma-ryzen-amd64": 24,
-  "crates/akuma-sched-amd64": 9,
+  "crates/akuma-sched-amd64": 10,
   "crates/akuma-scheduler": 28,
   "crates/akuma-selftest": 23,
   "crates/akuma-slot-table": 7,
@@ -71,7 +71,7 @@
   "crates/akuma-syscalls-abi": 2,
   "crates/akuma-syscalls-eventfd": 7,
   "crates/akuma-syscalls-glue": 469,
-  "crates/akuma-syscalls-glue-amd64": 7,
+  "crates/akuma-syscalls-glue-amd64": 11,
   "crates/akuma-syscalls-ipc": 19,
   "crates/akuma-syscalls-linux": 25,
   "crates/akuma-syscalls-log": 8,
@@ -102,5 +102,5 @@
   "crates/akuma-wifi": 49,
   "crates/akuma-wpa": 75,
   "crates/akuma-xhci": 27,
-  "taoxichuan/src": 138
+  "taoxichuan/src": 146
 }

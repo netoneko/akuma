@@ -559,6 +559,8 @@ akuma-exec = { path = "../crates/akuma-exec" }
 # `box run` answered "failed to spawn" until 2026-11-01. Taoxichuan has no box
 # and keeps it off.
 akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp", "exec"] }
+# The x86-only syscall bodies both x86 kernels share; so far `kill` (moved from `signal.rs`).
+akuma-syscalls-glue-amd64 = { path = "../crates/akuma-syscalls-glue-amd64" }
 
 [[bin]]
 name = "akuma-amd64"

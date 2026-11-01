@@ -147,6 +147,7 @@ dependencies = [
  "akuma-syscalls",
  "akuma-syscalls-abi",
  "akuma-syscalls-glue",
+ "akuma-syscalls-glue-amd64",
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
  "akuma-syscalls-net",

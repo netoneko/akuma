@@ -52,6 +52,18 @@ impl FxArea {
         &self.0
     }
 
+    /// An area from an image a program handed back (a signal frame's): exactly
+    /// [`SIZE`](Self::SIZE) bytes, else `None`. Not yet safe to restore: [`sanitize`](Self::sanitize) it.
+    #[must_use]
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let mut a = Self::zeroed();
+        if b.len() != Self::SIZE {
+            return None;
+        }
+        a.0.copy_from_slice(b);
+        Some(a)
+    }
+
     /// Make a user-supplied image safe to `xrstor`: reserved bits cleared, `MXCSR`
     /// masked to what this CPU implements.
     pub fn sanitize(&mut self) {

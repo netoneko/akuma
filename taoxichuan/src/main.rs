@@ -662,6 +662,11 @@ fn timer_trap_locked(t: &Trap<'_>) {
     if t.from_ring3() && child::kill_requested() {
         child::finish_killed();
     }
+    // A fatal pending signal (`SIGKILL`, or a default-terminate with no handler) ends a thread
+    // looping in ring 3; handlers wait for its next syscall return.
+    if t.from_ring3() {
+        child::deliver_fatal_on_tick();
+    }
     // M4 slice 3 preemption (session pf, plan §5): a tick that interrupted
     // ring 3 may switch — the same `x86_yield` the park loop and the idle lap
     // already run, on this handler's own (per-slot, `arm_trap_stack`) trap
@@ -1054,7 +1059,6 @@ const MAX_HOLES: usize = 64;
 const MAX_SHARED: usize = 8;
 /// errnos `akuma_ring3_amd64::err` does not carry.
 pub(crate) const EINTR: u64 = 4;
-pub(crate) const ESRCH: u64 = 3;
 /// Bisect mask for the mmap-slab rework, set from the kernel command line
 /// (`mmdbg=N`, default 7): 1 = munmap frees + records holes, 2 = MAP_FIXED
 /// releases what it replaces, 4 = mremap frees/moves the old range.
@@ -1289,28 +1293,6 @@ fn munmap_arm(addr: u64, len: u64) -> u64 {
 }
 
 
-/// `tkill(tid, sig)` / `tgkill(tgid, tid, sig)`. No signal is delivered on this
-/// kernel, so a signal's only effect is the one thing a thread can observe
-/// without a handler running: its blocked `poll`/pipe `read` returns `EINTR`.
-/// That is exactly what the jobserver crate relies on - cargo sends `SIGUSR1`
-/// to its helper thread to pull it out of a blocking wait and then joins it
-/// (the ENOSYS this answered before left cargo hung forever after any error).
-/// `tid` is the threading slot (what `clone` returned). Signal 0 only probes.
-fn tkill_arm(tid: u64, sig: u64) -> u64 {
-    if sig > 64 {
-        return e(ring3::err::EINVAL);
-    }
-    let tid = tid as usize;
-    if tid >= child::NSLOTS || !child::slot_in_use(tid) {
-        return e(ESRCH);
-    }
-    if sig != 0 {
-        akuma_threading::set_thread_interrupted(tid);
-        akuma_threading::get_waker_for_thread(tid).wake();
-    }
-    0
-}
-
 /// Which task record the syscall path acts on now.
 pub(crate) fn task_slot_index() -> usize {
     TASK_SLOT[ring3::cpu_index()].load(core::sync::atomic::Ordering::Relaxed)
@@ -1516,12 +1498,22 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     if child::kill_requested() {
         child::finish_killed();
     }
+    let nr = fr.rax;
     let r = dispatch_locked(fr);
     if child::kill_requested() {
         child::finish_killed();
     }
+    // The stash is this thread's again: the `rsp` the call chose on purpose (a signal frame, or
+    // `rt_sigreturn` putting the interrupted one back), else the one saved at entry - a park
+    // inside the call let other threads overwrite it. Before delivery, which builds on it.
+    ring3::set_user_rsp_stash(child::take_return_rsp().unwrap_or(stash));
+    // Pending signals are taken here, on the way back to ring 3: a handler's frame, an ignore,
+    // or a default action that ends the group (`child::deliver_at_return`). After an
+    // `rt_sigreturn` too, as on Linux: that is how the next pending signal gets its turn.
+    let r = child::deliver_at_return(fr, nr, r);
+    // A frame pushed just now already set the stash; its override is spent.
+    let _ = child::take_return_rsp();
     smp::bkl_leave();
-    ring3::set_user_rsp_stash(stash);
     r
 }
 
@@ -2202,8 +2194,16 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             e(ring3::err::ENOSYS)
         }
-        akuma_syscalls_abi::x86_64::TKILL => tkill_arm(fr.arg1(), fr.arg2()),
-        akuma_syscalls_abi::x86_64::TGKILL => tkill_arm(fr.arg2(), fr.arg3()),
+        // `tkill`/`tgkill`: the x86 kernels' shared bodies - pend on the thread, and interrupt
+        // it only when the default action kills (setting the flag on the caller of musl's
+        // `raise` made the mask restore after it fail with EINTR).
+        akuma_syscalls_abi::x86_64::TKILL => akuma_syscalls_glue_amd64::kill::tkill(fr.arg1() as u32, fr.arg2() as u32),
+        // `kill`: the x86 kernels' shared body - pend on the target group, each thread takes it
+        // at its own next return to ring 3.
+        akuma_syscalls_abi::x86_64::KILL => akuma_syscalls_glue_amd64::kill::kill(fr.arg1(), fr.arg2()),
+        akuma_syscalls_abi::x86_64::TGKILL => {
+            akuma_syscalls_glue_amd64::kill::tgkill(fr.arg1() as u32, fr.arg2() as u32, fr.arg3() as u32)
+        }
         other => {
             // A guest task hit a number this table does not serve; the errno
             // is the answer (the arch-level checklist arm is above). The

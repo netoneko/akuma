@@ -380,6 +380,11 @@ fn task_exit_code(code: i32) -> ! {
         akuma_threading::get_waker_for_thread(0).wake();
     }
     akuma_exec::process::publish_child_exit(lead_pid, code);
+    // The group's children - its threads' too - go to init, which reaps them (this kernel's
+    // init, sshd, runs `wait4(-1, WNOHANG)`), as amd64 and glue's exit do. Without it an orphan
+    // stayed registered under a dead parent nobody could wait for, and its thread slot leaked
+    // for good: `killtree` ran the 48-slot ring out by its third round.
+    let _ = akuma_exec::process::reparent_group_children_to(lead_pid, 1);
     if lead != cur {
         akuma_syscalls_glue::futex_purge_tid(lead);
         akuma_threading::mark_thread_terminated(lead);
@@ -850,14 +855,11 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
 }
 
 /// `rt_sigsuspend(mask, sigsetsize)` - x86_64 130: replace the signal mask and sleep until a
-/// signal arrives, then restore it and answer `EINTR`, always.
-///
-/// This kernel delivers no signal, so a sleeper can only be woken by the two things a signal
-/// would have meant here: a `tkill` (the thread's interrupt bit, [`crate::tkill_arm`]) and a
-/// child's death (`SIGCHLD`) - busybox ash's `wait` builtin parks in exactly this call and
-/// re-polls `wait4(WNOHANG)` after it, which is why the `ENOSYS` this answered before made
-/// `cmd & ...; wait` spin forever. The child side is wait4's: a live child of this process gets
-/// this task's slot stamped as its `waiter`, so its exit wakes the sleeper.
+/// signal the new mask lets through is pending (or the thread is interrupted), deliver it under
+/// that mask, and answer `EINTR`, always. busybox ash's `wait` builtin parks in exactly this
+/// call and re-polls `wait4(WNOHANG)` after it, which is why the `ENOSYS` this answered before
+/// made `cmd & ...; wait` spin forever. A child's exit pends SIGCHLD and wakes the sleeper
+/// (`publish_child_exit`), as `kill`/`tkill` do for theirs.
 pub fn sigsuspend_arm(fr: &mut ring3::SyscallFrame, mask_va: u64, sigsetsize: u64) -> u64 {
     if sigsetsize != 8 {
         return crate::e(ring3::err::EINVAL);
@@ -876,44 +878,174 @@ pub fn sigsuspend_arm(fr: &mut ring3::SyscallFrame, mask_va: u64, sigsetsize: u6
     let new = u64::from_le_bytes(b) & !unblockable;
     let old = akuma_exec::threading::thread_signal_mask();
     akuma_exec::threading::set_thread_signal_mask(new);
-    let mut child_died = false;
     loop {
         if akuma_threading::take_thread_interrupted(me) {
             #[cfg(feature = "trace-err")]
             sigsuspend_note(b'I', me);
             break;
         }
-        // A child's exit pends SIGCHLD on a thread of its parent's group and
-        // wakes it (`publish_child_exit`); this kernel delivers no other signal.
-        if akuma_threading::pending_signals_raw(me) & (1 << (SIGCHLD - 1)) != 0 {
-            akuma_threading::clear_pending_signal(me, SIGCHLD as u32);
+        // Any signal the temporary mask lets through ends the sleep (a child's exit pends
+        // SIGCHLD and wakes this thread: `publish_child_exit`; `kill`/`tkill` pend and wake).
+        if akuma_threading::pending_signals_raw(me) & !new != 0 {
             #[cfg(feature = "trace-err")]
             sigsuspend_note(b'D', me);
-            child_died = true;
             break;
         }
         let stash = ring3::user_rsp_stash();
         akuma_threading::schedule_blocking(u64::MAX);
         ring3::set_user_rsp_stash(stash);
     }
-    // SIGCHLD with a real handler: run it before this call returns (ash's `wait` sets a flag
-    // there and sleeps again until it is set). The mask during the call is the temporary one.
-    if child_died && deliver_sigchld(fr, new, old) {
-        return crate::e(crate::EINTR);
+    // Deliver under the temporary mask, as Linux does; the handler's `rt_sigreturn` puts the
+    // old mask back (ash's `wait` sets a flag in its SIGCHLD handler and sleeps again).
+    let eintr = crate::e(crate::EINTR);
+    if deliver_one(fr, akuma_syscalls_abi::x86_64::RT_SIGSUSPEND, eintr, new, old) {
+        return eintr;
     }
     akuma_exec::threading::set_thread_signal_mask(old);
-    crate::e(crate::EINTR)
+    eintr
 }
 
-const SIGCHLD: u64 = 17;
+/// The user `rsp` a thread returns to ring 3 with when a call moved it on purpose (a signal
+/// frame was pushed, or `rt_sigreturn` put the interrupted one back); 0 = none. Per thread
+/// slot, because the dispatcher saves the global stash at entry and puts it back at exit (a
+/// park inside the call lets other threads overwrite it), and that put-back would otherwise
+/// undo the move: the handler ran on the interrupted stack and its `ret` never reached the
+/// restorer.
+static RETURN_RSP: [core::sync::atomic::AtomicU64; NSLOTS] = [const { core::sync::atomic::AtomicU64::new(0) }; NSLOTS];
+
+fn set_return_rsp(rsp: u64) {
+    let me = crate::exec_twin::current_slot();
+    if me < NSLOTS {
+        RETURN_RSP[me].store(rsp, core::sync::atomic::Ordering::Relaxed);
+    }
+    ring3::set_user_rsp_stash(rsp);
+}
+
+/// The dispatcher's exit: the `rsp` a signal frame or `rt_sigreturn` chose for this thread,
+/// once, else `None` (the stash saved at entry is right).
+pub fn take_return_rsp() -> Option<u64> {
+    let me = crate::exec_twin::current_slot();
+    if me >= NSLOTS {
+        return None;
+    }
+    match RETURN_RSP[me].swap(0, core::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        v => Some(v),
+    }
+}
+
+/// Signals no mask can block: `SIGKILL` (9) and `SIGSTOP` (19).
+const UNBLOCKABLE: u64 = (1 << 8) | (1 << 18);
+
+/// Deliver the running thread's pending signals at its return to ring 3 from syscall `nr`,
+/// whose result is `r`: the dispatcher's exit. One handler at most (the next pending
+/// signal waits for this one's `rt_sigreturn`, itself a syscall return); ignored signals are
+/// dropped; a default action that kills ends the group ([`task_exit_code`], status
+/// `-signal`). Returns what the call answers.
+pub fn deliver_at_return(fr: &mut ring3::SyscallFrame, nr: u64, r: u64) -> u64 {
+    // The interrupt flag exists to break a call that is *blocking*; on the way back to ring 3
+    // nothing is. Left set, it makes the thread's next glue call answer EINTR without running:
+    // a `kill`/`tkill` aimed at the caller itself sets it, and musl's `raise` and `abort` then
+    // lost the mask restore after their `tkill`, so the signal stayed blocked.
+    let me = crate::exec_twin::current_slot();
+    if me < NSLOTS {
+        let _ = akuma_threading::take_thread_interrupted(me);
+    }
+    let mask = akuma_exec::threading::thread_signal_mask();
+    deliver_one(fr, nr, r, mask, mask);
+    r
+}
+
+/// Take pending signals the mask `cur` lets through until one runs a handler (`true`) or none
+/// is left (`false`). `restore` is the mask the handler's `rt_sigreturn` puts back.
+fn deliver_one(fr: &mut ring3::SyscallFrame, nr: u64, r: u64, cur: u64, restore: u64) -> bool {
+    let me = crate::exec_twin::current_slot();
+    if me >= NSLOTS {
+        return false;
+    }
+    let Some(p) = akuma_exec::process::current_process_shared() else {
+        return false;
+    };
+    while let Some(sig) = akuma_threading::take_pending_signal(cur & !UNBLOCKABLE) {
+        let idx = (sig as usize).wrapping_sub(1);
+        if idx >= akuma_exec::process::MAX_SIGNALS {
+            continue;
+        }
+        let act = p.signal_actions.actions.lock()[idx];
+        match act.handler {
+            akuma_exec::process::SignalHandler::Ignore => {}
+            akuma_exec::process::SignalHandler::UserFn(entry) => {
+                // `SA_RESTART`: an interrupted call runs again after the handler - the saved
+                // `rip` backs over the 2-byte `syscall` and `rax` is its number again - except
+                // the calls Linux never restarts.
+                let restart = r == crate::e(crate::EINTR) && act.flags & SA_RESTART != 0 && !NO_RESTART.contains(&nr);
+                let (rax, rip) = if restart { (nr, fr.user_rip - 2) } else { (r, fr.user_rip) };
+                if push_handler(fr, sig, entry as u64, &act, rax, rip, cur, restore) {
+                    return true;
+                }
+                // A handler that cannot be entered (no restorer, an unwritable stack) must not
+                // swallow a fatal signal.
+                if akuma_syscalls_glue::signal::signal_is_fatal_default(sig) {
+                    task_exit_code(-(sig as i32));
+                }
+            }
+            akuma_exec::process::SignalHandler::Default => {
+                if akuma_syscalls_glue::signal::signal_is_fatal_default(sig) {
+                    akuma_primitives::safe_print!(96, "[signal] pid={} killed by signal {}\n", p.pid, sig);
+                    task_exit_code(-(sig as i32));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// At a ring-3 tick: a pending signal whose action kills ends the group now, so a thread in a
+/// loop that makes no syscall still dies of `SIGKILL` (or `SIGTERM` with no handler). Handlers
+/// wait for the thread's next syscall return.
+pub fn deliver_fatal_on_tick() {
+    let me = crate::exec_twin::current_slot();
+    if me >= NSLOTS {
+        return;
+    }
+    let pend = akuma_threading::pending_signals_raw(me) & !(akuma_exec::threading::thread_signal_mask() & !UNBLOCKABLE);
+    if pend == 0 {
+        return;
+    }
+    let Some(p) = akuma_exec::process::current_process_shared() else {
+        return;
+    };
+    for sig in 1..=64u32 {
+        if pend & (1 << (sig - 1)) == 0 || !akuma_syscalls_glue::signal::signal_is_fatal_default(sig) {
+            continue;
+        }
+        let idx = (sig - 1) as usize;
+        let default = idx >= akuma_exec::process::MAX_SIGNALS
+            || matches!(p.signal_actions.actions.lock()[idx].handler, akuma_exec::process::SignalHandler::Default);
+        if sig == 9 || default {
+            akuma_threading::clear_pending_signal(me, sig);
+            task_exit_code(-(sig as i32));
+        }
+    }
+}
+
 const SA_RESTORER: u64 = 0x0400_0000;
 const SA_NODEFER: u64 = 0x4000_0000;
 const SA_SIGINFO: u64 = 4;
+const SA_RESTART: u64 = 0x1000_0000;
+/// Calls Linux never restarts after a handler, `SA_RESTART` or not: the sleeps and the waits
+/// with a timeout (x86_64 numbers).
+const NO_RESTART: [u64; 11] = [7, 23, 34, 35, 130, 230, 232, 270, 271, 281, 441];
 /// The registers `rt_sigreturn` puts back, in `pack_frame` order.
 const FRAME_WORDS: usize = 15;
 /// What the signal frame holds above the restorer slot: the saved registers, the user `rsp`
-/// at the interruption, the mask to restore.
-const SIGFRAME_BYTES: usize = FRAME_WORDS * 8 + 16;
+/// at the interruption, the mask to restore, and where the FP image is.
+const SIGFRAME_BYTES: usize = FRAME_WORDS * 8 + 24;
+/// The `siginfo_t` and `ucontext_t` an `SA_SIGINFO` handler is handed (`rsi`, `rdx`): the
+/// signal number and `SI_USER` in the first, zeros in the second (this kernel's frame is its
+/// own, so a handler that edits `uc_mcontext` changes nothing).
+const SIGINFO_BYTES: u64 = 128;
+const UCONTEXT_BYTES: u64 = 944;
 
 fn pack_frame(f: &ring3::SyscallFrame) -> [u64; FRAME_WORDS] {
     [
@@ -940,64 +1072,82 @@ fn unpack_frame(f: &mut ring3::SyscallFrame, w: &[u64; FRAME_WORDS]) {
     f.user_rflags = w[14];
 }
 
-/// Push a signal frame for `SIGCHLD` and redirect the syscall's return into its handler. `false`
-/// when there is nothing to run (default/ignored disposition, blocked, or the user stack is not
-/// writable), in which case nothing was changed. The frame, from the handler's `rsp` up:
-/// `[restorer][saved registers][user rsp][mask to restore]`; the restorer's `rt_sigreturn`
-/// finds the saved block at its `rsp`. The kernel reads the block back itself, so its layout is
-/// private to [`deliver_sigchld`] and [`sigreturn_arm`].
-fn deliver_sigchld(fr: &mut ring3::SyscallFrame, cur_mask: u64, restore_mask: u64) -> bool {
-    // The disposition is the process's, in `akuma-exec`'s table (glue's
-    // `rt_sigaction` writes it).
-    let Some(act) = akuma_exec::process::current_process_shared()
-        .map(|p| p.signal_actions.actions.lock()[(SIGCHLD - 1) as usize])
-    else {
-        return false;
-    };
-    let akuma_exec::process::SignalHandler::UserFn(handler) = act.handler else {
-        return false;
-    };
-    let (handler, flags, restorer, sa_mask) = (handler as u64, act.flags, act.restorer as u64, act.mask);
-    if flags & SA_RESTORER == 0 || flags & SA_SIGINFO != 0 {
-        return false;
-    }
-    if cur_mask & (1 << (SIGCHLD - 1)) != 0 {
+/// Push a signal frame for `sig` and redirect the return to ring 3 into its handler `entry`.
+/// `false` when it cannot be entered (no restorer, or the user stack is not writable), in
+/// which case nothing was changed. From the handler's `rsp` up: `[restorer][saved registers,
+/// user rsp, mask to restore, FP image address]`, then a zeroed `ucontext`, the `siginfo`, and
+/// the 64-byte-aligned FP image. The restorer's `rt_sigreturn` finds the saved block at its
+/// `rsp`; the layout is private to this function and [`sigreturn_arm`]. `rax`/`rip` are what
+/// the block saves for the interrupted code (its result, or a restart).
+#[allow(clippy::too_many_arguments)]
+fn push_handler(
+    fr: &mut ring3::SyscallFrame,
+    sig: u32,
+    entry: u64,
+    act: &akuma_exec::process::SignalAction,
+    rax: u64,
+    rip: u64,
+    cur_mask: u64,
+    restore_mask: u64,
+) -> bool {
+    let (flags, restorer, sa_mask) = (act.flags, act.restorer as u64, act.mask);
+    if flags & SA_RESTORER == 0 {
         return false;
     }
     let user_rsp = ring3::user_rsp_stash();
-    // Below the red zone, 16-aligned, then one word lower so the handler sees rsp = 8 (mod 16),
-    // as after a `call`.
-    let Some(top) = user_rsp.checked_sub(128 + SIGFRAME_BYTES as u64 + 8) else {
+    // Below the red zone: the FP image (64-aligned, `xsave`'s rule), the siginfo and the
+    // ucontext under it, then the block; the handler sees rsp = 8 (mod 16), as after a `call`.
+    let fx_size = akuma_sched_amd64::FxArea::SIZE as u64;
+    let Some(fp_at) = user_rsp.checked_sub(128 + fx_size).map(|v| v & !0x3F) else {
+        return false;
+    };
+    let info_at = fp_at - SIGINFO_BYTES;
+    let uc_at = info_at - UCONTEXT_BYTES;
+    let Some(top) = uc_at.checked_sub(SIGFRAME_BYTES as u64 + 8) else {
         return false;
     };
     let at = (top & !0xF) - 8;
+    if !crate::user_ok(at, user_rsp - at) {
+        return false;
+    }
     let mut buf = [0u8; 8 + SIGFRAME_BYTES];
     buf[..8].copy_from_slice(&restorer.to_le_bytes());
-    let words = pack_frame(fr);
+    let mut words = pack_frame(fr);
+    words[12] = rax;
+    words[13] = rip;
     for (i, w) in words.iter().enumerate() {
         buf[8 + i * 8..16 + i * 8].copy_from_slice(&w.to_le_bytes());
     }
-    // Resume value of the interrupted call is EINTR.
-    let rax_at = 8 + 12 * 8;
-    buf[rax_at..rax_at + 8].copy_from_slice(&crate::e(crate::EINTR).to_le_bytes());
     let tail = 8 + FRAME_WORDS * 8;
     buf[tail..tail + 8].copy_from_slice(&user_rsp.to_le_bytes());
     buf[tail + 8..tail + 16].copy_from_slice(&restore_mask.to_le_bytes());
-    if !crate::user_ok(at, buf.len() as u64) || !crate::copy_to_user(at, &buf) {
+    buf[tail + 16..tail + 24].copy_from_slice(&fp_at.to_le_bytes());
+    // The interrupted FP/SSE file goes to the frame; the handler starts from the initial state.
+    let mut fx = akuma_sched_amd64::FxArea::zeroed();
+    akuma_sched_amd64::fpu_save_live(&mut fx);
+    let mut info = [0u8; SIGINFO_BYTES as usize];
+    info[..4].copy_from_slice(&(sig as i32).to_le_bytes()); // si_signo; si_errno, si_code (SI_USER) 0
+    let zeros = [0u8; UCONTEXT_BYTES as usize];
+    if !crate::copy_to_user(fp_at, fx.bytes())
+        || !crate::copy_to_user(info_at, &info)
+        || !crate::copy_to_user(uc_at, &zeros)
+        || !crate::copy_to_user(at, &buf)
+    {
         return false;
     }
-    let during = cur_mask | sa_mask | if flags & SA_NODEFER == 0 { 1 << (SIGCHLD - 1) } else { 0 };
+    akuma_sched_amd64::fpu_reset_live();
+    let bit = 1u64 << (sig - 1);
+    let during = cur_mask | sa_mask | if flags & SA_NODEFER == 0 { bit } else { 0 };
     akuma_exec::threading::set_thread_signal_mask(during);
-    fr.user_rip = handler;
-    fr.rdi = SIGCHLD;
-    fr.rsi = 0;
-    fr.rdx = 0;
-    ring3::set_user_rsp_stash(at);
+    fr.user_rip = entry;
+    fr.rdi = u64::from(sig);
+    (fr.rsi, fr.rdx) = if flags & SA_SIGINFO != 0 { (info_at, uc_at) } else { (0, 0) };
+    set_return_rsp(at);
     true
 }
 
 /// `rt_sigreturn` - x86_64 15: the restorer's call after a handler returned. The user `rsp` is
-/// just past the restorer slot, where [`deliver_sigchld`] put the saved block.
+/// just past the restorer slot, where [`push_handler`] put the saved block.
 pub fn sigreturn_arm(fr: &mut ring3::SyscallFrame) -> u64 {
     let at = ring3::user_rsp_stash();
     let mut buf = [0u8; SIGFRAME_BYTES];
@@ -1011,14 +1161,30 @@ pub fn sigreturn_arm(fr: &mut ring3::SyscallFrame) -> u64 {
     let tail = FRAME_WORDS * 8;
     let user_rsp = u64::from_le_bytes(buf[tail..tail + 8].try_into().unwrap_or([0; 8]));
     let mask = u64::from_le_bytes(buf[tail + 8..tail + 16].try_into().unwrap_or([0; 8]));
+    let fp_at = u64::from_le_bytes(buf[tail + 16..tail + 24].try_into().unwrap_or([0; 8]));
     // Never trust a user-built frame with a kernel address or odd flags.
     const USER_TOP: u64 = 0x0000_8000_0000_0000;
     if words[13] >= USER_TOP || user_rsp >= USER_TOP {
         return crate::e(ring3::err::EFAULT);
     }
     words[14] = (words[14] & 0x0000_0CD5) | 0x202;
+    // The FP/SSE file the handler interrupted: a program chooses these bytes, and four kinds of
+    // malformed image make `xrstor` a ring-0 #GP, so it is sanitized first. 0 = initial state.
+    if fp_at == 0 {
+        akuma_sched_amd64::fpu_reset_live();
+    } else {
+        let mut img = [0u8; akuma_sched_amd64::FxArea::SIZE];
+        if fp_at % 64 != 0 || !crate::user_ok(fp_at, img.len() as u64) || !crate::copy_from_user(&mut img, fp_at) {
+            return crate::e(ring3::err::EFAULT);
+        }
+        let Some(mut fx) = akuma_sched_amd64::FxArea::from_bytes(&img) else {
+            return crate::e(ring3::err::EFAULT);
+        };
+        fx.sanitize();
+        akuma_sched_amd64::fpu_restore_live(&fx);
+    }
     unpack_frame(fr, &words);
-    ring3::set_user_rsp_stash(user_rsp);
+    set_return_rsp(user_rsp);
     akuma_exec::threading::set_thread_signal_mask(mask);
     // The dispatcher stores this in RAX: the interrupted call's own result.
     words[12]
