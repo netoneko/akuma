@@ -24,6 +24,7 @@ what Rust was sold as, not on specific functions or technical problems.
 - "and then kvm closes the self hosting loop one more time"
 - "and with rust built drivers derived from open spec that allow networking that is essential to the whole thing"
 - "many projects/companies are doing rust rewrite like google with argon and with google's tech track record i can trust they know what they are doing"
+- "the future is now, cyberpunk is here, you can install a kernel from crates.io (theorethically) and have your whole supply chain owned at kernel level" (2026-11-01, on the tokio kernel crate. The numbers under it: Taoxichuan's image already links 15 crates.io crates, 21,861 audit lines and 789 of its 1,669 `unsafe` lines, all at ring 0; a kernel published as a crate adds a `build.rs` that runs on the builder's machine. The counter-point is that it is countable: 141,339 audit lines for the whole Akuma stack, against 2,440,506 for Taoxichuan on a Linux host)
 
 ## Context
 

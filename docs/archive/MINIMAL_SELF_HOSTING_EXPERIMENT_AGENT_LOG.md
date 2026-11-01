@@ -2360,3 +2360,7 @@ Honorable mentions, named by the user (pointers to where each was met, not a ful
   `write(2)` on amd64. The copy budget counts `.cloned()`, `.to_vec()` and the fd copiers for that reason
   ([`CLONE_AND_MUT_BUDGETS.md`](CLONE_AND_MUT_BUDGETS.md), [`CLONE_AUDIT_2026_11_01.md`](CLONE_AUDIT_2026_11_01.md)).
 - **A refactor that changes timing finds the race the old code hid**: the killed-thread entry under classic blunders.
+- **The user, on where the tokio kernel crate leads:** "the future is now, cyberpunk is here, you can install a kernel
+  from crates.io (theorethically) and have your whole supply chain owned at kernel level". Recorded in the talk doc's
+  verbatim conclusions with the numbers under it (15 crates.io crates already in Taoxichuan's image, 789 of its 1,669
+  `unsafe` lines; 141,339 audit lines for the whole Akuma stack).
