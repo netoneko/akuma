@@ -432,7 +432,7 @@ async fn run_exec_session(
                 session.term_height as u16,
             );
         }
-        return bridge_process(stream, session, res.pid, res.stdout_fd, session.pty_requested).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, session.pty_requested).await;
     }
 
     // Same emergency fallback as the interactive path, with paws's own `-c`
@@ -450,7 +450,7 @@ async fn run_exec_session(
             );
         }
         println(&format!("[SSH] Spawned emergency shell: {}", used_path));
-        return bridge_process(stream, session, res.pid, res.stdout_fd, session.pty_requested).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, session.pty_requested).await;
     }
 
     // Neither could be spawned — exec itself is what is broken. Last resort:
@@ -526,7 +526,7 @@ async fn run_shell_session(
         // fresh TerminalState from the pty spawn, so its fd (ChildStdout) is
         // the handle the kernel resolves to that state.
         set_terminal_size(res.stdout_fd as i32, session.term_width as u16, session.term_height as u16);
-        return bridge_process(stream, session, res.pid, res.stdout_fd, true).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, true).await;
     }
 
     // The configured shell couldn't be spawned at all — try the built-in
@@ -535,7 +535,7 @@ async fn run_shell_session(
     if let Some((res, used_path)) = try_emergency_shell(&shell_path, None, &env_refs, true) {
         set_terminal_size(res.stdout_fd as i32, session.term_width as u16, session.term_height as u16);
         println(&format!("[SSH] Spawned emergency shell: {}", used_path));
-        return bridge_process(stream, session, res.pid, res.stdout_fd, true).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, true).await;
     }
 
     // Neither could be spawned — exec itself is what is broken. Last resort:
@@ -824,17 +824,31 @@ async fn bridge_process(
     session: &mut SshSession,
     pid: u32,
     stdout_fd: u32,
+    child_stdin: Option<u32>,
     pty: bool,
 ) -> Result<(), NetError> {
     let mut buf = [0u8; 1024];
 
-    // Open the child's stdin ONCE and reuse it for the whole session, instead
+    // The child's stdin, two ways. A `linux-abi` spawn hands us the write end
+    // of the child's stdin pipe (`child_stdin`): ours to write, and closing it
+    // is the EOF. A native spawn leaves the stdin channel with the kernel, so
+    // open it ONCE through procfs and reuse it for the whole session, instead
     // of open()+write()+close() per keystroke (a full procfs path resolution
     // — parse "/proc/<pid>/fd/0", look up the process, build a fresh
     // FileDescriptor — on every single character forwarded). Interactive
     // typing was paying 2 extra syscalls per keystroke for no reason; the
     // channel this resolves to doesn't change for the life of the session.
-    let stdin_fd = open(&format!("/proc/{}/fd/0", pid), open_flags::O_WRONLY);
+    //
+    // Opening `/proc/<pid>/fd/0` of a forked child names whatever fd 0 the
+    // child has, and `close_child_stdin` is a native syscall: before
+    // `spawn_full` gave `linux-abi` children a pipe, this pump fed a stdin the
+    // child was not reading and sent an EOF nothing delivered
+    // (`docs/archive/TAOXICHUAN_SSH_STDIN_PUMP.md`).
+    let owns_stdin = child_stdin.is_some();
+    let mut stdin_fd = match child_stdin {
+        Some(fd) => fd as i32,
+        None => open(&format!("/proc/{}/fd/0", pid), open_flags::O_WRONLY),
+    };
     if stdin_fd < 0 {
         eprintln(&format!("[SSHD] bridge_process: couldn't open stdin for pid {}", pid));
     }
@@ -1052,7 +1066,14 @@ async fn bridge_process(
             // back after the stdout drain above has made room.
         }
         if stdin_eof_pending && stdin_pending.is_empty() {
-            close_child_stdin(pid);
+            if owns_stdin {
+                if stdin_fd >= 0 {
+                    close(stdin_fd);
+                    stdin_fd = -1;
+                }
+            } else {
+                close_child_stdin(pid);
+            }
             stdin_eof_pending = false;
         }
 

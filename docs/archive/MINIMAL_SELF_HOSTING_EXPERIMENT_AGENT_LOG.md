@@ -2303,3 +2303,35 @@ account that the unchanged relay worked, not on a direct test of the user's clai
   readings and reactions are 108 of 297 phase-A prompts (36%). Nearly all of it disappeared after the 10-29 switch.
 - **The operator's memory of Akuma was a resource the tokenomics does not count.** A correct hint saves a hunt: the sshd ABI,
   the mmap cap and the bisect target each named in one line what a session would otherwise have instrumented for.
+
+### 2026-11-01: classic blunders (user's list for a talk, recorded at their request)
+
+The user is compiling the classic bugs that recur in this tree, for a talk. Recorded here as they come up. Each one
+fails silently: nothing errors, something just waits.
+
+**The ssh stdin pump** (cleanup, Opus): `ssh host 'cat > f' < file` hung on Taoxichuan. sshd's pump writes a child's
+stdin through `/proc/<pid>/fd/0` and ends it with the private `CLOSE_CHILD_STDIN`. That is right for a native `SPAWN`,
+where the kernel owns the child's stdin channel. The `linux-abi` spawn sshd runs on Taoxichuan is `fork`+`execve` and piped
+only stdout, so the child kept sshd's own fd 0. The pump wrote, with no error, into a descriptor the child was not
+reading, and sent an EOF through a syscall Taoxichuan had deleted. The child waited for input that never came. It went
+unnoticed because nothing sends stdin: every battery line, goose and the fixed point drive sessions with commands, not
+input. Fix: the spawn hands back the write end of a real stdin pipe
+([`TAOXICHUAN_SSH_STDIN_PUMP.md`](TAOXICHUAN_SSH_STDIN_PUMP.md)).
+
+The same day had a cousin: a timed park on an idle core never expired. The wake pass that readies an expired sleeper ran
+only inside the switch, and the idle loop switched only for threads that were already ready. The old `nanosleep` spun
+instead of parking, which hid it ([`TAOXICHUAN_ONE_CLOCK_TIME_FOLD.md`](TAOXICHUAN_ONE_CLOCK_TIME_FOLD.md)).
+
+Honorable mentions, named by the user (pointers to where each was met, not a full account):
+
+- **`wait4(-1)`**: "any child" is where per-parent bookkeeping goes wrong. It reaps a child that is not the caller's, or
+  answers `ECHILD` while one is still running ([`AKUMA_AMD64_WAIT4_OWNERSHIP.md`](AKUMA_AMD64_WAIT4_OWNERSHIP.md);
+  [`../../taoxichuan/docs/reference/processes.md`](../../taoxichuan/docs/reference/processes.md), the unstamped-rows rule).
+- **Networking pumps**: with no NIC interrupt, frames arrive only when somebody polls. Every wait, the idle lap and the
+  tick each had to learn to pump, one stall at a time ([`KVM_RELAY_SYN_STALL.md`](KVM_RELAY_SYN_STALL.md);
+  [`../../taoxichuan/docs/reference/devices.md`](../../taoxichuan/docs/reference/devices.md), "who pumps the NIC").
+- **An init that its children cannot fork from**: spawning worked for children of the spawn crossing but not from init.
+  gcc run under init died at `cc1: posix_spawn: Operation not permitted` (this log, the gcc probe on 10-30). On the metal,
+  an sshd running as init (a pool thread) had every `SPAWN` of `/bin/sh` refused with `EPERM`, silently
+  ([`TAOXICHUAN_METAL_SH_SPAWN_EPERM.md`](TAOXICHUAN_METAL_SH_SPAWN_EPERM.md)). The fork depth ceiling removed in
+  `c1c885c5` had the same shape: a limit left over from the old crossing that real forks did not need.

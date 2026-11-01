@@ -1222,7 +1222,7 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
                 let spawn_res = spawn(&config_for_local.command, args_opt);
                 
                 match spawn_res {
-                    Some(SpawnResult { pid, stdout_fd }) => {
+                    Some(SpawnResult { pid, stdout_fd, .. }) => {
                         svc.pid = Some(pid);
                         svc.stdout_fd = Some(nonblocking_stdout(stdout_fd));
                         svc.state = ServiceState::Running;
@@ -1409,7 +1409,7 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     cpus_leave(prev_cpus);
 
     match spawn_res {
-        Some(SpawnResult { pid, stdout_fd }) => {
+        Some(SpawnResult { pid, stdout_fd, .. }) => {
             if let Some(svc) = state.services.get_mut(name) {
                 svc.pid = Some(pid);
                 svc.stdout_fd = Some(nonblocking_stdout(stdout_fd));

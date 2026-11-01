@@ -2025,14 +2025,29 @@ pub struct SpawnResult {
     pub pid: u32,
     /// File descriptor to read child's stdout
     pub stdout_fd: u32,
+    /// The write end of the child's stdin pipe, owned by the caller: write to
+    /// feed the child, `close` to give it EOF. `Some` only on the `linux-abi`
+    /// path, and only when the caller passed no `stdin` bytes. Natively the
+    /// kernel owns the child's stdin channel; reach it through
+    /// `/proc/<pid>/fd/0` and end it with [`close_child_stdin`].
+    pub stdin_fd: Option<u32>,
 }
 
 /// Spawn a child process
 ///
 /// Returns SpawnResult on success with child PID and stdout FD.
 /// Returns None on error.
+///
+/// The child gets no input. Under `linux-abi` its stdin is an empty pipe that is
+/// already closed (EOF), what std's `Command::output` gives a child: a caller of
+/// plain `spawn` never writes a stdin, and an open write end it never closes
+/// would leak an fd per call and park any child that reads stdin.
 pub fn spawn(path: &str, args: Option<&[&str]>) -> Option<SpawnResult> {
-    spawn_full(path, args, None, &[], 0)
+    #[cfg(feature = "linux-abi")]
+    let stdin: Option<&[u8]> = Some(&[]);
+    #[cfg(not(feature = "linux-abi"))]
+    let stdin: Option<&[u8]> = None;
+    spawn_full(path, args, stdin, &[], 0)
 }
 
 /// Spawn flag bits passed in the SPAWN syscall's 6th argument (Akuma's own
@@ -2175,7 +2190,7 @@ fn spawn_full(
     // Extract PID (low 32 bits) and stdout_fd (high 32 bits)
     let pid = (result & 0xFFFF_FFFF) as u32;
     let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
-    Some(SpawnResult { pid, stdout_fd })
+    Some(SpawnResult { pid, stdout_fd, stdin_fd: None })
 }
 
 /// `linux-abi` process spawn: Akuma's own `SPAWN` (301) is a single private
@@ -2185,37 +2200,52 @@ fn spawn_full(
 /// running one (`uname -a` failed identically to `sleep`, which is what
 /// pointed at `spawn()` itself rather than at busybox/symlink handling).
 ///
-/// Built from the real Linux primitives instead: `pipe2` to capture the
-/// child's stdout, [`fork`] (already a genuine `CLONE` syscall — this part
-/// was never broken), `dup3` to move the pipe's write end onto the child's
-/// fd 1, then `execve`. `stdin` and `flags` (pty) are not wired up on this
-/// path — nothing in meow calls `spawn_with_stdin`/`spawn_pty` today, and
-/// adding a second pipe / pty allocation for callers that don't exist yet
-/// would be exactly the kind of speculative code this tree avoids.
+/// Built from the real Linux primitives instead: two `pipe2`s (the child's
+/// stdout and stdin), [`fork`] (already a genuine `CLONE` syscall — this part
+/// was never broken), `dup3` to move the pipes' ends onto the child's fds 1 and
+/// 0, then `execve`. `flags` (pty) is not wired up on this path.
+///
+/// **The stdin pipe is the half that was missing until 2026-11-01.** Without it
+/// the child inherited the spawner's own fd 0, and sshd's pump — which writes
+/// a native child's stdin through `/proc/<pid>/fd/0` and ends it with the
+/// private `CLOSE_CHILD_STDIN` — fed a descriptor the child was not reading and
+/// sent an EOF no kernel without that syscall delivers: `ssh host 'cat > f' <
+/// file` hung on Taoxichuan (`docs/archive/TAOXICHUAN_SSH_STDIN_PUMP.md`). Now
+/// the caller holds the write end ([`SpawnResult::stdin_fd`]) when it passed no
+/// `stdin` bytes; when it passed some, they are written and the end is closed,
+/// so the child reads them and then EOF. They are written before the parent
+/// returns, so more than a pipe's capacity blocks until the child reads.
 #[cfg(feature = "linux-abi")]
 fn spawn_full(
     path: &str,
     args: Option<&[&str]>,
-    _stdin: Option<&[u8]>,
+    stdin: Option<&[u8]>,
     env: &[&str],
     _flags: u64,
 ) -> Option<SpawnResult> {
     let (path_terminated, _args_terminated, argv, _env_terminated, envp) = build_argv_envp(path, args, env);
     let envp_arg = if env.is_empty() { core::ptr::null() } else { envp.as_ptr() };
 
-    let mut pipe_fds = [0i32, 0i32];
-    if pipe(&mut pipe_fds) < 0 {
+    let Some((out_read, out_write)) = pipe_cloexec() else {
         return None;
-    }
-    let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+    };
+    let Some((in_read, in_write)) = pipe_cloexec() else {
+        close(out_read);
+        close(out_write);
+        return None;
+    };
 
     match fork() {
         Ok(ForkResult::Child) => {
-            // dup3 onto STDOUT, then the original write fd is redundant —
-            // close both it and the read end, which this side never uses.
-            syscall(syscall::DUP3, write_fd as u64, fd::STDOUT as u64, 0, 0, 0, 0);
-            close(write_fd);
-            close(read_fd);
+            // dup3 onto STDOUT and STDIN (dup3 with no flags leaves the new fds
+            // open across execve), then the originals are redundant — close
+            // all four, including the two ends this side never uses.
+            syscall(syscall::DUP3, out_write as u64, fd::STDOUT as u64, 0, 0, 0, 0);
+            syscall(syscall::DUP3, in_read as u64, fd::STDIN as u64, 0, 0, 0, 0);
+            close(out_write);
+            close(out_read);
+            close(in_read);
+            close(in_write);
             syscall(
                 syscall::EXECVE,
                 path_terminated.as_ptr() as u64,
@@ -2231,15 +2261,43 @@ fn spawn_full(
             exit(127);
         }
         Ok(ForkResult::Parent(pid)) => {
-            close(write_fd);
-            Some(SpawnResult { pid, stdout_fd: read_fd as u32 })
+            close(out_write);
+            close(in_read);
+            let stdin_fd = match stdin {
+                None => Some(in_write as u32),
+                Some(bytes) => {
+                    let mut done = 0;
+                    while done < bytes.len() {
+                        let n = write_fd(in_write, &bytes[done..]);
+                        if n <= 0 {
+                            break;
+                        }
+                        done += n as usize;
+                    }
+                    close(in_write);
+                    None
+                }
+            };
+            Some(SpawnResult { pid, stdout_fd: out_read as u32, stdin_fd })
         }
         Err(_) => {
-            close(read_fd);
-            close(write_fd);
+            close(out_read);
+            close(out_write);
+            close(in_read);
+            close(in_write);
             None
         }
     }
+}
+
+/// `pipe2(O_CLOEXEC)`: `(read, write)`. Close-on-exec so a spawner's ends never
+/// leak into a later child's image; the child's `dup3` copies are not.
+#[cfg(feature = "linux-abi")]
+fn pipe_cloexec() -> Option<(i32, i32)> {
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    let mut fds = [0i32, 0i32];
+    let r = syscall(syscall::PIPE2, fds.as_mut_ptr() as u64, O_CLOEXEC, 0, 0, 0, 0) as i64;
+    (r >= 0).then_some((fds[0], fds[1]))
 }
 
 /// Kill a process by PID
