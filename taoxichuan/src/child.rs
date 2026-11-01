@@ -99,29 +99,6 @@ static SLOTS: akuma_primitives::cell::BorrowCell<[SpawnSlot; NSLOTS]> =
 // thread Processes' pids from the crate's counter and a second counter here
 // issued the same pid twice (a thread and a fork child sharing a table row).
 
-/// The parent-phase registers one crossing saves: what `child_enter`'s naked
-/// prologue stores and its exit-side consumers restore. `repr(C)` with the
-/// `ret_rsp` first — the asm addresses the record by offset, exactly the
-/// layout `exec_return`'s restore already walked (0x00 rsp, 0x08 rbx, 0x10
-/// rbp, 0x18 r12 … 0x30 r15).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CrossSave {
-    pub ret_rsp: u64,
-    pub rbx: u64,
-    pub rbp: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-}
-
-impl CrossSave {
-    const fn new() -> Self {
-        Self { ret_rsp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0 }
-    }
-}
-
 /// One slot's kernel+trap stacks (the twin's `prepare_task_slot` answer,
 /// amd64's `Stacks` discipline): leaked once on first use, reused on every
 /// recycle — a slot given a fresh pair per spawn would turn the slot ring
@@ -132,38 +109,11 @@ struct SlotStacks {
     trap: &'static mut [u64],
 }
 
-/// The per-slot machine state (slice 2): everything the crossing statics
-/// `NESTED_SLOT`/`NESTED_DEPTH`/`SPAWN_OUT_SLOT`/`PARENT_*`/`RET_RSP`/`SAVE_*`
-/// held, indexed by spawn-ring slot and read **through
-/// `exec_twin::current_slot()`** while a child runs. The plan's shape (§ 3):
-/// the moment two tasks can block, "the one task in the kernel" identity
-/// breaks, so the crossing state cannot live in shared statics — and the
-/// owner's rule is no new `static` "current task" anywhere: "who am I" is
-/// `current_slot()`, whose one-core stub is the sanctioned static.
-///
-/// Written only on the syscall path (single core, `IF` clear) or by
-/// `child_enter`'s asm prologue into `save`; read the same ways.
-pub struct SlotCross {
-    /// The parent's saved registers — `child_enter`'s asm writes here (the
-    /// record's address rides the crossing in `%rdx`).
-    save: CrossSave,
-    /// The parent's CR3 root, loaded by the exit tail (`child_exit`).
-    parent_root: u64,
-    /// The `TASKS` slot the child runs in (1 = spawned, 2 = fork child):
-    /// which record `exit` lands in. Was implicit in the old depth read.
-    task_slot: usize,
-    /// The `TASKS` slot of whoever the crossing returns to (0 = sshd, 1 =
-    /// the shell): `child_exit`'s `set_task_slot`. Was `depth - 1`.
-    parent_task_slot: usize,
-    /// The spawn-ring slot that becomes current again on exit
-    /// (`exec_twin::NO_SLOT` for sshd): `child_exit`'s
-    /// `set_current_slot`. Was the `NESTED_SLOT` save/restore dance.
-    parent_slot: usize,
-    /// The slot whose `out` buffer carries this child's fd 1. Set to the
-    /// slot itself by `spawn_arm`; a fork child inherits its parent's — a
-    /// fork child's writes must land in the buffer sshd drains, never in its
-    /// own slot (boot-3 lesson, gate P3).
-    out_slot: usize,
+/// The per-slot machine state, indexed by ring slot: the slot's leaked
+/// stacks and the ring-3 register capture `fork_process` consumes. Reached
+/// only through [`with_slot_state`] (a `BorrowCell`: two overlapping borrows
+/// are a panic naming the bug).
+pub struct SlotState {
     /// This slot's stacks, once `prepare_task_slot` made them.
     stacks: Option<SlotStacks>,
     /// The ring-3 register capture the `write/read_user_context` hooks serve
@@ -174,45 +124,18 @@ pub struct SlotCross {
     trap_stack_top: u64,
 }
 
-impl SlotCross {
+impl SlotState {
     const fn new() -> Self {
-        Self {
-            save: CrossSave::new(),
-            parent_root: 0,
-            task_slot: 0,
-            parent_task_slot: 0,
-            parent_slot: crate::exec_twin::NO_SLOT,
-            out_slot: 0,
-            stacks: None,
-            uctx: None,
-            kstack_top: 0,
-            trap_stack_top: 0,
-        }
+        Self { stacks: None, uctx: None, kstack_top: 0, trap_stack_top: 0 }
     }
 }
 
-/// The per-slot table itself, indexed by `exec_twin::current_slot()` while a child runs and by the resuming
-/// arm's own `slot_idx` after the crossing returns. A [`BorrowCell`]: the Rust side reaches it only through
-/// [`with_cross`], so two overlapping borrows of the table are a panic naming the bug. The one thing the cell cannot
-/// see is the naked `child_enter`/`exit_cross` asm writing `save` through [`save_ptr`]; no closure is ever open
-/// across a crossing.
-static SLOT_STATE: akuma_primitives::cell::BorrowCell<[SlotCross; NSLOTS]> =
-    akuma_primitives::cell::BorrowCell::new([const { SlotCross::new() }; NSLOTS]);
+static SLOT_STATE: akuma_primitives::cell::BorrowCell<[SlotState; NSLOTS]> =
+    akuma_primitives::cell::BorrowCell::new([const { SlotState::new() }; NSLOTS]);
 
-/// Run `f` on the crossing record of `slot` (the syscall-path readers and writers).
-pub fn with_cross<R>(slot: usize, f: impl FnOnce(&mut SlotCross) -> R) -> R {
+/// Run `f` on the machine state of `slot`.
+pub fn with_slot_state<R>(slot: usize, f: impl FnOnce(&mut SlotState) -> R) -> R {
     SLOT_STATE.with_mut(|st| f(&mut st[slot]))
-}
-
-/// `child_enter`'s asm destination for `slot` — a raw pointer, because the
-/// naked prologue takes it in `%rdx` and Rust must not see a reference to
-/// memory the asm writes behind its back.
-///
-/// SAFETY: as `slots`.
-unsafe fn save_ptr(slot: usize) -> *mut CrossSave {
-    assert!(slot < NSLOTS, "save_ptr: slot out of range");
-    // SAFETY: `as_ptr` points at the array; `slot` is in range (asserted); this forms a pointer, no reference.
-    unsafe { core::ptr::addr_of_mut!((*SLOT_STATE.as_ptr())[slot].save) }
 }
 
 /// Run `f` on the spawn ring. Panics on a nested call, which is the point.
@@ -223,12 +146,6 @@ fn with_slots<R>(f: impl FnOnce(&mut [SpawnSlot; NSLOTS]) -> R) -> R {
 /// The pid in ring row `slot`.
 fn slot_pid(slot: usize) -> u32 {
     SLOTS.with(|s| s[slot].pid)
-}
-
-/// Is a nested child running right now? The `exit_group` arm's fork in the
-/// dispatcher.
-pub fn nested_active() -> bool {
-    crate::exec_twin::current_slot() != crate::exec_twin::NO_SLOT
 }
 
 /// The `ProcessHooks::pid_for_thread` / `find_pid_by_thread` arm: the pid a
@@ -421,14 +338,6 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
         akuma_primitives::safe_print!(160, "  [init] bind refused: {}\n", msg);
         crate::halt();
     }
-    // Depth 1: the same standing the SPAWNed shell has, which `fork_arm_real`'s gate reads.
-    // out_slot = usize::MAX marks the BOOT session (stage 12): no spawn-slot
-    // buffer sits behind it and nothing drains one — the boot program and its
-    // fork children write their unbound fd 1/2 straight to the console (the
-    // write arm's `console_session` rule). A SPAWN crossing always stamps a
-    // real slot (its parent drains it through the ChildOut fd), so the
-    // sentinel never collides; fork children inherit it by the usual copy.
-    with_cross(tid, |c| c.out_slot = usize::MAX);
     register_shell_process(1, path, ti.root_pa, ti.entry, ti.rsp, tid);
     INIT_TID.store(tid, core::sync::atomic::Ordering::Relaxed);
     INIT_ENTRY.store(ti.entry, core::sync::atomic::Ordering::Relaxed);
@@ -514,14 +423,6 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         });
     }
     CHILD_BIND.with_mut(|b| b[tid] = (tid, pid, root_pa));
-    // The out_slot/depth stamp (session pg): the fork child writes into the
-    // SAME session buffer its parent had — the bridge drains the shell's.
-    let shell = crate::exec_twin::current_slot();
-    if shell != crate::exec_twin::NO_SLOT && shell < NSLOTS && tid < NSLOTS {
-        let out = with_cross(shell, |sc| sc.out_slot);
-        // `tid` was just bound inside the spawn ring.
-        with_cross(tid, |c| c.out_slot = out);
-    }
     Ok(())
 }
 
@@ -927,13 +828,9 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     drop(args);
     drop(image);
     drop(effective);
-    // SAFETY: the crossing contract — `root` maps the new image plus the
-    // shared kernel half, `ef` is ring-3-enterable. A real child never runs
-    // `exit_cross`, so this crossing has no return side; the dead dispatcher
-    // frame on the task's own band is abandoned, bounded by exec counts.
-    let _ = crate::smp::bkl_leave_all();
-    let _ = unsafe { child_enter(ti.root_pa, &ef, core::ptr::addr_of_mut!(EXEC_SAVE)) };
-    unreachable!("exec_real_task: a real child's crossing returned")
+    // The new image's root and first frame; the dispatcher frame on the
+    // task's own band is abandoned (bounded by exec counts).
+    crate::exec_twin::enter_user_on(ti.root_pa, &ef)
 }
 
 /// The syscall-path capture `fork_process` step 6 consumes:
@@ -1127,150 +1024,6 @@ fn fork_arm_real(fr: &ring3::SyscallFrame) -> u64 {
 // ---------------------------------------------------------------------------
 // Exec-replace: the nested child's execve.
 // ---------------------------------------------------------------------------
-
-/// Cross into the child and come back only when it exits.
-///
-/// Naked because the whole body is the contract: save the parent-phase
-/// callee-saved registers and stack pointer into the **caller-chosen
-/// per-slot record** (`save`, in `%rdx` — slice 2's replacement for the
-/// crossing statics the old `sym` operands named), load `CR3`, then the
-/// `enter_user` crossing. The exit arm reverses this exactly — restores the
-/// registers from the same record, moves `rsp` back to the saved value, and
-/// `ret`s, so this function *returns* the child's exit code into its
-/// caller (`spawn_arm`, `fork_arm`, `exec_replace`).
-///
-/// The stores must precede every clobber of `%rdx`: the crossing loads below
-/// spend it (`mov rdx, [rsi + 0x48]`) along with the frame pointer.
-///
-/// # Safety
-/// `root` must be the child's page root (mapping the kernel half and the
-/// child's image), `ef` a ring-3-enterable state in it, and `save` the
-/// per-slot record the exit side will read (`save_ptr(slot)`).
-#[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-pub unsafe extern "C" fn child_enter(root: u64, ef: &ring3::EntryFrame, save: *mut CrossSave) -> u64 {
-    core::arch::naked_asm!(
-        // Save the caller's (parent-phase) state into the slot record first.
-        "mov qword ptr [rdx + 0x00], rsp",
-        "mov qword ptr [rdx + 0x08], rbx",
-        "mov qword ptr [rdx + 0x10], rbp",
-        "mov qword ptr [rdx + 0x18], r12",
-        "mov qword ptr [rdx + 0x20], r13",
-        "mov qword ptr [rdx + 0x28], r14",
-        "mov qword ptr [rdx + 0x30], r15",
-        // The child's address space: kernel half survives (shared PML4).
-        "mov cr3, rdi",
-        // The enter_user crossing, verbatim (`akuma-ring3-amd64`): every load
-        // is spent against the frame pointer RSI, and the frame's own RSI is
-        // restored only after the pointer's last use — loading it early made
-        // every later read dereference the child's (null) RSI instead.
-        "mov rax, [rsi + 0x60]",
-        "mov rdx, [rsi + 0x48]",
-        "mov rbp, [rsi + 0x20]",
-        "mov r8,  [rsi + 0x38]",
-        "mov r9,  [rsi + 0x40]",
-        "mov rbx, [rsi + 0x28]",
-        "mov r12, [rsi + 0x18]",
-        "mov r13, [rsi + 0x10]",
-        "mov r14, [rsi + 0x08]",
-        "mov r15, [rsi + 0x00]",
-        "mov rcx, [rsi + 0x68]",
-        "mov r11, [rsi + 0x70]",
-        "mov r10, [rsi + 0x30]",
-        "mov rsp, [rsi + 0x78]",
-        "mov rdi, [rsi + 0x58]",
-        "mov rsi, [rsi + 0x50]", // last: spends the frame pointer
-        "swapgs",                // ring 0 -> ring 3 (see `akuma-ring3-amd64`'s per-CPU block)
-        "sysretq",
-    )
-}
-
-/// The exec crossing's scratch save (session pg): `child_enter` stores the
-/// caller's dead frame somewhere, and the M2 exec arm used to pass
-/// `save_ptr(cur)` — the SPAWN crossing's saved sshd frame. An inner exec
-/// (`sh -c "sh -c …"`, ash exec'ing the last command in place — every gate
-/// command) then lost sshd's resume frame: the image's `child_exit` ran
-/// `exit_cross` into the exec's dead save and sshd never resumed — no drain,
-/// no `[SSH] Exit status`, a hung session. The exec's save is write-only by
-/// construction (execve never returns to the exec'ing image), so ONE global
-/// scratch is enough: single core, IF clear, and two exec crossings can never
-/// be in flight at once.
-static mut EXEC_SAVE: CrossSave = CrossSave::new();
-
-/// Runs on the nested stack region, in the CHILD's address space, called
-/// from the dispatcher's exit arm — which is why this is `!` from Rust's
-/// point of view: it never returns *to the dispatcher*. It returns to
-/// [`spawn_arm`], via the saved rsp and the return address
-/// [`child_enter`]'s caller left.
-pub fn child_exit(code: u64) -> ! {
-    // PB5 evidence (session pb): the tick count after the child's last ring-3
-    // stretch. The matching "[TICK pre]" line is at the exec crossing below.
-    akuma_primitives::safe_print!(96, "[TICK post] n={}\n", akuma_lapic_amd64::ticks());
-    // M3: the exiting task's pipe ends die with it — the fork child's exit
-    // is what turns the last writer's close into the reader's EOF. Index
-    // payloads hold no kernel reference (the close arms' convention); only
-    // the counted pipe ends need the walk.
-    close_process_fds();
-    // "Who am I" is `current_slot()` now (slice 2): the running child's own
-    // slot names its record, its status row, and the crossing back.
-    let cur = crate::exec_twin::current_slot();
-    // Record first, while the Rust frame can still reach the tables.
-    // SAFETY: syscall-path discipline. Depth-aware (M2): depth 1 is the
-    // spawned shell handing the machine back to sshd; depth 2 is a fork
-    // child handing it back to the shell — the record knows which.
-    let status = with_slots(|s| {
-        s[cur].running = false;
-        s[cur].status = ((code & 0xFF) << 8) as u32;
-        s[cur].status
-    });
-    let (parent_root, parent_task_slot, parent_slot) = with_cross(cur, |c| {
-        crate::with_task_slot(c.task_slot, |t| t.exit = Some(code));
-        (c.parent_root, c.parent_task_slot, c.parent_slot)
-    });
-    crate::set_task_slot(parent_task_slot);
-    // The parent is current again: for a depth-1 exit that is the boot task
-    // (`NO_SLOT`), for a depth-2 exit the shell's slot — what the old
-    // decrement-`NESTED_DEPTH`-and-restore-`NESTED_SLOT` dance computed.
-    crate::exec_twin::set_current_slot(parent_slot);
-    // SAFETY: the record is live (this slot's own), the status is recorded,
-    // and the tail never returns to this frame.
-    unsafe { exit_cross(save_ptr(cur), parent_root, status) }
-}
-
-/// The exit tail's crossing back, naked because its whole body is the
-/// contract: restore the parent's callee-saved registers and stack pointer
-/// from the slot record, load the parent's CR3, put the status in `eax`, and
-/// `ret` into the resuming arm. Arguments arrive in `rdi`/`rsi`/`rdx` per
-/// the C ABI (`save`, `root`, `status`); everything the body writes is an
-/// argument register or the register being restored — there is **no operand
-/// allocation to get wrong**, which is the whole point of the naked form:
-/// boot 2 caught the inline-asm version of this tail letting LLVM allocate
-/// the `r13` input to the physical `rbx` the template's own first `mov`
-/// destroyed, so the resumed frame came back with a user address in `r13`.
-/// (`rbx`/`rbp` cannot be explicit inline-asm operands at all — LLVM
-/// reserves them — which closes the inline form off entirely.)
-///
-/// # Safety
-/// `save` must be this slot's own crossing record, `root` the parent's CR3,
-/// `status` the packed wait status; never returns.
-#[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-unsafe extern "C" fn exit_cross(save: *mut CrossSave, root: u64, status: u32) -> ! {
-    core::arch::naked_asm!(
-        "mov rbp, [rdi + 0x10]",
-        "mov r12, [rdi + 0x18]",
-        "mov r13, [rdi + 0x20]",
-        "mov r14, [rdi + 0x28]",
-        "mov r15, [rdi + 0x30]",
-        "mov rbx, [rdi + 0x08]",
-        // CR3 before the stack switch: both spaces map the kernel half, so
-        // the record reads above and the rsp below are safe in either.
-        "mov cr3, rsi",
-        "mov rsp, [rdi + 0x00]",
-        "mov eax, edx",
-        "ret",
-    )
-}
 
 // ---------------------------------------------------------------------------
 // The wait family, as the bridge drives it.
@@ -1823,7 +1576,7 @@ pub fn prepare_task_slot(slot: usize) -> Option<usize> {
         return None;
     }
     // The claim path (syscall context in slice 3).
-    let ktop = with_cross(slot, |c| {
+    let ktop = with_slot_state(slot, |c| {
         if c.stacks.is_none() {
             c.stacks = Some(leak_stacks());
         }
@@ -1832,7 +1585,6 @@ pub fn prepare_task_slot(slot: usize) -> Option<usize> {
         let ttop = ((s.trap.as_ptr() as usize + TSTACK_WORDS * 8) & !0xf) as u64;
         c.kstack_top = ktop;
         c.trap_stack_top = ttop;
-        c.save = CrossSave::new();
         c.uctx = None;
         Some(ktop)
     })?;
@@ -1850,7 +1602,7 @@ pub fn write_user_context(slot: usize, ctx: &akuma_exec::process::UserContext) {
         return;
     }
     // `slot` is not running.
-    with_cross(slot, |c| c.uctx = Some(*ctx));
+    with_slot_state(slot, |c| c.uctx = Some(*ctx));
 }
 
 /// `X86ArchHooks::read_user_context`: the exact mirror — `None` means the
@@ -1863,5 +1615,5 @@ pub fn read_user_context(
     if slot >= NSLOTS {
         return None;
     }
-    with_cross(slot, |c| c.uctx)
+    with_slot_state(slot, |c| c.uctx)
 }

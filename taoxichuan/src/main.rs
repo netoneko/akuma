@@ -1946,15 +1946,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 }
                 child::task_exit_real(code)
             }
-            // Stage 4: a nested child's exit does NOT reach the reaper — it
-            // hands the machine back to the parent (`child.rs`'s model:
-            // run-to-completion inside the SPAWN syscall, coroutine-style
-            // return). The boot's own sequential tasks still chain through
-            // `task_done` exactly as stage 3 left it. This arm is now the
-            // SHELL's exit only (slot 0): every fork child is a real task.
-            else if child::nested_active() {
-                child::child_exit(code)
-            }
             // Stage 3: not a halt — the report and the next spawn (or the
             // final gate line) live in `task_done`. This arm never returns to
             // the stub: the task is gone, and its parked `syscall` frame on

@@ -467,14 +467,6 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
         crate::set_task_slot(crate::child::sched_task_slot_of(cur));
     }
     let root = crate::child::sched_root_of(cur);
-    if root != 0 {
-        // SAFETY: `root` is a PMM-resident page-table frame naming the
-        // child's image and the shared kernel half; the load is the same one
-        // `child_enter` performs at every crossing.
-        unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
-        };
-    }
     let ef = akuma_ring3_amd64::EntryFrame {
         r15: ctx.regs[11],
         r14: ctx.regs[10],
@@ -493,8 +485,6 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
         rflags: 0x202,
         rsp: ctx.sp,
     };
-    // SAFETY: ring3's contract — an enterable ring-3 state, kernel IF clear,
-    // CR3 already the child's. `enter_user` is `!`: the child lives in ring 3.
     // Session pi: install the CAPTURED fs before entry. This crossing used to
     // leave IA32_FS_BASE holding the last-ran task's TLS pointer — the fork
     // "inheritance" was whatever the one core's MSR happened to hold, which
@@ -507,9 +497,25 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     // entries are per fork/spawn, never per tick.
     let _ = akuma_cpu::msr::set_fs_base(ctx.fs_base);
     crate::child::set_slot_fs(cur, ctx.fs_base);
+    enter_user_on(root, &ef)
+}
+
+/// Load `root` (when non-zero) and `sysret` into `ef` with the kernel lock
+/// released: the one way a task enters ring 3 here — a new thread or fork
+/// child ([`twin_enter_user`]) and an `execve`'s new image.
+pub(crate) fn enter_user_on(root: u64, ef: &akuma_ring3_amd64::EntryFrame) -> ! {
+    if root != 0 {
+        // SAFETY: `root` is a PMM-resident page-table frame naming the task's
+        // image and the shared kernel half this code runs on.
+        unsafe {
+            core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+        };
+    }
     // Ring 3 runs without the kernel lock.
     let _ = crate::smp::bkl_leave_all();
-    unsafe { akuma_ring3_amd64::enter_user(&ef) }
+    // SAFETY: ring3's contract — an enterable ring-3 state for the address
+    // space just loaded, kernel IF clear. `enter_user` is `!`.
+    unsafe { akuma_ring3_amd64::enter_user(ef) }
 }
 
 /// Enter ring 3 for the thread running now from a captured context: [`twin_enter_user`] for the init thread, which has no
