@@ -35,6 +35,8 @@ Stage files onto an image with `debugfs -w` only while the rig is stopped.
 - **Fixed point**: `scripts/kvm/taoxichuan/fp_metal.py K0 SHA` builds the kernel at `SHA` inside a guest under
   Akuma's own hypervisor, boots the result and builds again; it passes when K1 == K2 byte for byte
   (`docs/archive/TAOXICHUAN_FIXED_POINT.md`). Stop herd's `vm-dev` first.
+  When the ryzen runs Pop instead, `scripts/kvm/taoxichuan/fp_pop.py K0 SHA` runs the same two generations under
+  Linux KVM.
 - **Census**: `scripts/kvm/taoxichuan/census_pop.sh` on Pop, then `census_classify.py OUT UNISTD_64_H`, exits 1 on
   a call this kernel would not serve ([`../reference/syscalls.md`](../reference/syscalls.md)).
 

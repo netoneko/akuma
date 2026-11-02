@@ -61,3 +61,20 @@ What it needed beyond the KVM run:
 * **One ssh session at a time.** The cooperative sshd serves a single session, and the relay holds only two forwarded connections, so a second ssh (a status poll) is refused or times out while a long command runs. The build was started as one long foreground ssh and observed through the host-side console log.
 
 Not shown: that K1/K2 pass anything beyond booting and building; a second toolchain (K0 != K1 still stands).
+
+## After the cleanup (2026-11-02, B14)
+
+Re-run on `ade75544` (after B7b-B13 of [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md): the
+crate switch, `akuma-runtime-tokio`, one ELF loader, containers off) under Pop's Linux KVM on the ryzen, with
+`scripts/kvm/taoxichuan/fp_pop.py K0 ade75544` (smp=4, 3 GiB; K(n) pulled with `qemu-nbd --read-only` +
+`debugfs dump` and checked against the guest's own `md5sum`):
+
+| generation | built by | md5 | bytes | build time |
+|---|---|---|---|---|
+| K0 | the Mac (`--features no-tests,trace-err`) | `d41a2a1b8f17a859b1423542a7e79c9b` | 2,298,760 | - |
+| K1 | a guest running K0 | `6343290ae3a631eba40cce8491e0254e` | 2,291,536 | 476 s |
+| K2 | a guest running K1 | `6343290ae3a631eba40cce8491e0254e` | 2,291,536 | 471 s |
+
+**K1 == K2** (also `cmp`-identical on the Mac), with 0 fault, panic or bad-frame lines on either console. The
+image is larger than the 10-31 one because it is built with `trace-err` and carries everything B1-B13 pulled in.
+The bare-metal repeat under Akuma's hypervisor (`fp_metal.py`) waits for the ryzen to boot into Akuma.
