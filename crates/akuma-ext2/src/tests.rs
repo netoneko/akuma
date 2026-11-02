@@ -221,6 +221,58 @@ fn create_dir_is_findable() {
     assert!(m.is_dir, "created entry should be a directory");
 }
 
+/// The type bytes `fs` stored for `names` in directory `dir`.
+fn stored_types(fs: &Ext2Filesystem<MemBlockDevice>, dir: &str, names: &[&str]) -> Vec<(String, u8)> {
+    let state = fs.state.read();
+    let node = fs.read_inode(&state, fs.lookup_path(dir).unwrap()).unwrap();
+    let data = fs.read_inode_data(&state, &node).unwrap();
+    fs.parse_directory(&data)
+        .into_iter()
+        .filter(|(_, n, _)| names.contains(&n.as_str()))
+        .map(|(_, n, ft)| (n, ft))
+        .collect()
+}
+
+/// Without `INCOMPAT_FILETYPE` a dirent's byte 7 is the high half of `name_len`, not a
+/// type: new entries must store 0 there (e2fsck clears anything else), and `read_dir`
+/// must take the kind from the inode. It used to read 0 as "not a directory", so after
+/// e2fsck zeroed the bytes on a guest disk, `getdents64` reported `.git/refs/heads` as a
+/// regular file and git saw every directory as an untracked file.
+#[test]
+fn without_the_filetype_feature_dirents_store_no_type_and_read_dir_asks_the_inode() {
+    extern crate std;
+    let mut bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.ext2")).unwrap();
+    assert_ne!(bytes[1024 + 96] & 0x2, 0, "the fixture has INCOMPAT_FILETYPE; this test turns it off");
+    bytes[1024 + 96] &= !0x2;
+    let fs = Ext2Filesystem::new(MemBlockDevice::from_bytes(&bytes), || 0).unwrap();
+    fs.create_dir("/d").unwrap();
+    fs.create_dir("/d/sub").unwrap();
+    fs.write_file("/f", b"x").unwrap();
+
+    let root = fs.read_dir("/").unwrap();
+    let kind = |name: &str| root.iter().find(|e| e.name == name).map(|e| e.is_dir);
+    assert_eq!(kind("d"), Some(true), "a directory with no stored type is still a directory");
+    assert_eq!(kind("f"), Some(false));
+    assert!(fs.read_dir("/d").unwrap().iter().any(|e| e.name == "sub" && e.is_dir));
+
+    for (name, ft) in stored_types(&fs, "/", &["d", "f"]).into_iter().chain(stored_types(&fs, "/d", &[".", "..", "sub"])) {
+        assert_eq!(ft, 0, "{name}: no type byte may be stored without INCOMPAT_FILETYPE");
+    }
+}
+
+/// With `INCOMPAT_FILETYPE` (the fixture as built) the types are stored, so `getdents64`
+/// can report `d_type` without reading the inode.
+#[test]
+fn with_the_filetype_feature_dirents_store_their_type() {
+    let fs = mount_empty();
+    fs.create_dir("/d").unwrap();
+    fs.write_file("/f", b"x").unwrap();
+    let mut got = stored_types(&fs, "/", &["d", "f"]);
+    got.sort();
+    assert_eq!(got, vec![(alloc::string::String::from("d"), 2), (alloc::string::String::from("f"), 1)]);
+    assert!(stored_types(&fs, "/d", &[".", ".."]).iter().all(|(_, ft)| *ft == 2));
+}
+
 #[test]
 fn create_dir_and_write_files() {
     let fs = mount_empty();

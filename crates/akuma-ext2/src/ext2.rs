@@ -769,6 +769,18 @@ const FT_DIR: u8 = 2;
 const FT_SOCK: u8 = 6;
 const FT_SYMLINK: u8 = 7;
 
+/// `EXT2_FEATURE_INCOMPAT_FILETYPE`: directory entries carry a file type in byte 7.
+/// Without it that byte is the high half of a 16-bit `name_len`: it must be written
+/// 0 (e2fsck clears anything else, 42,815 entries on one guest disk) and read as
+/// "unknown", never as a type.
+const INCOMPAT_FILETYPE: u32 = 0x0002;
+
+/// The type byte a new directory entry gets: `ft` on a filesystem with
+/// [`INCOMPAT_FILETYPE`], else 0.
+fn stored_dirent_type(state: &Ext2State, ft: u8) -> u8 {
+    if state.superblock.feature_incompat & INCOMPAT_FILETYPE != 0 { ft } else { 0 }
+}
+
 /// `EXT2_LINK_MAX`: Linux refuses a link past this with `EMLINK`.
 const LINK_MAX: u16 = 65_000;
 
@@ -2708,7 +2720,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // Inode Data Operations
     // ========================================================================
 
-    fn read_inode_data(&self, state: &Ext2State, inode: &Inode) -> Result<Vec<u8>, FsError> {
+    /// `pub(crate)` for `mod tests`, which reads a directory's raw entries back.
+    pub(crate) fn read_inode_data(&self, state: &Ext2State, inode: &Inode) -> Result<Vec<u8>, FsError> {
         let size = inode.size_lower as usize;
 
         // Safety: Limit maximum kernel-side file allocation to 16MB to prevent OOM/panic.
@@ -2916,7 +2929,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // Directory Operations
     // ========================================================================
 
-    fn parse_directory(&self, data: &[u8]) -> Vec<(u32, String, u8)> {
+    /// `pub(crate)` for `mod tests`, which checks the stored type bytes.
+    pub(crate) fn parse_directory(&self, data: &[u8]) -> Vec<(u32, String, u8)> {
         let mut entries = Vec::new();
         let mut offset = 0;
 
@@ -2986,6 +3000,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         inode_num: u32,
         file_type: u8,
     ) -> Result<(), FsError> {
+        let file_type = stored_dirent_type(state, file_type);
         let mut dir_inode = self.read_inode(state, dir_inode_num)?;
         let mut dir_data = self.read_inode_data(state, &dir_inode)?;
 
@@ -3848,19 +3863,24 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
         let dir_data = self.read_inode_data(&state, &inode)?;
         let raw_entries = self.parse_directory(&dir_data);
+        let typed = state.superblock.feature_incompat & INCOMPAT_FILETYPE != 0;
 
         let entries = raw_entries
             .into_iter()
             .filter(|(inode, name, _)| *inode != 0 && name != "." && name != "..")
             .map(|(inode_num, name, file_type)| {
-                let is_dir = file_type == FT_DIR;
-                let is_symlink = file_type == FT_SYMLINK;
-                let size = if is_dir {
-                    0
-                } else {
-                    self.read_inode(&state, inode_num)
-                        .map_or(0, |i| i.size_lower as u64)
+                // The type byte is a type only on a filesystem with INCOMPAT_FILETYPE, and
+                // 0 there is "unknown": either way the inode decides. `DirEntry` has no
+                // unknown, so reading 0 as "not a directory" made getdents64 report
+                // `.git/refs/heads` as a regular file and git saw no refs at all.
+                let ft = if typed { file_type } else { 0 };
+                let node = if ft == FT_DIR { None } else { self.read_inode(&state, inode_num).ok() };
+                let kind = node.as_ref().map(|i| i.type_perms & 0xF000);
+                let (is_dir, is_symlink) = match ft {
+                    0 => (kind == Some(S_IFDIR), kind == Some(S_IFLNK)),
+                    ft => (ft == FT_DIR, ft == FT_SYMLINK),
                 };
+                let size = if is_dir { 0 } else { node.map_or(0, |i| i.size_lower as u64) };
                 DirEntry { name, is_dir, is_symlink, size }
             })
             .collect();
@@ -4027,7 +4047,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             inode: inode_num,
             rec_len: 12,
             name_len: 1,
-            file_type: FT_DIR,
+            file_type: stored_dirent_type(&state, FT_DIR),
         };
         dot_entry.serialize(&mut dir_data[0..DIR_ENTRY_HEADER_SIZE]);
         dir_data[DIR_ENTRY_HEADER_SIZE] = b'.';
@@ -4037,7 +4057,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             inode: parent_inode_num,
             rec_len: (state.block_size - 12) as u16,
             name_len: 2,
-            file_type: FT_DIR,
+            file_type: stored_dirent_type(&state, FT_DIR),
         };
         dotdot_entry.serialize(&mut dir_data[12..12 + DIR_ENTRY_HEADER_SIZE]);
         dir_data[12 + DIR_ENTRY_HEADER_SIZE] = b'.';

@@ -232,6 +232,14 @@ table" above and [`syscalls/container.md`](syscalls/container.md) "mount /
 umount2".
 
 - **`first_data_block`:** off-by-one fix (`archive/EXT2_FIRST_DATA_BLOCK_FIX.md`).
+- **Directory-entry types follow `INCOMPAT_FILETYPE`.** A new entry stores its type byte only on a
+  filesystem that declares the feature, else 0 (the byte is `name_len`'s high half there). `read_dir`
+  trusts a nonzero byte only on such a filesystem; otherwise the inode decides whether an entry is a
+  directory or symlink, because `DirEntry` has no "unknown" and a 0 read as a type is "regular file"
+  (`archive/EXT2_DIRENT_TYPE_WITHOUT_FILETYPE.md`).
+- **Largest file: 12 + 1024 + 1024² blocks** (4,299,210,752 bytes at 4 KiB). There are no
+  triple-indirect blocks; a block past that is `NotSupported` (`truncate` reports `EIO`). On an Akuma host
+  this caps a guest disk image at about 4 GiB.
 - **`getdents64`:** directory cache fix (`archive/GETDENTS64_DIR_CACHE_FIX.md`).
 - **`fs-cache` feature** (`Cargo.toml`): large ext2 block cache (clock
   eviction) — keeps the read-only toolchain resident across the many process
