@@ -515,7 +515,7 @@ fn fault_trap_locked(t: &mut Trap<'_>) {
     // fail. The live PTE decides, never the error code (`cow_resolve` re-reads
     // it); only `Fault` falls through.
     let cr2 = akuma_cpu::ctlreg::cr2();
-    if code & 3 == 3 && cr2 < 0x0000_8000_0000_0000 {
+    if code & 3 == 3 && cr2 < USER_TOP {
         let root = akuma_cpu::ctlreg::cr3() & PTE_ADDR;
         if cow_resolve(root, cr2).resolves() {
             return;
@@ -1015,6 +1015,10 @@ fn banner() {
 // Stage 2: the task, its syscalls, and the crossing into ring 3.
 // ---------------------------------------------------------------------------
 
+/// The end of the canonical user half: every user address is below it, and
+/// nothing a task names at or above it may be mapped, read or written for it.
+pub(crate) const USER_TOP: u64 = 0x0000_8000_0000_0000;
+
 /// Top of the task's stack: canonical user half, far from anything the kernel
 /// places. 16 pages — far more than musl's startup touches, and cheap.
 const USER_STACK_TOP: u64 = 0x0000_7000_0000_0000;
@@ -1272,7 +1276,7 @@ static ZERO_PAGE: [u8; 4096] = [0; 4096];
 /// they are, since the image cannot be read back from anywhere.
 fn madvise_arm(addr: u64, len: u64, advice: u64) -> u64 {
     use akuma_syscalls_mem::madvise::{self, Action, PageAction};
-    if !madvise::range_fits_user_va(addr as usize, len as usize, 0x0000_8000_0000_0000) {
+    if !madvise::range_fits_user_va(addr as usize, len as usize, USER_TOP as usize) {
         return e(ring3::err::EINVAL);
     }
     match madvise::action(advice as i32) {
@@ -1889,7 +1893,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let (code, addr) = (fr.arg1(), fr.arg2());
             match code {
                 ring3::arch::ARCH_SET_FS => {
-                    if addr >= 0x0000_8000_0000_0000 {
+                    if addr >= USER_TOP {
                         return e(ring3::err::EPERM); // the kernel half is not a TLS base
                     }
                     // `akuma_cpu::msr::set_fs_base` is the closed wrmsr path,
@@ -2466,8 +2470,53 @@ fn free_subtree(table_pa: u64, depth: u32) {
     akuma_pmm::free_page(table_pa as usize, tid);
 }
 
+/// Map one placed `PT_LOAD` into `root`, page by page: a fresh zeroed frame,
+/// mapped, with the segment's file-backed slice copied in through the physmap
+/// (the zero-filled `.bss` tail needs nothing more). Returns the page-rounded
+/// span it covered, `None` if a frame or a mapping failed or the segment
+/// reaches past the user half (a hostile image must not map into the kernel
+/// half every root shares). `akuma_elf_exec::load_segments` checked that
+/// `image[offset..offset + filesz]` is in bounds.
+///
+/// Protection: writable wins over executable, so a `W|X` segment (no image
+/// this kernel runs has one) is `USER_RW`.
+fn place_segment(root: u64, image: &[u8], seg: &akuma_elf_exec::LoadSeg) -> Option<(u64, u64)> {
+    let pte = if seg.flags & akuma_elf_exec::PF_W != 0 {
+        PteProt::USER_RW
+    } else if seg.flags & akuma_elf_exec::PF_X != 0 {
+        PteProt::USER_RX
+    } else {
+        PteProt::USER_RO
+    };
+    let end = seg.vaddr.checked_add(seg.memsz)?.checked_add(0xFFF)?;
+    let (first, last) = (seg.vaddr & !0xFFF, end & !0xFFF);
+    if last > USER_TOP {
+        return None;
+    }
+    let mut pva = first;
+    while pva < last {
+        let frame = phys::Frame::alloc_zeroed()?;
+        if !paging::map_page_in(root, pva as usize, frame.pa(), pte, MemAttr::WriteBack) {
+            return None;
+        }
+        // The page's overlap with the segment's file-backed range. The file
+        // slice starts at `p_offset`, not at the vaddr-relative offset: the two
+        // differ in every Alpine dynamic binary's text segment.
+        let from = pva.max(seg.vaddr);
+        let to = (pva + 4096).min(seg.vaddr + seg.filesz);
+        if from < to {
+            let off = (seg.offset + (from - seg.vaddr)) as usize;
+            frame.write_bytes((from - pva) as usize, &image[off..off + (to - from) as usize]);
+        }
+        pva += 4096;
+    }
+    Some((first, last))
+}
+
 fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
-    let img = ring3::Image::parse(image).ok()?;
+    const NO_SEG: akuma_elf_exec::LoadSeg = akuma_elf_exec::LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 };
+    let mut segs = [NO_SEG; 16];
+    let (prog, n) = akuma_elf_exec::program(image, &mut segs).ok()?;
     with_task(|t| {
         t.exit = None;
         // A fresh address space, a fresh region list: `user_ok` checks against
@@ -2485,49 +2534,21 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     let root = root_frame.pa();
     with_task(|t| t.root_pa = root);
 
-    // Place every PT_LOAD at its link address, page by page: fresh zeroed
-    // frame, map, copy the file-backed slice through the physmap. The zeroed
-    // tail (`memsz > filesz` — `.bss`) needs nothing more.
-    let mut placed = 0u64;
-    for seg in img.segments() {
-        let pte = match seg.prot {
-            ring3::Prot::Ro => PteProt::USER_RO,
-            ring3::Prot::Rx => PteProt::USER_RX,
-            ring3::Prot::Rw => PteProt::USER_RW,
-        };
-        let first = seg.vaddr & !0xFFF;
-        let last = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
-        let file = img.segment_bytes(seg);
-        let mut pva = first;
-        while pva < last {
-            let frame = phys::Frame::alloc_zeroed()?;
-            if !paging::map_page_in(root, pva as usize, frame.pa(), pte, MemAttr::WriteBack) {
-                return None;
-            }
-            // The page's overlap with the segment's file-backed range.
-            let from = pva.max(seg.vaddr);
-            let to = (pva + 4096).min(seg.vaddr + seg.filesz);
-            if from < to {
-                let src = &file[(from - seg.vaddr) as usize..(to - seg.vaddr) as usize];
-                // `from - pva` stays inside the frame because `from >= pva` and
-                // `to <= pva + 4096` (`write_bytes` checks it anyway).
-                frame.write_bytes((from - pva) as usize, src);
-            }
-            placed += 1;
-            pva += 4096;
-        }
+    // Every PT_LOAD at its placed address (a static-PIE's moved to `PIE_BASE`).
+    for seg in &segs[..n] {
+        let (first, last) = place_segment(root, image, seg)?;
         add_region(first, last);
     }
 
     // M5: a `PT_INTERP` names the dynamic linker. The *decision* — including
     // the one-NUL-byte static-PIE case — is the shared `akuma-elf-exec` rule
-    // (amd64's loader rides the same); the *mapping* is this kernel's page
-    // loop again. Placement: `INTERP_BASE` = 0x3000_0000, the base akuma-elf
-    // uses — above a static-PIE program at `PIE_BASE` (an image would have to
-    // be 512 MiB to reach it) and far below `MMAP_BASE`, so image and linker
-    // cannot meet. A hit here changes three auxv/cross facts at once: the
-    // entry ring 3 crosses is the linker's, `AT_BASE` is where it was placed,
-    // and `AT_ENTRY` stays the program's (already in the table below).
+    // (amd64's loader rides the same), and so is the parse; the mapping is
+    // `place_segment` again. Placement: `INTERP_BASE` = 0x3000_0000, the base
+    // akuma-elf uses — above a static-PIE program at `PIE_BASE` (an image
+    // would have to be 512 MiB to reach it) and far below `MMAP_BASE`, so
+    // image and linker cannot meet. A hit here changes three auxv/cross facts
+    // at once: the entry ring 3 crosses is the linker's, `AT_BASE` is where it
+    // was placed, and `AT_ENTRY` stays the program's.
     let (cross_entry, at_base) = match akuma_elf_exec::interp_path(image) {
         Ok(Some(path)) => {
             let ipath = core::str::from_utf8(path).ok()?;
@@ -2540,52 +2561,14 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                 console::puts("\n");
                 return None;
             };
-            let mut segs =
-                [akuma_elf_exec::LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 8];
-            let Ok(n) =
-                akuma_elf_exec::load_segments(&ldso, akuma_elf_exec::INTERP_BASE, &mut segs)
-            else {
+            let mut isegs = [NO_SEG; 8];
+            let Ok(n) = akuma_elf_exec::load_segments(&ldso, akuma_elf_exec::INTERP_BASE, &mut isegs) else {
                 console::puts("  exec: interpreter refused by the exec core\n");
                 return None;
             };
             let mut hi = akuma_elf_exec::INTERP_BASE;
-            for seg in &segs[..n] {
-                let first = seg.vaddr & !0xFFF;
-                let last = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
-                let mut pva = first;
-                while pva < last {
-                    let frame = phys::Frame::alloc_zeroed()?;
-                    let pte = if seg.flags & akuma_elf_exec::PF_X != 0 {
-                        PteProt::USER_RX
-                    } else if seg.flags & akuma_elf_exec::PF_W != 0 {
-                        PteProt::USER_RW
-                    } else {
-                        PteProt::USER_RO
-                    };
-                    if !paging::map_page_in(root, pva as usize, frame.pa(), pte, MemAttr::WriteBack) {
-                        return None;
-                    }
-                    // The page's overlap with the segment's file-backed range.
-                    let from = pva.max(seg.vaddr);
-                    let to = (pva + 4096).min(seg.vaddr + seg.filesz);
-                    if from < to {
-                        // `seg.offset` is `p_offset`: the file slice for
-                        // vaddr `v - p_vaddr` starts at
-                        // `p_offset + (v - p_vaddr)`, NOT at `v - p_vaddr`.
-                        // The whole-image Vec is indexed from the file's
-                        // start; the program loop above does not need this
-                        // because `img.segment_bytes(seg)` re-bases the slice
-                        // at the segment's own `p_offset`.
-                        let off = seg.offset + (from - seg.vaddr);
-                        let end = seg.offset + (to - seg.vaddr);
-                        let bytes = &ldso[off as usize..end as usize];
-                        frame.write_bytes((from - pva) as usize, bytes);
-                    }
-                    if last > hi {
-                        hi = last;
-                    }
-                    pva += 4096;
-                }
+            for seg in &isegs[..n] {
+                hi = hi.max(place_segment(root, &ldso, seg)?.1);
             }
             add_region(akuma_elf_exec::INTERP_BASE, hi);
             let Ok(ientry) = akuma_elf_exec::interp_entry(&ldso, akuma_elf_exec::INTERP_BASE) else {
@@ -2594,11 +2577,9 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
             };
             (ientry, akuma_elf_exec::INTERP_BASE)
         }
-        // Static or static-PIE: exactly the answer this loader always gave.
-        Ok(None) => (img.entry(), 0),
-        // A malformed phdr table the shared core refuses — the same refusal
-        // akuma-elf's parser would make. Not reachable for anything
-        // `ring3::Image::parse` accepted with a sane `e_phentsize`.
+        // Static or static-PIE: the program's own entry.
+        Ok(None) => (prog.entry, 0),
+        // `program` already walked the same table, so this is unreachable.
         Err(_) => return None,
     };
 
@@ -2622,11 +2603,11 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     const AUX_N: usize = 14;
     let mut aux = [(0u64, 0u64); AUX_N];
     aux[0] = (ring3::AT_BASE, at_base); // the interpreter's base, 0 if none
-    aux[1] = (ring3::AT_PHDR, img.phdr_va());
-    aux[2] = (ring3::AT_PHENT, img.phent());
-    aux[3] = (ring3::AT_PHNUM, img.phnum());
+    aux[1] = (ring3::AT_PHDR, prog.phdr_va);
+    aux[2] = (ring3::AT_PHENT, akuma_elf_exec::PHENT);
+    aux[3] = (ring3::AT_PHNUM, prog.phnum);
     aux[4] = (ring3::AT_PAGESZ, 4096);
-    aux[5] = (ring3::AT_ENTRY, img.entry());
+    aux[5] = (ring3::AT_ENTRY, prog.entry);
     aux[6] = (ring3::AT_UID, 0);
     aux[7] = (ring3::AT_EUID, 0);
     aux[8] = (ring3::AT_GID, 0);
@@ -2666,12 +2647,11 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
 
     // The heap slabs: `brk` above the image, `mmap` in its own window. Both
     // registered now, so a pointer check is one scan.
-    let brk0 = (img.image_end() + 0xFFF) & !0xFFF;
+    let brk0 = (prog.end + 0xFFF) & !0xFFF;
     with_task(|t| t.layout.set_brk_window(brk0, BRK_SLAB));
     add_region(brk0, brk0 + BRK_SLAB);
     add_region(MMAP_BASE, MMAP_BASE + MMAP_SLAB);
 
-    let _ = placed;
     Some(TaskImage { root_pa: root, entry: cross_entry, rsp })
 }
 

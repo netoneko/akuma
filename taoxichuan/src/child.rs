@@ -1120,8 +1120,7 @@ pub fn sigreturn_arm(fr: &mut ring3::SyscallFrame) -> u64 {
     let mask = u64::from_le_bytes(buf[tail + 8..tail + 16].try_into().unwrap_or([0; 8]));
     let fp_at = u64::from_le_bytes(buf[tail + 16..tail + 24].try_into().unwrap_or([0; 8]));
     // Never trust a user-built frame with a kernel address or odd flags.
-    const USER_TOP: u64 = 0x0000_8000_0000_0000;
-    if words[13] >= USER_TOP || user_rsp >= USER_TOP {
+    if words[13] >= crate::USER_TOP || user_rsp >= crate::USER_TOP {
         return crate::e(ring3::err::EFAULT);
     }
     words[14] = (words[14] & 0x0000_0CD5) | 0x202;
