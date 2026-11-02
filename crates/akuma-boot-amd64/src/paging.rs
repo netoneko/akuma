@@ -125,6 +125,27 @@ pub fn map_page_in(root: u64, va: usize, pa: u64, prot: PteProt, attr: MemAttr) 
     mapped
 }
 
+/// Write `entry`, as it is, into the 4 KiB user leaf for `va` in `root`,
+/// building user-accessible tables on the way down.
+///
+/// For entries that are not built from a protection: a demand-paging record
+/// (`akuma_pte_amd64::lazy`, not present), or a leaf moved whole from another
+/// slot of the same root (`mremap`), which carries its frame, its CoW marker and
+/// its dirty bit with it. A new present page goes through [`map_page_in`].
+///
+/// Whatever the slot held is overwritten: a caller replacing a present page
+/// unmaps it (and settles its frame) first, or that frame leaks. `false` when a
+/// table frame cannot be had or the path meets a large page.
+pub fn set_leaf_in(root: u64, va: usize, entry: u64) -> bool {
+    assert_eq!(va % PAGE_SIZE, 0, "va must be page aligned");
+    let set = walk::map_leaf::<Physmap>(root, va, entry, true, || akuma_pmm::alloc_page().map(|f| f as u64));
+    if set {
+        // The slot may have held a translation a TLB still caches.
+        invlpg(va);
+    }
+    set
+}
+
 /// Remove the mapping for `va` in the active address space.
 pub fn unmap_page(va: usize) -> Option<u64> {
     unmap_page_in(read_cr3(), va)

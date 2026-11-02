@@ -461,6 +461,29 @@ fraction, not a "leave N bytes free" constant, so it tracks the heap if that
 moves. The streaming-`execve` fix that would remove the need for the headroom is
 not done: `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §10.
 
+## Taoxichuan: the lazy record is the leaf
+
+Taoxichuan (`akuma-tokio-kernel-amd64`) has no region table, so a page that `mmap` reserved and nothing has
+touched is recorded in **its own not-present leaf entry** (`akuma_pte_amd64::lazy`: a tag bit, write/exec
+bits, and for a file page the inode and page index). `lazy::fill` makes it present from a not-present
+fault, from the kernel's `TaskWalk` copies, or from the `akuma_user_access` prefault hook that glue's
+`validate_user_range` calls.
+
+Rules that follow from the record being a leaf:
+
+- **Every walker treats a lazy leaf as unmapped**, which is right for translation, teardown and the
+  ledger. It is wrong in two places, and each has its own code: fork copies lazy leaves (the
+  `akuma-user-tree` clone plan skips non-present ones), and `release_pages` clears them
+  (`paging::unmap_page_in` clears only present leaves). A new path that unmaps a range goes through
+  `release_pages`. A new path that copies a page table handles `lazy::is_lazy`.
+- **A lazy file page pins its inode** for the address space's lifetime (`lazy::pin`, dropped in
+  `free_user_root`). A mapping whose inode cannot be pinned is filled eagerly.
+- **Writable `MAP_SHARED` file mappings stay eager**: their writeback walks present frames.
+- A ring-0 not-present fault fills zero pages only. A file fill reads the filesystem, which a ring-0
+  fault may already hold.
+
+`docs/archive/TAOXICHUAN_LAZY_MMAP.md`.
+
 ## Feature notes
 
 `mem.rs` is always compiled in (no `sc-*` gate; see

@@ -183,6 +183,10 @@ pub fn init() {
     // real task is parked (its loop feeds the tick and yields on wakeups).
     akuma_threading::register_x86_arch_hooks(akuma_sched_amd64::hooks::<crate::sched::Tx>());
     seed_idle();
+    // Glue's arms validate a user buffer before touching it and, when a page is
+    // not present, ask this hook to fill it: without it a lazy `mmap` buffer is
+    // `EFAULT` to every shared syscall (`lazy.rs`).
+    akuma_user_access::set_prefault_hook(crate::lazy::prefault);
     akuma_exec::process::reserve_pid_floor(2);
 }
 

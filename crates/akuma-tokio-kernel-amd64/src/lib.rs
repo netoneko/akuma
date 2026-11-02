@@ -40,6 +40,7 @@ extern crate alloc;
 mod child;
 mod console;
 mod exec_twin;
+mod lazy;
 mod net;
 #[cfg(feature = "trace-err")]
 mod ring;
@@ -451,6 +452,17 @@ fn fault_trap(t: &mut Trap<'_>) {
 
 fn fault_trap_locked(t: &mut Trap<'_>) {
     let code = t.error_code.unwrap_or(0);
+    // A not-present user page that `mmap` reserved and nothing has touched yet:
+    // fill it and retry. From ring 0 too (a kernel access that skipped
+    // `validate_user_range`'s prefault), but only zero-fill there - a file fill
+    // reads the filesystem, which a ring-0 fault may be holding. A failed fill
+    // (no memory, an unreadable file) falls through to the kill.
+    if code & 1 == 0 && akuma_cpu::ctlreg::cr2() < USER_TOP {
+        let root = akuma_cpu::ctlreg::cr3() & PTE_ADDR;
+        if lazy::fill(root, akuma_cpu::ctlreg::cr2(), t.from_ring3()) == lazy::Fill::Present {
+            return;
+        }
+    }
     if t.from_ring3() && code & 1 == 0 && grow_user_stack(akuma_cpu::ctlreg::cr2()) {
         return;
     }
@@ -1105,8 +1117,8 @@ impl Task {
 }
 
 /// `mprotect(addr, len, prot)`: re-map each present page of the range with
-/// the requested `R/W/X` (anonymous memory is eagerly mapped here, so a page
-/// either has a frame or is not part of the task). This is what makes
+/// the requested `R/W/X`, and give each lazy page (`lazy.rs`) the same
+/// permissions for when it is first touched. This is what makes
 /// `tcc -run` and every JIT work: the code is written RW, then flipped to RX,
 /// and a page mapped RW-non-exec faults on the fetch.
 ///
@@ -1137,6 +1149,9 @@ fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
     }
     for i in 0..pages {
         let va = (addr + i * 4096) as usize;
+        if lazy::reprotect(root, va as u64, want.write, want.exec) {
+            continue;
+        }
         // The remap below builds a fresh PTE; carry "written" across it or the policy forgets.
         let was_written = page_written(root, va as u64);
         if want.write && !cow_privatize(root, va as u64) {
@@ -1185,14 +1200,15 @@ fn mm_dump_for(va: u64) {
 }
 
 /// Unmap every present page of `[start, end)` in `root` and give its frame
-/// back (`free_page` honours a CoW count). Pages that were never faulted in
-/// are skipped.
+/// back (`free_page` honours a CoW count), and clear every lazy record in it.
 fn release_pages(root: u64, start: u64, end: u64) {
     let tid = akuma_primitives::preempt::current_tid() as u32;
     let mut va = start;
     while va < end {
         if let Some(pa) = paging::unmap_page_in(root, va as usize) {
             akuma_pmm::free_page(pa as usize, tid);
+        } else {
+            lazy::clear(root, va);
         }
         va += 4096;
     }
@@ -1250,20 +1266,18 @@ fn msync_arm(addr: u64, len: u64) -> u64 {
     0
 }
 
-/// What a zeroed page reads as, for `MADV_DONTNEED`'s in-place zero.
-static ZERO_PAGE: [u8; 4096] = [0; 4096];
-
 /// `madvise(addr, len, advice)`: the advice decode is `akuma-syscalls-mem`'s, shared with the other kernels
-/// (`MADV_FREE` is `EINVAL`, which musl's allocator reads as "not supported"; the hints are no-ops, and
-/// `MADV_WILLNEED` is one too, since every mapping here is populated at `mmap`).
+/// (`MADV_FREE` is `EINVAL`, which musl's allocator reads as "not supported"; the hints are no-ops, and so is
+/// `MADV_WILLNEED`: a lazy page fills on its first touch either way).
 ///
 /// `MADV_DONTNEED` makes the next read of each page in the mmap slab return zero, per
-/// [`akuma_syscalls_mem::madvise::dontneed_page_action`]: an unshared frame is zeroed in place, and a frame a
-/// fork peer also maps is replaced by a fresh zeroed one (zeroing it would wipe the peer's page). A writable
-/// `MAP_SHARED` file page is written back and kept, which is what Linux's drop and refault reads. Pinned
-/// divergences: a private file page is zeroed, where Linux refaults the file's bytes (nothing here records
-/// which slab pages came from a file); pages outside the slab (the image, `brk`, the main stack) are left as
-/// they are, since the image cannot be read back from anywhere.
+/// [`akuma_syscalls_mem::madvise::dontneed_page_action`]: a present page's leaf becomes a zero-fill lazy
+/// record with the page's permissions (`lazy.rs`), and the frame goes back - or, if a fork peer also maps it,
+/// only this space's count on it. A page not yet touched keeps its record, so a private file page nobody
+/// wrote still reads the file, as on Linux. A writable `MAP_SHARED` file page is written back and kept, which
+/// is what Linux's drop and refault reads. Pinned divergences: a present private file page refaults as
+/// zeros, where Linux rereads the file (the record of which file it came from went when it was filled);
+/// pages outside the slab (the image, `brk`, the main stack) are left as they are.
 fn madvise_arm(addr: u64, len: u64, advice: u64) -> u64 {
     use akuma_syscalls_mem::madvise::{self, Action, PageAction};
     if !madvise::range_fits_user_va(addr as usize, len as usize, USER_TOP as usize) {
@@ -1281,41 +1295,51 @@ fn madvise_arm(addr: u64, len: u64, advice: u64) -> u64 {
             if with_task(|t| t.layout.shared().iter().any(|f| f.base < end && start < f.base + f.len)) {
                 shared_writeback(start, end, false);
             }
-            // Only the used part of the slab: everything in it is mapped (no lazy pages), so the walk costs
-            // what the task has allocated, not the length ring 3 asked for.
+            // Only the used part of the slab: nothing above the cursor has a leaf.
             let (lo, hi) = (start.max(MMAP_BASE), end.min(with_task(|t| t.layout.mmap_cur())));
             let root = task_root();
-            let tid = akuma_primitives::preempt::current_tid() as u32;
+            // Frames whose leaves were just replaced, given back in batches once peers' TLBs have dropped them.
+            let mut dropped = [0u64; 64];
+            let mut n = 0;
             for va in (lo..hi).step_by(4096) {
                 if let (false, Some(slot)) = (with_task(|t| t.layout.in_shared(va)), leaf_entry(root, va)) {
                     let pte = slot.read();
-                    let old = pte & PTE_ADDR;
                     match madvise::dontneed_page_action(pte & 1 != 0, share_count(pte)) {
                         PageAction::Nothing => {}
-                        // The frame is this space's only: zero it where it is.
-                        PageAction::ZeroInPlace => {
-                            if let Some(f) = slot.frame() {
-                                f.write_bytes(0, &ZERO_PAGE);
-                            }
-                        }
-                        PageAction::BreakSharing => {
-                            // Out of frames: the page keeps its bytes, the answer that wipes nobody's page.
-                            if let Some(fresh) = phys::Frame::alloc_zeroed() {
-                                // A CoW-marked page was writable before the fork shared it, and its private
-                                // replacement is again; an unmarked read-only page stays read-only.
-                                let w = if pte & PTE_COW != 0 { PTE_W } else { 0 };
-                                slot.write(((pte & !PTE_ADDR) | w | fresh.pa()) & !PTE_COW);
-                                akuma_cpu::tlb::invlpg(va as usize);
-                                // As `cow_resolve`'s copy: peers drop the old translation before its count does.
-                                smp::shootdown();
-                                akuma_pmm::free_page(old as usize, tid);
+                        // Shared or not, the answer is the same here: this space lets go of the frame (a peer
+                        // keeps its count) and the page refaults as zeros.
+                        PageAction::ZeroInPlace | PageAction::BreakSharing => {
+                            let Some(record) = lazy::anon_like(pte).encode() else {
+                                continue;
+                            };
+                            slot.write(record);
+                            akuma_cpu::tlb::invlpg(va as usize);
+                            dropped[n] = pte & PTE_ADDR;
+                            n += 1;
+                            if n == dropped.len() {
+                                free_dropped(&dropped[..n]);
+                                n = 0;
                             }
                         }
                     }
                 }
             }
+            free_dropped(&dropped[..n]);
             0
         }
+    }
+}
+
+/// Give back frames whose leaves this core just rewrote, after every peer has dropped its translations of
+/// them (as `cow_resolve`'s copy: the shootdown comes before the count drops).
+fn free_dropped(frames: &[u64]) {
+    if frames.is_empty() {
+        return;
+    }
+    smp::shootdown();
+    let tid = akuma_primitives::preempt::current_tid() as u32;
+    for &f in frames {
+        akuma_pmm::free_page(f as usize, tid);
     }
 }
 
@@ -1394,7 +1418,7 @@ struct TaskWalk {
 
 impl akuma_user_walk::Walk for TaskWalk {
     fn read_page(&self, va: u64, out: &mut [u8]) -> bool {
-        let Some(pa) = paging::translate_in(self.root, (va & !0xFFF) as usize) else {
+        let Some(pa) = translate_filling(self.root, va) else {
             return false;
         };
         // SAFETY: `translate_in` named a mapped task frame.
@@ -1402,7 +1426,9 @@ impl akuma_user_walk::Walk for TaskWalk {
         true
     }
     fn write_page(&self, va: u64, src: &[u8]) -> bool {
-        if !cow_prepare_write(self.root, va) {
+        // Present first: `cow_prepare_write` judges the live entry, and a lazy
+        // one has none to judge.
+        if translate_filling(self.root, va).is_none() || !cow_prepare_write(self.root, va) {
             return false;
         }
         let Some(pa) = paging::translate_in(self.root, (va & !0xFFF) as usize) else {
@@ -1414,6 +1440,16 @@ impl akuma_user_walk::Walk for TaskWalk {
         mark_written(self.root, va);
         true
     }
+}
+
+/// The frame behind the page holding `va`, filling it first if it is lazy: the
+/// kernel's copies walk the page table and never fault, so they are where a
+/// lazy page meets its first kernel access.
+fn translate_filling(root: u64, va: u64) -> Option<u64> {
+    let page = (va & !0xFFF) as usize;
+    paging::translate_in(root, page).or_else(|| {
+        (lazy::fill(root, va, true) == lazy::Fill::Present).then(|| paging::translate_in(root, page)).flatten()
+    })
 }
 
 fn task_walk() -> TaskWalk {
@@ -1859,15 +1895,13 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 return brk_cur;
             }
             if let akuma_user_layout::Brk::Grow { from, to: end } = plan {
-                let mut page = from;
-                while page < end {
-                    let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
-                        return brk_cur;
-                    };
-                    if !paging::map_page_in(root, page as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
-                        return brk_cur;
-                    }
-                    page += 4096;
+                // A shrink left its pages mapped, and a regrow must read zeros: release whatever is
+                // there (it used to be overwritten, leaking the frame and keeping nothing), then
+                // reserve the range lazily.
+                release_pages(root, from, end);
+                if !lazy::reserve(root, from, end - from, lazy::Lazy::anon(true, false)) {
+                    release_pages(root, from, end);
+                    return brk_cur;
                 }
             }
             with_task(|t| t.layout.set_brk(want));
@@ -1963,63 +1997,79 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     None => return e(ring3::err::ENOMEM),
                 }
             };
-            // Mappings are RW (the kernel fills them), except that exec is exec: with W^X on, a
-            // `PROT_EXEC` mapping is RX - `W|X` was refused above, so it asked for no write - and a
-            // page can only become executable if the program never wrote it. With `wx=0` the old
-            // widening to RWX is back.
-            let pte = if prot & ring3::mmap::PROT_EXEC == 0 {
-                PteProt::USER_RW
+            // Mappings are RW, except that exec is exec: with W^X on, a `PROT_EXEC` mapping is RX - `W|X`
+            // was refused above, so it asked for no write - and a page can only become executable if the
+            // program never wrote it. With `wx=0` the old widening to RWX is back.
+            let (write, exec) = if prot & ring3::mmap::PROT_EXEC == 0 {
+                (true, false)
             } else if wx_on() {
-                PteProt::USER_RX
+                (false, true)
             } else {
-                PteProt::USER_RWX
+                (true, true)
             };
-            let mut page = base & !0xFFF;
-            while page < base + pages {
-                let Some(frame) = phys::Frame::alloc_zeroed() else {
-                    return e(ring3::err::ENOMEM);
-                };
-                if !paging::map_page_in(root, page as usize, frame.pa(), pte, MemAttr::WriteBack) {
+            let pte = PteProt { write, exec, user: true };
+            const MAP_SHARED: u64 = 0x1;
+            let shared_write = fnode.is_some() && flags & MAP_SHARED != 0 && prot & ring3::mmap::PROT_WRITE != 0;
+            // Lazy (`lazy.rs`): one record per page now, a frame on the first touch. A writable shared file
+            // mapping stays eager - its pages are written back by walking the present frames, and fork
+            // copies them (`SharedSpans::Copy`) - and so does a file mapping whose offset is unaligned or
+            // past what a record holds, or whose inode cannot be pinned.
+            let first = lazy::Lazy { write, exec, file: fnode.map(|inode| lazy::FilePage { inode, index: off / 4096 }) };
+            let lazy_ok = !shared_write
+                && off.is_multiple_of(4096)
+                && lazy::fits(first, pages / 4096)
+                && fnode.is_none_or(|node| lazy::pin(root, node));
+            if lazy_ok {
+                if !lazy::reserve(root, base, pages, first) {
+                    release_pages(root, base, base + pages);
                     return e(ring3::err::ENOMEM);
                 }
-                if let Some(node) = fnode {
-                    // File-backed private: fill this page straight from the
-                    // inode. A short read (the page runs past EOF) leaves
-                    // the zeroed tail — the same bytes a private mapping of
-                    // the file would have there.
-                    let foff = off + (page - base);
-                    let mut done = 0usize;
-                    while done < 4096 {
-                        let want = (4096 - done).min(1024);
-                        let mut chunk = [0u8; 1024];
-                        let got = match root_fs().read_at_by_inode(
-                            node,
-                            (foff + done as u64) as usize,
-                            &mut chunk[..want],
-                        ) {
-                            Ok(g) => g,
-                            Err(_) => return e(ring3::err::EIO),
-                        };
-                        if got == 0 {
-                            break;
-                        }
-                        frame.write_bytes(done, &chunk[..got]);
-                        done += got;
+            } else {
+                let mut page = base & !0xFFF;
+                while page < base + pages {
+                    let Some(frame) = phys::Frame::alloc_zeroed() else {
+                        return e(ring3::err::ENOMEM);
+                    };
+                    if !paging::map_page_in(root, page as usize, frame.pa(), pte, MemAttr::WriteBack) {
+                        return e(ring3::err::ENOMEM);
                     }
+                    if let Some(node) = fnode {
+                        // File-backed: fill this page straight from the inode. A short read (the page
+                        // runs past EOF) leaves the zeroed tail - the same bytes a mapping of the file
+                        // would have there.
+                        let foff = off + (page - base);
+                        let mut done = 0usize;
+                        while done < 4096 {
+                            let want = (4096 - done).min(1024);
+                            let mut chunk = [0u8; 1024];
+                            let got = match root_fs().read_at_by_inode(
+                                node,
+                                (foff + done as u64) as usize,
+                                &mut chunk[..want],
+                            ) {
+                                Ok(g) => g,
+                                Err(_) => return e(ring3::err::EIO),
+                            };
+                            if got == 0 {
+                                break;
+                            }
+                            frame.write_bytes(done, &chunk[..got]);
+                            done += got;
+                        }
+                    }
+                    page += 4096;
                 }
-                page += 4096;
             }
             // A MAP_FIXED mapping lands inside an earlier reservation, BELOW
             // `mmap_cur`: only a mapping above the cursor moves it.
             with_task(|t| t.layout.note_mapped(base + pages));
-            if let Some(node) = fnode {
-                const MAP_SHARED: u64 = 0x1;
-                if flags & MAP_SHARED != 0 && prot & ring3::mmap::PROT_WRITE != 0 {
-                    let f = akuma_user_layout::SharedFile { base, len: pages, inode: node, offset: off, size: fsize };
-                    let recorded = with_task(|t| t.layout.add_shared(f));
-                    if !recorded {
-                        akuma_primitives::safe_print!(96, "[mmap] shared-file table full: writes to this mapping are lost\n");
-                    }
+            if let Some(node) = fnode
+                && shared_write
+            {
+                let f = akuma_user_layout::SharedFile { base, len: pages, inode: node, offset: off, size: fsize };
+                let recorded = with_task(|t| t.layout.add_shared(f));
+                if !recorded {
+                    akuma_primitives::safe_print!(96, "[mmap] shared-file table full: writes to this mapping are lost\n");
                 }
             }
             base
@@ -2054,7 +2104,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // musl's realloc on an mmapped chunk. Shrink frees the tail; grow
             // extends in place when the range ends at the slab cursor, else
             // moves (MAYMOVE, which the caller accepts by using the returned
-            // address), copies the overlap and frees the old range.
+            // address): a slab mapping by moving its leaves, anything else by
+            // copying the overlap.
             // MREMAP_FIXED is refused: no fixed targets.
             let (old, old_sz, new_sz, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
             if new_sz == 0 || flags & 2 != 0 || old & 0xFFF != 0 {
@@ -2081,15 +2132,9 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             // In place: the range is the topmost thing in the slab.
             if let akuma_user_layout::Mremap::InPlace { from, to } = plan {
-                let mut page = from;
-                while page < to {
-                    let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
-                        return e(ring3::err::ENOMEM);
-                    };
-                    if !paging::map_page_in(root, page as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
-                        return e(ring3::err::ENOMEM);
-                    }
-                    page += 4096;
+                if !lazy::reserve(root, from, to - from, lazy::Lazy::anon(true, false)) {
+                    release_pages(root, from, to);
+                    return e(ring3::err::ENOMEM);
                 }
                 with_task(|t| t.layout.note_mapped(to));
                 return old;
@@ -2098,15 +2143,27 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let Some(base) = with_task(|t| t.layout.alloc(new_pages)) else {
                 return e(ring3::err::ENOMEM);
             };
-            let mut page = base & !0xFFF;
-            while page < base + new_pages {
-                let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
-                    return e(ring3::err::ENOMEM);
-                };
-                if !paging::map_page_in(root, page as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
+            // A slab mapping moves by its leaves: present or lazy, each page keeps its frame and its
+            // bits at the new address, so nothing is copied and nothing untouched gets filled. The
+            // tail past the old length is fresh zero-fill.
+            if release_old && mmdbg() & 4 != 0 {
+                if !lazy::reserve(root, base + old_pages, new_pages - old_pages, lazy::Lazy::anon(true, false)) {
+                    release_pages(root, base, base + new_pages);
                     return e(ring3::err::ENOMEM);
                 }
-                page += 4096;
+                if !lazy::move_range(root, old, base, old_pages) {
+                    release_pages(root, base, base + new_pages);
+                    return e(ring3::err::ENOMEM);
+                }
+                // Peers may still translate the old addresses to the moved frames.
+                smp::shootdown();
+                mm_event(4, old, old + old_pages);
+                with_task(|t| t.layout.release(old, old + old_pages));
+                return base;
+            }
+            if !lazy::reserve(root, base, new_pages, lazy::Lazy::anon(true, false)) {
+                release_pages(root, base, base + new_pages);
+                return e(ring3::err::ENOMEM);
             }
             let copy = old_sz.min(new_sz);
             let mut chunk = [0u8; 1024];
@@ -2119,11 +2176,6 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     return e(ring3::err::EFAULT);
                 }
                 done += n as u64;
-            }
-            if release_old && mmdbg() & 4 != 0 {
-                mm_event(4, old, old + old_pages);
-                release_pages(root, old, old + old_pages);
-                with_task(|t| t.layout.release(old, old + old_pages));
             }
             base
         }
@@ -2299,7 +2351,12 @@ pub(crate) fn clone_user_half(parent_root: u64, dst_root: u64) -> Option<()> {
     // that owns every page-table touch here.
     let (src, dst) = unsafe { (phys::Frame::from_pa(parent_root), phys::Frame::from_pa(dst_root)) };
     copy_kernel_half(dst);
-    clone_user_half_into(src, dst)
+    // The child inherits the parent's lazy file pages, so it holds their inodes too.
+    if !lazy::fork_pins(parent_root, dst_root) || clone_user_half_into(src, dst).is_none() {
+        lazy::drop_pins(dst_root);
+        return None;
+    }
+    Some(())
 }
 
 /// The kernel half of every task root is the live CR3's: one PML4 copy shares
@@ -2383,6 +2440,11 @@ fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
         let va = va_base | ((i as u64) << shift);
         // The decisions (skip / refuse / descend / copy / share-and-demote) are `akuma-user-tree`'s, host-tested
         // against a fake tree; this loop performs them. A writable `MAP_SHARED` file span is copied (`SharedSpans::Copy`).
+        // A lazy leaf is not present, so the plan would skip it: the child must inherit the record.
+        if depth == 0 && lazy::is_lazy(entry) {
+            dst.set_entry(i, entry);
+            continue;
+        }
         let plan = X86_64.plan_clone(depth, entry, depth == 0 && in_shared_span(va), SharedSpans::Copy);
         match plan {
             ClonePlan::Skip => {}
@@ -2644,6 +2706,7 @@ pub(crate) fn free_user_root(root: u64) -> usize {
     if root == 0 || root == (akuma_cpu::ctlreg::cr3() & ADDR) {
         return 0;
     }
+    lazy::drop_pins(root);
     let tid = akuma_primitives::preempt::current_tid() as u32;
     let mut n = 0usize;
     // Every frame named below is a page-table frame this walk reached from a

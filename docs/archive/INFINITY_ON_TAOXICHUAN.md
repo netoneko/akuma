@@ -11,7 +11,7 @@ Akuma on bare metal. The model is given https://github.com/hydro-project/infinit
 The order is fixed: **cut first, then build**. A clean clone pulls about 700 crates. Fewer crates is the point of
 the experiment, and so is the build time saved.
 
-Status: **running**. Results below are filled in as they land.
+Status: **done** 2026-11-03. GLM's port builds and passes PONG and `uname`; the push waits on credentials.
 
 ## Setup
 
@@ -108,13 +108,14 @@ Each is a kernel or hypervisor defect, not GLM's, and each is fixed:
 | no `#!` support in `execve` | GLM's Python wrapper: `Exec format error` | `a0ffa4d4`, [`TAOXICHUAN_EXEC_SHEBANG.md`](TAOXICHUAN_EXEC_SHEBANG.md) |
 | ext2 clock was a constant 0 | 1970 mtimes; `e2fsck` after the hard stop set `dtime` on 15,254 deleted inodes | `a0ffa4d4` |
 
-And three that are open:
+One more, fixed after the run:
 
-- **Eager mmap.** Taoxichuan allocates and zeroes every page at `mmap` time and copies file pages per
-  process, so each `rustc` holds a private copy of the 311 MB `librustc_driver`. At `-j3` on 3 GiB, a
-  rustc's thread-stack `mmap` got `ENOMEM`, which rustc reports as an ICE (`failed to spawn work thread`).
-  The amd64 kernel moved to the akuma-mmap region table and lazy, shared file pages (fpcache) in
-  2026-09; Taoxichuan has neither.
+| bug | what it did here | fix |
+|---|---|---|
+| eager `mmap`: every page allocated, zeroed and file-filled at `mmap` | at `-j3` on 3 GiB a `rustc` thread-stack `mmap` got `ENOMEM` (ICE: `failed to spawn work thread`) | [`TAOXICHUAN_LAZY_MMAP.md`](TAOXICHUAN_LAZY_MMAP.md): the same clean `-j3` build on 3 GiB now completes, 278 crates in 790 s |
+
+And two that are open:
+
 - **Stale process rows.** After a multi-threaded abort, and even after `SIGKILL`, rows stayed in `ps`
   (state R, `VmSize` 0, fds 0/1 open, `kill -0` succeeding) for pids cargo had already reaped.
 - **sshd as init miscounts.** It reaps with `wait4(-1)`, but counts every reaped orphan as a finished
@@ -126,8 +127,32 @@ no orphan list) and the 15,254 zero `dtime`s.
 
 ## Results
 
-_Pending: the build is past every kernel problem and on GLM's own code; the PONG and `uname` checks
-follow it._
+GLM finished every step on branch `no-aws` of its clone (`/src/infinity` in the guest):
+
+| commit | what |
+|---|---|
+| `becf10e` | remove the AWS crates, dependencies and CDK deployment |
+| `13a8526` | reqwest: OpenSSL to rustls with the ring provider (the guest has no OpenSSL, cmake or clang) |
+| `154daae` | trim the workspace to the closure the agent needs |
+| `6f78b4d` | fix the compile errors in its own code that the fixed kernel's diagnostics showed |
+| `c6d559d` | provider launcher, smoke test, shell-tool config |
+| `f0aef22` | `RESULT.md`: the run report |
+
+- **Size.** 664 to 399 crates in `Cargo.lock`; the workspace went from 21 members to 11.
+- **Build.** The closure (daemon, the `infinity` CLI, `infinity-provider-openai`, `infinity-mcp-shell-tools`)
+  built at `-j2`, about 18 minutes of build time over six attempts. Three of the attempts failed on kernel
+  bugs (the table above).
+- **PONG.** `infinity -H 'Reply with exactly the word PONG and nothing else.'` went daemon, provider
+  process, `api.z.ai` over rustls/ring and back. The saved thread ends in
+  `{"kind":"assistant","content":{"text":"PONG"}}`.
+- **`uname -a` through the tool path.** The agent called `shell_invoke_tool` on the MCP shell server,
+  which ran `/bin/sh -c 'uname -a'`, and replied with its output:
+  `Linux taoxichuan 0.1.0-923e27c3-taoxichuan 923e27c3-release x86_64 GNU/Linux`.
+- **Not pushed.** The guest holds no GitHub credentials. The `fork` remote
+  (`https://github.com/netoneko/infinity.git`) is configured; the push is the supervisor's to make.
+
+Two goose turns ended on supervisor action, not on GLM's: the smoke test blocked on `p.stderr.readline()`
+from a provider that writes nothing to stderr, and one turn died on a z.ai `Stream decode error`.
 
 ## Background
 

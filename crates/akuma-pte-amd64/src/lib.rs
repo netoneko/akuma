@@ -35,6 +35,8 @@
 
 use akuma_mmap::Prot;
 
+pub mod lazy;
+
 /// Present.
 pub const P: u64 = 1 << 0;
 /// Writable.
