@@ -349,7 +349,7 @@
         <div style="display:flex;flex-direction:column;gap:clamp(0.9rem,2.4vh,1.8rem)">
           <p class="eyebrow">Akuma OS</p>
           <h1>Self-hosting a <span class="n600">Rust kernel</span></h1>
-          <p class="sub">the memes were right</p>
+	  <p class="sub">with <em>mostly open</em> models</p>
           <p class="byline">Kirill Maksimov &middot; <span class="m">rust.org.il</span></p>
           <p class="link"><a href="https://github.com/netoneko/akuma">github.com/netoneko/akuma</a></p>
         </div>
@@ -367,7 +367,8 @@
     <div class="body">
       <p class="eyebrow">Capability test</p>
       <h2>Can a weak open model write a kernel that runs <em>real workloads</em>?</h2>
-<ul><li>Why open models? <strong>Dario won&rsquo;t let you write a Wi-Fi driver.</strong></li><li>Akuma was mostly written by commercial models. GLM was the sidekick, and <strong>GLM 5.3 Flash built KVM from AMD&rsquo;s spec PDFs</strong>.</li><li>Setup: about <span class="m">10 days</span>, a new kernel built from the code, docs and tests I already had.</li></ul>
+      <ul><li>Why open models? <strong>Dario won&rsquo;t let you write a Wi-Fi driver.</strong></li><li>My custom rust kernel <strong>Akuma</strong> was mostly written by commercial models and it was already self-hosting for a few months.</li><li>To speed up kernel development I used GLM 5.3 Flash to build <strong>KVM from AMD&rsquo;s spec PDFs</strong>.</li><li>I had a talk in <span class="m">10 days</span>, a hypothesis, and a lot of free time.</li></ul>
+
     </div>
   </section>
 
@@ -376,9 +377,9 @@
     <div class="num">03</div>
     <div class="body">
       <p class="eyebrow cool">The experiment</p>
-      <h2>A goal list ending in <code>cargo build</code></h2>
-<ul><li>Badly tuned loops and unknown token cost.</li><li>GLM reached the equivalent of a self-hosting C kernel: HTTPS <code>curl</code>, <code>apk</code>, fork, pipes, all running on Akuma&rsquo;s KVM.</li></ul>
+      <h2>Final goal: <code>cargo build</code></h2>
       <p class="pull cool">AI is good at what you can verify.</p>
+<ul><li>Badly tuned loops and unknown token cost.</li><li>GLM reached the equivalent of a self-hosting C kernel: HTTPS <code>curl</code>, <code>apk</code>, fork, pipes, all running on Akuma&rsquo;s KVM.</li></ul>
     </div>
   </section>
 
