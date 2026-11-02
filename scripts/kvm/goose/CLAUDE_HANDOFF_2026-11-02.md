@@ -1,10 +1,23 @@
 # Handoff (2026-11-02, after B15): record the fixed point, then start GLM on Shanghai unattended
 
-You are working alone in `/Users/netoneko/github.com/netoneko/akuma`, branch `rust-org-il-experiment` (HEAD
-`38eb26c6` or later). The user is away. Do both tasks below without asking; where a decision is genuinely
-theirs, pick the conservative option, note it, and keep going. Follow `CLAUDE.md` and the memory index. Never
-use fork subagents. Commit and push are allowed for this work: run `.git/hooks/pre-commit` separately when you
-change code, then commit with `--no-verify`. Docs-only commits may skip the hook.
+You are running on the ryzen, which is booted into Pop (`192.168.1.126`), as root. The user is away. Do both
+tasks below without asking; where a decision is genuinely theirs, pick the conservative option, note it, and keep
+going. Follow the repo's `CLAUDE.md`. Never use fork subagents. Commit and push are allowed for this work. For
+docs-only commits, `--no-verify` is fine.
+
+**The repo.** `netoneko/akuma`, branch `rust-org-il-experiment` (HEAD `0bbc8980` or later). Use an existing
+checkout on Pop if there is one, at the right branch and with a clean `git status`. Otherwise clone it under
+`/root`: `git clone --branch rust-org-il-experiment https://github.com/netoneko/akuma` (no
+`--recurse-submodules`, since the vendored submodules are about 37 GB and none is needed here). Add the remote
+`litter` = `git@github.com:netoneko/akuma-litter.git` if it is missing. Check that you can push before you need
+to: `ssh -T git@github.com`.
+
+- If you cannot push anywhere, do not create, copy or ask for credentials. Commit locally, write down the exact
+  push commands, and say so in the result file.
+- Never commit a submodule pointer.
+
+**Do not mount `/dev/nvme0n1p3`** (the Akuma root partition) read-write. The fixed-point guests run on qcow2
+overlays of it.
 
 ## Context
 
@@ -13,32 +26,60 @@ B15 (`aafbb973`) moved Taoxichuan's whole kernel into `crates/akuma-tokio-kernel
 brief for building a new kernel. Taoxichuan is now a 19-line `main.rs`, and `osaka/` is the 10-line sample.
 Read `docs/archive/TAOXICHUAN_CLEANUP_PLAN.md` (the B15 rows) and `crates/akuma-tokio-kernel/README.md` first.
 
-The ryzen is running Pop (`root@192.168.1.126`, reached as `scripts/utils/hpbox.py`'s `RZ_ROOT`). Its Akuma
+The ryzen is running Pop (`192.168.1.126`). Its Akuma
 root partition is `/dev/nvme0n1p3`.
 
 ## Task 1: record the B15 fixed point
 
-A two-generation fixed point of `961a77be` (the same kernel source as B15) was started from the previous session
-at 16:38. It runs under Pop's KVM through `scripts/kvm/taoxichuan/fp_pop.py`, with K0 built on the Mac. Let
-`S=/private/tmp/claude-502/-Users-netoneko-github-com-netoneko-akuma/56d3949a-0cba-4330-8d3d-383d80ffc90a/scratchpad`.
+At 16:38 the user's Mac started a two-generation self-hosting fixed point of `961a77be` (the same kernel source as
+B15) on this box, using `scripts/kvm/taoxichuan/fp_pop.py`. Read that script first: it is the procedure.
 
-- **Read the result.** The log is `$S/fp15/fp_pop.log`. It ends with `FIXED POINT: K1 == K2` (or `NOT A FIXED
-  POINT`) and then `rc=N`. Each generation's build takes about 8 minutes, so the run finished around 16:56.
-- **If the log stopped short** (no `rc=` line, and nothing new for 20 minutes), the previous session's shell
-  died. Stop the guest by its pidfile only: `ssh root@192.168.1.126 'TX_RUN=/root/tx-fp bash /root/tx-pop.sh stop'`.
-  Then rerun the check:
-  `python3 -I scripts/kvm/taoxichuan/fp_pop.py $S/fp15/k0 961a77be > $S/fp15/fp_pop.log 2>&1`.
-  If `$S/fp15/k0` is gone, rebuild it with
-  `cargo build -p taoxichuan --target x86_64-unknown-none --release --features no-tests,trace-err`.
-- **Record it** in `docs/archive/TAOXICHUAN_FIXED_POINT.md`: add a section "After B15 (2026-11-02)". Use the same
-  table shape as "After the cleanup": K0, K1, K2 with md5, bytes and build time from the log, plus the console
-  fault count. If K1 != K2, say so plainly; do not soften it.
-- **Update the B15 row** in `docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`: its last sentence, "Fixed point not rerun
-  yet", becomes the result.
-- **Check the hook.** `$S/hook_b15b.log` ends with `hook rc=N`. If N is not 0, fix what it names, rerun the hook,
-  and commit the fix.
-- **Commit and push** to both remotes:
-  `git push origin rust-org-il-experiment && git push litter rust-org-il-experiment`.
+**How the run works.**
+
+- K0 was built on the Mac (md5 `0272f1eb7de0e031e4266e9d89aec181`).
+- For n = 1 and 2:
+  - `/root/tx-pop.sh boot fresh` boots K(n-1) on a fresh overlay of the Akuma root partition. The run dir is
+    `TX_RUN=/root/tx-fp`; the guest's ssh is on port 2226.
+  - The guest builds `961a77be` detached and writes `/tmp/fp.status` (ending in K(n)'s md5).
+  - The Mac stops the guest and pulls K(n) to `/root/tx-fp/k<n>` with `qemu-nbd --read-only` + `debugfs dump`.
+- Each build takes about 8 minutes, so a healthy run ended around 16:56. Pass means `/root/tx-fp/k1` and
+  `/root/tx-fp/k2` are byte-identical.
+
+**The run is driven from the Mac, so the user leaving may have killed it halfway.** Work out where it stopped:
+
+- **Both `k1` and `k2` exist, and no guest is running.** Done: md5sum both and compare.
+  - "No guest" means `/root/tx-fp/qemu.pid` is absent, or names a dead pid.
+- **A guest is still up** (`ssh -p 2226 root@127.0.0.1 'cat /tmp/fp.status; tail -3 /tmp/fp.log'` answers):
+  - Wait for its status to carry an md5.
+  - Then finish that generation by hand, with the same commands as fp_pop.py: `TX_RUN=/root/tx-fp bash
+    /root/tx-pop.sh stop`, then the `qemu-nbd` / `debugfs dump` / `qemu-nbd -d` pull into `/root/tx-fp/k<n>`.
+    Use `/dev/nbd7`, and always detach it.
+  - Check that the pulled md5 equals the md5 the guest reported.
+- **`k1` exists but `k2` does not, and no guest is running.** Run generation 2 yourself, following fp_pop.py:
+  - Put `k1` at `/root/tx-fp/target/x86_64-unknown-none/release/taoxichuan`.
+  - Boot it, send the same build script, poll, stop, pull `k2`.
+- **Neither exists.** Rerun from K0. If `/root/tx-fp/target/x86_64-unknown-none/release/taoxichuan` still has
+  K0's md5, it is K0.
+  - fp_pop.py can drive the whole run from this box if `ssh root@192.168.1.126 true` works here (it reaches the
+    box through `scripts/utils/hpbox.py`'s `RZ_ROOT`).
+  - Otherwise do the steps by hand.
+
+Throughout:
+
+- Stop a guest only by its pidfile (`tx-pop.sh stop`). Never `pkill` by pattern, since other VMs may be running.
+- Readiness is a completed ssh command, not an open port.
+
+**Record it.**
+
+- In `docs/archive/TAOXICHUAN_FIXED_POINT.md`, add a section "After B15 (2026-11-02)". Use the table shape of
+  "After the cleanup": K0, K1, K2 with md5, size and build time, plus the count of fault-ish console lines.
+  - The grep is fp_pop.py's: `grep -acE 'Fault|PANIC|BADFRAME|stuck|never ack' /root/tx-fp/console.log`.
+  - The console log holds only the last generation.
+  - Note which steps you finished by hand.
+  - If K1 != K2, say so plainly. Do not soften it, and do not retry until it passes.
+- In `docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`, the B15 row ends "Fixed point not rerun yet". Replace that with
+  the result.
+- Commit, then push: `git push origin rust-org-il-experiment && git push litter rust-org-il-experiment`.
 
 ## Task 2: GLM starts on Shanghai by itself after the next reboot
 
