@@ -14,6 +14,7 @@ root through `scripts/utils/hpbox.py`; the guest is `scripts/kvm/taoxichuan_pop.
 | `fp_metal.py K0 SHA` | the fixed point on the ryzen under **Akuma's** hypervisor (`herd vm-run`); stop herd's `vm-dev` first |
 | `goose_glm.sh ['prompt']` | talk to GLM through goose in the guest at `192.168.1.159:2224`: a conversation (one `goose run` per turn on a named session; `TX_SESSION` resumes) or one prompt |
 | `probe_run.py` / `probes_on_guest.py` | boot, fetch `userspace/forktest/c_stress` probes over the user-net (`10.0.2.2:8099`), run them |
+| `census_pop.sh` / `census_classify.py OUT UNISTD_64_H` | B10's syscall census: tokio programs under `strace -f` on Pop (as root, from `/root/census`), then what serves each call on Taoxichuan, read from the sources; exits 1 on an unserved call (`docs/archive/TAOXICHUAN_B10_SYSCALL_CENSUS.md`) |
 | `pollhup.c`, `outputprobe.rs` | probes written for the cargo stall (`docs/archive/TAOXICHUAN_CARGO_STALL_REGRESSION.md`) |
 
 Traps (each cost time): the guest's `sh -c "...$?..."` is expanded by the OUTER shell - use plain commands; ssh stdin into the guest is lossy - send
