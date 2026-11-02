@@ -1,5 +1,7 @@
 # PLAN-pn — Taoxichuan stages 9–11, session pn: the syscalls `rustc`/`cargo` need and the order to enable them
 
+> **Archived 2026-11-02** from `PLAN-pn.md` at the repo root: session pn's plan for the syscalls `rustc` and `cargo` need. Done: the fixed point ([`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md)). Its census is [`TAOXICHUAN_RUST_SYSCALLS_CENSUS_PN.md`](TAOXICHUAN_RUST_SYSCALLS_CENSUS_PN.md); what the kernel serves now is `taoxichuan/docs/reference/syscalls.md`.
+
 Plan for the supervisor to execute. Taoxichuan must go from "tcc compiles C" to
 "`rustc hello.rs`, then `cargo build`, then the fixed point". This plan classifies
 every needed syscall/behaviour into one route — **A** already a family crate under

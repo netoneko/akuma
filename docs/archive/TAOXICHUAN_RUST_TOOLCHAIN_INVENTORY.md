@@ -8,11 +8,11 @@
 > **Corrected by measurement, 2026-10-29 (session pn).** The scores below are an
 > *inventory* of two archive lists, not a measurement of what `rustc` does. The
 > measured `rustc --version` census — see [`TAOXICHUAN_RUST_SYSCALLS_CENSUS_PN.md`](TAOXICHUAN_RUST_SYSCALLS_CENSUS_PN.md) and
-> `PLAN-pn.md` — shows `rustc 1.100` needs a **thread at startup** (the ctrlc
+> `TAOXICHUAN_STAGES9_11_PN_RUST_SYSCALLS_PLAN.md` — shows `rustc 1.100` needs a **thread at startup** (the ctrlc
 > handler's `clone`), which neither list contains; the run also demands `sigaltstack`,
 > `membarrier`, legacy `readlink`(89), a real `mprotect`, and a ≥1 GiB mmap slab
 > before the first `clone`. The percentages here understate the gap; the current-state
-> list and order of work live in `TAOXICHUAN_RUST_SYSCALLS_CENSUS_PN.md` / `PLAN-pn.md`.
+> list and order of work live in `TAOXICHUAN_RUST_SYSCALLS_CENSUS_PN.md` / `TAOXICHUAN_STAGES9_11_PN_RUST_SYSCALLS_PLAN.md`.
 
 Two archive docs record what the **full** kernel needed to run Rust, and they
 are the stage-9–12 shopping list for this kernel — rustc's behaviour does not

@@ -1,5 +1,7 @@
 # PLAN-pm — Taoxichuan stage 8, session pm: the switch to the standard process slots and scheduler
 
+> **Archived 2026-11-02** from `PLAN-pm.md` at the repo root: session pm's plan for moving Taoxichuan onto the standard process slots and scheduler. Its decision doc is [`TAOXICHUAN_SWITCH_TO_CRATES.md`](TAOXICHUAN_SWITCH_TO_CRATES.md); the slices were carried out as steps 2d-2i and A1-A6 of [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md). `RESULT-p*.md` files it names were session files, never committed.
+
 Plan for the supervisor to execute session by session. Taoxichuan stops hand-rolling
 process slots, the spawn crossing and its scheduler scaffolding, and becomes a
 composition of `akuma-exec` / `akuma-threading` / `akuma-slot-table` / `akuma-fdtable`

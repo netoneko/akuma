@@ -1,5 +1,7 @@
 # Taoxichuan stage 8, session pl — PLAN: the spawn-park stall
 
+> **Archived 2026-11-02** from `PLAN-pl.md` at the repo root: session pl's plan for the stage-8 spawn-park stall. The spawn crossing it diagnosed is deleted (cleanup step 2e, [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md)).
+
 Defect: ~1 boot in 4, the guest parks mid-spawn and nothing ever wakes it. `[SSH] Exec:` →
 `[TICK pre]` (the exec crossing) → cpu0 halted forever, tick alive (~200 exits/s), relay healthy
 but the guest sends nothing new. Fix = a cause named from evidence, a change at that site, a stall

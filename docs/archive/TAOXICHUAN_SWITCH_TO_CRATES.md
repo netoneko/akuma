@@ -3,7 +3,7 @@
 > **Archived 2026-11-02** from `taoxichuan/docs/reference/switch-to-crates.md`: the decision is carried out. Its slices became steps 2d-2i and A1-A6 of [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md); the process model as it is now is `taoxichuan/docs/reference/processes.md`.
 
 **Stability: C** (a decision doc: the target is decided, the slices are not yet
-executed). Plan: `PLAN-pm.md` at the repo root (session pm). Everything here was
+executed). Plan: `TAOXICHUAN_STAGE8_PM_STANDARD_SLOTS_PLAN.md` (session pm). Everything here was
 checked against the tree and `amd64/src/` on 2026-10-29 unless marked UNCHECKED.
 
 ## The decision
@@ -71,10 +71,10 @@ kind of code in `amd64/src/sched.rs` and `exec_runtime.rs`).
 | S6 | dispatcher two-table shape via `akuma-syscalls-abi` + glue (stage-9 enabler) | duplicated arms | battery + disjointness self-check | `GLUE_DISPATCH` |
 | S7 | sweep: docs, diagrams, dead ring types | remainder | grep clean | — |
 
-Cost: ~320 executor tool calls, ~10-13 boots (per-slice costs in `PLAN-pm.md` § 6).
+Cost: ~320 executor tool calls, ~10-13 boots (per-slice costs in `TAOXICHUAN_STAGE8_PM_STANDARD_SLOTS_PLAN.md` § 6).
 Cut to half: S0, S5, S6, folding S7 into S3/S4 — the thesis set is S0-S3.
 
-Known risks with their resolutions: `PLAN-pm.md` § 5 (stale slots/trap frames,
+Known risks with their resolutions: `TAOXICHUAN_STAGE8_PM_STANDARD_SLOTS_PLAN.md` § 5 (stale slots/trap frames,
 switch-while-masked, CR3 on switch, fd refcounts on fork, fs base on exec, FPU
 state, orphan reaping, INITIALIZING-slot discipline, linux-abi being a
 first consumer). The lost-wakeup stall (RESULT of session pl) is removed by
@@ -82,7 +82,7 @@ construction at S3 and only tolerated (retried, never scored FAIL) before it.
 
 ## Background
 
-`PLAN-pm.md` (this switch's full plan), `../docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md`
+`TAOXICHUAN_STAGE8_PM_STANDARD_SLOTS_PLAN.md` (this switch's full plan), `../docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md`
 (the process model), `../docs/archive/TAOXICHUAN_M4_SCHED_LITE_PLAN.md` (the twin's
 hook tables), `docs/reference/subsystems/scheduler.md` (the pool's slot state
 machine), `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md` (the experiment).

@@ -4,7 +4,7 @@
 
 **Stability: C** (current state after the stage 9–11 planning session pn; re-measure
 against the `[err]` trace after every slice). The full gap analysis with routes and
-costs is `PLAN-pn.md` at the repo root; the scored archive lists are
+costs is `TAOXICHUAN_STAGES9_11_PN_RUST_SYSCALLS_PLAN.md`; the scored archive lists are
 [`TAOXICHUAN_RUST_TOOLCHAIN_INVENTORY.md`](TAOXICHUAN_RUST_TOOLCHAIN_INVENTORY.md). The code wins where any of these disagree.
 
 ## Measured, not assumed
@@ -55,8 +55,8 @@ legacy `open`(2)/`stat`(4)/`poll`(7)/`readlink`(89), `ioctl` (ENOTTY), then `clo
    mappings + `msync` writeback — without which `rust-lld`'s output is a
    **0-byte binary with cargo reporting success** (the archive's recorded failure).
 
-Every item names its crate route in `PLAN-pn.md` §2; the order with gates and
-per-step costs is `PLAN-pn.md` §3.
+Every item names its crate route in `TAOXICHUAN_STAGES9_11_PN_RUST_SYSCALLS_PLAN.md` §2; the order with gates and
+per-step costs is `TAOXICHUAN_STAGES9_11_PN_RUST_SYSCALLS_PLAN.md` §3.
 
 
 ## Status 2026-10-30 (supervisor's QEMU loop; code wins over the tables above)
