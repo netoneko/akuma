@@ -39,10 +39,13 @@ pub fn pidfd_close(id: u32) {
 }
 
 pub(super) fn sys_pidfd_open(pid: u32, flags: u32) -> u64 {
-    use akuma_syscalls_linux::flags::open::{O_CLOEXEC, O_NONBLOCK};
+    use akuma_syscalls_linux::flags::open::O_NONBLOCK;
 
-    // Only flags 0, O_NONBLOCK, and O_CLOEXEC are valid.
-    if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+    // `PIDFD_NONBLOCK` (= `O_NONBLOCK`) is the one flag; anything else, `O_CLOEXEC`
+    // included, is `EINVAL`, as on Linux (checked against 6.17 by
+    // `userspace/forktest/c_stress/pidfdprobe.c`). `PIDFD_THREAD` (6.9) is refused
+    // like a kernel older than it: this pidfd only ever names a process.
+    if flags & !O_NONBLOCK != 0 {
         return EINVAL;
     }
 
@@ -60,9 +63,8 @@ pub(super) fn sys_pidfd_open(pid: u32, flags: u32) -> u64 {
 
     let pidfd_id = pidfd_create(pid);
     let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::PidFd(pidfd_id));
-    if flags & O_CLOEXEC != 0 {
-        proc.set_cloexec(fd);
-    }
+    // A pidfd is close-on-exec whether or not anyone asked.
+    proc.set_cloexec(fd);
     if flags & O_NONBLOCK != 0 {
         proc.set_nonblock(fd);
     }

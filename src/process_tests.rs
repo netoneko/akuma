@@ -667,6 +667,7 @@ pub fn run_all_tests() {
     test_kill_child_processes_recursive();
     test_kill_child_processes_thread_group_matches_fork_parent();
     test_pidfd_cloexec();
+    test_pidfd_open_flags_and_rt_sigpending();
 
     // fork_process copy math (overflow / cap helpers; see fork loop in akuma-exec)
     test_fork_page_count_for_len();
@@ -16574,6 +16575,29 @@ fn test_kill_child_processes_thread_group_matches_fork_parent() {
         crate::safe_print!(128,
             "[Test] kill_child_processes_thread_group_matches_fork_parent FAILED: missed_by_main={} compile_gone={}\n",
             missed_by_main, compile_gone);
+    }
+}
+
+/// `pidfd_open` takes Linux's one flag (`PIDFD_NONBLOCK`) and refuses `O_CLOEXEC`
+/// before it looks at the pid; `rt_sigpending` is served (it had no arm) and
+/// refuses a `sigsetsize` above 8. Both through the dispatcher by number
+/// (`docs/archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md`).
+fn test_pidfd_open_flags_and_rt_sigpending() {
+    use akuma_syscalls_linux::nr;
+    #[cfg(feature = "sc-pidfd")]
+    {
+        let r = crate::syscall::handle_syscall(nr::PIDFD_OPEN, &[999_999, 0x8_0000, 0, 0, 0, 0]);
+        if r == EINVAL {
+            console::print("[Test] pidfd_open_rejects_o_cloexec PASSED\n");
+        } else {
+            crate::safe_print!(96, "[Test] pidfd_open_rejects_o_cloexec FAILED: got {:#x}\n", r);
+        }
+    }
+    let r = crate::syscall::handle_syscall(nr::RT_SIGPENDING, &[0, 16, 0, 0, 0, 0]);
+    if r == EINVAL {
+        console::print("[Test] rt_sigpending_served PASSED\n");
+    } else {
+        crate::safe_print!(96, "[Test] rt_sigpending_served FAILED: got {:#x} (ENOSYS = no arm)\n", r);
     }
 }
 

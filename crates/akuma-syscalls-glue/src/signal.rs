@@ -118,6 +118,26 @@ pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigset
     0
 }
 
+/// `rt_sigpending(set, sigsetsize)`: the signals pending for the calling thread
+/// that its mask blocks (Linux's `do_sigpending`: pending, both the thread's and
+/// the process's, AND blocked; Akuma pends every signal on a thread). A
+/// `sigsetsize` above 8 is `EINVAL`; a smaller one gets that many bytes, as on
+/// Linux.
+pub(super) fn sys_rt_sigpending(set_ptr: u64, sigsetsize: usize) -> u64 {
+    if sigsetsize > 8 {
+        return EINVAL;
+    }
+    let tid = akuma_exec::threading::current_thread_id();
+    let set = akuma_exec::threading::pending_signals_raw(tid) & akuma_exec::threading::thread_signal_mask();
+    let bytes = set.to_le_bytes();
+    for (i, b) in bytes[..sigsetsize].iter().enumerate() {
+        if write_user_val(set_ptr.wrapping_add(i as u64), b).is_err() {
+            return EFAULT;
+        }
+    }
+    0
+}
+
 /// rt_sigsuspend - atomically install `mask`, wait until a signal is delivered
 /// (handler runs or the process is terminated), then restore the previous mask.
 /// Always returns -EINTR; it never returns 0 (POSIX).

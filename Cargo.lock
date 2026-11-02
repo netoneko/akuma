@@ -707,6 +707,7 @@ dependencies = [
  "akuma-syscalls-abi",
  "akuma-syscalls-glue",
  "akuma-syscalls-glue-amd64",
+ "akuma-syscalls-linux",
  "akuma-vfs-glue",
 ]
 

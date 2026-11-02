@@ -88,6 +88,9 @@ pub fn install(k: Kernel) {
 /// Serve `nr` (an x86_64 number) if it is this surface's: `Some` with the
 /// syscall-return value, `None` for a call the kernel must answer itself.
 pub fn dispatch(nr: u64, args: [u64; 6]) -> Option<u64> {
+    if shared_number(nr) {
+        return Some(akuma_syscalls_glue::handle_syscall(nr, &args));
+    }
     if let Some(call) = Syscall::from_x86_64(nr)
         && served_by_glue(call)
     {
@@ -101,6 +104,26 @@ pub fn dispatch(nr: u64, args: [u64; 6]) -> Option<u64> {
     }
     akuma_syscalls_glue_amd64::dispatch(nr, args)
 }
+
+/// Whether `nr` is one of this surface's shared-number calls.
+///
+/// `pidfd_open` (434) and `pidfd_send_signal` (424): Linux gave every call since
+/// about 5.1 one number on every 64-bit architecture, so `akuma-syscalls-abi`
+/// cannot name them (its rule 3) and they reach glue by the number itself, as
+/// amd64's dispatcher sends them. A test pins that the numbers agree.
+#[must_use]
+pub const fn shared_number(nr: u64) -> bool {
+    cfg!(feature = "process")
+        && matches!(nr, akuma_syscalls_linux::nr::PIDFD_OPEN | akuma_syscalls_linux::nr::PIDFD_SEND_SIGNAL)
+}
+
+/// `ExecRuntime::pidfd_close` for a kernel on this surface: the last descriptor
+/// naming a pidfd releases glue's record of it.
+#[cfg(feature = "process")]
+pub const PIDFD_CLOSE: fn(u32) = akuma_syscalls_glue::pidfd::pidfd_close;
+/// Without `process` no pidfd is ever opened.
+#[cfg(not(feature = "process"))]
+pub const PIDFD_CLOSE: fn(u32) = |_| {};
 
 /// Whether glue answers `call` on a kernel built with this crate's features.
 #[must_use]
@@ -232,6 +255,20 @@ mod tests {
         assert!(served_by_glue(Syscall::Futex));
         assert_eq!(served_by_glue(Syscall::Socket), cfg!(feature = "net"));
         assert_eq!(served_by_glue(Syscall::Wait4), cfg!(feature = "process"));
+    }
+
+    /// The shared-number calls really are one number on both ABIs: x86_64's
+    /// 434/424 (musl's `arch/x86_64/bits/syscall.h.in`) are the asm-generic
+    /// constants glue dispatches on, and the abi table names neither.
+    #[test]
+    fn shared_numbers_agree() {
+        assert_eq!(akuma_syscalls_linux::nr::PIDFD_OPEN, 434);
+        assert_eq!(akuma_syscalls_linux::nr::PIDFD_SEND_SIGNAL, 424);
+        for nr in [434, 424] {
+            assert_eq!(Syscall::from_x86_64(nr), None);
+            assert_eq!(shared_number(nr), cfg!(feature = "process"));
+        }
+        assert!(!shared_number(28));
     }
 
     /// Every served call round-trips through its x86_64 number, which is what

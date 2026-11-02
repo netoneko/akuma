@@ -2521,10 +2521,14 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // row added to `akuma-syscalls-abi` without its arm here used to fall
         // in silently (`brk` did, and earlier `fchdir`), where an undecoded
         // number at least prints `no row for`.
+        // `rt_sigsuspend` is glue's, beside `pause` (34) above: it arms the
+        // restore-sigmask slot, and `signal::deliver_pending` hands the saved
+        // mask to the frame (or puts it back when no handler runs).
+        Syscall::RtSigsuspend | Syscall::RtSigpending => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // Rows since 2026-11-01 (Taoxichuan serves them); this kernel has no
         // route to glue's yet and answers `ENOSYS`, as it did undecoded.
         // `Msync` never gets here: 26 is routed above, before the decode.
-        Syscall::RtSigsuspend | Syscall::Msync | Syscall::Waitid => errno::ENOSYS,
+        Syscall::Msync | Syscall::Waitid => errno::ENOSYS,
         _ => {
             akuma_primitives::safe_print!(
                 160,
@@ -6967,6 +6971,33 @@ fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
 }
 
 #[cfg(not(feature = "no-tests"))]
+/// `rt_sigsuspend` from ring 3, through busybox ash's `wait`, which parks in
+/// it with every signal blocked around the call.
+///
+/// The trapped `SIGUSR1` must end the `wait` (status 128 + 10), its handler
+/// must run, and the mask from before the `sigsuspend` must be back after it:
+/// the second `kill` is delivered only if `SIGUSR1` is not left blocked by the
+/// call's temporary mask. `ENOSYS` (this kernel's answer until 2026-11-02)
+/// made ash's loop spin with every signal blocked.
+pub fn sigsuspend_test(t: &mut Suite) {
+    if crate::fs::read_file("/bin/busybox").is_err() || crate::fs::read_file("/bin/sh").is_err() {
+        t.note("sigsuspend: busybox /bin/sh not on the disk; skipped", 0);
+        return;
+    }
+    let cmd = b"trap 'echo got' USR1; (sleep 1; kill -USR1 $$) & wait; echo rc=$?; kill -USR1 $$; echo end\0";
+    let Some((status, out)) = run_sh_capture(cmd) else {
+        t.check("sigsuspend: sh spawned", false);
+        return;
+    };
+    t.check_eq("sigsuspend: the shell exited 0", status, 0);
+    const WANT: &[u8] = b"got\nrc=138\ngot\nend\n";
+    t.check(
+        "sigsuspend: trap ran, wait said 138, and the mask was restored (trap ran again)",
+        out.windows(WANT.len()).any(|w| w == WANT),
+    );
+}
+
+#[cfg(not(feature = "no-tests"))]
 /// Shell redirection and pipelines — `dup2` and `pipe(2)`, end to end.
 ///
 /// These are the two things a build system cannot do without, and until
@@ -7749,6 +7780,29 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
         "dispatch: pidfd_send_signal on an unopened fd is EBADF",
         syscall_dispatch(424, 999, 15, 0, 0, 0, 0),
         (-9i64) as u64,
+    );
+    // Linux's one `pidfd_open` flag is `PIDFD_NONBLOCK`; `O_CLOEXEC` is refused
+    // (every pidfd is close-on-exec anyway), and before the pid is looked at.
+    t.check_eq(
+        "dispatch: pidfd_open(O_CLOEXEC) is EINVAL",
+        syscall_dispatch(434, 999_999, 0x8_0000, 0, 0, 0, 0),
+        (-22i64) as u64,
+    );
+
+    // `rt_sigsuspend` and `rt_sigpending` are glue's. A bad `sigsetsize` is
+    // `EINVAL` from glue's own check: an answer, where this kernel used to
+    // give `ENOSYS` for both.
+    t.check("dispatch: rt_sigsuspend 130 -> 133", hop(Syscall::RtSigsuspend, 130, nr::RT_SIGSUSPEND));
+    t.check("dispatch: rt_sigpending 127 -> 136", hop(Syscall::RtSigpending, 127, nr::RT_SIGPENDING));
+    t.check_eq(
+        "dispatch: rt_sigsuspend with sigsetsize 4 is EINVAL",
+        syscall_dispatch(130, 0, 4, 0, 0, 0, 0),
+        (-22i64) as u64,
+    );
+    t.check_eq(
+        "dispatch: rt_sigpending with sigsetsize 16 is EINVAL",
+        syscall_dispatch(127, 0, 16, 0, 0, 0, 0),
+        (-22i64) as u64,
     );
 
     // The `sc-aio` rows. `io_setup` 206 -> asm-generic 0 is the sharpest of

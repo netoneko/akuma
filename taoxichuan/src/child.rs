@@ -854,57 +854,6 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
     }
 }
 
-/// `rt_sigsuspend(mask, sigsetsize)` - x86_64 130: replace the signal mask and sleep until a
-/// signal the new mask lets through is pending (or the thread is interrupted), deliver it under
-/// that mask, and answer `EINTR`, always. busybox ash's `wait` builtin parks in exactly this
-/// call and re-polls `wait4(WNOHANG)` after it, which is why the `ENOSYS` this answered before
-/// made `cmd & ...; wait` spin forever. A child's exit pends SIGCHLD and wakes the sleeper
-/// (`publish_child_exit`), as `kill`/`tkill` do for theirs.
-pub fn sigsuspend_arm(fr: &mut ring3::SyscallFrame, mask_va: u64, sigsetsize: u64) -> u64 {
-    if sigsetsize != 8 {
-        return crate::e(ring3::err::EINVAL);
-    }
-    let mut b = [0u8; 8];
-    if !crate::user_ok(mask_va, 8) || !crate::copy_from_user(&mut b, mask_va) {
-        return crate::e(ring3::err::EFAULT);
-    }
-    let me = crate::exec_twin::current_slot();
-    if me == crate::exec_twin::NO_SLOT || me >= NSLOTS {
-        // A task that may not park (the boot task) cannot sleep: report the interruption.
-        return crate::e(crate::EINTR);
-    }
-    // SIGKILL (9) and SIGSTOP (19) can never be blocked.
-    let unblockable = (1u64 << 8) | (1u64 << 18);
-    let new = u64::from_le_bytes(b) & !unblockable;
-    let old = akuma_exec::threading::thread_signal_mask();
-    akuma_exec::threading::set_thread_signal_mask(new);
-    loop {
-        if akuma_threading::take_thread_interrupted(me) {
-            #[cfg(feature = "trace-err")]
-            sigsuspend_note(b'I', me);
-            break;
-        }
-        // Any signal the temporary mask lets through ends the sleep (a child's exit pends
-        // SIGCHLD and wakes this thread: `publish_child_exit`; `kill`/`tkill` pend and wake).
-        if akuma_threading::pending_signals_raw(me) & !new != 0 {
-            #[cfg(feature = "trace-err")]
-            sigsuspend_note(b'D', me);
-            break;
-        }
-        let stash = ring3::user_rsp_stash();
-        akuma_threading::schedule_blocking(u64::MAX);
-        ring3::set_user_rsp_stash(stash);
-    }
-    // Deliver under the temporary mask, as Linux does; the handler's `rt_sigreturn` puts the
-    // old mask back (ash's `wait` sets a flag in its SIGCHLD handler and sleeps again).
-    let eintr = crate::e(crate::EINTR);
-    if deliver_one(fr, akuma_syscalls_abi::x86_64::RT_SIGSUSPEND, eintr, new, old) {
-        return eintr;
-    }
-    akuma_exec::threading::set_thread_signal_mask(old);
-    eintr
-}
-
 /// The user `rsp` a thread returns to ring 3 with when a call moved it on purpose (a signal
 /// frame was pushed, or `rt_sigreturn` put the interrupted one back); 0 = none. Per thread
 /// slot, because the dispatcher saves the global stash at entry and puts it back at exit (a
@@ -952,7 +901,15 @@ pub fn deliver_at_return(fr: &mut ring3::SyscallFrame, nr: u64, r: u64) -> u64 {
         let _ = akuma_threading::take_thread_interrupted(me);
     }
     let mask = akuma_exec::threading::thread_signal_mask();
-    deliver_one(fr, nr, r, mask, mask);
+    // `rt_sigsuspend` and `pause` (glue's) armed the restore-sigmask slot: a handler entered here
+    // records the mask from before the call for its `rt_sigreturn`; with none entered, that mask
+    // is the thread's again now.
+    let restore = akuma_exec::threading::take_restore_sigmask();
+    if !deliver_one(fr, nr, r, mask, restore.unwrap_or(mask))
+        && let Some(m) = restore
+    {
+        akuma_exec::threading::set_thread_signal_mask(m);
+    }
     r
 }
 
@@ -1188,14 +1145,6 @@ pub fn sigreturn_arm(fr: &mut ring3::SyscallFrame) -> u64 {
     akuma_exec::threading::set_thread_signal_mask(mask);
     // The dispatcher stores this in RAX: the interrupted call's own result.
     words[12]
-}
-
-#[cfg(feature = "trace-err")]
-fn sigsuspend_note(why: u8, me: usize) {
-    static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 24 {
-        akuma_primitives::safe_print!(96, "[sigsuspend] {} me={} pid={}\n", why as char, me, slot_pid(me));
-    }
 }
 
 /// Page-table roots the twin built by hand for an exec'd image

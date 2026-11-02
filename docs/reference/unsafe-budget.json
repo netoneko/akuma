@@ -50,6 +50,7 @@
     "crates/akuma-reclock",
     "crates/akuma-rtw89",
     "crates/akuma-rump",
+    "crates/akuma-runtime-tokio",
     "crates/akuma-ryzen-amd64",
     "crates/akuma-scheduler",
     "crates/akuma-selftest",
@@ -66,6 +67,7 @@
     "crates/akuma-syscalls-mem",
     "crates/akuma-syscalls-net",
     "crates/akuma-syscalls-poll",
+    "crates/akuma-syscalls-proc",
     "crates/akuma-syscalls-signal",
     "crates/akuma-syscalls-sync",
     "crates/akuma-syscalls-time",
@@ -73,6 +75,7 @@
     "crates/akuma-tty",
     "crates/akuma-usb",
     "crates/akuma-usb-storage",
+    "crates/akuma-user-layout",
     "crates/akuma-user-space",
     "crates/akuma-user-tree",
     "crates/akuma-user-walk",
@@ -115,6 +118,6 @@
     "crates/akuma-uart": 1,
     "crates/akuma-user-access": 20,
     "crates/akuma-virtio": 17,
-    "taoxichuan/src": 34
+    "taoxichuan/src": 33
   }
 }

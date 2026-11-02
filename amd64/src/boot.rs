@@ -588,6 +588,7 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     }
 
     usermode::redirect_test(t);
+    usermode::sigsuspend_test(t);
     // Hand pid 1 back before `run_init` claims it for the real init process.
     let drained = fd::boot_row_release(usermode_boot_tid);
     t.check("usermode: the borrowed identity was reclaimed", drained >= 1);

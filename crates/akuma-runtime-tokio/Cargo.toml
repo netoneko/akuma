@@ -12,8 +12,9 @@ default = ["net"]
 # tokio `net`: TCP/UDP and AF_UNIX sockets, over glue's smoltcp socket table.
 net = ["akuma-syscalls-glue/smoltcp"]
 # tokio `process`: reaping (`wait4`/`waitid`) over the child channels `akuma-exec`
-# registers at fork. Spawning, `kill` and signal delivery stay the kernel's.
-process = []
+# registers at fork, and `pidfd_open` (tokio's reaper polls a pidfd and falls back
+# to SIGCHLD without one). Spawning, `kill` and signal delivery stay the kernel's.
+process = ["akuma-syscalls-glue/sc-pidfd"]
 
 [dependencies]
 # The bodies. epoll and eventfd are not optional: mio's `Poll` and `Waker` are
@@ -23,6 +24,8 @@ akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = fals
 akuma-syscalls-glue-amd64 = { path = "../akuma-syscalls-glue-amd64" }
 # Which x86_64 number is which call, and its asm-generic number for glue.
 akuma-syscalls-abi = { path = "../akuma-syscalls-abi" }
+# The asm-generic numbers, for the calls Linux numbered the same on both ABIs.
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 # The mount table's hooks (`install` sets the tokio kernel's answers).
 akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 # Pipe wakes go to a thread by number.

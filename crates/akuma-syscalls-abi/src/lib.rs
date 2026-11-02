@@ -555,9 +555,11 @@ syscall_table! {
     /// row is `=> 0`, because on AArch64 `rt_sigreturn` is consumed inside the
     /// EL0 sync handler and never reaches the dispatcher.
     RtSigreturn   => RT_SIGRETURN   = 15, nr::RT_SIGRETURN;
-    /// x86_64 130, asm-generic 133. Taoxichuan serves it locally (busybox ash's
-    /// `wait`); amd64 answers `ENOSYS`, as before the row existed.
+    /// x86_64 130, asm-generic 133. Glue's, for all three kernels: it arms the
+    /// restore-sigmask slot that each kernel's frame builder reads.
     RtSigsuspend  => RT_SIGSUSPEND  = 130, nr::RT_SIGSUSPEND;
+    /// x86_64 127, asm-generic 136. No kernel served it until 2026-11-02.
+    RtSigpending  => RT_SIGPENDING  = 127, nr::RT_SIGPENDING;
     /// x86_64 62, asm-generic 129. Akuma's private 302 is `nr::AKUMA_KILL`;
     /// until 2026-11-01 it was `nr::KILL` and this row named `nr::KILL_LINUX`.
     Kill          => KILL           = 62, nr::KILL;

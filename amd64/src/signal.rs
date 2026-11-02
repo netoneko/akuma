@@ -529,7 +529,18 @@ pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
         return signal_status(sig);
     }
 
+    // `rt_sigsuspend`'s saved mask (glue's `suspend_until_signal` arms the slot): a handler entered at this
+    // return records it in its frame for `rt_sigreturn` (Linux's `saved_sigmask`); with none entered it is the
+    // thread's mask again now.
+    let restore = threading::take_restore_sigmask();
+    let unsuspend = || {
+        if let Some(m) = restore {
+            threading::set_thread_signal_mask(m);
+        }
+    };
+
     if threading::pending_signals_raw(tid) == 0 {
+        unsuspend();
         return syscall_result;
     }
 
@@ -541,10 +552,15 @@ pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
     let cur = Regs::load(uctx, if restored { uctx.sig_rax } else { syscall_result }, restored);
 
     let Some(proc) = current_process_shared() else {
+        unsuspend();
         return syscall_result;
     };
 
-    match next_delivery(proc, tid, &cur) {
+    let next = next_delivery(proc, tid, &cur, restore);
+    if !matches!(next, Next::Handler(_)) {
+        unsuspend();
+    }
+    match next {
         Next::Nothing => {
             if restored { cur.rax } else { syscall_result }
         }
@@ -670,7 +686,7 @@ pub fn deliver_fault_signal(
     }
 
     let cur = Regs::from_trap(frame, regs);
-    let Some(next) = build_frame(&cur, sig, entry, &action, tid, Cause::Fault { si_code, addr })
+    let Some(next) = build_frame(&cur, sig, entry, &action, tid, Cause::Fault { si_code, addr }, None)
     else {
         DECLINED.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -848,7 +864,7 @@ enum Next {
 ///
 /// Consumes ignored and non-fatal-default signals on the way, which is what
 /// keeps the pending word from filling up with `SIGCHLD`s nobody asked for.
-fn next_delivery(proc: &akuma_exec::process::Process, tid: usize, cur: &Regs) -> Next {
+fn next_delivery(proc: &akuma_exec::process::Process, tid: usize, cur: &Regs, restore: Option<u64>) -> Next {
     while let Some(sig) = threading::take_pending_signal(threading::thread_signal_mask()) {
         let idx = (sig as usize).wrapping_sub(1);
         if idx >= akuma_exec::process::MAX_SIGNALS {
@@ -858,7 +874,7 @@ fn next_delivery(proc: &akuma_exec::process::Process, tid: usize, cur: &Regs) ->
         match action.handler {
             SignalHandler::Ignore => {}
             SignalHandler::UserFn(entry) => {
-                if let Some(next) = build_frame(cur, sig, entry, &action, tid, Cause::User) {
+                if let Some(next) = build_frame(cur, sig, entry, &action, tid, Cause::User, restore) {
                     enter_handler(sig, idx, &action, proc, tid);
                     return Next::Handler(next);
                 }
@@ -977,7 +993,7 @@ pub fn deliver_pending_on_tick(
         return TickOutcome::Unchanged;
     };
     let cur = Regs::from_trap(frame, regs);
-    match next_delivery(proc, tid, &cur) {
+    match next_delivery(proc, tid, &cur, None) {
         Next::Nothing => TickOutcome::Unchanged,
         Next::Handler(next) => {
             install_handler_frame(frame, regs, &next);
@@ -989,6 +1005,9 @@ pub fn deliver_pending_on_tick(
 
 /// Build the `rt_sigframe` for `sig` and return the register file that enters
 /// the handler, or `None` if it cannot be delivered.
+///
+/// `restore` is the mask an `rt_sigsuspend` saved, which the frame records in
+/// place of the temporary one; `None` everywhere else.
 fn build_frame(
     cur: &Regs,
     sig: u32,
@@ -996,6 +1015,7 @@ fn build_frame(
     action: &akuma_exec::process::SignalAction,
     tid: usize,
     cause: Cause,
+    restore: Option<u64>,
 ) -> Option<Regs> {
     // x86_64 has no kernel signal trampoline: the restorer is the program's.
     if action.flags & sa::RESTORER == 0 || action.restorer == 0 {
@@ -1048,7 +1068,9 @@ fn build_frame(
     frame.uc.uc_stack.ss_sp = alt_sp;
     frame.uc.uc_stack.ss_size = alt_size;
     frame.uc.uc_stack.ss_flags = if on_alt { SS_ONSTACK } else { 0 };
-    frame.uc.uc_sigmask = threading::thread_signal_mask();
+    // Inside `rt_sigsuspend` the mask the handler's `rt_sigreturn` restores is the one from before the
+    // call (`restore`), not the temporary one the call installed.
+    frame.uc.uc_sigmask = restore.unwrap_or_else(threading::thread_signal_mask);
     frame.uc.uc_mcontext = cur.to_sigcontext();
     frame.uc.uc_mcontext.oldmask = frame.uc.uc_sigmask;
     frame.uc.uc_mcontext.fpstate = fp_base;
@@ -1294,7 +1316,7 @@ pub fn smoke_test(t: &mut akuma_selftest::Suite) {
         restorer: 0,
     };
     t.check("signal: delivery declines without SA_RESTORER",
-        build_frame(&cur, 10, 0x40_1000, &no_restorer, 0, Cause::User).is_none());
+        build_frame(&cur, 10, 0x40_1000, &no_restorer, 0, Cause::User, None).is_none());
     let bad_handler = akuma_exec::process::SignalAction {
         handler: SignalHandler::UserFn(0),
         flags: sa::RESTORER,
@@ -1302,7 +1324,7 @@ pub fn smoke_test(t: &mut akuma_selftest::Suite) {
         restorer: 0x40_2000,
     };
     t.check("signal: delivery declines a non-user handler",
-        build_frame(&cur, 10, 0, &bad_handler, 0, Cause::User).is_none());
+        build_frame(&cur, 10, 0, &bad_handler, 0, Cause::User, None).is_none());
 
     // The fatal-default table this target shares with AArch64, spot-checked at
     // the two ends that matter: `SIGINT` must kill a foreground job, `SIGCHLD`

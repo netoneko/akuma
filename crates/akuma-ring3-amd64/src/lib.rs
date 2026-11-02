@@ -898,6 +898,8 @@ pub mod nr {
     /// number with no flags word.
     pub const FORK: u64 = 57;
     pub const VFORK: u64 = 58;
+    /// `pause(2)`: x86-only (asm-generic musl spells it `ppoll(0, 0, 0, 0)`).
+    pub const PAUSE: u64 = 34;
 }
 
 /// `openat(2)` flag bits (x86_64) and `dirfd` special values.

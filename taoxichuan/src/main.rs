@@ -384,6 +384,14 @@ impl Pte {
     fn write(&self, v: u64) {
         self.table.set_entry(self.idx, v);
     }
+
+    /// The frame this entry maps, if it is present.
+    fn frame(&self) -> Option<phys::Frame> {
+        let v = self.read();
+        // SAFETY: a present leaf of a user page table (`leaf_entry` walked to it) names a user frame the PMM
+        // handed out.
+        (v & 1 != 0).then(|| unsafe { phys::Frame::from_pa(v & PTE_ADDR) })
+    }
 }
 
 /// THE copy-on-write break: re-read the live PTE for `va` in `root`, ask
@@ -421,12 +429,11 @@ fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
             COW_TAKE.fetch_add(1, Relaxed);
         }
         CowAction::Copy => {
-            let Some(new) = phys::Frame::alloc_zeroed() else {
+            let (Some(new), Some(src)) = (phys::Frame::alloc_zeroed(), slot.frame()) else {
                 // Out of frames: the caller's kill path reports it.
                 return CowAction::Fault;
             };
-            // SAFETY: `old` is the frame this present leaf maps.
-            new.copy_page_from(unsafe { phys::Frame::from_pa(old) });
+            new.copy_page_from(src);
             slot.write(((pte & !PTE_ADDR) | PTE_W | new.pa()) & !PTE_COW);
             akuma_cpu::tlb::invlpg(va as usize);
             // A peer running a thread of this space may still map the old
@@ -1214,13 +1221,12 @@ fn shared_writeback(lo: u64, hi: u64, forget: bool) {
         if s < e {
             let mut va = s & !0xFFF;
             while va < e {
-                if let Some(pa) = paging::translate_in(root_pa, va as usize) {
+                if let Some(frame) = leaf_entry(root_pa, va).and_then(|p| p.frame()) {
                     let file_off = off + (va - base);
                     if file_off < fsize {
                         let n = (fsize - file_off).min(4096) as usize;
                         let mut page = [0u8; 4096];
-                        // SAFETY: `translate_in` named a mapped user frame.
-                        unsafe { phys::Frame::from_pa(pa) }.read_bytes(0, &mut page[..n]);
+                        frame.read_bytes(0, &mut page[..n]);
                         let _ = root_fs().write_at_by_inode(ino, file_off as usize, &page[..n]);
                     }
                 }
@@ -1248,6 +1254,75 @@ fn msync_arm(addr: u64, len: u64) -> u64 {
     }
     shared_writeback(addr, addr.saturating_add(len), false);
     0
+}
+
+/// What a zeroed page reads as, for `MADV_DONTNEED`'s in-place zero.
+static ZERO_PAGE: [u8; 4096] = [0; 4096];
+
+/// `madvise(addr, len, advice)`: the advice decode is `akuma-syscalls-mem`'s, shared with the other kernels
+/// (`MADV_FREE` is `EINVAL`, which musl's allocator reads as "not supported"; the hints are no-ops, and
+/// `MADV_WILLNEED` is one too, since every mapping here is populated at `mmap`).
+///
+/// `MADV_DONTNEED` makes the next read of each page in the mmap slab return zero, per
+/// [`akuma_syscalls_mem::madvise::dontneed_page_action`]: an unshared frame is zeroed in place, and a frame a
+/// fork peer also maps is replaced by a fresh zeroed one (zeroing it would wipe the peer's page). A writable
+/// `MAP_SHARED` file page is written back and kept, which is what Linux's drop and refault reads. Pinned
+/// divergences: a private file page is zeroed, where Linux refaults the file's bytes (nothing here records
+/// which slab pages came from a file); pages outside the slab (the image, `brk`, the main stack) are left as
+/// they are, since the image cannot be read back from anywhere.
+fn madvise_arm(addr: u64, len: u64, advice: u64) -> u64 {
+    use akuma_syscalls_mem::madvise::{self, Action, PageAction};
+    if !madvise::range_fits_user_va(addr as usize, len as usize, 0x0000_8000_0000_0000) {
+        return e(ring3::err::EINVAL);
+    }
+    match madvise::action(advice as i32) {
+        Action::Fail(errno) => errno,
+        Action::Ignore | Action::Willneed => 0,
+        Action::Dontneed => {
+            let (start, pages) = madvise::dontneed_zero_range(addr as usize, len as usize);
+            let (start, end) = (start as u64, (start + pages * 4096) as u64);
+            if pages == 0 {
+                return 0;
+            }
+            if with_task(|t| t.layout.shared().iter().any(|f| f.base < end && start < f.base + f.len)) {
+                shared_writeback(start, end, false);
+            }
+            // Only the used part of the slab: everything in it is mapped (no lazy pages), so the walk costs
+            // what the task has allocated, not the length ring 3 asked for.
+            let (lo, hi) = (start.max(MMAP_BASE), end.min(with_task(|t| t.layout.mmap_cur())));
+            let root = task_root();
+            let tid = akuma_primitives::preempt::current_tid() as u32;
+            for va in (lo..hi).step_by(4096) {
+                if let (false, Some(slot)) = (with_task(|t| t.layout.in_shared(va)), leaf_entry(root, va)) {
+                    let pte = slot.read();
+                    let old = pte & PTE_ADDR;
+                    match madvise::dontneed_page_action(pte & 1 != 0, share_count(pte)) {
+                        PageAction::Nothing => {}
+                        // The frame is this space's only: zero it where it is.
+                        PageAction::ZeroInPlace => {
+                            if let Some(f) = slot.frame() {
+                                f.write_bytes(0, &ZERO_PAGE);
+                            }
+                        }
+                        PageAction::BreakSharing => {
+                            // Out of frames: the page keeps its bytes, the answer that wipes nobody's page.
+                            if let Some(fresh) = phys::Frame::alloc_zeroed() {
+                                // A CoW-marked page was writable before the fork shared it, and its private
+                                // replacement is again; an unmarked read-only page stays read-only.
+                                let w = if pte & PTE_COW != 0 { PTE_W } else { 0 };
+                                slot.write(((pte & !PTE_ADDR) | w | fresh.pa()) & !PTE_COW);
+                                akuma_cpu::tlb::invlpg(va as usize);
+                                // As `cow_resolve`'s copy: peers drop the old translation before its count does.
+                                smp::shootdown();
+                                akuma_pmm::free_page(old as usize, tid);
+                            }
+                        }
+                    }
+                }
+            }
+            0
+        }
+    }
 }
 
 /// `munmap(addr, len)` for the mmap slab: free the frames, record the hole.
@@ -1964,6 +2039,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         akuma_syscalls_abi::x86_64::MPROTECT => mprotect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         akuma_syscalls_abi::x86_64::MUNMAP => munmap_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::MSYNC => msync_arm(fr.arg1(), fr.arg2()),
+        akuma_syscalls_abi::x86_64::MADVISE => madvise_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         akuma_syscalls_abi::x86_64::SCHED_YIELD => {
             if crate::exec_twin::current_slot() < child::NSLOTS && akuma_threading::x86_runnable_exists() {
                 let stash = ring3::user_rsp_stash();
@@ -1974,10 +2050,17 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         // x86_64 130. No signal is delivered here, so "a signal arrived" has two observable
         // causes: a `tkill` (the thread's interrupt bit) and a child's death (SIGCHLD).
-        akuma_syscalls_abi::x86_64::RT_SIGSUSPEND => {
-            let (a1, a2) = (fr.arg1(), fr.arg2());
-            child::sigsuspend_arm(fr, a1, a2)
-        }
+        // Glue's, as on the other two kernels: they arm the restore-sigmask slot that
+        // `child::deliver_at_return` reads. busybox ash's `wait` parks in `rt_sigsuspend`.
+        akuma_syscalls_abi::x86_64::RT_SIGSUSPEND => akuma_syscalls_glue::handle_syscall(
+            akuma_syscalls_abi::Syscall::RtSigsuspend.to_aarch64(),
+            &[fr.arg1(), fr.arg2(), 0, 0, 0, 0],
+        ),
+        akuma_syscalls_abi::x86_64::RT_SIGPENDING => akuma_syscalls_glue::handle_syscall(
+            akuma_syscalls_abi::Syscall::RtSigpending.to_aarch64(),
+            &[fr.arg1(), fr.arg2(), 0, 0, 0, 0],
+        ),
+        ring3::nr::PAUSE => akuma_syscalls_glue::sys_pause(),
         akuma_syscalls_abi::x86_64::RT_SIGRETURN => child::sigreturn_arm(fr),
         akuma_syscalls_abi::x86_64::MREMAP => {
             // musl's realloc on an mmapped chunk. Shrink frees the tail; grow

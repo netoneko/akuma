@@ -863,6 +863,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         nr::RT_SIGPROCMASK => signal::sys_rt_sigprocmask(args[0] as u32, args[1], args[2], args[3] as usize),
         nr::RT_SIGSUSPEND => signal::sys_rt_sigsuspend(args[0], args[1] as usize),
+        nr::RT_SIGPENDING => signal::sys_rt_sigpending(args[0], args[1] as usize),
         nr::RT_SIGTIMEDWAIT => flat(signal::sys_rt_sigtimedwait(args[0], args[1], args[2], args[3] as usize)),
         nr::RT_SIGRETURN => 0,
         nr::RT_SIGACTION => signal::sys_rt_sigaction(args[0] as u32, args[1] as usize, args[2] as usize, args[3] as usize),
