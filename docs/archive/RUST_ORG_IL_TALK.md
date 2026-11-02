@@ -84,8 +84,8 @@ build`; Osaka the same `tokioprobe` and battery. Census: 76 syscalls used by the
 **Fixed points since 11-01:** A6 `8909a603` under Akuma's own hypervisor on the ryzen (`26d1ead2...`), B14 `ade75544`
 under Pop's Linux KVM at `smp=4` (`6343290a...`), and **B15 `961a77be`, the crate kernel, under Pop's KVM: K1 == K2
 (`5f568279...`, 2,304,624 bytes, about 7.5 minutes a generation)** - the kernel whose `main.rs` is 19 lines builds
-itself reproducibly. Under TCG on the Mac (x86 emulated on arm64, `fp_tcg.py`): K1 built in 34 minutes, K2 running
-(see [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md)).
+itself reproducibly. **And under TCG on the Mac** (x86 emulated on arm64, no hypervisor, `fp_tcg.py`): **K1 == K2** (`b0c08970...`),
+33 minutes a generation (see [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md), "Under TCG").
 
 ## Facts re-measured 2026-11-01 (after the first day of cleanup)
 

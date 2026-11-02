@@ -101,3 +101,29 @@ session finished the generation by hand with `fp_pop.py`'s own commands: stopped
 (`TX_RUN=/root/tx-fp bash /root/tx-pop.sh stop`), pulled K2 and `/tmp/fp.status` out of the overlay with
 `/dev/nbd7` (`qemu-nbd --read-only`, `debugfs dump`, `qemu-nbd -d`), and checked the pulled md5 against the
 guest's. Nothing was rebuilt or rebooted; both steps the Mac skipped are the ones done by hand.
+
+## Under TCG (2026-11-02)
+
+The same commit, `961a77be`, and the same K0 (`0272f1eb...`), with no KVM at all: QEMU TCG on the Mac (x86_64 emulated
+on Apple arm64, microvm, `-cpu max`, 4 vCPUs, 3 GiB), driven by `scripts/kvm/taoxichuan/fp_tcg.py`:
+
+| generation | built by | md5 | bytes | build time |
+|---|---|---|---|---|
+| K0 | the Mac (`--features no-tests,trace-err`) | `0272f1eb7de0e031e4266e9d89aec181` | 2,306,328 | - |
+| K1 | a TCG guest running K0 | `b0c08970c611617b1bd9be8fc50aeec5` | 2,306,056 | 1,992 s |
+| K2 | a TCG guest running K1 | `b0c08970c611617b1bd9be8fc50aeec5` | 2,306,056 | 10,259 s (the Mac slept for part of it) |
+
+**K1 == K2** (`cmp`-identical), each pulled kernel's md5 equal to its guest's own `md5sum`, 0 fault-ish lines on
+either console. This is the first fixed point not run under a hardware hypervisor.
+
+How it differs from the KVM runs, and why K1 here is not the KVM runs' `5f568279...`:
+* **The inputs are staged, not fetched.** The Mac's toolchain image has neither git nor a resolver, so `fp_tcg.py`
+  writes `git archive 961a77be` of the same sparse paths plus a `cargo fetch --locked` CARGO_HOME as one tar onto an
+  APFS clone of the image (grown to 4 GiB), and the guest extracts it to the same absolute paths (`/tmp/gh`,
+  `/root/.cargo`) and builds `--offline`.
+* **No `.git`, so no build identity.** This run's K1 and K2 call themselves `0.1.0-unknown-taoxichuan`; the KVM runs'
+  call themselves `961a77b`. The script now sets `AKUMA_SHA_OVERRIDE` to the 7-digit SHA, so a rerun carries it.
+* **A different toolchain**: the Mac image's musl nightly is `2026-09-18`, not the ryzen root's.
+
+So the result is the same property on a third machine model - the kernel rebuilds itself to the same bytes - not
+bit-identity with the KVM K1.

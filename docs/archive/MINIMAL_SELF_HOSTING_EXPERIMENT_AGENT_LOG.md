@@ -2388,6 +2388,8 @@ the talk doc's "Facts re-measured 2026-11-02" ([`RUST_ORG_IL_TALK.md`](RUST_ORG_
 - **TCG.** The user had assumed the crate kernel already had a TCG fixed point; it had not - every earlier fixed point
   ran under KVM (the ryzen's Linux, Pop's Linux, or Akuma's own hypervisor). `fp_tcg.py` (new) runs it on the Mac:
   the toolchain image has neither git nor a resolver, so `git archive` of the commit and a `cargo fetch`ed
-  CARGO_HOME are staged onto an APFS clone of it and the guest builds `--offline`. Generation 1 built K1
-  `b0c08970...` in 2,038 s (about 4x KVM). The staged tree has no `.git`, so that run's kernels call themselves
-  `unknown`; the script now sets `AKUMA_SHA_OVERRIDE` for later runs.
+  CARGO_HOME are staged onto an APFS clone of it and the guest builds `--offline`. **K1 == K2** (`b0c08970...`,
+  `cmp`-identical, 0 faults): generation 1 built in 1,992 s (about 4x KVM), generation 2 in 10,259 s because the Mac
+  slept on the way home. The staged tree has no `.git`, so that run's kernels call themselves `unknown`, and the
+  Mac image's nightly is not the ryzen's, so K1 is not the KVM `5f568279...`; the script now sets
+  `AKUMA_SHA_OVERRIDE` for later runs ([`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md), "Under TCG").
