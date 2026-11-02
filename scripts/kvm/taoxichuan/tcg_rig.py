@@ -14,7 +14,8 @@ Environment: TX_DISK (the base ext2 image, required for boot; the guest never wr
 TX_RUN/overlay.qcow2, and `boot fresh` discards them), TX_KEY (ssh private key for the image's
 authorized_keys), TX_RUN (default $TMPDIR/tx-tcg), TX_PORT (default 2244), TX_MEM (3072), TX_SMP (1; above 1 also puts `smp=N` on the command line),
 TX_TARGET (cargo target dir, default target/), TX_KERNEL (default TX_TARGET/x86_64-unknown-none/release/taoxichuan; any kernel built on akuma-tokio-kernel boots the same way),
-TX_APPEND (extra cmdline), TX_INIT (default `init=/bin/sshd initargs=--port,22`; with another init, `boot` cannot
+TX_APPEND (extra cmdline), TX_QEMU_EXTRA (extra QEMU arguments, split on spaces - e.g.
+`-monitor unix:$TX_RUN/mon.sock,server,nowait` to read a wedged guest's CPUs with `info registers -a`), TX_INIT (default `init=/bin/sshd initargs=--port,22`; with another init, `boot` cannot
 wait for ssh - read the console).
 
 The cmdline carries `epoch=<host unix seconds>`: microvm has no RTC, and without the anchor the guest's clock
@@ -102,7 +103,7 @@ def boot(fresh):
                     "-device", "virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0",
                     "-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{PORT}-:22",
                     "-device", "virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1",
-                    "-pidfile", PIDFILE, "-daemonize"], check=True)
+                    "-pidfile", PIDFILE, "-daemonize"] + os.environ.get("TX_QEMU_EXTRA", "").split(), check=True)
     if "TX_INIT" in os.environ:
         print(f"BOOTED (no ssh wait with TX_INIT) console={RUN}/console.log")
         return

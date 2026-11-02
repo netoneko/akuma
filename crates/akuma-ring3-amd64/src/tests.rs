@@ -1,4 +1,6 @@
 use super::*;
+extern crate std;
+use std::{format, string::String, vec, vec::Vec};
 
 // ---- the stack builder: read the block back through the same mapping the
 // kernel places it with ----
@@ -75,6 +77,42 @@ fn stack_without_at_random_has_no_canary() {
     let rsp = build_stack(&mut buf, TOP, &["x"], &[], &aux);
     assert_eq!(rsp % 16, 0);
     assert_eq!(word(&buf, TOP, rsp), 1);
+}
+
+#[test]
+fn a_cargo_sized_argv_lays_out_in_a_block_of_stack_block_len() {
+    // 570 arguments and 84 variables: `infinity-agent-cli`'s rustc line, past
+    // the 512-string table this builder used to keep (and the 448-entry exec
+    // cap above it, which answered `E2BIG`). Every pointer must name its string.
+    const TOP: u64 = 0x7000_0000_0000;
+    let argv: Vec<String> = (0..570).map(|i| format!("-Ldependency=/t/d/{i}/out")).collect();
+    let env: Vec<String> = (0..84).map(|i| format!("V{i}=v{}", "x".repeat(i))).collect();
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let env: Vec<&str> = env.iter().map(String::as_str).collect();
+    let aux = [(AT_PAGESZ, 4096u64), (AT_RANDOM, 0), (AT_EXECFN, 0)];
+    let len = stack_block_len(&argv, &env, aux.len());
+    let mut buf = vec![0u8; len];
+    let rsp = build_stack(&mut buf, TOP, &argv, &env, &aux);
+
+    assert_eq!(rsp % 16, 0);
+    assert!(TOP - rsp <= len as u64, "nothing written below the block");
+    assert_eq!(word(&buf, TOP, rsp), 570, "argc");
+    for (i, a) in argv.iter().enumerate() {
+        assert_eq!(string(&buf, TOP, word(&buf, TOP, rsp + 8 + 8 * i as u64)), *a, "argv[{i}]");
+    }
+    let envp = rsp + 8 + 8 * 571;
+    assert_eq!(word(&buf, TOP, envp - 8), 0, "argv NULL");
+    for (i, e) in env.iter().enumerate() {
+        assert_eq!(string(&buf, TOP, word(&buf, TOP, envp + 8 * i as u64)), *e, "envp[{i}]");
+    }
+    assert_eq!(word(&buf, TOP, envp + 8 * 84), 0, "envp NULL");
+}
+
+#[test]
+fn stack_block_len_is_tight_enough_for_the_small_case() {
+    // The fixed 512-byte buffers above stay sufficient.
+    let aux8 = [(0u64, 0u64); 8];
+    assert!(stack_block_len(&["/bin/hello"], &[], aux8.len()) <= 512);
 }
 
 // ---- the frames the two crossings use ----

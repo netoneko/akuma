@@ -106,12 +106,24 @@ Loader pick (see [`../../abi/linux-compat.md`](../../abi/linux-compat.md)
 "ELF loading"): `read_file()` first; on `FsError` (binary > 16 MB), fall back
 to `load_elf_from_path` (page-at-a-time via `vfs::read_at()`).
 
+**Argument size on Taoxichuan.** The initial stack's argv/envp/auxv block is
+sized by what it holds (`akuma_ring3_amd64::stack_block_len`); there is no fixed
+block and no string-address table. The exec caps (`child.rs`) bound kernel work
+only: 32768 argv and 8192 envp entries, 128 KiB per string (Linux's
+`MAX_ARG_STRLEN`), 1 MiB in all; beyond them `E2BIG`. A cap derived from a fixed
+table is how a 570-argument `rustc` line failed
+([`TAOXICHUAN_EXEC_ARGV_LIMIT.md`](../../../archive/TAOXICHUAN_EXEC_ARGV_LIMIT.md)).
+
 ### `#!` scripts
 
 Both `execve` **and** `spawn` resolve them, through one shared parser
 (`akuma_exec::process::{parse_shebang, shebang_hop}`): `exec_shebang`
 (`src/syscall/proc.rs`) for the exec path, `resolve_shebang_chain`
-(`crates/akuma-exec/src/process/spawn.rs`) for the SPAWN abi. Up to 4 hops,
+(`crates/akuma-exec/src/process/spawn.rs`) for the SPAWN abi, and
+Taoxichuan's `exec_real_task` (`crates/akuma-tokio-kernel-amd64/src/child.rs`),
+which had no `#!` support until 2026-11-03
+([`TAOXICHUAN_EXEC_SHEBANG.md`](../../../archive/TAOXICHUAN_EXEC_SHEBANG.md)). A
+new exec path calls the same pair; it does not grow its own. Up to 4 hops,
 matching Linux's `BINPRM_MAX_RECURSION`; at most one argument after the
 interpreter, **not** split on whitespace (`#!/usr/bin/env -S a b` passes
 `-S a b` as one argv entry).

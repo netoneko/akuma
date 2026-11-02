@@ -866,10 +866,15 @@ impl akuma_ext2::BlockDevice for Vda {
     }
 }
 
-/// The ext2 root's inode clock: every time it stamps is 0 (`docs/gaps.md`).
+/// The ext2 root's inode clock: UTC once `epoch=` anchored it, else 0 (the
+/// AArch64 kernel's mount answers the same way, `akuma-vfs-glue/src/ext2.rs`).
+/// Read at each stamp, so mounting before the anchor is parsed is fine. Until
+/// 2026-11-03 this was a constant 0: every file a guest made read `Jan 1 1970`,
+/// and every inode it unlinked carried `dtime` 0, which `e2fsck` then reported
+/// 15,254 times as "deleted inode has zero dtime" (`docs/archive/INFINITY_ON_TAOXICHUAN.md`).
 #[cfg(feature = "disk")]
-fn no_clock() -> u64 {
-    0
+fn ext2_clock() -> u64 {
+    akuma_primitives::clock::utc_time_us(net::uptime_us()).unwrap_or(0)
 }
 
 /// The default root: ext2 on the first virtio-blk device.
@@ -879,7 +884,7 @@ fn disk_root() -> Option<alloc::sync::Arc<dyn Filesystem>> {
         console::puts("  [FATAL] no virtio block device -- the default root (ext2 on virtio-blk) cannot mount\n");
         return None;
     }
-    let Ok(fs) = akuma_ext2::Ext2Filesystem::new(Vda, no_clock) else {
+    let Ok(fs) = akuma_ext2::Ext2Filesystem::new(Vda, ext2_clock) else {
         console::puts("  fs:   /dev/vda holds no readable ext2 image\n");
         return None;
     };
@@ -1010,8 +1015,6 @@ pub(crate) const USER_TOP: u64 = 0x0000_8000_0000_0000;
 /// places. 16 pages — far more than musl's startup touches, and cheap.
 const USER_STACK_TOP: u64 = 0x0000_7000_0000_0000;
 const USER_STACK_PAGES: u64 = 16;
-/// Pages at the stack top that hold the argv/envp/auxv block `load_task` builds.
-pub(crate) const ARG_BLOCK_PAGES: usize = 12;
 /// `brk` and anonymous `mmap` each get a fixed slab, registered as user
 /// regions up front so every user-pointer check is one range scan. Stage 6:
 /// Sized by what the heaviest guest needs, not by what hello needs: rustc's
@@ -2567,21 +2570,6 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
         Err(_) => return None,
     };
 
-    // The stack, then the initial block on it. The block is < half a page and
-    // ends at `USER_STACK_TOP`, so it lands entirely in the top page.
-    let stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
-    let mut stack_frames = [None::<phys::Frame>; USER_STACK_PAGES as usize];
-    let mut pva = stack_base;
-    while pva < USER_STACK_TOP {
-        let frame = phys::Frame::alloc_zeroed()?;
-        stack_frames[((pva - stack_base) / 4096) as usize] = Some(frame);
-        if !paging::map_page_in(root, pva as usize, frame.pa(), PteProt::USER_RW, MemAttr::WriteBack) {
-            return None;
-        }
-        pva += 4096;
-    }
-    add_region(stack_base, USER_STACK_TOP);
-
     // argc/argv/envp/auxv. `AT_RANDOM`/`AT_EXECFN` values are the builder's
     // to fill.
     const AUX_N: usize = 14;
@@ -2600,33 +2588,39 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     aux[11] = (ring3::AT_HWCAP, 0);
     aux[12] = (ring3::AT_CLKTCK, 100);
     aux[13] = (ring3::AT_RANDOM, 0);
-    // `..n_args`, not `..=n_args`: the array is exactly argv-sized and the
-    // slice must be too. The old builder pre-filled every slot with argv[0]
-    // and then sliced one slot PAST the copied prefix (`..=`), so the new
-    // image's argv ended with a duplicate of argv[0] — apk 3's `add` then
-    // parsed that duplicate as a package name ("unable to select packages:
-    // apk.static (no such package)") while `--version` (G2) and `sh -c`
-    // (G1, the dup landed as $0) never noticed.
-    // No fixed argv/env caps here: the block below is sized in pages. rustc's
-    // linker line is ~50 arguments and `collect2` hands `ld` all of them (the
-    // old 16-entry copy truncated it: `ld: no input files`).
-    let full_argv: &[&str] = argv;
-    let n_args = argv.len();
-    // `ARG_BLOCK_PAGES` pages: `build_stack` lays the block out from
-    // `buf.len()` backwards, and a block too small for the strings panics on
-    // an underflowed slice index (512 bytes did, by exactly one pointer word,
-    // on `apk`'s first real install; a heavy `rustc` line needs several pages).
-    // The block ends at `USER_STACK_TOP` and fills the top pages exactly.
-    const BLOCK_PAGES: usize = ARG_BLOCK_PAGES;
-    let mut block = alloc::vec![0u8; BLOCK_PAGES * 4096];
-    let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &full_argv[..n_args], env, &aux);
+    // The block is sized by its contents: `stack_block_len` pages, ending at
+    // `USER_STACK_TOP`. A fixed block (12 pages until 2026-11-03) is what the
+    // exec path's entry caps were derived from, and a 570-argument `rustc`
+    // line got `E2BIG` (`docs/archive/TAOXICHUAN_EXEC_ARGV_LIMIT.md`). The
+    // exec path bounds the total (`child::ARG_BYTES_MAX`); the allocation is
+    // fallible because that bound is a megabyte.
+    // (The argv slice is exactly argv: an older builder sliced one slot past
+    // it, `..=`, and apk 3's `add` read the duplicated argv[0] as a package.)
+    let block_pages = ring3::stack_block_len(argv, env, aux.len()).div_ceil(4096);
+    let mut block: Vec<u8> = Vec::new();
+    block.try_reserve_exact(block_pages * 4096).ok()?;
+    block.resize(block_pages * 4096, 0);
+    let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, argv, env, &aux);
 
-    // The block ends at `USER_STACK_TOP`, so it fills the top `BLOCK_PAGES` pages.
-    for k in 0..BLOCK_PAGES {
-        if let Some(frame) = stack_frames[USER_STACK_PAGES as usize - BLOCK_PAGES + k] {
+    // The stack: at least `USER_STACK_PAGES`, and room for the block plus
+    // four pages of real stack under it; the fault path grows it from there.
+    // The block fills the top `block_pages` pages.
+    let stack_pages = (USER_STACK_PAGES as usize).max(block_pages + 4);
+    let stack_base = USER_STACK_TOP - stack_pages as u64 * 4096;
+    let first_block_page = stack_pages - block_pages;
+    for p in 0..stack_pages {
+        let frame = phys::Frame::alloc_zeroed()?;
+        if p >= first_block_page {
+            let k = p - first_block_page;
             frame.write_bytes(0, &block[k * 4096..(k + 1) * 4096]);
         }
+        let pva = stack_base + p as u64 * 4096;
+        if !paging::map_page_in(root, pva as usize, frame.pa(), PteProt::USER_RW, MemAttr::WriteBack) {
+            return None;
+        }
     }
+    add_region(stack_base, USER_STACK_TOP);
+    drop(block);
 
     // The heap slabs: `brk` above the image, `mmap` in its own window. Both
     // registered now, so a pointer check is one scan.

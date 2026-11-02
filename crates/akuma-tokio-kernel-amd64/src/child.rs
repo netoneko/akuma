@@ -76,19 +76,23 @@ pub fn pid_for_slot(idx: usize) -> Option<u32> {
 // `execve`'s argument block.
 // ---------------------------------------------------------------------------
 
-/// Entry caps. `ring3::build_stack` holds 512 strings in all (argv + envp), so
-/// the exec path refuses a larger sum with `E2BIG`. Cargo's heaviest `rustc`
-/// call for this kernel has 344 arguments, one of 5192 bytes, ~19.6 KB of
-/// arguments and 84 variables; the earlier caps (128 entries, 4096 bytes per
-/// string) answered such an `execve` `EFAULT` ("Bad address") and failed the
-/// build (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md`).
-const ARGV_MAX: usize = 448;
-const ENV_MAX: usize = 256;
-const MAX_STRS: usize = 512;
-const STR_MAX: usize = 32 * 1024;
-/// The loader lays argv/envp/auxv out in a block of `ARG_BLOCK_PAGES` pages;
-/// leave room for the pointer vectors, auxv and alignment.
-const ARG_BYTES_MAX: usize = crate::ARG_BLOCK_PAGES * 4096 - 2048;
+/// Entry caps. The loader sizes the argument block from what it holds
+/// (`ring3::stack_block_len`), so these bound kernel work per `execve`, not a
+/// table: about Linux's own limits (`MAX_ARG_STRLEN` 128 KiB per string, and a
+/// megabyte in all where Linux allows a quarter of the stack rlimit). Until
+/// 2026-11-03 they were 448 / 256 / 512 strings and ~47 KB, derived from a fixed
+/// 12-page block and a 512-entry address table in the builder; a 570-argument
+/// `rustc` line got `E2BIG` (`docs/archive/TAOXICHUAN_EXEC_ARGV_LIMIT.md`).
+/// Before that, 128 entries answered `EFAULT`
+/// (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md`).
+const ARGV_MAX: usize = 32 * 1024;
+const ENV_MAX: usize = 8 * 1024;
+const MAX_STRS: usize = ARGV_MAX + ENV_MAX;
+const STR_MAX: usize = 128 * 1024;
+const ARG_BYTES_MAX: usize = 1024 * 1024;
+/// `#!` hops followed before ENOEXEC, Linux's `BINPRM_MAX_RECURSION` (an
+/// interpreter may itself be a script; one that names itself stops here).
+const SHEBANG_MAX_DEPTH: usize = 4;
 
 /// `execve`'s `(path, argv, envp)` as this kernel's loader takes them.
 struct ExecArgs {
@@ -578,15 +582,43 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     let (Ok(argv_s), Ok(env_s)) = (utf8(req.argv), utf8(req.envp)) else {
         return crate::e(crate::err::EFAULT);
     };
-    let args = ExecArgs { path: req.path, argv: argv_s, env: env_s };
-    let effective = crate::resolve_effective(&args.path);
-    let image = match crate::read_image(&effective) {
+    let mut args = ExecArgs { path: req.path, argv: argv_s, env: env_s };
+    let mut effective = crate::resolve_effective(&args.path);
+    let mut image = match crate::read_image(&effective) {
         Ok(i) => i,
         Err(err) => {
             akuma_primitives::safe_print!(192, "[exec] '{}': read failed ({:?})\n", effective, err);
             return crate::e(crate::err::ENOENT);
         }
     };
+    // `#!` scripts: the interpreter is loaded instead, with argv
+    // `[interpreter, arg?, path as written, argv[1..]]`. One parser and one argv
+    // rule with the AArch64 kernel's `exec_shebang` and `spawn`'s chain walk
+    // (`akuma_exec::process::{parse_shebang, shebang_hop}`). Without this a
+    // `#!/usr/bin/env python3` RUSTC_WRAPPER failed cargo's spawn with ENOEXEC
+    // (`docs/archive/TAOXICHUAN_EXEC_SHEBANG.md`).
+    let mut prefix: Vec<String> = Vec::new();
+    let mut script_name = args.path.clone();
+    for _ in 0..SHEBANG_MAX_DEPTH {
+        let head = &image[..image.len().min(akuma_exec::process::SHEBANG_MAX)];
+        let Some((interp, arg)) = akuma_exec::process::parse_shebang(head) else {
+            break;
+        };
+        prefix = akuma_exec::process::shebang_hop(interp, arg, &script_name, &prefix);
+        script_name = String::from(interp);
+        effective = crate::resolve_effective(&script_name);
+        image = match crate::read_image(&effective) {
+            Ok(i) => i,
+            Err(err) => {
+                akuma_primitives::safe_print!(192, "[exec] interpreter '{}': read failed ({:?})\n", effective, err);
+                return crate::e(crate::err::ENOENT);
+            }
+        };
+    }
+    if !prefix.is_empty() {
+        prefix.extend(args.argv.drain(..).skip(1));
+        args.argv = prefix;
+    }
     if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
         return crate::e(crate::err::ENOEXEC);
     }

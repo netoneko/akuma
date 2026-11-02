@@ -86,10 +86,19 @@ pub const AT_EXECFN: u64 = 31;
 /// `AT_BASE` — the interpreter's base (none: static).
 pub const AT_BASE: u64 = 7;
 
-/// Most `argv`+`envp` strings whose addresses the builder will remember.
-/// The composed kernel passes one argv entry and no env; the bound is a
-/// sanity check, not a resource decision.
-const MAX_STRS: usize = 512;
+/// Bytes [`build_stack`] writes for these strings and `n_aux` auxv pairs, an
+/// upper bound with the alignment slack included. A caller sizes its buffer
+/// from this (the block is as large as the arguments make it; there is no
+/// fixed entry cap), and `build_stack` never writes below
+/// `stack_top - stack_block_len(..)`.
+#[must_use]
+pub fn stack_block_len(argv: &[&str], env: &[&str], n_aux: usize) -> usize {
+    let strings: usize = env.iter().chain(argv.iter()).map(|s| s.len() + 1).sum();
+    // canary 16 + two 16-byte alignments, then the words: auxv pairs plus
+    // AT_NULL, envp + NULL, argv + NULL, argc.
+    let words = 2 * (n_aux + 1) + (env.len() + 1) + (argv.len() + 1) + 1;
+    strings + 16 + 32 + words * 8
+}
 
 /// Lay out the initial user stack into `buf`, whose **last** byte is the last
 /// byte of the stack page at `stack_top` (i.e. `buf` is the tail of the stack,
@@ -104,26 +113,28 @@ const MAX_STRS: usize = 512;
 /// `AT_EXECFN` values are supplied by the builder itself (`AT_RANDOM` gets the
 /// in-block canary address, `AT_EXECFN` the `argv[0]` string address), so the
 /// caller states them as `(AT_RANDOM, 0)` / `(AT_EXECFN, 0)` placeholders.
+///
+/// `buf` must hold [`stack_block_len`] bytes. No string address is stored:
+/// string `i` (env first, then argv) sits at `stack_top` less the lengths of
+/// strings `0..=i`, so the pointer vectors are recomputed from the lengths,
+/// and the builder needs no table — and so no cap on the count.
 pub fn build_stack(buf: &mut [u8], stack_top: u64, argv: &[&str], env: &[&str], aux: &[(u64, u64)]) -> u64 {
     assert!(
-        argv.len() + env.len() <= MAX_STRS,
-        "argv+envp exceed the builder's string table"
+        buf.len() >= stack_block_len(argv, env, aux.len()),
+        "the argument block is smaller than stack_block_len"
     );
     let mut top = stack_top;
-    let mut addrs = [0u64; MAX_STRS];
-    let mut n_strs = 0usize;
     for s in env.iter().chain(argv.iter()) {
         let bytes = s.as_bytes();
         top -= bytes.len() as u64 + 1; // NUL
         let i = buf.len() - (stack_top - top) as usize;
         buf[i..i + bytes.len()].copy_from_slice(bytes);
         buf[i + bytes.len()] = 0;
-        addrs[n_strs] = top;
-        n_strs += 1;
     }
-    let env_addrs = &addrs[..env.len()];
-    let argv_addrs = &addrs[env.len()..n_strs];
-    let execfn = if argv.is_empty() { 0 } else { addrs[env.len()] };
+    // Where the env strings end and argv's begin; argv[0] is right below.
+    let env_bytes: u64 = env.iter().map(|s| s.len() as u64 + 1).sum();
+    let argv_top = stack_top - env_bytes;
+    let execfn = argv.first().map_or(0, |a0| argv_top - (a0.len() as u64 + 1));
 
     // The 16 canary bytes `AT_RANDOM` points at, then 16-byte alignment for
     // the pointer area (always applied: the vectors are u64s but the ABI
@@ -138,6 +149,12 @@ pub fn build_stack(buf: &mut [u8], stack_top: u64, argv: &[&str], env: &[&str], 
         }
     }
     top &= !0xF;
+    // The words below are the auxv pairs (even), the two vectors with their
+    // NULLs, and argc: an odd count when argc + envc is even, and then one
+    // pad word keeps the final rsp on the 16-boundary (Linux pads the same way).
+    if (argv.len() + env.len()).is_multiple_of(2) {
+        top -= 8;
+    }
 
     // Everything from here down is 8-byte words, written back-to-front so the
     // final `rsp` lands on `argc`.
@@ -164,13 +181,20 @@ pub fn build_stack(buf: &mut [u8], stack_top: u64, argv: &[&str], env: &[&str], 
         push(k);
     }
 
+    // Pushed last-first, so each vector walks its strings from the lowest
+    // address up: string `j`'s address is the top of its region less the
+    // lengths of strings `0..=j`.
     push(0); // envp NULL
-    for p in env_addrs.iter().rev() {
-        push(*p);
+    let mut end = argv_top;
+    for s in env.iter().rev() {
+        push(end);
+        end += s.len() as u64 + 1;
     }
     push(0); // argv NULL
-    for p in argv_addrs.iter().rev() {
-        push(*p);
+    let mut end = stack_top - env_bytes - argv.iter().map(|s| s.len() as u64 + 1).sum::<u64>();
+    for s in argv.iter().rev() {
+        push(end);
+        end += s.len() as u64 + 1;
     }
     push(argv.len() as u64); // argc
     top
