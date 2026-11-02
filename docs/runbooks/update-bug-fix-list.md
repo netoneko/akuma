@@ -4,6 +4,19 @@ You just fixed a bug and wrote (or updated) an archive doc about it. Do this
 so `docs/archive/BUG_FIX_LIST.md` — the hand-curated running audit of every
 fix in the codebase — doesn't silently go stale.
 
+## Which list
+
+There are two, with the same structure, counting rule and checks:
+
+- `docs/archive/BUG_FIX_LIST.md`: Akuma, meaning the AArch64 and amd64 kernels, every shared crate, glue, and the userspace
+  they run.
+- `docs/archive/TAOXICHUAN_BUG_FIX_LIST.md`: Taoxichuan, the tokio kernel (`crates/akuma-tokio-kernel-amd64`), its
+  rigs, and the code only it uses (the `linux-abi` spawn path, crates extracted for it while it was their only user).
+
+A fix goes where the code is, not where it was found. A glue or shared-crate bug that only Taoxichuan's gate exposed
+still goes in `BUG_FIX_LIST.md`; the Taoxichuan list names it once under "Found through Taoxichuan" without counting it.
+Every step and check below applies to whichever list you edit; point the scripts at that file.
+
 ## When to do this
 
 Any time you land a fix that gets its own `docs/archive/*.md` writeup (new
@@ -230,9 +243,10 @@ EOF
   { git diff --name-only "$BASE"..HEAD -- docs/archive/ ;
     git status --short -- docs/archive/ | awk '{print $NF}' ; } \
     | grep '\.md$' | sort -u | while read -r f; do
-      b=$(basename "$f"); [ "$b" = "BUG_FIX_LIST.md" ] && continue
-      grep -q "^### docs/archive/$b\$" docs/archive/BUG_FIX_LIST.md && s=listed \
-        || { grep -q "${b%.md}" docs/archive/BUG_FIX_LIST.md && s=mentioned || s=UNACCOUNTED; }
+      b=$(basename "$f"); case "$b" in BUG_FIX_LIST.md|TAOXICHUAN_BUG_FIX_LIST.md) continue;; esac
+      lists() { grep -q "$1" docs/archive/BUG_FIX_LIST.md docs/archive/TAOXICHUAN_BUG_FIX_LIST.md; }
+      lists "^### docs/archive/$b\$" && s=listed \
+        || { lists "${b%.md}" && s=mentioned || s=UNACCOUNTED; }
       printf '%-52s %s\n' "$b" "$s"
     done
   ```
