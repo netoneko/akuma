@@ -71,8 +71,14 @@ are tokio APIs no census program reached (`Child::wait` uses the pidfd and `wait
 
 ## Conclusions for B11
 
-- **`runtime` splits in two**: the 13 calls above stay unconditional; the other 25 go behind a feature for shells and
-  tools, which Taoxichuan turns on (its images run busybox and bash) and a tokio-only kernel leaves off.
+- **`runtime` splits in two**: the 13 calls above stay unconditional, with `nanosleep` and `clock_nanosleep` (no census
+  program made them, but `std::thread::sleep` does, from any blocking task); the other 23 go behind a `shell` feature,
+  which Taoxichuan turns on (its images run busybox and bash) and a tokio-only kernel leaves off.
+- **Checked on a kernel without it.** Taoxichuan built `--no-default-features` (no `shell`), on the Mac TCG rig with
+  the goose image: `tokioprobe` (4 workers) PASS, `nettest-reqwest get` 200, goose PONG, and the goose tool call prints
+  `census-ok`, 0 faults. Its `[nosys]` lines are all busybox's: `getuid` (102), `getgid` (104), `getppid` (110) from
+  `sh` and its applets, `setsid` (112) from the `timeout` applet's child, and `setgid`/`setuid` (106/105), which
+  busybox calls only because `getuid` failed. None comes from a tokio program.
 - `waitid`, `accept` and `sendmsg` stay in their groups: they are tokio's API surface, only not exercised here.
 - `sendfile` and `setitimer` belong to the tools feature if they are served at all; tokio does not need them.
 - The derivation was close: it predicted about 75 calls. What it could not know is which of them goose and std's spawn

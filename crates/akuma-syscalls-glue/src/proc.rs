@@ -79,6 +79,7 @@ pub fn encode_wait_status(code: i32) -> u32 {
     akuma_syscalls_proc::exit::wait_status(code)
 }
 
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_set_tpidr_el0(address: u64) -> u64 {
     akuma_cpu::sysreg::set_tpidr_el0(address);
     0
@@ -1497,6 +1498,7 @@ pub(super) fn sys_getpid() -> u64 {
 /// herd (`userspace/herd`) still calls this to try pinning a service to a
 /// secondary core and already treats `ENOSYS` as the expected result under
 /// shared-kernel SMP, so this stub stays for ABI compatibility.
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_core_init(core_idx: usize, init_program_ptr: u64) -> u64 {
     let _ = (core_idx, init_program_ptr);
     ENOSYS

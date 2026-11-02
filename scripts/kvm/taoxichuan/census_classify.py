@@ -39,7 +39,7 @@ def fn_body(text, start):
 def tokio_groups(row):
     text = src("crates/akuma-runtime-tokio/src/lib.rs")
     groups = {}
-    for name in ("runtime", "net", "process"):
+    for name in ("runtime", "net", "process", "shell"):
         names = re.findall(r"S(?:yscall)?::(\w+)", fn_body(text, f"pub const fn {name}(call"))
         groups[name] = [n for n in names if n in row]
     return groups
@@ -130,7 +130,7 @@ def main(argv):
     row = abi_rows()
     groups = tokio_groups(row)
     servers = [(f"tokio:{g}", {row[n] for n in names}) for g, names in groups.items()]
-    servers[-1][1].update({434, 424})  # `process`: the shared-number calls
+    servers[2][1].update({434, 424})  # `process`: the shared-number calls
     servers += [("glue-amd64 (fd family)", glue_amd64(row)), ("legacy fold -> glue-amd64", legacy_fold()),
                 ("taoxichuan local", local_arms(row))]
     union = set().union(*runs.values())

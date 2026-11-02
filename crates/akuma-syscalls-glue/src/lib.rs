@@ -804,14 +804,16 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLONE3 => proc::sys_clone3(args[0], args[1] as usize),
         #[cfg(feature = "exec")]
         nr::EXECVE => proc::sys_execve(args[0], args[1], args[2]),
+        #[cfg(feature = "akuma-native")]
         nr::UPTIME => time::sys_uptime(),
         // The floor control: no arguments read, no user memory touched, no
         // process resolved — a constant into x0. Everything this arm's cost
         // consists of is the boundary itself, which is the point.
+        #[cfg(feature = "akuma-native")]
         nr::AKUMA_GET_VERSION => version::sys_akuma_get_version(),
-        #[cfg(feature = "smoltcp")]
+        #[cfg(all(feature = "akuma-native", feature = "smoltcp"))]
         nr::RESOLVE_HOST => net::sys_resolve_host(args[0], args[1] as usize, args[2]),
-        #[cfg(not(feature = "smoltcp"))]
+        #[cfg(all(feature = "akuma-native", not(feature = "smoltcp")))]
         nr::RESOLVE_HOST => net_enetdown(),
         nr::GETDENTS64 => fs::sys_getdents64(args[0] as u32, args[1], args[2] as usize),
         nr::PSELECT6 => flat(poll::sys_pselect6(args[0] as usize, args[1], args[2], args[3], args[4], args[5])),
@@ -824,29 +826,43 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::RENAMEAT2 => flat(fs::sys_renameat2(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32)),
         nr::STATX => flat(fs::sys_statx(args[0] as i32, args[1], args[2] as u32, args[3] as u32, args[4])),
         nr::READLINKAT => flat(fs::sys_readlinkat(args[0] as i32, args[1], args[2], args[3] as usize)),
-        #[cfg(feature = "exec")]
+        #[cfg(all(feature = "exec", feature = "akuma-native"))]
         nr::SPAWN => flat(proc::sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5])),
+        #[cfg(feature = "akuma-native")]
         nr::AKUMA_KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
         #[cfg(feature = "sc-reboot")]
         nr::REBOOT => reboot::sys_reboot(args[0] as u32, args[1] as u32, args[2] as u32),
+        #[cfg(feature = "akuma-native")]
         nr::WAITPID => proc::sys_waitpid(args[0] as u32, args[1]),
         nr::GETRANDOM => proc::sys_getrandom(args[0], args[1] as usize),
+        #[cfg(feature = "akuma-native")]
         nr::TIME => time::sys_time(),
         nr::CHDIR => flat(fs::sys_chdir(args[0])),
         nr::CHROOT => flat(fs::sys_chroot(args[0])),
         nr::FCHDIR => fs::sys_fchdir(args[0] as u32),
+        #[cfg(feature = "akuma-native")]
         nr::SET_TERMINAL_ATTRIBUTES => term::sys_set_terminal_attributes(args[0], args[1], args[2]),
+        #[cfg(feature = "akuma-native")]
         nr::GET_TERMINAL_ATTRIBUTES => term::sys_get_terminal_attributes(args[0], args[1]),
+        #[cfg(feature = "akuma-native")]
         nr::SET_CURSOR_POSITION => term::sys_set_cursor_position(args[0], args[1]),
+        #[cfg(feature = "akuma-native")]
         nr::HIDE_CURSOR => term::sys_hide_cursor(),
+        #[cfg(feature = "akuma-native")]
         nr::SHOW_CURSOR => term::sys_show_cursor(),
+        #[cfg(feature = "akuma-native")]
         nr::CLEAR_SCREEN => term::sys_clear_screen(),
+        #[cfg(feature = "akuma-native")]
         nr::POLL_INPUT_EVENT => term::sys_poll_input_event(args[0], args[1] as usize, args[2]),
+        #[cfg(feature = "akuma-native")]
         nr::GET_CPU_STATS => term::sys_get_cpu_stats(args[0], args[1] as usize),
-        #[cfg(feature = "exec")]
+        #[cfg(all(feature = "exec", feature = "akuma-native"))]
         nr::SPAWN_EXT => flat(proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5])),
+        #[cfg(feature = "akuma-native")]
         nr::SET_BOX_STACK => proc::sys_set_box_stack(args[0], args[1]),
+        #[cfg(feature = "akuma-native")]
         nr::CLOSE_CHILD_STDIN => proc::sys_close_child_stdin(args[0] as u32),
+        #[cfg(feature = "akuma-native")]
         nr::CORE_INIT => proc::sys_core_init(args[0] as usize, args[1]),
         #[cfg(feature = "sc-containers")]
         nr::REGISTER_BOX => container::sys_register_box(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
@@ -878,6 +894,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FACCESSAT2 => flat(fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32)),
         nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),
+        #[cfg(feature = "akuma-native")]
         nr::SET_TPIDR_EL0 => proc::sys_set_tpidr_el0(args[0]),
         nr::GETPID => proc::sys_getpid(),
         nr::GETPPID => proc::sys_getppid(),

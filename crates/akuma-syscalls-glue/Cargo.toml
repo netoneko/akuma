@@ -56,7 +56,7 @@ log = { version = "0.4", default-features = false }
 #
 # **The bin must therefore use `default-features = false`** — same as it does for
 # `akuma-net` — or an `extreme-size` build would silently gain smoltcp.
-default = ["smoltcp", "exec"]
+default = ["smoltcp", "exec", "akuma-native"]
 
 # Every one is forwarded from the bin, which owns the real definitions.
 sc-reboot = ["dep:akuma-boot"]
@@ -81,6 +81,12 @@ rump = []
 # leave it off (the calls are then `ENOSYS` here); the AArch64 kernel enables it.
 exec = ["akuma-exec/elf-loader"]
 read-profile = ["dep:akuma-timer"]
+# Akuma's own syscall numbers (300-328 under asm-generic, `0x1000 +` that on
+# x86_64): `spawn`/`spawn_ext`/`waitpid`, the terminal and cursor calls,
+# `resolve_host`, `uptime`, `time`, `get_version`, `core_init`, the box stack.
+# libakuma's programs use them; a kernel that serves only the Linux ABI
+# (Taoxichuan, through `akuma-runtime-tokio`) leaves them off, and they are `ENOSYS`.
+akuma-native = []
 
 [lints]
 workspace = true

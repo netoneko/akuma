@@ -15,6 +15,11 @@ net = ["akuma-syscalls-glue/smoltcp"]
 # registers at fork, and `pidfd_open` (tokio's reaper polls a pidfd and falls back
 # to SIGCHLD without one). Spawning, `kill` and signal delivery stay the kernel's.
 process = ["akuma-syscalls-glue/sc-pidfd"]
+# Not a tokio feature: what a shell and its tools call and no tokio program does
+# (job control, the other ids, limits and accounting, `sync`, the clock and
+# hostname setters). A kernel whose images run busybox or bash turns it on.
+# The cut is B10's census (`docs/archive/TAOXICHUAN_B10_SYSCALL_CENSUS.md`).
+shell = []
 
 [dependencies]
 # The bodies. epoll and eventfd are not optional: mio's `Poll` and `Waker` are

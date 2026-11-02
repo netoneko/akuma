@@ -25,7 +25,8 @@
 //!
 //! Features mirror tokio's: `net` (default) and `process`. Turning one off takes
 //! its calls off the allow-list, and `net` also takes glue's smoltcp socket
-//! table out of the build.
+//! table out of the build. `shell` is the one that is not tokio's: the calls a
+//! shell and its tools make and no tokio program does.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -128,35 +129,63 @@ pub const PIDFD_CLOSE: fn(u32) = |_| {};
 /// Whether glue answers `call` on a kernel built with this crate's features.
 #[must_use]
 pub const fn served_by_glue(call: Syscall) -> bool {
-    runtime(call) || (cfg!(feature = "net") && net(call)) || (cfg!(feature = "process") && process(call))
+    runtime(call)
+        || (cfg!(feature = "net") && net(call))
+        || (cfg!(feature = "process") && process(call))
+        || (cfg!(feature = "shell") && shell(call))
 }
 
 /// What every Rust std + tokio binary calls, whatever its tokio features.
 ///
-/// Who it is, its limits and randomness, signal dispositions and masks (std ignores
+/// The 13 calls B10's census measured in every tokio program it ran: who it is,
+/// the worker count and randomness, signal dispositions and masks (std ignores
 /// SIGPIPE and installs its stack-overflow handler), thread naming and the exit
-/// tid clear, the clocks and sleeps, and `futex` (std's locks and parking).
+/// tid clear, the clock, and `futex` (std's locks and parking). Plus the two
+/// sleeps, which no census program made (tokio sleeps in `epoll_pwait`'s
+/// timeout) but `std::thread::sleep` does, from any blocking task.
 #[must_use]
 pub const fn runtime(call: Syscall) -> bool {
     use Syscall as S;
     matches!(
         call,
         S::Uname
-            | S::Sethostname
-            | S::Setdomainname
             | S::Getpid
-            | S::Getppid
             | S::Gettid
-            | S::Getuid
             | S::Geteuid
+            | S::SchedGetaffinity
+            | S::Getrandom
+            | S::RtSigaction
+            | S::RtSigprocmask
+            | S::Sigaltstack
+            | S::Prctl
+            | S::SetTidAddress
+            | S::ClockGettime
+            | S::Nanosleep
+            | S::ClockNanosleep
+            | S::Futex
+    )
+}
+
+/// The `shell` feature: what busybox and bash call and no census program did.
+///
+/// Job control (`setsid`, `setpgid` and the getters), the ids `id` prints, limits
+/// and accounting (`ulimit`, `time`, `uptime`), `sync`, `membarrier`, and the
+/// setters behind `date -s` and `hostname`.
+#[must_use]
+pub const fn shell(call: Syscall) -> bool {
+    use Syscall as S;
+    matches!(
+        call,
+        S::Sethostname
+            | S::Setdomainname
+            | S::Getppid
+            | S::Getuid
             | S::Getgid
             | S::Getegid
             | S::Getsid
             | S::Setsid
             | S::Getpgid
             | S::Setpgid
-            | S::SchedGetaffinity
-            | S::Getrandom
             | S::Membarrier
             | S::Sync
             | S::Syncfs
@@ -164,21 +193,12 @@ pub const fn runtime(call: Syscall) -> bool {
             | S::Getrusage
             | S::Getgroups
             | S::Times
-            | S::RtSigaction
-            | S::RtSigprocmask
-            | S::Sigaltstack
-            | S::Prctl
-            | S::SetTidAddress
-            | S::ClockGettime
             | S::ClockGetres
             | S::ClockSettime
             | S::Adjtimex
             | S::ClockAdjtime
-            | S::Nanosleep
-            | S::ClockNanosleep
             | S::Prlimit64
             | S::Getrlimit
-            | S::Futex
     )
 }
 
@@ -217,14 +237,18 @@ pub const fn process(call: Syscall) -> bool {
 mod tests {
     use super::*;
 
-    /// The three groups together are exactly the list Taoxichuan's
-    /// `served_by_glue` held when it moved here: the move changes no routing.
+    fn in_a_group(c: Syscall) -> bool {
+        runtime(c) || net(c) || process(c) || shell(c)
+    }
+
+    /// The groups together are exactly the list Taoxichuan's `served_by_glue`
+    /// held when it moved here: a kernel with every feature routes as before.
     #[test]
     fn groups_are_taoxichuans_former_list() {
         let mut got: [u64; 64] = [0; 64];
         let mut n = 0;
         for &c in Syscall::ALL {
-            if runtime(c) || net(c) || process(c) {
+            if in_a_group(c) {
                 got[n] = c.to_x86_64();
                 n += 1;
             }
@@ -244,7 +268,7 @@ mod tests {
     #[test]
     fn groups_are_disjoint() {
         for &c in Syscall::ALL {
-            let k = u8::from(runtime(c)) + u8::from(net(c)) + u8::from(process(c));
+            let k = u8::from(runtime(c)) + u8::from(net(c)) + u8::from(process(c)) + u8::from(shell(c));
             assert!(k <= 1, "{c:?} is in {k} groups");
         }
     }
@@ -255,6 +279,19 @@ mod tests {
         assert!(served_by_glue(Syscall::Futex));
         assert_eq!(served_by_glue(Syscall::Socket), cfg!(feature = "net"));
         assert_eq!(served_by_glue(Syscall::Wait4), cfg!(feature = "process"));
+        assert_eq!(served_by_glue(Syscall::Setsid), cfg!(feature = "shell"));
+    }
+
+    /// `runtime` is B10's census (the x86_64 numbers every census program's
+    /// calls on this crate's allow-list came to) plus the two sleeps.
+    #[test]
+    fn runtime_is_the_census() {
+        let census = [13, 14, 39, 63, 107, 131, 157, 186, 202, 204, 218, 228, 318];
+        let sleeps = [35, 230];
+        for &c in Syscall::ALL {
+            let nr = c.to_x86_64();
+            assert_eq!(runtime(c), census.contains(&nr) || sleeps.contains(&nr), "{c:?}");
+        }
     }
 
     /// The shared-number calls really are one number on both ABIs: x86_64's
@@ -276,7 +313,7 @@ mod tests {
     #[test]
     fn served_calls_decode_from_x86_64() {
         for &c in Syscall::ALL {
-            if runtime(c) || net(c) || process(c) {
+            if in_a_group(c) {
                 assert_eq!(Syscall::from_x86_64(c.to_x86_64()), Some(c));
             }
         }

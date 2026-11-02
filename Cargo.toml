@@ -865,7 +865,7 @@ akuma-syscalls = { path = "crates/akuma-syscalls" }
 
 # The syscall dispatcher and its families. Was `src/syscall/` — see
 # docs/archive/SRC_SYSCALL_EXTRACTION.md.
-akuma-syscalls-glue = { path = "crates/akuma-syscalls-glue", default-features = false, features = ["exec"] }
+akuma-syscalls-glue = { path = "crates/akuma-syscalls-glue", default-features = false, features = ["exec", "akuma-native"] }
 
 # Per-pid syscall trace rings behind `/proc/<pid>/syscalls`. Split out of
 # `src/syscall/` so `src/vfs/proc.rs` can read them without `src/vfs/` depending

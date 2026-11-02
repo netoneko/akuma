@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(feature = "akuma-native")]
 use akuma_tty::mode_flags;
 
 pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
@@ -379,6 +380,7 @@ pub fn note_cooked(proc: &akuma_exec::process::Process, fd: u32, how: &str) {
     }
 }
 
+#[cfg(feature = "akuma-native")]
 fn write_to_process_channel(data: &[u8]) -> u64 {
     let proc_channel = match akuma_exec::process::current_channel() {
         Some(channel) => channel,
@@ -388,6 +390,7 @@ fn write_to_process_channel(data: &[u8]) -> u64 {
     data.len() as u64
 }
 
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: u64) -> u64 {
     // A pty descriptor has its own termios; the console's state below is the
     // wrong target for it.
@@ -427,6 +430,7 @@ pub(super) fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: 
     0
 }
 
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_get_terminal_attributes(_fd: u64, attr_ptr: u64) -> u64 {
     if attr_ptr == 0 {
         return EINVAL;
@@ -447,6 +451,7 @@ pub(super) fn sys_get_terminal_attributes(_fd: u64, attr_ptr: u64) -> u64 {
     0
 }
 
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(64, "[syscall] sys_set_cursor_position({}, {})\n", col, row);
@@ -457,6 +462,7 @@ pub(super) fn sys_set_cursor_position(col: u64, row: u64) -> u64 {
     write_to_process_channel(sequence.as_bytes())
 }
 
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_hide_cursor() -> u64 {
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(64, "[syscall] sys_hide_cursor()\n");
@@ -464,6 +470,7 @@ pub(super) fn sys_hide_cursor() -> u64 {
     write_to_process_channel(b"\x1b[?25l")
 }
 
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_show_cursor() -> u64 {
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(64, "[syscall] sys_show_cursor()\n");
@@ -471,6 +478,7 @@ pub(super) fn sys_show_cursor() -> u64 {
     write_to_process_channel(b"\x1b[?25h")
 }
 
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_clear_screen() -> u64 {
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(64, "[syscall] sys_clear_screen()\n");
@@ -478,6 +486,7 @@ pub(super) fn sys_clear_screen() -> u64 {
     write_to_process_channel(b"\x1b[2J")
 }
 
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
     if buf_ptr == 0 || buf_len == 0 {
         return EINVAL;
@@ -567,6 +576,7 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
     }
 }
 
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
     let stat_size = core::mem::size_of::<ThreadCpuStat>();
     if !validate_user_ptr(ptr, max * stat_size) { return EFAULT; }

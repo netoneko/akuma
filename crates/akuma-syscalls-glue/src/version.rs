@@ -115,6 +115,7 @@ pub const fn parse_hex_prefix(s: &str) -> u32 {
 ///
 /// Kept as a named function rather than inlined into the dispatch `match` so
 /// the arm reads like every other one; it compiles to the same immediate.
+#[cfg(feature = "akuma-native")]
 #[inline]
 pub(super) fn sys_akuma_get_version() -> u64 {
     AKUMA_VERSION

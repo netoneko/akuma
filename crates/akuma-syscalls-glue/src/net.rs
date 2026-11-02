@@ -1733,7 +1733,7 @@ pub(super) fn socket_peer_closed_tcp(idx: usize) -> bool {
     }).unwrap_or(false)
 }
 
-#[cfg(feature = "smoltcp")]
+#[cfg(all(feature = "smoltcp", feature = "akuma-native"))]
 pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
     let _net_bkl = NetBklGuard::new();
     if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }

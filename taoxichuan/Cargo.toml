@@ -19,6 +19,12 @@ workspace = true
 no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
 # Name every syscall that answers a negative errno on the console (`[err] nr=N -E`).
 trace-err = []
+default = ["shell"]
+# The calls a shell and its tools make and no tokio program does
+# (`akuma-runtime-tokio`'s `shell`): the images run busybox and bash. Without it
+# the kernel serves the tokio surface B10's census measured, and nothing else
+# glue would answer (`docs/archive/TAOXICHUAN_B10_SYSCALL_CENSUS.md`).
+shell = ["akuma-runtime-tokio/shell"]
 
 [dependencies]
 # ---- The stage-1 crate lines, in boot order ---------------------------------
