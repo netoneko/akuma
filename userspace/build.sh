@@ -380,7 +380,7 @@ echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapm
 # lines above. `dynchild` is deliberately NOT here: it is `dynspawn`'s spawnee
 # and must be **dynamically** linked to test what it tests, so a `-static` build
 # of it would silently pass while exercising none of the loader.
-echo "Building abortsig + computecheck + dynspawn + md5probe + neonstate + pipewake + readback + segvchild + segvgroup + threadmax + tlsdirty (C, signal/compute/loader/pipe/thread probes)..."
+echo "Building abortsig + computecheck + dynspawn + md5probe + neonstate + pipewake + readback + segvchild + segvgroup + threadmax + tlsdirty + unixrw (C, signal/compute/loader/pipe/thread/socket probes)..."
 (
     cd forktest/c_stress
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o abortsig abortsig.c
@@ -394,6 +394,7 @@ echo "Building abortsig + computecheck + dynspawn + md5probe + neonstate + pipew
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o segvgroup segvgroup.c
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o threadmax threadmax.c
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o tlsdirty tlsdirty.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o unixrw unixrw.c
     # `dynchild`, **dynamically linked on purpose** — it is `dynspawn`'s spawnee
     # and exists to exercise the whole ld-musl startup path (self-relocation,
     # library mapping, PLT/GOT). A `-static` build of it would run and exit 42
@@ -409,10 +410,10 @@ echo "Building abortsig + computecheck + dynspawn + md5probe + neonstate + pipew
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o pattern2_parent pattern2_parent.c
 )
 for b in abortsig computecheck dynspawn dynchild md5probe neonstate pipewake readback \
-         segvchild segvgroup threadmax tlsdirty pattern2_parent; do
+         segvchild segvgroup threadmax tlsdirty pattern2_parent unixrw; do
     cp "forktest/c_stress/$b" ../bootstrap/bin/
 done
-echo "13 previously-unstaged c_stress probes copied to bootstrap/bin/"
+echo "14 c_stress probes copied to bootstrap/bin/"
 
 # permprobe: credentials + file permissions as uid 1000 sees them, one line per
 # check against Linux's errno (docs/archive/UNIX_PERMISSIONS.md). Run as root;

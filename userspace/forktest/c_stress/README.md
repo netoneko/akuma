@@ -243,6 +243,14 @@ Pure musl static ELFs (no Go runtime), so a failure is unambiguously the kernel'
   it replaces passed 95/96 on **both** arms of the 2026-08-04 fix and could not
   detect it. Regression test for the musl `__thread_list_lock` collision;
   diagnosis in `docs/runbooks/debug-futex-lost-wakeup.md`.
+- `unixrw` — are `read(2)`/`write(2)` on an AF_UNIX socket `recv`/`send` with
+  flags 0? Write-then-recv and send-then-read on stream and seqpacket pairs, the
+  record boundary of two seqpacket `write`s, and 20 rounds of Rust std's exact
+  spawn error channel: a seqpacket pair, fork, a failed `execve`, the child
+  `write`s errno+`NOEX`, the parent `recv`s. A `SOCK_DGRAM` pair prints SKIP
+  (glue refuses one). A kernel without the fix **wedges** on the first case (recv
+  spins with the BKL held) or reports `EOF` in the last; exit 0 = all pass.
+  `docs/archive/UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS.md`.
 
 ## Build (host)
 

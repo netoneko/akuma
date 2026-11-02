@@ -795,7 +795,25 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 }
             }
         }
-        // AF_UNIX socketpair endpoint: read from this endpoint's `rx` pipe.
+        // AF_UNIX endpoint. With a table entry, `read(2)` is `recv(fd, buf,
+        // len, 0)`: the same record queue `recv` keys a `SOCK_SEQPACKET`/
+        // `SOCK_DGRAM` socket off. Raw pipe bytes here desynced it from a
+        // `send`, and a raw `write` left bytes no `recv` could see — std's
+        // spawn reads its exec-error channel (a SEQPACKET pair) with `recv`,
+        // which then spun with the BKL held or read the child's exit as EOF
+        // (`docs/archive/UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS.md`).
+        akuma_exec::process::FileDescriptor::UnixSocket { sock, .. } if sock != 0 => {
+            if count == 0 {
+                return 0; // recv with no buffer would consume a whole record
+            }
+            let mut temp = alloc::vec![0u8; count];
+            let (n, _truncated) = super::unixsock::unix_recv(fd_num as u32, &mut temp, false, false);
+            if (n as i64) > 0 && copy_to_user(buf_ptr, &temp[..n as usize]).is_err() {
+                return EFAULT;
+            }
+            n
+        }
+        // A pre-table pipe pair (`sock == 0`): raw bytes from the `rx` pipe.
         akuma_exec::process::FileDescriptor::UnixSocket { rx, .. } => {
             let nonblock = super::net::fd_is_nonblock(fd_num as u32);
             let mut temp = alloc::vec![0u8; count];
@@ -1330,7 +1348,12 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                 }
             }
-            // AF_UNIX socketpair endpoint: write to this endpoint's `tx` pipe.
+            // AF_UNIX endpoint with a table entry: `write(2)` is `send(fd, buf,
+            // len, 0)`, so a framed socket's write is a record (see the read arm).
+            akuma_exec::process::FileDescriptor::UnixSocket { sock, .. } if sock != 0 => {
+                super::unixsock::unix_send(fd_num as u32, buf_slice, false)
+            }
+            // A pre-table pipe pair (`sock == 0`): raw bytes into the `tx` pipe.
             akuma_exec::process::FileDescriptor::UnixSocket { tx, .. } => {
                 let nonblock = super::net::fd_is_nonblock(fd_num as u32);
                 loop {

@@ -60,3 +60,4 @@ c_stress/permprobe
 c_stress/linkprobe
 c_stress/renameprobe
 c_stress/*.x86_64
+c_stress/unixrw

@@ -85,6 +85,19 @@ readable/writable state (`src/syscall/poll.rs` — see [`poll.md`](poll.md)).
 > `crates/akuma-syscalls-glue/src/net.rs`). The `iovs[0]`-only limit below
 > applies to the AF_INET path alone.
 
+**`read`/`write` on a unix socket are `recv`/`send` with flags 0.** When the fd
+has a table entry (`sock != 0`), `sys_read`/`sys_write`'s `UnixSocket` arms
+delegate to `unixsock::unix_recv`/`unix_send`, so a framed socket's `write` is a
+record and its `read` takes one. Only a pre-table pipe pair (`sock == 0`, the
+rump sysproxy channel) moves raw pipe bytes. Any new path that reads or writes a
+unix socket's pipes must go through the record queue too: a framed `recv` sees
+nothing that has no record, and its loop then spins with the BKL held. That is
+how Rust std's spawn error channel (a SEQPACKET pair: the child `write`s, the
+parent `recv`s) wedged a Taoxichuan guest and lost every failed exec's errno
+([`UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS.md`](../../../archive/UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS.md);
+probe: `userspace/forktest/c_stress/unixrw.c`). `readv`/`writev` still make one
+record per iovec rather than one per call.
+
 ## SCM_RIGHTS (2026-10-08)
 
 Unix sockets can pass file descriptors in `sendmsg`'s ancillary data. This
