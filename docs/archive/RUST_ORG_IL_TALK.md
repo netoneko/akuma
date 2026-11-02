@@ -88,6 +88,111 @@ their "before" figures (84,761 on 10-30) do not compare with these; quote this t
 - What did not change: it still self-hosts. K1 == K2 at the cutover's predecessors (`6af48c06`, ryzen KVM and
   metal) and after: B15 under Pop's KVM (`5f568279...`) and under TCG on the Mac (`b0c08970...`).
 
+## Bugs fixed, by subsystem (the bug-fix lists, 2026-11-02)
+
+From the two itemized lists: [`BUG_FIX_LIST.md`](BUG_FIX_LIST.md) (Akuma, the whole project's history) and
+[`TAOXICHUAN_BUG_FIX_LIST.md`](TAOXICHUAN_BUG_FIX_LIST.md) (Taoxichuan's own code, its rigs and its experiment). One
+item per distinct, named bug a doc records as fixed; a fix in code both kernels run is counted once, in Akuma's list.
+Akuma's subsystems are tagged per write-up, not per bug, so a grab-bag doc lands in one row.
+
+**Total: 1,586 fixes** - 1,481 in Akuma (415 docs) and 105 in Taoxichuan (28 docs).
+
+| Akuma subsystem | fixes | % |
+|---|---:|---:|
+| Syscall / ABI compatibility | 245 | 16.5 |
+| Memory & virtual memory | 177 | 12.0 |
+| Boot & drivers | 141 | 9.5 |
+| Scheduler & process management | 139 | 9.4 |
+| SMP & locking | 136 | 9.2 |
+| VFS & filesystem | 134 | 9.0 |
+| Networking | 95 | 6.4 |
+| Toolchain & self-hosting | 91 | 6.1 |
+| Misc / cross-cutting | 64 | 4.3 |
+| Console & terminal | 58 | 3.9 |
+| Containers | 56 | 3.8 |
+| Userspace apps & libraries | 40 | 2.7 |
+| Signals & exceptions | 40 | 2.7 |
+| SSH | 39 | 2.6 |
+| Rump kernel & syscall proxy | 26 | 1.8 |
+| **Akuma total** | **1,481** | |
+
+| Taoxichuan subsystem | fixes | % |
+|---|---:|---:|
+| Syscalls, files & pipes | 37 | 35.2 |
+| Processes, fork, threads & scheduling | 33 | 31.4 |
+| SMP, time & boot | 9 | 8.6 |
+| Exec & ELF loading | 8 | 7.6 |
+| Memory & copy-on-write | 6 | 5.7 |
+| Signals | 5 | 4.8 |
+| Networking & readiness | 4 | 3.8 |
+| Build & integration | 3 | 2.9 |
+| **Taoxichuan total** | **105** | |
+
+**This branch fixed 116**: all 105 of Taoxichuan's (the kernel exists only here), plus **11 in Akuma**. Akuma's
+list on `main` reads 1,470; on this branch, 1,481:
+
+| Akuma subsystem | `main` | branch | the fixes |
+|---|---:|---:|---|
+| Syscall / ABI compatibility | 242 | 245 | `dup`/`F_DUPFD` dropped `O_NONBLOCK` (tokio's signal driver blocked); `pidfd_open` flags and close-on-exec; `rt_sigpending` served by no kernel |
+| Misc / cross-cutting | 59 | 64 | `SIG_UNBLOCK` left a stray SIGKILL/SIGSTOP bit; `akuma-pmm`'s CoW table a heap node per shared frame; a `kvm0` guest disk read as 856 MiB (herd reload race); the audit scanner swallowed code after a gated last field; amd64 self-test build broken since the boot-kit extraction |
+| Memory & virtual memory | 176 | 177 | `kvm0` guest RAM capped at 1 GiB (one NPT directory) |
+| Networking | 94 | 95 | in-tree virtio-net sent frames without the `virtio_net_hdr` (DHCP never answered) |
+| Containers | 55 | 56 | every amd64 `box run` failed to spawn (glue's `exec` feature gated to AArch64) |
+| **Total** | **1,470** | **1,481** | **+11**, from 9 docs (406 -> 415) |
+
+All 11 turned up in Taoxichuan work: running a second kernel on the same crates, growing its VMs, measuring it.
+**Five were bugs in `main`'s code**, which every Akuma kernel carries until this branch merges: `dup`'s lost
+`O_NONBLOCK`, `pidfd_open`, the missing `rt_sigpending`, the CoW table and the 1 GiB guest-RAM cap. **Six were in code
+this branch wrote**, caught and fixed before it reaches `main`: the `box run` regression (`3e2bb725`, the
+one-ELF-loader step), the in-tree virtio-net header, the amd64 self-test build, `SIG_UNBLOCK` in the newly extracted
+`akuma-syscalls-signal`, the herd reload race in the new `boot_dev.sh`, and the audit scanner.
+- Two thirds of Taoxichuan's bugs (70 of 105) are in syscalls/files/pipes and processes/threads/scheduling. 59 of
+  the 105 come from one document, the experiment's agent log
+  ([`MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md`](MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md)).
+
+## Crates: `main` vs this branch (2026-11-02)
+
+Counted as directories under `crates/` with a `Cargo.toml`; "forbids `unsafe`" = `#![forbid(unsafe_code)]` in its
+`src/lib.rs`. (`docs/reference/crate-safety.md` counts differently; these two columns compare with each other.)
+
+| | `main` | branch | change |
+|---|---:|---:|---:|
+| crates in `crates/` | 98 | 117 | +19, none removed |
+| of which forbid `unsafe` | 82 | 97 | +15 |
+| kernel roots | `src/` (AArch64), `amd64/` | + `taoxichuan/` (19 lines), `osaka/` (10 lines) | +2 |
+
+The 19 new crates, by size (raw lines of `.rs`, tests and comments included):
+
+| crate | lines | `unsafe`? | what it is |
+|---|---:|---|---|
+| `akuma-tokio-kernel-amd64` | 6,134 | yes | the whole amd64 tokio kernel (was `taoxichuan/src`) |
+| `akuma-boot-amd64` | 969 | yes | the boot kit: PVH/multiboot2 entry, the physmap, kernel page tables, heap + PMM |
+| `akuma-ring3-amd64` | 920 | yes | ring 3: ET_EXEC parsing, the initial user stack, the syscall/sysret transitions |
+| `akuma-virtqueue` | 886 | no | the driver side of virtio-mmio as pure decisions (registers, negotiation, split virtqueue); replaced `virtio-drivers` |
+| `akuma-syscalls-glue-amd64` | 706 | no | the x86_64 syscall ABI over the shared glue for the fd family and x86-only time calls |
+| `akuma-sched-amd64` | 569 | yes | the scheduler's machine half: per-slot page-table root, trap stack, user context, FP state |
+| `akuma-lapic-amd64` | 566 | no | the LAPIC timer, EOI, PIT calibration, TSC rate |
+| `akuma-elf-exec` | 525 | no | the pure exec decisions for an ELF image: interpreter, load placement, entry |
+| `akuma-user-tree` | 512 | no | copy-on-write fork decisions over a 4-level user page-table tree |
+| `akuma-user-layout` | 505 | no | the layout of a user address space: valid regions, brk window, mmap slab |
+| `akuma-syscalls-signal` | 384 | no | signal bookkeeping: the `rt_sigaction` table, mask algebra |
+| `akuma-runtime-tokio` | 322 | no | the syscall surface a tokio program needs, as one dependency |
+| `akuma-fpu-amd64` | 274 | no | the FPU save area as pure byte algebra (fxsave/xsave layout, power-on image) |
+| `akuma-user-walk` | 241 | no | user-memory access by page walk: region check, chunked copies, string readers |
+| `akuma-syscalls-eventfd` | 234 | no | the `eventfd(2)` state machine |
+| `akuma-syscalls-proc` | 222 | no | the process family's pure decisions: clone flags, exit, wait status |
+| `akuma-comconsole` | 199 | no | the 16550 COM-port boot console |
+| `akuma-affinity` | 135 | no | the pure half of `sched_setaffinity`/`sched_getaffinity` |
+| `akuma-tokio-kernel` | 55 | no | `entry!` and the `Kernel` builder |
+
+15 of the 19 forbid `unsafe`; the four that cannot are the amd64 machine layer (boot, ring 3, the scheduler's machine
+half) and the kernel crate that drives it.
+
+**Nothing fell out.** Of the 117, 116 are in at least one kernel's default build (`cargo tree -e normal,build` of
+`akuma` for `aarch64-unknown-none` and `akuma-amd64`, `taoxichuan`, `osaka` for `x86_64-unknown-none`; with
+`--all-features` the set is the same). The one that is in none is `akuma-scheduler`, by design: the scheduling-policy
+simulator, a host tool (`sched-sim`) that ranks candidates before they go into a kernel.
+
 ## Facts re-measured 2026-11-02 (after B15: the kernel is a crate)
 
 The "before and after" table above supersedes this section's numbers for slides; the 11-01 and 10-30 sections stay

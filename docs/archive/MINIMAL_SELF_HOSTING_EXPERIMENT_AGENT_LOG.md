@@ -2393,3 +2393,44 @@ the talk doc's "Facts re-measured 2026-11-02" ([`RUST_ORG_IL_TALK.md`](RUST_ORG_
   slept on the way home. The staged tree has no `.git`, so that run's kernels call themselves `unknown`, and the
   Mac image's nightly is not the ryzen's, so K1 is not the KVM `5f568279...`; the script now sets
   `AKUMA_SHA_OVERRIDE` for later runs ([`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md), "Under TCG").
+
+### 2026-11-02: post cleanup verification
+
+The cleanup (A1-B15 on Opus, `TAOXICHUAN_CLEANUP_PLAN.md`) turned Taoxichuan into a 19-line `main.rs` over
+`akuma-tokio-kernel`. Three checks that the result still does what the experiment's kernel did, by other hands:
+
+**1. It still builds itself.** B15 (`961a77be`) K1 == K2 under Pop's Linux KVM (`5f568279...`, finished by goose on the
+box) and under QEMU TCG on the Mac with no hardware hypervisor (`b0c08970...`, `fp_tcg.py`); both in
+[`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md).
+
+**2. An open model can build a new kernel from the crate's README alone.** GLM (goose 1.52.0, `glm-5.3-flash`, low
+effort) was given `scripts/kvm/goose/shanghai-01-new-kernel.md`: build **Shanghai** from
+`crates/akuma-tokio-kernel/README.md`, with an ASCII skyline banner, through six gates. It ran on the ryzen booted into
+**Akuma on bare metal** (KVM-herd entry; guests under Akuma's own SVM hypervisor), unattended, with a supervisor prompt
+of machine facts (no QEMU, one guest at a time, which services not to touch, commit but do not push).
+
+| | |
+|---|---|
+| wall time | 48 min (18:38:35 -> 19:26:41Z), goose exited 0 |
+| result | all six gates pass: build, minimal image, boot (banner, 0 faults), `Linux shanghai` over ssh, `tokioprobe` `RESULT PASS` at 1 and 4 workers, goose -> GLM `PONG` from inside the guest |
+| what it wrote | `shanghai/` (`main.rs` 18 lines, `build.rs`, `Cargo.toml`, the banner, `RESULT.md`) + the `members` line + `Cargo.lock`; 8 commits on `shanghai`, relayed to litter by the supervisor (the box has no GitHub credentials) |
+| tokens (goose's session ledger) | **8.38M**: 8.30M input (8.16M of it, 98%, cache reads), 79K output; 124 model calls, 123 tool calls (117 shell, 5 write, 1 edit); ~$0.31 at the ledger's Flash average ($0.0365/M). The in-guest `PONG` is a separate few-thousand-token session in the guest's own ledger |
+| docs read | **two**: the brief and the README, each once, at the start. No file under `docs/` was opened. Code read: Osaka's three files, `taoxichuan_goose_image.sh`, `fp_metal.py`, tokioprobe's and nettest's `build-musl.sh`, sshd's `Cargo.toml` |
+
+Its `RESULT.md` lists 14 places where the README and its scripts did not fit this machine, all worked around in place:
+Akuma has no `ssh-keygen` (it derived the ed25519 public line in Python and checked it against the box's own key),
+no `rustup` or musl-cross (it wrapped the Gentoo musl gcc for `build-musl.sh`), no xattr syscalls (`mke2fs -d` needed
+an `LD_PRELOAD` stub), no block-device nodes (the goose-image script's `debugfs` on the raw partition became `cp`
+from the live root), and an Akuma-ABI `/bin/sshd` the guest cannot run; Akuma's `ssh` takes no `-o`; the README's
+`tokioprobe ... 300` is the rig's timeout, not an argument; a one-core spec must change `smp=` inside `cmdline=`.
+Two habits to note: it reused the box's `/root/.ssh/id_ed25519` as the login key (and found it is the same keypair as
+the box's sshd host key), and the gate-6 image carries the z.ai token by the script's design (it stays on the box).
+
+**3. Independent verification on the Mac.** The `shanghai` branch (`d4a6c7d9`) checked out here: only the allowed
+files changed; `build.rs` is the README's linker-script relay (identical to Osaka's); banner 19 lines, 75 columns,
+ASCII. `cargo build` and `cargo clippy -p shanghai --target x86_64-unknown-none --release`: no warnings. Under TCG
+(`tcg_rig.py`) on the from-scratch Osaka image: banner, `smp: 4 of 4`, 0 faults, `Linux shanghai 0.1.0-d4a6c7d9-shanghai`,
+`tokioprobe` `RESULT PASS` at `smp=1` and `smp=4`; on the goose image at `smp=4`: **battery 10/10 including goose ->
+GLM `PONG`, 0 console faults**.
+
+The banner reads as a skyline only once you know which tower is which; the user will iterate on it with GLM.

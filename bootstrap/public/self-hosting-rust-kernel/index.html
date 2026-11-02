@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Self-hosting a Rust kernel</title>
+<style>
+  /* ─────────────────────────────────────────────────────────────
+     Committed single-theme deck (projected, so dark is the design,
+     not a preference). Every colour is painted explicitly.
+       ground  sumi-indigo         ink   bone
+       shu     朱色 vermilion       ai    pale indigo
+     Type carries the split the talk is about:
+       mono  = anything measured        serif = anything argued
+     ───────────────────────────────────────────────────────────── */
+  :root {
+    --ground:   #12141b;
+    --panel:    #191d26;
+    --rule:     #2b3140;
+    --rule-soft:#21262f;
+    --ink:      #e8e6e1;
+    --ink-2:    #b6bac3;
+    --dim:      #8b929f;
+    --shu:      #e2553c;
+    --shu-soft: rgba(226, 85, 60, 0.13);
+    --ai:       #7a9cc6;
+
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+
+    --pad: clamp(1.4rem, 4.5vw, 5.5rem);
+    --rail: clamp(2.5rem, 4.5vw, 4.5rem);
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--serif);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── deck mechanics ─────────────────────────────────────────── */
+  .deck {
+    height: 100dvh;
+    overflow-y: auto;
+    scroll-snap-type: y mandatory;
+    scroll-behavior: smooth;
+    scrollbar-width: none;
+  }
+  .deck::-webkit-scrollbar { display: none; }
+  @media (prefers-reduced-motion: reduce) { .deck { scroll-behavior: auto; } }
+
+  .slide {
+    min-height: 100dvh;
+    scroll-snap-align: start;
+    scroll-snap-stop: always;
+    display: grid;
+    grid-template-columns: var(--rail) 1fr;
+    align-items: center;
+    border-bottom: 1px solid var(--rule-soft);
+    padding: clamp(2rem, 5vh, 4.5rem) var(--pad) clamp(2rem, 5vh, 4.5rem) 0;
+  }
+  .num {
+    align-self: stretch;
+    padding: clamp(2rem, 5vh, 4.5rem) clamp(0.6rem, 1.4vw, 1.3rem) 0 0;
+    border-right: 1px solid var(--rule-soft);
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.14em;
+    color: var(--dim);
+    text-align: right;
+  }
+  .body {
+    padding-left: clamp(1rem, 2.4vw, 2.4rem);
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: clamp(0.85rem, 2vh, 1.6rem);
+  }
+
+  /* ── type ───────────────────────────────────────────────────── */
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--shu);
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+  }
+  .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
+  .eyebrow.cool { color: var(--ai); }
+
+  h1 {
+    font-family: var(--serif);
+    font-weight: 400;
+    font-size: clamp(2.1rem, 5.4vw, 4.6rem);
+    line-height: 1.0;
+    letter-spacing: -0.022em;
+    text-wrap: balance;
+    margin: 0;
+  }
+  h1 .n600 { color: var(--shu); font-style: italic; }
+  h2 {
+    font-family: var(--serif);
+    font-weight: 400;
+    font-size: clamp(1.6rem, 3.5vw, 2.9rem);
+    line-height: 1.07;
+    letter-spacing: -0.017em;
+    text-wrap: balance;
+    margin: 0;
+    max-width: 32ch;
+  }
+  h2 em { font-style: italic; color: var(--shu); }
+  h2 .cool { font-style: italic; color: var(--ai); }
+
+  p { font-size: clamp(0.98rem, 1.2vw, 1.14rem); line-height: 1.55; color: var(--ink-2); max-width: 62ch; margin: 0; }
+  p strong, li strong { color: var(--ink); font-weight: 600; }
+  em.q { color: var(--shu); font-style: italic; }
+  code, .m { font-family: var(--mono); font-size: 0.87em; color: var(--ink); font-variant-numeric: tabular-nums; }
+
+  .byline {
+    font-family: var(--mono);
+    font-size: clamp(0.68rem, 0.9vw, 0.8rem);
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin: 0;
+    padding-top: clamp(0.4rem, 1.2vh, 0.9rem);
+    border-top: 1px solid var(--rule-soft);
+    max-width: 22rem;
+  }
+  .sub {
+    font-family: var(--mono);
+    font-size: clamp(0.78rem, 1.1vw, 1rem);
+    letter-spacing: 0.02em;
+    color: var(--ai);
+    margin: 0;
+  }
+  ul { margin: 0; padding-left: 1.15rem; display: flex; flex-direction: column; gap: 0.5rem; }
+  li { font-size: clamp(0.95rem, 1.15vw, 1.08rem); line-height: 1.5; color: var(--ink-2); max-width: 60ch; }
+  li::marker { color: var(--shu); }
+
+  .pull {
+    font-family: var(--serif);
+    font-size: clamp(1.2rem, 2.2vw, 1.85rem);
+    line-height: 1.22;
+    letter-spacing: -0.012em;
+    color: var(--ink);
+    margin: 0;
+    max-width: 36ch;
+    text-wrap: balance;
+    border-top: 2px solid var(--shu);
+    padding-top: clamp(0.7rem, 1.6vh, 1.1rem);
+  }
+  .pull.cool { border-top-color: var(--ai); }
+  /* .pull is a 36ch block, so pushing it right needs the BOX moved (margin-left:auto)
+     as well as the text aligned -- text-align alone leaves it hugging the left. */
+  .pull.right { margin-left: auto; text-align: right; }
+
+  /* a quote is a .pull that is someone else's words, so it reuses it */
+  blockquote.quote { margin: 0; }
+  blockquote.quote .pull { font-style: italic; }
+  blockquote.quote cite {
+    display: block;
+    margin-top: clamp(0.5rem, 1.3vh, 0.85rem);
+    font-family: var(--mono);
+    font-style: normal;
+    font-size: clamp(0.66rem, 0.9vw, 0.78rem);
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  /* ── data ───────────────────────────────────────────────────── */
+  .scroller { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 26rem;
+    font-family: var(--mono);
+    font-size: clamp(0.7rem, 0.92vw, 0.84rem);
+    font-variant-numeric: tabular-nums;
+  }
+  th {
+    text-align: left; font-weight: 500; text-transform: uppercase;
+    letter-spacing: 0.11em; font-size: 0.64rem; color: var(--dim);
+    padding: 0 0.85rem 0.55rem 0; border-bottom: 1px solid var(--rule); vertical-align: bottom;
+  }
+  td { padding: 0.58rem 0.85rem 0.58rem 0; border-bottom: 1px solid var(--rule-soft); color: var(--ink-2); vertical-align: top; }
+  th:last-child, td:last-child { padding-right: 0; }
+  tr.self td { color: var(--ink); background: var(--shu-soft); }
+  tr.self td:first-child { box-shadow: inset 3px 0 0 var(--shu); padding-left: 0.65rem; }
+  .hot { color: var(--shu); }
+
+  pre {
+    font-family: var(--mono);
+    font-size: clamp(0.68rem, 0.9vw, 0.82rem);
+    line-height: 1.75;
+    color: var(--ink-2);
+    background: var(--panel);
+    border: 1px solid var(--rule-soft);
+    border-left: 2px solid var(--shu);
+    padding: clamp(0.7rem, 1.6vw, 1.1rem);
+    margin: 0;
+    overflow-x: auto;
+  }
+  pre .d { color: var(--dim); }
+  pre .out { color: var(--shu); }
+
+  .figs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(8.5rem,100%),1fr)); gap: 1px; background: var(--rule-soft); border: 1px solid var(--rule-soft); }
+  .fig { background: var(--panel); padding: clamp(0.75rem, 1.7vw, 1.15rem); }
+  .fig .v { display: block; font-family: var(--mono); font-size: clamp(1.2rem, 2.5vw, 1.85rem); letter-spacing: -0.03em; color: var(--ink); line-height: 1.05; font-variant-numeric: tabular-nums; }
+  .fig .v.hot { color: var(--shu); }
+  .fig .k { display: block; margin-top: 0.45rem; font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.13em; text-transform: uppercase; color: var(--dim); }
+  /* .body is a flex column with a uniform gap, so a figure row and the prose
+     under it read as two unrelated blocks. .group re-parents them with a
+     SMALLER gap than .body's, which binds them by proximity, and a shared
+     max-width so the panel row and the text share one measure. */
+  .group { display: flex; flex-direction: column; gap: clamp(0.45rem, 1vh, 0.75rem); max-width: 62ch; }
+  .group > p { margin: 0; }
+
+  /* ── opener ─────────────────────────────────────────────────── */
+  .hero { display: grid; grid-template-columns: 1fr; gap: clamp(1.2rem, 3vw, 2.5rem); align-items: center; }
+  @media (min-width: 60rem) { .hero { grid-template-columns: 1.35fr 0.65fr; } }
+  .hero img {
+    width: 100%; height: auto; display: block;
+    border: 1px solid var(--rule);
+    filter: saturate(0.92) contrast(1.02);
+  }
+  .hero figure { margin: 0; }
+  .hero figcaption { font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); margin-top: 0.55rem; }
+
+  /* ── inline figure, for slides that are not the opener ──────── */
+  .shot { margin: 0; width: clamp(14rem, 30vw, 26rem); max-width: 100%; }
+  .shot img { width: 100%; height: auto; display: block; border: 1px solid var(--rule); filter: saturate(0.92) contrast(1.02); }
+  .shot figcaption { font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); margin-top: 0.55rem; }
+
+  /* ── overview: prose + figures left, mark + link right ──────── */
+  .split { display: grid; grid-template-columns: 1fr; gap: clamp(1.1rem, 2.8vw, 2.4rem); align-items: start; }
+  @media (min-width: 60rem) { .split { grid-template-columns: minmax(0, 1fr) auto; } }
+  /* .even -- both columns carry prose/tables, so neither may size to content */
+  @media (min-width: 60rem) { .split.even { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+  .split .col { display: flex; flex-direction: column; gap: clamp(0.8rem, 1.9vh, 1.4rem); min-width: 0; }
+  .mark { display: flex; flex-direction: column; gap: clamp(0.7rem, 1.8vh, 1.1rem); width: clamp(12rem, 22vw, 20rem); max-width: 100%; }
+  pre.logo {
+    background: none; border: 0; padding: 0; margin: 0; overflow: visible;
+    color: var(--shu);
+    font-size: clamp(0.4rem, 0.95vw, 0.8rem);
+    line-height: 1.05;
+    white-space: pre;
+  }
+  /* dense stats table — 13 rows have to share a slide with everything else */
+  table.dense td { padding-top: 0.3rem; padding-bottom: 0.3rem; }
+  .link { font-family: var(--mono); font-size: clamp(0.66rem, 0.9vw, 0.78rem); letter-spacing: 0.05em; margin: 0; }
+  .body a { color: var(--ai); text-decoration-color: var(--rule); text-underline-offset: 0.22em; }
+  .body a:hover { color: var(--shu); text-decoration-color: var(--shu); }
+  .body a:focus-visible { outline: 1px solid var(--ai); outline-offset: 2px; }
+  th.r, td.r { text-align: right; }
+
+  /* ── rail ───────────────────────────────────────────────────── */
+  .rail { position: fixed; left: 0; top: 0; bottom: 0; width: var(--rail); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.4rem; z-index: 20; pointer-events: none; }
+  .rail button { pointer-events: auto; appearance: none; background: none; border: 0; padding: 0; width: 1rem; height: 0.58rem; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+  .rail button::before { content: ""; width: 0.6rem; height: 1px; background: var(--rule); transition: background 160ms ease, width 160ms ease; }
+  .rail button:hover::before { background: var(--ink-2); width: 0.9rem; }
+  .rail button[aria-current="true"]::before { background: var(--shu); width: 1rem; height: 2px; }
+  .rail button:focus-visible { outline: 1px solid var(--ai); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { .rail button::before { transition: none; } }
+
+  .hint { position: fixed; right: var(--pad); bottom: clamp(0.8rem, 2vh, 1.4rem); font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.13em; text-transform: uppercase; color: var(--dim); z-index: 20; pointer-events: none; }
+  .hint kbd { font-family: var(--mono); border: 1px solid var(--rule); padding: 0.08rem 0.28rem; color: var(--ink-2); }
+
+  @media (max-width: 44rem) {
+    .slide { grid-template-columns: 1fr; padding-left: var(--pad); }
+    .num { display: none; }
+    .body { padding-left: 0; }
+    .hint { display: none; }
+    .rail { width: auto; left: auto; right: 0; padding-right: 0.45rem; }
+  }
+
+  /* ── print / PDF ────────────────────────────────────────────────
+     One 16:9 page per slide, with the navigation rail and keyboard
+     hint dropped: nothing in a PDF can be clicked or arrowed through.
+
+     Cmd-P will still not match the screen, and it cannot be made to.
+     Chrome lays print media out at a ~800px viewport whatever the
+     @page size says — measured with a breakpoint probe at both
+     1280x720px and 2276x1280px, and --window-size does not move it —
+     so every `min-width: 60rem` rule below loses and the two-column
+     slides paginate as the mobile stack. For a faithful PDF use
+     `scripts/render_deck_pdf.py`, which captures each slide in screen
+     media at 1280x720 instead.
+     ─────────────────────────────────────────────────────────────── */
+  @media print {
+    @page { size: 1280px 720px; margin: 0; }
+    /* the deck's dark ground is the design, not a preference — keep it */
+    * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+
+    .rail, .hint { display: none !important; }
+
+    /* drop the scroll-snap viewport; let the pages stack */
+    html, body { height: auto !important; overflow: visible !important; }
+    .deck { height: auto !important; overflow: visible !important; scroll-snap-type: none !important; }
+
+    .slide {
+      height: 720px; min-height: 0;
+      break-after: page; break-inside: avoid;
+      overflow: hidden;
+      border-bottom: 0;
+    }
+    .slide:last-child { break-after: auto; }
+
+    /* no horizontal scroll on paper — a clipped table would lose data */
+    .scroller { overflow: visible !important; }
+    table { min-width: 0; }
+  }
+
+  /* ── meme placeholder (until the image lands) ───────────────── */
+  .hero .placeholder {
+    aspect-ratio: 4 / 5;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px dashed var(--rule);
+    background: var(--panel);
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+</style>
+</head>
+<body>
+
+<div class="rail" id="rail" aria-label="Slide navigation"></div>
+
+<main class="deck" id="deck">
+
+  <!-- 01 -->
+  <section class="slide">
+    <div class="num">01</div>
+    <div class="body">
+      <div class="hero">
+        <div style="display:flex;flex-direction:column;gap:clamp(0.9rem,2.4vh,1.8rem)">
+          <p class="eyebrow">Akuma OS</p>
+          <h1>Self-hosting a <span class="n600">Rust kernel</span></h1>
+          <p class="sub">the memes were right</p>
+          <p class="byline">Kirill Maksimov &middot; <span class="m">rust.org.il</span></p>
+        </div>
+        <figure>
+          <div class="placeholder" role="img" aria-label="Placeholder for the opening meme">meme goes here</div>
+          <figcaption>caption goes here</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+
+<p class="hint"><kbd>↑</kbd> <kbd>↓</kbd> to navigate</p>
+
+<script>
+(function () {
+  var deck = document.getElementById('deck');
+  var rail = document.getElementById('rail');
+  var slides = Array.prototype.slice.call(deck.querySelectorAll('.slide'));
+  var current = 0;
+
+  slides.forEach(function (s, i) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.setAttribute('aria-label', 'Go to slide ' + (i + 1) + ' of ' + slides.length);
+    b.addEventListener('click', function () { go(i); });
+    rail.appendChild(b);
+  });
+  var ticks = Array.prototype.slice.call(rail.children);
+
+  function mark(i) {
+    if (i === current) return;
+    current = i;
+    ticks.forEach(function (t, n) { t.setAttribute('aria-current', n === i ? 'true' : 'false'); });
+  }
+  function go(i) {
+    i = Math.max(0, Math.min(slides.length - 1, i));
+    slides[i].scrollIntoView({ block: 'start' });
+    mark(i);
+  }
+
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting && e.intersectionRatio > 0.5) mark(slides.indexOf(e.target));
+      });
+    }, { threshold: [0.5, 0.75] });
+    slides.forEach(function (s) { io.observe(s); });
+  }
+  ticks[0].setAttribute('aria-current', 'true');
+
+  document.addEventListener('keydown', function (e) {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    var k = e.key;
+    if (k === 'ArrowDown' || k === 'ArrowRight' || k === 'PageDown' || k === ' ') { e.preventDefault(); go(current + 1); }
+    else if (k === 'ArrowUp' || k === 'ArrowLeft' || k === 'PageUp') { e.preventDefault(); go(current - 1); }
+    else if (k === 'Home') { e.preventDefault(); go(0); }
+    else if (k === 'End') { e.preventDefault(); go(slides.length - 1); }
+  });
+})();
+</script>
+</body>
+</html>
