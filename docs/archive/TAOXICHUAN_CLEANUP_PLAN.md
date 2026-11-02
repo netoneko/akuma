@@ -165,11 +165,12 @@ to the arch crate behind `X86ArchHooks`.
 | B12 | AArch64's slot table out of `akuma-threading`'s `cfg` blocks behind the same interface |
 | B13 | docs sweep (2i), `crate-safety.md` regenerated; `BUG_FIX_LIST.md` at branch close |
 | B14 | fixed point again |
+| B15–B21 | a whole kernel from one short file: `akuma-tokio-kernel` on top of `akuma-runtime-tokio`, features `console`, `disk`, `net`, `kernel` (memory, procs, signals, cpu), `smp`, with default implementations; Taoxichuan's `src/` becomes one file of at most 100 lines, then an aarch64 half after B12 ([`proposals/B15_TOKIO_KERNEL_KIT.md`](../../proposals/B15_TOKIO_KERNEL_KIT.md)) |
 
 Alongside: `.clone()` and `mut` budgets on the `unsafe` budget's model (`scripts/check_unsafe_budget.py`), after an
 audit of unneeded clones in both x86 kernels and their linked crates.
 
-**After B14: an `unsafe` pass** (decided 2026-11-01). Not before: the steps above delete code and move state, and
+**After B14: an `unsafe` pass** (decided 2026-11-01; moved after B19 on 2026-11-02, since B15–B19 move state again). Not before: the steps above delete code and move state, and
 both change where `unsafe` sits. Levers, as discussed (482 production sites across amd64, Taoxichuan and their
 crates; 789 of Taoxichuan's 1,669 image `unsafe` lines are third-party):
 
@@ -267,6 +268,7 @@ passes `epoch=`. Without it the guest clock reads 1970 and every TLS client refu
 | B12 plan | (this commit) | - | Not started: the step moves the AArch64 scheduler's switch out of `akuma-threading`'s default path, so it is written down first, in five separately gated steps (characterize both pickers, one picker with pinned policy fields, one `ArchHooks`, move the AArch64 effects to `akuma-sched-aarch64`, delete the `cfg` blocks), with the SMP stress each step needs and two open questions. Proposal: [`proposals/B12_AARCH64_SLOT_TABLE.md`](../../proposals/B12_AARCH64_SLOT_TABLE.md) |
 | B13: docs sweep (2i) | (this commit) | - | `taoxichuan/docs` rewritten to the tree after B11: `reference/syscalls.md` is the dispatch order (legacy fold, console intercept, `akuma-runtime-tokio`, local arms), the allow-list's groups and the 16 local arms, where it was a per-call table of about 100 rows, most of which had become glue's; `processes.md` (init, fork/threads/exec/exit through `akuma-exec`, glue's `wait4`, address-space lifetime), `gaps.md` (G1/G3-G6/G9 closed by earlier steps and dropped; open: G2, G7, G8, eager `mmap`, `PROT_READ`/`PROT_NONE`, `sendfile`, the full process table, inode times), `memory.md`, `scheduling.md`, `boot.md`, both READMEs and both runbooks (`gates.md` is now the TCG rig, the leak gate, the probes and the ryzen). `rust-toolchain.md`, `rust-syscalls.md` and `switch-to-crates.md` moved to `docs/archive/` (`TAOXICHUAN_RUST_TOOLCHAIN_INVENTORY.md`, `TAOXICHUAN_RUST_SYSCALLS_CENSUS_PN.md`, `TAOXICHUAN_SWITCH_TO_CRATES.md`), references fixed. Diagram sources synced with their inline copies (the memory map's `brk` slab said 64 MiB; it is 256). New reference doc `docs/reference/subsystems/syscalls/runtime-tokio.md`. Dead names in Taoxichuan's comments (the M2 crossing, `exec_replace`, `wait4_real`, `OUT_CAP`, "eager" fork, "no signals", "one core"), and `load_task`'s doc comment, which had been stranded on `clone_user_half`; no code changed. `crate-safety.md` regenerated: 86 of 115 crates forbid, 368 production sites. Pre-commit hook green |
 | B14: fixed point again | (this commit) | - | `ade75544` under Pop's Linux KVM on the ryzen, new `scripts/kvm/taoxichuan/fp_pop.py` (`fp_metal.py`'s procedure on `tx-pop.sh`): K1 == K2 = `6343290ae3a631eba40cce8491e0254e`, 2,291,536 bytes, 476 s / 471 s builds, no fault lines ([`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md) § After the cleanup). Bare metal under Akuma's hypervisor still to repeat when the ryzen boots Akuma |
+| B15–B21 plan | (this commit) | - | Proposal only: `proposals/B15_TOKIO_KERNEL_KIT.md`. A crate on top of `akuma-runtime-tokio` that wires a whole kernel, so a root is one `main.rs` of 20–100 lines for amd64 or aarch64; each part of Taoxichuan's machine becomes a feature with a default implementation |
 
 ## Background
 

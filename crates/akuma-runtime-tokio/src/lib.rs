@@ -1,8 +1,9 @@
 //! The syscall surface a tokio program needs, as one dependency.
 //!
 //! A composition root that depends on this crate runs tokio: "this kernel runs
-//! tokio" is a dependency, not a port (`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`,
-//! Phase 3; the analysis is `docs/archive/AKUMA_SYSCALLS_TOKIO_DEP_ANALYSIS.md`).
+//! tokio" is a dependency that ensures Linux binary compatibility
+//! (`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`, Phase 3; the analysis is
+//! `docs/archive/AKUMA_SYSCALLS_TOKIO_DEP_ANALYSIS.md`).
 //! It owns three things:
 //!
 //! - **The allow-list** ([`served_by_glue`]): which calls `akuma-syscalls-glue`

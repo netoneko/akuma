@@ -4,7 +4,7 @@
 > census, but a second consumer has not tried it yet).
 
 A composition root that depends on `crates/akuma-runtime-tokio` runs tokio: "this kernel runs tokio" is a
-dependency, not a port. The crate is a **surface**, not a family: it implements no syscall. It decides which of
+dependency that ensures Linux binary compatibility. The crate is a **surface**, not a family: it implements no syscall. It decides which of
 `akuma-syscalls-glue`'s calls a kernel serves and sets glue up to serve them. Source:
 `crates/akuma-runtime-tokio/src/lib.rs`.
 
