@@ -38,4 +38,4 @@ Found on the way: the trace build's idle-lap hang dump ran on every idle core wi
 
 ## Open
 `prepare_task_slot` and the user-context record are still Taoxichuan's own (`child.rs`); adopting the crate's needs the slot's `CrossSave` and bands to become the per-thread record, which is the end of the
-nested-crossing model (`switch-to-crates.md` S3). `init` (`sched::init`: record the kernel root, pin the boot thread, adopt it) is not extracted yet on either kernel.
+nested-crossing model (`TAOXICHUAN_SWITCH_TO_CRATES.md` S3). `init` (`sched::init`: record the kernel root, pin the boot thread, adopt it) is not extracted yet on either kernel.

@@ -63,7 +63,7 @@ pub fn set_current_slot(slot: usize) {
 // ── the X86ArchHooks bodies (the per-core machine effects) ──────────────────
 
 /// The idle thread's tid: outside the spawn ring (children claim 1..NSLOTS,
-/// the shell is 0), so no array index collides. Its stack is leaked once,
+/// the boot thread is 0), so no array index collides. Its stack is leaked once,
 /// below; its CR3 is the kernel's (sched_root_of answers 0).
 pub const IDLE_TID: usize = crate::child::NSLOTS;
 
@@ -146,13 +146,9 @@ fn seed_idle() {
     akuma_threading::x86_publish(IDLE_TID);
 }
 
-/// `X86ArchHooks::allow_tick` — the frozen-clock escape, real: open a
-/// one-instruction interrupt window, then mask again. Meaningless without a
-/// tick; this kernel has one now (session pb). Nothing calls it until
-/// blocking syscalls arrive (slice 3) — a kernel that runs IF=0 everywhere
-/// already gets its ticks in ring 3.
 /// The idle loop's clock feeder — the same one-instruction window
-/// [`allow_tick`] opens, under a name the idle thread can reach.
+/// `X86ArchHooks::allow_tick` opens (`sched::Tx`), under a name the idle
+/// thread can reach.
 pub fn tick_window() {
     // One instruction wide, and the tick handler is bounded, so the worst a
     // tick in the window does is count.
@@ -349,7 +345,7 @@ fn exec_runtime() -> ExecRuntime {
         // sysrets. Never returns (the child lives in ring 3; its syscalls
         // come back through the dispatcher).
         enter_user: twin_enter_user,
-        // The fork memory pass: the twin's proven eager-copy walk, INTO the
+        // The fork memory pass: the twin's copy-on-write clone, INTO the
         // child's fresh `UserAddressSpace` root.
         fork_share_memory: twin_fork_share_memory,
         // The child's CR3 + spawn-row binding — the twin's slot binding.
@@ -357,13 +353,12 @@ fn exec_runtime() -> ExecRuntime {
     }
 }
 
-/// `ExecRuntime::fork_share_memory` — the twin's eager copy, INTO the child
-/// address space `fork_process` step 1 built. The parent's live root (the
-/// shell's, through its shared view) is walked leaf-by-leaf by the twin's
-/// own proven cloner; the child's fresh root gets the kernel half and the
-/// cloned user subtrees. Ledger note: the copied frames are the twin's, not
-/// the crate ledger's — a child `Process::drop` frees only what it tracked.
-/// Bounded by the gate's fork counts; named in RESULT-pd.md.
+/// `ExecRuntime::fork_share_memory` — this kernel's copy-on-write clone, INTO
+/// the child address space `fork_process` step 1 built. The parent's live root
+/// (through its shared view) is walked by `clone_user_half`; the child's fresh
+/// root gets the kernel half and the parent's user leaves, shared
+/// copy-on-write. Ledger note: the shared frames are this kernel's, not the
+/// crate ledger's — a child `Process::drop` frees only what it tracked.
 fn twin_fork_share_memory(
     parent: &akuma_exec::process::Process,
     child: &mut akuma_exec::process::Process,
@@ -489,13 +484,17 @@ fn exec_config() -> ExecConfig {
         syscall_debug_info_enabled: false,
         fork_brk_serial_progress: false,
         enable_sgi_debug_prints: false,
-        // The spawn slot's 1 MiB stdout cap IS this kernel's proc-stdout
-        // bound (child.rs OUT_CAP); there is no stdin pump.
+        // A process's captured stdout keeps at most 1 MiB; there is no
+        // stdin pump.
         proc_stdin_max_size: 0,
         proc_stdout_max_size: 1024 * 1024,
-        cow_fork_enabled: false,  // the M2 fork is an eager copy, no CoW
+        // The crate's region-walk CoW does not run: `fork_share_memory`
+        // (`clone_user_half`) shares the parent's leaves copy-on-write itself.
+        cow_fork_enabled: false,
         vfork_fastpath_enabled: false,
-        pthread_kill_eintr_enabled: false, // no signals
+        // A pending `tkill` alone does not interrupt a blocking call: glue-amd64's
+        // `tkill` interrupts the thread itself when the default action kills.
+        pthread_kill_eintr_enabled: false,
         shared_file_pages_enabled: false,  // no file-page cache
     }
 }

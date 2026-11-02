@@ -1,48 +1,62 @@
-# Run the stage gates
+# Run the gates
 
-The gates are the ladder's evidence: each stage's gate is a set of guest
-console lines plus exit codes, collected rotation-proof (herd **replaces**
-`vm-dev.log.old` mid-boot — read slices of the *current* boot, anchored by the
-`epoch=` line or a per-boot timestamp, never the rotated file; measured twice
-2026-10-26, see the `fill_statfs` comment in `src/main.rs`).
+A change to this kernel, or to a crate it composes, is gated on the Mac's QEMU TCG rig first and on the ryzen
+second. Every gate boots a fresh guest; none scores a silent probe as a pass.
 
-## The gates and their vocabulary
+## 1. The TCG rig (Mac, no KVM)
 
-| stage | gate | the line(s) that pass it |
-|---|---|---|
-| 1 | reach init spawn, zero faults | `stage 1 gate reached -- init spawn`; zero `[Fault]`/`PANIC`/`[sig!]` |
-| 2 | static musl hello in ring 3 | `hello exit code 0`, `stage 2 gate reached` |
-| 3 | busybox echo + ls, sequential, byte-identical to the host reference | `stage 3 gate reached -- sequential tasks ran clean`; both exit codes 0 |
-| 4 | sshd serves a session | ssh round trip from the host (`boot_dev.sh` waits for it) |
-| 6/7 | `apk add curl`, then `curl -sS https://example.com` | agent-log stage entries; the `[statfs]` lines carry the anchored `tstamp=` a gate checks against this boot's epoch |
-| M2/P* | pipes, blocking fork, wait4 | the PH result doc's gate list (`docs/archive/TAOXICHUAN_M4_SLICE3_PH_RESULT.md`) |
+`scripts/kvm/taoxichuan/tcg_rig.py` (its docstring has every option). It boots `TX_DISK` through a qcow2
+overlay, so the image is never written; `boot fresh` discards the guest's writes.
 
-The gate runner is `scripts/kvm/goose/run_gates.sh`; per-session briefs live
-beside it (`scripts/kvm/goose/taoxichuan-*.md`).
+```bash
+R=scripts/kvm/taoxichuan/tcg_rig.py
+export TX_DISK=<the battery image> TX_KEY=<its ssh key>
+CON=${TMPDIR:-/tmp}/tx-tcg/console.log
+python3 $R build                                  # no-tests,trace-err: the leak gate reads trace-err's reap lines
+python3 $R boot fresh && python3 $R battery goose  # regression battery + the GLM prompt
+python3 -I scripts/kvm/goose/cow_leak_gate.py --console $CON --key $TX_KEY --port 2244 --cycles 20
+python3 $R stop
+TX_SMP=4 python3 $R boot fresh && python3 $R run /usr/local/bin/tokioprobe 300; python3 $R stop
+TX_DISK=<the toolchain image> python3 $R boot fresh && python3 $R battery toolchain; python3 $R stop
+```
+
+| gate | passes when |
+|---|---|
+| `battery` | every line matches `BATTERY` in the script (quick, F1, PK1, fs, append, dup2-sock, pipeline, apk, git) and `console faults=0`; `goose` adds a GLM round trip over TLS |
+| `cow_leak_gate.py` | the idle machine's free-page count after the rounds equals the baseline exactly (`delta=0`) and `cow_ref_count() == 0` |
+| `tokioprobe` at `smp=1` and `smp=4` | exits 0 with `RESULT PASS` (twice at `smp=4`) |
+| `battery toolchain` | `rustc` and a `cargo build` with a build script succeed with no `LD_LIBRARY_PATH` |
+| signal and process probes (on the image, `/usr/local/bin`) | `pidfdprobe`, `sigsusprobe`, `madvshared`, `decommitprobe`, `killtree 8` and `sh -c "sleep 1 & sleep 2 & wait"` pass at `smp=1` and `smp=4`; `sigprobe` provokes its two pinned faults and nothing else |
+
+Stage files onto an image with `debugfs -w` only while the rig is stopped.
+
+## 2. The ryzen
+
+- **Fixed point**: `scripts/kvm/taoxichuan/fp_metal.py K0 SHA` builds the kernel at `SHA` inside a guest under
+  Akuma's own hypervisor, boots the result and builds again; it passes when K1 == K2 byte for byte
+  (`docs/archive/TAOXICHUAN_FIXED_POINT.md`). Stop herd's `vm-dev` first.
+- **Census**: `scripts/kvm/taoxichuan/census_pop.sh` on Pop, then `census_classify.py OUT UNISTD_64_H`, exits 1 on
+  a call this kernel would not serve ([`../reference/syscalls.md`](../reference/syscalls.md)).
+
+The other ryzen drivers are listed in `scripts/kvm/taoxichuan/README.md`.
 
 ## Reading the console
 
-- `grep -a` is mandatory (QEMU/herd logs contain control bytes; plain grep
-  reads them as binary and prints nothing).
-- `[sc] unhandled <Name> (<nr>)` is a checklist line, not a failure — it says
-  exactly which syscall a stage still needs.
-- `[Fault] ring3 …` killed the task; anything without `ring3` killed the
-  kernel. Both halt the guest.
-- `[cx]`, `[w]`, `[wv]`, `[o]`, `[statfs]`, `[TICK pre/post]` are probes the
-  stages left in on purpose; they are bounded (per-call or per-second) and are
-  part of the evidence, not noise.
+- `grep -a` is mandatory (the console log contains control bytes; plain grep reads it as binary and prints
+  nothing).
+- `[nosys] nr=N` is printed once per unserved number per boot: a checklist line, not a failure. `nr=40`
+  (`sendfile`) is expected ([`../gaps.md`](../gaps.md) G12).
+- `[Fault] ring3 …` ended a task (it gets SIGSEGV, `rc=139`); anything without `ring3` stopped the kernel.
 
 ## Verify
 
-- The gate script's summary lines name PASS/FAIL per gate; a silent probe is
-  never scored a pass (the runner refuses it — same rule as the repo's
-  `mem_suite.py`).
-- For a FAIL, the first `unhandled`/`[Fault]` line at or after this boot's
-  anchor is the cause list; cross-reference `../reference/syscalls.md` for
-  what the number would have needed.
+- The battery prints `RESULT PASS` and exit 0; `cow_leak_gate.py` prints `delta=0 PASS`.
+- `grep -a '\[Fault\]' $CON` shows only the faults a probe provokes on purpose (`sigprobe`'s pinned pair).
+- For a FAIL, the first `[nosys]` or `[Fault]` line after the boot's banner is where to start; cross-reference
+  [`../reference/syscalls.md`](../reference/syscalls.md).
 
 ## Background
 
-`docs/archive/TAOXICHUAN_STAGE6_REST_PLAN.md`,
-`docs/archive/TAOXICHUAN_STAGE7_TRIM_PLAN.md`,
-`docs/archive/TAOXICHUAN_M4_SLICE3_PH_RESULT.md`.
+`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md` (the gates each step ran),
+`docs/archive/TAOXICHUAN_FIXED_POINT.md`, `docs/archive/TAOXICHUAN_COW_FORK.md` (the leak gate),
+`docs/archive/TAOXICHUAN_M4_SLICE3_PH_RESULT.md` (the stage gates before the rigs).

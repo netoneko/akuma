@@ -1,7 +1,7 @@
 # Taoxichuan: the crate-extraction plan (session X10, 2026-10-30)
 
 **Stability: C** — a plan, not an extraction: this session changed no kernel
-code. It extends [`taoxichuan/docs/reference/switch-to-crates.md`](../reference/switch-to-crates.md)
+code. It extends [`TAOXICHUAN_SWITCH_TO_CRATES.md`](TAOXICHUAN_SWITCH_TO_CRATES.md)
 (the process/scheduling switch, slices S0–S7) with the *rest* of the tree; the
 slice table there and the extraction list here are one programme read from two
 ends. Composition rule as applied below: every row says **pulled** (the crate
@@ -270,7 +270,7 @@ counts the same extraction logic produced there.
 
 ## Background
 
-[`switch-to-crates.md`](../reference/switch-to-crates.md) (the process/
+[`TAOXICHUAN_SWITCH_TO_CRATES.md`](TAOXICHUAN_SWITCH_TO_CRATES.md) (the process/
 scheduling switch this extends), [`docs/reference/crate-safety.md`]
 (../../../docs/reference/crate-safety.md) (which crates forbid `unsafe`),
 `docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md` (the incidents that fixed

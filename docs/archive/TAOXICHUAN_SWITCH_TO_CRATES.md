@@ -1,5 +1,7 @@
 # Switch to the standard process slots and scheduler — the target architecture
 
+> **Archived 2026-11-02** from `taoxichuan/docs/reference/switch-to-crates.md`: the decision is carried out. Its slices became steps 2d-2i and A1-A6 of [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md); the process model as it is now is `taoxichuan/docs/reference/processes.md`.
+
 **Stability: C** (a decision doc: the target is decided, the slices are not yet
 executed). Plan: `PLAN-pm.md` at the repo root (session pm). Everything here was
 checked against the tree and `amd64/src/` on 2026-10-29 unless marked UNCHECKED.

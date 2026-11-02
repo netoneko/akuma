@@ -14,8 +14,7 @@ device-uncached) by `map_device`; the virtio slot geometry goes to
 [`crates/akuma-comconsole`](../../../crates/akuma-comconsole), minimal. It is
 the first thing up and the thing everything else reports through (including
 every shared crate, via `akuma_primitives::console::set_print_hook`). It is
-**write-only**: there is no input path — an unbound fd 0 reads EOF, and
-`CloseChildStdin` is a no-op success for the same reason. The banner is
+**write-only**: there is no input path, and an unbound fd 0 reads EOF. The banner is
 `src/banner.txt`, included verbatim, printed at the init-spawn point where the
 full kernel prints its own.
 

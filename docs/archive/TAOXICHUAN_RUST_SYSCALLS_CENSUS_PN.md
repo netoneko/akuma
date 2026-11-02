@@ -1,9 +1,11 @@
 # Rust syscalls on this kernel — what is served, what is not, the order
 
+> **Archived 2026-11-02** from `taoxichuan/docs/reference/rust-syscalls.md`: session pn's census and work order, done (the fixed point, [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md)). What the kernel serves now is [`TAOXICHUAN_B10_SYSCALL_CENSUS.md`](TAOXICHUAN_B10_SYSCALL_CENSUS.md) and `taoxichuan/docs/reference/syscalls.md`.
+
 **Stability: C** (current state after the stage 9–11 planning session pn; re-measure
 against the `[err]` trace after every slice). The full gap analysis with routes and
 costs is `PLAN-pn.md` at the repo root; the scored archive lists are
-[`rust-toolchain.md`](rust-toolchain.md). The code wins where any of these disagree.
+[`TAOXICHUAN_RUST_TOOLCHAIN_INVENTORY.md`](TAOXICHUAN_RUST_TOOLCHAIN_INVENTORY.md). The code wins where any of these disagree.
 
 ## Measured, not assumed
 

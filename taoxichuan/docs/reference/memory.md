@@ -28,24 +28,27 @@ Canonical mermaid source: [`../diagrams/memory-map.md`](../diagrams/memory-map.m
   task. The kernel's own root additionally keeps the boot identity map
   ([`boot.md`](boot.md) § identity map).
 - Loading is **eager**: every `PT_LOAD` gets fresh zeroed frames mapped at its
-  link address, the file bytes copied through the physmap; `.bss` is the
-  zeroed tail. The ELF slicing is [`crates/akuma-ring3-amd64`](../../../crates/akuma-ring3-amd64)
-  (`Image::parse`); the PT_INTERP *decision* is
-  [`crates/akuma-elf-exec`](../../../crates/akuma-elf-exec) — this kernel maps
-  the interpreter itself, the crate only decides.
-- The initial stack is one full 4 KiB block laid out backwards from
-  `USER_STACK_TOP` by `ring3::build_stack`: argc/argv/envp/auxv (14 aux
-  entries: `AT_BASE` for the interpreter, `AT_PHDR/PHENT/PHNUM/ENTRY`, uids 0,
-  `AT_CLKTCK=100`, `AT_RANDOM=0`). One page, not 512 B — apk's long argv/env
-  overran the old block by exactly one pointer word and panicked the kernel
-  mid-install.
+  link address, the file bytes copied through the physmap from `p_offset`;
+  `.bss` is the zeroed tail. The ELF decisions are
+  [`crates/akuma-elf-exec`](../../../crates/akuma-elf-exec)'s: `program` for the
+  image (base, entry, `AT_PHDR`, the end where `brk` starts) and `load_segments`
+  for the interpreter, both checking each segment against the file. This
+  kernel's `place_segment` maps both through one page loop: writable wins over
+  executable, and a segment that overflows or reaches past `USER_TOP` is
+  refused before any frame is taken.
+- The initial stack is 16 pages below `USER_STACK_TOP`; its top
+  `ARG_BLOCK_PAGES` (12) hold the block `ring3::build_stack` lays out backwards:
+  argc/argv/envp/auxv (14 aux entries: `AT_BASE` for the interpreter,
+  `AT_PHDR/PHENT/PHNUM/ENTRY`, uids 0, `AT_CLKTCK=100`, `AT_RANDOM=0`).
 - `brk` grows by mapping fresh zeroed pages on demand inside its slab;
   shrinking is bookkeeping only (no unmap). Linux's contract is honoured: a
   failed `brk` returns the **old** break.
 - `mmap` serves `MAP_ANONYMOUS` (zeroed frames) and `MAP_PRIVATE` of an open
   regular file (zeroed frames filled from the inode at `off` — musl ldso's
-  `map_library` shape; no CoW, private because the address space dies with the
-  task). `W+X` is refused at `mmap` too: the W^X decision is
+  `map_library` shape; there is no page cache, so each mapping has its own
+  copy). A writable `MAP_SHARED` file mapping is recorded and written back to
+  the file by `msync`, `munmap`, exec and exit. Every mapping without `PROT_EXEC` is
+  mapped user read-write: `PROT_READ` alone is not enforced. `W+X` is refused at `mmap` too: the W^X decision is
   [`crates/akuma-syscalls-mem`](../../../crates/akuma-syscalls-mem) `wx::check_prot`,
   called at the top of both the `mmap` and `mprotect` arms (`wx=0` turns it off).
   The slab is 16 GiB of *reserved address space* (a page costs memory when mapped, not when reserved); at 1 GiB one `rustc` ran out of it — it maps a 311 MB `librustc_driver` and a ~17 MB stack per codegen thread — and musl reported the failed stack `mmap` as `EAGAIN` ("failed to spawn work thread"). Memory is the next wall: the fill is still eager (see `gaps.md`).
@@ -58,27 +61,31 @@ Canonical mermaid source: [`../diagrams/memory-map.md`](../diagrams/memory-map.m
 
 ## The user-pointer rule
 
-Every user pointer a syscall touches passes `user_ok(va, len)`: `[va, va+len)`
-must lie inside one of the task's registered regions (the image segments, the
-the 64 MiB brk slab, the 16 GiB mmap slab, the stack, the interpreter span —
-16 slots, registered at
-load). Then `copy_from_user`/`copy_to_user` walk the task's **own root page
-table** one page at a time and move bytes through the physmap. The region
-check is the gate; a page that fails to translate mid-copy is the backstop
-(`-EFAULT`), not the mechanism.
+The layout bookkeeping is [`crates/akuma-user-layout`](../../../crates/akuma-user-layout)'s `Layout`: the
+regions, the `brk` window, the mmap slab with its bump cursor and hole table,
+and the writable shared file mappings. It decides; this kernel maps, fills and
+frees, and tells it what it did.
 
-This kernel never dereferences a user pointer — there is no `uaccess`
-fast path. The console-emit path additionally refuses non-UTF-8 chunks with a
-`[tty] write: non-utf8 bytes elided` line rather than silently mangling them.
+This kernel's own arms check every user pointer with `user_ok(va, len)`:
+`[va, va+len)` must lie inside one of the task's registered regions (the image
+segments, the 256 MiB brk slab, the 16 GiB mmap slab, the stack, the
+interpreter span). Then `copy_from_user`/`copy_to_user` walk the task's **own
+root page table** one page at a time and move bytes through the physmap
+(`TaskWalk`, the effect half of `akuma-user-walk`). The region check is the
+gate; a page that fails to translate mid-copy is the backstop (`-EFAULT`).
+
+Glue's arms use [`crates/akuma-user-access`](../../../crates/akuma-user-access)
+instead: they touch the user address directly, and a fault inside one of its
+copies resumes at `user_copy_fixup` with `EFAULT`. A ring-0 write to a present
+copy-on-write page breaks the share in the fault handler first.
 
 ## fork's memory: copy-on-write
 
-`fork_share_memory(parent_root)` (main.rs) builds a fork child's address
-space — the M2 arm calls it directly, and the real fork reaches the same walk
+`clone_user_half` (main.rs) builds a fork child's address space, reached
 through the twin's `ExecRuntime::fork_share_memory` hook
-([`processes.md`](processes.md)) via `clone_user_half`: a fresh root (kernel
-half shared by the same PML4 copy), then a subtree-by-subtree clone of the
-parent's **user half only**. The page tables are copied; the **leaf frames are
+([`processes.md`](processes.md)): a fresh root (kernel half shared by the same
+PML4 copy), then a subtree-by-subtree clone of the parent's **user half
+only**. The page tables are copied; the **leaf frames are
 shared**:
 
 - every present 4 KiB leaf takes one `cow_ref_inc` (the first share inserts 2:
@@ -130,19 +137,20 @@ holes closed on 2026-10-30 are §9 of
 
 ## Allocation on syscall paths
 
-The fd and socket arms allocate (`Vec` gathers for writev/sendto, the child
-pipe buffer, path `String`s). The caps that keep that bounded: 1 MiB per
-`write`/`read` call (`WRITE_LIMIT`), 1 MiB of child stdout (`OUT_CAP`), 128 B
-path buffers, 64 KiB per pipe, and the execve argument block: 448 `argv` /
-256 `envp` entries, 32 KiB per string, `argv + envp <= 512` and a total-bytes
-guard — every overrun answers `E2BIG`, never `EFAULT` (2026-10-30; one heavy
-`rustc` call carries 344 arguments and a 5,192-byte argument). Out of memory is
-`[OOM]` + halt: there is no pressure ladder on a kernel with no processes to
-kill.
+The fd and socket arms are glue's and follow glue's allocation rules. This
+kernel's own arms allocate in exec (the argument strings and the stack block)
+and nowhere else per call; the caps that bound it are 1 MiB per console
+`write` (`WRITE_LIMIT`) and the execve argument block: 448 `argv` / 256 `envp`
+entries, 32 KiB per string, `argv + envp <= 512` and a total-bytes guard —
+every overrun answers `E2BIG`, never `EFAULT` (one heavy `rustc` call carries
+344 arguments and a 5,192-byte argument). A frame that cannot be allocated in
+a syscall answers `ENOMEM`; a failed kernel-heap allocation is `[OOM]` + halt.
 
 ## Background
 
 `docs/archive/TAOXICHUAN_STAGE6_PLAN.md` (the 64 MiB slabs),
-`docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md` § H3-f (the eager fork),
+`docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md` § H3-f (the eager fork CoW replaced),
+[`TAOXICHUAN_B8_ONE_ELF_LOADER.md`](../../../docs/archive/TAOXICHUAN_B8_ONE_ELF_LOADER.md) (one loader for
+program and interpreter),
 `docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md` (the stack-block
 and double-advance incidents).

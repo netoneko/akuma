@@ -6,5 +6,5 @@ working on the current tree, fix the runbook in the same commit or move it to
 
 | runbook | task |
 |---|---|
-| [build-and-boot.md](build-and-boot.md) | build the kernel, install it as the vm-dev guest, boot it under kvm0 |
-| [gates.md](gates.md) | run the stage gates and read their console evidence |
+| [build-and-boot.md](build-and-boot.md) | build the kernel; boot it on the Mac (QEMU TCG) or as the vm-dev guest under kvm0 |
+| [gates.md](gates.md) | the TCG rig's battery, the CoW leak gate, the probes, and the ryzen fixed point and census |

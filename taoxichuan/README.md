@@ -56,11 +56,12 @@ The kernel compiles itself on bare metal, and what it compiles is byte-identical
 
 ## What it boots as
 
-A kvm0/Firecracker-style **PVH guest**, single vCPU, virtio-mmio only (no PCI
-walk), an ext2 root on virtio-blk, virtio-net with DHCP, COM1 console. Ring 3
-runs static musl binaries spawned from the kernel command line
-(`init=`/`then=`); the staged ladder has reached busybox, sshd, `apk add curl`,
-`curl https://…`, and a first C-compile probe with tcc. See
+A kvm0/Firecracker-style **PVH guest**, one vCPU or `smp=N` under one big
+kernel lock, virtio-mmio only (no PCI walk), an ext2 root on virtio-blk,
+virtio-net with DHCP, COM1 console. Init comes from the kernel command line
+(`init=`, normally sshd) and runs as pid 1; everything else is its fork
+children, unmodified Linux musl binaries: busybox, bash, `apk`, `curl`, git,
+tcc, `rustc` and `cargo`, and tokio programs. See
 [`docs/README.md`](docs/README.md) for the status ladder and the doc set.
 
 ## Build
@@ -72,8 +73,14 @@ build must never reach). Build it for its target, explicitly:
 cargo build -p taoxichuan --target x86_64-unknown-none --release --features no-tests
 ```
 
+Features: `shell` (default) serves the calls busybox and bash make and no
+tokio program does; `--no-default-features --features no-tests` builds the
+tokio-only kernel B10's census measured. `trace-err` adds the evidence lines
+the leak gate reads.
+
 The linker script is handed over by `build.rs` (`rustc-link-arg-bins`), scoped
-to this package's binary — the same reasoning as `akuma-amd64`. Boot as a guest
+to this package's binary — the same reasoning as `akuma-amd64`. Boot it on the
+Mac under QEMU TCG with `scripts/kvm/taoxichuan/tcg_rig.py`, or as a guest
 under the dev box's kvm0: `scripts/kvm/goose/boot_dev.sh` (installs to
 `/boot/akuma-guest-dev`, rewrites the vm-dev herd confs, waits for ssh). The
 runbook is [`docs/runbooks/build-and-boot.md`](docs/runbooks/build-and-boot.md).
@@ -82,12 +89,13 @@ runbook is [`docs/runbooks/build-and-boot.md`](docs/runbooks/build-and-boot.md).
 
 | path | what it holds |
 |---|---|
-| `src/main.rs` | boot order, IDT/traps, LAPIC bring-up, the task record + fd table, ELF loader, the syscall dispatcher, the program list |
-| `src/child.rs` | the child model: SPAWN run-to-completion crossing, exec-replace, the M2 blocking fork, wait4/waitpid, the spawn ring |
-| `src/exec_twin.rs` | registration of the `akuma-exec`/`akuma-threading` hook tables (the runtime twin of amd64's `exec_runtime.rs`) |
+| `src/main.rs` | boot order, IDT/traps and the fault paths (stack growth, copy-on-write), LAPIC bring-up, the task records, the ELF loader, the syscall dispatcher and the memory arms |
+| `src/child.rs` | processes: the slot table, init's thread, fork and threads through `akuma-exec`, exec, exit, signal delivery and `rt_sigreturn`, address-space lifetime |
+| `src/exec_twin.rs` | registration of the `akuma-exec`/`akuma-threading` hook tables (the runtime twin of amd64's `exec_runtime.rs`), the idle thread |
+| `src/sched.rs` | the `akuma-sched-amd64` `Platform` (`Tx`) and its per-slot `Machine` table |
+| `src/smp.rs` | AP bring-up, the big kernel lock, TLB shootdown, the wake IPI |
 | `src/net.rs` | `NetRuntime` callbacks, the PIT-calibrated TSC clock, RDRAND, the NIC pump |
-| `src/pipes.rs` | the `akuma-pipes` table instance and its fd arms |
-| `src/sock.rs` | the AF_INET syscall arms over `akuma-net`'s socket table |
+| `src/ring.rs` | the `trace-err` evidence rings |
 | `src/banner.txt` | the boot banner, included verbatim |
 | `linker.ld` | low trampoline + high-kernel layout (shared shape with `akuma-amd64`) |
 | `docs/` | the kernel's own doc set: reference, runbooks, diagrams, gaps |
@@ -95,6 +103,6 @@ runbook is [`docs/runbooks/build-and-boot.md`](docs/runbooks/build-and-boot.md).
 ## Doc rule
 
 `docs/` is the living documentation of this kernel and is kept current in the
-same commit as the code it describes — every syscall arm has a row in
+same commit as the code it describes — every local syscall arm has a row in
 `docs/reference/syscalls.md`, and a diagram changes when the behaviour it
 shows changes. The rules are in [`docs/README.md`](docs/README.md).

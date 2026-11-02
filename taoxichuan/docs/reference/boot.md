@@ -33,7 +33,7 @@ flowchart TD
     J --> K["exec_twin::init — register ExecRuntime / ThreadRuntime /<br/>ProcessHooks / X86ArchHooks (akuma-exec, akuma-threading)"]
     K --> L["blk_init — map virtio-mmio window, akuma-virtio block up"]
     L --> M["ext2 mount on device 0 (akuma-ext2, BlockDevice = Vda)<br/>published as ROOT_FS"]
-    M --> N["net::net_init — TSC calibration vs PIT, smoltcp up<br/>(akuma-net over akuma-net-nic), DHCP wait ≤10 s"]
+    M --> N["net::net_init — TSC calibration vs PIT (no PIT →<br/>lapic tsc_hz), smoltcp up (akuma-net over akuma-net-nic),<br/>DHCP wait ≤10 s"]
     N --> O["banner (src/banner.txt, verbatim)<br/>epoch= cmdline token → UTC offset store (akuma-primitives::clock)"]
     O --> P["parse_init: init=/initargs=/initenv=<br/>(one program, fixed slots)"]
     P --> Q["run_init: read init off ext2, start it as pid 1 on a pool thread"]
@@ -57,13 +57,17 @@ of the table ([`crates/akuma-idt-amd64`](../../../crates/akuma-idt-amd64)) with
 plain reporter stubs, and points vector 32 (`TIMER_VECTOR`) at the trap crate's
 entry for `Kind::Timer` → `timer_trap` → `akuma_lapic_amd64::on_tick()`.
 
+- Before either: a ring-3 fault on a not-present page below the stack grows it; a write to a
+  present copy-on-write page, from either ring, is resolved
+  ([`memory.md`](memory.md) § fork's memory); a ring-0 fault inside
+  `akuma-user-access`'s copy loop resumes at its `EFAULT` trampoline.
 - A fault **from ring 3** is the task's death: `[Fault] ring3 … task killed`,
-  then halt. There is no scheduler to reap through.
+  and the process ends with wait status SIGSEGV while the machine runs on. The
+  boot task, which has no slot to reap through, halts.
 - Any other fault prints `[Fault] <kind> rip=… rsp=… cr2=… code=…` and halts.
   The `[Fault]` token is the gate's vocabulary; a correct boot has zero.
-- A tick that fires while ring 3 runs (the only place IF is set — every kernel
-  path runs with interrupts masked) counts and returns to the same
-  instruction. **No task switch yet** — see [`scheduling.md`](scheduling.md).
+- A tick that interrupts ring 3 (every kernel path runs with interrupts masked)
+  may switch tasks — see [`scheduling.md`](scheduling.md).
 
 The multiboot2 entry (`kmain_mb2`) exists because `boot.s` names it
 unconditionally; it prints "not composed in this kernel (PVH/VMM only)" and

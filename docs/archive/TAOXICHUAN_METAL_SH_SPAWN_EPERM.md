@@ -15,7 +15,7 @@ The vm-dev image (`/boot/akuma-dev-root-apk.img.orig`, copied fresh by `boot_dev
 refuses any caller that is not the boot task (`nested_active()`): `-EPERM` on the very first exec. Nothing logged it: `trace_err` keeps
 a 512-entry per-number cap and `SPAWN` is `AKUMA_PRIVATE_BASE + 301`, off the end of it.
 
-It was not init wiring: init is wired as designed. The image was stale against the design ("sshd spawns the Linux way", `switch-to-crates.md` rule 2).
+It was not init wiring: init is wired as designed. The image was stale against the design ("sshd spawns the Linux way", `TAOXICHUAN_SWITCH_TO_CRATES.md` rule 2).
 
 ## Fix
 * The image's `/bin/sshd` is now `sshd-fork-linuxabi` (`fork-sessions` + `libakuma/linux-abi`; md5 `2e3f32d3...`, from p3 `/root/tx/`), the old one kept as `/bin/sshd-coop`. Applied to the `.orig` (loop mount on Pop, p3 not in use by Akuma).

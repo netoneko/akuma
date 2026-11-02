@@ -54,40 +54,34 @@ Canonical mermaid source: [`../diagrams/scheduling.md`](../diagrams/scheduling.m
   itself: `NET_UP` (set after `akuma_net::init` succeeds — a tick can fire
   before the stack exists) and `IN_LAP` (tick-context and task-context laps
   never nest).
-- The syscall-answer clock is a **second** source by design: `net::uptime_us`
-  (PIT-calibrated TSC, [`devices.md`](devices.md) § clock) serves
-  `clock_gettime`/`nanosleep`/`poll` laps; the twin's tables get the tick
-  clock so the scheduler and `akuma-exec` cannot disagree (amd64's one-clock
-  rule, verbatim).
+- **One clock**: `net::uptime_us` (PIT-calibrated TSC, [`devices.md`](devices.md)
+  § clock) serves the time syscalls, the poll laps, futex deadlines and both
+  twin tables, so the scheduler, `akuma-exec` and glue cannot disagree (amd64's
+  one-clock rule). The tick only drives preemption and the netpoll backstop.
 
 ## switch_to — the machine effects of a park-point switch
 
-`exec_twin::switch_to(from, to)` is real (slice 3). The crate
-(`x86_yield_now`/`x86_switch_context`) has already named `next` current and
-moves the stacks itself; the twin adds, in order:
+The switch is `akuma_sched_amd64::switch_to::<sched::Tx>`, the crate's body shared with the metal kernel; `Tx`
+(`sched.rs`) supplies this kernel's answers. The crate (`x86_yield_now`/`x86_switch_context`) has already named
+`next` current and moves the stacks itself; the switch then installs, for the incoming slot:
 
-1. the incoming task's **syscall band** (`sched_kstack_top(to)` →
-   `set_syscall_stack_top`),
-2. `TASK_SLOT = sched_task_slot_of(to)` — the dispatcher's `task()` must name
-   the incoming task's record, or a resumed task runs its syscalls against the
-   *previous* task's fd table and root (the exec'd shell's writev loop reading
-   zeros out of the wrong address space, boot pg-2). Task `tid` runs against
-   record `tid + 1` (a `CLONE_THREAD` sibling against its creator's); the boot
-   thread is tid 0, record 1. The idle thread (tid ≥ NSLOTS) is
-   excluded — kernel-only, leaves the previous task's slot armed, exactly as
-   it leaves CR3,
-3. the incoming task's **trap stack** (`arm_trap_stack`),
-4. **CR3** (`sched_root_of(to)`; 0 = leave it alone — the idle thread runs on
-   the kernel root),
-5. **IA32_FS_BASE** from the incoming slot's shadow ([`processes.md`](processes.md)
-   § the fs discipline).
+1. **CR3** (`child::sched_root_of(to)`; idle threads run on the kernel root),
+2. the **trap stack** (`trap_top_for`) as the TSS `rsp0`,
+3. **IA32_FS_BASE** from the slot's shadow ([`processes.md`](processes.md) § the fs discipline), and the FP
+   state,
+4. in `Tx::after_install`: the **syscall band** (`sched_kstack_top(to)` → `set_syscall_stack_top`) and the
+   dispatcher's **task record** (`set_task_slot(sched_task_slot_of(to))`). The record must name the incoming
+   task's, or a resumed task runs its syscalls against the previous task's address space (an exec'd shell's
+   `writev` loop once read zeros out of the wrong one). Task `tid` runs against record `tid + 1` (a
+   `CLONE_THREAD` sibling against its creator's). Idle threads (tid ≥ `NSLOTS`) run kernel code only and
+   leave the previous record armed.
 
 `from` needs nothing: the crate saves its context.
 
 ## The idle thread halts
 
-`IDLE_TID = NSLOTS` (outside the ring; its CR3 is the kernel's, its stack a
-leaked 16 KiB), seeded READY at registration. `idle_main`:
+One idle thread per core, `idle_tid(cpu)` = `NSLOTS + cpu` (outside the ring;
+its CR3 is the kernel's, its stack a leaked 16 KiB), pinned to its core. `idle_main`:
 
 ```mermaid
 flowchart TD
@@ -127,9 +121,7 @@ calibration already measured (`akuma-lapic-amd64::tsc_hz()`); the fixed
 2,500 cyc/us guess remains only for a kernel where the LAPIC crate has not
 run. On the 3.79 GHz ryzen the guess alone ran the wall clock 1.52x fast; a
 current boot prints `calibrated <N> cyc/us` and `sleep 20` measures 20 s.
-Both the tick clock and the syscall-answer clock above are TSC-derived; the
-extraction plan (`docs/archive/TAOXICHUAN_CRATE_EXTRACTION_PLAN.md`, X2)
-moves both onto one `akuma-primitives::clock` source set at init.
+Every consumer reads that one clock (§ the tick, above).
 
 ## The hooks
 
@@ -162,7 +154,7 @@ Diagram: [`../diagrams/smp.md`](../diagrams/smp.md).
 `gs:[8]` the user-`RSP` stash, `gs:[16]` the syscall stack top, `gs:[24]` the
 core index, `gs:[32]` the running slot. The invariant is amd64's: in ring 0
 `GS_BASE` is the block and `KERNEL_GS_BASE` is the program's; the syscall stub,
-the IDT stubs and `enter_user`/`child_enter` `swapgs` at every ring crossing.
+the IDT stubs and `enter_user` `swapgs` at every ring crossing.
 Per-core as well: GDT row, TSS, boot trap stack (`gdt_init_cpu`), the dispatcher's
 task record (`TASK_SLOT[cpu]`), LAPIC timer (only the boot core advances the
 clock), idle thread.
@@ -181,6 +173,10 @@ unmap (`release_pages`), an `mprotect`, and a fork's demotion of the parent's
 live PTEs; the handler reloads CR3 and acknowledges a generation; the sender
 waits for every online core. A core spinning IRQ-masked for the lock services
 pending generations itself, so sender-waits-for-spinner cannot deadlock.
+
+**The wake IPI** (`smp::kick_halted_core`, vector 34, the threading `trigger_sgi` hook): a wake that makes a
+thread READY kicks one halted peer, whose idle lap then re-runs the picker; without it the peer waited for its
+next 10 ms tick. A core marks itself halted in `park_halt` and does not halt if work is already visible.
 
 **Rules learned the hard way**
 - An idle core runs on the *kernel* root (`switch_to` loads it): sitting on a

@@ -216,12 +216,11 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         return Err("taoxichuan: child tid outside the spawn ring");
     }
     // The tid IS this child's slot index (see NSLOTS). Stamp its SpawnSlot,
-    // give it its kernel+trap stacks (slice 2's leaked pairs, reused on
-    // recycle — `switch_to` points the syscall stub here), and copy the
-    // shell's task record into its own (`tid + 1`; 0 is sshd, 1 the shell):
-    // root from `fork_process`'s cloned address space, regions/brk/fds from
-    // the shell — the same snapshot the M2 arm makes, at bind time instead
-    // of fork time.
+    // give it its kernel+trap stacks (leaked pairs, reused on recycle —
+    // `switch_to` points the syscall stub here), and give a fork child a task
+    // record of its own (`tid + 1`): the root from `fork_process`'s cloned
+    // address space, the layout from the parent's. A thread shares its
+    // creator's record.
     let slot_idx = tid;
     with_slots(|s| {
         s[slot_idx] = SpawnSlot::new();
@@ -608,12 +607,12 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
         akuma_syscalls_glue::execve::commit(p, &effective, &argv_bytes);
     }
     // The registered Process's shared root view goes stale with the old
-    // image — re-point it, as `exec_replace` does for the shell.
+    // image — re-point it.
     {
         let pid = slot_pid(cur);
         let first_exec = OWNED_ROOT.with(|t| t[cur]) == 0;
         if disown_space(pid, ti.root_pa) {
-            // A fork child's first exec: the root it ran on is the eager
+            // A fork child's first exec: the root it ran on is the fork
             // clone (`clone_user_half`), every frame of which is raw — see
             // `disown_space`. Later execs park the previous exec'd root in
             // `adopt_exec_root`.
@@ -788,8 +787,7 @@ fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u
 /// child, whose `__clone` stub pops its function and argument from it).
 fn fork_arm_real(child_stack: u64) -> u64 {
     // The boot task has no registered Process to fork. Any other task forks
-    // for real, however deep: each child has its own thread and stacks (the
-    // M2 crossing's depth ceiling went with the crossing).
+    // for real, however deep: each child has its own thread and stacks.
     let cur = crate::exec_twin::current_slot();
     if cur == crate::exec_twin::NO_SLOT {
         return crate::e(crate::err::EPERM);
@@ -1159,7 +1157,7 @@ const PENDING_ROOTS: usize = 16;
 static PENDING_ROOT: akuma_primitives::cell::BorrowCell<[u64; PENDING_ROOTS]> = akuma_primitives::cell::BorrowCell::new([0; PENDING_ROOTS]);
 
 /// Point `pid`'s registered `Process` at a shared view of `root` and let go of
-/// the address space it owned WITHOUT dropping it. The eager fork clone
+/// the address space it owned WITHOUT dropping it. The fork clone
 /// (`clone_user_half`) fills the crate's fresh space with raw frames the
 /// space's ledger never saw, so `UserAddressSpace::drop` returns only the L0
 /// and the process-info page - every leaf and table frame leaked (a forked
@@ -1225,7 +1223,7 @@ fn sweep_parked_roots() -> usize {
 
 /// Page-table roots of exited processes, by pid, until their reap.
 ///
-/// A fork child's address space is the twin's eager clone, every frame of which
+/// A fork child's address space is the twin's fork clone, every frame of which
 /// the `Process`'s `UserAddressSpace` ledger never saw (see [`disown_space`]), so
 /// the twin frees it and the `Process` must not. At the exit the `Process` is
 /// handed a non-owning view of the same root and the root is recorded here;

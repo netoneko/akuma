@@ -16,6 +16,12 @@ Output: `target/x86_64-unknown-none/release/taoxichuan` (the dev box pins
 flags (`relocation-model=static`, `code-model=kernel`) live in the repo's
 `.cargo/config.toml`.
 
+## Boot on the Mac (QEMU TCG)
+
+The quickest boot needs no ryzen: `scripts/kvm/taoxichuan/tcg_rig.py build`, then `boot fresh` with `TX_DISK`
+and `TX_KEY` set; it waits for an ssh round trip and prints `BOOT OK ready_in=<s> port=<p> console=<log>`. The
+gates run on it ([`gates.md`](gates.md)).
+
 ## Boot (dev box, kvm0)
 
 One idempotent boot of the vm-dev guest, from the dev box:
@@ -44,7 +50,7 @@ Detail log: `/root/dev-cycle/taoxichuan-s7/boot_dev.log`; guest console:
 `/var/log/herd/vm-dev.log`.
 
 **The guest image's `/bin/sshd` must be the `linux-abi` build** (`sshd-fork-linuxabi`). A cooperative sshd uses Akuma's private
-`SPAWN`, which this kernel does not serve (`ENOSYS`; `/bin/sh failed to spawn` on the client). Patch the
+`SPAWN` and `UPTIME`, which this kernel does not serve (`ENOSYS`; `/bin/sh failed to spawn` on the client). Patch the
 `.orig` with a loop mount on the ryzen under Pop (`docs/archive/TAOXICHUAN_METAL_SH_SPAWN_EPERM.md`).
 
 ## Verify

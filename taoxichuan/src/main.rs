@@ -529,10 +529,9 @@ fn fault_trap_locked(t: &mut Trap<'_>) {
         t.frame.rip = fixup;
         return;
     }
-    // Stage 2: a fault *from ring 3* is the task's death, not the kernel's —
-    // say which, and park. There is no scheduler to reap through and no other
-    // task to keep running; what matters for the gate is that this prints
-    // `[Fault]` and stops instead of triple-faulting into guest silence.
+    // A fault *from ring 3* is the task's death, not the kernel's: say which,
+    // then end the task (below). What matters for the gate is that this prints
+    // `[Fault]` instead of triple-faulting into guest silence.
     if t.from_ring3() {
         akuma_primitives::safe_print!(
             192,
@@ -545,9 +544,9 @@ fn fault_trap_locked(t: &mut Trap<'_>) {
         );
         #[cfg(feature = "trace-err")]
         mm_dump_for(akuma_cpu::ctlreg::cr2());
-        // A real fork child or thread dies alone (SIGSEGV status to its
-        // waiter); the machine runs on. The shell and the boot task are the
-        // M2 shapes with no slot to reap through: those halt as before.
+        // A fork child or thread dies alone (SIGSEGV status to its waiter);
+        // the machine runs on. The boot task has no slot to reap through, so
+        // a fault there halts.
         if child::is_real_task() {
             akuma_primitives::safe_print!(64, "[Fault] slot {} killed (SIGSEGV)\n", exec_twin::current_slot());
             child::task_die_segv();
@@ -696,7 +695,7 @@ fn timer_trap_locked(t: &Trap<'_>) {
     // an exec'd shell's exit tears its slot down, a ring-3 tick can fire with
     // NO_SLOT current; the crate's switch engine indexes by current tid, so a
     // tick with no live slot must not switch (the same `may_park` discipline
-    // the pipe arms and `wait4_real` keep).
+    // every parking wait keeps).
     let slot = crate::exec_twin::current_slot();
     if t.from_ring3()
         && slot != crate::exec_twin::NO_SLOT
@@ -915,9 +914,9 @@ impl akuma_ext2::BlockDevice for Vda {
     }
 }
 
-/// No wall clock: nothing at this stage stamps an inode (the root is mounted
-/// read-only in spirit — no syscall path can write), and `|| 0` is the honest
-/// pre-sync answer the full kernel documents, not a guess dressed up as one.
+/// The ext2 root's inode clock: every time it stamps is 0. `|| 0` is the
+/// honest pre-sync answer the full kernel documents; no stage has needed
+/// mtimes yet (`docs/gaps.md`).
 fn no_clock() -> u64 {
     0
 }
@@ -926,9 +925,8 @@ fn no_clock() -> u64 {
 /// syscall. Stage 3's move out of `kmain`'s frame: `openat`/`getdents64`
 /// answer from ring-0 syscall context, which has no access to a local.
 ///
-/// SAFETY: one core; every touch is either before ring 3 exists or inside
-/// the syscall dispatcher (`IF` clear from `syscall`'s own masking) — the
-/// same discipline `task()` documents. `Ext2Filesystem` is `Send + Sync`
+/// Every touch is either before ring 3 exists or inside the syscall
+/// dispatcher, under the big kernel lock. `Ext2Filesystem` is `Send + Sync`
 /// (`akuma-vfs`'s `Filesystem` supertraits); the interior lock is a spinlock
 /// that never blocks on anything this kernel runs.
 static ROOT_FS: akuma_primitives::cell::BorrowCell<Option<&'static akuma_ext2::Ext2Filesystem<Vda>>> =
@@ -942,7 +940,7 @@ fn root_fs() -> &'static akuma_ext2::Ext2Filesystem<Vda> {
 
 /// Install `akuma-vfs-glue`'s hooks, create its mount table and mount the
 /// ext2 root at `/` — amd64's `fs::init_vfs` + `mount_root_on`, minus what this
-/// kernel does not build (no audio, no file-page cache, no `/proc` yet). Halts
+/// kernel does not build (no audio, no file-page cache). Halts
 /// on failure: a root the shared arms cannot resolve answers `ENOENT` for every
 /// path, silently (`AKUMA_AMD64_C1_STEP4A_VFS_ADOPTION.md` § 1).
 fn mount_vfs_glue(fs: alloc::sync::Arc<akuma_ext2::Ext2Filesystem<Vda>>) {
@@ -1838,16 +1836,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         akuma_syscalls_abi::x86_64::EXIT | akuma_syscalls_abi::x86_64::EXIT_GROUP => {
             let code = fr.arg1() & 0xFF; // what wait(2) would see
             with_task(|t| t.exit = Some(code));
-            // Slice 3 FIRST: a REAL fork child's exit is a task exit — status
-            // into the slot, its pipe references dropped, the wait4-parked
-            // parent woken, the threading slot terminated (never returns to
-            // the stub: `x86_finish_current` switches away for good). This
-            // test must outrank `nested_active()`: a real child runs at its
-            // own slot (1..NSLOTS), which made `nested_active()` true for it
-            // too and sent its exit_group down the M2 coroutine path — whose
-            // `exit_cross` restores a CrossSave `bind_child_task` never wrote
-            // and `ret`s through a zeroed return address (session pe: pd's
-            // deterministic rip=0).
+            // A slotted task's exit is a task exit — status published to its
+            // parent, its pipe references dropped, the wait4-parked parent
+            // woken, the threading slot terminated (never returns to the stub:
+            // `x86_finish_current` switches away for good).
             if child::is_real_task() {
                 // `exit` (60) from a thread ends that thread only; everything
                 // else (exit_group, a lone process's exit) ends the group.
@@ -2143,9 +2135,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             base
         }
-        // CLONE/FORK/VFORK + WAIT4 (stage 8, process-model M2): the blocking
-        // fork and the real reap — the arms busybox ash needs to run any
-        // non-final command of a list. child.rs's M2 scaffold.
+        // `clone` without `CLONE_THREAD`, `fork` and `vfork` all fork through
+        // `fork_process`; `CLONE_THREAD` goes to `clone_thread` (child.rs).
         akuma_syscalls_abi::x86_64::CLONE | ring3::nr::FORK | ring3::nr::VFORK => child::fork_arm(fr),
         akuma_syscalls_abi::x86_64::EXECVE => {
             // A fork child (its own threading slot, published by
@@ -2290,17 +2281,8 @@ pub(crate) fn task_done(code: u64) -> ! {
     console::puts("Taoxichuan: all programs done\n");
     halt();
 }
-/// Load an ELF image into the CURRENT task slot: fresh page root (the
-/// kernel's upper half shared by PML4 copy), every `PT_LOAD` placed eagerly
-/// at its link address, a Linux initial stack with argc/argv/envp/auxv on
-/// it, heap slabs registered, the fd table reset. Returns where to cross:
-/// the root to load into CR3, the entry, the initial `rsp`.
-///
-/// Shared by the boot spawn (`spawn`) and `execve` (`child.rs`) — one loader,
-/// one placement story. Runs with the kernel
-/// half live (the physmap does all the copying); the caller chooses the
-/// CR3 moment.
-/// M2 (H3-f), copy-on-write since 2026-10-30: the fork child's address space.
+
+/// The fork child's address space, copy-on-write since 2026-10-30.
 /// The child's user page tables are cloned subtree-by-subtree, but the LEAF
 /// frames are shared with the parent (`clone_user_tree`): a writable leaf is
 /// demoted to read-only + `PTE_COW` in both tables, a read-only leaf is shared
@@ -2513,6 +2495,16 @@ fn place_segment(root: u64, image: &[u8], seg: &akuma_elf_exec::LoadSeg) -> Opti
     Some((first, last))
 }
 
+/// Load an ELF image into the CURRENT task slot: fresh page root (the
+/// kernel's upper half shared by PML4 copy), every `PT_LOAD` placed eagerly
+/// at its link address, a Linux initial stack with argc/argv/envp/auxv on
+/// it, heap slabs registered, the fd table reset. Returns where to cross:
+/// the root to load into CR3, the entry, the initial `rsp`.
+///
+/// Shared by the boot spawn (`spawn`) and `execve` (`child.rs`) — one loader,
+/// one placement story. Runs with the kernel
+/// half live (the physmap does all the copying); the caller chooses the
+/// CR3 moment.
 fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     const NO_SEG: akuma_elf_exec::LoadSeg = akuma_elf_exec::LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 };
     let mut segs = [NO_SEG; 16];
@@ -2628,12 +2620,11 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     // old 16-entry copy truncated it: `ld: no input files`).
     let full_argv: &[&str] = argv;
     let n_args = argv.len();
-    // One full page, not the old 512: `build_stack` lays the block out from
-    // `buf.len()` backwards and `apk`'s long argv/env (`--allow-untrusted add
-    // /pkgs/...` plus sshd's environment) overran 512 by exactly the 8 bytes
-    // of one pointer word — the underflowed slice index panicked the kernel
-    // on the first real install. The block still ends at `USER_STACK_TOP` and
-    // now fills the top page exactly, which the copy below already handles.
+    // `ARG_BLOCK_PAGES` pages: `build_stack` lays the block out from
+    // `buf.len()` backwards, and a block too small for the strings panics on
+    // an underflowed slice index (512 bytes did, by exactly one pointer word,
+    // on `apk`'s first real install; a heavy `rustc` line needs several pages).
+    // The block ends at `USER_STACK_TOP` and fills the top pages exactly.
     const BLOCK_PAGES: usize = ARG_BLOCK_PAGES;
     let mut block = alloc::vec![0u8; BLOCK_PAGES * 4096];
     let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, &full_argv[..n_args], env, &aux);
@@ -2762,7 +2753,7 @@ fn spawn(p: &Prog, image: &[u8]) -> ! {
     console::puts("\n");
     // Init is pid 1 on a real pool thread (a tid >= 1, a ring row, a registered `Process`), the way amd64's `run_init`
     // starts it, not on the boot stack: that is what lets it `fork`/`clone` and be preempted, so `sshd` runs one forked process
-    // per session (`docs/reference/switch-to-crates.md` S1). The boot thread parks in `start_init_thread` and reports init's exit.
+    // per session (`docs/archive/TAOXICHUAN_SWITCH_TO_CRATES.md` S1). The boot thread parks in `start_init_thread` and reports init's exit.
     child::start_init_thread(path, &ti)
 }
 

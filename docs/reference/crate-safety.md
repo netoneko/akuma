@@ -1,7 +1,16 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-11-01 with `python3 scripts/cloc_akuma.py src crates`:
-**83 of 112 crates** forbid `unsafe`. 90656 of 91971 production lines (98.6%) sit
+**Grade: A** — regenerated 2026-11-02 with `python3 scripts/cloc_akuma.py src crates`:
+**86 of 115 crates** forbid `unsafe`. 91321 of 92636 production lines (98.6%) sit outside any `unsafe`
+block; 368 production sites across `crates/`, 0 inside enforced crates, unchanged from the run before. The
+three new crates all forbid: `akuma-syscalls-proc` (84 production lines: clone kinds, exit scope, wait status,
+execve's argument budget, shared by amd64 and Taoxichuan), `akuma-user-layout` (232: a user address space's
+layout bookkeeping for a kernel that maps eagerly) and `akuma-runtime-tokio` (149: the syscall surface of a
+tokio program, [`subsystems/syscalls/runtime-tokio.md`](subsystems/syscalls/runtime-tokio.md)).
+`akuma-ring3-amd64` is 407 production lines (3 sites, 8 `unsafe` lines) since its ELF `Image` moved into `akuma-elf-exec`
+([`TAOXICHUAN_B8_ONE_ELF_LOADER.md`](../archive/TAOXICHUAN_B8_ONE_ELF_LOADER.md)).
+
+The run before, 2026-11-01: **83 of 112 crates** forbid `unsafe`. 90656 of 91971 production lines (98.6%) sit
 outside any `unsafe` block; 368 production sites across `crates/`, 0 inside
 enforced crates; `src/` is down to 136 production lines (the `bin`) and 0
 production sites. `akuma-virtqueue` (the split virtqueue and virtio-mmio protocol,
@@ -412,6 +421,9 @@ host-test.
 | `akuma-scheduler` | discrete-event simulator for placement / netpoll wake policy |
 | `akuma-syscalls` | the shape of a syscall excursion (prologue/epilogue decisions, identity-slot model) |
 | `akuma-user-tree` | the CoW fork's per-entry decisions over a 4-level user tree (skip / refuse / descend / copy / share-and-demote), the free order, and the `SharedSpans` policy; plans only, no walker |
+| `akuma-syscalls-proc` | the process family's decisions: `clone` flag kinds, `exit` scope, the wait status encoding, execve's argument budget |
+| `akuma-user-layout` | a user address space's layout for an eagerly mapping kernel: regions, the `brk` window, the mmap slab's cursor and hole table, writable shared file mappings |
+| `akuma-runtime-tokio` | the syscall surface a tokio program needs: the allow-list of glue's calls by feature, glue's setup, the dispatch |
 | `akuma-fpu-amd64` | the amd64 FPU save area as pure byte algebra: `fxsave`/`xsave` sizes and offsets, the power-on image, and the `sanitize` rule that makes a program-supplied image safe to `xrstor` |
 | `akuma-syscalls-signal` | the signal bookkeeping: the `rt_sigaction` table and its wire image, execve reset, `rt_sigprocmask` algebra (no delivery) |
 | `akuma-syscalls-sync` | the futex family: op decode, waiter table, deadline algebra, `WAKE_OP`, wait-loop outcome |

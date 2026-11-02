@@ -11,8 +11,8 @@
 //! # The clock
 //!
 //! smoltcp stamps everything (retransmit, DHCP, ARP ageing) with `now()` in
-//! microseconds. Taoxichuan has no LAPIC driver and no timer tick, so the
-//! source is the TSC, calibrated once at boot against the PIT — the same
+//! microseconds. The source is the TSC, calibrated once at boot against the
+//! PIT — the same
 //! 8254 reference `akuma-amd64` uses, and the one device kvm0 emulates well
 //! enough to answer the channel-2 gate/output handshake through port 0x61
 //! (`amd64/src/kvm/linux.rs` wires 0x40–0x43 and 0x61). The calibration is
