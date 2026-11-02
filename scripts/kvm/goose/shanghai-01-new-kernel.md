@@ -5,6 +5,11 @@ You are building **Shanghai**, a new kernel, from one brief:
 describes is `osaka/` (a 10-line `main.rs`) — do not copy Osaka's directory, write Shanghai's files from the
 README, with `shanghai` as the package name and `.name("Shanghai")`.
 
+**The banner.** Draw a Shanghai skyline in ASCII art (the Oriental Pearl Tower, the Shanghai Tower, the Jin Mao
+Tower and the World Financial Center's open top, over the Huangpu), at most 78 columns wide and 20 lines tall,
+plain ASCII only. Save it as `shanghai/src/banner.txt` and wire it with `.banner(include_str!("banner.txt"))`.
+It prints just before init starts; gate 3's console capture must show it.
+
 ## Start
 
 - Branch: `git fetch origin && git checkout -b shanghai origin/rust-org-il-experiment` (at `aafbb973` or later).
