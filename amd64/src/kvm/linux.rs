@@ -492,7 +492,6 @@ enum RamSrc {
 /// window), so guest-physical `g` is host-physical `map.host(base, g)`.
 struct Ram {
     base: u64,
-    bytes: u64,
     map: svm::rammap::Map,
     src: RamSrc,
 }
@@ -503,7 +502,7 @@ impl Ram {
     fn alloc(bytes: u64) -> Option<Self> {
         let map = svm::rammap::plan(bytes)?;
         match super::ctl::carve(bytes) {
-            super::ctl::Carve::Reserved { pa, off } => Some(Self { base: pa, bytes, map, src: RamSrc::Reserved { off } }),
+            super::ctl::Carve::Reserved { pa, off } => Some(Self { base: pa, map, src: RamSrc::Reserved { off } }),
             super::ctl::Carve::Refused { free } => {
                 p("[KVM] linux: refused: guest RAM does not fit the kvmmem= reserve (");
                 dec(free >> 20);
@@ -514,7 +513,7 @@ impl Ram {
                 let alloc_pages = ((bytes + RAM_ALIGN) / 4096) as usize;
                 let alloc_pa = akuma_pmm::alloc_pages_contiguous_zeroed(alloc_pages)?;
                 let base = (alloc_pa as u64 + RAM_ALIGN - 1) & !(RAM_ALIGN - 1);
-                Some(Self { base, bytes, map, src: RamSrc::Pmm { alloc_pa, alloc_pages } })
+                Some(Self { base, map, src: RamSrc::Pmm { alloc_pa, alloc_pages } })
             }
         }
     }
@@ -885,9 +884,10 @@ fn load_kernel(path: &str, ram: &Ram, chunk: &mut FreshFrame) -> Result<Loaded, 
     }
     let entry = entry.ok_or("no PVH entry note (a bzImage, or a kernel built without CONFIG_PVH)")?;
 
-    // Segments load low: they must fit the extent below the device window — short of the
-    // handoff pages when the map is flat (then they sit at the low extent's top).
-    let limit = if ram.map.high.bytes == 0 { ram.bytes - 0x4000 } else { ram.map.low.bytes };
+    // Segments load low: they must fit the extent below the device window, short of the
+    // handoff pages, which always sit at the low extent's top (`hvm_start_info` reaches the
+    // guest in 32-bit EBX, so they cannot go above 4 GiB).
+    let limit = ram.map.low.bytes - 0x4000;
     let mut bytes = 0u64;
     for s in &loads[..nloads] {
         let end = s.pa.checked_add(s.memsz).ok_or("segment wraps")?;

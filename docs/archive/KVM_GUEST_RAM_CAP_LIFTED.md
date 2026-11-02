@@ -71,6 +71,16 @@ where the literal `4096 -> OutOfRange` case used to sit.
 - `cargo check --release --target x86_64-unknown-none -p akuma-amd64 --features no-tests`
   clean; `check_unsafe_budget.py` unchanged (494 sites).
 
+## Correction (2026-11-02)
+
+Two statements above were wrong, and were found the first time a guest was booted past 3 GiB:
+"the handoff pages ... sit under the top of the *upper* extent" put `hvm_start_info` above 4 GiB, where
+the guest's 32-bit EBX cannot address it (the guest halted on "no hvm_start_info magic"), and "the PVH
+memory map reports both extents" was true of the memmap page but not of `start_info.memmap_entries`, a
+literal 1 unless `add_acpi` ran, so an Akuma guest saw 3 GiB. Both fixed in
+[`KVM_GUEST_4GIB_PVH_HANDOFF.md`](KVM_GUEST_4GIB_PVH_HANDOFF.md); the handoff now always sits under the
+low extent's top.
+
 ## Still open
 
 - A guest past 3 GiB has a two-extent physical layout; nothing is lost (the excess sits above

@@ -1026,21 +1026,20 @@ pub fn run(nrips: bool, vm: &Vm) {
     let acpi_by_scan = guest.is_akuma();
     // The guest-physical RAM map (`svm::rammap`): flat to 3 GiB, then the PC shape — the
     // device window (virtio-mmio, local APIC) stays unmapped and excess RAM moves above
-    // 4 GiB. The handoff pages sit under the top of RAM; the ACPI page, when the map
-    // announces it, one page under them; each reported RAM extent stops short of all of it.
+    // 4 GiB. The handoff pages sit under the top of the LOW extent, never the high one:
+    // `hvm_start_info`'s address reaches the guest in EBX, a 32-bit register, so a
+    // start_info above 4 GiB arrives truncated (a 4096 MiB guest was handed 0x3fff_f000
+    // for 0x1_3fff_f000 and halted on "no hvm_start_info magic"). The ACPI page, when the
+    // map announces it, sits one page under them; the low RAM entry stops short of all of
+    // it, and the high extent is reported whole.
     let Some(m) = svm::rammap::plan(ram_bytes) else {
         p("[KVM] linux: refused: RAM is not a 2 MiB multiple of at most 4 GiB\n");
         return;
     };
-    let top = m.top();
+    let top = m.low.bytes;
     let acpi_gpa = if acpi_by_scan { BIOS_RSDP_GPA } else { top - 0x4000 };
     let keep = if acpi && !acpi_by_scan { 0x4000 } else { 0x3000 };
-    let (ram_len, hi_base, hi_len) = if m.high.bytes == 0 {
-        (ram_bytes - keep, 0, 0)
-    } else {
-        (m.low.bytes, m.high.gpa, m.high.bytes - keep)
-    };
-    let l = pvh::plan(top, 0, ram_len, hi_base, hi_len);
+    let l = pvh::plan(top, 0, top - keep, m.high.gpa, m.high.bytes);
     scratch.bytes_mut().fill(0);
     // The guest is told the host's TSC rate rather than left to calibrate it through trapped
     // port reads: a poll loop whose every iteration is a VM exit measures the exits, not the

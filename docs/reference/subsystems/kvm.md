@@ -216,7 +216,11 @@ adds one for a single driver. It is opened by the kernel's own `openat` arm like
   `0xD000_0000`, the local APIC page at `0xFEE0_0000`) and stays unmapped, and RAM past 3 GiB moves
   above 4 GiB. The NPT allocates one directory page of 512 2 MiB leaves per GiB that holds RAM (at
   4 GiB: four directories, 16 KiB more than the one page of the 1 GiB NPT), the PVH memory map reports
-  the two extents with the window as the gap, and the Akuma guest needs ≥ 768 MiB.
+  the two extents with the window as the gap, and the Akuma guest needs ≥ 768 MiB. **The PVH handoff
+  pages (cmdline, memmap, `hvm_start_info`, and Linux's ACPI page) always sit under the top of the low
+  extent**, never above 4 GiB: the guest gets `start_info`'s address in 32-bit EBX. `memmap_entries` is
+  the layout's RAM-entry count (`pvh::ram_entries`), whether or not an ACPI entry follows
+  ([`KVM_GUEST_4GIB_PVH_HANDOFF.md`](../../archive/KVM_GUEST_4GIB_PVH_HANDOFF.md)).
 - **Cores (`kvmcores=<list>`, spec `vm_cores`).** `kvmcores` is the machine's allowed set (default core 0), `vm_cores`
   the VM's own mask (default: everything allowed); `akuma_vm_spec::cores::place` puts virtual processor `i` on the
   `i`-th usable core of the intersection (wrapping: processors sharing a core take turns, as before placement). The

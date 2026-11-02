@@ -2085,8 +2085,10 @@ pub mod pvh {
     ///
     /// Three pages under `top_gpa`, RAM entries covering
     /// `[ram_base, ram_base + ram_len)` and — when the RAM crossed the device window —
-    /// `[ram_hi_base, ram_hi_base + ram_hi_len)`. `top_gpa` is the top of the *upper*
-    /// extent when there is one; every handoff page and the ACPI page sit under it.
+    /// `[ram_hi_base, ram_hi_base + ram_hi_len)`. `top_gpa` is the top of the *low*
+    /// extent, whatever the RAM's size: `start_gpa` reaches the guest in EBX, a 32-bit
+    /// register, so a handoff page above 4 GiB arrives truncated. Every handoff page and
+    /// the ACPI page sit under it, and only the low RAM entry stops short of them.
     #[must_use]
     pub const fn plan(top_gpa: u64, ram_base: u64, ram_len: u64, ram_hi_base: u64, ram_hi_len: u64) -> Layout {
         Layout {
@@ -2110,8 +2112,18 @@ pub mod pvh {
         wr64(buf, F_CMDLINE, l.cmdline_gpa);
         wr64(buf, F_RSDP, 0);
         wr64(buf, F_MEMMAP, l.memmap_gpa);
-        wr32(buf, F_ENTRIES, 1);
+        // The RAM entries `write_memmap` writes, told to the guest here. It was a literal 1,
+        // corrected only by `add_acpi`: a guest given no ACPI entry (the Akuma kernel scans
+        // for its RSDP) was told of the low extent alone and never saw RAM above 4 GiB.
+        wr32(buf, F_ENTRIES, ram_entries(l));
         wr32(buf, F_RESERVED, 0);
+    }
+
+    /// How many RAM entries the memory map for `l` carries: two when the RAM crossed the
+    /// device window, else one.
+    #[must_use]
+    pub const fn ram_entries(l: &Layout) -> u32 {
+        if l.ram_hi_len == 0 { 1 } else { 2 }
     }
 
     /// Write the memory map into the `memmap_gpa` page: the RAM entry (two when the
@@ -2122,16 +2134,13 @@ pub mod pvh {
         wr64(buf, E_SIZE, l.ram_len);
         wr32(buf, E_TYPE, MEMMAP_RAM);
         wr32(buf, E_RESERVED, 0);
-        let entries = if l.ram_hi_len == 0 {
-            1
-        } else {
+        if l.ram_hi_len != 0 {
             wr64(buf, MEMMAP_ENTRY_SIZE + E_ADDR, l.ram_hi_base);
             wr64(buf, MEMMAP_ENTRY_SIZE + E_SIZE, l.ram_hi_len);
             wr32(buf, MEMMAP_ENTRY_SIZE + E_TYPE, MEMMAP_RAM);
             wr32(buf, MEMMAP_ENTRY_SIZE + E_RESERVED, 0);
-            2
-        };
-        wr32(buf, F_ENTRIES, entries);
+        }
+        wr32(buf, F_ENTRIES, ram_entries(l));
     }
 
     /// `hvm_memmap_table_entry.type` = ACPI tables (reclaimable).
@@ -3506,13 +3515,17 @@ mod tests {
 
     /// The memory map for a 4096 MiB guest: two RAM entries around the device window,
     /// summing to the RAM less the handoff pages, with the window as the named gap —
-    /// and the ACPI entry appended after both.
+    /// and the ACPI entry appended after both. The handoff pages sit under the top of the
+    /// LOW extent: the guest is handed `start_gpa` in 32-bit EBX.
     #[test]
     fn the_memory_map_for_4096_mib_names_the_hole_and_sums_to_the_ram() {
         const RAM: u64 = 4096 << 20;
         let m = rammap::plan(RAM).expect("lays out");
-        let top = m.top();
-        let l = pvh::plan(top, 0, m.low.bytes, m.high.gpa, m.high.bytes - 0x3000);
+        let top = m.low.bytes;
+        let l = pvh::plan(top, 0, top - 0x3000, m.high.gpa, m.high.bytes);
+        for gpa in [l.cmdline_gpa, l.memmap_gpa, l.start_gpa] {
+            assert!(gpa + 0x1000 <= 1 << 32, "a handoff page at {gpa:#x} does not survive EBX");
+        }
 
         let mut page = [0u8; 4096];
         pvh::write_memmap(&mut page, &l);
@@ -3525,13 +3538,14 @@ mod tests {
             )
         };
         assert_eq!(&page[0x30..0x34], &2u32.to_le_bytes(), "two RAM entries");
-        assert_eq!(entry(&page, 0), (0, 3 << 30, 1));
-        assert_eq!(entry(&page, 1), (4 << 30, (1 << 30) - 0x3000, 1));
+        assert_eq!(entry(&page, 0), (0, (3 << 30) - 0x3000, 1));
+        assert_eq!(entry(&page, 1), (4 << 30, 1 << 30, 1));
         assert_eq!(entry(&page, 0).1 + entry(&page, 1).1, RAM - 0x3000, "usable RAM: the size less the handoff pages");
-        assert_eq!(entry(&page, 1).0 - (entry(&page, 0).0 + entry(&page, 0).1), 1 << 30, "the gap is exactly the device window");
+        assert_eq!(entry(&page, 1).0 - (entry(&page, 0).0 + entry(&page, 0).1), (1 << 30) + 0x3000, "the gap is the device window plus the handoff pages");
 
         let mut start = [0u8; 4096];
         pvh::write_start(&mut start, &l);
+        assert_eq!(&start[0x30..0x34], &2u32.to_le_bytes(), "start_info names both RAM entries with no ACPI entry");
         pvh::add_acpi(&mut start, &mut page, 0xDEAD_0000, top - 0x4000, 0x1000);
         assert_eq!(&start[0x30..0x34], &3u32.to_le_bytes(), "the ACPI entry came after both RAM entries");
         assert_eq!(entry(&page, 2), (top - 0x4000, 0x1000, 3));
