@@ -78,3 +78,26 @@ crate switch, `akuma-runtime-tokio`, one ELF loader, containers off) under Pop's
 **K1 == K2** (also `cmp`-identical on the Mac), with 0 fault, panic or bad-frame lines on either console. The
 image is larger than the 10-31 one because it is built with `trace-err` and carries everything B1-B13 pulled in.
 The bare-metal repeat under Akuma's hypervisor (`fp_metal.py`) waits for the ryzen to boot into Akuma.
+
+## After B15 (2026-11-02)
+
+Re-run on `961a77be` (the same kernel source as B15 - Taoxichuan moved into `akuma-tokio-kernel`), under
+Pop's Linux KVM on the ryzen with `scripts/kvm/taoxichuan/fp_pop.py` (smp=4, 3 GiB; K(n) pulled with
+`qemu-nbd --read-only` + `debugfs dump` and checked against the guest's own `md5sum`):
+
+| generation | built by | md5 | bytes | build time |
+|---|---|---|---|---|
+| K0 | the Mac (`--features no-tests,trace-err`) | `0272f1eb7de0e031e4266e9d89aec181` | - | - |
+| K1 | a guest running K0 | `5f568279177b7edf28bbc9445fee4d4c` | 2,304,624 | ~450 s (Mac-driven; its `/tmp/fp.status` is not preserved) |
+| K2 | a guest running K1 | `5f568279177b7edf28bbc9445fee4d4c` | 2,304,624 | 452 s (`/tmp/fp.status` pulled out of the overlay: 16:48:32 checked out, 16:56:11 built) |
+
+**K1 == K2** (`cmp`-identical), and each pulled kernel's md5 equals its guest's own `md5sum`. Generation 1's
+console had 0 fault-ish lines; generation 2's console has exactly one, `[BKL] cpu 0 stuck: owner cpu 2`
+(the BKL watchdog's "stuck" wording, not a Fault/PANIC/BADFRAME).
+
+**The Mac drove only half of generation 2.** It booted the K1 guest at 16:48 and the build finished at
+16:56, but the Mac never came back to stop the guest and pull K2. At 18:02 the ryzen's goose handoff
+session finished the generation by hand with `fp_pop.py`'s own commands: stopped the guest by its pidfile
+(`TX_RUN=/root/tx-fp bash /root/tx-pop.sh stop`), pulled K2 and `/tmp/fp.status` out of the overlay with
+`/dev/nbd7` (`qemu-nbd --read-only`, `debugfs dump`, `qemu-nbd -d`), and checked the pulled md5 against the
+guest's. Nothing was rebuilt or rebooted; both steps the Mac skipped are the ones done by hand.
