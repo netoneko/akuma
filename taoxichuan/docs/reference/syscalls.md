@@ -9,7 +9,7 @@ real traces; re-run the classifier rather than trusting a list here).
 sequenceDiagram
     participant U as task (ring 3)
     participant S as syscall stub (akuma-ring3-amd64)
-    participant D as dispatch (main.rs)
+    participant D as dispatch (lib.rs)
     participant T as akuma-runtime-tokio
     participant G as glue / glue-amd64
     U->>S: syscall (rax=nr, args; CPU masks IF)
@@ -34,7 +34,7 @@ assertions.
 
 ## Who answers, in order
 
-`dispatch` (main.rs) takes the big kernel lock for the whole call (nesting if this core holds it), ends
+`dispatch` (lib.rs) takes the big kernel lock for the whole call (nesting if this core holds it), ends
 the caller first if a sibling's `exit_group` asked it to, and then `dispatch_inner` asks:
 
 1. **`akuma_syscalls_abi::legacy::fold`.** The x86-only path spellings (`rename` 82, `mkdir` 83, `rmdir` 84,
@@ -86,16 +86,16 @@ Every arm `dispatch_inner` keeps after the steps above:
 
 | nr | call | arm (file) | notes |
 |---|---|---|---|
-| 60, 231 | `exit`, `exit_group` | dispatch (main.rs) → `child::task_exit_*` | `akuma-syscalls-proc::exit::scope`: `exit` from a thread ends the thread, otherwise the group. The boot task's exit is `task_done` |
-| 12 | `brk` | dispatch (main.rs) | `akuma-user-layout` plans it; grows by mapping zeroed pages; shrink is bookkeeping; failure returns the old break |
-| 158 | `arch_prctl` | dispatch (main.rs) | `ARCH_SET_FS`/`ARCH_GET_FS` through `akuma-cpu`'s canonical-checked MSR write; `SET_FS` also stamps the slot's fs shadow ([`processes.md`](processes.md) § fs) |
-| 9 | `mmap` | dispatch (main.rs) | anonymous and file-backed (filled from the inode); W^X check from `akuma-syscalls-mem`; placement from `akuma-user-layout` ([`memory.md`](memory.md)) |
-| 10 | `mprotect` | `mprotect_arm` (main.rs) | re-maps the PTEs under the W^X rule; `cow_privatize` before a shared frame goes writable |
-| 11 | `munmap` | `munmap_arm` (main.rs) | returns the frames and the span to the hole table |
-| 26 | `msync` | `msync_arm` (main.rs) | writes a writable `MAP_SHARED` file mapping back to its file |
-| 28 | `madvise` | `madvise_arm` (main.rs) | `akuma-syscalls-mem` decode; `MADV_DONTNEED` zeroes the mmap-slab pages (a frame a fork peer maps is replaced, not zeroed); `MADV_FREE` is `EINVAL` |
-| 25 | `mremap` | dispatch (main.rs) | shrink frees the tail; grow in place at the slab top, else move and copy; `MREMAP_FIXED` refused |
-| 24 | `sched_yield` | dispatch (main.rs) | `akuma_threading::x86_yield` when another thread is runnable |
+| 60, 231 | `exit`, `exit_group` | dispatch (lib.rs) → `child::task_exit_*` | `akuma-syscalls-proc::exit::scope`: `exit` from a thread ends the thread, otherwise the group. The boot task's exit is `task_done` |
+| 12 | `brk` | dispatch (lib.rs) | `akuma-user-layout` plans it; grows by mapping zeroed pages; shrink is bookkeeping; failure returns the old break |
+| 158 | `arch_prctl` | dispatch (lib.rs) | `ARCH_SET_FS`/`ARCH_GET_FS` through `akuma-cpu`'s canonical-checked MSR write; `SET_FS` also stamps the slot's fs shadow ([`processes.md`](processes.md) § fs) |
+| 9 | `mmap` | dispatch (lib.rs) | anonymous and file-backed (filled from the inode); W^X check from `akuma-syscalls-mem`; placement from `akuma-user-layout` ([`memory.md`](memory.md)) |
+| 10 | `mprotect` | `mprotect_arm` (lib.rs) | re-maps the PTEs under the W^X rule; `cow_privatize` before a shared frame goes writable |
+| 11 | `munmap` | `munmap_arm` (lib.rs) | returns the frames and the span to the hole table |
+| 26 | `msync` | `msync_arm` (lib.rs) | writes a writable `MAP_SHARED` file mapping back to its file |
+| 28 | `madvise` | `madvise_arm` (lib.rs) | `akuma-syscalls-mem` decode; `MADV_DONTNEED` zeroes the mmap-slab pages (a frame a fork peer maps is replaced, not zeroed); `MADV_FREE` is `EINVAL` |
+| 25 | `mremap` | dispatch (lib.rs) | shrink frees the tail; grow in place at the slab top, else move and copy; `MREMAP_FIXED` refused |
+| 24 | `sched_yield` | dispatch (lib.rs) | `akuma_threading::x86_yield` when another thread is runnable |
 | 130, 127 | `rt_sigsuspend`, `rt_sigpending` | glue, called directly | glue's arms, as on the other kernels |
 | 34 | `pause` | `akuma_syscalls_glue::sys_pause` | |
 | 15 | `rt_sigreturn` | `child::sigreturn_arm` | restores the frame `push_handler` saved |

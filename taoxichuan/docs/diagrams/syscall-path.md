@@ -6,7 +6,7 @@ Embedded inline in `../reference/syscalls.md`. Keep the two in the same commit.
 sequenceDiagram
     participant U as task (ring 3)
     participant S as syscall stub (akuma-ring3-amd64)
-    participant D as dispatch (main.rs)
+    participant D as dispatch (lib.rs)
     participant T as akuma-runtime-tokio
     participant G as glue / glue-amd64
     U->>S: syscall (rax=nr, args; CPU masks IF)

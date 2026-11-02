@@ -148,6 +148,7 @@ pub fn mark_idle(tid: usize, cpu: usize) {
     }
 }
 
+#[cfg(feature = "smp")]
 /// Core `cpu`'s idle thread is the context it is about to run: mark and adopt it.
 pub fn adopt_idle(tid: usize, cpu: usize) {
     mark_idle(tid, cpu);

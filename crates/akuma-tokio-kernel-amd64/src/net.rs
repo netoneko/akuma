@@ -356,6 +356,17 @@ fn lap_note(dur_us: u64) {
     }
 }
 
+/// The socket layer with no NIC: `127.0.0.1` works, nothing else is reachable. A kernel
+/// that leaves `Kernel::net` unwired, or whose NIC probe failed.
+pub fn loopback_init() {
+    if akuma_net::init_loopback_only(runtime()).is_err() {
+        crate::console::puts("  net: loopback init failed\n");
+        return;
+    }
+    crate::console::puts("  net: loopback only\n");
+}
+
+#[cfg(feature = "net")]
 /// The stack itself (probe virtio-net, bring up smoltcp, start DHCP); the
 /// clock was calibrated earlier ([`calibrate`], before `exec_twin::init`).
 /// Then the DHCP wait: bounded, pumping the NIC, so the guest
@@ -363,12 +374,12 @@ fn lap_note(dur_us: u64) {
 pub fn net_init() -> bool {
     akuma_primitives::safe_print!(96, "  net: stack init begin\n");
     if akuma_net::init(runtime(), true).is_err() {
-        akuma_comconsole::puts("  net: stack init failed -- no virtio-net device\n");
+        crate::console::puts("  net: stack init failed -- no virtio-net device\n");
         return false;
     }
     NET_UP.store(true, core::sync::atomic::Ordering::Release);
     crate::raw_uart(b"[raw] stack up, dhcp loop\n");
-    akuma_comconsole::puts("  net: smoltcp stack up, DHCP requested\n");
+    crate::console::puts("  net: smoltcp stack up, DHCP requested\n");
     let deadline = uptime_us() + 10_000_000; // 10 s
     while uptime_us() < deadline {
         netpoll();
@@ -386,6 +397,6 @@ pub fn net_init() -> bool {
         }
         wait_lap();
     }
-    akuma_comconsole::puts("  net: DHCP not answered in 10 s -- continuing unaddressed\n");
+    crate::console::puts("  net: DHCP not answered in 10 s -- continuing unaddressed\n");
     false
 }

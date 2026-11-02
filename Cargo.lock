@@ -930,6 +930,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-tokio-kernel"
+version = "0.1.0"
+dependencies = [
+ "akuma-tokio-kernel-amd64",
+]
+
+[[package]]
+name = "akuma-tokio-kernel-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-boot-amd64",
+ "akuma-comconsole",
+ "akuma-cow",
+ "akuma-cpu",
+ "akuma-elf-exec",
+ "akuma-exec",
+ "akuma-ext2",
+ "akuma-fpu-amd64",
+ "akuma-gdt",
+ "akuma-idt-amd64",
+ "akuma-isolation",
+ "akuma-lapic-amd64",
+ "akuma-mmap",
+ "akuma-mmu",
+ "akuma-net",
+ "akuma-pmm",
+ "akuma-port",
+ "akuma-primitives",
+ "akuma-pte-amd64",
+ "akuma-ring3-amd64",
+ "akuma-runtime-tokio",
+ "akuma-ryzen-amd64",
+ "akuma-sched-amd64",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-glue",
+ "akuma-syscalls-glue-amd64",
+ "akuma-syscalls-linux",
+ "akuma-syscalls-mem",
+ "akuma-syscalls-proc",
+ "akuma-threading",
+ "akuma-trap-amd64",
+ "akuma-tty",
+ "akuma-user-access",
+ "akuma-user-layout",
+ "akuma-user-tree",
+ "akuma-user-walk",
+ "akuma-vfs",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "spinning_top",
+]
+
+[[package]]
 name = "akuma-touchpad"
 version = "0.1.0"
 dependencies = [
@@ -1234,6 +1288,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "osaka"
+version = "0.1.0"
+dependencies = [
+ "akuma-tokio-kernel",
+]
+
+[[package]]
 name = "owned_ttf_parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1350,47 +1411,7 @@ dependencies = [
 name = "taoxichuan"
 version = "0.1.0"
 dependencies = [
- "akuma-alloc",
- "akuma-boot-amd64",
- "akuma-comconsole",
- "akuma-cow",
- "akuma-cpu",
- "akuma-elf-exec",
- "akuma-exec",
- "akuma-ext2",
- "akuma-fpu-amd64",
- "akuma-gdt",
- "akuma-idt-amd64",
- "akuma-isolation",
- "akuma-lapic-amd64",
- "akuma-mmap",
- "akuma-mmu",
- "akuma-net",
- "akuma-pmm",
- "akuma-port",
- "akuma-primitives",
- "akuma-pte-amd64",
- "akuma-ring3-amd64",
- "akuma-runtime-tokio",
- "akuma-ryzen-amd64",
- "akuma-sched-amd64",
- "akuma-syscalls-abi",
- "akuma-syscalls-glue",
- "akuma-syscalls-glue-amd64",
- "akuma-syscalls-linux",
- "akuma-syscalls-mem",
- "akuma-syscalls-proc",
- "akuma-threading",
- "akuma-trap-amd64",
- "akuma-tty",
- "akuma-user-access",
- "akuma-user-layout",
- "akuma-user-tree",
- "akuma-user-walk",
- "akuma-vfs",
- "akuma-vfs-glue",
- "akuma-virtio",
- "spinning_top",
+ "akuma-tokio-kernel",
 ]
 
 [[package]]

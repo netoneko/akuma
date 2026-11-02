@@ -37,9 +37,6 @@
 
 use akuma_exec::{ExecConfig, ExecRuntime};
 use akuma_threading::{ProcessHooks, ThreadConfig, ThreadRuntime};
-// `read_file` on the ext2 root is the `akuma_vfs::Filesystem` trait method —
-// child.rs imports the trait for the same reason.
-use akuma_vfs::Filesystem as _;
 
 /// The slot sentinel for "the boot task (sshd) is running": no spawn slot.
 /// Outside the spawn ring's indices by construction, so a child slot can
@@ -198,7 +195,7 @@ fn thread_runtime() -> ThreadRuntime {
         // ThreadRuntime's own EOI is dead on x86 (amd64's reason: the real
         // EOI lives in ExecRuntime, which has it below).
         end_of_interrupt: |_| {},
-        print_str: akuma_comconsole::puts,
+        print_str: crate::console::puts,
     }
 }
 
@@ -260,7 +257,7 @@ fn exec_runtime() -> ExecRuntime {
             (s.heap_size, s.allocated)
         },
         is_memory_low: akuma_alloc::is_memory_low,
-        print_str: akuma_comconsole::puts,
+        print_str: crate::console::puts,
         // The ext2 root, read through this kernel's own paths. `resolve_inode`
         // + `read_at_by_inode` are the same bytes ring 3 already gets.
         read_file: |path| crate::root_fs().read_file(path).map_err(|_| -1),

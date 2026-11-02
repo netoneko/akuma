@@ -81,7 +81,7 @@ copy-on-write page breaks the share in the fault handler first.
 
 ## fork's memory: copy-on-write
 
-`clone_user_half` (main.rs) builds a fork child's address space, reached
+`clone_user_half` (lib.rs) builds a fork child's address space, reached
 through the twin's `ExecRuntime::fork_share_memory` hook
 ([`processes.md`](processes.md)): a fresh root (kernel half shared by the same
 PML4 copy), then a subtree-by-subtree clone of the parent's **user half

@@ -7,7 +7,7 @@ commit.
 flowchart LR
     PIT["8254 PIT ch2 (ports 0x42/0x43/0x61)<br/>calibration reference"] -->|50 ms window| CAL["calibrate (lapic_init)<br/>counts/tick, tsc_hz"]
     CAL --> LVT["xAPIC LVT timer, periodic<br/>vector 32 (TIMER_VECTOR)<br/>akuma-lapic-amd64"]
-    LVT -->|tick| TT["timer_trap (main.rs)"]
+    LVT -->|tick| TT["timer_trap (lib.rs)"]
     CAL --> CLK["net::calibrate → net::uptime_us (TSC)<br/>one clock: ExecRuntime, ThreadRuntime, primitives::clock"]
     TT --> G{"from ring 3 AND slot<br/>slotted (not NO_SLOT)<br/>AND PREEMPT_ARMED?"}
     G -->|yes| Y["akuma_threading::x86_yield()<br/>→ switch_to on the per-slot trap stack"]

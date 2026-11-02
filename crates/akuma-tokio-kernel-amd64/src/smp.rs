@@ -13,29 +13,42 @@
 //! Stage S-b ends with every AP **online and halted** (`cli; hlt`): no timer,
 //! no task. Stage S-c gives them the picker.
 
+#[cfg(feature = "smp")]
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
+#[cfg(feature = "smp")]
 use akuma_boot_amd64::phys::phys_ptr;
 
 /// Most cores the per-CPU tables hold (`akuma_ring3_amd64::MAX_CPUS`).
 pub const MAX_CPUS: usize = akuma_ring3_amd64::MAX_CPUS;
 
+#[cfg(feature = "smp")]
 const AP_TRAMPOLINE_PA: u64 = 0x8000;
+#[cfg(feature = "smp")]
 const AP_STARTUP_VECTOR: u8 = (AP_TRAMPOLINE_PA >> 12) as u8;
+#[cfg(feature = "smp")]
 /// Mailbox offsets, mirrored as `AP_MB_*` in `boot.s`.
 const AP_MB_CR3: u64 = AP_TRAMPOLINE_PA + 0xF00;
+#[cfg(feature = "smp")]
 const AP_MB_STACK: u64 = AP_TRAMPOLINE_PA + 0xF08;
+#[cfg(feature = "smp")]
 const AP_MB_ENTRY: u64 = AP_TRAMPOLINE_PA + 0xF10;
+#[cfg(feature = "smp")]
 const AP_MB_INDEX: u64 = AP_TRAMPOLINE_PA + 0xF18;
+#[cfg(feature = "smp")]
 /// An AP's boot stack is also its idle thread's: it runs `netpoll` (smoltcp) and
 /// takes ticks that nest another `netpoll`, so it is far deeper than amd64's 32 KiB.
 const AP_STACK_SIZE: usize = 128 * 1024;
+#[cfg(feature = "smp")]
 const PTE_P_RW: u64 = 0x3;
+#[cfg(feature = "smp")]
 /// Microseconds to wait after INIT, and the budget (spins) for an AP to report.
 const AP_INIT_DELAY_US: u64 = 10_000;
+#[cfg(feature = "smp")]
 const AP_ONLINE_BUDGET_US: u64 = 200_000;
 
+#[cfg(feature = "smp")]
 unsafe extern "C" {
     static ap_trampoline_start: u8;
     static ap_trampoline_end: u8;
@@ -374,6 +387,7 @@ pub fn online_cpus() -> usize {
     ONLINE.load(Ordering::Acquire)
 }
 
+#[cfg(feature = "smp")]
 fn tsc_delay_us(us: u64) {
     let hz = akuma_lapic_amd64::tsc_hz().max(1);
     let end = akuma_cpu::tsc::rdtsc().wrapping_add(us * hz / 1_000_000);
@@ -382,12 +396,14 @@ fn tsc_delay_us(us: u64) {
     }
 }
 
+#[cfg(feature = "smp")]
 fn mailbox_write(pa: u64, v: u64) {
     // SAFETY: inside the trampoline page, which `start_secondaries` owns for
     // the duration of bring-up (RAM below 1 MiB, clear of the PVH block).
     unsafe { phys_ptr::<u64>(pa).write_volatile(v) };
 }
 
+#[cfg(feature = "smp")]
 /// Copy the active kernel PML4 into `__ap_pml4` with slot 0 pointing at
 /// `boot.s`'s still-intact identity PDPT, so the trampoline has somewhere to
 /// stand before it jumps high. Returns the root's physical address (it must be
@@ -408,6 +424,7 @@ fn ap_boot_root() -> u64 {
     root
 }
 
+#[cfg(feature = "smp")]
 fn install_trampoline() -> bool {
     let (src, len) = {
         let s = &raw const ap_trampoline_start;
@@ -422,6 +439,7 @@ fn install_trampoline() -> bool {
     true
 }
 
+#[cfg(feature = "smp")]
 /// The APIC ids of every enabled CPU the firmware tables list, or `None`.
 fn madt_cpus(cpus: &mut [u8; 32]) -> Option<usize> {
     use akuma_ryzen_amd64::acpi;
@@ -434,6 +452,7 @@ fn madt_cpus(cpus: &mut [u8; 32]) -> Option<usize> {
     Some(n)
 }
 
+#[cfg(feature = "smp")]
 /// Start every AP the MADT lists, up to `cap` CPUs in total. Returns how many
 /// APs came online. Serial, one core at a time through one mailbox.
 pub fn start_secondaries(cap: usize) -> usize {
@@ -497,6 +516,7 @@ pub fn start_secondaries(cap: usize) -> usize {
     started
 }
 
+#[cfg(feature = "smp")]
 fn wait_online(idx: usize) -> bool {
     let mut waited = 0u64;
     while !AP_UP[idx].load(Ordering::Acquire) {
@@ -509,6 +529,7 @@ fn wait_online(idx: usize) -> bool {
     true
 }
 
+#[cfg(feature = "smp")]
 /// Where the trampoline's `jmp` lands, in long mode on the stack the BSP
 /// allocated, `rdi` = this core's index. Brings the core to "kernel code can
 /// run here" (GDT/TSS, per-CPU block, IDT, SSE, syscall MSRs) and halts it.

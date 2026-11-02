@@ -13,7 +13,7 @@ What this kernel supplies:
   `pipe_clone_ref`/`pipe_write` are glue's own, so a fork's deep clone takes a
   reference per end, and every close, `dup2` displacement, close-on-exec sweep
   and exit drops one.
-- **The wake sink** (`main.rs`, beside the vfs-glue mount): a parked reader or
+- **The wake sink** (`akuma-runtime-tokio::install`, called from `lib.rs`'s `install_surface`): a parked reader or
   writer is woken by slot number with a fresh handle — amd64's `pipe::wake_sink`.
 - **Exit closes the table before the reap** (`child::close_process_fds`): a
   pipeline's reader gets EOF when its last writer *exits*, not when the writer's

@@ -10,8 +10,15 @@ crate is pulled, never copied). **This folder is the living documentation of
 the kernel as it is now**; the archive holds how it got here.
 
 This folder replaced `docs/taoxichuan/` (which is now a pointer here): the
-docs live next to the kernel they describe so a session touching
-`taoxichuan/src/` sees them.
+docs live next to the kernel they describe.
+
+**Where the code is (since B15, 2026-11-02).** `taoxichuan/src/main.rs` is one
+`Kernel` chain over `akuma-tokio-kernel`; everything these docs describe moved,
+unchanged, to [`crates/akuma-tokio-kernel-amd64/src/`](../../crates/akuma-tokio-kernel-amd64/src)
+(`main.rs` became `lib.rs`; `child.rs`, `exec_twin.rs`, `net.rs`, `sched.rs`,
+`smp.rs`, `ring.rs` kept their names). A file named here without a path is that
+crate's. Every kernel built on the crate (Osaka is the sample) is described by
+these docs too.
 
 ## Layout of this folder (the model keeps it current)
 

@@ -1,5 +1,5 @@
 //! Host model of a CoW fork: a fake page-table tree with per-frame reference counts, driven by the same
-//! recursion the kernel runs (`taoxichuan/src/main.rs`: `clone_user_tree` / `free_subtree`) but taking
+//! recursion the kernel runs (`crates/akuma-tokio-kernel-amd64/src/lib.rs`: `clone_user_tree` / `free_subtree`) but taking
 //! every decision from the crate's plans.
 
 use super::*;

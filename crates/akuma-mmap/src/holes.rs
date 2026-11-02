@@ -12,7 +12,7 @@
 //! Order matters and is pinned: removal is `swap_remove` (the last entry moves
 //! into the gap), and first-fit scans in table order, so the address a given
 //! history yields is a function of this exact sequence. Moved verbatim out of
-//! `taoxichuan/src/main.rs` (`add_hole`/`carve_hole`/`mmap_alloc`); the cursor
+//! `crates/akuma-tokio-kernel-amd64/src/lib.rs` (`add_hole`/`carve_hole`/`mmap_alloc`); the cursor
 //! stays the caller's (`Task::mmap_cur`), passed in as `&mut u64`.
 
 /// A fixed-capacity set of disjoint, non-abutting `[start, end)` holes.

@@ -85,6 +85,7 @@
   "crates/akuma-syscalls-time": 16,
   "crates/akuma-threading": 104,
   "crates/akuma-timer": 5,
+  "crates/akuma-tokio-kernel-amd64": 150,
   "crates/akuma-touchpad": 58,
   "crates/akuma-trap-aarch64": 6,
   "crates/akuma-trap-amd64": 20,
@@ -102,6 +103,5 @@
   "crates/akuma-vm-spec": 42,
   "crates/akuma-wifi": 49,
   "crates/akuma-wpa": 75,
-  "crates/akuma-xhci": 27,
-  "taoxichuan/src": 143
+  "crates/akuma-xhci": 27
 }

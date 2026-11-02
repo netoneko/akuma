@@ -9,7 +9,7 @@ against a current boot).
 flowchart LR
     PIT["8254 PIT ch2 (ports 0x42/0x43/0x61)<br/>calibration reference"] -->|50 ms window| CAL["calibrate (lapic_init)<br/>counts/tick, tsc_hz"]
     CAL --> LVT["xAPIC LVT timer, periodic<br/>vector 32 (TIMER_VECTOR)<br/>akuma-lapic-amd64"]
-    LVT -->|tick| TT["timer_trap (main.rs)"]
+    LVT -->|tick| TT["timer_trap (lib.rs)"]
     CAL --> CLK["net::calibrate → net::uptime_us (TSC)<br/>one clock: ExecRuntime, ThreadRuntime, primitives::clock"]
     TT --> G{"from ring 3 AND slot<br/>slotted (not NO_SLOT)<br/>AND PREEMPT_ARMED?"}
     G -->|yes| Y["akuma_threading::x86_yield()<br/>→ switch_to on the per-slot trap stack"]
@@ -23,7 +23,7 @@ Canonical mermaid source: [`../diagrams/scheduling.md`](../diagrams/scheduling.m
 
 - The tick source is the extracted crate
   [`crates/akuma-lapic-amd64`](../../../crates/akuma-lapic-amd64): `lapic_init`
-  (main.rs) masks the legacy PICs
+  (lib.rs) masks the legacy PICs
   ([`crates/akuma-port`](../../../crates/akuma-port)), sets
   `IA32_APIC_BASE.APIC_GLOBAL_ENABLE`, maps the LAPIC page device-uncached,
   and hands the crate the window — which software-enables the LAPIC,
@@ -187,7 +187,7 @@ next 10 ms tick. A core marks itself halted in `park_halt` and does not halt if 
   (`smp::ap_entry64`): hardware leaves it set, but Akuma's SVM model starts a
   non-boot vCPU with it clear and the ID read faults (nested page fault at
   `0xfee00020`). A guest needs `smp=N` on its cmdline *and* `vm_vcpus = N`.
-- The syscall dispatcher (`main.rs` `dispatch`) saves and restores the user-`RSP` stash around every call, so
+- The syscall dispatcher (`lib.rs` `dispatch`) saves and restores the user-`RSP` stash around every call, so
   any park inside one (glue's `futex`, `nanosleep`, a pipe or socket wait) is covered: a parked task can resume
   on another core.
 

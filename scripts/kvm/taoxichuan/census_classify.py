@@ -57,7 +57,7 @@ def legacy_fold():
 
 
 def local_arms(row):
-    text = src("taoxichuan/src/main.rs")
+    text = src("crates/akuma-tokio-kernel-amd64/src/lib.rs")
     body = fn_body(text, "fn dispatch_inner(")
     consts = set(re.findall(r"akuma_syscalls_abi::x86_64::([A-Z0-9_]+)", body))
     by_const = {re.sub(r"(?<!^)(?=[A-Z])", "_", n).upper(): v for n, v in row.items()}

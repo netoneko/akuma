@@ -71,6 +71,7 @@
     "crates/akuma-syscalls-signal",
     "crates/akuma-syscalls-sync",
     "crates/akuma-syscalls-time",
+    "crates/akuma-tokio-kernel",
     "crates/akuma-touchpad",
     "crates/akuma-tty",
     "crates/akuma-usb",
@@ -113,11 +114,11 @@
     "crates/akuma-slot-table": 9,
     "crates/akuma-threading": 65,
     "crates/akuma-timer": 1,
+    "crates/akuma-tokio-kernel-amd64": 33,
     "crates/akuma-trap-aarch64": 14,
     "crates/akuma-trap-amd64": 2,
     "crates/akuma-uart": 1,
     "crates/akuma-user-access": 20,
-    "crates/akuma-virtio": 17,
-    "taoxichuan/src": 33
+    "crates/akuma-virtio": 17
   }
 }

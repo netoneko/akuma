@@ -12,7 +12,7 @@ TABLES_DIR holds four inputs, taken from a Linux tree and the musl cross toolcha
 
 Checks: every constant in akuma-syscalls-linux::nr, akuma-syscalls-abi's rows (both halves),
 akuma-ring3-amd64::nr and libakuma's two per-arch tables (sshd's syscall layer); literal dispatch
-arms in amd64/src/usermode.rs and taoxichuan/src against the call their comment names; and
+arms in amd64/src/usermode.rs and crates/akuma-tokio-kernel-amd64/src against the call their comment names; and
 explicit "name = N" / "name (N)" / "x86_64 N" claims in comments. The arm and comment checks
 are heuristics and report false positives - read each hit in context. Findings and their review:
 docs/archive/SYSCALL_CONSTANT_AUDIT_2026_10_30.md.
@@ -126,7 +126,7 @@ NAMES_X86 = set(X86)
 def names_in(s):
     return {w for w in re.findall(r"`?([a-z][a-z0-9_]{2,})`?", s) if w in NAMES_X86}
 
-for rel in ["amd64/src/usermode.rs"] + sorted("taoxichuan/src/" + f for f in os.listdir(os.path.join(REPO, "taoxichuan/src")) if f.endswith(".rs")):
+for rel in ["amd64/src/usermode.rs"] + sorted("crates/akuma-tokio-kernel-amd64/src/" + f for f in os.listdir(os.path.join(REPO, "crates/akuma-tokio-kernel-amd64/src")) if f.endswith(".rs")):
     lines = open(os.path.join(REPO, rel)).read().split("\n")
     for i, ln in enumerate(lines):
         code = ln.split("//")[0]
@@ -156,7 +156,7 @@ CLAIM = [re.compile(r"`?([a-z][a-z0-9_]{2,})(?:\(2\))?`?\s*=\s*(\d{1,3})\b"),
          re.compile(r"`?([a-z][a-z0-9_]{2,})(?:\(2\))?`?[^.;`]{0,40}?\bx86_64\s+(?:nr\s+)?(\d{1,3})\b"),
          re.compile(r"\bx86_64\s+(?:nr\s+)?(\d{1,3})\b[^.;]{0,12}?`([a-z][a-z0-9_]{2,})`", re.I)]
 claim_files = ["amd64/src/usermode.rs", "crates/akuma-ring3-amd64/src/lib.rs", "crates/akuma-syscalls-abi/src/lib.rs"] + \
-    sorted("taoxichuan/src/" + f for f in os.listdir(os.path.join(REPO, "taoxichuan/src")) if f.endswith(".rs"))
+    sorted("crates/akuma-tokio-kernel-amd64/src/" + f for f in os.listdir(os.path.join(REPO, "crates/akuma-tokio-kernel-amd64/src")) if f.endswith(".rs"))
 for rel in claim_files:
     for i, ln in enumerate(open(os.path.join(REPO, rel)).read().split("\n")):
         if "//" not in ln:

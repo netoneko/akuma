@@ -17,8 +17,8 @@
   "crates/akuma-syscalls-glue": 90,
   "crates/akuma-syscalls-glue-amd64": 1,
   "crates/akuma-syscalls-ipc": 2,
+  "crates/akuma-tokio-kernel-amd64": 3,
   "crates/akuma-tty": 4,
   "crates/akuma-vfs": 8,
-  "crates/akuma-vfs-glue": 16,
-  "taoxichuan/src": 3
+  "crates/akuma-vfs-glue": 16
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "amd64", "taoxichuan", "crates/*"]
+members = [".", "amd64", "taoxichuan", "osaka", "crates/*"]
 default-members = [
     ".",
     "crates/akuma-alloc",

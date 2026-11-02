@@ -12,8 +12,8 @@
 
 Environment: TX_DISK (the base ext2 image, required for boot; the guest never writes it - writes land in
 TX_RUN/overlay.qcow2, and `boot fresh` discards them), TX_KEY (ssh private key for the image's
-authorized_keys), TX_RUN (default $TMPDIR/tx-tcg), TX_PORT (default 2244), TX_MEM (3072), TX_SMP (1),
-TX_TARGET (cargo target dir, default target/), TX_KERNEL (default TX_TARGET/x86_64-unknown-none/release/taoxichuan),
+authorized_keys), TX_RUN (default $TMPDIR/tx-tcg), TX_PORT (default 2244), TX_MEM (3072), TX_SMP (1; above 1 also puts `smp=N` on the command line),
+TX_TARGET (cargo target dir, default target/), TX_KERNEL (default TX_TARGET/x86_64-unknown-none/release/taoxichuan; any kernel built on akuma-tokio-kernel boots the same way),
 TX_APPEND (extra cmdline), TX_INIT (default `init=/bin/sshd initargs=--port,22`; with another init, `boot` cannot
 wait for ssh - read the console).
 
@@ -80,7 +80,14 @@ def boot(fresh):
         subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", "-b", os.path.abspath(disk), "-F", "raw", OVERLAY],
                        check=True)
     init = os.environ.get("TX_INIT", "init=/bin/sshd initargs=--port,22")
-    cl = f"{init} epoch={int(time.time())} {os.environ.get('TX_APPEND', '')}".strip()
+    append = os.environ.get("TX_APPEND", "")
+    smp = os.environ.get("TX_SMP", "1")
+    # QEMU's `-smp` only gives the guest the vCPUs; the kernel starts its application
+    # processors from `smp=N` on the command line. Without the token a TX_SMP=4 guest ran on
+    # one core while reporting nothing amiss.
+    if smp != "1" and "smp=" not in append:
+        append = f"smp={smp} {append}"
+    cl = f"{init} epoch={int(time.time())} {append}".strip()
     for i in range(4):
         cl += f" virtio_mmio.device=512@{0xfeb00000 + i * 512:#x}:{5 + i}"
     open(os.path.join(RUN, "console.log"), "w").close()
