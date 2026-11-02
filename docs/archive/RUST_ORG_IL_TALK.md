@@ -42,6 +42,51 @@ what Rust was sold as, not on specific functions or technical problems.
   has a "Measurements to take before the talk" checklist; its numbers are
   derived until re-measured on a clean tag.
 
+## Facts re-measured 2026-11-02 (after B15: the kernel is a crate)
+
+Supersedes the 11-01 section below for anything quoted on a slide; that section and the 10-30 one stay as the
+"before". Measured at `961a77be` (B15 of [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md); no kernel source
+changed after it), clean tree, `scripts/cloc_akuma.py --audit taoxichuan akuma-amd64`, `--features no-tests`. The
+Linux 6.18 figures are still the 10-30 builds.
+
+**The three numbers**
+
+| what an auditor would read | 11-02 (B15) | 11-01 | 10-30 |
+|---|---:|---:|---:|
+| **taoxichuan alone** (the guest image) | **77,839** | 78,351 | 84,761 |
+| of which Taoxichuan's own code | 13 (`main.rs`) + 3,758 (`akuma-tokio-kernel-amd64`) | 3,907 | 6,652 |
+| akuma-amd64 alone (the host) | 136,727 | 135,167 | - |
+| **taoxichuan on an Akuma host** (shared lines once) | **141,903** | 140,576 | 158,909 |
+| **taoxichuan on a Linux host** (Linux 6.18 + KVM, 2,362,283, + taoxichuan) | **2,440,122** | 2,440,634 | 2,447,044 |
+
+- **The kernel is a crate.** `taoxichuan/src/main.rs` is 19 lines (13 audit lines): one `Kernel` builder chain over
+  `akuma-tokio-kernel` (44 lines, `forbid(unsafe_code)`: `entry!`, the builder, the linker script) and
+  `akuma-tokio-kernel-amd64` (3,758 audit lines, 98 of them `unsafe`). A second kernel on the same crates, **Osaka**,
+  is 10 lines and boots a from-scratch image. `taoxichuan/src` went 12,131 lines (cleanup start) -> 6,548 (11-01)
+  -> 5,924 (before B15) -> **19**.
+- Taoxichuan adds **5,176** lines to an Akuma host; **93%** of its live lines (72,663 of 77,839) are already live
+  there. The Akuma-host total went up 1,327 because akuma-amd64 did (+1,560 over B1-B15, not broken down here), while
+  Taoxichuan went down 512.
+- The image: 75 workspace crates (55,965 lines) and 15 crates.io crates (21,861, **28%**). `unsafe`: 1,668 lines,
+  **789** of them third-party (47%).
+- Largest crates in the guest: smoltcp 11,030, `akuma-syscalls-glue` 10,753, `akuma-exec` 5,254, heapless 3,872,
+  `akuma-tokio-kernel-amd64` 3,758.
+- Against Linux: the guest is **10.7x** smaller than Linux trimmed to the same job (836,651) and **24x** smaller than
+  Linux as Firecracker ships it (1,868,016). The host is **17.3x**. Linux's host alone is **30x** Taoxichuan.
+- **Bugs this branch fixed: 116.** 105 in Taoxichuan's own code
+  ([`TAOXICHUAN_BUG_FIX_LIST.md`](TAOXICHUAN_BUG_FIX_LIST.md), 28 docs; the biggest classes are syscalls/files/pipes
+  37 and processes/fork/threads/scheduling 33), and 11 in shared Akuma crates, found through Taoxichuan or on the way
+  ([`BUG_FIX_LIST.md`](BUG_FIX_LIST.md) went 1,470 -> 1,481 fixes, 406 -> 415 docs, over the branch's 566 commits).
+
+**Runs on it (B15):** the battery + goose/GLM 10/10, `tokioprobe` at `smp=1` and real `smp=4`, `rustc` + `cargo
+build`; Osaka the same `tokioprobe` and battery. Census: 76 syscalls used by the workloads, 0 unserved.
+
+**Fixed points since 11-01:** A6 `8909a603` under Akuma's own hypervisor on the ryzen (`26d1ead2...`), B14 `ade75544`
+under Pop's Linux KVM at `smp=4` (`6343290a...`), and **B15 `961a77be`, the crate kernel, under Pop's KVM: K1 == K2
+(`5f568279...`, 2,304,624 bytes, about 7.5 minutes a generation)** - the kernel whose `main.rs` is 19 lines builds
+itself reproducibly. Under TCG on the Mac (x86 emulated on arm64, `fp_tcg.py`): K1 built in 34 minutes, K2 running
+(see [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md)).
+
 ## Facts re-measured 2026-11-01 (after the first day of cleanup)
 
 Supersedes the audit figures in the 10-30 section below for anything quoted on a slide; the 10-30

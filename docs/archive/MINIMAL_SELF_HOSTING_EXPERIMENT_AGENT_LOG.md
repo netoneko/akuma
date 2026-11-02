@@ -2364,3 +2364,30 @@ Honorable mentions, named by the user (pointers to where each was met, not a ful
   from crates.io (theorethically) and have your whole supply chain owned at kernel level". Recorded in the talk doc's
   verbatim conclusions with the numbers under it (15 crates.io crates already in Taoxichuan's image, 789 of its 1,669
   `unsafe` lines; 141,339 audit lines for the whole Akuma stack).
+
+### 2026-11-02: the numbers after B15 (the kernel is a crate)
+
+Re-measured at `961a77be` with `scripts/cloc_akuma.py --audit taoxichuan akuma-amd64` (`no-tests`); the full table is
+the talk doc's "Facts re-measured 2026-11-02" ([`RUST_ORG_IL_TALK.md`](RUST_ORG_IL_TALK.md)).
+
+- **Taoxichuan alone: 77,839 audit lines** (11-01: 78,351; 10-30: 84,761). Its own code is `main.rs`, 19 lines (13
+  audit lines), over `akuma-tokio-kernel` (44 lines, `forbid(unsafe_code)`) and `akuma-tokio-kernel-amd64` (3,758
+  audit lines, 98 `unsafe`). `taoxichuan/src`: 12,131 -> 6,548 -> 5,924 -> 19. Osaka, the second kernel on the same
+  crates, is 10 lines.
+- **On an Akuma host: 141,903** (akuma-amd64 alone 136,727, +1,560 since 11-01); Taoxichuan adds 5,176, and 93% of
+  its lines are already live in the host. **On a Linux host: 2,440,122.**
+- Third-party: 15 crates, 21,861 lines (28%), 789 of the image's 1,668 `unsafe` lines.
+- **Fixes this branch made: 116** - 105 in Taoxichuan
+  ([`TAOXICHUAN_BUG_FIX_LIST.md`](TAOXICHUAN_BUG_FIX_LIST.md), its own list since today, 28 docs) and 11 in shared
+  Akuma crates (`BUG_FIX_LIST.md` 1,470 -> 1,481).
+- **Fixed point.** B14 (`ade75544`) K1 == K2 under Pop's KVM at `smp=4`. **B15 (`961a77be`) K1 == K2 under Pop's KVM**
+  (`5f568279...`): the Mac drove generation 1 and booted generation 2, then left the LAN; goose, running the handoff
+  as root on the box, stopped the guest at 18:02, pulled K2 with `fp_pop.py`'s own commands and recorded it
+  ([`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md), "After B15"). Goose could not push to origin (HTTP 403
+  for its credential); its commits came in through litter.
+- **TCG.** The user had assumed the crate kernel already had a TCG fixed point; it had not - every earlier fixed point
+  ran under KVM (the ryzen's Linux, Pop's Linux, or Akuma's own hypervisor). `fp_tcg.py` (new) runs it on the Mac:
+  the toolchain image has neither git nor a resolver, so `git archive` of the commit and a `cargo fetch`ed
+  CARGO_HOME are staged onto an APFS clone of it and the guest builds `--offline`. Generation 1 built K1
+  `b0c08970...` in 2,038 s (about 4x KVM). The staged tree has no `.git`, so that run's kernels call themselves
+  `unknown`; the script now sets `AKUMA_SHA_OVERRIDE` for later runs.

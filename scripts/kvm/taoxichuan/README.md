@@ -12,6 +12,7 @@ root through `scripts/utils/hpbox.py`; the guest is `scripts/kvm/taoxichuan_pop.
 | `bis_run.sh SHA INIT` | `exp_cargo` on `kb-SHA` (a kernel you built from SHA) and count `rustc` execs in the console |
 | `fp_run.py KERNEL SMP` | the fixed-point build (`fp.sh`) - see `docs/archive/TAOXICHUAN_FIXED_POINT.md` |
 | `fp_pop.py K0 SHA` | the same two generations under Pop's Linux KVM (`tx-pop.sh` on an overlay of the Akuma root; K(n) pulled with `qemu-nbd --read-only` + `debugfs dump`); K1 == K2 passes |
+| `fp_tcg.py K0 SHA` | the same two generations under QEMU TCG on the Mac (`tcg_rig.py`'s machine); the toolchain image has no git or resolver, so the commit's sources and `cargo fetch`ed crates are staged onto an APFS clone of `FP_DISK` and built `--offline` |
 | `fp_metal.py K0 SHA` | the fixed point on the ryzen under **Akuma's** hypervisor (`herd vm-run`); stop herd's `vm-dev` first |
 | `goose_glm.sh ['prompt']` | talk to GLM through goose in the guest at `192.168.1.159:2224`: a conversation (one `goose run` per turn on a named session; `TX_SESSION` resumes) or one prompt |
 | `probe_run.py` / `probes_on_guest.py` | boot, fetch `userspace/forktest/c_stress` probes over the user-net (`10.0.2.2:8099`), run them |
