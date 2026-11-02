@@ -10,7 +10,7 @@ what Rust was sold as, not on specific functions or technical problems.
 - "self hosting on amd64 story that requires way more than running on qemu"
 - "rust shines in drivers, host level testing, the forced invention of inversion of control because of the big pre-porting refactor"
 - "all of this would be a complete nightmare in c"
-- "it's more about consistently apply what rust was sold as"
+- "it's more about consistently applying what rust was sold as"
 - "maybe i'll start with how it's exciting to be able to run things but running useful things forces you into a discipline because if you're doing things you should do them well"
 - "now your own software stack can be built by open models in relatively short time with minimal investment of money"
 - "the question is can reliable software be built with new tech, if yes, what enables it"
@@ -42,10 +42,56 @@ what Rust was sold as, not on specific functions or technical problems.
   has a "Measurements to take before the talk" checklist; its numbers are
   derived until re-measured on a clean tag.
 
+## Before and after the cleanup (re-measured 2026-11-02, one tool, both ends)
+
+The slide numbers. Goose + GLM wrote Taoxichuan up to the cutover; from there Opus cleaned it up
+([`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md), A1-B15, 62 commits in two days). **Before** is the
+cutover, `c362f165` (2026-11-01 13:39); **after** is `961a77be` (B15, 2026-11-02 16:37; no kernel source changed
+after it). Both ends measured today with the same `scripts/cloc_akuma.py --audit taoxichuan akuma-amd64`,
+`--features no-tests`, clean trees. The older sections below used earlier versions of the tool or a dirty tree, so
+their "before" figures (84,761 on 10-30) do not compare with these; quote this table.
+
+| audit lines (live code compiled into the image) | before (cutover) | after (B15) | change |
+|---|---:|---:|---:|
+| **taoxichuan alone** (the guest) | **87,761** | **77,839** | -9,922 (-11%) |
+| of which the kernel's own code | 7,844 (`taoxichuan` crate) | 3,771 (`main.rs` 13 + `akuma-tokio-kernel-amd64` 3,758) | -52% |
+| of which third-party (crates.io) | 41,748 (22 crates, 48%) | 21,861 (15 crates, 28%) | -48% |
+| `unsafe` lines in the guest | 2,850 | 1,668 | -41% |
+| - in the kernel's own code | 187 (`taoxichuan`) | 98 (`akuma-tokio-kernel-amd64`; `main.rs` has none) | -48% |
+| - in other workspace crates | 791 | 781 | -1% |
+| - in third-party crates | 1,872 (66%) | 789 (47%) | -58% |
+| build-time host code (build.rs, proc-macros and their dependencies) | 31,743 | 428 | -99% |
+| every file rustc read (`whole`, a C-style count) | 131,299 | 113,163 | -14% |
+| **akuma-amd64 alone** (the host) | **152,104** | **136,727** | -15,377 (-10%) |
+| `unsafe` lines in the host | 3,505 | 2,401 | -31% |
+| - in the kernel's own code (`amd64/`) | 289 | 289 | 0 |
+| - in workspace crates | 784 | 773 | -1% |
+| - in third-party crates | 2,432 (69%) | 1,339 (56%) | -45% |
+| **taoxichuan on an Akuma host** (union, shared lines once) | **161,128** | **141,903** | -19,225 (-12%) |
+| what Taoxichuan adds to the host | 9,024 | 5,176 | -43% |
+| share of Taoxichuan already live in the host | 90% | 93% | |
+| **taoxichuan on a Linux host** (Linux 6.18 + KVM 2,362,283, + the guest) | **2,450,044** | **2,440,122** | |
+
+- **The cleanup shrank the host too**, by more than it shrank the guest: most of it was shared code. The in-tree
+  virtio driver replaced `virtio-drivers` and its stack (zerocopy alone was 8,334 lines and 743 `unsafe`) in every
+  kernel, and with it went `syn` and the proc-macros (the build-time row).
+- **The `unsafe` that went away was almost all dependencies'.** Ours barely moved: 978 -> 879 lines in the guest
+  (kernel + workspace), 1,073 -> 1,062 in the host. Third-party `unsafe` fell by 1,083 lines in the guest and 1,093
+  in the host, because the crates holding it (zerocopy, virtio-drivers, safe-mmio) left the build.
+- **The guest's own code halved and stopped being a kernel.** `taoxichuan/src` went from 12,131 lines to a 19-line
+  `main.rs`; what was its private syscall dispatch, spawn ring and fd model is now the shared glue the host runs
+  (`akuma-syscalls-glue` went from not in the guest to its second-largest crate, 10,753). The workspace share grew
+  (38,169 -> 55,965) for that reason: the same behaviour, now in code two kernels share and test.
+- Against Linux: the guest went from **9.5x** to **10.7x** smaller than Linux trimmed to the same job (836,651),
+  and from 21x to **24x** smaller than Linux as Firecracker ships it (1,868,016). The host went from 15.5x to
+  **17.3x** smaller than Linux + KVM.
+- What did not change: it still self-hosts. K1 == K2 at the cutover's predecessors (`6af48c06`, ryzen KVM and
+  metal) and after: B15 under Pop's KVM (`5f568279...`) and under TCG on the Mac (`b0c08970...`).
+
 ## Facts re-measured 2026-11-02 (after B15: the kernel is a crate)
 
-Supersedes the 11-01 section below for anything quoted on a slide; that section and the 10-30 one stay as the
-"before". Measured at `961a77be` (B15 of [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md); no kernel source
+The "before and after" table above supersedes this section's numbers for slides; the 11-01 and 10-30 sections stay
+as history. Measured at `961a77be` (B15 of [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md); no kernel source
 changed after it), clean tree, `scripts/cloc_akuma.py --audit taoxichuan akuma-amd64`, `--features no-tests`. The
 Linux 6.18 figures are still the 10-30 builds.
 
