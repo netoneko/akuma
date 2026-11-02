@@ -25,6 +25,17 @@ Akuma isolates processes into **boxes**, each with its own:
 - `box_id` is per-process. The dispatch hook `intercept_box_syscall` enforces stack routing as a hard guarantee.
 - A process spawns into or `join_box`s into another box for isolation.
 
+**A kernel without containers has one box.** `akuma-isolation`'s `containers` feature
+(forwarded by every kernel's `sc-containers`; off in Taoxichuan and AArch64
+`extreme-size`) compiles the box half: `overlay_fs`, `subdir_fs` and the live
+`box_registry` with its `hierarchy`/`access` walks. Without it, `box_registry` is
+`host_only`: the same functions, answered for box 0 by construction (no table, no
+lock; nothing is a box's primary, a kill cascade is the box itself, box 0 reaches
+everything). `akuma-exec` cannot see another crate's features, so the names must stay
+identical; add a function to both or to neither. The mount namespace stays in every
+build: it is how `akuma-vfs-glue` resolves every path
+([`../../archive/TAOXICHUAN_CLEANUP_PLAN.md`](../../archive/TAOXICHUAN_CLEANUP_PLAN.md), B7b).
+
 Box syscalls live in `src/syscall/container.rs` (gated `sc-containers`). Rump
 box bookkeeping: `mark_box_rump(box_id)` / `box_is_rump(box_id)` /
 `RUMP_BOXES` (`src/rump_proxy.rs:67-84`).

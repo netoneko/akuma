@@ -1935,6 +1935,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
 /// syscalls are routed to that box's rump_server); any other value is a no-op
 /// (smoltcp default). herd calls this for a `stack = rump` service. Without the
 /// `rump` kernel feature the call is harmlessly ignored.
+#[cfg(feature = "akuma-native")]
 pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
     // Repointing a box's network stack decides where its AF_INET syscalls are
     // proxied, so it is only the owner's call — otherwise any process could
@@ -1968,6 +1969,7 @@ pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
 /// this function — reached from outside the crate rather than reimplemented
 /// beside it, which is what keeps the two authorization checks above from
 /// existing in one kernel and not the other.
+#[cfg(feature = "akuma-native")]
 pub fn sys_close_child_stdin(pid: u32) -> u64 {
     let caller = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
     let target = match akuma_exec::process::lookup_process_shared(pid) { Some(p) => p, None => return ESRCH };
@@ -2017,6 +2019,7 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
     if akuma_exec::process::deliver_signal(pid, sig) { 0 } else { ESRCH }
 }
 
+#[cfg(feature = "akuma-native")]
 pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     if status_ptr != 0 && !validate_user_ptr(status_ptr, 4) { return EFAULT; }
 
