@@ -8,22 +8,23 @@
   /* ─────────────────────────────────────────────────────────────
      Committed single-theme deck (projected, so dark is the design,
      not a preference). Every colour is painted explicitly.
-       ground  sumi-indigo         ink   bone
-       shu     朱色 vermilion       ai    pale indigo
+       Palette is lifted from a hand-glazed ceramic tile:
+       ground  deep cobalt glaze    ink   unglazed clay (cream)
+       shu     orchid pink (the rosy cast in the glaze)   ai  lilac sheen of the glaze
      Type carries the split the talk is about:
        mono  = anything measured        serif = anything argued
      ───────────────────────────────────────────────────────────── */
   :root {
-    --ground:   #12141b;
-    --panel:    #191d26;
-    --rule:     #2b3140;
-    --rule-soft:#21262f;
-    --ink:      #e8e6e1;
-    --ink-2:    #b6bac3;
-    --dim:      #8b929f;
-    --shu:      #e2553c;
-    --shu-soft: rgba(226, 85, 60, 0.13);
-    --ai:       #7a9cc6;
+    --ground:   #0d0f2c;
+    --panel:    #151848;
+    --rule:     #2d3380;
+    --rule-soft:#1e2262;
+    --ink:      #f2e9cf;
+    --ink-2:    #c9c6dc;
+    --dim:      #9496c4;
+    --shu:      #e48bb8;
+    --shu-soft: rgba(228, 139, 184, 0.15);
+    --ai:       #a79be6;
 
     --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
@@ -144,6 +145,7 @@
   ul { margin: 0; padding-left: 1.15rem; display: flex; flex-direction: column; gap: 0.5rem; }
   li { font-size: clamp(0.95rem, 1.15vw, 1.08rem); line-height: 1.5; color: var(--ink-2); max-width: 60ch; }
   li::marker { color: var(--shu); }
+  ol { margin: 0; padding-left: 1.4rem; display: flex; flex-direction: column; gap: 0.5rem; }
 
   .pull {
     font-family: var(--serif);
@@ -355,6 +357,139 @@
           <div class="placeholder" role="img" aria-label="Placeholder for the opening meme">meme goes here</div>
           <figcaption>caption goes here</figcaption>
         </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- 02 -->
+  <section class="slide">
+    <div class="num">02</div>
+    <div class="body">
+      <p class="eyebrow">Capability test</p>
+      <h2>Can a weak open model write a kernel that runs <em>real workloads</em>?</h2>
+<ul><li>Why open models? <strong>Dario won&rsquo;t let you write a Wi-Fi driver.</strong></li><li>Akuma was mostly written by commercial models. GLM was the sidekick, and <strong>GLM 5.3 Flash built KVM from AMD&rsquo;s spec PDFs</strong>.</li><li>Setup: about <span class="m">10 days</span>, a new kernel built from the code, docs and tests I already had.</li></ul>
+    </div>
+  </section>
+
+  <!-- 03 -->
+  <section class="slide">
+    <div class="num">03</div>
+    <div class="body">
+      <p class="eyebrow cool">The experiment</p>
+      <h2>A goal list ending in <code>cargo build</code></h2>
+<ul><li>Badly tuned loops and unknown token cost.</li><li>GLM reached the equivalent of a self-hosting C kernel: HTTPS <code>curl</code>, <code>apk</code>, fork, pipes, all running on Akuma&rsquo;s KVM.</li></ul>
+      <p class="pull cool">AI is good at what you can verify.</p>
+    </div>
+  </section>
+
+  <!-- 04 -->
+  <section class="slide">
+    <div class="num">04</div>
+    <div class="body">
+      <p class="eyebrow">The Rust bar</p>
+      <h2>Rust is much harder to host</h2>
+<p>Akuma had already self-hosted Rust, so feasibility was never in question, only the route and the clock.</p>
+      <div class="figs">
+        <div class="fig"><span class="v">~7 months</span><span class="k">Akuma&rsquo;s first self-host</span></div>
+        <div class="fig"><span class="v hot">7 d 4 h</span><span class="k">Taoxichuan</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 05 -->
+  <section class="slide">
+    <div class="num">05</div>
+    <div class="body">
+      <p class="eyebrow">Handoff and metal</p>
+      <h2>Handed off to <em>Sonnet</em>, verified by GLM on bare metal</h2>
+<ul><li>I handed off because I got tired of the resets and the quota grind.</li><li>Sonnet is the closest equivalent to GLM Flash, and big GLM is more capable than Sonnet, so open models can plausibly write acceptable kernel code. <span class="m">(My assessment, not a measurement: GLM was never tried on rustc and cargo.)</span></li><li>GLM ran the final self-hosting verification loop on bare metal.</li></ul>
+      <p class="pull"><code>K1 == K2</code>, byte for byte.</p>
+    </div>
+  </section>
+
+  <!-- 06 -->
+  <section class="slide">
+    <div class="num">06</div>
+    <div class="body">
+      <p class="eyebrow cool">Why Rust</p>
+      <h2>Expressive, flexible, and it <em>enforces discipline</em></h2>
+<ul><li>Easy to measure the audit surface.</li><li><strong>Composition:</strong> crates that arrived already debugged.</li><li><strong>Host tests</strong> in leaf crates.</li><li><strong>Inversion of control</strong>, forced by the pre-port refactor.</li><li><code>unsafe</code> is countable and contained.</li><li>Drivers and KVM built from specs.</li></ul>
+    </div>
+  </section>
+
+  <!-- 07 -->
+  <section class="slide">
+    <div class="num">07</div>
+    <div class="body">
+      <p class="eyebrow">Cleanup</p>
+      <h2>Opus cleaned up Taoxichuan</h2>
+<div class="scroller"><table>
+        <thead><tr><th>Measure</th><th class="r">Before</th><th class="r">After</th></tr></thead>
+        <tbody>
+          <tr><td>Guest audit lines</td><td class="r">87,761</td><td class="r hot">77,839</td></tr>
+          <tr><td>Guest <code>unsafe</code> lines</td><td class="r">2,850</td><td class="r hot">1,668</td></tr>
+          <tr><td>Kernel&rsquo;s own code (lines)</td><td class="r">7,844</td><td class="r hot">3,771</td></tr>
+          <tr><td>Third-party crates</td><td class="r">22</td><td class="r hot">15</td></tr>
+          <tr><td>Build-time host code (lines)</td><td class="r">31,743</td><td class="r hot">428</td></tr>
+        </tbody></table></div>
+      <p class="pull">Why not just Linux? Less capability means a smaller attack surface, which matters for agentic systems.</p>
+    </div>
+  </section>
+
+  <!-- 08 -->
+  <section class="slide">
+    <div class="num">08</div>
+    <div class="body">
+      <p class="eyebrow cool">Kernel as a crate</p>
+      <h2>Install a kernel from crates.io, and have your whole supply chain hijacked</h2>
+<ul><li>That&rsquo;s the cyberpunk joke.</li><li>GLM wrote a second kernel, <strong>Shanghai</strong>, from a crate&rsquo;s README, and it ran on Akuma.</li><li>Python runs too, so the capability surface is wider than intended.</li></ul>
+    </div>
+  </section>
+
+  <!-- 09 -->
+  <section class="slide">
+    <div class="num">09</div>
+    <div class="body">
+      <p class="eyebrow">Costs and benefits</p>
+      <h2>The real cost is mostly in <em>my sanity</em></h2>
+<div class="figs">
+        <div class="fig"><span class="v">633.1M</span><span class="k">GLM tokens &middot; 7,909 calls</span></div>
+        <div class="fig"><span class="v">~$27.2</span><span class="k">GLM at API prices</span></div>
+        <div class="fig"><span class="v">~3.2 wk</span><span class="k">of the $18/mo Lite plan</span></div>
+        <div class="fig"><span class="v hot">1,943M</span><span class="k">Claude tokens &middot; 3.1&times; GLM</span></div>
+      </div>
+      <p><strong>Benefit:</strong> 11 fixes in shared Akuma code (kernel, hypervisor and related), found through Taoxichuan work. <span class="m">Cost figures adjusted.</span></p>
+    </div>
+  </section>
+
+  <!-- 10 -->
+  <section class="slide">
+    <div class="num">10</div>
+    <div class="body">
+      <p class="eyebrow">What&rsquo;s next</p>
+      <h2>Hardening, then <span class="cool">verification</span></h2>
+      <div class="split even">
+        <div class="col">
+          <p class="sub">Hardening</p>
+          <ol>
+            <li>Read-only disk image, no ext2 write paths.</li>
+            <li>Syscall table as a compile-time allow-list built from the census.</li>
+            <li>No dynamic library loading.</li>
+            <li>Execution locked to signed binaries under a signed kernel.</li>
+            <li>Egress allow-list in the socket table.</li>
+            <li>Kernel code locked by the hypervisor through nested page tables.</li>
+            <li>Layered walls: box, ring 3 process, KVM guest.</li>
+          </ol>
+        </div>
+        <div class="col">
+          <p class="sub">Verification</p>
+          <ol>
+            <li>Fuzzing and static analysis on the pure crates.</li>
+            <li>Kani and Miri on the invariants.</li>
+            <li>LLM-drafted Verus proofs for small pure crates.</li>
+            <li>Linux differential tests.</li>
+          </ol>
+        </div>
       </div>
     </div>
   </section>
