@@ -232,6 +232,14 @@ Linux 6.18 figures are still the 10-30 builds.
 **Runs on it (B15):** the battery + goose/GLM 10/10, `tokioprobe` at `smp=1` and real `smp=4`, `rustc` + `cargo
 build`; Osaka the same `tokioprobe` and battery. Census: 76 syscalls used by the workloads, 0 unserved.
 
+**Python works, as a side effect of tokio.** Taoxichuan was built to run tokio programs, and nobody aimed it at
+Python. Then, on 2026-11-02, GLM (goose, inside a Taoxichuan guest under Akuma's hypervisor on the ryzen, working on
+[infinity](INFINITY_ON_TAOXICHUAN.md)) needed to look inside crates. It reached for `python3` and downloaded rig-core,
+reqwest and rustls-platform-verifier from crates.io with `urllib` over HTTPS. That is Alpine's CPython 3.14.8, an
+unmodified musl binary that came along with the box's root filesystem when the toolchain image was copied from it.
+`ssl` (OpenSSL 3.5.9), `sqlite3`, `threading` and `subprocess` all import and run. Nothing in the kernel knows
+Python exists: it runs on the syscall surface that was built for tokio, rustc and cargo.
+
 **Fixed points since 11-01:** A6 `8909a603` under Akuma's own hypervisor on the ryzen (`26d1ead2...`), B14 `ade75544`
 under Pop's Linux KVM at `smp=4` (`6343290a...`), and **B15 `961a77be`, the crate kernel, under Pop's KVM: K1 == K2
 (`5f568279...`, 2,304,624 bytes, about 7.5 minutes a generation)** - the kernel whose `main.rs` is 19 lines builds
