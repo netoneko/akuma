@@ -60,7 +60,7 @@ rm -rf /tmp/gh /tmp/tgt; mkdir -p /tmp/gh; cd /tmp/gh
 echo START $(date +%s) > /tmp/fp.status
 git init -q . && git remote add origin https://github.com/netoneko/akuma.git
 git fetch -q --depth 1 --filter=blob:none origin {sha} || {{ echo FAIL fetch >> /tmp/fp.status; exit 1; }}
-git sparse-checkout set --no-cone /Cargo.toml /Cargo.lock /build.rs /linker.ld /.cargo /rust-toolchain.toml /src /amd64 /taoxichuan /osaka /crates
+git sparse-checkout set --no-cone /Cargo.toml /Cargo.lock /build.rs /linker.ld /.cargo /rust-toolchain.toml /src /amd64 /taoxichuan /crates
 git checkout -q FETCH_HEAD || {{ echo FAIL checkout >> /tmp/fp.status; exit 1; }}
 echo CHECKED-OUT $(date +%s) >> /tmp/fp.status
 cargo build --release --target x86_64-unknown-none -p taoxichuan --features no-tests,trace-err -j4 --target-dir /tmp/tgt > /tmp/fp.log 2>&1

@@ -20,7 +20,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
 name = "akuma"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "akuma-alloc",
  "akuma-bkl",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "akuma-amd64"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "akuma-affinity",
  "akuma-alloc",
@@ -1288,13 +1288,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "osaka"
-version = "0.1.0"
-dependencies = [
- "akuma-tokio-kernel",
-]
 
 [[package]]
 name = "owned_ttf_parser"
