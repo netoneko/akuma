@@ -476,8 +476,13 @@ Rules that follow from the record being a leaf:
   `akuma-user-tree` clone plan skips non-present ones), and `release_pages` clears them
   (`paging::unmap_page_in` clears only present leaves). A new path that unmaps a range goes through
   `release_pages`. A new path that copies a page table handles `lazy::is_lazy`.
-- **A lazy file page pins its inode** for the address space's lifetime (`lazy::pin`, dropped in
-  `free_user_root`). A mapping whose inode cannot be pinned is filled eagerly.
+- **A lazy file page pins its inode** while an unfilled record of it is left in the address space
+  (`lazy::pin`, one per `(root, inode)` with the VA range its records live in). `release_pages` trims
+  the range and drops the pin once nothing in it names the inode, unless a shared record there still
+  writes back by inode (`lazy::unpin_released`). `mremap`'s move widens the range (`move_pins`), fork
+  copies it, and `free_user_root` drops what is left. So `unlink` after `munmap` frees the blocks at
+  once, as on Linux (`archive/UNLINKED_FILE_SPACE_RETURNED_LATE.md`). A mapping whose inode cannot
+  be pinned is filled eagerly.
 - **A writable `MAP_SHARED` file page is one frame for every mapper.** Its record carries `shared`, and
   its fill maps the frame `shmpages` (over `akuma-fpcache-rw`) holds for `(root mount, inode, page)`,
   publishing a fresh one on a miss. Fork shares every `MAP_SHARED` span writable and unmarked

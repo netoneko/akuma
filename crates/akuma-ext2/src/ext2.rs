@@ -40,7 +40,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(kernel_profile_extreme))]
 use spinning_top::Spinlock;
 
@@ -597,11 +597,18 @@ const DEFERRED_FREE_SLOTS: usize = 4096;
 /// exactly that way against the test suite's parallel mounts.)
 struct DeferredFrees {
     slots: [AtomicU32; DEFERRED_FREE_SLOTS],
+    /// `inode_pin::unpin_epoch()` when this list was last drained. A queued
+    /// inode becomes freeable the moment its last pin goes - an `munmap`, a
+    /// `close`, a process exit - and none of those is a filesystem call, so
+    /// [`Ext2Filesystem::write_state`] drains whenever the epoch has moved.
+    /// Draining only on unlink, as before, left the blocks allocated until some
+    /// unrelated file was deleted, and on disk across a crash.
+    drained_at: AtomicU64,
 }
 
 impl DeferredFrees {
     const fn new() -> Self {
-        Self { slots: [const { AtomicU32::new(0) }; DEFERRED_FREE_SLOTS] }
+        Self { slots: [const { AtomicU32::new(0) }; DEFERRED_FREE_SLOTS], drained_at: AtomicU64::new(0) }
     }
 
     /// Record `inode` for a later free. `false` means there was no room.
@@ -1715,9 +1722,23 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
     /// Acquire a write lock, blocking until available. Same per-attempt
     /// [`StateHoldGuard`] discipline as [`Self::read_state`] — see there.
+    ///
+    /// Every write hold first finishes the deferred frees whose last pin has
+    /// gone since the previous drain (see [`DeferredFrees::drained_at`]); a
+    /// drain that freed something flushes the free counts it staged.
     fn write_state(&self) -> Ext2WriteGuard<'_> {
         let (inner, hold) = self.state.write_holding(state_hold_guard);
-        Ext2WriteGuard { inner, hold }
+        let mut guard = Ext2WriteGuard { inner, hold };
+        let epoch = akuma_primitives::inode_pin::unpin_epoch();
+        if self.deferred.drained_at.load(Ordering::Acquire) != epoch {
+            // Recorded before the drain: a pin that goes during it moves the
+            // epoch again, and the next hold drains again.
+            self.deferred.drained_at.store(epoch, Ordering::Release);
+            if self.drain_deferred_frees(&mut guard) > 0 {
+                let _ = self.flush_meta(&mut guard);
+            }
+        }
+        guard
     }
 
     /// Recover everything the dead thread `tid` held on this mount.
@@ -2395,9 +2416,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// time: a mapping created *after* the unlink still names this inode, and
     /// freeing it would reintroduce exactly the defect the deferral exists to
     /// prevent.
-    fn drain_deferred_frees(&self, state: &mut Ext2State) {
+    fn drain_deferred_frees(&self, state: &mut Ext2State) -> usize {
         #[cfg(feature = "pmm-instr")]
         DEFERRED_DRAIN_CALLS.fetch_add(1, Ordering::Relaxed);
+        let mut freed = 0;
         for slot in &self.deferred.slots {
             let inode_num = slot.load(Ordering::Acquire);
             if inode_num == 0 {
@@ -2428,7 +2450,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 let _ = self.write_inode(state, inode_num, &inode);
             }
             let _ = self.free_inode(state, inode_num, false);
+            freed += 1;
         }
+        freed
     }
 
     /// Whether a directory holds anything but `.` and `..`.
@@ -4536,6 +4560,11 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn stats(&self) -> Result<FsStats, FsError> {
+        // A deferred free whose last pin has gone is free space: finish it
+        // first, so `df` after the last `munmap`/`close` shows it.
+        if akuma_primitives::inode_pin::unpinned_since(self.deferred.drained_at.load(Ordering::Acquire)) {
+            drop(self.write_state());
+        }
         let state = self.read_state();
         let total_blocks = state.superblock.total_blocks;
         let unallocated_blocks = state.superblock.unallocated_blocks;

@@ -1222,6 +1222,10 @@ fn mm_dump_for(va: u64) {
 /// A writable `MAP_SHARED` file page's frame is in `shmpages`' table too: when
 /// the range overlaps such a mapping, the table gives back whatever nobody maps
 /// now. The caller has written those pages back (`shared_writeback`).
+///
+/// A file whose last unfilled record in this space just went is unpinned
+/// (`lazy::unpin_released`), so an `unlink` after `munmap` frees its blocks at
+/// once, as on Linux, instead of when the process is reaped.
 fn release_pages(root: u64, start: u64, end: u64) {
     let tid = akuma_primitives::preempt::current_tid() as u32;
     let mut va = start;
@@ -1236,6 +1240,10 @@ fn release_pages(root: u64, start: u64, end: u64) {
     if with_task(|t| t.layout.shared().iter().any(|f| !f.is_anon() && f.overlaps(start, end))) {
         shmpages::sweep();
     }
+    // A shared file mapping left in the pin's range writes back by inode.
+    lazy::unpin_released(root, start, end, |inode, lo, hi| {
+        with_task(|t| t.layout.shared().iter().any(|f| !f.is_anon() && f.inode == inode && f.overlaps(lo, hi)))
+    });
     // Peers may still hold translations for the frames just freed: no frame is
     // reused before they have dropped them (the kernel lock is held throughout).
     smp::shootdown();
@@ -2071,7 +2079,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 file: fnode.map(|inode| lazy::FilePage { inode, index: off / 4096, shared: shared_write }),
             };
             let lazy_ok =
-                !shared_anon && lazy::fits(first, pages / 4096) && fnode.is_none_or(|node| lazy::pin(root, node));
+                !shared_anon && lazy::fits(first, pages / 4096) && fnode.is_none_or(|node| lazy::pin(root, node, base, base + pages));
             if lazy_ok {
                 if !lazy::reserve(root, base, pages, first) {
                     release_pages(root, base, base + pages);
@@ -2216,6 +2224,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     release_pages(root, base, base + new_pages);
                     return e(ring3::err::ENOMEM);
                 }
+                lazy::move_pins(root, old, base, old_pages);
                 // Peers may still translate the old addresses to the moved frames.
                 smp::shootdown();
                 mm_event(4, old, old + old_pages);
@@ -2612,7 +2621,7 @@ fn place_segment(root: u64, image: &[u8], seg: &akuma_elf_exec::LoadSeg, inode: 
     // A file record names a whole file page, so the segment's pages and the
     // file's must line up (`p_offset` congruent to `p_vaddr`, as the ELF spec
     // requires for a loadable image).
-    let inode = inode.filter(|&node| seg.offset.wrapping_sub(seg.vaddr).trailing_zeros() >= 12 && lazy::pin(root, node));
+    let inode = inode.filter(|&node| seg.offset.wrapping_sub(seg.vaddr).trailing_zeros() >= 12 && lazy::pin(root, node, first, last));
     let file_end = seg.vaddr + seg.filesz;
     let mut pva = first;
     while pva < last {

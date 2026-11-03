@@ -13,8 +13,8 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1492
-- **Docs contributing at least one fix:** 423
+- **Total distinct fixes counted:** 1493
+- **Docs contributing at least one fix:** 424
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
@@ -28,13 +28,13 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 | Rump Kernel & Syscall Proxy | 26 | 1.7% | 6 |
 | Toolchain & Self-Hosting | 91 | 6.1% | 13 |
 | SSH | 40 | 2.7% | 19 |
-| VFS & Filesystem | 139 | 9.3% | 43 |
-| Boot & Drivers | 141 | 9.5% | 22 |
+| VFS & Filesystem | 140 | 9.4% | 44 |
+| Boot & Drivers | 141 | 9.4% | 22 |
 | Signals & Exceptions | 40 | 2.7% | 15 |
 | Misc / Cross-cutting | 64 | 4.3% | 23 |
 | Console & Terminal | 58 | 3.9% | 18 |
 | Containers | 56 | 3.8% | 11 |
-| **Total** | **1492** | **100.0%** | **423** |
+| **Total** | **1493** | **100.0%** | **424** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -1632,7 +1632,7 @@ aren't recorded anywhere else.)
 ### docs/archive/SSHD_SESSION_WITHOUT_PATH.md
 - `session_env` stopped being empty when `HOME` was added (2026-10-17), so the kernel's `DEFAULT_ENV` and its `PATH` no longer applied and exec sessions ran with no `PATH` at all: gcc's `make_relative_prefix` fell back to `../` and `posix_spawnp("cc1")` failed with `ENOENT`; the session always gets Alpine's `PATH`
 
-## VFS & Filesystem (139 fixes, 43 docs)
+## VFS & Filesystem (140 fixes, 44 docs)
 
 ### docs/archive/AKUMA_EXT2_CLEANUP.md
 - §2.3: `read_inode` heap over-read (UB) — a rev-1 superblock's `inode_size` was taken off disk with no minimum check, so an image with `inode_size < 128` blitted a whole `Inode` out of a smaller allocation
@@ -1860,6 +1860,9 @@ aren't recorded anywhere else.)
 
 ### docs/archive/INODE_PIN_CONGESTED_WINDOW.md
 - `inode_pin::is_pinned` still answered `true` when it walked a full 32-slot window without finding the key, though `acquire` only ever records a pin inside that window and counts the rest as overflow. A run of tombstones held open by a live entry, which `compact_tail` cannot clear, made every inode homed there read pinned, and ext2 deferred each of their unlinks forever: 65 inodes and 4,327 blocks after one `cargo clean` on the Taoxichuan guest. A full window without the key now reads unpinned
+
+### docs/archive/UNLINKED_FILE_SPACE_RETURNED_LATE.md
+- ext2 finished an unlink deferred by a pin only at the next unlink, rename or inode allocation, though the pin itself goes at an `munmap`, a `close` or a reap, none of them a filesystem call: a file unlinked while open or mapped kept its blocks after the last `close`/`munmap` and after exit, until an unrelated file was deleted, and stayed half-deleted across a crash. The pin table counts last-pin releases (`unpin_epoch`), and every ext2 write hold and `statfs` drains when that count has moved
 
 ## Boot & Drivers (141 fixes, 22 docs)
 
@@ -2491,4 +2494,4 @@ Also scanned 2026-10-24 (the Firecracker guest hang on `kvm-part-1`: 5 code comm
 
 Also scanned 2026-11-02 (closing `rust-org-il-experiment`, 536 commits and about 70 archive docs, most of them the Taoxichuan experiment and its cleanup). Counted above: DUP_LOST_O_NONBLOCK, TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND (two shared-glue fixes), AKUMA_VIRTIO_IN_TREE, AMD64_BOX_SPAWN_EXT_REGRESSION, KVM_GUEST_DISK_856_MIB_RACE, AUDIT_SURFACE_METHODOLOGY, TAOXICHUAN_CLEANUP_PLAN (its one amd64 fix), KVM_GUEST_RAM_CAP_LIFTED, and the two shared-crate bullets of TAOXICHUAN_BUGS_FOUND_2026_10_30. **Every Taoxichuan-only fix moved to `TAOXICHUAN_BUG_FIX_LIST.md`**, including the six that were counted here under TAOXICHUAN_BUGS_FOUND_2026_10_30 and the TAOXICHUAN_SMP fixes (`dac8a275`, the AP's `IA32_APIC_BASE` enable; `5108b5e5`, which this paragraph used to name, is TAOXICHUAN_CARGO_STALL_REGRESSION's pipe-EOF fix and is counted there). No counted fix, open by their own text: AKUMA_RYZEN_HERD_STOP_GUEST_RESET (the ryzen reset on `herd stop goose-glm`, seen once), AMD64_THREADPROBE_EXIT_ZERO_FLAKE (logged as a flake by decision), GOOSE_SERVE_IDLE_SPIN, HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD. No fix, measurement or record: AKUMA_SYSCALLS_TOKIO_DEP_ANALYSIS, CLONE_AUDIT_2026_11_01 and CLONE_AND_MUT_BUDGETS (the audit's findings are not done), LINE_COUNT_ANALYSIS_POST_AMD64, RUST_ORG_IL_TALK, GOOSE_GLM_SERVE_ON_RYZEN (setup; its traps are workarounds), MINIMAL_SELF_HOSTING_EXPERIMENT (the brief). The branch's edits to AKUMA_FIRECRACKER_AMD64, AKUMA_FIRECRACKER_KVM, AKUMA_KVM_DEV_CYCLE and AMD64_J4_BUILD_CRASH_HUNT add no fix. AKUMA_AMD64_SCHED_CRATE's one fix is Taoxichuan's (the trace build's idle-lap dump) and is counted there. No doc to cite: `d6ee7d97` (`akuma-threading`'s x86 fresh-thread trampoline never released the outgoing thread's `ON_CPU` gate, so the first switch to a never-run thread could leave its predecessor unschedulable; named only as a bisect row in TAOXICHUAN_CARGO_STALL_REGRESSION).
 
-Also scanned 2026-11-03 (the Infinity run on Taoxichuan and what it left open). Counted above: EXT2_DIRENT_TYPE_WITHOUT_FILETYPE, KVM_GUEST_4GIB_PVH_HANDOFF, UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS, SSHD_SESSION_WITHOUT_PATH and the one shared-glue bullet of TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES. The rest of INFINITY_ON_TAOXICHUAN, TAOXICHUAN_EXEC_ARGV_LIMIT, TAOXICHUAN_EXEC_SHEBANG and TAOXICHUAN_LAZY_MMAP are Taoxichuan's and are counted there. KVM_GUEST_RAM_CAP_LIFTED's new paragraph corrects two of its statements and points at KVM_GUEST_4GIB_PVH_HANDOFF, where those fixes are counted. The edits to MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG, TAOXICHUAN_CLEANUP_PLAN, TAOXICHUAN_FIXED_POINT and RUST_ORG_IL_TALK add no fix. A second pass the same day (shared mappings, the lazy image, the ext2 cap) counts EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES and the one glue bullet of TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE; the rest of that doc is Taoxichuan's. The dated notes added to TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES, TAOXICHUAN_LAZY_MMAP and INFINITY_ON_TAOXICHUAN point at those two docs and add no fix. The ENOSPC inconsistencies EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES records are open. A third pass counts INODE_PIN_CONGESTED_WINDOW (`akuma-primitives`, so every kernel); the partial build measurement added to TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE and the dated note in TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES add no fix.
+Also scanned 2026-11-03 (the Infinity run on Taoxichuan and what it left open). Counted above: EXT2_DIRENT_TYPE_WITHOUT_FILETYPE, KVM_GUEST_4GIB_PVH_HANDOFF, UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS, SSHD_SESSION_WITHOUT_PATH and the one shared-glue bullet of TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES. The rest of INFINITY_ON_TAOXICHUAN, TAOXICHUAN_EXEC_ARGV_LIMIT, TAOXICHUAN_EXEC_SHEBANG and TAOXICHUAN_LAZY_MMAP are Taoxichuan's and are counted there. KVM_GUEST_RAM_CAP_LIFTED's new paragraph corrects two of its statements and points at KVM_GUEST_4GIB_PVH_HANDOFF, where those fixes are counted. The edits to MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG, TAOXICHUAN_CLEANUP_PLAN, TAOXICHUAN_FIXED_POINT and RUST_ORG_IL_TALK add no fix. A second pass the same day (shared mappings, the lazy image, the ext2 cap) counts EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES and the one glue bullet of TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE; the rest of that doc is Taoxichuan's. The dated notes added to TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES, TAOXICHUAN_LAZY_MMAP and INFINITY_ON_TAOXICHUAN point at those two docs and add no fix. The ENOSPC inconsistencies EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES records are open. A third pass counts INODE_PIN_CONGESTED_WINDOW (`akuma-primitives`, so every kernel); the partial build measurement added to TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE and the dated note in TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES add no fix. A fourth pass counts the ext2 drain of UNLINKED_FILE_SPACE_RETURNED_LATE; its Taoxichuan pin range is Taoxichuan's, counted there.

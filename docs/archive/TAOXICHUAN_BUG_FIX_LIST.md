@@ -16,21 +16,21 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ## Statistics
 
-- **Total distinct fixes counted:** 118
-- **Docs contributing at least one fix:** 34
+- **Total distinct fixes counted:** 119
+- **Docs contributing at least one fix:** 35
 - **Subsystem categories:** 8
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscalls, Files & Pipes | 37 | 31.4% | 6 |
-| Exec & ELF Loading | 11 | 9.3% | 4 |
-| Processes, Fork, Threads & Scheduling | 33 | 28.0% | 9 |
-| Memory & Copy-on-Write | 15 | 12.7% | 5 |
+| Syscalls, Files & Pipes | 37 | 31.1% | 6 |
+| Exec & ELF Loading | 11 | 9.2% | 4 |
+| Processes, Fork, Threads & Scheduling | 33 | 27.7% | 9 |
+| Memory & Copy-on-Write | 16 | 13.4% | 6 |
 | Signals | 5 | 4.2% | 2 |
 | Networking & Readiness | 4 | 3.4% | 2 |
-| SMP, Time & Boot | 10 | 8.5% | 5 |
+| SMP, Time & Boot | 10 | 8.4% | 5 |
 | Build & Integration | 3 | 2.5% | 1 |
-| **Total** | **118** | **100.0%** | **34** |
+| **Total** | **119** | **100.0%** | **35** |
 
 **Largest single write-ups:**
 
@@ -166,7 +166,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_SSH_STDIN_PUMP.md
 - the `linux-abi` `spawn_full` piped only stdout, so the child inherited the spawner's fd 0 and sshd's pump wrote into a stdin the child never read, with no EOF either: every ssh exec that sent stdin hung; `SpawnResult` carries the write end of a real stdin pipe (`15ff2709`)
 
-## Memory & Copy-on-Write (15 fixes, 5 docs)
+## Memory & Copy-on-Write (16 fixes, 6 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `mmap` demanded `fd == -1` for `MAP_ANONYMOUS` while libakuma passes 0 (Linux ignores it), so sshd's first allocation answered `ENODEV` (stage 4)
@@ -192,6 +192,9 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 - `MAP_FIXED` over a shared file mapping released its pages but kept its record, so the next write-back put the new mapping's bytes into the old file; it writes back and forgets the records under it
 - `mremap` of a shared file mapping moved its pages and left the record at the old address, so the write-back read whatever was there and lost the moved pages; refused with `EINVAL`
 - `mmap` accepted a file offset that is not a page multiple, which Linux refuses, and filled the mapping from it; `EINVAL`
+
+### docs/archive/UNLINKED_FILE_SPACE_RETURNED_LATE.md
+- a lazy file mapping pinned its inode until the process was reaped, never at `munmap`, so a file mapped, unmapped and then unlinked kept its blocks for the life of the process (16 MB held after `unlink` in `unlinkspace`); a pin covers the VA range its records live in, `release_pages` trims it, and it goes when no unfilled record or shared record in it names the inode
 
 ## Signals (5 fixes, 2 docs)
 
@@ -267,6 +270,8 @@ These are fixes to code every kernel runs, so the Akuma list counts them:
   Infinity guest's disk image on the Akuma host at about 4 GiB.
 - `INODE_PIN_CONGESTED_WINDOW.md`: the inode pin table read every inode homed in a full probe window as pinned, so ext2 never
   freed their unlinks (65 inodes after a `cargo clean` in the Infinity guest).
+- `UNLINKED_FILE_SPACE_RETURNED_LATE.md`: ext2 finished a deferred free only at the next unlink or create, so a file unlinked
+  while mapped or open kept its blocks after the last `munmap`/`close`, and after exit.
 
 ## Files scanned with zero counted fixes
 
@@ -304,7 +309,9 @@ Scanned 2026-11-02, closing `rust-org-il-experiment`.
   A second pass the same day: TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE closes that gap; its lazy ELF image and initial
   stack are an efficiency change with no failure behind them and are not counted, and the like-for-like build it records
   is a measurement. Fault-signal delivery is still open. A third pass: the measurement did not finish (the disk ran out before the final link) and the
-  stranded inodes it showed are INODE_PIN_CONGESTED_WINDOW, counted in `BUG_FIX_LIST.md`.
+  stranded inodes it showed are INODE_PIN_CONGESTED_WINDOW, counted in `BUG_FIX_LIST.md`. A fourth pass counts
+  UNLINKED_FILE_SPACE_RETURNED_LATE's Taoxichuan pin range here and its ext2 drain in `BUG_FIX_LIST.md`; the dated note in
+  TAOXICHUAN_LAZY_MMAP points at it and adds no fix.
 
 ## Background
 

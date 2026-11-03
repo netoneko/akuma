@@ -88,66 +88,70 @@ their "before" figures (84,761 on 10-30) do not compare with these; quote this t
 - What did not change: it still self-hosts. K1 == K2 at the cutover's predecessors (`6af48c06`, ryzen KVM and
   metal) and after: B15 under Pop's KVM (`5f568279...`) and under TCG on the Mac (`b0c08970...`).
 
-## Bugs fixed, by subsystem (the bug-fix lists, 2026-11-02)
+## Bugs fixed, by subsystem (the bug-fix lists, 2026-11-03)
 
 From the two itemized lists: [`BUG_FIX_LIST.md`](BUG_FIX_LIST.md) (Akuma, the whole project's history) and
 [`TAOXICHUAN_BUG_FIX_LIST.md`](TAOXICHUAN_BUG_FIX_LIST.md) (Taoxichuan's own code, its rigs and its experiment). One
 item per distinct, named bug a doc records as fixed; a fix in code both kernels run is counted once, in Akuma's list.
 Akuma's subsystems are tagged per write-up, not per bug, so a grab-bag doc lands in one row.
 
-**Total: 1,586 fixes** - 1,481 in Akuma (415 docs) and 105 in Taoxichuan (28 docs).
+**Total: 1,612 fixes** - 1,493 in Akuma (424 docs) and 119 in Taoxichuan (35 docs).
 
 | Akuma subsystem | fixes | % |
 |---|---:|---:|
-| Syscall / ABI compatibility | 245 | 16.5 |
-| Memory & virtual memory | 177 | 12.0 |
-| Boot & drivers | 141 | 9.5 |
-| Scheduler & process management | 139 | 9.4 |
-| SMP & locking | 136 | 9.2 |
-| VFS & filesystem | 134 | 9.0 |
-| Networking | 95 | 6.4 |
+| Syscall / ABI compatibility | 245 | 16.4 |
+| Memory & virtual memory | 181 | 12.1 |
+| Boot & drivers | 141 | 9.4 |
+| VFS & filesystem | 140 | 9.4 |
+| Scheduler & process management | 139 | 9.3 |
+| SMP & locking | 136 | 9.1 |
+| Networking | 96 | 6.4 |
 | Toolchain & self-hosting | 91 | 6.1 |
 | Misc / cross-cutting | 64 | 4.3 |
 | Console & terminal | 58 | 3.9 |
 | Containers | 56 | 3.8 |
 | Userspace apps & libraries | 40 | 2.7 |
 | Signals & exceptions | 40 | 2.7 |
-| SSH | 39 | 2.6 |
-| Rump kernel & syscall proxy | 26 | 1.8 |
-| **Akuma total** | **1,481** | |
+| SSH | 40 | 2.7 |
+| Rump kernel & syscall proxy | 26 | 1.7 |
+| **Akuma total** | **1,493** | |
 
 | Taoxichuan subsystem | fixes | % |
 |---|---:|---:|
-| Syscalls, files & pipes | 37 | 35.2 |
-| Processes, fork, threads & scheduling | 33 | 31.4 |
-| SMP, time & boot | 9 | 8.6 |
-| Exec & ELF loading | 8 | 7.6 |
-| Memory & copy-on-write | 6 | 5.7 |
-| Signals | 5 | 4.8 |
-| Networking & readiness | 4 | 3.8 |
-| Build & integration | 3 | 2.9 |
-| **Taoxichuan total** | **105** | |
+| Syscalls, files & pipes | 37 | 31.1 |
+| Processes, fork, threads & scheduling | 33 | 27.7 |
+| Memory & copy-on-write | 16 | 13.4 |
+| Exec & ELF loading | 11 | 9.2 |
+| SMP, time & boot | 10 | 8.4 |
+| Signals | 5 | 4.2 |
+| Networking & readiness | 4 | 3.4 |
+| Build & integration | 3 | 2.5 |
+| **Taoxichuan total** | **119** | |
 
-**This branch fixed 116**: all 105 of Taoxichuan's (the kernel exists only here), plus **11 in Akuma**. Akuma's
-list on `main` reads 1,470; on this branch, 1,481:
+**This branch fixed 142**: all 119 of Taoxichuan's (the kernel exists only here), plus **23 in Akuma**. Akuma's
+list on `main` reads 1,470; on this branch, 1,493:
 
 | Akuma subsystem | `main` | branch | the fixes |
 |---|---:|---:|---|
 | Syscall / ABI compatibility | 242 | 245 | `dup`/`F_DUPFD` dropped `O_NONBLOCK` (tokio's signal driver blocked); `pidfd_open` flags and close-on-exec; `rt_sigpending` served by no kernel |
 | Misc / cross-cutting | 59 | 64 | `SIG_UNBLOCK` left a stray SIGKILL/SIGSTOP bit; `akuma-pmm`'s CoW table a heap node per shared frame; a `kvm0` guest disk read as 856 MiB (herd reload race); the audit scanner swallowed code after a gated last field; amd64 self-test build broken since the boot-kit extraction |
-| Memory & virtual memory | 176 | 177 | `kvm0` guest RAM capped at 1 GiB (one NPT directory) |
-| Networking | 94 | 95 | in-tree virtio-net sent frames without the `virtio_net_hdr` (DHCP never answered) |
+| Memory & virtual memory | 176 | 181 | `kvm0` guest RAM capped at 1 GiB (one NPT directory); the PVH handoff placed above 4 GiB, and `memmap_entries` always 1; glue's by-inode write never invalidated the file-page cache; `copy_from_user_str` gave `EFAULT` for a path in an untouched lazy page |
+| VFS & filesystem | 134 | 140 | ext2 wrote dirent types without `INCOMPAT_FILETYPE`, and read a 0 type as "file"; no triple-indirect blocks and 32-bit sizes (the 4 GiB cap); a full pin-table window read "pinned", stranding unlinks; a deferred free finished only at the next unlink |
+| Networking | 94 | 96 | in-tree virtio-net sent frames without the `virtio_net_hdr` (DHCP never answered); AF_UNIX `read`/`write` skipped the record queue |
+| SSH | 39 | 40 | sshd sessions had no `PATH`, so gcc could not find `cc1` |
 | Containers | 55 | 56 | every amd64 `box run` failed to spawn (glue's `exec` feature gated to AArch64) |
-| **Total** | **1,470** | **1,481** | **+11**, from 9 docs (406 -> 415) |
+| **Total** | **1,470** | **1,493** | **+23**, from 18 docs (406 -> 424) |
 
-All 11 turned up in Taoxichuan work: running a second kernel on the same crates, growing its VMs, measuring it.
-**Five were bugs in `main`'s code**, which every Akuma kernel carries until this branch merges: `dup`'s lost
-`O_NONBLOCK`, `pidfd_open`, the missing `rt_sigpending`, the CoW table and the 1 GiB guest-RAM cap. **Six were in code
+All 23 turned up in Taoxichuan work: running a second kernel on the same crates, growing its VMs, measuring it.
+**Seventeen were bugs in `main`'s code**, which every Akuma kernel carries until this branch merges: `dup`'s lost
+`O_NONBLOCK`, `pidfd_open`, the missing `rt_sigpending`, the CoW table, the 1 GiB guest-RAM cap, the PVH handoff (2),
+the file-page cache invalidation, `copy_from_user_str`, AF_UNIX `read`/`write`, sshd's `PATH`, ext2's dirent types (2)
+and 4 GiB cap (2), and the pin table and deferred free behind deleted files keeping their space. **Six were in code
 this branch wrote**, caught and fixed before it reaches `main`: the `box run` regression (`3e2bb725`, the
 one-ELF-loader step), the in-tree virtio-net header, the amd64 self-test build, `SIG_UNBLOCK` in the newly extracted
 `akuma-syscalls-signal`, the herd reload race in the new `boot_dev.sh`, and the audit scanner.
-- Two thirds of Taoxichuan's bugs (70 of 105) are in syscalls/files/pipes and processes/threads/scheduling. 59 of
-  the 105 come from one document, the experiment's agent log
+- Three fifths of Taoxichuan's bugs (70 of 119) are in syscalls/files/pipes and processes/threads/scheduling. 59 of
+  the 119 come from one document, the experiment's agent log
   ([`MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md`](MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md)).
 
 ## Crates: `main` vs this branch (2026-11-02)
@@ -224,10 +228,10 @@ Linux 6.18 figures are still the 10-30 builds.
   `akuma-tokio-kernel-amd64` 3,758.
 - Against Linux: the guest is **10.7x** smaller than Linux trimmed to the same job (836,651) and **24x** smaller than
   Linux as Firecracker ships it (1,868,016). The host is **17.3x**. Linux's host alone is **30x** Taoxichuan.
-- **Bugs this branch fixed: 116.** 105 in Taoxichuan's own code
-  ([`TAOXICHUAN_BUG_FIX_LIST.md`](TAOXICHUAN_BUG_FIX_LIST.md), 28 docs; the biggest classes are syscalls/files/pipes
-  37 and processes/fork/threads/scheduling 33), and 11 in shared Akuma crates, found through Taoxichuan or on the way
-  ([`BUG_FIX_LIST.md`](BUG_FIX_LIST.md) went 1,470 -> 1,481 fixes, 406 -> 415 docs, over the branch's 566 commits).
+- **Bugs this branch fixed: 142.** 119 in Taoxichuan's own code
+  ([`TAOXICHUAN_BUG_FIX_LIST.md`](TAOXICHUAN_BUG_FIX_LIST.md), 35 docs; the biggest classes are syscalls/files/pipes
+  37 and processes/fork/threads/scheduling 33), and 23 in shared Akuma crates, found through Taoxichuan or on the way
+  ([`BUG_FIX_LIST.md`](BUG_FIX_LIST.md) went 1,470 -> 1,493 fixes, 406 -> 424 docs, over the branch's 566 commits).
 
 **Runs on it (B15):** the battery + goose/GLM 10/10, `tokioprobe` at `smp=1` and real `smp=4`, `rustc` + `cargo
 build`; Osaka the same `tokioprobe` and battery. Census: 76 syscalls used by the workloads, 0 unserved.

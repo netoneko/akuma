@@ -956,6 +956,30 @@ fn dropping_the_last_pin_lets_the_inode_be_reclaimed() {
     );
 }
 
+/// The last pin going is enough: no further unlink or create is needed for the
+/// blocks to come back. `statfs` (what `df` asks) finishes the free, so the
+/// space shows as soon as the last mapping or fd of an unlinked file goes, and
+/// it reaches the disk before a crash can strand it.
+#[test]
+fn statfs_after_the_last_pin_goes_shows_the_space_freed() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    let before = fs.stats().unwrap().free_blocks;
+    fs.write_file("/held", &[7u8; 64 * 1024]).unwrap();
+    let inode = fs.resolve_inode("/held").unwrap();
+    let written = before - fs.stats().unwrap().free_blocks;
+    assert!(written > 0, "fixture: the file must take blocks");
+
+    let pin = akuma_primitives::InodePin::new(inode);
+    fs.remove_file("/held").unwrap();
+    assert_eq!(fs.deferred_free_len(), 1, "a pinned unlink is deferred");
+    assert_eq!(before - fs.stats().unwrap().free_blocks, written, "and keeps its blocks while pinned");
+
+    drop(pin);
+    assert_eq!(fs.stats().unwrap().free_blocks, before, "statfs alone must finish the free");
+    assert_eq!(fs.deferred_free_len(), 0);
+}
+
 /// The unchanged path — an unlink with no mapping still frees immediately, so
 /// the fix costs nothing on the overwhelmingly common case.
 #[test]

@@ -68,6 +68,9 @@ space that can still fault it. `lazy::pin` holds an `akuma_primitives::InodePin`
 which ext2's deferred free respects. A fork child inherits its parent's pins, and `free_user_root` drops
 them. This is coarser than Linux: an unlinked file's blocks are freed when the last process that mapped it
 is reaped, not when its last page is unmapped. If a pin cannot be recorded, the mapping is filled eagerly.
+*(2026-11-03: no longer coarser. A pin now covers the range its records live in and goes when the last
+unfilled record of the inode does, at `munmap`:
+[`UNLINKED_FILE_SPACE_RETURNED_LATE.md`](UNLINKED_FILE_SPACE_RETURNED_LATE.md).)*
 
 **Still eager:**
 

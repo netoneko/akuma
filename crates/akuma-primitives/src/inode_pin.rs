@@ -83,6 +83,25 @@ static TABLE: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 /// `true` for every inode — see the module header.
 static OVERFLOW: [AtomicUsize; REGIONS] = [const { AtomicUsize::new(0) }; REGIONS];
 
+/// Times an inode's last pin went (its count reached zero, or a lost pin was
+/// balanced). The filesystem compares it against the value at its last drain
+/// ([`unpinned_since`]): an inode unlinked while pinned is freed by the next
+/// filesystem operation after its last pin goes, not by the next unlink.
+static UNPINS: AtomicU64 = AtomicU64::new(0);
+
+/// The current [`UNPINS`] count. A filesystem that deferred frees keeps the
+/// value it last drained at, and drains again when this differs.
+#[must_use]
+pub fn unpin_epoch() -> u64 {
+    UNPINS.load(Ordering::Acquire)
+}
+
+/// Has any inode's last pin gone since `epoch` (a value of [`unpin_epoch`])?
+#[must_use]
+pub fn unpinned_since(epoch: u64) -> bool {
+    unpin_epoch() != epoch
+}
+
 /// Regions the table is divided into for overflow accounting. An unrecorded pin
 /// makes only its **own** region answer conservatively, instead of the whole
 /// table.
@@ -290,6 +309,7 @@ fn release(inode: u32) {
                         // can, because unbounded tombstone growth is what breaks
                         // this table — see `compact_tail`.
                         compact_tail(pos);
+                        UNPINS.fetch_add(1, Ordering::AcqRel);
                     }
                     return;
                 }
@@ -307,7 +327,10 @@ fn release(inode: u32) {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    UNPINS.fetch_add(1, Ordering::AcqRel);
+                    return;
+                }
                 Err(v) => cur = v,
             }
         }

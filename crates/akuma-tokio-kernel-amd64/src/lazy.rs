@@ -305,51 +305,130 @@ pub fn anon_like(pte: u64) -> Lazy {
 // outlive every address space that can still fault it in.
 // ---------------------------------------------------------------------------
 
-/// `(root, pin)`: address space `root` holds lazy pages of `pin`'s inode. One
-/// entry per pair. Dropped with the root (`free_user_root`), so an unlinked
-/// file's blocks are freed when the last process that mapped it is reaped,
-/// not when its last page is unmapped - coarser than Linux, never earlier.
+/// Address space `root` may hold lazy pages of `pin`'s inode, all inside
+/// `[lo, hi)`. One entry per `(root, inode)`; its range only grows (`pin`,
+/// `move_pins`) until a release trims it ([`unpin_released`]). The entry goes
+/// when no unfilled record of the inode is left in its range - `munmap` of the
+/// mapping, as Linux - or with the root (`free_user_root`). A filled page holds
+/// its own frame and no longer needs the inode.
 /// Under the kernel lock, as `TASKS` is.
-static PINS: akuma_primitives::cell::BorrowCell<alloc::vec::Vec<(u64, akuma_primitives::InodePin)>> =
+struct Pin {
+    root: u64,
+    pin: akuma_primitives::InodePin,
+    lo: u64,
+    hi: u64,
+}
+
+static PINS: akuma_primitives::cell::BorrowCell<alloc::vec::Vec<Pin>> =
     akuma_primitives::cell::BorrowCell::new(alloc::vec::Vec::new());
 
-/// Pin `inode` for `root`. `false` when the table cannot grow - the caller
-/// maps the file eagerly instead.
-pub fn pin(root: u64, inode: u32) -> bool {
+/// Pin `inode` for `root`, for records in `[lo, hi)`. `false` when the table
+/// cannot grow - the caller maps the file eagerly instead.
+pub fn pin(root: u64, inode: u32, lo: u64, hi: u64) -> bool {
     PINS.with_mut(|p| {
-        if p.iter().any(|(r, pin)| *r == root && pin.inode() == inode) {
+        if let Some(e) = p.iter_mut().find(|e| e.root == root && e.pin.inode() == inode) {
+            e.lo = e.lo.min(lo);
+            e.hi = e.hi.max(hi);
             return true;
         }
         if p.try_reserve(1).is_err() {
             return false;
         }
-        p.push((root, akuma_primitives::InodePin::new(inode)));
+        p.push(Pin { root, pin: akuma_primitives::InodePin::new(inode), lo, hi });
         true
     })
 }
 
-/// A fork child's address space holds every lazy page its parent did.
-/// `false` when the table cannot grow; whatever was added is kept, and goes
-/// with `child`'s root.
+/// A fork child's address space holds every lazy page its parent did, at the
+/// same addresses. `false` when the table cannot grow; whatever was added is
+/// kept, and goes with `child`'s root.
 pub fn fork_pins(parent: u64, child: u64) -> bool {
     PINS.with_mut(|p| {
-        let n = p.iter().filter(|(r, _)| *r == parent).count();
+        let n = p.iter().filter(|e| e.root == parent).count();
         if p.try_reserve(n).is_err() {
             return false;
         }
         for i in 0..p.len() {
-            if p[i].0 == parent {
-                let pin = p[i].1.clone();
-                p.push((child, pin));
+            if p[i].root == parent {
+                let e = Pin { root: child, pin: p[i].pin.clone(), lo: p[i].lo, hi: p[i].hi };
+                p.push(e);
             }
         }
         true
     })
 }
 
+/// `mremap` moved `[from, from + len)` to `to`: a pin whose range overlaps
+/// the source now covers where those records went as well.
+pub fn move_pins(root: u64, from: u64, to: u64, len: u64) {
+    PINS.with_mut(|p| {
+        for e in p.iter_mut().filter(|e| e.root == root && e.lo < from + len && from < e.hi) {
+            let (s, t) = (e.lo.max(from), e.hi.min(from + len));
+            e.lo = e.lo.min(to + (s - from));
+            e.hi = e.hi.max(to + (t - from));
+        }
+    });
+}
+
+/// Pages a range check walks before it gives up and keeps the pin: a huge
+/// mapping unmapped a slice at a time would otherwise walk its rest each time.
+const SCAN_LIMIT: u64 = 1 << 16;
+
+/// Does an unfilled record in `[lo, hi)` of `root` name `inode`? `true` past
+/// [`SCAN_LIMIT`] without looking.
+fn names_inode(root: u64, lo: u64, hi: u64, inode: u32) -> bool {
+    if (hi - lo) / 4096 > SCAN_LIMIT {
+        return true;
+    }
+    let mut va = lo;
+    while va < hi {
+        if let Some(slot) = crate::leaf_entry(root, va)
+            && let Some(page) = lazy::decode(slot.read())
+            && page.file.is_some_and(|f| f.inode == inode)
+        {
+            return true;
+        }
+        va += 4096;
+    }
+    false
+}
+
+/// `[start, end)` of `root` was just released (`release_pages`): trim every
+/// pin of `root` by it, then drop each whose remaining range holds no record
+/// of its inode and which `keep(inode, lo, hi)` does not claim (a shared
+/// mapping writes back by inode). Returns whether a pin went. Allocates
+/// nothing; past the first 16 pins a release touches, the rest only trim.
+pub fn unpin_released(root: u64, start: u64, end: u64, keep: impl Fn(u32, u64, u64) -> bool) -> bool {
+    let mut cand = [(0u32, 0u64, 0u64); 16];
+    let mut n = 0;
+    PINS.with_mut(|p| {
+        for e in p.iter_mut().filter(|e| e.root == root && e.lo < end && start < e.hi) {
+            if start <= e.lo {
+                e.lo = end.min(e.hi);
+            } else if end >= e.hi {
+                e.hi = start;
+            }
+            if n < cand.len() {
+                cand[n] = (e.pin.inode(), e.lo, e.hi);
+                n += 1;
+            }
+        }
+    });
+    let mut dropped = false;
+    // The checks walk page tables and read the task record: no `PINS` borrow.
+    for &(inode, lo, hi) in &cand[..n] {
+        if lo < hi && (names_inode(root, lo, hi, inode) || keep(inode, lo, hi)) {
+            continue;
+        }
+        PINS.with_mut(|p| p.retain(|e| !(e.root == root && e.pin.inode() == inode)));
+        dropped = true;
+    }
+    dropped
+}
+
 /// `root` is gone: release its pins.
 pub fn drop_pins(root: u64) {
     // Dropping a pin is a CAS on the pin table and nothing else, so the
     // entries can drop inside the borrow; no allocation on the teardown path.
-    PINS.with_mut(|p| p.retain(|(r, _)| *r != root));
+    PINS.with_mut(|p| p.retain(|e| e.root != root));
 }

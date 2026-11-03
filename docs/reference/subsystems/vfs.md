@@ -127,7 +127,11 @@ things follow:
   `acquire` could not record is counted there. Inside the table its answer is
   exact: a key lives only in its own 32-slot window, so a full window without
   it means "not pinned". Answering `true` there kept unlinks deferred forever
-  (`archive/INODE_PIN_CONGESTED_WINDOW.md`).
+  (`archive/INODE_PIN_CONGESTED_WINDOW.md`). A deferred free finishes at the
+  **next ext2 write hold or `statfs` after the inode's last pin goes**, not at
+  the next unlink: the pin table counts last-pin releases (`unpin_epoch`), and
+  `write_state` drains when that count has moved since the mount last drained
+  (`archive/UNLINKED_FILE_SPACE_RETURNED_LATE.md`).
 - **`inode == 0` means "read by path"**, and that is the path every filesystem
   without inode addressing takes — procfs, `MemoryFilesystem`, synthetic nodes —
   plus `/etc/mtab`, which must stay a resolve-time synthetic.
@@ -383,6 +387,7 @@ namespace.
 - `archive/EXT2_FIRST_DATA_BLOCK_FIX.md`, `archive/GETDENTS64_DIR_CACHE_FIX.md`.
 - `archive/EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES.md` (the 4 GiB cap).
 - `archive/INODE_PIN_CONGESTED_WINDOW.md` (a full pin-table window read "pinned").
+- `archive/UNLINKED_FILE_SPACE_RETURNED_LATE.md` (space came back at the next unlink, or at reap).
 - `archive/VFS_LOCK_OPTIMIZATION_PLAN.md` (planning, not a fire).
 - `archive/BOX_SUBDIR_FS_LIMITATIONS.md`, `archive/STAT_AND_UNLINKAT_FIX.md`,
   `archive/PIPE_TTY_FIX.md`, `archive/WRITE_AT_SYSCALL.md`.
