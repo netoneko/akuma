@@ -14,7 +14,7 @@
 
 **Booting Akuma, Linux and NetBSD as KVM guests with Akuma as host kernel achieved** (2026-10-22) - an AMD SVM hypervisor inside the amd64 kernel, verified on bare metal Ryzen 7 8845HS; see [here](./docs/archive/AKUMA_KVM.md) (design and reference: [`kvm.md`](./docs/reference/subsystems/kvm.md)). Works both via KVM backend and [Firecracker via KVM](./docs/archive/AKUMA_FIRECKRACKER_KVM.md).
 
-**Self Hosting Rust Kernel** presentation for [rust.org.il](https://rust.org.il/events/2026-11-03-in-person), slides on [akuma.sh](https://github.com/akuma.sh/self-hosting-rust-kernel) with [source notes](./docs/archive/RUST_ORG_IL_TALK.md), [experiment methodology](./docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md) and [experiment log](./docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md).
+**Self Hosting Rust Kernel** presentation for [rust.org.il](https://rust.org.il/events/2026-11-03-in-person), slides on [akuma.sh](https://akuma.sh/self-hosting-rust-kernel) with [source notes](./docs/archive/RUST_ORG_IL_TALK.md), [experiment methodology](./docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md) and [experiment log](./docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md).
 
 ```
                                              %#%:                +
