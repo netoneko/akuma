@@ -488,26 +488,25 @@
   <section class="slide">
     <div class="num">05</div>
     <div class="body">
-      <p class="eyebrow">Handoff and metal</p>
-      <h2>Handed off to <em>Sonnet</em>, verified by GLM on bare metal</h2>
-<ul><li>I handed off because I got tired of the resets and the quota grind.</li><li>Sonnet is the closest equivalent to GLM Flash, and big GLM is more capable than Sonnet, so open models can plausibly write acceptable kernel code. <span class="m">(My assessment, not a measurement: GLM was never tried on rustc and cargo.)</span></li><li>GLM ran the final self-hosting verification loop on bare metal.</li></ul>
-      <p class="pull"><code>K1 == K2</code>, byte for byte.</p>
+      <p class="eyebrow cool">Why Rust</p>
+      <h2>The audit surface became a <span class="cool">number</span></h2>
+      <div class="figs">
+        <div class="fig"><span class="v hot">86 / 115</span><span class="k">crates forbid <code>unsafe</code></span></div>
+        <div class="fig"><span class="v">98.6%</span><span class="k">production lines outside any <code>unsafe</code></span></div>
+        <div class="fig"><span class="v">218 &rarr; 35</span><span class="k">inline <code>asm!</code> sites outside <code>akuma-cpu</code></span></div>
+        <div class="fig"><span class="v">17 &rarr; 0</span><span class="k"><code>unsafe</code> blocks in the syscall layer</span></div>
+      </div>
+      <ul>
+        <li><strong>Composition:</strong> 93% of Taoxichuan&rsquo;s live lines were already live in Akuma, and a second kernel, Osaka, is 10 lines.</li>
+        <li><strong>Host tests in leaf crates:</strong> the first test of the extracted <code>madvise</code> found that <code>madvise(addr, -1, DONTNEED)</code> looped over ~4.5e15 pages, reachable from unprivileged userspace.</li>
+        <li><strong>Types as the rule:</strong> <code>akuma-port</code> exposes devices, never a port number, so safe code cannot power the box off.</li>
+      </ul>
     </div>
   </section>
 
   <!-- 06 -->
   <section class="slide">
     <div class="num">06</div>
-    <div class="body">
-      <p class="eyebrow cool">Why Rust</p>
-      <h2>Expressive, flexible, and it <em>enforces discipline</em></h2>
-<ul><li>Easy to measure the audit surface.</li><li><strong>Composition:</strong> crates that arrived already debugged.</li><li><strong>Host tests</strong> in leaf crates.</li><li><strong>Inversion of control</strong>, forced by the pre-port refactor.</li><li><code>unsafe</code> is countable and contained.</li><li>Drivers and KVM built from specs.</li></ul>
-    </div>
-  </section>
-
-  <!-- 07 -->
-  <section class="slide">
-    <div class="num">07</div>
     <div class="body">
       <p class="eyebrow">Cleanup</p>
       <h2>Opus cleaned up Taoxichuan</h2>
@@ -524,9 +523,9 @@
     </div>
   </section>
 
-  <!-- 08 -->
+  <!-- 07 -->
   <section class="slide">
-    <div class="num">08</div>
+    <div class="num">07</div>
     <div class="body">
       <p class="eyebrow cool">Kernel as a crate</p>
       <h2>Install a kernel from crates.io, and have your whole supply chain hijacked</h2>
@@ -534,9 +533,9 @@
     </div>
   </section>
 
-  <!-- 09 -->
+  <!-- 08 -->
   <section class="slide">
-    <div class="num">09</div>
+    <div class="num">08</div>
     <div class="body">
       <p class="eyebrow">Costs and benefits</p>
       <h2>The real cost is mostly in <em>my sanity</em></h2>
@@ -559,9 +558,9 @@
     </div>
   </section>
 
-  <!-- 10 -->
+  <!-- 09 -->
   <section class="slide">
-    <div class="num">10</div>
+    <div class="num">09</div>
     <div class="body">
       <p class="eyebrow">What&rsquo;s next</p>
       <h2>Hardening, then <span class="cool">verification</span></h2>
