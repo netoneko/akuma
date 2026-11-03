@@ -196,6 +196,26 @@ impl Table {
         true
     }
 
+    /// Drop every entry nobody maps, handing each frame to `f` so the caller
+    /// can release the table's reference. Returns how many went.
+    ///
+    /// For a kernel whose teardown cannot name keys: Taoxichuan frees an
+    /// address space from its page table alone, after the records that said
+    /// which file each page came from are gone, so it cannot [`reap`](Self::reap)
+    /// page by page and sweeps instead. `reap`'s rule holds for every entry this
+    /// drops: the file must already have what the frame holds.
+    pub fn reap_unmapped(&mut self, refs: &impl Refs, mut f: impl FnMut(usize)) -> usize {
+        let before = self.map.len();
+        self.map.retain(|_, pa| {
+            if refs.get(*pa) > 1 {
+                return true;
+            }
+            f(*pa);
+            false
+        });
+        before - self.map.len()
+    }
+
     /// Visit every cached page of `(mount_id, inode)` that overlaps the byte
     /// range `[from, to)`, as `(page_offset, pa)`, ascending.
     pub fn for_each_in(&self, mount_id: u32, inode: u32, from: usize, to: usize, mut f: impl FnMut(usize, usize)) {
@@ -409,6 +429,27 @@ mod tests {
         assert_eq!(t.publish(K, 0x2000, &r), Publish::Existing(0x1000));
         assert_eq!(r.get(0x1000), 3, "winner's mapping + table + loser's mapping");
         assert_eq!(r.get(0x2000), 0, "the loser's frame was never referenced: it frees outright");
+    }
+
+    /// Two published pages, one still mapped by a second process: the sweep
+    /// takes only the one whose last mapping went, and hands its frame back.
+    #[test]
+    fn the_sweep_drops_only_entries_nobody_maps() {
+        let (mut t, r) = (Table::new(), FakeRefs::default());
+        let k2 = Key::new(1, 12, 0x9000);
+        t.publish(K, 0x1000, &r);
+        t.publish(k2, 0x2000, &r);
+        assert_eq!(t.lookup_and_ref(k2, &r), Some(0x2000));
+        // The filler of both unmaps them; `k2` keeps its second mapper.
+        r.dec(0x1000);
+        r.dec(0x2000);
+        let mut freed = Vec::new();
+        assert_eq!(t.reap_unmapped(&r, |pa| freed.push(pa)), 1);
+        assert_eq!(freed, [0x1000]);
+        assert_eq!(t.lookup_and_ref(K, &r), None);
+        assert_eq!(t.lookup_and_ref(k2, &r), Some(0x2000));
+        // Nothing left that nobody maps: a second sweep is a no-op.
+        assert_eq!(t.reap_unmapped(&r, |_| unreachable!()), 0);
     }
 
     #[test]

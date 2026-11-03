@@ -207,11 +207,20 @@ fn shared_span_policy_is_a_named_choice_with_a_test_per_value() {
     assert_eq!(L.plan_clone(0, e, true, SharedSpans::Copy), ClonePlan::CopyLeaf { old: 0xA000 });
     // ShareFrames (amd64): the same leaf is an ordinary share.
     assert!(matches!(L.plan_clone(0, e, true, SharedSpans::ShareFrames), ClonePlan::ShareLeaf { demoted: true, .. }));
-    // Outside a shared span the policy is irrelevant.
+    // ShareWritable (taoxichuan): shared, and the entry is stored back exactly as it was - still writable, no marker.
     assert_eq!(
-        L.plan_clone(0, e, false, SharedSpans::Copy),
-        L.plan_clone(0, e, false, SharedSpans::ShareFrames)
+        L.plan_clone(0, e, true, SharedSpans::ShareWritable),
+        ClonePlan::ShareLeaf { frame: 0xA000, parent_entry: e, child_entry: e, demoted: false }
     );
+    let ro = 0xA000 | P | 4;
+    assert_eq!(
+        L.plan_clone(0, ro, true, SharedSpans::ShareWritable),
+        ClonePlan::ShareLeaf { frame: 0xA000, parent_entry: ro, child_entry: ro, demoted: false }
+    );
+    // Outside a shared span the policy is irrelevant.
+    for policy in [SharedSpans::ShareFrames, SharedSpans::ShareWritable] {
+        assert_eq!(L.plan_clone(0, e, false, SharedSpans::Copy), L.plan_clone(0, e, false, policy));
+    }
 }
 
 #[test]
@@ -231,7 +240,7 @@ fn relink_keeps_flags_and_replaces_the_frame() {
 #[test]
 fn clone_is_zero_sum_and_demotes_exactly_the_writable_leaves() {
     for seed in 0..60 {
-        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames] {
+        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames, SharedSpans::ShareWritable] {
             let mut m = Mem::new();
             let parent = build(&mut m, seed);
             let before = live_refs(&m);
@@ -260,7 +269,7 @@ fn clone_is_zero_sum_and_demotes_exactly_the_writable_leaves() {
 #[test]
 fn freeing_clone_and_parent_returns_every_reference_and_table() {
     for seed in 0..60 {
-        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames] {
+        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames, SharedSpans::ShareWritable] {
             let mut m = Mem::new();
             let parent = build(&mut m, seed);
             let child = clone_table(&mut m, parent, 2, 0, &no_span, policy).unwrap();
@@ -280,7 +289,7 @@ fn a_failed_clone_leaves_every_reference_as_it_was() {
     for seed in 0..20 {
         // A shared span in the middle so the Copy policy allocates leaf frames too.
         let span = |va: u64| va & 0x1000 != 0;
-        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames] {
+        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames, SharedSpans::ShareWritable] {
             let mut probe = Mem::new();
             let parent = build(&mut probe, seed);
             let _ = clone_table(&mut probe, parent, 2, 0, &span, policy).unwrap();
@@ -339,4 +348,15 @@ fn shared_span_copy_creates_a_distinct_frame_and_share_frames_does_not() {
     free_table(&mut b, shared_child, 2);
     free_table(&mut b, pb, 2);
     assert!(b.refs.is_empty() && b.tables.is_empty());
+    let mut c = Mem::new();
+    let pc = build(&mut c, 3);
+    let before = leaves(&c, pc);
+    let writable_child = clone_table(&mut c, pc, 2, 0, &all, SharedSpans::ShareWritable).unwrap();
+    assert_eq!(c.refs.len(), n, "ShareWritable: no new leaf frame");
+    assert!(c.refs.values().all(|&r| r == 2), "ShareWritable: every leaf is held twice");
+    assert_eq!(leaves(&c, pc), before, "ShareWritable: the parent keeps its writable entries");
+    assert_eq!(leaves(&c, writable_child), before, "ShareWritable: the child's entries are the parent's");
+    free_table(&mut c, writable_child, 2);
+    free_table(&mut c, pc, 2);
+    assert!(c.refs.is_empty() && c.tables.is_empty());
 }

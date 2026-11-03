@@ -27,23 +27,43 @@ pub const fn page_span(len: u64) -> Option<u64> {
     }
 }
 
-/// A writable `MAP_SHARED` file mapping.
+/// A `MAP_SHARED` mapping: a writable file mapping, or (`inode == 0`) an anonymous one.
 ///
-/// Its pages are private frames filled from the file (no page cache), so the kernel copies them back on `munmap`, `msync`, exec and exit,
-/// clamped to `size`, the file's length when it was mapped.
+/// A fork shares its frames writable instead of copying them, so parent and child see each other's stores. A
+/// file mapping's pages are also copied back on `munmap`, `msync`, exec and exit, clamped to `size`, the file's
+/// length when it was mapped; an anonymous one has no file and nothing to write back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SharedFile {
     pub base: u64,
     pub len: u64,
+    /// The file's inode, or 0 for `MAP_SHARED | MAP_ANONYMOUS` (no ext2 inode is numbered 0).
     pub inode: u32,
     pub offset: u64,
     pub size: u64,
 }
 
 impl SharedFile {
+    /// A `MAP_SHARED | MAP_ANONYMOUS` mapping of `[base, base + len)`.
+    #[must_use]
+    pub const fn anon(base: u64, len: u64) -> Self {
+        Self { base, len, inode: 0, offset: 0, size: 0 }
+    }
+
+    /// Is this the anonymous kind (nothing to write back)?
+    #[must_use]
+    pub const fn is_anon(&self) -> bool {
+        self.inode == 0
+    }
+
     #[must_use]
     const fn within(&self, lo: u64, hi: u64) -> bool {
         self.base >= lo && self.base + self.len <= hi
+    }
+
+    /// Does `[lo, hi)` overlap this mapping?
+    #[must_use]
+    pub const fn overlaps(&self, lo: u64, hi: u64) -> bool {
+        self.base < hi && lo < self.base + self.len
     }
 }
 
@@ -290,8 +310,8 @@ impl<const REGIONS: usize, const HOLES: usize, const SHARED: usize> Layout<REGIO
 
     // ── shared file mappings ──────────────────────────────────────────────────
 
-    /// Record a writable shared file mapping. `false` when the table is full: writes to that
-    /// mapping then never reach the file.
+    /// Record a shared mapping. `false` when the table is full: writes to that file mapping
+    /// then never reach the file, and a fork copies its pages instead of sharing them.
     pub fn add_shared(&mut self, f: SharedFile) -> bool {
         if self.n_shared == SHARED {
             return false;
@@ -307,7 +327,7 @@ impl<const REGIONS: usize, const HOLES: usize, const SHARED: usize> Layout<REGIO
         &self.shared[..self.n_shared]
     }
 
-    /// Does `va` lie in a shared mapping? (A fork must copy those pages, not share them.)
+    /// Does `va` lie in a shared mapping? (A fork shares those pages writable rather than copy-on-write.)
     #[must_use]
     pub fn in_shared(&self, va: u64) -> bool {
         self.shared().iter().any(|f| va >= f.base && va < f.base + f.len)
@@ -339,16 +359,13 @@ impl<const REGIONS: usize, const HOLES: usize, const SHARED: usize> Layout<REGIO
         self.n_shared = 0;
     }
 
-    /// The layout of a `fork` child: the same regions, break and slab, and **no** shared
-    /// mappings. The child's copies of those pages are private (copy-on-write), so writing
-    /// them back would put the child's bytes in the file - Linux would share the pages
-    /// instead; this kernel does not, and keeping the records would also outlive the
-    /// parent's own write-back.
+    /// The layout of a `fork` child: the same regions, break, slab **and shared mappings**. A
+    /// fork shares a shared mapping's frames writable, so the child is a mapper like the
+    /// parent: it writes a file mapping back on its own `munmap`/exit, and a second fork
+    /// from it must share the pages again.
     #[must_use]
     pub const fn fork(&self) -> Self {
-        let mut child = *self;
-        child.n_shared = 0;
-        child
+        *self
     }
 }
 
@@ -487,7 +504,19 @@ mod tests {
     }
 
     #[test]
-    fn fork_keeps_the_layout_but_not_the_shared_mappings_and_exec_resets() {
+    fn an_anonymous_shared_record_has_no_file_and_overlap_is_half_open() {
+        let a = SharedFile::anon(BASE, 0x2000);
+        assert!(a.is_anon());
+        assert!(!SharedFile { inode: 3, ..a }.is_anon());
+        assert!(a.overlaps(BASE + 0x1fff, BASE + 0x3000) && a.overlaps(BASE - 1, BASE + 1));
+        assert!(!a.overlaps(BASE + 0x2000, BASE + 0x3000) && !a.overlaps(BASE - 0x1000, BASE));
+        let mut l = layout();
+        assert!(l.add_shared(a));
+        assert!(l.in_shared(BASE) && !l.in_shared(BASE + 0x2000));
+    }
+
+    #[test]
+    fn fork_keeps_the_layout_and_the_shared_mappings_and_exec_resets() {
         let mut l = layout();
         l.add_region(0x1000, 0x2000);
         l.set_brk_window(0x1000_0000, 0x1000);
@@ -497,7 +526,7 @@ mod tests {
         let c = l.fork();
         assert_eq!(c.regions(), l.regions());
         assert_eq!((c.brk(), c.mmap_cur(), c.holes()), (l.brk(), l.mmap_cur(), l.holes()));
-        assert!(c.shared().is_empty());
+        assert_eq!(c.shared(), l.shared(), "a fork child maps the same shared frames");
         l.reset_for_exec();
         assert!(l.regions().is_empty() && l.holes().is_empty() && l.shared().is_empty());
         assert_eq!(l.mmap_cur(), BASE);

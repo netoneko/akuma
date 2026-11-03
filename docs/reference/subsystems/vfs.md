@@ -122,7 +122,12 @@ things follow:
   after that name is unlinked or renamed over, which is what POSIX has always
   said and what path-based reads answered `ENOENT` to. The `InodePin` the fd
   holds is what makes reading by a reissuable number safe: ext2 defers the free
-  of a pinned inode (`release_last_link`, and see `inode_pin`).
+  of a pinned inode (`release_last_link`, and see `inode_pin`). `is_pinned` is
+  conservative only through the per-region overflow count, because a pin
+  `acquire` could not record is counted there. Inside the table its answer is
+  exact: a key lives only in its own 32-slot window, so a full window without
+  it means "not pinned". Answering `true` there kept unlinks deferred forever
+  (`archive/INODE_PIN_CONGESTED_WINDOW.md`).
 - **`inode == 0` means "read by path"**, and that is the path every filesystem
   without inode addressing takes — procfs, `MemoryFilesystem`, synthetic nodes —
   plus `/etc/mtab`, which must stay a resolve-time synthetic.
@@ -237,9 +242,13 @@ umount2".
   trusts a nonzero byte only on such a filesystem; otherwise the inode decides whether an entry is a
   directory or symlink, because `DirEntry` has no "unknown" and a 0 read as a type is "regular file"
   (`archive/EXT2_DIRENT_TYPE_WITHOUT_FILETYPE.md`).
-- **Largest file: 12 + 1024 + 1024² blocks** (4,299,210,752 bytes at 4 KiB). There are no
-  triple-indirect blocks; a block past that is `NotSupported` (`truncate` reports `EIO`). On an Akuma host
-  this caps a guest disk image at about 4 GiB.
+- **The block map is all four levels**: direct, singly, doubly and triply indirect, so a file reaches
+  about 4 TiB at 4 KiB blocks, of which at most 2 TiB can be allocated (`i_blocks` counts 512-byte
+  sectors in 32 bits). A
+  regular file's size is 64 bits, `i_size_lo | i_size_high << 32`: read and write it only through
+  `Inode::file_size()` / `set_file_size()`, never `size_lower` (in anything that is not a regular file
+  the high field is `i_dir_acl`). The first regular file past 2 GiB sets `RO_COMPAT_LARGE_FILE`
+  (`archive/EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES.md`).
 - **`getdents64`:** directory cache fix (`archive/GETDENTS64_DIR_CACHE_FIX.md`).
 - **`fs-cache` feature** (`Cargo.toml`): large ext2 block cache (clock
   eviction) — keeps the read-only toolchain resident across the many process
@@ -372,6 +381,8 @@ namespace.
 
 - `archive/PROCFS.md`, `archive/NAMESPACES.md`, `archive/CWD.md`.
 - `archive/EXT2_FIRST_DATA_BLOCK_FIX.md`, `archive/GETDENTS64_DIR_CACHE_FIX.md`.
+- `archive/EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES.md` (the 4 GiB cap).
+- `archive/INODE_PIN_CONGESTED_WINDOW.md` (a full pin-table window read "pinned").
 - `archive/VFS_LOCK_OPTIMIZATION_PLAN.md` (planning, not a fire).
 - `archive/BOX_SUBDIR_FS_LIMITATIONS.md`, `archive/STAT_AND_UNLINKAT_FIX.md`,
   `archive/PIPE_TTY_FIX.md`, `archive/WRITE_AT_SYSCALL.md`.

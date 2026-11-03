@@ -75,6 +75,10 @@ is reaped, not when its last page is unmapped. If a pin cannot be recorded, the 
 - file mappings at an unaligned offset;
 - the ELF image and the initial stack.
 
+*(2026-11-03: all three are lazy now, or refused (an unaligned offset is `EINVAL`), in
+[`TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md`](TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md), which also found that a
+path string in a lazily mapped library's `.rodata` was `EFAULT` since this change.)*
+
 **Found on the way.** `brk` regrow mapped fresh frames over the pages an earlier shrink had left mapped,
 leaking the old frames. Regrow now releases the range first.
 

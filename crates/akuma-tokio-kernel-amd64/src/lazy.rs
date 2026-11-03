@@ -84,6 +84,10 @@ pub fn fill(root: u64, va: u64, files: bool) -> Fill {
         return Fill::NotLazy;
     }
     let prot = PteProt { write: page.write, exec: page.exec, user: true };
+    // A `MAP_SHARED` writable file page: one frame for every mapper (`shmpages`).
+    if let Some(f) = page.file.filter(|f| f.shared) {
+        return fill_shared(root, va, f, prot);
+    }
     // A read-only file page is shared through the file-page cache: one frame
     // per `(inode, offset)` however many processes map it (amd64's rule, and
     // the same eligibility - see `akuma_fpcache`'s module docs).
@@ -123,6 +127,55 @@ pub fn fill(root: u64, va: u64, files: bool) -> Fill {
         akuma_fpcache::insert(FPCACHE_MOUNT, f.inode, f.index as usize * 4096, akuma_exec::PhysFrame::new(pa), true);
     }
     Fill::Present
+}
+
+/// Fill a page of a writable `MAP_SHARED` file mapping (its record keeps
+/// `shared` across a later `mprotect`, so this may map it read-only): the frame
+/// every other mapper of the page maps, or a fresh one filled from the file and
+/// published for them. amd64's `mm::shared_write_page`, on this kernel's frames.
+fn fill_shared(root: u64, va: u64, f: FilePage, prot: PteProt) -> Fill {
+    use crate::shmpages;
+    let key = shmpages::key(f.inode, f.index);
+    let pa = if let Some(pa) = shmpages::lookup_and_ref(key) {
+        pa
+    } else {
+        let Some(mut frame) = alloc_frame(false) else {
+            return Fill::Failed;
+        };
+        // Every fill and every file write holds the kernel lock, so a write
+        // cannot land between the read and the publish; the generation check
+        // is the crate's contract all the same, bounded as amd64 bounds it (the
+        // last attempt publishes unchecked).
+        let mut outcome = shmpages::Fill::Stale;
+        for attempt in 0..8 {
+            let generation = shmpages::fill_begin(f.inode);
+            let read = read_file_page(f, frame.bytes_mut());
+            let r = read.map(|_| shmpages::publish(key, frame.pa(), (attempt < 7).then_some(generation)));
+            shmpages::fill_end();
+            let Some(r) = r else {
+                return Fill::Failed;
+            };
+            outcome = r;
+            if !matches!(outcome, shmpages::Fill::Stale) {
+                break;
+            }
+        }
+        match outcome {
+            // The peer's frame is the page; this one goes back.
+            shmpages::Fill::Existing(peer) => peer,
+            // Published (the table took its reference) or private.
+            shmpages::Fill::Inserted | shmpages::Fill::Refused => frame.publish(),
+            shmpages::Fill::Stale => return Fill::Failed,
+        }
+    };
+    if paging::map_page_in(root, va as usize, pa as u64, prot, MemAttr::WriteBack) {
+        return Fill::Present;
+    }
+    // This mapping's reference goes; if it was the last besides the table's,
+    // so does the entry.
+    akuma_pmm::free_page(pa, akuma_primitives::preempt::current_tid() as u32);
+    shmpages::reap(key, pa);
+    Fill::Failed
 }
 
 /// The file-page cache keys on `(inode, mount id)`. This kernel has one ext2

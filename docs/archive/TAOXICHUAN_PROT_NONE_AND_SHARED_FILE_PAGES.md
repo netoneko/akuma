@@ -103,15 +103,20 @@ kernel delivers signals only on a syscall's return: a ring-3 fault ends the task
 
 - **The rerun of the lazy-mmap build** with sharing on: the same four `-p` packages, on 3 GiB, to the end. The guest disk
   has about 185 MB free, so it needs `target/` cleared first, or the bigger disk that triple-indirect ext2 support would
-  allow.
+  allow. *(2026-11-03: attempted with `target/` cleared, and the disk ran out before the final link. Peak `used` up to
+  that point was 2.27 GB against 2.86 GB, still not like-for-like, and the rerun still needs the bigger disk:
+  [`TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md`](TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md).)*
 - **Fault signals.** A page fault from ring 3 kills the task (`[Fault] ... task killed`) instead of delivering SIGSEGV
   to a handler. Anything that catches its own faults (GC write barriers, `mprotectlb`) dies.
 - **`MAP_SHARED|MAP_ANONYMOUS` is not shared across fork.** Fork copy-on-writes it like a private mapping, so a parent
   and child do not see each other's writes. `fpcpoison`'s gate and every shared-memory counter between processes rely
-  on it.
+  on it. *(2026-11-03: fixed, with writable shared file mappings, in
+  [`TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md`](TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md).)*
 - **A stale page stays in its current mappers.** An invalidation only stops new mappers getting the old frame. A process
   that mapped the file before the write keeps the bytes from before it, as it did with private copies. Linux would
-  show it the write.
+  show it the write. *(2026-11-03: a **writable** `MAP_SHARED` mapper now sees it, through the one-frame table in
+  [`TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md`](TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md); a read-only one,
+  private or shared, still does not.)*
 
 ## Background
 

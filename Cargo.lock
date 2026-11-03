@@ -949,6 +949,7 @@ dependencies = [
  "akuma-exec",
  "akuma-ext2",
  "akuma-fpcache",
+ "akuma-fpcache-rw",
  "akuma-fpu-amd64",
  "akuma-gdt",
  "akuma-idt-amd64",

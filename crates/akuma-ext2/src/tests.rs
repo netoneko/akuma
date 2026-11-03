@@ -3541,3 +3541,78 @@ fn lookup_of_first_entry_touches_far_fewer_blocks_than_the_whole_directory() {
          lookup ({last})"
     );
 }
+
+/// A file past 4 GiB on a 1 KiB-block image: logical blocks above
+/// `12 + 256 + 256²` live under the triply-indirect pointer, and the size needs
+/// `i_size_high`. Until 2026-11-03 `get_block_num`/`ensure_block` stopped at
+/// doubly indirect (`NotSupported` there: 64 MiB on 1 KiB blocks, 4 GiB on
+/// 4 KiB ones - the Taoxichuan guest image on the Akuma host could not grow
+/// past it) and `read_at`, `write_at` and `metadata` read only `i_size_lo`.
+/// Oracles: the bytes and size through this mount and a fresh one, the free
+/// count back at its baseline after truncating to zero, and `e2fsck -fn`.
+#[test]
+fn a_file_past_4_gib_uses_the_triple_indirect_map_and_its_full_size() {
+    extern crate std;
+    let dev = RecordingDevice::from_fixture("manyinodes.ext2");
+    let clock = || 1_700_000_000_000_000;
+    let fs = Ext2Filesystem::new(&dev, clock).unwrap();
+    fs.write_file("/big", b"").unwrap();
+    let baseline = fs.stats().unwrap().free_blocks;
+
+    const MIB: usize = 1 << 20;
+    let triple = 70 * MIB; // past 12 + 256 + 65536 KiB
+    let far = (5usize << 30) + 1020; // past 4 GiB, straddling a block boundary
+    let pieces: [(usize, &[u8]); 3] = [(0, b"head"), (triple, b"triple-indirect"), (far, b"past four gib")];
+    for (off, data) in pieces {
+        assert_eq!(fs.write_at("/big", off, data).unwrap(), data.len());
+    }
+    let size = (far + b"past four gib".len()) as u64;
+
+    let check = |fs: &Ext2Filesystem<&RecordingDevice>| {
+        assert_eq!(fs.metadata("/big").unwrap().size, size, "the size keeps its high word");
+        for (off, data) in pieces {
+            let mut back = vec![0u8; data.len()];
+            assert_eq!(fs.read_at("/big", off, &mut back).unwrap(), data.len());
+            assert_eq!(back, data, "bytes at {off:#x}");
+        }
+        let mut hole = vec![0xFFu8; 64];
+        assert_eq!(fs.read_at("/big", 3 << 30, &mut hole).unwrap(), 64);
+        assert!(hole.iter().all(|&b| b == 0), "a hole past 2 GiB reads zero");
+    };
+    check(&fs);
+    check(&Ext2Filesystem::new(&dev, clock).unwrap());
+
+    let fsck = || {
+        let e2fsck = ["/opt/homebrew/opt/e2fsprogs/sbin/e2fsck", "/usr/local/opt/e2fsprogs/sbin/e2fsck", "/sbin/e2fsck", "/usr/sbin/e2fsck"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists());
+        let Some(e2fsck) = e2fsck else {
+            std::eprintln!("note: e2fsck not found; skipping the on-disk consistency oracle");
+            return;
+        };
+        let img = std::env::temp_dir().join(alloc::format!("akuma-ext2-triple-{}.img", std::process::id()));
+        std::fs::write(&img, &*dev.inner.lock()).unwrap();
+        let out = std::process::Command::new(e2fsck).arg("-fn").arg(&img).output().unwrap();
+        let _ = std::fs::remove_file(&img);
+        assert!(
+            out.status.success(),
+            "e2fsck -fn found problems:\n{}{}",
+            alloc::string::String::from_utf8_lossy(&out.stdout),
+            alloc::string::String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    fs.sync().unwrap();
+    fsck();
+
+    // Shrink into the triply-indirect range, then out of it, then to zero.
+    fs.truncate("/big", (triple + 4) as u64).unwrap();
+    let mut back = [0u8; 4];
+    assert_eq!(fs.read_at("/big", triple, &mut back).unwrap(), 4);
+    assert_eq!(&back, b"trip");
+    fs.truncate("/big", 4).unwrap();
+    assert_eq!(fs.metadata("/big").unwrap().size, 4);
+    fs.truncate("/big", 0).unwrap();
+    assert_eq!(fs.stats().unwrap().free_blocks, baseline, "every data and pointer block came back");
+    fs.sync().unwrap();
+    fsck();
+}

@@ -45,6 +45,7 @@ mod net;
 #[cfg(feature = "trace-err")]
 mod ring;
 mod sched;
+mod shmpages;
 mod smp;
 
 use akuma_boot_amd64::{mem, paging, phys};
@@ -973,10 +974,14 @@ fn mount_root(fs: alloc::sync::Arc<dyn Filesystem>) {
     // inode number is reissued. AArch64's `fs::init` does both; this kernel
     // mounts ext2 itself, so it does them here. Every write through
     // `akuma-vfs-glue` invalidates by inode already, and `shared_writeback`
-    // does for the one write this kernel makes itself.
+    // does for the one write this kernel makes itself. The freed-inode hook
+    // also drops what the writable shared-page table (`shmpages`) still holds
+    // of the inode, and `shmpages::init` registers glue's write observers, so
+    // a `write(2)` reaches every mapping of the page.
     #[cfg(feature = "disk")]
-    akuma_ext2::init_inode_freed_hook(akuma_fpcache::invalidate_inode);
+    akuma_ext2::init_inode_freed_hook(shmpages::inode_freed);
     akuma_fpcache::init(akuma_pmm::total_count() * 4096);
+    shmpages::init();
     // `/proc`: the shared `ProcFilesystem`, rendering `akuma-exec`'s process
     // table (`<pid>/exe`, which musl's `$ORIGIN` expansion reads; `meminfo`;
     // `<pid>/fd`). Glue's `readlinkat` and friends answer through it.
@@ -1052,8 +1057,9 @@ const USER_STACK_PAGES: u64 = 16;
 const MMAP_SLAB: u64 = 0x4_0000_0000;
 /// Hole-table size per task (see `Task::holes`).
 const MAX_HOLES: usize = 64;
-/// Writable shared file mappings tracked per task (see `Task::shared`).
-const MAX_SHARED: usize = 8;
+/// `MAP_SHARED` mappings tracked per task: writable file ones (written back) and
+/// anonymous ones (shared across fork).
+const MAX_SHARED: usize = 32;
 /// errnos `akuma_ring3_amd64::err` does not carry.
 pub(crate) const EINTR: u64 = 4;
 /// Bisect mask for the mmap-slab rework, set from the kernel command line
@@ -1164,7 +1170,8 @@ fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
         }
         // The remap below builds a fresh PTE; carry "written" across it or the policy forgets.
         let was_written = page_written(root, va as u64);
-        if want.write && !cow_privatize(root, va as u64) {
+        // A shared mapping's frame is meant to be in every holder.
+        if want.write && !in_shared_span(va as u64) && !cow_privatize(root, va as u64) {
             return e(ring3::err::ENOMEM);
         }
         let Some(pa) = paging::translate_in(root, va) else {
@@ -1211,6 +1218,10 @@ fn mm_dump_for(va: u64) {
 
 /// Unmap every present page of `[start, end)` in `root` and give its frame
 /// back (`free_page` honours a CoW count), and clear every lazy record in it.
+///
+/// A writable `MAP_SHARED` file page's frame is in `shmpages`' table too: when
+/// the range overlaps such a mapping, the table gives back whatever nobody maps
+/// now. The caller has written those pages back (`shared_writeback`).
 fn release_pages(root: u64, start: u64, end: u64) {
     let tid = akuma_primitives::preempt::current_tid() as u32;
     let mut va = start;
@@ -1222,20 +1233,24 @@ fn release_pages(root: u64, start: u64, end: u64) {
         }
         va += 4096;
     }
+    if with_task(|t| t.layout.shared().iter().any(|f| !f.is_anon() && f.overlaps(start, end))) {
+        shmpages::sweep();
+    }
     // Peers may still hold translations for the frames just freed: no frame is
     // reused before they have dropped them (the kernel lock is held throughout).
     smp::shootdown();
 }
 
 /// Copy the pages of every writable `MAP_SHARED` file mapping that overlap
-/// `[lo, hi)` back to their files (clamped to the file's size at map time),
-/// and with `forget` drop the records wholly inside the range.
+/// `[lo, hi)` back to their files (clamped to the file's size at map time).
+/// A frame several mappers share is written by each of them; the bytes are the
+/// same. Anonymous shared mappings have no file and are skipped.
 #[allow(clippy::many_single_char_names)] // s/e are the clipped range
-fn shared_writeback(lo: u64, hi: u64, forget: bool) {
+fn shared_writeback(lo: u64, hi: u64) {
     // The records and the root are copied out and the task borrow is closed for the whole walk: the loop does file I/O
     // and `read_bytes`, and nothing in it may find the record borrowed. The (possibly shortened) table goes back at the end.
     let (root_pa, layout) = with_task(|t| (t.root_pa, t.layout));
-    for f in layout.shared() {
+    for f in layout.shared().iter().filter(|f| !f.is_anon()) {
         let (base, len, ino, off, fsize) = (f.base, f.len, f.inode, f.offset, f.size);
         let (s, e) = (base.max(lo), (base + len).min(hi));
         if s < e {
@@ -1256,16 +1271,16 @@ fn shared_writeback(lo: u64, hi: u64, forget: bool) {
             }
         }
     }
-    if forget {
-        with_task(|t| t.layout.forget_shared_within(lo, hi));
-    }
 }
 
 /// Write back every shared file mapping the running task still holds (exit,
-/// exec): the mapping dies with the address space.
+/// exec): the mapping dies with the address space. Its pages stay mapped until
+/// the root is freed (`free_user_root`), whose sweep then gives `shmpages` the
+/// entries nobody maps any more.
 pub(crate) fn shared_flush_all() {
     if with_task(|t| !t.layout.shared().is_empty()) {
-        shared_writeback(0, u64::MAX, true);
+        shared_writeback(0, u64::MAX);
+        with_task(|t| t.layout.forget_shared_within(0, u64::MAX));
     }
 }
 
@@ -1274,7 +1289,7 @@ fn msync_arm(addr: u64, len: u64) -> u64 {
     if addr & 0xFFF != 0 {
         return e(ring3::err::EINVAL);
     }
-    shared_writeback(addr, addr.saturating_add(len), false);
+    shared_writeback(addr, addr.saturating_add(len));
     0
 }
 
@@ -1305,7 +1320,7 @@ fn madvise_arm(addr: u64, len: u64, advice: u64) -> u64 {
                 return 0;
             }
             if with_task(|t| t.layout.shared().iter().any(|f| f.base < end && start < f.base + f.len)) {
-                shared_writeback(start, end, false);
+                shared_writeback(start, end);
             }
             // Only the used part of the slab: nothing above the cursor has a leaf.
             let (lo, hi) = (start.max(MMAP_BASE), end.min(with_task(|t| t.layout.mmap_cur())));
@@ -1366,10 +1381,13 @@ fn munmap_arm(addr: u64, len: u64) -> u64 {
     if mmdbg() & 1 == 0 {
         return 0;
     }
-    shared_writeback(addr, end, true);
+    shared_writeback(addr, end);
     mm_event(1, addr, end);
     release_pages(task_root(), addr, end);
-    with_task(|t| t.layout.release(addr, end));
+    with_task(|t| {
+        t.layout.forget_shared_within(addr, end);
+        t.layout.release(addr, end);
+    });
     0
 }
 
@@ -1967,7 +1985,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let (addr, len, prot, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
             let fd = fr.arg5();
             let off = fr.arg6();
-            if len == 0 {
+            // Linux refuses an offset that is not a page multiple, mapping or not.
+            if len == 0 || off & 0xFFF != 0 {
                 return e(ring3::err::EINVAL);
             }
             if wx_on() && let Some(no) = akuma_syscalls_mem::wx::check_prot(prot).errno() {
@@ -2004,8 +2023,15 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                 // the range leaves the hole table.
                 if mmdbg() & 2 != 0 {
                     mm_event(2, addr, addr + pages);
+                    // A shared file mapping under it keeps what was written to it.
+                    if overlaps_shared(addr, addr + pages) {
+                        shared_writeback(addr, addr + pages);
+                    }
                     release_pages(root, addr, addr + pages);
-                    with_task(|t| t.layout.carve(addr, addr + pages));
+                    with_task(|t| {
+                        t.layout.forget_shared_within(addr, addr + pages);
+                        t.layout.carve(addr, addr + pages);
+                    });
                 }
                 addr
             } else {
@@ -2032,16 +2058,20 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             let pte = if none { PteProt { write: false, exec: false, user: false } } else { PteProt { write, exec, user: true } };
             const MAP_SHARED: u64 = 0x1;
             let shared_write = fnode.is_some() && flags & MAP_SHARED != 0 && prot & ring3::mmap::PROT_WRITE != 0;
-            // Lazy (`lazy.rs`): one record per page now, a frame on the first touch. A writable shared file
-            // mapping stays eager - its pages are written back by walking the present frames, and fork
-            // copies them (`SharedSpans::Copy`) - and so does a file mapping whose offset is unaligned or
-            // past what a record holds, or whose inode cannot be pinned.
-            let first =
-                lazy::Lazy { write, exec, none, file: fnode.map(|inode| lazy::FilePage { inode, index: off / 4096 }) };
-            let lazy_ok = !shared_write
-                && off.is_multiple_of(4096)
-                && lazy::fits(first, pages / 4096)
-                && fnode.is_none_or(|node| lazy::pin(root, node));
+            let shared_anon = anon && flags & MAP_SHARED != 0;
+            // Lazy (`lazy.rs`): one record per page, a frame on the first touch. A writable shared file
+            // page's record says so (`shared`), and its fill maps the one frame every mapper of that page
+            // maps (`shmpages`); fork shares the span's present frames as they are. An anonymous shared
+            // mapping is eager: two lazy records would fill two frames, so it has its frames before the
+            // first fork. So is a file mapping past what a record holds, or whose inode cannot be pinned.
+            let first = lazy::Lazy {
+                write,
+                exec,
+                none,
+                file: fnode.map(|inode| lazy::FilePage { inode, index: off / 4096, shared: shared_write }),
+            };
+            let lazy_ok =
+                !shared_anon && lazy::fits(first, pages / 4096) && fnode.is_none_or(|node| lazy::pin(root, node));
             if lazy_ok {
                 if !lazy::reserve(root, base, pages, first) {
                     release_pages(root, base, base + pages);
@@ -2095,6 +2125,9 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     akuma_primitives::safe_print!(96, "[mmap] shared-file table full: writes to this mapping are lost\n");
                 }
             }
+            if shared_anon && !with_task(|t| t.layout.add_shared(akuma_user_layout::SharedFile::anon(base, pages))) {
+                akuma_primitives::safe_print!(96, "[mmap] shared-file table full: a fork copies this mapping\n");
+            }
             base
         }
         akuma_syscalls_abi::x86_64::MPROTECT => mprotect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
@@ -2136,6 +2169,11 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             if old_sz == 0 || !user_ok(old, old_sz) {
                 return e(ring3::err::EFAULT);
+            }
+            // A `MAP_SHARED` record names its range; moving or resizing the pages under it would leave it
+            // naming the wrong ones. Refused rather than followed (a pinned divergence: Linux allows it).
+            if overlaps_shared(old, old.saturating_add(old_sz)) {
+                return e(ring3::err::EINVAL);
             }
             let root = task_root();
             let Ok(plan) = with_task(|t| t.layout.mremap(old, old_sz, new_sz)) else {
@@ -2462,13 +2500,14 @@ fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
         let entry = src.entry(i);
         let va = va_base | ((i as u64) << shift);
         // The decisions (skip / refuse / descend / copy / share-and-demote) are `akuma-user-tree`'s, host-tested
-        // against a fake tree; this loop performs them. A writable `MAP_SHARED` file span is copied (`SharedSpans::Copy`).
+        // against a fake tree; this loop performs them. A `MAP_SHARED` span (a writable file mapping, or an anonymous
+        // one) is shared as it stands, writable and unmarked (`SharedSpans::ShareWritable`): parent and child map one frame.
         // A lazy leaf is not present, so the plan would skip it: the child must inherit the record.
         if depth == 0 && lazy::is_lazy(entry) {
             dst.set_entry(i, entry);
             continue;
         }
-        let plan = X86_64.plan_clone(depth, entry, depth == 0 && in_shared_span(va), SharedSpans::Copy);
+        let plan = X86_64.plan_clone(depth, entry, depth == 0 && in_shared_span(va), SharedSpans::ShareWritable);
         match plan {
             ClonePlan::Skip => {}
             ClonePlan::Refuse => {
@@ -2506,7 +2545,13 @@ fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
     Some(out)
 }
 
-/// Is `va` inside a writable `MAP_SHARED` file mapping of the running task?
+/// Does `[lo, hi)` overlap a `MAP_SHARED` mapping of the running task?
+fn overlaps_shared(lo: u64, hi: u64) -> bool {
+    with_task(|t| t.layout.shared().iter().any(|f| f.overlaps(lo, hi)))
+}
+
+/// Is `va` inside a `MAP_SHARED` mapping of the running task (a writable file
+/// one, or an anonymous one)?
 fn in_shared_span(va: u64) -> bool {
     with_task(|t| t.layout.in_shared(va))
 }
@@ -2542,7 +2587,16 @@ fn free_subtree(table_pa: u64, depth: u32) {
 ///
 /// Protection: writable wins over executable, so a `W|X` segment (no image
 /// this kernel runs has one) is `USER_RW`.
-fn place_segment(root: u64, image: &[u8], seg: &akuma_elf_exec::LoadSeg) -> Option<(u64, u64)> {
+///
+/// With `inode` (the image's, on the root filesystem) a page that is wholly
+/// one thing is left lazy (`lazy.rs`): every byte from the file becomes a file
+/// record - a read-only one then fills from the file-page cache, one frame for
+/// every process running the image - and every byte past the file a zero-fill
+/// one. A page the segment's start or its file end cuts is filled here, as
+/// every page was until 2026-11-03. Divergence: a lazy page reads the file when
+/// first touched, and nothing refuses a write to a running image (`ETXTBSY`),
+/// so rewriting one in place shows the running copy the new bytes.
+fn place_segment(root: u64, image: &[u8], seg: &akuma_elf_exec::LoadSeg, inode: Option<u32>) -> Option<(u64, u64)> {
     let pte = if seg.flags & akuma_elf_exec::PF_W != 0 {
         PteProt::USER_RW
     } else if seg.flags & akuma_elf_exec::PF_X != 0 {
@@ -2555,8 +2609,32 @@ fn place_segment(root: u64, image: &[u8], seg: &akuma_elf_exec::LoadSeg) -> Opti
     if last > USER_TOP {
         return None;
     }
+    // A file record names a whole file page, so the segment's pages and the
+    // file's must line up (`p_offset` congruent to `p_vaddr`, as the ELF spec
+    // requires for a loadable image).
+    let inode = inode.filter(|&node| seg.offset.wrapping_sub(seg.vaddr).trailing_zeros() >= 12 && lazy::pin(root, node));
+    let file_end = seg.vaddr + seg.filesz;
     let mut pva = first;
     while pva < last {
+        let lazy = if pva >= seg.vaddr && pva + 4096 <= file_end {
+            inode.map(|node| lazy::Lazy {
+                write: pte.write,
+                exec: pte.exec,
+                none: false,
+                file: Some(lazy::FilePage { inode: node, index: (seg.offset + (pva - seg.vaddr)) / 4096, shared: false }),
+            })
+        } else if pva >= file_end {
+            Some(lazy::Lazy::anon(pte.write, pte.exec))
+        } else {
+            None
+        };
+        if let Some(rec) = lazy.filter(|&rec| lazy::fits(rec, 1)) {
+            if !lazy::reserve(root, pva, 4096, rec) {
+                return None;
+            }
+            pva += 4096;
+            continue;
+        }
         let frame = phys::Frame::alloc_zeroed()?;
         if !paging::map_page_in(root, pva as usize, frame.pa(), pte, MemAttr::WriteBack) {
             return None;
@@ -2585,7 +2663,7 @@ fn place_segment(root: u64, image: &[u8], seg: &akuma_elf_exec::LoadSeg) -> Opti
 /// one placement story. Runs with the kernel
 /// half live (the physmap does all the copying); the caller chooses the
 /// CR3 moment.
-fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
+fn load_task(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Option<TaskImage> {
     const NO_SEG: akuma_elf_exec::LoadSeg = akuma_elf_exec::LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 };
     let mut segs = [NO_SEG; 16];
     let (prog, n) = akuma_elf_exec::program(image, &mut segs).ok()?;
@@ -2607,8 +2685,11 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     with_task(|t| t.root_pa = root);
 
     // Every PT_LOAD at its placed address (a static-PIE's moved to `PIE_BASE`).
+    // `read_image` read `path` from the root filesystem, so its inode there is
+    // the image's: what the lazy file pages fill from.
+    let image_inode = root_fs().resolve_inode(path).ok();
     for seg in &segs[..n] {
-        let (first, last) = place_segment(root, image, seg)?;
+        let (first, last) = place_segment(root, image, seg, image_inode)?;
         add_region(first, last);
     }
 
@@ -2639,8 +2720,9 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
                 return None;
             };
             let mut hi = akuma_elf_exec::INTERP_BASE;
+            let ldso_inode = root_fs().resolve_inode(&eff).ok();
             for seg in &isegs[..n] {
-                hi = hi.max(place_segment(root, &ldso, seg)?.1);
+                hi = hi.max(place_segment(root, &ldso, seg, ldso_inode)?.1);
             }
             add_region(akuma_elf_exec::INTERP_BASE, hi);
             let Ok(ientry) = akuma_elf_exec::interp_entry(&ldso, akuma_elf_exec::INTERP_BASE) else {
@@ -2689,16 +2771,19 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
 
     // The stack: at least `USER_STACK_PAGES`, and room for the block plus
     // four pages of real stack under it; the fault path grows it from there.
-    // The block fills the top `block_pages` pages.
+    // The block fills the top `block_pages` pages; the stack below it is lazy,
+    // a zero page on the first touch (it was all allocated here until
+    // 2026-11-03: `USER_STACK_PAGES` of zeros per exec, mostly never touched).
     let stack_pages = (USER_STACK_PAGES as usize).max(block_pages + 4);
     let stack_base = USER_STACK_TOP - stack_pages as u64 * 4096;
     let first_block_page = stack_pages - block_pages;
-    for p in 0..stack_pages {
+    if !lazy::reserve(root, stack_base, first_block_page as u64 * 4096, lazy::Lazy::anon(true, false)) {
+        return None;
+    }
+    for p in first_block_page..stack_pages {
         let frame = phys::Frame::alloc_zeroed()?;
-        if p >= first_block_page {
-            let k = p - first_block_page;
-            frame.write_bytes(0, &block[k * 4096..(k + 1) * 4096]);
-        }
+        let k = p - first_block_page;
+        frame.write_bytes(0, &block[k * 4096..(k + 1) * 4096]);
         let pva = stack_base + p as u64 * 4096;
         if !paging::map_page_in(root, pva as usize, frame.pa(), PteProt::USER_RW, MemAttr::WriteBack) {
             return None;
@@ -2777,6 +2862,9 @@ pub(crate) fn free_user_root(root: u64) -> usize {
         n += 1;
     }
     akuma_pmm::free_page(root as usize, tid);
+    // The root's shared file pages were written back at its exit or exec; any
+    // whose last mapping this was leave `shmpages` now.
+    shmpages::sweep();
     n + 1
 }
 
@@ -2810,7 +2898,7 @@ fn spawn(p: &Prog, image: &[u8]) -> ! {
         }
         (owned, n, env, p.n_env)
     };
-    let Some(ti) = load_task(&argv[..=n_args], &envv[..n_env], image) else {
+    let Some(ti) = load_task(&argv[..=n_args], &envv[..n_env], image, path) else {
         akuma_primitives::safe_print!(160, "  init: task load failed\n");
         halt();
     };

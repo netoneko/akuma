@@ -16,21 +16,21 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ## Statistics
 
-- **Total distinct fixes counted:** 113
-- **Docs contributing at least one fix:** 33
+- **Total distinct fixes counted:** 118
+- **Docs contributing at least one fix:** 34
 - **Subsystem categories:** 8
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscalls, Files & Pipes | 37 | 32.7% | 6 |
-| Exec & ELF Loading | 11 | 9.7% | 4 |
-| Processes, Fork, Threads & Scheduling | 33 | 29.2% | 9 |
-| Memory & Copy-on-Write | 10 | 8.8% | 4 |
-| Signals | 5 | 4.4% | 2 |
-| Networking & Readiness | 4 | 3.5% | 2 |
-| SMP, Time & Boot | 10 | 8.8% | 5 |
-| Build & Integration | 3 | 2.7% | 1 |
-| **Total** | **113** | **100.0%** | **33** |
+| Syscalls, Files & Pipes | 37 | 31.4% | 6 |
+| Exec & ELF Loading | 11 | 9.3% | 4 |
+| Processes, Fork, Threads & Scheduling | 33 | 28.0% | 9 |
+| Memory & Copy-on-Write | 15 | 12.7% | 5 |
+| Signals | 5 | 4.2% | 2 |
+| Networking & Readiness | 4 | 3.4% | 2 |
+| SMP, Time & Boot | 10 | 8.5% | 5 |
+| Build & Integration | 3 | 2.5% | 1 |
+| **Total** | **118** | **100.0%** | **34** |
 
 **Largest single write-ups:**
 
@@ -166,7 +166,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_SSH_STDIN_PUMP.md
 - the `linux-abi` `spawn_full` piped only stdout, so the child inherited the spawner's fd 0 and sshd's pump wrote into a stdin the child never read, with no EOF either: every ssh exec that sent stdin hung; `SpawnResult` carries the write end of a real stdin pipe (`15ff2709`)
 
-## Memory & Copy-on-Write (10 fixes, 4 docs)
+## Memory & Copy-on-Write (15 fixes, 5 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `mmap` demanded `fd == -1` for `MAP_ANONYMOUS` while libakuma passes 0 (Linux ignores it), so sshd's first allocation answered `ENODEV` (stage 4)
@@ -185,6 +185,13 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md
 - `mprotect(PROT_NONE)` returned 0 and changed nothing, and `mmap(PROT_NONE)` mapped the range read-write, so guard pages could be read and written; a present page keeps its frame with `U/S` clear (the kernel's copies answer `EFAULT`) and a lazy record carries a `NONE` bit that is never filled
 - `mmap` mapped every non-exec mapping read-write whatever `PROT_WRITE` said, so a write to a `PROT_READ` mapping succeeded (and no read-only file page could be shared); `write` is `PROT_WRITE`
+
+### docs/archive/TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md
+- fork copy-on-wrote `MAP_SHARED|MAP_ANONYMOUS` like a private mapping, so parent and child never saw each other's stores (`fpcpoison`'s round gate never opened); the mapping is eager and recorded, and fork shares its frames writable
+- a writable `MAP_SHARED` file mapping was a private frame per page per mapper, filled at `mmap` and copied by fork, so two processes on one file (SQLite's `-shm` shape) diverged and a `write(2)` never showed in a mapped page; one frame per file page for every mapper (`shmpages` over `akuma-fpcache-rw`), lazy, shared by fork, and written through by glue's observers
+- `MAP_FIXED` over a shared file mapping released its pages but kept its record, so the next write-back put the new mapping's bytes into the old file; it writes back and forgets the records under it
+- `mremap` of a shared file mapping moved its pages and left the record at the old address, so the write-back read whatever was there and lost the moved pages; refused with `EINVAL`
+- `mmap` accepted a file offset that is not a page multiple, which Linux refuses, and filled the mapping from it; `EINVAL`
 
 ## Signals (5 fixes, 2 docs)
 
@@ -254,6 +261,12 @@ These are fixes to code every kernel runs, so the Akuma list counts them:
 - `UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS.md`: glue's AF_UNIX `read`/`write` skipped the record queue.
 - `SSHD_SESSION_WITHOUT_PATH.md`: sshd sessions had no `PATH`, so gcc could not find `cc1`.
 - `TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md`: glue's by-inode write never invalidated the shared file-page cache.
+- `TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md`: glue's `copy_from_user_str` left each page to a ring-0 fault, so a path in
+  a lazy `.rodata` was `EFAULT`.
+- `EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES.md`: ext2 had no triple-indirect blocks and read sizes as 32 bits, which capped the
+  Infinity guest's disk image on the Akuma host at about 4 GiB.
+- `INODE_PIN_CONGESTED_WINDOW.md`: the inode pin table read every inode homed in a full probe window as pinned, so ext2 never
+  freed their unlinks (65 inodes after a `cargo clean` in the Infinity guest).
 
 ## Files scanned with zero counted fixes
 
@@ -288,6 +301,10 @@ Scanned 2026-11-02, closing `rust-org-il-experiment`.
   hook registration is part of the lazy fix, not a separate defect. TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES's
   file-page sharing is a capability, and its `shared_writeback` invalidation guards that capability; neither is counted.
   The `MAP_SHARED|MAP_ANONYMOUS`-across-fork gap and fault-signal delivery it records are open.
+  A second pass the same day: TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE closes that gap; its lazy ELF image and initial
+  stack are an efficiency change with no failure behind them and are not counted, and the like-for-like build it records
+  is a measurement. Fault-signal delivery is still open. A third pass: the measurement did not finish (the disk ran out before the final link) and the
+  stranded inodes it showed are INODE_PIN_CONGESTED_WINDOW, counted in `BUG_FIX_LIST.md`.
 
 ## Background
 

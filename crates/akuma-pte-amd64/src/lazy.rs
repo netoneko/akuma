@@ -14,7 +14,8 @@
 //! | 4 | file-backed |
 //! | 5 | `PROT_NONE`: never filled, every access faults |
 //! | 6..=37 | inode number (32 bits) |
-//! | 38..=63 | file page index (26 bits: offsets below 256 GiB) |
+//! | 38 | `MAP_SHARED`: one frame per file page for every mapper, not a private copy |
+//! | 39..=63 | file page index (25 bits: offsets below 128 GiB) |
 //!
 //! An anonymous lazy page is the tag and the permission bits; its inode and
 //! index fields are zero.
@@ -51,8 +52,9 @@ const EXEC: u64 = 1 << 3;
 const FILE: u64 = 1 << 4;
 const NONE: u64 = 1 << 5;
 const INODE_SHIFT: u32 = 6;
-const INDEX_SHIFT: u32 = 38;
-/// The largest file page index an entry can name (`2^26 - 1`).
+const SHARED: u64 = 1 << 38;
+const INDEX_SHIFT: u32 = 39;
+/// The largest file page index an entry can name (`2^25 - 1`).
 pub const MAX_INDEX: u64 = (1 << (64 - INDEX_SHIFT)) - 1;
 
 /// What a lazy page becomes on its first touch.
@@ -76,6 +78,9 @@ pub struct FilePage {
     pub inode: u32,
     /// The file offset of the page's first byte, in pages.
     pub index: u64,
+    /// A writable `MAP_SHARED` page: every mapper maps the one frame for this page of the file, and stores
+    /// reach the file. A private page is filled into a frame of its own.
+    pub shared: bool,
 }
 
 impl Lazy {
@@ -86,7 +91,7 @@ impl Lazy {
     }
 
     /// The entry, or `None` when the file page index does not fit (an offset at
-    /// or past 256 GiB) - the caller maps that page another way.
+    /// or past 128 GiB) - the caller maps that page another way.
     #[must_use]
     pub const fn encode(self) -> Option<u64> {
         let mut v = TAG;
@@ -104,6 +109,9 @@ impl Lazy {
                 return None;
             }
             v |= FILE | ((f.inode as u64) << INODE_SHIFT) | (f.index << INDEX_SHIFT);
+            if f.shared {
+                v |= SHARED;
+            }
         }
         Some(v)
     }
@@ -116,7 +124,7 @@ impl Lazy {
             None => Some(self),
             Some(f) => match f.index.checked_add(pages) {
                 Some(index) if index <= MAX_INDEX => {
-                    Some(Self { file: Some(FilePage { inode: f.inode, index }), ..self })
+                    Some(Self { file: Some(FilePage { index, ..f }), ..self })
                 }
                 _ => None,
             },
@@ -139,7 +147,7 @@ pub const fn decode(entry: u64) -> Option<Lazy> {
         return None;
     }
     let file = if entry & FILE != 0 {
-        Some(FilePage { inode: (entry >> INODE_SHIFT) as u32, index: entry >> INDEX_SHIFT })
+        Some(FilePage { inode: (entry >> INODE_SHIFT) as u32, index: entry >> INDEX_SHIFT, shared: entry & SHARED != 0 })
     } else {
         None
     };
@@ -167,23 +175,23 @@ mod tests {
     #[test]
     fn file_round_trips_at_the_field_limits() {
         for (inode, index) in [(1, 0), (u32::MAX, MAX_INDEX), (0x1234_5678, 76_000)] {
-            let l = Lazy { write: true, exec: false, none: false, file: Some(FilePage { inode, index }) };
+            let l = Lazy { write: true, exec: false, none: false, file: Some(FilePage { inode, index, shared: false }) };
             assert_eq!(decode(l.encode().unwrap()), Some(l));
         }
     }
 
     #[test]
     fn an_index_past_the_field_does_not_encode() {
-        let l = Lazy { write: false, exec: false, none: false, file: Some(FilePage { inode: 7, index: MAX_INDEX + 1 }) };
+        let l = Lazy { write: false, exec: false, none: false, file: Some(FilePage { inode: 7, index: MAX_INDEX + 1, shared: false }) };
         assert_eq!(l.encode(), None);
-        let at_limit = Lazy { file: Some(FilePage { inode: 7, index: MAX_INDEX }), ..l };
+        let at_limit = Lazy { file: Some(FilePage { inode: 7, index: MAX_INDEX, shared: false }), ..l };
         assert_eq!(at_limit.offset_by(1), None);
         assert_eq!(at_limit.offset_by(0), Some(at_limit));
     }
 
     #[test]
     fn no_lazy_entry_is_present_and_none_is_empty() {
-        let l = Lazy { write: true, exec: true, none: true, file: Some(FilePage { inode: u32::MAX, index: MAX_INDEX }) };
+        let l = Lazy { write: true, exec: true, none: true, file: Some(FilePage { inode: u32::MAX, index: MAX_INDEX, shared: false }) };
         for e in [Lazy::anon(false, false).encode().unwrap(), l.encode().unwrap()] {
             assert_eq!(e & P, 0, "a lazy entry must fault");
             assert_ne!(e, 0, "a lazy entry must not read as an empty slot");
@@ -201,26 +209,38 @@ mod tests {
 
     #[test]
     fn offset_by_advances_a_file_page_and_leaves_anonymous_alone() {
-        let f = Lazy { write: false, exec: true, none: false, file: Some(FilePage { inode: 9, index: 3 }) };
+        let f = Lazy { write: false, exec: true, none: false, file: Some(FilePage { inode: 9, index: 3, shared: false }) };
         assert_eq!(f.offset_by(4).unwrap().file.unwrap().index, 7);
         assert_eq!(Lazy::anon(true, false).offset_by(1 << 40), Some(Lazy::anon(true, false)));
     }
 
     #[test]
     fn with_prot_keeps_the_backing() {
-        let f = Lazy { write: true, exec: false, none: false, file: Some(FilePage { inode: 9, index: 3 }) };
+        let f = Lazy { write: true, exec: false, none: false, file: Some(FilePage { inode: 9, index: 3, shared: false }) };
         let r = f.with_prot(false, true, false);
         assert_eq!((r.write, r.exec, r.none, r.file), (false, true, false, f.file));
         let n = r.with_prot(false, false, true);
         assert_eq!(decode(n.encode().unwrap()), Some(n));
-        assert_eq!(decode(n.with_prot(true, false, false).encode().unwrap()).unwrap().none, false);
+        assert!(!decode(n.with_prot(true, false, false).encode().unwrap()).unwrap().none);
+    }
+
+    #[test]
+    fn shared_round_trips_and_advances_with_the_index() {
+        let f = Lazy { write: true, exec: false, none: false, file: Some(FilePage { inode: u32::MAX, index: MAX_INDEX, shared: true }) };
+        assert_eq!(decode(f.encode().unwrap()), Some(f));
+        let g = Lazy { file: Some(FilePage { inode: 9, index: 3, shared: true }), ..f };
+        let next = g.offset_by(5).unwrap().file.unwrap();
+        assert_eq!((next.index, next.shared, next.inode), (8, true, 9));
+        // The bit is the file's: a private page of the same file does not read as shared.
+        let p = Lazy { file: Some(FilePage { shared: false, ..g.file.unwrap() }), ..g };
+        assert!(!decode(p.encode().unwrap()).unwrap().file.unwrap().shared);
     }
 
     #[test]
     fn none_round_trips_with_and_without_a_file() {
         let a = Lazy { none: true, ..Lazy::anon(false, false) };
         assert_eq!(decode(a.encode().unwrap()), Some(a));
-        let f = Lazy { none: true, file: Some(FilePage { inode: u32::MAX, index: MAX_INDEX }), ..a };
+        let f = Lazy { none: true, file: Some(FilePage { inode: u32::MAX, index: MAX_INDEX, shared: false }), ..a };
         assert_eq!(decode(f.encode().unwrap()), Some(f));
     }
 }

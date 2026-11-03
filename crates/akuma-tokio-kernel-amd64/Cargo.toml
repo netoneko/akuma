@@ -58,6 +58,8 @@ akuma-pmm = { path = "../akuma-pmm" }
 # Shared frames for read-only file pages (`lazy.rs`): one copy of each page of
 # `librustc_driver` however many `rustc`s map it.
 akuma-fpcache = { path = "../akuma-fpcache" }
+# One frame per page of a writable `MAP_SHARED` file mapping, for every mapper (`shmpages.rs`).
+akuma-fpcache-rw = { path = "../akuma-fpcache-rw" }
 # The leaf crate every shared crate talks through: the console hook
 # (`safe_print!`), the physmap limit, the virtio window.
 akuma-primitives = { path = "../akuma-primitives" }

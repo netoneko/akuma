@@ -66,7 +66,9 @@ So a single file on Akuma's own root filesystem, and therefore a guest disk imag
 and for building only the packages the sanity check needs.
 
 Open: triple-indirect support in `akuma-ext2`. It is needed before a guest disk on this box can be larger than
-4 GiB.
+4 GiB. *(2026-11-03: written, along with the 64-bit file size that the cap also hid, in
+[`EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES.md`](EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES.md). It reaches this box with the next
+host kernel, at a reboot.)*
 
 ### Launch notes
 

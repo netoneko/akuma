@@ -1197,6 +1197,22 @@ impl Inode {
         self.os_specific_2[Self::GID_HIGH..Self::GID_HIGH + 2].copy_from_slice(&((gid >> 16) as u16).to_le_bytes());
     }
 
+    /// The size in bytes. A regular file's high word is `i_size_high`
+    /// (`RO_COMPAT_LARGE_FILE`); in anything else the field is `i_dir_acl`, and
+    /// the size is the low word alone.
+    pub(crate) fn file_size(&self) -> u64 {
+        let lo = u64::from(self.size_lower);
+        if self.type_perms & 0xF000 == S_IFREG { lo | (u64::from(self.size_upper) << 32) } else { lo }
+    }
+
+    /// Set [`Self::file_size`]: the high word only in a regular file.
+    pub(crate) fn set_file_size(&mut self, size: u64) {
+        self.size_lower = size as u32;
+        if self.type_perms & 0xF000 == S_IFREG {
+            self.size_upper = (size >> 32) as u32;
+        }
+    }
+
     /// The `i`-th pointer word (0..[`INODE_POINTER_WORDS`]) as a plain field
     /// access. This is what lets the fast-symlink window be read and written
     /// byte-exactly without ever taking a reference into a packed struct or
@@ -1996,6 +2012,21 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         state.sb_dirty = true;
     }
 
+    /// A regular file reached `size`: past 2 GiB, `i_size_high` is part of its
+    /// size, which a filesystem without `RO_COMPAT_LARGE_FILE` says nothing
+    /// reads. Set the bit (as Linux's ext2 does) so `e2fsck` and a mount
+    /// elsewhere read the size whole. Revision 0 has no feature words.
+    fn note_large_file(state: &mut Ext2State, size: u64) {
+        const RO_COMPAT_LARGE_FILE: u32 = 0x2;
+        if size > 0x7FFF_FFFF
+            && state.superblock.version_major >= 1
+            && state.superblock.feature_ro_compat & RO_COMPAT_LARGE_FILE == 0
+        {
+            state.superblock.feature_ro_compat |= RO_COMPAT_LARGE_FILE;
+            Self::stage_sb(state);
+        }
+    }
+
     /// Index of bitmap block `block_num` in `state.bitmap_cache`, loading it from
     /// disk on first touch. The allocators mutate `bitmap_cache[idx].1` in place
     /// and set `.2 = true`; `flush_meta` writes it back.
@@ -2614,6 +2645,19 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Ok(if block == 0 { None } else { Some(block) });
         }
 
+        // Triply indirect: a 4 KiB-block file past 4 GiB.
+        let (ppb, lb) = (u64::from(ptrs_per_block), u64::from(logical_block - ptrs_per_block * ptrs_per_block));
+        if lb < ppb * ppb * ppb {
+            let mut block = inode.triple_indirect_block;
+            for idx in [lb / (ppb * ppb), (lb / ppb) % ppb, lb % ppb] {
+                if block == 0 {
+                    return Ok(None);
+                }
+                block = self.with_block(state, block, |b| Self::read_block_ptr(b, idx as usize))?;
+            }
+            return Ok(if block == 0 { None } else { Some(block) });
+        }
+
         Err(FsError::NotSupported)
     }
 
@@ -2713,6 +2757,30 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Ok(block);
         }
 
+        // Triply indirect: three pointer blocks deep, each allocated (zeroed)
+        // the first time a block under it is.
+        let (ppb, lb) = (u64::from(ptrs_per_block), u64::from(lb - ptrs_per_block * ptrs_per_block));
+        if lb < ppb * ppb * ppb {
+            if inode.triple_indirect_block == 0 {
+                inode.triple_indirect_block = self.allocate_block(state)?;
+                inode.sectors_used += (state.block_size / 512) as u32;
+            }
+            let mut parent = inode.triple_indirect_block;
+            let idx = [lb / (ppb * ppb), (lb / ppb) % ppb, lb % ppb];
+            for (level, &i) in idx.iter().enumerate() {
+                let mut ptrs = self.read_block(state, parent)?;
+                let mut child = Self::read_block_ptr(&ptrs, i as usize);
+                if child == 0 {
+                    child = if level == 2 { self.allocate_block_inner(state, zero_leaf)? } else { self.allocate_block(state)? };
+                    Self::write_block_ptr(&mut ptrs, i as usize, child);
+                    self.write_block(state, parent, &ptrs)?;
+                    inode.sectors_used += (state.block_size / 512) as u32;
+                }
+                parent = child;
+            }
+            return Ok(parent);
+        }
+
         Err(FsError::NotSupported)
     }
 
@@ -2722,7 +2790,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
     /// `pub(crate)` for `mod tests`, which reads a directory's raw entries back.
     pub(crate) fn read_inode_data(&self, state: &Ext2State, inode: &Inode) -> Result<Vec<u8>, FsError> {
-        let size = inode.size_lower as usize;
+        let size = inode.file_size() as usize;
 
         // Safety: Limit maximum kernel-side file allocation to 16MB to prevent OOM/panic.
         // Large files should be accessed via read_at() instead of read_file().
@@ -2777,7 +2845,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             }
         }
 
-        inode.size_lower = data.len() as u32;
+        inode.set_file_size(data.len() as u64);
         let now = self.current_time();
         inode.modification_time = now;
         self.write_inode(state, inode_num, inode)?;
@@ -2866,7 +2934,58 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 self.write_block(state, inode.double_indirect_block, &dbl)?;
             }
         }
+
+        if inode.triple_indirect_block != 0 {
+            let ppb = u64::from(ppb);
+            let rel = u64::from(first).saturating_sub(12 + ppb + ppb * ppb);
+            let triple = inode.triple_indirect_block;
+            if self.free_tree_from(state, inode, triple, 3, rel)? {
+                inode.triple_indirect_block = 0;
+            }
+        }
         Ok(())
+    }
+
+    /// Free every data block at relative index `>= first` under the pointer
+    /// block `block`, which sits `level` levels above the data (1: it points at
+    /// data blocks), zeroing the pointers that named them; `sectors_used`
+    /// follows each free. `true` when `block` itself went too (`first == 0`),
+    /// and the caller must zero the pointer to it.
+    fn free_tree_from(&self, state: &mut Ext2State, inode: &mut Inode, block: u32, level: u32, first: u64) -> Result<bool, FsError> {
+        let sect = (state.block_size / 512) as u32;
+        let ppb = (state.block_size / 4) as u64;
+        // Data blocks under each pointer of this block.
+        let span = ppb.pow(level - 1);
+        let first_i = (first / span).min(ppb) as usize;
+        let mut ptrs = self.read_block(state, block)?;
+        let mut changed = false;
+        for i in first_i..ppb as usize {
+            let child = Self::read_block_ptr(&ptrs, i);
+            if child == 0 {
+                continue;
+            }
+            let freed = if level == 1 {
+                self.free_block(state, child)?;
+                inode.sectors_used = inode.sectors_used.saturating_sub(sect);
+                true
+            } else {
+                let child_first = if i == first_i { first % span } else { 0 };
+                self.free_tree_from(state, inode, child, level - 1, child_first)?
+            };
+            if freed {
+                Self::write_block_ptr(&mut ptrs, i, 0);
+                changed = true;
+            }
+        }
+        if first == 0 {
+            self.free_block(state, block)?;
+            inode.sectors_used = inode.sectors_used.saturating_sub(sect);
+            return Ok(true);
+        }
+        if changed {
+            self.write_block(state, block, &ptrs)?;
+        }
+        Ok(false)
     }
 
     fn truncate_inode(&self, state: &mut Ext2State, inode: &mut Inode) -> Result<(), FsError> {
@@ -2919,7 +3038,13 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             inode.double_indirect_block = 0;
         }
 
-        inode.size_lower = 0;
+        if inode.triple_indirect_block != 0 {
+            let triple = inode.triple_indirect_block;
+            self.free_tree_from(state, inode, triple, 3, 0)?;
+            inode.triple_indirect_block = 0;
+        }
+
+        inode.set_file_size(0);
         inode.sectors_used = 0;
 
         Ok(())
@@ -3389,7 +3514,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let inode = self.read_inode(state, inode_num)?;
         Ok(Metadata {
             is_dir: (inode.type_perms & 0xF000) == S_IFDIR,
-            size: inode.size_lower as u64,
+            size: inode.file_size(),
             inode: inode_num as u64,
             mode: inode.type_perms as u32,
             created: Some(inode.creation_time as u64),
@@ -3424,7 +3549,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Err(FsError::NotAFile);
         }
 
-        let file_size = inode.size_lower as usize;
+        let file_size = inode.file_size() as usize;
         if offset >= file_size {
             // Diagnostic (2026-08-15 hunt): a demand-fill clamps to `filesz`
             // resolved at mmap time, so `offset > file_size` here means this
@@ -3651,7 +3776,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Err(FsError::NotAFile);
         }
 
-        let current_size = inode.size_lower as u64 | ((inode.size_upper as u64) << 32);
+        let current_size = inode.file_size();
         let block_size = state.block_size as u64;
 
         // A failure partway leaves the inode describing exactly the blocks the
@@ -3721,8 +3846,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Err(e);
         }
 
-        inode.size_lower = length as u32;
-        inode.size_upper = (length >> 32) as u32;
+        inode.set_file_size(length);
+        Self::note_large_file(state, length);
         inode.modification_time = self.current_time();
         self.write_inode(state, inode_num, &inode)?;
         // A shrink stages bitmap, group-descriptor and superblock edits that
@@ -3750,10 +3875,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
 
         let end = offset + len;
-        let current_size = inode.size_lower as u64 | ((inode.size_upper as u64) << 32);
-        if end > current_size {
-            inode.size_lower = end as u32;
-            inode.size_upper = (end >> 32) as u32;
+        if end > inode.file_size() {
+            inode.set_file_size(end);
+            Self::note_large_file(state, end);
         }
         inode.modification_time = self.current_time();
         self.write_inode(state, inode_num, &inode)?;
@@ -3778,7 +3902,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
 
         // `None` is `O_APPEND`: the offset is the size *as of this lock hold*.
-        let offset = offset.unwrap_or(inode.size_lower as usize);
+        let offset = offset.unwrap_or_else(|| inode.file_size() as usize);
 
         let block_size = state.block_size;
         let end = offset + data.len();
@@ -3815,8 +3939,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
 
         // Update size if we extended the file
-        if end > inode.size_lower as usize {
-            inode.size_lower = end as u32;
+        if end as u64 > inode.file_size() {
+            inode.set_file_size(end as u64);
+            Self::note_large_file(state, end as u64);
         }
         inode.modification_time = self.current_time();
         self.write_inode(state, inode_num, &inode)?;
@@ -3880,7 +4005,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
                     0 => (kind == Some(S_IFDIR), kind == Some(S_IFLNK)),
                     ft => (ft == FT_DIR, ft == FT_SYMLINK),
                 };
-                let size = if is_dir { 0 } else { node.map_or(0, |i| i.size_lower as u64) };
+                let size = if is_dir { 0 } else { node.map_or(0, |i| i.file_size()) };
                 DirEntry { name, is_dir, is_symlink, size }
             })
             .collect();
@@ -3964,7 +4089,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             return Err(FsError::NotAFile);
         }
 
-        let file_size = inode.size_lower as usize;
+        let file_size = inode.file_size() as usize;
         if offset >= file_size {
             return Ok(0);
         }

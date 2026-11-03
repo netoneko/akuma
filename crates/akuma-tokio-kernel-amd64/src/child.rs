@@ -241,8 +241,9 @@ pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> R
         TASK_OF.with_mut(|t| t[slot_idx] = slot_idx + 1);
     }
     if !is_thread {
-        // The child's layout is the parent's, minus the shared file mappings: its copies of
-        // those pages are private, and writing them back would put its bytes in the file.
+        // The child's layout is the parent's, shared mappings included: fork shares those
+        // spans' frames (`SharedSpans::ShareWritable`), so the child writes back the same
+        // pages its parent does.
         let layout = crate::with_task(|t| t.layout.fork());
         crate::with_task_slot(slot_idx + 1, |ct| {
         ct.root_pa = root_pa;
@@ -627,7 +628,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     // The image about to be replaced may hold shared file mappings.
     crate::shared_flush_all();
     let old_root = crate::task_root();
-    let Some(ti) = crate::load_task(&argv, &env, &image) else {
+    let Some(ti) = crate::load_task(&argv, &env, &image, &effective) else {
         return crate::e(crate::err::ENOMEM);
     };
     // POSIX exec keeps open fds across the image swap; close-on-exec ones go,

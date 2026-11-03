@@ -478,9 +478,28 @@ Rules that follow from the record being a leaf:
   `release_pages`. A new path that copies a page table handles `lazy::is_lazy`.
 - **A lazy file page pins its inode** for the address space's lifetime (`lazy::pin`, dropped in
   `free_user_root`). A mapping whose inode cannot be pinned is filled eagerly.
-- **Writable `MAP_SHARED` file mappings stay eager**: their writeback walks present frames.
+- **A writable `MAP_SHARED` file page is one frame for every mapper.** Its record carries `shared`, and
+  its fill maps the frame `shmpages` (over `akuma-fpcache-rw`) holds for `(root mount, inode, page)`,
+  publishing a fresh one on a miss. Fork shares every `MAP_SHARED` span writable and unmarked
+  (`SharedSpans::ShareWritable`). glue's write observers copy a `write(2)` into the mapped frames.
+  **Every path that drops a mapping of such a page writes it back first** (`shared_writeback` before
+  `release_pages`: `munmap`, `MAP_FIXED`, exit, exec). The table then drops the entries nobody maps by
+  a sweep, because this kernel's teardown frees a root from its page table alone and cannot name keys:
+  `release_pages` sweeps when its range overlaps a shared file mapping, and so does `free_user_root`.
+- **`MAP_SHARED | MAP_ANONYMOUS` is eager and recorded** (`SharedFile::anon`), so its frames exist
+  before the first fork and the fork shares them. Two lazy records would fill two frames.
+- **The ELF image is lazy where a page is wholly one thing**: a page entirely inside a segment's file
+  bytes is a file record (so the image's text and rodata are the file-page cache's, shared by every
+  process running it), and a page entirely past them is a zero-fill record. A page the segment's start
+  or file end cuts is filled at exec. The initial stack below the argument block is zero-fill records.
 - A ring-0 not-present fault fills zero pages only. A file fill reads the filesystem, which a ring-0
-  fault may already hold.
+  fault may already hold. So **every kernel read of user memory prefaults first**: glue's copy
+  helpers validate (and prefault) their range, and `copy_from_user_str`, which has no range until it
+  has read the string, prefaults each page it enters. A path in an image's `.rodata` is a lazy file
+  page; a new raw reader that skips the prefault answers `EFAULT` for it.
+- **`mmap`'s offset is a page multiple or `EINVAL`**, as on Linux. `mremap` of a range overlapping a
+  `MAP_SHARED` record is `EINVAL` (a pinned divergence: the record names its range, and moving the pages
+  under it would make it name the wrong ones).
 - **`PROT_NONE` is the user bit, not an unmap.** A present page keeps its frame with `U/S` clear, so
   `mprotect(RW)` gives its contents back and fork and teardown see an ordinary present page. A lazy
   record carries a `NONE` bit and is never filled. Every kernel copy checks `U/S`: `translate_filling`
@@ -492,7 +511,8 @@ Rules that follow from the record being a leaf:
   stale pages to the next mapper. ext2's inode-freed hook is registered in `mount_root`, so a reissued
   inode number cannot hit an old entry.
 
-`docs/archive/TAOXICHUAN_LAZY_MMAP.md`, `docs/archive/TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md`.
+`docs/archive/TAOXICHUAN_LAZY_MMAP.md`, `docs/archive/TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md`,
+`docs/archive/TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md`.
 
 ## Feature notes
 

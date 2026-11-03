@@ -508,7 +508,14 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
         if !BYPASS_VALIDATION.load(Ordering::Acquire) && addr >= limit {
             return Err(EFAULT);
         }
-        
+        // Each page the string enters is faulted in here, one walk per page:
+        // a kernel that will not fill a lazy *file* page from a ring-0 fault
+        // (Taoxichuan - the fault may arrive with filesystem state held) would
+        // otherwise answer `EFAULT` for a path in an image's `.rodata`. A page
+        // that cannot be filled is left to the byte read to refuse.
+        if (len == 0 || addr.trailing_zeros() >= 12) && !BYPASS_VALIDATION.load(Ordering::Acquire) {
+            let _ = validate_user_ptr(addr, 1);
+        }
         let c = copy_from_user_byte(addr)?;
         if c == 0 { break; }
         bytes.push(c);

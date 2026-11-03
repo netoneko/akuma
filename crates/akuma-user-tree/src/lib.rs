@@ -53,17 +53,21 @@ pub const X86_64: PteLayout = PteLayout {
     addr_mask: 0x000f_ffff_ffff_f000,
 };
 
-/// What a fork does with a leaf that lies in a writable `MAP_SHARED` file mapping.
+/// What a fork does with a leaf that lies in a `MAP_SHARED` mapping (a writable file mapping, or anonymous).
 ///
-/// The kernels differ today and neither is wrong: the divergence is recorded here as a named choice with a
-/// test per value, not as an accident of two copies.
+/// The kernels differ and each answer is a named choice with a test, not an accident of two copies.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SharedSpans {
-    /// Copy the frame eagerly (taoxichuan): parent and child stop sharing writes through the fork, which a
-    /// `MAP_SHARED` mapping must NOT do, but no shared-page cache exists to keep them coherent.
+    /// Copy the frame eagerly: parent and child stop sharing writes through the fork, which a `MAP_SHARED`
+    /// mapping must NOT do. The answer for a kernel with nothing to keep the copies coherent.
     Copy,
-    /// Share the frame like any other leaf (amd64, whose `akuma-fpcache-rw` keeps shared writable pages coherent).
+    /// Share the frame like any other leaf, demoted to copy-on-write (amd64, whose `akuma-fpcache-rw` and fault
+    /// path re-share a shared writable page instead of breaking it).
     ShareFrames,
+    /// Share the frame and leave the entry as it is: writable stays writable in both trees and no CoW marker is
+    /// set, so a store by either side is seen by the other (taoxichuan). That is what `MAP_SHARED` means; the
+    /// frame's count goes up by one like any share, so teardown on either side drops only its own reference.
+    ShareWritable,
 }
 
 /// What to do with one entry while cloning. `depth` is the number of levels BELOW the table the entry is in:
@@ -132,8 +136,8 @@ impl PteLayout {
 
     /// Decide what to do with `entry` at `depth` levels above the leaves of its table.
     ///
-    /// `in_shared_span` is whether the VA this entry maps lies in a writable `MAP_SHARED` file mapping
-    /// (only meaningful at `depth == 0`).
+    /// `in_shared_span` is whether the VA this entry maps lies in a `MAP_SHARED` mapping the kernel shares
+    /// across fork (only meaningful at `depth == 0`).
     #[must_use]
     pub const fn plan_clone(&self, depth: u32, entry: u64, in_shared_span: bool, policy: SharedSpans) -> ClonePlan {
         if entry & self.present == 0 {
@@ -146,8 +150,14 @@ impl PteLayout {
             return ClonePlan::Descend { table: self.frame(entry) };
         }
         let frame = self.frame(entry);
-        if in_shared_span && matches!(policy, SharedSpans::Copy) {
-            return ClonePlan::CopyLeaf { old: frame };
+        if in_shared_span {
+            match policy {
+                SharedSpans::Copy => return ClonePlan::CopyLeaf { old: frame },
+                SharedSpans::ShareWritable => {
+                    return ClonePlan::ShareLeaf { frame, parent_entry: entry, child_entry: entry, demoted: false };
+                }
+                SharedSpans::ShareFrames => {}
+            }
         }
         let shared = self.demote(entry);
         ClonePlan::ShareLeaf { frame, parent_entry: shared, child_entry: shared, demoted: shared != entry }
