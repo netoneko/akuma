@@ -400,11 +400,11 @@
       <div class="split even">
         <div class="col">
           <ul>
-            <li>Development runs on Akuma (GLM-5.3-Flash + Goose)</li>
+            <li>Development runs on <strong>Akuma</strong> (GLM-5.3-Flash + Goose)</li>
 	    <li>Sloppy methodology leads to questionalbe results</li>
             <li>Every step ends in a gate a machine can check.</li>
 	    <li>390 interventions including real bangers like <em>this one is a classic, read the docs</em> with about 70% accuracy in guessing where the bugs are</li>
-            <li>GLM reached the equivalent of a self-hosting C kernel: HTTPS <code>curl</code>, <code>apk</code>, fork, pipes, all running on Akuma&rsquo;s KVM.</li>
+            <li>GLM reached the equivalent of a self-hosting C kernel: HTTPS <code>curl</code>, <code>apk</code>, fork, pipes, all running on <strong>Akuma</strong>&rsquo;s KVM.</li>
           </ul>
           <p class="pull cool">AI is good at what you can verify.</p>
         </div>
@@ -472,10 +472,10 @@
     <div class="body">
       <p class="eyebrow">The Rust bar</p>
       <h2>Rust is much harder to host</h2>
-<p>Akuma had already self-hosted Rust, so feasibility was never in question, only the route and the clock.</p>
+<p><strong>Akuma</strong> had already self-hosted Rust, so feasibility was never in question, only the route and the clock.</p>
       <div class="figs">
-        <div class="fig"><span class="v">~7 months</span><span class="k">Akuma&rsquo;s first self-host</span></div>
-        <div class="fig"><span class="v hot">7 d 4 h</span><span class="k">Taoxichuan</span></div>
+        <div class="fig"><span class="v">~7 months</span><span class="k"><strong>Akuma</strong>&rsquo;s first self-host</span></div>
+        <div class="fig"><span class="v hot">7 d 4 h</span><span class="k"><strong>Taoxichuan</strong></span></div>
       </div>
       <div class="scroller"><table>
         <thead><tr><th>Syscalls dispatched</th><th class="r">Count</th><th class="r">of Linux&rsquo;s 383</th></tr></thead>
@@ -484,7 +484,7 @@
           <tr><td>The brief&rsquo;s estimate for Rust (a guess, before any measurement)</td><td class="r">~70&ndash;90</td><td class="r">18&ndash;23%</td></tr>
           <tr><td>Rust self-host: <code>rustc</code>, <code>cargo -j4</code>, K1 == K2</td><td class="r hot">120</td><td class="r hot">31%</td></tr>
         </tbody></table></div>
-      <p><span class="m">Counted from Taoxichuan&rsquo;s dispatcher at the GLM handoff (<code>bc626f98</code>, 83 arms, 4 of them Akuma-private) and at the first fixed point (<code>6af48c06</code>, 120 with legacy folds).</span></p>
+      <p><span class="m">Counted from <strong>Taoxichuan</strong>&rsquo;s dispatcher at the GLM handoff (<code>bc626f98</code>, 83 arms, 4 of them <strong>Akuma</strong>-private) and at the first fixed point (<code>6af48c06</code>, 120 with legacy folds).</span></p>
     </div>
   </section>
 
@@ -503,7 +503,7 @@
           <tr class="self"><td>2026-10-24</td><td>after KVM</td><td class="r">101</td><td class="r">118,115</td><td class="r hot">485</td><td class="r hot">1.5%</td></tr>
         </tbody></table></div>
       <ul>
-        <li><strong>Composition:</strong> 93% of Taoxichuan&rsquo;s live lines were already live in Akuma, and a second kernel, Osaka, is 10 lines.</li>
+        <li><strong>Composition:</strong> 93% of <strong>Taoxichuan</strong>&rsquo;s live lines were already live in <strong>Akuma</strong>, and a second kernel, Osaka, is 10 lines.</li>
         <li><strong>Host tests in leaf crates:</strong> the first test of the extracted <code>madvise</code> found that <code>madvise(addr, -1, DONTNEED)</code> looped over ~4.5e15 pages, reachable from unprivileged userspace.</li>
         <li><strong>Types as the rule:</strong> <code>akuma-port</code> exposes devices, never a port number, so safe code cannot power the box off.</li>
       </ul>
@@ -536,7 +536,7 @@
 	    <p class="eyebrow cool">Kernel that only runs <span class="m">tokio</span></p>
       <h2>Install a kernel from crates.io, and have your whole supply chain hijacked</h2>
 <div class="split even">
-        <div class="col"><ul><li>The future is now.</li><li>GLM wrote a second kernel, <strong>Shanghai</strong>, while running on Taoxichuan from a crate&rsquo;s README, and it ran on Akuma.</li><li>As a regrettable side effect, Python runs too.</li></ul></div>
+        <div class="col"><ul><li>The future is now.</li><li>GLM wrote a second kernel, <strong>Shanghai</strong>, while running on <strong>Taoxichuan</strong> from a crate&rsquo;s README, and it ran on <strong>Akuma</strong>.</li><li>As a regrettable side effect, Python runs too.</li></ul></div>
         <svg class="loop nest" viewBox="0 0 500 282" role="img" aria-labelledby="nest-t nest-d">
           <title id="nest-t">Nesting: Akuma, Taoxichuan, goose, Shanghai</title>
           <desc id="nest-d">Akuma runs on bare metal and hosts KVM guests. One guest is Taoxichuan. Inside it, goose, talking to GLM, builds Shanghai, a second kernel. The Shanghai image boots as another guest on Akuma's KVM.</desc>
@@ -623,7 +623,7 @@
         <div class="fig"><span class="v">~18 min</span><span class="k">of build, six attempts</span></div>
       </div>
       <ul>
-        <li>Unattended: goose with GLM, inside a Taoxichuan guest, under Akuma&rsquo;s hypervisor on bare metal.</li>
+        <li>Unattended: goose with GLM, inside a <strong>Taoxichuan</strong> guest, under <strong>Akuma</strong>&rsquo;s hypervisor on bare metal.</li>
         <li>The job: clone <span class="m">infinity</span>, cut every AWS dependency, build what is left (cut first, then build).</li>
         <li>It swapped OpenSSL for rustls, since the guest has no OpenSSL headers, cmake or clang.</li>
         <li>Proof: the agent answered <code>PONG</code> through <code>api.z.ai</code>, then ran <code>uname -a</code> through its own tool path.</li>
