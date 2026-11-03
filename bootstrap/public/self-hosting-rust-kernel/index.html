@@ -603,6 +603,37 @@
   <section class="slide">
     <div class="num">09</div>
     <div class="body">
+      <p class="eyebrow">Costs and benefits</p>
+      <h2>Benefits for <em>Akuma</em></h2>
+    </div>
+  </section>
+
+  <!-- 10 -->
+  <section class="slide">
+    <div class="num">10</div>
+    <div class="body">
+      <p class="eyebrow cool">Real workload</p>
+      <h2>GLM strips AWS out of an agent runtime, builds it, and runs it on <span class="cool">the new kernel</span></h2>
+      <div class="figs">
+        <div class="fig"><span class="v hot">664 &rarr; 399</span><span class="k">crates in <code>Cargo.lock</code></span></div>
+        <div class="fig"><span class="v">21 &rarr; 11</span><span class="k">workspace members</span></div>
+        <div class="fig"><span class="v">&minus;32,623</span><span class="k">lines (+2,453), 156 files</span></div>
+        <div class="fig"><span class="v">~18 min</span><span class="k">of build, six attempts</span></div>
+      </div>
+      <ul>
+        <li>Unattended: goose with GLM, inside a Taoxichuan guest, under Akuma&rsquo;s hypervisor on bare metal.</li>
+        <li>The job: clone <span class="m">infinity</span>, cut every AWS dependency, build what is left (cut first, then build).</li>
+        <li>It swapped OpenSSL for rustls, since the guest has no OpenSSL headers, cmake or clang.</li>
+        <li>Proof: the agent answered <code>PONG</code> through <code>api.z.ai</code>, then ran <code>uname -a</code> through its own tool path.</li>
+        <li>Three of the six builds failed on kernel bugs, which were fixed along the way.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 11 -->
+  <section class="slide">
+    <div class="num">11</div>
+    <div class="body">
       <p class="eyebrow">What&rsquo;s next</p>
       <h2>Hardening, then <span class="cool">verification</span></h2>
       <div class="split even">
