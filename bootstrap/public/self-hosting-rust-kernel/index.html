@@ -473,6 +473,14 @@
         <div class="fig"><span class="v">~7 months</span><span class="k">Akuma&rsquo;s first self-host</span></div>
         <div class="fig"><span class="v hot">7 d 4 h</span><span class="k">Taoxichuan</span></div>
       </div>
+      <div class="scroller"><table>
+        <thead><tr><th>Syscalls dispatched</th><th class="r">Count</th><th class="r">of Linux&rsquo;s 383</th></tr></thead>
+        <tbody>
+          <tr><td>C-level kernel: HTTPS <code>curl</code>, <code>apk</code>, fork, pipes, static binaries</td><td class="r">83</td><td class="r">22%</td></tr>
+          <tr><td>The brief&rsquo;s estimate for Rust (a guess, before any measurement)</td><td class="r">~70&ndash;90</td><td class="r">18&ndash;23%</td></tr>
+          <tr><td>Rust self-host: <code>rustc</code>, <code>cargo -j4</code>, K1 == K2</td><td class="r hot">120</td><td class="r hot">31%</td></tr>
+        </tbody></table></div>
+      <p><span class="m">Counted from Taoxichuan&rsquo;s dispatcher at the GLM handoff (<code>bc626f98</code>, 83 arms, 4 of them Akuma-private) and at the first fixed point (<code>6af48c06</code>, 120 with legacy folds).</span></p>
     </div>
   </section>
 
@@ -538,7 +546,16 @@
         <div class="fig"><span class="v">~3.2 wk</span><span class="k">of the $18/mo Lite plan</span></div>
         <div class="fig"><span class="v hot">1,943M</span><span class="k">Claude tokens &middot; 3.1&times; GLM</span></div>
       </div>
-      <p><strong>Benefit:</strong> 11 fixes in shared Akuma code (kernel, hypervisor and related), found through Taoxichuan work. <span class="m">Cost figures adjusted.</span></p>
+      <p class="sub">If GLM had done it alone <span class="m">(extrapolation, not a measurement)</span></p>
+      <div class="scroller"><table>
+        <thead><tr><th>GLM slower than Claude by</th><th class="r">GLM tokens</th><th class="r">Agent-hours</th><th class="r">One $18 Lite plan</th></tr></thead>
+        <tbody>
+          <tr><td>2&times;</td><td class="r hot">0.67&ndash;0.81B</td><td class="r">122&ndash;147</td><td class="r">3.4&ndash;4.1 weeks</td></tr>
+          <tr><td>3&times;</td><td class="r">0.81&ndash;1.03B</td><td class="r">147&ndash;187</td><td class="r">4.1&ndash;5.2 weeks</td></tr>
+          <tr><td>4&times;</td><td class="r">0.95&ndash;1.24B</td><td class="r">173&ndash;225</td><td class="r">4.8&ndash;6.2 weeks</td></tr>
+        </tbody></table></div>
+      <p><strong>Benefit:</strong> 11 fixes in shared Akuma code (kernel, hypervisor and related), found through Taoxichuan work.</p>
+      <p><span class="m">Top row: actuals. GLM-alone rows: refined process from day one, a dead-end attempt dropped, no supervision counted; no GLM run exists for the rustc, cargo and threads milestones.</span></p>
     </div>
   </section>
 
