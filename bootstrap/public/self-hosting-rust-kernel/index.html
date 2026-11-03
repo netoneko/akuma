@@ -521,8 +521,8 @@
         </tbody></table></div>
       <ul>
         <li><strong>Composition:</strong> the <strong>Taoxichuan</strong> kernel (a KVM guest) runs inside <strong>Akuma</strong> (the bare-metal KVM host), and 93% of its live lines were already live in <strong>Akuma</strong>.</li>
-        <li><strong>Traits and inversion of control:</strong> forced by the pre-port refactor, a crate states what it needs and leaves the kernel to provide it.</li>
-        <li><strong>Host-tested crates make debugging cheaper:</strong> the first test of the extracted <code>madvise</code> found that <code>madvise(addr, -1, DONTNEED)</code> looped over ~4.5e15 pages, reachable from unprivileged userspace.</li>
+        <li><strong>Traits and inversion of control.</strong></li>
+        <li><strong>Host-tested crates make debugging cheaper.</strong></li>
         <li><strong>Isolation of <code>unsafe</code> in specific crates:</strong> 87 of 117 crates forbid it outright, and the rest keep it in small leaf crates.</li>
       </ul>
     </div>
