@@ -270,13 +270,17 @@
   svg.loop text { font-family: var(--mono); font-size: 12.5px; fill: var(--ink-2); }
   svg.loop text.h { fill: var(--ink); font-size: 13.5px; }
   svg.loop .small text, svg.loop text.small { font-size: 11.5px; }
-  svg.loop .cap { fill: var(--dim); font-size: 11.5px; letter-spacing: 0.12em; text-transform: uppercase; }
+  svg.loop .cap { fill: var(--dim); font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; }
   svg.loop .arr path { fill: none; stroke: var(--ink-2); stroke-width: 1.6; }
   svg.loop .arr path.fail { stroke: var(--ai); stroke-dasharray: 5 4; }
   svg.loop .arr path.pass { stroke: var(--shu); }
   svg.loop text.fail { fill: var(--ai); }
   svg.loop text.pass, svg.loop text.pass.h { fill: var(--shu); }
   svg.loop path.pass { stroke: var(--shu); stroke-width: 1.6; }
+  svg.loop.nest { max-width: 88%; }
+  svg.loop rect.o { fill: none; stroke: var(--rule); stroke-width: 1.5; stroke-dasharray: 6 5; }
+  svg.loop rect.g { fill: rgba(167, 155, 230, 0.06); stroke: var(--ai); stroke-width: 1.5; }
+  svg.loop rect.g.s { fill: var(--shu-soft); stroke: var(--shu); }
   svg.loop .sep { stroke: var(--rule-soft); stroke-width: 1; }
 
   /* ── rail ───────────────────────────────────────────────────── */
@@ -527,9 +531,47 @@
   <section class="slide">
     <div class="num">07</div>
     <div class="body">
-      <p class="eyebrow cool">Kernel as a crate</p>
+	    <p class="eyebrow cool">Kernel that only runs <span class="m">tokio</span></p>
       <h2>Install a kernel from crates.io, and have your whole supply chain hijacked</h2>
-<ul><li>That&rsquo;s the cyberpunk joke.</li><li>GLM wrote a second kernel, <strong>Shanghai</strong>, from a crate&rsquo;s README, and it ran on Akuma.</li><li>Python runs too, so the capability surface is wider than intended.</li></ul>
+<div class="split even">
+        <div class="col"><ul><li>The future is now.</li><li>GLM wrote a second kernel, <strong>Shanghai</strong>, while running on Taoxichuan from a crate&rsquo;s README, and it ran on Akuma.</li><li>As a regrettable side effect, Python runs too.</li></ul></div>
+        <svg class="loop nest" viewBox="0 0 500 282" role="img" aria-labelledby="nest-t nest-d">
+          <title id="nest-t">Nesting: Akuma, Taoxichuan, goose, Shanghai</title>
+          <desc id="nest-d">Akuma runs on bare metal and hosts KVM guests. One guest is Taoxichuan. Inside it, goose, talking to GLM, builds Shanghai, a second kernel. The Shanghai image boots as another guest on Akuma's KVM.</desc>
+          <rect class="o" x="4" y="4" width="492" height="274" rx="6"/>
+          <text x="16" y="24" class="cap">Akuma &middot; bare metal &middot; KVM</text>
+          <rect class="g" x="14" y="34" width="282" height="234" rx="5"/>
+          <text x="26" y="54" class="cap">guest &middot; Taoxichuan</text>
+          <g class="box">
+            <rect x="30" y="66"  width="250" height="46" rx="4"/>
+            <rect x="30" y="134" width="250" height="46" rx="4"/>
+            <rect x="30" y="202" width="250" height="46" rx="4"/>
+          </g>
+          <g class="t">
+            <text x="155" y="86"  text-anchor="middle" class="h">goose</text>
+            <text x="155" y="104" text-anchor="middle">GLM over the network</text>
+            <text x="155" y="154" text-anchor="middle" class="h">cargo build</text>
+            <text x="155" y="172" text-anchor="middle">from a crate&rsquo;s README</text>
+            <text x="155" y="222" text-anchor="middle" class="h">Shanghai image</text>
+            <text x="155" y="240" text-anchor="middle">a second kernel</text>
+          </g>
+          <g class="arr">
+            <path d="M155 112 V132" marker-end="url(#ah)"/>
+            <path d="M155 180 V200" marker-end="url(#ah)"/>
+            <path class="pass" d="M280 225 H320" marker-end="url(#ah)"/>
+          </g>
+          <text x="300" y="214" text-anchor="middle" class="t small pass">boots</text>
+          <rect class="g s" x="322" y="34" width="166" height="234" rx="5"/>
+          <text x="332" y="54" class="cap">guest &middot; Shanghai</text>
+          <g class="box">
+            <rect x="344" y="116" width="122" height="52" rx="4"/>
+          </g>
+          <g class="t">
+            <text x="405" y="138" text-anchor="middle" class="h">tokio</text>
+            <text x="405" y="156" text-anchor="middle">program</text>
+          </g>
+        </svg>
+      </div>
     </div>
   </section>
 
