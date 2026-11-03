@@ -656,7 +656,11 @@ fn main(kernel: akuma_tokio_kernel::Kernel) -&gt; ! {
           <tr><td>Crates in <strong>Akuma</strong></td><td class="r">98</td><td class="r hot">117</td><td class="r">+19</td></tr>
           <tr><td>Fixes in <strong>Akuma</strong>&rsquo;s bug-fix list</td><td class="r">1,470 &middot; 406 docs</td><td class="r hot">1,492 &middot; 423 docs</td><td class="r">+22</td></tr>
           <tr><td>Fixes in <strong>Taoxichuan</strong>&rsquo;s own list</td><td class="r">0</td><td class="r hot">118 &middot; 34 docs</td><td class="r">+118</td></tr>
+          <tr><td>Third-party crates in the guest image <span class="m">*</span></td><td class="r">22</td><td class="r hot">15</td><td class="r">&minus;7</td></tr>
+          <tr><td>Third-party code in the guest image, lines <span class="m">*</span></td><td class="r">41,748</td><td class="r hot">21,861</td><td class="r">&minus;48%</td></tr>
+          <tr><td>Build-time host code, lines <span class="m">*</span></td><td class="r">31,743</td><td class="r hot">428</td><td class="r">&minus;99%</td></tr>
         </tbody></table></div>
+      <p><span class="m">* Dependency cut: before = the cutover (2026-11-01), after = B15 (2026-11-02). The in-tree virtio driver replaced <code>virtio-drivers</code> and its stack in every kernel, and with it went <code>syn</code> and the proc-macros.</span></p>
     </div>
   </section>
 
