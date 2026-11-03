@@ -265,6 +265,7 @@
   .body a:hover { color: var(--shu); text-decoration-color: var(--shu); }
   .body a:focus-visible { outline: 1px solid var(--ai); outline-offset: 2px; }
   th.r, td.r { text-align: right; }
+  tr.grp td { color: var(--ai); font-size: 0.66rem; letter-spacing: 0.14em; text-transform: uppercase; padding-top: 0.75rem; padding-bottom: 0.2rem; border-bottom: 0; }
 
   /* ── verification-loop diagram (slide 3) ───────────────────── */
   svg.loop { width: 100%; height: auto; display: block; }
@@ -534,14 +535,20 @@
     <div class="body">
       <p class="eyebrow">Cleanup</p>
       <h2>GLM and Sonnet got kernel to the fixed point, Opus cleaned up</h2>
-<div class="scroller"><table>
-        <thead><tr><th>Measure</th><th class="r">Before</th><th class="r">After</th></tr></thead>
+<div class="scroller"><table class="dense">
+        <thead><tr><th>Audit lines unless noted</th><th class="r">Before cleanup</th><th class="r">After cleanup</th><th class="r">Change</th></tr></thead>
         <tbody>
-          <tr><td>Guest audit lines</td><td class="r">87,761</td><td class="r hot">77,839</td></tr>
-          <tr><td>Guest <code>unsafe</code> lines</td><td class="r">2,850</td><td class="r hot">1,668</td></tr>
-          <tr><td>Kernel&rsquo;s own code (lines)</td><td class="r">7,844</td><td class="r hot">3,771</td></tr>
-          <tr><td>Third-party crates</td><td class="r">22</td><td class="r hot">15</td></tr>
-          <tr><td>Build-time host code (lines)</td><td class="r">31,743</td><td class="r hot">428</td></tr>
+          <tr class="grp"><td colspan="4">The guest &middot; Taoxichuan</td></tr>
+          <tr><td>Audit lines (live code in the image)</td><td class="r">87,761</td><td class="r hot">77,839</td><td class="r">&minus;11%</td></tr>
+          <tr><td>The kernel&rsquo;s own code</td><td class="r">7,844</td><td class="r hot">3,771</td><td class="r">&minus;52%</td></tr>
+          <tr><td>Third-party code (crates.io)</td><td class="r">41,748 &middot; 22 crates</td><td class="r hot">21,861 &middot; 15 crates</td><td class="r">&minus;48%</td></tr>
+          <tr><td><code>unsafe</code> lines</td><td class="r">2,850</td><td class="r hot">1,668</td><td class="r">&minus;41%</td></tr>
+          <tr><td>Build-time host code</td><td class="r">31,743</td><td class="r hot">428</td><td class="r">&minus;99%</td></tr>
+          <tr class="grp"><td colspan="4">The host &middot; Akuma amd64, and the two together</td></tr>
+          <tr><td>Host audit lines</td><td class="r">152,104</td><td class="r hot">136,727</td><td class="r">&minus;10%</td></tr>
+          <tr><td>Taoxichuan on an Akuma host (shared lines once)</td><td class="r">161,128</td><td class="r hot">141,903</td><td class="r">&minus;12%</td></tr>
+          <tr><td>What Taoxichuan adds to the host</td><td class="r">9,024</td><td class="r hot">5,176</td><td class="r">&minus;43%</td></tr>
+          <tr><td>Share of Taoxichuan already live in the host</td><td class="r">90%</td><td class="r hot">93%</td><td class="r">+3 pts</td></tr>
         </tbody></table></div>
 	<p class="pull">Less capability <em>in theory</em> means a smaller attack surface and it's easier to reason about</p>
     </div>
