@@ -712,12 +712,22 @@ pub fn metadata_open_file(path: &str, mount_id: u32, inode: u32) -> Result<Metad
 /// `mount_id` selects the filesystem. No path-keyed cache is told about the
 /// write (there may be no path); the caller is the shared-mapping write-back,
 /// whose pages are the authority for these bytes until they land.
+///
+/// The shared file-page cache is told, by inode: it is keyed by inode, so it
+/// needs no path, and a cached read-only page of this file would otherwise keep
+/// serving the bytes from before the write - to an unlinked file's readers,
+/// whose path-keyed invalidation in [`write_at_open_file_or_path`] resolves to
+/// nothing, and after every shared-mapping write-back.
 pub fn write_at_open_file(mount_id: u32, inode: u32, offset: usize, data: &[u8]) -> Result<usize, FsError> {
     if inode == 0 {
         return Err(FsError::NotFound);
     }
     let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
-    fs.write_at_by_inode(inode, offset, data)
+    let r = fs.write_at_by_inode(inode, offset, data);
+    if cfg_shared_file_pages_enabled() {
+        akuma_fpcache::invalidate_inode(inode);
+    }
+    r
 }
 
 /// Write for an open file description: by the inode `open(2)` bound to it when

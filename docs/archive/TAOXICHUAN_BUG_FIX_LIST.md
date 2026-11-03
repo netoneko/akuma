@@ -16,21 +16,21 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ## Statistics
 
-- **Total distinct fixes counted:** 105
-- **Docs contributing at least one fix:** 28
+- **Total distinct fixes counted:** 113
+- **Docs contributing at least one fix:** 33
 - **Subsystem categories:** 8
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscalls, Files & Pipes | 37 | 35.2% | 6 |
-| Exec & ELF Loading | 8 | 7.6% | 2 |
-| Processes, Fork, Threads & Scheduling | 33 | 31.4% | 9 |
-| Memory & Copy-on-Write | 6 | 5.7% | 2 |
-| Signals | 5 | 4.8% | 2 |
-| Networking & Readiness | 4 | 3.8% | 2 |
-| SMP, Time & Boot | 9 | 8.6% | 4 |
-| Build & Integration | 3 | 2.9% | 1 |
-| **Total** | **105** | **100.0%** | **28** |
+| Syscalls, Files & Pipes | 37 | 32.7% | 6 |
+| Exec & ELF Loading | 11 | 9.7% | 4 |
+| Processes, Fork, Threads & Scheduling | 33 | 29.2% | 9 |
+| Memory & Copy-on-Write | 10 | 8.8% | 4 |
+| Signals | 5 | 4.4% | 2 |
+| Networking & Readiness | 4 | 3.5% | 2 |
+| SMP, Time & Boot | 10 | 8.8% | 5 |
+| Build & Integration | 3 | 2.7% | 1 |
+| **Total** | **113** | **100.0%** | **33** |
 
 **Largest single write-ups:**
 
@@ -92,7 +92,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/SYSCALL_CONSTANT_AUDIT_2026_10_30.md
 - `akuma-ring3-amd64::nr` (Taoxichuan's dispatch table) had `GETPID = 38` and `SENDFILE = 39`, both off by one, so `setitimer` (38) answered the caller's pid while it still had a `GETPID` arm; the third x86_64 table is gone
 
-## Exec & ELF Loading (8 fixes, 2 docs)
+## Exec & ELF Loading (11 fixes, 4 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `build_stack` sliced backwards from the end of a 512-byte initial stack block and apk's long argv and env overran it by one pointer word: a kernel PANIC on the first install write (stage 6B, `28dc8ba2`)
@@ -105,6 +105,13 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_B8_ONE_ELF_LOADER.md
 - the interpreter loop sliced `ldso[p_offset..p_offset + p_filesz]` with nothing checking the range against the file, so a short `PT_INTERP` file was an index panic in ring 0; `akuma-elf-exec::load_segments` refuses it
 - no segment was checked against the user half, so a segment at or above `0x0000_8000_0000_0000` (or one whose end overflowed) walked the PML4 slots every root shares with the kernel; both are refused before a frame is taken
+
+### docs/archive/TAOXICHUAN_EXEC_ARGV_LIMIT.md
+- `execve` capped argv at 448 entries because `build_stack` recorded string addresses in a `[u64; 512]` and `load_task` wrote a fixed 12-page block, so `infinity-agent-cli`'s 570-argument `rustc` line failed with `E2BIG`; the block is sized by its contents and the caps are 32768 argv, 8192 env, 128 KiB a string, 1 MiB in all
+- `build_stack` never padded, so `rsp` was 8 mod 16 whenever argc + envc was even; it pads one word, as Linux does
+
+### docs/archive/TAOXICHUAN_EXEC_SHEBANG.md
+- `exec_real_task` answered `ENOEXEC` for anything not ELF, so GLM's `#!/usr/bin/env python3` `RUSTC_WRAPPER` could not run; it follows up to 4 `#!` hops through the shared `parse_shebang`/`shebang_hop`
 
 ## Processes, Fork, Threads & Scheduling (33 fixes, 9 docs)
 
@@ -159,7 +166,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_SSH_STDIN_PUMP.md
 - the `linux-abi` `spawn_full` piped only stdout, so the child inherited the spawner's fd 0 and sshd's pump wrote into a stdin the child never read, with no EOF either: every ssh exec that sent stdin hung; `SpawnResult` carries the write end of a real stdin pipe (`15ff2709`)
 
-## Memory & Copy-on-Write (6 fixes, 2 docs)
+## Memory & Copy-on-Write (10 fixes, 4 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `mmap` demanded `fd == -1` for `MAP_ANONYMOUS` while libakuma passes 0 (Linux ignores it), so sshd's first allocation answered `ENODEV` (stage 4)
@@ -170,6 +177,14 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_COW_FORK.md
 - `openat` ignored `O_APPEND`, so `echo b >> f` overwrote from offset 0 and `printf ... >> Cargo.toml` destroyed the manifest
 - `arch_prctl(ARCH_GET_FS)` wrote user memory by hand through the physmap, bypassing the CoW break; it goes through `copy_to_user`
+
+### docs/archive/TAOXICHUAN_LAZY_MMAP.md
+- `mmap` allocated, zeroed and file-filled every page before returning, so a thread stack cost its full size and every `rustc` held a private copy of all of `librustc_driver` it mapped: at `-j3` on 3 GiB a thread-stack `mmap` got `ENOMEM` (ICE: `failed to spawn work thread`); an untouched page is a lazy record in its own not-present leaf, filled on first touch
+- `brk` regrow mapped fresh frames over the pages an earlier shrink had left mapped, leaking the old frames; regrow releases the range first
+
+### docs/archive/TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md
+- `mprotect(PROT_NONE)` returned 0 and changed nothing, and `mmap(PROT_NONE)` mapped the range read-write, so guard pages could be read and written; a present page keeps its frame with `U/S` clear (the kernel's copies answer `EFAULT`) and a lazy record carries a `NONE` bit that is never filled
+- `mmap` mapped every non-exec mapping read-write whatever `PROT_WRITE` said, so a write to a `PROT_READ` mapping succeeded (and no read-only file page could be shared); `write` is `PROT_WRITE`
 
 ## Signals (5 fixes, 2 docs)
 
@@ -192,7 +207,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_TOKIO_MULTI_EPOLL_FINDING.md
 - an edge-triggered eventfd reported only its first wake: mio's waker is written on every wake and never read, so a rising-edge-only model lost the rest and tokio's multi-thread runtime progressed only on its timeout; `epoll::on_eventfd_written` re-arms every `EPOLLET` entry naming the eventfd (GET 24,968 ms -> 53 ms)
 
-## SMP, Time & Boot (9 fixes, 4 docs)
+## SMP, Time & Boot (10 fixes, 5 docs)
 
 ### docs/archive/TAOXICHUAN_SMP.md
 - `switch_to` left CR3 alone for an idle thread, so an idle core sat on a finished task's root while another core reaped it and freed its page tables: a triple fault; an idle thread loads the kernel root
@@ -210,6 +225,9 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `lapic_init` ran before the PMM and heap were registered and its `map_device` allocates page-table frames: a boot panic (`9dc684ef`)
+
+### docs/archive/INFINITY_ON_TAOXICHUAN.md
+- ext2 was mounted with a constant-0 clock, so every file read 1 Jan 1970 and every unlinked inode carried `dtime` 0 (15,254 e2fsck repairs after a hard stop); it stamps UTC from the `epoch=` anchor (`a0ffa4d4`)
 
 ## Build & Integration (3 fixes, 1 doc)
 
@@ -231,6 +249,11 @@ These are fixes to code every kernel runs, so the Akuma list counts them:
 - `AKUMA_VIRTIO_IN_TREE.md`: the in-tree virtio-net `send` left out the header.
 - `AMD64_BOX_SPAWN_EXT_REGRESSION.md`: the glue `exec` feature, gated for Taoxichuan's audit surface, broke amd64's `box run`.
 - `TAOXICHUAN_CLEANUP_PLAN.md`: amd64's self-test build had not compiled since the boot-kit extraction.
+- `EXT2_DIRENT_TYPE_WITHOUT_FILETYPE.md`: ext2 wrote dirent types without `INCOMPAT_FILETYPE` and read a 0 type as "file".
+- `KVM_GUEST_4GIB_PVH_HANDOFF.md`: the PVH handoff above 4 GiB and the constant `memmap_entries`, in the hypervisor booting Taoxichuan.
+- `UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS.md`: glue's AF_UNIX `read`/`write` skipped the record queue.
+- `SSHD_SESSION_WITHOUT_PATH.md`: sshd sessions had no `PATH`, so gcc could not find `cc1`.
+- `TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md`: glue's by-inode write never invalidated the shared file-page cache.
 
 ## Files scanned with zero counted fixes
 
@@ -259,6 +282,12 @@ Scanned 2026-11-02, closing `rust-org-il-experiment`.
   with no flags word), `4d84edd2` (apk's live repositories line dialled `:8123` on every exec and hung with no listener),
   `12eeff10` (the SMP kernel lock is a ticket lock; an unfair spin starved a core that asks rarely), `e3026c94`
   (`rt_sigsuspend` + `rt_sigreturn`: busybox ash's `wait` no longer hangs), `10f84fc5` (the poll-pipe kind fix).
+- **Scanned 2026-11-03** (the Infinity run and the three items it left open): INFINITY_ON_TAOXICHUAN's other six bugs are
+  counted under their own docs, here or in `BUG_FIX_LIST.md`. Its open item (stale process rows after an abort) is not a
+  fix, and sshd-as-init's orphan miscount was retired by running herd as init, not fixed. TAOXICHUAN_LAZY_MMAP's prefault
+  hook registration is part of the lazy fix, not a separate defect. TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES's
+  file-page sharing is a capability, and its `shared_writeback` invalidation guards that capability; neither is counted.
+  The `MAP_SHARED|MAP_ANONYMOUS`-across-fork gap and fault-signal delivery it records are open.
 
 ## Background
 

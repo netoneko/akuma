@@ -481,8 +481,18 @@ Rules that follow from the record being a leaf:
 - **Writable `MAP_SHARED` file mappings stay eager**: their writeback walks present frames.
 - A ring-0 not-present fault fills zero pages only. A file fill reads the filesystem, which a ring-0
   fault may already hold.
+- **`PROT_NONE` is the user bit, not an unmap.** A present page keeps its frame with `U/S` clear, so
+  `mprotect(RW)` gives its contents back and fork and teardown see an ordinary present page. A lazy
+  record carries a `NONE` bit and is never filled. Every kernel copy checks `U/S`: `translate_filling`
+  and glue's `validate_user_range` both answer `EFAULT` for such a page.
+- **`mmap` maps exactly `PROT_WRITE`.** Nothing widens a `PROT_READ` mapping to RW.
+- **A read-only file page is shared** through `akuma-fpcache`, one frame per `(inode, offset)`. Every
+  path that writes file bytes must call `akuma_fpcache::invalidate_inode` after the write:
+  `akuma-vfs-glue`'s writers do, and so does `shared_writeback`. A new write path that skips it serves
+  stale pages to the next mapper. ext2's inode-freed hook is registered in `mount_root`, so a reissued
+  inode number cannot hit an old entry.
 
-`docs/archive/TAOXICHUAN_LAZY_MMAP.md`.
+`docs/archive/TAOXICHUAN_LAZY_MMAP.md`, `docs/archive/TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md`.
 
 ## Feature notes
 

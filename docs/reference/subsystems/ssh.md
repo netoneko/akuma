@@ -59,6 +59,12 @@ property, not a size trade — see
   documented; disks populated before that still say `--port 23`). On
   `extreme + userspace-sshd` there is no herd, and `config::AUTO_START_SSHD`
   spawns `/bin/sshd --port 22 --shell /bin/sh` directly from `kernel_main`.
+- **The session environment is built from scratch** (`session_env`): `HOME`,
+  `USER`, `LOGNAME` and `PATH` always, `ENV=/etc/profile`, and `TERM` only for
+  a pty. Nothing is inherited from sshd's own environment. A variable a program
+  needs must be set there: busybox ash does not export its default `PATH`, and
+  gcc without one cannot find `cc1`
+  ([`../../archive/SSHD_SESSION_WITHOUT_PATH.md`](../../archive/SSHD_SESSION_WITHOUT_PATH.md)).
 
 ### Resolved: unauthenticated pre-auth panic
 

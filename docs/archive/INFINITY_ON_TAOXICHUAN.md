@@ -108,18 +108,23 @@ Each is a kernel or hypervisor defect, not GLM's, and each is fixed:
 | no `#!` support in `execve` | GLM's Python wrapper: `Exec format error` | `a0ffa4d4`, [`TAOXICHUAN_EXEC_SHEBANG.md`](TAOXICHUAN_EXEC_SHEBANG.md) |
 | ext2 clock was a constant 0 | 1970 mtimes; `e2fsck` after the hard stop set `dtime` on 15,254 deleted inodes | `a0ffa4d4` |
 
-One more, fixed after the run:
+Fixed after the run:
 
 | bug | what it did here | fix |
 |---|---|---|
 | eager `mmap`: every page allocated, zeroed and file-filled at `mmap` | at `-j3` on 3 GiB a `rustc` thread-stack `mmap` got `ENOMEM` (ICE: `failed to spawn work thread`) | [`TAOXICHUAN_LAZY_MMAP.md`](TAOXICHUAN_LAZY_MMAP.md): the same clean `-j3` build on 3 GiB now completes, 278 crates in 790 s |
+| no file page shared between processes; `PROT_NONE` and `mmap`'s `PROT_READ` not enforced | each `rustc` held its own copy of every page of `librustc_driver` it touched | [`TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md`](TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md) |
+| sshd sessions had no `PATH` | gcc: `cannot execute 'cc1': posix_spawnp: No such file or directory` | [`SSHD_SESSION_WITHOUT_PATH.md`](SSHD_SESSION_WITHOUT_PATH.md) |
 
-And two that are open:
+sshd as init had a miscount: it reaped with `wait4(-1)` and counted every reaped orphan as a finished session
+(`live_sessions`). The guest runs herd as init instead now (`init=/bin/herd`, herd and sshd from the `linux-abi`
+build, `/etc/herd/enabled/sshd.conf` alone). herd reaps orphans and starts sshd as pid 2. The host's own herd services
+that were also enabled on the guest's disk copy are parked in `/etc/herd/disabled-guest/`.
+
+Still open:
 
 - **Stale process rows.** After a multi-threaded abort, and even after `SIGKILL`, rows stayed in `ps`
   (state R, `VmSize` 0, fds 0/1 open, `kill -0` succeeding) for pids cargo had already reaped.
-- **sshd as init miscounts.** It reaps with `wait4(-1)`, but counts every reaped orphan as a finished
-  session (`live_sessions`). herd's `sweep_reaped` is the reaper to share.
 
 `e2fsck` after the first restart also found 42,815 bad dirents (the dirent bug above). After the hard stop
 it found nothing structural: 336 leaked inodes (unlinked files still open when the guest died; ext2 has

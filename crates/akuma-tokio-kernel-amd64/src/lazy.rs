@@ -79,37 +79,79 @@ pub fn fill(root: u64, va: u64, files: bool) -> Fill {
     let Some(page) = lazy::decode(entry) else {
         return Fill::NotLazy;
     };
-    if page.file.is_some() && !files {
+    // `PROT_NONE` is never filled: the access that got here is a real fault.
+    if page.none || (page.file.is_some() && !files) {
         return Fill::NotLazy;
     }
+    let prot = PteProt { write: page.write, exec: page.exec, user: true };
+    // A read-only file page is shared through the file-page cache: one frame
+    // per `(inode, offset)` however many processes map it (amd64's rule, and
+    // the same eligibility - see `akuma_fpcache`'s module docs).
+    let share = page.file.filter(|_| !page.write && akuma_fpcache::cap() > 0);
+    if let Some(f) = share
+        && let Some((frame, _)) = akuma_fpcache::lookup_and_ref(FPCACHE_MOUNT, f.inode, f.index as usize * 4096, page.exec)
+    {
+        if paging::map_page_in(root, va as usize, frame.addr as u64, prot, MemAttr::WriteBack) {
+            return Fill::Present;
+        }
+        // The lookup took a count for this mapping; give it back.
+        akuma_pmm::free_page(frame.addr, akuma_primitives::preempt::current_tid() as u32);
+        return Fill::Failed;
+    }
+    let mut filled = 0;
     let frame = match page.file {
-        None => FreshFrame::alloc_zeroed(),
-        Some(f) => FreshFrame::alloc().and_then(|mut frame| read_file_page(f, frame.bytes_mut()).then_some(frame)),
+        None => alloc_frame(true),
+        Some(f) => alloc_frame(false).and_then(|mut frame| {
+            filled = read_file_page(f, frame.bytes_mut())?;
+            Some(frame)
+        }),
     };
     let Some(frame) = frame else {
         return Fill::Failed;
     };
-    let prot = PteProt { write: page.write, exec: page.exec, user: true };
     if !paging::map_page_in(root, va as usize, frame.pa() as u64, prot, MemAttr::WriteBack) {
         return Fill::Failed; // the frame drops back to the PMM
     }
-    frame.publish();
+    let pa = frame.publish();
+    // Published after it is mapped and filled: a peer can map it the moment it
+    // lands. A page that runs past EOF is not shared (its zero tail belongs to
+    // the mapping, not the file). Losing the insert race leaves this frame
+    // private, which is still correct.
+    if let Some(f) = share
+        && filled == 4096
+    {
+        akuma_fpcache::insert(FPCACHE_MOUNT, f.inode, f.index as usize * 4096, akuma_exec::PhysFrame::new(pa), true);
+    }
     Fill::Present
 }
 
+/// The file-page cache keys on `(inode, mount id)`. This kernel has one ext2
+/// mount, and every invalidation is by inode alone (`invalidate_inode` is
+/// id-blind on purpose), so any fixed non-zero id is the whole identity.
+const FPCACHE_MOUNT: u32 = 1;
+
+/// A frame for a fill. Out of memory, the file-page cache gives back pages
+/// nobody maps (this kernel has no reclaim pass that would ask it) and the
+/// allocation is tried once more.
+fn alloc_frame(zeroed: bool) -> Option<FreshFrame> {
+    let alloc = || if zeroed { FreshFrame::alloc_zeroed() } else { FreshFrame::alloc() };
+    alloc().or_else(|| (akuma_fpcache::shrink(64) > 0).then(alloc).flatten())
+}
+
 /// Fill `out` with page `f.index` of inode `f.inode`; bytes past the end of
-/// the file are zero, as `mmap(2)` specifies. `false` on a read error.
-fn read_file_page(f: lazy::FilePage, out: &mut [u8; 4096]) -> bool {
+/// the file are zero, as `mmap(2)` specifies. The count of file bytes read, or
+/// `None` on a read error.
+fn read_file_page(f: lazy::FilePage, out: &mut [u8; 4096]) -> Option<usize> {
     let mut done = 0usize;
     while done < out.len() {
         match crate::root_fs().read_at_by_inode(f.inode, f.index as usize * 4096 + done, &mut out[done..]) {
             Ok(0) => break,
             Ok(n) => done += n,
-            Err(_) => return false,
+            Err(_) => return None,
         }
     }
     out[done..].fill(0);
-    true
+    Some(done)
 }
 
 /// `akuma_user_access`'s prefault hook: make every lazy page of
@@ -130,8 +172,9 @@ pub fn prefault(start: usize, len: usize) -> bool {
 }
 
 /// `mprotect` on a page nothing has touched: its record takes the new
-/// permissions. `false` when the page at `va` is not lazy.
-pub fn reprotect(root: u64, va: u64, write: bool, exec: bool) -> bool {
+/// permissions (`none` for `PROT_NONE`). `false` when the page at `va` is not
+/// lazy.
+pub fn reprotect(root: u64, va: u64, write: bool, exec: bool, none: bool) -> bool {
     let Some(slot) = crate::leaf_entry(root, va & !0xFFF) else {
         return false;
     };
@@ -139,7 +182,7 @@ pub fn reprotect(root: u64, va: u64, write: bool, exec: bool) -> bool {
         return false;
     };
     // Same backing, so it encodes wherever the original did.
-    let Some(entry) = page.with_prot(write, exec).encode() else {
+    let Some(entry) = page.with_prot(write, exec, none).encode() else {
         return false;
     };
     slot.write(entry);
@@ -196,10 +239,12 @@ fn move_leaf(root: u64, from: u64, to: u64) -> bool {
 }
 
 /// The lazy leaf for the present page `pte` would be if it were dropped and
-/// refaulted as zeros: same permissions, no file (`MADV_DONTNEED`).
+/// refaulted as zeros: same permissions, no file (`MADV_DONTNEED`). A page
+/// without the user bit is a `PROT_NONE` one, and stays inaccessible.
 pub fn anon_like(pte: u64) -> Lazy {
     let write = pte & (akuma_pte_amd64::RW | akuma_pte_amd64::COW) != 0;
-    Lazy::anon(write, pte & akuma_pte_amd64::NX == 0)
+    let none = pte & akuma_pte_amd64::US == 0;
+    Lazy { none, ..Lazy::anon(write, pte & akuma_pte_amd64::NX == 0) }
 }
 
 // ---------------------------------------------------------------------------

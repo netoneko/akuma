@@ -55,6 +55,9 @@ akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64" }
 # allocator `paging` and `virtio` allocate through.
 akuma-alloc = { path = "../akuma-alloc" }
 akuma-pmm = { path = "../akuma-pmm" }
+# Shared frames for read-only file pages (`lazy.rs`): one copy of each page of
+# `librustc_driver` however many `rustc`s map it.
+akuma-fpcache = { path = "../akuma-fpcache" }
 # The leaf crate every shared crate talks through: the console hook
 # (`safe_print!`), the physmap limit, the virtio window.
 akuma-primitives = { path = "../akuma-primitives" }

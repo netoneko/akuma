@@ -12,10 +12,11 @@
 //! | 2 | writable once present |
 //! | 3 | executable once present |
 //! | 4 | file-backed |
-//! | 5..=36 | inode number (32 bits) |
-//! | 37..=63 | file page index (27 bits: offsets below 512 GiB) |
+//! | 5 | `PROT_NONE`: never filled, every access faults |
+//! | 6..=37 | inode number (32 bits) |
+//! | 38..=63 | file page index (26 bits: offsets below 256 GiB) |
 //!
-//! An anonymous lazy page is the tag and the two permission bits; its inode and
+//! An anonymous lazy page is the tag and the permission bits; its inode and
 //! index fields are zero.
 //!
 //! # Why the page table and not a region list
@@ -48,9 +49,10 @@ pub const TAG: u64 = 1 << 1;
 const WRITE: u64 = 1 << 2;
 const EXEC: u64 = 1 << 3;
 const FILE: u64 = 1 << 4;
-const INODE_SHIFT: u32 = 5;
-const INDEX_SHIFT: u32 = 37;
-/// The largest file page index an entry can name (`2^27 - 1`).
+const NONE: u64 = 1 << 5;
+const INODE_SHIFT: u32 = 6;
+const INDEX_SHIFT: u32 = 38;
+/// The largest file page index an entry can name (`2^26 - 1`).
 pub const MAX_INDEX: u64 = (1 << (64 - INDEX_SHIFT)) - 1;
 
 /// What a lazy page becomes on its first touch.
@@ -60,6 +62,9 @@ pub struct Lazy {
     pub write: bool,
     /// Map the page executable.
     pub exec: bool,
+    /// `PROT_NONE`: the page is reserved and inaccessible. It is never filled,
+    /// so every access faults; `write` and `exec` are ignored while it is set.
+    pub none: bool,
     /// Fill the page from this file instead of zeroing it.
     pub file: Option<FilePage>,
 }
@@ -77,11 +82,11 @@ impl Lazy {
     /// A zero-fill page.
     #[must_use]
     pub const fn anon(write: bool, exec: bool) -> Self {
-        Self { write, exec, file: None }
+        Self { write, exec, none: false, file: None }
     }
 
     /// The entry, or `None` when the file page index does not fit (an offset at
-    /// or past 512 GiB) - the caller maps that page another way.
+    /// or past 256 GiB) - the caller maps that page another way.
     #[must_use]
     pub const fn encode(self) -> Option<u64> {
         let mut v = TAG;
@@ -90,6 +95,9 @@ impl Lazy {
         }
         if self.exec {
             v |= EXEC;
+        }
+        if self.none {
+            v |= NONE;
         }
         if let Some(f) = self.file {
             if f.index > MAX_INDEX {
@@ -115,10 +123,11 @@ impl Lazy {
         }
     }
 
-    /// The same page with new permissions (`mprotect` on a page not yet touched).
+    /// The same page with new permissions (`mprotect` on a page not yet touched);
+    /// `none` makes it inaccessible.
     #[must_use]
-    pub const fn with_prot(self, write: bool, exec: bool) -> Self {
-        Self { write, exec, ..self }
+    pub const fn with_prot(self, write: bool, exec: bool, none: bool) -> Self {
+        Self { write, exec, none, ..self }
     }
 }
 
@@ -134,7 +143,7 @@ pub const fn decode(entry: u64) -> Option<Lazy> {
     } else {
         None
     };
-    Some(Lazy { write: entry & WRITE != 0, exec: entry & EXEC != 0, file })
+    Some(Lazy { write: entry & WRITE != 0, exec: entry & EXEC != 0, none: entry & NONE != 0, file })
 }
 
 /// Is `entry` a lazy page?
@@ -158,14 +167,14 @@ mod tests {
     #[test]
     fn file_round_trips_at_the_field_limits() {
         for (inode, index) in [(1, 0), (u32::MAX, MAX_INDEX), (0x1234_5678, 76_000)] {
-            let l = Lazy { write: true, exec: false, file: Some(FilePage { inode, index }) };
+            let l = Lazy { write: true, exec: false, none: false, file: Some(FilePage { inode, index }) };
             assert_eq!(decode(l.encode().unwrap()), Some(l));
         }
     }
 
     #[test]
     fn an_index_past_the_field_does_not_encode() {
-        let l = Lazy { write: false, exec: false, file: Some(FilePage { inode: 7, index: MAX_INDEX + 1 }) };
+        let l = Lazy { write: false, exec: false, none: false, file: Some(FilePage { inode: 7, index: MAX_INDEX + 1 }) };
         assert_eq!(l.encode(), None);
         let at_limit = Lazy { file: Some(FilePage { inode: 7, index: MAX_INDEX }), ..l };
         assert_eq!(at_limit.offset_by(1), None);
@@ -174,7 +183,7 @@ mod tests {
 
     #[test]
     fn no_lazy_entry_is_present_and_none_is_empty() {
-        let l = Lazy { write: true, exec: true, file: Some(FilePage { inode: u32::MAX, index: MAX_INDEX }) };
+        let l = Lazy { write: true, exec: true, none: true, file: Some(FilePage { inode: u32::MAX, index: MAX_INDEX }) };
         for e in [Lazy::anon(false, false).encode().unwrap(), l.encode().unwrap()] {
             assert_eq!(e & P, 0, "a lazy entry must fault");
             assert_ne!(e, 0, "a lazy entry must not read as an empty slot");
@@ -192,15 +201,26 @@ mod tests {
 
     #[test]
     fn offset_by_advances_a_file_page_and_leaves_anonymous_alone() {
-        let f = Lazy { write: false, exec: true, file: Some(FilePage { inode: 9, index: 3 }) };
+        let f = Lazy { write: false, exec: true, none: false, file: Some(FilePage { inode: 9, index: 3 }) };
         assert_eq!(f.offset_by(4).unwrap().file.unwrap().index, 7);
         assert_eq!(Lazy::anon(true, false).offset_by(1 << 40), Some(Lazy::anon(true, false)));
     }
 
     #[test]
     fn with_prot_keeps_the_backing() {
-        let f = Lazy { write: true, exec: false, file: Some(FilePage { inode: 9, index: 3 }) };
-        let r = f.with_prot(false, true);
-        assert_eq!((r.write, r.exec, r.file), (false, true, f.file));
+        let f = Lazy { write: true, exec: false, none: false, file: Some(FilePage { inode: 9, index: 3 }) };
+        let r = f.with_prot(false, true, false);
+        assert_eq!((r.write, r.exec, r.none, r.file), (false, true, false, f.file));
+        let n = r.with_prot(false, false, true);
+        assert_eq!(decode(n.encode().unwrap()), Some(n));
+        assert_eq!(decode(n.with_prot(true, false, false).encode().unwrap()).unwrap().none, false);
+    }
+
+    #[test]
+    fn none_round_trips_with_and_without_a_file() {
+        let a = Lazy { none: true, ..Lazy::anon(false, false) };
+        assert_eq!(decode(a.encode().unwrap()), Some(a));
+        let f = Lazy { none: true, file: Some(FilePage { inode: u32::MAX, index: MAX_INDEX }), ..a };
+        assert_eq!(decode(f.encode().unwrap()), Some(f));
     }
 }

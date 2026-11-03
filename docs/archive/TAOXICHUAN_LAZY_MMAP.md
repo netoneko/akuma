@@ -38,8 +38,9 @@ encoding (`akuma_pte_amd64::lazy`, host-tested):
 | 1 | tag: a lazy page, not an empty slot |
 | 2, 3 | writable, executable once present |
 | 4 | file-backed |
-| 5..=36 | inode |
-| 37..=63 | file page index (offsets below 512 GiB) |
+| 5 | `PROT_NONE`: never filled (added by [`TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md`](TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md)) |
+| 6..=37 | inode |
+| 38..=63 | file page index (offsets below 256 GiB) |
 
 `lazy::fill` makes a lazy page present: a zeroed frame, or one read from the inode with the tail past EOF
 zeroed, mapped with the recorded permissions. Three paths reach it:
@@ -96,20 +97,16 @@ leaking the old frames. Regrow now releases the range first.
 Unchanged by this fix (the deployed kernel gives the same results under TCG):
 
 - `mprotectlb` `rw_to_none_read` and `eager_mprotect_probe` PHASE2 fail, because `mprotect(PROT_NONE)` is
-  a no-op on Taoxichuan.
+  a no-op on Taoxichuan. Fixed next, in
+  [`TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md`](TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md).
 - `tcc -run` fails in `mprotect`: W^X refuses to make written pages executable (`wx=0` lifts it).
-- gcc reports `cannot execute 'cc1': posix_spawnp: No such file or directory`.
+- gcc reports `cannot execute 'cc1': posix_spawnp: No such file or directory`. Not a memory bug: the ssh
+  session had no `PATH` ([`SSHD_SESSION_WITHOUT_PATH.md`](SSHD_SESSION_WITHOUT_PATH.md)).
 
 ## Still open
 
-- **Sharing.** Every process still gets its own copy of each file page it touches, and the 2.86 GB peak
-  above is mostly that: three `rustc`s each holding the parts of `librustc_driver` they touched. Read-only
-  file pages could share a frame through `akuma-fpcache`, as amd64's do. That needs every Taoxichuan write
-  path (its own write arms and `shared_writeback`, not only `akuma-vfs-glue`'s) to call
-  `akuma_fpcache::invalidate_inode` first: a stale shared page would be a silent miscompile, since cargo
-  rewrites the `.rmeta` files `rustc` maps.
-- **`PROT_NONE` is not enforced.** A lazy record could carry it now, but the present-page half is a
-  separate change.
+- **Sharing** and **`PROT_NONE`**, left open here, are fixed in
+  [`TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md`](TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md).
 - **A page table per reservation.** A lazy reservation costs 2 KiB of tables per MiB before any page is
   touched. A 4 GiB `PROT_NONE` cage would be 8 MB of tables.
 

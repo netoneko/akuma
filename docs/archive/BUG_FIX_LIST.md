@@ -13,28 +13,28 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1481
-- **Docs contributing at least one fix:** 415
+- **Total distinct fixes counted:** 1488
+- **Docs contributing at least one fix:** 420
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
 | Syscall / ABI Compatibility Audits | 245 | 16.5% | 35 |
-| Memory & Virtual Memory | 177 | 12.0% | 58 |
-| Scheduler & Process Management | 139 | 9.4% | 43 |
-| SMP & Locking | 136 | 9.2% | 56 |
-| Networking | 95 | 6.4% | 36 |
+| Memory & Virtual Memory | 180 | 12.1% | 60 |
+| Scheduler & Process Management | 139 | 9.3% | 43 |
+| SMP & Locking | 136 | 9.1% | 56 |
+| Networking | 96 | 6.5% | 37 |
 | Userspace Apps & Libraries | 40 | 2.7% | 21 |
-| Rump Kernel & Syscall Proxy | 26 | 1.8% | 6 |
+| Rump Kernel & Syscall Proxy | 26 | 1.7% | 6 |
 | Toolchain & Self-Hosting | 91 | 6.1% | 13 |
-| SSH | 39 | 2.6% | 18 |
-| VFS & Filesystem | 134 | 9.0% | 40 |
+| SSH | 40 | 2.7% | 19 |
+| VFS & Filesystem | 136 | 9.1% | 41 |
 | Boot & Drivers | 141 | 9.5% | 22 |
 | Signals & Exceptions | 40 | 2.7% | 15 |
 | Misc / Cross-cutting | 64 | 4.3% | 23 |
 | Console & Terminal | 58 | 3.9% | 18 |
 | Containers | 56 | 3.8% | 11 |
-| **Total** | **1481** | **100.0%** | **415** |
+| **Total** | **1488** | **100.0%** | **420** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -334,7 +334,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - glue's `pidfd_open` accepted `O_CLOEXEC` and made the fd close-on-exec only on request; Linux accepts only `PIDFD_NONBLOCK`, answers `EINVAL` for anything else and makes every pidfd close-on-exec (found by `pidfdprobe` on Linux 6.17 first; fixed for all three kernels)
 - `rt_sigpending` (x86_64 127, asm-generic 136) was served by no kernel: no abi row, no glue arm; new `signal::sys_rt_sigpending` (Linux's `do_sigpending`) routed on all three
 
-## Memory & Virtual Memory (177 fixes, 58 docs)
+## Memory & Virtual Memory (180 fixes, 60 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -630,6 +630,13 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/KVM_GUEST_RAM_CAP_LIFTED.md
 - Guest RAM was capped at 1 GiB by the NPT's single directory page of 2 MiB leaves, echoed by `MAX_RAM_MIB = 1024` in the spec crate and `GPA_LIMIT = 1 << 30` in the memslot table, so any bigger VM was refused before boot (the self-hosting fixed point needs 3 GiB); the layout is now `akuma_svm_amd64::rammap` — flat to 3 GiB, then the PC shape: the 3..4 GiB device window (virtio-mmio, local APIC) stays unmapped and excess RAM moves above 4 GiB, with the NPT growing one directory page per RAM-holding GiB, the PVH memory map reporting both extents, and memslots refused in/across the window
+
+### docs/archive/KVM_GUEST_4GIB_PVH_HANDOFF.md
+- `pvh::plan` put cmdline, memmap and `hvm_start_info` under the top of the **upper** RAM extent, above 4 GiB, and the PVH entry hands the guest that address in 32-bit EBX, so a 4 GiB guest read a truncated pointer and stopped at `no hvm_start_info magic`; the handoff pages sit under the top of the low extent whatever the RAM size
+- `write_start` always wrote `memmap_entries = 1` and only `add_acpi` (never called for an Akuma guest, which scans for its RSDP) corrected it, so the 4 GiB guest saw its low 3 GiB; the count comes from the layout
+
+### docs/archive/TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md
+- `akuma_vfs_glue::write_at_open_file`, the by-inode write, never invalidated the shared file-page cache, and its `_or_path` caller invalidated by path, which for a file unlinked while open names nothing (and amd64's `msync` write-back calls it directly), so a cached page of the inode kept serving the bytes from before the write; it invalidates by inode after the write
 
 ## Scheduler & Process Management (139 fixes, 43 docs)
 
@@ -1121,7 +1128,7 @@ aren't recorded anywhere else.)
 - `/proc/stat` reported cpu0 100 % busy with an idle guest: `allow_tick` halted inside the calling task without crediting the halted time (`idle_loop` already did), so a core whose only task halts that way read fully busy; TSC measurement showed 12-13 % and `allow_tick` now credits its halt.
 - A task spinning on the hypervisor's device lock while holding the BKL deadlocked against a holder that needed the BKL back (found with on-demand cores, `smp::ensure_started`); `lock_dev` now drops the BKL between attempts.
 
-## Networking (95 fixes, 36 docs)
+## Networking (96 fixes, 37 docs)
 
 ### docs/archive/KVM_RELAY_SYN_STALL.md
 - The KVM host relay wedged on the ryzen under overlapping sessions: a forward slot reused one source port for every connection and the gateway's TCP sent its SYN once (no retransmit), so a guest holding the previous connection on that tuple never answered, the slot stayed `connecting`, the listen backlog filled and the port refused. Fixed with a rotating source-port generation per slot and a SYN retry (4 s) that gives up by resetting the client (`Gateway::fwd_reopen`, `relay.rs`); the SYNs a first 1.5 s retry chased were slow, not lost
@@ -1290,6 +1297,9 @@ aren't recorded anywhere else.)
 
 ### docs/archive/AKUMA_VIRTIO_IN_TREE.md
 - the in-tree `NetRaw::send` sent the Ethernet frame verbatim where `virtio-drivers`' `send` had chained a zeroed `virtio_net_hdr` in front, so QEMU read the frame's first 12 bytes as the header: DHCP was never answered and ssh never connected while the disk on the same ring code worked; `send` now chains a static zero header descriptor ahead of the frame
+
+### docs/archive/UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS.md
+- `read`/`write` on an AF_UNIX socket moved raw bytes through the endpoint's pipe and skipped the record queue `recv`/`send` use, so Rust std's exec-failure report over a `SOCK_SEQPACKET` pair was invisible: cargo read EOF as "exec succeeded" (and never took its `@argfile` retry), or the parent's `recv` spun with the BKL held and wedged the guest; both arms delegate to `unix_send`/`unix_recv` when the fd has a table entry
 
 ## Userspace Apps & Libraries (40 fixes, 21 docs)
 
@@ -1537,7 +1547,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_MAC_BUILT_KERNEL_METAL_HANG.md
 - `overlays/ryzen/cycle.py` could install a truncated kernel: `ship()` ran `cat > x.new && mv x.new x`, and when the local ssh timeout killed the client the remote `cat` saw EOF and exited 0, so `mv` renamed the partial file (8.8 of 10.5 MB); it now uploads to `.new`, checks the md5 and renames only on a match
 
-## SSH (39 fixes, 18 docs)
+## SSH (40 fixes, 19 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - Every SSH session ran as one future inside a single `sshd` process, so `panic = "abort"` — which is process-wide, not future- or thread-scoped — meant *any* panic on *any* connection dropped every other live session with it. `PROTOCOL_UNDER_LOAD.md` fixed the one known trigger (a malformed pre-KEX packet) while explicitly noting the blast radius itself remained; this closes that. Each accepted connection is now served by its own `fork()`ed child, which inherits the socket through the fd-table copy (`FdTable::clone_deep_for_fork` → `socket_clone_ref`, refcounted on close by `remove_socket` — machinery that already existed and was already correct for this case). Zero kernel changes were needed: `docs/MISSING_SOCKET_MACHINERY.md` had concluded the handoff was unbuildable, having surveyed `sys_spawn`, `SCM_RIGHTS` and procfs but not `fork()`, where the fd is never handed over at all. Verified by SIGKILLing one live session under load — exactly one peer ended, three ran to completion, the server kept serving. Bounded by a new `max_sessions` (default 24) against the global `MAX_PROCESSES = 64`, since a fully-occupied session now costs two process slots. On by default (`fork-sessions`); `SSHD_FORK_SESSIONS=0` reverts to the cooperative executor for memory-constrained images
@@ -1616,7 +1626,10 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_SSH_CLIENT_TOFU_PROMPT_CR.md
 - the `ssh` client's host-key prompt broke only on `\n` and discarded `\r`, and a terminal in raw mode sends CR for Enter — so answering the TOFU prompt did nothing, forever, with the typed `yes` already consumed; the fix echoes what it accepts, which is what makes the prompt answerable at all
 
-## VFS & Filesystem (134 fixes, 40 docs)
+### docs/archive/SSHD_SESSION_WITHOUT_PATH.md
+- `session_env` stopped being empty when `HOME` was added (2026-10-17), so the kernel's `DEFAULT_ENV` and its `PATH` no longer applied and exec sessions ran with no `PATH` at all: gcc's `make_relative_prefix` fell back to `../` and `posix_spawnp("cc1")` failed with `ENOENT`; the session always gets Alpine's `PATH`
+
+## VFS & Filesystem (136 fixes, 41 docs)
 
 ### docs/archive/AKUMA_EXT2_CLEANUP.md
 - §2.3: `read_inode` heap over-read (UB) — a rev-1 superblock's `inode_size` was taken off disk with no minimum check, so an image with `inode_size < 128` blitted a whole `Inode` out of a smaller allocation
@@ -1833,6 +1846,10 @@ aren't recorded anywhere else.)
 - `proc.get_fd` deep-cloned the `FileDescriptor`, snapshot included, so every `getdents64` still paid a full clone (70 ms/call on the metal); `SharedFdTable::with_fd` borrows the live entry in place (a 4,038-call stream in 446 ms)
 - Every `stat`/`open`/`exec` path component read the whole directory (`lookup_path` -> `read_inode_data` + `parse_directory`), 238 ms per `stat` in that directory; `Ext2Filesystem::find_in_dir` scans block by block and stops at the match (50 stats: 11.9 s -> 0.58 s)
 - herd's `hda-capture` service (`restart = true`, exits at once) wrote a `dmesg-boot-<ts>.txt` into `/root` every ~3 s, 146,113 files and a 5.5 MiB directory in ten days, which is what turned every lookup into a linear scan; the script writes `/var/log/dmesg/hda-boot-*.txt` pruned to the newest 20 and the service is disabled
+
+### docs/archive/EXT2_DIRENT_TYPE_WITHOUT_FILETYPE.md
+- `add_dir_entry` and `create_dir`'s `.`/`..` wrote a dirent type into byte 7 on filesystems without `INCOMPAT_FILETYPE`, where that byte is the high half of `name_len` and must be 0, so e2fsck cleared 42,815 entries of the Infinity guest's disk; the type is written only when the superblock declares the feature
+- `read_dir` took byte 7 alone as the type, and `DirEntry` has no "unknown", so a 0 read as "regular file": after e2fsck every directory the guest had made listed as a file and git saw them all as untracked; the byte is trusted only with the feature and nonzero, otherwise the inode decides
 
 ## Boot & Drivers (141 fixes, 22 docs)
 
@@ -2463,3 +2480,5 @@ Also scanned 2026-10-23 (the `kvm-part-1` branch — the SVM hypervisor, `kvm0` 
 Also scanned 2026-10-24 (the Firecracker guest hang on `kvm-part-1`: 5 code commits, 1 archive doc). Counted above: FIRECRACKER_GUEST_HANG, two fixes. It **resolves** the `/dev/net/tun` guest wedge that AKUMA_FIRECRACKER_KVM and the 2026-10-23 paragraph above call open — that wedge was the first of the two counted fixes, not a tap or virtio-net defect, so AKUMA_FIRECRACKER_KVM gains no bullet. UDP_REPLY_WAIT_TIMER_STORM gained a correction (its second `recvfrom` was the second fix) and no bullet. Fix-shaped commits with no archive doc to cite, named rather than left silent: the `num_buffers = 1` in `tun::read_frame` (a correct but unrelated hardening of the receive header, not a counted defect) and the `evring`/`strace_pid` instrumentation (diagnostic aids, no defect).
 
 Also scanned 2026-11-02 (closing `rust-org-il-experiment`, 536 commits and about 70 archive docs, most of them the Taoxichuan experiment and its cleanup). Counted above: DUP_LOST_O_NONBLOCK, TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND (two shared-glue fixes), AKUMA_VIRTIO_IN_TREE, AMD64_BOX_SPAWN_EXT_REGRESSION, KVM_GUEST_DISK_856_MIB_RACE, AUDIT_SURFACE_METHODOLOGY, TAOXICHUAN_CLEANUP_PLAN (its one amd64 fix), KVM_GUEST_RAM_CAP_LIFTED, and the two shared-crate bullets of TAOXICHUAN_BUGS_FOUND_2026_10_30. **Every Taoxichuan-only fix moved to `TAOXICHUAN_BUG_FIX_LIST.md`**, including the six that were counted here under TAOXICHUAN_BUGS_FOUND_2026_10_30 and the TAOXICHUAN_SMP fixes (`dac8a275`, the AP's `IA32_APIC_BASE` enable; `5108b5e5`, which this paragraph used to name, is TAOXICHUAN_CARGO_STALL_REGRESSION's pipe-EOF fix and is counted there). No counted fix, open by their own text: AKUMA_RYZEN_HERD_STOP_GUEST_RESET (the ryzen reset on `herd stop goose-glm`, seen once), AMD64_THREADPROBE_EXIT_ZERO_FLAKE (logged as a flake by decision), GOOSE_SERVE_IDLE_SPIN, HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD. No fix, measurement or record: AKUMA_SYSCALLS_TOKIO_DEP_ANALYSIS, CLONE_AUDIT_2026_11_01 and CLONE_AND_MUT_BUDGETS (the audit's findings are not done), LINE_COUNT_ANALYSIS_POST_AMD64, RUST_ORG_IL_TALK, GOOSE_GLM_SERVE_ON_RYZEN (setup; its traps are workarounds), MINIMAL_SELF_HOSTING_EXPERIMENT (the brief). The branch's edits to AKUMA_FIRECRACKER_AMD64, AKUMA_FIRECRACKER_KVM, AKUMA_KVM_DEV_CYCLE and AMD64_J4_BUILD_CRASH_HUNT add no fix. AKUMA_AMD64_SCHED_CRATE's one fix is Taoxichuan's (the trace build's idle-lap dump) and is counted there. No doc to cite: `d6ee7d97` (`akuma-threading`'s x86 fresh-thread trampoline never released the outgoing thread's `ON_CPU` gate, so the first switch to a never-run thread could leave its predecessor unschedulable; named only as a bisect row in TAOXICHUAN_CARGO_STALL_REGRESSION).
+
+Also scanned 2026-11-03 (the Infinity run on Taoxichuan and what it left open). Counted above: EXT2_DIRENT_TYPE_WITHOUT_FILETYPE, KVM_GUEST_4GIB_PVH_HANDOFF, UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS, SSHD_SESSION_WITHOUT_PATH and the one shared-glue bullet of TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES. The rest of INFINITY_ON_TAOXICHUAN, TAOXICHUAN_EXEC_ARGV_LIMIT, TAOXICHUAN_EXEC_SHEBANG and TAOXICHUAN_LAZY_MMAP are Taoxichuan's and are counted there. KVM_GUEST_RAM_CAP_LIFTED's new paragraph corrects two of its statements and points at KVM_GUEST_4GIB_PVH_HANDOFF, where those fixes are counted. The edits to MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG, TAOXICHUAN_CLEANUP_PLAN, TAOXICHUAN_FIXED_POINT and RUST_ORG_IL_TALK add no fix.

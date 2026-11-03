@@ -388,6 +388,13 @@ fn session_env(session: &SshSession) -> Vec<String> {
     env.push(String::from("HOME=/root"));
     env.push(String::from("USER=root"));
     env.push(String::from("LOGNAME=root"));
+    // PATH always, as OpenSSH sets it (Alpine's `/etc/profile` value). busybox
+    // ash searches a built-in default but does not export it, so without this
+    // every program the session runs saw no PATH at all: gcc could not find
+    // its own directory (libiberty's `make_relative_prefix` searches
+    // `getenv("PATH")`), fell back to the relative prefix `../`, and
+    // `posix_spawnp("cc1")` failed with ENOENT (2026-11-03).
+    env.push(String::from("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"));
     if session.pty_requested && !session.term_type.is_empty() {
         env.push(format!("TERM={}", session.term_type));
     }

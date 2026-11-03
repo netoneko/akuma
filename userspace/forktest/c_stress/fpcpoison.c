@@ -65,6 +65,13 @@
  * dead parent costs seconds rather than a wedged core. */
 #define GATE_SPIN_LIMIT 200000000L
 
+/* The spin-wait hint: AArch64's `yield`, x86's `pause`. */
+#if defined(__x86_64__)
+#define SPIN_HINT() __asm__ __volatile__("pause" ::: "memory")
+#else
+#define SPIN_HINT() __asm__ __volatile__("yield" ::: "memory")
+#endif
+
 static uint64_t fnv1a(const unsigned char *p, size_t n) {
     uint64_t h = 0xcbf29ce484222325ULL;
     for (size_t i = 0; i < n; i++) {
@@ -135,7 +142,7 @@ static void child_pass(const char *path, const uint64_t *ref, size_t npages,
             if (getppid() == 1) _exit(3);   /* parent died — do not spin on */
             break;                          /* proceed un-gated rather than hang */
         }
-        __asm__ __volatile__("yield" ::: "memory");
+        SPIN_HINT();
     }
 
     int bad = 0;
@@ -219,7 +226,7 @@ int main(int argc, char **argv) {
                                 "releasing anyway\n", c->ready, nprocs);
                 break;
             }
-            __asm__ __volatile__("yield" ::: "memory");
+            SPIN_HINT();
         }
         c->gate = 1;
 

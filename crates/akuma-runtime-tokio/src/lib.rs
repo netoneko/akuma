@@ -61,7 +61,8 @@ pub fn install(k: Kernel) {
         fs_exists: akuma_vfs_glue::exists,
         probed_core_count: k.online_cpus,
         utc_time_us: k.utc_time_us,
-        // No file-page cache: mmap populates eagerly.
+        // Glue's `fs::init` would call this; a tokio kernel mounts its root
+        // itself and arms the file-page cache there (Taoxichuan: `mount_root`).
         fpcache_init: |_| {},
         // Nothing renders `/proc/<pid>/maps` rows from here.
         pid_map_rows: |_| None,

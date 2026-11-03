@@ -969,6 +969,14 @@ fn mount_root(fs: alloc::sync::Arc<dyn Filesystem>) {
     // until this flag is set. AArch64's `fs::init` sets it; this kernel mounts
     // ext2 itself, as amd64 does, and sets it at the same point.
     akuma_vfs_glue::fs::mark_initialized();
+    // The shared file-page cache (`lazy.rs`), and what keeps it honest when an
+    // inode number is reissued. AArch64's `fs::init` does both; this kernel
+    // mounts ext2 itself, so it does them here. Every write through
+    // `akuma-vfs-glue` invalidates by inode already, and `shared_writeback`
+    // does for the one write this kernel makes itself.
+    #[cfg(feature = "disk")]
+    akuma_ext2::init_inode_freed_hook(akuma_fpcache::invalidate_inode);
+    akuma_fpcache::init(akuma_pmm::total_count() * 4096);
     // `/proc`: the shared `ProcFilesystem`, rendering `akuma-exec`'s process
     // table (`<pid>/exe`, which musl's `$ORIGIN` expansion reads; `meminfo`;
     // `<pid>/fd`). Glue's `readlinkat` and friends answer through it.
@@ -1122,8 +1130,11 @@ impl Task {
 /// `tcc -run` and every JIT work: the code is written RW, then flipped to RX,
 /// and a page mapped RW-non-exec faults on the fetch.
 ///
-/// `PROT_NONE` stays a no-op: guard pages are not enforced, and unmapping the
-/// frame would lose the contents a later `mprotect(RW)` must give back.
+/// `PROT_NONE` keeps a present page's frame and clears its user bit: ring 3
+/// faults on any access, the kernel's copies refuse it (`EFAULT`), and fork,
+/// teardown and the share counts see an ordinary present page, so a later
+/// `mprotect(RW)` gives the contents back. A lazy page's record is marked
+/// `none` and is never filled.
 fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
     if addr & 0xFFF != 0 {
         return e(ring3::err::EINVAL);
@@ -1136,10 +1147,9 @@ fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
         return e(ring3::err::ENOMEM);
     }
     #[allow(clippy::verbose_bit_mask)] // PROT_NONE is spelled as the bits it lacks
-    if prot & 7 == 0 {
-        return 0;
-    }
-    let want = PteProt { write: prot & ring3::mmap::PROT_WRITE != 0, exec: prot & ring3::mmap::PROT_EXEC != 0, user: true };
+    let none = prot & 7 == 0;
+    let want =
+        PteProt { write: prot & ring3::mmap::PROT_WRITE != 0, exec: prot & ring3::mmap::PROT_EXEC != 0, user: !none };
     let root = task_root();
     // W^X: decided for the whole range before any page changes, so a refusal leaves it as it was.
     if wx_on()
@@ -1149,7 +1159,7 @@ fn mprotect_arm(addr: u64, len: u64, prot: u64) -> u64 {
     }
     for i in 0..pages {
         let va = (addr + i * 4096) as usize;
-        if lazy::reprotect(root, va as u64, want.write, want.exec) {
+        if lazy::reprotect(root, va as u64, want.write, want.exec, none) {
             continue;
         }
         // The remap below builds a fresh PTE; carry "written" across it or the policy forgets.
@@ -1238,6 +1248,8 @@ fn shared_writeback(lo: u64, hi: u64, forget: bool) {
                         let mut page = [0u8; 4096];
                         frame.read_bytes(0, &mut page[..n]);
                         let _ = root_fs().write_at_by_inode(ino, file_off as usize, &page[..n]);
+                        // A cached read-only page of this file now holds the old bytes.
+                        akuma_fpcache::invalidate_inode(ino);
                     }
                 }
                 va += 4096;
@@ -1445,11 +1457,16 @@ impl akuma_user_walk::Walk for TaskWalk {
 /// The frame behind the page holding `va`, filling it first if it is lazy: the
 /// kernel's copies walk the page table and never fault, so they are where a
 /// lazy page meets its first kernel access.
+///
+/// `None` (`EFAULT`) for a page ring 3 cannot reach either: a `PROT_NONE`
+/// page keeps its frame with the user bit clear, and a syscall buffer there is
+/// `EFAULT` on Linux too.
 fn translate_filling(root: u64, va: u64) -> Option<u64> {
     let page = (va & !0xFFF) as usize;
-    paging::translate_in(root, page).or_else(|| {
+    let pa = paging::translate_in(root, page).or_else(|| {
         (lazy::fill(root, va, true) == lazy::Fill::Present).then(|| paging::translate_in(root, page)).flatten()
-    })
+    })?;
+    leaf_entry(root, page as u64).is_some_and(|pte| pte.read() & akuma_pte_amd64::US != 0).then_some(pa)
 }
 
 fn task_walk() -> TaskWalk {
@@ -1997,24 +2014,30 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
                     None => return e(ring3::err::ENOMEM),
                 }
             };
-            // Mappings are RW, except that exec is exec: with W^X on, a `PROT_EXEC` mapping is RX - `W|X`
-            // was refused above, so it asked for no write - and a page can only become executable if the
-            // program never wrote it. With `wx=0` the old widening to RWX is back.
+            // Writable only when asked, as `mprotect` already was: a `PROT_READ` file page is what the
+            // shared file-page cache can hand to every mapper (`lazy::fill`), and it was never shared
+            // while this widened it to RW. With W^X on, a `PROT_EXEC` mapping is RX - `W|X` was refused
+            // above, so it asked for no write - and a page can only become executable if the program
+            // never wrote it. With `wx=0` the old widening to RWX is back.
             let (write, exec) = if prot & ring3::mmap::PROT_EXEC == 0 {
-                (true, false)
+                (prot & ring3::mmap::PROT_WRITE != 0, false)
             } else if wx_on() {
                 (false, true)
             } else {
                 (true, true)
             };
-            let pte = PteProt { write, exec, user: true };
+            // `PROT_NONE`: a record nothing fills (or, eagerly, a page without the user bit).
+            #[allow(clippy::verbose_bit_mask)] // PROT_NONE is spelled as the bits it lacks
+            let none = prot & 7 == 0;
+            let pte = if none { PteProt { write: false, exec: false, user: false } } else { PteProt { write, exec, user: true } };
             const MAP_SHARED: u64 = 0x1;
             let shared_write = fnode.is_some() && flags & MAP_SHARED != 0 && prot & ring3::mmap::PROT_WRITE != 0;
             // Lazy (`lazy.rs`): one record per page now, a frame on the first touch. A writable shared file
             // mapping stays eager - its pages are written back by walking the present frames, and fork
             // copies them (`SharedSpans::Copy`) - and so does a file mapping whose offset is unaligned or
             // past what a record holds, or whose inode cannot be pinned.
-            let first = lazy::Lazy { write, exec, file: fnode.map(|inode| lazy::FilePage { inode, index: off / 4096 }) };
+            let first =
+                lazy::Lazy { write, exec, none, file: fnode.map(|inode| lazy::FilePage { inode, index: off / 4096 }) };
             let lazy_ok = !shared_write
                 && off.is_multiple_of(4096)
                 && lazy::fits(first, pages / 4096)
