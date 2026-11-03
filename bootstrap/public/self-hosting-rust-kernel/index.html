@@ -494,12 +494,14 @@
     <div class="body">
       <p class="eyebrow cool">Why Rust</p>
       <h2>The audit surface became a <span class="cool">number</span></h2>
-      <div class="figs">
-        <div class="fig"><span class="v hot">86 / 115</span><span class="k">crates forbid <code>unsafe</code></span></div>
-        <div class="fig"><span class="v">98.6%</span><span class="k">production lines outside any <code>unsafe</code></span></div>
-        <div class="fig"><span class="v">218 &rarr; 35</span><span class="k">inline <code>asm!</code> sites outside <code>akuma-cpu</code></span></div>
-        <div class="fig"><span class="v">17 &rarr; 0</span><span class="k"><code>unsafe</code> blocks in the syscall layer</span></div>
-      </div>
+      <div class="scroller"><table>
+        <thead><tr><th>Date</th><th>Where the port was</th><th class="r">Crates</th><th class="r">Auditable lines</th><th class="r"><code>unsafe</code> sites</th><th class="r"><code>unsafe</code> share</th></tr></thead>
+        <tbody>
+          <tr><td>2026-09-02</td><td>before the amd64 port</td><td class="r">52</td><td class="r">52,814</td><td class="r">374</td><td class="r">2.8%</td></tr>
+          <tr><td>2026-09-20</td><td>after the port&rsquo;s cleanup</td><td class="r">70</td><td class="r">76,350</td><td class="r">714</td><td class="r">3.4%</td></tr>
+          <tr><td>2026-10-17</td><td>port stabilized</td><td class="r">86</td><td class="r">101,133</td><td class="r">811</td><td class="r">2.8%</td></tr>
+          <tr class="self"><td>2026-10-24</td><td>after KVM</td><td class="r">101</td><td class="r">118,115</td><td class="r hot">485</td><td class="r hot">1.5%</td></tr>
+        </tbody></table></div>
       <ul>
         <li><strong>Composition:</strong> 93% of Taoxichuan&rsquo;s live lines were already live in Akuma, and a second kernel, Osaka, is 10 lines.</li>
         <li><strong>Host tests in leaf crates:</strong> the first test of the extracted <code>madvise</code> found that <code>madvise(addr, -1, DONTNEED)</code> looped over ~4.5e15 pages, reachable from unprivileged userspace.</li>
