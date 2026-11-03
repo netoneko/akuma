@@ -46,17 +46,16 @@
   .deck {
     height: 100dvh;
     overflow-y: auto;
-    scroll-snap-type: y mandatory;
-    scroll-behavior: smooth;
+    scroll-snap-type: y proximity;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
     scrollbar-width: none;
   }
   .deck::-webkit-scrollbar { display: none; }
-  @media (prefers-reduced-motion: reduce) { .deck { scroll-behavior: auto; } }
 
   .slide {
     min-height: 100dvh;
     scroll-snap-align: start;
-    scroll-snap-stop: always;
     display: grid;
     grid-template-columns: var(--rail) 1fr;
     align-items: center;
@@ -771,18 +770,29 @@ fn main(kernel: akuma_tokio_kernel::Kernel) -&gt; ! {
   }
   function go(i) {
     i = Math.max(0, Math.min(slides.length - 1, i));
-    slides[i].scrollIntoView({ block: 'start' });
+    var calm = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    slides[i].scrollIntoView({ block: 'start', behavior: calm ? 'auto' : 'smooth' });
     mark(i);
   }
 
-  if ('IntersectionObserver' in window) {
-    var io = new IntersectionObserver(function (entries) {
-      entries.forEach(function (e) {
-        if (e.isIntersecting && e.intersectionRatio > 0.5) mark(slides.indexOf(e.target));
-      });
-    }, { threshold: [0.5, 0.75] });
-    slides.forEach(function (s) { io.observe(s); });
+  // The current slide is the one covering the most of the viewport, not the
+  // first one to cross a threshold: a sliver of the next slide never wins,
+  // and a slide taller than the viewport still counts.
+  var queued = false;
+  function pick() {
+    queued = false;
+    var vh = deck.clientHeight, top = deck.getBoundingClientRect().top;
+    var best = current, bestCover = -1;
+    for (var n = 0; n < slides.length; n++) {
+      var r = slides[n].getBoundingClientRect();
+      var cover = Math.min(r.bottom - top, vh) - Math.max(r.top - top, 0);
+      if (cover > bestCover) { bestCover = cover; best = n; }
+    }
+    mark(best);
   }
+  deck.addEventListener('scroll', function () {
+    if (!queued) { queued = true; requestAnimationFrame(pick); }
+  }, { passive: true });
   ticks[0].setAttribute('aria-current', 'true');
 
   document.addEventListener('keydown', function (e) {
