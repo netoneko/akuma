@@ -212,6 +212,7 @@
     overflow-x: auto;
   }
   pre .d { color: var(--dim); }
+  pre.src { font-size: clamp(0.6rem, 0.78vw, 0.74rem); line-height: 1.5; }
   pre .out { color: var(--shu); }
 
   .figs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(8.5rem,100%),1fr)); gap: 1px; background: var(--rule-soft); border: 1px solid var(--rule-soft); }
@@ -536,7 +537,25 @@
 	    <p class="eyebrow cool">Kernel that only runs <span class="m">tokio</span></p>
       <h2>Install a kernel from crates.io, and have your whole supply chain hijacked</h2>
 <div class="split even">
-        <div class="col"><ul><li>The future is now.</li><li>GLM wrote a second kernel, <strong>Shanghai</strong>, while running on <strong>Taoxichuan</strong> from a crate&rsquo;s README, and it ran on <strong>Akuma</strong>.</li><li>As a regrettable side effect, Python runs too.</li></ul></div>
+        <div class="col"><ul><li>The future is now.</li><li>GLM wrote a second kernel, <strong>Shanghai</strong>, while running on <strong>Taoxichuan</strong> from a crate&rsquo;s README, and it ran on <strong>Akuma</strong>.</li><li>As a regrettable side effect, Python runs too.</li></ul>
+          <pre class="src"><span class="d">//! Shanghai: a kernel built from the `akuma-tokio-kernel` README. The whole</span>
+<span class="d">//! kernel is this file plus a skyline.</span>
+
+#![no_std]
+#![no_main]
+
+akuma_tokio_kernel::entry!(main);
+
+fn main(kernel: akuma_tokio_kernel::Kernel) -&gt; ! {
+    kernel
+        .name("Shanghai")
+        .banner(include_str!("banner.txt"))
+        .console()
+        .disk()
+        .net()
+        .smp()
+        .run_init()
+}</pre></div>
         <svg class="loop nest" viewBox="0 0 500 282" role="img" aria-labelledby="nest-t nest-d">
           <title id="nest-t">Nesting: Akuma, Taoxichuan, goose, Shanghai</title>
           <desc id="nest-d">Akuma runs on bare metal and hosts KVM guests. One guest is Taoxichuan. Inside it, goose, talking to GLM, builds Shanghai, a second kernel. The Shanghai image boots as another guest on Akuma's KVM.</desc>
@@ -679,7 +698,7 @@
           <tr><td>Taoxichuan: the fixed point</td><td><a href="https://github.com/netoneko/akuma/blob/rust-org-il-experiment/docs/archive/TAOXICHUAN_FIXED_POINT.md">TAOXICHUAN_FIXED_POINT.md</a></td><td>K1 == K2, step by step</td></tr>
           <tr><td>Infinity: the log</td><td><a href="https://github.com/netoneko/akuma/blob/rust-org-il-experiment/docs/archive/INFINITY_ON_TAOXICHUAN.md">INFINITY_ON_TAOXICHUAN.md</a></td><td>GLM strips AWS out of an agent runtime and builds it</td></tr>
         </tbody></table></div>
-      <p class="link"><a href="https://github.com/netoneko/akuma">github.com/netoneko/akuma</a> <span class="m">&middot; branch <code>rust-org-il-experiment</code>, <code>docs/archive/</code></span></p>
+      <p class="link"><a href="https://github.com/netoneko/akuma">github.com/netoneko/akuma</a></p>
     </div>
   </section>
 
