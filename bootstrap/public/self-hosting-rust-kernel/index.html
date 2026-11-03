@@ -511,18 +511,19 @@
       <p class="eyebrow cool">Why Rust</p>
       <h2>Extraction is cheap, <span class="cool">build system is excellent</span></h2>
       <div class="scroller"><table>
-        <thead><tr><th>Date</th><th>Where the port was</th><th class="r">Crates</th><th class="r">Auditable lines</th><th class="r"><code>unsafe</code> sites</th><th class="r"><code>unsafe</code> share</th></tr></thead>
+        <thead><tr><th>Date</th><th>Where the port was</th><th class="r">Crates</th><th class="r">Forbid <code>unsafe</code></th><th class="r">Auditable lines</th><th class="r"><code>unsafe</code> sites</th><th class="r"><code>unsafe</code> share</th></tr></thead>
         <tbody>
-          <tr><td>2026-09-02</td><td>before the amd64 port</td><td class="r">52</td><td class="r">52,814</td><td class="r">374</td><td class="r">2.8%</td></tr>
-          <tr><td>2026-09-20</td><td>after the port&rsquo;s cleanup</td><td class="r">70</td><td class="r">76,350</td><td class="r">714</td><td class="r">3.4%</td></tr>
-          <tr><td>2026-10-17</td><td>port stabilized</td><td class="r">86</td><td class="r">101,133</td><td class="r">811</td><td class="r">2.8%</td></tr>
-          <tr><td>2026-10-24</td><td>after KVM</td><td class="r">101</td><td class="r">118,115</td><td class="r">485</td><td class="r">1.5%</td></tr>
-          <tr class="self"><td>2026-11-02</td><td>after Taoxichuan</td><td class="r">117</td><td class="r">123,209</td><td class="r hot">481</td><td class="r hot">1.4%</td></tr>
+          <tr><td>2026-09-02</td><td>before the amd64 port</td><td class="r">52</td><td class="r">32</td><td class="r">52,814</td><td class="r">374</td><td class="r">2.8%</td></tr>
+          <tr><td>2026-09-20</td><td>after the port&rsquo;s cleanup</td><td class="r">70</td><td class="r">50</td><td class="r">76,350</td><td class="r">714</td><td class="r">3.4%</td></tr>
+          <tr><td>2026-10-17</td><td>port stabilized</td><td class="r">86</td><td class="r">66</td><td class="r">101,133</td><td class="r">811</td><td class="r">2.8%</td></tr>
+          <tr><td>2026-10-24</td><td>after KVM</td><td class="r">101</td><td class="r">73</td><td class="r">118,115</td><td class="r">485</td><td class="r">1.5%</td></tr>
+          <tr class="self"><td>2026-11-02</td><td>after Taoxichuan</td><td class="r">117</td><td class="r">87</td><td class="r">123,209</td><td class="r hot">481</td><td class="r hot">1.4%</td></tr>
         </tbody></table></div>
       <ul>
-        <li><strong>Composition:</strong> 93% of <strong>Taoxichuan</strong>&rsquo;s live lines were already live in <strong>Akuma</strong>, and a second kernel, Osaka, is 10 lines.</li>
-        <li><strong>Host tests in leaf crates:</strong> the first test of the extracted <code>madvise</code> found that <code>madvise(addr, -1, DONTNEED)</code> looped over ~4.5e15 pages, reachable from unprivileged userspace.</li>
-        <li><strong>Types as the rule:</strong> <code>akuma-port</code> exposes devices, never a port number, so safe code cannot power the box off.</li>
+        <li><strong>Composition:</strong> the <strong>Taoxichuan</strong> kernel (a KVM guest) runs inside <strong>Akuma</strong> (the bare-metal KVM host), and 93% of its live lines were already live in <strong>Akuma</strong>.</li>
+        <li><strong>Traits and inversion of control:</strong> forced by the pre-port refactor, a crate states what it needs and leaves the kernel to provide it.</li>
+        <li><strong>Host-tested crates make debugging cheaper:</strong> the first test of the extracted <code>madvise</code> found that <code>madvise(addr, -1, DONTNEED)</code> looped over ~4.5e15 pages, reachable from unprivileged userspace.</li>
+        <li><strong>Isolation of <code>unsafe</code> in specific crates:</strong> 87 of 117 crates forbid it outright, and the rest keep it in small leaf crates.</li>
       </ul>
     </div>
   </section>
