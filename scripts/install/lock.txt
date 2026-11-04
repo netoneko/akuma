@@ -1,0 +1,11 @@
+# scripts/install/lock.txt — every download is pinned: sha256, url, arch.
+# Format: <sha256>  <url>  <arch>. A changed upstream file must fail the stage.
+# I1 scope: x86_64 guest pins plus host-tool pins used to reproduce the
+# maintainer's environment (the e2fsprogs apks give debugfs/mke2fs -d to hosts
+# whose stock mke2fs lacks them, e.g. busybox-only boxes). arm64 guest pins are
+# I4 work (busybox.net arm64 coverage must be checked first — proposal § fetch).
+6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348  https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox  x86_64
+45bd65d010dab09b9c908a613ccf9fa10e7552ce80e566a357135dbf1762dcdf  https://dl-cdn.alpinelinux.org/alpine/v3.19/main/x86_64/e2fsprogs-1.47.0-r5.apk  host-x86_64
+742a68821399e0a8d70420405bd7310e079bff6686f6d706bcbc724369a9c3f0  https://dl-cdn.alpinelinux.org/alpine/v3.19/main/x86_64/e2fsprogs-libs-1.47.0-r5.apk  host-x86_64
+c5598274b4cc0ad640fa2036cfc0bac4b87e6cc6c43eab4d2e6e5bdb93612257  https://dl-cdn.alpinelinux.org/alpine/v3.19/main/x86_64/libcom_err-1.47.0-r5.apk  host-x86_64
+e5bf3927d2c74e597ed3559aff7f575fd3b70b04e1086bad811cb486b7456b7e  https://dl-cdn.alpinelinux.org/alpine/v3.19/main/x86_64/e2fsprogs-extra-1.47.0-r5.apk  host-x86_64
