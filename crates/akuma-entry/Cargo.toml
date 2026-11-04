@@ -6,6 +6,7 @@ description = "The kernel's entry points: boot assembly, the secondary-core tram
 
 [dependencies]
 akuma-bkl = { path = "../akuma-bkl" }
+akuma-boot-aarch64 = { path = "../akuma-boot-aarch64" }
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-exceptions = { path = "../akuma-exceptions" }
 akuma-exec = { path = "../akuma-exec" }
@@ -25,7 +26,7 @@ akuma-psci = { path = "../akuma-psci" }
 extreme = []
 no-tests = []
 smp-shared = ["akuma-gic/smp-shared", "akuma-kernel-core/smp-shared", "akuma-exceptions/smp-shared"]
-platform-firecracker = ["akuma-kernel-core/platform-firecracker"]
+platform-firecracker = ["akuma-kernel-core/platform-firecracker", "akuma-boot-aarch64/platform-firecracker"]
 
 [lints]
 workspace = true

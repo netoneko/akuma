@@ -1,0 +1,18 @@
+[package]
+name = "akuma-boot-aarch64"
+version = "0.1.0"
+edition = "2024"
+description = "The AArch64 boot assembly (`_boot`: Image header, early page tables, MMU on, `rust_start(dtb)`) and the two machine constants it needs before Rust runs. A leaf, so a kernel that is not the main one (a tokio kernel) boots through the same code."
+
+# The device-window layout the UART's boot slot is derived from; only the
+# assembly reads it, and the assembly is only built for the kernel target.
+[target.'cfg(all(target_arch = "aarch64", target_os = "none"))'.dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+
+[features]
+# Firecracker's aarch64 microVM instead of QEMU virt: the console UART's
+# physical address and whether the 1 GiB block at 0x4000_0000 is device memory.
+platform-firecracker = []
+
+[lints]
+workspace = true

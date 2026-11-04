@@ -18,6 +18,7 @@ akuma-fpcache = { path = "../akuma-fpcache" }
 akuma-gic = { path = "../akuma-gic" }
 akuma-net = { path = "../akuma-net", default-features = false }
 akuma-pmm = { path = "../akuma-pmm" }
+akuma-boot-aarch64 = { path = "../akuma-boot-aarch64" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-syscalls-time = { path = "../akuma-syscalls-time" }
 akuma-timer = { path = "../akuma-timer" }
@@ -45,7 +46,7 @@ net-profile = ["akuma-net/net-profile"]
 # reads is `feature = "platform-firecracker"` on THIS package, so the toggle has
 # to exist here and be forwarded from every crate above (see
 # `akuma-kernel-glue/Cargo.toml`) — a missing forward silently picks QEMU virt.
-platform-firecracker = []
+platform-firecracker = ["akuma-boot-aarch64/platform-firecracker"]
 bkl-profile = []
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
 net-noalloc = ["akuma-net/net-noalloc"]

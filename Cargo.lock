@@ -190,6 +190,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-boot-aarch64"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+]
+
+[[package]]
 name = "akuma-boot-amd64"
 version = "0.1.0"
 dependencies = [
@@ -277,6 +284,7 @@ name = "akuma-entry"
 version = "0.1.0"
 dependencies = [
  "akuma-bkl",
+ "akuma-boot-aarch64",
  "akuma-cpu",
  "akuma-exceptions",
  "akuma-exec",
@@ -452,6 +460,7 @@ version = "0.1.0"
 name = "akuma-kernel-core"
 version = "0.1.0"
 dependencies = [
+ "akuma-boot-aarch64",
  "akuma-config",
  "akuma-cpu",
  "akuma-dmesg",
@@ -936,7 +945,21 @@ dependencies = [
 name = "akuma-tokio-kernel"
 version = "0.1.0"
 dependencies = [
+ "akuma-tokio-kernel-aarch64",
  "akuma-tokio-kernel-amd64",
+]
+
+[[package]]
+name = "akuma-tokio-kernel-aarch64"
+version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-boot-aarch64",
+ "akuma-cpu",
+ "akuma-primitives",
+ "akuma-psci",
+ "akuma-tokio-kernel-core",
+ "akuma-uart",
 ]
 
 [[package]]

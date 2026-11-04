@@ -40,42 +40,7 @@ pub mod boot;
 #[cfg(all(target_os = "none", kernel_smp_shared))]
 pub mod smp_shared;
 
-/// The absolute symbols `linker.ld` exports to describe the loaded image and the
-/// boot stack reserved above it.
-///
-/// These were declared inline in `kernel_main` (and, separately and identically,
-/// in `src/process_tests.rs`) until this crate existed. Reading a linker symbol's
-/// *address* is a safe operation — `&raw const` needs no `unsafe` block — so the
-/// only reason those call sites were unsafe at all was the `unsafe extern` block
-/// required to name the symbols. Naming them once here makes every consumer safe
-/// and stops the two declarations from drifting.
-///
-/// The values auto-track the binary: `linker.ld` derives the stack reservation
-/// from the actual linked size, so there is no per-profile `IMAGE_SIZE` constant
-/// to keep in lockstep.
+/// The absolute symbols `linker.ld` exports, in `akuma-boot-aarch64` beside the
+/// assembly that consumes them since 2026-11-04.
 #[cfg(target_os = "none")]
-pub mod linker_syms {
-    unsafe extern "C" {
-        static _kernel_phys_end: u8;
-        static STACK_BOTTOM: u8;
-        static STACK_TOP: u8;
-    }
-
-    /// One past the last byte of the linked kernel image.
-    #[must_use]
-    pub fn kernel_phys_end() -> usize {
-        &raw const _kernel_phys_end as usize
-    }
-
-    /// First page of the boot stack — the guard-adjacent low end, not the SP.
-    #[must_use]
-    pub fn stack_bottom() -> usize {
-        &raw const STACK_BOTTOM as usize
-    }
-
-    /// Initial SP: one past the top of the boot stack.
-    #[must_use]
-    pub fn stack_top() -> usize {
-        &raw const STACK_TOP as usize
-    }
-}
+pub use akuma_boot_aarch64::linker_syms;

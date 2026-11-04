@@ -61,8 +61,9 @@ pub mod qemu_virt {
     /// GICv3 redistributor region base. CPU *n*'s RD frame is
     /// `GICR_PA + n * GICR_STRIDE`; its SGI frame is that plus `GICR_SGI_OFFSET`.
     pub const GICR_PA: usize = 0x080A_0000;
-    /// PL011 UART — the console. Needed before the FDT is parsed.
-    pub const UART_PA: usize = 0x0900_0000;
+    /// PL011 UART — the console. Needed before the FDT is parsed, so it is
+    /// written down beside the boot assembly that maps it.
+    pub use akuma_boot_aarch64::machine::UART_PA;
     /// Base of the virtio-mmio slot array.
     pub const VIRTIO_PA: usize = 0x0A00_0000;
     /// Bytes between virtio-mmio slots. QEMU virt packs eight slots 0x200 apart,
@@ -74,12 +75,9 @@ pub mod qemu_virt {
     /// SPI *n* is INTID *n* + 32.
     pub const VIRTIO_INTID_BASE: u32 = 48;
 
-    /// Is the 1 GiB identity block at `0x4000_0000` device memory?
-    ///
-    /// No — on QEMU virt that block *is* RAM. See the Firecracker arm, where the
-    /// same range is the MMIO window and getting this wrong creates a
-    /// mismatched-attribute alias over live device registers.
-    pub const MMIO_WINDOW_IS_DEVICE: bool = false;
+    /// Is the 1 GiB identity block at `0x4000_0000` device memory? No — on
+    /// QEMU virt that block *is* RAM (the value lives beside the boot assembly).
+    pub use akuma_boot_aarch64::machine::MMIO_WINDOW_IS_DEVICE;
 
     /// Can a virtio-sound device appear here?
     ///
@@ -119,9 +117,9 @@ pub mod firecracker {
     /// core's frames — silently costing the boot core its timer interrupt. The
     /// FDT-derived map replaces it before any GIC access.
     pub const GICR_PA: usize = 0x3FFD_0000;
-    /// `layout::SERIAL_MEM_START` = `RTC_MEM_START + MMIO_LEN`
-    /// = `0x4000_0000 + 0x1000 + 0x1000`. PL011-compatible.
-    pub const UART_PA: usize = 0x4000_2000;
+    /// `layout::SERIAL_MEM_START`, PL011-compatible; written down beside the
+    /// boot assembly that maps it.
+    pub use akuma_boot_aarch64::machine::UART_PA;
     /// `layout::MEM_32BIT_DEVICES_START` = `SERIAL_MEM_START + MMIO_LEN`.
     pub const VIRTIO_PA: usize = 0x4000_3000;
     /// `device_manager::mmio::MMIO_LEN`. Each virtio device gets its own page,
@@ -134,11 +132,9 @@ pub mod firecracker {
     /// is SPI 32 — so slot 0 is INTID 32, not 48 as on QEMU virt.
     pub const VIRTIO_INTID_BASE: u32 = 32;
 
-    /// Yes — `0x4000_0000..0x8000_0000` is `MMIO32`, holding the RTC, the serial
-    /// port and every virtio slot. Mapping it Normal-cacheable (as the QEMU path
-    /// does, where it is RAM) would alias live device registers with mismatched
-    /// memory attributes, which the ARM ARM leaves CONSTRAINED UNPREDICTABLE.
-    pub const MMIO_WINDOW_IS_DEVICE: bool = true;
+    /// Yes — `0x4000_0000..0x8000_0000` is `MMIO32` (the value and the reason
+    /// live beside the boot assembly).
+    pub use akuma_boot_aarch64::machine::MMIO_WINDOW_IS_DEVICE;
 
     /// No sound device. Firecracker implements virtio net, block, balloon, vsock
     /// and rng — there is no virtio-sound to attach, and the device tree a live

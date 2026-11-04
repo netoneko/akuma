@@ -1,0 +1,28 @@
+[package]
+name = "akuma-tokio-kernel-aarch64"
+version = "0.1.0"
+edition = "2024"
+description = "The aarch64 machine half of akuma-tokio-kernel: boot through akuma-boot-aarch64's _boot, the PL011 console, and (as B21 lands) the traps, memory and devices the amd64 half has."
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-alloc = { path = "../akuma-alloc" }
+akuma-boot-aarch64 = { path = "../akuma-boot-aarch64" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-psci = { path = "../akuma-psci" }
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core" }
+akuma-uart = { path = "../akuma-uart" }
+
+[features]
+# The same switches as the amd64 half, so one main.rs builds for both. Only
+# `console` does anything yet; the rest arrive with B21 A5.3 onward.
+console = []
+disk = []
+net = []
+smp = []
+shell = []
+no-tests = []
+trace-err = []

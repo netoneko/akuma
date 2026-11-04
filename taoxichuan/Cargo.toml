@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Taoxichuan: the kernel the minimal-self-hosting experiment built (self-hosting fixed point 2026-10-31), now one main.rs over akuma-tokio-kernel."
 
-# Not in `default-members`: like `akuma-amd64`, this is an x86_64-only bin the
-# default (aarch64) build must never reach.
+# Not in `default-members`: a kernel bin built per target (`--target x86_64-unknown-none` or,
+# since B21 A5.2, `aarch64-unknown-none`), which the default build must never reach.
 [lints]
 workspace = true
 
