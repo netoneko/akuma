@@ -1,7 +1,13 @@
-# Autonomous agents for `proposals/INSTALL_SCRIPT.md`: setup log (2026-11-04)
+# Building a kernel with local AI: pain and suffering
 
-**Status: in progress. This records what was set up and what was observed, not results.** The Qwen endpoint is not
-verified; the ryzen goose server does not exist yet.
+A running log of trying to make a local model (Qwen3-8B, on an old i5 under Akuma) build and boot an Akuma kernel
+through `proposals/INSTALL_SCRIPT.md`, with other models (GLM via goose) doing the setup around it. Started
+2026-11-04. Newest sections are at the bottom; each one says what was believed, what was measured, and what was
+wrong. Dated sections below are a diary, not reference: the rules they established go in `docs/reference/` when
+they are proven.
+
+**Status (2026-11-04, night): the Qwen is served and the first agent test against it is running. Not finished.**
+(The rest of this section was written as the setup log; its "not verified" notes are superseded by Update 2.)
 
 ## Goal
 
@@ -170,3 +176,61 @@ What was done, in order:
 `litter/install-script` (`dabe4a5b`). A steer with the new URL was **not delivered** (`session/load` unanswered), so
 its poller was restarted on `.120` instead and `/root/install-work/QWEN-URL.txt` holds the note; G3 starts when the
 poller prints `QWEN_READY=` (it now has).
+
+## Update 3 (2026-11-04, late night): mmap, the page cache, and the mistakes
+
+### The crash is still a hypothesis
+Believed: llama.cpp with `--no-mmap` writes ~5 GB into fresh anonymous memory; the kernel hands out frames lazily on
+first touch (`mm::fault_in` -> `populate_page`), and when the PMM has none it logs `[MM] fault REFUSED ... why=oom`
+and the fault falls through to SIGSEGV (`idt.rs` `page_fault_trap` -> `user_fault`). No OOM killer, no ENOMEM, no
+SIGBUS. Evidence: exit 139 five times with 4.3 GB free and a model needing ~5 GB; a write `#PF` inside a mapped RW
+anonymous region; a clean start after 10 GB was freed. **Not yet seen:** the `why=oom` line (the dmesg ring had wrapped).
+The alternative is a race of two cores faulting one page. The repro (two 8B servers fill RAM, a third starts; read
+`why=` and the `[memwatch-at-kill] pmm_free=` line) is written but **not run**: I stopped the served Qwen once to run it,
+which broke the ryzen agent's first G3 attempt, so it waits until that test is done.
+
+### mmap (the 4B Q4_K_M, `-t 2`, same binary and box)
+| | `--no-mmap` | mmap (default) |
+|---|---|---|
+| generated tok/s | **7.26** | 2.54, 2.45 (two requests in a row, so not first-touch) |
+| prompt tok/s | 14.4 | 6.3, 2.2 |
+| load | ~40 s polling | 9 s (pages already cached) |
+| buffers | all weights copied to anonymous memory | `CPU_Mapped` 2362 MiB (the file) + `CPU_REPACK` 1683 MiB |
+| memory | "used" +2.5 GB | "used" +2.0 GB, "buff/cache" +2.4 GB |
+
+- The cache is real: it **stayed** (2,726 MB) after the server was killed, and `available` counted it. That is the
+  amd64 kernel's `akuma-fpcache`, shared across processes and evictable by `reclaim_clean_file_pages`.
+- mmap is ~3x slower for generation, steady state. **Cause unknown.** Candidates, none tested: file-backed PTEs
+  mapped with different attributes; the unrepacked tensors read straight from cache-hot-but-4K-mapped file pages;
+  the shared-page path taking a lock per fault. `perf`-style counters would settle it; a `fault REFUSED`-style
+  counter for the mapped region would too.
+- So mmap **does not** fix the throughput, but it changes the failure: with file pages evictable, memory pressure
+  should mean eviction and re-read, not SIGSEGV. **Untested; this is the experiment that matters.**
+
+### Taoxichuan and memory (facts from the tree, nothing run)
+- `taoxichuan/docs/reference/memory.md` says: "there is no page cache, so each mapping has its own copy". `taoxichuan/Cargo.toml`
+  has no `akuma-fpcache` dependency. The amd64 kernel and `akuma-tokio-kernel-amd64`/`-core` (`lazy.rs`, `mm.rs`) do.
+- `akuma-fpcache` is 558 lines, `forbid(unsafe)`, keyed `(inode, mount id, offset)`, refcounted through the CoW count,
+  configured by an `FpcacheConfig` at `init`. **Adding it to Taoxichuan is plausibly small, but it rides on B21's move of
+  the memory code into `akuma-tokio-kernel-core`**; check how much of `lazy.rs` Taoxichuan can adopt before calling it small.
+- Guest RAM: the README's example guest has `ram_mib=3072`; the running `vm-dev` on ryzen has `vm_ram_mib = 768`.
+  A 4.7 GB model does not fit either. With no page cache an mmap'd model would be a private copy in each process.
+  Only Qwen2.5-0.5B (491 MB) is plausible inside a 768 MiB guest, and not with a kernel-side cache of its own.
+  The sane split stays: model server on a real host, the Taoxichuan guest is the client.
+
+### Mistakes made today (so nobody repeats them)
+1. **Stopped the Qwen service while an agent was using it.** The repro needed the memory; the ryzen agent's G3 attempt
+   hit `Could not connect to 192.168.1.120:8081`. Check who is using a shared service before touching it.
+2. `grep -q done` matched the error text `can't open /tmp/qwen.done`; test for the file.
+3. `kill $!` on Akuma's `sh` does not kill the server; two 5 GB servers leaked and caused the crash above. Find the
+   leader pid by its `--port` in `ps` and `kill -9` that.
+4. Wrote the Qwen URL as `.123` into `wait_qwen.py` and the agent's brief; the box had moved to `.120`.
+5. A steer to the ryzen agent was **not delivered** (`session/load` unanswered). Do not assume a steer arrived;
+   put the correction in a file or the poller the agent already reads.
+6. An `e2fsck -fy` was refused by the permission classifier until the user said so explicitly.
+
+### Where it stands
+Ryzen agent `install-i1b` (80 tool calls) pushed `scripts/install.sh`, the runbook and `install.txt` to
+`litter/install-script` and is in G3, driving a goose session against the Qwen on trashcan. Verdict pending; a
+watcher is on the RESULT file. Next: G3 verdict, then the OOM repro, then mmap-under-pressure (does eviction replace
+the SIGSEGV?), then the Linux `llama-bench` thread sweep for the Akuma scaling cliff.
