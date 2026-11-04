@@ -1019,30 +1019,7 @@ fn banner() {
 /// nothing a task names at or above it may be mapped, read or written for it.
 pub(crate) const USER_TOP: u64 = 0x0000_8000_0000_0000;
 
-/// Top of the task's stack: canonical user half, far from anything the kernel
-/// places. 16 pages — far more than musl's startup touches, and cheap.
-const USER_STACK_TOP: u64 = 0x0000_7000_0000_0000;
-const USER_STACK_PAGES: u64 = 16;
-/// `brk` and anonymous `mmap` each get a fixed slab, registered as user
-/// regions up front so every user-pointer check is one range scan. Stage 6:
-/// Sized by what the heaviest guest needs, not by what hello needs: rustc's
-/// `--version` maps ~1 GiB of address space (measured; 64 MiB made it
-/// `ENOMEM` before it printed). The cost is only pages actually touched, and
-/// the range is far from PIE code (`PIE_BASE`) and the stack. The bounds are
-/// constants for now; the per-process memory model comes with stage 12.
-///
-/// 16 GiB since 2026-10-30: compiling this kernel in the guest needs more than 1 GiB of
-/// address space in ONE rustc - it maps the 311 MB `librustc_driver`, a ~17 MB stack per
-/// codegen thread and every dependency's rlib - and the old 1 GiB slab answered `ENOMEM` to
-/// the stack `mmap`, which musl's `pthread_create` reports as `EAGAIN` ("failed to spawn work
-/// thread", an ICE) with 2 GiB of RAM still free (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md`).
-/// Address space only: a page costs memory when it is mapped, not when it is reserved.
-const MMAP_SLAB: u64 = 0x4_0000_0000;
-/// Hole-table size per task (see `Task::holes`).
-const MAX_HOLES: usize = 64;
-/// `MAP_SHARED` mappings tracked per task: writable file ones (written back) and
-/// anonymous ones (shared across fork).
-const MAX_SHARED: usize = 32;
+use akuma_tokio_kernel_core::task::{BRK_SLAB, MMAP_BASE, MMAP_SLAB, USER_STACK_PAGES, USER_STACK_TOP, Task};
 /// errnos `akuma_ring3_amd64::err` does not carry.
 pub(crate) const EINTR: u64 = 4;
 /// Bisect mask for the mmap-slab rework, set from the kernel command line
@@ -1052,11 +1029,6 @@ static MMDBG_V: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 fn mmdbg() -> u32 {
     MMDBG_V.load(core::sync::atomic::Ordering::Relaxed)
 }
-/// `brk` sits above the image at `PIE_BASE` (0x1000_0000); the dynamic linker
-/// is placed at `INTERP_BASE` (0x3000_0000), so the brk window must stay under
-/// 512 MiB less the image: 256 MiB, not the 512 the plan first named.
-const BRK_SLAB: u64 = 0x1000_0000;
-const MMAP_BASE: u64 = 0x0000_6000_0000_0000;
 /// Cap on one `write(2)`: the console is a serial line, not a disk.
 const WRITE_LIMIT: u64 = 1 << 20;
 
@@ -1082,36 +1054,12 @@ fn inode_size(inode: u32) -> Option<u64> {
     root_fs().metadata_by_inode(inode).ok().map(|md| md.size)
 }
 
-/// A task's memory record: its root page table, its layout (the user ranges a pointer may
-/// name, the brk window, the mmap slab and its holes, the writable shared file mappings -
-/// `akuma-user-layout`, whose decisions the memory arms below act on), and the exit code once
-/// captured. Descriptors, cwd and signal state are the registered `akuma-exec` Process's.
-struct Task {
-    root_pa: u64,
-    layout: UserLayout,
-    exit: Option<u64>,
-}
-
-/// 16 user regions, [`MAX_HOLES`] slab holes, [`MAX_SHARED`] shared file mappings.
-type UserLayout = akuma_user_layout::Layout<16, MAX_HOLES, MAX_SHARED>;
-
-/// The task records. A [`BorrowCell`](akuma_primitives::cell::BorrowCell): reached only through [`with_task`] /
-/// [`with_task_slot`] / [`with_tasks`] / [`task_root_of`], so two overlapping borrows are a panic naming the bug. A closure
-/// therefore never calls anything that reaches a task record again: `user_ok`, `copy_from_user`/`copy_to_user`, `add_region`,
-/// the page-table walkers and every `child::` entry run with the borrow CLOSED — read what you need out, drop the borrow, then call.
-static TASKS: akuma_primitives::cell::BorrowCell<[Task; crate::child::NSLOTS + 1]> =
-    akuma_primitives::cell::BorrowCell::new([const { Task::new() }; crate::child::NSLOTS + 1]);
-/// Which task record the syscall path on each core acts on: the running
-/// thread's slot, set on every switch-in (`sched.rs`, `exec_twin`); 0 is the
-/// boot thread.
-static TASK_SLOT: [core::sync::atomic::AtomicUsize; smp::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicUsize::new(0) }; smp::MAX_CPUS];
-
-impl Task {
-    const fn new() -> Self {
-        Self { root_pa: 0, layout: UserLayout::new(MMAP_BASE, MMAP_SLAB), exit: None }
-    }
-}
+/// The task records (`akuma_tokio_kernel_core::task`), reached only through [`with_task`] /
+/// [`with_task_slot`] / [`task_root_of`]: a closure never calls anything that reaches a task
+/// record again (`user_ok`, the user copies, `add_region`, the page-table walkers, every
+/// `child::` entry).
+static TASKS: akuma_tokio_kernel_core::task::Tasks<{ crate::child::NSLOTS + 1 }, { smp::MAX_CPUS }> =
+    akuma_tokio_kernel_core::task::Tasks::new();
 
 /// `mprotect(addr, len, prot)`: re-map each present page of the range with
 /// the requested `R/W/X`, and give each lazy page (`lazy.rs`) the same
@@ -1385,26 +1333,26 @@ fn munmap_arm(addr: u64, len: u64) -> u64 {
 
 /// Which task record the syscall path acts on now.
 pub(crate) fn task_slot_index() -> usize {
-    TASK_SLOT[ring3::cpu_index()].load(core::sync::atomic::Ordering::Relaxed)
+    TASKS.current(ring3::cpu_index())
 }
 
 pub(crate) fn set_task_slot(i: usize) {
-    TASK_SLOT[ring3::cpu_index()].store(i, core::sync::atomic::Ordering::Relaxed);
+    TASKS.set_current(ring3::cpu_index(), i);
 }
 
 /// Run `f` on record `slot`.
 pub(crate) fn with_task_slot<R>(slot: usize, f: impl FnOnce(&mut Task) -> R) -> R {
-    TASKS.with_mut(|t| f(&mut t[slot]))
+    TASKS.with_slot(slot, f)
 }
 
-/// Run `f` on the record the syscall path acts on now (`TASK_SLOT`): the dispatcher's task.
+/// Run `f` on the record the syscall path acts on now (`TASKS.current`): the dispatcher's task.
 pub(crate) fn with_task<R>(f: impl FnOnce(&mut Task) -> R) -> R {
     with_task_slot(task_slot_index(), f)
 }
 
 /// The page-table root of record `slot`.
 pub(crate) fn task_root_of(slot: usize) -> u64 {
-    TASKS.with(|t| t[slot].root_pa)
+    TASKS.root_of(slot)
 }
 
 /// The page-table root of the record the syscall path acts on now.

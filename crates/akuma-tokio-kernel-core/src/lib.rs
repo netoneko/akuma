@@ -19,6 +19,7 @@ pub mod lazy_record;
 pub mod mmu;
 pub mod nosys;
 pub mod ring;
+pub mod task;
 #[cfg(feature = "shmpages")]
 pub mod shmpages;
 

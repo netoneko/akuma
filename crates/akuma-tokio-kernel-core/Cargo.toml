@@ -19,6 +19,7 @@ disk = ["shmpages", "dep:akuma-fpcache"]
 
 [dependencies]
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-user-layout = { path = "../akuma-user-layout" }
 akuma-fpcache-rw = { path = "../akuma-fpcache-rw", optional = true }
 akuma-fpcache = { path = "../akuma-fpcache", optional = true }
 akuma-vfs = { path = "../akuma-vfs", optional = true }

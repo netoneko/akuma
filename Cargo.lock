@@ -995,6 +995,7 @@ dependencies = [
  "akuma-mmu",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-user-layout",
  "akuma-vfs",
  "akuma-vfs-glue",
  "spinning_top",
