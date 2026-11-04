@@ -1,13 +1,14 @@
 //! A page that is reserved but not yet there, written into its own leaf entry.
 //!
-//! The CPU reads nothing of a leaf whose `P` bit is clear, so the other 63 bits
-//! are the software's: Linux keeps swap entries there. A kernel with no region
-//! table (Taoxichuan's `akuma-tokio-kernel-amd64`) keeps its **demand-paging
-//! record** there instead — what the page will be when it is first touched:
+//! Neither CPU reads anything of a leaf whose bit 0 is clear (`P` on amd64, the
+//! valid bit of an AArch64 descriptor), so the other 63 bits are the software's:
+//! Linux keeps swap entries there. A tokio kernel has no region table and keeps
+//! its **demand-paging record** there instead: what the page will be when it is
+//! first touched. The layout is the same on both architectures:
 //!
 //! | bits | field |
 //! |---|---|
-//! | 0 | `P`, always clear |
+//! | 0 | [`VALID`] (`P` / the descriptor's valid bit), always clear |
 //! | 1 | [`TAG`]: this entry is a lazy page, not an empty slot |
 //! | 2 | writable once present |
 //! | 3 | executable once present |
@@ -33,7 +34,7 @@
 //!
 //! # What an entry must never be mistaken for
 //!
-//! Every walker tests `P` before anything else (`akuma-pagetable`'s lookup, the
+//! Every walker tests the valid bit before anything else (`akuma-pagetable`'s lookup, the
 //! clone and free plans of `akuma-user-tree`, a kernel's teardown), so a lazy
 //! entry is "not mapped" to all of them. That is right for translation and for
 //! freeing — a lazy entry names no frame — and wrong in exactly two places,
@@ -41,11 +42,13 @@
 //! clone plan skips a non-present leaf), and unmapping must clear it (`unmap`
 //! returns `None` for it and leaves it standing).
 
-use crate::P;
+/// Bit 0 of a leaf: `P` on amd64, the valid bit on AArch64. Clear in every
+/// entry this module writes; [`decode`] refuses any entry with it set.
+pub const VALID: u64 = 1 << 0;
 
-/// Bit 1 of a not-present leaf: a lazy page. Bit 1 is `RW` in a present entry,
-/// which is irrelevant here because `P` is clear in every entry this module
-/// writes, and [`decode`] refuses any entry with `P` set.
+/// Bit 1 of an invalid leaf: a lazy page. (Bit 1 means something else in a
+/// valid entry on either architecture, which is irrelevant here because
+/// [`VALID`] is clear in every entry this module writes.)
 pub const TAG: u64 = 1 << 1;
 const WRITE: u64 = 1 << 2;
 const EXEC: u64 = 1 << 3;
@@ -143,7 +146,7 @@ impl Lazy {
 /// an empty slot, or a not-present entry without [`TAG`].
 #[must_use]
 pub const fn decode(entry: u64) -> Option<Lazy> {
-    if entry & P != 0 || entry & TAG == 0 {
+    if entry & VALID != 0 || entry & TAG == 0 {
         return None;
     }
     let file = if entry & FILE != 0 {
@@ -193,7 +196,7 @@ mod tests {
     fn no_lazy_entry_is_present_and_none_is_empty() {
         let l = Lazy { write: true, exec: true, none: true, file: Some(FilePage { inode: u32::MAX, index: MAX_INDEX, shared: false }) };
         for e in [Lazy::anon(false, false).encode().unwrap(), l.encode().unwrap()] {
-            assert_eq!(e & P, 0, "a lazy entry must fault");
+            assert_eq!(e & VALID, 0, "a lazy entry must fault");
             assert_ne!(e, 0, "a lazy entry must not read as an empty slot");
         }
     }
@@ -201,8 +204,8 @@ mod tests {
     #[test]
     fn present_and_untagged_entries_are_not_lazy() {
         assert!(!is_lazy(0));
-        // A present leaf whose low bits happen to read as the tag (P|RW).
-        assert!(!is_lazy(P | TAG | 0x1000));
+        // A present leaf whose low bits happen to read as the tag (valid + bit 1).
+        assert!(!is_lazy(VALID | TAG | 0x1000));
         // Not present, but no tag: whatever else wrote it, it is not ours.
         assert!(!is_lazy(FILE | (5 << INODE_SHIFT)));
     }

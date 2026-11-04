@@ -8,8 +8,15 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "lazy")]
+extern crate alloc;
+
 pub mod cmdline;
 pub mod init;
+#[cfg(feature = "lazy")]
+pub mod lazy;
+pub mod lazy_record;
+pub mod mmu;
 pub mod nosys;
 pub mod ring;
 #[cfg(feature = "shmpages")]

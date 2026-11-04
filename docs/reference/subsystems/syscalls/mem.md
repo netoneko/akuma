@@ -464,8 +464,8 @@ not done: `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §10.
 ## Taoxichuan: the lazy record is the leaf
 
 Taoxichuan (`akuma-tokio-kernel-amd64`) has no region table, so a page that `mmap` reserved and nothing has
-touched is recorded in **its own not-present leaf entry** (`akuma_pte_amd64::lazy`: a tag bit, write/exec
-bits, and for a file page the inode and page index). `lazy::fill` makes it present from a not-present
+touched is recorded in **its own not-present leaf entry** (`akuma_tokio_kernel_core::lazy_record`: a tag bit, write/exec
+bits, and for a file page the inode and page index; bit 0 clear, so the same layout serves an AArch64 descriptor). `lazy::fill` makes it present from a not-present
 fault, from the kernel's `TaskWalk` copies, or from the `akuma_user_access` prefault hook that glue's
 `validate_user_range` calls.
 

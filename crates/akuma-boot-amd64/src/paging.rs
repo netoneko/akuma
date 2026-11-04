@@ -129,7 +129,7 @@ pub fn map_page_in(root: u64, va: usize, pa: u64, prot: PteProt, attr: MemAttr) 
 /// building user-accessible tables on the way down.
 ///
 /// For entries that are not built from a protection: a demand-paging record
-/// (`akuma_pte_amd64::lazy`, not present), or a leaf moved whole from another
+/// (`akuma_tokio_kernel_core::lazy_record`, not present), or a leaf moved whole from another
 /// slot of the same root (`mremap`), which carries its frame, its CoW marker and
 /// its dirty bit with it. A new present page goes through [`map_page_in`].
 ///

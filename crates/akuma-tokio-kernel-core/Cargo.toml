@@ -11,6 +11,9 @@ workspace = true
 # Writable `MAP_SHARED` file pages over the PMM's share count and glue's write observers
 # (`shmpages`). Off for host tests: it reaches the kernel's PMM and physmap.
 shmpages = ["dep:akuma-fpcache-rw", "dep:akuma-pmm", "dep:akuma-mmu", "dep:akuma-vfs-glue", "dep:spinning_top"]
+# Demand paging over the machine's `mmu::UserPages` (`lazy`): the fill, the reservation and
+# the inode pins. Reaches the file-page cache, the PMM and the root filesystem.
+lazy = ["shmpages", "dep:akuma-fpcache", "dep:akuma-vfs", "dep:akuma-mmap"]
 # ext2 as the root filesystem: `shmpages::inode_freed`, ext2's inode-freed hook.
 disk = ["shmpages", "dep:akuma-fpcache"]
 
@@ -18,6 +21,8 @@ disk = ["shmpages", "dep:akuma-fpcache"]
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-fpcache-rw = { path = "../akuma-fpcache-rw", optional = true }
 akuma-fpcache = { path = "../akuma-fpcache", optional = true }
+akuma-vfs = { path = "../akuma-vfs", optional = true }
+akuma-mmap = { path = "../akuma-mmap", optional = true }
 akuma-pmm = { path = "../akuma-pmm", optional = true }
 akuma-mmu = { path = "../akuma-mmu", optional = true }
 akuma-vfs-glue = { path = "../akuma-vfs-glue", optional = true }
