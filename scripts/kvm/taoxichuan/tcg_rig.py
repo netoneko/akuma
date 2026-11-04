@@ -117,8 +117,9 @@ def boot(fresh):
     sys.exit(f"BOOT FAIL no ssh round trip in 180 s (console: {RUN}/console.log)")
 
 
-# (name, command, timeout, expected stdout). The expected values are the 2026-11-01 baseline; `apk add git`'s
-# "9 errors" are pre-existing trigger-script failures (exit 127), recorded in the 2026-10-30 battery too.
+# (name, command, timeout, expected stdout). The expected values are the 2026-11-01 baseline, except `apk`'s, which
+# is v3.24's index as `apk_mirror.py` cached it on 2026-11-04 (the old mirror's snapshot gave "9 errors; 15 MiB in
+# 19 packages", the errors being trigger scripts that exit 127).
 BATTERY = [
     ("quick", "echo q", 40, "q"),
     ("F1", 'sh -c "echo x > /tmp/f; cat /tmp/f; wc -c /tmp/f"', 60, "x\n2 /tmp/f"),
@@ -130,7 +131,7 @@ BATTERY = [
     # A session shell's dup2 over its inherited copy of sshd's socket must not close sshd's connection.
     ("dup2-sock", "exec 4</etc/hostname; echo after; cat <&4 >/dev/null; echo ok", 60, "after\nok"),
     ("pipeline", "seq 1 500 | sort -rn | head -n 1", 60, "500"),
-    ("apk", "apk add git 2>&1 | tail -1", 300, "9 errors; 15 MiB in 19 packages"),
+    ("apk", "apk add git 2>&1 | tail -1", 300, "OK: 20 MiB in 28 packages"),
     ("git", "git --version", 60, "git version 2.54.0"),
 ]
 # The toolchain image's PATH, and deliberately no LD_LIBRARY_PATH: rustc's RUNPATH is `$ORIGIN/../lib`, which musl's
@@ -147,7 +148,23 @@ GOOSE = ("goose", ". /etc/goose.env; cd /root; timeout 400 goose run --no-sessio
          "'Reply with exactly the word PONG and nothing else. Do not use tools.' 2>&1 | tail -1", 460, "PONG")
 
 
+def ensure_apk_mirror(port=8130):
+    """The images' apk repository is http://10.0.2.2:8130/main: start apk_mirror.py if nothing listens there."""
+    import socket
+    with socket.socket() as s:
+        s.settimeout(1)
+        if s.connect_ex(("127.0.0.1", port)) == 0:
+            return
+    os.makedirs(RUN, exist_ok=True)
+    log = open(os.path.join(RUN, "apk-mirror.log"), "ab")
+    subprocess.Popen([sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "apk_mirror.py"),
+                      str(port)], stdout=log, stderr=log, start_new_session=True)
+    time.sleep(1)
+
+
 def battery(extra):
+    if extra != "toolchain":
+        ensure_apk_mirror()
     bad = 0
     lines = TOOLCHAIN if extra == "toolchain" else BATTERY + ([GOOSE] if extra == "goose" else [])
     for name, cmd, timeout, want in lines:
