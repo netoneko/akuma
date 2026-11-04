@@ -381,6 +381,8 @@ fn fault_trap_locked(t: &mut Trap<'_>) {
         );
         #[cfg(feature = "trace-err")]
         mm_dump_for(cr2);
+        #[cfg(feature = "trace-err")]
+        fault_code_dump(t.frame.rip);
         // A fork child or thread dies alone (SIGSEGV status to its waiter);
         // the machine runs on. The boot task has no slot to reap through, so
         // a fault there halts.
@@ -949,6 +951,30 @@ fn mm_event(_kind: u8, _start: u64, _end: u64) {}
 /// Print every recorded slab event that covers `va` (kinds: 1 munmap, 2
 /// MAP_FIXED release, 3 mremap shrink, 4 mremap move-free, 5 mmap, 6 mremap-grow).
 #[cfg(feature = "trace-err")]
+/// What the faulting task actually executes at `rip`: the 16 bytes mapped there, the frame
+/// that maps them, and that frame's share count. A fault the instruction at `rip` cannot raise
+/// means those bytes are not the image's.
+#[cfg(feature = "trace-err")]
+fn fault_code_dump(rip: u64) {
+    use akuma_tokio_kernel_core::mm::Mm;
+    let root = task_root();
+    let page = rip & !0xFFF;
+    let pte = leaf_entry(root, page).map_or(0, |slot| slot.read());
+    let pa = lazy::Amd64::translate(root, page).unwrap_or(0);
+    let mut b = [0u8; 16];
+    let ok = copy_from_user(&mut b, rip);
+    akuma_primitives::safe_print!(
+        256,
+        "[fault-code] rip=0x{:x} pte=0x{:x} pa=0x{:x} refs={} read={} bytes={:02x?}\n",
+        rip,
+        pte,
+        pa,
+        if pa != 0 { akuma_pmm::cow_ref_get(pa as usize) } else { 0 },
+        ok,
+        b
+    );
+}
+
 fn mm_dump_for(va: u64) {
     MM_EVENTS.view(|head, ev| {
         for i in 0..128 {
@@ -1876,7 +1902,7 @@ fn boot(k: &Kernel) -> ! {
 
     // Heap then PMM. The no-op reapers are the honest hooks for a kernel with
     // no processes, no page cache and no retired list (each is a `|| 0`).
-    if !mem::init(&machine, false, akuma_pmm::PmmHooks {
+    if !mem::init(&machine, cfg!(feature = "pmm-forensics"), akuma_pmm::PmmHooks {
         heap_reclaim: || 0,
         drain_retired: akuma_exec::process::reclaim::drain_retired_under_pressure,
         evict_clean_file_pages: |_| 0,

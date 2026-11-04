@@ -5666,6 +5666,19 @@ pub fn x86_release_on_cpu(slot: usize) {
     }
 }
 
+/// Hold `slot`'s [`ON_CPU`] gate from another core: `true` when it was clear, so
+/// the occupant is not executing anywhere and no core can pick it until the
+/// holder calls [`x86_release_on_cpu`]. `false`: it is on a core (or being
+/// switched in), and only it can stop itself.
+///
+/// This is the test "is that thread running?" has to use. The state word is
+/// not it: a READY thread another core has just claimed in [`x86_pick_next`] is
+/// already being switched in, and a thread marked TERMINATED there runs on.
+#[must_use]
+pub fn x86_hold_off_cpu(slot: usize) -> bool {
+    slot < MAX_THREADS && ON_CPU[slot].compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
 /// Test/diagnostic accessor: how many [`ON_CPU`] gates are set. Bounded by the
 /// number of cores on a healthy system (each core runs exactly one thread, plus
 /// at most one not-yet-cleared outgoing gate per core mid-switch).

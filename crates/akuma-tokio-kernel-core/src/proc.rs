@@ -285,15 +285,15 @@ pub fn task_exit_code<M: Proc>(code: i32) -> ! {
     mm::shared_flush_all::<M>();
     let cur = M::current_slot();
     let lead = group_leader(cur);
-    kill_siblings::<M>(cur, lead);
-    let lead_pid = with_slots(|s| {
-        s[lead].running = false;
-        s[lead].pid
-    });
     // The zombie keeps its thread slot until the parent's wait4: without the
     // hold `x86_claim_slot` hands the TERMINATED slot to the next fork while
-    // the pid is still waitable. Glue's reap releases it.
+    // the pid is still waitable. Glue's reap releases it. Taken before the
+    // siblings stop: their waits release the kernel lock, and a leader stopped
+    // by then is a TERMINATED slot a fork on another core could claim.
+    let lead_pid = with_slots(|s| s[lead].pid);
     akuma_exec::process::hold_exited_thread_slot(lead_pid, lead);
+    kill_siblings::<M>(cur, lead);
+    with_slots(|s| s[lead].running = false);
     if let Some(p) = akuma_exec::process::lookup_process_shared(lead_pid) {
         p.exit_code.store(code, Relaxed);
         p.state.store(akuma_exec::process::ProcessState::Zombie(code));
@@ -334,45 +334,55 @@ fn group_leader(cur: usize) -> usize {
     (0..NSLOTS).find(|&s| s != cur && slot_in_use(s) && slot_pid(s) == tgid).unwrap_or(cur)
 }
 
-/// `exit_group`: end every thread of `cur`'s group except `cur` and `lead`.
+/// `exit_group`: stop every thread of `cur`'s group except `cur`, the leader
+/// `lead` included.
 ///
-/// A sibling not executing is ended in place. One RUNNING on another core
-/// cannot be (marking it TERMINATED does not stop it), so it gets a kill request
-/// and ends itself at its next kernel entry or exit ([`finish_killed`]); this
-/// waits for that with the lock released, because the teardown after this must
-/// not run under a thread still in user mode
-/// (`docs/archive/TAOXICHUAN_EXIT_GROUP_RUNNING_SIBLING.md`).
+/// A thread is ended in place only while this core holds its `ON_CPU` gate
+/// (`x86_hold_off_cpu`): then it is not executing and no core can pick it. The
+/// state word cannot answer "is it running": a READY thread another core has
+/// just claimed is being switched in, and marking it TERMINATED did not stop it.
+/// It ran on in user mode under a root the reap then freed, and its stores
+/// landed in frames handed to other processes (killtree at smp=4,
+/// `docs/archive/TAOXICHUAN_KILL_SIBLINGS_ON_CPU_RACE.md`). A thread on a core
+/// gets a kill request and is waited for (lock released) until it ends itself
+/// at its next kernel entry or exit ([`finish_killed`]) or comes off its core.
+///
+/// The leader is stopped but keeps its slot and its `Process`: the exiting
+/// thread publishes the group's status there.
 pub fn kill_siblings<M: Proc>(cur: usize, lead: usize) {
     let tgid = slot_tgid(cur);
     let mut asked = [0u32; NSLOTS]; // the pid asked to end, per slot; 0 = none
     for (s, ask) in asked.iter_mut().enumerate() {
         let spid = slot_pid(s);
-        if s == cur || s == lead || !slot_in_use(s) || spid == tgid || slot_tgid(s) != tgid {
+        if s == cur || !slot_in_use(s) || slot_tgid(s) != tgid || (spid == tgid && s != lead) {
             continue;
         }
-        if akuma_threading::get_thread_state(s) == akuma_threading::thread_state::RUNNING {
+        if akuma_threading::is_thread_terminated(s) {
+            continue;
+        }
+        if !stop_in_place(s, spid, s == lead) {
             akuma_threading::request_thread_kill(s);
             *ask = spid;
-            continue;
         }
-        end_sibling(s, spid);
     }
-    // User mode reaches the kernel at least once a tick; the bound is for a
-    // thread that never does.
     let start = M::uptime_us();
+    let mut warned = false;
     while asked.iter().any(|&p| p != 0) {
         for (s, p) in asked.iter_mut().enumerate() {
-            if *p != 0 && (akuma_threading::is_thread_terminated(s) || slot_pid(s) != *p) {
+            if *p == 0 {
+                continue;
+            }
+            if akuma_threading::is_thread_terminated(s) || slot_pid(s) != *p || stop_in_place(s, *p, s == lead) {
                 *p = 0;
             }
         }
-        if M::uptime_us().saturating_sub(start) > 2_000_000 {
-            for (s, p) in asked.iter_mut().enumerate().filter(|(_, p)| **p != 0) {
-                safe_print!(96, "[exit_group] slot {} never reached the kernel; ended in place\n", s);
-                end_sibling(s, *p);
-                *p = 0;
+        // User mode reaches the kernel at least once a tick. A thread that does
+        // not is reported, never ended where it runs.
+        if !warned && M::uptime_us().saturating_sub(start) > 2_000_000 {
+            warned = true;
+            for (s, _) in asked.iter().enumerate().filter(|(_, p)| **p != 0) {
+                safe_print!(96, "[exit_group] slot {} still on a core after 2 s; waiting\n", s);
             }
-            break;
         }
         M::unlocked(|| {
             for _ in 0..2000 {
@@ -382,16 +392,27 @@ pub fn kill_siblings<M: Proc>(cur: usize, lead: usize) {
     }
 }
 
-/// End sibling slot `s` (pid `spid`) where it stands: it never runs again.
-fn end_sibling(s: usize, spid: u32) {
+/// End thread `s` (pid `spid`) where it stands if no core is executing it:
+/// `false` when it is on a core. The leader keeps its slot and `Process`.
+fn stop_in_place(s: usize, spid: u32, leader: bool) -> bool {
+    if !akuma_threading::x86_hold_off_cpu(s) {
+        return false;
+    }
     let _ = akuma_threading::take_kill_request_via_tid(s);
     akuma_syscalls_glue::futex_purge_tid(s);
-    with_slots(|t| {
-        t[s].running = false;
-        t[s].used = false;
-    });
+    if !leader {
+        with_slots(|t| {
+            t[s].running = false;
+            t[s].used = false;
+        });
+    }
     akuma_threading::mark_thread_terminated(s);
-    retire_thread_process(spid);
+    // TERMINATED now: `x86_pick_next` skips it with the gate open.
+    akuma_threading::x86_release_on_cpu(s);
+    if !leader {
+        retire_thread_process(spid);
+    }
+    true
 }
 
 /// Did `exit_group` ask the running thread to end?
@@ -407,6 +428,11 @@ pub fn finish_killed<M: Proc>() -> ! {
     let cur = M::current_slot();
     let _ = akuma_threading::take_kill_request_via_tid(cur);
     akuma_syscalls_glue::futex_purge_tid(cur);
+    // The leader, stopped by a sibling's `exit_group`: its slot and `Process`
+    // stay for the status that sibling publishes.
+    if slot_pid(cur) == slot_tgid(cur) {
+        akuma_threading::x86_finish_current()
+    }
     let pid = with_slots(|s| {
         s[cur].running = false;
         s[cur].used = false;

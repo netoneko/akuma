@@ -26,6 +26,8 @@ shell = ["akuma-tokio-kernel-amd64/shell", "akuma-tokio-kernel-aarch64/shell"]
 no-tests = ["akuma-tokio-kernel-amd64/no-tests", "akuma-tokio-kernel-aarch64/no-tests"]
 # Name every syscall that answers a negative errno on the console.
 trace-err = ["akuma-tokio-kernel-amd64/trace-err", "akuma-tokio-kernel-aarch64/trace-err"]
+# The PMM's use-after-free instruments: quarantine, premature-free check, CoW ledger (amd64).
+pmm-forensics = ["akuma-tokio-kernel-amd64/pmm-forensics"]
 
 # The machine half, chosen by the target. `target_os = "none"` too: `cfg(target_arch)` alone is the
 # *host's* under `cargo test`, and the machine halves build only for the kernel targets.

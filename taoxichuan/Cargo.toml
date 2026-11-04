@@ -14,6 +14,8 @@ workspace = true
 no-tests = ["akuma-tokio-kernel/no-tests"]
 # Name every syscall that answers a negative errno on the console (`[err] nr=N -E`).
 trace-err = ["akuma-tokio-kernel/trace-err"]
+# The PMM's use-after-free instruments (quarantine, premature-free check, CoW ledger).
+pmm-forensics = ["akuma-tokio-kernel/pmm-forensics"]
 default = ["shell"]
 # The calls a shell and its tools make and no tokio program does: the images run busybox and bash.
 # Without it the kernel serves the tokio surface B10's census measured

@@ -18,6 +18,9 @@ no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
 # Name every syscall that answers a negative errno on the console (`[err] nr=N -E`), and keep
 # the evidence rings the leak gate reads.
 trace-err = []
+# The PMM's use-after-free instruments (`akuma_boot_amd64::mem::init`'s forensics flag):
+# freed frames sit in a quarantine, a premature free and a resurrected frame are reported.
+pmm-forensics = []
 # What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-runtime-tokio/shell"]
 # The default devices, each wired by its `Kernel` method (`console()`, `disk()`, `net()`, `smp()`).

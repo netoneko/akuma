@@ -122,6 +122,19 @@ Lock legend: **M** = acquisition wrapped in `with_irqs_disabled`/`IrqGuard`;
 | pressure drain | `drain_retired_under_pressure` (from `alloc_page_zeroed_user`) | same as reclaim | ambient context = **whatever faulted** — see §5.2 |
 | scheduler (IRQ) | `sgi_scheduler_handler_with_sp` | `POOL` **try_lock** M | never blocks; no other subsystem lock reachable from IRQ context |
 
+### 2.0 "Is that thread running?" is the `ON_CPU` gate, never the state word (hooked scheduler)
+
+On the hooked scheduler (amd64 and both Taoxichuan machines) a thread is
+executing exactly when its `ON_CPU` gate is held. `x86_pick_next` reads `READY`,
+**claims the gate**, then switches in, so a `TERMINATED` stored over a `READY`
+thread from another core does not stop it. Code that ends another thread *in
+place* must first hold its gate (`akuma_threading::x86_hold_off_cpu`), mark it
+`TERMINATED`, then release the gate. A thread whose gate it cannot hold is on a
+core: ask it (`request_thread_kill`) and wait, and never end it where it runs.
+`akuma-tokio-kernel-core::proc::kill_siblings` is the implementation, and it
+stops the group leader too
+(`archive/TAOXICHUAN_KILL_SIBLINGS_ON_CPU_RACE.md`).
+
 ### 2.1 Every spawn path reclaims before it reports exhaustion (2026-08-03)
 
 A `FREE`-slot scan that misses does **not** mean the pool is full — far more
