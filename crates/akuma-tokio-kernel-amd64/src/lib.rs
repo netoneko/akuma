@@ -901,7 +901,7 @@ fn banner() {
 // `USER_TOP` (the end of the canonical user half: nothing a task names at or above it may be
 // mapped, read or written for it) is `akuma_tokio_kernel_core::task`'s.
 use akuma_tokio_kernel_core::mm;
-use akuma_tokio_kernel_core::task::{BRK_SLAB, MMAP_BASE, USER_TOP, MMAP_SLAB, USER_STACK_PAGES, USER_STACK_TOP, Task};
+use akuma_tokio_kernel_core::task::{USER_TOP, USER_STACK_TOP, Task};
 /// errnos `akuma_ring3_amd64::err` does not carry.
 pub(crate) const EINTR: u64 = 4;
 /// Bisect mask for the mmap-slab rework, set from the kernel command line
@@ -1027,12 +1027,6 @@ pub(crate) fn task_root() -> u64 {
     task_root_of(task_slot_index())
 }
 
-fn add_region(start: u64, end: u64) {
-    if !with_task(|t| t.layout.add_region(start, end)) {
-        akuma_primitives::safe_print!(96, "[exec] region table full: [{:#x}, {:#x}) is not user memory\n", start, end);
-    }
-}
-
 /// Is `[va, va+len)` fully inside a region this kernel mapped for the task?
 /// The check that makes `write(1, ptr, len)` honest: a bogus pointer is
 /// `-EFAULT`, not a kernel fault.
@@ -1109,37 +1103,9 @@ fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
     akuma_user_walk::copy_to(&task_walk(), dst_va, src)
 }
 
-/// The ext2 lookup does not follow symlinks (a deliberate crate boundary:
-/// `akuma-ext2` resolves components, `akuma-vfs::path` owns the chain
-/// walker). The serve image's `/bin/sh` — what sshd's exec path spawns — is
-/// a symlink, so every path that names a program goes through the chain
-/// walker with ext2 as the effect provider: `is_symlink` to decide, the
-/// link inode's bytes for the target (relative targets joined by the
-/// walker), 8 hops to ELOOP. The stage-3 `open` path gets the same walker,
-/// because `/etc/sshd/sshd.conf`'s `shell = /bin/sh` is the exact case.
-fn read_link_target(path: &str) -> Option<alloc::string::String> {
-    let fs = root_fs();
-    if !fs.is_symlink(path) {
-        return None;
-    }
-    // `read_symlink`, never `read_file`: a fast symlink (every busybox link
-    // on the serve image — `/bin/sh`, `/bin/apk` — fits the 60-byte inline
-    // form) keeps its target in the inode's pointer-word window and has no
-    // data blocks. `read_file` handed those first target bytes to the block
-    // mapper as a bogus block number, the read failed, spawn answered ENOENT,
-    // and sshd fell back to built-in paws on every exec — three stages of
-    // gates quietly ran on shell builtins because of this one provider.
-    // `read_symlink` returns the target verbatim (`read_symlink_inode`
-    // handles both the fast inline form and the slow block form); strip one
-    // trailing newline only as belt-and-braces.
-    fs.read_symlink(path)
-        .ok()
-        .map(|s| alloc::string::String::from(s.trim_end_matches('\n')))
-}
-
-/// Resolve symlinks (bounded), returning the effective path to look up.
+/// Resolve symlinks (bounded) on the root: `akuma_tokio_kernel_core::loader`'s, the one walker.
 fn resolve_effective(path: &str) -> alloc::string::String {
-    akuma_vfs::resolve_symlink_chain(path, 8, read_link_target)
+    akuma_tokio_kernel_core::loader::resolve_effective::<lazy::Amd64>(path)
 }
 
 /// Read a NUL-terminated path from the task at `src_va` into `buf`, returning
@@ -1158,30 +1124,9 @@ fn user_str(src_va: u64, buf: &mut [u8]) -> Option<&str> {
 /// relative path at `AT_FDCWD` resolves against `/` — this kernel has no
 /// working directory, and every task it boots runs at the root. `None` means
 /// the caller sees `EBADF` (a non-directory fd where a dirfd was required).
-/// A whole file for the ELF loader. `Filesystem::read_file` refuses anything
-/// over 16 MiB ("use read_at"), and cargo is 47 MB, cc1 38 MB: past that,
-/// read it in 1 MiB steps through the inode. One heap block of the file's
-/// size either way - the loader wants the image as a slice.
+/// A whole file for the ELF loader (`loader::read_image`).
 pub(crate) fn read_image(path: &str) -> Result<Vec<u8>, akuma_vfs::FsError> {
-    let fs = root_fs();
-    let md = fs.metadata(path)?;
-    if md.size <= 16 * 1024 * 1024 {
-        return fs.read_file(path);
-    }
-    let ino = fs.resolve_inode(path)?;
-    let mut data: Vec<u8> = Vec::new();
-    data.try_reserve_exact(md.size as usize).map_err(|_| akuma_vfs::FsError::NoSpace)?;
-    data.resize(md.size as usize, 0);
-    let mut off = 0usize;
-    while off < data.len() {
-        let end = (off + (1 << 20)).min(data.len());
-        let n = fs.read_at_by_inode(ino, off, &mut data[off..end])?;
-        if n == 0 {
-            return Err(akuma_vfs::FsError::Internal);
-        }
-        off += n;
-    }
-    Ok(data)
+    akuma_tokio_kernel_core::loader::read_image::<lazy::Amd64>(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1945,227 +1890,10 @@ fn overlaps_shared(lo: u64, hi: u64) -> bool {
     with_task(|t| t.layout.shared().iter().any(|f| f.overlaps(lo, hi)))
 }
 
-/// Map one placed `PT_LOAD` into `root`, page by page: a fresh zeroed frame,
-/// mapped, with the segment's file-backed slice copied in through the physmap
-/// (the zero-filled `.bss` tail needs nothing more). Returns the page-rounded
-/// span it covered, `None` if a frame or a mapping failed or the segment
-/// reaches past the user half (a hostile image must not map into the kernel
-/// half every root shares). `akuma_elf_exec::load_segments` checked that
-/// `image[offset..offset + filesz]` is in bounds.
-///
-/// Protection: writable wins over executable, so a `W|X` segment (no image
-/// this kernel runs has one) is `USER_RW`.
-///
-/// With `inode` (the image's, on the root filesystem) a page that is wholly
-/// one thing is left lazy (`lazy.rs`): every byte from the file becomes a file
-/// record - a read-only one then fills from the file-page cache, one frame for
-/// every process running the image - and every byte past the file a zero-fill
-/// one. A page the segment's start or its file end cuts is filled here, as
-/// every page was until 2026-11-03. Divergence: a lazy page reads the file when
-/// first touched, and nothing refuses a write to a running image (`ETXTBSY`),
-/// so rewriting one in place shows the running copy the new bytes.
-fn place_segment(root: u64, image: &[u8], seg: &akuma_elf_exec::LoadSeg, inode: Option<u32>) -> Option<(u64, u64)> {
-    let pte = if seg.flags & akuma_elf_exec::PF_W != 0 {
-        PteProt::USER_RW
-    } else if seg.flags & akuma_elf_exec::PF_X != 0 {
-        PteProt::USER_RX
-    } else {
-        PteProt::USER_RO
-    };
-    let end = seg.vaddr.checked_add(seg.memsz)?.checked_add(0xFFF)?;
-    let (first, last) = (seg.vaddr & !0xFFF, end & !0xFFF);
-    if last > USER_TOP {
-        return None;
-    }
-    // A file record names a whole file page, so the segment's pages and the
-    // file's must line up (`p_offset` congruent to `p_vaddr`, as the ELF spec
-    // requires for a loadable image).
-    let inode = inode.filter(|&node| seg.offset.wrapping_sub(seg.vaddr).trailing_zeros() >= 12 && lazy::pin(root, node, first, last));
-    let file_end = seg.vaddr + seg.filesz;
-    let mut pva = first;
-    while pva < last {
-        let lazy = if pva >= seg.vaddr && pva + 4096 <= file_end {
-            inode.map(|node| lazy::Lazy {
-                write: pte.write,
-                exec: pte.exec,
-                none: false,
-                file: Some(lazy::FilePage { inode: node, index: (seg.offset + (pva - seg.vaddr)) / 4096, shared: false }),
-            })
-        } else if pva >= file_end {
-            Some(lazy::Lazy::anon(pte.write, pte.exec))
-        } else {
-            None
-        };
-        if let Some(rec) = lazy.filter(|&rec| lazy::fits(rec, 1)) {
-            if !lazy::reserve(root, pva, 4096, rec) {
-                return None;
-            }
-            pva += 4096;
-            continue;
-        }
-        let frame = phys::Frame::alloc_zeroed()?;
-        if !paging::map_page_in(root, pva as usize, frame.pa(), pte, MemAttr::WriteBack) {
-            return None;
-        }
-        // The page's overlap with the segment's file-backed range. The file
-        // slice starts at `p_offset`, not at the vaddr-relative offset: the two
-        // differ in every Alpine dynamic binary's text segment.
-        let from = pva.max(seg.vaddr);
-        let to = (pva + 4096).min(seg.vaddr + seg.filesz);
-        if from < to {
-            let off = (seg.offset + (from - seg.vaddr)) as usize;
-            frame.write_bytes((from - pva) as usize, &image[off..off + (to - from) as usize]);
-        }
-        pva += 4096;
-    }
-    Some((first, last))
-}
-
-/// Load an ELF image into the CURRENT task slot: fresh page root (the
-/// kernel's upper half shared by PML4 copy), every `PT_LOAD` placed eagerly
-/// at its link address, a Linux initial stack with argc/argv/envp/auxv on
-/// it, heap slabs registered, the fd table reset. Returns where to cross:
-/// the root to load into CR3, the entry, the initial `rsp`.
-///
-/// Shared by the boot spawn (`spawn`) and `execve` (`child.rs`) — one loader,
-/// one placement story. Runs with the kernel
-/// half live (the physmap does all the copying); the caller chooses the
-/// CR3 moment.
+/// Load an ELF image into the CURRENT task slot (`akuma_tokio_kernel_core::loader::load_task`):
+/// shared by the boot spawn and `execve`.
 fn load_task(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Option<TaskImage> {
-    const NO_SEG: akuma_elf_exec::LoadSeg = akuma_elf_exec::LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 };
-    let mut segs = [NO_SEG; 16];
-    let (prog, n) = akuma_elf_exec::program(image, &mut segs).ok()?;
-    with_task(|t| {
-        t.exit = None;
-        // A fresh address space, a fresh region list: `user_ok` checks against
-        // exactly what THIS image mapped.
-        t.layout.reset_for_exec();
-    });
-
-    // The task's root: a fresh page table whose upper half is the kernel's
-    // (one PML4 copy shares every kernel subtree — physmap, device window,
-    // kernel image), whose lower half holds only the task. The kernel's own
-    // root keeps its identity map; the task's root simply has none.
-    // The task's tables are not live until the CR3 load below.
-    let root = akuma_tokio_kernel_core::tree::new_root::<lazy::Amd64>()?;
-    with_task(|t| t.root_pa = root);
-
-    // Every PT_LOAD at its placed address (a static-PIE's moved to `PIE_BASE`).
-    // `read_image` read `path` from the root filesystem, so its inode there is
-    // the image's: what the lazy file pages fill from.
-    let image_inode = root_fs().resolve_inode(path).ok();
-    for seg in &segs[..n] {
-        let (first, last) = place_segment(root, image, seg, image_inode)?;
-        add_region(first, last);
-    }
-
-    // M5: a `PT_INTERP` names the dynamic linker. The *decision* — including
-    // the one-NUL-byte static-PIE case — is the shared `akuma-elf-exec` rule
-    // (amd64's loader rides the same), and so is the parse; the mapping is
-    // `place_segment` again. Placement: `INTERP_BASE` = 0x3000_0000, the base
-    // akuma-elf uses — above a static-PIE program at `PIE_BASE` (an image
-    // would have to be 512 MiB to reach it) and far below `MMAP_BASE`, so
-    // image and linker cannot meet. A hit here changes three auxv/cross facts
-    // at once: the entry ring 3 crosses is the linker's, `AT_BASE` is where it
-    // was placed, and `AT_ENTRY` stays the program's.
-    let (cross_entry, at_base) = match akuma_elf_exec::interp_path(image) {
-        Ok(Some(path)) => {
-            let ipath = core::str::from_utf8(path).ok()?;
-            // Read through the same bounded symlink chain as the program:
-            // Alpine's `/lib/ld-musl-x86_64.so.1` is a link, not a file.
-            let eff = resolve_effective(ipath);
-            let Ok(ldso) = read_image(&eff) else {
-                console::puts("  exec: PT_INTERP unreadable: ");
-                console::puts(&eff);
-                console::puts("\n");
-                return None;
-            };
-            let mut isegs = [NO_SEG; 8];
-            let Ok(n) = akuma_elf_exec::load_segments(&ldso, akuma_elf_exec::INTERP_BASE, &mut isegs) else {
-                console::puts("  exec: interpreter refused by the exec core\n");
-                return None;
-            };
-            let mut hi = akuma_elf_exec::INTERP_BASE;
-            let ldso_inode = root_fs().resolve_inode(&eff).ok();
-            for seg in &isegs[..n] {
-                hi = hi.max(place_segment(root, &ldso, seg, ldso_inode)?.1);
-            }
-            add_region(akuma_elf_exec::INTERP_BASE, hi);
-            let Ok(ientry) = akuma_elf_exec::interp_entry(&ldso, akuma_elf_exec::INTERP_BASE) else {
-                console::puts("  exec: interpreter has no entry\n");
-                return None;
-            };
-            (ientry, akuma_elf_exec::INTERP_BASE)
-        }
-        // Static or static-PIE: the program's own entry.
-        Ok(None) => (prog.entry, 0),
-        // `program` already walked the same table, so this is unreachable.
-        Err(_) => return None,
-    };
-
-    // argc/argv/envp/auxv. `AT_RANDOM`/`AT_EXECFN` values are the builder's
-    // to fill.
-    const AUX_N: usize = 14;
-    let mut aux = [(0u64, 0u64); AUX_N];
-    aux[0] = (ring3::AT_BASE, at_base); // the interpreter's base, 0 if none
-    aux[1] = (ring3::AT_PHDR, prog.phdr_va);
-    aux[2] = (ring3::AT_PHENT, akuma_elf_exec::PHENT);
-    aux[3] = (ring3::AT_PHNUM, prog.phnum);
-    aux[4] = (ring3::AT_PAGESZ, 4096);
-    aux[5] = (ring3::AT_ENTRY, prog.entry);
-    aux[6] = (ring3::AT_UID, 0);
-    aux[7] = (ring3::AT_EUID, 0);
-    aux[8] = (ring3::AT_GID, 0);
-    aux[9] = (ring3::AT_EGID, 0);
-    aux[10] = (ring3::AT_SECURE, 0);
-    aux[11] = (ring3::AT_HWCAP, 0);
-    aux[12] = (ring3::AT_CLKTCK, 100);
-    aux[13] = (ring3::AT_RANDOM, 0);
-    // The block is sized by its contents: `stack_block_len` pages, ending at
-    // `USER_STACK_TOP`. A fixed block (12 pages until 2026-11-03) is what the
-    // exec path's entry caps were derived from, and a 570-argument `rustc`
-    // line got `E2BIG` (`docs/archive/TAOXICHUAN_EXEC_ARGV_LIMIT.md`). The
-    // exec path bounds the total (`child::ARG_BYTES_MAX`); the allocation is
-    // fallible because that bound is a megabyte.
-    // (The argv slice is exactly argv: an older builder sliced one slot past
-    // it, `..=`, and apk 3's `add` read the duplicated argv[0] as a package.)
-    let block_pages = ring3::stack_block_len(argv, env, aux.len()).div_ceil(4096);
-    let mut block: Vec<u8> = Vec::new();
-    block.try_reserve_exact(block_pages * 4096).ok()?;
-    block.resize(block_pages * 4096, 0);
-    let rsp = ring3::build_stack(&mut block, USER_STACK_TOP, argv, env, &aux);
-
-    // The stack: at least `USER_STACK_PAGES`, and room for the block plus
-    // four pages of real stack under it; the fault path grows it from there.
-    // The block fills the top `block_pages` pages; the stack below it is lazy,
-    // a zero page on the first touch (it was all allocated here until
-    // 2026-11-03: `USER_STACK_PAGES` of zeros per exec, mostly never touched).
-    let stack_pages = (USER_STACK_PAGES as usize).max(block_pages + 4);
-    let stack_base = USER_STACK_TOP - stack_pages as u64 * 4096;
-    let first_block_page = stack_pages - block_pages;
-    if !lazy::reserve(root, stack_base, first_block_page as u64 * 4096, lazy::Lazy::anon(true, false)) {
-        return None;
-    }
-    for p in first_block_page..stack_pages {
-        let frame = phys::Frame::alloc_zeroed()?;
-        let k = p - first_block_page;
-        frame.write_bytes(0, &block[k * 4096..(k + 1) * 4096]);
-        let pva = stack_base + p as u64 * 4096;
-        if !paging::map_page_in(root, pva as usize, frame.pa(), PteProt::USER_RW, MemAttr::WriteBack) {
-            return None;
-        }
-    }
-    add_region(stack_base, USER_STACK_TOP);
-    drop(block);
-
-    // The heap slabs: `brk` above the image, `mmap` in its own window. Both
-    // registered now, so a pointer check is one scan.
-    let brk0 = (prog.end + 0xFFF) & !0xFFF;
-    with_task(|t| t.layout.set_brk_window(brk0, BRK_SLAB));
-    add_region(brk0, brk0 + BRK_SLAB);
-    add_region(MMAP_BASE, MMAP_BASE + MMAP_SLAB);
-
-    Some(TaskImage { root_pa: root, entry: cross_entry, rsp })
+    akuma_tokio_kernel_core::loader::load_task::<lazy::Amd64>(argv, env, image, path)
 }
 
 /// Free a lower-half address space the loader built by hand (`tree::free_user_root`): every
@@ -2175,12 +1903,7 @@ pub(crate) fn free_user_root(root: u64) -> usize {
     akuma_tokio_kernel_core::tree::free_user_root::<lazy::Amd64>(root)
 }
 
-/// Where a loaded task starts: the root for CR3, the entry, the stack.
-pub struct TaskImage {
-    pub root_pa: u64,
-    pub entry: u64,
-    pub rsp: u64,
-}
+pub use akuma_tokio_kernel_core::loader::TaskImage;
 
 /// Load the image, build the task's address space, and cross. Never returns:
 /// the task ends in the dispatcher's `exit` or the trap handler's `[Fault]`.

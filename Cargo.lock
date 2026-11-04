@@ -713,6 +713,7 @@ name = "akuma-ring3-amd64"
 version = "0.1.0"
 dependencies = [
  "akuma-cpu",
+ "akuma-elf-exec",
  "akuma-gdt",
 ]
 
@@ -1052,6 +1053,7 @@ name = "akuma-tokio-kernel-core"
 version = "0.1.0"
 dependencies = [
  "akuma-cow",
+ "akuma-elf-exec",
  "akuma-fpcache",
  "akuma-fpcache-rw",
  "akuma-mmap",

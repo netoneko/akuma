@@ -17,6 +17,8 @@ pub mod cow;
 pub mod init;
 #[cfg(feature = "lazy")]
 pub mod lazy;
+#[cfg(feature = "lazy")]
+pub mod loader;
 pub mod lazy_record;
 #[cfg(feature = "lazy")]
 pub mod mm;

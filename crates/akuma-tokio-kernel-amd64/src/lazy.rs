@@ -156,6 +156,8 @@ impl akuma_tokio_kernel_core::tree::UserTree for Amd64 {
     }
 }
 
+impl akuma_tokio_kernel_core::loader::Loader for Amd64 {}
+
 impl core_lazy::Kernel for Amd64 {
     fn root_fs() -> &'static dyn akuma_vfs::Filesystem {
         crate::root_fs()

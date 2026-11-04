@@ -13,7 +13,7 @@ workspace = true
 shmpages = ["dep:akuma-fpcache-rw", "dep:akuma-pmm", "dep:akuma-mmu", "dep:akuma-vfs-glue", "dep:spinning_top"]
 # Demand paging over the machine's `mmu::UserPages` (`lazy`): the fill, the reservation and
 # the inode pins. Reaches the file-page cache, the PMM and the root filesystem.
-lazy = ["shmpages", "dep:akuma-fpcache", "dep:akuma-vfs", "dep:akuma-mmap", "dep:akuma-syscalls-linux", "dep:akuma-syscalls-mem", "dep:akuma-cow", "dep:akuma-user-tree"]
+lazy = ["shmpages", "dep:akuma-fpcache", "dep:akuma-vfs", "dep:akuma-mmap", "dep:akuma-syscalls-linux", "dep:akuma-syscalls-mem", "dep:akuma-cow", "dep:akuma-user-tree", "dep:akuma-elf-exec"]
 # ext2 as the root filesystem: `shmpages::inode_freed`, ext2's inode-freed hook.
 disk = ["shmpages", "dep:akuma-fpcache"]
 
@@ -32,3 +32,4 @@ akuma-mmu = { path = "../akuma-mmu", optional = true }
 akuma-vfs-glue = { path = "../akuma-vfs-glue", optional = true }
 spinning_top = { version = "0.3", optional = true }
 akuma-user-tree = { path = "../akuma-user-tree", optional = true }
+akuma-elf-exec = { path = "../akuma-elf-exec", optional = true }

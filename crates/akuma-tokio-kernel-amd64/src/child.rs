@@ -183,10 +183,10 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
         akuma_primitives::safe_print!(160, "  [init] bind refused: {}\n", msg);
         crate::halt();
     }
-    register_shell_process(1, path, ti.root_pa, ti.entry, ti.rsp, tid);
+    register_shell_process(1, path, ti.root_pa, ti.entry, ti.sp, tid);
     INIT_TID.store(tid, core::sync::atomic::Ordering::Relaxed);
     INIT_ENTRY.store(ti.entry, core::sync::atomic::Ordering::Relaxed);
-    INIT_RSP.store(ti.rsp, core::sync::atomic::Ordering::Relaxed);
+    INIT_RSP.store(ti.sp, core::sync::atomic::Ordering::Relaxed);
     // Straight onto the heap: `Box::new([0; N])` builds the 32 KiB array on this stack first.
     let stack: &'static mut [u64] = alloc::boxed::Box::leak(alloc::vec![0u64; INIT_STACK_WORDS].into_boxed_slice());
     let top = stack.as_mut_ptr() as usize + INIT_STACK_WORDS * 8;
@@ -660,7 +660,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
         rdx: 0, rsi: 0, rdi: 0, rax: 0,
         rip: ti.entry,
         rflags: 0x202,
-        rsp: ti.rsp,
+        rsp: ti.sp,
     };
     // The incoming image's first instructions must not see the OUTGOING
     // task's fs: the MSR rides the crossing (sysret does not touch it), and

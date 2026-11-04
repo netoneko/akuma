@@ -34,6 +34,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod stack;
+
 /// Where a dynamically linked image's interpreter is placed.
 ///
 /// The same base `akuma-elf` places

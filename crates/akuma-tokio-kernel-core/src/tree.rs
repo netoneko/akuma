@@ -52,7 +52,7 @@ const fn entry_va(va_base: u64, depth: u32, i: usize) -> u64 {
 pub fn new_root<M: UserTree>() -> Option<u64> {
     let root = <M::Frame as FreshPage>::alloc_zeroed()?.publish() as u64;
     if !M::install_kernel(root) {
-        free_user_root::<M>(root);
+        let _ = free_user_root::<M>(root);
         return None;
     }
     Some(root)
@@ -199,6 +199,7 @@ fn free_subtree<M: UserTree>(table: u64, depth: u32, va_base: u64) -> usize {
 ///
 /// The kernel's part is shared by every root and never touched. Returns the pages
 /// released. The root must not be the live one (`0` released when it is).
+#[must_use = "the count of pages released"]
 pub fn free_user_root<M: UserTree>(root: u64) -> usize {
     if root == 0 || root == M::live_root() {
         return 0;
