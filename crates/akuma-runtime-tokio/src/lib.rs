@@ -35,6 +35,8 @@
 
 use akuma_syscalls_abi::Syscall;
 
+pub mod console;
+
 /// What the composition root supplies. Everything else a tokio kernel needs from
 /// the hooks has one answer, which [`install`] gives.
 #[derive(Clone, Copy)]

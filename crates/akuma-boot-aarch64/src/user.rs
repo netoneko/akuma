@@ -142,3 +142,18 @@ pub fn switch_to(root: u64) -> bool {
 pub fn live_root() -> u64 {
     akuma_cpu::sysreg::ttbr0_el1() & ADDR
 }
+
+/// Name the thread this core runs: `TPIDRRO_EL0`, which
+/// `akuma_primitives::preempt::current_tid` reads and indexes every per-thread
+/// table with (the user-copy fixup, the preemption counters).
+///
+/// A tokio kernel's scheduler calls it on every switch-in. EL0 can read the
+/// register and cannot write it; it holds a slot index, nothing it could use.
+pub fn set_current_thread(tid: usize) {
+    // SAFETY: TPIDRRO_EL0 is never dereferenced: every reader bounds-checks the
+    // value before indexing (`current_tid` answers it, its callers compare it
+    // with `MAX_THREADS`), so any value is at worst a misattribution.
+    unsafe {
+        core::arch::asm!("msr tpidrro_el0, {t}", t = in(reg) tid as u64, options(nomem, nostack, preserves_flags));
+    }
+}

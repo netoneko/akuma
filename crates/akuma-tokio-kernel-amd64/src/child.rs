@@ -725,91 +725,14 @@ pub fn capture_user_context(fr: &ring3::SyscallFrame) {
     <crate::sched::Tx as akuma_sched_amd64::Platform>::write_user_context(slot, &ctx);
 }
 
-/// The exec'd shell, registered as an `akuma-exec` `Process` — premise 2's
-/// build-out: `fork_process` opens with `current_process_shared()`, which
-/// resolves thread→pid→`PROCESS_TABLE`, so the shell must be in both before
-/// it can fork anything. The literal is amd64's own bootstrap registration
-/// (`usermode.rs:4651`) adapted field for field: this kernel's answers where
-/// amd64 names its own subsystems — no channel (the session pipe is the
-/// twin's own mechanism), a fresh default TerminalState (nothing reads it),
-/// the stdio triple for the shared exit path's allocator-safety rule, and a
-/// `new_shared` view of the shell's live root — the address space is OWNED
-/// by the twin's task record, and a second owner would double-free it (the
-/// exact bug amd64's 5b slice 4 note records for its own slice-1 shape).
+/// The exec'd shell, registered as an `akuma-exec` `Process`: `fork_process` opens with
+/// `current_process_shared()`, which resolves thread->pid->`PROCESS_TABLE`, so the shell must
+/// be in both before it can fork anything (`Process::register_adopted`, shared with aarch64).
 fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u64, tid: usize) {
-    let Some(space) = akuma_mmu::UserAddressSpace::new_shared(root_pa as usize) else {
+    // Parent 1: sshd, the boot's init task (the pid floor is 2).
+    if !akuma_exec::process::Process::register_adopted(pid, 1, name, root_pa as usize, entry as usize, rsp as usize, tid) {
         akuma_primitives::safe_print!(128, "[spawn] root view for the process table failed\n");
-        return;
-    };
-    let proc = akuma_exec::process::Process {
-        pid,
-        pgid: pid,
-        tgid: pid, // group leader = self, amd64's own answer
-        state: akuma_exec::process::AtomicProcessState::new(
-            akuma_exec::process::ProcessState::Ready,
-        ),
-        address_space: akuma_exec::process::ProcAddressSpace::new(space),
-        parent_pid: 1, // sshd, the boot's init task (the pid floor is 2)
-        brk: core::sync::atomic::AtomicUsize::new(0),
-        initial_brk: core::sync::atomic::AtomicUsize::new(0),
-        entry_point: core::sync::atomic::AtomicUsize::new(entry as usize),
-        // The twin's own Task record owns brk/mmap/stack truth; these scalars
-        // feed shared readers only.
-        memory: akuma_exec::process::ProcessMemory::new(0, 0, 0, 0),
-        process_info_phys: core::sync::atomic::AtomicUsize::new(0), // no info page
-        image: spinning_top::Spinlock::new(akuma_exec::process::ProcessImage {
-            name: String::from(name),
-            exe: String::from(name),
-            args: Vec::new(),
-            context: akuma_exec::process::UserContext::new(entry as usize, rsp as usize),
-        }),
-        cwd: String::from("/"),
-        root: String::from("/"),
-        stdin: alloc::sync::Arc::new(spinning_top::Spinlock::new(
-            akuma_exec::process::StdioBuffer::new(),
-        )),
-        stdout: alloc::sync::Arc::new(spinning_top::Spinlock::new(
-            akuma_exec::process::StdioBuffer::new(),
-        )),
-        exited: core::sync::atomic::AtomicBool::new(false),
-        exit_code: core::sync::atomic::AtomicI32::new(0),
-        dynamic_page_tables: Vec::new(),
-        mmap_regions: akuma_exec::process::AssistedSpinlock::new(Vec::new()),
-        lazy_regions: spinning_top::Spinlock::new(akuma_exec::process::LazyRegionMap::new()),
-        // stdio triple: `alloc_fd`'s from-0 safety + the shared exit path.
-        fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::with_stdio()),
-        thread_id: Some(tid),
-        spawner_pid: None,
-        ctty: core::sync::atomic::AtomicU32::new(0),
-        terminal_state: alloc::sync::Arc::new(spinning_top::Spinlock::new(
-            akuma_tty::TerminalState::default(),
-        )),
-        box_id: 0,
-        creds: alloc::sync::Arc::new(akuma_exec::process::SharedCreds::new(
-            akuma_exec::process::Creds::ROOT,
-        )),
-        namespace: akuma_isolation::global_namespace(),
-        channel: None,
-        delegate_pid: None,
-        grabbed_by: None,
-        clear_child_tid: core::sync::atomic::AtomicU64::new(0),
-        robust_list_head: 0,
-        robust_list_len: 0,
-        signal_actions: alloc::sync::Arc::new(akuma_exec::process::SharedSignalTable::new()),
-        signal_mask: 0,
-        fault_mutex: spinning_top::Spinlock::new(alloc::collections::BTreeMap::new()),
-        sigaltstack_sp: core::sync::atomic::AtomicU64::new(0),
-        sigaltstack_flags: core::sync::atomic::AtomicI32::new(2), // SS_DISABLE
-        sigaltstack_size: core::sync::atomic::AtomicU64::new(0),
-        start_time_us: (akuma_exec::runtime::runtime().uptime_us)(),
-        current_syscall: core::sync::atomic::AtomicU64::new(!0),
-        last_syscall: core::sync::atomic::AtomicU64::new(0),
-        syscall_stats: akuma_exec::process::ProcessSyscallStats::new(),
-    };
-    akuma_exec::process::register_process(pid, alloc::boxed::Box::new(proc));
-    // tid ↔ pid: `current_process_shared()`'s first lookup. tid is this ring
-    // slot — the same number `current_slot()` answers from the crossing on.
-    akuma_exec::process::thread_pid_map_insert(tid, pid);
+    }
 }
 
 /// The NEW fork arm: `fork_process` over the registered shell. The child

@@ -5008,7 +5008,9 @@ const YIELD_MASKED_WARN_LIMIT: u32 = 8;
 /// Yield to another thread
 #[inline(never)]
 pub fn yield_now() {
-    #[cfg(target_os = "none")]
+    // The hooked path's yield is a call, not an SGI, so a masked `DAIF.I` costs
+    // it nothing (and is how its syscalls run): the check is the SGI path's.
+    #[cfg(all(target_os = "none", sgi_sched))]
     {
         // If DAIF.I is set, the SGI we are about to trigger will not be delivered
         // to this core until IRQs are re-enabled — yield_now becomes a no-op and

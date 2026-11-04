@@ -94,7 +94,7 @@
   "unsafe_sites": {
     "amd64/src": 80,
     "crates/akuma-alloc": 24,
-    "crates/akuma-boot-aarch64": 4,
+    "crates/akuma-boot-aarch64": 5,
     "crates/akuma-boot-amd64": 2,
     "crates/akuma-cpu": 65,
     "crates/akuma-dma": 17,

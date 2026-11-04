@@ -8,7 +8,10 @@
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use akuma_primitives::safe_print;
+use akuma_tokio_kernel_core::task::USER_TOP;
 use akuma_vectors_aarch64::{Frame, Kind, ec};
+
+use crate::mm::Aarch64;
 
 /// The virtual timer's PPI.
 pub const TIMER_INTID: u32 = 27;
@@ -50,15 +53,63 @@ fn irq(f: &mut Frame) {
     if id == SPURIOUS {
         return;
     }
-    if id == TIMER_INTID {
+    let tick = id == TIMER_INTID;
+    if tick {
         TICKS.fetch_add(1, Relaxed);
         akuma_timer::arm_periodic_tick();
     }
     akuma_gic::end_of_interrupt(id);
-    let _ = f;
+    // A tick that interrupted EL0 is the preemption point: the thread's user
+    // state is in `f`, on its own kernel stack, so switching away here and
+    // coming back later resumes it exactly. A tick in the kernel (an idle
+    // window) only counts.
+    if tick && f.from_el0() {
+        let _ = akuma_threading::x86_yield();
+    }
+}
+
+/// Data/instruction fault status: translation (a page not mapped yet).
+const fn is_translation(esr: u64) -> bool {
+    esr & 0x3C == 0x04
+}
+
+/// Data/instruction fault status: permission (mapped, not for this access).
+const fn is_permission(esr: u64) -> bool {
+    esr & 0x3C == 0x0C
+}
+
+/// A data abort that wrote (`WnR`).
+const fn is_write(esr: u64) -> bool {
+    esr & (1 << 6) != 0
+}
+
+/// A fault on a user address, from either level: a lazy page filled, or a
+/// copy-on-write share broken. `true` when the access can be retried.
+fn user_fault(far: u64, esr: u64, data: bool, files: bool) -> bool {
+    use akuma_tokio_kernel_core::{cow, lazy};
+    if far >= USER_TOP {
+        return false;
+    }
+    let root = akuma_boot_aarch64::user::live_root();
+    if is_translation(esr) && lazy::fill::<Aarch64>(root, far, files) == lazy::Fill::Present {
+        return true;
+    }
+    data && is_permission(esr) && is_write(esr) && cow::resolve::<Aarch64>(root, far).resolves()
 }
 
 fn el1_sync(f: &mut Frame) {
+    // The kernel touching user memory: glue writes user buffers directly, so a
+    // copy-on-write page or a lazy one can fault here. Only a zero fill from
+    // EL1 (a file fill reads the filesystem, which this path may hold).
+    if f.ec() == ec::DABT_SAME && user_fault(f.far, f.esr, true, false) {
+        return;
+    }
+    // A fault inside the user-copy loop is a bad user pointer: `EFAULT`.
+    let fixup = akuma_primitives::preempt::get_user_copy_fault_handler();
+    if f.ec() == ec::DABT_SAME && f.far < USER_TOP && fixup != 0 {
+        f.elr = fixup;
+        return;
+    }
     safe_print!(
         192,
         "[Fault] EL1 ec=0x{:x} elr=0x{:016x} far=0x{:016x} esr=0x{:x} sp=0x{:x}\n",
@@ -72,22 +123,23 @@ fn el1_sync(f: &mut Frame) {
 }
 
 fn el0_sync(f: &mut Frame) {
-    let what = match f.ec() {
-        ec::SVC64 => "svc",
-        ec::DABT_LOWER => "data abort",
-        ec::IABT_LOWER => "instruction abort",
-        _ => "trap",
-    };
+    match f.ec() {
+        ec::SVC64 => return crate::syscall::svc(f),
+        ec::DABT_LOWER if user_fault(f.far, f.esr, true, true) => return,
+        ec::IABT_LOWER if user_fault(f.far, f.esr, false, true) => return,
+        _ => {}
+    }
     safe_print!(
         192,
-        "[Fault] EL0 {} ec=0x{:x} elr=0x{:016x} far=0x{:016x} esr=0x{:x} -- no userspace yet\n",
-        what,
+        "[Fault] EL0 ec=0x{:x} elr=0x{:016x} sp=0x{:016x} far=0x{:016x} esr=0x{:x} -- task killed\n",
         f.ec(),
         f.elr,
+        f.sp,
         f.far,
         f.esr
     );
-    crate::halt();
+    // Signals are A5.8: a fault ends the process as SIGSEGV would.
+    crate::proc::exit((-11i64) as u64)
 }
 
 fn unexpected(f: &mut Frame) {

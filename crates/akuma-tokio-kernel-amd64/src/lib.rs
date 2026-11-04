@@ -265,10 +265,6 @@ use akuma_pte_amd64::ADDR_MASK as PTE_ADDR;
 // W^X and the copy-on-write break are `akuma_tokio_kernel_core::cow`'s, over `lazy::Amd64`'s bits.
 use akuma_tokio_kernel_core::cow;
 
-fn wx_on() -> bool {
-    cow::wx_on()
-}
-
 fn mark_written(root: u64, va: u64) {
     cow::mark_written::<lazy::Amd64>(root, va);
 }
@@ -911,8 +907,6 @@ static MMDBG_V: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 fn mmdbg() -> u32 {
     MMDBG_V.load(core::sync::atomic::Ordering::Relaxed)
 }
-/// Cap on one `write(2)`: the console is a serial line, not a disk.
-const WRITE_LIMIT: u64 = 1 << 20;
 
 /// The ext2 inode behind `fd` in the current process's descriptor table, if
 /// it names a regular file: the pin `openat` recorded, or the path resolved
@@ -927,13 +921,6 @@ fn fd_inode(fd: u64) -> Option<u32> {
     let inode = if kf.inode() != 0 { kf.inode() } else { root_fs().resolve_inode(&kf.path).ok()? };
     let md = root_fs().metadata_by_inode(inode).ok()?;
     (!md.is_dir).then_some(inode)
-}
-
-/// A regular file's current length, as ext2 has it — one size per inode, the
-/// way Linux keeps it, so every description of the file agrees. `None` when the
-/// inode cannot be read (the callers answer as for an empty file or `EIO`).
-fn inode_size(inode: u32) -> Option<u64> {
-    root_fs().metadata_by_inode(inode).ok().map(|md| md.size)
 }
 
 /// The task records (`akuma_tokio_kernel_core::task`), reached only through [`with_task`] /
@@ -976,10 +963,6 @@ fn mm_dump_for(va: u64) {
 
 fn release_pages(root: u64, start: u64, end: u64) {
     mm::release_pages::<lazy::Amd64>(root, start, end);
-}
-
-fn shared_writeback(lo: u64, hi: u64) {
-    mm::shared_writeback::<lazy::Amd64>(lo, hi);
 }
 
 pub(crate) fn shared_flush_all() {
@@ -1345,59 +1328,15 @@ fn trace_err(nr: u64, r: u64, a1: u64, a2: u64, a3: u64) {
     }
 }
 
-/// `write`/`writev` on a `Stdout`/`Stderr`/`DevTty` descriptor of a process
-/// with no I/O channel of its own: the console. Glue would buffer it in a
-/// channel nothing drains here; init (sshd) and every process forked from it
-/// write their stdio this way. `None` for
-/// every other call, so the fd layer serves it.
+/// `write`/`writev` of a channel-less process's stdio: the console
+/// (`akuma_runtime_tokio::console`, shared with aarch64).
 fn console_stdio_write(nr: u64, a: [u64; 6]) -> Option<u64> {
-    use akuma_exec::process::FileDescriptor as F;
-    let (fd, iov, cnt) = match nr {
-        akuma_syscalls_abi::x86_64::WRITE => (a[0], 0, 0),
-        akuma_syscalls_abi::x86_64::WRITEV => (a[0], a[1], a[2]),
+    let vectored = match nr {
+        akuma_syscalls_abi::x86_64::WRITE => false,
+        akuma_syscalls_abi::x86_64::WRITEV => true,
         _ => return None,
     };
-    // `Process.channel`, not `current_channel()`: the latter falls back to the
-    // per-thread exit channel every forked child is registered with for its
-    // parent's wait, and glue would buffer the child's stdout there, unread.
-    let p = akuma_exec::process::current_process_shared()?;
-    if p.channel.is_some() {
-        return None;
-    }
-    if !p.with_fd(fd as u32, |d| matches!(d, F::Stdout | F::Stderr | F::DevTty))? {
-        return None;
-    }
-    let emit = |base: u64, len: u64| -> u64 {
-        let mut chunk = [0u8; 256];
-        let mut done = 0u64;
-        while done < len {
-            let n = ((len - done) as usize).min(chunk.len());
-            if akuma_user_access::copy_from_user(&mut chunk[..n], base + done).is_err() {
-                return if done == 0 { e(ring3::err::EFAULT) } else { done };
-            }
-            for &b in &chunk[..n] {
-                console::putb(b);
-            }
-            done += n as u64;
-        }
-        done
-    };
-    if nr == akuma_syscalls_abi::x86_64::WRITE {
-        return Some(emit(a[1], a[2].min(WRITE_LIMIT)));
-    }
-    let mut total = 0u64;
-    for i in 0..cnt.min(1024) {
-        let mut entry = [0u64; 2];
-        if akuma_user_access::read_user_into(&mut entry, iov + i * 16).is_err() {
-            return Some(if total == 0 { e(ring3::err::EFAULT) } else { total });
-        }
-        let n = emit(entry[0], entry[1].min(WRITE_LIMIT));
-        if n.cast_signed() < 0 {
-            return Some(if total == 0 { n } else { total });
-        }
-        total += n;
-    }
-    Some(total)
+    akuma_runtime_tokio::console::stdio_write(vectored, a, console::putb)
 }
 
 /// The tokio surface on this ABI: the shared-number calls, then the allow-list by the call
@@ -1472,26 +1411,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             // from the stack top on the next task's first syscall).
             task_done(code)
         }
-        akuma_syscalls_abi::x86_64::BRK => {
-            let want = fr.arg1();
-            let (plan, brk_cur, root) = with_task(|t| (t.layout.brk_plan(want), t.layout.brk(), t.root_pa));
-            // Linux's failure value is the *old* break; a shrink is bookkeeping only (no unmap).
-            if plan == akuma_user_layout::Brk::Refuse {
-                return brk_cur;
-            }
-            if let akuma_user_layout::Brk::Grow { from, to: end } = plan {
-                // A shrink left its pages mapped, and a regrow must read zeros: release whatever is
-                // there (it used to be overwritten, leaking the frame and keeping nothing), then
-                // reserve the range lazily.
-                release_pages(root, from, end);
-                if !lazy::reserve(root, from, end - from, lazy::Lazy::anon(true, false)) {
-                    release_pages(root, from, end);
-                    return brk_cur;
-                }
-            }
-            with_task(|t| t.layout.set_brk(want));
-            want
-        }
+        akuma_syscalls_abi::x86_64::BRK => mm::brk_arm::<lazy::Amd64>(fr.arg1()),
         ring3::nr::ARCH_PRCTL => {
             let (code, addr) = (fr.arg1(), fr.arg2());
             match code {
@@ -1532,153 +1452,10 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
             }
         }
         akuma_syscalls_abi::x86_64::MMAP => {
-            let (addr, len, prot, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
-            let fd = fr.arg5();
-            let off = fr.arg6();
-            // Linux refuses an offset that is not a page multiple, mapping or not.
-            if len == 0 || off & 0xFFF != 0 {
-                return e(ring3::err::EINVAL);
-            }
-            if wx_on() && let Some(no) = akuma_syscalls_mem::wx::check_prot(prot).errno() {
-                return e(no);
-            }
-            // M5: two kinds of mapping. MAP_ANONYMOUS — the only kind this
-            // kernel served before — and, now, MAP_PRIVATE of an open file:
-            // musl's ldso reserves a library's span anonymous and then
-            // re-maps each PT_LOAD over it MAP_FIXED from the library's fd
-            // (`map_library`). Zeroed pages filled from the inode at `off`
-            // is exactly that, minus COW (writes are private to this task
-            // because its address space dies with it).
-            let anon = flags & ring3::mmap::MAP_ANONYMOUS != 0;
-            let mut fnode: Option<u32> = None;
-            let mut fsize = 0u64;
-            if !anon {
-                // A regular file in the process's table; anything else
-                // (unbound, socket, pipe, directory) has no file to map.
-                match fd_inode(fd) {
-                    Some(node) => {
-                        fnode = Some(node);
-                        fsize = inode_size(node).unwrap_or(0);
-                    }
-                    _ => return e(ring3::err::ENODEV),
-                }
-            }
-            let root = task_root();
-            let Some(pages) = akuma_user_layout::page_span(len) else {
-                return e(ring3::err::ENOMEM);
-            };
-            let base = if flags & ring3::mmap::MAP_FIXED != 0 && with_task(|t| t.layout.in_slab(addr, pages)) {
-                // Replacing whatever was there (musl's ldso maps each PT_LOAD
-                // over its anonymous reservation): the old frames go back, and
-                // the range leaves the hole table.
-                if mmdbg() & 2 != 0 {
-                    mm_event(2, addr, addr + pages);
-                    // A shared file mapping under it keeps what was written to it.
-                    if overlaps_shared(addr, addr + pages) {
-                        shared_writeback(addr, addr + pages);
-                    }
-                    release_pages(root, addr, addr + pages);
-                    with_task(|t| {
-                        t.layout.forget_shared_within(addr, addr + pages);
-                        t.layout.carve(addr, addr + pages);
-                    });
-                }
-                addr
-            } else {
-                match with_task(|t| t.layout.alloc(pages)) {
-                    Some(b) => b,
-                    None => return e(ring3::err::ENOMEM),
-                }
-            };
-            // Writable only when asked, as `mprotect` already was: a `PROT_READ` file page is what the
-            // shared file-page cache can hand to every mapper (`lazy::fill`), and it was never shared
-            // while this widened it to RW. With W^X on, a `PROT_EXEC` mapping is RX - `W|X` was refused
-            // above, so it asked for no write - and a page can only become executable if the program
-            // never wrote it. With `wx=0` the old widening to RWX is back.
-            let (write, exec) = if prot & ring3::mmap::PROT_EXEC == 0 {
-                (prot & ring3::mmap::PROT_WRITE != 0, false)
-            } else if wx_on() {
-                (false, true)
-            } else {
-                (true, true)
-            };
-            // `PROT_NONE`: a record nothing fills (or, eagerly, a page without the user bit).
-            #[allow(clippy::verbose_bit_mask)] // PROT_NONE is spelled as the bits it lacks
-            let none = prot & 7 == 0;
-            let pte = if none { PteProt { write: false, exec: false, user: false } } else { PteProt { write, exec, user: true } };
-            const MAP_SHARED: u64 = 0x1;
-            let shared_write = fnode.is_some() && flags & MAP_SHARED != 0 && prot & ring3::mmap::PROT_WRITE != 0;
-            let shared_anon = anon && flags & MAP_SHARED != 0;
-            // Lazy (`lazy.rs`): one record per page, a frame on the first touch. A writable shared file
-            // page's record says so (`shared`), and its fill maps the one frame every mapper of that page
-            // maps (`shmpages`); fork shares the span's present frames as they are. An anonymous shared
-            // mapping is eager: two lazy records would fill two frames, so it has its frames before the
-            // first fork. So is a file mapping past what a record holds, or whose inode cannot be pinned.
-            let first = lazy::Lazy {
-                write,
-                exec,
-                none,
-                file: fnode.map(|inode| lazy::FilePage { inode, index: off / 4096, shared: shared_write }),
-            };
-            let lazy_ok =
-                !shared_anon && lazy::fits(first, pages / 4096) && fnode.is_none_or(|node| lazy::pin(root, node, base, base + pages));
-            if lazy_ok {
-                if !lazy::reserve(root, base, pages, first) {
-                    release_pages(root, base, base + pages);
-                    return e(ring3::err::ENOMEM);
-                }
-            } else {
-                let mut page = base & !0xFFF;
-                while page < base + pages {
-                    let Some(frame) = phys::Frame::alloc_zeroed() else {
-                        return e(ring3::err::ENOMEM);
-                    };
-                    if !paging::map_page_in(root, page as usize, frame.pa(), pte, MemAttr::WriteBack) {
-                        return e(ring3::err::ENOMEM);
-                    }
-                    if let Some(node) = fnode {
-                        // File-backed: fill this page straight from the inode. A short read (the page
-                        // runs past EOF) leaves the zeroed tail - the same bytes a mapping of the file
-                        // would have there.
-                        let foff = off + (page - base);
-                        let mut done = 0usize;
-                        while done < 4096 {
-                            let want = (4096 - done).min(1024);
-                            let mut chunk = [0u8; 1024];
-                            let got = match root_fs().read_at_by_inode(
-                                node,
-                                (foff + done as u64) as usize,
-                                &mut chunk[..want],
-                            ) {
-                                Ok(g) => g,
-                                Err(_) => return e(ring3::err::EIO),
-                            };
-                            if got == 0 {
-                                break;
-                            }
-                            frame.write_bytes(done, &chunk[..got]);
-                            done += got;
-                        }
-                    }
-                    page += 4096;
-                }
-            }
-            // A MAP_FIXED mapping lands inside an earlier reservation, BELOW
-            // `mmap_cur`: only a mapping above the cursor moves it.
-            with_task(|t| t.layout.note_mapped(base + pages));
-            if let Some(node) = fnode
-                && shared_write
-            {
-                let f = akuma_user_layout::SharedFile { base, len: pages, inode: node, offset: off, size: fsize };
-                let recorded = with_task(|t| t.layout.add_shared(f));
-                if !recorded {
-                    akuma_primitives::safe_print!(96, "[mmap] shared-file table full: writes to this mapping are lost\n");
-                }
-            }
-            if shared_anon && !with_task(|t| t.layout.add_shared(akuma_user_layout::SharedFile::anon(base, pages))) {
-                akuma_primitives::safe_print!(96, "[mmap] shared-file table full: a fork copies this mapping\n");
-            }
-            base
+            let (flags, fd) = (fr.arg4(), fr.arg5());
+            // The descriptor is the process's; the decision is core's (`mm::mmap_arm`).
+            let file = if flags & ring3::mmap::MAP_ANONYMOUS == 0 { fd_inode(fd) } else { None };
+            mm::mmap_arm::<lazy::Amd64>(fr.arg1(), fr.arg2(), fr.arg3(), flags, file, fr.arg6())
         }
         akuma_syscalls_abi::x86_64::MPROTECT => mprotect_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         akuma_syscalls_abi::x86_64::MUNMAP => munmap_arm(fr.arg1(), fr.arg2()),

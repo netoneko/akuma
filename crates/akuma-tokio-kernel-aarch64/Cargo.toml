@@ -32,6 +32,7 @@ akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 akuma-fpcache = { path = "../akuma-fpcache" }
 # The tokio surface over glue (the amd64 half's feature set, so the two build glue alike).
 akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, features = ["smoltcp", "sc-epoll", "sc-eventfd"] }
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 akuma-runtime-tokio = { path = "../akuma-runtime-tokio", features = ["process"] }
 # The hooked cooperative scheduler (B21 A4), not the full kernel's SGI one.
 akuma-threading = { path = "../akuma-threading", features = ["hooked"] }

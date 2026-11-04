@@ -30,6 +30,9 @@ mod exec;
 mod fs;
 mod machine;
 mod mm;
+mod proc;
+mod sched;
+mod syscall;
 mod trap;
 
 use akuma_primitives::safe_print;
@@ -188,6 +191,7 @@ fn boot(k: &Kernel) -> ! {
 
     // The process runtime and the tokio surface, then the root.
     exec::init();
+    sched::init();
     fs::install_surface();
     #[cfg(feature = "disk")]
     let root = if k.disk && m.virtio.is_some() { fs::disk_root() } else { None };
@@ -208,17 +212,43 @@ fn boot(k: &Kernel) -> ! {
         }
         safe_print!(4, "\n");
     }
-    let init = akuma_tokio_kernel_core::cmdline::token(m.cmdline.as_str(), "init=").unwrap_or("/bin/init");
-    if akuma_vfs_glue::exists(init) {
-        safe_print!(160, "  init: {} is on the root\n", init);
-    } else {
-        safe_print!(160, "  init: {} not found on the root\n", init);
-    }
-
     akuma_primitives::console::print_str(id.art);
     safe_print!(96, "\n  {} {} (akuma-tokio-kernel, aarch64)\n\n", id.name, id.version);
-    safe_print!(160, "[{}] no EL0 or init on aarch64 yet (B21 A5.5+): powering off\n", id.name);
-    power_off()
+    run_init(m.cmdline.as_str())
+}
+
+/// Load `init=` (with `initargs=`/`initenv=`, `akuma_tokio_kernel_core::init::Prog`)
+/// into the boot record and start it as pid 1. Never returns.
+fn run_init(cmdline: &str) -> ! {
+    use akuma_tokio_kernel_core::init::{MAX_ARGV, MAX_ENV, Prog};
+    let mut prog = Prog::new();
+    prog.parse(cmdline);
+    let path = prog.path_str();
+    safe_print!(160, "{}: init spawn -- init={}\n", akuma_tokio_kernel_core::identity().name, path);
+    let Ok(image) = akuma_tokio_kernel_core::loader::read_image::<mm::Aarch64>(path) else {
+        safe_print!(160, "  init: {} is not on the root\n", path);
+        power_off();
+    };
+    let mut argv: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
+    for k in 0..prog.n_args() {
+        argv[k + 1] = prog.arg_str(k);
+    }
+    let mut env: [&str; MAX_ENV] = [""; MAX_ENV];
+    for (k, slot) in env.iter_mut().enumerate().take(prog.n_env()) {
+        *slot = prog.env_str(k);
+    }
+    mm::set_task_slot(0);
+    let Some(ti) = akuma_tokio_kernel_core::loader::load_task::<mm::Aarch64>(
+        &argv[..=prog.n_args()],
+        &env[..prog.n_env()],
+        &image,
+        path,
+    ) else {
+        safe_print!(96, "  init: task load failed\n");
+        power_off();
+    };
+    drop(image);
+    proc::start_init(path, &ti)
 }
 
 /// The console sink: every byte to the PL011, `\n` as `\r\n`.
@@ -240,8 +270,21 @@ pub fn halt() -> ! {
     }
 }
 
+/// One byte of a process's stdio to the console.
+pub(crate) fn console_putb(b: u8) {
+    #[cfg(feature = "console")]
+    {
+        if b == b'\n' {
+            akuma_uart::write_byte(b'\r');
+        }
+        akuma_uart::write_byte(b);
+    }
+    #[cfg(not(feature = "console"))]
+    let _ = b;
+}
+
 /// PSCI `SYSTEM_OFF`, then park the core if the call came back.
-fn power_off() -> ! {
+pub(crate) fn power_off() -> ! {
     let _ = akuma_psci::call(akuma_psci::SYSTEM_OFF, 0, 0, 0);
     halt()
 }

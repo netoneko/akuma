@@ -985,6 +985,7 @@ dependencies = [
  "akuma-pte-aarch64",
  "akuma-runtime-tokio",
  "akuma-syscalls-glue",
+ "akuma-syscalls-linux",
  "akuma-threading",
  "akuma-timer",
  "akuma-tokio-kernel-core",

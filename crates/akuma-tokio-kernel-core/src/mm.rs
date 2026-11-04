@@ -9,6 +9,7 @@
 use akuma_syscalls_linux::flags::prot::{PROT_EXEC, PROT_WRITE};
 
 use crate::{cow, lazy, shmpages};
+use crate::mmu::FreshPage;
 use crate::task::{MMAP_BASE, Task, USER_TOP};
 
 const EINVAL: u64 = 22;
@@ -291,3 +292,160 @@ pub fn munmap_arm<M: Mm>(addr: u64, len: u64) -> u64 {
     0
 }
 
+
+/// `brk(want)`: grow the break lazily, shrink it as bookkeeping only.
+///
+/// Linux's failure value is the *old* break. A grow first releases whatever a
+/// shrink left mapped (a regrow must read zeros), then reserves the range lazily.
+#[must_use]
+pub fn brk_arm<M: Mm>(want: u64) -> u64 {
+    let (plan, brk_cur, root) = M::with_task(|t| (t.layout.brk_plan(want), t.layout.brk(), t.root_pa));
+    if plan == akuma_user_layout::Brk::Refuse {
+        return brk_cur;
+    }
+    if let akuma_user_layout::Brk::Grow { from, to: end } = plan {
+        release_pages::<M>(root, from, end);
+        if !lazy::reserve::<M>(root, from, end - from, lazy::Lazy::anon(true, false)) {
+            release_pages::<M>(root, from, end);
+            return brk_cur;
+        }
+    }
+    M::with_task(|t| t.layout.set_brk(want));
+    want
+}
+
+/// `mmap(addr, len, prot, flags, fd, off)`, the descriptor already resolved.
+///
+/// `file` is the regular file's inode on the root, `None`
+/// for `MAP_ANONYMOUS`. A non-anonymous mapping of anything else is the caller's
+/// `ENODEV`.
+///
+/// Two kinds of mapping: anonymous, and `MAP_PRIVATE`/`MAP_SHARED` of a file
+/// (musl's ldso reserves a library's span anonymous, then maps each `PT_LOAD`
+/// over it `MAP_FIXED` from the library's fd). Lazy where a record can say it
+/// ([`lazy`]): one record per page, a frame on the first touch; a writable shared
+/// file page's record says `shared`, and its fill maps the one frame every mapper
+/// maps ([`shmpages`]). An anonymous shared mapping is eager (two lazy records
+/// would fill two frames), and so is a file mapping a record cannot hold or whose
+/// inode cannot be pinned. Writable only when asked; with W^X on (`cow`) a
+/// `PROT_EXEC` mapping is RX and `W|X` is refused.
+#[must_use]
+#[allow(clippy::too_many_lines)] // one syscall's whole decision, in Linux's order
+pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<u32>, off: u64) -> u64 {
+    use akuma_syscalls_linux::flags::map::{MAP_ANONYMOUS, MAP_FIXED, MAP_SHARED};
+    const ENODEV: u64 = 19;
+    const EIO: u64 = 5;
+    // Linux refuses an offset that is not a page multiple, mapping or not.
+    if len == 0 || off & 0xFFF != 0 {
+        return e(EINVAL);
+    }
+    if cow::wx_on()
+        && let Some(no) = akuma_syscalls_mem::wx::check_prot(prot).errno()
+    {
+        return e(no);
+    }
+    let anon = flags & u64::from(MAP_ANONYMOUS) != 0;
+    let fnode = match (anon, file) {
+        (true, _) => None,
+        (false, Some(node)) => Some(node),
+        (false, None) => return e(ENODEV),
+    };
+    let fs = M::root_fs();
+    let fsize = fnode.map_or(0, |node| fs.metadata_by_inode(node).map_or(0, |md| md.size));
+    let root = M::task_root();
+    let Some(pages) = akuma_user_layout::page_span(len) else {
+        return e(ENOMEM);
+    };
+    let base = if flags & u64::from(MAP_FIXED) != 0 && M::with_task(|t| t.layout.in_slab(addr, pages)) {
+        // Replacing whatever was there: the old frames go back, and the range
+        // leaves the hole table. A shared file mapping under it keeps what was
+        // written to it.
+        if M::mmdbg() & 2 != 0 {
+            M::mm_event(2, addr, addr + pages);
+            if M::with_task(|t| t.layout.shared().iter().any(|f| f.overlaps(addr, addr + pages))) {
+                shared_writeback::<M>(addr, addr + pages);
+            }
+            release_pages::<M>(root, addr, addr + pages);
+            M::with_task(|t| {
+                t.layout.forget_shared_within(addr, addr + pages);
+                t.layout.carve(addr, addr + pages);
+            });
+        }
+        addr
+    } else {
+        match M::with_task(|t| t.layout.alloc(pages)) {
+            Some(b) => b,
+            None => return e(ENOMEM),
+        }
+    };
+    let (write, exec) = if prot & u64::from(PROT_EXEC) == 0 {
+        (prot & u64::from(PROT_WRITE) != 0, false)
+    } else if cow::wx_on() {
+        (false, true)
+    } else {
+        (true, true)
+    };
+    // `PROT_NONE`: a record nothing fills (or, eagerly, a page without the user bit).
+    #[allow(clippy::verbose_bit_mask)] // PROT_NONE is spelled as the bits it lacks
+    let none = prot & 7 == 0;
+    let shared_write = fnode.is_some() && flags & u64::from(MAP_SHARED) != 0 && prot & u64::from(PROT_WRITE) != 0;
+    let shared_anon = anon && flags & u64::from(MAP_SHARED) != 0;
+    let first = lazy::Lazy {
+        write,
+        exec,
+        none,
+        file: fnode.map(|inode| lazy::FilePage { inode, index: off / 4096, shared: shared_write }),
+    };
+    let lazy_ok = !shared_anon
+        && lazy::fits(first, pages / 4096)
+        && fnode.is_none_or(|node| lazy::pin(root, node, base, base + pages));
+    if lazy_ok {
+        if !lazy::reserve::<M>(root, base, pages, first) {
+            release_pages::<M>(root, base, base + pages);
+            return e(ENOMEM);
+        }
+    } else {
+        let mut page = base & !0xFFF;
+        while page < base + pages {
+            let Some(mut frame) = <M::Frame as FreshPage>::alloc_zeroed() else {
+                return e(ENOMEM);
+            };
+            if let Some(node) = fnode {
+                // File-backed: fill this page straight from the inode. A short
+                // read (past EOF) leaves the zeroed tail.
+                let foff = off + (page - base);
+                let mut done = 0usize;
+                while done < 4096 {
+                    let got = match fs.read_at_by_inode(node, (foff + done as u64) as usize, &mut frame.bytes_mut()[done..]) {
+                        Ok(g) => g,
+                        Err(_) => return e(EIO),
+                    };
+                    if got == 0 {
+                        break;
+                    }
+                    done += got;
+                }
+            }
+            if !M::map_page(root, page, frame.pa() as u64, write && !none, exec && !none, !none) {
+                return e(ENOMEM);
+            }
+            let _ = frame.publish();
+            page += 4096;
+        }
+    }
+    // A MAP_FIXED mapping lands inside an earlier reservation, below the
+    // cursor: only a mapping above it moves it.
+    M::with_task(|t| t.layout.note_mapped(base + pages));
+    if let Some(node) = fnode
+        && shared_write
+    {
+        let f = akuma_user_layout::SharedFile { base, len: pages, inode: node, offset: off, size: fsize };
+        if !M::with_task(|t| t.layout.add_shared(f)) {
+            akuma_primitives::safe_print!(96, "[mmap] shared-file table full: writes to this mapping are lost\n");
+        }
+    }
+    if shared_anon && !M::with_task(|t| t.layout.add_shared(akuma_user_layout::SharedFile::anon(base, pages))) {
+        akuma_primitives::safe_print!(96, "[mmap] shared-file table full: a fork copies this mapping\n");
+    }
+    base
+}

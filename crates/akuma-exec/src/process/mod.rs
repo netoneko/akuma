@@ -28,6 +28,7 @@ pub mod signal;
 pub mod stats;
 pub mod fd;
 pub mod image;
+mod adopted;
 pub mod spawn;
 pub mod exec;
 pub mod diag;

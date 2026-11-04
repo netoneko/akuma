@@ -13,7 +13,7 @@ use akuma_pagetable::aarch64 as walk;
 use akuma_pte_aarch64 as pte;
 
 /// Task records: the spawn ring's slots plus the boot thread's (record 0).
-pub const NSLOTS: usize = 16;
+pub const NSLOTS: usize = 48;
 /// Cores this kernel can run (A6 brings the secondaries).
 pub const MAX_CPUS: usize = 8;
 
@@ -50,6 +50,12 @@ pub fn with_task<R>(f: impl FnOnce(&mut Task) -> R) -> R {
 #[must_use]
 pub fn task_root() -> u64 {
     TASKS.root_of(task_slot_index())
+}
+
+/// The page-table root of record `i` (`0`: none, the boot root).
+#[must_use]
+pub fn record_root(i: usize) -> u64 {
+    TASKS.root_of(i)
 }
 
 /// The aarch64 machine.
@@ -265,4 +271,11 @@ pub fn self_test() -> bool {
         after
     );
     shared && after == before
+}
+
+/// `AT_HWCAP`: FP and Advanced SIMD, which every core this runs on has.
+/// The optional extensions are not claimed until they are read from
+/// `ID_AA64ISAR0_EL1`; a program then takes its portable path.
+impl akuma_tokio_kernel_core::loader::Loader for Aarch64 {
+    const HWCAP: u64 = (1 << 0) | (1 << 1);
 }

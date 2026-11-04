@@ -9,8 +9,7 @@ use akuma_boot_amd64::phys::FreshFrame;
 use akuma_tokio_kernel_core::lazy as core_lazy;
 use akuma_tokio_kernel_core::mmu::{FreshPage, UserPages};
 
-pub use akuma_tokio_kernel_core::lazy::{Fill, Lazy, fits, move_pins, pin};
-pub use akuma_tokio_kernel_core::lazy_record::FilePage;
+pub use akuma_tokio_kernel_core::lazy::{Fill, Lazy, move_pins};
 
 /// The amd64 machine, as the core's demand paging sees it.
 pub struct Amd64;
