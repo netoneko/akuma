@@ -9,7 +9,7 @@ use akuma_boot_amd64::phys::FreshFrame;
 use akuma_tokio_kernel_core::lazy as core_lazy;
 use akuma_tokio_kernel_core::mmu::{FreshPage, UserPages};
 
-pub use akuma_tokio_kernel_core::lazy::{Fill, Lazy, move_pins};
+pub use akuma_tokio_kernel_core::lazy::{Fill, Lazy};
 
 /// The amd64 machine, as the core's demand paging sees it.
 pub struct Amd64;
@@ -124,6 +124,12 @@ impl akuma_tokio_kernel_core::mm::Mm for Amd64 {
     fn mm_event(kind: u8, start: u64, end: u64) {
         crate::mm_event(kind, start, end);
     }
+    fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
+        crate::copy_to_user(dst_va, src)
+    }
+    fn copy_from_user(dst: &mut [u8], src_va: u64) -> bool {
+        crate::copy_from_user(dst, src_va)
+    }
 }
 
 impl akuma_tokio_kernel_core::tree::UserTree for Amd64 {
@@ -166,20 +172,12 @@ impl core_lazy::Kernel for Amd64 {
     }
 }
 
-pub fn reserve(root: u64, base: u64, len: u64, first: Lazy) -> bool {
-    core_lazy::reserve::<Amd64>(root, base, len, first)
-}
-
 pub fn fill(root: u64, va: u64, files: bool) -> Fill {
     core_lazy::fill::<Amd64>(root, va, files)
 }
 
 pub fn prefault(start: usize, len: usize) -> bool {
     core_lazy::prefault::<Amd64>(start, len)
-}
-
-pub fn move_range(root: u64, from: u64, to: u64, len: u64) -> bool {
-    core_lazy::move_range::<Amd64>(root, from, to, len)
 }
 
 
@@ -205,8 +203,5 @@ impl akuma_tokio_kernel_core::proc::Proc for Amd64 {
     }
     fn record_root(i: usize) -> u64 {
         crate::task_root_of(i)
-    }
-    fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
-        crate::copy_to_user(dst_va, src)
     }
 }

@@ -948,9 +948,6 @@ fn mm_event(kind: u8, start: u64, end: u64) {
 #[cfg(not(feature = "trace-err"))]
 fn mm_event(_kind: u8, _start: u64, _end: u64) {}
 
-/// Print every recorded slab event that covers `va` (kinds: 1 munmap, 2
-/// MAP_FIXED release, 3 mremap shrink, 4 mremap move-free, 5 mmap, 6 mremap-grow).
-#[cfg(feature = "trace-err")]
 /// What the faulting task actually executes at `rip`: the 16 bytes mapped there, the frame
 /// that maps them, and that frame's share count. A fault the instruction at `rip` cannot raise
 /// means those bytes are not the image's.
@@ -975,6 +972,9 @@ fn fault_code_dump(rip: u64) {
     );
 }
 
+/// Print every recorded slab event that covers `va` (kinds: 1 munmap, 2
+/// MAP_FIXED release, 3 mremap shrink, 4 mremap move-free, 5 mmap, 6 mremap-grow).
+#[cfg(feature = "trace-err")]
 fn mm_dump_for(va: u64) {
     MM_EVENTS.view(|head, ev| {
         for i in 0..128 {
@@ -984,10 +984,6 @@ fn mm_dump_for(va: u64) {
             }
         }
     });
-}
-
-fn release_pages(root: u64, start: u64, end: u64) {
-    mm::release_pages::<lazy::Amd64>(root, start, end);
 }
 
 fn msync_arm(addr: u64, len: u64) -> u64 {
@@ -1494,91 +1490,8 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         ),
         ring3::nr::PAUSE => akuma_syscalls_glue::sys_pause(),
         akuma_syscalls_abi::x86_64::RT_SIGRETURN => child::sigreturn_arm(fr),
-        akuma_syscalls_abi::x86_64::MREMAP => {
-            // musl's realloc on an mmapped chunk. Shrink frees the tail; grow
-            // extends in place when the range ends at the slab cursor, else
-            // moves (MAYMOVE, which the caller accepts by using the returned
-            // address): a slab mapping by moving its leaves, anything else by
-            // copying the overlap.
-            // MREMAP_FIXED is refused: no fixed targets.
-            let (old, old_sz, new_sz, flags) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4());
-            if new_sz == 0 || flags & 2 != 0 || old & 0xFFF != 0 {
-                return e(ring3::err::EINVAL);
-            }
-            if old_sz == 0 || !user_ok(old, old_sz) {
-                return e(ring3::err::EFAULT);
-            }
-            // A `MAP_SHARED` record names its range; moving or resizing the pages under it would leave it
-            // naming the wrong ones. Refused rather than followed (a pinned divergence: Linux allows it).
-            if overlaps_shared(old, old.saturating_add(old_sz)) {
-                return e(ring3::err::EINVAL);
-            }
-            let root = task_root();
-            let Ok(plan) = with_task(|t| t.layout.mremap(old, old_sz, new_sz)) else {
-                return e(ring3::err::EINVAL);
-            };
-            // Both page-rounded; `mremap` above refused a size that does not round.
-            let (old_pages, new_pages) = (old_sz.div_ceil(4096) * 4096, new_sz.div_ceil(4096) * 4096);
-            if let akuma_user_layout::Mremap::Shrink { release } = plan {
-                if let Some((lo, hi)) = release
-                    && mmdbg() & 4 != 0
-                {
-                    mm_event(3, lo, hi);
-                    release_pages(root, lo, hi);
-                    with_task(|t| t.layout.release(lo, hi));
-                }
-                return old;
-            }
-            // In place: the range is the topmost thing in the slab.
-            if let akuma_user_layout::Mremap::InPlace { from, to } = plan {
-                if !lazy::reserve(root, from, to - from, lazy::Lazy::anon(true, false)) {
-                    release_pages(root, from, to);
-                    return e(ring3::err::ENOMEM);
-                }
-                with_task(|t| t.layout.note_mapped(to));
-                return old;
-            }
-            let release_old = matches!(plan, akuma_user_layout::Mremap::Move { release_old: true });
-            let Some(base) = with_task(|t| t.layout.alloc(new_pages)) else {
-                return e(ring3::err::ENOMEM);
-            };
-            // A slab mapping moves by its leaves: present or lazy, each page keeps its frame and its
-            // bits at the new address, so nothing is copied and nothing untouched gets filled. The
-            // tail past the old length is fresh zero-fill.
-            if release_old && mmdbg() & 4 != 0 {
-                if !lazy::reserve(root, base + old_pages, new_pages - old_pages, lazy::Lazy::anon(true, false)) {
-                    release_pages(root, base, base + new_pages);
-                    return e(ring3::err::ENOMEM);
-                }
-                if !lazy::move_range(root, old, base, old_pages) {
-                    release_pages(root, base, base + new_pages);
-                    return e(ring3::err::ENOMEM);
-                }
-                lazy::move_pins(root, old, base, old_pages);
-                // Peers may still translate the old addresses to the moved frames.
-                smp::shootdown();
-                mm_event(4, old, old + old_pages);
-                with_task(|t| t.layout.release(old, old + old_pages));
-                return base;
-            }
-            if !lazy::reserve(root, base, new_pages, lazy::Lazy::anon(true, false)) {
-                release_pages(root, base, base + new_pages);
-                return e(ring3::err::ENOMEM);
-            }
-            let copy = old_sz.min(new_sz);
-            let mut chunk = [0u8; 1024];
-            let mut done = 0u64;
-            while done < copy {
-                let n = ((copy - done) as usize).min(chunk.len());
-                if !copy_from_user(&mut chunk[..n], old + done)
-                    || !copy_to_user(base + done, &chunk[..n])
-                {
-                    return e(ring3::err::EFAULT);
-                }
-                done += n as u64;
-            }
-            base
-        }
+        // musl's realloc on an mmapped chunk (`akuma_tokio_kernel_core::mm`'s).
+        akuma_syscalls_abi::x86_64::MREMAP => mm::mremap_arm::<lazy::Amd64>(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4()),
         // `clone` without `CLONE_THREAD`, `fork` and `vfork` all fork through
         // `fork_process`; `CLONE_THREAD` goes to `clone_thread` (child.rs).
         akuma_syscalls_abi::x86_64::CLONE | ring3::nr::FORK | ring3::nr::VFORK => child::fork_arm(fr),
@@ -1671,11 +1584,6 @@ pub(crate) fn copy_kernel_half(dst: phys::Frame) {
     for i in 256..512 {
         dst.set_entry(i, k.entry(i));
     }
-}
-
-/// Does `[lo, hi)` overlap a `MAP_SHARED` mapping of the running task?
-fn overlaps_shared(lo: u64, hi: u64) -> bool {
-    with_task(|t| t.layout.shared().iter().any(|f| f.overlaps(lo, hi)))
 }
 
 /// Load an ELF image into the CURRENT task slot (`akuma_tokio_kernel_core::loader::load_task`):

@@ -40,6 +40,10 @@ pub trait Mm: lazy::Kernel {
     fn mmdbg() -> u32;
     /// Record a slab event for the fault reports (`trace-err`).
     fn mm_event(kind: u8, start: u64, end: u64);
+    /// Copy `src` to the running task's `dst_va`; `false` when it does not translate.
+    fn copy_to_user(dst_va: u64, src: &[u8]) -> bool;
+    /// Copy the running task's `src_va` into `dst`; `false` when it does not translate.
+    fn copy_from_user(dst: &mut [u8], src_va: u64) -> bool;
 }
 
 /// `mprotect(addr, len, prot)`.
@@ -292,6 +296,93 @@ pub fn munmap_arm<M: Mm>(addr: u64, len: u64) -> u64 {
     0
 }
 
+
+/// `mremap(old, old_sz, new_sz, flags)`: musl's `realloc` on an mmapped chunk.
+///
+/// A shrink frees the tail. A grow extends in place when the range ends at the
+/// slab cursor, else moves (`MREMAP_MAYMOVE`, which the caller accepts by using
+/// the returned address): a slab mapping by moving its leaves, anything else by
+/// copying the overlap. `MREMAP_FIXED` is refused (no fixed targets), and so is
+/// a range overlapping a `MAP_SHARED` mapping, whose record names its pages (a
+/// pinned divergence: Linux allows it).
+#[must_use]
+pub fn mremap_arm<M: Mm>(old: u64, old_sz: u64, new_sz: u64, flags: u64) -> u64 {
+    const EFAULT: u64 = 14;
+    if new_sz == 0 || flags & 2 != 0 || old & 0xFFF != 0 {
+        return e(EINVAL);
+    }
+    if old_sz == 0 || !M::with_task(|t| t.layout.user_ok(old, old_sz)) {
+        return e(EFAULT);
+    }
+    let end = old.saturating_add(old_sz);
+    if M::with_task(|t| t.layout.shared().iter().any(|f| f.overlaps(old, end))) {
+        return e(EINVAL);
+    }
+    let root = M::task_root();
+    let Ok(plan) = M::with_task(|t| t.layout.mremap(old, old_sz, new_sz)) else {
+        return e(EINVAL);
+    };
+    // Both page-rounded; `mremap` above refused a size that does not round.
+    let (old_pages, new_pages) = (old_sz.div_ceil(4096) * 4096, new_sz.div_ceil(4096) * 4096);
+    match plan {
+        akuma_user_layout::Mremap::Shrink { release } => {
+            if let Some((lo, hi)) = release
+                && M::mmdbg() & 4 != 0
+            {
+                M::mm_event(3, lo, hi);
+                release_pages::<M>(root, lo, hi);
+                M::with_task(|t| t.layout.release(lo, hi));
+            }
+            return old;
+        }
+        // In place: the range is the topmost thing in the slab.
+        akuma_user_layout::Mremap::InPlace { from, to } => {
+            if !lazy::reserve::<M>(root, from, to - from, lazy::Lazy::anon(true, false)) {
+                release_pages::<M>(root, from, to);
+                return e(ENOMEM);
+            }
+            M::with_task(|t| t.layout.note_mapped(to));
+            return old;
+        }
+        akuma_user_layout::Mremap::Move { .. } => {}
+    }
+    let release_old = matches!(plan, akuma_user_layout::Mremap::Move { release_old: true });
+    let Some(base) = M::with_task(|t| t.layout.alloc(new_pages)) else {
+        return e(ENOMEM);
+    };
+    // A slab mapping moves by its leaves: present or lazy, each page keeps its
+    // frame and its bits at the new address, so nothing is copied and nothing
+    // untouched gets filled. The tail past the old length is fresh zero-fill.
+    if release_old && M::mmdbg() & 4 != 0 {
+        if !lazy::reserve::<M>(root, base + old_pages, new_pages - old_pages, lazy::Lazy::anon(true, false))
+            || !lazy::move_range::<M>(root, old, base, old_pages)
+        {
+            release_pages::<M>(root, base, base + new_pages);
+            return e(ENOMEM);
+        }
+        lazy::move_pins(root, old, base, old_pages);
+        // Peers may still translate the old addresses to the moved frames.
+        M::shootdown();
+        M::mm_event(4, old, old + old_pages);
+        M::with_task(|t| t.layout.release(old, old + old_pages));
+        return base;
+    }
+    if !lazy::reserve::<M>(root, base, new_pages, lazy::Lazy::anon(true, false)) {
+        release_pages::<M>(root, base, base + new_pages);
+        return e(ENOMEM);
+    }
+    let copy = old_sz.min(new_sz);
+    let mut chunk = [0u8; 1024];
+    let mut done = 0u64;
+    while done < copy {
+        let n = ((copy - done) as usize).min(chunk.len());
+        if !M::copy_from_user(&mut chunk[..n], old + done) || !M::copy_to_user(base + done, &chunk[..n]) {
+            return e(EFAULT);
+        }
+        done += n as u64;
+    }
+    base
+}
 
 /// `brk(want)`: grow the break lazily, shrink it as bookkeeping only.
 ///

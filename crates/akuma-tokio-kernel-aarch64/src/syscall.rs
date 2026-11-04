@@ -8,20 +8,13 @@
 //! allow-listed calls go to glue and the fd family to the x86_64 ABI layer; on
 //! AArch64 glue's arms *are* the ABI layer, so it takes the rest directly.
 //! `clone`/`execve`/`exit` are `akuma_tokio_kernel_core::proc`'s, signal
-//! delivery `akuma_tokio_kernel_core::signal`'s at the return; `mremap` is
-//! `ENOSYS` until its arm moves to core (musl's `realloc` falls back to a copy).
+//! delivery `akuma_tokio_kernel_core::signal`'s at the return.
 
 use akuma_syscalls_linux::nr;
 use akuma_tokio_kernel_core::{mm, proc};
 use akuma_vectors_aarch64::Frame;
 
 use crate::mm::Aarch64;
-
-const ENOSYS: u64 = 38;
-
-const fn e(code: u64) -> u64 {
-    0u64.wrapping_sub(code)
-}
 
 /// Serve the `svc` that trapped into `f`. A thread `exit_group` asked to end
 /// leaves at entry or on the way back, rather than running on in a dying
@@ -66,10 +59,7 @@ fn dispatch(f: &Frame, n: u64, a: [u64; 6]) -> u64 {
             return proc::clone::<Aarch64>(a[0], a[1], a[2], a[3], a[4]);
         }
         nr::EXECVE => return crate::proc::exec(a[0], a[1], a[2]),
-        nr::MREMAP => {
-            akuma_tokio_kernel_core::nosys::note(n);
-            return e(ENOSYS);
-        }
+        nr::MREMAP => return mm::mremap_arm::<Aarch64>(a[0], a[1], a[2], a[3]),
         _ => {}
     }
     if let Some(r) = akuma_runtime_tokio::serve_shared(n, a) {

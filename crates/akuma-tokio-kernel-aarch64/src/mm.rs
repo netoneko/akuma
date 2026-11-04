@@ -185,6 +185,12 @@ impl akuma_tokio_kernel_core::mm::Mm for Aarch64 {
         7
     }
     fn mm_event(_kind: u8, _start: u64, _end: u64) {}
+    fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
+        akuma_user_access::copy_to_user(dst_va, src).is_ok()
+    }
+    fn copy_from_user(dst: &mut [u8], src_va: u64) -> bool {
+        akuma_user_access::copy_from_user(dst, src_va).is_ok()
+    }
 }
 
 impl akuma_tokio_kernel_core::lazy::Kernel for Aarch64 {
@@ -302,8 +308,5 @@ impl akuma_tokio_kernel_core::proc::Proc for Aarch64 {
     }
     fn record_root(i: usize) -> u64 {
         record_root(i)
-    }
-    fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
-        akuma_user_access::copy_to_user(dst_va, src).is_ok()
     }
 }

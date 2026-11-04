@@ -56,8 +56,6 @@ pub trait Proc: Loader {
     fn with_task_slot<R>(i: usize, f: impl FnOnce(&mut Task) -> R) -> R;
     /// The page-table root of task record `i`.
     fn record_root(i: usize) -> u64;
-    /// Copy `src` to the running task's `dst_va`; `false` when it does not translate.
-    fn copy_to_user(dst_va: u64, src: &[u8]) -> bool;
 }
 
 // ---------------------------------------------------------------------------
