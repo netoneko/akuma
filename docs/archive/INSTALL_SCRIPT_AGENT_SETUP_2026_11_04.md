@@ -71,3 +71,41 @@ git writes, sub-agents, touching console/sshd/kot/httpd/hda-capture services.
 
 `proposals/INSTALL_SCRIPT.md`, `scripts/kvm/goose/SUPERVISOR_RUNBOOK.md`, `scripts/kvm/goose/goose-glm-mac.sh`,
 `scripts/utils/hpbox.py`, `overlays/ryzen/arm.sh`.
+
+## Update (2026-11-04, evening): what happened to the Qwen on trashcan
+
+Times: Mac is IST; boxes and session logs are UTC.
+
+1. **Single-stream download is too slow.** `huggingface.co` -> trashcan ran at ~240 KB/s (ETA 5 h 40 m for the
+   5,027,784,224-byte `bartowski/Qwen_Qwen3-8B-GGUF` Q4_K_M file). The GLM agent switched to 8 parallel ranged `curl`
+   parts (`/tmp/dlpar.sh`, parts in `/tmp/parts/part0..7`, 628,473,028 bytes each): ~2.1-2.2 MB/s aggregate.
+2. **The box went hard-down at 35 %** (ssh and ping dead, no ARP entry, a /24 sweep found nothing). It was
+   power-cycled by hand. Cause not established: the 8 concurrent appends into ext2 are the only thing that changed.
+   After the restart all 8 parts were exactly full size (finished 16:02-16:06 UTC), so nothing was re-downloaded.
+3. **Assembly failed with `cat: write error: I/O error`.** `cat part0..part7 > /models/qwen3-8b-q4_k_m.gguf` ran at
+   ~7 MB/s, `stat` showed 1.29 GB at 18:34, and at 18:41 the process was gone, `/tmp/asm.log` held two
+   `write error: I/O error` lines, and the output file was **4,222,104 bytes** (it shrank). No `sha256`, no `done`
+   marker. `dmesg` (full of `[probe]` lines) showed no storage error. Uptime was continuous, so this was not a reboot.
+   Parts written by `curl` at 2 MB/s were fine; one sequential writer at 7 MB/s was not.
+4. **Not yet known:** whether this is the disk (hardware), the Akuma storage/ext2 path, or both. Two earlier incidents
+   point at the same area (`project_amd64_ext2_lost_bitmap_writes`, the USB/xHCI disk), so the root filesystem should
+   be treated as suspect until `e2fsck -n` says otherwise. Do not repair it blindly.
+5. **Process slips worth keeping:** a watcher loop used `grep -q done` on the error text "can't open /tmp/qwen.done",
+   so it fired early (match the success marker exactly, e.g. `test -f ... && echo FINISHED`). `df -h /` on Akuma
+   shows only procfs; use `df -h /dev/sda1`. `curl` is `/usr/bin/curl`, not `/bin/curl`.
+
+### Plan agreed with the user
+- User boots trashcan into **Ubuntu**. From there: assemble the parts, compare sha256 with Hugging Face's published
+  `54fffa050078e984116639c83dfb64b5aa6d4cd474e018b076777c632bbccccd`, run `e2fsck -n` on the Akuma root and read the disk's SMART/kernel
+  log, then boot back into Akuma.
+- **Update trashcan's Akuma kernel from main** while it is on Ubuntu (it reports `0.0.8 e61f9ee9-release-smp-shared`;
+  ryzen runs `fca1f9ed`). Build on the box (a Mac-built kernel hung on ryzen metal,
+  `docs/archive/AMD64_MAC_BUILT_KERNEL_METAL_HANG.md`), `--features no-tests`, install with `chmod +x`,
+  `/root/stage_akuma.sh` is the existing recipe. Keep the old kernel as a GRUB fallback entry.
+- Then finish the Qwen: proof run on `127.0.0.1:8082`, herd conf for `0.0.0.0:8081` (disable-then-enable), LAN check,
+  `wait_qwen.py` prints `QWEN_READY=`.
+
+### Ryzen session status at this point
+`install-i1b`: 42 tool calls, G1 recorded PASS in `RESULT-I1.md` (the kernel package is `taoxichuan`, the README's
+`-p osaka` is stale; the pinned 2026-09-19 toolchain is ignored because the box has no rustup), `scripts/install.sh`
+exists with three run logs, G3 waiting on `wait_qwen.py`. It may push only `install-i1:install-script` to `litter`.
