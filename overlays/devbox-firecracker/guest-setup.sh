@@ -66,9 +66,12 @@ run sysctl -qw net.ipv4.ip_forward=1
 say "$TAP -> $(runsh "ip -br addr show $TAP")"
 
 # ---- DHCP -----------------------------------------------------------------------
+# `[d]nsmasq`, not `dnsmasq`: runsh runs the check inside `sh -c '<the check>'`, whose own
+# command line contains the pattern, so the plain spelling always matched itself and
+# dnsmasq was never started.
 # Firecracker has no SLIRP, so nothing answers Akuma's DHCP request unless we run
 # a server. Akuma boots with config::ENABLE_DHCP = true.
-if runsh "pgrep -f 'dnsmasq.*$TAP' >/dev/null 2>&1"; then
+if runsh "pgrep -f '[d]nsmasq.*$TAP' >/dev/null 2>&1"; then
   say "dnsmasq already serving $TAP"
 else
   runsh "command -v dnsmasq >/dev/null 2>&1" || {
@@ -90,7 +93,7 @@ else
     --dhcp-authoritative --log-dhcp \
     --log-facility=/var/tmp/dnsmasq.log --pid-file=/var/tmp/dnsmasq.pid"
 fi
-runsh "pgrep -f 'dnsmasq.*$TAP' >/dev/null" && say "dnsmasq running"
+runsh "pgrep -f '[d]nsmasq.*$TAP' >/dev/null" && say "dnsmasq running"
 
 # ---- NAT ------------------------------------------------------------------------
 say "adding NAT for $SUBNET"

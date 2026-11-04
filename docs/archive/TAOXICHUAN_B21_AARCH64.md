@@ -106,6 +106,32 @@ frame builder and restorer, the user-register capture, `enter_user`, the clock a
 | A5.10 | `75f1c343` | **sshd and tokio on aarch64.** (a) Bugfix (`docs/archive/TAOXICHUAN_LOADER_SHARED_SEGMENT_PAGE.md`): `core::loader::place_segment` mapped a page two `PT_LOAD`s share (the disk's `sshd`: text to `0x416D00`, rodata from there) twice, the second time with a fresh frame and the later segment's permissions, which lost the text bytes and the exec bit. A shared page is built once now, from every overlapping segment's bytes, with the first segment's permissions (the main kernel's rule). (b) The EL0 fault report prints the faulting address's leaf (`pte=`). (c) aarch64 anchors the wall clock from `epoch=` on the command line, as amd64 does. Taoxichuan's sshd is the `linux-abi` build (clone+execve; the default build calls Akuma's private `SPAWN`, which glue serves through the main kernel's process model) | QEMU virt TCG, `init=/bin/sshd-linuxabi` (`cargo build -p sshd --release --target aarch64-unknown-none --features libakuma/linux-abi`, written onto an APFS clone of `disk.img` with `debugfs`), virtio-net with `hostfwd`: `vm_ready.py` READY; over ssh `uname -a` (`aarch64`), pipes, `kill -USR1 $$` 138, `wget` of example.com. The amd64 battery's commands, from ssh: `tokioprobe` RESULT PASS (multi-thread runtime, `uname` through tokio's process spawn and SIGCHLD, HTTPS to akuma.sh 200), `killtree 8` PASS, `pidfdprobe` PASS, `sleep & wait` ok, 0 faults (`killtree` and `pidfdprobe` built with `aarch64-linux-musl-gcc -static`). amd64 battery at smp=1 and smp=4: all PASS, 0 faults. Clippy clean on both targets; core host tests pass. Not yet: Lima KVM for this step (the disk clone lives outside the Lima mounts), SMP |
 | A6 | `9476cbef` (committed under the title "docs/archive: B21 A6 row hash"; a concurrent commit took HEAD during the first attempt) | **SMP on aarch64, on the amd64 half's lock.** (a) The ticket BKL moved from `akuma-tokio-kernel-amd64::smp` into `akuma-tokio-kernel-core::bkl`, generic over `BklCpu` (`index`, `while_waiting`; amd64 services its pending IPIs there). amd64 keeps thin wrappers, so none of its call sites changed. (b) The PSCI secondary trampoline moved verbatim from `akuma-entry` to `akuma-boot-aarch64::secondary` (feature `secondary`). The main kernel's `smp-shared` uses it from there; its image is the same size (3,950,832 B) with the same instruction multiset. `akuma-gic`'s per-core entry points compile under `smp-shared` or `secondary` (`cfg(gic_per_core)`). (c) `akuma-tokio-kernel-aarch64::smp` (feature `smp`): each secondary's idle thread is adopted before `CPU_ON`, then a bounded 500 ms wait for it to report in, with the lock released. The secondary installs the vectors, wakes its redistributor, arms its own CNTV tick and idles. The lock is taken in `irq` and `el0_sync`, released before EL0 in `cross`; new slots are born locked; idle runs at depth 0. Only core 0 counts ticks. TLB maintenance is now broadcast (`vaae1is`/`vmalle1is`), so there is no shootdown IPI; the one IPI is the wake SGI to a halted peer. The facade's `entry!` emits `secondary_shared_start`. (d) `akuma-vfs-glue`'s core counts always ask the hook (the main kernel without `smp-shared` answers 1), so `/proc/cpuinfo` lists the cores Taoxichuan brought up. Unsafe budget: the trampoline's one site moved from `akuma-entry` (1 -> 0) to `akuma-boot-aarch64` (5 -> 6) | TCG smp=4: `smp: 4 of 4`; battery (`tokioprobe`, `killtree 8`, `pidfdprobe`, `sleep & wait`) all PASS, 0 faults; four busy loops finish in the time of one. TCG smp=1: battery PASS. Lima KVM smp=4: battery PASS; HTTPS connects time out sometimes, at smp=1 too (`wget` of example.com failed 2 of 12). A `filter-dump` capture on the guest's netdev shows the guest sending its SYN and retransmitting it on schedule; slirp sends the SYN-ACK 2-12 s late or never, and the guest ACKs it within about 2 ms. So it is slirp nested in Lima, not the guest. amd64 battery at smp=1 and smp=4 on the core BKL: all PASS. Main kernel and extreme-size build. Clippy clean; host tests of the touched crates pass. Not yet: `/proc/stat` bills all busy time to cpu0 (the hooked scheduler does not record a thread's core) |
 
+## Parity status (2026-11-04, after A6)
+
+The aarch64 image is the same `taoxichuan/src/main.rs` as the amd64 one, built for the other target, and it
+now runs the same workloads:
+
+| workload | amd64 | aarch64 |
+|---|---|---|
+| boot, ext2 root, virtio-blk/net, DHCP | yes | yes (QEMU virt TCG; QEMU + KVM in Lima) |
+| SMP (`smp=N`, one kernel lock) | yes | yes: 4 of 4 cores, TCG and KVM |
+| sshd (`linux-abi` build), pipes, signals, `wait` | yes | yes |
+| `tokioprobe` (tokio runtime, process spawn, HTTPS) | PASS | PASS |
+| `killtree 8`, `pidfdprobe` | PASS | PASS |
+| goose 1.52.0 + GLM (`glm-5.3-flash`): PONG | PASS | PASS, 6.7 s, TCG smp=4 |
+| goose with its shell tool (spawn, file write, read back) | PASS | PASS: answered `aarch64, 4` from the file it wrote |
+| Infinity `no-aws` (daemon, CLI, provider, MCP shell) | builds; shipped for a run | builds (53 s, musl); `infinity` faults at start: no user-stack growth on aarch64 (`INFINITY_ON_TAOXICHUAN.md`, Update 2026-11-04) |
+| Firecracker | yes | handed to another agent (link base 0x8030_0000 and the device window via `platform-firecracker`) |
+| self-host (`cargo build` of the kernel in the guest) | yes | not yet |
+
+goose on aarch64 is the release's `goose-aarch64-unknown-linux-musl.tar.gz` (the same project and version as
+the amd64 image's x86_64 musl build; sha256 `4584ba88...e412` checked against the release), written to
+`/usr/local/bin/goose` on a scratch clone of `disk.img` with its config under `/root/.config/goose`. It ran
+on the first try: no kernel change was needed for it.
+
+Image size (`cloc_akuma.py --audit taoxichuan`): amd64 79,504 audit lines, aarch64 77,824; 72,408 are live
+in both, 7,096 amd64-only and 5,416 aarch64-only.
+
 ### Rig note
 
 `tcg_rig.py battery` runs against a guest that is already up; it does not boot one. The first A2.1 battery ran

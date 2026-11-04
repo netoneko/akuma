@@ -157,9 +157,52 @@ GLM finished every step on branch `no-aws` of its clone (`/src/infinity` in the 
   `Linux taoxichuan 0.1.0-923e27c3-taoxichuan 923e27c3-release x86_64 GNU/Linux`.
 - **Not pushed.** The guest holds no GitHub credentials. The `fork` remote
   (`https://github.com/netoneko/infinity.git`) is configured; the push is the supervisor's to make.
+  *(2026-11-04: pushed; see "Update (2026-11-04)" below.)*
 
 Two goose turns ended on supervisor action, not on GLM's: the smoke test blocked on `p.stderr.readline()`
 from a provider that writes nothing to stderr, and one turn died on a z.ai `Stream decode error`.
+
+## Update (2026-11-04): pushed, built for both architectures, shipped
+
+**Pushed.** `no-aws` (`3ec98ed`..`f0aef22`, six commits on upstream `1abc6fc`) is on
+`https://github.com/netoneko/infinity` as branch `no-aws`. The ryzen was in Pop, so the guest was not running:
+the Akuma partition and the guest's `disk.img` were mounted read-only from Pop, the commits were taken out as a
+`git bundle` (38 KB; the guest's clone is shallow, and the fork's `main` is already `1abc6fc`), and the branch
+was pushed from the Mac as tama. Both mounts were removed afterwards.
+
+**Built on the Mac, release, static musl** (`cargo build --locked --release -p infinity-mcp-shell-tools
+-p infinity-provider-rig -p infinity-daemon -p infinity-agent-cli`, the musl cross gcc as CC and linker):
+`x86_64-unknown-linux-musl` in 38 s, `aarch64-unknown-linux-musl` in 53 s, from a cold `target/`. The guest's
+build was debug and took about 18 minutes over six attempts.
+
+**amd64: shipped to the ryzen, not yet run on Taoxichuan.** `/root/infinity-no-aws/` on Pop holds
+`bin/` (the four binaries), `cfg/` (`run-provider.sh`, `providers.json`, `rap.json`, the repo's
+`smoke-provider.py`), `README.md` (where each file goes on a guest disk and the three checks) and
+`SHA256SUMS` (verified on Pop). `infinity --help` runs there on Pop's Linux. Running it on Taoxichuan is left
+for the next agent.
+
+### aarch64: open, for later
+
+Staged on a scratch clone of `disk.img` (the same files, the aarch64 build) and booted on aarch64
+Taoxichuan (QEMU virt TCG, `smp=4`, 2 GiB, the B21 A6 kernel), where goose 1.52.0 runs, answers PONG
+and uses its shell tool.
+
+1. **`infinity` dies at start: the aarch64 half does not grow the user stack.** `infinity --help` exits 139
+   with
+   `[Fault] EL0 ec=0x24 elr=0x00000000006adc58 sp=0x00006ffffffefd70 far=0x00006ffffffefd70 esr=0x92000047 pte=0x0`:
+   a write (`WnR`), translation fault at level 3, at the stack pointer itself, on an unmapped page about
+   66 KB below `USER_STACK_TOP` (`0x7000_0000_0000`). Every image starts with 16 stack pages (64 KiB,
+   `akuma_tokio_kernel_core::task::USER_STACK_PAGES`). amd64 grows the stack on a not-present fault just below
+   the region, up to 8 MiB (`grow_user_stack`, `crates/akuma-tokio-kernel-amd64/src/lib.rs`, called from its
+   page-fault handler). aarch64's `user_fault` (`crates/akuma-tokio-kernel-aarch64/src/trap.rs`) only fills
+   lazy pages, so the first frame past 64 KiB kills the task. goose happens not to go that deep. The function
+   at `elr` was not identified.
+   *Fix, not made:* `grow_user_stack` uses only things core already has (`Mm::with_task`, the layout's
+   `growth_below`/`extend_down`, `FreshPage`, `UserTree::map_page`), so it can move into
+   `akuma-tokio-kernel-core` as a function generic over `Loader`, beside the loader, and both machines'
+   fault paths can call it.
+2. Untested on aarch64 past that: the daemon, the provider and the PONG/tool path.
+   `infinity-mcp-shell-tools` starts and exits 0 on an empty stdin.
 
 ## Background
 

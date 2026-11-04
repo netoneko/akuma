@@ -234,3 +234,34 @@ Ryzen agent `install-i1b` (80 tool calls) pushed `scripts/install.sh`, the runbo
 `litter/install-script` and is in G3, driving a goose session against the Qwen on trashcan. Verdict pending; a
 watcher is on the RESULT file. Next: G3 verdict, then the OOM repro, then mmap-under-pressure (does eviction replace
 the SIGSEGV?), then the Linux `llama-bench` thread sweep for the Akuma scaling cliff.
+
+## Update 4 (2026-11-04, night): Infinity pushed and shipped; aarch64 Taoxichuan runs goose
+
+**Infinity `no-aws`.** GLM's port (`docs/archive/INFINITY_ON_TAOXICHUAN.md`) had never left the ryzen guest. It is
+now branch `no-aws` on `github.com/netoneko/infinity`, carried out of the guest's disk as a git bundle from
+Pop and pushed from the Mac as tama. Built on the Mac as static musl release binaries: 38 s for amd64 and 53 s
+for aarch64, against about 18 minutes of debug build inside the guest. The amd64 build is on the ryzen at
+`/root/infinity-no-aws/` (binaries, guest config, a README with the staging steps, checksums), for another
+agent to stage onto a Taoxichuan disk and run. It has not run on Taoxichuan yet.
+
+**aarch64 Taoxichuan** (B21, `docs/archive/TAOXICHUAN_B21_AARCH64.md`) now boots 4 cores and runs goose 1.52.0
+against GLM: PONG in 6.7 s, then a shell-tool turn that wrote a file and answered `aarch64, 4`, with no kernel
+change. Infinity does not run there yet: the aarch64 half never grows the user stack, and `infinity` goes past
+the first 64 KiB at start (details and the fix in the Infinity doc). Firecracker for aarch64 Taoxichuan is being
+handled by another agent.
+
+### Traps found (each cost time)
+1. **Lima mounts the Mac's repo read-only.** Firecracker opens its drive read-write and refuses with
+   `Read-only file system`. Copy the disk into Lima's own filesystem (`/var/tmp`) first. QEMU got away with
+   it only through `snapshot=on`.
+2. **`overlays/devbox-firecracker/guest-setup.sh` never started dnsmasq.** Its `pgrep -f 'dnsmasq.*tap0'`
+   runs inside `sh -c '<that check>'`, so it matched its own command line and reported "already serving".
+   Fixed in the script with `[d]nsmasq`.
+3. **A tar made on macOS carries AppleDouble `._*` files.** Delete them on the far side, or use
+   `COPYFILE_DISABLE=1 tar`.
+4. **The ryzen was in Pop**, so the Akuma address (`.159`) timed out. Pop is `.126`. The Infinity guest's disk
+   can be read from Pop by mounting the Akuma partition read-only, which is only safe while Akuma is not running.
+5. **The amd64 rule is not the aarch64 rule.** A binary that runs on one Taoxichuan can fault on the other: amd64
+   grows the stack and aarch64 does not. Parity is per behaviour, and the B21 log's status table is where it is
+   tracked.
+
