@@ -1768,9 +1768,8 @@ pub(crate) fn pid_map_rows(pid: u32) -> Option<alloc::vec::Vec<MapRow>> {
     HOOKS.get().and_then(|h| (h.pid_map_rows)(pid))
 }
 
-/// Gated exactly like its only caller, `proc::active_core_count`: without real
-/// SMP there is one core and nothing to ask the binary about.
-#[cfg(kernel_smp_shared)]
+/// The kernel's core count. Every kernel supplies the hook (the main kernel
+/// answers 1 without `smp-shared`; the tokio kernels their online count).
 fn probed_core_count() -> usize {
     HOOKS.get().map_or(1, |h| (h.probed_core_count)())
 }

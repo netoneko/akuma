@@ -29,7 +29,7 @@ pub fn rng_fill(buf: &mut [u8]) {
 pub fn install_surface() {
     akuma_runtime_tokio::install(akuma_runtime_tokio::Kernel {
         utc_time_us: || akuma_primitives::clock::utc_time_us(uptime_us()),
-        online_cpus: || 1,
+        online_cpus: crate::smp::online_cpus,
         rng_fill: |b| {
             rng_fill(b);
             true

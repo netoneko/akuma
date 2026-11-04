@@ -11,11 +11,11 @@ impl NetMachine for Aarch64Net {
     fn uptime_us() -> u64 {
         crate::fs::uptime_us()
     }
-    /// Wait for the next interrupt, then take it. `wfi` wakes on a pending
-    /// interrupt even while masked; the window after it runs the tick handler,
-    /// so the timer is re-armed and the lap is bounded by one tick.
+    /// Wait for the next interrupt with the kernel lock released, then take
+    /// it. `wfi` wakes on a pending interrupt even while masked; the window
+    /// after it runs the handler, so the lap is bounded by one tick.
     fn wait_lap() {
-        akuma_cpu::park::wfi();
+        crate::smp::park_halt();
         akuma_cpu::park::irq_window();
     }
     fn rng_fill(buf: &mut [u8]) {

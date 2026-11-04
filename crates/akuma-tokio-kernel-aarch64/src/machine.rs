@@ -21,6 +21,9 @@ pub struct Machine {
     pub virtio: Option<(usize, usize, usize)>,
     /// CPUs the tree describes.
     pub cpus: usize,
+    /// Physical address of redistributor 0 (secondaries wake their own frames).
+    #[cfg_attr(not(feature = "smp"), allow(dead_code))]
+    pub gicr: usize,
 }
 
 /// Copy the tree out of RAM, describe the machine, and install the device map
@@ -85,5 +88,6 @@ pub fn probe() -> Option<Machine> {
         cmdline,
         virtio: virtio.map(|(b, s, c)| (b, s, c.min((addr::DEV_VIRTIO_SIZE / s).max(1)))),
         cpus: desc.cpu_count,
+        gicr: redist.base as usize,
     })
 }

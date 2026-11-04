@@ -34,11 +34,16 @@ mod net;
 mod proc;
 mod sched;
 mod signal;
+mod smp;
 mod syscall;
 mod trap;
 
 use akuma_primitives::safe_print;
 use akuma_tokio_kernel_core::Identity;
+
+/// A secondary core's first Rust (`akuma-tokio-kernel`'s `entry!` defines the
+/// `secondary_shared_start` symbol the trampoline calls, and forwards here).
+pub use smp::secondary_start;
 
 /// The heap. `#[global_allocator]` is a binary-level declaration; the crate
 /// exports the implementation, this kernel installs it.
@@ -51,6 +56,7 @@ const HEAP_BYTES: usize = 16 << 20;
 
 /// A kernel being composed: what a root's `main.rs` chains before [`Kernel::run_init`].
 #[must_use = "a Kernel does nothing until `run_init`"]
+#[allow(clippy::struct_excessive_bools)] // one switch per builder method, not a state machine
 pub struct Kernel {
     dtb: u64,
     identity: Identity,
@@ -60,6 +66,8 @@ pub struct Kernel {
     disk: bool,
     #[cfg(feature = "net")]
     net: bool,
+    #[cfg(feature = "smp")]
+    smp: bool,
 }
 
 impl Kernel {
@@ -75,6 +83,8 @@ impl Kernel {
             disk: false,
             #[cfg(feature = "net")]
             net: false,
+            #[cfg(feature = "smp")]
+            smp: false,
         }
     }
 
@@ -108,10 +118,11 @@ impl Kernel {
         Self { net: true, ..self }
     }
 
-    /// The secondary cores (not wired on aarch64 yet).
+    /// The secondary cores: `smp=N` on the command line starts `N-1` of them
+    /// (absent or `1` keeps one core, as on amd64).
     #[cfg(feature = "smp")]
     pub const fn smp(self) -> Self {
-        self
+        Self { smp: true, ..self }
     }
 
     /// Boot. On aarch64 this ends after the machine is up, until init can load.
@@ -199,6 +210,8 @@ fn boot(k: &Kernel) -> ! {
     // The process runtime and the tokio surface, then the root.
     exec::init();
     sched::init();
+    // The boot thread holds the kernel lock from here; the switch hands it on.
+    smp::enter();
     fs::install_surface();
     #[cfg(feature = "net")]
     let nic = k.net && m.virtio.is_some();
@@ -223,6 +236,16 @@ fn boot(k: &Kernel) -> ! {
             safe_print!(80, " {}", e.name.as_str());
         }
         safe_print!(4, "\n");
+    }
+    #[cfg(feature = "smp")]
+    if k.smp {
+        let cap = akuma_tokio_kernel_core::cmdline::token(m.cmdline.as_str(), "smp=")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        if cap > 1 {
+            let started = smp::start_secondaries(cap, m.cpus, m.gicr);
+            safe_print!(64, "  smp: {} of {} requested\n", 1 + started, cap);
+        }
     }
     akuma_primitives::console::print_str(id.art);
     safe_print!(96, "\n  {} {} (akuma-tokio-kernel, aarch64)\n\n", id.name, id.version);

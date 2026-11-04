@@ -51,7 +51,7 @@ akuma-user-access = { path = "../akuma-user-access" }
 console = ["dep:akuma-uart"]
 disk = ["dep:akuma-ext2", "akuma-tokio-kernel-core/disk"]
 net = []
-smp = []
+smp = ["akuma-boot-aarch64/secondary", "akuma-gic/secondary"]
 shell = []
 no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
 trace-err = ["akuma-tokio-kernel-core/trace-err"]

@@ -116,9 +116,10 @@ impl UserPages for Aarch64 {
         Self::set_leaf(root, va, pte::user_leaf(pa, write, exec, true))
     }
 
+    /// Broadcast: a peer running a thread of this process may hold it.
     fn invalidate(va: u64) {
         akuma_cpu::barrier::dsb_ishst();
-        akuma_cpu::tlb::vaae1(va >> 12);
+        akuma_cpu::tlb::vaae1is(va >> 12);
         akuma_cpu::barrier::dsb_ish();
         akuma_cpu::barrier::isb();
     }
@@ -174,10 +175,11 @@ impl akuma_tokio_kernel_core::mm::Mm for Aarch64 {
     fn frame_of(e: u64) -> Option<u64> {
         pte::frame(e)
     }
-    /// One core, every task under ASID 0: drop this core's translations.
+    /// Every task runs under ASID 0: drop every core's non-global
+    /// translations, broadcast to the inner-shareable domain (no IPI).
     fn shootdown() {
         akuma_cpu::barrier::dsb_ishst();
-        akuma_cpu::tlb::vmalle1();
+        akuma_cpu::tlb::vmalle1is();
         akuma_cpu::barrier::dsb_ish();
         akuma_cpu::barrier::isb();
     }
@@ -290,12 +292,17 @@ impl akuma_tokio_kernel_core::proc::Proc for Aarch64 {
     fn current_slot() -> usize {
         crate::sched::current_slot()
     }
+    /// A slot is born holding the lock it was created under (the switch hands
+    /// the depth over).
     fn prepare_slot(slot: usize) -> bool {
-        crate::sched::prepare(slot).is_some()
+        let ok = crate::sched::prepare(slot).is_some();
+        if ok {
+            akuma_tokio_kernel_core::bkl::born_locked(slot);
+        }
+        ok
     }
-    /// No kernel lock yet (one core, IRQs masked in the kernel): just run it.
     fn unlocked(f: impl FnOnce()) {
-        f();
+        crate::smp::unlocked(f);
     }
     fn uptime_us() -> u64 {
         crate::fs::uptime_us()

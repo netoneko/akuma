@@ -17,6 +17,9 @@ akuma-phys = { path = "../akuma-phys" }
 # Firecracker's aarch64 microVM instead of QEMU virt: the console UART's
 # physical address and whether the 1 GiB block at 0x4000_0000 is device memory.
 platform-firecracker = []
+# The secondary-core trampoline and its stacks (`secondary`): 512 KiB of `.bss`,
+# so only a kernel that starts secondaries links it.
+secondary = []
 
 [lints]
 workspace = true

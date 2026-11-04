@@ -24,7 +24,7 @@
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub use akuma_tokio_kernel_amd64::{Kernel, boot_multiboot2};
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-pub use akuma_tokio_kernel_aarch64::Kernel;
+pub use akuma_tokio_kernel_aarch64::{Kernel, secondary_start};
 
 /// The kernel's entry points, calling `main` with a [`Kernel`] named after the calling package
 /// (`CARGO_PKG_NAME` is `uname -n`, `CARGO_PKG_VERSION` the release).
@@ -48,7 +48,8 @@ macro_rules! entry {
     };
 }
 
-/// See the amd64 spelling: `rust_start(dtb)` is the aarch64 entry `_boot` calls.
+/// See the amd64 spelling: `rust_start(dtb)` is the aarch64 entry `_boot` calls, and
+/// `secondary_shared_start` the one a secondary core's trampoline calls.
 #[cfg(target_arch = "aarch64")]
 #[macro_export]
 macro_rules! entry {
@@ -56,6 +57,13 @@ macro_rules! entry {
         #[unsafe(no_mangle)]
         pub extern "C" fn rust_start(dtb: u64) -> ! {
             $main($crate::Kernel::new(dtb, env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+        }
+
+        /// Where `akuma-boot-aarch64`'s secondary trampoline lands a core PSCI
+        /// started (only with the `smp` feature; unreferenced otherwise).
+        #[unsafe(no_mangle)]
+        pub extern "C" fn secondary_shared_start(_context_id: u64, core: u64) -> ! {
+            $crate::secondary_start(core)
         }
     };
 }

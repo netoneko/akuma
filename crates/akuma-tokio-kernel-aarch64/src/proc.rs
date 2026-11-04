@@ -46,6 +46,8 @@ fn cross(root: u64, f: &Frame) -> ! {
         safe_print!(64, "[exec] slot {} has no kernel stack\n", cur);
         crate::halt();
     };
+    // User mode runs without the kernel lock.
+    crate::smp::leave_all();
     akuma_vectors_aarch64::enter_user(f, top)
 }
 
@@ -102,6 +104,7 @@ pub fn start_init(path: &str, ti: &TaskImage) -> ! {
         safe_print!(64, "  [init] no kernel stack for init\n");
         crate::halt();
     };
+    akuma_tokio_kernel_core::bkl::born_locked(tid);
     akuma_threading::x86_seed_entry(tid, top, init_entry);
     // The boot thread becomes slot 0: it is about to block, and a thread the
     // pool has never heard of has no slot to park.

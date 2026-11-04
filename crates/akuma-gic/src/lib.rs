@@ -376,7 +376,7 @@ pub fn trigger_sgi(sgi_id: u32) {
 /// `aff0 < 16` (QEMU `virt` single cluster); larger affinities would need Aff1 routing.
 /// Used by real shared-kernel SMP for each core to ring its OWN scheduler SGI (the
 /// timer handler is shared, so it must self-target rather than hit PE0).
-#[cfg(kernel_smp_shared)]
+#[cfg(gic_per_core)]
 pub fn trigger_sgi_core(target_aff0: u32, sgi_id: u32) {
     if sgi_id > 15 || target_aff0 >= 16 {
         return;
@@ -445,7 +445,7 @@ pub fn set_priority(irq: u32, priority: u8) {
 /// copies of `mmio_w32`, `mmio_r32`, the `GICR_WAKER_*` bits and four raw `msr`
 /// instructions. All of them already existed here, so folding it in removed
 /// three `unsafe` blocks outright rather than relocating them.
-#[cfg(kernel_smp_shared)]
+#[cfg(gic_per_core)]
 pub fn secondary_init(idx: usize, layout: RedistributorLayout) {
     // EL1 virtual-timer PPI (the shared 10 ms scheduler tick) and the scheduler
     // SGI, which each core rings at itself from the shared timer handler.

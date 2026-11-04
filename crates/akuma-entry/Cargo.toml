@@ -25,7 +25,7 @@ akuma-psci = { path = "../akuma-psci" }
 # read. `smp-shared` gates the entire secondary-core half.
 extreme = []
 no-tests = []
-smp-shared = ["akuma-gic/smp-shared", "akuma-kernel-core/smp-shared", "akuma-exceptions/smp-shared"]
+smp-shared = ["akuma-boot-aarch64/secondary", "akuma-gic/smp-shared", "akuma-kernel-core/smp-shared", "akuma-exceptions/smp-shared"]
 platform-firecracker = ["akuma-kernel-core/platform-firecracker", "akuma-boot-aarch64/platform-firecracker"]
 
 [lints]

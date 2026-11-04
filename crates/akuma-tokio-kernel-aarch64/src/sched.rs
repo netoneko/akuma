@@ -179,8 +179,7 @@ fn hooks() -> X86ArchHooks {
         set_current_slot,
         idle_slot: || idle_tid(crate::mm::cpu_index()),
         can_run,
-        // No kernel lock yet: one core, IRQs masked in the kernel.
-        transfer_lock_depth: |_, _| {},
+        transfer_lock_depth: crate::smp::transfer_depth,
         allow_tick: akuma_cpu::park::irq_window,
         write_user_context,
         read_user_context,
@@ -188,20 +187,36 @@ fn hooks() -> X86ArchHooks {
     }
 }
 
-/// Core 0's idle thread: let the tick in, run whatever became ready, else wait
-/// for an interrupt. `wfi` wakes on a pending interrupt even while masked, so a
-/// tick between the check and the `wfi` is not lost.
-extern "C" fn idle_main() -> ! {
+/// A core's idle thread (core 0's seeded, a secondary's adopted): pump the
+/// NIC, let the tick in, run whatever became ready, else halt with the kernel
+/// lock released. It runs at lock depth 0 and takes the lock for each piece of
+/// kernel work. `wfi` wakes on a pending interrupt even while masked, so a tick
+/// between the check and the `wfi` is not lost.
+pub extern "C" fn idle_main() -> ! {
     loop {
-        akuma_cpu::park::irq_window();
+        crate::smp::enter();
         crate::net::netpoll();
+        crate::smp::leave();
+        akuma_cpu::park::irq_window();
         let due = akuma_threading::wake_is_due(akuma_threading::x86_earliest_wake_time(), crate::fs::uptime_us());
         if due || akuma_threading::x86_runnable_exists() {
+            // The pick and the switch read the shared slot and task tables.
+            crate::smp::enter();
             akuma_threading::x86_yield();
+            crate::smp::leave();
         } else {
-            akuma_cpu::park::wfi();
+            crate::smp::park_halt();
         }
     }
+}
+
+/// Core `cpu`'s idle thread is the context it is about to run (a secondary's
+/// trampoline stack): mark it idle and adopt it, before the core starts.
+#[cfg(feature = "smp")]
+pub fn adopt_idle(cpu: usize) {
+    let idle = idle_tid(cpu);
+    IDLE[idle].store(true, Relaxed);
+    akuma_threading::x86_adopt_running_thread(idle);
 }
 
 /// Register the scheduler's tables and seed core 0's idle thread. After the
@@ -210,7 +225,7 @@ pub fn init() {
     akuma_threading::register(
         ThreadRuntime {
             uptime_us: crate::fs::uptime_us,
-            trigger_sgi: |_| {},
+            trigger_sgi: |_| crate::smp::kick_halted_core(),
             wake_core: |_| {},
             wake_remote_idle: || false,
             end_of_interrupt: akuma_gic::end_of_interrupt,

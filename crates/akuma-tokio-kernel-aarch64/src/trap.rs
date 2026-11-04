@@ -42,11 +42,23 @@ pub fn init() {
 pub fn start_tick() {
     akuma_gic::init();
     akuma_gic::enable_irq(TIMER_INTID);
+    // The wake SGI a peer rings at a halted core (`smp::kick_halted_core`).
+    akuma_gic::enable_irq(akuma_gic::SGI_SCHEDULER);
     akuma_timer::set_tick_us(TICK_US);
     akuma_timer::arm_periodic_tick();
 }
 
+/// Every interrupt runs under the kernel lock (nested when the kernel was
+/// already running here, in an IRQ window).
 fn irq(f: &mut Frame) {
+    crate::smp::enter();
+    irq_locked(f);
+    crate::smp::leave();
+}
+
+/// The wake SGI needs nothing but its acknowledgement: arriving ended the
+/// `wfi`, and the idle lap re-runs the picker.
+fn irq_locked(f: &Frame) {
     let Some(id) = akuma_gic::acknowledge_irq() else {
         return;
     };
@@ -54,8 +66,12 @@ fn irq(f: &mut Frame) {
         return;
     }
     let tick = id == TIMER_INTID;
+    let boot_core = crate::mm::cpu_index() == 0;
     if tick {
-        TICKS.fetch_add(1, Relaxed);
+        // Each core re-arms its own CNTV; core 0 alone counts.
+        if boot_core {
+            TICKS.fetch_add(1, Relaxed);
+        }
         akuma_timer::arm_periodic_tick();
     }
     akuma_gic::end_of_interrupt(id);
@@ -72,8 +88,8 @@ fn irq(f: &mut Frame) {
     }
     // The pump's backstop: a user thread that never enters the kernel would
     // otherwise starve the NIC (no interrupt of its own here). A lap per tick
-    // bounds that at 10 ms; `netpoll` guards its own reentry.
-    if tick {
+    // bounds that at 10 ms; core 0's tick is enough.
+    if tick && boot_core {
         crate::net::netpoll();
     }
 }
@@ -132,7 +148,14 @@ fn el1_sync(f: &mut Frame) {
     crate::halt();
 }
 
+/// A trap from EL0 takes the kernel lock; the return to EL0 drops it.
 fn el0_sync(f: &mut Frame) {
+    crate::smp::enter();
+    el0_sync_locked(f);
+    crate::smp::leave();
+}
+
+fn el0_sync_locked(f: &mut Frame) {
     match f.ec() {
         ec::SVC64 => return crate::syscall::svc(f),
         ec::DABT_LOWER if user_fault(f.far, f.esr, true, true) => return,

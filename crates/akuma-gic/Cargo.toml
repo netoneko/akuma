@@ -10,6 +10,10 @@ description = "ARM GICv3 interrupt-controller driver (distributor, redistributor
 # the per-core SGI entry points (`trigger_sgi_core`, `broadcast_sgi`) and the
 # secondary bring-up path. Off, a single core self-targets via `trigger_sgi`.
 smp-shared = ["akuma-primitives/smp-shared"]
+# Only the per-core entry points (`secondary_init`, `trigger_sgi_core`), for a
+# kernel that starts secondaries without the main kernel's `smp-shared` tree
+# (Taoxichuan on aarch64).
+secondary = []
 
 [dependencies]
 # The device-window VAs the BSP reaches the GICD/GICR through

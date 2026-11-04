@@ -23,6 +23,8 @@
 #![no_std]
 
 pub mod machine;
+#[cfg(all(target_arch = "aarch64", target_os = "none", feature = "secondary"))]
+pub mod secondary;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 pub mod user;
 
