@@ -24,3 +24,6 @@ spinning_top = "0.3"
 [features]
 smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared"]
 extreme = ["akuma-primitives/extreme"]
+# aarch64: the hooked cooperative scheduler path (the one amd64 always uses) instead of the
+# SGI scheduler, for a tokio kernel (B21 A4). No effect on x86_64, which has only that path.
+hooked = []

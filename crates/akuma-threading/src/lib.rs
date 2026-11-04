@@ -126,7 +126,7 @@ pub use types::*;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(all(target_os = "none", sgi_sched))]
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use akuma_primitives::OnceCopy;
@@ -1444,7 +1444,7 @@ pub fn set_itimer(tid: usize, deadline: u64, interval: u64) {
 /// need to modify its own thread ID directly.
 
 /// Set the current thread ID in TPIDRRO_EL0
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(all(target_os = "none", sgi_sched))]
 #[inline]
 fn set_current_thread_register(tid: usize) {
     unsafe {
@@ -1467,7 +1467,7 @@ fn set_current_thread_register(tid: usize) {
 /// disagree — every AArch64 path that re-points the current thread has an
 /// x86 counterpart that must do the same, and a silent no-op is how
 /// `get_current_thread_register` came to read 0 for every thread.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", hooked_sched))]
 #[inline]
 fn set_current_thread_register(tid: usize) {
     if let Some(h) = X86_ARCH_HOOKS.get() {
@@ -1476,8 +1476,8 @@ fn set_current_thread_register(tid: usize) {
 }
 
 #[cfg(not(any(
-    all(target_os = "none", target_arch = "aarch64"),
-    all(target_os = "none", target_arch = "x86_64")
+    all(target_os = "none", sgi_sched),
+    all(target_os = "none", hooked_sched)
 )))]
 #[inline]
 fn set_current_thread_register(_tid: usize) {}
@@ -1502,12 +1502,12 @@ fn get_current_thread_register() -> usize {
     // is what [`X86ArchHooks::current_slot`] reads. `.get()` rather than
     // `require()`: this is called from diagnostics that can run before
     // registration, and answering 0 there is the same answer the register gave.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(hooked_sched)]
     match X86_ARCH_HOOKS.get() {
         Some(h) => (h.current_slot)(),
         None => IDLE_THREAD_IDX,
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(hooked_sched))]
     akuma_primitives::preempt::current_tid()
 }
 
@@ -1907,7 +1907,7 @@ fn note_user_thread_highwater() {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(sgi_sched)]
 impl ThreadPool {
     /// Internal helper to spawn a user closure without marking it READY
     pub fn spawn_user_closure_initializing(
@@ -1978,7 +1978,7 @@ impl ThreadPool {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 impl ThreadPool {
     /// Claim a slot for a user thread and leave it `INITIALIZING` — the
     /// x86_64 arm, and the read of this file that matters is that it is the
@@ -2061,15 +2061,15 @@ impl ThreadPool {
 ///
 /// Off both kernels this is a no-op: there is no slot table on a host.
 pub fn release_initializing_thread(tid: usize) {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(sgi_sched)]
     {
         if tid < MAX_THREADS {
             THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
         }
     }
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "none", hooked_sched))]
     x86_abandon(tid);
-    #[cfg(not(any(target_arch = "aarch64", all(target_os = "none", target_arch = "x86_64"))))]
+    #[cfg(not(any(sgi_sched, all(target_os = "none", hooked_sched))))]
     {
         let _ = tid;
     }
@@ -2570,7 +2570,7 @@ pub use akuma_primitives::preempt::{
 /// the scheduler switches back to this idle); `stack_base`/`stack_size` describe the
 /// boot stack so `validate_current_sp` recognizes it. Must be called with IRQs masked
 /// and before this core enables interrupts.
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(all(target_os = "none", sgi_sched))]
 pub fn adopt_current_as_core_idle(
     core_id: usize,
     exc_stack_top: u64,
@@ -2624,7 +2624,7 @@ pub fn adopt_current_as_core_idle(
 
 /// x86_64 stub — real shared-kernel SMP is out of scope for this pass (see
 /// `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md`); nothing calls this here.
-#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+#[cfg(all(target_os = "none", not(sgi_sched)))]
 pub fn adopt_current_as_core_idle(
     _core_id: usize,
     _exc_stack_top: u64,
@@ -2639,7 +2639,7 @@ pub fn adopt_current_as_core_idle(
 // ============================================================================
 
 // Assembly context switch implementation
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(all(target_os = "none", sgi_sched))]
 global_asm!(
     r#"
 .section .text
@@ -2694,15 +2694,15 @@ thread_exit_asm:
 "#
 );
 
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(all(target_os = "none", sgi_sched))]
 unsafe extern "C" {
     fn thread_start() -> !;
     fn thread_start_closure() -> !;
 }
 
-#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(not(all(target_os = "none", sgi_sched)))]
 unsafe extern "C" fn thread_start() -> ! { panic!("not on bare metal aarch64") }
-#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(not(all(target_os = "none", sgi_sched)))]
 unsafe extern "C" fn thread_start_closure() -> ! { panic!("not on bare metal aarch64") }
 
 // ============================================================================
@@ -2874,7 +2874,7 @@ fn x86_build_closure_context(stack_top: usize, trampoline: fn(*mut ()) -> !, clo
 /// policy for the AArch64 multi-core scheduler this pass does not attempt to
 /// match; this mirrors `amd64::sched::yield_now`'s own plain scan instead,
 /// which is exactly what a single-core, cooperative-only switch needs.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 fn x86_pick_next(from: usize, hooks: X86ArchHooks) -> Option<usize> {
     for step in 1..=MAX_THREADS {
         let candidate = (from + step) % MAX_THREADS;
@@ -2920,7 +2920,7 @@ fn x86_pick_next(from: usize, hooks: X86ArchHooks) -> Option<usize> {
 /// For an idle core that has just announced it is about to halt (amd64
 /// `smp::set_halted`): a wake that landed between its last pick and the
 /// announcement is visible here, so it does not sleep through it.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 #[must_use]
 pub fn x86_runnable_exists() -> bool {
     let hooks = arch();
@@ -2953,7 +2953,7 @@ pub fn x86_runnable_exists() -> bool {
 /// **Every field is load-bearing on a switch**; a missing one is not a
 /// degraded scheduler but a corrupt one, which is why this is a struct with no
 /// defaults rather than a set of optional setters.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 #[derive(Clone, Copy)]
 pub struct X86ArchHooks {
     /// Install `to`'s machine state on this core, called **immediately before**
@@ -3046,18 +3046,18 @@ pub struct X86ArchHooks {
     pub prepare_task_slot: fn(slot: usize) -> Option<usize>,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 static X86_ARCH_HOOKS: Registered<X86ArchHooks> =
     Registered::new("akuma-threading: X86ArchHooks not registered — call amd64::sched::init()");
 
 /// Register the x86_64 machine effects. Called once, early, from
 /// `amd64::sched::init` — before any thread but the boot thread exists.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 pub fn register_x86_arch_hooks(h: X86ArchHooks) {
     X86_ARCH_HOOKS.register(h);
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 #[inline]
 fn arch() -> X86ArchHooks {
     X86_ARCH_HOOKS.require()
@@ -3081,7 +3081,7 @@ fn arch() -> X86ArchHooks {
 /// than growing a second frame builder: the "closure pointer" is simply the
 /// function pointer, and there is nothing to free. Allocation-free, which
 /// matters because this is on the spawn path of every process a shell runs.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 fn x86_plain_entry_trampoline(entry: *mut ()) -> ! {
     // SAFETY: `x86_seed_entry` is the only producer of this pointer and it only
     // ever passes an `extern "C" fn() -> !`.
@@ -3098,7 +3098,7 @@ fn x86_plain_entry_trampoline(entry: *mut ()) -> ! {
 /// `ON_CPU` is latched here, not later: the thread is running right now, and a
 /// peer core that picked it up between this call and its first switch would
 /// resume a stack that is in use.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 pub fn x86_adopt_running_thread(slot: usize) {
     if slot >= MAX_THREADS {
         return;
@@ -3132,7 +3132,7 @@ pub fn x86_adopt_running_thread(slot: usize) {
 /// one that no core is executing is as good as a `FREE` one, which is what
 /// stops [`MAX_THREADS`] being a ceiling on the number of processes a boot may
 /// ever run rather than on how many are alive at once.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 pub fn x86_claim_slot() -> Option<usize> {
     for slot in 1..MAX_THREADS {
         let state = THREAD_STATES[slot].load(Ordering::Acquire);
@@ -3223,7 +3223,7 @@ pub fn x86_claim_slot() -> Option<usize> {
 /// leaks them lazily per slot and reuses them on recycle), where AArch64 takes
 /// them from the crate's own PMM-backed pool. The scheduler does not care which
 /// — it only needs somewhere to push a frame.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 pub fn x86_seed_entry(slot: usize, stack_top: usize, entry: extern "C" fn() -> !) {
     if slot >= MAX_THREADS {
         return;
@@ -3243,7 +3243,7 @@ pub fn x86_seed_entry(slot: usize, stack_top: usize, entry: extern "C" fn() -> !
 ///
 /// Separate from claiming so that forgetting it is a thread that never runs —
 /// loud — rather than one that runs too early.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 pub fn x86_publish(slot: usize) {
     if slot < MAX_THREADS {
         THREAD_STATES[slot].store(thread_state::READY, Ordering::Release);
@@ -3255,7 +3255,7 @@ pub fn x86_publish(slot: usize) {
 /// `TERMINATED`, not `FREE`: on this target a slot owns stacks its next
 /// occupant reuses, and the difference is visible to the caller's own
 /// bookkeeping. [`x86_claim_slot`] treats the two alike.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 pub fn x86_abandon(slot: usize) {
     if slot < MAX_THREADS {
         THREAD_STATES[slot].store(thread_state::TERMINATED, Ordering::Release);
@@ -3305,7 +3305,7 @@ pub fn reserve_slot(slot: usize) -> bool {
 /// published this thread is never chosen again. The loop exists because
 /// [`yield_now`] can legitimately decline to switch (nothing else runnable yet)
 /// and this thread must not run on regardless.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 pub fn x86_finish_current() -> ! {
     let slot = (arch().current_slot)();
     THREAD_STATES[slot].store(thread_state::TERMINATED, Ordering::SeqCst);
@@ -3335,12 +3335,12 @@ pub fn x86_finish_current() -> ! {
 }
 
 /// How many slots [`x86_reap_terminated_slots`] has carried to `FREE`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 static X86_REAPS: AtomicU64 = AtomicU64::new(0);
 
 /// Total slots reaped since boot. Zero on a box that has run user processes
 /// means no collector is calling [`x86_reap_terminated_slots`].
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 #[must_use]
 pub fn x86_reaps() -> u64 {
     X86_REAPS.load(Ordering::Relaxed)
@@ -3391,7 +3391,7 @@ pub fn x86_reaps() -> u64 {
 /// `space_root` carve-out covers both, so nothing downstream can tell.
 ///
 /// Returns how many slots it moved.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 pub fn x86_reap_terminated_slots() -> usize {
     let mut count = 0;
     for slot in 1..MAX_THREADS {
@@ -3439,7 +3439,7 @@ pub fn x86_reap_terminated_slots() -> usize {
 /// Called with the slot `INITIALIZING` under the caller's winning CAS, so no
 /// other core can be claiming or reaping it, and with none of this module's
 /// locks held — the hooks may take their own.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 fn x86_release_dead_slot(slot: usize) {
     let _stale_depth = bkl::clear_dropped_windows_for_dead_thread(slot);
     if let Some(purge) = SLOT_PURGE_CALLBACK.get() {
@@ -3456,7 +3456,7 @@ fn x86_release_dead_slot(slot: usize) {
 /// `TERMINATED` are not. Asked as "alive", not "not `READY`" — a thread parked
 /// on a pipe is as live as one spinning on it, and the boot's drive loop must
 /// not mistake the two.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 #[must_use]
 pub fn x86_slot_is_live(slot: usize) -> bool {
     slot < MAX_THREADS
@@ -3467,7 +3467,7 @@ pub fn x86_slot_is_live(slot: usize) -> bool {
 }
 
 /// Is `slot` parked in [`schedule_blocking`]? For diagnostics and self-tests.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 #[must_use]
 pub fn x86_slot_is_waiting(slot: usize) -> bool {
     slot < MAX_THREADS && THREAD_STATES[slot].load(Ordering::Acquire) == thread_state::WAITING
@@ -3494,21 +3494,21 @@ pub fn x86_slot_is_waiting(slot: usize) -> bool {
 /// `u64` rather than `u32` on purpose — a wrapped counter reads as "never
 /// skipped", which is exactly the answer being hunted. Relaxed: these are read
 /// long after the fact by a diagnostic, never to make a decision.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 static PICK_SKIP_ONCPU: [AtomicU64; MAX_THREADS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_THREADS]
 };
 
 /// See [`PICK_SKIP_ONCPU`].
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 static PICK_SKIP_CANRUN: [AtomicU64; MAX_THREADS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_THREADS]
 };
 
 /// See [`PICK_SKIP_ONCPU`].
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 static PICK_HITS: [AtomicU64; MAX_THREADS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_THREADS]
@@ -3516,7 +3516,7 @@ static PICK_HITS: [AtomicU64; MAX_THREADS] = {
 
 /// `(picked, skipped for the on-CPU gate, skipped for pinning)` for `slot`.
 /// Diagnostics only; see [`PICK_SKIP_ONCPU`] for how to read the triple.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 #[must_use]
 pub fn x86_slot_pick_counts(slot: usize) -> (u64, u64, u64) {
     if slot >= MAX_THREADS {
@@ -3537,7 +3537,7 @@ pub fn x86_slot_pick_counts(slot: usize) -> (u64, u64, u64) {
 /// can release this", which is the shape a lost `futex`/pipe wake leaves
 /// behind; a deadline already passed means [`x86_wake_pass`] is not running.
 /// The generation distinguishes a fresh occupant from the slot's previous one.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 #[must_use]
 pub fn x86_slot_wait_debug(slot: usize) -> (u64, bool, u64) {
     if slot >= MAX_THREADS {
@@ -3558,7 +3558,7 @@ pub fn x86_slot_wait_debug(slot: usize) -> (u64, bool, u64) {
 /// thread looks identical from outside whichever one it is. Reporting the
 /// state without the gate is how "the daemon is ready and never picked" reads
 /// as a scheduler bug when it is really a second core sitting on its stack.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 #[must_use]
 pub fn x86_slot_debug(slot: usize) -> (u8, u8) {
     if slot >= MAX_THREADS {
@@ -3576,7 +3576,7 @@ pub fn x86_slot_debug(slot: usize) -> (u8, u8) {
 /// needs the answer rather than just the effect: a core's idle loop, which must
 /// `hlt` when the picker found nothing and must **not** when it did.
 /// [`yield_now`] is the arch-neutral spelling and discards it.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 pub fn x86_yield() -> bool {
     x86_yield_now()
 }
@@ -3596,7 +3596,7 @@ pub fn x86_yield() -> bool {
 /// would overwrite it — resurrecting a thread that was killed, or stamping
 /// `READY` onto a half-written slot. `WAKE_TIMES` is cleared only after a
 /// transition this core owns.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 fn x86_wake_pass() {
     let now = (runtime().uptime_us)();
     for i in 0..MAX_THREADS {
@@ -3631,7 +3631,7 @@ fn x86_wake_pass() {
 /// (`amd64/src/lapic.rs`, `arm_deadline`). Lock-free and allocation-free; a
 /// racing wake or new park only makes the answer stale by one halt, and the
 /// halt's own wake path re-reads it.
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 #[must_use]
 pub fn x86_earliest_wake_time() -> Option<u64> {
     let mut best = u64::MAX;
@@ -3687,7 +3687,7 @@ pub fn wake_is_due(earliest: Option<u64>, now_us: u64) -> bool {
 /// every switch require the lock, which is what made a task parked mid-syscall
 /// own the lock for its whole sleep and freeze `serving` behind it
 /// (`docs/archive/AKUMA_AMD64_BKL_NETWORKING.md` 2026-09-20 night).
-#[cfg(target_arch = "x86_64")]
+#[cfg(hooked_sched)]
 fn x86_yield_now() -> bool {
     // Prev-handoff cleanup, first thing: whatever gate this core is still
     // carrying belongs to a thread whose stack is now dead (we are running,
@@ -3869,6 +3869,132 @@ fn x86_check_incoming_frame(cur: usize, next: usize) {
         safe_print!(64, "[SWITCH BADFRAME]   +{:#x} = {:#x}\n", i * 8, w);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The hooked path's register-file layer on aarch64 (B21 A4).
+//
+// The three functions above are the x86 spelling; these are the AArch64 one, for a
+// kernel that builds this crate with `hooked` (a tokio kernel) and so runs the
+// cooperative hooked scheduler instead of the SGI one. Same contract: save the
+// outgoing thread's callee-saved state, swap stacks, restore the incoming one's,
+// and return into it - at its last switch, or (first run) at the entry trampoline.
+//
+// The callee-saved set is AAPCS64's: x19-x28, the frame pointer x29, the link
+// register x30, sp, and the low halves of v8-v15 (d8-d15). The GPRs go into the
+// `Context` fields the SGI path already defines (`x19`..`x30`, `sp`, `daif`); d8-d15
+// go on the outgoing stack below `sp`, so `Context` keeps one layout for both
+// paths. `DAIF` is saved and restored for the reason x86 saves `RFLAGS`: the
+// interrupt mask belongs to the task, not to whoever last ran on this core.
+// ---------------------------------------------------------------------------
+
+/// `Context` byte offsets the asm below uses (`akuma-exec-core`'s aarch64
+/// `#[repr(C)]` layout: `magic` then `x19`..`x30`, `sp`, `daif`). Checked at
+/// compile time so a layout change fails the build, not the first switch.
+#[cfg(all(target_arch = "aarch64", hooked_sched))]
+const _: () = {
+    assert!(core::mem::offset_of!(Context, x19) == 8);
+    assert!(core::mem::offset_of!(Context, x29) == 88);
+    assert!(core::mem::offset_of!(Context, x30) == 96);
+    assert!(core::mem::offset_of!(Context, sp) == 104);
+    assert!(core::mem::offset_of!(Context, daif) == 112);
+};
+
+#[cfg(all(target_arch = "aarch64", hooked_sched))]
+core::arch::global_asm!(
+    r#"
+    .section .text
+.global akuma_threading_hooked_switch_context
+akuma_threading_hooked_switch_context:
+    /* x0 = *mut Context (outgoing), x1 = *const Context (incoming). */
+    sub sp, sp, #64
+    stp d8, d9, [sp, #0]
+    stp d10, d11, [sp, #16]
+    stp d12, d13, [sp, #32]
+    stp d14, d15, [sp, #48]
+    stp x19, x20, [x0, #8]
+    stp x21, x22, [x0, #24]
+    stp x23, x24, [x0, #40]
+    stp x25, x26, [x0, #56]
+    stp x27, x28, [x0, #72]
+    stp x29, x30, [x0, #88]
+    mov x9, sp
+    str x9, [x0, #104]
+    mrs x9, daif
+    str x9, [x0, #112]
+
+    ldp x19, x20, [x1, #8]
+    ldp x21, x22, [x1, #24]
+    ldp x23, x24, [x1, #40]
+    ldp x25, x26, [x1, #56]
+    ldp x27, x28, [x1, #72]
+    ldp x29, x30, [x1, #88]
+    ldr x9, [x1, #104]
+    mov sp, x9
+    ldp d8, d9, [sp, #0]
+    ldp d10, d11, [sp, #16]
+    ldp d12, d13, [sp, #32]
+    ldp d14, d15, [sp, #48]
+    add sp, sp, #64
+    ldr x9, [x1, #112]
+    msr daif, x9
+    ret
+
+.global akuma_threading_hooked_thread_entry_trampoline
+akuma_threading_hooked_thread_entry_trampoline:
+    /* First switch-in of a fresh thread: the `ret` above lands here with
+     * x19 = closure_ptr and x20 = the boxed-closure trampoline, seeded by
+     * `x86_build_closure_context`. As on x86, this is the task's first scheduler
+     * entry, so it clears the outgoing thread's ON_CPU gate itself. `br`, not
+     * `blr`: the trampoline never returns. */
+    bl rust_switch_finished
+    mov x0, x19
+    br x20
+"#
+);
+
+#[cfg(all(target_arch = "aarch64", hooked_sched))]
+unsafe extern "C" {
+    fn akuma_threading_hooked_switch_context(old: *mut Context, new: *const Context);
+    fn akuma_threading_hooked_thread_entry_trampoline() -> !;
+}
+
+/// The hooked path's switch on aarch64 (named for the path it serves, which
+/// was x86's alone when it was written).
+///
+/// # Safety
+/// As the x86_64 one: `old`/`new` are live [`Context`]s of threads nothing
+/// else is switching.
+#[cfg(all(target_arch = "aarch64", hooked_sched))]
+unsafe fn x86_switch_context(old: *mut Context, new: *const Context) {
+    // SAFETY: the caller's obligation, passed through.
+    unsafe { akuma_threading_hooked_switch_context(old, new) }
+}
+
+/// A fresh thread's [`Context`] on aarch64: the first switch into it pops a
+/// zeroed d8-d15 block, unmasks interrupts (`DAIF` = 0, as x86 starts with
+/// `IF` set) and returns into the entry trampoline with `closure_ptr` in x19
+/// and `trampoline` in x20.
+#[cfg(all(target_arch = "aarch64", hooked_sched))]
+fn x86_build_closure_context(stack_top: usize, trampoline: fn(*mut ()) -> !, closure_ptr: *mut ()) -> Context {
+    // 16-byte aligned, with the 64-byte d8-d15 block the switch pops below it.
+    let entry_sp = (stack_top & !0xf) - 64;
+    // SAFETY: the block is inside the stack the caller just allocated for this
+    // thread and nothing else has touched yet.
+    unsafe { core::ptr::write_bytes(entry_sp as *mut u8, 0, 64) };
+    let mut ctx = Context::zero();
+    ctx.x19 = closure_ptr as u64;
+    ctx.x20 = trampoline as *const () as u64;
+    ctx.x30 = akuma_threading_hooked_thread_entry_trampoline as *const () as u64;
+    ctx.sp = entry_sp as u64;
+    ctx.daif = 0;
+    ctx
+}
+
+/// The x86 path checks the saved `RFLAGS` word before `popfq`; the aarch64
+/// switch restores `DAIF` from the `Context` itself, where a corrupt word has
+/// no trap of its own to hide behind, so there is nothing to look at first.
+#[cfg(all(target_arch = "aarch64", hooked_sched))]
+fn x86_check_incoming_frame(_cur: usize, _next: usize) {}
 
 /// Set up a fake IRQ frame on a new thread's stack
 /// 
@@ -4901,9 +5027,9 @@ pub fn yield_now() {
     // context switch" section above), so this calls the cooperative switch
     // directly and synchronously rather than through an interrupt — the
     // same shape `amd64::sched::yield_now` already uses.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(hooked_sched)]
     x86_yield_now();
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(sgi_sched)]
     {
         voluntary_schedule_flag().store(true, Ordering::Release);
         (runtime().trigger_sgi)(0);
@@ -5125,7 +5251,7 @@ pub fn blocking_relax_net() {
 /// Takes current SP from assembly, returns new SP if switch needed (or 0).
 /// The assembly does the actual SP switch AFTER this function returns.
 /// This avoids the problem of switching SP in the middle of Rust code.
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(all(target_os = "none", sgi_sched))]
 pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     (runtime().end_of_interrupt)(irq);
 
@@ -5405,7 +5531,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
 /// `x86_64` today (`akuma-exceptions`'s IRQ handler is the sole caller, and
 /// nothing wires that handler up outside the aarch64 kernel), and if that
 /// ever changes the panic says so instead of silently never switching.
-#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(not(all(target_os = "none", sgi_sched)))]
 pub fn sgi_scheduler_handler_with_sp(_irq: u32, _current_sp: u64) -> u64 {
     unimplemented!(
         "sgi_scheduler_handler_with_sp: aarch64 bare metal only (writes ttbr0_el1) — \
@@ -5444,7 +5570,7 @@ pub extern "C" fn rust_switch_finished() {
 /// blockers costs only a short deferral, while trusting the state machine costs
 /// the machine if any revival route exists that the model missed.
 /// Bounded loop, no heap, no locks.
-#[cfg(target_arch = "aarch64")]
+#[cfg(sgi_sched)]
 pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
     if l0_base == 0 {
         return None;
@@ -5476,7 +5602,7 @@ pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
 /// depending on the kernel that owns it. Unregistered it answers `None`, which
 /// is the old behaviour and is correct for exactly as long as the old premise
 /// held — before a scheduler exists there is no slot to be carrying a root.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(sgi_sched))]
 static SAVED_ROOT_PROBE: akuma_primitives::Registered<fn(u64) -> Option<(usize, u8)>> =
     akuma_primitives::Registered::new(
         "akuma-threading: saved-root probe not registered (x86_64 free gate degraded)",
@@ -5485,12 +5611,12 @@ static SAVED_ROOT_PROBE: akuma_primitives::Registered<fn(u64) -> Option<(usize, 
 /// Register the x86_64 saved-root probe. Called once, by the target's scheduler
 /// `init`, before any address space can be built — the gate it feeds has to be
 /// correct for the whole run, not from the moment the first process dies.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(sgi_sched))]
 pub fn register_saved_root_probe(probe: fn(u64) -> Option<(usize, u8)>) {
     SAVED_ROOT_PROBE.register(probe);
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(sgi_sched))]
 pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
     if l0_base == 0 {
         return None;
@@ -5502,7 +5628,7 @@ pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
 /// (boot-suite self-tests only — they can't get a real thread parked with a
 /// chosen stale TTBR0 in its saved context).
 #[doc(hidden)]
-#[cfg(target_arch = "aarch64")]
+#[cfg(sgi_sched)]
 pub fn test_swap_saved_ctx_ttbr0(slot: usize, ttbr0: u64) -> u64 {
     unsafe {
         let ctx = &mut *get_context_mut(slot % MAX_THREADS);
@@ -5511,7 +5637,7 @@ pub fn test_swap_saved_ctx_ttbr0(slot: usize, ttbr0: u64) -> u64 {
 }
 
 #[doc(hidden)]
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(sgi_sched))]
 pub fn test_swap_saved_ctx_ttbr0(_slot: usize, _ttbr0: u64) -> u64 {
     0
 }
@@ -5561,18 +5687,18 @@ pub fn on_cpu_count() -> usize {
 ///
 /// Off both kernels (a host `cargo test`, where `target_arch` is the host's)
 /// this is a no-op rather than a panic: nothing on a host has a slot to write.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(sgi_sched))]
 pub fn update_thread_context(thread_id: usize, user_context: &UserContext) {
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "none", hooked_sched))]
     (arch().write_user_context)(thread_id, user_context);
-    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    #[cfg(not(all(target_os = "none", hooked_sched)))]
     {
         let _ = (thread_id, user_context);
     }
 }
 
 /// Update a thread's context for a new execution (e.g., after execve or fork)
-#[cfg(target_arch = "aarch64")]
+#[cfg(sgi_sched)]
 pub fn update_thread_context(thread_id: usize, user_context: &UserContext) {
     // Tripwire for the SMP=4 mixed-EL corruption: a "user" context whose PC is a
     // kernel address is poison at CREATION time (the capture read a clobbered
@@ -6076,7 +6202,7 @@ pub fn schedule_blocking(wake_time_us: u64) {
     // (device IRQs drive reschedules) but on a secondary two cooperating threads (the
     // rump sysproxy client↔server pipe hop) have NO IRQ between them, so every hop was
     // tick-bound (~10 ms). A voluntary SGI bypasses the preemption-disabled guard too.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(sgi_sched)]
     {
         voluntary_schedule_flag().store(true, Ordering::Release);
         (runtime().trigger_sgi)(0);
@@ -6122,10 +6248,10 @@ pub fn schedule_blocking(wake_time_us: u64) {
         }
 
         // Wait for interrupt - timer IRQ will fire within 10ms
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(sgi_sched)]
         akuma_cpu::park::wfi();
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(hooked_sched)]
         {
             // We are WAITING, so `x86_pick_next` skips us: this hands the core
             // to someone else and returns only once a waker, the wake-pass, or
@@ -6380,7 +6506,7 @@ where
 
     // Step 3, x86_64: same shape as `spawn_fn`'s x86_64 arm — no fake IRQ
     // frame, see the "x86_64 context switch" section above.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(hooked_sched)]
     {
         let stack_top = {
             let pool = POOL.lock();
@@ -6402,7 +6528,7 @@ where
 
     // Step 3, aarch64: set up fake IRQ frame and context.
     // This enables stack-based context switching
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(sgi_sched)]
     with_irqs_disabled(|| {
         // Get stack info from POOL (brief lock)
         let stack_top = {
@@ -6526,7 +6652,7 @@ where
 /// AArch64-only: both real callers are already gated the same way
 /// (`spawn_user_thread_fn_internal`'s aarch64 arm; the host test above).
 #[inline]
-#[cfg(target_arch = "aarch64")]
+#[cfg(sgi_sched)]
 fn init_thread_slot_context(
     slot_idx: usize,
     sp: u64,
@@ -6561,7 +6687,7 @@ fn init_thread_slot_context(
 /// Internal implementation for spawning user threads
 ///
 /// - start_irqs_disabled: if true, thread starts with IRQs disabled (for process threads)
-#[cfg_attr(target_arch = "x86_64", allow(unreachable_code, unused_variables))]
+#[cfg_attr(hooked_sched, allow(unreachable_code, unused_variables))]
 fn spawn_user_thread_fn_internal<F>(f: F, start_irqs_disabled: bool) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
@@ -6577,7 +6703,7 @@ where
     // worked and anything that computed, or touched an unmapped page, reset the
     // machine. Also gives the slot the canary pair the rest of the target paints.
     // `start_irqs_disabled` has no analogue on this cooperative-switch target.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(hooked_sched)]
     {
         let boxed: Box<F> = Box::new(f);
         let closure_ptr = Box::into_raw(boxed) as *mut ();
@@ -6635,7 +6761,7 @@ where
     // documented on `spawn_user_thread_fn_for_process`) has no analogue in
     // this pass's cooperative-only x86_64 path and is ignored; nothing on
     // this target calls that variant yet.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(hooked_sched)]
     {
         let _ = start_irqs_disabled;
         let stack_top = {
@@ -6659,7 +6785,7 @@ where
 
     // Step 3, aarch64: set up fake IRQ frame and minimal context.
     // This enables stack-based context switching
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(sgi_sched)]
     with_irqs_disabled(|| {
         // Get stack info from POOL (brief lock)
         let stack_top = {
@@ -6911,7 +7037,7 @@ pub fn dump_thread_resume_points() {
 /// resume point. Returns `live_elr == 0` if the thread has never been switched
 /// out via the IRQ path yet (`Context.sp == 0`). Returns `None` for out-of-range
 /// ids.
-#[cfg(target_arch = "aarch64")]
+#[cfg(sgi_sched)]
 pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
     if thread_id >= MAX_THREADS {
         return None;
@@ -6932,7 +7058,7 @@ pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
 
 /// x86_64 stub — this diagnostic reads the AArch64 fake-IRQ-frame layout
 /// that has no counterpart in this pass's cooperative-only switch.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(sgi_sched))]
 pub fn get_saved_kernel_resume(_thread_id: usize) -> Option<(u64, u64, u64)> {
     None
 }
@@ -6969,7 +7095,7 @@ pub fn no_trap_frame_child_count() -> u64 {
 /// instruction-abort class, `N` climbing by one per event for the whole boot
 /// (`docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`, class 2). Returning `None` fails
 /// the syscall instead, which is loud, local, and recoverable.
-#[cfg(target_arch = "aarch64")]
+#[cfg(sgi_sched)]
 pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
     if thread_id >= MAX_THREADS {
         return None;
@@ -7044,9 +7170,9 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
 /// Off both kernels (a host `cargo test`, where `target_arch` is the host's)
 /// there is no slot table at all, so `None` stays the only honest answer —
 /// the same shape `update_thread_context`'s host arm takes.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(sgi_sched))]
 pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "none", hooked_sched))]
     {
         if thread_id >= MAX_THREADS {
             return None;
@@ -7065,7 +7191,7 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
         }
         ctx
     }
-    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    #[cfg(not(all(target_os = "none", hooked_sched)))]
     {
         let _ = thread_id;
         None
