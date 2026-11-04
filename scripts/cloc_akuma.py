@@ -1670,12 +1670,27 @@ def print_external_report(kernel_gate: bool, W: int) -> None:
 #: name -> (manifest, cargo package, target triple, features, default features on).
 #: `no-tests` everywhere: the image a guest boots carries no boot self-tests.
 AUDIT_KERNELS = {
-    "taoxichuan": (os.path.join("taoxichuan", "Cargo.toml"), "taoxichuan",
-                   "x86_64-unknown-none", "no-tests", True),
+    "taoxichuan-amd64": (os.path.join("taoxichuan", "Cargo.toml"), "taoxichuan",
+                         "x86_64-unknown-none", "no-tests", True),
+    "taoxichuan-aarch64": (os.path.join("taoxichuan", "Cargo.toml"), "taoxichuan",
+                           "aarch64-unknown-none", "no-tests", True),
     "akuma-amd64": (os.path.join("amd64", "Cargo.toml"), "akuma-amd64",
                     "x86_64-unknown-none", "no-tests", True),
     "akuma-aarch64": ("Cargo.toml", "akuma", "aarch64-unknown-none", "no-tests", True),
 }
+
+#: A kernel built from one root for two architectures is audited as two TRACKS, one image
+#: per target, and reported with what each track adds over the other: the arch-only lines
+#: are what a reviewer reads for one machine and not the other, the shared lines are read
+#: once for both. `--audit taoxichuan` means both tracks.
+AUDIT_TRACKS = {
+    "taoxichuan": ("taoxichuan-amd64", "taoxichuan-aarch64"),
+}
+
+
+class AuditBuildFailed(Exception):
+    """`cargo check` refused the kernel for this target (a track not ported yet)."""
+
 
 #: Extensions a dep-info line can name that are code a reviewer reads. `.s` arrives
 #: via `global_asm!(include_str!(..))`; anything else (`banner.txt`, JSON tables)
@@ -1752,8 +1767,8 @@ def audit_units(manifest: str, pkg: str, triple: str, features: str, default: bo
         cmd.append("--no-default-features")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        tail = "\n".join(proc.stderr.strip().splitlines()[-5:])
-        raise SystemExit(f"error: `{' '.join(cmd)}` failed:\n{tail}")
+        tail = "\n".join(proc.stderr.strip().splitlines()[-12:])
+        raise AuditBuildFailed(f"`{' '.join(cmd)}` failed:\n{tail}")
 
     msgs = [json.loads(ln) for ln in proc.stdout.splitlines() if ln.startswith("{")]
     bs_cfgs: dict = {}
@@ -1874,15 +1889,60 @@ def audit_union(a: dict, b: dict):
 AUDIT_ORIGINS = ("kernel", "workspace", "third-party")
 
 
+def expand_audit_names(names: list) -> list:
+    """Track aliases (`taoxichuan`) become their per-arch kernels, in order, once each."""
+    out: list = []
+    for n in names:
+        for k in AUDIT_TRACKS.get(n, (n,)):
+            if k not in out:
+                out.append(k)
+    return out
+
+
+def track_split(a: dict, b: dict):
+    """{origin: [a_only, b_only, shared, union]} plus "total", from two kernels' line maps."""
+    u = audit_union(a, b)
+    out = {}
+    for key, (union, shared, _uu, _us) in u.items():
+        out[key] = [0, 0, shared, union]
+    for which, lines_ in ((0, a), (1, b)):
+        per: dict = {}
+        for path, (origin, live, _unsafe) in lines_.items():
+            per[origin] = per.get(origin, 0) + len(live)
+            per["total"] = per.get("total", 0) + len(live)
+        for key, n in per.items():
+            out.setdefault(key, [0, 0, 0, 0])[which] = n - out[key][2]
+    return out
+
+
 def print_audit_report(names: list, top: int, as_json: bool) -> None:
-    results = {n: audit_kernel(n) for n in names}
+    names = expand_audit_names(names)
+    results, failed = {}, {}
+    for n in names:
+        try:
+            results[n] = audit_kernel(n)
+        except AuditBuildFailed as e:
+            failed[n] = str(e)
+    tracks = {t: track_split(results[a][2], results[b][2])
+              for t, (a, b) in AUDIT_TRACKS.items() if a in results and b in results}
     if as_json:
         out = {}
         for n, (cfg, rows, _lines) in results.items():
             out[n] = {"manifest": cfg[0], "package": cfg[1], "triple": cfg[2],
                       "features": cfg[3], "default_features": cfg[4],
                       "crates": [vars(r) for r in rows]}
+        for n, why in failed.items():
+            out[n] = {"error": why}
+        for t, split in tracks.items():
+            a, b = AUDIT_TRACKS[t]
+            out[t] = {"tracks": [a, b], "lines": {
+                k: {f"{a}_only": v[0], f"{b}_only": v[1], "shared": v[2], "union": v[3]}
+                for k, v in split.items()}}
         print(json.dumps(out, indent=2))
+        return
+    if not results:
+        for n, why in failed.items():
+            print(f"{n}: does not build\n{why}")
         return
 
     W = 86
@@ -1917,6 +1977,24 @@ def print_audit_report(names: list, top: int, as_json: bool) -> None:
             print(f"  largest {top} crates in the image by audit lines:")
             for r in sorted(image, key=lambda r: -r.code)[:top]:
                 print(f"    {r.crate:<34}{r.origin:<13}{r.code:>8}{r.unsafe_code:>8}")
+        print()
+    for n, why in failed.items():
+        print(rule(W))
+        manifest, pkg, triple, _f, _d = AUDIT_KERNELS[n]
+        print(f"{n}: {pkg} does not build for {triple} (no track yet)")
+        cause = [ln for ln in why.splitlines() if "error" in ln or "panicked" in ln] or why.splitlines()[-1:]
+        print("  " + cause[-1].strip()[:W - 2])
+        print()
+
+    for t, split in tracks.items():
+        a, b = AUDIT_TRACKS[t]
+        print(rule(W))
+        print(f"{t}: arch tracks (audit lines; shared = live in both images, read once)")
+        print(rule(W))
+        print(f"  {'':<26}{a + ' only':>18}{b + ' only':>20}{'shared':>9}{'union':>9}")
+        for key in AUDIT_ORIGINS + ("total",):
+            v = split.get(key, [0, 0, 0, 0])
+            print(f"  {key:<26}{v[0]:>18}{v[1]:>20}{v[2]:>9}{v[3]:>9}")
         print()
 
     if len(summary) > 1:
@@ -2691,10 +2769,12 @@ def main() -> int:
     ap.add_argument("--elf-triple", default="aarch64-unknown-none")
     ap.add_argument("--elf-features", default="", help="features the ELF was built with")
     ap.add_argument("--elf-no-default-features", action="store_true")
-    ap.add_argument("--audit", nargs="*", metavar="KERNEL", choices=list(AUDIT_KERNELS),
+    ap.add_argument("--audit", nargs="*", metavar="KERNEL", choices=list(AUDIT_KERNELS) + list(AUDIT_TRACKS),
                     help="audit surface: the lines compiled into each kernel image, from rustc "
                          f"dep-info + cfg evaluation (default: taoxichuan akuma-amd64; "
-                         f"choices: {', '.join(AUDIT_KERNELS)})")
+                         f"choices: {', '.join(list(AUDIT_TRACKS) + list(AUDIT_KERNELS))}; "
+                         "a track name such as `taoxichuan` audits each architecture's image "
+                         "and what each adds over the other)")
     ap.add_argument("--linux", nargs="+", metavar="TREE",
                     help="SRCTREE OBJTREE [OBJTREE ...]: audit surface of BUILT Linux trees "
                          "(`make O=OBJTREE vmlinux`), each alone and pairwise unions; "

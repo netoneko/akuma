@@ -14,10 +14,11 @@
 //!   poller, no mouse, tun, audio or file-page cache). The kernel supplies only
 //!   what is genuinely its own: the clock, the core count, randomness, and what
 //!   to do after a reap.
-//! - **The dispatch** ([`dispatch`]): an allow-listed call to glue by its
-//!   asm-generic number, everything else to the x86_64 fd-family layer
-//!   (`akuma-syscalls-glue-amd64`), which answers `None` for what it does not
-//!   know.
+//! - **The dispatch** ([`serve`], [`serve_shared`]): an allow-listed call to glue
+//!   by its asm-generic number. Arch-neutral: each kernel's front decodes its own
+//!   numbers and routes what this answers `None` for to its ABI layer (the x86_64
+//!   fd family is `akuma-syscalls-glue-amd64`'s; on AArch64 glue's own arms take
+//!   the asm-generic calls as they are).
 //!
 //! What stays in the kernel: memory (`mmap` and friends), `clone`/`execve`/`exit`,
 //! signal delivery and the frame, and any device of its own. Those are the
@@ -88,24 +89,30 @@ pub fn install(k: Kernel) {
     akuma_primitives::rng::set_rng_hook(k.rng_fill);
 }
 
-/// Serve `nr` (an x86_64 number) if it is this surface's: `Some` with the
-/// syscall-return value, `None` for a call the kernel must answer itself.
-pub fn dispatch(nr: u64, args: [u64; 6]) -> Option<u64> {
-    if shared_number(nr) {
-        return Some(akuma_syscalls_glue::handle_syscall(nr, &args));
+/// Serve `call` if it is on the allow-list: `Some` with the syscall-return value,
+/// `None` for a call the kernel must answer itself (or route to its ABI layer).
+///
+/// Arch-neutral: the kernel's syscall front decodes its own numbers
+/// (`Syscall::from_x86_64`, `Syscall::from_aarch64`) and hands the call here; glue
+/// is reached by the asm-generic number on every architecture.
+pub fn serve(call: Syscall, args: [u64; 6]) -> Option<u64> {
+    if !served_by_glue(call) {
+        return None;
     }
-    if let Some(call) = Syscall::from_x86_64(nr)
-        && served_by_glue(call)
+    let r = akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args);
+    if matches!(call, Syscall::Wait4 | Syscall::Waitid)
+        && let Some(k) = KERNEL.get()
     {
-        let r = akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args);
-        if matches!(call, Syscall::Wait4 | Syscall::Waitid)
-            && let Some(k) = KERNEL.get()
-        {
-            (k.after_reap)();
-        }
-        return Some(r);
+        (k.after_reap)();
     }
-    akuma_syscalls_glue_amd64::dispatch(nr, args)
+    Some(r)
+}
+
+/// Serve a shared-number call ([`shared_number`]), which no `Syscall` row names:
+/// `nr` is the same on both ABIs, so a front asks this before it decodes.
+#[must_use]
+pub fn serve_shared(nr: u64, args: [u64; 6]) -> Option<u64> {
+    shared_number(nr).then(|| akuma_syscalls_glue::handle_syscall(nr, &args))
 }
 
 /// Whether `nr` is one of this surface's shared-number calls.
@@ -311,12 +318,23 @@ mod tests {
     }
 
     /// Every served call round-trips through its x86_64 number, which is what
-    /// [`dispatch`] decodes.
+    /// the amd64 front decodes before [`serve`].
     #[test]
     fn served_calls_decode_from_x86_64() {
         for &c in Syscall::ALL {
             if in_a_group(c) {
                 assert_eq!(Syscall::from_x86_64(c.to_x86_64()), Some(c));
+            }
+        }
+    }
+
+    /// And through its asm-generic number, which the AArch64 front decodes: the
+    /// allow-list is one list of calls for both architectures.
+    #[test]
+    fn served_calls_decode_from_aarch64() {
+        for &c in Syscall::ALL {
+            if in_a_group(c) {
+                assert_eq!(Syscall::from_aarch64(c.to_aarch64()), Some(c));
             }
         }
     }

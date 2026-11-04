@@ -2,7 +2,7 @@
 name = "akuma-runtime-tokio"
 version = "0.1.0"
 edition = "2024"
-description = "The syscall surface a tokio program needs, as one dependency of an x86_64 composition root: the allow-list of calls glue serves, the hooks a tokio kernel installs, and the dispatch to glue and its x86_64 ABI layer. Features mirror tokio's."
+description = "The syscall surface a tokio program needs, as one dependency of a composition root on either architecture: the allow-list of calls glue serves, the hooks a tokio kernel installs, and the dispatch of an allow-listed call to glue. Each kernel's front decodes its own numbers. Features mirror tokio's."
 
 [lints]
 workspace = true
@@ -25,9 +25,7 @@ shell = []
 # The bodies. epoll and eventfd are not optional: mio's `Poll` and `Waker` are
 # every tokio runtime's first two syscalls.
 akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, features = ["sc-epoll", "sc-eventfd"] }
-# The x86_64 ABI for the fd family (open flags, `struct stat`, the legacy numbers).
-akuma-syscalls-glue-amd64 = { path = "../akuma-syscalls-glue-amd64" }
-# Which x86_64 number is which call, and its asm-generic number for glue.
+# Which call a number is, on either ABI, and its asm-generic number for glue.
 akuma-syscalls-abi = { path = "../akuma-syscalls-abi" }
 # The asm-generic numbers, for the calls Linux numbered the same on both ABIs.
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }

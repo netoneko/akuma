@@ -1872,6 +1872,20 @@ fn console_stdio_write(nr: u64, a: [u64; 6]) -> Option<u64> {
     Some(total)
 }
 
+/// The tokio surface on this ABI: the shared-number calls, then the allow-list by the call
+/// an x86_64 number names (`akuma-runtime-tokio`, arch-neutral), then the x86_64 fd family
+/// (`akuma-syscalls-glue-amd64`: open flags, `struct stat`, the legacy numbers), which
+/// answers `None` for what it does not know.
+fn tokio_surface(nr: u64, args: [u64; 6]) -> Option<u64> {
+    if let Some(r) = akuma_runtime_tokio::serve_shared(nr, args) {
+        return Some(r);
+    }
+    if let Some(r) = akuma_syscalls_abi::Syscall::from_x86_64(nr).and_then(|c| akuma_runtime_tokio::serve(c, args)) {
+        return Some(r);
+    }
+    akuma_syscalls_glue_amd64::dispatch(nr, args)
+}
+
 fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     // M4 slice 3: the per-syscall capture `fork_process` step 6 consumes
     // (`get_saved_user_context` → the twin's `read_user_context`). The boot
@@ -1899,7 +1913,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         if let Some(r) = console_stdio_write(fr.rax, args) {
             return r;
         }
-        if let Some(r) = akuma_runtime_tokio::dispatch(fr.rax, args) {
+        if let Some(r) = tokio_surface(fr.rax, args) {
             return r;
         }
     }

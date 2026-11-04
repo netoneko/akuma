@@ -44,7 +44,8 @@ the caller first if a sibling's `exit_group` asked it to, and then `dispatch_inn
    channel of its own goes to the console. It reads `Process.channel`, not `current_channel()`, which falls
    back to a forked child's exit channel. Neither call is on the allow-list, so this order changes no
    routing.
-3. **[`akuma_runtime_tokio::dispatch`](../../../crates/akuma-runtime-tokio).** An allow-listed call goes to
+3. **`tokio_surface`** (`akuma-tokio-kernel-amd64`): [`akuma_runtime_tokio::serve_shared` and
+   `serve`](../../../crates/akuma-runtime-tokio), arch-neutral, send an allow-listed call to
    `akuma_syscalls_glue::handle_syscall` by its asm-generic number; anything else goes to
    `akuma_syscalls_glue_amd64::dispatch`, the x86_64 ABI layer over glue that amd64 uses too (open-flag
    permutation, the x86_64 `struct stat`, poll/select timeouts, `dup2`'s `old == new` rule, the legacy

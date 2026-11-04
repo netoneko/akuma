@@ -62,7 +62,7 @@ fd-family layer is `akuma-syscalls-glue-amd64`'s. This crate owns three things:
                   |   mkdirat, console stdio)                            |
                   +--------------------------+---------------------------+
                                              v
-   RUNTIME-TOKIO  akuma_runtime_tokio::dispatch(nr, args)
+   RUNTIME-TOKIO  serve_shared(nr, args), then serve(Syscall, args)
                   +------------------------------------------------------+
                   | a. pidfd_open / pidfd_send_signal  --> glue          |  Some(r)
                   | b. on the allow-list?              --> glue          |--------+
@@ -70,8 +70,11 @@ fd-family layer is `akuma-syscalls-glue-amd64`'s. This crate owns three things:
                   |      net:     socket, connect, epoll, eventfd, ...   |        |
                   |      process: wait4, waitid    (+ after_reap)        |        |
                   |      shell:   setpgid, getrlimit, sync, ...          |        |
-                  | c. else        --> glue-amd64 (open, read, stat ...) |        |
                   +--------------------------+---------------------------+        |
+                                             | None                               |
+                                             v                                    |
+   YOUR KERNEL    the ABI layer: on x86_64 glue-amd64 (open, read, stat    |        |
+                  ...); on AArch64 glue's own arms take the call as is     |        |
                                              | None                               |
                                              v                                    |
    YOUR KERNEL    +------------------------------------------------------+        |
@@ -107,11 +110,17 @@ akuma_runtime_tokio::install(akuma_runtime_tokio::Kernel {
     after_reap: child::collect, // free what a reap leaves; `|| {}` if nothing
 });
 
-// 2. In the syscall handler, after any kernel-specific intercepts.
-if let Some(r) = akuma_runtime_tokio::dispatch(nr, args) {
+// 2. In the syscall handler, after any kernel-specific intercepts: the shared numbers, then
+//    the call your ABI's number names (`from_x86_64` here, `from_aarch64` on AArch64), then
+//    your ABI layer (on x86_64, `akuma_syscalls_glue_amd64::dispatch`).
+if let Some(r) = akuma_runtime_tokio::serve_shared(nr, args) {
     return r;
 }
-// None: the kernel's own arms (mmap/brk/mprotect, clone/execve/exit, signal frames), else ENOSYS.
+if let Some(r) = Syscall::from_x86_64(nr).and_then(|c| akuma_runtime_tokio::serve(c, args)) {
+    return r;
+}
+// None: the ABI layer, the kernel's own arms (mmap/brk/mprotect, clone/execve/exit, signal
+// frames), else ENOSYS.
 
 // 3. With the `process` feature, in the `ExecRuntime` registration.
 pidfd_close: akuma_runtime_tokio::PIDFD_CLOSE,
