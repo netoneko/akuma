@@ -995,6 +995,8 @@ dependencies = [
  "akuma-mmu",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-syscalls-linux",
+ "akuma-syscalls-mem",
  "akuma-user-layout",
  "akuma-vfs",
  "akuma-vfs-glue",

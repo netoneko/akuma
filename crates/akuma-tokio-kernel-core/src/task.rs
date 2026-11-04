@@ -43,6 +43,11 @@ pub const MAX_SHARED: usize = 32;
 /// 512 MiB less the image: 256 MiB, not the 512 the plan first named.
 pub const BRK_SLAB: u64 = 0x1000_0000;
 pub const MMAP_BASE: u64 = 0x0000_6000_0000_0000;
+/// The top of user address space on both architectures: amd64's canonical
+/// lower half. AArch64's 48-bit `TTBR0` reaches twice as far; a tokio kernel
+/// does not use the upper half of it.
+pub const USER_TOP: u64 = 1 << 47;
+
 /// 16 user regions, [`MAX_HOLES`] slab holes, [`MAX_SHARED`] shared file mappings.
 pub type UserLayout = akuma_user_layout::Layout<16, MAX_HOLES, MAX_SHARED>;
 

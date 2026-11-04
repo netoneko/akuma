@@ -67,6 +67,45 @@ impl UserPages for Amd64 {
     }
 }
 
+impl akuma_tokio_kernel_core::mm::Mm for Amd64 {
+    fn with_task<R>(f: impl FnOnce(&mut akuma_tokio_kernel_core::task::Task) -> R) -> R {
+        crate::with_task(f)
+    }
+    fn translate(root: u64, va: u64) -> Option<u64> {
+        paging::translate_in(root, va as usize)
+    }
+    fn unmap(root: u64, va: u64) -> Option<u64> {
+        paging::unmap_page_in(root, va as usize)
+    }
+    fn map_page(root: u64, va: u64, pa: u64, write: bool, exec: bool, user: bool) -> bool {
+        paging::map_page_in(root, va as usize, pa, PteProt { write, exec, user }, MemAttr::WriteBack)
+    }
+    fn frame_of(pte: u64) -> Option<u64> {
+        akuma_pte_amd64::is_present(pte).then(|| akuma_pte_amd64::frame(pte))
+    }
+    fn shootdown() {
+        crate::smp::shootdown();
+    }
+    fn page_written(root: u64, va: u64) -> bool {
+        crate::page_written(root, va)
+    }
+    fn mark_written(root: u64, va: u64) {
+        crate::mark_written(root, va);
+    }
+    fn cow_privatize(root: u64, va: u64) -> bool {
+        crate::cow_privatize(root, va)
+    }
+    fn wx_enforced() -> bool {
+        crate::wx_on()
+    }
+    fn mmdbg() -> u32 {
+        crate::mmdbg()
+    }
+    fn mm_event(kind: u8, start: u64, end: u64) {
+        crate::mm_event(kind, start, end);
+    }
+}
+
 impl core_lazy::Kernel for Amd64 {
     fn root_fs() -> &'static dyn akuma_vfs::Filesystem {
         crate::root_fs()
@@ -88,22 +127,7 @@ pub fn prefault(start: usize, len: usize) -> bool {
     core_lazy::prefault::<Amd64>(start, len)
 }
 
-pub fn reprotect(root: u64, va: u64, write: bool, exec: bool, none: bool) -> bool {
-    core_lazy::reprotect::<Amd64>(root, va, write, exec, none)
-}
-
-pub fn clear(root: u64, va: u64) {
-    core_lazy::clear::<Amd64>(root, va);
-}
-
 pub fn move_range(root: u64, from: u64, to: u64, len: u64) -> bool {
     core_lazy::move_range::<Amd64>(root, from, to, len)
 }
 
-pub fn anon_like(pte: u64) -> Lazy {
-    Amd64::anon_like(pte)
-}
-
-pub fn unpin_released(root: u64, start: u64, end: u64, keep: impl Fn(u32, u64, u64) -> bool) -> bool {
-    core_lazy::unpin_released::<Amd64>(root, start, end, keep)
-}

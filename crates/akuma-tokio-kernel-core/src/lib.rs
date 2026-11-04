@@ -16,6 +16,8 @@ pub mod init;
 #[cfg(feature = "lazy")]
 pub mod lazy;
 pub mod lazy_record;
+#[cfg(feature = "lazy")]
+pub mod mm;
 pub mod mmu;
 pub mod nosys;
 pub mod ring;
