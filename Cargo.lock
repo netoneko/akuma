@@ -672,6 +672,10 @@ name = "akuma-psci"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-pte-aarch64"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-pte-amd64"
 version = "0.1.0"
 dependencies = [

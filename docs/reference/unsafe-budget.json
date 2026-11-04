@@ -46,6 +46,7 @@
     "crates/akuma-pipes",
     "crates/akuma-power",
     "crates/akuma-procfs",
+    "crates/akuma-pte-aarch64",
     "crates/akuma-pte-amd64",
     "crates/akuma-reclock",
     "crates/akuma-rtw89",

@@ -95,6 +95,7 @@ default-members = [
     "crates/akuma-syscalls-proc",
     "crates/akuma-runtime-tokio",
     "crates/akuma-tokio-kernel-core",
+    "crates/akuma-pte-aarch64",
     "crates/akuma-user-layout",
     "crates/akuma-tty",
     "crates/akuma-syscalls-time",
