@@ -7,19 +7,27 @@ description = "The aarch64 machine half of akuma-tokio-kernel: boot through akum
 [lints]
 workspace = true
 
-[dependencies]
+# The kernel's own target only; on a host the crate is empty (`#![cfg]` in lib.rs).
+[target.'cfg(target_os = "none")'.dependencies]
 akuma-alloc = { path = "../akuma-alloc" }
 akuma-boot-aarch64 = { path = "../akuma-boot-aarch64" }
 akuma-cpu = { path = "../akuma-cpu" }
+akuma-firecracker = { path = "../akuma-firecracker" }
+akuma-gic = { path = "../akuma-gic" }
+akuma-mmu = { path = "../akuma-mmu" }
+akuma-pmm = { path = "../akuma-pmm" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-psci = { path = "../akuma-psci" }
+akuma-timer = { path = "../akuma-timer" }
 akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core" }
-akuma-uart = { path = "../akuma-uart" }
+akuma-uart = { path = "../akuma-uart", optional = true }
+akuma-vectors-aarch64 = { path = "../akuma-vectors-aarch64" }
+fdt = "0.1"
 
 [features]
 # The same switches as the amd64 half, so one main.rs builds for both. Only
 # `console` does anything yet; the rest arrive with B21 A5.3 onward.
-console = []
+console = ["dep:akuma-uart"]
 disk = []
 net = []
 smp = []

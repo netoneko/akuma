@@ -458,3 +458,43 @@ pub static BOOT_X0_AT_ENTRY: core::sync::atomic::AtomicU64 =
 pub fn x0_at_entry() -> u64 {
     BOOT_X0_AT_ENTRY.load(core::sync::atomic::Ordering::Relaxed)
 }
+
+/// The device tree `_boot` was handed, copied into `buf`: its byte length.
+///
+/// `None` when `x0` named nothing that looks like one. When `buf` is too
+/// short nothing is copied and the length says what to allocate.
+///
+/// The tree sits in guest RAM wherever the loader put it, and that RAM is not
+/// the kernel's to keep: the PMM hands it out once it is up. So the tree is
+/// *copied*, once, before then. Call this before `akuma_pmm::init` (or any
+/// other user of RAM above the heap).
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[must_use]
+pub fn read_dtb(buf: &mut [u8]) -> Option<usize> {
+    let pa = x0_at_entry() as usize;
+    // Below 3 GiB: the boot tables identity-map [0, 3 GiB) (device below 1 GiB,
+    // normal above), so the pointer is readable at its own address.
+    if pa == 0 || pa >= 0xC000_0000 {
+        return None;
+    }
+    // SAFETY: `pa` is inside `_boot`'s identity map (checked above), so the
+    // 8 header bytes are mapped and readable; the loader placed the tree there
+    // and nothing has written that RAM yet, per this function's call-order
+    // contract; the borrow ends inside this call.
+    let head = unsafe { core::slice::from_raw_parts(pa as *const u8, 8) };
+    if head[..4] != [0xD0, 0x0D, 0xFE, 0xED] {
+        return None;
+    }
+    let total = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
+    if !(40..=(2 << 20)).contains(&total) || pa + total > 0xC000_0000 {
+        return None;
+    }
+    if total > buf.len() {
+        return Some(total);
+    }
+    // SAFETY: as above, extended to the `total` bytes the validated header
+    // declares (still under the identity map's 3 GiB end, checked).
+    let blob = unsafe { core::slice::from_raw_parts(pa as *const u8, total) };
+    buf[..total].copy_from_slice(blob);
+    Some(total)
+}

@@ -956,10 +956,17 @@ dependencies = [
  "akuma-alloc",
  "akuma-boot-aarch64",
  "akuma-cpu",
+ "akuma-firecracker",
+ "akuma-gic",
+ "akuma-mmu",
+ "akuma-pmm",
  "akuma-primitives",
  "akuma-psci",
+ "akuma-timer",
  "akuma-tokio-kernel-core",
  "akuma-uart",
+ "akuma-vectors-aarch64",
+ "fdt",
 ]
 
 [[package]]
@@ -1104,6 +1111,13 @@ version = "0.1.0"
 [[package]]
 name = "akuma-user-walk"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-vectors-aarch64"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+]
 
 [[package]]
 name = "akuma-vfs"
