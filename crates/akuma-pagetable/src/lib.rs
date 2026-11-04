@@ -189,6 +189,30 @@ impl Slot<'_> {
     }
 }
 
+/// Entry `i` of the table frame at `pa`, on either architecture.
+///
+/// What a walker that is not one of [`aarch64`] / [`amd64`] (the fork clone, the
+/// teardown) reads. `pa` is a promise, as a root is (the crate contract); `i` is checked.
+///
+/// # Panics
+/// If `i >= 512`.
+#[must_use]
+pub fn entry<M: PhysMap>(pa: u64, i: usize) -> u64 {
+    // SAFETY: the crate contract: `pa` is a live table frame (a root, or a frame
+    // reached through a valid table entry of one).
+    unsafe { Table::at(M::table_addr(pa)) }.get(i)
+}
+
+/// Overwrite entry `i` of the table frame at `pa`. As [`entry`]; the caller owns
+/// the TLB maintenance.
+///
+/// # Panics
+/// If `i >= 512`.
+pub fn set_entry<M: PhysMap>(pa: u64, i: usize, value: u64) {
+    // SAFETY: as `entry`.
+    unsafe { Table::at(M::table_addr(pa)) }.set(i, value);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ENTRIES, Table, index};

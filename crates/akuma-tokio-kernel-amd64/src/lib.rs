@@ -1924,39 +1924,15 @@ pub(crate) fn task_done(code: u64) -> ! {
     halt();
 }
 
-/// The fork child's address space, copy-on-write since 2026-10-30.
-/// The child's user page tables are cloned subtree-by-subtree, but the LEAF
-/// frames are shared with the parent (`clone_user_tree`): a writable leaf is
-/// demoted to read-only + `PTE_COW` in both tables, a read-only leaf is shared
-/// as is, and the first write by either side faults into `cow_resolve`
-/// (`fault_trap`), which copies or takes the frame in place. Only writable
-/// `MAP_SHARED` file mappings are still copied eagerly. The root is built the
-/// same way `load_task` builds one (kernel half copied from the live CR3, user
-/// half empty). Huge (PS) leaves are refused. `docs/reference/memory.md`.
+/// The fork child's address space, copy-on-write: `akuma_tokio_kernel_core::tree`'s clone
+/// over this machine's tree (`lazy::Amd64`'s `UserTree`). `docs/reference/memory.md`.
 pub(crate) fn clone_user_half(parent_root: u64, dst_root: u64) -> Option<()> {
-    // The `fork_share_memory` pass, INTO a root that already exists —
-    // `fork_process` step 1 handed the child a fresh `UserAddressSpace` and
-    // the hook fills it. The kernel half copies wholesale from the live CR3
-    // (the same upper-half copy `load_task` gives every task root — the
-    // fresh root from the crate shares only amd64's trio 256/257/511, and
-    // this kernel's convention is the full upper half). The user half clones
-    // the parent's subtrees leaf-by-leaf through `clone_user_tree`.
-    // SAFETY: both roots are PMM-resident page-table frames; the forking parent
-    // is parked and this kernel is single-core with IF clear — the discipline
-    // that owns every page-table touch here.
-    let (src, dst) = unsafe { (phys::Frame::from_pa(parent_root), phys::Frame::from_pa(dst_root)) };
-    copy_kernel_half(dst);
-    // The child inherits the parent's lazy file pages, so it holds their inodes too.
-    if !lazy::fork_pins(parent_root, dst_root) || clone_user_half_into(src, dst).is_none() {
-        lazy::drop_pins(dst_root);
-        return None;
-    }
-    Some(())
+    akuma_tokio_kernel_core::tree::clone_user_half::<lazy::Amd64>(parent_root, dst_root)
 }
 
 /// The kernel half of every task root is the live CR3's: one PML4 copy shares
 /// every kernel subtree (physmap, device window, kernel image).
-fn copy_kernel_half(dst: phys::Frame) {
+pub(crate) fn copy_kernel_half(dst: phys::Frame) {
     // SAFETY: CR3 holds the live PML4 frame.
     let k = unsafe { phys::Frame::from_pa(akuma_cpu::ctlreg::cr3() & PTE_ADDR) };
     for i in 256..512 {
@@ -1964,151 +1940,9 @@ fn copy_kernel_half(dst: phys::Frame) {
     }
 }
 
-/// Clone the user half of `src` (a parked parent's PML4) into `dst`, one PML4
-/// subtree at a time through [`clone_user_tree`]. On failure everything this
-/// pass linked into `dst` is released; the root frame itself stays the caller's.
-fn clone_user_half_into(src: phys::Frame, dst: phys::Frame) -> Option<()> {
-    use akuma_user_tree::{ClonePlan, SharedSpans, X86_64};
-    for i in 0..256 {
-        let entry = src.entry(i);
-        // PML4 entries sit three levels above the leaves.
-        match X86_64.plan_clone(3, entry, false, SharedSpans::Copy) {
-            ClonePlan::Skip => {}
-            ClonePlan::Descend { table } => {
-                let Some(sub) = clone_user_tree(table, 2, (i as u64) << 39) else {
-                    release_cloned_prefix(dst, i);
-                    return None;
-                };
-                dst.set_entry(i, X86_64.relink(entry, sub));
-            }
-            // A 1 GiB leaf: see fork_share_memory's note. Release what this pass linked first.
-            ClonePlan::Refuse | ClonePlan::CopyLeaf { .. } | ClonePlan::ShareLeaf { .. } => {
-                release_cloned_prefix(dst, i);
-                return None;
-            }
-        }
-    }
-    Some(())
-}
-
-/// Give back the first `upto` user PML4 slots a failed clone pass linked into `dst`; the root frame
-/// itself stays the caller's.
-fn release_cloned_prefix(dst: phys::Frame, upto: usize) {
-    for j in 0..upto {
-        if let Some(akuma_user_tree::FreeStep::Table(t)) = akuma_user_tree::X86_64.plan_free(3, dst.entry(j)) {
-            free_subtree(t, 2);
-            dst.set_entry(j, 0);
-        }
-    }
-}
-
-/// One page-table level of [`fork_share_memory`]'s clone: `depth` counts the
-/// levels BELOW this table (2 = a PDPT, 0 = a leaf PT naming 4 KiB frames) and
-/// `va_base` is the address the table's first entry covers.
-///
-/// Leaves are SHARED, not copied (copy-on-write): the child's entry names the
-/// parent's frame, `cow_ref_inc` counts the second holder, and a writable
-/// leaf is demoted to read-only + `PTE_COW` in BOTH tables (the parent's
-/// `invlpg`'d — a stale writable translation would write straight into the
-/// shared frame, silently). A leaf that was already read-only keeps its flags
-/// (text stays RX; no marker, so a write to it is still a kill). The one
-/// exception is a writable `MAP_SHARED` file mapping (`t.shared`): those stay
-/// eager per-process copies, the writeback model they run under. Interior
-/// entries get a cloned subtree; huge (PS) leaves are refused. Single core,
-/// `IF` clear, the forking parent parked.
-///
-/// On failure the partial subtree is released (through `free_page`, so the
-/// counts taken so far are dropped) — a refused fork leaks nothing.
-///
-/// `table_pa` must be a PMM-resident page-table frame whose table belongs to the
-/// USER half of a parked task's root (every caller reads it from a present entry
-/// of one).
-fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
-    use akuma_user_tree::{ClonePlan, SharedSpans, X86_64};
-    let dst = phys::Frame::alloc_zeroed()?;
-    let out = dst.pa();
-    let shift = 12 + 9 * depth;
-    // SAFETY: contract above.
-    let src = unsafe { phys::Frame::from_pa(table_pa) };
-    for i in 0..512 {
-        let entry = src.entry(i);
-        let va = va_base | ((i as u64) << shift);
-        // The decisions (skip / refuse / descend / copy / share-and-demote) are `akuma-user-tree`'s, host-tested
-        // against a fake tree; this loop performs them. A `MAP_SHARED` span (a writable file mapping, or an anonymous
-        // one) is shared as it stands, writable and unmarked (`SharedSpans::ShareWritable`): parent and child map one frame.
-        // A lazy leaf is not present, so the plan would skip it: the child must inherit the record.
-        if depth == 0 && lazy::is_lazy(entry) {
-            dst.set_entry(i, entry);
-            continue;
-        }
-        let plan = X86_64.plan_clone(depth, entry, depth == 0 && in_shared_span(va), SharedSpans::ShareWritable);
-        match plan {
-            ClonePlan::Skip => {}
-            ClonePlan::Refuse => {
-                free_subtree(out, depth);
-                return None; // a huge page: see fork_share_memory's note
-            }
-            ClonePlan::Descend { table } => {
-                let Some(sub) = clone_user_tree(table, depth - 1, va) else {
-                    free_subtree(out, depth);
-                    return None;
-                };
-                dst.set_entry(i, X86_64.relink(entry, sub));
-            }
-            ClonePlan::CopyLeaf { old } => {
-                let Some(frame) = phys::Frame::alloc_zeroed() else {
-                    free_subtree(out, depth);
-                    return None;
-                };
-                // SAFETY: `old` is the frame this present leaf maps.
-                frame.copy_page_from(unsafe { phys::Frame::from_pa(old) });
-                dst.set_entry(i, X86_64.relink(entry, frame.pa()));
-            }
-            ClonePlan::ShareLeaf { frame, parent_entry, child_entry, demoted } => {
-                akuma_pmm::cow_ref_inc(frame as usize);
-                if demoted {
-                    // The parent's entry changes: its TLB may hold the page writable.
-                    src.set_entry(i, parent_entry);
-                    akuma_cpu::tlb::invlpg(va as usize);
-                }
-                dst.set_entry(i, child_entry);
-                cow::count_shared();
-            }
-        }
-    }
-    Some(out)
-}
-
 /// Does `[lo, hi)` overlap a `MAP_SHARED` mapping of the running task?
 fn overlaps_shared(lo: u64, hi: u64) -> bool {
     with_task(|t| t.layout.shared().iter().any(|f| f.overlaps(lo, hi)))
-}
-
-/// Is `va` inside a `MAP_SHARED` mapping of the running task (a writable file
-/// one, or an anonymous one)?
-fn in_shared_span(va: u64) -> bool {
-    with_task(|t| t.layout.in_shared(va))
-}
-
-/// Release a page-table subtree built by [`clone_user_tree`]: `depth` levels
-/// below `table_pa` (0 = a leaf table). Leaves go through `free_page` (a
-/// shared frame only loses a count); the tables are never shared.
-///
-/// SAFETY-adjacent contract: `table_pa` is a table frame of the caller's own
-/// half-built tree, unreachable from any live root.
-fn free_subtree(table_pa: u64, depth: u32) {
-    use akuma_user_tree::{FreeStep, X86_64};
-    let tid = akuma_primitives::preempt::current_tid() as u32;
-    // SAFETY: the frame is a PMM page-table frame owned by the caller.
-    let table = unsafe { phys::Frame::from_pa(table_pa) };
-    for i in 0..512 {
-        match X86_64.plan_free(depth, table.entry(i)) {
-            None => {}
-            Some(FreeStep::Leaf(f)) => akuma_pmm::free_page(f as usize, tid),
-            Some(FreeStep::Table(t)) => free_subtree(t, depth - 1),
-        }
-    }
-    akuma_pmm::free_page(table_pa as usize, tid);
 }
 
 /// Map one placed `PT_LOAD` into `root`, page by page: a fresh zeroed frame,
@@ -2213,9 +2047,7 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Option<Ta
     // kernel image), whose lower half holds only the task. The kernel's own
     // root keeps its identity map; the task's root simply has none.
     // The task's tables are not live until the CR3 load below.
-    let root_frame = phys::Frame::alloc_zeroed()?;
-    copy_kernel_half(root_frame);
-    let root = root_frame.pa();
+    let root = akuma_tokio_kernel_core::tree::new_root::<lazy::Amd64>()?;
     with_task(|t| t.root_pa = root);
 
     // Every PT_LOAD at its placed address (a static-PIE's moved to `PIE_BASE`).
@@ -2336,70 +2168,11 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Option<Ta
     Some(TaskImage { root_pa: root, entry: cross_entry, rsp })
 }
 
-/// Free a lower-half address space the loader built by hand: every leaf frame
-/// (through `free_page`, so a CoW-shared frame only drops its count), every
-/// page-table frame, and the root. The upper half is the kernel's, shared
-/// with every root, and is never touched. Returns the pages released
-/// (leaves + tables + root). The root must not be the active CR3.
+/// Free a lower-half address space the loader built by hand (`tree::free_user_root`): every
+/// leaf frame (a CoW-shared one only drops its count), every table, the root. Returns the
+/// pages released. The root must not be the active CR3.
 pub(crate) fn free_user_root(root: u64) -> usize {
-    const PRESENT: u64 = 1;
-    const LARGE: u64 = 1 << 7;
-    const ADDR: u64 = 0x000f_ffff_ffff_f000;
-    if root == 0 || root == (akuma_cpu::ctlreg::cr3() & ADDR) {
-        return 0;
-    }
-    lazy::drop_pins(root);
-    let tid = akuma_primitives::preempt::current_tid() as u32;
-    let mut n = 0usize;
-    // Every frame named below is a page-table frame this walk reached from a
-    // present, non-large entry of a root the loader built.
-    let table = |pa: u64| {
-        // SAFETY: as above.
-        unsafe { phys::Frame::from_pa(pa) }
-    };
-    let l4 = table(root);
-    for i4 in 0..256 {
-        let e4 = l4.entry(i4);
-        if e4 & PRESENT == 0 {
-            continue;
-        }
-        let p3 = e4 & ADDR;
-        for i3 in 0..512 {
-            let e3 = table(p3).entry(i3);
-            if e3 & PRESENT == 0 {
-                continue;
-            }
-            if e3 & LARGE != 0 {
-                continue; // never built by the loader; not ours to guess
-            }
-            let p2 = e3 & ADDR;
-            for i2 in 0..512 {
-                let e2 = table(p2).entry(i2);
-                if e2 & PRESENT == 0 || e2 & LARGE != 0 {
-                    continue;
-                }
-                let p1 = e2 & ADDR;
-                for i1 in 0..512 {
-                    let e1 = table(p1).entry(i1);
-                    if e1 & PRESENT != 0 {
-                        akuma_pmm::free_page((e1 & ADDR) as usize, tid);
-                        n += 1;
-                    }
-                }
-                akuma_pmm::free_page(p1 as usize, tid);
-                n += 1;
-            }
-            akuma_pmm::free_page(p2 as usize, tid);
-            n += 1;
-        }
-        akuma_pmm::free_page(p3 as usize, tid);
-        n += 1;
-    }
-    akuma_pmm::free_page(root as usize, tid);
-    // The root's shared file pages were written back at its exit or exec; any
-    // whose last mapping this was leave `shmpages` now.
-    shmpages::sweep();
-    n + 1
+    akuma_tokio_kernel_core::tree::free_user_root::<lazy::Amd64>(root)
 }
 
 /// Where a loaded task starts: the root for CR3, the entry, the stack.

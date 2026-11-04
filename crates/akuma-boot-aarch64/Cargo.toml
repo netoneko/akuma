@@ -8,6 +8,10 @@ description = "The AArch64 boot assembly (`_boot`: Image header, early page tabl
 # assembly reads it, and the assembly is only built for the kernel target.
 [target.'cfg(all(target_arch = "aarch64", target_os = "none"))'.dependencies]
 akuma-primitives = { path = "../akuma-primitives" }
+# `user`: a task root's kernel part, through the physmap, and the checked TTBR0 switch.
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-pagetable = { path = "../akuma-pagetable" }
+akuma-phys = { path = "../akuma-phys" }
 
 [features]
 # Firecracker's aarch64 microVM instead of QEMU virt: the console UART's

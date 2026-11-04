@@ -21,6 +21,9 @@ pub trait FreshPage: Sized {
     fn pa(&self) -> usize;
     /// Its bytes.
     fn bytes_mut(&mut self) -> &mut [u8; 4096];
+    /// Overwrite it with the live frame at `src_pa`, which nothing writes while
+    /// this runs (a copy-on-write source every mapper holds read-only).
+    fn copy_from(&mut self, src_pa: usize);
     /// Give it up: it is now mapped or tracked by the caller. Returns its address.
     fn publish(self) -> usize;
 }

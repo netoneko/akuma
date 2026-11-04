@@ -193,6 +193,9 @@ dependencies = [
 name = "akuma-boot-aarch64"
 version = "0.1.0"
 dependencies = [
+ "akuma-cpu",
+ "akuma-pagetable",
+ "akuma-phys",
  "akuma-primitives",
 ]
 
@@ -203,6 +206,7 @@ dependencies = [
  "akuma-alloc",
  "akuma-cpu",
  "akuma-pagetable",
+ "akuma-phys",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-pte-amd64",
@@ -633,6 +637,15 @@ name = "akuma-pci"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-phys"
+version = "0.1.0"
+dependencies = [
+ "akuma-pagetable",
+ "akuma-pmm",
+ "akuma-primitives",
+]
+
+[[package]]
 name = "akuma-pipe"
 version = "0.1.0"
 
@@ -963,9 +976,12 @@ dependencies = [
  "akuma-gic",
  "akuma-mmu",
  "akuma-net",
+ "akuma-pagetable",
+ "akuma-phys",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-psci",
+ "akuma-pte-aarch64",
  "akuma-runtime-tokio",
  "akuma-syscalls-glue",
  "akuma-threading",
@@ -973,6 +989,7 @@ dependencies = [
  "akuma-tokio-kernel-core",
  "akuma-uart",
  "akuma-user-access",
+ "akuma-user-tree",
  "akuma-vectors-aarch64",
  "akuma-vfs",
  "akuma-vfs-glue",
@@ -1044,6 +1061,7 @@ dependencies = [
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
  "akuma-user-layout",
+ "akuma-user-tree",
  "akuma-vfs",
  "akuma-vfs-glue",
  "spinning_top",

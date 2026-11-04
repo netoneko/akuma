@@ -26,6 +26,8 @@ pub mod ring;
 pub mod task;
 #[cfg(feature = "shmpages")]
 pub mod shmpages;
+#[cfg(feature = "lazy")]
+pub mod tree;
 
 /// Who the kernel is: its name on the console, its node name and release in `uname`, its
 /// banner. Set once at the top of the boot from the `Kernel` the root built.

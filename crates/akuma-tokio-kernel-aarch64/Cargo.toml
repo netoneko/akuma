@@ -19,7 +19,7 @@ akuma-pmm = { path = "../akuma-pmm" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-psci = { path = "../akuma-psci" }
 akuma-timer = { path = "../akuma-timer" }
-akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["shmpages"] }
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["lazy"] }
 akuma-uart = { path = "../akuma-uart", optional = true }
 akuma-vectors-aarch64 = { path = "../akuma-vectors-aarch64" }
 fdt = "0.1"
@@ -36,6 +36,11 @@ akuma-runtime-tokio = { path = "../akuma-runtime-tokio", features = ["process"] 
 # The hooked cooperative scheduler (B21 A4), not the full kernel's SGI one.
 akuma-threading = { path = "../akuma-threading", features = ["hooked"] }
 akuma-exec = { path = "../akuma-exec" }
+# The task's page tables: frames, the AArch64 walker and leaf encoding, the fork plans.
+akuma-phys = { path = "../akuma-phys" }
+akuma-pagetable = { path = "../akuma-pagetable" }
+akuma-pte-aarch64 = { path = "../akuma-pte-aarch64" }
+akuma-user-tree = { path = "../akuma-user-tree" }
 akuma-net = { path = "../akuma-net" }
 akuma-user-access = { path = "../akuma-user-access" }
 

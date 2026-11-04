@@ -17,6 +17,7 @@ akuma-primitives = { path = "../akuma-primitives" }
 # The physical frame allocator: `phys.rs`'s `FreshFrame`, `paging.rs`'s
 # intermediate-table frames, `mem.rs`'s whole second half.
 akuma-pmm = { path = "../akuma-pmm" }
+akuma-phys = { path = "../akuma-phys" }
 # The kernel heap allocator `mem.rs` brings up.
 akuma-alloc = { path = "../akuma-alloc" }
 # `MachineDescription`/`MemRegion` — the memory map `mem.rs` walks. No other

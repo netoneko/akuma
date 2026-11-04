@@ -360,3 +360,46 @@ fn shared_span_copy_creates_a_distinct_frame_and_share_frames_does_not() {
     free_table(&mut c, pc, 2);
     assert!(c.refs.is_empty() && c.tables.is_empty());
 }
+
+/// AArch64's two inverted bits: a table-level descriptor with the table bit clear is a block, and a
+/// leaf with `AP[2]` clear is writable. Demoting sets `AP[2]` and the marker; a read-only leaf (text)
+/// is shared unchanged, so a write to it is still a kill.
+#[test]
+fn aarch64_layout_reads_its_inverted_bits() {
+    use crate::AARCH64 as A;
+    const VALID: u64 = 1;
+    const TABLE: u64 = 1 << 1;
+    const AP_RO: u64 = 1 << 7;
+    const AP_EL0: u64 = 1 << 6;
+    const COW: u64 = 1 << 55;
+    const UXN: u64 = 1 << 54;
+    // A block at L1/L2 refuses the fork; a table descends.
+    assert_eq!(A.plan_clone(1, 0x4000_0000 | VALID, false, SharedSpans::ShareWritable), ClonePlan::Refuse);
+    assert_eq!(
+        A.plan_clone(1, 0x5000 | VALID | TABLE, false, SharedSpans::ShareWritable),
+        ClonePlan::Descend { table: 0x5000 }
+    );
+    // A writable user page: shared read-only + marked in both trees.
+    let rw = 0x7000 | VALID | TABLE | AP_EL0 | UXN;
+    let ClonePlan::ShareLeaf { frame, parent_entry, child_entry, demoted } =
+        A.plan_clone(0, rw, false, SharedSpans::ShareWritable)
+    else {
+        panic!("a valid leaf is shared");
+    };
+    assert_eq!((frame, demoted), (0x7000, true));
+    assert_eq!(parent_entry, rw | AP_RO | COW);
+    assert_eq!(child_entry, parent_entry);
+    assert!(!A.is_writable(parent_entry));
+    // Text: read-only, unmarked, unchanged.
+    let rx = 0x8000 | VALID | TABLE | AP_EL0 | AP_RO;
+    assert_eq!(
+        A.plan_clone(0, rx, false, SharedSpans::ShareWritable),
+        ClonePlan::ShareLeaf { frame: 0x8000, parent_entry: rx, child_entry: rx, demoted: false }
+    );
+    // Not valid: skipped, and nothing to free.
+    assert_eq!(A.plan_clone(0, 0x9000 | TABLE, false, SharedSpans::ShareWritable), ClonePlan::Skip);
+    assert_eq!(A.plan_free(0, 0x9000), None);
+    // The x86 layout is unchanged by the polarity flags.
+    assert!(X86_64.is_writable(0x7000 | 1 | 2));
+    assert!(X86_64.is_huge(1 | (1 << 7)));
+}

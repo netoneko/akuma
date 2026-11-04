@@ -28,8 +28,12 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-/// x86_64 page-table entry bits, as the plans read them. Taking them as a value keeps the walker's
-/// encodings in the kernel (taoxichuan's CoW marker is bit 9, `PTE_COW`).
+/// A page-table entry format's bits, as the plans read them. Taking them as a value keeps the walker's
+/// encodings in the kernel (taoxichuan's CoW marker is bit 9, `PTE_COW`, on amd64; bit 55 on aarch64).
+///
+/// Two bits read inverted on AArch64, and that is the reason for the two polarity flags: a descriptor
+/// is a *block* (huge) when its table bit is **clear**, and a page is writable when `AP[2]` (the
+/// read-only bit) is **clear**. x86 sets both bits to mean what they say.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PteLayout {
     /// Present.
@@ -42,6 +46,10 @@ pub struct PteLayout {
     pub cow_marker: u64,
     /// The physical-address field.
     pub addr_mask: u64,
+    /// `writable` names a read-only bit: the entry is writable when it is clear (AArch64 `AP[2]`).
+    pub writable_when_clear: bool,
+    /// `huge` names a table bit: an entry at a table level is a huge leaf when it is clear (AArch64).
+    pub huge_when_clear: bool,
 }
 
 /// x86_64 4-level paging with the CoW marker in software bit 9.
@@ -51,6 +59,20 @@ pub const X86_64: PteLayout = PteLayout {
     huge: 1 << 7,
     cow_marker: 1 << 9,
     addr_mask: 0x000f_ffff_ffff_f000,
+    writable_when_clear: false,
+    huge_when_clear: false,
+};
+
+/// AArch64 4 KiB-granule stage-1 descriptors with the CoW marker in software bit 55
+/// (`akuma-pte-aarch64::COW`): valid bit 0, table/page bit 1, `AP[2]` (read-only) bit 7.
+pub const AARCH64: PteLayout = PteLayout {
+    present: 1,
+    writable: 1 << 7,
+    huge: 1 << 1,
+    cow_marker: 1 << 55,
+    addr_mask: 0x0000_ffff_ffff_f000,
+    writable_when_clear: true,
+    huge_when_clear: true,
 };
 
 /// What a fork does with a leaf that lies in a `MAP_SHARED` mapping (a writable file mapping, or anonymous).
@@ -128,10 +150,26 @@ impl PteLayout {
         (entry & !self.addr_mask) | (frame & self.addr_mask)
     }
 
+    /// Is the leaf `entry` writable?
+    #[must_use]
+    pub const fn is_writable(&self, entry: u64) -> bool {
+        (entry & self.writable != 0) != self.writable_when_clear
+    }
+
+    /// Is the table-level `entry` a huge leaf (a block)?
+    #[must_use]
+    pub const fn is_huge(&self, entry: u64) -> bool {
+        (entry & self.huge != 0) != self.huge_when_clear
+    }
+
     /// A writable leaf as the share leaves it: read-only plus the marker. Anything else is unchanged.
     #[must_use]
     pub const fn demote(&self, entry: u64) -> u64 {
-        if entry & self.writable != 0 { (entry & !self.writable) | self.cow_marker } else { entry }
+        if !self.is_writable(entry) {
+            return entry;
+        }
+        let ro = if self.writable_when_clear { entry | self.writable } else { entry & !self.writable };
+        ro | self.cow_marker
     }
 
     /// Decide what to do with `entry` at `depth` levels above the leaves of its table.
@@ -144,7 +182,7 @@ impl PteLayout {
             return ClonePlan::Skip;
         }
         if depth > 0 {
-            if entry & self.huge != 0 {
+            if self.is_huge(entry) {
                 return ClonePlan::Refuse;
             }
             return ClonePlan::Descend { table: self.frame(entry) };

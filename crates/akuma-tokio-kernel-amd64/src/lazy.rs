@@ -9,7 +9,7 @@ use akuma_boot_amd64::phys::FreshFrame;
 use akuma_tokio_kernel_core::lazy as core_lazy;
 use akuma_tokio_kernel_core::mmu::{FreshPage, UserPages};
 
-pub use akuma_tokio_kernel_core::lazy::{Fill, Lazy, drop_pins, fits, fork_pins, is_lazy, move_pins, pin};
+pub use akuma_tokio_kernel_core::lazy::{Fill, Lazy, fits, move_pins, pin};
 pub use akuma_tokio_kernel_core::lazy_record::FilePage;
 
 /// The amd64 machine, as the core's demand paging sees it.
@@ -30,6 +30,9 @@ impl FreshPage for Frame {
     }
     fn bytes_mut(&mut self) -> &mut [u8; 4096] {
         self.0.bytes_mut()
+    }
+    fn copy_from(&mut self, src_pa: usize) {
+        self.0.copy_from_frame(src_pa);
     }
     fn publish(self) -> usize {
         self.0.publish()
@@ -121,6 +124,35 @@ impl akuma_tokio_kernel_core::mm::Mm for Amd64 {
     }
     fn mm_event(kind: u8, start: u64, end: u64) {
         crate::mm_event(kind, start, end);
+    }
+}
+
+impl akuma_tokio_kernel_core::tree::UserTree for Amd64 {
+    const LAYOUT: akuma_user_tree::PteLayout = akuma_user_tree::X86_64;
+    fn entry(table: u64, i: usize) -> u64 {
+        // SAFETY: the tree walkers name only a live root or a frame a present
+        // table entry of one names: a PMM page-table frame.
+        unsafe { akuma_boot_amd64::phys::Frame::from_pa(table) }.entry(i)
+    }
+    fn set_entry(table: u64, i: usize, value: u64) {
+        // SAFETY: as `entry`.
+        unsafe { akuma_boot_amd64::phys::Frame::from_pa(table) }.set_entry(i, value);
+    }
+    /// The lower half; the upper half is the kernel's, shared by every root.
+    fn user_root_slot(i: usize) -> bool {
+        i < 256
+    }
+    /// Nothing inside a lower-half table is the kernel's.
+    fn kernel_entry(_depth: u32, _va: u64) -> bool {
+        false
+    }
+    fn install_kernel(dst: u64) -> bool {
+        // SAFETY: `dst` is the fresh root frame the caller allocated.
+        crate::copy_kernel_half(unsafe { akuma_boot_amd64::phys::Frame::from_pa(dst) });
+        true
+    }
+    fn live_root() -> u64 {
+        akuma_cpu::ctlreg::cr3() & akuma_pte_amd64::ADDR_MASK
     }
 }
 

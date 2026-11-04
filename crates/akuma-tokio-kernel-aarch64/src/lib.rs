@@ -29,6 +29,7 @@ extern crate alloc;
 mod exec;
 mod fs;
 mod machine;
+mod mm;
 mod trap;
 
 use akuma_primitives::safe_print;
@@ -164,6 +165,11 @@ fn boot(k: &Kernel) -> ! {
     );
 
     trap::init();
+    akuma_boot_aarch64::user::init();
+    if !mm::self_test() {
+        safe_print!(64, "  [FATAL] the memory self-test failed\n");
+        halt();
+    }
     trap::start_tick();
     // Let the tick run for a while in idle windows: the evidence that the GIC,
     // the timer and the EL1 IRQ vector all work.

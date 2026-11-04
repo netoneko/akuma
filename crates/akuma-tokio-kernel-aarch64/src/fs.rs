@@ -75,10 +75,20 @@ pub fn disk_root() -> Option<Arc<dyn Filesystem>> {
     Some(Arc::new(fs))
 }
 
+/// The mounted root, for the arms that read it directly (exec's image, the
+/// lazy file pages). Set once by [`mount_root`], before EL0 exists.
+static ROOT_FS: akuma_primitives::cell::BorrowCell<Option<&'static dyn Filesystem>> =
+    akuma_primitives::cell::BorrowCell::new(None);
+
+/// The mounted root. Panics before the mount, which precedes every EL0 crossing.
+pub fn root_fs() -> &'static dyn Filesystem {
+    ROOT_FS.get().expect("root_fs before the mount")
+}
+
 /// Mount `fs` at `/` and `/proc` beside it; arm the file-page cache and the
 /// shared-page table. `false` when the root could not be mounted.
 pub fn mount_root(fs: Arc<dyn Filesystem>) -> bool {
-    if akuma_vfs_glue::mount_with("/", Some("/dev/vda"), 0, fs).is_err() {
+    if akuma_vfs_glue::mount_with("/", Some("/dev/vda"), 0, fs.clone()).is_err() {
         safe_print!(96, "  [FATAL] could not mount the root into the shared mount table\n");
         return false;
     }
@@ -91,5 +101,8 @@ pub fn mount_root(fs: Arc<dyn Filesystem>) -> bool {
     if akuma_vfs_glue::mount_with("/proc", Some("proc"), 0, proc_fs).is_err() {
         safe_print!(64, "  fs:   /proc mount failed\n");
     }
+    // The mount lives for the rest of the boot: one `Arc` leaked to a `'static` borrow.
+    let fs: &'static Arc<dyn Filesystem> = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
+    ROOT_FS.set(Some(&**fs));
     true
 }

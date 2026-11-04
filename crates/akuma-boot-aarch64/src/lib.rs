@@ -23,6 +23,8 @@
 #![no_std]
 
 pub mod machine;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub mod user;
 
 /// The absolute symbols `linker.ld` exports to describe the loaded image and the
 /// boot stack reserved above it.
