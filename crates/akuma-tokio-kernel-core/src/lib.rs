@@ -19,6 +19,8 @@ pub mod init;
 pub mod lazy;
 #[cfg(feature = "lazy")]
 pub mod loader;
+#[cfg(feature = "process")]
+pub mod proc;
 pub mod lazy_record;
 #[cfg(feature = "lazy")]
 pub mod mm;

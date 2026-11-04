@@ -1,153 +1,85 @@
-//! Processes on this kernel: the slot table every forked task and thread
-//! occupies, `clone`/`fork`/`vfork` through `akuma-exec`'s `fork_process`,
-//! `execve` and exit (`wait4` is glue's, over the child channels), init's thread, the two signal arms this kernel
-//! keeps (`rt_sigsuspend`, `rt_sigreturn`), and the machine-state arms
-//! (`X86ArchHooks`) the shared scheduler calls.
-//!
-//! This file began as the stage-4 child model, where Akuma's private `SPAWN` ran
-//! a child to completion inside the syscall. That path, its syscall and its
-//! crossing are gone (`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`, step 2e): every
-//! process here is a fork child of init.
+//! Processes on this kernel, the machine's half: init's thread, the `clone`
+//! decode and the `execve` crossing on x86_64's syscall frame, the user-context
+//! capture `fork_process` reads, the two signal arms this kernel keeps
+//! (`rt_sigsuspend`, `rt_sigreturn`) and signal delivery. The slot ring, fork,
+//! `execve`'s load, exit and the root ownership are
+//! `akuma_tokio_kernel_core::proc`'s, shared with aarch64 (B21 A5.6c); the
+//! wrappers below keep their names for this crate's callers.
 
-use alloc::string::String;
-use alloc::vec::Vec;
 use akuma_ring3_amd64 as ring3;
+use akuma_tokio_kernel_core::proc;
 
-/// One ring slot: a forked task or a `CLONE_THREAD` sibling, from
-/// `bind_child_task` until it is reaped. The slot index is the task's
-/// threading tid.
-#[allow(clippy::struct_excessive_bools)] // one flag per independent slot fact; a bitset would hide them
-pub struct SpawnSlot {
-    pub used: bool,
-    pub pid: u32,
-    /// The task has not exited yet (set at bind, cleared at exit).
-    pub running: bool,
+use crate::lazy::Amd64;
+
+pub use akuma_tokio_kernel_core::proc::{NSLOTS, is_thread_task, pid_for_slot};
+
+pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> Result<(), &'static str> {
+    proc::bind_child_task::<Amd64>(tid, pid, root_pa, is_thread)
 }
 
-impl SpawnSlot {
-    const fn new() -> Self {
-        Self {
-            used: false,
-            pid: 0,
-            running: false,
-        }
+pub fn sched_task_slot_of(tid: usize) -> usize {
+    proc::sched_task_slot_of(tid)
+}
+
+pub fn sched_root_of(tid: usize) -> u64 {
+    proc::sched_root_of::<Amd64>(tid)
+}
+
+pub fn is_real_task() -> bool {
+    proc::is_real_task::<Amd64>()
+}
+
+pub fn task_exit_real(code: u64) -> ! {
+    proc::task_exit_code::<Amd64>((code & 0xFF) as i32)
+}
+
+pub fn task_exit_thread() -> ! {
+    proc::task_exit_thread::<Amd64>()
+}
+
+pub fn task_die_segv() -> ! {
+    proc::die_segv::<Amd64>()
+}
+
+fn task_exit_code(code: i32) -> ! {
+    proc::task_exit_code::<Amd64>(code)
+}
+
+pub fn on_thread_terminated(tid: usize) {
+    proc::on_thread_terminated::<Amd64>(tid);
+}
+
+pub fn kill_requested() -> bool {
+    proc::kill_requested::<Amd64>()
+}
+
+pub fn finish_killed() -> ! {
+    proc::finish_killed::<Amd64>()
+}
+
+/// Free what reaped processes left (`proc::collect`), with the reap line under `trace-err`.
+pub fn collect() {
+    let before = akuma_exec::pmm::free_count();
+    let c = proc::collect::<Amd64>();
+    if cfg!(feature = "trace-err") && c.reaped != 0 {
+        akuma_primitives::safe_print!(
+            224,
+            "[reap] reaped={} drained={} root={} free {} -> {} heap={}K cowrefs={} cow={:?} procs={}/{}\n",
+            c.reaped,
+            c.drained,
+            c.pages,
+            before,
+            akuma_exec::pmm::free_count(),
+            akuma_alloc::allocated_bytes() / 1024,
+            akuma_pmm::cow_ref_count(),
+            crate::cow_stats(),
+            akuma_exec::process::table::process_count(),
+            akuma_exec::process::table::retired_process_count()
+        );
     }
 }
 
-/// 12: the shell's own slot (0) plus eleven threading tids for real fork
-/// children — the crate claims tids from 1, and on this kernel the tid and
-/// the ring index are the SAME number by construction (`bind_child_task`
-/// stamps by tid; `switch_to`/`task()` index the same arrays).
-pub const NSLOTS: usize = 48;
-
-/// The spawn ring's rows. A [`BorrowCell`](akuma_primitives::cell::BorrowCell): the only way in is [`with_slots`] (or the one-field
-/// readers below), so two overlapping borrows are a panic naming the bug, and no closure ever calls out to anything that
-/// reaches the table again — `schedule_blocking` and every print run with the borrow closed.
-static SLOTS: akuma_primitives::cell::BorrowCell<[SpawnSlot; NSLOTS]> =
-    akuma_primitives::cell::BorrowCell::new([const { SpawnSlot::new() }; NSLOTS]);
-// Pids come from `akuma_exec::process::allocate_pid` (floor 2: 1 is sshd,
-// the boot's init task) - ONE allocator, because `clone_thread` draws its
-// thread Processes' pids from the crate's counter and a second counter here
-// issued the same pid twice (a thread and a fork child sharing a table row).
-
-/// Run `f` on the spawn ring. Panics on a nested call, which is the point.
-fn with_slots<R>(f: impl FnOnce(&mut [SpawnSlot; NSLOTS]) -> R) -> R {
-    SLOTS.with_mut(f)
-}
-
-/// The pid in ring row `slot`.
-fn slot_pid(slot: usize) -> u32 {
-    SLOTS.with(|s| s[slot].pid)
-}
-
-/// The `ProcessHooks::pid_for_thread` / `find_pid_by_thread` arm: the pid a
-/// spawn-ring slot runs under today, `None` for an unused slot. The thread
-/// namespace on this kernel IS the spawn ring until `fork_process` (slice 3)
-/// replaces it — one table, one answer.
-pub fn pid_for_slot(idx: usize) -> Option<u32> {
-    if idx < NSLOTS {
-        SLOTS.with(|s| s[idx].used.then_some(s[idx].pid))
-    } else {
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// `execve`'s argument block.
-// ---------------------------------------------------------------------------
-
-/// Entry caps. The loader sizes the argument block from what it holds
-/// (`ring3::stack_block_len`), so these bound kernel work per `execve`, not a
-/// table: about Linux's own limits (`MAX_ARG_STRLEN` 128 KiB per string, and a
-/// megabyte in all where Linux allows a quarter of the stack rlimit). Until
-/// 2026-11-03 they were 448 / 256 / 512 strings and ~47 KB, derived from a fixed
-/// 12-page block and a 512-entry address table in the builder; a 570-argument
-/// `rustc` line got `E2BIG` (`docs/archive/TAOXICHUAN_EXEC_ARGV_LIMIT.md`).
-/// Before that, 128 entries answered `EFAULT`
-/// (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md`).
-const ARGV_MAX: usize = 32 * 1024;
-const ENV_MAX: usize = 8 * 1024;
-const MAX_STRS: usize = ARGV_MAX + ENV_MAX;
-const STR_MAX: usize = 128 * 1024;
-const ARG_BYTES_MAX: usize = 1024 * 1024;
-/// `#!` hops followed before ENOEXEC, Linux's `BINPRM_MAX_RECURSION` (an
-/// interpreter may itself be a script; one that names itself stops here).
-const SHEBANG_MAX_DEPTH: usize = 4;
-
-/// `execve`'s `(path, argv, envp)` as this kernel's loader takes them.
-struct ExecArgs {
-    path: String,
-    argv: Vec<String>,
-    env: Vec<String>,
-}
-
-// ---------------------------------------------------------------------------
-// M4 slice 3: the real fork — premise 2's build-out
-// ---------------------------------------------------------------------------
-
-/// The task record each ring slot runs against: `slot + 1` for a process, the
-/// creator's record for a `CLONE_THREAD` sibling - which is how threads share
-/// regions, brk/mmap cursors, the fd table and the cwd with no second copy to
-/// keep coherent.
-static TASK_OF: akuma_primitives::cell::BorrowCell<[usize; NSLOTS]> = akuma_primitives::cell::BorrowCell::new({
-    let mut a = [0usize; NSLOTS];
-    let mut i = 0;
-    while i < NSLOTS {
-        a[i] = i + 1;
-        i += 1;
-    }
-    a
-});
-
-fn task_of(slot: usize) -> usize {
-    TASK_OF.with(|t| t[slot])
-}
-
-/// Is ring slot `slot` an occupied task or thread (the target of a `tkill`)?
-pub fn slot_in_use(slot: usize) -> bool {
-    slot < NSLOTS && SLOTS.with(|s| s[slot].used)
-}
-
-/// Is the running task a `CLONE_THREAD` sibling?
-pub fn is_thread_task() -> bool {
-    akuma_exec::process::current_process_shared().is_some_and(|p| p.pid != p.tgid)
-}
-
-/// The thread group of the task in slot `slot`: its `Process`'s `tgid` (a
-/// `clone_thread` Process carries its leader's pid), else its own pid.
-fn slot_tgid(slot: usize) -> u32 {
-    let pid = slot_pid(slot);
-    akuma_exec::process::table::with_process(pid, |p| p.tgid).unwrap_or(pid)
-}
-
-/// `fork_process`'s `bind_child_task` records: (tid, pid, root) — the twin's
-/// spawn-row. Indexed by tid; `root == 0` = free.
-static CHILD_BIND: akuma_primitives::cell::BorrowCell<[(usize, u32, u64); NSLOTS]> = akuma_primitives::cell::BorrowCell::new([(0, 0, 0); NSLOTS]);
-
-/// `ExecRuntime::bind_child_task`'s twin: stamp the child's spawn-row. The
-/// crate publishes the child's thread right after this returns, so a full
-/// ring must come back as an error the fork reports, not a panic.
-/// The pool slot init runs on.
+/// The pool slot init runs on (`proc::bind_init` claimed it).
 static INIT_TID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
 /// Init's entry point and initial stack, for [`init_thread_entry`].
 static INIT_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -170,20 +102,14 @@ extern "C" fn init_thread_entry() -> ! {
     crate::exec_twin::enter_user_ctx(&ctx)
 }
 
-/// Run the loaded boot program as pid 1 on a real pool thread and park the boot thread, the shape of amd64's
-/// `run_init`. The thread is claimed, stamped in the ring (`bind_child_task`: the same row a fork child gets, with the task
-/// record copied from the one `load_task` filled), registered as a `Process` (so `fork_process` finds a caller), seeded to enter
-/// ring 3 and published. The boot thread then waits for init to finish and reports its status like any boot program.
+/// Run the loaded boot program as pid 1 on a real pool thread and park the boot thread. The slot is claimed, bound and
+/// registered by `proc::bind_init` (the same row a fork child gets, with the task record copied from the one `load_task`
+/// filled), seeded here to enter ring 3 and published. The boot thread then waits for init to finish and reports its status.
 pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
-    let Some(tid) = akuma_threading::x86_claim_slot() else {
+    let Some(tid) = proc::bind_init::<Amd64>(path, ti) else {
         akuma_primitives::safe_print!(96, "  [init] no pool slot for init\n");
         crate::halt();
     };
-    if let Err(msg) = bind_child_task(tid, 1, ti.root_pa, false) {
-        akuma_primitives::safe_print!(160, "  [init] bind refused: {}\n", msg);
-        crate::halt();
-    }
-    register_shell_process(1, path, ti.root_pa, ti.entry, ti.sp, tid);
     INIT_TID.store(tid, core::sync::atomic::Ordering::Relaxed);
     INIT_ENTRY.store(ti.entry, core::sync::atomic::Ordering::Relaxed);
     INIT_RSP.store(ti.sp, core::sync::atomic::Ordering::Relaxed);
@@ -191,7 +117,7 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
     let stack: &'static mut [u64] = alloc::boxed::Box::leak(alloc::vec![0u64; INIT_STACK_WORDS].into_boxed_slice());
     let top = stack.as_mut_ptr() as usize + INIT_STACK_WORDS * 8;
     akuma_threading::x86_seed_entry(tid, top, init_thread_entry);
-    // The boot thread becomes pool slot 0 (the pool hands out 1.., amd64's `x86_adopt_running_thread(0)`): it is about to
+    // The boot thread becomes pool slot 0 (the pool hands out 1..): it is about to
     // block, and a thread the pool has never heard of has no slot to park.
     let _ = akuma_sched_amd64::prepare_task_slot::<crate::sched::Tx>(0);
     akuma_threading::x86_adopt_running_thread(0);
@@ -199,62 +125,7 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
     akuma_threading::x86_publish(tid);
     crate::PREEMPT_ARMED.store(true, core::sync::atomic::Ordering::Release);
     akuma_primitives::safe_print!(96, "[init] pid 1 on pool slot {}\n", tid);
-    // The boot thread: a timed sleep (an unbounded park starves init's startup) that init's exit also wakes by event
-    // (`task_exit_status`); on wake, finish as the boot program's exit.
-    loop {
-        let code = INIT_EXIT.load(core::sync::atomic::Ordering::Acquire);
-        if code != INIT_RUNNING {
-            crate::task_done(code);
-        }
-        akuma_threading::schedule_blocking(crate::net::uptime_us() + 10_000);
-    }
-}
-
-/// Init's exit code as the boot report shows it (`128 + signal` for a signal death), or
-/// [`INIT_RUNNING`]. Init has no parent to `wait4` for it, so its exit is recorded here.
-static INIT_EXIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(INIT_RUNNING);
-const INIT_RUNNING: u64 = u64::MAX;
-
-pub fn bind_child_task(tid: usize, pid: u32, root_pa: u64, is_thread: bool) -> Result<(), &'static str> {
-    if tid >= NSLOTS {
-        return Err("taoxichuan: child tid outside the spawn ring");
-    }
-    // The tid IS this child's slot index (see NSLOTS). Stamp its SpawnSlot,
-    // give it its kernel+trap stacks (leaked pairs, reused on recycle —
-    // `switch_to` points the syscall stub here), and give a fork child a task
-    // record of its own (`tid + 1`): the root from `fork_process`'s cloned
-    // address space, the layout from the parent's. A thread shares its
-    // creator's record.
-    let slot_idx = tid;
-    with_slots(|s| {
-        s[slot_idx] = SpawnSlot::new();
-        s[slot_idx].used = true;
-        s[slot_idx].running = true;
-        s[slot_idx].pid = pid;
-    });
-    let _ = akuma_sched_amd64::prepare_task_slot::<crate::sched::Tx>(slot_idx);
-    if is_thread {
-        // A thread runs against its creator's record: nothing to copy, and
-        // nothing to clone-ref (the fd table is the creator's own).
-        TASK_OF.with_mut(|t| t[slot_idx] = crate::task_slot_index());
-    } else {
-        TASK_OF.with_mut(|t| t[slot_idx] = slot_idx + 1);
-    }
-    if !is_thread {
-        // The child's layout is the parent's, shared mappings included: fork shares those
-        // spans' frames (`SharedSpans::ShareWritable`), so the child writes back the same
-        // pages its parent does.
-        let layout = crate::with_task(|t| t.layout.fork());
-        crate::with_task_slot(slot_idx + 1, |ct| {
-        ct.root_pa = root_pa;
-        ct.layout = layout;
-        ct.exit = None;
-        // The descriptors are the registered Process's: `fork_process` deep-cloned
-        // its table (pipe and socket references taken, epoll fds stripped).
-        });
-    }
-    CHILD_BIND.with_mut(|b| b[tid] = (tid, pid, root_pa));
-    Ok(())
+    crate::task_done(proc::wait_init::<Amd64>())
 }
 
 /// The kernel-stack top `switch_to` installs for `tid`: a slot's leaked pair
@@ -266,426 +137,6 @@ pub fn sched_kstack_top(tid: usize) -> u64 {
     } else {
         ring3::syscall_stack_top()
     }
-}
-
-/// The CR3 `switch_to` loads for `tid`: the task record's live root (exec
-/// updates it — a real child that exec'd must come back on the NEW image's
-/// root). 0 = leave CR3 alone (the idle thread runs on the kernel root).
-pub fn sched_task_slot_of(tid: usize) -> usize {
-    if tid < NSLOTS {
-        task_of(tid)
-    } else {
-        tid + 1
-    }
-}
-
-pub fn sched_root_of(tid: usize) -> u64 {
-    if tid < NSLOTS {
-        crate::task_root_of(task_of(tid))
-    } else {
-        0
-    }
-}
-
-/// A forked task is on the CPU: a threading tid 1..NSLOTS whose slot is
-/// stamped, running and bound. The boot thread (tid 0) and the idle threads
-/// are not.
-pub fn is_real_task() -> bool {
-    let cur = crate::exec_twin::current_slot();
-    if cur == crate::exec_twin::NO_SLOT || cur == 0 || cur >= NSLOTS {
-        return false;
-    }
-    SLOTS.with(|s| s[cur].used && s[cur].running)
-}
-
-/// A forked task's `exit_group` (or a lone process's `exit`): the whole group
-/// ends with exit code `code & 0xFF`. Never returns.
-pub fn task_exit_real(code: u64) -> ! {
-    task_exit_code((code & 0xFF) as i32)
-}
-
-/// `akuma-threading`'s slot-purge hook: thread `tid` has just been marked
-/// TERMINATED, by this kernel's exit path or by `akuma-exec` (a fatal signal's
-/// default action inside `akuma-syscalls-glue`: SIGPIPE on a pipe with no
-/// reader runs glue's `sys_exit_group`). Purge its futex waits; for the last
-/// thread of a process, clear the row's `running` and hand its page-table root
-/// to [`zombie_root`], so glue's reap can never drop it.
-pub fn on_thread_terminated(tid: usize) {
-    akuma_syscalls_glue::futex_purge_tid(tid);
-    if tid >= NSLOTS {
-        return;
-    }
-    let pid = slot_pid(tid);
-    let Some(p) = akuma_exec::process::lookup_process_shared(pid) else {
-        return;
-    };
-    if p.pid != p.tgid || !p.exited.load(core::sync::atomic::Ordering::Relaxed) {
-        return; // a thread (its space is the leader's), or a process still running
-    }
-    let was_running = with_slots(|s| core::mem::replace(&mut s[tid].running, false));
-    if was_running || OWNED_ROOT.with(|t| t[tid]) != 0 {
-        zombie_root(tid, pid);
-    }
-}
-
-/// A forked task killed by a fault: the group dies with wait status SIGSEGV
-/// (11), the parent's `wait4` sees `WIFSIGNALED` as on Linux, and the machine
-/// keeps running.
-pub fn task_die_segv() -> ! {
-    task_exit_code(-11)
-}
-
-/// The exiting process's descriptors, closed now rather than when its
-/// zombie is reaped: a pipe's EOF is its last writer's close, so a pipeline's
-/// reader would otherwise wait on a parent that waits on it. Each release goes
-/// through the runtime hooks (the tables are glue's). Callers have already
-/// stopped every thread that shares the table (`kill_siblings`).
-fn close_process_fds() {
-    if let Some(p) = akuma_exec::process::current_process_shared() {
-        p.fds.close_all();
-    }
-}
-
-/// End the caller's whole process with `code`: an exit code (0..=255), or
-/// `-signal` for a death by signal, the form glue's `encode_wait_status` reads.
-///
-/// The exit is published the way `akuma-exec` publishes every exit: the
-/// `Process` is marked a zombie, and `publish_child_exit` marks the child
-/// channel `fork_process` registered (waking a parent parked in glue's
-/// `wait4`) and raises SIGCHLD on the parent. Glue's `wait4` reaps it.
-fn task_exit_code(code: i32) -> ! {
-    // A shared file mapping persists at exit (rust-lld never munmaps its output).
-    crate::shared_flush_all();
-    let cur = crate::exec_twin::current_slot();
-    // The group's leader slot: `cur` itself unless a thread is the one
-    // calling `exit_group`. Every other thread of the group dies here
-    // (Linux's `exit_group`): purged from the futex table and terminated.
-    let lead = group_leader(cur);
-    kill_siblings(cur, lead);
-    let lead_pid = with_slots(|s| {
-        s[lead].running = false;
-        s[lead].pid
-    });
-    // The zombie keeps its thread slot until the parent's wait4: without this
-    // hold `x86_claim_slot` hands the TERMINATED slot to the next fork while the
-    // pid is still waitable. Glue's reap (`unregister_process`) releases it.
-    akuma_exec::process::hold_exited_thread_slot(lead_pid, lead);
-    if let Some(p) = akuma_exec::process::lookup_process_shared(lead_pid) {
-        p.exit_code.store(code, core::sync::atomic::Ordering::Relaxed);
-        p.state.store(akuma_exec::process::ProcessState::Zombie(code));
-        p.exited.store(true, core::sync::atomic::Ordering::Release);
-    }
-    close_process_fds();
-    zombie_root(lead, lead_pid);
-    // Init has no parent to wait for it: the parked boot thread reports it.
-    if lead == INIT_TID.load(core::sync::atomic::Ordering::Relaxed) {
-        let shown = if code < 0 { 128 + u64::from(code.unsigned_abs()) } else { code as u64 };
-        INIT_EXIT.store(shown, core::sync::atomic::Ordering::Release);
-        akuma_threading::get_waker_for_thread(0).wake();
-    }
-    akuma_exec::process::publish_child_exit(lead_pid, code);
-    // The group's children - its threads' too - go to init, which reaps them (this kernel's
-    // init, sshd, runs `wait4(-1, WNOHANG)`), as amd64 and glue's exit do. Without it an orphan
-    // stayed registered under a dead parent nobody could wait for, and its thread slot leaked
-    // for good: `killtree` ran the 48-slot ring out by its third round.
-    let _ = akuma_exec::process::reparent_group_children_to(lead_pid, 1);
-    if lead != cur {
-        akuma_syscalls_glue::futex_purge_tid(lead);
-        akuma_threading::mark_thread_terminated(lead);
-    }
-    akuma_threading::x86_finish_current()
-}
-
-/// The slot that owns the process `cur` belongs to: the slot whose pid is the
-/// group's `tgid`. `cur` when it is the leader (or the leader is gone).
-fn group_leader(cur: usize) -> usize {
-    if cur >= NSLOTS {
-        return cur;
-    }
-    let tgid = slot_tgid(cur);
-    if slot_pid(cur) == tgid {
-        return cur;
-    }
-    (0..NSLOTS).find(|&s| s != cur && slot_in_use(s) && slot_pid(s) == tgid).unwrap_or(cur)
-}
-
-/// `exit_group`: end every thread of `cur`'s group except `cur` and `lead`
-/// (the caller finishes those itself). A thread is a slot whose `Process` has
-/// the group's `tgid` and a pid of its own.
-///
-/// A sibling that is not executing (parked, or ready to run) is ended here. One
-/// RUNNING on another core cannot be: marking it TERMINATED does not stop it, and
-/// it ran on in a dying process - parked in a `futex` it overwrote its own
-/// TERMINATED with WAITING (`[REVIVE]`), with its `Process` already retired. So it
-/// gets a kill request instead, ends itself at its next kernel entry or exit
-/// ([`finish_killed`]: the syscall dispatcher and the ring-3 tick), and this
-/// caller waits for that with the lock released, because the group's teardown
-/// after this must not run under a thread still in ring 3.
-/// `docs/archive/TAOXICHUAN_EXIT_GROUP_RUNNING_SIBLING.md`.
-fn kill_siblings(cur: usize, lead: usize) {
-    let tgid = slot_tgid(cur);
-    let mut asked = [0u32; NSLOTS]; // the pid asked to end, per slot; 0 = none
-    for (s, ask) in asked.iter_mut().enumerate() {
-        let spid = slot_pid(s);
-        if s == cur || s == lead || !slot_in_use(s) || spid == tgid || slot_tgid(s) != tgid {
-            continue;
-        }
-        if akuma_threading::get_thread_state(s) == akuma_threading::thread_state::RUNNING {
-            akuma_threading::request_thread_kill(s);
-            *ask = spid;
-            continue;
-        }
-        end_sibling(s, spid);
-    }
-    // Ring 3 reaches the kernel at least once a tick, so this is ~10 ms per sibling;
-    // the bound is for a thread that never does (stuck with the lock released).
-    let start = crate::net::uptime_us();
-    while asked.iter().any(|&p| p != 0) {
-        for (s, p) in asked.iter_mut().enumerate() {
-            // Gone: terminated, or the slot already belongs to someone else.
-            if *p != 0 && (akuma_threading::is_thread_terminated(s) || slot_pid(s) != *p) {
-                *p = 0;
-            }
-        }
-        if crate::net::uptime_us().saturating_sub(start) > 2_000_000 {
-            for (s, p) in asked.iter_mut().enumerate().filter(|(_, p)| **p != 0) {
-                akuma_primitives::safe_print!(96, "[exit_group] slot {} never reached the kernel; ended in place\n", s);
-                end_sibling(s, *p);
-                *p = 0;
-            }
-            break;
-        }
-        crate::smp::bkl_unlocked(|| {
-            for _ in 0..2000 {
-                core::hint::spin_loop();
-            }
-        });
-    }
-}
-
-/// End sibling slot `s` (pid `spid`) of an exiting group where it stands: it is
-/// not executing, so it never runs again.
-fn end_sibling(s: usize, spid: u32) {
-    let _ = akuma_threading::take_kill_request_via_tid(s);
-    akuma_syscalls_glue::futex_purge_tid(s);
-    with_slots(|t| {
-        t[s].running = false;
-        t[s].used = false;
-    });
-    akuma_threading::mark_thread_terminated(s);
-    retire_thread_process(spid);
-}
-
-/// Did `exit_group` ask the running thread to end ([`kill_siblings`])?
-pub fn kill_requested() -> bool {
-    let cur = crate::exec_twin::current_slot();
-    cur < NSLOTS && akuma_threading::has_pending_kill(cur)
-}
-
-/// End the running thread at a kill request: no exit status (its group's
-/// exiting thread publishes that), no clear-child-tid wake (the group is going).
-pub fn finish_killed() -> ! {
-    let cur = crate::exec_twin::current_slot();
-    let _ = akuma_threading::take_kill_request_via_tid(cur);
-    akuma_syscalls_glue::futex_purge_tid(cur);
-    let pid = with_slots(|s| {
-        s[cur].running = false;
-        s[cur].used = false;
-        s[cur].pid
-    });
-    retire_thread_process(pid);
-    akuma_threading::x86_finish_current()
-}
-
-/// Take a dead thread's registered `Process` out of the process table.
-///
-/// `clone_thread` registers a real `Process` per thread (so `current_process` answers
-/// per thread), and nothing but the reap - which runs for a group LEADER, on its
-/// parent's `wait4` - ever unregistered one. A thread's own `exit` and `exit_group`'s
-/// `kill_siblings` freed the ring slot and left the `Process` ACTIVE for the rest of the
-/// boot, so every thread leaked a table entry: a `cargo build` of this kernel (cargo plus
-/// four `rustc`, each with a pool of threads) reached 256 live entries and panicked
-/// "Process table full" (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md` §7).
-///
-/// Retire only: the `Process` is freed by the next `drain_retired` (reap, idle loop, memory
-/// pressure), never here, because the exiting thread is still running on it. A thread's
-/// address space is the leader's shared view, so dropping it frees no frames.
-fn retire_thread_process(pid: u32) {
-    let _ = akuma_exec::process::unregister_process(pid);
-}
-
-/// A thread's `exit` (60): only this thread ends. `CLONE_CHILD_CLEARTID`
-/// (what `pthread_join` waits on): the tid word is zeroed and its futex
-/// woken before the slot is terminated.
-pub fn task_exit_thread() -> ! {
-    let cur = crate::exec_twin::current_slot();
-    if let Some(p) = akuma_exec::process::current_process_shared() {
-        let addr = p.clear_child_tid.swap(0, core::sync::atomic::Ordering::AcqRel);
-        if addr != 0 {
-            let _ = crate::copy_to_user(addr, &0u32.to_ne_bytes());
-            akuma_syscalls_glue::futex_wake(p.tgid, addr as usize, 1);
-        }
-    }
-    akuma_syscalls_glue::futex_purge_tid(cur);
-    // The slot leaves the table: a thread has no status for a parent to reap
-    // and must never look like a child to a `wait4` scan.
-    let pid = with_slots(|s| {
-        s[cur].running = false;
-        s[cur].used = false;
-        s[cur].pid
-    });
-    retire_thread_process(pid);
-    akuma_threading::x86_finish_current()
-}
-
-/// `clone(CLONE_THREAD|CLONE_VM|...)`: another thread of the caller's group
-/// through `akuma_exec::process::clone_thread`, which shares the address
-/// space and publishes a runnable slot; the bind hook gives it the creator's
-/// task record. Returns the thread's tid (its threading slot).
-fn clone_thread_arm(fr: &ring3::SyscallFrame) -> u64 {
-    let cur = crate::exec_twin::current_slot();
-    if cur == crate::exec_twin::NO_SLOT {
-        return crate::e(ring3::err::EPERM); // the boot task has no Process to clone
-    }
-    let (flags, stack, ptid, ctid, tls) = (fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5());
-    // Demand-driven drain at syscall ENTRY, before anything is claimed: every thread owns
-    // a `Process` row, `retire_thread_process` only retires it, and this is the one path
-    // that consumes rows, so it pays for collecting them. Not at thread teardown: reclaim
-    // runs `Process::drop`, and the exiting thread is still running on its own row
-    // (`docs/archive/AKUMA_AMD64_THREAD_LIFECYCLE.md` §3 - the same fix on the amd64 kernel).
-    collect();
-    match akuma_exec::process::clone_thread(stack, tls, ptid, ctid, flags) {
-        Ok(tid) => u64::from(tid),
-        Err(msg) => {
-            akuma_primitives::safe_print!(160, "[clone] thread refused: {}\n", msg);
-            crate::e(ring3::err::EAGAIN)
-        }
-    }
-}
-
-pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
-    let cur = crate::exec_twin::current_slot();
-    let mut budget = akuma_syscalls_proc::exec::Budget::new(MAX_STRS, STR_MAX, ARG_BYTES_MAX);
-    let req = match akuma_syscalls_glue::execve::read_request(
-        fr.arg1(),
-        fr.arg2(),
-        fr.arg3(),
-        ARGV_MAX,
-        ENV_MAX,
-        &mut budget,
-    ) {
-        Ok(r) => r,
-        Err(r) => return r,
-    };
-    // This kernel's loader takes `&str`: an argument that is not UTF-8 cannot
-    // reach it (the answer this path has always given).
-    let utf8 = |v: Vec<Vec<u8>>| v.into_iter().map(String::from_utf8).collect::<Result<Vec<String>, _>>();
-    let (Ok(argv_s), Ok(env_s)) = (utf8(req.argv), utf8(req.envp)) else {
-        return crate::e(crate::err::EFAULT);
-    };
-    let mut args = ExecArgs { path: req.path, argv: argv_s, env: env_s };
-    let mut effective = crate::resolve_effective(&args.path);
-    let mut image = match crate::read_image(&effective) {
-        Ok(i) => i,
-        Err(err) => {
-            akuma_primitives::safe_print!(192, "[exec] '{}': read failed ({:?})\n", effective, err);
-            return crate::e(crate::err::ENOENT);
-        }
-    };
-    // `#!` scripts: the interpreter is loaded instead, with argv
-    // `[interpreter, arg?, path as written, argv[1..]]`. One parser and one argv
-    // rule with the AArch64 kernel's `exec_shebang` and `spawn`'s chain walk
-    // (`akuma_exec::process::{parse_shebang, shebang_hop}`). Without this a
-    // `#!/usr/bin/env python3` RUSTC_WRAPPER failed cargo's spawn with ENOEXEC
-    // (`docs/archive/TAOXICHUAN_EXEC_SHEBANG.md`).
-    let mut prefix: Vec<String> = Vec::new();
-    let mut script_name = args.path.clone();
-    for _ in 0..SHEBANG_MAX_DEPTH {
-        let head = &image[..image.len().min(akuma_exec::process::SHEBANG_MAX)];
-        let Some((interp, arg)) = akuma_exec::process::parse_shebang(head) else {
-            break;
-        };
-        prefix = akuma_exec::process::shebang_hop(interp, arg, &script_name, &prefix);
-        script_name = String::from(interp);
-        effective = crate::resolve_effective(&script_name);
-        image = match crate::read_image(&effective) {
-            Ok(i) => i,
-            Err(err) => {
-                akuma_primitives::safe_print!(192, "[exec] interpreter '{}': read failed ({:?})\n", effective, err);
-                return crate::e(crate::err::ENOENT);
-            }
-        };
-    }
-    if !prefix.is_empty() {
-        prefix.extend(args.argv.drain(..).skip(1));
-        args.argv = prefix;
-    }
-    if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
-        return crate::e(crate::err::ENOEXEC);
-    }
-    let argv: Vec<&str> = args.argv.iter().map(String::as_str).collect();
-    let env: Vec<&str> = args.env.iter().map(String::as_str).collect();
-    // The image about to be replaced may hold shared file mappings.
-    crate::shared_flush_all();
-    let old_root = crate::task_root();
-    let Some(ti) = crate::load_task(&argv, &env, &image, &effective) else {
-        return crate::e(crate::err::ENOMEM);
-    };
-    // POSIX exec keeps open fds across the image swap; close-on-exec ones go,
-    // each released through the runtime hooks (the table is the process's).
-    // The process side (`/proc/self/exe`, which musl's `$ORIGIN` expansion
-    // reads; close-on-exec; caught handlers reset) is glue's, shared with amd64.
-    if let Some(p) = akuma_exec::process::current_process_shared() {
-        let argv_bytes: Vec<Vec<u8>> = args.argv.iter().map(|a| a.clone().into_bytes()).collect();
-        akuma_syscalls_glue::execve::commit(p, &effective, &argv_bytes);
-    }
-    // The registered Process's shared root view goes stale with the old
-    // image — re-point it.
-    {
-        let pid = slot_pid(cur);
-        let first_exec = OWNED_ROOT.with(|t| t[cur]) == 0;
-        if disown_space(pid, ti.root_pa) {
-            // A fork child's first exec: the root it ran on is the fork
-            // clone (`clone_user_half`), every frame of which is raw — see
-            // `disown_space`. Later execs park the previous exec'd root in
-            // `adopt_exec_root`.
-            if first_exec {
-                park_root(old_root);
-            }
-            adopt_exec_root(cur, ti.root_pa);
-        }
-    }
-    let ef = ring3::EntryFrame {
-        r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
-        rdx: 0, rsi: 0, rdi: 0, rax: 0,
-        rip: ti.entry,
-        rflags: 0x202,
-        rsp: ti.sp,
-    };
-    // The incoming image's first instructions must not see the OUTGOING
-    // task's fs: the MSR rides the crossing (sysret does not touch it), and
-    // a depth-2 exec (ash execs the pipeline's last command in place)
-    // otherwise enters the new image with the shell's TLS base still set —
-    // boot ph-7's PK2: grandfork's first stack-guard read (fs:0x28) hit the
-    // shell's busybox bss at 0x7131c0, unmapped in the fresh CR3, and the
-    // task died before musl could run its own arch_prctl. The fork path's
-    // inheritance is deliberate (same image, the capture's comment below);
-    // the exec path's is not (a new image) — 0, the same clean start a
-    // depth-1 exec gets from the boot crossing, and what the amd64 kernel's
-    // exec hands its images (grandfork passes there).
-    let _ = akuma_cpu::msr::set_fs_base(0);
-    crate::sched::set_slot_fs(cur, 0);
-    // This function never returns, so nothing local is ever dropped: the
-    // executable image (47 MB for cargo) and the argument strings would leak
-    // from the kernel heap on every exec. Free them before the crossing.
-    drop(argv);
-    drop(env);
-    drop(args);
-    drop(image);
-    drop(effective);
-    // The new image's root and first frame; the dispatcher frame on the
-    // task's own band is abandoned (bounded by exec counts).
-    crate::exec_twin::enter_user_on(ti.root_pa, &ef)
 }
 
 /// The syscall-path capture `fork_process` step 6 consumes:
@@ -725,87 +176,53 @@ pub fn capture_user_context(fr: &ring3::SyscallFrame) {
     <crate::sched::Tx as akuma_sched_amd64::Platform>::write_user_context(slot, &ctx);
 }
 
-/// The exec'd shell, registered as an `akuma-exec` `Process`: `fork_process` opens with
-/// `current_process_shared()`, which resolves thread->pid->`PROCESS_TABLE`, so the shell must
-/// be in both before it can fork anything (`Process::register_adopted`, shared with aarch64).
-fn register_shell_process(pid: u32, name: &str, root_pa: u64, entry: u64, rsp: u64, tid: usize) {
-    // Parent 1: sshd, the boot's init task (the pid floor is 2).
-    if !akuma_exec::process::Process::register_adopted(pid, 1, name, root_pa as usize, entry as usize, rsp as usize, tid) {
-        akuma_primitives::safe_print!(128, "[spawn] root view for the process table failed\n");
-    }
-}
-
-/// The NEW fork arm: `fork_process` over the registered shell. The child
-/// does NOT run here — the crate publishes it as a runnable thread and this
-/// arm returns the pid to the caller, exactly like Linux.
-/// Fork the caller through `fork_process`. `child_stack` 0: the child resumes
-/// on the parent's stack (a fork); otherwise on that stack (a `posix_spawn`
-/// child, whose `__clone` stub pops its function and argument from it).
-fn fork_arm_real(child_stack: u64) -> u64 {
-    // The boot task has no registered Process to fork. Any other task forks
-    // for real, however deep: each child has its own thread and stacks.
-    let cur = crate::exec_twin::current_slot();
-    if cur == crate::exec_twin::NO_SLOT {
-        return crate::e(crate::err::EPERM);
-    }
-    collect();
-    let child_pid = akuma_exec::process::allocate_pid();
-    match akuma_exec::process::fork_process(child_pid, child_stack) {
-        Ok(pid) => {
-            // `fork_process` registered the child's exit channel under its
-            // parent; glue's `wait4` finds it there (`is_child_of_group`).
-            u64::from(pid)
-        }
-        // The refusal line is the evidence this slice hunts for; name the
-        // message verbatim (the same discipline as spawn's read-failed
-        // print).
-        Err(msg) => {
-            akuma_primitives::safe_print!(192, "[forkp] refused: {}\n", msg);
-            for i in 0..NSLOTS {
-                let (used, running, rpid) = SLOTS.with(|t| (t[i].used, t[i].running, t[i].pid));
-                akuma_primitives::safe_print!(
-                    128,
-                    "  ring {}: pool={} oncpu={} held={} used={} running={} pid={}\n",
-                    i,
-                    akuma_threading::get_thread_state(i),
-                    akuma_threading::on_cpu_flag(i),
-                    akuma_threading::slot_held_by(i),
-                    used,
-                    running,
-                    rpid
-                );
-            }
-            crate::e(ring3::err::EAGAIN)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// fork, vfork and clone.
-// ---------------------------------------------------------------------------
-
 /// CLONE/FORK/VFORK (56/57/58). On x86_64 musl issues `fork()` as
 /// `clone(SIGCHLD)` and `posix_spawn` as `clone(SIGCHLD|CLONE_VM|CLONE_VFORK)`,
 /// but **vfork as the raw SYS_vfork in assembly, no flags word at all**
-/// (`vfork.s`: `mov $58, %eax`), and busybox ash forks its non-final commands
-/// through exactly that, so FORK/VFORK are accepted bare. A `CLONE_THREAD`
-/// clone is a thread (`clone_thread_arm`); every other one is a fork through
-/// `fork_process` (`fork_arm_real`).
+/// (`vfork.s`), and busybox ash forks its non-final commands through exactly
+/// that, so FORK/VFORK are accepted bare. x86_64's `clone` takes `child_tid`
+/// before `tls`; `proc::clone` takes the asm-generic order.
 pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
-    use akuma_syscalls_proc::clone::{self, Kind};
-    let kind = if fr.rax == akuma_syscalls_abi::x86_64::CLONE {
-        match clone::decode(fr.arg1(), fr.arg2()) {
-            Ok(k) => k,
-            Err(clone::Invalid) => return crate::e(crate::err::EINVAL),
-        }
+    if fr.rax == akuma_syscalls_abi::x86_64::CLONE {
+        proc::clone::<Amd64>(fr.arg1(), fr.arg2(), fr.arg3(), fr.arg5(), fr.arg4())
     } else {
-        Kind::Fork // fork (57) and vfork (58)
-    };
-    match kind {
-        Kind::Thread => clone_thread_arm(fr),
-        Kind::SpawnFork { child_stack } => fork_arm_real(child_stack),
-        Kind::Fork => fork_arm_real(0),
+        proc::fork::<Amd64>(0) // fork (57) and vfork (58)
     }
+}
+
+/// `execve` for a fork child: `proc::exec` loads the new image (its fds survive,
+/// its thread keeps running), then the crossing.
+pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
+    let cur = crate::exec_twin::current_slot();
+    let ti = match proc::exec::<Amd64>(fr.arg1(), fr.arg2(), fr.arg3()) {
+        Ok(ti) => ti,
+        Err(r) => return r,
+    };
+    let ef = ring3::EntryFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
+        rdx: 0, rsi: 0, rdi: 0, rax: 0,
+        rip: ti.entry,
+        rflags: 0x202,
+        rsp: ti.sp,
+    };
+    // The incoming image's first instructions must not see the OUTGOING
+    // task's fs: the MSR rides the crossing (sysret does not touch it), and
+    // a depth-2 exec (ash execs the pipeline's last command in place)
+    // otherwise enters the new image with the shell's TLS base still set —
+    // boot ph-7's PK2: grandfork's first stack-guard read (fs:0x28) hit the
+    // shell's busybox bss at 0x7131c0, unmapped in the fresh CR3, and the
+    // task died before musl could run its own arch_prctl. The fork path's
+    // inheritance is deliberate (same image, the capture's comment below);
+    // the exec path's is not (a new image) — 0, the same clean start a
+    // depth-1 exec gets from the boot crossing, and what the amd64 kernel's
+    // exec hands its images (grandfork passes there).
+    let _ = akuma_cpu::msr::set_fs_base(0);
+    crate::sched::set_slot_fs(cur, 0);
+    // `proc::exec` returned, so the image (47 MB for cargo) and the argument
+    // strings are already freed: nothing local is left to leak at the crossing.
+    // The new image's root and first frame; the dispatcher frame on the
+    // task's own band is abandoned (bounded by exec counts).
+    crate::exec_twin::enter_user_on(ti.root_pa, &ef)
 }
 
 /// The user `rsp` a thread returns to ring 3 with when a call moved it on purpose (a signal
@@ -1100,146 +517,3 @@ pub fn sigreturn_arm(fr: &mut ring3::SyscallFrame) -> u64 {
     words[12]
 }
 
-/// Page-table roots the twin built by hand for an exec'd image
-/// (`exec_real_task`'s loader maps raw frames), per slot. The registered
-/// `Process` only holds a `new_shared` view of such a root, so
-/// `UserAddressSpace::drop` frees none of it: the twin owns the root and must
-/// free it itself, at reap.
-static OWNED_ROOT: akuma_primitives::cell::BorrowCell<[u64; NSLOTS]> = akuma_primitives::cell::BorrowCell::new([0; NSLOTS]);
-/// Roots an earlier image of a still-running process left behind (a second
-/// `execve` in the same process). They cannot be freed at the exec — the
-/// arm is still running on the old CR3 — so they wait here for the next reap.
-const PENDING_ROOTS: usize = 16;
-static PENDING_ROOT: akuma_primitives::cell::BorrowCell<[u64; PENDING_ROOTS]> = akuma_primitives::cell::BorrowCell::new([0; PENDING_ROOTS]);
-
-/// Point `pid`'s registered `Process` at a shared view of `root` and let go of
-/// the address space it owned WITHOUT dropping it. The fork clone
-/// (`clone_user_half`) fills the crate's fresh space with raw frames the
-/// space's ledger never saw, so `UserAddressSpace::drop` returns only the L0
-/// and the process-info page - every leaf and table frame leaked (a forked
-/// 100k-page `rustc` left 104k pages per fork, the second `cargo` of a boot
-/// died of it). The twin frees the whole root itself ([`free_user_root`]),
-/// so the old owner must not free the L0 under it: it is forgotten, which
-/// leaks its ledger's small bookkeeping instead. `false`: no such process.
-fn disown_space(pid: u32, root: u64) -> bool {
-    let Some(view) = akuma_mmu::UserAddressSpace::new_shared(root as usize) else {
-        return false;
-    };
-    akuma_exec::process::table::with_process(pid, |p| {
-        let old = core::mem::replace(
-            &mut p.address_space,
-            akuma_exec::process::ProcAddressSpace::new(view),
-        );
-        if !old.is_shared() {
-            core::mem::forget(old);
-        }
-    })
-    .is_some()
-}
-
-/// `root` is a dead image's page-table root: free it at the next sweep.
-fn park_root(root: u64) {
-    if root == 0 {
-        return;
-    }
-    PENDING_ROOT.with_mut(|pend| {
-        // Full: a leaked image beats freeing a live root.
-        if let Some(r) = pend.iter_mut().find(|r| **r == 0) {
-            *r = root;
-        }
-    });
-}
-
-/// `slot` now runs the image rooted at `root`: remember it for the reap, and
-/// park the root it replaced (if it was an exec'd one) for the next sweep.
-fn adopt_exec_root(slot: usize, root: u64) {
-    let old = OWNED_ROOT.with_mut(|t| core::mem::replace(&mut t[slot], root));
-    if old != root {
-        park_root(old);
-    }
-}
-
-/// Free every parked root that is not the live CR3 (`free_user_root` refuses
-/// that one, and it stays parked), returning the pages released.
-fn sweep_parked_roots() -> usize {
-    let mut pages = 0usize;
-    for i in 0..PENDING_ROOTS {
-        // Read the entry out first: `free_user_root` runs with no borrow open.
-        let r = PENDING_ROOT.with(|p| p[i]);
-        if r != 0 {
-            let n = crate::free_user_root(r);
-            if n != 0 {
-                PENDING_ROOT.with_mut(|p| p[i] = 0);
-                pages += n;
-            }
-        }
-    }
-    pages
-}
-
-/// Page-table roots of exited processes, by pid, until their reap.
-///
-/// A fork child's address space is the twin's fork clone, every frame of which
-/// the `Process`'s `UserAddressSpace` ledger never saw (see [`disown_space`]), so
-/// the twin frees it and the `Process` must not. At the exit the `Process` is
-/// handed a non-owning view of the same root and the root is recorded here;
-/// after glue's `wait4` has unregistered the pid, [`collect`] frees it.
-const ZOMBIE_ROOTS: usize = 64;
-static ZOMBIE_ROOT: akuma_primitives::cell::BorrowCell<[(u32, u64); ZOMBIE_ROOTS]> =
-    akuma_primitives::cell::BorrowCell::new([(0, 0); ZOMBIE_ROOTS]);
-
-/// Record process `pid`'s root (slot `slot` is its leader) for [`collect`].
-/// The root the leader last ran on: its exec'd image, or, never exec'd, the
-/// fork clone in its task record. Idempotent: the exit path and the purge hook
-/// both call it.
-fn zombie_root(slot: usize, pid: u32) {
-    let own = OWNED_ROOT.with_mut(|t| core::mem::replace(&mut t[slot], 0));
-    let root = if own != 0 { own } else { crate::task_root_of(task_of(slot)) };
-    if root == 0 || ZOMBIE_ROOT.with(|z| z.iter().any(|&(p, _)| p == pid)) {
-        return;
-    }
-    let _ = disown_space(pid, root);
-    let stored = ZOMBIE_ROOT.with_mut(|z| {
-        z.iter_mut().find(|e| e.0 == 0).map(|e| *e = (pid, root)).is_some()
-    });
-    if !stored {
-        // Full: a leaked image beats freeing a root a zombie's view still names.
-        akuma_primitives::safe_print!(96, "[reap] zombie-root table full: pid {} leaks its image\n", pid);
-    }
-}
-
-/// Free what reaped processes left: the roots of pids no longer in the process
-/// table (glue's `wait4` unregistered them), retired `Process` rows, and parked
-/// roots. Run after every `wait4`/`waitid` and at fork/clone entry; cheap when
-/// there is nothing to do.
-pub fn collect() {
-    let before = akuma_exec::pmm::free_count();
-    let mut reaped = 0;
-    for i in 0..ZOMBIE_ROOTS {
-        let (pid, root) = ZOMBIE_ROOT.with(|z| z[i]);
-        if pid != 0 && akuma_exec::process::lookup_process_shared(pid).is_none() {
-            ZOMBIE_ROOT.with_mut(|z| z[i] = (0, 0));
-            park_root(root);
-            reaped += 1;
-        }
-    }
-    let drained = akuma_exec::process::reclaim::drain_retired();
-    let mut pages = sweep_parked_roots();
-    pages += akuma_mmu::drain_pending_ttbr_frees();
-    if cfg!(feature = "trace-err") && reaped != 0 {
-        akuma_primitives::safe_print!(
-            224,
-            "[reap] reaped={} drained={} root={} free {} -> {} heap={}K cowrefs={} cow={:?} procs={}/{}\n",
-            reaped,
-            drained,
-            pages,
-            before,
-            akuma_exec::pmm::free_count(),
-            akuma_alloc::allocated_bytes() / 1024,
-            akuma_pmm::cow_ref_count(),
-            crate::cow_stats(),
-            akuma_exec::process::table::process_count(),
-            akuma_exec::process::table::retired_process_count()
-        );
-    }
-}

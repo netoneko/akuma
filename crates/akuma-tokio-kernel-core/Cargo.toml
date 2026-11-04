@@ -14,6 +14,9 @@ shmpages = ["dep:akuma-fpcache-rw", "dep:akuma-pmm", "dep:akuma-mmu", "dep:akuma
 # Demand paging over the machine's `mmu::UserPages` (`lazy`): the fill, the reservation and
 # the inode pins. Reaches the file-page cache, the PMM and the root filesystem.
 lazy = ["shmpages", "dep:akuma-fpcache", "dep:akuma-vfs", "dep:akuma-mmap", "dep:akuma-syscalls-linux", "dep:akuma-syscalls-mem", "dep:akuma-cow", "dep:akuma-user-tree", "dep:akuma-elf-exec"]
+# Processes (`proc`): the slot ring, fork/clone/exec/exit over `akuma-exec`'s
+# `fork_process`, and who owns which page-table root until the reap.
+process = ["lazy", "dep:akuma-exec", "dep:akuma-threading", "dep:akuma-syscalls-glue", "dep:akuma-syscalls-proc"]
 # ext2 as the root filesystem: `shmpages::inode_freed`, ext2's inode-freed hook.
 disk = ["shmpages", "dep:akuma-fpcache"]
 
@@ -33,3 +36,7 @@ akuma-vfs-glue = { path = "../akuma-vfs-glue", optional = true }
 spinning_top = { version = "0.3", optional = true }
 akuma-user-tree = { path = "../akuma-user-tree", optional = true }
 akuma-elf-exec = { path = "../akuma-elf-exec", optional = true }
+akuma-exec = { path = "../akuma-exec", optional = true }
+akuma-threading = { path = "../akuma-threading", features = ["hooked"], optional = true }
+akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, optional = true }
+akuma-syscalls-proc = { path = "../akuma-syscalls-proc", optional = true }

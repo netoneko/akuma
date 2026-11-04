@@ -19,7 +19,7 @@ akuma-pmm = { path = "../akuma-pmm" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-psci = { path = "../akuma-psci" }
 akuma-timer = { path = "../akuma-timer" }
-akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["lazy"] }
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["process"] }
 akuma-uart = { path = "../akuma-uart", optional = true }
 akuma-vectors-aarch64 = { path = "../akuma-vectors-aarch64" }
 fdt = "0.1"

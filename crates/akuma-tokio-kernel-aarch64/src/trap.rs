@@ -65,6 +65,9 @@ fn irq(f: &mut Frame) {
     // window) only counts.
     if tick && f.from_el0() {
         let _ = akuma_threading::x86_yield();
+        if akuma_tokio_kernel_core::proc::kill_requested::<Aarch64>() {
+            akuma_tokio_kernel_core::proc::finish_killed::<Aarch64>();
+        }
     }
 }
 
@@ -139,7 +142,7 @@ fn el0_sync(f: &mut Frame) {
         f.esr
     );
     // Signals are A5.8: a fault ends the process as SIGSEGV would.
-    crate::proc::exit((-11i64) as u64)
+    crate::proc::die_segv()
 }
 
 fn unexpected(f: &mut Frame) {

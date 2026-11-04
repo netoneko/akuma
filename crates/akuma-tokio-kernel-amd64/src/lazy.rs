@@ -182,3 +182,31 @@ pub fn move_range(root: u64, from: u64, to: u64, len: u64) -> bool {
     core_lazy::move_range::<Amd64>(root, from, to, len)
 }
 
+
+impl akuma_tokio_kernel_core::proc::Proc for Amd64 {
+    fn current_slot() -> usize {
+        // `NO_SLOT` (the boot task before init) is `usize::MAX`: outside the ring.
+        crate::exec_twin::current_slot()
+    }
+    fn prepare_slot(slot: usize) -> bool {
+        akuma_sched_amd64::prepare_task_slot::<crate::sched::Tx>(slot).is_some()
+    }
+    fn unlocked(f: impl FnOnce()) {
+        crate::smp::bkl_unlocked(f);
+    }
+    fn uptime_us() -> u64 {
+        crate::net::uptime_us()
+    }
+    fn task_slot_index() -> usize {
+        crate::task_slot_index()
+    }
+    fn with_task_slot<R>(i: usize, f: impl FnOnce(&mut akuma_tokio_kernel_core::task::Task) -> R) -> R {
+        crate::with_task_slot(i, f)
+    }
+    fn record_root(i: usize) -> u64 {
+        crate::task_root_of(i)
+    }
+    fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
+        crate::copy_to_user(dst_va, src)
+    }
+}

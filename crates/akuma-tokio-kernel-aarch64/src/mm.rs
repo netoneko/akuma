@@ -13,7 +13,7 @@ use akuma_pagetable::aarch64 as walk;
 use akuma_pte_aarch64 as pte;
 
 /// Task records: the spawn ring's slots plus the boot thread's (record 0).
-pub const NSLOTS: usize = 48;
+pub use akuma_tokio_kernel_core::proc::NSLOTS;
 /// Cores this kernel can run (A6 brings the secondaries).
 pub const MAX_CPUS: usize = 8;
 
@@ -278,4 +278,32 @@ pub fn self_test() -> bool {
 /// `ID_AA64ISAR0_EL1`; a program then takes its portable path.
 impl akuma_tokio_kernel_core::loader::Loader for Aarch64 {
     const HWCAP: u64 = (1 << 0) | (1 << 1);
+}
+
+impl akuma_tokio_kernel_core::proc::Proc for Aarch64 {
+    fn current_slot() -> usize {
+        crate::sched::current_slot()
+    }
+    fn prepare_slot(slot: usize) -> bool {
+        crate::sched::prepare(slot).is_some()
+    }
+    /// No kernel lock yet (one core, IRQs masked in the kernel): just run it.
+    fn unlocked(f: impl FnOnce()) {
+        f();
+    }
+    fn uptime_us() -> u64 {
+        crate::fs::uptime_us()
+    }
+    fn task_slot_index() -> usize {
+        task_slot_index()
+    }
+    fn with_task_slot<R>(i: usize, f: impl FnOnce(&mut Task) -> R) -> R {
+        with_task_slot(i, f)
+    }
+    fn record_root(i: usize) -> u64 {
+        record_root(i)
+    }
+    fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
+        akuma_user_access::copy_to_user(dst_va, src).is_ok()
+    }
 }

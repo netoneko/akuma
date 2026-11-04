@@ -50,7 +50,6 @@ mod smp;
 
 use akuma_boot_amd64::{mem, paging, phys};
 use akuma_idt_amd64 as idt_lib;
-use akuma_ring3_amd64::err;
 use akuma_trap_amd64 as trap;
 use akuma_trap_amd64::{InterruptStackFrame, Kind, Trap};
 use akuma_vfs::Filesystem;
@@ -65,7 +64,6 @@ static _PB1_THREADING_REGISTER: fn(akuma_threading::ThreadRuntime, akuma_threadi
     akuma_threading::register;
 #[used]
 static _PB1_EXEC_INIT: fn(akuma_exec::ExecRuntime, akuma_exec::ExecConfig) = akuma_exec::init;
-use alloc::vec::Vec;
 /// The heap. `#[global_allocator]` is a binary-level declaration; the crate
 /// exports the implementation, this kernel installs it.
 #[global_allocator]
@@ -965,10 +963,6 @@ fn release_pages(root: u64, start: u64, end: u64) {
     mm::release_pages::<lazy::Amd64>(root, start, end);
 }
 
-pub(crate) fn shared_flush_all() {
-    mm::shared_flush_all::<lazy::Amd64>();
-}
-
 fn msync_arm(addr: u64, len: u64) -> u64 {
     mm::msync_arm::<lazy::Amd64>(addr, len)
 }
@@ -1101,16 +1095,6 @@ fn user_str(src_va: u64, buf: &mut [u8]) -> Option<&str> {
     core::str::from_utf8(&buf[..s.len()]).ok()
 }
 
-/// Stage 6: dirfd-relative path resolution. Absolute paths pass through; a
-/// relative path resolves against an open directory fd's path (apk opens the
-/// db / cache directory and then passes its fd to `openat`/`renameat`); a
-/// relative path at `AT_FDCWD` resolves against `/` — this kernel has no
-/// working directory, and every task it boots runs at the root. `None` means
-/// the caller sees `EBADF` (a non-directory fd where a dirfd was required).
-/// A whole file for the ELF loader (`loader::read_image`).
-pub(crate) fn read_image(path: &str) -> Result<Vec<u8>, akuma_vfs::FsError> {
-    akuma_tokio_kernel_core::loader::read_image::<lazy::Amd64>(path)
-}
 
 // ---------------------------------------------------------------------------
 // Stage 8 session Q: eventfd(2) — libcurl's multi-stack wakeup fd.
@@ -1221,7 +1205,7 @@ pub(crate) fn trace_hang_dump(per: usize) {
     akuma_primitives::safe_print!(64, "[hang] last syscalls per slot:\n");
     RING.view(|head, ring| {
         for slot in 0..child::NSLOTS {
-            if !child::slot_in_use(slot) {
+            if !akuma_tokio_kernel_core::proc::slot_in_use(slot) {
                 continue;
             }
             let (inr, ix, iy, iz) = INFLIGHT.with(|t| t[slot]);
@@ -1673,12 +1657,6 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Option<Ta
     akuma_tokio_kernel_core::loader::load_task::<lazy::Amd64>(argv, env, image, path)
 }
 
-/// Free a lower-half address space the loader built by hand (`tree::free_user_root`): every
-/// leaf frame (a CoW-shared one only drops its count), every table, the root. Returns the
-/// pages released. The root must not be the active CR3.
-pub(crate) fn free_user_root(root: u64) -> usize {
-    akuma_tokio_kernel_core::tree::free_user_root::<lazy::Amd64>(root)
-}
 
 pub use akuma_tokio_kernel_core::loader::TaskImage;
 

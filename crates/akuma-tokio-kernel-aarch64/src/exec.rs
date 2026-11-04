@@ -4,11 +4,9 @@
 //! Like the amd64 half, this kernel does not call `akuma_exec::init` (that
 //! registers the full AArch64 kernel's BKL, MMU gates and prefault hook). The
 //! process-crossing arms (`enter_user`, `fork_share_memory`,
-//! `bind_child_task`) arrive with EL0 (B21 A5.6); until then reaching one is a
-//! boot-order bug, reported and parked.
+//! `bind_child_task`) are `core::proc`'s, through this machine's `Proc`.
 
 use akuma_exec::{ExecConfig, ExecRuntime};
-use akuma_primitives::safe_print;
 
 /// The kernel stack each thread runs its syscalls on: the amd64 half's 64 KiB.
 pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
@@ -20,11 +18,6 @@ pub const USER_STACK_MAX: usize = 8 << 20;
 pub fn init() {
     akuma_exec::runtime::register(exec_runtime(), exec_config());
     akuma_exec::process::reserve_pid_floor(2);
-}
-
-fn not_yet(what: &str) -> ! {
-    safe_print!(96, "[exec] {} is not wired on aarch64 yet (B21 A5.6)\n", what);
-    crate::halt()
 }
 
 fn exec_runtime() -> ExecRuntime {
@@ -80,10 +73,46 @@ fn exec_runtime() -> ExecRuntime {
         clear_spawn_namespace: || {},
         rump_socket_clone_ref: |_, _| {},
         // EL0 (A5.6).
-        enter_user: |_| not_yet("enter_user"),
-        fork_share_memory: |_, _| Err("fork: not wired on aarch64 yet"),
-        bind_child_task: |_, _, _| Err("bind_child_task: not wired on aarch64 yet"),
+        // A fork child's or new thread's first crossing into EL0.
+        enter_user: crate::proc::enter_user,
+        fork_share_memory,
+        bind_child_task: |tid, child, kind| {
+            akuma_tokio_kernel_core::proc::bind_child_task::<crate::mm::Aarch64>(
+                tid,
+                child.pid,
+                child.address_space.l0_phys() as u64,
+                kind == akuma_exec::process::ChildKind::Thread,
+            )
+        },
     }
+}
+
+/// `ExecRuntime::fork_share_memory`: core's copy-on-write clone of the
+/// parent's root into a fresh one, which the child's `Process` then views.
+///
+/// Not into the space `fork_process` built: on AArch64 `UserAddressSpace::new`
+/// identity-maps RAM itself (an L1 and an L2 per GiB), which the clone would
+/// overwrite and leak at the child's first exec or exit. That space is dropped
+/// here instead (never live, so its frames go straight back), and the child
+/// holds a non-owning view of the clone, which core frees at the reap.
+fn fork_share_memory(
+    parent: &akuma_exec::process::Process,
+    child: &mut akuma_exec::process::Process,
+) -> Result<(), &'static str> {
+    use akuma_tokio_kernel_core::mmu::FreshPage;
+    use akuma_tokio_kernel_core::tree;
+    let src = parent.address_space.l0_phys() as u64;
+    let dst = crate::mm::Frame::alloc_zeroed().ok_or("aarch64: no frame for the child's root")?.publish() as u64;
+    if tree::clone_user_half::<crate::mm::Aarch64>(src, dst).is_none() {
+        let _ = tree::free_user_root::<crate::mm::Aarch64>(dst);
+        return Err("aarch64: user-half clone failed");
+    }
+    let Some(view) = akuma_mmu::UserAddressSpace::new_shared(dst as usize) else {
+        let _ = tree::free_user_root::<crate::mm::Aarch64>(dst);
+        return Err("aarch64: no view of the child's root");
+    };
+    child.address_space = akuma_exec::process::ProcAddressSpace::new(view);
+    Ok(())
 }
 
 fn exec_config() -> ExecConfig {

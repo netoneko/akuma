@@ -34,8 +34,23 @@ pub fn install_surface() {
             rng_fill(b);
             true
         },
-        after_reap: || {},
+        after_reap: || {
+            let _ = akuma_tokio_kernel_core::proc::collect::<crate::mm::Aarch64>();
+        },
     });
+    {
+        use akuma_syscalls_glue::{proc, version};
+        let id = akuma_tokio_kernel_core::identity();
+        proc::set_uts_identity(proc::UtsIdentity {
+            sysname: proc::uts_join(&["Linux"]),
+            nodename: proc::uts_join(&[id.nodename]),
+            release: proc::uts_join(&[id.version, "-", version::GIT_SHA, "-", id.nodename]),
+            version: proc::uts_join(&[version::BUILD_ID]),
+        });
+    }
+    // A process `akuma-exec` ends (a fatal signal's default action inside glue)
+    // must still reach this kernel's `wait4` (`proc::on_thread_terminated`).
+    akuma_threading::set_slot_purge_callback(akuma_tokio_kernel_core::proc::on_thread_terminated::<crate::mm::Aarch64>);
     akuma_vfs_glue::init();
     akuma_threading::set_slot_reap_callback(akuma_vfs_glue::reap_dead_thread);
 }

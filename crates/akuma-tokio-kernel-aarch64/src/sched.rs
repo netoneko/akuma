@@ -14,14 +14,17 @@
 //! Slot space, as on amd64: `0..NSLOTS` are the spawn ring (slot 0 the boot
 //! thread), `NSLOTS + cpu` is core `cpu`'s idle thread.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
 use akuma_exec::process::UserContext;
 use akuma_primitives::cell::BorrowCell;
 use akuma_primitives::safe_print;
 use akuma_threading::{ProcessHooks, ThreadConfig, ThreadRuntime, X86ArchHooks};
+use akuma_tokio_kernel_core::proc;
+use akuma_vectors_aarch64::Frame;
 
-use crate::mm::{MAX_CPUS, NSLOTS};
+use crate::mm::MAX_CPUS;
+use akuma_tokio_kernel_core::proc::NSLOTS;
 
 /// One thread's kernel stack. Its top holds the EL0 trap frame.
 pub const KSTACK_BYTES: usize = 64 * 1024;
@@ -35,10 +38,21 @@ static IDLE: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TA
 /// The EL0 register file `fork_process`/`clone_thread` wrote for a new slot,
 /// or the caller's capture at its last syscall.
 static UCTX: BorrowCell<[Option<UserContext>; MAX_TASKS]> = BorrowCell::new([const { None }; MAX_TASKS]);
-/// The task record a ring slot acts on (`0`: the boot record).
-static TASK_OF: [AtomicUsize; NSLOTS] = [const { AtomicUsize::new(0) }; NSLOTS];
-/// The pid a ring slot runs (`0`: none).
-static PID_OF: [AtomicU32; NSLOTS] = [const { AtomicU32::new(0) }; NSLOTS];
+/// A slot's FP/SIMD state as of its last `clone`. `UserContext` carries the
+/// general registers only, and musl's `svc` declares no vector clobbers, so a
+/// fork child must start with its parent's vector registers.
+#[derive(Clone, Copy)]
+struct Fp {
+    q: [u128; 32],
+    fpcr: u64,
+    fpsr: u64,
+}
+
+impl Fp {
+    const ZERO: Self = Self { q: [0; 32], fpcr: 0, fpsr: 0 };
+}
+
+static FP: BorrowCell<[Fp; MAX_TASKS]> = BorrowCell::new([Fp::ZERO; MAX_TASKS]);
 
 /// The slot this core runs.
 #[must_use]
@@ -57,26 +71,6 @@ pub const fn idle_tid(cpu: usize) -> usize {
     NSLOTS + cpu
 }
 
-/// The record ring slot `slot` acts on.
-#[must_use]
-pub fn task_of(slot: usize) -> usize {
-    TASK_OF.get(slot).map_or(0, |t| t.load(Relaxed))
-}
-
-/// The pid ring slot `slot` runs.
-#[must_use]
-pub fn pid_of(slot: usize) -> Option<u32> {
-    PID_OF.get(slot).map(|p| p.load(Relaxed)).filter(|&p| p != 0)
-}
-
-/// Bind ring slot `slot` to `pid` on task record `record`.
-pub fn bind(slot: usize, pid: u32, record: usize) {
-    if slot < NSLOTS {
-        TASK_OF[slot].store(record, Relaxed);
-        PID_OF[slot].store(pid, Relaxed);
-    }
-}
-
 /// The top of `slot`'s kernel stack, once it has one.
 #[must_use]
 pub fn kstack_top(slot: usize) -> Option<u64> {
@@ -84,14 +78,14 @@ pub fn kstack_top(slot: usize) -> Option<u64> {
 }
 
 fn switch_to(_from: usize, to: usize) {
-    let record = if to < NSLOTS { task_of(to) } else { 0 };
-    let root = crate::mm::record_root(record);
+    let root = proc::sched_root_of::<crate::mm::Aarch64>(to);
     if !akuma_boot_aarch64::user::switch_to(root) {
         safe_print!(96, "[sched] slot {} has root {:#x} without the kernel's part\n", to, root);
         crate::halt();
     }
+    // The idle threads run kernel code only and leave the record armed.
     if to < NSLOTS {
-        crate::mm::set_task_slot(record);
+        crate::mm::set_task_slot(proc::sched_task_slot_of(to));
     }
 }
 
@@ -112,13 +106,66 @@ pub fn prepare(slot: usize) -> Option<usize> {
     }
     IDLE[slot].store(false, Relaxed);
     UCTX.with_mut(|u| u[slot] = None);
+    FP.with_mut(|f| f[slot] = Fp::ZERO);
     Some(top.load(Relaxed))
 }
 
+/// `fork_process`/`clone_thread` writing a new slot's register file, from the
+/// creator's context: the creator's FP state goes with it.
 fn write_user_context(slot: usize, ctx: &UserContext) {
     if slot < MAX_TASKS {
         UCTX.with_mut(|u| u[slot] = Some(*ctx));
+        let from = current_slot();
+        if from < MAX_TASKS {
+            FP.with_mut(|f| f[slot] = f[from]);
+        }
     }
+}
+
+/// Record the running slot's EL0 register file from its trap frame: what
+/// `fork_process` reads (`read_user_context`) as the child's.
+pub fn capture(f: &Frame) {
+    let slot = current_slot();
+    if slot >= MAX_TASKS {
+        return;
+    }
+    let x = &f.x;
+    let ctx = UserContext {
+        x0: x[0], x1: x[1], x2: x[2], x3: x[3], x4: x[4], x5: x[5], x6: x[6], x7: x[7],
+        x8: x[8], x9: x[9], x10: x[10], x11: x[11], x12: x[12], x13: x[13], x14: x[14], x15: x[15],
+        x16: x[16], x17: x[17], x18: x[18], x19: x[19], x20: x[20], x21: x[21], x22: x[22], x23: x[23],
+        x24: x[24], x25: x[25], x26: x[26], x27: x[27], x28: x[28], x29: x[29], x30: x[30],
+        sp: f.sp,
+        pc: f.elr,
+        spsr: f.spsr,
+        tpidr: f.tpidr,
+        ttbr0: 0,
+    };
+    UCTX.with_mut(|u| u[slot] = Some(ctx));
+    FP.with_mut(|s| s[slot] = Fp { q: f.q, fpcr: f.fpcr, fpsr: f.fpsr });
+}
+
+/// The EL0 frame a slot crosses into from `ctx`, with the slot's FP state.
+#[must_use]
+pub fn frame_from(slot: usize, ctx: &UserContext) -> Frame {
+    let mut f = Frame::zeroed();
+    f.x = [
+        ctx.x0, ctx.x1, ctx.x2, ctx.x3, ctx.x4, ctx.x5, ctx.x6, ctx.x7, ctx.x8, ctx.x9, ctx.x10, ctx.x11, ctx.x12,
+        ctx.x13, ctx.x14, ctx.x15, ctx.x16, ctx.x17, ctx.x18, ctx.x19, ctx.x20, ctx.x21, ctx.x22, ctx.x23, ctx.x24,
+        ctx.x25, ctx.x26, ctx.x27, ctx.x28, ctx.x29, ctx.x30,
+    ];
+    f.sp = ctx.sp;
+    f.elr = ctx.pc;
+    f.spsr = ctx.spsr;
+    f.tpidr = ctx.tpidr;
+    if slot < MAX_TASKS {
+        FP.with(|s| {
+            f.q = s[slot].q;
+            f.fpcr = s[slot].fpcr;
+            f.fpsr = s[slot].fpsr;
+        });
+    }
+    f
 }
 
 fn read_user_context(slot: usize) -> Option<UserContext> {
@@ -190,8 +237,8 @@ pub fn init() {
         clear_draining: |_| {},
         drain_in_flight: |_| false,
         lifecycle_trace_on: || false,
-        pid_for_thread: pid_of,
-        find_pid_by_thread: pid_of,
+        pid_for_thread: proc::pid_for_slot,
+        find_pid_by_thread: proc::pid_for_slot,
         // Signals arrive with A5.8.
         is_current_interrupted: || false,
         proc_dump_info: |_| None,

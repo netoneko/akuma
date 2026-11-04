@@ -7,11 +7,11 @@
 //! then `akuma-syscalls-glue`, by the number as it came. On amd64 the
 //! allow-listed calls go to glue and the fd family to the x86_64 ABI layer; on
 //! AArch64 glue's arms *are* the ABI layer, so it takes the rest directly.
-//! `clone`, `execve` and `mremap` are `ENOSYS` until the process step (A5.6c).
+//! `clone`/`execve`/`exit` are `akuma_tokio_kernel_core::proc`'s; `mremap` is
+//! `ENOSYS` until its arm moves to core (musl's `realloc` falls back to a copy).
 
-use akuma_primitives::safe_print;
 use akuma_syscalls_linux::nr;
-use akuma_tokio_kernel_core::mm;
+use akuma_tokio_kernel_core::{mm, proc};
 use akuma_vectors_aarch64::Frame;
 
 use crate::mm::Aarch64;
@@ -22,20 +22,28 @@ const fn e(code: u64) -> u64 {
     0u64.wrapping_sub(code)
 }
 
-/// Serve the `svc` that trapped into `f`.
+/// Serve the `svc` that trapped into `f`. A thread `exit_group` asked to end
+/// leaves at entry or on the way back, rather than running on in a dying
+/// process (`proc::kill_siblings`).
 pub fn svc(f: &mut Frame) {
+    if proc::kill_requested::<Aarch64>() {
+        proc::finish_killed::<Aarch64>();
+    }
     let a = [f.x[0], f.x[1], f.x[2], f.x[3], f.x[4], f.x[5]];
-    f.x[0] = dispatch(f.x[8], a);
+    f.x[0] = dispatch(f, f.x[8], a);
+    if proc::kill_requested::<Aarch64>() {
+        proc::finish_killed::<Aarch64>();
+    }
 }
 
-fn dispatch(n: u64, a: [u64; 6]) -> u64 {
+fn dispatch(f: &Frame, n: u64, a: [u64; 6]) -> u64 {
     match n {
         nr::WRITE | nr::WRITEV => {
             if let Some(r) = akuma_runtime_tokio::console::stdio_write(n == nr::WRITEV, a, crate::console_putb) {
                 return r;
             }
         }
-        nr::EXIT | nr::EXIT_GROUP => crate::proc::exit(a[0] & 0xFF),
+        nr::EXIT | nr::EXIT_GROUP => proc::exit::<Aarch64>(n == nr::EXIT_GROUP, a[0]),
         nr::BRK => return mm::brk_arm::<Aarch64>(a[0]),
         nr::MMAP => {
             let anon = a[3] & u64::from(akuma_syscalls_linux::flags::map::MAP_ANONYMOUS) != 0;
@@ -46,8 +54,14 @@ fn dispatch(n: u64, a: [u64; 6]) -> u64 {
         nr::MUNMAP => return mm::munmap_arm::<Aarch64>(a[0], a[1]),
         nr::MSYNC => return mm::msync_arm::<Aarch64>(a[0], a[1]),
         nr::MADVISE => return mm::madvise_arm::<Aarch64>(a[0], a[1], a[2]),
-        nr::CLONE | nr::EXECVE | nr::MREMAP => {
-            safe_print!(64, "[nosys] {} (aarch64: the process step)\n", n);
+        // The child's register file is the caller's, as of this call.
+        nr::CLONE => {
+            crate::sched::capture(f);
+            return proc::clone::<Aarch64>(a[0], a[1], a[2], a[3], a[4]);
+        }
+        nr::EXECVE => return crate::proc::exec(a[0], a[1], a[2]),
+        nr::MREMAP => {
+            akuma_tokio_kernel_core::nosys::note(n);
             return e(ENOSYS);
         }
         _ => {}
