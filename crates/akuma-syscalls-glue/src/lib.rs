@@ -635,7 +635,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         crate::utils::read_profile::F_LAP_IDENT,
     );
 
-    if akuma_exec::process::is_current_interrupted() {
+    // The signal-state calls never answer `EINTR` (Linux never does), and do not
+    // consume the flag: they are how a program unblocks the very signal that set
+    // it. musl's `fork` child restores its mask with `rt_sigprocmask` after
+    // blocking app signals; a `SIGTERM` landing in between made that restore
+    // fail, the signal stayed blocked, and the child slept on forever
+    // (`docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
+    let signal_state = matches!(
+        syscall_num,
+        nr::RT_SIGPROCMASK | nr::RT_SIGACTION | nr::RT_SIGPENDING | nr::RT_SIGRETURN | nr::SIGALTSTACK
+    );
+    if !signal_state && akuma_exec::process::is_current_interrupted() {
         // **`EINTR`, and nothing else.**
         //
         // This used to also stamp the caller `exited = true`, `exit_code = 130`,

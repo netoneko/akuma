@@ -566,11 +566,10 @@ fn test_tkill_blocked_fatal_is_pended() {
     console::print("  [PASS] test_tkill_blocked_fatal_is_pended\n");
 }
 
-// NOTE: gap-2 (adding SIGUSR1/SIGUSR2/RT signals to signal_is_fatal_default)
-// was REVERTED — making those fatal-by-default kills the in-VM rustc self-host
-// build, which storms SIGUSR1 (~10,400 tkills). See report_known_gaps + §7k.5.
-// `test_tkill_blocked_fatal_is_pended` above already covers the genuinely-fatal
-// case (SIGTERM) for the pend-when-blocked path.
+// gap-2 (SIGUSR1/SIGUSR2/RT signals fatal by default, as on Linux) is closed:
+// `sys_tkill` attributes the handler or drops the signal and acts on the
+// target's group, which is what made the first attempt kill the rustc
+// self-host build (docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md).
 
 /// §7k.5 gap-3 fix: `rt_sigsuspend` validates its arguments.
 fn test_rt_sigsuspend_validation() {
@@ -830,9 +829,8 @@ fn report_known_gaps() {
     if first == Some(40) && second.is_none() {
         console::print("  [GAP ] RT-signal queuing: same-number signals coalesced (no siginfo queue) — feature, not yet implemented\n");
     }
-    console::print("  [GAP ] signal_is_fatal_default stays conservative: SIGUSR1/2 + RT NOT fatal-by-default (making them fatal kills the rustc self-host build's SIGUSR1 storm; real fix is tkill handler attribution) — §7k.5\n");
     // Fixed this session (§7k.5): rt_sigsuspend block+EINTR (gap 3),
-    // tgkill tgid/ESRCH check (gap 4). gap-2 reverted (see above). gap-1 open.
+    // tgkill tgid/ESRCH check (gap 4), the fatal-default table (gap 2). gap-1 open.
     let _ = SIGSEGV; // referenced for documentation symmetry
 }
 

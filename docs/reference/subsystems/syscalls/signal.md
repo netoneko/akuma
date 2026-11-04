@@ -135,20 +135,24 @@ bottom out in.
   nothing, take anything pending"; passing `!0` means "take only
   SIGKILL/SIGSTOP" — inverted from what it looks like at a glance, and the
   cause of a whole cluster of test-only bugs (`archive/SIGNAL_HELL.md` §2).
-- **`sys_tkill`** (`signal.rs:331`): `sig == 9` always calls
-  `sys_exit_group` directly — no handler lookup, no pend/mask path. For other
-  signals it reads the *target* thread's mask and the process-wide handler
-  table: `Ignore` → no-op; `UserFn` → `pend_signal_for_thread` (delivered at
-  the target's next syscall return); `Default` → fatal-by-default signals
-  (`signal_is_fatal_default`) call `sys_exit_group` immediately if unblocked,
-  or are pended (to fire once unmasked) if blocked.
-- **`signal_is_fatal_default`** deliberately excludes SIGUSR1/2 (10, 12) and
-  the real-time range (32–64) even though Linux's disposition table says they
-  terminate by default. Go's runtime and musl/pthreads both storm `tkill`
-  with these (async preemption, cancellation/timers) and often can't
-  attribute the target tid to a process at delivery time; treating them as
-  fatal killed an in-VM rustc self-host build on a stray SIGUSR1
-  (`docs/AKUMA_SELF_HOSTING.md` §7k.5, `signal.rs:69-87`).
+- **`sys_tkill`** resolves the *target* thread's process and reads its mask and
+  the process-wide handler table. **A tid it cannot attribute (no process, or
+  one already gone) is dropped**, never treated as `Default`. `Ignore` → no-op;
+  `UserFn` → `pend_signal_for_thread` (delivered at the target's next syscall
+  return); `Default` with a fatal-by-default signal (and `SIGKILL` always) ends
+  **the target's group, never the caller's**: `sys_exit_group` when the target
+  is in the caller's own group, else pend + `interrupt_thread` so the target dies
+  at its own return. Blocked → pended until unmasked.
+- **`signal_is_fatal_default`** is Linux's disposition table: everything in
+  `1..=64` except ignore-by-default (17, 23, 28) and stop/continue (18-22, no
+  job control). The two `tkill` rules above are what make that safe under the
+  `SIGUSR1` storm of a `rustc` build (`archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
+- **The interrupt bit answers only calls that are not signal state.** While a
+  thread's interrupt bit is set, glue's dispatch prologue answers `EINTR`
+  without running the call, **except** `rt_sigprocmask`, `rt_sigaction`,
+  `rt_sigpending`, `rt_sigreturn` and `sigaltstack`, which run and leave the bit
+  alone. Those calls are how a program makes a pending signal deliverable, and
+  Linux never fails them with `EINTR` (`archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
 - **`sys_tgkill`** adds one check over `tkill`: if the target tid resolves to
   a live process whose `tgid` doesn't match the caller's argument, `ESRCH`
   (prevents mis-delivery to a tid recycled into a different process); falls
@@ -329,5 +333,6 @@ if externally interrupted. `siginfo_t` fill-in is minimal (signo only).
   semantics were correct; the tests were inverted), the thread-group
   kill/exit_group cluster, and the crush goroutine-coordination stall
   (root cause: IRQ-disabled UART writes, not the signal primitives).
-- `docs/AKUMA_SELF_HOSTING.md` §7k.5 — why `signal_is_fatal_default` excludes
-  SIGUSR1/2 and the real-time range.
+- `archive/SIGNAL_FATAL_DEFAULT_LINUX.md` — why `signal_is_fatal_default`
+  once excluded SIGUSR1/2 and the real-time range (`archive/AKUMA_SELF_HOSTING.md`
+  §7k.5), and the `tkill` attribution fix that let it follow Linux.

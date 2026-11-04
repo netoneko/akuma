@@ -2469,9 +2469,8 @@ fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault
 /// `a_crash()` (`strb wzr, [x0]`) and the process died reporting *SIGSEGV at
 /// FAR=0* instead of SIGABRT. Repro: `userspace/forktest/c_stress/abortsig.c`.
 ///
-/// Fatality uses `signal_is_fatal_default`, which is deliberately conservative
-/// (no SIGUSR1/2, no RT signals — see its doc comment); this path must not turn
-/// the self-host build's SIGUSR1 storm into a kill.
+/// Fatality uses `signal_is_fatal_default` (Linux's table). This path reads the
+/// *current* process's own disposition, so a signal only reaches it attributed.
 ///
 /// Diverges when the signal is fatal; returns normally otherwise.
 fn apply_default_signal_action(signal: u32) {

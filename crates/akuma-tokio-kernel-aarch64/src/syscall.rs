@@ -7,7 +7,8 @@
 //! then `akuma-syscalls-glue`, by the number as it came. On amd64 the
 //! allow-listed calls go to glue and the fd family to the x86_64 ABI layer; on
 //! AArch64 glue's arms *are* the ABI layer, so it takes the rest directly.
-//! `clone`/`execve`/`exit` are `akuma_tokio_kernel_core::proc`'s; `mremap` is
+//! `clone`/`execve`/`exit` are `akuma_tokio_kernel_core::proc`'s, signal
+//! delivery `akuma_tokio_kernel_core::signal`'s at the return; `mremap` is
 //! `ENOSYS` until its arm moves to core (musl's `realloc` falls back to a copy).
 
 use akuma_syscalls_linux::nr;
@@ -29,11 +30,16 @@ pub fn svc(f: &mut Frame) {
     if proc::kill_requested::<Aarch64>() {
         proc::finish_killed::<Aarch64>();
     }
+    let n = f.x[8];
     let a = [f.x[0], f.x[1], f.x[2], f.x[3], f.x[4], f.x[5]];
-    f.x[0] = dispatch(f, f.x[8], a);
+    f.x[0] = if n == nr::RT_SIGRETURN { crate::signal::sigreturn(f) } else { dispatch(f, n, a) };
     if proc::kill_requested::<Aarch64>() {
         proc::finish_killed::<Aarch64>();
     }
+    // Pending signals are taken on the way back: a handler's frame, an ignore,
+    // or a default action that ends the group. After an `rt_sigreturn` too, as
+    // on Linux: that is how the next pending signal gets its turn.
+    crate::signal::at_return(f, n, a[0]);
 }
 
 fn dispatch(f: &Frame, n: u64, a: [u64; 6]) -> u64 {

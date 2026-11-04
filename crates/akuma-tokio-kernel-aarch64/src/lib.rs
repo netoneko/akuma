@@ -32,6 +32,7 @@ mod machine;
 mod mm;
 mod proc;
 mod sched;
+mod signal;
 mod syscall;
 mod trap;
 

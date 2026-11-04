@@ -13892,12 +13892,15 @@ fn test_publish_child_exit_pends_sigchld_on_parent() {
 /// keep omitting 17; this is a regression guard, since adding SIGCHLD delivery
 /// makes a stray signal 17 far more likely than before.
 fn test_sigchld_not_fatal_by_default() {
-    // sys_kill resolves fatality via signal_is_fatal_default in the signal path;
-    // we mirror that table inline so this test fails the day 17 is added to it.
-    fn signal_is_fatal_default(sig: u32) -> bool {
-        matches!(sig, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 14 | 15 | 24 | 25 | 26 | 27 | 31)
-    }
-    if !signal_is_fatal_default(17) && signal_is_fatal_default(9) {
+    // The table itself, with Linux's ignore/stop/continue set spelled out: none
+    // of these may kill, and SIGUSR1/SIGUSR2/RT signals must.
+    use crate::syscall::signal::signal_is_fatal_default;
+    let quiet = [17, 18, 19, 20, 21, 22, 23, 28];
+    let ok = quiet.iter().all(|&s| !signal_is_fatal_default(s))
+        && [9, 10, 12, 15, 34, 64].iter().all(|&s| signal_is_fatal_default(s))
+        && !signal_is_fatal_default(0)
+        && !signal_is_fatal_default(65);
+    if ok {
         console::print("[Test] sigchld_not_fatal_by_default PASSED\n");
     } else {
         console::print("[Test] sigchld_not_fatal_by_default FAILED: SIGCHLD(17) is fatal-by-default\n");

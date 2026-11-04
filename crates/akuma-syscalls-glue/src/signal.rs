@@ -62,22 +62,21 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
 
 /// Does signal `sig` terminate the process by default (no installed handler)?
 ///
-/// **Deliberately conservative — do NOT add SIGUSR1(10), SIGUSR2(12), or the
-/// real-time signals (32..=64) here.** Although Linux's *disposition table* says
-/// those terminate by default, Akuma's `tkill` resolves the handler per target
-/// thread and falls back to `Default` whenever it can't attribute the signal to
-/// a thread's process (transient/teardown threads, unresolved tids). Making a
-/// *stormed* signal fatal-by-default therefore kills the process on any such
-/// stray delivery.
+/// Linux's disposition table: every signal terminates except the ones whose
+/// default is to ignore (`SIGCHLD` 17, `SIGURG` 23, `SIGWINCH` 28) or to stop or
+/// continue (`SIGCONT` 18, `SIGSTOP` 19, `SIGTSTP` 20, `SIGTTIN` 21, `SIGTTOU`
+/// 22 — no job control here, so a stop is a no-op rather than a kill). That
+/// includes `SIGUSR1`/`SIGUSR2` and the real-time signals 32..=64.
 ///
-/// This bit us concretely (docs/AKUMA_SELF_HOSTING.md §7k.5): the in-VM rustc
-/// self-host build fires a SIGUSR1 storm (~10,400 `tkill(sig=10)`), and adding
-/// SIGUSR1 to this set killed rustc mid-build with `signal: 10`. musl/pthreads
-/// likewise storm SIGRTMIN (cancellation/timer). So the POSIX-correct fix belongs
-/// in `tkill`'s handler attribution, not in this table — until then this stays
-/// limited to signals that are not used as async wakeups.
+/// Until 2026-11-04 this left out `SIGUSR1`/`SIGUSR2` and the real-time range,
+/// because `sys_tkill` made an *unattributable* target's handler `Default` and
+/// then ran the default action on the **caller**, so the self-host build's
+/// `SIGUSR1` storm killed `rustc` the day they were added. `sys_tkill` now
+/// attributes or drops, and acts on the target's group, never the caller's
+/// (`docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
+#[must_use]
 pub fn signal_is_fatal_default(sig: u32) -> bool {
-    matches!(sig, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 14 | 15 | 24 | 25 | 26 | 27 | 31)
+    matches!(sig, 1..=64) && !matches!(sig, 17..=23 | 28)
 }
 
 /// rt_sigprocmask - change the signal mask
@@ -360,22 +359,32 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
 
     // Handler is process-wide (sigaction); the mask is PER-THREAD — read the
     // *target* thread's mask (docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D).
+    //
+    // A tid with no process (a kernel thread `check_signal_tid` let the host
+    // reach) or a process already gone has no disposition to run: the signal is
+    // dropped. Reading that as `Default` is what made fatal-by-default
+    // `SIGUSR1` kill rustc (`docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
     let target_mask = akuma_exec::threading::thread_signal_mask_of(tid as usize);
-    let target_handler = if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid as usize) {
-        if let Some(proc) = akuma_exec::process::lookup_process_shared(pid) {
-            let idx = (sig - 1) as usize;
-            let actions = proc.signal_actions.actions.lock();
-            actions[idx].handler
-        } else {
-            akuma_exec::process::SignalHandler::Default
-        }
-    } else {
-        akuma_exec::process::SignalHandler::Default
+    let Some(target_pid) = akuma_exec::process::find_pid_by_thread(tid as usize) else {
+        return 0;
     };
+    let Some(target) = akuma_exec::process::lookup_process_shared(target_pid) else {
+        return 0;
+    };
+    let target_handler = target.signal_actions.actions.lock()[(sig - 1) as usize].handler;
+    // A default action that kills ends the *target's* group. When that is the
+    // caller's own, it ends here; otherwise the target takes it at its own next
+    // return to EL0, woken from any park by the interrupt bit.
+    let same_group = akuma_exec::process::read_current_pid() == Some(target_pid);
 
     // SIGKILL (9) is always fatal and cannot be blocked/handled
     if sig == 9 {
-        super::proc::sys_exit_group(-(sig as i32));
+        if same_group {
+            super::proc::sys_exit_group(-(sig as i32));
+            return 0;
+        }
+        akuma_exec::threading::pend_signal_for_thread(tid as usize, sig);
+        akuma_exec::process::interrupt_thread(tid as usize);
         return 0;
     }
 
@@ -396,11 +405,16 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
             let bit = 1u64 << (sig - 1);
             let blocked = (target_mask & bit) != 0;
 
-            if signal_is_fatal_default(sig) && !blocked {
-                super::proc::sys_exit_group(-(sig as i32));
-            } else if signal_is_fatal_default(sig) && blocked {
-                // If fatal but blocked, we still pend it so it fires when unmasked
+            if !signal_is_fatal_default(sig) {
+                // Ignored by default: nothing to do.
+            } else if blocked {
+                // Fatal but blocked: pend it so it fires when unmasked.
                 akuma_exec::threading::pend_signal_for_thread(tid as usize, sig);
+            } else if same_group {
+                super::proc::sys_exit_group(-(sig as i32));
+            } else {
+                akuma_exec::threading::pend_signal_for_thread(tid as usize, sig);
+                akuma_exec::process::interrupt_thread(tid as usize);
             }
             0
         }

@@ -327,18 +327,22 @@ fn fault_trap(t: &mut Trap<'_>) {
 
 fn fault_trap_locked(t: &mut Trap<'_>) {
     let code = t.error_code.unwrap_or(0);
+    // `CR2` is the core's, not the thread's: a file fill below can park on the
+    // disk, and whatever faults on this core meanwhile overwrites it. Read once,
+    // before anything can block.
+    let cr2 = akuma_cpu::ctlreg::cr2();
     // A not-present user page that `mmap` reserved and nothing has touched yet:
     // fill it and retry. From ring 0 too (a kernel access that skipped
     // `validate_user_range`'s prefault), but only zero-fill there - a file fill
     // reads the filesystem, which a ring-0 fault may be holding. A failed fill
     // (no memory, an unreadable file) falls through to the kill.
-    if code & 1 == 0 && akuma_cpu::ctlreg::cr2() < USER_TOP {
+    if code & 1 == 0 && cr2 < USER_TOP {
         let root = akuma_cpu::ctlreg::cr3() & PTE_ADDR;
-        if lazy::fill(root, akuma_cpu::ctlreg::cr2(), t.from_ring3()) == lazy::Fill::Present {
+        if lazy::fill(root, cr2, t.from_ring3()) == lazy::Fill::Present {
             return;
         }
     }
-    if t.from_ring3() && code & 1 == 0 && grow_user_stack(akuma_cpu::ctlreg::cr2()) {
+    if t.from_ring3() && code & 1 == 0 && grow_user_stack(cr2) {
         return;
     }
     // A write to a present user page, from EITHER ring: the copy-on-write
@@ -348,7 +352,6 @@ fn fault_trap_locked(t: &mut Trap<'_>) {
     // a kernel write into a forked child's buffer must break the share, not
     // fail. The live PTE decides, never the error code (`cow_resolve` re-reads
     // it); only `Fault` falls through.
-    let cr2 = akuma_cpu::ctlreg::cr2();
     if code & 3 == 3 && cr2 < USER_TOP {
         let root = akuma_cpu::ctlreg::cr3() & PTE_ADDR;
         if cow_resolve(root, cr2).resolves() {
@@ -373,11 +376,11 @@ fn fault_trap_locked(t: &mut Trap<'_>) {
             t.kind,
             t.frame.rip,
             t.frame.rsp,
-            akuma_cpu::ctlreg::cr2(),
+            cr2,
             code
         );
         #[cfg(feature = "trace-err")]
-        mm_dump_for(akuma_cpu::ctlreg::cr2());
+        mm_dump_for(cr2);
         // A fork child or thread dies alone (SIGSEGV status to its waiter);
         // the machine runs on. The boot task has no slot to reap through, so
         // a fault there halts.
@@ -393,7 +396,7 @@ fn fault_trap_locked(t: &mut Trap<'_>) {
         t.kind,
         t.frame.rip,
         t.frame.rsp,
-        akuma_cpu::ctlreg::cr2(),
+        cr2,
         code
     );
     halt();
@@ -896,8 +899,6 @@ fn banner() {
 // mapped, read or written for it) is `akuma_tokio_kernel_core::task`'s.
 use akuma_tokio_kernel_core::mm;
 use akuma_tokio_kernel_core::task::{USER_TOP, USER_STACK_TOP, Task};
-/// errnos `akuma_ring3_amd64::err` does not carry.
-pub(crate) const EINTR: u64 = 4;
 /// Bisect mask for the mmap-slab rework, set from the kernel command line
 /// (`mmdbg=N`, default 7): 1 = munmap frees + records holes, 2 = MAP_FIXED
 /// releases what it replaces, 4 = mremap frees/moves the old range.

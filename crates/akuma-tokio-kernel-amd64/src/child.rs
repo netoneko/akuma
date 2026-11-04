@@ -7,7 +7,7 @@
 //! wrappers below keep their names for this crate's callers.
 
 use akuma_ring3_amd64 as ring3;
-use akuma_tokio_kernel_core::proc;
+use akuma_tokio_kernel_core::{proc, signal};
 
 use crate::lazy::Amd64;
 
@@ -39,10 +39,6 @@ pub fn task_exit_thread() -> ! {
 
 pub fn task_die_segv() -> ! {
     proc::die_segv::<Amd64>()
-}
-
-fn task_exit_code(code: i32) -> ! {
-    proc::task_exit_code::<Amd64>(code)
 }
 
 pub fn on_thread_terminated(tid: usize) {
@@ -254,113 +250,43 @@ pub fn take_return_rsp() -> Option<u64> {
     }
 }
 
-/// Signals no mask can block: `SIGKILL` (9) and `SIGSTOP` (19).
-const UNBLOCKABLE: u64 = (1 << 8) | (1 << 18);
-
-/// Deliver the running thread's pending signals at its return to ring 3 from syscall `nr`,
-/// whose result is `r`: the dispatcher's exit. One handler at most (the next pending
-/// signal waits for this one's `rt_sigreturn`, itself a syscall return); ignored signals are
-/// dropped; a default action that kills ends the group ([`task_exit_code`], status
-/// `-signal`). Returns what the call answers.
+/// The dispatcher's exit: pending signals at the return to ring 3 from syscall `nr`, whose
+/// result is `r` (`akuma_tokio_kernel_core::signal`'s decisions, this frame's push).
 pub fn deliver_at_return(fr: &mut ring3::SyscallFrame, nr: u64, r: u64) -> u64 {
-    // The interrupt flag exists to break a call that is *blocking*; on the way back to ring 3
-    // nothing is. Left set, it makes the thread's next glue call answer EINTR without running:
-    // a `kill`/`tkill` aimed at the caller itself sets it, and musl's `raise` and `abort` then
-    // lost the mask restore after their `tkill`, so the signal stayed blocked.
-    let me = crate::exec_twin::current_slot();
-    if me < NSLOTS {
-        let _ = akuma_threading::take_thread_interrupted(me);
-    }
-    let mask = akuma_exec::threading::thread_signal_mask();
-    // `rt_sigsuspend` and `pause` (glue's) armed the restore-sigmask slot: a handler entered here
-    // records the mask from before the call for its `rt_sigreturn`; with none entered, that mask
-    // is the thread's again now.
-    let restore = akuma_exec::threading::take_restore_sigmask();
-    if !deliver_one(fr, nr, r, mask, restore.unwrap_or(mask))
-        && let Some(m) = restore
-    {
-        akuma_exec::threading::set_thread_signal_mask(m);
-    }
-    r
+    signal::deliver_at_return::<Amd64, _>(&mut X86Frame(fr), nr, r, &NO_RESTART)
 }
 
-/// Take pending signals the mask `cur` lets through until one runs a handler (`true`) or none
-/// is left (`false`). `restore` is the mask the handler's `rt_sigreturn` puts back.
-fn deliver_one(fr: &mut ring3::SyscallFrame, nr: u64, r: u64, cur: u64, restore: u64) -> bool {
-    let me = crate::exec_twin::current_slot();
-    if me >= NSLOTS {
-        return false;
-    }
-    let Some(p) = akuma_exec::process::current_process_shared() else {
-        return false;
-    };
-    while let Some(sig) = akuma_threading::take_pending_signal(cur & !UNBLOCKABLE) {
-        let idx = (sig as usize).wrapping_sub(1);
-        if idx >= akuma_exec::process::MAX_SIGNALS {
-            continue;
-        }
-        let act = p.signal_actions.actions.lock()[idx];
-        match act.handler {
-            akuma_exec::process::SignalHandler::Ignore => {}
-            akuma_exec::process::SignalHandler::UserFn(entry) => {
-                // `SA_RESTART`: an interrupted call runs again after the handler - the saved
-                // `rip` backs over the 2-byte `syscall` and `rax` is its number again - except
-                // the calls Linux never restarts.
-                let restart = r == crate::e(crate::EINTR) && act.flags & SA_RESTART != 0 && !NO_RESTART.contains(&nr);
-                let (rax, rip) = if restart { (nr, fr.user_rip - 2) } else { (r, fr.user_rip) };
-                if push_handler(fr, sig, entry as u64, &act, rax, rip, cur, restore) {
-                    return true;
-                }
-                // A handler that cannot be entered (no restorer, an unwritable stack) must not
-                // swallow a fatal signal.
-                if akuma_syscalls_glue::signal::signal_is_fatal_default(sig) {
-                    task_exit_code(-(sig as i32));
-                }
-            }
-            akuma_exec::process::SignalHandler::Default => {
-                if akuma_syscalls_glue::signal::signal_is_fatal_default(sig) {
-                    akuma_primitives::safe_print!(96, "[signal] pid={} killed by signal {}\n", p.pid, sig);
-                    task_exit_code(-(sig as i32));
-                }
-            }
-        }
-    }
-    false
-}
-
-/// At a ring-3 tick: a pending signal whose action kills ends the group now, so a thread in a
-/// loop that makes no syscall still dies of `SIGKILL` (or `SIGTERM` with no handler). Handlers
-/// wait for the thread's next syscall return.
+/// At a ring-3 tick: a pending signal whose action kills ends the group now.
 pub fn deliver_fatal_on_tick() {
-    let me = crate::exec_twin::current_slot();
-    if me >= NSLOTS {
-        return;
-    }
-    let pend = akuma_threading::pending_signals_raw(me) & !(akuma_exec::threading::thread_signal_mask() & !UNBLOCKABLE);
-    if pend == 0 {
-        return;
-    }
-    let Some(p) = akuma_exec::process::current_process_shared() else {
-        return;
-    };
-    for sig in 1..=64u32 {
-        if pend & (1 << (sig - 1)) == 0 || !akuma_syscalls_glue::signal::signal_is_fatal_default(sig) {
-            continue;
-        }
-        let idx = (sig - 1) as usize;
-        let default = idx >= akuma_exec::process::MAX_SIGNALS
-            || matches!(p.signal_actions.actions.lock()[idx].handler, akuma_exec::process::SignalHandler::Default);
-        if sig == 9 || default {
-            akuma_threading::clear_pending_signal(me, sig);
-            task_exit_code(-(sig as i32));
-        }
+    signal::deliver_fatal_on_tick::<Amd64>();
+}
+
+/// The syscall frame, as `signal::Deliver` sees it.
+struct X86Frame<'a>(&'a mut ring3::SyscallFrame);
+
+impl signal::Deliver for X86Frame<'_> {
+    fn push_handler(
+        &mut self,
+        sig: u32,
+        entry: u64,
+        act: &akuma_exec::process::SignalAction,
+        result: u64,
+        restart: Option<u64>,
+        cur_mask: u64,
+        restore_mask: u64,
+    ) -> bool {
+        // A restart backs the saved `rip` over the 2-byte `syscall`, and `rax` is its number
+        // again.
+        let (rax, rip) = match restart {
+            Some(nr) => (nr, self.0.user_rip - 2),
+            None => (result, self.0.user_rip),
+        };
+        push_handler(self.0, sig, entry, act, rax, rip, cur_mask, restore_mask)
     }
 }
 
-const SA_RESTORER: u64 = 0x0400_0000;
-const SA_NODEFER: u64 = 0x4000_0000;
-const SA_SIGINFO: u64 = 4;
-const SA_RESTART: u64 = 0x1000_0000;
+const SA_RESTORER: u64 = signal::SA_RESTORER;
+const SA_SIGINFO: u64 = signal::SA_SIGINFO;
 /// Calls Linux never restarts after a handler, `SA_RESTART` or not: the sleeps and the waits
 /// with a timeout (x86_64 numbers).
 const NO_RESTART: [u64; 11] = [7, 23, 34, 35, 130, 230, 232, 270, 271, 281, 441];
@@ -418,7 +344,7 @@ fn push_handler(
     cur_mask: u64,
     restore_mask: u64,
 ) -> bool {
-    let (flags, restorer, sa_mask) = (act.flags, act.restorer as u64, act.mask);
+    let (flags, restorer) = (act.flags, act.restorer as u64);
     if flags & SA_RESTORER == 0 {
         return false;
     }
@@ -464,9 +390,7 @@ fn push_handler(
         return false;
     }
     akuma_sched_amd64::fpu_reset_live();
-    let bit = 1u64 << (sig - 1);
-    let during = cur_mask | sa_mask | if flags & SA_NODEFER == 0 { bit } else { 0 };
-    akuma_exec::threading::set_thread_signal_mask(during);
+    akuma_exec::threading::set_thread_signal_mask(signal::mask_during(sig, act, cur_mask));
     fr.user_rip = entry;
     fr.rdi = u64::from(sig);
     (fr.rsi, fr.rdx) = if flags & SA_SIGINFO != 0 { (info_at, uc_at) } else { (0, 0) };

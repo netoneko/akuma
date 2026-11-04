@@ -68,6 +68,7 @@ fn irq(f: &mut Frame) {
         if akuma_tokio_kernel_core::proc::kill_requested::<Aarch64>() {
             akuma_tokio_kernel_core::proc::finish_killed::<Aarch64>();
         }
+        akuma_tokio_kernel_core::signal::deliver_fatal_on_tick::<Aarch64>();
     }
 }
 

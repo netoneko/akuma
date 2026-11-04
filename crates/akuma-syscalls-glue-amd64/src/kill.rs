@@ -172,11 +172,14 @@ pub fn tkill(tid: u32, sig: u32) -> u64 {
         return ESRCH;
     }
 
-    let handler = akuma_exec::process::find_pid_by_thread(tid)
+    // A tid with no live process has no disposition to run: dropped, as glue's
+    // `sys_tkill` does (`docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
+    let Some(handler) = akuma_exec::process::find_pid_by_thread(tid)
         .and_then(akuma_exec::process::lookup_process_shared)
-        .map_or(akuma_exec::process::SignalHandler::Default, |p| {
-            p.signal_actions.actions.lock()[(sig - 1) as usize].handler
-        });
+        .map(|p| p.signal_actions.actions.lock()[(sig - 1) as usize].handler)
+    else {
+        return 0;
+    };
     // `SIG_IGN` drops the signal — except SIGKILL and SIGSTOP, which cannot be
     // ignored (`sigaction` refuses them, but a stale table entry must not win).
     if matches!(handler, akuma_exec::process::SignalHandler::Ignore) && sig != 9 && sig != 19 {
