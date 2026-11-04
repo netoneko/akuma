@@ -265,3 +265,56 @@ handled by another agent.
    grows the stack and aarch64 does not. Parity is per behaviour, and the B21 log's status table is where it is
    tracked.
 
+## Update 5 (2026-11-05): roles change; the script works; a 4B Qwen and Gemma pass the dev trial on Linux (Claude)
+
+**Who does what now.** GLM wrote the first `install.sh`, runbook and `install.txt` and was tuning them between Qwen attempts. That is
+tuning on the test set, so GLM was stopped; Claude owns the script and the runbook, and a local model only *executes* the runbook. GLM's
+work is on `litter/install-script`. Ryzen stays in Pop for now (user decision): both harnesses are checked on Linux before Akuma.
+
+**The oracle (a human drives the script).** On Pop, as an unprivileged user, `install.sh up --vmm firecracker` built the Taoxichuan kernel
+and `sshd` from a fresh shallow clone, made the image, booted it under Firecracker and `ssh 'busybox uname -a'` returned
+`Linux taoxichuan 0.1.0-ae1ead4-taoxichuan ae1ead4-release x86_64 GNU/Linux`. GLM's Firecracker path had **never been run** and had
+five bugs, found in this order:
+1. It created the tap with `ip tuntap add`, which needs root; the proposal's rule is no `sudo`. Now it uses a tap that already exists,
+   creates one only if it is root, and otherwise stops and prints the one command an administrator runs once.
+2. It never made the private disk copy (`disk-run.img`) the Firecracker JSON names, so Firecracker exited at once and the script
+   still printed `boot:` and waited 180 s. It now copies, checks the VMM is alive two seconds after launch, and the wait loop fails
+   fast (exit 50) with the console text if the VMM dies.
+3. It waited on ssh port 2222 (the QEMU hostfwd port); a Firecracker guest is reached on 22 over the tap.
+4. `ssh`, `status` and `down` had to be told `--vmm`/`--dir` again; the boot stage now records the VMM in `state/vmm`.
+5. `install.sh ssh '<cmd>'` was rejected as an unknown flag; the first non-option argument now starts the command.
+Added: `--kernel-bin PATH` (boot a supplied kernel), and `check` now fails for Firecracker when `/dev/kvm` is not writable.
+
+**Host facts (Pop).** `netoneko` has rustup, `~/bin/firecracker`, qemu, `ssh-keygen`; it is **not** in the `kvm` group. An ACL granted by
+hand (`setfacl -m u:netoneko:rw /dev/kvm`) **was reset by the system within the hour** and cost a trial. The harness re-grants it (an
+administrator action, never the model's); a durable fix is `usermod -aG kvm netoneko` and a new login. The tap `akuma-tap-2222`
+(10.0.2.2/24) is also created by hand and does not survive a reboot. Pop's root disk was 96 % full; clones and `cargo clean` freed ~1.3 GB.
+
+**The harness** `scripts/kvm/goose/qwen_install_trial.py` (design: `proposals/INSTALL_SCRIPT_QWEN_EXPERIMENT.md`): resets, ships the script and
+`bootstrap/public/install.txt`, runs `goose run` as `netoneko` against a model endpoint, then judges by itself (live VM, a real ssh
+`uname`, no `sudo`/package manager in the transcript). It runs a preflight (`install.sh check`) and refuses to start a trial that
+cannot boot.
+
+**Where the model runs now.** The trashcan Qwen3-8B (4.6 tok/s, ~11 minutes for goose's 6.5k-token opening prompt) was too slow
+to iterate on, so trials use the Mac's own ollama (`qwen3:4b`, `gemma4:e4b`) through a reverse ssh tunnel (Pop `127.0.0.1:21434` to the
+Mac's `11434`), with nothing exposed on the LAN. Goose's **generic OpenAI client cannot decode ollama's stream** (`Stream decode error`);
+its native `ollama` provider works. (The Mac has 48 GB RAM but 14 GB free disk, so the 35B Qwen from `../yolo` cannot be pulled.)
+
+| trial | model | outcome |
+|---|---|---|
+| qwen3-8b trashcan (2 runs) | Qwen3-8B Q4 | invalid: server ran with `n_ctx 8192` not 16384 (herd started before reload), then aborted as too slow |
+| qwen3-4b via second ollama | qwen3:4b | invalid: goose openai provider stream decode error |
+| qwen3-4b-ollama-2 | qwen3:4b | invalid: goose process had no `~/bin` on PATH; also used `sleep 600` (shell tool cuts at 300 s) |
+| qwen3-4b-ollama-3 | qwen3:4b | invalid: `/dev/kvm` ACL had been reset, `up` failed at boot |
+| **qwen3-4b-ollama-4** | qwen3:4b | **PASS 319 s**, 5 shell calls, polled at 60 s, harness confirmed VM + ssh |
+| **gemma4-e4b-ollama-1** | gemma4:e4b | **PASS 318 s**, 7 shell calls, three 60 s polls, harness confirmed VM + ssh |
+
+**What this does and does not show.** Both passes are *development* trials (`--keep-build`: the clone and the cargo build are reused, so the
+10-minute build was not exercised), n = 1 each, with a runbook written once by hand and not tuned on their transcripts. They show the
+chain works end to end once for two small local models. They do not show reliability: that needs the frozen protocol (N = 10, fresh
+builds, held-out variant). Four of the six trials were lost to *environment* faults of mine, all visible in `up.log` the whole time;
+the preflight exists because of them.
+
+**Next:** a full clean run (no `--keep-build`) for each model; Infinity with the Qwen on Linux (static binaries from
+`/root/infinity-no-aws` on Pop, run in a throwaway `HOME`); then Akuma on ryzen. Open: `check` prints `mke2fs -d: no` in
+trial runs but `yes` by hand (the probe runs against `$CACHE`, which may not exist yet).

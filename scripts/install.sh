@@ -176,6 +176,12 @@ if [ "$CMD" = check ]; then
 	else
 		need firecracker "firecracker: download the release binary from https://github.com/firecracker-microvm/firecracker/releases (needs /dev/kvm)"
 	fi
+	if [ "$VMM" = firecracker ] && [ ! -w /dev/kvm ]; then
+		deps_ok=1
+		missing="$missing/dev/kvm|not writable by $(id -un): an administrator runs once  sudo usermod -aG kvm $(id -un)  then log in again (or sudo setfacl -m u:$(id -un):rw /dev/kvm until reboot)
+"
+		missing_tools="$missing_tools"
+	fi
 	debugfs_ok=no
 	command -v debugfs >/dev/null 2>&1 && debugfs_ok=yes
 	kvm_ok=no
