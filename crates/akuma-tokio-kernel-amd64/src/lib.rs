@@ -45,7 +45,7 @@ mod net;
 #[cfg(feature = "trace-err")]
 use akuma_tokio_kernel_core::ring;
 mod sched;
-mod shmpages;
+use akuma_tokio_kernel_core::shmpages;
 mod smp;
 
 use akuma_boot_amd64::{mem, paging, phys};

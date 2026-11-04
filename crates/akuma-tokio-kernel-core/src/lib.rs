@@ -12,6 +12,8 @@ pub mod cmdline;
 pub mod init;
 pub mod nosys;
 pub mod ring;
+#[cfg(feature = "shmpages")]
+pub mod shmpages;
 
 /// Who the kernel is: its name on the console, its node name and release in `uname`, its
 /// banner. Set once at the top of the boot from the `Kernel` the root built.

@@ -989,7 +989,13 @@ dependencies = [
 name = "akuma-tokio-kernel-core"
 version = "0.1.0"
 dependencies = [
+ "akuma-fpcache",
+ "akuma-fpcache-rw",
+ "akuma-mmu",
+ "akuma-pmm",
  "akuma-primitives",
+ "akuma-vfs-glue",
+ "spinning_top",
 ]
 
 [[package]]

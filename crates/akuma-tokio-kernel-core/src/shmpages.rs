@@ -9,7 +9,7 @@
 //!
 //! The decisions - when an entry exists, who wins a fill race, when it goes,
 //! where a `write(2)` lands in a page - are the crate's, host-tested. This is
-//! amd64's `shmpages.rs` on this kernel's frames: the lock, the PMM's share
+//! amd64's `shmpages.rs` on a tokio kernel's frames (either architecture): the lock, the PMM's share
 //! count, and the physmap copies (`akuma_mmu::copy_to_phys`, bounds-checked
 //! against PMM RAM, so nothing here is `unsafe`).
 //!
@@ -122,8 +122,9 @@ pub enum Fill {
     Refused,
 }
 
-/// Publish a filled frame, unless a write raced the fill (checked under the
-/// hold the writer's copy takes). `generation` is [`fill_begin`]'s answer;
+/// Publish a filled frame, unless a write raced the fill.
+///
+/// The race is checked under the hold the writer's copy takes. `generation` is [`fill_begin`]'s answer;
 /// `None` publishes without the check, after the caller's retry bound.
 pub fn publish(key: Key, pa: usize, generation: Option<u64>) -> Fill {
     let r = with_table(|t| {
@@ -156,9 +157,10 @@ pub fn publish(key: Key, pa: usize, generation: Option<u64>) -> Fill {
     r
 }
 
-/// A mapping of `pa` as page `key` just went away (or never landed): drop the
-/// entry if nothing maps the frame any more, releasing the table's reference.
-/// The caller must have written back anything the file should keep first. A
+/// A mapping of `pa` as page `key` just went away (or never landed).
+///
+/// Drops the entry if nothing maps the frame any more, releasing the table's
+/// reference. The caller must have written back anything the file should keep first. A
 /// stale or premature call changes nothing.
 pub fn reap(key: Key, pa: usize) {
     if with_table(|t| t.reap(key, pa, &PmmRefs)) {
@@ -167,7 +169,9 @@ pub fn reap(key: Key, pa: usize) {
     }
 }
 
-/// Drop every entry nobody maps any more, freeing its frame. This kernel's
+/// Drop every entry nobody maps any more, freeing its frame.
+///
+/// A tokio kernel's
 /// teardown frees an address space from its page table alone, after the
 /// records naming each page's key are gone, so it sweeps rather than reaping
 /// page by page (`release_pages`, `free_user_root`). Every path that drops a

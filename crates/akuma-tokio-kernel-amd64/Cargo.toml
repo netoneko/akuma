@@ -24,7 +24,7 @@ shell = ["akuma-runtime-tokio/shell"]
 # COM1.
 console = ["dep:akuma-comconsole"]
 # ext2 on the first virtio-blk device as the root filesystem.
-disk = ["dep:akuma-ext2"]
+disk = ["dep:akuma-ext2", "akuma-tokio-kernel-core/disk"]
 # The first virtio-net device with DHCP; without it the socket layer is loopback-only.
 net = []
 # Application processors from the command line's `smp=N`.
@@ -156,5 +156,5 @@ akuma-syscalls-glue-amd64 = { path = "../akuma-syscalls-glue-amd64" }
 # The tokio surface: the allow-list, the hooks and the dispatch to glue (Phase 3).
 akuma-runtime-tokio = { path = "../akuma-runtime-tokio", features = ["process"] }
 # The arch-neutral half (B21): command-line tokens, the init program, identity, nosys, rings.
-akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core" }
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["shmpages"] }
 akuma-user-access = { path = "../akuma-user-access" }
