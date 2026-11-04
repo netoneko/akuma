@@ -43,7 +43,7 @@ mod exec_twin;
 mod lazy;
 mod net;
 #[cfg(feature = "trace-err")]
-mod ring;
+use akuma_tokio_kernel_core::ring;
 mod sched;
 mod shmpages;
 mod smp;
@@ -117,10 +117,7 @@ fn cmdline_token<'a>(start_info_pa: u64, prefix: &str, buf: &'a mut [u8]) -> Opt
     let mut scratch = [0u8; 512];
     let si = akuma_ryzen_amd64::StartInfo::parse(&Physmap, start_info_pa)?;
     let line = si.cmdline(&Physmap, &mut scratch)?;
-    let value = line.split_ascii_whitespace().find_map(|t| t.strip_prefix(prefix))?;
-    let n = value.len().min(buf.len());
-    buf[..n].copy_from_slice(&value.as_bytes()[..n]);
-    core::str::from_utf8(&buf[..n]).ok()
+    akuma_tokio_kernel_core::cmdline::token_into(line, prefix, buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -998,21 +995,7 @@ fn mount_root(fs: alloc::sync::Arc<dyn Filesystem>) {
 // its own: the last thing on the console before the machine would hand over.
 // ---------------------------------------------------------------------------
 
-/// Who the kernel is: its name on the console, its node name and release in `uname`, its
-/// banner. Set once at the top of the boot from the [`Kernel`] the root built.
-#[derive(Clone, Copy)]
-struct Identity {
-    name: &'static str,
-    nodename: &'static str,
-    version: &'static str,
-    art: &'static str,
-}
-
-static IDENTITY: akuma_primitives::OnceCopy<Identity> = akuma_primitives::OnceCopy::new();
-
-fn identity() -> Identity {
-    IDENTITY.get().unwrap_or(Identity { name: "akuma", nodename: "akuma", version: "0", art: "" })
-}
+use akuma_tokio_kernel_core::{Identity, identity};
 
 fn banner() {
     let id = identity();
@@ -1590,22 +1573,7 @@ pub(crate) fn read_image(path: &str) -> Result<Vec<u8>, akuma_vfs::FsError> {
 // Stage 8 session Q: eventfd(2) — libcurl's multi-stack wakeup fd.
 // ---------------------------------------------------------------------------
 
-/// One bit per syscall number below 512 already named by `nosys_note`.
-static NOSYS_SEEN: [core::sync::atomic::AtomicU64; 8] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
-
-/// Name an unserved syscall number on the console, once per number.
-fn nosys_note(nr: u64) {
-    use core::sync::atomic::Ordering::Relaxed;
-    if nr >= 512 {
-        akuma_primitives::safe_print!(64, "[nosys] nr={}\n", nr);
-        return;
-    }
-    let bit = 1u64 << (nr & 63);
-    if NOSYS_SEEN[(nr >> 6) as usize].fetch_or(bit, Relaxed) & bit == 0 {
-        akuma_primitives::safe_print!(64, "[nosys] nr={}\n", nr);
-    }
-}
+use akuma_tokio_kernel_core::nosys::note as nosys_note;
 
 /// The syscall landing: every ring 3 -> kernel entry holds the big kernel lock
 /// until the matching return to ring 3 (nesting if this core already owns it).
@@ -2301,86 +2269,14 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
 // Init: the one boot program.
 // ---------------------------------------------------------------------------
 
-/// argv entries beyond `argv[0]`, and each one's byte budget. The command
-/// line is 512 bytes total.
-const MAX_ARGV: usize = 16;
-const ARG_LEN: usize = 96;
-/// Environment entries (`initenv=`, comma-separated `KEY=value`, no comma or
-/// space in a value).
-const MAX_ENV: usize = 8;
-
-/// The init program from the command line (`init=`, `initargs=`, `initenv=`).
-/// Fixed slots, no heap: parsed before ring 3 exists, read again when init exits.
-#[derive(Clone, Copy)]
-struct Prog {
-    path: [u8; ARG_LEN],
-    args: [[u8; ARG_LEN]; MAX_ARGV],
-    n_args: usize,
-    env: [[u8; ARG_LEN]; MAX_ENV],
-    n_env: usize,
-}
-
-impl Prog {
-    const fn new() -> Self {
-        Self { path: [0; ARG_LEN], args: [[0; ARG_LEN]; MAX_ARGV], n_args: 0, env: [[0; ARG_LEN]; MAX_ENV], n_env: 0 }
-    }
-
-    /// One environment entry.
-    fn env_str(&self, i: usize) -> &str {
-        str_until_nul(&self.env[i])
-    }
-
-    /// argv[0], as the string it was stored as.
-    fn path_str(&self) -> &str {
-        str_until_nul(&self.path)
-    }
-
-    /// One argv entry beyond `argv[0]`.
-    fn arg_str(&self, i: usize) -> &str {
-        str_until_nul(&self.args[i])
-    }
-}
-
-/// The `&str` a NUL-padded slot holds ("" when unset).
-fn str_until_nul(buf: &[u8]) -> &str {
-    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    core::str::from_utf8(&buf[..end]).unwrap_or("")
-}
+use akuma_tokio_kernel_core::init::{MAX_ARGV, MAX_ENV, Prog};
 
 static INIT: akuma_primitives::cell::BorrowCell<Prog> = akuma_primitives::cell::BorrowCell::new(Prog::new());
 
-/// Fill [`INIT`] from the boot command line. `initargs`/`initenv` are
-/// comma-separated (`initargs=sh,/etc/guest.sh`). A sequence of programs is a
-/// shell script run as init: init is a real process, it can fork.
+/// Fill [`INIT`] from the boot command line. A sequence of programs is a shell script run as
+/// init: init is a real process, it can fork.
 fn parse_init(cmdline: &str) {
-    INIT.with_mut(|p| {
-        for token in cmdline.split_ascii_whitespace() {
-            if let Some(v) = token.strip_prefix("init=") {
-                store_slot(&mut p.path, v);
-            } else if let Some(v) = token.strip_prefix("initargs=") {
-                for a in v.split(',') {
-                    if p.n_args < MAX_ARGV {
-                        store_slot(&mut p.args[p.n_args], a);
-                        p.n_args += 1;
-                    }
-                }
-            } else if let Some(v) = token.strip_prefix("initenv=") {
-                for a in v.split(',') {
-                    if p.n_env < MAX_ENV {
-                        store_slot(&mut p.env[p.n_env], a);
-                        p.n_env += 1;
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn store_slot(dst: &mut [u8], s: &str) {
-    let b = s.as_bytes();
-    let n = b.len().min(dst.len() - 1);
-    dst[..n].copy_from_slice(&b[..n]);
-    dst[n] = 0;
+    INIT.with_mut(|p| p.parse(cmdline));
 }
 
 /// Load init and start it on its pool thread. Never returns.
@@ -2908,18 +2804,18 @@ fn spawn(p: &Prog, image: &[u8]) -> ! {
     }
     let (argv, n_args, envv, n_env) = {
         let mut a: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
-        for k in 0..p.n_args {
+        for k in 0..p.n_args() {
             a[k + 1] = p.arg_str(k);
         }
-        let n = p.n_args;
+        let n = p.n_args();
         let mut owned: [&str; MAX_ARGV + 1] = [path; MAX_ARGV + 1];
         owned[1..=n].copy_from_slice(&a[1..=n]);
         let mut env: [&str; MAX_ENV] = [""; MAX_ENV];
         #[allow(clippy::needless_range_loop)] // `k` also indexes `p`
-        for k in 0..p.n_env {
+        for k in 0..p.n_env() {
             env[k] = p.env_str(k);
         }
-        (owned, n, env, p.n_env)
+        (owned, n, env, p.n_env())
     };
     let Some(ti) = load_task(&argv[..=n_args], &envv[..n_env], image, path) else {
         akuma_primitives::safe_print!(160, "  init: task load failed\n");
@@ -3053,7 +2949,7 @@ fn boot(k: &Kernel) -> ! {
     if k.console {
         console::init();
     }
-    IDENTITY.set(k.identity);
+    akuma_tokio_kernel_core::set_identity(k.identity);
 
     console::puts("\n");
     console::puts(k.identity.name);

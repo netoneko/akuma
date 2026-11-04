@@ -972,6 +972,7 @@ dependencies = [
  "akuma-syscalls-mem",
  "akuma-syscalls-proc",
  "akuma-threading",
+ "akuma-tokio-kernel-core",
  "akuma-trap-amd64",
  "akuma-tty",
  "akuma-user-access",
@@ -982,6 +983,13 @@ dependencies = [
  "akuma-vfs-glue",
  "akuma-virtio",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-tokio-kernel-core"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
 ]
 
 [[package]]

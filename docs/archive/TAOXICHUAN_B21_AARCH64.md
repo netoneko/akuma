@@ -79,9 +79,18 @@ frame builder and restorer, the user-register capture, `enter_user`, the clock a
 
 | step | commit | what | gates |
 |---|---|---|---|
-| A0 | (this row) | Census above; the proposal's A4 revised | - |
-| A1 | (this commit) | **`akuma-runtime-tokio` is arch-neutral.** `serve(call: Syscall, args)` and `serve_shared(nr, args)` replace `dispatch(nr, args)`; the x86 front (decode by x86_64 number, then `akuma-syscalls-glue-amd64` for the fd family) is `tokio_surface` in the amd64 half, and the crate no longer depends on the x86 ABI layer. Same routing order as before. A host test pins that every allow-listed call round-trips through its asm-generic number too | host tests 7/7; battery 10/10; probes `smp=1` 3/3, `smp=4` 2/3 (the HEAD flake, also 2/3 on HEAD) |
-| cloc | (this commit) | **`--audit` reports per-arch tracks.** `taoxichuan` is now the track pair `taoxichuan-amd64` + `taoxichuan-aarch64`; a track that does not build is reported as "no track yet" instead of failing the run, and when both build, a table gives each track's arch-only lines, the shared lines and the union, per origin | `--self-test` PASS; `track_split` checked against a hand-built case; amd64 still 78,823 |
+| A0 | `17b13896` | Census above; the proposal's A4 revised | - |
+| A1 | `17b13896` | **`akuma-runtime-tokio` is arch-neutral.** `serve(call: Syscall, args)` and `serve_shared(nr, args)` replace `dispatch(nr, args)`; the x86 front (decode by x86_64 number, then `akuma-syscalls-glue-amd64` for the fd family) is `tokio_surface` in the amd64 half, and the crate no longer depends on the x86 ABI layer. Same routing order as before. A host test pins that every allow-listed call round-trips through its asm-generic number too | host tests 7/7; battery 10/10; probes `smp=1` 3/3, `smp=4` 2/3 (the HEAD flake, also 2/3 on HEAD) |
+| cloc | `17b13896` | **`--audit` reports per-arch tracks.** `taoxichuan` is now the track pair `taoxichuan-amd64` + `taoxichuan-aarch64`; a track that does not build is reported as "no track yet" instead of failing the run, and when both build, a table gives each track's arch-only lines, the shared lines and the union, per origin | `--self-test` PASS; `track_split` checked against a hand-built case; amd64 still 78,823 |
+| A2.1 | (this commit) | **`akuma-tokio-kernel-core` exists.** The first pieces that never touched the machine moved in from the amd64 half: the command line's `token=` words (`cmdline::token`; the half still finds the line in PVH start info), the init program (`init::Prog::parse`, with `store_slot`/`str_until_nul`), `Identity` and its once-cell, the unserved-syscall note (`nosys`), and the evidence `ring`. `no_std`, `forbid(unsafe_code)`, in `default-members`, 5 host tests (none of these pieces had one before). No behaviour change | host tests 5/5; battery 10/10; probes `smp=1` PASS (`smp=4` still running at commit) |
+
+### Rig note
+
+`tcg_rig.py battery` runs against a guest that is already up; it does not boot one. The first A2.1 battery ran
+without a `boot fresh` before it and failed every line with `rc=255 got=''`, though the guest's console shows each
+command executing with exit status 0. The saved HEAD kernel failed the same way in the same state. After
+`boot fresh`, a hand-run `ssh` returned normally and the battery passed 10/10. Why the client returned 255 was not
+pinned down. Boot fresh before every battery.
 
 ## Background
 

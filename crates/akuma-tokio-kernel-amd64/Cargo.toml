@@ -155,4 +155,6 @@ akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = fals
 akuma-syscalls-glue-amd64 = { path = "../akuma-syscalls-glue-amd64" }
 # The tokio surface: the allow-list, the hooks and the dispatch to glue (Phase 3).
 akuma-runtime-tokio = { path = "../akuma-runtime-tokio", features = ["process"] }
+# The arch-neutral half (B21): command-line tokens, the init program, identity, nosys, rings.
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core" }
 akuma-user-access = { path = "../akuma-user-access" }

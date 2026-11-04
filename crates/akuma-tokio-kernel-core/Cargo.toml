@@ -1,0 +1,11 @@
+[package]
+name = "akuma-tokio-kernel-core"
+version = "0.1.0"
+edition = "2024"
+description = "The arch-neutral half of akuma-tokio-kernel: what a tokio kernel decides without naming its machine (the boot command line's tokens, the init program, the kernel's identity, the unserved-syscall note, the evidence rings). Each architecture's machine half builds on it (B21)."
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
