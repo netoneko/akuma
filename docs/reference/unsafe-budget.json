@@ -105,7 +105,7 @@
     "crates/akuma-mmu": 20,
     "crates/akuma-net-nic": 13,
     "crates/akuma-not-even-once": 5,
-    "crates/akuma-pagetable": 5,
+    "crates/akuma-pagetable": 6,
     "crates/akuma-pmm": 3,
     "crates/akuma-port": 4,
     "crates/akuma-primitives": 10,

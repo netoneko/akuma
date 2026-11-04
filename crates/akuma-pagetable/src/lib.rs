@@ -18,7 +18,7 @@
 //! # The one stated contract
 //!
 //! > An address handed to [`Table::at`], or reached by following a present entry
-//! > from a root handed to a walker in [`amd64`], is a 4 KiB, 4 KiB-aligned
+//! > from a root handed to a walker in [`amd64`] or [`aarch64`], is a 4 KiB, 4 KiB-aligned
 //! > frame that is a live page table (or a zeroed frame about to become one), is
 //! > mapped in the kernel's physmap, and is not freed or repurposed while a
 //! > reference derived from it is alive.
@@ -41,6 +41,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+pub mod aarch64;
 pub mod amd64;
 
 /// Entries in a 4 KiB table: 4096 / 8.
