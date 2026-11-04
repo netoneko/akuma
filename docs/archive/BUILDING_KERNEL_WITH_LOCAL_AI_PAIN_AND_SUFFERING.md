@@ -361,3 +361,23 @@ Akuma's disk now holds `/root/demo/{bins,inf,scripts}`; the Infinity paths were 
 check, correctly: it would expose the user's ollama, unauthenticated, to the LAN and had not been approved by name. Order of
 preference: a reverse ssh tunnel (loopback on Akuma only, needs Akuma's sshd to support remote forwarding, untested), then the
 user's explicit approval of a short-lived forwarder, then trashcan's Qwen3-8B.
+
+## Update 7 (2026-11-05): all four pairs pass on Linux; Akuma is blocked on two decisions (Claude)
+
+**Linux, valid development trials (`--keep-build`, n = 1):** goose x qwen3:4b 319 s, goose x gemma4:e4b 318 s, infinity x qwen3:4b 562 s,
+infinity x gemma4:e4b 253 s. In each the model ran every step itself and the harness confirmed the VM and the ssh line.
+
+**On Akuma (ryzen booted with `arm.sh 29`; `0.0.8 fca1f9ed`):** the staged files are in place (`/root/demo/{bins,inf,scripts}`) and
+`install.sh check --vmm akuma ...` passes. Findings:
+1. **Akuma's ssh client does not read OpenSSH keys.** `-i` takes "Akuma's raw 32-byte format", takes no `-o` flags, and there is no
+   `ssh-keygen` on the box. The Akuma backend now makes its own 32 random bytes and derives the authorized_keys line with an embedded
+   RFC 8032 routine (checked against the RFC's test vector `9d61b19d... -> d75a9801...`); python3 is the one extra tool. The user's
+   own `/root/.ssh/id_ed25519` is never read.
+2. **Akuma's sshd refuses remote port forwarding** (`remote port forwarding failed for listen port`), so the loopback-only reverse tunnel
+   used for Pop cannot give Akuma a model endpoint.
+3. **kvm0 is exclusive and `vm-dev` holds it.** The script refuses to touch another VM; stopping `vm-dev` (the user's Taoxichuan dev guest)
+   was refused by the permission check because it had not been approved by name.
+
+**Needed from the user:** (a) permission to stop `vm-dev` for the test and restart it after; (b) a model endpoint for Akuma: approve a
+short-lived forwarder that puts the Mac's ollama on its LAN address (unauthenticated while up), or accept trashcan's Qwen3-8B
+(slow, no Gemma).

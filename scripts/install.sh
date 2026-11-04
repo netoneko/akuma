@@ -178,7 +178,8 @@ if [ "$CMD" = check ]; then
 	[ -n "$KERNEL_OVERRIDE" ] && [ -n "$SSHD_OVERRIDE" ] || need cargo    "rustup: curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly"
 	need mke2fs   "e2fsprogs: apt install e2fsprogs / apk add e2fsprogs / brew install e2fsprogs"
 	need ssh      "openssh: apt install openssh-client / apk add openssh-client / brew install openssh-client"
-	[ -n "$KEY_PUB" ] || need ssh-keygen "openssh (ssh-keygen): as ssh; or rerun with --key /path/to/key.pub"
+	[ -n "$KEY_PUB" ] || [ "$VMM" = akuma ] || need ssh-keygen "openssh (ssh-keygen): as ssh; or rerun with --key /path/to/key.pub"
+	[ "$VMM" != akuma ] || need python3 "python3: --vmm akuma derives its public key with it"
 	if [ "$VMM" = qemu ]; then
 		need qemu-system-x86_64 "qemu: apt install qemu-system-x86 / apk add qemu-system-x86_64 / brew install qemu"
 	elif [ "$VMM" = akuma ]; then
@@ -418,7 +419,77 @@ else
 fi
 
 # stage key ----------------------------------------------------------------
-if [ -n "$KEY_PUB" ]; then
+if [ "$VMM" = akuma ] && [ -z "$KEY_PUB" ]; then
+	# Akuma's own ssh client reads "Akuma's raw 32-byte" Ed25519 identity files, not OpenSSH keys, and there is no ssh-keygen on
+	# Akuma. So the key is 32 random bytes and the public half is derived with a small RFC 8032 routine (checked against the RFC's
+	# test vector). python3 is the one extra tool this backend needs; only the PUBLIC line is ever printed.
+	if stamped key && [ -f "$STATE/key" ] && [ -f "$STATE/key.pub" ]; then
+		note "key: already done"
+	elif [ "$DRY_RUN" = 1 ]; then
+		run sh -c "dd if=/dev/urandom of='$STATE/key' bs=32 count=1 && python3 ed25519_pub.py '$STATE/key' > '$STATE/key.pub'"
+		note "key: $STATE/key (raw 32 bytes) + key.pub"
+	else
+		command -v python3 >/dev/null 2>&1 || fatal 10 key "python3 missing: --vmm akuma derives its public key with it (or pass --key /path/to/key.pub and use your own identity)"
+		cat >"$STATE/ed25519_pub.py" <<'ED25519_PUB_PY'
+# Derive the OpenSSH authorized_keys line for an Ed25519 seed (RFC 8032, section 5.1.5). Prints only the PUBLIC line.
+import base64, hashlib, struct, sys
+p = 2**255 - 19
+d = -121665 * pow(121666, p - 2, p) % p
+
+def add(P, Q):
+    A = (P[1] - P[0]) * (Q[1] - Q[0]) % p
+    B = (P[1] + P[0]) * (Q[1] + Q[0]) % p
+    C = 2 * P[3] * Q[3] * d % p
+    D = 2 * P[2] * Q[2] % p
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % p, G * H % p, F * G % p, E * H % p)
+
+def mul(s, P):
+    Q = (0, 1, 1, 0)
+    while s > 0:
+        if s & 1:
+            Q = add(Q, P)
+        P = add(P, P)
+        s >>= 1
+    return Q
+
+def recover_x(y):
+    x2 = (y * y - 1) * pow(d * y * y + 1, p - 2, p) % p
+    x = pow(x2, (p + 3) // 8, p)
+    if (x * x - x2) % p != 0:
+        x = x * pow(2, (p - 1) // 4, p) % p
+    if x & 1:
+        x = p - x
+    return x
+
+gy = 4 * pow(5, p - 2, p) % p
+gx = recover_x(gy)
+G = (gx, gy, 1, gx * gy % p)
+
+def public(seed):
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    P = mul(a, G)
+    zi = pow(P[2], p - 2, p)
+    x, y = P[0] * zi % p, P[1] * zi % p
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+seed = open(sys.argv[1], "rb").read()
+if len(seed) != 32:
+    sys.exit("seed must be exactly 32 bytes")
+pub = public(seed)
+blob = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + pub
+print("ssh-ed25519 " + base64.b64encode(blob).decode() + " akuma-install")
+ED25519_PUB_PY
+		dd if=/dev/urandom of="$STATE/key" bs=32 count=1 >"$LOGS/key.log" 2>&1 || fatal 10 key "could not read 32 random bytes"
+		chmod 600 "$STATE/key" 2>/dev/null || :
+		python3 "$STATE/ed25519_pub.py" "$STATE/key" >"$STATE/key.pub" 2>>"$LOGS/key.log" </dev/null || fatal 10 key "could not derive the public key (see $LOGS/key.log)"
+		stamp key
+		note "key: $STATE/key (raw 32 bytes) + key.pub"
+	fi
+elif [ -n "$KEY_PUB" ]; then
 	[ -f "$KEY_PUB" ] || fatal 10 key "--key $KEY_PUB is not a file"
 	if [ "$DRY_RUN" = 1 ]; then
 		run sh -c "cp '$KEY_PUB' '$STATE/key.pub'"
