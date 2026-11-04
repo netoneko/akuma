@@ -19,18 +19,33 @@ akuma-pmm = { path = "../akuma-pmm" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-psci = { path = "../akuma-psci" }
 akuma-timer = { path = "../akuma-timer" }
-akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core" }
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["shmpages"] }
 akuma-uart = { path = "../akuma-uart", optional = true }
 akuma-vectors-aarch64 = { path = "../akuma-vectors-aarch64" }
 fdt = "0.1"
+# virtio-mmio block: the root disk's transport and driver, polled.
+akuma-virtio = { path = "../akuma-virtio" }
+# ext2 on it, mounted at `/` in the shared mount table (`akuma-vfs-glue`).
+akuma-ext2 = { path = "../akuma-ext2", optional = true }
+akuma-vfs = { path = "../akuma-vfs" }
+akuma-vfs-glue = { path = "../akuma-vfs-glue" }
+akuma-fpcache = { path = "../akuma-fpcache" }
+# The tokio surface over glue (the amd64 half's feature set, so the two build glue alike).
+akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, features = ["smoltcp", "sc-epoll", "sc-eventfd"] }
+akuma-runtime-tokio = { path = "../akuma-runtime-tokio", features = ["process"] }
+# The hooked cooperative scheduler (B21 A4), not the full kernel's SGI one.
+akuma-threading = { path = "../akuma-threading", features = ["hooked"] }
+akuma-exec = { path = "../akuma-exec" }
+akuma-net = { path = "../akuma-net" }
+akuma-user-access = { path = "../akuma-user-access" }
 
 [features]
 # The same switches as the amd64 half, so one main.rs builds for both. Only
 # `console` does anything yet; the rest arrive with B21 A5.3 onward.
 console = ["dep:akuma-uart"]
-disk = []
+disk = ["dep:akuma-ext2", "akuma-tokio-kernel-core/disk"]
 net = []
 smp = []
 shell = []
-no-tests = []
+no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
 trace-err = []

@@ -26,6 +26,8 @@
 
 extern crate alloc;
 
+mod exec;
+mod fs;
 mod machine;
 mod trap;
 
@@ -48,6 +50,8 @@ pub struct Kernel {
     identity: Identity,
     #[cfg(feature = "console")]
     console: bool,
+    #[cfg(feature = "disk")]
+    disk: bool,
 }
 
 impl Kernel {
@@ -59,6 +63,8 @@ impl Kernel {
             identity: Identity { name, nodename: name, version, art: "" },
             #[cfg(feature = "console")]
             console: false,
+            #[cfg(feature = "disk")]
+            disk: false,
         }
     }
 
@@ -80,10 +86,10 @@ impl Kernel {
         Self { console: true, ..self }
     }
 
-    /// ext2 on the first virtio-blk device (not wired on aarch64 yet).
+    /// ext2 on the first virtio-blk device, mounted at `/`.
     #[cfg(feature = "disk")]
     pub const fn disk(self) -> Self {
-        self
+        Self { disk: true, ..self }
     }
 
     /// The first virtio-net device (not wired on aarch64 yet).
@@ -174,9 +180,38 @@ fn boot(k: &Kernel) -> ! {
     );
     safe_print!(160, "  cmdline: {}\n", m.cmdline.as_str());
 
+    // The process runtime and the tokio surface, then the root.
+    exec::init();
+    fs::install_surface();
+    #[cfg(feature = "disk")]
+    let root = if k.disk && m.virtio.is_some() { fs::disk_root() } else { None };
+    #[cfg(not(feature = "disk"))]
+    let root: Option<alloc::sync::Arc<dyn akuma_vfs::Filesystem>> = None;
+    let Some(root) = root else {
+        safe_print!(96, "  [FATAL] no root filesystem\n");
+        power_off();
+    };
+    if !fs::mount_root(root) {
+        power_off();
+    }
+    // Evidence the mount table resolves: what `/` holds, and the init image.
+    if let Ok(entries) = akuma_vfs_glue::list_dir("/") {
+        safe_print!(32, "  /:");
+        for e in entries.iter().take(24) {
+            safe_print!(80, " {}", e.name.as_str());
+        }
+        safe_print!(4, "\n");
+    }
+    let init = akuma_tokio_kernel_core::cmdline::token(m.cmdline.as_str(), "init=").unwrap_or("/bin/init");
+    if akuma_vfs_glue::exists(init) {
+        safe_print!(160, "  init: {} is on the root\n", init);
+    } else {
+        safe_print!(160, "  init: {} not found on the root\n", init);
+    }
+
     akuma_primitives::console::print_str(id.art);
     safe_print!(96, "\n  {} {} (akuma-tokio-kernel, aarch64)\n\n", id.name, id.version);
-    safe_print!(160, "[{}] no root filesystem, EL0 or init on aarch64 yet (B21 A5.4+): powering off\n", id.name);
+    safe_print!(160, "[{}] no EL0 or init on aarch64 yet (B21 A5.5+): powering off\n", id.name);
     power_off()
 }
 
