@@ -1,14 +1,14 @@
 //! The memory syscall arms a tokio kernel serves itself: `mprotect`, `munmap`,
 //! `msync`, `madvise`, and the release and write-back paths under them.
 //!
-//! Arch-neutral: the page table, the TLB, the copy-on-write break and the W^X
-//! record are the machine's ([`Mm`]); the task's layout is `akuma-user-layout`'s
+//! Arch-neutral: the page table and the TLB are the machine's ([`Mm`]), the
+//! copy-on-write break and the W^X record [`cow`]'s; the task's layout is `akuma-user-layout`'s
 //! (through [`Mm::with_task`]); the decisions shared with the other kernels are
 //! `akuma-syscalls-mem`'s.
 
 use akuma_syscalls_linux::flags::prot::{PROT_EXEC, PROT_WRITE};
 
-use crate::{lazy, shmpages};
+use crate::{cow, lazy, shmpages};
 use crate::task::{MMAP_BASE, Task, USER_TOP};
 
 const EINVAL: u64 = 22;
@@ -35,15 +35,6 @@ pub trait Mm: lazy::Kernel {
     fn frame_of(pte: u64) -> Option<u64>;
     /// Every core has dropped its translations of what this core just changed.
     fn shootdown();
-    /// Has user code written the page at `va` (the W^X record)?
-    fn page_written(root: u64, va: u64) -> bool;
-    /// Record that the page at `va` was written (kept across a remap).
-    fn mark_written(root: u64, va: u64);
-    /// Give this space a private copy of the page at `va` if it shares it.
-    /// `false` when no frame could be had.
-    fn cow_privatize(root: u64, va: u64) -> bool;
-    /// Is W^X enforced (`wx=0` turns it off)?
-    fn wx_enforced() -> bool;
     /// The mmap-slab bisect mask (`mmdbg=N`).
     fn mmdbg() -> u32;
     /// Record a slab event for the fault reports (`trace-err`).
@@ -79,8 +70,8 @@ pub fn mprotect_arm<M: Mm>(addr: u64, len: u64, prot: u64) -> u64 {
     let (write, exec) = (prot & u64::from(PROT_WRITE) != 0, prot & u64::from(PROT_EXEC) != 0);
     let root = M::task_root();
     // W^X: decided for the whole range before any page changes, so a refusal leaves it as it was.
-    if M::wx_enforced()
-        && let Some(no) = akuma_syscalls_mem::wx::check_range(prot, |i| M::page_written(root, addr + i * 4096), pages).errno()
+    if cow::wx_on()
+        && let Some(no) = akuma_syscalls_mem::wx::check_range(prot, |i| cow::page_written::<M>(root, addr + i * 4096), pages).errno()
     {
         return e(no);
     }
@@ -90,9 +81,9 @@ pub fn mprotect_arm<M: Mm>(addr: u64, len: u64, prot: u64) -> u64 {
             continue;
         }
         // The remap below builds a fresh PTE; carry "written" across it or the policy forgets.
-        let was_written = M::page_written(root, va as u64);
+        let was_written = cow::page_written::<M>(root, va as u64);
         // A shared mapping's frame is meant to be in every holder.
-        if write && !M::with_task(|t| t.layout.in_shared(va as u64)) && !M::cow_privatize(root, va as u64) {
+        if write && !M::with_task(|t| t.layout.in_shared(va as u64)) && !cow::privatize::<M>(root, va as u64) {
             return e(ENOMEM);
         }
         let Some(pa) = M::translate(root, va as u64) else {
@@ -103,7 +94,7 @@ pub fn mprotect_arm<M: Mm>(addr: u64, len: u64, prot: u64) -> u64 {
             return e(ENOMEM);
         }
         if was_written {
-            M::mark_written(root, va as u64);
+            cow::mark_written::<M>(root, va as u64);
         }
     }
     // A tightened protection must reach peers' TLBs before the call returns.

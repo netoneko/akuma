@@ -12,6 +12,8 @@
 extern crate alloc;
 
 pub mod cmdline;
+#[cfg(feature = "lazy")]
+pub mod cow;
 pub mod init;
 #[cfg(feature = "lazy")]
 pub mod lazy;

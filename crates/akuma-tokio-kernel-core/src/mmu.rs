@@ -44,6 +44,21 @@ pub trait UserPages: 'static {
     fn map_user(root: u64, va: u64, pa: u64, write: bool, exec: bool) -> bool;
     /// Drop this core's translation for `va` in the current address space.
     fn invalidate(va: u64);
+    /// May user code write through the valid entry `pte`?
+    fn writable(pte: u64) -> bool;
+    /// Is `pte` marked as a copy-on-write share (read-only because a fork shared
+    /// it, not because the mapping is)?
+    fn cow_marked(pte: u64) -> bool;
+    /// Has the page been written since it was mapped (the W^X record)?
+    fn written(pte: u64) -> bool;
+    /// `pte`, recorded as written.
+    fn with_written(pte: u64) -> u64;
+    /// `pte`, writable and unmarked: this space takes the frame in place.
+    fn take(pte: u64) -> u64;
+    /// `pte`'s attributes on frame `pa`, writable and unmarked: the private copy.
+    fn take_at(pte: u64, pa: u64) -> u64;
+    /// `pte`, read-only and marked: a share the next write must break.
+    fn share_marked(pte: u64) -> u64;
     /// The lazy record a valid leaf `pte` would become if dropped and refaulted
     /// as zeros: same permissions, no file (`MADV_DONTNEED`). Reading
     /// permissions from a valid entry is the machine's encoding.

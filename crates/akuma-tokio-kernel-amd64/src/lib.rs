@@ -257,46 +257,26 @@ fn grow_user_stack(cr2: u64) -> bool {
 // Copy-on-write fork: shared leaf frames, the bit-9 marker, one break path.
 // ---------------------------------------------------------------------------
 
-/// x86 leaf PTE bits. Bit 9 is an AVL bit the MMU ignores: a page that was
-/// writable when `fork` shared it is demoted to read-only and marked, so a
-/// write fault can tell "break the share" from "this page is read-only"
-/// (`mprotect(PROT_READ)`, text) — `akuma_cow::CowFault::marked`.
-use akuma_pte_amd64::{ADDR_MASK as PTE_ADDR, COW as PTE_COW, D as PTE_D, RW as PTE_W};
+// x86 leaf PTE bits. Bit 9 is an AVL bit the MMU ignores: a page that was writable when
+// `fork` shared it is demoted to read-only and marked, so a write fault can tell "break the
+// share" from "this page is read-only" (`mprotect(PROT_READ)`, text) - `lazy::Amd64::cow_marked`.
+use akuma_pte_amd64::ADDR_MASK as PTE_ADDR;
 
-/// W^X (`akuma_syscalls_mem::wx`): no page is writable and executable, and a page written since it was
-/// mapped cannot be made executable. On by default; `wx=0` on the kernel command line turns it off for a
-/// guest that needs a JIT. Stricter than Linux on purpose.
-static WX_ENFORCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+// W^X and the copy-on-write break are `akuma_tokio_kernel_core::cow`'s, over `lazy::Amd64`'s bits.
+use akuma_tokio_kernel_core::cow;
+
 fn wx_on() -> bool {
-    WX_ENFORCE.load(core::sync::atomic::Ordering::Relaxed)
+    cow::wx_on()
 }
 
-/// Has the page at `va` in `root` been written since it was mapped (user store or kernel store)?
-fn page_written(root: u64, va: u64) -> bool {
-    leaf_entry(root, va & !0xFFF).is_some_and(|pte| pte.read() & PTE_D != 0)
-}
-
-/// Record that the kernel stored into the user page at `va` - the CPU sets the dirty bit for a user store,
-/// nothing sets it for ours.
 fn mark_written(root: u64, va: u64) {
-    if let Some(pte) = leaf_entry(root, va & !0xFFF) {
-        let v = pte.read();
-        if v & 1 != 0 && v & PTE_D == 0 {
-            pte.write(v | PTE_D);
-        }
-    }
+    cow::mark_written::<lazy::Amd64>(root, va);
 }
-
-static COW_SHARED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static COW_COPY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static COW_TAKE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static COW_RETRY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// `(shared, copied, taken-in-place, retried)` since boot, for the reap lines.
 #[cfg_attr(not(feature = "trace-err"), allow(dead_code))]
 pub(crate) fn cow_stats() -> (usize, usize, usize, usize) {
-    use core::sync::atomic::Ordering::Relaxed;
-    (COW_SHARED.load(Relaxed), COW_COPY.load(Relaxed), COW_TAKE.load(Relaxed), COW_RETRY.load(Relaxed))
+    cow::stats()
 }
 
 /// The 4 KiB leaf entry for `va` in `root`'s user half, if every level is
@@ -330,111 +310,14 @@ impl Pte {
     fn write(&self, v: u64) {
         self.table.set_entry(self.idx, v);
     }
-
-    /// The frame this entry maps, if it is present.
-    fn frame(&self) -> Option<phys::Frame> {
-        let v = self.read();
-        // SAFETY: a present leaf of a user page table (`leaf_entry` walked to it) names a user frame the PMM
-        // handed out.
-        (v & 1 != 0).then(|| unsafe { phys::Frame::from_pa(v & PTE_ADDR) })
-    }
 }
 
-/// THE copy-on-write break: re-read the live PTE for `va` in `root`, ask
-/// `akuma_cow::decide`, and carry the answer out. The write-fault arm and the
-/// kernel's own user-memory writers both come through here — one break path.
-/// Single core, `IF` clear (a trap or a syscall): nothing races the walk.
-/// `invlpg` after every PTE write is the whole shootdown.
 fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
-    use akuma_cow::CowAction;
-    use core::sync::atomic::Ordering::Relaxed;
-    let va = va & !0xFFF;
-    let Some(slot) = leaf_entry(root, va) else {
-        return CowAction::Fault;
-    };
-    let pte = slot.read();
-    if pte & 1 == 0 {
-        return CowAction::Fault;
-    }
-    let old = pte & PTE_ADDR;
-    let action = akuma_cow::CowFault {
-        pte_writable: pte & PTE_W != 0,
-        marked: pte & PTE_COW != 0,
-        refs: share_count(pte),
-    }
-    .decide();
-    match action {
-        CowAction::Retry => {
-            COW_RETRY.fetch_add(1, Relaxed);
-            akuma_cpu::tlb::invlpg(va as usize);
-        }
-        CowAction::Fault => {}
-        CowAction::TakeInPlace => {
-            slot.write((pte | PTE_W) & !PTE_COW);
-            akuma_cpu::tlb::invlpg(va as usize);
-            COW_TAKE.fetch_add(1, Relaxed);
-        }
-        CowAction::Copy => {
-            let (Some(new), Some(src)) = (phys::Frame::alloc_zeroed(), slot.frame()) else {
-                // Out of frames: the caller's kill path reports it.
-                return CowAction::Fault;
-            };
-            new.copy_page_from(src);
-            slot.write(((pte & !PTE_ADDR) | PTE_W | new.pa()) & !PTE_COW);
-            akuma_cpu::tlb::invlpg(va as usize);
-            // A peer running a thread of this space may still map the old
-            // frame: tell it before the old frame's count drops.
-            smp::shootdown();
-            // Drops this space's count on the old frame (frees it only if it
-            // was somehow the last holder).
-            akuma_pmm::free_page(old as usize, akuma_primitives::preempt::current_tid() as u32);
-            COW_COPY.fetch_add(1, Relaxed);
-        }
-    }
-    action
+    cow::resolve::<lazy::Amd64>(root, va)
 }
 
-/// Before the kernel writes into the user page at `va` (through the physmap, which never faults): decide
-/// whether the write may happen. `false` is `EFAULT`, as on Linux, where a kernel write to a page the user
-/// could not write faults.
-///
-/// * A marked read-only page is a CoW share: break it first. If the break cannot get a frame the write is
-///   refused - it used to be attempted anyway, into the still-shared frame, corrupting the other holder.
-/// * An UNMARKED read-only page that several spaces hold (shared text, or an `mprotect(PROT_READ)` page after a
-///   fork) must not be written: the write would land in every holder. Refused.
-/// * An unshared read-only page is left writable to the kernel (the only holder is the one asking).
 fn cow_prepare_write(root: u64, va: u64) -> bool {
-    use akuma_cow::KernelWrite;
-    let Some(slot) = leaf_entry(root, va & !0xFFF) else {
-        return true; // not mapped: the translate that follows reports it
-    };
-    let pte = slot.read();
-    match akuma_cow::kernel_write(pte & 1 != 0, pte & PTE_W != 0, pte & PTE_COW != 0, share_count(pte)) {
-        KernelWrite::Allow => true,
-        KernelWrite::Break => !matches!(cow_resolve(root, va), akuma_cow::CowAction::Fault),
-        KernelWrite::Refuse => false,
-    }
-}
-
-/// The PMM share count for the frame a PTE names, as `akuma-cow` takes it.
-fn share_count(pte: u64) -> u16 {
-    akuma_pmm::cow_ref_get((pte & PTE_ADDR) as usize)
-}
-
-/// `mprotect` is about to make `va` writable: a frame several spaces hold
-/// (marked or not - a shared read-only text page is unmarked) must be private
-/// first, or the write lands in every holder.
-fn cow_privatize(root: u64, va: u64) -> bool {
-    let Some(slot) = leaf_entry(root, va) else {
-        return true;
-    };
-    let pte = slot.read();
-    if !akuma_cow::needs_private_copy(pte & 1 != 0, share_count(pte)) {
-        return true;
-    }
-    // Force the Copy arm for a share the PTE does not mark.
-    slot.write((pte & !PTE_W) | PTE_COW);
-    !matches!(cow_resolve(root, va), akuma_cow::CowAction::Fault)
+    cow::prepare_write::<lazy::Amd64>(root, va)
 }
 
 fn fault_trap(t: &mut Trap<'_>) {
@@ -2189,7 +2072,7 @@ fn clone_user_tree(table_pa: u64, depth: u32, va_base: u64) -> Option<u64> {
                     akuma_cpu::tlb::invlpg(va as usize);
                 }
                 dst.set_entry(i, child_entry);
-                COW_SHARED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                cow::count_shared();
             }
         }
     }
@@ -2831,7 +2714,7 @@ fn boot(k: &Kernel) -> ! {
         MMDBG_V.store(n, core::sync::atomic::Ordering::Relaxed);
     }
     if cmdline_token(hvm_start_info, "wx=", &mut [0u8; 4]) == Some("0") {
-        WX_ENFORCE.store(false, core::sync::atomic::Ordering::Relaxed);
+        cow::wx_off();
     }
     if let Some(e) = cmdline_token(hvm_start_info, "epoch=", &mut [0u8; 32]) {
         match e.parse::<u64>() {

@@ -59,6 +59,36 @@ impl UserPages for Amd64 {
         akuma_cpu::tlb::invlpg(va as usize);
     }
 
+    fn writable(pte: u64) -> bool {
+        pte & akuma_pte_amd64::RW != 0
+    }
+
+    /// Bit 9, which the CPU ignores: amd64's CoW mark (`akuma_cow::CowFault::marked`).
+    fn cow_marked(pte: u64) -> bool {
+        pte & akuma_pte_amd64::COW != 0
+    }
+
+    /// The dirty bit: the CPU sets it on a user store, `with_written` on a kernel one.
+    fn written(pte: u64) -> bool {
+        pte & akuma_pte_amd64::D != 0
+    }
+
+    fn with_written(pte: u64) -> u64 {
+        pte | akuma_pte_amd64::D
+    }
+
+    fn take(pte: u64) -> u64 {
+        (pte | akuma_pte_amd64::RW) & !akuma_pte_amd64::COW
+    }
+
+    fn take_at(pte: u64, pa: u64) -> u64 {
+        ((pte & !akuma_pte_amd64::ADDR_MASK) | akuma_pte_amd64::RW | pa) & !akuma_pte_amd64::COW
+    }
+
+    fn share_marked(pte: u64) -> u64 {
+        (pte & !akuma_pte_amd64::RW) | akuma_pte_amd64::COW
+    }
+
     /// A page without the user bit is a `PROT_NONE` one, and stays inaccessible.
     fn anon_like(pte: u64) -> Lazy {
         let write = pte & (akuma_pte_amd64::RW | akuma_pte_amd64::COW) != 0;
@@ -85,18 +115,6 @@ impl akuma_tokio_kernel_core::mm::Mm for Amd64 {
     }
     fn shootdown() {
         crate::smp::shootdown();
-    }
-    fn page_written(root: u64, va: u64) -> bool {
-        crate::page_written(root, va)
-    }
-    fn mark_written(root: u64, va: u64) {
-        crate::mark_written(root, va);
-    }
-    fn cow_privatize(root: u64, va: u64) -> bool {
-        crate::cow_privatize(root, va)
-    }
-    fn wx_enforced() -> bool {
-        crate::wx_on()
     }
     fn mmdbg() -> u32 {
         crate::mmdbg()

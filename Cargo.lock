@@ -989,6 +989,7 @@ dependencies = [
 name = "akuma-tokio-kernel-core"
 version = "0.1.0"
 dependencies = [
+ "akuma-cow",
  "akuma-fpcache",
  "akuma-fpcache-rw",
  "akuma-mmap",
