@@ -109,3 +109,64 @@ Times: Mac is IST; boxes and session logs are UTC.
 `install-i1b`: 42 tool calls, G1 recorded PASS in `RESULT-I1.md` (the kernel package is `taoxichuan`, the README's
 `-p osaka` is stale; the pinned 2026-09-19 toolchain is ignored because the box has no rustup), `scripts/install.sh`
 exists with three run logs, G3 waiting on `wait_qwen.py`. It may push only `install-i1:install-script` to `litter`.
+
+## Update 2 (2026-11-04, night): the Qwen is up on trashcan
+
+**Result: `http://192.168.1.120:8081/v1` serves Qwen3-8B Q4_K_M from a herd service (`qwen`), ~4.6 generated tok/s,
+~10 prompt tok/s, thinking off. Verified from the Mac (two completions, `/v1/models`), then `herd stop`/`start`: no
+leaked process, memory back to 14.5 GB free, served again.** `wait_qwen.py` printed `QWEN_READY=`.
+
+What was done, in order:
+1. **From Ubuntu** (`sdb1` is the Akuma root, a 1 TB USB disk; SMART passes, 8 reallocated sectors, 0 pending):
+   assembled the 8 parts (`cat`, 5,027,784,224 bytes) and checked **sha256 = Hugging Face's `x-linked-etag`
+   (`54fffa05...cccd`)**. The Akuma-side `cat` had failed with an I/O error, Ubuntu's did not.
+2. `e2fsck -fn` showed leaked bitmaps (blocks/inodes marked used, actually free) and one wrong link count (inode
+   3014657). The user authorised `e2fsck -fy`; it exited 1 (errors fixed) and a second `-fn` pass was clean. The
+   kernel, model, conf and everything written afterwards survived; a final `-fn` after all copies was clean too.
+3. **Kernel updated from `origin/main` (`e80e6cd9`)**, built ON the box (`cargo build -p akuma-amd64 --target
+   x86_64-unknown-none --release --features no-tests`, pinned nightly-2026-09-19 via rustup), installed as the Akuma
+   partition's `/boot/akuma-amd64` (`chmod 755`, old one kept as `akuma-amd64.before-e80e6cd9`). It reports
+   `0.0.9 e80e6cd9-release-smp-shared`. **The amd64 kernel needs the `crates/akuma-fbcon/vendor/spleen` submodule**
+   (the first build failed on it); `proposals/INSTALL_SCRIPT.md`'s "no submodule" claim holds for Taoxichuan only.
+   GRUB loads the kernel from the Akuma partition; `/root/stage_akuma.sh` (installs to Ubuntu's `/boot/akuma`) is stale.
+4. **The image's `llama-server` was a generic x86-64 build** (`-march=x86-64`, AVX/AVX2/FMA off; `system_info` listed
+   only LLAMAFILE and REPACK): **0.83 prompt / 0.88 gen tok/s** on Ubuntu. Rebuilt static musl with `-march=haswell`,
+   `GGML_AVX/AVX2/FMA/F16C/BMI2=ON` (`/root/llama-build-haswell`, Ubuntu side), installed as `/bin/llama-server-hsw`
+   (the stock `llama-server` is untouched). The kernel saves AVX state (`OSXSAVE`, `XCR0` = x87+SSE+AVX, `xsave64`),
+   so this is safe. Linux with it: **4.6 gen / ~15 prompt tok/s**.
+5. **Thread scaling on Akuma is poor above 3 threads** (same binary, same box, `-c 2048`, 32-token completions;
+   gen tok/s, prompt tok/s in brackets):
+
+   | model | 1 thread | 2 | 3 | 4 |
+   |---|---|---|---|---|
+   | Qwen3-8B | 2.29 (3.8) | 3.93 (7.6) | 3.59 (10.0) | 1.45 (7.8) |
+   | Qwen3-4B | 4.25 (7.2) | 7.26 (14.4) | 5.80 (18.1) | 2.40 (10.7) |
+
+   Linux ran the 8B at 4 threads at 4.6. Hypothesis, NOT measured: llama.cpp's per-layer thread barrier plus kernel
+   work on one core (netpoll, timer) stalls the whole team. A Linux `llama-bench` sweep on the same box would turn
+   this into a kernel report; it needs another reboot to Ubuntu. Served with **`-t 3`** (prompt-bound agent turns).
+   `-t 2 -tb 3` is untested since the crash below was understood.
+6. **Qwen3-4B Q4_K_M staged as the backup** (`/models/qwen3-4b-q4_k_m.gguf`, sha256 `fbe1d5ed...bae3` = HF's, `cmp`-checked
+   after the copy; `/etc/herd/available/qwen4b.conf`, not enabled). Switch: `herd stop qwen; herd disable qwen;`
+   copy `qwen4b.conf` over `qwen.conf`'s args; `herd enable qwen; herd start qwen`.
+7. Service config (`/etc/herd/available/qwen.conf`, enabled):
+   `command = /bin/llama-server-hsw`, `args = -m /models/qwen3-8b-q4_k_m.gguf --host 0.0.0.0 --port 8081 -c 8192 -t 3
+   --parallel 1 --no-mmap --reasoning-budget 0`, `restart = true`, `restart_delay_ms = 5000`.
+
+### Traps found (each cost time)
+- **The box's DHCP address changed to `192.168.1.120`** (Ubuntu had been `.123`). `wait_qwen.py` now defaults to
+  `.120`; it will go stale again. A DHCP reservation or a fixed address for the Akuma MAC would fix it.
+- **`kill $!` on Akuma's `sh` did not kill the server**: two sweep servers (ports 8090, 8203) stayed alive, ~5 GB
+  each. The herd-started `qwen` then died with **SIGSEGV (exit 139) five times while loading**; `dmesg` showed a
+  user-mode write `#PF` inside a mapped RW anonymous region, i.e. the kernel failed to populate a page with 4.3 GB
+  free of 16. `kill -9` on the two leaders freed 10 GB and the same config then started cleanly. **Open:** an
+  allocation failure should not surface as SIGSEGV in a mapped region; that is a kernel finding to chase
+  (repro: hold ~11.7 GB, start the 8B with `--no-mmap`). My first hypothesis (`-tb` resizing the pool) was wrong.
+- `hpbox.py ak` has a 60 s limit: background anything longer (`setsid nohup ... &`) and poll for a marker file.
+- Never `grep -q done` on error text; test for the file. `df -h /` on Akuma shows procfs only.
+
+### Ryzen agent (`install-i1b`)
+65+ tool calls; `scripts/install.sh` and its runbook and `bootstrap/public/install.txt` are pushed to
+`litter/install-script` (`dabe4a5b`). A steer with the new URL was **not delivered** (`session/load` unanswered), so
+its poller was restarted on `.120` instead and `/root/install-work/QWEN-URL.txt` holds the note; G3 starts when the
+poller prints `QWEN_READY=` (it now has).

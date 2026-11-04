@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Block until the trashcan Qwen answers a real chat completion, then print its URL and exit 0.
 
-    python3 -I scripts/kvm/goose/wait_qwen.py [--url http://192.168.1.123:8081] [--deadline SECONDS]
+    python3 -I scripts/kvm/goose/wait_qwen.py [--url http://192.168.1.120:8081] [--deadline SECONDS]
 
 Readiness is a completed generation, not an open port or a /v1/models answer: llama-server answers
 /v1/models (and 503s the completion) while the model is still loading. Exit 0 ready, 1 deadline passed.
@@ -10,7 +10,7 @@ An agent that must not start before the endpoint exists runs this first, in the 
 import argparse, json, sys, time, urllib.request
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--url", default="http://192.168.1.123:8081")
+ap.add_argument("--url", default="http://192.168.1.120:8081")
 ap.add_argument("--deadline", type=int, default=6 * 3600)
 a = ap.parse_args()
 end = time.time() + a.deadline
