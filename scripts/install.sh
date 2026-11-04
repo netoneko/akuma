@@ -41,6 +41,7 @@ ARCH=x86_64
 KERNEL_NAME=taoxichuan
 KEY_PUB=
 KERNEL_OVERRIDE=       # --kernel-bin PATH: boot this kernel, do not build one
+SSHD_OVERRIDE=         # --sshd-bin PATH: put this sshd in the image, do not build one
 VMM_SET=0
 PERSIST=0
 DRY_RUN=0
@@ -111,6 +112,7 @@ while [ $# -gt 0 ]; do
 		--kernel)  KERNEL_NAME=$2; shift 2 ;;
 		--key)     KEY_PUB=$2; shift 2 ;;
 		--kernel-bin) KERNEL_OVERRIDE=$2; shift 2 ;;
+		--sshd-bin) SSHD_OVERRIDE=$2; shift 2 ;;
 		--mem)     MEM_MIB=$2; shift 2 ;;
 		--smp)     SMP=$2; shift 2 ;;
 		--persist) PERSIST=1; shift ;;
@@ -125,7 +127,7 @@ done
 
 case "$ARCH" in x86_64|amd64) ARCH=x86_64 ;; *) printf 'install.sh: only x86_64 in I1 (arm64 is I4)\n' >&2; exit 2 ;; esac
 case "$KERNEL_NAME" in taoxichuan) ;; *) printf 'install.sh: only --kernel taoxichuan in I1\n' >&2; exit 2 ;; esac
-case "$VMM" in qemu|firecracker) ;; *) printf 'install.sh: --vmm qemu|firecracker\n' >&2; exit 2 ;; esac
+case "$VMM" in qemu|firecracker|akuma) ;; *) printf 'install.sh: --vmm qemu|firecracker|akuma\n' >&2; exit 2 ;; esac
 case "$PORT" in ''|*[!0-9]*) printf 'install.sh: --port needs a number\n' >&2; exit 2 ;; esac
 if [ "$CMD" = ssh ]; then [ $# -ge 1 ] || { printf 'install.sh: ssh needs a command\n' >&2; exit 2; }; fi
 
@@ -140,6 +142,10 @@ IMG="$STATE/disk.img"
 if [ -n "$KERNEL_OVERRIDE" ]; then
 	[ -f "$KERNEL_OVERRIDE" ] || { printf 'install.sh: --kernel-bin %s: no such file\n' "$KERNEL_OVERRIDE" >&2; exit 2; }
 	KERNEL_BIN=$KERNEL_OVERRIDE
+fi
+if [ -n "$SSHD_OVERRIDE" ]; then
+	[ -f "$SSHD_OVERRIDE" ] || { printf 'install.sh: --sshd-bin %s: no such file\n' "$SSHD_OVERRIDE" >&2; exit 2; }
+	SSHD_BIN=$SSHD_OVERRIDE
 fi
 
 if [ "$DRY_RUN" = 0 ]; then
@@ -160,19 +166,23 @@ SSHPORT=$PORT                                 # qemu: the hostfwd port; firecrac
 [ "$VMM" = firecracker ] && SSHPORT=22
 if [ "$VMM" = firecracker ]; then GUEST_HOST=10.0.2.15; fi   # firecracker: the guest on its tap
 KEYOPT="-i $STATE/key"
-SSH_OPTS="$KEYOPT -p $SSHPORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes"
+SSH_EXTRA="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes"
+[ "$VMM" = akuma ] && SSH_EXTRA=""   # Akuma's own ssh client takes no -o flags (it reads them as a host name)
+SSH_OPTS="$KEYOPT -p $SSHPORT $SSH_EXTRA"
 
 # -----------------------------------------------------------------------: check
 
 if [ "$CMD" = check ]; then
-	need git      "git: apt install git / apk add git / brew install git"
+	[ -n "$KERNEL_OVERRIDE" ] && [ -n "$SSHD_OVERRIDE" ] || need git      "git: apt install git / apk add git / brew install git"
 	need curl     "curl: apt install curl / apk add curl / brew install curl"
-	need cargo    "rustup: curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly"
+	[ -n "$KERNEL_OVERRIDE" ] && [ -n "$SSHD_OVERRIDE" ] || need cargo    "rustup: curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly"
 	need mke2fs   "e2fsprogs: apt install e2fsprogs / apk add e2fsprogs / brew install e2fsprogs"
 	need ssh      "openssh: apt install openssh-client / apk add openssh-client / brew install openssh-client"
 	[ -n "$KEY_PUB" ] || need ssh-keygen "openssh (ssh-keygen): as ssh; or rerun with --key /path/to/key.pub"
 	if [ "$VMM" = qemu ]; then
 		need qemu-system-x86_64 "qemu: apt install qemu-system-x86 / apk add qemu-system-x86_64 / brew install qemu"
+	elif [ "$VMM" = akuma ]; then
+		need herd "herd: --vmm akuma only works on an Akuma host (Akuma's own hypervisor, started through herd)"
 	else
 		need firecracker "firecracker: download the release binary from https://github.com/firecracker-microvm/firecracker/releases (needs /dev/kvm)"
 	fi
@@ -265,6 +275,19 @@ fi
 
 # ------------------------------------------------------------------: down/status
 
+if [ "$CMD" = down ] && [ "$VMM" = akuma ]; then
+	if [ -f "$STATE/akuma.svc" ]; then
+		svc=$(cat "$STATE/akuma.svc")
+		herd stop "$svc" >/dev/null 2>&1 || :
+		herd disable "$svc" >/dev/null 2>&1 || :
+		rm -f "/etc/herd/available/$svc.conf" "/etc/herd/enabled/$svc.conf" "$STATE/akuma.svc"
+		note "down: stopped herd service $svc - only what this script started"
+	else
+		note "down: no $STATE/akuma.svc (nothing this script started)"
+	fi
+	exit 0
+fi
+
 if [ "$CMD" = down ]; then
 	pidfile="$STATE/$VMM.pid"
 	if [ -f "$pidfile" ]; then
@@ -292,6 +315,15 @@ if [ "$CMD" = down ]; then
 	exit 0
 fi
 
+if [ "$CMD" = status ] && [ "$VMM" = akuma ]; then
+	if [ -f "$STATE/akuma.svc" ] && herd status 2>/dev/null | grep -a -q "^ *$(cat "$STATE/akuma.svc"): running"; then
+		note "status: akuma running (herd service $(cat "$STATE/akuma.svc")), ssh target root@$GUEST_HOST -p $SSHPORT"
+		exit 0
+	fi
+	note "status: not running"
+	exit 1
+fi
+
 if [ "$CMD" = status ]; then
 	if [ -f "$STATE/$VMM.pid" ] && kill -0 "$(cat "$STATE/$VMM.pid")" 2>/dev/null; then
 		note "status: $VMM running, pid $(cat "$STATE/$VMM.pid"), ssh target root@$GUEST_HOST -p $SSHPORT"
@@ -310,7 +342,9 @@ fi
 # -------------------------------------------------------------------------: up
 
 # stage clone --------------------------------------------------------------
-if stamped clone && [ -d "$SRC" ]; then
+if [ -n "$KERNEL_OVERRIDE" ] && [ -n "$SSHD_OVERRIDE" ]; then
+	note "clone: skipped (kernel and sshd supplied)"
+elif stamped clone && [ -d "$SRC" ]; then
 	note "clone: already done ($SRC)"
 else
 	if [ "$DRY_RUN" = 1 ]; then
@@ -326,7 +360,9 @@ else
 fi
 
 # stage build --------------------------------------------------------------
-if stamped build && [ -f "$KERNEL_BIN" ] && [ -x "$SSHD_BIN" ]; then
+if [ -n "$KERNEL_OVERRIDE" ] && [ -n "$SSHD_OVERRIDE" ]; then
+	note "build: skipped (kernel $KERNEL_OVERRIDE and sshd $SSHD_OVERRIDE supplied)"
+elif stamped build && [ -f "$KERNEL_BIN" ] && [ -x "$SSHD_BIN" ]; then
 	note "build: already done"
 else
 	if [ "$DRY_RUN" = 1 ]; then
@@ -390,7 +426,7 @@ if [ -n "$KEY_PUB" ]; then
 		cp "$KEY_PUB" "$STATE/key.pub"
 		: >"$STATE/key"                        # marker: the private half lives with the user
 		KEYOPT=""                              # ssh falls back to the user's default identities
-		SSH_OPTS="$KEYOPT -p $SSHPORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes"
+		SSH_OPTS="$KEYOPT -p $SSHPORT $SSH_EXTRA"
 		stamp key
 	fi
 	note "key: authorized_keys from $KEY_PUB (no ssh-keygen needed; ssh must hold the matching private key)"
@@ -503,6 +539,18 @@ if [ "$VMM" = qemu ]; then
 $QEMU_CMD"
 	WAIT_TARGET="root@127.0.0.1"
 	BIN_NEEDED=qemu-system-x86_64
+elif [ "$VMM" = akuma ]; then
+	TAP=none
+	AKSVC=akuma-install-$PORT
+	VMDISK="$STATE/disk-run.img"                # private copy: never boot the stamped image
+	[ "$PERSIST" = 1 ] && VMDISK="$IMG"
+	AKCONF=$(printf '%s\n' "vm = true" "vm_type = kvm" "vm_kernel = $KERNEL_BIN" "vm_disk = $VMDISK" "vm_ram_mib = $MEM_MIB" "vm_vcpus = $SMP" "vm_forward = $PORT:22" "vm_cmdline = init=/bin/sshd initargs=--port,22 epoch=$epoch" "restart = false")
+	BOOT_STEPS="cp $IMG $VMDISK   # throwaway copy
+write /etc/herd/available/$AKSVC.conf and enabled/ with:
+$AKCONF
+herd disable $AKSVC; herd enable $AKSVC; herd start $AKSVC   # herd only re-parses on disable then enable; one VM at a time on kvm0"
+	WAIT_TARGET="root@127.0.0.1"
+	BIN_NEEDED=herd
 else
 	TAP=akuma-tap-$PORT
 	GUEST_MAC=02:FC:00:00:00:07                 # private to this script; never another VM's
@@ -538,6 +586,26 @@ else
 			fi
 			# shellcheck disable=SC2086
 			eval "$QEMU_CMD" >>"$LOGS/boot.log" 2>&1 || fatal 50 boot "qemu did not start"
+		elif [ "$VMM" = akuma ]; then
+			# Akuma's own hypervisor (/dev/kvm0) through herd: the one guest path on Akuma that has a network
+			# (vm_forward). kvm0 runs one VM at a time: refuse to touch somebody else's.
+			other=$(herd status 2>/dev/null | grep -a '(vm)' | grep -a ': running' | grep -a -v "$AKSVC" | head -3)
+			[ -z "$other" ] || fatal 50 boot "another VM is running on kvm0 ($other) and it allows one: a human stops it first (herd stop <name>), then rerun"
+			if [ "$PERSIST" = 0 ]; then cp "$IMG" "$VMDISK" || fatal 50 boot "could not copy the image to $VMDISK"; fi
+			printf '%s\n' "$AKCONF" >"/etc/herd/available/$AKSVC.conf" || fatal 50 boot "could not write the herd conf"
+			cp "/etc/herd/available/$AKSVC.conf" "/etc/herd/enabled/$AKSVC.conf" || fatal 50 boot "could not enable the herd conf"
+			herd disable "$AKSVC" >>"$LOGS/boot.log" 2>&1 || :
+			herd enable "$AKSVC" >>"$LOGS/boot.log" 2>&1 || fatal 50 boot "herd enable failed"
+			echo "$AKSVC" >"$STATE/akuma.svc"
+			# a new service is only known after herd's next config reload (within ~20 s)
+			i=0
+			while [ "$i" -lt 20 ]; do
+				herd status 2>/dev/null | grep -a -q "^ *$AKSVC:" && break
+				sleep 2; i=$((i+1))
+			done
+			herd start "$AKSVC" >>"$LOGS/boot.log" 2>&1 || fatal 50 boot "herd start $AKSVC failed (see $LOGS/boot.log)"
+			sleep 3
+			herd status 2>/dev/null | grep -a -q "^ *$AKSVC: running" || fatal 50 boot "herd service $AKSVC is not running: $(herd status 2>&1 | grep -a "$AKSVC")"
 		else
 				# Firecracker has no user-mode network, so the guest needs a tap, and creating one needs root.
 				# This script never uses sudo: it uses a tap that already exists, creates one only if it is

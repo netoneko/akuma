@@ -29,6 +29,22 @@ TASK = """Your task brief is the file /home/netoneko/demo/install.txt. Read it c
 Run every command with your shell tool. Do not ask the user questions; the user is not there."""
 
 
+DUMP_THREAD = """import json, sys
+d = json.load(open(sys.argv[1]))
+def w(x):
+    if isinstance(x, dict):
+        k = x.get("kind")
+        if k:
+            print(k, json.dumps(x)[:400])
+        for v in x.values():
+            w(v)
+    elif isinstance(x, list):
+        for i in x:
+            w(i)
+w(d)
+"""
+
+
 def root(cmd, inp=None, timeout=300):
     rc, o, e = hpbox.ryzen_root(cmd, timeout=timeout, input=inp)
     return rc, o, e
@@ -48,6 +64,8 @@ def main():
     ap.add_argument("--api-key", default="none")
     ap.add_argument("--provider", default="openai", choices=("openai", "ollama"),
                     help="goose provider: openai (llama-server) or ollama (native; goose's openai client cannot decode ollama's stream)")
+    ap.add_argument("--harness", default="goose", choices=("goose", "infinity"),
+                    help="agent harness: goose (goose run) or infinity (infinity -H; static no-aws build staged in demo/inf)")
     ap.add_argument("--keep-build", action="store_true", help="DEVELOPMENT only: keep clone+build, redo image+boot")
     ap.add_argument("--max-turns", type=int, default=40)
     ap.add_argument("--budget", type=int, default=5400, help="wall seconds")
@@ -95,19 +113,57 @@ def main():
            f"XDG_CONFIG_HOME={tdir}/cfg GOOSE_DISABLE_KEYRING=1 GOOSE_MODE=auto {prov} "
            f"GOOSE_MODEL={a.model} GOOSE_TEMPERATURE={a.temperature} GOOSE_TELEMETRY_ENABLED=false")
     t0 = time.time()
-    launcher = (f"cd {DEMO} && date +%s > {tdir}/start && "
-                f"(setsid nohup sh -c 'env {env} timeout {a.budget} goose run -i {DEMO}/TASK.txt --no-session "
-                f"--max-turns {a.max_turns} > {tdir}/transcript.txt 2>&1; echo $? > {tdir}/goose.rc; date +%s > {tdir}/end' "
-                f"> /dev/null 2>&1 < /dev/null &)")
-    as_user(launcher)
-    print(f"trial {a.label}-{n} started; budget {a.budget}s, {a.max_turns} turns", flush=True)
+    INF = f"{DEMO}/inf"
+    PATHV = "/home/netoneko/.cargo/bin:/home/netoneko/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    root(f"cat > {DEMO}/dump_thread.py", inp=DUMP_THREAD)
 
-    while True:
-        time.sleep(60)
-        rc, o, _ = as_user(f"test -f {tdir}/end && echo ENDED; tail -c 200 {DEMO}/up.log 2>/dev/null | tail -2")
-        print(time.strftime("%H:%M:%S"), o.strip().replace("\n", " | ")[-180:], flush=True)
-        if "ENDED" in o or time.time() - t0 > a.budget + 300:
-            break
+    def run_goose():
+        launcher = (f"cd {DEMO} && date +%s > {tdir}/start && "
+                    f"(setsid nohup sh -c 'env {env} timeout {a.budget} goose run -i {DEMO}/TASK.txt --no-session "
+                    f"--max-turns {a.max_turns} > {tdir}/transcript.txt 2>&1; echo $? > {tdir}/goose.rc; date +%s > {tdir}/end' "
+                    f"> /dev/null 2>&1 < /dev/null &)")
+        as_user(launcher)
+        print(f"trial {a.label}-{n} (goose) started; budget {a.budget}s, {a.max_turns} turns", flush=True)
+        while True:
+            time.sleep(60)
+            _, o, _ = as_user(f"test -f {tdir}/end && echo ENDED; tail -c 200 {DEMO}/up.log 2>/dev/null | tail -2")
+            print(time.strftime("%H:%M:%S"), o.strip().replace("\n", " | ")[-180:], flush=True)
+            if "ENDED" in o or time.time() - t0 > a.budget + 300:
+                return
+
+    def run_infinity():
+        # `infinity -H` hands the task to its daemon and returns at once; the daemon keeps running the agent, and a
+        # running daemon keeps the environment its provider was started with, so stop it first (model and URL change).
+        task = ("Your task brief is the file /home/netoneko/demo/install.txt. Read it completely with run_command (cat), "
+                "then carry it out. Use run_command for every command. Do not ask the user questions; the user is not there.")
+        # The daemon log is per daemon start, so remove it and count from zero: a baseline taken from the old log
+        # can be higher than anything the new one reaches (that hung a trial that had already finished).
+        as_user(f"HOME={INF}/home {INF}/bin/infinity daemon stop >/dev/null 2>&1; sleep 2; rm -f {INF}/home/.infinity/daemon.log; true")
+        base = 0
+        as_user(f"date +%s > {tdir}/start")
+        launcher = (f"cd {INF}/proj && (setsid nohup sh -c 'env PATH={PATHV} HOME={INF}/home OPENAI_BASE_URL={a.host}/v1 "
+                    f"INFINITY_PROVIDER_MODEL_ID={a.model} timeout {a.budget} {INF}/bin/infinity -H \"{task}\" "
+                    f"> {tdir}/transcript.txt 2>&1; echo $? > {tdir}/goose.rc' > /dev/null 2>&1 < /dev/null &)")
+        as_user(launcher)
+        print(f"trial {a.label}-{n} (infinity) started; budget {a.budget}s", flush=True)
+        while True:
+            time.sleep(60)
+            _, o, _ = as_user(f"echo FINALS=$(grep -a -c 'idle with no keep-alive clients' {INF}/home/.infinity/daemon.log); "
+                              f"tail -c 160 {DEMO}/up.log 2>/dev/null | tail -1")
+            print(time.strftime("%H:%M:%S"), o.strip().replace("\n", " | ")[-170:], flush=True)
+            try:
+                fin = int(o.split("FINALS=")[1].split()[0])
+            except (IndexError, ValueError):
+                fin = 0
+            if fin > base or time.time() - t0 > a.budget + 300:
+                break
+        as_user(f"date +%s > {tdir}/end")
+        # the thread is the transcript: every tool call and result, in order
+        as_user(f"cd {INF}/home/.infinity/threads && N=$(ls -t *.json | grep -v meta | head -1) && cp $N {tdir}/thread.json "
+                f"&& python3 {DEMO}/dump_thread.py {tdir}/thread.json >> {tdir}/transcript.txt")
+
+    (run_infinity if a.harness == "infinity" else run_goose)()
+
 
     # judge -----------------------------------------------------------------------------------------------
     _, st, _ = as_user(f"sh {SH} status --dir {RUN} 2>&1; echo status_rc=$?")
@@ -116,6 +172,7 @@ def main():
     low = tr.lower()
     forbidden = [w for w in ("sudo ", "apt ", "apt-get", "pip install", "pkill ", "killall") if w in low]
     ready = "AKUMA_READY=1" in tr
+    ran_ssh_step = ("install.sh ssh" in tr and "busybox uname" in tr)   # the model itself ran step 3, not just the VM came up
     ok_vm = "status_rc=0" in st
     ok_ssh = "Linux taoxichuan" in ss
     asked = any(w in low for w in ("which package manager", "please let me know", "would you like", "do you want me"))
@@ -125,7 +182,8 @@ def main():
         "harness_vm_alive": ok_vm, "harness_ssh_ok": ok_ssh, "ssh_line": ss.strip()[-120:],
         "transcript_saw_ready": ready, "model_claimed_done": claimed, "asked_user": asked,
         "forbidden": forbidden,
-        "PASS": bool(ok_vm and ok_ssh and not forbidden),
+        "model_ran_ssh_step": ran_ssh_step,
+        "PASS": bool(ok_vm and ok_ssh and ran_ssh_step and not forbidden),
         "false_success": bool(claimed and not (ok_vm and ok_ssh)),
         "wall_s": int(time.time() - t0),
     }

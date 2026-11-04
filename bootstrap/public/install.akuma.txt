@@ -1,0 +1,40 @@
+INSTALL AKUMA IN A VM  (read all of this once, then run the commands)
+
+YOUR JOB: boot a second Akuma as a virtual machine on THIS machine (it is itself Akuma) and run `busybox uname -a` inside it.
+You are unattended. Run commands; do not describe plans; do not ask the user anything.
+
+THE SCRIPT:  /root/demo/scripts/install.sh   (POSIX sh)
+THE FOLDER:  /root/demo/run                  (everything the script makes goes here)
+Use exactly these flags on every `up`/`check` call:
+    --vmm akuma --dir /root/demo/run --kernel-bin /root/demo/bins/taoxichuan --sshd-bin /root/demo/bins/sshd
+(The kernel and sshd are already built; the flags tell the script to use them.)
+
+STEP 1  check the machine (fast):
+    sh /root/demo/scripts/install.sh check --vmm akuma --dir /root/demo/run --kernel-bin /root/demo/bins/taoxichuan --sshd-bin /root/demo/bins/sshd
+  Expect the last line:  install.sh: check: prerequisites present
+  If it exits 10 a tool is missing: name the tool, say so, and STOP.
+
+STEP 2  bring it up (takes a few minutes). Start it in the background, because a long foreground command times out:
+    cd /root/demo && nohup sh scripts/install.sh up --vmm akuma --dir /root/demo/run --kernel-bin /root/demo/bins/taoxichuan --sshd-bin /root/demo/bins/sshd > up.log 2>&1 &
+  Then wait and look, once a minute:
+    sleep 60; tail -n 5 /root/demo/up.log
+  Repeat until the log contains the line  AKUMA_READY=1  (success) or a line starting  install.sh: FAIL  (failure).
+  Never sleep longer than 60 seconds in one command. Do not start `up` twice while it is running.
+
+STEP 3  run a command inside the VM:
+    sh /root/demo/scripts/install.sh ssh --vmm akuma --dir /root/demo/run 'busybox uname -a'
+  Success looks like:  Linux taoxichuan 0.1.0-... x86_64 GNU/Linux
+
+YOU ARE DONE when step 3 printed a line starting with  Linux taoxichuan . Say DONE and paste that line.
+Leave the VM running. Do not run `down`.
+
+IF A STEP FAILS
+  - Every failure prints a line  install.sh: FAIL stage=<name> <reason>  and the last 20 lines of that stage's log
+    (/root/demo/run/logs/<name>.log). Read them.
+  - Run `up` once more the same way: it resumes where it stopped. If it fails a second time, STOP and report the
+    FAIL line and the exit code.
+
+RULES
+  - Do not stop, start or edit any herd service yourself. Do not install packages. Do not delete anything outside /root/demo/run.
+  - Do not kill processes you did not start. Do not touch other folders.
+  - Never claim success without having seen the Linux taoxichuan line yourself.

@@ -318,3 +318,46 @@ the preflight exists because of them.
 **Next:** a full clean run (no `--keep-build`) for each model; Infinity with the Qwen on Linux (static binaries from
 `/root/infinity-no-aws` on Pop, run in a throwaway `HOME`); then Akuma on ryzen. Open: `check` prints `mke2fs -d: no` in
 trial runs but `yes` by hand (the probe runs against `$CACHE`, which may not exist yet).
+
+## Update 6 (2026-11-05): Infinity on Linux, a false pass caught, the Akuma backend (Claude)
+
+**Infinity (the `no-aws` build) works on Linux with both small models.** Static binaries from the other agent's
+`/root/infinity-no-aws` on Pop, run in a throwaway `HOME` (`/home/netoneko/demo/inf`) so a real `~/.infinity` is never touched.
+`infinity -H '<task>'` hands the task to its daemon and returns at once; the transcript is the thread JSON the daemon writes.
+Smoke tests: `qwen3:4b` answered `PONG`; `gemma4:e4b` called `run_command` first time and returned the output; `qwen3:4b` once
+guessed a tool called `shell` (wrong), recovered through `shell_list_tools`, and once ended with `rig::providers::openai::completion::streaming:
+There is no choice` (a stream chunk with no `choices`; seen once, not reproduced).
+**Trap:** the daemon keeps its provider process, so a running daemon keeps the model and URL it was first started with; the harness
+runs `infinity daemon stop` before each trial.
+
+**A false pass, retracted.** The first Infinity trial reported PASS in 208 s. Its transcript shows the model ran `cat install.txt`, `check`,
+a backgrounded `up` and a `sleep`, and **never ran the ssh step**; the harness ended it at the first "final message" and the VM was
+already up because the backgrounded `up` had finished on its own. The judge only checked the end state. Two fixes in
+`scripts/kvm/goose/qwen_install_trial.py`: an Infinity trial ends when the session goes idle with no clients, and a PASS now requires
+the transcript to show the model itself ran `install.sh ssh ... busybox uname`. A second harness bug followed: a baseline taken from the old
+daemon log was higher than anything the new log could reach (the log is per daemon start), so a trial that had already finished
+waited for its budget. The log is now deleted after the daemon stops and counted from zero. Trials from before these fixes are renamed
+`INVALID-*` on Pop.
+
+| pair on Linux (Pop) | model | result |
+|---|---|---|
+| goose | qwen3:4b | PASS 319 s (dev) |
+| goose | gemma4:e4b | PASS 318 s (dev) |
+| infinity | qwen3:4b | **PASS 562 s** (dev; the model ran every step, claimed DONE, saw `AKUMA_READY`; harness confirmed VM + ssh) |
+| infinity | gemma4:e4b | running |
+
+All are `--keep-build` single trials. Still no scored result.
+
+**The Akuma backend (`install.sh --vmm akuma`).** On Akuma the Linux `firecracker` binary has no network (no tap devices), so the only
+ssh-reachable guest is Akuma's own hypervisor through herd (`vm = true`, `vm_type = kvm`, `vm_forward = <port>:22`), the path the
+Taoxichuan dev guest uses. The backend writes the herd conf to both `available/` and `enabled/`, runs `herd disable` then `enable`
+(herd only re-parses then), waits for a new service to be known (reload tick, ~20 s), starts it, and reaches the guest with Akuma's own
+`ssh` (**no `-o` flags**: it reads them as a host name). It refuses to touch another VM (kvm0 allows one) and prints the command a human
+runs. New options `--kernel-bin` and `--sshd-bin` skip the clone and the 10-minute build. `bootstrap/public/install.akuma.txt` is the
+Akuma runbook. Not yet run on Akuma.
+Akuma's disk now holds `/root/demo/{bins,inf,scripts}`; the Infinity paths were rewritten from Pop's.
+
+**Blocked:** the Akuma host cannot reach the Mac's ollama (loopback only). A LAN forwarder on the Mac was refused by the permission
+check, correctly: it would expose the user's ollama, unauthenticated, to the LAN and had not been approved by name. Order of
+preference: a reverse ssh tunnel (loopback on Akuma only, needs Akuma's sshd to support remote forwarding, untested), then the
+user's explicit approval of a short-lived forwarder, then trashcan's Qwen3-8B.
