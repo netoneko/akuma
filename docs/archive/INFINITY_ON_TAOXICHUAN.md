@@ -181,28 +181,50 @@ build was debug and took about 18 minutes over six attempts.
 `SHA256SUMS` (verified on Pop). `infinity --help` runs there on Pop's Linux. Running it on Taoxichuan is left
 for the next agent.
 
-### aarch64: open, for later
+### aarch64: Infinity faulted at start (fixed 2026-11-05)
 
 Staged on a scratch clone of `disk.img` (the same files, the aarch64 build) and booted on aarch64
-Taoxichuan (QEMU virt TCG, `smp=4`, 2 GiB, the B21 A6 kernel), where goose 1.52.0 runs, answers PONG
-and uses its shell tool.
+Taoxichuan (QEMU virt TCG, `smp=4`, 2 GiB, the B21 A6 kernel), `infinity --help` exited 139 with
+`[Fault] EL0 ec=0x24 elr=0x00000000006adc58 sp=0x00006ffffffefd70 far=0x00006ffffffefd70 esr=0x92000047 pte=0x0`.
+goose 1.52.0 ran fine on the same kernel.
 
-1. **`infinity` dies at start: the aarch64 half does not grow the user stack.** `infinity --help` exits 139
-   with
-   `[Fault] EL0 ec=0x24 elr=0x00000000006adc58 sp=0x00006ffffffefd70 far=0x00006ffffffefd70 esr=0x92000047 pte=0x0`:
-   a write (`WnR`), translation fault at level 3, at the stack pointer itself, on an unmapped page about
-   66 KB below `USER_STACK_TOP` (`0x7000_0000_0000`). Every image starts with 16 stack pages (64 KiB,
-   `akuma_tokio_kernel_core::task::USER_STACK_PAGES`). amd64 grows the stack on a not-present fault just below
-   the region, up to 8 MiB (`grow_user_stack`, `crates/akuma-tokio-kernel-amd64/src/lib.rs`, called from its
-   page-fault handler). aarch64's `user_fault` (`crates/akuma-tokio-kernel-aarch64/src/trap.rs`) only fills
-   lazy pages, so the first frame past 64 KiB kills the task. goose happens not to go that deep. The function
-   at `elr` was not identified.
-   *Fix, not made:* `grow_user_stack` uses only things core already has (`Mm::with_task`, the layout's
-   `growth_below`/`extend_down`, `FreshPage`, `UserTree::map_page`), so it can move into
-   `akuma-tokio-kernel-core` as a function generic over `Loader`, beside the loader, and both machines'
-   fault paths can call it.
-2. Untested on aarch64 past that: the daemon, the provider and the PONG/tool path.
-   `infinity-mcp-shell-tools` starts and exits 0 on an empty stdin.
+- **Cause.** `elr` is in `tokio::Runtime::block_on::<infinity::main::{closure}>`, whose frame is the whole
+  `async main` future (0xb980 bytes, 46 KB). Its stack probe (`sub sp, sp, #0x1000; str xzr, [sp]` in a loop)
+  writes each page going down, and the first write past the 64 KiB every image starts with
+  (`USER_STACK_PAGES`) hit an unmapped page. amd64 grows the stack on that fault (`grow_user_stack`, up to
+  8 MiB); the aarch64 half had no growth at all, so the task was killed before `main`. Any `#[tokio::main]`
+  program with a large main future dies the same way. tokioprobe and goose passed only because their main
+  frames fit.
+- **Fix.** `grow_user_stack` moved into `akuma-tokio-kernel-core::loader`, generic over `Loader`. It uses only
+  what core already has: `Mm::with_task`, the layout's `growth_below`/`extend_down`, `FreshPage`, and
+  `UserTree::map_page`. amd64 calls it where it called its own copy, and aarch64's EL0 data abort calls it on a
+  translation fault. One zeroed frame per page grown, no heap.
+- **Verified.** A probe (`stackprobe`: a 256 KiB frame first touched by a user store, by `read` into it, and
+  by `write` from it, each in a fork child) passes all three on aarch64. `infinity --help` runs. Infinity's
+  PONG went daemon, provider, z.ai and back (`[Text] P`, `[Text] ONG`), and a tool turn called
+  `shell_invoke_tool` -> `run_command {"command":"uname -m && nproc"}` (status 200) and answered `aarch64`,
+  `4`. 0 kernel faults.
+- **Not changed.** Growth stays from user faults only, on both machines. A syscall that is the *first* to touch
+  a new stack page gets `EFAULT`, where Linux grows the stack. It needs a raw syscall from a leaf frame (a libc
+  call touches the lower stack first), so it is latent; the probe above shows it does not arise through libc.
+
+### On the main Akuma kernel (aarch64, 2026-11-05)
+
+The same aarch64 build on the main kernel (`cargo build --release`, smp-shared, `SMP=4`, HVF, 2 GiB, the
+scratch disk):
+
+- **The daemon needs `INFINITY_WS_PORT`.** Its WebSocket server binds `127.0.0.1:8080` by default, and the main
+  image's herd runs `/bin/httpd` there, so the daemon exits with `Address in use (os error 98)`, which is the
+  correct answer. With `INFINITY_WS_PORT=8090`: PONG, and tool turns that returned
+  `turn-1\naarch64\n0.00 0.00 0.00 16/16 264` through `run_command`.
+- **Load.** 13 sessions on one daemon, six of them started within a second (each with its provider process, an MCP
+  proxy RAP server and, when the model delegated, `spawn_thread` children): no kernel faults, and ssh stayed
+  up. The failures in that run were z.ai's `429 Too Many Requests` (code 1302) on a key other agents share, and
+  glm-5.3-flash choosing `spawn_thread` over calling the tool directly.
+- **Harness trap.** `infinity -H` returns as soon as the session exists, and the daemon logs
+  `Session <id> is idle but a client is still connected` at creation. Neither marks the end of a turn.
+- Getting there also found a **boot-suite failure** on the main kernel, unrelated to Infinity:
+  `docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`, "Correction (2026-11-05)".
 
 ## Background
 

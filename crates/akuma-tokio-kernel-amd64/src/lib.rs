@@ -53,7 +53,6 @@ use akuma_idt_amd64 as idt_lib;
 use akuma_trap_amd64 as trap;
 use akuma_trap_amd64::{InterruptStackFrame, Kind, Trap};
 use akuma_vfs::Filesystem;
-use akuma_boot_amd64::paging::{MemAttr, PteProt};
 use akuma_ring3_amd64 as ring3;
 
 // PB1 linkage proof (session pb): the two M4 crates must be *referenced*, or
@@ -224,31 +223,13 @@ static IDT: idt_lib::Idt = idt_lib::Idt::new();
 /// this kernel is a bug in this kernel; there is no userspace to deliver it to
 /// and no scheduler to defer it through, so the honest report is the full
 /// frame and a halt. The `[Fault]` token is the gate's vocabulary.
-/// How far a user stack may grow below its initial pages: 8 MiB, the Linux
-/// default `ulimit -s`. cargo's main thread goes deeper than the 64 KiB
-/// every image starts with.
-pub(crate) const STACK_MAX: u64 = 8 << 20;
+/// How far a user stack may grow (8 MiB); core's, shared with aarch64.
+pub(crate) use akuma_tokio_kernel_core::loader::STACK_MAX;
 
-/// A not-present fault just under a task's stack region is the stack growing:
-/// map the zeroed pages between the fault and the region, widen the region,
-/// and let the instruction retry. False for any other fault.
+/// A not-present fault just under a task's stack region is the stack growing
+/// (core's `grow_user_stack`, over this machine's tree).
 fn grow_user_stack(cr2: u64) -> bool {
-    let Some((root, (first, lo))) =
-        with_task(|tk| Some((tk.root_pa, tk.layout.growth_below(USER_STACK_TOP, STACK_MAX, cr2)?)))
-    else {
-        return false;
-    };
-    let mut page = lo;
-    while page > first {
-        page -= 4096;
-        let Some(pa) = akuma_pmm::alloc_page_zeroed() else {
-            return false;
-        };
-        if !paging::map_page_in(root, page as usize, pa as u64, PteProt::USER_RW, MemAttr::WriteBack) {
-            return false;
-        }
-    }
-    with_task(|tk| tk.layout.extend_down(USER_STACK_TOP, first))
+    akuma_tokio_kernel_core::loader::grow_user_stack::<lazy::Amd64>(cr2)
 }
 
 // ---------------------------------------------------------------------------
@@ -900,7 +881,7 @@ fn banner() {
 // `USER_TOP` (the end of the canonical user half: nothing a task names at or above it may be
 // mapped, read or written for it) is `akuma_tokio_kernel_core::task`'s.
 use akuma_tokio_kernel_core::mm;
-use akuma_tokio_kernel_core::task::{USER_TOP, USER_STACK_TOP, Task};
+use akuma_tokio_kernel_core::task::{USER_TOP, Task};
 /// Bisect mask for the mmap-slab rework, set from the kernel command line
 /// (`mmdbg=N`, default 7): 1 = munmap frees + records holes, 2 = MAP_FIXED
 /// releases what it replaces, 4 = mremap frees/moves the old range.

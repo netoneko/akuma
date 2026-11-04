@@ -91,6 +91,32 @@ makes a pending signal deliverable.
   smp=1 and smp=4: all pass, 0 faults, after both fixes. Before the
   `rt_sigprocmask` fix the smp=4 run hung in `pidfdprobe`.
 
+## Correction (2026-11-05): the boot suite was not run, and one of its tests asserted the old rule
+
+The verification above ran Taoxichuan and the amd64 probe battery, **not the main kernel's boot suite**.
+That suite's `test_tkill_blocked_fatal_is_pended` (`src/pthread_tests.rs`) sent a blocked SIGTERM to a
+kernel thread from `threading::spawn_fn` and asserted it was pended. A kernel thread has no owning
+process, so under this fix's rule the signal is dropped, and the main kernel panicked at boot on every run
+(`a blocked fatal signal was not pended for later delivery`). Found 2026-11-05 booting the main kernel at
+SMP=4 under HVF to run Infinity on it. It reproduced 3 of 3, including on a kernel built before B21 A6. The
+`[BKL] stuck owner=1 tag=511` lines printed just before it are the known load-driven storm and are
+unrelated: an instrumented build showed `tkill` returning in 3 us with the target's mask still set and
+nothing pended.
+
+The rule stands, and the test now asserts it: `test_tkill_to_a_kernel_thread_is_dropped` checks that a
+fatal signal to a kernel thread, blocked or not, returns 0, pends nothing and leaves the thread alone.
+The "blocked fatal default -> pend" branch is reachable only with a real process target now, so its
+coverage moved to the host: `sys_tkill`'s decision is `akuma_syscalls_signal::tkill_action`, a pure
+function of (signal, target disposition and group, or no process, mask), and glue only looks up and acts.
+Its tests are per-branch cases, an exhaustive sweep of every signal x target x blocked state checked
+against stated invariants (no process -> drop; nothing reaches the caller's group unless the target is in
+it; a blocked signal never acts now; only an unblocked fatal default or SIGKILL kills; a handler always
+pends), and a seeded 200,000-case fuzz showing that only the signal's own mask bit matters.
+`signal_is_fatal_default` forwards to the same crate's `fatal_by_default`, so the table has one copy.
+
+Verified: the boot suite passes at SMP=4 (HVF, 2 GiB) and the kernel serves ssh; `cargo test -p
+akuma-syscalls-signal` passes (17 tests).
+
 ## Still open
 
 - **Not yet run: the in-VM `rustc` self-host build (`-j4`)**, the workload that

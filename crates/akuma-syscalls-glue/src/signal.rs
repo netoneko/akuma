@@ -74,9 +74,11 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
 /// `SIGUSR1` storm killed `rustc` the day they were added. `sys_tkill` now
 /// attributes or drops, and acts on the target's group, never the caller's
 /// (`docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
+///
+/// The table is `akuma_syscalls_signal::fatal_by_default` (host-tested).
 #[must_use]
 pub fn signal_is_fatal_default(sig: u32) -> bool {
-    matches!(sig, 1..=64) && !matches!(sig, 17..=23 | 28)
+    akuma_syscalls_signal::fatal_by_default(u64::from(sig))
 }
 
 /// rt_sigprocmask - change the signal mask
@@ -346,6 +348,7 @@ pub fn check_signal_tid(tid: u32) -> Result<(), akuma_exec::process::SignalDeny>
 }
 
 pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
+    use akuma_syscalls_signal::{Disposition, TkillAction};
     if let Err(e) = check_signal_tid(tid) {
         return deny_errno(e);
     }
@@ -359,72 +362,41 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
 
     // Handler is process-wide (sigaction); the mask is PER-THREAD — read the
     // *target* thread's mask (docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D).
-    //
     // A tid with no process (a kernel thread `check_signal_tid` let the host
-    // reach) or a process already gone has no disposition to run: the signal is
-    // dropped. Reading that as `Default` is what made fatal-by-default
-    // `SIGUSR1` kill rustc (`docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
+    // reach) or a process already gone is `None`, and the decision drops it.
+    // What to do is `akuma_syscalls_signal::tkill_action`'s (host-tested, the
+    // rules and their reasons are there); this function only looks up and acts.
     let target_mask = akuma_exec::threading::thread_signal_mask_of(tid as usize);
-    let Some(target_pid) = akuma_exec::process::find_pid_by_thread(tid as usize) else {
-        return 0;
-    };
-    let Some(target) = akuma_exec::process::lookup_process_shared(target_pid) else {
-        return 0;
-    };
-    let target_handler = target.signal_actions.actions.lock()[(sig - 1) as usize].handler;
-    // A default action that kills ends the *target's* group. When that is the
-    // caller's own, it ends here; otherwise the target takes it at its own next
-    // return to EL0, woken from any park by the interrupt bit.
-    let same_group = akuma_exec::process::read_current_pid() == Some(target_pid);
-
-    // SIGKILL (9) is always fatal and cannot be blocked/handled
-    if sig == 9 {
-        if same_group {
-            super::proc::sys_exit_group(-(sig as i32));
-            return 0;
-        }
-        akuma_exec::threading::pend_signal_for_thread(tid as usize, sig);
-        akuma_exec::process::interrupt_thread(tid as usize);
-        return 0;
-    }
+    let target_pid = akuma_exec::process::find_pid_by_thread(tid as usize);
+    let target = target_pid.and_then(|pid| {
+        let proc = akuma_exec::process::lookup_process_shared(pid)?;
+        let handler = proc.signal_actions.actions.lock()[(sig - 1) as usize].handler;
+        let disposition = match handler {
+            akuma_exec::process::SignalHandler::Ignore => Disposition::Ignore,
+            akuma_exec::process::SignalHandler::Default => Disposition::Default,
+            akuma_exec::process::SignalHandler::UserFn(_) => Disposition::Handler,
+        };
+        Some((disposition, akuma_exec::process::read_current_pid() == Some(pid)))
+    });
+    let action = akuma_syscalls_signal::tkill_action(u64::from(sig), target, target_mask);
 
     if akuma_config::TRACE_TKILL {
-        let kind = match target_handler {
-            akuma_exec::process::SignalHandler::Ignore => "IGN",
-            akuma_exec::process::SignalHandler::Default => "DFL",
-            akuma_exec::process::SignalHandler::UserFn(_) => "FN",
-        };
-        akuma_primitives::safe_print!(128, "[signal]   tkill disp={} mask={:#x} blocked={} fatal={}\n",
-            kind, target_mask, (target_mask & (1u64 << (sig - 1))) != 0,
-            signal_is_fatal_default(sig));
+        akuma_primitives::safe_print!(128, "[signal]   tkill target={:?} mask={:#x} -> {:?}\n",
+            target, target_mask, action);
     }
 
-    match target_handler {
-        akuma_exec::process::SignalHandler::Ignore => 0,
-        akuma_exec::process::SignalHandler::Default => {
-            let bit = 1u64 << (sig - 1);
-            let blocked = (target_mask & bit) != 0;
-
-            if !signal_is_fatal_default(sig) {
-                // Ignored by default: nothing to do.
-            } else if blocked {
-                // Fatal but blocked: pend it so it fires when unmasked.
-                akuma_exec::threading::pend_signal_for_thread(tid as usize, sig);
-            } else if same_group {
-                super::proc::sys_exit_group(-(sig as i32));
-            } else {
-                akuma_exec::threading::pend_signal_for_thread(tid as usize, sig);
-                akuma_exec::process::interrupt_thread(tid as usize);
-            }
-            0
-        }
-        akuma_exec::process::SignalHandler::UserFn(_) => {
-            // Pend the signal on the target thread so it is delivered at the
-            // next syscall return for that thread.
+    match action {
+        TkillAction::Drop => {}
+        TkillAction::Pend => akuma_exec::threading::pend_signal_for_thread(tid as usize, sig),
+        TkillAction::PendInterrupt => {
             akuma_exec::threading::pend_signal_for_thread(tid as usize, sig);
-            0
+            akuma_exec::process::interrupt_thread(tid as usize);
+        }
+        TkillAction::ExitOwnGroup => {
+            super::proc::sys_exit_group(-(sig as i32));
         }
     }
+    0
 }
 
 /// tgkill(tgid, tid, sig) — like tkill but the thread must belong to thread

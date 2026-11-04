@@ -132,6 +132,19 @@ place_segment`, which builds the page from all overlapping segments) agree.
 Replacing the page with the later segment's frame drops the earlier segment's
 bytes and its exec bit (`docs/archive/TAOXICHUAN_LOADER_SHARED_SEGMENT_PAGE.md`).
 
+### The main thread's stack grows
+
+An image starts with 64 KiB of stack under `USER_STACK_TOP`. A not-present fault
+from user mode just below that region grows it, up to 8 MiB (Linux's default
+`ulimit -s`). On Taoxichuan that is `akuma-tokio-kernel-core::loader::grow_user_stack`,
+called by **both** machines' user fault paths. LLVM's stack probe (`sub sp, #4096;
+str xzr, [sp]`) grows it one page per fault; `Runtime::block_on` of a large
+`async main` is a 46 KB frame and probes past 64 KiB at start. A machine without
+this kills such programs before `main` runs (`docs/archive/INFINITY_ON_TAOXICHUAN.md`,
+Update 2026-11-04). Growth is from user faults only: a syscall that is the first to
+touch a new stack page gets `EFAULT`. That needs a raw syscall from a leaf frame,
+since any libc call touches the lower stack first.
+
 ### Dynamic linking (PT_INTERP)
 
 - A `PT_INTERP` program header names the interpreter; the loader reads it via

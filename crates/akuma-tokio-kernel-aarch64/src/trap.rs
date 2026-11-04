@@ -159,6 +159,12 @@ fn el0_sync_locked(f: &mut Frame) {
     match f.ec() {
         ec::SVC64 => return crate::syscall::svc(f),
         ec::DABT_LOWER if user_fault(f.far, f.esr, true, true) => return,
+        // Just under the stack region: the stack growing (core's rule, as on amd64).
+        ec::DABT_LOWER
+            if is_translation(f.esr) && akuma_tokio_kernel_core::loader::grow_user_stack::<Aarch64>(f.far) =>
+        {
+            return;
+        }
         ec::IABT_LOWER if user_fault(f.far, f.esr, false, true) => return,
         _ => {}
     }

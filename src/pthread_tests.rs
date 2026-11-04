@@ -515,11 +515,15 @@ fn test_tkill_validation_and_signal_boundary() {
     console::print("  [PASS] test_tkill_validation_and_signal_boundary\n");
 }
 
-/// A fatal-by-default signal that is currently *blocked* on the target thread
-/// must be pended (delivered later when unmasked), not dropped or acted on now.
-/// Exercises the `sys_tkill` Default-handler + blocked branch on a parked
-/// sibling (so a misfire can't kill the boot thread).
-fn test_tkill_blocked_fatal_is_pended() {
+/// A signal to a thread with no owning process (a kernel thread) is dropped:
+/// it has no disposition to run, and acting on it as `Default` is what let a
+/// `SIGUSR1` storm kill `rustc` (`docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
+/// So `tkill` of a fatal signal, blocked or not, returns 0, pends nothing and
+/// harms no one. Until 2026-11-05 this test asserted the opposite (a blocked
+/// fatal signal pended on a kernel thread), the rule from before that fix; the
+/// pend branch is now covered on the host, with every other branch, by
+/// `akuma-syscalls-signal`'s `tkill_action` tests.
+fn test_tkill_to_a_kernel_thread_is_dropped() {
     static TID: AtomicU32 = AtomicU32::new(u32::MAX);
     static READY: AtomicBool = AtomicBool::new(false);
     static FINISH: AtomicBool = AtomicBool::new(false);
@@ -556,14 +560,23 @@ fn test_tkill_blocked_fatal_is_pended() {
     let r = crate::syscall::handle_syscall(NR_TKILL, &[tid as u64, u64::from(SIGTERM), 0, 0, 0, 0]);
     assert!(r == 0, "tkill returned {r:#x}");
     assert!(
-        threading::peek_pending_signal(tid) == SIGTERM,
-        "a blocked fatal signal was not pended for later delivery"
+        threading::peek_pending_signal(tid) == 0,
+        "a signal to a kernel thread (no process) was pended; it must be dropped"
+    );
+    // Unblocked too: still dropped, and the thread is still there.
+    threading::seed_thread_signal_mask(tid, 0);
+    let r = crate::syscall::handle_syscall(NR_TKILL, &[tid as u64, u64::from(SIGTERM), 0, 0, 0, 0]);
+    assert!(r == 0, "tkill (unblocked) returned {r:#x}");
+    assert!(threading::peek_pending_signal(tid) == 0, "unblocked: pended on a kernel thread");
+    assert!(
+        threading::thread_signal_mask_of(tid) == 0 && TID.load(Ordering::Acquire) as usize == tid,
+        "the target's state changed under a dropped signal"
     );
 
     threading::pend_signal_for_thread(tid, 0);
     FINISH.store(true, Ordering::Release);
     for _ in 0..400 { threading::yield_now(); }
-    console::print("  [PASS] test_tkill_blocked_fatal_is_pended\n");
+    console::print("  [PASS] test_tkill_to_a_kernel_thread_is_dropped\n");
 }
 
 // gap-2 (SIGUSR1/SIGUSR2/RT signals fatal by default, as on Linux) is closed:
@@ -856,7 +869,7 @@ pub fn run_all_tests() {
     test_pending_signal_targets_correct_thread();
     test_take_pending_respects_mask_and_order();
     test_tkill_validation_and_signal_boundary();
-    test_tkill_blocked_fatal_is_pended();
+    test_tkill_to_a_kernel_thread_is_dropped();
     test_rt_sigsuspend_validation();
     test_rt_sigsuspend_blocks_then_eintr();
 

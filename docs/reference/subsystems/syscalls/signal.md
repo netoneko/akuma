@@ -143,7 +143,13 @@ bottom out in.
   **the target's group, never the caller's**: `sys_exit_group` when the target
   is in the caller's own group, else pend + `interrupt_thread` so the target dies
   at its own return. Blocked → pended until unmasked.
-- **`signal_is_fatal_default`** is Linux's disposition table: everything in
+  **The decision is `akuma_syscalls_signal::tkill_action`** (host-tested, with an
+  exhaustive sweep and a mask fuzz); `sys_tkill` only looks up the target and
+  performs the returned `Drop`/`Pend`/`PendInterrupt`/`ExitOwnGroup`. Change the
+  rule there, never inline. A kernel thread (no process) is a dropped target, so
+  boot tests cannot reach the pend branch through `spawn_fn`; that branch is
+  covered on the host (`archive/SIGNAL_FATAL_DEFAULT_LINUX.md`, correction).
+- **`signal_is_fatal_default`** (forwarding to `akuma_syscalls_signal::fatal_by_default`) is Linux's disposition table: everything in
   `1..=64` except ignore-by-default (17, 23, 28) and stop/continue (18-22, no
   job control). The two `tkill` rules above are what make that safe under the
   `SIGUSR1` storm of a `rustc` build (`archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).

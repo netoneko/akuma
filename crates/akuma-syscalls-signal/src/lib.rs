@@ -202,5 +202,85 @@ pub fn procmask(how: u64, cur: u64, new: Option<u64>, sigsetsize: u64) -> Result
     })
 }
 
+// ── tkill's decision ─────────────────────────────────────────────────────────
+
+/// Does `sig` (1..=64) terminate the process when no handler is installed?
+///
+/// Linux's table: every signal except those whose default is to ignore
+/// (`SIGCHLD` 17, `SIGURG` 23, `SIGWINCH` 28) or to stop or continue (18..=22;
+/// no job control here, so those are no-ops rather than kills). That includes
+/// `SIGUSR1`/`SIGUSR2` and the real-time signals 32..=64.
+#[must_use]
+pub const fn fatal_by_default(sig: u64) -> bool {
+    matches!(sig, 1..=64) && !matches!(sig, 17..=23 | 28)
+}
+
+/// The target thread's process-wide disposition for the signal (`sigaction`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    Ignore,
+    Default,
+    /// A user handler.
+    Handler,
+}
+
+/// What `tkill`/`tgkill` does with a signal (already validated as 1..=64).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TkillAction {
+    /// Nothing happens; the call still succeeds.
+    Drop,
+    /// Set the pending bit on the target thread; it runs when unmasked, at the
+    /// target's next return to user mode.
+    Pend,
+    /// Pend, and interrupt the target out of any park so it acts promptly (a
+    /// fatal default it cannot block).
+    PendInterrupt,
+    /// The caller's own group dies now: the target is in it and the default
+    /// action kills.
+    ExitOwnGroup,
+}
+
+/// `tkill`'s decision.
+///
+/// `target` is `None` when the thread has no owning process: a kernel thread,
+/// or a process already gone. Otherwise it is the target's disposition for
+/// `sig` and whether the target is in the caller's thread group. `mask` is the
+/// *target thread's* blocked set.
+///
+/// The rules (and why):
+/// - **No owning process: drop.** There is no disposition to run. Reading that
+///   as `Default` and acting on it is what made a `SIGUSR1` storm kill `rustc`
+///   (`docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
+/// - `SIGKILL` cannot be blocked or handled: the caller's group exits if it is
+///   the target's, else the target is pended and interrupted.
+/// - A handler always pends (delivered at the next return to user mode).
+/// - `Default`: not fatal, nothing; fatal and blocked, pend; fatal and
+///   unblocked, the group exits (own) or the target is pended and interrupted.
+/// - `Ignore`: nothing.
+#[must_use]
+pub const fn tkill_action(sig: u64, target: Option<(Disposition, bool)>, mask: u64) -> TkillAction {
+    let Some((disposition, same_group)) = target else {
+        return TkillAction::Drop;
+    };
+    if sig == SIGKILL {
+        return if same_group { TkillAction::ExitOwnGroup } else { TkillAction::PendInterrupt };
+    }
+    match disposition {
+        Disposition::Ignore => TkillAction::Drop,
+        Disposition::Handler => TkillAction::Pend,
+        Disposition::Default => {
+            if !fatal_by_default(sig) {
+                TkillAction::Drop
+            } else if mask & bit(sig) != 0 {
+                TkillAction::Pend
+            } else if same_group {
+                TkillAction::ExitOwnGroup
+            } else {
+                TkillAction::PendInterrupt
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

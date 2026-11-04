@@ -176,3 +176,138 @@ fn altstack_flag_rules() {
     assert_eq!(altstack_change(0, MINSIGSTKSZ), Ok(AltStackChange::Install));
     assert_eq!(altstack_change(i32::MIN, MINSIGSTKSZ), Ok(AltStackChange::Install));
 }
+
+// ── tkill_action ─────────────────────────────────────────────────────────────
+
+const DISPOSITIONS: [Disposition; 3] = [Disposition::Ignore, Disposition::Default, Disposition::Handler];
+
+/// Every target `tkill_action` can be asked about: no process, or one of the
+/// three dispositions in or out of the caller's group.
+fn targets() -> impl Iterator<Item = Option<(Disposition, bool)>> {
+    core::iter::once(None).chain(DISPOSITIONS.into_iter().flat_map(|d| [Some((d, false)), Some((d, true))]))
+}
+
+#[test]
+fn fatal_by_default_is_linuxs_table() {
+    // Ignored by default, or stop/continue (a no-op here): everything else kills.
+    let not_fatal = [17, 18, 19, 20, 21, 22, 23, 28];
+    for sig in 1..=64 {
+        assert_eq!(fatal_by_default(sig), !not_fatal.contains(&sig), "sig {sig}");
+    }
+    for sig in [0, 65, 100, u64::MAX] {
+        assert!(!fatal_by_default(sig), "sig {sig} is not a signal");
+    }
+    // The ones the pre-2026-11-04 table left out are fatal now.
+    for sig in [10, 12, 16, 29, 30, 32, 34, 64] {
+        assert!(fatal_by_default(sig), "sig {sig}");
+    }
+}
+
+#[test]
+fn a_thread_with_no_process_drops_everything() {
+    for sig in 1..=64 {
+        for mask in [0, u64::MAX, bit(sig)] {
+            assert_eq!(tkill_action(sig, None, mask), TkillAction::Drop, "sig {sig} mask {mask:#x}");
+        }
+    }
+}
+
+#[test]
+fn each_branch() {
+    use Disposition::{Default, Handler, Ignore};
+    use TkillAction::{Drop, ExitOwnGroup, Pend, PendInterrupt};
+    const TERM: u64 = 15;
+    const CHLD: u64 = 17;
+    // SIGKILL: no mask, no handler, no ignore.
+    for d in DISPOSITIONS {
+        assert_eq!(tkill_action(SIGKILL, Some((d, true)), u64::MAX), ExitOwnGroup);
+        assert_eq!(tkill_action(SIGKILL, Some((d, false)), u64::MAX), PendInterrupt);
+    }
+    assert_eq!(tkill_action(TERM, Some((Ignore, true)), 0), Drop);
+    assert_eq!(tkill_action(TERM, Some((Handler, true)), 0), Pend);
+    assert_eq!(tkill_action(TERM, Some((Handler, false)), bit(TERM)), Pend);
+    assert_eq!(tkill_action(CHLD, Some((Default, true)), 0), Drop);
+    // The branch the boot suite used to cover through a kernel thread.
+    assert_eq!(tkill_action(TERM, Some((Default, false)), bit(TERM)), Pend);
+    assert_eq!(tkill_action(TERM, Some((Default, true)), bit(TERM)), Pend);
+    assert_eq!(tkill_action(TERM, Some((Default, true)), 0), ExitOwnGroup);
+    assert_eq!(tkill_action(TERM, Some((Default, false)), 0), PendInterrupt);
+    // SIGUSR1 to a sibling thread with no handler kills the group, as on Linux.
+    assert_eq!(tkill_action(10, Some((Default, true)), 0), ExitOwnGroup);
+}
+
+/// Exhaustive: every signal, target and blocked state, against the rules
+/// stated as properties rather than as the function's own branches.
+#[test]
+fn exhaustive_sweep_holds_the_invariants() {
+    let mut seen = [false; 4];
+    for sig in 1..=64 {
+        for target in targets() {
+            for blocked in [false, true] {
+                let mask = if blocked { bit(sig) } else { 0 };
+                let a = tkill_action(sig, target, mask);
+                seen[a as usize] = true;
+                let ctx = (sig, target, blocked, a);
+                let kills = matches!(a, TkillAction::ExitOwnGroup | TkillAction::PendInterrupt);
+                // Nothing reaches the caller's group unless the target is in it.
+                if a == TkillAction::ExitOwnGroup {
+                    assert!(matches!(target, Some((_, true))), "{ctx:?}");
+                }
+                // A thread with no process is never acted on.
+                if target.is_none() {
+                    assert_eq!(a, TkillAction::Drop, "{ctx:?}");
+                }
+                if sig != SIGKILL {
+                    // A blocked signal never acts now, and is never lost while
+                    // something would run it (a handler, or a fatal default).
+                    if blocked {
+                        assert!(!kills, "{ctx:?}");
+                    }
+                    if let Some((d, _)) = target {
+                        // Only a fatal default kills, and only unblocked.
+                        if kills {
+                            assert!(d == Disposition::Default && fatal_by_default(sig) && !blocked, "{ctx:?}");
+                        }
+                        if d == Disposition::Ignore {
+                            assert_eq!(a, TkillAction::Drop, "{ctx:?}");
+                        }
+                        if d == Disposition::Handler {
+                            assert_eq!(a, TkillAction::Pend, "{ctx:?}");
+                        }
+                        if d == Disposition::Default && fatal_by_default(sig) && blocked {
+                            assert_eq!(a, TkillAction::Pend, "{ctx:?}");
+                        }
+                    }
+                } else if target.is_some() {
+                    // SIGKILL cannot be blocked, ignored or handled.
+                    assert!(kills, "{ctx:?}");
+                }
+            }
+        }
+    }
+    assert!(seen.iter().all(|&s| s), "every action is reachable: {seen:?}");
+}
+
+/// Fuzz the mask: only the signal's own bit may matter. A seeded xorshift so a
+/// failure reproduces.
+#[test]
+fn only_the_signals_own_mask_bit_matters() {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let all: std::vec::Vec<_> = targets().collect();
+    for _ in 0..200_000 {
+        let sig = next() % 64 + 1;
+        let target = all[(next() % all.len() as u64) as usize];
+        let mask = next();
+        assert_eq!(
+            tkill_action(sig, target, mask),
+            tkill_action(sig, target, mask & bit(sig)),
+            "sig {sig} target {target:?} mask {mask:#x}"
+        );
+    }
+}

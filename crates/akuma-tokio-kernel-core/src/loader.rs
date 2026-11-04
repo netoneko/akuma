@@ -159,6 +159,43 @@ pub fn place_segment<M: Loader>(
     Some((first, last))
 }
 
+/// How far a task's stack may grow below its initial pages: 8 MiB.
+///
+/// The Linux default `ulimit -s`. cargo's main thread goes deeper than the
+/// 64 KiB every image starts with, and so does `Runtime::block_on` of a large
+/// `async main` (its frame is the whole future; Infinity's is 46 KB).
+pub const STACK_MAX: u64 = 8 << 20;
+
+/// Grow the running task's stack down to a faulting address just under it.
+///
+/// A not-present fault there is the stack growing: map zeroed pages from the
+/// faulting page up to the region, widen the region, and let the access retry.
+/// `false` for any other fault, or when a frame or a mapping fails (the fault
+/// then kills, as it would have).
+///
+/// One zeroed frame per page grown, at most [`STACK_MAX`] in all; no heap. A
+/// stack probe (`sub sp, #4096; str xzr, [sp]`) grows it one page per fault.
+#[must_use]
+pub fn grow_user_stack<M: Loader>(far: u64) -> bool {
+    let Some((root, (first, lo))) =
+        M::with_task(|t| Some((t.root_pa, t.layout.growth_below(USER_STACK_TOP, STACK_MAX, far)?)))
+    else {
+        return false;
+    };
+    let mut page = lo;
+    while page > first {
+        page -= 4096;
+        let Some(frame) = <M::Frame as FreshPage>::alloc_zeroed() else {
+            return false;
+        };
+        if !M::map_page(root, page, frame.pa() as u64, true, false, true) {
+            return false;
+        }
+        let _ = frame.publish();
+    }
+    M::with_task(|t| t.layout.extend_down(USER_STACK_TOP, first))
+}
+
 /// Copy `seg`'s file bytes that fall in the page at `pva` into `page`; nothing
 /// when they do not overlap. The slice starts at `p_offset`.
 fn copy_file_bytes(page: &mut [u8; 4096], pva: u64, image: &[u8], seg: &LoadSeg) {
