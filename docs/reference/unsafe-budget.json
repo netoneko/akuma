@@ -119,7 +119,7 @@
     "crates/akuma-slot-table": 9,
     "crates/akuma-threading": 69,
     "crates/akuma-timer": 1,
-    "crates/akuma-tokio-kernel-amd64": 30,
+    "crates/akuma-tokio-kernel-amd64": 29,
     "crates/akuma-trap-aarch64": 14,
     "crates/akuma-trap-amd64": 2,
     "crates/akuma-uart": 1,

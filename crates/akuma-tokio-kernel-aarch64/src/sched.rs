@@ -194,6 +194,7 @@ fn hooks() -> X86ArchHooks {
 extern "C" fn idle_main() -> ! {
     loop {
         akuma_cpu::park::irq_window();
+        crate::net::netpoll();
         let due = akuma_threading::wake_is_due(akuma_threading::x86_earliest_wake_time(), crate::fs::uptime_us());
         if due || akuma_threading::x86_runnable_exists() {
             akuma_threading::x86_yield();

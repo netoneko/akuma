@@ -1060,6 +1060,7 @@ dependencies = [
  "akuma-fpcache-rw",
  "akuma-mmap",
  "akuma-mmu",
+ "akuma-net",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-syscalls-glue",

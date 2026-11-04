@@ -29,7 +29,7 @@
 //! sleeping task (glue's `nanosleep`) parks, so the core idles and the idle
 //! lap pumps.
 
-use akuma_net::NetRuntime;
+use akuma_tokio_kernel_core::net::{self, NetMachine};
 
 // ---------------------------------------------------------------------------
 // Port I/O — x86_64-only by construction (this crate never joins the root
@@ -225,178 +225,39 @@ pub fn rng_fill(buf: &mut [u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// The NetRuntime table — twelve function pointers, each collapsed to what a
-// one-core, no-interrupt, no-scheduler kernel can honestly answer. The same
-// collapses `akuma-amd64` makes (see `amd64/src/net.rs`); written out one by
-// one so each is a decision with a reason attached.
+// The socket layer's table, pump and bring-up are core's
+// (`akuma_tokio_kernel_core::net`); this machine supplies the clock, the lap and
+// the entropy.
 // ---------------------------------------------------------------------------
 
-/// Spin until `deadline_us`. The wait loops call this as a *backstop* between
-/// re-checks, and every lap pumps the NIC — on this guest there is no
-/// interrupt to wake anybody, so a backstop that did not poll would add its
-/// whole duration to every socket latency.
-fn park_until(deadline_us: u64) {
-    while uptime_us() < deadline_us {
-        netpoll();
+/// The amd64 machine as `akuma_tokio_kernel_core::net` sees it.
+pub struct Amd64Net;
+
+impl NetMachine for Amd64Net {
+    fn uptime_us() -> u64 {
+        uptime_us()
+    }
+    fn wait_lap() {
         wait_lap();
     }
-}
-
-/// One lap of a socket waiter with nothing to do. `wait_until` drives
-/// `poll()` itself at the top of every lap; this hook only has to burn a
-/// bounded moment before the next re-check. [Q5 fix-cand] pump here too:
-/// a waiter that reaches this hook between predicate laps (send buffer
-/// full, e.g. sshd's exit report with the relay slot unacked) must keep
-/// the only pump in the kernel alive, or the guest deadlocks with its
-/// NIC ring unposted and its TX frames unflushed (Q5 wedge).
-fn blocking_relax() {
-    for _ in 0..64 {
-        netpoll();
-        wait_lap();
+    fn rng_fill(buf: &mut [u8]) {
+        rng_fill(buf);
     }
 }
 
-/// A waker that does nothing: nothing here is ever parked in a way a waker
-/// could resume — the wait loops poll.
-fn noop_waker() -> core::task::Waker {
-    use core::task::{RawWaker, RawWakerVTable, Waker};
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(core::ptr::null(), &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
-    // SAFETY: the vtable's four functions are all no-ops that ignore the
-    // data pointer, so a null pointer is never dereferenced.
-    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
-}
-
-fn runtime() -> NetRuntime {
-    /// No parked core to ring a doorbell at: loopback frames ride the next
-    /// poll lap, and there is no `wfi` sleeper to end early.
-    fn noop() {}
-    NetRuntime {
-        uptime_us,
-        utc_seconds: || None, // no wall clock; nothing in akuma-net reads this hook
-        yield_now: || {
-            // [Q5 fix-cand] never a bare pause: every yield lap must keep
-            // the pump alive (see blocking_relax).
-            netpoll();
-            wait_lap();
-        },
-        blocking_relax,
-        park_until,
-        current_waker: noop_waker,
-        current_core_id: || 0,
-        current_box_id: || 0,
-        is_current_interrupted: || false, // no signal delivery in this kernel
-        rng_fill,
-        current_thread_id: || 0,
-        wake_netpoll: noop,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bring-up and the poll pump.
-// ---------------------------------------------------------------------------
-
-/// One lap of the stack: drain the NIC into smoltcp, run its timers. The
-/// everything-path for inbound frames on this guest.
-///
-/// Bring-up and reentrancy guard (session ph): the tick backstop calls this
-/// from interrupt context while the task-context pumps (sshd's serve loop,
-/// the DHCP wait, the NetRuntime hooks) may be inside it, and a tick can
-/// fire before the stack exists. One lap at a time; a no-op until
-/// `net_init` brought the stack up.
-static NET_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-static IN_LAP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// One lap of the stack: the tick and the idle thread call it.
 pub fn netpoll() {
-    if !NET_UP.load(core::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    if IN_LAP.swap(true, core::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    #[cfg(feature = "trace-err")]
-    let t0 = uptime_us();
-    let _ = akuma_net::smoltcp_net::poll();
-    #[cfg(feature = "trace-err")]
-    lap_note(uptime_us().saturating_sub(t0));
-    IN_LAP.store(false, core::sync::atomic::Ordering::Release);
+    net::netpoll::<Amd64Net>();
 }
 
-/// Trace builds: how long the stack's laps take. A lap runs with the kernel lock held, so a slow
-/// one is a stall for every core that wants the lock (docs/archive/TAOXICHUAN_J4_BKL_CONVOY.md).
-/// One line a second when anything ran: `laps` (all), `slow` (over 2 ms), `max_us`, `sum_us`.
-#[cfg(feature = "trace-err")]
-fn lap_note(dur_us: u64) {
-    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static LAPS: AtomicU64 = AtomicU64::new(0);
-    static SLOW: AtomicU64 = AtomicU64::new(0);
-    static MAX: AtomicU64 = AtomicU64::new(0);
-    static SUM: AtomicU64 = AtomicU64::new(0);
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    LAPS.fetch_add(1, Relaxed);
-    SUM.fetch_add(dur_us, Relaxed);
-    if dur_us > 2_000 {
-        SLOW.fetch_add(1, Relaxed);
-    }
-    MAX.fetch_max(dur_us, Relaxed);
-    let now = uptime_us();
-    let next = NEXT.load(Relaxed);
-    if now >= next && NEXT.compare_exchange(next, now + 1_000_000, Relaxed, Relaxed).is_ok() {
-        akuma_primitives::safe_print!(
-            128,
-            "[netlap] laps={} slow={} max_us={} sum_us={}\n",
-            LAPS.swap(0, Relaxed),
-            SLOW.swap(0, Relaxed),
-            MAX.swap(0, Relaxed),
-            SUM.swap(0, Relaxed)
-        );
-    }
-}
-
-/// The socket layer with no NIC: `127.0.0.1` works, nothing else is reachable. A kernel
-/// that leaves `Kernel::net` unwired, or whose NIC probe failed.
+/// The socket layer with no NIC.
 pub fn loopback_init() {
-    if akuma_net::init_loopback_only(runtime()).is_err() {
-        crate::console::puts("  net: loopback init failed\n");
-        return;
-    }
-    crate::console::puts("  net: loopback only\n");
+    net::loopback_init::<Amd64Net>();
 }
 
+/// The stack on virtio-net and the DHCP wait; the clock was calibrated earlier
+/// ([`calibrate`], before `exec_twin::init`).
 #[cfg(feature = "net")]
-/// The stack itself (probe virtio-net, bring up smoltcp, start DHCP); the
-/// clock was calibrated earlier ([`calibrate`], before `exec_twin::init`).
-/// Then the DHCP wait: bounded, pumping the NIC, so the guest
-/// has its address before init asks the socket layer for a port.
 pub fn net_init() -> bool {
-    akuma_primitives::safe_print!(96, "  net: stack init begin\n");
-    if akuma_net::init(runtime(), true).is_err() {
-        crate::console::puts("  net: stack init failed -- no virtio-net device\n");
-        return false;
-    }
-    NET_UP.store(true, core::sync::atomic::Ordering::Release);
-    crate::raw_uart(b"[raw] stack up, dhcp loop\n");
-    crate::console::puts("  net: smoltcp stack up, DHCP requested\n");
-    let deadline = uptime_us() + 10_000_000; // 10 s
-    while uptime_us() < deadline {
-        netpoll();
-        if akuma_net::smoltcp_net::is_dhcp_configured() {
-            let ip = akuma_net::smoltcp_net::static_ipv4().addr;
-            akuma_primitives::safe_print!(
-                96,
-                "  net: DHCP configured, {}.{}.{}.{}\n",
-                ip[0],
-                ip[1],
-                ip[2],
-                ip[3]
-            );
-            return true;
-        }
-        wait_lap();
-    }
-    crate::console::puts("  net: DHCP not answered in 10 s -- continuing unaddressed\n");
-    false
+    net::net_init::<Amd64Net>()
 }

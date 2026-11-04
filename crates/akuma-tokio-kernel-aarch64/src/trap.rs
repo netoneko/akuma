@@ -70,6 +70,12 @@ fn irq(f: &mut Frame) {
         }
         akuma_tokio_kernel_core::signal::deliver_fatal_on_tick::<Aarch64>();
     }
+    // The pump's backstop: a user thread that never enters the kernel would
+    // otherwise starve the NIC (no interrupt of its own here). A lap per tick
+    // bounds that at 10 ms; `netpoll` guards its own reentry.
+    if tick {
+        crate::net::netpoll();
+    }
 }
 
 /// Data/instruction fault status: translation (a page not mapped yet).

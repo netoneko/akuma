@@ -30,6 +30,7 @@ mod exec;
 mod fs;
 mod machine;
 mod mm;
+mod net;
 mod proc;
 mod sched;
 mod signal;
@@ -57,6 +58,8 @@ pub struct Kernel {
     console: bool,
     #[cfg(feature = "disk")]
     disk: bool,
+    #[cfg(feature = "net")]
+    net: bool,
 }
 
 impl Kernel {
@@ -70,6 +73,8 @@ impl Kernel {
             console: false,
             #[cfg(feature = "disk")]
             disk: false,
+            #[cfg(feature = "net")]
+            net: false,
         }
     }
 
@@ -97,10 +102,10 @@ impl Kernel {
         Self { disk: true, ..self }
     }
 
-    /// The first virtio-net device (not wired on aarch64 yet).
+    /// The first virtio-net device with DHCP; without it, loopback only.
     #[cfg(feature = "net")]
     pub const fn net(self) -> Self {
-        self
+        Self { net: true, ..self }
     }
 
     /// The secondary cores (not wired on aarch64 yet).
@@ -194,6 +199,11 @@ fn boot(k: &Kernel) -> ! {
     exec::init();
     sched::init();
     fs::install_surface();
+    #[cfg(feature = "net")]
+    let nic = k.net && m.virtio.is_some();
+    #[cfg(not(feature = "net"))]
+    let nic = false;
+    net::init(nic);
     #[cfg(feature = "disk")]
     let root = if k.disk && m.virtio.is_some() { fs::disk_root() } else { None };
     #[cfg(not(feature = "disk"))]

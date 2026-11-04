@@ -17,7 +17,7 @@ workspace = true
 no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
 # Name every syscall that answers a negative errno on the console (`[err] nr=N -E`), and keep
 # the evidence rings the leak gate reads.
-trace-err = []
+trace-err = ["akuma-tokio-kernel-core/trace-err"]
 # The PMM's use-after-free instruments (`akuma_boot_amd64::mem::init`'s forensics flag):
 # freed frames sit in a quarantine, a premature free and a resurrected frame are reported.
 pmm-forensics = []
@@ -159,5 +159,5 @@ akuma-syscalls-glue-amd64 = { path = "../akuma-syscalls-glue-amd64" }
 # The tokio surface: the allow-list, the hooks and the dispatch to glue (Phase 3).
 akuma-runtime-tokio = { path = "../akuma-runtime-tokio", features = ["process"] }
 # The arch-neutral half (B21): command-line tokens, the init program, identity, nosys, rings.
-akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["process"] }
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["process", "net"] }
 akuma-user-access = { path = "../akuma-user-access" }

@@ -19,6 +19,8 @@ pub mod init;
 pub mod lazy;
 #[cfg(feature = "lazy")]
 pub mod loader;
+#[cfg(feature = "net")]
+pub mod net;
 #[cfg(feature = "process")]
 pub mod proc;
 #[cfg(feature = "process")]
