@@ -139,14 +139,22 @@ fn el0_sync(f: &mut Frame) {
         ec::IABT_LOWER if user_fault(f.far, f.esr, false, true) => return,
         _ => {}
     }
+    // The leaf at the faulting address (0 when no table reaches it): what the
+    // page table said, which is what a permission fault is about.
+    let pte = if f.far < USER_TOP {
+        <Aarch64 as akuma_tokio_kernel_core::mmu::UserPages>::leaf(akuma_boot_aarch64::user::live_root(), f.far).unwrap_or(0)
+    } else {
+        0
+    };
     safe_print!(
-        192,
-        "[Fault] EL0 ec=0x{:x} elr=0x{:016x} sp=0x{:016x} far=0x{:016x} esr=0x{:x} -- task killed\n",
+        224,
+        "[Fault] EL0 ec=0x{:x} elr=0x{:016x} sp=0x{:016x} far=0x{:016x} esr=0x{:x} pte=0x{:x} -- task killed\n",
         f.ec(),
         f.elr,
         f.sp,
         f.far,
-        f.esr
+        f.esr,
+        pte
     );
     // Signals are A5.8: a fault ends the process as SIGSEGV would.
     crate::proc::die_segv()

@@ -119,6 +119,19 @@ Two loaders, picked by size (`src/elf_loader.rs` +
 `spawn_process_with_channel_ext` and `do_execve` try `read_file()` first; on
 `FsError` they fall back to the on-demand path via `file_size(path)`.
 
+### Two segments on one page
+
+`lld` packs segments without page alignment: a static libakuma binary can end
+`.text` and start its read-only segment on the same page (the disk's `sshd`:
+text to `0x416D00`, rodata from there). Every loader builds such a page
+**once**, holding the file bytes of every segment that overlaps it, with the
+permissions of the first segment to reach it; a later segment leaves a present
+page alone. The main kernel (`akuma-elf`'s `map_segment_eager`, first mapping
+wins, later bytes copied in) and Taoxichuan (`akuma-tokio-kernel-core::loader::
+place_segment`, which builds the page from all overlapping segments) agree.
+Replacing the page with the later segment's frame drops the earlier segment's
+bytes and its exec bit (`docs/archive/TAOXICHUAN_LOADER_SHARED_SEGMENT_PAGE.md`).
+
 ### Dynamic linking (PT_INTERP)
 
 - A `PT_INTERP` program header names the interpreter; the loader reads it via

@@ -93,8 +93,22 @@ pub fn read_image<M: lazy::Kernel>(path: &str) -> Result<Vec<u8>, akuma_vfs::FsE
 /// one frame for every process running the image) and a page wholly past the
 /// file a zero-fill record. A page the segment's start or file end cuts is
 /// filled here. Writable wins over executable.
+///
+/// Two segments can share a page (`lld` packs text and rodata without page
+/// alignment: the disk's `sshd` ends `.text` at `0x416D00` and starts the
+/// read-only segment there). The page is built once, by the first segment to
+/// reach it, with the file bytes of every segment in `all` that overlaps it,
+/// and keeps that segment's permissions; a later segment leaves a present page
+/// alone. That is the main kernel's loader's rule (`akuma-elf`'s
+/// `map_segment_eager`, first mapping wins).
 #[must_use]
-pub fn place_segment<M: Loader>(root: u64, image: &[u8], seg: &LoadSeg, inode: Option<u32>) -> Option<(u64, u64)> {
+pub fn place_segment<M: Loader>(
+    root: u64,
+    image: &[u8],
+    seg: &LoadSeg,
+    all: &[LoadSeg],
+    inode: Option<u32>,
+) -> Option<(u64, u64)> {
     let write = seg.flags & akuma_elf_exec::PF_W != 0;
     let exec = !write && seg.flags & akuma_elf_exec::PF_X != 0;
     let end = seg.vaddr.checked_add(seg.memsz)?.checked_add(0xFFF)?;
@@ -126,14 +140,14 @@ pub fn place_segment<M: Loader>(root: u64, image: &[u8], seg: &LoadSeg, inode: O
             pva += 4096;
             continue;
         }
+        // An earlier segment already built this page, with these bytes in it.
+        if M::leaf(root, pva).is_some_and(|e| !lazy::is_lazy(e) && M::frame_of(e).is_some()) {
+            pva += 4096;
+            continue;
+        }
         let mut frame = <M::Frame as FreshPage>::alloc_zeroed()?;
-        // The page's overlap with the file-backed range; the slice starts at `p_offset`.
-        let from = pva.max(seg.vaddr);
-        let to = (pva + 4096).min(file_end);
-        if from < to {
-            let off = (seg.offset + (from - seg.vaddr)) as usize;
-            let at = (from - pva) as usize;
-            frame.bytes_mut()[at..at + (to - from) as usize].copy_from_slice(&image[off..off + (to - from) as usize]);
+        for other in all {
+            copy_file_bytes(frame.bytes_mut(), pva, image, other);
         }
         let pa = frame.pa() as u64;
         if !M::map_page(root, pva, pa, write, exec, true) {
@@ -143,6 +157,22 @@ pub fn place_segment<M: Loader>(root: u64, image: &[u8], seg: &LoadSeg, inode: O
         pva += 4096;
     }
     Some((first, last))
+}
+
+/// Copy `seg`'s file bytes that fall in the page at `pva` into `page`; nothing
+/// when they do not overlap. The slice starts at `p_offset`.
+fn copy_file_bytes(page: &mut [u8; 4096], pva: u64, image: &[u8], seg: &LoadSeg) {
+    let from = pva.max(seg.vaddr);
+    let to = (pva + 4096).min(seg.vaddr.saturating_add(seg.filesz));
+    if from >= to {
+        return;
+    }
+    let off = (seg.offset + (from - seg.vaddr)) as usize;
+    let len = (to - from) as usize;
+    let at = (from - pva) as usize;
+    if let Some(src) = image.get(off..off + len) {
+        page[at..at + len].copy_from_slice(src);
+    }
 }
 
 /// Load an ELF image into the running task's record.
@@ -163,7 +193,7 @@ pub fn load_task<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &st
 
     let image_inode = M::root_fs().resolve_inode(path).ok();
     for seg in &segs[..n] {
-        let (first, last) = place_segment::<M>(root, image, seg, image_inode)?;
+        let (first, last) = place_segment::<M>(root, image, seg, &segs[..n], image_inode)?;
         add_region::<M>(first, last);
     }
 
@@ -183,7 +213,7 @@ pub fn load_task<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &st
             let mut hi = akuma_elf_exec::INTERP_BASE;
             let ldso_inode = M::root_fs().resolve_inode(&eff).ok();
             for seg in &isegs[..n] {
-                hi = hi.max(place_segment::<M>(root, &ldso, seg, ldso_inode)?.1);
+                hi = hi.max(place_segment::<M>(root, &ldso, seg, &isegs[..n], ldso_inode)?.1);
             }
             add_region::<M>(akuma_elf_exec::INTERP_BASE, hi);
             let Ok(ientry) = akuma_elf_exec::interp_entry(&ldso, akuma_elf_exec::INTERP_BASE) else {

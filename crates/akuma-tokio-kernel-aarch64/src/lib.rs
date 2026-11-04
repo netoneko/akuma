@@ -194,6 +194,7 @@ fn boot(k: &Kernel) -> ! {
         trap::TICK_US
     );
     safe_print!(160, "  cmdline: {}\n", m.cmdline.as_str());
+    anchor_wall_clock(m.cmdline.as_str());
 
     // The process runtime and the tokio surface, then the root.
     exec::init();
@@ -226,6 +227,23 @@ fn boot(k: &Kernel) -> ! {
     akuma_primitives::console::print_str(id.art);
     safe_print!(96, "\n  {} {} (akuma-tokio-kernel, aarch64)\n\n", id.name, id.version);
     run_init(m.cmdline.as_str())
+}
+
+/// The wall clock: `epoch=<unix seconds>` on the command line, anchored at
+/// the uptime sampled here (the amd64 half's rule; the rig passes the host's
+/// time). Without it `CLOCK_REALTIME` counts from 1970 at boot and TLS refuses
+/// every certificate as not yet valid.
+fn anchor_wall_clock(cmdline: &str) {
+    let Some(e) = akuma_tokio_kernel_core::cmdline::token(cmdline, "epoch=") else {
+        return;
+    };
+    let Ok(secs) = e.parse::<u64>() else {
+        safe_print!(64, "  [clock] bad epoch= token, ignored\n");
+        return;
+    };
+    let at = fs::uptime_us();
+    akuma_primitives::clock::set_utc_time_us(secs.saturating_mul(1_000_000), at);
+    safe_print!(96, "  [clock] epoch={} anchored at uptime={}us\n", secs, at);
 }
 
 /// Load `init=` (with `initargs=`/`initenv=`, `akuma_tokio_kernel_core::init::Prog`)
