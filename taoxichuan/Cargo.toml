@@ -21,6 +21,8 @@ default = ["shell"]
 # Without it the kernel serves the tokio surface B10's census measured
 # (`docs/archive/TAOXICHUAN_B10_SYSCALL_CENSUS.md`).
 shell = ["akuma-tokio-kernel/shell"]
+# aarch64 under Firecracker: the memory map, and the link base build.rs passes.
+platform-firecracker = ["akuma-tokio-kernel/platform-firecracker"]
 
 [dependencies]
 # Everything: boot, traps, memory, processes, signals, SMP, and the default devices.

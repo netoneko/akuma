@@ -55,3 +55,7 @@ smp = ["akuma-boot-aarch64/secondary", "akuma-gic/secondary"]
 shell = []
 no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
 trace-err = ["akuma-tokio-kernel-core/trace-err"]
+# Firecracker's memory map: boot treats 0x4000_0000..0x8000_0000 as device memory (the serial
+# port and the virtio slots live there) and maps the UART at 0x4000_2000. The link base
+# (0x8030_0000) is the binary's, set by its build script. Everything else comes from the tree.
+platform-firecracker = ["akuma-boot-aarch64/platform-firecracker"]

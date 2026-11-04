@@ -22,6 +22,9 @@ net = ["akuma-tokio-kernel-amd64/net", "akuma-tokio-kernel-aarch64/net"]
 smp = ["akuma-tokio-kernel-amd64/smp", "akuma-tokio-kernel-aarch64/smp"]
 # What busybox and bash call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-tokio-kernel-amd64/shell", "akuma-tokio-kernel-aarch64/shell"]
+# aarch64 under Firecracker (its memory map differs from QEMU virt's; the binary must also link at
+# 0x8030_0000). amd64 boots Firecracker through PVH and needs nothing.
+platform-firecracker = ["akuma-tokio-kernel-aarch64/platform-firecracker"]
 # Compile the boot self-tests of the shared crates out.
 no-tests = ["akuma-tokio-kernel-amd64/no-tests", "akuma-tokio-kernel-aarch64/no-tests"]
 # Name every syscall that answers a negative errno on the console.
