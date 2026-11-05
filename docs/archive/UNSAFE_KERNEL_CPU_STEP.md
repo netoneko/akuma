@@ -82,3 +82,19 @@ and switch asm, which need a type that encodes the slot-ownership protocol (a de
 
 Brief given to goose: `scripts/kvm/goose/` session `20261105_1` ("Akuma unsafe-kernel reduction"); it ended mid-edit of
 `CLAUDE.md`, which was recovered from its working tree.
+
+## Part 3 (goose-glm, 2026-11-06, on the ryzen/akuma box): item 1 of UNSAFE_CONTEXT_TABLE_DESIGN.md — the IRQ frame, single-sourced
+
+| what | now |
+|---|---|
+| 240/248 in `akuma-threading` (`IRQ_FRAME_ELR`/`IRQ_FRAME_SPSR`, `irq_frame_word`), `akuma-exceptions` (`IRQ_FRAME_SPSR_OFFSET`, hardcoded 240/248) and the `setup_fake_irq_frame` `frame.add(30/31)` writer | `akuma_trap_aarch64::irq_frame` (`ELR`/`SPSR`/`SIZE` — SIZE single-sourced from `akuma_exec_core::thread::IRQ_FRAME_SIZE`) + a `Copy` `IrqFrame` (`unsafe at` -> safe `elr`/`spsr`/`from_el0` -> safe `write_elr`/`write_spsr`); threading's writer and all 4 readers, and exceptions' `irq_eret_poison_check` + both BKL-reconcile SPSR reads + `interrupted_el0`, go through it |
+
+Host tests: `akuma-trap-aarch64` grew 2 (`round_trips_through_a_synthetic_frame` — a `[u64; 104]` frame written and read back through `IrqFrame`; `offsets_are_not_user_trap_frame_offsets` — pins 240=`x30`/248=`sp_el0` in the `UserTrapFrame`, i.e. exactly the trap this type exists to prevent).
+
+Budget (`scripts/check_unsafe_budget.py --update`, production): `akuma-threading` 59 -> 58, `akuma-exceptions` 27 -> 22, `akuma-trap-aarch64` 14 -> 19 (the five live in the leaf crate whose job is to hold them); whole tree 472 -> 471.
+
+Verified on this box (x86_64 musl host, **no aarch64 target installed**): `cargo test` akuma-trap-aarch64 (7), akuma-phys, akuma-threading (30) incl. `ready_transition_publishes_context_writes_without_a_lock` **20/20 consecutive** (the design doc's bare `-- filter` invocation fails standalone on base too — the test needs its suite's ProcessHooks registrar; run the whole suite); clippy `-D warnings` on threading/trap-aarch64/phys (akuma-exceptions-forensics blocked by a **pre-existing** `akuma-exec` musl-host build failure: `allocator_api` partially stabilized vs this toolchain — unrelated to this change); `cargo check` akuma-amd64 + akuma-tokio-kernel-amd64 (x86_64-unknown-none); **KVM guest boot on akuma itself** (`kbuild --features no-tests`, md5-identical kernel via `herd vm-dev`, 4 vcpus): `smp: 4 cpus online`, sshd init up, `[SWITCH NO-BKL]` switches running, 0 EXCEPTION/panic/POISON.
+
+**Not verified here, for the Mac: aarch64 `cargo check`, the `akuma-exceptions` build, `mw_gate.sh`, and every booted-aarch64 behaviour — items 1 and 3.3's SGI/IRQ-frame code is exactly what a unit test cannot exercise.**
+
+**Not started (next session): items 2a/2b (exceptions page copies + EL1 crash dump move — aarch64-only crate, uncompilable on this box) and item 3 (the context table: `Initializing`/`SwitchPair`/`with_current_ctx`/`peek` in a new `src/ctx_table.rs`; 34 `get_context*` sites to classify per §3.1's table).** The design doc's note stands: `crates/akuma-slot-table` already exists with its own budget entry — read it before item 3's "extract a crate is out of scope" reasoning.
