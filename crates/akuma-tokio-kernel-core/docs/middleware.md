@@ -211,19 +211,35 @@ gate knows exec still works); the console shows the `[nodl] ... refused an execv
 built without the feature, has no such behaviour.
 
 **Going further: the rest of the demo.** `nodl.rs` also has `mmap_guard` (refuse a file-backed `PROT_EXEC` mapping, which is
-what `ld-musl` does for every library and `dlopen` does later) and `mprotect_guard` (refuse adding `PROT_EXEC`, which would
-otherwise turn a read-only file mapping executable). `mwprobe` checks that each refusal fires and that the neighbouring cases
-stay allowed: anonymous `PROT_EXEC` memory, a read-only file mapping, `mprotect(PROT_READ)`. Together the three are a
-**demonstration, not a wholesale ban**:
+what `ld-musl` does for every library beyond libc, and `dlopen` does later) and `mprotect_guard` (refuse adding `PROT_EXEC`,
+which would otherwise turn a read-only file mapping executable). `mwprobe` checks that each refusal fires and that the
+neighbouring cases stay allowed: anonymous `PROT_EXEC` memory, a read-only file mapping, `mprotect(PROT_READ)`.
 
-- no real dynamically linked program has been run against it; only the syscalls such a program makes are tested, so what
-  `ld-musl` prints when its first library mapping is refused is not known;
-- the kernel's own loader maps the interpreter and the main binary without a syscall, so those are not seen at all;
-- a shebang script is data for a permitted interpreter; `memfd_create` was not checked; and a check by number cannot tell a file
-  mapping from an anonymous one in `mprotect`, so that guard is stricter than the mmap one on purpose.
+**What it does to real dynamic programs** (Alpine's `musl` loader, `busybox` and `xz`, fetched by `shanghai/mw_fetch_dyn.sh`; amd64
+and aarch64 at 4 cores):
 
+| child | stock kernel | with the three guards |
+|---|---|---|
+| `xz --version` (needs `liblzma.so.5`, a library besides libc) | prints `xz (XZ Utils) 5.8.4` | the loader fails: `Error loading shared library liblzma.so.5: Permission denied (needed by /usr/bin/xz)` |
+| `busybox true` (dynamic, needs only libc) | runs | **still runs** (known gap, pinned by a probe case) |
+
+The gap is structural: the kernel's own loader maps the interpreter and the main binary without a syscall, and `ld-musl` *is*
+libc, so a program with no other dependency never asks for a second mapping. This is **not a wholesale ban**: it stops a program
+loading libraries beyond libc and the `LD_*` knobs, nothing more.
+
+**Children are bound, because the policy is the kernel's.** The probe checks four kinds: a forked child that never execs (a raw
+`clone`), an exec'd static child in its own pid (the `[nodl]` lines in the console carry the child's pid, not 1), a child exec with
+`LD_PRELOAD` (refused with `EPERM`, so the child never starts), and the two dynamic children above.
+
+What is still outside it: a shebang script is data for a permitted interpreter; `memfd_create` was not checked; and a check by
+number cannot tell a file mapping from an anonymous one in `mprotect`, so that guard is stricter than the mmap one on purpose.
 A policy that must hold needs the verdict at the loader (a file becoming executable), not at the syscalls; this example is the
 shape of the hook, not the enforcement.
+
+**A lesson from writing it:** the first test subject was `bzip2`, and the probe passed it as "dynamic" because it ran under the
+guards without a single refusal. It had never asked for a second library: Alpine builds libbz2 into it, so it needs only libc. Check
+what a test subject actually loads (`strings -a <binary> | grep '^lib.*\.so'`) before trusting a result about it;
+`mw_fetch_dyn.sh` now fails if `xz` does not name `liblzma` or if `busybox` needs more than libc.
 
 ## The rules, and why each is there
 
@@ -271,6 +287,10 @@ The feature-on cost against the syscall floor is **not measured**; do not quote 
 - **In a guest:** copy Shanghai's pattern. Write a probe that makes raw `syscall` instructions (libc would hide an `-ENOSYS`
   behind `errno`), run it as `init`, and judge the boot by its result line. Always boot a **control** built without the feature
   too: it proves the calls your table touches are stock when it is off. `shanghai/mw_gate.sh` is the harness for both machines.
+- **Children and real programs:** a policy about processes is only shown by processes. `mwprobe` forks (raw `clone`), execs a static
+  child, and runs real dynamic binaries (`shanghai/mw_fetch_dyn.sh` fetches Alpine's loader, `busybox` and `xz`; it needs network the
+  first time and caches under the work dir). Run the same children on the control kernel: that is what shows the refusal is the
+  middleware's.
 - **Contention:** the `own` autolock is only exercised by threads on more than one core. `mwprobe` runs 4 threads x 500 `getpid`
   at `SMP=4` against a hook that reads, spins and writes its state; a lost update would leave the state below the atomic count.
 

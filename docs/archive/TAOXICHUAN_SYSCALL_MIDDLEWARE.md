@@ -81,7 +81,7 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
 - **Booted (2026-11-05, QEMU TCG: amd64 `microvm`, aarch64 `virt`):** `sh shanghai/mw_gate.sh [x86_64|aarch64|all]`
   (`SMP=N`) builds Shanghai twice per architecture (default, and `--features middleware` with the sample table in
   `shanghai/src/middleware.rs`), boots each with `shanghai/mwprobe/mwprobe.rs` as `init`, and judges the probe's own
-  result line. The middleware kernel passes every case on both machines (13 with the original table; 21 with the no-dynamic-loading demo below; earlier revisions of this record said 12 and 14 because the result line was counted as a case): `fallback` 1000/1001 (a value, a write
+  result line. The middleware kernel passes every case on both machines (13 with the original table; 26 with the no-dynamic-loading demo and its child probes below; earlier revisions of this record said 12 and 14 because the result line was counted as a case): `fallback` 1000/1001 (a value, a write
   through a user pointer, `EFAULT` on a bad one, an unserved number still `ENOSYS`), `kernel_pre` on `openat` (reads the
   path from user memory, refuses `/mw-deny` with `EACCES`, passes the rest), `kernel_post` on `gettid`, `own_pre`/`own_post`
   on `getpid` (5 calls seen 5 times), and the contention case: 4 threads x 500 `getpid` at once, where the `own_pre` hook
@@ -92,10 +92,18 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   `PROT_EXEC` is refused with `EACCES`, `mprotect` adding `PROT_EXEC` is refused, and an `execve` whose environment names an
   `LD_*` variable is refused with `EPERM` (the last needed the `execve` narrowing above). `mwprobe` checks each refusal and
   the neighbouring cases that must stay allowed (anonymous `PROT_EXEC` memory, a read-only file mapping,
-  `mprotect(PROT_READ)`, an `execve` with a clean environment, which is allowed and whose new image prints the result), and the
-  control kernel maps a file `PROT_EXEC` freely. 21 cases, on both machines at 4 cores; amd64 also at 1. It is a demonstration,
-  not a wholesale ban, and **no real dynamically linked program has been run against it**: the kernel's own loader maps the
-  interpreter without a syscall, and `memfd_create` and shebang scripts were not checked.
+  `mprotect(PROT_READ)`, an `execve` with a clean environment, which is allowed and whose new image prints the result).
+- **Children and real dynamic programs** (same day): the probe forks a child with a raw `clone` (no exec), execs a static child
+  (its own pid; the console's `[nodl]` lines carry it), execs with `LD_PRELOAD` (refused, `EPERM`), and runs two real dynamic
+  programs from Alpine (`shanghai/mw_fetch_dyn.sh`: musl loader, `busybox`, `xz` + `liblzma.so.5`). **Result, both machines
+  at SMP=4: 26 cases on the middleware kernel, 7 on the control, all passing.** `xz` runs on the control kernel and fails under
+  the guards inside `ld-musl` (`Error loading shared library liblzma.so.5: Permission denied`). A dynamic executable that needs only
+  libc (`busybox`) **still runs**: the kernel maps the interpreter and the main binary without a syscall and `ld-musl` is libc,
+  so there is no second mapping to refuse. That case is pinned in the probe as a known gap. It is a demonstration, not a wholesale
+  ban. `memfd_create` and shebang scripts were not checked.
+- **The first test subject was wrong:** `bzip2` ran under the guards with no refusal, which looked like a failed ban. Alpine builds
+  libbz2 into the binary (`strings` shows only `libc.musl` as a dependency), so it never asked for a second library. `xz` replaced
+  it, and `mw_fetch_dyn.sh` now checks the premise (`xz` names `liblzma`, `busybox` needs nothing beyond libc).
 - **Found by booting it:** the first real user could not write `..Middleware::new(0)` (private fields), which the
   in-module tests could not catch; the tables are now the all-public `Hooks<S>` (`Middleware::new(state, Hooks {..})`).
   The first sample also hooked `getuid`, which this kernel does not serve without `shell`, and added 1000 to its
