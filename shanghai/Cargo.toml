@@ -6,8 +6,13 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# The sample syscall middleware (`src/middleware.rs`, B22). Off by default: the default Shanghai has none.
+middleware = ["akuma-tokio-kernel/middleware", "dep:akuma-primitives"]
+
 [dependencies]
 akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel", features = ["no-tests"] }
+akuma-primitives = { path = "../crates/akuma-primitives", optional = true }
 
 [[bin]]
 name = "shanghai"

@@ -305,3 +305,9 @@ Shanghai, on this machine's hypervisor.
   the built image; `/root/tx/rs.goose.orig` was never written.
 - After each gate: killed only the guest recorded in `w/vm.pid`; `herd status` confirmed
   `vm-dev: exited` before each boot; the supervisor services were never touched.
+
+## Middleware sample (B22, 2026-11-05)
+
+`--features middleware` adds `src/middleware.rs` (one table, every tier once). `sh shanghai/mw_gate.sh` boots the default
+kernel (control) and the middleware kernel under QEMU TCG with `mwprobe/mwprobe.rs` as init: control `CONTROL PASS`,
+middleware `PASS` (14/14, including a 4-thread autolock contention case), on amd64 and aarch64, at 1 and 4 cores. See `proposals/B22_SYSCALL_MIDDLEWARE.md` § What was verified.
