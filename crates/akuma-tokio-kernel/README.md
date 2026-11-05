@@ -11,10 +11,11 @@ tokio" is a dependency that ensures Linux binary compatibility.
 **This README is the whole brief.** Give it to an agent and it can build a new kernel, boot it, get a shell
 in it, and run a tokio program on it. The sample kernel that follows it is [`shanghai/`](../../shanghai): an
 agent (goose with GLM) built it from an earlier revision of this brief, and its record, gate by gate, is
-[`shanghai/RESULT.md`](../../shanghai/RESULT.md). Re-checked for this revision (2026-11-05): Shanghai builds for
-both targets with and without `middleware`, and boots on both under QEMU TCG (`sh shanghai/mw_gate.sh`, below). The
-sshd/ssh image path, tokioprobe, goose and the `herd vm-run` spec were run when the brief was written and **not**
-re-run for this revision; where a command below has drifted, the file it points at wins.
+[`shanghai/RESULT.md`](../../shanghai/RESULT.md). Re-checked for this revision (2026-11-05): Shanghai builds for both
+targets in all three feature sets (none, `middleware`, `no-dynamic-loading`), and each boots on both machines under QEMU TCG
+(`sh shanghai/mw_gate.sh`, below: control 7, `middleware` 19, `no-dynamic-loading` 35 cases, all passing). The sshd/ssh image
+path, tokioprobe, goose and the `herd vm-run` spec were run when the brief was written and **not** re-run for this revision; where
+a command below has drifted, the file it points at wins.
 
 ## What you write
 
@@ -101,6 +102,7 @@ Then add the directory to `members` in the root `Cargo.toml` (`members = [".", "
 | `.root(make)` | — | your own root instead: `make: fn() -> Arc<dyn akuma_vfs::Filesystem>`, called once the heap is up (amd64 only today) |
 | `.net()` | `net` | the first virtio-net device, smoltcp, and a DHCP lease (waits up to 10 s). Without it, sockets work on loopback only |
 | `.smp()` | `smp` | the application processors `smp=N` on the command line asks for, all under one big kernel lock |
+| `.middleware(&MW)` | `middleware` (off) | the kernel's one table of syscall hooks and exec policy ([below](#syscall-middleware-optional)); a second call panics |
 | `.run_init()` | — | boot, then load `init=` from the root and run it as pid 1; never returns |
 
 Without a feature its method does not exist, so a kernel that does not want a part leaves out the call, and can
@@ -142,7 +144,8 @@ static MW: Middleware<u64> = Middleware::new(0, Hooks {
     // A syscall of your own: 1000 and up is above every number Linux assigns. `fallback` runs only where the
     // kernel would have answered -ENOSYS, so it cannot break a call the kernel already serves.
     fallback: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_ctx| Some(42))],
-    // Look at, change or refuse a call. Runs inside the kernel lock; the caller's memory is reachable.
+    // Look at or refuse a call (the context is read-only: a hook cannot change what runs). Runs inside the kernel lock; the
+    // caller's memory is reachable.
     kernel_pre: &[Route::new(&[On::Call(Syscall::Openat)], |ctx| {
         let mut buf = [0u8; 128];
         if let Ok(path) = ctx.user_str(ctx.args[1], &mut buf) {
@@ -164,9 +167,11 @@ From the guest, `syscall(1000)` returns 42. Shanghai carries a working table beh
 (`cargo build -p shanghai --features middleware --target <arch>-unknown-none --release`), and `sh shanghai/mw_gate.sh
 [x86_64|aarch64|all]` (`SMP=4` for four cores) boots it, and a control built without it, under QEMU TCG with
 [`shanghai/mwprobe`](../../shanghai/mwprobe) as `init`: the control must print `MWPROBE RESULT CONTROL PASS`, the
-middleware kernel `MWPROBE RESULT PASS`. The "no dynamic loading" demo guards are a further Shanghai feature, `--features no-dynamic-loading` (off by default; it implies
-`middleware`), and the gate boots three kernels per machine: stock, `middleware` alone (the guards must be absent), and with the feature
-(they must be on). It needs no sshd or key, only `e2fsprogs` and, the first time, network for Alpine's dynamic test binaries. The rules, each with its reason in the module docs:
+middleware kernel `MWPROBE RESULT PASS`. The "no dynamic loading" demo is a further Shanghai feature, `--features no-dynamic-loading`
+(off by default; it implies `middleware`): one **exec policy** that refuses dynamically linked programs and every route the probe found
+for turning a file or bytes into native code. The gate boots three kernels per machine: stock, `middleware` alone (the policy must be
+absent), and with the feature (it must be on, and the probe tries each avenue). It needs no sshd or key, only `e2fsprogs` and, the first
+time, network for Alpine's dynamic test binaries. The rules, each with its reason in the module docs:
 
 - **One table, flat, no chaining.** No `next`, no priorities. Two entries for one call in one tier are refused when
   the table is armed (a boot panic naming the number). A second `.middleware(..)` panics. To layer, write a
@@ -178,6 +183,11 @@ middleware kernel `MWPROBE RESULT PASS`. The "no dynamic loading" demo guards ar
 - **Cheap when idle.** Which numbers a tier wants is a 512-bit mask built when the table is armed, read once per
   call and latched, so an unhooked call costs a relaxed load and a bit test per tier. `Verdict::PassAndForget`
   clears a hook's bit for that number. Numbers from 512 up are always asked (that is where custom calls live).
+- **Hooks cannot mutate the kernel context.** Every `kernel` hook takes `&KernelCtx`: it can allow, refuse or answer a call, never
+  change what runs (rewriting arguments is how one hook defeats another's check). `OwnCtx` has `&mut` for the hook's own state only.
+- **One exec policy for new code.** Code reaches a process in three ways: an image (`execve`, init, a `#!` interpreter), a `PROT_EXEC`
+  `mmap`, a `PROT_EXEC` `mprotect`. `Hooks::exec` is asked at each, so a policy is one `match` and cannot be bypassed by a path nobody
+  hooked; the image is asked before anything is torn down, so a refusal is `EACCES` and leaves the caller untouched.
 - **Not everything is interceptable.** `exit`, `exit_group`, `clone`, `execve` and `rt_sigreturn` are observed
   only: no `fallback`, and a changed result is ignored. A `kernel_pre` refusal is honoured for `execve` (it skips the call
   before it touches the process) and ignored for the other four.
