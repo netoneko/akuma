@@ -37,7 +37,7 @@ and off by default, no runtime switches.
    shanghai/src/middleware.rs
    ┌────────────────────────────────────────────────────────────────────┐
    │ Hooks {                                                            │
-   │   kernel_pre : match Pre  { Execve => nodl::exec_guard(..),        │
+   │   pre : match Pre  { Execve => nodl::exec_guard(..),        │
    │                             Openat => own sample .. }              │
    │   exec       : |ev| compose(nodl::policy, signed::policy)          │
    │ }                                                                  │
@@ -58,7 +58,7 @@ and off by default, no runtime switches.
    user ── syscall execve ──► machine dispatcher
                                    │
                          ┌─────────▼──────────┐
-                         │ kernel_pre (Execve)│  nodl::exec_guard: LD_* in env?
+                         │ pre (Execve)│  nodl::exec_guard: LD_* in env?
                          └─────────┬──────────┘     └─ yes ──► EPERM, stop
                                    │ no
                          ┌─────────▼──────────┐

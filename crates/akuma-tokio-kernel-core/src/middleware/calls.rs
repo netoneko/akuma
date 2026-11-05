@@ -1,4 +1,4 @@
-//! Vocabulary of a call: which syscall an entry is about, what a `kernel_pre` hook may decide, what a machine supplies.
+//! Vocabulary of a call: which syscall an entry is about, what a `pre` hook may decide, what a machine supplies.
 
 pub use akuma_syscalls_abi::Syscall;
 
@@ -18,7 +18,7 @@ pub enum On {
     Nr(u64),
 }
 
-/// What a `kernel_pre` hook decided.
+/// What a `pre` hook decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Carry on to the call.
@@ -47,7 +47,7 @@ pub struct Machine {
     pub pid: fn() -> u32,
 }
 
-/// Calls a hook may watch but whose result it may not change, and which `fallback` never serves.
+/// Calls a hook may watch but whose result it may not change, and which `handler` never serves.
 #[must_use]
 pub const fn observe_only(call: Option<Syscall>) -> bool {
     matches!(
@@ -56,7 +56,7 @@ pub const fn observe_only(call: Option<Syscall>) -> bool {
     )
 }
 
-/// Whether a `kernel_pre` refusal (`Return`/`Errno`) is honoured for this call.
+/// Whether a `pre` refusal (`Return`/`Errno`) is honoured for this call.
 ///
 /// Every call that is not [`observe_only`], and `execve`, which fails cleanly before it touches the process (a
 /// signed-binaries or environment policy needs exactly that). `exit`, `exit_group`, `clone` and `rt_sigreturn`

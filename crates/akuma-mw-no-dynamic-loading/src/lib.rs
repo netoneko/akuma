@@ -10,11 +10,11 @@
 //! | `mmap` with `PROT_EXEC` | `ExecKind::Map` | refuse a file-backed mapping; anonymous memory is allowed (W^X already forbids the writable kind) |
 //! | `mprotect` adding `PROT_EXEC` | `ExecKind::Protect` | refuse (the kernel cannot say which file a present page came from) |
 //!
-//! Besides the policy there is [`exec_guard`], an ordinary `kernel_pre` hook on `execve` that refuses an `LD_*` variable in the new
+//! Besides the policy there is [`exec_guard`], an ordinary `pre` hook on `execve` that refuses an `LD_*` variable in the new
 //! environment: the guide's Example 2, kept because it is the clearest example of reading the caller's memory.
 //!
 //! **How a kernel uses it.** There is one middleware table per kernel and nothing chains, so this crate is not a table: it is two
-//! functions the kernel's table names (`Hooks { exec: Some(akuma_mw_no_dynamic_loading::exec_policy), kernel_pre: &[Route::new(
+//! functions the kernel's table names (`Hooks { exec: Some(akuma_mw_no_dynamic_loading::exec_policy), pre: &[Route::new(
 //! &[On::Call(Syscall::Execve)], akuma_mw_no_dynamic_loading::exec_guard)], .. }`). A kernel that composes several such crates
 //! writes the composition itself, in its own table, where it can be read. It takes no boot parameters and keeps no state.
 //!

@@ -35,7 +35,7 @@ fn a_call_nobody_hooked_runs_no_hook() {
 #[test]
 fn pre_can_answer_and_the_call_does_not_run() {
     static MW: Middleware = Middleware::new(Hooks {
-        kernel_pre: &[Route::new(&[On::Call(Syscall::Getpid)], |_| Verdict::Errno(1))],
+        pre: &[Route::new(&[On::Call(Syscall::Getpid)], |_| Verdict::Errno(1))],
         ..Hooks::new()
     });
     MW.arm(machine());
@@ -52,7 +52,7 @@ fn pre_can_answer_and_the_call_does_not_run() {
 #[test]
 fn fallback_serves_only_what_would_be_enosys() {
     static MW: Middleware = Middleware::new(Hooks {
-        fallback: &[Route::new(&[On::Nr(CUSTOM), On::Call(Syscall::Getpid)], |_| Some(42))],
+        handler: &[Route::new(&[On::Nr(CUSTOM), On::Call(Syscall::Getpid)], |_| Some(42))],
         ..Hooks::new()
     });
     MW.arm(machine());
@@ -65,7 +65,7 @@ fn fallback_serves_only_what_would_be_enosys() {
 #[test]
 fn exit_and_clone_are_observed_not_replaced() {
     static MW: Middleware = Middleware::new(Hooks {
-        kernel_pre: &[Route::new(&[On::Call(Syscall::Clone)], |_| Verdict::Return(0))],
+        pre: &[Route::new(&[On::Call(Syscall::Clone)], |_| Verdict::Return(0))],
         ..Hooks::new()
     });
     MW.arm(machine());
@@ -76,11 +76,11 @@ fn exit_and_clone_are_observed_not_replaced() {
 #[test]
 fn execve_can_be_refused_before_it_runs_but_not_served_or_rewritten() {
     static MW: Middleware = Middleware::new(Hooks {
-        kernel_pre: &[Route::new(&[On::Call(Syscall::Execve)], |c| {
+        pre: &[Route::new(&[On::Call(Syscall::Execve)], |c| {
             if c.args[0] == 1 { Verdict::Errno(1) } else { Verdict::Pass }
         })],
         // This may not take effect on an observe-only call.
-        fallback: &[Route::new(&[On::Call(Syscall::Execve)], |_| Some(99))],
+        handler: &[Route::new(&[On::Call(Syscall::Execve)], |_| Some(99))],
         ..Hooks::new()
     });
     MW.arm(machine());
@@ -93,7 +93,7 @@ fn execve_can_be_refused_before_it_runs_but_not_served_or_rewritten() {
     });
     assert_eq!(r.cast_signed(), -1);
     assert_eq!(ran.load(Relaxed), 0);
-    // Not refused: it runs, its -ENOSYS is not turned into 99 by the fallback, 
+    // Not refused: it runs, its -ENOSYS is not turned into 99 by the handler, 
     let a = [0; 6];
     assert_eq!(MW.run_kernel(59, a, 1, || ENOSYS_RET), ENOSYS_RET);
     assert_eq!(MW.run_kernel(59, a, 1, || 7), 7);
@@ -102,7 +102,7 @@ fn execve_can_be_refused_before_it_runs_but_not_served_or_rewritten() {
 #[test]
 fn exit_and_rt_sigreturn_cannot_be_refused() {
     static MW: Middleware = Middleware::new(Hooks {
-        kernel_pre: &[
+        pre: &[
             Route::new(&[On::Call(Syscall::ExitGroup), On::Call(Syscall::Exit)], |_| Verdict::Errno(1)),
             Route::new(&[On::Call(Syscall::RtSigreturn)], |_| Verdict::Return(0)),
         ],
@@ -118,7 +118,7 @@ fn exit_and_rt_sigreturn_cannot_be_refused() {
 #[test]
 fn pass_and_forget_clears_the_bit() {
     static MW: Middleware = Middleware::new(Hooks {
-        kernel_pre: &[Route::new(&[On::Call(Syscall::Getpid)], |_| Verdict::PassAndForget)],
+        pre: &[Route::new(&[On::Call(Syscall::Getpid)], |_| Verdict::PassAndForget)],
         ..Hooks::new()
     });
     MW.arm(machine());
@@ -147,7 +147,7 @@ fn user_memory_is_checked_and_strings_are_bounded() {
 #[should_panic(expected = "named twice")]
 fn two_entries_for_one_call_in_one_tier_are_refused() {
     static MW: Middleware = Middleware::new(Hooks {
-        kernel_pre: &[
+        pre: &[
             Route::new(&[On::Call(Syscall::Getpid)], |_| Verdict::Pass),
             Route::new(&[On::Nr(GETPID)], |_| Verdict::Pass),
         ],
@@ -160,7 +160,7 @@ fn two_entries_for_one_call_in_one_tier_are_refused() {
 #[test]
 fn the_guides_first_syscall_compiles_and_answers() {
     static MW: Middleware = Middleware::new(Hooks {
-        fallback: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_ctx| Some(42))],
+        handler: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_ctx| Some(42))],
         ..Hooks::new()
     });
     MW.arm(machine());

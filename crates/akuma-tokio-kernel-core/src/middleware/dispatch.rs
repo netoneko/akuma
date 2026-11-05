@@ -10,7 +10,7 @@ use akuma_primitives::OnceCopy;
 
 impl Middleware {
     /// The whole `kernel` side of one call: pre, the call (`inner`),
-    /// and the fallback where it answered `-ENOSYS`. Call with the kernel lock held.
+    /// and the handler where it answered `-ENOSYS`. Call with the kernel lock held.
     pub fn run_kernel(&self, nr: u64, args: [u64; 6], tid: u64, inner: impl FnOnce() -> u64) -> u64 {
         let machine = self.m();
         let wants = self.kernel_wants(nr);
@@ -21,7 +21,7 @@ impl Middleware {
 
         let mut ret = None;
         if wants
-            && let Some(h) = self.find(self.hooks.kernel_pre, nr)
+            && let Some(h) = self.find(self.hooks.pre, nr)
         {
             match h(&ctx) {
                 Verdict::Pass => {}
@@ -37,7 +37,7 @@ impl Middleware {
             let r = inner();
             if r == ENOSYS_RET
                 && !watch
-                && let Some(h) = self.find(self.hooks.fallback, nr)
+                && let Some(h) = self.find(self.hooks.handler, nr)
             {
                 h(&ctx).unwrap_or(r)
             } else {

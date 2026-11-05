@@ -1,7 +1,7 @@
 //! The table: routes, the interest mask, [`Hooks`] and [`Middleware`] (arming, the exec policy).
 
 use super::calls::{native, Machine, On, MASK_BITS};
-use super::ctx::{Fallback, KernelPre};
+use super::ctx::{Handler, Pre};
 use super::exec::{ExecEvent, ExecKind, ExecPolicy, ExecVerdict};
 use crate::params::Params;
 use akuma_primitives::OnceCopy;
@@ -42,10 +42,10 @@ impl Interest {
     }
 }
 
-/// The hook tables: all public, so a table is written `Hooks { fallback: &[..], ..Hooks::new() }` from any crate.
+/// The hook tables: all public, so a table is written `Hooks { handler: &[..], ..Hooks::new() }` from any crate.
 pub struct Hooks {
-    pub kernel_pre: &'static [Route<KernelPre>],
-    pub fallback: &'static [Route<Fallback>],
+    pub pre: &'static [Route<Pre>],
+    pub handler: &'static [Route<Handler>],
     /// The policy for new code (images, executable mappings): see [`ExecPolicy`]. `None`: everything allowed.
     pub exec: Option<ExecPolicy>,
     /// Runs once, at boot, after the command line is captured and before the first user instruction: read the
@@ -68,7 +68,7 @@ impl Hooks {
     /// No hooks.
     #[must_use]
     pub const fn new() -> Self {
-        Self { kernel_pre: &[], fallback: &[], exec: None, init: None, exec_sidecar: None }
+        Self { pre: &[], handler: &[], exec: None, init: None, exec_sidecar: None }
     }
 }
 
@@ -82,7 +82,7 @@ impl Default for Hooks {
 ///
 /// ```ignore
 /// static MW: Middleware = Middleware::new(Hooks {
-///     fallback: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_| Some(42))],
+///     handler: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_| Some(42))],
 ///     ..Hooks::new()
 /// });
 /// ```
@@ -103,7 +103,7 @@ impl Middleware {
         }
     }
 
-    /// Decide, once, which numbers `kernel_pre` wants, and refuse a table that names a number twice in one tier.
+    /// Decide, once, which numbers `pre` wants, and refuse a table that names a number twice in one tier.
     ///
     /// # Panics
     /// On a duplicate, with the number: overlap is an error, not an ordering question.
@@ -122,8 +122,8 @@ impl Middleware {
             }
         }
         self.machine.set(machine);
-        fill(self.hooks.kernel_pre, Some(&self.kp), &machine, "kernel_pre");
-        fill(self.hooks.fallback, None, &machine, "fallback");
+        fill(self.hooks.pre, Some(&self.kp), &machine, "pre");
+        fill(self.hooks.handler, None, &machine, "handler");
     }
 
     /// Run the [`Hooks::init`] hook, if there is one, with `params`. Called once, by [`init`], after the command line is captured.
@@ -142,7 +142,7 @@ impl Middleware {
         routes.iter().find(|r| r.on.iter().any(|o| native(&m, *o) == nr)).map(|r| r.hook)
     }
 
-    /// Whether `kernel_pre` wants to be asked about `nr`: read once per call.
+    /// Whether `pre` wants to be asked about `nr`: read once per call.
     #[must_use]
     pub fn kernel_wants(&self, nr: u64) -> bool {
         self.kp.test(nr)

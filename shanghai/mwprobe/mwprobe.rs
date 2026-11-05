@@ -375,26 +375,26 @@ fn main() {
         return;
     }
 
-    // fallback: a syscall of our own, above every number Linux assigns.
-    check("fallback 1000 hello", hello, 42);
+    // handler: a syscall of our own, above every number Linux assigns.
+    check("handler 1000 hello", hello, 42);
     let mut buf = 0u64;
-    check("fallback 1001 writes through a user pointer", sc(1001, [&raw mut buf as u64, 0, 0, 0]), 0);
+    check("handler 1001 writes through a user pointer", sc(1001, [&raw mut buf as u64, 0, 0, 0]), 0);
     let me = i64::from(std::process::id());
     check("  ...and wrote the caller's pid", buf as i64, me);
-    check("fallback 1001 with a bad pointer is EFAULT, not a crash", sc(1001, [8, 0, 0, 0]), EFAULT);
+    check("handler 1001 with a bad pointer is EFAULT, not a crash", sc(1001, [8, 0, 0, 0]), EFAULT);
     check("a number nobody serves is still ENOSYS", sc(1004, [0; 4]), ENOSYS);
 
-    // kernel_pre on openat: reads the path out of user memory, may refuse before the kernel looks.
-    check("kernel_pre refuses /mw-deny", open("/mw-deny"), EACCES);
-    check("kernel_pre passes /mw-ok (the kernel then says ENOENT)", open("/mw-ok"), ENOENT);
+    // pre on openat: reads the path out of user memory, may refuse before the kernel looks.
+    check("pre refuses /mw-deny", open("/mw-deny"), EACCES);
+    check("pre passes /mw-ok (the kernel then says ENOENT)", open("/mw-ok"), ENOENT);
 
     // Boot parameters: the `init` hook read `mw.sample.also=/mw-param` off the command line (the gate puts it there).
-    check("kernel_pre refuses the path given by mw.sample.also", open("/mw-param"), EACCES);
+    check("pre refuses the path given by mw.sample.also", open("/mw-param"), EACCES);
     let seen = sc(1006, [0; 4]);
     check("params: mw.sample.also was readable", seen & 1, 1);
     check("params: the kernel's own init= is NOT readable through the middleware's view", (seen >> 1) & 1, 0);
     check("params: mw.other.secret is NOT readable through the mw.sample. view", (seen >> 2) & 1, 0);
-    check("kernel_pre ignores a path it does not care about", open("/definitely-not-here"), ENOENT);
+    check("pre ignores a path it does not care about", open("/definitely-not-here"), ENOENT);
 
     // "No dynamic loading" (shanghai/src/nodl.rs): what ld.so and dlopen do is a file-backed PROT_EXEC mapping.
     let fd = open("/bin/mwprobe");

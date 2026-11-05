@@ -33,7 +33,7 @@ exec by its environment.
 
    pub static MW: Middleware = Middleware::new(Hooks {
        // 1000 is above every number Linux assigns. This runs only where the kernel would have said -ENOSYS.
-       fallback: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_ctx| Some(42))],
+       handler: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_ctx| Some(42))],
        ..Hooks::new()
    });
    ```
@@ -75,8 +75,8 @@ One `Middleware` per kernel, a `static`: `Middleware::new(Hooks { .. })`. `Hooks
 
 | tier | hook type | runs | it may |
 |---|---|---|---|
-| `kernel_pre` | `fn(&KernelCtx) -> Verdict` | inside the kernel lock, before the call | `Pass`, `PassAndForget`, `Return(v)`, `Errno(e)` (a refusal: not for `exit`/`clone`/`rt_sigreturn`) |
-| `fallback` | `fn(&KernelCtx) -> Option<u64>` | inside the lock, only where the answer is `-ENOSYS` | `Some(answer)` to serve the call, `None` to leave the `-ENOSYS` |
+| `pre` | `fn(&KernelCtx) -> Verdict` | inside the kernel lock, before the call | `Pass`, `PassAndForget`, `Return(v)`, `Errno(e)` (a refusal: not for `exit`/`clone`/`rt_sigreturn`) |
+| `handler` | `fn(&KernelCtx) -> Option<u64>` | inside the lock, only where the answer is `-ENOSYS` | `Some(answer)` to serve the call, `None` to leave the `-ENOSYS` |
 
 `On::Call(Syscall::Openat)` names a Linux call by identity (the machine maps it to its architecture's number);
 `On::Nr(1000)` names a raw number, the same on both architectures (use it from `CUSTOM_BASE` = 1000 up).
@@ -88,16 +88,16 @@ a function that calls your own functions and register that; the framework gives 
 ## Where it runs
 
 ```text
-amd64    dispatch():  [take the kernel lock] -> legacy fold -> kernel_pre -> the call
-                      -> fallback (if -ENOSYS) -> signal delivery -> [release]
-aarch64  el0_sync():  [take the kernel lock] -> kernel_pre -> the call -> fallback
+amd64    dispatch():  [take the kernel lock] -> legacy fold -> pre -> the call
+                      -> handler (if -ENOSYS) -> signal delivery -> [release]
+aarch64  el0_sync():  [take the kernel lock] -> pre -> the call -> handler
                       -> signal delivery -> [release]
 ```
 
 - The `kernel` tier sees the **canonical** number on amd64: the legacy spellings (`mkdir`, `unlink`, ...) have already been
   folded into their `*at` call.
 - A hook cannot change what the call sees: `KernelCtx` is read-only, and the call gets exactly the arguments the program passed.
-- A `Return`/`Errno` from `kernel_pre` skips the call (and the fallback).
+- A `Return`/`Errno` from `pre` skips the call (and the handler).
 
 ## What a hook gets
 
@@ -121,12 +121,12 @@ demo in the crate [`akuma-mw-no-dynamic-loading`](../../akuma-mw-no-dynamic-load
 
 **Where the data is.** A new process's environment is the third argument of `execve`: `ctx.args[2]` points at a
 NULL-terminated array of pointers to `NAME=value` strings, all in the *caller's* memory, which is still the old image's when a
-`kernel_pre` hook runs. So this is a `kernel_pre` hook (it needs user memory) on `Syscall::Execve`. It reads the pointer array
+`pre` hook runs. So this is a `pre` hook (it needs user memory) on `Syscall::Execve`. It reads the pointer array
 with `user_read_u64`, and for each string only the first three bytes, one at a time: a long value costs nothing, and a short
 string at the end of a page cannot fault. The environment of a process that is already running is not reachable this way.
 
-**Why it can refuse.** `execve` is observe-only: a hook cannot serve it with a `fallback` or replace its result. A
-`kernel_pre` *refusal*, though, skips the call before it touches the process, so it is honoured for `execve`
+**Why it can refuse.** `execve` is observe-only: a hook cannot serve it with a `handler` or replace its result. A
+`pre` *refusal*, though, skips the call before it touches the process, so it is honoured for `execve`
 (`may_refuse_before`; it stays ignored for `exit`, `exit_group`, `clone` and `rt_sigreturn`). A refused `execve` returns the
 errno to the caller, which is still running its old image.
 
@@ -182,7 +182,7 @@ Register it like any hook (Shanghai's table, `shanghai/src/middleware.rs`). In S
 default**: `no-dynamic-loading` (it implies `middleware`), so the sample table alone does not have them:
 
 ```rust
-kernel_pre: &[
+pre: &[
     Route::new(&[On::Call(Syscall::Openat)], open_guard),
     #[cfg(feature = "no-dynamic-loading")]
     Route::new(&[On::Call(Syscall::Execve)], akuma_mw_no_dynamic_loading::exec_guard),
@@ -211,7 +211,7 @@ cargo build -p shanghai --features no-dynamic-loading --target x86_64-unknown-no
 gate knows exec still works); the console shows the `[nodl] ... refused an execve with an LD_* variable` line; the control kernel,
 built without the feature, has no such behaviour.
 
-**Going further: the exec policy, and what it blocks.** The environment guard is an ordinary `kernel_pre` hook. The rest of the demo is
+**Going further: the exec policy, and what it blocks.** The environment guard is an ordinary `pre` hook. The rest of the demo is
 a different kind of hook, because "no dynamic loading" is not about one syscall: code reaches a process in exactly three ways, and the
 kernel asks **one** question at each of them, `Hooks::exec: Option<ExecPolicy>` (`fn(&ExecEvent) -> ExecVerdict`, `Allow` or
 `Deny(errno)`, read-only like every hook):
@@ -324,7 +324,7 @@ single-threaded, before the first user instruction, with no kernel context.
 - **Software guarantee only.** A raw-pointer write by the kernel itself would not be stopped; mapping the page read-only after boot
   is the stronger version and is not built.
 
-Shanghai's sample table reads `mw.sample.also=/path` (one more path `kernel_pre` refuses) and records what it could and could not
+Shanghai's sample table reads `mw.sample.also=/path` (one more path `pre` refuses) and records what it could and could not
 see (call 1006); the probe checks that the kernel's own words and another namespace's keys were invisible.
 
 ## Allowing from the checked bytes (`ExecVerdict::AllowFromImage`, `Hooks::exec_sidecar`)
@@ -340,11 +340,11 @@ signed kernel: survives).
 
 ## The rules, and why each is there
 
-- **No hook touches a lock.** `kernel_pre` and `fallback` run under the kernel lock, which the kernel takes, so there is no lock-order question and nothing for a hook to name. If you need a counter, an atomic works.
+- **No hook touches a lock.** `pre` and `handler` run under the kernel lock, which the kernel takes, so there is no lock-order question and nothing for a hook to name. If you need a counter, an atomic works.
 - **`kernel` hooks run under the big kernel lock.** Do not spin on something another core's syscall holds, and do not try to
   park the caller: there is no sanctioned way to block yet (see "Not built").
 - **Some calls are observed, never replaced:** `exit`, `exit_group`, `clone`, `execve`, `rt_sigreturn` rewrite the frame or do not
-  return. For them a `fallback` is ignored (`observe_only`). A `kernel_pre` refusal
+  return. For them a `handler` is ignored (`observe_only`). A `pre` refusal
   (`Return`/`Errno`) skips the call, so it cannot corrupt the frame: it is honoured for `execve` and ignored for `exit`,
   `exit_group`, `clone` and `rt_sigreturn` (`may_refuse_before`).
 - **Hooks cannot mutate the kernel context.** Every `kernel` hook takes `&KernelCtx`, so a hook can allow, refuse or answer a
@@ -358,10 +358,10 @@ signed kernel: survives).
 
 ## What it costs, and the caches
 
-Which numbers a tier wants is decided once, when the table is armed: a 512-bit mask for `kernel_pre`. A call nobody hooked costs one
+Which numbers a tier wants is decided once, when the table is armed: a 512-bit mask for `pre`. A call nobody hooked costs one
 relaxed load and a bit test, and no hook runs. Numbers from 512 up are always asked (that is where custom calls live).
 The mask is read **once per call**. A
-`kernel_pre` may return `Verdict::PassAndForget` to clear its own bit for that number for good. Verdicts themselves are never
+`pre` may return `Verdict::PassAndForget` to clear its own bit for that number for good. Verdicts themselves are never
 cached: they depend on the arguments.
 
 The feature-on cost against the syscall floor is **not measured**; do not quote a number for it.

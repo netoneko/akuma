@@ -7,10 +7,10 @@
 //!
 //! | what | tier | call |
 //! |---|---|---|
-//! | `hello`: answers 42 | `fallback` | 1000 |
-//! | `whoami`: writes the caller's pid to `*arg0` (or `-EFAULT`) | `fallback` | 1001 |
-//! | refuse `open("/mw-deny")` with `EACCES`; log any other `/mw-*` path | `kernel_pre` | `openat` |
-//! | with `--features no-dynamic-loading` only: no dynamic loading (file `PROT_EXEC` mmap, `mprotect(+X)`, `LD_*` in an `execve` env), see the `akuma-mw-no-dynamic-loading` crate | `kernel_pre` | `mmap` / `mprotect` / `execve` |
+//! | `hello`: answers 42 | `handler` | 1000 |
+//! | `whoami`: writes the caller's pid to `*arg0` (or `-EFAULT`) | `handler` | 1001 |
+//! | refuse `open("/mw-deny")` with `EACCES`; log any other `/mw-*` path | `pre` | `openat` |
+//! | with `--features no-dynamic-loading` only: no dynamic loading (file `PROT_EXEC` mmap, `mprotect(+X)`, `LD_*` in an `execve` env), see the `akuma-mw-no-dynamic-loading` crate | `pre` | `mmap` / `mprotect` / `execve` |
 
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -100,7 +100,7 @@ const SIDECAR: Option<&str> = None;
 
 /// The table the kernel registers.
 pub static MW: Middleware = Middleware::new(Hooks {
-    fallback: &[
+    handler: &[
         Route::new(&[On::Nr(CUSTOM_BASE)], |_| Some(42)),
         Route::new(&[On::Nr(CUSTOM_BASE + 1)], |ctx| {
             Some(match ctx.user_write_u64(ctx.args[0], u64::from(ctx.pid)) {
@@ -110,7 +110,7 @@ pub static MW: Middleware = Middleware::new(Hooks {
         }),
         Route::new(&[On::Nr(CUSTOM_BASE + 6)], |_| Some(PARAMS_SEEN.load(Relaxed))),
     ],
-    kernel_pre: &[
+    pre: &[
         Route::new(&[On::Call(Syscall::Openat)], open_guard),
         // The "no dynamic loading" demo (the `akuma-mw-no-dynamic-loading` crate), only with `--features no-dynamic-loading`: an env guard on execve here, and
         // the exec policy (`EXEC` below): one `match` over every way code arrives.

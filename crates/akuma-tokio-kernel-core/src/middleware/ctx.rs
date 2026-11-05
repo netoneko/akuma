@@ -106,7 +106,7 @@ impl KernelCtx {
     }
 }
 
-/// `kernel_pre`.
-pub type KernelPre = fn(&KernelCtx) -> Verdict;
-/// `fallback`: `Some(answer)` to serve the call, `None` to leave the `-ENOSYS`.
-pub type Fallback = fn(&KernelCtx) -> Option<u64>;
+/// `pre`.
+pub type Pre = fn(&KernelCtx) -> Verdict;
+/// `handler`: `Some(answer)` to serve the call, `None` to leave the `-ENOSYS`.
+pub type Handler = fn(&KernelCtx) -> Option<u64>;

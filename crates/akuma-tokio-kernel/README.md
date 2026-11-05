@@ -142,12 +142,12 @@ in the guide:
 use akuma_tokio_kernel::middleware::{CUSTOM_BASE, Hooks, Middleware, On, Route, Syscall, Verdict};
 
 static MW: Middleware<u64> = Middleware::new(0, Hooks {
-    // A syscall of your own: 1000 and up is above every number Linux assigns. `fallback` runs only where the
+    // A syscall of your own: 1000 and up is above every number Linux assigns. `handler` runs only where the
     // kernel would have answered -ENOSYS, so it cannot break a call the kernel already serves.
-    fallback: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_ctx| Some(42))],
+    handler: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_ctx| Some(42))],
     // Look at or refuse a call (the context is read-only: a hook cannot change what runs). Runs inside the kernel lock; the
     // caller's memory is reachable.
-    kernel_pre: &[Route::new(&[On::Call(Syscall::Openat)], |ctx| {
+    pre: &[Route::new(&[On::Call(Syscall::Openat)], |ctx| {
         let mut buf = [0u8; 128];
         if let Ok(path) = ctx.user_str(ctx.args[1], &mut buf) {
             akuma_primitives::safe_print!(160, "[mw] pid {} openat {}\n", ctx.pid, path);
@@ -176,7 +176,7 @@ probe pins what it does not cover. It needs no sshd or key, only `e2fsprogs` and
 - **One table, flat, no chaining.** No `next`, no priorities. Two entries for one call in one tier are refused when
   the table is armed (a boot panic naming the number). A second `.middleware(..)` panics. To layer, write a
   function that calls your functions and register that.
-- **One lock mode.** `kernel_pre` and `fallback` hooks run under the kernel lock, which the kernel takes. A hook never
+- **One lock mode.** `pre` and `handler` hooks run under the kernel lock, which the kernel takes. A hook never
   sees, names or takes a lock.
 - **Cheap when idle.** Which numbers a tier wants is a 512-bit mask built when the table is armed, read once per
   call, so an unhooked call costs a relaxed load and a bit test. `Verdict::PassAndForget`
@@ -187,7 +187,7 @@ probe pins what it does not cover. It needs no sshd or key, only `e2fsprogs` and
   `mmap`, a `PROT_EXEC` `mprotect`. `Hooks::exec` is asked at each, so a policy is one `match` and cannot be bypassed by a path nobody
   hooked; the image is asked before anything is torn down, so a refusal is `EACCES` and leaves the caller untouched.
 - **Not everything is interceptable.** `exit`, `exit_group`, `clone`, `execve` and `rt_sigreturn` are observed
-  only: no `fallback`, and a changed result is ignored. A `kernel_pre` refusal is honoured for `execve` (it skips the call
+  only: no `handler`, and a changed result is ignored. A `pre` refusal is honoured for `execve` (it skips the call
   before it touches the process) and ignored for the other four.
 - **No `unsafe`.** The module is `forbid(unsafe_code)` and the API needs none; your crate decides its own.
 - A hook that panics is a kernel panic.
