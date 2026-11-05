@@ -122,8 +122,6 @@ pub struct OwnCtx<'a, S> {
 
 /// `kernel_pre`.
 pub type KernelPre = fn(&KernelCtx) -> Verdict;
-/// `kernel_post`: the result in, the result out.
-pub type KernelPost = fn(&KernelCtx, u64) -> u64;
 /// `fallback`: `Some(answer)` to serve the call, `None` to leave the `-ENOSYS`.
 pub type Fallback = fn(&KernelCtx) -> Option<u64>;
 /// `own_pre`.

@@ -12,7 +12,6 @@
 //! | how many `getpid`s the `own` tier saw before / after the lock | `fallback` | 1002 / 1003 |
 //! | refuse `open("/mw-deny")` with `EACCES`; log any other `/mw-*` path | `kernel_pre` | `openat` |
 //! | with `--features no-dynamic-loading` only: no dynamic loading (file `PROT_EXEC` mmap, `mprotect(+X)`, `LD_*` in an `execve` env), see the `akuma-mw-no-dynamic-loading` crate | `kernel_pre` | `mmap` / `mprotect` / `execve` |
-//! | `gettid() + 1000` (an error result is left alone) | `kernel_post` | `gettid` |
 //! | count `getpid`, outside the kernel lock (a split read-modify-write on the state, so a lost update shows) | `own_pre` / `own_post` | `getpid` |
 //! | publish the `own` state when a `getppid` passes; read it back | `own_post` / `fallback` | `getppid` / 1005 |
 
@@ -132,8 +131,6 @@ pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
         #[cfg(feature = "no-dynamic-loading")]
         Route::new(&[On::Call(Syscall::Execve)], akuma_mw_no_dynamic_loading::exec_guard),
     ],
-    // A result is a value or `-errno`: only add to a value.
-    kernel_post: &[Route::new(&[On::Call(Syscall::Gettid)], |_, r| if r.cast_signed() < 0 { r } else { r + 1000 })],
     own_pre: &[Route::new(&[On::Call(Syscall::Getpid)], |ctx| {
         // Deliberately not `+= 1`: with the load and the store apart, two cores in here at once would lose an
         // update. The autolock is what makes `state` equal the atomic count below.

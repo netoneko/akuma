@@ -10,7 +10,7 @@ use akuma_primitives::OnceCopy;
 
 impl<S: Send + 'static> Middleware<S> {
     /// The whole `kernel` side of one call: pre, the call (`inner`),
-    /// the fallback where it answered `-ENOSYS`, then post. Call with the kernel lock held.
+    /// and the fallback where it answered `-ENOSYS`. Call with the kernel lock held.
     pub fn run_kernel(&self, nr: u64, args: [u64; 6], tid: u64, inner: impl FnOnce() -> u64) -> u64 {
         let machine = self.m();
         let latch = self.kernel_latch(nr);
@@ -31,7 +31,7 @@ impl<S: Send + 'static> Middleware<S> {
                 Verdict::Return(_) | Verdict::Errno(_) => {}
             }
         }
-        let mut r = if let Some(v) = ret {
+        if let Some(v) = ret {
             v
         } else {
             let r = inner();
@@ -43,16 +43,7 @@ impl<S: Send + 'static> Middleware<S> {
             } else {
                 r
             }
-        };
-        if latch.post
-            && let Some(h) = self.find(self.hooks.kernel_post, nr)
-        {
-            let new = h(&ctx, r);
-            if !watch {
-                r = new;
-            }
         }
-        r
     }
 }
 

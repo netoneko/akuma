@@ -77,7 +77,6 @@ One `Middleware<S>` per kernel, a `static`: `Middleware::new(state, Hooks { .. }
 |---|---|---|---|
 | `kernel_pre` | `fn(&KernelCtx) -> Verdict` | inside the kernel lock, before the call | `Pass`, `PassAndForget`, `Return(v)`, `Errno(e)` (a refusal: not for `exit`/`clone`/`rt_sigreturn`) |
 | `fallback` | `fn(&KernelCtx) -> Option<u64>` | inside the lock, only where the answer is `-ENOSYS` | `Some(answer)` to serve the call, `None` to leave the `-ENOSYS` |
-| `kernel_post` | `fn(&KernelCtx, u64) -> u64` | inside the lock, after the call | return the result to use (result in, result out) |
 | `own_pre` | `fn(&mut OwnCtx<S>)` | **outside** the lock, before it | observe, and update `ctx.state` |
 | `own_post` | `fn(&mut OwnCtx<S>, u64)` | outside the lock, after it | observe, and update `ctx.state` |
 
@@ -92,8 +91,8 @@ a function that calls your own functions and register that; the framework gives 
 
 ```text
 amd64    dispatch():  own_pre -> [take the kernel lock] -> legacy fold -> kernel_pre -> the call
-                      -> fallback (if -ENOSYS) -> kernel_post -> signal delivery -> [release] -> own_post
-aarch64  el0_sync():  own_pre -> [take the kernel lock] -> kernel_pre -> the call -> fallback -> kernel_post
+                      -> fallback (if -ENOSYS) -> signal delivery -> [release] -> own_post
+aarch64  el0_sync():  own_pre -> [take the kernel lock] -> kernel_pre -> the call -> fallback
                       -> signal delivery -> [release] -> own_post
 ```
 
@@ -101,7 +100,7 @@ aarch64  el0_sync():  own_pre -> [take the kernel lock] -> kernel_pre -> the cal
   folded into their `*at` call.
 - The `own` tier sees the **raw** number the program issued, before any folding, and has no user memory (below).
 - A hook cannot change what the call sees: `KernelCtx` is read-only, and the call gets exactly the arguments the program passed.
-- A `Return`/`Errno` from `kernel_pre` skips the call (and the fallback) but `kernel_post` still runs on that result.
+- A `Return`/`Errno` from `kernel_pre` skips the call (and the fallback).
 
 ## What a hook gets
 
@@ -356,15 +355,13 @@ signed kernel: survives).
 - **`kernel` hooks run under the big kernel lock.** Do not spin on something another core's syscall holds, and do not try to
   park the caller: there is no sanctioned way to block yet (see "Not built").
 - **Some calls are observed, never replaced:** `exit`, `exit_group`, `clone`, `execve`, `rt_sigreturn` rewrite the frame or do not
-  return. For them a `fallback` and a changed `kernel_post` result are ignored (`observe_only`). A `kernel_pre` refusal
+  return. For them a `fallback` is ignored (`observe_only`). A `kernel_pre` refusal
   (`Return`/`Errno`) skips the call, so it cannot corrupt the frame: it is honoured for `execve` and ignored for `exit`,
   `exit_group`, `clone` and `rt_sigreturn` (`may_refuse_before`).
 - **Hooks cannot mutate the kernel context.** Every `kernel` hook takes `&KernelCtx`, so a hook can allow, refuse or answer a
   call but never change what runs. Rewriting arguments is how one hook defeats another's check (a guard validates a path, a
   later hook swaps the pointer), and it would make combined hooks depend on their order. (`OwnCtx` has `&mut` for one thing: your
   own `state`.)
-- **A result is a value or `-errno`.** A `kernel_post` that does arithmetic must leave an error alone:
-  `if r.cast_signed() < 0 { r } else { r + 1000 }`. (The first Shanghai sample added 1000 to a `-ENOSYS` and returned 962.)
 - **A hook that panics is a kernel panic.** Treat it as kernel code.
 - **No `unsafe`.** `middleware/` is `#![forbid(unsafe_code)]` and the API needs none; put the same attribute at the top of your
   middleware module. Raw access means patching the attribute out of your own crate.
@@ -401,8 +398,7 @@ The feature-on cost against the syscall floor is **not measured**; do not quote 
 
 - Struct-update syntax needs public fields: write `Middleware::new(state, Hooks { fallback: .., ..Hooks::new() })`, not a
   `Middleware { .. }` literal.
-- Hook a call the kernel actually serves. `getuid` is only served with the `shell` feature; a table on it sees `-ENOSYS` and, if
-  it is a `kernel_post`, adds to an error.
+- Hook a call the kernel actually serves. `getuid` is only served with the `shell` feature; a table on it sees `-ENOSYS`.
 - On aarch64, QEMU's `-kernel` needs the flat `.bin`; when cargo reuses a cached ELF it does not relink and the `.bin` can be the
   other build's. Make it from the ELF (`sh scripts/mkbin.sh <elf> <bin>`), as the gate does
   (`docs/archive/LINK_KERNEL_BIN_LAYOUT.md`).

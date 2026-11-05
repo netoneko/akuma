@@ -396,9 +396,6 @@ fn main() {
     check("params: mw.other.secret is NOT readable through the mw.sample. view", (seen >> 2) & 1, 0);
     check("kernel_pre ignores a path it does not care about", open("/definitely-not-here"), ENOENT);
 
-    // kernel_post on gettid replaces the result (for init, tid == pid).
-    check("kernel_post gettid + 1000", sc(nr::GETTID, [0; 4]) - sc(nr::GETPID, [0; 4]), 1000);
-
     // own tier: outside the kernel lock, plain integers + private state.
     let (pre0, post0) = (sc(1002, [0; 4]), sc(1003, [0; 4]));
     for _ in 0..5 {

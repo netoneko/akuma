@@ -1,7 +1,7 @@
 //! The table: routes, the per-tier interest masks, the autolock, [`Hooks`] and [`Middleware`] (arming, latches, `own` hooks).
 
 use super::calls::{native, Machine, On, MASK_BITS};
-use super::ctx::{Fallback, KernelPost, KernelPre, OwnCtx, OwnPost, OwnPre};
+use super::ctx::{Fallback, KernelPre, OwnCtx, OwnPost, OwnPre};
 use super::exec::{ExecEvent, ExecKind, ExecPolicy, ExecVerdict};
 use crate::params::Params;
 use akuma_primitives::{OnceCopy, PreemptGuard};
@@ -67,7 +67,6 @@ impl<S> OwnLock<S> {
 /// The hook tables: all public, so a table is written `Hooks { fallback: &[..], ..Hooks::new() }` from any crate.
 pub struct Hooks<S: 'static> {
     pub kernel_pre: &'static [Route<KernelPre>],
-    pub kernel_post: &'static [Route<KernelPost>],
     pub fallback: &'static [Route<Fallback>],
     pub own_pre: &'static [Route<OwnPre<S>>],
     pub own_post: &'static [Route<OwnPost<S>>],
@@ -93,7 +92,7 @@ impl<S> Hooks<S> {
     /// No hooks.
     #[must_use]
     pub const fn new() -> Self {
-        Self { kernel_pre: &[], kernel_post: &[], fallback: &[], own_pre: &[], own_post: &[], exec: None, init: None, exec_sidecar: None }
+        Self { kernel_pre: &[], fallback: &[], own_pre: &[], own_post: &[], exec: None, init: None, exec_sidecar: None }
     }
 }
 
@@ -116,7 +115,6 @@ pub struct Middleware<S: Send + 'static> {
     pub(super) state: OwnLock<S>,
     pub(super) machine: OnceCopy<Machine>,
     pub(super) kp: Interest,
-    pub(super) kq: Interest,
     pub(super) op: Interest,
     pub(super) oq: Interest,
 }
@@ -129,7 +127,6 @@ impl<S: Send + 'static> Middleware<S> {
             state: OwnLock::new(state),
             machine: OnceCopy::new(),
             kp: Interest::new(),
-            kq: Interest::new(),
             op: Interest::new(),
             oq: Interest::new(),
         }
@@ -155,7 +152,6 @@ impl<S: Send + 'static> Middleware<S> {
         }
         self.machine.set(machine);
         fill(self.hooks.kernel_pre, Some(&self.kp), &machine, "kernel_pre");
-        fill(self.hooks.kernel_post, Some(&self.kq), &machine, "kernel_post");
         fill(self.hooks.fallback, None, &machine, "fallback");
         fill(self.hooks.own_pre, Some(&self.op), &machine, "own_pre");
         fill(self.hooks.own_post, Some(&self.oq), &machine, "own_post");
@@ -177,10 +173,10 @@ impl<S: Send + 'static> Middleware<S> {
         routes.iter().find(|r| r.on.iter().any(|o| native(&m, *o) == nr)).map(|r| r.hook)
     }
 
-    /// The `kernel_pre`/`kernel_post` decisions for `nr`, read once.
+    /// The `kernel_pre` decision for `nr`, read once.
     #[must_use]
     pub fn kernel_latch(&self, nr: u64) -> Latch {
-        Latch { pre: self.kp.test(nr), post: self.kq.test(nr) }
+        Latch { pre: self.kp.test(nr), post: false }
     }
 
     /// The `own_pre`/`own_post` decisions for `nr`, read once.

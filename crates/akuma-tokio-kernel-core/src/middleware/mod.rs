@@ -15,7 +15,6 @@
 //! |---|---|---|---|
 //! | `kernel_pre`  | inside the big kernel lock, before the call | [`KernelCtx`] (read-only): args, caller's memory, tid, pid | `Pass`, `Return`, `Errno` |
 //! | `fallback`    | inside the lock, only where the answer is `-ENOSYS` | [`KernelCtx`] | supply the answer (a *new* syscall) |
-//! | `kernel_post` | inside the lock, after the call | [`KernelCtx`] + the result | replace the result |
 //! | `own_pre` / `own_post` | **outside** the lock, around it | [`OwnCtx`]: plain integers + the middleware's private state | observe only |
 //! | `exec` (one policy) | wherever code reaches a process: an image (`load_task`), a `PROT_EXEC` `mmap`, a `PROT_EXEC` `mprotect` | [`ExecEvent`] | [`ExecVerdict::Allow`] or `Deny(errno)` |
 //!
@@ -30,7 +29,7 @@
 //! Which numbers a tier cares about is decided once, when the table is armed: a 512-bit mask per tier. A call
 //! nobody hooked costs one relaxed load and a bit test per tier. A hook may return [`Verdict::PassAndForget`] to
 //! clear its own bit for that number. The mask is read **once** per call and latched ([`Latch`]), so a pre-hook
-//! that prunes itself cannot make its own post-hook vanish. Numbers from 512 up are always asked.
+//! that prunes itself cannot make its own `own_post` hook vanish. Numbers from 512 up are always asked.
 //!
 //! # Not interceptable
 //!
@@ -55,7 +54,7 @@ mod tests;
 pub use akuma_syscalls_abi::Syscall;
 pub use crate::params::{self, ParamSource, Params};
 pub use calls::{observe_only, may_refuse_before, Machine, On, Verdict, CUSTOM_BASE, ENOSYS_RET, MASK_BITS};
-pub use ctx::{Fallback, KernelCtx, KernelPost, KernelPre, OwnCtx, OwnPost, OwnPre, UserError};
+pub use ctx::{Fallback, KernelCtx, KernelPre, OwnCtx, OwnPost, OwnPre, UserError};
 pub use dispatch::{active, init, install, own_enter, own_leave, run_kernel, Dispatch};
 pub use exec::{exec_event, exec_sidecar, exec_verdict, ExecEvent, ExecKind, ExecPolicy, ExecVerdict};
 pub use table::{Hooks, InitHook, Latch, Middleware, Route};

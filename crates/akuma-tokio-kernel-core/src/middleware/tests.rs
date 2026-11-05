@@ -52,19 +52,6 @@ fn pre_can_answer_and_the_call_does_not_run() {
 }
 
 #[test]
-fn post_replaces_the_result_and_the_call_sees_the_original_arguments() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks {
-        kernel_post: &[Route::new(&[On::Call(Syscall::Openat)], |_, r| r + 1)],
-        ..Hooks::new()
-    });
-    MW.arm(machine());
-    let a = [0, 0xAA, 0, 0, 0, 0];
-    // `inner` takes no arguments and a hook gets `&KernelCtx`: nothing a hook does can change what the call was
-    // given. The kernel's own arms read the frame, which the middleware never writes.
-    assert_eq!(MW.run_kernel(OPENAT, a, 1, || 0xAA), 0xAB);
-}
-
-#[test]
 fn fallback_serves_only_what_would_be_enosys() {
     static MW: Middleware<u32> = Middleware::new(0, Hooks {
         fallback: &[Route::new(&[On::Nr(CUSTOM), On::Call(Syscall::Getpid)], |_| Some(42))],
@@ -81,7 +68,6 @@ fn fallback_serves_only_what_would_be_enosys() {
 fn exit_and_clone_are_observed_not_replaced() {
     static MW: Middleware<u32> = Middleware::new(0, Hooks {
         kernel_pre: &[Route::new(&[On::Call(Syscall::Clone)], |_| Verdict::Return(0))],
-        kernel_post: &[Route::new(&[On::Call(Syscall::Clone)], |_, _| 0)],
         ..Hooks::new()
     });
     MW.arm(machine());
@@ -95,8 +81,7 @@ fn execve_can_be_refused_before_it_runs_but_not_served_or_rewritten() {
         kernel_pre: &[Route::new(&[On::Call(Syscall::Execve)], |c| {
             if c.args[0] == 1 { Verdict::Errno(1) } else { Verdict::Pass }
         })],
-        // Neither of these may take effect on an observe-only call.
-        kernel_post: &[Route::new(&[On::Call(Syscall::Execve)], |_, _| 0)],
+        // This may not take effect on an observe-only call.
         fallback: &[Route::new(&[On::Call(Syscall::Execve)], |_| Some(99))],
         ..Hooks::new()
     });
@@ -110,7 +95,7 @@ fn execve_can_be_refused_before_it_runs_but_not_served_or_rewritten() {
     });
     assert_eq!(r.cast_signed(), -1);
     assert_eq!(ran.load(Relaxed), 0);
-    // Not refused: it runs, its -ENOSYS is not turned into 99 by the fallback, and post cannot replace it.
+    // Not refused: it runs, its -ENOSYS is not turned into 99 by the fallback, 
     let a = [0; 6];
     assert_eq!(MW.run_kernel(59, a, 1, || ENOSYS_RET), ENOSYS_RET);
     assert_eq!(MW.run_kernel(59, a, 1, || 7), 7);
@@ -133,25 +118,16 @@ fn exit_and_rt_sigreturn_cannot_be_refused() {
 }
 
 #[test]
-fn pass_and_forget_clears_the_bit_but_the_latch_keeps_the_post_hook() {
-    static POSTS: AtomicUsize = AtomicUsize::new(0);
+fn pass_and_forget_clears_the_bit() {
     static MW: Middleware<u32> = Middleware::new(0, Hooks {
         kernel_pre: &[Route::new(&[On::Call(Syscall::Getpid)], |_| Verdict::PassAndForget)],
-        kernel_post: &[Route::new(&[On::Call(Syscall::Getpid)], |_, r| {
-            POSTS.fetch_add(1, Relaxed);
-            r
-        })],
         ..Hooks::new()
     });
     MW.arm(machine());
     let a = [0; 6];
     assert!(MW.kernel_latch(GETPID).pre);
     MW.run_kernel(GETPID, a, 1, || 1);
-    // The next call is not asked, but the post bit is its own.
     assert!(!MW.kernel_latch(GETPID).pre);
-    assert!(MW.kernel_latch(GETPID).post);
-    MW.run_kernel(GETPID, a, 1, || 1);
-    assert_eq!(POSTS.load(Relaxed), 2);
 }
 
 #[test]
@@ -202,7 +178,7 @@ fn two_entries_for_one_call_in_one_tier_are_refused() {
 fn the_same_call_in_two_tiers_is_fine() {
     static MW: Middleware<u32> = Middleware::new(0, Hooks {
         kernel_pre: &[Route::new(&[On::Call(Syscall::Getpid)], |_| Verdict::Pass)],
-        kernel_post: &[Route::new(&[On::Call(Syscall::Getpid)], |_, r| r)],
+        own_post: &[Route::new(&[On::Call(Syscall::Getpid)], |_, _| {})],
         ..Hooks::new()
     });
     MW.arm(machine());
