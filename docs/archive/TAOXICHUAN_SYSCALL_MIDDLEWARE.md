@@ -19,7 +19,7 @@ around dispatch, the same on amd64 and aarch64, without making the common path p
    Two entries for one call in one tier panic at arm time. A second `Kernel::middleware(..)` panics. Someone who
    wants layers writes a function that calls their functions; nothing in the framework makes that feel supported.
    (We are not node developers.)
-2. **Tiers, not a pipeline.** `kernel_pre` (may `Pass`, `PassAndForget`, `Return`, `Errno`, rewrite `args`),
+2. **Tiers, not a pipeline.** `kernel_pre` (may `Pass`, `PassAndForget`, `Return`, `Errno`),
    `fallback` (runs only where the answer is `-ENOSYS`: add a syscall without being able to break one), `kernel_post`
    (may replace the result), and `own_pre`/`own_post` (observe only).
 3. **No hook ever touches a lock.** `kernel_*`/`fallback` run inside the big kernel lock, which the kernel takes.
@@ -46,6 +46,14 @@ around dispatch, the same on amd64 and aarch64, without making the common path p
    aarch64 `Frame` never leave the machine halves. Raw access means patching the attribute out of your own crate.
 8. **No runtime off-switch.** Same lesson as `wx=0` (removed 2026-11-05): a production kernel does not get a
    command-line hatch to change what a syscall does.
+9. **Hooks cannot mutate the kernel context** (2026-11-05, the owner: "sets a bad precedent"). The first cut let a
+   `kernel_pre` rewrite `ctx.args` and the call then saw the new values; nothing used it (one unit test did). It is gone:
+   every `kernel` hook takes `&KernelCtx`, `run_kernel` takes the arguments by value and no longer writes them back, and
+   the machine halves lost their write-back. Why it matters beyond tidiness: rewriting arguments is how one hook defeats
+   another's check (a guard validates a path, a later hook swaps the pointer), and a policy middleware wants the guarantee
+   "a hook can only allow, refuse or answer, never change what runs". It also makes hooks pure functions of the context, so
+   combining them has no hidden order effects. `OwnCtx` keeps `&mut` for one thing only, the hook's own private `state`.
+   If a real need for rewriting appears, add it back as an explicit `Verdict::Rewrite(args)` with a use case in hand.
 
 ## Where the seams are
 
@@ -64,8 +72,8 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
 
 ## What was verified (and what was not)
 
-- **Host:** 11 tests in `middleware.rs` (nothing hooked runs nothing; pre answers and the call does not run; args
-  rewrite and result replace; fallback serves only `-ENOSYS`; the five observe-only calls; `PassAndForget` with the
+- **Host:** 11 tests in `middleware.rs` (nothing hooked runs nothing; pre answers and the call does not run; the
+  result is replaced and the call is given the original arguments; fallback serves only `-ENOSYS`; the five observe-only calls; `PassAndForget` with the
   latch; `own` state; checked user memory and bounded strings; duplicate refusal; same call in two tiers; numbers
   from 512 always asked). `cargo test -p akuma-tokio-kernel-core --features middleware --target $HOST`.
 - **Builds:** `akuma-tokio-kernel` with and without `--features middleware` for `x86_64-unknown-none` and

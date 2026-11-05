@@ -75,9 +75,9 @@ One `Middleware<S>` per kernel, a `static`: `Middleware::new(state, Hooks { .. }
 
 | tier | hook type | runs | it may |
 |---|---|---|---|
-| `kernel_pre` | `fn(&mut KernelCtx) -> Verdict` | inside the kernel lock, before the call | `Pass`, `PassAndForget`, `Return(v)`, `Errno(e)` (a refusal: not for `exit`/`clone`/`rt_sigreturn`); rewrite `ctx.args` |
-| `fallback` | `fn(&mut KernelCtx) -> Option<u64>` | inside the lock, only where the answer is `-ENOSYS` | `Some(answer)` to serve the call, `None` to leave the `-ENOSYS` |
-| `kernel_post` | `fn(&mut KernelCtx, u64) -> u64` | inside the lock, after the call | return the result to use (result in, result out) |
+| `kernel_pre` | `fn(&KernelCtx) -> Verdict` | inside the kernel lock, before the call | `Pass`, `PassAndForget`, `Return(v)`, `Errno(e)` (a refusal: not for `exit`/`clone`/`rt_sigreturn`) |
+| `fallback` | `fn(&KernelCtx) -> Option<u64>` | inside the lock, only where the answer is `-ENOSYS` | `Some(answer)` to serve the call, `None` to leave the `-ENOSYS` |
+| `kernel_post` | `fn(&KernelCtx, u64) -> u64` | inside the lock, after the call | return the result to use (result in, result out) |
 | `own_pre` | `fn(&mut OwnCtx<S>)` | **outside** the lock, before it | observe, and update `ctx.state` |
 | `own_post` | `fn(&mut OwnCtx<S>, u64)` | outside the lock, after it | observe, and update `ctx.state` |
 
@@ -100,12 +100,12 @@ aarch64  el0_sync():  own_pre -> [take the kernel lock] -> kernel_pre -> the cal
 - The `kernel` tier sees the **canonical** number on amd64: the legacy spellings (`mkdir`, `unlink`, ...) have already been
   folded into their `*at` call.
 - The `own` tier sees the **raw** number the program issued, before any folding, and has no user memory (below).
-- `kernel_pre` may rewrite `ctx.args`; the call and `kernel_post` see the new values.
+- A hook cannot change what the call sees: `KernelCtx` is read-only, and the call gets exactly the arguments the program passed.
 - A `Return`/`Errno` from `kernel_pre` skips the call (and the fallback) but `kernel_post` still runs on that result.
 
 ## What a hook gets
 
-`KernelCtx`: `nr` (native number), `call: Option<Syscall>`, `args: [u64; 6]` (rewritable), `tid`, `pid`, and checked access to the
+`KernelCtx`: `nr` (native number), `call: Option<Syscall>`, `args: [u64; 6]` (read-only, as passed), `tid`, `pid`, and checked access to the
 **caller's** memory:
 
 | method | does | error |
@@ -159,7 +159,7 @@ fn starts_with_ld(ctx: &KernelCtx, s: u64) -> Result<bool, UserError> {
 
 /// `execve(path, argv, envp)`: refuse a call whose `envp` has an `LD_*` entry. `envp` may be NULL (an empty
 /// environment). A bad pointer or an over-long list is refused too: unknown is not allowed.
-pub fn exec_guard(ctx: &mut KernelCtx) -> Verdict {
+pub fn exec_guard(ctx: &KernelCtx) -> Verdict {
     let mut slot = ctx.args[2];
     if slot == 0 {
         return Verdict::Pass;
@@ -240,6 +240,10 @@ shape of the hook, not the enforcement.
   return. For them a `fallback` and a changed `kernel_post` result are ignored (`observe_only`). A `kernel_pre` refusal
   (`Return`/`Errno`) skips the call, so it cannot corrupt the frame: it is honoured for `execve` and ignored for `exit`,
   `exit_group`, `clone` and `rt_sigreturn` (`may_refuse_before`).
+- **Hooks cannot mutate the kernel context.** Every `kernel` hook takes `&KernelCtx`, so a hook can allow, refuse or answer a
+  call but never change what runs. Rewriting arguments is how one hook defeats another's check (a guard validates a path, a
+  later hook swaps the pointer), and it would make combined hooks depend on their order. (`OwnCtx` has `&mut` for one thing: your
+  own `state`.)
 - **A result is a value or `-errno`.** A `kernel_post` that does arithmetic must leave an error alone:
   `if r.cast_signed() < 0 { r } else { r + 1000 }`. (The first Shanghai sample added 1000 to a `-ENOSYS` and returned 962.)
 - **A hook that panics is a kernel panic.** Treat it as kernel code.
