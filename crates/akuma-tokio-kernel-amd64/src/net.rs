@@ -185,27 +185,14 @@ fn weak_fill(buf: &mut [u8]) {
     akuma_primitives::rng::splitmix_fill(seed, buf);
 }
 
-/// One word from `RDRAND`, retrying transient failures ten times (Intel's own
-/// recommendation); `None` when the hardware stays out of entropy.
+/// One word from `RDRAND`, retrying transient failures ten times; `None`
+/// when the hardware stays out of entropy. The instruction (and those
+/// retries — Intel's own recommendation) is `akuma_cpu::rng::rdrand`'s, a
+/// byte-identical twin of the copy this file and `amd64/src/net.rs` each
+/// carried until it moved there.
 #[cfg(target_arch = "x86_64")]
 fn rdrand_word() -> Option<u64> {
-    for _ in 0..10 {
-        let mut value: u64 = 0;
-        let mut ok: u8 = 0;
-        // SAFETY: `rdrand` writes a general register and sets CF; no memory,
-        // no stack.
-        unsafe {
-            core::arch::asm!(
-                "rdrand {v}", "setc {ok}",
-                v = out(reg) value, ok = out(reg_byte) ok,
-                options(nomem, nostack),
-            );
-        }
-        if ok != 0 {
-            return Some(value);
-        }
-    }
-    None
+    akuma_cpu::rng::rdrand()
 }
 
 /// Fill `buf` from `RDRAND`; falls back to [`weak_fill`] when the CPU lacks the

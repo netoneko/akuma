@@ -99,8 +99,11 @@
 //!
 //! # What x86_64 gets today
 //!
-//! The host stub plus three real x86 arms — [`barrier`], [`park`], [`daif`] —
-//! and the read-only [`ctlreg`] control registers, and a **placeholder, not a port**, everywhere else: a no-op `dsb_ish` and a
+//! The host stub plus real x86 arms — [`barrier`], [`park`] (the idle
+//! brackets and `halt`), [`daif`] — the read-only [`ctlreg`] control registers
+//! **plus their named writers** (`enable_fpu`, `enable_xsave`,
+//! `enable_smep_smap`, `set_cr0_wp`; no raw write), [`interrupts`] (`on` /
+//! `off`), [`rng`], and the `msr` closed set — and a **placeholder, not a port**, everywhere else: a no-op `dsb_ish` and a
 //! `park::wfi` that does not park are wrong on real x86 hardware.
 //!
 //! [`daif`] went real on 2026-09-08 for the amd64 C1 process-table step
@@ -120,19 +123,25 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::inline_always, clippy::must_use_candidate)]
 
-/// x86_64 control registers, **read only**.
+/// x86_64 control registers: every read, and the writes the kernels need as
+/// **named functions**.
 ///
 /// `mov reg, crN` copies a register into a local: it dereferences nothing and has
-/// no side effect, so it is safe to execute — the same judgement the system
-/// registers in [`sysreg`] make for AArch64. **Writing** any of them is not here
-/// and will not be: `mov cr0, rax` can turn paging or write-protection off,
-/// `mov cr3, rax` switches the address space under the running code, and
-/// `mov cr4, rax` flips SMAP/SMEP/PAE. They stay `unsafe` at the call site, with
-/// the obligation stated there — the same asymmetry as `TTBR0_EL1` (read here,
-/// written elsewhere).
+/// no side effect, so every read is safe to execute — the same judgement the
+/// system registers in [`sysreg`] make for AArch64.
 ///
-/// Off x86_64 bare metal every function returns 0, like the rest of the crate's
-/// host stubs.
+/// A **raw** write is not here and will not be: `mov cr0, rax` can turn paging
+/// or write-protection off, `mov cr3, rax` switches the address space under the
+/// running code, and `mov cr4, rax` flips SMAP/SMEP/PAE — the same asymmetry as
+/// `TTBR0_EL1` (read here, written elsewhere). What the two kernels actually
+/// need to write is a handful of fixed semantics — enable the FPU/SSE, enable
+/// XSAVE, enable SMEP/SMAP, set WP — and each is here as a named function that
+/// read-modify-writes exactly its own bits, the closed-set design [`msr`] and
+/// `akuma-port` already draw: a `write_cr0(bits)` would let safe code turn
+/// paging off; [`set_cr0_wp`] cannot.
+///
+/// Off x86_64 bare metal every read returns 0 and every writer does nothing,
+/// like the rest of the crate's host stubs.
 pub mod ctlreg {
     /// `CR0`: `PE`, `WP`, `PG`, …
     #[inline(always)]
@@ -197,6 +206,124 @@ pub mod ctlreg {
         #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
         0
     }
+
+    // The raw writers. Private on purpose: the public surface is the named
+    // semantics below — a raw `write_crN(bits)` is exactly what must not be
+    // callable from safe code.
+
+    /// `mov cr0, rax`.
+    #[inline(always)]
+    fn write_cr0(v: u64) {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: writes back the register's own read with only a named
+        // function's bits changed; the semantic obligation is that caller's.
+        unsafe {
+            core::arch::asm!("mov cr0, {}", in(reg) v, options(nomem, nostack, preserves_flags));
+        };
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        let _ = v;
+    }
+
+    /// `mov cr4, rax`.
+    #[inline(always)]
+    fn write_cr4(v: u64) {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: as `write_cr0`.
+        unsafe {
+            core::arch::asm!("mov cr4, {}", in(reg) v, options(nomem, nostack, preserves_flags));
+        };
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        let _ = v;
+    }
+
+    // The bits the named writers below touch, spelt once.
+    const CR0_MP: u64 = 1 << 1;
+    const CR0_EM: u64 = 1 << 2;
+    const CR0_WP: u64 = 1 << 16;
+    const CR4_OSFXSR: u64 = 1 << 9;
+    const CR4_OSXMMEXCPT: u64 = 1 << 10;
+    const CR4_OSXSAVE: u64 = 1 << 18;
+    const CR4_SMEP: u64 = 1 << 20;
+    const CR4_SMAP: u64 = 1 << 21;
+
+    /// Make the FPU and SSE usable on this core.
+    ///
+    /// `CR0.EM=0`, `CR0.MP=1`, `CR4.OSFXSR=1`, `CR4.OSXMMEXCPT=1` — exactly the four bits `boot.s`
+    /// installs on the BSP in long mode (so an AP or a whole kernel that
+    /// skipped `boot.s`'s step matches it), every other bit of both registers
+    /// written back as read.
+    ///
+    /// Without them an SSE instruction takes `#UD` and `x87`/SSE state is not
+    /// context-switched by `fxsave`/`xsave` — SIGILL for a ring-3 program that
+    /// did nothing wrong. With them, SIMD exceptions arrive as `#XM` (vector
+    /// 19) rather than `#UD`, which is what a handler can decode.
+    ///
+    /// CR0.NE (native exceptions, bit 5) is deliberately not among them: the
+    /// boot paths this mirrors never set it, and changing that fact here would
+    /// be a behaviour change for the BSP/AP pair, not a move.
+    pub fn enable_fpu() {
+        write_cr0((cr0() & !CR0_EM) | CR0_MP);
+        write_cr4(cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT);
+    }
+
+    /// Enable XSAVE on this core: `CR4.OSXSAVE=1` (bit 18), then `XCR0=xcr0`
+    /// through `xsetbv` — in that order, because `xsetbv` is legal only once
+    /// `OSXSAVE` is set (the reverse order `#GP`s).
+    ///
+    /// The caller owes the CPUID facts, which this crate cannot read for it:
+    /// leaf 1 `ECX` bit 26 must say XSAVE exists, leaf `0xD` subleaf 0 `EAX`
+    /// must say every bit of `xcr0` is supported, and bit 0 (x87) of `xcr0`
+    /// must be set (architecturally required). A violation faults (`#GP` /
+    /// `#UD`); it is not memory-unsafe, which is why the obligation is a doc
+    /// and not an `unsafe` block.
+    pub fn enable_xsave(xcr0: u64) {
+        write_cr4(cr4() | CR4_OSXSAVE);
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: `OSXSAVE` was just set, so `xsetbv` is legal; the value's
+        // validity is the caller's CPUID obligation above.
+        unsafe {
+            core::arch::asm!(
+                "xsetbv",
+                in("ecx") 0u32,
+                in("eax") xcr0 as u32,
+                in("edx") (xcr0 >> 32) as u32,
+                options(nostack, preserves_flags)
+            );
+        };
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        let _ = xcr0;
+    }
+
+    /// Enable `CR4.SMEP` and/or `CR4.SMAP` on this core.
+    ///
+    /// Bits 20 and 21, each only when asked — the two flags are what CPUID.01H:EBX bits 7 and
+    /// 20 confirmed, and enabling a bit the part does not implement is
+    /// reserved-bit-set in CR4, which faults on the next use.
+    ///
+    /// SMEP makes ring 0 *executing* a user page fault; SMAP makes ring 0
+    /// *accessing* one fault unless `RFLAGS.AC` is set (see [`smap`]). Every
+    /// other CR4 bit is written back as read.
+    pub fn enable_smep_smap(smep: bool, smap: bool) {
+        let mut cr4 = cr4();
+        if smep {
+            cr4 |= CR4_SMEP;
+        }
+        if smap {
+            cr4 |= CR4_SMAP;
+        }
+        write_cr4(cr4);
+    }
+
+    /// Set `CR0.WP` (bit 16) on this core.
+    ///
+    /// From here a **ring-0 write** to a read-only page faults instead of
+    /// silently succeeding — without it
+    /// `.rodata` protection is a fiction and copy-on-write is impossible to
+    /// reason about, because the supervisor bit alone grants write access.
+    /// Every other CR0 bit is written back as read.
+    pub fn set_cr0_wp() {
+        write_cr0(cr0() | CR0_WP);
+    }
 }
 
 /// x86_64 model-specific registers: the closed set this kernel touches.
@@ -221,9 +348,16 @@ pub mod ctlreg {
 ///   `arch_prctl(ARCH_SET_FS, 0x8000_0000_0000_0000)` was a user-triggerable kernel
 ///   fault. These two are what the program owns and the kernel never dereferences,
 ///   the same judgement as `sysreg::set_tpidr_el0`.
-/// * **Nothing else.** [`write`] is `unsafe`: `GS_BASE` is the per-CPU base the
-///   kernel dereferences, `LSTAR`/`STAR`/`EFER` re-point the syscall path, `PAT`
-///   re-types memory, `APIC_BASE` enables the interrupt controller.
+/// * **A one-entry PAT edit** ([`set_pat_entry_wc`]): one byte becomes write-combining,
+///   the other seven are written back as read, and the obligation that no live
+///   mapping selects that entry is a boot-order fact of the caller, stated at the
+///   function. A wrong choice changes a memory type (a coherency hazard); it does not
+///   hand safe code a pointer.
+/// * **Nothing else.** [`write`] is `unsafe`: `GS_BASE` is the per-CPU base the kernel
+///   dereferences on every per-CPU read, so a wrong value is a wrong pointer;
+///   `LSTAR`/`STAR`/`EFER` re-point the syscall path, `APIC_BASE` enables the
+///   interrupt controller, and a raw `PAT` write can re-type memory a live mapping
+///   still selects.
 ///
 /// Off x86_64 bare metal every read returns 0 and every write does nothing, like
 /// the rest of the crate's host stubs.
@@ -345,6 +479,26 @@ pub mod msr {
         Ok(())
     }
 
+    /// Rewrite one PAT entry to write-combining: entry `index` (0..8) becomes
+    /// `WC` (`0x01`), the other seven stay exactly as firmware left them.
+    ///
+    /// The PAT is per-core, so a caller that wants WC anywhere runs this on the
+    /// BSP at init and on every AP that joins (the framebuffer path's
+    /// `WC_ON` handshake). The obligation, a liveness fact the caller states, is
+    /// that **no live mapping on this core selects `index`**, or its memory type
+    /// changes underneath it; the
+    /// framebuffer's index is chosen precisely because nothing else selects it.
+    /// Mappings created *after* this with that index get WC by construction.
+    pub fn set_pat_entry_wc(index: u32) {
+        assert!(index < 8, "PAT has eight entries");
+        let shift = index * 8;
+        let pat = (read(Msr::Pat) & !(0xFF << shift)) | (0x01 << shift);
+        // SAFETY: one PAT byte rewritten to a valid encoding (WC) and the
+        // other seven preserved; a translation only changes type if a live
+        // mapping selects `index`, which the caller owes not to be true.
+        unsafe { write(Msr::Pat, pat) };
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -401,6 +555,56 @@ pub mod tsc {
         }
         #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
         0
+    }
+}
+
+/// x86_64 hardware randomness: `RDRAND`.
+///
+/// One 64-bit word from the hardware RNG, retrying transient failures ten
+/// times (Intel's RDRAND usage note: a single attempt may legitimately fail
+/// under entropy exhaustion; ten clears it in practice), `None` when the
+/// hardware stays out of entropy after those retries. The instruction reads
+/// no memory and writes one register plus `CF`.
+///
+/// **The CPUID gate is the caller's**, on purpose: `rdrand` without
+/// `CPUID.01H:ECX` bit 30 is `#UD`, so the caller must have checked — but the
+/// two callers in the tree each pair that check with a *different* stated-weak
+/// fallback policy for a machine without the feature, and the pair (gate +
+/// fallback) is the caller's decision, not the instruction's. A caller that
+/// gates can never fault; the `Option` here carries only the
+/// out-of-entropy-after-retries case.
+///
+/// Off x86_64 bare metal this returns `None`, like the rest of the crate's
+/// host stubs.
+pub mod rng {
+    /// One word from `RDRAND`, ten transient-failure retries, `None` if the
+    /// hardware stays out of entropy.
+    pub fn rdrand() -> Option<u64> {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            for _ in 0..10 {
+                let mut value: u64 = 0;
+                let mut ok: u8 = 0;
+                // SAFETY: `rdrand` writes a general register and sets `CF`;
+                // it reads no memory and faults only on a CPU without the
+                // feature, which the caller's CPUID gate excludes.
+                // `preserves_flags` is omitted on purpose: `CF` is a flag
+                // this instruction writes.
+                unsafe {
+                    core::arch::asm!(
+                        "rdrand {v}", "setc {ok}",
+                        v = out(reg) value, ok = out(reg_byte) ok,
+                        options(nomem, nostack),
+                    );
+                }
+                if ok != 0 {
+                    return Some(value);
+                }
+            }
+            None
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        None
     }
 }
 
@@ -919,6 +1123,40 @@ pub mod park {
             core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
         };
     }
+
+    /// Halt this core forever, interrupts masked: the `-> !` end state for a
+    /// kernel with nothing left to do (init failed, nothing to run) or
+    /// nothing left to try (the panic path). Never returns.
+    ///
+    /// `cli; hlt` **per iteration**, not once: `hlt` still wakes on an NMI, and
+    /// an NMI handler returning into this core must land in another `hlt`,
+    /// not in a spin that burns the core the halt was saving. On AArch64 the
+    /// same shape is mask + `wfi` — `wfi` wakes on a *pending* (masked)
+    /// interrupt, so the loop re-masks and re-waits. Off bare metal this is
+    /// an endless `spin_loop`, the honest host stub for a function that
+    /// cannot return and has nothing to halt.
+    pub fn halt() -> ! {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        loop {
+            // SAFETY: `cli; hlt` at ring 0, never to return; masking
+            // interrupts permanently is the intent, not a leaked side effect.
+            unsafe {
+                core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
+            }
+        }
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        loop {
+            super::daif::mask_irq();
+            wfi();
+        }
+        #[cfg(not(any(
+            all(target_os = "none", target_arch = "aarch64"),
+            all(target_os = "none", target_arch = "x86_64")
+        )))]
+        loop {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// x86_64 per-CPU identity, read through `%gs`.
@@ -1189,6 +1427,55 @@ pub mod daif {
         let saved = read();
         mask_irq();
         saved
+    }
+}
+
+/// Interrupt delivery on and off — the intent-level spelling.
+///
+/// [`daif`] is the *register* vocabulary (raw `DAIF` on AArch64, raw `RFLAGS`
+/// on x86_64, opposite polarities, round-trippable through `restore` for
+/// `IrqGuard`); this module is the two things every boot path says with it —
+/// "interrupts on now" and "interrupts off now" — without naming a register or
+/// learning a polarity. On x86_64 these are the same `sti`/`cli` `daif`
+/// translates; on AArch64 they delegate to it.
+///
+/// The one thing this module cannot promise is that turning interrupts **on**
+/// is safe *here*: that needs the IDT loaded and every deliverable vector
+/// accounted for — a boot-order fact of the caller. That is why `on` is no
+/// more `unsafe` than `daif::unmask_irq` was: the block could never check it.
+pub mod interrupts {
+    /// `sti` / `msr daifclr, #2` — enable maskable interrupt delivery on this
+    /// core.
+    ///
+    /// `sti` takes effect after the *following* instruction, so a pending
+    /// interrupt is delivered at the next instruction boundary and never
+    /// slept past; callers that need the window closed use
+    /// `daif::unmask_irq_sync`.
+    #[inline(always)]
+    pub fn on() {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        super::daif::unmask_irq();
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: sets `RFLAGS.IF`; it touches no memory, and what an
+        // enabled interrupt may do is the handler's contract, not this
+        // instruction's.
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+        }
+    }
+
+    /// `cli` / `msr daifset, #2` — disable maskable interrupt delivery on
+    /// this core. The conservative direction: nothing a masked interrupt
+    /// could have done becomes unsafe by not happening.
+    #[inline(always)]
+    pub fn off() {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        super::daif::mask_irq();
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: clears `RFLAGS.IF`; it touches no memory.
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        }
     }
 }
 

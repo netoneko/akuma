@@ -2233,10 +2233,8 @@ pub fn smoke_test(t: &mut Suite) {
 
     // Enable interrupts so the tick runs while the workers do, then drive the
     // round-robin from the boot task until every worker has finished.
-    // SAFETY: IDT loaded, PICs masked, timer vector installed.
-    unsafe {
-        core::arch::asm!("sti", options(nomem, nostack));
-    }
+    // IDT loaded, PICs masked, timer vector installed.
+    akuma_cpu::interrupts::on();
 
     let tick_yields_before = TICK_YIELDS.load(Ordering::Relaxed);
     let mut switches = 0u64;
@@ -2249,10 +2247,8 @@ pub fn smoke_test(t: &mut Suite) {
         yield_now();
     }
 
-    // SAFETY: masking interrupts is the conservative direction.
-    unsafe {
-        core::arch::asm!("cli", options(nomem, nostack));
-    }
+    // Masking interrupts is always the conservative direction.
+    akuma_cpu::interrupts::off();
 
     // SAFETY: workers have finished; nothing else writes these.
     let (counters, checksums) = unsafe {
@@ -2367,15 +2363,13 @@ pub fn block_smoke_test(t: &mut Suite) {
         return;
     };
 
-    // SAFETY: IDT loaded, timer vector installed — the same window
-    // `smoke_test` opens, and for the same reason.
-    unsafe {
-        core::arch::asm!("sti", options(nomem, nostack));
-    }
+    // IDT loaded, timer vector installed — the same window `smoke_test`
+    // opens, and for the same reason.
+    akuma_cpu::interrupts::on();
 
     if !t.check("block: the worker reached its park", drive_until(&BLOCK_ARMED)) {
-        // SAFETY: masking is the conservative direction.
-        unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+        // Masking is the conservative direction.
+        akuma_cpu::interrupts::off();
         return;
     }
     // The worker stores `BLOCK_ARMED` and parks under one BKL hold, so by the
@@ -2465,10 +2459,8 @@ pub fn block_smoke_test(t: &mut Suite) {
         halted > 0 && spun == 0,
     );
 
-    // SAFETY: masking interrupts is the conservative direction.
-    unsafe {
-        core::arch::asm!("cli", options(nomem, nostack));
-    }
+    // Masking interrupts is the conservative direction.
+    akuma_cpu::interrupts::off();
 
     t.note("block: parks", blocks());
     t.note("block: wakes", wakes());

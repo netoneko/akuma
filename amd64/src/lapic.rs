@@ -399,13 +399,11 @@ pub fn enable_and_check_clock() -> bool {
     const BUDGET: u64 = 200_000_000;
 
     start_timer();
-    // SAFETY: the IDT is loaded, the timer vector has a handler and the legacy
-    // PICs are masked — the same preconditions `smoke_test` establishes for the
-    // kernel's first `sti`. This one is deliberately not paired with a `cli`:
+    // The IDT is loaded, the timer vector has a handler and the legacy PICs
+    // are masked — the same preconditions `smoke_test` establishes for the
+    // kernel's first `sti`. This one is deliberately not paired with an `off`:
     // handing `init` a machine with interrupts enabled is the point.
-    unsafe {
-        core::arch::asm!("sti", options(nomem, nostack));
-    }
+    akuma_cpu::interrupts::on();
     let before = ticks();
     let mut spins = 0u64;
     while ticks() == before && spins < BUDGET {
@@ -665,12 +663,10 @@ pub fn smoke_test(t: &mut Suite) {
     const WANT: u64 = 5;
     const BUDGET: u64 = 500_000_000;
 
-    // SAFETY: the IDT is loaded, the timer vector has a handler, the legacy PICs
+    // The IDT is loaded, the timer vector has a handler, the legacy PICs
     // are masked, and the LAPIC is configured. This is the first `sti` in the
     // kernel's life and everything it can deliver is accounted for.
-    unsafe {
-        core::arch::asm!("sti", options(nomem, nostack));
-    }
+    akuma_cpu::interrupts::on();
 
     let mut spins = 0u64;
     while ticks() < WANT && spins < BUDGET {
@@ -678,10 +674,8 @@ pub fn smoke_test(t: &mut Suite) {
         core::hint::spin_loop();
     }
 
-    // SAFETY: masking interrupts is always the conservative direction.
-    unsafe {
-        core::arch::asm!("cli", options(nomem, nostack));
-    }
+    // Masking interrupts is always the conservative direction.
+    akuma_cpu::interrupts::off();
     stop_timer();
 
     t.check("lapic: timer interrupts arrive", ticks() >= WANT);

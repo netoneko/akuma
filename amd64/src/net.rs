@@ -212,31 +212,13 @@ pub fn rng_fill_checked(buf: &mut [u8]) -> bool {
     }
     let mut i = 0;
     while i < buf.len() {
-        let mut value: u64 = 0;
-        let mut ok: u8 = 0;
-        for _ in 0..10 {
-            // SAFETY: `rdrand` writes a general register and sets CF. It reads
-            // no memory and faults only on a CPU without the feature, which
-            // every x86_64 part these machines run on has.
-            unsafe {
-                core::arch::asm!(
-                    "rdrand {v}",
-                    "setc {ok}",
-                    v = out(reg) value,
-                    ok = out(reg_byte) ok,
-                    options(nomem, nostack),
-                );
-            }
-            if ok != 0 {
-                break;
-            }
-        }
-        if ok == 0 {
-            // Out of entropy after ten tries. Stop rather than continue with a
-            // stale `value`: a short fill is a visible failure, a repeated
-            // qword is not.
+        // The instruction (and its ten transient-failure retries) is
+        // `akuma_cpu::rng::rdrand`'s; `None` means out of entropy after those
+        // retries. Stop rather than continue with a stale word: a short fill
+        // is a visible failure, a repeated qword is not.
+        let Some(value) = akuma_cpu::rng::rdrand() else {
             return false;
-        }
+        };
         let n = (buf.len() - i).min(8);
         buf[i..i + n].copy_from_slice(&value.to_le_bytes()[..n]);
         i += n;

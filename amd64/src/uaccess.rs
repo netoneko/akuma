@@ -181,17 +181,10 @@ pub fn init_smap() -> SmapStatus {
     let cpuid_smep = ebx & (1 << 7) != 0;
     let cpuid_smap = ebx & (1 << 20) != 0;
 
-    let mut cr4 = akuma_cpu::ctlreg::cr4();
-    if cpuid_smep {
-        cr4 |= CR4_SMEP;
-    }
-    if cpuid_smap {
-        cr4 |= CR4_SMAP;
-    }
-    // SAFETY: only the two feature bits CPUID just confirmed are added; every
-    // other bit is written back as read. Enabling SMEP/SMAP changes the
-    // permission check on user pages for ring 0 and nothing else.
-    unsafe { core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags)) };
+    // Only the two feature bits CPUID just confirmed are enabled; every other
+    // CR4 bit is preserved. Enabling SMEP/SMAP changes the permission check on
+    // user pages for ring 0 and nothing else.
+    akuma_cpu::ctlreg::enable_smep_smap(cpuid_smep, cpuid_smap);
     if cpuid_smap {
         SMAP_ACTIVE.store(1, Ordering::Release);
         // The shared user-copy crate has its own copy loop (`rep movsb`) and
@@ -202,14 +195,12 @@ pub fn init_smap() -> SmapStatus {
         akuma_user_access::set_smap_active(true);
     }
 
-    let mut cr0 = akuma_cpu::ctlreg::cr0();
-    cr0 |= CR0_WP;
-    // SAFETY: one bit added, every other written back as read. From here a
-    // ring-0 write to a read-only page faults instead of succeeding — which the
-    // `#PF` handler services (a CoW page) or reports (anything else). Nothing
-    // in this kernel writes a user page except through `write_bytes` below, and
-    // its `rep movsb` is already fixup-covered.
-    unsafe { core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags)) };
+    // `CR0.WP`: from here a ring-0 write to a read-only page faults instead
+    // of succeeding — which the `#PF` handler services (a CoW page) or
+    // reports (anything else). Nothing in this kernel writes a user page
+    // except through `write_bytes` below, and its `rep movsb` is already
+    // fixup-covered.
+    akuma_cpu::ctlreg::set_cr0_wp();
 
     SmapStatus { cpuid_smap, cpuid_smep }
 }

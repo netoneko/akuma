@@ -200,7 +200,9 @@ fn install_percpu(idx: usize) {
     block.index.store(idx as u32, Ordering::Relaxed);
     // SAFETY: `IA32_GS_BASE` is this core's per-CPU base. The block is a
     // `static`, so the address is valid for the life of the kernel, and nothing
-    // reads `gs:` before this.
+    // reads `gs:` before this. Stays `unsafe` on purpose: `gs:` is dereferenced
+    // by every per-CPU read, so a wrong base is a wrong pointer, not a fault
+    // `akuma-cpu` could rule out.
     unsafe { msr::write(Msr::GsBase, addr) };
     // The program's half of the pair: no user yet, and 0 is canonical.
     let _ = msr::set_user_gs_base(0);
@@ -939,21 +941,7 @@ unsafe extern "C" {
 /// `CR0.MP=1`, `CR4.OSFXSR`, `CR4.OSXMMEXCPT`. Ring 3 needs it; the kernel is
 /// soft-float and does not.
 fn enable_sse() {
-    // SAFETY: the same four control-register bits `boot.s` sets on the BSP,
-    // with the same justification (see `long_mode_start` there).
-    unsafe {
-        core::arch::asm!(
-            "mov rax, cr0",
-            "and rax, -5",
-            "or rax, 2",
-            "mov cr0, rax",
-            "mov rax, cr4",
-            "or rax, (1 << 9) | (1 << 10)",
-            "mov cr4, rax",
-            out("rax") _,
-            options(nostack, preserves_flags)
-        );
-    }
+    akuma_cpu::ctlreg::enable_fpu();
 }
 
 /// Non-zero once `CR4.OSXSAVE` is set and `XCR0` enables x87+SSE+AVX on this
@@ -986,25 +974,13 @@ pub fn enable_xsave() -> bool {
     if !have_xsave || !have_avx || u64::from(d0.eax) & XCR0_ENABLED != XCR0_ENABLED {
         return false;
     }
-    // SAFETY: OSXSAVE is set first, which makes `xsetbv` legal; `XCR0` bit 0
-    // must stay set and bit 2 requires bit 1, both satisfied by 0b111, and
-    // cpuid just said every bit is supported. The kernel is soft-float and never
-    // touches ymm, so no kernel code is affected; ring 3's ymm state is carried
-    // across switches by `sched.rs`.
-    unsafe {
-        core::arch::asm!(
-            "mov rax, cr4",
-            "or rax, (1 << 18)",
-            "mov cr4, rax",
-            "xor ecx, ecx",
-            "mov eax, {lo:e}",
-            "xor edx, edx",
-            "xsetbv",
-            lo = in(reg) XCR0_ENABLED as u32,
-            out("rax") _, out("rcx") _, out("rdx") _,
-            options(nostack, preserves_flags)
-        );
-    }
+    // The CPUID facts above are the writer's preconditions, stated there:
+    // leaf 1 says XSAVE exists, leaf 0xD says every bit of `XCR0_ENABLED` is
+    // supported, and bit 0 (x87) is set. OSXSAVE goes on before `xsetbv`,
+    // which is the order the function enforces. The kernel is soft-float
+    // and never touches ymm, so no kernel code is affected; ring 3's ymm
+    // state is carried across switches by `sched.rs`.
+    akuma_cpu::ctlreg::enable_xsave(XCR0_ENABLED);
     true
 }
 

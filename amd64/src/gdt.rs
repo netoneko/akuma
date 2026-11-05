@@ -96,8 +96,13 @@ pub fn set_kernel_stack(rsp0: u64) {
 
 /// Build the BSP's GDT and TSS, load both.
 pub fn init() {
-    // SAFETY: the static trap stack, addressed by its end.
-    let rsp0 = unsafe { (&raw mut TRAP_STACK).cast::<u8>().add(KERNEL_TRAP_STACK_SIZE) as u64 };
+    // The static trap stack's end, as an integer for the TSS — pure address
+    // arithmetic on a `static` (a raw pointer, a cast, an offset; no
+    // dereference), so no `unsafe` block. `wrapping_add` is the safe spelling
+    // of the sum; a static's own end is by definition the last byte of it.
+    let rsp0 = (&raw mut TRAP_STACK)
+        .cast::<u8>()
+        .wrapping_add(KERNEL_TRAP_STACK_SIZE) as u64;
     init_cpu(0, rsp0);
 }
 

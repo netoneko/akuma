@@ -25,8 +25,14 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `CMOS`, `PIC`, `PIT`, `I8042`, `PCI_CONFIG`, `RESET_CONTROL`, `DEBUGCON`), each
   reaching only its own range, with a host-tested registry that no two overlap.
   **Never open-code `in`/`out` or add a safe `outb(port, v)`** — the second is how
-  safe code gets to power the box off. `akuma_cpu::ctlreg` reads `CR0/2/3/4` (read
-  only; writes stay `unsafe` at the call site, like `TTBR0_EL1`).
+  safe code gets to power the box off. `akuma_cpu::ctlreg` reads `CR0/2/3/4`
+  and owns the CR0/CR4 writes the kernels need as **named functions**
+  (`enable_fpu`, `enable_xsave`, `enable_smep_smap`, `set_cr0_wp` — one
+  semantic each, bits stated at each); no raw `write_crN` exists, for the same
+  reason no function takes a port number, and `CR3` writes stay `unsafe` at the
+  call site like `TTBR0_EL1`. `akuma_cpu::interrupts::{on,off}` are `sti`/`cli`,
+  `park::halt` the `cli;hlt` end state, `rng::rdrand` the hardware word
+  (CPUID gate with the caller).
   `scripts/check_unsafe_budget.py` is the gate on `unsafe` growth: a component's
   production `unsafe` sites may not exceed `docs/reference/unsafe-budget.json`, and
   a new crate's budget is 0. To add `unsafe`, run it with `--update` so the budget
@@ -51,10 +57,13 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `rust_sync_el0_handler`; `akuma-exceptions` went 83 -> 38 sites. **Never write
   `(*frame).x0` in a handler.**
   `akuma_cpu::msr` is the closed set of MSRs the kernel touches (`Msr` enum): reads
-  safe, `write` unsafe, and `set_fs_base`/`set_user_gs_base` safe behind a canonical
-  check - `arch_prctl(ARCH_SET_FS, non-canonical)` used to `#GP` ring 0. Never add
-  another `unsafe fn wrmsr(u32, u64)`. `akuma_cpu::{tsc,debugreg,park::{wfi_mwait,
-  irq_window}}` cover `rdtsc`, `DR6` and the idle brackets.
+  safe, `write` unsafe (so the kernel's own `GS_BASE`, which every per-CPU read
+  dereferences, stays `unsafe` at its one call site), and `set_fs_base`/`set_user_gs_base`
+  safe behind a canonical check - `arch_prctl(ARCH_SET_FS, non-canonical)` used to
+  `#GP` ring 0 - plus `set_pat_entry_wc` for the one PAT edit the framebuffer path
+  needs. Never add another `unsafe fn wrmsr(u32, u64)`. `akuma_cpu::{tsc,debugreg,
+  park::{wfi_mwait,irq_window,halt}}` cover `rdtsc`, `DR6`, the idle brackets and
+  the `-> !` park.
   Both are **leaf crates on purpose**: the policy is to isolate `unsafe` in small
   crates whose only job is one stated contract, and shrink the drivers to safe code.
   `akuma-cpu` holds every AArch64 instruction that is **safe to execute** —
