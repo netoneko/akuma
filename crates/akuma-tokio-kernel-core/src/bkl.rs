@@ -27,6 +27,15 @@ pub trait BklCpu {
     fn index() -> usize;
     /// Called on every lap of a wait for the lock.
     fn while_waiting() {}
+    /// Mask interrupts on this core and return what [`Self::irq_restore`] needs to put them back as they were. [`enter`] wraps its whole
+    /// wait in this pair; the default does nothing, which is right only for a machine that never takes an interrupt on a path that can
+    /// reach the lock.
+    #[must_use]
+    fn irq_save() -> u64 {
+        0
+    }
+    /// Undo [`Self::irq_save`].
+    fn irq_restore(_saved: u64) {}
 }
 
 const NO_OWNER: usize = usize::MAX;
@@ -47,12 +56,21 @@ pub fn held<C: BklCpu>() -> bool {
 }
 
 /// Take the lock (or nest, if this core already owns it).
+///
+/// **Interrupts are masked from before the ticket is taken until the lock is owned.** A ticket lock is served in order, so a core that
+/// is interrupted while it waits and whose handler also asks for the lock queues the handler *behind* the suspended outer wait: the
+/// outer ticket is served first, cannot run until the handler returns, and the handler is waiting for a ticket that comes up after
+/// the outer one. All cores end up spinning with nobody owning the lock (`SERVING` pointing at a ticket no running core holds). That
+/// is the wedge seen as `[BKL] cpu N stuck: owner cpu -1`. With interrupts held off for the wait, a tick that arrives meanwhile is taken
+/// once the lock is owned, where the handler's `enter` nests. The wait still services the machine's polled work (`while_waiting`:
+/// a TLB shootdown) because a masked core cannot take the IPI.
 pub fn enter<C: BklCpu>() {
     let cpu = C::index();
     if OWNER.load(Ordering::Relaxed) == cpu {
         DEPTH.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    let saved_irq = C::irq_save();
     let ticket = NEXT.fetch_add(1, Ordering::Relaxed);
     let mut spins = 0u64;
     while SERVING.load(Ordering::Acquire) != ticket {
@@ -65,6 +83,7 @@ pub fn enter<C: BklCpu>() {
     }
     OWNER.store(cpu, Ordering::Relaxed);
     DEPTH.store(1, Ordering::Relaxed);
+    C::irq_restore(saved_irq);
 }
 
 /// Hand the lock to the next ticket.
@@ -137,5 +156,86 @@ pub fn transfer_depth<C: BklCpu>(from: usize, to: usize) {
 pub fn born_locked(tid: usize) {
     if let Some(t) = THREAD_DEPTH.get(tid) {
         t.store(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod tests {
+    use core::cell::Cell;
+    use core::sync::atomic::AtomicU64;
+    use std::sync::atomic::AtomicBool;
+    use std::{thread, thread_local};
+
+    use super::*;
+
+    thread_local! {
+        static CPU: Cell<usize> = const { Cell::new(0) };
+        static IRQ_ON: Cell<bool> = const { Cell::new(true) };
+        static IN_HANDLER: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Laps the waiter has spun, across the whole test: the holder lets go after `RELEASE_AT`, the waiter gives up after `DEADLOCK_AT`.
+    static LAPS: AtomicU64 = AtomicU64::new(0);
+    const RELEASE_AT: u64 = 20_000;
+    const DEADLOCK_AT: u64 = 3_000_000;
+    static HANDLER_RAN: AtomicBool = AtomicBool::new(false);
+
+    /// A core whose timer tick, if interrupts are on, lands on the first lap of a wait and asks for the lock itself.
+    struct Core;
+    impl BklCpu for Core {
+        fn index() -> usize {
+            CPU.get()
+        }
+        fn while_waiting() {
+            let laps = LAPS.fetch_add(1, Ordering::Relaxed);
+            assert!(laps < DEADLOCK_AT, "a handler that waited behind its own suspended wait: every core spins, nobody owns the lock");
+            if IRQ_ON.get() && !IN_HANDLER.get() {
+                IN_HANDLER.set(true);
+                HANDLER_RAN.store(true, Ordering::Relaxed);
+                enter::<Core>(); // the tick handler wants the lock
+                leave::<Core>();
+                IN_HANDLER.set(false);
+            }
+        }
+        fn irq_save() -> u64 {
+            u64::from(IRQ_ON.replace(false))
+        }
+        fn irq_restore(saved: u64) {
+            IRQ_ON.set(saved != 0);
+        }
+    }
+
+    /// One test owns the statics (the lock is process-wide).
+    #[test]
+    fn a_tick_that_lands_while_a_core_waits_does_not_queue_behind_the_wait() {
+        // Core 2 owns the lock and lets go once the waiter has spun for a while.
+        let holder = thread::spawn(|| {
+            CPU.set(2);
+            enter::<Core>();
+            while LAPS.load(Ordering::Relaxed) < RELEASE_AT {
+                core::hint::spin_loop();
+            }
+            leave::<Core>();
+        });
+        while OWNER.load(Ordering::Relaxed) != 2 {
+            core::hint::spin_loop();
+        }
+        CPU.set(1);
+        // Interrupts are on when core 1 asks. With the old `enter` the simulated tick took a second ticket behind this wait and the
+        // test died on `DEADLOCK_AT`; now interrupts are off for the whole wait, so the tick is held until the lock is owned.
+        enter::<Core>();
+        assert!(held::<Core>(), "core 1 got the lock once core 2 let go");
+        assert!(IRQ_ON.get(), "interrupts are back on as they were");
+        assert!(!HANDLER_RAN.load(Ordering::Relaxed), "no tick was taken while the core waited");
+        // The tick that was held off now arrives: this core owns the lock, so the handler's `enter` nests and its `leave` unnests.
+        enter::<Core>();
+        leave::<Core>();
+        assert!(held::<Core>(), "still owned at depth 1 after the nested handler");
+        leave::<Core>();
+        assert!(!held::<Core>());
+        holder.join().unwrap();
+        assert_eq!(NEXT.load(Ordering::Relaxed), SERVING.load(Ordering::Relaxed), "every ticket taken was served");
     }
 }

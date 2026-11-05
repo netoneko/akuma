@@ -93,6 +93,13 @@ impl bkl::BklCpu for Amd64Cpu {
     fn while_waiting() {
         service_pending();
     }
+    // Interrupts stay off for the whole wait (see `bkl::enter`): a tick that landed mid-wait would queue its own `enter` behind this one.
+    fn irq_save() -> u64 {
+        akuma_cpu::daif::save_and_mask_irq()
+    }
+    fn irq_restore(saved: u64) {
+        akuma_cpu::daif::restore(saved);
+    }
 }
 
 /// Does this core own the kernel lock? (A diagnostic for the switch.)
