@@ -36,7 +36,10 @@ around dispatch, the same on amd64 and aarch64, without making the common path p
    return `PassAndForget` to clear its own bit. Numbers from 512 up are always asked; that is where custom calls live
    (`CUSTOM_BASE` = 1000, above everything Linux assigns).
 6. **Some calls are observed, never replaced:** `exit`, `exit_group`, `clone`, `execve`, `rt_sigreturn` rewrite the
-   frame or do not return. A `Return`/`Errno` verdict or a changed result for them is ignored (`observe_only`).
+   frame or do not return. A `fallback` and a changed result for them are ignored (`observe_only`). Narrowed
+   2026-11-05: a `kernel_pre` *refusal* skips the call and cannot corrupt the frame, so it is honoured for `execve`
+   (`may_refuse_before`; an environment or signature policy needs it) and still ignored for `exit`, `exit_group`,
+   `clone` and `rt_sigreturn`.
 7. **No `unsafe`, and no raw frames.** The module is `forbid(unsafe_code)` and the API needs none: a hook gets
    `KernelCtx`/`OwnCtx` (number, `Option<Syscall>`, args, tid, pid) and checked user reads/writes
    (`user_read`, `user_write`, `user_read_u64`, `user_str`) over the kernel's own copies. The x86 `SyscallFrame` and the
@@ -70,13 +73,21 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
 - **Booted (2026-11-05, QEMU TCG: amd64 `microvm`, aarch64 `virt`):** `sh shanghai/mw_gate.sh [x86_64|aarch64|all]`
   (`SMP=N`) builds Shanghai twice per architecture (default, and `--features middleware` with the sample table in
   `shanghai/src/middleware.rs`), boots each with `shanghai/mwprobe/mwprobe.rs` as `init`, and judges the probe's own
-  result line. The middleware kernel passes all 14 cases on both machines: `fallback` 1000/1001 (a value, a write
+  result line. The middleware kernel passes every case on both machines (13 with the original table; 21 with the no-dynamic-loading demo below; earlier revisions of this record said 12 and 14 because the result line was counted as a case): `fallback` 1000/1001 (a value, a write
   through a user pointer, `EFAULT` on a bad one, an unserved number still `ENOSYS`), `kernel_pre` on `openat` (reads the
   path from user memory, refuses `/mw-deny` with `EACCES`, passes the rest), `kernel_post` on `gettid`, `own_pre`/`own_post`
   on `getpid` (5 calls seen 5 times), and the contention case: 4 threads x 500 `getpid` at once, where the `own_pre` hook
   does a split read-then-write on its private state; all 2000 were seen and the state equals the atomic count (no lost
   update). The control (no middleware) answers 1000 with `ENOSYS` and every touched call is stock. Runs: amd64 at 1 core
   (before the threaded case existed) and at 4; aarch64 at 1 and at 4 (4 CPUs online on both).
+- **Added 2026-11-05, the no-dynamic-loading demo** (`shanghai/src/nodl.rs`, three `kernel_pre` guards): `mmap` of a file with
+  `PROT_EXEC` is refused with `EACCES`, `mprotect` adding `PROT_EXEC` is refused, and an `execve` whose environment names an
+  `LD_*` variable is refused with `EPERM` (the last needed the `execve` narrowing above). `mwprobe` checks each refusal and
+  the neighbouring cases that must stay allowed (anonymous `PROT_EXEC` memory, a read-only file mapping,
+  `mprotect(PROT_READ)`, an `execve` with a clean environment, which is allowed and whose new image prints the result), and the
+  control kernel maps a file `PROT_EXEC` freely. 21 cases, on both machines at 4 cores; amd64 also at 1. It is a demonstration,
+  not a wholesale ban, and **no real dynamically linked program has been run against it**: the kernel's own loader maps the
+  interpreter without a syscall, and `memfd_create` and shebang scripts were not checked.
 - **Found by booting it:** the first real user could not write `..Middleware::new(0)` (private fields), which the
   in-module tests could not catch; the tables are now the all-public `Hooks<S>` (`Middleware::new(state, Hooks {..})`).
   The first sample also hooked `getuid`, which this kernel does not serve without `shell`, and added 1000 to its

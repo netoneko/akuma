@@ -2,7 +2,7 @@
 
 **Stability: B** (written 2026-11-05; the behaviour is booted on both machines under QEMU TCG, the cost of having it on is not
 measured, and the pieces in "Not built" are not there). The incident-style record, with what was argued and what was
-found by booting, is [`docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md`](../../../docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md);
+found by booting, is [`docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md`](../../../docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md);
 the code is [`src/middleware.rs`](../src/middleware.rs); a working table is
 [`shanghai/src/middleware.rs`](../../../shanghai/src/middleware.rs).
 
@@ -10,7 +10,10 @@ Middleware lets a kernel built on `akuma-tokio-kernel` answer a syscall of its o
 without touching the machine halves' dispatch. It is **off unless the `middleware` cargo feature is on**, for every kernel;
 with it off none of it is compiled and nothing in dispatch changes.
 
-## Your first syscall (five minutes)
+Two worked examples follow, both from Shanghai and both booted by its gate: **Example 1** adds a syscall of your own, **Example 2** refuses an
+exec by its environment.
+
+## Example 1: add a syscall of your own (five minutes)
 
 1. Turn the feature on in your kernel's `Cargo.toml` and make it optional the way Shanghai does:
 
@@ -44,6 +47,23 @@ with it off none of it is compiled and nothing in dispatch changes.
 
 4. From the guest, `syscall(1000)` returns 42. Everything else behaves as before.
 
+A syscall that takes a pointer reads or writes the caller's memory through the checked helpers and answers `-EFAULT` for a bad
+address; it never trusts the pointer. This one (Shanghai's number 1001, `shanghai/src/middleware.rs`) writes the caller's pid
+to the address in its first argument:
+
+```rust
+const EFAULT_RET: u64 = (-14i64) as u64;
+
+Route::new(&[On::Nr(CUSTOM_BASE + 1)], |ctx| {
+    Some(match ctx.user_write_u64(ctx.args[0], u64::from(ctx.pid)) {
+        Ok(()) => 0,
+        Err(_) => EFAULT_RET,
+    })
+}),
+```
+
+`syscall(1001, &mut v)` fills `v`, and `syscall(1001, 8)` returns `-14` instead of crashing the kernel: `mwprobe` checks both.
+
 To see it run end to end, `sh shanghai/mw_gate.sh [x86_64|aarch64|all]` (`SMP=4` for four cores) builds Shanghai with and
 without the feature, boots each under QEMU TCG with [`shanghai/mwprobe`](../../../shanghai/mwprobe) as `init`, and checks the
 probe's own result line. It needs only `e2fsprogs`, no sshd or key.
@@ -55,7 +75,7 @@ One `Middleware<S>` per kernel, a `static`: `Middleware::new(state, Hooks { .. }
 
 | tier | hook type | runs | it may |
 |---|---|---|---|
-| `kernel_pre` | `fn(&mut KernelCtx) -> Verdict` | inside the kernel lock, before the call | `Pass`, `PassAndForget`, `Return(v)`, `Errno(e)`; rewrite `ctx.args` |
+| `kernel_pre` | `fn(&mut KernelCtx) -> Verdict` | inside the kernel lock, before the call | `Pass`, `PassAndForget`, `Return(v)`, `Errno(e)` (a refusal: not for `exit`/`clone`/`rt_sigreturn`); rewrite `ctx.args` |
 | `fallback` | `fn(&mut KernelCtx) -> Option<u64>` | inside the lock, only where the answer is `-ENOSYS` | `Some(answer)` to serve the call, `None` to leave the `-ENOSYS` |
 | `kernel_post` | `fn(&mut KernelCtx, u64) -> u64` | inside the lock, after the call | return the result to use (result in, result out) |
 | `own_pre` | `fn(&mut OwnCtx<S>)` | **outside** the lock, before it | observe, and update `ctx.state` |
@@ -99,6 +119,112 @@ never a crash: write `?`-style code and return `-EFAULT`.
 
 `OwnCtx<S>`: `nr`, `call`, `args` (plain integers: **not pointers you may follow**), `tid`, and `state: &mut S`, your private state.
 
+## Example 2: refuse an exec by its environment
+
+The goal: **refuse to start any program whose environment names an `LD_*` variable** (`LD_PRELOAD`, `LD_LIBRARY_PATH`,
+`LD_AUDIT`, ...), the knobs the dynamic loader reads from the environment. It is the exec half of the "no dynamic loading"
+demo in [`shanghai/src/nodl.rs`](../../../shanghai/src/nodl.rs); the code below is that file's, not a paraphrase.
+
+**Where the data is.** A new process's environment is the third argument of `execve`: `ctx.args[2]` points at a
+NULL-terminated array of pointers to `NAME=value` strings, all in the *caller's* memory, which is still the old image's when a
+`kernel_pre` hook runs. So this is a `kernel_pre` hook (it needs user memory) on `Syscall::Execve`. It reads the pointer array
+with `user_read_u64`, and for each string only the first three bytes, one at a time: a long value costs nothing, and a short
+string at the end of a page cannot fault. The environment of a process that is already running is not reachable this way.
+
+**Why it can refuse.** `execve` is observe-only: a hook cannot serve it with a `fallback` or replace its result. A
+`kernel_pre` *refusal*, though, skips the call before it touches the process, so it is honoured for `execve`
+(`may_refuse_before`; it stays ignored for `exit`, `exit_group`, `clone` and `rt_sigreturn`). A refused `execve` returns the
+errno to the caller, which is still running its old image.
+
+```rust
+use akuma_tokio_kernel::middleware::{KernelCtx, UserError, Verdict};
+
+const EPERM: i32 = 1;
+const E2BIG: i32 = 7;
+/// More entries than any real environment; past it the call is refused (fail closed).
+const MAX_ENV: usize = 512;
+
+/// Whether the NUL-terminated string at `s` starts with `LD_`. Bytewise and bounded to three bytes, so a long
+/// string costs nothing and a short one at the end of a page does not fault.
+fn starts_with_ld(ctx: &KernelCtx, s: u64) -> Result<bool, UserError> {
+    let mut b = [0u8; 1];
+    for (i, want) in (0u64..).zip(*b"LD_") {
+        ctx.user_read(s + i, &mut b)?;
+        if b[0] != want {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `execve(path, argv, envp)`: refuse a call whose `envp` has an `LD_*` entry. `envp` may be NULL (an empty
+/// environment). A bad pointer or an over-long list is refused too: unknown is not allowed.
+pub fn exec_guard(ctx: &mut KernelCtx) -> Verdict {
+    let mut slot = ctx.args[2];
+    if slot == 0 {
+        return Verdict::Pass;
+    }
+    for _ in 0..MAX_ENV {
+        let s = match ctx.user_read_u64(slot) {
+            Ok(0) => return Verdict::Pass, // the NULL that ends the array
+            Ok(s) => s,
+            Err(e) => return Verdict::Errno(e.errno()),
+        };
+        match starts_with_ld(ctx, s) {
+            Ok(false) => {}
+            Ok(true) => {
+                akuma_primitives::safe_print!(96, "[nodl] pid {} refused an execve with an LD_* variable\n", ctx.pid);
+                return Verdict::Errno(EPERM);
+            }
+            Err(e) => return Verdict::Errno(e.errno()),
+        }
+        slot += 8;
+    }
+    Verdict::Errno(E2BIG)
+}
+```
+
+Register it like any hook (Shanghai's table, `shanghai/src/middleware.rs`):
+
+```rust
+kernel_pre: &[
+    Route::new(&[On::Call(Syscall::Execve)], crate::nodl::exec_guard),
+    // ...
+],
+```
+
+**Decisions in it, and why**
+
+- **It refuses; it does not strip.** Dropping the `LD_*` entries and letting the call proceed would need a different environment
+  array. Rewriting the caller's array in place is wrong (after `vfork` the parent shares that memory), and a hook has no scratch
+  user memory to build a new one. An exec-specific hook that gets a mutable list, applied inside the exec path, is the clean
+  way to strip, and it does not exist.
+- **Unknown is refused.** A bad pointer is `EFAULT`, an over-long list is `E2BIG`, and both are returned instead of guessed
+  past. A NULL `envp` is a valid empty environment and passes.
+- **Bounded.** At most `MAX_ENV` entries and three bytes of each: the cost under the kernel lock is fixed.
+- **Only at `execve`.** After exec a program can `setenv` what it likes; the dynamic loader reads its variables at startup, which
+  is why exec is the right place.
+
+**What the gate proves** (`mwprobe`, both machines at 4 cores, amd64 also at 1): an `execve` with `LD_PRELOAD=...` in its environment returns
+`-EPERM`; an `execve` with only `PATH=/bin` is allowed and the new image runs (it prints the run's result line, which is how the
+gate knows exec still works); the console shows the `[nodl] ... refused an execve with an LD_* variable` line; the control kernel,
+built without the feature, has no such behaviour.
+
+**Going further: the rest of the demo.** `nodl.rs` also has `mmap_guard` (refuse a file-backed `PROT_EXEC` mapping, which is
+what `ld-musl` does for every library and `dlopen` does later) and `mprotect_guard` (refuse adding `PROT_EXEC`, which would
+otherwise turn a read-only file mapping executable). `mwprobe` checks that each refusal fires and that the neighbouring cases
+stay allowed: anonymous `PROT_EXEC` memory, a read-only file mapping, `mprotect(PROT_READ)`. Together the three are a
+**demonstration, not a wholesale ban**:
+
+- no real dynamically linked program has been run against it; only the syscalls such a program makes are tested, so what
+  `ld-musl` prints when its first library mapping is refused is not known;
+- the kernel's own loader maps the interpreter and the main binary without a syscall, so those are not seen at all;
+- a shebang script is data for a permitted interpreter; `memfd_create` was not checked; and a check by number cannot tell a file
+  mapping from an anonymous one in `mprotect`, so that guard is stricter than the mmap one on purpose.
+
+A policy that must hold needs the verdict at the loader (a file becoming executable), not at the syscalls; this example is the
+shape of the hook, not the enforcement.
+
 ## The rules, and why each is there
 
 - **No hook touches a lock.** `kernel_*` and `fallback` run under the kernel lock, which the kernel takes. `own_*` run outside it,
@@ -111,7 +237,9 @@ never a crash: write `?`-style code and return `-EFAULT`.
 - **`kernel` hooks run under the big kernel lock.** Do not spin on something another core's syscall holds, and do not try to
   park the caller: there is no sanctioned way to block yet (see "Not built").
 - **Some calls are observed, never replaced:** `exit`, `exit_group`, `clone`, `execve`, `rt_sigreturn` rewrite the frame or do not
-  return. For them a `Return`/`Errno` verdict, a fallback, or a changed `kernel_post` result is ignored (`observe_only`).
+  return. For them a `fallback` and a changed `kernel_post` result are ignored (`observe_only`). A `kernel_pre` refusal
+  (`Return`/`Errno`) skips the call, so it cannot corrupt the frame: it is honoured for `execve` and ignored for `exit`,
+  `exit_group`, `clone` and `rt_sigreturn` (`may_refuse_before`).
 - **A result is a value or `-errno`.** A `kernel_post` that does arithmetic must leave an error alone:
   `if r.cast_signed() < 0 { r } else { r + 1000 }`. (The first Shanghai sample added 1000 to a `-ENOSYS` and returned 962.)
 - **A hook that panics is a kernel panic.** Treat it as kernel code.
@@ -154,15 +282,17 @@ The feature-on cost against the syscall floor is **not measured**; do not quote 
 
 ## Not built (yet)
 
-A runtime `arm`/`disarm` handle for interest bits; a lock-protected state cell for `kernel` hooks (use atomics, or a `BorrowCell`
-static, which the kernel lock serialises); typed `UserPtr<T>` (there are byte reads and `u64`/string helpers); a
+Refusing `clone`/`fork` before they run (as safe as refusing `execve`, but nobody has asked for it); stripping variables from an exec's
+environment (see Example 2); a runtime `arm`/`disarm` handle for interest bits; a lock-protected state cell for `kernel` hooks (use
+atomics, or a `BorrowCell` static, which the kernel lock serialises); typed `UserPtr<T>` (there are byte reads and `u64`/string helpers); a
 framework-provided blocking wait for `kernel` hooks; `Return` from an `own` hook (signal delivery on the way out runs under the
 kernel lock, and whether a cheap lock-free "signal pending" test exists has not been checked); a measured cost. Hosting
-rump's interceptor would need the first four and is out of scope while rump is deferred.
+rump's interceptor would need the `arm`/`disarm` handle, the state cell, typed pointers and the blocking wait, and is out of scope
+while rump is deferred.
 
 ## Background
 
-[`docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md`](../../../docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md) (design, what was
+[`docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md`](../../../docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md) (design, what was
 verified, deviations), [`crates/akuma-tokio-kernel/README.md`](../../akuma-tokio-kernel/README.md) § Syscall middleware,
 [`taoxichuan/docs/reference/syscalls.md`](../../../taoxichuan/docs/reference/syscalls.md) § Who answers, in order,
 `crates/akuma-bkl/src/policy.rs` (the per-syscall bitmap and the latch-at-entry rule this follows).

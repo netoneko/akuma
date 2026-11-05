@@ -110,7 +110,7 @@ console, no NIC and one core. The root filesystem is the one part a kernel canno
 your image runs a shell beyond `sh -c`), `trace-err` (print every failing syscall on the console), and
 `platform-firecracker` (aarch64 under Firecracker, whose memory map differs from QEMU virt's; the `build.rs`
 above moves the link base for it — amd64 boots Firecracker through PVH and needs nothing), and
-`middleware` ([below](#syscall-middleware-optional); off by default, and a kernel that leaves it off compiles none of it).
+`middleware` ([below](#syscall-middleware-optional) and the [middleware guide](../akuma-tokio-kernel-core/docs/middleware.md); off by default, and a kernel that leaves it off compiles none of it).
 
 Everything else is fixed and needs no code: the memory manager (`mmap`, `brk`, `mprotect`, copy-on-write
 `fork`), processes and threads (`clone`, `execve`, `wait4`), signals, pipes, epoll, futexes, the clock, the
@@ -124,11 +124,16 @@ built twice.
 ## Syscall middleware (optional)
 
 With the `middleware` feature (off by default, for every kernel) a kernel registers **one** table of hooks around
-syscall dispatch: `kernel.middleware(&MW)`. The design is
-[`docs/middleware.md`](../akuma-tokio-kernel-core/docs/middleware.md) (the guide: first syscall, the tiers, the rules) and
-[`docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md`](../../docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md) (the design record); the code is
-`akuma_tokio_kernel_core::middleware`, re-exported as `akuma_tokio_kernel::middleware`, and it is the same on
-amd64 and aarch64.
+syscall dispatch: `kernel.middleware(&MW)`.
+
+> **Start with the guide: [`akuma-tokio-kernel-core/docs/middleware.md`](../akuma-tokio-kernel-core/docs/middleware.md).** It has two
+> worked examples, both booted by Shanghai's gate (**add a syscall of your own**, and **refuse an exec by its
+> environment**), then the tiers, what a hook gets, the rules and the reason for each, what it costs, and how to test a table.
+
+The code is `akuma_tokio_kernel_core::middleware`, re-exported as `akuma_tokio_kernel::middleware`, and it is the same on amd64
+and aarch64; the design and what booting it found are in
+[`docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md`](../../docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md). The short version, with the rest
+in the guide:
 
 ```rust
 use akuma_tokio_kernel::middleware::{CUSTOM_BASE, Hooks, Middleware, On, Route, Syscall, Verdict};
@@ -172,7 +177,8 @@ middleware kernel `MWPROBE RESULT PASS`. It needs no sshd or key, only `e2fsprog
   call and latched, so an unhooked call costs a relaxed load and a bit test per tier. `Verdict::PassAndForget`
   clears a hook's bit for that number. Numbers from 512 up are always asked (that is where custom calls live).
 - **Not everything is interceptable.** `exit`, `exit_group`, `clone`, `execve` and `rt_sigreturn` are observed
-  only: a `Return` verdict or a changed result is ignored.
+  only: no `fallback`, and a changed result is ignored. A `kernel_pre` refusal is honoured for `execve` (it skips the call
+  before it touches the process) and ignored for the other four.
 - **No `unsafe`.** The module is `forbid(unsafe_code)` and the API needs none; your crate decides its own.
 - A hook that panics is a kernel panic, and `own` hooks run with preemption off.
 
@@ -371,6 +377,8 @@ call and exits 1 on one nobody does. A call nobody serves answers `ENOSYS` and t
 [`proposals/B21_TOKIO_KERNEL_AARCH64.md`](../../proposals/B21_TOKIO_KERNEL_AARCH64.md) and its record
 [`docs/archive/TAOXICHUAN_B21_AARCH64.md`](../../docs/archive/TAOXICHUAN_B21_AARCH64.md) (the aarch64 port,
 with the parity table over both machines),
+[`crates/akuma-tokio-kernel-core/docs/middleware.md`](../akuma-tokio-kernel-core/docs/middleware.md) (the syscall middleware guide) and
+[`docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md`](../../docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md) (its design record),
 [`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`](../../docs/archive/TAOXICHUAN_CLEANUP_PLAN.md) (B15),
 [`docs/archive/TAOXICHUAN_FIXED_POINT.md`](../../docs/archive/TAOXICHUAN_FIXED_POINT.md) (the kernel this came
 from compiles itself).
