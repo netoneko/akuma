@@ -17,10 +17,9 @@ use akuma_cow::{CowAction, KernelWrite};
 use crate::mm::Mm;
 use crate::mmu::FreshPage;
 
-/// W^X (`akuma_syscalls_mem::wx`): no page is writable and executable, and a page
-/// written since it was mapped cannot be made executable. Always on - there is no
-/// switch (the `wx=0` command-line hatch was removed 2026-11-05: production
-/// kernels do not run a JIT). Stricter than Linux on purpose.
+// W^X (`akuma_syscalls_mem::wx`) is decided in `mm.rs` and has no state here: no page is writable and executable, and
+// a page written since it was mapped cannot be made executable. Always on - there is no switch (the `wx=0`
+// command-line hatch was removed 2026-11-05: production kernels do not run a JIT). Stricter than Linux on purpose.
 
 static COW_SHARED: AtomicUsize = AtomicUsize::new(0);
 static COW_COPY: AtomicUsize = AtomicUsize::new(0);
