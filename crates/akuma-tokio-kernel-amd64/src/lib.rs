@@ -1595,7 +1595,7 @@ pub(crate) fn copy_kernel_half(dst: phys::Frame) {
 /// Load an ELF image into the CURRENT task slot (`akuma_tokio_kernel_core::loader::load_task`):
 /// shared by the boot spawn and `execve`.
 fn load_task(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Option<TaskImage> {
-    akuma_tokio_kernel_core::loader::load_task::<lazy::Amd64>(argv, env, image, path)
+    akuma_tokio_kernel_core::loader::load_task::<lazy::Amd64>(argv, env, image, path).ok()
 }
 
 

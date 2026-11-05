@@ -44,6 +44,12 @@ fn open_guard(ctx: &akuma_tokio_kernel::middleware::KernelCtx) -> Verdict {
     if path == "/mw-deny" { Verdict::Errno(EACCES) } else { Verdict::Pass }
 }
 
+/// The exec policy: the "no dynamic loading" demo's with its feature, none without it (everything is allowed).
+#[cfg(feature = "no-dynamic-loading")]
+const EXEC: Option<akuma_tokio_kernel::middleware::ExecPolicy> = Some(crate::nodl::exec_policy);
+#[cfg(not(feature = "no-dynamic-loading"))]
+const EXEC: Option<akuma_tokio_kernel::middleware::ExecPolicy> = None;
+
 /// The table the kernel registers.
 pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
     fallback: &[
@@ -60,12 +66,8 @@ pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
     ],
     kernel_pre: &[
         Route::new(&[On::Call(Syscall::Openat)], open_guard),
-        // The "no dynamic loading" demo (`nodl.rs`), only with `--features no-dynamic-loading`: three guards on the calls a
-        // dynamic loader makes.
-        #[cfg(feature = "no-dynamic-loading")]
-        Route::new(&[On::Call(Syscall::Mmap)], crate::nodl::mmap_guard),
-        #[cfg(feature = "no-dynamic-loading")]
-        Route::new(&[On::Call(Syscall::Mprotect)], crate::nodl::mprotect_guard),
+        // The "no dynamic loading" demo (`nodl.rs`), only with `--features no-dynamic-loading`: an env guard on execve here, and
+        // the exec policy (`EXEC` below): one `match` over every way code arrives.
         #[cfg(feature = "no-dynamic-loading")]
         Route::new(&[On::Call(Syscall::Execve)], crate::nodl::exec_guard),
     ],
@@ -85,4 +87,5 @@ pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
         }),
         Route::new(&[On::Call(Syscall::Getppid)], |ctx, _| STATE_SNAPSHOT.store(*ctx.state, Relaxed)),
     ],
+    exec: EXEC,
 });

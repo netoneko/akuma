@@ -212,12 +212,39 @@ fn copy_file_bytes(page: &mut [u8; 4096], pva: u64, image: &[u8], seg: &LoadSeg)
     }
 }
 
+/// Why [`load_task`] did not load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadError {
+    /// A frame, a table or a region could not be had, or the image is not one the exec core accepts.
+    NoMem,
+    /// The syscall middleware's exec policy refused the image (this positive errno). Decided before anything was touched, so the
+    /// task record is exactly as it was.
+    Refused(u64),
+}
+
 /// Load an ELF image into the running task's record.
 ///
 /// A fresh root, every `PT_LOAD` placed, the interpreter if any, a Linux initial stack, the heap
 /// windows. Returns where to cross. The caller chooses when the root goes live.
+///
+/// With the `middleware` feature the exec policy is asked first (`ExecKind::Image`), before the task's layout is reset: this is the
+/// one place `execve`, a `#!` interpreter and init all pass through, so a policy about which images may run is written once.
+///
+/// # Errors
+/// [`LoadError::Refused`] when the policy said no; [`LoadError::NoMem`] for every other failure.
+pub fn load_task<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Result<TaskImage, LoadError> {
+    #[cfg(feature = "middleware")]
+    {
+        let interp = akuma_elf_exec::interp_path(image).ok().flatten().and_then(|b| core::str::from_utf8(b).ok());
+        if let Some(no) = crate::middleware::exec_event(&crate::middleware::ExecKind::Image { path, interp, image }) {
+            return Err(LoadError::Refused(no));
+        }
+    }
+    load_task_inner::<M>(argv, env, image, path).ok_or(LoadError::NoMem)
+}
+
 #[must_use]
-pub fn load_task<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Option<TaskImage> {
+fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Option<TaskImage> {
     const NO_SEG: LoadSeg = LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 };
     let mut segs = [NO_SEG; 16];
     let (prog, n) = akuma_elf_exec::program(image, &mut segs).ok()?;

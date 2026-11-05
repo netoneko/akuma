@@ -17,6 +17,7 @@
 //! | `fallback`    | inside the lock, only where the answer is `-ENOSYS` | [`KernelCtx`] | supply the answer (a *new* syscall) |
 //! | `kernel_post` | inside the lock, after the call | [`KernelCtx`] + the result | replace the result |
 //! | `own_pre` / `own_post` | **outside** the lock, around it | [`OwnCtx`]: plain integers + the middleware's private state | observe only |
+//! | `exec` (one policy) | wherever code reaches a process: an image (`load_task`), a `PROT_EXEC` `mmap`, a `PROT_EXEC` `mprotect` | [`ExecEvent`] | [`ExecVerdict::Allow`] or `Deny(errno)` |
 //!
 //! A hook never sees a lock. A `kernel` hook runs under the kernel's own lock, taken by the kernel. An `own` hook
 //! is serialised by an *autolock* the framework owns (a spinlock with preemption off, held for exactly the hook
@@ -232,6 +233,41 @@ pub type OwnPre<S> = fn(&mut OwnCtx<'_, S>);
 /// `own_post`: the result.
 pub type OwnPost<S> = fn(&mut OwnCtx<'_, S>, u64);
 
+/// What the kernel is about to do that puts new code into a process. There are exactly three ways, and the kernel asks about each
+/// in one place (see [`ExecPolicy`]).
+#[derive(Clone, Copy, Debug)]
+pub enum ExecKind<'a> {
+    /// `execve` (and init, and a `#!` interpreter) is about to replace the process with this image. Asked before anything is torn
+    /// down, so a refusal leaves the caller exactly as it was. `interp` is the `PT_INTERP` path of a dynamically linked image.
+    Image { path: &'a str, interp: Option<&'a str>, image: &'a [u8] },
+    /// `mmap` with `PROT_EXEC`. `inode` is the regular file being mapped, `None` for anonymous memory.
+    Map { inode: Option<u32> },
+    /// `mprotect` adding `PROT_EXEC`. The kernel does not track which file a present page came from, so there is no identity.
+    Protect,
+}
+
+/// An [`ExecKind`] and who is asking.
+#[derive(Clone, Copy, Debug)]
+pub struct ExecEvent<'a> {
+    pub pid: u32,
+    pub kind: ExecKind<'a>,
+}
+
+/// What an [`ExecPolicy`] decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecVerdict {
+    Allow,
+    /// Refuse, with this positive errno (`13` is `EACCES`).
+    Deny(i32),
+}
+
+/// The one hook for "may this process get new code?".
+///
+/// It is called for every way the kernel introduces code (an image, a mapping, a protection change), so a policy is written once
+/// as a `match` and cannot be bypassed by a path nobody hooked. Read-only, like every hook: it can allow or refuse, never change
+/// what runs.
+pub type ExecPolicy = fn(&ExecEvent) -> ExecVerdict;
+
 /// One table entry: the calls it is about, and the hook.
 pub struct Route<F: 'static> {
     pub on: &'static [On],
@@ -295,13 +331,15 @@ pub struct Hooks<S: 'static> {
     pub fallback: &'static [Route<Fallback>],
     pub own_pre: &'static [Route<OwnPre<S>>],
     pub own_post: &'static [Route<OwnPost<S>>],
+    /// The policy for new code (images, executable mappings): see [`ExecPolicy`]. `None`: everything allowed.
+    pub exec: Option<ExecPolicy>,
 }
 
 impl<S> Hooks<S> {
     /// No hooks.
     #[must_use]
     pub const fn new() -> Self {
-        Self { kernel_pre: &[], kernel_post: &[], fallback: &[], own_pre: &[], own_post: &[] }
+        Self { kernel_pre: &[], kernel_post: &[], fallback: &[], own_pre: &[], own_post: &[], exec: None }
     }
 }
 
@@ -412,6 +450,15 @@ impl<S: Send + 'static> Middleware<S> {
         }
     }
 
+    /// Ask the table's [`ExecPolicy`] about `kind`. No policy: [`ExecVerdict::Allow`].
+    #[must_use]
+    pub fn exec_event(&self, kind: &ExecKind<'_>) -> ExecVerdict {
+        match self.hooks.exec {
+            Some(h) => h(&ExecEvent { pid: (self.m().pid)(), kind: *kind }),
+            None => ExecVerdict::Allow,
+        }
+    }
+
     /// The whole `kernel` side of one call: pre, the call (`inner`),
     /// the fallback where it answered `-ENOSYS`, then post. Call with the kernel lock held.
     pub fn run_kernel(&self, nr: u64, args: [u64; 6], tid: u64, inner: impl FnOnce() -> u64) -> u64 {
@@ -475,6 +522,8 @@ pub trait Dispatch: Sync {
     fn own_latch(&self, nr: u64) -> Latch;
     fn run_own_pre(&self, latch: Latch, nr: u64, args: [u64; 6], tid: u64);
     fn run_own_post(&self, latch: Latch, nr: u64, args: [u64; 6], tid: u64, ret: u64);
+    /// See [`Middleware::exec_event`].
+    fn exec_event(&self, kind: &ExecKind<'_>) -> ExecVerdict;
 }
 
 impl<S: Send + 'static> Dispatch for Middleware<S> {
@@ -492,6 +541,9 @@ impl<S: Send + 'static> Dispatch for Middleware<S> {
     }
     fn run_own_post(&self, latch: Latch, nr: u64, args: [u64; 6], tid: u64, ret: u64) {
         Self::run_own_post(self, latch, nr, args, tid, ret);
+    }
+    fn exec_event(&self, kind: &ExecKind<'_>) -> ExecVerdict {
+        Self::exec_event(self, kind)
     }
 }
 
@@ -518,6 +570,18 @@ pub fn run_kernel(nr: u64, args: [u64; 6], mut inner: impl FnMut() -> u64) -> u6
     match active() {
         Some(mw) => mw.run_kernel(nr, args, akuma_primitives::preempt::current_tid() as u64, &mut inner),
         None => inner(),
+    }
+}
+
+/// Ask the registered [`ExecPolicy`] whether the process may get new code.
+///
+/// `Some(errno)` (positive) means refuse; no middleware, or no policy in it, means `None`. Called from the loader (before anything
+/// is torn down) and from `mmap` and `mprotect`.
+#[must_use]
+pub fn exec_event(kind: &ExecKind<'_>) -> Option<u64> {
+    match active()?.exec_event(kind) {
+        ExecVerdict::Allow => None,
+        ExecVerdict::Deny(no) => Some(no.unsigned_abs().into()),
     }
 }
 
@@ -765,6 +829,29 @@ mod tests {
         // And as `Kernel::middleware` takes it: behind the object-safe face.
         let face: &'static dyn Dispatch = &MW;
         assert_eq!(face.own_latch(39), Latch::default());
+    }
+
+    #[test]
+    fn the_exec_policy_sees_every_way_code_arrives_and_is_allow_by_default() {
+        static NONE: Middleware<u32> = Middleware::new(0, Hooks::new());
+        static MW: Middleware<u32> = Middleware::new(0, Hooks {
+            exec: Some(|ev| match ev.kind {
+                ExecKind::Image { interp: Some(_), .. } => ExecVerdict::Deny(13),
+                ExecKind::Map { inode: Some(_) } | ExecKind::Protect => ExecVerdict::Deny(1),
+                _ => ExecVerdict::Allow,
+            }),
+            ..Hooks::new()
+        });
+        NONE.arm(machine());
+        MW.arm(machine());
+        let img = |interp| ExecKind::Image { path: "/bin/x", interp, image: &[] };
+        assert_eq!(NONE.exec_event(&img(Some("/lib/ld.so"))), ExecVerdict::Allow);
+        assert_eq!(NONE.exec_event(&ExecKind::Protect), ExecVerdict::Allow);
+        assert_eq!(MW.exec_event(&img(Some("/lib/ld.so"))), ExecVerdict::Deny(13));
+        assert_eq!(MW.exec_event(&img(None)), ExecVerdict::Allow);
+        assert_eq!(MW.exec_event(&ExecKind::Map { inode: Some(7) }), ExecVerdict::Deny(1));
+        assert_eq!(MW.exec_event(&ExecKind::Map { inode: None }), ExecVerdict::Allow);
+        assert_eq!(MW.exec_event(&ExecKind::Protect), ExecVerdict::Deny(1));
     }
 
     #[test]

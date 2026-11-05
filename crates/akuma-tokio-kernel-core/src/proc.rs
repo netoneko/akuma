@@ -609,8 +609,10 @@ pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> 
     // The image about to be replaced may hold shared file mappings.
     mm::shared_flush_all::<M>();
     let old_root = M::task_root();
-    let Some(ti) = loader::load_task::<M>(&argv, &env, &image, &effective) else {
-        return Err(e(ENOMEM));
+    let ti = match loader::load_task::<M>(&argv, &env, &image, &effective) {
+        Ok(ti) => ti,
+        Err(loader::LoadError::Refused(no)) => return Err(e(no)),
+        Err(loader::LoadError::NoMem) => return Err(e(ENOMEM)),
     };
     if let Some(p) = akuma_exec::process::current_process_shared() {
         let argv_bytes: Vec<Vec<u8>> = argv_s.iter().map(|a| a.clone().into_bytes()).collect();

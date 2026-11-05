@@ -316,7 +316,7 @@ fn run_init(cmdline: &str) -> ! {
         *slot = prog.env_str(k);
     }
     mm::set_task_slot(0);
-    let Some(ti) = akuma_tokio_kernel_core::loader::load_task::<mm::Aarch64>(
+    let Ok(ti) = akuma_tokio_kernel_core::loader::load_task::<mm::Aarch64>(
         &argv[..=prog.n_args()],
         &env[..prog.n_env()],
         &image,

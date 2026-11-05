@@ -70,6 +70,14 @@ pub fn mprotect_arm<M: Mm>(addr: u64, len: u64, prot: u64) -> u64 {
     if len > u64::MAX / 2 || !M::with_task(|t| t.layout.user_ok(addr, pages * 4096)) {
         return e(ENOMEM);
     }
+    // The exec policy (syscall middleware): another of the three ways code arrives. The kernel does not track which file a present
+    // page came from, so the policy gets no identity here.
+    #[cfg(feature = "middleware")]
+    if prot & u64::from(PROT_EXEC) != 0
+        && let Some(no) = crate::middleware::exec_event(&crate::middleware::ExecKind::Protect)
+    {
+        return e(no);
+    }
     #[allow(clippy::verbose_bit_mask)] // PROT_NONE is spelled as the bits it lacks
     let none = prot & 7 == 0;
     let (write, exec) = (prot & u64::from(PROT_WRITE) != 0, prot & u64::from(PROT_EXEC) != 0);
@@ -429,6 +437,13 @@ pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<
         return e(EINVAL);
     }
     if let Some(no) = akuma_syscalls_mem::wx::check_prot(prot).errno() {
+        return e(no);
+    }
+    // The exec policy (syscall middleware), asked for every mapping that is executable: one of the three ways code arrives.
+    #[cfg(feature = "middleware")]
+    if prot & u64::from(PROT_EXEC) != 0
+        && let Some(no) = crate::middleware::exec_event(&crate::middleware::ExecKind::Map { inode: file })
+    {
         return e(no);
     }
     let anon = flags & u64::from(MAP_ANONYMOUS) != 0;

@@ -65,6 +65,11 @@ mod nr {
     pub const CLONE: u64 = 56;
     pub const WAIT4: u64 = 61;
     pub const EXIT_GROUP: u64 = 231;
+    pub const WRITE: u64 = 1;
+    pub const MEMFD_CREATE: u64 = 319;
+    pub const EXECVEAT: u64 = 322;
+    pub const PTRACE: u64 = 101;
+    pub const PROCESS_VM_WRITEV: u64 = 311;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
@@ -78,6 +83,11 @@ mod nr {
     pub const CLONE: u64 = 220;
     pub const WAIT4: u64 = 260;
     pub const EXIT_GROUP: u64 = 94;
+    pub const WRITE: u64 = 64;
+    pub const MEMFD_CREATE: u64 = 279;
+    pub const EXECVEAT: u64 = 281;
+    pub const PTRACE: u64 = 117;
+    pub const PROCESS_VM_WRITEV: u64 = 271;
 }
 
 const ENOSYS: i64 = -38;
@@ -92,6 +102,19 @@ const MAP_PRIVATE: u64 = 2;
 const MAP_ANONYMOUS: u64 = 0x20;
 const NO_FD: u64 = -1i64 as u64;
 const SIGCHLD: u64 = 17;
+const PROT_WRITE: u64 = 2;
+#[cfg(target_arch = "x86_64")]
+const LOADER: &str = "/lib/ld-musl-x86_64.so.1";
+#[cfg(target_arch = "aarch64")]
+const LOADER: &str = "/lib/ld-musl-aarch64.so.1";
+
+/// The errno a child spawn failed with (`execve` refused it), or `None` if it spawned.
+fn spawn_errno(path: &str, args: &[&str]) -> Option<i32> {
+    match std::process::Command::new(path).args(args).env_clear().output() {
+        Ok(_) => None,
+        Err(e) => Some(e.raw_os_error().unwrap_or(-1)),
+    }
+}
 
 /// The attempts to get code into a process that the no-dynamic-loading policy refuses (a file mapped executable, and a
 /// read-only file mapping made executable); returns how many were NOT refused. Used by the children, which must be bound by
@@ -226,21 +249,61 @@ fn main() {
         check("(no-dynamic-loading off) mmap(file, PROT_EXEC) is allowed", i64::from(file_exec > 0), 1);
         let (ok, _) = run_dynamic("/usr/bin/xz", "--version");
         check("(no-dynamic-loading off) a dynamic child with an extra library runs", i64::from(ok), 1);
+        let (ok, _) = run_dynamic("/bin/busybox", "true");
+        check("(no-dynamic-loading off) a dynamic child with only libc runs (the image check is absent too)", i64::from(ok), 1);
         let bad = std::process::Command::new("/bin/mwprobe").arg("kid").env("LD_PRELOAD", "/lib/evil.so").status();
         check("(no-dynamic-loading off) a child exec with LD_PRELOAD is not refused", i64::from(bad.is_ok()), 1);
     } else {
+        // The avenues. The policy is one `match` over every way code arrives (shanghai/src/nodl.rs); this tries each way we know of.
+        // A. execve of a dynamically linked program, either kind, is refused before the process is touched (EACCES).
+        check("A1 execve of a dynamic program with an extra library (xz) is refused", i64::from(spawn_errno("/usr/bin/xz", &["--version"]) == Some(13)), 1);
+        check("A2 execve of a dynamic program with only libc (busybox) is refused: the gap is closed", i64::from(spawn_errno("/bin/busybox", &["true"]) == Some(13)), 1);
+        // B. The loader run directly has no PT_INTERP (it is its own interpreter), so the image check passes it; it then has to map
+        //    the program with a file-backed PROT_EXEC mmap, which the mapping check refuses.
+        let (ok, out) = run_dynamic(LOADER, "/bin/busybox");
+        println!("MWPROBE loader-direct: ok={ok} output={out}");
+        check("B  running the loader directly on a dynamic program cannot load it", i64::from(!ok), 1);
+        // C. A #! script whose interpreter is dynamic: the kernel resolves the interpreter and it goes through the same image check.
+        let script = "/tmp/dyn.sh";
+        let _ = std::fs::write(script, "#!/bin/busybox sh\ntrue\n");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755));
+        }
+        check("C  a #! script with a dynamic interpreter is refused", i64::from(spawn_errno(script, &[]) == Some(13)), 1);
+        // D. Mappings.
         let file_exec = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd as u64, 0]);
-        check("mmap(file, PROT_EXEC) is refused", file_exec, EACCES);
-        let anon_exec = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, NO_FD, 0]);
-        check("mmap(anonymous, PROT_EXEC) is still allowed", i64::from(anon_exec > 0), 1);
+        check("D1 mmap(file, PROT_EXEC) is refused", file_exec, EACCES);
         let file_ro = sc6(nr::MMAP, [0, 4096, PROT_READ, MAP_PRIVATE, fd as u64, 0]);
-        check("mmap(file, PROT_READ) is still allowed", i64::from(file_ro > 0), 1);
-        check("mprotect(+PROT_EXEC) is refused", sc(nr::MPROTECT, [file_ro as u64, 4096, PROT_READ | PROT_EXEC, 0]), EACCES);
-        check("mprotect(PROT_READ) is still allowed", sc(nr::MPROTECT, [file_ro as u64, 4096, PROT_READ, 0]), 0);
+        check("D2 mmap(file, PROT_READ) is still allowed", i64::from(file_ro > 0), 1);
+        check("D3 mprotect(file mapping, +PROT_EXEC) is refused", sc(nr::MPROTECT, [file_ro as u64, 4096, PROT_READ | PROT_EXEC, 0]), EACCES);
+        check("D4 mprotect(PROT_READ) is still allowed", sc(nr::MPROTECT, [file_ro as u64, 4096, PROT_READ, 0]), 0);
+        let anon_exec = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, NO_FD, 0]);
+        check("D5 mmap(anonymous, PROT_EXEC) is still allowed", i64::from(anon_exec > 0), 1);
+        // E. Loading by hand: put bytes in anonymous memory, then try to make it code.
+        let anon = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, NO_FD, 0]);
+        // SAFETY: `anon` is the fresh 4096-byte read-write mapping just made; one byte is written inside it.
+        unsafe { *(anon as *mut u8) = 0xC3 };
+        check("E1 anonymous memory with bytes written, then mprotect(+PROT_EXEC), is refused", sc(nr::MPROTECT, [anon as u64, 4096, PROT_READ | PROT_EXEC, 0]), EACCES);
+        check("E2 mmap(anonymous, PROT_READ|WRITE|EXEC) is refused (W^X)", sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, NO_FD, 0]), EACCES);
+        // F. memfd_create: an anonymous file you can write and then map. Either not served, or a mapping of it must be refused.
+        let name = b"x\0";
+        let m = sc(nr::MEMFD_CREATE, [name.as_ptr() as u64, 0, 0, 0]);
+        if m == ENOSYS {
+            check("F  memfd_create is not served (closed by absence)", m, ENOSYS);
+        } else {
+            let bytes = [0xC3u8; 16];
+            sc(nr::WRITE, [m as u64, bytes.as_ptr() as u64, 16, 0]);
+            let r = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, m as u64, 0]);
+            check("F  memfd_create is served, and mmap(memfd, PROT_EXEC) is refused", i64::from(r < 0), 1);
+        }
+        // G. Other ways to put code into a process that are not served: closed by absence (a regression here is a new avenue).
+        check("G1 execveat is not served", sc(nr::EXECVEAT, [0, 0, 0, 0]), ENOSYS);
+        check("G2 ptrace is not served", sc(nr::PTRACE, [0, 0, 0, 0]), ENOSYS);
+        check("G3 process_vm_writev is not served", sc(nr::PROCESS_VM_WRITEV, [0, 0, 0, 0]), ENOSYS);
+        check("G4 /proc/self/mem cannot be opened for writing", i64::from(std::fs::OpenOptions::new().write(true).open("/proc/self/mem").is_err()), 1);
 
-        // Children. The policy is the kernel's, not the process's: every process made from this one is bound by it.
-        //  1. a forked child that never execs (raw clone), 2. an exec'd static child (another pid), 3. a child exec with LD_PRELOAD,
-        //  4. a real dynamically linked child (xz) that needs a library besides libc (liblzma.so.5), 5. one that needs only libc.
+        // H. Children. The policy is the kernel's, not the process's: every process made from this one is bound by it.
         let pid = sc(nr::CLONE, [SIGCHLD, 0, 0, 0]);
         if pid == 0 {
             let n = load_attempts_allowed(fd);
@@ -249,16 +312,11 @@ fn main() {
         }
         let mut status: i32 = 0;
         let waited = sc(nr::WAIT4, [pid as u64, &raw mut status as u64, 0, 0]);
-        check("a forked child (no exec) is bound by the same guards", i64::from(pid > 0 && waited == pid && status == 0), 1);
+        check("H1 a forked child (no exec) is bound by the same policy", i64::from(pid > 0 && waited == pid && status == 0), 1);
         let kid = std::process::Command::new("/bin/mwprobe").arg("kid").env_clear().status();
-        check("an exec'd static child (another pid) is bound by the same guards", i64::from(matches!(&kid, Ok(s) if s.success())), 1);
+        check("H2 an exec'd static child (another pid) runs, and is bound by the same policy", i64::from(matches!(&kid, Ok(s) if s.success())), 1);
         let bad = std::process::Command::new("/bin/mwprobe").arg("kid").env("LD_PRELOAD", "/lib/evil.so").status();
-        check("a child exec with LD_PRELOAD is refused (EPERM)", i64::from(matches!(&bad, Err(e) if e.raw_os_error() == Some(1))), 1);
-        let (ok, err) = run_dynamic("/usr/bin/xz", "--version");
-        println!("MWPROBE xz (dynamic, needs liblzma.so.5): ok={ok} output={err}");
-        check("a dynamic child that needs a library besides libc cannot load it", i64::from(!ok), 1);
-        let (ok, _) = run_dynamic("/bin/busybox", "true");
-        check("a dynamic child that needs only libc still runs (known gap, pinned)", i64::from(ok), 1);
+        check("H3 a child exec with LD_PRELOAD is refused (EPERM, the env guard)", i64::from(matches!(&bad, Err(e) if e.raw_os_error() == Some(1))), 1);
     }
 
     // execve: the environment is checked before the call. LD_PRELOAD is refused; a clean environment execs us again.

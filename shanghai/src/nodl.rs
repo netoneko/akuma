@@ -1,48 +1,45 @@
 #![forbid(unsafe_code)]
-//! "No dynamic loading": a policy demo built from three `kernel_pre` hooks, compiled in only with `--features
-//! no-dynamic-loading` (off by default; it implies `middleware`) (B22, guide:
-//! `crates/akuma-tokio-kernel-core/docs/middleware.md` § Worked example). It is a demo, not a sandbox: it is **not** a
-//! wholesale ban, and the guide lists what gets around it.
+//! "No dynamic loading": a policy demo, compiled in only with `--features no-dynamic-loading` (off by default; it implies `middleware`)
+//! (B22, guide: `crates/akuma-tokio-kernel-core/docs/middleware.md` § Example 2). It bans **dynamically linked programs** and any
+//! way of turning a file into code, and it is written once, as one `match`, because the kernel asks one question - "may this process
+//! get new code?" - at every place code can arrive:
 //!
-//! What dynamic loading is, to a kernel: `ld-musl` (the interpreter the kernel's loader maps for a `PT_INTERP`
-//! binary) maps each shared library from a file with `PROT_EXEC`, and `dlopen` does the same later. So:
+//! | how code arrives | the event | what this policy does |
+//! |---|---|---|
+//! | `execve`, init, a `#!` interpreter | `ExecKind::Image` (asked before anything is torn down) | refuse an image with a `PT_INTERP`; a static image is allowed |
+//! | `mmap` with `PROT_EXEC` | `ExecKind::Map` | refuse a file-backed mapping; anonymous memory is allowed (W^X already forbids the writable kind) |
+//! | `mprotect` adding `PROT_EXEC` | `ExecKind::Protect` | refuse (the kernel cannot say which file a present page came from) |
 //!
-//! - [`mmap_guard`]: no file-backed `PROT_EXEC` mapping. Anonymous executable memory is untouched (W^X already
-//!   forbids the writable kind), so a static binary, which maps no library, is unaffected.
-//! - [`mprotect_guard`]: no adding `PROT_EXEC` after the fact, which is how a file mapped read-only would otherwise
-//!   be turned executable. A stricter rule than the mmap one: from `mprotect`'s arguments alone, file-backed and
-//!   anonymous cannot be told apart.
-//! - [`exec_guard`]: refuse an `execve` whose environment names an `LD_*` variable (`LD_PRELOAD`, `LD_LIBRARY_PATH`,
-//!   `LD_AUDIT`, ...), the knobs the dynamic loader reads from the environment. Refusing the whole call is the only
-//!   thing the hook API can do here: it cannot strip one variable and let the call proceed.
+//! Besides the policy there is [`exec_guard`], an ordinary `kernel_pre` hook on `execve` that refuses an `LD_*` variable in the new
+//! environment: the guide's Example 2, kept because it is the clearest example of reading the caller's memory.
+//!
+//! What gets around it is listed in the guide, and the probe (`shanghai/mwprobe`) tries each avenue it knows.
 
-use akuma_tokio_kernel::middleware::{KernelCtx, UserError, Verdict};
+use akuma_tokio_kernel::middleware::{ExecEvent, ExecKind, ExecVerdict, KernelCtx, UserError, Verdict};
 
-const PROT_EXEC: u64 = 4;
-const MAP_ANONYMOUS: u64 = 0x20;
 const EPERM: i32 = 1;
 const E2BIG: i32 = 7;
 const EACCES: i32 = 13;
 /// More entries than any real environment; past it the call is refused (fail closed).
 const MAX_ENV: usize = 512;
 
-/// `mmap(addr, len, prot, flags, fd, off)`: refuse a file-backed mapping that is executable.
-pub fn mmap_guard(ctx: &KernelCtx) -> Verdict {
-    let (prot, flags) = (ctx.args[2], ctx.args[3]);
-    if prot & PROT_EXEC != 0 && flags & MAP_ANONYMOUS == 0 {
-        akuma_primitives::safe_print!(96, "[nodl] pid {} refused a file-backed PROT_EXEC mmap\n", ctx.pid);
-        return Verdict::Errno(EACCES);
+/// The exec policy: one `match` over every way the kernel introduces code.
+pub fn exec_policy(ev: &ExecEvent) -> ExecVerdict {
+    match ev.kind {
+        ExecKind::Image { path, interp: Some(interp), .. } => {
+            akuma_primitives::safe_print!(160, "[nodl] pid {} refused a dynamic executable {} (interpreter {})\n", ev.pid, path, interp);
+            ExecVerdict::Deny(EACCES)
+        }
+        ExecKind::Image { interp: None, .. } | ExecKind::Map { inode: None } => ExecVerdict::Allow,
+        ExecKind::Map { inode: Some(_) } => {
+            akuma_primitives::safe_print!(96, "[nodl] pid {} refused a file-backed PROT_EXEC mmap\n", ev.pid);
+            ExecVerdict::Deny(EACCES)
+        }
+        ExecKind::Protect => {
+            akuma_primitives::safe_print!(96, "[nodl] pid {} refused mprotect(PROT_EXEC)\n", ev.pid);
+            ExecVerdict::Deny(EACCES)
+        }
     }
-    Verdict::Pass
-}
-
-/// `mprotect(addr, len, prot)`: refuse making anything executable.
-pub fn mprotect_guard(ctx: &KernelCtx) -> Verdict {
-    if ctx.args[2] & PROT_EXEC != 0 {
-        akuma_primitives::safe_print!(96, "[nodl] pid {} refused mprotect(PROT_EXEC)\n", ctx.pid);
-        return Verdict::Errno(EACCES);
-    }
-    Verdict::Pass
 }
 
 /// Whether the NUL-terminated string at `s` starts with `LD_`. Bytewise and bounded to three bytes, so a long
