@@ -1,8 +1,10 @@
-# B22: syscall middleware for the minimal kernel (proposal + first cut, 2026-11-05)
+# B22: syscall middleware for the minimal kernel (design + first cut, 2026-11-05)
 
 **Status: first cut written, host-tested, and BOOTED in Shanghai on both machines (QEMU TCG, 1 and 4 cores), including a 4-thread contention check on the `own` autolock.** Code:
-[`crates/akuma-tokio-kernel-core/src/middleware.rs`](../crates/akuma-tokio-kernel-core/src/middleware.rs); user-facing
-text: [`crates/akuma-tokio-kernel/README.md`](../crates/akuma-tokio-kernel/README.md) § Syscall middleware.
+[`crates/akuma-tokio-kernel-core/src/middleware.rs`](../../crates/akuma-tokio-kernel-core/src/middleware.rs); how to use it:
+[`crates/akuma-tokio-kernel-core/docs/middleware.md`](../../crates/akuma-tokio-kernel-core/docs/middleware.md) (the guide, current state);
+user-facing text: [`crates/akuma-tokio-kernel/README.md`](../../crates/akuma-tokio-kernel/README.md) § Syscall middleware.
+This is the record of the design and of what booting it found; the rules as they stand now are in the guide.
 The `middleware` cargo feature is **off by default for every kernel**; with it off none of this is compiled.
 
 ## Why

@@ -42,4 +42,4 @@ rebuilt here.
 
 ## Background
 
-`scripts/link_kernel.sh` (header), `scripts/mkbin.sh`, `proposals/B22_SYSCALL_MIDDLEWARE.md`.
+`scripts/link_kernel.sh` (header), `scripts/mkbin.sh`, `docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md`.

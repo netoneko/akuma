@@ -310,4 +310,4 @@ Shanghai, on this machine's hypervisor.
 
 `--features middleware` adds `src/middleware.rs` (one table, every tier once). `sh shanghai/mw_gate.sh` boots the default
 kernel (control) and the middleware kernel under QEMU TCG with `mwprobe/mwprobe.rs` as init: control `CONTROL PASS`,
-middleware `PASS` (14/14, including a 4-thread autolock contention case), on amd64 and aarch64, at 1 and 4 cores. See `proposals/B22_SYSCALL_MIDDLEWARE.md` § What was verified.
+middleware `PASS` (14/14, including a 4-thread autolock contention case), on amd64 and aarch64, at 1 and 4 cores. See `docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md` § What was verified, and the guide `crates/akuma-tokio-kernel-core/docs/middleware.md`.

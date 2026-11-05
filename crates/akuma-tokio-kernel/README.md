@@ -125,7 +125,8 @@ built twice.
 
 With the `middleware` feature (off by default, for every kernel) a kernel registers **one** table of hooks around
 syscall dispatch: `kernel.middleware(&MW)`. The design is
-[`proposals/B22_SYSCALL_MIDDLEWARE.md`](../../proposals/B22_SYSCALL_MIDDLEWARE.md); the code is
+[`docs/middleware.md`](../akuma-tokio-kernel-core/docs/middleware.md) (the guide: first syscall, the tiers, the rules) and
+[`docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md`](../../docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md) (the design record); the code is
 `akuma_tokio_kernel_core::middleware`, re-exported as `akuma_tokio_kernel::middleware`, and it is the same on
 amd64 and aarch64.
 
