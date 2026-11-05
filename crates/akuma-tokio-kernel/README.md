@@ -154,8 +154,6 @@ static MW: Middleware<u64> = Middleware::new(0, Hooks {
         }
         Verdict::Pass
     })],
-    // Outside the kernel lock, around it: plain integers and private state, never user memory.
-    own_pre: &[Route::new(&[On::Call(Syscall::Getpid)], |ctx| *ctx.state += 1)],
     ..Hooks::new()
 });
 
@@ -178,15 +176,13 @@ probe pins what it does not cover. It needs no sshd or key, only `e2fsprogs` and
 - **One table, flat, no chaining.** No `next`, no priorities. Two entries for one call in one tier are refused when
   the table is armed (a boot panic naming the number). A second `.middleware(..)` panics. To layer, write a
   function that calls your functions and register that.
-- **Two lock modes, chosen by the tier.** `kernel_*` and `fallback` hooks run under the kernel lock, which the
-  kernel takes; `own_*` hooks run outside it with a private state `S` that an autolock serialises. A hook never
-  sees, names or takes a lock. `own` hooks must be short and must not block, allocate or print, and get **no
-  user memory** (the page-table walk behind a user copy races a sibling's `munmap` when the lock is not held).
+- **One lock mode.** `kernel_pre` and `fallback` hooks run under the kernel lock, which the kernel takes. A hook never
+  sees, names or takes a lock.
 - **Cheap when idle.** Which numbers a tier wants is a 512-bit mask built when the table is armed, read once per
-  call and latched, so an unhooked call costs a relaxed load and a bit test per tier. `Verdict::PassAndForget`
+  call, so an unhooked call costs a relaxed load and a bit test. `Verdict::PassAndForget`
   clears a hook's bit for that number. Numbers from 512 up are always asked (that is where custom calls live).
 - **Hooks cannot mutate the kernel context.** Every `kernel` hook takes `&KernelCtx`: it can allow, refuse or answer a call, never
-  change what runs (rewriting arguments is how one hook defeats another's check). `OwnCtx` has `&mut` for the hook's own state only.
+  change what runs (rewriting arguments is how one hook defeats another's check).
 - **One exec policy for new code.** Code reaches a process in three ways: an image (`execve`, init, a `#!` interpreter), a `PROT_EXEC`
   `mmap`, a `PROT_EXEC` `mprotect`. `Hooks::exec` is asked at each, so a policy is one `match` and cannot be bypassed by a path nobody
   hooked; the image is asked before anything is torn down, so a refusal is `EACCES` and leaves the caller untouched.
@@ -194,7 +190,7 @@ probe pins what it does not cover. It needs no sshd or key, only `e2fsprogs` and
   only: no `fallback`, and a changed result is ignored. A `kernel_pre` refusal is honoured for `execve` (it skips the call
   before it touches the process) and ignored for the other four.
 - **No `unsafe`.** The module is `forbid(unsafe_code)` and the API needs none; your crate decides its own.
-- A hook that panics is a kernel panic, and `own` hooks run with preemption off.
+- A hook that panics is a kernel panic.
 
 ## Build it
 

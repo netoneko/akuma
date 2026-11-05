@@ -1,4 +1,4 @@
-//! What a hook is handed: [`KernelCtx`] (under the kernel lock, read-only) and [`OwnCtx`] (outside it), and the hook types.
+//! What a hook is handed: [`KernelCtx`] (under the kernel lock, read-only), and the hook types.
 
 use super::calls::{Machine, Verdict};
 use akuma_syscalls_abi::Syscall;
@@ -106,25 +106,7 @@ impl KernelCtx {
     }
 }
 
-/// The context of an `own` hook: runs outside the kernel lock. Plain integers, and the middleware's state.
-pub struct OwnCtx<'a, S> {
-    /// The native syscall number as the machine received it (before any legacy folding).
-    pub nr: u64,
-    /// The call it names, if it names one.
-    pub call: Option<Syscall>,
-    /// The six arguments, as integers. They are not pointers you may follow: there is no user memory here.
-    pub args: [u64; 6],
-    /// The calling thread.
-    pub tid: u64,
-    /// The middleware's private state, locked for the duration of the hook.
-    pub state: &'a mut S,
-}
-
 /// `kernel_pre`.
 pub type KernelPre = fn(&KernelCtx) -> Verdict;
 /// `fallback`: `Some(answer)` to serve the call, `None` to leave the `-ENOSYS`.
 pub type Fallback = fn(&KernelCtx) -> Option<u64>;
-/// `own_pre`.
-pub type OwnPre<S> = fn(&mut OwnCtx<'_, S>);
-/// `own_post`: the result.
-pub type OwnPost<S> = fn(&mut OwnCtx<'_, S>, u64);

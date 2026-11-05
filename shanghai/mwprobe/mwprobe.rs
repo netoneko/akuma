@@ -396,31 +396,6 @@ fn main() {
     check("params: mw.other.secret is NOT readable through the mw.sample. view", (seen >> 2) & 1, 0);
     check("kernel_pre ignores a path it does not care about", open("/definitely-not-here"), ENOENT);
 
-    // own tier: outside the kernel lock, plain integers + private state.
-    let (pre0, post0) = (sc(1002, [0; 4]), sc(1003, [0; 4]));
-    for _ in 0..5 {
-        sc(nr::GETPID, [0; 4]);
-    }
-    check("own_pre saw 5 getpids", sc(1002, [0; 4]) - pre0, 5);
-    check("own_post saw 5 getpids", sc(1003, [0; 4]) - post0, 5);
-
-    // The autolock under contention: THREADS threads each call getpid CALLS times at once. The `own_pre` hook reads,
-    // spins and writes its private state, so a lost update (two hooks in at once) leaves it below the atomic count.
-    const THREADS: i64 = 4;
-    const CALLS: i64 = 500;
-    let pre_before = sc(1002, [0; 4]);
-    let hs: Vec<_> = (0..THREADS)
-        .map(|_| std::thread::spawn(|| (0..CALLS).for_each(|_| {
-            sc(nr::GETPID, [0; 4]);
-        })))
-        .collect();
-    for h in hs {
-        h.join().unwrap();
-    }
-    check("own_pre saw every getpid from 4 threads", sc(1002, [0; 4]) - pre_before, THREADS * CALLS);
-    sc(nr::GETPPID, [0; 4]); // own_post(getppid) publishes the private state
-    check("own state == atomic count (no lost update under contention)", sc(1005, [0; 4]), sc(1002, [0; 4]));
-
     // "No dynamic loading" (shanghai/src/nodl.rs): what ld.so and dlopen do is a file-backed PROT_EXEC mapping.
     let fd = open("/bin/mwprobe");
     check("open the probe's own binary", i64::from(fd >= 3), 1);

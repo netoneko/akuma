@@ -54,10 +54,8 @@ the caller first if a sibling's `exit_group` asked it to, and then `dispatch_inn
 5. **Anything else** answers `ENOSYS` and prints `[nosys] nr=N` once per number per boot, so a probe run is
    its own gap list.
 
-With the `middleware` feature (off by default) the table of `akuma_tokio_kernel_core::middleware` wraps this: its `own` tier
-runs in `dispatch` outside the lock (raw number, before the fold), its `kernel` tier wraps steps 2-5 inside it (after the fold),
-and `fallback` runs only where steps 2-5 answered `ENOSYS`. aarch64 has the same two seams (`trap::el0_sync` and
-`syscall::dispatch`). Without the feature none of it is compiled. How to use it and the rules: [the middleware guide](../../../crates/akuma-tokio-kernel-core/docs/middleware.md); the design record: [B22](../../../docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md).
+With the `middleware` feature (off by default) the table of `akuma_tokio_kernel_core::middleware` wraps this: its `kernel_pre` tier wraps steps 2-5 inside the lock (after the fold),
+and `fallback` runs only where steps 2-5 answered `ENOSYS`. aarch64 has the same seam (`syscall::dispatch`). Without the feature none of it is compiled. How to use it and the rules: [the middleware guide](../../../crates/akuma-tokio-kernel-core/docs/middleware.md); the design record: [B22](../../../docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md).
 
 On the way out, `dispatch` restores the user-RSP stash (the stub's per-CPU slot, which any switch inside the
 call lets another thread overwrite), takes pending signals (`child::deliver_at_return`: a handler frame, an

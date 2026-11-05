@@ -31,7 +31,7 @@ exec by its environment.
    #![forbid(unsafe_code)]
    use akuma_tokio_kernel::middleware::{CUSTOM_BASE, Hooks, Middleware, On, Route};
 
-   pub static MW: Middleware<()> = Middleware::new((), Hooks {
+   pub static MW: Middleware = Middleware::new(Hooks {
        // 1000 is above every number Linux assigns. This runs only where the kernel would have said -ENOSYS.
        fallback: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_ctx| Some(42))],
        ..Hooks::new()
@@ -70,15 +70,13 @@ probe's own result line. It needs only `e2fsprogs`, no sshd or key.
 
 ## The table
 
-One `Middleware<S>` per kernel, a `static`: `Middleware::new(state, Hooks { .. })`. `Hooks` has five tiers, each a slice of
+One `Middleware` per kernel, a `static`: `Middleware::new(Hooks { .. })`. `Hooks` has two tiers, each a slice of
 `Route::new(&[On::..], hook)`, and one `exec` policy (below); leave the ones you do not use at `..Hooks::new()`.
 
 | tier | hook type | runs | it may |
 |---|---|---|---|
 | `kernel_pre` | `fn(&KernelCtx) -> Verdict` | inside the kernel lock, before the call | `Pass`, `PassAndForget`, `Return(v)`, `Errno(e)` (a refusal: not for `exit`/`clone`/`rt_sigreturn`) |
 | `fallback` | `fn(&KernelCtx) -> Option<u64>` | inside the lock, only where the answer is `-ENOSYS` | `Some(answer)` to serve the call, `None` to leave the `-ENOSYS` |
-| `own_pre` | `fn(&mut OwnCtx<S>)` | **outside** the lock, before it | observe, and update `ctx.state` |
-| `own_post` | `fn(&mut OwnCtx<S>, u64)` | outside the lock, after it | observe, and update `ctx.state` |
 
 `On::Call(Syscall::Openat)` names a Linux call by identity (the machine maps it to its architecture's number);
 `On::Nr(1000)` names a raw number, the same on both architectures (use it from `CUSTOM_BASE` = 1000 up).
@@ -90,15 +88,14 @@ a function that calls your own functions and register that; the framework gives 
 ## Where it runs
 
 ```text
-amd64    dispatch():  own_pre -> [take the kernel lock] -> legacy fold -> kernel_pre -> the call
-                      -> fallback (if -ENOSYS) -> signal delivery -> [release] -> own_post
-aarch64  el0_sync():  own_pre -> [take the kernel lock] -> kernel_pre -> the call -> fallback
-                      -> signal delivery -> [release] -> own_post
+amd64    dispatch():  [take the kernel lock] -> legacy fold -> kernel_pre -> the call
+                      -> fallback (if -ENOSYS) -> signal delivery -> [release]
+aarch64  el0_sync():  [take the kernel lock] -> kernel_pre -> the call -> fallback
+                      -> signal delivery -> [release]
 ```
 
 - The `kernel` tier sees the **canonical** number on amd64: the legacy spellings (`mkdir`, `unlink`, ...) have already been
   folded into their `*at` call.
-- The `own` tier sees the **raw** number the program issued, before any folding, and has no user memory (below).
 - A hook cannot change what the call sees: `KernelCtx` is read-only, and the call gets exactly the arguments the program passed.
 - A `Return`/`Errno` from `kernel_pre` skips the call (and the fallback).
 
@@ -115,8 +112,6 @@ aarch64  el0_sync():  own_pre -> [take the kernel lock] -> kernel_pre -> the cal
 
 `UserError::errno()` gives the positive errno to hand back (`Verdict::Errno(e.errno())`). A bad user pointer is an error value,
 never a crash: write `?`-style code and return `-EFAULT`.
-
-`OwnCtx<S>`: `nr`, `call`, `args` (plain integers: **not pointers you may follow**), `tid`, and `state: &mut S`, your private state.
 
 ## Example 2: refuse an exec by its environment
 
@@ -345,13 +340,7 @@ signed kernel: survives).
 
 ## The rules, and why each is there
 
-- **No hook touches a lock.** `kernel_*` and `fallback` run under the kernel lock, which the kernel takes. `own_*` run outside it,
-  with `state` behind an autolock the framework owns: a spinlock held with preemption off for exactly the hook call and never
-  while the kernel lock is taken, so there is no lock-order question and nothing for a hook to name.
-- **`own` hooks must be short, must not block, allocate or print, and get no user memory.** The walk behind a user copy races a
-  sibling thread's `munmap`/`mprotect` (which run under the kernel lock) and could read a frame that now belongs to another
-  process. Anything that reads the caller's memory is a `kernel` hook. If you need a lock-free counter, an atomic works from
-  any tier.
+- **No hook touches a lock.** `kernel_pre` and `fallback` run under the kernel lock, which the kernel takes, so there is no lock-order question and nothing for a hook to name. If you need a counter, an atomic works.
 - **`kernel` hooks run under the big kernel lock.** Do not spin on something another core's syscall holds, and do not try to
   park the caller: there is no sanctioned way to block yet (see "Not built").
 - **Some calls are observed, never replaced:** `exit`, `exit_group`, `clone`, `execve`, `rt_sigreturn` rewrite the frame or do not
@@ -360,8 +349,7 @@ signed kernel: survives).
   `exit_group`, `clone` and `rt_sigreturn` (`may_refuse_before`).
 - **Hooks cannot mutate the kernel context.** Every `kernel` hook takes `&KernelCtx`, so a hook can allow, refuse or answer a
   call but never change what runs. Rewriting arguments is how one hook defeats another's check (a guard validates a path, a
-  later hook swaps the pointer), and it would make combined hooks depend on their order. (`OwnCtx` has `&mut` for one thing: your
-  own `state`.)
+  later hook swaps the pointer), and it would make combined hooks depend on their order. 
 - **A hook that panics is a kernel panic.** Treat it as kernel code.
 - **No `unsafe`.** `middleware/` is `#![forbid(unsafe_code)]` and the API needs none; put the same attribute at the top of your
   middleware module. Raw access means patching the attribute out of your own crate.
@@ -370,9 +358,9 @@ signed kernel: survives).
 
 ## What it costs, and the caches
 
-Which numbers a tier wants is decided once, when the table is armed: a 512-bit mask per tier. A call nobody hooked costs one
-relaxed load and a bit test per tier, and no hook runs. Numbers from 512 up are always asked (that is where custom calls live).
-The mask is read **once per call** and latched, so a hook that prunes itself cannot make its own post-hook vanish. A
+Which numbers a tier wants is decided once, when the table is armed: a 512-bit mask for `kernel_pre`. A call nobody hooked costs one
+relaxed load and a bit test, and no hook runs. Numbers from 512 up are always asked (that is where custom calls live).
+The mask is read **once per call**. A
 `kernel_pre` may return `Verdict::PassAndForget` to clear its own bit for that number for good. Verdicts themselves are never
 cached: they depend on the arguments.
 
@@ -381,7 +369,7 @@ The feature-on cost against the syscall floor is **not measured**; do not quote 
 ## Testing a table
 
 - **On the host** (no kernel): `Middleware::arm(machine)` with a fake `Machine` (`decode`, `encode`, `copy_in`, `copy_out`,
-  `pid`), then `run_kernel`, `run_own_pre` and `run_own_post` directly. [`src/middleware/tests.rs`](../src/middleware/tests.rs) does
+  `pid`), then and `run_kernel` directly. [`src/middleware/tests.rs`](../src/middleware/tests.rs) does
   exactly this for every rule above: `cargo test -p akuma-tokio-kernel-core --features middleware --target $(rustc -vV | sed -n
   's/host: //p')`.
 - **In a guest:** copy Shanghai's pattern. Write a probe that makes raw `syscall` instructions (libc would hide an `-ENOSYS`
@@ -391,25 +379,13 @@ The feature-on cost against the syscall floor is **not measured**; do not quote 
   child, and runs real dynamic binaries (`shanghai/mw_fetch_dyn.sh` fetches Alpine's loader, `busybox` and `xz`; it needs network the
   first time and caches under the work dir). Run the same children on the control kernel: that is what shows the refusal is the
   middleware's.
-- **Contention:** the `own` autolock is only exercised by threads on more than one core. `mwprobe` runs 4 threads x 500 `getpid`
-  at `SMP=4` against a hook that reads, spins and writes its state; a lost update would leave the state below the atomic count.
-
-## Pitfalls found by booting it
-
-- Struct-update syntax needs public fields: write `Middleware::new(state, Hooks { fallback: .., ..Hooks::new() })`, not a
-  `Middleware { .. }` literal.
-- Hook a call the kernel actually serves. `getuid` is only served with the `shell` feature; a table on it sees `-ENOSYS`.
-- On aarch64, QEMU's `-kernel` needs the flat `.bin`; when cargo reuses a cached ELF it does not relink and the `.bin` can be the
-  other build's. Make it from the ELF (`sh scripts/mkbin.sh <elf> <bin>`), as the gate does
-  (`docs/archive/LINK_KERNEL_BIN_LAYOUT.md`).
 
 ## Not built (yet)
 
 Refusing `clone`/`fork` before they run (as safe as refusing `execve`, but nobody has asked for it); stripping variables from an exec's
 environment (see Example 2); a runtime `arm`/`disarm` handle for interest bits; a lock-protected state cell for `kernel` hooks (use
 atomics, or a `BorrowCell` static, which the kernel lock serialises); typed `UserPtr<T>` (there are byte reads and `u64`/string helpers); a
-framework-provided blocking wait for `kernel` hooks; `Return` from an `own` hook (signal delivery on the way out runs under the
-kernel lock, and whether a cheap lock-free "signal pending" test exists has not been checked); a measured cost. Hosting
+framework-provided blocking wait for `kernel` hooks; an observe-only tier outside the kernel lock (the `own_pre`/`own_post` tier was removed: nothing used it, and its state could not reach a decision); a measured cost. Hosting
 rump's interceptor would need the `arm`/`disarm` handle, the state cell, typed pointers and the blocking wait, and is out of scope
 while rump is deferred.
 

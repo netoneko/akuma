@@ -1135,12 +1135,6 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     // included) lets the next thread's syscall overwrite it, so it is saved
     // here and restored before the return, for every call at once.
     let stash = ring3::user_rsp_stash();
-    // Middleware's `own` tier runs here, outside the kernel lock (B22). The raw number and arguments: the
-    // legacy fold has not happened yet, and no user memory is reachable from this tier.
-    #[cfg(feature = "middleware")]
-    let (own_nr, own_args) = (fr.rax, [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()]);
-    #[cfg(feature = "middleware")]
-    let own = akuma_tokio_kernel_core::middleware::own_enter(own_nr, own_args);
     smp::bkl_enter();
     // A sibling `exit_group` asked to end leaves here, at entry or on the way back
     // to ring 3, rather than running on in a dying process (`child::kill_siblings`).
@@ -1163,8 +1157,6 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     // A frame pushed just now already set the stash; its override is spent.
     let _ = child::take_return_rsp();
     smp::bkl_leave();
-    #[cfg(feature = "middleware")]
-    akuma_tokio_kernel_core::middleware::own_leave(own, own_nr, own_args, r);
     r
 }
 

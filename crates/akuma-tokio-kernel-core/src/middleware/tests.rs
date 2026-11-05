@@ -21,22 +21,20 @@ fn machine() -> Machine {
 }
 
 const GETPID: u64 = 39;
-const OPENAT: u64 = 257;
 const CUSTOM: u64 = CUSTOM_BASE;
 
 #[test]
 fn a_call_nobody_hooked_runs_no_hook() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks::new());
+    static MW: Middleware = Middleware::new(Hooks::new());
     MW.arm(machine());
     let a = [1, 2, 3, 4, 5, 6];
-    assert_eq!(MW.kernel_latch(GETPID), Latch::default());
-    assert_eq!(MW.own_latch(GETPID), Latch::default());
+    assert!(!MW.kernel_wants(GETPID));
     assert_eq!(MW.run_kernel(GETPID, a, 1, || 99), 99);
 }
 
 #[test]
 fn pre_can_answer_and_the_call_does_not_run() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks {
+    static MW: Middleware = Middleware::new(Hooks {
         kernel_pre: &[Route::new(&[On::Call(Syscall::Getpid)], |_| Verdict::Errno(1))],
         ..Hooks::new()
     });
@@ -53,7 +51,7 @@ fn pre_can_answer_and_the_call_does_not_run() {
 
 #[test]
 fn fallback_serves_only_what_would_be_enosys() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks {
+    static MW: Middleware = Middleware::new(Hooks {
         fallback: &[Route::new(&[On::Nr(CUSTOM), On::Call(Syscall::Getpid)], |_| Some(42))],
         ..Hooks::new()
     });
@@ -66,7 +64,7 @@ fn fallback_serves_only_what_would_be_enosys() {
 
 #[test]
 fn exit_and_clone_are_observed_not_replaced() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks {
+    static MW: Middleware = Middleware::new(Hooks {
         kernel_pre: &[Route::new(&[On::Call(Syscall::Clone)], |_| Verdict::Return(0))],
         ..Hooks::new()
     });
@@ -77,7 +75,7 @@ fn exit_and_clone_are_observed_not_replaced() {
 
 #[test]
 fn execve_can_be_refused_before_it_runs_but_not_served_or_rewritten() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks {
+    static MW: Middleware = Middleware::new(Hooks {
         kernel_pre: &[Route::new(&[On::Call(Syscall::Execve)], |c| {
             if c.args[0] == 1 { Verdict::Errno(1) } else { Verdict::Pass }
         })],
@@ -103,7 +101,7 @@ fn execve_can_be_refused_before_it_runs_but_not_served_or_rewritten() {
 
 #[test]
 fn exit_and_rt_sigreturn_cannot_be_refused() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks {
+    static MW: Middleware = Middleware::new(Hooks {
         kernel_pre: &[
             Route::new(&[On::Call(Syscall::ExitGroup), On::Call(Syscall::Exit)], |_| Verdict::Errno(1)),
             Route::new(&[On::Call(Syscall::RtSigreturn)], |_| Verdict::Return(0)),
@@ -119,31 +117,15 @@ fn exit_and_rt_sigreturn_cannot_be_refused() {
 
 #[test]
 fn pass_and_forget_clears_the_bit() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks {
+    static MW: Middleware = Middleware::new(Hooks {
         kernel_pre: &[Route::new(&[On::Call(Syscall::Getpid)], |_| Verdict::PassAndForget)],
         ..Hooks::new()
     });
     MW.arm(machine());
     let a = [0; 6];
-    assert!(MW.kernel_latch(GETPID).pre);
+    assert!(MW.kernel_wants(GETPID));
     MW.run_kernel(GETPID, a, 1, || 1);
-    assert!(!MW.kernel_latch(GETPID).pre);
-}
-
-#[test]
-fn own_hooks_keep_private_state_and_see_integers() {
-    static MW: Middleware<u64> = Middleware::new(0, Hooks {
-        own_pre: &[Route::new(&[On::Call(Syscall::Getpid)], |c| *c.state += 1)],
-        own_post: &[Route::new(&[On::Call(Syscall::Getpid)], |c, r| *c.state += r)],
-        ..Hooks::new()
-    });
-    MW.arm(machine());
-    let l = MW.own_latch(GETPID);
-    assert_eq!(l, Latch { pre: true, post: true });
-    MW.run_own_pre(l, GETPID, [0; 6], 1);
-    MW.run_own_post(l, GETPID, [0; 6], 1, 10);
-    MW.state.with(|s| assert_eq!(*s, 11));
-    assert_eq!(MW.own_latch(OPENAT), Latch::default());
+    assert!(!MW.kernel_wants(GETPID));
 }
 
 #[test]
@@ -164,7 +146,7 @@ fn user_memory_is_checked_and_strings_are_bounded() {
 #[test]
 #[should_panic(expected = "named twice")]
 fn two_entries_for_one_call_in_one_tier_are_refused() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks {
+    static MW: Middleware = Middleware::new(Hooks {
         kernel_pre: &[
             Route::new(&[On::Call(Syscall::Getpid)], |_| Verdict::Pass),
             Route::new(&[On::Nr(GETPID)], |_| Verdict::Pass),
@@ -174,20 +156,10 @@ fn two_entries_for_one_call_in_one_tier_are_refused() {
     MW.arm(machine());
 }
 
-#[test]
-fn the_same_call_in_two_tiers_is_fine() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks {
-        kernel_pre: &[Route::new(&[On::Call(Syscall::Getpid)], |_| Verdict::Pass)],
-        own_post: &[Route::new(&[On::Call(Syscall::Getpid)], |_, _| {})],
-        ..Hooks::new()
-    });
-    MW.arm(machine());
-}
-
-/// `docs/middleware.md` § "Your first syscall": the table as written there, with the stateless `()`.
+/// `docs/middleware.md` § "Your first syscall": the table as written there.
 #[test]
 fn the_guides_first_syscall_compiles_and_answers() {
-    static MW: Middleware<()> = Middleware::new((), Hooks {
+    static MW: Middleware = Middleware::new(Hooks {
         fallback: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_ctx| Some(42))],
         ..Hooks::new()
     });
@@ -196,13 +168,13 @@ fn the_guides_first_syscall_compiles_and_answers() {
     assert_eq!(MW.run_kernel(CUSTOM_BASE, a, 1, || ENOSYS_RET), 42);
     // And as `Kernel::middleware` takes it: behind the object-safe face.
     let face: &'static dyn Dispatch = &MW;
-    assert_eq!(face.own_latch(39), Latch::default());
+    assert_eq!(face.run_kernel(39, a, 1, &mut || 5), 5);
 }
 
 #[test]
 fn the_exec_policy_sees_every_way_code_arrives_and_is_allow_by_default() {
-    static NONE: Middleware<u32> = Middleware::new(0, Hooks::new());
-    static MW: Middleware<u32> = Middleware::new(0, Hooks {
+    static NONE: Middleware = Middleware::new(Hooks::new());
+    static MW: Middleware = Middleware::new(Hooks {
         exec: Some(|ev| match ev.kind {
             ExecKind::Image { interp: Some(_), .. } => ExecVerdict::Deny(13),
             ExecKind::Map { inode: Some(_) } | ExecKind::Protect => ExecVerdict::Deny(1),
@@ -224,7 +196,7 @@ fn the_exec_policy_sees_every_way_code_arrives_and_is_allow_by_default() {
 
 #[test]
 fn a_policy_can_ask_for_the_image_to_be_the_only_source_and_for_a_sidecar() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks {
+    static MW: Middleware = Middleware::new(Hooks {
         exec: Some(|ev| match ev.kind {
             // Allowed only if the sidecar says so, and then mapped from the checked bytes.
             ExecKind::Image { sidecar: Some(b"ok"), .. } => ExecVerdict::AllowFromImage,
@@ -246,8 +218,8 @@ fn a_policy_can_ask_for_the_image_to_be_the_only_source_and_for_a_sidecar() {
 
 #[test]
 fn numbers_from_512_are_always_asked() {
-    static MW: Middleware<u32> = Middleware::new(0, Hooks::new());
+    static MW: Middleware = Middleware::new(Hooks::new());
     MW.arm(machine());
-    assert!(MW.kernel_latch(CUSTOM).pre);
-    assert!(!MW.kernel_latch(GETPID).pre);
+    assert!(MW.kernel_wants(CUSTOM));
+    assert!(!MW.kernel_wants(GETPID));
 }

@@ -150,16 +150,9 @@ fn el1_sync(f: &mut Frame) {
 
 /// A trap from EL0 takes the kernel lock; the return to EL0 drops it.
 fn el0_sync(f: &mut Frame) {
-    // Middleware's `own` tier runs outside the lock (B22): the raw number and integers, no user memory.
-    #[cfg(feature = "middleware")]
-    let (own_nr, own_args) = (f.x[8], [f.x[0], f.x[1], f.x[2], f.x[3], f.x[4], f.x[5]]);
-    #[cfg(feature = "middleware")]
-    let own = if f.ec() == ec::SVC64 { akuma_tokio_kernel_core::middleware::own_enter(own_nr, own_args) } else { None };
     crate::smp::enter();
     el0_sync_locked(f);
     crate::smp::leave();
-    #[cfg(feature = "middleware")]
-    akuma_tokio_kernel_core::middleware::own_leave(own, own_nr, own_args, f.x[0]);
 }
 
 fn el0_sync_locked(f: &mut Frame) {

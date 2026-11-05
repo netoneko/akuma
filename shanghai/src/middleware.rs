@@ -2,34 +2,23 @@
 //! Shanghai's sample syscall middleware (B22; guide: `crates/akuma-tokio-kernel-core/docs/middleware.md`). Built only with
 //! `--features middleware`; the default Shanghai has none of it.
 //!
-//! One table, three tiers, each demonstrated by one entry. `mwprobe` (`shanghai/mwprobe/mwprobe.rs`) is the
+//! One table, two tiers and an exec policy, each demonstrated by one entry. `mwprobe` (`shanghai/mwprobe/mwprobe.rs`) is the
 //! guest-side check and `shanghai/mw_gate.sh` boots it.
 //!
 //! | what | tier | call |
 //! |---|---|---|
 //! | `hello`: answers 42 | `fallback` | 1000 |
 //! | `whoami`: writes the caller's pid to `*arg0` (or `-EFAULT`) | `fallback` | 1001 |
-//! | how many `getpid`s the `own` tier saw before / after the lock | `fallback` | 1002 / 1003 |
 //! | refuse `open("/mw-deny")` with `EACCES`; log any other `/mw-*` path | `kernel_pre` | `openat` |
 //! | with `--features no-dynamic-loading` only: no dynamic loading (file `PROT_EXEC` mmap, `mprotect(+X)`, `LD_*` in an `execve` env), see the `akuma-mw-no-dynamic-loading` crate | `kernel_pre` | `mmap` / `mprotect` / `execve` |
-//! | count `getpid`, outside the kernel lock (a split read-modify-write on the state, so a lost update shows) | `own_pre` / `own_post` | `getpid` |
-//! | publish the `own` state when a `getppid` passes; read it back | `own_post` / `fallback` | `getppid` / 1005 |
 
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use akuma_primitives::OnceCopy;
 use akuma_tokio_kernel::middleware::{CUSTOM_BASE, Hooks, Middleware, On, ParamSource, Params, Route, Syscall, Verdict};
 
-/// `getpid`s the `own_pre` hook saw.
-static GETPID_PRE: AtomicU64 = AtomicU64::new(0);
-/// `getpid`s the `own_post` hook saw (the `own` state counts the same thing, under its autolock).
-static GETPID_POST: AtomicU64 = AtomicU64::new(0);
-
 const EACCES: i32 = 13;
 const EFAULT_RET: u64 = (-14i64) as u64;
-
-/// The `own` state as of the last `getppid`, for the probe to compare with [`GETPID_PRE`].
-static STATE_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
 
 /// An extra path to refuse, from the command line (`mw.sample.also=/path`), set once by [`init`]. Unset: none.
 static ALSO: OnceCopy<&'static str> = OnceCopy::new();
@@ -40,7 +29,7 @@ static PARAMS_SEEN: AtomicU64 = AtomicU64::new(0);
 
 /// [`Hooks::init`]: read this middleware's parameters, once, at boot. The view is already narrowed to `mw.`; this table narrows it
 /// again to `mw.sample.`, which is all it reads.
-fn init(params: &Params<'static>, _state: &mut u64) {
+fn init(params: &Params<'static>) {
     let mine = params.scoped("sample.");
     let mut seen = 0;
     if let Some(path) = mine.value("also") {
@@ -110,7 +99,7 @@ const SIDECAR: Option<&str> = Some(".sig");
 const SIDECAR: Option<&str> = None;
 
 /// The table the kernel registers.
-pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
+pub static MW: Middleware = Middleware::new(Hooks {
     fallback: &[
         Route::new(&[On::Nr(CUSTOM_BASE)], |_| Some(42)),
         Route::new(&[On::Nr(CUSTOM_BASE + 1)], |ctx| {
@@ -119,9 +108,6 @@ pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
                 Err(_) => EFAULT_RET,
             })
         }),
-        Route::new(&[On::Nr(CUSTOM_BASE + 2)], |_| Some(GETPID_PRE.load(Relaxed))),
-        Route::new(&[On::Nr(CUSTOM_BASE + 3)], |_| Some(GETPID_POST.load(Relaxed))),
-        Route::new(&[On::Nr(CUSTOM_BASE + 5)], |_| Some(STATE_SNAPSHOT.load(Relaxed))),
         Route::new(&[On::Nr(CUSTOM_BASE + 6)], |_| Some(PARAMS_SEEN.load(Relaxed))),
     ],
     kernel_pre: &[
@@ -130,20 +116,6 @@ pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
         // the exec policy (`EXEC` below): one `match` over every way code arrives.
         #[cfg(feature = "no-dynamic-loading")]
         Route::new(&[On::Call(Syscall::Execve)], akuma_mw_no_dynamic_loading::exec_guard),
-    ],
-    own_pre: &[Route::new(&[On::Call(Syscall::Getpid)], |ctx| {
-        // Deliberately not `+= 1`: with the load and the store apart, two cores in here at once would lose an
-        // update. The autolock is what makes `state` equal the atomic count below.
-        let v = *ctx.state;
-        core::hint::spin_loop();
-        *ctx.state = v + 1;
-        GETPID_PRE.fetch_add(1, Relaxed);
-    })],
-    own_post: &[
-        Route::new(&[On::Call(Syscall::Getpid)], |_, _| {
-            GETPID_POST.fetch_add(1, Relaxed);
-        }),
-        Route::new(&[On::Call(Syscall::Getppid)], |ctx, _| STATE_SNAPSHOT.store(*ctx.state, Relaxed)),
     ],
     exec: EXEC,
     init: Some(init),

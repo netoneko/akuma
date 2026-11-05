@@ -22,7 +22,7 @@ disk = ["shmpages", "dep:akuma-fpcache"]
 # The socket layer (`net`): `akuma-net`'s runtime table, the poll pump, the DHCP wait.
 net = ["dep:akuma-net"]
 # Syscall middleware (`middleware`, B22): one optional table of hooks around dispatch. Off by default.
-middleware = ["dep:akuma-syscalls-abi", "dep:spinning_top"]
+middleware = ["dep:akuma-syscalls-abi"]
 # Build-time ban on dynamically linked images: `akuma-elf-exec`'s `refuse-dynamic` (`program()` says `ExecErr::Dynamic`, whose errno is
 # EPERM) and the loader's mapping of it. No middleware, no hook, no dispatch arm. Off by default; images only (see `ExecErr::Dynamic`).
 refuse-dynamic-elf = ["akuma-elf-exec?/refuse-dynamic"]
