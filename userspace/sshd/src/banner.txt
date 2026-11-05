@@ -17,7 +17,7 @@
 ==================================================
  ###### Welcome to Akuma SSH Server ######
 
- part of Akuma Bohemian Operating System
+ part of Akuma Bohemian System Demon
  https://github.com/netoneko/akuma
 
  now with sick beats by Tokyo Rider
