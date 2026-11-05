@@ -32,6 +32,9 @@ trace-err = ["akuma-tokio-kernel-amd64/trace-err", "akuma-tokio-kernel-aarch64/t
 # The PMM's use-after-free instruments: quarantine, premature-free check, CoW ledger (amd64).
 pmm-forensics = ["akuma-tokio-kernel-amd64/pmm-forensics"]
 
+# Refuse every dynamically linked image at build time, with EPERM: the elf crate says no, so there is no hook and no dispatch arm.
+# Independent of `middleware`. Images only (execve, a `#!` interpreter, init); off by default.
+refuse-dynamic-elf = ["akuma-tokio-kernel-amd64/refuse-dynamic-elf", "akuma-tokio-kernel-aarch64/refuse-dynamic-elf"]
 # Syscall middleware (`Kernel::middleware`, `akuma_tokio_kernel::middleware`, B22). Off by default.
 middleware = ["akuma-tokio-kernel-amd64/middleware", "akuma-tokio-kernel-aarch64/middleware", "dep:akuma-tokio-kernel-core"]
 

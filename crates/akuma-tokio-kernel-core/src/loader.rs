@@ -233,6 +233,17 @@ pub enum LoadError {
 /// # Errors
 /// [`LoadError::Refused`] when the policy said no; [`LoadError::NoMem`] for every other failure.
 pub fn load_task<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Result<TaskImage, LoadError> {
+    // The elf crate's own build-time refusal (`refuse-dynamic`: a dynamically linked image, EPERM). No hook is involved: the crate
+    // says no, and this only turns its answer into the errno. Without the feature `program()` never says it, so the scan is skipped.
+    #[cfg(feature = "refuse-dynamic-elf")]
+    {
+        let mut segs = [LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 16];
+        if let Err(e) = akuma_elf_exec::program(image, &mut segs)
+            && let Some(no) = e.errno()
+        {
+            return Err(LoadError::Refused(no));
+        }
+    }
     #[cfg(feature = "middleware")]
     {
         let interp = akuma_elf_exec::interp_path(image).ok().flatten().and_then(|b| core::str::from_utf8(b).ok());

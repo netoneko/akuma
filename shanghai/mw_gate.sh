@@ -106,11 +106,15 @@ for arch in x86_64 aarch64; do
   stage mw "$tgt" "$arch"
   cargo build -p shanghai --features no-dynamic-loading --target "$tgt" --release
   stage nodl "$tgt" "$arch"
+  cargo build -p shanghai --features no-dynamic-elf --target "$tgt" --release
+  stage dynelf "$tgt" "$arch"
   # Three kernels per machine: stock (the control), the sample table alone (the no-dynamic-loading guards must be ABSENT:
   # they are a feature, off by default), and the sample table with --features no-dynamic-loading (initargs=nodl: they must be ON).
   "run_$arch" control "$W/plain-$arch" 'CONTROL PASS' || rc=1
   "run_$arch" middleware "$W/mw-$arch" 'PASS' || rc=1
   "run_$arch" no-dynamic-loading "$W/nodl-$arch" 'PASS' nodl || rc=1
+  # And the build-time ban in the elf crate (--features no-dynamic-elf, NO middleware): dynamic images refused with EPERM, scope pinned.
+  "run_$arch" no-dynamic-elf "$W/dynelf-$arch" 'DYNELF PASS' dynelf || rc=1
 done
 [ $rc -eq 0 ] && echo "MW GATE PASS ($WHICH, smp=$SMP)" || echo "MW GATE FAIL ($WHICH, smp=$SMP)"
 exit $rc

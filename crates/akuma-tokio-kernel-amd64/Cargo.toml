@@ -25,6 +25,8 @@ pmm-forensics = []
 shell = ["akuma-runtime-tokio/shell"]
 # Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.
 middleware = ["akuma-tokio-kernel-core/middleware"]
+# Refuse every dynamically linked image at build time, EPERM (`akuma-elf-exec`'s `refuse-dynamic`). Off by default.
+refuse-dynamic-elf = ["akuma-tokio-kernel-core/refuse-dynamic-elf"]
 # The default devices, each wired by its `Kernel` method (`console()`, `disk()`, `net()`, `smp()`).
 # COM1.
 console = ["dep:akuma-comconsole"]

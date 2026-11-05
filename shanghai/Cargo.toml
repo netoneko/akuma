@@ -12,6 +12,9 @@ middleware = ["akuma-tokio-kernel/middleware", "dep:akuma-primitives"]
 # The "no dynamic loading" demo (`src/nodl.rs`): refuse a file-backed PROT_EXEC mmap, mprotect(+X) and an execve with an LD_*
 # variable. Implies `middleware` (it is three hooks in the sample table) and is off by default, with or without `middleware`.
 no-dynamic-loading = ["middleware"]
+# The build-time alternative: the elf crate refuses every dynamically linked image with EPERM. No middleware, no hook, no dispatch arm;
+# covers images only (not a mapping made by hand). Off by default, independent of the two above.
+no-dynamic-elf = ["akuma-tokio-kernel/refuse-dynamic-elf"]
 
 [dependencies]
 akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel", features = ["no-tests"] }

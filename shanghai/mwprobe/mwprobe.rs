@@ -159,6 +159,10 @@ fn main() {
         println!("MWPROBE kid pid={} load attempts allowed={n}", std::process::id());
         std::process::exit(i32::from(n != 0));
     }
+    if args.get(1).map(String::as_str) == Some("noop") {
+        println!("MWPROBE noop child ran");
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("child") {
         println!("PASS execve with a clean environment is allowed (the new image ran)");
         let failed: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -168,6 +172,9 @@ fn main() {
     // `nodl` (the gate's `initargs=nodl`): this kernel was built with `--features no-dynamic-loading`, so the guards must be on.
     // Without it they must be absent: a build that silently lacks them, or has them when it should not, fails the gate.
     let nodl = args.get(1).map(String::as_str) == Some("nodl");
+    // `dynelf` (`initargs=dynelf`): the kernel was built with only `--features no-dynamic-elf`, so there is NO middleware and the elf crate
+    // refuses dynamic images with EPERM. That is a different expectation from both "stock" and "nodl", so it is its own branch.
+    let dynelf = args.get(1).map(String::as_str) == Some("dynelf");
     let fails = std::cell::Cell::new(0);
     let check = |name: &str, got: i64, want: i64| {
         let ok = got == want;
@@ -178,6 +185,31 @@ fn main() {
     };
 
     let hello = sc(1000, [0; 4]);
+    if hello == ENOSYS && dynelf {
+        // Build-time ban in the elf crate: images only, EPERM, nothing else changed.
+        check("A1 execve of a dynamic program with an extra library (xz) is refused with EPERM", i64::from(spawn_errno("/usr/bin/xz", &["--version"]) == Some(1)), 1);
+        check("A2 execve of a dynamic program with only libc (busybox) is refused with EPERM", i64::from(spawn_errno("/bin/busybox", &["true"]) == Some(1)), 1);
+        let script = "/tmp/dyn.sh";
+        let _ = std::fs::write(script, "#!/bin/busybox sh\ntrue\n");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755));
+        }
+        check("C  a #! script with a dynamic interpreter is refused with EPERM", i64::from(spawn_errno(script, &[]) == Some(1)), 1);
+        let noop = std::process::Command::new("/bin/mwprobe").arg("noop").env_clear().status();
+        check("H  a static child still runs", i64::from(matches!(&noop, Ok(s) if s.success())), 1);
+        // The scope, pinned: this feature refuses IMAGES. A kernel with no mapping policy still lets a program map a file executable
+        // by hand, so the loader run directly (it has no interpreter of its own) still loads a dynamic program. Closing that is the
+        // exec policy's job (`no-dynamic-loading`), not this feature's; if it ever closes, these two lines fail and say so.
+        let (ok, out) = run_dynamic(LOADER, "/bin/busybox");
+        println!("MWPROBE loader-direct: ok={ok} output={out}");
+        check("B  (scope, pinned) the loader run directly still loads a dynamic program: images only", i64::from(ok), 1);
+        let fd = open("/bin/mwprobe");
+        let file_exec = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd as u64, 0]);
+        check("D1 (scope, pinned) mmap(file, PROT_EXEC) is still allowed: no mapping policy in this build", i64::from(file_exec > 0), 1);
+        println!("MWPROBE RESULT DYNELF {}", if fails.get() == 0 { "PASS" } else { "FAIL" });
+        return;
+    }
     if hello == ENOSYS {
         // The control: a kernel with no middleware. Every call the middleware would touch must behave as stock.
         println!("MWPROBE no middleware registered (1000 -> ENOSYS); checking the stock behaviour");

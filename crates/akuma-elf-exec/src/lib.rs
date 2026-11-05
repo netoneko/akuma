@@ -31,6 +31,12 @@
 //! cross. Every effect — page tables, file reads, stack layout, auxv *table*
 //! shapes — stays with the caller. `#![forbid(unsafe_code)]` and zero
 //! dependencies: the decisions are slices and integers, testable on the host.
+//!
+//! # The `refuse-dynamic` feature
+//!
+//! Off by default. With it, [`program`] returns [`ExecErr::Dynamic`] for every image that names an interpreter, and
+//! [`ExecErr::errno`] says `EPERM` for it. A build-time ban on dynamically linked programs with no hook and no runtime switch: it
+//! covers *images* (`execve`, a `#!` interpreter, init) and nothing else, so a program that maps a library by hand still can.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -77,6 +83,25 @@ pub enum ExecErr {
     SegmentBounds,
     /// A program with no `PT_LOAD` at all: nothing to enter.
     NoSegments,
+    /// A dynamically linked image (it names an interpreter), refused because this crate was built with the `refuse-dynamic` feature.
+    /// Never produced without it. See [`ExecErr::errno`].
+    ///
+    /// The refusal is of the *image*: `execve`, a `#!` script's interpreter, init. It is not a sandbox. A kernel that maps a file
+    /// `PROT_EXEC` on request still lets a program do that by hand (for example `ld-musl <binary>`, which has no interpreter of its
+    /// own); closing that is a mapping policy, not this feature.
+    Dynamic,
+}
+
+impl ExecErr {
+    /// The positive errno a caller should hand back for this refusal, if it has one of its own. Only [`ExecErr::Dynamic`] does
+    /// (`EPERM`, 1); the rest are a malformed image, which each caller already maps as it chooses.
+    #[must_use]
+    pub const fn errno(self) -> Option<u64> {
+        match self {
+            Self::Dynamic => Some(1),
+            _ => None,
+        }
+    }
 }
 
 /// The `PT_INTERP` segment type.
@@ -279,6 +304,12 @@ pub struct Program {
 /// [`ExecErr::NoEntry`].
 pub fn program(image: &[u8], out: &mut [LoadSeg]) -> Result<(Program, usize), ExecErr> {
     let (e_entry, phoff, _, phnum) = header(image)?;
+    // The build-time policy: no dynamically linked image, whatever the caller. Decided before a segment is looked at. The static-PIE
+    // one-NUL `PT_INTERP` is not an interpreter (`interp_path` says `None`), so it stays allowed.
+    #[cfg(feature = "refuse-dynamic")]
+    if interp_path(image)?.is_some() {
+        return Err(ExecErr::Dynamic);
+    }
     // `header` accepted the type, so it is `ET_EXEC` (2) or `ET_DYN` (3).
     let base = if rd16(image, 16) == Some(3) { PIE_BASE } else { 0 };
     let n = load_segments(image, base, out)?;
@@ -360,6 +391,51 @@ mod tests {
         let mut buf = [0u8; 256];
         let n = elf(&mut buf, 2, 0x40_1000, &[(PT_LOAD, 0, 0x1000, 0x40_0000, 5, 0x1000)]);
         assert_eq!(interp_path(&buf[..n]), Ok(None));
+    }
+
+    /// A dynamic image: an `ET_DYN` with a `PT_LOAD` and a real `PT_INTERP` path.
+    fn dynamic_image(buf: &mut [u8]) -> usize {
+        let n = elf(buf, 3, 0x1000, &[(PT_LOAD, 0, 0x2f0, 0, 5, 0x400), (PT_INTERP, 0x300, 13, 0, 4, 13)]);
+        buf[0x300..0x30d].copy_from_slice(b"/lib/ld.so.1\0");
+        n.max(0x310)
+    }
+
+    #[cfg(not(feature = "refuse-dynamic"))]
+    #[test]
+    fn a_dynamic_image_is_accepted_by_default() {
+        let mut buf = [0u8; 1024];
+        let n = dynamic_image(&mut buf);
+        let mut out = [LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 4];
+        assert!(program(&buf[..n], &mut out).is_ok());
+        assert_eq!(interp_path(&buf[..n]), Ok(Some(&b"/lib/ld.so.1"[..])));
+    }
+
+    #[cfg(feature = "refuse-dynamic")]
+    #[test]
+    fn a_dynamic_image_is_refused_with_eperm_and_a_static_one_is_not() {
+        let mut out = [LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 4];
+        // Dynamic: refused, with EPERM.
+        let mut buf = [0u8; 1024];
+        let n = dynamic_image(&mut buf);
+        let err = program(&buf[..n], &mut out).unwrap_err();
+        assert_eq!(err, ExecErr::Dynamic);
+        assert_eq!(err.errno(), Some(1));
+        // Static ET_EXEC: allowed.
+        let mut st = [0u8; 256];
+        elf(&mut st, 2, 0x40_1000, &[(PT_LOAD, 0, 0x80, 0x40_0000, 5, 0x1000)]);
+        assert!(program(&st, &mut out).is_ok());
+        // Static-PIE: its one-NUL PT_INTERP names nothing, so it is allowed too.
+        let mut sp = [0u8; 1024];
+        elf(&mut sp, 3, 0x1000_1000, &[(PT_LOAD, 0, 0x100, 0, 5, 0x1000), (PT_INTERP, 0x200, 1, 0, 4, 1)]);
+        assert!(program(&sp, &mut out).is_ok());
+    }
+
+    #[test]
+    fn only_dynamic_has_an_errno_of_its_own() {
+        assert_eq!(ExecErr::Dynamic.errno(), Some(1));
+        for e in [ExecErr::Magic, ExecErr::NotElf64Le, ExecErr::NotExec, ExecErr::PhdrTable, ExecErr::NoEntry, ExecErr::TooManySegments, ExecErr::SegmentBounds, ExecErr::NoSegments] {
+            assert_eq!(e.errno(), None);
+        }
     }
 
     #[test]
