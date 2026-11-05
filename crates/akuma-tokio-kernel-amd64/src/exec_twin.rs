@@ -336,6 +336,8 @@ fn exec_runtime() -> ExecRuntime {
         // No mount table yet: no `(mount id, inode)` pair to give. A stub, as
         // the plan's table says — reached only by `ElfSource::Path` (slice 3).
         resolve_file_id: |_path| Err(-1),
+        // The tokio kernels keep the executable's mark in the task record (`loader::read_image_pinned`), not in `Process`.
+        text_pin: |_| Ok(akuma_primitives::TextPin::none()),
         // stat sizes live in this kernel's own stat arms, not behind a
         // one-path helper; unwired until a consumer exists (slice 3).
         file_size: |_path| Err("taoxichuan: file_size not wired (unreachable until fork_process)"),

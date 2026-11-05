@@ -868,6 +868,12 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     if let Err(e) = super::perm::check(&resolved_path, akuma_isolation::dac::MAY_EXEC) {
         return e;
     }
+    // Mark the file as being executed BEFORE its bytes are read, so it cannot be rewritten between the read and the mark (`ETXTBSY`,
+    // `docs/archive/ETXTBSY_TEXT_BUSY.md`). It must reach `Process::set_text` or be dropped before the `eret` below: this frame is
+    // abandoned on success, and a pin left in it would keep the file busy forever.
+    let Ok(text) = akuma_vfs_glue::text_pin(&resolved_path) else {
+        return ENOMEM;
+    };
     // On the size profile the heap seed is 1 MB. Reading a large binary
     // (e.g. the 700+ KB system linker that tcc invokes) would exhaust it.
     // Read just the first 256 bytes — enough for shebang detection — and
@@ -929,6 +935,8 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         // argv) BEFORE recursing into do_execve — the inner exec's eret abandons
         // every frame below it, so nothing big may still be owned here.
         let data = file_data.take().unwrap_or_default();
+        // The script is data; its interpreter is what runs, and the recursion marks that.
+        drop(text);
         return exec_shebang(resolved_path, data, args, env);
     }
 
@@ -994,6 +1002,8 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     {
         proc.image.lock().exe.clone_from(&resolved_path);
     }
+    // The new image's executable is busy for as long as it runs (the old image's mark is released).
+    proc.set_text(text);
 
     // Image replacement committed — *now* close the close-on-exec descriptors.
     // This is the POSIX "point of no return": a successful execve closes every

@@ -111,6 +111,12 @@ pub struct ExecRuntime {
     /// into silent zeros (`[FILL-SHORT/prefault]`, the self-host ICE).
     pub read_at_by_inode: fn(&str, u32, usize, &mut [u8]) -> Result<usize, i32>,
 
+    /// Mark the file at `path` as being executed (`akuma_primitives::text_busy`, `ETXTBSY`), to be taken **before** its bytes are read and
+    /// moved into the new process with `Process::set_text`. An inert pin for a path with no trackable identity.
+    /// `Err(())`: the table of executing files is full; refuse the spawn.
+    #[allow(clippy::type_complexity, clippy::result_unit_err)]
+    pub text_pin: fn(&str) -> Result<akuma_primitives::TextPin, ()>,
+
     // Process exit hook (e.g. socket cleanup)
     pub on_process_exit: fn(u32),
 

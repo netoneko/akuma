@@ -40,6 +40,8 @@ fn exec_runtime() -> ExecRuntime {
         },
         resolve_symlinks: akuma_vfs_glue::resolve_symlinks,
         resolve_file_id: |path| akuma_vfs_glue::resolve_file_id(path).ok_or(-1),
+        // The tokio kernels keep the executable's mark in the task record (`loader::read_image_pinned`), not in `Process`.
+        text_pin: |_| Ok(akuma_primitives::TextPin::none()),
         file_size: |path| akuma_vfs_glue::file_size(path).map_err(|_| "file_size: not found"),
         // glue's tables, as on amd64.
         pipe_close_write: akuma_syscalls_glue::pipe::pipe_close_write,

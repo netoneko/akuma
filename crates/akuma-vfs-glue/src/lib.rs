@@ -630,6 +630,21 @@ pub fn file_identity(path: &str) -> Option<(u32, u32)> {
     }
 }
 
+/// Mark the file at `path` as being executed (`akuma_primitives::text_busy`), to be taken **before** its bytes are read.
+///
+/// An inert pin for a path with no trackable identity (procfs, the memory filesystem, a missing file): there is nothing to protect, and
+/// the read that follows reports the real error.
+///
+/// # Errors
+/// `Err(())` when the table of executing files is full: refuse the `execve`.
+#[allow(clippy::result_unit_err)]
+pub fn text_pin(path: &str) -> Result<akuma_primitives::TextPin, ()> {
+    match file_identity(path) {
+        Some((fs, inode)) => akuma_primitives::TextPin::try_new(fs, inode).ok_or(()),
+        None => Ok(akuma_primitives::TextPin::none()),
+    }
+}
+
 /// The filesystem an fd (or a mapping) captured, found by the mount id it stored.
 ///
 /// Searched in the same order [`resolve_mount`] searches for a path — spawn

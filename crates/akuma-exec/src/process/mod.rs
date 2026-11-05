@@ -712,6 +712,12 @@ pub struct ProcessImage {
     /// The register state the *first* entry to EL0 `eret`s into. `Copy`, so
     /// readers take it out by value and drop the guard before the `eret`.
     pub context: UserContext,
+    /// Marks [`Self::exe`]'s file as being executed, so the filesystem refuses to change its data (`ETXTBSY`,
+    /// `akuma_primitives::text_busy`, `docs/archive/ETXTBSY_TEXT_BUSY.md`). Taken **before** the image is read, moved in by
+    /// [`Process::set_text`] once an image is installed (`execve`, spawn), cloned for a fork/vfork/thread child
+    /// ([`Process::inherit_from`]), and released when the process exits ([`Process::release_text`], from `publish_child_exit`) rather than
+    /// when its `Process` is finally dropped after `wait4`. An inert pin for a process with no executable on a tracked filesystem.
+    pub text: akuma_primitives::TextPin,
 }
 
 /// A user process
@@ -1034,6 +1040,8 @@ impl Process {
                     exe: pimg.exe.clone(),
                     args: pimg.args.clone(),
                     context: UserContext::default(),
+                    // The child runs the parent's image until it execs (a thread, for good): it holds the same executable busy.
+                    text: pimg.text.clone(),
                 }
             }),
             exited: AtomicBool::new(false),
@@ -1371,6 +1379,20 @@ impl Process {
         self.stdout.lock().clear();
         self.exited.store(false, Ordering::Relaxed);
         self.exit_code.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Process {
+    /// This process's executable is the one `pin` marks: hold it for as long as the image runs. The previous pin (the image this one
+    /// replaces) is released, after the image lock is dropped.
+    pub fn set_text(&self, pin: akuma_primitives::TextPin) {
+        let old = core::mem::replace(&mut self.image.lock().text, pin);
+        drop(old);
+    }
+
+    /// The process no longer executes its image (it exited): the file may be changed again. Idempotent.
+    pub fn release_text(&self) {
+        self.set_text(akuma_primitives::TextPin::none());
     }
 }
 
@@ -4110,6 +4132,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         image: Spinlock::new(ProcessImage {
             name: "test".to_string(),
             exe: "test".to_string(),
+            text: akuma_primitives::TextPin::none(),
             args: Vec::new(),
             context: UserContext::new(0, 0),
         }),

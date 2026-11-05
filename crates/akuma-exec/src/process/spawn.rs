@@ -347,6 +347,14 @@ pub fn spawn_process_with_creds(
     const HEAP_SLURP_MAX: usize = 0;
     #[cfg(not(kernel_profile_extreme))]
     const HEAP_SLURP_MAX: usize = 1024 * 1024; // 1 MiB
+    // Marked as being executed BEFORE the file is read or stat'ed for loading (`ETXTBSY`), inside the namespace override the read uses.
+    let text = match (runtime().text_pin)(elf_path) {
+        Ok(pin) => pin,
+        Err(()) => {
+            if use_ns_override { (runtime().clear_spawn_namespace)(); }
+            return Err(format!("Too many programs are running to mark {elf_path} as being executed"));
+        }
+    };
     let stat_size = (runtime().file_size)(elf_path).ok().map(|s| s as usize);
 
     // Pick the loader. Prefer the demand-paged path loader whenever slurping is
@@ -399,6 +407,8 @@ pub fn spawn_process_with_creds(
     };
     crate::mmu::as_trace(format_args!("[AS-NEW] pid={} l0=0x{:x} asid=0x{:x} via=spawn\n",
         process.pid, process.address_space.l0_phys(), process.address_space.asid()));
+    // The image just loaded: its executable is busy until the process exits.
+    process.set_text(text);
 
     // Always create a fresh channel per spawned process.
     // Reusing the parent's channel would cause the child's set_exited() call

@@ -92,6 +92,7 @@ pub fn ensure_test_runtime() {
         read_file: |_| Err(0),
         read_at: |_, _, _| Err(0),
         resolve_file_id: |_| Err(0),
+        text_pin: |_| Ok(akuma_primitives::TextPin::none()),
         read_at_by_inode: |_, _, _, _| Err(0),
         on_process_exit: |_| {},
         remove_socket: |_| {},

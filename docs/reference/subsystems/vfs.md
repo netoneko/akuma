@@ -273,8 +273,8 @@ umount2".
 - **A file being executed cannot have its data changed (`ETXTBSY`).** `akuma-ext2` refuses every write, truncate and fallocate of an inode
   that `akuma_primitives::text_busy` marks busy, by `(Filesystem::identity, inode)`, so a descriptor opened for writing before the exec is stopped too; `openat`
   refuses `O_WRONLY`/`O_RDWR`/`O_TRUNC` on it. Unlink and rename-over stay allowed. A process holds the mark (`TextPin`) from before its
-  image is read until it exits. **Only the tokio kernels (Shanghai, Taoxichuan) take the pin; the Akuma main kernels do not yet**, so
-  there nothing is ever busy: [`../../archive/ETXTBSY_TEXT_BUSY.md`](../../archive/ETXTBSY_TEXT_BUSY.md).
+  image is read until it exits (`Process::set_text`/`release_text` on the Akuma kernels, the task record on the tokio kernels):
+  [`../../archive/ETXTBSY_TEXT_BUSY.md`](../../archive/ETXTBSY_TEXT_BUSY.md).
 
 ## procfs
 

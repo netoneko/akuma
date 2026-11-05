@@ -147,6 +147,9 @@ pub fn raise_sigchld_for_parent(child_pid: Pid, exit_code: i32) {
 /// re-poll with `WNOHANG` and get `ECHILD`/0) but would confuse a
 /// signal-counting handler, so the guard is worth keeping.
 pub fn publish_child_exit(child_pid: Pid, exit_code: i32) {
+    // The process is done executing its image (this helper is every exit site's one route): lift `ETXTBSY` on its executable now, not
+    // when the zombie is reaped, which may be much later and which a still-running parent can postpone indefinitely.
+    let _ = super::table::with_process(child_pid, |p| p.release_text());
     let published = match get_child_channel(child_pid) {
         Some(ch) if !ch.has_exited() => {
             // Before `set_exited`: the parent's `wait4` reads this as soon as it

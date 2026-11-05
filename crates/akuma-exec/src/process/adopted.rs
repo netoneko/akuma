@@ -51,6 +51,7 @@ impl Process {
                 exe: String::from(name),
                 args: Vec::new(),
                 context: UserContext::new(entry, sp),
+                text: akuma_primitives::TextPin::none(),
             }),
             cwd: String::from("/"),
             root: String::from("/"),

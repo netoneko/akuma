@@ -458,6 +458,7 @@ fn runtime() -> ExecRuntime {
         // (`AKUMA_AMD64_BOX_SPAWN_EXT.md`) — nothing on this target had ever
         // reached this hook before.
         resolve_file_id: |path| bkl_free_io(|| akuma_vfs_glue::resolve_file_id(path).ok_or(-1)),
+        text_pin: akuma_vfs_glue::text_pin,
         read_at_by_inode: |path, inode, off, buf| {
             bkl_free_io(|| akuma_vfs_glue::read_at_by_inode(path, inode, off, buf).map_err(|_| -1))
         },

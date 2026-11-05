@@ -56,8 +56,10 @@ arrives during the wait is taken once the core owns the lock, where its `enter` 
   wedge, so this document does **not** claim ETXTBSY introduced it or that it was latent. The mechanism needs no ETXTBSY code; it needs a
   tick to land in a wait, and the new exec/exit work may only have made that window easier to hit. Running the baseline under the same
   stress would settle it.
-- **`akuma-bkl` (the main kernels' lock) was not examined.** It is a different implementation. If it takes a ticket with interrupts
-  enabled it has the same shape; its own `[BKL] stuck: owner=` storms in `docs/archive/` may be this.
+- **`akuma-bkl` (the main kernels' lock) was examined: it already masks interrupts across the ticket wait,** with a re-check after masking
+  (`KernelLock::acquire`), so it cannot take this deadlock. Its source also records a rare leaked ticket (`owner == 0`,
+  `next_ticket == now_serving + 5`, four cores spinning) whose root cause it calls "not yet pinned"; the signature matches what a stranded
+  suspended wait looks like, but nothing here shows that is the cause there.
 - aarch64 got the same fix but never showed the wedge.
 
 ## Background

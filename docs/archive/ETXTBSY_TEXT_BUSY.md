@@ -1,7 +1,7 @@
 # `ETXTBSY`: a file being executed cannot have its data changed (2026-11-05)
 
-**Status: done for the tokio-kernel family (Shanghai, Taoxichuan), amd64 and aarch64, gated. NOT done for the two Akuma main kernels
-(`src/` aarch64, `amd64/`).** Those are the larger half of "every kernel"; see "Open" for exactly what is missing.
+**Status: done and verified on all four kernels:** the tokio-kernel family (Shanghai, Taoxichuan) on amd64 and aarch64 through the gate, and the
+two Akuma main kernels (`src/` aarch64, `amd64/`) by booting each and running the probe's `txtbusy` mode (below).
 
 ## Why
 
@@ -34,6 +34,31 @@ Linux refuses the write (`ETXTBSY`, "Text file busy"); this kernel had no such r
   a fork child in `bind_child_task`, released in `zombie_root` (the one idempotent point both the normal exit and the signal-kill purge
   hook reach), and for init by the machines' init spawn. A `#!` script's own file is data and is not pinned, its interpreter is; a dynamic
   image's loader gets `Task::interp`.
+
+## The Akuma main kernels (added the same day)
+
+The filesystem check, `FsError::TextBusy`, `Filesystem::identity` and the `openat` refusal are shared, so what these kernels needed was the pin.
+It lives in `akuma_exec::process::ProcessImage::text` (lock-protected, next to `exe`, which has the same lifecycle):
+
+- **Taken before the read, moved in after the install.** aarch64 `do_execve` (`akuma-syscalls-glue`) and amd64 `do_execve` (`amd64/src/usermode.rs`)
+  call `akuma_vfs_glue::text_pin(path)` right after the execute-permission check and hand it to `Process::set_text` once the image is
+  installed. **On success both functions `eret`/abandon their frame, so a pin left in a local would be permanent**: the shebang branch drops it
+  explicitly (the script is data; the recursion pins the interpreter) and the success path moves it into the process.
+- **Spawn:** `spawn_process_with_channel_ext` takes it through a new `ExecRuntime::text_pin` hook (the two main kernels register
+  `akuma_vfs_glue::text_pin`; the tokio kernels and the tests register an inert one, since their mark lives in the task record).
+- **Fork, vfork, thread:** `Process::inherit_from` (the one constructor behind all three) clones the pin.
+- **Exit:** `publish_child_exit`, the helper every exit site routes through, calls `Process::release_text`, so the file is writable again when
+  the process exits, not when a `wait4` finally reaps the zombie. Dropping the `Process` is the backstop.
+- **Not changed:** `akuma-bkl`, the main kernels' lock. It already masks interrupts across the whole ticket wait, with a re-check after masking,
+  so the nested-ticket deadlock in `TAOXICHUAN_BKL_NESTED_TICKET_DEADLOCK.md` cannot happen there; its own comment records a rare leaked ticket
+  with the same signature (`owner == 0`, `next_ticket == now_serving + 5`, four cores spinning) whose root cause it calls "not yet pinned".
+
+**Verified by booting both and running `/bin/mwprobe txtbusy` (the probe copies itself to `/tmp` and runs the T cases on the copy):**
+`RESULT TXTBUSY PASS`, T-1..T6 all passing, on the aarch64 Akuma kernel (under HVF, with its full boot self-test suite: 166 PASS, 0 FAIL) and on
+the amd64 Akuma kernel (QEMU microvm, TCG). How to repeat: clone `disk.img` (`cp -c`), `debugfs -w` the probe into `/bin`, boot with
+`INSTANCE=9` (snapshotted, ssh on 3122) and `ssh ... /bin/mwprobe txtbusy`; amd64: `DISK=<img> INIT=/bin/mwprobe INITARGS=txtbusy sh amd64/run.sh`.
+The pin-taking sites were each compiled but only these two paths were *exercised* (`execve` and the probe's spawn); the kernel-initiated
+`spawn_process*` route was not given its own probe.
 
 ## Verification
 
@@ -71,15 +96,10 @@ a test for it (`a_busy_inode_on_one_filesystem_does_not_block_the_same_number_on
 
 ## Open
 
-- **The Akuma main kernels have no `ETXTBSY` yet**, although the ext2 check, `FsError::TextBusy` and the glue `openat` check are shared and
-  already active in them: what is missing is **taking the pin**, so for those kernels nothing is ever busy and behaviour is unchanged.
-  The natural place is a `TextPin` in `akuma_exec::process::ProcessImage` (it is lock-protected), set from `Process::install_image` via
-  `ImageInstall`, cloned in `Process::inherit_from` (the one constructor behind fork, vfork and `clone_thread`), taken before the read in
-  aarch64 `sys_execve` and amd64's hand-rolled `sys_execve` (`amd64/src/usermode.rs`), and in `spawn_process*` / `Process::from_elf*`; it
-  must also be released when the process becomes a zombie, not when its `Process` is finally dropped (a zombie waiting for `wait4` would
-  otherwise keep its binary busy). Both load by path on demand (`ImageSource::Path`), so the pin has to be taken before that load starts.
+- On the Akuma main kernels the binaries the kernel starts on its own (init, `herd`) are pinned through the spawn route, which has no probe of its
+  own; the `execve` route does.
 - Only the **root** filesystem's executables are pinned in the tokio kernels (`loader::read_image_pinned` uses `root_fs()`); a binary run
-  from another mount is not marked.
+  from another mount is not marked. The Akuma main kernels resolve the mount from the path, so a binary on any mounted ext2 is marked.
 - A writable `MAP_SHARED` mapping made **before** the exec is not stopped by this (writes go through the mapping, not `write(2)`); a
   signed image is immune (it is mapped from the verified bytes), an unsigned one is not. No probe for it.
 - An executable that is itself a shared library mapped by the dynamic loader is not pinned.

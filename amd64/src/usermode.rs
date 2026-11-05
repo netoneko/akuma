@@ -4670,6 +4670,7 @@ fn register_exec_process(
             // an `execve` rewrites them in this same lock so a re-entry cannot
             // pair a new entry point with an old stack.
             context: UserContext::new(image.entry as usize, image.stack as usize),
+            text: akuma_primitives::TextPin::none(),
         }),
         parent_pid: ppid,
         brk: AtomicUsize::new(image_top as usize),
@@ -5148,6 +5149,13 @@ fn do_execve(
         return e;
     }
 
+    // Mark the file as being executed BEFORE its bytes are read (`ETXTBSY`, `docs/archive/ETXTBSY_TEXT_BUSY.md`), so it cannot be
+    // rewritten between the read and the mark. It must reach `Process::set_text` or be dropped before this function can `eret`: the
+    // frame is abandoned on success, and a pin left in it would keep the file busy forever.
+    let Ok(text) = akuma_vfs_glue::text_pin(&akuma_vfs_glue::resolve_symlinks(&path)) else {
+        return errno::ENOMEM;
+    };
+
     // The image read runs BKL-free per `EXEC_BKL_DROP_ENABLED` — on a USB disk
     // whose transfer stalled, this read is the multi-second BKL hold behind the
     // `[BKL] stuck` storm of 2026-09-11 (`exec_runtime.rs` § "The exec-side
@@ -5213,6 +5221,8 @@ fn do_execve(
             new_argv.extend(argv_owned.into_iter().skip(1));
         }
         drop(path);
+        // The script is data; its interpreter is what runs, and the recursion marks that.
+        drop(text);
 
         return do_execve(slot, interp_path, new_argv, envp_owned);
     }
@@ -5387,6 +5397,8 @@ fn do_execve(
         serial::puts("\n");
         return errno::ENOMEM;
     }
+    // The new image's executable is busy for as long as it runs (the old image's mark is released).
+    proc.set_text(text);
     // `install_image` cleared the region list; the stack's demand-grown part is
     // one region, registered as at first exec (`Image::with_stack`).
     crate::mm::register_lazy_stack(ELF_STACK_TOP, ELF_STACK_PAGES, ELF_STACK_MAX_PAGES);

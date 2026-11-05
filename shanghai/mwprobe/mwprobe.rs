@@ -148,10 +148,9 @@ const ETXTBSY: i32 = 26;
 /// `ETXTBSY`: a file some process is executing cannot have its data changed, by any route; unlinking and renaming over it still work,
 /// and the refusal lifts when the process is gone. Runs `/bin/signed` as a child that waits on its stdin. Destroys `/bin/signed`
 /// (the last step renames another file over it), so it runs after everything else that needs the original.
-fn txtbusy_cycle(check: &dyn Fn(&str, i64, i64)) {
+fn txtbusy_cycle(check: &dyn Fn(&str, i64, i64), path: &str) {
     use std::os::unix::fs::FileExt;
     use std::process::Stdio;
-    let path = "/bin/signed";
     let raw = |e: std::io::Error| e.raw_os_error();
     let ok = |b: bool| i64::from(b);
     // A descriptor opened for writing BEFORE the program runs: Linux would refuse the exec; here the writes through it are refused.
@@ -298,8 +297,25 @@ fn main() {
         });
         // With ETXTBSY the child's own write is refused (the file it runs cannot be changed), so it keeps running either way.
         check("S10 a signed child cannot rewrite the file it runs (ETXTBSY) and keeps running", i64::from(text.contains("survived wrote=false open_errno=Some(26)")), 1);
-        txtbusy_cycle(&check);
+        txtbusy_cycle(&check, "/bin/signed");
         println!("MWPROBE RESULT SIGNED {}", if fails.get() == 0 { "PASS" } else { "FAIL" });
+        return;
+    }
+
+    // `txtbusy` (run by hand on any kernel, e.g. the Akuma main kernels, whose disks carry no /bin/signed): copy this program to /tmp and
+    // run the ETXTBSY cycle on the copy.
+    if args.get(1).map(String::as_str) == Some("txtbusy") {
+        let target = "/tmp/etxtbsy-target";
+        let me = std::env::current_exe().unwrap_or_else(|_| "/bin/mwprobe".into());
+        let _ = std::fs::remove_file(target);
+        let copied = std::fs::copy(&me, target).is_ok();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755));
+        }
+        check("T-1 the probe copied itself to /tmp", i64::from(copied), 1);
+        txtbusy_cycle(&check, target);
+        println!("MWPROBE RESULT TXTBUSY {}", if fails.get() == 0 { "PASS" } else { "FAIL" });
         return;
     }
 
@@ -354,7 +370,7 @@ fn main() {
         let text = out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
         println!("MWPROBE selfclobber (stock): {}", text.trim());
         check("X1 a stock kernel's child cannot rewrite the file it runs either (ETXTBSY) and keeps running", i64::from(text.contains("survived wrote=false open_errno=Some(26)")), 1);
-        txtbusy_cycle(&check);
+        txtbusy_cycle(&check, "/bin/signed");
         println!("MWPROBE RESULT CONTROL {}", if fails.get() == 0 { "PASS" } else { "FAIL" });
         return;
     }

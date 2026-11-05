@@ -456,6 +456,7 @@ impl Process {
                 exe: String::from(name),
                 args: Vec::new(),
                 context: UserContext::new(loaded.entry_point, loaded.sp),
+                text: akuma_primitives::TextPin::none(),
             }),
             parent_pid: 0,
             brk: core::sync::atomic::AtomicUsize::new(loaded.brk),
