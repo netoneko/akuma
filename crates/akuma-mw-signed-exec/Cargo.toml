@@ -8,7 +8,7 @@ description = "Syscall middleware: signed code only. An exec policy that lets an
 workspace = true
 
 [dependencies]
-akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["middleware"] }
+akuma-middleware = { path = "../akuma-middleware" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-ed25519 = { path = "../akuma-ed25519" }
 # SHA-256 of the image. RustCrypto's, like the signature check behind `akuma-ed25519`.

@@ -8,6 +8,8 @@ description = "The arch-neutral half of akuma-tokio-kernel: what a tokio kernel 
 workspace = true
 
 [features]
+# Syscall middleware (`akuma-middleware`, B22): the loader and `mprotect`/`mmap` ask its exec policy. Off by default.
+middleware = ["dep:akuma-middleware"]
 # Writable `MAP_SHARED` file pages over the PMM's share count and glue's write observers
 # (`shmpages`). Off for host tests: it reaches the kernel's PMM and physmap.
 shmpages = ["dep:akuma-fpcache-rw", "dep:akuma-pmm", "dep:akuma-mmu", "dep:akuma-vfs-glue", "dep:spinning_top"]
@@ -21,8 +23,6 @@ process = ["lazy", "dep:akuma-exec", "dep:akuma-threading", "dep:akuma-syscalls-
 disk = ["shmpages", "dep:akuma-fpcache"]
 # The socket layer (`net`): `akuma-net`'s runtime table, the poll pump, the DHCP wait.
 net = ["dep:akuma-net"]
-# Syscall middleware (`middleware`, B22): one optional table of hooks around dispatch. Off by default.
-middleware = ["dep:akuma-syscalls-abi"]
 # Build-time ban on dynamically linked images: `akuma-elf-exec`'s `refuse-dynamic` (`program()` says `ExecErr::Dynamic`, whose errno is
 # EPERM) and the loader's mapping of it. No middleware, no hook, no dispatch arm. Off by default; images only (see `ExecErr::Dynamic`).
 refuse-dynamic-elf = ["akuma-elf-exec?/refuse-dynamic"]
@@ -30,6 +30,7 @@ refuse-dynamic-elf = ["akuma-elf-exec?/refuse-dynamic"]
 trace-err = []
 
 [dependencies]
+akuma-middleware = { path = "../akuma-middleware", optional = true }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-user-layout = { path = "../akuma-user-layout" }
 akuma-fpcache-rw = { path = "../akuma-fpcache-rw", optional = true }
@@ -50,4 +51,3 @@ akuma-threading = { path = "../akuma-threading", features = ["hooked"], optional
 akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, optional = true }
 akuma-syscalls-proc = { path = "../akuma-syscalls-proc", optional = true }
 akuma-net = { path = "../akuma-net", optional = true }
-akuma-syscalls-abi = { path = "../akuma-syscalls-abi", optional = true }

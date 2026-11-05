@@ -12,7 +12,6 @@
 extern crate alloc;
 
 pub mod cmdline;
-pub mod params;
 #[cfg(feature = "lazy")]
 pub mod cow;
 pub mod init;
@@ -30,8 +29,6 @@ pub mod signal;
 pub mod lazy_record;
 #[cfg(feature = "lazy")]
 pub mod mm;
-#[cfg(feature = "middleware")]
-pub mod middleware;
 pub mod mmu;
 pub mod nosys;
 pub mod ring;

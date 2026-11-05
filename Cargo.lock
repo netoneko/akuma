@@ -552,6 +552,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-middleware"
+version = "0.1.0"
+dependencies = [
+ "akuma-params",
+ "akuma-primitives",
+ "akuma-syscalls-abi",
+]
+
+[[package]]
 name = "akuma-mmap"
 version = "0.1.0"
 
@@ -580,8 +589,8 @@ version = "0.1.0"
 name = "akuma-mw-no-dynamic-loading"
 version = "0.1.0"
 dependencies = [
+ "akuma-middleware",
  "akuma-primitives",
- "akuma-tokio-kernel-core",
 ]
 
 [[package]]
@@ -589,8 +598,8 @@ name = "akuma-mw-signed-exec"
 version = "0.1.0"
 dependencies = [
  "akuma-ed25519",
+ "akuma-middleware",
  "akuma-primitives",
- "akuma-tokio-kernel-core",
  "sha2",
 ]
 
@@ -655,6 +664,13 @@ name = "akuma-pagetable"
 version = "0.1.0"
 dependencies = [
  "akuma-pte-amd64",
+]
+
+[[package]]
+name = "akuma-params"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
 ]
 
 [[package]]
@@ -984,9 +1000,9 @@ dependencies = [
 name = "akuma-tokio-kernel"
 version = "0.1.0"
 dependencies = [
+ "akuma-middleware",
  "akuma-tokio-kernel-aarch64",
  "akuma-tokio-kernel-amd64",
- "akuma-tokio-kernel-core",
 ]
 
 [[package]]
@@ -1001,9 +1017,11 @@ dependencies = [
  "akuma-firecracker",
  "akuma-fpcache",
  "akuma-gic",
+ "akuma-middleware",
  "akuma-mmu",
  "akuma-net",
  "akuma-pagetable",
+ "akuma-params",
  "akuma-phys",
  "akuma-pmm",
  "akuma-primitives",
@@ -1044,9 +1062,11 @@ dependencies = [
  "akuma-idt-amd64",
  "akuma-isolation",
  "akuma-lapic-amd64",
+ "akuma-middleware",
  "akuma-mmap",
  "akuma-mmu",
  "akuma-net",
+ "akuma-params",
  "akuma-pmm",
  "akuma-port",
  "akuma-primitives",
@@ -1084,12 +1104,12 @@ dependencies = [
  "akuma-exec",
  "akuma-fpcache",
  "akuma-fpcache-rw",
+ "akuma-middleware",
  "akuma-mmap",
  "akuma-mmu",
  "akuma-net",
  "akuma-pmm",
  "akuma-primitives",
- "akuma-syscalls-abi",
  "akuma-syscalls-glue",
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",

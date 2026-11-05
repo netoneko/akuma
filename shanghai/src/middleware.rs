@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Shanghai's sample syscall middleware (B22; guide: `crates/akuma-tokio-kernel-core/docs/middleware.md`). Built only with
+//! Shanghai's sample syscall middleware (B22; guide: `crates/akuma-middleware/docs/middleware.md`). Built only with
 //! `--features middleware`; the default Shanghai has none of it.
 //!
 //! One table, two tiers and an exec policy, each demonstrated by one entry. `mwprobe` (`shanghai/mwprobe/mwprobe.rs`) is the

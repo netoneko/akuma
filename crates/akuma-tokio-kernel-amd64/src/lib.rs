@@ -109,9 +109,9 @@ fn cmdline(start_info_pa: u64, buf: &mut [u8]) -> &str {
     core::str::from_utf8(&buf[..n]).unwrap_or("")
 }
 
-/// Keep the boot command line, whole, once (`akuma_tokio_kernel_core::params`): a line that does not fit is not kept as a prefix.
+/// Keep the boot command line, whole, once (`akuma_params`): a line that does not fit is not kept as a prefix.
 fn capture_cmdline(start_info_pa: u64) {
-    use akuma_tokio_kernel_core::params::{Failure, capture};
+    use akuma_params::{Failure, capture};
     let r = capture(|buf| {
         let Some(si) = akuma_ryzen_amd64::StartInfo::parse(&Physmap, start_info_pa) else {
             return Ok(0);
@@ -1386,7 +1386,7 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     {
         let nr = fr.rax;
         let args = [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()];
-        akuma_tokio_kernel_core::middleware::run_kernel(nr, args, || dispatch_after_fold(fr))
+        akuma_middleware::run_kernel(nr, args, || dispatch_after_fold(fr))
     }
     #[cfg(not(feature = "middleware"))]
     {
@@ -1683,7 +1683,7 @@ pub struct Kernel {
     smp: bool,
     root: Option<fn() -> alloc::sync::Arc<dyn Filesystem>>,
     #[cfg(feature = "middleware")]
-    middleware: Option<&'static dyn akuma_tokio_kernel_core::middleware::Dispatch>,
+    middleware: Option<&'static dyn akuma_middleware::Dispatch>,
 }
 
 impl Kernel {
@@ -1758,10 +1758,10 @@ impl Kernel {
         self
     }
 
-    /// The kernel's one syscall middleware (`akuma_tokio_kernel_core::middleware`, B22). A second call panics:
+    /// The kernel's one syscall middleware (`akuma_middleware`, B22). A second call panics:
     /// a kernel has one table, and composes several in its own function.
     #[cfg(feature = "middleware")]
-    pub const fn middleware(mut self, mw: &'static dyn akuma_tokio_kernel_core::middleware::Dispatch) -> Self {
+    pub const fn middleware(mut self, mw: &'static dyn akuma_middleware::Dispatch) -> Self {
         assert!(self.middleware.is_none(), "one syscall middleware per kernel: compose in your own function");
         self.middleware = Some(mw);
         self
@@ -1786,9 +1786,9 @@ fn boot(k: &Kernel) -> ! {
     akuma_tokio_kernel_core::set_identity(k.identity);
     #[cfg(feature = "middleware")]
     if let Some(mw) = k.middleware {
-        akuma_tokio_kernel_core::middleware::install(
+        akuma_middleware::install(
             mw,
-            akuma_tokio_kernel_core::middleware::Machine {
+            akuma_middleware::Machine {
                 decode: akuma_syscalls_abi::Syscall::from_x86_64,
                 encode: akuma_syscalls_abi::Syscall::to_x86_64,
                 copy_in: copy_from_user,
@@ -1844,7 +1844,7 @@ fn boot(k: &Kernel) -> ! {
     // The line, whole and read-only from here on; then the middleware's `init` hook reads its `mw.*` words from it.
     capture_cmdline(hvm_start_info);
     #[cfg(feature = "middleware")]
-    akuma_tokio_kernel_core::middleware::init();
+    akuma_middleware::init();
     let mut describe_buf = [0u8; 512];
     let Ok(machine) = akuma_ryzen_amd64::describe(&Physmap, hvm_start_info, &mut describe_buf) else {
         console::puts("  [FATAL] no hvm_start_info magic at the PVH handoff address\n");

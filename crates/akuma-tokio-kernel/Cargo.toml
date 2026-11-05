@@ -36,7 +36,7 @@ pmm-forensics = ["akuma-tokio-kernel-amd64/pmm-forensics"]
 # Independent of `middleware`. Images only (execve, a `#!` interpreter, init); off by default.
 refuse-dynamic-elf = ["akuma-tokio-kernel-amd64/refuse-dynamic-elf", "akuma-tokio-kernel-aarch64/refuse-dynamic-elf"]
 # Syscall middleware (`Kernel::middleware`, `akuma_tokio_kernel::middleware`, B22). Off by default.
-middleware = ["akuma-tokio-kernel-amd64/middleware", "akuma-tokio-kernel-aarch64/middleware", "dep:akuma-tokio-kernel-core"]
+middleware = ["akuma-tokio-kernel-amd64/middleware", "akuma-tokio-kernel-aarch64/middleware", "dep:akuma-middleware"]
 
 # The machine half, chosen by the target. `target_os = "none"` too: `cfg(target_arch)` alone is the
 # *host's* under `cargo test`, and the machine halves build only for the kernel targets.
@@ -47,4 +47,4 @@ akuma-tokio-kernel-amd64 = { path = "../akuma-tokio-kernel-amd64" }
 akuma-tokio-kernel-aarch64 = { path = "../akuma-tokio-kernel-aarch64" }
 
 [dependencies]
-akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["middleware"], optional = true }
+akuma-middleware = { path = "../akuma-middleware", optional = true }

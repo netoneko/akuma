@@ -96,6 +96,8 @@ default-members = [
     "crates/akuma-runtime-tokio",
     "crates/akuma-tokio-kernel-core",
     "crates/akuma-ed25519",
+    "crates/akuma-middleware",
+    "crates/akuma-params",
     "crates/akuma-mw-no-dynamic-loading",
     "crates/akuma-mw-signed-exec",
     "crates/akuma-pte-aarch64",

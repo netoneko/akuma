@@ -1,6 +1,6 @@
 //! What a hook is handed: [`KernelCtx`] (under the kernel lock, read-only), and the hook types.
 
-use super::calls::{Machine, Verdict};
+use crate::calls::{Machine, Verdict};
 use akuma_syscalls_abi::Syscall;
 
 /// A user-memory access that did not go through.

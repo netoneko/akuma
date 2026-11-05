@@ -113,7 +113,7 @@ your image runs a shell beyond `sh -c`), `trace-err` (print every failing syscal
 `platform-firecracker` (aarch64 under Firecracker, whose memory map differs from QEMU virt's; the `build.rs`
 above moves the link base for it — amd64 boots Firecracker through PVH and needs nothing), `refuse-dynamic-elf` (a build-time ban on
 dynamically linked images, `EPERM`, decided inside the elf crate: no middleware, no hook; off by default), and
-`middleware` ([below](#syscall-middleware-optional) and the [middleware guide](../akuma-tokio-kernel-core/docs/middleware.md); off by default, and a kernel that leaves it off compiles none of it).
+`middleware` ([below](#syscall-middleware-optional) and the [middleware guide](../akuma-middleware/docs/middleware.md); off by default, and a kernel that leaves it off compiles none of it).
 
 Everything else is fixed and needs no code: the memory manager (`mmap`, `brk`, `mprotect`, copy-on-write
 `fork`), processes and threads (`clone`, `execve`, `wait4`), signals, pipes, epoll, futexes, the clock, the
@@ -129,11 +129,11 @@ built twice.
 With the `middleware` feature (off by default, for every kernel) a kernel registers **one** table of hooks around
 syscall dispatch: `kernel.middleware(&MW)`.
 
-> **Start with the guide: [`akuma-tokio-kernel-core/docs/middleware.md`](../akuma-tokio-kernel-core/docs/middleware.md).** It has two
+> **Start with the guide: [`akuma-middleware/docs/middleware.md`](../akuma-middleware/docs/middleware.md).** It has two
 > worked examples, both booted by Shanghai's gate (**add a syscall of your own**, and **refuse an exec by its
 > environment**), then the tiers, what a hook gets, the rules and the reason for each, what it costs, and how to test a table.
 
-The code is `akuma_tokio_kernel_core::middleware`, re-exported as `akuma_tokio_kernel::middleware`, and it is the same on amd64
+The code is `akuma_middleware`, re-exported as `akuma_tokio_kernel::middleware`, and it is the same on amd64
 and aarch64; the design and what booting it found are in
 [`docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md`](../../docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md). The short version, with the rest
 in the guide:
@@ -387,7 +387,7 @@ call and exits 1 on one nobody does. A call nobody serves answers `ENOSYS` and t
 [`proposals/B21_TOKIO_KERNEL_AARCH64.md`](../../proposals/B21_TOKIO_KERNEL_AARCH64.md) and its record
 [`docs/archive/TAOXICHUAN_B21_AARCH64.md`](../../docs/archive/TAOXICHUAN_B21_AARCH64.md) (the aarch64 port,
 with the parity table over both machines),
-[`crates/akuma-tokio-kernel-core/docs/middleware.md`](../akuma-tokio-kernel-core/docs/middleware.md) (the syscall middleware guide) and
+[`crates/akuma-middleware/docs/middleware.md`](../akuma-middleware/docs/middleware.md) (the syscall middleware guide) and
 [`docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md`](../../docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md) (its design record),
 [`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`](../../docs/archive/TAOXICHUAN_CLEANUP_PLAN.md) (B15),
 [`docs/archive/TAOXICHUAN_FIXED_POINT.md`](../../docs/archive/TAOXICHUAN_FIXED_POINT.md) (the kernel this came

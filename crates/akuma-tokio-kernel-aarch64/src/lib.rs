@@ -69,7 +69,7 @@ pub struct Kernel {
     #[cfg(feature = "smp")]
     smp: bool,
     #[cfg(feature = "middleware")]
-    middleware: Option<&'static dyn akuma_tokio_kernel_core::middleware::Dispatch>,
+    middleware: Option<&'static dyn akuma_middleware::Dispatch>,
 }
 
 impl Kernel {
@@ -129,10 +129,10 @@ impl Kernel {
         Self { smp: true, ..self }
     }
 
-    /// The kernel's one syscall middleware (`akuma_tokio_kernel_core::middleware`, B22). A second call panics:
+    /// The kernel's one syscall middleware (`akuma_middleware`, B22). A second call panics:
     /// a kernel has one table, and composes several in its own function.
     #[cfg(feature = "middleware")]
-    pub const fn middleware(self, mw: &'static dyn akuma_tokio_kernel_core::middleware::Dispatch) -> Self {
+    pub const fn middleware(self, mw: &'static dyn akuma_middleware::Dispatch) -> Self {
         assert!(self.middleware.is_none(), "one syscall middleware per kernel: compose in your own function");
         Self { middleware: Some(mw), ..self }
     }
@@ -151,8 +151,8 @@ fn boot(k: &Kernel) -> ! {
     akuma_tokio_kernel_core::set_identity(k.identity);
     #[cfg(feature = "middleware")]
     if let Some(mw) = k.middleware {
-        use akuma_tokio_kernel_core::middleware::{Machine, Syscall};
-        akuma_tokio_kernel_core::middleware::install(
+        use akuma_middleware::{Machine, Syscall};
+        akuma_middleware::install(
             mw,
             Machine {
                 decode: Syscall::from_aarch64,
@@ -231,10 +231,10 @@ fn boot(k: &Kernel) -> ! {
         trap::TICK_US
     );
     safe_print!(160, "  cmdline: {}\n", m.cmdline.as_str());
-    // The line, whole and read-only from here on (`akuma_tokio_kernel_core::params`); then the middleware's `init` hook reads its
+    // The line, whole and read-only from here on (`akuma_params`); then the middleware's `init` hook reads its
     // `mw.*` words from it, before anything runs in user mode.
     {
-        use akuma_tokio_kernel_core::params::{Failure, capture};
+        use akuma_params::{Failure, capture};
         let line = m.cmdline.as_bytes();
         let kept = capture(|buf| {
             if line.len() > buf.len() {
@@ -247,7 +247,7 @@ fn boot(k: &Kernel) -> ! {
             safe_print!(160, "  [params] the command line was not kept whole ({} bytes): mw.* parameters are absent\n", line.len());
         }
         #[cfg(feature = "middleware")]
-        akuma_tokio_kernel_core::middleware::init();
+        akuma_middleware::init();
     }
     anchor_wall_clock(m.cmdline.as_str());
 

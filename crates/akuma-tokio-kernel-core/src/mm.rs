@@ -74,7 +74,7 @@ pub fn mprotect_arm<M: Mm>(addr: u64, len: u64, prot: u64) -> u64 {
     // page came from, so the policy gets no identity here.
     #[cfg(feature = "middleware")]
     if prot & u64::from(PROT_EXEC) != 0
-        && let Some(no) = crate::middleware::exec_event(&crate::middleware::ExecKind::Protect)
+        && let Some(no) = akuma_middleware::exec_event(&akuma_middleware::ExecKind::Protect)
     {
         return e(no);
     }
@@ -442,7 +442,7 @@ pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<
     // The exec policy (syscall middleware), asked for every mapping that is executable: one of the three ways code arrives.
     #[cfg(feature = "middleware")]
     if prot & u64::from(PROT_EXEC) != 0
-        && let Some(no) = crate::middleware::exec_event(&crate::middleware::ExecKind::Map { inode: file })
+        && let Some(no) = akuma_middleware::exec_event(&akuma_middleware::ExecKind::Map { inode: file })
     {
         return e(no);
     }

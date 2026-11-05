@@ -20,6 +20,8 @@ akuma-primitives = { path = "../akuma-primitives" }
 akuma-psci = { path = "../akuma-psci" }
 akuma-timer = { path = "../akuma-timer" }
 akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["process", "net"] }
+akuma-params = { path = "../akuma-params" }
+akuma-middleware = { path = "../akuma-middleware", optional = true }
 akuma-uart = { path = "../akuma-uart", optional = true }
 akuma-vectors-aarch64 = { path = "../akuma-vectors-aarch64" }
 fdt = "0.1"
@@ -54,7 +56,7 @@ net = []
 smp = ["akuma-boot-aarch64/secondary", "akuma-gic/secondary"]
 shell = []
 # Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.
-middleware = ["akuma-tokio-kernel-core/middleware"]
+middleware = ["dep:akuma-middleware", "akuma-tokio-kernel-core/middleware"]
 # Refuse every dynamically linked image at build time, EPERM (`akuma-elf-exec`'s `refuse-dynamic`). Off by default.
 refuse-dynamic-elf = ["akuma-tokio-kernel-core/refuse-dynamic-elf"]
 no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]

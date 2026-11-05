@@ -24,7 +24,7 @@
 /// Syscall middleware (B22): one optional table of hooks around the kernel's syscall dispatch, registered with
 /// `Kernel::middleware`. Only with the `middleware` feature, which is off by default.
 #[cfg(feature = "middleware")]
-pub use akuma_tokio_kernel_core::middleware;
+pub use akuma_middleware as middleware;
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub use akuma_tokio_kernel_amd64::{Kernel, boot_multiboot2};

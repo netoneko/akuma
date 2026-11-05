@@ -66,7 +66,7 @@ pub const fn may_refuse_before(call: Option<Syscall>) -> bool {
     !observe_only(call) || matches!(call, Some(Syscall::Execve))
 }
 
-pub(super) fn native(m: &Machine, on: On) -> u64 {
+pub fn native(m: &Machine, on: On) -> u64 {
     match on {
         On::Call(c) => (m.encode)(c),
         On::Nr(n) => n,

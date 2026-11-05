@@ -9,5 +9,5 @@ workspace = true
 
 [dependencies]
 # The middleware vocabulary (`ExecEvent`, `KernelCtx`, `Verdict`) and nothing of any machine, so the policy tests on the host.
-akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["middleware"] }
+akuma-middleware = { path = "../akuma-middleware" }
 akuma-primitives = { path = "../akuma-primitives" }

@@ -29,7 +29,7 @@
 //! interpreter runs whatever it is given.
 
 use akuma_primitives::safe_print;
-use akuma_tokio_kernel_core::middleware::{ExecEvent, ExecKind, ExecVerdict, Params};
+use akuma_middleware::{ExecEvent, ExecKind, ExecVerdict, Params};
 use sha2::{Digest, Sha256};
 
 const EACCES: i32 = 13;
@@ -214,7 +214,7 @@ pub fn decide(cfg: &Config<'_>, path: &str, interp: Option<&str>, image: &[u8], 
 }
 
 /// The exec policy over `cfg`: one `match` over every way the kernel introduces code. The kernel's table calls this from a
-/// function of its own that supplies `cfg` (an [`ExecPolicy`](akuma_tokio_kernel_core::middleware::ExecPolicy) is a bare `fn`).
+/// function of its own that supplies `cfg` (an [`ExecPolicy`](akuma_middleware::ExecPolicy) is a bare `fn`).
 #[must_use]
 pub fn exec_policy(cfg: &Config<'_>, ev: &ExecEvent) -> ExecVerdict {
     match ev.kind {
@@ -247,7 +247,7 @@ extern crate std;
 mod tests {
     use std::fmt::Write as _;
 
-    use akuma_tokio_kernel_core::params::MW;
+    use akuma_middleware::params::MW;
 
     use super::*;
 

@@ -1,6 +1,6 @@
 //! The exec policy: "may this process get new code?", and the kernel-facing entry points that ask it.
 
-use super::dispatch::active;
+use crate::dispatch::active;
 
 /// What the kernel is about to do that puts new code into a process. There are exactly three ways, and the kernel asks about each
 /// in one place (see [`ExecPolicy`]).
@@ -12,7 +12,7 @@ pub enum ExecKind<'a> {
     /// `path` is the symlink-resolved path the kernel read (`/bin/ls` arrives as `/bin/busybox`), **not normalised**: a policy that
     /// matches on it must refuse a relative one and `..`/`//` itself. `image` is the kernel's own copy of the whole file, never mapped
     /// to user space, so it cannot change while a policy reads it. `sidecar` is the contents of `<path><suffix>` (at most 4 KiB) when
-    /// the table asks for one ([`Hooks::exec_sidecar`](super::Hooks::exec_sidecar)) and the file exists; `None` otherwise.
+    /// the table asks for one ([`Hooks::exec_sidecar`](crate::Hooks::exec_sidecar)) and the file exists; `None` otherwise.
     Image { path: &'a str, interp: Option<&'a str>, image: &'a [u8], sidecar: Option<&'a [u8]> },
     /// `mmap` with `PROT_EXEC`. `inode` is the regular file being mapped, `None` for anonymous memory.
     Map { inode: Option<u32> },
@@ -59,7 +59,7 @@ pub fn exec_event(kind: &ExecKind<'_>) -> Option<u64> {
     }
 }
 
-/// The suffix of the file the loader should also read next to an image (see [`Hooks::exec_sidecar`](super::Hooks::exec_sidecar)), if the table wants one.
+/// The suffix of the file the loader should also read next to an image (see [`Hooks::exec_sidecar`](crate::Hooks::exec_sidecar)), if the table wants one.
 #[must_use]
 pub fn exec_sidecar() -> Option<&'static str> {
     active()?.exec_sidecar()

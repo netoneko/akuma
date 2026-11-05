@@ -276,10 +276,10 @@ pub fn load_task<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &st
     // Whether the policy checked `image` and asked for it to be the only source of the code (`ExecVerdict::AllowFromImage`).
     #[cfg(feature = "middleware")]
     let from_image = {
-        use crate::middleware::{ExecKind, ExecVerdict};
+        use akuma_middleware::{ExecKind, ExecVerdict};
         let interp = akuma_elf_exec::interp_path(image).ok().flatten().and_then(|b| core::str::from_utf8(b).ok());
         let sidecar = read_sidecar::<M>(path);
-        match crate::middleware::exec_verdict(&ExecKind::Image { path, interp, image, sidecar: sidecar.as_deref() }) {
+        match akuma_middleware::exec_verdict(&ExecKind::Image { path, interp, image, sidecar: sidecar.as_deref() }) {
             ExecVerdict::Deny(no) => return Err(LoadError::Refused(no.unsigned_abs().into())),
             ExecVerdict::AllowFromImage => true,
             ExecVerdict::Allow => false,
@@ -293,7 +293,7 @@ pub fn load_task<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &st
 /// The sidecar the middleware asked for (`Hooks::exec_sidecar`), at most 4 KiB. One allocation, and only when a table asks.
 #[cfg(feature = "middleware")]
 fn read_sidecar<M: Loader>(path: &str) -> Option<Vec<u8>> {
-    let suffix = crate::middleware::exec_sidecar()?;
+    let suffix = akuma_middleware::exec_sidecar()?;
     let mut name = String::new();
     name.try_reserve_exact(path.len() + suffix.len()).ok()?;
     name.push_str(path);

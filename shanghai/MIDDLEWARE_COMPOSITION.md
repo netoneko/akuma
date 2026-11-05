@@ -3,7 +3,7 @@
 **Status: mostly built (2026-11-05).** Built and gated on both machines: the single table, its tiers, the exec hook, the
 exec-policy composition (Shanghai's `exec_policy`: a refusal from any crate wins, otherwise the strongest allow), signed code only
 (`akuma-mw-signed-exec`, feature `signed-exec`, below), and the BOOT half of the diagram (write-once command line, the narrowed `Params` view, `ParamSource`, `Hooks::init`; guide:
-`crates/akuma-tokio-kernel-core/docs/middleware.md` § Boot parameters). The first crate, `akuma-mw-no-dynamic-loading`, is built and
+`crates/akuma-middleware/docs/middleware.md` § Boot parameters). The first crate, `akuma-mw-no-dynamic-loading`, is built and
 used by Shanghai's `no-dynamic-loading` feature (two plain functions, no table, host-tested; it takes no parameters). The second, `akuma-mw-signed-exec`, takes its trust lists from
 `mw.signed.*`. **Not built:** the label (a per-task record of which binary a process is), minisign/signify sidecar formats, a verified-hash
 cache by inode. The detail below describes the original proposal; where it differs from this paragraph, this paragraph wins: the

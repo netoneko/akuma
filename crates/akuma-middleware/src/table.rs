@@ -1,9 +1,9 @@
 //! The table: routes, the interest mask, [`Hooks`] and [`Middleware`] (arming, the exec policy).
 
-use super::calls::{native, Machine, On, MASK_BITS};
-use super::ctx::{Handler, Pre};
-use super::exec::{ExecEvent, ExecKind, ExecPolicy, ExecVerdict};
-use crate::params::Params;
+use crate::calls::{native, Machine, On, MASK_BITS};
+use crate::ctx::{Handler, Pre};
+use crate::exec::{ExecEvent, ExecKind, ExecPolicy, ExecVerdict};
+use akuma_params::Params;
 use akuma_primitives::OnceCopy;
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -21,7 +21,7 @@ impl<F> Route<F> {
 }
 
 /// 512 bits, one per native syscall number, set when the tier wants to be asked.
-pub(super) struct Interest([AtomicU64; MASK_BITS / 64]);
+pub struct Interest([AtomicU64; MASK_BITS / 64]);
 
 impl Interest {
     const fn new() -> Self {

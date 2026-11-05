@@ -1,6 +1,6 @@
 #![no_std]
 #![forbid(unsafe_code)]
-//! "No dynamic loading" as a middleware crate (B22; guide: `akuma-tokio-kernel-core/docs/middleware.md` § Example 2). It bans
+//! "No dynamic loading" as a middleware crate (B22; guide: `akuma-middleware/docs/middleware.md` § Example 2). It bans
 //! **dynamically linked programs** and any way of turning a file into code, and it is written once, as one `match`, because the
 //! kernel asks one question - "may this process get new code?" - at every place code can arrive:
 //!
@@ -20,7 +20,7 @@
 //!
 //! What gets around it is listed in the guide, and Shanghai's probe (`shanghai/mwprobe`) tries each avenue it knows.
 
-use akuma_tokio_kernel_core::middleware::{ExecEvent, ExecKind, ExecVerdict, KernelCtx, UserError, Verdict};
+use akuma_middleware::{ExecEvent, ExecKind, ExecVerdict, KernelCtx, UserError, Verdict};
 
 const EPERM: i32 = 1;
 const E2BIG: i32 = 7;
@@ -100,7 +100,7 @@ mod tests {
     use std::sync::OnceLock;
     use std::vec::Vec;
 
-    use akuma_tokio_kernel_core::middleware::{Machine, Syscall};
+    use akuma_middleware::{Machine, Syscall};
 
     use super::*;
 

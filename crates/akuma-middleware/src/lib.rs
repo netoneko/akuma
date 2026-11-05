@@ -1,8 +1,7 @@
 //! Syscall middleware: one optional table of hooks around the kernel's syscall dispatch.
 //!
 //! The guide is `docs/middleware.md` in this crate; the design record is `docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md`.
-//! Off unless the `middleware` feature is on; a kernel that
-//! does not ask for it compiles none of this and pays nothing.
+//! A kernel wires it behind its own `middleware` feature; one that does not ask for it compiles none of this and pays nothing.
 //!
 //! # The shape
 //!
@@ -37,6 +36,9 @@
 //!
 //! This module has none and the API needs none. Raw access means patching the attribute out of your own crate.
 
+#![no_std]
+#![forbid(unsafe_code)]
+
 mod calls;
 mod ctx;
 mod dispatch;
@@ -46,7 +48,7 @@ mod table;
 mod tests;
 
 pub use akuma_syscalls_abi::Syscall;
-pub use crate::params::{self, ParamSource, Params};
+pub use akuma_params::{self as params, ParamSource, Params};
 pub use calls::{observe_only, may_refuse_before, Machine, On, Verdict, CUSTOM_BASE, ENOSYS_RET, MASK_BITS};
 pub use ctx::{Handler, KernelCtx, Pre, UserError};
 pub use dispatch::{active, init, install, run_kernel, Dispatch};

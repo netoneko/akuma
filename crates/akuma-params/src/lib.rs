@@ -1,3 +1,6 @@
+#![no_std]
+#![forbid(unsafe_code)]
+
 //! The boot command line, kept once and read-only, and the narrowed views middleware reads it through.
 //!
 //! **Write once.** [`capture`] takes the one buffer ([`akuma_primitives::TakeOnce`] hands out its `&'static mut` exactly once for the

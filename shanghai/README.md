@@ -56,7 +56,7 @@ carries none of its code.
 The two policy crates are the **worked example of a middleware that lives outside the kernel using it**: plain functions, no
 table of their own (there is one table per kernel and nothing chains), host-tested, composed by the kernel in
 [`src/middleware.rs`](src/middleware.rs) where the composition can be read. The guide for the mechanism is
-[`crates/akuma-tokio-kernel-core/docs/middleware.md`](../crates/akuma-tokio-kernel-core/docs/middleware.md).
+[`crates/akuma-middleware/docs/middleware.md`](../crates/akuma-middleware/docs/middleware.md).
 
 ## Try it: the gate
 

@@ -369,8 +369,8 @@ The feature-on cost against the syscall floor is **not measured**; do not quote 
 ## Testing a table
 
 - **On the host** (no kernel): `Middleware::arm(machine)` with a fake `Machine` (`decode`, `encode`, `copy_in`, `copy_out`,
-  `pid`), then and `run_kernel` directly. [`src/middleware/tests.rs`](../src/middleware/tests.rs) does
-  exactly this for every rule above: `cargo test -p akuma-tokio-kernel-core --features middleware --target $(rustc -vV | sed -n
+  `pid`), then and `run_kernel` directly. [`src/middleware/tests.rs`](../src/tests.rs) does
+  exactly this for every rule above: `cargo test -p akuma-middleware --target $(rustc -vV | sed -n
   's/host: //p')`.
 - **In a guest:** copy Shanghai's pattern. Write a probe that makes raw `syscall` instructions (libc would hide an `-ENOSYS`
   behind `errno`), run it as `init`, and judge the boot by its result line. Always boot a **control** built without the feature

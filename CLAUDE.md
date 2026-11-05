@@ -10,6 +10,10 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 - `crates/` — Host-testable extracted crates:
   `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,fdtable,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,svm-amd64,terminal,timer,trap-aarch64,user-space,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
+  `akuma-middleware` is the optional syscall **middleware** (B22): one table per kernel of a `pre`
+  guard, a `handler` for calls the kernel does not serve, and one exec policy; a kernel wires it behind
+  its `middleware` feature, and `akuma-params` (the boot command line's narrowed `Params` views) sits
+  beneath it so the kernels can capture the line without it. Guide: `crates/akuma-middleware/docs/middleware.md`.
   `akuma-fdtable` is the fd table's state machine — lowest-free allocation,
   dup/close/sweep/fork decisions, effects returned not performed, `forbid`,
   no locks; `SharedFdTable` in `akuma-exec` keeps the locks and performs the

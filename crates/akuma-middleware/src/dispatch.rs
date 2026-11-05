@@ -1,11 +1,11 @@
 //! Running one call through the table, and the process-wide registration the kernels' dispatchers use.
 
-use super::calls::{may_refuse_before, observe_only, Verdict, ENOSYS_RET};
-use super::ctx::KernelCtx;
-use super::exec::{ExecKind, ExecVerdict};
-use super::table::Middleware;
-use super::calls::Machine;
-use crate::params::Params;
+use crate::calls::{may_refuse_before, observe_only, Verdict, ENOSYS_RET};
+use crate::ctx::KernelCtx;
+use crate::exec::{ExecKind, ExecVerdict};
+use crate::table::Middleware;
+use crate::calls::Machine;
+use akuma_params::Params;
 use akuma_primitives::OnceCopy;
 
 impl Middleware {
@@ -55,7 +55,7 @@ pub trait Dispatch: Sync {
     fn run_kernel(&self, nr: u64, args: [u64; 6], tid: u64, inner: &mut dyn FnMut() -> u64) -> u64;
     /// See [`Middleware::exec_event`].
     fn exec_event(&self, kind: &ExecKind<'_>) -> ExecVerdict;
-    /// See [`Hooks::exec_sidecar`](super::Hooks::exec_sidecar).
+    /// See [`Hooks::exec_sidecar`](crate::Hooks::exec_sidecar).
     fn exec_sidecar(&self) -> Option<&'static str>;
     /// See [`Middleware::init_params`].
     fn init_with(&self, params: &Params<'static>);
@@ -91,8 +91,8 @@ pub fn install(mw: &'static dyn Dispatch, machine: Machine) {
     ACTIVE.set(mw);
 }
 
-/// Hand the registered middleware its parameters: its [`Hooks::init`](super::Hooks::init) runs, once, with the view under `mw.`. The machine calls
-/// this after [`params::capture`](crate::params::capture) and before it starts init. A no-op with no middleware.
+/// Hand the registered middleware its parameters: its [`Hooks::init`](crate::Hooks::init) runs, once, with the view under `mw.`. The machine calls
+/// this after [`params::capture`](akuma_params::capture) and before it starts init. A no-op with no middleware.
 pub fn init() {
     if let Some(mw) = active() {
         mw.init_with(&Params::middleware());

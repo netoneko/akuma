@@ -1,4 +1,4 @@
-use super::*;
+use crate::*;
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 fn machine() -> Machine {

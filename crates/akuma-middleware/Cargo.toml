@@ -1,0 +1,14 @@
+[package]
+name = "akuma-middleware"
+version = "0.1.0"
+edition = "2024"
+description = "Syscall middleware (B22): one optional table of hooks around a kernel's syscall dispatch - a `pre` guard, a `handler` for calls the kernel does not serve, and one exec policy. Arch-neutral; a kernel wires it behind its `middleware` feature"
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-syscalls-abi = { path = "../akuma-syscalls-abi" }
+# `Params`: the narrowed view of the boot command line that `Hooks::init` reads.
+akuma-params = { path = "../akuma-params" }
