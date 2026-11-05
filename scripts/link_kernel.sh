@@ -59,15 +59,25 @@ for a in "$@"; do
 done
 [ -n "$OUT" ] || exit 0
 
-# Only the kernel gets a flat image. The link target is the hash-suffixed
-# artifact under deps/ (cargo uplifts it to <profile>/akuma afterwards), so
-# convert from the file that exists NOW and write to where the uplifted ELF
-# will land — that sidesteps the uplift ordering entirely.
+# Every kernel gets a flat image: `akuma`, and the kernels built on akuma-tokio-kernel
+# (`taoxichuan`, `shanghai`, ...), whose `.bin` is what QEMU's `-kernel` needs (a plain ELF
+# gets no device tree). Only a final link of a binary for this target reaches this wrapper
+# (rlibs are archived, build scripts and proc macros link for the host), so any binary linked
+# here is a kernel. Convert from the file that exists NOW and write to where the uplifted ELF
+# will land (<profile>/<name>) — that sidesteps the uplift ordering entirely.
+#
+# Two layouts, because cargo moved the link output: `<profile>/deps/<name>-<hash>` (the original),
+# and `<profile>/build/<pkg>/<hash>/out/<name>` (what the 2026-09 nightly passes; the old pattern
+# alone matched nothing, so no .bin was written at all and a stale one looked current).
 case "$OUT" in
-  */deps/akuma-*)
+  */deps/*-*)
     profile_dir=$(dirname "$(dirname "$OUT")")
     base=$(basename "$OUT")
-    "$HERE/mkbin.sh" "$OUT" "${profile_dir}/${base%-*}.bin" >/dev/null || true
+    "$HERE/mkbin.sh" "$OUT" "${profile_dir}/${base%-*}.bin" >/dev/null 2>&1 || true
+    ;;
+  */build/*/*/out/*)
+    profile_dir=${OUT%/build/*/*/out/*}
+    "$HERE/mkbin.sh" "$OUT" "${profile_dir}/$(basename "$OUT").bin" >/dev/null 2>&1 || true
     ;;
 esac
 exit 0
