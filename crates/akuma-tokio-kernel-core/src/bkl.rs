@@ -194,8 +194,8 @@ mod tests {
             if IRQ_ON.get() && !IN_HANDLER.get() {
                 IN_HANDLER.set(true);
                 HANDLER_RAN.store(true, Ordering::Relaxed);
-                enter::<Core>(); // the tick handler wants the lock
-                leave::<Core>();
+                enter::<Self>(); // the tick handler wants the lock
+                leave::<Self>();
                 IN_HANDLER.set(false);
             }
         }

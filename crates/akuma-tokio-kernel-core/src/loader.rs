@@ -94,9 +94,11 @@ pub enum PinnedReadError {
     TableFull,
 }
 
-/// [`read_image`], with the file marked as being executed **before** its bytes are read, so there is no moment between the read and the
-/// mark in which the file can be rewritten: from here until the returned pin is dropped the filesystem refuses to change its data
-/// (`ETXTBSY`). The caller installs the pin in the task record with [`adopt_text`] once the image is loaded.
+/// [`read_image`], with the file marked as being executed before its bytes are read.
+///
+/// There is no moment between the read and the mark in which the file can be rewritten: from here until the returned pin is dropped
+/// the filesystem refuses to change its data (`ETXTBSY`). The caller installs the pin in the task record with [`adopt_text`] once the
+/// image is loaded.
 ///
 /// # Errors
 /// [`PinnedReadError`]. A path with no inode (`/proc` files, a built-in) is read without a pin (inert).

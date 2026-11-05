@@ -152,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "BorrowCell read while mutably borrowed")]
     fn a_nested_borrow_is_a_panic() {
         let t: Tasks<2, 1> = Tasks::new();
         t.with_slot(0, |_| t.root_of(1));
