@@ -459,3 +459,26 @@ path uses `/dev/kvm0`. Not run further; Firecracker-on-Akuma has no network, so 
 - Trial `glm-goose-1` (goose + glm-4.7-flash, Akuma host, 75 s): **not a pass, a model give-up.** `install.sh check` printed `qemu-system-x86_64: MISSING`
   and `firecracker: MISSING` (irrelevant for `--vmm akuma`), GLM read them as blockers and stopped ("missing tools: cargo, qemu, firecracker"). The
   check report now says `not needed for --vmm akuma` for tools the chosen path does not use. Rerun pending.
+
+### Update 10c — GLM-4.7-flash on the Akuma host, goose vs Infinity (2026-11-05)
+
+Host: ryzen booted into Akuma; VM = Taoxichuan guest booted by `install.sh up --vmm akuma` (herd `vm = true`, kvm0, forward 2230→22); model:
+`glm-4.7-flash:latest` on the user's Mac ollama over the LAN; runbook `bootstrap/public/install.akuma.txt`; wrapper `scripts/kvm/goose/akuma_trial.sh`
+(harness-judged: live VM + a real `ssh … uname` returning `Linux taoxichuan` + the model itself ran `install.sh ssh`).
+
+| run | harness | verdict | wall | tool calls | tokens in/out/total |
+|---|---|---|---|---|---|
+| glm-goose-1 | goose | fail: read `MISSING qemu/firecracker` lines of `check` as blockers and stopped (fixed: check says "not needed for --vmm akuma") | 75 s | – | – |
+| glm-goose-2 | goose | fail: hit the 40-turn cap, ran `ssh` by hand instead of `install.sh ssh`; `publickey authentication failed` (the same script booted and logged in cleanly on a fresh dir right after, so this was the run, not the script) | ~20 min | 37+ | not logged (`--no-session`) |
+| glm-goose-3 | goose | model passed; harness mis-judged (`tail -1` hit a blank line) | 94 s | 5 | 24,503 / 485 / 24,988 |
+| glm-goose-4 | goose | **PASS** | 109 s | 4 | 24,425 / 443 / 24,868 |
+| glm-infinity-1 | infinity | model passed (5 tool calls, DONE + real line); harness mis-judged | 112 s | 5 | not recorded |
+| glm-infinity-2/3/4 | infinity | **invalid**: the agent never sent a model request (0 `chat` spans; the thread went idle in the first second); wait loop then hung or fired at once | – | 0 | – |
+
+Notes. (1) The harness bugs found and fixed: blank trailing line in the ssh output; the Infinity "ran the ssh step" check matched the runbook text echoed by
+`cat`, now it reads `tool_call` commands from the thread JSON. (2) **Tokens:** goose records `accumulated_*_tokens` in its session db (needs a stored
+session: use `--name`, not `--no-session`), about 24.9k per run, ~98% prompt re-sent each turn. Infinity's thread JSON and daemon log hold **no usage numbers**
+in this build (its protocol has `token_usage`, nothing persisted); exact counts need a counting proxy between harness and ollama. (3) **Open:** after
+the first Infinity run, later runs against the same daemon dir never reach the model; cause not found (daemon/provider restart handling suspected). `going idle` in
+the daemon log is not a completion signal (it is also printed when a thread starts). (4) `vm-dev` was stopped with the user's go-ahead and is still halted;
+the trial VM `akuma-install-2230` is running. Not run: the Linux/Pop Firecracker workload (needs the ryzen booted into Pop).
