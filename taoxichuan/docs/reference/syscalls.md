@@ -54,6 +54,11 @@ the caller first if a sibling's `exit_group` asked it to, and then `dispatch_inn
 5. **Anything else** answers `ENOSYS` and prints `[nosys] nr=N` once per number per boot, so a probe run is
    its own gap list.
 
+With the `middleware` feature (off by default) the table of `akuma_tokio_kernel_core::middleware` wraps this: its `own` tier
+runs in `dispatch` outside the lock (raw number, before the fold), its `kernel` tier wraps steps 2-5 inside it (after the fold),
+and `fallback` runs only where steps 2-5 answered `ENOSYS`. aarch64 has the same two seams (`trap::el0_sync` and
+`syscall::dispatch`). Without the feature none of it is compiled. Design and rules: [B22](../../../proposals/B22_SYSCALL_MIDDLEWARE.md).
+
 On the way out, `dispatch` restores the user-RSP stash (the stub's per-CPU slot, which any switch inside the
 call lets another thread overwrite), takes pending signals (`child::deliver_at_return`: a handler frame, an
 ignore, or a default action that ends the group) and drops the lock.

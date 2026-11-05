@@ -35,7 +35,20 @@ pub fn svc(f: &mut Frame) {
     crate::signal::at_return(f, n, a[0]);
 }
 
+/// The kernel's own arms, then the tokio surface; with `middleware`, wrapped by its `kernel` tier (B22).
 fn dispatch(f: &Frame, n: u64, a: [u64; 6]) -> u64 {
+    #[cfg(feature = "middleware")]
+    {
+        let mut args = a;
+        akuma_tokio_kernel_core::middleware::run_kernel(n, &mut args, |a| dispatch_arms(f, n, *a))
+    }
+    #[cfg(not(feature = "middleware"))]
+    {
+        dispatch_arms(f, n, a)
+    }
+}
+
+fn dispatch_arms(f: &Frame, n: u64, a: [u64; 6]) -> u64 {
     match n {
         nr::WRITE | nr::WRITEV => {
             if let Some(r) = akuma_runtime_tokio::console::stdio_write(n == nr::WRITEV, a, crate::console_putb) {

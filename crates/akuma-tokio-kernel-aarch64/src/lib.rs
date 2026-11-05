@@ -68,6 +68,8 @@ pub struct Kernel {
     net: bool,
     #[cfg(feature = "smp")]
     smp: bool,
+    #[cfg(feature = "middleware")]
+    middleware: Option<&'static dyn akuma_tokio_kernel_core::middleware::Dispatch>,
 }
 
 impl Kernel {
@@ -85,6 +87,8 @@ impl Kernel {
             net: false,
             #[cfg(feature = "smp")]
             smp: false,
+            #[cfg(feature = "middleware")]
+            middleware: None,
         }
     }
 
@@ -125,6 +129,14 @@ impl Kernel {
         Self { smp: true, ..self }
     }
 
+    /// The kernel's one syscall middleware (`akuma_tokio_kernel_core::middleware`, B22). A second call panics:
+    /// a kernel has one table, and composes several in its own function.
+    #[cfg(feature = "middleware")]
+    pub const fn middleware(self, mw: &'static dyn akuma_tokio_kernel_core::middleware::Dispatch) -> Self {
+        assert!(self.middleware.is_none(), "one syscall middleware per kernel: compose in your own function");
+        Self { middleware: Some(mw), ..self }
+    }
+
     /// Boot. On aarch64 this ends after the machine is up, until init can load.
     pub fn run_init(self) -> ! {
         boot(&self)
@@ -137,6 +149,20 @@ fn boot(k: &Kernel) -> ! {
         akuma_primitives::console::set_print_hook(uart_print);
     }
     akuma_tokio_kernel_core::set_identity(k.identity);
+    #[cfg(feature = "middleware")]
+    if let Some(mw) = k.middleware {
+        use akuma_tokio_kernel_core::middleware::{Machine, Syscall};
+        akuma_tokio_kernel_core::middleware::install(
+            mw,
+            Machine {
+                decode: Syscall::from_aarch64,
+                encode: Syscall::to_aarch64,
+                copy_in: |dst, src| akuma_user_access::copy_from_user(dst, src).is_ok(),
+                copy_out: |dst, src| akuma_user_access::copy_to_user(dst, src).is_ok(),
+                pid: || akuma_exec::process::read_current_pid().unwrap_or(0),
+            },
+        );
+    }
     let id = akuma_tokio_kernel_core::identity();
     safe_print!(96, "\n{}/aarch64 -- EL1, MMU on, dtb at {:#x}\n", id.name, k.dtb);
 

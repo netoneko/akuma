@@ -21,6 +21,8 @@ process = ["lazy", "dep:akuma-exec", "dep:akuma-threading", "dep:akuma-syscalls-
 disk = ["shmpages", "dep:akuma-fpcache"]
 # The socket layer (`net`): `akuma-net`'s runtime table, the poll pump, the DHCP wait.
 net = ["dep:akuma-net"]
+# Syscall middleware (`middleware`, B22): one optional table of hooks around dispatch. Off by default.
+middleware = ["dep:akuma-syscalls-abi", "dep:spinning_top"]
 # Trace builds: the poll pump's lap meter (`[netlap]`).
 trace-err = []
 
@@ -45,3 +47,4 @@ akuma-threading = { path = "../akuma-threading", features = ["hooked"], optional
 akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, optional = true }
 akuma-syscalls-proc = { path = "../akuma-syscalls-proc", optional = true }
 akuma-net = { path = "../akuma-net", optional = true }
+akuma-syscalls-abi = { path = "../akuma-syscalls-abi", optional = true }

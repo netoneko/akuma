@@ -1115,6 +1115,12 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     // included) lets the next thread's syscall overwrite it, so it is saved
     // here and restored before the return, for every call at once.
     let stash = ring3::user_rsp_stash();
+    // Middleware's `own` tier runs here, outside the kernel lock (B22). The raw number and arguments: the
+    // legacy fold has not happened yet, and no user memory is reachable from this tier.
+    #[cfg(feature = "middleware")]
+    let (own_nr, own_args) = (fr.rax, [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()]);
+    #[cfg(feature = "middleware")]
+    let own = akuma_tokio_kernel_core::middleware::own_enter(own_nr, own_args);
     smp::bkl_enter();
     // A sibling `exit_group` asked to end leaves here, at entry or on the way back
     // to ring 3, rather than running on in a dying process (`child::kill_siblings`).
@@ -1137,6 +1143,8 @@ fn dispatch(fr: &mut ring3::SyscallFrame) -> u64 {
     // A frame pushed just now already set the stash; its override is spent.
     let _ = child::take_return_rsp();
     smp::bkl_leave();
+    #[cfg(feature = "middleware")]
+    akuma_tokio_kernel_core::middleware::own_leave(own, own_nr, own_args, r);
     r
 }
 
@@ -1359,6 +1367,30 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         fr.rax = call.to_x86_64();
         (fr.rdi, fr.rsi, fr.rdx, fr.r10, fr.r8, fr.r9) = (a[0], a[1], a[2], a[3], a[4], a[5]);
     }
+    // Middleware's `kernel` tier wraps the rest of the dispatch (B22), after the fold: a hook sees the
+    // canonical `*at` number on either spelling. It may rewrite the arguments; they are written back here.
+    #[cfg(feature = "middleware")]
+    {
+        let nr = fr.rax;
+        let mut args = [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()];
+        akuma_tokio_kernel_core::middleware::run_kernel(nr, &mut args, |a| {
+            fr.rdi = a[0];
+            fr.rsi = a[1];
+            fr.rdx = a[2];
+            fr.r10 = a[3];
+            fr.r8 = a[4];
+            fr.r9 = a[5];
+            dispatch_after_fold(fr)
+        })
+    }
+    #[cfg(not(feature = "middleware"))]
+    {
+        dispatch_after_fold(fr)
+    }
+}
+
+/// `dispatch_inner` from the tokio surface on: everything after the legacy fold.
+fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
     // The tokio surface (`akuma-runtime-tokio`): its allow-list to glue by the asm-generic
     // number, the fd family to the x86_64 ABI layer amd64 uses too. One local intercept
     // first: stdio of a process with no channel goes to the console (`write`/`writev` only,
@@ -1643,6 +1675,8 @@ pub struct Kernel {
     #[cfg(feature = "smp")]
     smp: bool,
     root: Option<fn() -> alloc::sync::Arc<dyn Filesystem>>,
+    #[cfg(feature = "middleware")]
+    middleware: Option<&'static dyn akuma_tokio_kernel_core::middleware::Dispatch>,
 }
 
 impl Kernel {
@@ -1661,6 +1695,8 @@ impl Kernel {
             #[cfg(feature = "smp")]
             smp: false,
             root: None,
+            #[cfg(feature = "middleware")]
+            middleware: None,
         }
     }
 
@@ -1715,6 +1751,15 @@ impl Kernel {
         self
     }
 
+    /// The kernel's one syscall middleware (`akuma_tokio_kernel_core::middleware`, B22). A second call panics:
+    /// a kernel has one table, and composes several in its own function.
+    #[cfg(feature = "middleware")]
+    pub const fn middleware(mut self, mw: &'static dyn akuma_tokio_kernel_core::middleware::Dispatch) -> Self {
+        assert!(self.middleware.is_none(), "one syscall middleware per kernel: compose in your own function");
+        self.middleware = Some(mw);
+        self
+    }
+
     /// Boot, then load `init=` from the root and run it as pid 1. Never returns.
     pub fn run_init(self) -> ! {
         boot(&self)
@@ -1732,6 +1777,19 @@ fn boot(k: &Kernel) -> ! {
         console::init();
     }
     akuma_tokio_kernel_core::set_identity(k.identity);
+    #[cfg(feature = "middleware")]
+    if let Some(mw) = k.middleware {
+        akuma_tokio_kernel_core::middleware::install(
+            mw,
+            akuma_tokio_kernel_core::middleware::Machine {
+                decode: akuma_syscalls_abi::Syscall::from_x86_64,
+                encode: akuma_syscalls_abi::Syscall::to_x86_64,
+                copy_in: copy_from_user,
+                copy_out: copy_to_user,
+                pid: || akuma_exec::process::read_current_pid().unwrap_or(0),
+            },
+        );
+    }
 
     console::puts("\n");
     console::puts(k.identity.name);

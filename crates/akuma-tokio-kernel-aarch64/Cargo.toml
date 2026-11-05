@@ -53,6 +53,8 @@ disk = ["dep:akuma-ext2", "akuma-tokio-kernel-core/disk"]
 net = []
 smp = ["akuma-boot-aarch64/secondary", "akuma-gic/secondary"]
 shell = []
+# Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.
+middleware = ["akuma-tokio-kernel-core/middleware"]
 no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
 trace-err = ["akuma-tokio-kernel-core/trace-err"]
 # Firecracker's memory map: boot treats 0x4000_0000..0x8000_0000 as device memory (the serial

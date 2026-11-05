@@ -32,6 +32,9 @@ trace-err = ["akuma-tokio-kernel-amd64/trace-err", "akuma-tokio-kernel-aarch64/t
 # The PMM's use-after-free instruments: quarantine, premature-free check, CoW ledger (amd64).
 pmm-forensics = ["akuma-tokio-kernel-amd64/pmm-forensics"]
 
+# Syscall middleware (`Kernel::middleware`, `akuma_tokio_kernel::middleware`, B22). Off by default.
+middleware = ["akuma-tokio-kernel-amd64/middleware", "akuma-tokio-kernel-aarch64/middleware", "dep:akuma-tokio-kernel-core"]
+
 # The machine half, chosen by the target. `target_os = "none"` too: `cfg(target_arch)` alone is the
 # *host's* under `cargo test`, and the machine halves build only for the kernel targets.
 [target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
@@ -39,3 +42,6 @@ akuma-tokio-kernel-amd64 = { path = "../akuma-tokio-kernel-amd64" }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "none"))'.dependencies]
 akuma-tokio-kernel-aarch64 = { path = "../akuma-tokio-kernel-aarch64" }
+
+[dependencies]
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["middleware"], optional = true }

@@ -23,6 +23,8 @@ trace-err = ["akuma-tokio-kernel-core/trace-err"]
 pmm-forensics = []
 # What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-runtime-tokio/shell"]
+# Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.
+middleware = ["akuma-tokio-kernel-core/middleware"]
 # The default devices, each wired by its `Kernel` method (`console()`, `disk()`, `net()`, `smp()`).
 # COM1.
 console = ["dep:akuma-comconsole"]
