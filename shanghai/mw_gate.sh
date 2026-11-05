@@ -4,6 +4,9 @@
 #
 #   sh shanghai/mw_gate.sh [x86_64|aarch64|all]     (default: all)
 #
+# The image also carries a dynamically linked userland (Alpine's musl loader, busybox, bzip2, libbz2: shanghai/mw_fetch_dyn.sh, needs
+# network on first use) for the child probes.
+#
 # Exit 0 only if, on every architecture asked for, the middleware kernel prints "MWPROBE RESULT PASS" and the control
 # (the same kernel built without the feature) prints "MWPROBE RESULT CONTROL PASS".
 #
@@ -31,6 +34,25 @@ mkdir /bin
 mkdir /tmp
 write $W/mwprobe-$1 /bin/mwprobe
 sif /bin/mwprobe mode 0100755
+EOF
+  # The dynamically linked userland for the child probes (cached by mw_fetch_dyn.sh): the musl loader, a dynamic busybox,
+  # and xz + liblzma (a library besides libc).
+  sh shanghai/mw_fetch_dyn.sh "$1" "$W/dyn-$1"
+  d=$W/dyn-$1/root
+  cat >> "$W/cmds-$1" <<EOF
+mkdir /lib
+mkdir /usr
+mkdir /usr/lib
+mkdir /usr/bin
+write $d/lib/ld-musl-$1.so.1 /lib/ld-musl-$1.so.1
+sif /lib/ld-musl-$1.so.1 mode 0100755
+symlink /lib/libc.musl-$1.so.1 ld-musl-$1.so.1
+write $d/usr/lib/liblzma.so.5 /usr/lib/liblzma.so.5
+sif /usr/lib/liblzma.so.5 mode 0100755
+write $d/usr/bin/xz /usr/bin/xz
+sif /usr/bin/xz mode 0100755
+write $d/bin/busybox /bin/busybox
+sif /bin/busybox mode 0100755
 EOF
   "$E/debugfs" -w -f "$W/cmds-$1" "$W/mw-$1.img" >/dev/null 2>&1
 }
