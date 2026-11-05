@@ -482,15 +482,11 @@ pub fn halt() -> ! {
     if smp::percpu_installed() {
         smp::bkl_abandon();
     }
+    // `cli; hlt` in a loop (an NMI wake re-masks and re-halts); never returns.
+    #[cfg(target_arch = "x86_64")]
+    akuma_cpu::park::halt();
+    #[cfg(not(target_arch = "x86_64"))]
     loop {
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: `cli` and `hlt` are unconditionally safe to execute at ring 0
-        // and this function never returns, so masking interrupts permanently is
-        // the intent rather than a leaked side effect.
-        unsafe {
-            core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
-        }
-        #[cfg(not(target_arch = "x86_64"))]
         core::hint::spin_loop();
     }
 }

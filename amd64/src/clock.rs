@@ -451,10 +451,8 @@ fn attempt_sntp(timeout_us: u64) -> SyncOutcome {
     // uptime-based deadline check can never fire — a network that genuinely
     // cannot reach an NTP server hangs the boot at 100% CPU forever instead
     // of giving up, which is exactly what happened before this line existed.
-    // SAFETY: unconditionally safe at ring 0; enables maskable interrupts.
-    unsafe {
-        core::arch::asm!("sti", options(nomem, nostack));
-    }
+    // Unconditionally safe at ring 0; enables maskable interrupts.
+    akuma_cpu::interrupts::on();
 
     // The shared resolver, with this call's own budget. It stood in for a
     // hand-rolled client (`amd64/src/dns.rs`) from 2026-09-05 to 2026-10-18,

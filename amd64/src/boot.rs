@@ -334,9 +334,9 @@ pub fn late_init(secondaries: impl FnOnce()) {
     secondaries();
     wire_console_and_syscalls();
     lapic::start_timer();
-    // SAFETY: unconditionally safe at ring 0; the IDT is installed and every
+    // Unconditionally safe at ring 0; the IDT is installed and every
     // vector's handler is in place by now.
-    unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    akuma_cpu::interrupts::on();
 }
 
 /// What [`self_tests`] concluded.

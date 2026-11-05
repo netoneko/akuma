@@ -622,24 +622,10 @@ pub(crate) fn idt_load() {
 /// The control-register state every core needs: `CR0.WP`, SSE legal for ring 3
 /// (`boot.s` sets the BSP's in long mode; the AP trampoline does not).
 pub(crate) fn enable_cpu_features() {
-    // SAFETY: setting architectural bits on this core; the same values the
-    // BSP runs with.
-    unsafe {
-        core::arch::asm!(
-            "mov {t}, cr0",
-            "and {t}, -5",
-            "or {t}, 2",
-            "or {t}, {wp}",
-            "mov cr0, {t}",
-            "mov {t}, cr4",
-            "or {t}, {sse}",
-            "mov cr4, {t}",
-            t = out(reg) _,
-            wp = in(reg) 1u64 << 16,
-            sse = in(reg) (1u64 << 9) | (1u64 << 10),
-            options(nostack)
-        );
-    }
+    // The same architectural bits the BSP runs with: the FPU/SSE four, then
+    // WP — one named writer per semantic, bits stated at each.
+    akuma_cpu::ctlreg::enable_fpu();
+    akuma_cpu::ctlreg::set_cr0_wp();
 }
 
 /// Fill and load the IDT: a reporter for every vector, the trap crate's stubs
@@ -1838,19 +1824,9 @@ fn boot(k: &Kernel) -> ! {
     idt_init();
     // `CR0.WP`: a kernel *write* to a read-only page honours the page tables.
     // Without it, `.rodata` protection is a fiction and copy-on-write later
-    // becomes impossible to reason about. The only CR0 bit this kernel sets.
-    // SAFETY: setting a single documented control-register bit; interrupts
-    // are masked, one core, no thread of execution to race.
-    unsafe {
-        core::arch::asm!(
-            "mov {tmp:r}, cr0",
-            "or {tmp:r}, {wp:r}",
-            "mov cr0, {tmp:r}",
-            tmp = out(reg) _,
-            wp = in(reg) 1u64 << 16,
-            options(nostack, preserves_flags)
-        );
-    }
+    // becomes impossible to reason about. The only CR0 bit this kernel sets;
+    // interrupts are masked, one core, no thread of execution to race.
+    akuma_cpu::ctlreg::set_cr0_wp();
 
     // The machine's own description of itself.
     // The command line is parsed per-token below (init=, initargs=) straight
@@ -2001,14 +1977,9 @@ pub fn boot_multiboot2() -> ! {
 
 /// Park the core forever with interrupts masked.
 pub fn halt() -> ! {
-    loop {
-        // SAFETY: `cli` and `hlt` are unconditionally safe to execute at ring
-        // 0 and this function never returns, so masking interrupts permanently
-        // is the intent rather than a leaked side effect.
-        unsafe {
-            core::arch::asm!("cli; hlt", options(nomem, nostack, preserves_flags));
-        }
-    }
+    // `cli; hlt` in a loop — an NMI wake re-masks and re-halts; the contract
+    // (never returns, interrupts masked for good) is `akuma_cpu::park::halt`'s.
+    akuma_cpu::park::halt()
 }
 
 /// Out of memory. The honest response at this stage is to say so and stop —

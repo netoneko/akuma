@@ -30,7 +30,6 @@
 //! that failed validation, and a black screen with no way to report it. That
 //! cost a reboot cycle on a machine in another room. It is now a unit test.
 
-use akuma_cpu::msr::{self, Msr};
 use akuma_fbcon::{Console, PixelFormat, Rgb, Surface};
 use akuma_pagetable::Table;
 use akuma_primitives::mmio::MmioWindow;
@@ -239,12 +238,11 @@ impl Framebuffer {
 // Write-combining the framebuffer
 // ---------------------------------------------------------------------------
 
-/// PAT memory-type encoding for write-combining.
-const PAT_WC: u64 = 0x01;
 /// The PAT entry we repurpose: index 4, selected by `PAT=1, PCD=0, PWT=0`. Firmware
 /// resets it to WB, and **nothing in this kernel sets the PAT bit in any entry**, so
 /// no existing mapping changes type. (Entries 0-3 -- the ones PWT/PCD pick -- are not
-/// touched at all.)
+/// touched at all.) The write-combining encoding itself (`0x01`) is spelt once, in
+/// `akuma_cpu::msr::set_pat_entry_wc`.
 const PAT_INDEX: u32 = 4;
 /// Bit 12 of a 2 MiB PDE / bit 7 of a 4 KiB PTE: the PAT selector bit.
 const PDE_PAT: u64 = 1 << 12;
@@ -290,13 +288,10 @@ fn pat_supported() -> bool {
 /// that skips it would see the WC-marked pages as write-back (and, under a UC MTRR,
 /// UC) -- slow but not wrong.
 fn pat_set_wc_this_cpu() {
-    let mut pat = msr::read(Msr::Pat);
-    let shift = PAT_INDEX * 8;
-    pat = (pat & !(0xFF << shift)) | (PAT_WC << shift);
-    // SAFETY: rewrites one PAT byte to a valid encoding (WC) and keeps the other
-    // seven as firmware left them. No live mapping selects entry 4 (see
-    // `PAT_INDEX`), so no translation changes type under us.
-    unsafe { msr::write(Msr::Pat, pat) };
+    // One PAT byte (ours) to a valid encoding (WC), the other seven as
+    // firmware left them; no live mapping selects our index, which is the
+    // helper's stated obligation.
+    akuma_cpu::msr::set_pat_entry_wc(PAT_INDEX);
 }
 
 /// Called by each AP early in `ap_entry64`: join the BSP's PAT setting.
