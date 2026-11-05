@@ -1,6 +1,6 @@
 //! Syscall middleware: one optional table of hooks around the kernel's syscall dispatch.
 //!
-//! The guide is `docs/middleware.md` in this crate; the design record is `docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md`.
+//! The guide is `docs/middleware.md` in this crate; the design record is `docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md`.
 //! Off unless the `middleware` feature is on; a kernel that
 //! does not ask for it compiles none of this and pays nothing.
 //!
@@ -33,8 +33,11 @@
 //!
 //! # Not interceptable
 //!
-//! `exit`, `exit_group`, `clone`, `execve` and `rt_sigreturn` rewrite the frame or never return; a hook sees them
-//! ([`observe_only`]) but a `Return`/`Errno` verdict or a changed result is ignored.
+//! `exit`, `exit_group`, `clone`, `execve` and `rt_sigreturn` rewrite the frame or never return, so a hook sees them
+//! ([`observe_only`]) but cannot serve them with a `fallback` or replace their result. A `kernel_pre` *refusal*
+//! (`Return`/`Errno`) is different: it skips the call, so it cannot corrupt the frame. It is honoured for `execve`
+//! ([`may_refuse_before`]) and ignored for `exit`, `exit_group`, `clone` and `rt_sigreturn`, whose callers do not
+//! expect a return value (`exit`) or are left half-done (`rt_sigreturn`).
 //!
 //! # `#![forbid(unsafe_code)]`
 //!
@@ -114,13 +117,23 @@ pub struct Machine {
     pub pid: fn() -> u32,
 }
 
-/// Calls a hook may watch but whose result it may not change.
+/// Calls a hook may watch but whose result it may not change, and which `fallback` never serves.
 #[must_use]
 pub const fn observe_only(call: Option<Syscall>) -> bool {
     matches!(
         call,
         Some(Syscall::Exit | Syscall::ExitGroup | Syscall::Clone | Syscall::Execve | Syscall::RtSigreturn)
     )
+}
+
+/// Whether a `kernel_pre` refusal (`Return`/`Errno`) is honoured for this call.
+///
+/// Every call that is not [`observe_only`], and `execve`, which fails cleanly before it touches the process (a
+/// signed-binaries or environment policy needs exactly that). `exit`, `exit_group`, `clone` and `rt_sigreturn`
+/// stay unrefusable.
+#[must_use]
+pub const fn may_refuse_before(call: Option<Syscall>) -> bool {
+    !observe_only(call) || matches!(call, Some(Syscall::Execve))
 }
 
 /// The context of a `kernel` hook: runs with the kernel lock held.
@@ -405,6 +418,7 @@ impl<S: Send + 'static> Middleware<S> {
         let latch = self.kernel_latch(nr);
         let call = (machine.decode)(nr);
         let watch = observe_only(call);
+        let refusable = may_refuse_before(call);
         let mut ctx = KernelCtx { nr, call, args: *args, tid, pid: (machine.pid)(), machine };
 
         let mut ret = None;
@@ -414,8 +428,8 @@ impl<S: Send + 'static> Middleware<S> {
             match h(&mut ctx) {
                 Verdict::Pass => {}
                 Verdict::PassAndForget => self.kp.clear(nr),
-                Verdict::Return(v) if !watch => ret = Some(v),
-                Verdict::Errno(e) if !watch => ret = Some((-i64::from(e)) as u64),
+                Verdict::Return(v) if refusable => ret = Some(v),
+                Verdict::Errno(e) if refusable => ret = Some((-i64::from(e)) as u64),
                 Verdict::Return(_) | Verdict::Errno(_) => {}
             }
         }
@@ -621,6 +635,49 @@ mod tests {
         MW.arm(machine());
         let mut a = [0; 6];
         assert_eq!(MW.run_kernel(56, &mut a, 1, |_| 77), 77);
+    }
+
+    #[test]
+    fn execve_can_be_refused_before_it_runs_but_not_served_or_rewritten() {
+        static MW: Middleware<u32> = Middleware::new(0, Hooks {
+            kernel_pre: &[Route::new(&[On::Call(Syscall::Execve)], |c| {
+                if c.args[0] == 1 { Verdict::Errno(1) } else { Verdict::Pass }
+            })],
+            // Neither of these may take effect on an observe-only call.
+            kernel_post: &[Route::new(&[On::Call(Syscall::Execve)], |_, _| 0)],
+            fallback: &[Route::new(&[On::Call(Syscall::Execve)], |_| Some(99))],
+            ..Hooks::new()
+        });
+        MW.arm(machine());
+        let ran = AtomicUsize::new(0);
+        // A refusal is honoured: EPERM, and the call never ran.
+        let mut a = [1, 0, 0, 0, 0, 0];
+        let r = MW.run_kernel(59, &mut a, 1, |_| {
+            ran.fetch_add(1, Relaxed);
+            0
+        });
+        assert_eq!(r.cast_signed(), -1);
+        assert_eq!(ran.load(Relaxed), 0);
+        // Not refused: it runs, its -ENOSYS is not turned into 99 by the fallback, and post cannot replace it.
+        let mut a = [0; 6];
+        assert_eq!(MW.run_kernel(59, &mut a, 1, |_| ENOSYS_RET), ENOSYS_RET);
+        assert_eq!(MW.run_kernel(59, &mut a, 1, |_| 7), 7);
+    }
+
+    #[test]
+    fn exit_and_rt_sigreturn_cannot_be_refused() {
+        static MW: Middleware<u32> = Middleware::new(0, Hooks {
+            kernel_pre: &[
+                Route::new(&[On::Call(Syscall::ExitGroup), On::Call(Syscall::Exit)], |_| Verdict::Errno(1)),
+                Route::new(&[On::Call(Syscall::RtSigreturn)], |_| Verdict::Return(0)),
+            ],
+            ..Hooks::new()
+        });
+        MW.arm(machine());
+        let mut a = [0; 6];
+        assert_eq!(MW.run_kernel(231, &mut a, 1, |_| 5), 5); // exit_group
+        assert_eq!(MW.run_kernel(60, &mut a, 1, |_| 5), 5); // exit
+        assert_eq!(MW.run_kernel(15, &mut a, 1, |_| 5), 5); // rt_sigreturn
     }
 
     #[test]
