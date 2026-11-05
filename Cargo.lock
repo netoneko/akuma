@@ -313,6 +313,7 @@ dependencies = [
  "akuma-alloc",
  "akuma-bkl",
  "akuma-cpu",
+ "akuma-exceptions-forensics",
  "akuma-exec",
  "akuma-fpcache",
  "akuma-gic",
@@ -320,6 +321,17 @@ dependencies = [
  "akuma-primitives",
  "akuma-syscalls-linux",
  "akuma-trap-aarch64",
+]
+
+[[package]]
+name = "akuma-exceptions-forensics"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-exec",
+ "akuma-phys",
+ "akuma-pmm",
+ "akuma-primitives",
 ]
 
 [[package]]
@@ -818,6 +830,10 @@ name = "akuma-sntp"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-stack"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-svm-amd64"
 version = "0.1.0"
 dependencies = [
@@ -984,6 +1000,7 @@ dependencies = [
  "akuma-mmu",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-stack",
  "spinning_top",
 ]
 

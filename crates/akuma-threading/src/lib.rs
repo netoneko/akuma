@@ -360,7 +360,47 @@ const WARM_FREE_USER: usize = 0;
 // sentinel), so sizing to peak+margin is safe. Costs a memset per stack alloc;
 // keep `false` in production and flip on only for a measurement boot.
 const STACK_USAGE_PROBE: bool = true;
-const STACK_SENTINEL: u64 = 0xABAB_ABAB_ABAB_ABAB;
+/// A stack's bookkeeping region (`akuma-stack`). The one place `akuma-threading` vouches for a stack's bytes.
+///
+/// The callers pass either a slot's PMM-backed stack (owned by that slot, mapped for its life) or the boot
+/// stack (thread 0's), or just the canary words at a stack's base; none is aliased by a Rust reference.
+fn stack_region(base: usize, size: usize) -> akuma_stack::StackRegion {
+    // SAFETY: see above.
+    unsafe { akuma_stack::StackRegion::new(base, size) }
+}
+
+/// Offsets inside the IRQ trap frame a thread is switched out from (`setup_fake_irq_frame`,
+/// `src/exceptions.rs`): `ELR_EL1` and `SPSR_EL1`. This is *not* the EL0 `UserTrapFrame` layout.
+#[cfg(target_arch = "aarch64")]
+const IRQ_FRAME_ELR: usize = 240;
+#[cfg(target_arch = "aarch64")]
+const IRQ_FRAME_SPSR: usize = 248;
+
+/// Read one word of an IRQ trap frame at `sp + off`.
+///
+/// `sp` must be the stack pointer a thread was switched out with (or the live IRQ frame the vector just
+/// built): it points at an 832-byte frame on that thread's kernel stack, which the thread cannot free while
+/// it is not running and which this reads volatile, once. Callers pass `Context.sp` (guarded `!= 0`) or
+/// the live `current_sp`/`new_sp`.
+#[cfg(target_arch = "aarch64")]
+fn irq_frame_word(sp: usize, off: usize) -> u64 {
+    // SAFETY: see above; `off` is one of the two consts, inside the 832-byte frame.
+    unsafe { core::ptr::read_volatile((sp + off) as *const u64) }
+}
+
+/// Snapshot the EL0 trap frame published for `tid` in `CURRENT_TRAP_FRAME`, if any.
+///
+/// The entry is stored by `set_current_trap_frame` on the owning thread's syscall entry and cleared by its
+/// epilogue, and the frame lives on that thread's kernel stack, so a non-zero entry names a live frame. The
+/// copy is a plain read of the whole struct, as the `&*` deref it replaces was.
+fn published_trap_frame(tid: usize) -> Option<UserTrapFrame> {
+    let p = CURRENT_TRAP_FRAME[tid].load(Ordering::Acquire);
+    if p == 0 {
+        return None;
+    }
+    // SAFETY: see above - a published entry is a live, aligned `UserTrapFrame` on the owner's stack.
+    Some(unsafe { core::ptr::read(p as *const UserTrapFrame) })
+}
 
 // Recorded peak usage per class (bytes), so a short-lived user thread's
 // high-water survives the free that WARM_FREE_USER=0 does immediately on exit.
@@ -395,16 +435,12 @@ pub fn paint_boot_stack(base: usize, top: usize) {
     BOOT_STACK_TOP.store(top, Ordering::Relaxed);
     let sp: usize = if cfg!(target_os = "none") { akuma_cpu::reg::sp() } else { top };
     let paint_end = sp.saturating_sub(8 * 1024) & !7; // 8 KB headroom below live SP
-    let mut addr = (base + 7) & !7;
-    if paint_end <= addr {
+    if paint_end <= (base + 7) & !7 {
         return;
     }
-    unsafe {
-        while addr + 8 <= paint_end {
-            (addr as *mut u64).write_volatile(STACK_SENTINEL);
-            addr += 8;
-        }
-    }
+    // SAFETY (stack_region): the boot stack is thread 0's; only the part below the live SP's 8 KB
+    // headroom is painted.
+    stack_region(base, top - base).paint_sentinel(0, paint_end);
 }
 
 fn record_stack_peak(slot: usize, used: usize) {
@@ -425,15 +461,8 @@ fn fill_stack_sentinel(base: usize, top: usize) {
     if base == 0 || top <= base {
         return;
     }
-    let canary_bytes = config().canary_words * 8;
-    let start = (base + canary_bytes + 7) & !7; // 8-byte aligned
-    let mut addr = start;
-    unsafe {
-        while addr + 8 <= top {
-            (addr as *mut u64).write_volatile(STACK_SENTINEL);
-            addr += 8;
-        }
-    }
+    // A fresh, unused stack: nothing is live in it yet.
+    stack_region(base, top - base).paint_sentinel(config().canary_words * 8, top);
 }
 
 /// Peak stack usage for a slot, as `(used_bytes, total_bytes)`. Requires
@@ -450,22 +479,8 @@ pub fn stack_high_water(slot: usize) -> Option<(usize, usize)> {
         if !stack.is_allocated() {
             return None;
         }
-        let base = stack.base;
         let size = stack.size;
-        let top = base + size;
-        let canary_bytes = config().canary_words * 8;
-        let mut addr = (base + canary_bytes + 7) & !7;
-        let mut first_used = top;
-        unsafe {
-            while addr + 8 <= top {
-                if (addr as *const u64).read_volatile() != STACK_SENTINEL {
-                    first_used = addr;
-                    break;
-                }
-                addr += 8;
-            }
-        }
-        Some((top - first_used, size))
+        Some((stack_region(stack.base, size).high_water(config().canary_words * 8), size))
     })
 }
 
@@ -494,19 +509,7 @@ pub fn report_stack_high_water() {
         // Skip the canary words at the base (init_stack_canary writes them AFTER
         // paint_boot_stack runs, so they read as non-sentinel and would otherwise
         // pin the high-water at "full").
-        let canary_bytes = config().canary_words * 8;
-        let mut addr = (boot_base + canary_bytes + 7) & !7;
-        let mut first_used = boot_top;
-        unsafe {
-            while addr + 8 <= boot_top {
-                if (addr as *const u64).read_volatile() != STACK_SENTINEL {
-                    first_used = addr;
-                    break;
-                }
-                addr += 8;
-            }
-        }
-        boot_used = boot_top - first_used;
+        boot_used = stack_region(boot_base, boot_size).high_water(config().canary_words * 8);
     }
     safe_print!(200,
         "[Stack] sys peak {}KB/{}KB | user peak {}KB/{}KB | boot peak {}KB/{}KB (probe; lower=more trim headroom)\n",
@@ -4412,21 +4415,10 @@ impl ThreadPool {
             // short-lived user thread's peak survives this free (WARM_FREE_USER=0
             // frees on every exit). Cheap scan; only when the probe is on.
             if STACK_USAGE_PROBE {
-                let base = stack.base;
-                let top = base + stack.size;
-                let canary_bytes = config().canary_words * 8;
-                let mut addr = (base + canary_bytes + 7) & !7;
-                let mut first_used = top;
-                unsafe {
-                    while addr + 8 <= top {
-                        if (addr as *const u64).read_volatile() != STACK_SENTINEL {
-                            first_used = addr;
-                            break;
-                        }
-                        addr += 8;
-                    }
-                }
-                record_stack_peak(slot_idx, top - first_used);
+                record_stack_peak(
+                    slot_idx,
+                    stack_region(stack.base, stack.size).high_water(config().canary_words * 8),
+                );
             }
             // Overflow verdict, taken here because this is the last moment the
             // evidence exists — the frames go back to the PMM on the next line and
@@ -4867,12 +4859,9 @@ fn init_stack_canary(stack_base: usize) {
     if stack_base == 0 {
         return;
     }
-    unsafe {
-        let ptr = stack_base as *mut u64;
-        for i in 0..config().canary_words {
-            ptr.add(i).write_volatile(config().stack_canary);
-        }
-    }
+    // The canary words sit at the base, below anything the thread has yet used.
+    stack_region(stack_base, config().canary_words * 8)
+        .write_canary(config().canary_words, config().stack_canary);
 }
 
 /// Check if stack canary is intact
@@ -4880,15 +4869,8 @@ fn check_stack_canary(stack_base: usize) -> bool {
     if stack_base == 0 {
         return true; // Boot stack or unallocated
     }
-    unsafe {
-        let ptr = stack_base as *const u64;
-        for i in 0..config().canary_words {
-            if ptr.add(i).read_volatile() != config().stack_canary {
-                return false; // Corrupted!
-            }
-        }
-    }
-    true
+    stack_region(stack_base, config().canary_words * 8)
+        .canary_intact(config().canary_words, config().stack_canary)
 }
 
 // ============================================================================
@@ -5270,8 +5252,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     // in schedule_indices: an EL1-interrupted thread is a BKL holder under
     // smp-shared and must stay displaceable (the BKL release valve).
     // SAFETY: current_sp is the live IRQ trap frame the vector asm just built.
-    let interrupted_el0 =
-        unsafe { core::ptr::read_volatile((current_sp as usize + 248) as *const u64) } & 0xF == 0;
+    let interrupted_el0 = irq_frame_word(current_sp as usize, IRQ_FRAME_SPSR) & 0xF == 0;
     
     // Get scheduling decision. Use try_lock instead of a blocking lock(): this handler
     // runs from the timer-driven SGI in IRQ context (PSTATE.I masked). If the timer
@@ -5466,8 +5447,8 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             // whose ELR is a kernel address would eret userspace into kernel text —
             // catch it HERE, at the restore, with both thread ids.
             {
-                let elr = ((new_sp + 240) as *const u64).read_volatile();
-                let spsr = ((new_sp + 248) as *const u64).read_volatile();
+                let elr = irq_frame_word(new_sp as usize, IRQ_FRAME_ELR);
+                let spsr = irq_frame_word(new_sp as usize, IRQ_FRAME_SPSR);
                 let kernel_text = mmu::is_kernel_text(elr as usize);
                 // EL0-target frames must not eret into kernel text (NOT merely
                 // ≥0x4000_0000 — user mmap VAs legitimately reach 0x1_xxxx_xxxx+);
@@ -6942,12 +6923,7 @@ pub fn current_trap_frame_elr() -> Option<u64> {
     if tid >= MAX_THREADS {
         return None;
     }
-    let frame_ptr = CURRENT_TRAP_FRAME[tid].load(Ordering::Acquire);
-    if frame_ptr == 0 {
-        return None;
-    }
-    let frame = unsafe { &*(frame_ptr as *const UserTrapFrame) };
-    Some(frame.elr_el1)
+    published_trap_frame(tid).map(|f| f.elr_el1)
 }
 
 /// Get the saved user context for a thread.
@@ -6978,10 +6954,7 @@ pub fn dump_thread_resume_points() {
             if ctx.sp == 0 {
                 0
             } else {
-                // SAFETY: Context.sp points at the 832-byte IRQ trap frame this
-                // thread was last switched out from (src/exceptions.rs:266-278);
-                // ELR_EL1 lives at offset +240 in that frame.
-                unsafe { core::ptr::read_volatile((ctx.sp as usize + 240) as *const u64) }
+                irq_frame_word(ctx.sp as usize, IRQ_FRAME_ELR)
             }
         };
         let stc = match st {
@@ -7007,11 +6980,7 @@ pub fn dump_thread_resume_points() {
         // syscall args — x0 (futex uaddr), x1 (futex op). Lets us correlate a
         // stuck FUTEX_WAIT to a (missing) FUTEX_WAKE on the same address.
         let (a0, a1) = {
-            let fp = CURRENT_TRAP_FRAME[tid].load(Ordering::Acquire);
-            if fp != 0 {
-                let f = unsafe { &*(fp as *const UserTrapFrame) };
-                (f.x0, f.x1)
-            } else { (0, 0) }
+            published_trap_frame(tid).map_or((0, 0), |f| (f.x0, f.x1))
         };
         // LAST_CORE == 0xFF means never scheduled even once, ever, since this slot's
         // last claim (Failure D falsification test, 2026-08-07 — see
@@ -7062,10 +7031,7 @@ pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
         let live_elr = if ctx.sp == 0 {
             0
         } else {
-            // SAFETY: Context.sp points at the 832-byte IRQ trap frame this
-            // thread was last switched out from (src/exceptions.rs:266-278);
-            // ELR_EL1 lives at offset +240 in that frame.
-            unsafe { core::ptr::read_volatile((ctx.sp as usize + 240) as *const u64) }
+            irq_frame_word(ctx.sp as usize, IRQ_FRAME_ELR)
         };
         Some((ctx.x30, live_elr, ctx.sp))
     })
@@ -7118,9 +7084,7 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
 
     // If this is the current thread and we have a live trap frame, use it for full register state
     if thread_id == current_thread_id() {
-        let frame_ptr = CURRENT_TRAP_FRAME[thread_id].load(Ordering::Acquire);
-        if frame_ptr != 0 {
-            let frame = unsafe { &*(frame_ptr as *const UserTrapFrame) };
+        if let Some(frame) = published_trap_frame(thread_id) {
             let ctx = unsafe { &*get_context(thread_id) };
             let ttbr0 = if ctx.ttbr0 != 0 { ctx.ttbr0 } else { mmu::get_boot_ttbr0() };
 

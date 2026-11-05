@@ -1,0 +1,10 @@
+[package]
+name = "akuma-stack"
+version = "0.1.0"
+edition = "2024"
+description = "A kernel thread stack as a bounds-checked region: sentinel painting, high-water scan and the base canary. The one place that dereferences a stack's raw bytes for bookkeeping."
+
+[lints]
+workspace = true
+
+[dependencies]

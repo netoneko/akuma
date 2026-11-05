@@ -55,6 +55,27 @@ live mapping selecting the edited entry changes memory type: a coherency hazard)
 * `akuma-tokio-kernel-core` fails `clippy -D warnings` on `loader.rs:97` (a long first doc paragraph, from the ETXTBSY change). It
   is not part of this change and was left alone.
 
+## Part 2 (supervisor, 2026-11-06): AP bring-up, APIC, CR3 flush, stack bookkeeping, saved-frame reads, forensics
+
+| what | now |
+|---|---|
+| AP trampoline page, mailbox, boot root, the three `boot.s` symbols (byte-identical copies in both amd64 kernels) | `akuma-boot-amd64::ap` (`ap_boot_root`, `mailbox_write` safe; `install_trampoline` stays `unsafe fn`, the page must be clear); `paging::boot_pd` |
+| `IA32_APIC_BASE.EN` open-coded four times; two CR3 self-flushes | `akuma_cpu::msr::enable_apic_global`, `ctlreg::flush_non_global`; other `mov cr3` uses call `akuma_pagetable`'s `load_cr3` |
+| `sys_rt_sigreturn` raw `UserCtx` pointer | three short borrows through `with_current_uctx` |
+| stack sentinel painting, high-water scans (4 copies), base canary write/check in `akuma-threading` | new `akuma-stack::StackRegion` (range-checked, 5 host tests); `akuma-threading` vouches for a region in one place (`stack_region`) |
+| `Context.sp + 240/248` IRQ-frame reads (5 sites) and four `&*CURRENT_TRAP_FRAME` derefs | `irq_frame_word` / `published_trap_frame`, one `unsafe` each |
+| `interp_relr_forensics`, `print_page_forensics` (raw physmap reads) | `akuma-exceptions-forensics`, behind `akuma-exceptions`' `forensics` feature (default on; off = empty calls); reads go through `akuma_phys::Frame` |
+
+`FrameHandle` was *not* used for the saved-frame reads: it names the frame the vector just pushed for the running handler, and
+the IRQ-frame offsets (240/248) are not the `UserTrapFrame` layout, so the contract does not fit another thread's frame.
+
+Production `unsafe` sites: kernels 93 -> 69 after the sweep + stack/frame/forensics work (`amd64/src` 69 -> 59, `tokio-kernel-amd64`
+24 -> 18, `akuma-threading` 69 -> 59, `akuma-exceptions` 29 -> 27); new leaves `akuma-stack` 5, `akuma-exceptions-forensics` 2,
+`akuma-boot-amd64` 2 -> 9, `akuma-cpu` 73 -> 75. Whole tree 492 (audit start) -> 472.
+
+Not done on purpose: the SVM run loop, per-CPU GDT, physmap slices, `deliver_pending`, and `akuma-threading`'s context table (~29)
+and switch asm, which need a type that encodes the slot-ownership protocol (a design, not a move).
+
 ## Background
 
 Brief given to goose: `scripts/kvm/goose/` session `20261105_1` ("Akuma unsafe-kernel reduction"); it ended mid-edit of

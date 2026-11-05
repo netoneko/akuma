@@ -29,6 +29,11 @@ no-bkl-irq = []
 # build set this; the default `cargo build`/`test` do not.
 no-tests = []
 
+# Fault-time forensics (`[RELR]` slot hunt, `[EAGER-UPGRADE]`/`[WILD-DA]` page dump) from
+# `akuma-exceptions-forensics`. On by default: they only run on anomaly paths. Off, the calls are empty.
+forensics = ["dep:akuma-exceptions-forensics"]
+default = ["forensics"]
+
 [dependencies]
 # The EL0 trap frame as a typed handle (volatile accessors + snapshot), so the
 # handlers do not dereference the vector asm's raw `*mut UserTrapFrame`.
@@ -64,3 +69,4 @@ akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 # The kernel heap, for the crash-time memory-stats dump
 # (`log_memory_stats_on_crash`). Leaf crate.
 akuma-alloc = { path = "../akuma-alloc" }
+akuma-exceptions-forensics = { path = "../akuma-exceptions-forensics", optional = true }
