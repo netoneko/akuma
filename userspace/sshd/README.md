@@ -107,6 +107,38 @@ It's a second `[[bin]]` target in this same package
 parse opposite halves of the same wire format, so `cargo build -p sshd`
 already produces both binaries.
 
+### Keys and `ssh-keygen`
+
+`-i` takes **either** Akuma's raw 32-byte Ed25519 seed (what `sshd` keeps in
+`/etc/sshd/id_ed25519`) **or a standard unencrypted OpenSSH private key**
+(`-----BEGIN OPENSSH PRIVATE KEY-----`), so a key made on any other machine can
+be copied over and used unchanged. An OpenSSH file the client recognises but
+cannot use (passphrase-protected, not Ed25519, damaged) is refused with a
+message that says which, before it tries the next default identity.
+
+The same binary is also `ssh-keygen` (busybox-style multicall): invoked under
+that name — `/bin/ssh-keygen` is a symlink to `ssh` — or as `ssh --keygen ...`
+(a bare `ssh keygen` would be ambiguous with a host of that name):
+
+```sh
+ssh-keygen -q -t ed25519 -N '' -C comment -f /path/key   # key + /path/key.pub, OpenSSH format, mode 0600
+ssh-keygen -y -f /path/key                               # print the public line
+```
+
+It writes exactly what OpenSSH's `ssh-keygen -t ed25519 -N ''` writes (real
+OpenSSH reads it: `ssh-keygen -y -f` on a key made here returns the same public
+key), and refuses to overwrite an existing file.
+
+**Deliberately minimal.** One key type (Ed25519) and no passphrases: `-t`
+anything else, or a non-empty `-N`, is an error that says so. No certificates,
+agent, SFTP/SCP or forwarding either. Anyone who needs the full OpenSSH feature
+set should use OpenSSH (it runs on Akuma's Linux guests and on any host); this
+client and `ssh-keygen` exist so a box with nothing else can still log in, and
+so scripts written for the usual commands (`install.sh` is one) work unchanged.
+The parser and writer are `akuma_ssh_crypto::keys` (host-tested against real
+`ssh-keygen` output), and the `ssh` binary must be rebuilt and `/bin/ssh` replaced
+(plus the symlink) on an existing image to pick this up.
+
 ## Build
 
 ```bash

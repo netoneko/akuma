@@ -289,3 +289,61 @@ pub fn parse_openssh_private_key_ed25519(text: &str) -> Result<[u8; 32], Openssh
     }
     Ok(seed)
 }
+
+/// Write the `openssh-key-v1` container for an unencrypted Ed25519 key.
+///
+/// The inverse of [`parse_openssh_private_key_ed25519`], and byte-for-byte what
+/// `ssh-keygen -t ed25519 -N ''` produces for the same seed, comment and check integer
+/// (`ssh-keygen -y -f` reads the result).
+///
+/// `check` is the two repeated check integers; `ssh-keygen` picks them at random, and they only
+/// have to agree, so a caller with entropy passes four random bytes. The comment ends up in both
+/// the private section and (separately, by the caller) the `.pub` line.
+#[must_use]
+pub fn encode_openssh_private_key_ed25519(seed: &[u8; 32], comment: &str, check: u32) -> String {
+    use crate::crypto::write_u32;
+
+    let public = *SigningKey::from_bytes(seed).verifying_key().as_bytes();
+
+    let mut outer = Vec::new();
+    write_string(&mut outer, b"ssh-ed25519");
+    write_string(&mut outer, &public);
+
+    let mut secret = Vec::with_capacity(64);
+    secret.extend_from_slice(seed);
+    secret.extend_from_slice(&public);
+
+    let mut private = Vec::new();
+    write_u32(&mut private, check);
+    write_u32(&mut private, check);
+    write_string(&mut private, b"ssh-ed25519");
+    write_string(&mut private, &public);
+    write_string(&mut private, &secret);
+    write_string(&mut private, comment.as_bytes());
+    let mut pad = 1u8;
+    while !private.len().is_multiple_of(8) {
+        private.push(pad);
+        pad += 1;
+    }
+
+    let mut body = Vec::new();
+    body.extend_from_slice(OPENSSH_MAGIC);
+    write_string(&mut body, b"none");
+    write_string(&mut body, b"none");
+    write_string(&mut body, b"");
+    write_u32(&mut body, 1);
+    write_string(&mut body, &outer);
+    write_string(&mut body, &private);
+
+    let b64 = base64_encode(&body);
+    let mut out = String::from(OPENSSH_PEM_BEGIN);
+    out.push('\n');
+    for line in b64.as_bytes().chunks(70) {
+        // base64 output is ASCII, so any chunk boundary is a character boundary
+        out.push_str(core::str::from_utf8(line).unwrap_or(""));
+        out.push('\n');
+    }
+    out.push_str(OPENSSH_PEM_END);
+    out.push('\n');
+    out
+}

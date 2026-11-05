@@ -608,6 +608,8 @@ fi
 
 if [ -n "$SSH_CLI" ]; then
     "$DEBUGFS" -w -R "write $SSH_CLI bin/ssh" "$IMG" >/dev/null 2>&1
+    # The client is also `ssh-keygen` (multicall, dispatched on argv[0]); a symlink gives it the usual name.
+    "$DEBUGFS" -w -R "symlink /bin/ssh-keygen ssh" "$IMG" >/dev/null 2>&1
 fi
 
 if [ -n "$SSHD" ]; then

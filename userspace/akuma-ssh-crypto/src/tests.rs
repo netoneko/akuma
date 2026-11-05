@@ -510,4 +510,37 @@ mod openssh_key_tests {
     fn describe_names_the_remedy_for_an_encrypted_key() {
         assert!(OpensshKeyError::Encrypted.describe().contains("ssh-keygen"));
     }
+
+    #[test]
+    fn encode_then_parse_returns_the_same_seed() {
+        for seed in [[0u8; 32], [0xFFu8; 32], SEED, core::array::from_fn(|i| i as u8)] {
+            for comment in ["", "x", "akuma-install", "a longer comment with spaces and ünïcode"] {
+                let text = encode_openssh_private_key_ed25519(&seed, comment, 0x0102_0304);
+                assert!(looks_like_openssh_private_key(&text));
+                assert_eq!(parse_openssh_private_key_ed25519(&text), Ok(seed), "comment {comment:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_file_has_the_shape_ssh_keygen_writes() {
+        let text = encode_openssh_private_key_ed25519(&SEED, "akuma-test", 7);
+        let lines: alloc::vec::Vec<&str> = text.lines().collect();
+        assert_eq!(lines.first(), Some(&"-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assert_eq!(lines.last(), Some(&"-----END OPENSSH PRIVATE KEY-----"));
+        assert!(text.ends_with('\n'));
+        // ssh-keygen wraps the base64 at 70 columns
+        assert!(lines[1..lines.len() - 2].iter().all(|l| l.len() == 70));
+        assert!(lines[lines.len() - 2].len() <= 70);
+    }
+
+    #[test]
+    fn encoding_the_seed_of_a_real_ssh_keygen_file_gives_a_parseable_equal_key() {
+        let seed = parse_openssh_private_key_ed25519(PLAIN).unwrap();
+        let again = encode_openssh_private_key_ed25519(&seed, "akuma-test", 1);
+        assert_eq!(parse_openssh_private_key_ed25519(&again), Ok(seed));
+        // same layout as the real file, whatever its check integers were
+        assert_eq!(again.len(), PLAIN.len());
+    }
 }
+

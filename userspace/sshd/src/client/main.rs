@@ -23,6 +23,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 mod crypto;
+mod keygen;
 mod keys;
 mod protocol;
 
@@ -39,6 +40,8 @@ fn print_usage() {
     println("                    /etc/sshd/id_ed25519, i.e. sshd's own host key)");
     println("  -t term           TERM to advertise to the remote pty (default xterm-256color)");
     println("");
+    println("      ssh --keygen ...   make or show a key (also installed as ssh-keygen)");
+    println("");
     println("With no command, opens an interactive shell over a pty.");
     println("With a command, runs it non-interactively (no pty) and exits with its status.");
 }
@@ -46,7 +49,18 @@ fn print_usage() {
 #[unsafe(no_mangle)]
 pub extern "C" fn main() {
     let mut args_iter = args();
-    args_iter.next(); // argv[0]
+    let argv0 = args_iter.next().unwrap_or("ssh");
+
+    // Multicall: the same binary is `ssh-keygen` when invoked under that name (a symlink), and
+    // `ssh --keygen ...` otherwise. Either way everything after the name / the flag is keygen's.
+    let invoked_as = argv0.rsplit('/').next().unwrap_or(argv0);
+    let keygen_first = invoked_as != "ssh-keygen" && args().nth(1) == Some("--keygen");
+    if invoked_as == "ssh-keygen" || keygen_first {
+        let skip = if keygen_first { 2 } else { 1 };
+        let rest: Vec<String> = args().skip(skip).map(String::from).collect();
+        keygen::run(rest);
+        return;
+    }
 
     let mut port: u16 = 22;
     let mut login: Option<String> = None;
