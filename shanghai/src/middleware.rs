@@ -52,6 +52,12 @@ fn init(params: &Params<'static>, _state: &mut u64) {
     seen |= u64::from(params.get("init").is_some()) << 1;
     seen |= u64::from(mine.get("secret").is_some()) << 2;
     PARAMS_SEEN.store(seen, Relaxed);
+    #[cfg(feature = "signed-exec")]
+    {
+        let cfg = akuma_mw_signed_exec::Config::from_params(&params.scoped("signed."));
+        akuma_primitives::safe_print!(160, "[signed] allow={} keys={} malformed={}\n", cfg.allowed().count(), cfg.keys().count(), cfg.malformed);
+        SIGNED.set(cfg);
+    }
     akuma_primitives::safe_print!(128, "[mw] params: also={:?} seen={:#x}\n", ALSO.get(), seen);
 }
 
@@ -73,11 +79,36 @@ fn open_guard(ctx: &akuma_tokio_kernel::middleware::KernelCtx) -> Verdict {
     if path == "/mw-deny" { Verdict::Errno(EACCES) } else { Verdict::Pass }
 }
 
-/// The exec policy: the "no dynamic loading" demo's with its feature, none without it (everything is allowed).
-#[cfg(feature = "no-dynamic-loading")]
-const EXEC: Option<akuma_tokio_kernel::middleware::ExecPolicy> = Some(akuma_mw_no_dynamic_loading::exec_policy);
-#[cfg(not(feature = "no-dynamic-loading"))]
+/// What `mw.signed.*` said, read once by [`init`]. Unset (init did not run): [`akuma_mw_signed_exec::Config::EMPTY`], so nothing runs.
+#[cfg(feature = "signed-exec")]
+static SIGNED: OnceCopy<akuma_mw_signed_exec::Config<'static>> = OnceCopy::new();
+
+/// The kernel's one exec policy: the features' policies in a row, composed here, where it can be read. A refusal from any of them
+/// wins; otherwise the strongest allow does (`AllowFromImage` over `Allow`).
+#[cfg(any(feature = "no-dynamic-loading", feature = "signed-exec"))]
+fn exec_policy(ev: &akuma_tokio_kernel::middleware::ExecEvent) -> akuma_tokio_kernel::middleware::ExecVerdict {
+    #[cfg(any(feature = "no-dynamic-loading", not(feature = "signed-exec")))]
+    use akuma_tokio_kernel::middleware::ExecVerdict as V;
+    #[cfg(feature = "no-dynamic-loading")]
+    if let V::Deny(no) = akuma_mw_no_dynamic_loading::exec_policy(ev) {
+        return V::Deny(no);
+    }
+    #[cfg(feature = "signed-exec")]
+    return akuma_mw_signed_exec::exec_policy(&SIGNED.get().unwrap_or(akuma_mw_signed_exec::Config::EMPTY), ev);
+    #[cfg(not(feature = "signed-exec"))]
+    V::Allow
+}
+
+/// The exec policy: this table's own, composed from the features that are on; none without one (everything is allowed).
+#[cfg(any(feature = "no-dynamic-loading", feature = "signed-exec"))]
+const EXEC: Option<akuma_tokio_kernel::middleware::ExecPolicy> = Some(exec_policy);
+#[cfg(not(any(feature = "no-dynamic-loading", feature = "signed-exec")))]
 const EXEC: Option<akuma_tokio_kernel::middleware::ExecPolicy> = None;
+/// The loader also reads `<path>.sig` when the signing policy is on.
+#[cfg(feature = "signed-exec")]
+const SIDECAR: Option<&str> = Some(".sig");
+#[cfg(not(feature = "signed-exec"))]
+const SIDECAR: Option<&str> = None;
 
 /// The table the kernel registers.
 pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
@@ -119,4 +150,5 @@ pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
     ],
     exec: EXEC,
     init: Some(init),
+    exec_sidecar: SIDECAR,
 });

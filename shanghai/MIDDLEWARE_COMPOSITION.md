@@ -1,10 +1,13 @@
 # Shanghai: composing middleware from external crates
 
-**Status: partly built (2026-11-05).** Built and gated on both machines: the single table, its tiers, the exec hook, and the
-BOOT half of the diagram (write-once command line, the narrowed `Params` view, `ParamSource`, `Hooks::init`; guide:
+**Status: mostly built (2026-11-05).** Built and gated on both machines: the single table, its tiers, the exec hook, the
+exec-policy composition (Shanghai's `exec_policy`: a refusal from any crate wins, otherwise the strongest allow), signed code only
+(`akuma-mw-signed-exec`, feature `signed-exec`, below), and the BOOT half of the diagram (write-once command line, the narrowed `Params` view, `ParamSource`, `Hooks::init`; guide:
 `crates/akuma-tokio-kernel-core/docs/middleware.md` § Boot parameters). The first crate, `akuma-mw-no-dynamic-loading`, is built and
-used by Shanghai's `no-dynamic-loading` feature (two plain functions, no table, host-tested; it takes no parameters yet). **Not built:**
-the signing crate, `compose`, the label. Shanghai's sample table plays the part of a crate with parameters (`mw.sample.also`).
+used by Shanghai's `no-dynamic-loading` feature (two plain functions, no table, host-tested; it takes no parameters). The second, `akuma-mw-signed-exec`, takes its trust lists from
+`mw.signed.*`. **Not built:** the label (a per-task record of which binary a process is), minisign/signify sidecar formats, a verified-hash
+cache by inode. The detail below describes the original proposal; where it differs from this paragraph, this paragraph wins: the
+policy is hashes first and a detached `<path>.sig` second (not an ELF trailer), and `compose` is Shanghai's own function.
 
 Rules this design keeps: one table per kernel (no chaining), hooks cannot mutate the kernel context, every ban is a feature
 and off by default, no runtime switches.
@@ -114,7 +117,11 @@ and off by default, no runtime switches.
   `place_segment`, every page is eager from the bytes that were hashed (costs the shared-page cache and RAM for signed images);
   (b) text-busy: refuse a write-open/truncate of an inode that has an exec pin (Linux's `ETXTBSY`; a VFS change in ext2, whose
   `is_pinned` check already exists); (c) per-page hashes verified at fault time (fs-verity style; much larger). **(a) is the
-  smallest and it keeps the policy honest; it needs `ExecVerdict::Allow` to say so.** Not built.
+  smallest and it keeps the policy honest; it needs `ExecVerdict::Allow` to say so.** **Built as `ExecVerdict::AllowFromImage` (same day).** The loader
+  then passes no inode to `place_segment` and does not resolve the path again (a `rename` between the read and the load would have named
+  another inode). Proved by a probe child that rewrites its own file while running (`selfclobber`): on the stock kernel it dies with
+  SIGSEGV (status 11); on the `signed-exec` kernel, on both machines, it survives. A path swap between read and load is closed by the
+  same change but has no probe of its own.
 - **Crypto (investigated 2026-11-05): nothing to write.** `akuma-ssh-crypto` is a wrapper over RustCrypto's `ed25519-dalek` and
   `sha2`, so there is no hand-rolled primitive to lift. `crates/akuma-ed25519` is the kernel's one door to it (verify only,
   `verify_strict`, no allocation, RFC 8032 vectors 1 and 2 pinned; builds for both `*-unknown-none` targets). Pure Ed25519 signs the
@@ -122,3 +129,37 @@ and off by default, no runtime switches.
   `curve25519-dalek` 4.1.3 and `sha2` 0.10.9 contain code a future Rust will reject; theirs, not ours, to watch.
 - **Trust:** a key on the command line is chosen by whoever writes the line (VMM or bootloader). Compiled-in keys are the
   strong mode; command-line keys are a convenience.
+
+## What is built: `signed-exec` (2026-11-05)
+
+`akuma-mw-signed-exec`, Shanghai feature `signed-exec` (implies `middleware`, off by default). An image runs only if one of these holds,
+and every other way of making code is refused with `EACCES`:
+
+- **Its SHA-256 is allowlisted for its path:** `mw.signed.allow=<64 hex>:<scope>` (repeatable; a scope is an exact absolute path, or a
+  directory prefix ending in `/`). The path is the symlink-resolved one the loader read, so a hash for `/bin/busybox` covers its applets.
+- **A detached `<path>.sig` verifies:** 64 raw bytes, Ed25519 over the whole file, under a key scoped to the path:
+  `mw.signed.key=<64 hex public key>:<scope>[,<scope>...]` (repeatable). The loader reads the sidecar (at most 4 KiB, only when the table
+  asks for one) and passes its bytes in the event, so the policy never touches the filesystem; a swapped `.sig` cannot make other bytes
+  verify, because the signature is checked against the exact `image` the policy was shown.
+- **Refused regardless:** a dynamically linked image (its interpreter and libraries are not covered), a file-backed `PROT_EXEC` mapping,
+  `mprotect(+X)`, a path that is not absolute and clean (`..`, `//`, relative).
+- **A malformed or over-long trust list makes the policy refuse every image**, with the reason on the console. No `mw.signed.*` word at
+  all: nothing runs, init included.
+- **The verdict is `AllowFromImage`:** the image is mapped from the bytes that were checked (see the time-of-check note above).
+
+Stock binaries need no change: a hash allowlist entry names the installed file, and a `.sig` can be made by whoever builds the image
+with an Ed25519 key (the gate uses OpenSSL 3: `openssl pkeyutl -sign -rawin`). Signatures published by upstream projects cover their
+release artifacts, not the installed file, and apk's are RSA over the package, so they are not directly checkable here; minisign and
+signify are plain Ed25519 and would be the next sidecar formats.
+
+**Gate (`sh shanghai/mw_gate.sh all`, SMP=4, 2026-11-05):** 172 PASS lines, both machines: control 8, `middleware` 23,
+`no-dynamic-loading` 39, `no-dynamic-elf` 6, `signed-exec` 10 each. The ten signed cases: an allowlisted hash runs (S1); an unlisted
+image, tampered bytes under a valid signature, a valid signature outside the key's scope, and the allowlisted bytes at another path are all
+refused (S2, S4, S5, S6); a signature under a scoped key runs (S3); a dynamic image, a file-backed executable mapping and `mprotect(+X)`
+are refused (S7, S8, S9); and a signed child that rewrites its own file keeps running (S10).
+
+**Costs and limits, stated.** One SHA-256 over the image on every exec (and an Ed25519 verify per matching key when the hash is not
+listed); not measured, and a cache by inode is not built. Signed images lose the shared file-page cache. A script run by a signed
+interpreter is data, not code, and a signed interpreter runs whatever it is given. The command-line trust list is chosen by whoever
+writes the command line: compiled-in keys are the strong mode and are not built. Not tried on KVM or Firecracker.
+

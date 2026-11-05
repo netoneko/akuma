@@ -159,6 +159,35 @@ fn main() {
         println!("MWPROBE kid pid={} load attempts allowed={n}", std::process::id());
         std::process::exit(i32::from(n != 0));
     }
+    // A signed child that rewrites its own file on disk, then keeps running code from every part of itself. If the kernel maps a
+    // signed image lazily from the file, pages not yet touched are now garbage; mapped from the verified bytes, nothing changes.
+    if args.get(1).map(String::as_str) == Some("selfclobber") {
+        use std::io::{Seek, SeekFrom, Write};
+        let path = args.get(2).map_or("/bin/signed", String::as_str);
+        let len = std::fs::metadata(path).map_or(0, |m| m.len());
+        let wrote = match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(mut f) => {
+                let zeros = [0u8; 65536];
+                let mut at = 0x1000u64;
+                let _ = f.seek(SeekFrom::Start(at));
+                while at < len {
+                    let n = zeros.len().min((len - at) as usize);
+                    if f.write_all(&zeros[..n]).is_err() {
+                        break;
+                    }
+                    at += n as u64;
+                }
+                let _ = f.sync_all();
+                at >= len
+            }
+            Err(_) => false,
+        };
+        let mut v: Vec<String> = (0..3000u64).map(|i| format!("{:x}", i.wrapping_mul(2_654_435_761))).collect();
+        v.sort();
+        let m: std::collections::HashMap<String, usize> = v.iter().cloned().zip(0..).collect();
+        println!("MWPROBE selfclobber survived wrote={wrote} items={}", v.len() + m.len());
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("noop") {
         println!("MWPROBE noop child ran");
         return;
@@ -175,6 +204,8 @@ fn main() {
     // `dynelf` (`initargs=dynelf`): the kernel was built with only `--features no-dynamic-elf`, so there is NO middleware and the elf crate
     // refuses dynamic images with EACCES. That is a different expectation from both "stock" and "nodl", so it is its own branch.
     let dynelf = args.get(1).map(String::as_str) == Some("dynelf");
+    // `signed` (`initargs=signed`): built with `--features signed-exec`, so only what the command line allowlists or a scoped key signs runs.
+    let signed = args.get(1).map(String::as_str) == Some("signed");
     let fails = std::cell::Cell::new(0);
     let check = |name: &str, got: i64, want: i64| {
         let ok = got == want;
@@ -183,6 +214,30 @@ fn main() {
             fails.set(fails.get() + 1);
         }
     };
+
+    if signed {
+        let errno = |p: &str| spawn_errno(p, &["noop"]);
+        check("S1 an allowlisted hash runs from its path (/bin/mwprobe)", i64::from(errno("/bin/mwprobe").is_none()), 1);
+        check("S2 an image whose hash is not listed is refused with EACCES (/bin/unlisted)", i64::from(errno("/bin/unlisted") == Some(13)), 1);
+        check("S3 a detached signature under a key scoped to /bin/ runs (/bin/signed)", i64::from(errno("/bin/signed").is_none()), 1);
+        check("S4 bytes that differ from what the signature covers are refused (/bin/tampered)", i64::from(errno("/bin/tampered") == Some(13)), 1);
+        check("S5 a valid signature under a key not scoped to the path is refused (/opt/signed)", i64::from(errno("/opt/signed") == Some(13)), 1);
+        check("S6 the allowlisted bytes at another path are refused (/tmp/mwprobe-copy)", i64::from(errno("/tmp/mwprobe-copy") == Some(13)), 1);
+        check("S7 a dynamically linked program is refused (/bin/busybox)", i64::from(errno("/bin/busybox") == Some(13)), 1);
+        check("S8 a file-backed PROT_EXEC mmap is refused", sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, open("/bin/mwprobe") as u64, 0]), EACCES);
+        let ro = sc6(nr::MMAP, [0, 4096, PROT_READ, MAP_PRIVATE, open("/bin/mwprobe") as u64, 0]);
+        check("S9 mprotect(+X) is refused", sc(nr::MPROTECT, [ro as u64, 4096, PROT_READ | PROT_EXEC, 0]), EACCES);
+        // Last, because it destroys the file: the signed image is mapped from the bytes that were checked.
+        let out = std::process::Command::new("/bin/signed").args(["selfclobber", "/bin/signed"]).env_clear().output();
+        let text = out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        println!("MWPROBE selfclobber: {}", match &out {
+            Ok(o) => format!("status={:?} stdout={:?}", o.status, text.trim()),
+            Err(e) => format!("spawn failed: {e}"),
+        });
+        check("S10 a signed child that rewrites its own file keeps running (mapped from the verified bytes)", i64::from(text.contains("survived wrote=true")), 1);
+        println!("MWPROBE RESULT SIGNED {}", if fails.get() == 0 { "PASS" } else { "FAIL" });
+        return;
+    }
 
     let hello = sc(1000, [0; 4]);
     if hello == ENOSYS && dynelf {
@@ -195,7 +250,9 @@ fn main() {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755));
         }
-        check("C  a #! script with a dynamic interpreter is refused with EACCES", i64::from(spawn_errno(script, &[]) == Some(13)), 1);
+        let c_errno = spawn_errno(script, &[]);
+        println!("MWPROBE C errno={c_errno:?} script_len={:?}", std::fs::metadata(script).map(|m| m.len()));
+        check("C  a #! script with a dynamic interpreter is refused with EACCES", i64::from(c_errno == Some(13)), 1);
         let noop = std::process::Command::new("/bin/mwprobe").arg("noop").env_clear().status();
         check("H  a static child still runs", i64::from(matches!(&noop, Ok(s) if s.success())), 1);
         // The scope, pinned: this feature refuses IMAGES. A kernel with no mapping policy still lets a program map a file executable
@@ -228,6 +285,13 @@ fn main() {
         check("a dynamic child with an extra library runs (stock)", i64::from(ok), 1);
         let (ok, _) = run_dynamic("/bin/busybox", "true");
         check("a dynamic child that needs only libc runs (stock)", i64::from(ok), 1);
+        // For contrast with the signed kernel, and not an assertion: the same self-rewriting child under a kernel that maps lazily from the file.
+        let out = std::process::Command::new("/bin/signed").args(["selfclobber", "/bin/signed"]).env_clear().output();
+        let how = match &out {
+            Ok(o) => format!("status={:?} stdout={:?}", o.status, String::from_utf8_lossy(&o.stdout).trim()),
+            Err(e) => format!("spawn failed: {e}"),
+        };
+        println!("MWPROBE selfclobber (stock, lazy): {how}");
         println!("MWPROBE RESULT CONTROL {}", if fails.get() == 0 { "PASS" } else { "FAIL" });
         return;
     }
@@ -311,7 +375,9 @@ fn main() {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755));
         }
-        check("C  a #! script with a dynamic interpreter is refused", i64::from(spawn_errno(script, &[]) == Some(13)), 1);
+        let c_errno = spawn_errno(script, &[]);
+        println!("MWPROBE C errno={c_errno:?} script_len={:?}", std::fs::metadata(script).map(|m| m.len()));
+        check("C  a #! script with a dynamic interpreter is refused", i64::from(c_errno == Some(13)), 1);
         // D. Mappings.
         let file_exec = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd as u64, 0]);
         check("D1 mmap(file, PROT_EXEC) is refused", file_exec, EACCES);

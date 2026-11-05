@@ -333,6 +333,17 @@ single-threaded, before the first user instruction, with no kernel context.
 Shanghai's sample table reads `mw.sample.also=/path` (one more path `kernel_pre` refuses) and records what it could and could not
 see (call 1006); the probe checks that the kernel's own words and another namespace's keys were invisible.
 
+## Allowing from the checked bytes (`ExecVerdict::AllowFromImage`, `Hooks::exec_sidecar`)
+
+A policy that *verifies* an image (a hash, a signature) has a problem that one that merely refuses does not: the kernel hands it its own
+copy of the whole file, which nothing can change while it reads it, but the loader would otherwise map whole-page segment pages as lazy
+records read from the inode at fault time, and a file rewritten (or a path renamed) after the check would run unchecked bytes. A policy
+answers `AllowFromImage` to say "I checked `image`; map from it": every page is placed from those bytes, no inode is attached and the path
+is not looked up again. The cost is the shared file-page cache for that image. `Hooks::exec_sidecar: Some(".sig")` makes the loader also read
+`<path>.sig` (at most 4 KiB) and pass it as `ExecKind::Image { sidecar }`, so the policy stays a pure function of its event. The worked
+example is `crates/akuma-mw-signed-exec`; the proof is the probe child that rewrites its own file while running (stock kernel: SIGSEGV;
+signed kernel: survives).
+
 ## The rules, and why each is there
 
 - **No hook touches a lock.** `kernel_*` and `fallback` run under the kernel lock, which the kernel takes. `own_*` run outside it,

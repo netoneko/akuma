@@ -244,18 +244,40 @@ pub fn load_task<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &st
             return Err(LoadError::Refused(no));
         }
     }
+    // Whether the policy checked `image` and asked for it to be the only source of the code (`ExecVerdict::AllowFromImage`).
     #[cfg(feature = "middleware")]
-    {
+    let from_image = {
+        use crate::middleware::{ExecKind, ExecVerdict};
         let interp = akuma_elf_exec::interp_path(image).ok().flatten().and_then(|b| core::str::from_utf8(b).ok());
-        if let Some(no) = crate::middleware::exec_event(&crate::middleware::ExecKind::Image { path, interp, image }) {
-            return Err(LoadError::Refused(no));
+        let sidecar = read_sidecar::<M>(path);
+        match crate::middleware::exec_verdict(&ExecKind::Image { path, interp, image, sidecar: sidecar.as_deref() }) {
+            ExecVerdict::Deny(no) => return Err(LoadError::Refused(no.unsigned_abs().into())),
+            ExecVerdict::AllowFromImage => true,
+            ExecVerdict::Allow => false,
         }
+    };
+    #[cfg(not(feature = "middleware"))]
+    let from_image = false;
+    load_task_inner::<M>(argv, env, image, path, from_image).ok_or(LoadError::NoMem)
+}
+
+/// The sidecar the middleware asked for (`Hooks::exec_sidecar`), at most 4 KiB. One allocation, and only when a table asks.
+#[cfg(feature = "middleware")]
+fn read_sidecar<M: Loader>(path: &str) -> Option<Vec<u8>> {
+    let suffix = crate::middleware::exec_sidecar()?;
+    let mut name = String::new();
+    name.try_reserve_exact(path.len() + suffix.len()).ok()?;
+    name.push_str(path);
+    name.push_str(suffix);
+    let fs = M::root_fs();
+    if fs.metadata(&name).ok()?.size > 4096 {
+        return None;
     }
-    load_task_inner::<M>(argv, env, image, path).ok_or(LoadError::NoMem)
+    fs.read_file(&name).ok()
 }
 
 #[must_use]
-fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Option<TaskImage> {
+fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &str, from_image: bool) -> Option<TaskImage> {
     const NO_SEG: LoadSeg = LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 };
     let mut segs = [NO_SEG; 16];
     let (prog, n) = akuma_elf_exec::program(image, &mut segs).ok()?;
@@ -266,7 +288,9 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
     let root = tree::new_root::<M>()?;
     M::with_task(|t| t.root_pa = root);
 
-    let image_inode = M::root_fs().resolve_inode(path).ok();
+    // From the verified bytes only: no inode, so no lazy file page is read from the file later and the path is not looked up again
+    // (a `rename` between the read and here would name another inode).
+    let image_inode = if from_image { None } else { M::root_fs().resolve_inode(path).ok() };
     for seg in &segs[..n] {
         let (first, last) = place_segment::<M>(root, image, seg, &segs[..n], image_inode)?;
         add_region::<M>(first, last);
@@ -286,7 +310,7 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
                 return None;
             };
             let mut hi = akuma_elf_exec::INTERP_BASE;
-            let ldso_inode = M::root_fs().resolve_inode(&eff).ok();
+            let ldso_inode = if from_image { None } else { M::root_fs().resolve_inode(&eff).ok() };
             for seg in &isegs[..n] {
                 hi = hi.max(place_segment::<M>(root, &ldso, seg, &isegs[..n], ldso_inode)?.1);
             }

@@ -157,9 +157,9 @@ mod tests {
 
     #[test]
     fn a_dynamic_image_is_refused_and_a_static_one_is_not() {
-        let dynamic = ExecKind::Image { path: "/bin/busybox", interp: Some("/lib/ld-musl-x86_64.so.1"), image: &[] };
+        let dynamic = ExecKind::Image { path: "/bin/busybox", interp: Some("/lib/ld-musl-x86_64.so.1"), image: &[], sidecar: None };
         assert_eq!(ev(dynamic), ExecVerdict::Deny(EACCES));
-        assert_eq!(ev(ExecKind::Image { path: "/bin/mwprobe", interp: None, image: &[] }), ExecVerdict::Allow);
+        assert_eq!(ev(ExecKind::Image { path: "/bin/mwprobe", interp: None, image: &[], sidecar: None }), ExecVerdict::Allow);
     }
 
     #[test]

@@ -1,0 +1,15 @@
+[package]
+name = "akuma-mw-signed-exec"
+version = "0.1.0"
+edition = "2024"
+description = "Syscall middleware: signed code only. An exec policy that lets an image run only if its SHA-256 is on an allowlist or a detached Ed25519 signature over its bytes verifies under a key scoped to its path, and maps it from the bytes it checked (B22)"
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["middleware"] }
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-ed25519 = { path = "../akuma-ed25519" }
+# SHA-256 of the image. RustCrypto's, like the signature check behind `akuma-ed25519`.
+sha2 = { version = "0.10", default-features = false }

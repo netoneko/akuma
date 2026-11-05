@@ -19,7 +19,7 @@
 # `qemu-system-aarch64 -machine virt` directly, the line scripts/cargo_runner.sh uses for TCG, and stops it by its pid file.
 set -eu
 cd "$(dirname "$0")/.."
-W=${MW_WORK:-/tmp/shanghai-mw}; E=${E:-/opt/homebrew/opt/e2fsprogs/sbin}; SMP=${SMP:-1}
+W=${MW_WORK:-/tmp/shanghai-mw}; E=${E:-/opt/homebrew/opt/e2fsprogs/sbin}; OPENSSL=${OPENSSL:-/opt/homebrew/opt/openssl@3/bin/openssl}; SMP=${SMP:-1}
 WHICH=${1:-all}
 # Words the probe expects every kernel to be given (boot parameters, B22): `mw.sample.also` is read by the sample table, `mw.other.secret`
 # belongs to another namespace and must stay invisible to it. A kernel without the sample table must ignore both.
@@ -31,7 +31,7 @@ build_probe() { # arch
     -C relocation-model=static -O shanghai/mwprobe/mwprobe.rs -o "$W/mwprobe-$1" 2>/dev/null
 }
 image() { # arch
-  rm -f "$W/mw-$1.img"; "$E/mke2fs" -q -F -t ext2 -b 4096 "$W/mw-$1.img" 16m
+  rm -f "$W/mw-$1.img"; "$E/mke2fs" -q -F -t ext2 -b 4096 "$W/mw-$1.img" 96m
   cat > "$W/cmds-$1" <<EOF
 mkdir /bin
 mkdir /tmp
@@ -57,14 +57,42 @@ sif /usr/bin/xz mode 0100755
 write $d/bin/busybox /bin/busybox
 sif /bin/busybox mode 0100755
 EOF
+  signed_assets "$1"
+  cat "$W/sigfiles-$1/cmds" >> "$W/cmds-$1"
   "$E/debugfs" -w -f "$W/cmds-$1" "$W/mw-$1.img" >/dev/null 2>&1
+}
+# The files the signed-exec kernel's probe runs, made from the probe binary (a static ELF ignores bytes after its segments, so a byte
+# appended is a different file that still runs), and the key that signs some of them. Ed25519 by OpenSSL 3 (macOS's stock one has none).
+signed_assets() { # arch
+  d=$W/sigfiles-$1; rm -rf "$d"; mkdir -p "$d"; base=$W/mwprobe-$1
+  "$OPENSSL" genpkey -algorithm ed25519 -out "$d/key.pem" 2>/dev/null
+  "$OPENSSL" pkey -in "$d/key.pem" -pubout -outform DER 2>/dev/null | tail -c 32 | xxd -p -c 64 > "$d/pub.hex"
+  mk() { cp "$base" "$d/$1"; printf '%s' "$2" >> "$d/$1"; }
+  mk unlisted A; mk signed B; mk tampered D
+  "$OPENSSL" pkeyutl -sign -inkey "$d/key.pem" -rawin -in "$d/signed" -out "$d/signed.sig" 2>/dev/null
+  cat > "$d/cmds" <<CMDS
+mkdir /opt
+write $d/unlisted /bin/unlisted
+sif /bin/unlisted mode 0100755
+write $d/signed /bin/signed
+sif /bin/signed mode 0100755
+write $d/signed.sig /bin/signed.sig
+write $d/tampered /bin/tampered
+sif /bin/tampered mode 0100755
+write $d/signed.sig /bin/tampered.sig
+write $d/signed /opt/signed
+sif /opt/signed mode 0100755
+write $d/signed.sig /opt/signed.sig
+write $base /tmp/mwprobe-copy
+sif /tmp/mwprobe-copy mode 0100755
+CMDS
 }
 wait_result() { # console
   n=0; while [ $n -lt 120 ]; do grep -a -q 'MWPROBE RESULT' "$1" 2>/dev/null && break; n=$((n+1)); sleep 2; done
 }
 report() { # name arch console want
   echo "== $1 ($2, smp=$SMP)"
-  grep -a -E '^(PASS|FAIL|MWPROBE|\[mw\])|PANIC|\[Fault\]' "$3" || echo "(no probe output)"
+  grep -a -E '^(PASS|FAIL|MWPROBE|\[mw\]|\[signed\])|PANIC|\[Fault\]' "$3" || echo "(no probe output)"
   grep -a -q "MWPROBE RESULT $4" "$3"
 }
 
@@ -72,21 +100,22 @@ report() { # name arch console want
 # reuses a cached ELF (switching back to a feature set built earlier) it does not relink, link_kernel.sh does not run, and
 # the .bin on disk is the OTHER build's - the control then silently boots the middleware kernel (seen 2026-11-05).
 stage() { # name target arch
+  rm -rf "$W/$1-$3"   # a stale directory of that name would make `cp` copy INTO it
   if [ "$3" = aarch64 ]; then sh scripts/mkbin.sh "target/$2/release/shanghai" "$W/$1-$3" >/dev/null 2>&1
   else cp "target/$2/release/shanghai" "$W/$1-$3"; fi
 }
 
-run_x86_64() { # name kernel want [initargs]
-  export TX_KERNEL=$2 TX_DISK=$W/mw-x86_64.img TX_RUN=$W/run-x86_64-$1 TX_PORT=${MW_PORT:-2251} TX_SMP=$SMP TX_INIT="init=/bin/mwprobe${4:+ initargs=$4} $MW_PARAMS"
+run_x86_64() { # name kernel want [initargs] [extra boot words]
+  export TX_KERNEL=$2 TX_DISK=$W/mw-x86_64.img TX_RUN=$W/run-x86_64-$1 TX_PORT=${MW_PORT:-2251} TX_SMP=$SMP TX_INIT="init=/bin/mwprobe${4:+ initargs=$4} $MW_PARAMS${5:+ $5}"
   python3 scripts/kvm/taoxichuan/tcg_rig.py boot fresh >/dev/null
   wait_result "$W/run-x86_64-$1/console.log"
   python3 scripts/kvm/taoxichuan/tcg_rig.py stop >/dev/null 2>&1 || true
   report "$1" x86_64 "$W/run-x86_64-$1/console.log" "$3"
 }
 
-run_aarch64() { # name kernel.bin want [initargs]
+run_aarch64() { # name kernel.bin want [initargs] [extra boot words]
   d=$W/run-aarch64-$1; rm -rf "$d"; mkdir -p "$d"; cp "$W/mw-aarch64.img" "$d/disk.img"; : > "$d/console.log"
-  cl="init=/bin/mwprobe${4:+ initargs=$4} $MW_PARAMS epoch=$(date +%s)"; [ "$SMP" != 1 ] && cl="$cl smp=$SMP"
+  cl="init=/bin/mwprobe${4:+ initargs=$4} $MW_PARAMS${5:+ $5} epoch=$(date +%s)"; [ "$SMP" != 1 ] && cl="$cl smp=$SMP"
   qemu-system-aarch64 -machine virt,gic-version=3 -accel tcg -cpu max -smp "$SMP" -m 1024 \
     -kernel "$2" -append "$cl" -nodefaults -no-reboot -display none -serial "file:$d/console.log" \
     -global virtio-mmio.force-legacy=false \
@@ -111,6 +140,8 @@ for arch in x86_64 aarch64; do
   stage nodl "$tgt" "$arch"
   cargo build -p shanghai --features no-dynamic-elf --target "$tgt" --release
   stage dynelf "$tgt" "$arch"
+  cargo build -p shanghai --features signed-exec --target "$tgt" --release
+  stage signed "$tgt" "$arch"
   # Three kernels per machine: stock (the control), the sample table alone (the no-dynamic-loading guards must be ABSENT:
   # they are a feature, off by default), and the sample table with --features no-dynamic-loading (initargs=nodl: they must be ON).
   "run_$arch" control "$W/plain-$arch" 'CONTROL PASS' || rc=1
@@ -118,6 +149,9 @@ for arch in x86_64 aarch64; do
   "run_$arch" no-dynamic-loading "$W/nodl-$arch" 'PASS' nodl || rc=1
   # And the build-time ban in the elf crate (--features no-dynamic-elf, NO middleware): dynamic images refused with EACCES, scope pinned.
   "run_$arch" no-dynamic-elf "$W/dynelf-$arch" 'DYNELF PASS' dynelf || rc=1
+  # Signed code only (--features signed-exec): the command line allowlists the probe by hash and trusts one key under /bin/.
+  sp="mw.signed.allow=$(shasum -a 256 "$W/mwprobe-$arch" | cut -d' ' -f1):/bin/mwprobe mw.signed.key=$(cat "$W/sigfiles-$arch/pub.hex"):/bin/"
+  "run_$arch" signed-exec "$W/signed-$arch" 'SIGNED PASS' signed "$sp" || rc=1
 done
 [ $rc -eq 0 ] && echo "MW GATE PASS ($WHICH, smp=$SMP)" || echo "MW GATE FAIL ($WHICH, smp=$SMP)"
 exit $rc

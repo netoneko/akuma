@@ -86,6 +86,8 @@ pub fn failed() -> bool {
 pub trait ParamSource {
     /// The value of the first `key=value` word, if any.
     fn get(&self, key: &str) -> Option<&str>;
+    /// Every `key=value` word with this key, in order, for a setting that may be repeated (`mw.signed.allow=` once per binary).
+    fn for_each(&self, key: &str, f: &mut dyn FnMut(&str));
 }
 
 /// A read-only view of a command line, narrowed to the words under up to three prefixes in a row.
@@ -130,6 +132,16 @@ impl<'a> Params<'a> {
         line.split_ascii_whitespace().find_map(|w| self.rest(w)?.strip_prefix(key)?.strip_prefix('='))
     }
 
+    /// [`ParamSource::for_each`], but each value borrows from the line, not from this view (see [`Self::value`]).
+    pub fn each_value(&self, key: &str, mut f: impl FnMut(&'a str)) {
+        let line: &'a str = self.line;
+        for w in line.split_ascii_whitespace() {
+            if let Some(v) = self.rest(w).and_then(|r| r.strip_prefix(key)).and_then(|r| r.strip_prefix('=')) {
+                f(v);
+            }
+        }
+    }
+
     fn rest<'t>(&self, mut word: &'t str) -> Option<&'t str> {
         for seg in &self.prefix[..self.depth] {
             word = word.strip_prefix(seg)?;
@@ -142,6 +154,9 @@ impl ParamSource for Params<'_> {
     fn get(&self, key: &str) -> Option<&str> {
         self.value(key)
     }
+    fn for_each(&self, key: &str, f: &mut dyn FnMut(&str)) {
+        self.each_value(key, f);
+    }
 }
 
 /// A fixed table of `(key, value)`, for a host test or a compiled-in default. A newtype, because a bare slice's own `get` would
@@ -152,6 +167,11 @@ pub struct Table<'a>(pub &'a [(&'a str, &'a str)]);
 impl ParamSource for Table<'_> {
     fn get(&self, key: &str) -> Option<&str> {
         self.0.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+    }
+    fn for_each(&self, key: &str, f: &mut dyn FnMut(&str)) {
+        for (_, v) in self.0.iter().filter(|(k, _)| *k == key) {
+            f(v);
+        }
     }
 }
 
@@ -179,6 +199,25 @@ mod tests {
     fn a_key_is_whole_not_a_prefix() {
         let p = Params::new("mw.a.keyring=1 mw.a.key=2", MW).scoped("a.");
         assert_eq!(p.get("key"), Some("2"));
+    }
+
+    #[test]
+    fn a_repeated_key_is_visited_in_order_and_only_under_its_namespace() {
+        let p = Params::new("mw.s.allow=a mw.t.allow=x mw.s.allow=b mw.s.allowed=c mw.s.allow=c", MW).scoped("s.");
+        let mut seen = [""; 4];
+        let mut n = 0;
+        p.each_value("allow", |v| {
+            seen[n] = v;
+            n += 1;
+        });
+        assert_eq!((n, &seen[..n]), (3, &["a", "b", "c"][..]));
+        let t = Table(&[("k", "1"), ("j", "2"), ("k", "3")]);
+        let mut m = 0;
+        let mut count = 0;
+        t.for_each("k", &mut |_| count += 1);
+        assert_eq!(count, 2);
+        p.for_each("allow", &mut |_| m += 1);
+        assert_eq!(m, 3);
     }
 
     #[test]

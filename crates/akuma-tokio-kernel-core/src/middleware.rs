@@ -249,7 +249,12 @@ pub type OwnPost<S> = fn(&mut OwnCtx<'_, S>, u64);
 pub enum ExecKind<'a> {
     /// `execve` (and init, and a `#!` interpreter) is about to replace the process with this image. Asked before anything is torn
     /// down, so a refusal leaves the caller exactly as it was. `interp` is the `PT_INTERP` path of a dynamically linked image.
-    Image { path: &'a str, interp: Option<&'a str>, image: &'a [u8] },
+    ///
+    /// `path` is the symlink-resolved path the kernel read (`/bin/ls` arrives as `/bin/busybox`), **not normalised**: a policy that
+    /// matches on it must refuse a relative one and `..`/`//` itself. `image` is the kernel's own copy of the whole file, never mapped
+    /// to user space, so it cannot change while a policy reads it. `sidecar` is the contents of `<path><suffix>` (at most 4 KiB) when
+    /// the table asks for one ([`Hooks::exec_sidecar`]) and the file exists; `None` otherwise.
+    Image { path: &'a str, interp: Option<&'a str>, image: &'a [u8], sidecar: Option<&'a [u8]> },
     /// `mmap` with `PROT_EXEC`. `inode` is the regular file being mapped, `None` for anonymous memory.
     Map { inode: Option<u32> },
     /// `mprotect` adding `PROT_EXEC`. The kernel does not track which file a present page came from, so there is no identity.
@@ -267,6 +272,11 @@ pub struct ExecEvent<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecVerdict {
     Allow,
+    /// Allow, **and map the image from the bytes this policy was shown**. For an `Image` event the loader then places every page
+    /// from `image` (no lazy file record, no second lookup of the path), so the code that runs is exactly the code that was checked
+    /// even if the file is rewritten, truncated or renamed afterwards. Costs the shared file-page cache for that image. For `Map` and
+    /// `Protect` it is the same as `Allow`.
+    AllowFromImage,
     /// Refuse, with this positive errno (`13` is `EACCES`).
     Deny(i32),
 }
@@ -350,6 +360,10 @@ pub struct Hooks<S: 'static> {
     /// If the line could not be captured whole ([`params::failed`]) the view is empty; a policy that needs a value must read
     /// that as "refuse", not as "unset".
     pub init: Option<InitHook<S>>,
+    /// A suffix (`".sig"`): for an `Image` event the loader also reads `<path><suffix>` (at most 4 KiB) and passes its bytes as
+    /// `sidecar`. `None`: no extra read, and `sidecar` is `None`. The policy stays a pure function of the event: it never touches
+    /// the filesystem, and a swapped sidecar cannot make other bytes verify, because it is checked against the `image` it was shown.
+    pub exec_sidecar: Option<&'static str>,
 }
 
 /// See [`Hooks::init`].
@@ -359,7 +373,7 @@ impl<S> Hooks<S> {
     /// No hooks.
     #[must_use]
     pub const fn new() -> Self {
-        Self { kernel_pre: &[], kernel_post: &[], fallback: &[], own_pre: &[], own_post: &[], exec: None, init: None }
+        Self { kernel_pre: &[], kernel_post: &[], fallback: &[], own_pre: &[], own_post: &[], exec: None, init: None, exec_sidecar: None }
     }
 }
 
@@ -551,6 +565,8 @@ pub trait Dispatch: Sync {
     fn run_own_post(&self, latch: Latch, nr: u64, args: [u64; 6], tid: u64, ret: u64);
     /// See [`Middleware::exec_event`].
     fn exec_event(&self, kind: &ExecKind<'_>) -> ExecVerdict;
+    /// See [`Hooks::exec_sidecar`].
+    fn exec_sidecar(&self) -> Option<&'static str>;
     /// See [`Middleware::init_params`].
     fn init_with(&self, params: &Params<'static>);
 }
@@ -573,6 +589,9 @@ impl<S: Send + 'static> Dispatch for Middleware<S> {
     }
     fn exec_event(&self, kind: &ExecKind<'_>) -> ExecVerdict {
         Self::exec_event(self, kind)
+    }
+    fn exec_sidecar(&self) -> Option<&'static str> {
+        self.hooks.exec_sidecar
     }
     fn init_with(&self, params: &Params<'static>) {
         self.init_params(params);
@@ -620,9 +639,21 @@ pub fn run_kernel(nr: u64, args: [u64; 6], mut inner: impl FnMut() -> u64) -> u6
 #[must_use]
 pub fn exec_event(kind: &ExecKind<'_>) -> Option<u64> {
     match active()?.exec_event(kind) {
-        ExecVerdict::Allow => None,
+        ExecVerdict::Allow | ExecVerdict::AllowFromImage => None,
         ExecVerdict::Deny(no) => Some(no.unsigned_abs().into()),
     }
+}
+
+/// The suffix of the file the loader should also read next to an image (see [`Hooks::exec_sidecar`]), if the table wants one.
+#[must_use]
+pub fn exec_sidecar() -> Option<&'static str> {
+    active()?.exec_sidecar()
+}
+
+/// [`exec_event`] with the whole answer: the loader needs to tell `Allow` from `AllowFromImage`. No middleware: `Allow`.
+#[must_use]
+pub fn exec_verdict(kind: &ExecKind<'_>) -> ExecVerdict {
+    active().map_or(ExecVerdict::Allow, |mw| mw.exec_event(kind))
 }
 
 /// The `own` side of a call before the kernel lock: `Some` when there is something to run after it.
@@ -884,7 +915,7 @@ mod tests {
         });
         NONE.arm(machine());
         MW.arm(machine());
-        let img = |interp| ExecKind::Image { path: "/bin/x", interp, image: &[] };
+        let img = |interp| ExecKind::Image { path: "/bin/x", interp, image: &[], sidecar: None };
         assert_eq!(NONE.exec_event(&img(Some("/lib/ld.so"))), ExecVerdict::Allow);
         assert_eq!(NONE.exec_event(&ExecKind::Protect), ExecVerdict::Allow);
         assert_eq!(MW.exec_event(&img(Some("/lib/ld.so"))), ExecVerdict::Deny(13));
@@ -892,6 +923,28 @@ mod tests {
         assert_eq!(MW.exec_event(&ExecKind::Map { inode: Some(7) }), ExecVerdict::Deny(1));
         assert_eq!(MW.exec_event(&ExecKind::Map { inode: None }), ExecVerdict::Allow);
         assert_eq!(MW.exec_event(&ExecKind::Protect), ExecVerdict::Deny(1));
+    }
+
+    #[test]
+    fn a_policy_can_ask_for_the_image_to_be_the_only_source_and_for_a_sidecar() {
+        static MW: Middleware<u32> = Middleware::new(0, Hooks {
+            exec: Some(|ev| match ev.kind {
+                // Allowed only if the sidecar says so, and then mapped from the checked bytes.
+                ExecKind::Image { sidecar: Some(b"ok"), .. } => ExecVerdict::AllowFromImage,
+                ExecKind::Image { .. } => ExecVerdict::Deny(13),
+                _ => ExecVerdict::Allow,
+            }),
+            exec_sidecar: Some(".sig"),
+            ..Hooks::new()
+        });
+        MW.arm(machine());
+        assert_eq!(MW.hooks.exec_sidecar, Some(".sig"));
+        let img = |sidecar| ExecKind::Image { path: "/bin/x", interp: None, image: &[1, 2, 3], sidecar };
+        assert_eq!(MW.exec_event(&img(Some(b"ok"))), ExecVerdict::AllowFromImage);
+        assert_eq!(MW.exec_event(&img(Some(b"no"))), ExecVerdict::Deny(13));
+        assert_eq!(MW.exec_event(&img(None)), ExecVerdict::Deny(13));
+        // For a mapping or a protection change `AllowFromImage` is not a thing a policy needs to say.
+        assert_eq!(MW.exec_event(&ExecKind::Protect), ExecVerdict::Allow);
     }
 
     #[test]

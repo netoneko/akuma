@@ -585,6 +585,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-mw-signed-exec"
+version = "0.1.0"
+dependencies = [
+ "akuma-ed25519",
+ "akuma-primitives",
+ "akuma-tokio-kernel-core",
+ "sha2",
+]
+
+[[package]]
 name = "akuma-net"
 version = "0.1.0"
 dependencies = [
@@ -1605,6 +1615,7 @@ name = "shanghai"
 version = "0.1.0"
 dependencies = [
  "akuma-mw-no-dynamic-loading",
+ "akuma-mw-signed-exec",
  "akuma-primitives",
  "akuma-tokio-kernel",
 ]

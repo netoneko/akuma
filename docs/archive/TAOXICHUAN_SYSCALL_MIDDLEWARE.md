@@ -199,3 +199,17 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   buffer does not cover them and the pin does not stop an in-place write (the smallest fix is a verdict that makes the loader map a
   signed image from the verified buffer); and the crypto is RustCrypto's, reached through the new `crates/akuma-ed25519` (verify
   only, strict, RFC 8032 vectors). Nothing is signed or checked at exec yet.
+
+- **Signed code only** (2026-11-05, the owner: hashes, with a detached `.sig` as the second path, because stock busybox and rust cannot carry a
+  trailer). `crates/akuma-mw-signed-exec` + Shanghai feature `signed-exec`: `mw.signed.allow=<sha256>:<scope>` and `mw.signed.key=<pubkey>:<scopes>`
+  on the command line; a detached `<path>.sig` read by the loader when the table asks (`Hooks::exec_sidecar`, 4 KiB cap) and passed as
+  `ExecKind::Image { sidecar }`; the verdict `ExecVerdict::AllowFromImage` makes the loader map the image from the bytes that were checked (no
+  inode, no second path lookup). The time-of-check gap found earlier (lazy file pages read at fault time; the pin does not stop writes; the path was
+  resolved twice) is closed by that verdict, and proved with a child that rewrites its own file: **SIGSEGV (status 11) on the stock kernel,
+  survives on the signed kernel, both machines**. **Result, both machines at SMP=4: `MW GATE PASS`, 172 PASS lines** (control 8, `middleware` 23,
+  `no-dynamic-loading` 39, `no-dynamic-elf` 6, `signed-exec` 10, each x2); 9 host tests in the crate. Gate-rig bugs found on the way, both mine:
+  the signed assets directory shared a name with the staged kernel (`cp` copied the kernel INTO the directory, and the kernel that booted was a
+  directory: empty console), and five 5 MB copies of the probe filled a 32 MB image so a `/tmp` write silently produced an empty file
+  (the `#!` case failed with ENOEXEC); the image is 96 MB now and `stage` replaces its target. Not built: the label, minisign/signify sidecars,
+  a hash cache by inode, compiled-in keys. Not measured: the cost of hashing on every exec. Design and limits: `shanghai/MIDDLEWARE_COMPOSITION.md`.
+
