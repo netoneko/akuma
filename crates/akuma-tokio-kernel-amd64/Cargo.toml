@@ -45,6 +45,7 @@ smp = []
 # the physmap, kernel page tables, heap + PMM bring-up. One crate where
 # `amd64/src` used to be the only home of all four.
 akuma-boot-amd64 = { path = "../akuma-boot-amd64" }
+akuma-pagetable = { path = "../akuma-pagetable" }
 # The console: COM1, minimal. The banner's only dependency at this stage.
 akuma-comconsole = { path = "../akuma-comconsole", optional = true }
 # The GDT/TSS descriptors this kernel loads (one core, no userspace yet — the

@@ -246,6 +246,19 @@ pub mod ctlreg {
     const CR4_SMEP: u64 = 1 << 20;
     const CR4_SMAP: u64 = 1 << 21;
 
+    /// Rewrite `CR3` with its own value: the architectural flush of every non-global TLB entry on this core.
+    ///
+    /// No mapping changes and the root stays the live one; the walk simply happens again on the next access. This is the
+    /// receiving half of a shootdown IPI. (Switching address spaces is `CR3` with *another* root, which is not here.)
+    #[inline(always)]
+    pub fn flush_non_global() {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: reloading the CR3 already active changes no mapping.
+        unsafe {
+            core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _, options(nostack));
+        };
+    }
+
     /// Make the FPU and SSE usable on this core.
     ///
     /// `CR0.EM=0`, `CR0.MP=1`, `CR4.OSFXSR=1`, `CR4.OSXMMEXCPT=1` — exactly the four bits `boot.s`
@@ -477,6 +490,22 @@ pub mod msr {
         // `%gs:` accesses.
         unsafe { write(Msr::KernelGsBase, base) };
         Ok(())
+    }
+
+    /// `IA32_APIC_BASE.EN` (bit 11): the xAPIC global-enable bit.
+    pub const APIC_GLOBAL_ENABLE: u64 = 1 << 11;
+
+    /// Set `IA32_APIC_BASE.EN` on this core and return the value now in the MSR.
+    ///
+    /// One bit is added; the base-address field and every other bit are written back as read, so the page the
+    /// APIC answers on does not move. Hardware leaves a started core's APIC enabled; a hypervisor's model may not.
+    /// The caller still maps the register page before touching it. That mapping, not this write, is what a stale
+    /// or wrong base would break, and it has its own `unsafe` vouch (`MmioWindow::new`).
+    pub fn enable_apic_global() -> u64 {
+        let v = read(Msr::ApicBase) | APIC_GLOBAL_ENABLE;
+        // SAFETY: one architectural bit set, the address field as found.
+        unsafe { write(Msr::ApicBase, v) };
+        v
     }
 
     /// Rewrite one PAT entry to write-combining: entry `index` (0..8) becomes

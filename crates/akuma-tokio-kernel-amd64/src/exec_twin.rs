@@ -441,10 +441,8 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
 pub fn enter_user_on(root: u64, ef: &akuma_ring3_amd64::EntryFrame) -> ! {
     if root != 0 {
         // SAFETY: `root` is a PMM-resident page-table frame naming the task's
-        // image and the shared kernel half this code runs on.
-        unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
-        };
+        // image and the shared kernel half this code runs on (`load_cr3`'s contract).
+        unsafe { akuma_pagetable::amd64::load_cr3(root) };
     }
     // Ring 3 runs without the kernel lock.
     let _ = crate::smp::bkl_leave_all();

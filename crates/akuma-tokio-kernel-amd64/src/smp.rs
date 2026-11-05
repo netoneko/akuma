@@ -17,45 +17,23 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-#[cfg(feature = "smp")]
-use akuma_boot_amd64::phys::phys_ptr;
 use akuma_tokio_kernel_core::bkl;
 
 /// Most cores the per-CPU tables hold (`akuma_ring3_amd64::MAX_CPUS`).
 pub const MAX_CPUS: usize = akuma_ring3_amd64::MAX_CPUS;
 
 #[cfg(feature = "smp")]
-const AP_TRAMPOLINE_PA: u64 = 0x8000;
-#[cfg(feature = "smp")]
-const AP_STARTUP_VECTOR: u8 = (AP_TRAMPOLINE_PA >> 12) as u8;
-#[cfg(feature = "smp")]
-/// Mailbox offsets, mirrored as `AP_MB_*` in `boot.s`.
-const AP_MB_CR3: u64 = AP_TRAMPOLINE_PA + 0xF00;
-#[cfg(feature = "smp")]
-const AP_MB_STACK: u64 = AP_TRAMPOLINE_PA + 0xF08;
-#[cfg(feature = "smp")]
-const AP_MB_ENTRY: u64 = AP_TRAMPOLINE_PA + 0xF10;
-#[cfg(feature = "smp")]
-const AP_MB_INDEX: u64 = AP_TRAMPOLINE_PA + 0xF18;
+use akuma_boot_amd64::ap::{self, AP_MB_CR3, AP_MB_ENTRY, AP_MB_INDEX, AP_MB_STACK, AP_STARTUP_VECTOR, mailbox_write};
 #[cfg(feature = "smp")]
 /// An AP's boot stack is also its idle thread's: it runs `netpoll` (smoltcp) and
 /// takes ticks that nest another `netpoll`, so it is far deeper than amd64's 32 KiB.
 const AP_STACK_SIZE: usize = 128 * 1024;
-#[cfg(feature = "smp")]
-const PTE_P_RW: u64 = 0x3;
 #[cfg(feature = "smp")]
 /// Microseconds to wait after INIT, and the budget (spins) for an AP to report.
 const AP_INIT_DELAY_US: u64 = 10_000;
 #[cfg(feature = "smp")]
 const AP_ONLINE_BUDGET_US: u64 = 200_000;
 
-#[cfg(feature = "smp")]
-unsafe extern "C" {
-    static ap_trampoline_start: u8;
-    static ap_trampoline_end: u8;
-    static __ap_pml4: u8;
-    static __pdpt_low: u8;
-}
 
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
 
@@ -166,9 +144,8 @@ pub fn service_pending() {
     if pending == 0 || pending <= SHOOT_ACKED[me].load(Ordering::Relaxed) {
         return;
     }
-    // SAFETY: rewriting CR3 with its own value is the architectural full
-    // non-global flush; the root stays valid.
-    unsafe { core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _, options(nostack)) };
+    // Rewriting CR3 with its own value is the architectural full non-global flush; the root stays valid.
+    akuma_cpu::ctlreg::flush_non_global();
     SHOOT_ACKED[me].store(pending, Ordering::Release);
 }
 
@@ -320,46 +297,11 @@ fn tsc_delay_us(us: u64) {
 }
 
 #[cfg(feature = "smp")]
-fn mailbox_write(pa: u64, v: u64) {
-    // SAFETY: inside the trampoline page, which `start_secondaries` owns for
-    // the duration of bring-up (RAM below 1 MiB, clear of the PVH block).
-    unsafe { phys_ptr::<u64>(pa).write_volatile(v) };
-}
-
-#[cfg(feature = "smp")]
-/// Copy the active kernel PML4 into `__ap_pml4` with slot 0 pointing at
-/// `boot.s`'s still-intact identity PDPT, so the trampoline has somewhere to
-/// stand before it jumps high. Returns the root's physical address (it must be
-/// below 4 GiB: CR3 is 32-bit in the trampoline's protected-mode phase).
-fn ap_boot_root() -> u64 {
-    // `.bss.pagetables` is linked VMA = LMA (low), so a symbol's address IS its
-    // physical address (as in `amd64/src/smp.rs`).
-    let root = (&raw const __ap_pml4) as u64;
-    let identity = (&raw const __pdpt_low) as u64;
-    let kernel_root = akuma_boot_amd64::paging::active_root();
-    // SAFETY: both symbols are page-aligned pages in the kernel image
-    // (`boot.s`), reachable through the physmap; `kernel_root` is the live
-    // PML4, likewise inside it.
-    unsafe {
-        core::ptr::copy_nonoverlapping(phys_ptr::<u8>(kernel_root), phys_ptr::<u8>(root), 4096);
-        phys_ptr::<u64>(root).write_volatile(identity | PTE_P_RW);
-    }
-    root
-}
-
-#[cfg(feature = "smp")]
+/// Copy the trampoline to its page (`akuma_boot_amd64::ap`). Returns false if it does not fit below the mailbox.
 fn install_trampoline() -> bool {
-    let (src, len) = {
-        let s = &raw const ap_trampoline_start;
-        let e = &raw const ap_trampoline_end;
-        (s, e as usize - s as usize)
-    };
-    if len > (AP_MB_CR3 - AP_TRAMPOLINE_PA) as usize {
-        return false;
-    }
-    // SAFETY: the destination page is RAM inside the physmap owned by bring-up.
-    unsafe { core::ptr::copy_nonoverlapping(src, phys_ptr::<u8>(AP_TRAMPOLINE_PA), len) };
-    true
+    // SAFETY: the page is RAM below 1 MiB, clear of the PVH block, and `start_secondaries` owns it for the
+    // duration of bring-up (the fixed layouts of the two VMMs, named at `AP_TRAMPOLINE_PA`).
+    unsafe { ap::install_trampoline() }
 }
 
 #[cfg(feature = "smp")]
@@ -390,7 +332,7 @@ pub fn start_secondaries(cap: usize) -> usize {
         akuma_primitives::safe_print!(64, "  smp: {} cpu in the MADT, cap {} - single core\n", n, cap);
         return 0;
     }
-    let root = ap_boot_root();
+    let root = ap::ap_boot_root(akuma_boot_amd64::paging::active_root());
     if root >= (4 << 30) {
         akuma_primitives::safe_print!(96, "  smp: [FAIL] AP boot root above 4 GiB\n");
         return 0;
@@ -461,12 +403,7 @@ extern "C" fn ap_entry64(idx: u64) -> ! {
     // Hardware leaves a started core's APIC enabled; a hypervisor's model may
     // not (Akuma's SVM guest starts non-boot vCPUs with the bit clear), and the
     // ID read just below would fault on an unmapped page. Set it, as the BSP does.
-    {
-        use akuma_cpu::msr::{self, Msr};
-        // SAFETY: sets exactly one bit in an architectural MSR, leaving the
-        // address field as found - the write `lapic_init` makes on the BSP.
-        unsafe { msr::write(Msr::ApicBase, msr::read(Msr::ApicBase) | akuma_lapic_amd64::APIC_GLOBAL_ENABLE) };
-    }
+    akuma_cpu::msr::enable_apic_global();
     // The AP boot root's identity slot is no longer needed: nothing low runs.
     crate::gdt_init_cpu(idx);
     let _ = akuma_ring3_amd64::install_percpu(idx, akuma_lapic_amd64::apic_id());

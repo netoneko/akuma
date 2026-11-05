@@ -71,7 +71,6 @@ use akuma_ryzen_amd64::MachineDescription;
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
-use crate::phys::phys_ptr;
 use crate::usermode::UserCtx;
 use crate::{gdt, idt, lapic, paging, sched, serial, uaccess, usermode};
 
@@ -453,21 +452,7 @@ pub fn set_bsp_lapic_id(id: u32) {
     PERCPU[0].lapic_id.store(id, Ordering::Relaxed);
 }
 
-/// Where the trampoline is copied. A STARTUP IPI's vector is the page number of
-/// a 4 KiB page below 1 MiB (`0x08` → `0x8000`); this one is clear of every
-/// boot structure both VMMs place — QEMU's `hvm_start_info` at `0x1580`,
-/// Firecracker's at `0x6000` with its memory map at `0x7000` and command line
-/// at `0x20000` — and of the PMM, which is handed the region *containing the
-/// kernel* (from 1 MiB) and never the low one.
-const AP_TRAMPOLINE_PA: u64 = 0x8000;
-const AP_STARTUP_VECTOR: u8 = (AP_TRAMPOLINE_PA >> 12) as u8;
-
-/// The mailbox the trampoline reads: fixed offsets inside the trampoline page,
-/// mirrored as `AP_MB_*` in `boot.s`.
-const AP_MB_CR3: u64 = AP_TRAMPOLINE_PA + 0xF00;
-const AP_MB_STACK: u64 = AP_TRAMPOLINE_PA + 0xF08;
-const AP_MB_ENTRY: u64 = AP_TRAMPOLINE_PA + 0xF10;
-const AP_MB_INDEX: u64 = AP_TRAMPOLINE_PA + 0xF18;
+use akuma_boot_amd64::ap::{self, AP_MB_CR3, AP_MB_ENTRY, AP_MB_INDEX, AP_MB_STACK, AP_STARTUP_VECTOR, AP_TRAMPOLINE_PA, mailbox_write};
 
 /// Kernel stack for an AP's idle task, and therefore for every interrupt it
 /// takes while idle. Same size as a scheduler task's.
@@ -481,11 +466,6 @@ const AP_INIT_DELAY: u32 = 1_000_000;
 
 /// Spins to wait for an AP to report in before the STARTUP is repeated.
 const AP_ONLINE_BUDGET: u64 = 200_000_000;
-
-unsafe extern "C" {
-    static ap_trampoline_start: u8;
-    static ap_trampoline_end: u8;
-}
 
 /// Is the trampoline page ordinary RAM, and clear of everything the boot
 /// loader placed?
@@ -510,81 +490,11 @@ pub fn trampoline_page_available(machine: &MachineDescription, keep_out: &[(u64,
     in_ram && clear
 }
 
-/// Present + writable, for the slot-0 entry of the AP boot root.
-const PTE_P_RW: u64 = 0x3;
-
-unsafe extern "C" {
-    /// The AP boot root, a page in the low boot region (`boot.s`).
-    static __ap_pml4: u8;
-    /// The identity map `boot.s` built, which `drop_identity_map` unlinked from
-    /// the kernel root but did not destroy.
-    static __pdpt_low: u8;
-}
-
-/// Build the page-table root APs enable paging on, and return its **physical**
-/// address: the kernel's PML4 with slot 0 pointing back at `boot.s`'s identity
-/// map, so the trampoline has somewhere to stand before it jumps high.
-///
-/// # Why this is a static page and not three PMM frames
-///
-/// It used to allocate three — a root, a PDPT and a PD carrying a fresh 1 GiB
-/// identity map — and free them once every core was up. That was correct for as
-/// long as every PMM frame was below 4 GiB, and stopped being correct the moment
-/// the physmap grew past it (2026-09-12). The trampoline sets CR3 in 32-bit
-/// protected mode, because setting CR3 is how it gets *out* of 32-bit protected
-/// mode; CR3 is 32 bits wide there, so a root at `0x1_2000_0000` is loaded as
-/// `0x2000_0000` and the core triple-faults on its first paged instruction. The
-/// symptom is a VMM that exits with no output during `smp: cpu 1 online`.
-///
-/// The other two frames were never the problem — the PDPT and PD are named by
-/// 64-bit page-table fields the CPU only walks once it is in long mode — but
-/// they are not needed either: `boot.s`'s own identity map is still sitting in
-/// `.bss`, unlinked from the kernel root by `drop_identity_map` and otherwise
-/// untouched. Pointing at it costs one static page instead of three
-/// allocations, deletes the "no frames for the AP boot tables" failure path,
-/// and makes the map a core boots on the same map the BSP booted on rather than
-/// a second one that has to be kept in agreement with it.
-fn ap_boot_root(kernel_root: u64) -> u64 {
-    let root = (&raw const __ap_pml4) as u64;
-    let identity = (&raw const __pdpt_low) as u64;
-    // SAFETY: both symbols are page-aligned pages in `.bss.pagetables`, whose
-    // VMA is its LMA, so their addresses are physical and inside the physmap.
-    // `kernel_root` is a live PML4, likewise inside it.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            phys_ptr::<u8>(kernel_root),
-            phys_ptr::<u8>(root),
-            4096,
-        );
-        phys_ptr::<u64>(root).write_volatile(identity | PTE_P_RW);
-    }
-    root
-}
-
-/// Copy the trampoline to its page. Returns false if it does not fit below the
-/// mailbox, which is a build error surfacing at run time.
+/// Copy the trampoline to its page (`akuma_boot_amd64::ap`). Returns false if it does not fit below the mailbox.
 fn install_trampoline() -> bool {
-    // Two linker-visible symbols bracketing a `.rodata` blob in the kernel
-    // image; the difference is its length.
-    let (src, len) = {
-        let s = &raw const ap_trampoline_start;
-        let e = &raw const ap_trampoline_end;
-        (s, e as usize - s as usize)
-    };
-    if len > (AP_MB_CR3 - AP_TRAMPOLINE_PA) as usize {
-        return false;
-    }
-    // SAFETY: the destination page is RAM inside the physmap and belongs to no
-    // one — see `AP_TRAMPOLINE_PA`.
-    unsafe {
-        core::ptr::copy_nonoverlapping(src, phys_ptr::<u8>(AP_TRAMPOLINE_PA), len);
-    }
-    true
-}
-
-fn mailbox_write(pa: u64, v: u64) {
-    // SAFETY: inside the trampoline page, which `install_trampoline` owns.
-    unsafe { phys_ptr::<u64>(pa).write_volatile(v) };
+    // SAFETY: both call sites run after `trampoline_page_available` (or the fixed VMM layouts named at
+    // `AP_TRAMPOLINE_PA`) cleared the page, and bring-up owns it from here.
+    unsafe { ap::install_trampoline() }
 }
 
 /// Start every AP the MADT lists. Returns how many came online.
@@ -612,7 +522,7 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
         serial::puts("\n");
     }
 
-    let ap_root = ap_boot_root(sched::kernel_root());
+    let ap_root = ap::ap_boot_root(sched::kernel_root());
     // The constraint `ap_boot_root` exists to satisfy, checked rather than
     // trusted: this is a link-time property of `.bss.pagetables`, and a boot
     // that violated it would take the machine down with nothing on the wire.
@@ -759,7 +669,7 @@ pub fn ensure_started(idx: usize) -> bool {
 /// [`start_secondaries`]' loop body for one core, run after boot from whichever core the caller
 /// is on, with delays on the TSC.
 fn start_late(idx: usize, id: u32) -> bool {
-    let ap_root = ap_boot_root(sched::kernel_root());
+    let ap_root = ap::ap_boot_root(sched::kernel_root());
     if ap_root >= (4 << 30) || !install_trampoline() {
         return false;
     }

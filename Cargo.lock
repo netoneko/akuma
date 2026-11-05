@@ -1066,6 +1066,7 @@ dependencies = [
  "akuma-mmap",
  "akuma-mmu",
  "akuma-net",
+ "akuma-pagetable",
  "akuma-params",
  "akuma-pmm",
  "akuma-port",

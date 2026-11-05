@@ -250,30 +250,13 @@ const PTE_PAT: u64 = 1 << 7;
 const PDE_LARGE_PRESENT: u64 = 0x81;
 const TWO_MIB: u64 = 1 << 21;
 
-unsafe extern "C" {
-    /// `boot.s`'s page directories, one per GiB, contiguous: entry `i` maps
-    /// `[i * 2 MiB, (i + 1) * 2 MiB)`. In `.bootbss`, whose VMA is its LMA, so the
-    /// symbol's address is physical. Shared by the identity map and the physmap, and
-    /// by every kernel root and every AP, which copy only the PML4.
-    static __pd0: u8;
-}
-
 /// Spare page tables, for splitting a 2 MiB PDE that the framebuffer only partly
 /// covers: a framebuffer has at most two partly-covered 2 MiB ends. Written only
 /// by `map_wc`, once, on the boot CPU before any other core is running;
 /// afterwards the CPU's page walker is the only reader.
 static SPLIT_PT: [Table; 2] = [const { Table::zeroed() }; 2];
 
-/// The page directory covering 2 MiB-region `i` of `boot.s`'s identity/physmap
-/// map, and the entry's index in it. One directory per GiB, contiguous.
-fn boot_pd(i: usize) -> (&'static Table, usize) {
-    assert!(i < 512 * crate::phys::PHYSMAP_PDS, "2 MiB region outside the boot page directories");
-    let pd0 = crate::phys::phys_to_virt((&raw const __pd0) as u64) as usize;
-    // SAFETY: `__pd0..` is `PHYSMAP_PDS` contiguous 4 KiB-aligned page
-    // directories in `.bootbss`, live for the whole boot and never freed; `i`
-    // was checked to name one of them.
-    (unsafe { Table::at(pd0 + (i / 512) * 4096) }, i % 512)
-}
+use akuma_boot_amd64::paging::boot_pd;
 
 /// Did [`map_wc`] succeed? APs read this to know whether to program their own PAT.
 static WC_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

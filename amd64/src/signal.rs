@@ -1138,16 +1138,15 @@ const UC_FP_XSTATE: u64 = 1;
 /// user address (`sysret` faults in ring 0 on a non-canonical one), and `rflags`
 /// goes through [`sanitize_rflags`].
 pub fn sys_rt_sigreturn() -> u64 {
-    let uctx_ptr = crate::smp::current_uctx();
-    if uctx_ptr.is_null() {
+    // Three short borrows of the task's `UserCtx` cell, never one held across the calls below: `exit_current_from_signal`
+    // and the user-copy path reach for it themselves.
+    let Some(user_rsp) = crate::sched::read_current_uctx(|u| u.user_rsp) else {
         return errno::EFAULT;
-    }
-    // SAFETY: the running task's own `UserCtx`.
-    let uctx = unsafe { &mut *uctx_ptr };
+    };
 
     // `%rsp` on entry to `rt_sigreturn` points just past `pretcode`, so the
     // frame starts 8 bytes below it.
-    let Some(base) = uctx.user_rsp.checked_sub(8) else {
+    let Some(base) = user_rsp.checked_sub(8) else {
         return errno::EFAULT;
     };
     let Some(frame) = crate::uaccess::read_val::<RtSigFrame>(base) else {
@@ -1186,8 +1185,11 @@ pub fn sys_rt_sigreturn() -> u64 {
     // The mask the handler ran under is discarded and the frame's is installed —
     // that is what makes `SA_NODEFER`-less nesting unwind correctly.
     threading::set_thread_signal_mask(frame.uc.uc_sigmask);
-    restored.store(uctx);
-    uctx.sig_rax
+    crate::sched::with_current_uctx(|uctx| {
+        restored.store(uctx);
+        uctx.sig_rax
+    })
+    .unwrap_or(errno::EFAULT)
 }
 
 /// `tkill(2)` — x86_64 200: the x86 kernels' shared body,

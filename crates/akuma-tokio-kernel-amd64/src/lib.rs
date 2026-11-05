@@ -589,9 +589,8 @@ fn lapic_init() -> bool {
         akuma_primitives::safe_print!(96, "  [lapic] IA32_APIC_BASE reports no LAPIC\n");
         return false;
     }
-    // SAFETY: sets exactly one bit in an architectural MSR, leaving the
-    // address field as found — the same write amd64's `lapic::init` makes.
-    unsafe { msr::write(Msr::ApicBase, base_msr | akuma_lapic_amd64::APIC_GLOBAL_ENABLE) };
+    // Sets exactly one bit in the MSR, leaving the address field as found — the same write amd64's `lapic::init` makes.
+    let base_msr = msr::enable_apic_global();
     if !map_device(base, 4096) {
         akuma_primitives::safe_print!(96, "  [lapic] could not map the LAPIC page\n");
         return false;
@@ -601,7 +600,7 @@ fn lapic_init() -> bool {
     let win = unsafe {
         akuma_primitives::mmio::MmioWindow::new((akuma_boot_amd64::phys::DEVMAP_BASE + base) as usize, 4096)
     };
-    if let Ok(info) = akuma_lapic_amd64::init(base_msr | akuma_lapic_amd64::APIC_GLOBAL_ENABLE, win) {
+    if let Ok(info) = akuma_lapic_amd64::init(base_msr, win) {
         akuma_primitives::safe_print!(
             160,
             "  lapic: id={} timer vector={} periodic; calibrated={} counts/tick={} tsc={} Hz\n",

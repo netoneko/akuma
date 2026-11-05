@@ -36,6 +36,8 @@
 // are long on purpose, and the page-table helpers return values their callers always use.
 #![allow(clippy::too_long_first_doc_paragraph, clippy::must_use_candidate)]
 
+#[cfg(target_arch = "x86_64")]
+pub mod ap;
 pub mod mem;
 pub mod paging;
 pub mod phys;

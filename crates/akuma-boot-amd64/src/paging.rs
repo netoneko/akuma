@@ -183,3 +183,26 @@ pub fn clear_identity_slot() {
     let root = read_cr3();
     walk::clear_root_slot::<Physmap>(root, 0);
 }
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    /// `boot.s`'s page directories, one per GiB, contiguous: entry `i` maps `[i * 2 MiB, (i + 1) * 2 MiB)`. In
+    /// `.bootbss`, whose VMA is its LMA, so the symbol's address is physical. Shared by the identity map and the
+    /// physmap, and by every kernel root and every AP, which copy only the PML4.
+    static __pd0: u8;
+}
+
+/// The page directory covering 2 MiB-region `i` of `boot.s`'s identity/physmap map, and the entry's index in it.
+/// One directory per GiB, contiguous.
+///
+/// # Panics
+/// If `i` is not one of the `PHYSMAP_PDS` directories.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn boot_pd(i: usize) -> (&'static akuma_pagetable::Table, usize) {
+    assert!(i < 512 * crate::phys::PHYSMAP_PDS, "2 MiB region outside the boot page directories");
+    let pd0 = phys_to_virt((&raw const __pd0) as u64) as usize;
+    // SAFETY: `__pd0..` is `PHYSMAP_PDS` contiguous 4 KiB-aligned page directories in `.bootbss`, live for the
+    // whole boot and never freed; `i` was checked to name one of them.
+    (unsafe { akuma_pagetable::Table::at(pd0 + (i / 512) * 4096) }, i % 512)
+}

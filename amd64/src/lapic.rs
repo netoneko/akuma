@@ -164,9 +164,8 @@ pub fn init() -> bool {
         return false;
     }
 
-    // SAFETY: sets exactly one bit in an architectural MSR, leaving the address
-    // field as found.
-    unsafe { msr::write(Msr::ApicBase, base_msr | APIC_GLOBAL_ENABLE) };
+    // Sets exactly one bit in the MSR, leaving the address field as found.
+    let base_msr = msr::enable_apic_global();
 
     // Map the register page into the *device* window, uncached — not the
     // physmap: 0xFEE0_0000 is at 3.98 GiB and the physmap stops at 1 GiB
@@ -223,9 +222,8 @@ pub fn init() -> bool {
 /// already has its handler; what is per core is the enable bit in this core's
 /// `IA32_APIC_BASE`, its spurious vector, and its own timer.
 pub fn init_ap() {
-    let base_msr = msr::read(Msr::ApicBase);
-    // SAFETY: as in `init` — one bit, the address left as found.
-    unsafe { msr::write(Msr::ApicBase, base_msr | APIC_GLOBAL_ENABLE) };
+    // As in `init`: one bit, the address left as found.
+    msr::enable_apic_global();
     timer::software_enable(SPURIOUS_VECTOR);
     timer::start_timer();
 }

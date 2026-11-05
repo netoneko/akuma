@@ -136,9 +136,9 @@ pub fn service_pending() {
     if pending == 0 || pending <= ACKED[me].load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    // SAFETY: reloading the CR3 already active changes no mapping — it only
-    // forces every non-global TLB entry to be re-walked.
-    unsafe { core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _, options(nostack)) };
+    // Reloading the CR3 already active changes no mapping — it only forces every
+    // non-global TLB entry to be re-walked.
+    akuma_cpu::ctlreg::flush_non_global();
     ACKED[me].store(pending, core::sync::atomic::Ordering::Release);
     SERVICED[me].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }

@@ -35,9 +35,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// The IA32_APIC_BASE fields this crate reads: the page's physical base.
 pub const APIC_BASE_MASK: u64 = 0x000f_ffff_ffff_f000;
-/// The IA32_APIC_BASE global-enable bit. The caller writes it (`unsafe`); this
-/// crate only names it so both kernels agree.
-pub const APIC_GLOBAL_ENABLE: u64 = 1 << 11;
+/// The IA32_APIC_BASE global-enable bit. Set by `akuma_cpu::msr::enable_apic_global`; this crate
+/// re-names it so both kernels agree.
+pub const APIC_GLOBAL_ENABLE: u64 = akuma_cpu::msr::APIC_GLOBAL_ENABLE;
 
 /// The spurious-delivery vector parked on in [`software_enable`]. Distinguishable
 /// from a real vector; nothing handles it here.
