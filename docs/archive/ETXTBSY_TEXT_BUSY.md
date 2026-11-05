@@ -108,4 +108,4 @@ a test for it (`a_busy_inode_on_one_filesystem_does_not_block_the_same_number_on
 
 `crates/akuma-primitives/src/text_busy.rs`; `crates/akuma-ext2/src/ext2.rs` (`deny_if_text_busy`); `crates/akuma-syscalls-glue/src/fs.rs`
 (`openat`); `crates/akuma-tokio-kernel-core/src/{loader,proc,task}.rs`; probe `shanghai/mwprobe/mwprobe.rs` (`txtbusy_cycle`).
-Context: `shanghai/MIDDLEWARE_COMPOSITION.md` (why signing needed it).
+Context: `shanghai/docs/MIDDLEWARE_COMPOSITION.md` (why signing needed it).

@@ -10,7 +10,7 @@ workspace = true
 # The sample syscall middleware (`src/middleware.rs`, B22). Off by default: the default Shanghai has none.
 middleware = ["akuma-tokio-kernel/middleware", "dep:akuma-primitives"]
 # The "no dynamic loading" demo (the `akuma-mw-no-dynamic-loading` crate): refuse a file-backed PROT_EXEC mmap, mprotect(+X) and an execve with an LD_*
-# variable. Implies `middleware` (it is three hooks in the sample table) and `no-dynamic-elf` (the elf crate refuses dynamic images first, with the same EACCES; the policy's `Image` arm is then a reference copy) and is off by default, with or without `middleware`.
+# variable. Implies `middleware` (it adds an `Execve` arm to the table's `pre` hook) and `no-dynamic-elf` (the elf crate refuses dynamic images first, with the same EACCES; the policy's `Image` arm is then a reference copy) and is off by default, with or without `middleware`.
 no-dynamic-loading = ["middleware", "no-dynamic-elf", "dep:akuma-mw-no-dynamic-loading"]
 # "Signed code only" (the `akuma-mw-signed-exec` crate): an image runs only if its SHA-256 is on the `mw.signed.allow=` allowlist for its path or a
 # detached `<path>.sig` verifies under an `mw.signed.key=` key scoped to it; every other way of making code (dynamic images, file-backed

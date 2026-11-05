@@ -17,9 +17,9 @@ It is not Akuma's main kernel and not a product. Nothing in it is a design to pr
 | [`Cargo.toml`](Cargo.toml) | one dependency, `akuma-tokio-kernel`; every other thing below is a **feature**, off by default |
 | [`build.rs`](build.rs) | how the linker is told about the machine (a script on amd64, a boot stack size on aarch64) |
 | [`src/banner.txt`](src/banner.txt) | the console banner (plain ASCII, within the size the console allows) |
-| [`src/middleware.rs`](src/middleware.rs) | the **second lesson**: one table of syscall hooks, with every tier shown by one entry (feature `middleware`) |
-| [`MIDDLEWARE_COMPOSITION.md`](MIDDLEWARE_COMPOSITION.md) | how two middleware crates compose into the one table; the design and what is built |
-| [`RESULT.md`](RESULT.md) | the record of the original build, gate by gate |
+| [`src/middleware.rs`](src/middleware.rs) | the **second lesson**: one table of syscall hooks, a `pre` guard, a `handler` for calls of our own and an exec policy (feature `middleware`) |
+| [`docs/MIDDLEWARE_COMPOSITION.md`](docs/MIDDLEWARE_COMPOSITION.md) | how two middleware crates compose into the one table; the design and what is built |
+| [`docs/EXPERIMENT_RESULT.md`](docs/EXPERIMENT_RESULT.md) | the record of the original build, gate by gate |
 
 The brief that explains `main.rs` line by line, how to build, boot and run tokio on it, is the
 [`akuma-tokio-kernel` README](../crates/akuma-tokio-kernel/README.md). This README is only the map.

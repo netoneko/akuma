@@ -184,7 +184,7 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   hook could see. **Result, both machines at SMP=4: `MW GATE PASS`, 152 PASS lines (134 + 18)**: the hook read the word; the kernel's
   own `init=` and `mw.other.secret` were invisible through the view; the control kernel ignored the `mw.*` words. Not built: the
   read-only page mapping (stronger than the software guarantee), the two crates, `compose`, the label. Design:
-  `shanghai/MIDDLEWARE_COMPOSITION.md`.
+  `shanghai/docs/MIDDLEWARE_COMPOSITION.md`.
 
 - **`no-dynamic-loading` is a crate** (2026-11-05, the owner: extract it, then use it as the example for how a middleware crate is built).
   `crates/akuma-mw-no-dynamic-loading` (`no_std`, `forbid(unsafe_code)`, depends on `akuma-tokio-kernel-core` with `middleware` and on
@@ -195,7 +195,7 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   which only the gate covered before; they needed `KernelCtx::for_test` (hidden, builds a context over a `Machine`).
 
 - **Signing groundwork** (2026-11-05, the owner: a fresh crate for signed binaries, tackling the checksum). Two findings recorded in
-  `shanghai/MIDDLEWARE_COMPOSITION.md`: lazy file-backed segment pages are read from the inode at fault time, so verifying the image
+  `shanghai/docs/MIDDLEWARE_COMPOSITION.md`: lazy file-backed segment pages are read from the inode at fault time, so verifying the image
   buffer does not cover them and the pin does not stop an in-place write (the smallest fix is a verdict that makes the loader map a
   signed image from the verified buffer); and the crypto is RustCrypto's, reached through the new `crates/akuma-ed25519` (verify
   only, strict, RFC 8032 vectors). Nothing is signed or checked at exec yet.
@@ -211,7 +211,7 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   the signed assets directory shared a name with the staged kernel (`cp` copied the kernel INTO the directory, and the kernel that booted was a
   directory: empty console), and five 5 MB copies of the probe filled a 32 MB image so a `/tmp` write silently produced an empty file
   (the `#!` case failed with ENOEXEC); the image is 96 MB now and `stage` replaces its target. Not built: the label, minisign/signify sidecars,
-  a hash cache by inode, compiled-in keys. Not measured: the cost of hashing on every exec. Design and limits: `shanghai/MIDDLEWARE_COMPOSITION.md`.
+  a hash cache by inode, compiled-in keys. Not measured: the cost of hashing on every exec. Design and limits: `shanghai/docs/MIDDLEWARE_COMPOSITION.md`.
 
 - **`ETXTBSY` and a big-lock deadlock found on the way** (2026-11-05, the owner: close the write-after-verify gap in every kernel). The
   signing proof (a child rewriting its own file) is now answered by the filesystem: `docs/archive/ETXTBSY_TEXT_BUSY.md` (tokio kernels

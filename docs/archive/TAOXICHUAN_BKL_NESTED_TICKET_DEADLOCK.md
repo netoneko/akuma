@@ -48,7 +48,7 @@ arrives during the wait is taken once the core owns the lock, where its `enter` 
   suspended wait", bounded so it fails instead of hanging) **and passes with the fix.**
 - **Under load, amd64, `middleware` kernel, SMP=4:** the unfixed tree wedged on boot 9 and boot 16 of two separate runs (16 busy loops
   on 12 host cores); the fixed kernel passed **100 of 100** of the same.
-- Gate, both machines at SMP=4 after the fix: `MW GATE PASS`, 206 PASS lines (`shanghai/MIDDLEWARE_COMPOSITION.md`).
+- Gate, both machines at SMP=4 after the fix: `MW GATE PASS`, 206 PASS lines (`shanghai/docs/MIDDLEWARE_COMPOSITION.md`).
 
 ## Open
 

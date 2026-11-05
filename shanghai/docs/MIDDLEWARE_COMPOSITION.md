@@ -27,8 +27,8 @@ and off by default, no runtime switches.
                sees only: log=1                         sees only: key=ab12..
                           │                                         │
                           ▼                                         ▼
-                 nodl::init(&p, &mut S)                 signed::init(&p, &mut S)
-                          └──────────────► shanghai State { nodl, signed } ◄──┘
+                 nodl (takes no params)                 Config::from_params(&p)
+                          └──────────────► shanghai statics (`SIGNED`, ...) ◄──┘
                           (`init=` and `smp=` are invisible to both)
 
 
@@ -100,7 +100,7 @@ and off by default, no runtime switches.
 - **`exec` takes one policy**, so Shanghai wraps the two in a `compose` function; a deny from either wins. nodl runs first
   because it is cheap; signing hashes only images that survive it.
 - **Each crate sees only its own `mw.<name>.` namespace** of the command line.
-- **One state type per table**, so Shanghai defines `State { nodl, signed }` and each crate exposes its own part.
+- **No shared state type.** `init` is `fn(&Params)`: Shanghai's one `init` reads each crate's namespace into that crate's config and stores it in a `static` (`SIGNED`); the policy functions take the config by argument, so they stay pure and host-testable. (An earlier design had one `State { nodl, signed }` per table; the `own` tier that needed it was removed.)
 - **Only the signed crate produces a label**; map and protect events have no binary, so no label.
 - **Open:** how a label from one policy combines with the plain `Allow` of another inside `compose` (simplest: the label
   comes from whichever policy returns one). Whether `compose` should live in Shanghai or as a helper in the core crate.
@@ -152,8 +152,7 @@ with an Ed25519 key (the gate uses OpenSSL 3: `openssl pkeyutl -sign -rawin`). S
 release artifacts, not the installed file, and apk's are RSA over the package, so they are not directly checkable here; minisign and
 signify are plain Ed25519 and would be the next sidecar formats.
 
-**Gate (`sh shanghai/mw_gate.sh all`, SMP=4, 2026-11-05, after `ETXTBSY`):** 206 PASS lines, both machines: control 17, `middleware` 23,
-`no-dynamic-loading` 39, `no-dynamic-elf` 6, `signed-exec` 18 each (172 before `ETXTBSY` added the T cases to the control and signed kernels). The ten signed cases: an allowlisted hash runs (S1); an unlisted
+**Gate (`sh shanghai/mw_gate.sh all`, 2026-11-05, after `ETXTBSY`):** 206 PASS lines at SMP=4 (172 before `ETXTBSY` added the T cases to the control and signed kernels). **Since then** the `kernel_post` and `own_pre`/`own_post` tiers were removed with their probes, and `pre`/`handler` became closed enums (`calls!`): per machine control 17, `middleware` 18 (was 23), `no-dynamic-loading` 34 (was 39), `no-dynamic-elf` 6, `signed-exec` 18, so 186 `^PASS` lines for both, 0 FAIL, run at SMP=1 (the SMP=4 run was not repeated). The ten signed cases: an allowlisted hash runs (S1); an unlisted
 image, tampered bytes under a valid signature, a valid signature outside the key's scope, and the allowlisted bytes at another path are all
 refused (S2, S4, S5, S6); a signature under a scoped key runs (S3); a dynamic image, a file-backed executable mapping and `mprotect(+X)`
 are refused (S7, S8, S9); and a signed child that tries to rewrite its own file is refused with `ETXTBSY` and keeps running (S10). **S10 originally proved the

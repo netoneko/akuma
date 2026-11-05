@@ -21,7 +21,7 @@ stage and fix, and the exit codes are fixed and documented.
 - **The smallest disk that gets you inside** is already written down, for the tokio kernel on amd64:
   `crates/akuma-tokio-kernel/README.md` § "The smallest disk". It covers `sshd` built `linux-abi`, a static busybox,
   `authorized_keys`, `mke2fs` + `debugfs -w`, and the QEMU `microvm` line. Shanghai (B20) followed it on the metal and
-  recorded 14 deviations (`shanghai/RESULT.md`, commit `d4a6c7d9`). Three of them matter here: no `ssh-keygen` on
+  recorded 14 deviations (`shanghai/docs/EXPERIMENT_RESULT.md`, commit `d4a6c7d9`). Three of them matter here: no `ssh-keygen` on
   that host, `mke2fs -d` and macOS xattrs, and `debugfs` without block device nodes.
 - **The nightly toolchain on a disk** is `scripts/populate_disk.sh --with-rust-toolchain`: rustc, cargo, rust-std and
   rust-src from `static.rust-lang.org`, plus clang/lld/gcc/binutils/make/musl-dev via `apk --root`. It runs **inside
@@ -162,6 +162,6 @@ the README's quick start pointing at the URL.
 ## Background
 
 [`crates/akuma-tokio-kernel/README.md`](../crates/akuma-tokio-kernel/README.md),
-`shanghai/RESULT.md` (commit `d4a6c7d9`), `scripts/populate_disk.sh`,
+`shanghai/docs/EXPERIMENT_RESULT.md` (commit `d4a6c7d9`), `scripts/populate_disk.sh`,
 [`B21_TOKIO_KERNEL_AARCH64.md`](B21_TOKIO_KERNEL_AARCH64.md),
 [`TAOXICHUAN_FIXED_POINT.md`](../docs/archive/TAOXICHUAN_FIXED_POINT.md).

@@ -11,9 +11,9 @@ tokio" is a dependency that ensures Linux binary compatibility.
 **This README is the whole brief.** Give it to an agent and it can build a new kernel, boot it, get a shell
 in it, and run a tokio program on it. The sample kernel that follows it is [`shanghai/`](../../shanghai): an
 agent (goose with GLM) built it from an earlier revision of this brief, and its record, gate by gate, is
-[`shanghai/RESULT.md`](../../shanghai/RESULT.md). Re-checked for this revision (2026-11-05): Shanghai builds for both
+[`shanghai/docs/EXPERIMENT_RESULT.md`](../../shanghai/docs/EXPERIMENT_RESULT.md). Re-checked for this revision (2026-11-05): Shanghai builds for both
 targets in all three feature sets (none, `middleware`, `no-dynamic-loading`), and each boots on both machines under QEMU TCG
-(`sh shanghai/mw_gate.sh`, below: control 17, `middleware` 23, `no-dynamic-loading` 39, `no-dynamic-elf` 6 and `signed-exec` 18 cases, all passing as of 2026-11-05; the policies are the `akuma-mw-no-dynamic-loading` and `akuma-mw-signed-exec` crates). The sshd/ssh image
+(`sh shanghai/mw_gate.sh`, below: control 17, `middleware` 18, `no-dynamic-loading` 34, `no-dynamic-elf` 6 and `signed-exec` 18 cases, all passing as of 2026-11-05 (SMP=1); the policies are the `akuma-mw-no-dynamic-loading` and `akuma-mw-signed-exec` crates). The sshd/ssh image
 path, tokioprobe, goose and the `herd vm-run` spec were run when the brief was written and **not** re-run for this revision; where
 a command below has drifted, the file it points at wins.
 
@@ -264,12 +264,12 @@ absent), and with the feature (it must be on, and the probe tries each avenue). 
 no-dynamic-elf`, the build-time alternative (`refuse-dynamic-elf`, no middleware at all): dynamic images are refused with `EPERM`, and the
 probe pins what it does not cover. It needs no sshd or key, only `e2fsprogs` and, the first time, network for Alpine's dynamic test binaries. The rules, each with its reason in the module docs:
 
-- **One table, flat, no chaining.** No `next`, no priorities. Two entries for one call in one tier are refused when
-  the table is armed (a boot panic naming the number). A second `.middleware(..)` panics. To layer, write a
+- **One table, flat, no chaining.** No `next`, no priorities. A call named twice in one enum does not compile
+  (and a Linux call that meets a custom number on one machine panics when the table is armed). A second `.middleware(..)` panics. To layer, write a
   function that calls your functions and register that.
 - **One lock mode.** `pre` and `handler` hooks run under the kernel lock, which the kernel takes. A hook never
   sees, names or takes a lock.
-- **Cheap when idle.** Which numbers a tier wants is a 512-bit mask built when the table is armed, read once per
+- **Cheap when idle.** Which numbers `pre` wants is a 512-bit mask built when the table is armed, from its enum, read once per
   call, so an unhooked call costs a relaxed load and a bit test. `Verdict::PassAndForget`
   clears a hook's bit for that number. Numbers from 512 up are always asked (that is where custom calls live).
 - **Hooks cannot mutate the kernel context.** Every `kernel` hook takes `&KernelCtx`: it can allow, refuse or answer a call, never
