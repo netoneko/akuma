@@ -44,8 +44,7 @@ The pieces on the ryzen (entry 30 = `kvmctl kvmmem=4096 kvmcores=4-7`, reserve a
 | `/boot/akuma-guest-dev` | the candidate guest kernel (a copy of `kbuild`'s output). |
 | `/boot/akuma-guest-root.img` | a 16 MiB ext2 root whose `/etc/guest.sh` prints `AKUMA-GUEST-UP`, `uname`, the md5 of `/bin/busybox`, writes and re-reads a 256 KiB file, then `AKUMA-GUEST-DONE`. Pristine copy. |
 | `/boot/akuma-dev-root.img` | the writable copy the dev guest boots from. |
-| `/etc/herd/available/vm-dev.conf` | the service: `vm = true`, `vm_kernel = /boot/akuma-guest-dev`, `vm_disk = /boot/akuma-dev-root.img`, 768 MiB, 1 vCPU, `restart = false`. |
-| `/var/log/herd/vm-dev.log` | the guest's console. |
+| `/etc/herd/available/vm-dev.conf` | the service: `vm = true`, `vm_kernel = /boot/akuma-guest-dev`, `vm_disk = /boot/akuma-dev-root.img`, 768 MiB, 1 vCPU, `restart = false`. || `/var/log/herd/vm-dev.log` | the guest's console. |
 
 **One `kvm0` VM at a time.** `herd stop vm-netbsd; herd stop vm-serve-mc; herd enable vm-dev; herd start vm-dev` (herd starts only enabled services), and
 afterwards `herd stop vm-dev; herd disable vm-dev` (an enabled `vm-dev` would start at every boot and take the slot) and `herd start vm-serve-mc`.
@@ -228,3 +227,10 @@ one of them, the 0x7F breadcrumb, was the cause); goose does not report money (t
 [`AKUMA_FIRECRACKER_KVM.md`](AKUMA_FIRECRACKER_KVM.md) (the `/dev/kvm` node, affinity, `/dev/net/tun` and the parked guest wedge);
 `docs/reference/subsystems/kvm.md` (`kvm0`, herd `vm = true`); `docs/runbooks/amd64-bare-metal-loop.md` (the older loop for the HP
 box); `overlays/ryzen/{arm.sh,cycle.py}` (entry arming and the laptop-driven reboot loop for autorebooting entries).
+
+## Ports (2026-11-06)
+
+**Host port 2222 is the box's own sshd** (`/bin/sshd` defaults to 2222, `userspace/sshd/src/main.rs`:
+CLI > config > default). Do not point a `vm_forward` at it. The install guest was renamed and remapped
+accordingly: `akuma-install-2222` (forward `2222:22`) is gone; use **`akuma-install-2322`**
+(forward `2322:22`, ssh via `ssh -p 2322`). Guest forwards live in `/etc/herd/available/akuma-install-*.conf`.
