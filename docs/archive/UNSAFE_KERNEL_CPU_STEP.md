@@ -73,6 +73,8 @@ Production `unsafe` sites: kernels 93 -> 69 after the sweep + stack/frame/forens
 24 -> 18, `akuma-threading` 69 -> 59, `akuma-exceptions` 29 -> 27); new leaves `akuma-stack` 5, `akuma-exceptions-forensics` 2,
 `akuma-boot-amd64` 2 -> 9, `akuma-cpu` 73 -> 75. Whole tree 492 (audit start) -> 472.
 
+Next step (design for glm): `UNSAFE_CONTEXT_TABLE_DESIGN.md`.
+
 Not done on purpose: the SVM run loop, per-CPU GDT, physmap slices, `deliver_pending`, and `akuma-threading`'s context table (~29)
 and switch asm, which need a type that encodes the slot-ownership protocol (a design, not a move).
 
