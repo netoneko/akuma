@@ -35,7 +35,7 @@
 //! # The `refuse-dynamic` feature
 //!
 //! Off by default. With it, [`program`] returns [`ExecErr::Dynamic`] for every image that names an interpreter, and
-//! [`ExecErr::errno`] says `EPERM` for it. A build-time ban on dynamically linked programs with no hook and no runtime switch: it
+//! [`ExecErr::errno`] says `EACCES` for it (the same errno the `no-dynamic-loading` exec policy answers with, so the two bans look alike to a caller). A build-time ban on dynamically linked programs with no hook and no runtime switch: it
 //! covers *images* (`execve`, a `#!` interpreter, init) and nothing else, so a program that maps a library by hand still can.
 #![no_std]
 #![forbid(unsafe_code)]
@@ -94,11 +94,11 @@ pub enum ExecErr {
 
 impl ExecErr {
     /// The positive errno a caller should hand back for this refusal, if it has one of its own. Only [`ExecErr::Dynamic`] does
-    /// (`EPERM`, 1); the rest are a malformed image, which each caller already maps as it chooses.
+    /// (`EACCES`, 13); the rest are a malformed image, which each caller already maps as it chooses.
     #[must_use]
     pub const fn errno(self) -> Option<u64> {
         match self {
-            Self::Dynamic => Some(1),
+            Self::Dynamic => Some(13),
             _ => None,
         }
     }
@@ -412,14 +412,14 @@ mod tests {
 
     #[cfg(feature = "refuse-dynamic")]
     #[test]
-    fn a_dynamic_image_is_refused_with_eperm_and_a_static_one_is_not() {
+    fn a_dynamic_image_is_refused_with_eacces_and_a_static_one_is_not() {
         let mut out = [LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 4];
-        // Dynamic: refused, with EPERM.
+        // Dynamic: refused, with EACCES.
         let mut buf = [0u8; 1024];
         let n = dynamic_image(&mut buf);
         let err = program(&buf[..n], &mut out).unwrap_err();
         assert_eq!(err, ExecErr::Dynamic);
-        assert_eq!(err.errno(), Some(1));
+        assert_eq!(err.errno(), Some(13));
         // Static ET_EXEC: allowed.
         let mut st = [0u8; 256];
         elf(&mut st, 2, 0x40_1000, &[(PT_LOAD, 0, 0x80, 0x40_0000, 5, 0x1000)]);
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn only_dynamic_has_an_errno_of_its_own() {
-        assert_eq!(ExecErr::Dynamic.errno(), Some(1));
+        assert_eq!(ExecErr::Dynamic.errno(), Some(13));
         for e in [ExecErr::Magic, ExecErr::NotElf64Le, ExecErr::NotExec, ExecErr::PhdrTable, ExecErr::NoEntry, ExecErr::TooManySegments, ExecErr::SegmentBounds, ExecErr::NoSegments] {
             assert_eq!(e.errno(), None);
         }

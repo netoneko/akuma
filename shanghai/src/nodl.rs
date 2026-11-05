@@ -26,6 +26,9 @@ const MAX_ENV: usize = 512;
 /// The exec policy: one `match` over every way the kernel introduces code.
 pub fn exec_policy(ev: &ExecEvent) -> ExecVerdict {
     match ev.kind {
+        // Kept for reference: with `no-dynamic-loading` this build also turns on `no-dynamic-elf`, so the elf crate refuses a dynamic
+        // image (with the same EACCES) before the kernel ever asks this policy, and this arm is not reached. It stays so the policy is
+        // complete on its own and so the `Image` event has a worked example of a verdict that reads the interpreter.
         ExecKind::Image { path, interp: Some(interp), .. } => {
             akuma_primitives::safe_print!(160, "[nodl] pid {} refused a dynamic executable {} (interpreter {})\n", ev.pid, path, interp);
             ExecVerdict::Deny(EACCES)

@@ -113,7 +113,7 @@ for arch in x86_64 aarch64; do
   "run_$arch" control "$W/plain-$arch" 'CONTROL PASS' || rc=1
   "run_$arch" middleware "$W/mw-$arch" 'PASS' || rc=1
   "run_$arch" no-dynamic-loading "$W/nodl-$arch" 'PASS' nodl || rc=1
-  # And the build-time ban in the elf crate (--features no-dynamic-elf, NO middleware): dynamic images refused with EPERM, scope pinned.
+  # And the build-time ban in the elf crate (--features no-dynamic-elf, NO middleware): dynamic images refused with EACCES, scope pinned.
   "run_$arch" no-dynamic-elf "$W/dynelf-$arch" 'DYNELF PASS' dynelf || rc=1
 done
 [ $rc -eq 0 ] && echo "MW GATE PASS ($WHICH, smp=$SMP)" || echo "MW GATE FAIL ($WHICH, smp=$SMP)"

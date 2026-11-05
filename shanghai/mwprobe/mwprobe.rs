@@ -173,7 +173,7 @@ fn main() {
     // Without it they must be absent: a build that silently lacks them, or has them when it should not, fails the gate.
     let nodl = args.get(1).map(String::as_str) == Some("nodl");
     // `dynelf` (`initargs=dynelf`): the kernel was built with only `--features no-dynamic-elf`, so there is NO middleware and the elf crate
-    // refuses dynamic images with EPERM. That is a different expectation from both "stock" and "nodl", so it is its own branch.
+    // refuses dynamic images with EACCES. That is a different expectation from both "stock" and "nodl", so it is its own branch.
     let dynelf = args.get(1).map(String::as_str) == Some("dynelf");
     let fails = std::cell::Cell::new(0);
     let check = |name: &str, got: i64, want: i64| {
@@ -186,16 +186,16 @@ fn main() {
 
     let hello = sc(1000, [0; 4]);
     if hello == ENOSYS && dynelf {
-        // Build-time ban in the elf crate: images only, EPERM, nothing else changed.
-        check("A1 execve of a dynamic program with an extra library (xz) is refused with EPERM", i64::from(spawn_errno("/usr/bin/xz", &["--version"]) == Some(1)), 1);
-        check("A2 execve of a dynamic program with only libc (busybox) is refused with EPERM", i64::from(spawn_errno("/bin/busybox", &["true"]) == Some(1)), 1);
+        // Build-time ban in the elf crate: images only, EACCES, nothing else changed.
+        check("A1 execve of a dynamic program with an extra library (xz) is refused with EACCES", i64::from(spawn_errno("/usr/bin/xz", &["--version"]) == Some(13)), 1);
+        check("A2 execve of a dynamic program with only libc (busybox) is refused with EACCES", i64::from(spawn_errno("/bin/busybox", &["true"]) == Some(13)), 1);
         let script = "/tmp/dyn.sh";
         let _ = std::fs::write(script, "#!/bin/busybox sh\ntrue\n");
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755));
         }
-        check("C  a #! script with a dynamic interpreter is refused with EPERM", i64::from(spawn_errno(script, &[]) == Some(1)), 1);
+        check("C  a #! script with a dynamic interpreter is refused with EACCES", i64::from(spawn_errno(script, &[]) == Some(13)), 1);
         let noop = std::process::Command::new("/bin/mwprobe").arg("noop").env_clear().status();
         check("H  a static child still runs", i64::from(matches!(&noop, Ok(s) if s.success())), 1);
         // The scope, pinned: this feature refuses IMAGES. A kernel with no mapping policy still lets a program map a file executable

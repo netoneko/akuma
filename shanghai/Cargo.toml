@@ -10,8 +10,8 @@ workspace = true
 # The sample syscall middleware (`src/middleware.rs`, B22). Off by default: the default Shanghai has none.
 middleware = ["akuma-tokio-kernel/middleware", "dep:akuma-primitives"]
 # The "no dynamic loading" demo (`src/nodl.rs`): refuse a file-backed PROT_EXEC mmap, mprotect(+X) and an execve with an LD_*
-# variable. Implies `middleware` (it is three hooks in the sample table) and is off by default, with or without `middleware`.
-no-dynamic-loading = ["middleware"]
+# variable. Implies `middleware` (it is three hooks in the sample table) and `no-dynamic-elf` (the elf crate refuses dynamic images first, with the same EACCES; the policy's `Image` arm is then a reference copy) and is off by default, with or without `middleware`.
+no-dynamic-loading = ["middleware", "no-dynamic-elf"]
 # The build-time alternative: the elf crate refuses every dynamically linked image with EPERM. No middleware, no hook, no dispatch arm;
 # covers images only (not a mapping made by hand). Off by default, independent of the two above.
 no-dynamic-elf = ["akuma-tokio-kernel/refuse-dynamic-elf"]

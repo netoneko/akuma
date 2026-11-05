@@ -123,13 +123,13 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   (the `Image` event carries the bytes; nothing checks them), and JIT (`mprotect(+X)` is refused outright).
 - **A build-time alternative in the elf crate** (2026-11-05, the owner: "a build-level feature (off by default) that simply returns EPERM for
   dynamic loading in the elf crate instead of having any dispatch arm"): `akuma-elf-exec`'s `refuse-dynamic` feature makes `program()`
-  return `ExecErr::Dynamic` (errno `EPERM`, `ExecErr::errno()`) for any image that names an interpreter (the static-PIE one-NUL
-  `PT_INTERP` is still static); `loader::load_task` turns it into `LoadError::Refused(1)` before anything is touched. No hook, no table,
+  return `ExecErr::Dynamic` (errno `EPERM` when first written; **changed to `EACCES` the same day at the owner's request, so it matches the exec policy**, `ExecErr::errno()`) for any image that names an interpreter (the static-PIE one-NUL
+  `PT_INTERP` is still static); `loader::load_task` turns it into `LoadError::Refused(13)` before anything is touched. No hook, no table,
   no runtime switch. Plumbed `no-dynamic-elf` (Shanghai) -> `akuma-tokio-kernel/refuse-dynamic-elf` -> the machine crates ->
   `akuma-tokio-kernel-core/refuse-dynamic-elf` -> `akuma-elf-exec/refuse-dynamic`, independent of `middleware`; `cargo tree -e features -i
   akuma-elf-exec` shows it on with the feature and off without. Four kernels per machine in the gate now. **Result, both machines at
   SMP=4: `no-dynamic-elf` 6 cases passing, no `[nodl]` line (no middleware in that build)**: dynamic `xz`, dynamic `busybox` and a `#!`
-  script with a dynamic interpreter are refused with `EPERM`; a static child runs. It covers **images only**, and the probe pins that:
+  script with a dynamic interpreter are refused with `EACCES` (first run with `EPERM`; re-run 2026-11-05 after the change, both machines at SMP=4: `MW GATE PASS`, 134 PASS lines, the same totals as before); a static child runs. It covers **images only**, and the probe pins that:
   the loader run directly (`ld-musl /bin/busybox`) still loads and runs BusyBox, and `mmap(file, PROT_EXEC)` is still allowed, because
   this build has no mapping policy. Closing those is the exec policy's job (`no-dynamic-loading`). Host tests in `akuma-elf-exec` for
   both configurations (14 each; the feature adds the refusal and the static / static-PIE controls).
@@ -171,3 +171,5 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
 `taoxichuan/docs/reference/syscalls.md` § Who answers, in order (the dispatch the table wraps);
 `crates/akuma-bkl/src/policy.rs` (the per-syscall opt-out bitmap and the latch-at-entry rule);
 `docs/archive/` W^X policy (`TAOXICHUAN_WX_POLICY.md`) for why there is no switch.
+
+- **`no-dynamic-loading` now implies `no-dynamic-elf`** (2026-11-05, the owner): the elf crate refuses a dynamic image first, with the same `EACCES`, so the policy's `ExecKind::Image` arm is no longer reached in that build. It is kept in `shanghai/src/nodl.rs` as a reference copy (commented there), so the policy stays complete if it is reused in another kernel (Taoxichuan). The gate counts did not change.

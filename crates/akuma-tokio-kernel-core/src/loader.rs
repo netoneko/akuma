@@ -233,7 +233,7 @@ pub enum LoadError {
 /// # Errors
 /// [`LoadError::Refused`] when the policy said no; [`LoadError::NoMem`] for every other failure.
 pub fn load_task<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &str) -> Result<TaskImage, LoadError> {
-    // The elf crate's own build-time refusal (`refuse-dynamic`: a dynamically linked image, EPERM). No hook is involved: the crate
+    // The elf crate's own build-time refusal (`refuse-dynamic`: a dynamically linked image, EACCES). No hook is involved: the crate
     // says no, and this only turns its answer into the errno. Without the feature `program()` never says it, so the scan is skipped.
     #[cfg(feature = "refuse-dynamic-elf")]
     {
