@@ -3,7 +3,7 @@
 **Stability: B** (written 2026-11-05; the behaviour is booted on both machines under QEMU TCG, the cost of having it on is not
 measured, and the pieces in "Not built" are not there). The incident-style record, with what was argued and what was
 found by booting, is [`docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md`](../../../docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md);
-the code is [`src/middleware.rs`](../src/middleware.rs); a working table is
+the code is [`src/middleware/`](../src/middleware/mod.rs) (`calls`, `ctx`, `exec`, `table`, `dispatch`); a working table is
 [`shanghai/src/middleware.rs`](../../../shanghai/src/middleware.rs).
 
 Middleware lets a kernel built on `akuma-tokio-kernel` answer a syscall of its own, watch one, change one, or refuse one,
@@ -366,7 +366,7 @@ signed kernel: survives).
 - **A result is a value or `-errno`.** A `kernel_post` that does arithmetic must leave an error alone:
   `if r.cast_signed() < 0 { r } else { r + 1000 }`. (The first Shanghai sample added 1000 to a `-ENOSYS` and returned 962.)
 - **A hook that panics is a kernel panic.** Treat it as kernel code.
-- **No `unsafe`.** `middleware.rs` is `#![forbid(unsafe_code)]` and the API needs none; put the same attribute at the top of your
+- **No `unsafe`.** `middleware/` is `#![forbid(unsafe_code)]` and the API needs none; put the same attribute at the top of your
   middleware module. Raw access means patching the attribute out of your own crate.
 - **No runtime switch.** A production kernel does not get a command-line hatch to change what a syscall does (the same decision
   as the removed `wx=0`).
@@ -384,7 +384,7 @@ The feature-on cost against the syscall floor is **not measured**; do not quote 
 ## Testing a table
 
 - **On the host** (no kernel): `Middleware::arm(machine)` with a fake `Machine` (`decode`, `encode`, `copy_in`, `copy_out`,
-  `pid`), then `run_kernel`, `run_own_pre` and `run_own_post` directly. [`src/middleware.rs`'s `tests`](../src/middleware.rs) does
+  `pid`), then `run_kernel`, `run_own_pre` and `run_own_post` directly. [`src/middleware/tests.rs`](../src/middleware/tests.rs) does
   exactly this for every rule above: `cargo test -p akuma-tokio-kernel-core --features middleware --target $(rustc -vV | sed -n
   's/host: //p')`.
 - **In a guest:** copy Shanghai's pattern. Write a probe that makes raw `syscall` instructions (libc would hide an `-ENOSYS`
