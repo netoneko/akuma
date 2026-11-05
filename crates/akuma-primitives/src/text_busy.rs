@@ -167,16 +167,16 @@ impl Drop for TextPin {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
     use std::vec::Vec;
 
     use super::*;
 
     // The table is a process-wide static and `cargo test` runs threads. Each test owns a range of inode numbers no other test uses, and
-    // they take this lock because one of them fills every slot: run beside it, any other test's pin would be refused.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    // they take the lock `inode_pin`'s tests use: one of them fills every slot (run beside it, any other test's pin would be refused), and
+    // every `TextPin` also holds an `InodePin`, whose fixtures assume an otherwise empty table.
     fn serial() -> MutexGuard<'static, ()> {
-        SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::inode_pin::TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]

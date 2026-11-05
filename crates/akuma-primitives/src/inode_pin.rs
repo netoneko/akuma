@@ -159,6 +159,11 @@ const fn slot_of(inode: u32) -> usize {
     (inode.wrapping_mul(0x9E37_79B9) >> 16) as usize & MASK
 }
 
+/// Serializes every unit test that touches the process-wide pin table: this module's and `text_busy`'s (a `TextPin` holds an `InodePin`, so
+/// a test that fills the `text_busy` table also fills this one, and `inode_pin`'s fixtures assume an otherwise empty table).
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A reference that keeps `inode`'s data alive. Clone to share, drop to release.
 ///
 /// Deliberately **not** `Copy`: the count is maintained entirely by `Clone` and
@@ -501,7 +506,7 @@ mod tests {
     // `true` for *every* inode by design, so a peer test asserting "not pinned"
     // would fail if it ran alongside. Serialize them rather than weaken the
     // assertions, since the conservative answer is the property under test.
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::TEST_LOCK;
 
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)

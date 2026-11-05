@@ -3582,7 +3582,7 @@ fn make_test_process(
         pid, pgid: pid, tgid: pid,
         state: akuma_exec::process::AtomicProcessState::new(akuma_exec::process::ProcessState::Ready),
         address_space: akuma_exec::process::ProcAddressSpace::new(addr_space),
-        image: spinning_top::Spinlock::new(akuma_exec::process::ProcessImage { name: String::from("test"), exe: String::from("test"), args: Vec::new(), context: akuma_exec::process::UserContext::new(0, 0) }),
+        image: spinning_top::Spinlock::new(akuma_exec::process::ProcessImage { name: String::from("test"), exe: String::from("test"), args: Vec::new(), context: akuma_exec::process::UserContext::new(0, 0), text: akuma_primitives::TextPin::none() }),
         parent_pid: ppid, brk: core::sync::atomic::AtomicUsize::new(0x1000_0000), initial_brk: core::sync::atomic::AtomicUsize::new(0x1000_0000),
         entry_point: core::sync::atomic::AtomicUsize::new(0), memory: mem, process_info_phys: core::sync::atomic::AtomicUsize::new(info_phys),
         cwd: String::from("/"),
@@ -7712,19 +7712,54 @@ fn test_user_copy_wide_and_faults() -> bool {
     }
 
     // ── 3. THE ONE THAT MATTERS: fault part way through a long copy.
-    //       Start in mapped kernel memory and run off its end, so the first chunks
-    //       succeed and a later one faults. If `x30` were clobbered by a prologue,
-    //       the trampoline's `ret` would not come back here and this test would
-    //       not return at all — a hang or a wild jump, not a FAILED line.
-    let straddle_len = 0x2000usize; // 8 KB: many 64-byte chunks before the cliff
-    let near_end = (akuma_exec::mmu::kernel_va_end() - 0x400) as *const u8;
+    //       Start in a mapped page and run off its end, so the first chunks succeed and a later one faults. If `x30`
+    //       were clobbered by a prologue, the trampoline's `ret` would not come back here and this test would not
+    //       return at all - a hang or a wild jump, not a FAILED line.
+    //
+    //       The cliff is a real one the guest itself defines: one mapped user page in a fresh address space, its
+    //       neighbour unmapped. It used to be the end of the kernel identity map, and that is not a cliff under a
+    //       hypervisor: the boot map can reach past a small guest's RAM, and a page that is mapped but has no RAM behind
+    //       it is a *stage-2* fault the guest never sees - QEMU's HVF backend asserts on it (`ldp` carries no syndrome,
+    //       ISV=0) and TCG silently reads zeros. A stage-1 hole is the same under TCG, HVF and KVM.
+    let page_off = 0x400usize; // bytes before the cliff
+    let straddle_len = 0x2000usize; // 8 KB: many 64-byte chunks, the later ones past the cliff
+    let user_va = 0x1000_0000usize;
     let mut big = alloc::vec![0u8; straddle_len];
-    let r = unsafe { copy_from_user_safe(big.as_mut_ptr(), near_end, straddle_len) };
-    if r.is_err() {
-        console::print("  OK: mid-copy fault returned EFAULT (trampoline still returns correctly)\n");
-    } else {
-        ok = false;
-        console::print("  FAILED: copy running off mapped memory did not fault\n");
+    let mut outcome: Option<(bool, bool)> = None; // (copy returned an error, the bytes before the cliff arrived)
+    if let Some(mut space) = akuma_exec::mmu::UserAddressSpace::new()
+        && let Some(frame) = crate::pmm::alloc_page_zeroed()
+    {
+        if space.map_page(user_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_ok() {
+            space.track_user_frame(frame);
+            let page = akuma_exec::mmu::phys_to_virt(frame.addr);
+            for i in 0..4096usize {
+                unsafe { page.add(i).write_volatile((i % 251) as u8) };
+            }
+            let src = (user_va + 4096 - page_off) as *const u8;
+            // Interrupts off while this space is live: a scheduler tick would swap `TTBR0` under the copy.
+            let r = akuma_primitives::with_irqs_disabled(|| {
+                space.activate();
+                let r = unsafe { copy_from_user_safe(big.as_mut_ptr(), src, straddle_len) };
+                akuma_exec::mmu::UserAddressSpace::deactivate();
+                r
+            });
+            // The chunks wholly before the cliff were delivered (64-byte chunks: allow the last partial one).
+            let delivered = (0..page_off - 64).all(|i| big[i] == ((4096 - page_off + i) % 251) as u8);
+            outcome = Some((r.is_err(), delivered));
+        } else {
+            crate::pmm::free_page(frame);
+        }
+    }
+    match outcome {
+        Some((true, true)) => console::print("  OK: mid-copy fault returned EFAULT, earlier bytes delivered (trampoline still returns correctly)\n"),
+        Some((errored, delivered)) => {
+            ok = false;
+            crate::safe_print!(160, "  FAILED: copy running off a mapped page: errored={} earlier_bytes_delivered={}\n", errored, delivered);
+        }
+        None => {
+            ok = false;
+            console::print("  FAILED: could not build the test address space (OOM or map failed)\n");
+        }
     }
 
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
