@@ -468,36 +468,19 @@ async fn run_exec_session(
     fail_spawn(stream, session, &shell_path, "exec").await
 }
 
-/// ASCII-art welcome banner, mirroring the in-kernel SSH server's login
-/// banner (`src/ssh/protocol.rs`). Kept as a local copy (`akuma_40.txt`)
-/// rather than reaching across into the kernel's source tree.
-const BANNER_ART: &str = include_str!("akuma_40.txt");
+/// The whole login banner exactly as a client sees it — the art, the dividers and the text — one
+/// line per line, in `banner.txt` beside this file, so the layout can be read and edited as plain
+/// text. (It began as a copy of the in-kernel SSH server's banner, `src/ssh/protocol.rs`, minus the
+/// "Type 'help'..." line: the spawned shell prints its own prompt.)
+const BANNER: &str = include_str!("banner.txt");
 
-/// Builds the same banner text the in-kernel SSH server prints on login,
-/// minus the "Type 'help'..." line (there's no built-in shell here — the
-/// spawned shell prints its own prompt).
+/// The banner text sent on login: `banner.txt` with CRLF line endings, as a terminal expects.
 fn build_banner() -> String {
-    let mut welcome = String::from("\r\n");
-    for line in BANNER_ART.lines() {
+    let mut welcome = String::with_capacity(BANNER.len() + 64);
+    for line in BANNER.lines() {
         welcome.push_str(line);
         welcome.push_str("\r\n");
     }
-    let boxed = [
-        "      Welcome to Akuma SSH Server",
-        "   now with sick beats by Tokyo Rider",
-        " https://tokyorider.bandcamp.com/album/omegashima",
-    ];
-    let longest = boxed.iter().map(|l| l.len()).max().unwrap_or(0);
-    let divider = "=".repeat(core::cmp::min(longest + 1, 50));
-    welcome.push_str("\r\n");
-    welcome.push_str(&divider);
-    welcome.push_str("\r\n");
-    for line in boxed {
-        welcome.push_str(line);
-        welcome.push_str("\r\n");
-    }
-    welcome.push_str(&divider);
-    welcome.push_str("\r\n\r\n");
     welcome
 }
 

@@ -1,3 +1,4 @@
+
                       =#=      .-
                       +*#*:.:-**
                       +%%#%##***
@@ -12,3 +13,14 @@
  ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
          .--+**%@@@@@%@@%%@@%*       :-.
                   ::::---#@%%*
+
+==================================================
+ ###### Welcome to Akuma SSH Server ######
+
+ part of Akuma Bohemian Operating System
+ https://github.com/netoneko/akuma
+
+ now with sick beats by Tokyo Rider
+ https://tokyorider.bandcamp.com/album/omegashima
+==================================================
+
