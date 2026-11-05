@@ -4153,6 +4153,67 @@ static THREAD_CONTEXTS: [SyncContext; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
+/// The `Context` words that display-only paths and the self-read paths look at.
+///
+/// `Context` is `#[repr(C)]` and made of `u64`s, so each of these is one naturally aligned machine word.
+#[derive(Clone, Copy)]
+enum CtxField {
+    #[cfg(target_arch = "aarch64")]
+    Sp,
+    #[cfg(target_arch = "aarch64")]
+    Ttbr0,
+    #[cfg(target_arch = "aarch64")]
+    X30,
+    #[cfg(target_arch = "aarch64")]
+    UserEntry,
+    #[cfg(target_arch = "aarch64")]
+    UserSp,
+    #[cfg(target_arch = "aarch64")]
+    IsUserProcess,
+    #[cfg(target_arch = "x86_64")]
+    Rsp,
+}
+
+impl CtxField {
+    fn offset(self) -> usize {
+        use core::mem::offset_of;
+        match self {
+            #[cfg(target_arch = "aarch64")]
+            Self::Sp => offset_of!(Context, sp),
+            #[cfg(target_arch = "aarch64")]
+            Self::Ttbr0 => offset_of!(Context, ttbr0),
+            #[cfg(target_arch = "aarch64")]
+            Self::X30 => offset_of!(Context, x30),
+            #[cfg(target_arch = "aarch64")]
+            Self::UserEntry => offset_of!(Context, user_entry),
+            #[cfg(target_arch = "aarch64")]
+            Self::UserSp => offset_of!(Context, user_sp),
+            #[cfg(target_arch = "aarch64")]
+            Self::IsUserProcess => offset_of!(Context, is_user_process),
+            #[cfg(target_arch = "x86_64")]
+            Self::Rsp => offset_of!(Context, rsp),
+        }
+    }
+}
+
+/// Read one word of slot `idx`'s context without owning the slot (case 4 of `SyncContext`).
+///
+/// This is the single door for the accepted display-only race: the dump and stats paths and the saved-root
+/// scan read slots whose owner may be running on a peer core. One relaxed, naturally aligned word load, so
+/// the value may be stale but is never torn, and nothing here dereferences what it returns. **Do not use
+/// the result for a correctness decision**, and do not use it where the slot's owner is the caller (that is
+/// `with_current_ctx`'s case).
+///
+/// # Panics
+/// If `idx >= MAX_THREADS`.
+fn peek(idx: usize, field: CtxField) -> u64 {
+    let base = THREAD_CONTEXTS[idx].get().cast::<u8>();
+    // SAFETY: `THREAD_CONTEXTS` is a `static` array, so the cell is live for the whole run; `field.offset()` is
+    // the offset of a `u64` field of the `repr(C)` `Context`, so the address is 8-aligned and inside the cell.
+    // The load is atomic (relaxed), so a concurrent plain write by the owner is at worst observed stale.
+    unsafe { AtomicU64::from_ptr(base.add(field.offset()).cast::<u64>()).load(Ordering::Relaxed) }
+}
+
 /// Get a mutable pointer to a thread's context
 /// SAFETY: caller must be in one of the three cases `SyncContext` documents
 /// (holds `POOL` across the switch, owns the slot's INITIALIZING CAS, or is
@@ -5549,7 +5610,7 @@ pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
         return None;
     }
     (0..MAX_THREADS).find_map(|i| {
-        let ttbr0 = unsafe { (*get_context(i)).ttbr0 };
+        let ttbr0 = peek(i, CtxField::Ttbr0);
         (ttbr0 & TTBR0_L0_MASK == l0_base)
             .then(|| (i, THREAD_STATES[i].load(Ordering::SeqCst)))
     })
@@ -6940,14 +7001,14 @@ pub fn dump_thread_resume_points() {
         let st = THREAD_STATES[tid].load(Ordering::SeqCst);
         if st == thread_state::FREE { continue; }
         let elr = {
-            let ctx = unsafe { &*get_context(tid) };
-            if ctx.sp == 0 {
+            let sp = peek(tid, CtxField::Sp);
+            if sp == 0 {
                 0
             } else {
-                // SAFETY: `ctx.sp` is a switched-out thread's saved IRQ frame on
+                // SAFETY: `sp` is a switched-out thread's saved IRQ frame on
                 // its own kernel stack (guarded `!= 0`); the thread cannot free
                 // that stack while it is not running.
-                unsafe { IrqFrame::at(ctx.sp) }.elr()
+                unsafe { IrqFrame::at(sp) }.elr()
             }
         };
         let stc = match st {
@@ -7020,16 +7081,16 @@ pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
         return None;
     }
     with_irqs_disabled(|| {
-        let ctx = unsafe { &*get_context(thread_id) };
-        let live_elr = if ctx.sp == 0 {
+        let sp = peek(thread_id, CtxField::Sp);
+        let live_elr = if sp == 0 {
             0
         } else {
-            // SAFETY: `ctx.sp` is a switched-out thread's saved IRQ frame on its
+            // SAFETY: `sp` is a switched-out thread's saved IRQ frame on its
             // own kernel stack (guarded `!= 0`); the thread cannot free that
             // stack while it is not running.
-            unsafe { IrqFrame::at(ctx.sp) }.elr()
+            unsafe { IrqFrame::at(sp) }.elr()
         };
-        Some((ctx.x30, live_elr, ctx.sp))
+        Some((peek(thread_id, CtxField::X30), live_elr, sp))
     })
 }
 
@@ -7081,8 +7142,9 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
     // If this is the current thread and we have a live trap frame, use it for full register state
     if thread_id == current_thread_id() {
         if let Some(frame) = published_trap_frame(thread_id) {
-            let ctx = unsafe { &*get_context(thread_id) };
-            let ttbr0 = if ctx.ttbr0 != 0 { ctx.ttbr0 } else { mmu::get_boot_ttbr0() };
+            // The current thread reading its own slot: cannot race itself (case 3).
+            let saved_ttbr0 = peek(thread_id, CtxField::Ttbr0);
+            let ttbr0 = if saved_ttbr0 != 0 { saved_ttbr0 } else { mmu::get_boot_ttbr0() };
 
             if config().syscall_debug_info_enabled {
                 safe_print!(128, "[threading] get_saved_user_context: captured from trap frame for thread {} (PC={:#x}, SP={:#x})\n",
@@ -7110,10 +7172,11 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
     // function docs for why the `user_entry`/`user_sp` triple is not one. Report
     // the stale values that *would* have been returned so the caller is
     // identifiable from a single log line, then fail the syscall.
-    let (stale_entry, stale_sp, is_user) = with_irqs_disabled(|| {
-        let ctx = unsafe { &*get_context(thread_id) };
-        (ctx.user_entry, ctx.user_sp, ctx.is_user_process)
-    });
+    let (stale_entry, stale_sp, is_user) = (
+        peek(thread_id, CtxField::UserEntry),
+        peek(thread_id, CtxField::UserSp),
+        peek(thread_id, CtxField::IsUserProcess),
+    );
     let n = NO_TRAP_FRAME_CHILDREN.fetch_add(1, Ordering::Relaxed);
     // Unbounded printing would itself wedge the box under a fork storm; the first
     // few plus a decade-spaced tail is enough to establish rate and identity.
@@ -7341,9 +7404,9 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
             // stack-pointer field is named `sp` on AArch64 and `rsp` on
             // x86_64 — see `akuma-exec-core::thread::Context`'s two arms.
             #[cfg(target_arch = "aarch64")]
-            { sps[i] = unsafe { (*get_context(i)).sp }; }
+            { sps[i] = peek(i, CtxField::Sp); }
             #[cfg(target_arch = "x86_64")]
-            { sps[i] = unsafe { (*get_context(i)).rsp }; }
+            { sps[i] = peek(i, CtxField::Rsp); }
         }
 
         ThreadPoolSnapshot {

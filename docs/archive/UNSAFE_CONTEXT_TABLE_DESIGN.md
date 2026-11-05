@@ -235,3 +235,19 @@ Hand-back: a short results doc appended as "Part 3" to `UNSAFE_KERNEL_CPU_STEP.m
 ## Background
 Prior art in this tree: `with_current_uctx` on amd64 (a closure-scoped borrow of a per-slot cell; the caveat is the same - the switch asm reads the record outside any
 Rust borrow), `akuma_phys::Frame`, `akuma_trap_aarch64::FrameHandle`, `akuma-dma`'s borrow word. Ownership audit: `BKL_PHASE7D_THREAD_CONTEXTS.md`.
+
+## Update 2026-11-06 (supervisor): what was done, and why the rest was re-scoped
+
+* **Done: §3.5 `peek`** (`CtxField` + `peek(idx, field)` in `akuma-threading`): the six display-only / self-read context reads (`dump_thread_resume_points`,
+  `get_saved_kernel_resume`, the `ttbr0` scan, `get_saved_user_context`'s saved-TTBR0 and stale-triple reads, the thread-list `sps[]` loop) go through one relaxed
+  atomic word load. `akuma-threading` 61 -> 55. Caveat the section above overstates: a relaxed atomic load against the owner's *plain* store is still a data race in
+  Rust's abstract model; it removes tearing and gives the paths one door, it does not make them formally defined. Making them formally defined needs the owner's writes
+  to be atomic too (`Context` fields as `AtomicU64`), which the switch asm and `Context: Copy` rule out.
+* **Re-scoped: §3.2 `Initializing` token.** `x86_seed_entry(slot, ..)` is public and is called by three kernels (`akuma-tokio-kernel-amd64` x2,
+  `akuma-tokio-kernel-aarch64`, `amd64/src/sched.rs`) with slot ids they obtained *without* `claim_free_slot` (`IDLE_TID`, fixed task slots). A linear token would have
+  to cross those crates, i.e. a protocol change in four places for roughly eight internal sites (the spawn paths and `adopt_current_as_core_idle`). Not worth the risk
+  without an amd64 metal loop in the same session; revisit as its own change if the count matters.
+* **Re-scoped: §2b crash-dump move.** The EL1 dump's four raw reads are interleaved with the handler's real logic; lifting them into the forensics crate makes the call
+  site one `unsafe fn` call and keeps the same reads elsewhere (net ~0). Not done.
+* **Re-scoped: §2a page copies.** The demand-fill sites write into frames already in a `frame_pool` (`PhysFrame`), so each conversion needs its own `Frame::from_pa`
+  (one `unsafe`) in place of the raw slice: no reduction. A safe "fill this exclusively-owned frame" method on `akuma_exec::PhysFrame` would be the enabling change.
