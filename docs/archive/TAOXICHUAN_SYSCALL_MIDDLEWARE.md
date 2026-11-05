@@ -185,3 +185,11 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   own `init=` and `mw.other.secret` were invisible through the view; the control kernel ignored the `mw.*` words. Not built: the
   read-only page mapping (stronger than the software guarantee), the two crates, `compose`, the label. Design:
   `shanghai/MIDDLEWARE_COMPOSITION.md`.
+
+- **`no-dynamic-loading` is a crate** (2026-11-05, the owner: extract it, then use it as the example for how a middleware crate is built).
+  `crates/akuma-mw-no-dynamic-loading` (`no_std`, `forbid(unsafe_code)`, depends on `akuma-tokio-kernel-core` with `middleware` and on
+  `akuma-primitives`, and on no machine) holds `exec_policy` and `exec_guard`, moved out of `shanghai/src/nodl.rs` unchanged in behaviour
+  (the `Image` arm stays, commented as a reference copy, since `no-dynamic-loading` turns the elf ban on). It is **functions, not a
+  table**: one table per kernel, so the kernel's table names them and a kernel composing several crates writes that composition itself.
+  Six host tests pin the policy and the guard (fail-closed on an unreadable pointer, an unreadable envp and a list over 512 entries),
+  which only the gate covered before; they needed `KernelCtx::for_test` (hidden, builds a context over a `Machine`).

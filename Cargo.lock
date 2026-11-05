@@ -570,6 +570,14 @@ name = "akuma-multiboot2"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-mw-no-dynamic-loading"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+ "akuma-tokio-kernel-core",
+]
+
+[[package]]
 name = "akuma-net"
 version = "0.1.0"
 dependencies = [
@@ -1456,6 +1464,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "shanghai"
 version = "0.1.0"
 dependencies = [
+ "akuma-mw-no-dynamic-loading",
  "akuma-primitives",
  "akuma-tokio-kernel",
 ]

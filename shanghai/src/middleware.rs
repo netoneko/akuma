@@ -11,7 +11,7 @@
 //! | `whoami`: writes the caller's pid to `*arg0` (or `-EFAULT`) | `fallback` | 1001 |
 //! | how many `getpid`s the `own` tier saw before / after the lock | `fallback` | 1002 / 1003 |
 //! | refuse `open("/mw-deny")` with `EACCES`; log any other `/mw-*` path | `kernel_pre` | `openat` |
-//! | with `--features no-dynamic-loading` only: no dynamic loading (file `PROT_EXEC` mmap, `mprotect(+X)`, `LD_*` in an `execve` env), see `nodl.rs` | `kernel_pre` | `mmap` / `mprotect` / `execve` |
+//! | with `--features no-dynamic-loading` only: no dynamic loading (file `PROT_EXEC` mmap, `mprotect(+X)`, `LD_*` in an `execve` env), see the `akuma-mw-no-dynamic-loading` crate | `kernel_pre` | `mmap` / `mprotect` / `execve` |
 //! | `gettid() + 1000` (an error result is left alone) | `kernel_post` | `gettid` |
 //! | count `getpid`, outside the kernel lock (a split read-modify-write on the state, so a lost update shows) | `own_pre` / `own_post` | `getpid` |
 //! | publish the `own` state when a `getppid` passes; read it back | `own_post` / `fallback` | `getppid` / 1005 |
@@ -75,7 +75,7 @@ fn open_guard(ctx: &akuma_tokio_kernel::middleware::KernelCtx) -> Verdict {
 
 /// The exec policy: the "no dynamic loading" demo's with its feature, none without it (everything is allowed).
 #[cfg(feature = "no-dynamic-loading")]
-const EXEC: Option<akuma_tokio_kernel::middleware::ExecPolicy> = Some(crate::nodl::exec_policy);
+const EXEC: Option<akuma_tokio_kernel::middleware::ExecPolicy> = Some(akuma_mw_no_dynamic_loading::exec_policy);
 #[cfg(not(feature = "no-dynamic-loading"))]
 const EXEC: Option<akuma_tokio_kernel::middleware::ExecPolicy> = None;
 
@@ -96,10 +96,10 @@ pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
     ],
     kernel_pre: &[
         Route::new(&[On::Call(Syscall::Openat)], open_guard),
-        // The "no dynamic loading" demo (`nodl.rs`), only with `--features no-dynamic-loading`: an env guard on execve here, and
+        // The "no dynamic loading" demo (the `akuma-mw-no-dynamic-loading` crate), only with `--features no-dynamic-loading`: an env guard on execve here, and
         // the exec policy (`EXEC` below): one `match` over every way code arrives.
         #[cfg(feature = "no-dynamic-loading")]
-        Route::new(&[On::Call(Syscall::Execve)], crate::nodl::exec_guard),
+        Route::new(&[On::Call(Syscall::Execve)], akuma_mw_no_dynamic_loading::exec_guard),
     ],
     // A result is a value or `-errno`: only add to a value.
     kernel_post: &[Route::new(&[On::Call(Syscall::Gettid)], |_, r| if r.cast_signed() < 0 { r } else { r + 1000 })],

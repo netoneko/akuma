@@ -6,8 +6,6 @@
 
 #[cfg(feature = "middleware")]
 mod middleware;
-#[cfg(feature = "no-dynamic-loading")]
-mod nodl;
 
 akuma_tokio_kernel::entry!(main);
 

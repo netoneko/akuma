@@ -1,0 +1,13 @@
+[package]
+name = "akuma-mw-no-dynamic-loading"
+version = "0.1.0"
+edition = "2024"
+description = "Syscall middleware: no dynamic loading. An exec policy (refuse a dynamically linked image, a file-backed PROT_EXEC mmap, mprotect(+X)) and an execve guard (refuse LD_* in the environment), as plain functions a kernel's one middleware table composes (B22)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The middleware vocabulary (`ExecEvent`, `KernelCtx`, `Verdict`) and nothing of any machine, so the policy tests on the host.
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["middleware"] }
+akuma-primitives = { path = "../akuma-primitives" }

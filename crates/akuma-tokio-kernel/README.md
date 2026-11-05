@@ -13,7 +13,7 @@ in it, and run a tokio program on it. The sample kernel that follows it is [`sha
 agent (goose with GLM) built it from an earlier revision of this brief, and its record, gate by gate, is
 [`shanghai/RESULT.md`](../../shanghai/RESULT.md). Re-checked for this revision (2026-11-05): Shanghai builds for both
 targets in all three feature sets (none, `middleware`, `no-dynamic-loading`), and each boots on both machines under QEMU TCG
-(`sh shanghai/mw_gate.sh`, below: control 7, `middleware` 19, `no-dynamic-loading` 35 cases, all passing). The sshd/ssh image
+(`sh shanghai/mw_gate.sh`, below: control 8, `middleware` 23, `no-dynamic-loading` 39 cases, and `no-dynamic-elf` 6, all passing as of 2026-11-05; the policy is the `akuma-mw-no-dynamic-loading` crate). The sshd/ssh image
 path, tokioprobe, goose and the `herd vm-run` spec were run when the brief was written and **not** re-run for this revision; where
 a command below has drifted, the file it points at wins.
 

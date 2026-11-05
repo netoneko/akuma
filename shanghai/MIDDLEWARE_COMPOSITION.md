@@ -2,8 +2,9 @@
 
 **Status: partly built (2026-11-05).** Built and gated on both machines: the single table, its tiers, the exec hook, and the
 BOOT half of the diagram (write-once command line, the narrowed `Params` view, `ParamSource`, `Hooks::init`; guide:
-`crates/akuma-tokio-kernel-core/docs/middleware.md` § Boot parameters). **Not built:** the two crates, `compose`, the label.
-Shanghai's sample table currently plays the part of both crates' parameters (`mw.sample.also`).
+`crates/akuma-tokio-kernel-core/docs/middleware.md` § Boot parameters). The first crate, `akuma-mw-no-dynamic-loading`, is built and
+used by Shanghai's `no-dynamic-loading` feature (two plain functions, no table, host-tested; it takes no parameters yet). **Not built:**
+the signing crate, `compose`, the label. Shanghai's sample table plays the part of a crate with parameters (`mw.sample.also`).
 
 Rules this design keeps: one table per kernel (no chaining), hooks cannot mutate the kernel context, every ban is a feature
 and off by default, no runtime switches.

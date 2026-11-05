@@ -155,6 +155,15 @@ pub struct KernelCtx {
 }
 
 impl KernelCtx {
+    /// A context over `machine`, for a host test of a hook that lives in another crate (a kernel builds its contexts itself, in
+    /// `run_kernel`). It forges nothing a hook could not already do: a `KernelCtx` is read-only and reaches memory only through
+    /// the `Machine` it is given. Not for a kernel.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test(nr: u64, args: [u64; 6], machine: Machine) -> Self {
+        Self { nr, call: (machine.decode)(nr), args, tid: 1, pid: (machine.pid)(), machine }
+    }
+
     /// Fill `buf` from the caller's memory at `addr`.
     ///
     /// # Errors

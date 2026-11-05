@@ -36,6 +36,7 @@
     "crates/akuma-locks-rw",
     "crates/akuma-mmap",
     "crates/akuma-multiboot2",
+    "crates/akuma-mw-no-dynamic-loading",
     "crates/akuma-net",
     "crates/akuma-net-rtl8169",
     "crates/akuma-net-unix",

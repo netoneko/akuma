@@ -123,7 +123,7 @@ never a crash: write `?`-style code and return `-EFAULT`.
 
 The goal: **refuse to start any program whose environment names an `LD_*` variable** (`LD_PRELOAD`, `LD_LIBRARY_PATH`,
 `LD_AUDIT`, ...), the knobs the dynamic loader reads from the environment. It is the exec half of the "no dynamic loading"
-demo in [`shanghai/src/nodl.rs`](../../../shanghai/src/nodl.rs); the code below is that file's, not a paraphrase.
+demo in the crate [`akuma-mw-no-dynamic-loading`](../../akuma-mw-no-dynamic-loading/src/lib.rs) (it was `shanghai/src/nodl.rs` until 2026-11-05; the crate is the worked example of a middleware that lives outside the kernel that uses it: two plain functions, no table, host-tested); the code below is that crate's, not a paraphrase.
 
 **Where the data is.** A new process's environment is the third argument of `execve`: `ctx.args[2]` points at a
 NULL-terminated array of pointers to `NAME=value` strings, all in the *caller's* memory, which is still the old image's when a
@@ -191,9 +191,9 @@ default**: `no-dynamic-loading` (it implies `middleware`), so the sample table a
 kernel_pre: &[
     Route::new(&[On::Call(Syscall::Openat)], open_guard),
     #[cfg(feature = "no-dynamic-loading")]
-    Route::new(&[On::Call(Syscall::Execve)], crate::nodl::exec_guard),
+    Route::new(&[On::Call(Syscall::Execve)], akuma_mw_no_dynamic_loading::exec_guard),
 ],
-exec: EXEC,   // Some(crate::nodl::exec_policy) with the feature, None without it
+exec: EXEC,   // Some(akuma_mw_no_dynamic_loading::exec_policy) with the feature, None without it
 ```
 
 ```text
@@ -228,7 +228,7 @@ kernel asks **one** question at each of them, `Hooks::exec: Option<ExecPolicy>` 
 | `mmap` with `PROT_EXEC` | `ExecKind::Map { inode }` (`None` = anonymous) | `mm::mmap_arm` |
 | `mprotect` adding `PROT_EXEC` | `ExecKind::Protect` | `mm::mprotect_arm` (the kernel cannot say which file a present page came from) |
 
-A policy is one `match`, so it cannot be bypassed by a path nobody hooked. Shanghai's (`nodl.rs`, `exec_policy`) refuses an image that
+A policy is one `match`, so it cannot be bypassed by a path nobody hooked. The crate's (`exec_policy`) refuses an image that
 has a `PT_INTERP`, refuses a file-backed executable mapping, refuses `mprotect(+PROT_EXEC)`, and allows the rest: static programs run,
 anonymous executable memory is allowed (W^X already forbids the writable kind). The policy is registered as `exec: Some(..)`, and
 only with `--features no-dynamic-loading`.
