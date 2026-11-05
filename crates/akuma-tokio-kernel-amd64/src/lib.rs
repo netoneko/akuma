@@ -166,13 +166,23 @@ static mut TRAP_STACKS: [TrapStack; crate::child::NSLOTS + 1] =
 /// interrupted frame on the interrupted task's stack, so the next ring-3 trap on any task must not land there),
 /// or - for an idle thread, which never traps from ring 3 - this core's boot stack.
 pub(crate) fn trap_top_for(slot: usize) -> u64 {
-    // SAFETY: only the address of a static is taken; nothing is read through it.
-    unsafe {
-        if slot <= crate::child::NSLOTS {
-            (&raw const TRAP_STACKS[slot]).cast::<u8>().add(TRAP_STACK_SIZE) as u64
-        } else {
-            (&raw const TRAP_STACK[ring3::cpu_index()]).cast::<u8>().add(TRAP_STACK_SIZE) as u64
-        }
+    // The end of the chosen stack, as an integer the TSS can hold. This is
+    // pure address arithmetic on a `static` — one raw borrow of a whole array
+    // (the safe form; indexing *into* a `static mut` is what needs `unsafe`),
+    // a cast, and byte offsets; nothing is dereferenced. `wrapping_add` is the
+    // safe spelling of the sums, and the result is the stack's own last byte,
+    // by construction in bounds.
+    let stride = core::mem::size_of::<TrapStack>();
+    if slot <= crate::child::NSLOTS {
+        // The per-slot array holds `NSLOTS + 1` stacks, so `slot` in
+        // `0..=NSLOTS` names a real element.
+        (&raw const TRAP_STACKS)
+            .cast::<u8>()
+            .wrapping_add(slot * stride + TRAP_STACK_SIZE) as u64
+    } else {
+        (&raw const TRAP_STACK)
+            .cast::<u8>()
+            .wrapping_add(ring3::cpu_index() * stride + TRAP_STACK_SIZE) as u64
     }
 }
 
