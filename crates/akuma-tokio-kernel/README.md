@@ -291,7 +291,7 @@ call and exits 1 on one nobody does. A call nobody serves answers `ENOSYS` and t
 - **A QEMU/Firecracker guest only**: virtio-mmio devices, no PCI, no multiboot2 (`entry!`'s `kmain_mb2` says
   so and halts). amd64 boots Firecracker through PVH; aarch64 turns on `platform-firecracker`.
 - **One root filesystem**, mounted at `/`, plus `/proc`. ext2 inode times are 0.
-- The open gaps (no `sendfile`, `PROT_NONE` not enforced, …) are [`taoxichuan/docs/gaps.md`](../../taoxichuan/docs/gaps.md).
+- The open gaps (no `sendfile`, eager `mmap`, …) are [`taoxichuan/docs/gaps.md`](../../taoxichuan/docs/gaps.md).
 
 ## Background
 
