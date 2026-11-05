@@ -1,8 +1,12 @@
 # akuma-tokio-kernel
 
-A whole kernel from one short `main.rs`. It runs unmodified Linux x86_64 musl binaries (busybox, sshd, git,
-rustc, and tokio programs such as goose) as a PVH guest under QEMU, Firecracker, Linux KVM or Akuma's own
-hypervisor. "This kernel runs tokio" is a dependency that ensures Linux binary compatibility.
+A whole kernel from one short `main.rs`, and one code base over **two machines**: the same `main.rs`,
+`Cargo.toml` and `build.rs` build for both `--target x86_64-unknown-none` (amd64) and
+`--target aarch64-unknown-none` (aarch64), and each kernel runs unmodified Linux musl binaries of its own
+architecture (busybox, sshd, git, rustc, and tokio programs such as goose). amd64 boots as a PVH guest;
+aarch64 boots through the Linux Image protocol with a device tree. Hosts: QEMU (`microvm` on amd64,
+`virt` on aarch64) under TCG or KVM, Firecracker, and Akuma's own hypervisor (amd64). "This kernel runs
+tokio" is a dependency that ensures Linux binary compatibility.
 
 **This README is the whole brief.** Give it to an agent and it can build a new kernel, boot it, get a shell
 in it, and run a tokio program on it. Every command below was run as written; the sample kernel that
@@ -32,12 +36,26 @@ name = "osaka"
 path = "src/main.rs"
 ```
 
-`osaka/build.rs` (hands the kernel its linker script):
+`osaka/build.rs` (hands the kernel its link arguments; per architecture, like
+[`taoxichuan/build.rs`](../../taoxichuan/build.rs)):
 
 ```rust
 fn main() {
-    let script = std::env::var("DEP_AKUMA_TOKIO_KERNEL_LINKER_SCRIPT").expect("akuma-tokio-kernel exports a linker script");
-    println!("cargo:rustc-link-arg-bins=-T{script}");
+    // amd64: the linker script `akuma-tokio-kernel` re-exports from its machine half.
+    if let Ok(script) = std::env::var("DEP_AKUMA_TOKIO_KERNEL_LINKER_SCRIPT") {
+        println!("cargo:rustc-link-arg-bins=-T{script}");
+    } else {
+        // aarch64: the workspace's .cargo/config.toml already links with -Tlinker.ld; give _boot
+        // its stack size, and Firecracker its load address when that feature is on.
+        assert!(
+            std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64"),
+            "akuma-tokio-kernel exports a linker script on amd64"
+        );
+        println!("cargo:rustc-link-arg-bins=--defsym=BOOT_STACK_SIZE={}", 1024 * 1024);
+        if std::env::var_os("CARGO_FEATURE_PLATFORM_FIRECRACKER").is_some() {
+            println!("cargo:rustc-link-arg-bins=--defsym=KERNEL_PHYS_BASE_OVERRIDE=0x80300000");
+        }
+    }
 }
 ```
 
@@ -55,18 +73,19 @@ fn main(kernel: akuma_tokio_kernel::Kernel) -> ! {
 ```
 
 Then add the directory to `members` in the root `Cargo.toml` (`members = [".", "amd64", "taoxichuan", "osaka",
-"crates/*"]`). Do **not** add it to `default-members`: it builds only for `x86_64-unknown-none`.
+"crates/*"]`). Do **not** add it to `default-members`: a kernel bin builds only per target
+(`x86_64-unknown-none` and `aarch64-unknown-none`), which the default (host) build must never reach.
 
 ## What you get
 
 | builder | feature (default on) | what it wires |
 |---|---|---|
-| `entry!(main)` | — | the boot entry symbols, the heap, the panic handler; `main` gets a `Kernel` named after your package |
+| `entry!(main)` | — | the boot entry symbols (amd64: `kmain`/`kmain_mb2` for PVH; aarch64: `rust_start` for the Image protocol, plus the secondary trampoline), the heap, the panic handler; `main` gets a `Kernel` named after your package |
 | `.name("Osaka")` | — | the name on the console and in the banner (the package name stays `uname -n`) |
 | `.banner(include_str!("banner.txt"))` | — | art printed before init starts |
-| `.console()` | `console` | COM1: boot lines, kernel messages, and the stdout/stderr of init and of every process with no ssh session |
+| `.console()` | `console` | the serial console (COM1 on amd64, the PL011 on aarch64): boot lines, kernel messages, and the stdout/stderr of init and of every process with no ssh session |
 | `.disk()` | `disk` | the root filesystem: ext2 on the first virtio-blk device, mounted at `/` |
-| `.root(make)` | — | your own root instead: `make: fn() -> Arc<dyn akuma_vfs::Filesystem>`, called once the heap is up |
+| `.root(make)` | — | your own root instead: `make: fn() -> Arc<dyn akuma_vfs::Filesystem>`, called once the heap is up (amd64 only today) |
 | `.net()` | `net` | the first virtio-net device, smoltcp, and a DHCP lease (waits up to 10 s). Without it, sockets work on loopback only |
 | `.smp()` | `smp` | the application processors `smp=N` on the command line asks for, all under one big kernel lock |
 | `.run_init()` | — | boot, then load `init=` from the root and run it as pid 1; never returns |
@@ -75,21 +94,32 @@ Without a feature its method does not exist, so a kernel that does not want a pa
 also leave out the code: `default-features = false, features = ["disk", "no-tests"]` builds a kernel with no
 console, no NIC and one core. The root filesystem is the one part a kernel cannot run without (`.disk()` or
 `.root(..)`). Other features: `shell` (the calls busybox and bash make that no tokio program does; turn it on if
-your image runs a shell beyond `sh -c`), `trace-err` (print every failing syscall on the console).
+your image runs a shell beyond `sh -c`), `trace-err` (print every failing syscall on the console), and
+`platform-firecracker` (aarch64 under Firecracker, whose memory map differs from QEMU virt's; the `build.rs`
+above moves the link base for it — amd64 boots Firecracker through PVH and needs nothing).
 
 Everything else is fixed and needs no code: the memory manager (`mmap`, `brk`, `mprotect`, copy-on-write
 `fork`), processes and threads (`clone`, `execve`, `wait4`), signals, pipes, epoll, futexes, the clock, the
 RNG, and the Linux syscall surface from [`akuma-runtime-tokio`](../akuma-runtime-tokio) (its README has the
-picture). The machine half is [`akuma-tokio-kernel-amd64`](../akuma-tokio-kernel-amd64); how it works
-inside is documented in [`taoxichuan/docs/`](../../taoxichuan/docs), Taoxichuan being the first kernel built
-this way.
+picture). The machine half is picked by the build target: [`akuma-tokio-kernel-amd64`](../akuma-tokio-kernel-amd64)
+or [`akuma-tokio-kernel-aarch64`](../akuma-tokio-kernel-aarch64), both driving the arch-neutral decisions
+they share in [`akuma-tokio-kernel-core`](../akuma-tokio-kernel-core); how it works inside is documented in
+[`taoxichuan/docs/`](../../taoxichuan/docs), Taoxichuan being the first kernel built this way — one `main.rs`,
+built twice.
 
 ## Build it
 
 ```bash
 cargo build -p osaka --target x86_64-unknown-none --release
 # -> target/x86_64-unknown-none/release/osaka
+
+cargo build -p osaka --target aarch64-unknown-none --release
+# -> target/aarch64-unknown-none/release/osaka
 ```
+
+On aarch64 the workspace's linker wrapper (`scripts/link_kernel.sh`) also objcopies a flat `.bin` next to the
+ELF — `target/aarch64-unknown-none/release/osaka.bin` — which is the file QEMU's `-kernel` takes: it speaks
+the Linux Image protocol, and QEMU hands the kernel its device tree.
 
 ## The smallest disk that gets you inside
 
@@ -104,7 +134,7 @@ W=/tmp/osaka; mkdir -p $W           # any work directory
 # 1. sshd: Akuma's own, built as a plain Linux binary (`linux-abi`: fork + execve, no private syscalls).
 (cd userspace && cargo build -p sshd --release --target x86_64-unknown-none --features libakuma/linux-abi)
 
-# 2. a shell: busybox's static x86_64 build (sshd runs every command as `/bin/sh -c`).
+# 2. a shell: busybox's static build for the kernel's target (sshd runs every command as `/bin/sh -c`).
 curl -sSL -o $W/busybox https://www.busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
 
 # 3. the key you log in with.
@@ -126,6 +156,10 @@ write $W/key.pub /etc/sshd/authorized_keys
 EOF
 $E/debugfs -w -f $W/cmds $W/osaka.img
 ```
+
+For an aarch64 kernel every guest binary must be aarch64 musl: build sshd with
+`--target aarch64-unknown-none` and take busybox's `1.35.0-aarch64-linux-musl` build; the `debugfs` steps
+and everything after are identical.
 
 `sshd` reads `/etc/sshd/authorized_keys`, listens on the port its command line gives, and makes its host key on
 first boot. `/bin/sh` is the only applet name linked; run the others as `busybox <applet>`, or link more names
@@ -163,12 +197,38 @@ qemu-system-x86_64 -M microvm,accel=tcg -cpu max -smp 1 -m 3072 \
 ssh -i $W/key -p 2245 -o StrictHostKeyChecking=no root@127.0.0.1 'busybox uname -a'
 ```
 
+On aarch64 the kernel boots on QEMU `virt`, with the same `-append` and the aarch64 image. Every virtio device
+must name its bus (`virtio-mmio-bus.N`): QEMU puts the first device with no `bus=` on the *highest* of its 32
+slots, while the kernel scans the lowest 8, so an unnamed device is invisible:
+
+```bash
+qemu-system-aarch64 -machine virt,gic-version=3 -accel tcg -smp 1 -m 1024 \
+  -kernel target/aarch64-unknown-none/release/osaka.bin \
+  -append "init=/bin/sshd initargs=--port,22 epoch=$(date +%s)" \
+  -nodefaults -no-reboot -display none -serial file:$W/console.log \
+  -global virtio-mmio.force-legacy=false \
+  -drive file=$W/osaka.img,format=raw,if=none,id=d0 \
+  -device virtio-blk-device,drive=d0,bus=virtio-mmio-bus.1 \
+  -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2245-:22 \
+  -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.0
+ssh -i $W/key -p 2245 -o StrictHostKeyChecking=no root@127.0.0.1 'busybox uname -a'
+#   Linux osaka 0.1.0-<sha>-osaka <sha>-release aarch64 GNU/Linux
+```
+
+`-smp 4` is SMP here as `TX_SMP=4` is there. A good boot prints `Osaka/aarch64 -- EL1, MMU on, dtb at
+0x48000000`, the RAM and slot line from the device tree, `ext2 root on /dev/vda`, `DHCP configured,
+10.0.2.15`, the banner, and sshd's lines. `scripts/cargo_runner.sh`, the repo's aarch64 runner, is this same
+line — net on bus.0, disk on bus.1, a virtio-rng on bus.2 — with KVM inside a Lima VM on the Mac and TCG
+outside it; the `tcg_rig.py` battery driver is amd64-only so far.
+
 The command line: `init=` and `initargs=` (comma-separated) name pid 1; `epoch=` is the wall clock in Unix
 seconds (a microvm has no RTC, and TLS refuses certificates from 1970); `smp=N` starts N cores with `.smp()`.
-`force-legacy=false` matters: the kernel's virtio drivers speak only the v2 transport.
+`force-legacy=false` matters: the kernel's virtio drivers speak only the v2 transport. On amd64 the microvm's
+virtio-mmio windows are reserved on the command line too (`virtio_mmio.device=512@...`); on aarch64 QEMU
+`virt` lists its slots in the device tree, which is also how the command line arrives (`/chosen/bootargs`).
 
-Under Akuma's own hypervisor (the ryzen booted into Akuma), the same kernel and image boot as a `herd vm-run`
-guest. This spec is the one `scripts/kvm/taoxichuan/fp_metal.py` boots Taoxichuan with; it has not been run
+Under Akuma's own hypervisor (the ryzen booted into Akuma; amd64 today), the same kernel and image boot as a
+`herd vm-run` guest. This spec is the one `scripts/kvm/taoxichuan/fp_metal.py` boots Taoxichuan with; it has not been run
 with Osaka yet:
 
 ```bash
@@ -189,10 +249,12 @@ setsid /bin/herd vm-run vm.spec </dev/null > vm.log 2>&1 &
 ## Run tokio on it
 
 `userspace/tokioprobe` is the smallest check that tokio works: a multi-thread runtime, a child process through
-`tokio::process`, and an HTTPS request with reqwest and rustls. It needs DNS and a `uname` on `PATH`:
+`tokio::process`, and an HTTPS request with reqwest and rustls. It needs DNS and a `uname` on `PATH`, and
+builds for either target (`ARCH` names the kernel's):
 
 ```bash
 (cd userspace/tokioprobe && ARCH=x86_64 ./build-musl.sh)       # -> bootstrap/bin/tokioprobe.x86_64
+(cd userspace/tokioprobe && ARCH=aarch64 ./build-musl.sh)      # -> bootstrap/bin/tokioprobe
 echo "nameserver 10.0.2.3" > $W/resolv.conf                      # QEMU user networking's resolver
 cat > $W/cmds2 <<EOF
 write $PWD/bootstrap/bin/tokioprobe.x86_64 /bin/tokioprobe
@@ -211,7 +273,8 @@ python3 scripts/kvm/taoxichuan/tcg_rig.py run /bin/tokioprobe 300
 
 goose (an AI agent, tokio throughout) needs a fuller image: the dynamic loader, a CA bundle, its config and an
 API key. `scripts/kvm/taoxichuan_goose_image.sh` builds one; the rig's `battery goose` runs the regression
-battery plus a goose prompt that must answer `PONG`.
+battery plus a goose prompt that must answer `PONG`. goose ships one tarball per architecture
+(`goose-x86_64-unknown-linux-musl` / `goose-aarch64-unknown-linux-musl`); both machines answer `PONG`.
 
 ## Check a workload before you boot it
 
@@ -222,14 +285,20 @@ call and exits 1 on one nobody does. A call nobody serves answers `ENOSYS` and t
 
 ## Known limits
 
-- **amd64 only** today; the aarch64 half is planned (`proposals/B15_TOKIO_KERNEL_KIT.md`, B21).
-- **A PVH guest only**: virtio-mmio devices, no PCI, no multiboot2 (`entry!`'s `kmain_mb2` says so and halts).
+- **Two machines, one brief**: amd64 and aarch64 both run the same battery — sshd, pipes, signals, `smp=4`
+  under one kernel lock, tokioprobe, goose. Still amd64-only today: the in-guest self-host build, and the
+  `tcg_rig.py` battery driver (for aarch64, drive QEMU `virt` by hand as above).
+- **A QEMU/Firecracker guest only**: virtio-mmio devices, no PCI, no multiboot2 (`entry!`'s `kmain_mb2` says
+  so and halts). amd64 boots Firecracker through PVH; aarch64 turns on `platform-firecracker`.
 - **One root filesystem**, mounted at `/`, plus `/proc`. ext2 inode times are 0.
 - The open gaps (no `sendfile`, `PROT_NONE` not enforced, …) are [`taoxichuan/docs/gaps.md`](../../taoxichuan/docs/gaps.md).
 
 ## Background
 
 [`proposals/B15_TOKIO_KERNEL_KIT.md`](../../proposals/B15_TOKIO_KERNEL_KIT.md) (the plan),
+[`proposals/B21_TOKIO_KERNEL_AARCH64.md`](../../proposals/B21_TOKIO_KERNEL_AARCH64.md) and its record
+[`docs/archive/TAOXICHUAN_B21_AARCH64.md`](../../docs/archive/TAOXICHUAN_B21_AARCH64.md) (the aarch64 port,
+with the parity table over both machines),
 [`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`](../../docs/archive/TAOXICHUAN_CLEANUP_PLAN.md) (B15),
 [`docs/archive/TAOXICHUAN_FIXED_POINT.md`](../../docs/archive/TAOXICHUAN_FIXED_POINT.md) (the kernel this came
 from compiles itself).
