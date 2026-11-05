@@ -404,3 +404,27 @@ failure. Now an identity file may also be an **unencrypted OpenSSH private key**
 - **Not done:** passphrase-protected keys (bcrypt-pbkdf plus aes256-ctr), other key types, `ssh-keygen`-style certificates.
 - **Follow-up:** `install.sh --vmm akuma` still derives its own key with an embedded RFC 8032 routine. With this client it could instead
   take any OpenSSH key made on another machine (`--key` plus the private file), and drop the python3 dependency; not changed yet.
+
+## Update 9 (2026-11-05): `ssh-keygen` on Akuma, install.sh generates keys the usual way, a banner file (Claude)
+
+User's scope calls: one key type (Ed25519), no passphrases, "if someone wants the full feature list they can use OpenSSH".
+- **`ssh-keygen` is the `ssh` binary** (busybox-style multicall): `ssh --keygen ...`, or invoked as `ssh-keygen` (a symlink; `amd64/mkdisk.sh` now
+  creates `/bin/ssh-keygen -> ssh`). `-t ed25519 -N '' [-C c] [-f path] [-q]` writes an OpenSSH-format key (0600) and `.pub`, refuses to
+  overwrite, rejects other types and non-empty passphrases with a message; `-y` prints a key's public line. Tolerates a dropped empty `-N ''`.
+  Code: `userspace/sshd/src/client/keygen.rs`; the container writer is `akuma_ssh_crypto::keys::encode_openssh_private_key_ed25519`
+  (3 new tests, 52 in the crate). **Cross-checked against the real tool both ways:** OpenSSH's `ssh-keygen -y` reads a key written by the Rust
+  encoder and returns exactly RFC 8032's public key; keys made by `ssh-keygen` on the ryzen and on trashcan are read by the Mac's `ssh-keygen -y`
+  and give the same public key as the `.pub` Akuma wrote.
+- **Installed** on trashcan and the ryzen: `/bin/ssh` replaced (sha256 `0da31159...`, 124,128 bytes, the old one kept as
+  `/bin/ssh.orig-2026-11-05`), `/bin/ssh-keygen` linked. Verified there: both forms work, overwrite refused, `rsa` and `-N secret` refused.
+- **`install.sh`:** it detects which `ssh` it has by asking `ssh -h` (Akuma's client names itself; **never `-V`**, which Akuma's client takes
+  for a host name and tries to connect to) and calls Akuma's with only `-i`/`-p`. The key is now made with plain `ssh-keygen -t ed25519 -N ''`
+  on every host; the python RFC 8032 routine from Update 6/7 is gone. `check` needs `ssh-keygen` (on Akuma that means the new `ssh`; the
+  message says so). **Busybox:** run for real under the ryzen's `/bin/sh` (busybox ash): `check`, and `up` through fetch (sha256-verified
+  download), key, image (`debugfs` recipe), then the boot stage refusing cleanly (exit 50) because `vm-dev` holds kvm0. Not yet run to a
+  booted VM on Akuma.
+- **Banner** (user request): the server banner gains `part of Akuma Bohemian Operating System` and the repo link under the welcome line.
+  It is the **server's** banner (`sshd`), so a box shows it only after `sshd` is replaced. It now lives whole in `userspace/sshd/src/banner.txt`
+  (art, dividers, text; open it to see the layout); `protocol.rs` just includes it. Output checked byte-identical to the old banner plus
+  the two lines. The new `sshd` is staged at `/root/demo/bins/sshd` on the ryzen; the running `/bin/sshd` is untouched.
+- **Docs:** `userspace/sshd/README.md` (Keys and `ssh-keygen`, scope), `docs/SSH_CLIENT.md` (the stale "raw only" note replaced).
