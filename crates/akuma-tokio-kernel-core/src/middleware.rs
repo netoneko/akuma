@@ -13,7 +13,7 @@
 //!
 //! | tier | runs | sees | may |
 //! |---|---|---|---|
-//! | `kernel_pre`  | inside the big kernel lock, before the call | [`KernelCtx`]: args, caller's memory, tid, pid | `Pass`, `Return`, `Errno`, rewrite `args` |
+//! | `kernel_pre`  | inside the big kernel lock, before the call | [`KernelCtx`] (read-only): args, caller's memory, tid, pid | `Pass`, `Return`, `Errno` |
 //! | `fallback`    | inside the lock, only where the answer is `-ENOSYS` | [`KernelCtx`] | supply the answer (a *new* syscall) |
 //! | `kernel_post` | inside the lock, after the call | [`KernelCtx`] + the result | replace the result |
 //! | `own_pre` / `own_post` | **outside** the lock, around it | [`OwnCtx`]: plain integers + the middleware's private state | observe only |
@@ -142,7 +142,8 @@ pub struct KernelCtx {
     pub nr: u64,
     /// The call it names, if it names one.
     pub call: Option<Syscall>,
-    /// The six arguments. A `kernel_pre` hook may rewrite them; the call then sees the new values.
+    /// The six arguments, as the program passed them. Read-only: a hook gets `&KernelCtx`, so nothing a hook does can change
+    /// what the call sees (a guard's check always describes what runs).
     pub args: [u64; 6],
     /// The calling thread.
     pub tid: u64,
@@ -221,11 +222,11 @@ pub struct OwnCtx<'a, S> {
 }
 
 /// `kernel_pre`.
-pub type KernelPre = fn(&mut KernelCtx) -> Verdict;
+pub type KernelPre = fn(&KernelCtx) -> Verdict;
 /// `kernel_post`: the result in, the result out.
-pub type KernelPost = fn(&mut KernelCtx, u64) -> u64;
+pub type KernelPost = fn(&KernelCtx, u64) -> u64;
 /// `fallback`: `Some(answer)` to serve the call, `None` to leave the `-ENOSYS`.
-pub type Fallback = fn(&mut KernelCtx) -> Option<u64>;
+pub type Fallback = fn(&KernelCtx) -> Option<u64>;
 /// `own_pre`.
 pub type OwnPre<S> = fn(&mut OwnCtx<'_, S>);
 /// `own_post`: the result.
@@ -411,21 +412,21 @@ impl<S: Send + 'static> Middleware<S> {
         }
     }
 
-    /// The whole `kernel` side of one call: pre, the call (`inner`, given the possibly rewritten arguments),
+    /// The whole `kernel` side of one call: pre, the call (`inner`),
     /// the fallback where it answered `-ENOSYS`, then post. Call with the kernel lock held.
-    pub fn run_kernel(&self, nr: u64, args: &mut [u64; 6], tid: u64, inner: impl FnOnce(&[u64; 6]) -> u64) -> u64 {
+    pub fn run_kernel(&self, nr: u64, args: [u64; 6], tid: u64, inner: impl FnOnce() -> u64) -> u64 {
         let machine = self.m();
         let latch = self.kernel_latch(nr);
         let call = (machine.decode)(nr);
         let watch = observe_only(call);
         let refusable = may_refuse_before(call);
-        let mut ctx = KernelCtx { nr, call, args: *args, tid, pid: (machine.pid)(), machine };
+        let ctx = KernelCtx { nr, call, args, tid, pid: (machine.pid)(), machine };
 
         let mut ret = None;
         if latch.pre
             && let Some(h) = self.find(self.hooks.kernel_pre, nr)
         {
-            match h(&mut ctx) {
+            match h(&ctx) {
                 Verdict::Pass => {}
                 Verdict::PassAndForget => self.kp.clear(nr),
                 Verdict::Return(v) if refusable => ret = Some(v),
@@ -433,16 +434,15 @@ impl<S: Send + 'static> Middleware<S> {
                 Verdict::Return(_) | Verdict::Errno(_) => {}
             }
         }
-        *args = ctx.args;
         let mut r = if let Some(v) = ret {
             v
         } else {
-            let r = inner(args);
+            let r = inner();
             if r == ENOSYS_RET
                 && !watch
                 && let Some(h) = self.find(self.hooks.fallback, nr)
             {
-                h(&mut ctx).unwrap_or(r)
+                h(&ctx).unwrap_or(r)
             } else {
                 r
             }
@@ -450,7 +450,7 @@ impl<S: Send + 'static> Middleware<S> {
         if latch.post
             && let Some(h) = self.find(self.hooks.kernel_post, nr)
         {
-            let new = h(&mut ctx, r);
+            let new = h(&ctx, r);
             if !watch {
                 r = new;
             }
@@ -471,7 +471,7 @@ pub trait Dispatch: Sync {
     /// See [`Middleware::arm`].
     fn arm_with(&self, machine: Machine);
     /// See [`Middleware::kernel_latch`] and friends, behind one call each.
-    fn run_kernel(&self, nr: u64, args: &mut [u64; 6], tid: u64, inner: &mut dyn FnMut(&[u64; 6]) -> u64) -> u64;
+    fn run_kernel(&self, nr: u64, args: [u64; 6], tid: u64, inner: &mut dyn FnMut() -> u64) -> u64;
     fn own_latch(&self, nr: u64) -> Latch;
     fn run_own_pre(&self, latch: Latch, nr: u64, args: [u64; 6], tid: u64);
     fn run_own_post(&self, latch: Latch, nr: u64, args: [u64; 6], tid: u64, ret: u64);
@@ -481,7 +481,7 @@ impl<S: Send + 'static> Dispatch for Middleware<S> {
     fn arm_with(&self, machine: Machine) {
         self.arm(machine);
     }
-    fn run_kernel(&self, nr: u64, args: &mut [u64; 6], tid: u64, inner: &mut dyn FnMut(&[u64; 6]) -> u64) -> u64 {
+    fn run_kernel(&self, nr: u64, args: [u64; 6], tid: u64, inner: &mut dyn FnMut() -> u64) -> u64 {
         Self::run_kernel(self, nr, args, tid, inner)
     }
     fn own_latch(&self, nr: u64) -> Latch {
@@ -514,10 +514,10 @@ pub fn active() -> Option<&'static dyn Dispatch> {
 }
 
 /// The `kernel` side of a call, for a machine's dispatcher: with no middleware registered, `inner` alone.
-pub fn run_kernel(nr: u64, args: &mut [u64; 6], mut inner: impl FnMut(&[u64; 6]) -> u64) -> u64 {
+pub fn run_kernel(nr: u64, args: [u64; 6], mut inner: impl FnMut() -> u64) -> u64 {
     match active() {
         Some(mw) => mw.run_kernel(nr, args, akuma_primitives::preempt::current_tid() as u64, &mut inner),
-        None => inner(args),
+        None => inner(),
     }
 }
 
@@ -572,10 +572,10 @@ mod tests {
     fn a_call_nobody_hooked_runs_no_hook() {
         static MW: Middleware<u32> = Middleware::new(0, Hooks::new());
         MW.arm(machine());
-        let mut a = [1, 2, 3, 4, 5, 6];
+        let a = [1, 2, 3, 4, 5, 6];
         assert_eq!(MW.kernel_latch(GETPID), Latch::default());
         assert_eq!(MW.own_latch(GETPID), Latch::default());
-        assert_eq!(MW.run_kernel(GETPID, &mut a, 1, |_| 99), 99);
+        assert_eq!(MW.run_kernel(GETPID, a, 1, || 99), 99);
     }
 
     #[test]
@@ -585,9 +585,9 @@ mod tests {
             ..Hooks::new()
         });
         MW.arm(machine());
-        let mut a = [0; 6];
+        let a = [0; 6];
         let ran = AtomicUsize::new(0);
-        let r = MW.run_kernel(GETPID, &mut a, 1, |_| {
+        let r = MW.run_kernel(GETPID, a, 1, || {
             ran.fetch_add(1, Relaxed);
             5
         });
@@ -596,20 +596,16 @@ mod tests {
     }
 
     #[test]
-    fn pre_rewrites_arguments_and_post_replaces_the_result() {
+    fn post_replaces_the_result_and_the_call_sees_the_original_arguments() {
         static MW: Middleware<u32> = Middleware::new(0, Hooks {
-            kernel_pre: &[Route::new(&[On::Call(Syscall::Openat)], |c| {
-                c.args[1] = 0xAA;
-                Verdict::Pass
-            })],
             kernel_post: &[Route::new(&[On::Call(Syscall::Openat)], |_, r| r + 1)],
             ..Hooks::new()
         });
         MW.arm(machine());
-        let mut a = [0; 6];
-        let r = MW.run_kernel(OPENAT, &mut a, 1, |a| a[1]);
-        assert_eq!(r, 0xAB);
-        assert_eq!(a[1], 0xAA);
+        let a = [0, 0xAA, 0, 0, 0, 0];
+        // `inner` takes no arguments and a hook gets `&KernelCtx`: nothing a hook does can change what the call was
+        // given. The kernel's own arms read the frame, which the middleware never writes.
+        assert_eq!(MW.run_kernel(OPENAT, a, 1, || 0xAA), 0xAB);
     }
 
     #[test]
@@ -619,10 +615,10 @@ mod tests {
             ..Hooks::new()
         });
         MW.arm(machine());
-        let mut a = [0; 6];
-        assert_eq!(MW.run_kernel(CUSTOM, &mut a, 1, |_| ENOSYS_RET), 42);
+        let a = [0; 6];
+        assert_eq!(MW.run_kernel(CUSTOM, a, 1, || ENOSYS_RET), 42);
         // getpid is served, so its answer stands.
-        assert_eq!(MW.run_kernel(GETPID, &mut a, 1, |_| 1234), 1234);
+        assert_eq!(MW.run_kernel(GETPID, a, 1, || 1234), 1234);
     }
 
     #[test]
@@ -633,8 +629,8 @@ mod tests {
             ..Hooks::new()
         });
         MW.arm(machine());
-        let mut a = [0; 6];
-        assert_eq!(MW.run_kernel(56, &mut a, 1, |_| 77), 77);
+        let a = [0; 6];
+        assert_eq!(MW.run_kernel(56, a, 1, || 77), 77);
     }
 
     #[test]
@@ -651,17 +647,17 @@ mod tests {
         MW.arm(machine());
         let ran = AtomicUsize::new(0);
         // A refusal is honoured: EPERM, and the call never ran.
-        let mut a = [1, 0, 0, 0, 0, 0];
-        let r = MW.run_kernel(59, &mut a, 1, |_| {
+        let a = [1, 0, 0, 0, 0, 0];
+        let r = MW.run_kernel(59, a, 1, || {
             ran.fetch_add(1, Relaxed);
             0
         });
         assert_eq!(r.cast_signed(), -1);
         assert_eq!(ran.load(Relaxed), 0);
         // Not refused: it runs, its -ENOSYS is not turned into 99 by the fallback, and post cannot replace it.
-        let mut a = [0; 6];
-        assert_eq!(MW.run_kernel(59, &mut a, 1, |_| ENOSYS_RET), ENOSYS_RET);
-        assert_eq!(MW.run_kernel(59, &mut a, 1, |_| 7), 7);
+        let a = [0; 6];
+        assert_eq!(MW.run_kernel(59, a, 1, || ENOSYS_RET), ENOSYS_RET);
+        assert_eq!(MW.run_kernel(59, a, 1, || 7), 7);
     }
 
     #[test]
@@ -674,10 +670,10 @@ mod tests {
             ..Hooks::new()
         });
         MW.arm(machine());
-        let mut a = [0; 6];
-        assert_eq!(MW.run_kernel(231, &mut a, 1, |_| 5), 5); // exit_group
-        assert_eq!(MW.run_kernel(60, &mut a, 1, |_| 5), 5); // exit
-        assert_eq!(MW.run_kernel(15, &mut a, 1, |_| 5), 5); // rt_sigreturn
+        let a = [0; 6];
+        assert_eq!(MW.run_kernel(231, a, 1, || 5), 5); // exit_group
+        assert_eq!(MW.run_kernel(60, a, 1, || 5), 5); // exit
+        assert_eq!(MW.run_kernel(15, a, 1, || 5), 5); // rt_sigreturn
     }
 
     #[test]
@@ -692,13 +688,13 @@ mod tests {
             ..Hooks::new()
         });
         MW.arm(machine());
-        let mut a = [0; 6];
+        let a = [0; 6];
         assert!(MW.kernel_latch(GETPID).pre);
-        MW.run_kernel(GETPID, &mut a, 1, |_| 1);
+        MW.run_kernel(GETPID, a, 1, || 1);
         // The next call is not asked, but the post bit is its own.
         assert!(!MW.kernel_latch(GETPID).pre);
         assert!(MW.kernel_latch(GETPID).post);
-        MW.run_kernel(GETPID, &mut a, 1, |_| 1);
+        MW.run_kernel(GETPID, a, 1, || 1);
         assert_eq!(POSTS.load(Relaxed), 2);
     }
 
@@ -764,8 +760,8 @@ mod tests {
             ..Hooks::new()
         });
         MW.arm(machine());
-        let mut a = [0; 6];
-        assert_eq!(MW.run_kernel(CUSTOM_BASE, &mut a, 1, |_| ENOSYS_RET), 42);
+        let a = [0; 6];
+        assert_eq!(MW.run_kernel(CUSTOM_BASE, a, 1, || ENOSYS_RET), 42);
         // And as `Kernel::middleware` takes it: behind the object-safe face.
         let face: &'static dyn Dispatch = &MW;
         assert_eq!(face.own_latch(39), Latch::default());

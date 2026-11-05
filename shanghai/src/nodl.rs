@@ -26,7 +26,7 @@ const EACCES: i32 = 13;
 const MAX_ENV: usize = 512;
 
 /// `mmap(addr, len, prot, flags, fd, off)`: refuse a file-backed mapping that is executable.
-pub fn mmap_guard(ctx: &mut KernelCtx) -> Verdict {
+pub fn mmap_guard(ctx: &KernelCtx) -> Verdict {
     let (prot, flags) = (ctx.args[2], ctx.args[3]);
     if prot & PROT_EXEC != 0 && flags & MAP_ANONYMOUS == 0 {
         akuma_primitives::safe_print!(96, "[nodl] pid {} refused a file-backed PROT_EXEC mmap\n", ctx.pid);
@@ -36,7 +36,7 @@ pub fn mmap_guard(ctx: &mut KernelCtx) -> Verdict {
 }
 
 /// `mprotect(addr, len, prot)`: refuse making anything executable.
-pub fn mprotect_guard(ctx: &mut KernelCtx) -> Verdict {
+pub fn mprotect_guard(ctx: &KernelCtx) -> Verdict {
     if ctx.args[2] & PROT_EXEC != 0 {
         akuma_primitives::safe_print!(96, "[nodl] pid {} refused mprotect(PROT_EXEC)\n", ctx.pid);
         return Verdict::Errno(EACCES);
@@ -59,7 +59,7 @@ fn starts_with_ld(ctx: &KernelCtx, s: u64) -> Result<bool, UserError> {
 
 /// `execve(path, argv, envp)`: refuse a call whose `envp` has an `LD_*` entry. `envp` may be NULL (an empty
 /// environment). A bad pointer or an over-long list is refused too: unknown is not allowed.
-pub fn exec_guard(ctx: &mut KernelCtx) -> Verdict {
+pub fn exec_guard(ctx: &KernelCtx) -> Verdict {
     let mut slot = ctx.args[2];
     if slot == 0 {
         return Verdict::Pass;

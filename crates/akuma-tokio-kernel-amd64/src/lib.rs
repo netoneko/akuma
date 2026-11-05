@@ -1367,21 +1367,14 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
         fr.rax = call.to_x86_64();
         (fr.rdi, fr.rsi, fr.rdx, fr.r10, fr.r8, fr.r9) = (a[0], a[1], a[2], a[3], a[4], a[5]);
     }
-    // Middleware's `kernel` tier wraps the rest of the dispatch (B22), after the fold: a hook sees the
-    // canonical `*at` number on either spelling. It may rewrite the arguments; they are written back here.
+    // Middleware's `kernel` tier wraps the rest of the dispatch (B22), after the fold: a hook sees the canonical `*at`
+    // number on either spelling. It gets the arguments by value and a read-only context: nothing a hook does can change
+    // what the call below reads from the frame.
     #[cfg(feature = "middleware")]
     {
         let nr = fr.rax;
-        let mut args = [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()];
-        akuma_tokio_kernel_core::middleware::run_kernel(nr, &mut args, |a| {
-            fr.rdi = a[0];
-            fr.rsi = a[1];
-            fr.rdx = a[2];
-            fr.r10 = a[3];
-            fr.r8 = a[4];
-            fr.r9 = a[5];
-            dispatch_after_fold(fr)
-        })
+        let args = [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()];
+        akuma_tokio_kernel_core::middleware::run_kernel(nr, args, || dispatch_after_fold(fr))
     }
     #[cfg(not(feature = "middleware"))]
     {

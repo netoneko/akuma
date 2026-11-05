@@ -32,7 +32,7 @@ const EFAULT_RET: u64 = (-14i64) as u64;
 static STATE_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
 
 /// `openat(dirfd, path, ..)`: `path` is argument 1.
-fn open_guard(ctx: &mut akuma_tokio_kernel::middleware::KernelCtx) -> Verdict {
+fn open_guard(ctx: &akuma_tokio_kernel::middleware::KernelCtx) -> Verdict {
     let mut buf = [0u8; 64];
     let Ok(path) = ctx.user_str(ctx.args[1], &mut buf) else {
         return Verdict::Pass; // not ours to judge: the kernel will say what is wrong with it

@@ -39,8 +39,7 @@ pub fn svc(f: &mut Frame) {
 fn dispatch(f: &Frame, n: u64, a: [u64; 6]) -> u64 {
     #[cfg(feature = "middleware")]
     {
-        let mut args = a;
-        akuma_tokio_kernel_core::middleware::run_kernel(n, &mut args, |a| dispatch_arms(f, n, *a))
+        akuma_tokio_kernel_core::middleware::run_kernel(n, a, || dispatch_arms(f, n, a))
     }
     #[cfg(not(feature = "middleware"))]
     {
