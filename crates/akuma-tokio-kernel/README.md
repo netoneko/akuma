@@ -164,7 +164,9 @@ From the guest, `syscall(1000)` returns 42. Shanghai carries a working table beh
 (`cargo build -p shanghai --features middleware --target <arch>-unknown-none --release`), and `sh shanghai/mw_gate.sh
 [x86_64|aarch64|all]` (`SMP=4` for four cores) boots it, and a control built without it, under QEMU TCG with
 [`shanghai/mwprobe`](../../shanghai/mwprobe) as `init`: the control must print `MWPROBE RESULT CONTROL PASS`, the
-middleware kernel `MWPROBE RESULT PASS`. It needs no sshd or key, only `e2fsprogs`. The rules, each with its reason in the module docs:
+middleware kernel `MWPROBE RESULT PASS`. The "no dynamic loading" demo guards are a further Shanghai feature, `--features no-dynamic-loading` (off by default; it implies
+`middleware`), and the gate boots three kernels per machine: stock, `middleware` alone (the guards must be absent), and with the feature
+(they must be on). It needs no sshd or key, only `e2fsprogs` and, the first time, network for Alpine's dynamic test binaries. The rules, each with its reason in the module docs:
 
 - **One table, flat, no chaining.** No `next`, no priorities. Two entries for one call in one tier are refused when
   the table is armed (a boot panic naming the number). A second `.middleware(..)` panics. To layer, write a

@@ -184,13 +184,20 @@ pub fn exec_guard(ctx: &KernelCtx) -> Verdict {
 }
 ```
 
-Register it like any hook (Shanghai's table, `shanghai/src/middleware.rs`):
+Register it like any hook (Shanghai's table, `shanghai/src/middleware.rs`). In Shanghai the three guards are a **feature, off by
+default**: `no-dynamic-loading` (it implies `middleware`), so the sample table alone does not have them:
 
 ```rust
 kernel_pre: &[
+    Route::new(&[On::Call(Syscall::Openat)], open_guard),
+    #[cfg(feature = "no-dynamic-loading")]
     Route::new(&[On::Call(Syscall::Execve)], crate::nodl::exec_guard),
-    // ...
+    // ... mmap_guard and mprotect_guard the same way
 ],
+```
+
+```text
+cargo build -p shanghai --features no-dynamic-loading --target x86_64-unknown-none --release     # or aarch64-unknown-none
 ```
 
 **Decisions in it, and why**
@@ -222,6 +229,43 @@ and aarch64 at 4 cores):
 |---|---|---|
 | `xz --version` (needs `liblzma.so.5`, a library besides libc) | prints `xz (XZ Utils) 5.8.4` | the loader fails: `Error loading shared library liblzma.so.5: Permission denied (needed by /usr/bin/xz)` |
 | `busybox true` (dynamic, needs only libc) | runs | **still runs** (known gap, pinned by a probe case) |
+
+What each child goes through, and where the guards can and cannot see it (the xz line is from the gate's console: the `[nodl]`
+refusal under the child's pid, then the loader's error; the "opens the file" step is inferred, the log does not record opens):
+
+```text
+             xz --version  (needs liblzma.so.5)                   busybox true  (needs only libc)
+             ─────────────────────────────────────                ──────────────────────────────────
+mwprobe      fork + execve("/usr/bin/xz", env: empty)             fork + execve("/bin/busybox", env: empty)
+             exec_guard: no LD_* in env -> allowed                exec_guard: no LD_* in env -> allowed
+                          |                                                     |
+                          v                                                     v
+KERNEL       the kernel's own loader, inside execve (no syscall from the program involved):
+ (its own    +- maps the main binary                              +- maps the main binary
+  loader)    +- reads PT_INTERP, maps /lib/ld-musl-<arch>.so.1    +- reads PT_INTERP, maps /lib/ld-musl-<arch>.so.1
+             +- starts the program at ld-musl's entry             +- starts the program at ld-musl's entry
+                          |                                                     |
+                          v                                                     v
+ld-musl      reads the binary's list of needed libraries          reads the binary's list of needed libraries
+(userspace,
+ in the      1. libc.musl-<arch>.so.1                             1. libc.musl-<arch>.so.1
+ child)         = ld-musl itself (a symlink to it)                   = ld-musl itself, already mapped
+                -> already mapped, no syscall                        -> no syscall
+                                                                  nothing else needed -> nothing left to map
+             2. liblzma.so.5
+                opens the file, then
+                mmap(fd, PROT_READ|PROT_EXEC, MAP_PRIVATE)
+                          |
+                          v
+MIDDLEWARE   kernel_pre on mmap: file-backed + PROT_EXEC          no executable file mapping is requested, so
+             mmap_guard -> Errno(EACCES)                           mmap_guard and mprotect_guard never run for
+             console: "[nodl] pid 9 refused a                      this process: nothing to refuse
+             file-backed PROT_EXEC mmap"
+                          |                                                     |
+                          v                                                     v
+RESULT       ld-musl: "Error loading shared library               runs `true`, exits 0
+             liblzma.so.5: Permission denied" -> the child fails  (on the stock kernel both run)
+```
 
 The gap is structural: the kernel's own loader maps the interpreter and the main binary without a syscall, and `ld-musl` *is*
 libc, so a program with no other dependency never asks for a second mapping. This is **not a wholesale ban**: it stops a program
@@ -306,6 +350,9 @@ The feature-on cost against the syscall floor is **not measured**; do not quote 
 
 ## Not built (yet)
 
+An `exec_image` tier (a hook the loader calls with the path, the interpreter path and the image bytes, read-only, able to refuse): the
+place to close the libc-only gap above by refusing any `PT_INTERP` executable, and the place a signed-binaries check belongs, since the
+loader holds the bytes it is about to map. Not built, and whether a loader refusal leaves a calling process intact was not checked.
 Refusing `clone`/`fork` before they run (as safe as refusing `execve`, but nobody has asked for it); stripping variables from an exec's
 environment (see Example 2); a runtime `arm`/`disarm` handle for interest bits; a lock-protected state cell for `kernel` hooks (use
 atomics, or a `BorrowCell` static, which the kernel lock serialises); typed `UserPtr<T>` (there are byte reads and `u64`/string helpers); a

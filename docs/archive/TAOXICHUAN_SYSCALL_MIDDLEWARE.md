@@ -101,6 +101,14 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   libc (`busybox`) **still runs**: the kernel maps the interpreter and the main binary without a syscall and `ld-musl` is libc,
   so there is no second mapping to refuse. That case is pinned in the probe as a known gap. It is a demonstration, not a wholesale
   ban. `memfd_create` and shebang scripts were not checked.
+- **A feature, off by default** (2026-11-05, the owner): the three guards are behind Shanghai's `no-dynamic-loading` feature (implies
+  `middleware`), so the sample table alone does not carry them. The gate boots three kernels per machine (stock; `middleware`
+  alone, where the probe asserts the guards are absent; `no-dynamic-loading`, booted with `initargs=nodl`, where it asserts they are
+  on), so a build that silently lacks or wrongly has the guards fails.
+- **Closing the libc-only gap** needs a hook where the loader handles `PT_INTERP`, not a syscall hook: an `exec_image` tier (path,
+  interpreter path, read-only image bytes, may refuse). Not built; also where a signed-binaries check belongs. Noted: running the
+  loader directly (`ld-musl <binary>`) has no `PT_INTERP`, so a `PT_INTERP` check alone would not see it (the `mmap` guard
+  probably still refuses the binary's own mapping; not tested).
 - **The first test subject was wrong:** `bzip2` ran under the guards with no refusal, which looked like a failed ban. Alpine builds
   libbz2 into the binary (`strings` shows only `libc.musl` as a dependency), so it never asked for a second library. `xz` replaced
   it, and `mw_fetch_dyn.sh` now checks the premise (`xz` names `liblzma`, `busybox` needs nothing beyond libc).
