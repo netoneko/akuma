@@ -32,7 +32,7 @@ Why this shape, and the wifi work it exists for:
 | network | **wifi** (entry 11): `python3 overlays/ryzen/wifi-ssh.py --key <key>` finds the station by its MAC and runs a command over ssh (port **2222**); the user's key is in p3's `/etc/sshd/authorized_keys`. Every other entry has no network; the log is the channel |
 | wifi credentials | `~/.akuma/wifi/<network>` on the laptop holds the passphrase; never copied into the repo, docs or logs |
 
-**Entry numbers vs GRUB indices.** `arm.sh N` takes the menu *index*. The embedded `grub.cfg.embedded` on the ESP lacks the repo's "entry 29" item, so the entry labelled 30 (KVM herd) is index 29; index 30 is out of range and boots entry 0. `/root/arm.sh` on the ryzen is an old script hardcoded to entry 17 (Gentoo) - use `overlays/ryzen/arm.sh`.
+**Entry numbers vs GRUB indices.** `arm.sh N` takes the menu *index*; for entries 0-28 the index **is** the label (checked 2026-11-06 against `grub.cfg.embedded`), so the verify entry for the smp/wifi/sshd command line is `arm.sh 26`. `arm.sh 27` is "KVM test", which boots p3's **primary** `/boot/akuma-amd64`, not `.verify` - arming 27 for a test kernel silently boots the old one. **Always confirm a verify boot by the commit hash in `uname -v` on the box matching the kernel you built** (`strings -a <kernel> | grep release-smp-shared`), not by the box coming up. The embedded `grub.cfg.embedded` on the ESP lacks the repo's "entry 29" item, so the entry labelled 30 (KVM herd) is index 29; index 30 is out of range and boots entry 0. `/root/arm.sh` on the ryzen is an old script hardcoded to entry 17 (Gentoo) - use `overlays/ryzen/arm.sh`.
 
 ## Quick start
 

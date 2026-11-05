@@ -5239,7 +5239,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     // in schedule_indices: an EL1-interrupted thread is a BKL holder under
     // smp-shared and must stay displaceable (the BKL release valve).
     // SAFETY: current_sp is the live IRQ trap frame the vector asm just built.
-    let interrupted_el0 = IrqFrame::at(current_sp).from_el0();
+    let interrupted_el0 = unsafe { IrqFrame::at(current_sp) }.from_el0();
     
     // Get scheduling decision. Use try_lock instead of a blocking lock(): this handler
     // runs from the timer-driven SGI in IRQ context (PSTATE.I masked). If the timer
@@ -6947,7 +6947,7 @@ pub fn dump_thread_resume_points() {
                 // SAFETY: `ctx.sp` is a switched-out thread's saved IRQ frame on
                 // its own kernel stack (guarded `!= 0`); the thread cannot free
                 // that stack while it is not running.
-                IrqFrame::at(ctx.sp).elr()
+                unsafe { IrqFrame::at(ctx.sp) }.elr()
             }
         };
         let stc = match st {
@@ -7027,7 +7027,7 @@ pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
             // SAFETY: `ctx.sp` is a switched-out thread's saved IRQ frame on its
             // own kernel stack (guarded `!= 0`); the thread cannot free that
             // stack while it is not running.
-            IrqFrame::at(ctx.sp).elr()
+            unsafe { IrqFrame::at(ctx.sp) }.elr()
         };
         Some((ctx.x30, live_elr, ctx.sp))
     })

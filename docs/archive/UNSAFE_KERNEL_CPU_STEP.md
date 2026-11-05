@@ -98,3 +98,14 @@ Verified on this box (x86_64 musl host, **no aarch64 target installed**): `cargo
 **Not verified here, for the Mac: aarch64 `cargo check`, the `akuma-exceptions` build, `mw_gate.sh`, and every booted-aarch64 behaviour — items 1 and 3.3's SGI/IRQ-frame code is exactly what a unit test cannot exercise.**
 
 **Not started (next session): items 2a/2b (exceptions page copies + EL1 crash dump move — aarch64-only crate, uncompilable on this box) and item 3 (the context table: `Initializing`/`SwitchPair`/`with_current_ctx`/`peek` in a new `src/ctx_table.rs`; 34 `get_context*` sites to classify per §3.1's table).** The design doc's note stands: `crates/akuma-slot-table` already exists with its own budget entry — read it before item 3's "extract a crate is out of scope" reasoning.
+
+## Part 3 review and metal verification (supervisor, 2026-11-06)
+
+* Glm's Part 3 (item 1) did not compile for aarch64: seven `IrqFrame::at` calls (three in `akuma-threading`, four in `akuma-exceptions`) lacked
+  their `unsafe` blocks, because its box has no aarch64 target and the code is `cfg`-gated. Fixed in the merge; its "471 sites" was therefore an
+  undercount - the real figure after the fix is **478** (`akuma-trap-aarch64` 14 -> 19, the callers keep one `unsafe` each). The aarch64 +
+  amd64 gate (`SMP=4 sh shanghai/mw_gate.sh all`, 186 `^PASS`, 0 FAIL) is what boots the IRQ-frame change under HVF.
+* **Metal (ryzen, GRUB entry 26, `d60ce6e4`, 8 cores, 300 fork/exec/pipe loops over ssh): no `EXCEPTION`/`panic`/`POISON`/`STACK-OVERFLOW`/`[FAIL`, `smp: 8 cpus online`.**
+  This is the first real metal boot of Parts 2-3. The two earlier "booted on metal" notes for Part 2 were wrong: `arm.sh 27` is the *KVM test* entry
+  and boots p3's primary kernel, not `.verify`. Confirm a verify boot by the commit hash in `uname -v` (see `overlays/ryzen/README.md`).
+* That kernel (md5 `d81d8028cfa83722fdb8b78b49d9bdf6`) was promoted to p3's `/boot/akuma-amd64`; the previous one is `/boot/akuma-amd64.prev-fca1f9ed`.

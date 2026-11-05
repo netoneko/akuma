@@ -2924,7 +2924,7 @@ extern "C" fn rust_default_exception_handler() {
 #[inline]
 fn irq_eret_poison_check(final_sp: u64, switched: bool) {
     // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-    let frame = IrqFrame::at(final_sp);
+    let frame = unsafe { IrqFrame::at(final_sp) };
     let elr = frame.elr();
     let kernel_text = akuma_exec::mmu::is_kernel_text(elr as usize);
     // EL0-target frames must not eret into kernel text; EL1-target frames must
@@ -2959,7 +2959,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     let interrupted_el0 = {
         // SAFETY: `current_sp` is the live interrupted IRQ trap frame the vector
         // asm just built. SPSR.M[3:0] == 0 ⇒ interrupted context was EL0t (userspace).
-        IrqFrame::at(current_sp).from_el0()
+        unsafe { IrqFrame::at(current_sp) }.from_el0()
     };
     // If this IRQ interrupted EL0, userspace was running on this core — count it (captures
     // pure compute loops that only get timer-preempted, not just syscalls).
@@ -2996,7 +2996,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
             akuma_exec::threading::sgi_scheduler_handler_with_sp(akuma_gic::SGI_SCHEDULER, current_sp);
         let final_sp = if new_sp != 0 { new_sp } else { current_sp };
         // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-        let spsr = IrqFrame::at(final_sp).spsr();
+        let spsr = unsafe { IrqFrame::at(final_sp) }.spsr();
         akuma_exec::bkl::reconcile_for_spsr_no_ticket(spsr);
         irq_eret_poison_check(final_sp, new_sp != 0);
         return new_sp;
@@ -3067,7 +3067,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
         // `current_sp` frame. Reconcile the BKL to that frame's target EL.
         let final_sp = if new_sp != 0 { new_sp } else { current_sp };
         // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-        let spsr = IrqFrame::at(final_sp).spsr();
+        let spsr = unsafe { IrqFrame::at(final_sp) }.spsr();
         akuma_exec::bkl::reconcile_for_spsr(spsr);
     }
     {
