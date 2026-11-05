@@ -6,6 +6,8 @@
 
 #[cfg(feature = "middleware")]
 mod middleware;
+#[cfg(feature = "middleware")]
+mod nodl;
 
 akuma_tokio_kernel::entry!(main);
 
