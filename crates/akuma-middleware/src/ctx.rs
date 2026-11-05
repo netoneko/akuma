@@ -1,6 +1,6 @@
 //! What a hook is handed: [`KernelCtx`] (under the kernel lock, read-only), and the hook types.
 
-use crate::calls::{Machine, Verdict};
+use crate::calls::Machine;
 use akuma_syscalls_abi::Syscall;
 
 /// A user-memory access that did not go through.
@@ -105,8 +105,3 @@ impl KernelCtx {
         Err(UserError::TooLong)
     }
 }
-
-/// `pre`.
-pub type Pre = fn(&KernelCtx) -> Verdict;
-/// `handler`: `Some(answer)` to serve the call, `None` to leave the `-ENOSYS`.
-pub type Handler = fn(&KernelCtx) -> Option<u64>;

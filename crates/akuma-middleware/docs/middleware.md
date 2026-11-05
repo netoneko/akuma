@@ -29,11 +29,19 @@ exec by its environment.
 
    ```rust
    #![forbid(unsafe_code)]
-   use akuma_tokio_kernel::middleware::{CUSTOM_BASE, Hooks, Middleware, On, Route};
+   use akuma_tokio_kernel::middleware::{Hooks, Middleware, NoCalls, calls};
 
-   pub static MW: Middleware = Middleware::new(Hooks {
-       // 1000 is above every number Linux assigns. This runs only where the kernel would have said -ENOSYS.
-       handler: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_ctx| Some(42))],
+   calls! {
+       // `Hello = 1000` is a call of your own: 1000 is above every number Linux assigns.
+       pub enum Serve { Hello = 1000 }
+   }
+
+   // The handler is an exhaustive `match` over the enum: add a variant and this stops compiling until it is handled.
+   // It runs only where the kernel would have said -ENOSYS.
+   pub static MW: Middleware<NoCalls, Serve> = Middleware::new(Hooks {
+       handler: Some(|_ctx, call| match call {
+           Serve::Hello => Some(42),
+       }),
        ..Hooks::new()
    });
    ```
@@ -54,11 +62,10 @@ to the address in its first argument:
 ```rust
 const EFAULT_RET: u64 = (-14i64) as u64;
 
-Route::new(&[On::Nr(CUSTOM_BASE + 1)], |ctx| {
-    Some(match ctx.user_write_u64(ctx.args[0], u64::from(ctx.pid)) {
-        Ok(()) => 0,
-        Err(_) => EFAULT_RET,
-    })
+// in `calls! { pub enum Serve { Hello = 1000, Whoami = 1001 } }`, the arm of the handler's `match`:
+Serve::Whoami => Some(match ctx.user_write_u64(ctx.args[0], u64::from(ctx.pid)) {
+    Ok(()) => 0,
+    Err(_) => EFAULT_RET,
 }),
 ```
 
@@ -70,19 +77,25 @@ probe's own result line. It needs only `e2fsprogs`, no sshd or key.
 
 ## The table
 
-One `Middleware` per kernel, a `static`: `Middleware::new(Hooks { .. })`. `Hooks` has two tiers, each a slice of
-`Route::new(&[On::..], hook)`, and one `exec` policy (below); leave the ones you do not use at `..Hooks::new()`.
+One `Middleware<P, H>` per kernel, a `static`: `Middleware::new(Hooks { .. })`. `Hooks` has two tiers, `pre` and `handler`, each an
+`Option` of one function over a closed enum, and one `exec` policy (below); leave the ones you do not use at `..Hooks::new()`.
+A tier you do not use is `None` and its enum is `NoCalls` (`Middleware<NoCalls, Serve>`).
 
 | tier | hook type | runs | it may |
 |---|---|---|---|
-| `pre` | `fn(&KernelCtx) -> Verdict` | inside the kernel lock, before the call | `Pass`, `PassAndForget`, `Return(v)`, `Errno(e)` (a refusal: not for `exit`/`clone`/`rt_sigreturn`) |
-| `handler` | `fn(&KernelCtx) -> Option<u64>` | inside the lock, only where the answer is `-ENOSYS` | `Some(answer)` to serve the call, `None` to leave the `-ENOSYS` |
+| `pre` | `fn(&KernelCtx, P) -> Verdict` | inside the kernel lock, before the call | `Pass`, `PassAndForget`, `Return(v)`, `Errno(e)` (a refusal: not for `exit`/`clone`/`rt_sigreturn`) |
+| `handler` | `fn(&KernelCtx, H) -> Option<u64>` | inside the lock, only where the answer is `-ENOSYS` | `Some(answer)` to serve the call, `None` to leave the `-ENOSYS` |
 
-`On::Call(Syscall::Openat)` names a Linux call by identity (the machine maps it to its architecture's number);
-`On::Nr(1000)` names a raw number, the same on both architectures (use it from `CUSTOM_BASE` = 1000 up).
+**The enum is the allow-list.** `calls! { pub enum Guard { Openat, Execve } }` makes an enum whose bare variants are Linux calls by identity
+(`Openat` is `Syscall::Openat`; the machine maps it to its architecture's number), and `Name = 1001` is a custom call with a fixed number, the
+same on both architectures. Only those calls reach the hook, and the hook is an exhaustive `match`, so a variant added later fails the build
+at the hook until it is handled (write the arms out, no `_ =>`, or the guarantee is gone). The interest mask is built from the enum, so a
+call outside it costs what it always did. The rules are checked when the table is built, as compile errors: a call twice in one enum, a custom
+number below `CUSTOM_BASE` (it would shadow Linux), and, for `handler`, a call it can never serve (`exit`, `exit_group`, `clone`, `execve`,
+`rt_sigreturn`). The one overlap the types cannot see, a Linux call and a custom number that are the same number on one machine, still
+panics when the table is armed at boot. Arguments stay raw in `ctx.args`.
 
-**One table, flat, no chaining.** There is no `next`, no priority and no ordering. Two entries naming the same call in the same
-tier panic when the table is armed at boot, with the number. A second `Kernel::middleware(..)` panics. To layer behaviours, write
+**One table, flat, no chaining.** There is no `next`, no priority and no ordering. A call named twice in one enum does not compile. A second `Kernel::middleware(..)` panics. To layer behaviours, write
 a function that calls your own functions and register that; the framework gives you nothing to make that feel supported.
 
 ## Where it runs
@@ -182,11 +195,23 @@ Register it like any hook (Shanghai's table, `shanghai/src/middleware.rs`). In S
 default**: `no-dynamic-loading` (it implies `middleware`), so the sample table alone does not have them:
 
 ```rust
-pre: &[
-    Route::new(&[On::Call(Syscall::Openat)], open_guard),
-    #[cfg(feature = "no-dynamic-loading")]
-    Route::new(&[On::Call(Syscall::Execve)], akuma_mw_no_dynamic_loading::exec_guard),
-],
+calls! {
+    pub enum Guard {
+        Openat,
+        #[cfg(feature = "no-dynamic-loading")]
+        Execve,
+    }
+}
+
+fn guard(ctx: &KernelCtx, call: Guard) -> Verdict {
+    match call {
+        Guard::Openat => open_guard(ctx),
+        #[cfg(feature = "no-dynamic-loading")]
+        Guard::Execve => akuma_mw_no_dynamic_loading::exec_guard(ctx),
+    }
+}
+
+// ...and in the table: `pre: Some(guard),`
 exec: EXEC,   // Some(akuma_mw_no_dynamic_loading::exec_policy) with the feature, None without it
 ```
 

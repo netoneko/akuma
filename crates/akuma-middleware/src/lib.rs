@@ -49,8 +49,8 @@ mod tests;
 
 pub use akuma_syscalls_abi::Syscall;
 pub use akuma_params::{self as params, ParamSource, Params};
-pub use calls::{observe_only, may_refuse_before, Machine, On, Verdict, CUSTOM_BASE, ENOSYS_RET, MASK_BITS};
-pub use ctx::{Handler, KernelCtx, Pre, UserError};
+pub use calls::{check_calls, may_refuse_before, observe_only, servable, Calls, Machine, NoCalls, On, Verdict, CUSTOM_BASE, ENOSYS_RET, MASK_BITS};
+pub use ctx::{KernelCtx, UserError};
 pub use dispatch::{active, init, install, run_kernel, Dispatch};
 pub use exec::{exec_event, exec_sidecar, exec_verdict, ExecEvent, ExecKind, ExecPolicy, ExecVerdict};
-pub use table::{Hooks, InitHook, Middleware, Route};
+pub use table::{Hooks, InitHook, Middleware};

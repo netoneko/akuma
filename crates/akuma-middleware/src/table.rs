@@ -1,24 +1,11 @@
 //! The table: routes, the interest mask, [`Hooks`] and [`Middleware`] (arming, the exec policy).
 
-use crate::calls::{native, Machine, On, MASK_BITS};
-use crate::ctx::{Handler, Pre};
+use crate::calls::{check_calls, native, servable, Calls, Machine, NoCalls, Verdict, MASK_BITS};
+use crate::ctx::KernelCtx;
 use crate::exec::{ExecEvent, ExecKind, ExecPolicy, ExecVerdict};
 use akuma_params::Params;
 use akuma_primitives::OnceCopy;
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-
-/// One table entry: the calls it is about, and the hook.
-pub struct Route<F: 'static> {
-    pub on: &'static [On],
-    pub hook: F,
-}
-
-impl<F> Route<F> {
-    /// An entry for `on`.
-    pub const fn new(on: &'static [On], hook: F) -> Self {
-        Self { on, hook }
-    }
-}
 
 /// 512 bits, one per native syscall number, set when the tier wants to be asked.
 pub struct Interest([AtomicU64; MASK_BITS / 64]);
@@ -42,10 +29,15 @@ impl Interest {
     }
 }
 
-/// The hook tables: all public, so a table is written `Hooks { handler: &[..], ..Hooks::new() }` from any crate.
-pub struct Hooks {
-    pub pre: &'static [Route<Pre>],
-    pub handler: &'static [Route<Handler>],
+/// The hooks: all public, so a table is written `Hooks { pre: Some(guard), ..Hooks::new() }` from any crate.
+///
+/// `P` is the set of calls `pre` is asked about and `H` the set `handler` can serve ([`calls!`](crate::calls)); each hook is an
+/// exhaustive `match` over its set. A tier with no hook is [`NoCalls`] and `None`.
+pub struct Hooks<P: Calls = NoCalls, H: Calls = NoCalls> {
+    /// Before the call, under the kernel lock: see the call, then pass, refuse or answer it.
+    pub pre: Option<fn(&KernelCtx, P) -> Verdict>,
+    /// After the kernel answered `-ENOSYS`: `Some(answer)` serves the call, `None` leaves the `-ENOSYS`.
+    pub handler: Option<fn(&KernelCtx, H) -> Option<u64>>,
     /// The policy for new code (images, executable mappings): see [`ExecPolicy`]. `None`: everything allowed.
     pub exec: Option<ExecPolicy>,
     /// Runs once, at boot, after the command line is captured and before the first user instruction: read the
@@ -64,15 +56,15 @@ pub struct Hooks {
 /// See [`Hooks::init`].
 pub type InitHook = fn(&Params<'static>);
 
-impl Hooks {
+impl<P: Calls, H: Calls> Hooks<P, H> {
     /// No hooks.
     #[must_use]
     pub const fn new() -> Self {
-        Self { pre: &[], handler: &[], exec: None, init: None, exec_sidecar: None }
+        Self { pre: None, handler: None, exec: None, init: None, exec_sidecar: None }
     }
 }
 
-impl Default for Hooks {
+impl<P: Calls, H: Calls> Default for Hooks<P, H> {
     fn default() -> Self {
         Self::new()
     }
@@ -81,21 +73,26 @@ impl Default for Hooks {
 /// The table. Make it a `static`.
 ///
 /// ```ignore
-/// static MW: Middleware = Middleware::new(Hooks {
-///     handler: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_| Some(42))],
+/// calls! { enum Serve { Hello = 1000 } }
+/// static MW: Middleware<NoCalls, Serve> = Middleware::new(Hooks {
+///     handler: Some(|_ctx, call| match call { Serve::Hello => Some(42) }),
 ///     ..Hooks::new()
 /// });
 /// ```
-pub struct Middleware {
-    pub(super) hooks: Hooks,
+pub struct Middleware<P: Calls = NoCalls, H: Calls = NoCalls> {
+    pub(super) hooks: Hooks<P, H>,
     pub(super) machine: OnceCopy<Machine>,
     pub(super) kp: Interest,
 }
 
-impl Middleware {
-    /// A table of `hooks`.
+impl<P: Calls, H: Calls> Middleware<P, H> {
+    /// A table of `hooks`. The rules on `P` and `H` are checked here, at compile time: no call twice, custom numbers from
+    /// `CUSTOM_BASE`, and nothing in `H` that a handler can never serve (`exit`, `clone`, `execve`, ...).
     #[must_use]
-    pub const fn new(hooks: Hooks) -> Self {
+    pub const fn new(hooks: Hooks<P, H>) -> Self {
+        const { check_calls(P::ALL) };
+        const { check_calls(H::ALL) };
+        const { assert!(servable(H::ALL), "middleware: `handler` names a call it can never serve (exit, exit_group, clone, execve, rt_sigreturn)") };
         Self {
             hooks,
             machine: OnceCopy::new(),
@@ -108,22 +105,19 @@ impl Middleware {
     /// # Panics
     /// On a duplicate, with the number: overlap is an error, not an ordering question.
     pub fn arm(&self, machine: Machine) {
-        fn fill<F: 'static>(routes: &[Route<F>], mask: Option<&Interest>, m: &Machine, tier: &str) {
-            for (i, r) in routes.iter().enumerate() {
-                for (a, on) in r.on.iter().enumerate() {
-                    let nr = native(m, *on);
-                    let again = r.on[a + 1..].iter().any(|o| native(m, *o) == nr)
-                        || routes[i + 1..].iter().any(|q| q.on.iter().any(|o| native(m, *o) == nr));
-                    assert!(!again, "middleware: syscall {nr} is named twice in `{tier}`");
-                    if let Some(mask) = mask {
-                        mask.set(nr);
-                    }
+        fn fill(all: &[crate::calls::On], mask: Option<&Interest>, m: &Machine, tier: &str) {
+            for (i, on) in all.iter().enumerate() {
+                let nr = native(m, *on);
+                // The one thing the types cannot see: a Linux call and a raw number that are the same call on this machine.
+                assert!(!all[i + 1..].iter().any(|o| native(m, *o) == nr), "middleware: syscall {nr} is named twice in `{tier}`");
+                if let Some(mask) = mask {
+                    mask.set(nr);
                 }
             }
         }
         self.machine.set(machine);
-        fill(self.hooks.pre, Some(&self.kp), &machine, "pre");
-        fill(self.hooks.handler, None, &machine, "handler");
+        fill(P::ALL, Some(&self.kp), &machine, "pre");
+        fill(H::ALL, None, &machine, "handler");
     }
 
     /// Run the [`Hooks::init`] hook, if there is one, with `params`. Called once, by [`init`], after the command line is captured.
@@ -135,11 +129,6 @@ impl Middleware {
 
     pub(super) fn m(&self) -> Machine {
         self.machine.get().expect("middleware: used before it was armed")
-    }
-
-    pub(super) fn find<F: Copy>(&self, routes: &[Route<F>], nr: u64) -> Option<F> {
-        let m = self.m();
-        routes.iter().find(|r| r.on.iter().any(|o| native(&m, *o) == nr)).map(|r| r.hook)
     }
 
     /// Whether `pre` wants to be asked about `nr`: read once per call.

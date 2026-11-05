@@ -14,8 +14,8 @@
 //! environment: the guide's Example 2, kept because it is the clearest example of reading the caller's memory.
 //!
 //! **How a kernel uses it.** There is one middleware table per kernel and nothing chains, so this crate is not a table: it is two
-//! functions the kernel's table names (`Hooks { exec: Some(akuma_mw_no_dynamic_loading::exec_policy), pre: &[Route::new(
-//! &[On::Call(Syscall::Execve)], akuma_mw_no_dynamic_loading::exec_guard)], .. }`). A kernel that composes several such crates
+//! functions the kernel's table names (`Hooks { exec: Some(akuma_mw_no_dynamic_loading::exec_policy), pre: Some(guard), .. }`, where `guard` is a `match` over
+//! the table's `Guard` enum whose `Execve` arm calls [`exec_guard`]). A kernel that composes several such crates
 //! writes the composition itself, in its own table, where it can be read. It takes no boot parameters and keeps no state.
 //!
 //! What gets around it is listed in the guide, and Shanghai's probe (`shanghai/mwprobe`) tries each avenue it knows.

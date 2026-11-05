@@ -11,6 +11,12 @@
 #[cfg(feature = "lazy")]
 extern crate alloc;
 
+/// Whether this crate was built with its `middleware` feature.
+///
+/// The loader and `mmap`/`mprotect` ask the exec policy only then. A kernel that offers middleware asserts it, so a miswired
+/// feature is a build error and not an exec policy that is silently never asked.
+pub const MIDDLEWARE: bool = cfg!(feature = "middleware");
+
 pub mod cmdline;
 #[cfg(feature = "lazy")]
 pub mod cow;

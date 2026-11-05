@@ -1,6 +1,6 @@
 //! Running one call through the table, and the process-wide registration the kernels' dispatchers use.
 
-use crate::calls::{may_refuse_before, observe_only, Verdict, ENOSYS_RET};
+use crate::calls::{may_refuse_before, observe_only, Calls, Verdict, ENOSYS_RET};
 use crate::ctx::KernelCtx;
 use crate::exec::{ExecKind, ExecVerdict};
 use crate::table::Middleware;
@@ -8,7 +8,7 @@ use crate::calls::Machine;
 use akuma_params::Params;
 use akuma_primitives::OnceCopy;
 
-impl Middleware {
+impl<P: Calls, H: Calls> Middleware<P, H> {
     /// The whole `kernel` side of one call: pre, the call (`inner`),
     /// and the handler where it answered `-ENOSYS`. Call with the kernel lock held.
     pub fn run_kernel(&self, nr: u64, args: [u64; 6], tid: u64, inner: impl FnOnce() -> u64) -> u64 {
@@ -21,9 +21,10 @@ impl Middleware {
 
         let mut ret = None;
         if wants
-            && let Some(h) = self.find(self.hooks.pre, nr)
+            && let Some(h) = self.hooks.pre
+            && let Some(which) = P::from_call(call, nr)
         {
-            match h(&ctx) {
+            match h(&ctx, which) {
                 Verdict::Pass => {}
                 Verdict::PassAndForget => self.kp.clear(nr),
                 Verdict::Return(v) if refusable => ret = Some(v),
@@ -37,9 +38,10 @@ impl Middleware {
             let r = inner();
             if r == ENOSYS_RET
                 && !watch
-                && let Some(h) = self.find(self.hooks.handler, nr)
+                && let Some(h) = self.hooks.handler
+                && let Some(which) = H::from_call(call, nr)
             {
-                h(&ctx).unwrap_or(r)
+                h(&ctx, which).unwrap_or(r)
             } else {
                 r
             }
@@ -61,7 +63,7 @@ pub trait Dispatch: Sync {
     fn init_with(&self, params: &Params<'static>);
 }
 
-impl Dispatch for Middleware {
+impl<P: Calls, H: Calls> Dispatch for Middleware<P, H> {
     fn arm_with(&self, machine: Machine) {
         self.arm(machine);
     }

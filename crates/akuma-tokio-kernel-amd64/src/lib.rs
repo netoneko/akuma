@@ -37,6 +37,12 @@
 
 extern crate alloc;
 
+#[cfg(feature = "middleware")]
+const _: () = assert!(
+    akuma_tokio_kernel_core::MIDDLEWARE,
+    "the `middleware` feature needs akuma-tokio-kernel-core/middleware: the loader would never ask the exec policy"
+);
+
 mod child;
 mod console;
 mod exec_twin;

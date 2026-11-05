@@ -139,6 +139,97 @@ and aarch64; the design and what booting it found are in
 in the guide:
 
 ```rust
+use akuma_tokio_kernel::middleware::{Hooks, Middleware, Verdict, calls};
+
+// Each tier is a closed enum of the calls it is about, and its hook is an exhaustive `match` over it. A bare variant is a
+// Linux call; `Name = 1000` is a call of your own (1000 and up is above every number Linux assigns).
+calls! { enum Guard { Openat } }
+calls! { enum Serve { Hello = 1000 } }
+
+static MW: Middleware<Guard, Serve> = Middleware::new(Hooks {
+    // `handler` runs only where the kernel would have answered -ENOSYS, so it cannot break a call the kernel already serves.
+    handler: Some(|_ctx, call| match call {
+        Serve::Hello => Some(42),
+    }),
+    // Look at or refuse a call (the context is read-only: a hook cannot change what runs). Runs inside the kernel lock; the
+    // caller's memory is reachable.
+    pre: Some(|ctx, call| match call {
+        Guard::Openat => {
+            let mut buf = [0u8; 128];
+            if let Ok(path) = ctx.user_str(ctx.args[1], &mut buf) {
+                akuma_primitives::safe_print!(160, "[mw] pid {} openat {}\n", ctx.pid, path);
+            }
+            Verdict::Pass
+        }
+    }),
+    ..Hooks::new()
+});
+
+fn main(kernel: akuma_tokio_kernel::Kernel) -> ! {
+    kernel
+        .name("Shanghai")
+        .banner(include_str!("banner.txt"))
+        .console()
+        .disk()
+        .net()
+        .smp()
+        .run_init()
+}
+```
+
+Then add the directory to `members` in the root `Cargo.toml` (`members = [".", "amd64", "taoxichuan", "shanghai",
+"crates/*"]`). Do **not** add it to `default-members`: a kernel bin builds only per target
+(`x86_64-unknown-none` and `aarch64-unknown-none`), which the default (host) build must never reach.
+
+## What you get
+
+| builder | feature (default on) | what it wires |
+|---|---|---|
+| `entry!(main)` | — | the boot entry symbols (amd64: `kmain`/`kmain_mb2` for PVH; aarch64: `rust_start` for the Image protocol, plus the secondary trampoline), the heap, the panic handler; `main` gets a `Kernel` named after your package |
+| `.name("Shanghai")` | — | the name on the console and in the banner (the package name stays `uname -n`) |
+| `.banner(include_str!("banner.txt"))` | — | art printed before init starts |
+| `.console()` | `console` | the serial console (COM1 on amd64, the PL011 on aarch64): boot lines, kernel messages, and the stdout/stderr of init and of every process with no ssh session |
+| `.disk()` | `disk` | the root filesystem: ext2 on the first virtio-blk device, mounted at `/` |
+| `.root(make)` | — | your own root instead: `make: fn() -> Arc<dyn akuma_vfs::Filesystem>`, called once the heap is up (amd64 only today) |
+| `.net()` | `net` | the first virtio-net device, smoltcp, and a DHCP lease (waits up to 10 s). Without it, sockets work on loopback only |
+| `.smp()` | `smp` | the application processors `smp=N` on the command line asks for, all under one big kernel lock |
+| `.middleware(&MW)` | `middleware` (off) | the kernel's one table of syscall hooks and exec policy ([below](#syscall-middleware-optional)); a second call panics |
+| `.run_init()` | — | boot, then load `init=` from the root and run it as pid 1; never returns |
+
+Without a feature its method does not exist, so a kernel that does not want a part leaves out the call, and can
+also leave out the code: `default-features = false, features = ["disk", "no-tests"]` builds a kernel with no
+console, no NIC and one core. The root filesystem is the one part a kernel cannot run without (`.disk()` or
+`.root(..)`). Other features: `shell` (the calls busybox and bash make that no tokio program does; turn it on if
+your image runs a shell beyond `sh -c`), `trace-err` (print every failing syscall on the console), and
+`platform-firecracker` (aarch64 under Firecracker, whose memory map differs from QEMU virt's; the `build.rs`
+above moves the link base for it — amd64 boots Firecracker through PVH and needs nothing), `refuse-dynamic-elf` (a build-time ban on
+dynamically linked images, `EPERM`, decided inside the elf crate: no middleware, no hook; off by default), and
+`middleware` ([below](#syscall-middleware-optional) and the [middleware guide](../akuma-middleware/docs/middleware.md); off by default, and a kernel that leaves it off compiles none of it).
+
+Everything else is fixed and needs no code: the memory manager (`mmap`, `brk`, `mprotect`, copy-on-write
+`fork`), processes and threads (`clone`, `execve`, `wait4`), signals, pipes, epoll, futexes, the clock, the
+RNG, and the Linux syscall surface from [`akuma-runtime-tokio`](../akuma-runtime-tokio) (its README has the
+picture). The machine half is picked by the build target: [`akuma-tokio-kernel-amd64`](../akuma-tokio-kernel-amd64)
+or [`akuma-tokio-kernel-aarch64`](../akuma-tokio-kernel-aarch64), both driving the arch-neutral decisions
+they share in [`akuma-tokio-kernel-core`](../akuma-tokio-kernel-core); how it works inside is documented in
+[`taoxichuan/docs/`](../../taoxichuan/docs), Taoxichuan being the first kernel built this way — one `main.rs`,
+built twice.
+
+## Syscall middleware (optional)
+
+With the `middleware` feature (off by default, for every kernel) a kernel registers **one** table of hooks around
+syscall dispatch: `kernel.middleware(&MW)`.
+
+> **Start with the guide: [`akuma-middleware/docs/middleware.md`](../akuma-middleware/docs/middleware.md).** It has two
+> worked examples, both booted by Shanghai's gate (**add a syscall of your own**, and **refuse an exec by its
+> environment**), then the tiers, what a hook gets, the rules and the reason for each, what it costs, and how to test a table.
+
+The code is `akuma_middleware`, re-exported as `akuma_tokio_kernel::middleware`, and it is the same on amd64
+and aarch64; the design and what booting it found are in
+[`docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md`](../../docs/archive/TAOXICHUAN_SYSCALL_MIDDLEWARE.md). The short version, with the rest
+in the guide:
+
+```rust
 use akuma_tokio_kernel::middleware::{CUSTOM_BASE, Hooks, Middleware, On, Route, Syscall, Verdict};
 
 static MW: Middleware<u64> = Middleware::new(0, Hooks {

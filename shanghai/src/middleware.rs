@@ -15,7 +15,7 @@
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use akuma_primitives::OnceCopy;
-use akuma_tokio_kernel::middleware::{CUSTOM_BASE, Hooks, Middleware, On, ParamSource, Params, Route, Syscall, Verdict};
+use akuma_tokio_kernel::middleware::{Hooks, KernelCtx, Middleware, ParamSource, Params, Verdict, calls};
 
 const EACCES: i32 = 13;
 const EFAULT_RET: u64 = (-14i64) as u64;
@@ -51,7 +51,7 @@ fn init(params: &Params<'static>) {
 
 /// `openat(dirfd, path, ..)`: `path` is argument 1.
 
-fn open_guard(ctx: &akuma_tokio_kernel::middleware::KernelCtx) -> Verdict {
+fn open_guard(ctx: &KernelCtx) -> Verdict {
     let mut buf = [0u8; 64];
     let Ok(path) = ctx.user_str(ctx.args[1], &mut buf) else {
         return Verdict::Pass; // not ours to judge: the kernel will say what is wrong with it
@@ -98,25 +98,49 @@ const SIDECAR: Option<&str> = Some(".sig");
 #[cfg(not(feature = "signed-exec"))]
 const SIDECAR: Option<&str> = None;
 
-/// The table the kernel registers.
-pub static MW: Middleware = Middleware::new(Hooks {
-    handler: &[
-        Route::new(&[On::Nr(CUSTOM_BASE)], |_| Some(42)),
-        Route::new(&[On::Nr(CUSTOM_BASE + 1)], |ctx| {
-            Some(match ctx.user_write_u64(ctx.args[0], u64::from(ctx.pid)) {
-                Ok(()) => 0,
-                Err(_) => EFAULT_RET,
-            })
-        }),
-        Route::new(&[On::Nr(CUSTOM_BASE + 6)], |_| Some(PARAMS_SEEN.load(Relaxed))),
-    ],
-    pre: &[
-        Route::new(&[On::Call(Syscall::Openat)], open_guard),
-        // The "no dynamic loading" demo (the `akuma-mw-no-dynamic-loading` crate), only with `--features no-dynamic-loading`: an env guard on execve here, and
-        // the exec policy (`EXEC` below): one `match` over every way code arrives.
+calls! {
+    /// The calls `pre` is asked about.
+    pub enum Guard {
+        Openat,
+        // The "no dynamic loading" demo (the `akuma-mw-no-dynamic-loading` crate), only with `--features no-dynamic-loading`: an env guard on
+        // execve here, and the exec policy (`EXEC` above): one `match` over every way code arrives.
         #[cfg(feature = "no-dynamic-loading")]
-        Route::new(&[On::Call(Syscall::Execve)], akuma_mw_no_dynamic_loading::exec_guard),
-    ],
+        Execve,
+    }
+}
+
+calls! {
+    /// The calls of our own the `handler` serves: numbers above every Linux one.
+    pub enum Serve {
+        Hello = 1000,
+        Whoami = 1001,
+        ParamsSeen = 1006,
+    }
+}
+
+fn guard(ctx: &KernelCtx, call: Guard) -> Verdict {
+    match call {
+        Guard::Openat => open_guard(ctx),
+        #[cfg(feature = "no-dynamic-loading")]
+        Guard::Execve => akuma_mw_no_dynamic_loading::exec_guard(ctx),
+    }
+}
+
+fn serve(ctx: &KernelCtx, call: Serve) -> Option<u64> {
+    Some(match call {
+        Serve::Hello => 42,
+        Serve::Whoami => match ctx.user_write_u64(ctx.args[0], u64::from(ctx.pid)) {
+            Ok(()) => 0,
+            Err(_) => EFAULT_RET,
+        },
+        Serve::ParamsSeen => PARAMS_SEEN.load(Relaxed),
+    })
+}
+
+/// The table the kernel registers.
+pub static MW: Middleware<Guard, Serve> = Middleware::new(Hooks {
+    pre: Some(guard),
+    handler: Some(serve),
     exec: EXEC,
     init: Some(init),
     exec_sidecar: SIDECAR,
