@@ -1,6 +1,7 @@
 //! Syscall middleware: one optional table of hooks around the kernel's syscall dispatch.
 //!
-//! B22, `proposals/B22_SYSCALL_MIDDLEWARE.md`. Off unless the `middleware` feature is on; a kernel that
+//! The guide is `docs/middleware.md` in this crate; the design record is `docs/archive/TAOXICHUAN_B22_SYSCALL_MIDDLEWARE.md`.
+//! Off unless the `middleware` feature is on; a kernel that
 //! does not ask for it compiles none of this and pays nothing.
 //!
 //! # The shape
@@ -696,6 +697,21 @@ mod tests {
             ..Hooks::new()
         });
         MW.arm(machine());
+    }
+
+    /// `docs/middleware.md` § "Your first syscall": the table as written there, with the stateless `()`.
+    #[test]
+    fn the_guides_first_syscall_compiles_and_answers() {
+        static MW: Middleware<()> = Middleware::new((), Hooks {
+            fallback: &[Route::new(&[On::Nr(CUSTOM_BASE)], |_ctx| Some(42))],
+            ..Hooks::new()
+        });
+        MW.arm(machine());
+        let mut a = [0; 6];
+        assert_eq!(MW.run_kernel(CUSTOM_BASE, &mut a, 1, |_| ENOSYS_RET), 42);
+        // And as `Kernel::middleware` takes it: behind the object-safe face.
+        let face: &'static dyn Dispatch = &MW;
+        assert_eq!(face.own_latch(39), Latch::default());
     }
 
     #[test]
