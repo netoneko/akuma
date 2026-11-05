@@ -56,7 +56,8 @@ wifi.powersave = 2
 ```
 
 plus `iw dev wlp2s0 set power_save off` for the live connection.
-Zero disconnects in the first hour after (counter checked hourly below).
+Zero disconnects in the first ~15 minutes after (the earlier cadence was one
+drop every 10–18 min; counter re-checked before the akuma fix branch).
 Reversible: delete the conf.d file.
 
 ## Findings — akuma
