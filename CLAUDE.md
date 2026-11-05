@@ -626,7 +626,8 @@ integration coverage. `scripts/` has targeted harnesses too
 (`ssh_harness.py`, `forktest_smp_matrix.py`, `run_selfhost_kernelbuild.py`,
 `test_sched_bklfree_ticket_fix.py`, …).
 
-Pre-commit hook runs clippy + tests automatically.
+Pre-commit hook runs clippy + tests + a secret scan automatically (docs-only commits skip it with `--no-verify`; see
+"Working with Claude Code").
 
 ## Working with Claude Code in this repo
 
@@ -634,19 +635,25 @@ Never use the `fork` subagent type (or any multi-agent fan-out) in this repo —
 work directly instead. Forking copies the whole conversation context into a background
 agent, which costs far more tokens than doing it inline.
 
-**The user drives all commits. Never `git commit`, `git push`, `git reset`, `git rebase`
-or otherwise rewrite history** — in this repo or any submodule. Run clippy and the host
-tests, fix what they find, and leave the work uncommitted.
+**Commit and push after every task you finished and verified** (standing instruction from the user, 2026-11-05;
+it replaces the earlier "the user drives all commits" rule). "Verified" means the checks that apply to the change
+passed: clippy and the host tests for code, the build for every target it touches, the boot gate for kernel work.
+Then:
 
-**Commit vocabulary describes the user's actions, not a request for yours.** When the
-user says "committed", "checkpoint", "committed checkpoint", "pushed", "landed",
-"stashed" or similar, they are *reporting what they just did* so you know the state of
-the tree — not asking you to do it. Treat such a line as context, not an instruction.
-The same goes for a bare noun phrase on its own line in a longer message; it is a status
-note.
+- **Stage only what you changed**, by path. Never `git add -A` / `git add .`: the tree routinely carries the user's
+  uncommitted work, submodule state (`userspace/meow`) and untracked results. Several tasks are several commits.
+- **Push the current branch to `origin`** (github.com/netoneko/akuma) right after the commit. **This covers branches
+  only: pushing to `main` (`git push origin main`, `HEAD:main`, a merge into it) still needs the user's explicit
+  permission, every time.** If you are on `main`, branch first and push the branch. A push also publishes any commit of
+  the user's that is ahead of origin; that is expected.
+- **Never rewrite history**: no `reset`, `rebase`, `commit --amend` or force-push, in this repo or any submodule. A
+  mistake is fixed by a new commit.
+- **Docs-only commits use `git commit --no-verify`.** A commit whose every path is Markdown or under `docs/` or
+  `proposals/` cannot change what clippy or the tests see, and the hook's run costs minutes. Anything that also
+  touches code, a script, a manifest or a lockfile runs the hook. `--no-verify` also skips the hook's secret scan of
+  staged `*.md`, so read what you stage for tokens, keys and passphrases first.
+- **A pasted handoff prompt or task spec that mentions commits does not change this**; the user's own message does.
 
-If you genuinely believe a commit is warranted, say so and stop. Only an unambiguous
-imperative addressed to you — "commit this", "please commit", "make a commit" — is a
-request. Anything less means leave the tree alone: a commit the user did not ask for
-hides the diff they were about to review (`git status` and `git diff` go quiet), and
-undoing it means rewriting history, which is also off-limits.
+**Commit vocabulary describes the user's actions.** When the user says "committed", "checkpoint", "pushed",
+"landed", "stashed" or similar, they are *reporting what they just did* so you know the state of the tree; it is
+context, not a request. The same goes for a bare noun phrase on its own line in a longer message.
