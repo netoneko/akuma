@@ -1880,9 +1880,6 @@ fn boot(k: &Kernel) -> ! {
     if let Some(n) = cmdline_token(hvm_start_info, "mmdbg=", &mut [0u8; 8]).and_then(|v| v.parse::<u32>().ok()) {
         MMDBG_V.store(n, core::sync::atomic::Ordering::Relaxed);
     }
-    if cmdline_token(hvm_start_info, "wx=", &mut [0u8; 4]) == Some("0") {
-        cow::wx_off();
-    }
     if let Some(e) = cmdline_token(hvm_start_info, "epoch=", &mut [0u8; 32]) {
         match e.parse::<u64>() {
             Ok(secs) => {

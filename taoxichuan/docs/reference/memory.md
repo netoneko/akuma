@@ -50,14 +50,14 @@ Canonical mermaid source: [`../diagrams/memory-map.md`](../diagrams/memory-map.m
   the file by `msync`, `munmap`, exec and exit. `PROT_READ` alone maps read-only and `PROT_NONE` maps without the user bit, so a guard page faults
   ([`TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md`](../../../docs/archive/TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES.md)). `W+X` is refused at `mmap` too: the W^X decision is
   [`crates/akuma-syscalls-mem`](../../../crates/akuma-syscalls-mem) `wx::check_prot`,
-  called at the top of both the `mmap` and `mprotect` arms (`wx=0` turns it off).
+  called at the top of both the `mmap` and `mprotect` arms. There is no switch to turn it off.
   The slab is 16 GiB of *reserved address space* (a page costs memory when mapped, not when reserved); at 1 GiB one `rustc` ran out of it — it maps a 311 MB `librustc_driver` and a ~17 MB stack per codegen thread — and musl reported the failed stack `mmap` as `EAGAIN` ("failed to spawn work thread"). Memory is the next wall: the fill is still eager (see `gaps.md`).
   `MAP_FIXED` is honoured only inside the mmap slab; the bump cursor never
   rewinds past it. `mremap` grows by moving to a fresh region (MAYMOVE;
   `MREMAP_FIXED` refused). `munmap` returns address space (hole table); `mprotect`
   re-maps the PTEs (`PROT_NONE` keeps the frame and clears the user bit; a later `RW` gives the contents back) under the W^X rule of
   `docs/archive/TAOXICHUAN_WX_POLICY.md`: `W+X` is refused and `PROT_EXEC` is
-  refused on a page written since it was mapped (`EACCES`; `wx=0` turns it off).
+  refused on a page written since it was mapped (`EACCES`; never off).
 
 ## The user-pointer rule
 

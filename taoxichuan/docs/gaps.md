@@ -21,7 +21,7 @@ what shows it. Rewritten 2026-11-02 against the tree after the cleanup plan's B1
 | exclusion | why | what lifts it |
 |---|---|---|
 | One big kernel lock | `smp=N` runs N cores under one lock ([`reference/scheduling.md`](reference/scheduling.md) § SMP); only ring 3 runs in parallel. The rig's default is `smp=1`: the in-guest `-j4` build measured 1.8x *slower* on 4 CPUs on 2026-10-31 (`docs/archive/TAOXICHUAN_SMP.md` § Measurements) | finer-grained locking |
-| W^X is enforced (stricter than Linux) | `W+X` refused; `PROT_EXEC` refused on any page written since mapping; `wx=0` restores the old widening. No JIT can run | `archive/TAOXICHUAN_WX_POLICY.md` |
+| W^X is enforced (stricter than Linux) | `W+X` refused; `PROT_EXEC` refused on any page written since mapping; no switch turns it off (`wx=0` removed 2026-11-05). No JIT can run | `archive/TAOXICHUAN_WX_POLICY.md` |
 | No containers | one box, the host: `akuma-isolation`'s `containers` feature is off ([`docs/reference/subsystems/containers.md`](../../docs/reference/subsystems/containers.md)) | a box syscall |
 | No Akuma-native syscalls | glue's `akuma-native` feature is off: `SPAWN`, `WAITPID`, the terminal calls and the rest answer `ENOSYS`, so an image needs the `linux-abi` sshd | — |
 | No pty, no users | everything runs as root on the serial console | a stage that needs them |

@@ -75,9 +75,7 @@ pub fn mprotect_arm<M: Mm>(addr: u64, len: u64, prot: u64) -> u64 {
     let (write, exec) = (prot & u64::from(PROT_WRITE) != 0, prot & u64::from(PROT_EXEC) != 0);
     let root = M::task_root();
     // W^X: decided for the whole range before any page changes, so a refusal leaves it as it was.
-    if cow::wx_on()
-        && let Some(no) = akuma_syscalls_mem::wx::check_range(prot, |i| cow::page_written::<M>(root, addr + i * 4096), pages).errno()
-    {
+    if let Some(no) = akuma_syscalls_mem::wx::check_range(prot, |i| cow::page_written::<M>(root, addr + i * 4096), pages).errno() {
         return e(no);
     }
     for i in 0..pages {
@@ -430,9 +428,7 @@ pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<
     if len == 0 || off & 0xFFF != 0 {
         return e(EINVAL);
     }
-    if cow::wx_on()
-        && let Some(no) = akuma_syscalls_mem::wx::check_prot(prot).errno()
-    {
+    if let Some(no) = akuma_syscalls_mem::wx::check_prot(prot).errno() {
         return e(no);
     }
     let anon = flags & u64::from(MAP_ANONYMOUS) != 0;
@@ -471,10 +467,9 @@ pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<
     };
     let (write, exec) = if prot & u64::from(PROT_EXEC) == 0 {
         (prot & u64::from(PROT_WRITE) != 0, false)
-    } else if cow::wx_on() {
-        (false, true)
     } else {
-        (true, true)
+        // W^X refused W+X above, so an executable mapping is never writable.
+        (false, true)
     };
     // `PROT_NONE`: a record nothing fills (or, eagerly, a page without the user bit).
     #[allow(clippy::verbose_bit_mask)] // PROT_NONE is spelled as the bits it lacks

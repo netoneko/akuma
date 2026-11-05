@@ -87,7 +87,6 @@ stage greps it). Tokens this kernel reads:
 | `epoch=` | wall-clock anchor: unix seconds → `akuma_primitives::clock::set_utc_time_us`, anchored at the uptime sampled at banner time. Written new (guest-cmdline policy): the metal's anchors are RTC/NTP mechanisms this guest cannot reach |
 | `initenv=` | init's environment, comma-separated |
 | `smp=N` | application processors to start, with `.smp()`; absent or 1 is one core |
-| `wx=0` | turn off the W^X refusal in `mmap`/`mprotect` |
 | `mmdbg=N` | the mmap-slab bisect mask (default 7) |
 
 ## Background

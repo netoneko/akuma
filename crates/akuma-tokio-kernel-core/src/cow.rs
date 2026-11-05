@@ -10,7 +10,7 @@
 //!
 //! Every caller holds the kernel lock (a trap or a syscall): nothing races the walk.
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use akuma_cow::{CowAction, KernelWrite};
 
@@ -18,21 +18,9 @@ use crate::mm::Mm;
 use crate::mmu::FreshPage;
 
 /// W^X (`akuma_syscalls_mem::wx`): no page is writable and executable, and a page
-/// written since it was mapped cannot be made executable. On by default; `wx=0` on
-/// the kernel command line turns it off for a guest that needs a JIT. Stricter
-/// than Linux on purpose.
-static WX_ENFORCE: AtomicBool = AtomicBool::new(true);
-
-/// Is W^X enforced?
-#[must_use]
-pub fn wx_on() -> bool {
-    WX_ENFORCE.load(Relaxed)
-}
-
-/// Turn W^X off (`wx=0`).
-pub fn wx_off() {
-    WX_ENFORCE.store(false, Relaxed);
-}
+/// written since it was mapped cannot be made executable. Always on - there is no
+/// switch (the `wx=0` command-line hatch was removed 2026-11-05: production
+/// kernels do not run a JIT). Stricter than Linux on purpose.
 
 static COW_SHARED: AtomicUsize = AtomicUsize::new(0);
 static COW_COPY: AtomicUsize = AtomicUsize::new(0);

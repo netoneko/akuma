@@ -16,8 +16,8 @@
 //!
 //! Both refusals answer `EACCES`, which is what OpenBSD's W^X and PaX's MPROTECT answer for the same
 //! requests; Linux itself allows both, so this is deliberately *stricter than Linux*. Programs that need a
-//! JIT (V8, a JVM, LuaJIT, `libffi` closures on some targets) cannot run under it; the kernel keeps a switch
-//! (`wx=0` on the command line) rather than a per-program exemption.
+//! JIT (V8, a JVM, LuaJIT, `libffi` closures on some targets) cannot run under it, and there is no switch or
+//! per-program exemption: the `wx=0` command-line hatch was removed 2026-11-05 (production kernels).
 
 use akuma_syscalls_linux::flags::prot;
 
