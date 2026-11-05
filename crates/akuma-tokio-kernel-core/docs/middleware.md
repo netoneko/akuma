@@ -276,6 +276,28 @@ loader sees what a syscall hook cannot; that is why the exec policy exists.
 "Closed by absence" is only as good as the absence. If `memfd_create`, `execveat` or `ptrace` is ever implemented, those probe lines
 fail (the `memfd_create` line already has the branch that tests a mapping of the memfd), which is the point of pinning them.
 
+**A build-time alternative that needs no middleware at all.** If all you want is "no dynamically linked programs", the elf crate can say
+no by itself. `akuma-elf-exec` has a `refuse-dynamic` cargo feature (off by default): with it, `program()` returns `ExecErr::Dynamic`
+for any image that names an interpreter, and `ExecErr::errno()` for that is `EPERM`. The loader turns the answer into the errno
+(`LoadError::Refused(1)`) before anything is torn down. There is no hook, no table, no dispatch arm and no runtime switch: a kernel
+built with it cannot load a dynamic image, and one built without it carries none of the code. In Shanghai it is `--features
+no-dynamic-elf`; the chain is `no-dynamic-elf` -> `akuma-tokio-kernel/refuse-dynamic-elf` -> the machine crates ->
+`akuma-tokio-kernel-core/refuse-dynamic-elf` -> `akuma-elf-exec/refuse-dynamic` (`cargo tree -e features -i akuma-elf-exec` shows
+it on or off). It is independent of `middleware` and of `no-dynamic-loading`.
+
+| | `no-dynamic-elf` (build-time, elf crate) | `no-dynamic-loading` (exec policy, middleware) |
+|---|---|---|
+| mechanism | `akuma-elf-exec::program()` refuses; compiled in or out | a `match` registered as `Hooks::exec`; needs `middleware` |
+| errno | `EPERM` | `EACCES` (the policy's choice) |
+| dynamic `execve`, both kinds; a `#!` script with a dynamic interpreter | refused | refused |
+| the loader run directly (`ld-musl <binary>`, no interpreter of its own) | **still loads the program** (pinned in the probe) | refused: its mapping is refused |
+| `mmap(file, PROT_EXEC)`, `mprotect(+X)`, code written to anonymous memory | not touched | refused |
+| runtime cost | none beyond the header scan | one hook call per exec / executable mapping |
+
+So the build-time feature closes the *image* avenue and nothing else, and the probe pins the rest as open (`B`, `D1`) so the scope
+cannot drift. Use it when images are the whole threat and you want a kernel that cannot be talked out of it; use the policy when the
+mapping avenues matter. They compose (the image check runs first, `EPERM`).
+
 **What this does not claim.** It bans dynamically linked programs and every route the probe found for turning a file or bytes into
 native code. It does not stop a static program from doing anything else, and it does not police interpreted code: a script run by a
 *static* interpreter (the script is data), or a static program's own bytecode, is not "loading a binary". `mprotect(+PROT_EXEC)` is

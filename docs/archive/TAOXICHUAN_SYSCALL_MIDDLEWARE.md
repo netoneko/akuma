@@ -121,6 +121,18 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   programs still run. **Result: control 7, `middleware` alone 19 (no `[nodl]` line), `no-dynamic-loading` 35 with 13 refusals logged,
   all passing, amd64 and aarch64.** Not claimed: interpreted code (a script run by a static interpreter is data), signatures
   (the `Image` event carries the bytes; nothing checks them), and JIT (`mprotect(+X)` is refused outright).
+- **A build-time alternative in the elf crate** (2026-11-05, the owner: "a build-level feature (off by default) that simply returns EPERM for
+  dynamic loading in the elf crate instead of having any dispatch arm"): `akuma-elf-exec`'s `refuse-dynamic` feature makes `program()`
+  return `ExecErr::Dynamic` (errno `EPERM`, `ExecErr::errno()`) for any image that names an interpreter (the static-PIE one-NUL
+  `PT_INTERP` is still static); `loader::load_task` turns it into `LoadError::Refused(1)` before anything is touched. No hook, no table,
+  no runtime switch. Plumbed `no-dynamic-elf` (Shanghai) -> `akuma-tokio-kernel/refuse-dynamic-elf` -> the machine crates ->
+  `akuma-tokio-kernel-core/refuse-dynamic-elf` -> `akuma-elf-exec/refuse-dynamic`, independent of `middleware`; `cargo tree -e features -i
+  akuma-elf-exec` shows it on with the feature and off without. Four kernels per machine in the gate now. **Result, both machines at
+  SMP=4: `no-dynamic-elf` 6 cases passing, no `[nodl]` line (no middleware in that build)**: dynamic `xz`, dynamic `busybox` and a `#!`
+  script with a dynamic interpreter are refused with `EPERM`; a static child runs. It covers **images only**, and the probe pins that:
+  the loader run directly (`ld-musl /bin/busybox`) still loads and runs BusyBox, and `mmap(file, PROT_EXEC)` is still allowed, because
+  this build has no mapping policy. Closing those is the exec policy's job (`no-dynamic-loading`). Host tests in `akuma-elf-exec` for
+  both configurations (14 each; the feature adds the refusal and the static / static-PIE controls).
 - **The first test subject was wrong:** `bzip2` ran under the guards with no refusal, which looked like a failed ban. Alpine builds
   libbz2 into the binary (`strings` shows only `libc.musl` as a dependency), so it never asked for a second library. `xz` replaced
   it, and `mw_fetch_dyn.sh` now checks the premise (`xz` names `liblzma`, `busybox` needs nothing beyond libc).

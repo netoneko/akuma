@@ -111,7 +111,8 @@ console, no NIC and one core. The root filesystem is the one part a kernel canno
 `.root(..)`). Other features: `shell` (the calls busybox and bash make that no tokio program does; turn it on if
 your image runs a shell beyond `sh -c`), `trace-err` (print every failing syscall on the console), and
 `platform-firecracker` (aarch64 under Firecracker, whose memory map differs from QEMU virt's; the `build.rs`
-above moves the link base for it — amd64 boots Firecracker through PVH and needs nothing), and
+above moves the link base for it — amd64 boots Firecracker through PVH and needs nothing), `refuse-dynamic-elf` (a build-time ban on
+dynamically linked images, `EPERM`, decided inside the elf crate: no middleware, no hook; off by default), and
 `middleware` ([below](#syscall-middleware-optional) and the [middleware guide](../akuma-tokio-kernel-core/docs/middleware.md); off by default, and a kernel that leaves it off compiles none of it).
 
 Everything else is fixed and needs no code: the memory manager (`mmap`, `brk`, `mprotect`, copy-on-write
@@ -170,8 +171,9 @@ From the guest, `syscall(1000)` returns 42. Shanghai carries a working table beh
 middleware kernel `MWPROBE RESULT PASS`. The "no dynamic loading" demo is a further Shanghai feature, `--features no-dynamic-loading`
 (off by default; it implies `middleware`): one **exec policy** that refuses dynamically linked programs and every route the probe found
 for turning a file or bytes into native code. The gate boots three kernels per machine: stock, `middleware` alone (the policy must be
-absent), and with the feature (it must be on, and the probe tries each avenue). It needs no sshd or key, only `e2fsprogs` and, the first
-time, network for Alpine's dynamic test binaries. The rules, each with its reason in the module docs:
+absent), and with the feature (it must be on, and the probe tries each avenue). A fourth kernel per machine has only `--features
+no-dynamic-elf`, the build-time alternative (`refuse-dynamic-elf`, no middleware at all): dynamic images are refused with `EPERM`, and the
+probe pins what it does not cover. It needs no sshd or key, only `e2fsprogs` and, the first time, network for Alpine's dynamic test binaries. The rules, each with its reason in the module docs:
 
 - **One table, flat, no chaining.** No `next`, no priorities. Two entries for one call in one tier are refused when
   the table is armed (a boot panic naming the number). A second `.middleware(..)` panics. To layer, write a
