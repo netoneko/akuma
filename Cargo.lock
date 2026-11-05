@@ -1001,6 +1001,7 @@ dependencies = [
  "akuma-pmm",
  "akuma-primitives",
  "akuma-stack",
+ "akuma-trap-aarch64",
  "spinning_top",
 ]
 

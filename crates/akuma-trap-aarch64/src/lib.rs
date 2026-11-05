@@ -213,6 +213,103 @@ impl FrameHandle {
     }
 }
 
+/// The AArch64 **IRQ trap frame**, single-sourced.
+///
+/// The 832-byte frame the IRQ/SGI vector asm pushes (and which
+/// `setup_fake_irq_frame` synthesizes for a thread's first resume): the offsets
+/// written once here, and one reader the handler crates share.
+///
+/// # Why a second frame type, next to [`FrameHandle`]
+///
+/// This is *not* the EL0 [`UserTrapFrame`] layout: there byte 240 is `x30` and
+/// byte 248 is `sp_el0`; here they are `ELR_EL1` and `SPSR_EL1`, and the frame is
+/// 832 bytes (a NEON/FP block sits behind the GPRs), not 288.
+///
+/// [`FrameHandle`]'s contract — the frame *this handler* just pushed, live and
+/// exclusively its — does not fit a saved frame: it is read by *other* threads
+/// (the scheduler on a peer core, a hang dump), exactly the aliasing
+/// `FrameHandle` forbids. So: constants and a tiny `Copy` value type, with the
+/// one `unsafe` at [`IrqFrame::at`], where the frame's liveness is promised. The
+/// writer (`setup_fake_irq_frame`) goes through the same [`IrqFrame::write_elr`]
+/// / [`IrqFrame::write_spsr`], so the synthetic frame and every reader cannot
+/// drift apart.
+pub mod irq_frame {
+    /// Byte offset of the saved `ELR_EL1` in the frame: word 30 of the vector's
+    /// store order (x30 first, x0/x1 last, then ELR, SPSR).
+    pub const ELR: usize = 240;
+    /// Byte offset of the saved `SPSR_EL1` in the frame: word 31.
+    pub const SPSR: usize = 248;
+    /// Size of the whole frame the SGI/IRQ vector pushes.
+    ///
+    /// 304 bytes of GPR block (x30..x0, ELR, SPSR, SP_EL0, TPIDR_EL0, x10/x11)
+    /// plus the 528-byte NEON/FP block — the same constant `akuma-threading`'s
+    /// `setup_fake_irq_frame` sizes and zeroes its synthetic frame with.
+    pub const SIZE: usize = akuma_exec_core::thread::IRQ_FRAME_SIZE;
+
+    /// A saved or live IRQ trap frame at `sp`.
+    ///
+    /// Reads and writes are volatile single words — the same instruction the raw
+    /// `read_volatile((sp + 24x) as *const u64)` they replace was — so a frame a
+    /// peer core is concurrently building or restoring cannot tear one.
+    #[derive(Clone, Copy)]
+    pub struct IrqFrame {
+        sp: usize,
+    }
+
+    impl IrqFrame {
+        /// Name the IRQ frame at `sp`.
+        ///
+        /// # Safety
+        /// `sp` points at an IRQ frame of [`SIZE`] bytes on a kernel stack that
+        /// outlives this value: the live frame the vector asm just built, or the
+        /// `Context.sp` of a thread that is not running (its stack cannot be
+        /// freed or reused while it is not running).
+        #[must_use]
+        pub unsafe fn at(sp: u64) -> Self {
+            Self { sp: sp as usize }
+        }
+
+        /// The saved `ELR_EL1` — where the frame's `eret` resumes.
+        #[must_use]
+        pub fn elr(self) -> u64 {
+            // SAFETY: `at`'s contract places `SIZE` bytes of frame at `sp`; `ELR`
+            // is one aligned `u64` inside it.
+            unsafe { core::ptr::read_volatile((self.sp + ELR) as *const u64) }
+        }
+
+        /// The saved `SPSR_EL1`.
+        #[must_use]
+        pub fn spsr(self) -> u64 {
+            // SAFETY: as [`Self::elr`].
+            unsafe { core::ptr::read_volatile((self.sp + SPSR) as *const u64) }
+        }
+
+        /// Does the frame's `eret` return to EL0 (userspace)?
+        ///
+        /// `SPSR.M[3:0] == 0` (EL0t) — the read every BKL reconcile and
+        /// scheduler-displacement decision keys on.
+        #[must_use]
+        pub fn from_el0(self) -> bool {
+            self.spsr().trailing_zeros() >= 4
+        }
+
+        /// Overwrite the saved `ELR_EL1` — the writer half
+        /// (`setup_fake_irq_frame` plants the thread's entry point here), kept in
+        /// this module so the synthetic frame and the readers share one layout.
+        pub fn write_elr(self, v: u64) {
+            // SAFETY: as [`Self::elr`], mirrored to a write.
+            unsafe { core::ptr::write_volatile((self.sp + ELR) as *mut u64, v) }
+        }
+
+        /// Overwrite the saved `SPSR_EL1` — the writer half (`setup_fake_irq_frame`
+        /// plants the EL/IRQ-mask state the first `eret` enters with).
+        pub fn write_spsr(self, v: u64) {
+            // SAFETY: as [`Self::elr`], mirrored to a write.
+            unsafe { core::ptr::write_volatile((self.sp + SPSR) as *mut u64, v) }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +378,52 @@ mod tests {
     fn a_null_frame_is_refused() {
         // SAFETY: the null check is what is under test.
         let _ = unsafe { FrameHandle::new(core::ptr::null_mut()) };
+    }
+}
+
+#[cfg(test)]
+mod irq_frame_tests {
+    use super::irq_frame::{self, IrqFrame};
+    use super::UserTrapFrame;
+
+    #[test]
+    fn round_trips_through_a_synthetic_frame() {
+        // `setup_fake_irq_frame`'s shape: `SIZE` zeroed bytes, word 30 = ELR,
+        // word 31 = SPSR. `[u64; 104]` is exactly the frame, so the size the
+        // vector pushes and this test builds are pinned together.
+        let mut frame = [0u64; 104];
+        assert_eq!(core::mem::size_of_val(&frame), irq_frame::SIZE);
+        frame[30] = 0x0001_2345_6789;
+        frame[31] = 0x345; // EL1h, IRQs enabled — M[3:0] = 5, not EL0
+        // SAFETY: `frame` is a live `SIZE`-byte frame for this whole test body.
+        let f = unsafe { IrqFrame::at(frame.as_ptr() as u64) };
+        assert_eq!(f.elr(), 0x0001_2345_6789);
+        assert_eq!(f.spsr(), 0x345);
+        assert!(!f.from_el0());
+        // The writer half lands in exactly the words the readers read.
+        f.write_elr(0x4000_0000);
+        f.write_spsr(0x3C5); // EL1h, IRQs disabled
+        assert_eq!((frame[30], frame[31]), (0x4000_0000, 0x3C5));
+        assert_eq!((f.elr(), f.spsr()), (0x4000_0000, 0x3C5));
+        assert!(!f.from_el0());
+        // M[3:0] == 0 is the EL0t the BKL reconcile and scheduler decisions key on.
+        f.write_spsr(0);
+        assert!(f.from_el0());
+    }
+
+    #[test]
+    fn offsets_are_not_user_trap_frame_offsets() {
+        // The reason `IrqFrame` exists next to `FrameHandle`: 240/248 are IRQ-frame
+        // words 30/31, and in the EL0 `UserTrapFrame` layout those same offsets are
+        // `x30` and `sp_el0`. Reinterpreting an IRQ frame as a `UserTrapFrame` would
+        // read the link register as the resume point and SP_EL0 as the PSR — and the
+        // frame would not even be long enough (288 bytes vs 832). This pins the two
+        // layouts apart so a change to either cannot silently reuse the other's
+        // offsets.
+        assert_eq!(core::mem::offset_of!(UserTrapFrame, x30), irq_frame::ELR);
+        assert_eq!(core::mem::offset_of!(UserTrapFrame, sp_el0), irq_frame::SPSR);
+        assert_ne!(core::mem::offset_of!(UserTrapFrame, elr_el1), irq_frame::ELR);
+        assert_ne!(core::mem::offset_of!(UserTrapFrame, spsr_el1), irq_frame::SPSR);
+        assert_ne!(core::mem::size_of::<UserTrapFrame>(), irq_frame::SIZE);
     }
 }

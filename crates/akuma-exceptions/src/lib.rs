@@ -96,7 +96,7 @@ extern crate alloc;
 #[cfg(target_os = "none")]
 use core::arch::global_asm;
 
-use akuma_trap_aarch64::FrameHandle;
+use akuma_trap_aarch64::{FrameHandle, irq_frame::IrqFrame};
 
 // `safe_print!` resolves unqualified throughout this crate — the same move
 // `akuma-exec` and `akuma-fpcache` make, and what let the moved call sites
@@ -2915,34 +2915,25 @@ extern "C" fn rust_default_exception_handler() {
 /// 
 /// Takes current SP, returns new SP if context switch needed (or 0 if no switch).
 /// The assembly does the actual SP switch AFTER this returns.
-/// Byte offset of the saved `SPSR_EL1` within the 832-byte IRQ trap frame (the frame
-/// `sp` points at when the vector calls `rust_irq_handler_with_sp`). Derived from the
-/// save order in `irq_el0_handler`/`irq_handler`: x30(0), x28/29..x0/1 (240), then
-/// ELR(240)/SPSR(248). Synthetic frames written by `setup_fake_irq_frame` place SPSR
-/// at the same slot (`frame.add(31)` = byte 248). The BKL reads it to learn the EL the
-/// `eret` will target. If the frame layout ever changes, update this constant.
-#[cfg(kernel_smp_shared)]
-const IRQ_FRAME_SPSR_OFFSET: usize = 248;
-
 /// Tripwire for the SMP=4 mixed-EL corruption (BKL_RUSTC_SCALING_BASELINE.md §5.1):
-/// inspect the IRQ frame the asm epilogue is about to restore (ELR at +240, SPSR at
-/// +248 — see `IRQ_FRAME_SPSR_OFFSET`). An EL0-target frame whose ELR sits in kernel
-/// text would eret userspace into kernel text. Covers BOTH epilogue outcomes (switch
-/// and no-switch); complements `[SGI-S POISON]`, which only sees the switch branch.
+/// inspect the IRQ frame the asm epilogue is about to restore. An EL0-target frame
+/// whose ELR sits in kernel text would eret userspace into kernel text. Covers BOTH
+/// epilogue outcomes (switch and no-switch); complements `[SGI-S POISON]`, which only
+/// sees the switch branch. The frame layout (ELR at +240, SPSR at +248) is
+/// `akuma_trap_aarch64::irq_frame`'s, shared with `setup_fake_irq_frame`.
 #[inline]
-#[allow(clippy::verbose_bit_mask)]
 fn irq_eret_poison_check(final_sp: u64, switched: bool) {
     // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-    let elr = unsafe { core::ptr::read_volatile((final_sp as usize + 240) as *const u64) };
-    let spsr = unsafe { core::ptr::read_volatile((final_sp as usize + 248) as *const u64) };
+    let frame = IrqFrame::at(final_sp);
+    let elr = frame.elr();
     let kernel_text = akuma_exec::mmu::is_kernel_text(elr as usize);
     // EL0-target frames must not eret into kernel text; EL1-target frames must
     // eret INTO kernel text (an EL1 ELR like 0x8 is the boot-storm crash shape).
-    let poison = if (spsr & 0xF) == 0 { kernel_text } else { !kernel_text };
+    let poison = if frame.from_el0() { kernel_text } else { !kernel_text };
     if poison {
         crate::safe_print!(160,
             "[IRQ POISON] eret elr={:#x} spsr={:#x} switched={} tid={} core={}\n",
-            elr, spsr, u64::from(switched),
+            elr, frame.spsr(), u64::from(switched),
             akuma_exec::threading::current_thread_id(),
             akuma_exec::bkl::current_core_id());
     }
@@ -2965,14 +2956,10 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     // holding the BKL) must keep it — releasing would expose the interrupted excursion's
     // shared state to peers.
     #[cfg(kernel_smp_shared)]
-    #[allow(clippy::verbose_bit_mask)]
     let interrupted_el0 = {
-        // SAFETY: `current_sp` is the live interrupted IRQ trap frame; SPSR at fixed off.
-        let cur_spsr = unsafe {
-            core::ptr::read_volatile((current_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
-        };
-        // SPSR.M[3:0] == 0 ⇒ interrupted context was EL0t (userspace).
-        (cur_spsr & 0xf) == 0
+        // SAFETY: `current_sp` is the live interrupted IRQ trap frame the vector
+        // asm just built. SPSR.M[3:0] == 0 ⇒ interrupted context was EL0t (userspace).
+        IrqFrame::at(current_sp).from_el0()
     };
     // If this IRQ interrupted EL0, userspace was running on this core — count it (captures
     // pure compute loops that only get timer-preempted, not just syscalls).
@@ -3008,10 +2995,8 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
         let new_sp =
             akuma_exec::threading::sgi_scheduler_handler_with_sp(akuma_gic::SGI_SCHEDULER, current_sp);
         let final_sp = if new_sp != 0 { new_sp } else { current_sp };
-        // SAFETY: `final_sp` is a live IRQ trap frame; SPSR sits at a fixed offset.
-        let spsr = unsafe {
-            core::ptr::read_volatile((final_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
-        };
+        // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
+        let spsr = IrqFrame::at(final_sp).spsr();
         akuma_exec::bkl::reconcile_for_spsr_no_ticket(spsr);
         irq_eret_poison_check(final_sp, new_sp != 0);
         return new_sp;
@@ -3081,10 +3066,8 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
         // The asm erets into `new_sp`'s frame after a switch, else the interrupted
         // `current_sp` frame. Reconcile the BKL to that frame's target EL.
         let final_sp = if new_sp != 0 { new_sp } else { current_sp };
-        // SAFETY: `final_sp` is a live IRQ trap frame; SPSR sits at a fixed offset.
-        let spsr = unsafe {
-            core::ptr::read_volatile((final_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
-        };
+        // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
+        let spsr = IrqFrame::at(final_sp).spsr();
         akuma_exec::bkl::reconcile_for_spsr(spsr);
     }
     {

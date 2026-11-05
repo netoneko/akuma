@@ -20,6 +20,7 @@ akuma-pmm = { path = "../akuma-pmm" }
 akuma-bkl = { path = "../akuma-bkl" }
 akuma-mmap = { path = "../akuma-mmap" }
 akuma-stack = { path = "../akuma-stack" }
+akuma-trap-aarch64 = { path = "../akuma-trap-aarch64" }
 spinning_top = "0.3"
 
 [features]

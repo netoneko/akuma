@@ -123,7 +123,6 @@ mod test_support;
 pub use akuma_exec_core::thread as types;
 
 pub use types::*;
-
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 #[cfg(all(target_os = "none", sgi_sched))]
@@ -144,6 +143,8 @@ use akuma_bkl::bkl;
 use akuma_bkl::sync;
 use akuma_exec_core::process::UserContext;
 use akuma_mmap::PhysFrame;
+#[cfg(target_arch = "aarch64")]
+use akuma_trap_aarch64::irq_frame::IrqFrame;
 
 // ── platform + config + process hooks (were `crate::runtime` / `crate::process`) ──
 
@@ -367,25 +368,6 @@ const STACK_USAGE_PROBE: bool = true;
 fn stack_region(base: usize, size: usize) -> akuma_stack::StackRegion {
     // SAFETY: see above.
     unsafe { akuma_stack::StackRegion::new(base, size) }
-}
-
-/// Offsets inside the IRQ trap frame a thread is switched out from (`setup_fake_irq_frame`,
-/// `src/exceptions.rs`): `ELR_EL1` and `SPSR_EL1`. This is *not* the EL0 `UserTrapFrame` layout.
-#[cfg(target_arch = "aarch64")]
-const IRQ_FRAME_ELR: usize = 240;
-#[cfg(target_arch = "aarch64")]
-const IRQ_FRAME_SPSR: usize = 248;
-
-/// Read one word of an IRQ trap frame at `sp + off`.
-///
-/// `sp` must be the stack pointer a thread was switched out with (or the live IRQ frame the vector just
-/// built): it points at an 832-byte frame on that thread's kernel stack, which the thread cannot free while
-/// it is not running and which this reads volatile, once. Callers pass `Context.sp` (guarded `!= 0`) or
-/// the live `current_sp`/`new_sp`.
-#[cfg(target_arch = "aarch64")]
-fn irq_frame_word(sp: usize, off: usize) -> u64 {
-    // SAFETY: see above; `off` is one of the two consts, inside the 832-byte frame.
-    unsafe { core::ptr::read_volatile((sp + off) as *const u64) }
 }
 
 /// Snapshot the EL0 trap frame published for `tid` in `CURRENT_TRAP_FRAME`, if any.
@@ -4052,14 +4034,19 @@ pub fn setup_fake_irq_frame(
         // [sp+96]: x18, x19
         frame.add(13).write_volatile(x19);  // x19 - trampoline
         
-        // [sp+240]: ELR, SPSR
-        frame.add(30).write_volatile(entry_point);  // ELR - where to jump
+        // [sp+240]: ELR, SPSR — written through `irq_frame`'s writer so the
+        // synthetic frame and every reader of a saved frame share one layout.
         let spsr = if x21 != 0 {
             0x000003C5  // EL1h, IRQs DISABLED
         } else {
             0x00000345  // EL1h, IRQs ENABLED
         };
-        frame.add(31).write_volatile(spsr);
+        // SAFETY: `frame_base` is the `irq_frame::SIZE`-byte frame this function
+        // just zeroed at the top of the new thread's kernel stack; that thread is
+        // not running, so the stack (and frame) outlives this value.
+        let frame_view = akuma_trap_aarch64::irq_frame::IrqFrame::at(frame_base);
+        frame_view.write_elr(entry_point);  // ELR - where to jump
+        frame_view.write_spsr(spsr);
         
         // NEON block at [sp+288..815] and x10/x11 at [sp+816] are all zero from write_bytes
     }
@@ -5252,7 +5239,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     // in schedule_indices: an EL1-interrupted thread is a BKL holder under
     // smp-shared and must stay displaceable (the BKL release valve).
     // SAFETY: current_sp is the live IRQ trap frame the vector asm just built.
-    let interrupted_el0 = irq_frame_word(current_sp as usize, IRQ_FRAME_SPSR) & 0xF == 0;
+    let interrupted_el0 = IrqFrame::at(current_sp).from_el0();
     
     // Get scheduling decision. Use try_lock instead of a blocking lock(): this handler
     // runs from the timer-driven SGI in IRQ context (PSTATE.I masked). If the timer
@@ -5447,17 +5434,20 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             // whose ELR is a kernel address would eret userspace into kernel text —
             // catch it HERE, at the restore, with both thread ids.
             {
-                let elr = irq_frame_word(new_sp as usize, IRQ_FRAME_ELR);
-                let spsr = irq_frame_word(new_sp as usize, IRQ_FRAME_SPSR);
+                // SAFETY: `new_sp` is the IRQ frame we are about to restore — the
+                // live frame the vector built or the synthetic one the incoming
+                // thread was seeded with.
+                let frame = IrqFrame::at(new_sp);
+                let elr = frame.elr();
                 let kernel_text = mmu::is_kernel_text(elr as usize);
                 // EL0-target frames must not eret into kernel text (NOT merely
                 // ≥0x4000_0000 — user mmap VAs legitimately reach 0x1_xxxx_xxxx+);
                 // EL1-target frames must eret INTO kernel text (ELR=0x8 shape).
-                let poison = if (spsr & 0xF) == 0 { kernel_text } else { !kernel_text };
+                let poison = if frame.from_el0() { kernel_text } else { !kernel_text };
                 if poison {
                     safe_print!(128,
                         "[SGI-S POISON] eret elr={:#x} spsr={:#x} old_tid={} new_tid={} sp={:#x}\n",
-                        elr, spsr, old_idx, new_idx, new_sp);
+                        elr, frame.spsr(), old_idx, new_idx, new_sp);
                 }
             }
 
@@ -6954,7 +6944,10 @@ pub fn dump_thread_resume_points() {
             if ctx.sp == 0 {
                 0
             } else {
-                irq_frame_word(ctx.sp as usize, IRQ_FRAME_ELR)
+                // SAFETY: `ctx.sp` is a switched-out thread's saved IRQ frame on
+                // its own kernel stack (guarded `!= 0`); the thread cannot free
+                // that stack while it is not running.
+                IrqFrame::at(ctx.sp).elr()
             }
         };
         let stc = match st {
@@ -7031,7 +7024,10 @@ pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
         let live_elr = if ctx.sp == 0 {
             0
         } else {
-            irq_frame_word(ctx.sp as usize, IRQ_FRAME_ELR)
+            // SAFETY: `ctx.sp` is a switched-out thread's saved IRQ frame on its
+            // own kernel stack (guarded `!= 0`); the thread cannot free that
+            // stack while it is not running.
+            IrqFrame::at(ctx.sp).elr()
         };
         Some((ctx.x30, live_elr, ctx.sp))
     })
