@@ -93,7 +93,7 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   `LD_*` variable is refused with `EPERM` (the last needed the `execve` narrowing above). `mwprobe` checks each refusal and
   the neighbouring cases that must stay allowed (anonymous `PROT_EXEC` memory, a read-only file mapping,
   `mprotect(PROT_READ)`, an `execve` with a clean environment, which is allowed and whose new image prints the result).
-- **Children and real dynamic programs** (same day): the probe forks a child with a raw `clone` (no exec), execs a static child
+- **Children and real dynamic programs** (same day; the first cut, with `mmap`/`mprotect` syscall guards - superseded by the exec policy below): the probe forks a child with a raw `clone` (no exec), execs a static child
   (its own pid; the console's `[nodl]` lines carry it), execs with `LD_PRELOAD` (refused, `EPERM`), and runs two real dynamic
   programs from Alpine (`shanghai/mw_fetch_dyn.sh`: musl loader, `busybox`, `xz` + `liblzma.so.5`). **Result, both machines
   at SMP=4: 26 cases on the middleware kernel, 7 on the control, all passing.** `xz` runs on the control kernel and fails under
@@ -105,10 +105,22 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   `middleware`), so the sample table alone does not carry them. The gate boots three kernels per machine (stock; `middleware`
   alone, where the probe asserts the guards are absent; `no-dynamic-loading`, booted with `initargs=nodl`, where it asserts they are
   on), so a build that silently lacks or wrongly has the guards fails.
-- **Closing the libc-only gap** needs a hook where the loader handles `PT_INTERP`, not a syscall hook: an `exec_image` tier (path,
-  interpreter path, read-only image bytes, may refuse). Not built; also where a signed-binaries check belongs. Noted: running the
-  loader directly (`ld-musl <binary>`) has no `PT_INTERP`, so a `PT_INTERP` check alone would not see it (the `mmap` guard
-  probably still refuses the binary's own mapping; not tested).
+- **Closing the libc-only gap: one exec policy** (2026-11-05, the owner: "isn't it a bit duplicating of us" - the loader and the syscalls
+  each answered "may this become code?" separately). Code reaches a process in three ways, so the kernel now asks **one** hook,
+  `Hooks::exec: Option<ExecPolicy>` (`fn(&ExecEvent) -> ExecVerdict`, `Allow` / `Deny(errno)`, read-only), at each: `loader::load_task`
+  (`ExecKind::Image { path, interp, image }`, asked before the task's layout is reset, so a refusal returns `EACCES` and leaves the
+  caller untouched; `load_task` returns `Result<_, LoadError>` for this, where `None` used to be a bare `ENOMEM`), `mm::mmap_arm`
+  (`ExecKind::Map { inode }`) and `mm::mprotect_arm` (`ExecKind::Protect`). The `mmap`/`mprotect` syscall guards in `nodl.rs` are gone;
+  the policy is one `match`. The `LD_*` environment guard stays an ordinary `kernel_pre` hook (the guide's Example 2).
+- **Avenues** (`mwprobe` with `initargs=nodl`, both machines at SMP=4, identical): `execve` of a dynamic program, with an extra library
+  (`xz`) and with only libc (`busybox`: the gap, now closed): refused `EACCES`; the loader run directly (`ld-musl /bin/busybox`): cannot
+  load it ("Not a valid dynamic program"; its mapping is refused); a `#!` script with a dynamic interpreter: refused; `mmap(file,
+  PROT_EXEC)` and `mprotect(+X)` on a file mapping: refused; bytes written into anonymous memory then `mprotect(+X)`, and `mmap(RWX)`:
+  refused; forked, exec'd and `LD_PRELOAD` children: bound. `memfd_create`, `execveat`, `ptrace`, `process_vm_writev` answer `ENOSYS` and
+  `/proc/self/mem` cannot be opened for writing: closed by absence, pinned by the probe so a later implementation fails it. Static
+  programs still run. **Result: control 7, `middleware` alone 19 (no `[nodl]` line), `no-dynamic-loading` 35 with 13 refusals logged,
+  all passing, amd64 and aarch64.** Not claimed: interpreted code (a script run by a static interpreter is data), signatures
+  (the `Image` event carries the bytes; nothing checks them), and JIT (`mprotect(+X)` is refused outright).
 - **The first test subject was wrong:** `bzip2` ran under the guards with no refusal, which looked like a failed ban. Alpine builds
   libbz2 into the binary (`strings` shows only `libc.musl` as a dependency), so it never asked for a second library. `xz` replaced
   it, and `mw_fetch_dyn.sh` now checks the premise (`xz` names `liblzma`, `busybox` needs nothing beyond libc).

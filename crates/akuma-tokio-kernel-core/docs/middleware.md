@@ -70,8 +70,8 @@ probe's own result line. It needs only `e2fsprogs`, no sshd or key.
 
 ## The table
 
-One `Middleware<S>` per kernel, a `static`: `Middleware::new(state, Hooks { .. })`. `Hooks` has five fields, each a slice of
-`Route::new(&[On::..], hook)`; leave the ones you do not use at `..Hooks::new()`.
+One `Middleware<S>` per kernel, a `static`: `Middleware::new(state, Hooks { .. })`. `Hooks` has five tiers, each a slice of
+`Route::new(&[On::..], hook)`, and one `exec` policy (below); leave the ones you do not use at `..Hooks::new()`.
 
 | tier | hook type | runs | it may |
 |---|---|---|---|
@@ -192,8 +192,8 @@ kernel_pre: &[
     Route::new(&[On::Call(Syscall::Openat)], open_guard),
     #[cfg(feature = "no-dynamic-loading")]
     Route::new(&[On::Call(Syscall::Execve)], crate::nodl::exec_guard),
-    // ... mmap_guard and mprotect_guard the same way
 ],
+exec: EXEC,   // Some(crate::nodl::exec_policy) with the feature, None without it
 ```
 
 ```text
@@ -217,73 +217,75 @@ cargo build -p shanghai --features no-dynamic-loading --target x86_64-unknown-no
 gate knows exec still works); the console shows the `[nodl] ... refused an execve with an LD_* variable` line; the control kernel,
 built without the feature, has no such behaviour.
 
-**Going further: the rest of the demo.** `nodl.rs` also has `mmap_guard` (refuse a file-backed `PROT_EXEC` mapping, which is
-what `ld-musl` does for every library beyond libc, and `dlopen` does later) and `mprotect_guard` (refuse adding `PROT_EXEC`,
-which would otherwise turn a read-only file mapping executable). `mwprobe` checks that each refusal fires and that the
-neighbouring cases stay allowed: anonymous `PROT_EXEC` memory, a read-only file mapping, `mprotect(PROT_READ)`.
+**Going further: the exec policy, and what it blocks.** The environment guard is an ordinary `kernel_pre` hook. The rest of the demo is
+a different kind of hook, because "no dynamic loading" is not about one syscall: code reaches a process in exactly three ways, and the
+kernel asks **one** question at each of them, `Hooks::exec: Option<ExecPolicy>` (`fn(&ExecEvent) -> ExecVerdict`, `Allow` or
+`Deny(errno)`, read-only like every hook):
 
-**What it does to real dynamic programs** (Alpine's `musl` loader, `busybox` and `xz`, fetched by `shanghai/mw_fetch_dyn.sh`; amd64
-and aarch64 at 4 cores):
-
-| child | stock kernel | with the three guards |
+| how code arrives | the event | asked from |
 |---|---|---|
-| `xz --version` (needs `liblzma.so.5`, a library besides libc) | prints `xz (XZ Utils) 5.8.4` | the loader fails: `Error loading shared library liblzma.so.5: Permission denied (needed by /usr/bin/xz)` |
-| `busybox true` (dynamic, needs only libc) | runs | **still runs** (known gap, pinned by a probe case) |
+| `execve`, init, a `#!` interpreter | `ExecKind::Image { path, interp, image }` | `loader::load_task`, **before** the task's layout is reset, so a refusal leaves the caller untouched (`EACCES`) |
+| `mmap` with `PROT_EXEC` | `ExecKind::Map { inode }` (`None` = anonymous) | `mm::mmap_arm` |
+| `mprotect` adding `PROT_EXEC` | `ExecKind::Protect` | `mm::mprotect_arm` (the kernel cannot say which file a present page came from) |
 
-What each child goes through, and where the guards can and cannot see it (the xz line is from the gate's console: the `[nodl]`
-refusal under the child's pid, then the loader's error; the "opens the file" step is inferred, the log does not record opens):
+A policy is one `match`, so it cannot be bypassed by a path nobody hooked. Shanghai's (`nodl.rs`, `exec_policy`) refuses an image that
+has a `PT_INTERP`, refuses a file-backed executable mapping, refuses `mprotect(+PROT_EXEC)`, and allows the rest: static programs run,
+anonymous executable memory is allowed (W^X already forbids the writable kind). The policy is registered as `exec: Some(..)`, and
+only with `--features no-dynamic-loading`.
+
+**What it does to real dynamic programs** (Alpine's `musl` loader, `busybox` and `xz`, fetched by `shanghai/mw_fetch_dyn.sh`;
+amd64 and aarch64 at 4 cores; on the stock kernel both run):
 
 ```text
              xz --version  (needs liblzma.so.5)                   busybox true  (needs only libc)
              ─────────────────────────────────────                ──────────────────────────────────
 mwprobe      fork + execve("/usr/bin/xz", env: empty)             fork + execve("/bin/busybox", env: empty)
-             exec_guard: no LD_* in env -> allowed                exec_guard: no LD_* in env -> allowed
                           |                                                     |
                           v                                                     v
-KERNEL       the kernel's own loader, inside execve (no syscall from the program involved):
- (its own    +- maps the main binary                              +- maps the main binary
-  loader)    +- reads PT_INTERP, maps /lib/ld-musl-<arch>.so.1    +- reads PT_INTERP, maps /lib/ld-musl-<arch>.so.1
-             +- starts the program at ld-musl's entry             +- starts the program at ld-musl's entry
+KERNEL       load_task: the exec policy is asked FIRST, with ExecKind::Image { path, interp: Some("/lib/ld-musl-<arch>.so.1"), .. }
                           |                                                     |
                           v                                                     v
-ld-musl      reads the binary's list of needed libraries          reads the binary's list of needed libraries
-(userspace,
- in the      1. libc.musl-<arch>.so.1                             1. libc.musl-<arch>.so.1
- child)         = ld-musl itself (a symlink to it)                   = ld-musl itself, already mapped
-                -> already mapped, no syscall                        -> no syscall
-                                                                  nothing else needed -> nothing left to map
-             2. liblzma.so.5
-                opens the file, then
-                mmap(fd, PROT_READ|PROT_EXEC, MAP_PRIVATE)
-                          |
-                          v
-MIDDLEWARE   kernel_pre on mmap: file-backed + PROT_EXEC          no executable file mapping is requested, so
-             mmap_guard -> Errno(EACCES)                           mmap_guard and mprotect_guard never run for
-             console: "[nodl] pid 9 refused a                      this process: nothing to refuse
-             file-backed PROT_EXEC mmap"
+MIDDLEWARE   exec_policy: an image with a PT_INTERP        ->      the same: a dynamic image is a dynamic image
+             console: "[nodl] pid 6 refused a dynamic             console: "[nodl] pid 7 refused a dynamic
+             executable /usr/bin/xz (interpreter ...)"             executable /bin/busybox (interpreter ...)"
                           |                                                     |
                           v                                                     v
-RESULT       ld-musl: "Error loading shared library               runs `true`, exits 0
-             liblzma.so.5: Permission denied" -> the child fails  (on the stock kernel both run)
+RESULT       execve returns EACCES; the child never starts;        execve returns EACCES; the child never starts;
+             nothing was mapped, the caller is untouched           the libc-only gap of the syscall guards is closed
 ```
 
-The gap is structural: the kernel's own loader maps the interpreter and the main binary without a syscall, and `ld-musl` *is*
-libc, so a program with no other dependency never asks for a second mapping. This is **not a wholesale ban**: it stops a program
-loading libraries beyond libc and the `LD_*` knobs, nothing more.
+The first cut guarded `mmap` and `mprotect` as syscalls. It stopped `xz` inside the loader (`Error loading shared library
+liblzma.so.5: Permission denied`) but let `busybox` run, because the kernel's own loader maps the interpreter and the main binary
+without a syscall and `ld-musl` *is* libc, so a program with no other dependency never asked for a second mapping. A hook at the
+loader sees what a syscall hook cannot; that is why the exec policy exists.
 
-**Children are bound, because the policy is the kernel's.** The probe checks four kinds: a forked child that never execs (a raw
-`clone`), an exec'd static child in its own pid (the `[nodl]` lines in the console carry the child's pid, not 1), a child exec with
-`LD_PRELOAD` (refused with `EPERM`, so the child never starts), and the two dynamic children above.
+**Every avenue the probe tries, with the result** (`mwprobe`, `--features no-dynamic-loading`, amd64 and aarch64, identical):
 
-What is still outside it: a shebang script is data for a permitted interpreter; `memfd_create` was not checked; and a check by
-number cannot tell a file mapping from an anonymous one in `mprotect`, so that guard is stricter than the mmap one on purpose.
-A policy that must hold needs the verdict at the loader (a file becoming executable), not at the syscalls; this example is the
-shape of the hook, not the enforcement.
+| | avenue | result |
+|---|---|---|
+| A1 | `execve` of a dynamic program with an extra library (`xz`) | refused, `EACCES` |
+| A2 | `execve` of a dynamic program with only libc (`busybox`) | refused, `EACCES` |
+| B | the loader run directly, `ld-musl /bin/busybox true` (no `PT_INTERP`, so the image check passes it) | cannot load it: its mapping of `busybox` is refused (`Not a valid dynamic program`) |
+| C | a `#!` script whose interpreter is dynamic | refused, `EACCES` (the kernel resolves the interpreter; it goes through the same image check) |
+| D1-D5 | `mmap(file, PROT_EXEC)`; `mprotect(+X)` on a file mapping | refused; read-only file mappings and anonymous executable memory still allowed |
+| E1, E2 | bytes written into anonymous memory, then `mprotect(+X)`; `mmap(RWX)` | refused (policy, and W^X) |
+| F | `memfd_create` | not served (`ENOSYS`): closed by absence, not by policy |
+| G1-G4 | `execveat`, `ptrace`, `process_vm_writev`; opening `/proc/self/mem` for writing | not served / cannot be opened: closed by absence |
+| H1-H3 | a forked child that never execs; an exec'd static child (own pid); a child exec with `LD_PRELOAD` | all bound by the same policy; the static child still runs |
+
+"Closed by absence" is only as good as the absence. If `memfd_create`, `execveat` or `ptrace` is ever implemented, those probe lines
+fail (the `memfd_create` line already has the branch that tests a mapping of the memfd), which is the point of pinning them.
+
+**What this does not claim.** It bans dynamically linked programs and every route the probe found for turning a file or bytes into
+native code. It does not stop a static program from doing anything else, and it does not police interpreted code: a script run by a
+*static* interpreter (the script is data), or a static program's own bytecode, is not "loading a binary". `mprotect(+PROT_EXEC)` is
+refused outright, so nothing can JIT. A policy that must also check *which* binaries may run (signatures) uses the same `Image` event,
+which carries the image bytes; that is not written.
 
 **A lesson from writing it:** the first test subject was `bzip2`, and the probe passed it as "dynamic" because it ran under the
 guards without a single refusal. It had never asked for a second library: Alpine builds libbz2 into it, so it needs only libc. Check
 what a test subject actually loads (`strings -a <binary> | grep '^lib.*\.so'`) before trusting a result about it;
-`mw_fetch_dyn.sh` now fails if `xz` does not name `liblzma` or if `busybox` needs more than libc.
+`mw_fetch_dyn.sh` fails if `xz` does not name `liblzma` or if `busybox` needs more than libc.
 
 ## The rules, and why each is there
 
@@ -350,9 +352,6 @@ The feature-on cost against the syscall floor is **not measured**; do not quote 
 
 ## Not built (yet)
 
-An `exec_image` tier (a hook the loader calls with the path, the interpreter path and the image bytes, read-only, able to refuse): the
-place to close the libc-only gap above by refusing any `PT_INTERP` executable, and the place a signed-binaries check belongs, since the
-loader holds the bytes it is about to map. Not built, and whether a loader refusal leaves a calling process intact was not checked.
 Refusing `clone`/`fork` before they run (as safe as refusing `execve`, but nobody has asked for it); stripping variables from an exec's
 environment (see Example 2); a runtime `arm`/`disarm` handle for interest bits; a lock-protected state cell for `kernel` hooks (use
 atomics, or a `BorrowCell` static, which the kernel lock serialises); typed `UserPtr<T>` (there are byte reads and `u64`/string helpers); a
