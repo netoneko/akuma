@@ -381,3 +381,26 @@ infinity x gemma4:e4b 253 s. In each the model ran every step itself and the har
 **Needed from the user:** (a) permission to stop `vm-dev` for the test and restart it after; (b) a model endpoint for Akuma: approve a
 short-lived forwarder that puts the Mac's ollama on its LAN address (unauthenticated while up), or accept trashcan's Qwen3-8B
 (slow, no Gemma).
+
+## Update 8 (2026-11-05): Akuma's ssh client now takes standard OpenSSH Ed25519 keys (Claude)
+
+Asked by the user after the Akuma backend had to derive a key by hand. `ssh -i` on Akuma took only "Akuma's raw 32-byte format"; an
+`ssh-keygen` key was rejected silently and the client fell back to a default identity, which looks like an unexplained authentication
+failure. Now an identity file may also be an **unencrypted OpenSSH private key** (`openssh-key-v1`, Ed25519).
+- **Parser** `akuma_ssh_crypto::keys::parse_openssh_private_key_ed25519` (pure, `no_std`, in the host-tested crate). It checks, and
+  rejects the whole file otherwise: the magic; cipher and KDF both `none` (`Encrypted` is its own error, with the remedy); exactly one key;
+  both check integers equal; the outer public blob, the private section and the key derived from the seed all agree; the trailing public
+  half of the 64-byte secret; the 1,2,3,... padding; no trailing bytes.
+- **Client** `userspace/sshd/src/client/keys.rs::try_load_key`: raw 32 bytes first, then the PEM; an OpenSSH file it recognises but cannot use
+  says why on stderr before the fallback. Help text updated.
+- **Tests:** 17 new host tests, 49 in the crate, all green: real `ssh-keygen` output (with and without a comment, a passphrase-protected one),
+  a synthetic container builder that breaks exactly one field at a time, CRLF and surrounding whitespace, and every truncation of a real key
+  (none accepted, none panic). Two older clippy warnings in the same file are not mine and were left.
+- **On the ryzen** (new client at `/root/demo/bins/ssh`, the installed `/bin/ssh` is unchanged until the image is rebuilt), against `vm-dev`'s
+  guest sshd on :2224, which authorises the box's key: raw key logs in; **the OpenSSH PEM of the same key logs in with no fallback message**;
+  the old client rejects that PEM and silently falls back; the passphrase-protected key prints `... is passphrase-protected ...`; an RSA key
+  prints `... is not an ssh-ed25519 key`. The PEM was built on the box by a script that printed nothing secret, and every test key, PEM and
+  helper was deleted afterwards.
+- **Not done:** passphrase-protected keys (bcrypt-pbkdf plus aes256-ctr), other key types, `ssh-keygen`-style certificates.
+- **Follow-up:** `install.sh --vmm akuma` still derives its own key with an embedded RFC 8032 routine. With this client it could instead
+  take any OpenSSH key made on another machine (`--key` plus the private file), and drop the python3 dependency; not changed yet.

@@ -260,3 +260,254 @@ mod auth_tests {
         assert!(!verify_signature(&verifying_key, b"wrong message", &sig));
     }
 }
+
+#[cfg(test)]
+mod openssh_key_tests {
+    extern crate alloc;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use ed25519_dalek::SigningKey;
+
+    use crate::crypto::{write_string, write_u32};
+    use crate::keys::*;
+
+    // Real files from `ssh-keygen -t ed25519` (OpenSSH 9.x), throwaway keys made for these tests.
+    const PLAIN: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACAu04Rq7JekhCiDyKsxPkaT3d++gHqey/r7w8YxUAcWPAAAAJBZ91iJWfdY\niQAAAAtzc2gtZWQyNTUxOQAAACAu04Rq7JekhCiDyKsxPkaT3d++gHqey/r7w8YxUAcWPA\nAAAEBVx8hZeZ9vh9WZEnUmMBorqLWoGEjOdUkgkWGrnkjlDi7ThGrsl6SEKIPIqzE+RpPd\n376Aep7L+vvDxjFQBxY8AAAACmFrdW1hLXRlc3QBAgM=\n-----END OPENSSH PRIVATE KEY-----\n";
+    const PLAIN_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC7ThGrsl6SEKIPIqzE+RpPd376Aep7L+vvDxjFQBxY8 akuma-test";
+    const NO_COMMENT: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACBvDe4e0eyY4TYxXTihTPK2SNcrFDm+ju3W7C5LbBz/WgAAAIgQTpxbEE6c\nWwAAAAtzc2gtZWQyNTUxOQAAACBvDe4e0eyY4TYxXTihTPK2SNcrFDm+ju3W7C5LbBz/Wg\nAAAEBje69vn1YkynnVB7epBEfcxg+J3kLT/jkQoLYPK8gB+G8N7h7R7JjhNjFdOKFM8rZI\n1ysUOb6O7dbsLktsHP9aAAAAAAECAwQF\n-----END OPENSSH PRIVATE KEY-----\n";
+    const NO_COMMENT_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG8N7h7R7JjhNjFdOKFM8rZI1ysUOb6O7dbsLktsHP9a";
+    /// `ssh-keygen -t ed25519 -N hunter2`: aes256-ctr + bcrypt.
+    const ENCRYPTED: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABB361XLDe\nKlfJKhFQ9RIWB6AAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIFMtyTIvNg6xXmOF\nI+xyCjMZAmXeK/wloXhEv46IIPsfAAAAkH7Kjd5SSnWLxHe1hArLXA87cxDz0WxUzX/sIg\nHASC8GVxIq4Qok02yVDYONt3mMTWT3yQF5DnHnTin7gPIWFei4VMDq1xXxYjt0Xlu08I00\niM/bE7evf7q7LqV5iIrcobLhgwxm8J9jh45OsLNxDLf3x2tJ7Uj3Pmot62wnPMnJIMAJY1\nX6oG8iLtXBIK6r5A==\n-----END OPENSSH PRIVATE KEY-----\n";
+
+    fn pub_of(seed: &[u8; 32]) -> [u8; 32] {
+        *SigningKey::from_bytes(seed).verifying_key().as_bytes()
+    }
+
+    /// Every field of a container, so a test can break exactly one.
+    struct Parts {
+        cipher: &'static [u8],
+        kdf: &'static [u8],
+        nkeys: u32,
+        outer_type: &'static [u8],
+        outer_pub: Vec<u8>,
+        check1: u32,
+        check2: u32,
+        inner_type: &'static [u8],
+        inner_pub: Vec<u8>,
+        secret: Vec<u8>,
+        comment: &'static [u8],
+        /// `None` = the correct 1,2,3... padding.
+        padding: Option<Vec<u8>>,
+    }
+
+    fn good(seed: &[u8; 32]) -> Parts {
+        let p = pub_of(seed).to_vec();
+        let mut secret = seed.to_vec();
+        secret.extend_from_slice(&p);
+        Parts {
+            cipher: b"none", kdf: b"none", nkeys: 1, outer_type: b"ssh-ed25519", outer_pub: p.clone(),
+            check1: 0xDEAD_BEEF, check2: 0xDEAD_BEEF, inner_type: b"ssh-ed25519", inner_pub: p, secret,
+            comment: b"test", padding: None,
+        }
+    }
+
+    fn pem(parts: &Parts) -> String {
+        let mut outer = Vec::new();
+        write_string(&mut outer, parts.outer_type);
+        write_string(&mut outer, &parts.outer_pub);
+
+        let mut private = Vec::new();
+        write_u32(&mut private, parts.check1);
+        write_u32(&mut private, parts.check2);
+        write_string(&mut private, parts.inner_type);
+        write_string(&mut private, &parts.inner_pub);
+        write_string(&mut private, &parts.secret);
+        write_string(&mut private, parts.comment);
+        if let Some(p) = &parts.padding {
+            private.extend_from_slice(p);
+        } else {
+            let mut i = 1u8;
+            while private.len() % 8 != 0 {
+                private.push(i);
+                i += 1;
+            }
+        }
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"openssh-key-v1\0");
+        write_string(&mut body, parts.cipher);
+        write_string(&mut body, parts.kdf);
+        write_string(&mut body, b"");
+        write_u32(&mut body, parts.nkeys);
+        write_string(&mut body, &outer);
+        write_string(&mut body, &private);
+
+        let b64 = base64_encode(&body);
+        let mut out = String::from("-----BEGIN OPENSSH PRIVATE KEY-----\n");
+        for chunk in b64.as_bytes().chunks(70) {
+            out.push_str(core::str::from_utf8(chunk).unwrap());
+            out.push('\n');
+        }
+        out.push_str("-----END OPENSSH PRIVATE KEY-----\n");
+        out
+    }
+
+    const SEED: [u8; 32] = [7u8; 32];
+
+    #[test]
+    fn real_openssh_key_yields_the_seed_whose_public_key_is_the_pub_file() {
+        let seed = parse_openssh_private_key_ed25519(PLAIN).expect("a real ssh-keygen key must parse");
+        let want = parse_public_key_ssh(PLAIN_PUB).expect("pub line parses");
+        assert_eq!(&pub_of(&seed), want.as_bytes());
+    }
+
+    #[test]
+    fn real_openssh_key_with_an_empty_comment_parses() {
+        let seed = parse_openssh_private_key_ed25519(NO_COMMENT).expect("empty comment is legal");
+        let want = parse_public_key_ssh(NO_COMMENT_PUB).expect("pub line parses");
+        assert_eq!(&pub_of(&seed), want.as_bytes());
+    }
+
+    #[test]
+    fn surrounding_whitespace_and_crlf_line_endings_are_tolerated() {
+        let crlf = PLAIN.replace('\n', "\r\n");
+        let padded = alloc::format!("\n\n  {}  \n\n", crlf.trim());
+        assert_eq!(parse_openssh_private_key_ed25519(&padded), parse_openssh_private_key_ed25519(PLAIN));
+    }
+
+    #[test]
+    fn a_passphrase_protected_key_is_reported_as_encrypted_not_malformed() {
+        assert_eq!(parse_openssh_private_key_ed25519(ENCRYPTED), Err(OpensshKeyError::Encrypted));
+    }
+
+    #[test]
+    fn synthetic_good_container_roundtrips_the_exact_seed() {
+        let text = pem(&good(&SEED));
+        assert_eq!(parse_openssh_private_key_ed25519(&text), Ok(SEED));
+        // and the builder agrees with ssh-keygen about being a valid container shape
+        assert!(looks_like_openssh_private_key(&text));
+    }
+
+    #[test]
+    fn mismatched_check_integers_are_rejected() {
+        // The classic sign of a wrong passphrase / corrupted private section.
+        let mut p = good(&SEED);
+        p.check2 = p.check1 ^ 1;
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&p)), Err(OpensshKeyError::Malformed));
+    }
+
+    #[test]
+    fn a_public_key_that_is_not_the_seeds_is_rejected() {
+        // Outer, inner and trailing half all agree with each other but not with the seed.
+        let other = pub_of(&[9u8; 32]).to_vec();
+        let mut p = good(&SEED);
+        p.outer_pub = other.clone();
+        p.inner_pub = other.clone();
+        let mut secret = SEED.to_vec();
+        secret.extend_from_slice(&other);
+        p.secret = secret;
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&p)), Err(OpensshKeyError::Malformed));
+    }
+
+    #[test]
+    fn outer_and_inner_public_keys_must_agree() {
+        let mut p = good(&SEED);
+        p.outer_pub = pub_of(&[9u8; 32]).to_vec();
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&p)), Err(OpensshKeyError::Malformed));
+    }
+
+    #[test]
+    fn the_trailing_public_half_of_the_secret_must_match() {
+        let mut p = good(&SEED);
+        let n = p.secret.len();
+        p.secret[n - 1] ^= 0x80;
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&p)), Err(OpensshKeyError::Malformed));
+    }
+
+    #[test]
+    fn a_secret_of_the_wrong_length_is_rejected() {
+        let mut p = good(&SEED);
+        p.secret.truncate(32);
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&p)), Err(OpensshKeyError::Malformed));
+    }
+
+    #[test]
+    fn wrong_padding_is_rejected() {
+        let mut p = good(&SEED);
+        // The padding must be 1,2,3,...; zeros are not accepted even when the length works out.
+        p.padding = Some(alloc::vec![0u8; 4]);
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&p)), Err(OpensshKeyError::Malformed));
+    }
+
+    #[test]
+    fn other_key_types_are_not_ed25519() {
+        let mut p = good(&SEED);
+        p.outer_type = b"ssh-rsa";
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&p)), Err(OpensshKeyError::NotEd25519));
+        let mut q = good(&SEED);
+        q.inner_type = b"ssh-rsa";
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&q)), Err(OpensshKeyError::NotEd25519));
+    }
+
+    #[test]
+    fn more_than_one_key_is_refused_and_zero_is_malformed() {
+        let mut p = good(&SEED);
+        p.nkeys = 2;
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&p)), Err(OpensshKeyError::MultipleKeys));
+        p.nkeys = 0;
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&p)), Err(OpensshKeyError::Malformed));
+    }
+
+    #[test]
+    fn an_encrypting_cipher_or_kdf_alone_is_enough_to_refuse() {
+        let mut p = good(&SEED);
+        p.cipher = b"aes256-ctr";
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&p)), Err(OpensshKeyError::Encrypted));
+        let mut q = good(&SEED);
+        q.kdf = b"bcrypt";
+        assert_eq!(parse_openssh_private_key_ed25519(&pem(&q)), Err(OpensshKeyError::Encrypted));
+    }
+
+    #[test]
+    fn not_a_pem_container_is_not_openssh() {
+        assert_eq!(parse_openssh_private_key_ed25519(""), Err(OpensshKeyError::NotOpenssh));
+        assert_eq!(parse_openssh_private_key_ed25519("hello"), Err(OpensshKeyError::NotOpenssh));
+        assert_eq!(parse_openssh_private_key_ed25519(PLAIN_PUB), Err(OpensshKeyError::NotOpenssh));
+        // a begin line with no end line
+        let cut = PLAIN.replace("-----END OPENSSH PRIVATE KEY-----", "");
+        assert_eq!(parse_openssh_private_key_ed25519(&cut), Err(OpensshKeyError::NotOpenssh));
+        assert!(!looks_like_openssh_private_key("\x01\x02 raw bytes"));
+    }
+
+    #[test]
+    fn valid_base64_with_the_wrong_magic_is_not_openssh() {
+        let text = alloc::format!("{}\n{}\n{}\n", OPENSSH_PEM_BEGIN, base64_encode(b"openssh-key-v2\0whatever"),
+            "-----END OPENSSH PRIVATE KEY-----");
+        assert_eq!(parse_openssh_private_key_ed25519(&text), Err(OpensshKeyError::NotOpenssh));
+    }
+
+    #[test]
+    fn every_truncation_of_a_real_key_is_rejected_and_never_panics() {
+        // Cut the decoded body at every length: each must be an error, none may panic or index out of range.
+        let b64: String = PLAIN.lines().filter(|l| !l.starts_with("-----")).collect();
+        let raw = base64_decode(&b64).unwrap();
+        for cut in 0..raw.len() {
+            let text = alloc::format!("{}\n{}\n-----END OPENSSH PRIVATE KEY-----", OPENSSH_PEM_BEGIN, base64_encode(&raw[..cut]));
+            assert!(parse_openssh_private_key_ed25519(&text).is_err(), "cut at {cut} was accepted");
+        }
+    }
+
+    #[test]
+    fn trailing_garbage_after_the_private_section_is_rejected() {
+        let b64: String = PLAIN.lines().filter(|l| !l.starts_with("-----")).collect();
+        let mut raw = base64_decode(&b64).unwrap();
+        raw.push(0);
+        let text = alloc::format!("{}\n{}\n-----END OPENSSH PRIVATE KEY-----", OPENSSH_PEM_BEGIN, base64_encode(&raw));
+        assert_eq!(parse_openssh_private_key_ed25519(&text), Err(OpensshKeyError::Malformed));
+    }
+
+    #[test]
+    fn describe_names_the_remedy_for_an_encrypted_key() {
+        assert!(OpensshKeyError::Encrypted.describe().contains("ssh-keygen"));
+    }
+}

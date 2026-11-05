@@ -33,7 +33,8 @@ fn print_usage() {
     println("");
     println("  -p port           Port to connect to (default 22)");
     println("  -l user           Remote login name (default: root, or from user@host)");
-    println("  -i identity_file  Ed25519 identity file, Akuma's raw 32-byte format");
+    println("  -i identity_file  Ed25519 identity file: an unencrypted OpenSSH private key");
+    println("                    (ssh-keygen -t ed25519 -N '') or Akuma's raw 32-byte format");
     println("                    (default: $HOME/.ssh/id_ed25519, falling back to");
     println("                    /etc/sshd/id_ed25519, i.e. sshd's own host key)");
     println("  -t term           TERM to advertise to the remote pty (default xterm-256color)");

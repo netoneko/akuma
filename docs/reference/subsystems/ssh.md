@@ -280,7 +280,16 @@ limitations accepted and documented rather than silently left).
   though they're moot talking to this repo's own `sshd`.
 - Identity key precedence: `-i <path>` → `$HOME/.ssh/id_ed25519` →
   `/etc/sshd/id_ed25519` (`sshd`'s own host key, reused) → generate + persist
-  to `$HOME/.ssh/id_ed25519`. Raw 32-byte format only, not OpenSSH PEM.
+  to `$HOME/.ssh/id_ed25519`. An identity file is **Akuma's raw 32-byte seed or a standard
+  unencrypted OpenSSH Ed25519 private key** (`-----BEGIN OPENSSH PRIVATE KEY-----`, what
+  `ssh-keygen -t ed25519 -N ''` writes), so a key made elsewhere works with `-i` unchanged. A
+  passphrase-protected key, a non-Ed25519 key or a damaged file is refused with a message that says
+  which, then the next default is tried. The parser is
+  `akuma_ssh_crypto::keys::parse_openssh_private_key_ed25519` (host-tested against real `ssh-keygen`
+  output, including every truncation); the client only calls it
+  (`userspace/sshd/src/client/keys.rs::try_load_key`). Verified on the ryzen: the OpenSSH form of a
+  key that logs in raw also logs in, and the old client rejects that same file
+  ([`../../archive/BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING.md`](../../archive/BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING.md) Update 8).
 - Host-tested pure wire logic (KEXINIT, exchange-hash, packet framing) lives
   in `sshd::client_wire` (the package lib target) — the `ssh` binary itself
   links `libakuma` unconditionally, same reason `sshd`'s own `main.rs` can't

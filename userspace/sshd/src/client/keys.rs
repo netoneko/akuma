@@ -1,12 +1,12 @@
 //! Client identity key and `known_hosts` handling for the `ssh` binary.
 //!
-//! Identity keys are stored in the same raw 32-byte format `sshd` uses for its
-//! host key (`userspace/sshd/src/keys.rs`) — not OpenSSH's PEM
-//! `-----BEGIN OPENSSH PRIVATE KEY-----` container. An identity file produced
-//! by real `ssh-keygen` will not load here; that format (plus its optional
-//! bcrypt-KDF encryption) is out of scope for a minimal client. Point `-i` at
-//! a raw key (e.g. copy `/etc/sshd/id_ed25519` itself) or let the client
-//! generate its own.
+//! An identity file is either Akuma's raw 32-byte Ed25519 seed (the format `sshd` uses for its
+//! own host key, `userspace/sshd/src/keys.rs`) or a standard **unencrypted OpenSSH private key**
+//! (`-----BEGIN OPENSSH PRIVATE KEY-----`, what `ssh-keygen -t ed25519 -N ''` writes), so a key
+//! made on any other machine can be copied over and used with `-i` unchanged. Passphrase-protected
+//! keys and key types other than Ed25519 are rejected with a message that says so; the parsing is
+//! `akuma_ssh_crypto::keys::parse_openssh_private_key_ed25519` (host-tested against real
+//! `ssh-keygen` output).
 
 use alloc::format;
 use alloc::string::String;
@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey, VerifyingKey};
 
 pub use akuma_ssh_crypto::keys::{base64_encode, encode_public_key_ssh, parse_public_key_ssh};
+use akuma_ssh_crypto::keys::{looks_like_openssh_private_key, parse_openssh_private_key_ed25519};
 
 use libakuma::*;
 
@@ -65,13 +66,28 @@ fn parent_dir(path: &str) -> Option<&str> {
     path.rfind('/').map(|i| &path[..i])
 }
 
-fn try_load_raw_key(path: &str) -> Option<SigningKey> {
+/// Load an Ed25519 identity from `path`: Akuma's raw 32-byte seed, or an unencrypted OpenSSH
+/// private key. `None` when the file is missing or is neither; an OpenSSH file that is
+/// recognisable but unusable (passphrase, wrong key type, damaged) says why on stderr, because
+/// otherwise the caller's fallback to a default key looks like a mysterious authentication
+/// failure further down.
+fn try_load_key(path: &str) -> Option<SigningKey> {
     let data = read_file_to_vec(path).ok()?;
-    if data.len() != SECRET_KEY_LENGTH {
+    if data.len() == SECRET_KEY_LENGTH {
+        let bytes: [u8; SECRET_KEY_LENGTH] = data.try_into().ok()?;
+        return Some(SigningKey::from_bytes(&bytes));
+    }
+    let text = core::str::from_utf8(&data).ok()?;
+    if !looks_like_openssh_private_key(text) {
         return None;
     }
-    let bytes: [u8; SECRET_KEY_LENGTH] = data.try_into().ok()?;
-    Some(SigningKey::from_bytes(&bytes))
+    match parse_openssh_private_key_ed25519(text) {
+        Ok(seed) => Some(SigningKey::from_bytes(&seed)),
+        Err(e) => {
+            eprintln(&format!("ssh: {path}: {}", e.describe()));
+            None
+        }
+    }
 }
 
 /// Generates and persists a new identity key. `None` if secure randomness
@@ -121,20 +137,20 @@ fn generate_and_save(path: &str) -> Option<SigningKey> {
 /// not fall back to any kind of default identity.
 pub fn load_identity(explicit: Option<&str>) -> Option<SigningKey> {
     if let Some(p) = explicit {
-        if let Some(k) = try_load_raw_key(p) {
+        if let Some(k) = try_load_key(p) {
             return Some(k);
         }
         eprintln(&format!(
-            "ssh: identity file '{p}' not found or not a valid raw Ed25519 key; falling back to defaults"
+            "ssh: identity file '{p}' not found or not a usable Ed25519 key (raw 32 bytes or unencrypted OpenSSH); falling back to defaults"
         ));
     }
 
     let user_key_path = format!("{}/.ssh/id_ed25519", home_dir());
-    if let Some(k) = try_load_raw_key(&user_key_path) {
+    if let Some(k) = try_load_key(&user_key_path) {
         return Some(k);
     }
 
-    if let Some(k) = try_load_raw_key(SSHD_HOST_KEY_PATH) {
+    if let Some(k) = try_load_key(SSHD_HOST_KEY_PATH) {
         println(&format!(
             "[ssh] no {user_key_path}; using sshd's host key ({SSHD_HOST_KEY_PATH}) as identity"
         ));
