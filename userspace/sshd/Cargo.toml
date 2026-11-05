@@ -18,6 +18,9 @@ path = "src/client/main.rs"
 # a std host target — libakuma defines #[panic_handler] and #[global_allocator],
 # which collide with std's. See src/lib.rs.
 default = ["akuma", "fork-sessions", "emergency-paws"]
+# libakuma's `linux-abi` is on for every sshd build (2026-11-05, for alignment): fork + pipe2 + dup3 +
+# execve instead of Akuma's private SPAWN. Taoxichuan has no SPAWN (it answers `nosys`, and sshd then falls
+# to the built-in paws, which cannot exec), and the Akuma kernels serve the same calls.
 akuma = ["dep:libakuma"]
 
 # ON by default. If the configured shell (`sshd.conf`'s `shell`, default
@@ -82,7 +85,7 @@ insecure-disable-key-verification = []
 # so it opts into libakuma's `net-async` feature (off by default).
 # Optional only so the `wire` unit tests can build for the host — the binary
 # always needs it (see [features]).
-libakuma = { path = "../libakuma", features = ["net-async"], optional = true }
+libakuma = { path = "../libakuma", features = ["net-async", "linux-abi"], optional = true }
 # Shared, host-testable SSH-2 wire-format/crypto primitives, instead of a
 # hand-rolled duplicate. `default-features = false` drops "fast" (curve25519-
 # dalek's ~30 KB precomputed basepoint-multiplication table) — neither binary

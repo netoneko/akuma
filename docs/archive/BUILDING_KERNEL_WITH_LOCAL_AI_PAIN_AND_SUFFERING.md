@@ -428,3 +428,24 @@ User's scope calls: one key type (Ed25519), no passphrases, "if someone wants th
   (art, dividers, text; open it to see the layout); `protocol.rs` just includes it. Output checked byte-identical to the old banner plus
   the two lines. The new `sshd` is staged at `/root/demo/bins/sshd` on the ryzen; the running `/bin/sshd` is untouched.
 - **Docs:** `userspace/sshd/README.md` (Keys and `ssh-keygen`, scope), `docs/SSH_CLIENT.md` (the stale "raw only" note replaced).
+
+## Update 10 — first VM booted by install.sh on Akuma itself (2026-11-05)
+
+`vm-dev` stopped with the user's go-ahead; kvm0 free. `install.sh up --vmm akuma` on the ryzen (Akuma) now boots a Taoxichuan guest through herd's
+`vm = true` and `install.sh ssh … busybox uname -a` prints `Linux taoxichuan 0.1.0-ae1ead4-taoxichuan … x86_64 GNU/Linux`. Three things stood in the way,
+none of them the model's fault:
+
+1. **Port 2222 is the host's own sshd.** `vm_forward = 2222:22` collided, so the "guest" login was the host rejecting the key
+   (`publickey authentication failed`). On `--vmm akuma` the default port is now **2230** (`--port` still wins).
+2. **Akuma's `ssh` asks yes/no for a new host key** and takes no `-o`. `install.sh` feeds `yes` on stdin for the Akuma flavor and deletes a stale
+   `127.0.0.1:<port>` line from `~/.ssh/known_hosts` before waiting (a fresh VM is a fresh host key; the client refuses a changed one).
+3. **The sshd must be the `linux-abi` build.** The default-ABI sshd spawns shells with Akuma's private `SPAWN` syscall (guest log `[nosys] nr=4397`),
+   Taoxichuan has none, so every session fell to the built-in paws ("builtins only, no exec"; auth worked, `uname -a` "worked" because it is a paws
+   builtin and printed `Akuma 0.1.0`). Proved by booting busybox as init in the same image (exec and the `sh` symlink fine), then by swapping in the
+   older installed sshd (same failure), then by the linux-abi build (works). Pop's trials had the linux-abi sshd, which is why they passed.
+   **`libakuma/linux-abi` is now on for every sshd build** (`userspace/sshd/Cargo.toml`, user decision "for alignment").
+
+Also: `/dev/kvm` (Firecracker node) is present on this boot — Firecracker reached `CREATE_VM` and got `EBUSY` while a kvm0 VM existed; the herd
+path uses `/dev/kvm0`. Not run further; Firecracker-on-Akuma has no network, so no ssh.
+**GLM-4.7-flash smoke:** goose (native ollama provider, Mac ollama over LAN) ran `echo hello-from-glm` and answered DONE on the ryzen.
+**Next:** Akuma trials (goose/infinity × qwen3:4b / gemma4:e4b / glm-4.7-flash) against this setup.

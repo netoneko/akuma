@@ -34,6 +34,7 @@ set -u
 SCRIPT_PATH=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 DIR="$HOME/akuma"
 PORT=2222
+PORT_SET=0
 VMM=qemu
 REF=post-release-improvements
 REPO=https://github.com/netoneko/akuma
@@ -105,7 +106,7 @@ esac
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--dir)     DIR=$2; shift 2 ;;
-		--port)    PORT=$2; shift 2 ;;
+		--port)    PORT=$2; PORT_SET=1; shift 2 ;;
 		--vmm)     VMM=$2; VMM_SET=1; shift 2 ;;
 		--ref)     REF=$2; shift 2 ;;
 		--arch)    ARCH=$2; shift 2 ;;
@@ -162,6 +163,8 @@ fi
 # user, so no -i and ssh falls back to the default identities.
 if [ "$VMM_SET" = 0 ] && [ -f "$STATE/vmm" ]; then VMM=$(cat "$STATE/vmm"); fi   # what 'up' booted
 GUEST_HOST=127.0.0.1                          # qemu: hostfwd on loopback
+# on Akuma the host's own sshd owns 2222, so a forward there would reach the host, not the VM
+[ "$VMM" = akuma ] && [ "$PORT_SET" = 0 ] && PORT=2230
 SSHPORT=$PORT                                 # qemu: the hostfwd port; firecracker: the guest's own 22
 [ "$VMM" = firecracker ] && SSHPORT=22
 if [ "$VMM" = firecracker ]; then GUEST_HOST=10.0.2.15; fi   # firecracker: the guest on its tap
@@ -175,6 +178,12 @@ if command -v ssh >/dev/null 2>&1; then
 fi
 SSH_EXTRA="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes"
 [ "$SSH_FLAVOR" = akuma ] && SSH_EXTRA=""
+# Akuma ssh has no StrictHostKeyChecking: it asks yes/no on stdin the first time.
+# Feed it "yes" (the VM is one we just booted on loopback; the key lands in known_hosts).
+SSH_YES=
+# a fresh VM has a fresh host key behind the same host:port; Akuma's client refuses a changed key
+forget_host() { [ "$SSH_FLAVOR" = akuma ] && [ -f "$HOME/.ssh/known_hosts" ] && sed -i "/^$GUEST_HOST:$SSHPORT /d" "$HOME/.ssh/known_hosts"; return 0; }
+[ "$SSH_FLAVOR" = akuma ] && SSH_YES="echo yes |"
 SSH_OPTS="$KEYOPT -p $SSHPORT $SSH_EXTRA"
 
 # -----------------------------------------------------------------------: check
@@ -343,6 +352,7 @@ fi
 if [ "$CMD" = ssh ]; then
 	[ -f "$STATE/key" ] || fatal 2 ssh "no $STATE/key — run up first"
 	# shellcheck disable=SC2086
+	if [ "$SSH_FLAVOR" = akuma ]; then echo yes | ssh $SSH_OPTS "root@$GUEST_HOST" "$@"; exit $?; fi
 	exec ssh $SSH_OPTS "root@$GUEST_HOST" "$@"
 fi
 
@@ -644,13 +654,14 @@ fi
 
 # stage wait: readiness is an ssh round-trip, never a log grep
 t0=$(date +%s)
+forget_host
 while :; do
 	now=$(date +%s)
 	if [ $((now - t0)) -ge "$WAIT_DEADLINE" ]; then
 		fatal 60 wait "guest never answered ssh within ${WAIT_DEADLINE}s (still booting? see $STATE/console.log)"
 	fi
 	if [ "$DRY_RUN" = 1 ]; then
-		run sh -c "ssh $SSH_OPTS $WAIT_TARGET true"
+		run sh -c "$SSH_YES ssh $SSH_OPTS $WAIT_TARGET true"
 		break
 	fi
 	# a VM that died will never answer: say so now instead of at the deadline
@@ -659,7 +670,7 @@ while :; do
 		fatal 50 boot "$VMM exited before ssh answered: $(tail -c 300 "$STATE/console.log" 2>/dev/null | tr -d '\000')"
 	fi
 	# shellcheck disable=SC2086
-	if ssh $SSH_OPTS "$WAIT_TARGET" true >>"$LOGS/wait.log" 2>&1; then
+	if { [ "$SSH_FLAVOR" = akuma ] && echo yes || true; } | ssh $SSH_OPTS "$WAIT_TARGET" true >>"$LOGS/wait.log" 2>&1; then
 		stamp wait
 		break
 	fi
