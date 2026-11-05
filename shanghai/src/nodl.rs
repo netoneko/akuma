@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
-//! "No dynamic loading": a policy demo built from three `kernel_pre` hooks (B22, guide:
+//! "No dynamic loading": a policy demo built from three `kernel_pre` hooks, compiled in only with `--features
+//! no-dynamic-loading` (off by default; it implies `middleware`) (B22, guide:
 //! `crates/akuma-tokio-kernel-core/docs/middleware.md` § Worked example). It is a demo, not a sandbox: it is **not** a
 //! wholesale ban, and the guide lists what gets around it.
 //!

@@ -142,6 +142,9 @@ fn main() {
         println!("MWPROBE RESULT {}", if failed == 0 { "PASS" } else { "FAIL" });
         return;
     }
+    // `nodl` (the gate's `initargs=nodl`): this kernel was built with `--features no-dynamic-loading`, so the guards must be on.
+    // Without it they must be absent: a build that silently lacks them, or has them when it should not, fails the gate.
+    let nodl = args.get(1).map(String::as_str) == Some("nodl");
     let fails = std::cell::Cell::new(0);
     let check = |name: &str, got: i64, want: i64| {
         let ok = got == want;
@@ -217,36 +220,46 @@ fn main() {
     // "No dynamic loading" (shanghai/src/nodl.rs): what ld.so and dlopen do is a file-backed PROT_EXEC mapping.
     let fd = open("/bin/mwprobe");
     check("open the probe's own binary", i64::from(fd >= 3), 1);
-    let file_exec = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd as u64, 0]);
-    check("mmap(file, PROT_EXEC) is refused", file_exec, EACCES);
-    let anon_exec = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, NO_FD, 0]);
-    check("mmap(anonymous, PROT_EXEC) is still allowed", i64::from(anon_exec > 0), 1);
-    let file_ro = sc6(nr::MMAP, [0, 4096, PROT_READ, MAP_PRIVATE, fd as u64, 0]);
-    check("mmap(file, PROT_READ) is still allowed", i64::from(file_ro > 0), 1);
-    check("mprotect(+PROT_EXEC) is refused", sc(nr::MPROTECT, [file_ro as u64, 4096, PROT_READ | PROT_EXEC, 0]), EACCES);
-    check("mprotect(PROT_READ) is still allowed", sc(nr::MPROTECT, [file_ro as u64, 4096, PROT_READ, 0]), 0);
+    if !nodl {
+        // The guards are a Shanghai feature (`no-dynamic-loading`), off by default: with only `middleware` none is in the table.
+        let file_exec = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd as u64, 0]);
+        check("(no-dynamic-loading off) mmap(file, PROT_EXEC) is allowed", i64::from(file_exec > 0), 1);
+        let (ok, _) = run_dynamic("/usr/bin/xz", "--version");
+        check("(no-dynamic-loading off) a dynamic child with an extra library runs", i64::from(ok), 1);
+        let bad = std::process::Command::new("/bin/mwprobe").arg("kid").env("LD_PRELOAD", "/lib/evil.so").status();
+        check("(no-dynamic-loading off) a child exec with LD_PRELOAD is not refused", i64::from(bad.is_ok()), 1);
+    } else {
+        let file_exec = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd as u64, 0]);
+        check("mmap(file, PROT_EXEC) is refused", file_exec, EACCES);
+        let anon_exec = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, NO_FD, 0]);
+        check("mmap(anonymous, PROT_EXEC) is still allowed", i64::from(anon_exec > 0), 1);
+        let file_ro = sc6(nr::MMAP, [0, 4096, PROT_READ, MAP_PRIVATE, fd as u64, 0]);
+        check("mmap(file, PROT_READ) is still allowed", i64::from(file_ro > 0), 1);
+        check("mprotect(+PROT_EXEC) is refused", sc(nr::MPROTECT, [file_ro as u64, 4096, PROT_READ | PROT_EXEC, 0]), EACCES);
+        check("mprotect(PROT_READ) is still allowed", sc(nr::MPROTECT, [file_ro as u64, 4096, PROT_READ, 0]), 0);
 
-    // Children. The policy is the kernel's, not the process's: every process made from this one is bound by it.
-    //  1. a forked child that never execs (raw clone), 2. an exec'd static child (another pid), 3. a child exec with LD_PRELOAD,
-    //  4. a real dynamically linked child (xz) that needs a library besides libc (liblzma.so.5), 5. one that needs only libc.
-    let pid = sc(nr::CLONE, [SIGCHLD, 0, 0, 0]);
-    if pid == 0 {
-        let n = load_attempts_allowed(fd);
-        sc(nr::EXIT_GROUP, [u64::from(n != 0), 0, 0, 0]);
-        loop {}
+        // Children. The policy is the kernel's, not the process's: every process made from this one is bound by it.
+        //  1. a forked child that never execs (raw clone), 2. an exec'd static child (another pid), 3. a child exec with LD_PRELOAD,
+        //  4. a real dynamically linked child (xz) that needs a library besides libc (liblzma.so.5), 5. one that needs only libc.
+        let pid = sc(nr::CLONE, [SIGCHLD, 0, 0, 0]);
+        if pid == 0 {
+            let n = load_attempts_allowed(fd);
+            sc(nr::EXIT_GROUP, [u64::from(n != 0), 0, 0, 0]);
+            loop {}
+        }
+        let mut status: i32 = 0;
+        let waited = sc(nr::WAIT4, [pid as u64, &raw mut status as u64, 0, 0]);
+        check("a forked child (no exec) is bound by the same guards", i64::from(pid > 0 && waited == pid && status == 0), 1);
+        let kid = std::process::Command::new("/bin/mwprobe").arg("kid").env_clear().status();
+        check("an exec'd static child (another pid) is bound by the same guards", i64::from(matches!(&kid, Ok(s) if s.success())), 1);
+        let bad = std::process::Command::new("/bin/mwprobe").arg("kid").env("LD_PRELOAD", "/lib/evil.so").status();
+        check("a child exec with LD_PRELOAD is refused (EPERM)", i64::from(matches!(&bad, Err(e) if e.raw_os_error() == Some(1))), 1);
+        let (ok, err) = run_dynamic("/usr/bin/xz", "--version");
+        println!("MWPROBE xz (dynamic, needs liblzma.so.5): ok={ok} output={err}");
+        check("a dynamic child that needs a library besides libc cannot load it", i64::from(!ok), 1);
+        let (ok, _) = run_dynamic("/bin/busybox", "true");
+        check("a dynamic child that needs only libc still runs (known gap, pinned)", i64::from(ok), 1);
     }
-    let mut status: i32 = 0;
-    let waited = sc(nr::WAIT4, [pid as u64, &raw mut status as u64, 0, 0]);
-    check("a forked child (no exec) is bound by the same guards", i64::from(pid > 0 && waited == pid && status == 0), 1);
-    let kid = std::process::Command::new("/bin/mwprobe").arg("kid").env_clear().status();
-    check("an exec'd static child (another pid) is bound by the same guards", i64::from(matches!(&kid, Ok(s) if s.success())), 1);
-    let bad = std::process::Command::new("/bin/mwprobe").arg("kid").env("LD_PRELOAD", "/lib/evil.so").status();
-    check("a child exec with LD_PRELOAD is refused (EPERM)", i64::from(matches!(&bad, Err(e) if e.raw_os_error() == Some(1))), 1);
-    let (ok, err) = run_dynamic("/usr/bin/xz", "--version");
-    println!("MWPROBE xz (dynamic, needs liblzma.so.5): ok={ok} output={err}");
-    check("a dynamic child that needs a library besides libc cannot load it", i64::from(!ok), 1);
-    let (ok, _) = run_dynamic("/bin/busybox", "true");
-    check("a dynamic child that needs only libc still runs (known gap, pinned)", i64::from(ok), 1);
 
     // execve: the environment is checked before the call. LD_PRELOAD is refused; a clean environment execs us again.
     let cstr = |s: &str| {
@@ -259,8 +272,10 @@ fn main() {
     let argv = [a0.as_ptr() as u64, a1.as_ptr() as u64, a2.as_ptr() as u64, 0];
     let preload = cstr("LD_PRELOAD=/lib/evil.so");
     let bad_env = [preload.as_ptr() as u64, 0];
-    let refused = sc(nr::EXECVE, [path.as_ptr() as u64, argv.as_ptr() as u64, bad_env.as_ptr() as u64, 0]);
-    check("execve with LD_PRELOAD in the environment is refused", refused, EPERM);
+    if nodl {
+        let refused = sc(nr::EXECVE, [path.as_ptr() as u64, argv.as_ptr() as u64, bad_env.as_ptr() as u64, 0]);
+        check("execve with LD_PRELOAD in the environment is refused", refused, EPERM);
+    }
     let path_var = cstr("PATH=/bin");
     let good_env = [path_var.as_ptr() as u64, 0];
     // Success never returns: the new image prints the result. Getting here means the exec was refused.

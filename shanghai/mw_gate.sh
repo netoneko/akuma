@@ -1,5 +1,5 @@
 #!/bin/sh
-# Boot Shanghai with its sample middleware (and, as a control, without) under QEMU TCG, running
+# Boot Shanghai with its sample middleware (with and without the no-dynamic-loading feature, and as a control with neither) under QEMU TCG, running
 # shanghai/mwprobe/mwprobe.rs as init, and judge each run by the probe's own result line.
 #
 #   sh shanghai/mw_gate.sh [x86_64|aarch64|all]     (default: all)
@@ -73,17 +73,17 @@ stage() { # name target arch
   else cp "target/$2/release/shanghai" "$W/$1-$3"; fi
 }
 
-run_x86_64() { # name kernel want
-  export TX_KERNEL=$2 TX_DISK=$W/mw-x86_64.img TX_RUN=$W/run-x86_64-$1 TX_PORT=${MW_PORT:-2251} TX_SMP=$SMP TX_INIT="init=/bin/mwprobe"
+run_x86_64() { # name kernel want [initargs]
+  export TX_KERNEL=$2 TX_DISK=$W/mw-x86_64.img TX_RUN=$W/run-x86_64-$1 TX_PORT=${MW_PORT:-2251} TX_SMP=$SMP TX_INIT="init=/bin/mwprobe${4:+ initargs=$4}"
   python3 scripts/kvm/taoxichuan/tcg_rig.py boot fresh >/dev/null
   wait_result "$W/run-x86_64-$1/console.log"
   python3 scripts/kvm/taoxichuan/tcg_rig.py stop >/dev/null 2>&1 || true
   report "$1" x86_64 "$W/run-x86_64-$1/console.log" "$3"
 }
 
-run_aarch64() { # name kernel.bin want
+run_aarch64() { # name kernel.bin want [initargs]
   d=$W/run-aarch64-$1; rm -rf "$d"; mkdir -p "$d"; cp "$W/mw-aarch64.img" "$d/disk.img"; : > "$d/console.log"
-  cl="init=/bin/mwprobe epoch=$(date +%s)"; [ "$SMP" != 1 ] && cl="$cl smp=$SMP"
+  cl="init=/bin/mwprobe${4:+ initargs=$4} epoch=$(date +%s)"; [ "$SMP" != 1 ] && cl="$cl smp=$SMP"
   qemu-system-aarch64 -machine virt,gic-version=3 -accel tcg -cpu max -smp "$SMP" -m 1024 \
     -kernel "$2" -append "$cl" -nodefaults -no-reboot -display none -serial "file:$d/console.log" \
     -global virtio-mmio.force-legacy=false \
@@ -104,8 +104,13 @@ for arch in x86_64 aarch64; do
   stage plain "$tgt" "$arch"
   cargo build -p shanghai --features middleware --target "$tgt" --release
   stage mw "$tgt" "$arch"
+  cargo build -p shanghai --features no-dynamic-loading --target "$tgt" --release
+  stage nodl "$tgt" "$arch"
+  # Three kernels per machine: stock (the control), the sample table alone (the no-dynamic-loading guards must be ABSENT:
+  # they are a feature, off by default), and the sample table with --features no-dynamic-loading (initargs=nodl: they must be ON).
   "run_$arch" control "$W/plain-$arch" 'CONTROL PASS' || rc=1
   "run_$arch" middleware "$W/mw-$arch" 'PASS' || rc=1
+  "run_$arch" no-dynamic-loading "$W/nodl-$arch" 'PASS' nodl || rc=1
 done
 [ $rc -eq 0 ] && echo "MW GATE PASS ($WHICH, smp=$SMP)" || echo "MW GATE FAIL ($WHICH, smp=$SMP)"
 exit $rc

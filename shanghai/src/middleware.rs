@@ -11,7 +11,7 @@
 //! | `whoami`: writes the caller's pid to `*arg0` (or `-EFAULT`) | `fallback` | 1001 |
 //! | how many `getpid`s the `own` tier saw before / after the lock | `fallback` | 1002 / 1003 |
 //! | refuse `open("/mw-deny")` with `EACCES`; log any other `/mw-*` path | `kernel_pre` | `openat` |
-//! | no dynamic loading (file `PROT_EXEC` mmap, `mprotect(+X)`, `LD_*` in an `execve` env), see `nodl.rs` | `kernel_pre` | `mmap` / `mprotect` / `execve` |
+//! | with `--features no-dynamic-loading` only: no dynamic loading (file `PROT_EXEC` mmap, `mprotect(+X)`, `LD_*` in an `execve` env), see `nodl.rs` | `kernel_pre` | `mmap` / `mprotect` / `execve` |
 //! | `gettid() + 1000` (an error result is left alone) | `kernel_post` | `gettid` |
 //! | count `getpid`, outside the kernel lock (a split read-modify-write on the state, so a lost update shows) | `own_pre` / `own_post` | `getpid` |
 //! | publish the `own` state when a `getppid` passes; read it back | `own_post` / `fallback` | `getppid` / 1005 |
@@ -60,9 +60,13 @@ pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
     ],
     kernel_pre: &[
         Route::new(&[On::Call(Syscall::Openat)], open_guard),
-        // The "no dynamic loading" demo (`nodl.rs`): three guards on the calls a dynamic loader makes.
+        // The "no dynamic loading" demo (`nodl.rs`), only with `--features no-dynamic-loading`: three guards on the calls a
+        // dynamic loader makes.
+        #[cfg(feature = "no-dynamic-loading")]
         Route::new(&[On::Call(Syscall::Mmap)], crate::nodl::mmap_guard),
+        #[cfg(feature = "no-dynamic-loading")]
         Route::new(&[On::Call(Syscall::Mprotect)], crate::nodl::mprotect_guard),
+        #[cfg(feature = "no-dynamic-loading")]
         Route::new(&[On::Call(Syscall::Execve)], crate::nodl::exec_guard),
     ],
     // A result is a value or `-errno`: only add to a value.
