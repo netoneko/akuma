@@ -152,11 +152,14 @@ with an Ed25519 key (the gate uses OpenSSL 3: `openssl pkeyutl -sign -rawin`). S
 release artifacts, not the installed file, and apk's are RSA over the package, so they are not directly checkable here; minisign and
 signify are plain Ed25519 and would be the next sidecar formats.
 
-**Gate (`sh shanghai/mw_gate.sh all`, SMP=4, 2026-11-05):** 172 PASS lines, both machines: control 8, `middleware` 23,
-`no-dynamic-loading` 39, `no-dynamic-elf` 6, `signed-exec` 10 each. The ten signed cases: an allowlisted hash runs (S1); an unlisted
+**Gate (`sh shanghai/mw_gate.sh all`, SMP=4, 2026-11-05, after `ETXTBSY`):** 206 PASS lines, both machines: control 17, `middleware` 23,
+`no-dynamic-loading` 39, `no-dynamic-elf` 6, `signed-exec` 18 each (172 before `ETXTBSY` added the T cases to the control and signed kernels). The ten signed cases: an allowlisted hash runs (S1); an unlisted
 image, tampered bytes under a valid signature, a valid signature outside the key's scope, and the allowlisted bytes at another path are all
 refused (S2, S4, S5, S6); a signature under a scoped key runs (S3); a dynamic image, a file-backed executable mapping and `mprotect(+X)`
-are refused (S7, S8, S9); and a signed child that rewrites its own file keeps running (S10).
+are refused (S7, S8, S9); and a signed child that tries to rewrite its own file is refused with `ETXTBSY` and keeps running (S10). **S10 originally proved the
+map-from-checked-bytes claim** (the child's write landed; stock kernel: SIGSEGV, signed kernel: survived); once `ETXTBSY` made the write
+impossible that proof no longer runs, and `AllowFromImage`'s remaining job (the read-then-load path swap, a write that bypasses `write(2)`
+such as a writable shared mapping made before the exec) has no probe of its own. See `docs/archive/ETXTBSY_TEXT_BUSY.md`.
 
 **Costs and limits, stated.** One SHA-256 over the image on every exec (and an Ed25519 verify per matching key when the hash is not
 listed); not measured, and a cache by inode is not built. Signed images lose the shared file-page cache. A script run by a signed

@@ -156,11 +156,15 @@ pub fn bind_child_task<M: Proc>(tid: usize, pid: u32, root_pa: u64, is_thread: b
         TASK_OF.with_mut(|t| t[tid] = creator);
     } else {
         TASK_OF.with_mut(|t| t[tid] = tid + 1);
-        let layout = M::with_task(|t| t.layout.fork());
+        let (layout, text, interp) = M::with_task(|t| (t.layout.fork(), t.text.clone(), t.interp.clone()));
         M::with_task_slot(tid + 1, |ct| {
             ct.root_pa = root_pa;
             ct.layout = layout;
             ct.exit = None;
+            // The child runs the parent's image until it execs: it holds the same executable busy. (Assigning drops whatever a
+            // dead process left in a reused record.)
+            ct.text = text;
+            ct.interp = interp;
         });
     }
     Ok(())
@@ -208,6 +212,11 @@ pub fn bind_init<M: Proc>(path: &str, ti: &TaskImage) -> Option<usize> {
         safe_print!(160, "  [init] bind refused: {}\n", msg);
         return None;
     }
+    // The child record now holds init's executable pin (cloned from the boot record's by the bind); the boot record is not a process.
+    M::with_task(|t| {
+        t.text = akuma_primitives::TextPin::none();
+        t.interp = akuma_primitives::TextPin::none();
+    });
     // Parent 1: init is the boot's root of the tree (the pid floor is 2).
     if !akuma_exec::process::Process::register_adopted(1, 1, path, ti.root_pa as usize, ti.entry as usize, ti.sp as usize, tid) {
         safe_print!(128, "  [init] root view for the process table failed\n");
@@ -575,13 +584,18 @@ pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> 
         return Err(e(EFAULT));
     };
     let mut effective = loader::resolve_effective::<M>(&req.path);
+    // Each image is marked as being executed BEFORE its bytes are read (`ETXTBSY`), so the file cannot be rewritten between the read and
+    // the mark; the pin of the image that finally loads is installed in the task record below, the others (a script) drop here.
     let read = |p: &str| {
-        loader::read_image::<M>(p).map_err(|err| {
+        loader::read_image_pinned::<M>(p).map_err(|err| {
             safe_print!(192, "[exec] '{}': read failed ({:?})\n", p, err);
-            e(ENOENT)
+            match err {
+                loader::PinnedReadError::TableFull => e(ENOMEM),
+                loader::PinnedReadError::Read(_) => e(ENOENT),
+            }
         })
     };
-    let mut image = read(&effective)?;
+    let (mut image, mut text) = read(&effective)?;
     // `#!` scripts: the interpreter is loaded instead, with argv
     // `[interpreter, arg?, path as written, argv[1..]]` - one parser and one
     // argv rule with the AArch64 kernel (`akuma_exec::process::shebang_hop`).
@@ -595,7 +609,7 @@ pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> 
         prefix = akuma_exec::process::shebang_hop(interp, arg, &script_name, &prefix);
         script_name = String::from(interp);
         effective = loader::resolve_effective::<M>(&script_name);
-        image = read(&effective)?;
+        (image, text) = read(&effective)?;
     }
     if !prefix.is_empty() {
         prefix.extend(core::mem::take(&mut argv_s).into_iter().skip(1));
@@ -614,6 +628,7 @@ pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> 
         Err(loader::LoadError::Refused(no)) => return Err(e(no)),
         Err(loader::LoadError::NoMem) => return Err(e(ENOMEM)),
     };
+    loader::adopt_text::<M>(text);
     if let Some(p) = akuma_exec::process::current_process_shared() {
         let argv_bytes: Vec<Vec<u8>> = argv_s.iter().map(|a| a.clone().into_bytes()).collect();
         akuma_syscalls_glue::execve::commit(p, &effective, &argv_bytes);
@@ -714,6 +729,11 @@ static ZOMBIE_ROOT: BorrowCell<[(u32, u64); ZOMBIE_ROOTS]> = BorrowCell::new([(0
 /// exec'd image, or, never exec'd, the fork clone in its task record.
 /// Idempotent: the exit path and the purge hook both call it.
 fn zombie_root<M: Proc>(slot: usize, pid: u32) {
+    // The process no longer executes its image: the files it was running may be changed again (`ETXTBSY` lifts).
+    M::with_task_slot(task_of(slot), |t| {
+        t.text = akuma_primitives::TextPin::none();
+        t.interp = akuma_primitives::TextPin::none();
+    });
     let own = OWNED_ROOT.with_mut(|t| core::mem::replace(&mut t[slot], 0));
     let root = if own != 0 { own } else { M::record_root(task_of(slot)) };
     if root == 0 || ZOMBIE_ROOT.with(|z| z.iter().any(|&(p, _)| p == pid)) {

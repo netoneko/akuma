@@ -256,6 +256,16 @@ static CACHE_SLOTS_USED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(any(ext2_fs_cache, test))]
 static CACHE_SLOTS_CAP: AtomicUsize = AtomicUsize::new(0);
 
+/// `ETXTBSY`: a file that some process is executing may not have its data changed (`akuma_primitives::text_busy`). Asked at every
+/// place this filesystem writes a regular file's data or size, by inode, so a descriptor opened for writing before the `execve`
+/// is stopped as well as a fresh `open`. Unlinking and renaming over the file stay allowed; the running image keeps its inode.
+fn deny_if_text_busy(fs: u32, inode_num: u32) -> Result<(), FsError> {
+    if akuma_primitives::text_busy::is_busy(fs, inode_num) { Err(FsError::TextBusy) } else { Ok(()) }
+}
+
+/// The next [`Filesystem::identity`]: starts at 1 so `0` stays "no identity".
+static NEXT_FS_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
 /// Set the upper bound (bytes) on the ext2 block cache backing store.
 ///
 /// The kernel derives this from detected RAM — `min(RAM/8, 128 MB)` as of
@@ -1512,6 +1522,8 @@ pub struct Ext2Filesystem<B: BlockDevice> {
     block_cache: Spinlock<BlockCache>,
     /// Inodes unlinked while a mapping still pinned them — see [`DeferredFrees`].
     deferred: DeferredFrees,
+    /// This instance's [`Filesystem::identity`]: unique, non-zero, assigned at construction.
+    id: u32,
     /// Directory-tree walks and block-cache accesses this instance has done, for
     /// [`Self::work_counters`].
     ///
@@ -1667,6 +1679,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             #[cfg(not(kernel_profile_extreme))]
             block_cache: Spinlock::new(make_block_cache(block_size, cache_cap_bytes)),
             deferred: DeferredFrees::new(),
+            id: NEXT_FS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             #[cfg(test)]
             counters: WorkCounters::default(),
         })
@@ -3799,6 +3812,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         if inode.type_perms & 0x8000 == 0 {
             return Err(FsError::NotAFile);
         }
+        deny_if_text_busy(self.id, inode_num)?;
 
         let current_size = inode.file_size();
         let block_size = state.block_size as u64;
@@ -3888,6 +3902,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         if (inode.type_perms & 0xF000) != S_IFREG {
             return Err(FsError::NotAFile);
         }
+        deny_if_text_busy(self.id, inode_num)?;
 
         let block_size = state.block_size as u64;
         let first_block = offset / block_size;
@@ -3924,6 +3939,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         if (inode.type_perms & 0xF000) == S_IFDIR {
             return Err(FsError::NotAFile);
         }
+        deny_if_text_busy(self.id, inode_num)?;
 
         // `None` is `O_APPEND`: the offset is the size *as of this lock hold*.
         let offset = offset.unwrap_or_else(|| inode.file_size() as usize);
@@ -3981,6 +3997,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 // ============================================================================
 
 impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
+    fn identity(&self) -> u32 {
+        self.id
+    }
+
     fn name(&self) -> &str {
         "ext2"
     }
@@ -4060,6 +4080,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
                 if (inode.type_perms & 0xF000) == S_IFDIR {
                     return Err(FsError::NotAFile);
                 }
+                deny_if_text_busy(self.id, inode_num)?;
 
                 self.truncate_inode(&mut state, &mut inode)?;
                 self.write_inode_data(&mut state, inode_num, &mut inode, data)?;

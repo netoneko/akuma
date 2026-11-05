@@ -1574,11 +1574,12 @@ fn run_init() -> ! {
     console::puts(": init spawn -- init=");
     console::puts(path);
     console::puts("\n");
-    let Ok(image) = root_fs().read_file(path) else {
+    // Marked as being executed before its bytes are read (`ETXTBSY`); installed in the task record once it loads.
+    let Ok((image, text)) = akuma_tokio_kernel_core::loader::read_image_pinned::<lazy::Amd64>(path) else {
         console::puts("  init: NOT on the mounted root\n");
         halt();
     };
-    spawn(&prog, &image)
+    spawn(&prog, &image, text)
 }
 
 /// Init exited (`child::start_init_thread` reports it from the parked boot
@@ -1623,7 +1624,7 @@ pub use akuma_tokio_kernel_core::loader::TaskImage;
 
 /// Load the image, build the task's address space, and cross. Never returns:
 /// the task ends in the dispatcher's `exit` or the trap handler's `[Fault]`.
-fn spawn(p: &Prog, image: &[u8]) -> ! {
+fn spawn(p: &Prog, image: &[u8], text: akuma_primitives::TextPin) -> ! {
     let path = p.path_str();
     if image.len() < 4 || image[..4] != [0x7f, b'E', b'L', b'F'] {
         akuma_primitives::safe_print!(160, "  init: ELF refused: bad magic\n");
@@ -1648,6 +1649,7 @@ fn spawn(p: &Prog, image: &[u8]) -> ! {
         akuma_primitives::safe_print!(160, "  init: task load failed\n");
         halt();
     };
+    akuma_tokio_kernel_core::loader::adopt_text::<lazy::Amd64>(text);
 
     // Arm the syscall path, then cross. `mov cr3` is the write the ctlreg
     // crate deliberately does not own (reads safe, writes unsafe at the call

@@ -616,6 +616,20 @@ pub fn open_file_ids(path: &str) -> Option<(u32, u32)> {
     resolve_file_id(path)
 }
 
+/// `(filesystem identity, inode)` of the file at `path`: the key `akuma_primitives::text_busy` uses.
+///
+/// The inode number alone repeats across mounts. `None` for a path with no inode, or on a filesystem with no identity (procfs, the memory
+/// filesystem), or a missing file.
+#[must_use]
+pub fn file_identity(path: &str) -> Option<(u32, u32)> {
+    let (mount, inode) = open_file_ids(path)?;
+    let fs = fs_for_mount_id(mount)?;
+    match fs.identity() {
+        0 => None,
+        id => Some((id, inode)),
+    }
+}
+
 /// The filesystem an fd (or a mapping) captured, found by the mount id it stored.
 ///
 /// Searched in the same order [`resolve_mount`] searches for a path — spawn

@@ -60,13 +60,25 @@ pub struct Task {
     pub layout: UserLayout,
     /// The exit code, once captured.
     pub exit: Option<u64>,
+    /// The executable this task is running: while it is held the filesystem refuses to change that file's data (`ETXTBSY`,
+    /// `akuma_primitives::text_busy`). Taken before the image is read, replaced on `execve`, cloned for a fork child, shared by threads
+    /// (they share the record), and released when the process dies ([`crate::proc`]'s `zombie_root`).
+    pub text: akuma_primitives::TextPin,
+    /// The dynamic loader of a dynamically linked image, held the same way.
+    pub interp: akuma_primitives::TextPin,
 }
 
 impl Task {
     /// An empty record.
     #[must_use]
     pub const fn new() -> Self {
-        Self { root_pa: 0, layout: UserLayout::new(MMAP_BASE, MMAP_SLAB), exit: None }
+        Self {
+            root_pa: 0,
+            layout: UserLayout::new(MMAP_BASE, MMAP_SLAB),
+            exit: None,
+            text: akuma_primitives::TextPin::none(),
+            interp: akuma_primitives::TextPin::none(),
+        }
     }
 }
 

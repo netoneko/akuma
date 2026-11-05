@@ -33,6 +33,8 @@ pub enum FsError {
     /// A `link` would push an inode past the filesystem's link-count limit
     /// (`EMLINK`).
     TooManyLinks,
+    /// The file is being executed and its data may not be changed (`ETXTBSY`). Unlink and rename over it stay allowed.
+    TextBusy,
 }
 
 impl core::fmt::Display for FsError {
@@ -59,6 +61,7 @@ impl core::fmt::Display for FsError {
             Self::NotSupported => "Operation not supported",
             Self::CrossDevice => "Invalid cross-device link",
             Self::TooManyLinks => "Too many links",
+            Self::TextBusy => "Text file busy",
         };
         f.write_str(msg)
     }
@@ -322,6 +325,14 @@ pub trait Filesystem: Send + Sync {
 
     fn resolve_inode(&self, _path: &str) -> Result<u32, FsError> {
         Err(FsError::NotSupported)
+    }
+
+    /// A number that names this filesystem *instance*, unique for the life of the kernel and never `0`; `0` (the default) means "this
+    /// filesystem has no stable inode numbers to key on" (procfs, the memory filesystem). `akuma_primitives::text_busy` keys the
+    /// "being executed" mark on `(identity, inode)` because inode numbers repeat across mounts: a mark on inode 12 of one ext2 must not
+    /// make inode 12 of another read as busy.
+    fn identity(&self) -> u32 {
+        0
     }
 
     fn read_at_by_inode(

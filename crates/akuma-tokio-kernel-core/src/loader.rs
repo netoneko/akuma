@@ -85,6 +85,35 @@ pub fn read_image<M: lazy::Kernel>(path: &str) -> Result<Vec<u8>, akuma_vfs::FsE
     Ok(data)
 }
 
+/// Why [`read_image_pinned`] did not return an image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinnedReadError {
+    /// The file could not be read.
+    Read(akuma_vfs::FsError),
+    /// Too many distinct executables are running at once to mark another (`akuma_primitives::text_busy::SLOTS`).
+    TableFull,
+}
+
+/// [`read_image`], with the file marked as being executed **before** its bytes are read, so there is no moment between the read and the
+/// mark in which the file can be rewritten: from here until the returned pin is dropped the filesystem refuses to change its data
+/// (`ETXTBSY`). The caller installs the pin in the task record with [`adopt_text`] once the image is loaded.
+///
+/// # Errors
+/// [`PinnedReadError`]. A path with no inode (`/proc` files, a built-in) is read without a pin (inert).
+pub fn read_image_pinned<M: lazy::Kernel>(path: &str) -> Result<(Vec<u8>, akuma_primitives::TextPin), PinnedReadError> {
+    let fs = M::root_fs();
+    let pin = match fs.resolve_inode(path) {
+        Ok(ino) => akuma_primitives::TextPin::try_new(fs.identity(), ino).ok_or(PinnedReadError::TableFull)?,
+        Err(_) => akuma_primitives::TextPin::none(),
+    };
+    read_image::<M>(path).map(|image| (image, pin)).map_err(PinnedReadError::Read)
+}
+
+/// The image just loaded is the running task's executable: hold `pin` for as long as it runs (the old one is released).
+pub fn adopt_text<M: Mm>(pin: akuma_primitives::TextPin) {
+    M::with_task(|t| t.text = pin);
+}
+
 /// Map one placed `PT_LOAD` into `root`. Returns the page-rounded span, `None`
 /// when a frame or a mapping failed or the segment reaches past the user half.
 ///
@@ -284,6 +313,8 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
     M::with_task(|t| {
         t.exit = None;
         t.layout.reset_for_exec();
+        // The previous image's loader is not this one's; a dynamic image takes its own pin below.
+        t.interp = akuma_primitives::TextPin::none();
     });
     let root = tree::new_root::<M>()?;
     M::with_task(|t| t.root_pa = root);
@@ -300,10 +331,11 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
         Ok(Some(ipath)) => {
             let ipath = core::str::from_utf8(ipath).ok()?;
             let eff = resolve_effective::<M>(ipath);
-            let Ok(ldso) = read_image::<M>(&eff) else {
+            let Ok((ldso, ipin)) = read_image_pinned::<M>(&eff) else {
                 safe_print!(160, "  exec: PT_INTERP unreadable: {}\n", eff.as_str());
                 return None;
             };
+            M::with_task(|t| t.interp = ipin);
             let mut isegs = [NO_SEG; 8];
             let Ok(n) = akuma_elf_exec::load_segments(&ldso, akuma_elf_exec::INTERP_BASE, &mut isegs) else {
                 safe_print!(96, "  exec: interpreter refused by the exec core\n");

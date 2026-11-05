@@ -3640,3 +3640,80 @@ fn a_file_past_4_gib_uses_the_triple_indirect_map_and_its_full_size() {
     fs.sync().unwrap();
     fsck();
 }
+
+/// `ETXTBSY`: while a process is executing a file, every way of changing its data is refused (by path and by inode, so a
+/// descriptor opened for writing before the exec is stopped too), and the refusal lifts when the last executor is gone.
+#[test]
+fn a_file_being_executed_cannot_have_its_data_changed() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/bin-x", b"ORIGINAL CODE").unwrap();
+    let inode = fs.resolve_inode("/bin-x").unwrap();
+    let text = akuma_primitives::TextPin::try_new(fs.identity(), inode).unwrap();
+
+    assert_eq!(fs.write_file("/bin-x", b"EVIL"), Err(akuma_vfs::FsError::TextBusy), "open(O_TRUNC) + write");
+    assert_eq!(fs.write_at("/bin-x", 0, b"EVIL"), Err(akuma_vfs::FsError::TextBusy), "write by path");
+    assert_eq!(fs.write_at_by_inode(inode, 0, b"EVIL"), Err(akuma_vfs::FsError::TextBusy), "write through an fd opened earlier");
+    assert_eq!(fs.truncate("/bin-x", 0), Err(akuma_vfs::FsError::TextBusy), "truncate by path");
+    assert_eq!(fs.truncate_by_inode(inode, 0), Err(akuma_vfs::FsError::TextBusy), "ftruncate");
+    assert_eq!(fs.fallocate_by_inode(inode, 0, 0, 4096), Err(akuma_vfs::FsError::TextBusy), "fallocate");
+    assert_eq!(fs.read_file("/bin-x").unwrap(), b"ORIGINAL CODE", "none of it changed a byte");
+
+    // Another file is not affected.
+    fs.write_file("/other", b"fine").unwrap();
+    fs.write_at("/other", 0, b"FINE").unwrap();
+
+    drop(text);
+    fs.write_at("/bin-x", 0, b"NEW ").unwrap();
+    assert_eq!(fs.read_file("/bin-x").unwrap(), b"NEW INAL CODE");
+}
+
+/// Linux lets a package manager replace a running binary by unlinking it or renaming a new file over it; the process keeps the old
+/// inode. That stays true: only changing the data in place is refused.
+#[test]
+fn a_file_being_executed_can_still_be_unlinked_or_renamed_over() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/run", b"RUNNING IMAGE").unwrap();
+    let inode = fs.resolve_inode("/run").unwrap();
+    let text = akuma_primitives::TextPin::try_new(fs.identity(), inode).unwrap();
+
+    // Rename a new file over it: the name now means the new file, and the old inode's data is intact for the process.
+    fs.write_file("/run.new", b"UPGRADED").unwrap();
+    fs.rename("/run.new", "/run").unwrap();
+    assert_eq!(fs.read_file("/run").unwrap(), b"UPGRADED");
+    assert_eq!(fs.read_at_by_inode(inode, 0, &mut [0u8; 13]).unwrap(), 13);
+    let mut old = [0u8; 13];
+    fs.read_at_by_inode(inode, 0, &mut old).unwrap();
+    assert_eq!(&old, b"RUNNING IMAGE", "the executing image's inode kept its bytes");
+
+    // Unlink the executing file's last name: allowed, and the data still reads (the text pin holds the inode).
+    fs.write_file("/gone", b"STILL RUNS").unwrap();
+    let gone = fs.resolve_inode("/gone").unwrap();
+    let t2 = akuma_primitives::TextPin::try_new(fs.identity(), gone).unwrap();
+    fs.remove_file("/gone").unwrap();
+    let mut buf = [0u8; 10];
+    fs.read_at_by_inode(gone, 0, &mut buf).unwrap();
+    assert_eq!(&buf, b"STILL RUNS");
+    drop((text, t2));
+}
+
+/// Two filesystems number their inodes alike. A mark on one must not make the other's same-numbered file busy (a test run caught the
+/// table when it was keyed on the inode number alone).
+#[test]
+fn a_busy_inode_on_one_filesystem_does_not_block_the_same_number_on_another() {
+    let _serial = pin_test_serial();
+    let a = mount_empty();
+    let b = mount_empty();
+    assert_ne!(a.identity(), 0);
+    assert_ne!(a.identity(), b.identity(), "each instance has its own identity");
+    a.write_file("/prog", b"A").unwrap();
+    b.write_file("/prog", b"B").unwrap();
+    let (ia, ib) = (a.resolve_inode("/prog").unwrap(), b.resolve_inode("/prog").unwrap());
+    assert_eq!(ia, ib, "the premise: the same inode number on both");
+    let text = akuma_primitives::TextPin::try_new(a.identity(), ia).unwrap();
+    assert_eq!(a.write_at("/prog", 0, b"X"), Err(akuma_vfs::FsError::TextBusy));
+    b.write_at("/prog", 0, b"X").unwrap();
+    assert_eq!(b.read_file("/prog").unwrap(), b"X");
+    drop(text);
+}

@@ -143,6 +143,57 @@ fn run_dynamic(path: &str, arg: &str) -> (bool, String) {
     }
 }
 
+const ETXTBSY: i32 = 26;
+
+/// `ETXTBSY`: a file some process is executing cannot have its data changed, by any route; unlinking and renaming over it still work,
+/// and the refusal lifts when the process is gone. Runs `/bin/signed` as a child that waits on its stdin. Destroys `/bin/signed`
+/// (the last step renames another file over it), so it runs after everything else that needs the original.
+fn txtbusy_cycle(check: &dyn Fn(&str, i64, i64)) {
+    use std::os::unix::fs::FileExt;
+    use std::process::Stdio;
+    let path = "/bin/signed";
+    let raw = |e: std::io::Error| e.raw_os_error();
+    let ok = |b: bool| i64::from(b);
+    // A descriptor opened for writing BEFORE the program runs: Linux would refuse the exec; here the writes through it are refused.
+    let early = std::fs::OpenOptions::new().write(true).open(path);
+    check("T0 a file nobody is executing can be opened for writing", ok(early.is_ok()), 1);
+    let Ok(mut early) = early else { return };
+    let spawn = || std::process::Command::new(path).arg("waitstdin").stdin(Stdio::piped()).stdout(Stdio::piped()).env_clear().spawn();
+    let Ok(mut child) = spawn() else {
+        check("T1 the executable could be started", 0, 1);
+        return;
+    };
+    check("T1 a running executable cannot be opened for writing (ETXTBSY)", ok(std::fs::OpenOptions::new().write(true).open(path).map_err(raw).err() == Some(Some(ETXTBSY))), 1);
+    check("T2 a descriptor opened for writing before the exec is stopped too (ETXTBSY)", ok(early.write_all_at(b"x", 0).map_err(raw).err() == Some(Some(ETXTBSY))), 1);
+    // Observation, not an assertion: Linux leaves a descriptor's offset alone when a write fails; this kernel reserves the offset
+    // before writing (`sys_write`), so a plain `write(2)` that was refused may have moved it.
+    let before = std::io::Seek::stream_position(&mut early).ok();
+    let plain = std::io::Write::write(&mut early, b"x").map_err(raw);
+    println!("MWPROBE note: plain write on a busy file -> {plain:?}; offset {before:?} -> {:?}", std::io::Seek::stream_position(&mut early).ok());
+    let _ = std::io::Seek::seek(&mut early, std::io::SeekFrom::Start(0));
+    check("T3 truncating a running executable is refused (ETXTBSY)", ok(early.set_len(0).map_err(raw).err() == Some(Some(ETXTBSY))), 1);
+    check("T3b O_TRUNC is refused too (ETXTBSY)", ok(std::fs::OpenOptions::new().write(true).truncate(true).open(path).map_err(raw).err() == Some(Some(ETXTBSY))), 1);
+    // The file reads exactly as it did.
+    check("T4 the running executable's bytes are untouched", ok(std::fs::read(path).map(|b| b.starts_with(b"\x7fELF")).unwrap_or(false)), 1);
+    // Releasing: close its stdin, let it exit.
+    drop(child.stdin.take());
+    let _ = child.wait();
+    check("T5 once the process has exited the file can be written again (the pin is released)", ok(early.write_all_at(&[0x7f], 0).is_ok()), 1);
+    // And replacing a running binary by renaming another file over it is still allowed.
+    let mut child = match spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("MWPROBE T6 second spawn failed: {e}");
+            check("T6 the executable could be started a second time", 0, 1);
+            return;
+        }
+    };
+    let _ = std::fs::write("/tmp/replacement", b"new file");
+    check("T6 renaming a new file over a running executable is allowed", ok(std::fs::rename("/tmp/replacement", path).is_ok()), 1);
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
 fn open(path: &str) -> i64 {
     let mut c = path.as_bytes().to_vec();
     c.push(0);
@@ -165,6 +216,7 @@ fn main() {
         use std::io::{Seek, SeekFrom, Write};
         let path = args.get(2).map_or("/bin/signed", String::as_str);
         let len = std::fs::metadata(path).map_or(0, |m| m.len());
+        let mut open_errno = None;
         let wrote = match std::fs::OpenOptions::new().write(true).open(path) {
             Ok(mut f) => {
                 let zeros = [0u8; 65536];
@@ -180,12 +232,22 @@ fn main() {
                 let _ = f.sync_all();
                 at >= len
             }
-            Err(_) => false,
+            Err(e) => {
+                open_errno = e.raw_os_error();
+                false
+            }
         };
         let mut v: Vec<String> = (0..3000u64).map(|i| format!("{:x}", i.wrapping_mul(2_654_435_761))).collect();
         v.sort();
         let m: std::collections::HashMap<String, usize> = v.iter().cloned().zip(0..).collect();
-        println!("MWPROBE selfclobber survived wrote={wrote} items={}", v.len() + m.len());
+        println!("MWPROBE selfclobber survived wrote={wrote} open_errno={open_errno:?} items={}", v.len() + m.len());
+        return;
+    }
+    // Stays alive until its stdin closes, so the parent can try to change the file it is running.
+    if args.get(1).map(String::as_str) == Some("waitstdin") {
+        let mut sink = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+        println!("MWPROBE waitstdin done");
         return;
     }
     if args.get(1).map(String::as_str) == Some("noop") {
@@ -234,7 +296,9 @@ fn main() {
             Ok(o) => format!("status={:?} stdout={:?}", o.status, text.trim()),
             Err(e) => format!("spawn failed: {e}"),
         });
-        check("S10 a signed child that rewrites its own file keeps running (mapped from the verified bytes)", i64::from(text.contains("survived wrote=true")), 1);
+        // With ETXTBSY the child's own write is refused (the file it runs cannot be changed), so it keeps running either way.
+        check("S10 a signed child cannot rewrite the file it runs (ETXTBSY) and keeps running", i64::from(text.contains("survived wrote=false open_errno=Some(26)")), 1);
+        txtbusy_cycle(&check);
         println!("MWPROBE RESULT SIGNED {}", if fails.get() == 0 { "PASS" } else { "FAIL" });
         return;
     }
@@ -287,11 +351,10 @@ fn main() {
         check("a dynamic child that needs only libc runs (stock)", i64::from(ok), 1);
         // For contrast with the signed kernel, and not an assertion: the same self-rewriting child under a kernel that maps lazily from the file.
         let out = std::process::Command::new("/bin/signed").args(["selfclobber", "/bin/signed"]).env_clear().output();
-        let how = match &out {
-            Ok(o) => format!("status={:?} stdout={:?}", o.status, String::from_utf8_lossy(&o.stdout).trim()),
-            Err(e) => format!("spawn failed: {e}"),
-        };
-        println!("MWPROBE selfclobber (stock, lazy): {how}");
+        let text = out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        println!("MWPROBE selfclobber (stock): {}", text.trim());
+        check("X1 a stock kernel's child cannot rewrite the file it runs either (ETXTBSY) and keeps running", i64::from(text.contains("survived wrote=false open_errno=Some(26)")), 1);
+        txtbusy_cycle(&check);
         println!("MWPROBE RESULT CONTROL {}", if fails.get() == 0 { "PASS" } else { "FAIL" });
         return;
     }

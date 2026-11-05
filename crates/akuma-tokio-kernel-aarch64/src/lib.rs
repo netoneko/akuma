@@ -321,7 +321,8 @@ fn run_init(cmdline: &str) -> ! {
     prog.parse(cmdline);
     let path = prog.path_str();
     safe_print!(160, "{}: init spawn -- init={}\n", akuma_tokio_kernel_core::identity().name, path);
-    let Ok(image) = akuma_tokio_kernel_core::loader::read_image::<mm::Aarch64>(path) else {
+    // Marked as being executed before its bytes are read (`ETXTBSY`); installed in the task record once it loads.
+    let Ok((image, text)) = akuma_tokio_kernel_core::loader::read_image_pinned::<mm::Aarch64>(path) else {
         safe_print!(160, "  init: {} is not on the root\n", path);
         power_off();
     };
@@ -343,6 +344,7 @@ fn run_init(cmdline: &str) -> ! {
         safe_print!(96, "  init: task load failed\n");
         power_off();
     };
+    akuma_tokio_kernel_core::loader::adopt_text::<mm::Aarch64>(text);
     drop(image);
     proc::start_init(path, &ti)
 }

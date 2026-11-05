@@ -154,6 +154,7 @@ pub fn fs_error_to_errno(e: akuma_vfs_glue::FsError) -> u64 {
         FsError::TooManyOpenFiles => EMFILE,
         FsError::CrossDevice => EXDEV,
         FsError::TooManyLinks => EMLINK,
+        FsError::TextBusy => ETXTBSY,
         _ => EIO,
     }
 }
@@ -2227,6 +2228,21 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
                 akuma_primitives::safe_print!(128, "[syscall] openat({:?}): write open of directory -> EISDIR\n", path);
             }
             return Err(EISDIR);
+        }
+
+        // Linux (`deny_write_access`): a file some process is executing cannot be opened for writing or truncated. The filesystem refuses
+        // the data change itself (`akuma_primitives::text_busy`, which also stops a descriptor opened BEFORE the exec); this is the
+        // `open(2)` half, so the error comes from the call Linux gives it at, and `O_TRUNC` does not report success having done nothing.
+        // Keyed on `(filesystem identity, inode)`, so a second mount's file with the same inode number is not affected.
+        if file_existed
+            && flags
+                & (akuma_exec::process::open_flags::O_WRONLY
+                    | akuma_exec::process::open_flags::O_RDWR
+                    | akuma_exec::process::open_flags::O_TRUNC)
+                != 0
+            && akuma_vfs_glue::file_identity(&path).is_some_and(|(fs, inode)| akuma_primitives::text_busy::is_busy(fs, inode))
+        {
+            return Err(ETXTBSY);
         }
 
         if !file_existed && (flags & akuma_exec::process::open_flags::O_CREAT != 0) {

@@ -213,3 +213,10 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   (the `#!` case failed with ENOEXEC); the image is 96 MB now and `stage` replaces its target. Not built: the label, minisign/signify sidecars,
   a hash cache by inode, compiled-in keys. Not measured: the cost of hashing on every exec. Design and limits: `shanghai/MIDDLEWARE_COMPOSITION.md`.
 
+- **`ETXTBSY` and a big-lock deadlock found on the way** (2026-11-05, the owner: close the write-after-verify gap in every kernel). The
+  signing proof (a child rewriting its own file) is now answered by the filesystem: `docs/archive/ETXTBSY_TEXT_BUSY.md` (tokio kernels
+  done; the Akuma main kernels are not). Adding it exposed a rare amd64 wedge in the tokio kernels' big lock, root-caused from a wedged
+  guest's registers and a per-ticket log and fixed in `bkl::enter` (a tick landing during a wait queued its own `enter` behind the suspended
+  wait): `docs/archive/TAOXICHUAN_BKL_NESTED_TICKET_DEADLOCK.md`. **Result after both, both machines at SMP=4: `MW GATE PASS`, 206 PASS
+  lines** (control 17, `middleware` 23, `no-dynamic-loading` 39, `no-dynamic-elf` 6, `signed-exec` 18, each x2).
+

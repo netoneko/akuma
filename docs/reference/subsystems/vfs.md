@@ -270,6 +270,11 @@ umount2".
   `/bin/linkprobe` (23 checks, Linux-identical).
 - **Ownership** (`Metadata.{uid,gid}`, `Filesystem::chown`, ids above 65535 in
   `osd2`): [`permissions.md`](permissions.md).
+- **A file being executed cannot have its data changed (`ETXTBSY`).** `akuma-ext2` refuses every write, truncate and fallocate of an inode
+  that `akuma_primitives::text_busy` marks busy, by `(Filesystem::identity, inode)`, so a descriptor opened for writing before the exec is stopped too; `openat`
+  refuses `O_WRONLY`/`O_RDWR`/`O_TRUNC` on it. Unlink and rename-over stay allowed. A process holds the mark (`TextPin`) from before its
+  image is read until it exits. **Only the tokio kernels (Shanghai, Taoxichuan) take the pin; the Akuma main kernels do not yet**, so
+  there nothing is ever busy: [`../../archive/ETXTBSY_TEXT_BUSY.md`](../../archive/ETXTBSY_TEXT_BUSY.md).
 
 ## procfs
 

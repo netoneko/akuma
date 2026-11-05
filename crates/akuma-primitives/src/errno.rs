@@ -104,6 +104,7 @@ errno_table! {
     EINVAL = 22;
     EMFILE = 24;
     ENOTTY = 25;
+    ETXTBSY = 26;
     ENOSPC = 28;
     ESPIPE = 29;
     EROFS = 30;
@@ -227,6 +228,7 @@ mod tests {
             ("EXDEV", EXDEV, 18),
             ("EINVAL", EINVAL, 22),
             ("EMFILE", EMFILE, 24),
+            ("ETXTBSY", ETXTBSY, 26),
             ("EADDRINUSE", EADDRINUSE, 98),
             ("ETIMEDOUT", ETIMEDOUT, 110),
             ("EINPROGRESS", EINPROGRESS, 115),
