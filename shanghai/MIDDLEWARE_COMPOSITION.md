@@ -105,5 +105,20 @@ and off by default, no runtime switches.
   NUL-terminated string at `cmdline_paddr`). The kept line is now 2048 bytes and a longer one is refused whole
   (`StartInfo::cmdline_complete`), never truncated. Still unchecked: whether QEMU or Firecracker cap the line before the kernel
   sees it.
+- **Time of check (investigated 2026-11-05): signing the image buffer is not enough.** `load_task` is handed the whole file as a
+  `&[u8]` (read once, so verifying *that* is race-free), but `place_segment` maps every whole-page segment page as a **lazy file
+  record named by inode**, filled from the file at fault time; only the boundary pages are copied from the buffer. The inode pin
+  (`InodePin`) stops the inode being *freed and reused*, not being *written*, and there is no `ETXTBSY` in the tree, so a file
+  rewritten between verification and fault-in runs unverified bytes (and `akuma-fpcache` shares the faulted page across
+  processes). Options, cheapest first: (a) the verdict carries "map from the verified buffer": the loader passes no inode to
+  `place_segment`, every page is eager from the bytes that were hashed (costs the shared-page cache and RAM for signed images);
+  (b) text-busy: refuse a write-open/truncate of an inode that has an exec pin (Linux's `ETXTBSY`; a VFS change in ext2, whose
+  `is_pinned` check already exists); (c) per-page hashes verified at fault time (fs-verity style; much larger). **(a) is the
+  smallest and it keeps the policy honest; it needs `ExecVerdict::Allow` to say so.** Not built.
+- **Crypto (investigated 2026-11-05): nothing to write.** `akuma-ssh-crypto` is a wrapper over RustCrypto's `ed25519-dalek` and
+  `sha2`, so there is no hand-rolled primitive to lift. `crates/akuma-ed25519` is the kernel's one door to it (verify only,
+  `verify_strict`, no allocation, RFC 8032 vectors 1 and 2 pinned; builds for both `*-unknown-none` targets). Pure Ed25519 signs the
+  message itself, so the signature covers the file bytes directly and no separate hash step is needed. Cargo warns that
+  `curve25519-dalek` 4.1.3 and `sha2` 0.10.9 contain code a future Rust will reject; theirs, not ours, to watch.
 - **Trust:** a key on the command line is chosen by whoever writes the line (VMM or bootloader). Compiled-in keys are the
   strong mode; command-line keys are a convenience.

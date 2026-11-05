@@ -193,3 +193,9 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
   table**: one table per kernel, so the kernel's table names them and a kernel composing several crates writes that composition itself.
   Six host tests pin the policy and the guard (fail-closed on an unreadable pointer, an unreadable envp and a list over 512 entries),
   which only the gate covered before; they needed `KernelCtx::for_test` (hidden, builds a context over a `Machine`).
+
+- **Signing groundwork** (2026-11-05, the owner: a fresh crate for signed binaries, tackling the checksum). Two findings recorded in
+  `shanghai/MIDDLEWARE_COMPOSITION.md`: lazy file-backed segment pages are read from the inode at fault time, so verifying the image
+  buffer does not cover them and the pin does not stop an in-place write (the smallest fix is a verdict that makes the loader map a
+  signed image from the verified buffer); and the crypto is RustCrypto's, reached through the new `crates/akuma-ed25519` (verify
+  only, strict, RFC 8032 vectors). Nothing is signed or checked at exec yet.

@@ -10,6 +10,7 @@
     "crates/akuma-dmesg",
     "crates/akuma-dns",
     "crates/akuma-dwi2c",
+    "crates/akuma-ed25519",
     "crates/akuma-elf",
     "crates/akuma-elf-exec",
     "crates/akuma-exec",
