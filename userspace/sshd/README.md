@@ -183,3 +183,9 @@ Only logic that needs no syscalls can live in the lib target — see
 | [`docs/CLIENT_REAL_SERVER_INTEROP_FIX.md`](docs/CLIENT_REAL_SERVER_INTEROP_FIX.md) | `ssh` client vs a real server: unhandled interleaved `GLOBAL_REQUEST`/`WINDOW_ADJUST` |
 | [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | Known gaps |
 | [`docs/MIGRATION_SUMMARY.md`](docs/MIGRATION_SUMMARY.md) | History of the kernel → userspace port |
+
+## Host keys: `-y` and what is never retried
+
+`ssh -y ...` (or `SSH_ACCEPT_NEW_HOSTKEY=1`) records a host key seen for the first time without asking. A **changed** key is always refused.
+Answers are not faults: declining the prompt, a changed host key, a bad host-key signature and a refused login end the run at once
+(`ClientError::Fatal`); only transport failures go through the auto-reconnect loop (`SSH_RECONNECT_ATTEMPTS`, `SSH_AUTO_RECONNECT=0`).

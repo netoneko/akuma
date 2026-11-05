@@ -449,3 +449,13 @@ Also: `/dev/kvm` (Firecracker node) is present on this boot — Firecracker reac
 path uses `/dev/kvm0`. Not run further; Firecracker-on-Akuma has no network, so no ssh.
 **GLM-4.7-flash smoke:** goose (native ollama provider, Mac ollama over LAN) ran `echo hello-from-glm` and answered DONE on the ryzen.
 **Next:** Akuma trials (goose/infinity × qwen3:4b / gemma4:e4b / glm-4.7-flash) against this setup.
+
+### Update 10b — ssh `-y`, no retry on an answer; first Akuma trial (GLM) was a model give-up
+
+- Akuma `ssh`: `-y` / `SSH_ACCEPT_NEW_HOSTKEY=1` accepts a new host key; **declining (`no`), a changed key, a bad host-key signature and a refused login are
+  now `ClientError::Fatal`: returned at once.** Before, every error went through the 10-attempt reconnect loop, so `no` re-asked the question up to ten
+  times and a refused key retried five-plus times (seen: `publickey authentication failed … reconnecting in 10s (attempt 5/10)`). Checked on the ryzen:
+  `echo no | ssh …` exits immediately; `-y` records and proceeds.
+- Trial `glm-goose-1` (goose + glm-4.7-flash, Akuma host, 75 s): **not a pass, a model give-up.** `install.sh check` printed `qemu-system-x86_64: MISSING`
+  and `firecracker: MISSING` (irrelevant for `--vmm akuma`), GLM read them as blockers and stopped ("missing tools: cargo, qemu, firecracker"). The
+  check report now says `not needed for --vmm akuma` for tools the chosen path does not use. Rerun pending.

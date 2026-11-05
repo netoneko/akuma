@@ -239,14 +239,14 @@ if [ "$CMD" = check ]; then
 	{
 		echo "git:        $(command -v git || echo MISSING)"
 		echo "curl:       $(command -v curl || echo MISSING)"
-		echo "cargo:      $(command -v cargo || echo MISSING)"
+		if [ -n "$KERNEL_OVERRIDE" ] && [ -n "$SSHD_OVERRIDE" ]; then echo "cargo:      not needed (kernel and sshd supplied)"; else echo "cargo:      $(command -v cargo || echo MISSING)"; fi
 		echo "mke2fs:     $(command -v mke2fs || echo MISSING) (-d: $mke2fs_d)"
 		echo "debugfs:    $(command -v debugfs || echo MISSING)"
 		echo "ssh:        $(command -v ssh || echo MISSING)"
 		echo "ssh-keygen: $(command -v ssh-keygen || echo MISSING)$([ -n "$KEY_PUB" ] && echo ' (--key given: not needed)')"
-		echo "qemu-system-x86_64: $(command -v qemu-system-x86_64 || echo MISSING)"
-		echo "firecracker: $(command -v firecracker || echo MISSING)"
-		echo "/dev/kvm writable: $kvm_ok (no: TCG, slow — the wait stage gets 600 s)"
+		if [ "$VMM" = qemu ]; then echo "qemu-system-x86_64: $(command -v qemu-system-x86_64 || echo MISSING)"; else echo "qemu-system-x86_64: not needed for --vmm $VMM"; fi
+		if [ "$VMM" = firecracker ]; then echo "firecracker: $(command -v firecracker || echo MISSING)"; else echo "firecracker: not needed for --vmm $VMM"; fi
+		if [ "$VMM" = akuma ]; then echo "herd (VMs are herd services, kvm0): $(command -v herd || echo MISSING)"; else echo "/dev/kvm writable: $kvm_ok (no: TCG, slow — the wait stage gets 600 s)"; fi
 		echo "disk free at $DIR: ${diskfree:-?} KiB ($disknote)"
 	} | tee "$LOGS/check.log"
 	if [ "$deps_ok" = 1 ]; then

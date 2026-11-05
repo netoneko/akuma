@@ -137,11 +137,18 @@ pub struct ClientConfig {
     pub identity: Option<String>,
     pub command: Option<String>,
     pub term: String,
+    /// `-y` / `SSH_ACCEPT_NEW_HOSTKEY=1`: record a host key never seen before without asking.
+    /// A CHANGED key is still refused.
+    pub accept_new_hostkey: bool,
 }
 
 pub enum ClientError {
     Net(NetError),
+    /// A transient failure: `run` reconnects.
     Msg(String),
+    /// An answer, not a fault (host key declined or changed, authentication refused): retrying
+    /// asks the same question again, so `run` returns it at once.
+    Fatal(String),
 }
 
 impl From<NetError> for ClientError {
@@ -154,7 +161,7 @@ impl core::fmt::Display for ClientError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ClientError::Net(e) => write!(f, "{} ({:?})", e.message, e.kind()),
-            ClientError::Msg(m) => write!(f, "{m}"),
+            ClientError::Msg(m) | ClientError::Fatal(m) => write!(f, "{m}"),
         }
     }
 }
@@ -182,6 +189,9 @@ pub fn run(cfg: ClientConfig) -> Result<i32, ClientError> {
         match run_once(&cfg) {
             Ok(code) => return Ok(code),
             Err(e) => {
+                if matches!(e, ClientError::Fatal(_)) {
+                    return Err(e);
+                }
                 if !sshd::client_resilience::should_retry(attempt, max_attempts) {
                     if max_attempts > 1 {
                         eprintln(&format!(
@@ -307,7 +317,7 @@ fn run_once(cfg: &ClientConfig) -> Result<i32, ClientError> {
     let signature = parse_signature_blob(&sig_blob)
         .ok_or_else(|| ClientError::Msg(String::from("malformed host key signature")))?;
     if host_key.verify(&exchange_hash, &signature).is_err() {
-        return Err(ClientError::Msg(String::from(
+        return Err(ClientError::Fatal(String::from(
             "host key signature verification FAILED \u{2014} refusing to continue (possible man-in-the-middle)",
         )));
     }
@@ -316,7 +326,7 @@ fn run_once(cfg: &ClientConfig) -> Result<i32, ClientError> {
     match keys::lookup_known_host(&host_spec, &host_key) {
         keys::HostKeyStatus::Known => {}
         keys::HostKeyStatus::Mismatch => {
-            return Err(ClientError::Msg(format!(
+            return Err(ClientError::Fatal(format!(
                 "REMOTE HOST IDENTIFICATION HAS CHANGED for {host_spec}!\n\
                  Someone could be eavesdropping (man-in-the-middle attack), or the host key was legitimately regenerated.\n\
                  Fingerprint offered: {}\n\
@@ -326,13 +336,20 @@ fn run_once(cfg: &ClientConfig) -> Result<i32, ClientError> {
             )));
         }
         keys::HostKeyStatus::New => {
-            println(&format!("The authenticity of host '{host_spec}' can't be established."));
-            println(&format!(
-                "ED25519 key fingerprint is {}.",
-                keys::fingerprint_sha256(&host_key)
-            ));
-            if !prompt_yes_no("Are you sure you want to continue connecting (yes/no)? ") {
-                return Err(ClientError::Msg(String::from("host key not accepted")));
+            if cfg.accept_new_hostkey || env_u64("SSH_ACCEPT_NEW_HOSTKEY").is_some_and(|v| v != 0) {
+                println(&format!(
+                    "Warning: permanently added '{host_spec}' (ED25519 {}) to the list of known hosts.",
+                    keys::fingerprint_sha256(&host_key)
+                ));
+            } else {
+                println(&format!("The authenticity of host '{host_spec}' can't be established."));
+                println(&format!(
+                    "ED25519 key fingerprint is {}.",
+                    keys::fingerprint_sha256(&host_key)
+                ));
+                if !prompt_yes_no("Are you sure you want to continue connecting (yes/no)? ") {
+                    return Err(ClientError::Fatal(String::from("host key verification failed (not accepted)")));
+                }
             }
             keys::add_known_host(&host_spec, &host_key);
         }
@@ -701,7 +718,7 @@ fn authenticate(
             SSH_MSG_USERAUTH_FAILURE => {
                 let mut off = 0;
                 let methods = read_string(&payload, &mut off).unwrap_or(b"");
-                return Err(ClientError::Msg(format!(
+                return Err(ClientError::Fatal(format!(
                     "publickey authentication failed for user '{username}' (server offers: {})",
                     core::str::from_utf8(methods).unwrap_or("")
                 )));

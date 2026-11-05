@@ -30,7 +30,7 @@ mod protocol;
 use libakuma::*;
 
 fn print_usage() {
-    println("Usage: ssh [-p port] [-l user] [-i identity_file] [-t term] [user@]host [command...]");
+    println("Usage: ssh [-p port] [-l user] [-i identity_file] [-t term] [-y] [user@]host [command...]");
     println("");
     println("  -p port           Port to connect to (default 22)");
     println("  -l user           Remote login name (default: root, or from user@host)");
@@ -38,6 +38,8 @@ fn print_usage() {
     println("                    (ssh-keygen -t ed25519 -N '') or Akuma's raw 32-byte format");
     println("                    (default: $HOME/.ssh/id_ed25519, falling back to");
     println("                    /etc/sshd/id_ed25519, i.e. sshd's own host key)");
+    println("  -y                Accept a host key never seen before without asking (also");
+    println("                    SSH_ACCEPT_NEW_HOSTKEY=1). A CHANGED key is always refused.");
     println("  -t term           TERM to advertise to the remote pty (default xterm-256color)");
     println("");
     println("      ssh --keygen ...   make or show a key (also installed as ssh-keygen)");
@@ -68,6 +70,7 @@ pub extern "C" fn main() {
     let mut term = String::from("xterm-256color");
     let mut host_arg: Option<String> = None;
     let mut command_parts: Vec<String> = Vec::new();
+    let mut accept_new = false;
 
     while let Some(a) = args_iter.next() {
         match a {
@@ -97,6 +100,7 @@ pub extern "C" fn main() {
                     term = String::from(v);
                 }
             }
+            "-y" => accept_new = true,
             "-h" | "--help" => {
                 print_usage();
                 return;
@@ -122,7 +126,7 @@ pub extern "C" fn main() {
         Some(command_parts.join(" "))
     };
 
-    let cfg = protocol::ClientConfig { host, port, username, identity, command, term };
+    let cfg = protocol::ClientConfig { host, port, username, identity, command, term, accept_new_hostkey: accept_new };
 
     match protocol::run(cfg) {
         Ok(code) => exit(code),
