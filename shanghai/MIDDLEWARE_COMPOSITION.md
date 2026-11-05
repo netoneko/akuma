@@ -1,8 +1,9 @@
 # Shanghai: composing middleware from external crates
 
-**Status: proposed design (2026-11-05).** What exists today is the single table, its tiers, and the exec hook
-(`crates/akuma-tokio-kernel-core/docs/middleware.md`). The `Params` view, the `init` hook, the label, and the two crates below
-do not exist yet. Nothing here is verified by a gate.
+**Status: partly built (2026-11-05).** Built and gated on both machines: the single table, its tiers, the exec hook, and the
+BOOT half of the diagram (write-once command line, the narrowed `Params` view, `ParamSource`, `Hooks::init`; guide:
+`crates/akuma-tokio-kernel-core/docs/middleware.md` § Boot parameters). **Not built:** the two crates, `compose`, the label.
+Shanghai's sample table currently plays the part of both crates' parameters (`mw.sample.also`).
 
 Rules this design keeps: one table per kernel (no chaining), hooks cannot mutate the kernel context, every ban is a feature
 and off by default, no runtime switches.
@@ -99,9 +100,9 @@ and off by default, no runtime switches.
 - **Only the signed crate produces a label**; map and protect events have no binary, so no label.
 - **Open:** how a label from one policy combines with the plain `Allow` of another inside `compose` (simplest: the label
   comes from whichever policy returns one). Whether `compose` should live in Shanghai or as a helper in the core crate.
-- **Open: the command line's size.** The 512 bytes are our own stack buffers (`cmdline()` / `cmdline_token()` in
-  `akuma-tokio-kernel-amd64`), not a PVH limit: the protocol gives only a NUL-terminated string at `cmdline_paddr`. The VMM may
-  cap it; not checked for QEMU or Firecracker. `StartInfo::cmdline` truncates silently, so a cut-off hex key would still parse;
-  it has to fail loudly before a key is read from the line.
+- **Settled: the command line's size.** The 512 bytes were our own stack buffers, not a PVH limit (the protocol gives only a
+  NUL-terminated string at `cmdline_paddr`). The kept line is now 2048 bytes and a longer one is refused whole
+  (`StartInfo::cmdline_complete`), never truncated. Still unchecked: whether QEMU or Firecracker cap the line before the kernel
+  sees it.
 - **Trust:** a key on the command line is chosen by whoever writes the line (VMM or bootloader). Compiled-in keys are the
   strong mode; command-line keys are a convenience.

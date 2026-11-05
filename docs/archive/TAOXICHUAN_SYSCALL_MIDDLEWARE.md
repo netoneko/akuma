@@ -173,3 +173,15 @@ entry. The amd64 `dispatch_inner` was split at the fold: everything after it is 
 `docs/archive/` W^X policy (`TAOXICHUAN_WX_POLICY.md`) for why there is no switch.
 
 - **`no-dynamic-loading` now implies `no-dynamic-elf`** (2026-11-05, the owner): the elf crate refuses a dynamic image first, with the same `EACCES`, so the policy's `ExecKind::Image` arm is no longer reached in that build. It is kept in `shanghai/src/nodl.rs` as a reference copy (commented there), so the policy stays complete if it is reused in another kernel (Taoxichuan). The gate counts did not change.
+
+- **Boot parameters for middleware** (2026-11-05, the owner: params must be immutable after init, and each middleware must see only what
+  it needs). `akuma-tokio-kernel-core::params`: the command line is captured once into a `TakeOnce` buffer (2048 bytes) and published as
+  `&'static str` (a second capture is refused); `Params` is a view narrowed to `mw.` and again per crate with `scoped`, with no way
+  back out; `ParamSource` is the trait a crate's parser reads through (a `Table` serves host tests). `Hooks::init` runs once from
+  `middleware::init()`, which both machines call after the capture and before init is spawned. amd64 reads the line with the new
+  `StartInfo::cmdline_complete`, which reports `TooLong` where `cmdline` handed back a prefix (a cut-off hex key is still hex).
+  The 512-byte cap was our own stack buffers, not PVH. Shanghai's sample table reads `mw.sample.also` and call 1006 reports what the
+  hook could see. **Result, both machines at SMP=4: `MW GATE PASS`, 152 PASS lines (134 + 18)**: the hook read the word; the kernel's
+  own `init=` and `mw.other.secret` were invisible through the view; the control kernel ignored the `mw.*` words. Not built: the
+  read-only page mapping (stronger than the software guarantee), the two crates, `compose`, the label. Design:
+  `shanghai/MIDDLEWARE_COMPOSITION.md`.

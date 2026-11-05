@@ -458,3 +458,33 @@ fn a_dsdt_pointer_at_a_non_dsdt_is_refused() {
     let (m, r) = dsdt_machine(&fadt_bytes(0, 0, 244));
     assert_eq!(acpi::dsdt(&m, &r), None);
 }
+
+#[test]
+fn cmdline_complete_returns_the_whole_line_or_says_it_cannot() {
+    use crate::CmdlineError;
+    let mut m = FakeMem::default();
+    m.put(0x6000, &start_info_bytes(0x560, 0, 0x7000, 0));
+    m.put(0x560, b"init=/bin/x mw.signed.key=0123456789abcdef\0");
+    let si = StartInfo::parse(&m, 0x6000).unwrap();
+    let line = b"init=/bin/x mw.signed.key=0123456789abcdef";
+
+    // Room for the line and nothing spare: whole, and not an error.
+    let mut exact = alloc::vec![0u8; line.len()];
+    assert_eq!(si.cmdline_complete(&m, &mut exact), Ok(Some(core::str::from_utf8(line).unwrap())));
+    // One byte short: an error, where `cmdline` would hand back a prefix whose hex key is still hex.
+    let mut short = alloc::vec![0u8; line.len() - 1];
+    assert_eq!(si.cmdline_complete(&m, &mut short), Err(CmdlineError::TooLong));
+    assert!(si.cmdline(&m, &mut short).is_some(), "the old reader still truncates silently; that is why this one exists");
+
+    // No command line at all is `Ok(None)`, not an error.
+    let mut none = FakeMem::default();
+    none.put(0x6000, &start_info_bytes(0, 0, 0x7000, 0));
+    let si0 = StartInfo::parse(&none, 0x6000).unwrap();
+    assert_eq!(si0.cmdline_complete(&none, &mut [0u8; 8]), Ok(None));
+
+    // Unreadable memory is its own answer.
+    let mut gone = FakeMem::default();
+    gone.put(0x6000, &start_info_bytes(0x9000, 0, 0x7000, 0));
+    let sig = StartInfo::parse(&gone, 0x6000).unwrap();
+    assert_eq!(sig.cmdline_complete(&gone, &mut [0u8; 8]), Err(CmdlineError::Unreadable));
+}

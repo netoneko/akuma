@@ -21,6 +21,9 @@ set -eu
 cd "$(dirname "$0")/.."
 W=${MW_WORK:-/tmp/shanghai-mw}; E=${E:-/opt/homebrew/opt/e2fsprogs/sbin}; SMP=${SMP:-1}
 WHICH=${1:-all}
+# Words the probe expects every kernel to be given (boot parameters, B22): `mw.sample.also` is read by the sample table, `mw.other.secret`
+# belongs to another namespace and must stay invisible to it. A kernel without the sample table must ignore both.
+MW_PARAMS=${MW_PARAMS:-"mw.sample.also=/mw-param mw.other.secret=hush"}
 mkdir -p "$W"
 
 build_probe() { # arch
@@ -74,7 +77,7 @@ stage() { # name target arch
 }
 
 run_x86_64() { # name kernel want [initargs]
-  export TX_KERNEL=$2 TX_DISK=$W/mw-x86_64.img TX_RUN=$W/run-x86_64-$1 TX_PORT=${MW_PORT:-2251} TX_SMP=$SMP TX_INIT="init=/bin/mwprobe${4:+ initargs=$4}"
+  export TX_KERNEL=$2 TX_DISK=$W/mw-x86_64.img TX_RUN=$W/run-x86_64-$1 TX_PORT=${MW_PORT:-2251} TX_SMP=$SMP TX_INIT="init=/bin/mwprobe${4:+ initargs=$4} $MW_PARAMS"
   python3 scripts/kvm/taoxichuan/tcg_rig.py boot fresh >/dev/null
   wait_result "$W/run-x86_64-$1/console.log"
   python3 scripts/kvm/taoxichuan/tcg_rig.py stop >/dev/null 2>&1 || true
@@ -83,7 +86,7 @@ run_x86_64() { # name kernel want [initargs]
 
 run_aarch64() { # name kernel.bin want [initargs]
   d=$W/run-aarch64-$1; rm -rf "$d"; mkdir -p "$d"; cp "$W/mw-aarch64.img" "$d/disk.img"; : > "$d/console.log"
-  cl="init=/bin/mwprobe${4:+ initargs=$4} epoch=$(date +%s)"; [ "$SMP" != 1 ] && cl="$cl smp=$SMP"
+  cl="init=/bin/mwprobe${4:+ initargs=$4} $MW_PARAMS epoch=$(date +%s)"; [ "$SMP" != 1 ] && cl="$cl smp=$SMP"
   qemu-system-aarch64 -machine virt,gic-version=3 -accel tcg -cpu max -smp "$SMP" -m 1024 \
     -kernel "$2" -append "$cl" -nodefaults -no-reboot -display none -serial "file:$d/console.log" \
     -global virtio-mmio.force-legacy=false \

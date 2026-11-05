@@ -216,6 +216,8 @@ fn main() {
         check("custom 1001 is ENOSYS", sc(1001, [0; 4]), ENOSYS);
         check("gettid is stock (== getpid)", sc(nr::GETTID, [0; 4]) - sc(nr::GETPID, [0; 4]), 0);
         check("open /mw-deny is stock (ENOENT, not EACCES)", open("/mw-deny"), ENOENT);
+        // The gate's line carries `mw.sample.also=/mw-param`; a kernel with no middleware must not act on `mw.*` words.
+        check("open /mw-param is stock (a mw.* word on the command line does nothing here)", open("/mw-param"), ENOENT);
         check("getpid works", i64::from(sc(nr::GETPID, [0; 4]) > 0), 1);
         let fd = open("/bin/mwprobe");
         let r = sc6(nr::MMAP, [0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd as u64, 0]);
@@ -242,6 +244,13 @@ fn main() {
     // kernel_pre on openat: reads the path out of user memory, may refuse before the kernel looks.
     check("kernel_pre refuses /mw-deny", open("/mw-deny"), EACCES);
     check("kernel_pre passes /mw-ok (the kernel then says ENOENT)", open("/mw-ok"), ENOENT);
+
+    // Boot parameters: the `init` hook read `mw.sample.also=/mw-param` off the command line (the gate puts it there).
+    check("kernel_pre refuses the path given by mw.sample.also", open("/mw-param"), EACCES);
+    let seen = sc(1006, [0; 4]);
+    check("params: mw.sample.also was readable", seen & 1, 1);
+    check("params: the kernel's own init= is NOT readable through the middleware's view", (seen >> 1) & 1, 0);
+    check("params: mw.other.secret is NOT readable through the mw.sample. view", (seen >> 2) & 1, 0);
     check("kernel_pre ignores a path it does not care about", open("/definitely-not-here"), ENOENT);
 
     // kernel_post on gettid replaces the result (for init, tid == pid).

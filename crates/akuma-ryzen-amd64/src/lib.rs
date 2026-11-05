@@ -79,7 +79,7 @@ pub mod startinfo;
 pub use acpi::{IoApic, Madt, Rsdp, TableHeader};
 pub use cmdline::{MmioDevice, MmioDevices};
 pub use mem::PhysMem;
-pub use startinfo::{MemRegion, StartInfo};
+pub use startinfo::{CmdlineError, MemRegion, StartInfo};
 
 /// Most memory regions recorded. Measured: Firecracker reports 4, QEMU
 /// `microvm` 6. Eight is headroom without being a guess at a bigger machine.

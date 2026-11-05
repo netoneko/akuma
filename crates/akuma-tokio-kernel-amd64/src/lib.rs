@@ -109,6 +109,26 @@ fn cmdline(start_info_pa: u64, buf: &mut [u8]) -> &str {
     core::str::from_utf8(&buf[..n]).unwrap_or("")
 }
 
+/// Keep the boot command line, whole, once (`akuma_tokio_kernel_core::params`): a line that does not fit is not kept as a prefix.
+fn capture_cmdline(start_info_pa: u64) {
+    use akuma_tokio_kernel_core::params::{Failure, capture};
+    let r = capture(|buf| {
+        let Some(si) = akuma_ryzen_amd64::StartInfo::parse(&Physmap, start_info_pa) else {
+            return Ok(0);
+        };
+        match si.cmdline_complete(&Physmap, buf) {
+            Ok(Some(l)) => Ok(l.len()),
+            Ok(None) => Ok(0),
+            Err(akuma_ryzen_amd64::CmdlineError::TooLong) => Err(Failure::TooLong),
+            Err(akuma_ryzen_amd64::CmdlineError::Unreadable) => Err(Failure::Unreadable),
+            Err(akuma_ryzen_amd64::CmdlineError::NotUtf8) => Err(Failure::NotUtf8),
+        }
+    });
+    if r.is_err() {
+        console::puts("  [params] the command line was not kept whole (too long, unreadable or not UTF-8): mw.* parameters are absent\n");
+    }
+}
+
 /// The value of one `token=` on the command line, copied into `buf`.
 fn cmdline_token<'a>(start_info_pa: u64, prefix: &str, buf: &'a mut [u8]) -> Option<&'a str> {
     let mut scratch = [0u8; 512];
@@ -1827,6 +1847,10 @@ fn boot(k: &Kernel) -> ! {
     // off the start info; a full copy exists only if a stage needs to grep it.
     let mut cmdline_buf = [0u8; 512];
     let _cmdline = cmdline(hvm_start_info, &mut cmdline_buf);
+    // The line, whole and read-only from here on; then the middleware's `init` hook reads its `mw.*` words from it.
+    capture_cmdline(hvm_start_info);
+    #[cfg(feature = "middleware")]
+    akuma_tokio_kernel_core::middleware::init();
     let mut describe_buf = [0u8; 512];
     let Ok(machine) = akuma_ryzen_amd64::describe(&Physmap, hvm_start_info, &mut describe_buf) else {
         console::puts("  [FATAL] no hvm_start_info magic at the PVH handoff address\n");

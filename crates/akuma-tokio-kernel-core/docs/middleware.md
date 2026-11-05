@@ -309,6 +309,30 @@ guards without a single refusal. It had never asked for a second library: Alpine
 what a test subject actually loads (`strings -a <binary> | grep '^lib.*\.so'`) before trusting a result about it;
 `mw_fetch_dyn.sh` fails if `xz` does not name `liblzma` or if `busybox` needs more than libc.
 
+## Boot parameters (`Hooks::init`)
+
+A table may read configuration off the boot command line, once, at boot. The machine captures the line whole into a write-once
+buffer (`params::capture`: 2048 bytes, taken exactly once, handed out afterwards only as `&'static str`, so nothing can change it
+by API) and then calls `middleware::init()`, which runs the table's `Hooks::init: fn(&Params<'static>, &mut S)`. It runs
+single-threaded, before the first user instruction, with no kernel context.
+
+- **The view is narrowed to `mw.`.** `init=`, `epoch=`, `smp=` are not visible. `Params::scoped("sample.")` narrows again and has
+  no inverse, so each crate in a composed table is handed only `mw.<name>.`. Keys are whole words (`key` does not match `keyring`)
+  and prefixes end at their dot (`mw.nodl.` is not `mw.nodlx.`).
+- **What a crate reads from is the `ParamSource` trait** (`get(key) -> Option<&str>`), implemented by the cmdline view and by
+  `params::Table` (a fixed list, for host tests and compiled-in defaults), so a crate's parser cannot tell where its input came
+  from. `Params::value` is `get` with a value that outlives the view; use it to keep a `&'static str` in a `OnceCopy`.
+- **A line that does not fit is not kept as a prefix.** amd64 reads it with `StartInfo::cmdline_complete`, which says `TooLong`
+  instead of truncating (`cmdline` still truncates, for readers that want `smp=` off the front of a long line). `params::failed()`
+  is then true and the view is empty. **A policy that needs a value must read an absent or malformed one as "refuse", never as
+  "unset".** The 512-byte limit the kernel used to read with was its own stack buffers, not PVH's (PVH gives only a NUL-terminated
+  string); whether a VMM caps the line before the kernel sees it is not checked.
+- **Software guarantee only.** A raw-pointer write by the kernel itself would not be stopped; mapping the page read-only after boot
+  is the stronger version and is not built.
+
+Shanghai's sample table reads `mw.sample.also=/path` (one more path `kernel_pre` refuses) and records what it could and could not
+see (call 1006); the probe checks that the kernel's own words and another namespace's keys were invisible.
+
 ## The rules, and why each is there
 
 - **No hook touches a lock.** `kernel_*` and `fallback` run under the kernel lock, which the kernel takes. `own_*` run outside it,

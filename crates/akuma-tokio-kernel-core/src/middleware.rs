@@ -47,6 +47,7 @@
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 pub use akuma_syscalls_abi::Syscall;
+pub use crate::params::{self, ParamSource, Params};
 use akuma_primitives::{OnceCopy, PreemptGuard};
 use spinning_top::Spinlock;
 
@@ -333,13 +334,23 @@ pub struct Hooks<S: 'static> {
     pub own_post: &'static [Route<OwnPost<S>>],
     /// The policy for new code (images, executable mappings): see [`ExecPolicy`]. `None`: everything allowed.
     pub exec: Option<ExecPolicy>,
+    /// Runs once, at boot, after the command line is captured and before the first user instruction: set up `state` from the
+    /// parameters. The view is already narrowed to `mw.` ([`Params::middleware`]); narrow it again per crate with
+    /// [`Params::scoped`]. Single-threaded, so it takes `&mut S` without the autolock. No kernel context: there is no process yet.
+    ///
+    /// If the line could not be captured whole ([`params::failed`]) the view is empty; a policy that needs a value must read
+    /// that as "refuse", not as "unset".
+    pub init: Option<InitHook<S>>,
 }
+
+/// See [`Hooks::init`].
+pub type InitHook<S> = fn(&Params<'static>, &mut S);
 
 impl<S> Hooks<S> {
     /// No hooks.
     #[must_use]
     pub const fn new() -> Self {
-        Self { kernel_pre: &[], kernel_post: &[], fallback: &[], own_pre: &[], own_post: &[], exec: None }
+        Self { kernel_pre: &[], kernel_post: &[], fallback: &[], own_pre: &[], own_post: &[], exec: None, init: None }
     }
 }
 
@@ -405,6 +416,13 @@ impl<S: Send + 'static> Middleware<S> {
         fill(self.hooks.fallback, None, &machine, "fallback");
         fill(self.hooks.own_pre, Some(&self.op), &machine, "own_pre");
         fill(self.hooks.own_post, Some(&self.oq), &machine, "own_post");
+    }
+
+    /// Run the [`Hooks::init`] hook, if there is one, with `params`. Called once, by [`init`], after the command line is captured.
+    pub fn init_params(&self, params: &Params<'static>) {
+        if let Some(h) = self.hooks.init {
+            h(params, &mut self.state.0.lock());
+        }
     }
 
     fn m(&self) -> Machine {
@@ -524,6 +542,8 @@ pub trait Dispatch: Sync {
     fn run_own_post(&self, latch: Latch, nr: u64, args: [u64; 6], tid: u64, ret: u64);
     /// See [`Middleware::exec_event`].
     fn exec_event(&self, kind: &ExecKind<'_>) -> ExecVerdict;
+    /// See [`Middleware::init_params`].
+    fn init_with(&self, params: &Params<'static>);
 }
 
 impl<S: Send + 'static> Dispatch for Middleware<S> {
@@ -545,6 +565,9 @@ impl<S: Send + 'static> Dispatch for Middleware<S> {
     fn exec_event(&self, kind: &ExecKind<'_>) -> ExecVerdict {
         Self::exec_event(self, kind)
     }
+    fn init_with(&self, params: &Params<'static>) {
+        self.init_params(params);
+    }
 }
 
 static ACTIVE: OnceCopy<&'static dyn Dispatch> = OnceCopy::new();
@@ -557,6 +580,14 @@ pub fn install(mw: &'static dyn Dispatch, machine: Machine) {
     assert!(ACTIVE.get().is_none(), "middleware: one table per kernel - compose in your own function");
     mw.arm_with(machine);
     ACTIVE.set(mw);
+}
+
+/// Hand the registered middleware its parameters: its [`Hooks::init`] runs, once, with the view under `mw.`. The machine calls
+/// this after [`params::capture`] and before it starts init. A no-op with no middleware.
+pub fn init() {
+    if let Some(mw) = active() {
+        mw.init_with(&Params::middleware());
+    }
 }
 
 /// The registered middleware, if any.

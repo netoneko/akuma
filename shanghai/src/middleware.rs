@@ -18,7 +18,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use akuma_tokio_kernel::middleware::{CUSTOM_BASE, Hooks, Middleware, On, Route, Syscall, Verdict};
+use akuma_primitives::OnceCopy;
+use akuma_tokio_kernel::middleware::{CUSTOM_BASE, Hooks, Middleware, On, ParamSource, Params, Route, Syscall, Verdict};
 
 /// `getpid`s the `own_pre` hook saw.
 static GETPID_PRE: AtomicU64 = AtomicU64::new(0);
@@ -31,12 +32,40 @@ const EFAULT_RET: u64 = (-14i64) as u64;
 /// The `own` state as of the last `getppid`, for the probe to compare with [`GETPID_PRE`].
 static STATE_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
 
+/// An extra path to refuse, from the command line (`mw.sample.also=/path`), set once by [`init`]. Unset: none.
+static ALSO: OnceCopy<&'static str> = OnceCopy::new();
+/// What [`init`] saw, for the probe (call 1006): bit 0 `mw.sample.also` was readable, bit 1 the kernel's own `init=` was
+/// readable through the middleware's view (it must not be), bit 2 `mw.other.secret` was readable through the `mw.sample.` view (it must
+/// not be; the gate's line carries it).
+static PARAMS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// [`Hooks::init`]: read this middleware's parameters, once, at boot. The view is already narrowed to `mw.`; this table narrows it
+/// again to `mw.sample.`, which is all it reads.
+fn init(params: &Params<'static>, _state: &mut u64) {
+    let mine = params.scoped("sample.");
+    let mut seen = 0;
+    if let Some(path) = mine.value("also") {
+        ALSO.set(path);
+        seen |= 1;
+    }
+    // Both of these must be invisible: the kernel's words are outside `mw.`, and `other.` is another crate's namespace.
+    seen |= u64::from(params.get("init").is_some()) << 1;
+    seen |= u64::from(mine.get("secret").is_some()) << 2;
+    PARAMS_SEEN.store(seen, Relaxed);
+    akuma_primitives::safe_print!(128, "[mw] params: also={:?} seen={:#x}\n", ALSO.get(), seen);
+}
+
 /// `openat(dirfd, path, ..)`: `path` is argument 1.
+
 fn open_guard(ctx: &akuma_tokio_kernel::middleware::KernelCtx) -> Verdict {
     let mut buf = [0u8; 64];
     let Ok(path) = ctx.user_str(ctx.args[1], &mut buf) else {
         return Verdict::Pass; // not ours to judge: the kernel will say what is wrong with it
     };
+    if ALSO.get() == Some(path) {
+        akuma_primitives::safe_print!(128, "[mw] pid {} openat {} (refused by mw.sample.also)\n", ctx.pid, path);
+        return Verdict::Errno(EACCES);
+    }
     if !path.starts_with("/mw-") {
         return Verdict::Pass;
     }
@@ -63,6 +92,7 @@ pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
         Route::new(&[On::Nr(CUSTOM_BASE + 2)], |_| Some(GETPID_PRE.load(Relaxed))),
         Route::new(&[On::Nr(CUSTOM_BASE + 3)], |_| Some(GETPID_POST.load(Relaxed))),
         Route::new(&[On::Nr(CUSTOM_BASE + 5)], |_| Some(STATE_SNAPSHOT.load(Relaxed))),
+        Route::new(&[On::Nr(CUSTOM_BASE + 6)], |_| Some(PARAMS_SEEN.load(Relaxed))),
     ],
     kernel_pre: &[
         Route::new(&[On::Call(Syscall::Openat)], open_guard),
@@ -88,4 +118,5 @@ pub static MW: Middleware<u64> = Middleware::new(0, Hooks {
         Route::new(&[On::Call(Syscall::Getppid)], |ctx, _| STATE_SNAPSHOT.store(*ctx.state, Relaxed)),
     ],
     exec: EXEC,
+    init: Some(init),
 });

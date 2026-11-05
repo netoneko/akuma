@@ -231,6 +231,24 @@ fn boot(k: &Kernel) -> ! {
         trap::TICK_US
     );
     safe_print!(160, "  cmdline: {}\n", m.cmdline.as_str());
+    // The line, whole and read-only from here on (`akuma_tokio_kernel_core::params`); then the middleware's `init` hook reads its
+    // `mw.*` words from it, before anything runs in user mode.
+    {
+        use akuma_tokio_kernel_core::params::{Failure, capture};
+        let line = m.cmdline.as_bytes();
+        let kept = capture(|buf| {
+            if line.len() > buf.len() {
+                return Err(Failure::TooLong);
+            }
+            buf[..line.len()].copy_from_slice(line);
+            Ok(line.len())
+        });
+        if kept.is_err() {
+            safe_print!(160, "  [params] the command line was not kept whole ({} bytes): mw.* parameters are absent\n", line.len());
+        }
+        #[cfg(feature = "middleware")]
+        akuma_tokio_kernel_core::middleware::init();
+    }
     anchor_wall_clock(m.cmdline.as_str());
 
     // The process runtime and the tokio surface, then the root.
