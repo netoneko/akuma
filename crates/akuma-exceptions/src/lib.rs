@@ -1605,7 +1605,7 @@ fn demand_page_lazy_region(
         let (_, _, free) = akuma_pmm::stats();
         safe_print!(160, "[{}] pid={} va=0x{:x} readahead pool exhausted, {} free pages — retrying single page\n",
             access.tag(), pid, far_usize, free);
-        if let Some(pf) = alloc_page_zeroed_user() {
+        if let Some(mut staged) = akuma_phys::FreshFrame::alloc_zeroed_user() {
             // Re-read file data for this single page
             let pg_data_start = core::cmp::max(page_va, segment_va);
             let pg_data_end = core::cmp::min(page_va + 0x1000, segment_va + filesz);
@@ -1613,15 +1613,13 @@ fn demand_page_lazy_region(
                 let dst_off = pg_data_start - page_va;
                 let file_off = file_offset + (pg_data_start - segment_va);
                 let len = pg_data_end - pg_data_start;
-                let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
-                let page_buf = unsafe {
-                    core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
-                };
-                let got = if inode != 0 {
-                    (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
-                } else {
-                    (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
-                };
+                let got = staged.fill_with(dst_off, len, |page_buf| {
+                    if inode != 0 {
+                        (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
+                    } else {
+                        (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
+                    }
+                });
                 // This arm never publishes to `file_page_cache`, so a short read here
                 // poisons only the faulting process — but it is the same defect and
                 // shares the counter, so a build that trips one can be told from a
@@ -1633,6 +1631,8 @@ fn demand_page_lazy_region(
                         pid, inode, file_off, len, got, page_va, path);
                 }
             }
+            // Filled; from here the frame is mapped-or-freed by hand below.
+            let pf = akuma_exec::PhysFrame::new(staged.publish());
             if is_exec {
                 // By the kernel VA (kva), not the user VA: the user page is not mapped
                 // yet at this point (the map happens below), so `ic ivau` on page_va
@@ -1748,15 +1748,10 @@ pub enum CowRemap<'a> {
 /// It is a function so the requirement has one statement instead of three, and so the
 /// two `CowRemap` arms cannot drift on it silently.
 #[inline]
-fn copy_page_under_as_lock(old_pa: usize, new_frame: akuma_exec::PhysFrame) {
-    // SAFETY: `old_pa` came from a valid user PTE and `new_frame` from the PMM, so
-    // both are identity-mapped, page-aligned and 4 KiB wide; the regions cannot
-    // overlap because `new_frame` was just allocated and is not mapped anywhere yet.
-    unsafe {
-        let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
-        let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
-        core::ptr::copy_nonoverlapping::<u8>(src, dst, 0x1000);
-    }
+fn copy_page_under_as_lock(old_pa: usize, new_frame: &mut akuma_phys::FreshFrame) {
+    // `new_frame` is exclusively ours and unmapped, so the copy cannot overlap or race
+    // a reader; `old_pa` stays valid because the callers hold `as_lock`.
+    new_frame.copy_from_frame(akuma_phys::PhysAddr::from_usize(old_pa));
 }
 
 /// Finish a CoW break: private copy of `old_pa` into `new_frame`, the faulting VA
@@ -1792,9 +1787,10 @@ pub fn complete_cow_break(
     remap: CowRemap<'_>,
     page_va: usize,
     old_pa: usize,
-    new_frame: akuma_exec::PhysFrame,
+    mut new_frame: akuma_phys::FreshFrame,
 ) {
-    akuma_pmm::track_frame(new_frame.addr, akuma_pmm::FrameSource::UserData);
+    let new_pf = akuma_exec::PhysFrame::new(new_frame.pa().as_usize());
+    akuma_pmm::track_frame(new_pf.addr, akuma_pmm::FrameSource::UserData);
 
     let released_last_va = match remap {
         CowRemap::TakingAsLock(owner) => {
@@ -1817,12 +1813,12 @@ pub fn complete_cow_break(
                 // 2026-08-14 because it amplified the F8 wedge (§10.2); with the
                 // saved-context free gate landed, 10/10 amplified suite runs were
                 // clean and this is safe.
-                copy_page_under_as_lock(old_pa, new_frame);
+                copy_page_under_as_lock(old_pa, &mut new_frame);
                 let _ = aspace.map_page(
-                    page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
+                    page_va, new_pf.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
                 );
                 let _ = akuma_exec::mmu::flush_tlb_page(page_va, akuma_exec::mmu::TlbTarget::AllCores);
-                aspace.track_user_frame(new_frame);
+                aspace.track_user_frame(new_pf);
                 // CoW: the old page is freed via the global CoW refcount, never here.
                 Some(aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa)))
             });
@@ -1833,24 +1829,27 @@ pub fn complete_cow_break(
                 // frame. Callers proceed/retry: a completed sibling break means
                 // the retried access succeeds; a genuine unmap re-faults with a
                 // translation (not permission) code and takes its normal path.
-                free_page(new_frame);
+                new_frame.free_by(akuma_primitives::preempt::current_tid() as u32);
                 return;
             };
             released
         }
         CowRemap::CallerHoldsAsLock(aspace) => {
             // The caller's AS-lock guard already covers this copy.
-            copy_page_under_as_lock(old_pa, new_frame);
+            copy_page_under_as_lock(old_pa, &mut new_frame);
             // Overwrite PTE: same VA, new PA, RW (free fn → live TTBR0;
             // `map_user_page` would refuse the valid PTE).
             akuma_exec::mmu::remap_current_user_page(
-                page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
+                page_va, new_pf.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
             );
-            aspace.track_user_frame(new_frame);
+            aspace.track_user_frame(new_pf);
             // CoW: the old page is freed via the global CoW refcount, never here.
             aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa))
         }
     };
+
+    // Mapped and tracked: the frame is the address space's now, not ours to free.
+    let _ = new_frame.publish();
 
     // Only this address space's LAST VA on the frame gives up its global reference.
     //
@@ -1884,9 +1883,8 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
     if akuma_pmm::cow_ref_get(old_pa) == 0 { return true; } // not CoW, already writable
 
     // CoW page: allocate a private copy and remap as RW.
-    let new_frame = match alloc_page_zeroed() {
-        Some(f) => f,
-        None => return false, // OOM
+    let Some(new_frame) = akuma_phys::FreshFrame::alloc_zeroed_clean() else {
+        return false; // OOM
     };
     // Owner resolution is the call site's business (F2): this path resolves the
     // *address-space owner*, which is the correct pid for a `CLONE_VM` sibling.
@@ -1898,7 +1896,7 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
         complete_cow_break(CowRemap::TakingAsLock(owner), page_va, old_pa, new_frame);
         true
     } else {
-        free_page(new_frame); // no owner — free to avoid leak
+        drop(new_frame); // no owner — frees the frame, nothing leaks
         false
     }
 }
@@ -1988,11 +1986,10 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
         return Some(SIGRETURN_TRAMPOLINE_ADDR);
     }
 
-    let frame = alloc_page_zeroed()?;
-    unsafe {
-        let ptr = akuma_exec::mmu::phys_to_virt(frame.addr).cast::<u8>();
-        core::ptr::copy_nonoverlapping(TRAMPOLINE.as_ptr(), ptr, TRAMPOLINE.len());
-    }
+    let mut staged = akuma_phys::FreshFrame::alloc_zeroed_clean()?;
+    staged.fill_with(0, TRAMPOLINE.len(), |buf| buf.copy_from_slice(&TRAMPOLINE));
+    // Mapped and tracked or freed by hand below, so it leaves the staging type here.
+    let frame = akuma_exec::PhysFrame::new(staged.publish());
 
     let (table_frames, installed) = akuma_exec::mmu::map_user_page(
         SIGRETURN_TRAMPOLINE_ADDR,
@@ -3451,9 +3448,8 @@ fn try_resolve_el1_cow_fault() -> bool {
 
     if akuma_pmm::cow_ref_get(old_pa) == 0 { return false; }
 
-    let new_frame = match alloc_page_zeroed() {
-        Some(f) => f,
-        None => return false, // OOM — fall through to kill-process path
+    let Some(new_frame) = akuma_phys::FreshFrame::alloc_zeroed_clean() else {
+        return false; // OOM — fall through to kill-process path
     };
 
     // F2 FIXED 2026-08-13: resolve the **address-space owner**, not the current pid —
@@ -3492,7 +3488,7 @@ fn try_resolve_el1_cow_fault() -> bool {
         // No process owner found: cannot remap — free the new frame to avoid a leak.
         // Do NOT cow_ref_dec: the page is still mapped RO with the original refcount.
         // Returning false lets the EL1 handler kill the process via the normal path.
-        free_page(new_frame);
+        drop(new_frame);
         false
     }
 }
@@ -4547,7 +4543,7 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
                     // Allocate the CoW destination BEFORE taking `as_lock` — alloc must
                     // stay outside the hold (the PMM OOM/reclaim path can re-enter
                     // `as_lock`). Freed below if the page didn't actually need CoW.
-                    if let Some(new_frame) = alloc_page_zeroed() {
+                    if let Some(new_frame) = akuma_phys::FreshFrame::alloc_zeroed_clean() {
                         let mut did_cow = false;
                         if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                             // PTE overwrite + 4 KiB copy under the AS lock (shared-kernel
@@ -4602,7 +4598,7 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
                             return frame.x0();
                         }
                         // Not a CoW page (or no owner): return the unused frame.
-                        free_page(new_frame);
+                        // (If the break ran, `complete_cow_break` consumed it.)
                     }
                     } // end write_allowed_by_record
                     // OOM or not-CoW: fall through to the lazy permission upgrade / SIGSEGV.

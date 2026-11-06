@@ -181,10 +181,38 @@ impl FreshFrame {
         Some(frame)
     }
 
+    /// Allocate a zeroed frame through the PMM's own `alloc_page_zeroed`, which
+    /// zeroes **and cleans the data cache** to the point of coherency. That is
+    /// what an AArch64 user page needs before it is mapped; [`FreshFrame::alloc_zeroed`]
+    /// zeroes through the physmap only. Same ownership as every `FreshFrame`.
+    #[must_use]
+    pub fn alloc_zeroed_clean() -> Option<Self> {
+        akuma_pmm::alloc_page_zeroed().map(|pa| Self { pa: PhysAddr::from_usize(pa) })
+    }
+
+    /// As [`FreshFrame::alloc_zeroed_clean`], for a **user** demand-paging fault:
+    /// `None` once free PMM has fallen to the user reserve (the caller treats that
+    /// as OOM), and the reclaim escalation runs first.
+    #[must_use]
+    pub fn alloc_zeroed_user() -> Option<Self> {
+        akuma_pmm::alloc_page_zeroed_user().map(|pa| Self { pa: PhysAddr::from_usize(pa) })
+    }
+
     /// The frame's physical address, for mapping it. Does not give it up.
     #[must_use]
     pub fn pa(&self) -> PhysAddr {
         self.pa
+    }
+
+    /// Run `f` over `len` bytes of the frame starting at `off` — a file read or a
+    /// code copy that lands straight in the staged page.
+    ///
+    /// # Panics
+    /// If `off + len` runs past the end of the page.
+    pub fn fill_with<R>(&mut self, off: usize, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        let end = off.checked_add(len).expect("fill_with: range overflows");
+        assert!(end <= PAGE_SIZE, "fill_with: range past the end of the page");
+        f(&mut self.bytes_mut()[off..end])
     }
 
     /// The frame's bytes.
@@ -223,6 +251,16 @@ impl FreshFrame {
         let pa = self.pa.as_usize();
         core::mem::forget(self);
         pa
+    }
+}
+
+impl FreshFrame {
+    /// Return the frame to the PMM now, attributing the release to thread `tid`
+    /// (what a premature-free report names). `Drop` does the same with `tid` 0.
+    pub fn free_by(self, tid: u32) {
+        let pa = self.pa.as_usize();
+        core::mem::forget(self);
+        akuma_pmm::free_page(pa, tid);
     }
 }
 

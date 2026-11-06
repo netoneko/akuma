@@ -6267,7 +6267,7 @@ fn test_cow_break_declines_stale_old_pa() {
             crate::pmm::free_page(frame_a);
             return (false, "OOM frame B");
         };
-        let Some(frame_c) = crate::pmm::alloc_page_zeroed() else {
+        let Some(frame_c) = akuma_phys::FreshFrame::alloc_zeroed_clean() else {
             crate::pmm::free_page(frame_a);
             crate::pmm::free_page(frame_b);
             return (false, "OOM frame C");
@@ -6301,13 +6301,14 @@ fn test_cow_break_declines_stale_old_pa() {
 
         // 2. Genuine break (old_pa really is A): PTE moves to the private copy and
         //    this space's reference on A is released (2 -> 1).
-        let Some(frame_d) = crate::pmm::alloc_page_zeroed() else {
+        let Some(frame_d) = akuma_phys::FreshFrame::alloc_zeroed_clean() else {
             return (false, "OOM frame D");
         };
+        let frame_d_pa = frame_d.pa().as_usize();
         akuma_exceptions::complete_cow_break(
             akuma_exceptions::CowRemap::TakingAsLock(owner), va, frame_a.addr, frame_d);
         let pte = owner.with_address_space(|a| a.translate(va).map(|p| p & !0xFFF));
-        if pte != Some(frame_d.addr) {
+        if pte != Some(frame_d_pa) {
             return (false, "genuine break did not remap to the private copy");
         }
         if crate::pmm::cow_ref_get(frame_a.addr) != 1 {

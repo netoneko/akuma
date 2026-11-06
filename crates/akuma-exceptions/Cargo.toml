@@ -59,6 +59,8 @@ akuma-bkl = { path = "../akuma-bkl" }
 # The physical frame allocator: alloc/free/CoW refcounts, the free ledger and
 # the demand-paging attribution counters.
 akuma-pmm = { path = "../akuma-pmm" }
+# `FreshFrame`: a staged page this code owns alone until it is mapped (CoW copy, trampoline, demand fill).
+akuma-phys = { path = "../akuma-phys" }
 # The shared file-page cache the demand-paging fill consults and publishes to.
 akuma-fpcache = { path = "../akuma-fpcache" }
 # The GICv3 driver: IRQ acknowledge/EOI and `SGI_SCHEDULER` in the IRQ handler.
