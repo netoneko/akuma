@@ -574,6 +574,25 @@ several times after it had failed (`taoxichuan/mkdisk.sh` twice, `bootstrap/bin`
 revised: after each failure it ran a nearly identical command. The README's section the brief points at ("smallest disk") is the thing to verify; three of the
 failures (where the sshd lands, which `mkdisk.sh` to use, the submodule) are exactly what a README for this task has to state.
 
+### Context for the result, and what is notable about Kyoto
+
+**The model is old and the context was small.** glm-4.7-flash is an earlier generation than the `glm-5.3-flash` that built Shanghai, and it ran at a **32 k
+context** (ollama's default; the model declares 202 k). The 5.2/5.3 flash models do not fit in the Mac's RAM, so the local trials are limited to what fits
+(~30 B at Q4, ~21 GB resident for this one); the hosted comparison is not reproducible locally. A small, older model, at a quarter-megatoken-class context cap,
+still read the README once and wrote a kernel that builds and boots. That is a good result for the size, whatever happened after gate 1.
+
+**Kyoto against Shanghai and Taoxichuan.**
+* `kyoto/src/main.rs` is the **same builder chain as Taoxichuan's, call for call** (`.name .banner .console .disk .net .smp .run_init`), with no
+  `middleware` feature arm like Shanghai's. The model took the minimal composition and added nothing; there is nothing in it to be wrong.
+* `build.rs` has both arms of the README's recipe, and one more than `shanghai/build.rs`: the aarch64 branch also passes
+  `KERNEL_PHYS_BASE_OVERRIDE=0x80300000` under `CARGO_FEATURE_PLATFORM_FIRECRACKER` (the README does not mention it: `grep` finds no such line there, so the model
+  got it from the tree while reading around, or from memory of the Firecracker path; the aarch64 build was not tried).
+* The banner is the **weak spot**. The brief asks for a small skyline; the file is six lines of figlet-style lettering whose glyphs are cut off (it reads as
+  the tail of "...ey", not "Kyoto"). It prints and does not break anything; it does not meet the brief. Shanghai's is a 19-line skyline.
+* `Cargo.toml` is the shape the README gives (workspace lints, one dependency with `no-tests`), no features.
+* Footprint: five files, one `members` line. No commit, no `RESULT.md` (both required by the brief), so it did not follow the reporting half of the task
+  even though it did the building half.
+
 Trial three, **gemma4:e4b** (`sapporo`), was started after these two and is not part of this update; append its row here when it finishes.
 
 Housekeeping found on the way: a trial's `wt/` checkout is shared, so judge a finished trial from its own `results/<label>/<city>.tar` extracted into a clean
