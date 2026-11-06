@@ -626,6 +626,11 @@ the hosted model carried the task through the disk image, boot, ssh and a tokio 
 local session; the local one used 89 minutes and a 1.9 M budget to not get past the disk image. So the local result is not "much slower at writing a kernel"; it is
 "stuck on the first piece of real build-system work".
 
+**Quota cost** (`scripts/kvm/goose/zai_usage.py`; lite plan caps measured 2026-10-26: ~34 M tokens per 5 h, ~205 M per week): Shanghai's 8.30 M input +
+79 k output is about **24 % of one 5-hour window and 4 % of the week**; the building-kernel part alone (~0.21 M) is about 0.6 % of a window. The three local
+trials cost no quota (the same 1.88 M-token Kyoto session would have been ~5.5 % of a window). The script only reports "since a time" up to now, so the
+Shanghai figure is the goose-recorded total (which matched z.ai's counts on 2026-10-26), not a fresh read of the usage endpoint.
+
 How the Shanghai numbers were taken: the first tool result containing a successful `shanghai` release build is message 39 (call 19, +329 s); input tokens
 are apportioned by cumulative message size as for Kyoto, but the fit is rougher here (the fitted fixed overhead came out negative, so treat ~210 k as +/-30 %).
 Whole-session totals are recorded values. The Shanghai brief and README revision differ from the local trials' (`shanghai-01-new-kernel.md` vs
