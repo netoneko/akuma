@@ -597,6 +597,7 @@ dependencies = [
  "akuma-cpu",
  "akuma-fdt",
  "akuma-mmap",
+ "akuma-mmu-raw",
  "akuma-pagetable",
  "akuma-pmm",
  "akuma-primitives",
@@ -604,6 +605,16 @@ dependencies = [
  "akuma-user-space",
  "log",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-mmu-raw"
+version = "0.1.0"
+dependencies = [
+ "akuma-fdt",
+ "akuma-pagetable",
+ "akuma-pmm",
+ "akuma-primitives",
 ]
 
 [[package]]

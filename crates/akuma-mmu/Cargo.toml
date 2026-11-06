@@ -51,6 +51,7 @@ akuma-mmap = { path = "../akuma-mmap" }
 akuma-user-space = { path = "../akuma-user-space" }
 # Frame allocation and free for page tables and user pages.
 akuma-pmm = { path = "../akuma-pmm" }
+akuma-mmu-raw = { path = "../akuma-mmu-raw" }
 # `current_core_id`, for the per-core ACTIVE_L0/PREV_L0 free gate.
 akuma-bkl = { path = "../akuma-bkl" }
 spinning_top = "0.3"

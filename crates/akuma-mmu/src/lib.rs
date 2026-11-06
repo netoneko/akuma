@@ -41,6 +41,7 @@
 //! `debug-info` feature.
 
 #![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
 // Inherited verbatim from `akuma-exec`'s crate-root `allow` list. This code did
 // not change when it moved out on 2026-08-30, so its lint posture must not
 // either — a split that silently turns 20 warnings on is not behaviour-preserving,
@@ -324,12 +325,8 @@ pub fn with_boot_identity_fdt<R>(pa: usize, f: impl FnOnce(Option<&akuma_fdt::Dt
     if !ensure_boot_identity_covers(base) {
         return f(None);
     }
-    // SAFETY: `base` is confirmed mapped through the boot identity map directly
-    // above, and `locate` validates the FDT magic and declared size before
-    // trusting either. Boot phase: single-threaded, on the boot page table,
-    // before any user address space exists.
-    let dtb = unsafe { akuma_fdt::locate(base) };
-    f(dtb.as_ref())
+    // `base` is confirmed mapped through the boot identity map directly above.
+    akuma_mmu_raw::with_dtb(base, f)
 }
 
 /// Extend the boot TTBR0 identity map to cover ALL detected RAM.
@@ -682,8 +679,7 @@ pub use akuma_primitives::addr::{phys_to_virt, virt_to_phys};
 /// walker reads the same words and another core edits them.
 #[inline(always)]
 fn table(addr: usize) -> &'static akuma_pagetable::Table {
-    // SAFETY: the contract above.
-    unsafe { akuma_pagetable::Table::at(addr) }
+    akuma_mmu_raw::table_at(addr)
 }
 
 /// A page of zeros: the source for zeroing a live frame through
@@ -947,9 +943,9 @@ pub fn flush_tlb_all(_target: TlbTarget) -> TlbFlush {
 // `FULL_FLUSH_THRESHOLD`).
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn flush_tlb_all(target: TlbTarget) -> TlbFlush {
-    // SAFETY: reloading the CR3 already active changes no mapping — it only
-    // forces every non-global TLB entry to be re-walked.
-    unsafe { x86_write_cr3(x86_read_cr3()) };
+    // Reloading the CR3 already active changes no mapping - it only forces every non-global TLB entry to be
+    // re-walked.
+    x86_write_cr3(x86_read_cr3());
     if target == TlbTarget::AllCores && shootdown_send_if_armed() {
         return TlbFlush::pending_remote();
     }
@@ -964,17 +960,7 @@ pub fn flush_tlb_all(_target: TlbTarget) -> TlbFlush { TlbFlush::done() }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn get_boot_ttbr0() -> u64 {
-    unsafe {
-        let addr: u64;
-        core::arch::asm!(
-            "adrp {tmp}, boot_ttbr0_addr",
-            "add {tmp}, {tmp}, :lo12:boot_ttbr0_addr",
-            "ldr {out}, [{tmp}]",
-            tmp = out(reg) _,
-            out = out(reg) addr,
-        );
-        addr
-    }
+    akuma_mmu_raw::boot_ttbr0_addr()
 }
 
 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
@@ -1700,19 +1686,7 @@ pub fn shared_l0_stats() -> (usize, usize, usize) {
 /// unchanging.
 #[must_use]
 pub fn copy_from_phys(pa: usize, dst: &mut [u8]) -> bool {
-    if dst.is_empty() {
-        return true;
-    }
-    if !akuma_pmm::contains(pa, dst.len()) {
-        return false;
-    }
-    // SAFETY: the whole range is inside PMM-managed RAM, which is identity-mapped
-    // and readable; `dst` is a live exclusive slice and cannot overlap it (it is
-    // kernel heap or stack, never a raw frame view).
-    unsafe {
-        core::ptr::copy_nonoverlapping(phys_to_virt(pa).cast_const(), dst.as_mut_ptr(), dst.len());
-    }
-    true
+    akuma_mmu_raw::copy_from_phys(pa, dst)
 }
 
 /// Copy `src` **into** the physical frame at `pa`. The mirror of
@@ -1724,17 +1698,7 @@ pub fn copy_from_phys(pa: usize, dst: &mut [u8]) -> bool {
 /// point and otherwise a bug.
 #[must_use]
 pub fn copy_to_phys(pa: usize, src: &[u8]) -> bool {
-    if src.is_empty() {
-        return true;
-    }
-    if !akuma_pmm::contains(pa, src.len()) {
-        return false;
-    }
-    // SAFETY: as `copy_from_phys`, with the roles reversed.
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), phys_to_virt(pa), src.len());
-    }
-    true
+    akuma_mmu_raw::copy_to_phys(pa, src)
 }
 
 /// Copy one `PAGE_SIZE` frame from `src_pa` to `dst_pa`.
@@ -1748,24 +1712,7 @@ pub fn copy_to_phys(pa: usize, src: &[u8]) -> bool {
 /// `unsafe` sites in `akuma-exec/src/process/mod.rs`.
 #[must_use]
 pub fn copy_phys_page(dst_pa: usize, src_pa: usize) -> bool {
-    let dst = dst_pa & !(PAGE_SIZE - 1);
-    let src = src_pa & !(PAGE_SIZE - 1);
-    if dst == src
-        || !akuma_pmm::contains(dst, PAGE_SIZE)
-        || !akuma_pmm::contains(src, PAGE_SIZE)
-    {
-        return false;
-    }
-    // SAFETY: both ranges are page-aligned, `PAGE_SIZE` long, inside PMM RAM
-    // (identity-mapped and readable/writable) and — checked above — disjoint.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            phys_to_virt(src).cast_const(),
-            phys_to_virt(dst),
-            PAGE_SIZE,
-        );
-    }
-    true
+    akuma_mmu_raw::copy_page(dst_pa & !(PAGE_SIZE - 1), src_pa & !(PAGE_SIZE - 1))
 }
 
 /// Write a plain `#[repr(C)]` value into the physical frame at `pa`.
@@ -1775,16 +1722,7 @@ pub fn copy_phys_page(dst_pa: usize, src_pa: usize) -> bool {
 /// `size_of::<T>()` bytes from `pa` leave PMM RAM.
 #[must_use]
 pub fn write_phys<T: Copy>(pa: usize, val: &T) -> bool {
-    if !akuma_pmm::contains(pa, core::mem::size_of::<T>()) {
-        return false;
-    }
-    // SAFETY: `pa` holds `size_of::<T>()` bytes of PMM RAM (identity-mapped,
-    // writable); `val` is a live `&T`. Alignment: `phys_to_virt(pa)` of a frame
-    // base is page-aligned, and every call site passes a frame base.
-    unsafe {
-        core::ptr::write(phys_to_virt(pa).cast::<T>(), *val);
-    }
-    true
+    akuma_mmu_raw::write_phys(pa, val)
 }
 
 /// Run `f` with a `&mut [u8]` view of `[offset, offset + len)` inside the
@@ -1803,15 +1741,7 @@ pub fn with_phys_bytes_mut<R>(
     len: usize,
     f: impl FnOnce(&mut [u8]) -> R,
 ) -> Option<R> {
-    let end = offset.checked_add(len)?;
-    if end > PAGE_SIZE || (pa & (PAGE_SIZE - 1)) != 0 || !akuma_pmm::contains(pa, PAGE_SIZE) {
-        return None;
-    }
-    // SAFETY: `pa` is a page-aligned PMM frame (identity-mapped, writable); the
-    // window is inside that page; the frame is not published to any page table,
-    // so `f` holds the only reference for its duration.
-    let buf = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(pa).add(offset), len) };
-    Some(f(buf))
+    akuma_mmu_raw::with_phys_window(pa, offset, len, f)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2580,14 +2510,9 @@ impl UserAddressSpace {
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 fn publish_and_install_ttbr0(ttbr0: u64) {
     let token = publish_l0_begin(ttbr0, akuma_bkl::bkl::current_core_id() as usize);
-    // SAFETY: the one `msr ttbr0_el1` in this crate. Per the `akuma-cpu` rule a
-    // write that re-points state the kernel dereferences is never safe to wrap
-    // in a general API; this is the leaf that states the obligation instead:
-    // `ttbr0` must map the running kernel, and the publish brackets above and
-    // below are what make a concurrent TTBR free check against the right value.
-    unsafe {
-        core::arch::asm!("dsb ish", "msr ttbr0_el1, {ttbr0}", "isb", ttbr0 = in(reg) ttbr0);
-    }
+    // The one TTBR0 install in this crate (`akuma-mmu-raw`): `ttbr0` must map the running kernel, and the
+    // publish brackets above and below are what make a concurrent TTBR free check against the right value.
+    akuma_mmu_raw::install_ttbr0(ttbr0);
     publish_l0_end(token);
 }
 
@@ -2973,9 +2898,8 @@ fn x86_read_cr3() -> u64 {
 /// As `load_cr3`: `root` maps everything the kernel executes from and touches
 /// before switching back.
 #[cfg(target_arch = "x86_64")]
-unsafe fn x86_write_cr3(root: u64) {
-    // SAFETY: the caller's obligation, stated above.
-    unsafe { x86_walk::load_cr3(root) };
+fn x86_write_cr3(root: u64) {
+    akuma_mmu_raw::write_cr3(root);
 }
 
 /// Walk to the leaf slot for `va`, without allocating. `None` if any level is
@@ -3531,15 +3455,10 @@ impl UserAddressSpace {
         let Some(pa) = self.translate(page_base) else {
             return false;
         };
-        // SAFETY: `translate` just confirmed `page_base` is mapped in *this*
-        // address space, so `pa` is a real frame reachable through the physmap.
-        // `&mut self` makes this borrow exclusive; the assert bounds the write
-        // to the single frame backing that page.
-        unsafe {
-            let dst = akuma_primitives::addr::phys_to_virt(pa + offset);
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
-        }
-        true
+        // `translate` just confirmed `page_base` is mapped in *this* address space, so `pa` is a real frame
+        // reachable through the physmap. `&mut self` makes the borrow exclusive; the assert bounds the write to
+        // the single frame backing that page.
+        akuma_mmu_raw::write_resolved(pa + offset, bytes)
     }
 
     // ── permission changes ─────────────────────────────────────────────────
@@ -3704,12 +3623,8 @@ impl UserAddressSpace {
     pub fn zero_mapped_page(&self, va: usize) -> bool {
         let _irq_guard = IrqGuard::new();
         let Some(pa) = self.translate(va & !(PAGE_SIZE - 1)) else { return false };
-        // SAFETY: `translate` confirmed the mapping, so `pa` is a live frame
-        // reachable through the physmap, and a whole page of it is ours.
-        unsafe {
-            core::ptr::write_bytes(phys_to_virt(pa) as *mut u8, 0, PAGE_SIZE);
-        }
-        true
+        // `translate` confirmed the mapping, so `pa` is a live frame reachable through the physmap.
+        akuma_mmu_raw::zero_resolved_page(pa)
     }
 
     // ── queries ────────────────────────────────────────────────────────────
@@ -3872,7 +3787,7 @@ impl UserAddressSpace {
     /// kernel's own PML4 slots, so `self.root` maps everything the kernel
     /// needs before the next line executes.
     pub fn activate(&self) {
-        unsafe { x86_write_cr3(self.root as u64) };
+        x86_write_cr3(self.root as u64);
     }
 
     /// Switch back to the kernel's own boot address space.
@@ -3886,10 +3801,9 @@ impl UserAddressSpace {
     pub fn deactivate() {
         let root = X86_BOOT_ROOT.load(Ordering::Acquire);
         if root != 0 {
-            // SAFETY: `root` is the PML4 that was active before any
-            // `UserAddressSpace` on this target ever existed — necessarily
-            // one that already maps the whole running kernel.
-            unsafe { x86_write_cr3(root) };
+            // `root` is the PML4 that was active before any `UserAddressSpace` on this target ever existed -
+            // necessarily one that already maps the whole running kernel.
+            x86_write_cr3(root);
         }
     }
 }
@@ -4372,19 +4286,8 @@ fn get_or_create_table_atomic(table: &akuma_pagetable::Table, idx: usize) -> (us
 }
 
 pub fn protect_kernel_code() {
-    unsafe extern "C" {
-        static _text_start: u8; static _text_end: u8;
-        static _rodata_start: u8; static _rodata_end: u8;
-        static _data_start: u8;
-        static _kernel_phys_end: u8;
-    }
-    let (text_start, text_end, rodata_start, rodata_end, data_start) = unsafe {
-        (&_text_start as *const u8 as usize,
-         &_text_end as *const u8 as usize,
-         &_rodata_start as *const u8 as usize,
-         &_rodata_end as *const u8 as usize,
-         &_data_start as *const u8 as usize)
-    };
+    let akuma_mmu_raw::KernelSections { text_start, text_end, rodata_start, rodata_end, data_start } =
+        akuma_mmu_raw::kernel_sections();
 
     const BLOCK_SIZE_2MB: usize = 2 * 1024 * 1024;
     const RAM_BASE: usize = 0x40000000;
@@ -4513,10 +4416,8 @@ pub fn read_current_user_val<T: Copy>(va: usize) -> Option<T> {
     if !is_current_user_range_mapped(va, core::mem::size_of::<T>()) {
         return None;
     }
-    // SAFETY: `[va, va + size_of::<T>())` is mapped and EL0-accessible in the
-    // live TTBR0 (checked directly above), so this EL1 read cannot fault.
-    // `read_unaligned` drops the alignment obligation; `T: Copy` is POD.
-    Some(unsafe { core::ptr::read_unaligned(va as *const T) })
+    // Mapped and EL0-accessible in the live TTBR0 (checked directly above), so this EL1 read cannot fault.
+    akuma_mmu_raw::read_user::<T>(va, true)
 }
 
 /// Is anything mapped at `va` in the current address space? **Presence** — see
@@ -4872,12 +4773,9 @@ pub fn write_current_user_val<T: Copy>(va: usize, val: &T) -> bool {
     if !is_current_user_range_writable(va, core::mem::size_of::<T>()) {
         return false;
     }
-    // SAFETY: `[va, va + size_of::<T>())` is mapped writable and EL0-accessible
-    // in the live TTBR0 (checked directly above), so this EL1 store cannot
-    // fault. `read_unaligned`/`write_unaligned` drop the alignment obligation;
-    // `T: Copy` is POD.
-    unsafe { core::ptr::write_unaligned(va as *mut T, *val) }
-    true
+    // Mapped writable and EL0-accessible in the live TTBR0 (checked directly above), so this EL1 store cannot
+    // fault.
+    akuma_mmu_raw::write_user(va, val, true)
 }
 
 #[cfg(test)]

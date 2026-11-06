@@ -1,0 +1,18 @@
+[package]
+name = "akuma-mmu-raw"
+version = "0.1.0"
+edition = "2024"
+description = "The raw operations akuma-mmu needs: physmap copies and windows, user-VA loads/stores, page-table references, TTBR0/CR3 installs, the boot-TTBR0 symbol, linker section bounds, the boot DTB. Split out so akuma-mmu can forbid unsafe_code."
+
+[lints]
+workspace = true
+
+# Sits BELOW `akuma-mmu`. Each function states, in its doc, the one fact its caller (the page-table logic)
+# owns; where a function can check part of it (PMM range, physmap window, alignment) it does.
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-pagetable = { path = "../akuma-pagetable" }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+akuma-fdt = { path = "../akuma-fdt" }
