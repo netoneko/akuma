@@ -538,10 +538,11 @@ and the tree, then writing five files. qwen wrote: 26 file writes against 14 she
 how a workspace manifest ends up overwritten twice. The one harness defect seen (the unadvertised `read` tool) did not affect either result; goose's builtin
 `developer` extension is a shell plus an editor, so `cat` is a complete substitute.
 
-For comparison, the sample kernel `shanghai/` was built from an earlier revision of the same README by **goose with a hosted GLM** on the ryzen booted into
-Akuma, and reached gate 6 (goose running inside the guest): `shanghai/docs/EXPERIMENT_RESULT.md`. The local 30 B Q4 model on a 32 k context got through build and
-boot (gates 1 and 3) before the budget ran out; it is not directly comparable (different revision of the brief, different model, TCG instead of the ryzen's
-KVM) but it is the same harness and the same README.
+For comparison, the sample kernel `shanghai/` was built **end to end by `glm-5.3-flash`** (a hosted model, run through goose) from an earlier revision of the
+same README, on the ryzen booted into Akuma, and reached gate 6 (goose running inside the guest): `shanghai/docs/EXPERIMENT_RESULT.md`. The local
+glm-4.7-flash (30 B, Q4, 32 k context) got through build and boot (gates 1 and 3) before the budget ran out and then spiralled on the disk image. Not directly
+comparable (different model generation, hosted vs local, different revision of the brief, TCG instead of the ryzen's KVM), but the same harness family and the
+same README.
 
 ### glm's 75 tool calls, split at the working kernel (Kyoto, from `goose.out`)
 
