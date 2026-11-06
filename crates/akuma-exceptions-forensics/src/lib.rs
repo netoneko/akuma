@@ -12,7 +12,7 @@
 
 extern crate alloc;
 
-use akuma_phys::Frame;
+use akuma_phys::{Frame, PhysAddr};
 use akuma_primitives::safe_print;
 
 /// Forensics for the `N × INTERP_BASE + offset` instruction-abort class
@@ -68,7 +68,7 @@ pub fn interp_relr_forensics(far: usize, pid: u32) {
             continue;
         };
         // SAFETY: a mapped user page of the interpreter's window: RAM no Rust object lives in.
-        let frame = unsafe { Frame::from_pa((pa & !0xFFF) as u64) };
+        let frame = unsafe { Frame::from_pa(PhysAddr::from_usize(pa & !0xFFF)) };
         for i in 0..512usize {
             let v = frame.entry(i) as usize;
             if v == far {
@@ -101,7 +101,7 @@ pub fn print_page_forensics(tag: &str, pid: u32, va: usize) {
     // Read through the kernel identity map, not the user VA: the point is to
     // inspect the frame regardless of what the user PTE currently permits.
     // SAFETY: `pa` is a page-aligned user frame (possibly already freed): RAM no Rust object lives in.
-    let frame = unsafe { Frame::from_pa(pa as u64) };
+    let frame = unsafe { Frame::from_pa(PhysAddr::from_usize(pa)) };
     let words = [frame.entry(0), frame.entry(1), frame.entry(2), frame.entry(3)];
     // Distance, not the raw seq: "freed 40 frees ago" and "freed 300 000 frees
     // ago" are different findings, and only the first implicates this frame. With

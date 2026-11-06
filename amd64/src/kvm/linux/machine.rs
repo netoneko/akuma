@@ -358,7 +358,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
     }
     // The host's FS/GS/TR/LDTR/syscall-MSR state, parked in a VMCB-format page that
     // `vmrun_regs` loads back after every exit.
-    let host_pa = host_f.pa() as u64;
+    let host_pa = host_f.pa().get();
     let _ = host_f.bytes_mut();
     save_host(host_pa);
 
@@ -958,7 +958,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
 
 /// A VMCB frame's physical address.
 fn vmcb_of_pa(frames: &[Option<FreshFrame>; MAX_VCPUS], cpu: usize) -> u64 {
-    frames[cpu].as_ref().expect("a VMCB is allocated for every virtual processor").pa() as u64
+    frames[cpu].as_ref().expect("a VMCB is allocated for every virtual processor").pa().get()
 }
 
 /// The `late()`/service entry: set a guest up, run it on its placed cores and report.
@@ -1137,7 +1137,7 @@ pub fn run(nrips: bool, vm: &Vm) {
             p("[KVM] linux: no frame for a VMCB\n");
             return;
         };
-        init_vmcb(f.bytes_mut(), guest, npt.pml4.pa() as u64, ASID + i as u32);
+        init_vmcb(f.bytes_mut(), guest, npt.pml4.pa().get(), ASID + i as u32);
         if i == 0 {
             // The BSP starts the way PVH says: 32-bit protected mode, paging off.
             let mut v = Vmcb::new(f.bytes_mut());

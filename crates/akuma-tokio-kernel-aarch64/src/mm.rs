@@ -72,13 +72,13 @@ impl FreshPage for Frame {
         FreshFrame::alloc_zeroed().map(Self)
     }
     fn pa(&self) -> usize {
-        self.0.pa()
+        self.0.pa().as_usize()
     }
     fn bytes_mut(&mut self) -> &mut [u8; 4096] {
         self.0.bytes_mut()
     }
     fn copy_from(&mut self, src_pa: usize) {
-        self.0.copy_from_frame(src_pa);
+        self.0.copy_from_frame(akuma_phys::PhysAddr::from_usize(src_pa));
     }
     fn publish(self) -> usize {
         self.0.publish()

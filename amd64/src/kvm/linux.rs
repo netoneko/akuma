@@ -812,14 +812,14 @@ fn build_npt(ram: &Ram) -> Option<Npt> {
     let mut pml4 = FreshFrame::alloc_zeroed()?;
     let mut pdpt = FreshFrame::alloc_zeroed()?;
     let mut dirs = [const { None }; svm::rammap::MAX_DIRS];
-    svm::wr64(pml4.bytes_mut(), 0, svm::npt::pointer(pdpt.pa() as u64));
+    svm::wr64(pml4.bytes_mut(), 0, svm::npt::pointer(pdpt.pa().get()));
     for (d, dir) in dirs.iter_mut().enumerate() {
         if !ram.map.covers((d as u64) << 30) {
             continue;
         }
         let mut page = FreshFrame::alloc_zeroed()?;
         svm::rammap::fill_directory(page.bytes_mut(), ram.map, ram.base, d);
-        svm::wr64(pdpt.bytes_mut(), d * 8, svm::npt::pointer(page.pa() as u64));
+        svm::wr64(pdpt.bytes_mut(), d * 8, svm::npt::pointer(page.pa().get()));
         *dir = Some(page);
     }
     Some(Npt { pml4, _pdpt: pdpt, _dirs: dirs })

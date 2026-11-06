@@ -48,6 +48,7 @@ mod console;
 mod exec_twin;
 mod lazy;
 mod net;
+use akuma_primitives::addr::PhysAddr;
 #[cfg(feature = "trace-err")]
 use akuma_tokio_kernel_core::ring;
 mod sched;
@@ -295,14 +296,14 @@ pub(crate) fn cow_stats() -> (usize, usize, usize, usize) {
 fn leaf_entry(root: u64, va: u64) -> Option<Pte> {
     // SAFETY: `root` is a user root (a task's `root_pa` or the live CR3): a
     // page-table frame.
-    let mut table = unsafe { phys::Frame::from_pa(root & PTE_ADDR) };
+    let mut table = unsafe { phys::Frame::from_pa(PhysAddr::new(root & PTE_ADDR)) };
     for shift in [39u32, 30, 21] {
         let e = table.entry(((va >> shift) & 0x1FF) as usize);
         if e & 1 == 0 || (shift != 39 && e & 0x80 != 0) {
             return None;
         }
         // SAFETY: a present, non-huge entry names the next-level table frame.
-        table = unsafe { phys::Frame::from_pa(e & PTE_ADDR) };
+        table = unsafe { phys::Frame::from_pa(PhysAddr::new(e & PTE_ADDR)) };
     }
     Some(Pte { table, idx: ((va >> 12) & 0x1FF) as usize })
 }
@@ -1054,7 +1055,7 @@ impl akuma_user_walk::Walk for TaskWalk {
             return false;
         };
         // SAFETY: `translate_in` named a mapped task frame.
-        unsafe { phys::Frame::from_pa(pa) }.read_bytes((va & 0xFFF) as usize, out);
+        unsafe { phys::Frame::from_pa(PhysAddr::new(pa)) }.read_bytes((va & 0xFFF) as usize, out);
         true
     }
     fn write_page(&self, va: u64, src: &[u8]) -> bool {
@@ -1068,7 +1069,7 @@ impl akuma_user_walk::Walk for TaskWalk {
         };
         // SAFETY: `translate_in` named a mapped task frame, one this kernel mapped RW (or RO, for image
         // bytes - every caller writes only into stack/heap/scratch regions).
-        unsafe { phys::Frame::from_pa(pa) }.write_bytes((va & 0xFFF) as usize, src);
+        unsafe { phys::Frame::from_pa(PhysAddr::new(pa)) }.write_bytes((va & 0xFFF) as usize, src);
         mark_written(self.root, va);
         true
     }
@@ -1600,7 +1601,7 @@ pub(crate) fn clone_user_half(parent_root: u64, dst_root: u64) -> Option<()> {
 /// every kernel subtree (physmap, device window, kernel image).
 pub(crate) fn copy_kernel_half(dst: phys::Frame) {
     // SAFETY: CR3 holds the live PML4 frame.
-    let k = unsafe { phys::Frame::from_pa(akuma_cpu::ctlreg::cr3() & PTE_ADDR) };
+    let k = unsafe { phys::Frame::from_pa(PhysAddr::new(akuma_cpu::ctlreg::cr3() & PTE_ADDR)) };
     for i in 256..512 {
         dst.set_entry(i, k.entry(i));
     }

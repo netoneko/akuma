@@ -58,6 +58,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// Zero on AArch64: the kernel map is the identity there, and every function
 /// below folds to a no-op exactly as it did before this constant existed.
+pub use crate::addr_types::{PAGE_SHIFT, PAGE_SIZE, Pfn, PhysAddr, VirtAddr};
+
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub const PHYSMAP_OFFSET: usize = 0;
 

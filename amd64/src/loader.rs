@@ -423,7 +423,7 @@ fn map_range(
             // address space would free out from under its next owner. On the
             // failing arm `frame` drops and the PMM gets it back, which the bare
             // `alloc_page` used to leak.
-            if !space.map_and_track_pte(va as usize, PhysFrame::new(frame.pa()), prot, NOT_COW) {
+            if !space.map_and_track_pte(va as usize, PhysFrame::new(frame.pa().as_usize()), prot, NOT_COW) {
                 return Err("could not map a segment page");
             }
             let _ = frame.publish();

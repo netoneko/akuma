@@ -130,7 +130,7 @@ fn build_npt(slots: &Table) -> Option<Npt> {
     let mut pml4 = FreshFrame::alloc_zeroed()?;
     let mut pdpt = FreshFrame::alloc_zeroed()?;
     let mut dirs = [const { None }; akuma_svm_amd64::rammap::MAX_DIRS];
-    akuma_svm_amd64::wr64(pml4.bytes_mut(), 0, akuma_svm_amd64::npt::pointer(pdpt.pa() as u64));
+    akuma_svm_amd64::wr64(pml4.bytes_mut(), 0, akuma_svm_amd64::npt::pointer(pdpt.pa().get()));
     for (d, dir) in dirs.iter_mut().enumerate() {
         let base = (d as u64) << 30;
         // A directory only for a GiB some slot actually covers; the window's GiB (and
@@ -150,7 +150,7 @@ fn build_npt(slots: &Table) -> Option<Npt> {
                 s.slice_off,
             );
         }
-        akuma_svm_amd64::wr64(pdpt.bytes_mut(), d * 8, akuma_svm_amd64::npt::pointer(page.pa() as u64));
+        akuma_svm_amd64::wr64(pdpt.bytes_mut(), d * 8, akuma_svm_amd64::npt::pointer(page.pa().get()));
         *dir = Some(page);
     }
     Some(Npt { pml4, _pdpt: pdpt, _dirs: dirs })
@@ -385,7 +385,7 @@ fn create_vcpu(id: u64) -> u64 {
         return r;
     }
     let Some(vc) = Vcpu::new(id).and_then(boxed) else { return errno::ENOMEM };
-    let pas = [vc.run[0].pa(), vc.run[1].pa()];
+    let pas = [vc.run[0].pa().as_usize(), vc.run[1].pa().as_usize()];
     let r = with_vm(|v| {
         v.created[id] = true;
         v.run_pas[id] = pas;
@@ -434,7 +434,7 @@ fn run_vcpu(id: u8) -> u64 {
         if v.npt.is_none() {
             v.npt = build_npt(&v.slots);
         }
-        let npt_pa = v.npt.as_ref()?.pml4.pa() as u64;
+        let npt_pa = v.npt.as_ref()?.pml4.pa().get();
         let mut vc = v.vcpus[id as usize].take()?;
         vc.refresh_events(&v.ioeventfds, &v.irqfds);
         Some((vc, v.slots, npt_pa))

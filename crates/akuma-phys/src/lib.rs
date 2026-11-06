@@ -17,6 +17,8 @@
 
 #![no_std]
 
+pub use akuma_primitives::addr::PhysAddr;
+
 /// Bytes in a frame.
 const PAGE_SIZE: usize = 4096;
 
@@ -27,9 +29,9 @@ const PAGE_SIZE: usize = 4096;
 /// worse than a named stop.
 #[must_use]
 #[inline]
-pub fn phys_ptr<T>(pa: u64) -> *mut T {
-    assert!(akuma_primitives::addr::physmap_contains(pa as usize), "physical address outside the physmap");
-    akuma_primitives::addr::phys_to_virt(pa as usize).cast::<T>()
+pub fn phys_ptr<T>(pa: PhysAddr) -> *mut T {
+    assert!(akuma_primitives::addr::physmap_contains(pa.as_usize()), "physical address outside the physmap");
+    akuma_primitives::addr::phys_to_virt(pa.as_usize()).cast::<T>()
 }
 
 /// `akuma-pagetable`'s view of the physmap: a table frame's kernel-virtual address.
@@ -37,7 +39,7 @@ pub struct Physmap;
 
 impl akuma_pagetable::PhysMap for Physmap {
     fn table_addr(pa: u64) -> usize {
-        phys_ptr::<u8>(pa) as usize
+        phys_ptr::<u8>(PhysAddr::new(pa)) as usize
     }
 }
 
@@ -53,7 +55,7 @@ impl akuma_pagetable::PhysMap for Physmap {
 /// object lives in. [`Frame::alloc_zeroed`] needs none — a frame fresh from the
 /// PMM is nobody's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Frame(u64);
+pub struct Frame(PhysAddr);
 
 impl Frame {
     /// Name the frame at `pa`.
@@ -67,21 +69,21 @@ impl Frame {
     /// callee reads it as plain data and, through the `set_*`/`write_*`/`copy_*`
     /// methods, rewrites it as plain data.
     #[must_use]
-    pub unsafe fn from_pa(pa: u64) -> Self {
-        assert!(pa.is_multiple_of(PAGE_SIZE as u64), "Frame::from_pa: unaligned");
-        assert!(akuma_primitives::addr::physmap_contains(pa as usize), "Frame::from_pa: outside the physmap");
+    pub unsafe fn from_pa(pa: PhysAddr) -> Self {
+        assert!(pa.is_page_aligned(), "Frame::from_pa: unaligned");
+        assert!(akuma_primitives::addr::physmap_contains(pa.as_usize()), "Frame::from_pa: outside the physmap");
         Self(pa)
     }
 
     /// A zeroed frame from the PMM, owned by the caller until it maps or frees it.
     #[must_use]
     pub fn alloc_zeroed() -> Option<Self> {
-        akuma_pmm::alloc_page_zeroed().map(|pa| Self(pa as u64))
+        akuma_pmm::alloc_page_zeroed().map(|pa| Self(PhysAddr::from_usize(pa)))
     }
 
     /// The physical address.
     #[must_use]
-    pub fn pa(self) -> u64 {
+    pub fn pa(self) -> PhysAddr {
         self.0
     }
 
@@ -159,7 +161,7 @@ impl Frame {
 /// [`FreshFrame::publish`] the moment it is mapped or tracked**: dropping a frame
 /// that a page table already names frees it out from under that mapping.
 pub struct FreshFrame {
-    pa: usize,
+    pa: PhysAddr,
 }
 
 impl FreshFrame {
@@ -167,7 +169,7 @@ impl FreshFrame {
     /// [`FreshFrame::alloc_zeroed`] unless every byte is about to be overwritten.
     #[must_use]
     pub fn alloc() -> Option<Self> {
-        akuma_pmm::alloc_page().map(|pa| Self { pa })
+        akuma_pmm::alloc_page().map(|pa| Self { pa: PhysAddr::from_usize(pa) })
     }
 
     /// Allocate a zeroed frame. Zero *before* mapping: a recycled frame otherwise
@@ -181,7 +183,7 @@ impl FreshFrame {
 
     /// The frame's physical address, for mapping it. Does not give it up.
     #[must_use]
-    pub fn pa(&self) -> usize {
+    pub fn pa(&self) -> PhysAddr {
         self.pa
     }
 
@@ -191,7 +193,7 @@ impl FreshFrame {
         // yet, and `publish` consumes the only handle), reached through the
         // physmap, which covers every PMM frame; `[u8; N]` has no alignment or
         // validity requirement, and `&mut self` makes this the only live view.
-        unsafe { &mut *phys_ptr::<[u8; PAGE_SIZE]>(self.pa as u64) }
+        unsafe { &mut *phys_ptr::<[u8; PAGE_SIZE]>(self.pa) }
     }
 
     /// Overwrite this frame with the contents of the live frame at `src_pa`.
@@ -203,14 +205,14 @@ impl FreshFrame {
     ///
     /// # Panics
     /// If `src_pa` is not page-aligned or is outside the physmap.
-    pub fn copy_from_frame(&mut self, src_pa: usize) {
-        assert!(src_pa.is_multiple_of(PAGE_SIZE), "copy_from_frame: unaligned source");
+    pub fn copy_from_frame(&mut self, src_pa: PhysAddr) {
+        assert!(src_pa.is_page_aligned(), "copy_from_frame: unaligned source");
         assert_ne!(src_pa, self.pa, "copy_from_frame: a frame cannot be its own source");
         // SAFETY: `phys_ptr` asserts `src_pa` is inside the physmap; the frame is
         // a whole page of RAM; it is not `self.pa` (checked), so the shared view
         // cannot alias the `&mut` that `bytes_mut` hands out; and the caller's
         // contract above rules out a concurrent writer.
-        let src = unsafe { &*phys_ptr::<[u8; PAGE_SIZE]>(src_pa as u64) };
+        let src = unsafe { &*phys_ptr::<[u8; PAGE_SIZE]>(src_pa) };
         self.bytes_mut().copy_from_slice(src);
     }
 
@@ -218,7 +220,7 @@ impl FreshFrame {
     /// is theirs to free. Returns its physical address.
     #[must_use = "the frame is now the caller's to map or free; dropping the address leaks it"]
     pub fn publish(self) -> usize {
-        let pa = self.pa;
+        let pa = self.pa.as_usize();
         core::mem::forget(self);
         pa
     }
@@ -226,6 +228,6 @@ impl FreshFrame {
 
 impl Drop for FreshFrame {
     fn drop(&mut self) {
-        akuma_pmm::free_page(self.pa, 0);
+        akuma_pmm::free_page(self.pa.as_usize(), 0);
     }
 }

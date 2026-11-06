@@ -428,8 +428,8 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
     let mem = SlotMem(slots);
     let id = vc.id;
     let nrips = true;
-    let host_pa = vc.host.pa() as u64;
-    let vmcb_pa = vc.vmcb.pa() as u64;
+    let host_pa = vc.host.pa().get();
+    let vmcb_pa = vc.vmcb.pa().get();
     let mut first = true;
 
     // Finish what the previous exit left the VMM to do.

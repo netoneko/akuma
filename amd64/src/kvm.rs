@@ -600,7 +600,7 @@ fn trivial_guest(nrips: bool) {
     };
 
     crumb(2);
-    let code_pa = code_f.pa() as u64;
+    let code_pa = code_f.pa().get();
     code_f.bytes_mut()[..GUEST_CODE.len()].copy_from_slice(&GUEST_CODE);
 
     // The permission maps: 4-KiB aligned and physically contiguous by
@@ -616,9 +616,9 @@ fn trivial_guest(nrips: bool) {
     // guest code. Guest CR0.PG=0 makes guest-linear == guest-physical, so the
     // NPT walk translates `code_pa` directly. The VMCB/hsave/NPT pages are
     // host-physical and never NPT-walked — no mapping for them.
-    let pml4_pa = pml4_f.pa() as u64;
-    let pdpt_pa = pdpt_f.pa() as u64;
-    let pd_pa = pd_f.pa() as u64;
+    let pml4_pa = pml4_f.pa().get();
+    let pdpt_pa = pdpt_f.pa().get();
+    let pd_pa = pd_f.pa().get();
     svm::wr64(pml4_f.bytes_mut(), 0, svm::npt::pointer(pdpt_pa));
     svm::wr64(pdpt_f.bytes_mut(), 0, svm::npt::pointer(pd_pa));
     let pd_index = ((code_pa >> 21) & 0x1FF) as usize;
@@ -715,7 +715,7 @@ fn trivial_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(7);
-        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx, 0) };
+        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa().get(), guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
         crumb(8);
@@ -864,7 +864,7 @@ fn longmode_guest(nrips: bool) {
     };
 
     crumb(0x12);
-    let code_pa = code_f.pa() as u64;
+    let code_pa = code_f.pa().get();
     code_f.bytes_mut()[..LONGMODE_CODE.len()].copy_from_slice(&LONGMODE_CODE);
 
     let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
@@ -877,12 +877,12 @@ fn longmode_guest(nrips: bool) {
     // touches: the code *and* the three guest page-table pages, which the
     // guest paging walk itself reads as guest-physical memory. Two of the
     // four PAs can share a 2 MiB page; writing that entry twice is fine.
-    let npml4_pa = npml4_f.pa() as u64;
-    let npdpt_pa = npdpt_f.pa() as u64;
-    let npd_pa = npd_f.pa() as u64;
-    let gpml4_pa = gpml4_f.pa() as u64;
-    let gpdpt_pa = gpdpt_f.pa() as u64;
-    let gpd_pa = gpd_f.pa() as u64;
+    let npml4_pa = npml4_f.pa().get();
+    let npdpt_pa = npdpt_f.pa().get();
+    let npd_pa = npd_f.pa().get();
+    let gpml4_pa = gpml4_f.pa().get();
+    let gpdpt_pa = gpdpt_f.pa().get();
+    let gpd_pa = gpd_f.pa().get();
     svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
     svm::wr64(npdpt_f.bytes_mut(), 0, svm::npt::pointer(npd_pa));
     for pa in [code_pa, gpml4_pa, gpdpt_pa, gpd_pa] {
@@ -979,7 +979,7 @@ fn longmode_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(0x17);
-        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx, 0) };
+        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa().get(), guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
         crumb(0x18);
@@ -1186,13 +1186,13 @@ fn twolvl_guest(nrips: bool) {
     // The runtime guest-physical address of every page: its region base or'd
     // with the frame's offset inside the aligned window the NPT leaf maps —
     // which is what makes the leaf's translation land on the frame itself.
-    let code_gpa = TWOVL_CODE_REGION | (code_f.pa() as u64 & 0x1F_FFFF);
-    let data_gpa = TWOVL_DATA_REGION | (data_f.pa() as u64 & 0x1F_FFFF);
+    let code_gpa = TWOVL_CODE_REGION | (code_f.pa().get() & 0x1F_FFFF);
+    let data_gpa = TWOVL_DATA_REGION | (data_f.pa().get() & 0x1F_FFFF);
     let gpt_gpa = [
-        TWOVL_GPT_REGION[0] | (gpml4_f.pa() as u64 & 0x1F_FFFF),
-        TWOVL_GPT_REGION[1] | (gpdpt_f.pa() as u64 & 0x1F_FFFF),
-        TWOVL_GPT_REGION[2] | (gpd_f.pa() as u64 & 0x1F_FFFF),
-        TWOVL_GPT_REGION[3] | (gpt_f.pa() as u64 & 0x1F_FFFF),
+        TWOVL_GPT_REGION[0] | (gpml4_f.pa().get() & 0x1F_FFFF),
+        TWOVL_GPT_REGION[1] | (gpdpt_f.pa().get() & 0x1F_FFFF),
+        TWOVL_GPT_REGION[2] | (gpd_f.pa().get() & 0x1F_FFFF),
+        TWOVL_GPT_REGION[3] | (gpt_f.pa().get() & 0x1F_FFFF),
     ];
     code_f.bytes_mut()[..TWOVL_CODE.len()].copy_from_slice(&TWOVL_CODE);
     data_f.bytes_mut()[..8].copy_from_slice(&TWOVL_DATA_MAGIC.to_le_bytes());
@@ -1206,18 +1206,18 @@ fn twolvl_guest(nrips: bool) {
     // NPT: every synthetic 2-MiB region → the aligned window holding the
     // frame that plays it. All six regions share PDPT index 1 (the 1–2 GiB
     // band), so one NPT PD covers them.
-    let npml4_pa = npml4_f.pa() as u64;
-    let npdpt_pa = npdpt_f.pa() as u64;
-    let npd_pa = npd_f.pa() as u64;
+    let npml4_pa = npml4_f.pa().get();
+    let npdpt_pa = npdpt_f.pa().get();
+    let npd_pa = npd_f.pa().get();
     svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
     svm::wr64(npdpt_f.bytes_mut(), 8, svm::npt::pointer(npd_pa));
     for (region, frame_pa) in [
-        (TWOVL_CODE_REGION, code_f.pa() as u64),
-        (TWOVL_DATA_REGION, data_f.pa() as u64),
-        (TWOVL_GPT_REGION[0], gpml4_f.pa() as u64),
-        (TWOVL_GPT_REGION[1], gpdpt_f.pa() as u64),
-        (TWOVL_GPT_REGION[2], gpd_f.pa() as u64),
-        (TWOVL_GPT_REGION[3], gpt_f.pa() as u64),
+        (TWOVL_CODE_REGION, code_f.pa().get()),
+        (TWOVL_DATA_REGION, data_f.pa().get()),
+        (TWOVL_GPT_REGION[0], gpml4_f.pa().get()),
+        (TWOVL_GPT_REGION[1], gpdpt_f.pa().get()),
+        (TWOVL_GPT_REGION[2], gpd_f.pa().get()),
+        (TWOVL_GPT_REGION[3], gpt_f.pa().get()),
     ] {
         let idx = ((region >> 21) & 0x1FF) as usize;
         svm::wr64(npd_f.bytes_mut(), idx * 8, svm::npt::leaf_2m(frame_pa & !0x1F_FFFF));
@@ -1303,7 +1303,7 @@ fn twolvl_guest(nrips: bool) {
     p(" gpa=");
     hx(code_gpa, 16);
     p(" hpa=");
-    hx(code_f.pa() as u64, 16);
+    hx(code_f.pa().get(), 16);
     p(")\n");
 
     // Same excursion shape as both earlier guests: IRQs masked for the run,
@@ -1315,7 +1315,7 @@ fn twolvl_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(0x37);
-        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx, 0) };
+        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa().get(), guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
         crumb(0x38);
@@ -1518,19 +1518,19 @@ fn pvh_guest(nrips: bool) {
     // NPT: the code page rides a 2-MiB leaf in its own region; the three
     // handoff pages, packed in one region by `pvh::plan`, need real 4-KiB
     // leaves — the first PT level any phase's nested tables have built.
-    let npml4_pa = npml4_f.pa() as u64;
-    let npdpt_pa = npdpt_f.pa() as u64;
-    let npd_pa = npd_f.pa() as u64;
-    let nptpt_pa = nptpt_f.pa() as u64;
+    let npml4_pa = npml4_f.pa().get();
+    let npdpt_pa = npdpt_f.pa().get();
+    let npd_pa = npd_f.pa().get();
+    let nptpt_pa = nptpt_f.pa().get();
     svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
     svm::wr64(npdpt_f.bytes_mut(), 8, svm::npt::pointer(npd_pa));
-    let code_gpa = PVH_CODE_REGION | (code_f.pa() as u64 & 0x1F_FFFF);
-    svm::wr64(npd_f.bytes_mut(), 0, svm::npt::leaf_2m(code_f.pa() as u64 & !0x1F_FFFF));
+    let code_gpa = PVH_CODE_REGION | (code_f.pa().get() & 0x1F_FFFF);
+    svm::wr64(npd_f.bytes_mut(), 0, svm::npt::leaf_2m(code_f.pa().get() & !0x1F_FFFF));
     svm::wr64(npd_f.bytes_mut(), 2 * 8, svm::npt::pointer(nptpt_pa));
     for (gpa, frame_pa) in [
-        (l.cmdline_gpa, cmdline_f.pa() as u64),
-        (l.memmap_gpa, memmap_f.pa() as u64),
-        (l.start_gpa, start_f.pa() as u64),
+        (l.cmdline_gpa, cmdline_f.pa().get()),
+        (l.memmap_gpa, memmap_f.pa().get()),
+        (l.start_gpa, start_f.pa().get()),
     ] {
         svm::wr64(nptpt_f.bytes_mut(), ((gpa >> 12) & 0x1FF) as usize * 8, svm::npt::leaf_4k(frame_pa));
     }
@@ -1611,7 +1611,7 @@ fn pvh_guest(nrips: bool) {
     for _ in 0..8 {
         crumb(0x47);
         let (rcx_out, rdx_out) =
-            unsafe { vmrun(vmcb_f.pa() as u64, guest_rcx, guest_rdx, l.start_gpa) };
+            unsafe { vmrun(vmcb_f.pa().get(), guest_rcx, guest_rdx, l.start_gpa) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
         crumb(0x48);
@@ -1766,18 +1766,18 @@ fn consistency_ladder() {
         return;
     };
 
-    let code_pa = code_f.pa() as u64;
+    let code_pa = code_f.pa().get();
     code_f.bytes_mut()[..PROBE_CODE.len()].copy_from_slice(&PROBE_CODE);
     let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
 
     // Nested and guest paging, built once for `probe_pa` exactly as the
     // long-mode phase builds them; rows that do not page simply never walk.
-    let npml4_pa = npml4_f.pa() as u64;
-    let npdpt_pa = npdpt_f.pa() as u64;
-    let npd_pa = npd_f.pa() as u64;
-    let gpml4_pa = gpml4_f.pa() as u64;
-    let gpdpt_pa = gpdpt_f.pa() as u64;
-    let gpd_pa = gpd_f.pa() as u64;
+    let npml4_pa = npml4_f.pa().get();
+    let npdpt_pa = npdpt_f.pa().get();
+    let npd_pa = npd_f.pa().get();
+    let gpml4_pa = gpml4_f.pa().get();
+    let gpdpt_pa = gpdpt_f.pa().get();
+    let gpd_pa = gpd_f.pa().get();
     svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
     svm::wr64(npdpt_f.bytes_mut(), 0, svm::npt::pointer(npd_pa));
     for pa in [code_pa, gpml4_pa, gpdpt_pa, gpd_pa] {
@@ -1883,7 +1883,7 @@ fn consistency_ladder() {
         }
 
         crumb(0x22 + i as u8);
-        unsafe { vmrun(vmcb_f.pa() as u64, 0, 0, 0) };
+        unsafe { vmrun(vmcb_f.pa().get(), 0, 0, 0) };
         let v = Vmcb::new(vmcb_f.bytes_mut());
         if ExitCode::from_u64(v.exitcode()) == ExitCode::Invalid {
             p("rejected\n");

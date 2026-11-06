@@ -5,6 +5,7 @@
 //! `invlpg`, the x86 leaf bits) and the call sites' names, unchanged.
 
 use akuma_boot_amd64::paging::{self, MemAttr, PteProt};
+use akuma_primitives::addr::PhysAddr;
 use akuma_boot_amd64::phys::FreshFrame;
 use akuma_tokio_kernel_core::lazy as core_lazy;
 use akuma_tokio_kernel_core::mmu::{FreshPage, UserPages};
@@ -25,13 +26,13 @@ impl FreshPage for Frame {
         FreshFrame::alloc_zeroed().map(Self)
     }
     fn pa(&self) -> usize {
-        self.0.pa()
+        self.0.pa().as_usize()
     }
     fn bytes_mut(&mut self) -> &mut [u8; 4096] {
         self.0.bytes_mut()
     }
     fn copy_from(&mut self, src_pa: usize) {
-        self.0.copy_from_frame(src_pa);
+        self.0.copy_from_frame(PhysAddr::from_usize(src_pa));
     }
     fn publish(self) -> usize {
         self.0.publish()
@@ -137,11 +138,11 @@ impl akuma_tokio_kernel_core::tree::UserTree for Amd64 {
     fn entry(table: u64, i: usize) -> u64 {
         // SAFETY: the tree walkers name only a live root or a frame a present
         // table entry of one names: a PMM page-table frame.
-        unsafe { akuma_boot_amd64::phys::Frame::from_pa(table) }.entry(i)
+        unsafe { akuma_boot_amd64::phys::Frame::from_pa(PhysAddr::new(table)) }.entry(i)
     }
     fn set_entry(table: u64, i: usize, value: u64) {
         // SAFETY: as `entry`.
-        unsafe { akuma_boot_amd64::phys::Frame::from_pa(table) }.set_entry(i, value);
+        unsafe { akuma_boot_amd64::phys::Frame::from_pa(PhysAddr::new(table)) }.set_entry(i, value);
     }
     /// The lower half; the upper half is the kernel's, shared by every root.
     fn user_root_slot(i: usize) -> bool {
@@ -153,7 +154,7 @@ impl akuma_tokio_kernel_core::tree::UserTree for Amd64 {
     }
     fn install_kernel(dst: u64) -> bool {
         // SAFETY: `dst` is the fresh root frame the caller allocated.
-        crate::copy_kernel_half(unsafe { akuma_boot_amd64::phys::Frame::from_pa(dst) });
+        crate::copy_kernel_half(unsafe { akuma_boot_amd64::phys::Frame::from_pa(PhysAddr::new(dst)) });
         true
     }
     fn live_root() -> u64 {

@@ -118,3 +118,32 @@ order for conversion sweeps. Then decide the `akuma-pmm` pilot by that diff.
 - [`VEC_AUDIT.md`](VEC_AUDIT.md) — context-over-shape lesson, third citation.
 - [`CLONE_AND_MUT_BUDGETS.md`](CLONE_AND_MUT_BUDGETS.md) — the budget
   mechanism the `addr_params` measure would extend.
+
+## Implementation status (tracked from 2026-11-06)
+
+Order follows the audit's own recommendation, with one deliberate change: the first converted crate is `akuma-phys`, not `akuma-pmm`. The audit chose
+`akuma-pmm` as the densest unit-confusion surface; `akuma-phys` is the **door** — every `Frame::from_pa`, `phys_ptr` and `FreshFrame::pa` is where a raw number
+becomes a pointer — and its `unsafe` is what `UNSAFE_OWNERSHIP_TYPES_DESIGN.md` (§1) needs typed first. Bottom-up, so each wave's callers can pass typed values
+from the wave below: **primitives -> phys -> pmm -> mmu/mmap/pagetable -> exec/exceptions/syscalls-glue -> amd64**.
+
+| wave | crate | what | state |
+|---|---|---|---|
+| 0 | gate | `scripts/check_addr_params.py` + `docs/reference/addr-params-budget.json` (the `addr_params` ratchet; `--list [COMPONENT]` prints the sites). Seeded at **615** | done |
+| 1 | `akuma-primitives` | `PhysAddr`, `VirtAddr`, `Pfn`, `PAGE_SIZE`/`PAGE_SHIFT` in `addr_types.rs`, re-exported from `addr`; 6 host tests; operator-minimal as specified | done |
+| 2 | `akuma-phys` | `phys_ptr(PhysAddr)`, `Frame::from_pa(PhysAddr)`, `Frame::pa()`/`FreshFrame::pa() -> PhysAddr`, `copy_from_frame(PhysAddr)`; callers in `amd64`, `akuma-tokio-kernel-amd64`, `akuma-exceptions-forensics` adapted (`publish() -> usize` unchanged until `akuma-pmm`) | done (612) |
+| 3 | `akuma-pmm` | `alloc_page*`/`free_page*`/`cow_ref_*`/`is_page_free`/`contains`/`init`/`add_ram`/`reserve_range` take and return `PhysAddr`/`Pfn`; **883 references outside the crate** (`grep -rn 'akuma_pmm::\|pmm::'`), so convert behind a typed twin per function and move callers wave by wave, deleting the `usize` twin at the end | next |
+| 4 | `akuma-pagetable`, `akuma-pte-*`, `akuma-mmap` | table-frame and PTE address params; `akuma_mmap::PhysFrame` stays the `Copy` address vocabulary but wraps a `PhysAddr` | |
+| 5 | `akuma-mmu` | 130 params in one file; its own sweep with the full verify-trim gate (Tier 4), per the audit | |
+| 6 | `akuma-exec`, `akuma-exceptions`, `akuma-tokio-kernel-{core,aarch64,amd64}`, `amd64/src/mm.rs` | consumers | |
+
+**Reading the hot list.** `check_addr_params.py` is wider than the audit's 248 (it scans the whole tree and the words `addr`/`base`), so the top of
+`--list` needs triage: `akuma-syscalls-glue/{net,mem}.rs` (user-space `addr` for a socket address or an `mmap` hint) and `akuma-xhci/src/trb.rs` (device-bus addresses)
+are not VA/PA confusion and should move to a different type (`UserAddr`) or stay. The mm-domain conversion order is `akuma-mmu` (130) -> `amd64/src/mm.rs` (24) ->
+`akuma-exec` (`children.rs` 20) -> `akuma-tokio-kernel-*` -> `akuma-exceptions` (16).
+
+**What the types did and did not do for `unsafe`.** Nothing by themselves: wave 2 changed no `unsafe` site (472 before and after). The reduction comes from what the
+types enable - `Frame::from_pa(PhysAddr)` is where the alignment assert became a type, and the ownership types in `UNSAFE_OWNERSHIP_TYPES_DESIGN.md` are built on
+`PhysAddr`/`Pfn`. Do not claim an `unsafe` win for a pure distinctness wave.
+
+Verification of waves 0-2: host tests (`akuma-primitives` 76, incl. the 6 new), clippy `-D warnings` on primitives/phys/forensics and both amd64 kernels, builds of
+`akuma-amd64`, `akuma-tokio-kernel-amd64`, `shanghai`, `taoxichuan` (`x86_64-unknown-none`) and the aarch64 kernel; `mw_gate.sh all` at `SMP=4`.

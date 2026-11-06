@@ -3250,11 +3250,11 @@ impl Image {
         // `map_and_track_pte` records it first and untracks it again if the map
         // fails, so a refusal leaves the failing frame to the handle's `Drop`, and
         // a frame already tracked is `space`'s to free, not ours.
-        if !space.map_and_track_pte(USER_CODE_VA, PhysFrame::new(code.pa()), PteProt::USER_RX, false) {
+        if !space.map_and_track_pte(USER_CODE_VA, PhysFrame::new(code.pa().as_usize()), PteProt::USER_RX, false) {
             return None;
         }
         let _ = code.publish();
-        if !space.map_and_track_pte(USER_STACK_VA, PhysFrame::new(stack.pa()), PteProt::USER_RW, false) {
+        if !space.map_and_track_pte(USER_STACK_VA, PhysFrame::new(stack.pa().as_usize()), PteProt::USER_RW, false) {
             return None;
         }
         let _ = stack.publish();

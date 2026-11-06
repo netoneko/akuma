@@ -573,7 +573,7 @@ fn page_fault_trap(t: &mut Trap<'_>) {
         // whatever the previous owner left in it to whoever faults next. If the
         // map fails the frame drops, which returns it to the PMM.
         if let Some(frame) = crate::phys::FreshFrame::alloc_zeroed()
-            && paging::map_page(page as usize, frame.pa() as u64, PteProt::KERNEL_RW, MemAttr::WriteBack)
+            && paging::map_page(page as usize, frame.pa().get(), PteProt::KERNEL_RW, MemAttr::WriteBack)
         {
             let _ = frame.publish();
             DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
@@ -869,9 +869,9 @@ fn cow_write_fault(addr: u64) -> bool {
             // The destination is not published in any page table until the
             // `map_page_pte` below, and `pa` is the CoW source, read-only in every
             // space that maps it.
-            fresh.copy_from_frame(pa);
+            fresh.copy_from_frame(akuma_primitives::addr::PhysAddr::from_usize(pa));
             let writable = PteProt { write: true, ..prot };
-            if !faulted.map_page_pte(page, fresh.pa(), writable, false) {
+            if !faulted.map_page_pte(page, fresh.pa().as_usize(), writable, false) {
                 return false; // `fresh` drops and frees the private copy
             }
             let fresh = fresh.publish();
