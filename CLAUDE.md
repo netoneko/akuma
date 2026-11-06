@@ -37,6 +37,13 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   production `unsafe` sites may not exceed `docs/reference/unsafe-budget.json`, and
   a new crate's budget is 0. To add `unsafe`, run it with `--update` so the budget
   diff carries the increase into review.
+  **Typed addresses** (`docs/reference/typed-addresses.md`): `akuma_primitives::addr::{PhysAddr, VirtAddr, Pfn}` are
+  operator-minimal newtypes (`addr - addr` is a byte count, `addr + addr` does not compile) and `akuma-phys` already takes
+  them; `scripts/check_addr_params.py` is the ratchet on untyped address parameters (`--update` carries an increase into
+  review, `--list <crate>` prints the sites for a conversion sweep). A pure signature change removes no `unsafe` - the
+  ownership types do: a value whose constructor makes the claim once and whose methods are safe (`Frame`, `FreshFrame`,
+  `akuma-stack::StackRegion`, `akuma_trap_aarch64::irq_frame::IrqFrame`). **Never add `unsafe { &mut *phys_ptr(..) }` for a
+  frame; never widen `akuma_mmap::PhysFrame`.**
   `akuma-dma` is **statically allocated DMA memory** (2026-10-18): `DmaArray<E, N, Align>` —
   the `static` itself, a length and alignment in its type, a borrow word that turns a
   second overlapping `&mut` into a panic, volatile `get`/`set` for cells a *device*

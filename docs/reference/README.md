@@ -98,3 +98,4 @@ For these, consult `archive/` directly in the meantime.
 4. Cross-link runbooks that build on this reference.
 5. Add a stability grade at the top (A/B/C) with a one-line justification.
 - [`crate-safety.md`](crate-safety.md) — which extracted crates are enforced `#![forbid(unsafe_code)]`, which cannot be, and why the ban is not in `Cargo.toml`.
+- [`typed-addresses.md`](typed-addresses.md) — `PhysAddr`/`VirtAddr`/`Pfn`, the `check_addr_params.py` ratchet and the ownership-type pattern that retires `unsafe` (grade B, conversion in progress).
