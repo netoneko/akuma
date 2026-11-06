@@ -35,6 +35,7 @@
 //! the Linux headers, which is how they were found.
 
 use super::types::{UserTrapFrame, IRQ_FRAME_SIZE};
+use akuma_trap_aarch64::FrameHandle;
 use core::mem::{offset_of, size_of};
 
 /// `_aarch64_ctx.magic` identifying the FPSIMD extension record.
@@ -289,7 +290,7 @@ impl RtSigFrame {
 ///
 /// **Not the EL0 IRQ frame's layout**, which is also 832 bytes but puts its NEON block
 /// at +288 with FPCR/FPSR at +800/+808 (`exceptions.rs`'s `irq_el0_handler` comment).
-/// Only pass a sync-frame pointer to [`sync_frame_neon`].
+/// Only a sync-frame [`FrameHandle`] reaches [`SyncFrameNeon::read`].
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SyncFrameNeon {
@@ -309,18 +310,29 @@ const _: () = assert!(offset_of!(SyncFrameNeon, fpcr) == 512);
 const _: () = assert!(SYNC_FRAME_NEON_OFFSET + size_of::<SyncFrameNeon>() == IRQ_FRAME_SIZE);
 const _: () = assert!(size_of::<UserTrapFrame>() <= SYNC_FRAME_NEON_OFFSET);
 
-/// The NEON save area of an EL0 **sync** trap frame.
-///
-/// # Safety
-///
-/// `frame` must point at an EL0 sync trap frame — 832 bytes, laid out by
-/// `sync_el0_handler`. An EL0 *IRQ* frame has a different NEON offset and passing one
-/// here reads the wrong registers.
-#[must_use]
-pub unsafe fn sync_frame_neon(frame: *mut UserTrapFrame) -> *mut SyncFrameNeon {
-    // SAFETY: the caller guarantees an 832-byte sync frame, and the assertions above
-    // place this area entirely inside it.
-    unsafe { frame.cast::<u8>().add(SYNC_FRAME_NEON_OFFSET).cast::<SyncFrameNeon>() }
+impl SyncFrameNeon {
+    const WORDS: usize = size_of::<Self>() / 8;
+
+    /// Read the NEON save area of the EL0 **sync** trap frame `frame` names. A
+    /// [`FrameHandle`] exists only for the sync handler's frame, so the IRQ
+    /// frame's different offset cannot be passed here.
+    #[must_use]
+    pub fn read(frame: FrameHandle) -> Self {
+        let w = frame.read_save_words::<{ Self::WORDS }>(SYNC_FRAME_NEON_OFFSET);
+        let mut vregs = [0u64; 64];
+        vregs.copy_from_slice(&w[..64]);
+        Self { vregs, fpcr: w[64], fpsr: w[65] }
+    }
+
+    /// Write this area back into `frame`'s save area, where `sync_el0_handler`
+    /// restores Q0-Q31, FPCR and FPSR from after the handler returns.
+    pub fn store(&self, frame: FrameHandle) {
+        let mut w = [0u64; Self::WORDS];
+        w[..64].copy_from_slice(&self.vregs);
+        w[64] = self.fpcr;
+        w[65] = self.fpsr;
+        frame.write_save_words(SYNC_FRAME_NEON_OFFSET, &w);
+    }
 }
 
 #[cfg(test)]

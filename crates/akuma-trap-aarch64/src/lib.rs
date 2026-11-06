@@ -36,6 +36,9 @@ use core::ptr::NonNull;
 
 pub use akuma_exec_core::thread::UserTrapFrame;
 
+/// Bytes in an EL0 trap frame (sync and IRQ frames are both this size).
+pub const FRAME_BYTES: usize = 832;
+
 /// Number of general registers in the frame (`x0`..`x30`).
 pub const GPRS: usize = 31;
 
@@ -172,6 +175,56 @@ impl FrameHandle {
                 _padding: 0,
             }
         }
+    }
+
+    /// `N` words of the frame's save area **past** the register block - the NEON
+    /// registers the sync handler stores after `UserTrapFrame`'s fields.
+    ///
+    /// `off` is a byte offset into the 832-byte frame, so the caller names its own
+    /// layout (`akuma-threading`'s `SYNC_FRAME_NEON_OFFSET`) and this crate does not
+    /// duplicate it. A handle is only ever made for the EL0 **sync** handler's frame,
+    /// so the sync layout is the only one a caller can mean; an IRQ frame has its
+    /// NEON block 16 bytes earlier and has no handle.
+    ///
+    /// # Panics
+    /// If `off` is not 8-aligned, starts inside the register block, or the range
+    /// runs past the end of the frame.
+    #[must_use]
+    #[track_caller]
+    pub fn read_save_words<const N: usize>(self, off: usize) -> [u64; N] {
+        Self::check_save_range(off, N);
+        let mut out = [0u64; N];
+        let base = self.ptr.as_ptr().cast::<u64>();
+        let mut i = 0;
+        while i < N {
+            // SAFETY: the module contract makes `base` an 832-byte live frame; the
+            // range check above keeps word `i` inside it past the register block,
+            // 8-aligned (`off % 8 == 0`, frame 16-aligned by the asm).
+            out[i] = unsafe { base.add(off / 8 + i).read_volatile() };
+            i += 1;
+        }
+        out
+    }
+
+    /// Store `words` at byte offset `off` of the save area: the other half of
+    /// [`read_save_words`](Self::read_save_words), with the same range rules.
+    #[track_caller]
+    pub fn write_save_words<const N: usize>(self, off: usize, words: &[u64; N]) {
+        Self::check_save_range(off, N);
+        let base = self.ptr.as_ptr().cast::<u64>();
+        let mut i = 0;
+        while i < N {
+            // SAFETY: as [`Self::read_save_words`]; one aligned `u64` store.
+            unsafe { base.add(off / 8 + i).write_volatile(words[i]) };
+            i += 1;
+        }
+    }
+
+    #[track_caller]
+    fn check_save_range(off: usize, words: usize) {
+        assert!(off.is_multiple_of(8), "save-area offset must be 8-aligned");
+        assert!(off >= core::mem::size_of::<UserTrapFrame>(), "save area starts inside the register block");
+        assert!(off + words * 8 <= FRAME_BYTES, "save-area range runs past the frame");
     }
 
     /// Write every register field of `f` back to the live frame - the other half
@@ -425,5 +478,44 @@ mod irq_frame_tests {
         assert_ne!(core::mem::offset_of!(UserTrapFrame, elr_el1), irq_frame::ELR);
         assert_ne!(core::mem::offset_of!(UserTrapFrame, spsr_el1), irq_frame::SPSR);
         assert_ne!(core::mem::size_of::<UserTrapFrame>(), irq_frame::SIZE);
+    }
+}
+
+#[cfg(test)]
+mod save_area_tests {
+    use super::{FRAME_BYTES, FrameHandle, UserTrapFrame};
+
+    // SAFETY (all): a zeroed `[u64; 104]` is exactly the 832-byte frame, 8-aligned, live and
+    // unaliased for the test.
+    fn handle(buf: &mut [u64; 104]) -> FrameHandle {
+        assert_eq!(core::mem::size_of_val(buf), FRAME_BYTES);
+        unsafe { FrameHandle::new(buf.as_mut_ptr().cast::<UserTrapFrame>()) }
+    }
+
+    #[test]
+    fn save_words_round_trip_and_touch_only_their_range() {
+        let mut buf = [0u64; 104];
+        let h = handle(&mut buf);
+        let w: [u64; 66] = core::array::from_fn(|i| 0x1000 + i as u64);
+        h.write_save_words(304, &w);
+        assert_eq!(h.read_save_words::<66>(304), w);
+        drop(h);
+        assert!(buf[..38].iter().all(|&x| x == 0), "register block and padding untouched");
+        assert_eq!(buf[38], 0x1000);
+        assert_eq!(buf[103], 0x1000 + 65);
+    }
+
+    #[test]
+    #[should_panic(expected = "past the frame")]
+    fn save_words_past_the_frame_panic() {
+        let mut buf = [0u64; 104];
+        let _ = handle(&mut buf).read_save_words::<67>(304);
+    }
+
+    #[test]
+    #[should_panic(expected = "inside the register block")]
+    fn save_words_inside_the_registers_panic() {
+        let mut buf = [0u64; 104];
+        let _ = handle(&mut buf).read_save_words::<2>(8);
     }
 }

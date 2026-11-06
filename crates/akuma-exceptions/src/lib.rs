@@ -2301,10 +2301,9 @@ fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault
     // FPSIMD extension record. The kernel never uses FP, so what `sync_el0_handler`
     // saved in this trap frame's NEON area is still the user's.
     //
-    // SAFETY: every `try_deliver_signal` caller is in the EL0 **sync** handler, whose
-    // 832-byte frame is the layout `sync_frame_neon` names. (The EL0 *IRQ* frame is
-    // also 832 bytes and puts its NEON block 16 bytes earlier.)
-    let neon = unsafe { &*sigframe::sync_frame_neon(frame.as_ptr()) };
+    // `frame` is the EL0 sync handler's frame (that is what a `FrameHandle` names), the
+    // only frame the NEON locator is defined for.
+    let neon = sigframe::SyncFrameNeon::read(frame);
     sf.fpsimd.magic = FPSIMD_MAGIC;
     sf.fpsimd.size = 528;
     // FPSR/FPCR are 32-bit registers stored in 64-bit slots on the kernel stack.
@@ -2561,13 +2560,13 @@ fn do_rt_sigreturn(frame: FrameHandle) -> Option<u64> {
     // Restore FPSIMD state from the signal frame into the trap frame's NEON save area;
     // sync_el0_handler restores the registers from there after this returns.
     if sf.fpsimd.magic == FPSIMD_MAGIC {
-        // SAFETY: `do_rt_sigreturn` is called only from the EL0 sync handler, so `frame`
-        // is the 832-byte sync frame whose layout `sync_frame_neon` names. The `&mut f`
-        // borrow above covers only the GPR block, which this area sits past.
-        let neon = unsafe { &mut *sigframe::sync_frame_neon(frame.as_ptr()) };
+        // `do_rt_sigreturn` is called only from the EL0 sync handler; this writes the
+        // NEON area, which sits past the GPR block `f` covers.
+        let mut neon = sigframe::SyncFrameNeon::read(frame);
         neon.fpsr = u64::from(sf.fpsimd.fpsr);
         neon.fpcr = u64::from(sf.fpsimd.fpcr);
         neon.vregs = sf.fpsimd.vregs;
+        neon.store(frame);
     }
 
     Some(sf.uc.uc_mcontext.regs[0])
