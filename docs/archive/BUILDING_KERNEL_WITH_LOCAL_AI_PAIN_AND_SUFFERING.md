@@ -578,8 +578,8 @@ failures (where the sshd lands, which `mkdisk.sh` to use, the submodule) are exa
 
 **The model is old and the context was small.** glm-4.7-flash was released on **2026-01-19** (a 30B-A3B mixture-of-experts; about 9.5 months before this
 run), an earlier generation than the `glm-5.3-flash` that built Shanghai, and it ran at a **32 k
-context** (ollama's default; the model declares 202 k). The hosted `glm-5.3-flash` is listed by third-party gateways at **~1.3 M tokens** of context (1,310,720; two others list 1,048,576; no Z.ai page was checked, so
-treat it as unverified), against the local 32 k, a gap of roughly 30-40x; the Shanghai session itself peaked at 127 k, four times the local window. The 5.2/5.3 flash models do not fit in the Mac's RAM, so the local trials are limited to what fits
+context** (ollama's default; the model declares 202 k). The hosted `glm-5.3-flash` has a **1 M-token context and 128 K max output** per Z.ai's own docs (`docs.z.ai/guides/vlm/glm-5.3-flash`; a 320 B MoE, 18 B active; third-party gateways
+round it to 1.05-1.31 M), against the local 32 k, a gap of about 30x; the Shanghai session itself peaked at 127 k, four times the local window. The 5.2/5.3 flash models do not fit in the Mac's RAM, so the local trials are limited to what fits
 (~30 B at Q4, ~21 GB resident for this one); the hosted comparison is not reproducible locally. A small, older model, at a 32 k context,
 still read the README once and wrote a kernel that builds and boots. That is a good result for the size, whatever happened after gate 1.
 
