@@ -21,6 +21,7 @@ akuma-bkl = { path = "../akuma-bkl" }
 akuma-mmap = { path = "../akuma-mmap" }
 akuma-stack = { path = "../akuma-stack" }
 akuma-trap-aarch64 = { path = "../akuma-trap-aarch64" }
+akuma-switch = { path = "../akuma-switch" }
 spinning_top = "0.3"
 
 [features]
@@ -28,4 +29,4 @@ smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/
 extreme = ["akuma-primitives/extreme"]
 # aarch64: the hooked cooperative scheduler path (the one amd64 always uses) instead of the
 # SGI scheduler, for a tokio kernel (B21 A4). No effect on x86_64, which has only that path.
-hooked = []
+hooked = ["akuma-switch/hooked"]

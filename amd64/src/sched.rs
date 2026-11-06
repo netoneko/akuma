@@ -156,8 +156,13 @@ impl akuma_sched_amd64::Platform for Amd64 {
     fn active_root() -> u64 {
         paging::active_root()
     }
-    unsafe fn activate(root: u64) {
-        // SAFETY: the trait's contract - a live PML4 that maps the kernel half.
+    fn activate(root: u64) {
+        // The trait method is safe: refuse what can be refused here (the shared checked `activate` in
+        // `akuma-pagetable` also compares the kernel-half PML4 slots, which needs a `PhysMap` this kernel
+        // does not name). Every root this kernel passes comes from `AddressSpace::root`, which aliases
+        // the kernel half by construction.
+        assert!(root != 0 && root.trailing_zeros() >= 12 && root >> 52 == 0, "activate: bad root {root:#x}");
+        // SAFETY: a page-aligned PML4 from this kernel's address-space table (see above).
         unsafe { paging::activate(root) };
     }
     fn set_kernel_stack(top: u64) {

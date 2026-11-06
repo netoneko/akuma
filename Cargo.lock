@@ -855,6 +855,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-switch"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-exec-core",
+ "akuma-primitives",
+ "akuma-stack",
+ "akuma-trap-aarch64",
+]
+
+[[package]]
 name = "akuma-syscalls"
 version = "0.1.0"
 dependencies = [
@@ -1014,6 +1025,7 @@ dependencies = [
  "akuma-pmm",
  "akuma-primitives",
  "akuma-stack",
+ "akuma-switch",
  "akuma-trap-aarch64",
  "spinning_top",
 ]

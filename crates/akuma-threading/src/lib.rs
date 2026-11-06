@@ -28,6 +28,7 @@
 //! resolves unchanged.
 
 #![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
 #![allow(dead_code)]
 // The lint allow-list this code was written against — ported verbatim from
 // `akuma-exec/src/lib.rs`, where it lived until 2026-09-02.
@@ -125,10 +126,10 @@ pub use akuma_exec_core::thread as types;
 pub use types::*;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-#[cfg(all(target_os = "none", sgi_sched))]
-use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use akuma_primitives::OnceCopy;
+pub use akuma_switch::rust_switch_finished;
+use akuma_switch::{CtxField, ON_CPU, PER_CORE_OFFCPU, peek};
 use akuma_primitives::once::Registered;
 use akuma_primitives::irq::{with_irqs_disabled, IrqGuard};
 use akuma_primitives::safe_print;
@@ -143,8 +144,6 @@ use akuma_bkl::bkl;
 use akuma_bkl::sync;
 use akuma_exec_core::process::UserContext;
 use akuma_mmap::PhysFrame;
-#[cfg(target_arch = "aarch64")]
-use akuma_trap_aarch64::irq_frame::IrqFrame;
 
 // ── platform + config + process hooks (were `crate::runtime` / `crate::process`) ──
 
@@ -232,7 +231,7 @@ fn process() -> ProcessHooks {
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline]
 pub fn set_current_exception_stack(stack_top: u64) {
-    unsafe { core::arch::asm!("msr tpidr_el1, {}", in(reg) stack_top); }
+    akuma_switch::set_exception_stack(stack_top);
 }
 
 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
@@ -366,8 +365,7 @@ const STACK_USAGE_PROBE: bool = true;
 /// The callers pass either a slot's PMM-backed stack (owned by that slot, mapped for its life) or the boot
 /// stack (thread 0's), or just the canary words at a stack's base; none is aliased by a Rust reference.
 fn stack_region(base: usize, size: usize) -> akuma_stack::StackRegion {
-    // SAFETY: see above.
-    unsafe { akuma_stack::StackRegion::new(base, size) }
+    akuma_switch::vouch_stack(base, size)
 }
 
 /// Snapshot the EL0 trap frame published for `tid` in `CURRENT_TRAP_FRAME`, if any.
@@ -376,12 +374,7 @@ fn stack_region(base: usize, size: usize) -> akuma_stack::StackRegion {
 /// epilogue, and the frame lives on that thread's kernel stack, so a non-zero entry names a live frame. The
 /// copy is a plain read of the whole struct, as the `&*` deref it replaces was.
 fn published_trap_frame(tid: usize) -> Option<UserTrapFrame> {
-    let p = CURRENT_TRAP_FRAME[tid].load(Ordering::Acquire);
-    if p == 0 {
-        return None;
-    }
-    // SAFETY: see above - a published entry is a live, aligned `UserTrapFrame` on the owner's stack.
-    Some(unsafe { core::ptr::read(p as *const UserTrapFrame) })
+    akuma_switch::read_published::<UserTrapFrame>(CURRENT_TRAP_FRAME[tid].load(Ordering::Acquire) as usize)
 }
 
 // Recorded peak usage per class (bytes), so a short-lived user thread's
@@ -555,18 +548,7 @@ static CURRENT_TRAP_FRAME: [AtomicU64; MAX_THREADS] = {
 /// `mov sp, x0`. Bringup sites (boot thread, per-core idle claim) set the gate
 /// for the thread they start life running. Pickers and the slot recycler skip
 /// gated threads.
-static ON_CPU: [AtomicU8; MAX_THREADS] = {
-    const INIT: AtomicU8 = AtomicU8::new(0);
-    [INIT; MAX_THREADS]
-};
-
-/// Per-core: the tid whose [`ON_CPU`] gate this core must clear once the
-/// vector asm has switched SP (`usize::MAX` = none pending). Sized by
-/// `types::MAX_CORES`, the SMP bringup cap.
-static PER_CORE_OFFCPU: [AtomicUsize; MAX_CORES] = {
-    const INIT: AtomicUsize = AtomicUsize::new(usize::MAX);
-    [INIT; MAX_CORES]
-};
+// `ON_CPU` and `PER_CORE_OFFCPU` live in `akuma-switch`, beside `rust_switch_finished` which clears them.
 
 /// Per-thread *expected* TTBR0 L0 base — the physical page-table root this
 /// thread's user context is supposed to run under. 0 = unknown (kernel/idle
@@ -1432,9 +1414,7 @@ pub fn set_itimer(tid: usize, deadline: u64, interval: u64) {
 #[cfg(all(target_os = "none", sgi_sched))]
 #[inline]
 fn set_current_thread_register(tid: usize) {
-    unsafe {
-        core::arch::asm!("msr tpidrro_el0, {}", in(reg) tid as u64);
-    }
+    akuma_switch::set_thread_register(tid);
     // BKL-hold profiler only (no-op unless `bkl-profile` turned it on; absent entirely
     // outside `smp-shared`). This is THE choke point for "the current thread changed" —
     // every switch path funnels through it (`commit_switch`, the network-thread boost in
@@ -1792,14 +1772,14 @@ pub fn spawn_user_thread_initializing(
     trampoline_fn: extern "C" fn() -> !,
     data_ptr: *mut (),
 ) -> Result<usize, &'static str> {
-    let trampoline_casted = unsafe {
-        core::mem::transmute::<extern "C" fn() -> !, fn(*mut ()) -> !>(trampoline_fn)
-    };
+    // The trampoline is entered by `blr x19` / `jmp rbx` with the data pointer in the first argument
+    // register; an `extern "C" fn()` ignores it. Passed as an address, so no fn-pointer type is forged.
+    let trampoline_addr = trampoline_fn as usize as u64;
 
     let attempt = || {
         with_irqs_disabled(|| {
             let mut pool = POOL.lock();
-            pool.spawn_user_closure_initializing(trampoline_casted, data_ptr)
+            pool.spawn_user_closure_initializing(trampoline_addr, data_ptr)
         })
     };
 
@@ -1897,7 +1877,7 @@ impl ThreadPool {
     /// Internal helper to spawn a user closure without marking it READY
     pub fn spawn_user_closure_initializing(
         &mut self,
-        trampoline_fn: fn(*mut ()) -> !,
+        trampoline_addr: u64,
         closure_ptr: *mut (),
     ) -> Result<usize, &'static str> {
         if !self.initialized { return Err("Thread pool not initialized"); }
@@ -1934,24 +1914,23 @@ impl ThreadPool {
 
                 let sp = setup_fake_irq_frame(
                     stack_top,
-                    thread_start_closure as *const () as u64,
-                    trampoline_fn as *const () as u64,
+                    akuma_switch::thread_start_closure_addr(),
+                    trampoline_addr,
                     closure_ptr as u64,
                     0,
                 );
 
-                unsafe {
-                    let ctx = &mut *get_context_mut(i);
+                akuma_switch::with_mut(i, |ctx| {
                     ctx.magic = CONTEXT_MAGIC;
                     ctx.sp = sp;
                     ctx.ttbr0 = boot_ttbr0;
-                    ctx.x19 = trampoline_fn as *const () as u64;
+                    ctx.x19 = trampoline_addr;
                     ctx.x20 = closure_ptr as u64;
-                    ctx.x30 = thread_start_closure as *const () as u64;
-                    ctx.elr = thread_start_closure as *const () as u64;
+                    ctx.x30 = akuma_switch::thread_start_closure_addr();
+                    ctx.elr = akuma_switch::thread_start_closure_addr();
                     ctx.spsr = 0x00000345;
                     ctx.is_user_process = 1; // Mark as user process thread
-                }
+                });
 
                 self.slots[i].start_time_us = 0;
 
@@ -1997,7 +1976,7 @@ impl ThreadPool {
     ///   out of a retry that could only fail again.
     pub fn spawn_user_closure_initializing(
         &mut self,
-        trampoline_fn: fn(*mut ()) -> !,
+        trampoline_addr: u64,
         closure_ptr: *mut (),
     ) -> Result<usize, &'static str> {
         let slot = x86_claim_slot().ok_or("No free x86 task slots")?;
@@ -2010,13 +1989,10 @@ impl ThreadPool {
             return Err("Failed to allocate x86 task stacks");
         };
 
-        // SAFETY: the slot is INITIALIZING, so no picker can select it and no
-        // switch can be reading its context concurrently — the same obligation
-        // `x86_seed_entry` documents, which this is the closure-carrying
-        // variant of.
-        unsafe {
-            *get_context_mut(slot) = x86_build_closure_context(stack_top, trampoline_fn, closure_ptr);
-        }
+        // The slot is INITIALIZING, so no picker can select it and no switch can be reading its
+        // context concurrently - the same obligation `x86_seed_entry` documents, which this is the
+        // closure-carrying variant of.
+        akuma_switch::set(slot, akuma_switch::build_closure_context(stack_top, trampoline_addr, closure_ptr as u64));
 
         // NOTE: deliberately NOT published. The caller must `mark_thread_ready`,
         // exactly as on AArch64.
@@ -2386,9 +2362,7 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
                 let _guard = IrqGuard::new();
                 
                 // Zero the context in THREAD_CONTEXTS
-                unsafe {
-                    *get_context_mut(i) = Context::zero();
-                }
+                akuma_switch::set(i, Context::zero());
                 
                 // Clear slot state
                 let mut pool = POOL.lock();
@@ -2590,12 +2564,11 @@ pub fn adopt_current_as_core_idle(
         init_stack_canary(stack_base);
     }
     // Seed a valid context; sp/ttbr0 are captured on the first switch-out from idle.
-    unsafe {
-        let ctx = &mut *get_context_mut(slot);
+    akuma_switch::with_mut(slot, |ctx| {
         ctx.magic = CONTEXT_MAGIC;
         ctx.ttbr0 = mmu::get_boot_ttbr0();
         ctx.is_user_process = 0;
-    }
+    });
     // This core is now the idle thread. Latch its ON_CPU gate: it starts life
     // running (never switched into via commit_switch), and a stuck-clear gate
     // would otherwise let a peer resume it mid-run.
@@ -2623,72 +2596,7 @@ pub fn adopt_current_as_core_idle(
 // Thread Constants
 // ============================================================================
 
-// Assembly context switch implementation
-#[cfg(all(target_os = "none", sgi_sched))]
-global_asm!(
-    r#"
-.section .text
-.global thread_start
-.global thread_start_closure
-
-// Thread entry trampoline for extern "C" functions
-// x19 holds the actual thread entry function
-thread_start:
-    // Enable IRQs for this thread
-    msr daifclr, #2
-    
-    // Call the thread entry function (in x19)
-    blr x19
-    
-    // Thread returned - mark as terminated and yield
-    // (This shouldn't happen for -> ! functions, but just in case)
-    b thread_exit_asm
-
-// Thread entry trampoline for Rust closures
-// x19 holds pointer to the closure trampoline function
-// x20 holds the raw pointer to the boxed closure data
-// x21 holds IRQ enable flag: 0 = enable IRQs now, non-zero = keep disabled
-thread_start_closure:
-    // CRITICAL: Verify x19 (trampoline) is valid before calling
-    // If x19 == 0, we'd jump to address 0 and crash with EC=0x0
-    cbnz x19, 2f
-    // x19 is 0! Halt with marker
-    mov x0, #0xBAD
-    movk x0, #0x0019, lsl #16   // 0x00190BAD = "bad x19"
-3:  wfi
-    b 3b
-2:
-    // Check if we should enable IRQs (x21 == 0 means enable)
-    // For process threads: x21 != 0, keep IRQs disabled until activate()
-    // For system/test threads: x21 == 0, enable IRQs now
-    cbnz x21, 1f           // Skip IRQ enable if x21 != 0
-    msr daifclr, #2        // Enable IRQs
-1:
-    // Call the trampoline with closure pointer as argument
-    // x19 = trampoline function pointer
-    // x20 = closure data pointer (passed as x0)
-    mov x0, x20
-    blr x19
-    
-    // Thread returned - should not happen for -> ! closures
-    b thread_exit_asm
-
-thread_exit_asm:
-    wfi
-    b thread_exit_asm
-"#
-);
-
-#[cfg(all(target_os = "none", sgi_sched))]
-unsafe extern "C" {
-    fn thread_start() -> !;
-    fn thread_start_closure() -> !;
-}
-
-#[cfg(not(all(target_os = "none", sgi_sched)))]
-unsafe extern "C" fn thread_start() -> ! { panic!("not on bare metal aarch64") }
-#[cfg(not(all(target_os = "none", sgi_sched)))]
-unsafe extern "C" fn thread_start_closure() -> ! { panic!("not on bare metal aarch64") }
+// The thread-entry assembly (`thread_start`, `thread_start_closure`) lives in `akuma-switch`.
 
 // ============================================================================
 // x86_64 context switch — cooperative only, ported from `amd64/src/sched.rs`
@@ -2708,150 +2616,11 @@ unsafe extern "C" fn thread_start_closure() -> ! { panic!("not on bare metal aar
 // AArch64 exception path expects, which has no x86_64 analogue. This is a
 // second, independent switch path, reachable only through the x86_64 arms of
 // [`spawn_fn`]/[`yield_now`] added alongside it.
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    r#"
-    .section .text
-.global akuma_threading_x86_switch_context
-akuma_threading_x86_switch_context:
-    /* System V: rdi = &mut old.rsp is NOT how this is called — see the Rust
-     * wrapper below, which passes raw `*mut Context`/`*const Context` whose
-     * first field is `magic`, not `rsp`. The offset is computed there so this
-     * asm never has to know the struct layout beyond "rsp is a u64 field",
-     * matching `amd64::sched::switch_context`'s own contract one level up.
-     *
-     * `pushfq`/`popfq` are not symmetry for its own sake, and leaving them out
-     * is how this port shipped originally: `IF` has to belong to the task, not
-     * to whoever last ran on this core. A syscall (interrupts off) that yields
-     * to a kernel task (interrupts on) must come back with them off, and it did
-     * not until `amd64/src/sched.rs` Stage U — the resumer's state leaked into
-     * the resumed, presenting as an unrelated intermittent hang. Restored here
-     * 2026-09-06 before anything adopts this switch
-     * (`docs/archive/AKUMA_PIPES_EXTRACTION.md` § "two of them disagree"). */
-    pushfq
-    push rbp
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    mov [rdi], rsp
-    mov rsp, [rsi]
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    pop rbp
-    popfq
-    ret
+// The switch and the first-run trampoline (`akuma_threading_x86_switch_context`,
+// `akuma_threading_x86_thread_entry_trampoline`) live in `akuma-switch`.
 
-.global akuma_threading_x86_thread_entry_trampoline
-akuma_threading_x86_thread_entry_trampoline:
-    /* Reached via the `ret` above the first time a freshly spawned thread is
-     * switched in — see `x86_build_closure_context`, which pre-loads r12 =
-     * closure_ptr and rbx = the boxed-closure trampoline fn pointer at
-     * exactly the stack slots this switch's `pop`s read them from. `jmp`,
-     * not `call`: the trampoline is `fn(*mut ()) -> !` and never returns, so
-     * there is no return address to arrange.
-     *
-     * First scheduler entry of a never-yet-run thread (ON_CPU's doc: the
-     * outgoing tid's gate "is cleared by rust_switch_finished ... at the
-     * task's first scheduler entry" — the AArch64 vector asm does it right
-     * after `mov sp, x0`). This trampoline IS that first entry on this
-     * target: a fresh task never returns to x86_switch_context's tail, so
-     * its `rust_switch_finished()` never runs for us. Without the call here
-     * the OUTGOING thread's ON_CPU gate stays latched forever, and pickers
-     * and `x86_runnable_exists` skip gated threads — the preempted thread
-     * can never be scheduled again. Seen on Taoxichuan stage 12: the first
-     * `sleep_until` park yielded (per its own contract) to the freshly
-     * seeded idle thread, the gate on the parker latched, idle saw nothing
-     * runnable and halted, and the whole guest wedged on its first timed
-     * poll (2026-10-31). Stack alignment: rsp == entry_slot here, 16-byte
-     * aligned, exactly the pre-`call` ABI state. */
-    call rust_switch_finished
-    mov rdi, r12
-    jmp rbx
-"#
-);
-
-#[cfg(target_arch = "x86_64")]
-unsafe extern "C" {
-    fn akuma_threading_x86_switch_context(old_rsp: *mut u64, new_rsp: *const u64);
-    fn akuma_threading_x86_thread_entry_trampoline() -> !;
-}
-
-/// Save the current thread's register state onto its own stack, switch to
-/// `new`'s stack, and resume it — either at the point it last called this
-/// same function, or (for a never-yet-run thread) at
-/// [`akuma_threading_x86_thread_entry_trampoline`], per
-/// [`x86_build_closure_context`].
-///
-/// # Safety
-/// `old`/`new` must point at live [`Context`]s for threads that are not
-/// concurrently being switched by anything else — the same obligation
-/// `get_context`/`get_context_mut` already document.
-#[cfg(target_arch = "x86_64")]
-unsafe fn x86_switch_context(old: *mut Context, new: *const Context) { unsafe {
-    // `rsp` is `Context`'s only field on this target (see its doc comment in
-    // `akuma-exec-core`), so `&raw mut (*old).rsp` and a plain `u64` pointer
-    // are the same address — spelled this way so the asm above only has to
-    // know "a `u64` slot", not the whole struct.
-    akuma_threading_x86_switch_context(&raw mut (*old).rsp, &raw const (*new).rsp);
-}}
-
-/// The `rflags` a thread that has never run starts with: `IF` set, plus bit 1,
-/// which is architecturally always 1. Mirrors `amd64::sched::INITIAL_RFLAGS`.
-#[cfg(target_arch = "x86_64")]
-const X86_INITIAL_RFLAGS: u64 = 0x202;
-
-/// Build the [`Context`] for a thread that has never run, so the first
-/// [`x86_switch_context`] into it starts `trampoline(closure_ptr)`.
-///
-/// Ported from `amd64::sched::Context::for_task`, generalised to pass one
-/// argument through — that file's tasks are all `extern "C" fn() -> !` with
-/// no per-task data (the three `smoke_test` workers are distinct top-level
-/// `fn`s), where `akuma-threading`'s `spawn_fn` needs to launch an arbitrary
-/// boxed `FnOnce() -> !`. `akuma_threading_x86_thread_entry_trampoline`
-/// unpacks the one argument `switch_context`'s plain `ret` cannot pass on its
-/// own: `closure_ptr` rides in r12, `trampoline` in rbx, both preserved
-/// exactly like the six real callee-saved registers because from the asm's
-/// point of view they are indistinguishable from them.
-///
-/// See `Context::for_task`'s own doc comment for why `entry_slot` sits 16
-/// bytes below `stack_top` rather than at it: System V's `rsp + 8 ≡ 0 (mod
-/// 16)` entry invariant, satisfied here because the callee this jumps to
-/// (the trampoline) is reached by `jmp`, not `call` — no return address is
-/// pushed, so the alignment `switch_context`'s `ret` leaves behind is already
-/// exactly what a normal call would have produced.
-///
-/// **Seven words, not six.** [`akuma_threading_x86_switch_context`] restores
-/// `rflags` too, so the frame it pops is `r15 r14 r13 r12 rbx rbp rflags` and
-/// then the return address. A fresh thread starts with [`X86_INITIAL_RFLAGS`]
-/// rather than a zero word: a zero `rflags` has `IF` clear, so the very first
-/// thread spawned this way would run with interrupts masked and never be
-/// ticked again.
-#[cfg(target_arch = "x86_64")]
-fn x86_build_closure_context(stack_top: usize, trampoline: fn(*mut ()) -> !, closure_ptr: *mut ()) -> Context {
-    let entry_slot = (stack_top - 16) & !0xf;
-    // SAFETY: `entry_slot` and the seven words below it are inside the stack
-    // the caller just allocated for this thread and nothing else has touched
-    // yet — the same obligation `amd64::sched::Context::for_task` documents.
-    unsafe {
-        let p = entry_slot as *mut u64;
-        p.write(akuma_threading_x86_thread_entry_trampoline as *const () as u64);
-        p.sub(1).write(X86_INITIAL_RFLAGS); // rflags
-        p.sub(2).write(0); // rbp
-        p.sub(3).write(trampoline as *const () as u64); // rbx
-        p.sub(4).write(closure_ptr as u64); // r12
-        p.sub(5).write(0); // r13
-        p.sub(6).write(0); // r14
-        p.sub(7).write(0); // r15
-    }
-    let mut ctx = Context::zero();
-    ctx.rsp = (entry_slot - 56) as u64;
-    ctx
-}
+// The never-run thread's first frame (`build_closure_context`, seven words: `r15 r14 r13 r12 rbx rbp rflags` and
+// the return address) is written by `akuma-switch`.
 
 /// Simple round-robin pick of the next `READY`/`RUNNING` slot after
 /// `from`, wrapping. Deliberately not [`ThreadPool::schedule_indices`] —
@@ -3059,20 +2828,6 @@ fn arch() -> X86ArchHooks {
 // `WAKE_TIMES`, `WOKEN_STATES`, `ON_CPU` and the wake/park discipline built on
 // them rather than each keeping its own.
 
-/// Adapter from this crate's boxed-closure entry convention to a plain
-/// `extern "C" fn() -> !`.
-///
-/// Lets [`x86_seed_entry`] reuse [`x86_build_closure_context`] verbatim rather
-/// than growing a second frame builder: the "closure pointer" is simply the
-/// function pointer, and there is nothing to free. Allocation-free, which
-/// matters because this is on the spawn path of every process a shell runs.
-#[cfg(hooked_sched)]
-fn x86_plain_entry_trampoline(entry: *mut ()) -> ! {
-    // SAFETY: `x86_seed_entry` is the only producer of this pointer and it only
-    // ever passes an `extern "C" fn() -> !`.
-    let f: extern "C" fn() -> ! = unsafe { core::mem::transmute(entry) };
-    f()
-}
 
 /// Register the thread this core is already executing as `slot`.
 ///
@@ -3213,15 +2968,9 @@ pub fn x86_seed_entry(slot: usize, stack_top: usize, entry: extern "C" fn() -> !
     if slot >= MAX_THREADS {
         return;
     }
-    // SAFETY: the slot is INITIALIZING, so no picker can select it and no
-    // switch can be reading its context concurrently.
-    unsafe {
-        *get_context_mut(slot) = x86_build_closure_context(
-            stack_top,
-            x86_plain_entry_trampoline,
-            entry as *const () as *mut (),
-        );
-    }
+    // The slot is INITIALIZING, so no picker can select it and no switch can be reading its context
+    // concurrently. `entry` is the trampoline itself (`jmp rbx`/`br x20`), entered with nothing to free.
+    akuma_switch::set(slot, akuma_switch::build_closure_context(stack_top, entry as usize as u64, 0));
 }
 
 /// Make an [`x86_claim_slot`] slot schedulable.
@@ -3760,13 +3509,10 @@ fn x86_yield_now() -> bool {
 
     x86_check_incoming_frame(cur, next);
 
-    // SAFETY: `cur`/`next` are both valid slot indices (`x86_pick_next` only
-    // returns in-range candidates), `ON_CPU` above is what stops another core
-    // resuming `next` concurrently, and `next`'s context was built either by
-    // `x86_build_closure_context` or by a previous call to this same function.
-    unsafe {
-        x86_switch_context(get_context_mut(cur), get_context(next));
-    }
+    // `cur`/`next` are both valid slot indices (`x86_pick_next` only returns in-range candidates),
+    // `ON_CPU` above is what stops another core resuming `next` concurrently, and `next`'s context was
+    // built either by `akuma_switch::build_closure_context` or by a previous call to this same function.
+    akuma_switch::switch_contexts(cur, next);
     // The only way here is on the INCOMING thread's stack — `cur`'s stack went
     // dead in the swap above, so its gate can drop now (a fresh task never
     // returns here; its predecessor's gate clears at the task's first
@@ -3817,13 +3563,13 @@ fn x86_check_incoming_frame(cur: usize, next: usize) {
     // SAFETY: `next` is in range and not running on any core (`ON_CPU`), so its
     // context is stable here; the read is one word from a kernel stack this
     // switch is about to restore from anyway.
-    let rsp = unsafe { (*get_context(next)).rsp };
+    let rsp = akuma_switch::with_ref(next, |c| c.rsp);
     if rsp == 0 {
         return;
     }
     // SAFETY: `rsp` is a kernel stack pointer with at least seven words of
     // frame above it — the frame the `pop`s below are about to consume.
-    let flags = unsafe { ((rsp as usize + RFLAGS_OFF) as *const u64).read_volatile() };
+    let flags = akuma_switch::read_stack_word(rsp as usize + RFLAGS_OFF);
     // Read it again. `next` is not on any core (`ON_CPU`) and its stack is
     // therefore nobody's to touch, so these two loads must agree — and when
     // they do not, *that* is the finding, not whatever value the first one got.
@@ -3831,7 +3577,7 @@ fn x86_check_incoming_frame(cur: usize, next: usize) {
     // few microseconds later, which is a thread's saved frame moving while the
     // switch that is about to restore it looks on.
     // SAFETY: as above.
-    let again = unsafe { ((rsp as usize + RFLAGS_OFF) as *const u64).read_volatile() };
+    let again = akuma_switch::read_stack_word(rsp as usize + RFLAGS_OFF);
     if again != flags {
         safe_print!(192,
             "[SWITCH FRAME MOVED] cur={} next={} state={} on_cpu={} last_core={} \
@@ -3850,7 +3596,7 @@ fn x86_check_incoming_frame(cur: usize, next: usize) {
         cur, next, THREAD_STATES[next].load(Ordering::SeqCst), rsp, flags);
     for i in 0..8 {
         // SAFETY: as above — eight words of the frame being restored.
-        let w = unsafe { ((rsp as usize + i * 8) as *const u64).read_volatile() };
+        let w = akuma_switch::read_stack_word(rsp as usize + i * 8);
         safe_print!(64, "[SWITCH BADFRAME]   +{:#x} = {:#x}\n", i * 8, w);
     }
 }
@@ -3872,108 +3618,7 @@ fn x86_check_incoming_frame(cur: usize, next: usize) {
 // interrupt mask belongs to the task, not to whoever last ran on this core.
 // ---------------------------------------------------------------------------
 
-/// `Context` byte offsets the asm below uses (`akuma-exec-core`'s aarch64
-/// `#[repr(C)]` layout: `magic` then `x19`..`x30`, `sp`, `daif`). Checked at
-/// compile time so a layout change fails the build, not the first switch.
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
-const _: () = {
-    assert!(core::mem::offset_of!(Context, x19) == 8);
-    assert!(core::mem::offset_of!(Context, x29) == 88);
-    assert!(core::mem::offset_of!(Context, x30) == 96);
-    assert!(core::mem::offset_of!(Context, sp) == 104);
-    assert!(core::mem::offset_of!(Context, daif) == 112);
-};
-
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
-core::arch::global_asm!(
-    r#"
-    .section .text
-.global akuma_threading_hooked_switch_context
-akuma_threading_hooked_switch_context:
-    /* x0 = *mut Context (outgoing), x1 = *const Context (incoming). */
-    sub sp, sp, #64
-    stp d8, d9, [sp, #0]
-    stp d10, d11, [sp, #16]
-    stp d12, d13, [sp, #32]
-    stp d14, d15, [sp, #48]
-    stp x19, x20, [x0, #8]
-    stp x21, x22, [x0, #24]
-    stp x23, x24, [x0, #40]
-    stp x25, x26, [x0, #56]
-    stp x27, x28, [x0, #72]
-    stp x29, x30, [x0, #88]
-    mov x9, sp
-    str x9, [x0, #104]
-    mrs x9, daif
-    str x9, [x0, #112]
-
-    ldp x19, x20, [x1, #8]
-    ldp x21, x22, [x1, #24]
-    ldp x23, x24, [x1, #40]
-    ldp x25, x26, [x1, #56]
-    ldp x27, x28, [x1, #72]
-    ldp x29, x30, [x1, #88]
-    ldr x9, [x1, #104]
-    mov sp, x9
-    ldp d8, d9, [sp, #0]
-    ldp d10, d11, [sp, #16]
-    ldp d12, d13, [sp, #32]
-    ldp d14, d15, [sp, #48]
-    add sp, sp, #64
-    ldr x9, [x1, #112]
-    msr daif, x9
-    ret
-
-.global akuma_threading_hooked_thread_entry_trampoline
-akuma_threading_hooked_thread_entry_trampoline:
-    /* First switch-in of a fresh thread: the `ret` above lands here with
-     * x19 = closure_ptr and x20 = the boxed-closure trampoline, seeded by
-     * `x86_build_closure_context`. As on x86, this is the task's first scheduler
-     * entry, so it clears the outgoing thread's ON_CPU gate itself. `br`, not
-     * `blr`: the trampoline never returns. */
-    bl rust_switch_finished
-    mov x0, x19
-    br x20
-"#
-);
-
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
-unsafe extern "C" {
-    fn akuma_threading_hooked_switch_context(old: *mut Context, new: *const Context);
-    fn akuma_threading_hooked_thread_entry_trampoline() -> !;
-}
-
-/// The hooked path's switch on aarch64 (named for the path it serves, which
-/// was x86's alone when it was written).
-///
-/// # Safety
-/// As the x86_64 one: `old`/`new` are live [`Context`]s of threads nothing
-/// else is switching.
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
-unsafe fn x86_switch_context(old: *mut Context, new: *const Context) {
-    // SAFETY: the caller's obligation, passed through.
-    unsafe { akuma_threading_hooked_switch_context(old, new) }
-}
-
-/// A fresh thread's [`Context`] on aarch64: the first switch into it pops a
-/// zeroed d8-d15 block, unmasks interrupts (`DAIF` = 0, as x86 starts with
-/// `IF` set) and returns into the entry trampoline with `closure_ptr` in x19
-/// and `trampoline` in x20.
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
-fn x86_build_closure_context(stack_top: usize, trampoline: fn(*mut ()) -> !, closure_ptr: *mut ()) -> Context {
-    // 16-byte aligned, with the 64-byte d8-d15 block the switch pops below it.
-    let entry_sp = (stack_top & !0xf) - 64;
-    // SAFETY: the block is inside the stack the caller just allocated for this
-    // thread and nothing else has touched yet.
-    unsafe { core::ptr::write_bytes(entry_sp as *mut u8, 0, 64) };
-    let mut ctx = Context::zero();
-    ctx.x19 = closure_ptr as u64;
-    ctx.x20 = trampoline as *const () as u64;
-    ctx.x30 = akuma_threading_hooked_thread_entry_trampoline as *const () as u64;
-    ctx.sp = entry_sp as u64;
-    ctx.daif = 0;
-    ctx
-}
+// The aarch64 hooked path's switch, entry trampoline and first frame live in `akuma-switch`.
 
 /// The x86 path checks the saved `RFLAGS` word before `popfq`; the aarch64
 /// switch restores `DAIF` from the `Context` itself, where a corrupt word has
@@ -4009,6 +3654,7 @@ fn x86_check_incoming_frame(_cur: usize, _next: usize) {}
 ///   [sp+816]: x10, x11
 /// 
 /// Returns the SP value pointing to the fake IRQ frame
+#[cfg(target_arch = "aarch64")]
 pub fn setup_fake_irq_frame(
     stack_top: u64,
     entry_point: u64,
@@ -4016,46 +3662,17 @@ pub fn setup_fake_irq_frame(
     x20: u64,  // Closure data pointer
     x21: u64,  // IRQ enable flag (0 = enable)
 ) -> u64 {
-    let frame_base = stack_top - IRQ_FRAME_SIZE as u64;
-    let frame = frame_base as *mut u64;
-    
-    unsafe {
-        // Zero the entire frame (GPR + NEON + x10/x11)
-        core::ptr::write_bytes(frame as *mut u8, 0, IRQ_FRAME_SIZE);
-        
-        // GPR block at [sp+0..287] — offsets unchanged from before
-        // [sp+0]: x30 - return address after thread_start_closure returns
-        frame.add(0).write_volatile(thread_exit_stub as *const () as u64);
-        
-        // [sp+80]: x20, x21
-        frame.add(10).write_volatile(x20);  // x20 - closure data
-        frame.add(11).write_volatile(x21);  // x21 - IRQ enable flag
-        
-        // [sp+96]: x18, x19
-        frame.add(13).write_volatile(x19);  // x19 - trampoline
-        
-        // [sp+240]: ELR, SPSR — written through `irq_frame`'s writer so the
-        // synthetic frame and every reader of a saved frame share one layout.
-        let spsr = if x21 != 0 {
-            0x000003C5  // EL1h, IRQs DISABLED
-        } else {
-            0x00000345  // EL1h, IRQs ENABLED
-        };
-        // SAFETY: `frame_base` is the `irq_frame::SIZE`-byte frame this function
-        // just zeroed at the top of the new thread's kernel stack; that thread is
-        // not running, so the stack (and frame) outlives this value.
-        let frame_view = akuma_trap_aarch64::irq_frame::IrqFrame::at(frame_base);
-        frame_view.write_elr(entry_point);  // ELR - where to jump
-        frame_view.write_spsr(spsr);
-        
-        // NEON block at [sp+288..815] and x10/x11 at [sp+816] are all zero from write_bytes
-    }
-    
-    frame_base
+    akuma_switch::setup_fake_irq_frame(
+        stack_top,
+        entry_point,
+        x19,
+        x20,
+        x21,
+        thread_exit_stub as *const () as u64,
+    )
 }
 
 /// Stub for thread exit - threads should never return here
-#[unsafe(no_mangle)]
 extern "C" fn thread_exit_stub() -> ! {
     safe_print!(128, "[THREAD] Exit stub reached - marking terminated\n");
     mark_current_terminated();
@@ -4080,155 +3697,7 @@ extern "C" fn thread_exit_stub() -> ! {
 // 4. Context is zeroed when state becomes FREE
 // ============================================================================
 
-use core::cell::UnsafeCell;
-
-/// Wrapper to make UnsafeCell<Context> Sync
-///
-/// SAFETY: THREAD_CONTEXTS\[idx\] is safe to share across cores under `smp-shared`
-/// (real cross-core concurrency, not just IRQ-masked single-core mutual exclusion)
-/// because every access falls into one of three cases, none of which depends on
-/// the BKL:
-///
-/// 1. **Scheduler switch** (`SGI` context save/restore, `ThreadPool::get_context_ptrs`
-///    callers): the outgoing and incoming slots are both touched only while `POOL`
-///    (a real `Spinlock<ThreadPool>`) is held across the *entire* switch — decision,
-///    context save, and context load — per the M5c note at the switch call site.
-///    `POOL` is the actual inner lock here; the scheduler never picks a slot whose
-///    state isn't READY (see `schedule_indices`), so a slot mid-setup is never a
-///    switch target.
-/// 2. **Spawn / reclaim setup**: a slot is only written by the thread that just won
-///    the `FREE -> INITIALIZING` (or `TERMINATED -> INITIALIZING`, see
-///    `reclaim_terminated_slots`) transition via `THREAD_STATES[idx].compare_exchange`
-///    (SeqCst). The CAS gives the winner exclusive ownership of that index — no
-///    other core can also win it — and the scheduler ignores INITIALIZING slots, so
-///    nothing else touches THREAD_CONTEXTS\[idx\] until the owner publishes it.
-///    Publication is `mark_thread_ready`'s plain `Ordering::SeqCst` store: a SeqCst
-///    store is a release, so every write to THREAD_CONTEXTS\[idx\] that precedes it in
-///    the owner's program order is guaranteed visible to any core whose SeqCst load
-///    (the scheduler's `THREAD_STATES[idx].load`) observes READY — this is a real
-///    memory-model guarantee, not something that happens to hold only while the BKL
-///    also serializes everything. (Host test:
-///    `ready_transition_publishes_context_writes_without_a_lock`.)
-/// 3. **Self-read of the live thread** (`get_saved_user_context`/fork's
-///    `get_saved_user_context(current_thread_id())`): a thread reading its own slot
-///    cannot race itself — there is only one execution of "this thread" at a time by
-///    construction.
-///
-/// What this does NOT cover: the debug/stat dump paths (`dump_thread_resume_points`,
-/// `list_kernel_threads`) read arbitrary threads' contexts, including ones RUNNING on
-/// a peer core, with no synchronization at all. That is a deliberate, accepted race —
-/// display-only, single aligned `u64` reads (no torn multi-word reads, no memory
-/// unsafety), tolerant of a stale value. Do not use that pattern for anything that
-/// feeds a correctness decision.
-///
-/// See `docs/archive/BKL_PHASE7D_THREAD_CONTEXTS.md` for the full audit (including
-/// the dead, latently-racy `ThreadPool::spawn`/`spawn_with_stack_size`/
-/// `spawn_system_closure`/`spawn_user_closure` methods removed alongside this fix —
-/// they scanned for FREE slots with a plain load instead of a CAS, which is only
-/// sound because nothing else ever called them).
-#[repr(transparent)]
-struct SyncContext(UnsafeCell<Context>);
-
-// SAFETY: See the invariant written out above — real cross-core exclusion via
-// `POOL` (case 1) or a `THREAD_STATES` CAS (case 2), not single-core IRQ masking.
-unsafe impl Sync for SyncContext {}
-
-impl SyncContext {
-    const fn new() -> Self {
-        Self(UnsafeCell::new(Context::zero()))
-    }
-    
-    #[inline]
-    fn get(&self) -> *mut Context {
-        self.0.get()
-    }
-}
-
-/// Per-thread CPU contexts, kept out of `POOL` so the scheduler can access them
-/// without holding that lock across a context switch.
-/// Safety: see `SyncContext`'s SAFETY comment above — POOL / a THREAD_STATES CAS /
-/// self-read, not IRQ masking alone.
-static THREAD_CONTEXTS: [SyncContext; MAX_THREADS] = {
-    const INIT: SyncContext = SyncContext::new();
-    [INIT; MAX_THREADS]
-};
-
-/// The `Context` words that display-only paths and the self-read paths look at.
-///
-/// `Context` is `#[repr(C)]` and made of `u64`s, so each of these is one naturally aligned machine word.
-#[derive(Clone, Copy)]
-enum CtxField {
-    #[cfg(target_arch = "aarch64")]
-    Sp,
-    #[cfg(target_arch = "aarch64")]
-    Ttbr0,
-    #[cfg(target_arch = "aarch64")]
-    X30,
-    #[cfg(target_arch = "aarch64")]
-    UserEntry,
-    #[cfg(target_arch = "aarch64")]
-    UserSp,
-    #[cfg(target_arch = "aarch64")]
-    IsUserProcess,
-    #[cfg(target_arch = "x86_64")]
-    Rsp,
-}
-
-impl CtxField {
-    fn offset(self) -> usize {
-        use core::mem::offset_of;
-        match self {
-            #[cfg(target_arch = "aarch64")]
-            Self::Sp => offset_of!(Context, sp),
-            #[cfg(target_arch = "aarch64")]
-            Self::Ttbr0 => offset_of!(Context, ttbr0),
-            #[cfg(target_arch = "aarch64")]
-            Self::X30 => offset_of!(Context, x30),
-            #[cfg(target_arch = "aarch64")]
-            Self::UserEntry => offset_of!(Context, user_entry),
-            #[cfg(target_arch = "aarch64")]
-            Self::UserSp => offset_of!(Context, user_sp),
-            #[cfg(target_arch = "aarch64")]
-            Self::IsUserProcess => offset_of!(Context, is_user_process),
-            #[cfg(target_arch = "x86_64")]
-            Self::Rsp => offset_of!(Context, rsp),
-        }
-    }
-}
-
-/// Read one word of slot `idx`'s context without owning the slot (case 4 of `SyncContext`).
-///
-/// This is the single door for the accepted display-only race: the dump and stats paths and the saved-root
-/// scan read slots whose owner may be running on a peer core. One relaxed, naturally aligned word load, so
-/// the value may be stale but is never torn, and nothing here dereferences what it returns. **Do not use
-/// the result for a correctness decision**, and do not use it where the slot's owner is the caller (that is
-/// `with_current_ctx`'s case).
-///
-/// # Panics
-/// If `idx >= MAX_THREADS`.
-fn peek(idx: usize, field: CtxField) -> u64 {
-    let base = THREAD_CONTEXTS[idx].get().cast::<u8>();
-    // SAFETY: `THREAD_CONTEXTS` is a `static` array, so the cell is live for the whole run; `field.offset()` is
-    // the offset of a `u64` field of the `repr(C)` `Context`, so the address is 8-aligned and inside the cell.
-    // The load is atomic (relaxed), so a concurrent plain write by the owner is at worst observed stale.
-    unsafe { AtomicU64::from_ptr(base.add(field.offset()).cast::<u64>()).load(Ordering::Relaxed) }
-}
-
-/// Get a mutable pointer to a thread's context
-/// SAFETY: caller must be in one of the three cases `SyncContext` documents
-/// (holds `POOL` across the switch, owns the slot's INITIALIZING CAS, or is
-/// reading its own live thread).
-#[inline]
-fn get_context_mut(idx: usize) -> *mut Context {
-    THREAD_CONTEXTS[idx].get()
-}
-
-/// Get an immutable pointer to a thread's context  
-/// SAFETY: Caller must ensure thread is not running
-#[inline]
-fn get_context(idx: usize) -> *const Context {
-    THREAD_CONTEXTS[idx].get()
-}
+// The per-thread `Context` table, its borrow word and `peek` live in `akuma-switch`.
 
 
 /// Fixed-size thread pool with per-thread stack sizes
@@ -4278,8 +3747,7 @@ impl ThreadPool {
         
         // Initialize boot thread context in THREAD_CONTEXTS (not in slot)
         #[cfg(target_arch = "aarch64")]
-        unsafe {
-            let boot_ctx = &mut *get_context_mut(IDLE_THREAD_IDX);
+        akuma_switch::with_mut(IDLE_THREAD_IDX, |boot_ctx| {
             boot_ctx.magic = CONTEXT_MAGIC;
             boot_ctx.ttbr0 = boot_ttbr0;
             // Boot thread starts with kernel mode SPSR
@@ -4288,7 +3756,7 @@ impl ThreadPool {
             boot_ctx.user_entry = 0;
             boot_ctx.user_sp = 0;
             boot_ctx.is_user_process = 0;
-        }
+        });
         // x86_64: `Context` is just `{ magic, rsp }`, and `rsp` for the
         // already-running boot thread is meaningless until the first switch
         // *away* from it saves it (same as `amd64::sched::Context::empty`'s
@@ -4296,9 +3764,7 @@ impl ThreadPool {
         #[cfg(target_arch = "x86_64")]
         {
             let _ = boot_ttbr0;
-            unsafe {
-                (*get_context_mut(IDLE_THREAD_IDX)).magic = CONTEXT_MAGIC;
-            }
+            akuma_switch::with_mut(IDLE_THREAD_IDX, |ctx| ctx.magic = CONTEXT_MAGIC);
         }
 
         // Boot stack info — bounds come from the kernel via ExecConfig because they
@@ -4324,9 +3790,7 @@ impl ThreadPool {
         let exc_frame = akuma_pmm::alloc_pages_contiguous_zeroed(exc_pages).map(PhysFrame::new)
             .expect("Failed to allocate boot exception stack from PMM");
         let boot_exception_stack_ptr = mmu::phys_to_virt(exc_frame.addr);
-        let boot_exception_stack_top = unsafe {
-            (boot_exception_stack_ptr as *const u8).add(EXCEPTION_STACK_SIZE) as u64
-        };
+        let boot_exception_stack_top = (boot_exception_stack_ptr as usize + EXCEPTION_STACK_SIZE) as u64;
         // Align to 16 bytes
         self.slots[IDLE_THREAD_IDX].exception_stack_top = boot_exception_stack_top & !0xF;
         
@@ -4886,16 +4350,6 @@ impl ThreadPool {
             .count()
     }
 
-    pub unsafe fn get_context_ptrs(
-        &mut self,
-        old_idx: usize,
-        new_idx: usize,
-    ) -> (*mut Context, *const Context) {
-        // Contexts are now in THREAD_CONTEXTS static array, not in slots
-        let old_ptr = get_context_mut(old_idx);
-        let new_ptr = get_context(new_idx);
-        (old_ptr, new_ptr)
-    }
 }
 
 // ============================================================================
@@ -5011,8 +4465,7 @@ pub fn init() {
 
 /// Trampoline function that calls a boxed FnOnce closure
 fn closure_trampoline<F: FnOnce() -> ! + Send + 'static>(closure_ptr: *mut ()) -> ! {
-    let closure = unsafe { Box::from_raw(closure_ptr as *mut F) };
-    closure()
+    akuma_switch::call_boxed_closure::<F>(closure_ptr)
 }
 
 /// Spawn a new preemptible thread with a Rust closure and default stack.
@@ -5300,7 +4753,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
     // in schedule_indices: an EL1-interrupted thread is a BKL holder under
     // smp-shared and must stay displaceable (the BKL release valve).
     // SAFETY: current_sp is the live IRQ trap frame the vector asm just built.
-    let interrupted_el0 = unsafe { IrqFrame::at(current_sp) }.from_el0();
+    let interrupted_el0 = akuma_switch::irq_frame_at(current_sp).from_el0();
     
     // Get scheduling decision. Use try_lock instead of a blocking lock(): this handler
     // runs from the timer-driven SGI in IRQ context (PSTATE.I masked). If the timer
@@ -5350,19 +4803,15 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             safe_print!(64, "[SGI-DBG] switching {} -> {}\n", old_idx, new_idx);
         }
         
-        unsafe {
-            // Get context pointers
-            let old_ctx = get_context_mut(old_idx);
-            let new_ctx = get_context(new_idx);
-            
+        {
             // Save current SP (from IRQ frame) to old context
-            (*old_ctx).sp = current_sp;
+            akuma_switch::with_mut(old_idx, |old| old.sp = current_sp);
             
             // Save current TTBR0 to old context
             // CRITICAL: Processes set their own TTBR0 via activate(),
             // so we must save it here to restore correctly later
             let current_ttbr0: u64 = akuma_cpu::sysreg::ttbr0_el1();
-            (*old_ctx).ttbr0 = current_ttbr0;
+            akuma_switch::with_mut(old_idx, |old| old.ttbr0 = current_ttbr0);
 
             // TTBR0 tripwire, save side (§2f AS MISMATCH hunt, see EXPECTED_L0):
             // the live tables at switch-out must be the outgoing thread's own.
@@ -5378,7 +4827,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             }
 
             // Load new SP from new context
-            let new_sp = (*new_ctx).sp;
+            let (new_sp, new_ttbr0) = akuma_switch::with_ref(new_idx, |new| (new.sp, new.ttbr0));
 
             // Verify new SP is valid — FULLY, because code below **dereferences** it
             // (the POISON tripwire reads `new_sp + 240` / `+ 248`) and `ldp`/`stp` on a
@@ -5422,8 +4871,8 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
             // Update exception stack for new thread
             set_current_exception_stack(new_tpidr);
             
-            // Load TTBR0 for new thread
-            let new_ttbr0 = (*new_ctx).ttbr0;
+            // `new_ttbr0` (the incoming thread's saved root) was read with its SP above; both are stable
+            // while POOL is held.
 
             // TTBR0 tripwire, restore side: the tables we are about to install
             // must be the incoming thread's own. A miss means its saved context
@@ -5473,15 +4922,12 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
                 // outgoing table across the msr window, ACTIVE covers the incoming one
                 // from before the hardware can walk it.
                 let pub_core = mmu::publish_l0_begin(new_ttbr0, bkl::current_core_id() as usize);
-                core::arch::asm!(
-                    "dsb ish",
-                    "msr ttbr0_el1, {ttbr0}",
-                    "isb",
-                    "tlbi vmalle1",
-                    "dsb ish",
-                    "isb",
-                    ttbr0 = in(reg) new_ttbr0,
-                );
+                if !akuma_switch::install_ttbr0_flush(new_ttbr0) {
+                    safe_print!(128,
+                        "[SGI-S FATAL] new_ttbr0={:#x} is not a root! old_tid={} new_tid={}\n",
+                        new_ttbr0, old_idx, new_idx);
+                    loop { akuma_cpu::park::wfi(); }
+                }
                 mmu::publish_l0_end(pub_core);
             }
             
@@ -5498,7 +4944,7 @@ pub fn sgi_scheduler_handler_with_sp(irq: u32, current_sp: u64) -> u64 {
                 // SAFETY: `new_sp` is the IRQ frame we are about to restore — the
                 // live frame the vector built or the synthetic one the incoming
                 // thread was seeded with.
-                let frame = IrqFrame::at(new_sp);
+                let frame = akuma_switch::irq_frame_at(new_sp);
                 let elr = frame.elr();
                 let kernel_text = mmu::is_kernel_text(elr as usize);
                 // EL0-target frames must not eret into kernel text (NOT merely
@@ -5573,20 +5019,8 @@ pub fn sgi_scheduler_handler_with_sp(_irq: u32, _current_sp: u64) -> u64 {
     )
 }
 
-/// Called from the IRQ vector asm immediately after `mov sp, x0`: this core is
-/// now off the outgoing thread's kernel stack, so peers may pick that thread up
-/// (or recycle its slot). Clears the off-CPU gate `commit_switch` latched.
-/// Runs with IRQs masked on the incoming thread's stack; takes no locks.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_switch_finished() {
-    let core = bkl::current_core_id() as usize;
-    if core < MAX_CORES {
-        let tid = PER_CORE_OFFCPU[core].swap(usize::MAX, Ordering::SeqCst);
-        if tid < MAX_THREADS {
-            ON_CPU[tid].store(0, Ordering::Release);
-        }
-    }
-}
+// `rust_switch_finished` (the vector asm's `bl` target, which clears the outgoing thread's `ON_CPU` gate) is
+// defined in `akuma-switch` and re-exported above.
 
 /// Is `l0_base` still referenced by any thread slot's SAVED context? Returns the
 /// first `(tid, state)` found. The address-space free path consults this in
@@ -5664,10 +5098,7 @@ pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
 #[doc(hidden)]
 #[cfg(sgi_sched)]
 pub fn test_swap_saved_ctx_ttbr0(slot: usize, ttbr0: u64) -> u64 {
-    unsafe {
-        let ctx = &mut *get_context_mut(slot % MAX_THREADS);
-        core::mem::replace(&mut ctx.ttbr0, ttbr0)
-    }
+    akuma_switch::with_mut(slot % MAX_THREADS, |ctx| core::mem::replace(&mut ctx.ttbr0, ttbr0))
 }
 
 #[doc(hidden)]
@@ -5757,8 +5188,7 @@ pub fn update_thread_context(thread_id: usize, user_context: &UserContext) {
     }
     // Disable IRQs to safely access context
     with_irqs_disabled(|| {
-        unsafe {
-            let ctx = &mut *get_context_mut(thread_id);
+        let sp = akuma_switch::with_mut(thread_id, |ctx| {
             
             // Update context fields that are directly in Context struct
             ctx.elr = user_context.pc;
@@ -5786,14 +5216,16 @@ pub fn update_thread_context(thread_id: usize, user_context: &UserContext) {
             ctx.user_tls = user_context.tpidr;
             ctx.is_user_process = 1;
             
+            ctx.sp
+        });
+        {
             // Update registers in the trap frame on the stack
             // The trap frame is at ctx.sp
-            let frame_ptr = ctx.sp as *mut u64;
             
             // Frame layout from setup_fake_irq_frame / IRQ handler:
             // [sp+224]: x0, x1
-            frame_ptr.add(224/8).write_volatile(user_context.x0);
-            frame_ptr.add(232/8).write_volatile(user_context.x1);
+            akuma_switch::write_frame_word(sp, 224, user_context.x0);
+            akuma_switch::write_frame_word(sp, 232, user_context.x1);
             
             // We can update other registers if needed, but for fork() x0=0 is the main one.
             // The trap frame has 0 for others by default (from setup_fake_irq_frame).
@@ -5808,7 +5240,7 @@ pub fn update_thread_context(thread_id: usize, user_context: &UserContext) {
 // Waker Integration
 // ============================================================================
 
-use core::task::{RawWaker, RawWakerVTable, Waker};
+use core::task::Waker;
 
 /// Waker implementation for thread-based waking. Carries a [`WakeHandle`], so
 /// it wakes one *incarnation* of the slot — a waker created for a thread that
@@ -5894,38 +5326,26 @@ impl ThreadWaker {
 /// Creates a RawWaker around a packed [`WakeHandle`] — the generation rides in
 /// the data pointer, so a `Waker` cloned into an executor or wait registry
 /// stays incarnation-bound with no allocation.
-fn waker_from_handle(handle: WakeHandle) -> RawWaker {
-    let ptr = handle.0 as *const ();
-    RawWaker::new(ptr, &THREAD_WAKER_VTABLE)
+fn waker_from_handle(handle: WakeHandle) -> Waker {
+    akuma_switch::handle_waker::<ThreadWake>(handle.0)
+}
+
+/// The one effect a thread waker performs: wake the incarnation its packed handle names.
+struct ThreadWake;
+
+impl akuma_switch::HandleWake for ThreadWake {
+    fn wake(handle: u64) {
+        wake_by_handle(WakeHandle(handle));
+    }
 }
 
 /// Creates a waker for the current thread (its current incarnation).
 pub fn current_thread_waker() -> Waker {
-    unsafe { Waker::from_raw(waker_from_handle(current_wake_handle())) }
+    waker_from_handle(current_wake_handle())
 }
 
-const THREAD_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    thread_waker_clone,
-    thread_waker_wake,
-    thread_waker_wake_by_ref,
-    thread_waker_drop,
-);
-
-unsafe fn thread_waker_clone(data: *const ()) -> RawWaker {
-    RawWaker::new(data, &THREAD_WAKER_VTABLE)
-}
-
-unsafe fn thread_waker_wake(data: *const ()) {
-    wake_by_handle(WakeHandle(data as u64));
-}
-
-unsafe fn thread_waker_wake_by_ref(data: *const ()) {
-    wake_by_handle(WakeHandle(data as u64));
-}
-
-unsafe fn thread_waker_drop(_data: *const ()) {
-    // No-op, waker doesn't own any resources
-}
+// The `RawWakerVTable` (clone copies the word, drop releases nothing, wake calls `ThreadWake::wake`) is
+// `akuma_switch::handle_waker`.
 
 /// Returns a Waker for `thread_id`'s CURRENT incarnation. Only meaningful
 /// where the caller knows the tid is live right now — a waiter registering
@@ -5934,7 +5354,7 @@ unsafe fn thread_waker_drop(_data: *const ()) {
 /// fresh-looking handle; store a [`WakeHandle`] at enqueue time instead and
 /// wake with [`wake_by_handle`].
 pub fn get_waker_for_thread(thread_id: usize) -> Waker {
-    unsafe { Waker::from_raw(waker_from_handle(wake_handle_for_thread(thread_id))) }
+    waker_from_handle(wake_handle_for_thread(thread_id))
 }
 
 /// Block the current thread until the specified wake time, then yield
@@ -6115,15 +5535,7 @@ pub fn park_site(tid: usize) -> Option<(&'static str, u32)> {
     if tid >= MAX_THREADS {
         return None;
     }
-    let p = PARK_SITES[tid].load(Ordering::Relaxed);
-    if p == 0 {
-        return None;
-    }
-    // SAFETY: the only writer is `note_park_site`, which stores a
-    // `&'static Location<'static>` obtained from `Location::caller()`. A
-    // `Location` is compiled into the binary's read-only data and lives for the
-    // whole program, so the pointer is valid for `'static` and never dangles.
-    let loc: &'static core::panic::Location<'static> = unsafe { &*(p as *const _) };
+    let loc = akuma_switch::static_location(PARK_SITES[tid].load(Ordering::Relaxed))?;
     Some((loc.file(), loc.line()))
 }
 
@@ -6560,11 +5972,11 @@ where
             pool.stacks[slot_idx].top as u64
         };
         with_irqs_disabled(|| {
-            // SAFETY: this slot was just claimed and is not yet READY.
-            unsafe {
-                *get_context_mut(slot_idx) =
-                    x86_build_closure_context(stack_top as usize, trampoline, closure_ptr);
-            }
+            // This slot was just claimed and is not yet READY.
+            akuma_switch::set(
+                slot_idx,
+                akuma_switch::build_closure_context(stack_top as usize, trampoline as usize as u64, closure_ptr as u64),
+            );
             {
                 let mut pool = POOL.lock();
                 pool.slots[slot_idx].start_time_us = 0;
@@ -6591,7 +6003,7 @@ where
         // Set up fake IRQ frame for stack-based context switching
         let sp = setup_fake_irq_frame(
             stack_top,
-            thread_start_closure as *const () as u64,  // ELR - where to jump
+            akuma_switch::thread_start_closure_addr(),  // ELR - where to jump
             trampoline as *const () as u64,            // x19 - trampoline
             closure_ptr as u64,                        // x20 - closure data
             0,                                         // x21 - enable IRQs
@@ -6602,18 +6014,17 @@ where
             slot_idx, stack_top, sp);
 
         // Write minimal context - only SP and TTBR0 needed for simple path
-        unsafe {
-            let ctx = &mut *get_context_mut(slot_idx);
+        akuma_switch::with_mut(slot_idx, |ctx| {
             ctx.magic = CONTEXT_MAGIC;
             ctx.sp = sp;
             ctx.ttbr0 = boot_ttbr0;
             // Legacy fields for compatibility
             ctx.x19 = trampoline as *const () as u64;
             ctx.x20 = closure_ptr as u64;
-            ctx.x30 = thread_start_closure as *const () as u64;
-            ctx.elr = thread_start_closure as *const () as u64;
+            ctx.x30 = akuma_switch::thread_start_closure_addr();
+            ctx.elr = akuma_switch::thread_start_closure_addr();
             ctx.spsr = 0x00000345;
-        }
+        });
 
         // Write slot metadata (needs POOL lock)
         {
@@ -6711,8 +6122,7 @@ fn init_thread_slot_context(
 ) {
     // SAFETY: the slot was just claimed by this caller and is not READY yet, so
     // no scheduler can be reading the context concurrently.
-    unsafe {
-        let ctx = &mut *get_context_mut(slot_idx);
+    akuma_switch::with_mut(slot_idx, |ctx| {
         ctx.magic = CONTEXT_MAGIC;
         ctx.sp = sp;
         ctx.ttbr0 = boot_ttbr0;
@@ -6720,15 +6130,15 @@ fn init_thread_slot_context(
         ctx.x19 = trampoline;
         ctx.x20 = closure_ptr;
         ctx.x21 = x21;
-        ctx.x30 = thread_start_closure as *const () as u64;
-        ctx.elr = thread_start_closure as *const () as u64;
+        ctx.x30 = akuma_switch::thread_start_closure_addr();
+        ctx.elr = akuma_switch::thread_start_closure_addr();
         ctx.spsr = 0x00000345; // EL1h, IRQs enabled
         ctx.is_user_process = if start_irqs_disabled { 1 } else { 0 };
         // Drop the previous occupant's published user context (see fn docs).
         ctx.user_entry = 0;
         ctx.user_sp = 0;
         ctx.user_tls = 0;
-    }
+    });
 }
 
 /// Internal implementation for spawning user threads
@@ -6756,7 +6166,7 @@ where
         let closure_ptr = Box::into_raw(boxed) as *mut ();
         let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
         let claimed = with_irqs_disabled(|| {
-            POOL.lock().spawn_user_closure_initializing(trampoline, closure_ptr)
+            POOL.lock().spawn_user_closure_initializing(trampoline as usize as u64, closure_ptr)
         });
         return match claimed {
             Ok(slot) => {
@@ -6765,9 +6175,8 @@ where
                 Ok(slot)
             }
             Err(e) => {
-                // SAFETY: `closure_ptr` came from `Box::into_raw` above and the
-                // failed claim never handed it to a thread.
-                drop(unsafe { Box::from_raw(closure_ptr as *mut F) });
+                // `closure_ptr` came from `Box::into_raw` above and the failed claim never handed it to a thread.
+                akuma_switch::drop_boxed_closure::<F>(closure_ptr);
                 Err(e)
             }
         };
@@ -6816,12 +6225,12 @@ where
             pool.stacks[slot_idx].top as u64
         };
         with_irqs_disabled(|| {
-            // SAFETY: this slot was just claimed and is not yet READY, so no
-            // switch can be reading its context concurrently.
-            unsafe {
-                *get_context_mut(slot_idx) =
-                    x86_build_closure_context(stack_top as usize, trampoline, closure_ptr);
-            }
+            // This slot was just claimed and is not yet READY, so no switch can be reading its context
+            // concurrently.
+            akuma_switch::set(
+                slot_idx,
+                akuma_switch::build_closure_context(stack_top as usize, trampoline as usize as u64, closure_ptr as u64),
+            );
             {
                 let mut pool = POOL.lock();
                 pool.slots[slot_idx].start_time_us = 0;
@@ -6851,7 +6260,7 @@ where
         // Set up fake IRQ frame for stack-based context switching
         let sp = setup_fake_irq_frame(
             stack_top,
-            thread_start_closure as *const () as u64,  // ELR - where to jump
+            akuma_switch::thread_start_closure_addr(),  // ELR - where to jump
             trampoline as *const () as u64,            // x19 - trampoline
             closure_ptr as u64,                        // x20 - closure data
             x21,                                       // x21 - IRQ enable flag
@@ -7008,7 +6417,7 @@ pub fn dump_thread_resume_points() {
                 // SAFETY: `sp` is a switched-out thread's saved IRQ frame on
                 // its own kernel stack (guarded `!= 0`); the thread cannot free
                 // that stack while it is not running.
-                unsafe { IrqFrame::at(sp) }.elr()
+                akuma_switch::irq_frame_at(sp).elr()
             }
         };
         let stc = match st {
@@ -7088,7 +6497,7 @@ pub fn get_saved_kernel_resume(thread_id: usize) -> Option<(u64, u64, u64)> {
             // SAFETY: `sp` is a switched-out thread's saved IRQ frame on its
             // own kernel stack (guarded `!= 0`); the thread cannot free that
             // stack while it is not running.
-            unsafe { IrqFrame::at(sp) }.elr()
+            akuma_switch::irq_frame_at(sp).elr()
         };
         Some((peek(thread_id, CtxField::X30), live_elr, sp))
     })
@@ -7908,13 +7317,12 @@ mod state_transition_guard_tests {
         // A live, dynamically linked process thread: `update_thread_context` published
         // this triple at its execve and nothing has overwritten it since. This is the
         // parent of a fork — not a recycled slot.
-        unsafe {
-            let ctx = &mut *get_context_mut(tid);
+        akuma_switch::with_mut(tid, |ctx| {
             ctx.is_user_process = 1;
             ctx.user_entry = LDMUSL_DLSTART;
             ctx.user_sp = 0x20_3fff_e1f0; // the real per-parent constant from relr_probe_run1.log
             ctx.user_tls = 0x3272_a918;
-        }
+        });
         assert!(
             CURRENT_TRAP_FRAME[tid].load(Ordering::Acquire) == 0,
             "precondition: this slot has no live EL0 trap frame",
@@ -7934,10 +7342,9 @@ mod state_transition_guard_tests {
             "a freshly recycled slot still reported a user context",
         );
 
-        unsafe {
-            let ctx = &mut *get_context_mut(tid);
+        akuma_switch::with_mut(tid, |ctx| {
             ctx.is_user_process = 0;
-        }
+        });
         THREAD_STATES[tid].store(thread_state::FREE, Ordering::SeqCst);
     }
 
@@ -8049,11 +7456,13 @@ mod thread_contexts_invariant_tests {
     /// suite compiles on both (the 2026-10-28 pe session found the suite
     /// x86_64-broken since the Context split).
     #[cfg(test)]
-    fn stamp_slot(idx: usize) -> *mut u64 {
+    fn stamp_slot(idx: usize) -> &'static AtomicU64 {
+        // `Sp`/`Rsp`: an atomic view of the word (`peek`'s door), with no borrow held - these tests race
+        // claimants on purpose, and the claim (not a borrow) is what they check.
         #[cfg(target_arch = "aarch64")]
-        unsafe { core::ptr::addr_of_mut!((*get_context_mut(idx)).x19) }
+        { akuma_switch::word_cell(idx, CtxField::Sp) }
         #[cfg(target_arch = "x86_64")]
-        unsafe { core::ptr::addr_of_mut!((*get_context_mut(idx)).rsp) }
+        { akuma_switch::word_cell(idx, CtxField::Rsp) }
     }
 
     #[test]
@@ -8079,11 +7488,9 @@ mod thread_contexts_invariant_tests {
                     // context. Stamp it, yield to widen the window for a would-be
                     // clobberer, then check our stamp is still intact.
                     let marker = (idx as u64) << 32 | t as u64;
-                    unsafe {
-                        *stamp_slot(idx) = marker;
-                    }
+                    stamp_slot(idx).store(marker, Ordering::Relaxed);
                     thread::yield_now();
-                    let seen = unsafe { *stamp_slot(idx) };
+                    let seen = stamp_slot(idx).load(Ordering::Relaxed);
                     if seen != marker {
                         mismatches.fetch_add(1, Ordering::SeqCst);
                     }
@@ -8125,7 +7532,7 @@ mod thread_contexts_invariant_tests {
                     let mut spins = 0u32;
                     loop {
                         if get_thread_state(idx) == thread_state::READY {
-                            let val = unsafe { *stamp_slot(idx) };
+                            let val = stamp_slot(idx).load(Ordering::Relaxed);
                             if val != marker {
                                 mismatch.store(1, Ordering::SeqCst);
                             }
@@ -8138,9 +7545,7 @@ mod thread_contexts_invariant_tests {
                 })
             };
 
-            unsafe {
-                *stamp_slot(idx) = marker;
-            }
+            stamp_slot(idx).store(marker, Ordering::Relaxed);
             mark_thread_ready(idx);
 
             reader.join().unwrap();

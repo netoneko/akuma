@@ -418,13 +418,16 @@ mod tests {
     fn siginfo_union_arms_overlap_at_16() {
         let mut sf = RtSigFrame::zeroed();
         sf.info.fields.fault = SigfaultFields { si_addr: 0x1234_5678_9ABC_DEF0 };
-        // SAFETY: both arms are plain integers over the same 112 bytes; reading the
-        // other arm is exactly what the C union permits and what this asserts.
-        let (pid, uid) = unsafe { (sf.info.fields.chld.si_pid, sf.info.fields.chld.si_uid) };
+        // Both arms are plain integers over the same 112 bytes: where the `SIGCHLD` arm's `si_pid` and `si_uid`
+        // sit is a layout fact (`offset_of!`), and the bytes at those offsets are the fault address's halves.
+        let bytes = frame_bytes(&sf);
+        let chld = 16 + core::mem::offset_of!(SigchldFields, si_pid);
+        let pid = u32::from_le_bytes(bytes[chld..chld + 4].try_into().expect("4 bytes"));
+        let uid_at = 16 + core::mem::offset_of!(SigchldFields, si_uid);
+        let uid = u32::from_le_bytes(bytes[uid_at..uid_at + 4].try_into().expect("4 bytes"));
         assert_eq!(pid, 0x9ABC_DEF0);
         assert_eq!(uid, 0x1234_5678);
 
-        let bytes = frame_bytes(&sf);
         assert_eq!(&bytes[16..24], &0x1234_5678_9ABC_DEF0u64.to_le_bytes());
     }
 
@@ -460,9 +463,7 @@ mod tests {
     }
 
     fn frame_bytes(sf: &RtSigFrame) -> [u8; SIGFRAME_SIZE] {
-        // SAFETY: `RtSigFrame` is `#[repr(C)]` over integers and arrays of them, with
-        // no padding the assertions above do not name, so every byte is initialised.
-        unsafe { core::mem::transmute_copy(sf) }
+        akuma_switch::bytes_of::<RtSigFrame, SIGFRAME_SIZE>(sf)
     }
 
     // The `expect`s below cannot fire — the ranges are constant and in bounds — and a

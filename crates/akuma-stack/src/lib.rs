@@ -81,6 +81,36 @@ impl StackRegion {
         0
     }
 
+    /// Zero `len` bytes ending `back` bytes below the top: `[top - back, top - back + len)`.
+    /// Returns `false` and writes nothing if that range does not lie inside the region.
+    ///
+    /// For seeding a *fresh* stack (no live frames on it yet): the context builders and the fake IRQ frame.
+    #[must_use]
+    pub fn zero_below_top(&self, back: usize, len: usize) -> bool {
+        let Some(start) = self.top().checked_sub(back) else { return false };
+        if start < self.base || start.saturating_add(len) > self.top() {
+            return false;
+        }
+        for off in 0..len {
+            // SAFETY: `start + off < start + len <= top`, and `start >= base`: inside the vouched region.
+            unsafe { ((start + off) as *mut u8).write_volatile(0) };
+        }
+        true
+    }
+
+    /// Write `value` at the 8-aligned word `back` bytes below the top (`top - back`). `false`, writing
+    /// nothing, if the word is not inside the region or the address is not 8-aligned.
+    #[must_use]
+    pub fn write_word_below_top(&self, back: usize, value: u64) -> bool {
+        let Some(addr) = self.top().checked_sub(back) else { return false };
+        if addr < self.base || addr.saturating_add(8) > self.top() || !addr.is_multiple_of(8) {
+            return false;
+        }
+        // SAFETY: `[addr, addr + 8)` is inside the vouched region and 8-aligned.
+        unsafe { (addr as *mut u64).write_volatile(value) };
+        true
+    }
+
     /// Write `words` copies of `value` at the base. Writes nothing for a region too small to hold them.
     pub fn write_canary(&self, words: usize, value: u64) {
         if words.saturating_mul(8) > self.size {

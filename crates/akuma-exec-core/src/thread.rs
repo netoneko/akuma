@@ -72,6 +72,7 @@ pub mod thread_state {
 
 /// User trap frame saved by the EL0 sync/IRQ handler.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct UserTrapFrame {
     pub x0: u64, pub x1: u64, pub x2: u64, pub x3: u64,
     pub x4: u64, pub x5: u64, pub x6: u64, pub x7: u64,
