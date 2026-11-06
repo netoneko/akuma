@@ -27,6 +27,7 @@ dependencies = [
  "akuma-boot",
  "akuma-config",
  "akuma-cpu",
+ "akuma-entry",
  "akuma-exceptions",
  "akuma-exec",
  "akuma-ext2",
@@ -303,8 +304,10 @@ dependencies = [
  "akuma-fdt",
  "akuma-gic",
  "akuma-kernel-core",
+ "akuma-phys",
  "akuma-primitives",
  "akuma-psci",
+ "akuma-trap-aarch64",
 ]
 
 [[package]]

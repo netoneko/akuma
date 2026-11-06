@@ -11,6 +11,9 @@ akuma-cpu = { path = "../akuma-cpu" }
 akuma-exceptions = { path = "../akuma-exceptions" }
 akuma-exec = { path = "../akuma-exec" }
 akuma-fdt = { path = "../akuma-fdt" }
+# `Frame::read_bytes` for the exception services; `IrqFrame` for the IRQ-frame service.
+akuma-phys = { path = "../akuma-phys" }
+akuma-trap-aarch64 = { path = "../akuma-trap-aarch64" }
 akuma-gic = { path = "../akuma-gic" }
 # `console`, `platform` and `timer`. This edge is why `console.rs`/`platform.rs`
 # moved DOWN into that crate rather than staying beside the assembly: they hold

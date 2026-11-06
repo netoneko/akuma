@@ -826,6 +826,8 @@ akuma-kernel-glue = { path = "crates/akuma-kernel-glue" }
 akuma-alloc = { path = "crates/akuma-alloc" }
 akuma-uart = { path = "crates/akuma-uart" }
 akuma-pmm = { path = "crates/akuma-pmm" }
+# The exception entry module's GPR-transparency probe, called by the boot suite.
+akuma-entry = { path = "crates/akuma-entry" }
 # FreshFrame: staged pages in the CoW-break boot test.
 akuma-phys = { path = "crates/akuma-phys" }
 # The dependency-free leaf: `OnceCopy`, the one stack writer + `safe_print!`.

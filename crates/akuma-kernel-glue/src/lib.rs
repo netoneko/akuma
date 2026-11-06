@@ -1052,7 +1052,7 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     });
 
     // Set up exception vectors and enable IRQs
-    exceptions::init();
+    akuma_entry::exceptions::init();
     console::print("IRQ handling enabled\n");
 
     // Initialize timer

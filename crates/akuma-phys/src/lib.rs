@@ -17,6 +17,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub use akuma_primitives::addr::PhysAddr;
 
 /// Bytes in a frame.
@@ -198,6 +200,16 @@ impl FreshFrame {
         akuma_pmm::alloc_page_zeroed_user().map(|pa| Self { pa: PhysAddr::from_usize(pa) })
     }
 
+    /// Allocate `count` zeroed (and cache-cleaned) frames in one PMM lock hold, none
+    /// of them contiguous by promise. `None` allocates nothing: no partial batch.
+    /// Each is its own `FreshFrame`, so a frame the caller never gets to map is
+    /// returned to the PMM when its slot is dropped.
+    #[must_use]
+    pub fn alloc_batch_zeroed(count: usize) -> Option<alloc::vec::Vec<Self>> {
+        let pas = akuma_pmm::alloc_pages_zeroed(count)?;
+        Some(pas.into_iter().map(|pa| Self { pa: PhysAddr::from_usize(pa) }).collect())
+    }
+
     /// The frame's physical address, for mapping it. Does not give it up.
     #[must_use]
     pub fn pa(&self) -> PhysAddr {
@@ -258,9 +270,14 @@ impl FreshFrame {
     /// Return the frame to the PMM now, attributing the release to thread `tid`
     /// (what a premature-free report names). `Drop` does the same with `tid` 0.
     pub fn free_by(self, tid: u32) {
+        self.free_at(tid, akuma_pmm::FreeSite::Unknown);
+    }
+
+    /// As [`FreshFrame::free_by`], naming the code path for premature-free reports.
+    pub fn free_at(self, tid: u32, site: akuma_pmm::FreeSite) {
         let pa = self.pa.as_usize();
         core::mem::forget(self);
-        akuma_pmm::free_page(pa, tid);
+        akuma_pmm::free_page_at(pa, tid, site);
     }
 }
 

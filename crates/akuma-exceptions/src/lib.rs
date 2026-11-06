@@ -68,6 +68,9 @@
 //! applying to the exception path.
 
 #![no_std]
+// No `unsafe` in this crate: the vector table, the `#[no_mangle]` shims and the control-flow
+// register writes live in `akuma-entry::exceptions`. See `EntryServices`.
+#![forbid(unsafe_code)]
 
 // Kernel-specific lints, mirroring the bin crate's allow list (this code was
 // lint-clean inside the bin under the same allowances; the casts are MMIO/PTE
@@ -90,12 +93,6 @@
 
 extern crate alloc;
 
-// Only the two `global_asm!` blobs use it, and both are bare-metal gated: the
-// vector table's `.section .text.exceptions` does not assemble for a Mach-O
-// host, and the GPR-transparency probe deliberately takes an EL1 data abort.
-#[cfg(target_os = "none")]
-use core::arch::global_asm;
-
 use akuma_trap_aarch64::{FrameHandle, irq_frame::IrqFrame};
 
 // `safe_print!` resolves unqualified throughout this crate — the same move
@@ -105,631 +102,6 @@ use akuma_trap_aarch64::{FrameHandle, irq_frame::IrqFrame};
 // `src/console.rs`'s and did not travel; the timestamp prefix it added is the
 // only thing those call sites lost.
 pub use akuma_primitives::safe_print;
-
-// Exception vector table with EL0 support
-#[cfg(target_os = "none")]
-global_asm!(
-    r#"
-.section .text.exceptions
-.balign 0x800
-
-.global exception_vector_table
-exception_vector_table:
-    // Current EL with SP0 (shouldn't happen normally)
-    .balign 0x80
-    b sync_el1_handler              // Synchronous
-    .balign 0x80
-    b irq_handler                   // IRQ
-    .balign 0x80
-    b default_exception_handler     // FIQ
-    .balign 0x80
-    b default_exception_handler     // SError
-
-    // Current EL with SPx (kernel exceptions)
-    .balign 0x80
-    b sync_el1_handler              // Synchronous
-    .balign 0x80
-    b irq_handler                   // IRQ
-    .balign 0x80
-    b default_exception_handler     // FIQ
-    .balign 0x80
-    b default_exception_handler     // SError
-
-    // Lower EL using AArch64 (EL0 -> EL1, user mode exceptions)
-    .balign 0x80
-    b sync_el0_handler              // Synchronous (SVC syscalls, faults)
-    .balign 0x80
-    b irq_el0_handler               // IRQ
-    .balign 0x80
-    b default_exception_handler     // FIQ
-    .balign 0x80
-    b default_exception_handler     // SError
-
-    // Lower EL using AArch32 (not supported)
-    .balign 0x80
-    b default_exception_handler     // Synchronous
-    .balign 0x80
-    b irq_handler                   // IRQ
-    .balign 0x80
-    b default_exception_handler     // FIQ
-    .balign 0x80
-    b default_exception_handler     // SError
-
-// Default exception handler - calls Rust handler then returns
-default_exception_handler:
-    stp     x0, x1, [sp, #-16]!
-    stp     x29, x30, [sp, #-16]!
-    stp     x2, x3, [sp, #-16]!     // Save extra regs for IL bit fix
-    bl      rust_default_exception_handler
-    // Clear IL bit in SPSR before ERET to prevent EC=0xe
-    mrs     x2, spsr_el1
-    bic     x2, x2, #0x100000       // Clear IL bit (bit 20)
-    msr     spsr_el1, x2
-    ldp     x2, x3, [sp], #16
-    ldp     x29, x30, [sp], #16
-    ldp     x0, x1, [sp], #16
-    eret
-
-// Synchronous exception from EL1 (kernel fault)
-//
-// THIS HANDLER MUST BE TRANSPARENT TO EVERY GPR. It is not just a crash
-// reporter: `try_resolve_el1_cow_fault` and `try_resolve_el1_user_copy_lazy_fault`
-// both *resolve* the fault and return, and the `eret` below then re-executes the
-// faulting instruction. A retry is only correct if that instruction's input
-// registers still hold what they held when it aborted — so anything
-// `rust_sync_el1_handler` clobbers is silently written into memory by the retry.
-//
-// Saving x0-x3/x29/x30 was enough only by accident: the pre-2026-08-27
-// `__arch_copy_user_memory` byte loop kept its one live datum in x3. The
-// 64/16/8-byte widening put live data in x3-x10, and x4-x10 were destroyed
-// across the fault — so a `read(2)` whose destination page was faulted in
-// mid-copy stored leftover handler state instead of file bytes, 24 bytes per
-// page, while reporting the full byte count
-// (docs/archive/BUSYBOX_HASH_MISCOMPUTE.md).
-//
-// x19-x28 need no save here: `rust_sync_el1_handler` is `extern "C"`, so AAPCS64
-// obliges it to preserve them. x18 does, because Rust treats the platform
-// register as a temporary on this target unless told otherwise. FP/SIMD state is
-// still NOT saved — no kernel copy path holds live NEON across a store, and the
-// EL0/IRQ vectors that do save it are the ones that need it.
-sync_el1_handler:
-    // Save the volatile registers a retried instruction may still need. FIRST,
-    // so the block handed to Rust below keeps its documented layout.
-    stp     x4, x5, [sp, #-16]!
-    stp     x6, x7, [sp, #-16]!
-    stp     x8, x9, [sp, #-16]!
-    stp     x10, x11, [sp, #-16]!
-    stp     x12, x13, [sp, #-16]!
-    stp     x14, x15, [sp, #-16]!
-    stp     x16, x17, [sp, #-16]!
-    str     x18, [sp, #-16]!        // 8 bytes + 8 padding: keep sp 16-byte aligned
-
-    stp     x29, x30, [sp, #-16]!
-    stp     x0, x1, [sp, #-16]!
-    stp     x2, x3, [sp, #-16]!     // Save extra regs for IL bit fix
-    
-    // Call Rust handler with a pointer to the saved-register block
-    // (layout from the pushes above: +0 x2, +8 x3, +16 x0, +24 x1, +32 x29, +40 x30)
-    mov     x0, sp
-    bl      rust_sync_el1_handler
-    
-    // Clear IL bit in SPSR before ERET to prevent EC=0xe
-    mrs     x2, spsr_el1
-    bic     x2, x2, #0x100000       // Clear IL bit (bit 20)
-    msr     spsr_el1, x2
-    
-    // Restore and return
-    ldp     x2, x3, [sp], #16
-    ldp     x0, x1, [sp], #16
-    ldp     x29, x30, [sp], #16
-
-    ldr     x18, [sp], #16
-    ldp     x16, x17, [sp], #16
-    ldp     x14, x15, [sp], #16
-    ldp     x12, x13, [sp], #16
-    ldp     x10, x11, [sp], #16
-    ldp     x8, x9, [sp], #16
-    ldp     x6, x7, [sp], #16
-    ldp     x4, x5, [sp], #16
-    eret
-
-// Synchronous exception from EL0 (user mode)
-// Handles SVC syscalls and user faults
-//
-// Frame layout (832 bytes):
-//   [sp+0..287]:   UserTrapFrame (GPRs, SP_EL0, ELR, SPSR, TPIDR)
-//   [sp+288..303]: kernel SP + padding
-//   [sp+304..831]: NEON/FP state (Q0-Q31, FPCR, FPSR)
-sync_el0_handler:
-    // Allocate full frame: 304 GPR + 528 NEON = 832 bytes
-    sub     sp, sp, #832
-    
-    // Save x8-x11 first (we'll clobber these for stack/NEON operations)
-    stp     x8, x9, [sp, #64]
-    stp     x10, x11, [sp, #80]
-    
-    // Save kernel SP at offset 288 (sp + 832 = original SP)
-    add     x9, sp, #832
-    str     x9, [sp, #288]
-    
-    // Save NEON/FP state at [sp+304..831]
-    stp     q0,  q1,  [sp, #304]
-    stp     q2,  q3,  [sp, #336]
-    stp     q4,  q5,  [sp, #368]
-    stp     q6,  q7,  [sp, #400]
-    stp     q8,  q9,  [sp, #432]
-    stp     q10, q11, [sp, #464]
-    stp     q12, q13, [sp, #496]
-    stp     q14, q15, [sp, #528]
-    stp     q16, q17, [sp, #560]
-    stp     q18, q19, [sp, #592]
-    stp     q20, q21, [sp, #624]
-    stp     q22, q23, [sp, #656]
-    stp     q24, q25, [sp, #688]
-    stp     q26, q27, [sp, #720]
-    stp     q28, q29, [sp, #752]
-    stp     q30, q31, [sp, #784]
-    mrs     x10, fpcr
-    mrs     x11, fpsr
-    str     x10, [sp, #816]
-    str     x11, [sp, #824]
-    
-    // Save x0-x7
-    stp     x0, x1, [sp, #0]
-    stp     x2, x3, [sp, #16]
-    stp     x4, x5, [sp, #32]
-    stp     x6, x7, [sp, #48]
-    stp     x12, x13, [sp, #96]
-    stp     x14, x15, [sp, #112]
-    stp     x16, x17, [sp, #128]
-    stp     x18, x19, [sp, #144]
-    stp     x20, x21, [sp, #160]
-    stp     x22, x23, [sp, #176]
-    stp     x24, x25, [sp, #192]
-    stp     x26, x27, [sp, #208]
-    stp     x28, x29, [sp, #224]
-    str     x30, [sp, #240]
-    
-    // Save SP_EL0
-    mrs     x0, sp_el0
-    str     x0, [sp, #248]
-    
-    // Save ELR_EL1 (user PC)
-    mrs     x0, elr_el1
-    str     x0, [sp, #256]
-    
-    // Save SPSR_EL1
-    mrs     x0, spsr_el1
-    str     x0, [sp, #264]
-
-    // Save TPIDR_EL0 (TLS)
-    mrs     x0, tpidr_el0
-    str     x0, [sp, #272]
-    
-    // Pass pointer to saved context as first arg
-    mov     x0, sp
-
-    // Snapshot the trap syndrome (x1=ESR_EL1, x2=FAR_EL1) as handler args
-    // while PSTATE.I is still masked from the trap. The syndrome registers
-    // are per-PE and only hold THIS trap's values until the next trap on
-    // this PE; IRQs are enabled just below, so any later `mrs esr_el1` /
-    // `mrs far_el1` in the handler can observe a different trap's syndrome
-    // (SMP phantom-SVC: an EL0 data abort classified as EC_SVC64 after the
-    // BKL spin was preempted by other threads' traps).
-    mrs     x1, esr_el1
-    mrs     x2, far_el1
-
-    // Enable IRQs during syscall handling to allow preemption
-    msr     daifclr, #2
-    isb
-
-    // Call Rust handler - returns syscall result in x0
-    bl      rust_sync_el0_handler
-    
-    // Disable IRQs before restoring registers
-    msr     daifset, #2
-    isb
-    
-    // x0 now has the syscall return value
-    // Save it to scratch area while we restore other registers
-    str     x0, [sp, #280]
-    
-    // Restore NEON/FP state from [sp+304..831]
-    ldr     x0, [sp, #816]
-    ldr     x1, [sp, #824]
-    msr     fpcr, x0
-    msr     fpsr, x1
-    ldp     q0,  q1,  [sp, #304]
-    ldp     q2,  q3,  [sp, #336]
-    ldp     q4,  q5,  [sp, #368]
-    ldp     q6,  q7,  [sp, #400]
-    ldp     q8,  q9,  [sp, #432]
-    ldp     q10, q11, [sp, #464]
-    ldp     q12, q13, [sp, #496]
-    ldp     q14, q15, [sp, #528]
-    ldp     q16, q17, [sp, #560]
-    ldp     q18, q19, [sp, #592]
-    ldp     q20, q21, [sp, #624]
-    ldp     q22, q23, [sp, #656]
-    ldp     q24, q25, [sp, #688]
-    ldp     q26, q27, [sp, #720]
-    ldp     q28, q29, [sp, #752]
-    ldp     q30, q31, [sp, #784]
-    
-    // Restore SPSR_EL1 (clear IL bit to prevent EC=0xe)
-    ldr     x0, [sp, #264]
-    bic     x0, x0, #0x100000
-    msr     spsr_el1, x0
-    
-    // Restore ELR_EL1
-    ldr     x0, [sp, #256]
-    msr     elr_el1, x0
-    
-    // Restore SP_EL0
-    ldr     x0, [sp, #248]
-    msr     sp_el0, x0
-
-    // Restore TPIDR_EL0 (TLS)
-    ldr     x0, [sp, #272]
-    msr     tpidr_el0, x0
-    
-    // Restore x30
-    ldr     x30, [sp, #240]
-    ldp     x28, x29, [sp, #224]
-    ldp     x26, x27, [sp, #208]
-    ldp     x24, x25, [sp, #192]
-    ldp     x22, x23, [sp, #176]
-    ldp     x20, x21, [sp, #160]
-    ldp     x18, x19, [sp, #144]
-    ldp     x16, x17, [sp, #128]
-    ldp     x14, x15, [sp, #112]
-    ldp     x12, x13, [sp, #96]
-    ldp     x10, x11, [sp, #80]
-    ldp     x8, x9, [sp, #64]
-    ldp     x6, x7, [sp, #48]
-    ldp     x4, x5, [sp, #32]
-    ldp     x2, x3, [sp, #16]
-    ldr     x1, [sp, #8]
-    
-    // Load syscall return value into x0
-    ldr     x0, [sp, #280]
-    
-    // Cleanup stack frame (832 bytes)
-    add     sp, sp, #832
-    
-    // Return to user mode
-    eret
-
-// IRQ from EL0 (user mode)
-// UNIFIED: Stack-based save/restore, same mechanism as EL1 IRQ handler.
-// Context switch: Rust handler returns new SP, assembly does the actual switch.
-// 
-// EL0 IRQ frame layout (832 bytes total) — full field list in
-// `threading::setup_fake_irq_frame`, which writes this exact layout:
-//   [sp+0..287]:   GPR block (x30, x28-x29, ..., x0-x1, ELR, SPSR, SP_EL0, TPIDR)
-//   [sp+288..815]: NEON block (Q0-Q31 at +288, FPCR at +800, FPSR at +808)
-//   [sp+816..831]: x10, x11 (scratch, pushed first / popped last)
-//
-// NOT interchangeable with the EL0 *sync* frame (`UserTrapFrame`), which is also
-// 832 bytes but orders its GPRs differently and starts NEON at +304.
-irq_el0_handler:
-    // ============================================================
-    // SAVE PHASE: Push all registers to stack in fixed layout
-    // EL0 IRQ frame: 832 bytes (GPR + NEON/FP)
-    // ============================================================
-    
-    // First save x10, x11 (need them for system registers)
-    stp     x10, x11, [sp, #-16]!
-
-    // Save NEON/FP state (528 bytes: 32 Q-regs + FPCR + FPSR)
-    sub     sp, sp, #528
-    stp     q0,  q1,  [sp, #0]
-    stp     q2,  q3,  [sp, #32]
-    stp     q4,  q5,  [sp, #64]
-    stp     q6,  q7,  [sp, #96]
-    stp     q8,  q9,  [sp, #128]
-    stp     q10, q11, [sp, #160]
-    stp     q12, q13, [sp, #192]
-    stp     q14, q15, [sp, #224]
-    stp     q16, q17, [sp, #256]
-    stp     q18, q19, [sp, #288]
-    stp     q20, q21, [sp, #320]
-    stp     q22, q23, [sp, #352]
-    stp     q24, q25, [sp, #384]
-    stp     q26, q27, [sp, #416]
-    stp     q28, q29, [sp, #448]
-    stp     q30, q31, [sp, #480]
-    mrs     x10, fpcr
-    mrs     x11, fpsr
-    str     x10, [sp, #512]
-    str     x11, [sp, #520]
-
-    // Save TPIDR_EL0 (TLS thread pointer)
-    mrs     x10, tpidr_el0
-    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
-    
-    // Save SP_EL0 (user stack pointer) - unique to EL0 handler
-    mrs     x10, sp_el0
-    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
-    
-    // Save ELR_EL1 and SPSR_EL1 to stack
-    mrs     x10, elr_el1
-    mrs     x11, spsr_el1
-    stp     x10, x11, [sp, #-16]!
-    
-    // Save all other registers
-    stp     x0, x1, [sp, #-16]!
-    stp     x2, x3, [sp, #-16]!
-    stp     x4, x5, [sp, #-16]!
-    stp     x6, x7, [sp, #-16]!
-    stp     x8, x9, [sp, #-16]!
-    stp     x12, x13, [sp, #-16]!
-    stp     x14, x15, [sp, #-16]!
-    stp     x16, x17, [sp, #-16]!
-    stp     x18, x19, [sp, #-16]!
-    stp     x20, x21, [sp, #-16]!
-    stp     x22, x23, [sp, #-16]!
-    stp     x24, x25, [sp, #-16]!
-    stp     x26, x27, [sp, #-16]!
-    stp     x28, x29, [sp, #-16]!
-    str     x30, [sp, #-16]!
-    
-    // Pass current SP as argument (x0)
-    mov     x0, sp
-    
-    // Call rust handler - returns new SP in x0 (or 0 if no switch needed)
-    bl      rust_irq_handler_with_sp
-    
-    // Check if context switch needed (x0 != 0)
-    cbz     x0, 4f
-    mov     sp, x0              // Switch SP in assembly!
-    // This core is now OFF the outgoing thread's stack — clear its off-CPU
-    // gate so peers may pick it up. Clobbers only caller-saved regs + x30,
-    // all of which the restore below overwrites. Uses the incoming thread's
-    // free stack space below its frame.
-    bl      rust_switch_finished
-4:
-    
-    // ============================================================
-    // RESTORE PHASE: Pop all registers from (possibly new) stack
-    // ============================================================
-    
-    // Restore general registers (reverse order of save)
-    ldr     x30, [sp], #16
-    ldp     x28, x29, [sp], #16
-    ldp     x26, x27, [sp], #16
-    ldp     x24, x25, [sp], #16
-    ldp     x22, x23, [sp], #16
-    ldp     x20, x21, [sp], #16
-    ldp     x18, x19, [sp], #16
-    ldp     x16, x17, [sp], #16
-    ldp     x14, x15, [sp], #16
-    ldp     x12, x13, [sp], #16
-    ldp     x8, x9, [sp], #16
-    ldp     x6, x7, [sp], #16
-    ldp     x4, x5, [sp], #16
-    ldp     x2, x3, [sp], #16
-    ldp     x0, x1, [sp], #16
-    
-    // Restore ELR and SPSR FROM STACK
-    ldp     x10, x11, [sp], #16      // x10 = ELR, x11 = SPSR
-    
-    // Clear IL bit in SPSR to prevent EC=0xe
-    bic     x11, x11, #0x100000
-    
-    // Write to system registers
-    msr     elr_el1, x10
-    msr     spsr_el1, x11
-    
-    // CRITICAL: Check for ELR=0 bug before ERET
-    cbnz    x10, 5f
-    mov     x0, #0xDEAD
-    movk    x0, #0xBEEF, lsl #16
-6:  wfi
-    b       6b
-5:
-    
-    // Restore SP_EL0 (user stack pointer)
-    ldr     x10, [sp], #16           // Load SP_EL0 from stack
-    msr     sp_el0, x10
-
-    // Restore TPIDR_EL0 (TLS thread pointer)
-    ldr     x10, [sp], #16
-    msr     tpidr_el0, x10
-
-    // Restore NEON/FP state
-    ldr     x10, [sp, #512]
-    ldr     x11, [sp, #520]
-    msr     fpcr, x10
-    msr     fpsr, x11
-    ldp     q0,  q1,  [sp, #0]
-    ldp     q2,  q3,  [sp, #32]
-    ldp     q4,  q5,  [sp, #64]
-    ldp     q6,  q7,  [sp, #96]
-    ldp     q8,  q9,  [sp, #128]
-    ldp     q10, q11, [sp, #160]
-    ldp     q12, q13, [sp, #192]
-    ldp     q14, q15, [sp, #224]
-    ldp     q16, q17, [sp, #256]
-    ldp     q18, q19, [sp, #288]
-    ldp     q20, q21, [sp, #320]
-    ldp     q22, q23, [sp, #352]
-    ldp     q24, q25, [sp, #384]
-    ldp     q26, q27, [sp, #416]
-    ldp     q28, q29, [sp, #448]
-    ldp     q30, q31, [sp, #480]
-    add     sp, sp, #528
-    
-    // Restore original x10, x11
-    ldp     x10, x11, [sp], #16
-    
-    eret
-
-// IRQ from EL1 (kernel mode)
-// UNIFIED: Stack-based save/restore, same frame layout as EL0 IRQ handler.
-// Context switch: Rust handler returns new SP, assembly does the actual switch.
-//
-// UNIFIED IRQ frame layout (832 bytes total) - same as EL0:
-//   [sp+0..287]:   GPR block (x30, x28-x29, ..., x0-x1, ELR, SPSR, SP_EL0, TPIDR)
-//   [sp+288..815]: NEON block (Q0-Q31 at +288, FPCR at +800, FPSR at +808)
-//   [sp+816..831]: x10, x11 (scratch, outermost — inside the frame, not past it)
-irq_handler:
-    // ============================================================
-    // SAVE PHASE: Push all registers to stack in fixed layout
-    // IRQ frame: 832 bytes total (unified with EL0 handler)
-    // ============================================================
-    
-    // First save x10, x11 (need them for system registers)
-    stp     x10, x11, [sp, #-16]!
-
-    // Save NEON/FP state (528 bytes: 32 Q-regs + FPCR + FPSR)
-    sub     sp, sp, #528
-    stp     q0,  q1,  [sp, #0]
-    stp     q2,  q3,  [sp, #32]
-    stp     q4,  q5,  [sp, #64]
-    stp     q6,  q7,  [sp, #96]
-    stp     q8,  q9,  [sp, #128]
-    stp     q10, q11, [sp, #160]
-    stp     q12, q13, [sp, #192]
-    stp     q14, q15, [sp, #224]
-    stp     q16, q17, [sp, #256]
-    stp     q18, q19, [sp, #288]
-    stp     q20, q21, [sp, #320]
-    stp     q22, q23, [sp, #352]
-    stp     q24, q25, [sp, #384]
-    stp     q26, q27, [sp, #416]
-    stp     q28, q29, [sp, #448]
-    stp     q30, q31, [sp, #480]
-    mrs     x10, fpcr
-    mrs     x11, fpsr
-    str     x10, [sp, #512]
-    str     x11, [sp, #520]
-
-    // Save TPIDR_EL0 (TLS thread pointer)
-    mrs     x10, tpidr_el0
-    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
-    
-    // Save SP_EL0 - preserves user stack during syscalls and enables
-    // unified frame layout between EL0 and EL1 handlers
-    mrs     x10, sp_el0
-    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
-    
-    // Save ELR_EL1 and SPSR_EL1 to stack
-    mrs     x10, elr_el1
-    mrs     x11, spsr_el1
-    stp     x10, x11, [sp, #-16]!
-    
-    // Save all other registers
-    stp     x0, x1, [sp, #-16]!
-    stp     x2, x3, [sp, #-16]!
-    stp     x4, x5, [sp, #-16]!
-    stp     x6, x7, [sp, #-16]!
-    stp     x8, x9, [sp, #-16]!
-    stp     x12, x13, [sp, #-16]!
-    stp     x14, x15, [sp, #-16]!
-    stp     x16, x17, [sp, #-16]!
-    stp     x18, x19, [sp, #-16]!
-    stp     x20, x21, [sp, #-16]!
-    stp     x22, x23, [sp, #-16]!
-    stp     x24, x25, [sp, #-16]!
-    stp     x26, x27, [sp, #-16]!
-    stp     x28, x29, [sp, #-16]!
-    str     x30, [sp, #-16]!
-    
-    // Pass current SP as argument (x0)
-    mov     x0, sp
-    
-    // Call rust handler - returns new SP in x0 (or 0 if no switch needed)
-    bl      rust_irq_handler_with_sp
-    
-    // Check if context switch needed (x0 != 0)
-    cbz     x0, 3f
-    mov     sp, x0              // Switch SP in assembly!
-    // Same off-CPU gate clear as the EL0 IRQ path — see there.
-    bl      rust_switch_finished
-3:
-    
-    // ============================================================
-    // RESTORE PHASE: Pop all registers from (possibly new) stack
-    // ============================================================
-    
-    // Restore general registers (reverse order of save)
-    ldr     x30, [sp], #16
-    ldp     x28, x29, [sp], #16
-    ldp     x26, x27, [sp], #16
-    ldp     x24, x25, [sp], #16
-    ldp     x22, x23, [sp], #16
-    ldp     x20, x21, [sp], #16
-    ldp     x18, x19, [sp], #16
-    ldp     x16, x17, [sp], #16
-    ldp     x14, x15, [sp], #16
-    ldp     x12, x13, [sp], #16
-    ldp     x8, x9, [sp], #16
-    ldp     x6, x7, [sp], #16
-    ldp     x4, x5, [sp], #16
-    ldp     x2, x3, [sp], #16
-    ldp     x0, x1, [sp], #16
-    
-    // Restore ELR and SPSR FROM STACK
-    ldp     x10, x11, [sp], #16      // x10 = ELR, x11 = SPSR
-    
-    // Clear IL bit in SPSR to prevent EC=0xe
-    bic     x11, x11, #0x100000
-    
-    // Write to system registers
-    msr     elr_el1, x10
-    msr     spsr_el1, x11
-    
-    // CRITICAL: Check for ELR=0 bug
-    cbnz    x10, 1f
-    mov     x0, #0xDEAD
-    movk    x0, #0xBEEF, lsl #16
-2:  wfi
-    b       2b
-1:
-    
-    // Restore SP_EL0 (user stack pointer) - matches EL0 handler frame layout
-    ldr     x10, [sp], #16
-    msr     sp_el0, x10
-
-    // Restore TPIDR_EL0 (TLS thread pointer)
-    ldr     x10, [sp], #16
-    msr     tpidr_el0, x10
-
-    // Restore NEON/FP state
-    ldr     x10, [sp, #512]
-    ldr     x11, [sp, #520]
-    msr     fpcr, x10
-    msr     fpsr, x11
-    ldp     q0,  q1,  [sp, #0]
-    ldp     q2,  q3,  [sp, #32]
-    ldp     q4,  q5,  [sp, #64]
-    ldp     q6,  q7,  [sp, #96]
-    ldp     q8,  q9,  [sp, #128]
-    ldp     q10, q11, [sp, #160]
-    ldp     q12, q13, [sp, #192]
-    ldp     q14, q15, [sp, #224]
-    ldp     q16, q17, [sp, #256]
-    ldp     q18, q19, [sp, #288]
-    ldp     q20, q21, [sp, #320]
-    ldp     q22, q23, [sp, #352]
-    ldp     q24, q25, [sp, #384]
-    ldp     q26, q27, [sp, #416]
-    ldp     q28, q29, [sp, #448]
-    ldp     q30, q31, [sp, #480]
-    add     sp, sp, #528
-    
-    // Restore original x10, x11
-    ldp     x10, x11, [sp], #16
-    
-    eret
-"#
-);
-
-#[cfg(target_os = "none")]
-unsafe extern "C" {
-    static exception_vector_table: u8;
-}
 
 // ============================================================================
 // Per-Thread Exception Stacks
@@ -759,45 +131,11 @@ unsafe extern "C" {
 // See docs/WAIT_QUEUES.md for detailed documentation.
 // ============================================================================
 
-/// Set the current exception stack for the running thread
-/// Called during context switch to update TPIDR_EL1
-#[inline]
-pub fn set_current_exception_stack(stack_top: u64) {
-    // Bare metal only: `msr tpidr_el1` is an EL1 instruction. It *assembles* on
-    // the aarch64 development host, so an ungated body would build under
-    // `cargo test` and die with `SIGILL` the first time a host test reached it —
-    // the trap `akuma-cpu`'s "Host builds" note records. See this crate's own
-    // note of the same name.
-    #[cfg(target_os = "none")]
-    unsafe {
-        core::arch::asm!("msr tpidr_el1, {}", in(reg) stack_top);
-    }
-    #[cfg(not(target_os = "none"))]
-    let _ = stack_top;
-}
-
 /// Get the current exception stack pointer from TPIDR_EL1
 #[inline]
 #[allow(dead_code)]
 pub fn get_current_exception_stack() -> u64 {
     akuma_cpu::sysreg::tpidr_el1()
-}
-
-/// Initialize the exception stack pointer for the boot thread
-/// Must be called before any user mode code runs
-pub fn init_exception_stack() {
-    // Boot thread (thread 0) uses the boot stack; its early exception stack is at
-    // the very top of that region. Read the STACK_TOP linker symbol (derived from
-    // the linked image size in linker.ld, the same one boot.rs loads as the initial
-    // SP and main.rs reads) so this can never go stale. Hardcoding the old
-    // 0x40800000 once pointed the early exception stack into the kernel heap at low
-    // RAM after the boot stack was relocated — see docs/LOW_MEMORY_ENVIRONMENT.md
-    // "Known bug".
-    unsafe extern "C" {
-        static STACK_TOP: u8;
-    }
-    let boot_stack_top = &raw const STACK_TOP as u64;
-    set_current_exception_stack(boot_stack_top);
 }
 
 pub use akuma_exec::threading::UserTrapFrame;
@@ -1342,19 +680,22 @@ fn demand_page_lazy_region(
         let needed = needed.min(akuma_pmm::user_readahead_budget(akuma_pmm::free_count()));
 
         // Batch-allocate all needed frames in one lock acquisition
-        let frame_pool = if needed > 0 {
-            alloc_pages_zeroed(needed).unwrap_or_else(|| {
+        let mut frame_pool: alloc::vec::Vec<Option<akuma_phys::FreshFrame>> = if needed > 0 {
+            akuma_phys::FreshFrame::alloc_batch_zeroed(needed).unwrap_or_else(|| {
                 // Fallback: allocate what we can one at a time, still honouring the
                 // reserve so we can't starve the kernel.
                 let mut v = alloc::vec::Vec::new();
                 for _ in 0..needed {
-                    match alloc_page_zeroed_user() {
+                    match akuma_phys::FreshFrame::alloc_zeroed_user() {
                         Some(f) => v.push(f),
                         None => break,
                     }
                 }
                 v
             })
+            .into_iter()
+            .map(Some)
+            .collect()
         } else {
             alloc::vec::Vec::new()
         };
@@ -1407,8 +748,9 @@ fn demand_page_lazy_region(
                     } else {
                         (akuma_exec::runtime::runtime().read_at)(path, file_off, &mut disk)
                     };
-                    let kva = akuma_exec::mmu::phys_to_virt(pf.addr).cast::<u8>();
-                    let cached = unsafe { core::slice::from_raw_parts(kva, 0x1000) };
+                    let mut cached_page = alloc::vec![0u8; 0x1000];
+                    (services().read_frame_bytes)(pf.addr, &mut cached_page);
+                    let cached = cached_page.as_slice();
                     if got == Ok(0x1000) && cached != disk.as_slice() {
                         let at = cached.iter().zip(disk.iter()).position(|(a, b)| a != b).unwrap_or(0);
                         akuma_pmm::dp_count(&akuma_pmm::DP_FILE_CACHE_MISMATCH, 1);
@@ -1437,7 +779,9 @@ fn demand_page_lazy_region(
             if pool_idx >= frame_pool.len() {
                 break;
             }
-            let pf = frame_pool[pool_idx];
+            // Staged until the fill below is done; `publish` hands it on as the address
+            // vocabulary type the install pass and the file cache work in.
+            let mut staged = frame_pool[pool_idx].take().expect("pool slot consumed once");
             pool_idx += 1;
 
             // `true` unless the fill below came up short. A page with no file data to
@@ -1451,15 +795,13 @@ fn demand_page_lazy_region(
                     let dst_off = pg_data_start - cur_va;
                     let file_off = file_offset + (pg_data_start - segment_va);
                     let len = pg_data_end - pg_data_start;
-                    let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
-                    let page_buf = unsafe {
-                        core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
-                    };
-                    let got = if inode != 0 {
-                        (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
-                    } else {
-                        (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
-                    };
+                    let got = staged.fill_with(dst_off, len, |page_buf| {
+                        if inode != 0 {
+                            (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
+                        } else {
+                            (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
+                        }
+                    });
                     // The range is already clamped to `filesz`, so anything less than
                     // `len` is a defect, not EOF. The frame came from
                     // `alloc_pages_zeroed`, so whatever was not read reads back as
@@ -1474,6 +816,10 @@ fn demand_page_lazy_region(
                     }
                 }
             }
+
+            // Filled. From here the frame is the install pass's and the file cache's, in the
+            // address vocabulary (`PhysFrame`), exactly as before.
+            let pf = akuma_exec::PhysFrame::new(staged.publish());
 
             if is_exec {
                 // By the kernel VA (kva), not the user VA: the user page is not mapped
@@ -1575,7 +921,12 @@ fn demand_page_lazy_region(
         // Free race-lost frames + unused pool frames (outside the hold).
         for pf in race_free { free_page_at(pf, akuma_pmm::FreeSite::FaultRaceLost); }
         while pool_idx < frame_pool.len() {
-            free_page_at(frame_pool[pool_idx], akuma_pmm::FreeSite::FaultPoolSurplus);
+            if let Some(surplus) = frame_pool[pool_idx].take() {
+                surplus.free_at(
+                    akuma_primitives::preempt::current_tid() as u32,
+                    akuma_pmm::FreeSite::FaultPoolSurplus,
+                );
+            }
             pool_idx += 1;
         }
 
@@ -2572,51 +1923,41 @@ fn do_rt_sigreturn(frame: FrameHandle) -> Option<u64> {
     Some(sf.uc.uc_mcontext.regs[0])
 }
 
-/// Point this PE's `VBAR_EL1` at the kernel's exception vector table, and `isb`
-/// so it is in effect before anything can take an exception.
-///
-/// Called once per core: by [`init`] on the BSP, and by
-/// `smp_shared::secondary_shared_start` on every PSCI-woken secondary — cores
-/// share one kernel image, so they share one vector table. Those were two
-/// independently written copies of this `msr` until 2026-09-01 (the secondary's
-/// resolved the symbol with its own `adrp`/`add` pair); a vector-table install
-/// that exists twice is a vector-table install that can drift.
-///
-/// `msr vbar_el1` is deliberately absent from `akuma-cpu` — installing a vector
-/// table is a change of control flow, so the obligation is real and stays here,
-/// discharged once.
-pub fn install_vbar() {
-    // Bare metal only, for two independent reasons: the vector table itself is a
-    // `global_asm!` blob that only assembles for the kernel target, and
-    // `msr vbar_el1` is an EL1 instruction. See this crate's "Host builds" note.
-    //
-    // SAFETY: installs the address of this kernel's own vector table, a linker
-    // symbol in `.text`. `&raw const` resolves the symbol without reading
-    // through it; the `isb` makes the new base effective before the next
-    // exception can be taken.
-    #[cfg(target_os = "none")]
-    unsafe {
-        let vbar = &raw const exception_vector_table as u64;
+// ============================================================================
+// Entry services
+// ============================================================================
+//
+// The few things this crate needs that are unsafe to do and so are done by
+// `akuma-entry`, which owns the vector table and the `#[no_mangle]` shims: the IRQ
+// frame at a given stack pointer, two display-only reads of kernel memory for the fatal
+// EL1 crash dump, and a physical-frame read for the file-cache verify diagnostic.
+// Handed over as plain `fn` pointers so this crate can `forbid(unsafe_code)`.
 
-        // Set VBAR_EL1 (Vector Base Address Register)
-        core::arch::asm!(
-            "msr vbar_el1, {vbar}",
-            "isb",
-            vbar = in(reg) vbar
-        );
-    }
+/// See the section header.
+#[derive(Clone, Copy)]
+pub struct EntryServices {
+    /// The live IRQ trap frame whose base is `sp`.
+    pub irq_frame_at: fn(u64) -> IrqFrame,
+    /// Read a `u32` at a kernel address (crash dump only).
+    pub peek_u32: fn(u64) -> u32,
+    /// Read a `u64` at a kernel address (crash dump only).
+    pub peek_u64: fn(u64) -> u64,
+    /// Copy the start of physical frame `pa` into the buffer.
+    pub read_frame_bytes: fn(usize, &mut [u8]),
 }
 
-/// Install exception vector table
-pub fn init() {
-    // Initialize exception stack before enabling exceptions
-    init_exception_stack();
+static SERVICES: akuma_primitives::Registered<EntryServices> = akuma_primitives::Registered::new(
+    "exceptions: EntryServices not registered - akuma_entry::exceptions::init() registers them",
+);
 
-    install_vbar();
+/// Register the entry services. Called once, by `akuma-entry`, before the vector table is installed.
+pub fn register_entry_services(s: EntryServices) {
+    SERVICES.register(s);
+}
 
-    // Enable IRQs by clearing DAIF.I, now that VBAR_EL1 is installed and
-    // synchronized above — the ordering that makes taking an interrupt safe.
-    akuma_primitives::irq::unmask_irqs();
+#[inline]
+fn services() -> EntryServices {
+    SERVICES.require()
 }
 
 // ============================================================================
@@ -2854,21 +2195,9 @@ fn alloc_page_zeroed_user() -> Option<akuma_exec::PhysFrame> {
     akuma_pmm::alloc_page_zeroed_user().map(akuma_exec::PhysFrame::new)
 }
 
-/// Contiguous-free batch allocation of `count` zeroed pages.
-#[inline]
-fn alloc_pages_zeroed(count: usize) -> Option<alloc::vec::Vec<akuma_exec::PhysFrame>> {
-    Some(
-        akuma_pmm::alloc_pages_zeroed(count)?
-            .into_iter()
-            .map(akuma_exec::PhysFrame::new)
-            .collect(),
-    )
-}
-
 /// Default exception handler - logs unexpected exceptions
 /// CRITICAL: Must NOT return if ELR/SPSR are invalid, or ERET will crash!
-#[unsafe(no_mangle)]
-extern "C" fn rust_default_exception_handler() {
+pub fn default_exception() {
     note_exception_entry();
     note_exc_class(3);
     let esr = akuma_cpu::sysreg::esr_el1();
@@ -2919,8 +2248,7 @@ extern "C" fn rust_default_exception_handler() {
 /// `akuma_trap_aarch64::irq_frame`'s, shared with `setup_fake_irq_frame`.
 #[inline]
 fn irq_eret_poison_check(final_sp: u64, switched: bool) {
-    // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-    let frame = unsafe { IrqFrame::at(final_sp) };
+    let frame = (services().irq_frame_at)(final_sp);
     let elr = frame.elr();
     let kernel_text = akuma_exec::mmu::is_kernel_text(elr as usize);
     // EL0-target frames must not eret into kernel text; EL1-target frames must
@@ -2940,8 +2268,7 @@ fn irq_eret_poison_check(final_sp: u64, switched: bool) {
 /// to the EL the pending `eret` will enter (release when returning to EL0, keep for
 /// EL1) using the SPSR of the frame we're about to restore — which, after a context
 /// switch, is the *incoming* thread's frame. No-op unless `cfg(kernel_smp_shared)`.
-#[unsafe(no_mangle)]
-extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
+pub fn irq_with_sp(current_sp: u64) -> u64 {
     note_exception_entry();
     note_exc_class(2);
     // Under shared SMP, read the interrupted frame's SPSR up front: SPSR.M[3:0]==0 means
@@ -2955,7 +2282,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
     let interrupted_el0 = {
         // SAFETY: `current_sp` is the live interrupted IRQ trap frame the vector
         // asm just built. SPSR.M[3:0] == 0 ⇒ interrupted context was EL0t (userspace).
-        unsafe { IrqFrame::at(current_sp) }.from_el0()
+        (services().irq_frame_at)(current_sp).from_el0()
     };
     // If this IRQ interrupted EL0, userspace was running on this core — count it (captures
     // pure compute loops that only get timer-preempted, not just syscalls).
@@ -2992,7 +2319,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
             akuma_exec::threading::sgi_scheduler_handler_with_sp(akuma_gic::SGI_SCHEDULER, current_sp);
         let final_sp = if new_sp != 0 { new_sp } else { current_sp };
         // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-        let spsr = unsafe { IrqFrame::at(final_sp) }.spsr();
+        let spsr = (services().irq_frame_at)(final_sp).spsr();
         akuma_exec::bkl::reconcile_for_spsr_no_ticket(spsr);
         irq_eret_poison_check(final_sp, new_sp != 0);
         return new_sp;
@@ -3063,7 +2390,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
         // `current_sp` frame. Reconcile the BKL to that frame's target EL.
         let final_sp = if new_sp != 0 { new_sp } else { current_sp };
         // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-        let spsr = unsafe { IrqFrame::at(final_sp) }.spsr();
+        let spsr = (services().irq_frame_at)(final_sp).spsr();
         akuma_exec::bkl::reconcile_for_spsr(spsr);
     }
     {
@@ -3087,8 +2414,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
 ///
 /// Safety: ERET from an EL1 exception restores SPSR_EL1 which had EL1 mode
 /// bits, so this function runs at EL1 and can safely call kernel functions.
-#[unsafe(no_mangle)]
-extern "C" fn el1_fault_recovery_pad() {
+pub fn el1_fault_recovery() {
     akuma_exec::process::return_to_kernel_from_fault(-14);
 }
 
@@ -3549,8 +2875,24 @@ fn try_resolve_el1_user_copy_lazy_fault() -> bool {
 /// `[x2, x3, x0, x1, x29, x30]` (see `sync_el1_handler` asm). x30 in particular
 /// names the CALLER when the fault is a wild branch (`blr` through a corrupt
 /// pointer leaves the call site + 4 in LR).
-#[unsafe(no_mangle)]
-extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
+pub fn sync_el1(saved_regs: Option<[u64; 6]>) -> El1Resume {
+    let mut resume = El1Resume::Retry;
+    sync_el1_body(saved_regs, &mut resume);
+    resume
+}
+
+/// Where the `eret` that ends an EL1 sync exception should go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum El1Resume {
+    /// `ELR_EL1` as the vector saved it: retry the faulting instruction (a resolved fault).
+    Retry,
+    /// A registered user-copy recovery trampoline, so the copy returns `EFAULT`.
+    At(u64),
+    /// The landing pad for a dying process's unrecoverable kernel-code fault.
+    RecoveryPad,
+}
+
+fn sync_el1_body(saved_regs: Option<[u64; 6]>, resume: &mut El1Resume) {
     note_exception_entry();
     note_exc_class(1);
     {
@@ -3603,11 +2945,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
     // Saved-register block from the vector: [x2, x3, x0, x1, x29, x30].
     // x30 names the caller when ELR is a wild branch target (blr through a
     // corrupt pointer leaves call site + 4 in LR).
-    if !saved_regs.is_null() {
-        let (r_x2, r_x3, r_x0, r_x1, r_x29, r_x30) = unsafe {
-            (saved_regs.read(), saved_regs.add(1).read(), saved_regs.add(2).read(),
-             saved_regs.add(3).read(), saved_regs.add(4).read(), saved_regs.add(5).read())
-        };
+    if let Some([r_x2, r_x3, r_x0, r_x1, r_x29, r_x30]) = saved_regs {
         safe_print!(256, "  x0={r_x0:#x} x1={r_x1:#x} x2={r_x2:#x} x3={r_x3:#x}\n");
         safe_print!(256, "  x29={r_x29:#x} x30(LR)={r_x30:#x} core={}\n",
             akuma_exec::bkl::current_core_id());
@@ -3615,7 +2953,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
 
     // Try to read the faulting instruction (if ELR is in kernel range)
     if (0x4000_0000..0x8000_0000).contains(&elr) {
-        let instr = unsafe { *(elr as *const u32) };
+        let instr = (services().peek_u32)(elr);
         safe_print!(256, "  Instruction at ELR: {instr:#010x}\n");
 
         // Decode ARM64 load/store instruction to find base register
@@ -3644,15 +2982,8 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
             if fault_handler != 0 {
                 // Redirect ELR to the recovery handler
                 // This allows copy_from_user/copy_to_user to return EFAULT safely.
-                // Bare metal only: `msr elr_el1` is an EL1 instruction, and off
-                // the kernel target there is no exception to return from. See the
-                // crate's "Host builds" note.
-                // SAFETY: `fault_handler` is the trampoline the in-progress user
-                // copy registered on this thread, in kernel text.
-                #[cfg(target_os = "none")]
-                unsafe {
-                    core::arch::asm!("msr elr_el1, {}", in(reg) fault_handler);
-                }
+                // The entry shim performs the `msr elr_el1` (bare metal only).
+                *resume = El1Resume::At(fault_handler);
                 // Clear the handler to prevent infinite loops if the recovery code itself faults
                 akuma_exec::threading::set_user_copy_fault_handler(0);
                 return;
@@ -3686,13 +3017,8 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
             // The landing pad yields in a loop; the scheduler stops dispatching
             // this thread once cleanup_terminated() recycles the slot.
             // Bare metal only, as above.
-            // SAFETY: `el1_fault_recovery_pad` is this crate's own landing pad,
-            // in kernel text and mapped in every address space.
-            #[cfg(target_os = "none")]
-            unsafe {
-                let pad = el1_fault_recovery_pad as *const () as usize as u64;
-                core::arch::asm!("msr elr_el1, {}", in(reg) pad);
-            }
+            // The entry shim points ELR at `el1_fault_recovery_pad`.
+            *resume = El1Resume::RecoveryPad;
             return;
         }
     }
@@ -3714,7 +3040,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
 
         // Read L0[0] entry to check if it points to valid L1
         let l0_base = ttbr0 & !0xFFF; // Mask off ASID etc
-        let l0_entry = unsafe { *(l0_base as *const u64) };
+        let l0_entry = (services().peek_u64)(l0_base);
         safe_print!(256, "    L0[0] entry: {l0_entry:#018x}\n");
 
         // Check if L0[0] looks valid (should be table descriptor)
@@ -3733,7 +3059,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
 
         // Now read L1[0] to check the device memory block entry
         if is_valid && is_table && (0x4000_0000..0x8000_0000).contains(&l1_addr) {
-            let l1_entry = unsafe { *(l1_addr as *const u64) };
+            let l1_entry = (services().peek_u64)(l1_addr);
             safe_print!(256, "    L1[0] entry: {l1_entry:#018x}\n");
 
             // L1[0] should be a 1GB block descriptor for device memory
@@ -3916,7 +3242,6 @@ pub fn spurious_svc_count() -> u64 {
 
 /// Synchronous exception handler from EL0 (user mode)
 /// Returns the syscall return value, or doesn't return if process exits
-#[unsafe(no_mangle)]
 /// Syscall / EL0-fault entry from the vector asm. Wraps the real handler with the
 /// Big Kernel Lock (real shared-kernel SMP): a thread executing kernel code on behalf
 /// of an EL0 trap holds the BKL for the whole excursion, so its shared-state access
@@ -3930,11 +3255,7 @@ pub fn spurious_svc_count() -> u64 {
 /// below runs with IRQs enabled, so this thread can be preempted (or even resume
 /// on another core) and the live syndrome registers then belong to someone
 /// else's trap. Same for ELR_EL1 — use the frame's saved copy.
-extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
-    // SAFETY: `frame` is what the vector asm just pushed for this handler on this
-    // thread's kernel stack, exclusively ours until the epilogue `eret`s - the
-    // handle's one contract.
-    let frame = unsafe { FrameHandle::new(frame) };
+pub fn sync_el0(frame: FrameHandle, esr: u64, far: u64) -> u64 {
     // Outermost span for `read-profile` (ZST otherwise): started before the BKL
     // acquire and the entry tripwires, so `exc - hs` names everything this
     // wrapper does around the dispatch. See `crate::syscall::utils::read_profile`.
@@ -5279,131 +4600,3 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Regression probe: is the EL1 sync exception transparent to x4-x18?
-//
-// Gated on `kernel_tests` like `src/process_tests.rs`, its only caller: the
-// extreme-size profile drops the boot suite, and a probe that provokes a data
-// abort has no business in a build that will never assert on it.
-// ---------------------------------------------------------------------------
-
-#[cfg(all(kernel_tests, target_os = "none"))]
-unsafe extern "C" {
-    fn __el1_gpr_transparency_probe(out: *mut u64, base: u64) -> u64;
-}
-
-#[cfg(all(kernel_tests, target_os = "none"))]
-global_asm!(
-    r#"
-.text
-.global __el1_gpr_transparency_probe
-.global __el1_gpr_transparency_landing
-
-// x0 = out (15 u64 slots), x1 = pattern base.
-// Loads `base + N` into xN for N in 4..=18, takes ONE EL1 data abort, and writes
-// what those registers hold *after* the exception into `out`. The caller compares.
-//
-// Leaf and stackless on purpose, for the same reason __arch_copy_user_memory is:
-// the recovery rewrites ELR_EL1 to the landing label below, so anything this
-// function pushed would never be popped. It also keeps the live pattern out of
-// x0-x3/x29/x30, which the vector has always saved — those would pass even with
-// the bug.
-__el1_gpr_transparency_probe:
-    add     x4,  x1, #4
-    add     x5,  x1, #5
-    add     x6,  x1, #6
-    add     x7,  x1, #7
-    add     x8,  x1, #8
-    add     x9,  x1, #9
-    add     x10, x1, #10
-    add     x11, x1, #11
-    add     x12, x1, #12
-    add     x13, x1, #13
-    add     x14, x1, #14
-    add     x15, x1, #15
-    add     x16, x1, #16
-    add     x17, x1, #17
-    add     x18, x1, #18
-
-    mov     x2, x0                  // out pointer: x2 is saved by the vector
-    // A high user VA nothing maps or lazily backs. NOT a low one like 0x1000:
-    // measured 2026-08-28, a store there did not fault during the boot suite, so
-    // the first version of this test passed vacuously on a kernel with the bug.
-    movz    x3, #0x6000, lsl #32    // 0x0000_6000_0000_0000
-    str     x4, [x3]                // <-- the abort. ELR is rewritten to 1f, or
-                                    //     a resolved fault retries this store.
-__el1_gpr_transparency_landing:
-1:  stp     x4,  x5,  [x2, #0]
-    stp     x6,  x7,  [x2, #16]
-    stp     x8,  x9,  [x2, #32]
-    stp     x10, x11, [x2, #48]
-    stp     x12, x13, [x2, #64]
-    stp     x14, x15, [x2, #80]
-    stp     x16, x17, [x2, #96]
-    str     x18,      [x2, #112]
-    mov     x0, #0
-    ret
-    "#
-);
-
-/// Which of x4..x18 an EL1 sync exception failed to preserve — a bitmask where
-/// bit `n - 4` means register `xn` came back wrong. `0` is the healthy answer.
-///
-/// The property under test is that `sync_el1_handler` is transparent to every
-/// GPR, because `try_resolve_el1_cow_fault` and
-/// `try_resolve_el1_user_copy_lazy_fault` resolve the fault and `eret` back to
-/// **re-execute the faulting instruction**. A retry is only correct if that
-/// instruction's inputs survived, so a register the handler clobbers is stored
-/// into memory by the retry as if it were data.
-///
-/// The vector used to save x0-x3/x29/x30 only. That was enough while
-/// `__arch_copy_user_memory` was a byte loop holding its one live datum in x3;
-/// the 2026-08-27 widening put live data in x3-x10, and a `read(2)` whose
-/// destination page faulted in mid-copy then stored leftover handler state —
-/// 24 bytes per page, with `read` reporting the full count
-/// (`docs/archive/BUSYBOX_HASH_MISCOMPUTE.md`).
-///
-/// Runs on whichever recovery arm the fault takes: the resolve-and-retry paths if
-/// the VA turns out to be lazily mappable, otherwise the registered user-copy
-/// trampoline. Both return through this same vector, so either pins the fix.
-///
-/// Returns `(clobber_mask, aborts_taken)`. **`aborts_taken` is not decoration** —
-/// if VA `0x1000` were mapped in the current address space the store would simply
-/// succeed, no exception would fire, and the mask would read `0` for a kernel with
-/// the bug wide open. A test that cannot fail is worse than no test
-/// (`docs/archive/SMP_ADOPTED_IDLE_STACK_CLOBBER.md` is the local precedent), so
-/// the caller must require that the count moved.
-#[must_use]
-#[cfg(all(kernel_tests, target_os = "none"))]
-pub fn el1_sync_gpr_clobber_mask() -> (u32, u64) {
-    const BASE: u64 = 0x5A5A_0000;
-    const EC_DATA_ABORT_EL1: usize = 0x25;
-    let mut out = [0u64; 15];
-
-    let before = SYNC_EC_EL1[EC_DATA_ABORT_EL1].load(core::sync::atomic::Ordering::Relaxed);
-
-    // The trampoline arm needs a registered handler, or an unrecoverable EL1
-    // abort would kill the current process instead of landing at the label.
-    akuma_exec::threading::set_user_copy_fault_handler(
-        __el1_gpr_transparency_landing as *const () as usize as u64,
-    );
-    // SAFETY: `out` has the 15 slots the probe writes, and the abort it takes is
-    // recovered by the handler registered just above.
-    unsafe { __el1_gpr_transparency_probe(out.as_mut_ptr(), BASE) };
-    akuma_exec::threading::set_user_copy_fault_handler(0);
-
-    let after = SYNC_EC_EL1[EC_DATA_ABORT_EL1].load(core::sync::atomic::Ordering::Relaxed);
-
-    let mut mask = 0u32;
-    for (i, got) in out.iter().enumerate() {
-        if *got != BASE + (i as u64 + 4) {
-            mask |= 1 << i;
-        }
-    }
-    (mask, after.wrapping_sub(before))
-}
-
-#[cfg(all(kernel_tests, target_os = "none"))]
-unsafe extern "C" {
-    fn __el1_gpr_transparency_landing();
-}

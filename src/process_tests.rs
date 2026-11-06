@@ -238,7 +238,7 @@ fn test_el1_sync_exception_preserves_gprs() {
     // log here is expected rather than a symptom.
     crate::safe_print!(160,
         "  [test] el1_sync_exception_preserves_gprs: the EL1 abort dump below is deliberate\n");
-    let (mask, aborts) = akuma_exceptions::el1_sync_gpr_clobber_mask();
+    let (mask, aborts) = akuma_entry::exceptions::el1_sync_gpr_clobber_mask();
     if aborts == 0 {
         // The probe's store did not fault, so nothing was tested. Report that as a
         // failure rather than a pass: a vacuous assertion here would hide exactly
