@@ -629,7 +629,27 @@ are apportioned by cumulative message size as for Kyoto, but the fit is rougher 
 Whole-session totals are recorded values. The Shanghai brief and README revision differ from the local trials' (`shanghai-01-new-kernel.md` vs
 `kernelgen-brief.md`), and Shanghai's session was driven with a larger context.
 
-Trial three, **gemma4:e4b** (`sapporo`), was started after these two and is not part of this update; append its row here when it finishes.
+### Trial three: gemma4:e4b (Sapporo): fast, almost a kernel, workspace broken
+
+Model `gemma4:e4b`, 8.0 B, Q4_K_M (declared 131 k context, loaded at 32 k), same goose 1.52.0 harness and brief. It stopped **by itself** (goose exit 0) after
+**8 tool calls and 1,313 s (22 min)**, with 151,541 input / 4,431 output tokens; the final context was exactly 32,768, the window, so it hit the ceiling.
+
+Calls: read the README (1), three `write`s (`Cargo.toml`, `banner.txt`, `main.rs`) (2-4), a `members` line (5), commit (6), build (7), `tree` (8). Then it replied
+"It looks like you haven't provided a specific request" and finished: it lost the task at the end of a full context.
+
+| check | result |
+|---|---|
+| `sapporo/Cargo.toml` | correct (same shape as Kyoto's and Taoxichuan's) |
+| `sapporo/src/main.rs` | the right builder chain, but **no `#![no_std]`, no `#![no_main]`, no `akuma_tokio_kernel::entry!(main)`** (bare `fn main`) |
+| `build.rs` | **missing** (no linker script) |
+| root `Cargo.toml` | **broken**: it ran `echo "members = [".", "amd64", ..."] >> Cargo.toml`; the shell ate the inner quotes, so the last line of the manifest is `members = [., amd64, taoxichuan, shanghai, sapporo, crates/*]`, which no TOML parser accepts |
+| build | **fails for the whole workspace**: `error: invalid mantissa, expected digits --> Cargo.toml:925:12` (the model saw this error in its own build call and did not act on it) |
+| boot | not reached |
+
+So Sapporo is the Nagoya failure mode in a milder form: the right idea in `main.rs`, three required pieces missing, and a corrupted workspace manifest. It is
+also the only trial with a clean commit. Against the other two, per call: Nagoya (qwen3:4b) wrote 26 files and shipped a stub; Kyoto (glm-4.7-flash) made 13
+calls to a building and booting kernel; Sapporo (gemma4:e4b) made 8 and broke the build with its one `echo >> Cargo.toml`. **The `members` edit is the trap
+in this task**: glm used the `edit` tool (one line replaced), qwen rewrote the file, gemma appended to it with shell quoting.
 
 Housekeeping found on the way: a trial's `wt/` checkout is shared, so judge a finished trial from its own `results/<label>/<city>.tar` extracted into a clean
 copy of `base.tar` (that is what was done), never from `wt/` while the next trial is running.
