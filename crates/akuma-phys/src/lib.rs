@@ -36,6 +36,28 @@ pub fn phys_ptr<T>(pa: PhysAddr) -> *mut T {
     akuma_primitives::addr::phys_to_virt(pa.as_usize()).cast::<T>()
 }
 
+/// Copy `out.len()` bytes of RAM at physical address `pa` into `out`, with volatile byte reads. `false`
+/// (nothing copied) if the range is not entirely inside the physmap.
+///
+/// Reads only, and bounds-checked: a stale value from a racing writer is a stale value, not a fault, so
+/// this is safe for display and for firmware tables read once at boot.
+#[must_use]
+pub fn peek_ram(pa: PhysAddr, out: &mut [u8]) -> bool {
+    let Some(end) = pa.as_usize().checked_add(out.len()) else {
+        return false;
+    };
+    let inside = |a: usize| akuma_primitives::addr::physmap_contains(a);
+    if !out.is_empty() && (!inside(pa.as_usize()) || !inside(end - 1)) {
+        return false;
+    }
+    for (i, slot) in out.iter_mut().enumerate() {
+        // SAFETY: both ends of the range are inside the physmap (checked above), which maps RAM
+        // for the kernel's lifetime; a volatile `u8` read has no alignment or validity requirement.
+        *slot = unsafe { phys_ptr::<u8>(pa + i as u64).read_volatile() };
+    }
+    true
+}
+
 /// `akuma-pagetable`'s view of the physmap: a table frame's kernel-virtual address.
 pub struct Physmap;
 

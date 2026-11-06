@@ -440,15 +440,11 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
 /// child ([`twin_enter_user`]) and an `execve`'s new image.
 pub fn enter_user_on(root: u64, ef: &akuma_ring3_amd64::EntryFrame) -> ! {
     if root != 0 {
-        // SAFETY: `root` is a PMM-resident page-table frame naming the task's
-        // image and the shared kernel half this code runs on (`load_cr3`'s contract).
-        unsafe { akuma_pagetable::amd64::load_cr3(root) };
+        akuma_pagetable::amd64::activate::<akuma_phys::Physmap>(root);
     }
     // Ring 3 runs without the kernel lock.
     let _ = crate::smp::bkl_leave_all();
-    // SAFETY: ring3's contract — an enterable ring-3 state for the address
-    // space just loaded, kernel IF clear. `enter_user` is `!`.
-    unsafe { akuma_ring3_amd64::enter_user(ef) }
+    akuma_ring3_amd64::enter_user_checked(ef)
 }
 
 /// Enter ring 3 for the thread running now from a captured context: [`twin_enter_user`] for the init thread, which has no

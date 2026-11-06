@@ -149,63 +149,18 @@ pub fn service_pending() {
     SHOOT_ACKED[me].store(pending, Ordering::Release);
 }
 
-/// The vector-33 handler body (called from [`shootdown_entry`]).
-#[unsafe(no_mangle)]
-extern "C" fn shootdown_dispatch(_frame: *const u8) {
+/// The vector-33/34 handler body: service a pending shootdown on this core and acknowledge the interrupt.
+/// Registered with the entry stub (`akuma_boot_amd64::shootdown`) before the vectors are installed.
+pub fn shootdown_handler() {
     service_pending();
     akuma_lapic_amd64::eoi();
-}
-
-core::arch::global_asm!(
-    r#"
-    .section .text
-.global shootdown_entry
-shootdown_entry:
-    test qword ptr [rsp + 8], 3
-    jz 1f
-    swapgs
-1:
-    push rbp
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    sub rsp, 8
-    cld
-    lea rdi, [rsp + 88]
-    call shootdown_dispatch
-    add rsp, 8
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    pop rbp
-    test qword ptr [rsp + 8], 3
-    jz 2f
-    swapgs
-2:
-    iretq
-"#
-);
-
-unsafe extern "C" {
-    fn shootdown_entry();
 }
 
 /// The entry stub's address, for `IDT.set(SHOOT_VECTOR, ..)`.
 #[must_use]
 pub fn shootdown_entry_addr() -> usize {
-    shootdown_entry as usize
+    akuma_boot_amd64::shootdown::set_handler(shootdown_handler);
+    akuma_boot_amd64::shootdown::entry_addr()
 }
 
 /// Make every other online core drop its cached user translations, and wait
@@ -299,9 +254,7 @@ fn tsc_delay_us(us: u64) {
 #[cfg(feature = "smp")]
 /// Copy the trampoline to its page (`akuma_boot_amd64::ap`). Returns false if it does not fit below the mailbox.
 fn install_trampoline() -> bool {
-    // SAFETY: the page is RAM below 1 MiB, clear of the PVH block, and `start_secondaries` owns it for the
-    // duration of bring-up (the fixed layouts of the two VMMs, named at `AP_TRAMPOLINE_PA`).
-    unsafe { ap::install_trampoline() }
+    ap::install_trampoline_once()
 }
 
 #[cfg(feature = "smp")]

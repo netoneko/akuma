@@ -43,11 +43,11 @@ impl UserPages for Amd64 {
     type Frame = Frame;
 
     fn leaf(root: u64, va: u64) -> Option<u64> {
-        crate::leaf_entry(root, va).map(|slot| slot.read())
+        crate::leaf_entry(root, va).map(|slot| slot.get())
     }
 
     fn write_leaf(root: u64, va: u64, entry: u64) -> bool {
-        crate::leaf_entry(root, va).map(|slot| slot.write(entry)).is_some()
+        crate::leaf_entry(root, va).map(|slot| slot.set(entry)).is_some()
     }
 
     fn set_leaf(root: u64, va: u64, entry: u64) -> bool {
@@ -136,13 +136,10 @@ impl akuma_tokio_kernel_core::mm::Mm for Amd64 {
 impl akuma_tokio_kernel_core::tree::UserTree for Amd64 {
     const LAYOUT: akuma_user_tree::PteLayout = akuma_user_tree::X86_64;
     fn entry(table: u64, i: usize) -> u64 {
-        // SAFETY: the tree walkers name only a live root or a frame a present
-        // table entry of one names: a PMM page-table frame.
-        unsafe { akuma_boot_amd64::phys::Frame::from_pa(PhysAddr::new(table)) }.entry(i)
+        akuma_pagetable::entry::<akuma_phys::Physmap>(table, i)
     }
     fn set_entry(table: u64, i: usize, value: u64) {
-        // SAFETY: as `entry`.
-        unsafe { akuma_boot_amd64::phys::Frame::from_pa(PhysAddr::new(table)) }.set_entry(i, value);
+        akuma_pagetable::set_entry::<akuma_phys::Physmap>(table, i, value);
     }
     /// The lower half; the upper half is the kernel's, shared by every root.
     fn user_root_slot(i: usize) -> bool {
@@ -153,8 +150,13 @@ impl akuma_tokio_kernel_core::tree::UserTree for Amd64 {
         false
     }
     fn install_kernel(dst: u64) -> bool {
-        // SAFETY: `dst` is the fresh root frame the caller allocated.
-        crate::copy_kernel_half(unsafe { akuma_boot_amd64::phys::Frame::from_pa(PhysAddr::new(dst)) });
+        // The kernel half of every task root is the live CR3's: one PML4 copy shares every kernel subtree
+        // (physmap, device window, kernel image). `dst` is the root frame the caller allocated; only the upper
+        // half is written - the lower half may already hold the task's own entries (`init_root` would zero it).
+        let live = Self::live_root();
+        for i in 256..512 {
+            akuma_pagetable::set_entry::<akuma_phys::Physmap>(dst, i, akuma_pagetable::entry::<akuma_phys::Physmap>(live, i));
+        }
         true
     }
     fn live_root() -> u64 {

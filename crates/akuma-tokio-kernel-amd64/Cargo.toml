@@ -46,6 +46,9 @@ smp = []
 # `amd64/src` used to be the only home of all four.
 akuma-boot-amd64 = { path = "../akuma-boot-amd64" }
 akuma-pagetable = { path = "../akuma-pagetable" }
+akuma-phys = { path = "../akuma-phys" }
+# Per-core GDT/TSS statics and lgdt/ltr, behind an API that cannot name another core's slot.
+akuma-percpu-gdt-amd64 = { path = "../akuma-percpu-gdt-amd64" }
 # The console: COM1, minimal. The banner's only dependency at this stage.
 akuma-comconsole = { path = "../akuma-comconsole", optional = true }
 # The GDT/TSS descriptors this kernel loads (one core, no userspace yet — the

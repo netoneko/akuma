@@ -493,6 +493,38 @@ pub unsafe extern "C" fn enter_user(f: &EntryFrame) -> ! {
     );
 }
 
+/// [`enter_user`] after checking the parts of `f` that make a `sysretq` hostile to ring 0.
+///
+/// The safe entry for a caller that built `f` from an ELF image and a stack: `sysretq` with a **non-canonical
+/// `RCX`** faults in ring 0 (the famous `sysret` privilege bug), a kernel-half `rip`/`rsp` would run or push in
+/// the kernel's own address range, and an `rflags` with `IOPL`/`VM`/`NT` set or `IF` clear hands the task more
+/// than ring 3 should have or hangs the core. So it refuses (panics) unless:
+///
+/// * `rip` and `rsp` are in the canonical **lower** half (`< 0x0000_8000_0000_0000`);
+/// * `rflags` has `IF` and the reserved bit 1 set and `IOPL`, `NT`, `VM` clear.
+///
+/// The active address space still has to map the kernel half and the user half; the checked
+/// `akuma_pagetable::amd64::activate` establishes the first for every root this kernel loads, and a user half
+/// that does not map `rip` is an ordinary page fault in ring 3.
+///
+/// # Panics
+/// If `f` fails the checks above.
+#[cfg(target_arch = "x86_64")]
+pub fn enter_user_checked(f: &EntryFrame) -> ! {
+    const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+    const IF: u64 = 1 << 9;
+    const RESERVED1: u64 = 1 << 1;
+    const FORBIDDEN: u64 = (3 << 12) | (1 << 14) | (1 << 17); // IOPL, NT, VM
+    assert!(f.rip < USER_LIMIT && f.rsp < USER_LIMIT, "enter_user: rip/rsp not in the user half");
+    assert!(
+        f.rflags & (IF | RESERVED1) == (IF | RESERVED1) && f.rflags & FORBIDDEN == 0,
+        "enter_user: unsafe rflags for ring 3"
+    );
+    // SAFETY: the checks above make `f` a ring-3-enterable state; the kernel-half mapping of the active root is
+    // the loader's `activate` (checked), and `enter_user` is `!`.
+    unsafe { enter_user(f) }
+}
+
 // ---------------------------------------------------------------------------
 // The x86_64 Linux ABI surface the minimal dispatcher serves: numbers, errno,
 // and the `arch_prctl` requests. (`akuma-syscalls-linux` is the AArch64/`asm-

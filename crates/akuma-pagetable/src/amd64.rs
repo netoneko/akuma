@@ -110,6 +110,62 @@ pub fn leaf_slot<'a, M: PhysMap>(root: u64, va: usize) -> Option<Slot<'a>> {
     }
 }
 
+/// The leaf slot for `va`, present or not.
+///
+/// Every level above it must be present and none a large page. For a caller that installs or inspects a lazy
+/// leaf (`leaf_slot` reports only a present one).
+#[must_use]
+pub fn leaf_table_slot<'a, M: PhysMap>(root: u64, va: usize) -> Option<Slot<'a>> {
+    let mut table_pa = root;
+    for level in (2..=4).rev() {
+        let entry = frame_table::<M>(table_pa).get(index(va, level));
+        if !pte::is_present(entry) || pte::is_large(entry) {
+            return None;
+        }
+        table_pa = pte::frame(entry);
+    }
+    Some(frame_table::<M>(table_pa).slot(index(va, 1)))
+}
+
+/// Copy the bytes of the page `va` is mapped to (under `root`) at `va`'s offset into `out`. The range must
+/// stay inside the page. `false` if `va` is not mapped as a present 4 KiB leaf or the range crosses the page.
+///
+/// The translation is done here, so the claim is the crate's usual one (`root` is a live root), not "this
+/// physical address is somebody's frame".
+#[must_use]
+pub fn read_user<M: PhysMap>(root: u64, va: usize, out: &mut [u8]) -> bool {
+    let off = va & 0xFFF;
+    if off + out.len() > 4096 {
+        return false;
+    }
+    let Lookup::Leaf { entry, .. } = lookup::<M>(root, va) else {
+        return false;
+    };
+    let base = M::table_addr(pte::frame(entry));
+    // SAFETY: `base` is the kernel-virtual address of the 4 KiB frame a present leaf names, and
+    // `off + len <= 4096` keeps the copy inside it; `out` is a distinct Rust slice, so they do not overlap.
+    unsafe { core::ptr::copy_nonoverlapping((base + off) as *const u8, out.as_mut_ptr(), out.len()) };
+    true
+}
+
+/// As [`read_user`], writing `src` into the page. Does **not** require the leaf to be writable: the kernel
+/// writes image bytes into read-only pages through the physmap.
+#[must_use]
+pub fn write_user<M: PhysMap>(root: u64, va: usize, src: &[u8]) -> bool {
+    let off = va & 0xFFF;
+    if off + src.len() > 4096 {
+        return false;
+    }
+    let Lookup::Leaf { entry, .. } = lookup::<M>(root, va) else {
+        return false;
+    };
+    let base = M::table_addr(pte::frame(entry));
+    // SAFETY: as [`read_user`]; the frame is the task's, whose mapping the caller has already prepared
+    // (CoW-broken, filled).
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), (base + off) as *mut u8, src.len()) };
+    true
+}
+
 /// Clear the leaf for `va`, returning the frame it mapped. The caller owns the
 /// TLB invalidation and the frame's fate.
 #[must_use = "the frame is the caller's to free, and None means nothing was mapped"]
@@ -184,6 +240,50 @@ pub unsafe fn load_cr3(root: u64) {
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
     }
+}
+
+/// Install `root` as the active PML4, **after checking** that it maps what the next instruction needs.
+///
+/// The safe counterpart of [`load_cr3`], for a caller that holds `root` as a bare address (a task's
+/// recorded root) and cannot state `load_cr3`'s contract itself. A root that fails the check is a bug that
+/// would otherwise be a triple fault on the instruction after `mov cr3` with nothing printed, so it is
+/// refused loudly instead. What is checked is exactly what that instruction and the next few touch:
+///
+/// * `root` is a non-zero, page-aligned address inside the 52-bit physical space;
+/// * the PML4 slots covering **this function's code**, **the current stack** and **the table-access window**
+///   (`M::table_addr`, the physmap the walkers reach frames through) are present in `root` and identical to
+///   the live root's. Every address space shares the kernel half by aliasing (`init_root`), so for a real
+///   task root this is always true; a stray, zeroed or lower-half-only frame fails it.
+///
+/// Not checked: that every *other* kernel mapping (heap, PMM pool, LAPIC window) is present. They live under
+/// the same shared kernel-half slots in this kernel, which is what the slot comparison establishes for the
+/// three it names; a kernel that scatters them across slots must name those slots too.
+///
+/// # Panics
+/// If `root` fails the checks above.
+#[cfg(target_arch = "x86_64")]
+pub fn activate<M: PhysMap>(root: u64) {
+    assert!(root != 0 && root.trailing_zeros() >= 12 && root >> 52 == 0, "activate: not a page-aligned physical address");
+    let live: u64;
+    // SAFETY: reading CR3 has no side effects.
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) live, options(nomem, nostack, preserves_flags)) };
+    let live = live & pte::ADDR_MASK;
+    if root != live {
+        let stack_probe = 0u8;
+        let here = activate::<M> as *const () as usize;
+        let on_stack = core::ptr::from_ref(&stack_probe) as usize;
+        let window = M::table_addr(root);
+        for va in [here, on_stack, window] {
+            let slot = (va >> 39) & 0x1FF;
+            let want = frame_table::<M>(live).get(slot);
+            assert!(
+                want & 1 != 0 && frame_table::<M>(root).get(slot) == want,
+                "activate: root does not share the live kernel slot {slot} - refusing to load it"
+            );
+        }
+    }
+    // SAFETY: the checks above are `load_cr3`'s obligation for the addresses executed next.
+    unsafe { load_cr3(root) };
 }
 
 /// Make `root_frame` a fresh PML4 that shares the kernel's upper half.

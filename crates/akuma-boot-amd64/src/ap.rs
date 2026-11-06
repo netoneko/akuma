@@ -93,6 +93,27 @@ pub unsafe fn install_trampoline() -> bool {
     true
 }
 
+/// Copy the trampoline to its page, **once**, for the two VMM layouts named at [`AP_TRAMPOLINE_PA`].
+///
+/// The safe form of [`install_trampoline`]. The claim that makes the copy sound - the page at
+/// [`AP_TRAMPOLINE_PA`] is RAM no one else owns - is a property of that constant (the fixed layouts of the
+/// two VMMs this kernel runs under, documented where the constant is defined), so it is stated here beside
+/// the constant instead of at each caller. A second call changes nothing and returns `true`: the blob is
+/// already there and the APs may be reading it.
+///
+/// Returns `false` if the blob does not fit below the mailbox.
+pub fn install_trampoline_once() -> bool {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return true;
+    }
+    // SAFETY: the page is RAM below 1 MiB, clear of the PVH block and owned by AP bring-up for its duration
+    // (the layouts named at `AP_TRAMPOLINE_PA`); the once-guard above keeps a second copy from running
+    // under an AP that is already executing the blob.
+    unsafe { install_trampoline() }
+}
+
 /// Write one mailbox word the trampoline will read. `pa` must be one of the `AP_MB_*` addresses.
 ///
 /// # Panics

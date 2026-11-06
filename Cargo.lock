@@ -695,6 +695,14 @@ name = "akuma-pci"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-percpu-gdt-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-gdt",
+]
+
+[[package]]
 name = "akuma-phys"
 version = "0.1.0"
 dependencies = [
@@ -1091,6 +1099,8 @@ dependencies = [
  "akuma-net",
  "akuma-pagetable",
  "akuma-params",
+ "akuma-percpu-gdt-amd64",
+ "akuma-phys",
  "akuma-pmm",
  "akuma-port",
  "akuma-primitives",

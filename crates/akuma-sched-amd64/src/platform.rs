@@ -54,11 +54,9 @@ pub trait Platform: 'static {
     fn kernel_root() -> u64;
     /// The root this core has installed now.
     fn active_root() -> u64;
-    /// Make `root` this core's page-table root.
-    ///
-    /// # Safety
-    /// `root` must be a live PML4 that maps the kernel half (every address space does).
-    unsafe fn activate(root: u64);
+    /// Make `root` this core's page-table root. Implementations must refuse (panic) a root that does not map
+    /// the kernel half (every address space does) - see `akuma_pagetable::amd64::activate`.
+    fn activate(root: u64);
 
     /// Point the TSS `rsp0` at `top`: where a ring-3 trap on this core lands.
     fn set_kernel_stack(top: u64);
@@ -177,7 +175,7 @@ pub fn switch_to<P: Platform>(from: usize, to: usize) {
     if P::RELOAD_SAME_ROOT || want != P::active_root() {
         // SAFETY: `want` is the kernel root or a thread's recorded root, both live PML4s
         // sharing the kernel half; a freed root was refused above.
-        unsafe { P::activate(want) };
+        P::activate(want);
     }
 
     P::set_kernel_stack(P::trap_top_of(to, to_m.trap_stack_top.load(Ordering::Relaxed)));

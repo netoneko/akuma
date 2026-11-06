@@ -23,6 +23,10 @@
 // the other amd64 machine crates are on a non-x86 host.
 #![cfg(all(target_arch = "x86_64", target_os = "none"))]
 #![no_std]
+// No `unsafe` here: the GDT/TSS statics, the shootdown stub, the AP trampoline copy, CR3 loads and the ring-3
+// crossing live in `akuma-percpu-gdt-amd64`, `akuma-boot-amd64`, `akuma-pagetable` and `akuma-ring3-amd64`,
+// behind checked safe functions (`docs/archive/UNSAFE_FORBID_THREE_CRATES_PLAN.md`).
+#![forbid(unsafe_code)]
 #![feature(alloc_error_handler)]
 #![feature(abi_x86_interrupt)]
 // Stage 1 registers every trap kind it does not specifically expect; until
@@ -93,12 +97,7 @@ impl akuma_ryzen_amd64::PhysMem for Physmap {
         if end > phys::PHYSMAP_LIMIT {
             return false;
         }
-        for (i, slot) in buf.iter_mut().enumerate() {
-            // SAFETY: the whole range was just proved to be inside the physmap,
-            // which `boot.s` maps before `kmain` runs.
-            *slot = unsafe { phys::phys_ptr::<u8>(pa + i as u64).read_volatile() };
-        }
-        true
+        akuma_phys::peek_ram(PhysAddr::new(pa), buf)
     }
 }
 
@@ -195,17 +194,8 @@ pub(crate) fn trap_top_for(slot: usize) -> u64 {
 
 /// Point THIS core's TSS `rsp0` at `top`.
 pub(crate) fn set_tss_rsp0(top: u64) {
-    // SAFETY: each core touches only its own TSS, IF clear on every caller path (a switch); reached
-    // through a raw pointer, never a reference to the whole array.
-    #[allow(clippy::deref_addrof)]
-    unsafe {
-        (*&raw mut TSS[ring3::cpu_index()]).set_rsp0(top);
-    }
+    akuma_percpu_gdt_amd64::set_rsp0(top);
 }
-/// One TSS and one GDT per CPU: `ltr` marks a TSS descriptor busy, so two
-/// cores cannot share either.
-static mut TSS: [akuma_gdt::Tss; smp::MAX_CPUS] = [const { akuma_gdt::Tss::new() }; smp::MAX_CPUS];
-
 /// Timer-preemption era flag (session pf, plan §5): set when init's thread is
 /// published (`child::start_init_thread`) — the tick switch runs only once user
 /// tasks exist. The pf-6
@@ -214,8 +204,6 @@ static mut TSS: [akuma_gdt::Tss; smp::MAX_CPUS] = [const { akuma_gdt::Tss::new()
 /// nothing to preempt and the tick must not switch at all.
 pub(crate) static PREEMPT_ARMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-static mut GDT: [[u64; akuma_gdt::SLOTS]; smp::MAX_CPUS] = [[0; akuma_gdt::SLOTS]; smp::MAX_CPUS];
-
 /// Build the GDT and TSS, load both. One core; the entries are byte-identical
 /// to `boot.s`'s at the same selectors, so `CS`/`SS` stay valid across the
 /// `lgdt` and nothing needs a far return.
@@ -226,28 +214,13 @@ fn gdt_init() {
 /// [`gdt_init`] for core `cpu`: its own GDT row, TSS and boot trap stack.
 /// Each core touches only its own index.
 pub(crate) fn gdt_init_cpu(cpu: usize) {
-    // SAFETY: interrupts are masked on the calling core and only core `cpu`
-    // touches index `cpu` of these statics. Reached only through raw
-    // pointers, never references to the whole array.
-    unsafe {
-        let tss = &raw mut TSS[cpu];
-        (*tss).set_rsp0((&raw mut TRAP_STACK[cpu]).cast::<u8>().add(TRAP_STACK_SIZE) as u64);
-        let gdt = &raw mut GDT[cpu];
-        *gdt = akuma_gdt::table(tss as u64);
-        #[repr(C, packed)]
-        struct Gdtr {
-            limit: u16,
-            base: u64,
-        }
-        let gdtr = Gdtr { limit: akuma_gdt::GDT_LIMIT, base: gdt as u64 };
-        core::arch::asm!(
-            "lgdt [{gdtr}]",
-            "ltr {tr:x}",
-            gdtr = in(reg) &raw const gdtr,
-            tr = in(reg) akuma_gdt::TSS_SELECTOR,
-            options(readonly, nostack, preserves_flags)
-        );
-    }
+    assert!(cpu < smp::MAX_CPUS, "cpu index out of range for the trap stacks");
+    // Address arithmetic on a `static` only (a raw borrow of the whole array, a cast, byte offsets); nothing is
+    // dereferenced, so no `unsafe`.
+    let rsp0 = (&raw mut TRAP_STACK)
+        .cast::<u8>()
+        .wrapping_add(cpu * core::mem::size_of::<TrapStack>() + TRAP_STACK_SIZE) as u64;
+    akuma_percpu_gdt_amd64::init_cpu(cpu, rsp0);
 }
 
 // ---------------------------------------------------------------------------
@@ -294,35 +267,11 @@ pub(crate) fn cow_stats() -> (usize, usize, usize, usize) {
 /// The 4 KiB leaf entry for `va` in `root`'s user half, if every level is
 /// present and none is a huge page.
 fn leaf_entry(root: u64, va: u64) -> Option<Pte> {
-    // SAFETY: `root` is a user root (a task's `root_pa` or the live CR3): a
-    // page-table frame.
-    let mut table = unsafe { phys::Frame::from_pa(PhysAddr::new(root & PTE_ADDR)) };
-    for shift in [39u32, 30, 21] {
-        let e = table.entry(((va >> shift) & 0x1FF) as usize);
-        if e & 1 == 0 || (shift != 39 && e & 0x80 != 0) {
-            return None;
-        }
-        // SAFETY: a present, non-huge entry names the next-level table frame.
-        table = unsafe { phys::Frame::from_pa(PhysAddr::new(e & PTE_ADDR)) };
-    }
-    Some(Pte { table, idx: ((va >> 12) & 0x1FF) as usize })
+    akuma_pagetable::amd64::leaf_table_slot::<akuma_phys::Physmap>(root & PTE_ADDR, va as usize)
 }
 
-/// One leaf entry: the table frame and the slot in it.
-struct Pte {
-    table: phys::Frame,
-    idx: usize,
-}
-
-impl Pte {
-    fn read(&self) -> u64 {
-        self.table.entry(self.idx)
-    }
-
-    fn write(&self, v: u64) {
-        self.table.set_entry(self.idx, v);
-    }
-}
+/// One leaf entry: the table slot holding it.
+type Pte = akuma_pagetable::Slot<'static>;
 
 fn cow_resolve(root: u64, va: u64) -> akuma_cow::CowAction {
     cow::resolve::<lazy::Amd64>(root, va)
@@ -592,14 +541,9 @@ fn lapic_init() -> bool {
     }
     // Sets exactly one bit in the MSR, leaving the address field as found — the same write amd64's `lapic::init` makes.
     let base_msr = msr::enable_apic_global();
-    if !map_device(base, 4096) {
+    let Some(win) = paging::map_device_window(base, 4096) else {
         akuma_primitives::safe_print!(96, "  [lapic] could not map the LAPIC page\n");
         return false;
-    }
-    // SAFETY: the page at DEVMAP_BASE+base is the LAPIC register file, mapped
-    // device-uncached just above for the kernel's lifetime, page-aligned.
-    let win = unsafe {
-        akuma_primitives::mmio::MmioWindow::new((akuma_boot_amd64::phys::DEVMAP_BASE + base) as usize, 4096)
     };
     if let Ok(info) = akuma_lapic_amd64::init(base_msr, win) {
         akuma_primitives::safe_print!(
@@ -683,11 +627,13 @@ fn idt_init() {
 // virtio-blk: map the announced transports, hand the geometry to the driver.
 // ---------------------------------------------------------------------------
 
+#[cfg(any(feature = "disk", feature = "net"))]
 const PAGE_SIZE: u64 = 4096;
 
 /// Map one device's register file into the device window, uncached — the
 /// direct-window half of `akuma-amd64`'s `blk.rs`, pulled no further than
 /// stage 1 needs (one transport class, no partitions).
+#[cfg(any(feature = "disk", feature = "net"))]
 fn map_device(base: u64, len: u64) -> bool {
     let first = base & !(PAGE_SIZE - 1);
     let last = (base + len).div_ceil(PAGE_SIZE) * PAGE_SIZE;
@@ -959,7 +905,7 @@ fn fault_code_dump(rip: u64) {
     use akuma_tokio_kernel_core::mm::Mm;
     let root = task_root();
     let page = rip & !0xFFF;
-    let pte = leaf_entry(root, page).map_or(0, |slot| slot.read());
+    let pte = leaf_entry(root, page).map_or(0, |slot| slot.get());
     let pa = lazy::Amd64::translate(root, page).unwrap_or(0);
     let mut b = [0u8; 16];
     let ok = copy_from_user(&mut b, rip);
@@ -1051,12 +997,9 @@ struct TaskWalk {
 
 impl akuma_user_walk::Walk for TaskWalk {
     fn read_page(&self, va: u64, out: &mut [u8]) -> bool {
-        let Some(pa) = translate_filling(self.root, va) else {
-            return false;
-        };
-        // SAFETY: `translate_in` named a mapped task frame.
-        unsafe { phys::Frame::from_pa(PhysAddr::new(pa)) }.read_bytes((va & 0xFFF) as usize, out);
-        true
+        // Fill a lazy page first, then read the frame it now names.
+        translate_filling(self.root, va).is_some()
+            && akuma_pagetable::amd64::read_user::<akuma_phys::Physmap>(self.root, va as usize, out)
     }
     fn write_page(&self, va: u64, src: &[u8]) -> bool {
         // Present first: `cow_prepare_write` judges the live entry, and a lazy
@@ -1064,12 +1007,9 @@ impl akuma_user_walk::Walk for TaskWalk {
         if translate_filling(self.root, va).is_none() || !cow_prepare_write(self.root, va) {
             return false;
         }
-        let Some(pa) = paging::translate_in(self.root, (va & !0xFFF) as usize) else {
+        if !akuma_pagetable::amd64::write_user::<akuma_phys::Physmap>(self.root, va as usize, src) {
             return false;
-        };
-        // SAFETY: `translate_in` named a mapped task frame, one this kernel mapped RW (or RO, for image
-        // bytes - every caller writes only into stack/heap/scratch regions).
-        unsafe { phys::Frame::from_pa(PhysAddr::new(pa)) }.write_bytes((va & 0xFFF) as usize, src);
+        }
         mark_written(self.root, va);
         true
     }
@@ -1087,7 +1027,7 @@ fn translate_filling(root: u64, va: u64) -> Option<u64> {
     let pa = paging::translate_in(root, page).or_else(|| {
         (lazy::fill(root, va, true) == lazy::Fill::Present).then(|| paging::translate_in(root, page)).flatten()
     })?;
-    leaf_entry(root, page as u64).is_some_and(|pte| pte.read() & akuma_pte_amd64::US != 0).then_some(pa)
+    leaf_entry(root, page as u64).is_some_and(|pte| pte.get() & akuma_pte_amd64::US != 0).then_some(pa)
 }
 
 fn task_walk() -> TaskWalk {
@@ -1595,16 +1535,6 @@ pub(crate) fn task_done(code: u64) -> ! {
 /// over this machine's tree (`lazy::Amd64`'s `UserTree`). `docs/reference/memory.md`.
 pub(crate) fn clone_user_half(parent_root: u64, dst_root: u64) -> Option<()> {
     akuma_tokio_kernel_core::tree::clone_user_half::<lazy::Amd64>(parent_root, dst_root)
-}
-
-/// The kernel half of every task root is the live CR3's: one PML4 copy shares
-/// every kernel subtree (physmap, device window, kernel image).
-pub(crate) fn copy_kernel_half(dst: phys::Frame) {
-    // SAFETY: CR3 holds the live PML4 frame.
-    let k = unsafe { phys::Frame::from_pa(PhysAddr::new(akuma_cpu::ctlreg::cr3() & PTE_ADDR)) };
-    for i in 256..512 {
-        dst.set_entry(i, k.entry(i));
-    }
 }
 
 /// Load an ELF image into the CURRENT task slot (`akuma_tokio_kernel_core::loader::load_task`):

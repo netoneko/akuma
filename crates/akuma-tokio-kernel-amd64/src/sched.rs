@@ -79,9 +79,8 @@ impl Platform for Tx {
     fn active_root() -> u64 {
         akuma_boot_amd64::paging::active_root()
     }
-    unsafe fn activate(root: u64) {
-        // SAFETY: the trait's contract - a live PML4 that maps the kernel half - is `load_cr3`'s.
-        unsafe { akuma_pagetable::amd64::load_cr3(root) };
+    fn activate(root: u64) {
+        akuma_pagetable::amd64::activate::<akuma_phys::Physmap>(root);
     }
     fn set_kernel_stack(top: u64) {
         crate::set_tss_rsp0(top);
