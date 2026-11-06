@@ -518,6 +518,31 @@ copying `shanghai/`), and a 4B cannot; the part that needs real multi-step shell
 90 minutes on TCG. Caveats, so nobody over-reads the table: one trial per model, the brief names the API and the sample kernel, the base tree for glm was the
 tree at the time (`base.tar`, older than the unsafe-reduction work of the same day), and TCG slowness is part of the cost.
 
+### Configuration of the two trials (read off the rig, 2026-11-06)
+
+| | glm-4.7-flash (Kyoto) | qwen3:4b (Nagoya) |
+|---|---|---|
+| model | `glm-4.7-flash:latest`, **29.9 B** parameters, MoE (`glm4moelite`), GGUF **Q4_K_M**, ~21 GB resident | `qwen3:4b`, **4.0 B** dense, GGUF **Q4_K_M** |
+| capabilities (ollama) | completion, **tools**, thinking | completion, tools, thinking |
+| context | declared 202,752; **loaded at 32,768** (`/api/ps`, the ollama default, not raised) | declared 262,144; loaded size not observed (not resident when checked) |
+| sampling | the model's own defaults: temperature 1, top_p 0.95, min_p 0.01, repeat_penalty 1; nothing overridden by the harness | model defaults |
+| where it ran | ollama on the Mac over the LAN, no cloud | same |
+| harness | **goose 1.52.0**, `goose run --with-builtin developer -i BRIEF --name kg-<label> --max-turns 120`, provider `ollama`, `GOOSE_MODE=auto` (no confirmation prompts), telemetry off, keyring disabled | same |
+| isolation | per-trial `XDG_CONFIG_HOME` / `XDG_DATA_HOME` under `results/<label>/`, clean checkout `wt/`, `CARGO_TARGET_DIR` shared | same |
+| budget | 5,400 s `timeout` | same |
+| tool calls (goose log) | 70 `shell`, 1 `edit`, 4 `write` | 14 `shell`, 6 `edit`, 26 `write` |
+| harness noise | 2 x `-32600: Tool 'read' was not advertised for this model turn` (goose asked for a tool the turn did not list; non-fatal, it fell back to `shell cat`) | none |
+
+Two differences in *behaviour* are visible in the call mix and are worth more than the headline pass/fail. glm explored: 70 shell commands, reading the README
+and the tree, then writing five files. qwen wrote: 26 file writes against 14 shell commands, i.e. it produced a lot of text and checked little of it, which is
+how a workspace manifest ends up overwritten twice. The one harness defect seen (the unadvertised `read` tool) did not affect either result; goose's builtin
+`developer` extension is a shell plus an editor, so `cat` is a complete substitute.
+
+For comparison, the sample kernel `shanghai/` was built from an earlier revision of the same README by **goose with a hosted GLM** on the ryzen booted into
+Akuma, and reached gate 6 (goose running inside the guest): `shanghai/docs/EXPERIMENT_RESULT.md`. The local 30 B Q4 model on a 32 k context got through build and
+boot (gates 1 and 3) before the budget ran out; it is not directly comparable (different revision of the brief, different model, TCG instead of the ryzen's
+KVM) but it is the same harness and the same README.
+
 Trial three, **gemma4:e4b** (`sapporo`), was started after these two and is not part of this update; append its row here when it finishes.
 
 Housekeeping found on the way: a trial's `wt/` checkout is shared, so judge a finished trial from its own `results/<label>/<city>.tar` extracted into a clean
