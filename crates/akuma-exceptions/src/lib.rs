@@ -1896,7 +1896,7 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
         complete_cow_break(CowRemap::TakingAsLock(owner), page_va, old_pa, new_frame);
         true
     } else {
-        drop(new_frame); // no owner — frees the frame, nothing leaks
+        new_frame.free_by(akuma_primitives::preempt::current_tid() as u32); // no owner — free to avoid leak
         false
     }
 }
@@ -3488,7 +3488,7 @@ fn try_resolve_el1_cow_fault() -> bool {
         // No process owner found: cannot remap — free the new frame to avoid a leak.
         // Do NOT cow_ref_dec: the page is still mapped RO with the original refcount.
         // Returning false lets the EL1 handler kill the process via the normal path.
-        drop(new_frame);
+        new_frame.free_by(akuma_primitives::preempt::current_tid() as u32);
         false
     }
 }
