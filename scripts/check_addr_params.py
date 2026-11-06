@@ -8,7 +8,7 @@ parameter without the budget file's diff carrying it into review, and a decrease
 
 What counts: a parameter of a production `fn` whose name is an address word (`va`, `vaddr`, `pa`, `paddr`, `pfn`,
 `phys`, `addr`, `base`, also with a `_suffix` or `prefix_`) and whose type is exactly `usize` or `u64`. Test files,
-`tests.rs`, `tests/` directories and everything from a file's first `#[cfg(test)]` on are excluded. Greps, not a
+`tests.rs`, `tests/` directories and inline `#[cfg(test)] mod name { .. }` blocks are excluded. Greps, not a
 parser: it matches the audit's own method (its precision is "context-read, not exact").
 
     scripts/check_addr_params.py            # check (exit 1 on a violation)
@@ -63,9 +63,15 @@ def split_params(sig):
 
 def sites_in(text):
     """`[(line, fn, param)]` of untyped-address parameters in the production part of `text`."""
-    cut = text.find("#[cfg(test)]")
-    if cut != -1:
-        text = text[:cut]
+    # Blank out every inline `#[cfg(test)] mod name { ... }` block (brace-matched), keeping line numbers. Test modules
+    # can sit between production items (akuma-pmm has five), so truncating at the first one would hide the rest.
+    for m in list(re.finditer(r"#\[cfg\(test\)\]\s*(?:pub\s+)?mod\s+\w+\s*\{", text))[::-1]:
+        k, depth = m.end(), 1
+        while k < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[k], 0)
+            k += 1
+        block = text[m.start():k]
+        text = text[: m.start()] + re.sub(r"[^\n]", " ", block) + text[k:]
     found = []
     for m in FN.finditer(text):
         i, depth = m.end(), 1
@@ -117,9 +123,9 @@ def compare(now, budget):
 
 
 def self_test():
-    src = "pub fn a(va: usize, len: usize) {}\nfn b(&self, pa: u64, mut base_pa: usize) -> u8 { 0 }\nfn c(v: PhysAddr, n: usize) {}\n#[cfg(test)]\nfn d(va: usize) {}"
+    src = "pub fn a(va: usize, len: usize) {}\nfn b(&self, pa: u64, mut base_pa: usize) -> u8 { 0 }\nfn c(v: PhysAddr, n: usize) {}\n#[cfg(test)]\nfn t1(va: usize) {}\n#[cfg(test)]\nmod tests { fn d(va: usize) { if true { } } }\nfn after(pa: u64) {}"
     got = [(f, p) for _, f, p in sites_in(src)]
-    assert got == [("a", "va"), ("b", "pa"), ("b", "base_pa")], got
+    assert got == [("a", "va"), ("b", "pa"), ("b", "base_pa"), ("t1", "va"), ("after", "pa")], got
     assert compare({"x": 3}, {"x": 3}) == ([], [])
     assert compare({"x": 4}, {"x": 3})[0] == ["x: 4 untyped address params, budget 3 (+1)"]
     assert component_of(os.path.join("crates", "akuma-pmm", "src", "lib.rs")) == "crates/akuma-pmm"

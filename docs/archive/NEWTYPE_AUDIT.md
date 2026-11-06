@@ -128,9 +128,9 @@ from the wave below: **primitives -> phys -> pmm -> mmu/mmap/pagetable -> exec/e
 
 | wave | crate | what | state |
 |---|---|---|---|
-| 0 | gate | `scripts/check_addr_params.py` + `docs/reference/addr-params-budget.json` (the `addr_params` ratchet; `--list [COMPONENT]` prints the sites). Seeded at **615** | done |
+| 0 | gate | `scripts/check_addr_params.py` + `docs/reference/addr-params-budget.json` (the `addr_params` ratchet; `--list [COMPONENT]` prints the sites). Seeded at 615, then **corrected to 678** the same day: the first scanner stopped reading a file at its first `#[cfg(test)]`, which hid 63 sites in files that interleave test modules with production code (`akuma-pmm` showed 4, really 53 - the audit's 52). Test modules are now blanked by brace matching | done |
 | 1 | `akuma-primitives` | `PhysAddr`, `VirtAddr`, `Pfn`, `PAGE_SIZE`/`PAGE_SHIFT` in `addr_types.rs`, re-exported from `addr`; 6 host tests; operator-minimal as specified | done |
-| 2 | `akuma-phys` | `phys_ptr(PhysAddr)`, `Frame::from_pa(PhysAddr)`, `Frame::pa()`/`FreshFrame::pa() -> PhysAddr`, `copy_from_frame(PhysAddr)`; callers in `amd64`, `akuma-tokio-kernel-amd64`, `akuma-exceptions-forensics` adapted (`publish() -> usize` unchanged until `akuma-pmm`) | done (612) |
+| 2 | `akuma-phys` | `phys_ptr(PhysAddr)`, `Frame::from_pa(PhysAddr)`, `Frame::pa()`/`FreshFrame::pa() -> PhysAddr`, `copy_from_frame(PhysAddr)`; callers in `amd64`, `akuma-tokio-kernel-amd64`, `akuma-exceptions-forensics` adapted (`publish() -> usize` unchanged until `akuma-pmm`) | done (`akuma-phys` 5 -> 2 untyped; 678 -> 673 after the callers) |
 | 3 | `akuma-pmm` | `alloc_page*`/`free_page*`/`cow_ref_*`/`is_page_free`/`contains`/`init`/`add_ram`/`reserve_range` take and return `PhysAddr`/`Pfn`; **883 references outside the crate** (`grep -rn 'akuma_pmm::\|pmm::'`), so convert behind a typed twin per function and move callers wave by wave, deleting the `usize` twin at the end | next |
 | 4 | `akuma-pagetable`, `akuma-pte-*`, `akuma-mmap` | table-frame and PTE address params; `akuma_mmap::PhysFrame` stays the `Copy` address vocabulary but wraps a `PhysAddr` | |
 | 5 | `akuma-mmu` | 130 params in one file; its own sweep with the full verify-trim gate (Tier 4), per the audit | |
