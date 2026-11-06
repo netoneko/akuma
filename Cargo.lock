@@ -440,6 +440,14 @@ name = "akuma-fpu-amd64"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-frame-raw"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-primitives",
+]
+
+[[package]]
 name = "akuma-gdt"
 version = "0.1.0"
 
@@ -726,7 +734,7 @@ dependencies = [
 name = "akuma-pmm"
 version = "0.1.0"
 dependencies = [
- "akuma-cpu",
+ "akuma-frame-raw",
  "akuma-primitives",
  "spinning_top",
 ]
