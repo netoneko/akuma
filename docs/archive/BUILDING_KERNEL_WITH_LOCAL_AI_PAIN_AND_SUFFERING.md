@@ -592,6 +592,20 @@ still read the README once and wrote a kernel that builds and boots. That is a g
 * Footprint: five files, one `members` line. No commit, no `RESULT.md` (both required by the brief), so it did not follow the reporting half of the task
   even though it did the building half.
 
+### Record: a new kernel from the README in 6.5 minutes (glm-4.7-flash, local)
+
+| | to a building kernel (calls 1-13) | whole session (77 requests) |
+|---|---|---|
+| wall time | **~6.5 min** (build result back at +391 s; files written by +240 s) | 5,320 s (~89 min) |
+| input tokens | **~230 k** (estimate, +/-15 %) | 1,875,408 (recorded) |
+| output tokens | **~2 k** (estimate) | 8,323 (recorded) |
+| model / context | glm-4.7-flash, 29.9 B Q4_K_M, local ollama, **32 k** | same |
+
+Source: goose's `sessions.db` for the trial (`accumulated_*_tokens` are recorded for the whole session only; per-message tokens are not, so the 13-call figure is
+the whole total apportioned by cumulative message size, with the per-request overhead (~11.8 k: system prompt and tool definitions) fitted so it reproduces
+both recorded totals). Times are goose's message timestamps; model load before the first message is not counted. Unverified past the build: the kernel was
+later booted by the harness (gate 3), not by the model. The remaining ~88 % of the input tokens bought nothing (the disk-image spiral above).
+
 Trial three, **gemma4:e4b** (`sapporo`), was started after these two and is not part of this update; append its row here when it finishes.
 
 Housekeeping found on the way: a trial's `wt/` checkout is shared, so judge a finished trial from its own `results/<label>/<city>.tar` extracted into a clean
