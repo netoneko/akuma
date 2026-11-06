@@ -543,6 +543,36 @@ Akuma, and reached gate 6 (goose running inside the guest): `shanghai/docs/EXPER
 boot (gates 1 and 3) before the budget ran out; it is not directly comparable (different revision of the brief, different model, TCG instead of the ryzen's
 KVM) but it is the same harness and the same README.
 
+### glm's 75 tool calls, split at the working kernel (Kyoto, from `goose.out`)
+
+**Calls 1-13: the kernel (13 calls, 8 shell + 4 write + 1 edit).** This is the whole of what produced a bootable kernel.
+
+| calls | what |
+|---|---|
+| 1 | `cat crates/akuma-tokio-kernel/README.md` (the only input it read) |
+| 2-6 | `mkdir kyoto/src`; write `Cargo.toml`, `banner.txt`, `build.rs`, `main.rs` |
+| 7-11 | five calls to find the `members` line of the root `Cargo.toml` (`grep`, `cat`, `grep -A5`, `head`, `sed`); the first one hit the unadvertised-`read` error, the rest re-read the same line |
+| 12 | one `edit`: add `"kyoto"` to `members` (a one-line change, unlike qwen's rewrites of the whole file) |
+| 13 | `cargo build -p kyoto --target x86_64-unknown-none --release -j4`: **Finished in 12 s**. Gate 1 passes; the model says so and moves on |
+
+No call in this stretch failed except the tool-name error. It never opened `shanghai/`; the README was enough.
+
+**Calls 14-75: the spiral (62 calls, all shell, no file written to the tree).** Gate 2 (disk image) was never completed. In order:
+
+| calls | what it tried | why it went nowhere |
+|---|---|---|
+| 14-25 | its own recipe: `mke2fs` + a `debugfs -f` command file + `curl` busybox from busybox.net; a path from the brief's Mac-flavoured text (`/opt/homebrew/.../mke2fs`) failed first, then `/usr/sbin/mke2fs` worked | `debugfs` could not `write` the `sshd` binary because it did not exist at the path in the command file |
+| 15, 26-38 | build `sshd` (`cargo build -p sshd --target x86_64-unknown-none`: "Finished" in 3.5 s) and then **look for the output**: `find`, `ls userspace/target/...` x9 | the binary was never found where it looked; `userspace/` is its own workspace and its target dir is not the one the model searched; it kept re-running the build and re-searching instead of reading `cargo`'s output path |
+| 39-52 | switch to `--target aarch64-unknown-none` and `userspace/build.sh` (`rustup target add aarch64-unknown-none`, a full `build.sh`) | **wrong architecture for an amd64 kernel**; the aarch64 build also needs `aarch64-linux-musl-gcc` for its C probes (not installed) |
+| 53-58 | find `amd64/mkdisk.sh` (a real disk builder) and read it | right idea, found on the 54th call |
+| 59-63 | run `mkdisk.sh`: `hello.elf not found`, so build `akuma-amd64`, which fails on the missing `spleen` font submodule (`base.tar` has no submodules) | the dependency was for a different kernel; `git submodule update` cannot work in a `git archive` checkout |
+| 64-75 | back to `ls`/`find` for `*.img`, `taoxichuan/mkdisk.sh` (does not exist, tried twice), `bootstrap/bin/sshd` (does not exist, tried three times) | the same three dead ends repeated; goose's `--max-turns 120` was never reached, the 5,400 s budget was |
+
+What the spiral is made of: **three** distinct dead ends (find the built sshd, an aarch64 detour, a submodule that cannot exist in the checkout), each re-tried
+several times after it had failed (`taoxichuan/mkdisk.sh` twice, `bootstrap/bin` three times, the sshd `find` over a dozen). There is no sign of a plan being
+revised: after each failure it ran a nearly identical command. The README's section the brief points at ("smallest disk") is the thing to verify; three of the
+failures (where the sshd lands, which `mkdisk.sh` to use, the submodule) are exactly what a README for this task has to state.
+
 Trial three, **gemma4:e4b** (`sapporo`), was started after these two and is not part of this update; append its row here when it finishes.
 
 Housekeeping found on the way: a trial's `wt/` checkout is shared, so judge a finished trial from its own `results/<label>/<city>.tar` extracted into a clean
