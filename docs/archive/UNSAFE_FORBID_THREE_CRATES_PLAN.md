@@ -72,6 +72,21 @@ Do (a) and (c) first (mechanical), (b) needs the `SlotClaim` change and its own 
 2. `akuma-tokio-kernel-amd64`: delete the duplicate walker, boot leaf crate -> forbid. TCG `SMP=4`, then metal.
 3. `akuma-threading`: (a) + (c), then `SlotClaim` (b) with a metal boot.
 
+## Log
+
+**2026-11-06 - we are crushing it today** (owner's note). Production `unsafe` 472 -> 452, 97 crates and modules under
+`forbid`. Landed on `post-release-improvements`:
+
+* `da9a90a3`, `c662d795`: `FreshFrame` staging for the CoW break, trampoline and single-page fill (`COW_FRESHFRAME_STAGING.md`).
+* `3ec608e4`: the sigframe NEON area through the sync-frame handle.
+* `2a80a72f`: **`akuma-exceptions` forbid** - entry shims, vector table and `msr` writes in `akuma-entry::exceptions`.
+  aarch64 gate, 310 boot tests, and the CoW probes (mem_suite 10/10 x3) green.
+* `c2f58d79`: **`akuma-tokio-kernel-amd64` forbid** - `akuma-percpu-gdt-amd64`, `akuma_boot_amd64::shootdown`,
+  checked `amd64::activate` / `enter_user_checked`, and `leaf_table_slot` / `read_user` / `write_user` in
+  `akuma-pagetable`. The amd64 TCG gate caught one real regression on the way (`init_root` zeroed the lower
+  half that `copy_kernel_half` had left alone; fixed before the commit). Firecracker/metal: see below.
+* `akuma-threading` (53 sites) is untouched and is the next one.
+
 ## Background
 
 `UNSAFE_OWNERSHIP_TYPES_DESIGN.md`, `UNSAFE_CONTEXT_TABLE_DESIGN.md`, `COW_FRESHFRAME_STAGING.md`, `docs/reference/crate-safety.md`.
