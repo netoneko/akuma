@@ -606,6 +606,29 @@ the whole total apportioned by cumulative message size, with the per-request ove
 both recorded totals). Times are goose's message timestamps; model load before the first message is not counted. Unverified past the build: the kernel was
 later booted by the harness (gate 3), not by the model. The remaining ~88 % of the input tokens bought nothing (the disk-image spiral above).
 
+### Against Shanghai (glm-5.3-flash, hosted), same README family
+
+Shanghai's session survives in the goose db on the Akuma root partition (`/root/.local/share/goose/sessions/sessions.db`, session `20261102_1`
+"shanghai-akuma-01", working dir `/src/shanghai-wt`, 2026-11-02 18:38-19:26). That run did **all six gates** of its brief, on the ryzen booted into Akuma
+with KVM, not the five of the local trials.
+
+| | Kyoto: glm-4.7-flash, local, 32 k | Shanghai: glm-5.3-flash, hosted |
+|---|---|---|
+| to a building kernel | 13 calls, **~6.5 min**, ~230 k input (est.) | call 19, **~5.5 min** (+329 s), ~210 k input (est., see below) |
+| whole session | 77 requests, 89 min, 1.88 M in / 8.3 k out; gates 1 (+3 by the harness) | **123 tool calls, 48 min (2,872 s)**, 8.30 M in / 79.5 k out; **gates 1-6 passed** |
+| final context | 32.6 k (the window) | 127 k |
+| spiral | 62 of 75 calls, never left gate 2 | none recorded as such; the extra tokens went into gates 2-6 |
+
+Reading it: **time to a building kernel is the same to within a minute** (5.5 vs 6.5), at about the same input-token cost. What differs is everything after:
+the hosted model carried the task through the disk image, boot, ssh and a tokio program in 48 minutes, spending 4.4x the input tokens of the whole
+local session; the local one used 89 minutes and a 1.9 M budget to not get past the disk image. So the local result is not "much slower at writing a kernel"; it is
+"stuck on the first piece of real build-system work".
+
+How the Shanghai numbers were taken: the first tool result containing a successful `shanghai` release build is message 39 (call 19, +329 s); input tokens
+are apportioned by cumulative message size as for Kyoto, but the fit is rougher here (the fitted fixed overhead came out negative, so treat ~210 k as +/-30 %).
+Whole-session totals are recorded values. The Shanghai brief and README revision differ from the local trials' (`shanghai-01-new-kernel.md` vs
+`kernelgen-brief.md`), and Shanghai's session was driven with a larger context.
+
 Trial three, **gemma4:e4b** (`sapporo`), was started after these two and is not part of this update; append its row here when it finishes.
 
 Housekeeping found on the way: a trial's `wt/` checkout is shared, so judge a finished trial from its own `results/<label>/<city>.tar` extracted into a clean
