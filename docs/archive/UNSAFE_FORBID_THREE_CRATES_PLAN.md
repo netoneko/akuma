@@ -84,7 +84,14 @@ Do (a) and (c) first (mechanical), (b) needs the `SlotClaim` change and its own 
 * `c2f58d79`: **`akuma-tokio-kernel-amd64` forbid** - `akuma-percpu-gdt-amd64`, `akuma_boot_amd64::shootdown`,
   checked `amd64::activate` / `enter_user_checked`, and `leaf_table_slot` / `read_user` / `write_user` in
   `akuma-pagetable`. The amd64 TCG gate caught one real regression on the way (`init_root` zeroed the lower
-  half that `copy_kernel_half` had left alone; fixed before the commit). Firecracker/metal: see below.
+  half that `copy_kernel_half` had left alone; fixed before the commit).
+  **Firecracker on Pop** (real `firecracker`, KVM, root = a dm-snapshot of p3, kernel built on Pop from `c2f58d79`):
+  Taoxichuan boots at **`smp=4` (4 of 4 online) and `smp=1`**, reaches `init spawn`, enters ring 3, `sshd` listening;
+  zero `[Fault]` / panic / `activate:` / `enter_user:` refusals / `GDT slot` panics in the console. That exercises
+  the per-core GDT init, `set_rsp0`, the AP trampoline copy, the shootdown stub, the checked `activate` and
+  `enter_user_checked` on real KVM. Not run: a workload over the network (no DHCP on the test tap), the
+  `akuma-amd64` kernel (it only picks up the shared-crate additions, none on its paths), and metal
+  (the ryzen is on Pop for the local-model trials; deferred by the owner to verify on Akuma later).
 * `akuma-threading` (53 sites) is untouched and is the next one.
 
 ## Background
