@@ -482,3 +482,43 @@ in this build (its protocol has `token_usage`, nothing persisted); exact counts 
 the first Infinity run, later runs against the same daemon dir never reach the model; cause not found (daemon/provider restart handling suspected). `going idle` in
 the daemon log is not a completion signal (it is also printed when a thread starts). (4) `vm-dev` was stopped with the user's go-ahead and is still halted;
 the trial VM `akuma-install-2230` is running. Not run: the Linux/Pop Firecracker workload (needs the ryzen booted into Pop).
+
+## Update 11 (2026-11-06): can a local model compose a fresh kernel? qwen3:4b no, glm-4.7-flash builds and boots one (Claude)
+
+The experiment: give a local model one document, `crates/akuma-tokio-kernel/README.md`, and ask it to write a new city kernel from it
+(`scripts/kvm/goose/kernelgen-brief.md`, driver `scripts/kvm/goose/kernelgen_trial.sh`). The new directory `{city}/` is the only thing it may add, plus one
+`members` line. Five gates: build, minimal disk image, boot (long mode + `entering ring 3 -- /bin/sshd`, no `[Fault]`, its own ASCII banner), `ssh uname`,
+`tokioprobe RESULT PASS`. Each trial: goose (`--max-turns 120`, `developer` builtin) against ollama on the Mac, 5,400 s budget, clean checkout from `git archive`,
+on the ryzen while it is booted into Pop (no KVM for the model's own qemu: TCG only). The trials run one after another; the **harness**, not the model, judges
+afterwards (build the produced crate in a clean copy, boot it under the real Firecracker on a throwaway dm-snapshot of the Akuma root).
+
+| trial | model | city | shell calls | stopped by | produced | build | boots |
+|---|---|---|---|---|---|---|---|
+| Nagoya | qwen3:4b | `nagoya` | 14 | budget (exit 124) | `main.rs` of 2 lines: `println!("{}");` (malformed), no dependency, no `no_std`; also **rewrote the root `Cargo.toml`** (twice), which breaks the whole workspace | no (workspace fails to load: `workspace.lints` not defined) | - |
+| Kyoto | glm-4.7-flash | `kyoto` | 70 | budget (exit 124) | `kyoto/{Cargo.toml, build.rs, src/main.rs, src/banner.txt}` + one `members` line | **yes**, 8 s | **yes** |
+
+**qwen3:4b failed outright.** It never reached gate 1 in a form that could pass: the file it wrote is not a kernel, and its edits to the root manifest broke
+every `cargo` command in the tree, which it then spent its remaining turns trying to diagnose. No commit, no `RESULT.md`. The size of the model is the likely
+reason (the README is long and the dependency on `akuma-tokio-kernel`'s builder API is the whole task), but this run does not prove it: one trial, one prompt.
+
+**glm-4.7-flash got a working kernel.** `kyoto/src/main.rs` is ten lines: `akuma_tokio_kernel::entry!(main)` and a `Kernel` builder chain
+(`.name("Kyoto").banner(include_str!("banner.txt")).console().disk().net().smp().run_init()`), the same composition the README describes for Shanghai. The
+`build.rs` is the README's linker-script hand-off, with the aarch64 fallback it also describes. Harness result: `cargo build -p kyoto --target
+x86_64-unknown-none --release -j4` finishes (the shared crates were already built), and under Firecracker (1 vCPU, root = snapshot of the Akuma root partition,
+`init=/bin/sshd`) the console shows `Kyoto/amd64 -- long mode reached`, `Kyoto 0.1.0 (akuma-tokio-kernel, amd64)`, `Kyoto: init spawn -- init=/bin/sshd`,
+`Kyoto: entering ring 3 -- /bin/sshd` and `[SSHD] Listening on 0.0.0.0:22...`, with no `[Fault]` or panic line. That is gates 1 and 3 of the brief.
+
+What glm did **not** do, and the model stopped on: it never committed (`commits.txt` is only `base`), never wrote `RESULT.md`, and its last 15 minutes of output
+are a hunt for a disk image: `ls taoxichuan/mkdisk.sh` (no such file), `find -name "*.img"`, `grep kyoto|sshd|disk.img`. So **gate 2 (the "smallest disk"
+steps) is where it ran out**, which makes the README's disk section the first thing to check for a missing or misnamed script before blaming the model. Gates
+2, 4 and 5 were therefore not exercised by either trial.
+
+Reading the pair: the composition API is small enough that a 30B-class local model can use it from the README alone (it wrote the right ten lines without
+copying `shanghai/`), and a 4B cannot; the part that needs real multi-step shell work (disk image, ssh, a tokio probe) is still beyond what either did in
+90 minutes on TCG. Caveats, so nobody over-reads the table: one trial per model, the brief names the API and the sample kernel, the base tree for glm was the
+tree at the time (`base.tar`, older than the unsafe-reduction work of the same day), and TCG slowness is part of the cost.
+
+Trial three, **gemma4:e4b** (`sapporo`), was started after these two and is not part of this update; append its row here when it finishes.
+
+Housekeeping found on the way: a trial's `wt/` checkout is shared, so judge a finished trial from its own `results/<label>/<city>.tar` extracted into a clean
+copy of `base.tar` (that is what was done), never from `wt/` while the next trial is running.
