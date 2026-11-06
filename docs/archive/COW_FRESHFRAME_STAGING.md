@@ -80,7 +80,11 @@ pages drifting down by one per absorbed fault.
 
 ## Probe results
 
-(filled in after the probe run)
+`scripts/mem_suite.py --port 2322` (devbox-smoltcp, `SMP=4`, aarch64 HVF), three consecutive runs on the tree at
+`2a80a72f` (this change plus the `akuma-exceptions` entry split): **10/10 probes PASS each time, 3 DIVERGE**
+(the documented `smapsdirty` ones). Included: `cowstale`, `madvshared`, `shmanon`, `mmaplazy`, `mprotectlb`,
+`mmap_stress`, `mmap_file`, `eager_mprotect_probe`, `mremapmove`. The absorbed-path free itself is still not
+asserted by any probe (see Open).
 
 ## Open
 
