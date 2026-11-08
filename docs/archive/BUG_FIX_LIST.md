@@ -13,28 +13,28 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1493
-- **Docs contributing at least one fix:** 424
+- **Total distinct fixes counted:** 1506
+- **Docs contributing at least one fix:** 429
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 245 | 16.4% | 35 |
-| Memory & Virtual Memory | 181 | 12.1% | 61 |
-| Scheduler & Process Management | 139 | 9.3% | 43 |
-| SMP & Locking | 136 | 9.1% | 56 |
+| Syscall / ABI Compatibility Audits | 245 | 16.3% | 35 |
+| Memory & Virtual Memory | 182 | 12.1% | 62 |
+| Scheduler & Process Management | 139 | 9.2% | 43 |
+| SMP & Locking | 136 | 9.0% | 56 |
 | Networking | 96 | 6.4% | 37 |
 | Userspace Apps & Libraries | 40 | 2.7% | 21 |
 | Rump Kernel & Syscall Proxy | 26 | 1.7% | 6 |
-| Toolchain & Self-Hosting | 91 | 6.1% | 13 |
+| Toolchain & Self-Hosting | 94 | 6.2% | 14 |
 | SSH | 40 | 2.7% | 19 |
-| VFS & Filesystem | 140 | 9.4% | 44 |
-| Boot & Drivers | 141 | 9.4% | 22 |
-| Signals & Exceptions | 40 | 2.7% | 15 |
-| Misc / Cross-cutting | 64 | 4.3% | 23 |
+| VFS & Filesystem | 143 | 9.5% | 45 |
+| Boot & Drivers | 142 | 9.4% | 23 |
+| Signals & Exceptions | 45 | 3.0% | 16 |
+| Misc / Cross-cutting | 64 | 4.2% | 23 |
 | Console & Terminal | 58 | 3.9% | 18 |
-| Containers | 56 | 3.8% | 11 |
-| **Total** | **1493** | **100.0%** | **424** |
+| Containers | 56 | 3.7% | 11 |
+| **Total** | **1506** | **100.0%** | **429** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -334,7 +334,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - glue's `pidfd_open` accepted `O_CLOEXEC` and made the fd close-on-exec only on request; Linux accepts only `PIDFD_NONBLOCK`, answers `EINVAL` for anything else and makes every pidfd close-on-exec (found by `pidfdprobe` on Linux 6.17 first; fixed for all three kernels)
 - `rt_sigpending` (x86_64 127, asm-generic 136) was served by no kernel: no abi row, no glue arm; new `signal::sys_rt_sigpending` (Linux's `do_sigpending`) routed on all three
 
-## Memory & Virtual Memory (181 fixes, 61 docs)
+## Memory & Virtual Memory (182 fixes, 62 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -640,6 +640,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md
 - glue's `copy_from_user_str` read a path byte by byte and left each page to the fault handler, which on Taoxichuan fills no file page from ring 0, so a path in a lazily mapped library's or image's `.rodata` was `EFAULT` (git: `could not open '/dev/null' ... Bad address`); it prefaults each page it enters
+
+### docs/archive/COW_FRESHFRAME_STAGING.md
+- The EL0 write-fault arm allocated its CoW destination before `as_lock` and, when `stale_write_fault_absorbed` made the break unnecessary, returned without freeing it: one 4 KiB frame leaked per absorbed fault; the frame is a `FreshFrame` now, freed by `Drop` on that exit
 
 ## Scheduler & Process Management (139 fixes, 43 docs)
 
@@ -1429,7 +1432,7 @@ aren't recorded anywhere else.)
 - On the rump devbox, every ssh session reset at kex (`kex_exchange_identification: Connection reset by peer`): `RumpSocket` was the one fd family `clone_deep_for_fork` did not refcount, so a forked sshd session's parent `drop(stream)` closed the socket out from under its own still-running child; fixed by refcounting `RumpSocket` the same way every other fd family already was (superseded the wrong DHCP-path diagnosis in `DEVBOX_ISSUES.md` Issue 10)
 
 
-## Toolchain & Self-Hosting (91 fixes, 13 docs)
+## Toolchain & Self-Hosting (94 fixes, 14 docs)
 
 ### docs/archive/AKUMA_SELF_HOSTING.md
 - §3: boot self-test VA collision causing MEMORY≥8G `map_user_page` crash
@@ -1550,6 +1553,11 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_MAC_BUILT_KERNEL_METAL_HANG.md
 - `overlays/ryzen/cycle.py` could install a truncated kernel: `ship()` ran `cat > x.new && mv x.new x`, and when the local ssh timeout killed the client the remote `cat` saw EOF and exited 0, so `mv` renamed the partial file (8.8 of 10.5 MB); it now uploads to `.new`, checks the md5 and renames only on a match
 
+### docs/archive/LINK_KERNEL_BIN_LAYOUT.md
+- `scripts/link_kernel.sh` matched only `*/deps/akuma-*`, a path the 2026-09 nightly no longer links to, so `cargo build` wrote no `.bin` for any kernel (and `akuma.bin` went stale); it handles both layouts and any binary linked for the target
+- A cargo-cached ELF is uplifted without relinking, so the wrapper never runs and the gate's aarch64 control kernel booted the middleware `.bin`; `mw_gate.sh` runs `mkbin.sh` on the ELF after every build
+- `shanghai/build.rs` was amd64-only (no `BOOT_STACK_SIZE` branch), so Shanghai did not build for aarch64
+
 ## SSH (40 fixes, 19 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
@@ -1632,7 +1640,7 @@ aren't recorded anywhere else.)
 ### docs/archive/SSHD_SESSION_WITHOUT_PATH.md
 - `session_env` stopped being empty when `HOME` was added (2026-10-17), so the kernel's `DEFAULT_ENV` and its `PATH` no longer applied and exec sessions ran with no `PATH` at all: gcc's `make_relative_prefix` fell back to `../` and `posix_spawnp("cc1")` failed with `ENOENT`; the session always gets Alpine's `PATH`
 
-## VFS & Filesystem (140 fixes, 44 docs)
+## VFS & Filesystem (143 fixes, 45 docs)
 
 ### docs/archive/AKUMA_EXT2_CLEANUP.md
 - §2.3: `read_inode` heap over-read (UB) — a rev-1 superblock's `inode_size` was taken off disk with no minimum check, so an image with `inode_size < 128` blitted a whole `Inode` out of a smaller allocation
@@ -1864,7 +1872,12 @@ aren't recorded anywhere else.)
 ### docs/archive/UNLINKED_FILE_SPACE_RETURNED_LATE.md
 - ext2 finished an unlink deferred by a pin only at the next unlink, rename or inode allocation, though the pin itself goes at an `munmap`, a `close` or a reap, none of them a filesystem call: a file unlinked while open or mapped kept its blocks after the last `close`/`munmap` and after exit, until an unrelated file was deleted, and stayed half-deleted across a crash. The pin table counts last-pin releases (`unpin_epoch`), and every ext2 write hold and `statfs` drains when that count has moved
 
-## Boot & Drivers (141 fixes, 22 docs)
+### docs/archive/ETXTBSY_TEXT_BUSY.md
+- Nothing stopped a writer rewriting a file that was being executed (lazy text pages are read from the inode after `execve`): a child that rewrote its own binary died with SIGSEGV and a signature checked at exec described bytes that no longer ran; `text_busy` pins `(filesystem identity, inode)` per executor and ext2 and `openat` answer `ETXTBSY`
+- `openat`'s `O_TRUNC` path discarded the result of `write_file` (`let _ =`), so a refused truncate would have reported success having done nothing
+- The first `text_busy` table keyed on the inode number alone, so a binary running from one mount blocked writes to same-numbered files on every other mount (three unrelated `akuma-ext2` tests failed); keyed on `(identity, inode)`
+
+## Boot & Drivers (142 fixes, 23 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
@@ -2053,7 +2066,10 @@ aren't recorded anywhere else.)
 - `lapic::arm_deadline`/`arm_oneshot_in_us`/`arm_idle_shot` wrote the one-shot's count and only then set `ONESHOT`, and `net_blocking_relax` → `allow_tick` called them with `IF` set (the BKL release restores the flags it was taken under): a tick landing between the two (a whole VM exit wide under SVM) found the flag clear, did not restore the periodic tick, and the `sti; hlt` after it slept on a spent one-shot with no timer left — a guest hang that read as a Firecracker/NIC wedge; the three arm functions now run with interrupts off
 - A `poll(2)`/`ppoll(2)` that timed out returned 0 without writing its scan back, so a caller reusing its array (busybox `nc -u -w 2`) kept the previous call's `POLLIN`, read a socket with nothing to say and looped on a 10 s `ETIMEDOUT` forever; the timeout path now stores the zeroed `revents`, pinned by `epollops` `poll_timeout_clears_revents`
 
-## Signals & Exceptions (40 fixes, 15 docs)
+### docs/archive/HVF_BOOT_TEST_STAGE2_FAULT.md
+- `test_safe_user_access_fault` copied across `kernel_va_end()` into a stretch the boot map covers with no RAM behind it, so under HVF the stage-2 fault (`ISV=0`) aborted QEMU and the boot suite never finished; the test builds its own stage-1 cliff now (166 PASS)
+
+## Signals & Exceptions (45 fixes, 16 docs)
 
 ### docs/archive/CTRL_C_SIGINT_DELIVERY.md
 - Ctrl-C never interrupted a foreground child over `ssh -tt` (repro: `tail -f`): **no line discipline in the tree generated `SIGINT` at all**. Fixed in the kernel as a process-group broadcast; the first attempt — patching sshd to target `foreground_pgid` as a single pid — was wrong and is recorded as such
@@ -2125,6 +2141,13 @@ aren't recorded anywhere else.)
 
 ### docs/archive/AMD64_METAL_CONTROL_RUN.md
 - Emulating a trapped `MRS` with `rt == 31` on AArch64 wrote word 31 of the trap frame (`sp_el0`) instead of discarding the result as `XZR`, as the read side already did
+
+### docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md
+- `signal_is_fatal_default` omitted `SIGUSR1`/`SIGUSR2`, `SIGSTKFLT`, `SIGIO`, `SIGPWR` and every real-time signal, so `kill -USR2 $$` was dropped on every Akuma kernel; it is Linux's table now (one copy, `akuma_syscalls_signal::fatal_by_default`)
+- `sys_tkill` took an unattributable target (thread mid-creation or teardown) to have the `Default` disposition instead of dropping the signal, which is what made the table change kill the in-VM `rustc` build with `signal: 10`
+- `sys_tkill`'s default action ran `sys_exit_group` on the **caller**, so a fatal signal aimed at another process killed the sender; it ends the target's group, pended and woken, and the decision is `tkill_action`, host-tested exhaustively
+- glue's dispatch prologue answered `rt_sigprocmask` (and `rt_sigaction`, `rt_sigpending`, `rt_sigreturn`, `sigaltstack`) with `EINTR` while the interrupt bit was set, so musl's `fork` child never restored its mask and `pidfdprobe` hung at smp=4; those calls never answer `EINTR` nor consume the bit
+- `test_tkill_blocked_fatal_is_pended` sent a blocked SIGTERM to a kernel thread and asserted it was pended, which the new rule drops, so the main kernel panicked at boot on every run; replaced by `test_tkill_to_a_kernel_thread_is_dropped`
 
 ## Misc / Cross-cutting (64 fixes, 23 docs)
 
@@ -2495,3 +2518,5 @@ Also scanned 2026-10-24 (the Firecracker guest hang on `kvm-part-1`: 5 code comm
 Also scanned 2026-11-02 (closing `rust-org-il-experiment`, 536 commits and about 70 archive docs, most of them the Taoxichuan experiment and its cleanup). Counted above: DUP_LOST_O_NONBLOCK, TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND (two shared-glue fixes), AKUMA_VIRTIO_IN_TREE, AMD64_BOX_SPAWN_EXT_REGRESSION, KVM_GUEST_DISK_856_MIB_RACE, AUDIT_SURFACE_METHODOLOGY, TAOXICHUAN_CLEANUP_PLAN (its one amd64 fix), KVM_GUEST_RAM_CAP_LIFTED, and the two shared-crate bullets of TAOXICHUAN_BUGS_FOUND_2026_10_30. **Every Taoxichuan-only fix moved to `TAOXICHUAN_BUG_FIX_LIST.md`**, including the six that were counted here under TAOXICHUAN_BUGS_FOUND_2026_10_30 and the TAOXICHUAN_SMP fixes (`dac8a275`, the AP's `IA32_APIC_BASE` enable; `5108b5e5`, which this paragraph used to name, is TAOXICHUAN_CARGO_STALL_REGRESSION's pipe-EOF fix and is counted there). No counted fix, open by their own text: AKUMA_RYZEN_HERD_STOP_GUEST_RESET (the ryzen reset on `herd stop goose-glm`, seen once), AMD64_THREADPROBE_EXIT_ZERO_FLAKE (logged as a flake by decision), GOOSE_SERVE_IDLE_SPIN, HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD. No fix, measurement or record: AKUMA_SYSCALLS_TOKIO_DEP_ANALYSIS, CLONE_AUDIT_2026_11_01 and CLONE_AND_MUT_BUDGETS (the audit's findings are not done), LINE_COUNT_ANALYSIS_POST_AMD64, RUST_ORG_IL_TALK, GOOSE_GLM_SERVE_ON_RYZEN (setup; its traps are workarounds), MINIMAL_SELF_HOSTING_EXPERIMENT (the brief). The branch's edits to AKUMA_FIRECRACKER_AMD64, AKUMA_FIRECRACKER_KVM, AKUMA_KVM_DEV_CYCLE and AMD64_J4_BUILD_CRASH_HUNT add no fix. AKUMA_AMD64_SCHED_CRATE's one fix is Taoxichuan's (the trace build's idle-lap dump) and is counted there. No doc to cite: `d6ee7d97` (`akuma-threading`'s x86 fresh-thread trampoline never released the outgoing thread's `ON_CPU` gate, so the first switch to a never-run thread could leave its predecessor unschedulable; named only as a bisect row in TAOXICHUAN_CARGO_STALL_REGRESSION).
 
 Also scanned 2026-11-03 (the Infinity run on Taoxichuan and what it left open). Counted above: EXT2_DIRENT_TYPE_WITHOUT_FILETYPE, KVM_GUEST_4GIB_PVH_HANDOFF, UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS, SSHD_SESSION_WITHOUT_PATH and the one shared-glue bullet of TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES. The rest of INFINITY_ON_TAOXICHUAN, TAOXICHUAN_EXEC_ARGV_LIMIT, TAOXICHUAN_EXEC_SHEBANG and TAOXICHUAN_LAZY_MMAP are Taoxichuan's and are counted there. KVM_GUEST_RAM_CAP_LIFTED's new paragraph corrects two of its statements and points at KVM_GUEST_4GIB_PVH_HANDOFF, where those fixes are counted. The edits to MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG, TAOXICHUAN_CLEANUP_PLAN, TAOXICHUAN_FIXED_POINT and RUST_ORG_IL_TALK add no fix. A second pass the same day (shared mappings, the lazy image, the ext2 cap) counts EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES and the one glue bullet of TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE; the rest of that doc is Taoxichuan's. The dated notes added to TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES, TAOXICHUAN_LAZY_MMAP and INFINITY_ON_TAOXICHUAN point at those two docs and add no fix. The ENOSPC inconsistencies EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES records are open. A third pass counts INODE_PIN_CONGESTED_WINDOW (`akuma-primitives`, so every kernel); the partial build measurement added to TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE and the dated note in TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES add no fix. A fourth pass counts the ext2 drain of UNLINKED_FILE_SPACE_RETURNED_LATE; its Taoxichuan pin range is Taoxichuan's, counted there.
+
+Also scanned 2026-11-08 (closing `post-release-improvements`, 136 commits, the Shanghai middleware work, the unsafe-reduction rounds and the ETXTBSY and signal fixes). Counted above: COW_FRESHFRAME_STAGING, ETXTBSY_TEXT_BUSY, HVF_BOOT_TEST_STAGE2_FAULT, LINK_KERNEL_BIN_LAYOUT and SIGNAL_FATAL_DEFAULT_LINUX. The tokio kernels' fixes from the same branch (TAOXICHUAN_BKL_NESTED_TICKET_DEADLOCK, TAOXICHUAN_KILL_SIBLINGS_ON_CPU_RACE, TAOXICHUAN_LOADER_SHARED_SEGMENT_PAGE, INFINITY_ON_TAOXICHUAN's stack growth, TAOXICHUAN_B21_AARCH64's build break) are in `TAOXICHUAN_BUG_FIX_LIST.md`. No counted fix: NEWTYPE_AUDIT, VEC_SENSITIVE_LAYERS_AUDIT, UNSAFE_KERNEL_AUDIT, UNSAFE_CONTEXT_TABLE_DESIGN, UNSAFE_OWNERSHIP_TYPES_DESIGN, UNSAFE_FORBID_THREE_CRATES_PLAN and GLM_BRIEF_UNSAFE_CPU_STEP (audits, designs and a brief); UNSAFE_KERNEL_CPU_STEP (a refactor; the seven missing `unsafe` blocks in a model's aarch64-only change were fixed in the merge, before they built anywhere); BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING (an experiment log; its harness fixes are rig changes); RTW89_WIFI_DORMANCY_AUDIT (root cause of the ryzen link drops; the Pop fix is host configuration and the Akuma fixes are planned, not landed, so the `u64` underflow in the `[rtw] link:` gap line stays open); AKUMA_KVM_DEV_CYCLE's new Ports section (a port-allocation note). Fix-shaped commits with no archive doc, uncounted: `0fdf7a7f` (two `akuma-primitives` test fixtures shared a table and raced), `72ff4d3e` (`check_addr_params` truncated at the first `cfg(test)`), `c662d795` (follow-up inside COW_FRESHFRAME_STAGING), `616f704d` (clippy), the `install.sh` and ssh-client `-y` commits (tooling), and the `shanghai` gate commits (rig).

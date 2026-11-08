@@ -65,6 +65,4 @@ arrives during the wait is taken once the core owns the lock, where its `enter` 
 ## Background
 
 `crates/akuma-tokio-kernel-core/src/bkl.rs`; `scripts/kvm/taoxichuan/tcg_rig.py` (`TX_QEMU_EXTRA`); related: `FIRECRACKER_BKL_TICKET_SILENT_WEDGE.md`
-(another ticket-lock wedge, a different cause: read it before assuming this is the same one). **Not yet in
-`TAOXICHUAN_BUG_FIX_LIST.md`:** `docs/runbooks/update-bug-fix-list.md` needs its branch-wide sweep and counted statistics, which was not
-done here.
+(another ticket-lock wedge, a different cause: read it before assuming this is the same one). Counted in `TAOXICHUAN_BUG_FIX_LIST.md`.

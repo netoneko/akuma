@@ -16,21 +16,21 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ## Statistics
 
-- **Total distinct fixes counted:** 119
-- **Docs contributing at least one fix:** 35
+- **Total distinct fixes counted:** 125
+- **Docs contributing at least one fix:** 39
 - **Subsystem categories:** 8
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscalls, Files & Pipes | 37 | 31.1% | 6 |
-| Exec & ELF Loading | 11 | 9.2% | 4 |
-| Processes, Fork, Threads & Scheduling | 33 | 27.7% | 9 |
-| Memory & Copy-on-Write | 16 | 13.4% | 6 |
-| Signals | 5 | 4.2% | 2 |
-| Networking & Readiness | 4 | 3.4% | 2 |
-| SMP, Time & Boot | 10 | 8.4% | 5 |
-| Build & Integration | 3 | 2.5% | 1 |
-| **Total** | **119** | **100.0%** | **35** |
+| Syscalls, Files & Pipes | 37 | 29.6% | 6 |
+| Exec & ELF Loading | 12 | 9.6% | 5 |
+| Processes, Fork, Threads & Scheduling | 35 | 28.0% | 10 |
+| Memory & Copy-on-Write | 16 | 12.8% | 6 |
+| Signals | 5 | 4.0% | 2 |
+| Networking & Readiness | 4 | 3.2% | 2 |
+| SMP, Time & Boot | 12 | 9.6% | 6 |
+| Build & Integration | 4 | 3.2% | 2 |
+| **Total** | **125** | **100.0%** | **39** |
 
 **Largest single write-ups:**
 
@@ -92,7 +92,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/SYSCALL_CONSTANT_AUDIT_2026_10_30.md
 - `akuma-ring3-amd64::nr` (Taoxichuan's dispatch table) had `GETPID = 38` and `SENDFILE = 39`, both off by one, so `setitimer` (38) answered the caller's pid while it still had a `GETPID` arm; the third x86_64 table is gone
 
-## Exec & ELF Loading (11 fixes, 4 docs)
+## Exec & ELF Loading (12 fixes, 5 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `build_stack` sliced backwards from the end of a 512-byte initial stack block and apk's long argv and env overran it by one pointer word: a kernel PANIC on the first install write (stage 6B, `28dc8ba2`)
@@ -113,7 +113,10 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_EXEC_SHEBANG.md
 - `exec_real_task` answered `ENOEXEC` for anything not ELF, so GLM's `#!/usr/bin/env python3` `RUSTC_WRAPPER` could not run; it follows up to 4 `#!` hops through the shared `parse_shebang`/`shebang_hop`
 
-## Processes, Fork, Threads & Scheduling (33 fixes, 9 docs)
+### docs/archive/TAOXICHUAN_LOADER_SHARED_SEGMENT_PAGE.md
+- `place_segment` built a page two `PT_LOAD`s share eagerly for each segment in turn, so the second replaced the first's frame, dropping its exec bit and its bytes (sshd's `.text` tail read as zeros, an instruction abort at start); it copies every overlapping segment into the page and keeps the first mapping, as the main kernel does
+
+## Processes, Fork, Threads & Scheduling (35 fixes, 10 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `child_enter` (naked asm) loaded `ef.rsi` early and kept dereferencing the loaded value: a page fault at `cr2=0x20` on the first real SPAWN (stage 6B)
@@ -166,6 +169,10 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_SSH_STDIN_PUMP.md
 - the `linux-abi` `spawn_full` piped only stdout, so the child inherited the spawner's fd 0 and sshd's pump wrote into a stdin the child never read, with no EOF either: every ssh exec that sent stdin hung; `SpawnResult` carries the write end of a real stdin pipe (`15ff2709`)
 
+### docs/archive/TAOXICHUAN_KILL_SIBLINGS_ON_CPU_RACE.md
+- `exit_group`'s `kill_siblings` decided from the state word whether a sibling was executing, but on the hooked scheduler the `ON_CPU` gate says that: a thread another core had just picked, and the leader (marked terminated unconditionally by `task_exit_code`), kept running in user mode while the reap freed its frames, so killtree faulted in about half the smp=4 boots; `x86_hold_off_cpu` holds the gate, and a thread that cannot be held is asked to end itself
+- The amd64 fault report read `CR2` live after `lazy::fill`, which can park on a disk read, so it (and `grow_user_stack`) could act on another task's fault address; it is captured once at entry
+
 ## Memory & Copy-on-Write (16 fixes, 6 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
@@ -217,7 +224,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_TOKIO_MULTI_EPOLL_FINDING.md
 - an edge-triggered eventfd reported only its first wake: mio's waker is written on every wake and never read, so a rising-edge-only model lost the rest and tokio's multi-thread runtime progressed only on its timeout; `epoll::on_eventfd_written` re-arms every `EPOLLET` entry naming the eventfd (GET 24,968 ms -> 53 ms)
 
-## SMP, Time & Boot (10 fixes, 5 docs)
+## SMP, Time & Boot (12 fixes, 6 docs)
 
 ### docs/archive/TAOXICHUAN_SMP.md
 - `switch_to` left CR3 alone for an idle thread, so an idle core sat on a finished task's root while another core reaped it and freed its page tables: a triple fault; an idle thread loads the kernel root
@@ -238,13 +245,20 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ### docs/archive/INFINITY_ON_TAOXICHUAN.md
 - ext2 was mounted with a constant-0 clock, so every file read 1 Jan 1970 and every unlinked inode carried `dtime` 0 (15,254 e2fsck repairs after a hard stop); it stamps UTC from the `epoch=` anchor (`a0ffa4d4`)
+- aarch64 had no user-stack growth (amd64 grows on the fault up to 8 MiB), so Infinity's 46 KB `async main` frame probed past the 64 KiB initial stack and the task was killed before `main`; `grow_user_stack` moved into core, generic over `Loader`, and the aarch64 EL0 data abort calls it (2026-11-05)
 
-## Build & Integration (3 fixes, 1 doc)
+### docs/archive/TAOXICHUAN_BKL_NESTED_TICKET_DEADLOCK.md
+- `bkl::enter` could be reached with interrupts on, so a timer tick during a ticket wait took a second ticket behind the suspended outer one and every core queued behind them (about 1 amd64 boot in 8, 0 of 100 after); it masks interrupts for the whole wait (`BklCpu::irq_save`/`irq_restore`)
+
+## Build & Integration (4 fixes, 2 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `akuma-boot-amd64` assembled its AT&T `boot.s` unconditionally, which broke the Mac's pre-commit hook (`att_syntax` is x86-only); the `global_asm!` is gated on `target_arch = "x86_64"` (stage 1)
 - `crates/akuma-ring3-amd64` went into the workspace `default-members`, so the AArch64 kernel build compiled its x86 `naked_asm!`: 55 assembler errors (stage 2)
 - `akuma-net`'s new `socket_local_addr` lacked `#[cfg(feature = "smoltcp")]`, which broke the AArch64 `extreme-size` build at the merge (`1dd4c29a`)
+
+### docs/archive/TAOXICHUAN_B21_AARCH64.md
+- `1dfa9efa` left `mm_dump_for` without its `#[cfg(feature = "trace-err")]` when `fault_code_dump` was inserted between them, so an amd64 build without `trace-err` did not compile
 
 ---
 
@@ -272,6 +286,9 @@ These are fixes to code every kernel runs, so the Akuma list counts them:
   freed their unlinks (65 inodes after a `cargo clean` in the Infinity guest).
 - `UNLINKED_FILE_SPACE_RETURNED_LATE.md`: ext2 finished a deferred free only at the next unlink or create, so a file unlinked
   while mapped or open kept its blocks after the last `munmap`/`close`, and after exit.
+- `SIGNAL_FATAL_DEFAULT_LINUX.md`: glue's `signal_is_fatal_default` dropped `SIGUSR1`/`SIGUSR2` and the real-time signals, `sys_tkill` ran the default action on its caller, and the dispatch prologue answered `rt_sigprocmask` with `EINTR`; found bringing signals to aarch64 Taoxichuan (B21 A5.7).
+- `ETXTBSY_TEXT_BUSY.md`: a file being executed could be rewritten (the tokio kernels' signed-exec proof died with SIGSEGV); the fix is in ext2 and glue's `openat`, so every kernel has it.
+
 
 ## Files scanned with zero counted fixes
 
@@ -312,6 +329,8 @@ Scanned 2026-11-02, closing `rust-org-il-experiment`.
   stranded inodes it showed are INODE_PIN_CONGESTED_WINDOW, counted in `BUG_FIX_LIST.md`. A fourth pass counts
   UNLINKED_FILE_SPACE_RETURNED_LATE's Taoxichuan pin range here and its ext2 drain in `BUG_FIX_LIST.md`; the dated note in
   TAOXICHUAN_LAZY_MMAP points at it and adds no fix.
+- **Scanned 2026-11-08** (closing `post-release-improvements`). Counted above: TAOXICHUAN_BKL_NESTED_TICKET_DEADLOCK, TAOXICHUAN_KILL_SIBLINGS_ON_CPU_RACE, TAOXICHUAN_LOADER_SHARED_SEGMENT_PAGE, INFINITY_ON_TAOXICHUAN's aarch64 stack growth and TAOXICHUAN_B21_AARCH64's build break. TAOXICHUAN_B21_AARCH64's other entries are steps and measurements; its aarch64 `mremap` was a syscall the kernel had never served, and its `CR2` fix is counted under TAOXICHUAN_KILL_SIBLINGS_ON_CPU_RACE. TAOXICHUAN_SYSCALL_MIDDLEWARE is a capability (the middleware crates, `signed-exec`, `no-dynamic-loading`); the rig bugs it records (a signed-assets directory named like the staged kernel, a 32 MB gate image filled by five probe copies) and TAOXICHUAN_B21_AARCH64's Alpine-mirror 404 are tooling, uncounted. The `ETXTBSY` and signal fixes it led to are in `BUG_FIX_LIST.md`.
+
 
 ## Background
 
