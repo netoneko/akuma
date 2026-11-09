@@ -243,6 +243,49 @@ rig lacks: the framebuffer console, the USB keyboard, wifi, or the metal's real 
 installed as p3 `/boot/akuma-amd64.verify` (entry 26); the previous `.verify` is `.verify.pre-e64d3fa`.
 Quick paste of the `/login` code works on metal (10 s).
 
+### 2026-11-09 (evening): the trashcan on metal, z.ai, and an input-lag harness
+
+Kernel `e1ff650a` (claude-fixes, `no-tests`), **built on the trashcan itself** (`kbuild -j4 --online
+--features no-tests` in a clean worktree, 9 min; the guest's offline crate cache was older than the lockfile),
+installed with `kinstall`. Claude 2.1.301 (`linux-x64-musl`, sha256 from the release manifest) on the box's
+persistent root, run through a `claude-glm` wrapper that points it at z.ai's Anthropic endpoint
+(`glm-5.3-flash`, key read from the box's existing `/root/kot/zai.token`), so there is no `/login` screen.
+The trashcan answers at **192.168.1.120** now (the `akuma` ssh alias), not `.123`.
+
+`scripts/benchmarks/claude_input_lag.py` drives it over an ssh PTY into a pyte screen and times
+keystroke -> echo (`lag:N`), with `paste:`, `resize` and `dump` steps; `--lima NAME` runs the same probe in
+a Lima VM. All numbers below are from the Mac over wifi.
+
+| run | result |
+|---|---|
+| 1. 15 keys right after the prompt appears | first key **1873 ms**, then 470, 308, then 113-214 (median 167) |
+| 1. then 45 s idle at the **main prompt**, 5 more keys | **none shown in 30 s each** (an older claude was still alive) |
+| 2. clean box (all claudes killed first), 5 keys; 50 s idle; 5 keys | 1260, 648, 100-138 (median 138); then 140-286 (median 265), **nothing lost** |
+| 3. an orphaned claude alive in its first minute | trust screen after **69.6 s** (19 s clean); keys median 336 (p90 1576); after idle median 215; nothing lost |
+| control: raw-mode `cat` through the same PTY, idle 10/40/60/90 s | median 49-91 ms, min 12-14, nothing lost at any idle |
+| Linux A/B: same claude 2.1.301 (`linux-arm64`), same z.ai setup, Lima VM | median **12.6 ms**, first key 25 ms, nothing lost after 45 s idle |
+
+**The Linux number is not a fair baseline.** The VM has no network in the path. The Mac's own LAN path is
+noisy: a bare TCP connect to the trashcan's sshd port has median 48 ms (p90 128, max 193), and to the *router*
+median 43-75 ms (max 487). So about 50 ms of any figure above is wifi. Compare only runs over the same path:
+claude runs 2-3 sit at 2-5x the `cat` control, and the 1.3-1.9 s first key plus the 69 s start are well outside
+that noise. A fair Linux comparison needs the probe on the same path (or the timing taken inside the box).
+
+What this adds to the ledger:
+
+- **Not the input path.** `cat` through the identical sshd/PTY path never stalls and never loses a key.
+- **Not output volume/drain.** The stall is after idle, when claude prints nothing, and the harness drains the PTY every 20 ms.
+- **Kernel sleep granularity is fine**: a 1 ms sleep takes ~1.1 ms (so sshd's `sleep_ms(1)` poll is not a 60 ms tick).
+- The total loss (run 1) was seen **once** and did not reproduce in runs 2-3 (one clean, one with an orphan), so it is
+  intermittent. State when seen: main process `R`, utime unchanged over 5 s, `/proc/<pid>/syscalls` showing only repeated
+  `113`s. The earlier stuck-input diagnostics (`[stdin-starved]`, commits ae3a91c5/34e1f405) are not on this branch.
+- Idle orphaned claudes use no CPU (counters flat over 10 s); an orphan's *own* start-up burst slows a second
+  claude's start. `kill -9` of the leader can leave a zombie (`Z`, parent pid 7 never reaps it).
+
+**Next:** take the timing inside the box so the wifi drops out: timestamps for sshd receiving the byte, claude's
+`read(0)`, its `write(1)`, and sshd sending (the per-process syscall ring already has timestamps), and repeat the idle
+probe 5+ times per arm until the total loss reproduces or does not.
+
 ## Background
 
 - [`AMD64_TLB_STUCK_MMAP_REGIONS.md`](AMD64_TLB_STUCK_MMAP_REGIONS.md) — the wedge found the same afternoon, on the way here
