@@ -200,6 +200,32 @@ thread's `Process.channel` (or left it `None`).
 - Or log in on another machine and copy `~/.claude/.credentials.json` (Linux
   stores it as a file; macOS uses the Keychain).
 
+### 2026-11-09: reproduced in the Firecracker-on-p3 rig; what was ruled out
+
+The stall reproduces in `fc-p3.sh` (so no metal needed) with the handoff's `ssh_pty_steps.py`
+script, `HOME=/root`, kernel `d60ce6e4`. The rig now lives in `/mnt/akuma-selfhost` (the old
+`/home/netoneko/akuma-selfhost` is gone; run a copy of `fc-p3.sh` with `W=` changed).
+
+| variation (45 s idle, then paste) | result |
+|---|---|
+| control, `xterm-ghostty`, default PATH | stuck, every run |
+| `TERM=dumb` | 1 of 2 passed: flaky, not a fix |
+| plain `TERM=xterm` | stuck |
+| `xdg-open` replaced by `#!/bin/sh; exit 0` | stuck (so `gio` is not needed) |
+| `/usr/bin/xdg-open` renamed away | stuck 2 of 2 |
+| `BROWSER=/bin/true` | stuck |
+| `PATH` without `/usr/bin` (single runs) | passed: **do not trust**, one sample each, and the same shape as the flaky `TERM=dumb` |
+| `nopidfd` boot flag (`pidfd_open` -> ENOSYS, branch `nopidfd-exp`, `00227e1d`) | stuck: **pidfd is not the cause** |
+
+With `strace_nr=61,247,60,231,58,59` every `vfork` child was reaped by a `wait4` that returned
+its pid; no exit was lost. Four early children `execve` then `exit_group(128)`.
+
+Do not count the single-run passes as fixes. Anything claimed from this rig needs 3+ runs per arm.
+
+Build note: `claude-fixes` HEAD does not link for amd64 (`duplicate symbol: shootdown_entry`,
+defined in both `amd64/src/shootdown.rs` and `akuma-boot-amd64`, from `c2f58d79`); the
+experiment was built on `d60ce6e4`.
+
 ## Background
 
 - [`AMD64_TLB_STUCK_MMAP_REGIONS.md`](AMD64_TLB_STUCK_MMAP_REGIONS.md) — the wedge found the same afternoon, on the way here
