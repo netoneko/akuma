@@ -118,9 +118,8 @@ const STUCK_REPORT_SPINS: u32 = 1 << 27;
 /// raised. The IDT is one shared table that every AP loads, so the APs pick
 /// the handler up from there.
 pub fn install() {
-    #[allow(function_casts_as_integer)]
-    let entry = shootdown_entry as usize;
-    idt::set_handler(VECTOR, entry);
+    akuma_boot_amd64::shootdown::set_handler(handler);
+    idt::set_handler(VECTOR, akuma_boot_amd64::shootdown::entry_addr());
 }
 
 /// What the handler and the BKL assist both do: invalidate everything this
@@ -145,8 +144,10 @@ pub fn service_pending() {
 
 /// The vector's body. No lock, no allocation, no scheduler touch — see the
 /// module header for why that is load-bearing.
-#[unsafe(no_mangle)]
-extern "C" fn shootdown_dispatch(_frame: *const idt::InterruptStackFrame) {
+///
+/// The entry stub itself (`swapgs`, the register saves, `iretq`) is
+/// `akuma_boot_amd64::shootdown`'s; it calls this through `set_handler`.
+fn handler() {
     idt::note_trap_entry_flags();
     service_pending();
     crate::lapic::eoi();
@@ -365,53 +366,3 @@ pub fn smoke_test(t: &mut Suite) {
     t.check("shootdown: every core acknowledged the IPI", all);
 }
 
-// The entry stub. Hand-assembled on the timer's pattern: `swapgs` on a ring-3
-// origin (the handler reads the per-CPU block), the ten pushes keep `rsp`
-// 16-aligned at the `call` and give a debugger a frame, and `iretq` resumes
-// exactly what was interrupted — the handler edits nothing in the frame.
-core::arch::global_asm!(
-    r#"
-    .section .text
-.global shootdown_entry
-shootdown_entry:
-    test qword ptr [rsp + 8], 3
-    jz 1f
-    swapgs
-1:
-    push rbp
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    sub rsp, 8
-    cld                              /* see idt.rs fixable_exception_entry!: DF survives delivery */
-    lea rdi, [rsp + 88]              /* &InterruptStackFrame */
-    call shootdown_dispatch
-    add rsp, 8
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    pop rbp
-    test qword ptr [rsp + 8], 3
-    jz 2f
-    swapgs
-2:
-    iretq
-"#
-);
-
-unsafe extern "C" {
-    /// The vector-33 entry point, installed by [`install`].
-    fn shootdown_entry();
-}
