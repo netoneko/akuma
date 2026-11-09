@@ -449,6 +449,9 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
             if machine::flag(hvm_start_info, "strace_err") {
                 usermode::SYSCALL_TRACE_ERRORS.store(true, core::sync::atomic::Ordering::Relaxed);
             }
+            if machine::flag(hvm_start_info, "nopidfd") {
+                usermode::NO_PIDFD.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
             let mut pid = [0u8; 16];
             if let Some(n) = machine::strace_pid(hvm_start_info, &mut pid).and_then(|v| v.parse::<u64>().ok()) {
                 usermode::SYSCALL_TRACE_PID.store(n, core::sync::atomic::Ordering::Relaxed);

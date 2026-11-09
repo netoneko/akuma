@@ -39,7 +39,13 @@ use akuma_mmu::{LeafAction, PteProt, UserAddressSpace};
 
 use crate::loader;
 use crate::serial;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+/// `nopidfd` on the kernel command line: `pidfd_open` answers `ENOSYS`, the way a
+/// kernel older than 5.3 would, so a program that probes for it takes its
+/// fallback path. A diagnostic for the `/login` input stall
+/// (`docs/archive/AMD64_CLAUDE_LOGIN_INPUT_STUCK.md`), never a default.
+pub static NO_PIDFD: AtomicBool = AtomicBool::new(false);
 use spinning_top::Spinlock;
 
 /// `EFER.SCE` — without it, `syscall` raises `#UD`.
@@ -1616,6 +1622,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
     // vocabulary hop exists to prevent.
     match nr {
         // `pidfd_open(pid, flags)` — 434 on both x86_64 and asm-generic.
+        434 if NO_PIDFD.load(Ordering::Relaxed) => return (-38i64) as u64,
         434 => return to_glue_raw(akuma_syscalls_linux::nr::PIDFD_OPEN, [a1, a2, 0, 0, 0, 0]),
         // `pidfd_send_signal(pidfd, sig, info, flags)` — 424 on both. `info`
         // is not decoded here or in glue — see `sys_pidfd_send_signal`'s own
