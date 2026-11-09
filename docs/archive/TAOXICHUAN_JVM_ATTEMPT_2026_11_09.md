@@ -1,7 +1,8 @@
 # Can Taoxichuan run a JVM? (aarch64, QEMU HVF, Corretto 21) — 2026-11-09
 
 **Answer:** not the stock kernel, and not yet with the policy lifted. Three blockers in a row; the third is
-undiagnosed. Nothing from this attempt is committed to the kernel.
+undiagnosed — ranked suspects from an evening tree walk at the bottom (*Suspects for blocker 3*). Nothing from
+this attempt is committed to the kernel.
 
 ## Rig
 
@@ -41,6 +42,40 @@ A/B of the same Corretto build with `strace` to compare the syscall sequence.
 
 Eclipse J9 / Semeru was **not** tried: its Alpine/musl builds are x86_64 only as far as checked, and it needs the same
 W^X relaxation.
+
+## Suspects for blocker 3 (tree walk, same evening)
+
+Ranked guesses after grepping the tree; nothing here is verified by experiment yet.
+
+1. **mmap error convention** (top suspect). HotSpot reserves the 48M code cache `PROT_NONE`; on failure Linux
+   returns `MAP_FAILED` (-1), never `NULL`. If any failure path in `akuma-syscalls-mem/src/mmap.rs` (or the
+   syscall arm wrapping it) yields a zero base, musl hands HotSpot a NULL cache base and the first
+   stub-generation store goes to `far=0x0` — exactly the observed shape (store to 0 right after the
+   `CodeCache:` log line). Grep every mmap return path for a `0` result.
+2. **mprotect over `PROT_NONE` reservations, especially to `PROT_EXEC`.** The JIT model is
+   reserve-PROT_NONE then commit in place; if committing a sub-range of a lazy/PROT_NONE region errors
+   (`akuma-tokio-kernel-core/src/mm.rs`), the cache is unusable and the failure may surface as the NULL store
+   rather than a clean VM exit.
+3. **Faults never reach the JVM's SIGSEGV handler.** The `[Fault] EL0 ec=0x24 …` line is the kernel's own
+   handler; there is no `hs_err` file, so HotSpot's handler — installed precisely to catch probing faults and
+   implicit null checks — never ran. If the EL0 data-abort path kills the task without consulting the user
+   `rt_sigaction` (SA_SIGINFO ucontext/restorer, `sigaltstack`/SA_ONSTACK), every small HotSpot mismatch becomes
+   a raw kill instead of a readable report, and masks the real blocker 3.
+4. **Empty `/proc/<pid>/maps`.** `akuma-procfs/src/tree.rs` gates maps/statm rendering on the pid being
+   registered with the procfs pseudo-tree, and it rendered empty for the JVM. HotSpot reads `/proc/self/maps`
+   during `os::init` (memory info, compressed-oops base heuristics near `libjvm.so`), so this may participate
+   in the crash, not just cripple diagnosis.
+5. **Page size / auxv mismatch.** This kernel runs 64K pages; Alpine aarch64 musl is built for 4K.
+   `akuma-elf-exec/src/stack.rs` does populate `AT_PAGESZ`/`AT_HWCAP`, but verify the value handed to a
+   4K-built libc (and that `AT_HWCAP` advertises LSE/CRC) with one `getauxval` probe on the box.
+6. **No vDSO.** `akuma-exceptions` mentions it only in a comment. Not a boot blocker (plain syscalls work), but
+   HotSpot hammers `clock_gettime(CLOCK_MONOTONIC)`; without a fast path the GC threads crawl. (Aside observed
+   on the dev box the same evening: OpenJDK 21 amd64 under a container with vsyscall unavailable segfaults at
+   `0xffffffffff600800` in `JNI_CreateJavaVM` — even real kernels bite on this.)
+
+Suggested order of attack: land `getcpu` (correct on its own, see *Policy note*), then a per-process W^X
+exemption switch instead of the blunt `None` used here, then route the EL0 fault path through user signal
+handlers with VMA-aware fatal reports — the last one likely unmasks blocker 3 for free.
 
 ## Policy note
 
