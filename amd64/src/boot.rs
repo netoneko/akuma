@@ -339,6 +339,66 @@ pub fn late_init(secondaries: impl FnOnce()) {
     akuma_cpu::interrupts::on();
 }
 
+/// The value of a `prefix=value` token on the command line, or `None`.
+///
+/// Pure and allocation-free: the one parse of a valued boot flag, over the
+/// `&str` both boot protocols now hand the shared code (PVH copies it out of the
+/// start-info block, multiboot2 gets it directly).
+#[must_use]
+pub fn token_value<'a>(cmdline: &'a str, prefix: &str) -> Option<&'a str> {
+    cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix(prefix))
+}
+
+/// Apply the boot flags that steer the running kernel rather than the boot:
+/// `fbverbose`, `fbtrace`, `strace`, `strace_err`, `strace_pid=`, `strace_nr=`,
+/// `nopidfd`.
+///
+/// One function for both entry points. Until 2026-11-10 the PVH `kmain` parsed
+/// all seven and the multiboot2 `boot_to_init` parsed two, so `strace` on the
+/// GRUB-booted metal silently did nothing — the same "registered from one
+/// `kmain` and not the other" failure `install_shared_sinks` exists for.
+pub fn apply_runtime_flags(cmdline: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let has = |w: &str| cmdline.split_ascii_whitespace().any(|t| t == w);
+    crate::serial::set_fb_verbose(has("fbverbose"));
+    crate::multiboot2::set_fb_trace(has("fbtrace"));
+    if has("strace") {
+        crate::usermode::SYSCALL_TRACE.store(true, Relaxed);
+    }
+    if has("strace_err") {
+        crate::usermode::SYSCALL_TRACE_ERRORS.store(true, Relaxed);
+    }
+    if has("nopidfd") {
+        crate::usermode::NO_PIDFD.store(true, Relaxed);
+    }
+    if let Some(n) = token_value(cmdline, "strace_pid=").and_then(|v| v.parse::<u64>().ok()) {
+        crate::usermode::SYSCALL_TRACE_PID.store(n, Relaxed);
+        crate::usermode::SYSCALL_TRACE.store(true, Relaxed);
+    }
+    if let Some(list) = token_value(cmdline, "strace_nr=") {
+        crate::usermode::trace_nrs_from(list);
+    }
+}
+
+/// How long the boot waits for DHCP before giving up on a wall clock.
+///
+/// Generous, because on the Realtek machine the receiver has to be restarted
+/// once before anything arrives (`akuma-net-nic`'s `rtl8169` stall recovery).
+/// A boot that waits eight seconds and gets a clock is worth more than one that
+/// gives up in two and cannot verify a certificate.
+pub const SETTLE_BUDGET_MS: u64 = 8_000;
+
+/// DHCP, then the wall clock (SNTP), in the only order that works: SNTP needs
+/// an address and a route. Both boot paths run this; the netpoll daemon, which
+/// must come last (see `net::settle_for_dhcp`), is the caller's next line.
+pub fn dhcp_then_clock() {
+    if crate::net::settle_for_dhcp(SETTLE_BUDGET_MS) {
+        crate::clock::sync_via_sntp();
+    } else {
+        crate::serial::puts("  net:  DHCP did not settle; no wall clock yet (SNTP will retry)\n");
+    }
+}
+
 /// What [`self_tests`] concluded.
 #[cfg(not(feature = "no-tests"))]
 pub struct Verdict {

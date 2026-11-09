@@ -1202,10 +1202,8 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
         // netpoll daemon) does SNTP once the interface has an address.
         if crate::rtw89_sta::is_link() {
             serial::puts("  net:  wifi link: DHCP and the wall clock follow the join\n");
-        } else if crate::net::settle_for_dhcp(SETTLE_BUDGET_MS) {
-            crate::clock::sync_via_sntp();
         } else {
-            serial::puts("  net:  DHCP did not settle; no wall clock yet (SNTP will retry)\n");
+            crate::boot::dhcp_then_clock();
         }
         // A no-op when `boot::self_tests` already spawned one — `spawn_netpoll`
         // is idempotent since 2026-09-07, and it had to become so: this call
@@ -1220,15 +1218,8 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
             crate::net::enable_probe();
         }
     }
-    // `fbverbose`: keep diagnostics on the TV even with a console shell, for
-    // debugging a hang on the metal. See `serial::set_fb_quiet`.
-    crate::serial::set_fb_verbose(cmdline.split_ascii_whitespace().any(|t| t == "fbverbose"));
-    // `strace_err`: one `[sc!]` line per failing syscall (pid, decoded path,
-    // errno), to the console ring — the PVH path has always parsed it, this one
-    // did not, so the GRUB-booted metal could not use it.
-    if cmdline.split_ascii_whitespace().any(|t| t == "strace_err") {
-        crate::usermode::SYSCALL_TRACE_ERRORS.store(true, core::sync::atomic::Ordering::Relaxed);
-    }
+    // `fbverbose`, `fbtrace`, `strace*`, `nopidfd`: shared with the PVH path.
+    crate::boot::apply_runtime_flags(cmdline);
 
     // The laptop's I2C-HID touchpad (`touchpad`): found by its DSDT name or
     // `touchpad=`, a no-op elsewhere. After the LAPIC is calibrated because its
@@ -1349,16 +1340,6 @@ fn machine_from(info: &BootInfo<'_>) -> MachineDescription {
     });
     MachineDescription::from_memory_map(&regions[..n], rsdp, madt)
 }
-
-/// How long to drive the stack by hand waiting for a DHCP lease before giving
-/// up and booting without a wall clock.
-///
-/// Generous, because on this machine the receiver has to be restarted once
-/// before anything arrives (`akuma-net-nic`'s `rtl8169` stall recovery) and
-/// that takes a couple of seconds of polling to detect. A boot that waits eight
-/// seconds and gets a clock is worth more than one that gives up in two and
-/// cannot verify a certificate.
-const SETTLE_BUDGET_MS: u64 = 8_000;
 
 /// Cycle a band of colour along the bottom, for ever.
 ///

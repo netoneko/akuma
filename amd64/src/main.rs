@@ -362,12 +362,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         // address from the socket waits' own polling and never an SNTP
         // attempt, found when the CMOS write-back could not be exercised here.
         if have_net {
-            const SETTLE_BUDGET_MS: u64 = 8_000;
-            if net::settle_for_dhcp(SETTLE_BUDGET_MS) {
-                clock::sync_via_sntp();
-            } else {
-                serial::puts("  net:  DHCP did not settle; no wall clock yet (SNTP will retry)\n");
-            }
+            boot::dhcp_then_clock();
             net::spawn_netpoll();
             // A service guest (`kvmserve`) needs the host's network: start it now.
             kvm::spawn_service(cmdline);
@@ -441,26 +436,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
             if have_net {
                 lapic::start_timer();
             }
-            serial::set_fb_verbose(machine::flag(hvm_start_info, "fbverbose"));
-            multiboot2::set_fb_trace(machine::flag(hvm_start_info, "fbtrace"));
-            if machine::flag(hvm_start_info, "strace") {
-                usermode::SYSCALL_TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
-            }
-            if machine::flag(hvm_start_info, "strace_err") {
-                usermode::SYSCALL_TRACE_ERRORS.store(true, core::sync::atomic::Ordering::Relaxed);
-            }
-            if machine::flag(hvm_start_info, "nopidfd") {
-                usermode::NO_PIDFD.store(true, core::sync::atomic::Ordering::Relaxed);
-            }
-            let mut pid = [0u8; 16];
-            if let Some(n) = machine::strace_pid(hvm_start_info, &mut pid).and_then(|v| v.parse::<u64>().ok()) {
-                usermode::SYSCALL_TRACE_PID.store(n, core::sync::atomic::Ordering::Relaxed);
-                usermode::SYSCALL_TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
-            }
-            let mut nrs = [0u8; 128];
-            if let Some(list) = machine::strace_nrs(hvm_start_info, &mut nrs) {
-                usermode::trace_nrs_from(list);
-            }
+            boot::apply_runtime_flags(cmdline);
             usermode::run_init(path, &args);
         }
     }
