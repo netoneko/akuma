@@ -17,9 +17,18 @@ static CHILD_CHANNELS: Spinlock<BTreeMap<Pid, (Arc<ProcessChannel>, Pid)>> =
     Spinlock::new(BTreeMap::new());
 
 /// Register a child process channel (called when spawning via syscall)
+///
+/// `parent_pid` is the pid of the thread that forked, and the registry records its **thread group**
+/// instead when that thread is still known: a child belongs to the process, not to the one thread that
+/// happened to call `fork`/`clone`. Recording the thread's own pid meant that once a pool thread exited,
+/// `is_child_of_group` could no longer resolve its group and `wait4` answered `ECHILD` for a zombie
+/// that nobody could ever reap — while its pidfd stayed readable, so a runtime polling it (Bun)
+/// spun forever and starved its own stdin (`docs/archive/CHILD_OF_EXITED_THREAD_UNREAPABLE.md`).
 pub fn register_child_channel(child_pid: Pid, channel: Arc<ProcessChannel>, parent_pid: Pid) {
+    // Resolved before the registry lock is taken: `find_process` takes the process-table lock.
+    let parent = find_process(|p| if p.pid == parent_pid { Some(p.tgid) } else { None }).unwrap_or(parent_pid);
     with_irqs_disabled(|| {
-        CHILD_CHANNELS.lock().insert(child_pid, (channel, parent_pid));
+        CHILD_CHANNELS.lock().insert(child_pid, (channel, parent));
     })
 }
 

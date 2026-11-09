@@ -1147,12 +1147,14 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
     };
 
     let waiter_tid = akuma_exec::threading::current_thread_id();
+    // Children belong to the thread group (the registry records the group, see `register_child_channel`),
+    // so every lookup below is by group: any thread may wait for what any thread of its process forked.
+    let waiter_tgid = akuma_exec::process::current_process_shared().map_or(current_pid, |pr| pr.tgid);
 
     if pid > 0 {
         let p = pid as u32;
         // Waiting on a process that is not our child (thread-group-wise) must
         // fail with ECHILD, not block — see is_child_of_group.
-        let waiter_tgid = akuma_exec::process::current_process_shared().map_or(current_pid, |pr| pr.tgid);
         if !akuma_exec::process::is_child_of_group(p, waiter_tgid) {
             return ECHILD;
         }
@@ -1224,7 +1226,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
             }
         }
     } else if pid == -1 || pid == 0 {
-        if !akuma_exec::process::has_children(current_pid) {
+        if !akuma_exec::process::has_children(waiter_tgid) {
             if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] wait4: no children for PID {}\n", current_pid);
             }
@@ -1232,7 +1234,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
         }
 
         loop {
-            if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(current_pid) {
+            if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(waiter_tgid) {
                 let code = ch.exit_code();
                 if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                     let st = encode_wait_status(code);
@@ -1263,9 +1265,9 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 return 0;
             }
             // Register as poller on ALL children so any exit wakes us immediately.
-            akuma_exec::process::add_poller_to_all_children(current_pid, waiter_tid);
+            akuma_exec::process::add_poller_to_all_children(waiter_tgid, waiter_tid);
             // Double-check after registering to avoid missed-wakeup race.
-            if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(current_pid) {
+            if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(waiter_tgid) {
                 let code = ch.exit_code();
                 if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                     let st = encode_wait_status(code);

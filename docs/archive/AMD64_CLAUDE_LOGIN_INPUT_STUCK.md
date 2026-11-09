@@ -1,6 +1,6 @@
 # amd64: Claude Code `/login` stops taking input — paste, Esc and Enter (2026-10-17)
 
-**Status: OPEN — reliably reproduced, root cause not found.** Read **§ Handoff**
+**Status: ROOT CAUSE FOUND 2026-11-09 — [`CHILD_OF_EXITED_THREAD_UNREAPABLE.md`](CHILD_OF_EXITED_THREAD_UNREAPABLE.md)** (a child forked by a pool thread that later exits could never be reaped: `wait4` said `ECHILD`, the pidfd stayed readable, Bun's loop spun). Fix verified on the trashcan, 3 of 3 runs. The text below is the investigation record. Read **§ Handoff**
 at the end first: two of the mechanisms proposed below were later ruled out, and
 the section headed "Mechanism (confirmed)" is only partly right.
 
@@ -278,11 +278,11 @@ What this adds to the ledger:
 - **Kernel sleep granularity is fine**: a 1 ms sleep takes ~1.1 ms (so sshd's `sleep_ms(1)` poll is not a 60 ms tick).
 - The total loss (run 1) was seen **once** and did not reproduce in runs 2-3 (one clean, one with an orphan), so it is
   intermittent. State when seen: main process `R`, utime unchanged over 5 s, `/proc/<pid>/syscalls` showing only repeated
-  `113`s. The earlier stuck-input diagnostics (`[stdin-starved]`, commits ae3a91c5/34e1f405) are not on this branch.
+  `113`s. The `[stdin-starved]` diagnostic (ae3a91c5/34e1f405) *is* on this branch (my earlier "not on this branch" was wrong); it never fired because the stall was not an unscanned stdin epoll at all.
 - Idle orphaned claudes use no CPU (counters flat over 10 s); an orphan's *own* start-up burst slows a second
   claude's start. `kill -9` of the leader can leave a zombie (`Z`, parent pid 7 never reaps it).
 
-**Next:** take the timing inside the box so the wifi drops out: timestamps for sshd receiving the byte, claude's
+**Superseded the same evening:** the in-box probe reproduced the loss with no ssh in the path and found the cause (see the link at the top). The plan that was written here: timestamps for sshd receiving the byte, claude's
 `read(0)`, its `write(1)`, and sshd sending (the per-process syscall ring already has timestamps), and repeat the idle
 probe 5+ times per arm until the total loss reproduces or does not.
 
