@@ -201,8 +201,8 @@ impl Rgb {
 /// of every stem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Smooth {
-    Gray,
     #[default]
+    Gray,
     Rgb,
     Bgr,
 }

@@ -207,6 +207,17 @@ present 2 MiB entry, or more than two ragged ends. The console works at the old 
 the splash backs off to 150 ms by itself. Rollback of the whole change:
 `cp -f /boot/akuma-amd64.prev /boot/akuma-amd64` (the pre-WC kernel).
 
+## macOS-style text (2026-11-09)
+
+Text edges default to **gray** anti-aliasing (`smooth = gray`), not subpixel, and every Plex cut
+(10x20 to 24x48) is baked with coverage exponent 0.6 (`HD_COVERAGE_GAMMA` in
+`crates/akuma-fbcon/build.rs`), which thickens stems the way macOS's stem darkening does. Subpixel
+is one line away: `smooth = rgb` (or `bgr`) in `/etc/console.conf`, or `CSI ? 9002 h`.
+Look at it without a VM: `AKUMA_FBCON_CONF="smooth = gray" AKUMA_FBCON_DUMP=<dir> cargo test
+-p akuma-fbcon --test dump -- --ignored`, then `sips -s format png <dir>/text.ppm --out text.png`.
+**Not verified on glass.** Open: Greek, Cyrillic gaps, CJK and symbols are 1-bit Unifont bitmaps,
+so they still look jagged beside the smooth Plex text.
+
 ## Font crispness: the HD cut (2026-10-01, verified on the trashcan)
 
 On a 4K screen the default font (IBM Plex Mono, 12x24) used to be drawn at **scale 2**: a

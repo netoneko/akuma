@@ -36,6 +36,10 @@ fn console(w: usize, h: usize) -> Console<Mem> {
     con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
     con.clear();
     con.set_margin(0, 0);
+    // AKUMA_FBCON_CONF="smooth = gray" etc.: render a config variant.
+    if let Ok(conf) = std::env::var("AKUMA_FBCON_CONF") {
+        con.apply_config(&akuma_fbcon::config::ConsoleConfig::parse(&conf));
+    }
     con
 }
 
