@@ -18,6 +18,8 @@ advertising clause; Apache-2.0 patent terms are not triggered because MIT is cho
 | [`arrayvec`](https://github.com/bluss/arrayvec) | 0.7.8 | MIT OR Apache-2.0 | Fixed-capacity vector `vte` uses for its OSC buffer (no allocation). |
 | [`memchr`](https://github.com/BurntSushi/memchr) | 2.8.3 | Unlicense OR MIT | Byte search `vte` uses to skip plain text. |
 | [GNU Unifont](https://unifoundry.com/unifont/) 18.0.01 | OFL-1.1 (dual-licensed with GPLv2+ and the Font Embedding Exception; **used under the OFL**) | The 16x16 CJK/kana/Hangul glyphs and the 8x16 Greek/Cyrillic/Vietnamese fallback (`vendor/unifont/`). Repacked 1-bit; nothing else changed. |
+| [DejaVu Sans Mono](https://dejavu-fonts.github.io/) 2.37 | Bitstream Vera / DejaVu licence (permissive; `vendor/hires/LICENSE-DEJAVU.txt`) | Symbols, Greek and Latin Extended glyphs, rasterized to `vendor/hires/sym-24x48.*`. Derived tables only. |
+| [Noto Sans CJK SC](https://github.com/notofonts/noto-cjk) | OFL-1.1 (`vendor/hires/LICENSE-NOTO-OFL-1.1.txt`) | The ~12.5k common CJK/kana/Hangul glyphs, rasterized to `vendor/hires/cjk-*.bin`. Derived tables only. |
 | [Noto Emoji](https://github.com/googlefonts/noto-emoji) images | commit e20cbc2 | Apache-2.0 (image resources); OFL-1.1 (the repository's root `LICENSE`, for the fonts) | The ~650 colour emoji the console draws (`vendor/noto-emoji/`). **Modified**: downscaled to 24x24 and quantised to RGBA4444. |
 
 ## vte 0.15.0 — LICENSE-MIT

@@ -62,6 +62,7 @@ pub mod console;
 pub mod emoji;
 pub mod font;
 pub mod glyph;
+pub mod hires;
 pub mod format;
 pub mod splash;
 pub mod unifont;

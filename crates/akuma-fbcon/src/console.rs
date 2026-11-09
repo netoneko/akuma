@@ -11,6 +11,7 @@ use core::fmt;
 use crate::font::{self, Font};
 use crate::emoji;
 use crate::glyph;
+use crate::hires;
 use crate::unifont;
 use crate::{Rgb, Smooth, Surface};
 
@@ -1643,6 +1644,22 @@ impl<S: Surface> Console<S> {
             return;
         }
 
+        // A CJK character in the common set: Noto Sans CJK, anti-aliased, baked at
+        // 22 and 40 pixels and area-resampled to the two-cell box (1:1 on the 11x22 and
+        // 20x40 defaults). Anything outside the set falls through to Unifont below.
+        if wide {
+            let side = span.min(ch);
+            if let Some(g) = hires::cjk(cp, side) {
+                self.surface.fill(x0, y0, span, ch, bg);
+                let (ox, oy) = (x0 + (span - side) / 2, y0 + (ch - side) / 2);
+                let surface = &mut self.surface;
+                hires::resample((g.side(), g.side()), (side, side), |x, y| g.at(x, y), &mut |x, y, c| {
+                    surface.put(ox + x, oy + y, if c == 255 { fg } else { bg.blend(fg, c) });
+                });
+                return;
+            }
+        }
+
         // A CJK character: Unifont's 16x16 bitmap, at the largest whole multiple
         // that fits the two-cell box (3x on the usual 48x48), centred.
         if wide && let Some(g) = unifont::glyph(cp) {
@@ -1719,6 +1736,20 @@ impl<S: Surface> Console<S> {
                     && let Some(to) = glyph::fold(cp)
                 {
                     cp = to;
+                }
+                // Smooth symbols, Greek and Latin Extended (DejaVu Sans Mono, 24x48
+                // coverage fitted to the cell). Greek wins over Plex's one or two
+                // stray letters so a word is not drawn in two faces.
+                if cp >= 0x180
+                    && (!self.font.draws(cp) || (0x370..=0x3FF).contains(&cp))
+                    && let Some(g) = hires::sym(cp)
+                {
+                    self.surface.fill(x0, y0, cw, ch, bg);
+                    let surface = &mut self.surface;
+                    hires::resample((hires::SYM_W, hires::SYM_H), (cw, ch), |x, y| g[y * hires::SYM_W + x], &mut |x, y, c| {
+                        surface.put(x0 + x, y0 + y, if c == 255 { fg } else { bg.blend(fg, c) });
+                    });
+                    return;
                 }
                 if cp >= 0x180
                     && !self.font.draws(cp)

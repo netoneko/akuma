@@ -215,8 +215,15 @@ Text edges default to **gray** anti-aliasing (`smooth = gray`), not subpixel, an
 is one line away: `smooth = rgb` (or `bgr`) in `/etc/console.conf`, or `CSI ? 9002 h`.
 Look at it without a VM: `AKUMA_FBCON_CONF="smooth = gray" AKUMA_FBCON_DUMP=<dir> cargo test
 -p akuma-fbcon --test dump -- --ignored`, then `sips -s format png <dir>/text.ppm --out text.png`.
-**Not verified on glass.** Open: Greek, Cyrillic gaps, CJK and symbols are 1-bit Unifont bitmaps,
-so they still look jagged beside the smooth Plex text.
+**Not verified on glass.**
+
+CJK, Greek, Latin Extended-B/IPA and the symbol blocks are anti-aliased too (`src/hires.rs`):
+Noto Sans CJK SC for the ~12.5k common CJK glyphs (GB2312 + JIS X 0208 + KS X 1001 Hangul, kana,
+fullwidth) baked at 22 and 40 px and 4-bit, DejaVu Sans Mono for symbols and Greek at 24x48, 8-bit;
+both area-resampled to the cell (1:1 on the 11x22 and 20x40 defaults). Unifont stays the fallback
+for everything outside the set. **Image cost: +14.9 MB** (`vendor/hires/`: CJK 13.0, symbols 1.9),
+all of it `static` data in the kernel image whether or not it is drawn. Rebake:
+header of `crates/akuma-fbcon/tests/bake_hires.rs`.
 
 ## Font crispness: the HD cut (2026-10-01, verified on the trashcan)
 

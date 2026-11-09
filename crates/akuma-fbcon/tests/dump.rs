@@ -66,7 +66,8 @@ fn dump_frames() {
     }
 
     // Text: scripts, symbols, emoji, boxes.
-    let mut con = console(1920, 1080);
+    for (name, w, h) in [("text", 1920, 1080), ("text-4k", 3840, 2160)] {
+    let mut con = console(w, h);
     con.write_str_bytes(
         "\x1b[1;36mUnicode on the TV\x1b[0m\r\n\r\n\
          Latin     : café naïve Łódź Žluťoučký Việt\r\n\
@@ -82,5 +83,6 @@ fn dump_frames() {
                      └──┴──┘ ╚══╩══╝\r\n\
          \x1b[7m reverse \x1b[0m \x1b[1mbold\x1b[0m \x1b[4munder\x1b[0m \x1b[31mred\x1b[32mgreen\x1b[34mblue\x1b[0m\r\n",
     );
-    ppm(&dir, "text", &con.into_surface());
+    ppm(&dir, name, &con.into_surface());
+    }
 }
