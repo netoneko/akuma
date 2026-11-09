@@ -37,8 +37,11 @@ Reproduced without claude (python on the trashcan, `scripts` scratch `reap2.py`)
 
 Linux keeps the child with the thread group, so the third case is reaped there.
 
-Also found, not fixed here: `waitid(2)` is `ENOSYS` on amd64 (`os.waitid` and `waitid(P_PIDFD, ...)` both), though
-`akuma-syscalls-glue` has an implementation; amd64's dispatch does not route x86_64 247 to it.
+Also found: `waitid(2)` was `ENOSYS` on amd64 (`os.waitid` and `waitid(P_PIDFD, ...)` both), though
+`akuma-syscalls-glue` has an implementation. Wired the same evening: `Syscall::Waitid` in `amd64/src/usermode.rs` goes to glue like
+`wait4` and sweeps the reaped `SPAWN` rows. Checked on the trashcan (python/ctypes): `P_PID` with `WNOWAIT` leaves the child,
+the next call reaps it (`CLD_EXITED`, status 7), then `ECHILD`; `WNOHANG` on a live child returns 0 with `si_pid` 0;
+`P_PIDFD` blocks until exit; `P_ALL` finds an exited child; `P_PIDFD` on the caller's own pidfd gives `ECHILD` (Go's probe).
 
 ## Fix
 
@@ -67,7 +70,7 @@ Not fixed by this and still visible: the **first minute** after start is slow (f
 1.9 s in two runs) while claude's startup `rg --files /root` scan and the pool threads run on a very large `/root`.
 That is a separate cost, not a stall.
 
-Still open: `waitid` is `ENOSYS` on amd64; the unit test `reaping_a_buffered_child_keeps_its_output_but_not_the_child`
+Still open: the unit test `reaping_a_buffered_child_keeps_its_output_but_not_the_child`
 fails when run alone under a `children` filter (needs `akuma_exec::init`, fails on the pristine tree too); no host
 test yet covers "forker thread gone" because it needs a process table.
 

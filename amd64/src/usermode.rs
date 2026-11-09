@@ -2532,10 +2532,17 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // restore-sigmask slot, and `signal::deliver_pending` hands the saved
         // mask to the frame (or puts it back when no handler runs).
         Syscall::RtSigsuspend | Syscall::RtSigpending => to_glue(call, [a1, a2, 0, 0, 0, 0]),
-        // Rows since 2026-11-01 (Taoxichuan serves them); this kernel has no
-        // route to glue's yet and answers `ENOSYS`, as it did undecoded.
+        // `waitid(idtype, id, infop, options, rusage)` — x86_64 247, glue's (`sys_waitid`: `P_PID`/`P_ALL`/
+        // `P_PIDFD`, `WNOHANG`/`WNOWAIT`, the same group-wise child lookup and `ECHILD` rules as `wait4`).
+        // Answered `ENOSYS` until 2026-11-09, which Bun and Go's pidfd probe both ask. Like `wait4` it reaps
+        // (unless `WNOWAIT`), so the `SPAWN` row sweep follows.
+        Syscall::Waitid => {
+            let r = to_glue(Syscall::Waitid, [a1, a2, a3, a4, a5, 0]);
+            sweep_reaped_spawn_rows();
+            r
+        }
         // `Msync` never gets here: 26 is routed above, before the decode.
-        Syscall::Msync | Syscall::Waitid => errno::ENOSYS,
+        Syscall::Msync => errno::ENOSYS,
         _ => {
             akuma_primitives::safe_print!(
                 160,
