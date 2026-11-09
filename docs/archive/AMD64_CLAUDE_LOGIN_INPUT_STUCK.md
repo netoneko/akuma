@@ -226,6 +226,23 @@ Build note: `claude-fixes` HEAD does not link for amd64 (`duplicate symbol: shoo
 defined in both `amd64/src/shootdown.rs` and `akuma-boot-amd64`, from `c2f58d79`); the
 experiment was built on `d60ce6e4`.
 
+### 2026-11-09 (later): the metal hang, and what the klog showed
+
+First metal retry of the day froze the whole box (no ping) with claude running on the **console**.
+`/var/log/ryzen/klog-272.dmesg` (klogd keeps the last ~5 s on p3) shows the box healthy to the
+end: `ps` listed claude pid 50 (26 s CPU, `git`/`dpkg -S` helpers alive, 18 Bun threads), the console
+echoed `kill -9 ` as it was typed, and the log stops there. Heavy `[bkls>]` BKL-spin warnings
+(85 lines, rotating owners, tickets advancing: contention, not one stuck owner).
+
+Not reproduced: Firecracker 8 vCPU, `kill -9` of the whole claude process set (3 of 3 alive), of the
+leader pid only (3 of 3 alive); metal over ssh, leader `kill -9` (alive). So the hang needs something the
+rig lacks: the framebuffer console, the USB keyboard, wifi, or the metal's real 8 cores.
+(An earlier "hang reproduced in the rig" note of mine was a probe bug, `tail -1` of a blank line.)
+
+`claude-fixes` linked again at `1e2fbdf0` (shootdown stub now the crate's). Metal kernel `e64d3fa`
+installed as p3 `/boot/akuma-amd64.verify` (entry 26); the previous `.verify` is `.verify.pre-e64d3fa`.
+Quick paste of the `/login` code works on metal (10 s).
+
 ## Background
 
 - [`AMD64_TLB_STUCK_MMAP_REGIONS.md`](AMD64_TLB_STUCK_MMAP_REGIONS.md) — the wedge found the same afternoon, on the way here
