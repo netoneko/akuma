@@ -61,7 +61,7 @@ encode_rustflags() {
 #   <name used by this script>|<dir>|<cargo package>|<binary>|<path that must exist>
 #
 # An empty <binary> means the member's build script installs into bootstrap/bin
-# itself (llama-cpp installs llama-cli/-server/-bench, nca installs nca), so
+# itself (llama-cpp installs llama-cli/-server/-bench), so
 # there is nothing here to copy. The last field is a file from the member's
 # submodule: absent means the submodule is not checked out, and the member is
 # skipped rather than failing the whole build.
@@ -69,7 +69,6 @@ EXTERNAL_MEMBERS=(
     "meow|meow|meow|meow|meow/Cargo.toml"
     "tcc|tcc|tcc|tcc|tcc/tinycc/libtcc.c"
     "llama-cpp|llama.cpp|llama-cpp||llama.cpp/llama.cpp/CMakeLists.txt"
-    "nca|nca|native-cli-ai||nca/native-cli-ai/Cargo.toml"
 )
 
 # Print the EXTERNAL_MEMBERS row for $1; fail if $1 is an ordinary workspace member.
@@ -226,7 +225,6 @@ MEMBERS=(
     "llama-cpp"
     "wavplay"
     "scratch"
-    "nca"
     )
 
 
@@ -251,8 +249,8 @@ done
 # Create bin directory if it doesn't exist
 mkdir -p ../bootstrap/bin
 
-# Copy binaries (only if they exist). llama-cli/-server/-bench and nca are NOT
-# listed: their build scripts install them into bootstrap/bin directly, and they
+# Copy binaries (only if they exist). llama-cli/-server/-bench are NOT
+# listed: their build script installs them into bootstrap/bin directly, and they
 # never appear under any target/ dir this script looks in.
 BINARIES=(
     "hello"

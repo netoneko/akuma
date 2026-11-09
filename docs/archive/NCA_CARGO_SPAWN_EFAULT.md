@@ -1,5 +1,7 @@
 # cargo→rustc spawn: `Bad address (os error 14)` under real concurrency
 
+> **nca retired 2026-11-09.** `userspace/nca` and its `native-cli-ai` submodule were removed from the tree today in favor of goose. This document is kept as history: paths under `userspace/nca/` no longer exist (they are in git history before the removal commit), and the kernel findings below stand on their own.
+
 **Date:** 2026-08-17/18
 **Status:** OPEN — root cause not yet found. One sibling bug in the same family
 (`NCA_FD_NONBLOCK_TOCTOU.md`) is fixed; this one survives it.
