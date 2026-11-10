@@ -736,3 +736,72 @@ comes from.
 
 **Open:** the two epoll findings above; the epoll/futex suites under both schedulers; the 2-in-180 ssh
 session failures; signal and deferred-kill delivery on the IRQ-return path (W3c).
+
+### W3b follow-up — what the epoll test measures, the old kernels, and a hooked TLS bug (2026-11-10)
+
+**Was the epoll failure introduced by the refactor?** No. Same `--features epoll-waker-trace` build
+of the pre-refactor kernel (`main`, merge-base `3baa8e88`, trace applied in a scratch worktree, not
+committed), two runs per cell:
+
+| `test_epoll_socket_waker` | SMP=1 | SMP=2 | SMP=4 |
+|---|---|---|---|
+| `main` (pre-refactor) | pass, pass | pass; **fail** (8.2 ms after `wake_all`, same core) | **fail**, **fail** |
+| this branch, SGI | pass, pass | pass, pass | **fail**, **fail** |
+| this branch, hooked | pass, pass | **fail**; pass | **fail**, **fail** |
+
+`orphan reparented to init` also failed once on `main` and once on SGI at SMP=4. That one predates
+the refactor too.
+
+**And the test does not measure a waker on any kernel.** The trace probes the fd before the wait and
+times one non-blocking lap and one smoltcp drain:
+
+- the fd is `EPOLLHUP` **before** the wait (`probe_before=0x10`). A never-connected smoltcp TCP socket
+  is `Closed`, `!is_active()` makes it "dead", and a dead socket reports HUP whatever was asked
+  (Linux also reports POLLHUP for a never-connected TCP socket). Every return, woken or not, was that
+  HUP.
+- one non-blocking `epoll_pwait` lap took **6.7–7.2 ms**, and one `smoltcp_net::poll()` called alone
+  took **8.3 ms**. Once that drain had run, the real wait returned in 4 µs. The first drain after a
+  gap clears a backlog, and the epoll lap does that drain before it probes.
+
+So the test's elapsed time is one backlogged drain plus scheduling noise. Whether it crosses 8 ms
+depends on how much network work piled up earlier in the suite, not on a scheduler. The "cross-core
+wake is slow" reading in the correction above is withdrawn: those were drain times. **Open:** the test
+needs rewriting to measure a wake (an fd that is not ready until the waker acts, the drain run before
+timing). Why one drain costs ~8 ms at that point in the boot suite was not investigated.
+
+**A userspace wake-latency probe for both kernels.** `userspace/epollprobe/c/epoll_wake_latency.c`
+(new): one thread parks in `epoll_wait(-1)` on a pipe, another writes after 2 ms (spinning or
+sleeping), 300 iterations, latency from the write to the wait's return. One source, static musl, both
+ISAs. Akuma does not answer `getcpu`, so only the combined bucket fills. p50 / p99 in µs:
+
+| AArch64, Lima devbox | spin SMP=2 | sleep SMP=2 | spin SMP=4 | sleep SMP=4 |
+|---|---|---|---|---|
+| `main` (pre-refactor) | 55 / 1434 | 137 / 555 | 173 / 814 | 283 / 590 |
+| this branch, SGI | 53 / 1296 | 141 / 610 | 154 / 1080 | 267 / 648 |
+| this branch, hooked (TLS fix below) | 139 / 290 | 331 / 992 | 142 / 529 | 181 / 458 |
+
+| amd64, QEMU TCG | spin SMP=2 | sleep SMP=2 | spin SMP=4 | sleep SMP=4 |
+|---|---|---|---|---|
+| pre-refactor (`c2f58d79^`) | 24 / 83 | 234 / 535 | 53 / 92 | 305 / 659 |
+| this branch | 26 / 75 | 235 / 495 | 52 / 100 | 322 / 825 |
+
+The refactor did not move either kernel's wake path. The amd64 baseline is `c2f58d79^`, not the
+merge-base: from `c2f58d79` (2026-11-06) `main`'s amd64 kernel does not link, because
+`shootdown_entry` is defined both in `amd64/src/shootdown.rs` and in `akuma-boot-amd64`. That is a
+`main` problem this branch does not have; it is not fixed there. Hooked differs from SGI in shape,
+not by a clear margin either way.
+
+**The probe found a hooked-only correctness bug.** Before the fix, the probe SIGSEGVed in all four
+hooked runs (SMP=2 and 4, both modes): the main thread came back from `pthread_join` with the exited
+thread's TLS. The shared syscall epilogue copies the live `TPIDR_EL0` into the frame, and the hooked
+switch did not preserve the register. Fixed in `akuma-kernel-glue::hooked::switch_to` (per-slot
+`SAVED_TLS`); full write-up in `docs/archive/HOOKED_TPIDR_EL0_SWITCH.md`. After the fix: the probe
+completes everywhere; hooked boot suite SMP=1 314/0, SMP=2 322/0, SMP=4 319/1 (the epoll test
+above); devbox ssh session stress **0 failures in 100 at SMP=4 and 0 in 100 at SMP=2**, against 2 in
+186 before. That makes this bug the likely cause of the earlier `exit 255`s, but 200 clean sessions
+do not prove it. Under the same probe, hooked logs 15–21 `[bkls>]` contention lines against 4–5 on
+`main` and SGI, and one `[BKL] stuck` appeared in a 100-session stress run. That is noted here, not
+investigated.
+
+**Open:** rewrite `test_epoll_socket_waker`; the epoll/futex suites under both schedulers; hooked BKL
+contention; W3c.

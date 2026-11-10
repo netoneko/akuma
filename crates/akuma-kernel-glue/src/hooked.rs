@@ -9,10 +9,19 @@
 //!
 //! What a switch installs is small. An EL0 trap saves the whole user register file in a
 //! frame at the top of the thread's own kernel stack and the crossing back restores it from
-//! there, so `SP_EL0`, `TPIDR_EL0` and the vector registers need nothing per switch; the
-//! switch itself saves the callee-saved kernel state. What is left is the page-table root
-//! (`TTBR0_EL1` — the kernel lives in the low half, so every root maps it) and the thread's
-//! name (`TPIDRRO_EL0`, which every per-slot table is indexed with).
+//! there, so `SP_EL0` and the vector registers need nothing per switch; the switch itself
+//! saves the callee-saved kernel state. What is left is the page-table root (`TTBR0_EL1` —
+//! the kernel lives in the low half, so every root maps it), the thread's name
+//! (`TPIDRRO_EL0`, which every per-slot table is indexed with) and `TPIDR_EL0`.
+//!
+//! `TPIDR_EL0` is not covered by the frame, because the syscall epilogue in
+//! `akuma-exceptions` copies the LIVE register into the frame after every syscall (that is
+//! how `set_tpidr_el0` sticks). A thread that blocked inside the syscall finishes it after
+//! other threads have run on the core, and each of those set the register on its way to
+//! EL0; without a per-switch save the epilogue stamped the last one's TLS into this
+//! thread's frame. A two-thread program SIGSEGVed on its first `pthread_join`, with the
+//! exited thread's (already unmapped) TLS as its own. The SGI scheduler's IRQ entry saves
+//! the register around every switch, which is why only this path had it.
 //!
 //! # The page-table root, per slot
 //!
@@ -47,6 +56,10 @@ const L0_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 static SAVED_ROOT: [AtomicU64; MAX_THREADS] = [const { AtomicU64::new(0) }; MAX_THREADS];
 /// The slot generation [`SAVED_ROOT`]'s entry was recorded under.
 static SAVED_GEN: [AtomicU64; MAX_THREADS] = [const { AtomicU64::new(0) }; MAX_THREADS];
+/// Each slot's `TPIDR_EL0` as of its last switch-out (see the module doc). A slot that never
+/// ran, or a recycled one, installs a stale value, which is harmless: its first crossing to
+/// EL0 restores its own frame's value before anything at EL0 reads the register.
+static SAVED_TLS: [AtomicU64; MAX_THREADS] = [const { AtomicU64::new(0) }; MAX_THREADS];
 /// Core-pinned idle threads, which no picker may offer.
 static IDLE: [AtomicBool; MAX_THREADS] = [const { AtomicBool::new(false) }; MAX_THREADS];
 /// Each core's idle thread (`usize::MAX`: none yet).
@@ -104,6 +117,10 @@ fn root_for(slot: usize) -> u64 {
 }
 
 fn switch_to(from: usize, to: usize) {
+    if let (Some(out), Some(inc)) = (SAVED_TLS.get(from), SAVED_TLS.get(to)) {
+        out.store(akuma_cpu::sysreg::tpidr_el0(), Relaxed);
+        akuma_cpu::sysreg::set_tpidr_el0(inc.load(Relaxed));
+    }
     let live = akuma_exec::mmu::get_current_ttbr0() as u64;
     if let Some(rec) = SAVED_ROOT.get(from) {
         // A finished thread never switches in again; recording its root would only make

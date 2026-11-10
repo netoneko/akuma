@@ -13097,14 +13097,21 @@ mod epoll_waker_trace {
     }
 
     /// Print the stamps relative to the waiter's `start`, then clear them for a rerun.
-    pub fn report(start: u64, elapsed: u64) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn report(start: u64, elapsed: u64, nready: u64, revents: u32, pre: u32, post: u32, lap0_n: u64, lap0_us: u64) {
         let rel = |t: u64| if t == 0 { -1 } else { t as i64 - start as i64 };
         crate::safe_print!(
-            192,
-            "[epoll-waker-trace] waker_started={} wake_all={} returned={} (us from park) waker_core={} waiter_core={}\n",
+            256,
+            "[epoll-waker-trace] waker_started={} wake_all={} returned={} (us from park) nready={} revents={:#x} probe_before={:#x} probe_after={:#x} nonblocking_lap={} in {}us waker_core={} waiter_core={}\n",
             rel(STARTED.swap(0, SeqCst)),
             rel(WOKE.swap(0, SeqCst)),
             elapsed,
+            nready,
+            revents,
+            pre,
+            post,
+            lap0_n,
+            lap0_us,
             WAKER_CORE.swap(u64::MAX, SeqCst),
             core()
         );
@@ -13169,8 +13176,31 @@ fn test_epoll_socket_waker() {
 
     // Wait for event with a large timeout (1s)
     let mut out_events = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
+    // What the fd reports before anything has happened to it.
+    #[cfg(feature = "epoll-waker-trace")]
+    let pre = crate::syscall::poll::epoll_check_fd_readiness(fd, 0x001, None);
+    // And what one non-blocking lap of the real wait returns, and how long it takes.
+    #[cfg(feature = "epoll-waker-trace")]
+    let (lap0_n, lap0_us) = {
+        let mut ev0 = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
+        let t = crate::timer::uptime_us();
+        let n = sys_epoll_pwait(epfd as u32, ev0.as_mut_ptr() as usize, 1, 0);
+        (n, crate::timer::uptime_us() - t)
+    };
+    // The lap's first step on its own: one smoltcp drain.
+    #[cfg(feature = "epoll-waker-trace")]
+    let poll_us = {
+        let t = crate::timer::uptime_us();
+        let _ = akuma_net::smoltcp_net::poll();
+        crate::timer::uptime_us() - t
+    };
+    #[cfg(feature = "epoll-waker-trace")]
+    crate::safe_print!(64, "[epoll-waker-trace] one smoltcp poll() took {}us\n", poll_us);
     let start = crate::timer::uptime_us();
     let nready = sys_epoll_pwait(epfd as u32, out_events.as_mut_ptr() as usize, 1, 1000);
+    // And straight after the wait returned.
+    #[cfg(feature = "epoll-waker-trace")]
+    let post = crate::syscall::poll::epoll_check_fd_readiness(fd, 0x001, None);
     let end = crate::timer::uptime_us();
     
     let elapsed = end - start;
@@ -13185,7 +13215,7 @@ fn test_epoll_socket_waker() {
     unregister_thread_pid(tid);
 
     #[cfg(feature = "epoll-waker-trace")]
-    epoll_waker_trace::report(start, elapsed);
+    epoll_waker_trace::report(start, elapsed, nready, out_events[0].events, pre, post, lap0_n, lap0_us);
 
     if nready == 1 && out_events[0].data == 0xDEADBEEF {
         // We expect it to take slightly more than 5ms (because of the delay in the thread),
