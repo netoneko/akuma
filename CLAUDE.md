@@ -8,7 +8,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,fdtable,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,svm-amd64,terminal,timer,trap-aarch64,user-space,vfs,virtio}`
+  `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,fdtable,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,machine-facts,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,svm-amd64,terminal,timer,trap-aarch64,user-space,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
   `akuma-middleware` is the optional syscall **middleware** (B22): one table per kernel of a `pre`
   guard, a `handler` for calls the kernel does not serve, and one exec policy; a kernel wires it behind

@@ -431,3 +431,39 @@ fn the_rtc_is_not_the_console() {
     let qemu = describe_ok(QEMU_SMP1).uart.unwrap();
     assert_eq!(qemu.region.base, 0x0900_0000);
 }
+
+// ---------------------------------------------------------------------------
+// The neutral view
+// ---------------------------------------------------------------------------
+
+/// Every measured Firecracker machine, seen through `akuma-machine-facts`, passes the neutral
+/// invariants and agrees with the FDT-shaped description it came from.
+#[test]
+fn facts_validate_and_agree_on_every_measured_machine() {
+    use akuma_machine_facts::{IrqController, Provenance};
+    for (vcpus, blob) in SWEEP {
+        let m = describe_ok(blob);
+        let f = m.facts();
+        assert_eq!(f.validate(), Ok(()), "{vcpus} vCPU(s)");
+        assert_eq!(f.provenance, Provenance::Fdt);
+        assert_eq!(f.cpus, Some(vcpus));
+        assert_eq!(f.ram().len(), 1);
+        assert_eq!((f.ram()[0].base, f.ram()[0].size), (m.ram.base, m.ram.size));
+        assert_eq!(f.virtio().len(), m.virtio_slots().len());
+        for (a, b) in f.virtio().iter().zip(m.virtio_slots()) {
+            assert_eq!((a.window.base, a.window.size, a.irq), (b.region.base, b.region.size, b.intid));
+        }
+        assert!(matches!(f.irq, IrqController::Gicv3 { redistributors: Some(_), .. }));
+    }
+}
+
+/// The redistributor span the neutral view carries is the one that moves with the vCPU count.
+#[test]
+fn facts_carry_the_redistributor_that_moves_with_the_vcpu_count() {
+    use akuma_machine_facts::IrqController;
+    let base = |blob| match describe_ok(blob).facts().irq {
+        IrqController::Gicv3 { redistributors: Some(r), .. } => r.base,
+        other => panic!("expected GICv3 with redistributors, got {other:?}"),
+    };
+    assert!(base(VCPU1) != base(VCPU8));
+}

@@ -217,6 +217,33 @@ impl MachineDescription {
 }
 
 /// Why a device tree could not be turned into a machine description.
+impl MachineDescription {
+    /// The neutral view of this machine ([`akuma_machine_facts::Facts`], provenance `Fdt`).
+    ///
+    /// Everything a kernel decision needs and nothing FDT-shaped: RAM, the virtio transports in
+    /// address order, the CPU count and the GIC. The UART and the FDT's own size stay here — they
+    /// are this protocol's facts, not the machine's.
+    #[must_use]
+    pub fn facts(&self) -> akuma_machine_facts::Facts {
+        use akuma_machine_facts::{Facts, IrqController, Provenance, Range, VirtioMmio};
+        let r = |x: Region| Range::new(x.base, x.size);
+        let mut f = Facts::new(Provenance::Fdt);
+        let _ = f.push_ram(r(self.ram));
+        for d in self.virtio_slots() {
+            let _ = f.push_virtio(VirtioMmio { window: r(d.region), irq: d.intid });
+        }
+        f.cpus = Some(self.cpu_count);
+        f.irq = match self.gic.version {
+            GicVersion::V2 => IrqController::Gicv2 { distributor: r(self.gic.distributor) },
+            GicVersion::V3 => IrqController::Gicv3 {
+                distributor: r(self.gic.distributor),
+                redistributors: self.gic.redistributors.map(r),
+            },
+        };
+        f
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// Not a device tree, or a truncated one.

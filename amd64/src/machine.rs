@@ -219,3 +219,48 @@ pub fn report(d: &MachineDescription) {
         serial::puts("\n");
     }
 }
+
+/// Print the neutral view of the machine ([`akuma_machine_facts::Facts`]) and whether it passes
+/// the neutral invariants. One line, the same on both boot paths: `provenance` says which protocol
+/// the facts came from (`Pvh` or `Multiboot2`).
+///
+/// Report-only, deliberately: a machine whose facts fail validation still boots exactly as it did
+/// before this line existed (the seam's first gate is "both kernels boot unchanged"); the verdict
+/// is for the log and for the harness that greps it.
+pub fn report_facts(d: &MachineDescription, provenance: akuma_machine_facts::Provenance) {
+    use akuma_machine_facts::IrqController;
+    let f = d.facts(provenance);
+    serial::puts("  facts: ");
+    serial::puts(provenance.name());
+    serial::puts(", ");
+    serial::put_dec(f.ram_bytes() / (1024 * 1024));
+    serial::puts(" MiB in ");
+    serial::put_dec(f.ram().len() as u64);
+    serial::puts(" region(s), cpus ");
+    match f.cpus {
+        Some(n) => serial::put_dec(n as u64),
+        None => serial::puts("?"),
+    }
+    serial::puts(", virtio ");
+    serial::put_dec(f.virtio().len() as u64);
+    serial::puts(", irq ");
+    serial::puts(match f.irq {
+        IrqController::IoApic { .. } => "ioapic",
+        IrqController::Unknown => "unknown",
+        IrqController::Gicv2 { .. } | IrqController::Gicv3 { .. } => "gic",
+    });
+    match f.validate() {
+        Ok(()) => serial::puts("  [ok]\n"),
+        Err(e) => {
+            serial::puts("  [INVALID: ");
+            serial::puts(match e {
+                akuma_machine_facts::FactsError::NoRam => "no ram",
+                akuma_machine_facts::FactsError::RamOverlap => "ram overlap",
+                akuma_machine_facts::FactsError::VirtioInRam => "virtio window inside ram",
+                akuma_machine_facts::FactsError::VirtioOverlap => "virtio overlap",
+                akuma_machine_facts::FactsError::ZeroCpus => "zero cpus",
+            });
+            serial::puts("]\n");
+        }
+    }
+}

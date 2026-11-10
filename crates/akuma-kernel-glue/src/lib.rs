@@ -751,6 +751,22 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
             }
         }
 
+        if let Some(f) = platform::fdt_facts(fdt.as_ref()) {
+            safe_print!(160, "[Platform] facts: {}, {} MiB in {} region(s), cpus {}, virtio {}, irq {}  [{}]\n",
+                f.provenance.name(),
+                f.ram_bytes() / (1024 * 1024),
+                f.ram().len(),
+                f.cpus.unwrap_or(0),
+                f.virtio().len(),
+                match f.irq {
+                    akuma_machine_facts::IrqController::Gicv2 { .. } => "gicv2",
+                    akuma_machine_facts::IrqController::Gicv3 { .. } => "gicv3",
+                    akuma_machine_facts::IrqController::IoApic { .. } => "ioapic",
+                    akuma_machine_facts::IrqController::Unknown => "unknown",
+                },
+                if f.validate().is_ok() { "ok" } else { "INVALID" });
+        }
+
         let ram = detect_memory(fdt.as_ref());
 
         // Real (shared-kernel) SMP: snapshot CPU/PSCI info from the DTB NOW, before the

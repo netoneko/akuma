@@ -488,3 +488,39 @@ fn cmdline_complete_returns_the_whole_line_or_says_it_cannot() {
     let sig = StartInfo::parse(&gone, 0x6000).unwrap();
     assert_eq!(sig.cmdline_complete(&gone, &mut [0u8; 8]), Err(CmdlineError::Unreadable));
 }
+
+// ---------------------------------------------------------------------------
+// The neutral view
+// ---------------------------------------------------------------------------
+
+/// Only usable RAM becomes `Facts` RAM; the virtio list keeps command-line order and the result
+/// passes the neutral invariants.
+#[test]
+fn facts_keep_usable_ram_and_virtio_order() {
+    use akuma_machine_facts::{Provenance, Range};
+    let regions = [
+        MemRegion { addr: 0, size: 0x9_f000, kind: 1 },
+        MemRegion { addr: 0x9_f000, size: 0x6_1000, kind: 2 }, // reserved: not ours to allocate
+        MemRegion { addr: 0x10_0000, size: 0x7ff0_0000, kind: 1 },
+    ];
+    let mut m = MachineDescription::from_memory_map(&regions, None, None);
+    m.virtio = cmdline::parse(
+        "virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6",
+    );
+    let f = m.facts(Provenance::Pvh);
+    assert_eq!(f.validate(), Ok(()));
+    assert_eq!(f.ram(), &[Range::new(0, 0x9_f000), Range::new(0x10_0000, 0x7ff0_0000)]);
+    assert_eq!(f.ram_bytes(), m.usable_ram());
+    let v: std::vec::Vec<_> = f.virtio().iter().map(|d| (d.window.base, d.irq)).collect();
+    assert_eq!(v, [(0xfeb0_0000, 5), (0xfeb0_0200, 6)]);
+    assert_eq!(f.cpus, None, "no MADT, no CPU count");
+}
+
+/// Provenance is the caller's statement of which protocol it parsed, passed through untouched.
+#[test]
+fn facts_carry_the_callers_provenance() {
+    use akuma_machine_facts::Provenance;
+    let m = MachineDescription::from_memory_map(&[MemRegion { addr: 0, size: 0x1000, kind: 1 }], None, None);
+    assert_eq!(m.facts(Provenance::Multiboot2).provenance, Provenance::Multiboot2);
+    assert_eq!(m.facts(Provenance::Pvh).provenance, Provenance::Pvh);
+}

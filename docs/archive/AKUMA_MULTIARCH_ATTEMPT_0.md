@@ -68,6 +68,30 @@ Run as root with `MEM=3072` (ryzen has ~6 GB available). Never install these ker
 
 The multiboot2 side of M1a–M1c is therefore boot-verified under KVM (not on the metal itself).
 
+## M2 — the `MachineFacts` seam
+
+- **M2a (done): `akuma-machine-facts`** — a new leaf crate (no dependencies, `forbid(unsafe_code)`,
+  unsafe budget 0, fixed arrays, `Copy`) holding what *both* discovery paths supply today:
+  RAM regions, CPU count, virtio-MMIO windows + IRQs, the interrupt controller
+  (`Gicv2`/`Gicv3`/`IoApic`/`Unknown`) and a `Provenance` (`CompileTime`/`Fdt`/`Pvh`/`Multiboot2`).
+  `Facts::validate()` enforces the invariants every consumer assumes (RAM present and
+  non-overlapping, virtio windows outside RAM and each other, CPU count ≠ 0). Console, timer, RNG
+  and the reboot conduit are deliberately **not** in it: they are arch constants, not discovered.
+  Per the research doc's open question 1, this is the *sibling* shape (own crate, own API), not an
+  in-place generalisation of `akuma-kernel-core::platform` — that fold is M7.
+  The protocol crates own the adapters and depend on the facts crate, never the reverse:
+  `akuma_firecracker::MachineDescription::facts()` (tested against the four *measured* Firecracker
+  FDTs, 1/2/4/8 vCPUs) and `akuma_ryzen_amd64::MachineDescription::facts(provenance)` (only
+  type-1 memory becomes RAM). 12 + 2 + 2 host tests.
+- **M2b (done): both kernels report it, neither behaves differently.** One line per boot:
+  - amd64 PVH (TCG, SMP=4): `facts: pvh, 2047 MiB in 2 region(s), cpus 4, virtio 2, irq ioapic  [ok]`, suite **836/0**.
+  - AArch64 (QEMU HVF, SMP=2): `[Platform] facts: fdt, 512 MiB in 1 region(s), cpus 2, virtio 8, irq gicv3  [ok]`, boot suite green.
+  Report-only: a failing `validate()` prints `INVALID` and the boot continues exactly as before.
+- **Not yet:** nothing *consumes* `Facts` — `mem::init`, `blk::init`, `smp::start_secondaries` and
+  `detect_memory` still read their protocol-shaped descriptions. Switching them is the real M2
+  payoff and the next step, one consumer at a time. The AArch64 compile-time map
+  (`platform::{qemu_virt, firecracker}`) does not yet produce `Facts` either.
+
 ## Decisions (owner, 2026-11-10)
 
 - **D1 — rump:** a universal, **optional** `rump` feature on the shared spine, not bin-local. Its

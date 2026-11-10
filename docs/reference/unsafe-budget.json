@@ -36,6 +36,7 @@
     "crates/akuma-kvm-abi",
     "crates/akuma-lapic-amd64",
     "crates/akuma-locks-rw",
+    "crates/akuma-machine-facts",
     "crates/akuma-middleware",
     "crates/akuma-mmap",
     "crates/akuma-mmu",

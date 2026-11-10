@@ -185,6 +185,29 @@ impl MachineDescription {
     pub fn ioapic_addr(&self) -> Option<u32> {
         self.madt.as_ref()?.ioapics().first().map(|io| io.addr)
     }
+
+    /// The neutral view of this machine ([`akuma_machine_facts::Facts`]) under `provenance`
+    /// (`Pvh` or `Multiboot2` — the caller knows which protocol it parsed).
+    ///
+    /// Only type-1 (usable) memory becomes RAM; reserved, ACPI and NVS regions are real parts of
+    /// the E820 map but not something a frame allocator may hand out. virtio-MMIO windows keep the
+    /// command line's order, which is the slot order the drivers probe.
+    #[must_use]
+    pub fn facts(&self, provenance: akuma_machine_facts::Provenance) -> akuma_machine_facts::Facts {
+        use akuma_machine_facts::{Facts, IrqController, Range, VirtioMmio};
+        let mut f = Facts::new(provenance);
+        for r in self.regions().iter().filter(|r| r.is_ram()) {
+            let _ = f.push_ram(Range::new(r.addr, r.size));
+        }
+        for d in self.virtio.as_slice() {
+            let _ = f.push_virtio(VirtioMmio { window: Range::new(d.base, d.len), irq: d.irq });
+        }
+        f.cpus = self.cpu_count();
+        if let Some(base) = self.ioapic_addr() {
+            f.irq = IrqController::IoApic { base: u64::from(base) };
+        }
+        f
+    }
 }
 
 /// Why a description could not be built.

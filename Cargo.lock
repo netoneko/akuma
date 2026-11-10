@@ -124,6 +124,7 @@ dependencies = [
  "akuma-kvm-abi",
  "akuma-lapic-amd64",
  "akuma-locks-rw",
+ "akuma-machine-facts",
  "akuma-mmap",
  "akuma-mmu",
  "akuma-multiboot2",
@@ -416,6 +417,7 @@ version = "0.1.0"
 name = "akuma-firecracker"
 version = "0.1.0"
 dependencies = [
+ "akuma-machine-facts",
  "fdt",
 ]
 
@@ -506,6 +508,7 @@ dependencies = [
  "akuma-firecracker",
  "akuma-fpcache",
  "akuma-gic",
+ "akuma-machine-facts",
  "akuma-net",
  "akuma-pmm",
  "akuma-primitives",
@@ -533,6 +536,7 @@ dependencies = [
  "akuma-fdt",
  "akuma-gic",
  "akuma-kernel-core",
+ "akuma-machine-facts",
  "akuma-net",
  "akuma-pmm",
  "akuma-primitives",
@@ -575,6 +579,10 @@ dependencies = [
  "akuma-primitives",
  "spinning_top",
 ]
+
+[[package]]
+name = "akuma-machine-facts"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-middleware"
@@ -825,6 +833,9 @@ dependencies = [
 [[package]]
 name = "akuma-ryzen-amd64"
 version = "0.1.0"
+dependencies = [
+ "akuma-machine-facts",
+]
 
 [[package]]
 name = "akuma-sched-amd64"

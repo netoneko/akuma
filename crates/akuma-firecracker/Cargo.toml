@@ -5,6 +5,7 @@ edition = "2024"
 description = "Derive Akuma's machine description (RAM, GIC, UART, virtio slots) from a flattened device tree"
 
 [dependencies]
+akuma-machine-facts = { path = "../akuma-machine-facts" }
 # Same version the kernel already uses in src/main.rs and src/smp_shared.rs.
 # no_std and alloc-free, which is required: the device map has to be built
 # before the heap exists.

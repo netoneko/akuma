@@ -912,6 +912,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     serial::puts(" MiB usable across ");
     serial::put_dec(machine.regions().len() as u64);
     serial::puts(" regions\n");
+    crate::machine::report_facts(&machine, akuma_machine_facts::Provenance::Multiboot2);
 
     // PCI enumeration. This is the whole reason it matters on this entry: a
     // VMM announces its devices, real firmware announces nothing. The xHCI /

@@ -249,6 +249,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // reportably rather than triple-fault.
     let machine = machine::describe(hvm_start_info);
     machine::report(&machine);
+    machine::report_facts(&machine, akuma_machine_facts::Provenance::Pvh);
 
     // No PCI enumeration on this path. PVH means a VMM, and the VMMs this
     // target runs under (Firecracker, QEMU `microvm`) present every device as
