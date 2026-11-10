@@ -124,7 +124,7 @@
     "crates/akuma-percpu-gdt-amd64": 2,
     "crates/akuma-phys": 9,
     "crates/akuma-port": 4,
-    "crates/akuma-primitives": 10,
+    "crates/akuma-primitives": 11,
     "crates/akuma-psci": 2,
     "crates/akuma-ring3-amd64": 4,
     "crates/akuma-sched-amd64": 4,

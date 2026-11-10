@@ -293,6 +293,8 @@ pub struct Console<S: Surface> {
     /// The grid changed size under the program (a new margin); see
     /// [`Console::take_geometry`].
     geometry_dirty: bool,
+    /// `CSI ? 2026 h`: the program is mid-frame and asks that nothing be presented until `l`.
+    sync_update: bool,
     /// Where the last character went, and whether it was an emoji picture — what an
     /// emoji *sequence* (VS16, ZWJ, a skin-tone modifier) is glued to.
     last_cell: Option<(usize, usize)>,
@@ -403,6 +405,7 @@ impl<S: Surface> Console<S> {
             reply: [0; REPLY_CAP],
             reply_len: 0,
             geometry_dirty: false,
+            sync_update: false,
             last_cell: None,
             last_emoji: false,
             swallow: false,
@@ -1034,6 +1037,10 @@ impl<S: Surface> Console<S> {
             match mode {
                 7 => self.autowrap = on,
                 25 => self.cursor_hidden = !on,
+                // Synchronized output: the owner of the screen (`amd64`'s `mirror_byte`)
+                // holds back presenting the frame until `l`; the grid and back buffer
+                // keep updating meanwhile.
+                2026 => self.sync_update = on,
                 // Mouse reporting. 1000/1002/1003 are levels of one setting: the
                 // highest one on wins, and switching a level off while a higher
                 // one is on leaves the higher one alone.
@@ -1891,6 +1898,12 @@ impl<S: Surface> Console<S> {
     /// Give the surface back.
     pub fn into_surface(self) -> S {
         self.surface
+    }
+
+    /// Is the program inside a synchronized-update frame (`CSI ? 2026 h` .. `l`)?
+    #[must_use]
+    pub const fn sync_update(&self) -> bool {
+        self.sync_update
     }
 
     /// The surface, for a caller that wants to draw around the text.

@@ -236,6 +236,42 @@ impl MmioWindow {
         true
     }
 
+    /// Copy `src` into consecutive dwords starting at `off`; `false` (nothing
+    /// written) if the span is outside the window or `off` is not dword-aligned.
+    ///
+    /// The copy twin of [`Self::fill32`], for presenting a RAM back buffer to a
+    /// write-combining framebuffer: one `rep movsd` per span lets the CPU gather
+    /// the stores into full-line bursts, which a loop of volatile stores does not.
+    /// The direction flag is clear (see `fill32`).
+    #[inline]
+    #[must_use]
+    pub fn copy32_from(&self, off: usize, src: &[u32]) -> bool {
+        let Some(bytes) = src.len().checked_mul(4) else { return false };
+        let Some(end) = off.checked_add(bytes) else { return false };
+        if end > self.len || !(self.base + off).is_multiple_of(4) {
+            return false;
+        }
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: `off + 4 * src.len() <= len` and the destination is
+        // dword-aligned, so the stores land inside the window `new`'s caller
+        // vouched is mapped device memory; the source is a live slice of exactly
+        // `src.len()` dwords, and `rep movsd` copies that many from `rsi` to `rdi`.
+        unsafe {
+            core::arch::asm!(
+                "rep movsd",
+                inout("rdi") self.base + off => _,
+                inout("rsi") src.as_ptr() => _,
+                inout("rcx") src.len() => _,
+                options(nostack, preserves_flags),
+            );
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        for (i, &v) in src.iter().enumerate() {
+            self.write::<u32>(off + i * 4, v);
+        }
+        true
+    }
+
     /// Volatile read of the `T`-wide register at `off`.
     ///
     /// # Panics
