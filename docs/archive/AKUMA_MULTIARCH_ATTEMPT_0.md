@@ -652,3 +652,69 @@ same contract as the SGI shim's, D4 step 1 anticipated it); `akuma-kernel-glue` 
 5 -> 6 (`saved_root_probe(l0_base: u64)`, whose shape `register_saved_root_probe` fixes for both kernels,
 like amd64's `any_task_on_space_root`); amd64 ratchets 85 -> 84. **Not run yet:** devbox, the
 epoll/futex suites, any SMP>1 — those wait for W3b's secondary bring-up.
+
+## W3b — the hooked scheduler on 2 and 4 cores (2026-11-10)
+
+`--features hooked-sched` now starts the secondaries. **Lima, boot suite to herd:**
+
+| | SMP=1 | SMP=2 | SMP=4 |
+|---|---|---|---|
+| hooked | 314/0 (x2) | 322/0 (x2), 321/1 (the final build) | 319/1 (x3, and once on an earlier build: `test_epoll_socket_waker` every time, 8.1–14.2 ms) |
+| SGI, same tree | 314/0 | 324/0 | 322/0 |
+
+The count difference is the three SGI-only tests that print `[SKIP]` under the feature. **devbox-smoltcp**
+(`devbox-smoltcp,no-tests,hooked-sched`, `devbox.img` snapshotted, ssh from the host): SMP=2 and 4 boot,
+answer ssh in 3 s, report 2/4 CPUs, run `cargo --version` and 8 concurrent forks. Back-to-back ssh sessions
+at SMP=4: **2 failures (exit 255) in 186 on hooked, 0 in 126 on SGI** — open; the reruns of 60 and 100 were
+clean, and stderr was not captured for either failure.
+
+How the cores come up: the SGI trampoline and `secondary_shared_start` are shared; under the feature the
+core's adoption and its idle loop come from the kernel through a registered
+`akuma_entry::smp_shared::HookedSecondary` (`akuma-entry` sits below glue), the core takes the kit's vector
+table, and `threading::x86_adopt_core_idle` (new) claims a slot, records the boot stack and paints its
+canary, as `adopt_current_as_core_idle` does for the SGI path. The cores start after `hooked::init` in both
+images. Four defects stood between "core 1 online" and a green suite, each of them a property the SGI path
+got from its tick:
+
+1. **A recycled slot inherited a dead process's identity.** The hooked reaper
+   (`x86_reap_terminated_slots`) and `x86_claim_slot`'s direct reuse of a `TERMINATED` slot skip the
+   collector's cleanup callback — on this kernel `on_thread_cleanup`, which drops the tid -> pid row and
+   unregisters the process. amd64 tears down on the dying thread and never needed it. Found as a lost futex
+   wake: `test_futex_basic_wake`'s kernel-thread waiter, on a recycled slot on core 1, keyed its wait on
+   `tgid=21` (a finished test process) while the waker used `tgid=0`; `futex_dump` showed both entries.
+   Fix: `akuma-threading/collector-recycles` (set only by this feature) makes `x86_claim_slot` take `FREE`
+   slots only, and the idle threads call the collector (`reclaim_terminated_slots`), not the reaper.
+2. **A kernel thread that yields keeps the BKL across the switch.** The lock stays with the core, nothing
+   preempts EL1, so threads that poll by yielding — to each other, or to nothing — kept it for good: two
+   `blocking_relax` waiters on core 0 wedged core 1 (`[BKL] stuck`, `smp_shared_blocking_wait_peer_progress`).
+   `x86_yield_now` (`yield-takes-bkl`) now releases and re-takes a held lock before switching; the ticket
+   lock makes that a handoff. A yield already lets other kernel code run between the caller's halves, so
+   no caller can rely on the lock across one.
+3. **A socket wait that halts never gives the core up.** `idle_halt` (the socket wait's park) relies on
+   the tick displacing a halted non-idle thread (the 2026-08-25 SMP=1 freeze fix); there is no such tick
+   here, so httpd's `accept` held the only core at SMP=1 and herd's console drain never ran (lldb: the one
+   vCPU in `idle_halt` under `socket_accept`). Under the feature it yields instead when anything else can
+   run. (It surfaced only after 1 changed slot numbering, which changed who reached the core first.)
+4. **Tests that assumed one core or the SGI idle.** `Thread spawn`/`Spawn and cleanup` and the three
+   `ThreadWaker` tests read a slot a peer's idle thread may already have run and recycled; they accept that
+   outcome under the feature (`slots_collected()`, a hooked-only counter). `core_idle_slots_survive_init`
+   accepts `READY`: a hooked core switches its idle thread out whenever it has work.
+
+**Gates.** Default AArch64 build vs `6144a970`: same 5466 symbols, one `.text` instruction differs (a
+`#[track_caller]` line immediate, 5468 -> 5540), `.rodata` panic locations. Clippy clean (`hooked-sched`,
+`hooked-sched,no-tests`, amd64). `check_addr_params` green — the two new stack-base parameters are
+`VirtAddr`. Host tests for `akuma-threading` pass; note that `--features hooked` (with or without the new
+features) does not build on a macOS host — `akuma-switch`'s ELF section syntax, pre-existing. amd64 (the
+threading crate is shared; none of the new features is on there, so what reaches it is the
+`cfg(hooked_sched)` additions with `collector-recycles` false): TCG candidate vs `6144a970`, two runs
+each, SMP=1 827/0 on all four, SMP=4 837/0 on all four. One candidate SMP=4 run took 163 s instead of
+7–9 s, all of it inside `sigregs` (pid 17's null-store `SIGSEGV` loop stalled ~155 s, then finished);
+the rerun took 7 s. That is the open `sigregs` SMP=4 TCG finding above, this time recovering instead of
+hanging. Note that all three sightings so far (here and the two above) were on a candidate build, each
+with unrelated changes — not yet seen on a baseline, which with these sample sizes says little either way.
+
+**Open:** the epoll waker latency (every SMP=4 run, and one SMP=2 run of three, 8.1–14.2 ms against an
+8 ms bound with a 5 ms built-in delay; the wake path — CAS,
+`wake_core` SGI to the waiter's last core, that core's idle yields — reads correct, so the epoll/futex
+suites are the next measurement); the 2-in-180 ssh session failures; signal and deferred-kill delivery on
+the IRQ-return path (W3c).

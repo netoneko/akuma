@@ -34,3 +34,8 @@ hooked = ["akuma-switch/hooked"]
 # back on resume. The AArch64 root kernel under `hooked-sched` (its dropped-BKL windows); see
 # `x86_yield_now`.
 yield-takes-bkl = ["hooked"]
+# With `hooked`: a dead thread's slot is recycled only by the collector (`cleanup_terminated*`,
+# which runs the kernel's `set_cleanup_callback` teardown and the full per-slot scrub), never claimed
+# straight from `TERMINATED`. The AArch64 root kernel under `hooked-sched`, whose process teardown is
+# that callback; amd64 tears down on the dying thread and claims directly. See `x86_claim_slot`.
+collector-recycles = ["hooked"]

@@ -1236,8 +1236,12 @@ fn test_core_idle_slots_survive_init() {
         checked += 1;
 
         let expect_base = crate::smp_shared::secondary_stack_base(core);
-        let running =
-            threading::get_thread_state(slot) == threading::thread_state::RUNNING;
+        // Still this core's idle thread, not recycled: RUNNING — or, under `hooked-sched`,
+        // READY, since a hooked core switches its idle thread out (a call, not a preemption)
+        // whenever it has something else to run.
+        let state = threading::get_thread_state(slot);
+        let running = state == threading::thread_state::RUNNING
+            || (cfg!(feature = "hooked-sched") && state == threading::thread_state::READY);
         let bounds = threading::slot_stack_bounds(slot);
         let base_ok = bounds.map(|(b, _)| b) == Some(expect_base);
 

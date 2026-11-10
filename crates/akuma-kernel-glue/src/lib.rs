@@ -1209,10 +1209,11 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // sshd under SMP>=2. See docs/archive/SMP_SHARED.md M4 "open item".
     #[cfg(all(kernel_smp_shared, feature = "no-tests", not(feature = "hooked-sched")))]
     smp_shared::bringup_secondaries();
-    // `hooked-sched` (M6): the secondaries' bring-up adopts each core's idle thread through the
-    // SGI path's `adopt_current_as_core_idle`, which this path does not have yet. One core.
+    // `hooked-sched` (M6): here in both images. A secondary's idle thread is adopted through
+    // `hooked::init`'s registration, so the cores cannot start before it — the SGI self-test
+    // image's earlier start (see the note before `exceptions::init`) is not available here.
     #[cfg(all(kernel_smp_shared, feature = "hooked-sched"))]
-    console::print("[hooked] secondary cores not started: the hooked path's SMP bring-up is not built yet\n");
+    smp_shared::bringup_secondaries();
 
     // The boot self-test suite spawns many concurrent threads/processes. On a
     // tiny machine there aren't enough user thread slots (the pool is scaled to

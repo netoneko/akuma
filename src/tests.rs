@@ -2142,11 +2142,28 @@ fn get_test_flag() -> bool {
     TEST_THREAD_RAN.load(Ordering::Acquire)
 }
 
+/// Slots the collector has recycled since boot (`hooked-sched`); 0 on the SGI path, whose
+/// only collector is the thread running these tests. Under `hooked-sched` every core's
+/// idle thread collects, so at SMP>1 a spawned test thread can run and be recycled on a
+/// peer core between `spawn_fn` and the test's next count; the spawn tests accept that
+/// outcome when this moved by more than their own cleanup accounts for.
+fn peer_reaps() -> u64 {
+    #[cfg(feature = "hooked-sched")]
+    {
+        threading::slots_collected()
+    }
+    #[cfg(not(feature = "hooked-sched"))]
+    {
+        0
+    }
+}
+
 /// Test: Can spawn a thread without hanging
 fn test_spawn_thread() -> bool {
     console::print("\n[TEST] Thread spawn\n");
 
     let count_before = threading::thread_count();
+    let reaps_before = peer_reaps();
     crate::safe_print!(64, "  Threads before: {}\n", count_before);
 
     // Try to spawn - simple thread that just marks itself terminated immediately
@@ -2164,7 +2181,11 @@ fn test_spawn_thread() -> bool {
             let count_after = threading::thread_count();
             crate::safe_print!(64, "  Threads after: {}\n", count_after);
 
-            let ok = count_after == count_before + 1;
+            let reaped = peer_reaps() > reaps_before;
+            if reaped {
+                console::print("  (ran and was reaped on a peer core)\n");
+            }
+            let ok = count_after == count_before + 1 || (reaped && count_after == count_before);
             crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
             ok
         }
@@ -2230,6 +2251,7 @@ fn test_spawn_and_cleanup() -> bool {
     console::print("\n[TEST] Spawn and cleanup\n");
 
     let count_before = threading::thread_count();
+    let reaps_before = peer_reaps();
     crate::safe_print!(64, "  Threads before: {}\n", count_before);
 
     // Spawn thread
@@ -2269,7 +2291,8 @@ fn test_spawn_and_cleanup() -> bool {
     let count_after = threading::thread_count();
     crate::safe_print!(64, "  Threads after: {}\n", count_after);
 
-    let ok = count_after == count_before && cleaned >= 1;
+    let ok = count_after == count_before
+        && (cleaned >= 1 || peer_reaps() > reaps_before + cleaned as u64);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
 }
@@ -9378,6 +9401,18 @@ extern "C" fn waker_test_park_trampoline() -> ! {
 /// failing the assertion, not crashing. Each test below wraps that window in
 /// `disable_preemption()`/`enable_preemption()` to make the read deterministic
 /// on the single-core boot the self-test suite normally runs under.
+/// Did a woken test slot read as woken? `READY` — or, under `hooked-sched`, any state a
+/// peer core's idle thread can carry it to before the read: it picks up a `READY` thread
+/// at once (`disable_preemption` holds only this core), runs the self-terminating
+/// trampoline, and reaps the slot. Never `WAITING` or `INITIALIZING`, which are what a
+/// lost or misdirected wake leaves.
+fn woken_state_ok(state: u8) -> bool {
+    use akuma_exec::threading::thread_state;
+    state == thread_state::READY
+        || (cfg!(feature = "hooked-sched")
+            && matches!(state, thread_state::RUNNING | thread_state::TERMINATED | thread_state::FREE))
+}
+
 fn spawn_waker_test_slot() -> Result<usize, &'static str> {
     akuma_exec::threading::spawn_user_thread_initializing(
         waker_test_park_trampoline,
@@ -9414,7 +9449,7 @@ pub fn test_thread_waker_marks_ready() -> bool {
     threading::mark_thread_terminated(tid);
     threading::cleanup_terminated_force();
 
-    let ok = state == thread_state::READY && woken;
+    let ok = woken_state_ok(state) && woken;
     crate::safe_print!(128, "  state={} (expected {}), woken={} (expected true)\n",
         state, thread_state::READY, woken);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
@@ -9453,7 +9488,7 @@ pub fn test_thread_waker_idempotent() -> bool {
     threading::mark_thread_terminated(tid);
     threading::cleanup_terminated_force();
 
-    let ok = state == thread_state::READY && woken;
+    let ok = woken_state_ok(state) && woken;
     crate::safe_print!(128, "  state={} (expected {}), woken={}\n",
         state, thread_state::READY, woken);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
@@ -9491,7 +9526,7 @@ pub fn test_thread_waker_roundtrip() -> bool {
     threading::mark_thread_terminated(tid);
     threading::cleanup_terminated_force();
 
-    let ok = state == thread_state::READY && woken;
+    let ok = woken_state_ok(state) && woken;
     crate::safe_print!(128, "  state={} (expected {}), woken={}\n",
         state, thread_state::READY, woken);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });

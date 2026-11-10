@@ -1618,6 +1618,34 @@ pub fn ensure_pool_stack_top(slot: usize, size: usize) -> Option<usize> {
     slot_stack_bounds(slot).map(|(base, size)| (base + size) & !0xF)
 }
 
+/// Adopt the context this core is running — a secondary's boot stack, `stack_base` and
+/// `stack_size` bytes up — as core `core_id`'s idle thread, on the hooked path: the
+/// [`adopt_current_as_core_idle`] of a kernel whose switch is a call.
+///
+/// The stack is recorded and its canary painted for the reason that function gives (the
+/// pool's bounds are what `slot_stack_bounds` and the canary sweep read; the stack is
+/// static `.bss`, so nothing else paints it). The thread register names the slot before
+/// it is latched running. The caller marks the slot unpickable (its `can_run`) before
+/// this core can first switch away from it. Call with interrupts masked, once per core.
+#[cfg(all(target_os = "none", hooked_sched))]
+pub fn x86_adopt_core_idle(
+    core_id: usize,
+    stack_base: akuma_primitives::addr::VirtAddr,
+    stack_size: usize,
+) -> Option<usize> {
+    let slot = x86_claim_slot()?;
+    with_irqs_disabled(|| {
+        POOL.lock().stacks[slot] = StackInfo::new(stack_base.get(), stack_size);
+    });
+    if config().enable_stack_canaries {
+        init_stack_canary(stack_base.get());
+    }
+    register_core_idle(core_id, slot);
+    (arch().set_current_slot)(slot);
+    x86_adopt_running_thread(slot);
+    Some(slot)
+}
+
 /// Per-thread termination timestamp (for cooldown tracking)
 static TERMINATION_TIME: [AtomicU64; MAX_THREADS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
@@ -2289,6 +2317,19 @@ pub fn reclaim_terminated_slots() -> usize {
     cleanup_terminated_internal(true, false)
 }
 
+/// Slots the collector has carried to `FREE` since boot, on the hooked path (where every
+/// core's idle thread collects, so a self-test cannot assume its own `cleanup_terminated*`
+/// call is the one that recycles its thread).
+#[cfg(hooked_sched)]
+static COLLECTED: AtomicU64 = AtomicU64::new(0);
+
+/// See [`COLLECTED`].
+#[cfg(hooked_sched)]
+#[must_use]
+pub fn slots_collected() -> u64 {
+    COLLECTED.load(Ordering::Relaxed)
+}
+
 /// Internal cleanup implementation.
 ///
 /// `any_caller` drops the "only thread 0 collects" gate; `ignore_cooldown` drops the
@@ -2500,6 +2541,8 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
 
             // NOW set to FREE - cleanup is complete, spawn can safely claim this slot
             THREAD_STATES[i].store(thread_state::FREE, Ordering::SeqCst);
+            #[cfg(hooked_sched)]
+            COLLECTED.fetch_add(1, Ordering::Relaxed);
             
             // Gated as a LIFECYCLE trace (2026-08-29). This fires once per thread
             // recycle, and a thread-heavy workload — an in-VM `-j4` build, say —
@@ -2897,6 +2940,14 @@ pub fn x86_claim_slot() -> Option<usize> {
     for slot in 1..MAX_THREADS {
         let state = THREAD_STATES[slot].load(Ordering::Acquire);
         if !slot_reusable(state, ON_CPU[slot].load(Ordering::Acquire), slot_held_by(slot)) {
+            continue;
+        }
+        // `collector-recycles`: a `TERMINATED` slot still carries a dead thread whose
+        // kernel-side teardown is the collector's cleanup callback (the AArch64 root
+        // kernel's `on_thread_cleanup`: its tid -> pid row, its process's unregister).
+        // Claimed from here, the next occupant inherits that identity — measured: a
+        // kernel thread's futex keyed on a dead process's tgid, its wake lost.
+        if cfg!(feature = "collector-recycles") && state != thread_state::FREE {
             continue;
         }
         if THREAD_STATES[slot]
@@ -3453,12 +3504,25 @@ fn x86_yield_now() -> bool {
         // it back on resume: every thread then crosses a switch holding the lock, on whichever
         // core it resumes. amd64 needs none of this (its boot suite asserts no switch runs
         // without the lock), and the tokio kernels do not use `akuma_bkl`.
-        let reacquired = !bkl::held_by_current();
-        if reacquired {
-            bkl::enter_kernel();
+        //
+        // A caller that does hold it releases and re-takes it first, so any core queued for
+        // the lock gets it before this core switches. A yield already lets other kernel code
+        // run between the caller's two halves, so no caller can be relying on the lock across
+        // one; and nothing preempts a kernel thread on this path (the SGI path's tick was
+        // this release), so without it a core whose threads poll by yielding — to each
+        // other, or to nothing — keeps the lock for as long as they poll, and the thread
+        // they are polling for, spinning for the lock on a peer core, never runs. Measured:
+        // two `blocking_relax` waiters on core 0 switching to each other held the lock for
+        // good, `[BKL] stuck` on core 1 (`smp_shared_blocking_wait_peer_progress`, SMP=2).
+        // Uncontended it is one release and one acquire of a free ticket lock; the ticket
+        // lock is what makes it a handoff.
+        let held = bkl::held_by_current();
+        if held {
+            bkl::leave_kernel();
         }
+        bkl::enter_kernel();
         let switched = x86_yield_switch();
-        if reacquired {
+        if !held {
             bkl::leave_kernel();
         }
         switched
@@ -4589,6 +4653,18 @@ pub fn yield_now() {
 /// nothing to do, so genuinely stop" primitive for idle loops.
 #[cfg(target_os = "none")]
 pub fn idle_halt() {
+    // The hooked path (the AArch64 root kernel under `hooked-sched`, which is what sets
+    // `yield-takes-bkl`): a tick never switches a thread out of EL1 there, so the
+    // displacement this function relies on — "keep the halt preemptible and the tick
+    // hands the core to a READY peer" (below) — does not exist. A socket waiter parked
+    // here held the only core for good at SMP=1: httpd's `accept`, while herd's console
+    // drain waited READY behind it. So when anything else can run, switch to it instead
+    // of halting; the caller's wait loop comes back here when it resumes.
+    #[cfg(feature = "yield-takes-bkl")]
+    if x86_runnable_exists() {
+        yield_now();
+        return;
+    }
     let tid = current_thread_id();
     // Non-idle halters must stay PREEMPTIBLE (SMP=1 freeze fix, 2026-08-25).
     //

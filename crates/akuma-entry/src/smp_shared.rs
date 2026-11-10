@@ -88,6 +88,31 @@ static ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// wait there is a single load.
 static BSP_IRQ_READY: AtomicBool = AtomicBool::new(false);
 
+/// The hooked scheduler's half of a secondary's start (`hooked-sched`, M6).
+///
+/// Which slot becomes the core's idle thread and what that thread runs. The kernel's glue
+/// owns both (its idle loop and its record of which slots are idle), and this crate sits
+/// below it, so it registers them here before [`bringup_secondaries`].
+#[cfg(feature = "hooked-sched")]
+#[derive(Clone, Copy)]
+pub struct HookedSecondary {
+    /// Make the running context core `core`'s idle thread on its boot stack (`base`,
+    /// `size` bytes), returning the slot; `None` parks the core. Interrupts are masked.
+    pub adopt: fn(core: usize, base: akuma_primitives::addr::VirtAddr, size: usize) -> Option<usize>,
+    /// The core's idle loop: entered with interrupts open and the lock not held.
+    pub idle: fn() -> !,
+}
+
+#[cfg(feature = "hooked-sched")]
+static HOOKED_SECONDARY: akuma_not_even_once::Registered<HookedSecondary> =
+    akuma_not_even_once::Registered::new("akuma-entry: HookedSecondary not registered");
+
+/// Register [`HookedSecondary`]. Once, before [`bringup_secondaries`].
+#[cfg(feature = "hooked-sched")]
+pub fn register_hooked_secondary(h: HookedSecondary) {
+    HOOKED_SECONDARY.register(h);
+}
+
 /// Let the secondaries start taking interrupts. Called by `kernel_main` once the
 /// exception hooks are registered, the BSP's vectors are installed and the timer
 /// is initialised. Idempotent.
@@ -380,7 +405,9 @@ pub fn secondary_stack_base(core: usize) -> usize {
 /// This had its own `adrp`/`add`/`msr` sequence until 2026-09-01. It is the same
 /// install `exceptions::init` does on the BSP — and "the same" is the whole
 /// point of shared-kernel SMP — so it now calls the one implementation instead
-/// of carrying a second copy that could drift from it.
+/// of carrying a second copy that could drift from it. (`hooked-sched` installs the
+/// kit's table instead, `crate::hooked::install_on_this_core`.)
+#[cfg(not(feature = "hooked-sched"))]
 fn set_shared_vbar() {
     crate::exceptions::install_vbar();
 }
@@ -583,8 +610,17 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
 
     // Adopt the current (boot) context as this core's idle thread so the shared
     // scheduler can switch away from it and back. Sets TPIDRRO_EL0.
+    #[cfg(not(feature = "hooked-sched"))]
     let idle =
         akuma_exec::threading::adopt_current_as_core_idle(core, exc_top, stack_base, stack_size);
+    // The hooked path's adoption is the kernel's (it owns which slots are idle); the
+    // exception stack is the SGI path's and has no counterpart there.
+    #[cfg(feature = "hooked-sched")]
+    let _ = exc_top;
+    #[cfg(feature = "hooked-sched")]
+    let idle = HOOKED_SECONDARY
+        .get()
+        .and_then(|h| (h.adopt)(core, akuma_primitives::addr::VirtAddr::new(stack_base), stack_size));
 
     ONLINE_COUNT.fetch_add(1, Ordering::AcqRel);
     let Some(slot) = idle else {
@@ -604,7 +640,10 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
 
     // Bring up this PE's interrupt receive path, install shared vectors, arm the tick.
     akuma_gic::secondary_init(core, redistributor_layout());
+    #[cfg(not(feature = "hooked-sched"))]
     set_shared_vbar();
+    #[cfg(feature = "hooked-sched")]
+    crate::hooked::install_on_this_core();
     // Arm this core's periodic tick from the shared choice (BSP's probe /
     // override result, published via akuma-timer's registry).
     akuma_kernel_core::timer::enable_timer_interrupts(akuma_kernel_core::timer::current_tick_us());
@@ -614,6 +653,13 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
     // interrupts, so a tick already pending must be taken before the idle loop is
     // entered rather than at some later synchronization point.
     akuma_primitives::irq::unmask_irqs_sync();
+
+    // The hooked path's idle loop is the kernel's: it yields to whatever is runnable,
+    // since nothing preempts a kernel thread there, and halts without the lock.
+    #[cfg(feature = "hooked-sched")]
+    if let Some(h) = HOOKED_SECONDARY.get() {
+        (h.idle)();
+    }
 
     // Idle loop. Two requirements pull against each other: (1) don't hammer the BKL
     // when there's nothing to run (a `yield_now()` every iteration livelocks SMP=4 as

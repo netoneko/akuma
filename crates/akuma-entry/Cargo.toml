@@ -23,6 +23,8 @@ akuma-kernel-core = { path = "../akuma-kernel-core" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-psci = { path = "../akuma-psci" }
 akuma-vectors-aarch64 = { path = "../akuma-vectors-aarch64", optional = true }
+# The hooked secondary start's registered half (`smp_shared::register_hooked_secondary`).
+akuma-not-even-once = { path = "../akuma-not-even-once", optional = true }
 
 [features]
 # Mirrors the root package's toggles that this crate's own build.rs and modules
@@ -33,7 +35,7 @@ smp-shared = ["akuma-boot-aarch64/secondary", "akuma-gic/smp-shared", "akuma-ker
 platform-firecracker = ["akuma-kernel-core/platform-firecracker", "akuma-boot-aarch64/platform-firecracker"]
 # M6 (multiarch attempt 0): the root kernel's front end on `akuma-vectors-aarch64` (`hooked`),
 # for the hooked scheduler. Default off.
-hooked-sched = ["dep:akuma-vectors-aarch64", "akuma-exceptions/hooked-sched", "akuma-exec/hooked-sched"]
+hooked-sched = ["dep:akuma-vectors-aarch64", "dep:akuma-not-even-once", "akuma-exceptions/hooked-sched", "akuma-exec/hooked-sched"]
 
 [lints]
 workspace = true

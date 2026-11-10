@@ -307,6 +307,7 @@ dependencies = [
  "akuma-fdt",
  "akuma-gic",
  "akuma-kernel-core",
+ "akuma-not-even-once",
  "akuma-phys",
  "akuma-primitives",
  "akuma-psci",
