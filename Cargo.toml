@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "amd64", "taoxichuan", "shanghai", "crates/*"]
+members = [".", "amd64", "amd64/bin", "taoxichuan", "shanghai", "crates/*"]
 default-members = [
     ".",
     "crates/akuma-alloc",
@@ -827,9 +827,11 @@ akuma-kernel-core = { path = "crates/akuma-kernel-core" }
 # the platform/machine description, the rump sysproxy client, and the
 # kernel_main/async-main orchestration. Extracted 2026-09-01, on top of
 # `akuma-kernel-core`. `src/` keeps only the crate-root-mandatory items
-# (global allocator, alloc-error handler, panic handler, the `rust_start`
-# entry stub) plus the boot self-test suite.
+# (global allocator, alloc-error handler, panic handler) plus the boot
+# self-test suite.
 akuma-kernel-glue = { path = "crates/akuma-kernel-glue" }
+# The arch-neutral front: `entry!` defines `rust_start` and hands it to glue's `start`.
+akuma-kernel = { path = "crates/akuma-kernel" }
 # Physical memory manager: bitmap allocator, frame tracking, UAF quarantine,
 # free/CoW event ledgers. `src/pmm.rs` is now a thin shim over this crate.
 akuma-alloc = { path = "crates/akuma-alloc" }

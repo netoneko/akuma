@@ -1,7 +1,14 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-11-10 with `python3 scripts/cloc_akuma.py src crates`:
-**101 of 135 crates** forbid `unsafe`. 101859 of 102948 production lines (98.9%) sit outside any `unsafe`
+**Grade: A** — regenerated 2026-11-11 with `python3 scripts/cloc_akuma.py src crates`:
+**102 of 136 crates** forbid `unsafe`. 101402 of 102477 production lines (99.0%) sit outside any `unsafe`
+block; 357 production sites across `crates/` (379 with tests), 0 inside enforced crates. The new crate is
+`akuma-kernel`, the full kernel's arch-neutral front (`entry!` plus the machine half the target selects),
+which forbids like its `akuma-tokio-kernel` sibling: the `#[unsafe(no_mangle)]` its macro writes lands in
+the calling bin. Production sites fell 361 → 357 with the SGI scheduler's deletion
+([`AKUMA_MULTIARCH_ATTEMPT_0.md`](../archive/AKUMA_MULTIARCH_ATTEMPT_0.md)).
+
+The run before, 2026-11-10: **101 of 135 crates** forbid `unsafe`. 101859 of 102948 production lines (98.9%) sit outside any `unsafe`
 block; 361 production sites across `crates/` (383 with tests), 0 inside enforced crates. Fifteen crates
 took the ban since the run before. Four already existed and moved their remaining `unsafe` into a leaf:
 `akuma-exceptions` (to `akuma-entry::exceptions`), `akuma-mmu`, `akuma-pmm` and `akuma-threading` (to

@@ -218,42 +218,15 @@ fn panic(info: &PanicInfo) -> ! {
     halt()
 }
 
-/// The C ABI entry point the boot assembly `bl`s.
+akuma_kernel::entry!(register_boot_tests);
+
+/// Run by `akuma_kernel::entry!`'s `rust_start` before `kernel_main`.
 ///
-/// Immediately delegates to `kernel_main` (in `akuma-kernel-glue`). It holds
-/// no `unsafe` operations of its own any more; the `#[unsafe(no_mangle)]`
-/// attribute is the only thing here the `unsafe_code` lint objects to, and the
-/// boot assembly needs the symbol name.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
-    // FIRST statement in the kernel's Rust entry, before any output at all: point
-    // the shared `safe_print!` at the PL011.
-    //
-    // Why here and not in `akuma_exec::init` (which also registers it, from the
-    // same `ExecRuntime::print_str = console::print`): that call is at
-    // `kernel_main`'s line ~754, and everything between here and there —
-    // DTB scan, memory detection, the MMU and heap bring-up, the layout
-    // assertions — prints. Registering there would have silently swallowed all
-    // of it, because the shared macro discards when unregistered. `console::print`
-    // needs no initialisation (a const MMIO base and a volatile store), so there
-    // is nothing to order this after. `OnceCopy::set` ignores the later duplicate.
-    akuma_primitives::console::set_print_hook(console::print);
-
-    // Early debug: print raw DTB pointer before anything else
-    console::print("DTB ptr from boot (x0 arg): 0x");
-    console::print_hex(dtb_ptr as u64);
-    console::print("\n");
-
-    // Also print what was stored at very first instruction
-    let x0_at_entry = boot::x0_at_entry();
-    console::print("x0 at _boot entry: 0x");
-    console::print_hex(x0_at_entry);
-    console::print("\n");
-
-    // The boot self-test suite stays in `src/` (this bin crate), but
-    // `kernel_main` — which runs it — is in `akuma-kernel-glue`, which cannot
-    // depend back on its own dependent. Register the entry points as hooks
-    // before handing off; see `akuma_kernel_glue::BootTestHooks`.
+/// The boot self-test suite stays in `src/` (this bin crate), but `kernel_main`
+/// — which runs it — is in `akuma-kernel-glue`, which cannot depend back on its
+/// own dependent. So the entry points are registered as hooks before the hand-off;
+/// see `akuma_kernel_glue::BootTestHooks`. Nothing to do in a `no-tests` build.
+fn register_boot_tests() {
     #[cfg(kernel_tests)]
     akuma_kernel_glue::set_boot_test_hooks(akuma_kernel_glue::BootTestHooks {
         daif_tests: daif_tests::run_all_tests,
@@ -276,6 +249,4 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
         any(not(feature = "no-tests"), feature = "rump-tests"),
     ))]
     akuma_kernel_glue::set_rump_tests_hook(rump_tests::run_all_tests);
-
-    akuma_kernel_glue::kernel_main(dtb_ptr)
 }

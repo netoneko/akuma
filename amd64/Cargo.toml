@@ -1,8 +1,11 @@
 [package]
-name = "akuma-amd64"
+name = "akuma-kernel-amd64"
 version = "0.0.9"
 edition = "2024"
-description = "amd64 (x86_64) boot target: PVH -> long mode -> the arch-neutral crates"
+description = "The amd64 Akuma kernel, as a library: everything but the entry symbols, which akuma-kernel's entry! puts in the bin (amd64/bin, package akuma-amd64)"
+# Exports the linker script's path to the bin (`build.rs`): a dependency's `rustc-link-arg`
+# never reaches a binary that depends on it.
+links = "akuma_kernel_amd64"
 
 [lints]
 workspace = true
@@ -578,14 +581,7 @@ akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features
 # The x86-only syscall bodies both x86 kernels share; so far `kill` (moved from `signal.rs`).
 akuma-syscalls-glue-amd64 = { path = "../crates/akuma-syscalls-glue-amd64" }
 
-# The kernel is a library (the amd64 machine half, named for the `akuma-kernel` kit it is
-# headed for) and a bin that only defines the two entry symbols `boot.s` calls. Same shape as
-# `akuma-tokio-kernel-amd64` + `taoxichuan`; the package and the bin keep their names so every
-# script that builds `-p akuma-amd64` or reads `target/x86_64-unknown-none/*/akuma-amd64` works.
+# The bin is `amd64/bin` (package `akuma-amd64`, which forwards every feature above), so
+# `-p akuma-amd64` and `target/x86_64-unknown-none/*/akuma-amd64` mean what they always meant.
 [lib]
-name = "akuma_kernel_amd64"
 path = "src/lib.rs"
-
-[[bin]]
-name = "akuma-amd64"
-path = "src/main.rs"

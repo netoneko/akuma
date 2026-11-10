@@ -1270,3 +1270,46 @@ identical to the pre-split build. The image file is +10.7 KB (+0.04%, unstripped
 `kmain` and `kmain_mb2` at adjacent addresses. **multiboot2: not run.** The KVM rig is on the
 ryzen's Pop install, which is down (only the ryzen's own Akuma answers), and the trashcan is down.
 The `kmain_mb2` change is the symbol moving to the bin, which wraps `%rdi` in a `PhysAddr` (so the address-parameter ratchet does not count it twice).
+
+## M7b — the `akuma-kernel` front; both kernels enter through `entry!` (2026-11-11)
+
+`crates/akuma-kernel` (`forbid(unsafe_code)`, 60 lines) is the full kernel's front, built the
+same way as `akuma-tokio-kernel`. `entry!` expands to the target's entry symbols, and each one
+calls the machine half that the target selects:
+
+| target | half | `entry!` expands to |
+|---|---|---|
+| `x86_64-unknown-none` | `akuma-kernel-amd64` (`amd64/`) | `kmain` → `kmain`, `kmain_mb2` → `kmain_mb2(PhysAddr)` |
+| `aarch64-unknown-none` | `akuma-kernel-glue` | `rust_start(dtb)` → `start(dtb, before_main)` |
+
+`entry!(f)` takes an optional `before_main` hook. The AArch64 root kernel passes
+`register_boot_tests`, which registers its boot self-tests, because the suite lives in the bin
+crate and glue cannot depend back on it. Its `rust_start` body moved into
+`akuma_kernel_glue::start` unchanged: the print hook, the DTB and x0 lines, then `kernel_main`.
+`src/main.rs` now holds the allocator, the panic handler, the test-suite modules and
+`akuma_kernel::entry!(register_boot_tests);`.
+
+amd64 needed one more package split. The bin cannot use the front while it shares a package
+with the library: `akuma-amd64 → akuma-kernel → akuma-amd64` is a cycle. So:
+
+- `amd64/` is now package **`akuma-kernel-amd64`**, library only. All `amd64/src/...` paths
+  are unchanged. Its `build.rs` exports `linker.ld` as `links` metadata instead of passing
+  `-T` itself.
+- **`amd64/bin/`** is package **`akuma-amd64`**. It holds the 11-line `main.rs`
+  (`akuma_kernel::entry!()`), a `build.rs` that passes the linker script on, and all 22
+  features plus `default`, forwarded by name. So `-p akuma-amd64 [--features ...]`, `amd64/run.sh`,
+  the metal `build.sh`, and every reader of `target/x86_64-unknown-none/*/akuma-amd64` keep
+  working.
+
+**Still two bins.** The research doc's end state is two thin bins over one front (option C).
+Option B, one bin crate for both targets, was rejected there. The AArch64 bin is not thin yet:
+its 35 kL of boot tests are still in `src/`.
+
+**Gates.** Clippy clean: default, devbox-smoltcp, extreme, amd64 (base and
+`ring0-preempt,no-tests`), taoxichuan (both arches), and `akuma-kernel` on the host. Unsafe stays at
+414 and addr at 700. AArch64 boot suite: 314/0, 322/0 and 320/0 at SMP=1, 2 and 4. Devbox at SMP=4:
+the epoll suite has 0 FAIL (1 known DIVERGE) and the futex suite passes every probe; panics=0,
+segv=0. Extreme at 16 MB: `sigspin` 5/5, panics=0; its single SEGV is the same tcc-hello `/tmp/h`
+fault the baseline shows. amd64 under TCG: 829/0 at SMP=1, 839/0 at SMP=2, and 841/0 with
+`ring0-preempt`. `nm` shows `kmain` and `kmain_mb2`, now defined by the macro in the bin, at the
+same addresses as M7a. **multiboot2: not booted** (the ryzen Pop rig and the trashcan are down).

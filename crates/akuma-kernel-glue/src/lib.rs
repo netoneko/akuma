@@ -597,6 +597,38 @@ fn thread_nr_for_alloc_hook() -> u64 {
     if nr == u64::MAX { 511 } else { nr }
 }
 
+/// The body of the `rust_start` symbol `akuma_kernel::entry!` defines: what runs between the
+/// boot assembly and [`kernel_main`].
+///
+/// `before_main` runs after the console hook is installed and before `kernel_main`; the root
+/// kernel registers its boot self-tests there ([`set_boot_test_hooks`]), because the suite lives
+/// in the bin crate and this crate cannot depend back on it.
+#[cfg(target_os = "none")]
+pub fn start(dtb_ptr: usize, before_main: fn()) -> ! {
+    // FIRST statement in the kernel's Rust entry, before any output at all: point
+    // the shared `safe_print!` at the PL011.
+    //
+    // Why here and not in `akuma_exec::init` (which also registers it, from the
+    // same `ExecRuntime::print_str = console::print`): that call is late in
+    // `kernel_main`, and everything before it — DTB scan, memory detection, the MMU
+    // and heap bring-up, the layout assertions — prints. Registering there would
+    // have silently swallowed all of it, because the shared macro discards when
+    // unregistered. `console::print` needs no initialisation (a const MMIO base and
+    // a volatile store), so there is nothing to order this after. `OnceCopy::set`
+    // ignores the later duplicate.
+    akuma_primitives::console::set_print_hook(console::print);
+
+    console::print("DTB ptr from boot (x0 arg): 0x");
+    console::print_hex(dtb_ptr as u64);
+    console::print("\n");
+    console::print("x0 at _boot entry: 0x");
+    console::print_hex(boot::x0_at_entry());
+    console::print("\n");
+
+    before_main();
+    kernel_main(dtb_ptr)
+}
+
 /// Main kernel initialization - all safe code
 #[cfg(target_os = "none")]
 pub fn kernel_main(dtb_ptr: usize) -> ! {

@@ -90,7 +90,7 @@ re-add what they need. `Cargo.toml:361-369`.
 
 ### Crate features the amd64 kernels leave off
 
-Not bin features: each is a crate's own, turned on by the AArch64 kernel's manifests and left off by `akuma-amd64` and
+Not bin features: each is a crate's own, turned on by the AArch64 kernel's manifests and left off by `akuma-amd64` (its library, `akuma-kernel-amd64`) and
 Taoxichuan, which load binaries with their own loaders and reach `akuma-exec` only through `Process::install_image`.
 
 | Feature | Effect | Source |
@@ -115,9 +115,13 @@ sshd-related features.
 
 ### The `akuma-amd64` package
 
-A separate package (`amd64/Cargo.toml`), deliberately outside `default-members`,
-so none of the features above apply to it and none of these apply to the AArch64
-kernel.
+Two packages, both deliberately outside `default-members`, so none of the features
+above apply to them and none of these apply to the AArch64 kernel. The features are
+defined by the kernel library, `akuma-kernel-amd64` (`amd64/Cargo.toml`). The bin,
+`akuma-amd64` (`amd64/bin/Cargo.toml`), is `akuma_kernel::entry!()` and forwards
+every one of them under the same name, so `-p akuma-amd64 --features X` works. A
+feature added to the library needs its forwarding line in the bin; if it is missing,
+cargo reports an error rather than silently ignoring the feature.
 
 | Feature | Effect | Source |
 |---|---|---|

@@ -1,5 +1,5 @@
-//! Two jobs: hand the kernel its linker script, and build the guest programs
-//! the kernel's ELF loader consumes.
+//! Two jobs: export the kernel's linker script to the bin (`amd64/bin`), and
+//! build the guest programs the kernel's ELF loader consumes.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -12,7 +12,7 @@ fn main() {
     build_user_program(&dir, "threadprobe");
     build_user_program(&dir, "killprobe");
     build_user_program(&dir, "sigregs");
-    // Forward the feature set as a cfg, so the bin can gate on it the way the
+    // Forward the feature set as a cfg, so the kernel can gate on it the way the
     // shared crates do. `smp.rs` uses it to refuse a build without `smp-shared`
     // (its BKL is `akuma_bkl`'s, whose entry points are no-ops without the cfg).
     println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
@@ -21,18 +21,18 @@ fn main() {
     }
 }
 
-/// Pass the amd64 linker script to the bin only.
+/// Export the amd64 linker script's path to the bin.
 ///
 /// Deliberately NOT in `.cargo/config.toml`: a `[target.x86_64-unknown-none]`
 /// rustflags entry there would apply to every crate built for that target,
 /// including the per-crate `cargo build -p <crate> --target x86_64-unknown-none`
-/// probes used to measure how much of the tree is arch-neutral. Those build
-/// rlibs, which are archived rather than linked, but a bad `-T` still poisons
-/// the flag set. `rustc-link-arg-bins` is scoped to this package's binary.
+/// probes used to measure how much of the tree is arch-neutral. And a
+/// dependency's `rustc-link-arg` never reaches the binary that depends on it, so
+/// the path travels as `links` metadata: `amd64/bin/build.rs` reads it as
+/// `DEP_AKUMA_KERNEL_AMD64_LINKER_SCRIPT` and passes it with `rustc-link-arg-bins`.
 fn kernel_link_args(dir: &str) {
-    println!("cargo:rustc-link-arg-bins=-T{dir}/linker.ld");
+    println!("cargo:linker_script={dir}/linker.ld");
     println!("cargo:rerun-if-changed=linker.ld");
-    println!("cargo:rerun-if-changed=src/boot.s");
 }
 
 /// Compile and link `userspace/amd64/<name>/<name>.rs` into a static ELF64 the

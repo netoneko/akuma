@@ -1,10 +1,11 @@
 //! The amd64 kernel: everything but its two entry symbols.
 //!
-//! The bin (`main.rs`) defines `kmain` (PVH) and `kmain_mb2` (multiboot2), the symbols
-//! `akuma-boot-amd64`'s `boot.s` jumps to, and calls [`kmain`] / [`kmain_mb2`] here. The
-//! rest of the kernel (the allocator, the panic handler, every subsystem) is this library,
-//! so a front crate can select it by target the way `akuma-tokio-kernel` selects its
-//! machine halves (`docs/archive/AKUMA_ARCH_CONVERGENCE_RESEARCH.md` §4, option C).
+//! The bin (`amd64/bin`, package `akuma-amd64`) is `akuma_kernel::entry!()`, which
+//! defines `kmain` (PVH) and `kmain_mb2` (multiboot2), the symbols `akuma-boot-amd64`'s
+//! `boot.s` jumps to, and calls [`kmain`] / [`kmain_mb2`] here. The rest of the kernel (the
+//! allocator, the panic handler, every subsystem) is this library, which `akuma-kernel`
+//! selects on `x86_64-unknown-none` the way `akuma-tokio-kernel` selects its machine
+//! halves (`docs/archive/AKUMA_ARCH_CONVERGENCE_RESEARCH.md` §4, option C).
 
 #![no_std]
 #![feature(alloc_error_handler)]
@@ -42,7 +43,7 @@ extern crate alloc;
 /// upside.
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!(
-    "akuma-amd64 is an x86_64 target: build it with \
+    "akuma-kernel-amd64 is an x86_64 target: build the kernel with \
      `cargo build -p akuma-amd64 --target x86_64-unknown-none` (or amd64/run.sh)"
 );
 
@@ -162,6 +163,9 @@ mod xhci;
 
 #[cfg(target_arch = "x86_64")]
 pub use multiboot2::kmain_mb2;
+/// For `akuma_kernel::entry!`, which wraps `kmain_mb2`'s raw argument.
+#[doc(hidden)]
+pub use akuma_primitives::addr::PhysAddr;
 
 /// The kernel heap.
 ///
