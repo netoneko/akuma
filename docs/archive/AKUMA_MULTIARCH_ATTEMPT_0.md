@@ -1000,3 +1000,59 @@ Gates on the park build:
 
 - About 150 % idle CPU at SMP=4 on *both* schedulers. Not yet attributed.
 - A waker-driven park in the wait loop, to get µs wakes back at SMP=1 without the burn.
+
+## The hooked scheduler preempts EL1 (2026-11-10)
+
+The hooked path switched only on a tick that interrupted EL0, so kernel threads were cooperative,
+and four workarounds had grown around that. Now the tick preempts EL1 under the SGI path's
+gates, and the workarounds are gone. Gating it found that the hooked switch never published its
+TTBR0 to the free gate's registry, which is now fixed too. Details:
+`docs/archive/HOOKED_EL1_PREEMPTION.md`.
+
+Gates, Lima `fc`. Step 1 is preemption plus the publish fix; step 2 adds the workaround removal.
+
+| | SMP=1 | SMP=2 | SMP=4 |
+|---|---|---|---|
+| boot suite, step 1 | 313/1 | 322/0 | 319/1 |
+| boot suite, step 2 | 313/1 | 322/0 | 319/1 |
+
+The only boot-suite failure in either step is `test_epoll_socket_waker`'s latency threshold,
+8.2–8.5 ms. `pmm_conserved` at SMP=2 passed 8 of 8 after the publish fix; before it, it failed
+1 run in 3.
+
+Both steps also passed these:
+
+- futex suite, all probes, at SMP=2 and 4;
+- sigspin, 5/5 at SMP=2;
+- no panics, BKL-stuck lines or SIGSEGVs;
+- clippy clean on hooked, SGI and amd64.
+
+At SMP=1 the NEON/FP `_across_preemption` tests now really interleave two busy kernel threads,
+with 0 errors.
+
+Idle and wake measurements, step 2. The wake probe is a pipe wake, in µs.
+
+| build | SMP | idle CPU | ssh RTT p50 | wake spin p50 / p99 | wake sleep p50 / p99 |
+|---|---|---|---|---|---|
+| SGI | 1 | 44.0 % | 124 ms | 2883 / 4053 | 399 / 3252 |
+| hooked, park (previous) | 1 | 36.6 % | 60 ms | 1263 / 1767 | 1372 / 1811 |
+| hooked, preemptive | 1 | 42.5 % | 138 ms | 2929 / 3675 | 2953 / 3663 |
+| SGI | 4 | 145.3 % | 67 ms | 173 / 1278 | 231 / 641 |
+| hooked, preemptive | 4 | 175.0 % | 74 ms | 83 / 1234 | 209 / 911 |
+
+Extreme-size, 8 MB, HVF: idle host CPU 0.4–0.5 %.
+
+**Reading.** At SMP=1 hooked now behaves like SGI, including SGI's slow wake: the socket waiter
+`wfi`s until the tick, where the park bounded it at 1 ms. That is the price of one `idle_halt`
+for both paths. The µs wake belongs in the wait loop as a waker-driven park, for both
+schedulers (open item above).
+
+The SMP=4 idle figure is one run each; the open item "~150 % idle at SMP=4 on both schedulers"
+stands.
+
+**Open:**
+
+- amd64 still does not preempt ring 0. The reason `preempt_if_needed` gives, the heap lock, no
+  longer holds: `akuma-alloc` masks interrupts on x86 too.
+- The hooked switch's `x86_*` names and "cooperative-only" comments: rename them when the SGI
+  path goes.

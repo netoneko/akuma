@@ -1486,6 +1486,19 @@ pub fn pending_ttbr_free_stats() -> (usize, usize, usize) {
     })
 }
 
+/// The L0 addresses of up to `out.len()` parked address spaces, for a diagnostic that asks
+/// the gates which core or thread still names each one. Returns how many it wrote.
+pub fn pending_ttbr_free_l0s(out: &mut [u64]) -> usize {
+    with_irqs_disabled(|| {
+        let pending = PENDING_TTBR_FREES.lock();
+        let n = pending.len().min(out.len());
+        for (slot, e) in out.iter_mut().zip(pending.iter()) {
+            *slot = e.l0_frame.addr as u64;
+        }
+        n
+    })
+}
+
 /// Free the frames of a dead address space, or park them if some core's
 /// TTBR0 is still resident on `l0_addr`. The sole exit for page-table frames
 /// from both `UserAddressSpace::drop` branches (owner-immediate and

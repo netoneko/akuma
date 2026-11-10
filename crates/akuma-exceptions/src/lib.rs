@@ -2411,9 +2411,11 @@ pub fn irq_with_sp(current_sp: u64) -> u64 {
 /// released at the end only if this entry took it — after a switch that is the resumed
 /// thread releasing the lock its core holds on its behalf, which is the return to EL0.
 ///
-/// The scheduler SGI preempts only when it interrupted EL0 (`el0` is `Some`): kernel code
-/// switches cooperatively, and an EL1 entry is an interrupt window, where the SGI's only job
-/// was to end a `wfi`.
+/// The scheduler SGI preempts EL0 always and EL1 when
+/// [`akuma_exec::threading::el1_preemptible`] says so (preemption not disabled, `POOL` free,
+/// the thread `RUNNING`), as the SGI path's tick does. A kernel thread that holds the BKL
+/// gives up the core's hold for as long as it is switched out, and takes it again when it
+/// resumes, as on the SGI path.
 ///
 /// An interrupt from EL0 is also a **return to user mode**, and it is the only one a thread
 /// in a pure compute loop ever makes. So, as Linux does on every return to user mode, the
@@ -2446,7 +2448,10 @@ pub fn irq_hooked(el0: Option<FrameHandle>) {
                 (hooks().dispatch_irq)(irq);
             }
             akuma_gic::end_of_interrupt(irq);
-            preempt = from_el0 && irq == akuma_gic::SGI_SCHEDULER;
+            // The tick preempts EL1 code as well as EL0, as the SGI path's does, under the
+            // same gates (`el1_preemptible`): kernel threads need not yield to share a core.
+            preempt = irq == akuma_gic::SGI_SCHEDULER
+                && (from_el0 || akuma_exec::threading::el1_preemptible());
         }
         None => {
             SPURIOUS_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);

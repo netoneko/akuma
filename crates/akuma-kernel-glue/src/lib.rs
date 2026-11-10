@@ -2278,22 +2278,12 @@ fn run_async_main() -> ! {
         // idle loop in smp_shared.rs). A pending RX/timer/SGI IRQ makes WFI return at
         // once, so burst draining is unaffected, while the peer core gets a BKL window
         // every iteration.
-        // `hooked-sched` (M6): nothing preempts a kernel thread on that path, so this loop
-        // hands the core over itself every lap, and halts (lock released) only when nothing
-        // else can run. The wake pass for deadlines runs inside the yield.
-        // Also without `smp-shared` (extreme-size): a bare `yield_now()` loop there never
-        // halts, and with nothing else runnable it spun the only core at 100 %. The BKL
-        // calls are no-ops without `smp-shared`.
-        #[cfg(all(feature = "smoltcp", feature = "hooked-sched"))]
-        {
-            if !threading::x86_runnable_exists() {
-                akuma_exec::bkl::leave_kernel();
-                akuma_cpu::park::wfi();
-                akuma_exec::bkl::enter_kernel();
-            }
-            threading::yield_now();
-        }
-        #[cfg(all(kernel_smp_shared, feature = "smoltcp", not(feature = "hooked-sched")))]
+        // The hooked scheduler takes the same halt without `smp-shared` too (extreme-size):
+        // its `yield_now` returns at once when nothing else can run, so a bare yield loop
+        // spun the only core at 100 %. The BKL calls are no-ops without `smp-shared`. A
+        // READY peer still gets the core: the tick preempts this thread mid-`wfi`, on both
+        // scheduler paths (`docs/archive/HOOKED_EL1_PREEMPTION.md`).
+        #[cfg(all(feature = "smoltcp", any(kernel_smp_shared, feature = "hooked-sched")))]
         {
             akuma_exec::bkl::leave_kernel();
             // IRQs are enabled; the timer/RX/SGI IRQ wakes us and its handler
@@ -2304,12 +2294,13 @@ fn run_async_main() -> ! {
             // the top-of-loop HOLD_TAG_NETPOLL_MAINT call above — negligible, but must
             // be something other than whatever HOLD_TAG_NETPOLL_HERD left behind
             // (BKL_VFS_CARVE_OUT.md §18, §19).
+            #[cfg(kernel_smp_shared)]
             akuma_exec::sync::set_holder_tag(
                 akuma_exec::bkl::current_core_id(),
                 akuma_exec::sync::HOLD_TAG_NETPOLL,
             );
         }
-        #[cfg(not(any(all(kernel_smp_shared, feature = "smoltcp"), all(feature = "smoltcp", feature = "hooked-sched"))))]
+        #[cfg(not(all(feature = "smoltcp", any(kernel_smp_shared, feature = "hooked-sched"))))]
         threading::yield_now();
 
         // In a rump-only / devbox build there is no smoltcp interface to poll

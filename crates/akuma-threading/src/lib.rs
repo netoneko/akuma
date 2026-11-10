@@ -2749,6 +2749,32 @@ pub fn x86_runnable_exists() -> bool {
     })
 }
 
+/// May the scheduler tick switch away from the EL1 code it interrupted? The hooked
+/// path's counterpart of the SGI path's EL1 preemption gates, for
+/// `akuma_exceptions::irq_hooked` to ask before it yields from an interrupt that
+/// landed in the kernel. Interrupts are masked (the caller is an IRQ handler).
+///
+/// - **Preemption not disabled** for the running thread: the same per-thread count
+///   the SGI scheduler reads (`PreemptGuard`, `disable_preemption`).
+/// - **`POOL` is free.** It is a plain spinlock that does not mask interrupts, and the
+///   switch takes it for the CPU-time bill: the interrupted code may be holding it,
+///   and then the switch would spin on this core's own hold. The SGI handler's
+///   `POOL.try_lock` skips the tick for the same reason. A peer's hold skips it too,
+///   which costs one tick.
+/// - **The thread is `RUNNING`.** A thread that has just published `WAITING` or
+///   `TERMINATED` is on its way into its own switch, and taking the core first would
+///   skip what it does in between (`x86_finish_current`'s futex purge, a park's
+///   re-check). It gets there within a few instructions.
+#[cfg(hooked_sched)]
+#[must_use]
+pub fn el1_preemptible() -> bool {
+    if is_preemption_disabled() || POOL.is_locked() {
+        return false;
+    }
+    let cur = (arch().current_slot)();
+    cur < MAX_THREADS && THREAD_STATES[cur].load(Ordering::Acquire) == thread_state::RUNNING
+}
+
 /// The machine effects the x86_64 scheduler cannot perform itself.
 ///
 /// # Why hooks and not code in this crate
@@ -3494,6 +3520,21 @@ pub fn wake_is_due(earliest: Option<u64>, now_us: u64) -> bool {
 /// (`docs/archive/AKUMA_AMD64_BKL_NETWORKING.md` 2026-09-20 night).
 #[cfg(hooked_sched)]
 fn x86_yield_now() -> bool {
+    // AArch64: the scheduler tick preempts EL1 code too ([`el1_preemptible`]), so a
+    // voluntary switch must not be interrupted half-way and re-entered from the tick.
+    // Each thread restores the mask it yielded with when it resumes here; one that
+    // yielded from an interrupt was masked already. amd64 never preempts ring 0.
+    #[cfg(target_arch = "aarch64")]
+    let daif = akuma_primitives::irq::irq_save_mask();
+    let switched = x86_yield_locked();
+    #[cfg(target_arch = "aarch64")]
+    akuma_primitives::irq::irq_restore(daif);
+    switched
+}
+
+/// [`x86_yield_now`] with interrupts already dealt with: the lock, then the switch.
+#[cfg(hooked_sched)]
+fn x86_yield_locked() -> bool {
     #[cfg(feature = "yield-takes-bkl")]
     {
         // The AArch64 root kernel's `akuma_bkl` lets a thread run a stretch of EL1 code with the
@@ -3508,10 +3549,11 @@ fn x86_yield_now() -> bool {
         // A caller that does hold it releases and re-takes it first, so any core queued for
         // the lock gets it before this core switches. A yield already lets other kernel code
         // run between the caller's two halves, so no caller can be relying on the lock across
-        // one; and nothing preempts a kernel thread on this path (the SGI path's tick was
-        // this release), so without it a core whose threads poll by yielding — to each
-        // other, or to nothing — keeps the lock for as long as they poll, and the thread
-        // they are polling for, spinning for the lock on a peer core, never runs. Measured:
+        // one. Without the release, a core whose threads poll by yielding — to each other, or
+        // to nothing — keeps the lock for as long as they poll, and the thread they are
+        // polling for, spinning for the lock on a peer core, never runs: the tick's
+        // preemption of EL1 (`el1_preemptible`) lands in this same function, so it would not
+        // help either. Measured, before the tick preempted EL1:
         // two `blocking_relax` waiters on core 0 switching to each other held the lock for
         // good, `[BKL] stuck` on core 1 (`smp_shared_blocking_wait_peer_progress`, SMP=2).
         // Uncontended it is one release and one acquire of a free ticket lock; the ticket
@@ -4651,39 +4693,8 @@ pub fn yield_now() {
 /// stop a racing timer tick from billing the halt. [`yield_now`] is still the
 /// cooperative give-up-the-CPU primitive; this is the complementary "there is
 /// nothing to do, so genuinely stop" primitive for idle loops.
-/// How long [`idle_halt`] parks a non-idle caller on the hooked path: a floor, not a
-/// period — the caller comes back at the first wake pass past it, at the latest the next
-/// timer tick. 1 ms is the shortest tick the governor runs.
-#[cfg(feature = "yield-takes-bkl")]
-const IDLE_HALT_PARK_US: u64 = 1_000;
-
 #[cfg(target_os = "none")]
 pub fn idle_halt() {
-    // The hooked path (the AArch64 root kernel under `hooked-sched`, which is what sets
-    // `yield-takes-bkl`): a tick never switches a thread out of EL1 there, so the
-    // displacement this function relies on — "keep the halt preemptible and the tick
-    // hands the core to a READY peer" (below) — does not exist. A socket waiter parked
-    // here held the only core for good at SMP=1: httpd's `accept`, while herd's console
-    // drain waited READY behind it. So when anything else can run, switch to it instead
-    // of halting; the caller's wait loop comes back here when it resumes.
-    //
-    // And not by yielding while staying runnable, which is what this did until
-    // 2026-11-10: two threads that both had nothing to do — the async-main loop here
-    // and the netpoll loop — each saw the other runnable and handed the core back and
-    // forth for ever, so no core ever halted and an idle guest burned a whole host CPU
-    // (97–100 %, devbox and extreme alike; `docs/archive/HOOKED_IDLE_CPU_BURN.md`).
-    // Parked, the caller is not runnable: anything that is runs, the idle thread halts
-    // when nothing is, and the first wake pass past the deadline (at the latest the next
-    // tick) brings the caller back — the same "until the next interrupt" an SGI-path
-    // `wfi` gives it. An idle thread never parks; it takes the halt below.
-    #[cfg(feature = "yield-takes-bkl")]
-    {
-        let tid = current_thread_id();
-        if !(tid < MAX_THREADS && IS_IDLE_THREAD[tid].load(Ordering::Relaxed)) {
-            sleep_us(IDLE_HALT_PARK_US);
-            return;
-        }
-    }
     let tid = current_thread_id();
     // Non-idle halters must stay PREEMPTIBLE (SMP=1 freeze fix, 2026-08-25).
     //

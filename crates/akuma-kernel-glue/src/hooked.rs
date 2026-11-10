@@ -135,13 +135,24 @@ fn switch_to(from: usize, to: usize) {
         rec.store(if keep { live } else { 0 }, Relaxed);
     }
     let root = root_for(to);
-    if root & L0_MASK != live & L0_MASK && !akuma_switch::install_ttbr0_flush(root) {
+    if root & L0_MASK == live & L0_MASK {
+        return;
+    }
+    // Publish the transition to the per-core live-root registry the address-space free
+    // gate reads (`mmu::any_core_on_l0`), as the SGI switch and `activate`/`deactivate`
+    // do: PREV covers the outgoing root across the `msr`, ACTIVE the incoming one from
+    // before the hardware can walk it. Unpublished, the registry went on naming whatever
+    // the core last `activate`d — pinning that address space after its process died, and
+    // leaving the root installed here unprotected while it was live.
+    let token = akuma_exec::mmu::publish_l0_begin(root, akuma_exec::bkl::current_core_id() as usize);
+    if !akuma_switch::install_ttbr0_flush(root) {
         safe_print!(96, "[hooked] slot {} has no page-table root to install\n", to);
         akuma_exec::bkl::leave_kernel();
         loop {
             akuma_cpu::park::wfi();
         }
     }
+    akuma_exec::mmu::publish_l0_end(token);
 }
 
 /// The free gate's probe: an off-CPU slot that can still be switched in, carrying the

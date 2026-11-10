@@ -1741,6 +1741,11 @@ fn test_thread_slot_reclaim_on_spawn() {
 
     // Fill the pool. Each thread marks itself terminated immediately, so every slot ends
     // up TERMINATED-but-occupied — the state the old code could not get out of.
+    //
+    // The earliest any spawned thread can have terminated is the start of THIS loop, not
+    // of the yield loop below: thread 0 is preemptible on both scheduler paths, so a tick
+    // during a long fill runs the threads already spawned. That is the cooldown baseline.
+    let run_loop_start = crate::timer::uptime_us();
     let mut spawned = 0usize;
     // Stop on the first refusal, or once we have clearly out-spawned the pool — past that
     // point reclaim-on-demand is simply recycling as fast as we can ask, which is the
@@ -1758,10 +1763,7 @@ fn test_thread_slot_reclaim_on_spawn() {
     {
         spawned += 1;
     }
-    // Let every spawned thread run far enough to mark itself terminated. No
-    // spawned thread's own termination timestamp can be earlier than this loop's
-    // start, so that's the earliest possible cooldown baseline for the check below.
-    let run_loop_start = crate::timer::uptime_us();
+    // Let every spawned thread run far enough to mark itself terminated.
     for _ in 0..64 {
         akuma_exec::threading::yield_now();
     }
@@ -7131,6 +7133,11 @@ fn test_pmm_conserved_across_spawn_exit_reap() {
             akuma_exec::threading::yield_now();
         }
         akuma_exec::process::table::reclaim_retired_processes_force();
+        // And the address-space free that waits for no core and no switched-out thread
+        // to name the dead L0: the idle loops and `netpoll_maint` drain it on their own
+        // schedule, so whether this cycle's free has landed by the time the test counts
+        // depends on who ran last — drive it, as the reap above is driven.
+        akuma_exec::mmu::drain_pending_ttbr_frees();
         true
     }
 
@@ -7166,6 +7173,7 @@ fn test_pmm_conserved_across_spawn_exit_reap() {
         // Same as the clean path: retire alone frees nothing, so drive the
         // deferred `Process` drop that actually releases the address space.
         akuma_exec::process::table::reclaim_retired_processes_force();
+        akuma_exec::mmu::drain_pending_ttbr_frees();
         true
     }
 
@@ -7182,24 +7190,36 @@ fn test_pmm_conserved_across_spawn_exit_reap() {
     const CYCLES: usize = 4;
     const SLOP: usize = 4; // one-off async reclaim jitter, in pages
 
-    fn run_phase(baseline: usize, cycle: fn() -> bool) -> (usize, usize) {
+    // `per` records the free count after each cycle, so a failure says whether the pages
+    // went in one step (something else allocated in the window) or a few each cycle (a leak).
+    fn run_phase(baseline: usize, cycle: fn() -> bool, per: &mut [usize; CYCLES]) -> (usize, usize) {
         let mut last = baseline;
         let mut completed = 0usize;
-        for _ in 0..CYCLES {
+        for slot in per.iter_mut() {
             if !cycle() {
                 break;
             }
             crate::allocator::reclaim_to_pmm();
             last = crate::pmm::free_count();
+            *slot = last;
             completed += 1;
         }
         (last, completed)
     }
 
+    let mut clean_per = [0usize; CYCLES];
+    let mut kill_per = [0usize; CYCLES];
+    fn stack_pages() -> usize {
+        (0..akuma_exec::threading::MAX_THREADS)
+            .filter_map(akuma_exec::threading::slot_stack_bounds)
+            .map(|(_, size)| size / 4096)
+            .sum()
+    }
+    let stacks0 = stack_pages();
     let baseline = crate::pmm::free_count();
     let span0 = crate::allocator::claimed_span_report();
-    let (clean_last, clean_n) = run_phase(baseline, spawn_exit_reap_cycle);
-    let (kill_last, kill_n) = run_phase(clean_last, spawn_kill_reap_cycle);
+    let (clean_last, clean_n) = run_phase(baseline, spawn_exit_reap_cycle, &mut clean_per);
+    let (kill_last, kill_n) = run_phase(clean_last, spawn_kill_reap_cycle, &mut kill_per);
     let span1 = crate::allocator::claimed_span_report();
 
     if clean_n == 0 || kill_n == 0 {
@@ -7222,6 +7242,22 @@ fn test_pmm_conserved_across_spawn_exit_reap() {
             "[Test] pmm_conserved_across_spawn_exit_reap FAILED: clean leaked {}p over {}x, kill leaked {}p over {}x ({} KB total); pinned spans {}->{} (+{}p heap-stuck)\n",
             clean_leak, clean_n, kill_leak, kill_n, (clean_leak + kill_leak) * 4,
             span0.pinned_spans, span1.pinned_spans, pinned_delta);
+        crate::safe_print!(240,
+            "[Test] pmm_conserved_across_spawn_exit_reap   free: baseline={} clean={:?} kill={:?}; heap committed {}p -> {}p; slot stacks {}p -> {}p\n",
+            baseline, clean_per, kill_per, span0.committed_pages, span1.committed_pages, stacks0, stack_pages());
+        let (pend, pend_uf, pend_pt) = akuma_exec::mmu::pending_ttbr_free_stats();
+        crate::safe_print!(160,
+            "[Test] pmm_conserved_across_spawn_exit_reap   pending ttbr frees: {} ({} user + {} table frames); retired pages {}\n",
+            pend, pend_uf, pend_pt, akuma_exec::process::reclaim::retired_pages_pending());
+        let mut l0s = [0u64; 4];
+        let n = akuma_exec::mmu::pending_ttbr_free_l0s(&mut l0s);
+        for &l0 in &l0s[..n] {
+            let on_core = akuma_exec::mmu::any_core_on_l0(l0 as usize);
+            let saved = akuma_exec::threading::any_saved_ctx_on_l0(l0);
+            crate::safe_print!(160,
+                "[Test] pmm_conserved_across_spawn_exit_reap   l0={:#x} on_core={:?} saved_by={:?} (thread0={})\n",
+                l0, on_core, saved, akuma_exec::threading::current_thread_id());
+        }
     }
 }
 

@@ -391,9 +391,9 @@ pub fn run_threading_tests() -> bool {
     // `yield_now()` call. That holds on the SGI path, whose yield is a self-SGI through the IRQ
     // entry that saves the whole vector file; the hooked path's yield is an ordinary call, which
     // preserves what AAPCS64 says a call preserves (d8-d15) and no more. User threads are not
-    // affected: their FP state is in the EL0 trap frame. Under `hooked-sched` the
-    // `_across_preemption` tests still run but pass vacuously - kernel threads are not preempted
-    // on that path (docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md, W3).
+    // affected: their FP state is in the EL0 trap frame. The `_across_preemption` tests run on
+    // both paths: the tick preempts kernel threads on each, through an IRQ entry that saves the
+    // whole vector file (`docs/archive/HOOKED_EL1_PREEMPTION.md`).
     #[cfg(not(feature = "hooked-sched"))]
     run_test!(test_neon_regs_across_yield, "neon_regs_across_yield");
     #[cfg(feature = "hooked-sched")]
