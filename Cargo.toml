@@ -345,6 +345,9 @@ rump-tests = ["akuma-kernel-glue/rump-tests"]
 # passing) and a same-binary `bkl-profile` A/B on the contention regimen
 # (`irq/sched` 24.7% → 10.2%, 6/6 digests exact both sides). Remove from this
 # list to A/B.
+# M6: the hooked cooperative scheduler (the path amd64 and the tokio kernels run) instead of the SGI one.
+# Default OFF and not in any profile; the AArch64 default build must stay byte-identical without it.
+hooked-sched = ["akuma-exec/hooked-sched"]
 smp-shared = ["akuma-exec/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-exceptions/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq", "akuma-syscalls-glue/smp-shared", "akuma-kernel-core/smp-shared", "akuma-kernel-glue/smp-shared"]
 
 # Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the

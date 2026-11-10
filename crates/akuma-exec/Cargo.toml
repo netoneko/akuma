@@ -23,6 +23,9 @@ elf-loader = ["dep:akuma-elf", "dep:embedded-io-async"]
 # (build_extreme_size.sh). Lets this crate's build.rs emit
 # `cfg(kernel_profile_extreme)` so threading can trim the warm-stack floor and
 # right-size kernel stacks for the extreme low-memory target. NOT a syscall gate.
+# M6 (multiarch attempt 0): compile the hooked cooperative scheduler path instead of the AArch64 SGI one.
+# Default off; see docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md § M6.
+hooked-sched = ["akuma-threading/hooked"]
 extreme = ["akuma-primitives/extreme", "akuma-elf?/extreme", "akuma-threading/extreme", "akuma-el0-entry/extreme"]
 
 # Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared` feature.

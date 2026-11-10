@@ -177,20 +177,57 @@ at the call site.
   flake of the thread probe, **not** reproduced in 4/4 runs of the identical binary and not
   correlated with this change (it predates it). Worth its own look; not investigated here.
 
-## M6 — scoping only (not started; D3 decided)
+## M6 — the feature exists, default off; the machine half does not (2026-11-10)
 
-- The root kernel has **no `hooked` feature reference** (`git grep hooked -- src Cargo.toml build.rs`
-  finds only an unrelated comment). `akuma-switch` defines `hooked = []`; `akuma-threading` selects
-  `hooked_sched` vs `sgi_sched` by cfg from `build.rs`; only `akuma-tokio-kernel-aarch64` turns it on.
-  So M6 is: a root `hooked-sched` feature forwarding `akuma-threading/hooked` + `akuma-switch/hooked`,
-  the AArch64 `ArchHooks` registration (the tokio kernel's `sched.rs`, 274 L, is the model), default
-  **off**, with the Lima AArch64 gate proving the default build's suite output is unchanged and a second
-  Lima run with the feature on. Not attempted in this window: it changes the context-switch path of the
-  production kernel and needs more than the 2 h left to gate responsibly (SMP=1/2/4 on KVM, plus the
-  `epoll`/`futex` suites that are scheduler-sensitive).
-- Housekeeping done: scratch baseline worktree removed. `docs/reference/crate-safety.md` count
-  (79 vs 80 of 108/109) left for `scripts/cloc_akuma.py` regeneration by the owner, per CLAUDE.md
-  ("never increment by hand").
+**Done.** `hooked-sched` (root) -> `akuma-exec/hooked-sched` -> `akuma-threading/hooked` ->
+`akuma-switch/hooked`; in no profile, not in `default`. **Gate: the AArch64 default build is
+byte-identical** with and without the plumbing (`cmp` of the release ELF built from the stashed vs the
+edited tree: identical; the guard in `src/main.rs` is `if cfg!(feature = "hooked-sched")`, const-folded).
+With the feature **on**, the whole kernel compiles and clippy is clean (the `hooked_sched` cfg is
+confirmed active in `akuma-threading`'s build-script output), and `rust_start` prints
+`hooked-sched: the AArch64 full kernel has no machine half ... halting` and parks, instead of panicking
+at the first timer tick.
+
+**Why it stops there — measured, not assumed.** `akuma_threading::sgi_scheduler_handler_with_sp` is
+`#[cfg(sgi_sched)]`; under the hooked path it is a stub that panics, and
+`akuma-exceptions/src/lib.rs:2319` and `:2364` call it from the root kernel's IRQ front end. The root
+kernel *is* the SGI design: preemption is a handler that returns a different SP to assembly, with
+per-thread saved contexts (`akuma-switch`) and `TTBR0` in them. The hooked path is the opposite shape:
+cooperative switches (`x86_yield`/`x86_pick_next`) with the machine's effects supplied through
+`X86ArchHooks`, an EL0 trap frame at the top of each thread's own kernel stack, and an idle thread per
+core that runs the picker. `akuma-tokio-kernel-aarch64` has that machine half (`sched.rs` 274 L,
+`trap.rs` 195 L, `smp.rs` 202 L, built on `akuma-vectors-aarch64`), but it sits under a different trap
+front end than `akuma-exceptions`.
+
+So "flip the feature" needs, in order — none of it is a flag:
+1. **A second IRQ/EL0-trap front end in `akuma-exceptions`** (or reuse `akuma-vectors-aarch64`) that
+   saves the EL0 frame on the thread's own kernel stack and calls `x86_yield` from the tick, selected
+   by the feature. This is where the risk is; the SGI front end has ~10 documented SMP races fixed in it.
+2. **The AArch64 `X86ArchHooks`/`ThreadRuntime`/`ProcessHooks` registration** for the root kernel
+   (`switch_to` = `TTBR0` via `akuma_boot_aarch64::user::switch_to`, `prepare_task_slot` = kernel stack,
+   `transfer_lock_depth` = the BKL depth) — the tokio kernel's `hooks()` is the template.
+3. **Boot ordering**: `kernel_glue::kernel_main` calls `threading::init()` (`:1138`) and brings
+   secondaries up around it; under the hooked path core idle threads are seeded instead.
+4. **The self-test suite**: tests that read SGI-path state (`get_saved_kernel_resume`,
+   `any_saved_ctx_on_l0`, `update_thread_context`) have no hooked meaning and need cfg arms.
+5. Gate per the research doc: boot suite byte-identical off (done), devbox boots on, SMP 1/2/4 probes
+   on Lima/KVM.
+
+Recommendation: do it as the **A5/A7 tail of B21** (the tokio kit's aarch64 half), where the front end
+already exists, and let the root kernel adopt the *kit's* trap front end rather than grow a second one —
+that is D4's sequencing question, still open.
+
+## M7 — not started, on purpose
+
+The research doc's own rule (§4): *"Do not start by creating the kit crate ... the kit front
+(`entry!` + cfg re-export) is ~50 lines and can arrive last, when the amd64 bin is thin."* The bin is not
+thin: `amd64/src` is 53 kL, `usermode.rs` alone 9.3 kL (1,346 L `syscall_dispatch`, 2,661 L of boot
+self-tests), and amd64 still consumes neither `akuma-kernel-core` nor `akuma-kernel-glue`. A front crate
+now would re-export two kernels that share a name and nothing else — the "thin witness" the doc warns
+about. Preconditions, in order: (a) amd64 on `kernel-core`'s neutral spine (console rules, config,
+timer policy, irq table), with `MachineFacts` as the input; (b) the boot self-tests moved out of
+`usermode.rs` into a tests crate; (c) M6 done; (d) the dispatcher split by family. M7 is then a
+rename/hoist.
 
 ## M2 tail, and the thread-probe flake (2026-11-10, afternoon)
 
