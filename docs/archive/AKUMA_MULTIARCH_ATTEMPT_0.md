@@ -46,4 +46,13 @@ therefore a sequence of small convergences of those, not a rewrite.
   behind a feature, with **extensive testing** required before `sock.rs`'s local state machine is
   deleted: host differential tests old-vs-new first (the `sockaddr_in` slice-4 precedent), then
   an AF_UNIX probe under TCG, and sshd/herd paths that use unix sockets. Unblocks **M5**.
-- **D3 (AArch64 onto the hooked scheduler), D4, D5:** still open. D3 blocks M6.
+- **D3 — scheduler:** **AArch64 adopts the hooked scheduler** (`akuma-threading`'s hooked path),
+  behind a feature first. *Correction to the stated reason:* both paths live in one crate and share
+  the same ~31 host tests (slot/wake/park state machine); the SGI handler and the hooked switch
+  bodies are `target_os = "none"` code and neither is host-tested. The real argument for the hooked
+  path is one scheduler shape across both kernels (and the `X86ArchHooks`/`Platform` seam), not
+  better test coverage. It is a behaviour change, so M6 keeps the
+  research doc's gate: the AArch64 boot suite must be byte-identical with the feature off, and
+  feature-on needs its own run (QEMU HVF/TCG here; SMP probes). The SGI path stays until then.
+  Unblocks **M6**.
+- **D4, D5:** still open; neither blocks M1/M2.
