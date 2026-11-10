@@ -3532,6 +3532,15 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             parent_path
         };
         let parent_inode = self.lookup_path_internal(state, parent_path)?;
+        // `lookup_path_internal` proves every component it walks *through* is a
+        // directory, but never the last one: for `f/x` with `f` a regular file it
+        // returns `f` happily. Every caller then writes a directory entry into the
+        // parent, so a file parent was silently turned into a (corrupt) directory
+        // (`docs/archive/MKDIR_UNDER_REGULAR_FILE.md`). Linux answers ENOTDIR.
+        let parent = self.read_inode(state, parent_inode)?;
+        if (parent.type_perms & 0xF000) != S_IFDIR {
+            return Err(FsError::NotADirectory);
+        }
         Ok((parent_inode, name.to_string()))
     }
 

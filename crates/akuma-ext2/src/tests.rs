@@ -2,7 +2,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use crate::BlockDevice;
 use crate::Ext2Filesystem;
-use akuma_vfs::Filesystem;
+use akuma_vfs::{Filesystem, FsError};
 
 /// In-memory block device backed by a `Vec<u8>`.
 pub struct MemBlockDevice {
@@ -219,6 +219,20 @@ fn create_dir_is_findable() {
     assert!(fs.exists("/findme"), "created dir should be findable via lookup");
     let m = fs.metadata("/findme").unwrap();
     assert!(m.is_dir, "created entry should be a directory");
+}
+
+/// A regular file is not a directory: creating anything *under* it is ENOTDIR and
+/// must leave the file untouched. `lookup_parent` used to return the file's inode, so
+/// `mkdir f/x` wrote a dirent into its data block and bumped its link count.
+#[test]
+fn creating_under_a_regular_file_is_not_a_directory() {
+    let fs = mount_empty();
+    fs.write_file("/f", b"x\n").unwrap();
+    assert_eq!(fs.create_dir("/f/x"), Err(FsError::NotADirectory));
+    assert_eq!(fs.write_file("/f/w", b"hi"), Err(FsError::NotADirectory));
+    let m = fs.metadata("/f").unwrap();
+    assert_eq!((m.size, m.is_dir), (2, false), "the file must be unchanged");
+    assert_eq!(fs.read_file("/f").unwrap(), b"x\n");
 }
 
 /// The type bytes `fs` stored for `names` in directory `dir`.

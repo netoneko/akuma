@@ -58,6 +58,15 @@ If there is no `strace`, a Node one-liner reproduces the tool's call:
 Start a Claude Code session on the box; any Bash tool call, for example `git status`, runs and
 returns output instead of the `EIO` above.
 
+### Update 2026-11-10 (Bun probe on the trashcan, c523598a)
+
+Bun's `fs.mkdirSync(.., {recursive:true, mode:0o700})` (twice over the same path), plain `mkdirSync`,
+`EEXIST` and `fs.promises.mkdir` recursive all behave; the `EIO` did **not** reproduce, so suspect 1
+and 2 look unlikely on a clean path. The probe did find a real, separate bug while testing a file in
+the path: `mkdir f/x` with `f` a regular file succeeded and corrupted `f` — fixed, see
+[`MKDIR_UNDER_REGULAR_FILE.md`](MKDIR_UNDER_REGULAR_FILE.md). Suspect 3 (a non-directory on the path)
+is still the one to check first: run `ls -ld` on each component of the failing path.
+
 ## Not yet written up
 
 Nothing else recorded. Add further Claude Code problems as numbered sections here, and link the
