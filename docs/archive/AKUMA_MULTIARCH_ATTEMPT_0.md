@@ -94,6 +94,26 @@ The multiboot2 side of M1a–M1c is therefore boot-verified under KVM (not on th
   payoff and the next step, one consumer at a time. The AArch64 compile-time map
   (`platform::{qemu_virt, firecracker}`) does not yet produce `Facts` either.
 
+### The AArch64 gate (Lima, 2026-11-10)
+
+`limactl start fc` (nested virt, `/dev/kvm`), then `limactl shell fc env SMP=N DISK=<abs path>
+MEMORY=512M [KERNEL=<abs path>] sh scripts/lima_aarch64_run.sh` — **`limactl shell` does not forward
+the caller's environment**, so variables go through `env` inside the guest, and the disk is mounted
+`snapshot=on` (the Mac's `disk.img` is never written). `timeout` kills the shell but not QEMU in the
+guest: stop it with `limactl shell fc pkill -f 'hostfwd=tcp::2622-:22'` (instance 4's forward) before
+the next run, or its ports collide. Baseline = a scratch worktree of `0b78d0cb` built to its own
+target dir and copied under the repo (Lima mounts `$HOME`, not `/private/tmp`).
+
+| kernel | SMP | `PASSED` | `FAILED` | note |
+|---|---|---:|---:|---|
+| baseline `0b78d0cb` (5,058,360 B) | 1 | 310 | 0 | |
+| M2 candidate (5,063,608 B, +5,248) | 1 | 310 | 0 | prints `[Platform] facts: fdt, 512 MiB in 1 region(s), cpus 1, virtio 8, irq gicv3  [ok]` |
+| baseline | 2 | 320 | 0 | |
+| candidate | 2 | 320 | 0, 0, **1** | 1 of 3 runs: `test_epoll_socket_waker FAILED: latency too high (8292us)` — a latency threshold, not seen in the other two candidate runs; the same 320 pass |
+
+The diff of test results at SMP=1 is timings and page counts only. The earlier Mac HVF run is not a
+gate (HVF asserts mid-suite, `QEMU_HVF_ISV_BUG.md`).
+
 ## Decisions (owner, 2026-11-10)
 
 - **D1 — rump:** a universal, **optional** `rump` feature on the shared spine, not bin-local. Its
