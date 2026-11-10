@@ -1520,6 +1520,8 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     t.check("dispatch: capget 125 -> 90", hop(Syscall::Capget, 125, nr::CAPGET));
     t.check("dispatch: capset 126 -> 91", hop(Syscall::Capset, 126, nr::CAPSET));
     t.check("dispatch: fallocate 285 -> 47", hop(Syscall::Fallocate, 285, nr::FALLOCATE));
+    t.check("dispatch: faccessat2 439 -> 439", hop(Syscall::Faccessat2, 439, nr::FACCESSAT2));
+    t.check("dispatch: close_range 436 -> 436", hop(Syscall::CloseRange, 436, nr::CLOSE_RANGE));
 
     let d = |nr_x86: u64| syscall_dispatch(nr_x86, 0, 0, 0, 0, 0, 0);
     t.check_eq("dispatch: glue answers getuid 0", d(102), 0);

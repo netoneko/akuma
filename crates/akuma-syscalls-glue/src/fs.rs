@@ -223,6 +223,41 @@ pub(super) fn dirfd_base(dirfd: i32, raw_path: &str) -> Result<Option<String>, u
     }
 }
 
+/// `/proc/self/fd/N/<rest>` (or `/proc/<own pid>/fd/N/<rest>`) rewritten to
+/// `<path of fd N>/<rest>`; `None` when `path` is not of that shape or fd `N`
+/// is not an open file/directory.
+///
+/// On Linux `/proc/self/fd/N` is a *magic link*: the walk continues from the
+/// object fd `N` names, so `mkdir("/proc/self/fd/11/-root")` creates `-root`
+/// inside the directory open as fd 11. Bun's recursive `mkdir` is built on
+/// exactly that. Here the path fell through to procfs, which cannot create
+/// entries and answered `EIO` — Claude Code's Bash tool died on
+/// `EIO: i/o error, mkdir '/tmp/claude-0/-root'` before running anything
+/// (`docs/archive/PROC_SELF_FD_PATH_PREFIX.md`). A bare `/proc/self/fd/N` (no
+/// trailing component) is not rewritten: `openat` reopens those itself.
+fn expand_own_proc_fd_prefix(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (who, tail) = rest.split_once("/fd/")?;
+    if who != "self" {
+        let pid: u32 = who.parse().ok()?;
+        if akuma_exec::process::read_current_pid() != Some(pid) {
+            return None;
+        }
+    }
+    let (n, sub) = tail.split_once('/')?;
+    let n: u32 = n.parse().ok()?;
+    let proc = akuma_exec::process::current_process_shared()?;
+    match proc.get_fd(n) {
+        Some(akuma_exec::process::FileDescriptor::File(f)) => {
+            let mut out = String::from(f.path.trim_end_matches('/'));
+            out.push('/');
+            out.push_str(sub);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// `raw_path` resolved against `dirfd` — [`dirfd_base`] plus the join.
 ///
 /// An absolute path is canonicalized (`.`/`..` folded), which is what the old
@@ -236,6 +271,9 @@ pub(super) fn dirfd_base(dirfd: i32, raw_path: &str) -> Result<Option<String>, u
 /// second `AT_FDCWD` ladder in another kernel is exactly the drift this
 /// function was written to end.
 pub fn resolve_path_at(dirfd: i32, raw_path: &str) -> Result<String, u64> {
+    if let Some(expanded) = expand_own_proc_fd_prefix(raw_path) {
+        return Ok(akuma_vfs_glue::canonicalize_path(&expanded));
+    }
     let Some(base) = dirfd_base(dirfd, raw_path)? else {
         return Ok(akuma_vfs_glue::canonicalize_path(raw_path));
     };
@@ -3357,6 +3395,7 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
 
 pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
     let raw_path = copy_from_user_str(path_ptr, 512)?;
+    let raw_path = expand_own_proc_fd_prefix(&raw_path).unwrap_or(raw_path);
 
     // Build the dirfd-relative base path (fd-table lookup only, no disk I/O) before
     // entering the VFS BKL window — mirrors sys_unlinkat/sys_renameat: early-return
@@ -3399,6 +3438,7 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
 
 pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> SysResult {
     let path = copy_from_user_str(path_ptr, 512)?;
+    let path = expand_own_proc_fd_prefix(&path).unwrap_or(path);
 
     // Build the dirfd-relative base path (fd-table lookups only, no disk I/O) before
     // entering the VFS BKL window — matches sys_statx/sys_newfstatat: the early-return

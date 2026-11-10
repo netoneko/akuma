@@ -105,9 +105,73 @@ struct Framebuffer {
     height: usize,
     format: PixelFormat,
     bytes_per_pixel: usize,
+    /// The RAM copy every draw lands in once [`Framebuffer::enable_back`] has run;
+    /// `None` until the heap exists (and for a mode it cannot mirror), in which
+    /// case draws go straight to the scanout as they always did.
+    back: Option<Back>,
+}
+
+/// A cached full-screen copy of the pixels plus, per row, the span (in pixels,
+/// half-open) that changed since the last [`Framebuffer::flush`].
+///
+/// **Why it exists** (`docs/archive/FBCON_DOUBLE_BUFFER.md`): the scanout is
+/// write-combining device memory that the panel reads while it is being written, so
+/// a program that erases and rewrites lines (Claude Code's TUI, a spinner) showed
+/// every intermediate state as flicker. Drawing here is cheap RAM stores; the
+/// panel only sees a finished picture, copied in one pass per flush, and a program
+/// that asks for it (`CSI ? 2026 h`) controls when that pass happens.
+struct Back {
+    pix: alloc::vec::Vec<u32>,
+    /// Dwords per row (`pitch / 4`).
+    stride: usize,
+    /// First changed pixel of each row (`u32::MAX` = clean) and one past the last.
+    dlo: alloc::vec::Vec<u32>,
+    dhi: alloc::vec::Vec<u32>,
+}
+
+impl Back {
+    #[inline]
+    fn mark(&mut self, y: usize, x0: usize, x1: usize) {
+        // x1 <= width < 2^32 and y < height: both checked by the callers.
+        if (x0 as u32) < self.dlo[y] {
+            self.dlo[y] = x0 as u32;
+        }
+        if (x1 as u32) > self.dhi[y] {
+            self.dhi[y] = x1 as u32;
+        }
+    }
 }
 
 impl Framebuffer {
+    /// Start mirroring draws in RAM. Needs the heap, so it is not part of
+    /// [`Framebuffer::new`]; fallible allocation, and `false` (direct drawing keeps
+    /// working) when it fails or the mode is not 32 bits per pixel on a dword pitch.
+    /// The caller repaints afterwards, since what is on the glass is not in the copy.
+    fn enable_back(&mut self) -> bool {
+        if self.back.is_some() {
+            return true;
+        }
+        if self.bytes_per_pixel != 4 || self.pitch % 4 != 0 {
+            return false;
+        }
+        let stride = self.pitch / 4;
+        let Some(len) = stride.checked_mul(self.height) else { return false };
+        let mut pix = alloc::vec::Vec::new();
+        let mut dlo = alloc::vec::Vec::new();
+        let mut dhi = alloc::vec::Vec::new();
+        if pix.try_reserve_exact(len).is_err()
+            || dlo.try_reserve_exact(self.height).is_err()
+            || dhi.try_reserve_exact(self.height).is_err()
+        {
+            return false;
+        }
+        pix.resize(len, 0u32);
+        dlo.resize(self.height, u32::MAX);
+        dhi.resize(self.height, 0u32);
+        self.back = Some(Back { pix, stride, dlo, dhi });
+        true
+    }
+
     fn new(fb: &akuma_multiboot2::Framebuffer) -> Option<Self> {
         let size = fb.size_bytes();
         // Refuse rather than fault: a framebuffer above what boot.s maps cannot
@@ -137,6 +201,7 @@ impl Framebuffer {
             height: fb.height as usize,
             format,
             bytes_per_pixel: format.bytes_per_pixel(),
+            back: None,
         })
     }
 }
@@ -174,6 +239,14 @@ impl Surface for Framebuffer {
         }
         let px = self.format.encode(color);
         let n = x1 - x;
+        if let Some(b) = self.back.as_mut() {
+            for row in y..y1 {
+                let at = row * b.stride + x;
+                b.pix[at..at + n].fill(px);
+                b.mark(row, x, x1);
+            }
+            return;
+        }
         for row in y..y1 {
             // x < x1 <= width and row < y1 <= height, so the span lies inside
             // `pitch * height` bytes; the window refuses it otherwise.
@@ -196,6 +269,11 @@ impl Surface for Framebuffer {
             return;
         }
         let px = self.format.encode(color);
+        if let Some(b) = self.back.as_mut() {
+            b.pix[y * b.stride + x] = px;
+            b.mark(y, x, x + 1);
+            return;
+        }
         let offset = y * self.pitch + x * self.bytes_per_pixel;
 
         // `offset` is inside `pitch * height` because x and y were bounds-checked
@@ -227,8 +305,25 @@ impl Framebuffer {
     ///
     /// `sfence` orders and flushes WC stores; ordinary stores and `lock`ed
     /// instructions do not reliably do it. Cheap when nothing is pending.
-    #[allow(clippy::unused_self)] // a method so call sites say which surface they drained
-    fn flush(&self) {
+    ///
+    /// With a back buffer this is the **present**: every row's changed span is
+    /// copied to the scanout (one `rep movsd` each) and marked clean, then the WC
+    /// buffers are drained. A flush with nothing changed is a scan of the dirty
+    /// arrays and the `sfence`.
+    fn flush(&mut self) {
+        if let Some(b) = self.back.as_mut() {
+            for y in 0..self.height {
+                let (lo, hi) = (b.dlo[y] as usize, b.dhi[y] as usize);
+                if lo >= hi {
+                    continue;
+                }
+                let at = y * b.stride;
+                // In range by construction: marked spans lie inside the row.
+                let _ = self.win.copy32_from(y * self.pitch + lo * 4, &b.pix[at + lo..at + hi]);
+                b.dlo[y] = u32::MAX;
+                b.dhi[y] = 0;
+            }
+        }
         // `sfence` on this target.
         akuma_cpu::barrier::dsb_ishst();
     }
@@ -399,6 +494,7 @@ pub fn fb_set_dim(pct: u8) {
 /// The crash path's unmute: no lock, no repaint — the fatal dump that follows
 /// draws over whatever the program left, which is the point.
 pub fn fb_force_unmute() {
+    CRASHED.store(true, core::sync::atomic::Ordering::Release);
     FB_MUTED.store(false, core::sync::atomic::Ordering::Release);
 }
 
@@ -418,6 +514,32 @@ static CONSOLE: Spinlock<Option<FbConsole>> = Spinlock::new(None);
 /// length), so it is `Send` without a promise.
 struct FbConsole(Console<Framebuffer>);
 
+/// A frame is open: the last byte seen left `CSI ? 2026` set. [`mirror_byte`] only.
+static SYNC_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// When the open frame began (`net::uptime_us`), so a program that never sends the
+/// closing `l` cannot freeze the screen: [`cursor_idle`] presents after
+/// [`SYNC_TIMEOUT_US`] whatever the mode says.
+static SYNC_SINCE_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const SYNC_TIMEOUT_US: u64 = 150_000;
+/// The crash path ran: present after every byte.
+static CRASHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Mirror every console draw in RAM and present it in one pass per flush (see
+/// [`Back`]). Call once the heap exists; a no-op without a console, and a failed
+/// allocation leaves the direct-drawing console exactly as it was. Returns whether
+/// the back buffer is on, for the `[fb]` line.
+pub fn fb_enable_double_buffer() -> bool {
+    let mut g = CONSOLE.lock();
+    let Some(c) = g.as_mut() else { return false };
+    if !c.0.surface_mut().enable_back() {
+        return false;
+    }
+    // What is on the glass is not in the copy: redraw it all from the grid.
+    c.0.repaint();
+    c.0.surface_mut().flush();
+    true
+}
+
 /// Write one byte to the framebuffer console, if it exists.
 ///
 /// Called from `serial::putb`, which is what makes this the console for
@@ -427,9 +549,22 @@ pub fn mirror_byte(byte: u8) {
     if let Some(c) = CONSOLE.lock().as_mut() {
         let t0 = crate::polltime::tsc();
         c.0.write_byte(byte);
+        // `CSI ? 2026 h .. l`: the program is mid-frame. Draws still land (in the
+        // back buffer), but nothing is presented until the frame ends — an
+        // atomic repaint instead of a visible erase-and-rewrite.
+        let syncing = c.0.sync_update();
+        let was_syncing = SYNC_ACTIVE.swap(syncing, core::sync::atomic::Ordering::Relaxed);
+        if syncing && !was_syncing {
+            SYNC_SINCE_US.store(crate::net::uptime_us(), core::sync::atomic::Ordering::Relaxed);
+        }
+        if was_syncing && !syncing {
+            c.0.surface_mut().flush();
+        }
         // Per line, not per byte: a drain waits for the device. A trailing partial
-        // line is flushed by `cursor_idle` when output goes quiet.
-        if byte == b'\n' {
+        // line is flushed by `cursor_idle` when output goes quiet. After a crash
+        // (`fb_force_unmute`) every byte is presented: the dump may be the last
+        // thing this machine ever draws, and nothing will call `cursor_idle`.
+        if !syncing && (byte == b'\n' || CRASHED.load(core::sync::atomic::Ordering::Relaxed)) {
             c.0.surface_mut().flush();
         }
         BURST_CYCLES.fetch_add(crate::polltime::tsc().wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
@@ -468,6 +603,14 @@ pub fn cursor_idle() -> Option<(u16, u16)> {
     let geometry = {
         let mut g = CONSOLE.try_lock()?;
         let c = &mut g.as_mut()?.0;
+        // Mid-frame (`CSI ? 2026 h`): a quiet lap between two writes of one frame is
+        // not the end of it. Wait for the program's `l`, up to the timeout.
+        if c.sync_update()
+            && crate::net::uptime_us().saturating_sub(SYNC_SINCE_US.load(core::sync::atomic::Ordering::Relaxed))
+                < SYNC_TIMEOUT_US
+        {
+            return None;
+        }
         c.show_cursor();
         c.surface_mut().flush();
         c.take_geometry()
@@ -952,6 +1095,10 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         serial::puts("\nAkuma/amd64 - memory bring-up FAILED\n");
         crate::halt();
     }
+
+    // Double-buffer the console now that there is a heap (`FBCON_DOUBLE_BUFFER.md`).
+    // The result lands in `dmesg`; a failure keeps direct drawing.
+    serial::puts(if fb_enable_double_buffer() { "[fb] double buffer on\n" } else { "[fb] double buffer off\n" });
 
     // The console hook and the `akuma-exec` runtime, exactly as `kmain` does —
     // one call, because "exactly as `kmain` does" was two lines on that path and
