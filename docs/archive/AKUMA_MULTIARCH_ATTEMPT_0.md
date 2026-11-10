@@ -713,8 +713,26 @@ the rerun took 7 s. That is the open `sigregs` SMP=4 TCG finding above, this tim
 hanging. Note that all three sightings so far (here and the two above) were on a candidate build, each
 with unrelated changes — not yet seen on a baseline, which with these sample sizes says little either way.
 
-**Open:** the epoll waker latency (every SMP=4 run, and one SMP=2 run of three, 8.1–14.2 ms against an
-8 ms bound with a 5 ms built-in delay; the wake path — CAS,
-`wake_core` SGI to the waiter's last core, that core's idle yields — reads correct, so the epoll/futex
-suites are the next measurement); the 2-in-180 ssh session failures; signal and deferred-kill delivery on
-the IRQ-return path (W3c).
+**`test_epoll_socket_waker` is not a hooked regression (corrected the same day).** The table above reads
+as if it were: SGI passed in its three runs. An instrumented build (not committed) stamped when the waker
+thread starts, when it calls `wake_all`, and when the waiter returns, on both schedulers:
+
+| | waker starts | `wake_all` | waiter returns | cores (waker, waiter) |
+|---|---|---|---|---|
+| SGI SMP=1 | +631 µs | +6720 | +6780 (pass) | 0, 0 |
+| SGI SMP=2 | +761 | +6030 | +11925 (**fail**) | 1, 0 |
+| SGI SMP=4 | +934 | +6150 | +8965 (**fail**) | 2, 3 |
+| hooked SMP=1 | not yet | not yet | +7321 (pass) | 0, 0 |
+| hooked SMP=2 | +78 | +5081 | +7529 (pass) | 1, 0 |
+| hooked SMP=4 | +1267 | not yet | +5944 (pass) | 1, 3 |
+
+Two separate things. (1) **A cross-core wake is slow on both schedulers**: 2.4–5.9 ms from `wake_all`
+on one core to the waiter running on another, against 60 µs on one core. The test's 8 ms bound leaves 3 ms
+after the 5 ms spin, so it fails whenever that delay crosses it, under SGI as well. (2) **Under hooked the
+waiter sometimes returns ready before anything woke it** (SMP=1 and SMP=4 rows: `EPOLLIN` at 6–7 ms with
+`wake_all` not yet called). Then the test is not measuring the waker at all. Both are open; the next
+measurement stamps the `wake_core` SGI's send, its arrival and the switch, and where the early readiness
+comes from.
+
+**Open:** the two epoll findings above; the epoll/futex suites under both schedulers; the 2-in-180 ssh
+session failures; signal and deferred-kill delivery on the IRQ-return path (W3c).

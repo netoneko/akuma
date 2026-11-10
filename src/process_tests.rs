@@ -13071,6 +13071,46 @@ fn test_socket_wait_backstop_no_hang() {
     }
 }
 
+/// `--features epoll-waker-trace`: stamps for [`test_epoll_socket_waker`], to split its
+/// elapsed time into "waker started", "`wake_all` called" and "waiter returned", with the
+/// core each side ran on. A stamp still unset at report time prints as `-1`: that side had not
+/// got there when the waiter returned. Measurement only; off in every profile.
+#[cfg(feature = "epoll-waker-trace")]
+mod epoll_waker_trace {
+    use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+
+    static STARTED: AtomicU64 = AtomicU64::new(0);
+    static WOKE: AtomicU64 = AtomicU64::new(0);
+    static WAKER_CORE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    fn core() -> u64 {
+        akuma_cpu::sysreg::mpidr_el1() & 0xff
+    }
+
+    pub fn waker_started(now: u64) {
+        STARTED.store(now, SeqCst);
+        WAKER_CORE.store(core(), SeqCst);
+    }
+
+    pub fn woke() {
+        WOKE.store(crate::timer::uptime_us(), SeqCst);
+    }
+
+    /// Print the stamps relative to the waiter's `start`, then clear them for a rerun.
+    pub fn report(start: u64, elapsed: u64) {
+        let rel = |t: u64| if t == 0 { -1 } else { t as i64 - start as i64 };
+        crate::safe_print!(
+            192,
+            "[epoll-waker-trace] waker_started={} wake_all={} returned={} (us from park) waker_core={} waiter_core={}\n",
+            rel(STARTED.swap(0, SeqCst)),
+            rel(WOKE.swap(0, SeqCst)),
+            elapsed,
+            WAKER_CORE.swap(u64::MAX, SeqCst),
+            core()
+        );
+    }
+}
+
 fn test_epoll_socket_waker() {
     use crate::syscall::poll::{sys_epoll_create1, sys_epoll_ctl, sys_epoll_pwait};
     // The `epoll_event` buffers below are kernel STACK addresses, which are
@@ -13108,6 +13148,8 @@ fn test_epoll_socket_waker() {
     // In a background thread, wait 5ms then simulate data arrival
     akuma_exec::threading::spawn_user_thread_fn(move || {
         let start = crate::timer::uptime_us();
+        #[cfg(feature = "epoll-waker-trace")]
+        epoll_waker_trace::waker_started(start);
         while crate::timer::uptime_us() - start < 5000 {
             akuma_exec::threading::yield_now();
         }
@@ -13116,6 +13158,8 @@ fn test_epoll_socket_waker() {
         akuma_net::socket::with_socket(sock_idx, |sock| {
             sock.wake_all();
         });
+        #[cfg(feature = "epoll-waker-trace")]
+        epoll_waker_trace::woke();
 
         // Mark terminated before yield loop to avoid thread leak
         let tid = akuma_exec::threading::current_thread_id();
@@ -13139,6 +13183,9 @@ fn test_epoll_socket_waker() {
     }
     unregister_process(pid);
     unregister_thread_pid(tid);
+
+    #[cfg(feature = "epoll-waker-trace")]
+    epoll_waker_trace::report(start, elapsed);
 
     if nready == 1 && out_events[0].data == 0xDEADBEEF {
         // We expect it to take slightly more than 5ms (because of the delay in the thread),
