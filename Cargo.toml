@@ -54,7 +54,6 @@ default-members = [
     "crates/akuma-port",
     "crates/akuma-net-unix",
     "crates/akuma-net-yarn",
-    "crates/akuma-fbcon",
     "crates/akuma-pipe",
     "crates/akuma-pipes",
     "crates/akuma-pmm",
@@ -120,6 +119,12 @@ default-members = [
     "crates/akuma-virtio",
 ]
 exclude = ["userspace"]
+
+# `akuma-fbcon` (anti-aliased console fonts, baked by its `build.rs` from IBM Plex Mono and the
+# Spleen submodule) is a workspace member but NOT a default member: only the amd64 kernel draws
+# text on a framebuffer, so an AArch64 `cargo build`/`test` must not bake fonts or need the
+# `crates/akuma-fbcon/vendor/spleen` submodule. It still builds as `amd64`'s dependency; test it
+# with `cargo test -p akuma-fbcon --target $(rustc -vV | sed -n 's/^host: //p')`.
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
