@@ -365,6 +365,18 @@ pub fn bring_up_secondaries(
     }
 }
 
+/// The command-line policies that need no hardware, set once for both boot paths: the `smp=N`
+/// cap and the idle wake budget (`idlesleep[=N]`, `idlemwait`).
+///
+/// Both entry points call this right after the command line is in hand. Until 2026-11-10 the PVH
+/// `kmain` set the idle policy early and the multiboot2 path set it only inside its
+/// `start_secondaries` closure, which the full-suite boot never runs — so `idlesleep` was silently
+/// ignored by a GRUB-booted tests kernel.
+pub fn apply_cmdline_policies(cmdline: &str) {
+    smp::set_cpu_cap_from_cmdline(cmdline);
+    crate::sched::set_idle_policy_from_cmdline(cmdline);
+}
+
 /// The value of a `prefix=value` token on the command line, or `None`.
 ///
 /// Pure and allocation-free: the one parse of a valued boot flag, over the

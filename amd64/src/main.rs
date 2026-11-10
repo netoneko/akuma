@@ -268,9 +268,8 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // `/proc/power`: after `mem::init`, because mapping the EC window allocates
     // page-table frames.
     power::init(&machine, cmdline);
-    // The idle wake budget (`idlesleep` / `idlemwait`), the same on both boot
-    // paths — `multiboot2.rs` calls this beside `set_cpu_cap_from_cmdline`.
-    sched::set_idle_policy_from_cmdline(cmdline);
+    // `smp=N` and the idle wake budget: one call, shared with the multiboot2 path.
+    boot::apply_cmdline_policies(cmdline);
 
     // The console hook and the `akuma-exec` runtime, shared with the multiboot2
     // entry point. One call because the two used to be two, and the second of

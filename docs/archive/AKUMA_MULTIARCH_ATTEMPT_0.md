@@ -42,6 +42,13 @@ therefore a sequence of small convergences of those, not a rewrite.
   property: this candidate completed). `no-tests` + default build and clippy clean. multiboot2
   side compiled only.
 
+- **M1c (done):** `boot::apply_cmdline_policies(cmdline)` (the `smp=N` cap + the idle wake budget)
+  called by both entry points right after the command line is known. The multiboot2 path used to set
+  the idle policy only inside its `start_secondaries` closure, which the full-suite boot never runs,
+  so `idlesleep` was silently ignored by a GRUB-booted tests kernel. Verified PVH TCG SMP=4 plain
+  836/0. Note: `SMP=4 KCMDLINE="smp=2 idlesleep"` fails `smp ring3: two processes ran on two cores`
+  on **both** M1b and M1c (control run) — a property of that command line, not of these commits.
+
 ## Decisions (owner, 2026-11-10)
 
 - **D1 — rump:** a universal, **optional** `rump` feature on the shared spine, not bin-local. Its

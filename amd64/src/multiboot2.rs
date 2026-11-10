@@ -902,6 +902,9 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     #[cfg(feature = "no-tests")]
     let _ = crate::boot::early_init();
 
+    // `smp=N` and the idle wake budget, as on the PVH path.
+    crate::boot::apply_cmdline_policies(info.cmdline());
+
     // The machine, as multiboot2 describes it.
     let machine = machine_from(&info);
     serial::puts("  ram:  ");
@@ -1051,9 +1054,6 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     };
     let start_secondaries = || {
         let cmdline = info.cmdline();
-        // The idle wake budget (`idlesleep` / `idlemwait`), the same call the
-        // PVH path makes in `main.rs`.
-        crate::sched::set_idle_policy_from_cmdline(cmdline);
         // The KVM rungs that need the root filesystem (`kvmtest kvmlinux`): the
         // Linux guest reads `/boot/vmlinux` off it. Here — after `late_init`'s
         // `lapic::init`, before the secondaries start — and not right after the
