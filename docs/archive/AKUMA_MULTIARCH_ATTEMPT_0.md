@@ -785,11 +785,48 @@ ISAs. Akuma does not answer `getcpu`, so only the combined bucket fills. p50 / p
 | pre-refactor (`c2f58d79^`) | 24 / 83 | 234 / 535 | 53 / 92 | 305 / 659 |
 | this branch | 26 / 75 | 235 / 495 | 52 / 100 | 322 / 825 |
 
-The refactor did not move either kernel's wake path. The amd64 baseline is `c2f58d79^`, not the
-merge-base: from `c2f58d79` (2026-11-06) `main`'s amd64 kernel does not link, because
-`shootdown_entry` is defined both in `amd64/src/shootdown.rs` and in `akuma-boot-amd64`. That is a
-`main` problem this branch does not have; it is not fixed there. Hooked differs from SGI in shape,
-not by a clear margin either way.
+The refactor did not move either kernel's wake path. The amd64 baseline is `c2f58d79^`, because
+`3baa8e88`'s amd64 kernel does not link (`shootdown_entry` defined in both `amd64/src/shootdown.rs`
+and `akuma-boot-amd64`, from `c2f58d79`). Hooked differs from SGI in shape, not by a clear margin
+either way.
+
+*Correction (same day): wrong baseline, and `main` does link.* This branch forked at **`0b78d0cb`**
+(2026-11-09), not `3baa8e88`. The latter was `origin/main` as fetched when this section was started,
+two days older. `main` fixed the duplicate symbol itself in `1e2fbdf0`, before the fork. The code
+between `3baa8e88` and `0b78d0cb` is fbcon fonts, `wait4`/`waitid` routing and a `nopidfd` flag, with
+no scheduler or epoll change, so the latency conclusions above stand. A rerun against `0b78d0cb`
+would be the clean form. The metal A/B below is effectively against the fork point: its old kernel,
+`c523598a`, is two docs-only commits before it.
+
+**On real hardware (the trashcan, 2026-11-10).** The QEMU TCG amd64 numbers above are emulated (x86
+on an ARM host); the Lima AArch64 ones are not (Lima `vz` plus nested KVM). With the owner's go-ahead
+the branch kernel (`417485ca`, default features) is installed as the trashcan's main kernel. The old
+one is kept as `/boot/akuma-amd64.c523598a`; `.good` is untouched. Boot self-test **789/0** (the
+metal set, not the TCG 837), and herd brings `kot` and `llama-server` back. Probe, 300 iterations,
+p50 / p99 µs:
+
+| | rounds | spin p50 | spin p99 | sleep p50 | sleep p99 |
+|---|---|---|---|---|---|
+| `c523598a`, 19 h uptime | 2 | 9, 97 | 19, 1234 | 10, 10 | 22, 55 |
+| `c523598a`, fresh boot + 60 s | 4 | 7–9 | 14–19 | 9–10 | 16–24 |
+| `417485ca`, ~12 s after boot | 4 | 7–1015 | 23–5052 | 7–9 | 18–39 |
+| `417485ca`, ~36 s after boot | 6 | 7–9 | 17–1036 | 8–13 | 17–1019 |
+
+Real-hardware wake is **~7–10 µs**, against 26–320 µs under TCG. Both kernels have a second mode
+where a wake waits about one 1 ms tick. The old kernel showed it once at 19 h uptime; the branch
+kernel showed it in its first rounds after boot, while `llama-server` loads an 8 GB model and `kot`
+starts, and not in its last four. That points at load. It is not a clean A/B: the old kernel's
+fresh-boot rounds started ~2 min after boot and the branch kernel's within one, so it is not shown
+the 1 ms mode is load-only. **Open:** rerun both kernels with the same post-boot wait, and find
+which path waits for the tick (a halted peer core not sent a wake IPI is the first suspect).
+
+**Line count, same script on all three trees** (`scripts/cloc_akuma.py`, no arguments): fork point
+`0b78d0cb` 129,055 production / 70,590 test; `main` today 129,247 / 70,644; this branch 129,874 /
+70,946. The branch is **+819 production lines**, all additions: `akuma-kernel-glue` +236 (hooked
+machine half), `akuma-machine-facts` +178 (new), `amd64/src` +96, `akuma-entry` +94,
+`akuma-threading` +79, the rest +136. Nothing is removed yet, because the hooked scheduler sits
+beside the SGI one behind a feature. The reductions come with making hooked the AArch64 default and
+deleting the SGI path, and with amd64 adopting `akuma-kernel-glue`. That size is not measured.
 
 **The probe found a hooked-only correctness bug.** Before the fix, the probe SIGSEGVed in all four
 hooked runs (SMP=2 and 4, both modes): the main thread came back from `pthread_join` with the exited
