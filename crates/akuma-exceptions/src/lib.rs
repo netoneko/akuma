@@ -2411,11 +2411,19 @@ pub fn irq_with_sp(current_sp: u64) -> u64 {
 /// released at the end only if this entry took it — after a switch that is the resumed
 /// thread releasing the lock its core holds on its behalf, which is the return to EL0.
 ///
-/// The scheduler SGI preempts only when it interrupted EL0 (`from_el0`): kernel code
+/// The scheduler SGI preempts only when it interrupted EL0 (`el0` is `Some`): kernel code
 /// switches cooperatively, and an EL1 entry is an interrupt window, where the SGI's only job
 /// was to end a `wfi`.
+///
+/// An interrupt from EL0 is also a **return to user mode**, and it is the only one a thread
+/// in a pure compute loop ever makes. So, as Linux does on every return to user mode, the
+/// thread resuming into `el0` first takes a deferred kill and then one pending signal (see
+/// [`deliver_on_irq_return`]). Without it `kill -TERM` of a spinner did nothing and its
+/// handlers never ran (`userspace/forktest/c_stress/sigspin.c`,
+/// `docs/archive/HOOKED_IRQ_SIGNAL_DELIVERY.md`).
 #[cfg(feature = "hooked-sched")]
-pub fn irq_hooked(from_el0: bool) {
+pub fn irq_hooked(el0: Option<FrameHandle>) {
+    let from_el0 = el0.is_some();
     note_exception_entry();
     note_exc_class(2);
     let held = akuma_exec::bkl::held_by_current();
@@ -2443,9 +2451,59 @@ pub fn irq_hooked(from_el0: bool) {
     if preempt {
         akuma_exec::threading::yield_now();
     }
+    if let Some(frame) = el0 {
+        deliver_on_irq_return(frame);
+    }
     if !held {
         akuma_exec::bkl::leave_kernel();
     }
+}
+
+/// The return-to-user-mode work of an interrupt from EL0 under the hooked scheduler, run
+/// by the thread that is about to resume into `frame` (after any switch), BKL held.
+///
+/// 1. A **deferred kill** posted by a peer's `kill_thread_group` ends the thread here, as
+///    it does at the syscall boundary in [`sync_el0`]: nothing is held below this frame but
+///    the BKL, which the terminal mark+yield reconciles.
+/// 2. One **pending signal** is delivered into `frame`, exactly as on syscall return, with
+///    two differences that both follow from there being no syscall: the ESR passed is 0, so
+///    `SA_RESTART` never backs `ELR` up onto an `svc` that was not there; and `x0` is the
+///    interrupted code's live register, which the signal frame saves as it stands, so it is
+///    replaced only by the handler's argument. There is no [`akuma_exec::threading::sigframe_active`]
+///    bound either: that bound protects a syscall return the program has not observed yet,
+///    and an interrupt carries none.
+///
+/// Interrupts are open for the delivery: building the frame may fault in the user stack,
+/// and the sync path does that work with them open too. The interrupt that brought us here
+/// has had its EOI, so a nested one is an ordinary EL1 interrupt window.
+#[cfg(feature = "hooked-sched")]
+fn deliver_on_irq_return(frame: FrameHandle) {
+    #[cfg(kernel_smp_shared)]
+    if akuma_exec::threading::take_thread_kill_request() {
+        let tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::threading::mark_thread_terminated(tid);
+        loop {
+            akuma_exec::threading::yield_now();
+        }
+    }
+    let sig_mask = akuma_exec::threading::thread_signal_mask();
+    let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) else {
+        return;
+    };
+    let thread_slot = akuma_exec::threading::current_thread_id();
+    // Go's SIGURG before its thread has a sigaltstack: not ready yet, keep it pending —
+    // the same rule as the syscall-return path.
+    if sig == 23 && akuma_exec::threading::get_sigaltstack(thread_slot).0 == 0 {
+        akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
+        return;
+    }
+    akuma_primitives::irq::unmask_irqs_sync();
+    if try_deliver_signal(frame, sig, 0, false, 0) {
+        frame.set_x0(u64::from(sig));
+    } else {
+        apply_default_signal_action(sig); // diverges if fatal
+    }
+    akuma_primitives::irq::mask_irqs_sync();
 }
 
 /// Landing pad for EL1 fault recovery.

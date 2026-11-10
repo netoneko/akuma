@@ -842,3 +842,79 @@ investigated.
 
 **Open:** rewrite `test_epoll_socket_waker`; the epoll/futex suites under both schedulers; hooked BKL
 contention; W3c.
+
+## The epoll and futex suites under both schedulers (2026-11-10)
+
+`scripts/epoll_suite.py` and `scripts/futex_suite.py`, Lima `fc` (KVM), devbox, one VM at a time,
+`sgi-6a8-devbox` against `hooked-6a8-devbox` (both built at `6a817703`):
+
+| kernel | SMP | epollops | futexops / futexkey / futextest / futexkill | `[BKL] stuck` |
+|---|---|---|---|---|
+| SGI | 2 | 17 PASS, 1 known DIVERGE | all pass | 1 |
+| hooked | 2 | 17 PASS, 1 known DIVERGE | **futexops: no output** (0 PASS, 0 FAIL); rest pass | 5 |
+| SGI | 4 | 17 PASS, 1 known DIVERGE | all pass | 2 |
+| hooked | 4 | 17 PASS, 1 known DIVERGE | all pass | 30 |
+
+The known DIVERGE is `epoll_ctl_add_twice`: a second ADD returns 0 where Linux returns EEXIST. Both
+schedulers show it.
+
+The empty futexops run could not be explained, because the harness kept only the failure lines.
+The rerun booted hooked SMP=2 once and ran the whole futex suite 5 times: all four probes passed
+every time, 20 of 20 probe runs. It is recorded as one silent run that did not reproduce.
+
+**Where the `[BKL] stuck` lines come from.** All of them come from `futextest`'s thread
+spawn-and-join churn (about 1,200 thread exits per run, each printing `[unregister] ... NO map
+owner`). Run alone at SMP=4 on the hooked kernel:
+
+- `futexops`, `futexkey` and `futexkill` give 0;
+- `futextest` gives 28.
+
+Seven full `futextest` runs per kernel, SMP=4, one boot each:
+
+| per run | hooked (`hooked-w3c-devbox`) | SGI (`sgi-6a8-devbox`) |
+|---|---|---|
+| `[BKL] stuck` (8M-spin waits) | 28–35 | 0–3 |
+| `[bkls>]` (shorter waits) | 156–176 | 497–602 |
+| wall time | 11.3–13.9 s | 13.6–16.1 s |
+
+So hooked has fewer contended waits in total and finishes the workload about 13% faster, but
+more of its waits are long ones. The SGI tick that preempts kernel code is gone on hooked, so a
+kernel stretch now runs to its end, and peers wait it out.
+
+**One hypothesis tested and rejected:** the idle thread's collector reaps every eligible slot in
+one BKL hold. Bounding it to 2 slots per hold made no difference, A/B/A/B:
+
+- unbounded: 30 and 28 stuck lines;
+- bounded: 25 and 26.
+
+The change was reverted. Which stretch holds the lock is still open. The holds are tagged 511
+(the profiler's "unknown" bucket), so the next measurement is a `bkl-profile` build that tags the
+hooked path's holds.
+
+## W3c — signal and deferred-kill delivery on the hooked IRQ return (2026-11-10)
+
+Going in, the step was "mirror what the SGI path does on an IRQ return to EL0". **The SGI path does
+nothing there.** On AArch64 the only places that take a pending signal are syscall return,
+`rt_sigreturn` and the JIT retry. A thread in a pure compute loop therefore never received
+SIGTERM, SIGINT or a handled signal under either scheduler; only SIGKILL worked, because it
+hard-kills. The new probe `userspace/forktest/c_stress/sigspin.c` shows it: 0 of 3 rounds for
+`term`, `handler` and `thread-term` on both schedulers, and 3 of 3 for the two SIGKILL cases.
+
+Fix, on the hooked path only:
+
+- `irq_hooked` takes the EL0 frame;
+- before the BKL is released, `deliver_on_irq_return` consumes a deferred kill, then one
+  pending signal.
+
+The kit's IRQ frame is the full user frame, so `try_deliver_signal` writes into it unchanged. The
+SGI path's IRQ frame is a smaller layout and is left as it is; that path is to be deleted. Full
+write-up and timings: `docs/archive/HOOKED_IRQ_SIGNAL_DELIVERY.md`.
+
+**Gates** (`hooked-w3c-*`):
+
+- `sigspin 5`: 25 of 25 rounds pass at each of SMP=1, 2 and 4. SIGTERM reaches a spinner in
+  5–15 ms, and a handler runs in 1–11 ms.
+- Boot suite: SMP=1 314/0, SMP=2 322/0, SMP=4 319/1. The failure is the known
+  `test_epoll_socket_waker`.
+- epoll and futex suites: all pass at SMP=2 and 4, with `stuck` 1 and 38.
+- clippy is clean with and without `hooked-sched`.

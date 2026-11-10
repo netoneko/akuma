@@ -65,12 +65,7 @@ pub fn install_on_this_core() {
 /// again before the stub restores the frame.
 fn el0_sync(f: &mut Frame) {
     let (esr, far) = (f.esr, f.far);
-    // SAFETY: `f` is the frame the kit's stub pushed for this entry on the current
-    // thread's kernel stack, exclusively this handler's until it returns (the kit's one
-    // contract), and its first 288 bytes and NEON area are `UserTrapFrame` and the sync
-    // save area at the offsets the assertions above pin. The handle is not used after
-    // `sync_el0` returns.
-    let frame = unsafe { FrameHandle::new(core::ptr::from_mut(f).cast::<UserTrapFrame>()) };
+    let frame = user_frame(f);
     akuma_primitives::irq::unmask_irqs_sync();
     let ret = exc::sync_el0(frame, esr, far);
     akuma_primitives::irq::mask_irqs_sync();
@@ -89,12 +84,27 @@ fn el1_sync(f: &mut Frame) {
     }
 }
 
-fn el0_irq(_f: &mut Frame) {
-    exc::irq_hooked(true);
+/// An interrupt from EL0, which is also a return to user mode: `irq_hooked` delivers a
+/// pending signal into this frame before the stub restores it.
+fn el0_irq(f: &mut Frame) {
+    exc::irq_hooked(Some(user_frame(f)));
+}
+
+/// `akuma-exceptions`' typed view of an EL0 entry's frame. The handle borrows `f` in all
+/// but name: an EL0 handler makes it, passes it down, and does not use it after the call
+/// it was passed to returns.
+fn user_frame(f: &mut Frame) -> FrameHandle {
+    // SAFETY: `f` is the frame the kit's stub pushed for this EL0 entry on the current
+    // thread's kernel stack, exclusively this handler's until it returns (the kit's one
+    // contract), and its first 288 bytes and NEON area are `UserTrapFrame` and the sync
+    // save area at the offsets the assertions above pin. A switch inside the handler leaves
+    // the frame where it is, and only this thread uses the handle, once it resumes. Both
+    // callers drop the handle before they return.
+    unsafe { FrameHandle::new(core::ptr::from_mut(f).cast::<UserTrapFrame>()) }
 }
 
 fn el1_irq(_f: &mut Frame) {
-    exc::irq_hooked(false);
+    exc::irq_hooked(None);
 }
 
 fn unexpected(f: &mut Frame) {
