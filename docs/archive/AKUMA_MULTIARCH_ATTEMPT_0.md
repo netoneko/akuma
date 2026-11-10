@@ -177,6 +177,21 @@ at the call site.
   flake of the thread probe, **not** reproduced in 4/4 runs of the identical binary and not
   correlated with this change (it predates it). Worth its own look; not investigated here.
 
+## M6 — scoping only (not started; D3 decided)
+
+- The root kernel has **no `hooked` feature reference** (`git grep hooked -- src Cargo.toml build.rs`
+  finds only an unrelated comment). `akuma-switch` defines `hooked = []`; `akuma-threading` selects
+  `hooked_sched` vs `sgi_sched` by cfg from `build.rs`; only `akuma-tokio-kernel-aarch64` turns it on.
+  So M6 is: a root `hooked-sched` feature forwarding `akuma-threading/hooked` + `akuma-switch/hooked`,
+  the AArch64 `ArchHooks` registration (the tokio kernel's `sched.rs`, 274 L, is the model), default
+  **off**, with the Lima AArch64 gate proving the default build's suite output is unchanged and a second
+  Lima run with the feature on. Not attempted in this window: it changes the context-switch path of the
+  production kernel and needs more than the 2 h left to gate responsibly (SMP=1/2/4 on KVM, plus the
+  `epoll`/`futex` suites that are scheduler-sensitive).
+- Housekeeping done: scratch baseline worktree removed. `docs/reference/crate-safety.md` count
+  (79 vs 80 of 108/109) left for `scripts/cloc_akuma.py` regeneration by the owner, per CLAUDE.md
+  ("never increment by hand").
+
 ## Decisions (owner, 2026-11-10)
 
 - **D1 — rump:** a universal, **optional** `rump` feature on the shared spine, not bin-local. Its
