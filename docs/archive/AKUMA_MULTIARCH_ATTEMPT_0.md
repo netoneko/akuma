@@ -34,6 +34,13 @@ therefore a sequence of small convergences of those, not a rewrite.
   `nopidfd` etc. now work on the GRUB-booted metal. `SETTLE_BUDGET_MS` has one definition.
   `machine::{strace_pid,strace_nrs}` deleted (dead). Verified: PVH TCG SMP=1 826/0, `STRACE=1`
   prints `[sc]` lines through the shared function. multiboot2 side: compiles, not booted.
+- **M1b (done):** `boot::bring_up_secondaries(machine, cmdline, keep_out) -> usize` replaces three
+  copies of "start the other cores" (the self-test suite, the PVH `kmain` no-tests arm, the
+  multiboot2 `start_secondaries` closure). The suite printed why it stayed single-core; the other
+  two were silent — now all three print `nosmp` / `trampoline page is not free RAM`. Verified: PVH
+  TCG **SMP=1 826/0, SMP=4 836/0** (the SMP=4 stall in M0 was the TCG flake, not a baseline
+  property: this candidate completed). `no-tests` + default build and clippy clean. multiboot2
+  side compiled only.
 
 ## Decisions (owner, 2026-11-10)
 
@@ -56,11 +63,3 @@ therefore a sequence of small convergences of those, not a rewrite.
   feature-on needs its own run (QEMU HVF/TCG here; SMP probes). The SGI path stays until then.
   Unblocks **M6**.
 - **D4, D5:** still open; neither blocks M1/M2.
-
-- **M1b (done):** `boot::bring_up_secondaries(machine, cmdline, keep_out) -> usize` replaces three
-  copies of "start the other cores" (the self-test suite, the PVH `kmain` no-tests arm, the
-  multiboot2 `start_secondaries` closure). The suite printed why it stayed single-core; the other
-  two were silent — now all three print `nosmp` / `trampoline page is not free RAM`. Verified: PVH
-  TCG **SMP=1 826/0, SMP=4 836/0** (the SMP=4 stall in M0 was the TCG flake, not a baseline
-  property: this candidate completed). `no-tests` + default build and clippy clean. multiboot2
-  side compiled only.
