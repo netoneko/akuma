@@ -445,7 +445,10 @@ unsafe extern "C" {
     fn akuma_threading_x86_thread_entry_trampoline() -> !;
 }
 
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
+// Bare metal only, like the SGI path's asm above: a host build (`cargo test` with the default
+// features, which carry `hooked-sched`) assembles for Mach-O/ELF-host, where `.section .text` is not
+// valid, and never switches: `switch_contexts` has a host arm, and the trampoline a host stub.
+#[cfg(all(target_os = "none", target_arch = "aarch64", hooked_sched))]
 core::arch::global_asm!(
     r#"
     .section .text
@@ -498,10 +501,16 @@ akuma_threading_hooked_thread_entry_trampoline:
 "#
 );
 
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", hooked_sched))]
 unsafe extern "C" {
     fn akuma_threading_hooked_switch_context(old: *mut Context, new: *const Context);
     fn akuma_threading_hooked_thread_entry_trampoline() -> !;
+}
+
+/// Host stand-in for the entry trampoline; its address is all a host build takes.
+#[cfg(all(not(target_os = "none"), target_arch = "aarch64", hooked_sched))]
+extern "C" fn akuma_threading_hooked_thread_entry_trampoline() -> ! {
+    unreachable!("akuma-switch: host builds have no context switch");
 }
 
 #[cfg(all(target_arch = "aarch64", hooked_sched))]
@@ -538,10 +547,16 @@ pub fn switch_contexts(old: usize, new: usize) {
     unsafe {
         akuma_threading_x86_switch_context(&raw mut (*o).rsp, &raw const (*n).rsp);
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     // SAFETY: see the doc.
     unsafe {
         akuma_threading_hooked_switch_context(o, n);
+    }
+    // Host builds (`cargo test` with the default features) have no switch asm and never switch.
+    #[cfg(all(not(target_os = "none"), target_arch = "aarch64"))]
+    {
+        let _ = (o, n);
+        unreachable!("akuma-switch: host builds have no context switch");
     }
 }
 

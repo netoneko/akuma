@@ -7530,12 +7530,16 @@ mod state_transition_guard_tests {
         );
 
         // Same answer once the slot is recycled, where the triple is a dead
-        // process's rather than merely the wrong one.
-        init_thread_slot_context(tid, 0x8000, 0xbeef_0000, 0, 0, 1, true);
-        assert!(
-            get_saved_user_context(tid).is_none(),
-            "a freshly recycled slot still reported a user context",
-        );
+        // process's rather than merely the wrong one. The SGI path's slot
+        // initialiser; the hooked path seeds a slot through `x86_seed_entry`.
+        #[cfg(sgi_sched)]
+        {
+            init_thread_slot_context(tid, 0x8000, 0xbeef_0000, 0, 0, 1, true);
+            assert!(
+                get_saved_user_context(tid).is_none(),
+                "a freshly recycled slot still reported a user context",
+            );
+        }
 
         akuma_switch::with_mut(tid, |ctx| {
             ctx.is_user_process = 0;

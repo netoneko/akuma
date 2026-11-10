@@ -1366,12 +1366,12 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
 
 /// The longest the hooked netpoll loop parks between laps with no packet: the resolution
 /// of its housekeeping (reclaim, herd output, heartbeats) and of smoltcp's own timers.
-#[cfg(all(feature = "smoltcp", feature = "hooked-sched"))]
+#[cfg(all(feature = "smoltcp", feature = "hooked-sched", target_os = "none"))]
 const NETPOLL_PARK_US: u64 = 10_000;
 
 /// How long the boot thread's housekeeping loop sleeps between laps under the hooked
 /// scheduler: its cleanup runs every 10 laps, so every 100 ms.
-#[cfg(feature = "hooked-sched")]
+#[cfg(all(feature = "hooked-sched", target_os = "none"))]
 const BOOT_THREAD_PERIOD_US: u64 = 10_000;
 
 #[cfg(target_os = "none")]

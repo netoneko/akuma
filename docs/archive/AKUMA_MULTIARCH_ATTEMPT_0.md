@@ -1131,3 +1131,40 @@ forced `false`) fails both checks.
 
 - Preemption with the BKL held, as AArch64 does, needs an audit of amd64's own BKL sections.
 - KVM gates are still to run.
+
+## Hooked is the AArch64 default (2026-11-11)
+
+`hooked-sched` is now in the root `default` and in `scripts/build_extreme_size.sh`. The SGI path is
+still built by `--no-default-features` without it, until the next step deletes it.
+
+Builds that stay on SGI:
+
+- the rump devbox (`build_devbox.sh`, deferred): rump with hooked has never been tested;
+- the taoxichuan kernel, which does not use this scheduler.
+
+The new default builds match the `hooked-nohz` builds gated above to within about 100 bytes.
+
+Gates, Lima `fc` and KVM:
+
+- Boot suite SMP=1: 314/0. SMP=4: 320/0.
+- Boot suite SMP=2, four serial runs: 322/0 each. A run alongside the SMP=1 and SMP=4 suites in the
+  same Lima VM (7 vCPUs) failed `orphan reparented to init` and the epoll-waker latency check. It
+  took 53 s against 32 s alone, so CPU contention.
+- Devbox SMP=4, new sshd: epoll 17/0 with the 1 known DIVERGE, futex all pass. No panics, BKL-stuck
+  lines or SIGSEGVs.
+
+Extreme-size under HVF, guest script uname / `tcc` hello / `sigspin 3`:
+
+| build | RAM | `tcc` + run | `sigspin` |
+|---|---|---|---|
+| SGI | 8 MB | builds; `/tmp/h` SIGSEGVs (known, both kernels) | 2 PASS, 3 FAIL |
+| hooked | 8 MB | same | ssh session lost; no kernel message |
+| hooked | 16 MB | same | 5/5 PASS |
+
+**Open:**
+
+- The 8 MB regime is under memory pressure on both kernels, and worse on hooked. This is the
+  ~300 KB gap recorded earlier. 8 MB is not a floor any acceptance playbook gates on now; the
+  4 MB floor boots on neither build.
+- The trashcan (amd64 metal) is down since the 2026-11-10 reboot and needs a power cycle, so the
+  `ring0-preempt` KVM gate has not run.
