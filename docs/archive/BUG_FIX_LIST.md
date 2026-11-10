@@ -13,28 +13,28 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1506
-- **Docs contributing at least one fix:** 429
+- **Total distinct fixes counted:** 1514
+- **Docs contributing at least one fix:** 435
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 245 | 16.3% | 35 |
-| Memory & Virtual Memory | 182 | 12.1% | 62 |
-| Scheduler & Process Management | 139 | 9.2% | 43 |
+| Syscall / ABI Compatibility Audits | 247 | 16.3% | 36 |
+| Memory & Virtual Memory | 182 | 12.0% | 62 |
+| Scheduler & Process Management | 141 | 9.3% | 44 |
 | SMP & Locking | 136 | 9.0% | 56 |
-| Networking | 96 | 6.4% | 37 |
-| Userspace Apps & Libraries | 40 | 2.7% | 21 |
+| Networking | 96 | 6.3% | 37 |
+| Userspace Apps & Libraries | 40 | 2.6% | 21 |
 | Rump Kernel & Syscall Proxy | 26 | 1.7% | 6 |
 | Toolchain & Self-Hosting | 94 | 6.2% | 14 |
-| SSH | 40 | 2.7% | 19 |
-| VFS & Filesystem | 143 | 9.5% | 45 |
+| SSH | 40 | 2.6% | 19 |
+| VFS & Filesystem | 145 | 9.6% | 47 |
 | Boot & Drivers | 142 | 9.4% | 23 |
-| Signals & Exceptions | 45 | 3.0% | 16 |
+| Signals & Exceptions | 46 | 3.0% | 17 |
 | Misc / Cross-cutting | 64 | 4.2% | 23 |
-| Console & Terminal | 58 | 3.9% | 18 |
+| Console & Terminal | 59 | 3.9% | 19 |
 | Containers | 56 | 3.7% | 11 |
-| **Total** | **1506** | **100.0%** | **429** |
+| **Total** | **1514** | **100.0%** | **435** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -54,7 +54,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ---
 
-## Syscall / ABI Compatibility Audits (245 fixes, 35 docs)
+## Syscall / ABI Compatibility Audits (247 fixes, 36 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -333,6 +333,10 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md
 - glue's `pidfd_open` accepted `O_CLOEXEC` and made the fd close-on-exec only on request; Linux accepts only `PIDFD_NONBLOCK`, answers `EINVAL` for anything else and makes every pidfd close-on-exec (found by `pidfdprobe` on Linux 6.17 first; fixed for all three kernels)
 - `rt_sigpending` (x86_64 127, asm-generic 136) was served by no kernel: no abi row, no glue arm; new `signal::sys_rt_sigpending` (Linux's `do_sigpending`) routed on all three
+
+### docs/archive/PROC_SELF_FD_PATH_PREFIX.md
+- `faccessat2` (439) was `ENOSYS` on amd64; the table gained the row and it routes to glue
+- `close_range` (436) was `ENOSYS`, so Bun's fd sweep fell back to 9111 `fcntl` `EBADF` calls; now implemented, with the fb/tun/wifi fd releases run for closed fds
 
 ## Memory & Virtual Memory (182 fixes, 62 docs)
 
@@ -644,7 +648,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/COW_FRESHFRAME_STAGING.md
 - The EL0 write-fault arm allocated its CoW destination before `as_lock` and, when `stale_write_fault_absorbed` made the break unnecessary, returned without freeing it: one 4 KiB frame leaked per absorbed fault; the frame is a `FreshFrame` now, freed by `Drop` on that exit
 
-## Scheduler & Process Management (139 fixes, 43 docs)
+## Scheduler & Process Management (141 fixes, 44 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -873,6 +877,10 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/AKUMA_STALE_TID_ZOMBIE_SLOT.md
 - On amd64 a zombie's tid was reissued before the parent reaped it, so a `kill` of the zombie's pid could resolve to the tid's new owner; the slot is held (`SLOT_HELD_BY`, one `slot_reusable` rule shared by claim and reap) from `run_process`'s exit until `retire_process` releases it
+
+### docs/archive/CHILD_OF_EXITED_THREAD_UNREAPABLE.md
+- `register_child_channel` recorded the **forking thread's** pid as the child's parent, so once Bun's idle pool thread exited `wait4` answered `ECHILD` for a live child of the caller while its pidfd stayed readable (a hot epoll loop, Claude Code's input stall); the child now belongs to the thread group
+- `waitid(2)` (including `P_PIDFD`) was `ENOSYS` on amd64 though glue implements it; `Syscall::Waitid` now routes to glue
 
 ## SMP & Locking (136 fixes, 56 docs)
 
@@ -1640,7 +1648,7 @@ aren't recorded anywhere else.)
 ### docs/archive/SSHD_SESSION_WITHOUT_PATH.md
 - `session_env` stopped being empty when `HOME` was added (2026-10-17), so the kernel's `DEFAULT_ENV` and its `PATH` no longer applied and exec sessions ran with no `PATH` at all: gcc's `make_relative_prefix` fell back to `../` and `posix_spawnp("cc1")` failed with `ENOENT`; the session always gets Alpine's `PATH`
 
-## VFS & Filesystem (143 fixes, 45 docs)
+## VFS & Filesystem (145 fixes, 47 docs)
 
 ### docs/archive/AKUMA_EXT2_CLEANUP.md
 - §2.3: `read_inode` heap over-read (UB) — a rev-1 superblock's `inode_size` was taken off disk with no minimum check, so an image with `inode_size < 128` blitted a whole `Inode` out of a smaller allocation
@@ -1877,6 +1885,12 @@ aren't recorded anywhere else.)
 - `openat`'s `O_TRUNC` path discarded the result of `write_file` (`let _ =`), so a refused truncate would have reported success having done nothing
 - The first `text_busy` table keyed on the inode number alone, so a binary running from one mount blocked writes to same-numbered files on every other mount (three unrelated `akuma-ext2` tests failed); keyed on `(identity, inode)`
 
+### docs/archive/MKDIR_UNDER_REGULAR_FILE.md
+- `lookup_parent` returned a regular file as the "parent" because `lookup_path_internal` only checks the components it walks through, so `mkdir`/create under a file succeeded and corrupted it; ext2 now answers `ENOTDIR` (test added)
+
+### docs/archive/PROC_SELF_FD_PATH_PREFIX.md
+- Bun's `mkdir('/proc/self/fd/N/<name>')` was sent to procfs, which answered `EIO` (Claude Code's Bash tool failed with `EIO: mkdir /tmp/claude-0/-root`); `/proc/self/fd/N/` and `/proc/<own pid>/fd/N/` prefixes are now expanded to the fd's path in path resolution, `mkdirat` and `unlinkat`
+
 ## Boot & Drivers (142 fixes, 23 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
@@ -2069,7 +2083,7 @@ aren't recorded anywhere else.)
 ### docs/archive/HVF_BOOT_TEST_STAGE2_FAULT.md
 - `test_safe_user_access_fault` copied across `kernel_va_end()` into a stretch the boot map covers with no RAM behind it, so under HVF the stage-2 fault (`ISV=0`) aborted QEMU and the boot suite never finished; the test builds its own stage-1 cliff now (166 PASS)
 
-## Signals & Exceptions (45 fixes, 16 docs)
+## Signals & Exceptions (46 fixes, 17 docs)
 
 ### docs/archive/CTRL_C_SIGINT_DELIVERY.md
 - Ctrl-C never interrupted a foreground child over `ssh -tt` (repro: `tail -f`): **no line discipline in the tree generated `SIGINT` at all**. Fixed in the kernel as a process-group broadcast; the first attempt — patching sshd to target `foreground_pgid` as a single pid — was wrong and is recorded as such
@@ -2148,6 +2162,9 @@ aren't recorded anywhere else.)
 - `sys_tkill`'s default action ran `sys_exit_group` on the **caller**, so a fatal signal aimed at another process killed the sender; it ends the target's group, pended and woken, and the decision is `tkill_action`, host-tested exhaustively
 - glue's dispatch prologue answered `rt_sigprocmask` (and `rt_sigaction`, `rt_sigpending`, `rt_sigreturn`, `sigaltstack`) with `EINTR` while the interrupt bit was set, so musl's `fork` child never restored its mask and `pidfdprobe` hung at smp=4; those calls never answer `EINTR` nor consume the bit
 - `test_tkill_blocked_fatal_is_pended` sent a blocked SIGTERM to a kernel thread and asserted it was pended, which the new rule drops, so the main kernel panicked at boot on every run; replaced by `test_tkill_to_a_kernel_thread_is_dropped`
+
+### docs/archive/BUN_GC_FUTEX_HANG_2026_11_10.md
+- amd64 `FUTEX_WAIT` restarted after a signal whose handler had `SA_RESTART`, so JSC's GC thread-suspend signal never ran its handler and Bun hung ~10 s in; a deliverable pending signal now ends the wait with `EINTR`
 
 ## Misc / Cross-cutting (64 fixes, 23 docs)
 
@@ -2283,7 +2300,7 @@ aren't recorded anywhere else.)
 (Akuma's half only; the plan's Taoxichuan fixes are counted in `TAOXICHUAN_BUG_FIX_LIST.md`.)
 - `akuma-amd64`'s self-test build (without `no-tests`) had not compiled since the stage-1 boot-kit extraction (`43edbffc`): the physmap self-test named constants that moved to `akuma-boot-amd64`, and four imports and two functions (`kvm::api::check_shared_memory`, `Vcpu::get_regs`) were dead; fixed with the analysis-row trims (`a4cd34b2`)
 
-## Console & Terminal (58 fixes, 18 docs)
+## Console & Terminal (59 fixes, 19 docs)
 
 ### docs/archive/VEC_AUDIT.md
 - `crates/akuma-terminal`'s canonical-mode `canon_buffer` grew one byte per keystroke with no cap and was drained only by a line terminator, so a peer writing to a tty in canonical mode and never sending `\n` grew kernel heap without limit. Capped at `MAX_CANON = 4095` (Linux N_TTY's own ceiling), dropping — and deliberately not echoing — input beyond it, while the `\n`/VEOF paths stay uncapped so a full line can always still be terminated
@@ -2381,6 +2398,9 @@ aren't recorded anywhere else.)
 ### docs/archive/TTY_CTRL_C_JOB_CONTROL.md
 - `^C` could not interrupt a job-control shell's foreground job (`sleep 100` from `sh -i`, over ssh, on both kernels) because `kill_process_group` always spared the group leader, which there is the job itself; `TerminalState` records the session shell's group and spares the leader only while the foreground group is that one
 
+### docs/archive/FBCON_DOUBLE_BUFFER.md
+- The amd64 framebuffer console drew straight into scanout and ignored `CSI ? 2026` synchronized output, so Claude Code's TUI flickered (and a dim step flashed the whole screen); a RAM back buffer is now presented per flush and `?2026` frames are honored
+
 ## Containers (56 fixes, 11 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
@@ -2464,6 +2484,8 @@ aren't recorded anywhere else.)
 - every amd64 `box run` answered `failed to spawn /bin/busybox` (12 box-suite checks): gating glue's `execve`/`SPAWN`/`SPAWN_EXT` behind a new `exec` feature turned it on only for AArch64, on the premise that both x86 kernels load with their own loaders, but amd64's box spawns still go through glue's; `amd64/Cargo.toml` enables `exec`
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
+
+Also scanned 2026-11-10 (the Claude Code on Akuma work, `claude-fixes`). Counted above: CHILD_OF_EXITED_THREAD_UNREAPABLE, BUN_GC_FUTEX_HANG_2026_11_10, MKDIR_UNDER_REGULAR_FILE, PROC_SELF_FD_PATH_PREFIX (split under VFS and Syscall) and FBCON_DOUBLE_BUFFER. No counted fix: CLAUDE_COMPATIBILITY_ISSUES is the litter-side report whose items are counted under MKDIR_UNDER_REGULAR_FILE and PROC_SELF_FD_PATH_PREFIX; AMD64_CLAUDE_LOGIN_INPUT_STUCK now points at its root cause, counted under CHILD_OF_EXITED_THREAD_UNREAPABLE; AKUMA_ARCH_CONVERGENCE_RESEARCH is research; TAOXICHUAN_JVM_ATTEMPT_2026_11_09 is an experiment whose third blocker is undiagnosed and landed nothing. Fix commit with no doc to cite, not counted: `1e2fbdf0` (the duplicate `shootdown_entry` that broke the amd64 link).
 
 Also scanned 2026-10-20 (the amd64 metal, signal-return and `/proc` work, 16 archive docs added or edited). Counted above: AARCH64_SMP_HOOKS_RACE, AMD64_TLB_STUCK_MMAP_REGIONS, AMD64_FORK_VS_THREADS_SEGV, AKUMA_STALE_TID_ZOMBIE_SLOT, AMD64_PHYSMAP_SELFTEST_LAST_PDE, AMD64_UNSAFE_REDUCTION_TRAP_MSR, AMD64_MAC_BUILT_KERNEL_METAL_HANG (its one fix is the `cycle.py` truncated install; the hang itself is unexplained and not counted), AKUMA_PROC_TREE_UNIFICATION, AMD64_METAL_CONTROL_RUN (its one `MRS rt == 31` fix; the run record itself is not a fix), and POST_AMD64_CODE_AUDIT (its one fix, the shared `akuma-dns` client). AMD64_UNSAFE_REDUCTION_TRAP_MSR's `ls /root` investigation and its round-3 frame-ownership fixes carry six more bullets, split under VFS and Memory. Three fixes had been recorded only in `docs/reference/` docs (poll.md, power.md, tty.md); reference docs hold current state, not history, so their incident records were moved to EPOLL_ONESHOT_AND_NESTED_SPIN, WATCHDOG_FEED_BUCKET and TTY_CTRL_C_JOB_CONTROL and are counted there. Fix commits on the branch with no doc to cite are not counted: sshd's missing `HOME` (`ac41e664`), the stale `uname` SHA in worktrees (`5a577983`), the Tokyo Night prompt's unbracketed SGR escapes (`c7d2a8e7`). Five runbooks that were investigation logs or handoffs rather than procedures were moved into `docs/archive/` under conventional names (THREAD_SPAWN_SEGV_INVESTIGATION, CARGO_CANNOT_REACH_CRATES_IO, AMD64_J4_BUILD_CRASH_HUNT, AMD64_EXT2_CORRUPTION_HANDOFF, AKUMA_AMD64_HDA_AUDIO_BRIEF). Each is the maintained summary of fixes already counted under their archive originals, so none gets a bullet of its own: THREAD_SPAWN_SEGV_INVESTIGATION under MPROTECT_TLB_ASID_BUG, CLONE_TIDFLAGS_THREAD_LIST_LOCK, THREAD_STATES_RACES_TID_GENERATIONS and TRAMPOLINE_STALE_PROCESS_RELR (its `NO-TRAPFRAME` hardening is already a bullet); CARGO_CANNOT_REACH_CRATES_IO (the `sys_pselect6` `exceptfds` fix) under CARGO_CRATES_IO_CONNECT_FAIL; AMD64_J4_BUILD_CRASH_HUNT (the `execve` `EIO`) under AKUMA_AMD64_TARGETED_SHOOTDOWN; AMD64_EXT2_CORRUPTION_HANDOFF under AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION; AKUMA_AMD64_HDA_AUDIO_BRIEF (its six HDA defects) under AKUMA_AMD64_HDA_REWRITE. No counted fix: AARCH64_CLAUDE_BUN_SEGV, AMD64_CLAUDE_LOGIN_INPUT_STUCK and AMD64_CRUSH_ORPHANS_AFTER_PTY_CLOSE are **open** by their own headers (reproduced, not root-caused; the third is a hypothesis only); CLONE_AUDIT is an audit with no defect attached; AKUMA_TTY_EXTRACTION is a behaviour-preserving extraction whose step 2 is open; AKUMA_AMD64_PIPE_TABLE_UNIFICATION took a two-line edit and is already named here.
 
