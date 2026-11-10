@@ -83,8 +83,8 @@ pub enum SharedSpans {
     /// Copy the frame eagerly: parent and child stop sharing writes through the fork, which a `MAP_SHARED`
     /// mapping must NOT do. The answer for a kernel with nothing to keep the copies coherent.
     Copy,
-    /// Share the frame like any other leaf, demoted to copy-on-write (amd64, whose `akuma-fpcache-rw` and fault
-    /// path re-share a shared writable page instead of breaking it).
+    /// Share the frame like any other leaf, demoted to copy-on-write. (amd64 once did this; since 2026-10-03 its
+    /// fork walk uses [`SharedSpans::ShareWritable`] for `MAP_SHARED` spans, via [`fork_leaf`].)
     ShareFrames,
     /// Share the frame and leave the entry as it is: writable stays writable in both trees and no CoW marker is
     /// set, so a store by either side is seen by the other (taoxichuan). That is what `MAP_SHARED` means; the

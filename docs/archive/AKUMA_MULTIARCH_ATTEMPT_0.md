@@ -210,8 +210,11 @@ at the call site.
   `crate::sock` (`usermode.rs`, "AF_UNIX first, then the native stack"), and `crate::sock` says so
   in its own comment. The suite has a `socketpair` smoke test. So there is no local unix state
   machine to delete and M5's "adopt net-unix" item shrinks to: confirm nothing in `sock.rs`/`fd.rs`
-  still special-cases a unix fd beyond `fd::is_unix_socket`, and add an AF_UNIX *connect/accept*
-  probe (not only `socketpair`) for the extensive testing D2 asked for.
+  still special-cases a unix fd beyond `fd::is_unix_socket`, and run the AF_UNIX battery D2 asked for. **That battery exists:**
+  `userspace/forktest/c_stress/unixsock_amd64.c` (14 checks: STREAM/DGRAM, bind/listen/accept4/connect,
+  epoll on the listener, S_IFSOCK path, connect-to-nothing) is in `scripts/utils/amd64_shmwrite_check.py`,
+  and passed 14/14 on metal (`AKUMA_AMD64_AGENT_STAGING_AND_ACCOUNTING.md`). Nothing to write; re-run it
+  after any change to the unix routing in `usermode.rs`.
 - **D3 — scheduler:** **AArch64 adopts the hooked scheduler** (`akuma-threading`'s hooked path),
   behind a feature first. *Correction to the stated reason:* both paths live in one crate and share
   the same ~31 host tests (slot/wake/park state machine); the SGI handler and the hooked switch
