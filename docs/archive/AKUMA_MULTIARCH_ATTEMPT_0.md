@@ -34,3 +34,16 @@ therefore a sequence of small convergences of those, not a rewrite.
   `nopidfd` etc. now work on the GRUB-booted metal. `SETTLE_BUDGET_MS` has one definition.
   `machine::{strace_pid,strace_nrs}` deleted (dead). Verified: PVH TCG SMP=1 826/0, `STRACE=1`
   prints `[sc]` lines through the shared function. multiboot2 side: compiles, not booted.
+
+## Decisions (owner, 2026-11-10)
+
+- **D1 — rump:** a universal, **optional** `rump` feature on the shared spine, not bin-local. Its
+  testing is **deferred**; until then amd64 does not build it by default, and the feature must not
+  leak into the other kernel's build (`cargo tree` check, research doc §7). On AArch64 the feature
+  is already in `default` at compile time, but rump only runs under `rump-default` / `devbox`
+  (`RUMP_NIC=1`); the default devbox is the smoltcp one. Unblocks **M2**.
+- **D2 — AF_UNIX on amd64:** **adopt `akuma-net-unix`** (one state machine for both kernels),
+  behind a feature, with **extensive testing** required before `sock.rs`'s local state machine is
+  deleted: host differential tests old-vs-new first (the `sockaddr_in` slice-4 precedent), then
+  an AF_UNIX probe under TCG, and sshd/herd paths that use unix sockets. Unblocks **M5**.
+- **D3 (AArch64 onto the hooked scheduler), D4, D5:** still open. D3 blocks M6.
