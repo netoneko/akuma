@@ -282,3 +282,33 @@ rename/hoist.
   feature-on needs its own run (QEMU HVF/TCG here; SMP probes). The SGI path stays until then.
   Unblocks **M6**.
 - **D4, D5:** still open; neither blocks M1/M2.
+
+## W5a — the thread-probe flake, fixed at the test (2026-11-10, evening)
+
+**Cause, confirmed.** Five boot tests (`elf`, `fdprobe`, `thread`, `kill`, `sigregs`) reset a global
+`EXIT_STATUS`, drove the scheduler until `all_user_tasks_finished()`, and read the global back. Every
+process on every core stored it on its way out of ring 3 (`run_process`, `unwind_to_kernel`, the exit
+arms), so a straggler or a forked child could overwrite the probe's status — the `got 0x0 want 0x1ff`
+failure. **Fix:** `usermode::wait_test_exit(pid, spins)` waits on the test process's **own exit
+channel** (`get_child_channel(pid)`, marked by `run_process` after `thread::drain` with the full `i32`)
+and returns that status. Not `waitpid`: a wait status keeps 8 bits and the probes report 9- and 12-bit
+masks. With no reader left, the global and its six stores are deleted; `exit_current_with_code(code)`
+became `exit_current_group()` (the code was only ever stored to the global; the real carrier is `%rax`).
+
+**Gate (PVH, TCG, interleaved, same session).**
+
+| kernel | SMP=1 | SMP=2 | SMP=4 |
+|---|---|---|---|
+| baseline `445fe139` | 4/4 826/0 | — | 1/4 clean: **2× `thread: ... got 0x0 want 0x1ff`**, 1× `spawn` stdio checks fail then hang (727 s timeout) |
+| candidate | **16/16 826/0** | **6/6 836/0** | 2/4 clean: 1× `net: the netpoll daemon completes laps`, 1× `spawn` stdio checks fail then stall after "netpoll daemon spawned" |
+
+So the thread-probe failure is gone (0 in 26 candidate runs, 2 in 4 baseline SMP=4 runs) and **no real
+threads failure was hiding behind it** — every candidate run reports `0x1ff`. The remaining SMP=4 TCG
+failures appear on the baseline too and are different tests:
+
+- **`spawn: the child's registered table holds fd 0 as Stdin` (+fd 1, fd 2):** the same family of test
+  race. The test inspects the child's fd table right after `sys_spawn`, on the comment's assumption that
+  this is "the one moment the table is guaranteed populated"; at SMP=4 `/bin/hello` can run to its exit
+  on another core and `close_all` has emptied the table first. Open: the fix needs a child that blocks
+  until told (e.g. reads stdin) so the inspection window is real; not changed here.
+- **netpoll laps / stall after "netpoll daemon spawned":** the TCG SMP=4 stall M0 recorded. Not a gate.

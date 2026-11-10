@@ -521,7 +521,7 @@ pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
         // Found by `usermode::kill_test` (`got 0xf7 want …fff7`), 2026-10-09.
         if status.cast_signed() >= 0 && status & crate::thread::GROUP_EXIT_CODE_FLAG != 0 {
             let code = u64::from(status & 0xff);
-            crate::usermode::exit_current_with_code(code);
+            crate::usermode::exit_current_group();
             return code;
         }
         let sig = status.cast_signed().wrapping_neg() as u32;

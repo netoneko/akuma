@@ -461,8 +461,6 @@ fn trace_error(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, r: u64) {
 }
 /// Bytes accepted by `write`, across all processes.
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
-/// Status the last process exited with.
-static EXIT_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Which task performed each `write`, in order. Proving that two processes ran
 /// concurrently needs the *interleaving*, not just the totals: three writes from
@@ -883,7 +881,6 @@ pub fn leave_current_from_tick(status: u64) -> ! {
 /// [`leave_current_from_tick`]: return `status` into whoever called
 /// `enter_user`, as `.Lexit_to_kernel` would for a syscall that set `leave`.
 fn unwind_to_kernel(status: u64) -> ! {
-    EXIT_STATUS.store(status, Ordering::Relaxed);
     let uctx = crate::smp::current_uctx();
     assert!(!uctx.is_null(), "ring-3 fault with no current UserCtx");
     // SAFETY: `uctx.kernel_rsp` is the stack `enter_user_mode` published for
@@ -1192,22 +1189,17 @@ pub fn exit_current_from_signal(sig: u32) {
     // `crate::signal::notify_group_of_thread_fatal`.
     crate::signal::notify_group_of_thread_fatal(sig);
     crate::thread::set_group_exiting(current_proc_slot());
-    // `EXIT_STATUS` is a diagnostic counter, not the path the status travels:
-    // [`run_process`] overwrites it with `enter_user`'s return value the moment
-    // the task leaves ring 3. The real carrier is `%rax`, which is why
-    // `signal::deliver_pending` returns `-(sig)` rather than the interrupted
-    // syscall's result. Stored anyway for the same reason `Syscall::ExitGroup`
-    // stores it: the two arms should read alike.
-    EXIT_STATUS.store((-(i64::from(sig))) as u64, Ordering::Relaxed);
+    // The status travels in `%rax`: [`run_process`] reads `enter_user`'s
+    // return value, which is why `signal::deliver_pending` returns `-(sig)`
+    // rather than the interrupted syscall's result.
     mark_leave();
 }
 
 /// Leave ring 3 as `exit_group(code)` does: mark the group exiting and set
-/// `leave`, which the syscall return path reads. The same three lines
-/// [`exit_current_from_signal`] has for a death by signal, with a plain code.
-pub fn exit_current_with_code(code: u64) {
+/// `leave`, which the syscall return path reads. The code itself is the
+/// caller's return value, carried out in `%rax` to [`run_process`].
+pub fn exit_current_group() {
     crate::thread::set_group_exiting(current_proc_slot());
-    EXIT_STATUS.store(code, Ordering::Relaxed);
     mark_leave();
 }
 
@@ -1914,19 +1906,16 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             {
                 crate::thread::exit_group_from_thread(current_proc_slot(), p.tgid, a1);
             }
-            exit_current_with_code(a1);
+            exit_current_group();
             a1
         }
         Syscall::Exit => {
             // A main thread's `exit` is a process exit: nothing else runs in
             // its address space, and `run_process` is the only frame below it.
             // A non-main thread's is not — it must leave ring 3 without
-            // touching `EXIT_STATUS`, the fd table or the spawn record, all of
-            // which belong to the process it is only one thread of.
-            let scope = akuma_syscalls_proc::exit::scope(false, !crate::thread::current_is_main());
-            if scope == akuma_syscalls_proc::exit::Scope::Group {
-                EXIT_STATUS.store(a1, Ordering::Relaxed);
-            }
+            // touching the fd table or the spawn record, both of which belong
+            // to the process it is only one thread of. Either way the status
+            // is `a1`, carried out in `%rax`.
             mark_leave();
             a1
         }
@@ -3934,7 +3923,6 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     // user-accessible in the address space the scheduler installed for this
     // task, and every program this kernel runs ends in exit_group.
     let status = enter_user(first.pc, first.sp, forked_child);
-    EXIT_STATUS.store(status, Ordering::Relaxed);
     // **This task slot is the process's tid, and it stays the zombie's until the
     // reap** (`hold_exited_thread_slot`; `unregister_process` releases it).
     // Reissued at `sched::finish` below, as it used to be, the tid named the
@@ -4189,6 +4177,29 @@ fn start_test_process(
 /// what every production drain site uses. It also drains the TTBR-deferred
 /// frame list, which is where an address space's frames go if another core's
 /// `CR3` still stands on its L0.
+#[cfg(not(feature = "no-tests"))]
+/// Drive the scheduler until self-test process `pid` has exited, and return
+/// **its own** exit status (`u64::MAX` if it did not exit within `spins`).
+///
+/// Read from the process's exit channel, which `run_process` marks with the
+/// full status after it has drained the process's threads. The tests used to
+/// read a global "last exit status" instead, which every process on every core
+/// stored as it left ring 3 — a forked child or a straggler from an earlier
+/// test could overwrite the probe's status between the reset and the read, and
+/// the thread probe intermittently reported `0x0`. A `waitpid` status would not
+/// do either: it keeps 8 bits, and the probes report 9- and 12-bit masks.
+fn wait_test_exit(pid: u32, spins: u64) -> u64 {
+    let Some(ch) = akuma_exec::process::get_child_channel(pid) else {
+        return u64::MAX;
+    };
+    let mut n = 0u64;
+    while !ch.has_exited() && n < spins {
+        n += 1;
+        crate::sched::yield_now();
+    }
+    if ch.has_exited() { i64::from(ch.exit_code()).cast_unsigned() } else { u64::MAX }
+}
+
 #[cfg(not(feature = "no-tests"))]
 fn finish_test_process(pid: u32, task_slot: usize) {
     reap_exec_process(pid, task_slot);
@@ -6348,7 +6359,7 @@ fn spawn_row_of(pid: u32) -> Option<usize> {
 ///
 /// Spawns `/bin/hello` — the same image `elf_test` runs, but this time its
 /// stdout is a pipe rather than the console and its exit status arrives through
-/// `waitpid` rather than the `EXIT_STATUS` global. The self-test calls
+/// `waitpid` rather than the process's exit channel. The self-test calls
 /// `sys_spawn` with kernel pointers, which is fine: `user_cstr` just does
 /// volatile reads and the kernel may read its own memory.
 pub fn spawn_test(t: &mut Suite) {
@@ -8550,15 +8561,8 @@ pub fn elf_test(t: &mut Suite) {
     };
     t.check("elf: process spawned", true);
 
-    EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
     serial::puts("  -- userspace output follows (from an ELF image) --\n");
-    let mut spins = 0u64;
-    while !crate::sched::all_user_tasks_finished() && spins < 10_000 {
-        spins += 1;
-        crate::sched::yield_now();
-    }
-
-    let status = EXIT_STATUS.load(Ordering::Relaxed);
+    let status = wait_test_exit(started.0, 10_000);
     t.check_eq("elf: program ran and reported every check", status, ALL_OK);
     if status != ALL_OK && status != u64::MAX {
         // Name the failures individually. A bare "got 0x2F, want 0x3F" makes the
@@ -8857,14 +8861,7 @@ pub fn fdprobe_test(t: &mut Suite) {
     };
     t.check("fdprobe: spawned", true);
 
-    EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
-    let mut spins = 0u64;
-    while !crate::sched::all_user_tasks_finished() && spins < 10_000 {
-        spins += 1;
-        crate::sched::yield_now();
-    }
-
-    let status = EXIT_STATUS.load(Ordering::Relaxed);
+    let status = wait_test_exit(started.0, 10_000);
     t.check_eq("fdprobe: every syscall claim held", status, ALL_OK);
     if status != ALL_OK && status != u64::MAX {
         // Name the failures individually rather than making the reader decode a
@@ -9113,14 +9110,7 @@ pub fn thread_test(t: &mut Suite) {
     };
     t.check("thread: probe spawned", true);
 
-    EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
-    let mut spins = 0u64;
-    while !crate::sched::all_user_tasks_finished() && spins < 200_000 {
-        spins += 1;
-        crate::sched::yield_now();
-    }
-
-    let status = EXIT_STATUS.load(Ordering::Relaxed);
+    let status = wait_test_exit(started.0, 200_000);
     t.check_eq("thread: probe reported every check", status, ALL_OK);
     if status != ALL_OK && status != u64::MAX {
         // Named individually: a bitmask in a boot log is a puzzle, and each of
@@ -9197,7 +9187,6 @@ pub fn kill_test(t: &mut Suite) {
         t.check("kill: probe spawned", false);
         return;
     };
-    EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
 
     // Let it reach the state: three workers registered, then a few hundred
     // more rounds so the parkers are parked and the spinner has been ticked.
@@ -9220,21 +9209,16 @@ pub fn kill_test(t: &mut Suite) {
     t.check_eq("kill: kill(pid, SIGKILL) is accepted",
         syscall_dispatch(Syscall::Kill.to_x86_64(), u64::from(pid), 9, 0, 0, 0, 0), 0);
 
-    let mut spins = 0u64;
-    while !crate::sched::all_user_tasks_finished() && spins < 400_000 {
-        spins += 1;
-        crate::sched::yield_now();
-    }
+    let status = wait_test_exit(pid, 400_000);
     let took_us = crate::net::uptime_us().saturating_sub(t0);
-    t.check("kill: the group finished", crate::sched::all_user_tasks_finished());
+    t.check("kill: the group finished", status != u64::MAX);
     // Well under the 2 s grace the old path always paid; the tick that reaches
     // the spinner is 10 ms.
     t.check("kill: the group was gone within a second", took_us < 1_000_000);
     t.check_eq("kill: no thread was terminated by a peer",
         akuma_threading::cross_thread_terminations() as u64, cross_before as u64);
     t.check_eq("kill: every thread row came back", crate::thread::live_count(SLOT) as u64, 0);
-    t.check_eq("kill: the status is a SIGKILL death",
-        EXIT_STATUS.load(Ordering::Relaxed), SIGKILL_STATUS);
+    t.check_eq("kill: the status is a SIGKILL death", status, SIGKILL_STATUS);
     // A `kill(2)` at a dead pid: the row is a zombie until reaped, which is
     // still "exists" (0) — by pid and by its process group (Linux keeps a
     // zombie in its pgrp's task list until it is reaped). After the reap the
@@ -9281,17 +9265,12 @@ pub fn sigregs_test(t: &mut Suite) {
         t.check("sigregs: probe spawned", false);
         return;
     };
-    EXIT_STATUS.store(u64::MAX, Ordering::Relaxed);
     // 48 deliveries at one per millisecond, plus the TCG tax; the probe caps
     // itself long before this and reports 3/5 rather than hanging.
-    let mut spins = 0u64;
-    while !crate::sched::all_user_tasks_finished() && spins < 8_000_000 {
-        spins += 1;
-        crate::sched::yield_now();
-    }
-    t.check("sigregs: the probe finished", crate::sched::all_user_tasks_finished());
+    let status = wait_test_exit(pid, 8_000_000);
+    t.check("sigregs: the probe finished", status != u64::MAX);
     t.check_eq("sigregs: rcx, r11 and the SSE/AVX file survive tick- and fault-time signals (exit 0)",
-        EXIT_STATUS.load(Ordering::Relaxed), 0);
+        status, 0);
     finish_test_process(pid, task_slot);
     t.check_eq("sigregs: teardown leaks nothing", akuma_pmm::free_count() as u64, free_before as u64);
 }
