@@ -131,52 +131,41 @@ pub fn halt() -> ! {
         akuma_cpu::park::wfi();
     }
 }
+
+/// RAM base and size, from the machine's `Facts` (multiarch M2: both kernels read
+/// memory from the neutral description, not from their protocol's parser).
+///
+/// `facts` is `None` when there is no DTB, or one `akuma_firecracker::describe_fdt`
+/// cannot describe (no memory node with a size, no GIC node); both fall back to
+/// QEMU virt's defaults, as a missing DTB always did. The first RAM region is the
+/// one used — the same region the FDT's own `memory` node lists first.
 #[cfg(target_os = "none")]
-fn detect_memory(fdt: Option<&akuma_fdt::Fdt<'_>>) -> (usize, usize) {
+fn detect_memory(facts: Option<&akuma_machine_facts::Facts>, have_fdt: bool) -> (usize, usize) {
     const DEFAULT_RAM_BASE: usize = 0x4000_0000; // QEMU virt: 1 GB
 
     const DEFAULT_RAM_SIZE: usize = 256 * 1024 * 1024;
     const DTB_RESERVE: usize = 2 * 1024 * 1024; // 2 MB
 
-    let Some(fdt) = fdt else {
-        console::print("[Memory] No DTB found, using default 256MB\n");
+    let Some(region) = facts.and_then(|f| f.ram().first().copied()) else {
+        if have_fdt {
+            console::print("[Memory] DTB does not describe this machine, using defaults\n");
+        } else {
+            console::print("[Memory] No DTB found, using default 256MB\n");
+        }
         return (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE - DTB_RESERVE);
     };
-
-    // Get memory regions from DTB
-    let memory = fdt.memory();
-    if let Some(region) = memory.regions().next() {
-        let base = region.starting_address as usize;
-        let ram_size = region.size.unwrap_or(DEFAULT_RAM_SIZE);
-        
-        console::print("[Memory] Detected from DTB: base=0x");
-        console::print_hex(base as u64);
-        console::print(", size=");
-        console::print_dec(ram_size / 1024 / 1024);
-        console::print(" MB\n");
-        (base, ram_size)
-    } else {
-        console::print("[Memory] No memory region in DTB, using defaults\n");
-        (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE - DTB_RESERVE)
-    }
+    let base = region.base as usize;
+    let ram_size = region.size as usize;
+    console::print("[Memory] Detected from DTB: base=0x");
+    console::print_hex(base as u64);
+    console::print(", size=");
+    console::print_dec(ram_size / 1024 / 1024);
+    console::print(" MB\n");
+    (base, ram_size)
 }
 
-/// Decide the kernel heap size (bytes) for a given RAM size and code+stack reserve.
-///
-/// Pure function so it can be unit-tested without booting (see
-/// `tests::test_compute_heap_size`).
-///
-/// - `config::KERNEL_HEAP_SIZE_MB != 0` → use that fixed value (manual override).
-/// - **RAM ≥ 256 MB** → the historical generous heap: `1/8 of RAM, clamped to
-///   [64 MB, 256 MB]`. Unchanged so the common 256 MB+ configs and memory-hungry
-///   workloads (go build, bun, rustc metadata) behave exactly as before.
-/// - **RAM < 256 MB** → scale down: target `1/8 of RAM` with an 8 MB floor (the
-///   kernel boots using only ~2 MB of heap), but **never more than half of the
-///   memory left after code+stack**, so user pages always survive. The old code
-///   used a flat 64 MB floor here, which left 0 user pages below ~72 MB (no boot)
-///   and starved user RAM at 128 MB.
-///   Kernel physical-RAM layout: three contiguous regions starting at `ram_base`
-///   — `[.. heap_start)` code+boot-stack, `[heap_start ..)` heap, then user pages.
+/// Kernel physical-RAM layout: three contiguous regions starting at `ram_base` —
+/// `[.. heap_start)` code+boot-stack, `[heap_start ..)` heap, then user pages.
 pub struct MemoryLayout {
     pub code_and_stack: usize,
     pub heap_start: usize,
@@ -242,6 +231,20 @@ pub fn reserve_calc_ram(ram_size: usize, clamp_mb: usize) -> usize {
     }
 }
 
+/// Decide the kernel heap size (bytes) for a given RAM size and code+stack reserve.
+///
+/// Pure function so it can be unit-tested without booting (see
+/// `tests::test_compute_heap_size`).
+///
+/// - `config::KERNEL_HEAP_SIZE_MB != 0` → use that fixed value (manual override).
+/// - **RAM ≥ 256 MB** → the historical generous heap: `1/8 of RAM, clamped to
+///   [64 MB, 256 MB]`. Unchanged so the common 256 MB+ configs and memory-hungry
+///   workloads (go build, bun, rustc metadata) behave exactly as before.
+/// - **RAM < 256 MB** → scale down: target `1/8 of RAM` with an 8 MB floor (the
+///   kernel boots using only ~2 MB of heap), but **never more than half of the
+///   memory left after code+stack**, so user pages always survive. The old code
+///   used a flat 64 MB floor here, which left 0 user pages below ~72 MB (no boot)
+///   and starved user RAM at 128 MB.
 #[must_use]
 pub fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize {
     const MB: usize = 1024 * 1024;
@@ -751,7 +754,8 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
             }
         }
 
-        if let Some(f) = platform::fdt_facts(fdt.as_ref()) {
+        let facts = platform::fdt_facts(fdt.as_ref());
+        if let Some(f) = facts.as_ref() {
             safe_print!(160, "[Platform] facts: {}, {} MiB in {} region(s), cpus {}, virtio {}, irq {}  [{}]\n",
                 f.provenance.name(),
                 f.ram_bytes() / (1024 * 1024),
@@ -767,7 +771,7 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
                 if f.validate().is_ok() { "ok" } else { "INVALID" });
         }
 
-        let ram = detect_memory(fdt.as_ref());
+        let ram = detect_memory(facts.as_ref(), fdt.is_some());
 
         // Real (shared-kernel) SMP: snapshot CPU/PSCI info from the DTB NOW, before the
         // heap allocator (which can be placed exactly at the DTB's address on

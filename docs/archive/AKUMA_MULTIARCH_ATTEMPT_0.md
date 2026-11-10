@@ -424,3 +424,27 @@ which is exactly the free-frame difference.
 `445fe139` baseline (`s4b4`, 727 s timeout) and on this candidate (1 of 2): the suite passes `kill`,
 starts `sigregs`, the log shows ~8 `[sig!]` deliveries of its null-store `SIGSEGV`, then nothing. Not
 the known post-netpoll stall (that one stops before the suite). Not investigated yet.
+
+### W1c — the AArch64 kernel's memory bring-up reads `Facts` too (2026-11-10)
+
+The last M2 `Facts` consumer on the AArch64 side. `akuma-kernel-glue::detect_memory` parsed the FDT's
+`memory` node itself, a second reader beside `platform::fdt_facts` (which already built a `Facts` for
+the `[Platform] facts:` line and threw it away). It now takes `Option<&Facts>` and uses the first RAM
+region, and `kernel_main` builds the `Facts` once and hands it to both.
+
+- **One pinned behaviour change, on a path no supported machine takes:** a DTB that
+  `akuma_firecracker::describe_fdt` cannot describe (no `memory` node with a size, or no GIC node) used
+  to have its memory node read anyway; now it takes QEMU virt's defaults and says
+  `[Memory] DTB does not describe this machine, using defaults`. A DTB with a memory node but no
+  `size` used to be read as 256 MB; `describe_fdt` refuses it, same defaults. QEMU virt, Lima's KVM
+  machine and Firecracker all describe cleanly (the `facts:` line reads `ok` on each).
+- Fixed in passing: `compute_heap_size`'s doc comment had drifted onto `struct MemoryLayout`, leaving
+  the function undocumented; each has its own again.
+
+**Gates.** clippy `-D warnings` (`akuma-kernel-glue`, aarch64). Lima KVM, SMP=1, interleaved
+`280496b3` (stashed HEAD) vs candidate, 3 runs each: **313 passed, 1 failed in all six**, the failure
+being `test_epoll_socket_waker`'s 10 ms latency threshold on both sides (baseline 9.2–10.4 ms,
+candidate 8.8–20.7 ms) — a tick-granularity threshold under KVM, not this change. The
+`[Memory] Detected from DTB: base=0x40000000, size=512 MB` line is identical in all six. The final
+binary differs from the tested one only by doc-comment moves: `.text` identical, one panic-location
+byte in `.rodata`.
