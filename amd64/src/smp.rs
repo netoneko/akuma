@@ -479,15 +479,13 @@ const AP_ONLINE_BUDGET: u64 = 200_000_000;
 /// means "stay single-core", which is a configuration, not a failure.
 #[must_use]
 pub fn trampoline_page_available(machine: &MachineDescription, keep_out: &[(u64, u64)]) -> bool {
-    let (page_start, page_end) = (AP_TRAMPOLINE_PA, AP_TRAMPOLINE_PA + 4096);
-    let in_ram = machine
-        .regions()
-        .iter()
-        .any(|r| r.kind == 1 && r.addr <= page_start && r.addr + r.size >= page_end);
-    let clear = keep_out
-        .iter()
-        .all(|&(s, e)| e <= page_start || s >= page_end);
-    in_ram && clear
+    use akuma_machine_facts::{Provenance, Range};
+    // The decision is the neutral one (`Facts::is_clear_ram`); this function only names the page
+    // and converts the caller's `[start, end)` pairs.
+    machine.facts(Provenance::Pvh).is_clear_ram(
+        Range::new(AP_TRAMPOLINE_PA, 4096),
+        keep_out.iter().map(|&(s, e)| Range::new(s, e.saturating_sub(s))),
+    )
 }
 
 /// Copy the trampoline to its page (`akuma_boot_amd64::ap`). Returns false if it does not fit below the mailbox.

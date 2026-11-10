@@ -47,6 +47,13 @@ impl Range {
         addr >= self.base && addr < self.end()
     }
 
+    /// Does `self` wholly contain `other`? An empty `other` is covered by anything that contains
+    /// its base.
+    #[must_use]
+    pub const fn covers(self, other: Self) -> bool {
+        self.base <= other.base && other.end() <= self.end()
+    }
+
     /// Do the two spans share any byte? Empty spans overlap nothing.
     #[must_use]
     pub const fn overlaps(self, other: Self) -> bool {
@@ -188,6 +195,17 @@ impl Facts {
         self.ram().iter().copied().find(|r| r.contains(pa))
     }
 
+    /// Is `span` wholly inside one RAM region and clear of every `keep_out` range?
+    ///
+    /// The boot loader may have placed things in RAM that the memory map does not mention (a PVH
+    /// start-info block, GRUB's information block, a root-image module). A caller about to write
+    /// to a fixed page — the AP trampoline is the one today — names what it must not clobber and
+    /// asks. `false` is a configuration ("stay single-core"), not a failure.
+    #[must_use]
+    pub fn is_clear_ram(&self, span: Range, keep_out: impl IntoIterator<Item = Range>) -> bool {
+        self.ram().iter().any(|r| r.covers(span)) && keep_out.into_iter().all(|k| !k.overlaps(span))
+    }
+
     /// Check the invariants every consumer assumes. `O(n²)` over at most `MAX_RAM`/`MAX_VIRTIO`
     /// entries, once, at boot.
     ///
@@ -314,6 +332,50 @@ mod tests {
         assert_eq!(f.ram_containing(0x20_0000).map(|r| r.base), Some(0x10_0000));
         assert_eq!(f.ram_containing(0x50), None);
         assert_eq!(f.ram_bytes(), 0x7ff0_0000);
+    }
+
+    #[test]
+    fn a_span_inside_ram_and_clear_of_keep_out_is_clear_ram() {
+        let f = ok();
+        let page = Range::new(0x20_8000, 0x1000);
+        assert!(f.is_clear_ram(page, []));
+        assert!(f.is_clear_ram(page, [Range::new(0x20_9000, 0x1000), Range::new(0x20_7000, 0x1000)]));
+    }
+
+    #[test]
+    fn keep_out_touching_the_span_refuses_it() {
+        let f = ok();
+        let page = Range::new(0x10_8000, 0x1000);
+        assert!(!f.is_clear_ram(page, [Range::new(0x10_8fff, 1)]));
+        assert!(!f.is_clear_ram(page, [Range::new(0x10_0000, 0x10_0000)]));
+        // an empty keep-out (the "no module" sentinel `(0, 0)`) overlaps nothing
+        assert!(f.is_clear_ram(page, [Range::new(0, 0)]));
+    }
+
+    #[test]
+    fn a_span_outside_or_straddling_ram_is_not_clear_ram() {
+        let f = ok(); // RAM starts at 0x10_0000
+        assert!(!f.is_clear_ram(Range::new(0x8000, 0x1000), []), "below RAM");
+        assert!(!f.is_clear_ram(Range::new(0x10_0000 - 0x800, 0x1000), []), "straddles the start");
+        let end = 0x10_0000 + 0x7ff0_0000;
+        assert!(f.is_clear_ram(Range::new(end - 0x1000, 0x1000), []), "last page");
+        assert!(!f.is_clear_ram(Range::new(end - 0x800, 0x1000), []), "straddles the end");
+    }
+
+    #[test]
+    fn a_span_split_across_two_ram_regions_is_not_clear_ram() {
+        let mut f = Facts::new(Provenance::Pvh);
+        assert!(f.push_ram(Range::new(0, 0x1000)));
+        assert!(f.push_ram(Range::new(0x1000, 0x1000)));
+        assert!(!f.is_clear_ram(Range::new(0x800, 0x1000), []), "adjacent regions are two regions");
+    }
+
+    #[test]
+    fn range_covers_is_containment() {
+        assert!(Range::new(0, 10).covers(Range::new(2, 3)));
+        assert!(Range::new(0, 10).covers(Range::new(0, 10)));
+        assert!(!Range::new(0, 10).covers(Range::new(5, 6)));
+        assert!(!Range::new(5, 10).covers(Range::new(4, 2)));
     }
 
     #[test]
