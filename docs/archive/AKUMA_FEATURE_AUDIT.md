@@ -60,6 +60,23 @@ measured starting point. Read-only audit; nothing changed yet.
 7. **Features unification risk** (research doc §7) is a direct consequence of 1: two lists, so a
    flag added to one kernel is easy to forget on the other.
 
+## F1 applied (2026-11-10): `scripts/check_feature_parity.py`
+
+A ratchet, not an equality check: it records today's differences between the 16 common features in
+`docs/reference/feature-parity-baseline.json` and fails only on a **new** one (the way through is
+`--update`, like `check_unsafe_budget.py`). Three of the 16 differ today, none changed by this commit:
+
+- `no-tests`: amd64's is a bare cfg flag; AArch64's also forwards `akuma-exec/no-tests`,
+  `akuma-syscalls-glue/no-tests` and `akuma-net/small-sockets`. So an amd64 `no-tests` build keeps
+  the full-size socket table and the test-only code in those crates.
+- `sc-sysv-ipc`: amd64 does not forward `akuma-vfs-glue/sc-sysv-ipc`.
+- `smp-shared`: amd64 does not forward `akuma-net/smp-shared` or `akuma-primitives/smp-shared`
+  (AArch64 does), and forwards the `no-bkl-vfs` leaf crates directly where AArch64 goes through
+  `no-bkl-vfs`/`no-bkl-irq`.
+
+Whether each is intentional for the metal build is the owner's call; the checker only stops a
+fourth from appearing unnoticed.
+
 ## Proposed simplifications (none applied)
 
 | # | change | risk | gate |
