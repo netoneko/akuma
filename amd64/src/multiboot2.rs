@@ -151,7 +151,7 @@ impl Framebuffer {
         if self.back.is_some() {
             return true;
         }
-        if self.bytes_per_pixel != 4 || self.pitch % 4 != 0 {
+        if self.bytes_per_pixel != 4 || !self.pitch.is_multiple_of(4) {
             return false;
         }
         let stride = self.pitch / 4;
