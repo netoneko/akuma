@@ -277,6 +277,27 @@ fn wait(uaddr: u64, val: u32, bitset: u32, deadline_at: u64, private: bool) -> u
             let _ = WAITERS.lock().remove_anywhere(tgid, me);
             return errno::EINTR;
         }
+        // **A deliverable signal ends a futex wait even when its handler has
+        // `SA_RESTART`.** `should_interrupt_blocking_syscall` deliberately skips
+        // `SA_RESTART` handlers ("not reporting it makes the loop take another
+        // pass, which is a restart" — right for `read`/`write`, which is why Go's
+        // `SIGURG` works), but a delivery happens at syscall *return*, and a futex
+        // waiter that loops instead of returning never reaches it: the handler
+        // never runs. JavaScriptCore's concurrent GC suspends the mutator with a
+        // `pthread_kill` and waits for that handler to post a semaphore while the
+        // mutator sits in `FUTEX_WAIT` on a stack latch — a deadlock Linux does not
+        // have, because it runs the handler and restarts the wait. Every futex
+        // caller already tolerates `EINTR` (musl, `std` and WTF all loop), so
+        // return it and let the epilogue deliver. The aarch64 path does the same
+        // (`akuma-syscalls-glue`'s `signal_pending`). Blocked signals do not count.
+        // `docs/archive/BUN_GC_FUTEX_HANG_2026_11_10.md`.
+        if akuma_exec::threading::pending_signals_raw(me)
+            & !akuma_exec::threading::thread_signal_mask()
+            != 0
+        {
+            let _ = WAITERS.lock().remove_anywhere(tgid, me);
+            return errno::EINTR;
+        }
         if deadline::expired(deadline_at, crate::net::uptime_us()) {
             // `remove_anywhere`, not `dequeue(key, ..)`: a `FUTEX_REQUEUE` may
             // have moved this waiter behind its back, and dequeuing from the

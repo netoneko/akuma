@@ -1,6 +1,6 @@
-# Bun hangs ~10 s in: main thread parked on a futex nobody wakes (OPEN)
+# Bun hangs ~10 s in: a signal handler never runs because a futex wait ignores SA_RESTART signals (FIXED)
 
-**Status: OPEN — root cause not found.** Started as "interactive `claude` stops reading keyboard
+**Status: FIXED 2026-11-10 (amd64 `FUTEX_WAIT` now returns `EINTR` for any deliverable pending signal).** Started as "interactive `claude` stops reading keyboard
 input on the ryzen"; the evidence below says it is **not** stdin, a tty, or epoll. Updated as
 evidence arrives; every section is dated.
 
@@ -72,7 +72,40 @@ run, 4-vCPU guest:
 So the helper's `FUTEX_WAKE` on the latch either never happened or never matched. Next: capture
 the helpers' futex calls (same tgid) to see whether the latch wake was issued and on what address.
 
-## Candidate causes (not yet tested)
+## Root cause and fix (2026-11-10)
+
+`BUN_JSC_useConcurrentGC=0` makes the GC-script hang disappear (0/6 hangs; baseline 5/6, one marker
+thread 6/6, JIT off 5/6), which points at the concurrent collector — and JavaScriptCore's collector
+**suspends the mutator with a signal**: `pthread_kill(main, SIGUSR1)`, then waits for main's handler to
+post a semaphore. The main thread is parked in `FUTEX_WAIT` (on a stack latch) when the signal
+arrives. The signal wakes it (the spurious `k2`/`k4` ready in the trace) but `amd64/src/futex.rs`'s
+wait loop only asked `should_interrupt_blocking_syscall()`, which **deliberately skips `SA_RESTART`
+handlers** ("not reporting it makes the loop take another pass — a restart"). That is fine for
+`read`/`write` but wrong for a loop that never returns to user mode: delivery happens at syscall
+return, so the handler never runs, the collector waits forever, and the whole process is parked.
+Linux runs the handler and restarts the wait. WTF installs its suspend handler with `SA_RESTART`.
+
+Minimal reproducer (no Bun, `scratchpad/srfutex.c`): thread A blocks in `FUTEX_WAIT`; thread B
+`pthread_kill`s it and waits 3 s for the handler. Before: `SA_RESTART=1 handler_ran=0`,
+`SA_RESTART=0 handler_ran=1`. After: both run the handler and A's wait returns `-4`.
+
+Fix: in the amd64 futex wait loop, a pending signal not blocked by the thread's mask
+(`pending_signals_raw(me) & !thread_signal_mask() != 0`) ends the wait with `EINTR`, whatever
+`SA_RESTART` says. Every futex caller (musl, Rust `std`, WTF) already loops on `EINTR`. The aarch64
+path already did this (`akuma-syscalls-glue/src/sync.rs`: `signal_pending`), so it never had the bug.
+
+Verified in the 4-vCPU KVM guest: GC script **12/12 pass** (was ~50-80% hang), original stdin repro
+**8/8 pass** (stalled at ~10 s almost every time), `srfutex` passes in both modes.
+
+Other blocking waits that use `should_interrupt_blocking_syscall` alone (pipe/socket/poll families)
+keep the `SA_RESTART` skip; a program that signals a thread parked there with a `SA_RESTART` handler
+and waits for the handler hits the same shape. Not observed; audit if one shows up.
+
+Open oddity: on the trashcan the same `srfutex 1` run reports `handler_ran=1` (A returns `-4`) with the
+same `c523598a` version string, i.e. its kernel already behaved as fixed for that test while the Bun
+stall still reproduced there with stdin keys. Not explained.
+
+## Candidate causes (superseded)
 
 - A wake lost on the `FUTEX_CMP_REQUEUE` / condvar path musl uses for WTF's condvars
   (`amd64/src/futex.rs`, `akuma-syscalls-sync`), e.g. the waiter moved to a key the later
@@ -100,10 +133,6 @@ Separate defect; not the cause here (the stall also happens between dumps).
 - Do not run `taskset` (affinity experiments) on the ryzen's metal Akuma: one preceded a hard lockup
   and a watchdog reset to Pop.
 
-## Next
-
-Trace every futex operation of the Bun process (wait / wake / requeue with address, thread, result,
-woken count) into the ring and find the wake that should have reached `uaddr=0x7fffffffd024`'s key.
 
 ## Background
 
