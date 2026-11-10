@@ -312,3 +312,17 @@ failures appear on the baseline too and are different tests:
   on another core and `close_all` has emptied the table first. Open: the fix needs a child that blocks
   until told (e.g. reads stdin) so the inspection window is real; not changed here.
 - **netpoll laps / stall after "netpoll daemon spawned":** the TCG SMP=4 stall M0 recorded. Not a gate.
+
+## W5b — `check_addr_params.py` back to green (2026-11-10)
+
+It failed on `main` too (+29 over budget in six crates). Cause: the 2026-11-06 `unsafe` sweep
+(`15b40615`, `c2f58d79`, `fa01c1af`, `7c425e96`) moved raw-pointer operations into new leaf crates
+(`akuma-switch`, `akuma-frame-raw`, `akuma-mmu-raw`) and the untyped `pa`/`addr`/`base` parameters
+moved with them, the same day the address budget was recorded; `akuma-pagetable` (+3) and
+`akuma-threading` (+2) gained the checked doors that replaced `Frame::from_pa` claims. Nothing caught
+it because **the pre-commit hook does not run `check_addr_params.py`** (the hook lives in `.git/hooks`
+and is not versioned, so this branch cannot change that; worth adding by the owner). This branch's
+`akuma-machine-facts` (M2a) added 3. Resolved with a justified `--update` (per-crate reasons in
+`docs/reference/typed-addresses.md`'s status table); the same run ratcheted `amd64` 87→85,
+`akuma-exceptions` 16→15 and `akuma-pmm` 53→49 **down**. Total 704 in 55 components. Typing the raw
+leaves is the bottom-up sweep that doc already orders, not this branch's work.
