@@ -87,6 +87,8 @@ The multiboot2 side of M1a–M1c is therefore boot-verified under KVM (not on th
   - amd64 PVH (TCG, SMP=4): `facts: pvh, 2047 MiB in 2 region(s), cpus 4, virtio 2, irq ioapic  [ok]`, suite **836/0**.
   - AArch64 (QEMU HVF, SMP=2): `[Platform] facts: fdt, 512 MiB in 1 region(s), cpus 2, virtio 8, irq gicv3  [ok]`, boot suite green.
   Report-only: a failing `validate()` prints `INVALID` and the boot continues exactly as before.
+  - amd64 **multiboot2** (ryzen KVM rig, entry 31, `087da1e1`): `facts: multiboot2, 3066 MiB in 8 region(s), cpus 4, virtio 0, irq ioapic  [ok]`, suite **826/0**, 4 CPUs online.
+    (`virtio 0` is right: a firmware boot has no virtio-MMIO command line; PCI devices are not in `Facts` yet.)
 - **Not yet:** nothing *consumes* `Facts` — `mem::init`, `blk::init`, `smp::start_secondaries` and
   `detect_memory` still read their protocol-shaped descriptions. Switching them is the real M2
   payoff and the next step, one consumer at a time. The AArch64 compile-time map
