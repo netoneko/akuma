@@ -918,3 +918,48 @@ write-up and timings: `docs/archive/HOOKED_IRQ_SIGNAL_DELIVERY.md`.
   `test_epoll_socket_waker`.
 - epoll and futex suites: all pass at SMP=2 and 4, with `stuck` 1 and 38.
 - clippy is clean with and without `hooked-sched`.
+
+## Thread churn: the `[unregister]` print (2026-11-10)
+
+The long BKL holds above were not the scheduler's. With `bkl-profile` and the hooked path tagged
+(`irq_hooked` transient `irq`, idle `idle`, tag reload in `switch_to`), 50 of 64 stuck lines
+were blamed on `idle`. A temporary timing probe in the hooked idle loop then showed about 6 ms
+per reclaimed slot. The cost was one console line per thread exit,
+`[unregister] ... has NO map owner`, which is normal on AArch64 and is a trap per byte under
+KVM. Rate-limiting that line took `futextest` from about 13 s to 2.5–3.3 s on both schedulers,
+with 0 stuck lines. Write-up and numbers: `docs/archive/UNREGISTER_PRINT_BKL_HOLDS.md`.
+
+**Harness correction.** Two SGI SMP=2 boots looked wedged ("did not reach herd"). Both had
+passed the suite and started herd. The console tore `[herd] Userspace supervisor starting` at
+SMP>1, so my harness's marker grep missed it, the failure CLAUDE.md warns about. It now matches
+`[Main] Starting herd supervisor`, which one core prints.
+
+## Extreme-size under the hooked scheduler (2026-11-10)
+
+`scripts/build_extreme_size.sh --features hooked-sched` builds; the image is 4 KB smaller than
+SGI's. QEMU HVF, `SNAPSHOT=1`, 8 MB, the same commands on both kernels (ssh through `paws`, files
+fetched with `busybox wget`):
+
+| | SGI | hooked |
+|---|---|---|
+| boot to ssh | 3 s | 3 s |
+| `tcc -o /tmp/h /tmp/h.c` | ok | ok |
+| `sigspin 3` | 2 PASS, 3 FAIL (no delivery to spinners) | **5 PASS**, about 1 ms delivery |
+| `MemFree` after boot | 3,692–3,752 kB | 3,292–3,400 kB |
+
+**Open, before hooked becomes the default:**
+
+- **hooked leaves about 350–400 kB less free at 8 MB.** One known part is core 0's idle loop,
+  which is its own slot with a 96 KB zeroed system stack where SGI idles on the boot stack. The
+  rest is not accounted for yet.
+- **The 4 MB floor (acceptance 05) does not boot on this branch or on `main`.** QEMU stops with
+  `Not enough space for DTB after kernel/initrd`. With .bss included, the image ends at about
+  0x40235000 (main 0x40235040), past the 0x40200000 the 1 MB `text_offset` layout needs. It is
+  not the scheduler, since the SGI build fails the same way.
+- **`/tmp/h` from tcc logs a SIGSEGV on both kernels at 8 MB.** It exits 0 according to `paws`.
+  Not investigated.
+
+**Trashcan.** The fair A/B rebooted the box from c523598a into 6a817703 at 21:27, and it has not
+come back: no ping, no ARP. The six c523598a rounds before that were clean, 7–10 µs p50 with no
+1 ms mode. The box needs a power cycle. Its GRUB default boots `/boot/akuma-amd64`, now
+6a817703, and the fallback boots the untouched `.good`.

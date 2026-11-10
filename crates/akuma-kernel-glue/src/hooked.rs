@@ -117,6 +117,11 @@ fn root_for(slot: usize) -> u64 {
 }
 
 fn switch_to(from: usize, to: usize) {
+    // BKL-hold profiler (one relaxed load unless `bkl-profile` turned it on): the core's
+    // sampling cache follows the incoming thread, as the SGI path's
+    // `set_current_thread_register` does. Without it a waiter blames the incoming thread's
+    // hold on whatever the outgoing one was doing.
+    akuma_exec::sync::load_thread_tag_to_core(akuma_exec::bkl::current_core_id(), to);
     if let (Some(out), Some(inc)) = (SAVED_TLS.get(from), SAVED_TLS.get(to)) {
         out.store(akuma_cpu::sysreg::tpidr_el0(), Relaxed);
         akuma_cpu::sysreg::set_tpidr_el0(inc.load(Relaxed));
@@ -242,6 +247,8 @@ pub fn enter_user(ctx: &UserContext) -> ! {
 extern "C" fn idle_main() -> ! {
     loop {
         akuma_exec::bkl::enter_kernel();
+        // BKL-hold profiler only (a relaxed load unless `bkl-profile` turned it on).
+        akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IDLE);
         // The collector, not the x86 reaper: this kernel's process teardown is its cleanup
         // callback, which the reaper does not run (`akuma-threading/collector-recycles`).
         threading::reclaim_terminated_slots();

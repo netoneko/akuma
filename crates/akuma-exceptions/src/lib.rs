@@ -2430,6 +2430,10 @@ pub fn irq_hooked(el0: Option<FrameHandle>) {
     if !held {
         akuma_exec::bkl::enter_kernel();
     }
+    // BKL-hold profiler only (one relaxed load unless `bkl-profile` turned it on): this
+    // excursion is the interrupt's, not the interrupted thread's, as on the SGI path.
+    #[cfg(kernel_smp_shared)]
+    akuma_exec::sync::set_core_tag_transient(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IRQ);
     #[cfg(kernel_smp_shared)]
     if from_el0 {
         (hooks().record_el0_trap)();
@@ -2450,10 +2454,19 @@ pub fn irq_hooked(el0: Option<FrameHandle>) {
     }
     if preempt {
         akuma_exec::threading::yield_now();
+        // The thread resumed here is finishing its own interrupt return, whatever its tag
+        // says it was last doing; and the core may be another one now.
+        #[cfg(kernel_smp_shared)]
+        akuma_exec::sync::set_core_tag_transient(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IRQ);
     }
     if let Some(frame) = el0 {
         deliver_on_irq_return(frame);
     }
+    #[cfg(kernel_smp_shared)]
+    akuma_exec::sync::load_thread_tag_to_core(
+        akuma_exec::bkl::current_core_id(),
+        akuma_exec::threading::current_thread_id(),
+    );
     if !held {
         akuma_exec::bkl::leave_kernel();
     }

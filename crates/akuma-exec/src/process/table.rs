@@ -165,10 +165,21 @@ fn retire_process(pid: Pid) -> bool {
                 // until publish**, so between claim and publish a live, freshly
                 // claimed slot also reads `None` here — and this terminates it.
                 // Suspected root cause of the `-j4` wedge; this names the killer.
+                //
+                // Rate-limited (first 8, then powers of two, with the running count): on
+                // AArch64 a missing entry is the *normal* reap, so unlimited this printed
+                // once per thread exit — ~1,200 lines per `futextest` run, each byte a trap
+                // under KVM, inside a BKL hold. That alone took the run from 2.5 s to ~13 s
+                // and was every `[BKL] stuck` line it produced
+                // (docs/archive/UNREGISTER_PRINT_BKL_HOLDS.md).
                 if slot_owner.is_none() && tid != crate::threading::current_thread_id() {
-                    crate::safe_print!(112,
-                        "[unregister] pid={} tid={} has NO map owner — terminating anyway\n",
-                        pid, tid);
+                    static NO_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                    let n = NO_OWNER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if n < 8 || n.is_power_of_two() {
+                        crate::safe_print!(128,
+                            "[unregister] pid={} tid={} has NO map owner — terminating anyway (x{})\n",
+                            pid, tid, n + 1);
+                    }
                 }
                 if tid != current_tid && !recycled {
                     crate::threading::mark_thread_terminated(tid);
