@@ -256,7 +256,12 @@ extern "C" fn idle_main() -> ! {
         let ran = (due || threading::x86_runnable_exists()) && threading::x86_yield();
         akuma_exec::bkl::leave_kernel();
         if !ran && !threading::x86_runnable_exists() {
+            // Take the halt out of this slot's CPU bill, as amd64's idle loop does: the
+            // switch bills a slot for its whole residency, so without it every second this
+            // core slept was `user` time in `/proc/stat` and `top` showed it pegged.
+            let entered = crate::timer::uptime_us();
             akuma_cpu::park::wfi();
+            threading::credit_halted_time(threading::current_thread_id(), entered);
         }
         akuma_cpu::park::irq_window();
     }

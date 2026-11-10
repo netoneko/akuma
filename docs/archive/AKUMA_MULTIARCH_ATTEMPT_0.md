@@ -963,3 +963,40 @@ fetched with `busybox wget`):
 come back: no ping, no ARP. The six c523598a rounds before that were clean, 7–10 µs p50 with no
 1 ms mode. The box needs a power cycle. Its GRUB default boots `/boot/akuma-amd64`, now
 6a817703, and the fallback boots the untouched `.good`.
+
+## Hooked: the idle CPU burn (2026-11-10)
+
+An idle hooked guest kept a whole host CPU busy: the async-main and netpoll threads yielded to each
+other for ever, so the idle thread never ran. Cause and fix are in `docs/archive/HOOKED_IDLE_CPU_BURN.md`.
+In short: `idle_halt` parks for 1 ms instead of yielding (only under `yield-takes-bkl`), the netpoll
+loop's hooked branch also applies without `smp-shared`, and the hooked idle loop credits its `wfi`.
+
+Extreme-size, 8 MB, HVF: idle host CPU 100 % -> 0.1 %; `/proc/stat` over 5 s idle +1 `user`, +533 `idle`.
+
+Devbox, Lima `fc`. Idle CPU is the QEMU process's share. The wake probe is a pipe wake through a
+`spin` or `sleep` waiter, measured in µs.
+
+| build | SMP | idle CPU | ssh RTT p50 | wake spin p50 / p99 | wake sleep p50 / p99 |
+|---|---|---|---|---|---|
+| SGI | 1 | 44.0 % | 124 ms | 2883 / 4053 | 399 / 3252 |
+| hooked, before | 1 | 100.8 % | 52 ms | 58 / 1102 | 53 / 129 |
+| hooked, park | 1 | 36.6 % | 60 ms | 1263 / 1767 | 1372 / 1811 |
+| SGI | 4 | 145.3 % | 67 ms | 173 / 1278 | 231 / 641 |
+| hooked, before | 4 | 154.1 % | 74 ms | 142 / 487 | 165 / 552 |
+| hooked, park | 4 | 153.1 % | 78 ms | 140 / 493 | 183 / 548 |
+
+At SMP=1 the park gives back the µs wakes the burn had bought; wakes now arrive on the 1 ms
+deadline or the tick, still about 2x better than SGI's spin case. At SMP=4 the park changes nothing.
+
+Gates on the park build:
+
+- Boot suite: 314/0, 322/0 and 319/1 at SMP=1/2/4. The one failure is the known
+  `test_epoll_socket_waker` latency flake (15.9 ms).
+- futex suite: all probes pass at SMP=2 and 4.
+- sigspin at SMP=2: 5/5.
+- No panics, BKL-stuck lines or SIGSEGVs.
+
+**Open:**
+
+- About 150 % idle CPU at SMP=4 on *both* schedulers. Not yet attributed.
+- A waker-driven park in the wait loop, to get µs wakes back at SMP=1 without the burn.

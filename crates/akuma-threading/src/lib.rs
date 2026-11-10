@@ -4651,6 +4651,12 @@ pub fn yield_now() {
 /// stop a racing timer tick from billing the halt. [`yield_now`] is still the
 /// cooperative give-up-the-CPU primitive; this is the complementary "there is
 /// nothing to do, so genuinely stop" primitive for idle loops.
+/// How long [`idle_halt`] parks a non-idle caller on the hooked path: a floor, not a
+/// period — the caller comes back at the first wake pass past it, at the latest the next
+/// timer tick. 1 ms is the shortest tick the governor runs.
+#[cfg(feature = "yield-takes-bkl")]
+const IDLE_HALT_PARK_US: u64 = 1_000;
+
 #[cfg(target_os = "none")]
 pub fn idle_halt() {
     // The hooked path (the AArch64 root kernel under `hooked-sched`, which is what sets
@@ -4660,10 +4666,23 @@ pub fn idle_halt() {
     // here held the only core for good at SMP=1: httpd's `accept`, while herd's console
     // drain waited READY behind it. So when anything else can run, switch to it instead
     // of halting; the caller's wait loop comes back here when it resumes.
+    //
+    // And not by yielding while staying runnable, which is what this did until
+    // 2026-11-10: two threads that both had nothing to do — the async-main loop here
+    // and the netpoll loop — each saw the other runnable and handed the core back and
+    // forth for ever, so no core ever halted and an idle guest burned a whole host CPU
+    // (97–100 %, devbox and extreme alike; `docs/archive/HOOKED_IDLE_CPU_BURN.md`).
+    // Parked, the caller is not runnable: anything that is runs, the idle thread halts
+    // when nothing is, and the first wake pass past the deadline (at the latest the next
+    // tick) brings the caller back — the same "until the next interrupt" an SGI-path
+    // `wfi` gives it. An idle thread never parks; it takes the halt below.
     #[cfg(feature = "yield-takes-bkl")]
-    if x86_runnable_exists() {
-        yield_now();
-        return;
+    {
+        let tid = current_thread_id();
+        if !(tid < MAX_THREADS && IS_IDLE_THREAD[tid].load(Ordering::Relaxed)) {
+            sleep_us(IDLE_HALT_PARK_US);
+            return;
+        }
     }
     let tid = current_thread_id();
     // Non-idle halters must stay PREEMPTIBLE (SMP=1 freeze fix, 2026-08-25).

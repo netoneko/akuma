@@ -2281,7 +2281,10 @@ fn run_async_main() -> ! {
         // `hooked-sched` (M6): nothing preempts a kernel thread on that path, so this loop
         // hands the core over itself every lap, and halts (lock released) only when nothing
         // else can run. The wake pass for deadlines runs inside the yield.
-        #[cfg(all(kernel_smp_shared, feature = "smoltcp", feature = "hooked-sched"))]
+        // Also without `smp-shared` (extreme-size): a bare `yield_now()` loop there never
+        // halts, and with nothing else runnable it spun the only core at 100 %. The BKL
+        // calls are no-ops without `smp-shared`.
+        #[cfg(all(feature = "smoltcp", feature = "hooked-sched"))]
         {
             if !threading::x86_runnable_exists() {
                 akuma_exec::bkl::leave_kernel();
@@ -2306,7 +2309,7 @@ fn run_async_main() -> ! {
                 akuma_exec::sync::HOLD_TAG_NETPOLL,
             );
         }
-        #[cfg(not(all(kernel_smp_shared, feature = "smoltcp")))]
+        #[cfg(not(any(all(kernel_smp_shared, feature = "smoltcp"), all(feature = "smoltcp", feature = "hooked-sched"))))]
         threading::yield_now();
 
         // In a rump-only / devbox build there is no smoltcp interface to poll
