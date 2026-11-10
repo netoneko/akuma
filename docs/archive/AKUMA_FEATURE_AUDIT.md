@@ -30,12 +30,22 @@ measured starting point. Read-only audit; nothing changed yet.
    `scripts/validate_fork_smp.py`) — and `akuma_bkl::policy` already has *runtime* toggles for the
    same phases. **Not dead; do not delete blind.** Candidate: keep the runtime toggles as the A/B
    mechanism and fold the compile-time six into `smp-shared`.
-3. **Eleven diagnostic/instrumentation flags**, all off by default: `leak-instr`, `pmm-instr`,
-   `bkl-profile`, `net-profile`, `read-profile`, `syscall-debug-info`, `reboot-trace` (amd64,
-   *default-on*), `pmm-forensics`, `mm-forensics`, `net-waker-park`, `net-direct-waker`. Referenced
-   from scripts/docs: `leak-instr` 0, `pmm-instr` 0, `net-direct-waker` 0, `reboot-trace` 0,
-   `pmm-forensics` 1, `mm-forensics` 1. Zero references = candidates to confirm with the owner and
-   delete or fold into one `instr` feature.
+3. **Eleven diagnostic/instrumentation flags**, all off by default except `reboot-trace` on amd64:
+   `leak-instr`, `pmm-instr`, `bkl-profile`, `net-profile`, `read-profile`, `syscall-debug-info`,
+   `reboot-trace`, `pmm-forensics`, `mm-forensics`, `net-waker-park`, `net-direct-waker`.
+   **Checked 2026-11-10 against the whole tree (not just scripts/docs): none is dead.** My first
+   pass grepped only `scripts/ overlays/ acceptance/ docs/runbooks docs/reference` and reported
+   `leak-instr`, `pmm-instr`, `net-direct-waker`, `reboot-trace` as zero-reference — wrong. Each has
+   live `cfg` sites (`leak-instr` 40, `pmm-instr` 12, `reboot-trace` 2 in `amd64/src/reboot.rs`,
+   added 2026-10-07 for "who called reboot(2)") and archive write-ups; `pmm-forensics` and
+   `mm-forensics` are named in the `docs/README.md` symptom matrix (the `mmap` double-populate
+   hunt) and used by the tokio kernel. They are hunting tools kept for the next hunt.
+   The one real candidate is **`net-direct-waker`**: A/B'd *null* (`LONG_ROAD_TO_REDIS_PART_2.md`
+   §"net-direct-waker A/B — null, correctly"), 3 cfg sites, one of three compile-time
+   `WaitPolicy` choices in `akuma-net/src/socket.rs` (`direct_waker` / `targeted` via
+   `net-waker-park` / `promiscuous`). Retiring it, or making the policy a runtime field, is an
+   owner call.
+
 4. **Bundles that are really build targets, not features:** `devbox` (`rump-default userspace-sshd
    sc-reboot`), `devbox-smoltcp` (`userspace-sshd smp-shared`), `taoxichuan` (`no-tests extreme
    userspace-sshd`). Referenced 24–107 times, so they stay, but `build-profiles.md` already says
@@ -56,7 +66,7 @@ measured starting point. Read-only audit; nothing changed yet.
 |---|---|---|---|
 | F1 | One shared feature table: a `akuma-kernel-features`-style doc + a check script that asserts the 16 common names forward the same crates in root and `amd64/` | none (a checker) | script in CI/pre-commit |
 | F2 | Fold the six compile-time `no-bkl-*` into `smp-shared`; A/B stays on the runtime toggles | medium: 76 cfg sites, SMP behaviour | AArch64 boot suite byte-identical; amd64 TCG SMP=1 826/0; SMP gates need KVM/metal |
-| F3 | Delete zero-reference instrumentation after owner review; merge the rest into one `instr` feature | low-medium | build matrix |
+| F3 | **Revised 2026-11-10:** keep the instrumentation (none is dead); optionally retire `net-direct-waker` (null A/B) | low | build matrix |
 | F4 | Make `sc-*` one group feature `linux-extra-syscalls` (still individually settable for `extreme-size`) | low | `extreme-size` image size must not move |
 | F5 | `rump` per D1: one name, off by default on amd64, `cargo tree` leak check | low | tree check |
 
