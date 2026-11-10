@@ -3537,11 +3537,26 @@ fn share_parent_memory_into(
         let (va, pa) = (leaf.va, leaf.pa);
         let frame = PhysFrame::new(pa);
 
+        // The per-leaf decision is `akuma_user_tree::fork_leaf` — one table, host-tested against
+        // `PteLayout::plan_clone` (`fork_leaf_agrees_with_plan_clone`), so this decoded-leaf walk and a
+        // raw-entry walker cannot disagree. The arms below are its four classes, in its order.
+        let in_shared = shared_ranges.iter().any(|(start, end)| va >= *start && va < *end);
+        let class = akuma_user_tree::fork_leaf(
+            if leaf.attr == akuma_mmu::MemAttr::WriteBack {
+                akuma_user_tree::Backing::Ram
+            } else {
+                akuma_user_tree::Backing::Device
+            },
+            if in_shared { akuma_user_tree::Span::Shared } else { akuma_user_tree::Span::Private },
+            leaf.prot.write,
+            leaf.cow,
+        );
+
         // A device page (`/dev/fb0`'s write-combining framebuffer) is not PMM
         // RAM: no share count, no ledger entry, no copy-on-write — the child
         // simply maps the same device memory the same way. Counting it would
         // hand the framebuffer to the page allocator when the child exits.
-        if leaf.attr != akuma_mmu::MemAttr::WriteBack {
+        if class == akuma_user_tree::ForkLeaf::Device {
             if !child_space.map_device_page(va, pa, leaf.prot, leaf.attr) {
                 ok = false;
             }
@@ -3560,7 +3575,7 @@ fn share_parent_memory_into(
         //
         // So: same frame, writable in **both**, no CoW marker, and the
         // parent's own PTE deliberately left alone (`LeafAction::Keep`).
-        if shared_ranges.iter().any(|(start, end)| va >= *start && va < *end) {
+        if class == akuma_user_tree::ForkLeaf::ShareWritable {
             let shared_rw = PteProt { write: true, ..leaf.prot };
             // One share-count reference per **frame**, not per VA: a frame the
             // parent maps at two VAs (one file mapped twice) is one reference
@@ -3579,9 +3594,7 @@ fn share_parent_memory_into(
         // A page that is already read-only and *not* CoW stays exactly as it
         // is in both spaces — `.rodata`, an `mprotect(PROT_READ)` region.
         // Marking it would turn a legitimate `SIGSEGV` into a silent write.
-        let share_writable = leaf.prot.write || leaf.cow;
-
-        if share_writable {
+        if class == akuma_user_tree::ForkLeaf::DemoteBoth {
             // Demote in **both** address spaces. Demoting only the child
             // leaves the parent writing straight through to memory the
             // child can see change — the entire point of CoW, missed.

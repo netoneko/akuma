@@ -156,6 +156,27 @@ at the call site.
 4. A GRUB-image-free multiboot2 gate now exists (ryzen KVM rig, above), and an AArch64 KVM gate
    (Lima). Both are what M6/M7 need.
 
+## M3 — the fork walk's decision table (option ii)
+
+- **M3a (done): `akuma_user_tree::fork_leaf(Backing, Span, writable, cow) -> ForkLeaf`** with
+  `ForkLeaf::{Device, ShareWritable, DemoteBoth, ShareReadOnly}`, and `amd64/src/usermode.rs`'s
+  `share_parent_memory_into` now classifies each leaf through it (the four arm bodies are unchanged;
+  only their conditions moved). Two host tests: the truth table, and
+  **`fork_leaf_agrees_with_plan_clone`** — for every `(shared, writable, cow)` it derives the raw x86
+  entry and requires `PteLayout::plan_clone(.., SharedSpans::ShareWritable)` to leave the same
+  parent/child entries. The two decision tables (decoded-leaf walker, raw-entry walker) can no longer
+  drift apart unnoticed. This is option (ii) of the audit: no second walker.
+- **Pinned discrepancy:** the amd64 bin treats a `MAP_SHARED` span as `SharedSpans::ShareWritable`
+  (writable in both, no CoW marker — the 2026-10-03 shared-writable-pages fix), but the
+  `SharedSpans::ShareFrames` doc comment still says "(amd64 ...)": that comment is stale. Left for a
+  doc-only fix by whoever owns the enum.
+- **Gate:** ryzen KVM multiboot2 SMP=4 (entry 31, working-tree overlay via `local.tar`): **826 passed, 0 failed**, 4 CPUs online — the suite's `fork`/`execve`/CoW checks run on this walk. PVH TCG SMP=1, baseline `0b78d0cb` vs candidate, interleaved, 4 runs each: **826 passed,
+  0 failed in all eight**. One earlier candidate run (SMP=1, built from this tree) and one SMP=4 run
+  (M2c, before this change) showed `thread: probe reported every check [FAIL] got 0x0 want 0x1ff`
+  (ten checks, all the clone/futex thread probe) and passed on re-run — an intermittent TCG timing
+  flake of the thread probe, **not** reproduced in 4/4 runs of the identical binary and not
+  correlated with this change (it predates it). Worth its own look; not investigated here.
+
 ## Decisions (owner, 2026-11-10)
 
 - **D1 — rump:** a universal, **optional** `rump` feature on the shared spine, not bin-local. Its

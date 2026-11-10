@@ -166,6 +166,7 @@ dependencies = [
  "akuma-usb-storage",
  "akuma-user-access",
  "akuma-user-space",
+ "akuma-user-tree",
  "akuma-vfs",
  "akuma-vfs-glue",
  "akuma-virtio",
