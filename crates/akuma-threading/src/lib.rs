@@ -1604,6 +1604,20 @@ fn ensure_slot_stack(slot_idx: usize, size: usize) -> bool {
     pool.allocate_stack_for_slot(slot_idx, size)
 }
 
+/// The top of `slot`'s pool stack, allocated now if the slot has none (16-byte aligned).
+///
+/// `X86ArchHooks::prepare_task_slot` for a hooked kernel whose kernel stacks are this pool's —
+/// the AArch64 root kernel under `hooked-sched` (amd64 keeps its own per-slot pair). The whole
+/// stack is the thread's: the hooked path has no separate exception area, the EL0 trap frame
+/// lands at the top. `None` when the slot is out of range or the PMM cannot back the stack.
+#[cfg(hooked_sched)]
+pub fn ensure_pool_stack_top(slot: usize, size: usize) -> Option<usize> {
+    if slot >= MAX_THREADS || !ensure_slot_stack(slot, size) {
+        return None;
+    }
+    slot_stack_bounds(slot).map(|(base, size)| (base + size) & !0xF)
+}
+
 /// Per-thread termination timestamp (for cooldown tracking)
 static TERMINATION_TIME: [AtomicU64; MAX_THREADS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
@@ -1776,12 +1790,16 @@ pub fn spawn_user_thread_initializing(
     // register; an `extern "C" fn()` ignores it. Passed as an address, so no fn-pointer type is forged.
     let trampoline_addr = trampoline_fn as usize as u64;
 
+    #[cfg(sgi_sched)]
     let attempt = || {
         with_irqs_disabled(|| {
             let mut pool = POOL.lock();
             pool.spawn_user_closure_initializing(trampoline_addr, data_ptr)
         })
     };
+    // Without the pool lock: see the hooked arm's doc.
+    #[cfg(hooked_sched)]
+    let attempt = || with_irqs_disabled(|| ThreadPool::spawn_user_closure_initializing(trampoline_addr, data_ptr));
 
     // On slot exhaustion, collect cooled-down terminated slots ourselves and retry
     // once before failing — the pool is usually not exhausted, just uncollected (see
@@ -1958,12 +1976,15 @@ impl ThreadPool {
     ///
     /// # Three differences from the AArch64 arm, all of them this target's
     ///
-    /// * **`self` is unused, and the pool lock buys nothing here.** The slot
+    /// * **No `self`, and it must be called without the pool lock.** The slot
     ///   table this claims from is the crate's lock-free `THREAD_STATES`
-    ///   ([`x86_claim_slot`]); the `POOL`-guarded `stacks`/`slots` arrays are
-    ///   the AArch64 stack pool, which this target does not use. The method
-    ///   stays on `ThreadPool` so both architectures present one signature to
-    ///   [`spawn_user_thread_initializing`].
+    ///   ([`x86_claim_slot`]), so the lock buys nothing — and the stack comes
+    ///   from [`X86ArchHooks::prepare_task_slot`], which on the AArch64 root
+    ///   kernel under `hooked-sched` *is* this pool (`ensure_pool_stack_top`)
+    ///   and takes `POOL` itself. It was a `&mut self` method called under the
+    ///   lock until 2026-11-10, which deadlocked that kernel's first `spawn_fn`
+    ///   on the non-reentrant spinlock; amd64's stacks are its own, so it never
+    ///   showed there.
     /// * **Stacks come from the target** ([`X86ArchHooks::prepare_task_slot`]),
     ///   because `amd64` owns them per slot and reuses a recycled slot's pair.
     /// * **Exhaustion is final, and the error string says so.**
@@ -1975,7 +1996,6 @@ impl ThreadPool {
     ///   `kernel_profile_extreme`, i.e. AArch64's — so a distinct string opts
     ///   out of a retry that could only fail again.
     pub fn spawn_user_closure_initializing(
-        &mut self,
         trampoline_addr: u64,
         closure_ptr: *mut (),
     ) -> Result<usize, &'static str> {
@@ -3423,6 +3443,33 @@ pub fn wake_is_due(earliest: Option<u64>, now_us: u64) -> bool {
 /// (`docs/archive/AKUMA_AMD64_BKL_NETWORKING.md` 2026-09-20 night).
 #[cfg(hooked_sched)]
 fn x86_yield_now() -> bool {
+    #[cfg(feature = "yield-takes-bkl")]
+    {
+        // The AArch64 root kernel's `akuma_bkl` lets a thread run a stretch of EL1 code with the
+        // lock deliberately released (the dropped-window carve-outs, and `lock_bounded`'s backoff,
+        // which calls the yield hook holding nothing). The lock belongs to the *core* across a
+        // switch, so a thread that yields from there would hand the next one a core that does not
+        // hold what that thread was holding when it switched out. Take it for the switch and give
+        // it back on resume: every thread then crosses a switch holding the lock, on whichever
+        // core it resumes. amd64 needs none of this (its boot suite asserts no switch runs
+        // without the lock), and the tokio kernels do not use `akuma_bkl`.
+        let reacquired = !bkl::held_by_current();
+        if reacquired {
+            bkl::enter_kernel();
+        }
+        let switched = x86_yield_switch();
+        if reacquired {
+            bkl::leave_kernel();
+        }
+        switched
+    }
+    #[cfg(not(feature = "yield-takes-bkl"))]
+    x86_yield_switch()
+}
+
+/// The switch [`x86_yield_now`] performs: pick, hand over, return on resume.
+#[cfg(hooked_sched)]
+fn x86_yield_switch() -> bool {
     // Prev-handoff cleanup, first thing: whatever gate this core is still
     // carrying belongs to a thread whose stack is now dead (we are running,
     // here, after its switch). No-op when there is no pending gate.
@@ -6165,9 +6212,8 @@ where
         let boxed: Box<F> = Box::new(f);
         let closure_ptr = Box::into_raw(boxed) as *mut ();
         let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
-        let claimed = with_irqs_disabled(|| {
-            POOL.lock().spawn_user_closure_initializing(trampoline as usize as u64, closure_ptr)
-        });
+        let claimed =
+            with_irqs_disabled(|| ThreadPool::spawn_user_closure_initializing(trampoline as usize as u64, closure_ptr));
         return match claimed {
             Ok(slot) => {
                 mark_thread_ready(slot);
@@ -6324,6 +6370,30 @@ pub fn get_thread_state_enum(thread_id: usize) -> Option<ThreadState> {
         thread_state::TERMINATED => ThreadState::Terminated,
         thread_state::INITIALIZING => ThreadState::Ready, // Treat as ready for display
         _ => ThreadState::Free,
+    })
+}
+
+/// The calling thread's EL0 register file, from the sync trap frame its syscall entry published
+/// (`set_current_trap_frame`) — `X86ArchHooks::read_user_context` for the AArch64 root kernel under
+/// `hooked-sched`, whose front end runs the same `akuma_exceptions::sync_el0` and so publishes the
+/// same frame. What the SGI arm of [`get_saved_user_context`] builds, for the same caller: `None` for
+/// any thread but the caller, or with no live frame; `spsr` a clean EL0t; `ttbr0` the live root.
+#[cfg(all(target_arch = "aarch64", hooked_sched))]
+pub fn published_user_context(tid: usize) -> Option<UserContext> {
+    if tid >= MAX_THREADS || tid != current_thread_id() {
+        return None;
+    }
+    let f = published_trap_frame(tid)?;
+    Some(UserContext {
+        x0: f.x0, x1: f.x1, x2: f.x2, x3: f.x3, x4: f.x4, x5: f.x5, x6: f.x6, x7: f.x7,
+        x8: f.x8, x9: f.x9, x10: f.x10, x11: f.x11, x12: f.x12, x13: f.x13, x14: f.x14, x15: f.x15,
+        x16: f.x16, x17: f.x17, x18: f.x18, x19: f.x19, x20: f.x20, x21: f.x21, x22: f.x22, x23: f.x23,
+        x24: f.x24, x25: f.x25, x26: f.x26, x27: f.x27, x28: f.x28, x29: f.x29, x30: f.x30,
+        sp: f.sp_el0,
+        pc: f.elr_el1,
+        spsr: 0,
+        tpidr: f.tpidr_el0,
+        ttbr0: mmu::get_current_ttbr0() as u64,
     })
 }
 

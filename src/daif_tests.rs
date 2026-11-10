@@ -92,6 +92,7 @@ fn test_with_irqs_disabled_matches_guard() {
     console::print("  [PASS] test_with_irqs_disabled_matches_guard\n");
 }
 
+#[cfg_attr(feature = "hooked-sched", allow(dead_code))]
 fn test_yield_now_detects_masked_yield() {
     let initial = YIELD_WITH_IRQS_MASKED.load(Ordering::Relaxed);
 
@@ -188,7 +189,12 @@ pub fn run_all_tests() {
     test_nested_irq_guard_preserves_outer();
     test_with_irqs_disabled_matches_guard();
     test_yield_now_clean_path_does_not_warn();
+    // SGI path only: there a yield is a self-SGI, which a masked `DAIF.I` cannot deliver, so a
+    // masked yield is the failure mode the counter catches. The hooked path's yield is a call.
+    #[cfg(not(feature = "hooked-sched"))]
     test_yield_now_detects_masked_yield();
+    #[cfg(feature = "hooked-sched")]
+    console::print("  [SKIP] test_yield_now_detects_masked_yield (SGI scheduler only)\n");
     test_runtime_is_lock_free_under_masked_irqs();
     console::print("--- DAIF tests complete ---\n");
 }

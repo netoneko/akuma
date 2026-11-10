@@ -6183,8 +6183,17 @@ fn test_as_drop_defers_while_core_on_l0() {
 /// until the reference dissolves. Faked here via `test_swap_saved_ctx_ttbr0`
 /// on the top slot, which boot-suite-time spawns (low-first claim) never use.
 fn test_as_drop_defers_while_saved_ctx_on_l0() {
-    use akuma_exec::{mmu, threading};
-    const SLOT: usize = akuma_exec::threading::MAX_THREADS - 1;
+    use akuma_exec::mmu;
+    // The SGI path keeps a parked thread's root in its saved `Context`, which the gate scans
+    // whatever the slot's state; any slot will do. The hooked path keeps it in the glue's
+    // per-slot record, and its probe counts only a slot that can still be switched in, so the
+    // test stages the reference on its own (running) slot there.
+    #[cfg(not(feature = "hooked-sched"))]
+    let (slot, swap): (usize, fn(usize, u64) -> u64) =
+        (akuma_exec::threading::MAX_THREADS - 1, akuma_exec::threading::test_swap_saved_ctx_ttbr0);
+    #[cfg(feature = "hooked-sched")]
+    let (slot, swap): (usize, fn(usize, u64) -> u64) =
+        (akuma_exec::threading::current_thread_id(), akuma_kernel_glue::hooked::test_swap_saved_root);
 
     // Start from a drained state so the parked-entry accounting below is ours.
     mmu::drain_pending_ttbr_frees();
@@ -6200,24 +6209,24 @@ fn test_as_drop_defers_while_saved_ctx_on_l0() {
         // Plant the dying L0 in a parked slot's saved context (the shape a
         // thread preempted before its exit-path `deactivate()` leaves behind,
         // reaped by its parent while off-CPU), then tear down.
-        let prev_ctx_ttbr0 = threading::test_swap_saved_ctx_ttbr0(SLOT, l0 as u64);
+        let prev_ctx_ttbr0 = swap(slot, l0 as u64);
         drop(as_space);
 
         // 1. The frames must be parked, not freed.
         let (parked_now, _, _) = mmu::pending_ttbr_free_stats();
         if parked_now <= parked0 {
-            threading::test_swap_saved_ctx_ttbr0(SLOT, prev_ctx_ttbr0);
+            swap(slot, prev_ctx_ttbr0);
             return (false, "drop freed frames despite saved-ctx reference (gate missing)", 0, 0);
         }
         // 2. A drain while the context still holds the L0 must not release them.
         mmu::drain_pending_ttbr_frees();
         let (parked_held, _, _) = mmu::pending_ttbr_free_stats();
         if parked_held <= parked0 {
-            threading::test_swap_saved_ctx_ttbr0(SLOT, prev_ctx_ttbr0);
+            swap(slot, prev_ctx_ttbr0);
             return (false, "drain released frames while saved ctx still on L0", 0, 0);
         }
         // 3. Context reference dissolves → drain releases everything; PMM conserved.
-        threading::test_swap_saved_ctx_ttbr0(SLOT, prev_ctx_ttbr0);
+        swap(slot, prev_ctx_ttbr0);
         mmu::drain_pending_ttbr_frees();
         let (parked_after, _, _) = mmu::pending_ttbr_free_stats();
         if parked_after != parked0 {

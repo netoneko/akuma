@@ -385,10 +385,24 @@ pub fn run_threading_tests() -> bool {
     run_test!(test_thread_waker_roundtrip, "thread_waker_roundtrip");
     run_test!(test_block_on_real_waker, "block_on_real_waker");
 
-    // NEON/FP register save/restore tests
+    // NEON/FP register save/restore tests.
+    //
+    // The two `_across_yield` tests keep values in caller-saved state (Q0-Q3, FPCR/FPSR) across a
+    // `yield_now()` call. That holds on the SGI path, whose yield is a self-SGI through the IRQ
+    // entry that saves the whole vector file; the hooked path's yield is an ordinary call, which
+    // preserves what AAPCS64 says a call preserves (d8-d15) and no more. User threads are not
+    // affected: their FP state is in the EL0 trap frame. Under `hooked-sched` the
+    // `_across_preemption` tests still run but pass vacuously - kernel threads are not preempted
+    // on that path (docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md, W3).
+    #[cfg(not(feature = "hooked-sched"))]
     run_test!(test_neon_regs_across_yield, "neon_regs_across_yield");
+    #[cfg(feature = "hooked-sched")]
+    console::print("\n[TEST] NEON registers across voluntary yields\n  [SKIP] SGI scheduler only\n");
     run_test_heavy!(test_neon_regs_across_preemption, "neon_regs_across_preemption");
+    #[cfg(not(feature = "hooked-sched"))]
     run_test_heavy!(test_fpcr_fpsr_across_yield, "fpcr_fpsr_across_yield");
+    #[cfg(feature = "hooked-sched")]
+    console::print("\n[TEST] FPCR/FPSR across yields\n  [SKIP] SGI scheduler only\n");
     run_test_heavy!(test_fp_arithmetic_across_preemption, "fp_arithmetic_across_preemption");
 
     // Parallel process tests (requires /bin/hello)
@@ -5984,6 +5998,7 @@ fn neon_preempt_thread(pattern: u64, label: &'static str, done: &'static AtomicB
 /// Two threads each load a distinct pattern into Q0-Q3, yield repeatedly, then
 /// verify the pattern is intact. If the kernel doesn't save/restore NEON across
 /// context switches the patterns will be mixed.
+#[cfg_attr(feature = "hooked-sched", allow(dead_code))]
 fn test_neon_regs_across_yield() -> bool {
     console::print("\n[TEST] NEON registers across voluntary yields\n");
 
@@ -6075,6 +6090,7 @@ fn test_neon_regs_across_preemption() -> bool {
 ///
 /// Sets FPCR rounding mode bits in two threads to different values, yields,
 /// and verifies they're still correct. Catches missing FPCR/FPSR save.
+#[cfg_attr(feature = "hooked-sched", allow(dead_code))]
 fn test_fpcr_fpsr_across_yield() -> bool {
     console::print("\n[TEST] FPCR/FPSR across yields\n");
 

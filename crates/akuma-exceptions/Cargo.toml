@@ -23,6 +23,10 @@ smp-shared = []
 # it compiles to nothing in either single-cfg combination.
 no-bkl-irq = []
 
+# M6 (multiarch attempt 0): the hooked scheduler's IRQ body (`irq_hooked`), called by the root
+# kernel's `akuma-vectors-aarch64` front end instead of the SGI path's `irq_with_sp`.
+hooked-sched = []
+
 # Compile the boot self-test surface out (`kernel_tests` cfg NOT emitted):
 # `el1_sync_gpr_clobber_mask`'s GPR-transparency probe, the `TEST_SIGFRAME_*`
 # layout consts and the boot suite's entry points. extreme-size and the devbox

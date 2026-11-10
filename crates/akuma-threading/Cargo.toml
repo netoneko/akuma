@@ -30,3 +30,7 @@ extreme = ["akuma-primitives/extreme"]
 # aarch64: the hooked cooperative scheduler path (the one amd64 always uses) instead of the
 # SGI scheduler, for a tokio kernel (B21 A4). No effect on x86_64, which has only that path.
 hooked = ["akuma-switch/hooked"]
+# With `hooked`: a thread that yields without `akuma_bkl` held takes it for the switch and gives it
+# back on resume. The AArch64 root kernel under `hooked-sched` (its dropped-BKL windows); see
+# `x86_yield_now`.
+yield-takes-bkl = ["hooked"]

@@ -110,7 +110,7 @@
     "crates/akuma-cpu": 75,
     "crates/akuma-dma": 17,
     "crates/akuma-el0-entry": 4,
-    "crates/akuma-entry": 14,
+    "crates/akuma-entry": 15,
     "crates/akuma-exceptions-forensics": 2,
     "crates/akuma-fdt": 3,
     "crates/akuma-frame-raw": 3,

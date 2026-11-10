@@ -118,6 +118,8 @@ pub use akuma_entry::smp_shared;
 pub mod syscall;
 #[cfg(target_os = "none")]
 pub mod vfs;
+#[cfg(all(target_os = "none", feature = "hooked-sched"))]
+pub mod hooked;
 
 #[cfg(target_os = "none")]
 use akuma_exec::{mmu, process, threading};
@@ -434,7 +436,12 @@ pub(crate) fn build_exec_runtime(
         // so the AArch64 kernel's behaviour here is unchanged by the seam;
         // see `akuma_exec::ExecRuntime::enter_user` for what the other arm
         // has to be instead.
+        #[cfg(not(feature = "hooked-sched"))]
         enter_user: akuma_exec::process::enter_user_mode_checked,
+        // Under `hooked-sched` the crossing is the kit's, which also points the thread's
+        // later EL0 traps at the top of its own kernel stack (`hooked::enter_user`).
+        #[cfg(feature = "hooked-sched")]
+        enter_user: hooked::enter_user,
         // The AArch64 fork memory pass, which is `fork_process`'s own step 4 —
         // registered rather than called directly so the amd64 kernel can
         // substitute a walk that speaks x86 page tables. See the field's doc.
@@ -1009,7 +1016,7 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     //    stalls the boot. So the runtime image brings secondaries up AFTER `threading::init`
     //    (below), where the slot allocator is live and hands out distinct slots. See
     //    docs/archive/SMP_SHARED.md M4 "open item".
-    #[cfg(all(kernel_smp_shared, not(feature = "no-tests")))]
+    #[cfg(all(kernel_smp_shared, not(feature = "no-tests"), not(feature = "hooked-sched")))]
     smp_shared::bringup_secondaries();
 
     // Exception-path hooks: the dispatcher + the EL0-trap diagnostic the IRQ
@@ -1072,7 +1079,10 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     });
 
     // Set up exception vectors and enable IRQs
+    #[cfg(not(feature = "hooked-sched"))]
     akuma_entry::exceptions::init();
+    #[cfg(feature = "hooked-sched")]
+    akuma_entry::hooked::init();
     console::print("IRQ handling enabled\n");
 
     // Initialize timer
@@ -1156,6 +1166,10 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // died while parked is inherited by the slot's next occupant and silently absorbs that
     // address's next wake.
     threading::set_slot_purge_callback(syscall::futex_purge_tid);
+    // The hooked scheduler's machine half and core 0's idle thread (M6): after the slot
+    // table exists, before anything but the boot thread runs.
+    #[cfg(feature = "hooked-sched")]
+    hooked::init();
     process::init_box_registry(); // Init Box 0
     console::print("Threading system initialized\n");
 
@@ -1193,8 +1207,12 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // `threading::init`; see the note there.) Combined with the network path's cross-core
     // lock discipline (`PreemptGuard` in akuma-net), this lets the devbox boot to userspace
     // sshd under SMP>=2. See docs/archive/SMP_SHARED.md M4 "open item".
-    #[cfg(all(kernel_smp_shared, feature = "no-tests"))]
+    #[cfg(all(kernel_smp_shared, feature = "no-tests", not(feature = "hooked-sched")))]
     smp_shared::bringup_secondaries();
+    // `hooked-sched` (M6): the secondaries' bring-up adopts each core's idle thread through the
+    // SGI path's `adopt_current_as_core_idle`, which this path does not have yet. One core.
+    #[cfg(all(kernel_smp_shared, feature = "hooked-sched"))]
+    console::print("[hooked] secondary cores not started: the hooked path's SMP bring-up is not built yet\n");
 
     // The boot self-test suite spawns many concurrent threads/processes. On a
     // tiny machine there aren't enough user thread slots (the pool is scaled to
@@ -2259,7 +2277,19 @@ fn run_async_main() -> ! {
         // idle loop in smp_shared.rs). A pending RX/timer/SGI IRQ makes WFI return at
         // once, so burst draining is unaffected, while the peer core gets a BKL window
         // every iteration.
-        #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
+        // `hooked-sched` (M6): nothing preempts a kernel thread on that path, so this loop
+        // hands the core over itself every lap, and halts (lock released) only when nothing
+        // else can run. The wake pass for deadlines runs inside the yield.
+        #[cfg(all(kernel_smp_shared, feature = "smoltcp", feature = "hooked-sched"))]
+        {
+            if !threading::x86_runnable_exists() {
+                akuma_exec::bkl::leave_kernel();
+                akuma_cpu::park::wfi();
+                akuma_exec::bkl::enter_kernel();
+            }
+            threading::yield_now();
+        }
+        #[cfg(all(kernel_smp_shared, feature = "smoltcp", not(feature = "hooked-sched")))]
         {
             akuma_exec::bkl::leave_kernel();
             // IRQs are enabled; the timer/RX/SGI IRQ wakes us and its handler

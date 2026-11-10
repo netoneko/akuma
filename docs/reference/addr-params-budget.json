@@ -1,6 +1,6 @@
 {
   "untyped_address_params": {
-    "amd64": 85,
+    "amd64": 84,
     "crates/akuma-alloc": 3,
     "crates/akuma-boot-aarch64": 1,
     "crates/akuma-boot-amd64": 15,
@@ -20,7 +20,7 @@
     "crates/akuma-gdt": 2,
     "crates/akuma-gic": 2,
     "crates/akuma-hda": 1,
-    "crates/akuma-kernel-glue": 5,
+    "crates/akuma-kernel-glue": 6,
     "crates/akuma-kvm-abi": 3,
     "crates/akuma-lapic-amd64": 1,
     "crates/akuma-machine-facts": 3,

@@ -43,6 +43,8 @@ pub mod boot;
 pub mod exceptions;
 #[cfg(all(target_os = "none", kernel_smp_shared))]
 pub mod smp_shared;
+#[cfg(all(target_os = "none", feature = "hooked-sched"))]
+pub mod hooked;
 
 /// The absolute symbols `linker.ld` exports, in `akuma-boot-aarch64` beside the
 /// assembly that consumes them since 2026-11-04.

@@ -239,15 +239,6 @@ pub extern "C" fn rust_start(dtb_ptr: usize) -> ! {
     // is nothing to order this after. `OnceCopy::set` ignores the later duplicate.
     akuma_primitives::console::set_print_hook(console::print);
 
-    // `hooked-sched` (M6, docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md) selects the cooperative scheduler
-    // path in `akuma-threading`, but this kernel's machine half for it does not exist yet: the IRQ
-    // front end in `akuma-exceptions` still enters `sgi_scheduler_handler_with_sp`, which panics
-    // under that path. Say so at the first instruction instead of at the first timer tick.
-    if cfg!(feature = "hooked-sched") {
-        console::print("hooked-sched: the AArch64 full kernel has no machine half for the hooked scheduler yet; halting\n");
-        akuma_cpu::park::halt();
-    }
-
     // Early debug: print raw DTB pointer before anything else
     console::print("DTB ptr from boot (x0 arg): 0x");
     console::print_hex(dtb_ptr as u64);

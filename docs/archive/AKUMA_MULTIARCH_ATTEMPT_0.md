@@ -588,3 +588,67 @@ recommended this; what settles it is a measurement, not a preference:
   `akuma_boot_aarch64::user::switch_to`, `prepare_task_slot` = kernel stacks, `transfer_lock_depth` = the
   BKL depth), with `sched.rs` of `akuma-tokio-kernel-aarch64` as the template; (4) boot order — seed
   idle threads where `kernel_main` calls `threading::init()`; (5) cfg arms for the SGI-only self-tests.
+
+## W3a — the hooked scheduler boots the AArch64 root kernel, one core (2026-11-10)
+
+`cargo build --release --features hooked-sched` now boots: vectors from `akuma-vectors-aarch64`,
+threads switched by `akuma-threading`'s hooked path, the root kernel's own syscall/fault/IRQ logic
+unchanged behind them. **Lima SMP=1: PASSED=313 FAILED=1** — the same count as the SGI baseline, the one
+failure the known `test_epoll_socket_waker` 10 ms latency flake — then herd, httpd and sshd start. 29 s
+to herd in the harness against 59 s for the SGI build (not investigated; the harness stops at herd).
+Secondary cores are **not** started under the feature yet (`[hooked] secondary cores not started`):
+SMP>1 is W3b. Default off; the default build is code-identical (below).
+
+What it took, by D4's steps:
+
+1. **Front end** — `akuma-entry::hooked` (new, behind `akuma-entry/hooked-sched`): registers the kit's
+   five handlers. `El0Sync` names the kit frame as a `FrameHandle` (const assertions pin the 288-byte
+   prefix and the NEON offset), opens interrupts as the SGI stub does, calls `akuma_exceptions::sync_el0`
+   and writes x0. `El1Sync` hands `sync_el1` the six registers the SGI stub pushes and turns its
+   `El1Resume` into `frame.elr`. IRQs call the new `akuma_exceptions::irq_hooked(from_el0)`: BKL unless
+   already held, ack, dispatch, EOI, and `yield_now` only for the scheduler SGI that interrupted EL0.
+   EL1 runs with interrupts open, as on the SGI path.
+2. **Machine half** — `akuma-kernel-glue::hooked` (new): `switch_to` records the outgoing slot's live
+   TTBR0 with its slot generation and installs the incoming one's (`akuma_switch::install_ttbr0_flush`,
+   now compiled for both AArch64 paths, as is `set_thread_register`); a generation mismatch or a root in
+   `akuma-mmu`'s freed-L0 ring installs the boot tables instead. That record is also the free gate's
+   probe (`register_saved_root_probe`), filtered like amd64's to slots that can still be switched in.
+   Kernel stacks are the pool's (`threading::ensure_pool_stack_top`, new). `read_user_context` is the
+   trap frame `sync_el0` already publishes (`threading::published_user_context`, new);
+   `write_user_context` is a no-op because fork/clone children start from their image context. EL0
+   entry is `hooked::enter_user` (kit `enter_user` at the slot's stack top); under the feature
+   `akuma_exec::process::enter_user_mode_checked` routes through the runtime hook, so `execve` needs no
+   change. The idle thread reaps, yields when work is due, else `wfi` without the lock.
+3. **The lock** — `akuma_bkl` stays with the core across a switch, so `transfer_lock_depth` is a no-op
+   (as amd64). The root kernel, unlike amd64, yields from dropped-BKL windows (VFS/net carve-outs,
+   `lock_bounded`'s backoff); `akuma-threading/yield-takes-bkl` (new, set only by this feature) takes the
+   lock around such a switch and gives it back on resume.
+4. **Boot order** — `hooked::init` after `threading::init`; `akuma_entry::hooked::init` replaces
+   `exceptions::init`; the netpoll main loop, which on `smp-shared` only `wfi`s and relies on the tick
+   to preempt it, yields every lap under the feature (it halts only when nothing else is runnable) —
+   without that, herd never ran. The `src/main.rs` halt is gone.
+5. **Self-tests** — three cfg arms. `yield_now_detects_masked_yield`, `neon_regs_across_yield` and
+   `fpcr_fpsr_across_yield` assert SGI-path properties (a yield is a self-SGI through the full-frame IRQ
+   entry; Q0-Q3/FPCR survive it); a hooked yield is a call and preserves what AAPCS64 says a call
+   preserves. They print `[SKIP]`. `as_drop_defers_while_saved_ctx_on_l0` gets a hooked arm
+   (`hooked::test_swap_saved_root` on its own slot). **Vacuous under the feature, still run:**
+   `neon_regs_across_preemption` and `fp_arithmetic_across_preemption` pass because kernel threads are
+   never preempted on this path, not because the save works.
+
+**A real defect found on the way, in shared code:** the hooked `spawn_user_closure_initializing` was a
+`&mut self` method called under `POOL`, and `prepare_task_slot` runs inside it. amd64's stacks are its
+own, so nothing noticed; this kernel's stacks are the pool's, and its first `spawn_fn` deadlocked on the
+non-reentrant spinlock. It is now an associated function called without the lock (the lock guarded
+nothing it touches).
+
+**Gates.** Default AArch64 build vs HEAD (built in a detached worktree): same 5466 symbols; `.text`
+differs in 2 bytes — one `mov` immediate 5421 -> 5468, a `#[track_caller]` line in `akuma-threading`
+moved by the lines added above it; `.rodata` 249 bytes of panic-location lines; `.symtab`/`.strtab` only
+LLVM's per-module hash suffixes. amd64 (the threading change runs there): TCG candidate vs HEAD 2+2 runs
+each, SMP=1 827/0 and SMP=4 837/0 on all eight, no `sigregs` hang this time. taoxichuan and shanghai
+build both arches; `--features hooked-sched` and `hooked-sched,no-tests` clippy-clean; amd64 clippy
+clean. Budgets: `akuma-entry` unsafe 14 -> 15 (the `FrameHandle::new` claim over the kit frame — the
+same contract as the SGI shim's, D4 step 1 anticipated it); `akuma-kernel-glue` untyped address params
+5 -> 6 (`saved_root_probe(l0_base: u64)`, whose shape `register_saved_root_probe` fixes for both kernels,
+like amd64's `any_task_on_space_root`); amd64 ratchets 85 -> 84. **Not run yet:** devbox, the
+epoll/futex suites, any SMP>1 — those wait for W3b's secondary bring-up.

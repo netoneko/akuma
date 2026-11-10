@@ -311,6 +311,7 @@ dependencies = [
  "akuma-primitives",
  "akuma-psci",
  "akuma-trap-aarch64",
+ "akuma-vectors-aarch64",
 ]
 
 [[package]]
@@ -534,6 +535,7 @@ dependencies = [
  "akuma-entry",
  "akuma-exceptions",
  "akuma-exec",
+ "akuma-exec-core",
  "akuma-ext2",
  "akuma-fdt",
  "akuma-gic",
@@ -544,8 +546,10 @@ dependencies = [
  "akuma-primitives",
  "akuma-psci",
  "akuma-rump",
+ "akuma-switch",
  "akuma-syscalls-glue",
  "akuma-timer",
+ "akuma-vectors-aarch64",
  "akuma-vfs-glue",
  "akuma-virtio",
  "log",

@@ -34,6 +34,9 @@ akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = fals
 akuma-timer = { path = "../akuma-timer" }
 akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 akuma-virtio = { path = "../akuma-virtio" }
+akuma-vectors-aarch64 = { path = "../akuma-vectors-aarch64", optional = true }
+akuma-switch = { path = "../akuma-switch", optional = true }
+akuma-exec-core = { path = "../akuma-exec-core", optional = true }
 log = { version = "0.4", default-features = false }
 spinning_top = "0.3"
 
@@ -77,6 +80,9 @@ smoltcp = ["akuma-net/smoltcp", "akuma-syscalls-glue/smoltcp", "akuma-kernel-cor
 sound = ["akuma-virtio/sound"]
 platform-firecracker = ["akuma-config/platform-firecracker", "akuma-entry/platform-firecracker", "akuma-kernel-core/platform-firecracker", "akuma-virtio/platform-firecracker"]
 rump = ["akuma-net/rump", "dep:akuma-rump", "akuma-syscalls-glue/rump"]
+# M6 (multiarch attempt 0): the hooked cooperative scheduler on this kernel — `hooked`'s
+# machine half, `akuma-entry`'s front end on `akuma-vectors-aarch64`. Default off.
+hooked-sched = ["akuma-exec/hooked-sched", "akuma-entry/hooked-sched", "akuma-exceptions/hooked-sched", "dep:akuma-vectors-aarch64", "dep:akuma-switch", "dep:akuma-exec-core"]
 rump-default = ["rump"]
 rump-tests = []
 sc-eventfd = ["akuma-syscalls-glue/sc-eventfd"]

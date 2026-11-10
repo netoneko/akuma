@@ -664,7 +664,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
 /// The landing pad an unrecoverable EL1 data abort in a dying process's kernel code
 /// `eret`s to; see `akuma_exceptions::sync_el1`.
 #[unsafe(no_mangle)]
-extern "C" fn el1_fault_recovery_pad() {
+pub(crate) extern "C" fn el1_fault_recovery_pad() {
     exc::el1_fault_recovery();
 }
 
@@ -816,17 +816,23 @@ pub fn install_vbar() {
     }
 }
 
-/// Install exception vector table
-pub fn init() {
-    // Initialize exception stack before enabling exceptions
-    init_exception_stack();
-
+/// Hand `akuma-exceptions` the crash-dump and frame reads it cannot make itself. Both
+/// front ends register them: this one in [`init`], the hooked one in `crate::hooked::init`.
+pub(crate) fn register_services() {
     exc::register_entry_services(exc::EntryServices {
         irq_frame_at,
         peek_u32,
         peek_u64,
         read_frame_bytes,
     });
+}
+
+/// Install exception vector table
+pub fn init() {
+    // Initialize exception stack before enabling exceptions
+    init_exception_stack();
+
+    register_services();
 
     install_vbar();
 

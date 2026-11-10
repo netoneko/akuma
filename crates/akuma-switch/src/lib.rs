@@ -112,7 +112,10 @@ pub fn set_exception_stack(stack_top: u64) {
 pub fn set_exception_stack(_stack_top: u64) {}
 
 /// Set the current thread id in `TPIDRRO_EL0` (read-only from EL0). Every per-slot static is indexed with it.
-#[cfg(all(target_os = "none", sgi_sched))]
+///
+/// Both AArch64 scheduler paths: the SGI switch calls it, and so does the root kernel's hooked
+/// machine half (`akuma-kernel-glue`'s `hooked`), whose `set_current_slot` hook it is.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline]
 pub fn set_thread_register(tid: usize) {
     // SAFETY: a single `msr` with no memory operands; the caller is the scheduler naming the thread it runs.
@@ -124,7 +127,9 @@ pub fn set_thread_register(tid: usize) {
 /// The kernel runs in the TTBR0 low half, so a TTBR0 that does not map kernel text is a machine-wedging fault
 /// loop at the next fetch: the caller must pass a root it has just validated (the scheduler installs a
 /// thread's own saved root). Refuses (returns `false`) the one value that can never be a root.
-#[cfg(all(target_os = "none", sgi_sched))]
+///
+/// Both AArch64 scheduler paths, for the reason [`set_thread_register`] is.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[must_use]
 pub fn install_ttbr0_flush(new_ttbr0: u64) -> bool {
     if new_ttbr0 & 0x0000_FFFF_FFFF_F000 == 0 {

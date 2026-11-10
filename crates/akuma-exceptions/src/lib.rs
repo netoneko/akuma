@@ -2400,6 +2400,54 @@ pub fn irq_with_sp(current_sp: u64) -> u64 {
     new_sp
 }
 
+/// IRQ / SGI entry for the hooked scheduler (`hooked-sched`, M6): the root kernel's
+/// `akuma-vectors-aarch64` front end calls this from its `El0Irq`/`El1Irq` handlers.
+///
+/// What [`irq_with_sp`] does for the SGI design, without its stack-pointer protocol: the
+/// switch is an ordinary call ([`akuma_exec::threading::yield_now`]) made on the interrupted
+/// thread's own kernel stack, where the vector stub saved its frame, so there is no frame to
+/// hand back and nothing to reconcile against an SPSR. The BKL is taken for the dispatch
+/// unless this core already holds it (an EL1 window opened by code that holds it), and
+/// released at the end only if this entry took it — after a switch that is the resumed
+/// thread releasing the lock its core holds on its behalf, which is the return to EL0.
+///
+/// The scheduler SGI preempts only when it interrupted EL0 (`from_el0`): kernel code
+/// switches cooperatively, and an EL1 entry is an interrupt window, where the SGI's only job
+/// was to end a `wfi`.
+#[cfg(feature = "hooked-sched")]
+pub fn irq_hooked(from_el0: bool) {
+    note_exception_entry();
+    note_exc_class(2);
+    let held = akuma_exec::bkl::held_by_current();
+    if !held {
+        akuma_exec::bkl::enter_kernel();
+    }
+    #[cfg(kernel_smp_shared)]
+    if from_el0 {
+        (hooks().record_el0_trap)();
+    }
+    let mut preempt = false;
+    match akuma_gic::acknowledge_irq() {
+        Some(irq) => {
+            note_irq_intid(irq);
+            if irq != akuma_gic::SGI_SCHEDULER {
+                (hooks().dispatch_irq)(irq);
+            }
+            akuma_gic::end_of_interrupt(irq);
+            preempt = from_el0 && irq == akuma_gic::SGI_SCHEDULER;
+        }
+        None => {
+            SPURIOUS_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if preempt {
+        akuma_exec::threading::yield_now();
+    }
+    if !held {
+        akuma_exec::bkl::leave_kernel();
+    }
+}
+
 /// Landing pad for EL1 fault recovery.
 ///
 /// After an EC=0x25 data abort from kernel code, ELR is redirected here so
