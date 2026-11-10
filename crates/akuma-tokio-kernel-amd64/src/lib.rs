@@ -1782,7 +1782,8 @@ fn boot(k: &Kernel) -> ! {
 
     // Heap then PMM. The no-op reapers are the honest hooks for a kernel with
     // no processes, no page cache and no retired list (each is a `|| 0`).
-    if !mem::init(&machine, cfg!(feature = "pmm-forensics"), akuma_pmm::PmmHooks {
+    let facts = machine.facts(akuma_machine_facts::Provenance::Pvh);
+    if !mem::init(&facts, cfg!(feature = "pmm-forensics"), akuma_pmm::PmmHooks {
         heap_reclaim: || 0,
         drain_retired: akuma_exec::process::reclaim::drain_retired_under_pressure,
         evict_clean_file_pages: |_| 0,

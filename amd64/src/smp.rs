@@ -67,7 +67,6 @@ use akuma_cpu::msr::{self, Msr};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use akuma_ryzen_amd64::acpi::Madt;
-use akuma_ryzen_amd64::MachineDescription;
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
@@ -478,11 +477,11 @@ const AP_ONLINE_BUDGET: u64 = 200_000_000;
 /// unless the page is inside a RAM region and outside all of them. A refusal
 /// means "stay single-core", which is a configuration, not a failure.
 #[must_use]
-pub fn trampoline_page_available(machine: &MachineDescription, keep_out: &[(u64, u64)]) -> bool {
-    use akuma_machine_facts::{Provenance, Range};
+pub fn trampoline_page_available(facts: &akuma_machine_facts::Facts, keep_out: &[(u64, u64)]) -> bool {
+    use akuma_machine_facts::Range;
     // The decision is the neutral one (`Facts::is_clear_ram`); this function only names the page
     // and converts the caller's `[start, end)` pairs.
-    machine.facts(Provenance::Pvh).is_clear_ram(
+    facts.is_clear_ram(
         Range::new(AP_TRAMPOLINE_PA, 4096),
         keep_out.iter().map(|&(s, e)| Range::new(s, e.saturating_sub(s))),
     )

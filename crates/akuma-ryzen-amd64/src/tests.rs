@@ -411,6 +411,33 @@ fn unevenly_spaced_transports_fall_back_to_one_slot() {
 }
 
 #[test]
+fn facts_geometry_agrees_with_the_protocol_view() {
+    // `blk::init` reads the slot geometry off `Facts`; the tokio kernel reads it
+    // off `MmioDevices`. Same windows in, same answer out.
+    use akuma_machine_facts::Provenance;
+    let m = firecracker(1);
+    let mut buf = [0u8; 256];
+    let d = describe(&m, 0x6000, &mut buf).unwrap();
+    let f = d.facts(Provenance::Pvh);
+    assert_eq!(f.virtio_geometry().map(|g| (g.base, g.stride, g.slots)), d.virtio.geometry());
+    for line in [
+        "virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0009000:6",
+        "virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6",
+        "virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6",
+    ] {
+        let devs = cmdline::parse(line);
+        let mut f = akuma_machine_facts::Facts::new(Provenance::Pvh);
+        for dev in devs.as_slice() {
+            assert!(f.push_virtio(akuma_machine_facts::VirtioMmio {
+                window: akuma_machine_facts::Range::new(dev.base, dev.len),
+                irq: dev.irq,
+            }));
+        }
+        assert_eq!(f.virtio_geometry().map(|g| (g.base, g.stride, g.slots)), devs.geometry(), "{line}");
+    }
+}
+
+#[test]
 fn size_suffixes_are_one_field_spelled_three_ways() {
     assert_eq!(cmdline::parse_size("4K"), Some(4096));
     assert_eq!(cmdline::parse_size("4k"), Some(4096));

@@ -69,6 +69,35 @@ pub struct VirtioMmio {
     pub irq: u32,
 }
 
+/// Where the virtio slots are, as drivers address them: slot `i` at `base + i * stride`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VirtioGeometry {
+    pub base: u64,
+    pub stride: u64,
+    pub slots: usize,
+}
+
+/// The slot geometry a list of transport windows describes, or `None` for no windows.
+///
+/// The stride is the first window's size. A list that is not evenly spaced at that stride (each
+/// window `base + i * stride`, each exactly `stride` long) cannot be addressed as slots, so the
+/// count falls back to 1 rather than pointing slot 1 at nothing. Both VMMs measured so far are
+/// dense (Firecracker 0x1000 apart, QEMU `microvm` 0x200); that is measured, not guaranteed.
+#[must_use]
+pub fn virtio_geometry<I: IntoIterator<Item = Range>>(windows: I) -> Option<VirtioGeometry> {
+    let mut it = windows.into_iter();
+    let first = it.next()?;
+    let stride = first.size;
+    let mut count = 1usize;
+    let mut dense = true;
+    for (i, w) in it.enumerate() {
+        count += 1;
+        let want = stride.checked_mul(i as u64 + 1).and_then(|o| first.base.checked_add(o));
+        dense &= want == Some(w.base) && w.size == stride;
+    }
+    Some(VirtioGeometry { base: first.base, stride, slots: if dense { count } else { 1 } })
+}
+
 /// The interrupt controller, as far as discovery can tell.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum IrqController {
@@ -183,6 +212,12 @@ impl Facts {
         &self.virtio[..self.virtio_count]
     }
 
+    /// The virtio slot geometry, per [`virtio_geometry`].
+    #[must_use]
+    pub fn virtio_geometry(&self) -> Option<VirtioGeometry> {
+        virtio_geometry(self.virtio().iter().map(|d| d.window))
+    }
+
     /// Total RAM bytes, saturating.
     #[must_use]
     pub fn ram_bytes(&self) -> u64 {
@@ -237,6 +272,52 @@ impl Facts {
 
 #[cfg(test)]
 mod tests {
+
+    fn windows(list: &[(u64, u64)]) -> impl Iterator<Item = Range> + '_ {
+        list.iter().map(|&(b, l)| Range::new(b, l))
+    }
+
+    #[test]
+    fn geometry_of_nothing_is_none() {
+        assert_eq!(virtio_geometry(windows(&[])), None);
+        assert_eq!(Facts::new(Provenance::Pvh).virtio_geometry(), None);
+    }
+
+    #[test]
+    fn dense_windows_are_slots() {
+        // QEMU microvm: 0x200 apart.
+        let g = virtio_geometry(windows(&[(0xfeb0_0000, 0x200), (0xfeb0_0200, 0x200), (0xfeb0_0400, 0x200)]));
+        assert_eq!(g, Some(VirtioGeometry { base: 0xfeb0_0000, stride: 0x200, slots: 3 }));
+        // A single window is one slot of its own size.
+        let g = virtio_geometry(windows(&[(0xd000_0000, 4096)]));
+        assert_eq!(g, Some(VirtioGeometry { base: 0xd000_0000, stride: 4096, slots: 1 }));
+    }
+
+    #[test]
+    fn a_gap_or_a_size_mismatch_falls_back_to_one_slot() {
+        let gap = virtio_geometry(windows(&[(0xd000_0000, 4096), (0xd000_2000, 4096)]));
+        assert_eq!(gap, Some(VirtioGeometry { base: 0xd000_0000, stride: 4096, slots: 1 }));
+        let size = virtio_geometry(windows(&[(0xd000_0000, 4096), (0xd000_1000, 512)]));
+        assert_eq!(size.map(|g| g.slots), Some(1));
+        // Out of order is not dense either.
+        let order = virtio_geometry(windows(&[(0xd000_1000, 4096), (0xd000_0000, 4096)]));
+        assert_eq!(order.map(|g| g.slots), Some(1));
+    }
+
+    #[test]
+    fn a_stride_that_overflows_is_not_dense() {
+        let g = virtio_geometry(windows(&[(u64::MAX - 0x100, 0x200), (0, 0x200)]));
+        assert_eq!(g.map(|g| g.slots), Some(1));
+    }
+
+    #[test]
+    fn facts_geometry_reads_its_own_windows() {
+        let mut f = Facts::new(Provenance::Fdt);
+        for i in 0..4u64 {
+            assert!(f.push_virtio(VirtioMmio { window: Range::new(0x4000_3000 + i * 0x1000, 0x1000), irq: 32 + i as u32 }));
+        }
+        assert_eq!(f.virtio_geometry(), Some(VirtioGeometry { base: 0x4000_3000, stride: 0x1000, slots: 4 }));
+    }
     use super::*;
 
     fn ok() -> Facts {

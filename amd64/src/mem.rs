@@ -15,7 +15,7 @@
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
-use akuma_ryzen_amd64::MachineDescription;
+use akuma_machine_facts::Facts;
 
 pub use akuma_boot_amd64::mem::heap_size;
 
@@ -24,16 +24,16 @@ pub use akuma_boot_amd64::mem::heap_size;
 use crate::phys::{PHYSMAP_LIMIT, phys_to_virt};
 
 /// Bring up heap then PMM. Returns false if the machine described no usable RAM.
-pub fn init(machine: &MachineDescription) -> bool {
-    init_reserving(machine, &[])
+pub fn init(facts: &Facts) -> bool {
+    init_reserving(facts, &[])
 }
 
 /// As [`init`], but keeping the PMM's hands off every `[start, end)` in
 /// `reserved` as well — on a multiboot2 boot, the modules and the information
 /// block, both of which the kernel goes on reading after this returns.
-pub fn init_reserving(machine: &MachineDescription, reserved: &[(u64, u64)]) -> bool {
+pub fn init_reserving(facts: &Facts, reserved: &[(u64, u64)]) -> bool {
     akuma_boot_amd64::mem::init_reserving(
-        machine,
+        facts,
         reserved,
         cfg!(feature = "pmm-forensics"),
         akuma_pmm::PmmHooks {

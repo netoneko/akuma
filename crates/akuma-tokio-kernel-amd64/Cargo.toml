@@ -62,6 +62,8 @@ akuma-trap-amd64 = { path = "../akuma-trap-amd64" }
 # The machine's own description of itself: the PVH handoff, the memory map, the
 # virtio-mmio command line.
 akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64" }
+# `Facts`, the neutral machine view `akuma_boot_amd64::mem::init` reads.
+akuma-machine-facts = { path = "../akuma-machine-facts" }
 # The heap allocator (installed here as the global allocator) and the frame
 # allocator `paging` and `virtio` allocate through.
 akuma-alloc = { path = "../akuma-alloc" }

@@ -42,7 +42,6 @@
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
-use akuma_ryzen_amd64::MmioDevices;
 use crate::paging::{self, MemAttr, PteProt};
 use crate::phys::DEVMAP_BASE;
 use crate::serial;
@@ -77,8 +76,8 @@ fn map_device(base: u64, len: u64) -> bool {
 /// Returns false when the machine announced no virtio device — which is not an
 /// error. It is what `"drives": []` produces, and what every boot before this
 /// stage did.
-pub fn init(devices: &MmioDevices) -> bool {
-    let devs = devices.as_slice();
+pub fn init(facts: &akuma_machine_facts::Facts) -> bool {
+    let devs = facts.virtio();
     let Some(first) = devs.first() else {
         // No transports announced. Say so explicitly: the window defaults are
         // AArch64's, and a later probe that walks them faults on an address this
@@ -88,17 +87,17 @@ pub fn init(devices: &MmioDevices) -> bool {
     };
 
     for d in devs {
-        if !map_device(d.base, d.len) {
+        if !map_device(d.window.base, d.window.size) {
             serial::puts("  [blk] could not map a virtio transport\n");
             return false;
         }
     }
 
-    // Slot geometry: `base + i * stride`. The evenly-spaced check lives in
-    // `akuma-ryzen-amd64`, where it is host-tested — believing a stride that does
-    // not hold would point slot 1 at nothing and hand `VirtIOBlk::new` a page of
-    // zeroes.
-    let Some((base, stride, slots)) = devices.geometry() else {
+    // Slot geometry: `base + i * stride`. The evenly-spaced check is
+    // `akuma_machine_facts::virtio_geometry`, host-tested — believing a stride
+    // that does not hold would point slot 1 at nothing and hand `VirtIOBlk::new`
+    // a page of zeroes.
+    let Some(akuma_machine_facts::VirtioGeometry { base, stride, slots }) = facts.virtio_geometry() else {
         return false;
     };
     if slots < devs.len() {

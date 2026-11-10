@@ -210,12 +210,12 @@ version = "0.1.0"
 dependencies = [
  "akuma-alloc",
  "akuma-cpu",
+ "akuma-machine-facts",
  "akuma-pagetable",
  "akuma-phys",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-pte-amd64",
- "akuma-ryzen-amd64",
 ]
 
 [[package]]
@@ -1137,6 +1137,7 @@ dependencies = [
  "akuma-idt-amd64",
  "akuma-isolation",
  "akuma-lapic-amd64",
+ "akuma-machine-facts",
  "akuma-middleware",
  "akuma-mmap",
  "akuma-mmu",

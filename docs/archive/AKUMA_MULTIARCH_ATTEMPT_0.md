@@ -378,3 +378,49 @@ AArch64 bin's `crate::` paths. What `kernel-core` uniquely owns and amd64 lacked
   **826/0**, candidate 4/4 **827/0** (the one new check). Unsafe budget 419 unchanged.
 - **Not run:** multiboot2 (ryzen rig: `ssh 192.168.1.126:22` timed out — the bench is off the LAN); the change is on
   the path both protocols share (`install_shared_sinks`), so the PVH run exercises it.
+
+### W1b — amd64 memory bring-up, block driver and trampoline read `Facts` (2026-11-10)
+
+The M2 consumers. Each entry point builds `Facts` **once** with its real provenance
+(`machine.facts(Pvh)` in `kmain`, `machine.facts(Multiboot2)` in `kmain_mb2`) and everything that
+needs RAM or virtio windows reads that; `MachineDescription` stays the protocol adapter and keeps only
+what `Facts` does not hold (the MADT's LAPIC ids for `start_secondaries`, ACPI for `power`, the
+command line).
+
+- **`akuma-machine-facts`:** `VirtioGeometry` + `virtio_geometry(windows)` + `Facts::virtio_geometry()`
+  — the evenly-spaced-slots rule that was a method on the PVH command-line type, now the one copy
+  (overflow-checked; 5 new host tests). `akuma_ryzen_amd64::MmioDevices::geometry` delegates to it (the
+  tokio kernel still calls that), and `facts_geometry_agrees_with_the_protocol_view` pins both views on
+  the Firecracker fixture and three command lines.
+- **`akuma-boot-amd64::mem::{init, init_reserving}` take `&Facts`** (were `&MachineDescription`):
+  they only ever read the type-1 regions and their sum, which are `Facts::ram()`/`ram_bytes()`
+  (same `is_ram` filter, both caps 16). The crate's dependency on the protocol crate
+  (`akuma-ryzen-amd64`) is **gone**, replaced by the dependency-free facts crate. Callers updated:
+  amd64 `mem.rs`, `multiboot2.rs`, and `akuma-tokio-kernel-amd64` (PVH, builds `Facts` at the call).
+- **amd64 `blk::init(&Facts)`**, **`smp::trampoline_page_available(&Facts, ..)`** (it used to build a
+  `Facts` stamped `Pvh` even on a multiboot2 boot), **`machine::report_facts(&Facts)`**,
+  **`boot::bring_up_secondaries(madt, &facts, cmdline, keep_out)`**, and `SuiteCtx.facts`.
+- Only visible difference by construction: the `mem:` region report no longer lists zero-size RAM
+  entries (`Facts::push_ram` drops them; they were always `usable_of == None`).
+
+**Gates.** Host: `akuma-machine-facts` 22/22, `akuma-ryzen-amd64` 22/22. clippy `-D warnings`: amd64
+(default, `no-tests`), `akuma-boot-amd64` + `akuma-tokio-kernel-amd64` (x86_64), `-boot-amd64`,
+`-ryzen-amd64`, `-machine-facts` (host). Builds: amd64, taoxichuan (x86_64 **and** aarch64, `no-tests`),
+shanghai. amd64 PVH TCG, interleaved against the W1a build: SMP=1 **4/4 827/0** both; SMP=4 baseline
+2/2 837/0, candidate 1/2 837/0 + 1 hang in `sigregs` (below). The `facts:`/`mem:`/`blk:` boot lines are
+**identical** to the baseline's. AArch64 untouched by this slice. **Not run:** multiboot2 (ryzen rig
+unreachable from this network) — `kmain_mb2` compiles and its three changed lines are the same
+substitutions as `kmain`'s.
+
+**One codegen surprise, explained.** The candidate's `.text` is 431 KB **smaller** (3,470,031 →
+3,039,183 B) and its `pmm:` line shows 105 more free frames — deterministic, every run. Per-symbol diff:
+nothing was removed; ThinLTO stopped inlining `serial::putb` / `serial::putb_tty` into every print site
+(they now exist as standalone 618 B / 547 B functions; `rtw89_sta::daemon` −37 KB, `netpoll_daemon`
+−19 KB, `machine::report` −18 KB ... are their inlined copies leaving). Behaviour is identical; a
+serial byte costs one call more, which a port write dwarfs. The image end moved 0x69000 = 105 pages,
+which is exactly the free-frame difference.
+
+**Open finding (pre-existing, not this slice): `sigregs` can hang at SMP=4 under TCG.** Seen on the
+`445fe139` baseline (`s4b4`, 727 s timeout) and on this candidate (1 of 2): the suite passes `kill`,
+starts `sigregs`, the log shows ~8 `[sig!]` deliveries of its null-store `SIGSEGV`, then nothing. Not
+the known post-netpoll stall (that one stops before the suite). Not investigated yet.

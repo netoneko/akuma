@@ -256,6 +256,9 @@ pub fn install_shared_sinks() {
 #[cfg(not(feature = "no-tests"))]
 pub struct SuiteCtx<'a> {
     pub machine: &'a MachineDescription,
+    /// The same machine in the neutral shape (multiarch M2): what memory
+    /// bring-up, the block driver and the trampoline check read.
+    pub facts: &'a akuma_machine_facts::Facts,
     /// The kernel command line, however this protocol obtained it. Every
     /// `strace`/`nosmp`/`netprobe`-style decision below reads it from here, so
     /// the two paths cannot answer the same flag differently.
@@ -354,7 +357,8 @@ pub fn late_init(secondaries: impl FnOnce()) {
 /// on the trampoline page differs by protocol (a PVH start-info block, or GRUB's information
 /// block and root image).
 pub fn bring_up_secondaries(
-    machine: &akuma_ryzen_amd64::MachineDescription,
+    madt: Option<&akuma_ryzen_amd64::acpi::Madt>,
+    facts: &akuma_machine_facts::Facts,
     cmdline: &str,
     keep_out: &[(u64, u64)],
 ) -> usize {
@@ -362,8 +366,8 @@ pub fn bring_up_secondaries(
     if cmdline.split_ascii_whitespace().any(|t| t == "nosmp") {
         crate::serial::puts("  smp:  nosmp on the command line — single core\n");
         0
-    } else if smp::trampoline_page_available(machine, keep_out) {
-        smp::start_secondaries(machine.madt.as_ref())
+    } else if smp::trampoline_page_available(facts, keep_out) {
+        smp::start_secondaries(madt)
     } else {
         crate::serial::puts("  smp:  trampoline page is not free RAM — single core\n");
         0
@@ -620,7 +624,7 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     // from four cores interleaves into every other line, and taking them out of
     // the picture is the cheapest way to decide whether a fault is cross-core.
     let nosmp = flag("nosmp");
-    let started = bring_up_secondaries(cx.machine, cx.cmdline, &cx.keep_out);
+    let started = bring_up_secondaries(cx.machine.madt.as_ref(), cx.facts, cx.cmdline, &cx.keep_out);
     let expected_aps = if nosmp {
         0
     } else {

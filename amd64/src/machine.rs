@@ -221,17 +221,16 @@ pub fn report(d: &MachineDescription) {
 }
 
 /// Print the neutral view of the machine ([`akuma_machine_facts::Facts`]) and whether it passes
-/// the neutral invariants. One line, the same on both boot paths: `provenance` says which protocol
-/// the facts came from (`Pvh` or `Multiboot2`).
+/// the neutral invariants. One line, the same on both boot paths: `f.provenance` says which
+/// protocol the facts came from (`Pvh` or `Multiboot2`).
 ///
 /// Report-only, deliberately: a machine whose facts fail validation still boots exactly as it did
 /// before this line existed (the seam's first gate is "both kernels boot unchanged"); the verdict
 /// is for the log and for the harness that greps it.
-pub fn report_facts(d: &MachineDescription, provenance: akuma_machine_facts::Provenance) {
+pub fn report_facts(f: &akuma_machine_facts::Facts) {
     use akuma_machine_facts::IrqController;
-    let f = d.facts(provenance);
     serial::puts("  facts: ");
-    serial::puts(provenance.name());
+    serial::puts(f.provenance.name());
     serial::puts(", ");
     serial::put_dec(f.ram_bytes() / (1024 * 1024));
     serial::puts(" MiB in ");

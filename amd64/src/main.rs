@@ -249,7 +249,10 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // reportably rather than triple-fault.
     let machine = machine::describe(hvm_start_info);
     machine::report(&machine);
-    machine::report_facts(&machine, akuma_machine_facts::Provenance::Pvh);
+    // The neutral view (multiarch M2), built once: memory bring-up, the block
+    // driver and the AP trampoline check read this, not the PVH description.
+    let facts = machine.facts(akuma_machine_facts::Provenance::Pvh);
+    machine::report_facts(&facts);
 
     // No PCI enumeration on this path. PVH means a VMM, and the VMMs this
     // target runs under (Firecracker, QEMU `microvm`) present every device as
@@ -259,7 +262,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
     // there invents devices. Enumeration lives on the bare-metal
     // (`multiboot2.rs`) path only.
 
-    if !mem::init(&machine) {
+    if !mem::init(&facts) {
         serial::puts("\nAkuma/amd64 — memory bring-up FAILED\n");
         halt();
     }
@@ -296,7 +299,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
 
     // Block devices, after the heap (the virtio HAL allocates DMA buffers from
     // it) and after the IDT (a bad transport address should fault reportably).
-    let have_disk = blk::init(&machine.virtio);
+    let have_disk = blk::init(&facts);
     // The filesystem, on top of that disk. Both are best-effort: a machine with
     // no drive still boots, which is what `DISK=none` and every stage before
     // Stage M did.
@@ -347,7 +350,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
                 // off the filesystem.
                 kvm::late(cmdline);
             }
-            boot::bring_up_secondaries(&machine, cmdline, &keep_out);
+            boot::bring_up_secondaries(machine.madt.as_ref(), &facts, cmdline, &keep_out);
         });
         // The network's bring-up the suite would otherwise have done on the way
         // past, the same block `multiboot2::boot_to_init` runs: DHCP, then the
@@ -378,6 +381,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
         &mut t,
         &boot::SuiteCtx {
             machine: &machine,
+            facts: &facts,
             cmdline,
             smap,
             have_pci,

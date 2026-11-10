@@ -912,7 +912,8 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     serial::puts(" MiB usable across ");
     serial::put_dec(machine.regions().len() as u64);
     serial::puts(" regions\n");
-    crate::machine::report_facts(&machine, akuma_machine_facts::Provenance::Multiboot2);
+    let facts = machine.facts(akuma_machine_facts::Provenance::Multiboot2);
+    crate::machine::report_facts(&facts);
 
     // PCI enumeration. This is the whole reason it matters on this entry: a
     // VMM announces its devices, real firmware announces nothing. The xHCI /
@@ -947,7 +948,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
     // is read for the rest of this function, long after the PMM starts
     // handing out frames, and nothing in the memory map marks its pages either.
     let info_span = (info_phys, info_phys + bytes.len() as u64);
-    if !crate::mem::init_reserving(&machine, &[reserved, info_span]) {
+    if !crate::mem::init_reserving(&facts, &[reserved, info_span]) {
         serial::puts("\nAkuma/amd64 - memory bring-up FAILED\n");
         crate::halt();
     }
@@ -1067,7 +1068,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         if have_fs {
             crate::kvm::late(cmdline);
         }
-        crate::boot::bring_up_secondaries(&machine, cmdline, &mb2_keep_out());
+        crate::boot::bring_up_secondaries(machine.madt.as_ref(), &facts, cmdline, &mb2_keep_out());
     };
 
     // No suite in this build: `boot::late_init` is the same bring-up the
@@ -1106,6 +1107,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         &mut t,
         &crate::boot::SuiteCtx {
             machine: &machine,
+            facts: &facts,
             cmdline: info.cmdline(),
             smap,
             // Firmware boots always have PCI, and the scan already happened

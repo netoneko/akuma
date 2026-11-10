@@ -22,7 +22,7 @@
 //!   no-ops.
 //! * the **forensics flag**: the full kernel's `pmm-forensics` feature.
 
-use akuma_ryzen_amd64::{MachineDescription, MemRegion};
+use akuma_machine_facts::{Facts, Range};
 use akuma_primitives::safe_print;
 
 use crate::phys::{PHYSMAP_LIMIT, phys_to_virt};
@@ -89,8 +89,10 @@ const fn align_up(v: usize, to: usize) -> usize {
 }
 
 /// Bring up heap then PMM. Returns false if the machine described no usable RAM.
-pub fn init(machine: &MachineDescription, forensics: bool, hooks: akuma_pmm::PmmHooks) -> bool {
-    init_reserving(machine, &[], forensics, hooks)
+///
+/// Reads only `facts.ram()`: the regions either boot protocol reported as RAM.
+pub fn init(facts: &Facts, forensics: bool, hooks: akuma_pmm::PmmHooks) -> bool {
+    init_reserving(facts, &[], forensics, hooks)
 }
 
 /// How a region of RAM ended up being used, for the boot-log accounting.
@@ -158,7 +160,7 @@ impl Usable {
 /// instruments (see `akuma-amd64`'s `pmm-forensics` feature for the costs);
 /// `hooks` are registered verbatim into `akuma_pmm`.
 pub fn init_reserving(
-    machine: &MachineDescription,
+    facts: &Facts,
     reserved: &[(u64, u64)],
     forensics: bool,
     hooks: akuma_pmm::PmmHooks,
@@ -192,7 +194,7 @@ pub fn init_reserving(
     let mut span_base = u64::MAX;
     let mut span_end = 0u64;
     let mut ram_total = 0u64;
-    for u in usable_regions(machine, &taken).take(akuma_pmm::MAX_RAM_REGIONS) {
+    for u in usable_regions(facts, &taken).take(akuma_pmm::MAX_RAM_REGIONS) {
         span_base = span_base.min(u.base);
         span_end = span_end.max(u.end);
         ram_total += u.end - u.base;
@@ -208,7 +210,7 @@ pub fn init_reserving(
     // otherwise.
     let mut roomiest: Option<Usable> = None;
     let mut kernel_home: Option<Usable> = None;
-    for u in usable_regions(machine, &taken).take(regions) {
+    for u in usable_regions(facts, &taken).take(regions) {
         if roomiest.is_none_or(|r| u.room() > r.room()) {
             roomiest = Some(u);
         }
@@ -223,7 +225,7 @@ pub fn init_reserving(
         let at = |u: Usable| heap_start_in(u, want as u64, &taken).map(|s| (u, want, s));
         kernel_home.and_then(at).or_else(|| at(roomiest))
     };
-    let (heap_home, heap_bytes, heap_at) = pick(heap_size_for(machine.usable_ram()))
+    let (heap_home, heap_bytes, heap_at) = pick(heap_size_for(facts.ram_bytes()))
         .or_else(|| pick(HEAP_SIZE))
         // Nothing fits at either size. Keep the historical choice so the
         // explicit diagnostic below reports against the same region it always
@@ -239,8 +241,8 @@ pub fn init_reserving(
     // whole point of the rest: every reported region, and what became of it.
     let mut seen = 0usize;
     safe_print!(96, "  mem:  RAM the machine reported, and what became of each:\n");
-    for r in machine.regions().iter().filter(|r| r.is_ram()) {
-        let fate = if r.addr >= PHYSMAP_LIMIT {
+    for r in facts.ram() {
+        let fate = if r.base >= PHYSMAP_LIMIT {
             Fate::Unreachable
         } else {
             match usable_of(*r, &taken) {
@@ -262,7 +264,7 @@ pub fn init_reserving(
         safe_print!(
             160,
             "    0x{:016x} + {} MiB  {}\n",
-            r.addr,
+            r.base,
             r.size / 1024 / 1024,
             fate.label()
         );
@@ -274,7 +276,7 @@ pub fn init_reserving(
     safe_print!(
         160,
         "  mem:  {} MiB usable, {} MiB managed, physmap reaches {} GiB\n",
-        machine.usable_ram() / 1024 / 1024,
+        facts.ram_bytes() / 1024 / 1024,
         ram_total / 1024 / 1024,
         PHYSMAP_LIMIT / 1024 / 1024 / 1024
     );
@@ -334,7 +336,7 @@ pub fn init_reserving(
     // spoken for. The reverse would reserve pages that are about to be declared
     // free and hand out the kernel image.
     akuma_pmm::init_sparse(span_base as usize, (span_end - span_base) as usize);
-    for u in usable_regions(machine, &taken).take(regions) {
+    for u in usable_regions(facts, &taken).take(regions) {
         if akuma_pmm::add_ram(u.base as usize, (u.end - u.base) as usize).is_none() {
             // Cannot happen -- the scan above took at most `MAX_RAM_REGIONS` --
             // but a PMM that is handing out an undescribed region is handing
@@ -392,8 +394,8 @@ const LOW_RAM_FLOOR: u64 = 0x10_0000;
 /// region's bottom raises `floor` past it; one covering the top clips `end`
 /// below it. A span strictly **inside** `[floor, end)` is left in the region
 /// and reserved as a hole by [`init_reserving`]; the heap is placed around it.
-fn usable_of(r: MemRegion, taken: &[(u64, u64)]) -> Option<Usable> {
-    let base = r.addr.max(LOW_RAM_FLOOR);
+fn usable_of(r: Range, taken: &[(u64, u64)]) -> Option<Usable> {
+    let base = r.base.max(LOW_RAM_FLOOR);
     let mut end = r.end().min(PHYSMAP_LIMIT);
     if end <= base {
         return None;
@@ -442,12 +444,8 @@ fn heap_start_in(u: Usable, want: u64, taken: &[(u64, u64)]) -> Option<u64> {
 /// once: this runs before the heap exists, so there is nowhere to build one,
 /// and the list is walked three times at boot and never again.
 fn usable_regions<'a>(
-    machine: &'a MachineDescription,
+    facts: &'a Facts,
     taken: &'a [(u64, u64)],
 ) -> impl Iterator<Item = Usable> + 'a {
-    machine
-        .regions()
-        .iter()
-        .filter(|r| r.is_ram())
-        .filter_map(move |r| usable_of(*r, taken))
+    facts.ram().iter().filter_map(move |r| usable_of(*r, taken))
 }
