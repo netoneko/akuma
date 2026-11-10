@@ -52,6 +52,26 @@ resume events, per-thread enable, printed by the idle loop's 30 s block) + `DUMP
 keystrokes were only a trigger (allocation -> GC at a particular moment); the hang itself needs no
 terminal.
 
+## Update 2026-11-10 (futex trace of the GC-script hang, main thread only)
+
+Tracing every futex call of the process's *main* thread (helper threads rename themselves with
+`prctl(PR_SET_NAME)`, so a comm filter missed them — next build keys on tgid) in a hung `gc_test.js`
+run, 4-vCPU guest:
+
+- The main thread broadcasts to the collector/helpers (`FUTEX_WAKE_PRIVATE` on heap futexes
+  `0x52312b0`, `0x3c0..984`, `0x513b960` with count 65535 -> woke 1, then 0), then enqueues
+  `FUTEX_WAIT_PRIVATE` on a **stack** latch (`0x7fffffffd054`; an earlier identical round used
+  `0x7fffffffce24` and returned 0 immediately after one `FUTEX_WAKE` from a helper).
+- Within the same millisecond something readied the thread (`k2` waker with state WAITING, `k4`
+  sticky resume) **but the wait did not return** — the waiter stayed queued (the idle-loop futex
+  dump still lists it), so that wake was not a `FUTEX_WAKE` on the latch's key: a spurious ready,
+  after which the wait loop re-tested, found itself still queued, and re-parked.
+- Then nothing for 14 s except the 1 s untimed-park backstop (filtered out of the trace) until the
+  test's `timeout` killed it (`ret -4`, EINTR).
+
+So the helper's `FUTEX_WAKE` on the latch either never happened or never matched. Next: capture
+the helpers' futex calls (same tgid) to see whether the latch wake was issued and on what address.
+
 ## Candidate causes (not yet tested)
 
 - A wake lost on the `FUTEX_CMP_REQUEUE` / condvar path musl uses for WTF's condvars
