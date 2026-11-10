@@ -3,7 +3,9 @@
 Running Claude Code on Akuma itself. Each entry is an open problem unless it says otherwise.
 Started 2026-11-10 on branch `akuma-convergence-research`.
 
-## 1. Bash tool fails: `EIO: i/o error, mkdir '<scratchpad>/tasks'`
+## 1. Bash tool fails: `EIO: i/o error, mkdir '<scratchpad>/tasks'` — FIXED 2026-11-10
+
+Root cause and fix: [`PROC_SELF_FD_PATH_PREFIX.md`](PROC_SELF_FD_PATH_PREFIX.md) — Bun creates the directory via `mkdir("/proc/self/fd/N/<name>")`, which Akuma sent to procfs (`EIO`). The suspects below were all wrong; kept as the record.
 
 ### Symptom
 

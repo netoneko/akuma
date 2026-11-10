@@ -293,6 +293,13 @@ syscall_table! {
     // kernel; see the crate header, rule 2.
     Openat     => OPENAT     = 257, nr::OPENAT;
     Mkdirat    => MKDIRAT    = 258, nr::MKDIRAT;
+    /// `faccessat2(dirfd, path, mode, flags)` — Linux 5.8; what Bun and libuv call for `access`
+    /// and `which`. Glue has had the arm for aarch64; amd64 answered `ENOSYS` (observed 16 times
+    /// in one headless Claude Code run) and callers fell back.
+    Faccessat2 => FACCESSAT2 = 439, nr::FACCESSAT2;
+    /// `close_range(first, last, flags)` — Linux 5.9. With it `ENOSYS`, every child spawn
+    /// walked the whole fd limit with `fcntl` (9111 `EBADF` calls in one Claude Code run).
+    CloseRange => CLOSE_RANGE = 436, nr::CLOSE_RANGE;
     Newfstatat => NEWFSTATAT = 262, nr::NEWFSTATAT;
     Unlinkat   => UNLINKAT   = 263, nr::UNLINKAT;
     Renameat   => RENAMEAT   = 264, nr::RENAMEAT;
@@ -1113,15 +1120,19 @@ mod tests {
     /// exists to catch is already in the tree.
     #[test]
     fn tables_disagree_where_linux_does() {
-        let differing = Syscall::ALL
-            .iter()
-            .filter(|s| s.to_x86_64() != s.to_aarch64())
-            .count();
+        // From 424 (`pidfd_send_signal`) up Linux numbers every architecture alike, so
+        // `faccessat2` (439) and `close_range` (436) are the same digit in both tables.
+        // Below that line the tables were drawn independently and must all differ.
+        let legacy = || Syscall::ALL.iter().filter(|s| s.to_x86_64() < 424);
+        let differing = legacy().filter(|s| s.to_x86_64() != s.to_aarch64()).count();
         assert_eq!(
             differing,
-            Syscall::ALL.len(),
-            "the two ABIs agree on some syscall, which Linux does not"
+            legacy().count(),
+            "the two ABIs agree on some pre-424 syscall, which Linux does not"
         );
+        for s in Syscall::ALL.iter().filter(|s| s.to_x86_64() >= 424) {
+            assert_eq!(s.to_x86_64(), s.to_aarch64(), "{s:?}: the unified numbering must agree");
+        }
 
         // Spot-checks against the kernel tables, so a mass edit cannot drift
         // both sides together.
