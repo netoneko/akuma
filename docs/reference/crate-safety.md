@@ -1,7 +1,23 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-11-02 with `python3 scripts/cloc_akuma.py src crates`:
-**86 of 115 crates** forbid `unsafe`. 91321 of 92636 production lines (98.6%) sit outside any `unsafe`
+**Grade: A** — regenerated 2026-11-10 with `python3 scripts/cloc_akuma.py src crates`:
+**101 of 135 crates** forbid `unsafe`. 101859 of 102948 production lines (98.9%) sit outside any `unsafe`
+block; 361 production sites across `crates/` (383 with tests), 0 inside enforced crates. Fifteen crates
+took the ban since the run before. Four already existed and moved their remaining `unsafe` into a leaf:
+`akuma-exceptions` (to `akuma-entry::exceptions`), `akuma-mmu`, `akuma-pmm` and `akuma-threading` (to
+`akuma-switch`). Eleven are new and forbid from their first commit: `akuma-machine-facts`,
+`akuma-middleware`, `akuma-params`, `akuma-ed25519`, `akuma-mw-no-dynamic-loading`,
+`akuma-mw-signed-exec`, `akuma-pte-aarch64` and the four `akuma-tokio-kernel*`. The nine other new crates
+*are* those leaves and cannot: `akuma-switch`, `akuma-frame-raw`, `akuma-mmu-raw`, `akuma-phys`,
+`akuma-stack`, `akuma-exceptions-forensics`, `akuma-boot-aarch64`, `akuma-vectors-aarch64` and
+`akuma-percpu-gdt-amd64`. Nothing lost the ban (the enforced sets of the two runs diff to 15 added, 0
+removed). The counter itself was corrected on the way: it scored the function-pointer *type* in
+`akuma-exceptions`' `enter_user_mode as unsafe fn(..) -> !` cast as an `unsafe` site — 1 inside an enforced
+crate, which its own report flags as a counter bug — and now retracts an `unsafe` (or
+`unsafe extern "ABI"`) that turns out to be followed by `fn(`; three self-test cases pin it, and
+`unsafe-budget.json` dropped `akuma-exceptions`' 1.
+
+The run before, 2026-11-02: **86 of 115 crates** forbid `unsafe`. 91321 of 92636 production lines (98.6%) sit outside any `unsafe`
 block; 368 production sites across `crates/`, 0 inside enforced crates, unchanged from the run before. The
 three new crates all forbid: `akuma-syscalls-proc` (84 production lines: clone kinds, exit scope, wait status,
 execve's argument budget, shared by amd64 and Taoxichuan), `akuma-user-layout` (232: a user address space's

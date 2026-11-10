@@ -543,3 +543,47 @@ shanghai for x86_64 **and** aarch64 (the tokio kernels are `adopted`'s callers);
 again failed `orphan reparented to init (shell did not exit in 10s)` (2 of 2 baseline SMP=2 pairs today,
 0 of 2 candidate; a baseline flake, not investigated). amd64 PVH TCG vs W2b: SMP=1 827/0 2/2, SMP=4
 837/0 2/2 on both sides.
+
+## W5c — `crate-safety.md` regenerated; the unsafe counter stops counting a type (2026-11-10)
+
+`python3 scripts/cloc_akuma.py src crates`: **101 of 135 crates** forbid `unsafe`, 98.9% of production
+lines outside any `unsafe` block, 361 production sites under `crates/`. The run reported **1 site inside
+an enforced crate** and flagged it as a counter bug: `akuma-exceptions` (forbid since 11-06) casts
+`enter_user_mode as unsafe fn(&UserContext) -> !`, and the lexer counted every `unsafe` token. It now
+retracts an `unsafe` (or `unsafe extern "ABI"`) followed by `fn(` — a pointer type has no name between
+`fn` and its parameters; a declaration does. Three self-test cases pin it; nothing else in the tree moved
+(362 -> 361), and `unsafe-budget.json` drops `akuma-exceptions`' 1 (ratchet down). The doc's opening
+paragraph names the 15 crates that took the ban since 11-02 (the enforced sets of the two runs diff to 15
+added, 0 removed). `docs/README.md`: the thread-probe row now says root-caused (W5a), and a row for the
+open `sigregs` SMP=4 TCG hang. **Not done, deliberately:** the `CLAUDE.md` crate counts are stale (the
+file says 79 of 108); `CLAUDE.md` is the owner's to edit.
+
+## D4 — the root kernel's hooked-scheduler front end is the kit's (decided 2026-11-10)
+
+**Decision: under `hooked-sched`, the AArch64 root kernel installs `akuma-vectors-aarch64`'s table, the
+tokio kernels' front end, and does not grow a second one inside `akuma-exceptions`.** The handoff
+recommended this; what settles it is a measurement, not a preference:
+
+- **The two front ends already build the same frame.** The root kernel's EL0 sync frame is
+  `UserTrapFrame` (x0–x30 at 0, `sp_el0` 248, `elr_el1` 256, `spsr_el1` 264, `tpidr_el0` 272, pad 280)
+  with the NEON save area at `akuma_threading::SYNC_FRAME_NEON_OFFSET` = 304 (`SyncFrameNeon`: q0–q31,
+  `fpcr` at +512 = 816, `fpsr` 824) inside an `IRQ_FRAME_SIZE` of 832. `akuma_vectors_aarch64::Frame` is
+  `x` 0, `sp` 248, `elr` 256, `spsr` 264, `tpidr` 272, `esr` 280, `far` 288, `q` 304, `fpcr` 816, `fpsr` 824,
+  `FRAME_BYTES` 832 — the same bytes, with the syndrome kept where the root kernel keeps padding. So the
+  root's syscall/fault/signal logic (`akuma-exceptions::sync_el0(FrameHandle)`, `sigframe.rs`'s NEON
+  accessors) can run over a kit frame with no translation layer: a `FrameHandle` over its first 288
+  bytes and the NEON area at the offset both already use.
+- **What a second front end would duplicate is the risky part.** `akuma-entry::exceptions`' vectors and
+  `irq_with_sp` carry the SGI design's ~10 documented SMP fixes (ESR/FAR snapshot in the vector, the
+  eret-window poison checks, BKL reconcile by the restored frame's SPSR). Under the hooked path most of
+  those questions do not arise — the frame never moves, a switch is a call — and the kit's stubs are the
+  ones the tokio kernel already boots SMP on.
+- **What adoption costs** (the remaining W3 work, in order): (1) a `FrameHandle` constructor over a kit
+  `Frame` (`akuma-trap-aarch64`, the one `unsafe` it needs is the same claim `FrameHandle::new` makes
+  today); (2) kit handlers in the root kernel for `El0Sync` (-> `akuma_exceptions::sync_el0`), `El1Sync`
+  (the user-copy fixup and lazy/CoW EL1 faults the SGI path handles in `sync_el1`), `El0Irq`/`El1Irq`
+  (ack, timer re-arm, `x86_yield` on a tick from EL0, BKL enter/leave); (3) the `X86ArchHooks` /
+  `ThreadRuntime` / `ProcessHooks` registration (`switch_to` = TTBR0 via
+  `akuma_boot_aarch64::user::switch_to`, `prepare_task_slot` = kernel stacks, `transfer_lock_depth` = the
+  BKL depth), with `sched.rs` of `akuma-tokio-kernel-aarch64` as the template; (4) boot order — seed
+  idle threads where `kernel_main` calls `threading::init()`; (5) cfg arms for the SGI-only self-tests.

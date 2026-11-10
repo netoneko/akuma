@@ -456,6 +456,11 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
     # edition-2024 `#[unsafe(..)]` attribute — neither of which opens an unsafe
     # *context*, so those count one line and nothing more.
     unsafe_pending = False
+    # The last `unsafe` token might yet turn out to be a function-pointer *type*
+    # (`unsafe fn(..)`, `unsafe extern "C" fn(..)` — a cast target or a field
+    # type, never a site): "unsafe" -> after it, "extern" -> after `extern`.
+    # A `fn` followed directly by `(` retracts the site the token recorded.
+    unsafe_fnptr_watch = ""
     unsafe_spans: list = []  # open blocks: dicts of start line / brace depth
     # Architectures named by `#[cfg(target_arch = "...")]` attributes (see
     # FileCount.arches).
@@ -702,6 +707,21 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
                     and spans[-1]["depth"] == depth and spans[-1]["pdepth"] == pdepth
                     and last_ident != "pub"):
                 spans[-1]["kind"] = "item" if last_ident in ITEM_KEYWORDS else "expr"
+            if unsafe_fnptr_watch and last_ident != "unsafe":
+                if last_ident == "extern" and unsafe_fnptr_watch == "unsafe":
+                    unsafe_fnptr_watch = "extern"
+                else:
+                    if last_ident == "fn":
+                        k = j
+                        while k < n and text[k] in " \t\n":
+                            k += 1
+                        if k < n and text[k] == "(" and unsafe_lines:
+                            # A type, not a declaration: no name between `fn` and
+                            # its parameters. Undo what the `unsafe` token recorded.
+                            ln = unsafe_lines.pop()
+                            if ln not in unsafe_lines:
+                                unsafe_span.discard(ln)
+                    unsafe_fnptr_watch = ""
             if last_ident != "unsafe" and unsafe_pending:
                 # `unsafe fn` / `unsafe impl` / `unsafe trait` / `unsafe extern`.
                 # In edition 2024 an `unsafe fn` body is NOT itself an unsafe
@@ -726,6 +746,7 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
                 unsafe_lines.append(line)
                 unsafe_span.add(line)
                 unsafe_pending = True
+                unsafe_fnptr_watch = "unsafe"
             i = j
             continue
 
@@ -2337,6 +2358,24 @@ UNSAFE_CASES = [
     ),
     ("unsafe impl is one line", "unsafe impl Send for X {}\n", 1, 1),
     ("unsafe trait is one line", "unsafe trait T {\n    fn a();\n}\n", 1, 1),
+    (
+        "an unsafe fn-pointer type in a cast is not a site",
+        "fn f() {\n    let a = g as unsafe fn(&X) -> ! as usize;\n}\n",
+        0,
+        0,
+    ),
+    (
+        "nor is an unsafe extern fn-pointer type",
+        'struct S {\n    f: unsafe extern "C" fn(u64) -> u64,\n}\n',
+        0,
+        0,
+    ),
+    (
+        "but an unsafe extern fn declaration is",
+        'unsafe extern "C" fn f() {\n    a();\n}\n',
+        1,
+        1,
+    ),
     (
         "unsafe extern block declares, it does not execute",
         'unsafe extern "C" {\n    fn a();\n}\n',
