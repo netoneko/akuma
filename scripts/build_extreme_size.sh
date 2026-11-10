@@ -25,7 +25,7 @@ set -e
 cargo +nightly build \
     --profile extreme-size \
     --no-default-features \
-    --features no-tests,smoltcp,extreme,userspace-sshd,hooked-sched \
+    --features no-tests,smoltcp,extreme,userspace-sshd \
     -Z build-std=core,alloc \
     "$@"
 ls -lh target/aarch64-unknown-none/extreme-size/akuma

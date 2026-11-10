@@ -27,15 +27,12 @@ spinning_top = "0.3"
 [features]
 smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared"]
 extreme = ["akuma-primitives/extreme"]
-# aarch64: the hooked cooperative scheduler path (the one amd64 always uses) instead of the
-# SGI scheduler, for a tokio kernel (B21 A4). No effect on x86_64, which has only that path.
-hooked = ["akuma-switch/hooked"]
-# With `hooked`: a thread that yields without `akuma_bkl` held takes it for the switch and gives it
-# back on resume. The AArch64 root kernel under `hooked-sched` (its dropped-BKL windows); see
+# A thread that yields without `akuma_bkl` held takes it for the switch and gives it back on
+# resume. The AArch64 root kernel (its dropped-BKL windows), through `akuma-kernel-glue`; see
 # `x86_yield_now`.
-yield-takes-bkl = ["hooked"]
-# With `hooked`: a dead thread's slot is recycled only by the collector (`cleanup_terminated*`,
-# which runs the kernel's `set_cleanup_callback` teardown and the full per-slot scrub), never claimed
-# straight from `TERMINATED`. The AArch64 root kernel under `hooked-sched`, whose process teardown is
-# that callback; amd64 tears down on the dying thread and claims directly. See `x86_claim_slot`.
-collector-recycles = ["hooked"]
+yield-takes-bkl = []
+# A dead thread's slot is recycled only by the collector (`cleanup_terminated*`, which runs the
+# kernel's `set_cleanup_callback` teardown and the full per-slot scrub), never claimed straight from
+# `TERMINATED`. The AArch64 root kernel, whose process teardown is that callback; amd64 tears down on
+# the dying thread and claims directly. See `x86_claim_slot`.
+collector-recycles = []

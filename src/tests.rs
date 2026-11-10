@@ -394,14 +394,8 @@ pub fn run_threading_tests() -> bool {
     // affected: their FP state is in the EL0 trap frame. The `_across_preemption` tests run on
     // both paths: the tick preempts kernel threads on each, through an IRQ entry that saves the
     // whole vector file (`docs/archive/HOOKED_EL1_PREEMPTION.md`).
-    #[cfg(not(feature = "hooked-sched"))]
-    run_test!(test_neon_regs_across_yield, "neon_regs_across_yield");
-    #[cfg(feature = "hooked-sched")]
     console::print("\n[TEST] NEON registers across voluntary yields\n  [SKIP] SGI scheduler only\n");
     run_test_heavy!(test_neon_regs_across_preemption, "neon_regs_across_preemption");
-    #[cfg(not(feature = "hooked-sched"))]
-    run_test_heavy!(test_fpcr_fpsr_across_yield, "fpcr_fpsr_across_yield");
-    #[cfg(feature = "hooked-sched")]
     console::print("\n[TEST] FPCR/FPSR across yields\n  [SKIP] SGI scheduler only\n");
     run_test_heavy!(test_fp_arithmetic_across_preemption, "fp_arithmetic_across_preemption");
 
@@ -2148,13 +2142,8 @@ fn get_test_flag() -> bool {
 /// peer core between `spawn_fn` and the test's next count; the spawn tests accept that
 /// outcome when this moved by more than their own cleanup accounts for.
 fn peer_reaps() -> u64 {
-    #[cfg(feature = "hooked-sched")]
     {
         threading::slots_collected()
-    }
-    #[cfg(not(feature = "hooked-sched"))]
-    {
-        0
     }
 }
 
@@ -6021,7 +6010,7 @@ fn neon_preempt_thread(pattern: u64, label: &'static str, done: &'static AtomicB
 /// Two threads each load a distinct pattern into Q0-Q3, yield repeatedly, then
 /// verify the pattern is intact. If the kernel doesn't save/restore NEON across
 /// context switches the patterns will be mixed.
-#[cfg_attr(feature = "hooked-sched", allow(dead_code))]
+#[allow(dead_code)]
 fn test_neon_regs_across_yield() -> bool {
     console::print("\n[TEST] NEON registers across voluntary yields\n");
 
@@ -6113,7 +6102,7 @@ fn test_neon_regs_across_preemption() -> bool {
 ///
 /// Sets FPCR rounding mode bits in two threads to different values, yields,
 /// and verifies they're still correct. Catches missing FPCR/FPSR save.
-#[cfg_attr(feature = "hooked-sched", allow(dead_code))]
+#[allow(dead_code)]
 fn test_fpcr_fpsr_across_yield() -> bool {
     console::print("\n[TEST] FPCR/FPSR across yields\n");
 
@@ -9401,7 +9390,7 @@ extern "C" fn waker_test_park_trampoline() -> ! {
 /// failing the assertion, not crashing. Each test below wraps that window in
 /// `disable_preemption()`/`enable_preemption()` to make the read deterministic
 /// on the single-core boot the self-test suite normally runs under.
-/// Did a woken test slot read as woken? `READY` — or, under `hooked-sched`, any state a
+/// Did a woken test slot read as woken? `READY`, or any state a
 /// peer core's idle thread can carry it to before the read: it picks up a `READY` thread
 /// at once (`disable_preemption` holds only this core), runs the self-terminating
 /// trampoline, and reaps the slot. Never `WAITING` or `INITIALIZING`, which are what a
@@ -9409,8 +9398,7 @@ extern "C" fn waker_test_park_trampoline() -> ! {
 fn woken_state_ok(state: u8) -> bool {
     use akuma_exec::threading::thread_state;
     state == thread_state::READY
-        || (cfg!(feature = "hooked-sched")
-            && matches!(state, thread_state::RUNNING | thread_state::TERMINATED | thread_state::FREE))
+        || matches!(state, thread_state::RUNNING | thread_state::TERMINATED | thread_state::FREE)
 }
 
 fn spawn_waker_test_slot() -> Result<usize, &'static str> {

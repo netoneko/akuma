@@ -1236,12 +1236,12 @@ fn test_core_idle_slots_survive_init() {
         checked += 1;
 
         let expect_base = crate::smp_shared::secondary_stack_base(core);
-        // Still this core's idle thread, not recycled: RUNNING — or, under `hooked-sched`,
-        // READY, since a hooked core switches its idle thread out (a call, not a preemption)
+        // Still this core's idle thread, not recycled: RUNNING, or
+        // READY, since a core switches its idle thread out (a call, not a preemption)
         // whenever it has something else to run.
         let state = threading::get_thread_state(slot);
         let running = state == threading::thread_state::RUNNING
-            || (cfg!(feature = "hooked-sched") && state == threading::thread_state::READY);
+            || state == threading::thread_state::READY;
         let bounds = threading::slot_stack_bounds(slot);
         let base_ok = bounds.map(|(b, _)| b) == Some(expect_base);
 
@@ -6194,10 +6194,6 @@ fn test_as_drop_defers_while_saved_ctx_on_l0() {
     // whatever the slot's state; any slot will do. The hooked path keeps it in the glue's
     // per-slot record, and its probe counts only a slot that can still be switched in, so the
     // test stages the reference on its own (running) slot there.
-    #[cfg(not(feature = "hooked-sched"))]
-    let (slot, swap): (usize, fn(usize, u64) -> u64) =
-        (akuma_exec::threading::MAX_THREADS - 1, akuma_exec::threading::test_swap_saved_ctx_ttbr0);
-    #[cfg(feature = "hooked-sched")]
     let (slot, swap): (usize, fn(usize, u64) -> u64) =
         (akuma_exec::threading::current_thread_id(), akuma_kernel_glue::hooked::test_swap_saved_root);
 

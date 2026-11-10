@@ -120,7 +120,7 @@ Lock legend: **M** = acquisition wrapped in `with_irqs_disabled`/`IrqGuard`;
 | slot recycle | `cleanup_terminated_internal` | `POOL` M (short holds) | `CLEANUP_CALLBACK` re-enters process subsystem (`THREAD_PID_MAP` ×3, `unregister_process`) with no lock held |
 | retired reclaim | `reclaim_retired_processes` | none in sweep | `drop(Box<Process>)` = the whole §3 tree |
 | pressure drain | `drain_retired_under_pressure` (from `alloc_page_zeroed_user`) | same as reclaim | ambient context = **whatever faulted** — see §5.2 |
-| scheduler (IRQ) | `sgi_scheduler_handler_with_sp` | `POOL` **try_lock** M | never blocks; no other subsystem lock reachable from IRQ context |
+| scheduler (tick) | `irq_hooked` → `yield_now` | `POOL` M, only for the CPU-time bill; the tick does not preempt while `POOL` is held (`el1_preemptible`) | the pick is the `ON_CPU` CAS, not a lock |
 
 ### 2.0 "Is that thread running?" is the `ON_CPU` gate, never the state word (hooked scheduler)
 

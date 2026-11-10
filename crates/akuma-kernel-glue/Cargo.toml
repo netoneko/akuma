@@ -34,9 +34,13 @@ akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = fals
 akuma-timer = { path = "../akuma-timer" }
 akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 akuma-virtio = { path = "../akuma-virtio" }
-akuma-vectors-aarch64 = { path = "../akuma-vectors-aarch64", optional = true }
-akuma-switch = { path = "../akuma-switch", optional = true }
-akuma-exec-core = { path = "../akuma-exec-core", optional = true }
+akuma-vectors-aarch64 = { path = "../akuma-vectors-aarch64" }
+akuma-switch = { path = "../akuma-switch" }
+akuma-exec-core = { path = "../akuma-exec-core" }
+# The AArch64 root kernel's two choices in the shared scheduler, which amd64 makes the other way:
+# a thread yielding with the BKL dropped takes it for the switch (its dropped-BKL windows), and a
+# dead slot is recycled only by the collector, whose cleanup callback is this kernel's teardown.
+akuma-threading = { path = "../akuma-threading", features = ["yield-takes-bkl", "collector-recycles"] }
 log = { version = "0.4", default-features = false }
 spinning_top = "0.3"
 
@@ -80,9 +84,6 @@ smoltcp = ["akuma-net/smoltcp", "akuma-syscalls-glue/smoltcp", "akuma-kernel-cor
 sound = ["akuma-virtio/sound"]
 platform-firecracker = ["akuma-config/platform-firecracker", "akuma-entry/platform-firecracker", "akuma-kernel-core/platform-firecracker", "akuma-virtio/platform-firecracker"]
 rump = ["akuma-net/rump", "dep:akuma-rump", "akuma-syscalls-glue/rump"]
-# M6 (multiarch attempt 0): the hooked cooperative scheduler on this kernel — `hooked`'s
-# machine half, `akuma-entry`'s front end on `akuma-vectors-aarch64`. Default off.
-hooked-sched = ["akuma-kernel-core/hooked-sched", "akuma-exec/hooked-sched", "akuma-entry/hooked-sched", "akuma-exceptions/hooked-sched", "dep:akuma-vectors-aarch64", "dep:akuma-switch", "dep:akuma-exec-core"]
 rump-default = ["rump"]
 rump-tests = []
 sc-eventfd = ["akuma-syscalls-glue/sc-eventfd"]

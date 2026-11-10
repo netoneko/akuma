@@ -1434,15 +1434,6 @@ pub fn with_own_process_exclusive<T, F: FnOnce(&Process) -> T>(f: F) -> Option<T
     Some(f(children::lookup_process_shared(pid)?))
 }
 
-/// The EL0 entry `eret` — `enter_user_mode` (the register-load + `eret` asm)
-/// and its SPSR gate `enter_user_mode_checked` — **moved to `akuma-el0-entry`
-/// on 2026-09-02** (`AKUMA_EXEC_AUDIT.md` §6). Re-exported under the original
-/// paths so this crate's call sites (`Process::run`,
-/// `spawn::run_registered_process`, `entry_point_trampoline`) and
-/// `akuma-syscalls-glue`'s one `enter_user_mode_checked` call resolve unchanged.
-#[cfg(not(feature = "hooked-sched"))]
-pub use akuma_el0_entry::{enter_user_mode, enter_user_mode_checked};
-#[cfg(feature = "hooked-sched")]
 pub use akuma_el0_entry::enter_user_mode;
 
 /// Under `hooked-sched` the AArch64 root kernel enters EL0 through its hooked machine half
@@ -1450,7 +1441,6 @@ pub use akuma_el0_entry::enter_user_mode;
 /// SGI path's `eret`: every EL0 entry has to land its later traps at the top of the thread's own
 /// kernel stack. That is the registered [`crate::ExecRuntime::enter_user`], so `execve`'s direct
 /// call (`akuma-syscalls-glue`) reaches it under the name it already uses.
-#[cfg(feature = "hooked-sched")]
 pub fn enter_user_mode_checked(ctx: &UserContext) -> ! {
     (crate::runtime::runtime().enter_user)(ctx)
 }

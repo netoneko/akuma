@@ -549,6 +549,7 @@ dependencies = [
  "akuma-rump",
  "akuma-switch",
  "akuma-syscalls-glue",
+ "akuma-threading",
  "akuma-timer",
  "akuma-vectors-aarch64",
  "akuma-vfs-glue",

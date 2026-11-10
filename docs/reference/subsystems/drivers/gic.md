@@ -90,20 +90,21 @@ GICv3 mnemonic support.
 
 `src/irq.rs` is the handler-registration layer above the GIC:
 `register_handler(irq, f)` records `f` in a `Vec<Option<IrqHandler>>` and
-calls `gic::enable_irq(irq)` (`irq.rs:84-96`). The unified IRQ entry
-(`rust_irq_handler_with_sp`, `crates/akuma-exceptions/src/lib.rs`) does:
+calls `gic::enable_irq(irq)` (`irq.rs:84-96`). The IRQ entry
+(`irq_hooked`, `crates/akuma-exceptions/src/lib.rs`, called from the
+`akuma-vectors-aarch64` front end) does:
 
 ```
 irq = gic::acknowledge_irq()
-if irq == SGI_SCHEDULER: akuma_exec::threading::sgi_scheduler_handler_with_sp(irq, sp)  // EOIs itself, may switch SP
-else: irq::dispatch_irq(irq); gic::end_of_interrupt(irq)
+if irq != SGI_SCHEDULER: irq::dispatch_irq(irq)
+gic::end_of_interrupt(irq)
+if (irq == SGI_SCHEDULER || irq == TIMER_PPI) && (from EL0 || el1_preemptible()): yield_now()
 ```
 
-SGI 0 (`SGI_SCHEDULER`, `gic.rs:192`) is special-cased because it may return a
-different stack pointer for a context switch; every other registered IRQ
-(currently only PPI 27, the timer) goes through the generic dispatch table and
-is EOI'd by the wrapper. For what the scheduler does once it gets the SGI, see
-[`../scheduler.md`](../scheduler.md).
+SGI 0 (`SGI_SCHEDULER`) carries no work of its own: a peer rings it to make a halted or
+busy core reschedule. PPI 27 (`akuma_gic::TIMER_PPI`, the timer) is both a registered
+handler and a preemption point. The switch is an ordinary call on the interrupted thread's
+stack; see [`../scheduler.md`](../scheduler.md).
 
 ## Cross-core doorbell (shared-kernel SMP)
 

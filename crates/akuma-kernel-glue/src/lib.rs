@@ -118,7 +118,7 @@ pub use akuma_entry::smp_shared;
 pub mod syscall;
 #[cfg(target_os = "none")]
 pub mod vfs;
-#[cfg(all(target_os = "none", feature = "hooked-sched"))]
+#[cfg(target_os = "none")]
 pub mod hooked;
 
 #[cfg(target_os = "none")]
@@ -436,11 +436,8 @@ pub(crate) fn build_exec_runtime(
         // so the AArch64 kernel's behaviour here is unchanged by the seam;
         // see `akuma_exec::ExecRuntime::enter_user` for what the other arm
         // has to be instead.
-        #[cfg(not(feature = "hooked-sched"))]
-        enter_user: akuma_exec::process::enter_user_mode_checked,
         // Under `hooked-sched` the crossing is the kit's, which also points the thread's
         // later EL0 traps at the top of its own kernel stack (`hooked::enter_user`).
-        #[cfg(feature = "hooked-sched")]
         enter_user: hooked::enter_user,
         // The AArch64 fork memory pass, which is `fork_process`'s own step 4 —
         // registered rather than called directly so the amd64 kernel can
@@ -1016,8 +1013,6 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     //    stalls the boot. So the runtime image brings secondaries up AFTER `threading::init`
     //    (below), where the slot allocator is live and hands out distinct slots. See
     //    docs/archive/SMP_SHARED.md M4 "open item".
-    #[cfg(all(kernel_smp_shared, not(feature = "no-tests"), not(feature = "hooked-sched")))]
-    smp_shared::bringup_secondaries();
 
     // Exception-path hooks: the dispatcher + the EL0-trap diagnostic the IRQ
     // and SVC entry points call out to. Registered BEFORE `exceptions::init()`
@@ -1079,9 +1074,6 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     });
 
     // Set up exception vectors and enable IRQs
-    #[cfg(not(feature = "hooked-sched"))]
-    akuma_entry::exceptions::init();
-    #[cfg(feature = "hooked-sched")]
     akuma_entry::hooked::init();
     console::print("IRQ handling enabled\n");
 
@@ -1168,7 +1160,6 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     threading::set_slot_purge_callback(syscall::futex_purge_tid);
     // The hooked scheduler's machine half and core 0's idle thread (M6): after the slot
     // table exists, before anything but the boot thread runs.
-    #[cfg(feature = "hooked-sched")]
     hooked::init();
     process::init_box_registry(); // Init Box 0
     console::print("Threading system initialized\n");
@@ -1207,12 +1198,10 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // `threading::init`; see the note there.) Combined with the network path's cross-core
     // lock discipline (`PreemptGuard` in akuma-net), this lets the devbox boot to userspace
     // sshd under SMP>=2. See docs/archive/SMP_SHARED.md M4 "open item".
-    #[cfg(all(kernel_smp_shared, feature = "no-tests", not(feature = "hooked-sched")))]
-    smp_shared::bringup_secondaries();
     // `hooked-sched` (M6): here in both images. A secondary's idle thread is adopted through
     // `hooked::init`'s registration, so the cores cannot start before it — the SGI self-test
     // image's earlier start (see the note before `exceptions::init`) is not available here.
-    #[cfg(all(kernel_smp_shared, feature = "hooked-sched"))]
+    #[cfg(kernel_smp_shared)]
     smp_shared::bringup_secondaries();
 
     // The boot self-test suite spawns many concurrent threads/processes. On a
@@ -1366,12 +1355,12 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
 
 /// The longest the hooked netpoll loop parks between laps with no packet: the resolution
 /// of its housekeeping (reclaim, herd output, heartbeats) and of smoltcp's own timers.
-#[cfg(all(feature = "smoltcp", feature = "hooked-sched", target_os = "none"))]
+#[cfg(all(feature = "smoltcp", target_os = "none"))]
 const NETPOLL_PARK_US: u64 = 10_000;
 
 /// How long the boot thread's housekeeping loop sleeps between laps under the hooked
 /// scheduler: its cleanup runs every 10 laps, so every 100 ms.
-#[cfg(all(feature = "hooked-sched", target_os = "none"))]
+#[cfg(target_os = "none")]
 const BOOT_THREAD_PERIOD_US: u64 = 10_000;
 
 #[cfg(target_os = "none")]
@@ -1467,24 +1456,7 @@ fn run_async_main_preemptive() -> ! {
                 // Hooked scheduler: this is housekeeping, not an idle loop — park it for a
                 // fixed period and let the core's idle thread halt, tickless. A `wfi` here
                 // held a core on its 1 ms tick for nothing (`docs/archive/HOOKED_IDLE_TICK.md`).
-                #[cfg(feature = "hooked-sched")]
                 threading::sleep_us(BOOT_THREAD_PERIOD_US);
-                #[cfg(not(feature = "hooked-sched"))]
-                {
-                    threading::yield_now();
-
-                    // Genuinely halt until the next interrupt (timer tick ~10 ms, or a
-                    // device IRQ). Without this the boot/idle thread is a pure
-                    // `loop { yield_now() }` busy-spin: yield_now() only fires a self-SGI
-                    // and returns immediately, so when no other thread is runnable this
-                    // thread and the network poller ping-pong SGIs at microsecond
-                    // granularity and pin the host vCPU at 100% even at idle. idle_halt
-                    // (not raw wfi) also keeps CPU-time accounting honest so the halt
-                    // isn't billed as busy time. The secondary cores already WFI in their
-                    // idle loops (smp.rs); this is the BSP equivalent.
-                    // See docs/KNOWN_ISSUES.md issue #11.
-                    threading::idle_halt();
-                }
             }
 
             console::print("[AsyncMain] Preemtive main thread terminated\n");
@@ -1626,7 +1598,6 @@ fn run_async_main() -> ! {
     // and `docs/runbooks/debug-devbox.md`.
     #[cfg(not(feature = "rump-default"))]
     threading::set_network_thread_id(threading::current_thread_id());
-    #[cfg(feature = "hooked-sched")]
     threading::register_netpoll_parker();
 
     // =========================================================================
@@ -2306,26 +2277,9 @@ fn run_async_main() -> ! {
         // Hooked scheduler: park instead, woken by the doorbell (`wake_netpoll_parker`) or the
         // period, so the core's idle thread can halt with its tick stopped. A `wfi` here kept
         // the core on its 1 ms tick (`docs/archive/HOOKED_IDLE_TICK.md`).
-        #[cfg(all(feature = "smoltcp", feature = "hooked-sched"))]
+        #[cfg(feature = "smoltcp")]
         threading::schedule_blocking(timer::uptime_us().saturating_add(NETPOLL_PARK_US));
-        #[cfg(all(feature = "smoltcp", kernel_smp_shared, not(feature = "hooked-sched")))]
-        {
-            akuma_exec::bkl::leave_kernel();
-            // IRQs are enabled; the timer/RX/SGI IRQ wakes us and its handler
-            // re-takes the BKL (our enter_kernel below is then idempotent).
-            akuma_cpu::park::wfi();
-            akuma_exec::bkl::enter_kernel();
-            // Profiler only: names the sliver between re-acquiring the BKL post-WFI and
-            // the top-of-loop HOLD_TAG_NETPOLL_MAINT call above — negligible, but must
-            // be something other than whatever HOLD_TAG_NETPOLL_HERD left behind
-            // (BKL_VFS_CARVE_OUT.md §18, §19).
-            #[cfg(kernel_smp_shared)]
-            akuma_exec::sync::set_holder_tag(
-                akuma_exec::bkl::current_core_id(),
-                akuma_exec::sync::HOLD_TAG_NETPOLL,
-            );
-        }
-        #[cfg(not(all(feature = "smoltcp", any(kernel_smp_shared, feature = "hooked-sched"))))]
+        #[cfg(not(feature = "smoltcp"))]
         threading::yield_now();
 
         // In a rump-only / devbox build there is no smoltcp interface to poll
@@ -2408,7 +2362,6 @@ fn ring_netpoll_doorbell() {}
 fn ring_netpoll_doorbell() {
     // The hooked netpoll loop parks between laps rather than halting, so an interrupt alone
     // does not resume it: wake it.
-    #[cfg(feature = "hooked-sched")]
     threading::wake_netpoll_parker();
     #[cfg(kernel_smp_shared)]
     if !NETPOLL_WAKE_PENDING.swap(true, core::sync::atomic::Ordering::AcqRel) {

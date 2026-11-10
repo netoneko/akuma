@@ -20,5 +20,3 @@ akuma-stack = { path = "../akuma-stack" }
 akuma-trap-aarch64 = { path = "../akuma-trap-aarch64" }
 
 [features]
-# aarch64: the hooked cooperative scheduler path instead of the SGI one (see akuma-threading).
-hooked = []

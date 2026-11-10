@@ -20,8 +20,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-#[cfg(all(target_os = "none", sgi_sched))]
-use core::arch::global_asm;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -298,70 +296,9 @@ pub fn word_cell(idx: usize, field: CtxField) -> &'static AtomicU64 {
 
 // ── the switch ──────────────────────────────────────────────────────────────────────────────────────────
 
-#[cfg(all(target_os = "none", sgi_sched))]
-global_asm!(
-    r#"
-.section .text
-.global thread_start
-.global thread_start_closure
 
-// Thread entry trampoline for extern "C" functions
-// x19 holds the actual thread entry function
-thread_start:
-    // Enable IRQs for this thread
-    msr daifclr, #2
-    
-    // Call the thread entry function (in x19)
-    blr x19
-    
-    // Thread returned - mark as terminated and yield
-    // (This shouldn't happen for -> ! functions, but just in case)
-    b thread_exit_asm
 
-// Thread entry trampoline for Rust closures
-// x19 holds pointer to the closure trampoline function
-// x20 holds the raw pointer to the boxed closure data
-// x21 holds IRQ enable flag: 0 = enable IRQs now, non-zero = keep disabled
-thread_start_closure:
-    // CRITICAL: Verify x19 (trampoline) is valid before calling
-    // If x19 == 0, we'd jump to address 0 and crash with EC=0x0
-    cbnz x19, 2f
-    // x19 is 0! Halt with marker
-    mov x0, #0xBAD
-    movk x0, #0x0019, lsl #16   // 0x00190BAD = "bad x19"
-3:  wfi
-    b 3b
-2:
-    // Check if we should enable IRQs (x21 == 0 means enable)
-    // For process threads: x21 != 0, keep IRQs disabled until activate()
-    // For system/test threads: x21 == 0, enable IRQs now
-    cbnz x21, 1f           // Skip IRQ enable if x21 != 0
-    msr daifclr, #2        // Enable IRQs
-1:
-    // Call the trampoline with closure pointer as argument
-    // x19 = trampoline function pointer
-    // x20 = closure data pointer (passed as x0)
-    mov x0, x20
-    blr x19
-    
-    // Thread returned - should not happen for -> ! closures
-    b thread_exit_asm
-
-thread_exit_asm:
-    wfi
-    b thread_exit_asm
-"#
-);
-
-#[cfg(all(target_os = "none", sgi_sched))]
-unsafe extern "C" {
-    fn thread_start() -> !;
-    fn thread_start_closure() -> !;
-}
-
-#[cfg(not(all(target_os = "none", sgi_sched)))]
 extern "C" fn thread_start() -> ! { panic!("not on bare metal aarch64") }
-#[cfg(not(all(target_os = "none", sgi_sched)))]
 extern "C" fn thread_start_closure() -> ! { panic!("not on bare metal aarch64") }
 
 /// Address of the SGI path's `extern "C"` thread entry trampoline.
@@ -448,7 +385,7 @@ unsafe extern "C" {
 // Bare metal only, like the SGI path's asm above: a host build (`cargo test` with the default
 // features, which carry `hooked-sched`) assembles for Mach-O/ELF-host, where `.section .text` is not
 // valid, and never switches: `switch_contexts` has a host arm, and the trampoline a host stub.
-#[cfg(all(target_os = "none", target_arch = "aarch64", hooked_sched))]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 core::arch::global_asm!(
     r#"
     .section .text
@@ -501,19 +438,19 @@ akuma_threading_hooked_thread_entry_trampoline:
 "#
 );
 
-#[cfg(all(target_os = "none", target_arch = "aarch64", hooked_sched))]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 unsafe extern "C" {
     fn akuma_threading_hooked_switch_context(old: *mut Context, new: *const Context);
     fn akuma_threading_hooked_thread_entry_trampoline() -> !;
 }
 
 /// Host stand-in for the entry trampoline; its address is all a host build takes.
-#[cfg(all(not(target_os = "none"), target_arch = "aarch64", hooked_sched))]
+#[cfg(all(not(target_os = "none"), target_arch = "aarch64"))]
 extern "C" fn akuma_threading_hooked_thread_entry_trampoline() -> ! {
     unreachable!("akuma-switch: host builds have no context switch");
 }
 
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
+#[cfg(target_arch = "aarch64")]
 const _: () = {
     assert!(core::mem::offset_of!(Context, x19) == 8);
     assert!(core::mem::offset_of!(Context, x29) == 88);
@@ -533,7 +470,6 @@ const _: () = {
 ///
 /// # Panics
 /// If `old == new`, an index is out of range, or either slot is borrowed.
-#[cfg(hooked_sched)]
 pub fn switch_contexts(old: usize, new: usize) {
     assert!(old != new, "switch_contexts: old == new ({old})");
     assert!(
@@ -561,12 +497,12 @@ pub fn switch_contexts(old: usize, new: usize) {
 }
 
 /// The address a fresh hooked thread's first switch returns into.
-#[cfg(all(hooked_sched, target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[must_use]
 pub fn entry_trampoline_addr() -> u64 { akuma_threading_x86_thread_entry_trampoline as *const () as u64 }
 
 /// The address a fresh hooked thread's first switch returns into.
-#[cfg(all(hooked_sched, target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 #[must_use]
 pub fn entry_trampoline_addr() -> u64 { akuma_threading_hooked_thread_entry_trampoline as *const () as u64 }
 
@@ -626,7 +562,7 @@ pub fn build_closure_context(stack_top: usize, trampoline: u64, closure_ptr: u64
 
 /// A fresh thread's [`Context`] on the aarch64 hooked path: a zeroed d8-d15 block, `DAIF` = 0, returning into
 /// the entry trampoline with `closure_ptr` in x19 and `trampoline` in x20.
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
+#[cfg(target_arch = "aarch64")]
 #[must_use]
 pub fn build_closure_context(stack_top: usize, trampoline: u64, closure_ptr: u64) -> Context {
     let entry_sp = (stack_top & !0xf) - 64;

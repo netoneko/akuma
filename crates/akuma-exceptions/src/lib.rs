@@ -2234,188 +2234,20 @@ pub fn default_exception() {
     }
 }
 
-/// UNIFIED IRQ handler for stack-based context switching
-/// 
-/// Used by both irq_el0_handler (user mode IRQs) and irq_handler (kernel mode IRQs).
-/// 
-/// Takes current SP, returns new SP if context switch needed (or 0 if no switch).
-/// The assembly does the actual SP switch AFTER this returns.
-/// Tripwire for the SMP=4 mixed-EL corruption (BKL_RUSTC_SCALING_BASELINE.md §5.1):
-/// inspect the IRQ frame the asm epilogue is about to restore. An EL0-target frame
-/// whose ELR sits in kernel text would eret userspace into kernel text. Covers BOTH
-/// epilogue outcomes (switch and no-switch); complements `[SGI-S POISON]`, which only
-/// sees the switch branch. The frame layout (ELR at +240, SPSR at +248) is
-/// `akuma_trap_aarch64::irq_frame`'s, shared with `setup_fake_irq_frame`.
-#[inline]
-fn irq_eret_poison_check(final_sp: u64, switched: bool) {
-    let frame = (services().irq_frame_at)(final_sp);
-    let elr = frame.elr();
-    let kernel_text = akuma_exec::mmu::is_kernel_text(elr as usize);
-    // EL0-target frames must not eret into kernel text; EL1-target frames must
-    // eret INTO kernel text (an EL1 ELR like 0x8 is the boot-storm crash shape).
-    let poison = if frame.from_el0() { kernel_text } else { !kernel_text };
-    if poison {
-        crate::safe_print!(160,
-            "[IRQ POISON] eret elr={:#x} spsr={:#x} switched={} tid={} core={}\n",
-            elr, frame.spsr(), u64::from(switched),
-            akuma_exec::threading::current_thread_id(),
-            akuma_exec::bkl::current_core_id());
-    }
-}
-
-/// IRQ / SGI entry from the vector asm. Under real shared-kernel SMP this runs the
-/// scheduler and device handlers holding the Big Kernel Lock, then reconciles the BKL
-/// to the EL the pending `eret` will enter (release when returning to EL0, keep for
-/// EL1) using the SPSR of the frame we're about to restore — which, after a context
-/// switch, is the *incoming* thread's frame. No-op unless `cfg(kernel_smp_shared)`.
-pub fn irq_with_sp(current_sp: u64) -> u64 {
-    note_exception_entry();
-    note_exc_class(2);
-    // Under shared SMP, read the interrupted frame's SPSR up front: SPSR.M[3:0]==0 means
-    // we preempted EL0 (userspace), where this core holds NO BKL (the invariant is "held
-    // iff in EL1"). That is exactly the case where the scheduler SGI can run BKL-FREE
-    // (M5c) — the switch is made atomic by POOL alone, so peer cores' timer ticks no
-    // longer serialize on the BKL. A scheduler SGI that preempted EL1 (a syscall/fault
-    // holding the BKL) must keep it — releasing would expose the interrupted excursion's
-    // shared state to peers.
-    #[cfg(kernel_smp_shared)]
-    let interrupted_el0 = {
-        // SAFETY: `current_sp` is the live interrupted IRQ trap frame the vector
-        // asm just built. SPSR.M[3:0] == 0 ⇒ interrupted context was EL0t (userspace).
-        (services().irq_frame_at)(current_sp).from_el0()
-    };
-    // If this IRQ interrupted EL0, userspace was running on this core — count it (captures
-    // pure compute loops that only get timer-preempted, not just syscalls).
-    #[cfg(kernel_smp_shared)]
-    if interrupted_el0 {
-        (hooks().record_el0_trap)();
-    }
-
-    // Acknowledge the IRQ once, up front (the GIC IAR read needs no BKL).
-    let irq_opt = akuma_gic::acknowledge_irq();
-    match irq_opt {
-        Some(intid) => note_irq_intid(intid),
-        // IAR said "spurious" (1023): the vector fired but the interrupt was
-        // already consumed (peer core, or a de-asserted level source). These
-        // entries are invisible to the per-INTID counters yet still count in
-        // EXCEPTION_ENTRIES — exactly the gap the ~140K/s/core unattributed
-        // exception storm hid in (CROSS_CORE_THREAD_COLLAPSE.md §3).
-        None => {
-            SPURIOUS_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    // BKL-free fast path (M5c): a scheduler SGI that preempted EL0. This core held no BKL,
-    // and `sgi_scheduler_handler_with_sp` makes the switch atomic on POOL. Reconcile at
-    // the end (re)acquires the BKL only if the thread we resume into is EL1.
-    // IMPORTANT: use reconcile_for_spsr_no_ticket here because we never called
-    // enter_kernel — a normal reconcile would leak a ticket.
-    #[cfg(kernel_smp_shared)]
-    if interrupted_el0
-        && akuma_bkl::policy::sched_bklfree_el0_enabled()
-        && matches!(irq_opt, Some(i) if i == akuma_gic::SGI_SCHEDULER)
-    {
-        let new_sp =
-            akuma_exec::threading::sgi_scheduler_handler_with_sp(akuma_gic::SGI_SCHEDULER, current_sp);
-        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
-        // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-        let spsr = (services().irq_frame_at)(final_sp).spsr();
-        akuma_exec::bkl::reconcile_for_spsr_no_ticket(spsr);
-        irq_eret_poison_check(final_sp, new_sp != 0);
-        return new_sp;
-    }
-
-    // BKL-free device-IRQ dispatch (Phase 7a, docs/archive/BKL_PHASE7_AUDIT.md §2.3/§5).
-    // The timer is the only device IRQ this kernel registers
-    // (`irq::register_handler(27, timer::timer_irq_handler)`), and its handler
-    // (`akuma_exec::alarms::on_timer_interrupt`'s alarm queue, the preemption watchdog, the
-    // scheduler-SGI trigger) no longer touches anything the BKL alone protects: the
-    // alarm queue has its own `Spinlock`, the watchdog reads are per-thread atomics, and
-    // `trigger_sgi_self`/GIC ack/EOI are raw MMIO. Unlike the M5c fast path above, this
-    // has no context switch and never calls `enter_kernel`, so there is nothing to
-    // reconcile — the interrupted thread's BKL hold state (held or not, EL0 or EL1) is
-    // left completely untouched by this excursion.
-    #[cfg(all(kernel_smp_shared, kernel_no_bkl_irq))]
-    if akuma_bkl::policy::irq_bkl_drop_enabled()
-        && let Some(irq) = irq_opt
-        && irq != akuma_gic::SGI_SCHEDULER
-    {
-        (hooks().dispatch_irq)(irq);
-        akuma_gic::end_of_interrupt(irq);
-        return 0;
-    }
-
-    // Device IRQ, or a scheduler SGI that preempted EL1 (BKL held): run holding the BKL.
-    akuma_exec::bkl::enter_kernel();
-    // Profiler bookkeeping only (no-op unless `bkl-profile` is on): the IRQ dispatch is a
-    // TRANSIENT excursion that does not belong to the interrupted thread, so it stamps the
-    // per-core sampling cache alone and leaves the interrupted thread's own per-thread tag
-    // intact. Without this the core would stay mislabeled "irq/sched" for the rest of the
-    // syscall it interrupted, attributing peer contention against the *remainder* of a long
-    // syscall to the brief IRQ instead.
-    #[cfg(kernel_smp_shared)]
-    akuma_exec::sync::set_core_tag_transient(
-        akuma_exec::bkl::current_core_id(),
-        akuma_exec::sync::HOLD_TAG_IRQ,
-    );
-
-    let new_sp = if let Some(irq) = irq_opt {
-        if irq == akuma_gic::SGI_SCHEDULER {
-            akuma_exec::threading::sgi_scheduler_handler_with_sp(irq, current_sp)
-        } else {
-            // Normal device IRQ: dispatch then EOI.
-            (hooks().dispatch_irq)(irq);
-            akuma_gic::end_of_interrupt(irq);
-            0
-        }
-    } else {
-        0
-    };
-
-    // End of the transient excursion: point the sampling cache back at whichever thread
-    // this core is about to run. ONE rule covers both outcomes, which is why the old
-    // `if new_sp == 0 { restore saved tag }` special case is gone — after a switch
-    // (`new_sp != 0`) `current_thread_id()` is the INCOMING thread and we install its own
-    // tag (previously it inherited `irq/sched` and kept it for the rest of its syscall);
-    // with no switch it is the interrupted thread and we reinstall the tag it never lost.
-    #[cfg(kernel_smp_shared)]
-    akuma_exec::sync::load_thread_tag_to_core(
-        akuma_exec::bkl::current_core_id(),
-        akuma_exec::threading::current_thread_id(),
-    );
-
-    #[cfg(kernel_smp_shared)]
-    {
-        // The asm erets into `new_sp`'s frame after a switch, else the interrupted
-        // `current_sp` frame. Reconcile the BKL to that frame's target EL.
-        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
-        // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-        let spsr = (services().irq_frame_at)(final_sp).spsr();
-        akuma_exec::bkl::reconcile_for_spsr(spsr);
-    }
-    {
-        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
-        irq_eret_poison_check(final_sp, new_sp != 0);
-    }
-    new_sp
-}
-
-/// IRQ / SGI entry for the hooked scheduler (`hooked-sched`, M6): the root kernel's
-/// `akuma-vectors-aarch64` front end calls this from its `El0Irq`/`El1Irq` handlers.
+/// IRQ / SGI entry: the root kernel's `akuma-vectors-aarch64` front end calls this from its
+/// `El0Irq`/`El1Irq` handlers.
 ///
-/// What [`irq_with_sp`] does for the SGI design, without its stack-pointer protocol: the
-/// switch is an ordinary call ([`akuma_exec::threading::yield_now`]) made on the interrupted
+/// The switch is an ordinary call ([`akuma_exec::threading::yield_now`]) made on the interrupted
 /// thread's own kernel stack, where the vector stub saved its frame, so there is no frame to
 /// hand back and nothing to reconcile against an SPSR. The BKL is taken for the dispatch
 /// unless this core already holds it (an EL1 window opened by code that holds it), and
 /// released at the end only if this entry took it — after a switch that is the resumed
 /// thread releasing the lock its core holds on its behalf, which is the return to EL0.
 ///
-/// The scheduler SGI preempts EL0 always and EL1 when
+/// The tick and the scheduler SGI preempt EL0 always and EL1 when
 /// [`akuma_exec::threading::el1_preemptible`] says so (preemption not disabled, `POOL` free,
-/// the thread `RUNNING`), as the SGI path's tick does. A kernel thread that holds the BKL
-/// gives up the core's hold for as long as it is switched out, and takes it again when it
-/// resumes, as on the SGI path.
+/// the thread `RUNNING`). A kernel thread that holds the BKL gives up the core's hold for as
+/// long as it is switched out, and takes it again when it resumes.
 ///
 /// An interrupt from EL0 is also a **return to user mode**, and it is the only one a thread
 /// in a pure compute loop ever makes. So, as Linux does on every return to user mode, the
@@ -2423,7 +2255,6 @@ pub fn irq_with_sp(current_sp: u64) -> u64 {
 /// [`deliver_on_irq_return`]). Without it `kill -TERM` of a spinner did nothing and its
 /// handlers never ran (`userspace/forktest/c_stress/sigspin.c`,
 /// `docs/archive/HOOKED_IRQ_SIGNAL_DELIVERY.md`).
-#[cfg(feature = "hooked-sched")]
 pub fn irq_hooked(el0: Option<FrameHandle>) {
     let from_el0 = el0.is_some();
     note_exception_entry();
@@ -2433,7 +2264,7 @@ pub fn irq_hooked(el0: Option<FrameHandle>) {
         akuma_exec::bkl::enter_kernel();
     }
     // BKL-hold profiler only (one relaxed load unless `bkl-profile` turned it on): this
-    // excursion is the interrupt's, not the interrupted thread's, as on the SGI path.
+    // excursion is the interrupt's, not the interrupted thread's.
     #[cfg(kernel_smp_shared)]
     akuma_exec::sync::set_core_tag_transient(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IRQ);
     #[cfg(kernel_smp_shared)]
@@ -2448,10 +2279,9 @@ pub fn irq_hooked(el0: Option<FrameHandle>) {
                 (hooks().dispatch_irq)(irq);
             }
             akuma_gic::end_of_interrupt(irq);
-            // The tick preempts EL1 code as well as EL0, as the SGI path's does, under the
-            // same gates (`el1_preemptible`): kernel threads need not yield to share a core.
-            // The timer interrupt is a preemption point by itself: the hooked tick rings
-            // no self-SGI (`timer_irq_handler`).
+            // The tick preempts EL1 code as well as EL0, under `el1_preemptible`: kernel
+            // threads need not yield to share a core. The timer interrupt is a preemption
+            // point by itself; the tick rings no self-SGI (`timer_irq_handler`).
             preempt = (irq == akuma_gic::SGI_SCHEDULER || irq == akuma_gic::TIMER_PPI)
                 && (from_el0 || akuma_exec::threading::el1_preemptible());
         }
@@ -2496,7 +2326,6 @@ pub fn irq_hooked(el0: Option<FrameHandle>) {
 /// Interrupts are open for the delivery: building the frame may fault in the user stack,
 /// and the sync path does that work with them open too. The interrupt that brought us here
 /// has had its EOI, so a nested one is an ordinary EL1 interrupt window.
-#[cfg(feature = "hooked-sched")]
 fn deliver_on_irq_return(frame: FrameHandle) {
     #[cfg(kernel_smp_shared)]
     if akuma_exec::threading::take_thread_kill_request() {

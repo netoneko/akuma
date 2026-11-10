@@ -3,13 +3,11 @@
 Current-state architecture for preemptive threading, the scheduler, context
 switch, synchronization primitives, and blocking.
 
-> **Stability: A (stable)** for everything below **except**
-> [The `POOL` gate](#the-pool-gate-shared-smp), which is **C (active risk)** — it carries an
-> open, reproducible wedge under shared-SMP fork churn. Threading churn was concentrated in
-> Jan–Mar and has been quiet since. The proportional scheduler + SGI preemption model is
-> settled. The recurring lesson across the codebase: **never `yield_now()` or
-> do slow I/O inside a preemption-disabled closure** — that is the single most
-> common cause of hangs (see `../../runbooks/debug-network.md`).
+> **Stability: B (verify behaviour).** One scheduler since 2026-11-11, shared by AArch64 and
+> amd64 (`akuma-threading`'s `x86_*` functions, named for where they started); the AArch64
+> SGI scheduler it replaced is deleted. The recurring lesson across the codebase still
+> holds: **never `yield_now()` or do slow I/O inside a preemption-disabled closure**, the
+> single most common cause of hangs (see `../../runbooks/debug-network.md`).
 
 For real (shared-kernel) SMP, see [`smp-shared.md`](smp-shared.md).
 
@@ -44,8 +42,8 @@ stateDiagram-v2
     [*] --> FREE
     FREE --> INITIALIZING: claim_free_slot() CAS + scrub_thread_slot()
     INITIALIZING --> READY: context built, stack ensured
-    READY --> RUNNING: schedule_indices() picks it
-    RUNNING --> READY: SGI preempt / yield_now()
+    READY --> RUNNING: x86_pick_next() claims it (ON_CPU CAS)
+    RUNNING --> READY: tick preemption / yield_now()
     RUNNING --> WAITING: schedule_blocking()
     WAITING --> READY: waker sees WAITING (park/wake handshake)
     RUNNING --> TERMINATED: mark_thread_terminated()
@@ -62,149 +60,74 @@ the CPU.
 
 ## Preemption
 
-- **Timer tick → SGI** (Software Generated Interrupt). **1 ms since 2026-08-18**
-  (`TIMER_INTERVAL_US`, `src/config.rs`); **10 ms on `extreme-size`** (profile
-  gate — the 4 MB single-core box pays for every interrupt). The timer fires,
-  the exception handler runs the scheduler. Measurement record:
-  `../../archive/SCHEDULING_INVESTIGATION.md` → Resolution.
-- `PREEMPT_WAKE_TID` / `WOKEN_STATES`: "sticky wake" flags set by `wake()`,
-  consumed in `schedule_indices`. A woken thread runs promptly via the SGI.
-- **Preemption watchdog** (`ENABLE_PREEMPTION_WATCHDOG`, default true): warns
-  if preemption disabled >100 ms (`PREEMPTION_WATCHDOG_WARN_US`); at 5 s
-  (`PREEMPTION_WATCHDOG_PANIC_US`) it prints a rate-limited `[WATCHDOG]`
-  critical line and **keeps running** — `check_preemption_watchdog`
-  (`akuma-primitives/src/preempt.rs`, re-exported into
-  `crates/akuma-exec/src/threading/types.rs:60`) deliberately never panics ("DO NOT
-  use panic! here - we're in IRQ context"); the constant is merely *named*
-  `PANIC_US`. This is the tripwire for the "yield inside a critical section" bug class.
-- `with_irqs_disabled` (`runtime.rs:256`) is the primitive; nesting is counted
-  (`preemption_disabled_count`).
+- **The switch is a function call.** `yield_now` → `x86_yield_now` → `x86_yield_switch`
+  picks, does the bookkeeping, runs the target's `switch_to` hook (TTBR0/CR3, TLS, FP
+  state) and calls `akuma_switch::switch_contexts`, which saves the callee-saved registers
+  and the interrupt mask on the outgoing stack and resumes the incoming one where it last
+  called the same function. `x86_yield_now` masks interrupts around the switch on both
+  architectures; each thread resumes with the mask it yielded with.
+- **The timer tick preempts.** AArch64: `akuma_exceptions::irq_hooked` yields on the timer
+  PPI (or a scheduler SGI from a peer) when the IRQ came from EL0, or from EL1 and
+  `threading::el1_preemptible()` holds. amd64: `sched::preempt_if_needed` switches ring 3
+  and the idle loop, and with `ring0-preempt` kernel code outside the BKL
+  (`../../archive/AMD64_RING0_PREEMPTION.md`).
+- **`el1_preemptible`**: the running thread's preemption count is zero (`PreemptGuard`,
+  `disable_preemption`), `POOL` is free (a spinlock that does not mask interrupts, which
+  the switch takes for CPU-time accounting), and the thread is `RUNNING` (not half-way into
+  a park or its own termination).
+- **Tick.** 1 ms (`TIMER_INTERVAL_US`, `src/config.rs`; the host WFI probe can lengthen it),
+  10 ms on `extreme-size`. **Idle cores are tickless**: an idle thread arms its core's timer
+  for the earliest parked deadline or alarm (capped at 10 ms), halts, and re-arms the tick
+  when it runs again (`akuma-kernel-glue`'s `hooked.rs`). No self-SGI per tick: the timer
+  interrupt is itself the preemption point.
+- **Preemption watchdog** (`ENABLE_PREEMPTION_WATCHDOG`, default true): warns if
+  preemption is disabled >100 ms (`PREEMPTION_WATCHDOG_WARN_US`); at 5 s
+  (`PREEMPTION_WATCHDOG_PANIC_US`) it prints a rate-limited `[WATCHDOG]` critical line and
+  **keeps running** (`check_preemption_watchdog`, `akuma-primitives/src/preempt.rs`, never
+  panics in IRQ context). This is the tripwire for the "yield inside a critical section"
+  bug class.
+- `with_irqs_disabled` is the primitive; nesting is counted.
 
 ## Context switch
 
-- Saves/restores the full trap frame (`THREAD_CURRENT_TRAP_FRAME` per slot) +
-  callee-saved regs + TPIDR_EL1 (exception SP) + TTBR0 swap.
-- **Same-TTBR0 fast path (2026-08-19):** the switch skips both the
-  `msr ttbr0_el1` and the TLB flush when the incoming thread's saved TTBR0
-  equals the live register — sibling threads of one process, and all kernel
-  threads (shared boot table). Safe because the live-TTBR0 free gate
-  (`mmu::any_core_on_l0` + the saved-context arm) forbids freeing/reissuing an
-  L0 a core is parked on, so an equal value is provably the same address
-  space; page-table edits broadcast (`tlbi ...is`) under smp-shared. The old
-  unconditional `tlbi vmalle1` per switch (the ASID-0 crutch — kernel
-  translations included, since the kernel lives in the TTBR0 low half) cost
-  same-process thread workloads their whole TLB every quantum
-  (`../../archive/CROSS_CORE_THREAD_COLLAPSE.md` §1). Cross-AS switches keep
-  the full flush. Regression test: `test_same_ttbr0_switch_pingpong`.
-- **Key invariant (cross-AS switches):** full local flush after a TTBR0 change —
-  all address spaces share ASID 0, so stale entries from the previous AS would
-  be valid hits. Stale TTBR0 was the dominant bug class in
-  `fork`/`vfork`/`clone_thread`
-  (all three call sites now set `child_ctx.ttbr0 = new_proc.address_space.ttbr0()`).
+- **What moves.** `akuma_switch::Context` per slot: callee-saved registers, `sp`, the
+  interrupt mask (`DAIF`/`RFLAGS`), and on AArch64 d8-d15. Everything else is the target's
+  `switch_to` hook: the address-space root, the thread's TLS register, the exception stack,
+  FP state on amd64.
+- **The BKL travels with the core.** A thread switches holding the lock (`yield-takes-bkl`
+  on AArch64 takes it for the switch when the caller dropped it); the incoming thread
+  resumes holding it and releases it on its own way back to user mode.
+- **`ON_CPU` is the claim.** The picker takes a thread with a 0→1 compare-and-swap on its
+  `ON_CPU` gate, so two cores never resume one stack. The outgoing thread's gate stays set
+  through the switch and is cleared once its stack is provably dead
+  (`rust_switch_finished`, right after the switch returns on the incoming stack).
+- **Same address space, no flush.** `switch_to` returns early when the incoming root equals
+  the live one. A cross-space switch publishes the new root to the per-core `ACTIVE_L0`
+  registry (`mmu::publish_l0_begin`/`_end`) before installing it, which is what the
+  page-table free gate (`mmu::any_core_on_l0`) reads; an unpublished root lets a dead
+  address space be freed under a live `TTBR0`
+  (`../../archive/HOOKED_EL1_PREEMPTION.md`). All address spaces share ASID 0, so a
+  cross-space switch flushes the local TLB.
 
-## The `POOL` gate (shared-SMP)
+## `POOL`
 
-> **Stability: C (active risk).** The wedge described at the end of this section is
-> open and reproducible.
+`POOL: Spinlock<ThreadPool>` guards the slot table's non-atomic fields: per-slot stacks and
+CPU-time stamps. The state machine itself is the lock-free `THREAD_STATES`, and the pick is
+the `ON_CPU` CAS, so the switch does not hold `POOL` across the context switch; it takes it
+only for the CPU-time bill. `POOL` does not mask interrupts, so `el1_preemptible` refuses a
+tick that lands while it is held (the switch would spin on this core's own hold).
 
-`POOL: Spinlock<ThreadPool>` (`threading/mod.rs:2744`) is a **single global lock** guarding
-the slot table. Under `smp-shared` it is also what makes the context switch atomic:
-`sgi_scheduler_handler_with_sp` holds `POOL` across the *entire* switch — decision,
-outgoing context save, and incoming load — **on every path**, unconditionally. It has to,
-because `schedule_indices`/`commit_switch` mark the outgoing thread `READY` (so a peer
-core may pick it), and a peer that restored a not-yet-saved SP would run a corrupt stack.
+## Scheduling
 
-Only *half* of that switch is BKL-free, though — "the scheduler SGI runs BKL-free" is
-overstated as a blanket claim. Since M5c step-2, a scheduler SGI that preempted **EL0**
-runs the whole switch without ever taking the BKL, gated on `interrupted_el0 &&
-sched_bklfree_el0_enabled() && irq == SGI_SCHEDULER` (`crates/akuma-exceptions/src/lib.rs`, `rust_irq_handler_with_sp`). An
-SGI that instead preempted **EL1** falls through to `bkl::enter_kernel()`
-(`exceptions.rs:2665`) and runs `sgi_scheduler_handler_with_sp` **BKL-held**
-(`exceptions.rs:2680`), exactly like any other device IRQ. So the BKL-free path is the
-EL0-preempt arm only; the `POOL`-across-the-whole-switch guarantee above holds either way.
-
-The load-bearing consequence: **`POOL` is the gate on all preemption.** The SGI handler
-takes it with `try_lock` and, on failure, skips the tick entirely.
-
-```mermaid
-flowchart TD
-    T["10 ms timer IRQ"] --> SGI["SCHED_SGI → this core"]
-    SGI --> H["sgi_scheduler_handler_with_sp()"]
-    H --> TL{"POOL.try_lock()"}
-    TL -->|"None (contended)"| SKIP["SGI_POOL_SKIP += 1<br/>return 0 — no preemption this tick"]
-    TL -->|Some| DEC["schedule_indices(voluntary, core_id)"]
-    DEC --> SW["save outgoing ctx + load incoming<br/>(POOL held across the whole switch)"]
-    SW --> RET["return new SP (guard drops)"]
-    RET --> ASM["assembly switches SP"]
-    ASM --> ERET["eret epilogue →<br/>reconcile_for_spsr_no_ticket → BKL"]
-    SKIP --> NEXT["next tick retries"]
-    NEXT -.-> T
-```
-
-`try_lock` rather than `lock` is mandatory, not an optimisation: the handler runs in IRQ
-context with `PSTATE.I` masked, so a blocking acquire against a `POOL` held by the very
-thread it interrupted would spin forever. Skipping a tick is safe **for a transient
-holder** — the comment's "the next tick retries" is only true if the holder is guaranteed
-to make progress without being preempted.
-
-### Reasoning about the transitions
-
-Every ordinary `POOL` holder is bounded and lock-free internally, which is why the design
-works day to day:
-
-| Holder | Held across | Bounded by |
-|---|---|---|
-| SGI handler (`try_lock`) | one context switch | register save/load |
-| spawn (`spawn_*_thread_*`) | slot claim + context build | no I/O |
-| recycle (`cleanup_terminated_internal`) | three short windows, each under `IrqGuard` | per-slot field writes |
-| `ensure_slot_stack` | PMM alloc + page zeroing | **no-op on `release`** (slots pre-allocated); only the size profile allocates lazily |
-| `idle_halt` (`try_lock`) | post-WFI bookkeeping | skippable |
-| diagnostics (`list_kernel_threads`, canary/stack checks) | a read scan | slot count |
-
-So the invariant that keeps preemption alive is:
-
-> A `POOL` holder must never wait on anything that requires **another thread to be
-> scheduled**. Doing so is unrecoverable: the thread it is waiting for can only be switched
-> in by the SGI handler, and every core's SGI handler skips its tick for as long as that
-> holder keeps `POOL` — so the wait blocks the very mechanism that could end it.
-
-That is a circular wait *through the scheduler itself*, and no lock-ordering rule catches
-it — there is no global hierarchy in this kernel by design
-([`locking.md`](locking.md)). It is also invisible to the existing tripwire: the
-**preemption watchdog** only **prints a critical warning** at 5 s of disabled
-preemption and keeps running — it never panics (see [Preemption](#preemption) above;
-`types.rs:69`) — and it watches the per-thread `PREEMPTION_DISABLED` counters, *not*
-consecutive SGI skips. A `POOL`-gated wedge trips no counter, so the watchdog stays
-silent through it.
-
-### The observed wedge (open)
-
-Reproduced 2026-08-08 on `release-smp-shared` + `devbox-smoltcp`, SMP=4, under 6
-concurrent `bssfork` instances (heavy fork + thread churn):
-
-- `[SGI] POOL contended, skipped N ticks` climbs without bound (69 000+ and still going),
-  alternating between just two tids — the message reports the *interrupted* thread, so
-  this says two threads keep getting timer IRQs and neither can ever be switched out.
-- The console keeps printing, so IRQs and the UART are alive — **the box is not dead, it
-  is unscheduled.** ssh stops answering because no userspace thread can be switched in.
-- Onset is always thread-churn heavy: a burst of `[PROC-EXIT]` / `[TERM]` /
-  `[Cleanup] Thread N recycled` immediately precedes it.
-- The preemption watchdog does not fire, per the blind spot above.
-
-**Established:** it is *pre-existing and independent of the BKL ticket accounting* — it
-reproduces on both arms of that A/B, on the same load, and the fixed kernel reaches it
-with zero `[BKL] stuck` lines, so the two defects do not share a mechanism.
-
-**Not yet established:** which `POOL` holder wedges. `Spinlock` carries no owner, so the
-skip message names the *interrupted* thread on the skipping core, never the holder — the
-same trap that made `tag=511` useless for the BKL storm (see
-[`locking.md`](locking.md#attribution-tooling)). Reading the skipping tid as the culprit
-is the mistake to avoid here.
-
-**Cheap discriminator, not yet run:** record the holder. A `POOL_OWNER: AtomicUsize`
-(plus a `#[track_caller]` site) stored immediately after every successful `lock()`/
-`try_lock()` and cleared before release turns the skip line into a naming of the actual
-holder, which reduces the suspect list to a handful of call sites in one run.
+- **Round-robin from the current slot** (`x86_pick_next`): the first `READY` or `RUNNING`
+  slot after the caller's that is not on a CPU and that this core may run. No weights, no
+  priorities.
+- **Pinning** is the target's `can_run` hook: the boot thread runs on the boot core, each
+  idle thread on its own core.
+- **Wake pass.** Before each pick, `x86_wake_pass` readies every `WAITING` thread whose
+  deadline has passed (CAS, so a racing wake or kill wins).
+- **Idle threads** halt only when `x86_runnable_exists()` finds nothing; a wake that lands
+  between the last pick and the halt announcement is seen there.
 
 ## Synchronization primitives
 
@@ -224,14 +147,11 @@ holder, which reduces the suspect list to a handful of call sites in one run.
 
 ## Blocking & wait/wake
 
-- **`yield_now()`** (`threading/mod.rs:2856`) — voluntary yield; thread stays
-  `Ready`, wakes promptly, **no SGI**. Use inside `block_on` and any
-  cooperative loop.
-- **`schedule_blocking(wake_time_us)`** (`threading/mod.rs:3563`) — flips the
-  thread to `Waiting`; on wake fires an SGI for immediate context switch.
-  **Do NOT use inside `block_on` while the network thread may hold the
-  `NETWORK` spinlock** (SGI-during-poll deadlock — see
-  `../../runbooks/debug-ssh-latency.md`).
+- **`yield_now()`** — voluntary switch through the hooked path above; the thread stays
+  `READY`. Use inside `block_on` and any cooperative loop.
+- **`schedule_blocking(wake_time_us)`** — publishes `WAITING` and switches away; a waker or
+  the deadline (`x86_wake_pass`) readies it. A wake for a thread on a halted core sends that
+  core a scheduler SGI.
 - **`Waker`** (`ThreadWaker`, `threading/mod.rs:3351`, `wake()` at `:3363`) — `wake()` sets the sticky
   `WOKEN_STATES` flag + `PREEMPT_WAKE_TID`. Used by wait queues, epoll, and the
   SSH `current_thread_waker()`.
@@ -259,10 +179,9 @@ Steps 1 and 2 are a unit: `publish_waiting_and_take_pending_wake` runs them unde
 a local IRQ mask, because a context switch on this core can only arrive via IRQ.
 Split them and the wake is lost outright — the waker at (b) sees `RUNNING`, so it
 leaves nothing behind but a flag nobody will read again, and an untimed waiter
-sleeps forever. `schedule_blocking` deliberately asks to be switched out
-immediately after step 1 (`voluntary_schedule_flag` + self-SGI), so "the park
-loop rechecks the flag eventually" is **not** a substitute; the loop usually
-first runs only after the thread has been resumed.
+sleeps forever. `schedule_blocking` switches out immediately after step 1, so "the park
+loop rechecks the flag eventually" is **not** a substitute; the loop usually first runs
+only after the thread has been resumed.
 
 Both `SeqCst` orderings are required, not decorative: they are what guarantees
 that if (a) lands after step 2's swap, then step 1's store precedes it, so (b)
@@ -273,54 +192,6 @@ sessions inside the futex layer before being found in the scheduler. Diagnosis
 and the `hist=...EpW` signature: `../../runbooks/debug-futex-lost-wakeup.md` §4a.
 Regression test: `park_wake_race_tests`
 (`crates/akuma-exec/src/threading/mod.rs`).
-
-## Scheduling weights
-
-- **Proportional scheduler** (`schedule_indices`, `threading/mod.rs:2425`).
-  `MAIN_THREAD_PRIORITY_BOOST` is legacy (off) — proportional is default.
-- **`NETWORK_THREAD_RATIO`** (default 4) — the network thread is boosted every
-  N ticks. The boosted thread is the **registered** one
-  (`set_network_thread_id`, called by `run_async_main`), not slot 0.
-  Historical bug: boost was hardcoded to slot 0 (idle) → SSH staggering.
-- **Wake-deadline preemption (on since 2026-08-18).** When the scheduler's
-  deadline wake-pass promotes a WAITING thread (sleep/timer expiry), it arms
-  `PREEMPT_WAKE_TID` for the earliest-deadline thread so it runs on the NEXT
-  switch instead of joining the back of the round-robin queue
-  (`WAKE_DEADLINE_PREEMPT` in `threading/mod.rs`). Before this, eligibility
-  was not execution: an expired sleeper waited a full round-robin pass, giving
-  short sleeps a ~35 ms floor and making every poll-interval cap inert
-  (`../../archive/SCHEDULING_INVESTIGATION.md`). The older
-  `WAKEUP_LOCALITY_HINT` gate (arming the same hint from explicit
-  `ThreadWaker::wake` calls) stays off — measured no gain for the rump
-  sysproxy, and re-measured **worse** for llama.cpp thread barriers
-  2026-08-19 (`tg16 -t 2` 2.5 → 1.15 tok/s: the single-slot hint preempts the
-  producer; `../../archive/CROSS_CORE_THREAD_COLLAPSE.md` §2A).
-- **Bounded displacement bypass (on since 2026-08-19, smp-shared only,
-  EL0-interrupted ticks only).** On an involuntary tick that interrupted
-  USERSPACE and would displace a RUNNING, non-idle thread for another READY
-  thread, the scheduler first tries `wake_remote_idle()` (SGIs the lowest
-  idle peer core and reports whether one existed); if an idle core can take the
-  READY work, this core keeps its thread — for at most
-  `DISPLACEMENT_IMMUNITY_TICKS - 1 = 4` consecutive ticks (~5 ms effective
-  timeslice), then it rotates exactly as baseline. Applies to both the
-  round-robin scan and the network-boost path. **The EL0 gate is load-bearing**:
-  an EL1-interrupted thread is a BKL holder ("held iff in EL1"), and the
-  per-tick switch is the BKL release valve for long kernel excursions — an
-  ungated version wedged the boot suite's FS tests in a `[BKL] stuck` storm
-  (thread 0 held the BKL through bulk ext2 I/O forever). Rationale +
-  measurements (llama `-t 2` decode 1.6 → 22 tok/s across this + the
-  same-TTBR0 switch fix; the unbounded variant starved sshd and is documented
-  as a failure): `../../archive/CROSS_CORE_THREAD_COLLAPSE.md` §2B.
-  Off smp-shared, `wake_remote_idle` is `|| false` and the bypass is inert.
-- **Idle-fallback keep-running (2026-08-19, EL0-interrupted ticks only).** When
-  the scan finds NO other non-idle READY thread, a still-RUNNING,
-  EL0-interrupted current thread now stays on-core (`return None`) instead of
-  being switched out to the per-core idle thread — the old behavior made every
-  lone CPU-bound thread bounce core → idle → another core on every tick. Safe
-  against double-run: a RUNNING thread is never picked by a peer's scan. Safe
-  against BKL starvation: only EL0-interrupted (no BKL held) threads qualify;
-  EL1-interrupted, WAITING (blocked), or READY (yielded) currents still fall
-  through to the idle switch.
 
 ## Evaluating a placement policy before building it
 
@@ -334,8 +205,8 @@ HOST=$(rustc -vV | grep '^host:' | cut -d' ' -f2)
 cargo run -p akuma-scheduler --release --target $HOST
 ```
 
-It already carries `RoundRobin` (pre-2026-08-19), `Immunity` (today's bounded
-displacement bypass), `Spread` (a placement governor) and `Pinned` (hard
+It carries `RoundRobin`, `Immunity` (the deleted SGI scheduler's bounded displacement
+bypass), `Spread` (a placement governor) and `Pinned` (hard
 affinity), plus the netpoll wake policy as a separate axis. **Three conclusions
 from it are load-bearing for anyone about to change this file**
 (`../../archive/AKUMA_SCHEDULING_EXTRACTION.md`):
@@ -372,6 +243,11 @@ BKL carve-outs.
 - `archive/CROSS_CORE_THREAD_COLLAPSE.md` — the 2026-08-19 fixes above.
 - `archive/AKUMA_SCHEDULING_EXTRACTION.md` — `crates/akuma-scheduler` (policy
   simulator) and `crates/akuma-kacho` (the shared self-tuning primitives).
+- `archive/AKUMA_MULTIARCH_ATTEMPT_0.md` — the scheduler unification: the hooked scheduler
+  on AArch64, its EL1 preemption (`archive/HOOKED_EL1_PREEMPTION.md`), tickless idle
+  (`archive/HOOKED_IDLE_TICK.md`), and the deletion of the SGI scheduler, whose
+  proportional weights, `POOL`-gated SGI handler and open `POOL` wedge this page described
+  until 2026-11-11.
 - `archive/MULTIKERNEL.md` — the removed one-kernel-per-core design (29
   commits); see `archive/TRIM_FAT_MULTIKERNEL.md` for the removal.
 - `archive/SCHEDULING_AUDIT.md` (2026-08-18) — docs-vs-code audit of this

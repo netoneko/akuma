@@ -165,10 +165,6 @@ pub fn timer_irq_handler(_irq: u32) {
     }
     // The hooked scheduler preempts on this interrupt itself (`irq_hooked`): a self-SGI
     // would be a second interrupt, and under KVM a trapped GIC write, for every tick.
-    #[cfg(all(kernel_smp_shared, not(feature = "hooked-sched")))]
-    akuma_gic::trigger_sgi_self(akuma_gic::SGI_SCHEDULER);
-    #[cfg(all(not(kernel_smp_shared), not(feature = "hooked-sched")))]
-    akuma_gic::trigger_sgi(akuma_gic::SGI_SCHEDULER);
 }
 
 /// Arm this core's timer for `deadline_us` (uptime) instead of its next periodic tick.

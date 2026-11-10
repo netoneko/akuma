@@ -56,9 +56,6 @@ net-profile = ["akuma-net/net-profile"]
 # `akuma-kernel-glue/Cargo.toml`) — a missing forward silently picks QEMU virt.
 platform-firecracker = ["akuma-boot-aarch64/platform-firecracker"]
 bkl-profile = []
-# The hooked scheduler: the timer IRQ is itself the preemption point (`irq_hooked`), so
-# the tick rings no self-SGI.
-hooked-sched = []
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
 net-noalloc = ["akuma-net/net-noalloc"]
 

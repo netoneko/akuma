@@ -1168,3 +1168,60 @@ Extreme-size under HVF, guest script uname / `tcc` hello / `sigspin 3`:
   4 MB floor boots on neither build.
 - The trashcan (amd64 metal) is down since the 2026-11-10 reboot and needs a power cycle, so the
   `ring0-preempt` KVM gate has not run.
+
+## The SGI scheduler is deleted (2026-11-11)
+
+One scheduler is left for both architectures: the hooked path.
+
+**Line count:** 27 files, −2,109 / +78.
+
+**What went:**
+
+- `akuma-threading`:
+  - `sgi_scheduler_handler_with_sp` and the `ThreadPool` picker `impl` (proportional weights,
+    network-thread boost, displacement bypass, idle fallback, wake-deadline preemption);
+  - the SGI-path slot initialiser and saved-context readers, and `adopt_current_as_core_idle`;
+  - the `sgi_sched`/`hooked_sched` cfgs and the `hooked` feature.
+- `akuma-switch`: the SGI trampoline asm.
+- `akuma-entry`: the SGI vector table, its four `#[no_mangle]` handlers, `install_vbar`, `init`,
+  and the secondaries' `set_shared_vbar`.
+- `akuma-exceptions`: `irq_with_sp` and its poison check.
+- `akuma-kernel-core`: the self-SGI on every tick.
+- The `hooked-sched` features of the root, glue, entry, exceptions, kernel-core and exec.
+
+The AArch64 root kernel's two scheduler choices, `yield-takes-bkl` and `collector-recycles`, are
+now enabled by `akuma-kernel-glue`'s direct `akuma-threading` dependency.
+
+**Effects:**
+
+- Production `unsafe` sites: 420 → 414. The budget was ratcheted down.
+- The default AArch64 binaries are within ~100 bytes of the hooked builds gated above. The SGI
+  code was already compiled out of them, so the deletion removes source and changes nothing that
+  ran.
+- The rump devbox (`build_devbox.sh`) and the stage-1 `taoxichuan` feature build now get the
+  hooked scheduler too. Neither is booted here: rump is deferred, and the Firecracker platform
+  build has 2 clippy errors that predate this change.
+
+**Mechanics:** a cfg folder (`hooked_sched` = true, `sgi_sched` = false) resolved attributes and
+deleted the governed items. One range ended early and was caught by the compiler. Two attributes
+were left orphaned above deleted items; they were found by a diff scan and fixed by hand. The
+asm-reachable SGI code was traced and removed by hand, since `dead_code` cannot see it.
+
+`docs/reference/subsystems/scheduler.md` now describes the hooked scheduler. Its SGI-era sections
+(the `POOL` gate, the proportional weights, the open `POOL` wedge) are gone with the code. `gic.md`,
+`thread-lifecycle.md` and the `verify-trim-fat-change` runbook row are updated.
+
+**Gates (post-deletion binaries, run serially on Lima/TCG):**
+
+| Gate | Result |
+|------|--------|
+| Boot suite, SMP=1/2/4 | 314/0, 322/0, 320/0 |
+| Devbox SMP=4: `epoll_suite.py` | 17 PASS, 0 FAIL, 1 known DIVERGE |
+| Devbox SMP=4: `futex_suite.py` | all probes pass; panics=0, bkl_stuck=0, segv=0 |
+| `sigspin`, SMP=2 | 5/5 |
+| extreme at 16 MB | `sigspin` 5/5; panics=0 |
+| amd64 TCG, base SMP=1/2 | 829/0, 839/0 |
+| amd64 TCG, `ring0-preempt` SMP=2 | 841/0 |
+
+The extreme run's single SEGV is the `/tmp/h` tcc-hello fault, which the pre-deletion hooked
+baseline shows identically. It is not a regression.
