@@ -356,7 +356,7 @@ pub fn sync_tick() {
 /// it worked. Never fatal — this target booted with no clock at all for
 /// every stage before this one, and a network that cannot reach an NTP pool
 /// (no route, a captive/offline network, DNS blocked) is not a reason to
-/// fail the boot over. Called once from `main.rs`, after DHCP; [`sync_tick`]
+/// fail the boot over. Called once from `lib.rs`, after DHCP; [`sync_tick`]
 /// keeps trying afterwards if this did not land.
 pub fn sync_via_sntp() {
     let outcome = attempt_sntp(NTP_TIMEOUT_US);

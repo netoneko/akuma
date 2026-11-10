@@ -4891,7 +4891,7 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // nothing; a spin costs the core a compile is trying to use.
     //
     // Why the `timer_running` guard: `uptime_us` advances only on the tick, and
-    // `main.rs` arms the timer only when there is a network. Parking against a
+    // `lib.rs` arms the timer only when there is a network. Parking against a
     // clock that does not move would hang a no-network boot forever — the same
     // condition `console::pump_daemon` carries, for the same reason.
     while !crate::sched::all_user_tasks_finished() {

@@ -367,7 +367,7 @@ fn wake_reader() {
 /// asked to sleep.
 ///
 /// The original objection was real and is kept as the `else`: `uptime_us`
-/// advances only on the LAPIC tick, and `main.rs` arms the timer only when
+/// advances only on the LAPIC tick, and `lib.rs` arms the timer only when
 /// there is a network, so on a no-network boot a parked pump is **a console
 /// that never delivers a keystroke** — the one failure this module must not
 /// have. So the park is conditional on [`crate::lapic::timer_running`], and a

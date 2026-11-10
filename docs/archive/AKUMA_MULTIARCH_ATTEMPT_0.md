@@ -1247,3 +1247,26 @@ counter stays zero.
 Gates: clippy clean for default, devbox-smoltcp, amd64 (base and `ring0-preempt`), taoxichuan
 (both arches) and shanghai. Host tests pass; unsafe 414, addr 700. Boot suite 322/0 at SMP=2 and
 320/0 at SMP=4; amd64 TCG 839/0, and 841/0 with `ring0-preempt`.
+
+## M7a — the amd64 kernel is a library behind a two-symbol bin (2026-11-11)
+
+The first move of M7, done the way B15 did it for the tokio kit: code moves under a library
+first, and the front crate arrives after. `amd64/src/main.rs` became `amd64/src/lib.rs` (a
+`git mv`, so its history follows), and the package gained a `[lib]` named
+`akuma_kernel_amd64`, after the machine half it is headed to be (research doc §9.3). The new
+`main.rs` is 21 lines: the two `#[unsafe(no_mangle)] extern "C"` symbols `boot.s` calls (`kmain`,
+`kmain_mb2`), each calling the library's plain `kmain`/`kmain_mb2`. These are exactly the two
+symbols the tokio kit's `entry!` expands to on amd64.
+
+What did not move: the package and the bin keep the name `akuma-amd64`, so `-p akuma-amd64`,
+`amd64/run.sh`, the metal `build.sh` and every `target/x86_64-unknown-none/*/akuma-amd64` reader
+are unchanged. `build.rs` is untouched: `rustc-link-arg-bins` still reaches the bin, and the
+`kernel_smp_shared` cfg and the `OUT_DIR` probe ELFs reach the library because it is the same
+package. `#[global_allocator]`, `#[alloc_error_handler]` and `#[panic_handler]` moved with the
+library (one per linked image, which is still true).
+
+Gates (TCG): default SMP=1 829/0, SMP=2 839/0; `ring0-preempt` SMP=2 841/0. All three are
+identical to the pre-split build. The image file is +10.7 KB (+0.04%, unstripped). `nm` shows
+`kmain` and `kmain_mb2` at adjacent addresses. **multiboot2: not run.** The KVM rig is on the
+ryzen's Pop install, which is down (only the ryzen's own Akuma answers), and the trashcan is down.
+The `kmain_mb2` change is the symbol moving to the bin, which wraps `%rdi` in a `PhysAddr` (so the address-parameter ratchet does not count it twice).

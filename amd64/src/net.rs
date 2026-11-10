@@ -1180,7 +1180,7 @@ pub fn smoke_test(t: &mut Suite, up: bool) {
 /// Stage Q: the netpoll daemon, the loop that was missing.
 ///
 /// Split in two 2026-09-05 (`docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.30)
-/// — one call used to do both; `main.rs` now calls
+/// — one call used to do both; `lib.rs` now calls
 /// [`netpoll_drain_selftest`] then [`netpoll_spawn_selftest`] itself, with
 /// `clock.rs`'s SNTP fetch run in the gap between them: after DHCP (this
 /// drain is where it actually finishes) but **before** the netpoll daemon

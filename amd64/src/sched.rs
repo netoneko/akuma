@@ -934,7 +934,7 @@ static IDLE_QUIET_LAPS: [AtomicU32; crate::smp::MAX_CPUS] =
 static IDLE_MWAIT: AtomicU32 = AtomicU32::new(0);
 
 /// Parse the idle-policy knobs off the command line. Both boot paths call
-/// this (`main.rs` and `multiboot2.rs`), the way `smp::set_cpu_cap_from_
+/// this (`lib.rs` and `multiboot2.rs`), the way `smp::set_cpu_cap_from_
 /// cmdline` is called from both.
 pub fn set_idle_policy_from_cmdline(cmdline: &str) {
     let mut sleep = false;
@@ -2018,7 +2018,7 @@ fn allow_tick_masked() {
     // does not switch away from kernel code, and `cli` restores the mask the
     // caller had.
     //
-    // **Unless the timer is not running.** `main.rs` arms it only when there is
+    // **Unless the timer is not running.** `lib.rs` arms it only when there is
     // a network, and a `hlt` with no timer and no device interrupt is a core
     // that never comes back. That boot keeps the old spin, which is the
     // behaviour it has always had.

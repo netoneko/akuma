@@ -911,7 +911,7 @@ fn init_console(info: &BootInfo<'_>) -> Result<ConsoleUp, &'static str> {
     Ok(ConsoleUp { fb, font, fw, fh, fcols, frows, fscale })
 }
 
-/// Long-mode entry for a GRUB/multiboot2 boot, called from `boot.s`.
+/// The GRUB/multiboot2 boot, from long mode on; the bin's `kmain_mb2` symbol calls it.
 ///
 /// Deliberately parallel to [`crate::kmain`], and in the same order, because
 /// that order is load-bearing and documented there. What differs is only where
@@ -921,8 +921,8 @@ fn init_console(info: &BootInfo<'_>) -> Result<ConsoleUp, &'static str> {
 // The information block's size field is a `u32` at an 8-byte-aligned address
 // (the multiboot2 ABI); the byte pointer is how the physmap hands it over.
 #[allow(clippy::cast_ptr_alignment)]
-#[unsafe(no_mangle)]
-pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
+pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr) -> ! {
+    let info_phys = info.get();
     ega_text(0, "Akuma/amd64: multiboot2 entry reached");
     // Probe for a UART and configure it if one answers. This path never called
     // `serial::init` — the reference machine has no serial port — and got away
@@ -1210,7 +1210,7 @@ pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
         // scheduler, the hardware watchdog), and before the LAPIC timer there is
         // none, so a guest that spins without exiting never gives the host a
         // chance to stop it (found rehearsing under QEMU/KVM, 2026-10-22). Same
-        // place as the PVH path's call in `main.rs`; the BSP only, so the
+        // place as the PVH path's call in `lib.rs`; the BSP only, so the
         // thread cannot migrate off the core that enabled SVM.
         if have_fs {
             crate::kvm::late(cmdline);

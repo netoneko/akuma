@@ -32,7 +32,7 @@
 //! would pass user pointers. Those are kernel addresses, which [`range_ok`]
 //! rightly refuses — so the range check honours
 //! `akuma_user_access::BYPASS_VALIDATION`, the per-thread switch the AArch64
-//! kernel's ~85 boot-test sites already use for exactly this, and `main.rs`
+//! kernel's ~85 boot-test sites already use for exactly this, and `lib.rs`
 //! holds a `BypassValidationGuard` across the self-test block and drops it
 //! before `run_init`. Under the bypass the *copy* is still fault-safe (an
 //! unmapped kernel address is recovered like any other); only the "is this in
