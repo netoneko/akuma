@@ -49,6 +49,25 @@ therefore a sequence of small convergences of those, not a rewrite.
   836/0. Note: `SMP=4 KCMDLINE="smp=2 idlesleep"` fails `smp ring3: two processes ran on two cores`
   on **both** M1b and M1c (control run) — a property of that command line, not of these commits.
 
+### The multiboot2 gate (ryzen, 2026-11-10)
+
+`kmain_mb2` can be **booted** without touching the metal: ryzen (Pop, `/dev/kvm`) runs
+`overlays/ryzen/qemu.sh` — OVMF → the overlay's `grub.cfg` → multiboot2 kernel + `root.img` module,
+the same chain as the real box, in QEMU/KVM. To keep the user's `/home/netoneko/akuma-metal` (and its
+`out/` kernels) untouched, the rig runs from its own directory: copies of `build.sh` and `qemu.sh`
+with `W=/home/netoneko/akuma-multiarch-rig`, `build.sh` cloning **this branch from GitHub** (so a
+commit must be pushed before it is tested), `qemu.sh` patched to take `SMP=` and an extra
+`grub.cfg` entry 31 (tests kernel, RAM root, `smp=4`, autoreboot) appended to the rig's own clone.
+Run as root with `MEM=3072` (ryzen has ~6 GB available). Never install these kernels on the metal
+(Mac-built or rig-built): they are for the rehearsal only.
+
+| build | entry | result |
+|---|---|---|
+| M1a+M1b (`87ae39e6`) | 3: tests kernel, RAM root, `nosmp` | **816 passed, 0 failed**; prints the new `smp:  nosmp on the command line — single core` |
+| M1a–M1c (`6453829a`) | 31: tests kernel, RAM root, `smp=4` | **826 passed, 0 failed**; 4 CPUs online, `online count agrees`; autoreboot reached, QEMU exited |
+
+The multiboot2 side of M1a–M1c is therefore boot-verified under KVM (not on the metal itself).
+
 ## Decisions (owner, 2026-11-10)
 
 - **D1 — rump:** a universal, **optional** `rump` feature on the shared spine, not bin-local. Its
