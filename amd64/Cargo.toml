@@ -38,6 +38,15 @@ smp-shared = ["akuma-exec/smp-shared", "akuma-kernel-core/smp-shared", "akuma-sy
 # (`DEFAULT_CACHE_CAP_BYTES`); the kernel never calls `set_cache_cap_bytes`.
 fs-cache = ["akuma-ext2/fs-cache"]
 
+# Preempt ring 0. Syscalls run with `IF` set once the BKL is taken, and the timer
+# switches a thread in kernel code when `akuma_threading::el1_preemptible` allows it
+# (preemption not disabled, scheduler pool unlocked, thread RUNNING) **and this core
+# does not hold the BKL**: the shared crates' dropped-BKL windows (`no-bkl-*` above),
+# which AArch64 already preempts. A BKL-held section is not preempted, because this
+# target's own kernel code was written for a ring 0 that never switches involuntarily.
+# OFF by default until its gates pass; `docs/archive/AMD64_RING0_PREEMPTION.md`.
+ring0-preempt = []
+
 # Linux's regular-file read contract: a `read`/`pread` of a regular file
 # returns every byte asked for unless the file ends first (up to Linux's own
 # `MAX_RW_COUNT`), instead of stopping at this target's 64 KiB `MAX_IO`. Served

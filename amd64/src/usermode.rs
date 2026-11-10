@@ -980,6 +980,12 @@ extern "C" fn syscall_handler(
     // says where a parked thread is parked, which the `[BKL]` tag above cannot
     // — that one is per *core* and names whoever last held the lock.
     crate::sched::note_syscall_entry(nr);
+    // `ring0-preempt`: the syscall body runs with interrupts on, so the tick can switch
+    // it out of a dropped-BKL window (`sched::ring0_preemptible`). `IA32_FMASK` cleared
+    // `IF` on entry, which is what kept the stub's user-`rsp` window atomic; that window
+    // is behind us. Masked again before the epilogue below.
+    #[cfg(feature = "ring0-preempt")]
+    akuma_cpu::interrupts::on();
     CALLS.fetch_add(1, Ordering::Relaxed);
     // Per-process syscall counters — the `[PSTATS]` machinery, aarch64 parity
     // (`akuma-kernel-glue` bumps the same counters through the `akuma-syscalls`
@@ -1115,6 +1121,10 @@ extern "C" fn syscall_handler(
         serial::put_dec(crate::net::uptime_us());
         serial::puts("\n");
     }
+    // Masked from here to `sysretq`: the stub's exit reads this core's per-CPU block and
+    // runs with the user `rsp` loaded, and the epilogue's `leave` decision is per core.
+    #[cfg(feature = "ring0-preempt")]
+    akuma_cpu::interrupts::off();
     let uctx = crate::smp::current_uctx();
     // **The signal epilogue.** Before the `leave` read below, because a fatal
     // default action sets that flag — and after the trace lines, so a syscall's

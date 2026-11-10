@@ -558,6 +558,8 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
         lapic::start_timer();
         sched::smoke_test(t);
         sched::block_smoke_test(t);
+        #[cfg(feature = "ring0-preempt")]
+        sched::ring0_preempt_smoke_test(t);
         lapic::stop_timer();
     }
     // Needs no tick and runs no task: it claims one unpublished slot, writes a

@@ -50,12 +50,11 @@
 //! # What did **not** move
 //!
 //! Preemption. [`preempt_if_needed`] still runs from this target's own timer
-//! vector, and still switches only ring 3 and the idle loop — a kernel thread
-//! preempted inside the heap allocator leaves the heap's spinlock held, and the
-//! next thread to allocate spins on it forever with interrupts off. AArch64
-//! reaches its scheduler through an SGI and a fake IRQ-return frame; x86_64
-//! reaches it through a plain call. Both are in the crate; only one is used
-//! here.
+//! vector. It switches ring 3 and the idle loop. With `ring0-preempt` it also
+//! switches kernel code outside the BKL, under the shared `el1_preemptible`
+//! gate. Without that feature ring 0 runs with `IF` clear (syscalls via
+//! `IA32_FMASK`), so a tick never lands there
+//! (`docs/archive/AMD64_RING0_PREEMPTION.md`).
 
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
@@ -524,9 +523,10 @@ fn register_hooks() {
 /// returns from here, the handler returns, and `iretq` resumes whatever it was
 /// doing.
 ///
-/// Only ring 3 (`from_user`) and the idle loop are switched away from here. A
-/// kernel thread keeps running and consumes the flag at its next `yield_now` —
-/// see the module header for the deadlock that ring-0 preemption was.
+/// Ring 3 (`from_user`) and the idle loop are switched away from here. Kernel
+/// code is too with `ring0-preempt`, when [`ring0_preemptible`] says so;
+/// otherwise a kernel thread keeps running and consumes the flag at its next
+/// `yield_now`.
 pub fn preempt_if_needed(from_user: bool) {
     if !smp::need_resched() {
         return;
@@ -541,7 +541,42 @@ pub fn preempt_if_needed(from_user: bool) {
         PREEMPTIONS.fetch_add(1, Ordering::Relaxed);
         yield_now();
         smp::bkl_leave();
+    } else if ring0_preemptible() {
+        PREEMPTIONS.fetch_add(1, Ordering::Relaxed);
+        RING0_PREEMPTIONS.fetch_add(1, Ordering::Relaxed);
+        // `yield_now` takes the BKL for the switch and gives it back on resume, so the
+        // interrupted code resumes as unlocked as it was.
+        yield_now();
     }
+}
+
+/// May the tick switch away from the kernel code it interrupted?
+///
+/// The shared gate ([`threading::el1_preemptible`]: preemption not disabled, the
+/// scheduler pool not locked, the thread `RUNNING` rather than half-way into a park)
+/// plus one of this target's own: **this core does not hold the BKL**. The lock
+/// belongs to the core, so a thread preempted inside a BKL section would leave the
+/// next thread on this core running inside it too, and this target's kernel code was
+/// written for a ring 0 that never switches involuntarily. The shared crates'
+/// dropped-BKL windows (`no-bkl-*`) are already preempted on AArch64.
+#[cfg(feature = "ring0-preempt")]
+fn ring0_preemptible() -> bool {
+    !smp::bkl_held() && threading::el1_preemptible()
+}
+
+#[cfg(not(feature = "ring0-preempt"))]
+fn ring0_preemptible() -> bool {
+    false
+}
+
+/// Switches the tick made from kernel code (`ring0-preempt`); a subset of
+/// [`PREEMPTIONS`].
+static RING0_PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times the tick took a thread off the CPU in ring 0.
+#[must_use]
+pub fn ring0_preemptions() -> u64 {
+    RING0_PREEMPTIONS.load(Ordering::Relaxed)
 }
 
 /// A **tick-sampled profile**: how many timer ticks found each task slot on the
@@ -1946,6 +1981,19 @@ pub fn finish() -> ! {
 /// `sti` takes effect only after the following instruction, so the `nop` is the
 /// window and a pending tick is recognised at the boundary before `cli`.
 pub fn allow_tick() {
+    // The bracket below is written for `IF` clear: it drops the BKL and arms the
+    // one-shot before the halt, and a tick switching the caller out in between would
+    // halt it later on a stale deadline. A `ring0-preempt` syscall calls this with `IF`
+    // set, so mask for the bracket and give the caller its flag back after: the x86
+    // `wfi`/`irq_window` end in `cli`, and a caller left masked would run the rest of
+    // its syscall unpreemptible behind its back.
+    let saved = akuma_cpu::daif::save_and_mask_irq();
+    allow_tick_masked();
+    akuma_cpu::daif::restore(saved);
+}
+
+/// [`allow_tick`]'s body, entered with `IF` clear.
+fn allow_tick_masked() {
     // **`hlt`, not `nop`, when the tick is what we are waiting for.**
     //
     // This was `sti; nop; cli`: open a one-instruction window, let a pending
@@ -2327,6 +2375,70 @@ extern "C" fn timeout_worker() -> ! {
     block_until_deadline(deadline);
     TIMEOUT_DONE.store(1, Ordering::Release);
     finish();
+}
+
+/// Set by [`ring0_setter`]; the spinner waits for it without ever yielding.
+#[cfg(all(feature = "ring0-preempt", not(feature = "no-tests")))]
+static R0_FLAG: AtomicU64 = AtomicU64::new(0);
+/// [`ring0_spinner`]'s verdict: 1 it saw the flag, 2 it gave up at its deadline.
+#[cfg(all(feature = "ring0-preempt", not(feature = "no-tests")))]
+static R0_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// How long [`ring0_spinner`] spins before it gives up: long enough for many ticks,
+/// short enough that a kernel without ring-0 preemption fails the check rather than
+/// hanging the boot.
+#[cfg(all(feature = "ring0-preempt", not(feature = "no-tests")))]
+const R0_SPIN_US: u64 = 500_000;
+
+/// Spin in ring 0, BKL dropped and `IF` set, until [`R0_FLAG`] — with no yield. On one
+/// core only the tick switching it out lets the setter run.
+#[cfg(all(feature = "ring0-preempt", not(feature = "no-tests")))]
+extern "C" fn ring0_spinner() -> ! {
+    smp::bkl_leave();
+    akuma_cpu::interrupts::on();
+    let deadline = crate::net::uptime_us().saturating_add(R0_SPIN_US);
+    let verdict = loop {
+        if R0_FLAG.load(Ordering::Acquire) != 0 {
+            break 1;
+        }
+        if crate::net::uptime_us() >= deadline {
+            break 2;
+        }
+        core::hint::spin_loop();
+    };
+    akuma_cpu::interrupts::off();
+    smp::bkl_enter();
+    R0_DONE.store(verdict, Ordering::Release);
+    finish();
+}
+
+#[cfg(all(feature = "ring0-preempt", not(feature = "no-tests")))]
+extern "C" fn ring0_setter() -> ! {
+    R0_FLAG.store(1, Ordering::Release);
+    finish();
+}
+
+#[cfg(all(feature = "ring0-preempt", not(feature = "no-tests")))]
+/// `ring0-preempt`: the tick switches a thread out of kernel code that does not hold
+/// the BKL. A spinner that never yields waits for a flag only a second thread sets; on
+/// one core it can see the flag only if the tick took it off the CPU.
+pub fn ring0_preempt_smoke_test(t: &mut Suite) {
+    let before = ring0_preemptions();
+    if spawn(ring0_spinner).is_none() || spawn(ring0_setter).is_none() {
+        t.check("ring0: workers spawned", false);
+        return;
+    }
+    akuma_cpu::interrupts::on();
+    let finished = drive_until(&R0_DONE);
+    akuma_cpu::interrupts::off();
+    t.check(
+        "ring0: a spinning kernel thread is preempted and the flag reaches it",
+        finished && R0_DONE.load(Ordering::Acquire) == 1,
+    );
+    t.note("ring0: preemptions", ring0_preemptions() - before);
+    if smp::online_cpus() == 1 {
+        t.check("ring0: the tick switched ring 0 at least once", ring0_preemptions() > before);
+    }
 }
 
 /// Drive the round-robin until `done`, or until [`DRIVE_LAPS`] laps.

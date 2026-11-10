@@ -3540,14 +3540,13 @@ pub fn wake_is_due(earliest: Option<u64>, now_us: u64) -> bool {
 /// (`docs/archive/AKUMA_AMD64_BKL_NETWORKING.md` 2026-09-20 night).
 #[cfg(hooked_sched)]
 fn x86_yield_now() -> bool {
-    // AArch64: the scheduler tick preempts EL1 code too ([`el1_preemptible`]), so a
-    // voluntary switch must not be interrupted half-way and re-entered from the tick.
-    // Each thread restores the mask it yielded with when it resumes here; one that
-    // yielded from an interrupt was masked already. amd64 never preempts ring 0.
-    #[cfg(target_arch = "aarch64")]
+    // The scheduler tick preempts kernel code ([`el1_preemptible`]; amd64 with
+    // `ring0-preempt`), so a voluntary switch must not be interrupted half-way and
+    // re-entered from the tick. Each thread restores the mask it yielded with when it
+    // resumes here; one that yielded from an interrupt was masked already. On x86 this
+    // is `pushfq; cli` .. `popfq`, a no-op for the ring 0 that runs with `IF` clear.
     let daif = akuma_primitives::irq::irq_save_mask();
     let switched = x86_yield_locked();
-    #[cfg(target_arch = "aarch64")]
     akuma_primitives::irq::irq_restore(daif);
     switched
 }

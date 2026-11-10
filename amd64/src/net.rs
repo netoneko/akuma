@@ -913,6 +913,9 @@ pub fn print_probe_line(now_us: u64, laps: u64) {
     serial::put_dec(akuma_net::smoltcp_net::nic_irq_count());
     serial::puts(" laps=");
     serial::put_dec(laps);
+    // Timer switches out of kernel code (`ring0-preempt`; 0 without it).
+    serial::puts(" r0pre=");
+    serial::put_dec(crate::sched::ring0_preemptions());
     // The tick-sampled profile: who is actually on the CPU. Three slots and the
     // idle count are enough to tell "one thread is spinning" from "the machine
     // is asleep", which is the question a 100%-busy vCPU poses.

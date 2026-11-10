@@ -1101,3 +1101,33 @@ Extreme-size, 8 MB, HVF: idle host CPU 0.4 %.
 - The SMP=4 sleep-wake p99 is 2.3 ms.
 
 Both are worth an A/B before the SGI path goes.
+
+## amd64 ring 0 preempts outside the BKL (2026-11-11)
+
+New feature `ring0-preempt`, off by default. Write-up: `docs/archive/AMD64_RING0_PREEMPTION.md`.
+
+What it does:
+
+- amd64 syscalls run with `IF` set once they hold the BKL.
+- The timer switches kernel code under AArch64's `el1_preemptible` gate, plus one extra condition:
+  this core does not hold the BKL.
+- The shared `x86_yield_now` now masks interrupts on both architectures.
+
+What it found: the old reason in `sched.rs`, a heap spinlock, was out of date. The real reason ring
+0 was never preempted is that `IA32_FMASK` kept every syscall masked.
+
+TCG results:
+
+| build | SMP=1 | SMP=2 | SMP=4 |
+|---|---|---|---|
+| default | 829/0 | 839/0 | 839/0 |
+| `ring0-preempt` | 831/0 | 841/0 | 841/0 |
+
+The two extra checks in the `ring0-preempt` build are a new one-core boot check: a ring-0 spinner
+that never yields waits for a flag only another thread can set. Its negative control (the gate
+forced `false`) fails both checks.
+
+**Open:**
+
+- Preemption with the BKL held, as AArch64 does, needs an audit of amd64's own BKL sections.
+- KVM gates are still to run.
