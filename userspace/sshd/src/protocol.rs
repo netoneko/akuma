@@ -803,12 +803,39 @@ fn cook_output(data: &[u8], pty: bool) -> Vec<u8> {
 /// ours will interrupt.
 fn teardown_child(pid: u32, stdout_fd: u32, stdin_fd: i32) {
     kill_signal(pid, SIGKILL);
+    // The shell's own group too (`kill(-pgid)`, served by the amd64 kernel):
+    // a `sleep` or `tail -f` it started would otherwise outlive the session.
+    // ESRCH when the child is not a group leader, EPERM on kernels without
+    // group kill — both fine, the direct kill above already went out.
+    let _ = kill_signal(session_policy::group_signal_target(pid), SIGKILL);
+    // Closing a pty master also hangs the terminal up (SIGHUP + SIGCONT to the
+    // session and foreground group), which is what OpenSSH relies on.
     close(stdout_fd as i32);
     if stdin_fd >= 0 {
         close(stdin_fd);
     }
+    reap_child(pid);
 }
 
+/// Wait (bounded) for a SIGKILLed child and reap it, as OpenSSH's SIGCHLD
+/// handler does, so a torn-down session never leaves a zombie behind.
+/// `SIGKILL` delivery is asynchronous, so a single `waitpid` right after the
+/// kill usually sees "still running"; poll briefly. Blocking `sleep_ms` is fine
+/// here: each session is its own forked process, not a shared executor.
+fn reap_child(pid: u32) {
+    const REAP_POLLS: u32 = 500;
+    for _ in 0..REAP_POLLS {
+        if waitpid_status(pid).is_some() {
+            return;
+        }
+        sleep_ms(2);
+    }
+    eprintln(&format!("[SSHD] child pid {} did not exit after SIGKILL; not reaped", pid));
+}
+
+/// Runs the bridge; if it ends in an error (a send to a client that is gone —
+/// every `?` inside means that) the child has not been reaped, so kill and reap
+/// it here rather than orphaning it when the session process exits.
 async fn bridge_process(
     stream: &mut SshStream,
     session: &mut SshSession,
@@ -817,6 +844,24 @@ async fn bridge_process(
     child_stdin: Option<u32>,
     pty: bool,
 ) -> Result<(), NetError> {
+    match bridge_process_inner(stream, session, pid, stdout_fd, child_stdin, pty).await {
+        Ok(report) => report,
+        Err(e) => {
+            // stdin fd (if the bridge opened it) is closed by process exit.
+            teardown_child(pid, stdout_fd, -1);
+            Err(e)
+        }
+    }
+}
+
+async fn bridge_process_inner(
+    stream: &mut SshStream,
+    session: &mut SshSession,
+    pid: u32,
+    stdout_fd: u32,
+    child_stdin: Option<u32>,
+    pty: bool,
+) -> Result<Result<(), NetError>, NetError> {
     let mut buf = [0u8; 1024];
 
     // The child's stdin, two ways. A `linux-abi` spawn hands us the write end
@@ -926,7 +971,7 @@ async fn bridge_process(
                     if session.watch.probe_outstanding { "un" } else { "" },
                 ));
                 teardown_child(pid, stdout_fd, stdin_fd);
-                return Ok(());
+                return Ok(Ok(()));
             }
         }
 
@@ -971,7 +1016,7 @@ async fn bridge_process(
                         pid, e
                     ));
                     teardown_child(pid, stdout_fd, stdin_fd);
-                    return Ok(());
+                    return Ok(Ok(()));
                 }
             }
 
@@ -1095,7 +1140,8 @@ async fn bridge_process(
 
     // Only now that the fds are released (so a write error can't leak them via
     // `?`) tell the client how the command ended.
-    send_exit_report(stream, session, status).await
+    // Child already reaped: a failure here must not trigger teardown.
+    Ok(send_exit_report(stream, session, status).await)
 }
 
 /// RFC 4254 §6.10: report how the command ended, then tear the channel down

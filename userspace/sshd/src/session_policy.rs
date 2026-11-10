@@ -169,6 +169,14 @@ impl SessionWatch {
     }
 }
 
+/// The `pid` argument that makes `kill(2)` address the process group led by
+/// `pid` (`kill(-pgid, sig)`), as the 32-bit two's complement the syscall
+/// ABI carries. `0` and `1` would mean "own group" / init, so they map to
+/// themselves' unreachable neighbour: `u32::MAX`-free, and callers never pass them.
+pub fn group_signal_target(pid: u32) -> u32 {
+    (-(pid as i32)) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +309,13 @@ mod tests {
         assert_eq!(watch.connected_ms, 42);
         assert_eq!(watch.last_activity_ms, 42);
         assert!(!watch.probe_outstanding);
+    }
+
+    #[test]
+    fn group_target_is_negated_pid() {
+        assert_eq!((group_signal_target(53) as i32), -53);
+        assert_eq!(group_signal_target(53), 0xffff_ffcb);
+        // The amd64 kernel recovers the sign by truncating the register to 32 bits.
+        assert_eq!((u64::from(group_signal_target(53)) as u32) as i32, -53);
     }
 }

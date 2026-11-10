@@ -13,6 +13,11 @@
 /// (a probe reply is just another packet — no reply-specific tracking is
 /// needed, per RFC 4254 §4 a server answers an unknown `want_reply` request
 /// with `SSH_MSG_REQUEST_FAILURE`).
+/// Default probe interval (5 s) and tolerated unanswered probes (2): a dead
+/// connection is declared after `interval * (count_max + 1)` = 15 s of silence.
+pub const DEFAULT_ALIVE_INTERVAL_MS: u64 = 5_000;
+pub const DEFAULT_ALIVE_COUNT_MAX: u32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keepalive {
     /// Probe after this much inbound silence. `0` disables keepalive.
@@ -179,5 +184,17 @@ mod tests {
         assert!(!should_retry(4, 3));
         // Reconnect disabled entirely: a single attempt never retries.
         assert!(!should_retry(1, 1));
+    }
+
+    #[test]
+    fn default_detection_budget_is_short() {
+        let budget = DEFAULT_ALIVE_INTERVAL_MS * (u64::from(DEFAULT_ALIVE_COUNT_MAX) + 1);
+        assert!(budget <= 20_000, "dead-peer detection takes {budget} ms");
+        let mut k = Keepalive::new(DEFAULT_ALIVE_INTERVAL_MS, DEFAULT_ALIVE_COUNT_MAX);
+        let mut probes = 0;
+        while k.on_probe_sent() != ProbeOutcome::Dead {
+            probes += 1;
+        }
+        assert_eq!(probes + 1, 3);
     }
 }
