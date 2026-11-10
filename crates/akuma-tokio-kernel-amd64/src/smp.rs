@@ -214,7 +214,7 @@ pub fn park_halt() {
     let me = akuma_ring3_amd64::cpu_index();
     bkl_unlocked(|| {
         HALTED[me].store(true, Ordering::SeqCst);
-        if !akuma_threading::x86_runnable_exists() {
+        if !akuma_threading::runnable_exists() {
             akuma_cpu::park::wfi();
         }
         HALTED[me].store(false, Ordering::SeqCst);

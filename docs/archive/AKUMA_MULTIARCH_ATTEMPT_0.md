@@ -1225,3 +1225,25 @@ asm-reachable SGI code was traced and removed by hand, since `dead_code` cannot 
 
 The extreme run's single SEGV is the `/tmp/h` tcc-hello fault, which the pre-deletion hooked
 baseline shows identically. It is not a regression.
+
+## The scheduler surface loses its `x86_` prefix (2026-11-11)
+
+The switch, picker and spawn surface in `akuma-threading` had been named for the target it was
+first written for. Both kernels now run it, so the prefix said something false.
+
+- `X86ArchHooks` → `ArchHooks`, `register_x86_arch_hooks` → `register_arch_hooks`.
+- `x86_<name>` → `<name>` for the picker, wake pass, slot lifecycle and debug readers
+  (`claim_slot`, `seed_entry`, `pick_next`, `wake_pass`, `runnable_exists`, `earliest_wake_time`, ...).
+- `x86_publish` → `publish_slot` and `x86_abandon` → `abandon_slot`, to read beside `claim_slot`.
+- `x86_yield` (public, `-> bool`) and the private `x86_yield_now` were the same function; they
+  are now one `pub fn try_yield() -> bool`, and `yield_now()` calls it.
+- Kept: `x86_check_incoming_frame` and the `akuma_threading_x86_switch_context` asm symbol,
+  which are genuinely x86.
+
+Deleted with it: `YIELD_WITH_IRQS_MASKED` and its two DAIF boot tests. Only the SGI path ever
+incremented the counter, so one test was already skipped and the other asserted that a dead
+counter stays zero.
+
+Gates: clippy clean for default, devbox-smoltcp, amd64 (base and `ring0-preempt`), taoxichuan
+(both arches) and shanghai. Host tests pass; unsafe 414, addr 700. Boot suite 322/0 at SMP=2 and
+320/0 at SMP=4; amd64 TCG 839/0, and 841/0 with `ring0-preempt`.

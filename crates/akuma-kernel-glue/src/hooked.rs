@@ -1,8 +1,8 @@
-//! The hooked scheduler's machine half for the AArch64 root kernel (`hooked-sched`, M6).
+//! The scheduler's machine half for the AArch64 root kernel.
 //!
 //! `akuma-threading`'s hooked path — the one amd64 and the tokio kernels run — switches
 //! threads inside an ordinary call and asks the kernel for the machine effects through
-//! `X86ArchHooks` (the name is the path's, not the ISA's). This module is that table for
+//! `ArchHooks`. This module is that table for
 //! this kernel, its idle threads and its EL0 entry. The trap front end that feeds it is
 //! `akuma_entry::hooked` (`akuma-vectors-aarch64`, D4 in
 //! `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`).
@@ -20,8 +20,8 @@
 //! other threads have run on the core, and each of those set the register on its way to
 //! EL0; without a per-switch save the epilogue stamped the last one's TLS into this
 //! thread's frame. A two-thread program SIGSEGVed on its first `pthread_join`, with the
-//! exited thread's (already unmapped) TLS as its own. The SGI scheduler's IRQ entry saves
-//! the register around every switch, which is why only this path had it.
+//! exited thread's (already unmapped) TLS as its own. The deleted SGI scheduler's IRQ entry
+//! saved the register around every switch, which is why only this path had it.
 //!
 //! # The page-table root, per slot
 //!
@@ -44,7 +44,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use akuma_exec::process::UserContext;
-use akuma_exec::threading::{self, X86ArchHooks};
+use akuma_exec::threading::{self, ArchHooks};
 use akuma_exec_core::thread::{MAX_CORES, MAX_THREADS, thread_state};
 use akuma_primitives::safe_print;
 use akuma_vectors_aarch64::Frame;
@@ -205,8 +205,8 @@ fn read_user_context(slot: usize) -> Option<UserContext> {
     threading::published_user_context(slot)
 }
 
-fn hooks() -> X86ArchHooks {
-    X86ArchHooks {
+fn hooks() -> ArchHooks {
+    ArchHooks {
         switch_to,
         current_slot,
         set_current_slot,
@@ -272,10 +272,10 @@ extern "C" fn idle_main() -> ! {
         // The collector, not the x86 reaper: this kernel's process teardown is its cleanup
         // callback, which the reaper does not run (`akuma-threading/collector-recycles`).
         threading::reclaim_terminated_slots();
-        let due = threading::wake_is_due(threading::x86_earliest_wake_time(), crate::timer::uptime_us());
-        let ran = (due || threading::x86_runnable_exists()) && threading::x86_yield();
+        let due = threading::wake_is_due(threading::earliest_wake_time(), crate::timer::uptime_us());
+        let ran = (due || threading::runnable_exists()) && threading::try_yield();
         akuma_exec::bkl::leave_kernel();
-        if !ran && !threading::x86_runnable_exists() {
+        if !ran && !threading::runnable_exists() {
             // Take the halt out of this slot's CPU bill, as amd64's idle loop does: the
             // switch bills a slot for its whole residency, so without it every second this
             // core slept was `user` time in `/proc/stat` and `top` showed it pegged.
@@ -287,7 +287,7 @@ extern "C" fn idle_main() -> ! {
             // cap bounds how late one fires. New work arrives by SGI (`ThreadWaker::wake`,
             // the netpoll doorbell), which ends the halt like any interrupt.
             let mut deadline = entered.saturating_add(IDLE_HALT_MAX_US);
-            if let Some(w) = threading::x86_earliest_wake_time() {
+            if let Some(w) = threading::earliest_wake_time() {
                 deadline = deadline.min(w);
             }
             if let Some(a) = akuma_exec::alarms::next_deadline() {
@@ -307,7 +307,7 @@ extern "C" fn idle_main() -> ! {
 /// running, so no peer can resume it before this core first switches away.
 #[cfg(kernel_smp_shared)]
 fn adopt_secondary(core: usize, base: akuma_primitives::addr::VirtAddr, size: usize) -> Option<usize> {
-    let slot = threading::x86_adopt_core_idle(core, base, size)?;
+    let slot = threading::adopt_core_idle(core, base, size)?;
     mark_idle(core, slot);
     safe_print!(64, "[hooked] core {} online, idle thread is slot {}\n", core, slot);
     Some(slot)
@@ -328,10 +328,10 @@ fn mark_idle(core: usize, slot: usize) {
 /// idle thread. After `threading::init` (the slot table) and before any thread but the
 /// boot thread runs.
 pub fn init() {
-    threading::register_x86_arch_hooks(hooks());
+    threading::register_arch_hooks(hooks());
     threading::register_saved_root_probe(saved_root_probe);
     set_current_slot(0);
-    let Some(idle) = threading::x86_claim_slot() else {
+    let Some(idle) = threading::claim_slot() else {
         safe_print!(64, "[FATAL] hooked: no slot for core 0's idle thread\n");
         loop {
             akuma_cpu::park::wfi();
@@ -344,8 +344,8 @@ pub fn init() {
         }
     };
     mark_idle(0, idle);
-    threading::x86_seed_entry(idle, top, idle_main);
-    threading::x86_publish(idle);
+    threading::seed_entry(idle, top, idle_main);
+    threading::publish_slot(idle);
     #[cfg(kernel_smp_shared)]
     akuma_entry::smp_shared::register_hooked_secondary(akuma_entry::smp_shared::HookedSecondary {
         adopt: adopt_secondary,

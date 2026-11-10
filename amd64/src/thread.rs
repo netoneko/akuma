@@ -486,7 +486,7 @@ fn teardown(slot: usize) {
     // The other kernel does this from `akuma_exec::process::on_thread_cleanup`,
     // registered as `threading::set_cleanup_callback` and run when a thread slot
     // is recycled. That callback never fires here, because x86 slots are
-    // recycled by `x86_claim_slot` taking a `TERMINATED` one directly rather
+    // recycled by `claim_slot` taking a `TERMINATED` one directly rather
     // than through the crate's collector — so the release has to happen at the
     // one point this target *does* know a thread is finished, which is here.
     //
@@ -590,7 +590,7 @@ fn wake_group(proc_slot: usize) {
             .map(|p| p.tgid);
         let stale = match owner_tgid {
             Some(tg) => my_tgid.is_some_and(|mine| mine != tg),
-            None => !akuma_threading::x86_slot_is_live(t.task),
+            None => !akuma_threading::slot_is_live(t.task),
         };
         if stale {
             THREADS.lock()[i] = None;

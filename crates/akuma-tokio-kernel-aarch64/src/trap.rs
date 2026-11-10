@@ -80,7 +80,7 @@ fn irq_locked(f: &Frame) {
     // coming back later resumes it exactly. A tick in the kernel (an idle
     // window) only counts.
     if tick && f.from_el0() {
-        let _ = akuma_threading::x86_yield();
+        let _ = akuma_threading::try_yield();
         if akuma_tokio_kernel_core::proc::kill_requested::<Aarch64>() {
             akuma_tokio_kernel_core::proc::finish_killed::<Aarch64>();
         }

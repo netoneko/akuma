@@ -414,7 +414,7 @@ private numbers (315-318, 324, 325) to `akuma-syscalls-glue` from
   (`set_eager_path_loads`) — amd64's `#PF` handler does not serve `LazyRegionMap`.
 - **Threads**: a `spawn_ext` thread is created through
   `spawn_user_closure_initializing` so it gets a trap stack. A new way to create
-  a user thread on x86_64 must call `X86ArchHooks::prepare_task_slot`.
+  a user thread on x86_64 must call `ArchHooks::prepare_task_slot`.
 - **Stacks**: kernel stacks are 32 KiB with no guard page. Do not hold `Process`
   by value more than necessary; its big arrays live on the heap.
 - **Signals/kill**: `kill_box` kills members through `set_box_member_killer`

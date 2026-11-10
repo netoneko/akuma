@@ -18,8 +18,8 @@ fi
 TMR=$(grep -c '^\[TMR\]' "$LOG" || true)
 T0=$(grep -c '^\[Thread0\]' "$LOG" || true)
 # SCHED warnings emitted *after* the DAIF test section are real regressions.
-# The DAIF tests deliberately trigger one warning (test_yield_now_detects_masked_yield),
-# so we exclude warnings before "DAIF tests complete" from the regression count.
+# Warnings before "DAIF tests complete" are excluded from the regression count (the
+# masked-yield test that used to trigger one went with the SGI scheduler).
 SCHED_TOTAL=$(grep -c '\[SCHED\] WARNING' "$LOG" || true)
 if grep -q 'DAIF tests complete' "$LOG"; then
     SCHED=$(awk '/DAIF tests complete/{found=1; next} found && /\[SCHED\] WARNING/{n++} END{print n+0}' "$LOG")
@@ -28,7 +28,7 @@ else
 fi
 HEARTBEAT=$(grep -c '^\[Heartbeat\]' "$LOG" || true)
 NEG=$(grep -cE 'PANIC:|FATAL|UNHANDLED EXCEPTION|kernel panic|BUG:|0xBAD[0-9A-Fa-f]*\b' "$LOG" || true)
-DAIF_TEST_PASSES=$(grep -c '\[PASS\] test_irq_guard\|\[PASS\] test_nested_irq\|\[PASS\] test_with_irqs\|\[PASS\] test_yield_now' "$LOG" || true)
+DAIF_TEST_PASSES=$(grep -c '\[PASS\] test_irq_guard\|\[PASS\] test_nested_irq\|\[PASS\] test_with_irqs\|\[PASS\] test_runtime_is_lock_free' "$LOG" || true)
 LAST_TMR=$(grep '^\[TMR\]' "$LOG" | tail -1 || true)
 LAST_T0=$(grep '^\[Thread0\]' "$LOG" | tail -1 || true)
 

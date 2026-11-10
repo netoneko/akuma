@@ -1,5 +1,5 @@
 //! The hooked scheduler's machine half on aarch64: `akuma-threading`'s
-//! `X86ArchHooks` (the name is the hooked path's, not the ISA's), the thread
+//! `ArchHooks` (the name is the hooked path's, not the ISA's), the thread
 //! runtime and process hooks, and the idle thread.
 //!
 //! What a switch must install here is small. An EL0 trap saves the whole user
@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use akuma_exec::process::UserContext;
 use akuma_primitives::cell::BorrowCell;
 use akuma_primitives::safe_print;
-use akuma_threading::{ProcessHooks, ThreadConfig, ThreadRuntime, X86ArchHooks};
+use akuma_threading::{ProcessHooks, ThreadConfig, ThreadRuntime, ArchHooks};
 use akuma_tokio_kernel_core::proc;
 use akuma_vectors_aarch64::Frame;
 
@@ -172,8 +172,8 @@ fn read_user_context(slot: usize) -> Option<UserContext> {
     UCTX.with(|u| u.get(slot).copied().flatten())
 }
 
-fn hooks() -> X86ArchHooks {
-    X86ArchHooks {
+fn hooks() -> ArchHooks {
+    ArchHooks {
         switch_to,
         current_slot,
         set_current_slot,
@@ -198,11 +198,11 @@ pub extern "C" fn idle_main() -> ! {
         crate::net::netpoll();
         crate::smp::leave();
         akuma_cpu::park::irq_window();
-        let due = akuma_threading::wake_is_due(akuma_threading::x86_earliest_wake_time(), crate::fs::uptime_us());
-        if due || akuma_threading::x86_runnable_exists() {
+        let due = akuma_threading::wake_is_due(akuma_threading::earliest_wake_time(), crate::fs::uptime_us());
+        if due || akuma_threading::runnable_exists() {
             // The pick and the switch read the shared slot and task tables.
             crate::smp::enter();
-            akuma_threading::x86_yield();
+            akuma_threading::try_yield();
             crate::smp::leave();
         } else {
             crate::smp::park_halt();
@@ -216,7 +216,7 @@ pub extern "C" fn idle_main() -> ! {
 pub fn adopt_idle(cpu: usize) {
     let idle = idle_tid(cpu);
     IDLE[idle].store(true, Relaxed);
-    akuma_threading::x86_adopt_running_thread(idle);
+    akuma_threading::adopt_running_thread(idle);
 }
 
 /// Register the scheduler's tables and seed core 0's idle thread. After the
@@ -260,7 +260,7 @@ pub fn init() {
         proc_dump_info: |_| None,
         dump_orphan_processes: || {},
     });
-    akuma_threading::register_x86_arch_hooks(hooks());
+    akuma_threading::register_arch_hooks(hooks());
     set_current_slot(0);
     let idle = idle_tid(0);
     let Some(top) = prepare(idle) else {
@@ -268,7 +268,7 @@ pub fn init() {
         crate::halt();
     };
     IDLE[idle].store(true, Relaxed);
-    akuma_threading::x86_seed_entry(idle, top, idle_main);
-    akuma_threading::x86_publish(idle);
+    akuma_threading::seed_entry(idle, top, idle_main);
+    akuma_threading::publish_slot(idle);
     akuma_user_access::set_prefault_hook(akuma_tokio_kernel_core::lazy::prefault::<crate::mm::Aarch64>);
 }

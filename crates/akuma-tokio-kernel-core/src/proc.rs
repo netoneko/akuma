@@ -207,7 +207,7 @@ const INIT_RUNNING: u64 = u64::MAX;
 /// machine seeds it to cross into the image and publishes it.
 #[must_use]
 pub fn bind_init<M: Proc>(path: &str, ti: &TaskImage) -> Option<usize> {
-    let tid = akuma_threading::x86_claim_slot()?;
+    let tid = akuma_threading::claim_slot()?;
     if let Err(msg) = bind_child_task::<M>(tid, 1, ti.root_pa, false) {
         safe_print!(160, "  [init] bind refused: {}\n", msg);
         return None;
@@ -293,7 +293,7 @@ pub fn task_exit_code<M: Proc>(code: i32) -> ! {
     let cur = M::current_slot();
     let lead = group_leader(cur);
     // The zombie keeps its thread slot until the parent's wait4: without the
-    // hold `x86_claim_slot` hands the TERMINATED slot to the next fork while
+    // hold `claim_slot` hands the TERMINATED slot to the next fork while
     // the pid is still waitable. Glue's reap releases it. Taken before the
     // siblings stop: their waits release the kernel lock, and a leader stopped
     // by then is a TERMINATED slot a fork on another core could claim.
@@ -325,7 +325,7 @@ pub fn task_exit_code<M: Proc>(code: i32) -> ! {
         akuma_syscalls_glue::futex_purge_tid(lead);
         akuma_threading::mark_thread_terminated(lead);
     }
-    akuma_threading::x86_finish_current()
+    akuma_threading::finish_current()
 }
 
 /// The slot that owns the process `cur` belongs to: the one whose pid is the
@@ -345,7 +345,7 @@ fn group_leader(cur: usize) -> usize {
 /// `lead` included.
 ///
 /// A thread is ended in place only while this core holds its `ON_CPU` gate
-/// (`x86_hold_off_cpu`): then it is not executing and no core can pick it. The
+/// (`hold_off_cpu`): then it is not executing and no core can pick it. The
 /// state word cannot answer "is it running": a READY thread another core has
 /// just claimed is being switched in, and marking it TERMINATED did not stop it.
 /// It ran on in user mode under a root the reap then freed, and its stores
@@ -402,7 +402,7 @@ pub fn kill_siblings<M: Proc>(cur: usize, lead: usize) {
 /// End thread `s` (pid `spid`) where it stands if no core is executing it:
 /// `false` when it is on a core. The leader keeps its slot and `Process`.
 fn stop_in_place(s: usize, spid: u32, leader: bool) -> bool {
-    if !akuma_threading::x86_hold_off_cpu(s) {
+    if !akuma_threading::hold_off_cpu(s) {
         return false;
     }
     let _ = akuma_threading::take_kill_request_via_tid(s);
@@ -414,8 +414,8 @@ fn stop_in_place(s: usize, spid: u32, leader: bool) -> bool {
         });
     }
     akuma_threading::mark_thread_terminated(s);
-    // TERMINATED now: `x86_pick_next` skips it with the gate open.
-    akuma_threading::x86_release_on_cpu(s);
+    // TERMINATED now: `pick_next` skips it with the gate open.
+    akuma_threading::release_on_cpu(s);
     if !leader {
         retire_thread_process(spid);
     }
@@ -438,7 +438,7 @@ pub fn finish_killed<M: Proc>() -> ! {
     // The leader, stopped by a sibling's `exit_group`: its slot and `Process`
     // stay for the status that sibling publishes.
     if slot_pid(cur) == slot_tgid(cur) {
-        akuma_threading::x86_finish_current()
+        akuma_threading::finish_current()
     }
     let pid = with_slots(|s| {
         s[cur].running = false;
@@ -446,7 +446,7 @@ pub fn finish_killed<M: Proc>() -> ! {
         s[cur].pid
     });
     retire_thread_process(pid);
-    akuma_threading::x86_finish_current()
+    akuma_threading::finish_current()
 }
 
 /// Take a dead thread's registered `Process` out of the process table. Retire
@@ -474,7 +474,7 @@ pub fn task_exit_thread<M: Proc>() -> ! {
         s[cur].pid
     });
     retire_thread_process(pid);
-    akuma_threading::x86_finish_current()
+    akuma_threading::finish_current()
 }
 
 // ---------------------------------------------------------------------------

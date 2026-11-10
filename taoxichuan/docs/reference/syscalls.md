@@ -99,7 +99,7 @@ Every arm `dispatch_inner` keeps after the steps above:
 | 26 | `msync` | `msync_arm` (lib.rs) | writes a writable `MAP_SHARED` file mapping back to its file |
 | 28 | `madvise` | `madvise_arm` (lib.rs) | `akuma-syscalls-mem` decode; `MADV_DONTNEED` zeroes the mmap-slab pages (a frame a fork peer maps is replaced, not zeroed); `MADV_FREE` is `EINVAL` |
 | 25 | `mremap` | dispatch (lib.rs) | shrink frees the tail; grow in place at the slab top, else move and copy; `MREMAP_FIXED` refused |
-| 24 | `sched_yield` | dispatch (lib.rs) | `akuma_threading::x86_yield` when another thread is runnable |
+| 24 | `sched_yield` | dispatch (lib.rs) | `akuma_threading::try_yield` when another thread is runnable |
 | 130, 127 | `rt_sigsuspend`, `rt_sigpending` | glue, called directly | glue's arms, as on the other kernels |
 | 34 | `pause` | `akuma_syscalls_glue::sys_pause` | |
 | 15 | `rt_sigreturn` | `child::sigreturn_arm` | restores the frame `push_handler` saved |

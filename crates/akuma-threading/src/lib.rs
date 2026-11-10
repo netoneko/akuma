@@ -1246,7 +1246,7 @@ static SLOT_HELD_BY: [AtomicU32; MAX_THREADS] = {
 /// occupant runs on it, so a `kill`, `unregister` or `exit_group` aimed at the
 /// zombie can land on the newcomer, and every `thread_id` table scan finds the
 /// zombie (`[TRAMP-MISMATCH] … table scan found <dead pid>`). amd64 reissued a
-/// slot the moment its last thread finished (`x86_claim_slot` takes a
+/// slot the moment its last thread finished (`claim_slot` takes a
 /// `TERMINATED` slot directly) — 2026-10-16, ryzen,
 /// `docs/archive/AKUMA_STALE_TID_ZOMBIE_SLOT.md`. Like a Linux pid, the tid is
 /// now not reused until the zombie is gone.
@@ -1287,7 +1287,7 @@ pub fn slot_held_by(slot: usize) -> u32 {
 
 /// May a slot in `state`, with `on_cpu`, held by `held_by`, be given to a new
 /// thread? `FREE`, or `TERMINATED` with no core still on its stack — and in both
-/// cases not held by an unreaped zombie. The one rule [`x86_claim_slot`] and the
+/// cases not held by an unreaped zombie. The one rule [`claim_slot`] and the
 /// x86 reaper both apply; pure so the host tests can pin it.
 #[must_use]
 pub fn slot_reusable(state: u8, on_cpu: u8, held_by: u32) -> bool {
@@ -1432,7 +1432,7 @@ pub fn set_itimer(tid: usize, deadline: u64, interval: u64) {
 
 
 /// x86_64: the identity lives in the target's per-CPU block, and the switch
-/// already publishes it through [`X86ArchHooks::set_current_slot`] before
+/// already publishes it through [`ArchHooks::set_current_slot`] before
 /// handing the stack over. Forwarded here too so the two spellings cannot
 /// disagree — every AArch64 path that re-points the current thread has an
 /// x86 counterpart that must do the same, and a silent no-op is how
@@ -1440,7 +1440,7 @@ pub fn set_itimer(tid: usize, deadline: u64, interval: u64) {
 #[cfg(target_os = "none")]
 #[inline]
 fn set_current_thread_register(tid: usize) {
-    if let Some(h) = X86_ARCH_HOOKS.get() {
+    if let Some(h) = ARCH_HOOKS.get() {
         (h.set_current_slot)(tid);
     }
 }
@@ -1466,10 +1466,10 @@ fn get_current_thread_register() -> usize {
     // "the worker is parked" [FAIL] while the worker ran merrily on.
     //
     // The identity lives in the target's per-CPU block instead (`%gs`), which
-    // is what [`X86ArchHooks::current_slot`] reads. `.get()` rather than
+    // is what [`ArchHooks::current_slot`] reads. `.get()` rather than
     // `require()`: this is called from diagnostics that can run before
     // registration, and answering 0 there is the same answer the register gave.
-    match X86_ARCH_HOOKS.get() {
+    match ARCH_HOOKS.get() {
         Some(h) => (h.current_slot)(),
         None => IDLE_THREAD_IDX,
     }
@@ -1605,7 +1605,7 @@ fn ensure_slot_stack(slot_idx: usize, size: usize) -> bool {
 
 /// The top of `slot`'s pool stack, allocated now if the slot has none (16-byte aligned).
 ///
-/// `X86ArchHooks::prepare_task_slot` for a hooked kernel whose kernel stacks are this pool's —
+/// `ArchHooks::prepare_task_slot` for a hooked kernel whose kernel stacks are this pool's —
 /// the AArch64 root kernel under `hooked-sched` (amd64 keeps its own per-slot pair). The whole
 /// stack is the thread's: the hooked path has no separate exception area, the EL0 trap frame
 /// lands at the top. `None` when the slot is out of range or the PMM cannot back the stack.
@@ -1626,12 +1626,12 @@ pub fn ensure_pool_stack_top(slot: usize, size: usize) -> Option<usize> {
 /// it is latched running. The caller marks the slot unpickable (its `can_run`) before
 /// this core can first switch away from it. Call with interrupts masked, once per core.
 #[cfg(target_os = "none")]
-pub fn x86_adopt_core_idle(
+pub fn adopt_core_idle(
     core_id: usize,
     stack_base: akuma_primitives::addr::VirtAddr,
     stack_size: usize,
 ) -> Option<usize> {
-    let slot = x86_claim_slot()?;
+    let slot = claim_slot()?;
     with_irqs_disabled(|| {
         POOL.lock().stacks[slot] = StackInfo::new(stack_base.get(), stack_size);
     });
@@ -1640,7 +1640,7 @@ pub fn x86_adopt_core_idle(
     }
     register_core_idle(core_id, slot);
     (arch().set_current_slot)(slot);
-    x86_adopt_running_thread(slot);
+    adopt_running_thread(slot);
     Some(slot)
 }
 
@@ -1926,19 +1926,19 @@ impl ThreadPool {
     ///
     /// * **No `self`, and it must be called without the pool lock.** The slot
     ///   table this claims from is the crate's lock-free `THREAD_STATES`
-    ///   ([`x86_claim_slot`]), so the lock buys nothing — and the stack comes
-    ///   from [`X86ArchHooks::prepare_task_slot`], which on the AArch64 root
+    ///   ([`claim_slot`]), so the lock buys nothing — and the stack comes
+    ///   from [`ArchHooks::prepare_task_slot`], which on the AArch64 root
     ///   kernel under `hooked-sched` *is* this pool (`ensure_pool_stack_top`)
     ///   and takes `POOL` itself. It was a `&mut self` method called under the
     ///   lock until 2026-11-10, which deadlocked that kernel's first `spawn_fn`
     ///   on the non-reentrant spinlock; amd64's stacks are its own, so it never
     ///   showed there.
-    /// * **Stacks come from the target** ([`X86ArchHooks::prepare_task_slot`]),
+    /// * **Stacks come from the target** ([`ArchHooks::prepare_task_slot`]),
     ///   because `amd64` owns them per slot and reuses a recycled slot's pair.
     /// * **Exhaustion is final, and the error string says so.**
     ///   [`spawn_user_thread_initializing`] answers `"No free user thread
     ///   slots"` with a reclaim-and-retry pass; that pass exists to move
-    ///   cooled-down `TERMINATED` slots to `FREE`, and [`x86_claim_slot`]
+    ///   cooled-down `TERMINATED` slots to `FREE`, and [`claim_slot`]
     ///   already takes a `TERMINATED` slot no core is executing. There is
     ///   nothing left for it to free — the stack-return half is
     ///   `kernel_profile_extreme`, i.e. AArch64's — so a distinct string opts
@@ -1947,18 +1947,18 @@ impl ThreadPool {
         trampoline_addr: u64,
         closure_ptr: *mut (),
     ) -> Result<usize, &'static str> {
-        let slot = x86_claim_slot().ok_or("No free x86 task slots")?;
+        let slot = claim_slot().ok_or("No free x86 task slots")?;
 
         let Some(stack_top) = (arch().prepare_task_slot)(slot) else {
             // `TERMINATED`, not `FREE` — the slot may already own one of the
-            // two stacks, and `x86_abandon` is what says "reusable, but not
+            // two stacks, and `abandon_slot` is what says "reusable, but not
             // pristine". Same reasoning as `amd64::sched::abandon_unpublished`.
-            x86_abandon(slot);
+            abandon_slot(slot);
             return Err("Failed to allocate x86 task stacks");
         };
 
         // The slot is INITIALIZING, so no picker can select it and no switch can be reading its
-        // context concurrently - the same obligation `x86_seed_entry` documents, which this is the
+        // context concurrently - the same obligation `seed_entry` documents, which this is the
         // closure-carrying variant of.
         akuma_switch::set(slot, akuma_switch::build_closure_context(stack_top, trampoline_addr, closure_ptr as u64));
 
@@ -1983,15 +1983,15 @@ impl ThreadPool {
 /// for their own claim path.** AArch64 stores `FREE`, matching what
 /// `spawn_user_closure_initializing` already does when its own stack
 /// allocation fails: the stack went back to the PMM, so the slot is pristine.
-/// x86_64 stores `TERMINATED` ([`x86_abandon`]), because on that target the
+/// x86_64 stores `TERMINATED` ([`abandon_slot`]), because on that target the
 /// slot owns two leaked 32 KiB stacks that its next occupant reuses — handing
-/// it back as pristine would leak the pair — and [`x86_claim_slot`] treats a
+/// it back as pristine would leak the pair — and [`claim_slot`] treats a
 /// `TERMINATED` slot no core is executing as claimable anyway.
 ///
 /// Off both kernels this is a no-op: there is no slot table on a host.
 pub fn release_initializing_thread(tid: usize) {
     #[cfg(target_os = "none")]
-    x86_abandon(tid);
+    abandon_slot(tid);
     #[cfg(not(target_os = "none"))]
     {
         let _ = tid;
@@ -2511,23 +2511,14 @@ pub fn adopt_current_as_core_idle(
 // The thread-entry assembly (`thread_start`, `thread_start_closure`) lives in `akuma-switch`.
 
 // ============================================================================
-// x86_64 context switch — cooperative only, ported from `amd64/src/sched.rs`
+// The context switch — a function call, on both architectures
 // ============================================================================
 //
-// See `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md` for why this is a
-// materially simpler mechanism than the AArch64 SGI/fake-IRQ-frame switch
-// above, not a smaller version of it: a plain function-call-style switch,
-// with the callee-saved register file living on each thread's own stack
-// rather than in `Context`. `amd64/src/sched.rs`'s own `switch_context` is
-// proven — its `smoke_test` runs real cooperative+preemptive round-robin
-// scheduling today — so this is a port of that asm, not new design.
-//
-// Deliberately NOT wired into the AArch64-shaped machinery this file already
-// has for spawning (`setup_fake_irq_frame`, `init_thread_slot_context`,
-// `sgi_scheduler_handler_with_sp`): those build the fake-IRQ-return frame the
-// AArch64 exception path expects, which has no x86_64 analogue. This is a
-// second, independent switch path, reachable only through the x86_64 arms of
-// [`spawn_fn`]/[`yield_now`] added alongside it.
+// The switch saves the callee-saved register file on the outgoing thread's own
+// stack and swaps stack pointers (`proposals/AKUMA_THREADING_ARCH_PORTABILITY.md`).
+// Both kernels schedule through it: amd64 since the port, and AArch64 since the
+// SGI/fake-IRQ-frame switch was deleted (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`).
+// The machine effects each target performs around it are [`ArchHooks`].
 // The switch and the first-run trampoline (`akuma_threading_x86_switch_context`,
 // `akuma_threading_x86_thread_entry_trampoline`) live in `akuma-switch`.
 
@@ -2540,7 +2531,7 @@ pub fn adopt_current_as_core_idle(
 /// policy for the AArch64 multi-core scheduler this pass does not attempt to
 /// match; this mirrors `amd64::sched::yield_now`'s own plain scan instead,
 /// which is exactly what a single-core, cooperative-only switch needs.
-fn x86_pick_next(from: usize, hooks: X86ArchHooks) -> Option<usize> {
+fn pick_next(from: usize, hooks: ArchHooks) -> Option<usize> {
     for step in 1..=MAX_THREADS {
         let candidate = (from + step) % MAX_THREADS;
         let state = THREAD_STATES[candidate].load(Ordering::Acquire);
@@ -2579,14 +2570,14 @@ fn x86_pick_next(from: usize, hooks: X86ArchHooks) -> Option<usize> {
     None
 }
 
-/// Would [`x86_pick_next`] find something for this core? The same three tests,
+/// Would [`pick_next`] find something for this core? The same three tests,
 /// without the claim and without switching.
 ///
 /// For an idle core that has just announced it is about to halt (amd64
 /// `smp::set_halted`): a wake that landed between its last pick and the
 /// announcement is visible here, so it does not sleep through it.
 #[must_use]
-pub fn x86_runnable_exists() -> bool {
+pub fn runnable_exists() -> bool {
     let hooks = arch();
     (0..MAX_THREADS).any(|i| {
         let state = THREAD_STATES[i].load(Ordering::SeqCst);
@@ -2610,7 +2601,7 @@ pub fn x86_runnable_exists() -> bool {
 ///   tick too, which costs one tick.
 /// - **The thread is `RUNNING`.** A thread that has just published `WAITING` or
 ///   `TERMINATED` is on its way into its own switch, and taking the core first would
-///   skip what it does in between (`x86_finish_current`'s futex purge, a park's
+///   skip what it does in between (`finish_current`'s futex purge, a park's
 ///   re-check). It gets there within a few instructions.
 #[must_use]
 pub fn el1_preemptible() -> bool {
@@ -2621,29 +2612,27 @@ pub fn el1_preemptible() -> bool {
     cur < MAX_THREADS && THREAD_STATES[cur].load(Ordering::Acquire) == thread_state::RUNNING
 }
 
-/// The machine effects the x86_64 scheduler cannot perform itself.
+/// The machine effects the scheduler cannot perform itself.
 ///
 /// # Why hooks and not code in this crate
 ///
 /// Everything here is per-core CPU state that only the *target* knows how to
-/// touch: `CR3`, the ring-3 trap stack in the TSS, the `IA32_FS_BASE`/`GS_BASE`
-/// MSRs, the `fxsave` area, the Big Kernel Lock's recursion depth, and which
-/// slot this core is currently running. On AArch64 the equivalents are welded
-/// into the SGI trampoline because there is exactly one kernel that uses them;
-/// on x86_64 there is exactly one too (`amd64/`), and the difference is that
-/// this crate must keep building for `aarch64-unknown-none` without naming any
-/// of it.
+/// touch: on amd64 `CR3`, the ring-3 trap stack in the TSS, the
+/// `IA32_FS_BASE`/`GS_BASE` MSRs, the `fxsave` area; on AArch64 `TTBR0_EL1`,
+/// `TPIDRRO_EL0` and `TPIDR_EL0` (`akuma-kernel-glue`'s `hooked` module); on
+/// both, the Big Kernel Lock's recursion depth and which slot this core is
+/// running. The crate builds for both targets without naming any of it.
 ///
 /// The split is the same one [`ThreadRuntime`] and [`ProcessHooks`] already
 /// make — the scheduler decides, the caller performs — applied to the layer
 /// below them rather than the layer above.
 ///
-/// Registered once by `amd64::sched::init` via [`register_x86_arch_hooks`].
+/// Registered once by `amd64::sched::init` via [`register_arch_hooks`].
 /// **Every field is load-bearing on a switch**; a missing one is not a
 /// degraded scheduler but a corrupt one, which is why this is a struct with no
 /// defaults rather than a set of optional setters.
 #[derive(Clone, Copy)]
-pub struct X86ArchHooks {
+pub struct ArchHooks {
     /// Install `to`'s machine state on this core, called **immediately before**
     /// the stack switch and with `from` still current.
     ///
@@ -2718,7 +2707,7 @@ pub struct X86ArchHooks {
     /// reads its own caller's capture, which the `syscall_entry` assembly
     /// wrote on the way in and nothing rewrites until the way out.
     pub read_user_context: fn(slot: usize) -> Option<UserContext>,
-    /// Give a freshly [`x86_claim_slot`]ed slot its kernel and trap stacks and
+    /// Give a freshly [`claim_slot`]ed slot its kernel and trap stacks and
     /// its default machine state, and answer the top of the kernel stack.
     ///
     /// Stacks are the *target's* on this architecture — `amd64` leaks a pair
@@ -2734,30 +2723,27 @@ pub struct X86ArchHooks {
     pub prepare_task_slot: fn(slot: usize) -> Option<usize>,
 }
 
-static X86_ARCH_HOOKS: Registered<X86ArchHooks> =
-    Registered::new("akuma-threading: X86ArchHooks not registered — call amd64::sched::init()");
+static ARCH_HOOKS: Registered<ArchHooks> =
+    Registered::new("akuma-threading: ArchHooks not registered — call amd64::sched::init()");
 
 /// Register the x86_64 machine effects. Called once, early, from
 /// `amd64::sched::init` — before any thread but the boot thread exists.
-pub fn register_x86_arch_hooks(h: X86ArchHooks) {
-    X86_ARCH_HOOKS.register(h);
+pub fn register_arch_hooks(h: ArchHooks) {
+    ARCH_HOOKS.register(h);
 }
 
 #[inline]
-fn arch() -> X86ArchHooks {
-    X86_ARCH_HOOKS.require()
+fn arch() -> ArchHooks {
+    ARCH_HOOKS.require()
 }
 
-// ── the x86_64 spawn/adopt surface `amd64/src/sched.rs` schedules through ──
+// ── the spawn/adopt surface: claim, seed, publish ──
 //
-// AArch64 reaches the thread table through `spawn_fn`/`spawn_system_thread_fn`,
-// which box a closure and build a fake IRQ-return frame. x86_64 needs neither:
 // `amd64`'s entries are plain `extern "C" fn() -> !` with their per-thread data
-// in a side table, and its switch is a function call. These are the narrow,
-// allocation-free equivalents — claim, seed, publish — with the same state
-// machine underneath, so both architectures share `THREAD_STATES`,
-// `WAKE_TIMES`, `WOKEN_STATES`, `ON_CPU` and the wake/park discipline built on
-// them rather than each keeping its own.
+// in a side table; `spawn_fn`/`spawn_system_thread_fn` box a closure. Both end
+// here: the narrow, allocation-free claim/seed/publish steps over one state
+// machine, so both architectures share `THREAD_STATES`, `WAKE_TIMES`,
+// `WOKEN_STATES`, `ON_CPU` and the wake/park discipline built on them.
 
 
 /// Register the thread this core is already executing as `slot`.
@@ -2769,7 +2755,7 @@ fn arch() -> X86ArchHooks {
 /// `ON_CPU` is latched here, not later: the thread is running right now, and a
 /// peer core that picked it up between this call and its first switch would
 /// resume a stack that is in use.
-pub fn x86_adopt_running_thread(slot: usize) {
+pub fn adopt_running_thread(slot: usize) {
     if slot >= MAX_THREADS {
         return;
     }
@@ -2778,7 +2764,7 @@ pub fn x86_adopt_running_thread(slot: usize) {
     WAKE_TIMES[slot].store(0, Ordering::SeqCst);
     WOKEN_STATES[slot].store(false, Ordering::SeqCst);
     // Give this thread a `start_time_us` from the moment it becomes the
-    // running one, same reason as the stamp in `x86_yield_now`: without it, a
+    // running one, same reason as the stamp in `try_yield`: without it, a
     // thread that is never switched OUT before something reads its CPU time
     // (or whose first switch-out would otherwise bill from a stale/zero
     // start) undercounts its very first slice.
@@ -2789,7 +2775,7 @@ pub fn x86_adopt_running_thread(slot: usize) {
 }
 
 /// Claim a slot and leave it [`thread_state::INITIALIZING`] — visible to
-/// nothing until [`x86_publish`].
+/// nothing until [`publish_slot`].
 ///
 /// The gap between claiming and publishing is not an implementation detail, it
 /// is the point: `amd64` has been bitten twice by a task becoming schedulable
@@ -2802,7 +2788,7 @@ pub fn x86_adopt_running_thread(slot: usize) {
 /// one that no core is executing is as good as a `FREE` one, which is what
 /// stops [`MAX_THREADS`] being a ceiling on the number of processes a boot may
 /// ever run rather than on how many are alive at once.
-pub fn x86_claim_slot() -> Option<usize> {
+pub fn claim_slot() -> Option<usize> {
     for slot in 1..MAX_THREADS {
         let state = THREAD_STATES[slot].load(Ordering::Acquire);
         if !slot_reusable(state, ON_CPU[slot].load(Ordering::Acquire), slot_held_by(slot)) {
@@ -2857,16 +2843,16 @@ pub fn x86_claim_slot() -> Option<usize> {
             // Holds none of this module's locks here, so the hook may take its
             // own — the same context the two AArch64 sites document.
             //
-            // Since the reaper landed this is [`x86_release_dead_slot`] — the
+            // Since the reaper landed this is [`release_dead_slot`] — the
             // futex purge plus the two releases that had no x86 caller at all
             // (the BKL dropped-window ledger and the orphaned-lock reap). It
-            // runs here as well as in [`x86_reap_terminated_slots`] because the
+            // runs here as well as in [`reap_terminated_slots`] because the
             // sweep is a *timeliness* mechanism and this is the *correctness*
             // one: this is the instant a new occupant arrives, so whatever the
             // last one left must be gone by now whether or not any collector
             // happened to run. After a reap the slot is already `FREE` and
             // every release is a no-op.
-            x86_release_dead_slot(slot);
+            release_dead_slot(slot);
             WAKE_TIMES[slot].store(0, Ordering::SeqCst);
             WOKEN_STATES[slot].store(false, Ordering::SeqCst);
             ON_CPU[slot].store(0, Ordering::SeqCst);
@@ -2900,7 +2886,7 @@ pub fn x86_claim_slot() -> Option<usize> {
 /// leaks them lazily per slot and reuses them on recycle), where AArch64 takes
 /// them from the crate's own PMM-backed pool. The scheduler does not care which
 /// — it only needs somewhere to push a frame.
-pub fn x86_seed_entry(slot: usize, stack_top: usize, entry: extern "C" fn() -> !) {
+pub fn seed_entry(slot: usize, stack_top: usize, entry: extern "C" fn() -> !) {
     if slot >= MAX_THREADS {
         return;
     }
@@ -2909,11 +2895,11 @@ pub fn x86_seed_entry(slot: usize, stack_top: usize, entry: extern "C" fn() -> !
     akuma_switch::set(slot, akuma_switch::build_closure_context(stack_top, entry as usize as u64, 0));
 }
 
-/// Make an [`x86_claim_slot`] slot schedulable.
+/// Make an [`claim_slot`] slot schedulable.
 ///
 /// Separate from claiming so that forgetting it is a thread that never runs —
 /// loud — rather than one that runs too early.
-pub fn x86_publish(slot: usize) {
+pub fn publish_slot(slot: usize) {
     if slot < MAX_THREADS {
         THREAD_STATES[slot].store(thread_state::READY, Ordering::Release);
     }
@@ -2923,8 +2909,8 @@ pub fn x86_publish(slot: usize) {
 ///
 /// `TERMINATED`, not `FREE`: on this target a slot owns stacks its next
 /// occupant reuses, and the difference is visible to the caller's own
-/// bookkeeping. [`x86_claim_slot`] treats the two alike.
-pub fn x86_abandon(slot: usize) {
+/// bookkeeping. [`claim_slot`] treats the two alike.
+pub fn abandon_slot(slot: usize) {
     if slot < MAX_THREADS {
         THREAD_STATES[slot].store(thread_state::TERMINATED, Ordering::Release);
     }
@@ -2973,7 +2959,7 @@ pub fn reserve_slot(slot: usize) -> bool {
 /// published this thread is never chosen again. The loop exists because
 /// [`yield_now`] can legitimately decline to switch (nothing else runnable yet)
 /// and this thread must not run on regardless.
-pub fn x86_finish_current() -> ! {
+pub fn finish_current() -> ! {
     let slot = (arch().current_slot)();
     THREAD_STATES[slot].store(thread_state::TERMINATED, Ordering::SeqCst);
     WAKE_TIMES[slot].store(0, Ordering::SeqCst);
@@ -2984,7 +2970,7 @@ pub fn x86_finish_current() -> ! {
     // `FUTEX_WAITERS` it is still a wake target, so a `FUTEX_WAKE(uaddr, 1)`
     // pops the corpse, counts it toward `max_wake` and leaves the live waiter
     // parked. Until this line the earliest purge on this target was
-    // [`x86_claim_slot`]'s, i.e. "whenever someone happens to want this slot" —
+    // [`claim_slot`]'s, i.e. "whenever someone happens to want this slot" —
     // short under a build, unbounded on an idle box
     // (`AKUMA_AMD64_NO_SLOT_RECYCLER.md` §3.2).
     //
@@ -3001,13 +2987,13 @@ pub fn x86_finish_current() -> ! {
     }
 }
 
-/// How many slots [`x86_reap_terminated_slots`] has carried to `FREE`.
+/// How many slots [`reap_terminated_slots`] has carried to `FREE`.
 static X86_REAPS: AtomicU64 = AtomicU64::new(0);
 
 /// Total slots reaped since boot. Zero on a box that has run user processes
-/// means no collector is calling [`x86_reap_terminated_slots`].
+/// means no collector is calling [`reap_terminated_slots`].
 #[must_use]
-pub fn x86_reaps() -> u64 {
+pub fn reaps() -> u64 {
     X86_REAPS.load(Ordering::Relaxed)
 }
 
@@ -3018,7 +3004,7 @@ pub fn x86_reaps() -> u64 {
 ///
 /// On AArch64 a slot is cleaned when its thread dies; on x86_64 it was cleaned
 /// when the slot was next *claimed*, and `TERMINATED → FREE` never happened at
-/// all ([`x86_claim_slot`] takes a `TERMINATED` slot directly). Everything that
+/// all ([`claim_slot`] takes a `TERMINATED` slot directly). Everything that
 /// is purely per-slot state survived that — the claim scrubs it — but the two
 /// hooks that have to fire *while the tid is dead and its slot not yet
 /// reissued* had no x86 caller at all, and neither did the BKL ledger reset.
@@ -3033,7 +3019,7 @@ pub fn x86_reaps() -> u64 {
 ///   `amd64` opens windows in `net.rs` and `exec_runtime.rs`, so this is not
 ///   hypothetical here.
 /// - **`SLOT_PURGE_CALLBACK`.** Idempotent, and already fired at death by
-///   [`x86_finish_current`]; repeated here to cover a slot that reached
+///   [`finish_current`]; repeated here to cover a slot that reached
 ///   `TERMINATED` by some other route.
 /// - **`SLOT_REAP_CALLBACK`.** Orphaned-lock recovery: release whatever this
 ///   thread died holding. Last, which is exactly the reap contract — the tid is
@@ -3043,7 +3029,7 @@ pub fn x86_reaps() -> u64 {
 ///
 /// The shared recycler's `thread_cleanup_cooldown_us` exists to guarantee the
 /// thread has left its own kernel stack. `ON_CPU` establishes that directly and
-/// this target already gates on it (the same test [`x86_claim_slot`] makes), so
+/// this target already gates on it (the same test [`claim_slot`] makes), so
 /// a settling time would only add latency.
 ///
 /// # Racing the claim
@@ -3052,11 +3038,11 @@ pub fn x86_reaps() -> u64 {
 /// that wins the slot skips it here, and a reap that wins it makes the claim
 /// look elsewhere. `FREE` is what makes the pass idempotent — without it every
 /// sweep would re-run the hooks over every dead slot until something reused it.
-/// `x86_claim_slot` treats `FREE` and `TERMINATED` alike, and `slot_can_install`'s
+/// `claim_slot` treats `FREE` and `TERMINATED` alike, and `slot_can_install`'s
 /// `space_root` carve-out covers both, so nothing downstream can tell.
 ///
 /// Returns how many slots it moved.
-pub fn x86_reap_terminated_slots() -> usize {
+pub fn reap_terminated_slots() -> usize {
     let mut count = 0;
     for slot in 1..MAX_THREADS {
         if THREAD_STATES[slot].load(Ordering::Acquire) != thread_state::TERMINATED {
@@ -3081,7 +3067,7 @@ pub fn x86_reap_terminated_slots() -> usize {
             )
             .is_ok()
         {
-            x86_release_dead_slot(slot);
+            release_dead_slot(slot);
             THREAD_STATES[slot].store(thread_state::FREE, Ordering::Release);
             X86_REAPS.fetch_add(1, Ordering::Relaxed);
             count += 1;
@@ -3090,8 +3076,8 @@ pub fn x86_reap_terminated_slots() -> usize {
     count
 }
 
-/// The three releases [`x86_reap_terminated_slots`] performs, factored out so
-/// [`x86_claim_slot`] can perform them too.
+/// The three releases [`reap_terminated_slots`] performs, factored out so
+/// [`claim_slot`] can perform them too.
 ///
 /// A collector is a timeliness mechanism, not a correctness one: whether it ran
 /// depends on whether anything called it. A claim is the one moment where
@@ -3103,7 +3089,7 @@ pub fn x86_reap_terminated_slots() -> usize {
 /// Called with the slot `INITIALIZING` under the caller's winning CAS, so no
 /// other core can be claiming or reaping it, and with none of this module's
 /// locks held — the hooks may take their own.
-fn x86_release_dead_slot(slot: usize) {
+fn release_dead_slot(slot: usize) {
     let _stale_depth = bkl::clear_dropped_windows_for_dead_thread(slot);
     if let Some(purge) = SLOT_PURGE_CALLBACK.get() {
         purge(slot);
@@ -3120,7 +3106,7 @@ fn x86_release_dead_slot(slot: usize) {
 /// on a pipe is as live as one spinning on it, and the boot's drive loop must
 /// not mistake the two.
 #[must_use]
-pub fn x86_slot_is_live(slot: usize) -> bool {
+pub fn slot_is_live(slot: usize) -> bool {
     slot < MAX_THREADS
         && !matches!(
             THREAD_STATES[slot].load(Ordering::Acquire),
@@ -3130,12 +3116,12 @@ pub fn x86_slot_is_live(slot: usize) -> bool {
 
 /// Is `slot` parked in [`schedule_blocking`]? For diagnostics and self-tests.
 #[must_use]
-pub fn x86_slot_is_waiting(slot: usize) -> bool {
+pub fn slot_is_waiting(slot: usize) -> bool {
     slot < MAX_THREADS && THREAD_STATES[slot].load(Ordering::Acquire) == thread_state::WAITING
 }
 
-/// Per-slot tally of [`x86_pick_next`] outcomes: skipped because another core
-/// holds the on-CPU gate, skipped because [`X86ArchHooks::can_run`] said no,
+/// Per-slot tally of [`pick_next`] outcomes: skipped because another core
+/// holds the on-CPU gate, skipped because [`ArchHooks::can_run`] said no,
 /// and returned as the pick.
 ///
 /// # Why per-slot, and why all three
@@ -3175,7 +3161,7 @@ static PICK_HITS: [AtomicU64; MAX_THREADS] = {
 /// `(picked, skipped for the on-CPU gate, skipped for pinning)` for `slot`.
 /// Diagnostics only; see [`PICK_SKIP_ONCPU`] for how to read the triple.
 #[must_use]
-pub fn x86_slot_pick_counts(slot: usize) -> (u64, u64, u64) {
+pub fn slot_pick_counts(slot: usize) -> (u64, u64, u64) {
     if slot >= MAX_THREADS {
         return (0, 0, 0);
     }
@@ -3188,14 +3174,14 @@ pub fn x86_slot_pick_counts(slot: usize) -> (u64, u64, u64) {
 
 /// `(wake deadline in us, woken flag, slot generation)` for `slot`.
 ///
-/// The other half of [`x86_slot_debug`]: a `WAITING` slot is a lost wakeup or a
+/// The other half of [`slot_debug`]: a `WAITING` slot is a lost wakeup or a
 /// dead timer depending on whether it carries a deadline, and whether that
 /// deadline is in the past. A deadline of `0` means "no timeout — only a waker
 /// can release this", which is the shape a lost `futex`/pipe wake leaves
-/// behind; a deadline already passed means [`x86_wake_pass`] is not running.
+/// behind; a deadline already passed means [`wake_pass`] is not running.
 /// The generation distinguishes a fresh occupant from the slot's previous one.
 #[must_use]
-pub fn x86_slot_wait_debug(slot: usize) -> (u64, bool, u64) {
+pub fn slot_wait_debug(slot: usize) -> (u64, bool, u64) {
     if slot >= MAX_THREADS {
         return (0, false, 0);
     }
@@ -3208,14 +3194,14 @@ pub fn x86_slot_wait_debug(slot: usize) -> (u64, bool, u64) {
 
 /// `(thread state, on-cpu gate)` for `slot`, for diagnostics only.
 ///
-/// The pair, not either alone: [`x86_pick_next`] skips a candidate for two
+/// The pair, not either alone: [`pick_next`] skips a candidate for two
 /// completely different reasons — a state that is neither `READY` nor
 /// `RUNNING`, or an `ON_CPU` gate another core still holds — and a starved
 /// thread looks identical from outside whichever one it is. Reporting the
 /// state without the gate is how "the daemon is ready and never picked" reads
 /// as a scheduler bug when it is really a second core sitting on its stack.
 #[must_use]
-pub fn x86_slot_debug(slot: usize) -> (u8, u8) {
+pub fn slot_debug(slot: usize) -> (u8, u8) {
     if slot >= MAX_THREADS {
         return (thread_state::FREE, 0);
     }
@@ -3223,16 +3209,6 @@ pub fn x86_slot_debug(slot: usize) -> (u8, u8) {
         THREAD_STATES[slot].load(Ordering::Acquire),
         ON_CPU[slot].load(Ordering::Acquire),
     )
-}
-
-/// Hand this core to another runnable thread; `true` if a switch happened.
-///
-/// The public face of the x86_64 cooperative switch, for the one caller that
-/// needs the answer rather than just the effect: a core's idle loop, which must
-/// `hlt` when the picker found nothing and must **not** when it did.
-/// [`yield_now`] is the arch-neutral spelling and discards it.
-pub fn x86_yield() -> bool {
-    x86_yield_now()
 }
 
 /// Ready every `WAITING` thread whose wake deadline has passed.
@@ -3250,7 +3226,7 @@ pub fn x86_yield() -> bool {
 /// would overwrite it — resurrecting a thread that was killed, or stamping
 /// `READY` onto a half-written slot. `WAKE_TIMES` is cleared only after a
 /// transition this core owns.
-fn x86_wake_pass() {
+fn wake_pass() {
     let now = (runtime().uptime_us)();
     for i in 0..MAX_THREADS {
         if THREAD_STATES[i].load(Ordering::SeqCst) != thread_state::WAITING {
@@ -3277,7 +3253,7 @@ fn x86_wake_pass() {
 /// The earliest wake deadline of any `WAITING` thread, on the
 /// `runtime().uptime_us` clock; `None` when no parked thread has one.
 ///
-/// For a core about to halt: [`x86_wake_pass`] can only ready a timed-out
+/// For a core about to halt: [`wake_pass`] can only ready a timed-out
 /// thread when something runs it, and a halted core runs it at its next
 /// interrupt. With only the periodic tick, a deadline was served up to one tick
 /// late; the amd64 kernel arms a one-shot timer for this value instead
@@ -3285,7 +3261,7 @@ fn x86_wake_pass() {
 /// racing wake or new park only makes the answer stale by one halt, and the
 /// halt's own wake path re-reads it.
 #[must_use]
-pub fn x86_earliest_wake_time() -> Option<u64> {
+pub fn earliest_wake_time() -> Option<u64> {
     let mut best = u64::MAX;
     for i in 0..MAX_THREADS {
         if THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::WAITING {
@@ -3299,11 +3275,11 @@ pub fn x86_earliest_wake_time() -> Option<u64> {
     (best != u64::MAX).then_some(best)
 }
 
-/// Is a parked thread's deadline (`earliest`, from [`x86_earliest_wake_time`])
+/// Is a parked thread's deadline (`earliest`, from [`earliest_wake_time`])
 /// already due at `now_us`?
 ///
 /// The question a **kernel wait loop that halts instead of yielding** must ask
-/// before it halts. Only [`x86_yield_now`] runs the wake pass, so such a loop
+/// before it halts. Only [`try_yield`] runs the wake pass, so such a loop
 /// never readies the due sleeper; and because the sleeper stays `WAITING` with
 /// a past deadline, the halt's one-shot timer is armed for 1 count, fires at
 /// once, and the loop spins at interrupt rate while the sleeper starves
@@ -3313,12 +3289,13 @@ pub fn wake_is_due(earliest: Option<u64>, now_us: u64) -> bool {
     earliest.is_some_and(|t| t <= now_us)
 }
 
-/// The x86_64 cooperative switch: called from [`yield_now`]'s x86_64 arm and
-/// from [`schedule_blocking`]'s.
+/// Hand this core to another runnable thread; `true` if a switch happened.
 ///
-/// Returns whether a switch actually happened, which
-/// [`schedule_blocking`] needs: a parked thread that could not be switched away
-/// from has to do something other than call this again immediately.
+/// The voluntary switch on both architectures: [`yield_now`] calls it and
+/// discards the answer. Two callers need the answer: [`schedule_blocking`] (a
+/// parked thread that could not be switched away from has to do something other
+/// than call this again immediately), and a core's idle loop, which must halt
+/// when the picker found nothing and must **not** when it did.
 ///
 /// A no-op when the running thread is still runnable and there is nothing else
 /// — a lone thread calling this in a loop must make progress rather than
@@ -3339,20 +3316,20 @@ pub fn wake_is_due(earliest: Option<u64>, now_us: u64) -> bool {
 /// every switch require the lock, which is what made a task parked mid-syscall
 /// own the lock for its whole sleep and freeze `serving` behind it
 /// (`docs/archive/AKUMA_AMD64_BKL_NETWORKING.md` 2026-09-20 night).
-fn x86_yield_now() -> bool {
+pub fn try_yield() -> bool {
     // The scheduler tick preempts kernel code ([`el1_preemptible`]; amd64 with
     // `ring0-preempt`), so a voluntary switch must not be interrupted half-way and
     // re-entered from the tick. Each thread restores the mask it yielded with when it
     // resumes here; one that yielded from an interrupt was masked already. On x86 this
     // is `pushfq; cli` .. `popfq`, a no-op for the ring 0 that runs with `IF` clear.
     let daif = akuma_primitives::irq::irq_save_mask();
-    let switched = x86_yield_locked();
+    let switched = yield_locked();
     akuma_primitives::irq::irq_restore(daif);
     switched
 }
 
-/// [`x86_yield_now`] with interrupts already dealt with: the lock, then the switch.
-fn x86_yield_locked() -> bool {
+/// [`try_yield`] with interrupts already dealt with: the lock, then the switch.
+fn yield_locked() -> bool {
     #[cfg(feature = "yield-takes-bkl")]
     {
         // The AArch64 root kernel's `akuma_bkl` lets a thread run a stretch of EL1 code with the
@@ -3381,18 +3358,18 @@ fn x86_yield_locked() -> bool {
             bkl::leave_kernel();
         }
         bkl::enter_kernel();
-        let switched = x86_yield_switch();
+        let switched = yield_switch();
         if !held {
             bkl::leave_kernel();
         }
         switched
     }
     #[cfg(not(feature = "yield-takes-bkl"))]
-    x86_yield_switch()
+    yield_switch()
 }
 
-/// The switch [`x86_yield_now`] performs: pick, hand over, return on resume.
-fn x86_yield_switch() -> bool {
+/// The switch [`try_yield`] performs: pick, hand over, return on resume.
+fn yield_switch() -> bool {
     // Prev-handoff cleanup, first thing: whatever gate this core is still
     // carrying belongs to a thread whose stack is now dead (we are running,
     // here, after its switch). No-op when there is no pending gate.
@@ -3401,7 +3378,7 @@ fn x86_yield_switch() -> bool {
     // Before the pick, not after: a thread whose deadline just passed has to be
     // a candidate for *this* scan, or a core with nothing else runnable parks
     // and the timeout is served a tick late at best.
-    x86_wake_pass();
+    wake_pass();
 
     let hooks = arch();
     let cur = (hooks.current_slot)();
@@ -3410,7 +3387,7 @@ fn x86_yield_switch() -> bool {
         thread_state::RUNNING | thread_state::READY
     );
 
-    let next = match x86_pick_next(cur, hooks) {
+    let next = match pick_next(cur, hooks) {
         Some(n) if n != cur => n,
         // Nothing to switch to and this thread can carry on.
         _ if cur_runnable => return false,
@@ -3430,7 +3407,7 @@ fn x86_yield_switch() -> bool {
     // the generic path (bill `cur`'s elapsed slice into `TOTAL_CPU_TIMES`,
     // stamp `next`'s `start_time_us`), under the same `POOL` lock
     // `get_thread_cpu_time`'s live-delta read already takes. Without this,
-    // `x86_yield_now` was the *only* switch path on this target and never
+    // `try_yield` was the *only* switch path on this target and never
     // touched `start_time_us` at all: `TOTAL_CPU_TIMES` never accumulated and
     // the live-delta branch had no start to measure from, so `/proc/<pid>/
     // stat`'s `utime` (field 14 — what `ps`'s TIME column reads) read 0 for
@@ -3479,7 +3456,7 @@ fn x86_yield_switch() -> bool {
 
     x86_check_incoming_frame(cur, next);
 
-    // `cur`/`next` are both valid slot indices (`x86_pick_next` only returns in-range candidates),
+    // `cur`/`next` are both valid slot indices (`pick_next` only returns in-range candidates),
     // `ON_CPU` above is what stops another core resuming `next` concurrently, and `next`'s context was
     // built either by `akuma_switch::build_closure_context` or by a previous call to this same function.
     akuma_switch::switch_contexts(cur, next);
@@ -4449,25 +4426,11 @@ where
 }
 
 
-/// Counter of yield_now() calls observed with IRQs masked (DAIF.I=1).
-/// SGIs are gated by DAIF.I, so a yield issued under an IrqGuard (or any
-/// IRQ-disabling spinlock) is a silent no-op — the caller will busy-spin
-/// instead of yielding, and on this single-core kernel that wedges the
-/// timer interrupt too. See docs/STABILITY_URGENT_ISSUES.md issue #1.
-pub static YIELD_WITH_IRQS_MASKED: AtomicU64 = AtomicU64::new(0);
-static YIELD_MASKED_WARNED: AtomicU32 = AtomicU32::new(0);
-const YIELD_MASKED_WARN_LIMIT: u32 = 8;
-
 /// Yield to another thread
 #[inline(never)]
 pub fn yield_now() {
-    // The hooked path's yield is a call, not an SGI, so a masked `DAIF.I` costs
-    // it nothing (and is how its syscalls run): the check is the SGI path's.
-    // x86_64: no SGI/interrupt-based switch exists yet (see the "x86_64
-    // context switch" section above), so this calls the cooperative switch
-    // directly and synchronously rather than through an interrupt — the
-    // same shape `amd64::sched::yield_now` already uses.
-    x86_yield_now();
+    // A function call on both architectures, so a masked interrupt flag does not stop it.
+    try_yield();
 }
 
 /// Halt the calling (idle) thread until the next interrupt, AND keep CPU-time
@@ -4744,10 +4707,10 @@ pub fn on_cpu_flag(tid: usize) -> bool {
 /// switch path raised is only lowered by the next switch's tail, which never
 /// comes for a slot whose last "switch" was the return into its parent. The
 /// slot then sits `TERMINATED` but `ON_CPU`, which [`slot_reusable`] refuses
-/// forever - one ring slot burned per command, and `x86_claim_slot` out of
+/// forever - one ring slot burned per command, and `claim_slot` out of
 /// slots after a dozen. **Only call this when the occupant is dead and no core
 /// is executing on its stacks.**
-pub fn x86_release_on_cpu(slot: usize) {
+pub fn release_on_cpu(slot: usize) {
     if slot < MAX_THREADS {
         ON_CPU[slot].store(0, Ordering::SeqCst);
     }
@@ -4755,14 +4718,14 @@ pub fn x86_release_on_cpu(slot: usize) {
 
 /// Hold `slot`'s [`ON_CPU`] gate from another core: `true` when it was clear, so
 /// the occupant is not executing anywhere and no core can pick it until the
-/// holder calls [`x86_release_on_cpu`]. `false`: it is on a core (or being
+/// holder calls [`release_on_cpu`]. `false`: it is on a core (or being
 /// switched in), and only it can stop itself.
 ///
 /// This is the test "is that thread running?" has to use. The state word is
-/// not it: a READY thread another core has just claimed in [`x86_pick_next`] is
+/// not it: a READY thread another core has just claimed in [`pick_next`] is
 /// already being switched in, and a thread marked TERMINATED there runs on.
 #[must_use]
-pub fn x86_hold_off_cpu(slot: usize) -> bool {
+pub fn hold_off_cpu(slot: usize) -> bool {
     slot < MAX_THREADS && ON_CPU[slot].compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok()
 }
 
@@ -5267,15 +5230,15 @@ pub fn schedule_blocking(wake_time_us: u64) {
         // Wait for interrupt - timer IRQ will fire within 10ms
 
         {
-            // We are WAITING, so `x86_pick_next` skips us: this hands the core
+            // We are WAITING, so `pick_next` skips us: this hands the core
             // to someone else and returns only once a waker, the wake-pass, or
             // a kill has readied us again.
-            if !x86_yield_now() {
+            if !try_yield() {
                 // Nothing else could take the core, and this core's idle thread
                 // is the caller. Not a hang and not a spin either: open one
                 // interrupt window so the tick lands and the clock — and
                 // therefore every deadline, including our own — keeps moving.
-                // The loop then re-tests. See `X86ArchHooks::allow_tick`.
+                // The loop then re-tests. See `ArchHooks::allow_tick`.
                 (arch().allow_tick)();
             }
         }
@@ -5601,7 +5564,7 @@ where
 {
     // x86_64: take the slot and its stacks from the target, exactly as the
     // two-phase fork path does (`spawn_user_closure_initializing` ->
-    // `X86ArchHooks::prepare_task_slot`). This function used to claim from
+    // `ArchHooks::prepare_task_slot`). This function used to claim from
     // `THREAD_STATES` and take a stack from the AArch64 PMM pool below, which
     // never ran `prepare_task_slot`: the slot's `trap_stack_top` stayed 0, so
     // `TSS.rsp0` was 0 and the first interrupt or fault a `spawn_ext`-created
@@ -5731,7 +5694,7 @@ pub fn get_thread_state_enum(thread_id: usize) -> Option<ThreadState> {
 }
 
 /// The calling thread's EL0 register file, from the sync trap frame its syscall entry published
-/// (`set_current_trap_frame`) — `X86ArchHooks::read_user_context` for the AArch64 root kernel under
+/// (`set_current_trap_frame`) — `ArchHooks::read_user_context` for the AArch64 root kernel under
 /// `hooked-sched`, whose front end runs the same `akuma_exceptions::sync_el0` and so publishes the
 /// same frame. What the SGI arm of [`get_saved_user_context`] builds, for the same caller: `None` for
 /// any thread but the caller, or with no live frame; `spsr` a clean EL0t; `ttbr0` the live root.
@@ -5924,7 +5887,7 @@ pub fn no_trap_frame_child_count() -> u64 {
 /// `syscall_entry` assembly on the way in.
 ///
 /// The refusal is preserved and is the same refusal:
-/// [`X86ArchHooks::read_user_context`] answers `None` for a slot that has
+/// [`ArchHooks::read_user_context`] answers `None` for a slot that has
 /// never trapped in from ring 3 (`user_rip`/`user_rsp` still zero), which is
 /// what "no live trap frame" means here. `amd64::usermode::sys_fork` performed
 /// exactly that check by hand before this existed.
@@ -6650,7 +6613,7 @@ mod state_transition_guard_tests {
 
         // Same answer once the slot is recycled, where the triple is a dead
         // process's rather than merely the wrong one. The SGI path's slot
-        // initialiser; the hooked path seeds a slot through `x86_seed_entry`.
+        // initialiser; the hooked path seeds a slot through `seed_entry`.
 
         akuma_switch::with_mut(tid, |ctx| {
             ctx.is_user_process = 0;
@@ -6872,7 +6835,7 @@ mod thread_contexts_invariant_tests {
     }
 }
 
-/// The reuse rule `x86_claim_slot` and the x86 reaper share. The zombie hold is
+/// The reuse rule `claim_slot` and the x86 reaper share. The zombie hold is
 /// the 2026-10-16 ryzen fix: a tid an unreaped process still owns is never
 /// handed to a new thread (`docs/archive/AKUMA_STALE_TID_ZOMBIE_SLOT.md`).
 #[cfg(test)]

@@ -111,7 +111,7 @@ promise a watt the pixels do not deliver.
 
   boot cmdline                          idle core, every lap
   ------------                          --------------------
-  idlesleep[=N]  idlemwait              x86_yield() found work? --yes--> run it
+  idlesleep[=N]  idlemwait              try_yield() found work? --yes--> run it
       |  (off by default)               |no; quiet laps++
       v                                 v
   idle policy on:                  budget = WakeBudget(quiet laps) <= 100 ticks

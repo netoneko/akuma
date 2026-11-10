@@ -42,7 +42,7 @@ stateDiagram-v2
     [*] --> FREE
     FREE --> INITIALIZING: claim_free_slot() CAS + scrub_thread_slot()
     INITIALIZING --> READY: context built, stack ensured
-    READY --> RUNNING: x86_pick_next() claims it (ON_CPU CAS)
+    READY --> RUNNING: pick_next() claims it (ON_CPU CAS)
     RUNNING --> READY: tick preemption / yield_now()
     RUNNING --> WAITING: schedule_blocking()
     WAITING --> READY: waker sees WAITING (park/wake handshake)
@@ -60,11 +60,11 @@ the CPU.
 
 ## Preemption
 
-- **The switch is a function call.** `yield_now` → `x86_yield_now` → `x86_yield_switch`
+- **The switch is a function call.** `yield_now` → `try_yield` → `yield_switch`
   picks, does the bookkeeping, runs the target's `switch_to` hook (TTBR0/CR3, TLS, FP
   state) and calls `akuma_switch::switch_contexts`, which saves the callee-saved registers
   and the interrupt mask on the outgoing stack and resumes the incoming one where it last
-  called the same function. `x86_yield_now` masks interrupts around the switch on both
+  called the same function. `try_yield` masks interrupts around the switch on both
   architectures; each thread resumes with the mask it yielded with.
 - **The timer tick preempts.** AArch64: `akuma_exceptions::irq_hooked` yields on the timer
   PPI (or a scheduler SGI from a peer) when the IRQ came from EL0, or from EL1 and
@@ -119,14 +119,14 @@ tick that lands while it is held (the switch would spin on this core's own hold)
 
 ## Scheduling
 
-- **Round-robin from the current slot** (`x86_pick_next`): the first `READY` or `RUNNING`
+- **Round-robin from the current slot** (`pick_next`): the first `READY` or `RUNNING`
   slot after the caller's that is not on a CPU and that this core may run. No weights, no
   priorities.
 - **Pinning** is the target's `can_run` hook: the boot thread runs on the boot core, each
   idle thread on its own core.
-- **Wake pass.** Before each pick, `x86_wake_pass` readies every `WAITING` thread whose
+- **Wake pass.** Before each pick, `wake_pass` readies every `WAITING` thread whose
   deadline has passed (CAS, so a racing wake or kill wins).
-- **Idle threads** halt only when `x86_runnable_exists()` finds nothing; a wake that lands
+- **Idle threads** halt only when `runnable_exists()` finds nothing; a wake that lands
   between the last pick and the halt announcement is seen there.
 
 ## Synchronization primitives
@@ -150,7 +150,7 @@ tick that lands while it is held (the switch would spin on this core's own hold)
 - **`yield_now()`** — voluntary switch through the hooked path above; the thread stays
   `READY`. Use inside `block_on` and any cooperative loop.
 - **`schedule_blocking(wake_time_us)`** — publishes `WAITING` and switches away; a waker or
-  the deadline (`x86_wake_pass`) readies it. A wake for a thread on a halted core sends that
+  the deadline (`wake_pass`) readies it. A wake for a thread on a halted core sends that
   core a scheduler SGI.
 - **`Waker`** (`ThreadWaker`, `threading/mod.rs:3351`, `wake()` at `:3363`) — `wake()` sets the sticky
   `WOKEN_STATES` flag + `PREEMPT_WAKE_TID`. Used by wait queues, epoll, and the

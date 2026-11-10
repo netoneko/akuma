@@ -304,7 +304,7 @@ fn net_blocking_relax() {
     // `lapic::arm_deadline` then arms a 1-count one-shot every lap: an interrupt
     // storm with the sleeper (the netpoll daemon among them) starved. Measured
     // as `nc -u -w 2` hanging after a UDP reply (`docs/archive/UDP_REPLY_WAIT_TIMER_STORM.md`).
-    if akuma_threading::wake_is_due(akuma_threading::x86_earliest_wake_time(), uptime_us()) {
+    if akuma_threading::wake_is_due(akuma_threading::earliest_wake_time(), uptime_us()) {
         crate::sched::yield_now();
         return;
     }
@@ -978,14 +978,14 @@ pub fn settle_for_dhcp(budget_ms: u64) -> bool {
 /// path never had it (`kmain` relies on the suite's spawn), which is why it
 /// only ever showed up on the metal.
 ///
-/// A live slot short-circuits: `true`, no second task. `x86_slot_is_live`
+/// A live slot short-circuits: `true`, no second task. `slot_is_live`
 /// rather than "did we spawn before", so a daemon that somehow died is
 /// replaced rather than assumed.
 pub fn spawn_netpoll() -> bool {
     use core::sync::atomic::Ordering;
 
     let existing = NETPOLL_SLOT.load(Ordering::Relaxed);
-    if existing != usize::MAX && akuma_threading::x86_slot_is_live(existing) {
+    if existing != usize::MAX && akuma_threading::slot_is_live(existing) {
         serial::puts("  net:  netpoll daemon already running\n");
         return true;
     }
@@ -1345,8 +1345,8 @@ pub fn netpoll_spawn_selftest(t: &mut Suite) {
     t.note("net: netpoll daemon entered", entered);
     t.note("net: netpoll drains completed", NETPOLL_DRAINED.load(Ordering::Relaxed));
     t.note("net: netpoll ticks completed", NETPOLL_TICKED.load(Ordering::Relaxed));
-    let (state, on_cpu) = akuma_threading::x86_slot_debug(slot);
-    // The two reasons `x86_pick_next` skips a candidate. `state` is
+    let (state, on_cpu) = akuma_threading::slot_debug(slot);
+    // The two reasons `pick_next` skips a candidate. `state` is
     // `akuma_exec_core::thread::thread_state` (0 FREE, 1 READY, 2 RUNNING,
     // 3 TERMINATED, 4 INITIALIZING, 5 WAITING); `on_cpu` non-zero means another
     // core is on that stack and this one must not touch it.

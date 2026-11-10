@@ -17,7 +17,7 @@
 //! subsystems this kernel serves from its own modules). It registers the four
 //! tables it needs: `ExecRuntime` + `ExecConfig` through
 //! `akuma_exec::runtime::register`, and `ThreadRuntime` + `ThreadConfig` +
-//! `ProcessHooks` + `X86ArchHooks` through `akuma_threading`'s register fns.
+//! `ProcessHooks` + `ArchHooks` through `akuma_threading`'s register fns.
 //!
 //! The one-clock rule: both tables get `crate::net::uptime_us` (the
 //! calibrated TSC), so the scheduler, `akuma-exec`, `akuma_primitives::clock`
@@ -57,7 +57,7 @@ pub fn set_current_slot(slot: usize) {
     akuma_ring3_amd64::set_cpu_slot(slot as u64);
 }
 
-// ── the X86ArchHooks bodies (the per-core machine effects) ──────────────────
+// ── the ArchHooks bodies (the per-core machine effects) ──────────────────
 
 /// The idle thread's tid: outside the spawn ring (children claim 1..NSLOTS,
 /// the boot thread is 0), so no array index collides. Its stack is leaked once,
@@ -99,12 +99,12 @@ pub extern "C" fn idle_main() -> ! {
         crate::smp::bkl_leave();
         crate::exec_twin::tick_window();
         // A sleeper whose deadline has passed is still WAITING: only the wake
-        // pass inside `x86_yield` readies it. So a due deadline is a reason to
+        // pass inside `try_yield` readies it. So a due deadline is a reason to
         // yield too, or a timed park (glue's `nanosleep`, a `poll`/`epoll`
         // timeout) on an otherwise idle core never expires. amd64's wait
         // loops ask the same question (`amd64/src/net.rs`).
-        let due = akuma_threading::wake_is_due(akuma_threading::x86_earliest_wake_time(), crate::net::uptime_us());
-        if due || akuma_threading::x86_runnable_exists() {
+        let due = akuma_threading::wake_is_due(akuma_threading::earliest_wake_time(), crate::net::uptime_us());
+        if due || akuma_threading::runnable_exists() {
             #[cfg(feature = "trace-err")]
             {
                 idle_laps = 0;
@@ -113,7 +113,7 @@ pub extern "C" fn idle_main() -> ! {
             // task tables: they run under the kernel lock (the switch hands
             // the depth to whichever thread runs next, and back).
             crate::smp::bkl_enter();
-            akuma_threading::x86_yield();
+            akuma_threading::try_yield();
             crate::smp::bkl_leave();
         } else {
             crate::net::wait_lap();
@@ -139,12 +139,12 @@ fn seed_idle() {
     let stack: &'static mut [u64; 2048] = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u64; 2048]));
     let top = ((core::ptr::from_mut(stack) as *const u64 as usize) + 2048 * 8) & !0xf;
     crate::sched::mark_idle(IDLE_TID, 0);
-    akuma_threading::x86_seed_entry(IDLE_TID, top, idle_main);
-    akuma_threading::x86_publish(IDLE_TID);
+    akuma_threading::seed_entry(IDLE_TID, top, idle_main);
+    akuma_threading::publish_slot(IDLE_TID);
 }
 
 /// The idle loop's clock feeder — the same one-instruction window
-/// `X86ArchHooks::allow_tick` opens (`sched::Tx`), under a name the idle
+/// `ArchHooks::allow_tick` opens (`sched::Tx`), under a name the idle
 /// thread can reach.
 pub fn tick_window() {
     // One instruction wide, and the tick handler is bounded, so the worst a
@@ -181,7 +181,7 @@ pub fn init() {
     // state arms landed in slice 2. The idle thread is seeded last: READY
     // from the first registration, it only ever gets the core when every
     // real task is parked (its loop feeds the tick and yields on wakeups).
-    akuma_threading::register_x86_arch_hooks(akuma_sched_amd64::hooks::<crate::sched::Tx>());
+    akuma_threading::register_arch_hooks(akuma_sched_amd64::hooks::<crate::sched::Tx>());
     seed_idle();
     // Glue's arms validate a user buffer before touching it and, when a page is
     // not present, ask this hook to fill it: without it a lazy `mmap` buffer is

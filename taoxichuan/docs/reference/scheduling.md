@@ -12,7 +12,7 @@ flowchart LR
     LVT -->|tick| TT["timer_trap (lib.rs)"]
     CAL --> CLK["net::calibrate → net::uptime_us (TSC)<br/>one clock: ExecRuntime, ThreadRuntime, primitives::clock"]
     TT --> G{"from ring 3 AND slot<br/>slotted (not NO_SLOT)<br/>AND PREEMPT_ARMED?"}
-    G -->|yes| Y["akuma_threading::x86_yield()<br/>→ switch_to on the per-slot trap stack"]
+    G -->|yes| Y["akuma_threading::try_yield()<br/>→ switch_to on the per-slot trap stack"]
     G -->|no| R["return to the same instruction"]
     TT --> NP["netpoll backstop: one drained lap per tick<br/>(NET_UP / IN_LAP guarded)"]
     Y --> NP
@@ -29,7 +29,7 @@ Canonical mermaid source: [`../diagrams/scheduling.md`](../diagrams/scheduling.m
   and hands the crate the window — which software-enables the LAPIC,
   calibrates against the 8254 PIT and arms the periodic timer at vector 32.
 - **The tick may switch** (slice 3): a tick that interrupted ring 3 runs the
-  same `x86_yield` the park loop and the idle lap run, on this handler's own
+  same `try_yield` the park loop and the idle lap run, on this handler's own
   per-slot trap stack (`arm_trap_stack` — a preempting switch leaves the
   interrupted frame on the interrupted task's stack, so the next ring-3 trap
   on any task must not land there). Two gates, both paid for:
@@ -62,7 +62,7 @@ Canonical mermaid source: [`../diagrams/scheduling.md`](../diagrams/scheduling.m
 ## switch_to — the machine effects of a park-point switch
 
 The switch is `akuma_sched_amd64::switch_to::<sched::Tx>`, the crate's body shared with the metal kernel; `Tx`
-(`sched.rs`) supplies this kernel's answers. The crate (`x86_yield_now`/`x86_switch_context`) has already named
+(`sched.rs`) supplies this kernel's answers. The crate (`try_yield`/`x86_switch_context`) has already named
 `next` current and moves the stacks itself; the switch then installs, for the incoming slot:
 
 1. **CR3** (`child::sched_root_of(to)`; idle threads run on the kernel root),
@@ -88,7 +88,7 @@ flowchart TD
     A["idle_main lap"] --> B["netpoll — the everything-path's last resort"]
     B --> C["tick_window — one-instruction sti window<br/>keeps the clock alive for timed parks"]
     C --> D{"anything READY?"}
-    D -->|yes| E["x86_yield — a woken task must not wait for nothing:<br/>the waker only readies, it cannot switch"]
+    D -->|yes| E["try_yield — a woken task must not wait for nothing:<br/>the waker only readies, it cannot switch"]
     D -->|no| F["net::wait_lap — sti;hlt;cli<br/>HALT until the 100 Hz tick wakes it"]
     E --> A
     F --> A
@@ -125,7 +125,7 @@ Every consumer reads that one clock (§ the tick, above).
 
 ## The hooks
 
-`exec_twin` registers `X86ArchHooks`; all slice-2/3 arms are real now:
+`exec_twin` registers `ArchHooks`; all slice-2/3 arms are real now:
 
 | hook | today |
 |---|---|

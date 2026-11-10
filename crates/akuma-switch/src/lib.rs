@@ -350,7 +350,7 @@ akuma_threading_x86_switch_context:
 .global akuma_threading_x86_thread_entry_trampoline
 akuma_threading_x86_thread_entry_trampoline:
     /* Reached via the `ret` above the first time a freshly spawned thread is
-     * switched in — see `x86_build_closure_context`, which pre-loads r12 =
+     * switched in — see `build_closure_context`, which pre-loads r12 =
      * closure_ptr and rbx = the boxed-closure trampoline fn pointer at
      * exactly the stack slots this switch's `pop`s read them from. `jmp`,
      * not `call`: the trampoline is `fn(*mut ()) -> !` and never returns, so
@@ -363,7 +363,7 @@ akuma_threading_x86_thread_entry_trampoline:
      * target: a fresh task never returns to x86_switch_context's tail, so
      * its `rust_switch_finished()` never runs for us. Without the call here
      * the OUTGOING thread's ON_CPU gate stays latched forever, and pickers
-     * and `x86_runnable_exists` skip gated threads — the preempted thread
+     * and `runnable_exists` skip gated threads — the preempted thread
      * can never be scheduled again. Seen on Taoxichuan stage 12: the first
      * `sleep_until` park yielded (per its own contract) to the freshly
      * seeded idle thread, the gate on the parker latched, idle saw nothing
@@ -429,7 +429,7 @@ akuma_threading_hooked_switch_context:
 akuma_threading_hooked_thread_entry_trampoline:
     /* First switch-in of a fresh thread: the `ret` above lands here with
      * x19 = closure_ptr and x20 = the boxed-closure trampoline, seeded by
-     * `x86_build_closure_context`. As on x86, this is the task's first scheduler
+     * `build_closure_context`. As on x86, this is the task's first scheduler
      * entry, so it clears the outgoing thread's ON_CPU gate itself. `br`, not
      * `blr`: the trampoline never returns. */
     bl rust_switch_finished

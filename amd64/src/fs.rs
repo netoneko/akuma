@@ -524,7 +524,7 @@ pub fn mount_root() -> bool {
 pub fn install_reap_hooks() {
     akuma_threading::set_slot_reap_callback(akuma_vfs_glue::reap_dead_thread);
     akuma_locks_rw::register_backstop(|| {
-        akuma_threading::x86_reap_terminated_slots();
+        akuma_threading::reap_terminated_slots();
     });
 }
 

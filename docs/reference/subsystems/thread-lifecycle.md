@@ -125,10 +125,10 @@ Lock legend: **M** = acquisition wrapped in `with_irqs_disabled`/`IrqGuard`;
 ### 2.0 "Is that thread running?" is the `ON_CPU` gate, never the state word (hooked scheduler)
 
 On the hooked scheduler (amd64 and both Taoxichuan machines) a thread is
-executing exactly when its `ON_CPU` gate is held. `x86_pick_next` reads `READY`,
+executing exactly when its `ON_CPU` gate is held. `pick_next` reads `READY`,
 **claims the gate**, then switches in, so a `TERMINATED` stored over a `READY`
 thread from another core does not stop it. Code that ends another thread *in
-place* must first hold its gate (`akuma_threading::x86_hold_off_cpu`), mark it
+place* must first hold its gate (`akuma_threading::hold_off_cpu`), mark it
 `TERMINATED`, then release the gate. A thread whose gate it cannot hold is on a
 core: ask it (`request_thread_kill`) and wait, and never end it where it runs.
 `akuma-tokio-kernel-core::proc::kill_siblings` is the implementation, and it

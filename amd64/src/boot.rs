@@ -743,7 +743,7 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     // number that stays 0 on a box that has run processes is the signature of
     // the gap this exists to close — no collector is calling it
     // (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md`).
-    t.note("sched: thread slots reaped", akuma_threading::x86_reaps());
+    t.note("sched: thread slots reaped", akuma_threading::reaps());
 
     t.note("suite: guest microseconds elapsed", crate::net::uptime_us().saturating_sub(suite_start_us));
     // **Bounded-hold tripwire** (`akuma-bkl`'s `MAX_WAIT_SPINS`). A healthy

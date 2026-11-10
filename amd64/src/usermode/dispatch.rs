@@ -1366,7 +1366,7 @@ fn time(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // the thread WAITING against a deadline (`schedule_blocking`) instead
         // of spinning — its x86 arm is the same `yield`-then-`allow_tick`
         // sequence, reached only when nothing else can take the core, and
-        // `x86_wake_pass` is what readies the sleeper at the deadline.
+        // `wake_pass` is what readies the sleeper at the deadline.
         //
         // Two checks came with the fold rather than being dropped at it: the
         // signal check this arm had (`^C` on a sleeping foreground job) is

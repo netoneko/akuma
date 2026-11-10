@@ -1,21 +1,14 @@
 //! DAIF / IRQ-mask correctness tests.
 //!
-//! Covers the invariants that protect the kernel from the silent-hang
-//! failure mode described in `docs/STABILITY_URGENT_ISSUES.md` issue #1:
-//! a thread that yields with IRQs masked silently busy-spins (the SGI
-//! is gated by DAIF.I), and on this single-core kernel that wedges the
-//! timer interrupt too — both heartbeats stop together.
-//!
 //! These tests verify:
 //!   1. `IrqGuard` masks and then restores the I-bit correctly.
 //!   2. Nested guards preserve the outer scope's mask state.
 //!   3. `with_irqs_disabled` matches `IrqGuard` semantics.
-//!   4. `yield_now()` detects and counts yields issued under a mask.
+//!   4. `runtime()`/`config()` are lock-free under a mask
+//!      (`docs/STABILITY_URGENT_ISSUES.md` issue #1).
 
-use core::sync::atomic::Ordering;
 
 use akuma_exec::runtime::{config, runtime, with_irqs_disabled, IrqGuard};
-use akuma_exec::threading::{yield_now, YIELD_WITH_IRQS_MASKED};
 
 use crate::console;
 
@@ -92,41 +85,6 @@ fn test_with_irqs_disabled_matches_guard() {
     console::print("  [PASS] test_with_irqs_disabled_matches_guard\n");
 }
 
-#[allow(dead_code)]
-fn test_yield_now_detects_masked_yield() {
-    let initial = YIELD_WITH_IRQS_MASKED.load(Ordering::Relaxed);
-
-    with_irqs_disabled(|| {
-        // SGI cannot deliver while DAIF.I=1, so this is structurally the
-        // failure-mode call. The instrumentation must count it.
-        yield_now();
-    });
-
-    let after = YIELD_WITH_IRQS_MASKED.load(Ordering::Relaxed);
-    assert!(
-        after > initial,
-        "yield_now under IrqGuard must increment YIELD_WITH_IRQS_MASKED (was {initial}, now {after})"
-    );
-    console::print("  [PASS] test_yield_now_detects_masked_yield\n");
-}
-
-fn test_yield_now_clean_path_does_not_warn() {
-    // With IRQs enabled, yield_now is the normal path and must NOT bump
-    // the masked-yield counter.
-    let before = read_daif();
-    assert!(before & DAIF_I_BIT == 0, "precondition: IRQs enabled");
-
-    let initial = YIELD_WITH_IRQS_MASKED.load(Ordering::Relaxed);
-    yield_now();
-    let after = YIELD_WITH_IRQS_MASKED.load(Ordering::Relaxed);
-
-    assert_eq!(
-        after, initial,
-        "yield_now with IRQs enabled must not increment masked counter"
-    );
-    console::print("  [PASS] test_yield_now_clean_path_does_not_warn\n");
-}
-
 fn test_runtime_is_lock_free_under_masked_irqs() {
     // Regression test for the hang found at uptime ~217s on instance 7
     // of the 2026-05-28 parallel hunt (see docs/STABILITY_URGENT_ISSUES.md
@@ -142,8 +100,6 @@ fn test_runtime_is_lock_free_under_masked_irqs() {
     // can drive thousands of calls under DAIF.I=1 — pre-fix this would
     // already deadlock the first time any other thread held the lock;
     // post-fix it is uniformly fast and DAIF is restored cleanly.
-
-    let saved_yield_count = YIELD_WITH_IRQS_MASKED.load(Ordering::Relaxed);
 
     with_irqs_disabled(|| {
         let during = read_daif();
@@ -172,14 +128,6 @@ fn test_runtime_is_lock_free_under_masked_irqs() {
         "DAIF.I must be cleared after with_irqs_disabled (daif={after:#x})"
     );
 
-    // Sanity: this path must not yield (we never call yield_now), so the
-    // masked-yield counter is untouched.
-    assert_eq!(
-        YIELD_WITH_IRQS_MASKED.load(Ordering::Relaxed),
-        saved_yield_count,
-        "runtime()/config() reads must not yield"
-    );
-
     console::print("  [PASS] test_runtime_is_lock_free_under_masked_irqs\n");
 }
 
@@ -188,10 +136,6 @@ pub fn run_all_tests() {
     test_irq_guard_masks_and_restores();
     test_nested_irq_guard_preserves_outer();
     test_with_irqs_disabled_matches_guard();
-    test_yield_now_clean_path_does_not_warn();
-    // SGI path only: there a yield is a self-SGI, which a masked `DAIF.I` cannot deliver, so a
-    // masked yield is the failure mode the counter catches. The hooked path's yield is a call.
-    console::print("  [SKIP] test_yield_now_detects_masked_yield (SGI scheduler only)\n");
     test_runtime_is_lock_free_under_masked_irqs();
     console::print("--- DAIF tests complete ---\n");
 }

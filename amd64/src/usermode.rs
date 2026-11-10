@@ -2141,7 +2141,7 @@ fn share_parent_memory_into(
 /// by resolving identity per *thread* instead of per call
 /// (`akuma_exec::process::table::THREAD_IDENTITY`, commit `c2a0e630`). Its key
 /// is the thread id, which on this target **is** the scheduler task slot
-/// (`X86ArchHooks::current_slot`), and that is the same key
+/// (`ArchHooks::current_slot`), and that is the same key
 /// `register_exec_process` inserts under — so the cache resolves on the first
 /// try for every process this kernel starts.
 ///
@@ -3161,7 +3161,7 @@ fn register_exec_process(
         // Two facts make filling it safe rather than a reversal of that
         // reasoning. Since A1 the task slot **is** the `akuma-threading` thread
         // id on this target (`threading::current_thread_id` reads
-        // `X86ArchHooks::current_slot`, which is `sched::current_task`), so there
+        // `ArchHooks::current_slot`, which is `sched::current_task`), so there
         // is no second numbering to reconcile. And the field was never
         // consistently `None` anyway: a `fork` child and a `clone` thread both
         // go through the shared `spawn_child_thread_and_publish`, which has

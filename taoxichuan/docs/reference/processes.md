@@ -14,10 +14,10 @@ The per-slot machine state (kernel and trap stacks, the saved user context, the 
 ## Init is pid 1 on a pool thread
 
 The first boot program (`init=`) does not run on the boot stack. `spawn()` loads it, then
-`child::start_init_thread` claims a pool slot (`x86_claim_slot`, tid >= 1), binds it the way a fork child is
+`child::start_init_thread` claims a pool slot (`claim_slot`, tid >= 1), binds it the way a fork child is
 bound, registers a `Process` with pid 1 (`register_shell_process`, so `fork_process` finds a caller), seeds the
 thread to cross into ring 3 at the image's entry, and publishes it. The boot thread is adopted as pool slot 0
-(`x86_adopt_running_thread(0)`, as amd64 does) and parks, reporting init's exit through `task_done`. The fresh
+(`adopt_running_thread(0)`, as amd64 does) and parks, reporting init's exit through `task_done`. The fresh
 thread names its own slot current before crossing (`init_thread_entry`); the crate does not do that for a
 seeded entry.
 
@@ -94,7 +94,7 @@ slot's user record in `akuma-sched-amd64`'s `Machine` table (`sched::set_slot_fs
 ## The runtime twin
 
 `src/exec_twin.rs` registers the hook tables the shared crates read: `ExecRuntime` + `ExecConfig`
-(`akuma_exec::runtime::register`) and `ThreadRuntime` + `ThreadConfig` + `ProcessHooks` + `X86ArchHooks`
+(`akuma_exec::runtime::register`) and `ThreadRuntime` + `ThreadConfig` + `ProcessHooks` + `ArchHooks`
 (`akuma_threading`; the arch hooks are `akuma_sched_amd64::hooks::<sched::Tx>()`). Every arm either names
 code that exists here or is a no-op **with the reason stated** (the `AKUMA_AMD64_STALE_FALSE_HOOKS.md`
 lesson). One clock: both tables get `net::uptime_us` (the calibrated TSC), the same clock

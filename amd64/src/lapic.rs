@@ -425,7 +425,7 @@ pub static ONESHOT_ARMS: AtomicU64 = AtomicU64::new(0);
 ///
 /// A timed wait (`FUTEX_WAIT` with a timeout, so every
 /// `pthread_cond_timedwait`) parks with its deadline in `WAKE_TIMES`, and only
-/// `x86_wake_pass` moves it out — which runs when a core next schedules. A
+/// `wake_pass` moves it out — which runs when a core next schedules. A
 /// halted core schedules at its next interrupt, and with the periodic tick
 /// alone that is up to 10 ms after the deadline: `timerlat` measured a 1 ms
 /// futex wait at 10.0 ms median, 16 ms at 26.3 (2026-10-09; Linux +0.12 ms),
@@ -459,7 +459,7 @@ pub fn arm_deadline() {
         // tick serves it sooner". Put the periodic mode back first.
         restore_periodic();
         let Some(now) = tsc_uptime_us() else { return };
-        let Some(due) = akuma_threading::x86_earliest_wake_time() else { return };
+        let Some(due) = akuma_threading::earliest_wake_time() else { return };
         let per_tick = u64::from(timer::calibrated_count());
         // Already due: the wake pass will find it without a halt; arm the minimum
         // so the halt ends at once if the caller halts anyway.
@@ -599,7 +599,7 @@ pub fn arm_idle_shot(max_ticks: u32) -> u32 {
         // in exact counts, not rounded ticks, or a 3 ms futex deadline would wake
         // 10 ms late and undo `arm_deadline`'s measured win. Past the cap, sleep
         // the cap.
-        let shot_counts = match akuma_threading::x86_earliest_wake_time() {
+        let shot_counts = match akuma_threading::earliest_wake_time() {
             Some(due) => {
                 let left_us = due.saturating_sub(now);
                 let exact = (left_us * per_tick).div_ceil(u64::from(US_PER_TICK_TARGET)).max(1);

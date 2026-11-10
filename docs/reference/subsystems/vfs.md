@@ -304,7 +304,7 @@ binary's CORE column already reads via `sys_get_cpu_stats`
 (`akuma_exec::threading::get_thread_cpu_time`; bucketed by core in `proc.rs`'s
 `cpu_time_snapshot`). The bucketing key is `LAST_CORE`, which **every switch
 path must stamp**: AArch64's `commit_switch` always did, but amd64's x86 arm
-(`x86_yield_now`) did not until 2026-09-26, and every `cpuN` row there read 0
+(`try_yield`) did not until 2026-09-26, and every `cpuN` row there read 0
 busy. The row count is `active_core_count`, which needs `kernel_smp_shared` on
 this crate. A kernel that forgets to forward `akuma-vfs-glue/smp-shared` (amd64
 did, until the same date) gets a single `cpu0` row with no build error

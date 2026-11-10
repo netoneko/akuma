@@ -161,7 +161,7 @@ fn retire_process(pid: Pid) -> bool {
                 // terminates silently. The comment above argues a missing entry
                 // means "nobody has claimed it" — true on AArch64, where the slot
                 // recycler evicts the map entry. **amd64 claims a TERMINATED slot
-                // directly (`x86_claim_slot`) and does not insert into the map
+                // directly (`claim_slot`) and does not insert into the map
                 // until publish**, so between claim and publish a live, freshly
                 // claimed slot also reads `None` here — and this terminates it.
                 // Suspected root cause of the `-j4` wedge; this names the killer.
@@ -699,7 +699,7 @@ pub fn thread_pid_map_remove(tid: usize) -> Option<Pid> {
 /// every `p.thread_id` table scan found the zombie (`[TRAMP-MISMATCH] … table
 /// scan found <dead pid>`, `[kill]`/`[unregister] … stale tid`). amd64 did
 /// exactly that: `run_process` -> `sched::finish` made the slot claimable at once
-/// (`x86_claim_slot` takes a `TERMINATED` slot directly) while the zombie waited
+/// (`claim_slot` takes a `TERMINATED` slot directly) while the zombie waited
 /// for its parent's `wait4` (2026-10-16, ryzen,
 /// `docs/archive/AKUMA_STALE_TID_ZOMBIE_SLOT.md`). With the hold, the zombie's
 /// records stay true until the reap, because nothing else can be on that slot.

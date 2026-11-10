@@ -480,7 +480,7 @@ fn timer_trap_locked(t: &Trap<'_>) {
         child::deliver_fatal_on_tick();
     }
     // M4 slice 3 preemption (session pf, plan §5): a tick that interrupted
-    // ring 3 may switch — the same `x86_yield` the park loop and the idle lap
+    // ring 3 may switch — the same `try_yield` the park loop and the idle lap
     // already run, on this handler's own (per-slot, `arm_trap_stack`) trap
     // stack; the interrupted frame survives the stack switch, and `on_tick`
     // has already EOI'd, so the LAPIC can deliver the next tick to whichever
@@ -508,7 +508,7 @@ fn timer_trap_locked(t: &Trap<'_>) {
         && slot < crate::child::NSLOTS
         && PREEMPT_ARMED.load(core::sync::atomic::Ordering::Acquire)
     {
-        akuma_threading::x86_yield();
+        akuma_threading::try_yield();
     }
     // **The netpoll backstop** (session ph, boot ph-5's P2 stall): the guest's
     // other pumps are all task-context (sshd's serve-loop sleep, the DHCP
@@ -1358,7 +1358,7 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
             // A slotted task's exit is a task exit — status published to its
             // parent, its pipe references dropped, the wait4-parked parent
             // woken, the threading slot terminated (never returns to the stub:
-            // `x86_finish_current` switches away for good).
+            // `finish_current` switches away for good).
             if child::is_real_task() {
                 // `exit` (60) from a thread ends that thread only; everything
                 // else (exit_group, a lone process's exit) ends the group.
@@ -1429,9 +1429,9 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
         akuma_syscalls_abi::x86_64::MSYNC => msync_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::MADVISE => madvise_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         akuma_syscalls_abi::x86_64::SCHED_YIELD => {
-            if crate::exec_twin::current_slot() < child::NSLOTS && akuma_threading::x86_runnable_exists() {
+            if crate::exec_twin::current_slot() < child::NSLOTS && akuma_threading::runnable_exists() {
                 let stash = ring3::user_rsp_stash();
-                akuma_threading::x86_yield();
+                akuma_threading::try_yield();
                 ring3::set_user_rsp_stash(stash);
             }
             0
