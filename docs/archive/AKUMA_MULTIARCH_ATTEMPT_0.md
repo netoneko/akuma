@@ -114,6 +114,48 @@ target dir and copied under the repo (Lima mounts `$HOME`, not `/private/tmp`).
 The diff of test results at SMP=1 is timings and page counts only. The earlier Mac HVF run is not a
 gate (HVF asserts mid-suite, `QEMU_HVF_ISV_BUG.md`).
 
+## Ladder status, audited against the tree (2026-11-10)
+
+The research doc was written from a 53 kLoC bin and a September-era seam audit; checking each
+claim against the current tree found most of the extraction work **already done**. This section
+replaces the doc's §3.1/§9 status. Method: for each E item, grep the consumer and read the comment
+at the call site.
+
+| item | research doc said | tree says | status |
+|---|---|---|---|
+| E1 boot spine | two hand-maintained `kmain`s | `early_init`/`install_shared_sinks`/`late_init`/`self_tests` already shared; M1a–c merged the tail, flag parsing, secondaries and policies | **done** (device bring-up *order* still differs by protocol — deliberate) |
+| E2 process model | `PROCS[128]` in `usermode.rs`, "the big one, ~4–5 kL" | **`PROCS` was deleted in 5b slice 4** (`AKUMA_AMD64_STEP5B_SLICE4_PROCS.md`); the process is `akuma_exec::process::Process`; what is left in `usermode.rs` is the syscall dispatcher (1,346 L), `do_execve`/`register_exec_process`/`sys_spawn`, fork's page walk and 2,661 L of boot self-tests | **done** (nothing to delete last) |
+| E3 mm | walk should use `akuma-user-tree` plans | `mm.rs` already consumes `akuma-mmap` and `akuma-syscalls-mem` (18 + several sites); the **fork walk is `share_parent_memory_into` over `rewrite_leaves_in_range`** — it sees decoded leaves (`va/pa/prot/attr`), not raw PTE bits, so `PteLayout::plan_clone` (which works on raw entries) does not fit it without a different walker | **open, and not a mechanical swap** — see below |
+| E4 sockets / AF_UNIX | `sock.rs` holds the unix state machine | AF_UNIX is routed to glue's `unixsock` (on `akuma-net-unix`) before `sock.rs`; `socketpair` smoke test exists | **done** (D2 correction above) |
+| E5 net | DHCP/netpoll policy local | consumes `akuma_net::smoltcp_net`/`dns`; local code is hook bodies + clock/RNG | **done** |
+| E6 loader | local ELF→address-space | `loader.rs` uses `akuma_elf_exec` (`entry_to_cross` etc.), 713 L | **done** |
+| E7 fs/mount | local mount policy | mount table *is* `akuma_vfs_glue` since C1 step 4a | **done** |
+| E8 console | serial-as-channel | `ProcessChannel` over `akuma_tty`/`akuma_exec` | **done** |
+| E9 fault policy | duplicated CoW break | the **decision** is `akuma_cow` on both kernels; the page-table write stays local on each | **done** (decision shared) |
+| M2 MachineFacts | — | `akuma-machine-facts` + adapters + both kernels report it; **no consumer reads it yet** except `smp::trampoline_page_available` (M2c) | **half** |
+| M6 scheduler | AArch64 full kernel onto hooked path | `akuma-threading/hooked` exists and `akuma-tokio-kernel-aarch64` uses it; the root kernel does not | **open** (D3 decided) |
+| M7 kit | `akuma-kernel` front + machine halves | not started | **open** |
+| amd64 on `akuma-kernel-core`/`-glue` | "consumes none" | still true (`amd64/Cargo.toml` has neither) | **open — the real remaining convergence** |
+
+### What that means for the plan
+
+1. **M4 and most of M5 are finished work.** Do not schedule them; correct the research doc if it is
+   ever reused.
+2. **The honest remaining distance** between the two kernels is (a) amd64 not consuming
+   `akuma-kernel-core`/`-glue` (the neutral spine: console rules, config, timer policy, irq table,
+   `kernel_main`'s boot order), (b) the scheduler shape (M6), (c) the fork page walk (M3), and (d) the
+   kit front (M7). `MachineFacts` is the on-ramp for (a): every `kernel_main` step that today reads
+   an AArch64 machine constant has to read `Facts` first.
+3. **M3 is a walker question, not a plan swap.** `plan_clone`/`plan_free` decide per raw entry; amd64
+   forks through a leaf iterator that hides the entries. Two honest options: (i) give
+   `UserAddressSpace` a raw-entry walk for amd64 and feed `plan_clone` (changes the hottest,
+   SMP-sensitive path in the kernel — needs the fork/CoW battery, `cow_leak_gate`-equivalent delta 0,
+   and an SMP gate on KVM), or (ii) leave the leaf walker and pin its three leaf cases
+   (device / shared-span / CoW) in a host test beside `plan_clone`'s, so the two cannot disagree.
+   (ii) is cheap and removes the drift risk; (i) buys a second walker nobody asked for.
+4. A GRUB-image-free multiboot2 gate now exists (ryzen KVM rig, above), and an AArch64 KVM gate
+   (Lima). Both are what M6/M7 need.
+
 ## Decisions (owner, 2026-11-10)
 
 - **D1 — rump:** a universal, **optional** `rump` feature on the shared spine, not bin-local. Its
