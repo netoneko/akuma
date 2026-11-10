@@ -326,3 +326,55 @@ and is not versioned, so this branch cannot change that; worth adding by the own
 `docs/reference/typed-addresses.md`'s status table); the same run ratcheted `amd64` 87→85,
 `akuma-exceptions` 16→15 and `akuma-pmm` 53→49 **down**. Total 704 in 55 components. Typing the raw
 leaves is the bottom-up sweep that doc already orders, not this branch's work.
+
+## W1 — amd64 onto the neutral spine
+
+### The classification (2026-11-10, read against the tree)
+
+`akuma-kernel-core` did **not build** for `x86_64-unknown-none` (first error: `akuma-gic`'s `{v:w}`
+asm), so "amd64 consumes none of it" was a build fact, not a choice. Every module, with what amd64 does
+for the same job today:
+
+| module | class | amd64 today | action |
+|---|---|---|---|
+| core `klog` (`log` crate sink) | **neutral** | **no logger installed**: every `log::info!/warn!` from `akuma-exec`/`akuma-elf` was dropped (2 info+ sites today, e.g. `[ktg] grace expired`; the ~50 `debug!` are below klog's level anyway) | **adopted, W1a** |
+| core `config`, `fs`, `file_page_cache` | neutral re-export shims | calls `akuma_config`, `akuma_vfs_glue::fs`, `akuma_fpcache` directly — the same crates | nothing to move (the shim exists for `crate::x` spellings in `src/`) |
+| core `pmm` (`akuma_exec::pmm` + `dp_counters_line`) | neutral | re-export unused; the demand-paging counter dump is AArch64's crash path only | adopt opportunistically if amd64's fault path wants the line |
+| core `irq` (line table + `akuma_gic::enable_irq`) | table neutral, enable AArch64 | **routes no device IRQ at all** — devices are polled; the only vectors are LAPIC timer, wake IPI, shootdown | `register_handler` gated `target_arch = "aarch64"`; no amd64 consumer exists to adopt the table |
+| core `ntp_boot` | neutral-after-a-hook (uptime, yield) | `clock.rs` runs the **same** `akuma_sntp::boot` loop over the LAPIC clock — the protocol was already one crate | gated to AArch64; folding the ~40 lines of effect wiring is optional |
+| core `console` (PL011, cross-core serialisation, line input, dmesg ring) | AArch64 device + neutral rules | serial `ProcessChannel` over `akuma_tty`; dmesg ring is the shared `akuma-dmesg` | gated; the printing *rules* are already `akuma_primitives::safe_print!` on both |
+| core `timer` (CNTV ISR, SGI ring, governor) | AArch64 | LAPIC TSC-deadline; tick policy is `akuma_timer::policy` (shared crate) | gated; M6 changes its tail (`x86_yield` instead of the SGI) |
+| core `platform` (compile-time map + FDT) | AArch64 | `akuma-ryzen-amd64` / `akuma-multiboot2`; both feed `Facts` (M2) | gated; the neutral output is `Facts` |
+| core `bkl_profile`, `nic_profile` | neutral diagnostics, feature-gated | none | not adopted (no consumer asked) |
+| glue `compute_heap_size`/`compute_thread_limit`/`reserve_calc_ram`/`compute_memory_layout` | neutral, pure, host-tested | `akuma_boot_amd64::mem::heap_size_for` — also pure and tested, **different policy on purpose** (512 MiB / 1 GiB at ≥ 8 GiB, raised after `apk add` exhausted 64 MiB; AArch64 is RAM/8 clamped 64–256 MiB) | **pinned divergence**, not unified: a merge would change one kernel's heap |
+| glue `build_exec_runtime` vs amd64 `exec_runtime::runtime()` | same shape (`ExecRuntime`), values per machine | ~15 of ~45 fields name the same glue functions (`eventfd`/`unixsock`/`epoll`/`pidfd`/`pty`/`flock`/namespaces); amd64 differs on purpose in pipes (`crate::pipe`), sockets (`sock::close`), futex, BKL-free I/O | considered and **not** folded: struct-update from a shared base would turn a missing machine field from a compile error into a runtime panic |
+| glue `kernel_main`, `run_async_main(_preemptive)`, `detect_memory`, `halt`, netpoll doorbell | AArch64 boot sequencing (GIC, PSCI, FDT, linker symbols) | `boot.rs` spine (M1) | per-machine by construction; M6/M7 territory |
+| glue `vfs`, `syscall` | `src/` re-export shims | — | nothing |
+| glue `rump_proxy` | D1: universal optional feature | not built | deferred (D1) |
+
+So the neutral spine amd64 can actually *use* is small: most neutral logic already lives in leaf crates
+both kernels consume directly, and `kernel-core`'s neutral modules are mostly re-export shims for the
+AArch64 bin's `crate::` paths. What `kernel-core` uniquely owns and amd64 lacked was the logger.
+
+### W1a — `akuma-kernel-core` builds for amd64; amd64 installs `klog` (2026-11-10)
+
+- `akuma-kernel-core`: `akuma-gic`, `akuma-boot-aarch64` and the crates only its AArch64 modules name
+  (`-dmesg`, `-fdt`, `-firecracker`, `-machine-facts`, `-syscalls-time`, `-timer`, `-uart`) moved to
+  `[target.'cfg(target_arch = "aarch64")'.dependencies]`; `console`, `platform` and `timer` are
+  `cfg(all(target_os = "none", target_arch = "aarch64"))`; `ntp_boot` and `irq::register_handler` are
+  `cfg(target_arch = "aarch64")` (the host build and `akuma-kernel-glue`'s host check still reach them). New `klog::is_installed()`.
+- amd64: depends on `akuma-kernel-core` (no features), calls `klog::init()` in
+  `boot::install_shared_sinks` right after the print hook (both boot protocols), and the suite checks
+  `klog: the log crate's sink is installed`. Its `smp-shared`, `no-tests` and `net-noalloc` now forward
+  to `akuma-kernel-core/*` like the root does (inert on amd64 — they reach only target-gated deps — and
+  required by `check_feature_parity.py`, which stays at the 3 known drifts).
+- **Gates.** AArch64 default release: with only the manifest/cfg change, **ELF byte-identical** to the
+  stashed-HEAD build (`cmp`; note a baseline from an older commit differs by the embedded git hash
+  `0x280496b3` vs `0x445fe139` — compare against HEAD, not the branch point). With `is_installed`
+  added, the **load image is identical** (`rust-objcopy -O binary` + `cmp`) and the ELF differs only in
+  `.strtab` (+9 B, symbol names). `extreme-size` builds. amd64 `cargo tree -e features`: identical
+  apart from the new crate. clippy `-D warnings` clean for amd64 (default, `no-tests`, `net-noalloc`)
+  and `akuma-kernel-core` on both targets. amd64 PVH TCG SMP=1, interleaved: baseline (W5a) 4/4
+  **826/0**, candidate 4/4 **827/0** (the one new check). Unsafe budget 419 unchanged.
+- **Not run:** multiboot2 (ryzen rig: `ssh 192.168.1.126:22` timed out — the bench is off the LAN); the change is on
+  the path both protocols share (`install_shared_sinks`), so the PVH run exercises it.

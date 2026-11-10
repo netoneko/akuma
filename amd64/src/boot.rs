@@ -125,6 +125,11 @@ pub fn install_shared_sinks() {
     // every diagnostic `akuma-virtio` emits — including the one naming why a
     // device failed to initialise — is silently dropped.
     akuma_primitives::console::set_print_hook(crate::serial::puts);
+    // The `log` crate's sink, the same one the AArch64 kernel installs
+    // (`akuma_kernel_core::klog`). Shared crates (`akuma-exec`, `akuma-elf`)
+    // report through `log::warn!`/`info!`; with no logger installed every one
+    // of those lines was dropped on this target. Info and above, heap-free.
+    akuma_kernel_core::klog::init();
     crate::exec_runtime::init();
     // The wall clock, from the CMOS RTC, before anything is mounted: every
     // inode stamp from here on carries the year. Both boot protocols, for the
@@ -527,6 +532,10 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     // runs the path in a loop, the way `scripts/benchmarks/` does it.
     let suite_start_us = crate::net::uptime_us();
 
+    // The shared `log` sink (`akuma_kernel_core::klog`), installed by
+    // `install_shared_sinks` on both boot protocols. Without it the shared
+    // crates' `log::warn!` lines vanish on this target and nothing says so.
+    t.check("klog: the log crate's sink is installed", akuma_kernel_core::klog::is_installed());
     crate::mem::smoke_test(t);
     paging::smoke_test(t);
     // The *other* x86 walker: `akuma-mmu`'s, which the shared crates reach

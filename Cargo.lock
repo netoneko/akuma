@@ -121,6 +121,7 @@ dependencies = [
  "akuma-ieee80211",
  "akuma-isolation",
  "akuma-kacho",
+ "akuma-kernel-core",
  "akuma-kvm-abi",
  "akuma-lapic-amd64",
  "akuma-locks-rw",

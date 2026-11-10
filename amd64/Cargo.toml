@@ -28,7 +28,7 @@ default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd",
 # the remaining phases are deliberately NOT forwarded yet: this target's net
 # syscalls are its own `net.rs`, and each further phase needs its own audit +
 # A/B before it lands here.
-smp-shared = ["akuma-exec/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-vfs-glue/smp-shared","akuma-syscalls-glue/no-bkl-vfs", "akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "no-bkl-network", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-kernel-core/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-vfs-glue/smp-shared","akuma-syscalls-glue/no-bkl-vfs", "akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "no-bkl-network", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers"]
 # The ext2 block cache forwarded to the aarch64 default (root Cargo.toml has
 # `fs-cache` in `default` since 2026-08-02). Without it this target runs the
 # 64-slot FIFO ring, which a single ssh session thrashes: every connection
@@ -244,13 +244,13 @@ console-notify = []
 # The initialisation the suite performs inline — the LAPIC, the console fd and
 # the syscall MSRs — is `boot::late_init`, which this build calls instead. See
 # `self_tests`' own header for the rule that keeps the two in step.
-no-tests = []
+no-tests = ["akuma-kernel-core/no-tests"]
 # The virtio-net path with an 8-slot receive ring (and a staged transmit ring) instead of ONE
 # receive buffer. Off: it measured worse on AArch64 (wake latency, `akuma-net` [features]) and
 # the KVM guest's relay moves 4-8 MB/s without it. The guest does wait for its one buffer (about
 # a fifth of frames: `rx_starved` in the `[KVM] guest:` line); if that ever matters, this is the
 # A/B. docs/archive/KVM_RELAY_SYN_STALL.md.
-net-noalloc = ["akuma-net/net-noalloc"]
+net-noalloc = ["akuma-net/net-noalloc", "akuma-kernel-core/net-noalloc"]
 
 [dependencies]
 # Stage A of the amd64 bring-up: the kernel's own memory management, running on
@@ -372,6 +372,11 @@ akuma-trap-amd64 = { path = "../crates/akuma-trap-amd64" }
 # `hvm.rs`, `cmdline.rs` and `acpi.rs` are no longer modules here.
 akuma-ryzen-amd64 = { path = "../crates/akuma-ryzen-amd64" }
 akuma-machine-facts = { path = "../crates/akuma-machine-facts" }
+# The neutral spine both kernels share (multiarch W1): today amd64 consumes its
+# `klog` (the `log` crate sink). The AArch64-only modules (`console`, `timer`,
+# `platform`, `ntp_boot`, `irq::register_handler`) and their GIC/boot deps are
+# target-gated out of this build; no feature is enabled here.
+akuma-kernel-core = { path = "../crates/akuma-kernel-core" }
 akuma-user-tree = { path = "../crates/akuma-user-tree" }
 # The filesystem, used unmodified. Its whole interface to a disk is a two-method
 # `BlockDevice` trait, which is exactly what `akuma-virtio` exposes — see

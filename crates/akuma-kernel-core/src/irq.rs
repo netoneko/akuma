@@ -55,7 +55,12 @@ static IRQ_HANDLERS: Spinlock<IrqHandlers> = Spinlock::new(IrqHandlers {
     handlers: [None; MAX_IRQ],
 });
 
-/// Register an IRQ handler
+/// Register an IRQ handler and enable its line at the GIC.
+///
+/// AArch64 only: the amd64 kernel routes no device interrupt through a line
+/// table (its devices are polled; the LAPIC timer, wake IPI and shootdown own
+/// their IDT vectors directly), so there is no line to enable there.
+#[cfg(target_arch = "aarch64")]
 pub fn register_handler(irq: u32, handler: IrqHandler) {
     let idx = irq as usize;
     if idx >= MAX_IRQ {

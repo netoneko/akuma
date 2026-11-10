@@ -79,3 +79,13 @@ pub fn init() {
         log::set_max_level(LevelFilter::Info);
     }
 }
+
+/// Is a `log` sink live?
+///
+/// `false` until [`init`] has run: every `log::warn!` from a shared crate is
+/// dropped before then. Both kernels install it; amd64's boot suite checks it
+/// so a lost registration fails a boot rather than going quiet.
+#[must_use]
+pub fn is_installed() -> bool {
+    log::max_level() >= LevelFilter::Info
+}

@@ -6,28 +6,35 @@ description = "Unsafe-free half of the bin crate: config/timer/irq/pmm/vfs-fs sh
 
 [dependencies]
 akuma-config = { path = "../akuma-config" }
-# The `dmesg` console-history ring. Pure, host-tested, dependency-free; this
-# crate supplies the `static` and the lock discipline around it (`console.rs`).
-akuma-dmesg = { path = "../akuma-dmesg" }
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-exec = { path = "../akuma-exec" }
 akuma-ext2 = { path = "../akuma-ext2" }
-akuma-fdt = { path = "../akuma-fdt" }
-akuma-firecracker = { path = "../akuma-firecracker" }
-akuma-machine-facts = { path = "../akuma-machine-facts" }
 akuma-fpcache = { path = "../akuma-fpcache" }
-akuma-gic = { path = "../akuma-gic" }
 akuma-net = { path = "../akuma-net", default-features = false }
 akuma-pmm = { path = "../akuma-pmm" }
-akuma-boot-aarch64 = { path = "../akuma-boot-aarch64" }
 akuma-primitives = { path = "../akuma-primitives" }
-akuma-syscalls-time = { path = "../akuma-syscalls-time" }
-akuma-timer = { path = "../akuma-timer" }
-akuma-uart = { path = "../akuma-uart" }
 akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 log = { version = "0.4", default-features = false }
 spinning_top = "0.3"
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
+
+# The AArch64 machine half: the GIC (`irq::register_handler`, the scheduler SGI in
+# `timer`) and the boot-time machine map (`platform`). Target-gated so the crate
+# builds for `x86_64-unknown-none` too, where amd64 consumes its neutral modules
+# (`klog`, `config`, `fs`, `pmm`, ...); the modules that name these are gated on
+# `all(target_os = "none", target_arch = "aarch64")` in `lib.rs`.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+akuma-gic = { path = "../akuma-gic" }
+akuma-boot-aarch64 = { path = "../akuma-boot-aarch64" }
+# What `console` (PL011, the dmesg ring), `timer` (CNTV), `platform` (FDT) and
+# `ntp_boot` (CNTV uptime) name, and `platform::fdt_facts`'s `Facts`; neutral crates, used here only by those modules.
+akuma-dmesg = { path = "../akuma-dmesg" }
+akuma-machine-facts = { path = "../akuma-machine-facts" }
+akuma-fdt = { path = "../akuma-fdt" }
+akuma-firecracker = { path = "../akuma-firecracker" }
+akuma-syscalls-time = { path = "../akuma-syscalls-time" }
+akuma-timer = { path = "../akuma-timer" }
+akuma-uart = { path = "../akuma-uart" }
 
 [features]
 # See akuma-kernel-glue's `pmm-instr`: gates the `fpcache::len` re-export.
