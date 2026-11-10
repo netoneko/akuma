@@ -29,6 +29,7 @@ pub mod stats;
 pub mod fd;
 pub mod image;
 mod adopted;
+mod fresh;
 pub mod spawn;
 pub mod exec;
 pub mod diag;
@@ -40,6 +41,7 @@ pub use lifecycle::LifecycleGuard;
 // `execve`'s load/install seam — see `image::ImageInstall`. Re-exported beside
 // the other process types because both kernels' syscall layers build one.
 pub use image::ImageInstall;
+pub use fresh::FreshProcess;
 pub use address_space::{AddressSpaceGuard, AssistedSpinlock, ProcAddressSpace};
 pub use bkl_guard::{process_bkl_drop_enabled, set_process_bkl_drop_enabled, ProcessBklGuard};
 
@@ -983,8 +985,8 @@ impl Process {
     ///
     /// This is the single constructor behind [`fork_process`], [`vfork_process`]
     /// and [`clone_thread`] — `docs/archive/COW_PILE_AUDIT.md` §8 item 4. Adding a
-    /// `Process` field is now one edit here (plus `Process::from_elf`, which
-    /// builds from an ELF image rather than from a parent and so is not a caller).
+    /// `Process` field is now one edit here (plus [`Process::fresh`], which every
+    /// kernel's new-process path builds through and which has no parent to copy).
     ///
     /// Fallible allocation (`Box::try_new`) on purpose: fork under memory pressure
     /// must return ENOMEM to the caller, not panic the kernel.

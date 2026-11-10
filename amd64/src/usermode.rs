@@ -45,7 +45,7 @@ pub use tests::{
 use akuma_mmap::{MmapRegion, PhysFrame};
 use alloc::vec::Vec;
 
-use akuma_exec::process::{ProcAddressSpace, UserContext};
+use akuma_exec::process::UserContext;
 use akuma_mmu::{LeafAction, PteProt, UserAddressSpace};
 
 use crate::loader;
@@ -3012,18 +3012,12 @@ fn register_exec_process(
     channel: Option<alloc::sync::Arc<akuma_exec::process::ProcessChannel>>,
 ) {
     use alloc::boxed::Box;
-    use alloc::collections::BTreeMap;
     use alloc::string::String;
     use alloc::sync::Arc;
-    use core::sync::atomic::{
-        AtomicBool, AtomicI32, AtomicUsize,
-    };
 
     use akuma_exec::process::{
-        AtomicProcessState, LazyRegionMap, Process, ProcessChannel, ProcessImage, ProcessMemory,
-        ProcessState, ProcessSyscallStats, SharedFdTable, SharedSignalTable,
-        StdioBuffer, UserContext, register_channel, register_child_channel, register_process,
-        thread_pid_map_insert,
+        FreshProcess, LazyRegionMap, Process, ProcessChannel, ProcessMemory, SharedFdTable, register_channel,
+        register_child_channel, register_process, thread_pid_map_insert,
     };
 
     let stack_bottom = ELF_STACK_TOP - (ELF_STACK_MAX_PAGES as u64 * 4096);
@@ -3069,11 +3063,10 @@ fn register_exec_process(
             Some(akuma_exec::process::FileDescriptor::Stdin)
         );
 
-    let proc = Box::new(Process {
+    // Group leader = self; no CLONE_THREAD groups in the table yet.
+    let proc = Box::new(Process::fresh(FreshProcess {
         pid,
-        pgid: pid,
-        tgid: pid, // group leader = self; no CLONE_THREAD groups in the table yet
-        state: AtomicProcessState::new(ProcessState::Ready),
+        parent_pid: ppid,
         // 5b slice 4: the **owning** address space, moved in from the loader.
         // Slice 1 registered a `new_shared` view here — non-owning, no `Drop`,
         // pointed at a root `PROCS` really owned — because two structures
@@ -3082,44 +3075,38 @@ fn register_exec_process(
         // frees a dead process's frames and page tables (through
         // `free_or_defer_as_frames`, which parks them while any core's `CR3` or
         // any preempted thread's saved context still stands on the L0).
-        address_space: ProcAddressSpace::new(image.space),
-        image: Spinlock::new(ProcessImage {
-            name: String::from(name),
-            exe: String::from(name),
-            // 5b slice 2: the argument vector, so `/proc/<pid>/cmdline` can be
-            // rendered from the registered process rather than from the spawn
-            // row. Slice 1 left this empty, which was invisible only because
-            // nothing read it yet — moving the procfs readers over without
-            // filling it would have blanked every `ps` COMMAND column, the
-            // exact shape of silent divergence the fold is supposed to avoid.
-            //
-            // The wire format is the one `Spawn::cmdline` already carries and
-            // `/proc/<pid>/cmdline` wants: each argument NUL-terminated. A
-            // trailing NUL therefore yields an empty final element, which
-            // `split` produces and `filter` drops. Non-UTF-8 argv is possible
-            // on Linux and impossible in a `String`, so it is lossy-converted
-            // rather than dropped — a mangled argument still identifies the
-            // process; a missing one does not.
-            args: cmdline
-                .split(|b| *b == 0)
-                .filter(|a| !a.is_empty())
-                .map(|a| String::from_utf8_lossy(a).into_owned())
-                .collect(),
-            // 5b slice 4: **where ring 3 starts**, which is what this field
-            // has always meant — `UserContext::new(entry_point, stack_pointer)`
-            // writes exactly `pc`/`sp`. Slice 1 registered it zeroed and noted
-            // that amd64 "never `eret`s from it"; that stays true, and is
-            // beside the point. `run_process` reads these two scalars back
-            // (`current_entry_stack`) instead of indexing a second table, and
-            // an `execve` rewrites them in this same lock so a re-entry cannot
-            // pair a new entry point with an old stack.
-            context: UserContext::new(image.entry as usize, image.stack as usize),
-            text: akuma_primitives::TextPin::none(),
-        }),
-        parent_pid: ppid,
-        brk: AtomicUsize::new(image_top as usize),
-        initial_brk: AtomicUsize::new(image_top as usize),
-        entry_point: AtomicUsize::new(image.entry as usize),
+        address_space: image.space,
+        name: String::from(name),
+        // 5b slice 2: the argument vector, so `/proc/<pid>/cmdline` can be
+        // rendered from the registered process rather than from the spawn
+        // row. Slice 1 left this empty, which was invisible only because
+        // nothing read it yet — moving the procfs readers over without
+        // filling it would have blanked every `ps` COMMAND column, the
+        // exact shape of silent divergence the fold is supposed to avoid.
+        //
+        // The wire format is the one `Spawn::cmdline` already carries and
+        // `/proc/<pid>/cmdline` wants: each argument NUL-terminated. A
+        // trailing NUL therefore yields an empty final element, which
+        // `split` produces and `filter` drops. Non-UTF-8 argv is possible
+        // on Linux and impossible in a `String`, so it is lossy-converted
+        // rather than dropped — a mangled argument still identifies the
+        // process; a missing one does not.
+        args: cmdline
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect(),
+        // 5b slice 4: **where ring 3 starts** — `entry`/`sp` become the saved
+        // context, which is what that field has always meant — `UserContext::new(entry_point, stack_pointer)`
+        // writes exactly `pc`/`sp`. Slice 1 registered it zeroed and noted
+        // that amd64 "never `eret`s from it"; that stays true, and is
+        // beside the point. `run_process` reads these two scalars back
+        // (`current_entry_stack`) instead of indexing a second table, and
+        // an `execve` rewrites them in this same lock so a re-entry cannot
+        // pair a new entry point with an old stack.
+        entry: image.entry as usize,
+        sp: image.stack as usize,
+        brk: image_top as usize,
         memory: ProcessMemory::new(
             image_top as usize,
             stack_bottom as usize,
@@ -3128,19 +3115,12 @@ fn register_exec_process(
         ),
         // Stated decision, not a default: see the module header — the page is
         // never read on this target and mapping it would leak 4 KiB/process.
-        process_info_phys: AtomicUsize::new(0),
-        cwd: String::from("/"),
-        root: String::from("/"),
-        stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
-        stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
-        exited: AtomicBool::new(false),
-        exit_code: AtomicI32::new(0),
-        dynamic_page_tables: Vec::new(),
+        process_info_phys: 0,
         // 5b slice 4: the region list this target demand-pages from, moved in
         // from the loader. Empty for everything but a `fork` child, which
         // arrives carrying the parent's extents.
-        mmap_regions: akuma_exec::process::AssistedSpinlock::new(image.regions),
-        lazy_regions: Spinlock::new(LazyRegionMap::new()),
+        mmap_regions: image.regions,
+        lazy_regions: LazyRegionMap::new(),
         // **`with_stdio()` since 4b batch 2a** — it was `new()`, and the
         // comment here recorded why: a table holding `Stdin`/`Stdout`/`Stderr`
         // made `is_bound(1)` true and routed the write into `sys_write_file`,
@@ -3180,8 +3160,6 @@ fn register_exec_process(
         // half that could not be signalled: `init`, everything `sshd` spawns,
         // and every `execve`d image.
         thread_id: Some(task_slot),
-        spawner_pid: None,
-        ctty: core::sync::atomic::AtomicU32::new(0),
         // A console process gets the console's **shared** line discipline, not a
         // fresh one — one serial line, one set of termios flags, exactly as a
         // tty behaves and as a `fork` child already inherits through `term`.
@@ -3192,15 +3170,11 @@ fn register_exec_process(
         terminal_state: term
             .or_else(|| console_attached.then(crate::console::terminal_state).flatten())
             .unwrap_or_else(|| Arc::new(Spinlock::new(crate::console::default_terminal_state()))),
-        box_id: 0,
         // The spawner's credentials, copied: a spawn is credential-neutral,
         // exactly as on AArch64 (`akuma_exec::process::spawn`). `init` and the
         // self-test processes have no registered parent and start as root.
-        creds: Arc::new(akuma_exec::process::SharedCreds::new(
-            akuma_exec::process::lookup_process_shared(ppid)
-                .map_or(akuma_exec::process::Creds::ROOT, |p| p.creds.get()),
-        )),
-        namespace: akuma_isolation::global_namespace(),
+        creds: akuma_exec::process::lookup_process_shared(ppid)
+            .map_or(akuma_exec::process::Creds::ROOT, |p| p.creds.get()),
         // **The console's channel, for a console-attached process; `None` for
         // everything else.**
         //
@@ -3219,22 +3193,7 @@ fn register_exec_process(
         // arm's own `EAGAIN`, `EINTR`, raw/cooked branch and `EPOLLET` edge
         // re-arm come with it.
         channel: channel.clone().or_else(|| console_attached.then(crate::console::channel).flatten()),
-        delegate_pid: None,
-        grabbed_by: None,
-        clear_child_tid: AtomicU64::new(0),
-        robust_list_head: 0,
-        robust_list_len: 0,
-        signal_actions: Arc::new(SharedSignalTable::new()),
-        signal_mask: 0,
-        fault_mutex: Spinlock::new(BTreeMap::new()),
-        sigaltstack_sp: AtomicU64::new(0),
-        sigaltstack_flags: AtomicI32::new(2), // SS_DISABLE
-        sigaltstack_size: AtomicU64::new(0),
-        start_time_us: (akuma_exec::runtime::runtime().uptime_us)(),
-        current_syscall: AtomicU64::new(!0),
-        last_syscall: AtomicU64::new(0),
-        syscall_stats: ProcessSyscallStats::new(),
-    });
+    }));
     register_process(pid, proc);
     thread_pid_map_insert(task_slot, pid);
     // Tell the console pump who to address its keystrokes to, so `^C` goes

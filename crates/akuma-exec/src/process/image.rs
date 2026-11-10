@@ -1,12 +1,11 @@
 // Without `elf-loader` the loading half of this file compiles out; its imports stay.
 #![cfg_attr(not(feature = "elf-loader"), allow(unused_imports))]
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::format;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 
 use akuma_tty as terminal;
 use spinning_top::Spinlock;
@@ -25,10 +24,7 @@ use crate::mmu;
 use crate::runtime::{runtime, config, track_frame, FrameSource, PhysFrame};
 use crate::process::types::{ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo, Pid};
 use crate::process::lifecycle::LifecycleGuard;
-use super::{
-    AtomicProcessState, LazyRegionMap, NEXT_PID, Process, ProcessState, ProcessSyscallStats, SharedFdTable,
-    SharedSignalTable, StdioBuffer, UserContext,
-};
+use super::{LazyRegionMap, NEXT_PID, Process, SharedFdTable};
 
 #[cfg(feature = "elf-loader")]
 /// True if some OTHER process shares `tgid` — a live CLONE_THREAD sibling of `pid`.
@@ -445,63 +441,26 @@ impl Process {
         let lazy_stack_start = loaded.stack_top.saturating_sub(LAZY_STACK_MAX);
         lazy_regions.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
 
-        Ok(Self {
+        Ok(Self::fresh(crate::process::FreshProcess {
             pid,
-            pgid: pid,
-            tgid: pid, // group leader = self
-            state: AtomicProcessState::new(ProcessState::Ready),
-            address_space: crate::process::ProcAddressSpace::new(loaded.address_space),
-            image: Spinlock::new(crate::process::ProcessImage {
-                name: String::from(name),
-                exe: String::from(name),
-                args: Vec::new(),
-                context: UserContext::new(loaded.entry_point, loaded.sp),
-                text: akuma_primitives::TextPin::none(),
-            }),
             parent_pid: 0,
-            brk: core::sync::atomic::AtomicUsize::new(loaded.brk),
-            initial_brk: AtomicUsize::new(loaded.brk),
-            entry_point: AtomicUsize::new(loaded.entry_point),
+            name: String::from(name),
+            args: Vec::new(),
+            address_space: loaded.address_space,
+            entry: loaded.entry_point,
+            sp: loaded.sp,
+            brk: loaded.brk,
             memory,
-            process_info_phys: AtomicUsize::new(process_info_frame.addr),
-            cwd: String::from("/"),
-            root: String::from("/"),
-            stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
-            stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
-            exited: AtomicBool::new(false),
-            exit_code: AtomicI32::new(0),
-            dynamic_page_tables: Vec::new(),
-            mmap_regions: crate::process::AssistedSpinlock::new(Vec::new()),
-            lazy_regions: Spinlock::new(lazy_regions),
+            process_info_phys: process_info_frame.addr,
+            mmap_regions: Vec::new(),
+            lazy_regions,
             fds: Arc::new(SharedFdTable::with_stdio()),
             thread_id: None,
-            // Spawner PID - set when spawned by another process
-            spawner_pid: None,
-            ctty: core::sync::atomic::AtomicU32::new(0),
-            // Terminal State - default for new processes
             terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
-
-            box_id: 0,
             // Root until something lowers it. `spawn` overwrites this with the
             // caller's credentials; only the very first process keeps it as is.
-            creds: Arc::new(crate::process::SharedCreds::new(crate::process::Creds::ROOT)),
-            namespace: akuma_isolation::global_namespace(),
+            creds: crate::process::Creds::ROOT,
             channel: None,
-            delegate_pid: None,
-            grabbed_by: None,
-            clear_child_tid: AtomicU64::new(0),
-            robust_list_head: 0,
-            robust_list_len: 0,
-            signal_actions: Arc::new(SharedSignalTable::new()),
-            signal_mask: 0,
-            fault_mutex: Spinlock::new(BTreeMap::new()),
-            sigaltstack_sp: AtomicU64::new(0),
-            sigaltstack_flags: AtomicI32::new(2), // SS_DISABLE
-            sigaltstack_size: AtomicU64::new(0),
-            start_time_us: (runtime().uptime_us)(),
-            current_syscall: core::sync::atomic::AtomicU64::new(!0),
-            last_syscall: core::sync::atomic::AtomicU64::new(0),
-            syscall_stats: ProcessSyscallStats::new(),
-        })
+        }))
     }
 }

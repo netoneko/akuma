@@ -515,3 +515,31 @@ fallback.
 commit (`f19cc93b`), 2 rounds plus 4 extra SMP=4 pairs: SMP=1 **827/0** in 4/4; SMP=4 baseline **837/0** in 6/6, candidate **837/0** in 5/6 and one run that hung in `sigregs` (the pre-existing SMP=4 TCG hang, `docs/README.md` row) — the suite's
 `dispatch_smoke_test` (the vocabulary hop, the disjoint tables, `symlink` read-back) and every probe
 that makes syscalls run through the new dispatcher.
+
+### W2c — one fresh-process constructor for three kernels (2026-11-10)
+
+The neutral part of `register_exec_process`. Three kernels build a process that did not fork from one —
+AArch64's `Process::from_elf` (`akuma-exec/src/process/image.rs`), the tokio kernels' `Process::adopted`,
+amd64's `register_exec_process` — and each spelled the whole 45-field `Process` literal. A field-by-field
+comparison found **28 initialisers textually identical in all three** (signal table, sigaltstack, robust
+list, cwd/root, namespace, stdio buffers, counters, `pgid == tgid == pid`, `ctty` 0). They are now
+`Process::fresh(FreshProcess)` in `akuma-exec/src/process/fresh.rs`; `FreshProcess` is the 17 inputs the
+three actually differ in. All three call it; amd64's per-field comments (owning address space, `with_stdio`,
+`thread_id`, the console's terminal state and channel) moved onto the seed fields unchanged. The clone
+family (`Process::inherit_from`) keeps its own literal: nearly every field comes from the parent. No new
+allocation (the same `String`s/`Arc`s, moved through the seed).
+
+**What does not move, and why.** `do_execve`'s neutral steps already run through shared code
+(`perm::check`, `text_pin`, `parse_shebang`/`shebang_hop`, `Process::install_image`,
+`glue::execve::commit`); what is left is x86 image building (`Image`, `crate::loader`), amd64's thread
+drain and arming its user context — machine half. `sys_spawn` is the same shape (amd64's `SPAWN` rows,
+console attach, `Image`). Moving them into `akuma-exec` would mean hooks for each of those, which is
+more seam than code. **Recorded as final for this attempt.**
+
+**Gates.** Builds: AArch64 kernel, amd64 (default + `no-tests` clippy `-D warnings`), taoxichuan and
+shanghai for x86_64 **and** aarch64 (the tokio kernels are `adopted`'s callers); clippy `akuma-exec`
+(aarch64); host tests `akuma-exec` 106/106. Lima KVM, interleaved vs the stashed tree: SMP=1 **313/1** in
+3/3 on both sides (the epoll latency threshold); SMP=2 candidate **323/1**, baseline 322/2 — the baseline
+again failed `orphan reparented to init (shell did not exit in 10s)` (2 of 2 baseline SMP=2 pairs today,
+0 of 2 candidate; a baseline flake, not investigated). amd64 PVH TCG vs W2b: SMP=1 827/0 2/2, SMP=4
+837/0 2/2 on both sides.
