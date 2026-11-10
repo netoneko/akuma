@@ -192,6 +192,26 @@ at the call site.
   (79 vs 80 of 108/109) left for `scripts/cloc_akuma.py` regeneration by the owner, per CLAUDE.md
   ("never increment by hand").
 
+## M2 tail, and the thread-probe flake (2026-11-10, afternoon)
+
+- **AArch64 compile-time map -> `Facts`: not done, deliberately.** `akuma-kernel-core::platform` is
+  `#[cfg(target_os = "none")]`, so a host test cannot reach the `machine::{RAM_BASE, VIRTIO_PA,
+  VIRTIO_STRIDE, VIRTIO_INTID_BASE}` constants. The bootstrap-vs-FDT agreement is already pinned by
+  literals in `akuma-firecracker`'s tests against the measured QEMU and Firecracker trees
+  (`virtio_slots_are_dense_from_0x40003000_and_intid_32`, `qemu_virtio_intids_start_at_48_...`). A
+  compile-time `Facts` would also have no RAM size (the map is a bootstrap guess), so `validate()`
+  would reject it. If the constants are ever moved into a host-visible crate, the agreement test
+  becomes one assert per constant.
+- **Thread-probe flake, read not reproduced.** `thread_test` (`usermode.rs`) reads the global
+  `EXIT_STATUS`, which any process on any core writes (`run_process` overwrites it with
+  `enter_user`'s return; `exit_group` and fault paths store too). The failure value was `0x0`, not
+  `u64::MAX`, so something stored 0 *after* the test reset it and the loop's
+  `all_user_tasks_finished()` exit condition came true — a status from another task (a lingering
+  earlier test process or a probe thread), or the probe's own early exit, not "never ran". The test is
+  the racy part: `spawn_test` already moved to `waitpid` for the same reason (its comment says so).
+  Suggested fix for the owner: read the status through `waitpid` like `spawn_test`, then the flake
+  cannot hide a real failure either way. Not changed here because it edits the suite's meaning.
+
 ## Decisions (owner, 2026-11-10)
 
 - **D1 — rump:** a universal, **optional** `rump` feature on the shared spine, not bin-local. Its
