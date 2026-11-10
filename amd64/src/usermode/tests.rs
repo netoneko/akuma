@@ -9,6 +9,7 @@
 //! sibling because the tests reach its private state — `Image`'s fields, `PROCS`,
 //! `reap_exec_process` — and a child sees that without widening anything.
 
+use super::dispatch::to_glue;
 use super::*;
 use akuma_selftest::Suite;
 

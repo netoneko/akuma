@@ -486,3 +486,32 @@ Recorded here because the handoff asked for the decision with W2: M3a (`akuma_us
 plus `fork_leaf_agrees_with_plan_clone`) already pins amd64's leaf walker to `plan_clone`'s decision
 table. Option (i) would replace the hottest SMP-sensitive path in the kernel with a second, raw-entry
 walker to buy a property the agreement test already guarantees. Not doing it.
+
+### W2b — `syscall_dispatch` moves to `usermode/dispatch.rs`, split by family (2026-11-10)
+
+The 1,338-line dispatcher (939 of them comments) and the C1 seam (`to_glue`, `to_glue_raw`) are now
+`amd64/src/usermode/dispatch.rs`. Its four stages keep their order: Akuma-private numbers
+(`akuma_private`, the old 230-line `return match`), the x86-only legacy folds and the shared-number
+calls (inline, verbatim), then the decoded `Syscall` table — which was one ~900-line `match` and is now
+eight family functions, `fs` (53 arms), `poll` (9), `mem` (9), `net` (25), `process` (23), `signal` (7),
+`time` (9), `system` (10), each `Option<u64>`, tried in that order before the `has no dispatch arm`
+fallback.
+
+- **Behaviour-preserving by construction:** a variant's arms (a guarded `AF_UNIX` arm and the unguarded
+  one after it) stay together in one family in their original order, and the families are disjoint —
+  the split script asserts both — so the order the families are tried in cannot change which arm
+  answers. A line-multiset diff of old dispatcher vs new module shows every original line present; the
+  only additions are the scaffolding and three `return X` -> `return Some(X)` in `clone`'s arm.
+- **Cost, from the codegen, not measured at runtime.** Left alone, LLVM kept the eight families out of
+  line (each called once, but `fs` is 2 KB), and `Option::or_else` closures stayed out of line even with
+  the families inlined into them. With `#[inline(always)]` on the families (per-item
+  `allow(clippy::inline_always)` with a reason, the `akuma-fbcon` precedent) and `if let .. return`
+  chaining, the hot path is one `syscall_dispatch` with **5** jump tables where the single `match` had
+  **3**; a call pays at most a couple of extra range checks. `.text` +5.3 KB. No KVM syscall-rate
+  measurement was possible from here (ryzen unreachable); TCG timings would not resolve it.
+- `usermode.rs` is now **4,940** lines (from 9,277 before W2a).
+
+**Gates.** clippy `-D warnings`, amd64 default and `no-tests`. PVH TCG, interleaved against the W2a
+commit (`f19cc93b`), 2 rounds plus 4 extra SMP=4 pairs: SMP=1 **827/0** in 4/4; SMP=4 baseline **837/0** in 6/6, candidate **837/0** in 5/6 and one run that hung in `sigregs` (the pre-existing SMP=4 TCG hang, `docs/README.md` row) — the suite's
+`dispatch_smoke_test` (the vocabulary hop, the disjoint tables, `symlink` read-back) and every probe
+that makes syscalls run through the new dispatcher.
