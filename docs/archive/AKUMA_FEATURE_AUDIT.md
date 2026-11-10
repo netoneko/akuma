@@ -16,7 +16,7 @@ measured starting point. Read-only audit; nothing changed yet.
 
 ## Findings
 
-1. **Two parallel feature vocabularies.** 17 names exist in both root and `amd64/` with the same
+1. **Two parallel feature vocabularies.** 16 names exist in both root and `amd64/` with the same
    job and *different forwarding lists*, written by hand twice: `smp-shared`, `fs-cache`,
    `syscall-debug-info`, `no-tests`, `net-noalloc`, the 7 `sc-*` (`sc-epoll sc-eventfd sc-timerfd
    sc-pidfd sc-aio sc-sysv-ipc sc-containers`) and four `no-bkl-*`. Examples of drift already
@@ -54,7 +54,7 @@ measured starting point. Read-only audit; nothing changed yet.
 
 | # | change | risk | gate |
 |---|---|---|---|
-| F1 | One shared feature table: a `akuma-kernel-features`-style doc + a check script that asserts the 17 common names forward the same crates in root and `amd64/` | none (a checker) | script in CI/pre-commit |
+| F1 | One shared feature table: a `akuma-kernel-features`-style doc + a check script that asserts the 16 common names forward the same crates in root and `amd64/` | none (a checker) | script in CI/pre-commit |
 | F2 | Fold the six compile-time `no-bkl-*` into `smp-shared`; A/B stays on the runtime toggles | medium: 76 cfg sites, SMP behaviour | AArch64 boot suite byte-identical; amd64 TCG SMP=1 826/0; SMP gates need KVM/metal |
 | F3 | Delete zero-reference instrumentation after owner review; merge the rest into one `instr` feature | low-medium | build matrix |
 | F4 | Make `sc-*` one group feature `linux-extra-syscalls` (still individually settable for `extreme-size`) | low | `extreme-size` image size must not move |
