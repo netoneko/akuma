@@ -330,7 +330,6 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
                 (si.addr, si.addr + 4096),
                 (si.cmdline_paddr, si.cmdline_paddr + 4096),
             ];
-            smp::set_cpu_cap_from_cmdline(cmdline);
             // The SVM hypervisor rehearsal, on request only (`kvmctl` arms it for
             // `/dev/kvm0` and runs nothing). `kvmtest` on the
             // command line runs here the rungs the multiboot2 path runs on the
@@ -348,11 +347,7 @@ pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
                 // off the filesystem.
                 kvm::late(cmdline);
             }
-            if !cmdline.split_ascii_whitespace().any(|w| w == "nosmp")
-                && smp::trampoline_page_available(&machine, &keep_out)
-            {
-                smp::start_secondaries(machine.madt.as_ref());
-            }
+            boot::bring_up_secondaries(&machine, cmdline, &keep_out);
         });
         // The network's bring-up the suite would otherwise have done on the way
         // past, the same block `multiboot2::boot_to_init` runs: DHCP, then the

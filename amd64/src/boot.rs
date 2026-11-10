@@ -339,6 +339,32 @@ pub fn late_init(secondaries: impl FnOnce()) {
     akuma_cpu::interrupts::on();
 }
 
+/// Bring up the other cores, or say why not. Returns how many started.
+///
+/// The one copy of a sequence that was written three times — in [`self_tests`], in the PVH
+/// `kmain`'s no-tests arm and in the multiboot2 `start_secondaries` closure — and had drifted:
+/// the suite printed why it stayed single-core, the other two stayed silent. `nosmp` is a
+/// bring-up lever (a framebuffer console interleaves `[BKL] stuck` chatter from four cores into
+/// every line); `smp=N` caps the count; `keep_out` is the caller's to fill because what might sit
+/// on the trampoline page differs by protocol (a PVH start-info block, or GRUB's information
+/// block and root image).
+pub fn bring_up_secondaries(
+    machine: &akuma_ryzen_amd64::MachineDescription,
+    cmdline: &str,
+    keep_out: &[(u64, u64)],
+) -> usize {
+    smp::set_cpu_cap_from_cmdline(cmdline);
+    if cmdline.split_ascii_whitespace().any(|t| t == "nosmp") {
+        crate::serial::puts("  smp:  nosmp on the command line — single core\n");
+        0
+    } else if smp::trampoline_page_available(machine, keep_out) {
+        smp::start_secondaries(machine.madt.as_ref())
+    } else {
+        crate::serial::puts("  smp:  trampoline page is not free RAM — single core\n");
+        0
+    }
+}
+
 /// The value of a `prefix=value` token on the command line, or `None`.
 ///
 /// Pure and allocation-free: the one parse of a valued boot flag, over the
@@ -573,7 +599,7 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     // from four cores interleaves into every other line, and taking them out of
     // the picture is the cheapest way to decide whether a fault is cross-core.
     let nosmp = flag("nosmp");
-    smp::set_cpu_cap_from_cmdline(cx.cmdline);
+    let started = bring_up_secondaries(cx.machine, cx.cmdline, &cx.keep_out);
     let expected_aps = if nosmp {
         0
     } else {
@@ -582,19 +608,6 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
             .madt
             .as_ref()
             .map_or(0, |m| m.cpus().len().saturating_sub(1).min(smp::MAX_CPUS - 1).min(cap - 1))
-    };
-    let started = if nosmp {
-        crate::serial::puts("  smp:  nosmp on the command line — single core\n");
-        0
-    } else if smp::trampoline_page_available(cx.machine, &cx.keep_out) {
-        smp::start_secondaries(cx.machine.madt.as_ref())
-    } else {
-        // What might be sitting on the trampoline page differs by protocol: a
-        // PVH start-info block, or the information block and root image GRUB
-        // left in RAM. Either one there means single core rather than a copy
-        // over it — which is why `keep_out` is the caller's to fill in.
-        crate::serial::puts("  smp:  trampoline page is not free RAM — single core\n");
-        0
     };
     smp::smoke_test(t, expected_aps, started);
     // Right after the secondaries come up: the shootdown's whole termination
