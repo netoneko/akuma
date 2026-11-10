@@ -65,6 +65,7 @@ Run as root with `MEM=3072` (ryzen has ~6 GB available). Never install these ker
 |---|---|---|
 | M1a+M1b (`87ae39e6`) | 3: tests kernel, RAM root, `nosmp` | **816 passed, 0 failed**; prints the new `smp:  nosmp on the command line — single core` |
 | M1a–M1c (`6453829a`) | 31: tests kernel, RAM root, `smp=4` | **826 passed, 0 failed**; 4 CPUs online, `online count agrees`; autoreboot reached, QEMU exited |
+| W1b–W2c + W5c (`89dd26f7`) | 31: tests kernel, RAM root, `smp=4` | **827 passed, 0 failed**; `facts: multiboot2, 3066 MiB in 8 region(s), cpus 4`; 4 CPUs online; herd + sshd + autoreboot, QEMU exited. Covers the W1b/W2 rows below that said "multiboot2: not run" |
 
 The multiboot2 side of M1a–M1c is therefore boot-verified under KVM (not on the metal itself).
 
