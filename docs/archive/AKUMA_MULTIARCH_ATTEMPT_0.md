@@ -125,6 +125,15 @@ gate (HVF asserts mid-suite, `QEMU_HVF_ISV_BUG.md`).
   behind a feature, with **extensive testing** required before `sock.rs`'s local state machine is
   deleted: host differential tests old-vs-new first (the `sockaddr_in` slice-4 precedent), then
   an AF_UNIX probe under TCG, and sshd/herd paths that use unix sockets. Unblocks **M5**.
+- **D2, correction (2026-11-10): already adopted.** The research doc's premise ("amd64 has no
+  `akuma-net-unix`; its unix-socket marshalling lives in `sock.rs`") is stale. `akuma-syscalls-glue`
+  depends on `akuma-net-unix` and serves AF_UNIX through `glue::unixsock`; amd64's dispatcher routes
+  `socket`/`socketpair`/`sendto`/`recvfrom`/`sendmsg`/`recvmsg` for AF_UNIX to it *before*
+  `crate::sock` (`usermode.rs`, "AF_UNIX first, then the native stack"), and `crate::sock` says so
+  in its own comment. The suite has a `socketpair` smoke test. So there is no local unix state
+  machine to delete and M5's "adopt net-unix" item shrinks to: confirm nothing in `sock.rs`/`fd.rs`
+  still special-cases a unix fd beyond `fd::is_unix_socket`, and add an AF_UNIX *connect/accept*
+  probe (not only `socketpair`) for the extensive testing D2 asked for.
 - **D3 — scheduler:** **AArch64 adopts the hooked scheduler** (`akuma-threading`'s hooked path),
   behind a feature first. *Correction to the stated reason:* both paths live in one crate and share
   the same ~31 host tests (slot/wake/park state machine); the SGI handler and the hooked switch
