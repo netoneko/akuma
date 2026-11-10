@@ -163,10 +163,32 @@ pub fn timer_irq_handler(_irq: u32) {
             }
         }
     }
-    #[cfg(kernel_smp_shared)]
+    // The hooked scheduler preempts on this interrupt itself (`irq_hooked`): a self-SGI
+    // would be a second interrupt, and under KVM a trapped GIC write, for every tick.
+    #[cfg(all(kernel_smp_shared, not(feature = "hooked-sched")))]
     akuma_gic::trigger_sgi_self(akuma_gic::SGI_SCHEDULER);
-    #[cfg(not(kernel_smp_shared))]
+    #[cfg(all(not(kernel_smp_shared), not(feature = "hooked-sched")))]
     akuma_gic::trigger_sgi(akuma_gic::SGI_SCHEDULER);
+}
+
+/// Arm this core's timer for `deadline_us` (uptime) instead of its next periodic tick.
+///
+/// For an idle core about to halt with nothing due sooner. Never sooner than one tick from
+/// now, so a deadline already due costs one ordinary tick rather than an interrupt storm.
+///
+/// Every interrupt that ends the halt early (an SGI for new work, a device) must be
+/// followed by [`rearm_tick`]; the timer's own interrupt re-arms the tick itself.
+pub fn arm_idle_deadline(deadline_us: u64) {
+    let tick = current_tick_us();
+    let delay = deadline_us.saturating_sub(uptime_us()).max(tick);
+    let ticks = akuma_timer::ticks_from_us(akuma_timer::read_frequency(), delay);
+    akuma_cpu::vtimer::set_cval(akuma_timer::read_counter() + ticks);
+}
+
+/// Put this core back on its periodic tick after [`arm_idle_deadline`].
+pub fn rearm_tick() {
+    let ticks = akuma_timer::ticks_from_us(akuma_timer::read_frequency(), current_tick_us());
+    akuma_cpu::vtimer::set_cval(akuma_timer::read_counter() + ticks);
 }
 
 // ============================================================================

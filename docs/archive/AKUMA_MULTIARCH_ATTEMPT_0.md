@@ -1056,3 +1056,48 @@ stands.
   longer holds: `akuma-alloc` masks interrupts on x86 too.
 - The hooked switch's `x86_*` names and "cooperative-only" comments: rename them when the SGI
   path goes.
+
+## Idle cost at SMP=4 (2026-11-11)
+
+An idle 4-core devbox burned about 1.5 host cores on both schedulers. The cost has three causes,
+each fixed: sshd polled every millisecond; every core ticked at 1 kHz and sent itself an SGI on
+each tick; and two kernel loops halted with `wfi` instead of parking. Details:
+`docs/archive/HOOKED_IDLE_TICK.md`.
+
+The fix also gives back the µs wakes that the EL1-preemption step had traded away at SMP=1.
+
+The gates ran on the hooked build, with the new sshd on a copy of `devbox.img`.
+
+| | SMP=1 | SMP=2 | SMP=4 |
+|---|---|---|---|
+| boot suite | 314/0 | 322/0 | 320/0 |
+
+`test_epoll_socket_waker` passed at every core count.
+
+Also:
+
+- futex suite: all probes pass at SMP=2 and 4;
+- epoll suite at SMP=4: 17 PASS, 0 FAIL, the 1 known DIVERGE;
+- sigspin: 5/5;
+- no panics, BKL-stuck lines or SIGSEGVs;
+- clippy clean on hooked, SGI and amd64.
+
+Idle and wake measurements. The wake probe is a pipe wake, in µs.
+
+| build | SMP | idle CPU | ssh RTT p50 | wake spin p50 / p99 | wake sleep p50 / p99 |
+|---|---|---|---|---|---|
+| SGI | 1 | 44.0 % | 124 ms | 2883 / 4053 | 399 / 3252 |
+| hooked, preemptive | 1 | 42.5 % | 138 ms | 2929 / 3675 | 2953 / 3663 |
+| **hooked, tickless idle** | 1 | **5.4 %** | **78 ms** | **74 / 158** | **126 / 527** |
+| SGI | 4 | 145.3 % | 67 ms | 173 / 1278 | 231 / 641 |
+| hooked, preemptive | 4 | 175.0 % | 74 ms | 83 / 1234 | 209 / 911 |
+| **hooked, tickless idle** | 4 | **22.9 %** | 94 ms | **54 / 301** | 216 / 2286 |
+
+Extreme-size, 8 MB, HVF: idle host CPU 0.4 %.
+
+**Open:**
+
+- ssh RTT at SMP=4 is 94 ms, against 67 ms for SGI. One run each.
+- The SMP=4 sleep-wake p99 is 2.3 ms.
+
+Both are worth an A/B before the SGI path goes.

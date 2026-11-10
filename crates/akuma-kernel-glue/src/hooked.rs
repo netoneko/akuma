@@ -117,6 +117,11 @@ fn root_for(slot: usize) -> u64 {
 }
 
 fn switch_to(from: usize, to: usize) {
+    // An idle thread may be leaving with its tick stopped (`idle_main`'s halt, ended by an
+    // SGI that switched it out before it could re-arm): the incoming thread needs the tick.
+    if IDLE.get(from).is_some_and(|i| i.load(Relaxed)) {
+        crate::timer::rearm_tick();
+    }
     // BKL-hold profiler (one relaxed load unless `bkl-profile` turned it on): the core's
     // sampling cache follows the incoming thread, as the SGI path's
     // `set_current_thread_register` does. Without it a waiter blames the incoming thread's
@@ -255,6 +260,10 @@ pub fn enter_user(ctx: &UserContext) -> ! {
 /// else halt.
 /// It takes the lock for each piece of scheduler work and halts without it; `wfi` ends on
 /// a pending interrupt even while masked, and the window after it takes that interrupt.
+/// The longest an idle core halts with its tick stopped: the bound on how late an itimer
+/// (which has no deadline the idle loop can read) or a missed wake deadline is served.
+const IDLE_HALT_MAX_US: u64 = 10_000;
+
 extern "C" fn idle_main() -> ! {
     loop {
         akuma_exec::bkl::enter_kernel();
@@ -271,7 +280,22 @@ extern "C" fn idle_main() -> ! {
             // switch bills a slot for its whole residency, so without it every second this
             // core slept was `user` time in `/proc/stat` and `top` showed it pegged.
             let entered = crate::timer::uptime_us();
+            // Tickless while halted: an idle core's tick does nothing but wake it, and under
+            // KVM every wake is an exit, on every core, a thousand times a second at a 1 ms
+            // tick. Sleep to the earliest thing that is due instead — a parked thread's
+            // timeout, an alarm — capped, because itimers have no deadline to ask for and the
+            // cap bounds how late one fires. New work arrives by SGI (`ThreadWaker::wake`,
+            // the netpoll doorbell), which ends the halt like any interrupt.
+            let mut deadline = entered.saturating_add(IDLE_HALT_MAX_US);
+            if let Some(w) = threading::x86_earliest_wake_time() {
+                deadline = deadline.min(w);
+            }
+            if let Some(a) = akuma_exec::alarms::next_deadline() {
+                deadline = deadline.min(a);
+            }
+            crate::timer::arm_idle_deadline(deadline);
             akuma_cpu::park::wfi();
+            crate::timer::rearm_tick();
             threading::credit_halted_time(threading::current_thread_id(), entered);
         }
         akuma_cpu::park::irq_window();

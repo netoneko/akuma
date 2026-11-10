@@ -82,7 +82,7 @@ platform-firecracker = ["akuma-config/platform-firecracker", "akuma-entry/platfo
 rump = ["akuma-net/rump", "dep:akuma-rump", "akuma-syscalls-glue/rump"]
 # M6 (multiarch attempt 0): the hooked cooperative scheduler on this kernel — `hooked`'s
 # machine half, `akuma-entry`'s front end on `akuma-vectors-aarch64`. Default off.
-hooked-sched = ["akuma-exec/hooked-sched", "akuma-entry/hooked-sched", "akuma-exceptions/hooked-sched", "dep:akuma-vectors-aarch64", "dep:akuma-switch", "dep:akuma-exec-core"]
+hooked-sched = ["akuma-kernel-core/hooked-sched", "akuma-exec/hooked-sched", "akuma-entry/hooked-sched", "akuma-exceptions/hooked-sched", "dep:akuma-vectors-aarch64", "dep:akuma-switch", "dep:akuma-exec-core"]
 rump-default = ["rump"]
 rump-tests = []
 sc-eventfd = ["akuma-syscalls-glue/sc-eventfd"]

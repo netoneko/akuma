@@ -67,6 +67,9 @@ use akuma_primitives::addr;
 /// six call sites.
 pub const SGI_SCHEDULER: u32 = 0;
 
+/// The EL1 virtual-timer PPI: every core's scheduler tick.
+pub const TIMER_PPI: u32 = 27;
+
 /// Where a secondary core's redistributor frames are, so
 /// [`secondary_init`] can find them without naming `src/platform.rs`.
 ///
@@ -447,9 +450,8 @@ pub fn set_priority(irq: u32, priority: u8) {
 /// three `unsafe` blocks outright rather than relocating them.
 #[cfg(gic_per_core)]
 pub fn secondary_init(idx: usize, layout: RedistributorLayout) {
-    // EL1 virtual-timer PPI (the shared 10 ms scheduler tick) and the scheduler
-    // SGI, which each core rings at itself from the shared timer handler.
-    const TIMER_PPI: u32 = 27;
+    // The EL1 virtual-timer PPI (`TIMER_PPI`, the scheduler tick) and the scheduler SGI
+    // are the two interrupts each core enables for itself.
 
     // CPU interface: system registers on, priority mask open, no sub-priority
     // grouping, Group 1 delivery enabled. Same sequence as `init` steps 1 and 5.

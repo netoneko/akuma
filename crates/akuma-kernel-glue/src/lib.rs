@@ -1364,6 +1364,16 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     run_async_main_preemptive();
 }
 
+/// The longest the hooked netpoll loop parks between laps with no packet: the resolution
+/// of its housekeeping (reclaim, herd output, heartbeats) and of smoltcp's own timers.
+#[cfg(all(feature = "smoltcp", feature = "hooked-sched"))]
+const NETPOLL_PARK_US: u64 = 10_000;
+
+/// How long the boot thread's housekeeping loop sleeps between laps under the hooked
+/// scheduler: its cleanup runs every 10 laps, so every 100 ms.
+#[cfg(feature = "hooked-sched")]
+const BOOT_THREAD_PERIOD_US: u64 = 10_000;
+
 #[cfg(target_os = "none")]
 fn run_async_main_preemptive() -> ! {
     // Use spawn_system_thread_fn - it uses SYSTEM_THREAD_STACK_SIZE (256KB)
@@ -1454,19 +1464,27 @@ fn run_async_main_preemptive() -> ! {
                     }
                 }
 
-                threading::yield_now();
+                // Hooked scheduler: this is housekeeping, not an idle loop — park it for a
+                // fixed period and let the core's idle thread halt, tickless. A `wfi` here
+                // held a core on its 1 ms tick for nothing (`docs/archive/HOOKED_IDLE_TICK.md`).
+                #[cfg(feature = "hooked-sched")]
+                threading::sleep_us(BOOT_THREAD_PERIOD_US);
+                #[cfg(not(feature = "hooked-sched"))]
+                {
+                    threading::yield_now();
 
-                // Genuinely halt until the next interrupt (timer tick ~10 ms, or a
-                // device IRQ). Without this the boot/idle thread is a pure
-                // `loop { yield_now() }` busy-spin: yield_now() only fires a self-SGI
-                // and returns immediately, so when no other thread is runnable this
-                // thread and the network poller ping-pong SGIs at microsecond
-                // granularity and pin the host vCPU at 100% even at idle. idle_halt
-                // (not raw wfi) also keeps CPU-time accounting honest so the halt
-                // isn't billed as busy time. The secondary cores already WFI in their
-                // idle loops (smp.rs); this is the BSP equivalent.
-                // See docs/KNOWN_ISSUES.md issue #11.
-                threading::idle_halt();
+                    // Genuinely halt until the next interrupt (timer tick ~10 ms, or a
+                    // device IRQ). Without this the boot/idle thread is a pure
+                    // `loop { yield_now() }` busy-spin: yield_now() only fires a self-SGI
+                    // and returns immediately, so when no other thread is runnable this
+                    // thread and the network poller ping-pong SGIs at microsecond
+                    // granularity and pin the host vCPU at 100% even at idle. idle_halt
+                    // (not raw wfi) also keeps CPU-time accounting honest so the halt
+                    // isn't billed as busy time. The secondary cores already WFI in their
+                    // idle loops (smp.rs); this is the BSP equivalent.
+                    // See docs/KNOWN_ISSUES.md issue #11.
+                    threading::idle_halt();
+                }
             }
 
             console::print("[AsyncMain] Preemtive main thread terminated\n");
@@ -1608,6 +1626,8 @@ fn run_async_main() -> ! {
     // and `docs/runbooks/debug-devbox.md`.
     #[cfg(not(feature = "rump-default"))]
     threading::set_network_thread_id(threading::current_thread_id());
+    #[cfg(feature = "hooked-sched")]
+    threading::register_netpoll_parker();
 
     // =========================================================================
     // Skip async network if disabled (for debugging)
@@ -2283,7 +2303,12 @@ fn run_async_main() -> ! {
         // spun the only core at 100 %. The BKL calls are no-ops without `smp-shared`. A
         // READY peer still gets the core: the tick preempts this thread mid-`wfi`, on both
         // scheduler paths (`docs/archive/HOOKED_EL1_PREEMPTION.md`).
-        #[cfg(all(feature = "smoltcp", any(kernel_smp_shared, feature = "hooked-sched")))]
+        // Hooked scheduler: park instead, woken by the doorbell (`wake_netpoll_parker`) or the
+        // period, so the core's idle thread can halt with its tick stopped. A `wfi` here kept
+        // the core on its 1 ms tick (`docs/archive/HOOKED_IDLE_TICK.md`).
+        #[cfg(all(feature = "smoltcp", feature = "hooked-sched"))]
+        threading::schedule_blocking(timer::uptime_us().saturating_add(NETPOLL_PARK_US));
+        #[cfg(all(feature = "smoltcp", kernel_smp_shared, not(feature = "hooked-sched")))]
         {
             akuma_exec::bkl::leave_kernel();
             // IRQs are enabled; the timer/RX/SGI IRQ wakes us and its handler
@@ -2381,6 +2406,10 @@ fn ring_netpoll_doorbell() {}
 #[cfg(feature = "smoltcp")]
 #[cfg(target_os = "none")]
 fn ring_netpoll_doorbell() {
+    // The hooked netpoll loop parks between laps rather than halting, so an interrupt alone
+    // does not resume it: wake it.
+    #[cfg(feature = "hooked-sched")]
+    threading::wake_netpoll_parker();
     #[cfg(kernel_smp_shared)]
     if !NETPOLL_WAKE_PENDING.swap(true, core::sync::atomic::Ordering::AcqRel) {
         // Wake EVERY core, not just the ones with a parked socket waiter.

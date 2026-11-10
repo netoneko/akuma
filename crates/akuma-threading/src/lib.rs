@@ -658,6 +658,26 @@ pub fn wake_handle_for_thread(tid: usize) -> WakeHandle {
     WakeHandle::new(tid, thread_generation(tid))
 }
 
+/// The netpoll loop's own handle while it parks between laps (`u64::MAX`: none). A packet
+/// or a loopback push rings the netpoll doorbell, which wakes it through here.
+static NETPOLL_PARKER: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Register the calling thread as the netpoll loop that parks between laps
+/// ([`wake_netpoll_parker`] wakes it). Called by that thread itself, so its handle is live.
+pub fn register_netpoll_parker() {
+    NETPOLL_PARKER.store(current_wake_handle().0, Ordering::Release);
+}
+
+/// Wake the parked netpoll loop, if one registered. Lock-free and allocation-free, so an
+/// interrupt handler may call it; a wake that lands before the loop parks is kept by the
+/// sticky woken flag [`schedule_blocking`] checks, and a stale handle does nothing.
+pub fn wake_netpoll_parker() {
+    let raw = NETPOLL_PARKER.load(Ordering::Acquire);
+    if raw != u64::MAX {
+        wake_by_handle(WakeHandle(raw));
+    }
+}
+
 /// Generation-validated wake: the WAITING→READY transition fires only if the
 /// slot still hosts the incarnation the handle names. Refusal has no side
 /// effect — not even the sticky `WOKEN_STATES` flag, which on a stale tid

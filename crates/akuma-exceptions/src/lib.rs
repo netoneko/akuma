@@ -2450,7 +2450,9 @@ pub fn irq_hooked(el0: Option<FrameHandle>) {
             akuma_gic::end_of_interrupt(irq);
             // The tick preempts EL1 code as well as EL0, as the SGI path's does, under the
             // same gates (`el1_preemptible`): kernel threads need not yield to share a core.
-            preempt = irq == akuma_gic::SGI_SCHEDULER
+            // The timer interrupt is a preemption point by itself: the hooked tick rings
+            // no self-SGI (`timer_irq_handler`).
+            preempt = (irq == akuma_gic::SGI_SCHEDULER || irq == akuma_gic::TIMER_PPI)
                 && (from_el0 || akuma_exec::threading::el1_preemptible());
         }
         None => {

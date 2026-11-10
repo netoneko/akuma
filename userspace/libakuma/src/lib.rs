@@ -223,6 +223,7 @@ pub mod syscall {
         pub const FCHOWNAT: u64 = 54;
         pub const CLONE: u64 = 220;
         pub const WAIT4: u64 = 260;
+        pub const PPOLL: u64 = 73;
         /// Select a box's network stack (`0` smoltcp, `1` NetBSD rump).
         pub const SET_BOX_STACK: u64 = 324;
         /// Real Linux asm-generic numbers, used only by the `linux-abi`
@@ -319,6 +320,7 @@ pub mod syscall {
         pub const FCHOWNAT: u64 = 260;
         pub const CLONE: u64 = 56;
         pub const WAIT4: u64 = 61;
+        pub const PPOLL: u64 = 271;
         /// Select a box's network stack (`0` smoltcp, `1` NetBSD rump).
         pub const SET_BOX_STACK: u64 = AKUMA_PRIVATE_BASE + 324;
         /// Real x86_64 numbers for the `linux-abi` `spawn_full` path, the
@@ -1123,6 +1125,35 @@ pub fn listen(fd: i32, backlog: i32) -> i32 {
         backlog as u64,
         0, 0, 0, 0,
     ) as i32
+}
+
+/// One `struct pollfd`: the fd, the events asked for, the events that happened.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+/// Readable (or, on a listening socket, a connection is waiting to be accepted).
+pub const POLLIN: i16 = 0x001;
+
+/// Wait until one of `fds` is ready or `timeout_ms` passes (`< 0`: no timeout), as
+/// `poll(2)`. Issued as `ppoll` with no signal mask, which both architectures have.
+/// Returns how many fds have events (0 on timeout), or a negative errno.
+pub fn poll(fds: &mut [PollFd], timeout_ms: i32) -> isize {
+    let ts;
+    let tsp = if timeout_ms < 0 {
+        0
+    } else {
+        ts = Timespec {
+            tv_sec: i64::from(timeout_ms / 1000),
+            tv_nsec: i64::from(timeout_ms % 1000) * 1_000_000,
+        };
+        &ts as *const Timespec as u64
+    };
+    syscall(syscall::PPOLL, fds.as_mut_ptr() as u64, fds.len() as u64, tsp, 0, 0, 0) as i64 as isize
 }
 
 /// Accept a connection
