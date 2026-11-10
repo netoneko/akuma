@@ -808,6 +808,10 @@ fn teardown_child(pid: u32, stdout_fd: u32, stdin_fd: i32) {
     // ESRCH when the child is not a group leader, EPERM on kernels without
     // group kill — both fine, the direct kill above already went out.
     let _ = kill_signal(session_policy::group_signal_target(pid), SIGKILL);
+    // sshd does not setsid its children, so the shell is rarely a group leader and
+    // the group kill above finds nothing: take the shell's descendants down by
+    // walking /proc (best effort: a box without /proc mounted simply has none to find).
+    kill_descendants(pid);
     // Closing a pty master also hangs the terminal up (SIGHUP + SIGCONT to the
     // session and foreground group), which is what OpenSSH relies on.
     close(stdout_fd as i32);
@@ -815,6 +819,35 @@ fn teardown_child(pid: u32, stdout_fd: u32, stdin_fd: i32) {
         close(stdin_fd);
     }
     reap_child(pid);
+}
+
+/// SIGKILL every transitive child of `root`, found through `/proc/<pid>/stat`'s ppid.
+fn kill_descendants(root: u32) {
+    let Some(dir) = read_dir("/proc") else { return };
+    let mut procs: Vec<(u32, u32)> = Vec::new();
+    for e in dir {
+        let Ok(pid) = e.name.parse::<u32>() else { continue };
+        let fd = open(&format!("/proc/{}/stat", pid), open_flags::O_RDONLY);
+        if fd < 0 {
+            continue;
+        }
+        let mut buf = [0u8; 256];
+        let n = read_fd(fd, &mut buf);
+        close(fd);
+        if n > 0
+            && let Some(ppid) = session_policy::parse_ppid(&buf[..n as usize])
+        {
+            procs.push((pid, ppid));
+        }
+    }
+    let mut kids = [0u32; 128];
+    let n = session_policy::descendants(root, &procs, &mut kids);
+    if n > 0 {
+        eprintln(&format!("[SSHD] killing {} descendant(s) of pid {}", n, root));
+    }
+    for &k in &kids[..n] {
+        kill_signal(k, SIGKILL);
+    }
 }
 
 /// Wait (bounded) for a SIGKILLed child and reap it, as OpenSSH's SIGCHLD
@@ -847,6 +880,10 @@ async fn bridge_process(
     match bridge_process_inner(stream, session, pid, stdout_fd, child_stdin, pty).await {
         Ok(report) => report,
         Err(e) => {
+            eprintln(&format!(
+                "[SSHD] Session pid {}: bridge ended with {:?} ({}) - killing and reaping the child",
+                pid, e.kind(), e.message
+            ));
             // stdin fd (if the bridge opened it) is closed by process exit.
             teardown_child(pid, stdout_fd, -1);
             Err(e)
@@ -993,7 +1030,16 @@ async fn bridge_process_inner(
             // stdout in the same tick, so it can't await a would-block read
             // (see `SshStream::try_read`).
             match stream.try_read(&mut ssh_buf) {
-                Ok(0) => client_done = true, // peer closed its write side (TCP)
+                // TCP EOF. Not "done sending": an SSH client says that with
+                // CHANNEL_EOF (handled below) and OpenSSH treats a bare TCP EOF as
+                // the peer being gone and ends the session - so do we. Waiting on
+                // it left a dead client's shell running until the idle watch's
+                // probe grace ran out (up to 2 minutes at the defaults).
+                Ok(0) => {
+                    eprintln(&format!("[SSHD] Session pid {}: client closed the connection - tearing down", pid));
+                    teardown_child(pid, stdout_fd, stdin_fd);
+                    return Ok(Ok(()));
+                }
                 Ok(n) => {
                     did_io = true;
                     // Any inbound byte — even one belonging to a packet the
@@ -1081,6 +1127,41 @@ async fn bridge_process_inner(
                             set_terminal_size(stdout_fd as i32, w as u16, h as u16);
                         }
                     }
+                }
+            }
+        } else {
+            // The client has finished SENDING (CHANNEL_EOF, or a TCP FIN) but the
+            // socket still has to be watched. Without this, a client that died
+            // after its FIN was never noticed (its RST, provoked by our probe,
+            // sat unread) and a live one's keepalive replies never counted as
+            // life, so the idle watch could only fire after the full probe
+            // grace (up to 2 minutes at the defaults) - or kill a healthy
+            // `ssh host longcmd </dev/null` that was answering every probe.
+            let mut drain = [0u8; 512];
+            match stream.try_read(&mut drain) {
+                // TCP EOF after the client's CHANNEL_EOF: it hung up for good.
+                Ok(0) => {
+                    eprintln(&format!("[SSHD] Session pid {}: client closed the connection - tearing down", pid));
+                    teardown_child(pid, stdout_fd, stdin_fd);
+                    return Ok(Ok(()));
+                }
+                Ok(n) => {
+                    did_io = true;
+                    session.watch.note_activity(now_ms());
+                    session.input_buffer.extend_from_slice(&drain[..n]);
+                    // Keep the cipher's sequence numbers in step; the content
+                    // (probe replies, window adjusts) needs no action.
+                    while process_encrypted_packet(session).is_some() {}
+                }
+                Err(e) if e.kind() == NetErrorKind::WouldBlock
+                    || e.kind() == NetErrorKind::Interrupted => {}
+                Err(e) => {
+                    eprintln(&format!(
+                        "[SSHD] Session pid {}: socket failed after client EOF ({:?}) — tearing down",
+                        pid, e
+                    ));
+                    teardown_child(pid, stdout_fd, stdin_fd);
+                    return Ok(Ok(()));
                 }
             }
         }
