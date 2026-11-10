@@ -448,3 +448,41 @@ candidate 8.8–20.7 ms) — a tick-granularity threshold under KVM, not this ch
 `[Memory] Detected from DTB: base=0x40000000, size=512 MB` line is identical in all six. The final
 binary differs from the tested one only by doc-comment moves: `.text` identical, one panic-location
 byte in `.rodata`.
+
+W1c at **SMP=2** (one pair, Lima, after the commit): candidate **323/1** (the same latency threshold),
+baseline 322/2 — it also failed `orphan reparented to init (shell did not exit in 10s)` and did not reach
+herd. A baseline flake, recorded so the pair reads honestly; not investigated.
+
+## W2 — `usermode.rs` shrinks
+
+### W2a — the boot self-tests move to `usermode/tests.rs` (2026-11-10)
+
+`amd64/src/usermode.rs` was 9,277 lines and a third of it was `#[cfg(not(feature = "no-tests"))]`
+items. They are now the child module `amd64/src/usermode/tests.rs` (2,979 lines moved, unchanged): the
+22 `pub fn *_test(t: &mut Suite)` entry points, their private helpers (`run_sh_capture`,
+`for_each_pt_load`, `socketpair_test`, `argv_capacity_test`, `reject_test`, ...), the test-process
+plumbing (`start_test_process`, `wait_test_exit`, `finish_test_process`), the hand-assembled program
+(`build_user_program`, `Image::new`, `Image::from_elf` — a second `impl Image` block in the child), and
+the embedded probe ELFs. One `cfg` on `mod tests;` replaces the per-item gates; `usermode.rs` re-exports
+the 22 entry points by name, so `boot.rs`'s `usermode::*_test` calls did not change.
+
+**A child module, not a tests crate.** The tests reach `usermode`'s private state (`Image`'s fields,
+`PROCS`, `SPAWN`, `reap_exec_process`); a child sees it through `use super::*` without widening anything,
+a crate would need all of it `pub`. The extraction was by script (each gated item with its leading
+doc/attribute block, cut at the column-0 or column-4 closing brace), checked by the compiler and the
+image below. Fixed in passing: W5a had put `wait_test_exit` between `finish_test_process` and its doc
+comment, which the move would have carried; each has its own doc again.
+
+**Gates.** clippy `-D warnings`, amd64 default and `no-tests`. The `no-tests` image's `.text` is
+**byte-identical** to the stashed-HEAD build; `.rodata` differs in 5 words, each a panic-location line
+number in `usermode.rs` moved up by the removed lines (415→386, 448→419, 4297→4039, ...). PVH TCG,
+interleaved against the stashed HEAD, 2 rounds: SMP=1 **827/0** in 4/4; SMP=4 baseline 837/0 in 2/2,
+candidate 837/0 in 1/2 and one run that stopped after `net: netpoll daemon spawned [OK]` until the 600 s
+timeout — the known TCG SMP=4 post-netpoll stall (no failed check; the next round passed in 15 s).
+
+### M3 — option (ii) is final
+
+Recorded here because the handoff asked for the decision with W2: M3a (`akuma_user_tree::fork_leaf`
+plus `fork_leaf_agrees_with_plan_clone`) already pins amd64's leaf walker to `plan_clone`'s decision
+table. Option (i) would replace the hottest SMP-sensitive path in the kernel with a second, raw-entry
+walker to buy a property the agreement test already guarantees. Not doing it.
