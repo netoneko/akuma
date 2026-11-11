@@ -2048,3 +2048,10 @@ probe passes. A slice-1 guest that only did refused connects survived 70 s. The 
 follow no workload. All of it ran under TCG on a laptop on battery, so host throttling is not ruled
 out. It is open, and it predates both slices. The next step is the same freeze under
 `ring0-preempt`, with `GDB=1` attached when it stops to read where the vCPU is.
+
+**Correction (2026-11-11, later the same day): it was QEMU, not the guest.** The guest kept running
+throughout: its clock, scheduler, netpoll daemon and sshd's accept loop were all live. QEMU's main loop
+was stuck in its timer list holding the BQL, with both vCPUs blocked on it mid-MMIO store. The trigger
+was `akuma_lapic_amd64::start_timer` writing the periodic LVT before the new count, leaving a 32 ns
+periodic timer for one store. Unrelated to either slice. Fixed by zeroing the count first:
+`docs/archive/AMD64_LAPIC_PERIODIC_SWITCH_QEMU_LIVELOCK.md`.

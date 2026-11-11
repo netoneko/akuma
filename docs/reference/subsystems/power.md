@@ -41,7 +41,7 @@ one one-shot of up to **100 ticks (1 s)** — the budget ramping with
 consecutive quiet laps (`akuma-kacho::WakeBudget`), floored again by the first
 wake that finds work. `idlesleep=<ticks>` caps the ceiling lower.
 
-Two invariants, both stated where they are enforced (`amd64/src/lapic.rs`):
+Three invariants, each stated where it is enforced (`amd64/src/lapic.rs`, `akuma-lapic-amd64`):
 
 1. **Deadline precision is not traded away.** A sub-tick futex deadline arms
    an exact one-shot (`arm_deadline`) and the long shot refuses to cover it;
@@ -52,6 +52,11 @@ Two invariants, both stated where they are enforced (`amd64/src/lapic.rs`):
    — on the fire (`credit_shot_fired`) or on an early IRQ wake
    (`settle_idle_shot`, which also pets the watchdog). `[IDLESTAT]
    halts= shots= shot_ticks_credited=` in the 30 s dump is the A/B evidence.
+3. **Never enter periodic mode with a one-shot count loaded.** `start_timer`
+   zeroes the initial count before writing the periodic LVT: a leftover count
+   of 1 (`arm_deadline`'s floor) makes a 32 ns periodic timer that QEMU's main
+   loop cannot catch up with while holding the BQL, and the guest's next MMIO
+   store waits on it forever (`archive/AMD64_LAPIC_PERIODIC_SWITCH_QEMU_LIVELOCK.md`).
 
 **Off by default.** `idlemwait` swaps the idle bracket's wait instruction for
 `mwait` (CPUID-gated, hint 0) as a third A/B arm. The decision procedure,
