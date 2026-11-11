@@ -985,6 +985,8 @@ pub fn run_all_tests() {
     // `box_mod::access` was pure-tested but uncalled, so none of these were enforced.
     #[cfg(feature = "sc-containers")]
     test_box_isolation_syscall_guards();
+    #[cfg(feature = "sc-containers")]
+    test_kill_box_removes_its_msgqueues();
 
     // `no-bkl-process` (Phase 3): ProcessBklGuard's ledger balance + latching, and the
     // real `cow_share_and_demote_range` pass fork's dropped-BKL window runs — pins what
@@ -8199,7 +8201,6 @@ fn test_stdcheck() {
     }
 }
 
-#[allow(dead_code)]
 /// Test the echo2 binary if it exists
 fn test_echo2() {
     const ECHO2_PATH: &str = "/bin/echo2";
@@ -9191,6 +9192,65 @@ fn test_msgqueue_box_isolation() {
             64,
             "[Test] msgqueue_box_isolation FAILED: id1={} id2={} id3={}\n",
             id1 as i64, id2 as i64, id3 as i64,
+        );
+    }
+}
+
+/// `kill_box` removes the box's message queues. They are keyed `(box_id, msqid)` and herd derives
+/// a box id from its name, so before the fix a box restarted under the same name inherited the
+/// previous generation's queues and undelivered messages (`docs/archive/DEAD_CODE_SWEEP_FINDINGS.md`
+/// §1: `cleanup_box_queues` existed and had no caller).
+#[cfg(feature = "sc-containers")]
+fn test_kill_box_removes_its_msgqueues() {
+    use crate::syscall::msgqueue::{
+        cleanup_box_queues, list_msg_queues, msgqueue_message_count, msgqueue_push_direct,
+    };
+    use crate::syscall::{handle_syscall, nr};
+    use akuma_exec::process::{
+        register_box, register_process, register_thread_pid, unregister_box, unregister_process,
+        unregister_thread_pid, BoxInfo,
+    };
+    use alloc::string::String;
+
+    const BOX_Q: u64 = 0x005E_C0DE;
+    register_box(BoxInfo {
+        id: BOX_Q,
+        name: String::from("msgq_teardown"),
+        root_dir: String::from("/"),
+        creator_pid: 1,
+        primary_pid: 1,
+        parent_box_id: Some(0),
+    });
+
+    // Create the queue as a process inside the box, then leave it.
+    let tid = akuma_exec::threading::current_thread_id();
+    let pid: u32 = 7741;
+    let mut proc = make_test_process(pid);
+    proc.box_id = BOX_Q;
+    register_process(pid, proc);
+    register_thread_pid(tid, pid);
+    let msqid = handle_syscall(NR_MSGGET, &[0x7e_a2d0, IPC_CREAT | 0o600, 0, 0, 0, 0]);
+    unregister_thread_pid(tid);
+    unregister_process(pid);
+
+    let created = (msqid as i64) > 0;
+    let pushed = created && msgqueue_push_direct(BOX_Q, msqid as u32, 1, b"stale");
+    let before = if created { msgqueue_message_count(BOX_Q, msqid as u32) } else { 0 };
+
+    // Kill it from the host box.
+    let killed = handle_syscall(nr::KILL_BOX, &[BOX_Q, 0, 0, 0, 0, 0]);
+    let left = list_msg_queues().iter().filter(|q| q.box_id == BOX_Q).count();
+    let _ = unregister_box(BOX_Q);
+    // A test that failed before the kill must not leave its queue behind for the next boot test.
+    cleanup_box_queues(BOX_Q);
+
+    if created && pushed && before == 1 && killed == 0 && left == 0 {
+        console::print("[Test] kill_box_removes_its_msgqueues PASSED\n");
+    } else {
+        crate::safe_print!(
+            128,
+            "[Test] kill_box_removes_its_msgqueues FAILED: msqid={} pushed={} before={} kill={} left={}\n",
+            msqid as i64, pushed, before, killed as i64, left,
         );
     }
 }

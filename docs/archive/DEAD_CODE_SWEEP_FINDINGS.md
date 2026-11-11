@@ -5,7 +5,17 @@ Actionable output of the dead-code measurement recorded in
 statistics and their interpretation; this one is the list of real defects the
 sweep surfaced, ranked by severity, with the evidence chain for each.
 
-**Status: nothing here is fixed. No source was edited.** Every claim below is
+**Status (corrected 2026-11-11):** §1 is fixed ([`MSGQUEUE_BOX_TEARDOWN.md`](MSGQUEUE_BOX_TEARDOWN.md)).
+§5's `run_all` is deleted. From "No action needed", the following were deleted in the pre-merge
+sweep ([`AKUMA_FEATURE_AUDIT.md`](AKUMA_FEATURE_AUDIT.md)):
+- `getchar_blocking` and `BUFFER_SIZE`; the rest of the UART input path stays;
+- `mark_thread_running` and `get_wake_time`;
+- `exec`, the legacy wrapper.
+
+`futex_wait_at_tgid_for_test` is now gated on `kernel_tests` instead of allowed. §2, §3 and §4
+stand: those tests are still parked, with the same reasons.
+
+**Original status (2026-08-07): nothing here is fixed. No source was edited.** Every claim below is
 read from the code at commit `d3f28d6` (branch `another-smp-attempt-0`) — none of
 it was observed at runtime, and nothing was booted to confirm. Verification steps
 are given per finding.

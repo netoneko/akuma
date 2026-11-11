@@ -68,6 +68,13 @@ pub(super) fn sys_kill_box(box_id: u64) -> u64 {
         return ESRCH;
     }
     akuma_vfs_glue::remove_box_namespace(box_id);
+    // The box's SysV message queues go with it. The table is keyed
+    // `(box_id, msqid)` and herd derives a box id from the box's name, so a
+    // restarted box would otherwise inherit the previous generation's queues
+    // and their undelivered messages. Every thread that could be parked on one
+    // was in the box and has just been killed, so no waiter is stranded.
+    #[cfg(feature = "sc-sysv-ipc")]
+    akuma_syscalls_ipc::cleanup_box_queues(box_id);
     0
 }
 

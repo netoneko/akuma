@@ -109,16 +109,13 @@ fn fd_wants_rump_poll_interval(_fd: i32) -> bool {
 
 /// True if any of the polled raw fd numbers (epoll interest list / ppoll fds)
 /// wants the tightened rump poll cadence (see `fd_wants_rump_poll_interval`).
-#[cfg(feature = "rump")]
+/// Its one caller is `sys_epoll_pwait`, hence the `sc-epoll` gate on both arms.
+#[cfg(all(feature = "rump", feature = "sc-epoll"))]
 fn any_fd_wants_rump_poll_interval(fds: &[u32]) -> bool {
     fds.iter().any(|&fd| fd_wants_rump_poll_interval(fd as i32))
 }
 
-// Sole caller is `sys_epoll_pwait`; a build with no `sc-epoll` and no `rump`
-// compiles neither the rump variant above nor the caller. Allow rather than
-// mirroring the sc-epoll gate here.
-#[allow(dead_code)]
-#[cfg(not(feature = "rump"))]
+#[cfg(all(not(feature = "rump"), feature = "sc-epoll"))]
 fn any_fd_wants_rump_poll_interval(_fds: &[u32]) -> bool {
     false
 }

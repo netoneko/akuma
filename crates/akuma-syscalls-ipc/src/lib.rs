@@ -357,7 +357,6 @@ pub fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) 
 }
 
 /// Register a thread as interested in receiving from this queue (for epoll/poll).
-#[allow(dead_code)]
 pub fn msgqueue_add_recv_poller(box_id: u64, msqid: u32, tid: usize) {
     with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
@@ -368,7 +367,6 @@ pub fn msgqueue_add_recv_poller(box_id: u64, msqid: u32, tid: usize) {
 }
 
 /// Register a thread as interested in sending to this queue (for epoll/poll).
-#[allow(dead_code)]
 pub fn msgqueue_add_send_poller(box_id: u64, msqid: u32, tid: usize) {
     with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();
@@ -408,7 +406,6 @@ pub fn list_msg_queues() -> Vec<MsgQueueSnapshot> {
 // ============================================================================
 
 /// Test helper: return the number of recv pollers registered on a queue.
-#[allow(dead_code)]
 #[must_use]
 pub fn msgqueue_recv_pollers_count(box_id: u64, msqid: u32) -> usize {
     with_irqs_disabled(|| {
@@ -417,7 +414,6 @@ pub fn msgqueue_recv_pollers_count(box_id: u64, msqid: u32) -> usize {
 }
 
 /// Test helper: return the number of send pollers registered on a queue.
-#[allow(dead_code)]
 #[must_use]
 pub fn msgqueue_send_pollers_count(box_id: u64, msqid: u32) -> usize {
     with_irqs_disabled(|| {
@@ -426,7 +422,6 @@ pub fn msgqueue_send_pollers_count(box_id: u64, msqid: u32) -> usize {
 }
 
 /// Test helper: check if a specific tid is registered as a recv poller.
-#[allow(dead_code)]
 #[must_use]
 pub fn msgqueue_is_recv_poller(box_id: u64, msqid: u32, tid: usize) -> bool {
     with_irqs_disabled(|| {
@@ -435,7 +430,6 @@ pub fn msgqueue_is_recv_poller(box_id: u64, msqid: u32, tid: usize) -> bool {
 }
 
 /// Test helper: directly push a message into a queue (bypasses userspace pointer validation).
-#[allow(dead_code)]
 #[must_use]
 pub fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[u8]) -> bool {
     with_irqs_disabled(|| {
@@ -459,7 +453,6 @@ pub fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[u8]) ->
 }
 
 /// Test helper: pop a message from a queue (bypasses userspace pointer validation).
-#[allow(dead_code)]
 #[must_use]
 pub fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc::vec::Vec<u8>)> {
     with_irqs_disabled(|| {
@@ -485,7 +478,6 @@ pub fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc::vec::
 }
 
 /// Test helper: return the number of messages in the queue.
-#[allow(dead_code)]
 #[must_use]
 pub fn msgqueue_message_count(box_id: u64, msqid: u32) -> usize {
     with_irqs_disabled(|| {
@@ -493,8 +485,10 @@ pub fn msgqueue_message_count(box_id: u64, msqid: u32) -> usize {
     })
 }
 
-/// Called from sys_kill_box to remove all queues belonging to a box.
-#[allow(dead_code)]
+/// Remove every queue belonging to a box, without waking anyone parked on one.
+///
+/// Called from `akuma-syscalls-glue`'s `sys_kill_box` after the box's threads
+/// are killed, which is what makes not waking them correct.
 pub fn cleanup_box_queues(box_id: u64) {
     with_irqs_disabled(|| {
         let mut table = MSGQUEUE_TABLE.lock();

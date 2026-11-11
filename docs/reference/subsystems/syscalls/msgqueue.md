@@ -16,7 +16,7 @@ when off, see [`../syscalls.md`](../syscalls.md) "Feature gates").
 ## Per-box key isolation
 
 `MSGQUEUE_TABLE: Spinlock<BTreeMap<(u64, u32), MsgQueue>>`
-(`src/syscall/msgqueue.rs:40`) is keyed by `(box_id, msqid)`, **not** just
+(`crates/akuma-syscalls-ipc/src/lib.rs`) is keyed by `(box_id, msqid)`, **not** just
 `msqid`. SysV keys (the `key_t` passed to `msgget`) are small integers a
 process picks (often via `ftok`), visible to any process on the system on
 real Linux — scoping the table by `box_id` stops a process in one
@@ -24,6 +24,15 @@ container from opening a queue that happens to share a key with another
 container's queue. `msqid`s themselves are allocated from a single global
 `NEXT_MSQID` atomic (simpler than per-box counters; the 32-bit space is in
 no danger of exhaustion).
+
+**A box's queues die with the box.** `sys_kill_box` calls
+`cleanup_box_queues(box_id)` after the kill has taken, without waking
+anyone: every thread that could be parked on one of those queues was in the
+box. This is required, not tidy-up — herd derives a box id from the box's
+name, so a box restarted under the same name gets the same id and would
+otherwise inherit the previous generation's queues and undelivered messages.
+Boot test: `test_kill_box_removes_its_msgqueues`
+([`../../../archive/MSGQUEUE_BOX_TEARDOWN.md`](../../../archive/MSGQUEUE_BOX_TEARDOWN.md)).
 
 ## msgget
 
@@ -67,7 +76,8 @@ event, unlike pipe/futex which wake immediately.
 
 ## Background
 
-No dedicated postmortem doc exists for this family — it was implemented
+[`../../../archive/MSGQUEUE_BOX_TEARDOWN.md`](../../../archive/MSGQUEUE_BOX_TEARDOWN.md)
+— queues outlived their box. Otherwise the family was implemented
 directly against the SysV IPC spec (`docs/archive/SPLIT_SYSCALLS.md` covers
 the `src/syscall/` split generally but predates this module). See
 [`../syscalls.md`](../syscalls.md) "The `src/syscall/` split" for where

@@ -415,7 +415,6 @@ pub fn sched_bklfree_el0_enabled() -> bool {
 
 /// Enable/disable the BKL-free EL0-preempt scheduler path (M5c step 2). Default ON since
 /// 2026-07-24 (the ticket-leak fix above). Kept toggleable for A/B debugging.
-#[allow(dead_code)]
 pub fn set_sched_bklfree_el0_enabled(on: bool) {
     SCHED_BKLFREE_EL0_ENABLED.store(on, Ordering::Relaxed);
 }

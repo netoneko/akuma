@@ -3,8 +3,6 @@
 //! These types have no architecture-specific dependencies and can be
 //! compiled and tested on the host.
 
-#![allow(dead_code)]
-
 use alloc::string::String;
 
 /// Compile-time constant for static array sizes, and the ceiling

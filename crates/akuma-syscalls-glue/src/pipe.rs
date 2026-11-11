@@ -260,7 +260,6 @@ fn write_inner(id: u32, data: &[u8], raise_sigpipe: bool) -> Result<usize, i32> 
 // Callers live on the rump-sysproxy paths (`not(smoltcp)` sendmsg, `feature = "rump"`
 // proxy) and in the boot tests; a smoltcp + no-tests build without rump compiles
 // none of them. Allow rather than cfg-mirror three caller gates.
-#[allow(dead_code)]
 pub fn pipe_write_all_blocking(id: u32, data: &[u8]) -> Result<(), i32> {
     let mut off = 0usize;
     while off < data.len() {

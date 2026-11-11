@@ -3,8 +3,6 @@
 //! These types have no architecture-specific or runtime dependencies
 //! and can be compiled and tested on the host.
 
-#![allow(dead_code)]
-
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;

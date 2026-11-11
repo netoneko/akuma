@@ -2,8 +2,6 @@
 //!
 //! No architecture-specific or runtime dependencies - fully host-testable.
 
-#![allow(dead_code)]
-
 use alloc::string::String;
 
 pub const DEBUG_ELF_LOADING: bool = true;

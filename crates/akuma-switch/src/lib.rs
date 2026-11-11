@@ -509,7 +509,6 @@ pub fn entry_trampoline_addr() -> u64 { akuma_threading_hooked_thread_entry_tram
 // ── fresh-stack writers ─────────────────────────────────────────────────────────────────────────────────
 
 /// How much of a stack's top the writers below may touch: a frame plus the register file, nothing deeper.
-#[allow(dead_code)]
 const SEED_WINDOW: usize = 4096;
 
 /// A stack's region, vouched by its owner.

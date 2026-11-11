@@ -32,7 +32,7 @@ akuma-dmesg = { path = "../akuma-dmesg" }
 akuma-machine-facts = { path = "../akuma-machine-facts" }
 akuma-fdt = { path = "../akuma-fdt" }
 akuma-firecracker = { path = "../akuma-firecracker" }
-akuma-syscalls-time = { path = "../akuma-syscalls-time" }
+akuma-syscalls-time = { path = "../akuma-syscalls-time", optional = true }
 akuma-timer = { path = "../akuma-timer" }
 akuma-uart = { path = "../akuma-uart" }
 
@@ -40,9 +40,8 @@ akuma-uart = { path = "../akuma-uart" }
 # See akuma-kernel-glue's `pmm-instr`: gates the `fpcache::len` re-export.
 pmm-instr = []
 # Mirrors the root package's own toggles of the same name — each needs to
-# reach this crate's build.rs so `kernel_tests`/
-# `kernel_bkl_smp` come out the same here as in the bin crate. See
-# `build.rs`.
+# reach this crate's build.rs so `kernel_tests` comes out the same here as in
+# the bin crate. See `build.rs`.
 no-tests = []
 # `trigger_sgi_self` (timer.rs) is itself `#[cfg(kernel_bkl_smp)]` inside
 # akuma-gic, gated on akuma-gic's OWN feature — forward this one, unlike the
@@ -55,7 +54,9 @@ net-profile = ["akuma-net/net-profile"]
 # `akuma-kernel-glue/Cargo.toml`) — a missing forward silently picks QEMU virt.
 platform-firecracker = ["akuma-boot-aarch64/platform-firecracker"]
 bkl-profile = []
-smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
+# `ntp_boot` (the boot-time SNTP over a UDP socket) is the only user of
+# `akuma-syscalls-time` here.
+smoltcp = ["dep:smoltcp", "akuma-net/smoltcp", "dep:akuma-syscalls-time"]
 
 [lints]
 workspace = true

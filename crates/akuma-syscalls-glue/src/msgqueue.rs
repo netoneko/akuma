@@ -18,7 +18,7 @@ pub use akuma_syscalls_ipc::{sys_msgctl, sys_msgget, sys_msgrcv, sys_msgsnd};
 /// most annoying shape of build break to discover.
 #[cfg(kernel_tests)]
 pub use akuma_syscalls_ipc::{
-    msgqueue_add_recv_poller, msgqueue_add_send_poller, msgqueue_is_recv_poller,
+    cleanup_box_queues, list_msg_queues, msgqueue_add_recv_poller, msgqueue_add_send_poller, msgqueue_is_recv_poller,
     msgqueue_message_count, msgqueue_pop_direct, msgqueue_push_direct,
     msgqueue_recv_pollers_count, msgqueue_send_pollers_count,
 };

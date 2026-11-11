@@ -131,13 +131,6 @@ pub use akuma_primitives::safe_print;
 // See docs/WAIT_QUEUES.md for detailed documentation.
 // ============================================================================
 
-/// Get the current exception stack pointer from TPIDR_EL1
-#[inline]
-#[allow(dead_code)]
-pub fn get_current_exception_stack() -> u64 {
-    akuma_cpu::sysreg::tpidr_el1()
-}
-
 pub use akuma_exec::threading::UserTrapFrame;
 
 /// ESR_EL1 exception class values

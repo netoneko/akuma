@@ -1,6 +1,7 @@
 //! System tests for threading and other core functionality
 //!
-//! Run with `tests::run_all()` after scheduler initialization.
+//! Entered through `run_memory_tests`, `run_threading_tests` and `run_benchmarks`
+//! (see this crate's `lib.rs`), after scheduler initialization.
 //! If tests fail, the kernel should halt.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -387,16 +388,12 @@ pub fn run_threading_tests() -> bool {
 
     // NEON/FP register save/restore tests.
     //
-    // The two `_across_yield` tests keep values in caller-saved state (Q0-Q3, FPCR/FPSR) across a
-    // `yield_now()` call. That holds on the SGI path, whose yield is a self-SGI through the IRQ
-    // entry that saves the whole vector file; the hooked path's yield is an ordinary call, which
-    // preserves what AAPCS64 says a call preserves (d8-d15) and no more. User threads are not
-    // affected: their FP state is in the EL0 trap frame. The `_across_preemption` tests run on
-    // both paths: the tick preempts kernel threads on each, through an IRQ entry that saves the
-    // whole vector file (`docs/archive/HOOKED_EL1_PREEMPTION.md`).
-    console::print("\n[TEST] NEON registers across voluntary yields\n  [SKIP] SGI scheduler only\n");
+    // There is no voluntary-yield variant: a kernel thread's `yield_now()` is an ordinary call,
+    // which preserves what AAPCS64 says a call preserves (d8-d15) and no more, so caller-saved
+    // FP state across it is not a kernel guarantee. User threads keep theirs in the EL0 trap
+    // frame. The tick preempts kernel threads through an IRQ entry that saves the whole vector
+    // file, which is what these two check (`docs/archive/HOOKED_EL1_PREEMPTION.md`).
     run_test_heavy!(test_neon_regs_across_preemption, "neon_regs_across_preemption");
-    console::print("\n[TEST] FPCR/FPSR across yields\n  [SKIP] SGI scheduler only\n");
     run_test_heavy!(test_fp_arithmetic_across_preemption, "fp_arithmetic_across_preemption");
 
     // Parallel process tests (requires /bin/hello)
@@ -504,18 +501,6 @@ fn test_terminal_syscalls() -> bool {
 
     crate::safe_print!(64, "  Result: {}\n", if all_ok { "PASS" } else { "FAIL" });
     all_ok
-}
-
-/// Run all system tests - returns true if all pass
-/// Note: This runs both memory and threading tests together.
-/// For finer control, use run_memory_tests() and run_threading_tests() separately.
-#[allow(dead_code)]
-pub fn run_all() -> bool {
-    let mut all_pass = true;
-    all_pass &= run_memory_tests();
-    all_pass &= run_threading_tests();
-    run_benchmarks(); // always passes, just prints numbers
-    all_pass
 }
 
 
@@ -5874,91 +5859,12 @@ fn test_membarrier_private_expedited_succeeds() -> bool {
 
 static NEON_TEST_ERRORS: AtomicU32 = AtomicU32::new(0);
 
-/// Test: NEON registers survive voluntary yields.
-///
-/// One thread of the FPCR-preservation test: set the rounding mode to `fpcr_val`
-/// and re-read it across 30 yields, counting every yield that came back with a
-/// different mode.
-///
-/// FPCR is the *control* half of the NEON state — a kernel that saves the Q
-/// registers but not FPCR passes [`neon_yield_thread`] and fails here, which is why
-/// this is a separate test rather than more assertions in that one. Only bits 23:22
-/// (RMode) are compared; the rest of FPCR is not under test.
-fn fpcr_rmode_thread(fpcr_val: u64, done: &'static AtomicBool) -> ! {
-    let mut errors: u32 = 0;
-    akuma_cpu::sysreg::set_fpcr(fpcr_val);
-
-    for _ in 0..30 {
-        threading::yield_now();
-        let read_back = akuma_cpu::sysreg::fpcr();
-        if (read_back & (3 << 22)) != (fpcr_val & (3 << 22)) {
-            errors += 1;
-        }
-    }
-    if errors > 0 { NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed); }
-    done.store(true, Ordering::Release);
-    threading::mark_current_terminated();
-    loop { threading::yield_now(); akuma_cpu::park::wfi(); }
-}
-
-/// One thread of [`test_neon_regs_across_yield`]: fill **Q0-Q3** with `pattern`,
-/// yield 50 times, and count every yield that came back with a register changed.
-///
-/// Was written twice — the two spawned closures differed only in the pattern
-/// constant and which `DONE_*` flag they set. Errors go to the shared
-/// `NEON_TEST_ERRORS` rather than a return value because the thread cannot return:
-/// it ends in the mark-terminated + park loop every test thread here ends in.
-fn neon_yield_thread(pattern: u64, done: &'static AtomicBool) -> ! {
-    let mut errors: u32 = 0;
-    unsafe {
-        core::arch::asm!(
-            "dup v0.2d, {p}",
-            "dup v1.2d, {p}",
-            "dup v2.2d, {p}",
-            "dup v3.2d, {p}",
-            p = in(reg) pattern,
-        );
-    }
-
-    for _ in 0..50 {
-        threading::yield_now();
-
-        let mut lo0: u64;
-        let mut lo1: u64;
-        let mut lo2: u64;
-        let mut lo3: u64;
-        unsafe {
-            core::arch::asm!(
-                "mov {lo0}, v0.d[0]",
-                "mov {lo1}, v1.d[0]",
-                "mov {lo2}, v2.d[0]",
-                "mov {lo3}, v3.d[0]",
-                lo0 = out(reg) lo0,
-                lo1 = out(reg) lo1,
-                lo2 = out(reg) lo2,
-                lo3 = out(reg) lo3,
-            );
-        }
-        if lo0 != pattern || lo1 != pattern || lo2 != pattern || lo3 != pattern {
-            errors += 1;
-        }
-    }
-    if errors > 0 {
-        NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
-    }
-    done.store(true, Ordering::Release);
-    threading::mark_current_terminated();
-    loop { threading::yield_now(); akuma_cpu::park::wfi(); }
-}
-
 /// One thread of [`test_neon_regs_across_preemption`]: fill **Q4-Q7** with
 /// `pattern` and busy-loop for 30 ms, re-checking as fast as it can.
 ///
-/// Deliberately a *separate* helper from [`neon_yield_thread`] rather than one
-/// parameterised body. The two differ in the register bank they occupy (Q0-Q3 vs
-/// Q4-Q7), and `asm!` register names cannot be parameters — but more importantly
-/// the difference is the coverage: the two banks are saved by different code paths
-/// and folding them together would quietly halve what these tests watch.
+/// It fills Q4-Q7. Until 2026-11-11 a sibling voluntary-yield test filled Q0-Q3;
+/// it ran only on the SGI scheduler, whose yield entered through the IRQ path, and
+/// was deleted with that scheduler's last trace.
 fn neon_preempt_thread(pattern: u64, label: &'static str, done: &'static AtomicBool) -> ! {
     let mut errors: u32 = 0;
     unsafe {
@@ -6007,51 +5913,6 @@ fn neon_preempt_thread(pattern: u64, label: &'static str, done: &'static AtomicB
     loop { threading::yield_now(); akuma_cpu::park::wfi(); }
 }
 
-/// Two threads each load a distinct pattern into Q0-Q3, yield repeatedly, then
-/// verify the pattern is intact. If the kernel doesn't save/restore NEON across
-/// context switches the patterns will be mixed.
-#[allow(dead_code)]
-fn test_neon_regs_across_yield() -> bool {
-    console::print("\n[TEST] NEON registers across voluntary yields\n");
-
-    NEON_TEST_ERRORS.store(0, Ordering::SeqCst);
-
-    static DONE_A: AtomicBool = AtomicBool::new(false);
-    static DONE_B: AtomicBool = AtomicBool::new(false);
-    DONE_A.store(false, Ordering::SeqCst);
-    DONE_B.store(false, Ordering::SeqCst);
-
-    // Thread A: fills Q0-Q3 with 0xAAAA pattern
-    match threading::spawn_fn(|| neon_yield_thread(0xAAAA_AAAA_AAAA_AAAA, &DONE_A)) {
-        Ok(tid) => crate::safe_print!(32, "  Thread A: tid={}\n", tid),
-        Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
-    }
-
-    // Thread B: fills Q0-Q3 with 0x5555 pattern (opposite of A)
-    match threading::spawn_fn(|| neon_yield_thread(0x5555_5555_5555_5555, &DONE_B)) {
-        Ok(tid) => crate::safe_print!(32, "  Thread B: tid={}\n", tid),
-        Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
-    }
-
-    // Wait for both threads
-    for _ in 0..200 {
-        threading::yield_now();
-        if DONE_A.load(Ordering::Acquire) && DONE_B.load(Ordering::Acquire) { break; }
-    }
-
-    let cleaned = threading::cleanup_terminated_force();
-    let errors = NEON_TEST_ERRORS.load(Ordering::SeqCst);
-    let both_done = DONE_A.load(Ordering::Acquire) && DONE_B.load(Ordering::Acquire);
-    let pass = both_done && errors == 0;
-
-    crate::safe_print!(128,
-        "  done_a={} done_b={} errors={} cleaned={}\n",
-        DONE_A.load(Ordering::Acquire), DONE_B.load(Ordering::Acquire), errors, cleaned
-    );
-    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
-    pass
-}
-
 /// Test: NEON registers survive preemptive scheduling (busy-loop, no yield).
 ///
 /// Two threads busy-loop using NEON registers for a known duration. The timer
@@ -6093,51 +5954,6 @@ fn test_neon_regs_across_preemption() -> bool {
     crate::safe_print!(128,
         "  done_a={} done_b={} errors={} cleaned={}\n",
         P_DONE_A.load(Ordering::Acquire), P_DONE_B.load(Ordering::Acquire), errors, cleaned
-    );
-    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
-    pass
-}
-
-/// Test: FPCR/FPSR are preserved across context switches.
-///
-/// Sets FPCR rounding mode bits in two threads to different values, yields,
-/// and verifies they're still correct. Catches missing FPCR/FPSR save.
-#[allow(dead_code)]
-fn test_fpcr_fpsr_across_yield() -> bool {
-    console::print("\n[TEST] FPCR/FPSR across yields\n");
-
-    NEON_TEST_ERRORS.store(0, Ordering::SeqCst);
-
-    static F_DONE_A: AtomicBool = AtomicBool::new(false);
-    static F_DONE_B: AtomicBool = AtomicBool::new(false);
-    F_DONE_A.store(false, Ordering::SeqCst);
-    F_DONE_B.store(false, Ordering::SeqCst);
-
-    // Thread A: FPCR rounding mode = Round to Nearest (RMode=00, bits 23:22)
-    match threading::spawn_fn(|| fpcr_rmode_thread(0 << 22, &F_DONE_A)) {
-        Ok(_) => {}
-        Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
-    }
-
-    // Thread B: FPCR rounding mode = Round towards Plus Infinity (RMode=01)
-    match threading::spawn_fn(|| fpcr_rmode_thread(1 << 22, &F_DONE_B)) {
-        Ok(_) => {}
-        Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
-    }
-
-    for _ in 0..200 {
-        threading::yield_now();
-        if F_DONE_A.load(Ordering::Acquire) && F_DONE_B.load(Ordering::Acquire) { break; }
-    }
-
-    let cleaned = threading::cleanup_terminated_force();
-    let errors = NEON_TEST_ERRORS.load(Ordering::SeqCst);
-    let both_done = F_DONE_A.load(Ordering::Acquire) && F_DONE_B.load(Ordering::Acquire);
-    let pass = both_done && errors == 0;
-
-    crate::safe_print!(128,
-        "  done_a={} done_b={} errors={} cleaned={}\n",
-        F_DONE_A.load(Ordering::Acquire), F_DONE_B.load(Ordering::Acquire), errors, cleaned
     );
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass

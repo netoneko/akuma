@@ -208,6 +208,9 @@ const ICC_BPR1_EL1: &str = "S3_0_C12_C12_3";
 const ICC_IGRPEN1_EL1: &str = "S3_0_C12_C12_7";
 const ICC_IAR1_EL1: &str = "S3_0_C12_C12_0";
 const ICC_EOIR1_EL1: &str = "S3_0_C12_C12_1";
+// Only the targeted SGIs write it; the PE0-only `trigger_sgi` that needed it
+// unconditionally was deleted 2026-11-11.
+#[cfg(any(gic_per_core, kernel_bkl_smp))]
 const ICC_SGI1R_EL1: &str = "S3_0_C12_C11_5";
 
 #[inline]
@@ -355,27 +358,9 @@ pub fn end_of_interrupt(irq: u32) {
     let _ = ICC_EOIR1_EL1;
 }
 
-/// Trigger a Software Generated Interrupt to this CPU (affinity 0.0.0.0).
-// Unused under `kernel_bkl_smp` (self-targets via `trigger_sgi_core`); kept for the
-// default/single-core path.
-#[allow(dead_code)]
-pub fn trigger_sgi(sgi_id: u32) {
-    if sgi_id > 15 {
-        return;
-    }
-    // ICC_SGI1R_EL1: IRM=0 (use target list), Aff3/2/1 = 0, INTID at [27:24],
-    // TargetList bit 0 selects affinity-0 PE 0 (this CPU).
-    let val = (u64::from(sgi_id) << 24) | 1;
-    write_sysreg!("S3_0_C12_C11_5", val);
-    let _ = ICC_SGI1R_EL1;
-    dsb_ish();
-    isb();
-}
-
 /// Trigger an SGI on a SPECIFIC core, identified by its affinity-0 (`MPIDR & 0xff`).
 ///
-/// Unlike [`trigger_sgi`] (which hardcodes the target list to PE0), this targets one
-/// peer in cluster Aff1=0 by setting that PE's bit in the 16-bit TargetList. Valid for
+/// This targets one peer in cluster Aff1=0 by setting that PE's bit in the 16-bit TargetList. Valid for
 /// `aff0 < 16` (QEMU `virt` single cluster); larger affinities would need Aff1 routing.
 /// Used by real shared-kernel SMP for each core to ring its OWN scheduler SGI (the
 /// timer handler is shared, so it must self-target rather than hit PE0).
@@ -410,23 +395,6 @@ pub fn broadcast_sgi(sgi_id: u32) {
     let _ = ICC_SGI1R_EL1;
     dsb_ish();
     isb();
-}
-
-/// Set interrupt priority (0 = highest, 255 = lowest). Only SGI/PPI (< 32) is
-/// supported here, which covers Akuma's usage.
-#[allow(dead_code)]
-pub fn set_priority(irq: u32, priority: u8) {
-    if irq >= 32 {
-        return;
-    }
-    // GICR SGI_base IPRIORITYR is a byte-addressable array, device-mapped.
-    // Single-register `strb` (no writeback) keeps ISV=1 under HVF.
-    let addr = addr::DEV_GICR_SGI_VA + gicr_sgi::IPRIORITYR + irq as usize;
-    // SAFETY: `addr` is a device-mapped GIC MMIO register.
-    unsafe {
-        core::arch::asm!("strb {v:w}, [{a}]", v = in(reg) u32::from(priority), a = in(reg) addr,
-            options(nostack, preserves_flags));
-    }
 }
 
 /// Bring up THIS secondary's GICv3 receive path.
@@ -488,7 +456,8 @@ pub fn secondary_init(idx: usize, layout: RedistributorLayout) {
 /// affinity-0 field.
 ///
 /// The shared timer handler runs on whichever core took the tick, so it must
-/// self-target rather than hit PE0 the way [`trigger_sgi`] does. Lived in
+/// self-target rather than hit PE0 (the deleted single-core `trigger_sgi` hardcoded
+/// PE0's bit in the target list). Lived in
 /// `src/gic.rs` (the deleted backend dispatcher) — it is the one entry point
 /// there that was more than a `#[cfg]` forward.
 #[cfg(kernel_bkl_smp)]

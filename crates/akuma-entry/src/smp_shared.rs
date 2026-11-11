@@ -343,13 +343,11 @@ pub fn bringup_secondaries() {
 ///
 /// Consumed by the boot self-test in `process_tests.rs` (compiled out under `no-tests`,
 /// e.g. the devbox-smoltcp runtime image — hence `allow(dead_code)`).
-#[allow(dead_code)]
 pub fn online_secondary_count() -> usize {
     ONLINE_COUNT.load(Ordering::Acquire)
 }
 
 /// Number of cores the DTB reported (including the BSP). See `online_secondary_count`.
-#[allow(dead_code)]
 pub fn probed_core_count() -> usize {
     NUM_CORES.load(Ordering::Relaxed)
 }

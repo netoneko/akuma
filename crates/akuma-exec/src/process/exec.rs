@@ -71,20 +71,6 @@ pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]
 }
 
 #[cfg(feature = "elf-loader")]
-/// Execute an ELF binary from the filesystem (legacy API for backwards compatibility)
-///
-/// # Arguments
-/// * `path` - Path to the ELF binary
-///
-/// # Returns
-/// Exit code of the process, or error message
-#[allow(dead_code)]
-pub fn exec(path: &str) -> Result<i32, String> {
-    let (exit_code, _stdout) = exec_with_io(path, None, None)?;
-    Ok(exit_code)
-}
-
-#[cfg(feature = "elf-loader")]
 /// Execute a binary asynchronously and return its output when complete
 ///
 /// Spawns the process on a user thread and polls for completion,

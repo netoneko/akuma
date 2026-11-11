@@ -323,6 +323,58 @@ name. Effects:
 
 The other six `sc-*` stay individually settable.
 
+## Dead-code sweep before the merge (2026-11-11)
+
+The cheap pass: remove only what is provably dead now, and leave the "which kernel's copy wins"
+dead code to the merge. Method, the same as
+[`DEAD_CODE_SWEEP_FINDINGS.md`](DEAD_CODE_SWEEP_FINDINGS.md) used:
+- comment out every plain `#[allow(dead_code)]`;
+- `cargo check` 11 configurations with `RUSTFLAGS="-W dead_code"` in a scratch target dir. The
+  configurations are the 5 AArch64 feature sets, `platform-firecracker`, amd64 ± `no-tests`,
+  Taoxichuan on both arches, and the host tests;
+- `pub` items, which the lint never checks: search for callers across the tree.
+
+**Missing from that list: each crate built on its own** (`cargo clippy -p <crate>` on the host,
+with the crate's own default features), which is what the pre-commit hook runs. Two items are
+dead only there: a stub whose only caller needs `sc-epoll`, and a register constant whose users
+need `bkl-smp`/`gic_per_core`. The hook caught both. A future sweep should add the per-crate
+loop to its configurations.
+
+**Unused dependencies** (`cargo::unused_dependencies` with every crate rebuilt):
+- `akuma-net`'s `akuma-dns`, `akuma-net-yarn` and `embedded-io-async`, and `akuma-kernel-core`'s
+  `akuma-syscalls-time`, are now optional and enabled by `smoltcp`, the only feature their users
+  compile under.
+- `akuma-net`'s `log` stays. It carries `release_max_level_info` for every crate's `log` and is
+  the only crate that sets it, so the warning in the `extreme-size` build is expected (comment in
+  the manifest).
+
+**Blanket allows:**
+- `akuma-threading`'s crate-level `#![allow(dead_code)]` hid two functions
+  (`mark_thread_running`, `get_wake_time`, both deleted) and an AArch64-only stub compiled on
+  x86_64 (`thread_exit_stub`, now `cfg(target_arch = "aarch64")` like its one user).
+- Five module-level allows (`akuma-elf/types.rs`, `akuma-exec-core/{thread,process}.rs`,
+  `akuma-kernel-core/platform.rs`, `akuma-mmu/types.rs`) hid nothing and are gone.
+- The conditional ones (`no-tests`, no-`smoltcp`) stay. They cover test-only code in runtime
+  builds.
+
+**Item-level allows, 50:**
+
+| outcome | items |
+|---|---|
+| deleted, zero callers | `akuma_exec::process::exec` (legacy wrapper), `akuma_exec::pmm::leak_count` + `akuma_pmm::leak_count`, `akuma_exceptions::get_current_exception_stack`, `akuma_gic::set_priority`, `akuma_gic::trigger_sgi` (its last caller was a single-core arm folded away the same day; `unsafe` budget 410 → 409), `console::{print_as_akuma, getchar_blocking, BUFFER_SIZE}`, `akuma_vfs_glue::{unmount_in_namespace, list_namespace_mounts}`, `tests::run_all` |
+| deleted, could no longer pass | the two `_across_yield` NEON/FPCR boot tests and their two thread helpers. They held caller-saved FP state across `yield_now()`, which only the deleted SGI scheduler preserved; the `_across_preemption` pair still runs |
+| gated instead of allowed | `futex_wait_at_tgid_for_test` → `cfg(kernel_tests)`; glue's five rump hooks → `cfg(feature = "rump")`; `any_fd_wants_rump_poll_interval` → `sc-epoll` (its one caller's gate); `ICC_SGI1R_EL1` → the cfgs of the two targeted-SGI functions left using it |
+| allow kept, parked with a written reason | 6 allocator-pattern tests (hang under preemption), `test_term_state_lock_bounded…` (harness wedge), 5 msgqueue waker tests (real-slot crash), `test_forktest_parent_mmap` (config-gated) |
+| allow removed, item used or `pub` | the rest (24) |
+
+**One live defect turned up.** `cleanup_box_queues` still had no caller, three months after the
+first sweep recorded it, so SysV message queues outlived their box and a same-named restart
+inherited them. Fixed, with a boot test:
+[`MSGQUEUE_BOX_TEARDOWN.md`](MSGQUEUE_BOX_TEARDOWN.md).
+
+Not dead, just missing: x86_64 `sendfile` (40) is `ENOSYS` on amd64, and so is AArch64's (71). No
+`sendfile` exists in glue. busybox `cat` falls back to `read`.
+
 ## Proposed simplifications
 
 | # | change | risk | gate |

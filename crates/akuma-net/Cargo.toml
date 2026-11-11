@@ -24,8 +24,9 @@ bkl-smp = []
 # The native smoltcp TCP/IP stack: the smoltcp_net/socket/dns/http modules and
 # everything with smoltcp types in its signatures. Optional so a rump-only build
 # (devbox) can compile it out entirely. The rump path (rump_tap + the kernel
-# sysproxy client) is smoltcp-free and stays available without this.
-smoltcp = ["dep:smoltcp"]
+# sysproxy client) is smoltcp-free and stays available without this. The DNS
+# client, the wait loop and the async stream trait are used only by those modules.
+smoltcp = ["dep:smoltcp", "dep:akuma-dns", "dep:akuma-net-yarn", "dep:embedded-io-async"]
 # Raw L2 packet path (a second virtio-net NIC exposed as /dev/net/tap0) for the
 # kernel's `rump` feature. Adds crate::rump_tap (the hardware half); the
 # device-independent orchestration lives in the host-tested `akuma-rump` crate.
@@ -47,23 +48,27 @@ akuma-rump = { path = "../akuma-rump", optional = true }
 akuma-primitives = { path = "../akuma-primitives" }
 # The DNS A-record client: wire format and the resolver-walk loop, over effects
 # this crate wires to its UDP sockets (`dns::resolve_ipv4`).
-akuma-dns = { path = "../akuma-dns" }
+akuma-dns = { path = "../akuma-dns", optional = true }
 # The virtio-net device: DMA buffers, the NIC wrapper, and smoltcp's `Device`
 # impls. Every `unsafe` in networking lives there, which is why it is a crate.
 akuma-net-nic = { path = "../akuma-net-nic" }
 # The `wait_until` readiness state machine, extracted so its five
 # incident-driven rules have host tests instead of only a devbox boot.
 # See crates/akuma-net-yarn/src/lib.rs.
-akuma-net-yarn = { path = "../akuma-net-yarn" }
+akuma-net-yarn = { path = "../akuma-net-yarn", optional = true }
 # The virtio-net driver and the MMIO probe (`smoltcp_net::init` finds NIC0).
 akuma-virtio = { path = "../akuma-virtio" }
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
-embedded-io-async = { version = "0.6", default-features = false }
+embedded-io-async = { version = "0.6", default-features = false, optional = true }
 spinning_top = "0.3"
 # NOT `max_level_off`: that feature elides every `log::` macro at COMPILE time,
 # which made `smoltcp_net::init` silent and a hang inside it invisible (see
 # src/klog.rs and docs/archive/AKUMA_FIRECRACKER_KVM.md §5.1). Filtering is done
 # at runtime by the sink instead. `release_max_level_info` still drops
 # debug!/trace! statically, so smoltcp's per-packet tracing costs nothing.
+# This crate's own code calls no `log::` macro: the dependency is here for that
+# feature, which cargo unifies onto every crate's `log` (it is the only crate in
+# the tree that sets it). A build in which cargo reports it as an unused
+# dependency is right about the code and wrong about the purpose; keep it.
 log = { version = "0.4", default-features = false, features = ["release_max_level_info"] }
 

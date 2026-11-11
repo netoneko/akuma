@@ -2,8 +2,6 @@
 //!
 //! No architecture-specific dependencies - fully host-testable.
 
-#![allow(dead_code)]
-
 /// Page geometry and the neutral permission vocabulary, re-exported from
 /// `akuma-mmap`.
 ///

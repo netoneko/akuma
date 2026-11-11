@@ -29,7 +29,6 @@
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
-#![allow(dead_code)]
 // The lint allow-list this code was written against — ported verbatim from
 // `akuma-exec/src/lib.rs`, where it lived until 2026-09-02.
 #![allow(
@@ -1987,19 +1986,6 @@ pub fn release_initializing_thread(tid: usize) {
     }
 }
 
-/// Mark a thread as running (lock-free)
-#[track_caller]
-fn mark_thread_running(idx: usize) {
-    if idx < MAX_THREADS {
-        let prev = THREAD_STATES[idx].swap(thread_state::RUNNING, Ordering::SeqCst);
-        if prev == thread_state::TERMINATED {
-            let loc = core::panic::Location::caller();
-            safe_print!(160, "[REVIVE] tid={} TERMINATED->RUNNING at={}:{} by_tid={}\n",
-                idx, loc.file(), loc.line(), get_current_thread_register());
-        }
-    }
-}
-
 /// Mark a thread as waiting with a wake time (lock-free)
 #[track_caller]
 fn mark_thread_waiting(idx: usize, wake_time_us: u64) {
@@ -2016,15 +2002,6 @@ fn mark_thread_waiting(idx: usize, wake_time_us: u64) {
             safe_print!(160, "[REVIVE] tid={} TERMINATED->WAITING at={}:{} by_tid={}\n",
                 idx, loc.file(), loc.line(), get_current_thread_register());
         }
-    }
-}
-
-/// Get thread wake time (lock-free read)
-fn get_wake_time(idx: usize) -> u64 {
-    if idx < MAX_THREADS {
-        WAKE_TIMES[idx].load(Ordering::Relaxed)
-    } else {
-        0
     }
 }
 
@@ -3579,7 +3556,9 @@ pub fn setup_fake_irq_frame(
     )
 }
 
-/// Stub for thread exit - threads should never return here
+/// Stub for thread exit - threads should never return here. The return address
+/// [`setup_fake_irq_frame`] plants, so AArch64-only like it.
+#[cfg(target_arch = "aarch64")]
 extern "C" fn thread_exit_stub() -> ! {
     safe_print!(128, "[THREAD] Exit stub reached - marking terminated\n");
     mark_current_terminated();

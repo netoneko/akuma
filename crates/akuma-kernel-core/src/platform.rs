@@ -32,8 +32,6 @@
 //! Add a `machine` module with the same constants and a `feature` gate. Nothing
 //! outside this file should need a `#[cfg]` for it.
 
-#![allow(dead_code)]
-
 use akuma_exec::mmu::{self, DevRegion};
 use akuma_primitives::addr;
 

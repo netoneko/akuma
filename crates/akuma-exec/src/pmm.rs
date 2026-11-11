@@ -65,10 +65,6 @@ pub fn track_frame(frame: PhysFrame, source: FrameSource) {
 
 // `tracking_stats` moved out on 2026-09-01: exceptions.rs — its only caller —
 // reads `akuma_pmm::tracking_stats()` directly now.
-#[allow(dead_code)]
-pub fn leak_count() -> usize {
-    akuma_pmm::leak_count()
-}
 
 // ============================================================================
 // UAF hunt: free ledger, is_page_free, CoW event ledger — pure re-exports

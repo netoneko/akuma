@@ -1416,3 +1416,21 @@ const-assert `akuma_bkl::ACTIVE`. The 16 crates Taoxichuan shares keep the switc
 `kernel_bkl_smp` because Taoxichuan still serializes under its own lock. Merging the two locks is
 `proposals/ONE_BIG_KERNEL_LOCK.md`, deferred to the big merge. Taoxichuan images are
 byte-identical; the Akuma images move by codegen noise only (`AKUMA_FEATURE_AUDIT.md`).
+
+## The pre-merge dead-code sweep (2026-11-11)
+
+The cheap pass before the merge:
+- unused dependencies made optional;
+- blanket `dead_code` allows removed;
+- items with no caller deleted, including `gic::trigger_sgi`, whose last caller was a
+  single-core arm;
+- the two SGI-only `_across_yield` boot tests deleted.
+
+It surfaced one live defect: SysV message queues outlived their box. That is fixed, with a boot
+test (`MSGQUEUE_BOX_TEARDOWN.md`). The "which kernel's copy wins" dead code is left for the
+merge (`AKUMA_FEATURE_AUDIT.md`).
+
+Gates:
+- HVF default: SMP=1 has the known `thread_slot_reclaim_on_spawn` failure only; SMP=2 and SMP=4
+  are clean. Every prior test line is present, plus the new one.
+- amd64 TCG: SMP=1 829/0, SMP=2 839/0.

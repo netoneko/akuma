@@ -1430,30 +1430,31 @@ pub fn set_hooks(h: SyscallHooks) {
     HOOKS.set(h);
 }
 
-/// Which of these has a caller depends on the feature set — the rump five need
-/// `rump` — so the parity surface is
-/// deliberately wider than any single configuration uses. Same argument the
-/// virtio-audio stub carried: the syscall layer compiles unchanged either way.
-#[allow(dead_code)]
+/// The rump five exist only with `rump`, the only feature their callers compile under.
 pub(crate) mod hooks {
     use super::HOOKS;
 
+    #[cfg(feature = "rump")]
     pub fn box_is_rump(box_id: u64) -> bool {
         HOOKS.get().is_some_and(|h| (h.box_is_rump)(box_id))
     }
+    #[cfg(feature = "rump")]
     pub fn mark_box_rump(box_id: u64) {
         if let Some(h) = HOOKS.get() {
             (h.mark_box_rump)(box_id);
         }
     }
+    #[cfg(feature = "rump")]
     pub fn attach_server(box_id: u64, server_pid: akuma_exec::process::Pid) {
         if let Some(h) = HOOKS.get() {
             (h.attach_server)(box_id, server_pid);
         }
     }
+    #[cfg(feature = "rump")]
     pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
         HOOKS.get().and_then(|h| (h.intercept_box_syscall)(syscall_num, args))
     }
+    #[cfg(feature = "rump")]
     pub fn rump_socket_readable(rump_fd: i32) -> bool {
         HOOKS.get().is_some_and(|h| (h.rump_socket_readable)(rump_fd))
     }

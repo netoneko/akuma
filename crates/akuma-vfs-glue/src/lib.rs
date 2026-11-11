@@ -130,21 +130,6 @@ pub fn replace_box_root(box_id: u64, fs: Arc<dyn Filesystem>) -> Result<(), FsEr
     ns.mount.lock().replace_pristine_root("subdirfs", fs)
 }
 
-/// Unmount a path from a specific box's namespace.
-#[allow(dead_code)]
-pub fn unmount_in_namespace(box_id: u64, path: &str) -> Result<(), FsError> {
-    let namespaces = BOX_NAMESPACES.lock();
-    let ns = namespaces.get(&box_id).ok_or(FsError::NotFound)?;
-    ns.mount.lock().unmount(path)
-}
-
-/// List mounts in a specific box's namespace.
-#[allow(dead_code)]
-pub fn list_namespace_mounts(box_id: u64) -> Vec<MountInfo> {
-    let namespaces = BOX_NAMESPACES.lock();
-    namespaces.get(&box_id).map_or_else(Vec::new, |ns| ns.mount.lock().list_mounts())
-}
-
 /// Resolve `path` with no process CWD to resolve against — i.e. as if the CWD
 /// were `/`.
 ///

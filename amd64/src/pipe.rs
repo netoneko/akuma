@@ -216,7 +216,6 @@ pub fn alloc() -> Option<PipeId> {
 /// what keeps a description alive under `dup`, and only its final release
 /// reaches [`close_read`]/[`close_write`]. Counting names here as well would
 /// double-count every inherited pipe and leak it.
-#[allow(dead_code)]
 pub fn clone_ref(id: PipeId, is_write: bool) {
     glue::pipe_clone_ref(id as u32, is_write);
 }

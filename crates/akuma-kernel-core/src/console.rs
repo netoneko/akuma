@@ -166,7 +166,6 @@ static MULTICORE: AtomicBool = AtomicBool::new(false);
 /// `allow(dead_code)`: the only caller is `smp_shared::secondary_entry_shared`,
 /// which is compiled out without `smp-shared`.
 #[cfg(kernel_console_lock)]
-#[allow(dead_code)]
 pub fn set_multicore() {
     MULTICORE.store(true, Ordering::Release);
 }
@@ -174,7 +173,6 @@ pub fn set_multicore() {
 /// No-op when the lock is compiled out (`CONSOLE_LOCK=0`). See above for
 /// why this can be uncalled.
 #[cfg(not(kernel_console_lock))]
-#[allow(dead_code)]
 pub fn set_multicore() {}
 
 // ============================================================================
@@ -323,17 +321,6 @@ pub fn getchar() -> u8 {
     akuma_uart::read_byte()
 }
 
-/// Read a character (blocking)
-#[allow(dead_code)]
-fn getchar_blocking() -> u8 {
-    while !has_char() {}
-    akuma_uart::read_byte()
-}
-
-#[allow(dead_code)]
-const BUFFER_SIZE: usize = 100;
-
-#[allow(dead_code)]
 pub fn read_line(buffer: &mut Vec<u8>, with_echo: bool) -> usize {
     loop {
         if has_char() {
@@ -347,11 +334,4 @@ pub fn read_line(buffer: &mut Vec<u8>, with_echo: bool) -> usize {
             }
         }
     }
-}
-
-#[allow(dead_code)]
-pub fn print_as_akuma(s: &str) {
-    print("≽ܫ≼ ... ");
-    print(s);
-    print("\n");
 }

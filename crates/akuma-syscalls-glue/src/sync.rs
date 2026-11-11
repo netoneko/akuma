@@ -1,6 +1,6 @@
 use super::*;
 
-use akuma_exec::threading::{WakeHandle, current_wake_handle, wake_by_handle};
+use akuma_exec::threading::{WakeHandle, wake_by_handle};
 use akuma_syscalls_sync::{Action, Located, Namespace, Step, WaiterId, WaiterTable, WakeOp};
 use akuma_syscalls_linux::flags::futex as fx;
 
@@ -333,11 +333,11 @@ pub fn futex_wake(tgid: u32, uaddr: usize, max_wake: i32) {
 /// This helper lets tests place a waiter at a non-zero tgid so we can
 /// verify that `futex_wake(tgid, ...)` correctly reaches private-futex
 /// queues (the fix for the `clear_child_tid` / `pthread_join` hang).
-#[allow(dead_code)]
+#[cfg(kernel_tests)]
 pub fn futex_wait_at_tgid_for_test(tgid: u32, uaddr: usize) {
     let key = (tgid, uaddr);
     akuma_primitives::irq::with_irqs_disabled(|| {
-        FUTEX_WAITERS.lock().enqueue(key, QueuedWaiter(current_wake_handle()), BITSET_MATCH_ANY);
+        FUTEX_WAITERS.lock().enqueue(key, QueuedWaiter(akuma_exec::threading::current_wake_handle()), BITSET_MATCH_ANY);
     });
     akuma_exec::threading::park_indefinitely();
     // futex_do_wake removed us from the queue before calling wake()

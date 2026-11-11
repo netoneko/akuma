@@ -55,7 +55,7 @@ the box's recorded `creator_pid`.
 | Syscall | Rule | Denied with |
 |---|---|---|
 | `REGISTER_BOX` | `can_register_box`: re-registering a live box needs `can_access_box`; a **new** box becomes a child of the caller's box and its `root_dir` must lie inside the caller's own root (`validate_nested_root`, component-boundary match). `root_dir` is canonicalized first. Box 0 cannot be created | `EPERM` |
-| `KILL_BOX` | `can_kill_box`. The namespace is dropped only after the kill succeeds | `EPERM` |
+| `KILL_BOX` | `can_kill_box`. The namespace and the box's SysV message queues are dropped only after the kill succeeds | `EPERM` |
 | `SPAWN_EXT` (`box_id != 0`) | `can_access_box` — the child inherits that box's `box_id` **and** its mount namespace. `box_id == 0` means "inherit the caller's box" and is unchecked | `EPERM` |
 | `SET_BOX_STACK` | `can_access_box` | `EPERM` |
 | `MOUNT_IN_NS` | caller must be box 0. With fstype `overlay` at `/`, the target box must additionally have **no processes** and a still-pristine root | `EPERM` |

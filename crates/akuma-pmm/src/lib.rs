@@ -436,7 +436,6 @@ impl FrameTracker {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct FrameTrackingStats {
     pub current_tracked: usize,
     pub kernel_count: usize,
@@ -467,15 +466,6 @@ pub fn tracking_stats() -> Option<FrameTrackingStats> {
         Some(FRAME_TRACKER.lock().stats())
     } else {
         None
-    }
-}
-
-#[allow(dead_code)]
-pub fn leak_count() -> usize {
-    if DEBUG_FRAME_TRACKING {
-        FRAME_TRACKER.lock().leak_count()
-    } else {
-        0
     }
 }
 

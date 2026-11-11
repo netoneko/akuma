@@ -115,7 +115,7 @@
     "crates/akuma-exceptions-forensics": 2,
     "crates/akuma-fdt": 3,
     "crates/akuma-frame-raw": 3,
-    "crates/akuma-gic": 5,
+    "crates/akuma-gic": 4,
     "crates/akuma-idt-amd64": 1,
     "crates/akuma-locks-rw-cell": 8,
     "crates/akuma-mmu-raw": 15,

@@ -140,9 +140,8 @@ pub fn timer_irq_handler(_irq: u32) {
 
     // Trigger SGI for scheduling - scheduler will decide if switch is needed.
     // Real shared-kernel SMP: this timer handler is shared across cores (one dispatch
-    // table), so it must ring the CURRENT core's scheduler SGI, not the hardcoded PE0
-    // that `trigger_sgi` targets — otherwise a secondary's tick would preempt the BSP.
-    // On the BSP (aff0 = 0) `trigger_sgi_self` is equivalent to `trigger_sgi`.
+    // table), so it must ring the CURRENT core's scheduler SGI, not PE0 — otherwise a
+    // secondary's tick would preempt the BSP.
     //
     // Runtime governor (before the SGI so a demotion lands on this very tick's
     // re-arm path next interrupt): every GOVERNOR_WINDOW_TICKS, check whether

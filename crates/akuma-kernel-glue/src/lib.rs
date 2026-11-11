@@ -333,9 +333,8 @@ pub(crate) fn build_exec_runtime(
         enable_irqs: irq::enable_irqs,
         end_of_interrupt: akuma_gic::end_of_interrupt,
         // Real shared-kernel SMP: voluntary reschedules (yield_now / schedule_blocking)
-        // must ring THIS core's scheduler SGI, not the hardcoded PE0 that `trigger_sgi`
-        // targets — otherwise a secondary's yield/block pokes the BSP and never
-        // reschedules itself. On the BSP (aff0 = 0) `trigger_sgi_self` is equivalent.
+        // must ring THIS core's scheduler SGI, not PE0 — otherwise a secondary's
+        // yield/block pokes the BSP and never reschedules itself.
         trigger_sgi: akuma_gic::trigger_sgi_self,
         // Cross-core wakeup (M4): nudge an idle peer to run a just-woken thread. No-op
         // off shared-SMP.
