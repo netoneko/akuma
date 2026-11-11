@@ -1,19 +1,19 @@
 //! The global Big Kernel Lock (BKL) for real (shared-kernel) SMP.
 //!
 //! Wraps the single process-wide [`KernelLock`] plus the core-identity helper, and
-//! exposes the acquire/release/reconcile entry points the kernel's exception path
-//! calls. See [`crate::sync::KernelLock`] for the lock semantics and
+//! exposes the acquire/release entry points and the dropped-window ledger the kernel's
+//! exception path and scheduler call. See [`crate::sync::KernelLock`] for the lock semantics and
 //! docs/reference/subsystems/smp-shared.md for the design.
 //!
 //! **Zero-cost when off:** every function here compiles to an empty inline body
 //! unless `cfg(kernel_bkl_smp)` is set (the `smp-shared` feature, forwarded from
 //! the bin crate). Builds without it are byte-for-byte unaffected.
 //!
-//! **M1 wiring:** the syscall path (`rust_sync_el0_handler` entry/exit) and the idle
-//! loop take/drop the BKL, establishing "held while a core executes kernel code" on
-//! the hot path. The IRQ/scheduler context-switch reconciliation (releasing to an
-//! incoming EL0 thread, re-acquiring for an incoming EL1 thread) lands in M2 alongside
-//! the cross-core scheduler, where it can be exercised under real contention.
+//! **Wiring:** the EL0 syscall path takes it on entry and drops it before the return;
+//! an interrupt takes it only if the interrupted code did not hold it, and drops only
+//! what it took; the switch and the idle loop drop and re-take it around a wait. There
+//! is no eret-time reconcile: the SGI scheduler's (`reconcile_for_spsr`) went with it
+//! on 2026-11-11 (docs/archive/SGI_SCHEDULER_RESIDUE.md).
 
 #[cfg(all(kernel_bkl_smp, target_os = "none"))]
 use crate::sync::KernelLock;
@@ -30,11 +30,11 @@ static KERNEL_LOCK: KernelLock = KernelLock::new();
 //
 // The BKL-carve-out guards (`VfsBklGuard`, `NetBklGuard`, the execve ELF-read drop, the
 // file-fault fill drop) run a bounded stretch of EL1 code with the BKL deliberately
-// RELEASED so peer cores can enter the kernel. That violates the reconcile invariant
+// RELEASED so peer cores can enter the kernel. That violates the invariant
 // "BKL held iff EL1" on purpose — and before this ledger existed, the violation did not
-// survive the first interrupt: a timer IRQ landing inside the window would
-// `enter_kernel` for the handler and the eret epilogue's `reconcile_for_spsr`, seeing an
-// EL1 target frame, would KEEP the lock. From that instant the remainder of the window —
+// survive the first interrupt: under the SGI scheduler a timer IRQ landing inside the
+// window would `enter_kernel` for the handler and the eret epilogue, seeing an EL1
+// target frame, would KEEP the lock. From that instant the remainder of the window —
 // potentially most of a slow ext2 syscall (~20 ms for a 64 KiB write at the measured
 // ~2.5 MB/s) — ran with the BKL silently re-held, serializing the peer for tens of
 // milliseconds. That is precisely the `[BKL] stuck` (10M-spin, owner genuinely held)
@@ -42,8 +42,8 @@ static KERNEL_LOCK: KernelLock = KernelLock::new();
 // §8): the fair FIFO ticket lock cannot produce such a wait without a genuine long hold.
 //
 // The ledger records, PER THREAD, how many dropped-BKL windows are currently open, so
-// every eret that resumes EL1 code can restore the state that code actually wants:
-// dropped. It is thread-scoped (not core-scoped) because a window survives preemption,
+// any path that would re-take the lock for a thread (the idle loop after `wfi`, the
+// EL0-entry tripwire) can tell that the thread wants it dropped. It is thread-scoped (not core-scoped) because a window survives preemption,
 // blocking waits, and migration — the thread may resume on another core.
 
 /// Per-thread count of open deliberately-dropped-BKL windows.
@@ -115,24 +115,16 @@ impl<const N: usize> Default for DroppedWindowLedger<N> {
 /// The kernel's ledger, indexed by thread id.
 ///
 /// Depth updates need no cross-core atomicity guarantees beyond the store itself: a
-/// thread only opens/closes its OWN entry, and it cannot run on two cores at once. The
-/// IRQ epilogue on the resuming core reads the entry after the scheduler's `commit_switch`
-/// published the thread, so it observes the depth the thread had when it was switched out.
+/// thread only opens/closes its OWN entry, and it cannot run on two cores at once, so a
+/// reader on the core that resumes it observes the depth it had when it was switched out.
 #[cfg(all(kernel_bkl_smp, target_os = "none"))]
 static DROPPED_WINDOWS: DroppedWindowLedger<{ akuma_primitives::MAX_THREADS }> =
     DroppedWindowLedger::new();
 
-/// How many times an eret epilogue preserved a dropped window that the pre-ledger code
-/// would have converted into a BKL-held run. Diagnostic for the `[BKL] stuck` regression;
-/// sampled with decaying frequency into the log by `reconcile_for_spsr`.
-#[cfg(all(kernel_bkl_smp, target_os = "none"))]
-static WINDOWS_PRESERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 /// Open a deliberately-dropped-BKL window for the current thread and release the BKL.
 ///
-/// Order matters: the depth is published BEFORE the release, so an IRQ that lands in
-/// between sees the window and leaves the lock released on its way out (our own
-/// `leave_kernel` then idempotently no-ops).
+/// Order matters: the depth is published BEFORE the release, so a reader that runs in
+/// between already sees the window.
 #[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 pub fn dropped_window_open() {
@@ -143,9 +135,8 @@ pub fn dropped_window_open() {
 /// Close the current thread's innermost dropped-BKL window, re-acquiring the BKL when it
 /// was the outermost one. A nested close leaves the lock released for the outer window.
 ///
-/// Order matters: the depth is decremented BEFORE the re-acquire, so an IRQ landing in
-/// between reconciles to "held" (target EL1, no window) and our `enter_kernel` is the
-/// owner-reentrant no-op.
+/// Order matters: the depth is decremented BEFORE the re-acquire; if anything takes the
+/// lock for this thread in between, our `enter_kernel` is the owner-reentrant no-op.
 #[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 pub fn dropped_window_close() {
@@ -162,7 +153,7 @@ pub fn dropped_window_close() {
 /// EL0→EL1 excursion is one open dropped window that was opened WITHOUT a prior
 /// `enter_kernel` (the entry handler skipped the acquire), so its close must not take
 /// the lock either — the excursion ends by `eret`ing to EL0, where the BKL is released
-/// anyway. Everything in between (IRQ epilogues, preemption, migration, nested
+/// anyway. Everything in between (interrupts, preemption, migration, nested
 /// carve-out guards at depth ≥ 2) sees a perfectly ordinary dropped window, which is
 /// what keeps the mixed converted/unconverted state safe. Pair strictly with a
 /// `dropped_window_open()` made on the never-acquired entry path; every other dropper
@@ -312,72 +303,6 @@ pub fn leave_kernel() {
     crate::sync::irq_restore(daif);
 }
 
-/// Reconcile the BKL to the EL this core is about to `eret` into, given the SPSR that
-/// will be restored: `SPSR.M[3:0] == 0` means EL0 (release), otherwise EL1 (acquire) —
-/// UNLESS the thread being resumed is inside a deliberately-dropped-BKL window
-/// (see [`DroppedWindowLedger`]), in which case an EL1 target is restored to its chosen
-/// state: released. Without that exception, the first timer tick inside a dropped
-/// window converts the window's remainder into a BKL-held run — the `[BKL] stuck`
-/// regression (docs/archive/BKL_VFS_CARVE_OUT.md §8). No-op unless
-/// `cfg(kernel_bkl_smp)`.
-///
-/// The current-thread read is authoritative here: both callers are IRQ epilogues that
-/// run after the scheduler's `commit_switch` published the incoming thread, so the
-/// window check applies to the thread the eret actually resumes.
-///
-/// Callers are IRQ epilogues (already masked), but mask anyway so the core-id read
-/// stays migration-atomic with the lock op no matter the calling context (see
-/// [`enter_kernel`]).
-#[cfg(all(kernel_bkl_smp, target_os = "none"))]
-#[inline]
-pub fn reconcile_for_spsr(spsr: u64) {
-    let target_is_el0 = (spsr & 0xf) == 0;
-    let release = target_is_el0 || note_preserved_window();
-    let daif = crate::sync::irq_save_mask();
-    KERNEL_LOCK.reconcile(current_core_id(), release);
-    crate::sync::irq_restore(daif);
-}
-
-/// Window check for the eret epilogues, with a decaying-frequency diagnostic: counts —
-/// and occasionally logs — each time an epilogue PRESERVES a dropped window that the
-/// pre-ledger reconcile would have silently converted to a BKL-held run. Log volume is
-/// power-of-two sampled (x1, x2, x4, …), so a whole bulk-I/O run costs ~log2(N) lines.
-#[cfg(all(kernel_bkl_smp, target_os = "none"))]
-#[inline]
-fn note_preserved_window() -> bool {
-    if !in_dropped_window() {
-        return false;
-    }
-    let n = WINDOWS_PRESERVED.fetch_add(1, Ordering::Relaxed) + 1;
-    if n.is_power_of_two() {
-        crate::safe_print!(96, "[BKL] dropped window preserved across IRQ x{n}\n");
-    }
-    true
-}
-
-/// Total eret epilogues that preserved a dropped-BKL window (see [`note_preserved_window`]).
-#[cfg(all(kernel_bkl_smp, target_os = "none"))]
-pub fn dropped_windows_preserved() -> u64 {
-    WINDOWS_PRESERVED.load(Ordering::Relaxed)
-}
-
-/// Ticket-free variant of reconcile_for_spsr for use after BKL-free scheduler paths.
-/// When we run the scheduler BKL-free (M5c step-2), we never called `enter_kernel`,
-/// so a reconcile that targets EL1 must acquire without taking a ticket — otherwise
-/// we leak a ticket. This variant uses `KernelLock::reconcile_no_ticket`.
-///
-/// Consults the dropped-window ledger exactly like [`reconcile_for_spsr`]: resuming an
-/// EL1 thread inside a dropped window must not (re-)acquire on its behalf.
-#[cfg(all(kernel_bkl_smp, target_os = "none"))]
-#[inline]
-pub fn reconcile_for_spsr_no_ticket(spsr: u64) {
-    let target_is_el0 = (spsr & 0xf) == 0;
-    let release = target_is_el0 || note_preserved_window();
-    let daif = crate::sync::irq_save_mask();
-    KERNEL_LOCK.reconcile_no_ticket(current_core_id(), release);
-    crate::sync::irq_restore(daif);
-}
-
 /// `true` if this core currently holds the BKL. For assertions / diagnostics.
 #[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
@@ -395,14 +320,6 @@ pub fn enter_kernel() {}
 #[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn leave_kernel() {}
-
-#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
-#[inline(always)]
-pub fn reconcile_for_spsr(_spsr: u64) {}
-
-#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
-#[inline(always)]
-pub fn reconcile_for_spsr_no_ticket(_spsr: u64) {}
 
 #[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
@@ -440,17 +357,11 @@ pub fn clear_dropped_windows_for_dead_thread(_tid: usize) -> u32 {
     0
 }
 
-#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
-#[inline(always)]
-pub fn dropped_windows_preserved() -> u64 {
-    0
-}
-
 #[cfg(test)]
 mod tests {
     use super::DroppedWindowLedger;
 
-    /// The nesting contract the eret epilogues and guards rely on: only the OUTERMOST
+    /// The nesting contract the guards rely on: only the OUTERMOST
     /// close asks for a re-acquire; while any window is open the thread reads as
     /// BKL-free; depths are per-thread.
     #[test]

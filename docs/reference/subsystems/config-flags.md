@@ -167,8 +167,8 @@ and the syscall→lock map.
 Each carve-out also has a **runtime** toggle (default on) for same-binary A/B and
 as a kill switch — `set_fault_bkl_drop_enabled()`, `set_exec_bkl_drop_enabled()`,
 `set_vfs_bkl_drop_enabled()`, `set_process_bkl_drop_enabled()`,
-`set_mm_bkl_drop_enabled()`, `set_drivers_bkl_drop_enabled()`,
-`set_irq_bkl_drop_enabled()`, all reachable from `src/smp_shared.rs`. Guards
+`set_mm_bkl_drop_enabled()`, `set_drivers_bkl_drop_enabled()`, all reachable from
+`akuma-entry`'s `smp_shared` forwarder. Guards
 latch the toggle at construction and must never re-read it in `drop()` (that
 unbalances the BKL ticket FIFO).
 

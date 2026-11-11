@@ -51,9 +51,8 @@ SMP=4 cargo run --release     # -smp 4
 | `SMP=4` boot suite stops emitting after ~23 tests (QEMU alive, serial log frozen), ~81 `[BKL] stuck owner=1` lines then silence, freeze right after `smp_shared_cooperative_wait PASSED` — while `SMP=1` reports a clean 286/0 | **Someone changed `blocking_relax`.** Its leading `yield_now` is what lets a spawn/exec/reap waiter run a READY peer on its own core; halting instead leaves the peer unscheduled and the wait never resolves — the original socket-recv / `exec_with_io_cwd` wedge. Reproduced deterministically 2026-08-20 by dropping the yield kernel-wide. | Put the yield back in `blocking_relax`. If the motive was network throughput, use `blocking_relax_net` (no yield) wired into `NetRuntime::blocking_relax` **only** — that keeps +30 % req/s and passes 294/0. **Acceptance signal is the line `smp_shared_blocking_wait_peer_progress PASSED`, not the pass count, and NOT the `[BKL] stuck` count — that is ~85 on healthy and wedged kernels alike.** [`../archive/BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md`](../archive/BLOCKING_RELAX_YIELD_SMP4_REGRESSION.md) |
 | `[BKL] stuck: owner=N waiter=M` **flood that never stops**, no forward progress | A core is wedged in EL1 holding the BKL (real deadlock) — OR the BSP panicked while holding it (see the panic dump just above the flood). | If preceded by a panic dump, it's that panic — fix the panic, the flood is an artifact. Else attach gdb (below) and find what `owner`'s core is spinning on. |
 | A few dozen **transient** `[BKL] stuck` during a spawn-heavy / FS test, then progress | Coarse-BKL contention — a core held the BKL >10 M spins (~10 ms) while peers waited. Expected today. | Profile it (below). The dominant holder is usually the scheduler. Not a bug. |
-| `SMP=4` works for several exchanges then **wedges under sustained fork/exec + network load** (e.g. meow hangs on ~turn 4), flood is `owner=0` (unowned!) and never stops | **ROOT-CAUSED (2026-07-20): a `sched_bklfree_el0` ticket leak.** `owner=0` in the stuck line means the lock is *unowned* (`owner` stores `core_id+1`) yet waiters spin — the fair `KernelLock`'s `next_ticket` ran ahead of `now_serving` with no owner to advance it. The BKL-free EL0-preempt path is the only one that `reconcile`-acquires without a paired `enter_kernel`, so it can take a ticket with no matching release. | **FIXED PROPERLY 2026-08-08 — the ticket accounting itself.** (History: first mitigated by reverting `sched_bklfree_el0` to default-OFF; A/B then was flag-ON wedges in seconds, flag-OFF 13/13 clean. The flag is **default-ON again today** — `SCHED_BKLFREE_EL0_ENABLED = true`, `src/smp_shared.rs:435` — so that mitigation is no longer what protects you.) The leak is that a barge (`acquire_no_ticket`) consumed a live waiter's serving slot, the waiter re-ticketed, and the abandoned allocation was never matched by an ownership episode. Barges now leave the FIFO untouched entirely. A/B at SMP=4, 30x `bssfork 20 3 1`: 140 stuck / 25 `advanced-lost` → **0 / 0**. Full invariant + how to read the diagnostics: [`../reference/subsystems/locking.md`](../reference/subsystems/locking.md) -> "The FIFO ticket invariant". To confirm an imbalance live: `lldb`, `memory read --size 4 --count 4 &KERNEL_LOCK` → `next_ticket` > `now_serving` with `owner==0`. |
-| SMP=4 **nondeterministically wedges** in a spawn/timing-heavy test (`parallel_processes`, "Mixed cooperative") — a re-run passes | **FIXED (2026-07-20).** Was a cooperative wait-loop (`yield_now` only) holding the BKL while a child stranded RUNNING on a BKL-blocked peer, the unfair test-and-set then livelocking recovery. | Fixed by `idle_halt` on the wait loops (drop the BKL) + the fair FIFO ticket BKL. If a *new* wedge appears, check for a yield-only wait holding the BKL (see "M5c step-2" below). |
-| `[BKL] stuck: owner=1` flood, workload frozen, **only** with `sched_bklfree_el0` ON | The M5c step-2 **cross-core circular deadlock** (re-root-caused 2026-07-20 with lldb — the earlier "monopoly on an unfair lock" note was wrong; it's a hard hang, not a re-grab race). A BKL-free secondary claims a thread `RUNNING` without the BKL while the BSP holds the BKL in a cooperative yield-wait for it. | The two-part fix (idle_halt on cooperative waits + fair ticket BKL) fixes *this* deadlock. Step-2's **separate ticket-leak bug under load** is also fixed now (2026-08-08, the barge accounting — see the `owner=0` row above), and the flag is **default-ON** again; the "stays default-OFF" advice this row used to give is stale. |
+| `SMP=4` works for several exchanges then **wedges under sustained fork/exec + network load** (e.g. meow hangs on ~turn 4), flood is `owner=0` (unowned!) and never stops | **ROOT-CAUSED (2026-07-20): a `sched_bklfree_el0` ticket leak.** `owner=0` in the stuck line means the lock is *unowned* (`owner` stores `core_id+1`) yet waiters spin — the fair `KernelLock`'s `next_ticket` ran ahead of `now_serving` with no owner to advance it. The BKL-free EL0-preempt path is the only one that `reconcile`-acquires without a paired `enter_kernel`, so it can take a ticket with no matching release. | **FIXED PROPERLY 2026-08-08 — the ticket accounting itself.** (History: first mitigated by reverting `sched_bklfree_el0` to default-OFF; A/B then was flag-ON wedges in seconds, flag-OFF 13/13 clean. The flag is **default-ON again today** — `SCHED_BKLFREE_EL0_ENABLED = true`, `src/smp_shared.rs:435` — so that mitigation is no longer what protects you.) The leak is that a barge (`acquire_no_ticket`) consumed a live waiter's serving slot, the waiter re-ticketed, and the abandoned allocation was never matched by an ownership episode. Barges then left the FIFO untouched; since 2026-11-11 there is no barge at all (the path that used it went with the SGI scheduler). A/B at SMP=4, 30x `bssfork 20 3 1`: 140 stuck / 25 `advanced-lost` → **0 / 0**. Full invariant + how to read the diagnostics: [`../reference/subsystems/locking.md`](../reference/subsystems/locking.md) -> "The FIFO ticket invariant". To confirm an imbalance live: `lldb`, `memory read --size 4 --count 4 &KERNEL_LOCK` → `next_ticket` > `now_serving` with `owner==0`. |
+| SMP=4 **nondeterministically wedges** in a spawn/timing-heavy test (`parallel_processes`, "Mixed cooperative") — a re-run passes | **FIXED (2026-07-20).** Was a cooperative wait-loop (`yield_now` only) holding the BKL while a child stranded RUNNING on a BKL-blocked peer, the unfair test-and-set then livelocking recovery. | Fixed by `idle_halt` on the wait loops (drop the BKL) + the fair FIFO ticket BKL. If a *new* wedge appears, check for a yield-only wait holding the BKL (see [`M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md`](../archive/M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md)). |
 | `owner=N waiter=N` (same core) self-deadlock | A non-idempotent re-acquire, or holding a spinlock then taking the BKL and being re-entered. | `KernelLock::acquire` handles nested `enter_kernel` from a timer IRQ two ways: a reentrant fast path (`owner==me` → return, no ticket) and **masking local IRQs across the ticket wait** so a nested exception can't take a second ticket. If you added a lock that nests with the BKL, check ordering: `BKL > as_lock > {PMM, page tables, block, ...}`. |
 | `[SGI] POOL contended, skipped N ticks` | The scheduler SGI used `POOL.try_lock()` and the current thread already held POOL (mid-op). One preemption tick skipped — harmless; the next tick retries. | If it climbs without bound, don't assume a leaked `POOL` guard: [`scheduler.md`](../reference/subsystems/scheduler.md#the-observed-wedge-open) documents a reproducible never-stops case under heavy fork/thread-churn load where every ordinary holder is bounded and none leaks — instead a live holder is blocked waiting on a thread that can only be scheduled back in by the very SGI its `POOL` hold is starving (a circular wait through the scheduler itself). Identify the actual holder before concluding anything leaked. |
 | Boots at SMP=1 but hangs/deadlocks at SMP≥2 in a subsystem | That subsystem isn't SMP-safe: an inner spinlock (`NETWORK`, `SOCKET_TABLE`, block, VFS) is held across a context switch, so under the BKL a peer spins on it while holding the BKL. | Wrap the critical section in a `PreemptGuard` (akuma-net pattern) so the inner lock is never held across a switch; or fold it under the BKL/`as_lock` ordering. |
@@ -94,92 +93,7 @@ profiler only around the window.
   fault drop. This is the "shorten BKL holds" lever (execve ELF-load was the dominant coarse-BKL
   hold). A/B-measured by the `smp_shared_exec_parallelism` self-test (SMP=2): busybox exec storm,
   ~26–63% fewer BKL spins with the drop ON across boots.
-- `smp_shared::set_sched_bklfree_el0_enabled(bool)` — the M5c step-2 optimization (run the
-  scheduler SGI BKL-free when it preempted EL0). **Default ON.** The ticket-accounting leak
-  was declared resolved 2026-07-24 via the `reconcile_for_spsr_no_ticket` path, but that fix
-  was **incomplete** — it added a compensating `next_ticket` bump inside `acquire_no_ticket`,
-  which kept the counters equal in aggregate while still allocating a phantom slot no core
-  would ever hold, and still let the barge consume a live waiter's slot. The `owner=0` storm
-  therefore persisted (measurable at 140 `[BKL] stuck` per 30 `bssfork 20 3 1` runs). Fixed
-  for real 2026-08-08 by taking the queue out of the barge's path entirely; see
-  [`../reference/subsystems/locking.md`](../reference/subsystems/locking.md) -> "The FIFO
-  ticket invariant". The optimization
-  reduces BKL contention by ~70% (scheduler/IRQ path was the dominant holder) under
-  multi-process load. Safe to enable at SMP≥4; A/B-measured wins in fault+exec parallelism
-  self-tests. Can be toggled off for debugging.
 - `sync::set_profiling(bool)` — the BKL-hold profiler. Default **off**.
-
-## M5c step-2 (BKL-free EL0 scheduler): the deadlock and its fix
-
-**Re-root-caused 2026-07-20 with lldb over the QEMU gdbstub.** The earlier (2026-07-19)
-"monopoly on an unfair lock" explanation was **wrong** — reasoned, never confirmed at the
-instruction level. It is a **hard cross-core circular deadlock**, not a fairness/re-grab
-problem. Enabling `sched_bklfree_el0` and booting `SMP=4` reproduces a `[BKL] stuck:
-owner=1` flood (~3000–5000 events, all `owner=1` = the BSP, vs. ~102 toggle-off) with the
-workload permanently wedged. To reproduce: add
-`smp_shared::set_sched_bklfree_el0_enabled(true)` right after `bringup_secondaries()` in
-`main.rs` (do not commit), build, `SMP=4 GDB=1 INSTANCE=1 cargo run …`, grep the log for
-`BKL] stuck`, then attach lldb on `:1235`.
-
-> **Watch out — two overlapping symptoms.** The *terminal* state everyone sampled before is
-> a red herring: it is the pre-existing `test_mmap_file_oom` **panic** → the panic's
-> semihosting `HLT #0xF000` (`0xd45e0000`) → `EC=0x0` → `rust_sync_el1_handler`'s terminal
-> `loop{wfe}` on core 0 *holding the BKL* (per the table row above: "if preceded by a panic
-> dump, the flood is an artifact"). Sample the **pre-panic** flood (`grep -c PANIC` must be
-> `0`) to see the real step-2 bug.
-
-**Mechanism (confirmed by live register/memory state at the pre-panic wedge).**
-
-1. The BSP (core 0) holds the BKL and is spinning in `exec_with_io_cwd`'s cooperative
-   wait-loop — `while !channel.has_exited() && !is_thread_terminated(tid) { yield_now() }` —
-   waiting for the EL0 child it spawned (backtrace: `run_all_tests → exec_with_io →
-   exec_with_io_cwd → yield_now → …irq_handler → sgi_scheduler_handler_with_sp`). The loop
-   runs entirely in EL1, so the BKL is never reconciled-to-EL0-released; the BSP holds it
-   throughout.
-2. The child thread is state **`RUNNING`**, and it is the current thread (`TPIDRRO_EL0`) of a
-   **secondary** — but that secondary is frozen in the inlined `KernelLock::acquire` spin
-   inside `enter_kernel` (`rust_irq_handler_with_sp`, the `ldar/cmp/b.eq` loop). It took a
-   syscall/device IRQ while running the child and now waits on the BKL the BSP holds.
-3. The BSP's `ThreadPool::schedule_indices` only ever selects a **READY, non-idle** thread.
-   The child is `RUNNING` (skipped); the only READY thread is a per-core idle
-   (`IDLE_SLOT_FOR_CORE`, skipped by `IS_IDLE_THREAD`). So the scan returns `None`, and the
-   BSP spins its yield loop forever holding the BKL. **Circular wait:** BSP holds BKL & waits
-   for child → child is RUNNING on a secondary → secondary needs the BKL → BSP holds it.
-
-**Why the toggle is the trigger.** The BKL-free EL0-preempt path lets a secondary **claim a
-READY thread and mark it `RUNNING` without acquiring the BKL**, while the BSP holds the BKL
-in a cooperative wait for that thread. Once the child is `RUNNING` on a secondary the BSP
-won't migrate it (it moves only READY threads) and the secondary freezes the instant the
-child needs EL1. With the toggle **off** a secondary can only claim a thread by first taking
-the BKL — impossible while the BSP holds it — so the child stays **READY** and the **BSP
-itself** runs it, reconciling to EL0 and releasing the BKL. No deadlock. (The old note's
-"per-tick circulation" is really "secondaries can't steal a thread out from under a
-BKL-holding cooperative waiter.")
-
-**The fix is TWO parts, both required — both now DONE** (validated at SMP=4 with the
-40-iteration exec-and-wait stress `test_smp_shared_cooperative_wait`, 3/3 clean where the
-unfixed build hung ~100%):
-
-1. **A kernel thread must not hold the BKL across a cooperative wait-loop.** Drop +
-   re-acquire the BKL around the `yield_now` wait — done for `exec_with_io_cwd` and
-   `test_parallel_processes` via `idle_halt`. This alone cut the hang from ~100% to a
-   **~25% residual**.
-2. **A fair / queued BKL.** The residual ~25% was a *livelock*: after the waiter dropped the
-   BKL (idle_halt WFI), the unfair test-and-set let the other spinning secondaries and the
-   waiter's own next-tick re-grab starve the one secondary holding the BKL-free-stolen
-   child, so it never got the BKL to un-strand it. (Attaching gdb *hides* this — the stub's
-   periodic all-core halts perturb the race enough to let it through; it reproduces without
-   gdb.) **Done:** `KernelLock` (`crates/akuma-exec/src/sync.rs`) is now a **FIFO ticket
-   lock** — a contended acquirer takes a ticket and waits its turn (masking local IRQs for
-   the wait so a nested exception can't take a second, un-serviceable ticket); the owner's
-   release advances `now_serving` by one. Reentrant/reconcile acquires take no ticket, so the
-   counters stay balanced across the non-lexical acquire/release of context switches.
-
-**Result:** step-2 is now safe to enable at SMP≥4 (left defaulting off only because flipping
-the kernel-wide default is a separate call). As a bonus, the same idle_halt + fair-BKL combo
-**also cured the pre-existing nondeterministic SMP=4 `parallel_processes` hang** (same
-yield-wait-under-BKL root cause) — the full self-test suite now reaches the `test_mmap_file_oom`
-baseline reliably at SMP=4.
 
 ## Live debugging with gdb/lldb
 

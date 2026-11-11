@@ -226,8 +226,6 @@ pub(crate) fn register_threading(rt: &ExecRuntime, cfg: &ExecConfig) {
             enable_stack_canaries: cfg.enable_stack_canaries,
             stack_canary: cfg.stack_canary,
             canary_words: cfg.canary_words,
-            network_thread_ratio: cfg.network_thread_ratio,
-            prioritize_never_scheduled: cfg.prioritize_never_scheduled,
             deferred_thread_cleanup: cfg.deferred_thread_cleanup,
             thread_cleanup_cooldown_us: cfg.thread_cleanup_cooldown_us,
             syscall_debug_info_enabled: cfg.syscall_debug_info_enabled,

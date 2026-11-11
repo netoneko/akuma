@@ -394,6 +394,12 @@ manifest, Python and shell files; vendored trees excluded), then followed the co
   caller), and ~40 single functions across 18 crates.
 - `unsafe` budget 409 → 407 (`akuma-virtio`'s unused `transmit_begin`/`transmit_complete`);
   untyped address parameters 700 → 692.
+- **The lock, in a second commit:** the eret-time reconcile (`reconcile_for_spsr` and its
+  ticket-free twin), `KernelLock`'s barge acquire and `barged` flags, two `akuma_bkl::policy`
+  toggles with no reader (`no-bkl-irq`, `sched_bklfree_el0`), and two scheduler config fields
+  every kernel filled in for nothing. All of it served only the SGI path. `KernelLock` now
+  has one acquire mode, which is one fewer to map onto Taoxichuan's lock at the merge
+  ([`ONE_BIG_KERNEL_LOCK.md`](../../proposals/ONE_BIG_KERNEL_LOCK.md)).
 
 ## Proposed simplifications
 

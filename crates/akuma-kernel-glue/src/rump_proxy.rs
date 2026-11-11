@@ -1458,7 +1458,8 @@ pub fn start_default_stack() {
         }
     };
     // Register rump_server's main thread (the fiber-scheduler OS thread) as the
-    // scheduler's network thread so it gets the `NETWORK_THREAD_RATIO` boost.
+    // scheduler's network thread. It got the `NETWORK_THREAD_RATIO` boost until the SGI
+    // scheduler went (docs/archive/SGI_SCHEDULER_RESIDUE.md); now it only names it.
     // Unlike the proxy handshake kthread (which parks after `Client::connect`),
     // this thread is the one that actually processes every proxied socket
     // syscall — the 90-120 ms per-call sysproxy latency observed pre-fix traces

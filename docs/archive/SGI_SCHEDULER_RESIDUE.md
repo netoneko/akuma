@@ -1,6 +1,6 @@
 # What the SGI scheduler left behind (2026-11-11)
 
-**Status:** the dead code is removed. Two behaviours that went with the SGI scheduler are
+**Status:** the dead code is removed. Three behaviours that went with the SGI scheduler are
 recorded as **open**, unmeasured on the current scheduler.
 
 ## Background
@@ -53,24 +53,48 @@ Kept on purpose: hardware register vocabulary with no caller (EHCI/xHCI/HID/NVMe
 I2C/HDA/SVM fields and constants, `AT_*`, `MAIR_*`, PSCI ids, `akuma_cpu::set_fpcr`). Each
 models a spec or an instruction, costs nothing, and is what a future driver reaches for.
 
-## Open: two fixes that went with the SGI picker
+## Removed from the lock and its configuration (second commit)
 
-Both were run-next hints read only by `schedule_indices`. The current picker, `pick_next`, is
-plain round-robin with no hint, so a thread that becomes runnable waits its turn.
+The SGI path was also the only caller of the lock's eret-time reconcile:
+- `akuma_bkl::bkl::{reconcile_for_spsr, reconcile_for_spsr_no_ticket}` and the
+  "window preserved" counter they kept (`dropped_windows_preserved`, printed by `[BKLPROF]`
+  as `windows_preserved=` and therefore always 0 since);
+- `KernelLock::{reconcile, reconcile_no_ticket, acquire_no_ticket}` and the per-core
+  `barged` flags `release` consulted. The ticket-free "barge" acquire existed only for the
+  BKL-free EL0-preempt scheduler path; with it gone, every hold is ticketed and `release`
+  always advances `now_serving`. The three host tests of the barge went with it;
+- two `akuma_bkl::policy` toggles whose only reader was the SGI IRQ handler:
+  `irq_bkl_drop_enabled` (`no-bkl-irq`) and `sched_bklfree_el0_enabled`. Boot tests still
+  flipped them, testing nothing. Five phase toggles remain, each with a production reader;
+- the scheduler config fields `network_thread_ratio` and `prioritize_never_scheduled`
+  (and `config::{NETWORK_THREAD_RATIO, PRIORITIZE_NEVER_SCHEDULED}`), which every kernel,
+  Taoxichuan's included, filled in and nothing read.
+
+The interrupt path today takes the lock only if the interrupted code did not hold it and
+drops only what it took, so a dropped window survives an interrupt without any eret-time
+logic. The dropped-window ledger stays; the idle loop and the EL0-entry tripwire read it.
+
+## Open: three behaviours that went with the SGI picker
+
+All three lived in `schedule_indices`. The current picker, `pick_next`, is plain round-robin
+with no hint and no boost, so a thread that becomes runnable waits its turn.
 
 | fix | what it did | what is left |
 |---|---|---|
 | `WAKE_DEADLINE_PREEMPT`, 2026-08-18 ([`SCHEDULING_INVESTIGATION.md`](SCHEDULING_INVESTIGATION.md)) | an expired sleeper ran on the next switch, removing a ~tick × runnable-threads floor on `nanosleep`/`poll` | the faster tick (3 ms today) |
 | `SIGNAL_WAKE_PREEMPT`, 2026-08-28 ([`PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md`](PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md)) | a signal-woken thread ran on the next switch | `SIGFRAME_ACTIVE`, the half that took the probe from 9/10 to 15/15 |
+| `NETWORK_THREAD_RATIO` boost, 2026-07-18 ([`RUMP_SYSPROXY_LATENCY_FIX.md`](RUMP_SYSPROXY_LATENCY_FIX.md) Phase 2a) | the registered network thread (netpoll, or `rump_server` under `rump-default`) was preferred every 4th tick | `set_network_thread_id` still registers it, which now only names it in thread dumps |
 
-Neither was re-measured when the call switch became the default. What to run:
+None was re-measured when the call switch became the default. What to run:
 - the `nanosleep`/`sleep_ms(1)` floor from `SCHEDULING_INVESTIGATION.md` § Evidence, at
   SMP=1 with three runnable threads;
-- `smp1.ex.pthread_kill_eintr` from `scripts/verify_trim.py`.
+- `smp1.ex.pthread_kill_eintr` from `scripts/verify_trim.py`;
+- the rump sysproxy round trip from `RUMP_SYSPROXY_LATENCY_FIX.md`, on the rump devbox
+  (deferred; needs `RUMP_NIC=1`).
 
-If either regressed, the fix belongs in `pick_next`. A hint there has to work with the
-`ON_CPU` claim and with several cores scanning at once, which a single global slot did not
-need to under the SGI picker.
+If any regressed, the fix belongs in `pick_next`. A hint there has to work with the `ON_CPU`
+claim and with several cores scanning at once, which a single global slot did not need to
+under the SGI picker.
 
 ## Verification
 

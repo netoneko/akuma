@@ -331,9 +331,8 @@ pub fn need_resched() -> bool {
 //   `bkl_leave` goes *to* it — verified site by site — so "depth > 1" never
 //   existed; what the depth simulated ("a task born in kernel code holds
 //   without entering") falls out of the owner model directly.
-// - AArch64's `reconcile_for_spsr` has **no amd64 counterpart and needs none**:
-//   the eret epilogue analyzes the SPSR because AArch64's boundary is one
-//   shared instruction; this target's boundaries are explicit calls
+// - AArch64's SGI scheduler had an eret-time `reconcile_for_spsr` (deleted with
+//   it, 2026-11-11); this target never needed one: its boundaries are explicit calls
 //   (`usermode.rs`'s `bkl_enter`/`bkl_leave`), so there is nothing to infer.
 // - The old `[BKL] stuck: cpu N waiting on owner M` diagnostic is the crate's
 //   `log_kernel_lock_stuck` now (plus a lost-ticket self-heal the private lock

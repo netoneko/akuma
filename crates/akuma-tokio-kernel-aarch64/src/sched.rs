@@ -241,8 +241,6 @@ pub fn init() {
             enable_stack_canaries: false,
             stack_canary: 0,
             canary_words: 0,
-            network_thread_ratio: 0,
-            prioritize_never_scheduled: false,
             deferred_thread_cleanup: false,
             thread_cleanup_cooldown_us: 0,
             syscall_debug_info_enabled: false,

@@ -346,7 +346,7 @@ pub fn run_all_tests() {
     // BKL-free EL0-preempt scheduler lets a peer strand the child -> cross-core deadlock.
     // Safe to run now that the BKL is fair (ticket lock) + `exec_with_io` drops the BKL
     // across its wait — both required to keep step-2 from deadlocking (see
-    // docs/runbooks/debug-smp.md §"M5c step-2").
+    // docs/archive/M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md).
     test_smp_shared_cooperative_wait();
 
     // Real (shared-kernel) SMP: a thread parked in a blocking poll-wait (socket recv / DNS
@@ -1927,7 +1927,6 @@ fn test_smp_shared_dropped_window_survives_irq() {
         );
         return;
     }
-    let preserved_before = bkl::dropped_windows_preserved();
 
     bkl::dropped_window_open();
     let open_released = !bkl::held_by_current();
@@ -1954,23 +1953,17 @@ fn test_smp_shared_dropped_window_survives_irq() {
     // Outermost close re-acquires.
     bkl::dropped_window_close();
     let outer_close_reacquired = bkl::held_by_current();
-    let preserved = bkl::dropped_windows_preserved().saturating_sub(preserved_before);
 
     if open_released && survived_irqs && nested_close_stayed_free && outer_close_reacquired {
-        crate::safe_print!(
-            160,
-            "[Test] smp_shared_dropped_window_survives_irq PASSED ({} eret(s) preserved the window)\n",
-            preserved
-        );
+        console::print("[Test] smp_shared_dropped_window_survives_irq PASSED\n");
     } else {
         crate::safe_print!(
             224,
-            "[Test] smp_shared_dropped_window_survives_irq FAILED: open_released={} survived_irqs={} nested_close_stayed_free={} outer_close_reacquired={} (preserved={})\n",
+            "[Test] smp_shared_dropped_window_survives_irq FAILED: open_released={} survived_irqs={} nested_close_stayed_free={} outer_close_reacquired={}\n",
             open_released,
             survived_irqs,
             nested_close_stayed_free,
-            outer_close_reacquired,
-            preserved
+            outer_close_reacquired
         );
     }
 }
@@ -2425,8 +2418,9 @@ fn test_smp_shared_vfs_parallelism() {
 }
 
 /// M5c step-2 regression: proves a kernel thread that exec's an EL0 child and
-/// cooperatively waits for it does NOT deadlock with the BKL-free EL0-preempt scheduler
-/// enabled.
+/// cooperatively waits for it does NOT deadlock. The BKL-free EL0-preempt scheduler that
+/// opened the window went with the SGI scheduler (2026-11-11); the exec-and-wait stress
+/// stays as a cooperative-wait check under the current switch.
 ///
 /// Topology (lldb-confirmed 2026-07-20): with `sched_bklfree_el0` ON, a peer core can
 /// claim the exec'd child (mark it RUNNING + become its `TPIDRRO_EL0`) WITHOUT acquiring
@@ -2445,12 +2439,6 @@ fn test_smp_shared_cooperative_wait() {
         console::print("[Test] smp_shared_cooperative_wait SKIPPED (/bin/hello not on disk)\n");
         return;
     }
-
-    // Enable the M5c step-2 BKL-free EL0-preempt scheduler ONLY for this test (restore
-    // after). This is the toggle that opens the deadlock window; the fix must hold with it
-    // on.
-    let saved = crate::smp_shared::sched_bklfree_el0_enabled();
-    crate::smp_shared::set_sched_bklfree_el0_enabled(true);
 
     // The deadlock is a *race*: a peer core, timer-preempted while running EL0, must claim
     // the exec'd child BKL-free during the narrow window the BSP holds the BKL in the wait.
@@ -2500,12 +2488,11 @@ fn test_smp_shared_cooperative_wait() {
         akuma_exec::threading::yield_now();
         akuma_exec::threading::idle_halt();
     }
-    crate::smp_shared::set_sched_bklfree_el0_enabled(saved);
 
     if ok {
         crate::safe_print!(
             128,
-            "[Test] smp_shared_cooperative_wait PASSED ({} exec+wait iters under step-2 + peer EL0 load; no BKL deadlock)\n",
+            "[Test] smp_shared_cooperative_wait PASSED ({} exec+wait iters under peer EL0 load; no BKL deadlock)\n",
             ITERS
         );
     } else {
@@ -2527,8 +2514,7 @@ fn test_smp_shared_cooperative_wait() {
 /// forward progress — exec + cooperatively reap a userspace child — while every core is
 /// parked in a blocking wait. If `blocking_relax` stops dropping the BKL, a waiter on a peer
 /// holds it forever and the exec below wedges: the boot suite hangs HERE (that IS the
-/// regression signal). Runs with the BKL-free EL0-preempt scheduler ON (the shipping
-/// default). Needs >=1 secondary; no-op on a single-CPU boot.
+/// regression signal). Needs >=1 secondary; no-op on a single-CPU boot.
 fn test_smp_shared_blocking_wait_peer_progress() {
     if crate::smp_shared::probed_core_count() <= 1 {
         console::print(
@@ -2542,9 +2528,6 @@ fn test_smp_shared_blocking_wait_peer_progress() {
         );
         return;
     }
-
-    let saved = crate::smp_shared::sched_bklfree_el0_enabled();
-    crate::smp_shared::set_sched_bklfree_el0_enabled(true);
 
     // One waiter per core, each parked in `blocking_relax()` (mirrors a process blocked in a
     // socket recv / DNS resolve). They occupy every core; the BSP must still push through.
@@ -2572,7 +2555,6 @@ fn test_smp_shared_blocking_wait_peer_progress() {
     }
 
     crate::smp_shared::stop_and_reclaim_demos();
-    crate::smp_shared::set_sched_bklfree_el0_enabled(saved);
 
     if ok {
         crate::safe_print!(
@@ -5398,24 +5380,6 @@ fn test_timer_irq_preserves_bkl_state() {
         crate::safe_print!(128,
             "[Test] timer_irq_preserves_bkl_state FAILED: before={} after={}\n",
             held_before, held_after);
-    }
-
-    // Runtime kill switch: forcing the fallback (BKL-held) path must preserve the same
-    // invariant, same discipline as `test_drivers_bkl_drop`'s toggle-off check.
-    {
-        use crate::smp_shared::{irq_bkl_drop_enabled, set_irq_bkl_drop_enabled};
-        let was = irq_bkl_drop_enabled();
-        set_irq_bkl_drop_enabled(false);
-        let held_before_off = bkl::held_by_current();
-        busy_wait_us(50_000);
-        let held_after_off = bkl::held_by_current();
-        if held_before_off != held_after_off {
-            fails += 1;
-            crate::safe_print!(128,
-                "[Test] timer_irq_preserves_bkl_state (toggle off) FAILED: before={} after={}\n",
-                held_before_off, held_after_off);
-        }
-        set_irq_bkl_drop_enabled(was);
     }
 
     if fails == 0 {

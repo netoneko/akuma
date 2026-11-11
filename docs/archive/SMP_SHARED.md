@@ -625,7 +625,7 @@ only (its busybox spawn-storm provokes the pre-existing SMP≥4 race and would h
 **Status:** step 1 shipped + verified; step 2 root-caused and correctly gated. The
 prerequisite for enabling it is shortening BKL hold times (M5b per-AS fault lock; split
 fork/exec/ELF-load off the BKL) and/or a fair/queued BKL — **not** more scheduler surgery.
-Full analysis in `docs/runbooks/debug-smp.md` (§"M5c step-2"). **Files:**
+Full analysis in [`M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md`](M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md). **Files:**
 `crates/akuma-exec/src/threading/mod.rs` (POOL over switch), `src/exceptions.rs`
 (`rust_irq_handler_with_sp` restructure), `src/smp_shared.rs` (step-2 toggle + root cause).
 Profiler + `debug-smp.md` runbook added alongside.

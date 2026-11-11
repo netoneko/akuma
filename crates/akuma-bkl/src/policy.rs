@@ -1,7 +1,9 @@
 //! BKL policy: the runtime toggles that decide whether a path takes the BKL.
 //!
-//! Seven `no-bkl-*` phase toggles plus the per-syscall opt-out bitmap, moved out
-//! of `src/smp_shared.rs` on 2026-09-01. They are pure policy state — a relaxed
+//! Five `no-bkl-*` phase toggles plus the per-syscall opt-out bitmap, moved out
+//! of `src/smp_shared.rs` on 2026-09-01. Two more (`no-bkl-irq` and the
+//! BKL-free EL0-preempt scheduler) went with the SGI scheduler's IRQ path, their
+//! only reader, on 2026-11-11 (docs/archive/SGI_SCHEDULER_RESIDUE.md). They are pure policy state — a relaxed
 //! atomic load each, with a paired setter that exists so a *same-binary* A/B can
 //! flip the phase at runtime — so they belong with the protocol they gate rather
 //! than with the SMP bring-up code they happened to be written next to.
@@ -144,37 +146,6 @@ pub fn set_drivers_bkl_drop_enabled(on: bool) {
     DRIVERS_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
 }
 
-/// Runtime toggle (default **on**) for `no-bkl-irq` (Phase 7a of
-/// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7) — dispatch the timer IRQ (27) in
-/// `rust_irq_handler_with_sp` without acquiring the BKL at all, relying on the alarm
-/// queue's own `Spinlock` (`akuma_exec::alarms::ALARM_QUEUE`) and the lock-free preemption
-/// watchdog / GIC MMIO the handler otherwise touches. Unlike `VfsBklGuard` and friends
-/// this is not a dropped-BKL "window" latched per-call — there is no `enter_kernel` to
-/// balance on this path in the first place — so the read happens once, directly in
-/// `rust_irq_handler_with_sp`, with no latch-at-construction discipline needed.
-///
-/// Included in `smp-shared`'s default bundle since 2026-08-01, same as
-/// `no-bkl-mm`/`no-bkl-drivers` above — a plain `smp-shared` build always reaches the
-/// call site in `rust_irq_handler_with_sp` that reads this.
-///
-/// A/B'd 2026-08-01 on the SMP=4 contention regimen (source-toggled, byte-identical
-/// feature set): `irq/sched` 24.7% (off, matches the pre-Phase-7a ~23.5% baseline) →
-/// 10.2% (on), 6/6 digests exact both sides, 0 stuck/RECOVERED/PANIC/WILD/SPURIOUS —
-/// see docs/archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md §5.
-static IRQ_BKL_DROP_ENABLED: AtomicBool = AtomicBool::new(true);
-
-/// Whether the timer-IRQ BKL-drop (`no-bkl-irq`) is currently enabled.
-#[inline]
-pub fn irq_bkl_drop_enabled() -> bool {
-    IRQ_BKL_DROP_ENABLED.load(Ordering::Relaxed)
-}
-
-/// Enable/disable the timer-IRQ BKL-drop at runtime. Used by A/B measurement; also
-/// serves as a runtime kill-switch, same as the other phases.
-pub fn set_irq_bkl_drop_enabled(on: bool) {
-    IRQ_BKL_DROP_ENABLED.store(on, Ordering::Relaxed);
-}
-
 // --- The per-syscall BKL opt-out list (Phase 7f) ---------------------------------
 //
 // docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7.3: instead of removing the BKL from
@@ -242,8 +213,8 @@ const SYSCALL_BKL_OPTOUT_SEED: &[u64] = &[
     // `is_current_interrupted` re-looks-up each iteration and clones an
     // `Arc<ProcessChannel>` whose lifetime is refcount-independent of the slot.
     // Every lookup-then-use is bounded far inside the 10ms reclaim cooldown. The
-    // BKL was never held across the wait anyway (§4.1): `reconcile_for_spsr`
-    // re-points the per-core lock at whichever thread the core resumes.
+    // BKL was never held across the wait anyway (§4.1): the lock is per-core and
+    // follows whichever thread the core resumes.
     nr::NANOSLEEP,
     // Phase 7f tranche 3: `futex`, the second blocking conversion, cleared once its
     // named prerequisite landed. The archive doc's §4.3 verdict was
@@ -345,79 +316,6 @@ pub fn set_syscall_bkl_optout(nr: u64, on: bool) -> bool {
     true
 }
 
-/// Runtime toggle (default **off**) for the M5c optimization: run the scheduler SGI
-/// BKL-free when it preempted EL0 (userspace, no BKL held), so peer cores' timer ticks
-/// don't serialize on the BKL. Correct at SMP=2. Left **off** because at SMP≥4 it opens a
-/// **correctness deadlock** (see below) — not merely because it is premature.
-///
-/// ROOT CAUSE of the SMP≥4 hang (re-root-caused 2026-07-20 with lldb over the QEMU
-/// gdbstub; full evidence in docs/runbooks/debug-smp.md §"M5c step-2"). It is a hard
-/// **cross-core circular deadlock**, NOT the fairness/monopoly story the earlier note
-/// claimed. Live state at the wedge:
-///
-/// - The BSP (core 0) holds the BKL and is spinning in a kernel thread's cooperative
-///   wait-loop — `exec_with_io_cwd`'s `while !child.has_exited() { yield_now() }` — waiting
-///   for an EL0 child it spawned. Because the loop runs entirely in EL1, the BKL is never
-///   reconciled-to-EL0-released; the BSP holds it the whole time.
-/// - The child is state `RUNNING`, "owned" by a secondary (its `TPIDRRO_EL0`), but that
-///   secondary is frozen in `enter_kernel`'s BKL-acquire spin (`rust_irq_handler_with_sp`)
-///   — it took a syscall/device IRQ while running the child and now waits on the BKL the
-///   BSP holds.
-/// - The BSP's `schedule_indices` only ever selects a **READY, non-idle** thread. The child
-///   is `RUNNING` (skipped) and the only READY thread is a per-core idle (skipped), so the
-///   scheduler returns `None` and the BSP spins its yield loop forever holding the BKL.
-///
-/// Why this toggle is what triggers it: the BKL-free EL0-preempt path lets a secondary
-/// **claim a READY thread and mark it `RUNNING` without acquiring the BKL**, while the BSP
-/// is holding the BKL in a cooperative wait for that very thread. Once the child is
-/// `RUNNING` on a secondary, (a) the BSP won't touch it (it migrates only READY threads)
-/// and (b) the secondary freezes the instant the child needs EL1. With the toggle OFF a
-/// secondary can only claim a thread by first acquiring the BKL — which it can't while the
-/// BSP holds it — so the child stays READY and the **BSP itself** runs it, reconciling to
-/// EL0 and releasing the BKL. No deadlock.
-///
-/// The fix is TWO parts, both required — and both now DONE (validated at SMP=4 with the
-/// 40-iteration exec-and-wait stress `test_smp_shared_cooperative_wait`, 3/3 clean where the
-/// unfixed build hung ~100%):
-///
-/// 1. "A kernel thread must not hold the BKL across a cooperative wait-loop": drop +
-///    re-acquire the BKL around `yield_now` waits. Done for `exec_with_io_cwd` via
-///    `idle_halt` (`crate::process::exec::exec_with_io_cwd`). Alone this cut the hang from
-///    ~100% to a ~25% residual.
-/// 2. A FAIR / queued BKL. The residual ~25% was a livelock: after the waiter dropped the
-///    BKL, the unfair test-and-set let peers (and the waiter re-grabbing on its next tick)
-///    starve the one secondary holding the BKL-free-stolen child. Done: `KernelLock` is now
-///    a FIFO ticket lock (`akuma_exec::sync`), which removes the residual.
-///
-/// The two-part fix above makes this toggle safe against the *cooperative-wait* deadlock it
-/// was created for. It was ALSO briefly enabled by default (2026-07-20) and reverted the same
-/// day for a separate bug: under heavy fork/exec churn at SMP≥4 the BKL-free EL0-preempt path
-/// leaked a ticket in the fair `KernelLock` — it is the only path that acquires the BKL via
-/// `reconcile_for_spsr` WITHOUT a paired `enter_kernel` (`exceptions.rs`, the
-/// `sched_bklfree_el0_enabled()` branch), so a `next_ticket` advance had no matching
-/// `now_serving` advance; once the counters drifted the lock hard-deadlocked with `owner==0`
-/// (unowned) and every core spun in the ticket wait. lldb-confirmed 2026-07-20 (core spinning
-/// at `rust_irq_handler_with_sp` on `now_serving != my_ticket`, `owner==0`).
-///
-/// **Fixed 2026-07-24** (commit "more smp fixes"): the reconcile path for this branch now uses
-/// `reconcile_for_spsr_no_ticket` (`akuma_exec::bkl`), a variant that never takes a ticket in
-/// the first place (`KernelLock::acquire_no_ticket`) — so there is nothing for `now_serving` to
-/// fail to match. Default flipped back to ON the same day. The POOL-over-switch foundation
-/// (step 1 of M5c) is always active regardless.
-/// Only affects `cfg(kernel_bkl_smp)` builds — the default release build is untouched.
-static SCHED_BKLFREE_EL0_ENABLED: AtomicBool = AtomicBool::new(true);
-
-/// Whether the BKL-free EL0-preempt scheduler path (M5c step 2) is enabled.
-#[inline]
-pub fn sched_bklfree_el0_enabled() -> bool {
-    SCHED_BKLFREE_EL0_ENABLED.load(Ordering::Relaxed)
-}
-
-/// Enable/disable the BKL-free EL0-preempt scheduler path (M5c step 2). Default ON since
-/// 2026-07-24 (the ticket-leak fix above). Kept toggleable for A/B debugging.
-pub fn set_sched_bklfree_el0_enabled(on: bool) {
-    SCHED_BKLFREE_EL0_ENABLED.store(on, Ordering::Relaxed);
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,14 +399,12 @@ mod tests {
     #[test]
     fn phase_toggles_default_on() {
         // Read-only on purpose: no test here mutates these, so this cannot race.
-        // All seven ship enabled; a default flipping to `false` unnoticed is a
+        // All five ship enabled; a default flipping to `false` unnoticed is a
         // silent whole-phase revert.
         assert!(fault_bkl_drop_enabled());
         assert!(exec_bkl_drop_enabled());
         assert!(vfs_bkl_drop_enabled());
         assert!(mm_bkl_drop_enabled());
         assert!(drivers_bkl_drop_enabled());
-        assert!(irq_bkl_drop_enabled());
-        assert!(sched_bklfree_el0_enabled());
     }
 }

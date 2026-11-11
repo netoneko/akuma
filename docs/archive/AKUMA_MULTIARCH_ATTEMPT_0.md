@@ -1459,3 +1459,16 @@ Gates:
 - HVF default: SMP=1/2/4, 0 `[Test]` failures; the PASSED set equals the previous run's minus
   the deleted `borrow_tracker_disabled_no_serial_flood`.
 - amd64 TCG: SMP=1 829/0, SMP=2 839/0.
+
+## The lock's SGI residue (2026-11-11)
+
+Same scan, the BKL's side: `reconcile_for_spsr` (both forms), `KernelLock`'s ticket-free barge
+acquire, the `no-bkl-irq` and `sched_bklfree_el0` toggles and two unread scheduler config
+fields are gone. Every BKL hold is now ticketed. Removing the config fields found a third
+behaviour the SGI picker took with it, the network-thread boost the rump sysproxy latency fix
+relied on; it is on the same open list (`SGI_SCHEDULER_RESIDUE.md`). The M5c step-2 section of
+`debug-smp.md` described a path that no longer exists and moved to
+`M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md`.
+
+Gates: HVF default SMP=1/2/4, 0 `[Test]` failures and the same PASSED set as the previous
+commit; amd64 TCG SMP=1 829/0, SMP=2 839/0; clippy 9 targets, host tests.

@@ -22,9 +22,10 @@ of any specific fix, follow the links into `docs/archive/`.
 In every Akuma build (real shared-kernel SMP, `cfg(kernel_bkl_smp)`), one
 kernel runs across all cores. Correctness is anchored by a single **Big Kernel
 Lock** (`akuma_exec::sync::KernelLock`, driven via `akuma_exec::bkl`):
-**held iff a core is in EL1**, reconciled at every EL transition
-(`reconcile_for_spsr`, called from IRQ/exception epilogues), with a fair FIFO
-ticket wait so no core starves. Without `bkl-smp` (Taoxichuan, host tests) it's a zero-cost no-op.
+**held iff a core is in EL1**: the EL0 syscall entry takes it and drops it before
+the return, an interrupt takes it only if the interrupted code did not hold it and
+drops only what it took, and a switch crosses holding it (`yield_locked`). A fair
+FIFO ticket wait means no core starves. Without `bkl-smp` (Taoxichuan, host tests) it's a zero-cost no-op.
 
 The BKL upgraded the kernel's old single-core invariant (`with_irqs_disabled`,
 which only gives mutual exclusion on *one* core) to something SMP-safe in one
@@ -88,14 +89,14 @@ been **removed**: at HEAD, a waiter that loses the ownership CAS at its own turn
 through and keeps its ticket, spinning in place until the holder's release lands it in
 the `reticket-skipped` case above (`sync.rs:595-612`).
 
-The out-of-band acquirer is what forces re-tickets. `acquire_no_ticket` (the BKL-free
-EL0-preempt reconcile, `reconcile_for_spsr_no_ticket`, **default-on** via
-`SCHED_BKLFREE_EL0_ENABLED`) takes ownership without occupying a queue slot. It must
-therefore leave the FIFO **completely** untouched — no ticket on acquire, and no advance on
-release (a per-core `barged` flag on `KernelLock` tells `release` which kind of hold it is
-ending). Anything less consumes a live waiter's slot and forces that waiter to re-ticket.
-An earlier compensating `next_ticket.fetch_add(1)` in the barge kept the counters equal and
-still wedged, for exactly the phantom-ticket reason above.
+**Every hold is ticketed.** There is no out-of-band acquire: the ticket-free "barge" that
+the SGI scheduler's BKL-free EL0-preempt path used went with that scheduler
+([`SGI_SCHEDULER_RESIDUE.md`](../../archive/SGI_SCHEDULER_RESIDUE.md)), and with it the
+per-core `barged` flag `release` consulted. Do not add an acquire that skips the queue: it
+must then leave the FIFO completely untouched, no ticket and no advance, and the two
+attempts at that both lost slots (history:
+[`M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md`](../../archive/M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md)
+and `debug-smp.md`'s `owner=0` row).
 
 **Reading the diagnostics.** `[BKL] stuck` prints `owner=`, `waiter=`, `tag=`:
 
@@ -113,8 +114,7 @@ still wedged, for exactly the phantom-ticket reason above.
   above converts what used to leak into benign `reticket-skipped` recoveries, and those
   bump the aggregate on a perfectly healthy, contended run (`sync.rs:1616-1618`).
 
-Regression: `sync::tests::kernel_lock_barge_against_waiters_does_not_leak_serving_slots`
-(host). Note that asserting *final drift* does not catch this class — the `advanced-lost`
+Note that asserting *final drift* does not catch this class — the `advanced-lost`
 self-heal repairs the counters, so a leaking build still ends balanced (it just pays a 20M
 spin freeze per leak). The leak-specific signal is `kernel_lock_lost_ticket_recoveries()`
 — non-zero there means a ticket was genuinely lost, full stop. The boot self-test
@@ -247,16 +247,14 @@ Each of these was a real bug found during a carve-out, not a hypothetical.
   restored on drop. The reverse order reopens, for an instant, exactly the
   window the guard exists to close. (§3.)
 
-- **An interrupt landing inside a dropped-BKL window will silently convert it
-  back to BKL-held, unless you track that on purpose.** The reconcile
-  invariant ("BKL held iff EL1") is enforced at every `eret` against the
-  *interrupted frame's* SPSR — which is EL1 — so a timer IRQ during a dropped
-  window makes the epilogue re-take the BKL and hold it for the rest of the
-  window, silently re-serializing what was supposed to be BKL-free. Fixed
-  with a **per-thread depth of open dropped-BKL windows** consulted at every
-  `eret`: "target is EL1 *and* the resumed thread has an open window" also
-  means release. Thread-scoped, not core-scoped, because windows survive
-  preemption and cross-core migration. Any new dropper (a new guard type, a
+- **Anything that re-takes the lock for a thread must check whether that thread
+  is inside a dropped-BKL window.** Under the SGI scheduler an eret-time reconcile
+  re-took it for any EL1 target, so a timer IRQ during a dropped window
+  silently re-serialized the rest of it. Today the interrupt path restores what
+  it found, and the readers of the **per-thread depth of open dropped-BKL
+  windows** are the idle loop after `wfi` and the EL0-entry tripwire.
+  Thread-scoped, not core-scoped, because windows survive preemption and
+  cross-core migration. Any new dropper (a new guard type, a
   new blocking-wait site) must go through this same
   `bkl::dropped_window_open()/close()` pair, not a bare `leave_kernel`/
   `enter_kernel`. (§9; `akuma_exec::bkl::DroppedWindowLedger`.)
@@ -507,8 +505,7 @@ so conversion moved its whole body BKL-free; cleared once gate 2 below was close
 wholesale** — their unix-socket routing arm runs before their guard and stays
 BKL-held (the AB-BA note below). **`getcwd` must not be listed** either, despite the
 VFS map calling it guardless: it *reads* `proc.cwd`, a plain `String` `Process`
-field that `chdir` writes BKL-held (see the load-bearing table). `KernelLock`/
-`reconcile_for_spsr`/the ledger/the guards must survive until the un-converted set
+field that `chdir` writes BKL-held (see the load-bearing table). `KernelLock`/the ledger/the guards must survive until the un-converted set
 is empty. See
 [`BKL_PHASE7F_OPTOUT_LIST.md`](../../archive/BKL_PHASE7F_OPTOUT_LIST.md).
 
@@ -861,10 +858,10 @@ signature matches a known physical-page-reuse-race pattern. That guard was rever
 it looks like it does.**
 
 **Refinement (Phase 7f tranche 2, archive doc §4.1) — what the BKL actually covers
-here.** `KERNEL_LOCK` is a **per-core** lock, and `bkl::reconcile_for_spsr` reconciles
-it for *the thread the core is about to run*. So when a thread blocks and the core
-switches away, that thread's hold simply evaporates; nothing restores it until the
-thread is resumed and its own eret epilogue re-acquires. `schedule_blocking` never
+here.** `KERNEL_LOCK` is a **per-core** lock. A switch crosses holding it and a
+thread that did not hold it before the switch drops it after (`yield_locked`), so the
+lock follows the core, not the thread: while a thread is blocked it holds nothing, and
+it is BKL-held again only once it resumes. `schedule_blocking` never
 calls `leave_kernel` because it does not need to. Three consequences worth having
 written down:
 
@@ -1005,8 +1002,8 @@ Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
   canonical approach: *don't remove the BKL, invert its default* via a
   per-syscall opt-in list seeded empty, so it withers into provably-dead code
   instead of being deleted in one step — note the constraint that
-  `reconcile_for_spsr` and the dropped-window ledger must survive the whole
-  traversal.
+  the dropped-window ledger must survive the whole traversal (the eret-time
+  reconcile it also named went with the SGI scheduler).
 - [`SMP_SHARED.md`](../../archive/SMP_SHARED.md) — full shared-kernel SMP
   progress log (M0–M5).
 - [`smp-shared.md`](smp-shared.md) — current-state milestone status for

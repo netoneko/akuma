@@ -466,8 +466,6 @@ pub(crate) fn build_exec_runtime(
         enable_stack_canaries,
         stack_canary: config::STACK_CANARY,
         canary_words: config::CANARY_WORDS,
-        network_thread_ratio: config::NETWORK_THREAD_RATIO,
-        prioritize_never_scheduled: config::PRIORITIZE_NEVER_SCHEDULED,
         deferred_thread_cleanup: config::DEFERRED_THREAD_CLEANUP,
         thread_cleanup_cooldown_us: config::THREAD_CLEANUP_COOLDOWN_US,
         process_reclaim_cooldown_us: config::PROCESS_RECLAIM_COOLDOWN_US,
@@ -1568,7 +1566,9 @@ fn run_async_main() -> ! {
     use core::pin::pin;
     use core::task::{Context, Waker};
 
-    // Register this thread as the network poller so the scheduler boost targets it.
+    // Register this thread as the network poller. Today that only names it
+    // ("network" in thread dumps): the scheduler boost it once selected went with the
+    // SGI scheduler (docs/archive/SGI_SCHEDULER_RESIDUE.md).
     //
     // Under `rump-default` (devbox), this thread drives the (compiled-but-unused)
     // smoltcp stack and does no real work — so it must NOT claim the boost slot.

@@ -170,8 +170,6 @@ pub struct ThreadConfig {
     pub enable_stack_canaries: bool,
     pub stack_canary: u64,
     pub canary_words: usize,
-    pub network_thread_ratio: u32,
-    pub prioritize_never_scheduled: bool,
     pub deferred_thread_cleanup: bool,
     pub thread_cleanup_cooldown_us: u64,
     pub syscall_debug_info_enabled: bool,
@@ -314,8 +312,9 @@ pub fn set_slot_reap_callback(cb: fn(usize)) {
     SLOT_REAP_CALLBACK.set(cb);
 }
 
-/// Thread ID of the network polling loop (run_async_main).
-/// Set at boot by set_network_thread_id(). usize::MAX means not yet registered.
+/// Thread ID of the network polling loop (run_async_main, or rump_server under
+/// `rump-default`). Set at boot by set_network_thread_id(); read only to name the thread.
+/// usize::MAX means not yet registered.
 static NETWORK_THREAD_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 pub fn set_network_thread_id(tid: usize) {
@@ -4990,8 +4989,7 @@ pub fn dump_thread_resume_points() {
             published_trap_frame(tid).map_or((0, 0), |f| (f.x0, f.x1))
         };
         // LAST_CORE == 0xFF means never scheduled even once, ever, since this slot's
-        // last claim (Failure D falsification test, 2026-08-07 — see
-        // config::PRIORITIZE_NEVER_SCHEDULED). Printed raw so a hang dump can answer
+        // last claim (Failure D falsification test, 2026-08-07). Printed raw so a hang dump can answer
         // "are there genuinely never-run threads right now" without inference.
         let last_core = LAST_CORE[tid].load(Ordering::Relaxed);
         // Raw TOTAL_CPU_TIMES (not the live-corrected `get_thread_cpu_time`, which takes

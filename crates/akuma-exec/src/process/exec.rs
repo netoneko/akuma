@@ -51,8 +51,8 @@ pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]
         // nothing READY (the child is RUNNING on a peer core that claimed it BKL-free via
         // the M5c step-2 path), returns without switching — so this thread would spin here
         // holding the BKL forever while the peer running the child freezes the instant the
-        // child needs EL1 (a cross-core circular deadlock; see `smp_shared.rs`
-        // SCHED_BKLFREE_EL0 and docs/runbooks/debug-smp.md §"M5c step-2"). `blocking_relax`
+        // child needs EL1 (a cross-core circular deadlock under the SGI scheduler's BKL-free
+        // path, docs/archive/M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md). `blocking_relax`
         // drops the BKL around a WFI so the peer can drive the child to exit.
         crate::threading::blocking_relax();
     }

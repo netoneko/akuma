@@ -386,9 +386,6 @@ pub struct ExecConfig {
     pub enable_stack_canaries: bool,
     pub stack_canary: u64,
     pub canary_words: usize,
-    pub network_thread_ratio: u32,
-    /// See `config::PRIORITIZE_NEVER_SCHEDULED`.
-    pub prioritize_never_scheduled: bool,
     pub deferred_thread_cleanup: bool,
     pub thread_cleanup_cooldown_us: u64,
     /// Cooldown before `process::reclaim_retired_processes` actually frees a
@@ -506,8 +503,6 @@ impl ExecConfig {
             enable_stack_canaries: false,
             stack_canary: 0xDEAD_BEEF_CAFE_BABE,
             canary_words: 2,
-            network_thread_ratio: 4,
-            prioritize_never_scheduled: false,
             deferred_thread_cleanup: false,
             thread_cleanup_cooldown_us: 0,
             process_reclaim_cooldown_us: 0,

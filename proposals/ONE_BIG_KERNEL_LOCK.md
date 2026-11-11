@@ -11,7 +11,7 @@ Two kernels' worth of SMP run on two different big kernel locks, over the same s
 |---|---|---|
 | lock | `akuma-bkl` (`KernelLock` in `sync.rs`, the wrappers in `bkl.rs`, the drop policy in `policy.rs`) | `akuma_tokio_kernel_core::bkl` (241 lines) |
 | shape | recursive, hold-tag attribution, **dropped windows**: exec's ELF read, demand-page fill, VFS, mm and drivers leave the lock and re-enter it, with a per-thread ledger so a tick cannot re-take it mid-window | ticket lock, re-entrant by owner core, depth per thread handed over at a switch (`transfer_depth`); taken around every kernel entry, **no dropped windows** |
-| machine hooks | the kernel's exception path calls `enter_kernel`/`leave_kernel`/`reconcile_for_spsr` | `BklCpu`: `index`, `while_waiting` (amd64 services TLB shootdowns while spinning), `irq_save`/`irq_restore` |
+| machine hooks | the kernel's exception path calls `enter_kernel`/`leave_kernel` (an interrupt restores the state it found); a switch crosses holding the lock (`yield_locked`) | `BklCpu`: `index`, `while_waiting` (amd64 services TLB shootdowns while spinning), `irq_save`/`irq_restore` |
 | how the shared crates see it | built with `bkl-smp` (`cfg(kernel_bkl_smp)`): they call `akuma-bkl` themselves, open dropped windows, mask IRQs in `PreemptGuard` | built **without** `bkl-smp`: every `akuma-bkl` call is an empty body and the embedder serializes around them |
 
 The `bkl-smp` switch on the 16 shared crates exists only because of this split. Both Akuma kernels
@@ -33,8 +33,9 @@ only as `cfg(test)` (or go, where a test does not need them).
   `akuma-bkl`'s wait would need the same callout (the `BklCpu::while_waiting` shape) or an amd64
   Taoxichuan core spinning IRQ-masked never takes the shootdown IPI.
 - **Depth hand-over.** Taoxichuan moves the lock depth with the thread at a switch
-  (`transfer_depth`, `born_locked`); `akuma-bkl` reconciles on the way back to EL0
-  (`reconcile_for_spsr`). The two must be mapped onto each other, per architecture.
+  (`transfer_depth`, `born_locked`); `akuma-bkl` is per-core, every switch crosses holding
+  it, and a thread that did not hold it drops it after (`yield_locked`). The two must be
+  mapped onto each other, per architecture.
 - **Fairness.** Taoxichuan's lock is a ticket lock because an unfair spin starved sshd under four
   compilers; check `KernelLock`'s order before swapping.
 
