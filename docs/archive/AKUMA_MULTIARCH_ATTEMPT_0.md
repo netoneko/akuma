@@ -2399,3 +2399,96 @@ fails with `[asid] EXHAUSTED` in `UserAddressSpace::new_shared`. Repeated runs l
 to spawn a process, and ssh stops answering. The kernel from before any slice (`mrg`, 16:43) behaves
 the same, and the drain at clone does not cure it, so ASIDs are leaked, not slow to come back.
 Next item.
+
+## RAM floor: how low amd64 actually goes (2026-11-11/12)
+
+The heap-sizing bug above (flat 512 MiB heap request, no floor proportional to actual RAM) is
+fixed: `crates/akuma-mem-policy` is a new, pure, host-unit-tested crate holding
+`compute_heap_size`, `compute_thread_limit`, `compute_memory_layout`, `compute_user_stack_size` and
+`reserve_calc_ram`, each taking a `manual_override` instead of reading a config const directly.
+Wired into **all four** kernels (AArch64 root, amd64 root, Taoxichuan's amd64 half, Shanghai's
+AArch64 half) — not just amd64, which is where the bug was found. `compute_user_stack_size`
+replaced three separate flat 8 MiB stack-ceiling constants (amd64 root's `ELF_STACK_MAX_PAGES *
+4096`, Taoxichuan-amd64's `STACK_MAX`, Taoxichuan-aarch64's `USER_STACK_MAX`) with one
+RAM-proportional formula.
+
+Also merged in while this was in flight: `origin/akuma-multiarch-attempt-0`'s LAPIC periodic-timer
+fix (`docs/archive/AMD64_LAPIC_PERIODIC_SWITCH_QEMU_LIVELOCK.md`) and its fd-layer/signals/threads
+slices — `config-flag-sweep` is at merge commit `332ad7f6`, 8 commits ahead of where it branched
+from `akuma-multiarch-attempt-0`.
+
+**Floor numbers** — amd64 headless, `no-tests` build, `forktest_parent -duration=4s` as the
+workload, Firecracker PVH guest, no NIC:
+
+| SMP | Floor (RAM, passes) | Next step down (fails) |
+|---|---|---|
+| 1 | 24 MiB | 20 MiB — real `[FATAL]` PMM exhaustion |
+| 2 | 24 MiB | 20 MiB — real `[FATAL]` PMM exhaustion |
+| 4 | 28 MiB | 24 MiB — real `[FATAL]` PMM exhaustion |
+
+All three floors are genuine out-of-memory FATALs, not harness artifacts — confirmed only after
+three stacked **test-harness** bugs (none of them kernel bugs) were found and fixed in the sweep
+driver:
+
+1. A marker-substring race: matching the bare substring `"paws"` against the kernel's own
+   `-- running /bin/paws --` announcement line, which appears *before* the real `paws v0.3.0`
+   shell-ready banner — sent the test's typed command before the shell could read it.
+2. Stray/duplicate `firecracker` processes, left over from earlier manual debugging in the same
+   scratch directory, racing the sweep's own VM for the shared `akuma-vm.json`/`disk.img`.
+3. The real one: the driver script wrote a command to firecracker's stdin, then did a blind
+   `time.sleep(per_cmd_wait)` with **zero reads** of its stdout. The guest's console output backs
+   up in the unread OS pipe; once it backs up enough, firecracker's write to that pipe blocks,
+   which stalls the guest — the shell never even echoes the next typed command. A `select()`
+   "ready" result only promises *some* bytes, not a full line, so a later fix that kept draining
+   continuously still intermittently hung: a *blocking* `readline()` after `select()` can wait
+   forever for the rest of a line that never arrives if the peer stalls. The real fix was a
+   non-blocking read of the fd (`fcntl` + `os.read()` + manual line-splitting) so no read call can
+   ever block past its own `select()` timeout.
+
+**Better approach, not yet used for the numbers above**: driving an interactive shell over a pipe
+is inherently fragile (see the three bugs). `herd` (the real service supervisor, normally used as
+`init=` over ssh) reports a `oneshot` service's completion straight on the console —
+`[herd] Oneshot service <name> completed` — with **no stdin interaction needed at all**: boot, read
+the console for a fixed time budget, done. A `/etc/herd/enabled/forktest.conf` (`oneshot = true`,
+`command = /bin/forktest_parent`, `args = -duration=4s`) staged onto the disk image and
+`init=/bin/herd` on the boot line sidesteps the whole class of bug above. Confirmed working on
+amd64 headless at `mem_size_mib=512`. The floor numbers in the table were taken with the
+interactive-shell harness (now fixed); re-running them through `herd` instead would be the natural
+next step, and is probably worth it before trusting the exact low-end numbers (24/24/28 MiB) too
+far.
+
+## Taoxichuan: spawn fails under a no-NIC Firecracker config, not yet understood (2026-11-12)
+
+While trying the same floor-finding approach on Taoxichuan (`taoxichuan` binary, amd64 half,
+`no-tests`), every attempt to run an external program failed, independent of RAM size and
+independent of which program:
+
+- `init=/bin/paws` directly as pid 1: the shell prints its banner and prompt, but the **first**
+  blocking read for a keystroke — even for a pure builtin like `echo`, no exec involved — hits
+  `[nosys] nr=4409` and paws then calls `exit(0)`, ending the session.
+- `init=/bin/herd`: `bind()` on the control socket fails with `[nosys] nr=4415` (expected-ish, no
+  NIC), but then **every** service spawn (`console`, `forktest`, `sshd`) fails too, with
+  `[nosys] nr=4397` — `[herd] Failed to start <svc>`.
+
+None of 4409/4397/4415 match any named syscall constant anywhere in `akuma-syscalls-abi`'s x86_64
+table — they don't look like real (if unimplemented) syscall numbers so much as a corrupted/garbage
+value landing in whatever register supplies the syscall number (`fr.rax`) at dispatch time. The
+values are deterministic and close together (within ~20), consistent with low bits of nearby
+addresses rather than noise, but the exact mechanism is not found — `child.rs`'s
+`pack_frame`/`unpack_frame` (the `rt_sigreturn` signal-frame save/restore, which does write `rax`
+back from a saved word array) is a plausible area, not a confirmed one.
+
+**Confirmed pre-existing, not introduced by the merge above**: reproduces identically on
+`taoxichuan` built from plain `origin/akuma-multiarch-attempt-0` (no `akuma-mem-policy`, no fd/LAPIC
+merge) at `mem_size_mib=2048` (big enough that the old flat-heap bug doesn't mask it).
+
+**Not yet reconciled** with normal usage: Taoxichuan's own README says it boots with virtio-net +
+DHCP and `init=` normally `sshd`, and ssh with interactive input is reported to work fine in that
+setup. Every reproduction above used a Firecracker config with **no virtio-net device**
+(`"network-interfaces": []`) and `init=` set directly to `/bin/paws` or `/bin/herd`, bypassing sshd
+entirely — a combination the normal dev loop (`docs/runbooks/build-and-boot.md`,
+`scripts/kvm/goose/boot_dev.sh`) does not use. Whether this is a real spawn-path bug that normal
+usage simply never exercises, or an artifact specific to the no-NIC/non-sshd boot path used here, is
+open. Left here rather than chased further; the next step is reproducing against the actual
+documented dev-loop setup (real NIC, `init=/bin/sshd`) before concluding anything about Taoxichuan's
+RAM floor.
