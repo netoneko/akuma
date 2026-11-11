@@ -1,8 +1,7 @@
 //! Rump sysproxy / scheduling regression guards.
 //!
 //! Static + behavioural invariants for the rump-default devbox performance
-//! fixes (Phase 2a: `start_default_stack` registers rump_server's TID as the
-//! network thread; Phase 2b: rump-aware shorter blocking-poll cadence).
+//! fixes (Phase 2b: rump-aware shorter blocking-poll cadence).
 //! Mirrors the source-text-check pattern in
 //! `ssh_tests::test_block_on_uses_yield_now`.
 //!
@@ -10,14 +9,9 @@
 //! `#[cfg(feature = "rump")]`), not host-testable — they assert on pure
 //! functions in `crate::syscall::poll` and on rump fd lifetime.
 //!
-//! The two SOURCE-TEXT tests (T1 `run_async_main` cfg gate, T2
-//! `start_default_stack` TID registration) moved to host tests in
-//! `akuma-kernel-glue`'s `source_shape` module on 2026-09-03. They used
-//! `include_str!` on `kernel-glue/src/lib.rs` (126 KB) and `rump_proxy.rs`
-//! (78 KB), putting ~200 KB of source text into the kernel image's `.rodata`;
-//! and being gated with this module they never ran in the devbox builds that
-//! actually use `rump-default`. On host they cost no image bytes and run for
-//! every profile.
+//! The two source-text tests that guarded the network-thread registration (T1, T2) were
+//! deleted on 2026-11-11: the registration only names the thread now that the scheduler
+//! boost is gone (docs/archive/SGI_SCHEDULER_RESIDUE.md).
 
 use crate::console;
 

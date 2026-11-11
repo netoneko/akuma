@@ -3,8 +3,11 @@
 **Correction 2026-11-11:** `WAKE_DEADLINE_PREEMPT`, half of the fix below, no longer
 does anything. Its run-next hint (`PREEMPT_WAKE_TID`) was read only by the SGI scheduler's
 picker, and the call-switch scheduler that replaced it (default since `e85f53dd`, the only
-one since `cd1d8f17`) scans plain round-robin. The tick half stands (3 ms today). The
-nanosleep floor has not been re-measured since: [`SGI_SCHEDULER_RESIDUE.md`](SGI_SCHEDULER_RESIDUE.md).
+one since `cd1d8f17`) scans plain round-robin. The tick half stands (probed at boot; 1 ms
+under HVF). Measured 2026-11-11: a 1 ms sleep with 3 CPU hogs takes 4.3 ms at SMP=1 (the fix
+had 1.06 ms) and 1.0 ms at SMP=4. Accepted for the merge
+([`SGI_SCHEDULER_RESIDUE.md`](SGI_SCHEDULER_RESIDUE.md)); the improvement is
+[`proposals/WAKEUP_LATENCY_UNDER_LOAD.md`](../../proposals/WAKEUP_LATENCY_UNDER_LOAD.md).
 
 **Date:** 2026-08-17/18
 **Status:** **The kernel-scheduler fix below is real and stands. The

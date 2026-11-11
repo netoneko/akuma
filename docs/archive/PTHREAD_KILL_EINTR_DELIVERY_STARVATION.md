@@ -15,7 +15,10 @@ The guard is that probe, a Tier 3 exercise rather than a boot test.
 **Correction 2026-11-11:** of the second fix's two halves, `SIGNAL_WAKE_PREEMPT` no longer
 does anything: its hint was read only by the SGI scheduler's picker, which is gone. The other
 half, `SIGFRAME_ACTIVE` (the one that took the probe from 9/10 to 15/15), is still in place.
-The probe has not been re-run since: [`SGI_SCHEDULER_RESIDUE.md`](SGI_SCHEDULER_RESIDUE.md).
+Re-run 2026-11-11 under QEMU HVF: 20/20 at SMP=1 and at SMP=4, idle and with 3 CPU hogs
+([`SGI_SCHEDULER_RESIDUE.md`](SGI_SCHEDULER_RESIDUE.md)). On amd64 metal it is flaky at phase 2
+on this branch and on the kernel before it, which is a separate open problem
+([`proposals/WAKEUP_LATENCY_UNDER_LOAD.md`](../../proposals/WAKEUP_LATENCY_UNDER_LOAD.md) § Related).
 
 ## Summary
 

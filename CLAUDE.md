@@ -375,8 +375,9 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   is not one.
   `akuma-bkl` is the BKL protocol and the spinlocks under it — and since
   2026-09-01 also `akuma_bkl::policy`, the **decision** to take it or skip it:
-  the seven `no-bkl-*` phase toggles (runtime atomics; the compile-time
-  `no-bkl-*` features were folded into `smp-shared`) and the per-syscall opt-out bitmap, moved
+  the five `no-bkl-*` phase toggles (runtime atomics; the compile-time
+  `no-bkl-*` features were folded into `smp-shared`; `no-bkl-irq` and `sched_bklfree_el0`
+  went with the SGI scheduler, 2026-11-11) and the per-syscall opt-out bitmap, moved
   out of `src/smp_shared.rs` (which went 1173 -> 808 lines,
   `docs/archive/AKUMA_SMP_SHARED_SPLIT.md`). Each toggle is a relaxed atomic load
   with a **paired setter that is not test-only** — every phase in

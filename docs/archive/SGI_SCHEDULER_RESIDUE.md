@@ -1,7 +1,9 @@
 # What the SGI scheduler left behind (2026-11-11)
 
-**Status:** the dead code is removed. Three behaviours that went with the SGI scheduler are
-recorded as **open**, unmeasured on the current scheduler.
+**Status: closed (2026-11-11).** The dead code is removed. The three behaviours that went
+with the SGI scheduler were measured on the current scheduler and accepted for the merge (see
+"Measured"). Improving wakeup latency under load is
+[`proposals/WAKEUP_LATENCY_UNDER_LOAD.md`](../../proposals/WAKEUP_LATENCY_UNDER_LOAD.md).
 
 ## Background
 
@@ -74,7 +76,7 @@ The interrupt path today takes the lock only if the interrupted code did not hol
 drops only what it took, so a dropped window survives an interrupt without any eret-time
 logic. The dropped-window ledger stays; the idle loop and the EL0-entry tripwire read it.
 
-## Open: three behaviours that went with the SGI picker
+## Three behaviours that went with the SGI picker
 
 All three lived in `schedule_indices`. The current picker, `pick_next`, is plain round-robin
 with no hint and no boost, so a thread that becomes runnable waits its turn.
@@ -85,16 +87,32 @@ with no hint and no boost, so a thread that becomes runnable waits its turn.
 | `SIGNAL_WAKE_PREEMPT`, 2026-08-28 ([`PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md`](PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md)) | a signal-woken thread ran on the next switch | `SIGFRAME_ACTIVE`, the half that took the probe from 9/10 to 15/15 |
 | `NETWORK_THREAD_RATIO` boost, 2026-07-18 ([`RUMP_SYSPROXY_LATENCY_FIX.md`](RUMP_SYSPROXY_LATENCY_FIX.md) Phase 2a) | the registered network thread (netpoll, or `rump_server` under `rump-default`) was preferred every 4th tick | `set_network_thread_id` still registers it, which now only names it in thread dumps |
 
-None was re-measured when the call switch became the default. What to run:
-- the `nanosleep`/`sleep_ms(1)` floor from `SCHEDULING_INVESTIGATION.md` § Evidence, at
-  SMP=1 with three runnable threads;
-- `smp1.ex.pthread_kill_eintr` from `scripts/verify_trim.py`;
-- the rump sysproxy round trip from `RUMP_SYSPROXY_LATENCY_FIX.md`, on the rump devbox
-  (deferred; needs `RUMP_NIC=1`).
+## Measured (2026-11-11)
 
-If any regressed, the fix belongs in `pick_next`. A hint there has to work with the `ON_CPU`
-claim and with several cores scanning at once, which a single global slot did not need to
-under the SGI picker.
+`ncaprobe sleepbench` (1 ms request, median of 40) and `pthread_kill_eintr`, on `da505df7`.
+The full table and its caveats are in
+[`proposals/WAKEUP_LATENCY_UNDER_LOAD.md`](../../proposals/WAKEUP_LATENCY_UNDER_LOAD.md).
+
+| | idle | 3 CPU hogs | 7 hogs | `pthread_kill_eintr` |
+|---|---|---|---|---|
+| AArch64 HVF SMP=1 | 1.27 ms | 4.29 ms | — | 20/20 |
+| AArch64 HVF SMP=4 | 1.31 ms | 1.00 ms | 2.02 ms | 20/20 |
+| amd64 trashcan (metal, 4 cores) | 1.01 ms | 10.0 ms | 11.5 ms | flaky on this kernel and on the one before it |
+
+- **`WAKE_DEADLINE_PREEMPT`:** AArch64 SMP=1 under load went from the fix's ~1.06 ms to
+  4.3 ms. That is round robin at a 1 ms tick. It is far from the original ~35 ms floor, and
+  SMP≥2 is unaffected. amd64 never had this fix: its picker was always plain round robin, and
+  a kernel trashcan ran before this branch measured 6–24 ms under the same load.
+- **`SIGNAL_WAKE_PREEMPT`:** no regression on AArch64. `SIGFRAME_ACTIVE` carries the probe.
+  amd64's flakiness predates this branch and is a separate signal-delivery problem, listed
+  in the proposal.
+- **`NETWORK_THREAD_RATIO`:** not measured (rump devbox, deferred). The scheduler no longer
+  reads `set_network_thread_id`. It remains only to name the thread `network` in dumps, and
+  the source-shape tests guarding its registration went with this closure.
+
+Accepted for the merge. Restoring sub-tick wakeups under load, on both architectures, is the
+proposal's job: a deadline timer on busy cores, a kick for halted cores, and a per-core
+run-next hint in `pick_next`.
 
 ## Verification
 

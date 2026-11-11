@@ -2,8 +2,8 @@
 
 > **Correction 2026-11-11:** Phase 2a's `NETWORK_THREAD_RATIO` boost no longer exists. It
 > was read only by the SGI scheduler's picker; the call-switch scheduler has no boost, and
-> `set_network_thread_id` now only names the thread. Not re-measured since:
-> [`SGI_SCHEDULER_RESIDUE.md`](SGI_SCHEDULER_RESIDUE.md).
+> `set_network_thread_id` now only names the thread. Not re-measured (the rump devbox is
+> deferred); accepted for the merge in [`SGI_SCHEDULER_RESIDUE.md`](SGI_SCHEDULER_RESIDUE.md).
 
 > **Status: LIVE (2026-07-18).** Phase 2a + 2b + 3a + 3b applied, measured,
 > verified. Phase 3e/3f root-caused (not yet fixed) a residual ~300ms
