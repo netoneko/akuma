@@ -1779,3 +1779,66 @@ Candidates, by how little they touch the kernel (counted 2026-11-11):
 None of this needs SVM hardware, which is the point: today every change to these paths is
 compile-only until it reaches the ryzen.
 
+### Future work: a sweep of crates without host tests
+
+`akuma-kvm-amd64` is not the only crate `cargo test` never exercises. A survey of all 141 crates
+(2026-11-11: `#[test]` count per crate, its line count, and whether `lib.rs` or the manifest gates it
+to `target_os = "none"`) finds 31 with **no** host tests and several large ones with very few. They
+split into crates that cannot be host-tested, where the boot suites are the coverage, and crates
+that could be and are not. This is a first pass, from the survey and each crate's stated purpose,
+not from reading every crate; the sweep itself should confirm each classification.
+
+**Cannot be host-tested, by design** (the boot suites cover them):
+
+- *Kernel-only by `cfg`:* `akuma-drivers-amd64`, `akuma-kvm-amd64`, `akuma-svm-switch-amd64`,
+  `akuma-tokio-kernel-aarch64`, `akuma-tokio-kernel-amd64`, and the kernel fronts `akuma-kernel` and
+  `akuma-tokio-kernel`. `akuma-kernel-tests-aarch64` and `akuma-kernel-tests-amd64` *are* the boot
+  suites (about 38k lines of in-kernel tests).
+- *Instruction and MMIO leaves*, whose whole job is one `asm!` or one register window:
+  `akuma-boot-aarch64`, `akuma-boot-amd64`, `akuma-entry`, `akuma-el0-entry`,
+  `akuma-vectors-aarch64`, `akuma-switch`, `akuma-sched-amd64`, `akuma-percpu-gdt-amd64`,
+  `akuma-mmu-raw`, `akuma-frame-raw`, `akuma-gic`, `akuma-psci`, `akuma-uart`, `akuma-comconsole`.
+  `akuma-cpu` (7 tests) and `akuma-idt-amd64` (4) test the little that is not an instruction, which is
+  the right amount.
+- *Physmap access:* `akuma-phys` dereferences the kernel's physmap; its contracts are exercised by
+  every boot-suite allocation.
+- *Compile-time constants:* `akuma-config` is consts with nothing to execute. A test would only
+  restate the values.
+
+**Lacking coverage, and testable** (the sweep's real work):
+
+- `akuma-fpcache` (558 lines, `forbid`): a keyed, refcounted page cache. Its insert, lookup, evict
+  and cap decisions are pure apart from the frame source, which a fake can supply.
+- `akuma-syscalls-ipc` (497): System V message queues. Queue state and the
+  `msgget`/`msgctl`/`msgsnd`/`msgrcv` errno rules are pure; only the user copies are not.
+- `akuma-syscalls-time` (613): its tests left with the SNTP code for `akuma-sntp` (`2fb18cb7`), so the
+  itimer and `adjtimex` logic still here is untested. `docs/reference/subsystems/syscalls/time.md`
+  still says the `sntp`/`boot` submodules are host-tested "in the same crate"; fix that in the sweep.
+- `akuma-syscalls-log` (3 tests, 272 lines): the per-pid trace rings' wrap and retain-past-exit rules.
+- `akuma-alloc` (1.4k): the growth, backoff and reclaim **policy** around Talc. Several fixed bugs
+  (`heap_growth_backoff_fix`, the heap->PMM reclaim) were policy bugs. The policy can be driven
+  against a host-memory arena; only the Talc hookup needs the kernel.
+- `akuma-exceptions` (4.5k, `forbid`, 0 tests): the largest untested crate. The fault classification
+  (ESR decode to action) and the CoW-break bookkeeping are decisions, and `akuma-cow` shows the
+  pattern for pulling one out. The ~500-line break path is deliberately welded to `akuma-exec`
+  (see `akuma-cow`), so expect a partial extraction, not a whole-crate test suite.
+- `akuma-exceptions-forensics` (163): feature-gated diagnostics. Low priority; test only if it is
+  kept.
+- `akuma-virtio` (2 tests, 2.5k): split-ring and descriptor bookkeeping can run over host memory,
+  like `akuma-dma`'s fake. Today most of it is covered only by booting.
+- `akuma-net-nic` (8 tests, 3.4k): the frame arenas and lease rules are host-testable. The DMA
+  doorbells are not.
+
+**Glue, where the rule is "extract, don't test in place":** `akuma-kernel-glue` (4.6k, 0 tests),
+`akuma-vfs-glue` (4k, 2), `akuma-syscalls-glue` (20.9k, 5), `akuma-kernel-core` (2k, 0) and
+`akuma-tokio-kernel-core` (4.1k, 18). By the naming rule a `-glue` crate is the part that cannot be
+host-tested. The sweep's task here is to find pure logic that has collected in them anyway (decision
+tables, wire formats, errno rules) and move it down into a family crate, as was done for
+`akuma-syscalls-{time,sync,poll,mem,net}`. It is not to add tests to the glue.
+
+How to run the sweep: regenerate the counts (a short script over `crates/*/` counting `#[test]`
+against lines; keep it next to `scripts/cloc_akuma.py` so the numbers are reproducible). Then work
+through the "testable" list largest-risk-first, taking `akuma-exceptions`, `akuma-alloc` and
+`akuma-fpcache` before the small ones, since those three have the most bug history in
+`BUG_FIX_LIST.md`.
+
