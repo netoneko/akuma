@@ -2,8 +2,8 @@
 # Boot the Akuma devbox-smoltcp: the smoltcp (native, in-kernel) counterpart to the
 # rump devbox, for A/B latency comparisons on the SAME disk image.
 #
-# This build is RUMP-FREE by construction: --no-default-features drops `rump` (which
-# is in the default set), and no `rump`/`rump-default`/`userspace-sshd`/`rump-tests`
+# This build is RUMP-FREE by construction: `rump` is not in the default set (since
+# 2026-11-11), and no `rump`/`rump-default`/`userspace-sshd`/`rump-tests`
 # feature is selected. Result: no rump_server, no /dev/net/tap0, no sysproxy, no
 # RUMP_NIC — box 0 runs the native smoltcp stack directly and the built-in in-kernel
 # SSH server. Verify rump-freeness: `nm target/aarch64-unknown-none/release/akuma |

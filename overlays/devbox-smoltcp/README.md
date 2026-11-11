@@ -13,8 +13,8 @@ control for measuring that tax — see
 
 ## Rump-free by construction
 
-`run.sh` builds with `--no-default-features` (which drops `rump`, part of the default
-feature set) and selects **no** `rump` / `rump-default` / `userspace-sshd` /
+`run.sh` builds with `--no-default-features` (`rump` has not been in the default set
+since 2026-11-11 anyway) and selects **no** `rump` / `rump-default` / `userspace-sshd` /
 `rump-tests` feature. So the binary contains **zero** rump code and the runtime has no
 rump_server, no `/dev/net/tap0`, no sysproxy, and no `RUMP_NIC`. Box 0 is native
 smoltcp and the SSH server is the **built-in in-kernel** one (not the userspace

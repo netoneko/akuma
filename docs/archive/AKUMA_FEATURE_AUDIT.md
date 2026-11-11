@@ -123,6 +123,30 @@ predicted to suit it (`REDIS_ROUND_TRIP_CEILING.md`). Removed:
 `[NICSTAT]` keeps its `orphan`/`tx_stall` columns, always 0, so parsers do not shift.
 `akuma-net-nic`'s unsafe budget went from 13 to 9. The default image's sections are unchanged.
 
+## F5 applied: `rump` out of `default`, `rump-tests` and `devbox` folded (2026-11-11)
+
+- `rump` is off by default. Acceptance 11 builds `--features rump`.
+- `rump-tests` is gone: every `rump` build runs the rump regression guards at boot, `no-tests` or
+  not. The devbox already did; a plain `rump` build ran them anyway, because it does not set
+  `no-tests`.
+- The `devbox` bundle is gone. `scripts/build_devbox.sh`, `overlays/devbox/run.sh` and
+  `scripts/sched_audit_matrix.py` name `rump-default,userspace-sshd,sc-reboot` directly.
+- `rump-default` stays a feature. The plan merged it into `rump`, but acceptance 11 runs a rump
+  kernel with box 0 on the native stack and checks the kernel-as-client sysproxy test, which
+  `rump-default` compiles out. The choice would have to be made at boot, and the AArch64 kernel
+  reads no command line yet (`akuma-params` is wired only on amd64).
+
+Verification:
+
+- Identity: the new `--features rump` image has the same `.text`/`.rodata`/`.data`/`.bss` as the
+  old default, and the new devbox set gives the same image as the old
+  `devbox,…,rump-tests` set.
+- The default image is 81 KB smaller in `.text`.
+- HVF on the default image: `SMP=2` 323/0, `SMP=4` 321/0, `SMP=1` 314/1 (the open
+  `thread_slot_reclaim_on_spawn` failure).
+- HVF on the `rump` image: all four rump guards pass.
+- Lima devbox-smoltcp at `SMP=4`: epoll 0 FAIL / 1 DIVERGE, futex all pass.
+
 ## `many-sessions` and `small-sockets` removed (2026-11-11)
 
 `many-sessions` was the kernel half of the process-per-session sshd. It raised the listener

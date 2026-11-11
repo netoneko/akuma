@@ -270,7 +270,6 @@ default = [
     "smp-shared",
     "smoltcp",
     "sound",
-    "rump",
     "fs-cache",
     "sc-aio", "sc-sysv-ipc", "sc-containers",
     "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
@@ -295,10 +294,6 @@ no-tests = ["akuma-exceptions/no-tests", "akuma-exec/no-tests", "akuma-syscalls-
 # depends on vCPU count. See docs/archive/FIRECRACKER_PORT.md.
 platform-firecracker = ["akuma-config/platform-firecracker", "akuma-virtio/platform-firecracker", "akuma-kernel-glue/platform-firecracker", "akuma-kernel-tests-aarch64/platform-firecracker"]
 
-# Allow ONLY rump_tests to compile even when `no-tests` is set — used by the
-# devbox to verify rump regression guards at boot without pulling in the full
-# test suite (which requires default features smoltcp types etc.).
-rump-tests = ["akuma-kernel-glue/rump-tests", "akuma-kernel-tests-aarch64/rump-tests"]
 
 # Real (shared-kernel) SMP / classic symmetric multiprocessing. NOT in `default`:
 # all shared-kernel secondary bringup + the shared scheduler/locking live behind
@@ -363,11 +358,12 @@ read-profile = ["akuma-syscalls-glue/read-profile"]
 # Rump-kernel support: a raw L2 packet path so a userspace NetBSD rump TCP/IP
 # stack can send/receive Ethernet frames. Binds a SECOND virtio-net device
 # (NIC1) and exposes it as /dev/net/tap0 (open/read/write whole frames + a
-# no-op TUN/TAP ioctl), leaving NIC0 on the native smoltcp stack. Included in
-# `default` so only the RELEASE profile carries it; the size/extreme profiles
-# build with --no-default-features and omit it (it targets roomy VMs, not the
-# 4 MB floor). NIC1 itself only exists when the QEMU runner is started with
-# RUMP_NIC=1; without it, tap init no-ops and /dev/net/tap0 returns ENODEV.
+# no-op TUN/TAP ioctl), leaving NIC0 on the native smoltcp stack. OFF by
+# default since 2026-11-11; build with `--features rump` (acceptance 11) or
+# `rump-default` (the rump devbox). A rump build always runs the rump
+# regression guards at boot, `no-tests` or not (`rump-tests` folded in). NIC1
+# itself only exists when the QEMU runner is started with RUMP_NIC=1; without
+# it, tap init no-ops and /dev/net/tap0 returns ENODEV.
 rump = ["akuma-net/rump", "dep:akuma-rump", "akuma-syscalls-glue/rump", "akuma-kernel-glue/rump", "akuma-kernel-tests-aarch64/rump"]
 
 # Linux `reboot(2)` -> PSCI SYSTEM_RESET/SYSTEM_OFF (src/syscall/reboot.rs).
@@ -482,12 +478,6 @@ userspace-sshd = ["akuma-config/userspace-sshd"]
 # platform feature (scripts/build_taoxichuan_fc.sh). One line per stage that pulls a crate.
 taoxichuan = ["no-tests", "extreme", "userspace-sshd"]
 
-# The devbox meta-feature: rump is the default stack and there is no built-in
-# SSH. Selected with `--features devbox` (+ the `devbox` profile). Built with
-# `--no-default-features` (scripts/build_devbox.sh), so `sc-reboot` is listed
-# here explicitly even though it's also in `default` now — this feature set
-# doesn't get `default`'s members for free.
-devbox = ["rump-default", "userspace-sshd", "sc-reboot"]
 
 # ── devbox-smoltcp: the DEFAULT devbox going forward ─────────────────────────
 # A dev image on the NATIVE smoltcp stack (NOT rump — rump_server work is

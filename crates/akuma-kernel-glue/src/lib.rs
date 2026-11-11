@@ -551,26 +551,16 @@ fn boot_test_hooks() -> BootTestHooks {
 }
 
 /// The rump regression-guard suite (`crates/akuma-kernel-tests-aarch64/src/rump_tests.rs`) is gated
-/// independently of `kernel_tests` — it can run on a `no-tests` build when
-/// `rump-tests` is explicitly on — so it gets its own hook rather than a
+/// independently of `kernel_tests` — every `rump` build runs it, `no-tests` or
+/// not — so it gets its own hook rather than a
 /// field on [`BootTestHooks`].
-#[cfg(all(
-    target_os = "none",
-    not(kernel_profile_extreme),
-    feature = "rump",
-    any(not(feature = "no-tests"), feature = "rump-tests"),
-))]
+#[cfg(all(target_os = "none", not(kernel_profile_extreme), feature = "rump"))]
 static RUMP_TESTS_HOOK: akuma_primitives::Registered<fn()> = akuma_primitives::Registered::new(
     "akuma-kernel-glue: rump tests hook not registered — \
      call akuma_kernel_glue::set_rump_tests_hook() from rust_start first",
 );
 
-#[cfg(all(
-    target_os = "none",
-    not(kernel_profile_extreme),
-    feature = "rump",
-    any(not(feature = "no-tests"), feature = "rump-tests"),
-))]
+#[cfg(all(target_os = "none", not(kernel_profile_extreme), feature = "rump"))]
 pub fn set_rump_tests_hook(f: fn()) {
     RUMP_TESTS_HOOK.register(f);
 }
@@ -1786,11 +1776,7 @@ fn run_async_main() -> ! {
     // Rump sysproxy / scheduling regression guards. Compile under `rump` (so
     // they also run on default-smoltcp builds that opt a herd box into rump),
     // not gated on `rump-default`. See `crates/akuma-kernel-tests-aarch64/src/rump_tests.rs`.
-    #[cfg(all(
-        not(kernel_profile_extreme),
-        feature = "rump",
-        any(not(feature = "no-tests"), feature = "rump-tests"),
-    ))]
+    #[cfg(all(not(kernel_profile_extreme), feature = "rump"))]
     // `require`, not `get`: this static and `rust_start`'s registration carry the
     // identical cfg, so an absent hook here means the two drifted apart — and the
     // old `if let Some` spelling turned that into a regression suite silently not

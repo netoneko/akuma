@@ -31,7 +31,7 @@ Source: `Cargo.toml:73-105`.
 
 `default` (`Cargo.toml:109-124`):
 ```
-smp-shared, smoltcp, sound, rump, fs-cache,
+smp-shared, smoltcp, sound, fs-cache,
 sc-aio, sc-sysv-ipc, sc-containers,
 sc-timerfd, sc-eventfd, sc-pidfd, sc-epoll
 ```
@@ -48,12 +48,10 @@ HTTPS client anywhere in this tree now; use a userspace tool.
 | Feature | Effect | Source |
 |---|---|---|
 | `smoltcp` | Native smoltcp TCP/IP stack on NIC0; DNS/HTTP depend on it. (No longer gates a built-in SSH server — that was deleted entirely, not just from non-smoltcp builds.) | `Cargo.toml:315` |
-| `rump` | Raw L2 tap path on NIC1 (`/dev/net/tap0`) for a userspace NetBSD rump stack. NIC1 only exists with `RUMP_NIC=1`. | `Cargo.toml:309` |
-| `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. | `Cargo.toml:378` |
-| `rump-tests` | Compiles only `rump_tests` even under `no-tests` — used by the devbox to verify rump regression guards at boot without pulling in the full boot-test suite. | `Cargo.toml:142` |
+| `rump` | **Off by default** since 2026-11-11. Raw L2 tap path on NIC1 (`/dev/net/tap0`) for a userspace NetBSD rump stack, the sysproxy client, and the rump regression guards, which every `rump` build runs at boot even with `no-tests` (the old `rump-tests`). NIC1 only exists with `RUMP_NIC=1`. Acceptance 11 builds it with box 0 on the native stack. | `Cargo.toml:309` |
+| `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. The rump devbox's feature; it replaces the removed `devbox` bundle. A separate feature because the AArch64 kernel reads no boot command line to choose it at runtime. | `Cargo.toml:378` |
 | `userspace-sshd` | Selects the herd-less startup path: `AUTO_START_HERD` off, kernel spawns `/bin/sshd` directly via `AUTO_START_SSHD`. Drives `config::ENABLE_USERSPACE_SSHD`. There is only ever one sshd (userspace) now — this no longer toggles between a built-in and a userspace server, only who starts the userspace one. | `Cargo.toml:386` |
 | (`many-sessions`) | **Removed 2026-11-11.** The listener backlog is 8 on every build; configure sshd for it or raise `MAX_BACKLOG` — [`../build-profiles.md`](../build-profiles.md) § Listener backlog. |
-| `devbox` | Meta-feature = `["rump-default", "userspace-sshd", "sc-reboot"]`. Built `--no-default-features` (`scripts/build_devbox.sh`), so `sc-reboot` is listed explicitly here even though it's also in `default` now — this feature set doesn't inherit `default`'s members. | `Cargo.toml:393` |
 | `devbox-smoltcp` | Meta-feature = `["userspace-sshd", "smp-shared"]` — the **default** devbox. Keeps smoltcp; both members are no-ops here since they're already in `default` (this build does NOT pass `--no-default-features`) — `sc-reboot` used to be listed a third time for the same reason before it moved into `default` itself (2026-08-25). | `Cargo.toml:405` |
 
 > **Drift note:** `overlays/devbox/README.md:142,211`

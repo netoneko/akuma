@@ -1389,3 +1389,10 @@ amd64 TCG gate: 829/0 at `SMP=1` and 839/0 at `SMP=2`, the same as before.
 The listener backlog is 8 and the smoltcp table is 256 (32 on extreme) on both kernels,
 which leaves one less networking difference between them. Details and gates are in
 `AKUMA_FEATURE_AUDIT.md`.
+
+## F5: rump out of the default (2026-11-11)
+
+`rump` is opt-in; `rump-tests` and the `devbox` bundle are folded away. `rump-default` stays until
+the AArch64 kernel reads a boot command line, which would let box 0's stack be chosen at boot
+(`AKUMA_FEATURE_AUDIT.md`). The default AArch64 image is 81 KB lighter in `.text`. On this
+point it now matches amd64, which never had rump.

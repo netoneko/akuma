@@ -79,11 +79,7 @@ mod network_tests;
 mod process_tests;
 #[cfg(kernel_tests)]
 mod pthread_tests;
-#[cfg(all(
-    not(kernel_profile_extreme),
-    feature = "rump",
-    any(not(feature = "no-tests"), feature = "rump-tests"),
-))]
+#[cfg(all(not(kernel_profile_extreme), feature = "rump"))]
 mod rump_tests;
 #[cfg(kernel_tests)]
 mod sync_tests;
@@ -109,10 +105,6 @@ pub fn register() {
         #[cfg(feature = "smoltcp")]
         process_network_tests: process_tests::run_network_tests,
     });
-    #[cfg(all(
-        not(kernel_profile_extreme),
-        feature = "rump",
-        any(not(feature = "no-tests"), feature = "rump-tests"),
-    ))]
+    #[cfg(all(not(kernel_profile_extreme), feature = "rump"))]
     akuma_kernel_glue::set_rump_tests_hook(rump_tests::run_all_tests);
 }
