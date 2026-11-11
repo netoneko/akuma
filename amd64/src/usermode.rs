@@ -1581,9 +1581,9 @@ fn owns_non_console_channel() -> bool {
 pub fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     const EFAULT: u64 = (-14i64) as u64;
 
-    // `/dev/wifi0`: command lines for the wifi driver (`crate::wifi`).
+    // `/dev/wifi0`: command lines for the wifi driver (`drivers::Wireless`).
     if crate::fd::is_dev_wifi(fd) {
-        return crate::wifi::write(buf, len as usize);
+        return crate::drivers::wireless_dev_write(buf, len as usize);
     }
 
     // `/dev/net/tun`: one frame behind its virtio-net header (`crate::kvm::tun`).

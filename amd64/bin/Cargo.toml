@@ -21,10 +21,11 @@ all-drivers = ["akuma-drivers-amd64/all"]
 fbcon = ["akuma-drivers-amd64/fbcon"]
 hda = ["akuma-drivers-amd64/hda"]
 touchpad = ["akuma-drivers-amd64/touchpad"]
+wifi = ["akuma-drivers-amd64/wifi"]
 # The lean image for a bare-metal test box, used as `--no-default-features --features headless`:
 # the machine half's defaults, the boot suite, and no optional driver. No framebuffer console
 # (the console is the serial port; GRUB's framebuffer is left alone), no splash, no `/dev/fb0`,
-# no sound, no touchpad. What a test box needs stays, because it is in the machine half rather
+# no sound, no touchpad, no Wi-Fi (`/dev/wifi0`, the rtw89 card and its 4 MiB of DMA buffers). What a test box needs stays, because it is in the machine half rather
 # than behind a feature: the serial console, the boot disk (the GRUB-module ramdisk, NVMe, USB
 # storage via xHCI), the NIC (RTL8169) and the USB keyboard. `docs/reference/build-profiles.md`.
 headless = ["akuma-kernel-amd64/default"]

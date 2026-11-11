@@ -562,9 +562,9 @@ fn open_framebuffer(flags: u32) -> u64 {
 }
 
 /// `open("/dev/wifi0")`: a `DevWifi` descriptor, when a wifi backend exists.
-/// See `crate::wifi`.
+/// See `drivers::Wireless`.
 fn open_wifi(flags: u32) -> u64 {
-    if !crate::wifi::present() {
+    if !crate::drivers::wireless_present() {
         return errno::ENOENT;
     }
     let Some(proc) = akuma_exec::process::current_process_shared() else {
@@ -888,7 +888,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     if resolved == "/dev/fb0" {
         return open_framebuffer(flags);
     }
-    // `/dev/wifi0`, likewise this kernel's own: `crate::wifi` serves it.
+    // `/dev/wifi0`, likewise this kernel's own: the wireless driver serves it (`drivers::Wireless`).
     if resolved == "/dev/wifi0" {
         return open_wifi(flags);
     }
@@ -1196,7 +1196,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         let Some(proc) = akuma_exec::process::current_process_shared() else {
             return errno::ESRCH;
         };
-        return crate::wifi::read(proc.tgid, fd as u32, buf, len.min(MAX_IO) as usize);
+        return crate::drivers::wireless_dev_read(proc.tgid, fd as u32, buf, len.min(MAX_IO) as usize);
     }
     // `/dev/net/tun`: one frame behind its virtio-net header, or `EAGAIN`.
     if is_dev_tun(fd) {

@@ -295,8 +295,110 @@ pub fn display_art_color(ch: u8, x: usize, y: usize, t_ms: u64) -> Option<(u8, u
     DISPLAY.get().map(|d| (d.art_color)(ch, x, y, t_ms))
 }
 
+/// Wireless: `/dev/wifi0` and the card that can be the network link.
+///
+/// The control device has its own backends (`wifisim`, the card). Probed in three steps because the card's firmware is a file: the device at
+/// boot, the card after the root mount, the station daemon once the scheduler runs.
+///
+/// The RTL8169 is not in this class: it is the machine half's wired NIC (`net`), driven
+/// through `akuma-net`'s own `ExternalDevice`. A wireless driver hands `net` its frame queues
+/// ([`Wireless::link`]) and `net` makes them the interface, so the class is the edge between
+/// a radio and the stack, not a general net-device registry.
+pub struct Wireless {
+    /// `/dev/wifi0`'s backend from the command line (`wifisim`), before the root mount.
+    pub init: fn(&str),
+    /// The card, after the root mount (its firmware is a file).
+    pub card_init: fn(&str),
+    /// The station daemon, once the scheduler runs.
+    pub spawn: fn(),
+    /// The card was kept up as a station and is the network link.
+    pub is_link: fn() -> bool,
+    /// The station's frame queues, which `net` makes the interface when [`Wireless::is_link`].
+    pub link: &'static akuma_net::queued::FrameQueues,
+    /// Stop the card's DMA before a warm reset.
+    pub shutdown_for_reset: fn(),
+    /// `/dev/wifi0` exists.
+    pub present: fn() -> bool,
+    /// `read(2)` on `/dev/wifi0`, per `(tgid, fd)` cursor.
+    pub dev_read: fn(tgid: u32, fd: u32, buf: u64, len: usize) -> u64,
+    /// `write(2)` on `/dev/wifi0`: one command line.
+    pub dev_write: fn(buf: u64, len: usize) -> u64,
+    /// A `/dev/wifi0` descriptor closed: drop its cursor.
+    pub release: fn(tgid: u32, fd: u32),
+}
+
+static WIRELESS: Registered<&'static Wireless> = Registered::new("no wireless driver registered");
+
+/// Install the wireless driver. Idempotent by `Registered`'s contract.
+pub fn register_wireless(driver: &'static Wireless) {
+    WIRELESS.register(driver);
+}
+
+pub fn wireless_init(cmdline: &str) {
+    if let Some(d) = WIRELESS.get() {
+        (d.init)(cmdline);
+    }
+}
+
+pub fn wireless_card_init(cmdline: &str) {
+    if let Some(d) = WIRELESS.get() {
+        (d.card_init)(cmdline);
+    }
+}
+
+pub fn wireless_spawn() {
+    if let Some(d) = WIRELESS.get() {
+        (d.spawn)();
+    }
+}
+
+#[must_use]
+pub fn wireless_is_link() -> bool {
+    WIRELESS.get().is_some_and(|d| (d.is_link)())
+}
+
+/// The station's frame queues when the card is the link.
+#[must_use]
+pub fn wireless_link() -> Option<&'static akuma_net::queued::FrameQueues> {
+    WIRELESS.get().filter(|d| (d.is_link)()).map(|d| d.link)
+}
+
+pub fn wireless_shutdown_for_reset() {
+    if let Some(d) = WIRELESS.get() {
+        (d.shutdown_for_reset)();
+    }
+}
+
+#[must_use]
+pub fn wireless_present() -> bool {
+    WIRELESS.get().is_some_and(|d| (d.present)())
+}
+
+/// `ENODEV` without a driver; unreachable in practice, because `open` refuses the node
+/// while [`wireless_present`] is false.
+#[must_use]
+pub fn wireless_dev_read(tgid: u32, fd: u32, buf: u64, len: usize) -> u64 {
+    WIRELESS.get().map_or(crate::fd::errno::ENODEV, |d| (d.dev_read)(tgid, fd, buf, len))
+}
+
+/// As [`wireless_dev_read`].
+#[must_use]
+pub fn wireless_dev_write(buf: u64, len: usize) -> u64 {
+    WIRELESS.get().map_or(crate::fd::errno::ENODEV, |d| (d.dev_write)(buf, len))
+}
+
+pub fn wireless_release(tgid: u32, fd: u32) {
+    if let Some(d) = WIRELESS.get() {
+        (d.release)(tgid, fd);
+    }
+}
+
 /// What a driver may use of the machine half.
 pub mod services {
+    /// The VFS's view of driver-owned device nodes.
+    pub mod vfs {
+        pub use akuma_vfs_glue::set_wifi_present;
+    }
     /// The EGA text line, the output of last resort before any console exists.
     pub mod boot {
         pub use crate::multiboot2::ega_text;
@@ -311,8 +413,12 @@ pub mod services {
         pub use crate::drivers::{fb_mouse, fb_set_pointer};
         pub use crate::fbdev::geometry;
     }
+    /// Reading a firmware file off the root filesystem.
+    pub mod fs {
+        pub use crate::fs::{metadata, read_at, resolve_symlinks};
+    }
     pub mod errno {
-        pub use crate::fd::errno::{EAGAIN, EFAULT, EINVAL, ENODEV};
+        pub use crate::fd::errno::{EAGAIN, EFAULT, EINVAL, EIO, ENODEV, EOPNOTSUPP};
     }
     pub mod input {
         pub use crate::input::note_input;
@@ -321,7 +427,7 @@ pub mod services {
         pub use crate::machine::Physmap;
     }
     pub mod net {
-        pub use crate::net::uptime_us;
+        pub use crate::net::{rng_fill_checked, uptime_us, wake_netpoll};
     }
     pub mod paging {
         pub use crate::paging::map_device_window;
@@ -337,12 +443,13 @@ pub mod services {
     }
     pub mod pci {
         pub use crate::pci::{
-            config_space, enable, find_class, for_each, map_bar_window, probe_bar_size,
+            config_space, enable, enable_bridges_above, enable_full, find_class, for_each,
+            map_bar_window, probe_bar_size, quiesce,
             read_u16_config, write_u16_config,
         };
     }
     pub mod sched {
-        pub use crate::sched::yield_now;
+        pub use crate::sched::{block_until_deadline, spawn_daemon, wake, yield_now};
     }
     pub mod serial {
         pub use crate::serial::{put_dec, put_hex, put_hexn, puts};

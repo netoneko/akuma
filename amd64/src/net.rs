@@ -291,14 +291,14 @@ fn net_blocking_relax() {
     // **On the wifi link, yield first.** Everything above assumes the waiter's
     // own `poll()` is what moves frames, which is true of a NIC the stack
     // reads itself. The wifi station's frames move only when its daemon runs
-    // (`rtw89_sta.rs`, `ExternalDevice::Queued`), and kernel code is not
+    // (`akuma-drivers-amd64`'s `rtw89_sta.rs`, `ExternalDevice::Queued`), and kernel code is not
     // preempted on this target: a blocking `connect`/`recv` that only halts
     // keeps the core from that daemon, so its SYN-ACK sits in the card's
     // receive ring until the connect times out. Measured on ryzen 2026-10-06:
     // the daemon lapped twice in 10 s while `nc` waited (1000 times
     // otherwise), and every outbound TCP connect failed while sshd (epoll,
     // which parks) and DNS (`poll(2)`) worked.
-    if crate::rtw89_sta::is_link() {
+    if crate::drivers::wireless_is_link() {
         crate::sched::yield_now();
     }
     // **A sleeper whose deadline has passed needs the scheduler, not a halt.**
@@ -1039,10 +1039,10 @@ pub fn init_bare_metal(cmdline: &str) -> bool {
         // No Ethernet. The wifi station, if `rtw89wifi` kept the card, is the
         // link: DHCP on, no pre-DHCP address (nothing here knows the network
         // it will join).
-        if crate::rtw89_sta::is_link() {
+        if let Some(link) = crate::drivers::wireless_link() {
             serial::puts("  nic:  wifi station (rtw89) — the link comes up when userspace joins\n");
             let device = akuma_net::ExternalDevice::Queued(akuma_net::queued::QueuedDevice::new(
-                &crate::rtw89_sta::LINK,
+                link,
             ));
             // Without a lease the interface carries a link-local address (and
             // resolves through 1.1.1.1), never `BARE_METAL_STATIC_V4`: a wifi

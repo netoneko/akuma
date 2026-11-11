@@ -57,9 +57,9 @@ use akuma_rtw89::bringup::{self, Ch12, Dma, RING_BYTES, SLOT};
 use akuma_rtw89::fw::Source;
 use akuma_rtw89::{Bus, h2c, rx, script, tx};
 
-use crate::pci;
-use crate::polltime::spin_us;
-use crate::serial;
+use akuma_kernel_amd64::drivers::services::pci;
+use akuma_kernel_amd64::drivers::services::polltime::spin_us;
+use akuma_kernel_amd64::drivers::services::serial;
 
 /// Diagnostics only: `R_AX_DMAC_ERR_ISR` and the HAXI DMA error indications
 /// behind its bit 14 (`R_AX_HAXI_IDCT`: `TXBD_LEN0`, `TXBD_4KBOUND`,
@@ -149,7 +149,7 @@ impl Source for File {
     fn read_at(&mut self, off: u32, buf: &mut [u8]) -> bool {
         let mut done = 0;
         while done < buf.len() {
-            match crate::fs::read_at(&self.path, off as usize + done, &mut buf[done..]) {
+            match akuma_kernel_amd64::drivers::services::fs::read_at(&self.path, off as usize + done, &mut buf[done..]) {
                 Ok(0) | Err(_) => return false,
                 Ok(n) => done += n,
             }
@@ -192,8 +192,8 @@ pub fn init(cmdline: &str) {
         return;
     };
     let Some(mut file) = FIRMWARE.iter().find_map(|&path| {
-        let path = crate::fs::resolve_symlinks(path);
-        let size = crate::fs::metadata(&path).ok()?.size;
+        let path = akuma_kernel_amd64::drivers::services::fs::resolve_symlinks(path);
+        let size = akuma_kernel_amd64::drivers::services::fs::metadata(&path).ok()?.size;
         Some(File { path, len: u32::try_from(size).ok()? })
     }) else {
         say("no firmware: /lib/firmware/rtw89/rtw8852c_fw-1.bin missing (overlays/ryzen/fetch-firmware.sh)");
@@ -244,12 +244,12 @@ pub fn init(cmdline: &str) {
 
     let mut dma = dma_statics();
 
-    let t0 = crate::polltime::tsc();
+    let t0 = akuma_kernel_amd64::drivers::services::polltime::tsc();
     let mut ch12 = Ch12::new();
     let result = bringup::bring_up(&mut regs, &mut dma, &mut ch12, &mut file, &mut |what: &'static str, v: u32| {
         say_hex(what, u64::from(v));
     });
-    let us = (crate::polltime::tsc() - t0) / (crate::polltime::tsc_hz() / 1_000_000).max(1);
+    let us = (akuma_kernel_amd64::drivers::services::polltime::tsc() - t0) / (akuma_kernel_amd64::drivers::services::polltime::tsc_hz() / 1_000_000).max(1);
     match result {
         Ok(r) => {
             serial::puts("[rtw] fw ready v");
@@ -572,10 +572,10 @@ impl script::H2cSink<Regs> for Sink<'_, '_> {
 /// Replay `seq` (with `vars`) and log what the chip did differently, as
 /// `[rtw] <label>: ...`. `false` if the replay could not run to the end.
 fn replay(regs: &mut Regs, dma: &mut Dma<'_>, ch12: &mut Ch12, label: &str, seq: &[u8], vars: &script::Vars) -> bool {
-    let t0 = crate::polltime::tsc();
+    let t0 = akuma_kernel_amd64::drivers::services::polltime::tsc();
     let mut st = script::Stats::default();
     let result = script::run(regs, seq, vars, &mut Sink { ch12, dma }, &mut st);
-    let us = (crate::polltime::tsc() - t0) / (crate::polltime::tsc_hz() / 1_000_000).max(1);
+    let us = (akuma_kernel_amd64::drivers::services::polltime::tsc() - t0) / (akuma_kernel_amd64::drivers::services::polltime::tsc_hz() / 1_000_000).max(1);
     let ok = match result {
         Ok(()) => true,
         Err(script::Error::Diverged) => false,
@@ -669,8 +669,8 @@ fn start_and_listen(regs: &mut Regs, dma: &mut Dma<'_>, ch12: &mut Ch12) {
     let mut nseen = 0;
     let mut counts = [0u32; 16];
     let (mut bad, mut frames, mut crc) = (0u32, 0u32, 0u32);
-    let deadline = crate::polltime::tsc() + crate::polltime::ticks_ms(LISTEN_MS);
-    while crate::polltime::tsc() < deadline {
+    let deadline = akuma_kernel_amd64::drivers::services::polltime::tsc() + akuma_kernel_amd64::drivers::services::polltime::ticks_ms(LISTEN_MS);
+    while akuma_kernel_amd64::drivers::services::polltime::tsc() < deadline {
         let n = rxq.ready(regs);
         for _ in 0..n {
             let at = usize::from(rxq.wp) * RX_BUF_BYTES;

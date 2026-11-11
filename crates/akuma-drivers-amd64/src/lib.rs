@@ -34,6 +34,12 @@ mod hda;
 mod i2c;
 #[cfg(feature = "touchpad")]
 mod touchpad;
+#[cfg(feature = "wifi")]
+mod rtw89;
+#[cfg(feature = "wifi")]
+mod rtw89_sta;
+#[cfg(feature = "wifi")]
+mod wifi;
 
 /// Install every driver this build compiled in. The bin's `before_main`, before either entry
 /// point probes anything.
@@ -55,4 +61,6 @@ pub fn register() {
         dev_write: touchpad::dev_write,
         console_bridge: touchpad::console_bridge,
     });
+    #[cfg(feature = "wifi")]
+    akuma_kernel_amd64::drivers::register_wireless(&wifi::WIRELESS);
 }

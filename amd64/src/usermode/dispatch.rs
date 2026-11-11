@@ -626,11 +626,11 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
             if crate::fd::is_dev_tun(a1) {
                 crate::kvm::tun::release();
             }
-            // A `/dev/wifi0` descriptor's read cursor (`crate::wifi`).
+            // A `/dev/wifi0` descriptor's read cursor (`drivers::Wireless`).
             if crate::fd::is_dev_wifi(a1)
                 && let Some(p) = current_process()
             {
-                crate::wifi::release(p.tgid, a1 as u32);
+                crate::drivers::wireless_release(p.tgid, a1 as u32);
             }
             to_glue(call, [a1, 0, 0, 0, 0, 0])
         }
@@ -685,7 +685,7 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
                         crate::kvm::tun::release();
                     }
                     if crate::fd::is_dev_wifi(f) {
-                        crate::wifi::release(p.tgid, fd);
+                        crate::drivers::wireless_release(p.tgid, fd);
                     }
                 }
             }

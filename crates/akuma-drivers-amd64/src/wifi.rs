@@ -40,8 +40,8 @@ use akuma_wifi::sim::SimRadio;
 use akuma_wifi::IfName;
 use spinning_top::Spinlock;
 
-use crate::fd::errno;
-use crate::serial;
+use akuma_kernel_amd64::drivers::services::errno;
+use akuma_kernel_amd64::drivers::services::serial;
 
 /// The one interface name this kernel answers to.
 const IFACE: &[u8] = b"wlan0";
@@ -127,7 +127,7 @@ pub fn init(cmdline: &str) {
     };
     *BACKEND.lock() = Some(Backend::Sim(radio));
     PRESENT.store(true, Ordering::Release);
-    akuma_vfs_glue::set_wifi_present(true);
+    akuma_kernel_amd64::drivers::services::vfs::set_wifi_present(true);
 }
 
 /// The RTL8852CE station took the card (`rtw89wifi`): it is the radio behind
@@ -141,7 +141,7 @@ pub fn register_rtw89() {
     }
     *b = Some(Backend::Rtw89);
     PRESENT.store(true, Ordering::Release);
-    akuma_vfs_glue::set_wifi_present(true);
+    akuma_kernel_amd64::drivers::services::vfs::set_wifi_present(true);
 }
 
 /// Is there a `/dev/wifi0`?
@@ -190,7 +190,7 @@ pub fn read(tgid: u32, fd: u32, buf: u64, len: usize) -> u64 {
         return 0;
     }
     let n = (slot.len - slot.pos).min(len);
-    if !crate::uaccess::write_bytes(buf, &slot.buf[slot.pos..slot.pos + n]) {
+    if !akuma_kernel_amd64::drivers::services::uaccess::write_bytes(buf, &slot.buf[slot.pos..slot.pos + n]) {
         return errno::EFAULT;
     }
     slot.pos += n;
@@ -207,7 +207,7 @@ pub fn write(buf: u64, len: usize) -> u64 {
         return errno::EINVAL;
     }
     let mut text = [0u8; MAX_WRITE];
-    if !crate::uaccess::read_bytes(buf, &mut text[..len]) {
+    if !akuma_kernel_amd64::drivers::services::uaccess::read_bytes(buf, &mut text[..len]) {
         return errno::EFAULT;
     }
     let text = &text[..len];
@@ -249,3 +249,17 @@ pub fn release(tgid: u32, fd: u32) {
         *s = EMPTY_SLOT;
     }
 }
+
+/// The Wi-Fi driver, as the machine half's wireless class.
+pub static WIRELESS: akuma_kernel_amd64::drivers::Wireless = akuma_kernel_amd64::drivers::Wireless {
+    init,
+    card_init: crate::rtw89::init,
+    spawn: crate::rtw89_sta::spawn,
+    is_link: crate::rtw89_sta::is_link,
+    link: &crate::rtw89_sta::LINK,
+    shutdown_for_reset: crate::rtw89::shutdown_for_reset,
+    present,
+    dev_read: read,
+    dev_write: write,
+    release,
+};

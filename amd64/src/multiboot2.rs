@@ -342,7 +342,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // PCI scan, both done above; petting starts with the timer tick.
     crate::watchdog::init(info.cmdline());
     // `/dev/wifi0` and its backend (`wifisim` today; the radio later).
-    crate::wifi::init(info.cmdline());
+    crate::drivers::wireless_init(info.cmdline());
 
     // `root=/dev/nvme0n1pN`: the NVMe disk's GPT partition N (ryzen).
     let want_nvme_root = info
@@ -372,7 +372,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // again — wifi stage W1; `rtw89wifi` keeps it up for the station
     // (W3/W4). After the root mount: the firmware is a file.
     if have_fs {
-        crate::rtw89::init(info.cmdline());
+        crate::drivers::wireless_card_init(info.cmdline());
     }
 
     // Networking: the Realtek NIC if this box has one, loopback only otherwise.
@@ -513,7 +513,7 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
     crate::splash::spawn_daemon();
     crate::splash::phase(1);
     // The wifi station, if `rtw89wifi` kept the card: it needs the scheduler.
-    crate::rtw89_sta::spawn();
+    crate::drivers::wireless_spawn();
     if have_net {
         // The wall clock, and the order it has to happen in.
         //
@@ -535,7 +535,7 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
         // here would spend the whole budget on a link that cannot come up
         // yet. DHCP runs when the join lands, and `clock::sync_tick` (in the
         // netpoll daemon) does SNTP once the interface has an address.
-        if crate::rtw89_sta::is_link() {
+        if crate::drivers::wireless_is_link() {
             serial::puts("  net:  wifi link: DHCP and the wall clock follow the join\n");
         } else {
             crate::boot::dhcp_then_clock();

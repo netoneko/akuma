@@ -162,8 +162,9 @@ pub fn enable_full(addr: Address, bus_master: bool, mask_intx: bool) {
     write_u32(addr, 0x04, status | u32::from(cmd));
 }
 
-/// Memory decode and Bus Master Enable on every bridge between `bus` and the
-/// root, as Linux's `pci_enable_device` -> `pci_enable_bridge` does. Returns
+/// Memory decode and Bus Master Enable on every bridge between `bus` and the root.
+///
+/// As Linux's `pci_enable_device` -> `pci_enable_bridge` does. Returns
 /// the command register of the first bridge (the device's own port) as it was
 /// before, or `None` if no bridge leads to `bus`.
 ///
@@ -175,6 +176,7 @@ pub fn enable_full(addr: Address, bus_master: bool, mask_intx: bool) {
 /// (2026-10-06, `docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md` § 5.2). The
 /// NVMe worked all along because firmware booted through its port. A driver
 /// that sets [`command::BUS_MASTER`] on its device should call this too.
+#[allow(clippy::must_use_candidate, reason = "the previous command value is for a report; a caller may ignore it")]
 pub fn enable_bridges_above(mut bus: u8) -> Option<u16> {
     let mut first = None;
     // A tree deeper than this would be a loop in a misread topology.

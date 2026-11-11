@@ -115,13 +115,6 @@ mod pci;
 /// The `reboot(2)` syscall and the x86 machine reset under it.
 #[cfg(target_arch = "x86_64")]
 mod reboot;
-/// ryzen's RTL8852CE wifi card, up to running firmware (`rtw89`, wifi stage W1).
-#[cfg(target_arch = "x86_64")]
-mod rtw89;
-/// The station on that card: `/dev/wifi0`'s radio, the recorded join replayed
-/// around its own frames (`rtw89wifi`, wifi stages W3/W4).
-#[cfg(target_arch = "x86_64")]
-mod rtw89_sta;
 /// A span of RAM as a block device, so a machine with no storage driver can
 /// still mount the root filesystem its boot loader left in memory.
 mod ramdisk;
@@ -160,7 +153,6 @@ mod splash;
 #[doc(hidden)]
 pub mod testing;
 mod watchdog;
-mod wifi;
 mod xhci;
 
 #[cfg(target_arch = "x86_64")]
@@ -269,7 +261,7 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
     }
     // `/dev/wifi0` (`wifisim`): on this path too, so a VMM guest can test the
     // tool and the device without hardware.
-    wifi::init(cmdline);
+    crate::drivers::wireless_init(cmdline);
     // `/proc/power`: after `mem::init`, because mapping the EC window allocates
     // page-table frames.
     power::init(&machine, cmdline);
