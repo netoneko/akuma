@@ -14,7 +14,7 @@ use akuma_svm_amd64::pit::{self, Pit};
 use akuma_svm_amd64::{Vmcb, save};
 
 use super::MAX_VCPUS;
-use crate::kvm::linux::{
+use crate::linux::{
     APIC_BASE_ADDR, APIC_BASE_BSP, APIC_BASE_ENABLE, MSR_APIC_BASE, MSR_CSTAR, MSR_EFER, MSR_FS_BASE, MSR_GS_BASE,
     MSR_KERNEL_GS_BASE, MSR_LSTAR, MSR_PAT, MSR_SFMASK, MSR_STAR, MSR_SYSENTER_CS, MSR_SYSENTER_EIP, MSR_SYSENTER_ESP,
     MSR_TSC,

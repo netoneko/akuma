@@ -98,7 +98,7 @@ const BIOS_RSDP_GPA: u64 = 0xE_0000;
 /// routing, and each more is one more VMCB and one more share of the host core.
 const AKUMA_SMP_VCPUS: usize = 2;
 /// Most virtual processors any guest has: sizes the per-processor arrays.
-pub(super) const MAX_VCPUS: usize = 4;
+pub const MAX_VCPUS: usize = 4;
 /// How long one virtual processor runs before the host timer takes the core back for
 /// the next (µs), when more than one can run. Short enough that an AP spinning on a
 /// flag the BSP is about to set does not cost a host tick (10 ms) per round.
@@ -362,22 +362,22 @@ const QUIET_BUDGET_US: u64 = 20_000_000;
 /// stale translations.
 const ASID: u32 = 1;
 
-pub(super) const MSR_EFER: u32 = 0xC000_0080;
-pub(super) const MSR_STAR: u32 = 0xC000_0081;
-pub(super) const MSR_LSTAR: u32 = 0xC000_0082;
-pub(super) const MSR_CSTAR: u32 = 0xC000_0083;
-pub(super) const MSR_SFMASK: u32 = 0xC000_0084;
-pub(super) const MSR_FS_BASE: u32 = 0xC000_0100;
-pub(super) const MSR_GS_BASE: u32 = 0xC000_0101;
-pub(super) const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
-pub(super) const MSR_SYSENTER_CS: u32 = 0x174;
-pub(super) const MSR_SYSENTER_ESP: u32 = 0x175;
-pub(super) const MSR_SYSENTER_EIP: u32 = 0x176;
-pub(super) const MSR_PAT: u32 = 0x277;
-pub(super) const MSR_TSC: u32 = 0x10;
-pub(super) const MSR_APIC_BASE: u32 = 0x1B;
+pub const MSR_EFER: u32 = 0xC000_0080;
+pub const MSR_STAR: u32 = 0xC000_0081;
+pub const MSR_LSTAR: u32 = 0xC000_0082;
+pub const MSR_CSTAR: u32 = 0xC000_0083;
+pub const MSR_SFMASK: u32 = 0xC000_0084;
+pub const MSR_FS_BASE: u32 = 0xC000_0100;
+pub const MSR_GS_BASE: u32 = 0xC000_0101;
+pub const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+pub const MSR_SYSENTER_CS: u32 = 0x174;
+pub const MSR_SYSENTER_ESP: u32 = 0x175;
+pub const MSR_SYSENTER_EIP: u32 = 0x176;
+pub const MSR_PAT: u32 = 0x277;
+pub const MSR_TSC: u32 = 0x10;
+pub const MSR_APIC_BASE: u32 = 0x1B;
 
-pub(super) use akuma_svm_switch_amd64::GuestRegs;
+pub use akuma_svm_switch_amd64::GuestRegs;
 
 
 /// Where a guest's RAM came from, so it goes back there.
@@ -645,7 +645,7 @@ impl Disk for HostDisk {
 
 /// General register `n` in the instruction encoding's numbering (RAX, RCX, RDX,
 /// RBX, RSP, RBP, RSI, RDI, R8-R15): the VMCB holds RAX and RSP, `regs` the rest.
-pub(super) fn get_reg(v: &Vmcb<'_>, r: &GuestRegs, n: u8) -> u64 {
+pub fn get_reg(v: &Vmcb<'_>, r: &GuestRegs, n: u8) -> u64 {
     match n {
         0 => v.rax(),
         1 => r.rcx,
@@ -666,7 +666,7 @@ pub(super) fn get_reg(v: &Vmcb<'_>, r: &GuestRegs, n: u8) -> u64 {
     }
 }
 
-pub(super) fn set_reg(v: &mut Vmcb<'_>, r: &mut GuestRegs, n: u8, val: u64) {
+pub fn set_reg(v: &mut Vmcb<'_>, r: &mut GuestRegs, n: u8, val: u64) {
     match n {
         0 => v.set_rax(val),
         1 => r.rcx = val,
@@ -879,9 +879,9 @@ impl Needle {
 }
 
 /// `IA32_APIC_BASE`: bit 11 global enable, bit 8 BSP, bits 51:12 the base.
-pub(super) const APIC_BASE_ENABLE: u64 = 1 << 11;
-pub(super) const APIC_BASE_BSP: u64 = 1 << 8;
-pub(super) const APIC_BASE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
+pub const APIC_BASE_ENABLE: u64 = 1 << 11;
+pub const APIC_BASE_BSP: u64 = 1 << 8;
+pub const APIC_BASE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
 
 /// Where an interrupt offered to the guest came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1498,13 +1498,13 @@ fn vmcb_of(frames: &mut [Option<FreshFrame>; MAX_VCPUS], cpu: usize) -> Vmcb<'_>
 /// What every processor intercepts: CPUID, every port, every MSR, HLT, the host's own
 /// interrupts and NMIs (so a timer tick reaches the host), and a triple fault (so a dead
 /// guest is a report and not a reset).
-pub(super) const INTR0_BASE: u32 =
+pub const INTR0_BASE: u32 =
     intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT | intr0::SHUTDOWN;
 
 /// The controls every virtual processor shares: everything the guest can ask the
 /// hypervisor about is intercepted, nested paging is on, and the host's `IF` — not
 /// the guest's — decides whether a physical interrupt is taken while the guest runs.
-pub(super) fn init_vmcb(page: &mut [u8; 4096], guest: Guest, npt_root: u64, asid: u32) {
+pub fn init_vmcb(page: &mut [u8; 4096], guest: Guest, npt_root: u64, asid: u32) {
     let mut v = Vmcb::new(page);
     v.set_intr0(INTR0_BASE);
     v.set_intr1(intr1::VMRUN | intr1::VMMCALL | intr1::XSETBV);

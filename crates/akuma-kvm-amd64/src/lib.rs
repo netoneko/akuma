@@ -41,6 +41,19 @@
 //! The first guest that writes RCX before an intercepted instruction
 //! would otherwise corrupt the host in flight.
 
+//!
+//! A crate of its own (2026-11-11) so that `akuma-drivers-amd64` can forbid `unsafe`: entering a
+//! guest (`akuma_svm_switch_amd64::run`) is an `unsafe fn` whose contract — the guest reaches
+//! only memory it owns — no type states yet, because guest RAM is carved physical ranges rather
+//! than an owning type. Each of the seven entries carries its own `allow` and SAFETY argument;
+//! nothing else here may use `unsafe`.
+
+#![no_std]
+#![cfg(all(target_arch = "x86_64", target_os = "none"))]
+#![deny(unsafe_code)]
+
+extern crate alloc;
+
 use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
 use akuma_kernel_amd64::drivers::services::serial;
 use akuma_kernel_amd64::drivers::services::smp;
@@ -124,7 +137,9 @@ fn dec(v: u64) {
 // ---------------------------------------------------------------------------
 
 /// Probe for SVM and, with `kvmtest` on the command line, run the rehearsal
-/// guests (trivial, then long-mode). Safe to call on any x86_64 part: the
+/// guests (trivial, then long-mode).
+///
+/// Safe to call on any x86_64 part: the
 /// only MSR touched (`VM_CR`) is
 /// read strictly after CPUID advertises SVM — an rdmsr of an unimplemented
 /// MSR `#GP`s.
@@ -358,7 +373,9 @@ fn vcpus_in(text: &[u8]) -> Option<u8> {
 }
 
 /// Start the boot-flag service guest (`kvmserve`, `kvmgentoo`, or the selector file's
-/// `akuma-serve`/`akuma-gentoo`) in the VM slot, as a guest with no owner. Call it **after**
+/// `akuma-serve`/`akuma-gentoo`) in the VM slot, as a guest with no owner.
+///
+/// Call it **after**
 /// the host's network is up and its netpoll daemon is running: the guest's port forward listens
 /// on the host's stack. A guest brought up through `/dev/kvm0` needs no call here.
 pub fn spawn_service(cmdline: &str) {
@@ -716,6 +733,7 @@ fn trivial_guest(nrips: bool) {
         // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
         // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
         // succeeded on this core.
+        #[allow(unsafe_code)]
         let (rcx_out, rdx_out) = unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
@@ -984,6 +1002,7 @@ fn longmode_guest(nrips: bool) {
         // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
         // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
         // succeeded on this core.
+        #[allow(unsafe_code)]
         let (rcx_out, rdx_out) = unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
@@ -1324,6 +1343,7 @@ fn twolvl_guest(nrips: bool) {
         // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
         // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
         // succeeded on this core.
+        #[allow(unsafe_code)]
         let (rcx_out, rdx_out) = unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
@@ -1623,6 +1643,7 @@ fn pvh_guest(nrips: bool) {
         // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
         // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
         // succeeded on this core.
+        #[allow(unsafe_code)]
         let (rcx_out, rdx_out) =
             unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, l.start_gpa) };
         guest_rcx = rcx_out;
@@ -1900,6 +1921,7 @@ fn consistency_ladder() {
         // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
         // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
         // succeeded on this core.
+        #[allow(unsafe_code)]
         let _ = unsafe { switch::run(vmcb_f.pa(), 0, 0, 0) };
         let v = Vmcb::new(vmcb_f.bytes_mut());
         if ExitCode::from_u64(v.exitcode()) == ExitCode::Invalid {

@@ -18,10 +18,9 @@
 
 #![no_std]
 #![cfg(all(target_arch = "x86_64", target_os = "none"))]
-// `deny`, not `forbid`: `kvm` enters guests through `akuma_svm_switch_amd64::run`, an
-// `unsafe fn` whose contract (the guest reaches only memory it owns) no type states yet; the
-// `allow` is on that module only.
-#![deny(unsafe_code)]
+// The one driver that needs `unsafe` (the hypervisor, which enters guests) is its own crate,
+// `akuma-kvm-amd64`, behind the `kvm` feature.
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
@@ -30,9 +29,6 @@ mod fbcon;
 
 #[cfg(feature = "hda")]
 mod hda;
-#[cfg(feature = "kvm")]
-#[allow(unsafe_code)]
-mod kvm;
 #[cfg(feature = "touchpad")]
 mod i2c;
 #[cfg(feature = "touchpad")]
@@ -67,5 +63,5 @@ pub fn register() {
     #[cfg(feature = "wifi")]
     akuma_kernel_amd64::drivers::register_wireless(&wifi::WIRELESS);
     #[cfg(feature = "kvm")]
-    akuma_kernel_amd64::drivers::register_hypervisor(&kvm::HYPERVISOR);
+    akuma_kernel_amd64::drivers::register_hypervisor(&akuma_kvm_amd64::HYPERVISOR);
 }

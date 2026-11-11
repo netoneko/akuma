@@ -5,8 +5,8 @@ on the ryzen metal it runs on. It runs a real Linux guest (Firecracker CI
 `vmlinux-6.1.128`) with a console, timer interrupts and a virtio-blk ext2 root, and
 the **Akuma amd64 kernel itself** as a guest (local APIC, virtio from the command
 line, busybox init).
-Source: **`amd64/src/kvm.rs`** (phases 0-5, the consistency ladder),
-**`amd64/src/kvm/linux.rs`** (the Linux phase), and the pure models in
+Source: **`crates/akuma-kvm-amd64/src/lib.rs`** (phases 0-5, the consistency ladder),
+**`crates/akuma-kvm-amd64/src/linux.rs`** (the Linux phase), and the pure models in
 **`crates/akuma-svm-amd64`**.
 
 > **Stability: C (active risk).** Phases 0-9 have passed on the metal (2026-10-22:
@@ -23,8 +23,10 @@ from the AMD APM Vol 2/3, the virtio and ACPI specifications, Xen's public
 ## Division of labour
 
 `akuma-svm-amd64` is `#![forbid(unsafe_code)]`, `no_std`, no dependencies, and owns
-*vocabulary and decisions*. `amd64/src/kvm*.rs` owns every `unsafe` (the MSR
-writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
+*vocabulary and decisions*. `akuma-svm-switch-amd64` executes the instructions (the
+`EFER.SVME`/`VM_HSAVE_PA` writes, `VMRUN`, `VMSAVE`/`VMLOAD`) behind owned types;
+`akuma-kvm-amd64` is the wiring and every effect, and its only `unsafe` is the seven calls
+that enter a guest, whose contract (the guest reaches only memory it owns) no type states yet.
 
 | module | what it is |
 |---|---|
@@ -44,7 +46,7 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 The VM's *description* is a separate leaf crate, **`akuma-vm-spec`** (`forbid(unsafe_code)`, no
 dependencies): the `Spec` (kernel, command line, RAM, vCPUs, disk, port forwards, backend) with its
 parser, its `key=value` wire text, the first-fit extent `arena` over the reserved guest RAM, and the
-`kvmcores=` list parser. The kernel (`amd64/src/kvm/ctl.rs`) and herd both depend on it, so they cannot
+`kvmcores=` list parser. The kernel (`crates/akuma-kvm-amd64/src/ctl.rs`) and herd both depend on it, so they cannot
 disagree on a key or a limit.
 
 ## Invariants
@@ -322,7 +324,7 @@ otherwise. Verified: Alpine's `firecracker --no-api --no-seccomp --config-file v
 ([`../../runbooks/run-firecracker-on-akuma.md`](../../runbooks/run-firecracker-on-akuma.md)). How the protocol was learned and
 what is unconfirmed: [`../../archive/AKUMA_FIRECRACKER_KVM.md`](../../archive/AKUMA_FIRECRACKER_KVM.md). Code: the pure crate
 `crates/akuma-kvm-abi` (request decode, vCPU argument layouts, the memslot table, the run page; `forbid(unsafe)`),
-`amd64/src/kvm/api.rs` + `api/{vcpu,platform}.rs`, `mm::{remap_user_to_phys, mmap_frames}`.
+`crates/akuma-kvm-amd64/src/api.rs` + `api/{vcpu,platform}.rs`, `mm::{remap_user_to_phys, mmap_frames}`.
 
 - **Handles.** `FileDescriptor::DevKvm(id)`: 0 is `/dev/kvm0`, `n > 0` names a slot of the handle table (system / VM / vCPU),
   so `dup` needs no reference counts. A handle, and the VM, live until their owner process is gone (reaped by the next

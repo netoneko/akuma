@@ -299,6 +299,7 @@ fn create(text: &str, len: usize) -> u64 {
 }
 
 /// `read(fd, buf, len)` on `/dev/kvm0`: console bytes, `EAGAIN`, or 0 at the end.
+#[must_use]
 pub fn dev_read(buf: u64, len: usize) -> u64 {
     let mut tmp = [0u8; READ_CHUNK];
     let want = len.min(READ_CHUNK);

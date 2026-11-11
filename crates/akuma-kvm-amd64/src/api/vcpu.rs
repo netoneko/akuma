@@ -18,9 +18,9 @@ use spinning_top::Spinlock;
 
 use super::platform::{Offer, Platform, Source};
 use akuma_kernel_amd64::drivers::services::errno;
-use crate::kvm::linux::{Guest, GuestRegs, INTR0_BASE, get_reg, init_vmcb, set_reg};
+use crate::linux::{Guest, GuestRegs, INTR0_BASE, get_reg, init_vmcb, set_reg};
 use akuma_svm_switch_amd64::{self as switch, HostState};
-use crate::kvm::{enable_on_core, next_rip};
+use crate::{enable_on_core, next_rip};
 use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
 use akuma_kernel_amd64::drivers::services::sched::FxArea;
 
@@ -375,7 +375,7 @@ static PLACED_TRACED: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 
 fn placed_core(id: usize) -> Option<usize> {
     let wanted = akuma_kernel_amd64::drivers::services::sched::affinity_of(akuma_exec::threading::current_thread_id());
-    let kvm = crate::kvm::vm_cores();
+    let kvm = crate::vm_cores();
     if wanted == 0 && kvm == 1 {
         return None;
     }
@@ -395,7 +395,7 @@ fn run_pinned(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, n
             vc.id,
             me,
             akuma_kernel_amd64::drivers::services::sched::affinity_of(akuma_exec::threading::current_thread_id()),
-            crate::kvm::vm_cores()
+            crate::vm_cores()
         );
     }
     for _ in 0..3 {
@@ -486,6 +486,7 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
         // permission maps `init_vmcb` installs. `vc.host` was saved just above, on this core, where
         // `enable_on_core` succeeded and to which the thread is pinned.
         let unlocked = Unlocked::new();
+        #[allow(unsafe_code)]
         unsafe { switch::run_with_regs(vmcb_pa, &vc.host, &mut vc.regs) };
         drop(unlocked);
         akuma_kernel_amd64::drivers::services::sched::fpu_save_live(&mut vc.fpu[0]);

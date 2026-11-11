@@ -243,16 +243,16 @@ pub enum FileDescriptor {
     /// there is no per-descriptor cursor state to keep.
     DevPower,
     /// The hypervisor's control device (`/dev/kvm0`): a VM spec or `stop`/`status` in, the
-    /// guest's console out (`akuma-vm-spec`, `amd64/src/kvm/ctl.rs`). Only the amd64 kernel
+    /// guest's console out (`akuma-vm-spec`, `crates/akuma-kvm-amd64/src/ctl.rs`). Only the amd64 kernel
     /// opens one, and only when the hypervisor is armed (`kvmctl`); one VM at a time. The id is 0 for
-    /// `/dev/kvm0` and `n > 0` for handle `n` of the KVM-ioctl node `/dev/kvm` (`amd64/src/kvm/api.rs`).
+    /// `/dev/kvm0` and `n > 0` for handle `n` of the KVM-ioctl node `/dev/kvm` (`crates/akuma-kvm-amd64/src/api.rs`).
     DevKvm(u32),
     /// The pointer node (`/dev/input/mouse0`): 8-byte records from the
     /// laptop's touchpad (`akuma-touchpad::ptp::encode`). Only the amd64
     /// kernel opens one, and only when a touchpad came up; reads never block.
     DevMouse,
     /// The tap clone device (`/dev/net/tun`): Ethernet frames (with a virtio-net header) to and from
-    /// the hypervisor's gateway, for a userspace VMM's network device (`amd64/src/kvm/tun.rs`).
+    /// the hypervisor's gateway, for a userspace VMM's network device (`crates/akuma-kvm-amd64/src/tun.rs`).
     /// Only the amd64 kernel opens one, with the `/dev/kvm` node armed; one at a time.
     DevTun,
     /// The master side of pseudo-terminal pair `N` (`open("/dev/ptmx")`).

@@ -206,6 +206,7 @@ pub fn write_frame(b: &[u8]) -> u64 {
 }
 
 /// `read(2)`.
+#[must_use]
 pub fn read(buf: u64, len: usize) -> u64 {
     let mut b = [0u8; BUF];
     match read_frame(&mut b) {
@@ -218,6 +219,7 @@ pub fn read(buf: u64, len: usize) -> u64 {
 }
 
 /// `write(2)`.
+#[must_use]
 pub fn write(buf: u64, len: usize) -> u64 {
     let mut b = [0u8; BUF];
     if len > BUF {
@@ -230,6 +232,7 @@ pub fn write(buf: u64, len: usize) -> u64 {
 }
 
 /// `writev(2)`: the iovecs are one frame (Firecracker sends the virtio header and the frame as two).
+#[must_use]
 pub fn writev(iov: u64, cnt: usize) -> u64 {
     let mut b = [0u8; BUF];
     let mut n = 0usize;
@@ -251,6 +254,7 @@ pub fn writev(iov: u64, cnt: usize) -> u64 {
 }
 
 /// `readv(2)`: one frame scattered over the iovecs.
+#[must_use]
 pub fn readv(iov: u64, cnt: usize) -> u64 {
     let mut b = [0u8; BUF];
     let n = match read_frame(&mut b) {

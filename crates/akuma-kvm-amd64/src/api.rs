@@ -161,8 +161,9 @@ fn irq_off<T>(f: impl FnOnce() -> T) -> T {
     akuma_primitives::irq::with_irqs_disabled(f)
 }
 
-/// A process is forking: if it owns the API VM, say so on the console. The guest's RAM is the VMM's memory
-/// remapped onto the reserved slice, and a fork would CoW-share frames the guest writes through, so the
+/// A process is forking: if it owns the API VM, say so on the console.
+///
+/// The guest's RAM is the VMM's memory remapped onto the reserved slice, and a fork would CoW-share frames the guest writes through, so the
 /// child and the guest would diverge. Not prevented (the VMM does not fork after `CREATE_VM`), only visible.
 pub fn note_fork() {
     if !enabled() {
@@ -242,6 +243,7 @@ fn new_handle(kind: Kind, vcpu: u8) -> u64 {
 }
 
 /// `open("/dev/kvm")`: the system descriptor.
+#[must_use]
 pub fn open(flags: u32) -> u64 {
     reap_handles();
     let r = new_handle(Kind::System, 0);
@@ -458,6 +460,7 @@ fn run_vcpu(id: u8) -> u64 {
 }
 
 /// `mmap` of a vCPU descriptor: the run page(s) as shared memory.
+#[must_use]
 pub fn mmap_vcpu(id: u32, addr: u64, len: u64, prot: u64, flags: u64) -> u64 {
     let Some(h) = irq_off(|| HANDLES.lock().get(id as usize - 1).copied().flatten()) else { return errno::EBADF };
     if h.kind != Kind::Vcpu {

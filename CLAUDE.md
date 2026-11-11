@@ -24,6 +24,8 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   hypervisor) whose
   forwarders read "absent" when nothing registered, and reaches the kernel only through
   `drivers::services`. **Never add a driver `cfg` to the machine half**; add a class slot.
+  It is `forbid(unsafe_code)`; the hypervisor is its own crate, `akuma-kvm-amd64` (the `kvm`
+  feature pulls it in), because entering a guest is the one driver operation that needs `unsafe`.
   `akuma-fdtable` is the fd table's state machine — lowest-free allocation,
   dup/close/sweep/fork decisions, effects returned not performed, `forbid`,
   no locks; `SharedFdTable` in `akuma-exec` keeps the locks and performs the
@@ -301,14 +303,14 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   (made only by giving up a `FreshFrame`, consumed, so no page is two cores' save area) and
   checks CPUID and `VM_CR.SVMDIS` first; `HostState::save` is `VMSAVE` into an owned page. Only
   `run`/`run_with_regs` stay `unsafe fn`: the guest reaches whatever its VMCB's nested page table
-  and permission maps let it, and guest RAM is carved physical ranges, not an owning type. That
-  is the one kind of `unsafe` left in `akuma-drivers-amd64` (7 call sites, `deny` not `forbid`).
+  and permission maps let it, and guest RAM is carved physical ranges, not an owning type. Those
+  7 call sites are all the `unsafe` in `akuma-kvm-amd64` (each with its own `allow`).
   **Never open-code an SVM instruction in the wiring.**
   `akuma-vm-spec` is **what a VM is, before anything runs it** (2026-10-22; `forbid(unsafe_code)`,
   no dependencies): the `Spec` (kernel, cmdline, RAM, vCPUs, disk, forwards, backend), its parser and
   `key=value` wire text, Firecracker's field names as aliases, the first-fit `arena` over the
   `kvmmem=` reserve and the `kvmcores=` list. herd builds a spec from `vm_*` keys and the kernel
-  parses the same text off `/dev/kvm0` (`amd64/src/kvm/ctl.rs`), so the two cannot disagree.
+  parses the same text off `/dev/kvm0` (`crates/akuma-kvm-amd64/src/ctl.rs`), so the two cannot disagree.
   **Never parse a VM description anywhere else, and never put guest RAM anywhere but the reserve
   when `kvmmem=` is set — a request that does not fit is refused**
   (`docs/reference/subsystems/kvm.md` § VMs as services).

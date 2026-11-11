@@ -1,7 +1,7 @@
 //! The `/dev/kvm` ioctl protocol, as data.
 //!
 //! Everything here was read off the wire: the unmodified `firecracker` was run against a logging
-//! stub (`amd64/src/kvm/api.rs`) and each request code, argument size and argument content was
+//! stub (`crates/akuma-kvm-amd64/src/api.rs`) and each request code, argument size and argument content was
 //! recorded (`docs/archive/AKUMA_FIRECRACKER_KVM.md`, Phase 1). No Linux, KVM or Firecracker
 //! source or header was consulted. Names are inferred from direction, size, contents and position
 //! in the boot sequence.

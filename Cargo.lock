@@ -180,15 +180,10 @@ version = "0.1.0"
 name = "akuma-drivers-amd64"
 version = "0.1.0"
 dependencies = [
- "akuma-affinity",
- "akuma-bkl",
  "akuma-boot-amd64",
  "akuma-cpu",
  "akuma-dma",
- "akuma-dmesg",
  "akuma-dwi2c",
- "akuma-exec",
- "akuma-exec-core",
  "akuma-fbcon",
  "akuma-fbdev",
  "akuma-hda",
@@ -196,24 +191,16 @@ dependencies = [
  "akuma-i2c-hid",
  "akuma-ieee80211",
  "akuma-kernel-amd64",
- "akuma-kvm-abi",
- "akuma-mmu",
+ "akuma-kvm-amd64",
  "akuma-multiboot2",
  "akuma-net",
  "akuma-pagetable",
  "akuma-pci",
- "akuma-pmm",
  "akuma-primitives",
  "akuma-rtw89",
  "akuma-ryzen-amd64",
- "akuma-svm-amd64",
- "akuma-svm-switch-amd64",
- "akuma-syscalls-glue",
- "akuma-threading",
  "akuma-touchpad",
- "akuma-vfs-glue",
  "akuma-virtio",
- "akuma-vm-spec",
  "akuma-wifi",
  "akuma-wpa",
  "spinning_top",
@@ -661,6 +648,32 @@ dependencies = [
 [[package]]
 name = "akuma-kvm-abi"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-kvm-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-affinity",
+ "akuma-bkl",
+ "akuma-cpu",
+ "akuma-dmesg",
+ "akuma-exec",
+ "akuma-exec-core",
+ "akuma-kernel-amd64",
+ "akuma-kvm-abi",
+ "akuma-mmu",
+ "akuma-net",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-svm-amd64",
+ "akuma-svm-switch-amd64",
+ "akuma-syscalls-glue",
+ "akuma-threading",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "akuma-vm-spec",
+ "spinning_top",
+]
 
 [[package]]
 name = "akuma-lapic-amd64"

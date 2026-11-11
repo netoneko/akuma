@@ -625,6 +625,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
         // nested paging over `build_npt`'s table, which maps only this machine's own RAM, with the
         // I/O and MSR permission maps `init_vmcb` installs.
         // `host` was saved on this core, where `enable_on_core` succeeded.
+        #[allow(unsafe_code)]
         unsafe { switch::run_with_regs(vmcb_of_pa(&vmcbs, i), &host, &mut regs_all[i]) };
         acct.guest += akuma_cpu::tsc::rdtsc().wrapping_sub(guest_t0);
         if service {

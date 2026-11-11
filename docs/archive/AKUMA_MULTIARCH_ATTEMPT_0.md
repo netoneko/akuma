@@ -1736,3 +1736,23 @@ carry `forbid(unsafe_code)`; the answer is "not yet", and the 7 are the reason.
   compile-verified only**: TCG boots PVH with no guest, the trashcan has no SVM, and rig kernels do
   not go on the ryzen metal. The asm is byte-for-byte the old asm with the operands renamed.
 
+### `akuma-kvm-amd64`: the drivers crate forbids `unsafe` (2026-11-11)
+
+Typing guest memory is deferred (it needs the ryzen). In the meantime the hypervisor moved out of
+`akuma-drivers-amd64` into its own crate, `akuma-kvm-amd64`, with `git mv` (the module tree is
+unchanged; `crate::kvm::` became `crate::`). The drivers crate's `kvm` feature now just pulls it in,
+and `register` installs `akuma_kvm_amd64::HYPERVISOR`.
+
+- `akuma-drivers-amd64` is `#![forbid(unsafe_code)]`: 103 of 141 crates forbid.
+- `akuma-kvm-amd64` is `deny(unsafe_code)` with an `allow` on each of the seven guest-entry
+  statements, not on the crate or a module, so new `unsafe` anywhere else in it does not compile.
+- The dependencies only the hypervisor used moved with it, with the same specs and default
+  features, so feature unification turned nothing on.
+- Moving the module to a crate root surfaced pedantic lints a private module hid
+  (`redundant_pub_crate`, `must_use_candidate`, long first doc paragraphs); fixed, no behaviour change.
+- Gates: clippy clean on six feature sets (incl. `headless,kvm`); amd64 TCG default and headless SMP=1 829/0, SMP=2 839/0.
+- Budget: drivers 7 -> 0, `akuma-kvm-amd64` 0 -> 7, total unchanged at 405. The 13 untyped address
+  parameters moved with the code (`addr-params-budget.json`).
+- Stale `amd64/src/kvm/` paths in live docs and code comments (stale since `887d601f`) now point
+  at the crate.
+
