@@ -1807,6 +1807,12 @@ pub fn mark_thread_ready(idx: usize) {
     }
 }
 
+/// The exhaustion error that [`spawn_user_thread_initializing`] answers with a
+/// reclaim-and-retry pass. Every producer that wants the retry must return this
+/// constant: the retry matches on the string, so a differently spelled error
+/// silently skips it.
+const NO_FREE_USER_SLOTS: &str = "No free user thread slots";
+
 /// Spawn a user thread but keep it in INITIALIZING state
 pub fn spawn_user_thread_initializing(
     trampoline_fn: extern "C" fn() -> !,
@@ -1837,7 +1843,7 @@ pub fn spawn_user_thread_initializing(
             note_user_thread_highwater();
             Ok(slot)
         }
-        Err("No free user thread slots") => {
+        Err(NO_FREE_USER_SLOTS) => {
             // Census BEFORE the reclaim, so the log distinguishes the two very different
             // states that produce the same error: genuinely full (`live` at the ceiling)
             // versus merely uncollected (`terminated` holding the slots). Only the first
@@ -1855,7 +1861,7 @@ pub fn spawn_user_thread_initializing(
                      reclaimable (high-water {})\n",
                     live, terminated, thread_limit() - config().reserved_threads,
                     USER_THREAD_HIGHWATER.load(Ordering::Relaxed));
-                return Err("No free user thread slots");
+                return Err(NO_FREE_USER_SLOTS);
             }
             safe_print!(192,
                 "[threads] slots exhausted (live={} terminated={} ceiling={}) — reclaimed {} \
@@ -1935,19 +1941,27 @@ impl ThreadPool {
     ///   showed there.
     /// * **Stacks come from the target** ([`ArchHooks::prepare_task_slot`]),
     ///   because `amd64` owns them per slot and reuses a recycled slot's pair.
-    /// * **Exhaustion is final, and the error string says so.**
-    ///   [`spawn_user_thread_initializing`] answers `"No free user thread
-    ///   slots"` with a reclaim-and-retry pass; that pass exists to move
-    ///   cooled-down `TERMINATED` slots to `FREE`, and [`claim_slot`]
-    ///   already takes a `TERMINATED` slot no core is executing. There is
-    ///   nothing left for it to free — the stack-return half is
-    ///   `kernel_profile_extreme`, i.e. AArch64's — so a distinct string opts
-    ///   out of a retry that could only fail again.
+    /// * **Whether exhaustion is final depends on `collector-recycles`.**
+    ///   [`spawn_user_thread_initializing`] answers [`NO_FREE_USER_SLOTS`]
+    ///   with a reclaim-and-retry pass that moves cooled-down `TERMINATED`
+    ///   slots to `FREE`. Without the feature (amd64), [`claim_slot`]
+    ///   already takes a `TERMINATED` slot no core is executing, so the
+    ///   retry could only fail again, and a distinct string opts out of it.
+    ///   With it (the AArch64 kernel), [`claim_slot`] takes only `FREE`
+    ///   slots, so a pool full of `TERMINATED` slots is exactly what the
+    ///   retry exists for. This arm answered the amd64 string on both
+    ///   kernels until 2026-11-11, so every AArch64 `fork`/`vfork`/`clone`
+    ///   that met such a pool failed with `EAGAIN` instead of reclaiming
+    ///   (`docs/archive/AARCH64_SPAWN_RECLAIM_SKIPPED.md`).
     pub fn spawn_user_closure_initializing(
         trampoline_addr: u64,
         closure_ptr: *mut (),
     ) -> Result<usize, &'static str> {
-        let slot = claim_slot().ok_or("No free x86 task slots")?;
+        let slot = claim_slot().ok_or(if cfg!(feature = "collector-recycles") {
+            NO_FREE_USER_SLOTS
+        } else {
+            "No free x86 task slots"
+        })?;
 
         let Some(stack_top) = (arch().prepare_task_slot)(slot) else {
             // `TERMINATED`, not `FREE` — the slot may already own one of the

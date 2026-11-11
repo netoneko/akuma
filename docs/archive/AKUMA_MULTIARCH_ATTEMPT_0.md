@@ -1350,3 +1350,14 @@ pass. Extreme 16 MB gives `sigspin` 5/5. The boot suite at first failed `test_ep
 on battery, the unchanged M7b image failed it the same way (10.7 and 10.4 ms) where it had passed 3/3
 an hour earlier on mains. Back on AC power, this build gave 314/0 and 322/0 at SMP=1 and 2, and at SMP=4
 the known flake (8.14 ms; `main` fails it at SMP=4 too, see W3b). **Run latency-bound gates on mains power.**
+
+## AArch64 fork/clone reclaim was skipped since hooked became the only scheduler (2026-11-11)
+
+HVF at `SMP=1` exposed it in the test-move gate on both images. The shared
+`spawn_user_closure_initializing` answered exhaustion with amd64's
+`"No free x86 task slots"`, so `spawn_user_thread_initializing`'s reclaim-and-retry,
+which is keyed on `"No free user thread slots"`, never ran on AArch64. That is wrong there:
+under `collector-recycles` `claim_slot` takes only `FREE` slots. The fix returns the
+retryable constant when that feature is on, and leaves the amd64 path unchanged. Before
+the fix 4/4 runs failed, after it 4/4 passed. Record:
+[`AARCH64_SPAWN_RECLAIM_SKIPPED.md`](AARCH64_SPAWN_RECLAIM_SKIPPED.md).

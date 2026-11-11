@@ -169,10 +169,21 @@ thread-slot echo of the `register_process` rule in
 [`locking.md`](locking.md#no-bkl-process): on-demand reclaim is safe exactly
 where the caller controls its own lock context.
 
-> ⚠ **Untested by the boot suite.** `test_thread_slot_reclaim_on_spawn`
-> (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs:1273`) drives `spawn_user_thread_fn`, i.e. only the
-> `_fn_internal` row. The `_initializing` row is covered only by the userspace
-> repro (`userspace/forktest/c_stress/futextest.c` phase 2).
+**The retry is keyed on the error string `NO_FREE_USER_SLOTS`.** A producer that
+spells exhaustion any other way silently opts out of the reclaim. The closure path
+(`ThreadPool::spawn_user_closure_initializing`) returns it whenever `akuma-threading`'s
+`collector-recycles` feature is on, as it is on the AArch64 kernel. There `claim_slot`
+takes only `FREE` slots, so the retry is what recycles `TERMINATED` ones. On amd64,
+where `claim_slot` already takes cooled-down `TERMINATED` slots, it returns a
+distinct string and skips the retry
+([`../../archive/AARCH64_SPAWN_RECLAIM_SKIPPED.md`](../../archive/AARCH64_SPAWN_RECLAIM_SKIPPED.md)).
+
+Boot-suite coverage: `test_thread_slot_reclaim_on_spawn` drives the `_fn_internal`
+row and `test_thread_slot_reclaim_on_spawn_initializing` the `_initializing` row
+(both in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`). Both report
+INCONCLUSIVE rather than PASS when the idle collector frees the slots first, which
+on a fast host is the common case. QEMU HVF at `SMP=1` is the configuration that
+reliably forces the reclaim.
 
 ## 3. The `drop(Box<Process>)` lock tree (teardown leaf)
 
