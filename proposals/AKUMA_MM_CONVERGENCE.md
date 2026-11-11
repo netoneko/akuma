@@ -9,7 +9,9 @@ deferred there because it cannot be done one call at a time.*
 | step | state |
 |---|---|
 | 1. `LazyRegion` stores `Prot` | **done** — `Option<Prot>`, the `u64` only at `LazyRegionMap`'s edges (exact, host-tested); boot suites, `mem_suite` 11/11 |
-| 2–6 | open |
+| — | **`MAP_FIXED` leak fixed first** (2026-11-12): glue's `MAP_FIXED` kept every replaced eager frame until exit and left an overlapping record in the list. It now goes through `unmap_range`, `munmap`'s body. A prerequisite for step 5, since this `mem.rs` becomes amd64's mm too ([`AKUMA_MAP_FIXED_EAGER_LEAK.md`](../docs/archive/AKUMA_MAP_FIXED_EAGER_LEAK.md)) |
+| 2 | folded into step 4 (below) |
+| 3–6 | open |
 
 ## Goal
 
@@ -125,6 +127,34 @@ Each step is one commit, keeps both kernels building and passing, and changes on
    - `mremap`'s move rules.
 6. **Writable shared file pages converge** on `akuma-fpcache-rw` for both kernels, and glue's
    `SharedFileMapping` table is deleted.
+
+## Decisions after step 1
+
+Reading the code for step 2 changed four parts of the plan above.
+
+- **Step 2 folds into step 4.** `LazySource` is what the AArch64 fault path already consumes, in
+  three passes with the BKL dropped. Translating it to a `FileBacking` and back in step 2, only
+  to delete the source in step 4, is two rewrites of the 15 call sites. Instead, step 4 keeps
+  `LazySource` as the fault path's *view*, built from the one list under its lock, so the fault
+  code does not change in the step that moves the storage.
+- **Pins are refcounted per inode, released with the last region that names it.** This replaces
+  "held until the address space drops" above. It keeps AArch64's current lifetime: an unmapped
+  file stops pinning its blocks. amd64 gets that lifetime too, instead of the longer one it has
+  today. The map lives in the shared `UserAddressSpace` (step 3). `munmap`, `MAP_FIXED` and
+  `mremap` release a pin through the regions they detach.
+- **`MmapRegion` needs a `lazy` marker.** Three AArch64 readers of the eager list assume
+  every record in it is backed by present pages:
+  - `eager_region_flags_for_page_fault`;
+  - `recorded_protection`;
+  - `munmap`'s frame free.
+
+  Once lazy regions join that list, each reader must skip lazy records or treat them
+  differently, and the marker is what lets them tell.
+- **ELF segments start their file data above the region start** (`segment_va >
+  start_va`: the first page holds a partial segment). `FileBacking`'s "offset of the region
+  start" cannot express that, so step 4 extends `FileBacking` rather than dropping the field.
+  Lazy file regions with inode 0 (the `read_at(path, ..)` fallback) must be audited in the same
+  step: list every producer and confirm it always has an inode, or keep it eager.
 
 ## Gates
 
