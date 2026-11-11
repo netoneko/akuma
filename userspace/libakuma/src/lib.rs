@@ -177,7 +177,7 @@ pub mod syscall {
         pub const GETRANDOM: u64 = 278;
         pub const RESOLVE_HOST: u64 = 300;
         /// `console_notify` — put a line on the kernel console. Wired only on
-        /// the amd64 target (behind its `console-notify` feature); on AArch64
+        /// the amd64 target; on AArch64
         /// the number is reserved but the call returns `ENOSYS`.
         pub const CONSOLE_NOTIFY: u64 = 322;
         pub const SPAWN: u64 = 301;
@@ -273,8 +273,8 @@ pub mod syscall {
         pub const GETRANDOM: u64 = 318;
         pub const RESOLVE_HOST: u64 = AKUMA_PRIVATE_BASE + 300;
         /// `console_notify` — put a line straight on the framebuffer/serial
-        /// console. Wired on this target behind the kernel's `console-notify`
-        /// feature (default-on); `/bin/wall` is the front end.
+        /// console. Always wired on this target;
+        /// `/bin/wall` is the front end.
         pub const CONSOLE_NOTIFY: u64 = AKUMA_PRIVATE_BASE + 322;
         pub const SPAWN: u64 = AKUMA_PRIVATE_BASE + 301;
         /// Akuma-private `kill(pid, sig)` (Linux `kill` is not in this table).
@@ -1272,8 +1272,8 @@ pub fn resolve_host(hostname: &str) -> Result<[u8; 4], i32> {
 /// there is. The kernel frames the message and strips control bytes; at most
 /// 512 bytes are taken.
 ///
-/// Returns `Err(ENOSYS)` on a kernel built without the `console-notify` feature
-/// (every target but amd64, today).
+/// Returns `Err(ENOSYS)` on a kernel that does not serve it (every target but
+/// amd64, today).
 pub fn console_notify(msg: &str) -> Result<(), i32> {
     let ret = syscall(
         syscall::CONSOLE_NOTIFY,

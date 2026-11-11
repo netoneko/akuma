@@ -670,7 +670,6 @@ pub fn self_tests(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     usermode::winsize_to_child_test(t);
     usermode::session_terminal_is_private_test(t);
     usermode::wait4_ownership_test(t);
-    #[cfg(feature = "console-notify")]
     usermode::console_notify_test(t);
     usermode::busybox_test(t);
     usermode::execve_test(t);

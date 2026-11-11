@@ -445,8 +445,8 @@ fn akuma_private(nr: u64, a: [u64; 6]) -> u64 {
         // sshd's session-teardown SIGHUP/SIGTERM is now real too, which is
         // the Linux behaviour.
         302 => to_glue_raw(akuma_syscalls_linux::nr::AKUMA_KILL, [a1, a2, 0, 0, 0, 0]),
-        // `console_notify(ptr, len)` — Akuma-private 322, feature
-        // `console-notify` (default-on for this target). Prints a
+        // `console_notify(ptr, len)` — Akuma-private 322, served on this
+        // target only. Prints a
         // caller-supplied line straight to the framebuffer/serial console,
         // framed so it stands out in a scrolling boot log. The HP box has a
         // screen and no keyboard, so this is how a program — or a person
@@ -458,7 +458,6 @@ fn akuma_private(nr: u64, a: [u64; 6]) -> u64 {
         // bytes, and a careless or hostile caller should not be able to move
         // its cursor or scroll it from here. A trailing '\n' the caller
         // included is dropped — the framing adds its own.
-        #[cfg(feature = "console-notify")]
         322 => {
             const MAX_MSG: usize = 512;
             let n = (a2 as usize).min(MAX_MSG);

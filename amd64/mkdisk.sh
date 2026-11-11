@@ -232,8 +232,7 @@ done
 [ -n "$HGET" ] && "$DEBUGFS" -w -R "write $HGET bin/hget" "$IMG" >/dev/null 2>&1
 [ -n "$BOX" ] && "$DEBUGFS" -w -R "write $BOX bin/box" "$IMG" >/dev/null 2>&1
 # `wall`: a line straight to the framebuffer/serial console via the Akuma-private
-# `console_notify` syscall (kernel feature `console-notify`, default-on for this
-# target). The HP box has a screen and no keyboard, so this is how an ssh
+# `console_notify` syscall (served by this target's kernel only). The HP box has a screen and no keyboard, so this is how an ssh
 # session leaves a note on the display in front of it.
 [ -n "$WALL" ] && "$DEBUGFS" -w -R "write $WALL bin/wall" "$IMG" >/dev/null 2>&1
 # `wifi`: the wifi manager — /etc/wifi/<network> + the kernel's /dev/wifi0

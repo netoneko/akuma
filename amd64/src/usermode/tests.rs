@@ -748,7 +748,6 @@ pub fn session_terminal_is_private_test(t: &mut Suite) {
 /// are what pin the ABI `libakuma::console_notify` is written against: that the
 /// length is `a2`, that a zero length is `EINVAL` and a bad pointer is `EFAULT`,
 /// and that the number resolves at all rather than falling through to `ENOSYS`.
-#[cfg(feature = "console-notify")]
 pub fn console_notify_test(t: &mut Suite) {
     use crate::fd::errno;
     const NR: u64 = 0x1000 + 322;

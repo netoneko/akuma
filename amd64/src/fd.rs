@@ -1207,7 +1207,6 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     if is_dev_power(fd) {
         return crate::power::dev_read(buf, len.min(MAX_IO) as usize);
     }
-    #[cfg(feature = "linux-file-io")]
     if len > MAX_IO && is_regular_file(fd) {
         return read_file_full(len, |done, chunk| {
             akuma_syscalls_glue::fs::sys_read(fd, buf + done, chunk)
@@ -1218,13 +1217,12 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
 
 /// Linux's ceiling on one `read`/`write` (`MAX_RW_COUNT`, `INT_MAX` rounded
 /// down to a page): a larger request is served as this many bytes.
-#[cfg(feature = "linux-file-io")]
 const MAX_RW_COUNT: u64 = 0x7fff_f000;
 
 /// Serve a regular-file `read`/`pread` of `len > MAX_IO` bytes the way Linux
 /// does: **all of it**, unless the file ends or an error intervenes.
 ///
-/// # Why (feature `linux-file-io`, 2026-10-08)
+/// # Why (2026-10-08)
 ///
 /// Every file read on this target was clamped to [`MAX_IO`] (64 KiB) — here,
 /// and again inside glue's `File` arms. A short read is legal POSIX, but Linux
@@ -1248,7 +1246,6 @@ const MAX_RW_COUNT: u64 = 0x7fff_f000;
 /// `f_pos_lock` across the whole read, and this takes the cursor one chunk at a
 /// time, so two concurrent `read`s of one fd can interleave chunks. Nothing on
 /// the path that motivated this shares a description between readers.
-#[cfg(feature = "linux-file-io")]
 fn read_file_full(len: u64, mut chunk: impl FnMut(u64, usize) -> u64) -> u64 {
     let len = len.min(MAX_RW_COUNT);
     let mut done = 0u64;
@@ -1316,7 +1313,6 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
     {
         return errno::ESPIPE;
     }
-    #[cfg(feature = "linux-file-io")]
     if len > MAX_IO && is_regular_file(fd) {
         // A negative offset stays glue's `EINVAL` on the first chunk.
         return read_file_full(len, |done, chunk| {

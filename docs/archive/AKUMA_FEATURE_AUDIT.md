@@ -123,6 +123,15 @@ predicted to suit it (`REDIS_ROUND_TRIP_CEILING.md`). Removed:
 `[NICSTAT]` keeps its `orphan`/`tx_stall` columns, always 0, so parsers do not shift.
 `akuma-net-nic`'s unsafe budget went from 13 to 9. The default image's sections are unchanged.
 
+## amd64 `console-notify`, `linux-file-io`, `reboot-trace` made unconditional (2026-11-11)
+
+All three were in amd64's `default`, and no amd64 kernel can build without its defaults: the
+`smp-shared` const assert in `smp.rs` stops the build. So the opt-out each comment offered could not
+be exercised. The features are gone and their code is always compiled. The image is the
+same: the boot suite still runs the `console_notify` checks and counts 829/0 at `SMP=1` and 839/0 at
+`SMP=2`, as before. `console_notify` (322) stays amd64-only; the AArch64 kernel still answers
+`ENOSYS`.
+
 ## `net-waker-park` and `net-direct-waker` removed (2026-11-11)
 
 These were the two targeted parks for a blocking socket waiter (F3). `net-waker-park` registered on

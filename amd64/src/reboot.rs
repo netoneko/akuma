@@ -108,7 +108,7 @@ fn spin(iterations: u32) {
     }
 }
 
-/// Who asked for the reset — `reboot-trace` feature, on by default.
+/// Who asked for the reset.
 ///
 /// A reset is silent: `Ok(Some(Action::Restart))` goes straight to `0xCF9`, the
 /// in-memory `dmesg` ring dies with the machine, and the only evidence left is
@@ -119,10 +119,8 @@ fn spin(iterations: u32) {
 ///
 /// Allocation: none of its own — the line is rendered into a stack buffer and
 /// names are copied out under the `image` lock. `fs::write_file` allocates
-/// inside the VFS; that is one write on a terminal, once-per-boot path and the
-/// feature is a diagnostic build, not a default one. Best-effort: a failed
+/// inside the VFS; that is one write on a terminal, once-per-boot path. Best-effort: a failed
 /// write is reported on the console and the reset proceeds regardless.
-#[cfg(feature = "reboot-trace")]
 mod trace {
     use crate::serial;
 
@@ -240,7 +238,6 @@ pub fn sys_reboot(magic1: u64, magic2: u64, cmd: u64, _arg: u64) -> u64 {
     let decoded = decode(magic1 as u32, magic2 as u32, cmd as u32);
     // Only a request that will actually act is worth a record: a rejected or
     // no-op call neither resets nor halts.
-    #[cfg(feature = "reboot-trace")]
     if matches!(decoded, Ok(Some(Action::Restart | Action::PowerOff))) {
         trace::record(cmd);
     }

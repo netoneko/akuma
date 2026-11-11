@@ -14,7 +14,7 @@
 //!
 //! The kernel caps the message at 512 bytes and strips control characters, so
 //! this side does not need to. It fails with a message (not silently) if the
-//! kernel was built without the `console-notify` feature — `console_notify`
+//! kernel does not serve `console_notify` (the AArch64 one today), which
 //! returns `ENOSYS` there.
 
 #![no_std]

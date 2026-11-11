@@ -16,7 +16,7 @@ workspace = true
 # cfg — a build without it would run four cores with no lock at all. Enforced by
 # a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
 # rather than booting corrupt.
-default = ["console-notify", "smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd", "sc-aio", "sc-sysv-ipc", "sc-containers", "reboot-trace", "linux-file-io"]
+default = ["smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd", "sc-aio", "sc-sysv-ipc", "sc-containers"]
 # Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
 # to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
 # `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.
@@ -48,15 +48,6 @@ fs-cache = ["akuma-ext2/fs-cache"]
 # OFF by default until its gates pass; `docs/archive/AMD64_RING0_PREEMPTION.md`.
 ring0-preempt = []
 
-# Linux's regular-file read contract: a `read`/`pread` of a regular file
-# returns every byte asked for unless the file ends first (up to Linux's own
-# `MAX_RW_COUNT`), instead of stopping at this target's 64 KiB `MAX_IO`. Served
-# as a loop of 64 KiB glue reads, so the kernel's buffer per call is unchanged.
-# Chromium's V8 snapshot read is what found it (`snapprobe`); see
-# `fd.rs`'s `read_file_full`. Remove it from `default` to get the old clamp
-# back for an A/B.
-linux-file-io = []
-
 # The compile-time syscall debug mode the AArch64 kernel has (root
 # `Cargo.toml`'s `syscall-debug-info`): glue's per-arm `[syscall]` lines and the
 # `[FORK-DBG]`/`[TRAMP]` fork/exec/thread-spawn lifecycle traces
@@ -70,14 +61,6 @@ syscall-debug-info = [
     "dep:akuma-syscalls-time", "akuma-syscalls-time/debug-info",
     "akuma-exec/debug-info", "akuma-config/syscall-debug-info",
 ]
-
-# Record who called `reboot(2)` — pid/tgid/name/argv and the ancestor chain — to
-# the console and `/var/log/reboot-trace.log`, before the reset. ON by default
-# (one stack buffer and one file append on a path that is about to reset the
-# machine); remove it from `default` to drop it. A diagnostic for "the box reset
-# and nobody knows why" (the next kernel only sees "software wrote 0xE to
-# 0xCF9"). See `amd64/src/reboot.rs`.
-reboot-trace = []
 
 # PMM forensics for the SMP corruption hunt. OFF by default and meant to be
 # turned on for a hunt build, the way `akuma-pmm`'s own `pmm-instr` is.
@@ -207,15 +190,6 @@ sc-sysv-ipc = ["akuma-syscalls-glue/sc-sysv-ipc"]
 # the single-box world this target already is.
 # `docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`.
 sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-containers", "akuma-isolation/containers"]
-# `console_notify` — the Akuma-private syscall (322) a userspace program calls
-# to put a framed line straight on the framebuffer/serial console (`/bin/wall`).
-# On by default *for this target only*: the HP bare-metal reference box has a
-# display but no working keyboard, so a line on its screen is the one channel to
-# a person in front of it that is not the network. It is a write-to-console
-# primitive any userspace binary can reach, so it is a feature rather than
-# unconditional — a deployment that does not want userspace touching the console
-# builds `--no-default-features`.
-console-notify = []
 # Compile the boot self-test suite **out**.
 #
 # The same opt-in the AArch64 kernel has (root `Cargo.toml`), and it means the
