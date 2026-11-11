@@ -22,6 +22,10 @@
 
 #[cfg(feature = "hda")]
 mod hda;
+#[cfg(feature = "touchpad")]
+mod i2c;
+#[cfg(feature = "touchpad")]
+mod touchpad;
 
 /// Install every driver this build compiled in. The bin's `before_main`, before either entry
 /// point probes anything.
@@ -29,5 +33,16 @@ pub fn register() {
     #[cfg(feature = "hda")]
     akuma_kernel_amd64::drivers::register_sound(akuma_kernel_amd64::drivers::Sound {
         init: hda::init,
+    });
+    #[cfg(feature = "touchpad")]
+    akuma_kernel_amd64::drivers::register_pointer(akuma_kernel_amd64::drivers::Pointer {
+        discover: touchpad::discover,
+        init: touchpad::init,
+        poll: touchpad::poll,
+        present: touchpad::present,
+        has_events: touchpad::has_events,
+        dev_read: touchpad::dev_read,
+        dev_write: touchpad::dev_write,
+        console_bridge: touchpad::console_bridge,
     });
 }

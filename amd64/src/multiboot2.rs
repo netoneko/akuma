@@ -740,8 +740,9 @@ pub fn fb_take_reply(out: &mut [u8]) -> usize {
 }
 
 /// What the program on the console asked of the pointer, and the grid to place
-/// it on: `(tracking, sgr, [origin_x, origin_y, cell_w, cell_h, cols, rows])`.
-/// `None` with no framebuffer console or when the console is busy this lap
+/// it on.
+///
+/// `(tracking, sgr, [origin_x, origin_y, cell_w, cell_h, cols, rows])`; `None` with no framebuffer console or when the console is busy this lap
 /// (`try_lock`, like [`fb_take_reply`]).
 pub fn fb_mouse() -> Option<(u16, bool, [u32; 6])> {
     let g = CONSOLE.try_lock()?;
@@ -1147,7 +1148,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // mapping the EC window allocates page-table frames.
     crate::power::init(&machine, info.cmdline());
     // The touchpad: only decide here (a table scan); bring-up waits for `boot_to_init`.
-    crate::touchpad::discover(&machine, info.cmdline());
+    crate::drivers::pointer_discover(&machine, info.cmdline());
 
     // The root filesystem. With `root=/dev/sda1` on the command line, bring up
     // the xHCI + USB mass-storage stack and mount the persistent partition; on
@@ -1390,7 +1391,7 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
     // The laptop's I2C-HID touchpad (`touchpad`): found by its DSDT name or
     // `touchpad=`, a no-op elsewhere. After the LAPIC is calibrated because its
     // bring-up delays (60 ms power-on, 100 ms reset) spin on the TSC.
-    crate::touchpad::init();
+    crate::drivers::pointer_init();
 
     if run_shell {
         crate::splash::phase(2);

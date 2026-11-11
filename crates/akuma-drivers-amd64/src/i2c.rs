@@ -23,8 +23,8 @@
 use akuma_dwi2c::{BusSpeed, XferError, aoac, data_cmd, ic, intr, status};
 use akuma_primitives::mmio::MmioWindow;
 
-use crate::paging;
-use crate::polltime::{spin_us, tsc, ticks_ms};
+use akuma_kernel_amd64::drivers::services::paging;
+use akuma_kernel_amd64::drivers::services::polltime::{spin_us, tsc, ticks_ms};
 
 
 /// Map `[pa, pa + len)` as device memory and return the `len` bytes at `pa` as a

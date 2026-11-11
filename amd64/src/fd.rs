@@ -648,7 +648,7 @@ pub fn is_dev_wifi(fd: u64) -> bool {
 /// `open("/dev/input/mouse0")`: a `DevMouse` descriptor, only when the
 /// touchpad came up — a machine without one has no node (`ENOENT`).
 fn open_mouse(flags: u32) -> u64 {
-    if !crate::touchpad::present() {
+    if !crate::drivers::pointer_present() {
         return errno::ENOENT;
     }
     let Some(proc) = akuma_exec::process::current_process_shared() else {
@@ -1204,7 +1204,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     }
     // `/dev/input/mouse0`: whole 8-byte pointer records, or `EAGAIN`.
     if is_dev_mouse(fd) {
-        return crate::touchpad::dev_read(buf, len.min(MAX_IO) as usize);
+        return crate::drivers::pointer_dev_read(buf, len.min(MAX_IO) as usize);
     }
     // `/dev/kvm0`: the guest's console stream, `EAGAIN` while it is quiet, 0 once it ended.
     if is_dev_kvm(fd) {

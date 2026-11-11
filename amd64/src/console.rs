@@ -234,7 +234,7 @@ const PUMP_OUT: usize = 256;
 pub fn pump_once() -> bool {
     // The touchpad is polled whether or not a console process is attached: its
     // consumer is `/dev/input/mouse0`, not the tty.
-    crate::touchpad::poll();
+    crate::drivers::pointer_poll();
     let Some(ch) = channel() else {
         return false;
     };
@@ -263,7 +263,7 @@ pub fn pump_once() -> bool {
     // typed in like keys (`CSI < b ; col ; row M`). Costs one console
     // `try_lock` and nothing else while no program has asked.
     if n < inbuf.len() {
-        n += crate::touchpad::console_bridge(&mut inbuf[n..]);
+        n += crate::drivers::pointer_console_bridge(&mut inbuf[n..]);
     }
     if n > 0 {
         // **Through the shared line discipline, not into the FIFO.**

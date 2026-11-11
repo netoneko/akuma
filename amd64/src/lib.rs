@@ -80,8 +80,6 @@ mod gdt;
 pub mod drivers;
 #[cfg(target_arch = "x86_64")]
 mod usermode;
-#[cfg(target_arch = "x86_64")]
-mod i2c;
 mod idt;
 #[cfg(target_arch = "x86_64")]
 mod input;
@@ -153,7 +151,6 @@ mod shmpages;
 mod sock;
 /// `clone(CLONE_VM|CLONE_THREAD)`: threads sharing one address space.
 mod thread;
-mod touchpad;
 mod uaccess;
 #[cfg(target_arch = "x86_64")]
 mod splash;

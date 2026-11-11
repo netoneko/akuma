@@ -1599,7 +1599,7 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     // `/dev/input/mouse0`: control lines (`natural`, `natural=0|1`) — the
     // scroll-direction toggle (`crate::touchpad::dev_write`).
     if crate::fd::is_dev_mouse(fd) {
-        return crate::touchpad::dev_write(buf, len as usize);
+        return crate::drivers::pointer_dev_write(buf, len as usize);
     }
 
     // `/dev/power`: `dim=<percent>` lines for the power daemon's lever
