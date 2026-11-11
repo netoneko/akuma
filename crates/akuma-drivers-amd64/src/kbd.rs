@@ -44,6 +44,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use akuma_port::I8042;
+use spinning_top::Spinlock;
 
 /// Status bit 0: a byte is waiting in the output buffer.
 const STS_OUTPUT_FULL: u8 = 1 << 0;
@@ -127,39 +128,27 @@ impl Kbd {
     }
 }
 
-static KBD: BoundedLock = BoundedLock {
-    lock: AtomicBool::new(false),
-    state: core::cell::UnsafeCell::new(Kbd::new()),
-};
+static KBD: BoundedLock = BoundedLock { state: Spinlock::new(Kbd::new()) };
 
 /// The keyboard lock, in the shape `serial.rs` uses for the UART: a bounded
-/// CAS spin that **gives up** after [`LOCK_BUDGET`] spins instead of hanging.
-/// A caller that cannot take it simply reports "no key" — the scancode stays
-/// in the controller and the next poll tries again. The unbounded
-/// alternative (a plain spinlock) hangs the machine: this kernel preempts
+/// try-lock spin that **gives up** after [`LOCK_BUDGET`] attempts instead of
+/// hanging. A caller that cannot take it simply reports "no key" — the scancode
+/// stays in the controller and the next poll tries again. The unbounded
+/// alternative (a plain `lock()`) hangs the machine: this kernel preempts
 /// threads that hold spinlocks, so the holder can be descheduled while a
 /// poller spins forever behind it — which is what froze the SMP boot of
-/// 2026-10-07 before klog's first flush. Exclusive access is by the lock
-/// bit; the `UnsafeCell` is sound because every `&mut Kbd` is handed out
-/// only while the bit is held.
+/// 2026-10-07 before klog's first flush.
 struct BoundedLock {
-    lock: AtomicBool,
-    state: core::cell::UnsafeCell<Kbd>,
+    state: Spinlock<Kbd>,
 }
-
-unsafe impl Sync for BoundedLock {}
 
 const LOCK_BUDGET: u32 = 1 << 22;
 
 impl BoundedLock {
     fn lock(&self) -> Option<KbdGuard<'_>> {
         for spins in 0..LOCK_BUDGET {
-            if self
-                .lock
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Some(KbdGuard { lock: self });
+            if let Some(g) = self.state.try_lock() {
+                return Some(KbdGuard(g));
             }
             if spins % 64 == 63 {
                 core::hint::spin_loop();
@@ -169,20 +158,11 @@ impl BoundedLock {
     }
 }
 
-struct KbdGuard<'a> {
-    lock: &'a BoundedLock,
-}
+struct KbdGuard<'a>(spinning_top::guard::SpinlockGuard<'a, Kbd>);
 
 impl KbdGuard<'_> {
     fn kbd(&mut self) -> &mut Kbd {
-        // SAFETY: the lock bit is held; no other core or thread can be here.
-        unsafe { &mut *self.lock.state.get() }
-    }
-}
-
-impl Drop for KbdGuard<'_> {
-    fn drop(&mut self) {
-        self.lock.lock.store(false, Ordering::Release);
+        &mut self.0
     }
 }
 
@@ -436,9 +416,9 @@ static SCANCODES_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomi
 /// `set_fb_quiet` keeps diagnostics off the TV while the shell is up.
 fn log_scancode(sc: u8) {
     if SCANCODES_SEEN.fetch_add(1, Ordering::Relaxed) < SCANCODE_LOG_CAP {
-        crate::serial::puts("[kbd] sc=0x");
-        crate::serial::put_hexn(u64::from(sc), 2);
-        crate::serial::puts("\n");
+        akuma_kernel_amd64::drivers::services::serial::puts("[kbd] sc=0x");
+        akuma_kernel_amd64::drivers::services::serial::put_hexn(u64::from(sc), 2);
+        akuma_kernel_amd64::drivers::services::serial::puts("\n");
     }
 }
 
@@ -464,15 +444,15 @@ fn heartbeat() {
     STATUS_OR.fetch_or(st, Ordering::Relaxed);
     let n = POLLS.fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_multiple_of(HEARTBEAT_EVERY) && n / HEARTBEAT_EVERY <= HEARTBEAT_LINES {
-        crate::serial::puts("[kbd] polls=");
-        crate::serial::put_dec(u64::from(n));
-        crate::serial::puts(" st=0x");
-        crate::serial::put_hexn(u64::from(st), 2);
-        crate::serial::puts(" or=0x");
-        crate::serial::put_hexn(u64::from(STATUS_OR.load(Ordering::Relaxed)), 2);
-        crate::serial::puts(" scancodes=");
-        crate::serial::put_dec(u64::from(SCANCODES_SEEN.load(Ordering::Relaxed)));
-        crate::serial::puts("\n");
+        akuma_kernel_amd64::drivers::services::serial::puts("[kbd] polls=");
+        akuma_kernel_amd64::drivers::services::serial::put_dec(u64::from(n));
+        akuma_kernel_amd64::drivers::services::serial::puts(" st=0x");
+        akuma_kernel_amd64::drivers::services::serial::put_hexn(u64::from(st), 2);
+        akuma_kernel_amd64::drivers::services::serial::puts(" or=0x");
+        akuma_kernel_amd64::drivers::services::serial::put_hexn(u64::from(STATUS_OR.load(Ordering::Relaxed)), 2);
+        akuma_kernel_amd64::drivers::services::serial::puts(" scancodes=");
+        akuma_kernel_amd64::drivers::services::serial::put_dec(u64::from(SCANCODES_SEEN.load(Ordering::Relaxed)));
+        akuma_kernel_amd64::drivers::services::serial::puts("\n");
     }
 }
 

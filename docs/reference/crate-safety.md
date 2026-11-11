@@ -137,7 +137,7 @@ against Linux's register trace of the same card. Its MMIO/DMA half is
 [`subsystems/wifi.md`](subsystems/wifi.md)). Earlier the same day, also carrying the ban
 from its first commit: **`akuma-nvme`** (582 production lines, 0 sites). That is
 the NVMe register/queue/Identify/PRP/GPT logic, with a partition window every
-access is checked against. Its MMIO/DMA half is `amd64/src/nvme.rs`, which
+access is checked against. Its MMIO/DMA half is `crates/akuma-drivers-amd64/src/nvme.rs`, which
 lives in `amd64/` and is not counted here (`overlays/ryzen/`,
 [`AKUMA_AMD64_ON_RYZEN_LAPTOP.md`](../archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md)
 § 9). Most of the other six new forbidding crates since 2026-09-06

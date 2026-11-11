@@ -73,9 +73,9 @@ use akuma_primitives::addr::virt_to_phys;
 use akuma_primitives::mmio::MmioWindow;
 use spinning_top::Spinlock;
 
-use crate::pci;
-use crate::polltime::{spin_us, ticks_ms, tsc};
-use crate::serial;
+use akuma_kernel_amd64::drivers::services::pci;
+use akuma_kernel_amd64::drivers::services::polltime::{spin_us, ticks_ms, tsc};
+use akuma_kernel_amd64::drivers::services::serial;
 
 /// Entries per queue. One command is ever in flight; 16 is the spec's
 /// comfortable minimum and every controller supports it.

@@ -54,9 +54,9 @@ pub fn perform_reset() -> ! {
     if akuma_vfs_glue::sync_all_filesystems().is_err() {
         serial::puts("[reboot] fs sync failed; disk may need e2fsck\n");
     }
-    let _ = crate::xhci::flush();
-    // NVMe: flush, normal shutdown, bus mastering off — see `nvme::shutdown`.
-    crate::nvme::shutdown();
+    let _ = crate::drivers::usb_flush();
+    // NVMe: flush, normal shutdown, bus mastering off (the driver's `shutdown`).
+    crate::drivers::nvme_shutdown();
 
     // Before the reset, not after: a reset does not stop a bus-master device.
     // An xHCI controller still running here keeps writing its rings into this
@@ -64,7 +64,7 @@ pub fn perform_reset() -> ! {
     // kernel into the very same memory — which is how a box ends up
     // crash-looping on a kernel that is itself fine. UEFI does not re-initialise
     // a controller the OS claimed, so nothing downstream undoes this for us.
-    crate::xhci::shutdown();
+    crate::drivers::usb_shutdown();
     // The wifi card, if `rtw89wifi` kept it up: the same bus-master hazard.
     crate::drivers::wireless_shutdown_for_reset();
 

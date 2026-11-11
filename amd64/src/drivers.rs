@@ -540,6 +540,212 @@ hypervisor_forward! {
     fn hypervisor_tun_ioctl => tun_ioctl(req: u32, arg: u64) -> u64 or ENODEV;
 }
 
+/// What a storage forwarder answers when no driver is compiled in.
+const NO_DRIVER: &str = "no driver for this device in this build";
+
+/// USB: the xHCI host controller, its mass-storage disk (`/dev/sda`) and its boot keyboard.
+///
+/// Brought up by the multiboot2 root search (`root=/dev/sda1` or `usb`).
+/// Stopping a controller the *firmware* left running is not here: the machine half does that on
+/// every boot (`pci::quiesce_xhci_controllers`), with or without this driver.
+#[derive(Clone, Copy)]
+pub struct Usb {
+    pub init: fn() -> Result<(), &'static str>,
+    pub is_initialized: fn() -> bool,
+    /// Halt the controller this kernel brought up (reboot, before the reset).
+    pub shutdown: fn(),
+    pub read_bytes: fn(offset: u64, buf: &mut [u8]) -> Result<(), &'static str>,
+    pub write_bytes: fn(offset: u64, data: &[u8]) -> Result<(), &'static str>,
+    pub flush: fn() -> Result<(), &'static str>,
+    pub init_keyboard: fn() -> Result<(), &'static str>,
+    pub keyboard_getb: fn() -> Option<u8>,
+    pub keyboard_has_byte: fn() -> bool,
+    /// The boot suite's USB checks; `None` in a `no-tests` build.
+    pub smoke_test: Option<fn(&mut akuma_selftest::Suite, bool)>,
+}
+
+static USB: Registered<Usb> = Registered::new("no USB driver registered");
+
+/// Install the USB driver. Idempotent by `Registered`'s contract.
+pub fn register_usb(driver: Usb) {
+    USB.register(driver);
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn usb_init() -> Result<(), &'static str> {
+    USB.get().map_or(Err(NO_DRIVER), |d| (d.init)())
+}
+
+#[must_use]
+pub fn usb_is_initialized() -> bool {
+    USB.get().is_some_and(|d| (d.is_initialized)())
+}
+
+pub fn usb_shutdown() {
+    if let Some(d) = USB.get() {
+        (d.shutdown)();
+    }
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn usb_read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
+    USB.get().map_or(Err(NO_DRIVER), |d| (d.read_bytes)(offset, buf))
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn usb_write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
+    USB.get().map_or(Err(NO_DRIVER), |d| (d.write_bytes)(offset, data))
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn usb_flush() -> Result<(), &'static str> {
+    USB.get().map_or(Err(NO_DRIVER), |d| (d.flush)())
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn usb_init_keyboard() -> Result<(), &'static str> {
+    USB.get().map_or(Err(NO_DRIVER), |d| (d.init_keyboard)())
+}
+
+#[must_use]
+pub fn usb_keyboard_getb() -> Option<u8> {
+    USB.get().and_then(|d| (d.keyboard_getb)())
+}
+
+#[must_use]
+pub fn usb_keyboard_has_byte() -> bool {
+    USB.get().is_some_and(|d| (d.keyboard_has_byte)())
+}
+
+/// The boot suite's USB checks, or a note that this build has no USB driver.
+pub fn usb_smoke_test(t: &mut akuma_selftest::Suite, present: bool) {
+    match USB.get().and_then(|d| d.smoke_test) {
+        Some(f) => f(t, present),
+        None => t.note("xhci: no USB driver in this build", 0),
+    }
+}
+
+/// NVMe: the bare-metal root disk (`root=/dev/nvme0n1pN`) and, through the hypervisor, a guest
+/// disk on a second partition. Every access is confined to the partition opened for it.
+#[derive(Clone, Copy)]
+pub struct Nvme {
+    pub init: fn() -> Result<(), &'static str>,
+    pub open_partition: fn(number: u32) -> Result<(), &'static str>,
+    pub read_bytes: fn(offset: u64, buf: &mut [u8]) -> Result<(), &'static str>,
+    pub write_bytes: fn(offset: u64, data: &[u8]) -> Result<(), &'static str>,
+    pub flush: fn() -> Result<(), &'static str>,
+    /// Flush, normal shutdown, bus mastering off (reboot).
+    pub shutdown: fn(),
+    pub open_guest_partition: fn(number: u32) -> Result<u64, &'static str>,
+    pub close_guest_partition: fn(),
+    pub guest_read: fn(offset: u64, buf: &mut [u8]) -> Result<(), &'static str>,
+    pub guest_write: fn(offset: u64, data: &[u8]) -> Result<(), &'static str>,
+}
+
+static NVME: Registered<Nvme> = Registered::new("no NVMe driver registered");
+
+/// Install the NVMe driver. Idempotent by `Registered`'s contract.
+pub fn register_nvme(driver: Nvme) {
+    NVME.register(driver);
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn nvme_init() -> Result<(), &'static str> {
+    NVME.get().map_or(Err(NO_DRIVER), |d| (d.init)())
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn nvme_open_partition(number: u32) -> Result<(), &'static str> {
+    NVME.get().map_or(Err(NO_DRIVER), |d| (d.open_partition)(number))
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn nvme_read_bytes(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
+    NVME.get().map_or(Err(NO_DRIVER), |d| (d.read_bytes)(offset, buf))
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn nvme_write_bytes(offset: u64, data: &[u8]) -> Result<(), &'static str> {
+    NVME.get().map_or(Err(NO_DRIVER), |d| (d.write_bytes)(offset, data))
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn nvme_flush() -> Result<(), &'static str> {
+    NVME.get().map_or(Err(NO_DRIVER), |d| (d.flush)())
+}
+
+pub fn nvme_shutdown() {
+    if let Some(d) = NVME.get() {
+        (d.shutdown)();
+    }
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn nvme_open_guest_partition(number: u32) -> Result<u64, &'static str> {
+    NVME.get().map_or(Err(NO_DRIVER), |d| (d.open_guest_partition)(number))
+}
+
+pub fn nvme_close_guest_partition() {
+    if let Some(d) = NVME.get() {
+        (d.close_guest_partition)();
+    }
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn nvme_guest_read(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
+    NVME.get().map_or(Err(NO_DRIVER), |d| (d.guest_read)(offset, buf))
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn nvme_guest_write(offset: u64, data: &[u8]) -> Result<(), &'static str> {
+    NVME.get().map_or(Err(NO_DRIVER), |d| (d.guest_write)(offset, data))
+}
+
+/// Keyboard: the i8042 (PS/2, or the firmware's USB legacy emulation of one), one of the
+/// console's three input sources (`input`).
+#[derive(Clone, Copy)]
+pub struct Keyboard {
+    /// Probe and enable the controller; `false` when there is none.
+    pub init: fn() -> bool,
+    pub getb: fn() -> Option<u8>,
+    pub has_byte: fn() -> bool,
+}
+
+static KEYBOARD: Registered<Keyboard> = Registered::new("no keyboard driver registered");
+
+/// Install the keyboard driver. Idempotent by `Registered`'s contract.
+pub fn register_keyboard(driver: Keyboard) {
+    KEYBOARD.register(driver);
+}
+
+#[must_use]
+pub fn keyboard_init() -> bool {
+    KEYBOARD.get().is_some_and(|d| (d.init)())
+}
+
+#[must_use]
+pub fn keyboard_getb() -> Option<u8> {
+    KEYBOARD.get().and_then(|d| (d.getb)())
+}
+
+#[must_use]
+pub fn keyboard_has_byte() -> bool {
+    KEYBOARD.get().is_some_and(|d| (d.has_byte)())
+}
+
 /// What a driver may use of the machine half.
 pub mod services {
     /// The VFS's view of driver-owned device nodes.
@@ -562,7 +768,7 @@ pub mod services {
     }
     /// Reading a firmware file off the root filesystem.
     pub mod fs {
-        pub use crate::fs::{metadata, read_at, resolve_symlinks};
+        pub use crate::fs::{SDA1_OFFSET, mbr_looks_right, metadata, read_at, resolve_symlinks};
     }
     pub mod errno {
         pub use crate::fd::errno::{
@@ -581,10 +787,12 @@ pub mod services {
     pub mod mm {
         pub use crate::mm::{mmap_frames, remap_user_to_phys};
     }
-    /// A guest disk on an NVMe partition.
+    /// A guest disk on an NVMe partition (through the NVMe class: absent without its driver).
     pub mod nvme {
-        pub use crate::nvme::{
-            close_guest_partition, flush, guest_read, guest_write, open_guest_partition,
+        pub use crate::drivers::{
+            nvme_close_guest_partition as close_guest_partition, nvme_flush as flush,
+            nvme_guest_read as guest_read, nvme_guest_write as guest_write,
+            nvme_open_guest_partition as open_guest_partition,
         };
     }
     pub mod phys {
@@ -596,6 +804,7 @@ pub mod services {
             bkl_drop_window, cpu_index, ensure_started, is_deferred, kick_core, online_cpus,
             MAX_CPUS,
         };
+        pub use crate::shootdown::masked_wait_assist;
     }
     pub mod input {
         pub use crate::input::note_input;
@@ -621,7 +830,7 @@ pub mod services {
     pub mod pci {
         pub use crate::pci::{
             config_space, enable, enable_bridges_above, enable_full, find_class, for_each,
-            map_bar_window, probe_bar_size, quiesce,
+            map_bar_window, probe_bar_size, quiesce, quiesce_xhci_controllers,
             read_u16_config, write_u16_config,
         };
     }

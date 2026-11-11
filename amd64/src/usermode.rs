@@ -4857,8 +4857,8 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // `usb` flag): enumerate it before the pump starts reading input, so the
     // first lap already has a keyboard. A failure costs the keyboard only — the
     // log says which step, and the serial console still works.
-    if crate::xhci::is_initialized()
-        && let Err(e) = crate::xhci::init_keyboard()
+    if crate::drivers::usb_is_initialized()
+        && let Err(e) = crate::drivers::usb_init_keyboard()
     {
         serial::puts("  [init] no USB keyboard: ");
         serial::puts(e);

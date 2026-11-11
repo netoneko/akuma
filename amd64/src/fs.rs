@@ -187,6 +187,19 @@ impl BlockDevice for VirtioBlk {
 /// The block device is the whole disk (`akuma_xhci` addresses it by absolute
 /// LBA); this adds the partition's byte offset so `read_bytes(0)` lands at the
 /// filesystem's start. On the reference box that is `sda1` at LBA 2048.
+/// `sda1` starts at LBA 2048 (the `fdisk` / `mke2fs` default) — 1 MiB.
+pub const SDA1_OFFSET: u64 = 2048 * 512;
+
+/// `true` if a 512-byte MBR sector has the boot signature and partition 1 starts
+/// at LBA 2048 — the sanity check before trusting [`SDA1_OFFSET`].
+#[must_use]
+pub fn mbr_looks_right(sector: &[u8]) -> bool {
+    sector.len() >= 512
+        && sector[510] == 0x55
+        && sector[511] == 0xAA
+        && u32::from_le_bytes([sector[454], sector[455], sector[456], sector[457]]) == 2048
+}
+
 pub struct UsbDisk {
     partition_offset: u64,
 }
@@ -200,18 +213,18 @@ impl UsbDisk {
 
 impl BlockDevice for UsbDisk {
     fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
-        crate::xhci::read_bytes(self.partition_offset + offset, buf).map_err(|_| ())
+        crate::drivers::usb_read_bytes(self.partition_offset + offset, buf).map_err(|_| ())
     }
 
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
-        crate::xhci::write_bytes(self.partition_offset + offset, data).map_err(|_| ())
+        crate::drivers::usb_write_bytes(self.partition_offset + offset, data).map_err(|_| ())
     }
 
     /// SCSI `SYNCHRONIZE CACHE (10)`, whole medium. The partition offset is
     /// irrelevant: the barrier is drive-wide, and `lba 0, blocks 0` asks for
     /// exactly that.
     fn flush(&self) -> Result<(), ()> {
-        crate::xhci::flush().map_err(|_| ())
+        crate::drivers::usb_flush().map_err(|_| ())
     }
 }
 
@@ -221,16 +234,16 @@ pub struct NvmeDisk;
 
 impl BlockDevice for NvmeDisk {
     fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
-        crate::nvme::read_bytes(offset, buf).map_err(|_| ())
+        crate::drivers::nvme_read_bytes(offset, buf).map_err(|_| ())
     }
 
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
-        crate::nvme::write_bytes(offset, data).map_err(|_| ())
+        crate::drivers::nvme_write_bytes(offset, data).map_err(|_| ())
     }
 
     /// NVMe `Flush`: the namespace's volatile write cache, all of it.
     fn flush(&self) -> Result<(), ()> {
-        crate::nvme::flush().map_err(|_| ())
+        crate::drivers::nvme_flush().map_err(|_| ())
     }
 }
 

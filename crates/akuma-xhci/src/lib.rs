@@ -28,7 +28,7 @@
 //!
 //! Not here: the MMIO on the mapped BAR, the `.bss` DMA rings/contexts/scratchpad
 //! with known physical addresses, the reset sequencing and the event-ring drain
-//! loop. That is `amd64/src/xhci.rs`, behind one stated DMA contract, the way
+//! loop. That is `crates/akuma-drivers-amd64/src/xhci.rs`, behind one stated DMA contract, the way
 //! `akuma-net-nic`'s `rtl8169.rs` is the glue over `akuma-net-rtl8169`.
 //!
 //! Descriptor parsing (device/config/interface/endpoint) is **not duplicated** —

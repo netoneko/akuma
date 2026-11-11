@@ -29,6 +29,12 @@ mod fbcon;
 
 #[cfg(feature = "hda")]
 mod hda;
+#[cfg(feature = "i8042")]
+mod kbd;
+#[cfg(feature = "nvme")]
+mod nvme;
+#[cfg(feature = "xhci")]
+mod xhci;
 #[cfg(feature = "touchpad")]
 mod i2c;
 #[cfg(feature = "touchpad")]
@@ -62,6 +68,41 @@ pub fn register() {
     });
     #[cfg(feature = "wifi")]
     akuma_kernel_amd64::drivers::register_wireless(&wifi::WIRELESS);
+    #[cfg(feature = "xhci")]
+    akuma_kernel_amd64::drivers::register_usb(akuma_kernel_amd64::drivers::Usb {
+        init: xhci::init,
+        is_initialized: xhci::is_initialized,
+        shutdown: xhci::shutdown,
+        read_bytes: xhci::read_bytes,
+        write_bytes: xhci::write_bytes,
+        flush: xhci::flush,
+        init_keyboard: xhci::init_keyboard,
+        keyboard_getb: xhci::keyboard_getb,
+        keyboard_has_byte: xhci::keyboard_has_byte,
+        #[cfg(not(feature = "no-tests"))]
+        smoke_test: Some(xhci::smoke_test),
+        #[cfg(feature = "no-tests")]
+        smoke_test: None,
+    });
+    #[cfg(feature = "nvme")]
+    akuma_kernel_amd64::drivers::register_nvme(akuma_kernel_amd64::drivers::Nvme {
+        init: nvme::init,
+        open_partition: nvme::open_partition,
+        read_bytes: nvme::read_bytes,
+        write_bytes: nvme::write_bytes,
+        flush: nvme::flush,
+        shutdown: nvme::shutdown,
+        open_guest_partition: nvme::open_guest_partition,
+        close_guest_partition: nvme::close_guest_partition,
+        guest_read: nvme::guest_read,
+        guest_write: nvme::guest_write,
+    });
+    #[cfg(feature = "i8042")]
+    akuma_kernel_amd64::drivers::register_keyboard(akuma_kernel_amd64::drivers::Keyboard {
+        init: kbd::init,
+        getb: kbd::getb,
+        has_byte: kbd::has_byte,
+    });
     #[cfg(feature = "kvm")]
     akuma_kernel_amd64::drivers::register_hypervisor(&akuma_kvm_amd64::HYPERVISOR);
 }

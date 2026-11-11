@@ -11,7 +11,11 @@ workspace = true
 # not install it, so the machine half's probe for that class does nothing. `all` is what the
 # bin's default (bare-metal) image enables; `amd64/bin/Cargo.toml` names the smaller sets.
 [features]
-all = ["fbcon", "hda", "kvm", "touchpad", "wifi"]
+all = ["fbcon", "hda", "i8042", "kvm", "nvme", "touchpad", "wifi", "xhci"]
+# The bin's `no-tests`: drivers register no boot-suite checks.
+no-tests = []
+# The storage and keyboard drivers a test box keeps (the bin's `headless`).
+storage-and-input = ["i8042", "nvme", "xhci"]
 # The framebuffer text console on GRUB's linear framebuffer, with the boot splash and
 # `/dev/fb0`'s registration. Off, the multiboot2 boot is headless: its console is the serial
 # port (the bare-metal reference machine has no UART, so a build for it wants this on).
@@ -36,6 +40,17 @@ wifi = [
 # tap behind its gateway (`docs/reference/subsystems/kvm.md`). AMD only; off, none of the
 # three nodes opens, as on a CPU without SVM.
 kvm = ["dep:akuma-kvm-amd64"]
+# The xHCI USB host controller: a USB mass-storage root (`root=/dev/sda1`, `usb`) and the boot
+# keyboard behind it. A controller the firmware left running is stopped by the machine half on
+# every boot whether or not this is on.
+xhci = [
+    "dep:akuma-xhci", "dep:akuma-usb", "dep:akuma-usb-storage", "dep:akuma-dma", "dep:akuma-pci",
+    "dep:akuma-primitives", "dep:akuma-selftest", "dep:spinning_top",
+]
+# NVMe: the bare-metal root disk (`root=/dev/nvme0n1pN`) and the hypervisor's guest partition.
+nvme = ["dep:akuma-nvme", "dep:akuma-dma", "dep:akuma-pci", "dep:akuma-primitives", "dep:spinning_top"]
+# The i8042 keyboard controller (PS/2, or the firmware's USB legacy emulation of one).
+i8042 = ["dep:akuma-port", "dep:spinning_top"]
 # Intel HD Audio playback behind `/dev/dsp`.
 hda = ["dep:akuma-hda", "dep:akuma-dma", "dep:akuma-pci", "dep:akuma-primitives", "dep:akuma-virtio", "dep:spinning_top"]
 
@@ -57,6 +72,12 @@ akuma-hid = { path = "../akuma-hid", optional = true }
 akuma-ieee80211 = { path = "../akuma-ieee80211", optional = true }
 akuma-i2c-hid = { path = "../akuma-i2c-hid", optional = true }
 akuma-multiboot2 = { path = "../akuma-multiboot2", optional = true }
+akuma-nvme = { path = "../akuma-nvme", optional = true }
+akuma-port = { path = "../akuma-port", optional = true }
+akuma-selftest = { path = "../akuma-selftest", optional = true }
+akuma-usb = { path = "../akuma-usb", optional = true }
+akuma-usb-storage = { path = "../akuma-usb-storage", optional = true }
+akuma-xhci = { path = "../akuma-xhci", optional = true }
 akuma-net = { path = "../akuma-net", features = ["rtl8169"], optional = true }
 akuma-pagetable = { path = "../akuma-pagetable", optional = true }
 akuma-pci = { path = "../akuma-pci", optional = true }

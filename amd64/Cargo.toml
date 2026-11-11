@@ -234,20 +234,6 @@ akuma-port = { path = "../crates/akuma-port" }
 # The GDT/TSS as data: descriptors, the TSS descriptor packing, and the
 # syscall/sysret selector arithmetic (compile-time asserted).
 akuma-gdt = { path = "../crates/akuma-gdt" }
-# xHCI (USB 3.0 host controller) layout + TRB/context bit math, host-tested
-# against register values read off `00:14.0` on the reference machine. The
-# MMIO/DMA half is `src/xhci.rs`. Persistence: the only spare disk is trapped in
-# a USB-to-SATA enclosure (`docs/archive/AKUMA_SELF_HEALING_PORT.md`).
-akuma-xhci = { path = "../crates/akuma-xhci" }
-# NVMe (ryzen's SSD): register/queue/Identify/PRP/GPT logic, host-tested; the
-# MMIO/DMA half is `src/nvme.rs`.
-akuma-nvme = { path = "../crates/akuma-nvme" }
-# USB Mass Storage Bulk-Only Transport wire format (CBW/CSW + minimal SCSI),
-# driven over `akuma-xhci` by `src/usb_storage.rs`'s BOT helpers in `src/xhci.rs`.
-akuma-usb-storage = { path = "../crates/akuma-usb-storage" }
-# Standard USB descriptor parsing (device / config / interface / endpoint) —
-# transport-independent, shared with the (deferred) keyboard work.
-akuma-usb = { path = "../crates/akuma-usb" }
 # Linux `reboot(2)` ABI decode, shared with the aarch64 kernel's `sc-reboot`.
 # `src/pci.rs`'s sibling `src/reboot.rs` adds the x86 reset that `akuma-boot`'s
 # own `system_reset` (a PSCI `smc`) cannot do here.
@@ -271,9 +257,6 @@ akuma-virtio = { path = "../crates/akuma-virtio" }
 # virtio HAL uses. Reached transitively already; named here because this crate
 # now calls it directly.
 akuma-primitives = { path = "../crates/akuma-primitives" }
-# Statically allocated DMA memory (rings, contexts, bounce buffers) with the
-# `unsafe` inside: `DmaArray`. The xHCI and HDA drivers hold no raw statics.
-akuma-dma = { path = "../crates/akuma-dma" }
 # The fd table's parts (`Names`/`FlagSet`) that `KERNEL_TABLE`'s static is
 # made of; the state machine itself comes in through `akuma-exec`.
 akuma-fdtable = { path = "../crates/akuma-fdtable" }

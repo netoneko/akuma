@@ -66,8 +66,8 @@ use akuma_xhci::xcap::ProtocolMap;
 use akuma_xhci::{Speed, xcap};
 use spinning_top::Spinlock;
 
-use crate::pci;
-use crate::serial;
+use akuma_kernel_amd64::drivers::services::pci;
+use akuma_kernel_amd64::drivers::services::serial;
 
 // ===========================================================================
 // DMA memory
@@ -197,7 +197,7 @@ dma_buf!(bounce, bounce_mut, BOUNCE_BUF, BOUNCE_LEN, A4K);
 // `tsc_hz`, `ticks_ms`, `spin_us` and `tsc` moved to `crate::polltime`
 // (2026-10-06) so the NVMe driver polls through the same shootdown-assisting
 // wait instead of a copy of it.
-use crate::polltime::{spin_us, ticks_ms, tsc, tsc_hz};
+use akuma_kernel_amd64::drivers::services::polltime::{spin_us, ticks_ms, tsc, tsc_hz};
 
 /// Controller commands and bring-up register polls. The controller itself
 /// answers in microseconds; a second is generous and keeps a dead controller
@@ -312,7 +312,7 @@ fn lock_xhci() -> spinning_top::guard::SpinlockGuard<'static, Option<Xhci>> {
         if let Some(g) = XHCI.try_lock() {
             return g;
         }
-        crate::shootdown::masked_wait_assist();
+        akuma_kernel_amd64::drivers::services::smp::masked_wait_assist();
         core::hint::spin_loop();
     }
 }
@@ -825,53 +825,19 @@ pub fn init() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Stop every xHCI controller on the bus from DMA-ing, using config space only.
-///
-/// This runs on **every** boot, before the memory map is trusted and long
-/// before anything decides whether to drive USB at all — because the thing it
-/// defends against is the *previous* boot. A controller left running keeps
-/// writing its rings into the physical addresses that boot handed it, which on
-/// this target are `.bss` inside a kernel image loaded at 2 MiB. The next
-/// kernel is loaded into that same memory with the old DMA still in flight, so
-/// it is corrupted before its first instruction — and the box restarts, and
-/// does it again. UEFI does not fully re-initialise a controller the OS took
-/// over, so a warm reboot does not clear it; only a full power cycle does.
-///
-/// Clearing `BUS_MASTER` here is what makes that recoverable in software. It
-/// costs one config-space write per controller and needs no driver, no BAR and
-/// no knowledge of what the previous boot was doing.
-///
-/// Scoped to xHCI deliberately. The obvious generalisation — quiesce every
-/// bus-master device — would take out the GPU, whose framebuffer is this
-/// machine's only console.
-pub fn quiesce_all() {
-    let mut found = 0u32;
-    pci::for_each(|d| {
-        if d.header.is_class(0x0c, 0x03) && d.header.prog_if == 0x30 {
-            pci::quiesce(d.addr);
-            found += 1;
-        }
-    });
-    if found > 0 {
-        serial::puts("  [xhci] quiesced ");
-        serial::put_dec(u64::from(found));
-        serial::puts(" controller(s): bus-master off, INTx masked\n");
-    }
-}
-
 /// Halt the controller this kernel brought up, on the way out of the kernel.
 ///
 /// The error paths in [`init`] already halt; this is the **success** path,
 /// which otherwise leaves a fully-configured DMA engine running across a warm
-/// reboot — the same crash-loop [`quiesce_all`] describes, just earned by a
+/// reboot — the same crash-loop the machine half's `pci::quiesce_xhci_controllers` describes, just earned by a
 /// bring-up that worked. Safe to call when the driver never initialised.
 pub fn shutdown() {
     if let Some(x) = lock_xhci().take() {
         halt_controller(x.op);
     }
-    // Belt and braces: `quiesce_all` needs no lock and no successful bring-up,
+    // Belt and braces: the quiesce needs no lock and no successful bring-up,
     // so it also covers a controller that `init` left mid-flight.
-    quiesce_all();
+    pci::quiesce_xhci_controllers();
 }
 
 /// Stop the controller and reset it, so a partially-configured DMA engine
@@ -1874,6 +1840,7 @@ pub fn is_initialized() -> bool {
 
 /// Capacity in 512-byte sectors (the block device's own unit).
 #[must_use]
+#[cfg(not(feature = "no-tests"))]
 pub fn capacity_sectors() -> Option<u64> {
     let g = lock_xhci();
     let x = g.as_ref()?;
@@ -2465,18 +2432,6 @@ pub fn keyboard_has_byte() -> bool {
 // Self-test
 // ===========================================================================
 
-/// `sda1` starts at LBA 2048 (the `fdisk` / `mke2fs` default) — 1 MiB.
-pub const SDA1_OFFSET: u64 = 2048 * 512;
-
-/// `true` if a 512-byte MBR sector has the boot signature and partition 1 starts
-/// at LBA 2048 — the sanity check before trusting [`SDA1_OFFSET`].
-#[must_use]
-pub fn mbr_looks_right(sector: &[u8]) -> bool {
-    sector.len() >= 512
-        && sector[510] == 0x55
-        && sector[511] == 0xAA
-        && u32::from_le_bytes([sector[454], sector[455], sector[456], sector[457]]) == 2048
-}
 
 #[cfg(not(feature = "no-tests"))]
 pub fn smoke_test(t: &mut Suite, present: bool) {
@@ -2494,11 +2449,11 @@ pub fn smoke_test(t: &mut Suite, present: bool) {
 
     let mut mbr = [0u8; 512];
     if t.check("xhci: read the MBR at LBA 0", read_bytes(0, &mut mbr).is_ok()) {
-        t.check("xhci: MBR signature + sda1 @ LBA 2048", mbr_looks_right(&mbr));
+        t.check("xhci: MBR signature + sda1 @ LBA 2048", akuma_kernel_amd64::drivers::services::fs::mbr_looks_right(&mbr));
     }
 
     let mut sb = [0u8; 512];
-    if t.check("xhci: read the sda1 ext2 superblock", read_bytes(SDA1_OFFSET + 1024, &mut sb).is_ok())
+    if t.check("xhci: read the sda1 ext2 superblock", read_bytes(akuma_kernel_amd64::drivers::services::fs::SDA1_OFFSET + 1024, &mut sb).is_ok())
     {
         let magic = u16::from_le_bytes([sb[56], sb[57]]);
         t.check_eq("xhci: sda1 superblock magic 0xEF53", u64::from(magic), 0xEF53);

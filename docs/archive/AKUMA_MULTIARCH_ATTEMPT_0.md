@@ -1842,3 +1842,49 @@ through the "testable" list largest-risk-first, taking `akuma-exceptions`, `akum
 `akuma-fpcache` before the small ones, since those three have the most bug history in
 `BUG_FIX_LIST.md`.
 
+## The storage and keyboard drivers join the drivers crate (2026-11-11)
+
+xHCI (2.5 kL), NVMe (0.6 kL) and the i8042 keyboard (0.5 kL) moved from `amd64/src` into
+`akuma-drivers-amd64` with `git mv`, each behind its own feature (`xhci`, `nvme`, `i8042`; all three
+in `all`, and in the new `storage-and-input`, which the bin's `headless` now enables). Three new class
+slots in `amd64/src/drivers.rs`, in the existing shape (a `Registered` table of function pointers,
+forwarders that read "absent"):
+
+- **`Usb`**: init, shutdown, the `/dev/sda` byte I/O and flush, the boot keyboard, and the boot
+  suite's `smoke_test` (an `Option`, `None` under the drivers crate's new `no-tests`, which the bin's
+  `no-tests` forwards).
+- **`Nvme`**: init and `open_partition` for the root, byte I/O, flush, shutdown, and the guest
+  partition the hypervisor uses. `services::nvme` now re-exports the forwarders under the old names,
+  so `akuma-kvm-amd64` did not change.
+- **`Keyboard`**: the i8042's init, `getb`, `has_byte`. `input`'s three-source poll asks the two classes.
+
+What did **not** move, and why:
+
+- **`quiesce_all` became the machine half's `pci::quiesce_xhci_controllers`.** It stops any xHCI
+  controller the *firmware* left bus-mastering into this kernel's memory (the warm-reboot crash loop).
+  A build without the USB driver needs it most, so it cannot live behind the driver's feature. The
+  driver's `shutdown` still calls it as its belt-and-braces last step.
+- **`SDA1_OFFSET` / `mbr_looks_right`** (the USB root's partition layout) went to `fs.rs`, beside
+  `UsbDisk`. The root search owns that knowledge; the driver's smoke test reads it through `services::fs`.
+- **`blk.rs`** (virtio-blk) stays. It is not a driver: it points the shared `akuma-virtio` driver at
+  the transport window `MachineFacts` reports, which is machine-half work (AArch64 does it in its own glue).
+- **`pci`, `ramdisk`, `input`, `fbdev`, `splash`** stay. `pci` is the enumeration every driver binds
+  through (a service already), `ramdisk` is a GRUB module in memory, and the other three are registries
+  that the console, `fd`, `mm` and the scheduler call on every path, inert without a driver behind them.
+
+**`unsafe` went down, not sideways.** `kbd.rs` carried a hand-rolled bounded lock (`UnsafeCell`, an
+`unsafe impl Sync`, a `&mut *` in the guard), two sites. It is now `spinning_top::Spinlock::try_lock`
+in the same bounded loop (give up after `1 << 22` attempts and report "no key"), so the
+drivers crate stays `forbid`. `amd64/src` 42 -> 40; total 405 -> 403. NVMe and xHCI held no `unsafe`
+(BAR windows from `pci::map_bar_window`, `DmaArray` for DMA). Four untyped address parameters moved
+with the code.
+
+One function lost its only caller: xHCI's `capacity_sectors` was used only by its smoke test (as
+`pub` in the machine half nothing flagged it); it is now `cfg(not(feature = "no-tests"))`.
+
+Gates: clippy clean on seven amd64 feature sets (default, `no-tests`, `ring0-preempt`, `headless`,
+`headless,no-tests`, `headless,kvm`, and `--no-default-features` with no driver at all); TCG default
+and headless SMP=1 829/0, SMP=2 839/0; AArch64 `cargo check`. **Compile-only:** none of the three drivers
+runs under TCG's PVH boot (no PCI scan, no i8042 probe on that path), so their first boot is the
+ryzen rig or the metal.
+

@@ -251,13 +251,16 @@ left out takes its probe with it and the class reads as absent.
 
 | Image | Build | What it is |
 |---|---|---|
-| **default** (bare metal) | `cargo build -p akuma-amd64 --target x86_64-unknown-none --release` | Every driver (`all-drivers`: `fbcon`, `hda`, `kvm`, `touchpad`, `wifi`) and the boot suite. The image for a machine that is used (HP box, ryzen). |
-| **headless** (bare-metal test box) | `... --no-default-features --features headless`; boot under TCG with `NO_DEFAULT_FEATURES=1 FEATURES=headless sh amd64/run.sh` | The machine half's defaults and the boot suite, no optional driver: no framebuffer console (the console is the serial port, GRUB's framebuffer is not touched), no splash, no `/dev/fb0`, no sound, no touchpad, no Wi-Fi (`/dev/wifi0`, the rtw89 card), no hypervisor (`/dev/kvm0`, `/dev/kvm`, `/dev/net/tun`), and none of their crates linked. For a test box with a serial line (trashcan, an Intel CPU: the hypervisor is AMD SVM only). |
+| **default** (bare metal) | `cargo build -p akuma-amd64 --target x86_64-unknown-none --release` | Every driver (`all-drivers`: `fbcon`, `hda`, `i8042`, `kvm`, `nvme`, `touchpad`, `wifi`, `xhci`) and the boot suite. The image for a machine that is used (HP box, ryzen). |
+| **headless** (bare-metal test box) | `... --no-default-features --features headless`; boot under TCG with `NO_DEFAULT_FEATURES=1 FEATURES=headless sh amd64/run.sh` | The machine half's defaults, the boot suite, and only the storage and keyboard drivers (`storage-and-input`: `nvme`, `xhci`, `i8042`). No framebuffer console (the console is the serial port, GRUB's framebuffer is not touched), no splash, no `/dev/fb0`, no sound, no touchpad, no Wi-Fi (`/dev/wifi0`, the rtw89 card), no hypervisor (`/dev/kvm0`, `/dev/kvm`, `/dev/net/tun`), and none of their crates linked. For a test box with a serial line (trashcan, an Intel CPU: the hypervisor is AMD SVM only). |
 | **no-tests** | `--features no-tests` (combines with `headless`) | Drops the boot suite (`akuma-kernel-tests-amd64` is not linked). |
 
-`headless` keeps what a test box needs because none of it is behind a feature yet: the
-serial console, the boot disk (the GRUB-module ramdisk, NVMe, USB storage), the RTL8169 NIC,
-and xHCI, which is both the USB keyboard and USB storage and so stays. A machine with no UART
+`headless` keeps what a test box needs: the storage and keyboard drivers by feature
+(`storage-and-input`: NVMe, xHCI, which is both the USB keyboard and USB storage, and the i8042),
+and in the machine half the serial console, the GRUB-module ramdisk, virtio-blk and the RTL8169
+NIC. A build with `--no-default-features` and nothing else has no NVMe, USB or i8042 at all; the
+machine half still stops any xHCI controller the firmware left running
+(`pci::quiesce_xhci_controllers`). A machine with no UART
 (the multiboot2 reference machine) wants `fbcon`: a headless kernel there is silent.
 
 Sizes (`llvm-size -A`, 2026-11-11, after the guest test programs lost their DWARF and Wi-Fi

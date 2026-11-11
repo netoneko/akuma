@@ -7,7 +7,7 @@
 //! has one disk, an SK hynix NVMe SSD (`1c5c:1d59`), holding Pop!_OS, the ESP
 //! and the partition Akuma is to own. A driver for it is two halves, the same
 //! split `akuma-xhci` made: the `unsafe` register file and DMA memory stay in
-//! `amd64/src/nvme.rs`, and everything that can be decided from bytes lives
+//! `crates/akuma-drivers-amd64/src/nvme.rs`, and everything that can be decided from bytes lives
 //! here, under `forbid(unsafe_code)`, with host tests:
 //!
 //! | module | decides |

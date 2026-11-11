@@ -1,8 +1,8 @@
 //! Console input: whichever of the machine's input devices has a byte.
 //!
 //! Three sources, all polled, all able to be absent: the 16550 (`serial`), the
-//! i8042 keyboard (`kbd`, the firmware's PS/2 emulation) and the native USB
-//! keyboard (`xhci::keyboard_getb`, which exists because that emulation ends when
+//! i8042 keyboard (the `Keyboard` driver class, the firmware's PS/2 emulation) and the native USB
+//! keyboard (the `Usb` class's `keyboard_getb`, which exists because that emulation ends when
 //! the xHCI driver takes the controller). A VMM guest has the first and not the second;
 //! the bare-metal reference machine has the second (through firmware's USB
 //! legacy emulation) and not the first. `fd.rs`'s console read and `poll(2)`
@@ -12,7 +12,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{kbd, serial};
+use crate::drivers::{keyboard_getb, keyboard_has_byte, usb_keyboard_getb, usb_keyboard_has_byte};
+use crate::serial;
 
 /// `uptime_us` of the last console input byte — a keystroke, a serial byte, a
 /// USB HID report — which `/proc/power`'s `idle_ms=` fact and the power daemon
@@ -38,7 +39,7 @@ pub fn idle_ms() -> u64 {
 /// Take one byte from any console input device.
 #[must_use]
 pub fn getb() -> Option<u8> {
-    let b = serial::getb().or_else(kbd::getb).or_else(crate::xhci::keyboard_getb);
+    let b = serial::getb().or_else(keyboard_getb).or_else(usb_keyboard_getb);
     if b.is_some() {
         note_input();
     }
@@ -48,7 +49,7 @@ pub fn getb() -> Option<u8> {
 /// Is a byte waiting on any console input device? Non-destructive.
 #[must_use]
 pub fn has_byte() -> bool {
-    let any = serial::has_byte() || kbd::has_byte() || crate::xhci::keyboard_has_byte();
+    let any = serial::has_byte() || keyboard_has_byte() || usb_keyboard_has_byte();
     if any {
         note_input();
     }

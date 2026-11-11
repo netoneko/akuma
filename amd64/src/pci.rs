@@ -383,3 +383,41 @@ pub fn smoke_test(t: &mut Suite) {
     t.check("pci: every enumerated function has a real vendor id", all_sane);
     t.note("pci: functions enumerated", n as u64);
 }
+
+/// Stop every xHCI controller on the bus from DMA-ing, using config space only.
+///
+/// This runs on **every** boot, before the memory map is trusted and long
+/// before anything decides whether to drive USB at all — because the thing it
+/// defends against is the *previous* boot. A controller left running keeps
+/// writing its rings into the physical addresses that boot handed it, which on
+/// this target are `.bss` inside a kernel image loaded at 2 MiB. The next
+/// kernel is loaded into that same memory with the old DMA still in flight, so
+/// it is corrupted before its first instruction — and the box restarts, and
+/// does it again. UEFI does not fully re-initialise a controller the OS took
+/// over, so a warm reboot does not clear it; only a full power cycle does.
+///
+/// Clearing `BUS_MASTER` here is what makes that recoverable in software. It
+/// costs one config-space write per controller and needs no driver, no BAR and
+/// no knowledge of what the previous boot was doing.
+///
+/// Scoped to xHCI deliberately. The obvious generalisation — quiesce every
+/// bus-master device — would take out the GPU, whose framebuffer is this
+/// machine's only console.
+///
+/// In the machine half, not with the USB driver: a build without that driver still boots on
+/// hardware whose firmware left a controller running.
+pub fn quiesce_xhci_controllers() {
+    let mut found = 0u32;
+    for_each(|d| {
+        if d.header.is_class(0x0c, 0x03) && d.header.prog_if == 0x30 {
+            quiesce(d.addr);
+            found += 1;
+        }
+    });
+    if found > 0 {
+        crate::serial::puts("  [xhci] quiesced ");
+        crate::serial::put_dec(u64::from(found));
+        crate::serial::puts(" controller(s): bus-master off, INTx masked\n");
+    }
+}
+

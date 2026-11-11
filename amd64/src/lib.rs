@@ -84,8 +84,6 @@ mod idt;
 #[cfg(target_arch = "x86_64")]
 mod input;
 #[cfg(target_arch = "x86_64")]
-mod kbd;
-#[cfg(target_arch = "x86_64")]
 mod lapic;
 #[cfg(target_arch = "x86_64")]
 mod machine;
@@ -100,7 +98,6 @@ mod mm;
 mod multiboot2;
 #[cfg(target_arch = "x86_64")]
 mod net;
-mod nvme;
 #[cfg(target_arch = "x86_64")]
 mod paging;
 /// PCI enumeration — how a bare-metal boot finds the USB controllers, the NIC
@@ -148,7 +145,6 @@ mod splash;
 #[doc(hidden)]
 pub mod testing;
 mod watchdog;
-mod xhci;
 
 #[cfg(target_arch = "x86_64")]
 pub use multiboot2::kmain_mb2;
@@ -208,7 +204,7 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
     serial::puts("  uart: ");
     serial::puts(if serial::present() { "present" } else { "absent (reads report no data)" });
     serial::puts("  kbd: ");
-    serial::puts(if kbd::init() { "i8042 present\n" } else { "no i8042\n" });
+    serial::puts(if drivers::keyboard_init() { "i8042 present\n" } else { "no i8042\n" });
     serial::puts("  hvm_start_info @ 0x");
     serial::put_hex(hvm_start_info);
     serial::puts("\n");
@@ -281,7 +277,7 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
     if have_pci {
         pci::scan();
         pci::report();
-        xhci::quiesce_all();
+        pci::quiesce_xhci_controllers();
         drivers::sound_init(machine::flag(hvm_start_info, "hdatest"));
     }
 

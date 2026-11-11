@@ -235,7 +235,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // it on the i8042 ports for as long as no OS claims the USB controllers —
     // which this kernel never does. See `kbd`.
     serial::puts("  kbd: ");
-    serial::puts(if crate::kbd::init() { "i8042 present" } else { "no i8042" });
+    serial::puts(if crate::drivers::keyboard_init() { "i8042 present" } else { "no i8042" });
     match &console {
         Ok(c) => {
             serial::puts("\n  font: ");
@@ -307,8 +307,8 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // Immediately: stop any xHCI controller a PREVIOUS boot left running. This
     // is before the memory map is trusted and before anything decides whether
     // to drive USB, because what it defends against is already in flight —
-    // see `xhci::quiesce_all`.
-    crate::xhci::quiesce_all();
+    // see `pci::quiesce_xhci_controllers`.
+    crate::pci::quiesce_xhci_controllers();
 
     // The root filesystem is already in memory, and NOTHING IN THE MEMORY MAP
     // SAYS SO. Reserve it before the physical allocator is told anything.
@@ -648,19 +648,19 @@ fn init_path(cmdline: &str) -> &str {
 /// and mount `sda1` as the root filesystem. `false` on any failure — the caller
 /// falls back to the RAM image.
 pub fn try_usb_root() -> bool {
-    if let Err(e) = crate::xhci::init() {
+    if let Err(e) = crate::drivers::usb_init() {
         serial::puts("  fs:   xHCI/USB disk: ");
         serial::puts(e);
         serial::puts("\n");
         return false;
     }
     let mut mbr = [0u8; 512];
-    if crate::xhci::read_bytes(0, &mut mbr).is_err() || !crate::xhci::mbr_looks_right(&mbr) {
+    if crate::drivers::usb_read_bytes(0, &mut mbr).is_err() || !crate::fs::mbr_looks_right(&mbr) {
         serial::puts("  fs:   /dev/sda MBR check failed\n");
         return false;
     }
     crate::fs::mount_root_on(
-        crate::fs::RootDevice::Usb(crate::fs::UsbDisk::new(crate::xhci::SDA1_OFFSET)),
+        crate::fs::RootDevice::Usb(crate::fs::UsbDisk::new(crate::fs::SDA1_OFFSET)),
         // `/dev/`-prefixed like the virtio root, so `device_is_mounted` can
         // strip it and recognise the partition as one a filesystem is caching.
         "/dev/sda1",
@@ -673,7 +673,7 @@ pub fn try_usb_root() -> bool {
 /// partition already holds a readable ext2 superblock: `mount_root_on` refuses
 /// before any write if it does not.
 fn try_nvme_root(part: u32) -> bool {
-    if let Err(e) = crate::nvme::init().and_then(|()| crate::nvme::open_partition(part)) {
+    if let Err(e) = crate::drivers::nvme_init().and_then(|()| crate::drivers::nvme_open_partition(part)) {
         serial::puts("  fs:   NVMe: ");
         serial::puts(e);
         serial::puts("\n");

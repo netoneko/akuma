@@ -20,18 +20,22 @@ default = ["akuma-kernel-amd64/default", "all-drivers"]
 all-drivers = ["akuma-drivers-amd64/all"]
 fbcon = ["akuma-drivers-amd64/fbcon"]
 hda = ["akuma-drivers-amd64/hda"]
+i8042 = ["akuma-drivers-amd64/i8042"]
 kvm = ["akuma-drivers-amd64/kvm"]
+nvme = ["akuma-drivers-amd64/nvme"]
 touchpad = ["akuma-drivers-amd64/touchpad"]
 wifi = ["akuma-drivers-amd64/wifi"]
+xhci = ["akuma-drivers-amd64/xhci"]
 # The lean image for a bare-metal test box, used as `--no-default-features --features headless`:
-# the machine half's defaults, the boot suite, and no optional driver. No framebuffer console
+# the machine half's defaults, the boot suite, and only the storage and keyboard drivers a test
+# box needs (`storage-and-input`: NVMe, xHCI for USB storage and the USB keyboard, the i8042).
+# No framebuffer console
 # (the console is the serial port; GRUB's framebuffer is left alone), no splash, no `/dev/fb0`,
 # no sound, no touchpad, no Wi-Fi (`/dev/wifi0`, the rtw89 card and its 4 MiB of DMA buffers), no
 # hypervisor (`/dev/kvm0`, `/dev/kvm`, `/dev/net/tun`: AMD SVM only, and a test box may be
-# Intel). What a test box needs stays, because it is in the machine half rather than behind a
-# feature: the serial console, the boot disk (the GRUB-module ramdisk, NVMe, USB
-# storage via xHCI), the NIC (RTL8169) and the USB keyboard. `docs/reference/build-profiles.md`.
-headless = ["akuma-kernel-amd64/default"]
+# Intel). The serial console, the GRUB-module ramdisk, virtio-blk and the NIC (RTL8169) are in
+# the machine half. `docs/reference/build-profiles.md`.
+headless = ["akuma-kernel-amd64/default", "akuma-drivers-amd64/storage-and-input"]
 ring0-preempt = ["akuma-kernel-amd64/ring0-preempt", "akuma-kernel-tests-amd64/ring0-preempt"]
 syscall-debug-info = ["akuma-kernel-amd64/syscall-debug-info"]
 pmm-forensics = ["akuma-kernel-amd64/pmm-forensics"]
@@ -43,7 +47,7 @@ sc-timerfd = ["akuma-kernel-amd64/sc-timerfd"]
 sc-pidfd = ["akuma-kernel-amd64/sc-pidfd"]
 sc-aio = ["akuma-kernel-amd64/sc-aio"]
 sc-containers = ["akuma-kernel-amd64/sc-containers"]
-no-tests = ["akuma-kernel-amd64/no-tests", "akuma-kernel-tests-amd64/no-tests"]
+no-tests = ["akuma-kernel-amd64/no-tests", "akuma-kernel-tests-amd64/no-tests", "akuma-drivers-amd64/no-tests"]
 
 [dependencies]
 akuma-kernel = { path = "../../crates/akuma-kernel" }

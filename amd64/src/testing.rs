@@ -148,5 +148,5 @@ pub mod usermode {
 }
 
 pub mod xhci {
-    pub use crate::xhci::smoke_test;
+    pub use crate::drivers::usb_smoke_test as smoke_test;
 }
