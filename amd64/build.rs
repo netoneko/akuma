@@ -72,6 +72,12 @@ fn build_user_program(dir: &str, name: &str) {
         .args(["-C", "relocation-model=static"])
         .args(["-C", "code-model=small"])
         .args(["-C", "panic=abort"])
+        // No DWARF. Without this `sigregs.elf` was 742 KB of which ~707 KB was `.debug_*`, and the
+        // boot suite `include_bytes!`es it (and three more) into every image that has tests;
+        // `mkdisk.sh` also copies `hello`/`fdprobe` onto every disk. Nothing reads the debug
+        // info. The symbol table stays (a few KB): it is what turns a faulting guest `rip`
+        // from the suite's output into a function name with `llvm-nm`.
+        .args(["-C", "strip=debuginfo"])
         // `--no-pie` as well as the static relocation model: the model decides
         // what relocations are emitted, the link flag decides what kind of
         // object comes out. Without it the result is ET_DYN, and the loader
