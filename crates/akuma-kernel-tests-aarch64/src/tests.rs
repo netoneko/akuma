@@ -3100,7 +3100,9 @@ impl Drop for LazyTestProcess {
 /// these tests used before the map moved onto `Process`.
 fn lazy_regions_of(pid: u32) -> Vec<(usize, usize, u64)> {
     akuma_exec::process::lazy_regions_snapshot(pid).map_or(Vec::new(), |m| {
-        m.values().map(|r| (r.start_va, r.size, r.flags)).collect()
+        m.values()
+            .map(|r| (r.start_va, r.size, r.prot.map_or(0, akuma_exec::mmu::user_flags::to_pte)))
+            .collect()
     })
 }
 
@@ -3259,9 +3261,13 @@ fn test_lazy_region_clone() -> bool {
     let _child = LazyTestProcess::new(CHILD_PID);
 
     // Create regions in parent
-    akuma_exec::process::push_lazy_region(PARENT_PID, 0x1000_0000, 0x100_0000, 0x3);
-    akuma_exec::process::push_lazy_region(PARENT_PID, 0x2000_0000, 0x200_0000, 0x1);
-    akuma_exec::process::push_lazy_region(PARENT_PID, 0x5000_0000, 0x50_0000, 0x7);
+    // Three distinct protections, so a clone that mixed them up would show.
+    const A: u64 = akuma_exec::mmu::user_flags::RW_NO_EXEC;
+    const B: u64 = akuma_exec::mmu::user_flags::RX;
+    const C: u64 = akuma_exec::mmu::user_flags::RO_NO_EXEC;
+    akuma_exec::process::push_lazy_region(PARENT_PID, 0x1000_0000, 0x100_0000, A);
+    akuma_exec::process::push_lazy_region(PARENT_PID, 0x2000_0000, 0x200_0000, B);
+    akuma_exec::process::push_lazy_region(PARENT_PID, 0x5000_0000, 0x50_0000, C);
 
     // Clone to child
     akuma_exec::process::clone_lazy_regions(PARENT_PID, CHILD_PID);
@@ -3270,9 +3276,9 @@ fn test_lazy_region_clone() -> bool {
     let child_regions = lazy_regions_of(CHILD_PID);
 
     let ok = child_regions.len() == 3
-        && child_regions.iter().any(|&(s, sz, f)| s == 0x1000_0000 && sz == 0x100_0000 && f == 0x3)
-        && child_regions.iter().any(|&(s, sz, f)| s == 0x2000_0000 && sz == 0x200_0000 && f == 0x1)
-        && child_regions.iter().any(|&(s, sz, f)| s == 0x5000_0000 && sz == 0x50_0000 && f == 0x7);
+        && child_regions.iter().any(|&(s, sz, f)| s == 0x1000_0000 && sz == 0x100_0000 && f == A)
+        && child_regions.iter().any(|&(s, sz, f)| s == 0x2000_0000 && sz == 0x200_0000 && f == B)
+        && child_regions.iter().any(|&(s, sz, f)| s == 0x5000_0000 && sz == 0x50_0000 && f == C);
 
     // Verify parent still has its regions (clone should not remove them)
     let parent_regions = lazy_regions_of(PARENT_PID);

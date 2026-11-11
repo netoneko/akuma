@@ -4,6 +4,13 @@
 [`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`](../docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md),
 deferred there because it cannot be done one call at a time.*
 
+## Status
+
+| step | state |
+|---|---|
+| 1. `LazyRegion` stores `Prot` | **done** — `Option<Prot>`, the `u64` only at `LazyRegionMap`'s edges (exact, host-tested); boot suites, `mem_suite` 11/11 |
+| 2–6 | open |
+
 ## Goal
 
 `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `msync` and `brk` are served by **one**

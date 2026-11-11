@@ -90,8 +90,9 @@ pub mod user_flags {
     ///
     /// Because the `u64` is the currency `akuma-exec` still speaks. Its
     /// `UserAddressSpace` calls — `map_page`, `alloc_and_map`, `map_and_track`,
-    /// `map_user_page_tracked` — take a PTE flag word, and `LazyRegion::flags`
-    /// stores one; that is AArch64 machinery living in a crate both kernels
+    /// `map_user_page_tracked` — take a PTE flag word, and `LazyRegionMap`'s
+    /// callers still pass one (it stores a `Prot` since step 1 of
+    /// `proposals/AKUMA_MM_CONVERGENCE.md`); that is AArch64 machinery living in a crate both kernels
     /// compile. The x86 walker cannot consume those bits (the two permission
     /// masks share exactly zero, and AArch64's `AP_MASK` lands on x86's Dirty
     /// and PAT — `akuma_mmap::types` has the measurement), so it decodes them
@@ -141,8 +142,8 @@ pub mod user_flags {
     /// Whether a mapping with these raw PTE flags lets EL0 **write**.
     ///
     /// Still takes a `u64` because its callers hold *page-table* flags —
-    /// `lazy_map_flags`' output and `LazyRegion::flags`, both of which are
-    /// AArch64 encodings that have not moved. A caller holding a [`Prot`] wants
+    /// `lazy_map_flags`' output and the word a lazy-region lookup returns, both
+    /// of which are AArch64 encodings that have not moved. A caller holding a [`Prot`] wants
     /// `Prot::is_write` instead.
     #[must_use]
     pub const fn is_write(flags_val: u64) -> bool {
@@ -268,7 +269,8 @@ impl FaultAccess {
 
 /// PTE flags for one demand-paged page of a lazy region.
 ///
-/// `region_flags` is what the region recorded (`LazyRegion::flags`): an `mmap` PROT
+/// `region_flags` is what the region recorded (`LazyRegion::prot`, as the word a
+/// lookup returns, `0` when unrecorded): an `mmap` PROT
 /// translated by [`user_flags::from_prot`], or an ELF segment's `p_flags`. It wins
 /// whenever it says anything at all — a region is a statement about permissions and
 /// the fault is not. `file_backed` is false for anonymous pages, which have never

@@ -32,8 +32,9 @@ pub struct MmapRegion {
     pub pages: usize,
     pub frames: Vec<PhysFrame>,
     /// The protection this mapping is *supposed* to have, as the neutral [`Prot`]
-    /// vocabulary — the eager counterpart of `LazyRegion::flags`, which is still a
-    /// raw AArch64 `u64` because it lives in `akuma-exec`, above this crate.
+    /// vocabulary — the eager counterpart of `LazyRegion::prot`, which records the
+    /// same thing for a demand-paged region (`Option<Prot>`, `None` = unrecorded,
+    /// the split [`prot_recorded`](Self::prot_recorded) makes here).
     ///
     /// Without it an eager region records extent and frames but no permission, so
     /// the EL0 write-permission-fault handler cannot tell a PTE that is wrongly

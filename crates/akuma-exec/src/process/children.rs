@@ -1017,6 +1017,21 @@ pub fn alloc_mmap(size: usize) -> usize {
 // directly), preserving the coverage the old global-table tests gave us.
 // ==========================================================================
 
+/// The protection an AArch64 `user_flags` word records: `0` is "none recorded",
+/// anything else its [`Prot`](akuma_mmap::Prot). Exact for every word this tree
+/// stores (the six [`to_pte`](crate::mmu::user_flags::to_pte) encodings), which
+/// [`region_word`] inverts.
+fn region_prot(word: u64) -> Option<akuma_mmap::Prot> {
+    (word != 0).then(|| crate::mmu::user_flags::from_pte(word))
+}
+
+/// The AArch64 word for a region's recorded protection: [`region_prot`] read
+/// backwards. Where the map's callers still speak the PTE word, until the fault
+/// path takes a `Prot` (step 2 of `proposals/AKUMA_MM_CONVERGENCE.md`).
+fn region_word(prot: Option<akuma_mmap::Prot>) -> u64 {
+    prot.map_or(0, crate::mmu::user_flags::to_pte)
+}
+
 /// A process's set of demand-paged lazy regions, keyed by `start_va`.
 pub struct LazyRegionMap {
     regions: BTreeMap<usize, LazyRegion>,
@@ -1040,14 +1055,14 @@ impl LazyRegionMap {
     pub fn lookup(&self, va: usize) -> Option<(u64, LazySource, usize, usize)> {
         let (_key, r) = self.regions.range(..=va).next_back()?;
         (va < r.start_va + r.size)
-            .then(|| (r.flags, r.source.clone(), r.start_va, r.size))
+            .then(|| (region_word(r.prot), r.source.clone(), r.start_va, r.size))
     }
 
     /// Insert/replace a region. Returns the new region count.
     pub fn push(&mut self, start_va: usize, size: usize, flags: u64, source: LazySource) -> usize {
         self.regions.insert(
             start_va,
-            LazyRegion { start_va, size, flags, source },
+            LazyRegion { start_va, size, prot: region_prot(flags), source },
         );
         self.regions.len()
     }
@@ -1105,6 +1120,7 @@ impl LazyRegionMap {
     /// Update flags on all regions overlapping `[range_start, range_end)`,
     /// splitting partially-overlapping regions as needed.
     pub fn update_flags(&mut self, range_start: usize, range_size: usize, new_flags: u64) {
+        let new_prot = region_prot(new_flags);
         let range_end = range_start + range_size;
         // Collect keys of regions that overlap [range_start, range_end).
         let keys: alloc::vec::Vec<usize> = self
@@ -1118,7 +1134,7 @@ impl LazyRegionMap {
             let r_start = key;
             let r_size = self.regions[&key].size;
             let r_end = r_start + r_size;
-            let r_flags = self.regions[&key].flags;
+            let r_prot = self.regions[&key].prot;
             let r_source = self.regions[&key].source.clone();
 
             let clip_start = r_start.max(range_start);
@@ -1126,7 +1142,7 @@ impl LazyRegionMap {
 
             if clip_start == r_start && clip_end == r_end {
                 // Fully contained: update in place.
-                self.regions.get_mut(&key).unwrap().flags = new_flags;
+                self.regions.get_mut(&key).unwrap().prot = new_prot;
             } else {
                 // Partially overlapping: remove and re-insert up to 3 pieces.
                 self.regions.remove(&key);
@@ -1134,21 +1150,21 @@ impl LazyRegionMap {
                     self.regions.insert(r_start, LazyRegion {
                         start_va: r_start,
                         size: clip_start - r_start,
-                        flags: r_flags,
+                        prot: r_prot,
                         source: r_source.clone(),
                     });
                 }
                 self.regions.insert(clip_start, LazyRegion {
                     start_va: clip_start,
                     size: clip_end - clip_start,
-                    flags: new_flags,
+                    prot: new_prot,
                     source: r_source.clone(),
                 });
                 if clip_end < r_end {
                     self.regions.insert(clip_end, LazyRegion {
                         start_va: clip_end,
                         size: r_end - clip_end,
-                        flags: r_flags,
+                        prot: r_prot,
                         source: r_source,
                     });
                 }
@@ -1177,7 +1193,7 @@ impl LazyRegionMap {
         let reg_start = key;
         let reg_size = self.regions[&key].size;
         let reg_end = reg_start + reg_size;
-        let reg_flags = self.regions[&key].flags;
+        let reg_prot = self.regions[&key].prot;
         let reg_source = self.regions[&key].source.clone();
 
         let clip_start = range_start.max(reg_start);
@@ -1192,7 +1208,7 @@ impl LazyRegionMap {
             self.regions.insert(clip_end, LazyRegion {
                 start_va: clip_end,
                 size: reg_end - clip_end,
-                flags: reg_flags,
+                prot: reg_prot,
                 source: reg_source,
             });
             Some(('P', clip_start, (clip_end - clip_start) / 4096))
@@ -1206,7 +1222,7 @@ impl LazyRegionMap {
             self.regions.insert(clip_end, LazyRegion {
                 start_va: clip_end,
                 size: reg_end - clip_end,
-                flags: reg_flags,
+                prot: reg_prot,
                 source: reg_source,
             });
             Some(('M', clip_start, (clip_end - clip_start) / 4096))
@@ -1946,8 +1962,8 @@ mod lazy_region_propagation_tests {
         let mut parent = LazyRegionMap::new();
         let mut child = LazyRegionMap::new();
 
-        parent.push(0x1000_0000, 0x1000, 0x1, LazySource::Zero);
-        parent.push(0x2000_0000, 0x2000, 0x2, file_source("/bin/busybox", 42));
+        parent.push(0x1000_0000, 0x1000, crate::mmu::user_flags::RX, LazySource::Zero);
+        parent.push(0x2000_0000, 0x2000, crate::mmu::user_flags::RW_NO_EXEC, file_source("/bin/busybox", 42));
 
         let total = child.extend_from_slice(&snapshot(&parent));
         assert_eq!(total, 2);
@@ -1957,12 +1973,12 @@ mod lazy_region_propagation_tests {
 
         let r1 = &child_regions[&0x1000_0000];
         assert_eq!(r1.size, 0x1000);
-        assert_eq!(r1.flags, 0x1);
+        assert_eq!(r1.prot, Some(akuma_mmap::Prot::RX));
         assert!(matches!(r1.source, LazySource::Zero));
 
         let r2 = &child_regions[&0x2000_0000];
         assert_eq!(r2.size, 0x2000);
-        assert_eq!(r2.flags, 0x2);
+        assert_eq!(r2.prot, Some(akuma_mmap::Prot::RW_NO_EXEC));
         match &r2.source {
             LazySource::File { path, inode, .. } => {
                 assert_eq!(path, "/bin/busybox");
@@ -2138,15 +2154,47 @@ mod lazy_region_propagation_tests {
         let mut parent = LazyRegionMap::new();
         let mut child = LazyRegionMap::new();
 
-        child.push(0x1000_0000, 0x1000, 0x1, LazySource::Zero);
-        parent.push(0x1000_0000, 0x8000, 0x7, file_source("/bin/dash", 7));
+        child.push(0x1000_0000, 0x1000, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+        parent.push(0x1000_0000, 0x8000, crate::mmu::user_flags::RX, file_source("/bin/dash", 7));
 
         assert_eq!(child.extend_from_slice(&snapshot(&parent)), 1);
 
         let (flags, source, start_va, size) =
             child.lookup(0x1000_4000).expect("the parent's larger region now covers this VA");
-        assert_eq!((start_va, size, flags), (0x1000_0000, 0x8000, 0x7));
+        assert_eq!((start_va, size, flags), (0x1000_0000, 0x8000, crate::mmu::user_flags::RX));
         assert!(matches!(source, LazySource::File { inode: 7, .. }));
+    }
+}
+
+/// The map stores a `Prot` and speaks the AArch64 word at its edges; the
+/// conversion must give back exactly the word it was handed for every word
+/// this tree stores, or `[WPF]`'s `lazy_self=` and every mprotect would see a
+/// different value than before.
+#[cfg(test)]
+mod region_word_tests {
+    use super::{region_prot, region_word};
+    use crate::mmu::user_flags;
+
+    #[test]
+    fn every_stored_word_round_trips() {
+        for w in [
+            0,
+            user_flags::NONE,
+            user_flags::RO,
+            user_flags::RW,
+            user_flags::RW_NO_EXEC,
+            user_flags::RX,
+            user_flags::RO_NO_EXEC,
+            user_flags::EXEC,
+        ] {
+            assert_eq!(region_word(region_prot(w)), w, "word {w:#x}");
+        }
+    }
+
+    #[test]
+    fn zero_is_unrecorded_not_none() {
+        assert_eq!(region_prot(0), None);
+        assert_eq!(region_prot(user_flags::NONE), Some(akuma_mmap::Prot::NONE));
     }
 }
 

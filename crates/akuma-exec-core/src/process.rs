@@ -470,7 +470,16 @@ impl LazySource {
 pub struct LazyRegion {
     pub start_va: usize,
     pub size: usize,
-    pub flags: u64,
+    /// The protection this region records, in the neutral vocabulary both
+    /// kernels share, or `None` when it records none and the fault path picks
+    /// one from the access (`akuma_mmu::lazy_map_flags`).
+    ///
+    /// It was the AArch64 PTE word itself (`flags: u64`, with `0` meaning
+    /// "unrecorded") until step 1 of `proposals/AKUMA_MM_CONVERGENCE.md`, which
+    /// is what kept a lazy region from being something the amd64 kernel could
+    /// read. The word survives at `LazyRegionMap`'s edges only, as an exact
+    /// conversion.
+    pub prot: Option<akuma_mmap::Prot>,
     pub source: LazySource,
 }
 
