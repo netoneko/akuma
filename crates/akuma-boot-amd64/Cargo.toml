@@ -31,3 +31,6 @@ akuma-pagetable = { path = "../akuma-pagetable" }
 akuma-pte-amd64 = { path = "../akuma-pte-amd64" }
 # `cr3` reads, `invlpg`, `load_cr3` — the register half of `paging.rs`.
 akuma-cpu = { path = "../akuma-cpu" }
+# The RAM-proportional heap-sizing fallback `mem.rs` retries with — pure, no deps, shared with
+# AArch64's `akuma-kernel-glue` (config flag sweep, 2026-11-11).
+akuma-mem-policy = { path = "../akuma-mem-policy" }

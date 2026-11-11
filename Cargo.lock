@@ -131,6 +131,7 @@ dependencies = [
  "akuma-alloc",
  "akuma-cpu",
  "akuma-machine-facts",
+ "akuma-mem-policy",
  "akuma-pagetable",
  "akuma-phys",
  "akuma-pmm",
@@ -579,6 +580,7 @@ dependencies = [
  "akuma-gic",
  "akuma-kernel-core",
  "akuma-machine-facts",
+ "akuma-mem-policy",
  "akuma-net",
  "akuma-pmm",
  "akuma-primitives",
@@ -703,6 +705,10 @@ dependencies = [
 
 [[package]]
 name = "akuma-machine-facts"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-mem-policy"
 version = "0.1.0"
 
 [[package]]

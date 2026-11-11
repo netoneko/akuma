@@ -1,0 +1,10 @@
+[package]
+name = "akuma-mem-policy"
+version = "0.1.0"
+edition = "2024"
+description = "Resource-sizing policy shared by every kernel (and, eventually, every userspace runtime's minimum-requirement check): how big a heap, how many threads, and later sockets/stacks, a given RAM size should get. Pure, no_std, no deps — each kernel supplies its own akuma-config constants as arguments."
+
+[lints]
+workspace = true
+
+[dependencies]

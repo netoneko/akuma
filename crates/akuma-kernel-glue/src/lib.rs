@@ -175,22 +175,15 @@ fn detect_memory(facts: Option<&akuma_machine_facts::Facts>, have_fdt: bool) -> 
     (base, ram_size)
 }
 
-/// Kernel physical-RAM layout: three contiguous regions starting at `ram_base` —
-/// `[.. heap_start)` code+boot-stack, `[heap_start ..)` heap, then user pages.
-pub struct MemoryLayout {
-    pub code_and_stack: usize,
-    pub heap_start: usize,
-    pub heap_size: usize,
-    pub user_pages_start: usize,
-    pub user_pages_size: usize,
-}
+/// Kernel physical-RAM layout. Re-exported from `akuma-mem-policy` (config flag sweep,
+/// 2026-11-11): see that crate for the type itself.
+pub use akuma_mem_policy::MemoryLayout;
 
 /// Compute the kernel memory layout for a detected RAM region.
 ///
-/// All profile-specific policy lives in `config` (`MIN_CODE_AND_STACK_BYTES`,
-/// `STACK_GUARD_BYTES`, `MEM_CALC_CLAMP_MB`) rather than inline `#[cfg]` in the
-/// boot path, so the layout is one pure, unit-testable function
-/// (`tests::test_compute_memory_layout`).
+/// Thin wrapper over `akuma_mem_policy::compute_memory_layout`, supplying this kernel's own
+/// `config::` constants as arguments — the policy itself (and its unit tests) now lives in that
+/// crate, shared with amd64.
 ///
 /// CRITICAL: `code_and_stack` must cover the *boot stack* (`boot_stack_top` =
 /// the STACK_TOP linker symbol, absolute VA of the initial SP), or the heap is
@@ -198,118 +191,45 @@ pub struct MemoryLayout {
 /// pages under pressure — kernel-corrupts-kernel (the EC=0x21/0x22 crash; see
 /// docs/STACK_CORRUPTION_ANALYSIS.md). The boot layout sanity guard in
 /// `kernel_main` re-verifies the result before any allocation.
-///
-/// `calc_ram` (see `reserve_calc_ram`) sizes only the kernel's OWN reserves;
-/// `user_pages_size` is always carved from the REAL `ram_size`.
 #[must_use]
-pub fn compute_memory_layout(
-    ram_base: usize,
-    ram_size: usize,
-    boot_stack_top: usize,
-) -> MemoryLayout {
-    let stack_cover = (boot_stack_top - ram_base) + config::STACK_GUARD_BYTES;
-    let calc_ram = reserve_calc_ram(ram_size, config::MEM_CALC_CLAMP_MB);
-    let code_and_stack = core::cmp::max(
-        core::cmp::max(calc_ram / 16, config::MIN_CODE_AND_STACK_BYTES),
-        stack_cover,
-    );
-    let heap_start = ram_base + code_and_stack;
-    let heap_size = compute_heap_size(calc_ram, code_and_stack);
-    let user_pages_start = heap_start + heap_size;
-    let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
-    MemoryLayout {
-        code_and_stack,
-        heap_start,
-        heap_size,
-        user_pages_start,
-        user_pages_size,
-    }
+pub fn compute_memory_layout(ram_base: usize, ram_size: usize, boot_stack_top: usize) -> MemoryLayout {
+    akuma_mem_policy::compute_memory_layout(
+        ram_base,
+        ram_size,
+        boot_stack_top,
+        config::MIN_CODE_AND_STACK_BYTES,
+        config::STACK_GUARD_BYTES,
+        config::MEM_CALC_CLAMP_MB,
+        config::KERNEL_HEAP_SIZE_MB,
+    )
 }
 
-/// RAM size used to compute the kernel's own reserves (code+stack, heap).
-///
-/// `clamp_mb == 0` → return the real `ram_size` (historical behaviour, used on
-/// release/size). Otherwise cap at `clamp_mb` MiB, so on a big box the kernel's
-/// reserve math stays pinned to the small-machine numbers it was tuned for and
-/// the surplus RAM flows to the user-page pool. See `config::MEM_CALC_CLAMP_MB`.
-/// Pure so it can be unit-tested (see `tests::test_reserve_calc_ram`).
+/// RAM size used to compute the kernel's own reserves (code+stack, heap). See
+/// `akuma_mem_policy::reserve_calc_ram`.
 #[must_use]
 pub fn reserve_calc_ram(ram_size: usize, clamp_mb: usize) -> usize {
-    if clamp_mb != 0 {
-        core::cmp::min(ram_size, clamp_mb * 1024 * 1024)
-    } else {
-        ram_size
-    }
+    akuma_mem_policy::reserve_calc_ram(ram_size, clamp_mb)
 }
 
-/// Decide the kernel heap size (bytes) for a given RAM size and code+stack reserve.
-///
-/// Pure function so it can be unit-tested without booting (see
-/// `tests::test_compute_heap_size`).
-///
-/// - `config::KERNEL_HEAP_SIZE_MB != 0` → use that fixed value (manual override).
-/// - **RAM ≥ 256 MB** → the historical generous heap: `1/8 of RAM, clamped to
-///   [64 MB, 256 MB]`. Unchanged so the common 256 MB+ configs and memory-hungry
-///   workloads (go build, bun, rustc metadata) behave exactly as before.
-/// - **RAM < 256 MB** → scale down: target `1/8 of RAM` with an 8 MB floor (the
-///   kernel boots using only ~2 MB of heap), but **never more than half of the
-///   memory left after code+stack**, so user pages always survive. The old code
-///   used a flat 64 MB floor here, which left 0 user pages below ~72 MB (no boot)
-///   and starved user RAM at 128 MB.
+/// Decide the kernel heap size (bytes) for a given RAM size and code+stack reserve. See
+/// `akuma_mem_policy::compute_heap_size`.
 #[must_use]
 pub fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize {
-    const MB: usize = 1024 * 1024;
-    if config::KERNEL_HEAP_SIZE_MB != 0 {
-        return config::KERNEL_HEAP_SIZE_MB * MB;
-    }
-    if ram_size >= 256 * MB {
-        (ram_size / 8).clamp(64 * MB, 256 * MB)
-    } else {
-        // Small RAM. The kernel boots on ~2.2 MB of heap. Thread stacks are NOT
-        // in the heap (they come from PMM), so the heap doesn't have to cover
-        // them — keeping it small leaves more user pages for the thread pool +
-        // processes.
-        //
-        // The floor is 4 MB (was 8 MB): on a 24 MB box that nearly doubles the
-        // user-page pool (5 MB → 9 MB), and the PmmOomHandler grows the heap on
-        // demand from PMM. For RAM >= 128 MB, ram/8 dominates the floor
-        // (16 MB+), so this only shrinks the heap below 128 MB.
-        const SMALL_FLOOR: usize = 4 * MB;
-        const MIN_USER: usize = 4 * MB;
-        let cap = ram_size
-            .saturating_sub(code_and_stack)
-            .saturating_sub(MIN_USER);
-        core::cmp::min(
-            core::cmp::max(ram_size / 8, SMALL_FLOOR),
-            core::cmp::max(cap, MB),
-        )
-    }
+    akuma_mem_policy::compute_heap_size(ram_size, code_and_stack, config::KERNEL_HEAP_SIZE_MB)
 }
 
 /// Decide how many thread slots get a stack allocated (`thread_limit`, capped at `MAX_THREADS`).
-///
-/// Thread stacks come from PMM (the user-pages pool), so on a small machine
-/// the full 64-thread pool (~9 MB) is the real boot floor. Give the pool at
-/// most ~half of user pages (leaving the rest for processes), keeping the
-/// `reserved` system threads plus at least a couple of user threads. See
-/// docs/LOW_MEMORY_ENVIRONMENT.md.
+/// See `akuma_mem_policy::compute_thread_limit`.
 #[must_use]
 pub fn compute_thread_limit(user_pages_size: usize) -> usize {
-    if config::THREAD_LIMIT_OVERRIDE != 0 {
-        return config::THREAD_LIMIT_OVERRIDE;
-    }
-    let reserved = config::RESERVED_THREADS;
-    let sys_total = reserved.saturating_sub(1) * config::SYSTEM_THREAD_STACK_SIZE;
-    // The pool gets at most 1/4 of user pages — processes (their ELF images,
-    // heaps, page tables) need the rest, and one process ELF load OOMs if the
-    // pool is too greedy (observed at MEMORY=32M when the pool took half).
-    let stack_budget = user_pages_size / 4;
-    let user_budget = stack_budget.saturating_sub(sys_total);
-    let n_user = user_budget / config::USER_THREAD_STACK_SIZE;
-    // Floor: reserved + 6 so a minimal session (shell + SSH thread + tcc +
-    // a couple of sub-processes) can coexist without hitting "no free user
-    // thread slots".  Cost at 64 KB/slot: 4 × 64 KB = 256 KB extra pool.
-    (reserved + n_user).clamp(reserved + 6, config::MAX_THREADS)
+    akuma_mem_policy::compute_thread_limit(
+        user_pages_size,
+        config::RESERVED_THREADS,
+        config::SYSTEM_THREAD_STACK_SIZE,
+        config::USER_THREAD_STACK_SIZE,
+        config::MAX_THREADS,
+        config::THREAD_LIMIT_OVERRIDE,
+    )
 }
 
 /// Build the `akuma-exec` runtime callbacks + config from the kernel's functions and
