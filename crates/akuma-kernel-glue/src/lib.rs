@@ -474,10 +474,16 @@ pub(crate) fn build_exec_runtime(
         enable_sgi_debug_prints: config::ENABLE_SGI_DEBUG_PRINTS,
         proc_stdin_max_size: config::PROC_STDIN_MAX_SIZE,
         proc_stdout_max_size: config::PROC_STDOUT_MAX_SIZE,
-        cow_fork_enabled: config::COW_FORK_ENABLED,
-        vfork_fastpath_enabled: config::VFORK_FASTPATH_ENABLED,
+        // CoW fork, the vfork fast-path and the shared file-page cache were each a
+        // `config::X_ENABLED` kill-switch, born with its feature and never flipped
+        // since (2026-03-28, 2026-05-31, 2026-08-05 respectively) — removed
+        // 2026-11-11 (config flag sweep). amd64 and both tokio kernels set these
+        // `RuntimeConfig` fields independently (currently all `false` there), so the
+        // field stays; only the AArch64 root kernel's global on/off const is gone.
+        cow_fork_enabled: true,
+        vfork_fastpath_enabled: true,
         pthread_kill_eintr_enabled: config::PTHREAD_KILL_EINTR_ENABLED,
-        shared_file_pages_enabled: config::SHARED_FILE_PAGES_ENABLED,
+        shared_file_pages_enabled: true,
     };
     (rt, cfg)
 }
@@ -1244,7 +1250,11 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // =========================================================================
     // Filesystem initialization
     // =========================================================================
-    if !config::SKIP_FILESYSTEM_INIT {
+    // `SKIP_FILESYSTEM_INIT` (config flag sweep, 2026-11-11): an unconditional
+    // debug escape hatch, never flipped since it was added, removed along with
+    // the kill-switches above. This block (kept as a bare scope, no behavior
+    // change) always runs now.
+    {
         console::print("\n--- Filesystem Initialization ---\n");
 
         // Initialize block device first
@@ -1331,8 +1341,6 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
         }
 
         console::print("--- Filesystem Initialization Done ---\n\n");
-    } else {
-        console::print("[FS] Filesystem SKIPPED via config::SKIP_FILESYSTEM_INIT\n");
     }
 
     run_async_main_preemptive();
@@ -1574,23 +1582,10 @@ fn run_async_main() -> ! {
     threading::register_netpoll_parker();
 
     // =========================================================================
-    // Skip async network if disabled (for debugging)
-    // =========================================================================
-    if config::SKIP_ASYNC_NETWORK {
-        console::print("[AsyncMain] Network SKIPPED via config::SKIP_ASYNC_NETWORK\n");
-        console::print("[Idle] Entering minimal idle loop...\n");
-        
-        // Enable IRQs so timer can fire
-        akuma_primitives::irq::unmask_irqs();
-        
-        loop {
-            threading::yield_now();
-        }
-    }
-
-    // =========================================================================
     // Network initialization and main loop
     // =========================================================================
+    // `SKIP_ASYNC_NETWORK` (config flag sweep, 2026-11-11): removed with the
+    // other unconditional debug kill-switches. Network init always runs now.
     console::print("\n--- Network Initialization ---\n");
 
     // Initialize the akuma-net networking stack. The MMIO slot table lives in
@@ -1996,7 +1991,7 @@ fn run_async_main() -> ! {
             // Shared read-only file pages, same cadence. `hits` is the number of
             // private frame allocations + `read_at` sweeps this cache avoided, which
             // is the direct measure of the `-j4` amplification it exists to remove.
-            if crate::config::SHARED_FILE_PAGES_ENABLED {
+            {
                 let mut w = console::StackWriter::<192>::new();
                 crate::file_page_cache::stats_line(&mut w);
                 w.flush();

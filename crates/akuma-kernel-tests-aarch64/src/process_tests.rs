@@ -9746,10 +9746,10 @@ fn test_demand_paging_merged_body_policy() {
     const FAKE_INODE: u32 = u32::MAX;
     const OFF_DIRTY: usize = 0x8000_0000;
     const OFF_CLEAN: usize = 0x8000_1000;
-    if !crate::config::SHARED_FILE_PAGES_ENABLED {
-        crate::safe_print!(96,
-            "[Test] dp_merged_body: cache handshake SKIPPED (SHARED_FILE_PAGES_ENABLED=false)\n");
-    } else if let (Some(dirty), Some(clean)) =
+    // `SHARED_FILE_PAGES_ENABLED` removed (config flag sweep, 2026-11-11): never
+    // flipped since 2026-08-05, so this body always ran in practice; the `false`
+    // branch's print is gone with it.
+    if let (Some(dirty), Some(clean)) =
         (crate::pmm::alloc_page_zeroed(), crate::pmm::alloc_page_zeroed())
     {
         crate::file_page_cache::insert(FAKE_MOUNT, FAKE_INODE, OFF_DIRTY, dirty, false);
@@ -9821,9 +9821,8 @@ fn test_demand_paging_merged_body_policy() {
     // lifecycle" W2).
     const FAKE_INODE2: u32 = u32::MAX - 1;
     const OFF_RACE: usize = 0x8000_0000;
-    if crate::config::SHARED_FILE_PAGES_ENABLED
-        && let (Some(winner), Some(loser)) =
-            (crate::pmm::alloc_page_zeroed(), crate::pmm::alloc_page_zeroed())
+    if let (Some(winner), Some(loser)) =
+        (crate::pmm::alloc_page_zeroed(), crate::pmm::alloc_page_zeroed())
     {
         crate::file_page_cache::insert(FAKE_MOUNT, FAKE_INODE2, OFF_RACE, winner, false);
         if crate::pmm::cow_ref_get(winner.addr) != 2 {
@@ -9872,9 +9871,7 @@ fn test_demand_paging_merged_body_policy() {
     const MOUNT_B: u32 = u32::MAX - 3;
     const SHARED_INODE: u32 = u32::MAX - 4;
     const OFF_ALIAS: usize = 0x8000_2000;
-    if crate::config::SHARED_FILE_PAGES_ENABLED
-        && let Some(page_a) = crate::pmm::alloc_page_zeroed()
-    {
+    if let Some(page_a) = crate::pmm::alloc_page_zeroed() {
         crate::file_page_cache::insert(MOUNT_A, SHARED_INODE, OFF_ALIAS, page_a, false);
 
         // The other mount's identically-numbered inode must not find it.

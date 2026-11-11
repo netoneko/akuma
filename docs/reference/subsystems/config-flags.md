@@ -251,15 +251,20 @@ These are **compile-time** `pub const bool` — toggle in source and rebuild.
 
 ### Scheduler / concurrency
 
+**Config flag sweep (2026-11-11): `COW_FORK_ENABLED`, `VFORK_FASTPATH_ENABLED`, `SHARED_FILE_PAGES_ENABLED` and
+`ENABLE_PREEMPTION_WATCHDOG` are removed.** Each was a global on/off const, born `true` with its feature (2026-03-28,
+2026-05-31, 2026-08-05) or last flipped 2026-01-23, and never touched since — the opt-out could never be exercised, same
+shape as the Cargo features the feature audit removed for the same reason. CoW fork and the vfork fast-path are now
+unconditional in the AArch64 root kernel; the preemption watchdog always runs. `cow_fork_enabled`/`vfork_fastpath_enabled`/
+`shared_file_pages_enabled` stay as `RuntimeConfig` **fields** (`akuma-exec`) — amd64 and both tokio kernels set them to
+`false` in their own boot code, a real per-kernel difference, not a dead switch — only the global const feeding the
+AArch64 side is gone.
+
 | Knob | Default | Effect | Source |
 |---|---|---|---|
-| `COW_FORK_ENABLED` | `true` | Copy-on-Write fork. | `config.rs:301` |
-| `VFORK_FASTPATH_ENABLED` | `true` | vfork fast path. | `config.rs:311` |
-| `SHARED_FILE_PAGES_ENABLED` | `true` | Share one physical frame between all read-only mappers of a file page, keyed `(inode, file_offset)`, instead of a private copy per process. Fixes the `-jN` memory/I-O amplification. Off = per-process private file pages. | `config.rs` |
 | `FPCACHE_BASE_RAM_DIVISOR` | `8` | Base file-page cache cap as a divisor of total RAM. 8 = RAM/8 = 512 MB at `MEMORY=4096`. Lower it to starve the cache for an A/B. | `config.rs` |
 | `FPCACHE_INFLATE_PCT` | `20` | Extra cap allowed **on top of the base**, as a percent of the base, granted only while free RAM can spare it. 614 MB at `MEMORY=4096` — enough to hold a 532 MB mmap'd model that the base cap misses by 20 MB. `0` pins the cap at the base (old fixed behaviour). | `config.rs` |
 | `FPCACHE_INFLATE_HEADROOM_MULT` | `2` | Free RAM demanded before the inflation is granted, as a multiple of the inflation. Withdrawal happens at `1x`, so the two form a hysteresis band and the cap cannot flap. | `config.rs` |
-| `ENABLE_PREEMPTION_WATCHDOG` | `true` | | `config.rs:275` |
 
 ### Service autostart
 
@@ -272,12 +277,15 @@ These are **compile-time** `pub const bool` — toggle in source and rebuild.
 | Knob | Default | Effect | Source |
 |---|---|---|---|
 | `DISABLE_ALL_TESTS` | `false` | Skip all boot self-tests. | `config.rs:231` |
-| `SKIP_FILESYSTEM_INIT` | `false` | | `config.rs:259` |
-| `SKIP_ASYNC_NETWORK` | `false` | | `config.rs:244` |
 | `RUN_NETWORK_TESTS` | `false` | | `config.rs:247` |
-| `RUN_CONTAINER_TESTS` | `false` | | `config.rs:250` |
 | `IGNORE_THREADING_TESTS` | `false` | | `config.rs:224` |
 | `FAIL_TESTS_IF_TEST_BINARY_MISSING` | `false` | | `config.rs:196` |
+
+`SKIP_FILESYSTEM_INIT` and `SKIP_ASYNC_NETWORK` were listed here but were never actually gated by `kernel_tests` —
+each had one unconditional call site in `akuma-kernel-glue`, a debug escape hatch in the live boot path, not a test
+gate. Removed in the same 2026-11-11 sweep as the Scheduler/concurrency consts above, for the same reason (never
+flipped). `RUN_CONTAINER_TESTS` was already gone from the tree with no call site anywhere — this row was stale; it
+pointed at a `config.rs:250` that now holds something else.
 
 ## Build flags for `populate_disk.sh`
 
