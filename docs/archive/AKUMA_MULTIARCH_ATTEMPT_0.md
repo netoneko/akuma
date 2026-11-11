@@ -2299,3 +2299,61 @@ Gates:
 - `pread` on a `TimerFd` answers `EAGAIN` and on an `EpollFd` `EINVAL`, where Linux's `ESPIPE`
   check comes first.
 - `pread` on a `BlockDev` is `EBADF`.
+
+### Slice 5: mm (deferred, 2026-11-11)
+
+Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral
+`akuma_mmap::Prot`, filled by its own `mm::fault_in`. AArch64 splits them: eager regions in
+`mmap_regions`, lazy ones in `Process::lazy_regions`, whose entries carry **AArch64 PTE bits**
+(`page_flags: u64`) and which `akuma-exceptions`' fault handler reads. Glue's `mem.rs` writes the
+second shape, so routing amd64's `mmap` to it would hand its fault path regions it cannot read; even
+`brk` depends on which fault path knows the heap. Converging is one region model and one fault path.
+That touches AArch64's self-host and CoW fault path, so it gets a design doc first; the threads
+slice went ahead of it.
+
+### Slice 6: threads (2026-11-11)
+
+Thread creation was already one copy: both kernels call `akuma_exec::process::clone_thread`. What
+differed was the arm around it. `userspace/forktest/c_stress/cloneflags.c` is the oracle: raw
+`clone` syscalls, because musl's `clone()` refuses `CLONE_VM` without `CLONE_VFORK` before the kernel
+sees it. Before the slice:
+
+| case | Linux 7.0 | AArch64 | amd64 |
+|---|---|---|---|
+| Go's flag word, no `CLONE_SETTLS` | ran | ran | `EINVAL` |
+| `pthread_create`'s flag word | ran | ran | ran |
+| `CLONE_VM\|CLONE_THREAD` without `CLONE_SIGHAND` | `EINVAL` | ran | `EINVAL` |
+| `CLONE_SIGHAND` without `CLONE_VM` | `EINVAL` | `ENOSYS` | `EINVAL` |
+
+amd64 refused every Go OS thread. It required `CLONE_SETTLS` on the reasoning that a thread without it
+"runs on the parent's `%fs`". On Linux it does, and Go's runtime asks for exactly that, then sets
+its TLS itself in the child.
+
+Shared code had the matching bug. `clone_thread` installed the `tls` argument unconditionally, so
+a thread made without `CLONE_SETTLS` got whatever the register held. It now keeps the parent's TLS
+base unless `CLONE_SETTLS` is set.
+
+Now:
+
+- glue's `sys_clone` asks `akuma_syscalls_proc::clone::decode` for the two `EINVAL` combinations,
+  the rule the x86 kernels already used.
+- glue `proc::clone_thread` is every kernel's thread arm. It drains retired process rows first:
+  amd64 did that to stop thread churn from filling the process table, and it is one copy now.
+  It maps a thread-slot or table limit to `EAGAIN`, a zero stack to `EINVAL` and memory to
+  `ENOMEM`.
+- Removed:
+  - glue's second, post-ready seed of the signal mask, since `clone_thread` seeds it before ready;
+  - amd64's `CLONE_THREAD`, stack and `CLONE_SETTLS` refusals and its errno mapping;
+  - `usermode::clone_flags`.
+- amd64 keeps one check, a caller with no process slot.
+
+Gates: `cloneflags` matches Linux on both kernels. `thrprobe` (8 × 12 threads) and
+`pthread_kill_eintr` pass on both, and `futextest` passes on amd64. Clippy is clean on amd64
+(default, `headless`, `no-tests`), AArch64 and Taoxichuan. The boot suites hold: amd64 TCG
+836/846/846, `headless` 846; AArch64 HVF 315/323/321.
+
+**Found on the way, pre-existing:** on AArch64, `futextest` step 6 (500 thread create/join rounds)
+fails with `[asid] EXHAUSTED` in `UserAddressSpace::new_shared`. Repeated runs leave the box unable
+to spawn a process, and ssh stops answering. The kernel from before any slice (`mrg`, 16:43) behaves
+the same, and the drain at clone does not cure it, so ASIDs are leaked, not slow to come back.
+Next item.

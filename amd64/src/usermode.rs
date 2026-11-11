@@ -2695,27 +2695,6 @@ pub fn alloc_pid() -> u32 {
     akuma_exec::process::allocate_pid()
 }
 
-/// The `clone(2)` flag bits this kernel names.
-///
-/// Spelled out rather than reached through `akuma-syscalls-linux`: these are
-/// architecture-independent Linux constants, and the one that matters here —
-/// `CLONE_SETTLS` — pairs with an x86_64-specific *argument position*, so
-/// keeping the two facts in one file is worth more than the deduplication.
-pub mod clone_flags {
-    // `CLONE_VM` left 2026-11-01: the thread/spawn/fork decision is
-    // `akuma_syscalls_proc::clone::decode` now.
-    pub const CLONE_THREAD: u64 = 0x0001_0000;
-    pub const CLONE_SETTLS: u64 = 0x0008_0000;
-    // `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`
-    // are **not** here since the `clone` fold: the shared
-    // `akuma_exec::process::clone_thread` is the only reader of those three
-    // now — it decides which pointer gets the tid and which gets the zero-and-
-    // wake at exit — and a second copy of the bits beside a path that no longer
-    // consults them is how the two drift. `trace_clone_flags` still names them,
-    // from its own literal table, because a trace line has to name a bit
-    // whether or not this file acts on it.
-}
-
 /// Bytes of argv kept per process for `/proc/<pid>/cmdline`.
 ///
 /// A shell command line, not a program's whole argument vector: 256 bytes holds
