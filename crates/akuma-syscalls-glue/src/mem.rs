@@ -528,15 +528,10 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             return EINVAL;
         }
         if is_fixed {
-            let _ = akuma_exec::process::munmap_lazy_regions_in_range(proc.tgid, addr, pages * 4096);
-            // Page-table edits under `as_lock` (shared-kernel SMP): excludes a
-            // concurrent BKL-free fault on this address space. No alloc/IO here.
-            proc.with_address_space(|aspace| {
-                for i in 0..pages {
-                    let va = addr + i * 4096;
-                    aspace.unmap_page(va);
-                }
-            });
+            // Whatever was mapped here goes, exactly as `munmap` would remove
+            // it, but the range stays off the free list: the new mapping takes
+            // it at once.
+            unmap_range(proc, addr, pages * 4096, false);
         }
         addr
     } else if let Some(a) = proc.vm_alloc_mmap(pages * 4096) { a } else {
@@ -1430,6 +1425,26 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     // preserved divergence, pinned by the crate's
     // `diverge_munmap_zero_length_unmaps_one_page`.
     let unmap_len = akuma_syscalls_mem::mmap::munmap_len(len);
+    unmap_range(proc, addr, unmap_len, true);
+    0
+}
+
+/// Remove every mapping in `[addr, addr + unmap_len)` from `proc`: eager
+/// regions (writing back a shared file mapping first), lazy regions, and any
+/// page mapped outside both, freeing their frames. `munmap`'s body, and what
+/// `MAP_FIXED` does to the range it lands on.
+///
+/// `recycle_va` returns the freed range to the mmap free list. `munmap` wants
+/// that; `MAP_FIXED` must not, since its new mapping occupies the range at
+/// once and a later `mmap` would be handed the same addresses.
+///
+/// `MAP_FIXED` used to clear the PTEs itself with `unmap_page`, which neither
+/// frees a frame nor drops it from the ledger, and it left the old eager
+/// record in the list under the new one: every replaced page stayed allocated
+/// until the process exited, and the list broke `akuma-mmap`'s no-overlap
+/// invariant (`userspace/forktest/c_stress/mapfixed.c`, 32 MB over 2000 rounds;
+/// `docs/archive/AKUMA_MAP_FIXED_EAGER_LEAK.md`).
+fn unmap_range(proc: &akuma_exec::process::Process, addr: usize, unmap_len: usize, recycle_va: bool) {
 
     // Detach EVERY eager region overlapping the range, clipping partial ones at
     // both ends, under vm_lock (pure Vec ops only). The actual page unmap + frame
@@ -1515,7 +1530,9 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             let _ = akuma_exec::mmu::flush_tlb_range_all_asid(base, n, akuma_exec::mmu::TlbTarget::AllCores);
         });
         for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapRegion); }
-        proc.vm_free_mmap(base, n * 4096);
+        if recycle_va {
+            proc.vm_free_mmap(base, n * 4096);
+        }
     }
 
     // Lazy regions in the same range. Previously unreachable whenever an eager
@@ -1563,14 +1580,14 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
             // next_mmap, which causes an infinite mmap→reject→munmap→same-addr
             // loop (observed with Go's heap prober returning 0x100000000 60+
             // times in succession).
-            if had_physical {
+            if had_physical && recycle_va {
                 proc.vm_free_mmap(freed_start, freed_pages * 4096);
             }
         }
-        return 0;
+        return;
     }
     if unmapped_any_eager {
-        return 0;
+        return;
     }
 
     let total_pages = unmap_len / 4096;
@@ -1610,5 +1627,4 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
         }
     });
     for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapSpan); }
-    0
 }

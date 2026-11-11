@@ -71,7 +71,7 @@ reports as DIVERGE rather than FAIL.
 # Host, milliseconds — the decisions and the region algebra
 cargo test -p akuma-syscalls-mem -p akuma-mmap --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
 
-# Live guest — all ten c_stress memory probes
+# Live guest — the c_stress memory probes
 scripts/mem_suite.py --port 2322            # add --only <a,b> for a subset
 
 # Cost, A/B/A, ratio-to-getpid not ns
@@ -315,6 +315,25 @@ clean/private range is a success, not an error).
 capability bitmask (`0x18` = `PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED`).
 `CMD_REGISTER_PRIVATE_EXPEDITED` is a no-op success. `CMD_PRIVATE_EXPEDITED`
 issues a real `dsb ish` + `isb`. Any other cmd → `EINVAL`.
+
+## `MAP_FIXED` replaces exactly as `munmap` removes
+
+Whatever a `MAP_FIXED` mapping lands on is removed by glue's `unmap_range`, the function that
+is `munmap`'s body. That covers eager regions (clipped, frames freed from the live PTE, shared
+file pages written back), lazy regions and stray pages. The one difference is `recycle_va =
+false`: the range is not returned to the mmap free list, because the new mapping occupies it at
+once.
+
+**Never clear a range by `unmap_page` alone.** It clears the PTE and nothing else. The frame
+stays in the ledger until exit, and the old `MmapRegion` stays in the list under the new one,
+which breaks the no-overlap invariant every region lookup relies on. Any path that replaces a
+mapping goes through `unmap_range`. Gates:
+
+- `userspace/forktest/c_stress/mapfixed.c`, the `mem_suite.py` probe, measures free memory
+  over 2000 replace cycles;
+- `test_map_fixed_replaces_eager_mapping` (boot suite) checks the record count and the PMM.
+
+[`archive/AKUMA_MAP_FIXED_EAGER_LEAK.md`](../../../archive/AKUMA_MAP_FIXED_EAGER_LEAK.md)
 
 ## Writable MAP_SHARED file-backed mappings (writeback)
 

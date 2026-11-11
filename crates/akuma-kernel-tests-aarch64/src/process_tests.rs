@@ -997,6 +997,10 @@ pub fn run_all_tests() {
     // paths, plus the runtime kill switch — pins what the carve-out must preserve.
     test_mm_bkl_drop();
 
+    // MAP_FIXED over a live eager mapping must remove it as munmap would: one
+    // record left in the list, and the replaced frames back in the PMM.
+    test_map_fixed_replaces_eager_mapping();
+
     // `no-bkl-drivers` (Phase 6): DriverBklGuard's ledger balance across
     // sys_getrandom and the sys_fb_* entry points, on early-error paths and a
     // real guarded path, plus the runtime kill switch.
@@ -5075,6 +5079,103 @@ fn test_mm_bkl_drop() {
     } else {
         crate::safe_print!(64, "[Test] mm-bkl-drop FAILED ({} cases)\n", fails);
         panic!("test_mm_bkl_drop: {fails} cases failed");
+    }
+}
+
+/// `mmap(MAP_FIXED)` over a live eager anonymous mapping
+/// (`docs/archive/AKUMA_MAP_FIXED_EAGER_LEAK.md`).
+///
+/// The fixed path used to clear the PTEs with `unmap_page`, which frees no
+/// frame and leaves the old `MmapRegion` in the list under the new one. Each
+/// round here maps four eager pages, replaces them with `MAP_FIXED`, checks
+/// that exactly one record covers the address, and unmaps. Both mappings
+/// are `MAP_FIXED` at one VA, so the first lands on nothing and the second
+/// replaces it. Before the fix
+/// every round kept four frames until the process exited and the list held
+/// two overlapping records.
+fn test_map_fixed_replaces_eager_mapping() {
+    use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid, with_process};
+    use akuma_exec::threading::current_thread_id;
+    use crate::syscall::{handle_syscall, nr};
+
+    const PROT_RW: u64 = 0x3;
+    const MAP_PRIVATE: u64 = 0x02;
+    const MAP_FIXED: u64 = 0x10;
+    const MAP_ANONYMOUS: u64 = 0x20;
+    // Within `MMAP_EAGER_MAX_PAGES`, so both mappings take the eager path.
+    const LEN: u64 = 4 * 4096;
+    // Clear of `test_mm_bkl_drop`'s 0x12_0000_0000.
+    const VA: u64 = 0x13_0000_0000;
+    const ROUNDS: usize = 8;
+
+    let tid = current_thread_id();
+    let pid: u32 = 7720;
+    register_process(pid, make_test_process(pid));
+    register_thread_pid(tid, pid);
+    // The eager install edits only the installed TTBR0's tables
+    // (`map_user_page_tracked_no_flush`, clause 3), so run on this process's.
+    let _ = with_process(pid, |p| p.address_space.activate());
+
+    let covering = |va: u64| -> usize {
+        with_process(pid, |p| p.vm_with_regions(|list| {
+            list.iter().filter(|r| r.start_va <= va as usize && (va as usize) < r.start_va + r.pages * 4096).count()
+        })).unwrap_or(usize::MAX)
+    };
+
+    let mut fails = 0u32;
+    // One round before measuring, so the page-table pages the first mapping
+    // allocates are not counted as lost. A freed frame sits in the PMM's UAF
+    // quarantine until evicted, so drain it before each snapshot.
+    let mut free_before = 0usize;
+    for round in 0..=ROUNDS {
+        if round == 1 {
+            crate::pmm::quarantine_drain_all();
+            free_before = crate::pmm::free_count();
+        }
+        let a = handle_syscall(nr::MMAP, &[VA, LEN, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, !0u64, 0]);
+        if a != VA {
+            fails += 1;
+            crate::safe_print!(96, "[Test] map-fixed: mmap FAILED r={}\n", a as i64);
+            break;
+        }
+        let b = handle_syscall(nr::MMAP, &[a, LEN, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, !0u64, 0]);
+        if b != a {
+            fails += 1;
+            crate::safe_print!(96, "[Test] map-fixed: MAP_FIXED returned {:#x}, want {:#x}\n", b, a);
+            let _ = handle_syscall(nr::MUNMAP, &[a, LEN, 0, 0, 0, 0]);
+            break;
+        }
+        let n = covering(a);
+        if n != 1 {
+            fails += 1;
+            crate::safe_print!(96, "[Test] map-fixed: {} records cover {:#x} after MAP_FIXED (want 1)\n", n, a);
+        }
+        let _ = handle_syscall(nr::MUNMAP, &[a, LEN, 0, 0, 0, 0]);
+        let n = covering(a);
+        if n != 0 {
+            fails += 1;
+            crate::safe_print!(96, "[Test] map-fixed: {} records still cover {:#x} after munmap\n", n, a);
+        }
+    }
+    crate::pmm::quarantine_drain_all();
+    let free_after = crate::pmm::free_count();
+    // A leak is 4 frames a round, 32 over the measured rounds. Allow a little
+    // for other cores allocating meanwhile.
+    let lost = free_before.saturating_sub(free_after);
+    if lost >= 16 {
+        fails += 1;
+        crate::safe_print!(128, "[Test] map-fixed: {} frames not returned over {} rounds\n", lost, ROUNDS);
+    }
+
+    akuma_exec::mmu::UserAddressSpace::deactivate();
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    if fails == 0 {
+        crate::safe_print!(128, "[Test] map-fixed-replaces-eager PASSED ({} rounds, {} frames lost)\n", ROUNDS, lost);
+    } else {
+        crate::safe_print!(64, "[Test] map-fixed-replaces-eager FAILED ({} cases)\n", fails);
+        panic!("test_map_fixed_replaces_eager_mapping: {fails} cases failed");
     }
 }
 
