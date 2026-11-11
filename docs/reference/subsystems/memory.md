@@ -808,6 +808,9 @@ Rules:
   `ENOMEM`). Linux does not fail `pthread_create` because exited threads are
   still cooling, and here the capacity always comes back within the two
   cooldowns. Spawn is not retried.
+- **The cooldowns are the ceiling on sustained churn**: about 250 thread
+  creations per 20 ms. Past it, creation is slowed by the wait above, not
+  refused.
 
 `userspace/forktest/c_stress/thrchurn.c` is the gate: `thrchurn 2000 0 1`
 creates and joins threads with no pause and must report `0 failed`. Background:
