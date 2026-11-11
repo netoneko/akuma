@@ -772,6 +772,8 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
             // is all zeros, which is what `mmap(2)` says and what
             // `saturating_sub` gives.
             filesz: size.saturating_sub(offset as usize),
+            // An `mmap` maps from a page-aligned file offset: no lead.
+            lead: 0,
         })
     } else {
         None
