@@ -2122,13 +2122,32 @@ Gates:
   measured on the pre-slice amd64 kernel.
 - `abortsig`, `pthread_kill_eintr`, `sigsusprobe`: PASS on both. `sigprobe`: all 12 rungs on amd64.
 
-**Still open:**
+**Future work** (found by this slice's gates, not fixed in it):
 
-- **amd64 `setpgid` is a no-op outside a pty session** (`pty::sys_setpgid_gated` returns 0 and
-  changes nothing), so `kill(-pgid)` finds no group there and killtree passes on its per-pid
-  fallback. A process-group item, not a signals one.
-- **AArch64 `sigprobe` stops at rung 9**: a write to a present read-only page reports `si_code`
-  `SEGV_MAPERR` (1) where Linux reports `SEGV_ACCERR` (2). That is in the fault path, which this slice
-  did not touch, and was not compared against the baseline kernel.
-- AArch64 SIGKILL no longer forces out a thread that never returns to user mode. The deferred kill
-  posted by the teardown still does, after its 2 s grace.
+- **amd64 process groups outside a pty session.** `setpgid`, `getpgid` and `getsid` are real only for
+  a process whose session a pty controls (`pty::sys_{setpgid,getpgid,getsid}_gated`, since
+  `5ceb3bb0`, 2026-10-05). Everywhere else `setpgid` returns 0 and changes nothing, and `getpgid`
+  reports 1. That was the stub's behaviour from the first amd64 checkpoint, and it was kept
+  deliberately because nothing on the console side had been tested against job control. `setsid`
+  is real everywhere. Consequences:
+  - `kill(-pgid)` for a group made with `setpgid` in a non-pty process (`ssh host cmd`, a service
+    under herd) is `ESRCH`. killtree passes on amd64 only through its per-pid fallback. A minimal
+    repro (fork, child `setpgid(0, 0)`, parent `kill(-child, 9)`) read `setpgid=0 pgid=1` and
+    `ESRCH` on amd64, and worked on AArch64.
+  - **Suspected, not tested:** if every non-pty process reads group 1, `kill(0, sig)` from one of
+    them signals every leader whose group reads 1, possibly herd and sshd, not just the caller's
+    group. Check in a VM before relying on either answer.
+  - Fix: make the three calls real everywhere, as on AArch64, with the console Ctrl-C path
+    (`kill_foreground_group`) re-tested, since that is the job-control reader the gate protected.
+- **AArch64 `sigprobe` rung 9.** A write to a present read-only page reports `si_code`
+  `SEGV_MAPERR` (1) where Linux reports `SEGV_ACCERR` (2); rungs 10-12 are never reached. This is in
+  the EL0 fault path, which this slice did not touch, and it was not run on the baseline kernel.
+  Next: run it on the baseline, then find where `akuma-exceptions` chooses the code for a
+  permission fault.
+- **AArch64 SIGKILL of a thread that never returns to user mode.** `kill(pid, 9)` used to force it
+  out after a 2 s grace. Now only the teardown's deferred kill does, and only once some thread of the
+  group has started `exit_group`. A group whose every thread is stuck in the kernel is not reaped by
+  `kill -9`. Linux does not force such a thread out either; a stuck kernel thread is a bug of its
+  own.
+- **`tkill` of an unknown in-range tid returns 0** (Linux: `ESRCH`). Pinned, not fixed: it was the
+  pre-slice behaviour on both kernels.
