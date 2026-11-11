@@ -227,8 +227,34 @@ self-tests), and amd64 still consumes neither `akuma-kernel-core` nor `akuma-ker
 now would re-export two kernels that share a name and nothing else — the "thin witness" the doc warns
 about. Preconditions, in order: (a) amd64 on `kernel-core`'s neutral spine (console rules, config,
 timer policy, irq table), with `MachineFacts` as the input; (b) the boot self-tests moved out of
-`usermode.rs` into a tests crate; (c) M6 done; (d) the dispatcher split by family. M7 is then a
+`usermode.rs` into a tests crate; (c) M6 done; (d) the dispatcher split by family; (e) the
+device drivers out of the machine half into a drivers-wiring crate (below). M7 is then a
 rename/hoist.
+
+### Added to the plan 2026-11-11: the tests crate and the drivers-wiring crate
+
+`amd64/src` (56.9 kL) does not split two ways (tests and drivers). It splits three ways, and
+each destination gets its own crate:
+
+| destination | what | crate |
+|---|---|---|
+| neutral, shared with AArch64 | syscall dispatch, `fd`, `mm`, most of `signal`, `sock`, `fs`, `pipe`, `futex`, `loader` | the existing `akuma-kernel-core`/`-glue`, `akuma-syscalls-glue`, `akuma-exec` |
+| boot self-tests | `usermode/tests.rs` (3.0 kL) plus every file's inline `cfg(not(feature = "no-tests"))` suite | **`akuma-kernel-tests-amd64`**, the counterpart of `akuma-kernel-tests-aarch64`; a `no-tests` image does not link it |
+| device drivers | `xhci`, `hda`, `rtw89`/`rtw89_sta`/`wifi`, `nvme`, `touchpad`/`i2c`/`input`/`kbd`, `fbdev`/`splash`, `ramdisk`, `blk`, `pci`, `kvm` | **`akuma-drivers-amd64`**: the wiring between the host-tested driver crates (`akuma-rtw89`, `akuma-net-rtl8169`, `akuma-dma`, `akuma-svm-amd64`, …) and the kernel's registries |
+| machine half | IDT/trap entry, `lapic`, `smp`, `gdt`, `paging`, `multiboot2`, `boot`, ring 3 entry, x86 sigframe, fpu, `sched`'s `ArchHooks` side | `akuma-kernel-amd64` (what `amd64/` becomes) |
+
+**The drivers-wiring crate is configurable.** Every amd64 image compiles every driver today and
+probes for the hardware at boot. `akuma-drivers-amd64` gives each driver its own feature
+(`xhci`, `hda`, `wifi-rtw89`, `nvme`, `touchpad`, `kvm`, …). An `all` feature is the
+bare-metal default; a Firecracker image needs none of them. The machine half sees drivers only
+through one registration call per class (block, input, net, framebuffer, sound), so turning a
+feature off removes the driver's code and its probe, and leaves no `cfg` in the machine half.
+The PCI enumeration the drivers bind through moves with them. The machine half keeps only
+config-space access (`akuma-port`'s `PCI_CONFIG`).
+
+The order is: tests crate first, because it is pure movement and touches no driver; then one
+driver per commit, each one gated by an amd64 TCG self-test and, for drivers TCG does not
+exercise (`rtw89`, `rtl8169`, `hda`, `touchpad`), a trashcan or ryzen boot.
 
 ## M2 tail, and the thread-probe flake (2026-11-10, afternoon)
 
