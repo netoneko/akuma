@@ -482,6 +482,17 @@ pub fn sys_exit_group_pub(code: i32) -> ! {
 
 pub(super) fn sys_exit_group(code: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
+        // One teardown per group. A sibling already claimed it: that sibling's
+        // `kill_thread_group` is (or will be) waiting for this thread to die, so
+        // die here, the way a posted deferred kill ends a thread at its EL0
+        // boundary. Running a second teardown would make the two wait on each
+        // other for the full 2 s grace (`SharedSignalTable::claim_group_exit`).
+        if !proc.signal_actions.claim_group_exit() {
+            akuma_exec::threading::mark_thread_terminated(akuma_exec::threading::current_thread_id());
+            loop {
+                akuma_exec::threading::yield_now();
+            }
+        }
         if akuma_config::FUTEX_DBG_ENABLED {
             akuma_primitives::tprint!(96, "[exit94] tid={} pid={} tgid={}\n",
                 akuma_exec::threading::current_thread_id(), proc.pid, proc.tgid);
@@ -1974,34 +1985,6 @@ pub fn sys_close_child_stdin(pid: u32) -> u64 {
         Ok(()) => 0,
         Err(_) => ESRCH,
     }
-}
-
-pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
-    if pid == 0 { return 0; }
-    // Linux: kill(pid <= 0, ...) targets a process group; we don't support
-    // those semantics, so return EPERM for "operation not permitted".
-    if pid <= 1 { return EPERM; }
-
-    // Box, then uid (`check_signal`). Before the probe below, so `kill(pid, 0)`
-    // cannot reveal a process in a box the caller cannot see.
-    if let Err(e) = akuma_exec::process::check_signal_pid(pid) {
-        return super::signal::deny_errno(e);
-    }
-
-    // sig=0 is a "does the process exist?" probe — don't actually send anything.
-    if sig == 0 {
-        return if akuma_exec::process::lookup_process_shared(pid).is_some() { 0 } else { ESRCH };
-    }
-
-    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED || akuma_config::SYSCALL_DEBUG_NET_ENABLED {
-        akuma_primitives::tprint!(96, "[signal] kill(pid={}, sig={})\n", pid, sig);
-    }
-
-    // Per-pid delivery (thread-group interrupt+pend, SIGKILL hard-kill, and
-    // the no-live-thread fallback) lives in `akuma_exec::process::deliver_signal`
-    // now, shared with `kill_foreground_group`'s per-member broadcast (used by the
-    // kernel's Ctrl-C/SIGINT handling — see `write_to_process_stdin`).
-    if akuma_exec::process::deliver_signal(pid, sig) { 0 } else { ESRCH }
 }
 
 #[cfg(feature = "akuma-native")]

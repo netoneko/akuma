@@ -2055,3 +2055,80 @@ was stuck in its timer list holding the BQL, with both vCPUs blocked on it mid-M
 was `akuma_lapic_amd64::start_timer` writing the periodic LVT before the new count, leaving a 32 ns
 periodic timer for one store. Unrelated to either slice. Fixed by zeroing the count first:
 `docs/archive/AMD64_LAPIC_PERIODIC_SWITCH_QEMU_LIVELOCK.md`.
+
+### Slice 3: signals (2026-11-11)
+
+`kill`, `tkill` and `tgkill` are one copy, glue's `signal::{sys_kill, sys_tkill, sys_tgkill}`, on
+every kernel. x86_64 62/200/234 go `to_glue`; the Taoxichuan arms call glue's functions by name;
+`crates/akuma-syscalls-glue-amd64/src/kill.rs` (237 lines) and the three amd64 wrappers in
+`amd64/src/signal.rs` are deleted, and so is glue's `proc::sys_kill`. The x86 body was the stronger
+one and became glue's: every signal, SIGKILL included, is pended on the target group and taken by
+each thread at its own return to user mode. AArch64 used to hand SIGKILL to `deliver_signal`, whose
+SIGKILL arm marks the victims' slots `TERMINATED` from the killer's core. That arm now serves only
+console Ctrl-C (`kill_foreground_group`).
+
+The decision `akuma_syscalls_signal::tkill_action` is now `{Drop, Pend, PendInterrupt}`. The
+pinned divergences, each a change for both kernels unless noted:
+
+| case | before | now |
+|---|---|---|
+| fatal default to the caller's own group (`ExitOwnGroup`) | AArch64 called `sys_exit_group` inside `tkill`; wrong exit on amd64 | pend + interrupt; the caller dies at the return it is about to make |
+| blocked fatal signal | amd64 interrupted the target's wait | pend only (a blocked signal never ends a wait) |
+| blocked default-ignore signal, or `SIG_IGN` + blocked | glue dropped it | pended, as on Linux (the disposition can change before unblock) |
+| SIGKILL to a tid with a stale table entry | depended on the disposition read | always pend + interrupt |
+| `kill(pid, SIGKILL)` on AArch64 | hard kill from the caller's core, 2 s grace for a victim stuck in the kernel | pend; a victim that never returns to user mode is no longer forced out |
+| amd64 Akuma 302 and `pidfd_send_signal(SIGKILL)` | reached `deliver_signal`'s hard kill, which amd64 cannot survive | pend (`pidfd_send_signal` now `EINVAL`s `sig > 64`) |
+| `tkill` of an unknown in-range tid | 0 | still 0 (Linux: `ESRCH`); pinned |
+| `kill(-pgid)` on AArch64 | `ESRCH` | works |
+
+**Two defects found by the gates and fixed in the slice:**
+
+1. **Every group SIGKILL cost 2 s on AArch64.** With SIGKILL pended on every thread, each thread
+   takes the fatal default and calls `sys_exit_group`; each one's `kill_thread_group` grace-waits for
+   its siblings, which are in their own grace waits. killtree read 2006-2016 ms on every round, with
+   25 `[ktg] grace expired` lines. Fix: Linux's `SIGNAL_GROUP_EXIT` as
+   `SharedSignalTable::claim_group_exit` (the table is shared by exactly the `CLONE_THREAD` group).
+   The first caller runs the teardown; a later one marks its own slot `TERMINATED` and parks, as a
+   posted deferred kill does at the EL0 boundary. amd64 does not use glue's `sys_exit_group`.
+2. **amd64 `kill` could fail with `EINTR` and send nothing.** Glue's dispatch prologue answers `EINTR`,
+   without running the call, while the caller's interrupt bit is up. amd64's own `sys_kill` was called
+   directly and never saw that gate. Once routed, `sigregs`'s `kill(child, SIGKILL)` raced a SIGUSR1
+   from the child landing on the other core, returned `EINTR`, and the child was orphaned: the boot
+   suite at `SMP=2` failed `sigregs: teardown leaks nothing` and `wait4: no children -> ECHILD` in 3
+   of 5 runs (the pre-slice kernel 0 of 7). Found with a temporary print in `sys_kill`: the failing
+   run had no SIGKILL from the parent at all. Fix: the signal senders join the signal-state calls the
+   gate exempts. Linux never fails `kill` with `EINTR`.
+
+Gates:
+
+- clippy clean on amd64 default, `no-tests`, `ring0-preempt`, `headless`, `headless,no-tests`,
+  `headless,kvm`, `--no-default-features`; AArch64 default, `no-tests`, the rump devbox set;
+  Taoxichuan x86_64 and aarch64. Host tests (`akuma-syscalls-signal` 17, glue, glue-amd64), unsafe
+  budget and address-param ratchets: ok.
+- AArch64 HVF boot suite 315 (`SMP=1`), 323 (`SMP=2`), 321 (`SMP=4`); the one `FAILED` line at 1 and
+  4 is `thread_slot_reclaim`'s own `SPAWN FAILED` print and is in the baseline log too.
+- amd64 TCG 836 (`SMP=1`), 846 (`SMP=2`, 8 of 8 runs, and `headless` 2 of 2), 846 (`SMP=4`).
+- killtree, 8 rounds of modes 1-4, AArch64 HVF `SMP=4`:
+
+  | | baseline (HEAD `63652251`) | this slice |
+  |---|---|---|
+  | SIGKILL browser, tree | 28-32 ms | 14-15 ms |
+  | SIGKILL group | `ESRCH`, per-pid fallback | 11-12 ms |
+  | SIGTERM group, 300 ms, SIGKILL | 2012-2015 ms | 312 ms (the 300 ms is the probe's pause) |
+  | worst tree | 2015 ms | 312 ms |
+  | `[ktg] grace expired` lines | 7 | 0 |
+
+- killtree on amd64 TCG `SMP=2`: PASS, worst 308 ms, SIGKILL rounds 34-110 ms, no grace expiry. Not
+  measured on the pre-slice amd64 kernel.
+- `abortsig`, `pthread_kill_eintr`, `sigsusprobe`: PASS on both. `sigprobe`: all 12 rungs on amd64.
+
+**Still open:**
+
+- **amd64 `setpgid` is a no-op outside a pty session** (`pty::sys_setpgid_gated` returns 0 and
+  changes nothing), so `kill(-pgid)` finds no group there and killtree passes on its per-pid
+  fallback. A process-group item, not a signals one.
+- **AArch64 `sigprobe` stops at rung 9**: a write to a present read-only page reports `si_code`
+  `SEGV_MAPERR` (1) where Linux reports `SEGV_ACCERR` (2). That is in the fault path, which this slice
+  did not touch, and was not compared against the baseline kernel.
+- AArch64 SIGKILL no longer forces out a thread that never returns to user mode. The deferred kill
+  posted by the teardown still does, after its 2 s grace.

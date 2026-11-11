@@ -641,11 +641,19 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // blocking app signals; a `SIGTERM` landing in between made that restore
     // fail, the signal stayed blocked, and the child slept on forever
     // (`docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
-    let signal_state = matches!(
+    //
+    // Nor do the signal-*sending* calls: they never block, and Linux's `kill(2)`
+    // has no `EINTR` at all. Answering it here meant a `kill` that ran while a
+    // signal to the caller was landing on another core did nothing and failed:
+    // the amd64 `sigregs` probe's `kill(child, SIGKILL)` was dropped that way and
+    // left the child orphaned, once `kill` came through glue
+    // (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md` "Slice 3: signals").
+    let never_interrupted = matches!(
         syscall_num,
         nr::RT_SIGPROCMASK | nr::RT_SIGACTION | nr::RT_SIGPENDING | nr::RT_SIGRETURN | nr::SIGALTSTACK
+            | nr::KILL | nr::TKILL | nr::TGKILL | nr::AKUMA_KILL | nr::PIDFD_SEND_SIGNAL
     );
-    if !signal_state && akuma_exec::process::is_current_interrupted() {
+    if !never_interrupted && akuma_exec::process::is_current_interrupted() {
         // **`EINTR`, and nothing else.**
         //
         // This used to also stamp the caller `exited = true`, `exit_code = 130`,
@@ -846,7 +854,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(all(feature = "exec", feature = "akuma-native"))]
         nr::SPAWN => flat(proc::sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5])),
         #[cfg(feature = "akuma-native")]
-        nr::AKUMA_KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
+        nr::AKUMA_KILL => signal::sys_kill(args[0], args[1]),
         #[cfg(feature = "sc-reboot")]
         nr::REBOOT => reboot::sys_reboot(args[0] as u32, args[1] as u32, args[2] as u32),
         #[cfg(feature = "akuma-native")]
@@ -921,7 +929,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRESUID => cred::sys_getres(args[0], args[1], args[2], false),
         nr::GETRESGID => cred::sys_getres(args[0], args[1], args[2], true),
         nr::GETGROUPS => cred::sys_getgroups(args[0] as i32, args[1]),
-        nr::KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
+        nr::KILL => signal::sys_kill(args[0], args[1]),
         nr::SETPGID => proc::sys_setpgid(args[0] as u32, args[1] as u32),
         nr::GETPGID => proc::sys_getpgid(args[0] as u32),
         nr::SETSID => proc::sys_setsid(),

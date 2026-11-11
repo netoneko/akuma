@@ -1267,19 +1267,12 @@ fn signal(call: Syscall, a: [u64; 6]) -> Option<u64> {
         Syscall::RtSigaction
         | Syscall::RtSigprocmask
         | Syscall::Sigaltstack => to_glue(call, [a1, a2, a3, a4, a5, a6]),
-        // `kill(2)` is this target's since 2026-10-09: glue's hands SIGKILL to
-        // the AArch64 hard-kill path, which this kernel cannot survive under
-        // load (`crate::signal::sys_kill` has the measurements). Every signal
-        // is pended and the wait interrupted; `signal::deliver_pending` owns
-        // the fatality, as it does for `tkill`.
-        Syscall::Kill => crate::signal::sys_kill(a1, a2),
-        // **Not** glue's, and `crate::signal::sys_tkill`'s doc comment is the
-        // reason: glue decides a fatal default *inline* by calling
-        // `sys_exit_group`, which on this target leaves ring 3 through the wrong
-        // epilogue. Here every signal is pended and `signal::deliver_pending`
-        // owns every fatality decision.
-        Syscall::Tkill => crate::signal::sys_tkill(a1 as u32, a2 as u32),
-        Syscall::Tgkill => crate::signal::sys_tgkill(a1 as u32, a2 as u32, a3 as u32),
+        // Glue's since 2026-11-11, one copy for both kernels: every signal,
+        // SIGKILL included, is pended and the waits interrupted, and
+        // `signal::deliver_pending` owns every fatality decision here, as
+        // `apply_default_signal_action` does on AArch64 (`akuma_syscalls_glue::
+        // signal::sys_kill` and `sys_tkill` have the history).
+        Syscall::Kill | Syscall::Tkill | Syscall::Tgkill => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         // Glue's: it takes from the same per-thread pending set
         // `crate::signal`'s delivery does (`threading::take_pending_signal`).
         Syscall::RtSigtimedwait => to_glue(call, [a1, a2, a3, a4, 0, 0]),

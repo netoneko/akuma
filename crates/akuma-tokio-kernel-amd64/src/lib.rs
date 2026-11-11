@@ -1465,15 +1465,15 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             e(ring3::err::ENOSYS)
         }
-        // `tkill`/`tgkill`: the x86 kernels' shared bodies - pend on the thread, and interrupt
+        // `tkill`/`tgkill`: glue's, shared by every kernel - pend on the thread, and interrupt
         // it only when the default action kills (setting the flag on the caller of musl's
         // `raise` made the mask restore after it fail with EINTR).
-        akuma_syscalls_abi::x86_64::TKILL => akuma_syscalls_glue_amd64::kill::tkill(fr.arg1() as u32, fr.arg2() as u32),
-        // `kill`: the x86 kernels' shared body - pend on the target group, each thread takes it
-        // at its own next return to ring 3.
-        akuma_syscalls_abi::x86_64::KILL => akuma_syscalls_glue_amd64::kill::kill(fr.arg1(), fr.arg2()),
+        akuma_syscalls_abi::x86_64::TKILL => akuma_syscalls_glue::signal::sys_tkill(fr.arg1() as u32, fr.arg2() as u32),
+        // `kill`: glue's, shared by every kernel since 2026-11-11 - pend on the target group,
+        // each thread takes it at its own next return to ring 3.
+        akuma_syscalls_abi::x86_64::KILL => akuma_syscalls_glue::signal::sys_kill(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::TGKILL => {
-            akuma_syscalls_glue_amd64::kill::tgkill(fr.arg1() as u32, fr.arg2() as u32, fr.arg3() as u32)
+            akuma_syscalls_glue::signal::sys_tgkill(fr.arg1() as u32, fr.arg2() as u32, fr.arg3() as u32)
         }
         other => {
             // A guest task hit a number this table does not serve; the errno

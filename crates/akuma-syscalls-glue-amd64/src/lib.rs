@@ -34,8 +34,6 @@
 
 extern crate alloc;
 
-pub mod kill;
-
 use akuma_exec::process::FileDescriptor;
 use akuma_syscalls_abi::Syscall;
 use akuma_syscalls_glue as glue;
