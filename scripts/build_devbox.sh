@@ -12,7 +12,7 @@ set -e
 # Omitted vs. the default set: `smoltcp` (rump is the only stack). Boot with RUMP_NIC=1 (overlays/devbox/run.sh does that).
 #
 # Extra args are forwarded (e.g. `scripts/build_devbox.sh --quiet`).
-DEVBOX_FEATURES="rump-default,userspace-sshd,sc-reboot,sound,no-tests,sc-aio,sc-sysv-ipc,sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
+DEVBOX_FEATURES="rump-default,userspace-sshd,sc-reboot,sound,no-tests,linux-extra-syscalls"
 cargo build \
     --release \
     --no-default-features \

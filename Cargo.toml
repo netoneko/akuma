@@ -271,8 +271,7 @@ default = [
     "smoltcp",
     "sound",
     "fs-cache",
-    "sc-aio", "sc-sysv-ipc", "sc-containers",
-    "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
+    "linux-extra-syscalls",
     # Linux reboot(2) -> PSCI SYSTEM_RESET/SYSTEM_OFF. In `default` since
     # 2026-08-25 — see the `sc-reboot` feature definition below for why it was
     # gated and why that reason no longer applies.
@@ -445,8 +444,12 @@ extreme = ["akuma-exec/extreme", "akuma-ext2/extreme", "akuma-primitives/extreme
 # cache at all) — akuma-ext2's build.rs gates the cfg on that.
 fs-cache = ["akuma-ext2/fs-cache", "akuma-kernel-tests-aarch64/fs-cache"]
 
-# Per-family syscall gates. Default-on so `cargo build`/`run`/`test` keep every
-# syscall; the minimal builds use --no-default-features and re-add what they want.
+# Per-family syscall gates, normally selected together as `linux-extra-syscalls`.
+# The seven families together: what a Linux program expects beyond the core set.
+# In `default`; `extreme-size` builds without it. The families stay individually
+# settable for an image that wants some of them. `sc-reboot` is NOT a member: only
+# the AArch64 kernel has it, and the group means the same thing on both kernels.
+linux-extra-syscalls = ["sc-aio", "sc-sysv-ipc", "sc-containers", "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll"]
 # Tier 1 — pure dead weight, no akuma-exec callbacks.
 sc-aio          = ["akuma-syscalls-glue/sc-aio"]
 sc-sysv-ipc     = ["dep:akuma-syscalls-ipc", "akuma-vfs-glue/sc-sysv-ipc", "akuma-syscalls-glue/sc-sysv-ipc"]

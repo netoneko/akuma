@@ -1,6 +1,7 @@
 {
   "common": [
     "fs-cache",
+    "linux-extra-syscalls",
     "no-tests",
     "sc-aio",
     "sc-containers",

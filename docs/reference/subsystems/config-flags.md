@@ -32,9 +32,14 @@ Source: `Cargo.toml:73-105`.
 `default` (`Cargo.toml:109-124`):
 ```
 smp-shared, smoltcp, sound, fs-cache,
-sc-aio, sc-sysv-ipc, sc-containers,
-sc-timerfd, sc-eventfd, sc-pidfd, sc-epoll
+linux-extra-syscalls, sc-reboot
 ```
+
+`linux-extra-syscalls` is the group of the seven `sc-*` families (`sc-aio`,
+`sc-sysv-ipc`, `sc-containers`, `sc-timerfd`, `sc-eventfd`, `sc-pidfd`,
+`sc-epoll`), with the same name and members on amd64. The families stay
+individually settable. `sc-reboot` is outside it because only the AArch64
+kernel has it.
 
 There is no `neko`/`kernel-tls`/`tls-rsa` feature anymore — the in-kernel
 editor, shell, and all in-kernel cryptography were deleted outright on

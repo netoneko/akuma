@@ -16,7 +16,11 @@ workspace = true
 # cfg — a build without it would run four cores with no lock at all. Enforced by
 # a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
 # rather than booting corrupt.
-default = ["smp-shared", "fs-cache", "sc-epoll", "sc-eventfd", "sc-timerfd", "sc-pidfd", "sc-aio", "sc-sysv-ipc", "sc-containers"]
+default = ["smp-shared", "fs-cache", "linux-extra-syscalls"]
+# The seven families together: what a Linux program expects beyond the core set.
+# In `default`. The families stay individually settable. Same name and members as
+# the AArch64 kernel's group, whose `sc-reboot` is deliberately outside it.
+linux-extra-syscalls = ["sc-aio", "sc-sysv-ipc", "sc-containers", "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll"]
 # Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
 # to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
 # `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.

@@ -1396,3 +1396,8 @@ which leaves one less networking difference between them. Details and gates are 
 the AArch64 kernel reads a boot command line, which would let box 0's stack be chosen at boot
 (`AKUMA_FEATURE_AUDIT.md`). The default AArch64 image is 81 KB lighter in `.text`. On this
 point it now matches amd64, which never had rump.
+
+## F4: `linux-extra-syscalls` (2026-11-11)
+
+The seven `sc-*` families are one group on both kernels, under the same name. Images are
+byte-identical (`AKUMA_FEATURE_AUDIT.md`).

@@ -18,7 +18,7 @@ apart entirely by feature set, not profile.
 
 | Target | Profile | Build command | Networking | Purpose |
 |---|---|---|---|---|
-| **release** (default) | `release` | `cargo build --release` / `cargo run --release` | smoltcp (native) + userspace `/bin/sshd`; rump not compiled in (`--features rump` makes it available per box) | Day-to-day development image. Full `default` feature set: sound, real shared-kernel SMP (`smp-shared`), all `sc-*` syscall families. No in-kernel TLS/shell/editor — those were deleted 2026-08-10, see [below](#there-is-no-built-in-ssh-server). |
+| **release** (default) | `release` | `cargo build --release` / `cargo run --release` | smoltcp (native) + userspace `/bin/sshd`; rump not compiled in (`--features rump` makes it available per box) | Day-to-day development image. Full `default` feature set: sound, real shared-kernel SMP (`smp-shared`), `linux-extra-syscalls` (every `sc-*` family). No in-kernel TLS/shell/editor — those were deleted 2026-08-10, see [below](#there-is-no-built-in-ssh-server). |
 | **extreme-size** | `extreme-size` (inherits `release`) | `scripts/build_extreme_size.sh` | smoltcp + userspace `/bin/sshd`, **no HTTPS** | 4 MB RAM floor target. `opt-level = "z"`, LTO, `codegen-units = 1`, tighter stack/heap constants via `cfg(kernel_profile_extreme)`. No in-kernel TLS anywhere in this tree (not extreme-specific — see below); use a userspace HTTPS tool. Compiles again since `fix-extreme-size` — see [Fixed](#fixed-extreme-size-build-breakage-was-broken-at-d3f28d6). |
 | **devbox** | `release` | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | **rump only** (no smoltcp) | *(deferred — see `devbox-smoltcp`.)* Rump-stack workstation image: NetBSD rump as box 0's default stack. `--no-default-features`, so smoltcp is compiled out. |
 | **devbox-smoltcp** (default devbox) | `release` | `scripts/build_devbox_smoltcp.sh` / `overlays/devbox/run-smoltcp.sh` | smoltcp (native) + userspace `/bin/sshd` | The **default** "develop inside Akuma" image (2026-07-19). Native smoltcp stack for box 0 + real shared-kernel SMP (`SMP=N`). Keeps the default feature set layered on top (`+= devbox-smoltcp,no-tests`, no `--no-default-features`). rump_server work is deferred. |
@@ -187,7 +187,7 @@ extreme vs release) and two open defects it surfaced:
 
 `release` builds with cargo's normal default feature resolution: `smp-shared`
 (which includes the BKL carve-outs), `smoltcp`, `sound`, `fs-cache`,
-and all eight `sc-*` syscall families (`Cargo.toml:126-142`).
+`linux-extra-syscalls` (the seven `sc-*` families) and `sc-reboot`.
 There is no `neko`/`kernel-tls`/`tls-rsa` to drop anywhere — those features
 were deleted from `Cargo.toml` entirely (commit `bade6ab` for TLS,
 `e9d08f1` for the editor) rather than being opt-out. `devbox`/`extreme-size`

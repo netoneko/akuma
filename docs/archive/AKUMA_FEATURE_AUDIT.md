@@ -123,6 +123,20 @@ predicted to suit it (`REDIS_ROUND_TRIP_CEILING.md`). Removed:
 `[NICSTAT]` keeps its `orphan`/`tx_stall` columns, always 0, so parsers do not shift.
 `akuma-net-nic`'s unsafe budget went from 13 to 9. The default image's sections are unchanged.
 
+## F4 applied: `linux-extra-syscalls` (2026-11-11)
+
+Both kernels have `linux-extra-syscalls` = the seven `sc-*` families, in `default`. Every script
+already selected all seven or none, so the devbox lists name the group. The families stay
+individually settable. `sc-reboot` is not a member, because only AArch64 has it. The parity
+baseline gains one common name (12).
+
+Verification:
+
+- AArch64: the default, devbox and `extreme-size` images have the same sections as before. The
+  `extreme-size` size did not move.
+- amd64: the default image's `.text` is byte-identical to a build listing the seven families
+  explicitly.
+
 ## F5 applied: `rump` out of `default`, `rump-tests` and `devbox` folded (2026-11-11)
 
 - `rump` is off by default. Acceptance 11 builds `--features rump`.

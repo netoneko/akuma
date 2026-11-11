@@ -30,7 +30,7 @@ CLI feature anymore.
 |---|---|---|---|---|
 | `release` | `release` | `panic=abort` | (plain `cargo run --release`) | full `default` (includes `smp-shared`) |
 | `extreme-size` | `extreme-size` | inherits `release` + `opt-level=z`, LTO, `codegen-units=1`, `strip`, `panic=immediate-abort` | `scripts/build_extreme_size.sh` (+ `extreme` feature) | `--no-default-features`; `no-tests,smoltcp,extreme,userspace-sshd` |
-| `devbox` (rump-only, deferred) | `release` | inherits release | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | `--no-default-features`; `rump-default,userspace-sshd,sc-reboot,sound,no-tests`, all `sc-*` |
+| `devbox` (rump-only, deferred) | `release` | inherits release | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | `--no-default-features`; `rump-default,userspace-sshd,sc-reboot,sound,no-tests,linux-extra-syscalls` |
 | `devbox-smoltcp` (default devbox) | `release` | inherits release | `scripts/build_devbox_smoltcp.sh` / `overlays/devbox/run-smoltcp.sh` | `default` + `devbox-smoltcp,no-tests` (**no** `--no-default-features`) |
 
 `devbox-smoltcp` is the default "develop inside Akuma" image; it layers its

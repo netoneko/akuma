@@ -29,8 +29,7 @@ state:
     # rump devbox at SMP=4 — build_devbox.sh is --no-default-features, so smp-shared
     # has to be added explicitly or the secondaries are never brought up:
     cargo build --release --no-default-features --features \
-      "rump-default,userspace-sshd,sc-reboot,sound,no-tests,smp-shared,sc-aio,sc-sysv-ipc,\
-sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
+      "rump-default,userspace-sshd,sc-reboot,sound,no-tests,smp-shared,linux-extra-syscalls"
     rust-objcopy -O binary target/aarch64-unknown-none/release/akuma /tmp/schedaudit-rump.bin
 
 To build a baseline arm from a tree that already has the fix, stash just the two
