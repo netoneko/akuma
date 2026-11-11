@@ -1888,3 +1888,38 @@ and headless SMP=1 829/0, SMP=2 839/0; AArch64 `cargo check`. **Compile-only:** 
 runs under TCG's PVH boot (no PCI scan, no i8042 probe on that path), so their first boot is the
 ryzen rig or the metal.
 
+## The convergence, re-evaluated against the tree (2026-11-11, evening)
+
+"The big merge" is one kernel build for both architectures: the neutral half shared, two machine
+halves. With the drivers out, `amd64/src` is 33 kL. What is still a second copy of something AArch64
+gets from a shared crate turns out to be much narrower than the 9.3 plan assumed. The checks behind
+that:
+
+- **Already shared:** the process model (`akuma_exec::process::Process`), the fd table (both kernels'
+  `SharedFdTable`; amd64 adds a `KERNEL_TABLE` fallback for kernel tasks with no process, which the
+  boot suite runs as), the address-space type (`akuma_mmu::UserAddressSpace`, which grew an x86_64 walker
+  in B3), the scheduler (`akuma-threading`'s hooked path) and the whole of `akuma-syscalls-glue`, which
+  amd64 builds with the same `akuma-native` feature set as AArch64. Glue's families no longer name the
+  AArch64 walker (`akuma_mmu`: 0 references in `fs`/`mem`/`net`/`sync`/`signal`/`proc`).
+- **The dispatcher is mostly glue already:** 95 of the 136 decoded arms in
+  `amd64/src/usermode/dispatch.rs` hand the call to glue (`to_glue`, which converts the number to
+  asm-generic). The x86-only legacy spellings (`open`, `stat`, `fork`, ...) stay amd64's by rule, since
+  they have no asm-generic number.
+- **What is still local**, and is the convergence:
+
+| family | amd64 copy | glue's | why it stayed local | plan |
+|---|---|---|---|---|
+| sockets | `sock.rs` (818 L, wiring over `akuma_net::socket`) | `net.rs` | both wire the same crate; never folded | route to glue, delete |
+| futex | `futex.rs` (450 L, effects over `akuma-syscalls-sync`) | `sync.rs` | glue's used `akuma_exec::threading` when amd64 had its own scheduler (the `amd64/Cargo.toml` note is from then); both are on `akuma-threading` now | route to glue, delete |
+| signals | `kill`/`tkill`/`tgkill` via `akuma-syscalls-glue-amd64::kill`; `rt_sigreturn` and delivery | `signal.rs`/`proc.rs` | the x86 `kill -9` fix went into the x86 copy | diff the two, keep the stronger, one copy; sigframe and `rt_sigreturn` stay per-arch |
+| fd I/O | `fd.rs` (3.8 kL): read/write/open/stat/dup/fcntl/ioctl/poll/select/getdents | `fs.rs`/`poll.rs` | device kinds glue does not know (`DevKvm`, `DevTun`, `DevWifi`, `DevFb`, `DevMouse`, `DevPower`) and x86 `struct stat`/open-flag translation | device kinds through `SyscallHooks` (it already carries `dev_mouse_has_events`/`dev_tun_has_frame`); x86 ABI translation from `akuma-syscalls-glue-amd64`, which the tokio kernel already uses for exactly this; then route |
+| mm | `mm.rs` (3.5 kL) | `mem.rs` | shared-writable file pages (`shmpages`), `/dev/fb0` and `/dev/kvm` mappings, the fork walk (M3) | last: diff per call, hooks for the device mappings |
+| threads | `thread.rs` `clone(CLONE_VM)` | `proc.rs` clone | the per-arch TLS/stack register setup | glue's decision, arch hook for the register file |
+
+Order: sockets, futex, signals, fd, mm, threads. Small to large, and each slice is independently
+revertible. Per slice: route the arms to glue, delete the local body, then gate with clippy on every
+amd64 feature set, the amd64 TCG suite at SMP=1/2, the `c_stress` probes for that family through the
+amd64 harness (`scripts/utils/amd64_*.py`), the AArch64 HVF suite where glue itself changed, and the
+ryzen Firecracker lane before the slice counts as done. Every divergence found between the two copies
+gets pinned in the slice's commit (research doc §7), not silently resolved.
+
