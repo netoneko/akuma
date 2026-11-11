@@ -49,6 +49,25 @@ pub mod open {
     /// writes) take their `.tmp` + `renameat` fallback instead of writing into
     /// a directory fd.
     pub const O_TMPFILE: u32 = 0o20040000;
+
+    /// Whether a descriptor opened with `flags` may be read.
+    ///
+    /// Access mode `O_RDONLY` or `O_RDWR`, and not `O_PATH`. Linux answers
+    /// `read`/`pread` on any other descriptor with `EBADF`; mode 3 (neither
+    /// read nor write) is not readable either.
+    #[must_use]
+    pub const fn may_read(flags: u32) -> bool {
+        flags & O_PATH == 0 && matches!(flags & O_ACCMODE, O_RDONLY | O_RDWR)
+    }
+
+    /// Whether a descriptor opened with `flags` may be written.
+    ///
+    /// Access mode `O_WRONLY` or `O_RDWR`, and not `O_PATH`. Otherwise
+    /// `write`/`pwrite` is `EBADF`, as on Linux.
+    #[must_use]
+    pub const fn may_write(flags: u32) -> bool {
+        flags & O_PATH == 0 && matches!(flags & O_ACCMODE, O_WRONLY | O_RDWR)
+    }
 }
 
 /// `*at(2)` `flags` bits and the `AT_FDCWD` sentinel.
@@ -332,6 +351,19 @@ mod tests {
             assert_eq!(f & open::O_ACCMODE, 0, "flag {f:#o} collides with O_ACCMODE");
         }
         assert_eq!(open::O_RDWR & open::O_ACCMODE, open::O_RDWR);
+    }
+
+    /// The access mode decides read and write permission; the other open flags do not,
+    /// except `O_PATH`, which grants neither.
+    #[test]
+    fn access_mode_grants_read_and_write() {
+        use open::{may_read, may_write, O_CLOEXEC, O_CREAT, O_PATH, O_RDONLY, O_RDWR, O_WRONLY};
+        assert!(may_read(O_RDONLY) && !may_write(O_RDONLY));
+        assert!(!may_read(O_WRONLY) && may_write(O_WRONLY));
+        assert!(may_read(O_RDWR) && may_write(O_RDWR));
+        assert!(!may_read(3) && !may_write(3), "mode 3 is neither");
+        assert!(may_write(O_WRONLY | O_CREAT | O_CLOEXEC) && !may_read(O_WRONLY | O_CREAT | O_CLOEXEC));
+        assert!(!may_read(O_PATH) && !may_write(O_PATH | O_RDWR));
     }
 
     /// No two `mmap` flags may share a bit, and none may be zero — a zero flag

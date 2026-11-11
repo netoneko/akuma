@@ -113,6 +113,8 @@ errno_table! {
     ERANGE = 34;
     ENOSYS = 38;
     ENOTEMPTY = 39;
+    /// Too many levels of symbolic links, and `open(O_NOFOLLOW)` on a symlink.
+    ELOOP = 40;
     ENOMSG = 42;
     /// The fd is not a socket.
     ///
@@ -243,6 +245,8 @@ mod tests {
             ("ERANGE", ERANGE, 34),
             ("ENOSYS", ENOSYS, 38),
             ("ENOTEMPTY", ENOTEMPTY, 39),
+            // Added 2026-11-11 for `openat`'s `O_NOFOLLOW` refusal (glue).
+            ("ELOOP", ELOOP, 40),
             ("EDESTADDRREQ", EDESTADDRREQ, 89),
             // Added 2026-08-23 for the AF_UNIX socket family
             // (`akuma_net_unix`); no history under the old tables.

@@ -4440,7 +4440,7 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
 // `current_stdout_pipe`.** They answered "which pipe serves this task's fd
 // 0/1/2" out of the `Spawn` row, and every read, write and poll of an unbound
 // 0/1/2 called one of them. A spawned child's stdio is descriptors now, so
-// `fd::pipe_read_id`/`pipe_write_id` answer the same question from the table
+// the descriptor table answers the same question (`fd::pipe_read_id`), the one
 // the rest of the module already trusts, and an unbound 0/1/2 means exactly
 // one thing again: the console.
 //

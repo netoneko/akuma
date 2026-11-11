@@ -535,15 +535,6 @@ pub fn is_dev_fb(fd: u64) -> bool {
     table_with(fd, |d| matches!(d, FileDescriptor::DevFb)).unwrap_or(false)
 }
 
-/// The pipe id behind `fd` if it is a `PipeWrite` descriptor.
-#[must_use]
-pub fn pipe_write_id(fd: u64) -> Option<usize> {
-    table_get(fd).and_then(|d| match d {
-        FileDescriptor::PipeWrite(p) => Some(p as usize),
-        _ => None,
-    })
-}
-
 /// Is `fd` marked `O_NONBLOCK`? `false` for anything not in the table.
 ///
 /// Read from the table's `nonblock` set — keyed by **fd number**, which is
@@ -663,11 +654,9 @@ pub fn trace_user_cstr(ptr: u64) {
 /// symlink through glue like everything else under `/proc`, and an `ssh`
 /// session's `^C` becomes a `SIGINT` instead of a `0x03` byte.
 ///
-/// **3. The refusals glue's `openat_path` does not make** (`O_DIRECTORY`,
-/// `O_EXCL`, `O_NOFOLLOW`, `O_CREAT` on a directory) are
-/// `akuma_syscalls_glue_amd64::openat_resolved`'s, the x86 kernels' one copy,
-/// which this function ends in. `docs/archive/AKUMA_AMD64_4B_FOLD_BATCH2D.md`
-/// § "The three flags" records why they are not in glue itself yet.
+/// **3. The flag refusals** (`O_DIRECTORY`, `O_EXCL`, `O_NOFOLLOW`, `O_CREAT`
+/// on a directory) are glue's `openat_path`'s, for both kernels, since
+/// 2026-11-11 (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "Slice 4: fd").
 ///
 /// **4. A block node is `ENODEV`, not a raw descriptor.** Glue serves
 /// `/dev/vdX` as a `BlockDev` descriptor (`docs/archive/RAW_BLOCK_DEVICE_FD.md`);
@@ -729,11 +718,9 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
         return errno::EMFILE;
     }
 
-    // The four refusals glue's `openat_path` leaves to its caller (`O_NOFOLLOW`
-    // on a symlink, `O_CREAT` on a directory, `O_DIRECTORY` on a file,
-    // `O_EXCL` on anything present), then glue's arm: the x86 kernels' shared
-    // body, the one Taoxichuan runs.
-    akuma_syscalls_glue_amd64::openat_resolved(dirfd, &resolved, flags, mode)
+    // Glue's arm, refusals and this kernel's devices included. The path is
+    // absolute, so glue does not resolve it a second time.
+    akuma_syscalls_glue::flat(akuma_syscalls_glue::fs::openat_path(dirfd as i32, &resolved, flags, mode as u32))
 }
 
 /// The `open(2)` flag bits, **asm-generic encoding** — the tree's own table,
@@ -922,26 +909,22 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     akuma_syscalls_glue_amd64::read(fd, buf, len)
 }
 
-/// `pread64(fd, buf, count, offset)` — x86_64 syscall 17. **Glue's arm** (4b
-/// batch 3a) behind the errno this target refuses to give up.
+/// `pread64(fd, buf, count, offset)` — x86_64 syscall 17. **Glue's arm**,
+/// behind this kernel's unbound console descriptors.
 ///
 /// A read from an explicit offset that **does not move the descriptor's
 /// cursor**. That is the whole difference from [`sys_read`], and it is why the
 /// two are separate arms in glue as well.
 ///
-/// # `ESPIPE` is the preamble
+/// # `ESPIPE`
 ///
 /// A pipe, socket or console descriptor has no offset to read from, and Linux
 /// says `ESPIPE` for that — a *seekability* answer, distinct from "no such
-/// descriptor". Glue's arm answers `_ => EBADF` for all three, and the
-/// difference is not cosmetic: **musl's `FILE` layer falls back to `read()` on
-/// `ESPIPE` and gives up on `EBADF`**, so the wrong one turns a working
-/// unseekable stream into a closed file. Moving this into glue is a behaviour
-/// change on the AArch64 kernel, whose verification loop does not run on this
-/// machine, so it stays here and is stated rather than assumed absent.
-///
-/// Asked ahead of the table lookup, so the answer is about the *kind* of
-/// descriptor rather than about whether a file happens to sit behind it.
+/// descriptor": **musl's `FILE` layer falls back to `read()` on `ESPIPE` and
+/// gives up on `EBADF`**. Glue answers it for every descriptor without a
+/// position (`userspace/forktest/c_stress/fdrefuse.c`). The one case left here
+/// is a console end that is not in the table at all, which glue would call
+/// `EBADF`.
 ///
 /// # Why this exists at all
 ///
@@ -961,15 +944,8 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    // See the header. A `/dev` character node **is** seekable — `pread` on
-    // `/dev/zero` is ordinary — so the nodes are deliberately not in this
-    // guard; glue serves all three, and the offset changes nothing for any of
-    // them.
-    if socket_index(fd).is_some()
-        || pipe_read_id(fd).is_some()
-        || pipe_write_id(fd).is_some()
-        || console_end(fd).is_some()
-    {
+    // See the header: an unbound console end, which glue cannot see.
+    if console_end(fd).is_some() && !is_bound(fd) {
         return errno::ESPIPE;
     }
     akuma_syscalls_glue_amd64::pread64(fd, buf, len, offset)
@@ -1132,7 +1108,7 @@ pub fn is_regular_file(fd: u64) -> bool {
 }
 
 /// `Some(EBADF)` when `fd` names a regular file opened `O_RDONLY`, `None`
-/// otherwise. `write(2)` gets this refusal from `akuma_syscalls_glue_amd64::write`;
+/// otherwise. `write(2)` gets this refusal from glue's `sys_write`;
 /// `mm::sys_mmap` asks it to refuse a shared-writable mapping of such an fd.
 #[must_use]
 pub fn write_mode_refusal(fd: u64) -> Option<u64> {
@@ -1148,9 +1124,8 @@ pub fn write_mode_refusal(fd: u64) -> Option<u64> {
 ///
 /// A forward, not a second implementation, and the same shape as
 /// [`sys_close`]: the dispatcher's `write` arm is `usermode::sys_write`, which
-/// keeps the serial console and hands everything else here. The
-/// `O_RDONLY` refusal is glue-amd64's, so a kernel-side check gets the answer
-/// ring 3 gets.
+/// keeps the serial console and hands everything else here. The `O_RDONLY`
+/// refusal is glue's, so a kernel-side check gets the answer ring 3 gets.
 ///
 /// Named `_file` because that is what its callers write to; it will serve a
 /// pipe, a socket or a `/dev` node just as well, since glue's arm dispatches on
@@ -1273,23 +1248,13 @@ fn console_has_input() -> bool {
 }
 
 
-/// `lseek(fd, offset, whence)` — **served by `akuma-syscalls-glue`** (4b batch
-/// 3a), behind one arm this kernel keeps.
+/// `lseek(fd, offset, whence)` — **served by `akuma-syscalls-glue`**, with the
+/// register decode this target needs.
 ///
-/// # The one arm that stays
-///
-/// A `/dev` character node. Linux seeks one to exactly the offset asked for —
-/// `/dev/null` and `/dev/zero` are contentless and infinite, so no position is
-/// out of range and none of them means anything — and glue answers `0` for
-/// `DevNull`/`DevZero` and `ESPIPE` for `DevUrandom`/`DevTty`, which has no
-/// arm at all. Handing this over would trade a Linux answer for a matching
-/// one; fixing it in glue is a behaviour change on the AArch64 kernel, whose
-/// verification loop does not run on this machine (batch 2d records the same
-/// call for `openat`'s three flags). So it is a stated divergence, asked with
-/// one table lookup, ahead of the delegation.
-///
-/// The cursor stays at 0 for all three whences because nothing moves it: the
-/// read and write arms never touch a node's `position`.
+/// This kernel kept one arm of its own until 2026-11-11: a `/dev` character
+/// node, seeked to the offset asked for. Linux answers `0` for `/dev/null`,
+/// `/dev/zero` and `/dev/urandom` whatever the offset
+/// (`userspace/forktest/c_stress/fdrefuse.c`), which is glue's answer now.
 ///
 /// # What the fold gained
 ///
@@ -1305,27 +1270,6 @@ fn console_has_input() -> bool {
 ///   `EBADF` — glue separates the two, where this arm's console guard could
 ///   not.
 pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
-    // See the header. Ahead of the delegation, and one table lookup with no I/O
-    // behind it.
-    //
-    // **`/dev/tty` is excluded**, and it is the reason this test is no longer
-    // `is_some()`. A terminal is not seekable and Linux answers `ESPIPE` for
-    // one; glue's arm already does exactly that (its `_ =>` after the
-    // `DevNull`/`DevZero` and `File`/`BlockDev` arms). Before the console
-    // channel landed the exclusion was unnecessary because a `DevTty`
-    // descriptor could not exist here — glue's `openat` refused `/dev/tty` with
-    // `ENODEV` for want of a terminal channel. It can exist now, and without
-    // this it would seek to whatever offset it was handed.
-    if dev_node_of(fd).is_some_and(|n| n != "tty") {
-        const SEEK_SET: u64 = 0;
-        const SEEK_CUR: u64 = 1;
-        const SEEK_END: u64 = 2;
-        if !matches!(whence, SEEK_SET | SEEK_CUR | SEEK_END) {
-            return errno::EINVAL;
-        }
-        let delta = offset.cast_signed();
-        return if delta < 0 { errno::EINVAL } else { delta as u64 };
-    }
     akuma_syscalls_glue::fs::sys_lseek(
         // Truncating rather than refusing a number past `u32`: glue's own
         // dispatch spells `args[0] as u32`, so a folded arm must decode the

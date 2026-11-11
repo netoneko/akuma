@@ -355,6 +355,13 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         (proc.pid, fd)
     };
     rec.lap(crate::utils::read_profile::S_FD);
+    // A file not opened for reading (`O_WRONLY`, `O_PATH`) is `EBADF`, as on Linux
+    // (`userspace/forktest/c_stress/fdrefuse.c`).
+    if let akuma_exec::process::FileDescriptor::File(ref f) = fd
+        && !akuma_syscalls_linux::flags::open::may_read(f.flags)
+    {
+        return EBADF;
+    }
 
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
         akuma_primitives::safe_print!(128, "[syscall] read(stdin, count={})\n", count);
@@ -985,15 +992,21 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
 /// `pread64(fd, buf, count, offset)`.
 ///
-/// `pub` since the amd64 `pread64` preamble delegates to it (4b batch 3a),
-/// behind the two answers that kernel keeps: a `len == 0` short-circuit and
-/// `ESPIPE` — not the `_ => EBADF` below — for a pipe, socket or console
-/// descriptor.
+/// A descriptor with no file position (a pipe, socket, terminal, eventfd, a
+/// kernel's own character device) is `ESPIPE`, and a file not opened for
+/// reading is `EBADF`, as on Linux (`userspace/forktest/c_stress/fdrefuse.c`).
+/// `pub` since amd64's `pread64` delegates to it, behind the one answer that
+/// kernel keeps: its unbound console descriptors, which are not in the table.
 pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
     if offset < 0 { return EINVAL; }
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
+    if let akuma_exec::process::FileDescriptor::File(ref f) = fd
+        && !akuma_syscalls_linux::flags::open::may_read(f.flags)
+    {
+        return EBADF;
+    }
 
     match fd {
         akuma_exec::process::FileDescriptor::File(ref f) => {
@@ -1037,15 +1050,24 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
         }
         akuma_exec::process::FileDescriptor::TimerFd(_) => EAGAIN,
         akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
-        _ => EBADF
+        // A block device has a position and Linux serves `pread` on one; this
+        // arm does not, and `ESPIPE` would tell the caller it is a stream.
+        akuma_exec::process::FileDescriptor::BlockDev { .. } => EBADF,
+        _ => ESPIPE
     }
 }
 
+/// `pwrite64(fd, buf, count, offset)`: the refusals of [`sys_pread64`], for writing.
 pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
     if offset < 0 { return EINVAL; }
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
+    if let akuma_exec::process::FileDescriptor::File(ref f) = fd
+        && !akuma_syscalls_linux::flags::open::may_write(f.flags)
+    {
+        return EBADF;
+    }
 
     match fd {
         akuma_exec::process::FileDescriptor::File(ref f) => {
@@ -1062,7 +1084,9 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
             }
         }
         akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom | akuma_exec::process::FileDescriptor::DevZero => count as u64,
-        _ => EBADF
+        // See `sys_pread64`.
+        akuma_exec::process::FileDescriptor::BlockDev { .. } => EBADF,
+        _ => ESPIPE
     }
 }
 
@@ -1083,6 +1107,12 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         let Some(proc) = akuma_exec::process::current_process_shared() else { return EBADF };
         match proc.get_fd(fd_num as u32) { Some(e) => (proc.pid, e), None => return EBADF }
     };
+    // A file not opened for writing (`O_RDONLY`, `O_PATH`) is `EBADF`, as on Linux.
+    if let akuma_exec::process::FileDescriptor::File(ref f) = fd
+        && !akuma_syscalls_linux::flags::open::may_write(f.flags)
+    {
+        return EBADF;
+    }
 
     // Pseudo-terminals: see the matching arm in `sys_read`.
     // A device its kernel serves itself (`chardev`).
@@ -1922,6 +1952,43 @@ pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> SysResult
     openat_path(dirfd, &raw_path, flags, mode)
 }
 
+/// The four refusals `openat` makes from what is at `path` (resolved, its last
+/// component not followed), in Linux's order (`userspace/forktest/c_stress/fdrefuse.c`):
+///
+/// - `O_NOFOLLOW` on a symlink is `ELOOP` (unless `O_PATH`, which opens the link);
+/// - `O_CREAT | O_EXCL` on anything present is `EEXIST`;
+/// - `O_CREAT` on a directory is `EISDIR`;
+/// - `O_DIRECTORY` on anything but a directory is `ENOTDIR`.
+///
+/// No lookup at all unless one of those flags is set.
+fn open_refusal(path: &str, flags: u32) -> Result<(), u64> {
+    use akuma_exec::process::open_flags::{O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_PATH};
+    let nofollow = flags & (O_NOFOLLOW | O_PATH) == O_NOFOLLOW;
+    let creating = flags & O_CREAT != 0;
+    let wants_dir = flags & O_DIRECTORY != 0;
+    if !(nofollow || creating || wants_dir) {
+        return Ok(());
+    }
+    let _vfs_bkl = VfsBklGuard::new();
+    if nofollow && akuma_vfs_glue::is_symlink(path) {
+        return Err(ELOOP);
+    }
+    if !(creating || wants_dir) {
+        return Ok(());
+    }
+    let Ok(md) = akuma_vfs_glue::metadata(path) else { return Ok(()) };
+    if creating && flags & O_EXCL != 0 {
+        return Err(EEXIST);
+    }
+    if creating && md.is_dir {
+        return Err(EISDIR);
+    }
+    if wants_dir && !md.is_dir {
+        return Err(ENOTDIR);
+    }
+    Ok(())
+}
+
 /// `openat(2)` on a path already in kernel memory — the whole of the arm
 /// except the user copy.
 ///
@@ -1967,6 +2034,8 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             return Err(e);
         }
     };
+
+    open_refusal(&path, flags)?;
 
     // A device its kernel serves itself (`chardev`): the resolved path names it.
     if let Some(r) = super::chardev::open(&path, flags) {
@@ -2465,13 +2534,24 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
 
 /// `lseek(fd, offset, whence)`.
 ///
-/// `pub` since the amd64 `lseek` preamble delegates to it (4b batch 3a): that
-/// kernel keeps one arm of its own — a `/dev` character node, which Linux seeks
-/// to the offset asked for and this function answers `0`/`ESPIPE` for — and
-/// hands everything else here.
+/// As on Linux (`userspace/forktest/c_stress/fdrefuse.c`): a missing
+/// descriptor is `EBADF` before a `whence` past `SEEK_HOLE` is `EINVAL`, and
+/// `/dev/null`, `/dev/zero` and `/dev/urandom` answer `0` whatever the offset.
 pub fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
+    /// `SEEK_MAX` (`SEEK_HOLE`).
+    const SEEK_MAX: u32 = 4;
     if let Some(proc) = akuma_exec::process::current_process_shared() {
-        if matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevZero)) {
+        let Some(entry) = proc.get_fd(fd) else { return EBADF };
+        // `whence` is an `unsigned int` on Linux: a negative one is past the end too.
+        if whence as u32 > SEEK_MAX {
+            return EINVAL;
+        }
+        if matches!(
+            entry,
+            akuma_exec::process::FileDescriptor::DevNull
+                | akuma_exec::process::FileDescriptor::DevZero
+                | akuma_exec::process::FileDescriptor::DevUrandom
+        ) {
             return 0;
         }
         // SEEK_END needs the on-disk size, so lseek on a real file is a VFS call. It
@@ -2479,8 +2559,8 @@ pub fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
         // `with_irqs_disabled`), so the ext2 work below is already IRQ-masked — no nested
         // exception can wait on the BKL from inside it, which is what makes the drop safe.
         let _vfs_bkl = VfsBklGuard::new_if(matches!(
-            proc.get_fd(fd),
-            Some(akuma_exec::process::FileDescriptor::File(_) | akuma_exec::process::FileDescriptor::BlockDev { .. })
+            entry,
+            akuma_exec::process::FileDescriptor::File(_) | akuma_exec::process::FileDescriptor::BlockDev { .. }
         ));
 
         let mut new_pos = 0i64;

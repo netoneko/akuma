@@ -2230,3 +2230,72 @@ A write of `dim=50` came back in the next read, and the shell smoke passed.
 0, so `cat /dev/power` does not end. `powerd` reads once. Path `stat`s of these nodes
 (`ls -l /dev/power`) fail with `ENOENT` because the VFS has no entries for them; only the
 descriptor answers.
+
+**Step 3: the refusals are glue's, for both kernels.** Steps 1 and 2 left the Linux-correct
+refusals where they were: in glue-amd64 (`openat`'s four, the `O_RDONLY` write) and in amd64's own
+preambles (`pread64`'s `ESPIPE`, the `/dev` `lseek`). Each had a comment saying it stayed out of glue
+because the change would land on AArch64 too, and AArch64 was not verified from this machine. Both
+kernels are verified here now (HVF and TCG), and Linux gives an oracle: `userspace/forktest/c_stress/fdrefuse.c`,
+22 rows, run as the same static musl binary on Linux 7.0 (Lima `fc`) and on each kernel.
+
+Before the step, against Linux:
+
+| row | Linux | AArch64 | amd64 |
+|---|---|---|---|
+| `O_CREAT\|O_EXCL` on a present file | `EEXIST` | opened | `EEXIST` |
+| `O_DIRECTORY` on a file | `ENOTDIR` | opened | `ENOTDIR` |
+| `O_CREAT` on a directory | `EISDIR` | opened | `EISDIR` |
+| `O_NOFOLLOW` on a symlink | `ELOOP` | opened | `ELOOP` |
+| `write` on `O_RDONLY` | `EBADF` | wrote | `EBADF` |
+| `pwrite` on `O_RDONLY` | `EBADF` | wrote | wrote |
+| `read`/`pread` on `O_WRONLY` | `EBADF` | read | read |
+| `pread`/`pwrite` on a pipe | `ESPIPE` | `EBADF` | `ESPIPE`/`EBADF` |
+| `pread`/`pwrite` on a socketpair | `ESPIPE` | `EBADF` | `EBADF` |
+| `lseek(/dev/null\|zero, 100)` | 0 | 0 | 100 |
+| `lseek(/dev/urandom, 100)` | 0 | `ESPIPE` | 100 |
+| `lseek` with `whence` 7 | `EINVAL` | 0 | `EINVAL` |
+
+AArch64 was wrong on the most rows, and `O_EXCL` was the worst of them: exclusive create, the
+primitive lock files and `mkstemp` races rely on, silently succeeded on a file that was already
+there. amd64's two `lseek` answers came from a preamble whose comment said Linux seeks a `/dev` node
+to the offset asked for. Linux does not (`null_lseek` returns 0, `/dev/urandom` is `noop_llseek`);
+glue's `0` was right and amd64 had overridden it. amd64's `pread` on a socketpair was `EBADF` despite
+its `ESPIPE` preamble, because `socket_index` knows only this kernel's own socket table, not AF_UNIX
+pairs.
+
+What moved:
+
+- `akuma_syscalls_linux::flags::open::{may_read, may_write}`: the access-mode rule, with `O_PATH`
+  and mode 3 granting neither; host-tested.
+- `ELOOP` (40) joins `akuma_primitives::errno`; glue-amd64's private copies of `EEXIST`, `ENOTDIR`,
+  `EISDIR` and `ELOOP` are gone.
+- glue `fs::open_refusal`: the four, in Linux's order (`EEXIST` before `EISDIR` for
+  `O_CREAT|O_EXCL` on a directory, where glue-amd64 had them the other way round). It runs before
+  any device or `/proc/self/fd` arm, does no lookup unless one of the three flags is set, and takes
+  the VFS BKL drop for the lookups it does make.
+- glue `sys_read`/`sys_write`/`sys_pread64`/`sys_pwrite64`: `EBADF` by access mode; the `_` arm of
+  the two positioned calls is `ESPIPE`, with `BlockDev` kept `EBADF`.
+- glue `sys_lseek`: `EBADF`, then `whence > SEEK_HOLE` `EINVAL`, then `/dev/urandom` joins the 0 arm.
+- Removed: glue-amd64's `openat_resolved` (amd64 calls `fs::openat_path` directly) and its `write`
+  check; amd64's `pread64` preamble down to the unbound console fds glue cannot see; amd64's
+  `lseek` arm; the `pipe_write_id` helper that was left unused.
+
+Still amd64's: the `MAX_FDS` ceiling on `openat`/`dup2`/`dup3` (it is this kernel's lookup bound
+too, so it is not only a policy), and the block-node `ENODEV`.
+
+Gates:
+
+- clippy: amd64 default, `headless`, `no-tests`; AArch64; Taoxichuan.
+- Host tests for `akuma-syscalls-linux`.
+- Boot suites: amd64 TCG 836/846/846, `headless` 846; AArch64 HVF 315/323/321. Both are unchanged
+  from step 2.
+- `fdrefuse`: identical to Linux on both kernels.
+- An ssh shell smoke on both kernels: `>>`, `set -C`, `sed -i`, `cp -r`, `find`, a 1.2 MB
+  `dd`/`cp`/`cmp`, `mv`, a symlink, `sort -o`, and a busybox `tar` round trip.
+
+**Not changed, pinned:**
+
+- `dup3` replacing a device descriptor still does not release the device (step 2).
+- `pread` on a `TimerFd` answers `EAGAIN` and on an `EpollFd` `EINVAL`, where Linux's `ESPIPE`
+  check comes first.
+- `pread` on a `BlockDev` is `EBADF`.

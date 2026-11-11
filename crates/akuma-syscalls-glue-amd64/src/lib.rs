@@ -37,16 +37,11 @@ extern crate alloc;
 use akuma_exec::process::FileDescriptor;
 use akuma_syscalls_abi::Syscall;
 use akuma_syscalls_glue as glue;
-use akuma_syscalls_linux::flags::open as o;
 
 const EBADF: u64 = (-9i64) as u64;
 const EFAULT: u64 = (-14i64) as u64;
-const EEXIST: u64 = (-17i64) as u64;
-const ENOTDIR: u64 = (-20i64) as u64;
-const EISDIR: u64 = (-21i64) as u64;
 const EINVAL: u64 = (-22i64) as u64;
 const ENOENT: u64 = (-2i64) as u64;
-const ELOOP: u64 = (-40i64) as u64;
 
 const AT_FDCWD: u64 = (-100i64) as u64;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -162,48 +157,12 @@ pub fn to_glue(call: Syscall, a: [u64; 6]) -> u64 {
 }
 
 /// `openat(dirfd, path, flags, mode)` with the x86_64 flags permuted to glue's.
-///
-/// Also the four checks glue's `openat_path` leaves to its caller
-/// (`O_NOFOLLOW` on a symlink, `O_CREAT` on a directory, `O_DIRECTORY` on a
-/// file, `O_EXCL` on anything present): amd64's preamble, minus its devices.
+/// The flag refusals (`O_NOFOLLOW`, `O_CREAT` on a directory, `O_DIRECTORY` on a
+/// file, `O_EXCL`) are glue's, for every kernel.
 #[must_use]
 pub fn openat(dirfd: u64, path: u64, flags_x86: u64, mode: u64) -> u64 {
     let flags = akuma_syscalls_abi::open_flags::x86_64_to_aarch64(flags_x86 as u32);
-    let Ok(raw) = glue::copy_from_user_str(path, 1024) else {
-        return EFAULT;
-    };
-    let Ok(resolved) = glue::fs::resolve_path_at(dirfd as i32, &raw) else {
-        return EBADF;
-    };
-    openat_resolved(dirfd, &resolved, flags, mode)
-}
-
-/// [`openat`] from a resolved path and asm-generic `flags`.
-///
-/// For a kernel that looks at the resolved path first, to serve a device of
-/// its own, without reading and resolving it twice.
-#[must_use]
-pub fn openat_resolved(dirfd: u64, resolved: &str, flags: u32, mode: u64) -> u64 {
-    if flags & o::O_NOFOLLOW != 0 && akuma_vfs_glue::is_symlink(resolved) {
-        return ELOOP;
-    }
-    let creating = flags & o::O_CREAT != 0;
-    let wants_dir = flags & o::O_DIRECTORY != 0;
-    if creating || wants_dir {
-        let md = akuma_vfs_glue::metadata(resolved);
-        let is_dir = md.as_ref().is_ok_and(|m| m.is_dir);
-        let present = md.is_ok();
-        if creating && is_dir {
-            return EISDIR;
-        }
-        if wants_dir && present && !is_dir {
-            return ENOTDIR;
-        }
-        if creating && flags & o::O_EXCL != 0 && present {
-            return EEXIST;
-        }
-    }
-    glue::flat(glue::fs::openat_path(dirfd as i32, resolved, flags, mode as u32))
+    glue::flat(glue::fs::sys_openat(dirfd as i32, path, flags, mode as u32))
 }
 
 /// Whether `fd` names a regular file in the caller's table (not a directory,
@@ -265,16 +224,9 @@ pub fn pread64(fd: u64, buf: u64, len: u64, off: u64) -> u64 {
     glue::fs::sys_pread64(fd as u32, buf, len.min(MAX_IO) as usize, off.cast_signed())
 }
 
-/// `write(fd, buf, len)`: glue's arm, after the one check it leaves to its
-/// caller — a file opened `O_RDONLY` refuses writes with `EBADF`.
+/// `write(fd, buf, len)`: glue's arm, in the shape [`vectored`] takes.
 #[must_use]
 pub fn write(fd: u64, buf: u64, len: u64) -> u64 {
-    let read_only = akuma_exec::process::current_process_shared().and_then(|p| {
-        p.with_fd(fd as u32, |d| matches!(d, FileDescriptor::File(f) if f.flags & o::O_ACCMODE == o::O_RDONLY))
-    });
-    if read_only == Some(true) {
-        return EBADF;
-    }
     glue::fs::sys_write(fd, buf, len as usize)
 }
 
