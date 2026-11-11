@@ -408,11 +408,12 @@ pub use akuma_syscalls_linux::flags::open as open_flags;
 pub enum LazySource {
     Zero,
     File {
-        path: String,
+        /// Never 0: a file with no inode identity is mapped eagerly, since a
+        /// region records no path to read it by.
         inode: u32,
         /// Which mount `inode` belongs to (`akuma_vfs::ResolvedMount::id`),
-        /// captured with it at mmap time. `0` means "no identity", which
-        /// disables page-cache sharing for this region.
+        /// captured with it at mmap time; the fill reads through it. Never 0,
+        /// for the same reason as `inode`.
         ///
         /// An inode number alone does not name a file: a second `mount(2)` puts
         /// another filesystem's numbers in the same range, and the page cache is
@@ -456,15 +457,14 @@ impl LazySource {
     /// as part of construction, so a caller cannot create an unpinned mapping.
     #[must_use]
     pub fn file(
-        path: String,
         mount_id: u32,
         inode: u32,
         file_offset: usize,
         filesz: usize,
         segment_va: usize,
     ) -> Self {
+        debug_assert!(inode != 0 && mount_id != 0, "a lazy file region needs a (mount, inode) identity");
         Self::File {
-            path,
             inode,
             mount_id,
             file_offset,

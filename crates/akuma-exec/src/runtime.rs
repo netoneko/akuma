@@ -104,12 +104,13 @@ pub struct ExecRuntime {
     /// ambiguous across two mounted filesystems, which is what makes it unsafe
     /// as a page-cache key (F-1, `docs/archive/EXT2_WRITEBACK_DESIGN.md`).
     pub resolve_file_id: fn(&str) -> Result<(u32, u32), i32>,
-    /// Takes the path as well as the inode: the VFS is multi-root (`with_fs`
-    /// dispatches on the path prefix), so an inode alone does not name a file.
-    /// The prefault fill in `mmu/user_access.rs` calls this for every
-    /// inode-backed lazy file page — a stub registration here turns those pages
-    /// into silent zeros (`[FILL-SHORT/prefault]`, the self-host ICE).
-    pub read_at_by_inode: fn(&str, u32, usize, &mut [u8]) -> Result<usize, i32>,
+    /// Read a file named by `(mount id, inode)`, the pair a lazy file region
+    /// records. The mount id selects the filesystem (an inode alone does not
+    /// name a file), so no path is needed, and a file unlinked since it was
+    /// mapped still reads. The demand-fault and prefault fills call this for
+    /// every lazy file page; a stub registration turns those pages into silent
+    /// zeros (`[FILL-SHORT/prefault]`, the self-host ICE).
+    pub read_at_by_inode: fn(u32, u32, usize, &mut [u8]) -> Result<usize, i32>,
 
     /// Mark the file at `path` as being executed (`akuma_primitives::text_busy`, `ETXTBSY`), to be taken **before** its bytes are read and
     /// moved into the new process with `Process::set_text`. An inert pin for a path with no trackable identity.

@@ -269,7 +269,7 @@ fn exec_runtime() -> ExecRuntime {
                 .and_then(|ino| crate::root_fs().read_at_by_inode(ino, off, buf))
                 .map_err(|_| -1)
         },
-        read_at_by_inode: |_path, ino, off, buf| {
+        read_at_by_inode: |_mount_id, ino, off, buf| {
             crate::root_fs().read_at_by_inode(ino, off, buf).map_err(|_| -1)
         },
         // Symlinks: this target resolves inside its own path walk

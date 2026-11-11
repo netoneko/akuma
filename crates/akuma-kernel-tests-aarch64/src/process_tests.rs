@@ -5207,7 +5207,7 @@ fn test_lazy_file_regions_pin_in_address_space() {
     let pid: u32 = 7721;
     register_process(pid, make_test_process(pid));
 
-    let src = || LazySource::file(alloc::string::String::from("/pin-test"), 1, INO, 0, 0x2000, A);
+    let src = || LazySource::file(1, INO, 0, 0x2000, A);
     let as_pins = || with_process(pid, |p| p.with_address_space(|a| a.pins_mapped_inode(INO))).unwrap_or(false);
     let mut fails = 0u32;
     let mut check = |ok: bool, what: &str| {

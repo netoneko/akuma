@@ -35,8 +35,8 @@ fn exec_runtime() -> ExecRuntime {
         // The root, through the shared mount table.
         read_file: |path| akuma_vfs_glue::read_file(path).map_err(|_| -1),
         read_at: |path, off, buf| akuma_vfs_glue::read_at(path, off, buf).map_err(|_| -1),
-        read_at_by_inode: |path, ino, off, buf| {
-            akuma_vfs_glue::read_at_by_inode(path, ino, off, buf).map_err(|_| -1)
+        read_at_by_inode: |mount_id, ino, off, buf| {
+            akuma_vfs_glue::read_at_by_mount_inode(mount_id, ino, off, buf).map_err(|_| -1)
         },
         resolve_symlinks: akuma_vfs_glue::resolve_symlinks,
         resolve_file_id: |path| akuma_vfs_glue::resolve_file_id(path).ok_or(-1),

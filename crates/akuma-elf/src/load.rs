@@ -107,6 +107,11 @@ pub fn load_elf_from_path<A: UserPages>(
     interp_prefix: Option<&str>,
 ) -> Result<LoadedElf<A>, ElfError> {
     let (mount_id, inode) = (crate::vfs().resolve_file_id)(path).unwrap_or((0, 0));
+    // A deferred segment is read back by `(mount, inode)` alone, so a file
+    // without that identity is loaded eagerly instead, as `load_elf` does.
+    if inode == 0 || mount_id == 0 {
+        return load_image(ElfSource::Path(path), &MapStrategy::Eager, interp_prefix);
+    }
 
     if DEBUG_ELF_LOADING {
         log::debug!(

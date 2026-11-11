@@ -448,8 +448,14 @@ fn mmap_eager_to_lazy_fallback(
                 let _vfs_window = super::fs::VfsBklGuard::new();
                 resolve_file_extent(&path, f.mount_id(), f.inode(), offset, len)
             };
+            // A lazy file region reads by `(mount, inode)` only; a file without
+            // that identity has nothing to demand-page from.
+            if inode == 0 || mount_id == 0 {
+                akuma_pmm::note_user_enomem("mmap/eager-file", len);
+                return ENOMEM;
+            }
             let source = akuma_exec::process::LazySource::file(
-                path, mount_id, inode, offset, filesz, mmap_addr,
+                mount_id, inode, offset, filesz, mmap_addr,
             );
             let count = akuma_exec::process::push_lazy_region_with_source(
                 proc.tgid, mmap_addr, pages * 4096, page_flags, source);
@@ -582,17 +588,20 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // plan's change for parity-db's 1 GiB reserves); it is recorded for
     // present-page writeback below instead of being forced eager.
     if akuma_config::MMAP_FILE_BACKED_LAZY && plan.file_lazy_eligible
-        && let Some(akuma_exec::process::FileDescriptor::File(ref f)) = proc.get_fd(fd as u32) {
-            let path = f.path.clone();
+        && let Some(akuma_exec::process::FileDescriptor::File(ref f)) = proc.get_fd(fd as u32)
+        && let (mount_id, inode, filesz) = {
             // Path→inode resolution reads ext2 metadata (real I/O on a cold cache) —
             // take the dropped-BKL window for it like every other on-disk read path
             // (Phase 2e of the no-bkl-vfs carve-out).
-            let (mount_id, inode, filesz) = {
-                let _vfs_window = super::fs::VfsBklGuard::new();
-                resolve_file_extent(&path, f.mount_id(), f.inode(), offset, len)
-            };
+            let _vfs_window = super::fs::VfsBklGuard::new();
+            resolve_file_extent(&f.path, f.mount_id(), f.inode(), offset, len)
+        }
+        // A lazy file region reads by `(mount, inode)` only. A file without that
+        // identity (no inode on its filesystem, or a size that would not read)
+        // takes the eager path below, which reads by path once at mmap time.
+        && inode != 0 && mount_id != 0 {
+            let path = f.path.clone();
             let source = akuma_exec::process::LazySource::file(
-                path.clone(),
                 mount_id,
                 inode,
                 offset,

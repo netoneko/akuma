@@ -361,8 +361,8 @@ pub(crate) fn build_exec_runtime(
         // `[0,0,0,0]` metadata ICE in the self-host build. See
         // `akuma_pmm::DP_PREFAULT_FILL_SHORT` and
         // `docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md`.
-        read_at_by_inode: |path, inode, off, buf| {
-            crate::vfs::read_at_by_inode(path, inode, off, buf).map_err(|_| -1)
+        read_at_by_inode: |mount_id, inode, off, buf| {
+            akuma_vfs_glue::read_at_by_mount_inode(mount_id, inode, off, buf).map_err(|_| -1)
         },
         on_process_exit: |_pid| {},
         remove_socket: akuma_net::socket::remove_socket,

@@ -605,7 +605,7 @@ fn demand_page_lazy_region(
     let shareable_mapping = akuma_fpcache::is_shareable_mapping(map_flags);
 
     if let akuma_exec::process::LazySource::File {
-        ref path, inode, mount_id, file_offset, filesz, segment_va, ..
+        inode, mount_id, file_offset, filesz, segment_va, ..
     } = *source
     {
         if demand_page_log_enabled() {
@@ -734,11 +734,7 @@ fn demand_page_lazy_region(
                 if fpcache_verify_hits() {
                     let file_off = file_offset + (cur_va - segment_va);
                     let mut disk = alloc::vec![0u8; 0x1000];
-                    let got = if inode != 0 {
-                        (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, &mut disk)
-                    } else {
-                        (akuma_exec::runtime::runtime().read_at)(path, file_off, &mut disk)
-                    };
+                    let got = (akuma_exec::runtime::runtime().read_at_by_inode)(mount_id, inode, file_off, &mut disk);
                     let mut cached_page = alloc::vec![0u8; 0x1000];
                     (services().read_frame_bytes)(pf.addr, &mut cached_page);
                     let cached = cached_page.as_slice();
@@ -787,11 +783,7 @@ fn demand_page_lazy_region(
                     let file_off = file_offset + (pg_data_start - segment_va);
                     let len = pg_data_end - pg_data_start;
                     let got = staged.fill_with(dst_off, len, |page_buf| {
-                        if inode != 0 {
-                            (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
-                        } else {
-                            (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
-                        }
+                        (akuma_exec::runtime::runtime().read_at_by_inode)(mount_id, inode, file_off, page_buf)
                     });
                     // The range is already clamped to `filesz`, so anything less than
                     // `len` is a defect, not EOF. The frame came from
@@ -802,8 +794,8 @@ fn demand_page_lazy_region(
                     if !fill_complete {
                         akuma_pmm::dp_count(&akuma_pmm::DP_FILE_FILL_SHORT, 1);
                         safe_print!(288,
-                            "[FILL-SHORT] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} path={} — page left zero-filled\n",
-                            pid, inode, file_off, len, got, cur_va, path);
+                            "[FILL-SHORT] pid={} mount={} inode={} file_off={:#x} want={} got={:?} va={:#x} — page left zero-filled\n",
+                            pid, mount_id, inode, file_off, len, got, cur_va);
                     }
                 }
             }
@@ -955,11 +947,7 @@ fn demand_page_lazy_region(
                 let file_off = file_offset + (pg_data_start - segment_va);
                 let len = pg_data_end - pg_data_start;
                 let got = staged.fill_with(dst_off, len, |page_buf| {
-                    if inode != 0 {
-                        (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
-                    } else {
-                        (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
-                    }
+                    (akuma_exec::runtime::runtime().read_at_by_inode)(mount_id, inode, file_off, page_buf)
                 });
                 // This arm never publishes to `file_page_cache`, so a short read here
                 // poisons only the faulting process — but it is the same defect and
@@ -968,8 +956,8 @@ fn demand_page_lazy_region(
                 if got != Ok(len) {
                     akuma_pmm::dp_count(&akuma_pmm::DP_FILE_FILL_SHORT, 1);
                     safe_print!(288,
-                        "[FILL-SHORT/single] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} path={}\n",
-                        pid, inode, file_off, len, got, page_va, path);
+                        "[FILL-SHORT/single] pid={} mount={} inode={} file_off={:#x} want={} got={:?} va={:#x}\n",
+                        pid, mount_id, inode, file_off, len, got, page_va);
                 }
             }
             // Filled; from here the frame is mapped-or-freed by hand below.

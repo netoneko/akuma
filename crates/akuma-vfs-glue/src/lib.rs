@@ -692,6 +692,18 @@ pub fn read_at_open_file(
     fs.read_at_by_inode(inode, offset, buf)
 }
 
+/// Read a file named only by `(mount id, inode)` — a lazy file region's record.
+///
+/// [`read_at_open_file`] without its by-path fallback: a region records no
+/// path, so `inode == 0` or an unknown mount is an error, never a guess.
+pub fn read_at_by_mount_inode(mount_id: u32, inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+    if inode == 0 {
+        return Err(FsError::NotFound);
+    }
+    let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
+    fs.read_at_by_inode(inode, offset, buf)
+}
+
 /// [`metadata`] for an open file description, by the inode `open(2)` bound to it
 /// when there is one and by path otherwise.
 ///

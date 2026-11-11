@@ -1990,8 +1990,8 @@ mod lazy_region_propagation_tests {
 
     /// Mount id 1 throughout: these tests are about region propagation across
     /// fork, not about which filesystem the inode came from.
-    fn file_source(path: &str, inode: u32) -> LazySource {
-        LazySource::file(alloc::string::String::from(path), 1, inode, 0, 0x2000, 0x2000_0000)
+    fn file_source(_path: &str, inode: u32) -> LazySource {
+        LazySource::file(1, inode, 0, 0x2000, 0x2000_0000)
     }
 
     #[test]
@@ -2017,9 +2017,8 @@ mod lazy_region_propagation_tests {
         assert_eq!(r2.size, 0x2000);
         assert_eq!(r2.prot, Some(akuma_mmap::Prot::RW_NO_EXEC));
         match &r2.source {
-            LazySource::File { path, inode, .. } => {
-                assert_eq!(path, "/bin/busybox");
-                assert_eq!(*inode, 42);
+            LazySource::File { inode, mount_id, .. } => {
+                assert_eq!((*mount_id, *inode), (1, 42));
             }
             _ => panic!("expected a File-backed lazy source to survive propagation"),
         }
@@ -2175,8 +2174,7 @@ mod lazy_region_propagation_tests {
         // `LazySource::Zero` has no file behind it; it must not touch the table.
         let mut map = LazyRegionMap::new();
         map.push(0x1000_0000, 0x1000, 0x1, LazySource::Zero);
-        // An inode-0 file region is the "read by path" case and is equally inert.
-        map.push(0x2000_0000, 0x1000, 0x1, file_source("/by-path", 0));
+        // (A file region always has an inode now: `LazySource::file` asserts it.)
         assert_eq!(pin_count(0), 0);
         map.clear();
     }
