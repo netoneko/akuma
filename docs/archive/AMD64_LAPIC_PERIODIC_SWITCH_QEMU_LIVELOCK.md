@@ -75,11 +75,12 @@ one-shot of the periodic count. `start_timer` is the only writer that enters per
 ## Verified
 
 - `akuma-lapic-amd64` host tests and clippy on the amd64 kernel are clean.
-- Soak on the same rig (`SMP=2`, TCG, idle herd guest, ssh pinged every 10 s): **partial at commit
-  time**. The guest answered for 10+ minutes; one missed ping at 111 s, during heavy host load, with
-  QEMU's monitor still answering (it did not during the hangs). QEMU's main thread had used ~5 s of
-  CPU at 2.5 min, against 134 s on a hung guest of the same age. The three kernels before the fix
-  hung at ~70 s, ~160 s and ~270 s on this rig. A full 25-minute soak on AC power is still owed.
+- Soak on the same rig (`SMP=2`, TCG, idle herd guest, ssh pinged every 10 s): **25 minutes, passed**
+  (finished just after the fix was committed). Every ping answered except one at 111 s, taken during
+  heavy host load, and QEMU's monitor still answered at that moment (during the hangs it did not).
+  sshd was still serving at 1524 s of uptime. QEMU's main thread had used ~5 s of CPU at 2.5 min,
+  against 134 s on a hung guest of the same age. The three kernels before the fix hung at ~70 s,
+  ~160 s and ~270 s on this rig. On battery power, not AC.
 
 ## Still open
 
