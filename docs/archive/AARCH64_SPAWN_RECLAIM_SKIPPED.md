@@ -63,6 +63,14 @@ before.
   never having run. Twenty minutes earlier it had passed on the same pre-fix image,
   4 of 4. So it is host-state dependent, not this change. Its fill threads did not run
   during 200 ms of `yield_now` from thread 0 at `SMP=1`. Not yet investigated.
+  **This is not the failure the earlier docs explain.** Every recorded failure of this test
+  before this one was `hot_reclaim=N (want 0)`, the fill loop outliving the 10 ms
+  cooldown. That was a flaw in how the test was set up, fixed by moving the cooldown
+  baseline (`TRIM_FAT_COOPERATIVE_SCHEDULING.md` §4.3, `HOOKED_EL1_PREEMPTION.md`; also
+  `PAGE_TABLE_UAF_BKL_STORM.md`, `J4_HANG_LIVE_AUTOPSY.md`, `AARCH64_SMP_HOOKS_RACE.md`).
+  This failure is `hot_reclaim=0` with `respawn_ok=false` and
+  `gated_from_other_thread=usize::MAX`: the hot-reclaim assertion held, and no spawned
+  thread ran at all.
 
 ## Background
 
