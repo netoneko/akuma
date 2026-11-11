@@ -1369,3 +1369,12 @@ manifests; they were on in every build of both kernels, and `no-bkl-irq` had gat
 the SGI deletion. Section sizes are unchanged, and the boot suites match the pre-change runs (HVF
 314/1, 323/0, 321/0; amd64 TCG 829/0, 839/0). Details:
 [`AKUMA_FEATURE_AUDIT.md`](AKUMA_FEATURE_AUDIT.md) § "F2 applied".
+
+## `net-waker-park` / `net-direct-waker` removed (2026-11-11)
+
+Both targeted socket parks were deleted with their code; `wait_until` is promiscuous on every
+build, as it already was by default (`AKUMA_FEATURE_AUDIT.md`). Gates on AC power: HVF
+`SMP=2` 323/0 and `SMP=4` 321/0. At `SMP=1` the result was 314/1, the open
+`thread_slot_reclaim_on_spawn` `respawn_ok=false` shape (`AARCH64_SPAWN_RECLAIM_SKIPPED.md`).
+On the Lima devbox at `SMP=4`, epoll had 0 FAIL and 1 known DIVERGE, futex passed every probe,
+and there were no panics.

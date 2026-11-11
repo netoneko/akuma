@@ -123,6 +123,22 @@ predicted to suit it (`REDIS_ROUND_TRIP_CEILING.md`). Removed:
 `[NICSTAT]` keeps its `orphan`/`tx_stall` columns, always 0, so parsers do not shift.
 `akuma-net-nic`'s unsafe budget went from 13 to 9. The default image's sections are unchanged.
 
+## `net-waker-park` and `net-direct-waker` removed (2026-11-11)
+
+These were the two targeted parks for a blocking socket waiter (F3). `net-waker-park` registered on
+the kernel socket's waker list and measured worse (`AKUMA_NET_ISSUES.md` §8). `net-direct-waker`
+registered on the smoltcp socket and A/B'd null (`LONG_ROAD_TO_REDIS_PART_2.md`). Both were off,
+and no script enabled either. Removed:
+
+- `akuma-net-yarn`'s `ParkKind::{Targeted, DirectWaker}` and `WaitPolicy::{targeted, direct_waker}`;
+- `wait_park`'s register/re-check arm;
+- `smoltcp_net::register_socket_waker`;
+- the `idx` parameter `wait_until` carried only to register a waker;
+- the feature-gated boot test `test_socket_wait_registers_waker`.
+
+`wait_until` uses `WaitPolicy::promiscuous()`, as every build did. The epoll family's
+`ScanRegistered` kind and the model-only `LightSleep` stay.
+
 ## Proposed simplifications
 
 | # | change | risk | gate |

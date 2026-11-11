@@ -132,13 +132,15 @@ shallow and those frames took a spin or were dropped. `orphan` counts device
 completions whose token no slot claims, which should be impossible and means
 the token map has desynchronised from the used ring.
 
-## Latency: `net-waker-park` is off for the same kind of reason
+## Latency: targeted socket parking lost for the same kind of reason
 
 The other tempting lever. Blocking socket ops (`accept`/`recv`/`send`/`connect`)
 park in `blocking_relax` — yield + WFI — which leaves the thread READY, so
 nothing can target it and the socket's `wake_all()` walks an empty waker list.
 Every other blocking path in the kernel (pipes, fs, msgqueue, epoll) registers
-and parks properly. Fixing that outlier **measured worse**:
+and parks properly. Fixing that outlier **measured worse**. The two attempts,
+`net-waker-park` and `net-direct-waker` (a waker on the smoltcp socket instead,
+which A/B'd null), were removed 2026-11-11:
 
 | | default | `net-waker-park` |
 |---|---:|---:|
@@ -150,8 +152,8 @@ per 5 s window — so the imprecise wake is plentiful, while the directed one is
 lossy (`wake_all` drains the list, so a waiter must re-register every lap).
 Full reasoning: [`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md) §8.
 
-**Diagnostic that stays useful either way:** `KernelSocket::waker_count()` reads
-zero for any blocking socket waiter on the default build. If you are debugging a
+**Diagnostic:** `KernelSocket::waker_count()` reads zero for any blocking socket
+waiter. If you are debugging a
 socket that never wakes, that zero is expected, not the bug.
 
 ## The doorbell must be re-armed BEFORE the drain
