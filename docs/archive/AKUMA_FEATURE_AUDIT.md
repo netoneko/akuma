@@ -304,10 +304,24 @@ saying what became of it.
     `sys_{get,set}sockopt` wrappers, pmm forwarders) stayed in the runtime image. It now
     forwards like AArch64's: amd64 `no-tests` `.text` is 2,833,167 → 2,831,215 (−1,952 B).
     Boots to `uname` at SMP=1 and 2 (TCG).
-  - **`sc-sysv-ipc`** not forwarding to `akuma-vfs-glue` is intended and stays the one pinned
-    drift: that crate's `/proc/sysvipc/msg` lives in a `ProcFilesystem` amd64 does not mount
-    (`amd64/Cargo.toml`). Forwarding it would compile dead code.
-  - The parity baseline is ratcheted to 1 drift of 10.
+  - **`sc-sysv-ipc`** not forwarding to `akuma-vfs-glue` was first recorded here as intended,
+    on the word of an `amd64/Cargo.toml` comment saying amd64 does not mount that crate's
+    `ProcFilesystem`. **That was wrong** (corrected the same day): amd64 has mounted it as
+    its `/proc` since multiarch 5b slice 3 (`amd64/src/fs.rs`), so amd64 had the queue
+    syscalls but no `/proc/sysvipc/msg`. Fixed in the next section.
+
+## `sc-sysv-ipc` folded into `linux-extra-syscalls` (2026-11-11)
+
+The kernel-level `sc-sysv-ipc` feature is gone on both kernels. `linux-extra-syscalls` now turns
+on `akuma-syscalls-glue/sc-sysv-ipc` and `akuma-vfs-glue/sc-sysv-ipc` directly; the AArch64 kernel
+also turns on its optional `akuma-syscalls-ipc` dependency. The crates keep their feature of that
+name. Effects:
+
+- amd64 gains `/proc/sysvipc/msg`.
+- The stale amd64 comment is rewritten.
+- The parity check has no drift left: 0 of 9 common features.
+
+The other six `sc-*` stay individually settable.
 
 ## Proposed simplifications
 

@@ -7,16 +7,8 @@
     "sc-epoll",
     "sc-eventfd",
     "sc-pidfd",
-    "sc-sysv-ipc",
     "sc-timerfd",
     "syscall-debug-info"
   ],
-  "drift": {
-    "sc-sysv-ipc": {
-      "only_aarch64": [
-        "akuma-vfs-glue/sc-sysv-ipc"
-      ],
-      "only_amd64": []
-    }
-  }
+  "drift": {}
 }

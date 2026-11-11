@@ -34,10 +34,12 @@ Source: `Cargo.toml:73-105`.
 smoltcp, sound, linux-extra-syscalls, sc-reboot
 ```
 
-`linux-extra-syscalls` is the group of the seven `sc-*` families (`sc-aio`,
-`sc-sysv-ipc`, `sc-containers`, `sc-timerfd`, `sc-eventfd`, `sc-pidfd`,
-`sc-epoll`), with the same name and members on amd64. The families stay
-individually settable. `sc-reboot` is outside it because only the AArch64
+`linux-extra-syscalls` is the group of the seven extra families, with the same
+name and members on amd64: six `sc-*` features (`sc-aio`, `sc-containers`,
+`sc-timerfd`, `sc-eventfd`, `sc-pidfd`, `sc-epoll`) that stay individually
+settable, plus SysV message queues and `/proc/sysvipc/msg`, which only the group
+turns on (the `sc-sysv-ipc` kernel feature was folded into it 2026-11-11; the
+crates keep a feature of that name). `sc-reboot` is outside it because only the AArch64
 kernel has it.
 
 There is no `neko`/`kernel-tls`/`tls-rsa` feature anymore — the in-kernel
@@ -72,7 +74,7 @@ re-add what they need. `Cargo.toml:361-369`.
 | Feature | Tier | Notes |
 |---|---|---|
 | `sc-aio` | 1 (dead weight) | |
-| `sc-sysv-ipc` | 1 | |
+| (`sc-sysv-ipc`) | 1 | Folded into `linux-extra-syscalls` 2026-11-11; still a feature of `akuma-syscalls-glue`/`akuma-vfs-glue`. |
 | `sc-containers` | 1 | |
 | `sc-timerfd` | 1 | |
 | `sc-eventfd` | 2 (needs ExecRuntime stub when off) | |

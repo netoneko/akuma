@@ -13,9 +13,23 @@ workspace = true
 [features]
 default = ["linux-extra-syscalls"]
 # The seven families together: what a Linux program expects beyond the core set.
-# In `default`. The families stay individually settable. Same name and members as
-# the AArch64 kernel's group, whose `sc-reboot` is deliberately outside it.
-linux-extra-syscalls = ["sc-aio", "sc-sysv-ipc", "sc-containers", "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll"]
+# In `default`. Six families stay individually settable; SysV message queues are
+# only the group's (see below). Same name and members as the AArch64 kernel's
+# group, whose `sc-reboot` is deliberately outside it.
+#
+# SysV message queues: `msgget`/`msgctl`/`msgsnd`/`msgrcv`, the only quarter of
+# SysV IPC `akuma-syscalls-glue` implements (no shared memory, no semaphores).
+# `struct msqid_ds` is byte-identical between x86_64 and aarch64 musl, so it
+# needs no ABI-boundary translation. `akuma-vfs-glue/sc-sysv-ipc` adds
+# `/proc/sysvipc/msg`: this kernel mounts that crate's `ProcFilesystem` as its
+# `/proc` (`src/fs.rs`), and the listing reads the same `akuma-syscalls-ipc`
+# state the syscalls write. Until 2026-11-11 this was a separate `sc-sysv-ipc`
+# feature that did not forward to `akuma-vfs-glue`, on a stale belief that
+# `/proc` was not mounted here, so amd64 had the queues but no listing.
+linux-extra-syscalls = [
+    "sc-aio", "sc-containers", "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
+    "akuma-syscalls-glue/sc-sysv-ipc", "akuma-vfs-glue/sc-sysv-ipc",
+]
 # Preempt ring 0. Syscalls run with `IF` set once the BKL is taken, and the timer
 # switches a thread in kernel code when `akuma_threading::el1_preemptible` allows it
 # (preemption not disabled, scheduler pool unlocked, thread RUNNING) **and this core
@@ -130,18 +144,6 @@ sc-pidfd = ["akuma-syscalls-glue/sc-pidfd"]
 # `Mmap`/`Munmap`/`Madvise`/`Mremap` use, so this is worth re-checking if the
 # two ever appear to disagree about a region.
 sc-aio = ["akuma-syscalls-glue/sc-aio"]
-# `msgget`/`msgctl`/`msgsnd`/`msgrcv` — SysV message queues, the only quarter
-# of SysV IPC `akuma-syscalls-glue` implements (no shared memory, no
-# semaphores). `struct msqid_ds` is confirmed byte-identical between x86_64
-# and aarch64 musl, so — like `sc-timerfd` and unlike `sc-epoll` — this
-# needed no ABI-boundary translation. Not forwarded to
-# `akuma-vfs-glue/sc-sysv-ipc`: that crate's `/proc/sysvipc/msg` listing
-# lives inside its `ProcFilesystem`, which this target does not mount (it
-# renders from `akuma-exec`'s process table via a global `/proc`, and this
-# target's own VFS mount is separate) — not because it fails to build for
-# `x86_64-unknown-none`, which it has since B3 (correction, 2026-09-17: the
-# comment used to say the opposite; see `akuma-vfs-glue`'s own Cargo.toml).
-sc-sysv-ipc = ["akuma-syscalls-glue/sc-sysv-ipc"]
 # `mount`(165)/`umount2`(166) — real Linux syscalls, gated behind
 # `akuma-syscalls-glue`'s `sc-containers` (the same feature that also compiles
 # `register_box`/`kill_box`/`reattach`/`mount_in_ns`, the "box" lifecycle
@@ -151,8 +153,8 @@ sc-sysv-ipc = ["akuma-syscalls-glue/sc-sysv-ipc"]
 # forward `cargo check` on the standalone crate fails "item configured out"
 # (root `Cargo.toml` already does this for the AArch64 binary; amd64's own
 # manifest had just never defined the forwarding feature). `ProcFilesystem`
-# itself compiles for `x86_64-unknown-none` (has since B3, see the
-# `sc-sysv-ipc` note above) so this needed no `#[cfg]` carve-out inside
+# itself compiles for `x86_64-unknown-none` (has since B3) and is this kernel's
+# mounted `/proc`, so this needed no `#[cfg]` carve-out inside
 # `container.rs`.
 #
 # **Only `Mount`/`Umount2` got an amd64 dispatch arm.**

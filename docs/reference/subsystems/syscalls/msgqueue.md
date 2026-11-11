@@ -1,9 +1,11 @@
 # msgqueue syscalls
 
 SysV message queues: `msgget` (186), `msgctl` (187), `msgrcv` (188),
-`msgsnd` (189). Source: `src/syscall/msgqueue.rs`. Gated by the
-`sc-sysv-ipc` feature (Tier 1 — pure dead weight when off, see
-[`../syscalls.md`](../syscalls.md) "Feature gates").
+`msgsnd` (189). Source: `crates/akuma-syscalls-glue/src/msgqueue.rs`, state in
+`akuma-syscalls-ipc`. Gated by the crates' `sc-sysv-ipc` feature, which both
+kernels turn on only through `linux-extra-syscalls` (Tier 1 — pure dead weight
+when off, see [`../syscalls.md`](../syscalls.md) "Feature gates").
+`/proc/sysvipc/msg` lists the queues on both kernels.
 
 > **Stability: A (stable).** Dormant since Apr 2026 (only a clippy pass
 > since); no crisis cohort ever formed around this family. Caveat: no

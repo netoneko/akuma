@@ -389,13 +389,18 @@ sound = ["akuma-virtio/sound", "akuma-kernel-glue/sound", "akuma-kernel-tests-aa
 
 # Per-family syscall gates, normally selected together as `linux-extra-syscalls`.
 # The seven families together: what a Linux program expects beyond the core set.
-# In `default`; `extreme-size` builds without it. The families stay individually
-# settable for an image that wants some of them. `sc-reboot` is NOT a member: only
-# the AArch64 kernel has it, and the group means the same thing on both kernels.
-linux-extra-syscalls = ["sc-aio", "sc-sysv-ipc", "sc-containers", "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll"]
+# In `default`; `extreme-size` builds without it. Six families stay individually
+# settable for an image that wants some of them. SysV message queues
+# (`msgget`/`msgctl`/`msgsnd`/`msgrcv` plus `/proc/sysvipc/msg`) are not: they
+# were `sc-sysv-ipc` until 2026-11-11 and are now only the group's, on both
+# kernels. `sc-reboot` is NOT a member: only the AArch64 kernel has it, and the
+# group means the same thing on both kernels.
+linux-extra-syscalls = [
+    "sc-aio", "sc-containers", "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
+    "dep:akuma-syscalls-ipc", "akuma-vfs-glue/sc-sysv-ipc", "akuma-syscalls-glue/sc-sysv-ipc",
+]
 # Tier 1 — pure dead weight, no akuma-exec callbacks.
 sc-aio          = ["akuma-syscalls-glue/sc-aio"]
-sc-sysv-ipc     = ["dep:akuma-syscalls-ipc", "akuma-vfs-glue/sc-sysv-ipc", "akuma-syscalls-glue/sc-sysv-ipc"]
 sc-containers   = ["akuma-vfs-glue/sc-containers", "akuma-syscalls-glue/sc-containers", "akuma-isolation/containers", "akuma-kernel-tests-aarch64/sc-containers"]
 sc-timerfd      = ["akuma-syscalls-glue/sc-timerfd"]
 # Tier 2 — each needs a no-op ExecRuntime callback stub when off (see main.rs).
@@ -567,7 +572,7 @@ akuma-syscalls-log = { path = "crates/akuma-syscalls-log" }
 akuma-vfs-glue = { path = "crates/akuma-vfs-glue" }
 
 # The SysV message-queue family. Split out for the same cycle as -log: /proc
-# lists the queues. Optional and gated on `sc-sysv-ipc` exactly as the module it
+# lists the queues. Optional and gated on `linux-extra-syscalls` exactly as the module it
 # replaced was, so `extreme-size` (--no-default-features) still compiles none of
 # it — the crate split must not quietly re-add ~440 lines to the 4 MB floor.
 akuma-syscalls-ipc = { path = "crates/akuma-syscalls-ipc", optional = true }
