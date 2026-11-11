@@ -1048,7 +1048,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 // `1`, so `busybox nproc` and cargo's `num_cpus` always saw one
                 // CPU and `cargo build` defaulted to `-j1` even on an SMP=2+
                 // kernel. Until 2026-11-01 the hook was read only under
-                // `kernel_smp_shared`, which Taoxichuan does not build glue
+                // `kernel_bkl_smp`, which Taoxichuan does not build glue
                 // with, so tokio started one worker there at `smp=4`.
                 let nr_cpus: usize = crate::hooks::probed_core_count();
                 let mask: u64 = if nr_cpus >= CPU_SET_BITS_PER_WORD {

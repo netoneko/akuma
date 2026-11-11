@@ -84,6 +84,12 @@
 extern crate alloc;
 
 /// The runtime BKL-drop toggles and the per-syscall opt-out bitmap.
+/// Whether this build's lock is real: `bkl-smp` on (cfg `kernel_bkl_smp`). Off, every
+/// entry point in [`bkl`] is an empty body, so a kernel that runs more than one core on
+/// this lock must assert it at compile time — both Akuma kernels do. Taoxichuan builds
+/// it off and serializes under its own lock (`proposals/ONE_BIG_KERNEL_LOCK.md`).
+pub const ACTIVE: bool = cfg!(kernel_bkl_smp);
+
 pub mod policy;
 pub mod bkl;
 pub mod sync;

@@ -13,7 +13,7 @@ workspace = true
 # inner spinlock while a nested IRQ hard-spins on the BKL (the SMP=4 AB-BA wedge).
 # See `preempt::PreemptGuard`. That half was the separate `no-bkl-network` /
 # `no-bkl-vfs` features until 2026-11-11.
-smp-shared = []
+bkl-smp = []
 
 # No dependencies, by design. This is the leaf every other crate may depend on,
 # so anything added here is added to the whole tree's dependency closure. If a

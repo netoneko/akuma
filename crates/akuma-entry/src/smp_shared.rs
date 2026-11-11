@@ -30,9 +30,8 @@
 //! cross-core locks. A `static` in this build is genuinely shared across cores — not
 //! replicated — which is the whole point.
 //!
-//! Everything here is behind `cfg(kernel_smp_shared)` (the `smp-shared` feature);
-//! the default and multikernel (`smp`) builds compile none of it, and build.rs makes
-//! `smp` and `smp-shared` mutually exclusive.
+//! Every Akuma kernel build compiles this (the `smp-shared` feature that gated it,
+//! and the single-core build without it, were removed 2026-11-11).
 //!
 //! **Milestone M0 (this file):** bring N cores up on the shared boot page tables and
 //! the single shared PMM/heap — no isolation, no partitions. Each secondary sets up
@@ -374,7 +373,6 @@ fn dsb_sy() {
 /// `gic_v3::init`'s CPU-interface sequence — was **three `unsafe` blocks that
 /// already existed elsewhere**, so consolidating removed them rather than
 /// relocating them (`docs/archive/AKUMA_GIC_CONSOLIDATION.md`).
-#[cfg(kernel_smp_shared)]
 fn redistributor_layout() -> akuma_gic::RedistributorLayout {
     akuma_gic::RedistributorLayout {
         base_pa: akuma_kernel_core::platform::gicr_base_pa(),

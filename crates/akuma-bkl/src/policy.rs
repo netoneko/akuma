@@ -404,7 +404,7 @@ pub fn set_syscall_bkl_optout(nr: u64, on: bool) -> bool {
 /// the first place (`KernelLock::acquire_no_ticket`) — so there is nothing for `now_serving` to
 /// fail to match. Default flipped back to ON the same day. The POOL-over-switch foundation
 /// (step 1 of M5c) is always active regardless.
-/// Only affects `cfg(kernel_smp_shared)` builds — the default release build is untouched.
+/// Only affects `cfg(kernel_bkl_smp)` builds — the default release build is untouched.
 static SCHED_BKLFREE_EL0_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Whether the BKL-free EL0-preempt scheduler path (M5c step 2) is enabled.

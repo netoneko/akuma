@@ -10,7 +10,7 @@ workspace = true
 [features]
 # Real (shared-kernel) SMP: only reaches `akuma-bkl`, whose `enter_kernel` /
 # `leave_kernel` bracket the interpreter's whole-file read.
-smp-shared = ["akuma-bkl/smp-shared"]
+bkl-smp = ["akuma-bkl/bkl-smp"]
 
 [dependencies]
 # `phys_to_virt` for the segment writes, and `safe_print!`.

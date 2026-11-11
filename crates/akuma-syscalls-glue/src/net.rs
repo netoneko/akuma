@@ -76,7 +76,7 @@ pub(super) struct NetBkl;
 
 #[cfg(feature = "smoltcp")]
 impl GuardToggle for NetBkl {
-    const COMPILED_IN: bool = cfg!(kernel_smp_shared);
+    const COMPILED_IN: bool = cfg!(kernel_bkl_smp);
     #[inline]
     fn enabled() -> bool {
         true

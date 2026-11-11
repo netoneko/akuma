@@ -25,14 +25,14 @@ use akuma_net::socket::{self, libc_errno};
 pub(super) struct VfsBkl;
 
 impl GuardToggle for VfsBkl {
-    const COMPILED_IN: bool = cfg!(kernel_smp_shared);
+    const COMPILED_IN: bool = cfg!(kernel_bkl_smp);
     #[inline]
     fn enabled() -> bool {
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         {
             akuma_bkl::policy::vfs_bkl_drop_enabled()
         }
-        #[cfg(not(kernel_smp_shared))]
+        #[cfg(not(kernel_bkl_smp))]
         {
             false
         }
@@ -84,14 +84,14 @@ pub(super) type VfsBklGuard = ToggledGuard<VfsBkl>;
 pub(super) struct DriverBkl;
 
 impl GuardToggle for DriverBkl {
-    const COMPILED_IN: bool = cfg!(kernel_smp_shared);
+    const COMPILED_IN: bool = cfg!(kernel_bkl_smp);
     #[inline]
     fn enabled() -> bool {
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         {
             akuma_bkl::policy::drivers_bkl_drop_enabled()
         }
-        #[cfg(not(kernel_smp_shared))]
+        #[cfg(not(kernel_bkl_smp))]
         {
             false
         }
@@ -658,7 +658,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
         }
         akuma_exec::process::FileDescriptor::BlockDev { idx, pos, .. } => {
-            // Raw block read (`proposals/RAW_BLOCK_DEVICE_FD.md`) — same BKL
+            // Raw block read (`docs/archive/RAW_BLOCK_DEVICE_FD.md`) — same BKL
             // discipline as the `File` arm above, since it's the same
             // underlying disk I/O `akuma_vfs_glue::ext2` drives.
             let _vfs_bkl = VfsBklGuard::new();
@@ -1116,7 +1116,7 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
     } else if let akuma_exec::process::FileDescriptor::BlockDev { pos, .. } = fd {
         // No `reserve_write_pos`-style upfront reservation — the one intended
-        // consumer (`dd` onto the drop-off drive, `proposals/RAW_BLOCK_DEVICE_FD.md`)
+        // consumer (`dd` onto the drop-off drive, `docs/archive/RAW_BLOCK_DEVICE_FD.md`)
         // is a single sequential writer; two processes racing writable fds on
         // the same unmounted device is unguarded, same as Linux raw block I/O.
         pos as usize
@@ -2019,7 +2019,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     // measurement window the audit flagged (`BKL_PHASE7_AUDIT.md` §5, 7c: "10.5% for
     // a converted syscall's prologue/epilogue is high enough that either the window
     // starts too late or the re-acquire costs more than expected"). This guard's only
-    // live cfg is `kernel_smp_shared`; without it it's a no-op.
+    // live cfg is `kernel_bkl_smp`; without it it's a no-op.
     let _vfs_bkl = VfsBklGuard::new();
 
     let path = akuma_vfs_glue::resolve_symlinks(&path);
@@ -2151,7 +2151,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
         return Err(ESRCH);
     }
 
-    // Raw block device open (`/dev/vdX`) — `proposals/RAW_BLOCK_DEVICE_FD.md`.
+    // Raw block device open (`/dev/vdX`) — `docs/archive/RAW_BLOCK_DEVICE_FD.md`.
     // `dev_node` only reports a block node here for the host (box_id == 0);
     // boxes get no synthetic /dev, so this never fires for a box process.
     if let Some(node) = akuma_vfs_glue::dev_node(&path)

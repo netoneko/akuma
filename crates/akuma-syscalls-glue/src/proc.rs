@@ -885,12 +885,12 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         // proven file-fault drop. The dropped-window ledger keeps the window BKL-free across
         // timer ticks (a bare leave/enter pair let the first tick re-hold the BKL for the
         // rest of the read); the syscall wrapper's leave_kernel still balances it.
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         let exec_dropped_bkl = akuma_bkl::policy::exec_bkl_drop_enabled();
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         if exec_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
         let read_result = akuma_vfs_glue::fs::read_file(&resolved_path);
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         if exec_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
         match read_result {
             Ok(data) => Some(data),

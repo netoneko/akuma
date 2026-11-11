@@ -356,7 +356,7 @@ pub fn end_of_interrupt(irq: u32) {
 }
 
 /// Trigger a Software Generated Interrupt to this CPU (affinity 0.0.0.0).
-// Unused under `kernel_smp_shared` (self-targets via `trigger_sgi_core`); kept for the
+// Unused under `kernel_bkl_smp` (self-targets via `trigger_sgi_core`); kept for the
 // default/single-core path.
 #[allow(dead_code)]
 pub fn trigger_sgi(sgi_id: u32) {
@@ -398,7 +398,7 @@ pub fn trigger_sgi_core(target_aff0: u32, sgi_id: u32) {
 /// so a single register write reaches every core Akuma runs on — the machine is
 /// a flat `-smp N` with Aff1/2/3 = 0. Bits for PEs that do not exist are
 /// ignored by the GIC, so no core count is needed here.
-#[cfg(kernel_smp_shared)]
+#[cfg(kernel_bkl_smp)]
 pub fn broadcast_sgi(sgi_id: u32) {
     if sgi_id > 15 {
         return;
@@ -491,7 +491,7 @@ pub fn secondary_init(idx: usize, layout: RedistributorLayout) {
 /// self-target rather than hit PE0 the way [`trigger_sgi`] does. Lived in
 /// `src/gic.rs` (the deleted backend dispatcher) — it is the one entry point
 /// there that was more than a `#[cfg]` forward.
-#[cfg(kernel_smp_shared)]
+#[cfg(kernel_bkl_smp)]
 pub fn trigger_sgi_self(sgi_id: u32) {
     let mpidr = akuma_cpu::sysreg::mpidr_el1();
     trigger_sgi_core((mpidr & 0xff) as u32, sgi_id);

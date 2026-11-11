@@ -474,8 +474,8 @@ call and exits 1 on one nobody does. A call nobody serves answers `ENOSYS` and t
 
 ## Background
 
-[`proposals/B15_TOKIO_KERNEL_KIT.md`](../../proposals/B15_TOKIO_KERNEL_KIT.md) (the plan),
-[`proposals/B21_TOKIO_KERNEL_AARCH64.md`](../../proposals/B21_TOKIO_KERNEL_AARCH64.md) and its record
+[`docs/archive/B15_TOKIO_KERNEL_KIT.md`](../../docs/archive/B15_TOKIO_KERNEL_KIT.md) (the plan),
+[`docs/archive/B21_TOKIO_KERNEL_AARCH64.md`](../../docs/archive/B21_TOKIO_KERNEL_AARCH64.md) and its record
 [`docs/archive/TAOXICHUAN_B21_AARCH64.md`](../../docs/archive/TAOXICHUAN_B21_AARCH64.md) (the aarch64 port,
 with the parity table over both machines),
 [`crates/akuma-middleware/docs/middleware.md`](../akuma-middleware/docs/middleware.md) (the syscall middleware guide) and

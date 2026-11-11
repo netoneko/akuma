@@ -245,6 +245,50 @@ No crate dropped out of any image: the removal deleted constants and arms, not d
 `smp-shared` is not yet removable: Taoxichuan, the host tests and the rump devbox build without
 it (252 cfg sites in 35 files). It needs its own step - deciding what Taoxichuan gets.
 
+## `smp-shared` removed; the shared crates' switch is `bkl-smp` (2026-11-11)
+
+There is no single-core AArch64 build any more. Shared-kernel SMP is unconditional on both Akuma
+kernels; `SMP=1` is the same image on one core.
+
+- **The single-core arms are deleted** wherever only Akuma compiles them: `akuma-entry`,
+  `akuma-exceptions`, `akuma-kernel-glue`, `akuma-kernel-core`, `akuma-kernel-tests-aarch64`,
+  `amd64/src` (the cfg resolver folded `kernel_smp_shared` to true). These crates no longer emit
+  the cfg or carry the feature.
+- **The 16 crates Taoxichuan shares keep the switch**, renamed `bkl-smp` / `cfg(kernel_bkl_smp)`:
+  akuma-bkl, -cpu, -dma, -el0-entry, -exec, -ext2, -gic, -mmu, -net, -net-nic, -primitives,
+  -switch, -syscalls-glue, -threading, -tokio-kernel-amd64, -vfs-glue. Taoxichuan builds them
+  without it and serializes under its own ticket lock. Host tests use the off arms. Unifying the
+  two locks is [`proposals/ONE_BIG_KERNEL_LOCK.md`](../../proposals/ONE_BIG_KERNEL_LOCK.md).
+- **How it is wired:**
+  - The root `Cargo.toml` turns `bkl-smp` on through `akuma-kernel-glue`, and `amd64/Cargo.toml`
+    on each shared dependency.
+  - `akuma_bkl::ACTIVE` (`cfg!(kernel_bkl_smp)`) is const-asserted by both kernels, so a missed
+    forward fails the build. It replaces amd64's `BKL_REQUIRES_SMP_SHARED`.
+- **The `devbox-smoltcp` feature** is now empty (it was an alias for `smp-shared`).
+- **Behaviour change: builds without default features are now SMP.** The rump devbox and an
+  `--no-default-features --features no-tests,smoltcp` kernel were single-core before. The latter
+  could not run commands over ssh (`/bin/sh: uname: No such process`, already true at 6c6e1004).
+  It now boots and runs `uname`, `ls` and `cat /proc/meminfo` at 256 MB.
+
+| image | `.text` |
+|---|---|
+| Taoxichuan x86_64 | byte-identical |
+| Taoxichuan aarch64 | byte-identical |
+| default | +128 B (virtio/net-nic inlining shifts; −48 B by symbol) |
+| devbox-smoltcp | +120 B (symbol noise) |
+| amd64 | −48 B (smoltcp/glue inlining) |
+| rump devbox | 1,683,092 → 1,754,568 (gains SMP) |
+
+Gates:
+
+- HVF default image: SMP=1 314/1 (the known `thread_slot_reclaim_on_spawn`), SMP=2 323/0,
+  SMP=4 321/0.
+- amd64 TCG: SMP=1 829/0, SMP=2 839/0.
+- Clippy on 9 targets; host tests; unsafe budget 410; untyped-address ratchet 700.
+
+`proposals/` was cleared the same day: its six files moved to `docs/archive/`, each with a banner
+saying what became of it.
+
 ## Proposed simplifications
 
 | # | change | risk | gate |

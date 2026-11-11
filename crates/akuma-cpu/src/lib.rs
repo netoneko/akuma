@@ -1037,7 +1037,7 @@ pub mod park {
     /// clear (`amd64/src/sched.rs`: the idle loop is "the only place the
     /// scheduler re-enables it"), so a bare `hlt` there is a permanent sleep —
     /// measured as the `cowstale` probe never returning after
-    /// `blocking_relax_net` → `idle_halt` went live with `kernel_smp_shared`
+    /// `blocking_relax_net` → `idle_halt` went live with `kernel_bkl_smp`
     /// (2026-09-08). `sti` takes effect after the *following* instruction, so
     /// the three-instruction sequence is atomic with respect to the tick: an
     /// interrupt arriving between `sti` and `hlt` is taken, never slept past.

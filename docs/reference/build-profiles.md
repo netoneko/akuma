@@ -183,8 +183,8 @@ extreme vs release) and two open defects it surfaced:
 
 ## Feature deltas vs. default `release`
 
-`release` builds with cargo's normal default feature resolution: `smp-shared`
-(which includes the BKL carve-outs), `smoltcp`, `sound`,
+`release` builds with cargo's normal default feature resolution (shared-kernel
+SMP and its BKL carve-outs are unconditional, not a feature): `smoltcp`, `sound`,
 `linux-extra-syscalls` (the seven `sc-*` families) and `sc-reboot`. The ext2
 block cache is not a feature: it is on in every build (the `fs-cache` feature
 was folded in 2026-11-11).
@@ -196,8 +196,8 @@ were deleted from `Cargo.toml` entirely (commit `bade6ab` for TLS,
 
 | Target | Drops vs. default | Adds vs. default |
 |---|---|---|
-| `devbox` | `smoltcp`, `smp-shared` | `rump-default` (→ `rump`), `no-tests` |
-| `devbox-smoltcp` | — (inherits default set) | `devbox-smoltcp` (now only an alias for `smp-shared`, already default), `no-tests` |
+| `devbox` | `smoltcp` | `rump-default` (→ `rump`), `no-tests` |
+| `devbox-smoltcp` | — (inherits default set) | `devbox-smoltcp` (now an empty feature), `no-tests` |
 
 ### Listener backlog and the userspace sshd
 
@@ -255,7 +255,7 @@ codegen:
 
 Practical cost: artifacts for different feature sets now share
 `target/aarch64-unknown-none/release/`, so switching between e.g. plain release
-and `--features smp-shared` forces a rebuild instead of hitting a warm
+and `--features devbox-smoltcp,no-tests` forces a rebuild instead of hitting a warm
 per-profile cache.
 
 ## Known inconsistencies

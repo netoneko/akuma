@@ -1287,7 +1287,7 @@ The caps (weekly about 205M, 5-hour about 34M) are therefore Flash-only and unaf
 
 ### Idea parked (2026-10-26): libakuma on plain Linux syscalls, so `userspace/scratch` could be the stage 8 git client
 
-Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart HTTP) builds unchanged for `x86_64-unknown-none` (285 KB static) and uses only Linux-numbered calls on x86_64 except three Akuma-private ones (`RESOLVE_HOST`, `UPTIME`, `TIME`) that Taoxichuan would answer with ENOSYS. Not run in a guest. **User's decision: do not cut this corner now**; real `git` is the better preparation for later stages, goose is left to find its own route to the stage 8 gate, and the libakuma Linux-compat change is written down as an idea in `proposals/LIBAKUMA_LINUX_COMPAT.md` (findings, the change, the first test). Revisit if the git gate stalls.
+Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart HTTP) builds unchanged for `x86_64-unknown-none` (285 KB static) and uses only Linux-numbered calls on x86_64 except three Akuma-private ones (`RESOLVE_HOST`, `UPTIME`, `TIME`) that Taoxichuan would answer with ENOSYS. Not run in a guest. **User's decision: do not cut this corner now**; real `git` is the better preparation for later stages, goose is left to find its own route to the stage 8 gate, and the libakuma Linux-compat change is written down as an idea in `docs/archive/LIBAKUMA_LINUX_COMPAT.md` (findings, the change, the first test). Revisit if the git gate stalls.
 
 
 ### Process finding (2026-10-27): goose reads source and adds probes by default; the debugging docs already described the bug

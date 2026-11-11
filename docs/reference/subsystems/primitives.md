@@ -227,7 +227,7 @@ Device-nGnRnE at boot. `akuma_exec::mmu` re-exports the whole table.
 
 ## Features are load-bearing, and a mistake here is silent
 
-`PreemptGuard`'s entire body is behind `#[cfg(kernel_smp_shared)]`, which this
+`PreemptGuard`'s entire body is behind `#[cfg(kernel_bkl_smp)]`, which this
 crate's own `build.rs` emits from its own forwarded `smp-shared` feature. If the
 forwarding chain breaks, **the guard compiles to a zero-sized no-op**: nothing
 fails to build, nothing warns, and every inner-spinlock critical section in the

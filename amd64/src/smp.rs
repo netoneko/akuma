@@ -4,7 +4,7 @@
 //! said so in its `SAFETY` comments — "single core" — as the whole justification
 //! for a `static mut` table reached through raw pointers. This is what replaces
 //! that justification. It is the amd64 counterpart of the aarch64 kernel's
-//! `smp-shared` feature: **one shared kernel across all cores, serialised by one
+//! shared-kernel SMP: **one shared kernel across all cores, serialised by one
 //! lock** (`docs/reference/subsystems/smp-shared.md`), chosen over fine-grained
 //! locking for the same reason it was chosen there — it turns "every `static
 //! mut` in the tree is a data race" into "kernel code runs on one core at a
@@ -169,7 +169,7 @@ impl PerCpu {
 ///
 /// `index` and `current_task` are also read cross-crate — `akuma_cpu::percpu`
 /// loads `gs:[24]`/`gs:[32]` for `current_core_id`/`current_tid` under
-/// `kernel_smp_shared` — so those two offsets are a cross-crate contract, not
+/// `kernel_bkl_smp` — so those two offsets are a cross-crate contract, not
 /// just an assembly one. Moving either field means moving the offset in
 /// `akuma-cpu`'s `percpu` module in the same change.
 const OFFSETS_PINNED: () = {
@@ -315,7 +315,7 @@ pub fn need_resched() -> bool {
 // ---------------------------------------------------------------------------
 //
 // **`akuma_bkl`'s lock, not a private one, since 5b (2026-09-08).** This file
-// carried a hand-rolled ticket BKL from bring-up. Flipping `kernel_smp_shared`
+// carried a hand-rolled ticket BKL from bring-up. Flipping `kernel_bkl_smp`
 // for the process-table step would have activated `akuma_bkl`'s `KernelLock`
 // *alongside* it — two locks answering one question, with `idle_halt`,
 // `blocking_relax` and `akuma_elf::interp`'s loader taking the crate's while
@@ -341,17 +341,13 @@ pub fn need_resched() -> bool {
 //   — so greps keyed on the old wording move to `stuck: owner=`; the
 //   `docs/runbooks/recover-wedged-vm.md` `[BKL] stuck` prefix is unchanged.
 //
-// The build without `kernel_smp_shared` refuses to compile below: the crate's
+// A build whose `akuma-bkl` lacks `bkl-smp` refuses to compile: the crate's
 // entry points are no-ops there, which would run four cores with no lock at all.
-
-#[cfg(not(kernel_smp_shared))]
-const BKL_REQUIRES_SMP_SHARED: () = assert!(
-    false,
-    "amd64 requires the `smp-shared` feature: its Big Kernel Lock is akuma_bkl's, \
+const _: () = assert!(
+    akuma_bkl::ACTIVE,
+    "amd64 needs `akuma-bkl` built with `bkl-smp`: its Big Kernel Lock is akuma_bkl's, \
      whose entry points are no-ops without it"
 );
-#[cfg(not(kernel_smp_shared))]
-const _: () = BKL_REQUIRES_SMP_SHARED;
 
 /// Spins a core waits with the lock dropped in [`bkl_drop_window`] before it
 /// takes the lock back. Small on purpose: the lock is FIFO, so a peer that was

@@ -746,7 +746,7 @@ pub fn sync_icache_range(kva: usize, len: usize) {
 /// `oncpu_gate_scheduler_race`, `cowstale_stale_write_fault_fixed`) turned on
 /// exactly that question. `ThisCore` is for a translation provably private to
 /// the calling core (e.g. a scratch mapping nothing else could have cached);
-/// picking it for anything else under `kernel_smp_shared` reintroduces the
+/// picking it for anything else under `kernel_bkl_smp` reintroduces the
 /// stale-peer-translation bug those investigations closed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TlbTarget {
@@ -916,7 +916,7 @@ fn shootdown_wait_remote() {
 // variants broadcast the invalidation across the inner-shareable domain (all cores on
 // QEMU `virt`). Other builds keep the cheaper core-local form. The context-switch flush
 // (threading) stays local — it only needs to clear the switching core's own TLB.
-#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_bkl_smp))]
 pub fn flush_tlb_all(target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     match target {
@@ -926,7 +926,7 @@ pub fn flush_tlb_all(target: TlbTarget) -> TlbFlush {
     TlbFlush::pending()
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_bkl_smp)))]
 pub fn flush_tlb_all(_target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::vmalle1();
@@ -967,7 +967,7 @@ pub fn get_boot_ttbr0() -> u64 {
 pub fn get_boot_ttbr0() -> u64 { 0 }
 
 // Inner-shareable under shared SMP (see `flush_tlb_all`).
-#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_bkl_smp))]
 pub fn flush_tlb_asid(asid: u16, target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     match target {
@@ -977,7 +977,7 @@ pub fn flush_tlb_asid(asid: u16, target: TlbTarget) -> TlbFlush {
     TlbFlush::pending()
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_bkl_smp)))]
 pub fn flush_tlb_asid(asid: u16, _target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::aside1(asid);
@@ -1000,7 +1000,7 @@ pub fn flush_tlb_asid(_asid: u16, target: TlbTarget) -> TlbFlush {
 pub fn flush_tlb_asid(_asid: u16, _target: TlbTarget) -> TlbFlush { TlbFlush::done() }
 
 // Inner-shareable under shared SMP (see `flush_tlb_all`).
-#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_bkl_smp))]
 pub fn flush_tlb_page(va: usize, target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     match target {
@@ -1010,7 +1010,7 @@ pub fn flush_tlb_page(va: usize, target: TlbTarget) -> TlbFlush {
     TlbFlush::pending()
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_bkl_smp)))]
 pub fn flush_tlb_page(va: usize, _target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::vaae1((va >> 12) as u64);
@@ -1159,10 +1159,10 @@ static PREV_L0: [AtomicU64; TTBR_TRACK_CORES] = [ATOMIC_U64_ZERO; TTBR_TRACK_COR
 ///
 /// It used to read `akuma_bkl::bkl::current_core_id()` itself, which is
 /// `akuma_primitives::cpu::current_core_id` — an `mrs mpidr_el1` under
-/// `kernel_smp_shared`, and a **literal `0`** otherwise. That shim's doc reasons
+/// `kernel_bkl_smp`, and a **literal `0`** otherwise. That shim's doc reasons
 /// about two cases (single-core, and the AArch64 multikernel where every caller
 /// wants `0`) and there is now a third it did not anticipate: **amd64 is real
-/// SMP without `kernel_smp_shared`**, running four cores off its own ticket BKL
+/// SMP without `kernel_bkl_smp`**, running four cores off its own ticket BKL
 /// in `amd64/src/smp.rs`. There every core would have published into slot 0,
 /// and the last writer would erase the record of a table a *peer* core is still
 /// running on — which is the precise thing this registry exists to prevent, so
@@ -4239,7 +4239,7 @@ pub fn flush_tlb_range_all_asid(start_va: usize, pages: usize, target: TlbTarget
     // invalidate peers running the same address space in EL0 (see
     // `flush_tlb_all`). Other builds, and a `ThisCore` target, keep the
     // cheaper core-local form.
-    let broadcast = cfg!(kernel_smp_shared) && target == TlbTarget::AllCores;
+    let broadcast = cfg!(kernel_bkl_smp) && target == TlbTarget::AllCores;
     for _ in 0..pages {
         if broadcast {
             akuma_cpu::tlb::vaae1is((va >> 12) as u64);
@@ -4720,10 +4720,10 @@ fn demote_range(l0: &akuma_pagetable::Table, va_start: usize, pages: usize) -> u
             demoted += 1;
         }
     });
-    // Ensure all PTE writes are visible before returning. Under kernel_smp_shared,
+    // Ensure all PTE writes are visible before returning. Under kernel_bkl_smp,
     // the caller will issue flush_tlb_all() which includes DSB, but this DSB here
     // guarantees ordering even if the call pattern changes.
-    #[cfg(kernel_smp_shared)]
+    #[cfg(kernel_bkl_smp)]
     akuma_cpu::barrier::dsb_ish();
     demoted
 }

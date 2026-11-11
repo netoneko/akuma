@@ -1,7 +1,10 @@
 # B15–B21: a whole kernel from one short file (proposal, 2026-11-02)
 
+> **Archived 2026-11-11 from `proposals/`.** Done: `crates/akuma-tokio-kernel` and `taoxichuan/src/main.rs`
+> (one `Kernel` chain) are this proposal built. The status line below is as last written.
+
 **Status: proposal, not started.** Steps B15–B21 of
-[`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`](../docs/archive/TAOXICHUAN_CLEANUP_PLAN.md).
+[`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md).
 
 ## Goal
 
@@ -125,6 +128,6 @@ steps move state) applies again.
 
 ## Background
 
-[`TAOXICHUAN_CLEANUP_PLAN.md`](../docs/archive/TAOXICHUAN_CLEANUP_PLAN.md) (phase 3, B11),
+[`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md) (phase 3, B11),
 [`B12_AARCH64_SLOT_TABLE.md`](B12_AARCH64_SLOT_TABLE.md),
-[`crates/akuma-runtime-tokio/README.md`](../crates/akuma-runtime-tokio/README.md).
+[`crates/akuma-runtime-tokio/README.md`](../../crates/akuma-runtime-tokio/README.md).

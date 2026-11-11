@@ -1408,3 +1408,11 @@ The 4 MB `extreme` build and its `kernel_profile_extreme` cfg are gone; the `ext
 stays as codegen only. `fs-cache` is folded in, so every build, both arches and Taoxichuan
 included, has the ext2 clock cache. Default images unchanged; the rump devbox gains 10.7 KB for
 the cache (`AKUMA_FEATURE_AUDIT.md`). One cfg dimension fewer for the unification.
+
+## `smp-shared` removed, `bkl-smp` on the shared crates (2026-11-11)
+
+The single-core AArch64 build is gone; both kernels are shared-kernel SMP unconditionally and
+const-assert `akuma_bkl::ACTIVE`. The 16 crates Taoxichuan shares keep the switch as `bkl-smp` /
+`kernel_bkl_smp` because Taoxichuan still serializes under its own lock. Merging the two locks is
+`proposals/ONE_BIG_KERNEL_LOCK.md`, deferred to the big merge. Taoxichuan images are
+byte-identical; the Akuma images move by codegen noise only (`AKUMA_FEATURE_AUDIT.md`).

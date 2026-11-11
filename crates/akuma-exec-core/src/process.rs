@@ -303,7 +303,7 @@ pub enum FileDescriptor {
     /// advance (`dd` is sequential; `lseek` also updates it). `writable` is
     /// fixed at open time: an `O_RDONLY` fd cannot be upgraded by anything
     /// after the open-time mounted-device check
-    /// (`proposals/RAW_BLOCK_DEVICE_FD.md` §3 — a raw write to a *mounted*
+    /// (`docs/archive/RAW_BLOCK_DEVICE_FD.md` §3 — a raw write to a *mounted*
     /// device bypasses `Ext2Filesystem`'s cache, so write-open of a mounted
     /// device is refused with `EBUSY` and only ever an unmounted device like
     /// the `KERNEL_DROPOFF` drive gets a writable fd).

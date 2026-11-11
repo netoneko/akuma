@@ -72,8 +72,8 @@ static KTG_TRACES: AtomicUsize = AtomicUsize::new(0);
 
 /// Rate-limit counter for the `[KTG-STALE]` tripwire: a grace-expired hard kill
 /// aimed at a thread slot that had been recycled to an unrelated process.
-/// Only the `kernel_smp_shared` grace-wait has that window, so only it reports.
-#[cfg(kernel_smp_shared)]
+/// Only the `kernel_bkl_smp` grace-wait has that window, so only it reports.
+#[cfg(kernel_bkl_smp)]
 static KTG_STALE_SKIPS: AtomicUsize = AtomicUsize::new(0);
 
 /// Rate-limit counter for the `[KTG-STALE-CH]` tripwire: PHASE 2 about to evict
@@ -1164,7 +1164,7 @@ impl Process {
     /// the fault fast path holds this lock *instead of* the BKL. See
     /// docs/archive/SMP_SHARED_M5_FAULT_LOCK_PLAN.md.
     ///
-    /// On builds without `kernel_smp_shared` this is a bare (uncontended) spinlock
+    /// On builds without `kernel_bkl_smp` this is a bare (uncontended) spinlock
     /// hold with no IRQ change — see [`ProcAddressSpace::lock`].
     #[inline]
     pub fn with_as_locked<R>(&self, f: impl FnOnce() -> R) -> R {
@@ -1570,7 +1570,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     // Single-core / non-SMP: the caller is the only EL1 thread, so no sibling
     // can be mid-critical-section; the direct mark is safe and the default
     // build stays byte-for-byte unchanged.
-    #[cfg(kernel_smp_shared)]
+    #[cfg(kernel_bkl_smp)]
     {
         for (sib_pid, sib_tid) in &siblings {
             if let Some(tid) = sib_tid {
@@ -1684,7 +1684,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
             crate::threading::blocking_relax();
         }
     }
-    #[cfg(not(kernel_smp_shared))]
+    #[cfg(not(kernel_bkl_smp))]
     {
         // PHASE 1 (single-core): mark ALL sibling threads TERMINATED. The
         // caller is the sole EL1 thread, so none can be mid-critical-section.
@@ -1743,7 +1743,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
         }
 
         // Deliberately do NOT clear `p.thread_id` here, even though `kill_process` and
-        // `kill_fork_subtree_recursive` do. Under `kernel_smp_shared` PHASE 1 only
+        // `kill_fork_subtree_recursive` do. Under `kernel_bkl_smp` PHASE 1 only
         // *requests* a deferred kill and its grace-wait exits as soon as each sibling
         // has consumed the request — which is before the sibling has actually marked
         // itself TERMINATED. `unregister_process` re-reading this field is the backstop

@@ -7,18 +7,12 @@
 // root's build.rs only ever spoke for the root package.
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
     println!("cargo::rustc-check-cfg=cfg(kernel_console_lock)");
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_TESTS");
     let kernel_tests = std::env::var("CARGO_FEATURE_NO_TESTS").is_err();
     if kernel_tests {
         println!("cargo:rustc-cfg=kernel_tests");
-    }
-
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
-    if std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok() {
-        println!("cargo:rustc-cfg=kernel_smp_shared");
     }
 
     // `console.rs`'s opt-in cross-core lock. Same derivation as the root and

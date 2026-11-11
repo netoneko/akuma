@@ -6,7 +6,7 @@
 //! docs/reference/subsystems/smp-shared.md for the design.
 //!
 //! **Zero-cost when off:** every function here compiles to an empty inline body
-//! unless `cfg(kernel_smp_shared)` is set (the `smp-shared` feature, forwarded from
+//! unless `cfg(kernel_bkl_smp)` is set (the `smp-shared` feature, forwarded from
 //! the bin crate). Builds without it are byte-for-byte unaffected.
 //!
 //! **M1 wiring:** the syscall path (`rust_sync_el0_handler` entry/exit) and the idle
@@ -15,15 +15,15 @@
 //! incoming EL0 thread, re-acquiring for an incoming EL1 thread) lands in M2 alongside
 //! the cross-core scheduler, where it can be exercised under real contention.
 
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 use crate::sync::KernelLock;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// The one Big Kernel Lock. Only meaningful under `cfg(kernel_smp_shared)`, and
+/// The one Big Kernel Lock. Only meaningful under `cfg(kernel_bkl_smp)`, and
 /// only on the bare-metal target — every user is `target_os = "none"`, so the
 /// host test build (which now sees `smp-shared` because it is in the default
 /// feature set) would otherwise carry it unused and trip `dead_code = "deny"`.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 static KERNEL_LOCK: KernelLock = KernelLock::new();
 
 // --- Deliberately-dropped BKL windows -------------------------------------------------
@@ -118,14 +118,14 @@ impl<const N: usize> Default for DroppedWindowLedger<N> {
 /// thread only opens/closes its OWN entry, and it cannot run on two cores at once. The
 /// IRQ epilogue on the resuming core reads the entry after the scheduler's `commit_switch`
 /// published the thread, so it observes the depth the thread had when it was switched out.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 static DROPPED_WINDOWS: DroppedWindowLedger<{ akuma_primitives::MAX_THREADS }> =
     DroppedWindowLedger::new();
 
 /// How many times an eret epilogue preserved a dropped window that the pre-ledger code
 /// would have converted into a BKL-held run. Diagnostic for the `[BKL] stuck` regression;
 /// sampled with decaying frequency into the log by `reconcile_for_spsr`.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 static WINDOWS_PRESERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Open a deliberately-dropped-BKL window for the current thread and release the BKL.
@@ -133,7 +133,7 @@ static WINDOWS_PRESERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 /// Order matters: the depth is published BEFORE the release, so an IRQ that lands in
 /// between sees the window and leaves the lock released on its way out (our own
 /// `leave_kernel` then idempotently no-ops).
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 pub fn dropped_window_open() {
     DROPPED_WINDOWS.open(akuma_primitives::preempt::current_tid());
@@ -146,7 +146,7 @@ pub fn dropped_window_open() {
 /// Order matters: the depth is decremented BEFORE the re-acquire, so an IRQ landing in
 /// between reconciles to "held" (target EL1, no window) and our `enter_kernel` is the
 /// owner-reentrant no-op.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 pub fn dropped_window_close() {
     if DROPPED_WINDOWS.close(akuma_primitives::preempt::current_tid()) {
@@ -167,7 +167,7 @@ pub fn dropped_window_close() {
 /// what keeps the mixed converted/unconverted state safe. Pair strictly with a
 /// `dropped_window_open()` made on the never-acquired entry path; every other dropper
 /// keeps using [`dropped_window_close`].
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 pub fn dropped_window_close_no_reacquire() {
     let _ = DROPPED_WINDOWS.close(akuma_primitives::preempt::current_tid());
@@ -175,7 +175,7 @@ pub fn dropped_window_close_no_reacquire() {
 
 /// `true` if the current thread is inside a deliberately-dropped-BKL window, i.e. its
 /// EL1 code must be resumed with the BKL RELEASED.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 pub fn in_dropped_window() -> bool {
     DROPPED_WINDOWS.is_open(akuma_primitives::preempt::current_tid())
@@ -228,7 +228,7 @@ impl Drop for DroppedWindowPause {
 /// (`return_to_kernel_from_fault`) and the syscall-entry tripwire in
 /// `rust_sync_el0_handler` (a recycled thread slot must never inherit a stale window —
 /// its EL1 excursions would silently run BKL-free).
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 pub fn reset_dropped_windows() -> u32 {
     let prior = DROPPED_WINDOWS.reset(akuma_primitives::preempt::current_tid());
     if prior != 0 {
@@ -254,7 +254,7 @@ pub fn reset_dropped_windows() -> u32 {
 /// it TERMINATED while it sits in `schedule_blocking`, so its excursion never reaches
 /// the close. Phase 7f tranche 2b found this the moment `nanosleep` — the first
 /// converted syscall that parks a thread for a long time — was listed.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 pub fn clear_dropped_windows_for_dead_thread(tid: usize) -> u32 {
     DROPPED_WINDOWS.reset(tid)
 }
@@ -263,7 +263,7 @@ pub fn clear_dropped_windows_for_dead_thread(tid: usize) -> u32 {
 /// only so `test_syscall_bkl_optout` can stage the "thread died mid-window" shape that
 /// [`clear_dropped_windows_for_dead_thread`] exists to clean up, without actually
 /// killing a parked thread. Never call this outside tests.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 pub fn dropped_window_open_for_tid_test(tid: usize) {
     DROPPED_WINDOWS.open(tid);
 }
@@ -279,7 +279,7 @@ pub use akuma_primitives::cpu::current_core_id;
 
 /// Acquire the BKL for this core — call on entering kernel code from EL0. Spins if
 /// another core holds it; idempotent if this core already does. No-op unless
-/// `cfg(kernel_smp_shared)`.
+/// `cfg(kernel_bkl_smp)`.
 ///
 /// IRQs are masked around the `current_core_id()` read AND the lock operation. The
 /// syscall path calls this with IRQs enabled, so without the mask a preemption between
@@ -291,7 +291,7 @@ pub use akuma_primitives::cpu::current_core_id;
 /// 2026-07-22: a spinner on CPU3 with `me=2` in its registers), and a stale-`me`
 /// `release` CAS silently no-ops (the long-standing ticket-leak family — `owner`/
 /// `now_serving` drift the self-heal papers over).
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 pub fn enter_kernel() {
     let daif = crate::sync::irq_save_mask();
@@ -300,11 +300,11 @@ pub fn enter_kernel() {
 }
 
 /// Release the BKL for this core — call on returning to EL0. Idempotent if this core
-/// does not hold it. No-op unless `cfg(kernel_smp_shared)`.
+/// does not hold it. No-op unless `cfg(kernel_bkl_smp)`.
 ///
 /// Masked for the same migration-atomicity reason as [`enter_kernel`]: releasing with
 /// a stale core id is a silent CAS no-op that leaks the hold.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 pub fn leave_kernel() {
     let daif = crate::sync::irq_save_mask();
@@ -319,7 +319,7 @@ pub fn leave_kernel() {
 /// state: released. Without that exception, the first timer tick inside a dropped
 /// window converts the window's remainder into a BKL-held run — the `[BKL] stuck`
 /// regression (docs/archive/BKL_VFS_CARVE_OUT.md §8). No-op unless
-/// `cfg(kernel_smp_shared)`.
+/// `cfg(kernel_bkl_smp)`.
 ///
 /// The current-thread read is authoritative here: both callers are IRQ epilogues that
 /// run after the scheduler's `commit_switch` published the incoming thread, so the
@@ -328,7 +328,7 @@ pub fn leave_kernel() {
 /// Callers are IRQ epilogues (already masked), but mask anyway so the core-id read
 /// stays migration-atomic with the lock op no matter the calling context (see
 /// [`enter_kernel`]).
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 pub fn reconcile_for_spsr(spsr: u64) {
     let target_is_el0 = (spsr & 0xf) == 0;
@@ -342,7 +342,7 @@ pub fn reconcile_for_spsr(spsr: u64) {
 /// and occasionally logs — each time an epilogue PRESERVES a dropped window that the
 /// pre-ledger reconcile would have silently converted to a BKL-held run. Log volume is
 /// power-of-two sampled (x1, x2, x4, …), so a whole bulk-I/O run costs ~log2(N) lines.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 fn note_preserved_window() -> bool {
     if !in_dropped_window() {
@@ -356,7 +356,7 @@ fn note_preserved_window() -> bool {
 }
 
 /// Total eret epilogues that preserved a dropped-BKL window (see [`note_preserved_window`]).
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 pub fn dropped_windows_preserved() -> u64 {
     WINDOWS_PRESERVED.load(Ordering::Relaxed)
 }
@@ -368,7 +368,7 @@ pub fn dropped_windows_preserved() -> u64 {
 ///
 /// Consults the dropped-window ledger exactly like [`reconcile_for_spsr`]: resuming an
 /// EL1 thread inside a dropped window must not (re-)acquire on its behalf.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 pub fn reconcile_for_spsr_no_ticket(spsr: u64) {
     let target_is_el0 = (spsr & 0xf) == 0;
@@ -379,7 +379,7 @@ pub fn reconcile_for_spsr_no_ticket(spsr: u64) {
 }
 
 /// `true` if this core currently holds the BKL. For assertions / diagnostics.
-#[cfg(all(kernel_smp_shared, target_os = "none"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none"))]
 #[inline]
 pub fn held_by_current() -> bool {
     KERNEL_LOCK.held_by(current_core_id())
@@ -388,59 +388,59 @@ pub fn held_by_current() -> bool {
 // ---- No-op shims: everything above collapses to nothing unless smp-shared is on and
 // we're building for the bare-metal target. Keeps call sites unconditional. ----
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn enter_kernel() {}
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn leave_kernel() {}
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn reconcile_for_spsr(_spsr: u64) {}
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn reconcile_for_spsr_no_ticket(_spsr: u64) {}
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn held_by_current() -> bool {
     false
 }
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn dropped_window_open() {}
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn dropped_window_close() {}
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn dropped_window_close_no_reacquire() {}
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn in_dropped_window() -> bool {
     false
 }
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn reset_dropped_windows() -> u32 {
     0
 }
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn clear_dropped_windows_for_dead_thread(_tid: usize) -> u32 {
     0
 }
 
-#[cfg(not(all(kernel_smp_shared, target_os = "none")))]
+#[cfg(not(all(kernel_bkl_smp, target_os = "none")))]
 #[inline(always)]
 pub fn dropped_windows_preserved() -> u64 {
     0

@@ -542,11 +542,13 @@ scripts/build_devbox_smoltcp.sh && overlays/devbox/run-smoltcp.sh  # default dev
 scripts/build_devbox.sh && overlays/devbox/run.sh         # rump devbox (deferred; needs RUMP_NIC=1)
 ```
 
-**`cargo build --release` is real SMP.** `smp-shared` — one shared kernel across
-all cores under real locks — is in the default feature set; run it with `SMP=N`.
-That is *the* SMP. The `smp` feature is the separate, experimental
-**multikernel** (one whole kernel per core); the two are mutually exclusive
-(build.rs panics), so building it needs `--no-default-features`.
+**Every Akuma build is real SMP**: one shared kernel across all cores under
+`akuma-bkl` (run it with `SMP=N`; `SMP=1` is the same image on one core). It is
+not a feature any more: the `smp-shared` feature and the single-core build
+without it were removed 2026-11-11. The shared crates still carry the switch as
+`bkl-smp` (cfg `kernel_bkl_smp`) because Taoxichuan builds them without it and
+serializes under its own lock — `proposals/ONE_BIG_KERNEL_LOCK.md`. The
+multikernel (`smp`, one whole kernel per core) was removed 2026-08-10.
 
 Profiles are only `release`, `extreme-size` and `release-debug` — a build target
 is `--release` plus a feature set. `extreme-size` is **codegen only**

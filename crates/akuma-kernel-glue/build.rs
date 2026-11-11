@@ -4,17 +4,10 @@
 // features, so this crate needs its own build script (see
 // `akuma-kernel-core/build.rs` for the same pattern, one layer down).
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
     println!("cargo::rustc-check-cfg=cfg(kernel_console_lock)");
     println!("cargo::rustc-check-cfg=cfg(kernel_audio)");
-
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
-    let smp_shared = std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok();
-    if smp_shared {
-        println!("cargo:rustc-cfg=kernel_smp_shared");
-    }
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BKL_PROFILE");
     if std::env::var("CARGO_FEATURE_BKL_PROFILE").is_ok() {

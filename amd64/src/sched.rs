@@ -2686,7 +2686,6 @@ pub fn reaper_smoke_test(t: &mut Suite) {
     // `dead` reaches the state a killed thread leaves behind; `live` stays
     // INITIALIZING, i.e. claimed and about to be used by somebody.
     abandon_unpublished(dead);
-    #[cfg(kernel_smp_shared)]
     {
         akuma_bkl::bkl::dropped_window_open_for_tid_test(dead);
         akuma_bkl::bkl::dropped_window_open_for_tid_test(live);
@@ -2711,7 +2710,6 @@ pub fn reaper_smoke_test(t: &mut Suite) {
         u64::from(akuma_exec_core::thread::thread_state::INITIALIZING),
     );
 
-    #[cfg(kernel_smp_shared)]
     {
         // `reset` returns the prior depth, so a second clear reads what the
         // reap left. Zero means the reap did it; the control says the staging

@@ -13,7 +13,7 @@
 //! PMM can hand its RAM out) → device tree (RAM, GIC, UART, virtio; installs
 //! the device window) → PMM over the rest of RAM → vectors → GIC and the tick.
 //! Then what is not here yet: the root filesystem, EL0, init
-//! (`proposals/B21_TOKIO_KERNEL_AARCH64.md`, `docs/archive/TAOXICHUAN_B21_AARCH64.md`).
+//! (`docs/archive/B21_TOKIO_KERNEL_AARCH64.md`, `docs/archive/TAOXICHUAN_B21_AARCH64.md`).
 //!
 //! Console output is `safe_print!` over a stack buffer into the UART: nothing
 //! on a print path allocates.

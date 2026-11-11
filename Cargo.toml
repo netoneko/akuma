@@ -216,7 +216,7 @@ panic = "abort"
 # against the gdbstub (see docs/reference/scripts/multi-vm.md) instead of raw
 # addresses. OFF BY DEFAULT: nothing selects this profile unless explicitly
 # requested — `cargo build --profile release-debug --features
-# smp-shared,devbox-smoltcp,no-tests` (or whatever feature set you're debugging).
+# devbox-smoltcp,no-tests` (or whatever feature set you're debugging).
 # `cargo build --release` (the real target) is byte-for-byte unaffected.
 #
 # Only use this on a bug you can ALREADY reproduce reliably. `lockprobe.py`
@@ -262,10 +262,6 @@ syscall-debug-info = [
 ]
 
 default = [
-    # Real (shared-kernel) SMP is the default since 2026-08-10 — this is *the* SMP.
-    # The multikernel (one-kernel-per-core) alternative was removed 2026-08-10 —
-    # see docs/archive/TRIM_FAT_MULTIKERNEL.md.
-    "smp-shared",
     "smoltcp",
     "sound",
     "linux-extra-syscalls",
@@ -290,26 +286,9 @@ no-tests = ["akuma-exceptions/no-tests", "akuma-exec/no-tests", "akuma-syscalls-
 # depends on vCPU count. See docs/archive/FIRECRACKER_PORT.md.
 platform-firecracker = ["akuma-config/platform-firecracker", "akuma-virtio/platform-firecracker", "akuma-kernel-glue/platform-firecracker", "akuma-kernel-tests-aarch64/platform-firecracker"]
 
-
-# Real (shared-kernel) SMP / classic symmetric multiprocessing. NOT in `default`:
-# all shared-kernel secondary bringup + the shared scheduler/locking live behind
-# `cfg(kernel_smp_shared)`, which build.rs emits only when this feature is set (via
-# CARGO_FEATURE_SMP_SHARED). Built with plain `--release`. Every core shares one
-# kernel image, one PMM/heap, and one run queue under real cross-core locks. See
-# docs/reference/subsystems/smp-shared.md and docs/archive/SMP_SHARED.md. The
-# experimental one-kernel-per-core alternative (`smp`) was removed 2026-08-10 —
-# docs/archive/TRIM_FAT_MULTIKERNEL.md.
-# Also runs five syscall families without the Big Kernel Lock — network, VFS,
-# fork's page copy, mm and the drivers (Phases 2-6 of
-# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md) — and turns on the IRQ masking
-# in `PreemptGuard` that makes that safe. Each was its own `no-bkl-*` feature until
-# 2026-11-11, when they were folded in: every shipped build had all of them on,
-# and A/B is the runtime toggles in `akuma_bkl::policy` (same binary, no
-# rebuild). `docs/archive/AKUMA_FEATURE_AUDIT.md` F2.
 # Measurement only: `test_epoll_socket_waker` prints when its waker started, when it called
 # `wake_all`, when the waiter returned, and on which cores (`[epoll-waker-trace]`). Off everywhere.
 epoll-waker-trace = ["akuma-kernel-tests-aarch64/epoll-waker-trace"]
-smp-shared = ["akuma-exec/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-exceptions/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "akuma-ext2/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-kernel-core/smp-shared", "akuma-kernel-glue/smp-shared", "akuma-kernel-tests-aarch64/smp-shared"]
 
 # BKL-hold attribution (measurement builds only — never ship it). Enables the
 # per-tag BKL profiler in `akuma_exec::sync` for the whole boot and makes the
@@ -318,8 +297,7 @@ smp-shared = ["akuma-exec/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-excep
 # This is the input that decides whether more BKL carve-outs are worth it (the
 # Phase 0 estimate that scheduler/IRQ holds ~70% of contended time was never
 # measured under a real userspace workload). Costs a shared-line store on every
-# kernel entry, so it perturbs timing-sensitive tests — keep it out of
-# `smp-shared` and enable it explicitly:
+# kernel entry, so it perturbs timing-sensitive tests — enable it explicitly:
 #   cargo build --release --features devbox-smoltcp,no-tests,bkl-profile
 bkl-profile = ["akuma-kernel-core/bkl-profile", "akuma-kernel-glue/bkl-profile", "akuma-kernel-tests-aarch64/bkl-profile"]
 
@@ -388,10 +366,7 @@ rump = ["akuma-net/rump", "dep:akuma-rump", "akuma-syscalls-glue/rump", "akuma-k
 #
 # `system_reset`/`system_off` now live in `akuma-boot`, over the `akuma-psci`
 # conduit, so the syscall no longer names `smp_shared` at all
-# (`docs/archive/AKUMA_SMP_SHARED_SPLIT.md`). NOTE this means `devbox`
-# (rump-only, deferred) no longer picks up `smp-shared` transitively — it never
-# asked for it, but if that build is ever meant to have real SMP it must now say
-# so explicitly.
+# (`docs/archive/AKUMA_SMP_SHARED_SPLIT.md`).
 sc-reboot = ["dep:akuma-boot", "akuma-vfs-glue/sc-reboot", "akuma-syscalls-glue/sc-reboot"]
 # The native smoltcp TCP/IP stack (NIC0): the in-kernel socket syscalls, DNS/HTTP,
 # and the built-in SSH server are all built on it. In `default`; the devbox build
@@ -442,11 +417,10 @@ sc-epoll        = ["akuma-syscalls-glue/sc-epoll", "akuma-kernel-glue/sc-epoll",
 rump-default = ["rump", "akuma-kernel-glue/rump-default"]
 
 # ── devbox-smoltcp: the default devbox ───────────────────────────────────────
-# An alias the devbox scripts and benchmarks name: the default feature set
-# already is the smoltcp devbox (`smp-shared` is in `default`, and there is no
-# built-in SSH server to drop). Kept so `--features devbox-smoltcp,no-tests`
+# An empty alias the devbox scripts and benchmarks name: the default feature set
+# already is the smoltcp devbox. Kept so `--features devbox-smoltcp,no-tests`
 # keeps working.
-devbox-smoltcp = ["smp-shared"]
+devbox-smoltcp = []
 
 [lints]
 workspace = true
@@ -521,7 +495,13 @@ akuma-kernel-core = { path = "crates/akuma-kernel-core" }
 # kernel_main/async-main orchestration. Extracted 2026-09-01, on top of
 # `akuma-kernel-core`. `src/` keeps only the crate-root-mandatory items
 # (global allocator, alloc-error handler, panic handler) and `entry!`.
-akuma-kernel-glue = { path = "crates/akuma-kernel-glue" }
+# Shared-kernel SMP under `akuma-bkl` is not optional on this kernel: `bkl-smp` fans
+# out from akuma-kernel-glue to every shared crate (one image, one PMM/heap, one run
+# queue under real cross-core locks, the BKL's dropped windows and `PreemptGuard`'s
+# IRQ masking). SMP=1 is the same image on one core. The `smp-shared` feature that
+# selected it, and the single-core build without it, were removed 2026-11-11 —
+# docs/reference/subsystems/smp-shared.md, docs/archive/AKUMA_FEATURE_AUDIT.md.
+akuma-kernel-glue = { path = "crates/akuma-kernel-glue", features = ["bkl-smp"] }
 # The arch-neutral front: `entry!` defines `rust_start` and hands it to glue's `start`.
 akuma-kernel = { path = "crates/akuma-kernel" }
 # The boot self-test suite, moved out of `src/`; `entry!`'s `before_main` registers it. Its

@@ -51,7 +51,6 @@ pub use akuma_kernel_glue::linker_syms;
 pub use akuma_kernel_glue::platform;
 #[cfg(feature = "rump")]
 pub use akuma_kernel_glue::rump_proxy;
-#[cfg(kernel_smp_shared)]
 pub use akuma_kernel_glue::smp_shared;
 pub use akuma_kernel_glue::syscall;
 pub use akuma_kernel_glue::vfs;

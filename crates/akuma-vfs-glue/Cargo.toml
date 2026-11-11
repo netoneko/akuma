@@ -66,8 +66,8 @@ akuma-syscalls-ipc = { path = "../akuma-syscalls-ipc", optional = true }
 sc-sysv-ipc = ["dep:akuma-syscalls-ipc"]
 sc-containers = ["akuma-isolation/containers"]
 sc-reboot = []
-# So build.rs can emit `kernel_smp_shared` — see its header for why that matters.
-smp-shared = []
+# So build.rs can emit `kernel_bkl_smp` — see its header for why that matters.
+bkl-smp = []
 
 [lints]
 workspace = true

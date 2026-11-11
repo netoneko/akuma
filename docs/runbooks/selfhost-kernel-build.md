@@ -543,10 +543,10 @@ The host kernel that runs the self-host VM must be built with the devbox
 feature set — the same one §5 builds *inside* the guest:
 
 ```bash
-cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests
+cargo build --release --features devbox-smoltcp,no-tests
 ```
 
-`--features smp-shared` alone builds the same SMP kernel but serves port 22 from
+A kernel from before 2026-08-10 built without these features serves port 22 from
 the **in-kernel** SSH server, whose shell is a builtin dispatcher, not a login
 shell. It is not a smaller shell, it is a different thing, and the failures it
 produces all look like guest or kernel bugs:
@@ -730,7 +730,7 @@ whole buffer — `busybox nproc`/cargo then saw 0 CPUs and fell back to 1. (Linu
 returns the byte count placed in the mask.) **FIXED (2026-08-06):** the handler
 now returns `(1 << nr_cpus) - 1` in the mask and the byte count written as the
 return value, where `nr_cpus` is `smp_shared::probed_core_count()` under
-`kernel_smp_shared` (BSP + secondaries, all online after
+`kernel_bkl_smp` (BSP + secondaries, all online after
 `bringup_secondaries`) and `1` on single-core and multikernel builds (a
 multikernel core runs only its own kernel). `busybox nproc` and cargo's `-j`
 default now reflect the actual SMP count.

@@ -28,7 +28,7 @@ leak-instr = ["akuma-user-space/leak-instr"]
 
 # Real (shared-kernel) SMP, forwarded from the bin crate. Only reaches
 # `akuma-bkl`, whose `current_core_id` this crate uses for the TTBR free gate.
-smp-shared = ["akuma-bkl/smp-shared", "akuma-primitives/smp-shared"]
+bkl-smp = ["akuma-bkl/bkl-smp", "akuma-primitives/bkl-smp"]
 
 [dependencies]
 # The amd64 entry format (bits, encoder, PteProt/MemAttr) and the table accessor

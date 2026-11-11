@@ -1,5 +1,8 @@
 # libakuma on plain Linux syscalls (idea, parked 2026-10-26)
 
+> **Archived 2026-11-11 from `proposals/`** when that directory was cleared. Still an idea, not done:
+> `libakuma` keeps its private syscall range (`AKUMA_PRIVATE_BASE`).
+
 **Status: an idea that came out of the Taoxichuan experiment. Not scheduled.** The user's call: it is the right thing to do on its own merits, but it is not on the path to the ladder, which wants real `git` (a preparation for later stages). Goose is left to find its own way to stage 8's git gate; revisit this if that stalls.
 
 ## Why it came up

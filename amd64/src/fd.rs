@@ -839,7 +839,7 @@ fn path_from_user(ptr: u64) -> Option<alloc::string::String> {
 /// three flags" records what moving them would cost and buy.
 ///
 /// **4. A block node is `ENODEV`, not a raw descriptor.** Glue serves
-/// `/dev/vdX` as a `BlockDev` descriptor (`proposals/RAW_BLOCK_DEVICE_FD.md`);
+/// `/dev/vdX` as a `BlockDev` descriptor (`docs/archive/RAW_BLOCK_DEVICE_FD.md`);
 /// nothing on this target reads one, so a folded `open("/dev/vda")` would hand
 /// back a descriptor whose first `read` answers `EBADF` — a failure at the
 /// wrong syscall, which is the `O_TMPFILE` lesson exactly. Refused here, at

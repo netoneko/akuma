@@ -54,17 +54,16 @@ pmm-instr = ["akuma-pmm/pmm-instr", "akuma-kernel-core/pmm-instr", "akuma-ext2/p
 # `akuma-kernel-core/Cargo.toml` for why each needs its own copy here rather
 # than relying on root's build.rs (build scripts are per-package).
 no-tests = ["akuma-kernel-core/no-tests", "akuma-entry/no-tests"]
-smp-shared = [
-    "akuma-exec/smp-shared",
-    "akuma-vfs-glue/smp-shared",
-    "akuma-exceptions/smp-shared",
-    "akuma-gic/smp-shared",
-    "akuma-net/smp-shared",
-    "akuma-primitives/smp-shared",
-    "akuma-syscalls-glue/smp-shared",
-    "akuma-kernel-core/smp-shared",
-    "akuma-entry/smp-shared",
-    "akuma-ext2/smp-shared",
+bkl-smp = [
+    "akuma-exec/bkl-smp",
+    "akuma-vfs-glue/bkl-smp",
+    "akuma-gic/bkl-smp",
+    "akuma-net/bkl-smp",
+    "akuma-primitives/bkl-smp",
+    "akuma-syscalls-glue/bkl-smp",
+    "akuma-kernel-core/bkl-smp",
+    "akuma-entry/bkl-smp",
+    "akuma-ext2/bkl-smp",
 ]
 net-profile = ["akuma-net/net-profile", "akuma-kernel-core/net-profile"]
 bkl-profile = ["akuma-kernel-core/bkl-profile"]

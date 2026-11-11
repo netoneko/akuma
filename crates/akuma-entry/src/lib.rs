@@ -39,7 +39,7 @@
 pub mod boot;
 #[cfg(target_os = "none")]
 pub mod exceptions;
-#[cfg(all(target_os = "none", kernel_smp_shared))]
+#[cfg(target_os = "none")]
 pub mod smp_shared;
 #[cfg(target_os = "none")]
 pub mod hooked;

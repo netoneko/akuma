@@ -1,23 +1,8 @@
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
     println!("cargo::rustc-check-cfg=cfg(kernel_console_lock)");
     println!("cargo::rustc-check-cfg=cfg(kernel_audio)");
-
-    // Real (shared-kernel) SMP gate: ONE shared kernel — one set of statics, one
-    // page-table set, one PMM/heap, one global run queue — across all cores under
-    // real cross-core locking. All of it lives behind `cfg(kernel_smp_shared)`,
-    // emitted only when the `smp-shared` feature is set (exposed as
-    // CARGO_FEATURE_SMP_SHARED). Paired with the `release-smp-shared` profile. See
-    // docs/reference/subsystems/smp-shared.md. The experimental one-kernel-per-core
-    // multikernel (`smp`/`kernel_smp`) was removed 2026-08-10 —
-    // docs/archive/TRIM_FAT_MULTIKERNEL.md.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
-    let smp_shared = std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok();
-    if smp_shared {
-        println!("cargo:rustc-cfg=kernel_smp_shared");
-    }
 
     // BKL-hold attribution build. Turns on the per-tag profiler in
     // `akuma_exec::sync` for the whole boot and has the async-main loop dump a

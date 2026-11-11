@@ -625,7 +625,7 @@ fn range_walk_test(t: &mut Suite, uas: &mut UserAddressSpace) {
 ///    reports "free it" for every table in the system.
 /// 2. **Cores publish into distinct slots.** `publish_l0_begin` used to read
 ///    `akuma_bkl::bkl::current_core_id()`, which is a literal `0` on every
-///    build without `kernel_smp_shared` — and this target is real SMP without
+///    build without `kernel_bkl_smp` — and this target is real SMP without
 ///    it. Four cores all writing slot 0 is worse than no registry: the last
 ///    writer erases the record of a table a peer is still executing on. Checked
 ///    by publishing distinct fake roots into each core's slot and reading all

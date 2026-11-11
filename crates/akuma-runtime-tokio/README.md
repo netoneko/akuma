@@ -166,5 +166,5 @@ who serves each call, and exits 1 on one nobody serves.
 - The analysis that shaped it:
   [`docs/archive/AKUMA_SYSCALLS_TOKIO_DEP_ANALYSIS.md`](../../docs/archive/AKUMA_SYSCALLS_TOKIO_DEP_ANALYSIS.md)
 - A whole kernel on top of it, from one short file (proposal):
-  [`proposals/B15_TOKIO_KERNEL_KIT.md`](../../proposals/B15_TOKIO_KERNEL_KIT.md)
+  [`docs/archive/B15_TOKIO_KERNEL_KIT.md`](../../docs/archive/B15_TOKIO_KERNEL_KIT.md)
 - Its one consumer's dispatch order: [`taoxichuan/docs/reference/syscalls.md`](../../taoxichuan/docs/reference/syscalls.md)

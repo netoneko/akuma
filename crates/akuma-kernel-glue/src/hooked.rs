@@ -305,7 +305,6 @@ extern "C" fn idle_main() -> ! {
 /// A secondary core's idle thread: its boot context, adopted on its boot stack
 /// ([`akuma_entry::smp_shared::HookedSecondary::adopt`]). Unpickable before it is latched
 /// running, so no peer can resume it before this core first switches away.
-#[cfg(kernel_smp_shared)]
 fn adopt_secondary(core: usize, base: akuma_primitives::addr::VirtAddr, size: usize) -> Option<usize> {
     let slot = threading::adopt_core_idle(core, base, size)?;
     mark_idle(core, slot);
@@ -313,7 +312,6 @@ fn adopt_secondary(core: usize, base: akuma_primitives::addr::VirtAddr, size: us
     Some(slot)
 }
 
-#[cfg(kernel_smp_shared)]
 fn secondary_idle() -> ! {
     idle_main()
 }
@@ -346,7 +344,6 @@ pub fn init() {
     mark_idle(0, idle);
     threading::seed_entry(idle, top, idle_main);
     threading::publish_slot(idle);
-    #[cfg(kernel_smp_shared)]
     akuma_entry::smp_shared::register_hooked_secondary(akuma_entry::smp_shared::HookedSecondary {
         adopt: adopt_secondary,
         idle: secondary_idle,

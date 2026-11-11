@@ -355,7 +355,7 @@ working machine, and it costs nothing but a partition.
 (stage-by-stage) and `amd64/README.md`. The aarch64 Firecracker port, a different
 machine and device model: `docs/archive/AKUMA_FIRECRACKER_KVM.md`. Platform
 dependency and what the arch split needs:
-`proposals/REDUCING_PLATFORM_DEPENDENCY.md` §0.
+`docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §0.
 
 ---
 

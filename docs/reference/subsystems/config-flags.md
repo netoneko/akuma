@@ -17,7 +17,7 @@ profiles exist since the 2026-08-10 consolidation removed five that were pure
 
 | Profile | Inherits | Used by | Notes |
 |---|---|---|---|
-| `release` | — | default `cargo run` / `cargo build` | full `default` feature set, including real shared-kernel SMP (`smp-shared`) |
+| `release` | — | default `cargo run` / `cargo build` | full `default` feature set (shared-kernel SMP is unconditional) |
 | `extreme-size` | `release` | `cargo build --profile extreme-size …` (manual) | codegen only: `opt-level=z`, LTO, `codegen-units=1`, stripped. The same kernel as `release` for a given feature set; no cfg reads the profile since the `extreme` feature was removed 2026-11-11 |
 | `release-debug` | `release` | `cargo build --profile release-debug --features ...` (manual only) | adds `debug = true` (DWARF) for source-level `lldb` against the gdbstub |
 
@@ -31,8 +31,7 @@ Source: `Cargo.toml:73-105`.
 
 `default` (`Cargo.toml:109-124`):
 ```
-smp-shared, smoltcp, sound,
-linux-extra-syscalls, sc-reboot
+smoltcp, sound, linux-extra-syscalls, sc-reboot
 ```
 
 `linux-extra-syscalls` is the group of the seven `sc-*` families (`sc-aio`,
@@ -57,7 +56,7 @@ HTTPS client anywhere in this tree now; use a userspace tool.
 | `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. The rump devbox's feature; it replaces the removed `devbox` bundle. A separate feature because the AArch64 kernel reads no boot command line to choose it at runtime. | `Cargo.toml:378` |
 | (`userspace-sshd`) | **Removed 2026-11-11** with `extreme`, the only build that selected it. herd starts `/bin/sshd` on every build. |
 | (`many-sessions`) | **Removed 2026-11-11.** The listener backlog is 8 on every build; configure sshd for it or raise `MAX_BACKLOG` — [`../build-profiles.md`](../build-profiles.md) § Listener backlog. |
-| `devbox-smoltcp` | Alias for `smp-shared` — the **default** devbox's feature. A no-op on top of `default` (this build does NOT pass `--no-default-features`); kept so existing build lines still resolve. | `Cargo.toml` |
+| `devbox-smoltcp` | An empty feature — the **default** devbox's name. A no-op on top of `default` (this build does NOT pass `--no-default-features`); kept so existing build lines still resolve. | `Cargo.toml` |
 
 > **Drift note:** `overlays/devbox/README.md:142,211`
 > still say "Phase 2 will build with `--no-default-features`" and "smoltcp is
@@ -123,7 +122,7 @@ cargo reports an error rather than silently ignoring the feature.
 
 | Feature | Effect | Source |
 |---|---|---|
-| `smp-shared` | **Required, not optional.** Forwards to `akuma-exec/smp-shared`; the BKL's entry points are no-ops without the cfg, so a `--no-default-features` build would run four cores with no lock. A const assert in `amd64/src/smp.rs` fails the build rather than letting it boot corrupt. | `amd64/Cargo.toml` |
+| *(no SMP feature)* | Shared-kernel SMP is unconditional: `amd64/Cargo.toml` turns on `bkl-smp` on every shared crate it depends on, and `const _: () = assert!(akuma_bkl::ACTIVE)` in `amd64/src/smp.rs` fails the build if one is ever missed (the BKL's entry points are no-ops without it). The `smp-shared` feature was removed 2026-11-11. | `amd64/Cargo.toml` |
 | `no-tests` | Drops the boot self-test suite, as on AArch64. `boot::self_tests` and every `*_test`/`smoke_test` function in `amd64/src` disappear and `boot::late_init` performs the bring-up the suite otherwise does on the way past (the LAPIC, the secondaries, the console fd, the syscall MSRs, the timer, `sti`) — the same call the runtime `skiptests` command-line lever makes. Verified by booting, not only by compiling. | `amd64/Cargo.toml` |
 | `syscall-debug-info` | Off. Forwards the AArch64 kernel's compile-time syscall debug mode (`akuma-config`, `akuma-syscalls`, `akuma-syscalls-time`, `akuma-exec`). On amd64 it prints glue's per-arm `[syscall]` lines only; the `[FORK-DBG]`/`[TRAMP]` traces never fire, because fork and exec are this target's own. For "which syscall failed" use the runtime `strace_err` flag instead: [`../../runbooks/trace-failing-syscalls-amd64.md`](../../runbooks/trace-failing-syscalls-amd64.md). | `amd64/Cargo.toml` |
 
@@ -144,20 +143,20 @@ when its `cfg` cannot hold in a `no-tests` world. Before the feature existed
 
 ### SMP / Big Kernel Lock
 
-`smp-shared` is the real shared-kernel SMP model — one shared kernel across
+Every Akuma build is the real shared-kernel SMP model — one shared kernel across
 all cores under real cross-core locks. It also runs five syscall families without
 the Big Kernel Lock: network, VFS, fork's page copy, mm and the drivers. And it makes
 `PreemptGuard` mask local IRQs for inner-lock holds, which is what makes those
 carve-outs safe. There is no compile-time switch per family. The six `no-bkl-*`
-features were folded into `smp-shared` on 2026-11-11, because every build of both
+features were folded into what is now `bkl-smp` on 2026-11-11, because every build of both
 kernels had them all on; `no-bkl-irq` had gated nothing since the SGI scheduler was
 deleted (`docs/archive/AKUMA_FEATURE_AUDIT.md` F2). A/B a family with its **runtime**
 toggle, described below. See [`locking.md`](locking.md) for the carve-out playbook
 and the syscall→lock map.
 
-| Feature | cfg emitted | In `smp-shared` by default? | Effect |
+| Feature | cfg emitted | In `default`? | Effect |
 |---|---|---|---|
-| `smp-shared` | `kernel_smp_shared` | — | One kernel across all cores; activates the BKL and the five BKL carve-outs. **In `default`** since 2026-08-10 — this is *the* SMP now, not a separate profile/CLI opt-in (the one-kernel-per-core "multikernel" `smp` feature was removed the same day). |
+| `bkl-smp` (shared crates only) | `kernel_bkl_smp` | — | The BKL is real and the shared crates open its dropped windows. **Not a kernel feature**: both Akuma kernels enable it on every shared crate unconditionally (the root `Cargo.toml` through `akuma-kernel-glue`, `amd64/Cargo.toml` directly) and assert `akuma_bkl::ACTIVE`; Taoxichuan leaves it off and serializes under its own lock ([`../../../proposals/ONE_BIG_KERNEL_LOCK.md`](../../../proposals/ONE_BIG_KERNEL_LOCK.md)). Was the `smp-shared` feature / `kernel_smp_shared` until 2026-11-11, when the single-core AArch64 build was removed. |
 | `bkl-profile` | `kernel_bkl_profile` | **no — measurement only** | Per-tag BKL-hold profiler + periodic `[BKLPROF]` histogram. Perturbs timing; never ship it. |
 | `read-profile` | *(feature only)* | **no — measurement only** | Per-stage `read(2)` accounting: `sys_read`'s `File` arm, `handle_syscall` and the EL0 handler each time themselves, and a `[READPROF]` window prints every 256 file reads — which stage of a warm read is validation, fd lookup, the staging allocation, ext2, the user copy, or the two wrappers. Answers what neither `bkl-profile` ("which syscall held the lock") nor `net-profile` ("how long was the device busy") can: the split *inside* one syscall. **Single-core only** (the wrapper spans are handed up by one flag — run `SMP=1`), and **never read wall-clock throughput off this build**: the dump's own console write is ~55 ms per window. Use `scripts/benchmarks/read_stage_profile.py`, which drops windows with mixed request sizes or preempted samples. Background: `docs/archive/EXT2_READ_PATH_STAGE_PROFILE.md`. |
 | `CONSOLE_LOCK` (env) | `kernel_console_lock` | **default-on** | Cross-core spinlock + owner-core-ID reentrancy guard around `console::emit`'s UART write loop, so two cores under `smp-shared` can't byte-interleave each other's lines at the shared PL011 register. On in every build since 2026-11-11 (it was off under `opt-level = "z"`, the old single-core `extreme` target). `CONSOLE_LOCK=0` opt-out (debug). Background: `docs/archive/UART_SMP_INTERLEAVE_FIX.md`. |

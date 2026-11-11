@@ -23,13 +23,14 @@ and `release-debug` (a DWARF-debug variant of `release`, not tied to any
 wrapper script). The `size` profile and the one-kernel-per-core "multikernel"
 (`smp` feature, `release-smp`/`release-smp-shared` profiles) were both removed
 2026-08-10 — see `docs/archive/TRIM_FAT_MULTIKERNEL.md` and
-`docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`. Real (shared-kernel) SMP,
-`smp-shared`, is now in `default` — it is not a separate profile or an opt-in
-CLI feature anymore.
+`docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`. Real (shared-kernel) SMP is
+unconditional — not a profile and, since 2026-11-11, not a feature either (the
+shared crates' `bkl-smp` switch is on for both Akuma kernels; see
+`docs/reference/subsystems/smp-shared.md`).
 
 | Target | Profile | Codegen | Wrapper script | Feature set |
 |---|---|---|---|---|
-| `release` | `release` | `panic=abort` | (plain `cargo run --release`) | full `default` (includes `smp-shared`) |
+| `release` | `release` | `panic=abort` | (plain `cargo run --release`) | full `default` |
 | `extreme-size` | `extreme-size` | inherits `release` + `opt-level=z`, LTO, `codegen-units=1`, `strip` | (none — `cargo build --profile extreme-size`) | any; codegen only, the same kernel as `release` for that set |
 | `devbox` (rump-only, deferred) | `release` | inherits release | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | `--no-default-features`; `rump-default,sc-reboot,sound,no-tests,linux-extra-syscalls` |
 | `devbox-smoltcp` (default devbox) | `release` | inherits release | `scripts/build_devbox_smoltcp.sh` / `overlays/devbox/run-smoltcp.sh` | `default` + `devbox-smoltcp,no-tests` (**no** `--no-default-features`) |
@@ -39,7 +40,7 @@ feature on top of plain `release` rather than defining its own profile, so a
 target is not always 1:1 with a profile.
 
 `rump-default` makes rump the default stack for box 0. `devbox-smoltcp` is an
-alias for `smp-shared`, already in `default`. Every image's SSH is the
+empty feature kept so existing build lines resolve. Every image's SSH is the
 userspace `/bin/sshd`, started by herd: the in-kernel SSH server (and the
 shell/editor behind it) was deleted on 2026-08-10
 (`docs/archive/BUILTIN_SSH_REMOVAL.md`). No cfg reads the Cargo profile: the

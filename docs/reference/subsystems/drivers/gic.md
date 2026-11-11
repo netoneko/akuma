@@ -35,7 +35,7 @@ reference is ever wanted; nothing in the tree dispatches on a backend any more.
 | Secondary bring-up | `secondary_init(idx, RedistributorLayout)` — takes the redistributor geometry as an argument, read from `src/platform.rs`'s installed device map, so an FDT-discovered redistributor beats any compile-time literal |
 | IRQ dispatch | `acknowledge_irq`, `end_of_interrupt` |
 | Registration | `enable_irq`, `set_priority` |
-| Scheduling | `SGI_SCHEDULER`, `trigger_sgi` (single-core self-target), `trigger_sgi_self` / `trigger_sgi_core` / `broadcast_sgi` (`kernel_smp_shared` only) |
+| Scheduling | `SGI_SCHEDULER`, `trigger_sgi` (single-core self-target), `trigger_sgi_self` / `trigger_sgi_core` / `broadcast_sgi` (`kernel_bkl_smp` only) |
 
 `init` reaches the hardware through the `addr::DEV_GIC*` device-window VAs;
 `secondary_init` uses PAs, because it runs on the boot page table where only the
@@ -109,7 +109,7 @@ stack; see [`../scheduler.md`](../scheduler.md).
 ## Cross-core doorbell (shared-kernel SMP)
 
 `trigger_sgi_core(target_aff0, sgi_id)` (`gic_v3.rs:243-253`,
-`cfg(kernel_smp_shared)` only) targets one specific core by affinity-0
+`cfg(kernel_bkl_smp)` only) targets one specific core by affinity-0
 (`MPIDR & 0xff`) via `ICC_SGI1R_EL1`'s 16-bit TargetList, instead of
 `trigger_sgi`'s hardcoded "this CPU" target list. `trigger_sgi_self`
 (self-targeted, reading its own `MPIDR`) builds on it so the shared timer

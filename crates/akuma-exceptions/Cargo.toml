@@ -7,15 +7,6 @@ edition = "2024"
 workspace = true
 
 [features]
-# Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared`
-# feature. This crate's build.rs emits `cfg(kernel_smp_shared)` from it, which
-# gates the BKL excursion wrapper, the IRQ reconciliation, the EL0-trap
-# diagnostic hook and the dropped-window tripwires — the same cfg names the
-# bin crate uses so the gates are uniform. With it off the exception handlers
-# compile the `not()` arms (no BKL, no reconciliation), which is what the
-# single-core profiles (extreme-size, devbox) build.
-smp-shared = []
-
 
 # Compile the boot self-test surface out (`kernel_tests` cfg NOT emitted):
 # `el1_sync_gpr_clobber_mask`'s GPR-transparency probe, the `TEST_SIGFRAME_*`

@@ -11,29 +11,11 @@ links = "akuma_kernel_amd64"
 workspace = true
 
 [features]
-# Real (shared-kernel) SMP is **required**, not optional: since 5b the kernel's
-# BKL is `akuma_bkl`'s (see `smp.rs`), whose entry points are no-ops without the
-# cfg — a build without it would run four cores with no lock at all. Enforced by
-# a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
-# rather than booting corrupt.
-default = ["smp-shared", "linux-extra-syscalls"]
+default = ["linux-extra-syscalls"]
 # The seven families together: what a Linux program expects beyond the core set.
 # In `default`. The families stay individually settable. Same name and members as
 # the AArch64 kernel's group, whose `sc-reboot` is deliberately outside it.
 linux-extra-syscalls = ["sc-aio", "sc-sysv-ipc", "sc-containers", "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll"]
-# Real (shared-kernel) SMP. Forwards to `akuma-exec/smp-shared`, which fans out
-# to every shared crate's `kernel_smp_shared` cfg. See the 5b work in
-# `proposals/NEXT_AGENT_AMD64_STEP6_AND_5B.md`.
-#
-# Also runs the shared crates' syscall families without the Big Kernel Lock
-# (network, VFS, fork's page copy, mm, drivers), exactly as the AArch64 kernel's
-# `smp-shared` does. Those were separate `no-bkl-*` features until 2026-11-11, on in
-# every build of both kernels; A/B is the runtime toggles in `akuma_bkl::policy`
-# (`docs/archive/AKUMA_FEATURE_AUDIT.md` F2). Without the VFS carve-out every glue fs
-# syscall here ran BKL-held, so one stalled xHCI transfer spun its full one-second
-# timeout holding the BKL and presented as `[BKL] stuck` on every other core —
-# `docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-11.
-smp-shared = ["akuma-exec/smp-shared", "akuma-kernel-core/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-ext2/smp-shared"]
 # Preempt ring 0. Syscalls run with `IF` set once the BKL is taken, and the timer
 # switches a thread in kernel code when `akuma_threading::el1_preemptible` allows it
 # (preemption not disabled, scheduler pool unlocked, thread RUNNING) **and this core
@@ -325,12 +307,22 @@ akuma-machine-facts = { path = "../crates/akuma-machine-facts" }
 # `klog` (the `log` crate sink). The AArch64-only modules (`console`, `timer`,
 # `platform`, `ntp_boot`, `irq::register_handler`) and their GIC/boot deps are
 # target-gated out of this build; no feature is enabled here.
-akuma-kernel-core = { path = "../crates/akuma-kernel-core" }
+# Shared-kernel SMP under `akuma-bkl` (`bkl-smp`) is not optional: this kernel's BKL
+# is `akuma_bkl`'s (`smp.rs`), whose entry points are no-ops without it - a build
+# without it would run four cores with no lock at all, which `smp.rs` refuses at
+# compile time (`akuma_bkl::ACTIVE`). It also runs the shared crates' syscall
+# families in the BKL's dropped windows (network, VFS, fork's page copy, mm,
+# drivers), as the AArch64 kernel does; A/B is the runtime toggles in
+# `akuma_bkl::policy`. Without the VFS window every glue fs syscall here ran
+# BKL-held, so one stalled xHCI transfer spun its full one-second timeout holding
+# the BKL (`docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-11). Was the
+# `smp-shared` feature, required, until 2026-11-11.
+akuma-kernel-core = { path = "../crates/akuma-kernel-core", features = ["bkl-smp"] }
 akuma-user-tree = { path = "../crates/akuma-user-tree" }
 # The filesystem, used unmodified. Its whole interface to a disk is a two-method
 # `BlockDevice` trait, which is exactly what `akuma-virtio` exposes — see
 # `src/fs.rs` for how short the adaptation is.
-akuma-ext2 = { path = "../crates/akuma-ext2" }
+akuma-ext2 = { path = "../crates/akuma-ext2", features = ["bkl-smp"] }
 # The `Filesystem` trait `Ext2Filesystem` implements, plus `FsError`/`Metadata`
 # and the `MS_*` flag words a mount record carries.
 akuma-vfs = { path = "../crates/akuma-vfs" }
@@ -342,7 +334,7 @@ akuma-vfs = { path = "../crates/akuma-vfs" }
 # prerequisite for folding the VFS syscall arms
 # (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md` § C1 step 4). Already in the link
 # graph through `akuma-syscalls-glue`; named here because this crate calls it.
-akuma-vfs-glue = { path = "../crates/akuma-vfs-glue" }
+akuma-vfs-glue = { path = "../crates/akuma-vfs-glue", features = ["bkl-smp"] }
 spinning_top = "0.3"
 # The tree's tuning knobs, for `MMAP_EAGER_MAX_PAGES` — how many pages a mapping
 # may have before it is demand-paged instead of populated at `mmap` time. Read
@@ -508,13 +500,13 @@ akuma-locks-rw = { path = "../crates/akuma-locks-rw" }
 # because `exec_runtime.rs` builds its `ExecRuntime`/`ExecConfig` tables —
 # without that registration the first syscall folded into glue panics in
 # `akuma_exec::runtime::config()`, which is a `Registered` cell.
-akuma-exec = { path = "../crates/akuma-exec" }
+akuma-exec = { path = "../crates/akuma-exec", features = ["bkl-smp"] }
 # `exec`: box's `SPAWN_EXT` (private 315) is glue's `sys_spawn_ext`, which loads
 # through `akuma-exec`'s ELF loader. Row 8 of the tokio dependency analysis
 # (`3e2bb725`) put that path behind the feature and left it off here, so every
 # `box run` answered "failed to spawn" until 2026-11-01. Taoxichuan has no box
 # and keeps it off.
-akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp", "exec", "akuma-native"] }
+akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp", "exec", "akuma-native", "bkl-smp"] }
 # The x86-only syscall bodies both x86 kernels share; so far `kill` (moved from `signal.rs`).
 akuma-syscalls-glue-amd64 = { path = "../crates/akuma-syscalls-glue-amd64" }
 

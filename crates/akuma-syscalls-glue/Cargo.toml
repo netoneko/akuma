@@ -61,7 +61,7 @@ default = ["smoltcp", "exec", "akuma-native"]
 # Every one is forwarded from the bin, which owns the real definitions.
 sc-reboot = ["dep:akuma-boot"]
 sc-sysv-ipc = ["dep:akuma-syscalls-ipc"]
-smp-shared = []
+bkl-smp = []
 no-tests = []
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
 sc-aio = []

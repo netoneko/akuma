@@ -98,7 +98,7 @@ pub fn set_process_bkl_drop_enabled(on: bool) {
 pub struct ProcessBkl;
 
 impl GuardToggle for ProcessBkl {
-    const COMPILED_IN: bool = cfg!(kernel_smp_shared);
+    const COMPILED_IN: bool = cfg!(kernel_bkl_smp);
     #[inline]
     fn enabled() -> bool {
         process_bkl_drop_enabled()
@@ -121,6 +121,6 @@ impl GuardToggle for ProcessBkl {
 /// `?` early-returns inside the copy loop, keeping the syscall wrapper's single
 /// `leave_kernel` balanced.
 ///
-/// No-op without `kernel_smp_shared` (`COMPILED_IN` is then a constant `false`, so
+/// No-op without `kernel_bkl_smp` (`COMPILED_IN` is then a constant `false`, so
 /// `new`/`drop` fold away), or while the runtime toggle is off.
 pub type ProcessBklGuard = ToggledGuard<ProcessBkl>;

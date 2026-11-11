@@ -1,6 +1,10 @@
 # B21: Taoxichuan on aarch64, and a smaller audit (proposal, 2026-11-04)
 
-**Status: in progress** - [`docs/archive/TAOXICHUAN_B21_AARCH64.md`](../docs/archive/TAOXICHUAN_B21_AARCH64.md) is the record (A0, A1 done 2026-11-04). The step B21 of [`B15_TOKIO_KERNEL_KIT.md`](B15_TOKIO_KERNEL_KIT.md) reserved
+> **Archived 2026-11-11 from `proposals/`.** Done: `crates/akuma-tokio-kernel-aarch64` exists and Taoxichuan
+> builds for aarch64; [`TAOXICHUAN_B21_AARCH64.md`](TAOXICHUAN_B21_AARCH64.md) is the record. The status
+> line below is as last written.
+
+**Status: in progress** - [`docs/archive/TAOXICHUAN_B21_AARCH64.md`](TAOXICHUAN_B21_AARCH64.md) is the record (A0, A1 done 2026-11-04). The step B21 of [`B15_TOKIO_KERNEL_KIT.md`](B15_TOKIO_KERNEL_KIT.md) reserved
 ("its own proposal when it starts"), plus a second track that reduces the image's audit lines. The two are one plan
 because the largest audit cut available is the same work as the port: code that becomes arch-neutral is counted once
 for two kernels instead of once per architecture.
@@ -132,7 +136,7 @@ A target to aim at, not a promise: amd64 under 75,000 after R2–R6.
 ## Background
 
 [`B15_TOKIO_KERNEL_KIT.md`](B15_TOKIO_KERNEL_KIT.md), [`B12_AARCH64_SLOT_TABLE.md`](B12_AARCH64_SLOT_TABLE.md),
-[`TAOXICHUAN_CLEANUP_PLAN.md`](../docs/archive/TAOXICHUAN_CLEANUP_PLAN.md) (status table, rows B15 and the dependency
-analysis rows), [`TAOXICHUAN_B10_SYSCALL_CENSUS.md`](../docs/archive/TAOXICHUAN_B10_SYSCALL_CENSUS.md),
-[`AUDIT_SURFACE_METHODOLOGY.md`](../docs/archive/AUDIT_SURFACE_METHODOLOGY.md),
-[`AKUMA_VIRTIO_IN_TREE.md`](../docs/archive/AKUMA_VIRTIO_IN_TREE.md).
+[`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md) (status table, rows B15 and the dependency
+analysis rows), [`TAOXICHUAN_B10_SYSCALL_CENSUS.md`](TAOXICHUAN_B10_SYSCALL_CENSUS.md),
+[`AUDIT_SURFACE_METHODOLOGY.md`](AUDIT_SURFACE_METHODOLOGY.md),
+[`AKUMA_VIRTIO_IN_TREE.md`](AKUMA_VIRTIO_IN_TREE.md).

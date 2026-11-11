@@ -1,7 +1,7 @@
 # Building a kernel with local AI: pain and suffering
 
 A running log of trying to make a local model (Qwen3-8B, on an old i5 under Akuma) build and boot an Akuma kernel
-through `proposals/INSTALL_SCRIPT.md`, with other models (GLM via goose) doing the setup around it. Started
+through `docs/archive/INSTALL_SCRIPT.md`, with other models (GLM via goose) doing the setup around it. Started
 2026-11-04. Newest sections are at the bottom; each one says what was believed, what was measured, and what was
 wrong. Dated sections below are a diary, not reference: the rules they established go in `docs/reference/` when
 they are proven.
@@ -11,7 +11,7 @@ they are proven.
 
 ## Goal
 
-Work through `proposals/INSTALL_SCRIPT.md` (steps I0-I6) with autonomous agents on the two boxes. The install script
+Work through `docs/archive/INSTALL_SCRIPT.md` (steps I0-I6) with autonomous agents on the two boxes. The install script
 is meant to be run by a *local qwen* under an agent harness, so the first job is a Qwen the LAN can reach: it is both
 the proposal's end user (step I5, the stranger test) and the model the agents' output is judged against.
 
@@ -36,7 +36,7 @@ the proposal's end user (step I5, the stranger test) and the model the agents' o
 
 ## What was run
 
-1. Read `proposals/INSTALL_SCRIPT.md`, `scripts/kvm/goose/SUPERVISOR_RUNBOOK.md`, `BRIEF_TEMPLATE.md`.
+1. Read `docs/archive/INSTALL_SCRIPT.md`, `scripts/kvm/goose/SUPERVISOR_RUNBOOK.md`, `BRIEF_TEMPLATE.md`.
 2. Surveyed trashcan over `hpbox.py ak` (numbers above).
 3. Started the Mac goose-glm server on `127.0.0.1:3286` and probed it. The first probe failed with
    `KeyError: 'result'`: `session/new` needs a **Mac** `cwd` (`GOOSE_ACP_CWD`), the same trap the runbook records for
@@ -75,7 +75,7 @@ git writes, sub-agents, touching console/sshd/kot/httpd/hda-capture services.
 
 ## Background
 
-`proposals/INSTALL_SCRIPT.md`, `scripts/kvm/goose/SUPERVISOR_RUNBOOK.md`, `scripts/kvm/goose/goose-glm-mac.sh`,
+`docs/archive/INSTALL_SCRIPT.md`, `scripts/kvm/goose/SUPERVISOR_RUNBOOK.md`, `scripts/kvm/goose/goose-glm-mac.sh`,
 `scripts/utils/hpbox.py`, `overlays/ryzen/arm.sh`.
 
 ## Update (2026-11-04, evening): what happened to the Qwen on trashcan
@@ -133,7 +133,7 @@ What was done, in order:
    x86_64-unknown-none --release --features no-tests`, pinned nightly-2026-09-19 via rustup), installed as the Akuma
    partition's `/boot/akuma-amd64` (`chmod 755`, old one kept as `akuma-amd64.before-e80e6cd9`). It reports
    `0.0.9 e80e6cd9-release-smp-shared`. **The amd64 kernel needs the `crates/akuma-fbcon/vendor/spleen` submodule**
-   (the first build failed on it); `proposals/INSTALL_SCRIPT.md`'s "no submodule" claim holds for Taoxichuan only.
+   (the first build failed on it); `docs/archive/INSTALL_SCRIPT.md`'s "no submodule" claim holds for Taoxichuan only.
    GRUB loads the kernel from the Akuma partition; `/root/stage_akuma.sh` (installs to Ubuntu's `/boot/akuma`) is stale.
 4. **The image's `llama-server` was a generic x86-64 build** (`-march=x86-64`, AVX/AVX2/FMA off; `system_info` listed
    only LLAMAFILE and REPACK): **0.83 prompt / 0.88 gen tok/s** on Ubuntu. Rebuilt static musl with `-march=haswell`,
@@ -290,7 +290,7 @@ hand (`setfacl -m u:netoneko:rw /dev/kvm`) **was reset by the system within the 
 administrator action, never the model's); a durable fix is `usermod -aG kvm netoneko` and a new login. The tap `akuma-tap-2222`
 (10.0.2.2/24) is also created by hand and does not survive a reboot. Pop's root disk was 96 % full; clones and `cargo clean` freed ~1.3 GB.
 
-**The harness** `scripts/kvm/goose/qwen_install_trial.py` (design: `proposals/INSTALL_SCRIPT_QWEN_EXPERIMENT.md`): resets, ships the script and
+**The harness** `scripts/kvm/goose/qwen_install_trial.py` (design: `docs/archive/INSTALL_SCRIPT_QWEN_EXPERIMENT.md`): resets, ships the script and
 `bootstrap/public/install.txt`, runs `goose run` as `netoneko` against a model endpoint, then judges by itself (live VM, a real ssh
 `uname`, no `sudo`/package manager in the transcript). It runs a preflight (`install.sh check`) and refuses to start a trial that
 cannot boot.

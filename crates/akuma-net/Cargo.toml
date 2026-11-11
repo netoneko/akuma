@@ -15,12 +15,12 @@ default = ["smoltcp"]
 # (same discipline as the kernel's `bkl-profile`). Forwarded from the kernel's
 # feature of the same name; the kernel prints the windowed delta as `[NICSTAT]`.
 net-profile = ["akuma-net-nic/net-profile"]
-# Real shared-kernel SMP. Gates the `PreemptGuard` critical-section preemption
+# Akuma's shared-kernel SMP (`bkl-smp`). Gates the `PreemptGuard` critical-section preemption
 # guards (runtime.rs): under the Big Kernel Lock the base NETWORK/SOCKET_TABLE
 # spinlocks must never be held across a context switch. A no-op otherwise, so
-# non-SMP builds are byte-for-byte unchanged. Forwarded from the kernel's
-# `smp-shared` feature. See docs/reference/subsystems/smp-shared.md.
-smp-shared = []
+# builds without it are byte-for-byte unchanged. See
+# docs/reference/subsystems/smp-shared.md.
+bkl-smp = []
 # The native smoltcp TCP/IP stack: the smoltcp_net/socket/dns/http modules and
 # everything with smoltcp types in its signatures. Optional so a rump-only build
 # (devbox) can compile it out entirely. The rump path (rump_tap + the kernel

@@ -25,7 +25,7 @@ akuma-switch = { path = "../akuma-switch" }
 spinning_top = "0.3"
 
 [features]
-smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared"]
+bkl-smp = ["akuma-primitives/bkl-smp", "akuma-bkl/bkl-smp", "akuma-mmu/bkl-smp"]
 # A thread that yields without `akuma_bkl` held takes it for the switch and gives it back on
 # resume. The AArch64 root kernel (its dropped-BKL windows), through `akuma-kernel-glue`; see
 # `x86_yield_now`.

@@ -1,5 +1,9 @@
 # A fair experiment: can a local Qwen install Akuma with `install.sh`? (proposal, 2026-11-04)
 
+> **Archived 2026-11-11 from `proposals/`** when that directory was cleared. The experiment as designed
+> here has no recorded run in the tree; the development record is
+> [`BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING.md`](BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING.md).
+
 **Status: design, not run.** What exists now (`install-i1b` iterating on `install.txt` between Qwen attempts, on a host that cannot
 boot a guest) is **development**, and the doc `docs/archive/BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING.md` records it as
 such. This file says what a result must look like before anyone writes "the Qwen passes".
@@ -86,5 +90,5 @@ V0 is acceptable **during development**, never as the reported result.
 4. Freeze, then V0 x10, then V1 x10, then the floor. Archive the transcripts and a short analysis in `docs/archive/`.
 
 ## Background
-`proposals/INSTALL_SCRIPT.md`; `docs/archive/BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING.md`;
+`docs/archive/INSTALL_SCRIPT.md`; `docs/archive/BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING.md`;
 `scripts/kvm/goose/wait_qwen.py`; the Qwen service on trashcan (`/etc/herd/available/qwen.conf`).

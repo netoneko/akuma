@@ -24,12 +24,12 @@ pmm-instr = []
 # Forwarded to `akuma-primitives` so the guard's IRQ-masking half is active even
 # in a graph that does not include `akuma-exec` (e.g. `cargo test -p akuma-ext2`);
 # previously this relied on cargo unifying `akuma-exec`'s copy of the feature.
-smp-shared = ["akuma-primitives/smp-shared"]
+bkl-smp = ["akuma-primitives/bkl-smp"]
 
 [dependencies]
 akuma-vfs = { path = "../akuma-vfs" }
 # `Registered` (the lock-free `InodeFreedHook` cell) + `PreemptGuard` (the
-# IRQ-masking inner-lock guard under `smp-shared`). These two symbols were the ENTIRE reason
+# IRQ-masking inner-lock guard under `bkl-smp`). These two symbols were the ENTIRE reason
 # this crate depended on `akuma-exec` — the 23.8k-line execution crate, for a
 # ~40-line RAII guard and a ~40-line cell. Both live in the dependency-free leaf
 # now, so that edge is gone: see

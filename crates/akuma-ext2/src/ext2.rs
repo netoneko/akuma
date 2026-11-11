@@ -1238,9 +1238,9 @@ pub(crate) struct Ext2State {
 ///
 /// **IRQs are masked around the non-blocking `try_*` and the resulting hold only, never
 /// across the acquisition backoff** — see [`Ext2Filesystem::read_state`].
-#[cfg(feature = "smp-shared")]
+#[cfg(feature = "bkl-smp")]
 type StateHoldGuard = akuma_primitives::PreemptGuard;
-#[cfg(not(feature = "smp-shared"))]
+#[cfg(not(feature = "bkl-smp"))]
 type StateHoldGuard = NoStateHold;
 
 /// The `StateHoldGuard` stand-in when `smp-shared` is off: a ZST that compiles to nothing.
@@ -1249,10 +1249,10 @@ type StateHoldGuard = NoStateHold;
 /// `drop(hold)` before each backoff spin type-checks identically in both configurations —
 /// without it, the same source line is a real release in one build and a lint
 /// (`dropping_copy_types` / `drop_non_drop`) in the other.
-#[cfg(not(feature = "smp-shared"))]
+#[cfg(not(feature = "bkl-smp"))]
 struct NoStateHold;
 
-#[cfg(not(feature = "smp-shared"))]
+#[cfg(not(feature = "bkl-smp"))]
 impl Drop for NoStateHold {
     fn drop(&mut self) {}
 }
@@ -1260,9 +1260,9 @@ impl Drop for NoStateHold {
 /// Take a [`StateHoldGuard`] for one `try_*` attempt (and, on success, the hold).
 #[inline]
 fn state_hold_guard() -> StateHoldGuard {
-    #[cfg(feature = "smp-shared")]
+    #[cfg(feature = "bkl-smp")]
     return akuma_primitives::PreemptGuard::new();
-    #[cfg(not(feature = "smp-shared"))]
+    #[cfg(not(feature = "bkl-smp"))]
     NoStateHold
 }
 

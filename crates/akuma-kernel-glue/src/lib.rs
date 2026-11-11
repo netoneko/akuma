@@ -112,7 +112,7 @@ pub use akuma_kernel_core::console;
 pub use akuma_kernel_core::platform;
 #[cfg(all(target_os = "none", feature = "rump"))]
 pub mod rump_proxy;
-#[cfg(all(target_os = "none", kernel_smp_shared))]
+#[cfg(target_os = "none")]
 pub use akuma_entry::smp_shared;
 #[cfg(target_os = "none")]
 pub mod syscall;
@@ -120,6 +120,15 @@ pub mod syscall;
 pub mod vfs;
 #[cfg(target_os = "none")]
 pub mod hooked;
+
+// Every core of this kernel runs under `akuma-bkl`, whose entry points are empty
+// bodies unless it is built with `bkl-smp`. The root manifest turns that on through
+// this crate; a build that somehow lost it would boot SMP=N with no lock at all.
+#[cfg(target_os = "none")]
+const _: () = assert!(
+    akuma_bkl::ACTIVE,
+    "the AArch64 kernel needs `akuma-bkl` built with `bkl-smp`"
+);
 
 #[cfg(target_os = "none")]
 use akuma_exec::{mmu, process, threading};
@@ -327,22 +336,13 @@ pub(crate) fn build_exec_runtime(
         // must ring THIS core's scheduler SGI, not the hardcoded PE0 that `trigger_sgi`
         // targets — otherwise a secondary's yield/block pokes the BSP and never
         // reschedules itself. On the BSP (aff0 = 0) `trigger_sgi_self` is equivalent.
-        #[cfg(kernel_smp_shared)]
         trigger_sgi: akuma_gic::trigger_sgi_self,
-        #[cfg(not(kernel_smp_shared))]
-        trigger_sgi: akuma_gic::trigger_sgi,
         // Cross-core wakeup (M4): nudge an idle peer to run a just-woken thread. No-op
         // off shared-SMP.
-        #[cfg(kernel_smp_shared)]
         wake_remote_idle: smp_shared::wake_remote_idle,
-        #[cfg(not(kernel_smp_shared))]
-        wake_remote_idle: || false,
         // Direct a scheduler SGI at the woken thread's last-known core so its
         // scheduler picks up the READY thread promptly. No-op off shared-SMP.
-        #[cfg(kernel_smp_shared)]
         wake_core: smp_shared::wake_core,
-        #[cfg(not(kernel_smp_shared))]
-        wake_core: |_| {},
         heap_stats: || {
             let s = allocator::stats();
             (s.heap_size, s.allocated)
@@ -350,10 +350,7 @@ pub(crate) fn build_exec_runtime(
         is_memory_low: allocator::is_memory_low,
         // Whether the execve/ELF-load BKL-drop is enabled (M5c hold-shortening). Lets the
         // ELF loader drop the BKL around the dynamic-interpreter read. No-op off shared-SMP.
-        #[cfg(kernel_smp_shared)]
         exec_bkl_drop_enabled: smp_shared::exec_bkl_drop_enabled,
-        #[cfg(not(kernel_smp_shared))]
-        exec_bkl_drop_enabled: || false,
         read_file: |path| crate::fs::read_file(path).map_err(|_| -1),
         read_at: |path, off, buf| crate::vfs::read_at(path, off, buf).map_err(|_| -1),
         resolve_file_id: |path| crate::vfs::resolve_file_id(path).ok_or(-1),
@@ -793,7 +790,6 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
         // Real (shared-kernel) SMP: snapshot CPU/PSCI info from the DTB NOW, before the
         // heap allocator (which can be placed exactly at the DTB's address on
         // large-RAM configs) overwrites it. No-op without the `smp-shared` feature.
-        #[cfg(kernel_smp_shared)]
         smp_shared::probe_dtb(fdt.as_ref());
 
         ram
@@ -1048,28 +1044,9 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
         debug_sigsegv_syscall_stub_elir_max: config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MAX,
         debug_pattern2_trap_trace: config::DEBUG_PATTERN2_TRAP_TRACE,
     });
-    #[cfg(kernel_smp_shared)]
     exceptions::register_hooks(exceptions::ExceptionHooks {
         dispatch_irq: irq::dispatch_irq,
         record_el0_trap: smp_shared::record_el0_trap,
-        report_poison_value: akuma_exec::process::reclaim::report_poison_value,
-        dp_counters_line: pmm::dp_counters_line,
-        handle_syscall: syscall::handle_syscall,
-        current_syscall_nr: syscall::current_syscall_nr,
-        inc_pagefault: syscall::syscall_counters::inc_pagefault,
-        inc_qemu_dc_zva_ec15: syscall::syscall_counters::inc_qemu_dc_zva_ec15,
-        inc_qemu_stp_xzr_ec15: syscall::syscall_counters::inc_qemu_stp_xzr_ec15,
-        sys_exit_group: syscall::proc::sys_exit_group_pub,
-        notify_child_channel_exited: syscall::proc::notify_child_channel_exited_pub,
-        vfork_complete: syscall::proc::vfork_complete,
-        signal_is_fatal_default: syscall::signal::signal_is_fatal_default,
-        syscall_log_formatted: syscall::log::get_formatted,
-        read_profile_span_new: syscall::utils::read_profile::exception_span_start,
-        read_profile_span_end: syscall::utils::read_profile::exception_span_end,
-    });
-    #[cfg(not(kernel_smp_shared))]
-    exceptions::register_hooks(exceptions::ExceptionHooks {
-        dispatch_irq: irq::dispatch_irq,
         report_poison_value: akuma_exec::process::reclaim::report_poison_value,
         dp_counters_line: pmm::dp_counters_line,
         handle_syscall: syscall::handle_syscall,
@@ -1096,7 +1073,6 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Secondaries brought up earlier (self-test image) are parked before their GIC/IRQ
     // setup until here: hooks registered, vectors installed, tick period published.
-    #[cfg(kernel_smp_shared)]
     smp_shared::open_secondary_irq_gate();
 
     // =========================================================================
@@ -1214,7 +1190,6 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // `hooked-sched` (M6): here in both images. A secondary's idle thread is adopted through
     // `hooked::init`'s registration, so the cores cannot start before it — the SGI self-test
     // image's earlier start (see the note before `exceptions::init`) is not available here.
-    #[cfg(kernel_smp_shared)]
     smp_shared::bringup_secondaries();
 
     // The boot self-test suite spawns many concurrent threads/processes. On a
@@ -1531,7 +1506,6 @@ fn netpoll_drain_step() {
     {
         // Profiler only: isolate the burst-drain itself from the maintenance work
         // above it (BKL_VFS_CARVE_OUT.md §19 sub-tag split).
-        #[cfg(kernel_smp_shared)]
         akuma_exec::sync::set_holder_tag(
             akuma_exec::bkl::current_core_id(),
             akuma_exec::sync::HOLD_TAG_NETPOLL_DRAIN,
@@ -1540,11 +1514,10 @@ fn netpoll_drain_step() {
         // transitively `SOCKET_TABLE` via the post-drop wake pass) is already behind
         // its own `PreemptGuard`-protected lock, so the drain doesn't need the BKL for
         // exclusivity — same precedent as `NetBklGuard` (src/syscall/net.rs), whose
-        // mechanism this reuses directly. Safe because under `kernel_smp_shared`
+        // mechanism this reuses directly. Safe because under `kernel_bkl_smp`
         // `PreemptGuard::new()` also masks IRQs for the inner `NETWORK` hold, which is what
         // keeps a nested IRQ from ever observing this core "holding NETWORK, wanting
         // the BKL" — the AB-BA shape the `PreemptGuard` doc warns about.
-        #[cfg(kernel_smp_shared)]
         akuma_exec::bkl::dropped_window_open();
         // Re-arm the netpoll doorbell BEFORE draining, not after.
         //
@@ -1570,7 +1543,6 @@ fn netpoll_drain_step() {
         // (`NIC_WAKE_PENDING`); renamed when a loopback frame push
         // (`akuma_net::runtime::NetRuntime::wake_netpoll`) became a second ringer
         // — see `ring_netpoll_doorbell` and `docs/archive/LOOPBACK_RING_CONVERSION.md`.
-        #[cfg(kernel_smp_shared)]
         NETPOLL_WAKE_PENDING.store(false, core::sync::atomic::Ordering::Relaxed);
         let mut polls = 0u32;
         while akuma_net::smoltcp_net::poll() {
@@ -1579,7 +1551,6 @@ fn netpoll_drain_step() {
                 break; // Safety cap to avoid starving other threads
             }
         }
-        #[cfg(kernel_smp_shared)]
         akuma_exec::bkl::dropped_window_close();
     }
 }
@@ -1856,7 +1827,7 @@ fn run_async_main() -> ! {
         // the smoltcp drain and herd polling below it, so a `netpoll` measurement
         // decomposes instead of crediting the whole iteration to one bucket
         // (BKL_VFS_CARVE_OUT.md §19).
-        #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
+        #[cfg(feature = "smoltcp")]
         akuma_exec::sync::set_holder_tag(
             akuma_exec::bkl::current_core_id(),
             akuma_exec::sync::HOLD_TAG_NETPOLL_MAINT,
@@ -2206,7 +2177,7 @@ fn run_async_main() -> ! {
         if config::MEM_MONITOR_ENABLED {
             // Profiler only: attribute the (normally disabled) mem-monitor poll
             // separately from the drain (BKL_VFS_CARVE_OUT.md §19).
-            #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
+            #[cfg(feature = "smoltcp")]
             akuma_exec::sync::set_holder_tag(
                 akuma_exec::bkl::current_core_id(),
                 akuma_exec::sync::HOLD_TAG_NETPOLL_MEMMON,
@@ -2223,7 +2194,7 @@ fn run_async_main() -> ! {
         // to 100 ms was tried 2026-08-20 and measured NEUTRAL-TO-WORSE (req/s
         // 1,040 -> 1,002, p90 2,453 -> 2,727 us on the same machine state). Do not
         // "fix" it again without re-measuring: see AKUMA_NET_ISSUES.md §10.
-        #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
+        #[cfg(feature = "smoltcp")]
         akuma_exec::sync::set_holder_tag(
             akuma_exec::bkl::current_core_id(),
             akuma_exec::sync::HOLD_TAG_NETPOLL_HERD,
@@ -2321,14 +2292,14 @@ const VIRTIO_MMIO_SPI_BASE: u32 = platform::machine::VIRTIO_INTID_BASE;
 ///
 /// Only exists where it is used: the doorbell is about waking *peer* cores, so a
 /// build without `smp-shared` has nobody to poke.
-#[cfg(all(feature = "smoltcp", kernel_smp_shared))]
+#[cfg(feature = "smoltcp")]
 #[cfg(target_os = "none")]
 static NETPOLL_WAKE_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Ring the cross-core netpoll doorbell: broadcast the scheduler SGI to every
 /// core, coalesced through [`NETPOLL_WAKE_PENDING`] so a burst costs one SGI
-/// per drain cycle rather than one per frame. No-op off `kernel_smp_shared`
+/// per drain cycle rather than one per frame. No-op off `kernel_bkl_smp`
 /// (see that static's doc comment).
 ///
 /// Two callers want exactly the same effect — end every core's
@@ -2353,7 +2324,6 @@ fn ring_netpoll_doorbell() {
     // The hooked netpoll loop parks between laps rather than halting, so an interrupt alone
     // does not resume it: wake it.
     threading::wake_netpoll_parker();
-    #[cfg(kernel_smp_shared)]
     if !NETPOLL_WAKE_PENDING.swap(true, core::sync::atomic::Ordering::AcqRel) {
         // Wake EVERY core, not just the ones with a parked socket waiter.
         //

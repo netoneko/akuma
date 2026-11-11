@@ -1,6 +1,6 @@
 # Debug SMP (shared-kernel multiprocessing)
 
-Symptom-driven debugging for **real (shared-kernel) SMP** — `cfg(kernel_smp_shared)`,
+Symptom-driven debugging for **real (shared-kernel) SMP** — `cfg(kernel_bkl_smp)`,
 the `smp-shared` feature, in the default feature set since 2026-08-10. For architecture
 see [`../reference/subsystems/smp-shared.md`](../reference/subsystems/smp-shared.md); for
 the running dev log see [`../archive/SMP_SHARED.md`](../archive/SMP_SHARED.md).
@@ -33,9 +33,9 @@ the running dev log see [`../archive/SMP_SHARED.md`](../archive/SMP_SHARED.md).
 ## Build & run
 
 ```bash
-cargo build --profile release-smp-shared --features smp-shared
-SMP=2 cargo run --profile release-smp-shared --features smp-shared     # -smp 2
-SMP=4 cargo run --profile release-smp-shared --features smp-shared     # -smp 4
+cargo build --release
+SMP=2 cargo run --release     # -smp 2
+SMP=4 cargo run --release     # -smp 4
 ```
 
 `SMP=N` (cargo_runner.sh) sets QEMU `-smp N`. Boot self-tests
@@ -188,7 +188,7 @@ The host has no `gdb`; attach `lldb` to QEMU's gdbstub. See
 lldb+gdbstub. Recipe:
 
 ```bash
-INSTANCE=1 GDB=1 SMP=2 cargo run --profile release-smp-shared --features smp-shared   # gdbstub on :1235
+INSTANCE=1 GDB=1 SMP=2 cargo run --release   # gdbstub on :1235
 # in another shell:
 lldb target/aarch64-unknown-none/release-smp-shared/akuma \
   -o "gdb-remote localhost:1235" -o "thread backtrace all"
@@ -246,5 +246,5 @@ where you can.
   OOM/reclaim path can re-enter it. Hold it only for short PTE-edit windows (IRQs off).
   Allocate before, free after.
 - The `size` / `extreme` builds compile **none** of this — every
-  `bkl`/`as_lock`/profiler entry is a zero-cost no-op unless `cfg(kernel_smp_shared)`.
+  `bkl`/`as_lock`/profiler entry is a zero-cost no-op unless `cfg(kernel_bkl_smp)`.
 - All SMP work is gated; if a change regresses a non-SMP build, you broke a `cfg` gate.

@@ -4,7 +4,6 @@
 fn main() {
     for cfg in [
         "kernel_tests",
-        "kernel_smp_shared",
         "kernel_bkl_profile",
         "kernel_audio",
     ] {
@@ -12,7 +11,6 @@ fn main() {
     }
     for var in [
         "CARGO_FEATURE_NO_TESTS",
-        "CARGO_FEATURE_SMP_SHARED",
         "CARGO_FEATURE_BKL_PROFILE",
         "CARGO_FEATURE_SOUND",
         "CARGO_FEATURE_PLATFORM_FIRECRACKER",
@@ -22,9 +20,6 @@ fn main() {
     let feature = |name: &str| std::env::var_os(format!("CARGO_FEATURE_{name}")).is_some();
     if !feature("NO_TESTS") {
         println!("cargo:rustc-cfg=kernel_tests");
-    }
-    if feature("SMP_SHARED") {
-        println!("cargo:rustc-cfg=kernel_smp_shared");
     }
     if feature("BKL_PROFILE") {
         println!("cargo:rustc-cfg=kernel_bkl_profile");

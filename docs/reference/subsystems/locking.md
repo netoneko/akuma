@@ -9,7 +9,8 @@
 >
 > **The `no-bkl-*` names below are carve-outs, not features.** Each was a Cargo
 > feature until 2026-11-11, always on under `smp-shared`. They were folded into
-> `smp-shared` then, and their cfgs now read `kernel_smp_shared`. A/B one with its
+> it then, and their cfgs now read `kernel_bkl_smp` (the shared crates' `bkl-smp`
+> switch, which both Akuma kernels always enable). A/B one with its
 > runtime toggle in `akuma_bkl::policy` (`docs/archive/AKUMA_FEATURE_AUDIT.md` F2).
 
 This is the distilled "how to add a lock, or remove one, without re-deriving
@@ -18,12 +19,12 @@ of any specific fix, follow the links into `docs/archive/`.
 
 ## The model
 
-Under `smp-shared` (real shared-kernel SMP, `cfg(kernel_smp_shared)`), one
+In every Akuma build (real shared-kernel SMP, `cfg(kernel_bkl_smp)`), one
 kernel runs across all cores. Correctness is anchored by a single **Big Kernel
 Lock** (`akuma_exec::sync::KernelLock`, driven via `akuma_exec::bkl`):
 **held iff a core is in EL1**, reconciled at every EL transition
 (`reconcile_for_spsr`, called from IRQ/exception epilogues), with a fair FIFO
-ticket wait so no core starves. Off `smp-shared` it's a zero-cost no-op.
+ticket wait so no core starves. Without `bkl-smp` (Taoxichuan, host tests) it's a zero-cost no-op.
 
 The BKL upgraded the kernel's old single-core invariant (`with_irqs_disabled`,
 which only gives mutual exclusion on *one* core) to something SMP-safe in one

@@ -4,15 +4,15 @@ fn main() {
     //
     // **Grep for both spellings**, the attribute and the `cfg!(..)` macro form:
     // `grep -rohE 'kernel_[a-z_]+'` and filter by hand. The BKL carve-outs
-    // (`cfg!(kernel_smp_shared)` in each family's `COMPILED_IN`) were their own
+    // (`cfg!(kernel_bkl_smp)` in each family's `COMPILED_IN`) were their own
     // `kernel_no_bkl_*` cfgs until 2026-11-11; `smp-shared` now implies them, and
     // A/B is the runtime toggles in `akuma_bkl::policy`.
-    for c in ["kernel_smp_shared", "kernel_tests"] {
+    for c in ["kernel_bkl_smp", "kernel_tests"] {
         println!("cargo::rustc-check-cfg=cfg({c})");
     }
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
-    if std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok() {
-        println!("cargo:rustc-cfg=kernel_smp_shared");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BKL_SMP");
+    if std::env::var("CARGO_FEATURE_BKL_SMP").is_ok() {
+        println!("cargo:rustc-cfg=kernel_bkl_smp");
     }
     // `no-tests` is an opt-*out*, so its absence is what enables the suite.
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_TESTS");
@@ -137,7 +137,7 @@ fn main() {
 
     // The `extreme-size` profile is the only one at opt-level "z"; it names the
     // codegen, not a feature set.
-    let smp_shared = std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok();
+    let smp_shared = std::env::var("CARGO_FEATURE_BKL_SMP").is_ok();
     let size_opt = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
     let build_profile = if size_opt {
         "extreme-size"

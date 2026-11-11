@@ -20,15 +20,16 @@ no-tests = []
 # `akuma-kernel-glue`, `akuma-exceptions`, the bin).
 elf-loader = ["dep:akuma-elf", "dep:embedded-io-async"]
 
-# Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared` feature.
-# Lets this crate's build.rs emit `cfg(kernel_smp_shared)` so the Big Kernel Lock
-# (`bkl`) is active; with it off, `bkl` compiles to zero-overhead no-ops and the
-# default/other builds are unaffected. See docs/reference/subsystems/smp-shared.md.
+# Akuma's shared-kernel SMP under `akuma-bkl` (`bkl-smp`, cfg `kernel_bkl_smp`): the
+# Big Kernel Lock (`bkl`) is active; with it off, `bkl` compiles to zero-overhead
+# no-ops. See docs/reference/subsystems/smp-shared.md.
+# Both Akuma kernels always turn it on; Taoxichuan never does (it serializes under
+# its own lock, proposals/ONE_BIG_KERNEL_LOCK.md); host tests build the off arms.
 #
 # Also turns on the BKL-free fork page-copy (`ProcessBklGuard`, process/bkl_guard.rs),
 # the separate `no-bkl-process` feature until 2026-11-11; A/B is its runtime toggle,
 # `akuma_bkl::policy`.
-smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared", "akuma-elf?/smp-shared", "akuma-threading/smp-shared", "akuma-el0-entry/smp-shared"]
+bkl-smp = ["akuma-primitives/bkl-smp", "akuma-bkl/bkl-smp", "akuma-mmu/bkl-smp", "akuma-elf?/bkl-smp", "akuma-threading/bkl-smp", "akuma-el0-entry/bkl-smp"]
 
 # Mirrors the bin crate's `syscall-debug-info`. OFF by default.
 #

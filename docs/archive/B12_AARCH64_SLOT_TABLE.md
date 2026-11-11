@@ -1,6 +1,11 @@
 # B12: AArch64's slot table behind the interface the x86 kernels use (proposal, 2026-11-02)
 
-**Status: proposal, not started.** Step B12 of [`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`](../docs/archive/TAOXICHUAN_CLEANUP_PLAN.md).
+> **Archived 2026-11-11 from `proposals/`.** Done by another route: the AArch64 kernel's scheduler
+> runs behind the shared `ArchHooks` (registered from `crates/akuma-kernel-glue/src/hooked.rs`, "hooked"
+> scheduler). The separate `akuma-sched-aarch64` crate this proposed (S4) was not created. The status
+> line below is as last written.
+
+**Status: proposal, not started.** Step B12 of [`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md).
 Written before any code moves because this step changes the AArch64 scheduler, the code behind most of the SMP
 incidents in `docs/archive/` (the ON_CPU gate, the TTBR gate, the adopted idle-stack clobber, the phantom SVC).
 

@@ -2483,7 +2483,7 @@ UNSAFE_CASES = [
         # A plain feature gate says nothing about tests; charging it to test
         # would hide real shipped `unsafe` behind any optional feature.
         "a non-test feature gate is production",
-        '#[cfg(feature = "smp-shared")]\nfn f() {\n    unsafe { a() };\n}\n',
+        '#[cfg(feature = "bkl-smp")]\nfn f() {\n    unsafe { a() };\n}\n',
         1,
         1,
     ),

@@ -3,7 +3,6 @@
 // THIS package's own resolved features, so this crate needs its own build
 // script (see `akuma-kernel-core/build.rs` for the same pattern, one layer down).
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
 
     // Absence of `no-tests` = the boot self-tests are built (mirrors the root crate and
@@ -13,8 +12,4 @@ fn main() {
         println!("cargo:rustc-cfg=kernel_tests");
     }
 
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
-    if std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok() {
-        println!("cargo:rustc-cfg=kernel_smp_shared");
-    }
 }

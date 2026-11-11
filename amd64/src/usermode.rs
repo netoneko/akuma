@@ -2263,7 +2263,7 @@ pub fn current_mm_pid() -> u32 {
 ///
 /// Short. Every caller here holds it across one PTE edit or one bounded range
 /// walk and nothing that blocks. `ProcAddressSpace::lock` **does** mask IRQs on
-/// this target — `kernel_smp_shared` is a required feature of it since the
+/// this target — `kernel_bkl_smp` is a required feature of it since the
 /// unblock (`docs/archive/AKUMA_AMD64_SMP_SHARED_UNBLOCK.md`) and `akuma-cpu`'s
 /// `daif` has real x86 arms.
 ///
@@ -2936,7 +2936,7 @@ pub fn current_pid() -> u32 {
 //
 // It stopped being open on 2026-09-08: `smp-shared` is a **required** default
 // feature of this target (`Cargo.toml`, const-asserted in `smp.rs`), so
-// `kernel_smp_shared` is on and `ProcAddressSpace::lock()` really masks IRQs
+// `kernel_bkl_smp` is on and `ProcAddressSpace::lock()` really masks IRQs
 // (`akuma-cpu`'s `daif` has real x86 arms now). The shared table behind that
 // lock is therefore exclusion-correct from day one, and this slice adds no
 // lock of its own — `register_process`'s `SlotTable` CAS and the IRQ-masked
@@ -3955,7 +3955,7 @@ fn sys_fork() -> u64 {
     //   POSIX; this target had no dispositions to carry, so it is a gain that
     //   costs nothing today and is correct the moment `sigaction` works.
     // * **`LifecycleGuard`** wraps the whole thing. A no-op unless
-    //   `kernel_smp_shared`, which this target does not build.
+    //   `kernel_bkl_smp`, which this target does not build.
     //
     // The parent-slot bound this used to check (`>= PROC_SLOTS`) is gone with
     // the hand-rolled slot search; `current_process()` inside `fork_process` is

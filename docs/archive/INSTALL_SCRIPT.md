@@ -1,5 +1,8 @@
 # `install.sh`: from a URL to an ssh prompt on Akuma (proposal, 2026-11-04)
 
+> **Archived 2026-11-11 from `proposals/`.** Done: `scripts/install.sh` and `bootstrap/public/install.txt`.
+> The status line below is as last written.
+
 **Status: proposal, not started.**
 
 ## Goal
@@ -161,7 +164,7 @@ the README's quick start pointing at the URL.
 
 ## Background
 
-[`crates/akuma-tokio-kernel/README.md`](../crates/akuma-tokio-kernel/README.md),
+[`crates/akuma-tokio-kernel/README.md`](../../crates/akuma-tokio-kernel/README.md),
 `shanghai/docs/EXPERIMENT_RESULT.md` (commit `d4a6c7d9`), `scripts/populate_disk.sh`,
 [`B21_TOKIO_KERNEL_AARCH64.md`](B21_TOKIO_KERNEL_AARCH64.md),
-[`TAOXICHUAN_FIXED_POINT.md`](../docs/archive/TAOXICHUAN_FIXED_POINT.md).
+[`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md).

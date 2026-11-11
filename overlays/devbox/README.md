@@ -63,7 +63,8 @@ two features. (The `devbox` feature that bundled them was removed 2026-11-11.)
 ### devbox-smoltcp (the default) — the inverse
 
 The recommended image is the **`devbox-smoltcp`** meta-feature on the
-**`release`** profile (the `smp-shared` feature does the work):
+**`release`** profile (every Akuma build is shared-kernel SMP; the feature is an
+empty alias kept for the scripts):
 
 ```
 cargo run --release --features devbox-smoltcp,no-tests   # run-smoltcp.sh

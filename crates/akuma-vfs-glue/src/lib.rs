@@ -1482,7 +1482,7 @@ pub fn is_dev_dir(path: &str) -> bool {
 ///
 /// This is the check that keeps a raw
 /// write-open off a device `Ext2Filesystem` is caching
-/// (`proposals/RAW_BLOCK_DEVICE_FD.md` §3). Root mounts with source
+/// (`docs/archive/RAW_BLOCK_DEVICE_FD.md` §3). Root mounts with source
 /// `/dev/vda` (`src/fs.rs`), so this strips an optional `/dev/` prefix off
 /// each recorded source before comparing.
 ///

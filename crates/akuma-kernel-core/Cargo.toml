@@ -41,13 +41,13 @@ akuma-uart = { path = "../akuma-uart" }
 pmm-instr = []
 # Mirrors the root package's own toggles of the same name — each needs to
 # reach this crate's build.rs so `kernel_tests`/
-# `kernel_smp_shared` come out the same here as in the bin crate. See
+# `kernel_bkl_smp` come out the same here as in the bin crate. See
 # `build.rs`.
 no-tests = []
-# `trigger_sgi_self` (timer.rs) is itself `#[cfg(kernel_smp_shared)]` inside
+# `trigger_sgi_self` (timer.rs) is itself `#[cfg(kernel_bkl_smp)]` inside
 # akuma-gic, gated on akuma-gic's OWN feature — forward this one, unlike the
 # other toggles above, which only need to reach this crate's own build.rs.
-smp-shared = ["akuma-gic/smp-shared"]
+bkl-smp = ["akuma-gic/bkl-smp"]
 net-profile = ["akuma-net/net-profile"]
 # `platform.rs` selects the machine description at compile time. The cfg it
 # reads is `feature = "platform-firecracker"` on THIS package, so the toggle has

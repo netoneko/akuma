@@ -2,9 +2,12 @@
 
 Classic symmetric multiprocessing: ONE shared kernel across all cores — one
 page-table set, one PMM/heap, one global run queue, real cross-core locking. Source:
-`src/smp_shared.rs`. Behind `cfg(kernel_smp_shared)` (the `smp-shared` feature).
-**In the default feature set since 2026-08-10** — a plain `cargo build --release`
-carries it.
+`crates/akuma-entry/src/smp_shared.rs`. **Every Akuma build** (AArch64 and amd64)
+is this; there is no feature to turn it off. The shared crates carry it as
+`bkl-smp` (cfg `kernel_bkl_smp`), which both Akuma kernels always enable and
+Taoxichuan does not (it serializes under its own lock —
+[`../../../proposals/ONE_BIG_KERNEL_LOCK.md`](../../../proposals/ONE_BIG_KERNEL_LOCK.md)).
+`akuma_bkl::ACTIVE` is asserted at compile time by both kernels.
 
 > **Stability: C (active development).** M0–M4 done as of 2026-07-19 (userspace runs +
 > migrates across cores; one open boot item, below). Progress log:
@@ -18,8 +21,8 @@ The one-kernel-per-core "multikernel" alternative (share-nothing, replicated
 ## Build & run
 
 ```bash
-cargo build --release --features smp-shared   # already the default feature set
-SMP=2 cargo run --release   # -smp 2 in QEMU
+cargo build --release
+SMP=2 cargo run --release   # -smp 2 in QEMU; SMP=1 is the same image on one core
 ```
 
 `SMP=N` (cargo_runner.sh) sets QEMU `-smp N`. The primary test image is
@@ -39,14 +42,14 @@ real SMP) — see `scripts/build_devbox_smoltcp.sh` and
   no per-thread depth crosses context switches. Contended acquisition is a **fair FIFO
   ticket wait** (M5c) so no core is starved — the reentrant/reconcile acquires take no
   ticket, keeping the counters balanced across context switches. Zero-cost no-op unless
-  `cfg(kernel_smp_shared)`. M1 wires it on the syscall path (`rust_sync_el0_handler`
+  `cfg(kernel_bkl_smp)`. M1 wires it on the syscall path (`rust_sync_el0_handler`
   wrapper + `enter_user_mode`); the IRQ/scheduler reconciliation is M2.
 - **Single global run queue + lock**; each core's current thread is `TPIDRRO_EL0`
   (already per-core hardware). The single `ThreadPool.current_idx`/`round_robin_idx`
   do not generalize and are being retired.
 - **TLB (M3, done):** the page-table *modification* flushes (`flush_tlb_all`/`_asid`/
   `_page`/`_range_all_asid`) broadcast over the inner-shareable domain (`...is`) under
-  `kernel_smp_shared`, so a user address space edited on one core is coherent on peers
+  `kernel_bkl_smp`, so a user address space edited on one core is coherent on peers
   running it. Real per-AS ASIDs are deferred (a perf optimization; all use ASID 0 today,
   which is correct given private per-core TLBs + IS edits + the **cross-AS**
   switch-flush). Since 2026-08-19 the switch-flush is conditional: a switch whose

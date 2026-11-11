@@ -28,9 +28,10 @@ akuma-not-even-once = { path = "../akuma-not-even-once" }
 
 [features]
 # Mirrors the root package's toggles that this crate's own build.rs and modules
-# read. `smp-shared` gates the entire secondary-core half.
+# read. `bkl-smp` forwards to the secondary-core half's dependencies; the
+# Akuma kernels always turn it on.
 no-tests = []
-smp-shared = ["akuma-boot-aarch64/secondary", "akuma-gic/smp-shared", "akuma-kernel-core/smp-shared", "akuma-exceptions/smp-shared"]
+bkl-smp = ["akuma-boot-aarch64/secondary", "akuma-gic/bkl-smp", "akuma-kernel-core/bkl-smp"]
 platform-firecracker = ["akuma-kernel-core/platform-firecracker", "akuma-boot-aarch64/platform-firecracker"]
 
 [lints]

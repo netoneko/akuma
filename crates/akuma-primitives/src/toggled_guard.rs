@@ -40,7 +40,7 @@ use core::marker::PhantomData;
 /// toggled, then alias the guard: `pub type DriverBklGuard = ToggledGuard<DriverBkl>;`
 pub trait GuardToggle {
     /// Whether this guard is compiled in at all — normally
-    /// `cfg!(kernel_smp_shared)`.
+    /// `cfg!(kernel_bkl_smp)`.
     ///
     /// When `false`, [`enter`](Self::enter) and [`exit`](Self::exit) are never reached
     /// and the guard folds to nothing: `new()` stores a constant `false` to a local

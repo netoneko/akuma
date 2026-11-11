@@ -139,8 +139,8 @@ use spinning_top::Spinlock;
 // this module lived inside that crate.
 use akuma_mmu as mmu;
 use akuma_bkl::bkl;
-// Only the `kernel_smp_shared` thread-tag call sites use this.
-#[cfg(kernel_smp_shared)]
+// Only the `kernel_bkl_smp` thread-tag call sites use this.
+#[cfg(kernel_bkl_smp)]
 use akuma_bkl::sync;
 use akuma_exec_core::process::UserContext;
 use akuma_mmap::PhysFrame;
@@ -1534,7 +1534,7 @@ fn scrub_thread_slot(i: usize) {
 
     // Profiler attribution: without this the new thread lends the previous occupant's
     // tag to any peer sampling this slot before its first kernel entry.
-    #[cfg(kernel_smp_shared)]
+    #[cfg(kernel_bkl_smp)]
     sync::reset_thread_tag(i);
 }
 
@@ -1654,7 +1654,7 @@ pub fn mark_thread_terminated(idx: usize) {
     if idx != IDLE_THREAD_IDX && idx < MAX_THREADS {
         // Attribute EVERY termination to its site, not just cross-thread ones.
         // The `[kill]` tracer below fires only when `killer != idx`, which under
-        // `kernel_smp_shared` misses the whole deferred-kill path: PHASE 1 posts
+        // `kernel_bkl_smp` misses the whole deferred-kill path: PHASE 1 posts
         // `request_thread_kill` and the victim self-marks at its EL1→EL0 boundary,
         // so `killer == idx` and a thread killed from outside dies with no trace
         // at all. That blind spot is why a "zero `[kill]` lines" reading cannot be
@@ -4393,7 +4393,7 @@ pub fn idle_halt() {
     // Real shared-kernel SMP: an idle core must not hold the Big Kernel Lock while
     // halted, or peer cores can't enter the kernel. Drop it before WFI; the IRQ that
     // wakes us re-takes it via the IRQ-path reconcile as it returns into this thread.
-    // No-op unless `cfg(kernel_smp_shared)`.
+    // No-op unless `cfg(kernel_bkl_smp)`.
     bkl::leave_kernel();
     // SAFETY: WFI halts the PE until a pending IRQ. IRQs are enabled on entry, so
     // the interrupt (timer tick / device) is taken and serviced before WFI returns.
@@ -4412,7 +4412,7 @@ pub fn idle_halt() {
         // `yield_now()` that follows in the idle loop) is attributed "unknown". Gated on
         // IS_IDLE_THREAD because non-idle callers use `idle_halt()` as a plain wait and
         // must keep their own excursion's tag.
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         if is_idle {
             sync::set_holder_tag(bkl::current_core_id(), sync::HOLD_TAG_IDLE);
         }
@@ -4489,19 +4489,19 @@ pub fn credit_halted_time(_tid: usize, _entered_us: u64) {}
 /// [`blocking_relax_net`] instead, which is the variant without it — see there for
 /// why the two paths differ.
 ///
-/// Off `cfg(kernel_smp_shared)` this is a plain `yield_now` — single-core / default
+/// Off `cfg(kernel_bkl_smp)` this is a plain `yield_now` — single-core / default
 /// builds are byte-for-byte unchanged (the `idle_halt` call compiles out).
 #[inline]
 pub fn blocking_relax() {
     yield_now();
-    #[cfg(kernel_smp_shared)]
+    #[cfg(kernel_bkl_smp)]
     idle_halt();
 }
 
 /// [`blocking_relax`] for the **socket** wait loop (`akuma_net`'s `wait_until`),
 /// wired in through `NetRuntime::blocking_relax`.
 ///
-/// Identical except that under `cfg(kernel_smp_shared)` it does NOT `yield_now`
+/// Identical except that under `cfg(kernel_bkl_smp)` it does NOT `yield_now`
 /// before halting. That single difference is worth +27 % on HTTP throughput and cuts
 /// p90 by half (A/B 2026-08-20, 5x2000 requests per arm, same session and same
 /// `httpd`: 1,028 -> 1,307 req/s, p90 2,411 -> 1,166 us, ranges disjoint):
@@ -4527,9 +4527,9 @@ pub fn blocking_relax() {
 /// and does not.
 #[inline]
 pub fn blocking_relax_net() {
-    #[cfg(not(kernel_smp_shared))]
+    #[cfg(not(kernel_bkl_smp))]
     yield_now();
-    #[cfg(kernel_smp_shared)]
+    #[cfg(kernel_bkl_smp)]
     idle_halt();
 }
 

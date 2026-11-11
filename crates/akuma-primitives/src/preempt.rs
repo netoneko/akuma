@@ -116,7 +116,7 @@ pub fn current_tid() -> usize {
 
 /// Current thread id on x86_64 bare metal.
 ///
-/// Real only under `kernel_smp_shared`, where the per-thread statics this
+/// Real only under `kernel_bkl_smp`, where the per-thread statics this
 /// feeds (`PREEMPTION_DISABLED`, `akuma-bkl`'s dropped-window ledger) are
 /// consulted by shared code and a constant 0 would make four cores share one
 /// counter. The answer is `akuma_cpu::percpu::current_task()` — `gs:[32]`, the
@@ -127,7 +127,7 @@ pub fn current_tid() -> usize {
 ///
 /// The bounds check matches the AArch64 arm: a garbage slot must be named and
 /// halted, not indexed.
-#[cfg(all(target_os = "none", target_arch = "x86_64", kernel_smp_shared))]
+#[cfg(all(target_os = "none", target_arch = "x86_64", kernel_bkl_smp))]
 #[inline]
 #[must_use]
 pub fn current_tid() -> usize {
@@ -149,12 +149,12 @@ pub fn current_tid() -> usize {
 /// Current thread id where this crate can read no per-CPU register.
 ///
 /// That is host builds, bare-metal targets other than AArch64, and x86_64
-/// builds without `kernel_smp_shared` — see the arm above for why the gate is
+/// builds without `kernel_bkl_smp` — see the arm above for why the gate is
 /// the conjunction.
 ///
 /// Zero, stated rather than inherited.
 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-#[cfg(not(all(target_os = "none", target_arch = "x86_64", kernel_smp_shared)))]
+#[cfg(not(all(target_os = "none", target_arch = "x86_64", kernel_bkl_smp)))]
 #[inline]
 #[must_use]
 pub fn current_tid() -> usize {
@@ -399,10 +399,10 @@ pub fn check_preemption_watchdog() -> Option<u64> {
 pub struct PreemptGuard {
     /// Whether `new()` actually disabled preemption. Present only under
     /// `smp-shared`; other builds carry no state.
-    #[cfg(kernel_smp_shared)]
+    #[cfg(kernel_bkl_smp)]
     active: bool,
     /// Saved DAIF to restore on drop (see type doc).
-    #[cfg(kernel_smp_shared)]
+    #[cfg(kernel_bkl_smp)]
     saved_daif: u64,
 }
 
@@ -410,7 +410,7 @@ impl PreemptGuard {
     /// Disable preemption (under `smp-shared`) until the returned guard drops.
     #[inline]
     pub fn new() -> Self {
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         {
             // Direct call, no runtime registration — which is the historical
             // reason the net crate used a callback pointer, and why this works
@@ -420,7 +420,7 @@ impl PreemptGuard {
             // re-enables preemption only once IRQs are live again.
             Self { active: true, saved_daif: crate::irq::irq_save_mask() }
         }
-        #[cfg(not(kernel_smp_shared))]
+        #[cfg(not(kernel_bkl_smp))]
         Self {}
     }
 }
@@ -438,9 +438,9 @@ impl Drop for PreemptGuard {
         // Restore IRQs first (reverse of new's order), then re-enable preemption
         // — so a timer IRQ can't preempt us between enable_preemption and the
         // DAIF restore.
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         crate::irq::irq_restore(self.saved_daif);
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         if self.active {
             enable_preemption();
         }
@@ -575,7 +575,7 @@ mod tests {
         let before = preemption_disabled_count(0);
         {
             let _g = PreemptGuard::new();
-            #[cfg(kernel_smp_shared)]
+            #[cfg(kernel_bkl_smp)]
             assert_eq!(preemption_disabled_count(0), before + 1);
         }
         assert_eq!(preemption_disabled_count(0), before);
@@ -588,10 +588,10 @@ mod tests {
             let _outer = PreemptGuard::new();
             {
                 let _inner = PreemptGuard::new();
-                #[cfg(kernel_smp_shared)]
+                #[cfg(kernel_bkl_smp)]
                 assert_eq!(preemption_disabled_count(0), 2);
             }
-            #[cfg(kernel_smp_shared)]
+            #[cfg(kernel_bkl_smp)]
             assert!(is_preemption_disabled());
         }
         assert_eq!(preemption_disabled_count(0), 0);

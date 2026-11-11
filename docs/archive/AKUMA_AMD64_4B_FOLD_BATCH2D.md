@@ -32,7 +32,7 @@ of four parts and one call.
 3. **Three flags and a directory guard glue does not enforce** — `O_DIRECTORY`,
    `O_EXCL`, `O_NOFOLLOW`, `O_CREAT`-on-a-directory. See below.
 4. **A block node is `ENODEV`.** Glue serves `/dev/vdX` as a `BlockDev`
-   descriptor (`proposals/RAW_BLOCK_DEVICE_FD.md`); nothing here reads one, and
+   descriptor (`docs/archive/RAW_BLOCK_DEVICE_FD.md`); nothing here reads one, and
    `akuma_virtio::block` *does* have `vda` registered on this target, so a
    folded `open("/dev/vda")` would have handed back a descriptor whose first
    `read` answers `EBADF` — a failure at the wrong syscall, which is the

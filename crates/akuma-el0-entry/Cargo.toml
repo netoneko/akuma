@@ -19,4 +19,4 @@ akuma-bkl = { path = "../akuma-bkl" }
 akuma-threading = { path = "../akuma-threading" }
 
 [features]
-smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-threading/smp-shared"]
+bkl-smp = ["akuma-primitives/bkl-smp", "akuma-bkl/bkl-smp", "akuma-threading/bkl-smp"]

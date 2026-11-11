@@ -279,48 +279,39 @@ pub fn run_all_tests() {
     // Real (shared-kernel) SMP M0: confirm every secondary the DTB reported came up
     // on the shared kernel. Runs FIRST so it is observed even if a later, unrelated
     // memory-pressure test aborts the suite. No-op on a single-CPU boot.
-    #[cfg(kernel_smp_shared)]
     test_smp_shared_cores_online();
 
     // `threading::init` must not trample slots the secondaries already adopted (their
     // RUNNING state, their stack). Runs right after the cores-online check, before
     // anything spawns — a clobbered slot is most visible before the allocator reuses it.
-    #[cfg(kernel_smp_shared)]
     test_core_idle_slots_survive_init();
 
     // Real (shared-kernel) SMP M2c: confirm the shared scheduler runs threads on more
     // than one core (secondaries participate in scheduling). No-op on a single CPU.
-    #[cfg(kernel_smp_shared)]
     test_smp_shared_scheduler();
 
     // Real (shared-kernel) SMP M3: confirm USERSPACE processes run across cores.
-    #[cfg(kernel_smp_shared)]
     test_smp_shared_userspace();
 
     // Real (shared-kernel) SMP M4: confirm a single thread MIGRATES across cores.
-    #[cfg(kernel_smp_shared)]
     test_smp_shared_migration();
 
     // PMM/heap lock-order regression: concurrent page-batch alloc + heap churn.
     // Must run HERE (not in tests.rs) — it needs live worker threads, and the memory
     // suite runs before the scheduler can schedule them.
-    #[cfg(kernel_smp_shared)]
     test_pmm_heap_lock_order_smp();
 
     // Real (shared-kernel) SMP M5b Stage 4a: A/B-measure whether dropping the BKL
     // around a file-fault's block I/O reduces cross-core BKL contention.
-    #[cfg(kernel_smp_shared)]
     test_smp_shared_fault_parallelism();
 
     // Real (shared-kernel) SMP M5c: A/B-measure whether dropping the BKL around execve's
     // whole-file ELF read reduces cross-core BKL contention.
-    #[cfg(kernel_smp_shared)]
     test_smp_shared_exec_parallelism();
 
     // A deliberately-dropped-BKL window (Vfs/Net guards, exec/fault drops) must SURVIVE
     // timer IRQs and scheduler crossings — regression for the `[BKL] stuck` conversion
     // where the first tick inside a window re-held the BKL for the window's remainder.
-    #[cfg(kernel_smp_shared)]
     test_smp_shared_dropped_window_survives_irq();
 
     // The EL0-return `eret` must hold IRQs masked from the `ELR_EL1` write through
@@ -330,12 +321,10 @@ pub fn run_all_tests() {
     // BKL-hold ATTRIBUTION must follow the thread, not the core: a thread preempted
     // mid-excursion must still be attributed to that excursion when it resumes, and the
     // transient IRQ stamp must never overwrite the interrupted thread's own tag.
-    #[cfg(kernel_smp_shared)]
     test_smp_shared_holder_tag_follows_thread();
 
     // `no-bkl-vfs`: concurrent fs syscalls (read/stat/getdents) from several processes must
     // stay correct with the BKL dropped, and should lower cross-core BKL contention.
-    #[cfg(kernel_smp_shared)]
     test_smp_shared_vfs_parallelism();
 
     // Same-TTBR0 context switches skip the `msr ttbr0_el1` + `tlbi vmalle1` (the
@@ -358,13 +347,11 @@ pub fn run_all_tests() {
     // Safe to run now that the BKL is fair (ticket lock) + `exec_with_io` drops the BKL
     // across its wait — both required to keep step-2 from deadlocking (see
     // docs/runbooks/debug-smp.md §"M5c step-2").
-    #[cfg(kernel_smp_shared)]
     test_smp_shared_cooperative_wait();
 
     // Real (shared-kernel) SMP: a thread parked in a blocking poll-wait (socket recv / DNS
     // resolve) must DROP the BKL across the wait, or it freezes every peer core. Regression
     // for the `blocking_relax` fix of the meow->LLM wedge (see docs/runbooks/debug-smp.md).
-    #[cfg(kernel_smp_shared)]
     test_smp_shared_blocking_wait_peer_progress();
 
     // `poll_input_event`/`term_state_lock` preemption wedge regression: a thread
@@ -1022,7 +1009,6 @@ pub fn run_all_tests() {
     // `no-bkl-irq` (Phase 7a): the timer IRQ (27) dispatch no longer needs the BKL at
     // all — pins that this core's BKL hold state is unchanged across real timer ticks,
     // plus the runtime kill switch.
-    #[cfg(kernel_smp_shared)]
     test_timer_irq_preserves_bkl_state();
 
     // Phase 7b piece 1: the per-call dropped window around `smoltcp_net::poll()` inside
@@ -1037,7 +1023,6 @@ pub fn run_all_tests() {
     // set/query + deny list, ledger balance across a real opted-out `handle_syscall`
     // dispatch, the latched kill switch flipping mid-excursion, and
     // `DroppedWindowPause` restoring BKL-held execution inside an opted-out window.
-    #[cfg(kernel_smp_shared)]
     test_syscall_bkl_optout();
 
     // Phase 7f pre-flight: the demand-paging helpers `validate_user_ptr` reaches from
@@ -1055,12 +1040,10 @@ pub fn run_all_tests() {
     // BKL ticket-accounting tripwire: like the phantom-SVC check above, runs LAST so it
     // covers every kernel excursion the suite generated. A nonzero count means the fair
     // FIFO ticket lock had to self-heal — see `test_no_bkl_ticket_recoveries`.
-    #[cfg(kernel_smp_shared)]
     test_no_bkl_ticket_recoveries();
 
     // Stale dropped-window tripwire: the "0 stale-depth heals" pass criterion, made a
     // suite assertion. Runs LAST for the same coverage reason as the two above.
-    #[cfg(kernel_smp_shared)]
     test_no_stale_window_heals();
 
     // LAST on purpose: this one provokes a real EL1 data abort, and the handler
@@ -1109,10 +1092,7 @@ fn test_thread_last_core_tracked() {
 
     // Non-SMP builds always run on core 0 (`current_core_id()` is a `0` shim); SMP builds
     // are single-core unless the DTB reported >1 CPU.
-    #[cfg(kernel_smp_shared)]
     let single_core = crate::smp_shared::probed_core_count() <= 1;
-    #[cfg(not(kernel_smp_shared))]
-    let single_core = true;
 
     const MAX_CORES: u8 = akuma_exec::threading::MAX_CORES as u8;
     if core == 0xFF {
@@ -1155,7 +1135,6 @@ fn test_no_spurious_svc_traps() {
 /// `sync::tests::kernel_lock_no_ticket_acquire_release_stays_balanced`.
 ///
 /// Non-zero here means a *new* pairing break, so keep it a failure rather than a log line.
-#[cfg(kernel_smp_shared)]
 fn test_no_bkl_ticket_recoveries() {
     let n = akuma_exec::sync::kernel_lock_recoveries();
     if n == 0 {
@@ -1172,7 +1151,6 @@ fn test_no_bkl_ticket_recoveries() {
 /// M0 boot self-test for real SMP: `smp_shared::bringup_secondaries` (run earlier in
 /// `kernel_main`) should have brought every non-BSP core online. Verifies the online
 /// count equals `probed_core_count - 1` when the DTB reports more than one CPU.
-#[cfg(kernel_smp_shared)]
 fn test_smp_shared_cores_online() {
     let probed = crate::smp_shared::probed_core_count();
     let online = crate::smp_shared::online_secondary_count();
@@ -1212,7 +1190,6 @@ fn test_smp_shared_cores_online() {
 /// break: the slot is still RUNNING, the pool's recorded stack base is the core's
 /// ACTUAL `.bss` stack, and the size is the real one. See
 /// docs/archive/SMP_ADOPTED_IDLE_SLOT_CLOBBER.md.
-#[cfg(kernel_smp_shared)]
 fn test_core_idle_slots_survive_init() {
     use akuma_exec::threading;
 
@@ -1275,7 +1252,6 @@ fn test_core_idle_slots_survive_init() {
 /// shared scheduler, not just the BSP. The wait loop `idle_halt`s (not just yields) so
 /// the BSP releases the Big Kernel Lock and secondaries can pick up the (sleeping)
 /// workers; a yield-only wait would let the BSP monopolize the BKL and starve them.
-#[cfg(kernel_smp_shared)]
 fn test_smp_shared_scheduler() {
     if crate::smp_shared::probed_core_count() <= 1 {
         console::print("[Test] smp_shared_scheduler SKIPPED (single CPU; boot with SMP>1)\n");
@@ -1321,7 +1297,6 @@ fn test_smp_shared_scheduler() {
 /// mask shows >1 core it demonstrably moved between them (not just different threads on
 /// different cores, which M2c/M3 already show). Also exercises the cross-core wake path
 /// (each `sleep_us` wake nudges an idle peer). The BSP waits with yield+`idle_halt`.
-#[cfg(kernel_smp_shared)]
 fn test_smp_shared_migration() {
     if crate::smp_shared::probed_core_count() <= 1 {
         console::print("[Test] smp_shared_migration SKIPPED (single CPU; boot with SMP>1)\n");
@@ -1356,7 +1331,6 @@ fn test_smp_shared_migration() {
 /// per core) and yields the CPU (so it migrates). The BSP waits with yield+`idle_halt`
 /// so it releases the Big Kernel Lock and secondaries can pick the processes up. This is
 /// the payoff: userspace runs *concurrently* across cores (userspace holds no BKL).
-#[cfg(kernel_smp_shared)]
 fn test_smp_shared_userspace() {
     if crate::smp_shared::probed_core_count() <= 1 {
         console::print("[Test] smp_shared_userspace SKIPPED (single CPU; boot with SMP>1)\n");
@@ -1427,7 +1401,6 @@ fn test_smp_shared_userspace() {
 /// children are shells that re-exec busybox). The 5 s ceiling is a liveness bound,
 /// not a deadline: a phase that hits it still returns a usable count, and the tests
 /// are measurements rather than pass/fail.
-#[cfg(kernel_smp_shared)]
 fn bkl_spawn_storm_spins(path: &str, args: &[&str], copies: usize, rounds: usize) -> u64 {
     use akuma_exec::sync::{contention_spins, reset_contention_spins};
 
@@ -1463,7 +1436,6 @@ fn bkl_spawn_storm_spins(path: &str, args: &[&str], copies: usize, rounds: usize
 /// `IRQ/sched` dominance means the measured change is elsewhere. Both callers print
 /// this immediately after their A/B, which is the only point the counters describe
 /// the storm and not the rest of boot.
-#[cfg(kernel_smp_shared)]
 fn print_bkl_wait_by_holder(label: &str) {
     use akuma_exec::sync::{wait_by_holder, HOLD_TAG_FAULT, HOLD_TAG_IRQ};
 
@@ -1494,7 +1466,6 @@ fn print_bkl_wait_by_holder(label: &str) {
 /// can be small; the real payoff is under genuine disk latency. The self-test suite's own
 /// SMP=4 contention is scheduler/spawn-bound, so this dedicated fault workload is the only
 /// in-tree way to observe the fault-path effect.
-#[cfg(kernel_smp_shared)]
 fn test_smp_shared_fault_parallelism() {
     use akuma_exec::sync::{reset_wait_by_holder, set_profiling};
     // This is a MEASUREMENT tool, not a correctness test: its heavy busybox spawn-storm
@@ -1573,7 +1544,6 @@ fn test_smp_shared_fault_parallelism() {
 /// so no PATH lookup); each child `execve` hits the BKL-dropped whole-file read. Same
 /// SMP=2-only caveat as the fault test (a heavy spawn storm provokes the pre-existing SMP≥4
 /// race). This is a MEASUREMENT tool: it always "passes" as long as it runs to completion.
-#[cfg(kernel_smp_shared)]
 fn test_smp_shared_exec_parallelism() {
     use akuma_exec::sync::{reset_wait_by_holder, set_profiling};
     if crate::smp_shared::probed_core_count() != 2 {
@@ -1946,7 +1916,6 @@ fn test_thread_slot_reclaim_on_spawn_initializing() {
 ///
 /// Also pins the nesting contract: an inner window's close must NOT re-acquire while the
 /// outer window is still open; the outermost close must.
-#[cfg(kernel_smp_shared)]
 fn test_smp_shared_dropped_window_survives_irq() {
     use akuma_exec::bkl;
 
@@ -2135,7 +2104,6 @@ fn test_el0_eret_masks_irqs() {
 /// The assertion is the contract stated as an experiment: stamp a sentinel tag, then cross
 /// the scheduler and real timer IRQs repeatedly, and require the tag to still be there —
 /// both in the thread's own entry and in whatever core we come back on.
-#[cfg(kernel_smp_shared)]
 fn test_smp_shared_holder_tag_follows_thread() {
     use akuma_exec::sync::{
         core_tag, set_holder_tag, set_profiling, thread_tag, HOLD_TAG_UNKNOWN,
@@ -2235,7 +2203,6 @@ fn test_smp_shared_holder_tag_follows_thread() {
 /// Note the A/B toggle is what keeps this honest: half 1 is run once with the drop OFF and
 /// once with it ON, so a checksum mismatch can be attributed to the carve-out rather than
 /// to a pre-existing ext2 concurrency bug.
-#[cfg(kernel_smp_shared)]
 fn test_smp_shared_vfs_parallelism() {
     use akuma_exec::sync::{contention_spins, reset_contention_spins};
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -2469,7 +2436,6 @@ fn test_smp_shared_vfs_parallelism() {
 /// and the boot suite hangs *here*. The fix is `exec_with_io_cwd`'s `idle_halt` (drops the
 /// BKL around a WFI so the peer can drive the child to exit). Needs ≥1 secondary (so a peer
 /// exists to do the BKL-free claim); no-op on a single-CPU boot.
-#[cfg(kernel_smp_shared)]
 fn test_smp_shared_cooperative_wait() {
     if crate::smp_shared::probed_core_count() <= 1 {
         console::print("[Test] smp_shared_cooperative_wait SKIPPED (single CPU; boot with SMP>1)\n");
@@ -2563,7 +2529,6 @@ fn test_smp_shared_cooperative_wait() {
 /// holds it forever and the exec below wedges: the boot suite hangs HERE (that IS the
 /// regression signal). Runs with the BKL-free EL0-preempt scheduler ON (the shipping
 /// default). Needs >=1 secondary; no-op on a single-CPU boot.
-#[cfg(kernel_smp_shared)]
 fn test_smp_shared_blocking_wait_peer_progress() {
     if crate::smp_shared::probed_core_count() <= 1 {
         console::print(
@@ -4790,10 +4755,7 @@ fn test_fork_bkl_drop() {
     // Go through the `smp_shared` re-exports where they exist, so the boot image's
     // single "all BKL toggles live here" module is the one under test (and doesn't rot
     // into dead code). The atomic itself lives in akuma-exec — see `bkl_guard.rs`.
-    #[cfg(kernel_smp_shared)]
     use crate::smp_shared::{process_bkl_drop_enabled, set_process_bkl_drop_enabled};
-    #[cfg(not(kernel_smp_shared))]
-    use akuma_exec::process::{process_bkl_drop_enabled, set_process_bkl_drop_enabled};
 
     /// Enough to cross a chunk boundary twice and leave a partial trailing chunk, so an
     /// off-by-one in the `while done < pages` loop (dropped tail, re-shared chunk, or a
@@ -4807,7 +4769,7 @@ fn test_fork_bkl_drop() {
 
     // ── Phase 1: guard ledger contract ──────────────────────────────────────
     // `in_dropped_window()` is a stub returning false unless
-    // `all(kernel_smp_shared, target_os = "none")`, so the "closed afterwards"
+    // `all(kernel_bkl_smp, target_os = "none")`, so the "closed afterwards"
     // assertions below hold on every build; the "open inside" one is only meaningful
     // where the guard actually does something.
     if bkl::in_dropped_window() {
@@ -4817,7 +4779,6 @@ fn test_fork_bkl_drop() {
     {
         set_process_bkl_drop_enabled(true);
         let _g = ProcessBklGuard::new();
-        #[cfg(kernel_smp_shared)]
         if !bkl::in_dropped_window() {
             fails += 1;
             crate::safe_print!(96, "[Test] fork-bkl-drop: guard did not open the window\n");
@@ -5114,7 +5075,6 @@ fn test_mm_bkl_drop() {
 
     // Runtime kill switch: with the toggle off, the guard must never open the window at
     // all — same kill-switch contract as `set_vfs_bkl_drop_enabled`.
-    #[cfg(kernel_smp_shared)]
     {
         use crate::smp_shared::{mm_bkl_drop_enabled, set_mm_bkl_drop_enabled};
         let was = mm_bkl_drop_enabled();
@@ -5236,10 +5196,7 @@ fn test_gicr_device_map() {
     // The load-bearing check. `gic_v3` (BSP) and `smp_shared::secondary_gic_init`
     // both index this region as `base + core * GICR_STRIDE`, so every such frame
     // must exist and must not be the distributor.
-    #[cfg(kernel_smp_shared)]
     let cores = crate::smp_shared::probed_core_count();
-    #[cfg(not(kernel_smp_shared))]
-    let cores = 1usize;
 
     let gicd = crate::platform::gicd_base_pa();
     let gicd_end = gicd + addr::DEV_GIC_DIST_SIZE;
@@ -5380,7 +5337,6 @@ fn test_drivers_bkl_drop() {
 
     // The kill switch, checked directly: the toggle must round-trip, which keeps
     // the contract honest and the setter exercised on every platform.
-    #[cfg(kernel_smp_shared)]
     {
         use crate::smp_shared::{drivers_bkl_drop_enabled, set_drivers_bkl_drop_enabled};
         let was = drivers_bkl_drop_enabled();
@@ -5420,7 +5376,6 @@ fn test_drivers_bkl_drop() {
 /// started held or not — a leaked acquire, a spurious release, or any other pairing
 /// break on the new fast path would flip it. Also exercises the runtime kill switch,
 /// which must preserve the same invariant via the fallback (BKL-held) path.
-#[cfg(kernel_smp_shared)]
 fn test_timer_irq_preserves_bkl_state() {
     use akuma_exec::bkl;
 
@@ -5644,7 +5599,6 @@ fn test_poll_bkl_drop() {
 /// `dropped_window_open()` (which releases the held lock — the opted-out steady state
 /// is identical from there on) and the test re-acquires after the "exit" half to
 /// restore its own invariant.
-#[cfg(kernel_smp_shared)]
 fn test_syscall_bkl_optout() {
     use akuma_exec::bkl;
     use akuma_exec::process::{register_process, unregister_process, register_thread_pid, unregister_thread_pid};
@@ -5828,7 +5782,6 @@ fn test_syscall_bkl_optout() {
 /// excursion: with the opt-out mechanism live, that would be an opted-out syscall
 /// whose exit path failed to close, or a never-return path that skipped the
 /// `return_to_kernel` ledger reset. Runs LAST, like `test_no_spurious_svc_traps`.
-#[cfg(kernel_smp_shared)]
 fn test_no_stale_window_heals() {
     let n = akuma_exceptions::stale_window_heal_count();
     if n == 0 {
@@ -14302,7 +14255,7 @@ fn test_kill_thread_group_reaps_futex_blocked_sibling() {
     use akuma_exec::threading;
 
     /// What a REAL woken futex-waiter does at its EL1→EL0 boundary under
-    /// deferred kill (`cfg(kernel_smp_shared)`): consume the pending kill
+    /// deferred kill (`cfg(kernel_bkl_smp)`): consume the pending kill
     /// request and self-terminate. Under non-smp-shared builds
     /// `kill_thread_group` PHASE 1 hard-marks the sibling TERMINATED, so this
     /// never runs. The sibling must be a real initialized thread (valid stack
@@ -14624,7 +14577,7 @@ fn test_kill_thread_group_terminates_before_cleanup() {
 }
 
 /// Verify the deferred-kill primitive that backs `kill_thread_group` PHASE 1
-/// under real shared-kernel SMP (`cfg(kernel_smp_shared)`): a pending kill
+/// under real shared-kernel SMP (`cfg(kernel_bkl_smp)`): a pending kill
 /// arms the flag but leaves the thread schedulable (NOT TERMINATED), and the
 /// boundary check (`take_kill_request`) clears it exactly once.
 ///
@@ -20021,7 +19974,6 @@ fn test_vfork_child_context_ttbr0_not_stale() {
 ///
 /// Skipped on a single-CPU boot. Same failure mode as above: it hangs, it does
 /// not return false.
-#[cfg(kernel_smp_shared)]
 fn test_pmm_heap_lock_order_smp() {
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -20581,7 +20533,7 @@ fn test_identity_lazy_restamp() {
 ///
 /// It lives in `akuma-primitives` (the leaf crate — see
 /// `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.555), and its whole
-/// body is behind `#[cfg(kernel_smp_shared)]`, which that crate's `build.rs`
+/// body is behind ``, which that crate's `build.rs`
 /// emits from its own forwarded `smp-shared` feature. So if the forwarding chain
 /// ever breaks — the bin crate's `smp-shared` not reaching
 /// `akuma-primitives/smp-shared` — the guard silently compiles to a zero-sized
@@ -20617,10 +20569,7 @@ fn test_preempt_guard_is_live() {
 
     // Under `smp-shared` the guard must bite; without it, it is a documented
     // no-op and the counts stay flat.
-    #[cfg(kernel_smp_shared)]
     let expected_live = true;
-    #[cfg(not(kernel_smp_shared))]
-    let expected_live = false;
 
     let counts_ok = if expected_live {
         inside_1 == outer + 1 && inside_2 == outer + 2 && still_held && after == outer

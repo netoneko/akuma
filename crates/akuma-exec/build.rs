@@ -1,13 +1,13 @@
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
+    println!("cargo::rustc-check-cfg=cfg(kernel_bkl_smp)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
 
     // Real (shared-kernel) SMP, forwarded from the bin's `smp-shared` feature
     // (smp-shared = ["akuma-exec/smp-shared"]). Emits the same cfg name the bin
     // crate uses so the Big Kernel Lock code is uniform across crates.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
-    if std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok() {
-        println!("cargo:rustc-cfg=kernel_smp_shared");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BKL_SMP");
+    if std::env::var("CARGO_FEATURE_BKL_SMP").is_ok() {
+        println!("cargo:rustc-cfg=kernel_bkl_smp");
     }
 
     // The bin crate's `no-tests` feature compiles the boot self-test surface out.
