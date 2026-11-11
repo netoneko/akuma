@@ -2048,3 +2048,46 @@ probe passes. A slice-1 guest that only did refused connects survived 70 s. The 
 follow no workload. All of it ran under TCG on a laptop on battery, so host throttling is not ruled
 out. It is open, and it predates both slices. The next step is the same freeze under
 `ring0-preempt`, with `GDB=1` attached when it stops to read where the vCPU is.
+
+## Open issue: heap auto-sizing does not scale down for the unified build's smaller footprints (2026-11-11)
+
+Found while boot-gating the config flag sweep (`config-flag-sweep` branch) on amd64 `headless`
+under local Firecracker: at `mem_size_mib=512` (511 MiB usable, one RAM region past the 1 MiB
+floor), boot failed with
+
+```
+[FATAL] heap ends 0x0000000020703000 but the region holding it ends 0x0000000020000000
+```
+
+**Root cause** (`crates/akuma-boot-amd64/src/mem.rs::heap_size_for`): the heap-size policy is a
+two-step function with no floor that respects actual available RAM —
+
+```rust
+pub const HEAP_SIZE: usize = 512 * 1024 * 1024;        // every machine under the threshold
+pub const HEAP_SIZE_LARGE: usize = 1024 * 1024 * 1024; // >= LARGE_HEAP_RAM_THRESHOLD
+pub const LARGE_HEAP_RAM_THRESHOLD: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+```
+
+Below 8 GiB, every machine gets a flat 512 MiB heap request regardless of how much RAM it
+actually has. At `mem_size_mib=512` the single usable region is itself only 511 MiB, so the flat
+request cannot fit *by construction* — before even subtracting the kernel image, PMM bookkeeping
+or boot stack. `pick()` falls back to the same oversized `HEAP_SIZE` a second time
+(`.or_else(|| pick(HEAP_SIZE))`) rather than to anything RAM-proportional, so there is no smaller
+value to fall back to. Booting at `mem_size_mib=2048` (the project's usual default) worked and
+passed the full suite (802/0); the bug only shows at a genuinely small machine.
+
+**Why this matters for the unified build specifically**: the drivers-crate split and the
+`headless`/`storage-and-input` feature set (2026-11-11, this same day) exist to make a small,
+test-box-sized amd64 image — the explicit goal in "docs: stripped guest programs, the wifi and kvm
+features, headless sizes" (`2062fc32`). A smaller binary and a smaller feature set do not help if
+the heap floor alone already needs 512 MiB+ to boot at all; `KERNEL_HEAP_SIZE_MB` (manual override,
+`config.rs`) is a workaround per-boot, not a fix to the default policy. AArch64 is unaudited here —
+unknown whether its own heap-sizing path (`akuma-kernel-core`) has the same flat-floor shape; worth
+checking as part of the same pass, since convergence is supposed to make the two agree.
+
+**Next step**: make `heap_size_for` (or its AArch64 equivalent, once compared) scale from actual
+usable RAM rather than stepping between two fixed sizes — e.g. a fraction of `usable_ram` with a
+small absolute floor — and gate it with a boot test at a RAM size below today's 512 MiB floor
+(Firecracker `mem_size_mib` in the 128-384 MiB range) alongside the existing 2048 MiB default, on
+both `headless` and the full driver set. Not scheduled against a slice yet; filed here because the
+unified build's own stated smaller-footprint goal is what exposed it.
