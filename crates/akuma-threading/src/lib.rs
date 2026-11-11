@@ -1796,15 +1796,21 @@ pub fn spawn_user_thread_initializing(
     // register; an `extern "C" fn()` ignores it. Passed as an address, so no fn-pointer type is forged.
     let trampoline_addr = trampoline_fn as usize as u64;
 
+    claim_user_slot_with_reclaim(trampoline_addr, data_ptr)
+}
+
+/// Claim a user slot for `trampoline_addr(data_ptr)`, left `INITIALIZING`, reclaiming
+/// cooled-down `TERMINATED` slots and retrying once on exhaustion. Both user spawn paths
+/// ([`spawn_user_thread_initializing`] and [`spawn_user_thread_fn`]) go through it.
+fn claim_user_slot_with_reclaim(trampoline_addr: u64, data_ptr: *mut ()) -> Result<usize, &'static str> {
     // Without the pool lock: see the hooked arm's doc.
     let attempt = || with_irqs_disabled(|| ThreadPool::spawn_user_closure_initializing(trampoline_addr, data_ptr));
 
     // On slot exhaustion, collect cooled-down terminated slots ourselves and retry
     // once before failing — the pool is usually not exhausted, just uncollected (see
-    // `reclaim_terminated_slots`). This is the same fallback
-    // `spawn_user_thread_fn_internal` / `spawn_system_thread_fn` already do; without
-    // it, this path — every fork/vfork/clone_thread, i.e. every real pthread_create —
-    // reports EAGAIN to userspace while the slots it needs sit TERMINATED waiting for
+    // `reclaim_terminated_slots`). `spawn_system_thread_fn` does the same; without
+    // it, every fork/vfork/clone_thread (i.e. every real pthread_create) and every
+    // `spawn_process` reports EAGAIN to userspace while the slots it needs sit TERMINATED waiting for
     // an idle loop that a busy system never reaches. A tight
     // pthread_create/pthread_join loop failed deterministically at ~iteration 58 of
     // 200 with MAX_THREADS=64.
@@ -5423,108 +5429,38 @@ where
     spawn_user_thread_fn_internal(f, true)
 }
 
-/// Internal implementation for spawning user threads
+/// Internal implementation for spawning user threads.
 ///
-/// - start_irqs_disabled: if true, thread starts with IRQs disabled (for process threads)
-#[allow(unreachable_code, unused_variables)]
+/// The slot and its stacks come from [`ThreadPool::spawn_user_closure_initializing`],
+/// as for the two-phase fork path, through the same reclaim-and-retry. Until
+/// 2026-11-11 this called it once and returned its error, and the old
+/// claim/reclaim/retry body sat below an early `return` as unreachable code, so on
+/// the AArch64 kernel (`collector-recycles`: claims take only `FREE` slots) a pool
+/// full of cooled-down `TERMINATED` slots refused every `spawn_process`
+/// (`docs/archive/AARCH64_SPAWN_RECLAIM_SKIPPED.md`).
+///
+/// `start_irqs_disabled` is not honoured: the closure context is built the same
+/// way for both callers (open question recorded in that doc).
 fn spawn_user_thread_fn_internal<F>(f: F, start_irqs_disabled: bool) -> Result<usize, &'static str>
 where
     F: FnOnce() -> ! + Send + 'static,
 {
-    // x86_64: take the slot and its stacks from the target, exactly as the
-    // two-phase fork path does (`spawn_user_closure_initializing` ->
-    // `ArchHooks::prepare_task_slot`). This function used to claim from
-    // `THREAD_STATES` and take a stack from the AArch64 PMM pool below, which
-    // never ran `prepare_task_slot`: the slot's `trap_stack_top` stayed 0, so
-    // `TSS.rsp0` was 0 and the first interrupt or fault a `spawn_ext`-created
-    // process took in ring 3 was a double fault -> triple fault. The process
-    // survived only while it stayed in syscalls, which is why a short `box open`
-    // worked and anything that computed, or touched an unmapped page, reset the
-    // machine. Also gives the slot the canary pair the rest of the target paints.
-    // `start_irqs_disabled` has no analogue on this cooperative-switch target.
-    {
-        let boxed: Box<F> = Box::new(f);
-        let closure_ptr = Box::into_raw(boxed) as *mut ();
-        let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
-        let claimed =
-            with_irqs_disabled(|| ThreadPool::spawn_user_closure_initializing(trampoline as usize as u64, closure_ptr));
-        return match claimed {
-            Ok(slot) => {
-                mark_thread_ready(slot);
-                note_user_thread_highwater();
-                Ok(slot)
-            }
-            Err(e) => {
-                // `closure_ptr` came from `Box::into_raw` above and the failed claim never handed it to a thread.
-                akuma_switch::drop_boxed_closure::<F>(closure_ptr);
-                Err(e)
-            }
-        };
-    }
-
-    // Step 1: Atomically claim a free slot (lock-free). On a miss, collect
-    // cooled-down terminated slots ourselves and retry once before failing — the
-    // pool is usually not exhausted, just uncollected (see
-    // `reclaim_terminated_slots`). Without this, a spawn storm reports ENOMEM to
-    // userspace while the slots it needs sit TERMINATED waiting for an idle loop
-    // that a busy system never reaches.
-    let slot_idx = match claim_free_slot(config().reserved_threads, thread_limit()) {
-        Some(idx) => idx,
-        None => {
-            if reclaim_terminated_slots() == 0 {
-                return Err("No free user thread slots");
-            }
-            match claim_free_slot(config().reserved_threads, thread_limit()) {
-                Some(idx) => idx,
-                None => return Err("No free user thread slots"),
-            }
-        }
-    };
-
-    // Lazy stacks: ensure this slot has a stack (no-op if pre-allocated).
-    if !ensure_slot_stack(slot_idx, config().user_thread_stack_size) {
-        THREAD_STATES[slot_idx].store(thread_state::FREE, Ordering::SeqCst);
-        return Err("Failed to allocate user thread stack from PMM");
-    }
-
-    // Step 2: Box the closure (heap allocation - no lock held!)
+    let _ = start_irqs_disabled;
     let boxed: Box<F> = Box::new(f);
     let closure_ptr = Box::into_raw(boxed) as *mut ();
     let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
-
-    // Step 3, x86_64: no fake IRQ frame — see the "x86_64 context switch"
-    // section above. `start_irqs_disabled` (the process-thread race guard
-    // documented on `spawn_user_thread_fn_for_process`) has no analogue in
-    // this pass's cooperative-only x86_64 path and is ignored; nothing on
-    // this target calls that variant yet.
-    {
-        let _ = start_irqs_disabled;
-        let stack_top = {
-            let pool = POOL.lock();
-            pool.stacks[slot_idx].top as u64
-        };
-        with_irqs_disabled(|| {
-            // This slot was just claimed and is not yet READY, so no switch can be reading its context
-            // concurrently.
-            akuma_switch::set(
-                slot_idx,
-                akuma_switch::build_closure_context(stack_top as usize, trampoline as usize as u64, closure_ptr as u64),
-            );
-            {
-                let mut pool = POOL.lock();
-                pool.slots[slot_idx].start_time_us = 0;
-            }
-            THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
-        });
+    match claim_user_slot_with_reclaim(trampoline as usize as u64, closure_ptr) {
+        Ok(slot) => {
+            mark_thread_ready(slot);
+            Ok(slot)
+        }
+        Err(e) => {
+            // `closure_ptr` came from `Box::into_raw` above and the failed claim never handed it to a thread.
+            akuma_switch::drop_boxed_closure::<F>(closure_ptr);
+            Err(e)
+        }
     }
-
-    // Step 3, aarch64: set up fake IRQ frame and minimal context.
-    // This enables stack-based context switching
-    
-    Ok(slot_idx)
 }
-
-/// Count available user thread slots
 
 /// Count available user thread slots
 ///

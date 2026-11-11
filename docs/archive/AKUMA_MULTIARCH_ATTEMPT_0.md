@@ -1434,3 +1434,15 @@ Gates:
 - HVF default: SMP=1 has the known `thread_slot_reclaim_on_spawn` failure only; SMP=2 and SMP=4
   are clean. Every prior test line is present, plus the new one.
 - amd64 TCG: SMP=1 829/0, SMP=2 839/0.
+
+## `thread_slot_reclaim_on_spawn` fixed: the boot suite is green at every SMP (2026-11-11)
+
+`spawn_user_thread_fn_internal`, the path every `spawn_process` thread takes, claimed a slot once
+and returned the error. Its reclaim-and-retry was unreachable code below an early `return`, so
+on AArch64 a pool of cooled-down `TERMINATED` slots refused the spawn. Both spawn entry points
+now share `claim_user_slot_with_reclaim` (`AARCH64_SPAWN_RECLAIM_SKIPPED.md`).
+
+Gates:
+- HVF default: SMP=1 (two runs), SMP=2 and SMP=4 all have 0 `[Test]` failures, with
+  `thread_slot_reclaim_on_spawn PASSED` in each.
+- amd64 TCG: SMP=1 829/0, SMP=2 839/0.

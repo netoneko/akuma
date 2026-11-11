@@ -72,6 +72,32 @@ before.
   `gated_from_other_thread=usize::MAX`: the hot-reclaim assertion held, and no spawned
   thread ran at all.
 
+## The `thread_slot_reclaim_on_spawn` failure: the second entry point (resolved 2026-11-11, later the same day)
+
+The open item above was the same defect, reached through the other user spawn entry point.
+
+`spawn_user_thread_fn_internal` serves `spawn_user_thread_fn` and
+`spawn_user_thread_fn_for_process`, so it creates every `spawn_process` thread. It had taken
+amd64's shape: claim through `spawn_user_closure_initializing` once, then `return` its result.
+The claim/reclaim/retry body it used to run sat below that `return` as unreachable code, behind
+`#[allow(unreachable_code, unused_variables)]`. So no reclaim ran on this path at all.
+
+With `collector-recycles` on, that explains the whole failure shape:
+- The fill loop stops at a pool of `TERMINATED` slots.
+- The gate helper's spawn is refused, so `gated_from_other_thread` stays `usize::MAX`.
+- After the 200 ms cooldown, the respawn is refused too: `respawn_ok=false`.
+
+On the Lima rig, the idle collector usually frees slots first, which is why it passed there and
+looked host-dependent. In production, process creation (`spawn_process`, herd's services, boxed
+processes) could fail while slots were only waiting to be collected.
+
+**Fix:** the retry moved out of `spawn_user_thread_initializing` into
+`claim_user_slot_with_reclaim`, which both entry points call. The unreachable body is deleted.
+
+**Still open:** `start_irqs_disabled`, the `_for_process` variant's guard against a tick before
+the user TTBR0 is set, is ignored on this path on both kernels. That was already so before this
+change; it was the case the unreachable AArch64 body handled.
+
 ## Background
 
 [`../reference/subsystems/thread-lifecycle.md`](../reference/subsystems/thread-lifecycle.md) §2.1 ·
