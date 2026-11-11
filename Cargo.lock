@@ -92,8 +92,10 @@ dependencies = [
 name = "akuma-amd64"
 version = "0.0.9"
 dependencies = [
+ "akuma-drivers-amd64",
  "akuma-kernel",
  "akuma-kernel-amd64",
+ "akuma-kernel-tests-amd64",
 ]
 
 [[package]]
@@ -173,6 +175,48 @@ version = "0.1.0"
 [[package]]
 name = "akuma-dns"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-drivers-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-affinity",
+ "akuma-bkl",
+ "akuma-boot-amd64",
+ "akuma-cpu",
+ "akuma-dma",
+ "akuma-dmesg",
+ "akuma-dwi2c",
+ "akuma-exec",
+ "akuma-exec-core",
+ "akuma-fbcon",
+ "akuma-fbdev",
+ "akuma-hda",
+ "akuma-hid",
+ "akuma-i2c-hid",
+ "akuma-ieee80211",
+ "akuma-kernel-amd64",
+ "akuma-kvm-abi",
+ "akuma-mmu",
+ "akuma-multiboot2",
+ "akuma-net",
+ "akuma-pagetable",
+ "akuma-pci",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-rtw89",
+ "akuma-ryzen-amd64",
+ "akuma-svm-amd64",
+ "akuma-syscalls-glue",
+ "akuma-threading",
+ "akuma-touchpad",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "akuma-vm-spec",
+ "akuma-wifi",
+ "akuma-wpa",
+ "spinning_top",
+]
 
 [[package]]
 name = "akuma-dwi2c"
@@ -439,28 +483,21 @@ dependencies = [
  "akuma-cpu",
  "akuma-dma",
  "akuma-dmesg",
- "akuma-dwi2c",
  "akuma-elf",
  "akuma-elf-exec",
  "akuma-exec",
  "akuma-exec-core",
  "akuma-ext2",
- "akuma-fbcon",
  "akuma-fbdev",
  "akuma-fdtable",
  "akuma-fpcache",
  "akuma-fpcache-rw",
  "akuma-fpu-amd64",
  "akuma-gdt",
- "akuma-hda",
- "akuma-hid",
- "akuma-i2c-hid",
  "akuma-idt-amd64",
- "akuma-ieee80211",
  "akuma-isolation",
  "akuma-kacho",
  "akuma-kernel-core",
- "akuma-kvm-abi",
  "akuma-lapic-amd64",
  "akuma-locks-rw",
  "akuma-machine-facts",
@@ -480,12 +517,10 @@ dependencies = [
  "akuma-primitives",
  "akuma-procfs",
  "akuma-pte-amd64",
- "akuma-rtw89",
  "akuma-ryzen-amd64",
  "akuma-sched-amd64",
  "akuma-selftest",
  "akuma-sntp",
- "akuma-svm-amd64",
  "akuma-syscalls",
  "akuma-syscalls-abi",
  "akuma-syscalls-glue",
@@ -498,7 +533,6 @@ dependencies = [
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
  "akuma-threading",
- "akuma-touchpad",
  "akuma-trap-amd64",
  "akuma-tty",
  "akuma-usb",
@@ -509,9 +543,6 @@ dependencies = [
  "akuma-vfs",
  "akuma-vfs-glue",
  "akuma-virtio",
- "akuma-vm-spec",
- "akuma-wifi",
- "akuma-wpa",
  "akuma-xhci",
  "spinning_top",
 ]
@@ -602,6 +633,28 @@ dependencies = [
  "log",
  "smoltcp",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-kernel-tests-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-boot-amd64",
+ "akuma-cpu",
+ "akuma-exec",
+ "akuma-kernel-amd64",
+ "akuma-kernel-core",
+ "akuma-mmap",
+ "akuma-mmu",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-selftest",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-linux",
+ "akuma-threading",
+ "akuma-user-access",
+ "akuma-vfs-glue",
 ]
 
 [[package]]

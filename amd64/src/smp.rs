@@ -635,9 +635,10 @@ fn tsc_delay_us(us: u64) {
     }
 }
 
-/// Make sure core `idx` is running as a host core, starting it (and every deferred core below
-/// it, so the online set stays contiguous: cores are counted, not listed) if `smp=` left it out.
-/// True if it is up. **Called by the hypervisor when a VM is placed on a core the host never
+/// Make sure core `idx` is running as a host core; true if it is up.
+///
+/// Starts it (and every deferred core below it, so the online set stays contiguous: cores are
+/// counted, not listed) if `smp=` left it out. **Called by the hypervisor when a VM is placed on a core the host never
 /// started**; until then such a core has not been woken, written to, or counted by Akuma.
 pub fn ensure_started(idx: usize) -> bool {
     if idx < ONLINE.load(Ordering::Acquire) {
@@ -775,8 +776,9 @@ pub fn kick_halted_core() {
     }
 }
 
-/// Interrupt core `cpu` (not this one) with the wake IPI, whatever it is doing: it ends a
-/// `hlt`, and a core running a guest takes a `#VMEXIT` for it. For a hypervisor task that must
+/// Interrupt core `cpu` (not this one) with the wake IPI, whatever it is doing.
+///
+/// It ends a `hlt`, and a core running a guest takes a `#VMEXIT` for it. For a hypervisor task that must
 /// look at something *now* — a virtual interrupt for its guest, a stop request — rather than
 /// at its next sleep or host tick. Unlike [`kick_halted_core`] it names the core and does not
 /// care whether the idle loop had announced a halt.
@@ -905,7 +907,7 @@ extern "C" fn ap_entry64(index: u64) -> ! {
     enable_sse();
     let _ = enable_xsave();
     // This core's own PAT, so the write-combining framebuffer is WC here too.
-    crate::multiboot2::pat_init_ap();
+    crate::drivers::pat_init_ap();
     gdt::init_cpu(idx, PERCPU[idx].stack_top.load(Ordering::Relaxed));
     idt::load();
     install_percpu(idx);
@@ -929,7 +931,7 @@ extern "C" fn ap_entry64(index: u64) -> ! {
     // When the BSP's probe asked for the hypervisor rehearsal, this core
     // gets its host save area and `EFER.SVME` too (per-core MSR state —
     // rung 2 wants vCPUs schedulable on any core).
-    crate::kvm::ap_hook();
+    crate::drivers::hypervisor_ap_hook();
 
     // No standing BKL hold: `idle_loop` takes the lock around its protected
     // work and runs the halt bare (2026-09-20). The old `bkl_enter()` here was

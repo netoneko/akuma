@@ -37,7 +37,7 @@ use akuma_dmesg::Ring;
 use akuma_vm_spec::{arena::Arena, spec::MAX_WIRE, Spec};
 use spinning_top::Spinlock;
 
-use crate::fd::errno;
+use akuma_kernel_amd64::drivers::services::errno;
 
 /// Console stream capacity: the helper drains every 100 ms, a boot is ~60 KiB over ~15 s.
 const CONSOLE_CAP: usize = 32 << 10;
@@ -142,19 +142,15 @@ pub(super) fn emit_hex(v: u64, nibbles: u32) {
     irq_off(|| CONSOLE.lock().ring.push_bytes(&d[..n]));
 }
 
-/// A stack writer for one status line.
-struct Line {
-    buf: [u8; 192],
-    n: usize,
-}
+/// A stack writer for one status line: the console's own, which truncates as this one's
+/// hand-rolled predecessor did (the pre-commit console-print rule allows no other).
+type Line = akuma_primitives::console::StackWriter<192>;
 
-impl core::fmt::Write for Line {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let room = self.buf.len() - self.n;
-        let take = s.len().min(room);
-        self.buf[self.n..self.n + take].copy_from_slice(&s.as_bytes()[..take]);
-        self.n += take;
-        Ok(())
+/// The line, or `fallback` if truncation split a code point (`as_str` is then empty).
+fn line_or<'a>(l: &'a Line, fallback: &'a str) -> &'a str {
+    match l.as_str() {
+        "" => fallback,
+        s => s,
     }
 }
 
@@ -164,8 +160,8 @@ fn status_line() {
         let s = SLOT.lock();
         (s.phase, s.spec, s.owner, s.started_us, s.generation)
     });
-    let mut l = Line { buf: [0; 192], n: 0 };
-    let up_s = if phase == Phase::Running { crate::net::uptime_us().saturating_sub(started) / 1_000_000 } else { 0 };
+    let mut l = Line::new();
+    let up_s = if phase == Phase::Running { akuma_kernel_amd64::drivers::services::net::uptime_us().saturating_sub(started) / 1_000_000 } else { 0 };
     let _ = write!(l, "[kvm] status: state={} gen={generation} owner={owner} up_s={up_s}", phase.name());
     if let Some(s) = spec {
         let _ = write!(l, " type={} vcpus={} ram_mib={} forwards={}", s.backend.name(), s.vcpus, s.ram_mib, s.forwards().len());
@@ -176,13 +172,13 @@ fn status_line() {
     let _ = write!(l, " last_crumb={:#04x}", super::last_crumb());
     let lost = LOST.load(Ordering::Relaxed);
     let _ = writeln!(l, " console_lost={lost}");
-    emit(core::str::from_utf8(&l.buf[..l.n]).unwrap_or("[kvm] status: ?\n"));
+    emit(line_or(&l, "[kvm] status: ?\n"));
 }
 
 /// `status`'s previous reading of each core's halted cycles, and of the TSC, so a second
 /// `status` reports the interval between the two (the first, the time since boot).
 static CORES_LAST_TSC: AtomicU64 = AtomicU64::new(0);
-static CORES_LAST_HALT: [AtomicU64; crate::smp::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+static CORES_LAST_HALT: [AtomicU64; akuma_kernel_amd64::drivers::services::smp::MAX_CPUS] = [const { AtomicU64::new(0) }; akuma_kernel_amd64::drivers::services::smp::MAX_CPUS];
 
 /// One `[kvm] cores:` line: each host core's busy share since the last `status`, from the
 /// cycles it spent halted. The tick accounting (`/proc/stat`) cannot say this: it bills a halt
@@ -191,17 +187,17 @@ fn cores_line() {
     use core::fmt::Write as _;
     let now = akuma_cpu::tsc::rdtsc();
     let wall = now.wrapping_sub(CORES_LAST_TSC.swap(now, Ordering::Relaxed));
-    let mut l = Line { buf: [0; 192], n: 0 };
-    let _ = write!(l, "[kvm] cores: interval_ms={} busy%:", u128::from(wall) * 1000 / u128::from(crate::lapic::tsc_hz().max(1)));
-    for (c, last) in CORES_LAST_HALT.iter().enumerate().take(crate::smp::online_cpus().min(crate::smp::MAX_CPUS)) {
-        let h = crate::sched::halted_tsc(c);
+    let mut l = Line::new();
+    let _ = write!(l, "[kvm] cores: interval_ms={} busy%:", u128::from(wall) * 1000 / u128::from(akuma_kernel_amd64::drivers::services::lapic::tsc_hz().max(1)));
+    for (c, last) in CORES_LAST_HALT.iter().enumerate().take(akuma_kernel_amd64::drivers::services::smp::online_cpus().min(akuma_kernel_amd64::drivers::services::smp::MAX_CPUS)) {
+        let h = akuma_kernel_amd64::drivers::services::sched::halted_tsc(c);
         let halted = h.wrapping_sub(last.swap(h, Ordering::Relaxed)).min(wall);
         let tenths = if wall == 0 { 0 } else { u128::from(wall - halted) * 1000 / u128::from(wall) };
         let _ = write!(l, " c{c}={}.{}", tenths / 10, tenths % 10);
     }
     let _ = writeln!(l);
     // `p` routes to the stream while a VM runs and to the host console (and `dmesg`) otherwise.
-    super::p(core::str::from_utf8(&l.buf[..l.n]).unwrap_or("[kvm] cores: ?\n"));
+    super::p(line_or(&l, "[kvm] cores: ?\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +213,7 @@ pub fn dev_write(buf: u64, len: usize) -> u64 {
         return errno::EINVAL;
     }
     let mut raw = [0u8; MAX_WIRE];
-    if !crate::uaccess::read_bytes(buf, &mut raw[..len]) {
+    if !akuma_kernel_amd64::drivers::services::uaccess::read_bytes(buf, &mut raw[..len]) {
         return errno::EFAULT;
     }
     let Ok(text) = core::str::from_utf8(&raw[..len]) else { return errno::EINVAL };
@@ -271,7 +267,7 @@ fn create(text: &str, len: usize) -> u64 {
     if super::api::vm_live() {
         return errno::EBUSY;
     }
-    let owner = crate::usermode::current_process().map_or(0, |p| p.tgid);
+    let owner = akuma_kernel_amd64::drivers::services::usermode::current_process().map_or(0, |p| p.tgid);
     let started = irq_off(|| {
         let mut s = SLOT.lock();
         if matches!(s.phase, Phase::Pending | Phase::Running) {
@@ -320,7 +316,7 @@ pub fn dev_read(buf: u64, len: usize) -> u64 {
         let phase = irq_off(|| SLOT.lock().phase);
         return if matches!(phase, Phase::Pending | Phase::Running) { errno::EAGAIN } else { 0 };
     }
-    if !crate::uaccess::write_bytes(buf, &tmp[..n]) {
+    if !akuma_kernel_amd64::drivers::services::uaccess::write_bytes(buf, &tmp[..n]) {
         return errno::EFAULT;
     }
     irq_off(|| CONSOLE.lock().consumed += n as u64);
@@ -341,17 +337,17 @@ fn ensure_task() -> bool {
     }
     // A core the host already runs is preferred (the task is repinned to its VM's first core when
     // a VM starts); a core `smp=` left out is started only if there is no other.
-    let Some(core) = akuma_vm_spec::cores::first(super::vm_cores(), |c| super::core_ready(c as usize) && !crate::smp::is_deferred(c as usize))
+    let Some(core) = akuma_vm_spec::cores::first(super::vm_cores(), |c| super::core_ready(c as usize) && !akuma_kernel_amd64::drivers::services::smp::is_deferred(c as usize))
         .or_else(|| akuma_vm_spec::cores::first(super::vm_cores(), |c| super::core_ready(c as usize)))
     else {
         super::p("[KVM] kvm0: no core in kvmcores= has SVM enabled\n");
         return false;
     };
-    if !crate::smp::ensure_started(core as usize) {
+    if !akuma_kernel_amd64::drivers::services::smp::ensure_started(core as usize) {
         super::p("[KVM] kvm0: could not start the VM task's core\n");
         return false;
     }
-    let Some(slot) = crate::sched::spawn_daemon_on(vm_task, core as usize) else {
+    let Some(slot) = akuma_kernel_amd64::drivers::services::sched::spawn_daemon_on(vm_task, core as usize) else {
         super::p("[KVM] kvm0: no task slot for the VM task\n");
         return false;
     };
@@ -372,7 +368,7 @@ fn take_pending() -> Option<Spec> {
             return None;
         }
         s.phase = Phase::Running;
-        s.started_us = crate::net::uptime_us();
+        s.started_us = akuma_kernel_amd64::drivers::services::net::uptime_us();
         s.spec
     })
 }
@@ -385,8 +381,8 @@ extern "C" fn vm_task() -> ! {
             end_of_run();
         }
         // Idle: a tick is the latency of a `create`.
-        crate::sched::yield_now();
-        crate::sched::allow_tick();
+        akuma_kernel_amd64::drivers::services::sched::yield_now();
+        akuma_kernel_amd64::drivers::services::sched::allow_tick();
     }
 }
 
@@ -420,7 +416,7 @@ pub(super) fn should_stop() -> bool {
     if STOP.load(Ordering::Acquire) {
         return true;
     }
-    let now = crate::net::uptime_us();
+    let now = akuma_kernel_amd64::drivers::services::net::uptime_us();
     if now.saturating_sub(LEASE_CHECKED_US.load(Ordering::Relaxed)) < LEASE_CHECK_US {
         return false;
     }

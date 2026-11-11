@@ -237,7 +237,39 @@ from `--no-default-features` (unlike `devbox`).
 - **Developing/debugging the kernel day to day** → `release` (`cargo run --release`).
 - **A smaller image of the same kernel** → `--profile extreme-size` with the feature set you want. There is no longer a 4 MB-floor target.
 - **Working inside Akuma as a Unix box (self-hosted toolchain, editor, daily use)** → `devbox-smoltcp` (the default devbox: native smoltcp + real SMP; `overlays/devbox/run-smoltcp.sh`). The rump `devbox` is deferred but still boots via `overlays/devbox/run.sh` (needs `RUMP_NIC=1`).
+- **A lean amd64 kernel for a bare-metal test box** → `-p akuma-amd64 --no-default-features --features headless` ([amd64 images](#amd64-images)).
 - **Exercising real (shared-kernel) SMP** → nothing to do; it is in `--release`. Set `SMP=N` at run time. See `docs/reference/subsystems/smp-shared.md`.
+
+## amd64 images
+
+The amd64 kernel is a separate package (`-p akuma-amd64 --target x86_64-unknown-none
+--release`); its feature table is in
+[`subsystems/config-flags.md`](subsystems/config-flags.md#the-akuma-amd64-package). Its
+device drivers are `crates/akuma-drivers-amd64`, one feature per driver, and the machine
+half reaches each class through a registration slot (`amd64/src/drivers.rs`), so a driver
+left out takes its probe with it and the class reads as absent.
+
+| Image | Build | What it is |
+|---|---|---|
+| **default** (bare metal) | `cargo build -p akuma-amd64 --target x86_64-unknown-none --release` | Every driver (`all-drivers`: `fbcon`, `hda`, `kvm`, `touchpad`, `wifi`) and the boot suite. The image for a machine that is used (HP box, ryzen). |
+| **headless** (bare-metal test box) | `... --no-default-features --features headless`; boot under TCG with `NO_DEFAULT_FEATURES=1 FEATURES=headless sh amd64/run.sh` | The machine half's defaults and the boot suite, no optional driver: no framebuffer console (the console is the serial port, GRUB's framebuffer is not touched), no splash, no `/dev/fb0`, no sound, no touchpad, no Wi-Fi (`/dev/wifi0`, the rtw89 card), no hypervisor (`/dev/kvm0`, `/dev/kvm`, `/dev/net/tun`), and none of their crates linked. For a test box with a serial line (trashcan, an Intel CPU: the hypervisor is AMD SVM only). |
+| **no-tests** | `--features no-tests` (combines with `headless`) | Drops the boot suite (`akuma-kernel-tests-amd64` is not linked). |
+
+`headless` keeps what a test box needs because none of it is behind a feature yet: the
+serial console, the boot disk (the GRUB-module ramdisk, NVMe, USB storage), the RTL8169 NIC,
+and xHCI, which is both the USB keyboard and USB storage and so stays. A machine with no UART
+(the multiboot2 reference machine) wants `fbcon`: a headless kernel there is silent.
+
+Sizes (`llvm-size -A`, 2026-11-11, after the guest test programs lost their DWARF and Wi-Fi
+and KVM became features):
+
+| image | `.text` | `.rodata` | `.bss` |
+|---|---:|---:|---:|
+| default | 3,053,311 | 21,598,896 | 5,811,096 |
+| headless | 2,452,479 | 249,752 | 1,149,848 |
+| headless + no-tests | 2,255,855 | 154,576 | 1,118,360 |
+
+The default image's `.rodata` is almost all `akuma-fbcon`'s baked fonts.
 
 ## Profiles were consolidated (2026-08-10)
 

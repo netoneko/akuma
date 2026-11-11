@@ -203,8 +203,9 @@ pub mod errno {
     /// "The image was rejected by the loader" — `exec_load_errno`'s default
     /// for a rejection string it does not recognise.
     pub const ENOEXEC: u64 = (-8i64) as u64;
-    /// The argument or environment list is longer than the initial stack
-    /// builder will place ([`crate::loader::MAX_ARGV`] / `MAX_ENVP`). Linux
+    /// The argument or environment list is too long.
+    ///
+    /// Longer than the initial stack builder will place ([`crate::loader::MAX_ARGV`] / `MAX_ENVP`). Linux
     /// answers this when `argv` exceeds `ARG_MAX`; this target answers it for
     /// the same reason, and answering it **at all** is the point — truncating
     /// instead handed `ld` a command line with its inputs missing and cost a
@@ -218,7 +219,9 @@ pub mod errno {
     /// `FUTEX_WAIT` ran out of time. The one errno a futex wait can return
     /// that no other syscall here produces.
     pub const ETIMEDOUT: u64 = (-110i64) as u64;
-    /// Interrupted. The one errno this kernel originates rather than reports:
+    /// Interrupted.
+    ///
+    /// The one errno this kernel originates rather than reports:
     /// a thread whose group called `exit_group` gets it for the syscall it was
     /// in the middle of, so the call fails rather than acting on a dying
     /// address space.
@@ -323,6 +326,7 @@ fn cur_table() -> &'static akuma_exec::process::SharedFdTable {
 /// Clone `fd`'s description out of the calling table, or `None` if the fd
 /// names nothing — a closed descriptor, one out of range, or a console
 /// descriptor.
+#[must_use]
 pub fn table_get(fd: u64) -> Option<FileDescriptor> {
     table_get_in(cur_table(), fd)
 }
@@ -561,9 +565,9 @@ fn open_framebuffer(flags: u32) -> u64 {
 }
 
 /// `open("/dev/wifi0")`: a `DevWifi` descriptor, when a wifi backend exists.
-/// See `crate::wifi`.
+/// See `drivers::Wireless`.
 fn open_wifi(flags: u32) -> u64 {
-    if !crate::wifi::present() {
+    if !crate::drivers::wireless_present() {
         return errno::ENOENT;
     }
     let Some(proc) = akuma_exec::process::current_process_shared() else {
@@ -593,7 +597,7 @@ fn open_power(flags: u32) -> u64 {
 
 /// `open("/dev/kvm0")`: a `DevKvm` descriptor, when the hypervisor is armed (`kvmctl`).
 fn open_kvm(flags: u32) -> u64 {
-    if !crate::kvm::svm_armed() {
+    if !crate::drivers::hypervisor_armed() {
         return errno::ENOENT;
     }
     let Some(proc) = akuma_exec::process::current_process_shared() else {
@@ -647,7 +651,7 @@ pub fn is_dev_wifi(fd: u64) -> bool {
 /// `open("/dev/input/mouse0")`: a `DevMouse` descriptor, only when the
 /// touchpad came up — a machine without one has no node (`ENOENT`).
 fn open_mouse(flags: u32) -> u64 {
-    if !crate::touchpad::present() {
+    if !crate::drivers::pointer_present() {
         return errno::ENOENT;
     }
     let Some(proc) = akuma_exec::process::current_process_shared() else {
@@ -712,6 +716,8 @@ pub fn is_nonblocking(fd: u64) -> bool {
 /// `F_DUPFD` now allocates the lowest free fd from **0**, not from
 /// [`FIRST_FILE_FD`] — Linux's "lowest available" — which is the same
 /// convergence `openat` made in batch 2d.
+// Its result is informational; callers that cannot act on it ignore it.
+#[allow(clippy::must_use_candidate)]
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     // `F_ADD_SEALS` / `F_GET_SEALS` (memfd): accepted and not enforced — Firecracker seals the
     // ring buffer it maps twice and only checks that the call succeeded. No seal is ever reported.
@@ -885,7 +891,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     if resolved == "/dev/fb0" {
         return open_framebuffer(flags);
     }
-    // `/dev/wifi0`, likewise this kernel's own: `crate::wifi` serves it.
+    // `/dev/wifi0`, likewise this kernel's own: the wireless driver serves it (`drivers::Wireless`).
     if resolved == "/dev/wifi0" {
         return open_wifi(flags);
     }
@@ -895,17 +901,17 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     if resolved == "/dev/power" {
         return open_power(flags);
     }
-    // `/dev/kvm0`: the hypervisor's control device (`crate::kvm::ctl`), when armed.
+    // `/dev/kvm0`: the hypervisor's control device (`drivers::Hypervisor`), when armed.
     if resolved == "/dev/kvm0" {
         return open_kvm(flags);
     }
-    // `/dev/kvm`: the census stub (`crate::kvm::api`), only with the `kvmapi` boot flag.
-    if resolved == "/dev/kvm" && crate::kvm::api::enabled() {
-        return crate::kvm::api::open(flags);
+    // `/dev/kvm`: the census stub (`drivers::Hypervisor`), only with the `kvmapi` boot flag.
+    if resolved == "/dev/kvm" && crate::drivers::hypervisor_api_enabled() {
+        return crate::drivers::hypervisor_api_open(flags);
     }
     // `/dev/net/tun`: the tap for a userspace VMM's NIC, behind the hypervisor's gateway.
-    if resolved == "/dev/net/tun" {
-        return crate::kvm::tun::open(flags);
+    if resolved == "/dev/net/tun" && crate::drivers::hypervisor_present() {
+        return crate::drivers::hypervisor_tun_open(flags);
     }
     // `/dev/input/mouse0`: the touchpad's pointer stream (`crate::touchpad`).
     if resolved == "/dev/input/mouse0" {
@@ -1117,6 +1123,9 @@ pub fn sys_pipe2(fds: u64, flags: u64) -> u64 {
 /// `SharedFdTable::with_stdio`). The console itself is unaffected: it is
 /// answered by number in `read`/`write` through [`console_end`], not by a
 /// descriptor this could close.
+// `close(2)`'s result: cleanup paths that cannot act on a failure ignore it, as Linux
+// callers routinely do.
+#[allow(clippy::must_use_candidate)]
 pub fn sys_close(fd: u64) -> u64 {
     akuma_syscalls_glue::fs::sys_close(fd as u32)
 }
@@ -1180,6 +1189,7 @@ pub fn sys_close(fd: u64) -> u64 {
 ///   arm) rather than under the lock.
 /// - **`EPOLLET` edges are re-armed** after a pipe or socket read, which this
 ///   arm never did.
+#[must_use]
 pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
@@ -1189,19 +1199,19 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
         let Some(proc) = akuma_exec::process::current_process_shared() else {
             return errno::ESRCH;
         };
-        return crate::wifi::read(proc.tgid, fd as u32, buf, len.min(MAX_IO) as usize);
+        return crate::drivers::wireless_dev_read(proc.tgid, fd as u32, buf, len.min(MAX_IO) as usize);
     }
     // `/dev/net/tun`: one frame behind its virtio-net header, or `EAGAIN`.
     if is_dev_tun(fd) {
-        return crate::kvm::tun::read(buf, len.min(MAX_IO) as usize);
+        return crate::drivers::hypervisor_tun_read(buf, len.min(MAX_IO) as usize);
     }
     // `/dev/input/mouse0`: whole 8-byte pointer records, or `EAGAIN`.
     if is_dev_mouse(fd) {
-        return crate::touchpad::dev_read(buf, len.min(MAX_IO) as usize);
+        return crate::drivers::pointer_dev_read(buf, len.min(MAX_IO) as usize);
     }
     // `/dev/kvm0`: the guest's console stream, `EAGAIN` while it is quiet, 0 once it ended.
     if is_dev_kvm(fd) {
-        return crate::kvm::ctl::dev_read(buf, len.min(MAX_IO) as usize);
+        return crate::drivers::hypervisor_ctl_read(buf, len.min(MAX_IO) as usize);
     }
     // `/dev/power`: the kernel's idle/dim facts, fresh per read.
     if is_dev_power(fd) {
@@ -2233,12 +2243,13 @@ pub fn sys_access(path: u64) -> u64 {
 ///   not `ENOTTY`.** Glue's first line is `current_process_shared()`. Only the
 ///   boot task can be in that state, and `boot_row_register` is the answer the
 ///   suite already uses for it (4b batch 2b).
+#[must_use]
 pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     if let Some(id) = dev_kvm_api_id(fd) {
-        return crate::kvm::api::ioctl(fd, id, req as u32, arg);
+        return crate::drivers::hypervisor_api_ioctl(fd, id, req as u32, arg);
     }
     if is_dev_tun(fd) {
-        return crate::kvm::tun::ioctl(req as u32, arg);
+        return crate::drivers::hypervisor_tun_ioctl(req as u32, arg);
     }
     // The fbdev requests, on a `/dev/fb0` descriptor only.
     if is_dev_fb(fd) {
@@ -2459,7 +2470,7 @@ fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
                 // request clamped to the screen), so `stty size` never claims a
                 // size the glass does not have.
                 let (rows, cols) = if crate::console::is_console_terminal(&ts) {
-                    crate::multiboot2::fb_set_view(cols, rows).unwrap_or((rows, cols))
+                    crate::drivers::fb_set_view(cols, rows).unwrap_or((rows, cols))
                 } else {
                     (rows, cols)
                 };
@@ -2746,6 +2757,7 @@ fn proc_consistency_check(t: &mut Suite) {
 ///
 /// The AArch64 kernel has had this since long before: `register_at_syscall_process`,
 /// used 25 times in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`.
+#[must_use]
 pub fn boot_row_register() -> usize {
     let tid = akuma_exec::threading::current_thread_id();
     akuma_exec::process::register_process(1, akuma_exec::process::make_test_process(1));
@@ -2792,6 +2804,8 @@ pub fn boot_row_register() -> usize {
 /// that way the identity costs a permanent page and `identity: probe teardown
 /// leaks nothing` reports it, correctly. Draining is what makes the
 /// registration a loan rather than a leak.
+// Its result is informational; callers that cannot act on it ignore it.
+#[allow(clippy::must_use_candidate)]
 pub fn boot_row_release(tid: usize) -> usize {
     // The console channel [`boot_row_register`] took out. Left behind, the next
     // boot row to land on this slot inherits it — and so would any unrelated

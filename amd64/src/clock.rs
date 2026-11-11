@@ -353,7 +353,9 @@ pub fn sync_tick() {
 }
 
 /// Best-effort: resolve [`NTP_HOST`], fetch the time once, and record it if
-/// it worked. Never fatal — this target booted with no clock at all for
+/// it worked.
+///
+/// Never fatal — this target booted with no clock at all for
 /// every stage before this one, and a network that cannot reach an NTP pool
 /// (no route, a captive/offline network, DNS blocked) is not a reason to
 /// fail the boot over. Called once from `lib.rs`, after DHCP; [`sync_tick`]

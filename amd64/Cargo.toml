@@ -172,8 +172,9 @@ sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-contain
 # Compile the boot self-test suite **out**.
 #
 # The same opt-in the AArch64 kernel has (root `Cargo.toml`), and it means the
-# same thing here: `boot::self_tests` and every `*_test`/`smoke_test` function
-# in `amd64/src` disappear, leaving a kernel that boots straight into `init`.
+# same thing here: the bin stops linking `akuma-kernel-tests-amd64` (the boot
+# suite) and every `*_test`/`smoke_test` function left in `amd64/src`
+# disappears, leaving a kernel that boots straight into `init`.
 # The devbox and `extreme-size` targets build with it on the other
 # architecture; on this one it is what makes the line count honest, because
 # `scripts/cloc_akuma.py` attributes an item to the *test* bucket exactly when
@@ -182,7 +183,8 @@ sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-contain
 #
 # The initialisation the suite performs inline — the LAPIC, the console fd and
 # the syscall MSRs — is `boot::late_init`, which this build calls instead. See
-# `self_tests`' own header for the rule that keeps the two in step.
+# the suite's header (`crates/akuma-kernel-tests-amd64/src/suite.rs`) for the
+# rule that keeps the two in step.
 no-tests = ["akuma-kernel-core/no-tests", "akuma-exec/no-tests", "akuma-syscalls-glue/no-tests"]
 
 [dependencies]
@@ -202,12 +204,7 @@ akuma-alloc = { path = "../crates/akuma-alloc" }
 akuma-boot-amd64 = { path = "../crates/akuma-boot-amd64" }
 akuma-pmm = { path = "../crates/akuma-pmm" }
 akuma-cpu = { path = "../crates/akuma-cpu" }
-# The SVM seed's VMCB vocabulary, exit codes and §15.5.1 guest-state checks —
-# host-tested there, consumed by `kvm.rs` on the metal.
-akuma-svm-amd64 = { path = "../crates/akuma-svm-amd64" }
 akuma-affinity = { path = "../crates/akuma-affinity" }
-akuma-vm-spec = { path = "../crates/akuma-vm-spec" }
-akuma-kvm-abi = { path = "../crates/akuma-kvm-abi" }
 # The Big Kernel Lock (`smp.rs`'s `bkl_enter`/`bkl_leave` forward here).
 akuma-bkl = { path = "../crates/akuma-bkl" }
 akuma-sched-amd64 = { path = "../crates/akuma-sched-amd64" }
@@ -219,9 +216,6 @@ akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
 # [FAIL] used to print and the boot then finished announcing success.
 akuma-lapic-amd64 = { path = "../crates/akuma-lapic-amd64" }
 akuma-selftest = { path = "../crates/akuma-selftest" }
-# The framebuffer text console. The bare-metal reference machine has no UART at
-# all, so on a GRUB boot this is the only way the kernel can say anything.
-akuma-fbcon = { path = "../crates/akuma-fbcon" }
 # Parsing GRUB's information block. A crate, with tests, because the first
 # version of this parser lived in amd64/src/multiboot2.rs and had a one-byte
 # offset error that could only be found by rebooting the machine.
@@ -240,9 +234,6 @@ akuma-port = { path = "../crates/akuma-port" }
 # The GDT/TSS as data: descriptors, the TSS descriptor packing, and the
 # syscall/sysret selector arithmetic (compile-time asserted).
 akuma-gdt = { path = "../crates/akuma-gdt" }
-# Pure HDA register half (GCAP decode, version gate), host-tested; the metal
-# half (PCI walk, BAR0 map) lives in this target hda.rs.
-akuma-hda = { path = "../crates/akuma-hda" }
 # xHCI (USB 3.0 host controller) layout + TRB/context bit math, host-tested
 # against register values read off `00:14.0` on the reference machine. The
 # MMIO/DMA half is `src/xhci.rs`. Persistence: the only spare disk is trapped in
@@ -251,15 +242,6 @@ akuma-xhci = { path = "../crates/akuma-xhci" }
 # NVMe (ryzen's SSD): register/queue/Identify/PRP/GPT logic, host-tested; the
 # MMIO/DMA half is `src/nvme.rs`.
 akuma-nvme = { path = "../crates/akuma-nvme" }
-# The /dev/wifi0 control protocol (`src/wifi.rs`), shared with `userspace/wifi`.
-akuma-wifi = { path = "../crates/akuma-wifi" }
-# RTL8852CE (ryzen's wifi) bring-up: power-on, DMA, firmware download, host-tested
-# against Linux's register trace of the card; the MMIO/DMA half is `src/rtw89.rs`.
-akuma-rtw89 = { path = "../crates/akuma-rtw89" }
-# 802.11 frames and the station state machine the rtw89 driver joins with.
-akuma-ieee80211 = { path = "../crates/akuma-ieee80211" }
-# WPA2-PSK: the 4-way and group-key handshakes the rtw89 station runs in the kernel.
-akuma-wpa = { path = "../crates/akuma-wpa" }
 # USB Mass Storage Bulk-Only Transport wire format (CBW/CSW + minimal SCSI),
 # driven over `akuma-xhci` by `src/usb_storage.rs`'s BOT helpers in `src/xhci.rs`.
 akuma-usb-storage = { path = "../crates/akuma-usb-storage" }
@@ -398,10 +380,6 @@ akuma-fpcache-rw = { path = "../crates/akuma-fpcache-rw" }
 # `/dev/fb0`'s decisions (ioctl answers, FBIOPUT acceptance, single owner,
 # mmap bounds), host-tested. `src/fbdev.rs` is the device.
 akuma-fbdev = { path = "../crates/akuma-fbdev" }
-akuma-dwi2c = { path = "../crates/akuma-dwi2c" }
-akuma-hid = { path = "../crates/akuma-hid" }
-akuma-i2c-hid = { path = "../crates/akuma-i2c-hid" }
-akuma-touchpad = { path = "../crates/akuma-touchpad" }
 # The shared MMU crate. Its x86 `UserAddressSpace` is **the** user-space page
 # table on this target since C1 step 5a: `mm.rs`, `idt.rs`, `loader.rs`,
 # `usermode.rs` and `fd.rs` all map through it, and `paging.rs` lost its own

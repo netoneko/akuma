@@ -42,9 +42,9 @@ use akuma_touchpad::{Clickpad, Config};
 use spinning_top::Spinlock;
 
 use crate::i2c::{self, Dw};
-use crate::machine::Physmap;
-use crate::polltime::spin_us;
-use crate::serial;
+use akuma_kernel_amd64::drivers::services::machine::Physmap;
+use akuma_kernel_amd64::drivers::services::polltime::spin_us;
+use akuma_kernel_amd64::drivers::services::{display, errno, input, net, serial, uaccess};
 
 /// The 16AHP9's measured constants (M0, 2026-10-16).
 const DEFAULT_MMIO: u64 = 0xFEDC_2000;
@@ -384,7 +384,7 @@ fn bring_up(mmio: u64, addr: u8) -> Option<Pad> {
         fail("no precision-touchpad report in the descriptor");
         return None;
     };
-    let Some(fb) = crate::fbdev::geometry() else {
+    let Some(fb) = display::geometry() else {
         fail("no framebuffer to map the pointer onto");
         return None;
     };
@@ -584,7 +584,7 @@ impl Pad {
                         self.st.reports += 1;
                         let f = self.dec.frame();
                         touching = f.contacts.iter().any(|c| c.down) || f.button;
-                        self.pad.update(&f, crate::net::uptime_us());
+                        self.pad.update(&f, net::uptime_us());
                         let down = f.contacts.iter().any(|c| c.down);
                         if down {
                             self.st.down_frames += 1;
@@ -605,7 +605,7 @@ impl Pad {
             self.last_touch_us = now;
             // A finger on the pad is a person at the machine: `idle_ms=` (and so
             // `powersaved`'s dim) must see it, or only the keyboard undims.
-            crate::input::note_input();
+            input::note_input();
         }
         let active = now.saturating_sub(self.last_touch_us) < ACTIVE_HOLD_US;
         self.next_poll_us = now + if active { ACTIVE_PERIOD_US } else { IDLE_PERIOD_US };
@@ -623,7 +623,7 @@ pub fn poll() {
     let _irq = akuma_primitives::irq::IrqGuard::new();
     let Some(mut g) = PAD.try_lock() else { return };
     let Some(p) = g.as_mut() else { return };
-    if !p.tick(crate::net::uptime_us()) {
+    if !p.tick(net::uptime_us()) {
         serial::puts("  [touchpad] bus failing; disabled (dropped ");
         serial::put_dec(u64::from(p.pad.dropped_moves()));
         serial::puts(" moves)\n");
@@ -649,17 +649,17 @@ pub fn dev_read(buf: u64, len: usize) -> u64 {
     const MAX_RECORDS: usize = 16;
     let want = (len / EVENT_BYTES).min(MAX_RECORDS);
     if want == 0 {
-        return crate::fd::errno::EINVAL;
+        return errno::EINVAL;
     }
     let mut out = [0u8; MAX_RECORDS * EVENT_BYTES];
     let mut n = 0;
     {
         let _irq = akuma_primitives::irq::IrqGuard::new();
         let Some(mut g) = PAD.try_lock() else {
-            return crate::fd::errno::EAGAIN;
+            return errno::EAGAIN;
         };
         let Some(p) = g.as_mut() else {
-            return crate::fd::errno::ENODEV;
+            return errno::ENODEV;
         };
         while n < want
             && let Some(ev) = p.pad.pop()
@@ -669,11 +669,11 @@ pub fn dev_read(buf: u64, len: usize) -> u64 {
         }
     }
     if n == 0 {
-        return crate::fd::errno::EAGAIN;
+        return errno::EAGAIN;
     }
     let bytes = n * EVENT_BYTES;
-    if !crate::uaccess::write_bytes(buf, &out[..bytes]) {
-        return crate::fd::errno::EFAULT;
+    if !uaccess::write_bytes(buf, &out[..bytes]) {
+        return errno::EFAULT;
     }
     bytes as u64
 }
@@ -700,7 +700,7 @@ pub fn console_bridge(out: &mut [u8]) -> usize {
     if !UP.load(Ordering::Acquire) {
         return 0;
     }
-    let Some((tracking, sgr, g)) = crate::multiboot2::fb_mouse() else { return 0 };
+    let Some((tracking, sgr, g)) = display::fb_mouse() else { return 0 };
     let _irq = akuma_primitives::irq::IrqGuard::new();
     let Some(mut guard) = PAD.try_lock() else { return 0 };
     let Some(p) = guard.as_mut() else { return 0 };
@@ -708,7 +708,7 @@ pub fn console_bridge(out: &mut [u8]) -> usize {
         if p.bridge_on {
             p.bridge_on = false;
             p.mouse.reset();
-            crate::multiboot2::fb_set_pointer(None);
+            display::fb_set_pointer(None);
         }
         return 0;
     }
@@ -735,7 +735,7 @@ pub fn console_bridge(out: &mut [u8]) -> usize {
         n += p.mouse.feed(&ev, mode, sgr, &grid, &mut out[n..]);
     }
     let (col, row) = p.mouse.cell();
-    crate::multiboot2::fb_set_pointer(Some((row.saturating_sub(1) as usize, col.saturating_sub(1) as usize)));
+    display::fb_set_pointer(Some((row.saturating_sub(1) as usize, col.saturating_sub(1) as usize)));
     n
 }
 
@@ -747,23 +747,23 @@ pub fn dev_write(buf: u64, len: usize) -> u64 {
         return 0;
     }
     if len > 256 {
-        return crate::fd::errno::EINVAL;
+        return errno::EINVAL;
     }
     let mut text = [0u8; 256];
-    if !crate::uaccess::read_bytes(buf, &mut text[..len]) {
-        return crate::fd::errno::EFAULT;
+    if !uaccess::read_bytes(buf, &mut text[..len]) {
+        return errno::EFAULT;
     }
     let mut ctls = [None; 8];
     for (n, line) in text[..len].split(|&c| c == b'\n').filter(|l| !l.iter().all(u8::is_ascii_whitespace)).enumerate() {
-        let Some(c) = parse_ctl(line) else { return crate::fd::errno::EINVAL };
+        let Some(c) = parse_ctl(line) else { return errno::EINVAL };
         if n == ctls.len() {
-            return crate::fd::errno::EINVAL;
+            return errno::EINVAL;
         }
         ctls[n] = Some(c);
     }
     let _irq = akuma_primitives::irq::IrqGuard::new();
-    let Some(mut g) = PAD.try_lock() else { return crate::fd::errno::EAGAIN };
-    let Some(p) = g.as_mut() else { return crate::fd::errno::ENODEV };
+    let Some(mut g) = PAD.try_lock() else { return errno::EAGAIN };
+    let Some(p) = g.as_mut() else { return errno::ENODEV };
     for c in ctls.into_iter().flatten() {
         match c {
             Ctl::Natural(v) => {

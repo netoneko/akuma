@@ -76,6 +76,7 @@ pub fn drop_identity_map() {
     unsafe { activate(active_root()) };
 }
 
+/// Map, write, read back and unmap one page through this walker.
 ///
 /// Chosen VA is 1 GiB — the first address `boot.s` does *not* map, so the whole
 /// path (allocate PDPT entry, PD, PT, leaf) is exercised and a false pass from

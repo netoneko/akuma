@@ -14,6 +14,16 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   guard, a `handler` for calls the kernel does not serve, and one exec policy; a kernel wires it behind
   its `middleware` feature, and `akuma-params` (the boot command line's narrowed `Params` views) sits
   beneath it so the kernels can capture the line without it. Guide: `crates/akuma-middleware/docs/middleware.md`.
+  `akuma-kernel-tests-amd64` is the amd64 boot suite (2026-11-11), the counterpart of
+  `akuma-kernel-tests-aarch64`: it reaches the kernel only through `akuma_kernel_amd64::testing`
+  (one re-export per item) and installs itself with `boot::register_self_tests` from the bin's
+  `before_main`; a `no-tests` image does not link it. `akuma-drivers-amd64` is the amd64 driver
+  wiring, **one feature per driver** (`fbcon`, `hda`, `kvm`, `touchpad`, `wifi`; `all` is the bin's default,
+  `headless` the lean test-box set — `docs/reference/build-profiles.md` § amd64 images): each
+  driver registers a per-class table (`amd64/src/drivers.rs`: display, sound, pointer, wireless,
+  hypervisor) whose
+  forwarders read "absent" when nothing registered, and reaches the kernel only through
+  `drivers::services`. **Never add a driver `cfg` to the machine half**; add a class slot.
   `akuma-fdtable` is the fd table's state machine — lowest-free allocation,
   dup/close/sweep/fork decisions, effects returned not performed, `forbid`,
   no locks; `SharedFdTable` in `akuma-exec` keeps the locks and performs the

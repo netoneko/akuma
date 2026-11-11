@@ -27,7 +27,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spinning_top::Spinlock;
 
 use super::relay::Relay;
-use crate::fd::errno;
+use akuma_kernel_amd64::drivers::services::errno;
 
 const TUNSETIFF: u32 = 0x4004_54ca;
 const TUNGETFEATURES: u32 = 0x8004_54cf;
@@ -132,7 +132,7 @@ pub fn open(flags: u32) -> u64 {
     OWNER.store(proc.tgid, Ordering::Release);
     spawn_pump();
     let fd = proc.alloc_fd(akuma_exec_core::process::FileDescriptor::DevTun);
-    if flags & crate::fd::open_flags::O_CLOEXEC != 0 {
+    if flags & akuma_kernel_amd64::drivers::services::fd::open_flags::O_CLOEXEC != 0 {
         proc.set_cloexec(fd);
     }
     u64::from(fd)
@@ -211,7 +211,7 @@ pub fn read(buf: u64, len: usize) -> u64 {
     match read_frame(&mut b) {
         Ok(n) => {
             let n = n.min(len);
-            if crate::uaccess::write_bytes(buf, &b[..n]) { n as u64 } else { errno::EFAULT }
+            if akuma_kernel_amd64::drivers::services::uaccess::write_bytes(buf, &b[..n]) { n as u64 } else { errno::EFAULT }
         }
         Err(e) => e,
     }
@@ -223,7 +223,7 @@ pub fn write(buf: u64, len: usize) -> u64 {
     if len > BUF {
         return len as u64;
     }
-    if !crate::uaccess::read_bytes(buf, &mut b[..len]) {
+    if !akuma_kernel_amd64::drivers::services::uaccess::read_bytes(buf, &mut b[..len]) {
         return errno::EFAULT;
     }
     write_frame(&b[..len])
@@ -234,7 +234,7 @@ pub fn writev(iov: u64, cnt: usize) -> u64 {
     let mut b = [0u8; BUF];
     let mut n = 0usize;
     for i in 0..cnt.min(64) {
-        let Some([base, len]) = crate::uaccess::read_val::<[u64; 2]>(iov + (i as u64) * 16) else { return errno::EFAULT };
+        let Some([base, len]) = akuma_kernel_amd64::drivers::services::uaccess::read_val::<[u64; 2]>(iov + (i as u64) * 16) else { return errno::EFAULT };
         let len = len as usize;
         if len == 0 {
             continue;
@@ -242,7 +242,7 @@ pub fn writev(iov: u64, cnt: usize) -> u64 {
         if n + len > BUF {
             return (n + len) as u64; // oversize: dropped, as `write` does
         }
-        if !crate::uaccess::read_bytes(base, &mut b[n..n + len]) {
+        if !akuma_kernel_amd64::drivers::services::uaccess::read_bytes(base, &mut b[n..n + len]) {
             return errno::EFAULT;
         }
         n += len;
@@ -262,10 +262,10 @@ pub fn readv(iov: u64, cnt: usize) -> u64 {
         if done == n {
             break;
         }
-        let Some([base, len]) = crate::uaccess::read_val::<[u64; 2]>(iov + (i as u64) * 16) else { return errno::EFAULT };
+        let Some([base, len]) = akuma_kernel_amd64::drivers::services::uaccess::read_val::<[u64; 2]>(iov + (i as u64) * 16) else { return errno::EFAULT };
         let take = (len as usize).min(n - done);
         if take > 0 {
-            if !crate::uaccess::write_bytes(base, &b[done..done + take]) {
+            if !akuma_kernel_amd64::drivers::services::uaccess::write_bytes(base, &b[done..done + take]) {
                 return errno::EFAULT;
             }
             done += take;
@@ -289,7 +289,7 @@ fn ioctl_inner(req: u32, arg: u64) -> u64 {
     match req {
         TUNSETIFF => {
             let mut ifr = [0u8; IFREQ_LEN];
-            if !crate::uaccess::read_bytes(arg, &mut ifr) {
+            if !akuma_kernel_amd64::drivers::services::uaccess::read_bytes(arg, &mut ifr) {
                 return errno::EFAULT;
             }
             let flags = u16::from_le_bytes([ifr[16], ifr[17]]);
@@ -306,23 +306,23 @@ fn ioctl_inner(req: u32, arg: u64) -> u64 {
             if r.is_none() {
                 return errno::EBADF;
             }
-            if crate::uaccess::write_bytes(arg, &ifr) { 0 } else { errno::EFAULT }
+            if akuma_kernel_amd64::drivers::services::uaccess::write_bytes(arg, &ifr) { 0 } else { errno::EFAULT }
         }
         TUNGETFEATURES => {
             let f = u32::from(IFF_TAP | IFF_NO_PI | IFF_VNET_HDR);
-            if crate::uaccess::write_val(arg, f) { 0 } else { errno::EFAULT }
+            if akuma_kernel_amd64::drivers::services::uaccess::write_val(arg, f) { 0 } else { errno::EFAULT }
         }
         TUNGETIFF => {
             let mut ifr = [0u8; IFREQ_LEN];
             ifr[..IFNAME.len()].copy_from_slice(IFNAME);
             let fl = with(|t| t.flags).unwrap_or(0);
             ifr[16..18].copy_from_slice(&fl.to_le_bytes());
-            if crate::uaccess::write_bytes(arg, &ifr) { 0 } else { errno::EFAULT }
+            if akuma_kernel_amd64::drivers::services::uaccess::write_bytes(arg, &ifr) { 0 } else { errno::EFAULT }
         }
         // The guest does not negotiate checksum/TSO offload, so the frames are complete either way.
         TUNSETOFFLOAD => 0,
         TUNSETVNETHDRSZ => {
-            let Some(sz) = crate::uaccess::read_val::<u32>(arg) else { return errno::EFAULT };
+            let Some(sz) = akuma_kernel_amd64::drivers::services::uaccess::read_val::<u32>(arg) else { return errno::EFAULT };
             let sz = sz as usize;
             if !(10..=MAX_HDR).contains(&sz) {
                 return errno::EINVAL;
@@ -331,7 +331,7 @@ fn ioctl_inner(req: u32, arg: u64) -> u64 {
         }
         TUNGETVNETHDRSZ => {
             let sz = with(|t| t.hdr as u32).unwrap_or(10);
-            if crate::uaccess::write_val(arg, sz) { 0 } else { errno::EFAULT }
+            if akuma_kernel_amd64::drivers::services::uaccess::write_val(arg, sz) { 0 } else { errno::EFAULT }
         }
         _ => errno::ENOTTY,
     }
@@ -360,7 +360,7 @@ extern "C" fn pump_daemon() -> ! {
     let mut next_us = 0u64;
     loop {
         // A counter line every 2 s while the tap is moving frames (the census instrument).
-        let now = crate::net::uptime_us();
+        let now = akuma_kernel_amd64::drivers::services::net::uptime_us();
         let sum = WRITES.load(Ordering::Relaxed) + READS.load(Ordering::Relaxed) + EAGAINS.load(Ordering::Relaxed);
         if now >= next_us && sum != last && OWNER.load(Ordering::Acquire) != 0 {
             next_us = now + 2_000_000;
@@ -370,20 +370,20 @@ extern "C" fn pump_daemon() -> ! {
         let busy = OWNER.load(Ordering::Acquire) != 0
             && with(|t| {
                 let t = &mut *t;
-                t.relay.poll(&mut t.gw, crate::net::uptime_us());
+                t.relay.poll(&mut t.gw, akuma_kernel_amd64::drivers::services::net::uptime_us());
                 t.gw.has_frame()
             })
             .unwrap_or(false);
         if busy {
-            crate::sched::yield_now();
+            akuma_kernel_amd64::drivers::services::sched::yield_now();
         } else {
-            crate::sched::block_until_deadline(crate::net::uptime_us() + u64::from(crate::lapic::US_PER_TICK_TARGET));
+            akuma_kernel_amd64::drivers::services::sched::block_until_deadline(akuma_kernel_amd64::drivers::services::net::uptime_us() + u64::from(akuma_kernel_amd64::drivers::services::lapic::US_PER_TICK_TARGET));
         }
     }
 }
 
 fn spawn_pump() {
-    if !PUMP_SPAWNED.swap(true, Ordering::AcqRel) && crate::sched::spawn_daemon(pump_daemon).is_none() {
+    if !PUMP_SPAWNED.swap(true, Ordering::AcqRel) && akuma_kernel_amd64::drivers::services::sched::spawn_daemon(pump_daemon).is_none() {
         PUMP_SPAWNED.store(false, Ordering::Release);
     }
 }

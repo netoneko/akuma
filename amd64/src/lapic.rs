@@ -155,6 +155,8 @@ fn mask_legacy_pics() {
 
 /// Map the LAPIC, enable it, and start a periodic timer. Interrupts stay masked;
 /// the caller decides when to `sti`.
+// The boot suite checks the result; `late_init` has nothing to do on failure but carry on.
+#[allow(clippy::must_use_candidate)]
 pub fn init() -> bool {
     mask_legacy_pics();
 
@@ -488,6 +490,7 @@ pub fn arm_deadline() {
 /// [`restore_periodic`] bringing the periodic tick back once the shot fires), so
 /// the host tick resumes by itself; and like it, called with interrupts off on the
 /// core whose timer it touches. A shot already in flight that fires sooner stays.
+#[must_use]
 pub fn arm_oneshot_in_us(us: u64) -> bool {
     // Interrupts off for the whole arm, whatever the caller's `IF` was: see `arm_deadline`.
     akuma_primitives::irq::with_irqs_disabled(|| {

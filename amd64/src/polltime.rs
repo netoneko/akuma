@@ -24,6 +24,7 @@
 /// constant (`docs/archive/AKUMA_AMD64_USB_XHCI.md` § "Clock finding").
 const TSC_HZ_FALLBACK: u64 = 4_000_000_000;
 
+#[must_use]
 pub fn tsc_hz() -> u64 {
     match crate::lapic::tsc_hz() {
         0 => TSC_HZ_FALLBACK,
@@ -32,6 +33,7 @@ pub fn tsc_hz() -> u64 {
 }
 
 /// TSC ticks in `ms` milliseconds.
+#[must_use]
 pub fn ticks_ms(ms: u64) -> u64 {
     tsc_hz() / 1000 * ms
 }
@@ -58,6 +60,7 @@ pub fn spin_us(us: u64) {
     }
 }
 
+#[must_use]
 pub fn tsc() -> u64 {
     akuma_cpu::tsc::rdtsc()
 }

@@ -131,7 +131,7 @@ pub fn replay_klog_tail_to_fb(max: usize) {
                 at_line_start = b == b'\n';
                 continue;
             }
-            crate::multiboot2::mirror_byte(b);
+            crate::drivers::mirror_byte(b);
         }
         skip += n;
     }
@@ -291,7 +291,7 @@ pub fn begin_fatal() -> bool {
     // to it (best effort, never waiting on the console).
     crate::splash::crash();
     // A program drawing through `/dev/fb0` does not get to hide a crash.
-    crate::multiboot2::fb_force_unmute();
+    crate::drivers::fb_force_unmute();
     FB_QUIET.store(false, Ordering::Release);
     FATAL_ACTIVE.swap(true, Ordering::AcqRel)
 }
@@ -396,7 +396,7 @@ fn putb_raw_m(byte: u8, mirror: bool) {
     // absent port ever read 0 would still have said what it was about to hang
     // on.
     if mirror {
-        crate::multiboot2::mirror_byte(byte);
+        crate::drivers::mirror_byte(byte);
     }
 
     if !PRESENT.load(Ordering::Relaxed) {

@@ -29,18 +29,13 @@ use akuma_cpu::msr::{self, Msr};
 use akuma_syscalls_abi::Syscall;
 
 mod dispatch;
-use dispatch::syscall_dispatch;
+// `pub` for the boot suite (`crate::testing::usermode`), which drives it with kernel buffers.
+pub use dispatch::syscall_dispatch;
 
+// The boot suite's ring-3 tests are `crates/akuma-kernel-tests-amd64/src/usermode.rs`; what
+// they reach in here is `pub` and re-exported through `crate::testing::usermode` only.
 #[cfg(not(feature = "no-tests"))]
-mod tests;
-#[cfg(not(feature = "no-tests"))]
-pub use tests::{
-    busybox_test, console_notify_test, dispatch_smoke_test, elf_test, execve_test, fdprobe_test,
-    fork_test, identity_cost_test, kill_test, preempt_test, redirect_test,
-    session_terminal_is_private_test, sigregs_test, sigsuspend_test, smoke_test, smp_parallel_test,
-    socketpair_smoke_test, spawn_stale_group_state_test, spawn_test, thread_test,
-    wait4_ownership_test, winsize_to_child_test,
-};
+pub use dispatch::to_glue;
 
 use akuma_mmap::{MmapRegion, PhysFrame};
 use alloc::vec::Vec;
@@ -70,8 +65,10 @@ const EFER_SCE: u64 = 1 << 0;
 /// and `0x41_0000` is inside `hello`'s. Linux puts the stack at the top of the
 /// user address space for the same reason — it is the one place a program's
 /// segments cannot already be.
-const ELF_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
-/// Pages of stack. The initial frame is under 200 bytes, but the stack is
+pub const ELF_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
+/// Pages of stack.
+///
+/// The initial frame is under 200 bytes, but the stack is
 /// eagerly allocated and there is no growth policy or guard page — so it has to
 /// be sized for the *largest* program the loader runs, not the smallest.
 /// `sshd`'s key exchange (curve25519, ed25519, AES) drives the deepest stack
@@ -300,12 +297,14 @@ impl UserCtx {
 
 /// `AF_UNIX`'s value in `socket(2)`'s `domain` — the one family this target
 /// serves from `akuma-syscalls-glue` rather than `crate::sock`.
-const AF_UNIX: u64 = 1;
+pub const AF_UNIX: u64 = 1;
 
 /// How many syscalls arrived.
 static CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// Print every syscall number and its result. Off during the self-tests, turned
+/// Print every syscall number and its result.
+///
+/// Off during the self-tests, turned
 /// on by `run_init` when `strace` is on the command line — a bring-up aid for
 /// running a program the tree did not compile (busybox).
 pub static SYSCALL_TRACE: core::sync::atomic::AtomicBool =
@@ -436,17 +435,21 @@ fn trace_error(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, r: u64) {
 /// Bytes accepted by `write`, across all processes.
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
 
-/// Which task performed each `write`, in order. Proving that two processes ran
+/// Which task performed each `write`, in order.
+///
+/// Proving that two processes ran
 /// concurrently needs the *interleaving*, not just the totals: three writes from
 /// A followed by three from B would satisfy every count-based check and would
 /// mean the scheduler never switched.
-static WRITE_SEQ: [AtomicU64; 32] = [const { AtomicU64::new(u64::MAX) }; 32];
-static WRITE_SEQ_LEN: AtomicU64 = AtomicU64::new(0);
-/// Which *core* served each `write`, alongside [`WRITE_SEQ`]. Two processes
+pub static WRITE_SEQ: [AtomicU64; 32] = [const { AtomicU64::new(u64::MAX) }; 32];
+pub static WRITE_SEQ_LEN: AtomicU64 = AtomicU64::new(0);
+/// Which *core* served each `write`, alongside [`WRITE_SEQ`].
+///
+/// Two processes
 /// whose writes arrive from two cores ran on two cores — the ring-3 half of
 /// the SMP self-test, and the only witness of user-mode parallelism the kernel
 /// can take without instrumenting the programs.
-static WRITE_CPU: [AtomicU64; 32] = [const { AtomicU64::new(u64::MAX) }; 32];
+pub static WRITE_CPU: [AtomicU64; 32] = [const { AtomicU64::new(u64::MAX) }; 32];
 
 /// Largest `write` this kernel will accept. A bound rather than trust: `len`
 /// comes from ring 3, and an unbounded length would walk off the mapped page
@@ -1195,7 +1198,7 @@ fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
     use crate::fd::errno;
     // A tap frame is one `writev`: splitting it per segment would send the header as its own frame.
     if crate::fd::is_dev_tun(fd) {
-        return crate::kvm::tun::writev(iov, cnt as usize);
+        return crate::drivers::hypervisor_tun_writev(iov, cnt as usize);
     }
     let cnt = (cnt as usize).min(1024);
     let mut total: u64 = 0;
@@ -1226,7 +1229,7 @@ fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
 fn sys_readv(fd: u64, iov: u64, cnt: u64) -> u64 {
     use crate::fd::errno;
     if crate::fd::is_dev_tun(fd) {
-        return crate::kvm::tun::readv(iov, cnt as usize);
+        return crate::drivers::hypervisor_tun_readv(iov, cnt as usize);
     }
     let cnt = (cnt as usize).min(1024);
     let mut total: u64 = 0;
@@ -1575,28 +1578,28 @@ fn owns_non_console_channel() -> bool {
 ///   `akuma_threading::park_indefinitely`, which this target now gives a 1 s
 ///   deadline (`sched::BACKSTOP_US`) — the prerequisite that had to land before
 ///   any blocking arm could fold at all.
-fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
+pub fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     const EFAULT: u64 = (-14i64) as u64;
 
-    // `/dev/wifi0`: command lines for the wifi driver (`crate::wifi`).
+    // `/dev/wifi0`: command lines for the wifi driver (`drivers::Wireless`).
     if crate::fd::is_dev_wifi(fd) {
-        return crate::wifi::write(buf, len as usize);
+        return crate::drivers::wireless_dev_write(buf, len as usize);
     }
 
-    // `/dev/net/tun`: one frame behind its virtio-net header (`crate::kvm::tun`).
+    // `/dev/net/tun`: one frame behind its virtio-net header (`drivers::Hypervisor`).
     if crate::fd::is_dev_tun(fd) {
-        return crate::kvm::tun::write(buf, len as usize);
+        return crate::drivers::hypervisor_tun_write(buf, len as usize);
     }
 
-    // `/dev/kvm0`: a VM spec, `stop` or `status` (`crate::kvm::ctl`). Refused whole.
+    // `/dev/kvm0`: a VM spec, `stop` or `status` (`drivers::Hypervisor`). Refused whole.
     if crate::fd::is_dev_kvm(fd) {
-        return crate::kvm::ctl::dev_write(buf, len as usize);
+        return crate::drivers::hypervisor_ctl_write(buf, len as usize);
     }
 
     // `/dev/input/mouse0`: control lines (`natural`, `natural=0|1`) — the
     // scroll-direction toggle (`crate::touchpad::dev_write`).
     if crate::fd::is_dev_mouse(fd) {
-        return crate::touchpad::dev_write(buf, len as usize);
+        return crate::drivers::pointer_dev_write(buf, len as usize);
     }
 
     // `/dev/power`: `dim=<percent>` lines for the power daemon's lever
@@ -1743,17 +1746,17 @@ pub fn init_syscall() {
 /// it by value and moves each field into the registered process. A failed
 /// spawn simply drops it, which is what frees the half-built space —
 /// the same `Drop` contract the old type had, minus the array.
-struct Image {
+pub struct Image {
     /// The address space the loader built, with the program in it.
     ///
     /// A plain [`UserAddressSpace`], not a [`ProcAddressSpace`]: nothing can
     /// reach this space concurrently until it is registered, and the lock and
     /// the lock-free root mirror are exactly what registration adds.
-    space: UserAddressSpace,
+    pub space: UserAddressSpace,
     /// Where ring 3 starts executing.
-    entry: u64,
+    pub entry: u64,
     /// Initial `rsp`.
-    stack: u64,
+    pub stack: u64,
     /// The `mmap` regions this image starts life with.
     ///
     /// Empty for everything but a `fork` child, which inherits the parent's
@@ -1769,7 +1772,7 @@ struct Image {
     /// [`Image::space`] — which counts VAs per frame and is what teardown
     /// walks; a second frame list in the region would be a second answer to the
     /// same question.
-    regions: Vec<MmapRegion>,
+    pub regions: Vec<MmapRegion>,
 }
 
 impl Image {
@@ -1779,7 +1782,7 @@ impl Image {
     /// stack and no environment. The self-tests pass a single element because
     /// `hello.rs` only checks `argv[0]`; the syscall paths carry an environment
     /// and go through [`Self::from_elf_argv_envp`] directly.
-    fn from_elf_argv(
+    pub fn from_elf_argv(
         image: &[u8],
         argv: &[&[u8]],
     ) -> Result<(Self, loader::LoadedImage), &'static str> {
@@ -2159,6 +2162,7 @@ fn share_parent_memory_into(
 /// `pub` since C2 slice 4: `fd.rs` resolves the registered `SharedFdTable`
 /// through it (its `shared_table()`), the same accessor the fork path uses to
 /// build the child's copy.
+#[must_use]
 pub fn current_process() -> Option<&'static akuma_exec::process::Process> {
     akuma_exec::process::current_thread_own_process().map(|(_pid, p)| p)
 }
@@ -2588,7 +2592,7 @@ extern "C" fn proc_entry() -> ! {
 /// child's syscalls merely fell back to the pre-slice answers — and this is
 /// what closes it, for the reason `spawn_in_space_unpublished` has no
 /// publish-immediately variant at all.
-fn spawn_process_task(proc_slot: usize, root: u64) -> Option<usize> {
+pub fn spawn_process_task(proc_slot: usize, root: u64) -> Option<usize> {
     let task_slot = crate::sched::spawn_in_space_unpublished(proc_entry, root)?;
     crate::sched::seed_proc_slot(task_slot, proc_slot);
     // **A new process in this slot starts with a clean group.** Both flags are
@@ -2685,7 +2689,7 @@ const SPAWN_SLOTS: usize = PROC_SLOTS - SPAWN_SLOT_BASE;
 /// `unsafe` block per access. A row is "free" when its `pid` is 0 (no process has
 /// pid 0), so `exec_slot` is written first and `pid` last (Release), and read in
 /// the opposite order.
-struct SpawnTable {
+pub struct SpawnTable {
     pid: [AtomicU32; SPAWN_SLOTS],
     exec_slot: [AtomicUsize; SPAWN_SLOTS],
 }
@@ -2724,7 +2728,7 @@ impl SpawnTable {
     }
 
     /// The first free row's process slot (`SPAWN_SLOT_BASE + offset`).
-    fn first_free_slot(&self) -> Option<usize> {
+    pub fn first_free_slot(&self) -> Option<usize> {
         (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| self.is_free(s - SPAWN_SLOT_BASE))
     }
 
@@ -2734,7 +2738,7 @@ impl SpawnTable {
     }
 }
 
-static SPAWN: SpawnTable = SpawnTable::new();
+pub static SPAWN: SpawnTable = SpawnTable::new();
 
 /// The next pid.
 ///
@@ -2756,6 +2760,7 @@ static SPAWN: SpawnTable = SpawnTable::new();
 /// no longer does: a `clone` child's tid is its kernel thread slot, which is
 /// what `clone(2)` returns and what every per-thread array is indexed by. See
 /// `crate::thread::Thread::tid`.
+#[must_use]
 pub fn alloc_pid() -> u32 {
     akuma_exec::process::allocate_pid()
 }
@@ -2824,7 +2829,9 @@ fn set_init_cmdline<'a>(args: impl IntoIterator<Item = &'a [u8]>) {
 
 
 /// The pid of the process making the current syscall — what `/proc/self`
-/// resolves to. `1` for init and for anything not in the spawn table, matching
+/// resolves to.
+///
+/// `1` for init and for anything not in the spawn table, matching
 /// `getpid`, which returns 1 on this target for exactly the same reason.
 #[must_use]
 pub fn current_pid() -> u32 {
@@ -2962,7 +2969,7 @@ pub fn current_pid() -> u32 {
 /// yet, and if it is (it was published first), the window before registration
 /// resolves identity exactly as it did before this slice — `None`, and the
 /// same fallbacks as ever.
-fn register_exec_process(
+pub fn register_exec_process(
     pid: u32,
     ppid: u32,
     task_slot: usize,
@@ -3265,7 +3272,7 @@ fn register_exec_process(
 /// exactly the silent-wrongness this table exists to prevent. Compare, then
 /// remove; a stale entry is self-correcting (the new owner's insert overwrote
 /// it), a matching one is ours.
-fn reap_exec_process(pid: u32, task_slot: usize) {
+pub fn reap_exec_process(pid: u32, task_slot: usize) {
     use akuma_exec::process::{
         pid_for_thread, reap_child_channel, thread_pid_map_remove, unregister_process,
     };
@@ -3960,7 +3967,7 @@ fn sys_fork() -> u64 {
     // The parent-slot bound this used to check (`>= PROC_SLOTS`) is gone with
     // the hand-rolled slot search; `current_process()` inside `fork_process` is
     // the same question asked of the authoritative table.
-    crate::kvm::api::note_fork();
+    crate::drivers::hypervisor_note_fork();
     let child_pid = alloc_pid();
     match akuma_exec::process::fork_process(child_pid, 0) {
         Ok(pid) => u64::from(pid),
@@ -4108,7 +4115,7 @@ pub fn bind_child_task(
 
 /// Spawn flag bits (Akuma's own SPAWN ABI, arg6). Keep in sync with
 /// `libakuma::SPAWN_FLAG_PTY` and glue's constant of the same name.
-const SPAWN_FLAG_PTY: u64 = 1;
+pub const SPAWN_FLAG_PTY: u64 = 1;
 /// The child **is the console's process**: it gets the console's channel and its
 /// shared line discipline instead of a session channel of its own, so its fd 0
 /// reads the keyboard and its fd 1/2 draw on the screen. Keep in sync with
@@ -4513,6 +4520,7 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
 // a pipe fd 1 no longer had — and the descriptor said something different. Two
 // sources, one of them ignoring redirection.
 
+#[must_use]
 pub fn current_proc_slot() -> usize {
     // Under the BKL; the running task's slot, or `usize::MAX` with none.
     crate::sched::read_current_uctx(|u| u.proc_slot).unwrap_or(usize::MAX)
@@ -4702,7 +4710,7 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
 /// It released the spawn's stdin-pipe writer reference too, until the pipes
 /// themselves went (2026-09-11). A `ProcessChannel` needs no such hand: the last
 /// `Arc` out drops it.
-fn sweep_reaped_spawn_rows() {
+pub fn sweep_reaped_spawn_rows() {
     for off in 0..SPAWN_SLOTS {
         // Under the BKL; nothing yields between the read and the write below.
         let Some(Spawn { pid, exec_slot: slot }) = SPAWN.get(off) else {
@@ -4724,7 +4732,7 @@ fn sweep_reaped_spawn_rows() {
     }
 }
 
-fn spawn_row_of(pid: u32) -> Option<usize> {
+pub fn spawn_row_of(pid: u32) -> Option<usize> {
     SPAWN.position_of(pid)
 }
 
@@ -4839,11 +4847,11 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
         && let Ok(text) = core::str::from_utf8(&conf)
         && !crate::splash::defer_config(text)
     {
-        let _ = crate::multiboot2::fb_apply_config(text);
+        let _ = crate::drivers::fb_apply_config(text);
     }
-    if let Some((rows, cols)) = crate::multiboot2::fb_grid() {
+    if let Some((rows, cols)) = crate::drivers::fb_grid() {
         crate::console::set_size(rows, cols);
-        crate::multiboot2::fb_summary();
+        crate::drivers::fb_summary();
     }
     // The USB keyboard, if the xHCI controller is up (a USB root disk, or the
     // `usb` flag): enumerate it before the pump starts reading input, so the

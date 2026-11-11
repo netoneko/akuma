@@ -34,10 +34,17 @@ DISK="${DISK:-}"
 # nobody boots is a build configuration that rots.
 #
 #   FEATURES=no-tests sh amd64/run.sh
+#
+# NO_DEFAULT_FEATURES=1 adds `--no-default-features`, which a smaller driver set
+# needs because cargo features only add: the headless test image is
+#
+#   NO_DEFAULT_FEATURES=1 FEATURES=headless sh amd64/run.sh
 FEATURES="${FEATURES:-}"
+NO_DEFAULT_FEATURES="${NO_DEFAULT_FEATURES:-}"
 
 # shellcheck disable=SC2086  # deliberately word-split (empty = no flag)
 cargo build -p akuma-amd64 --target x86_64-unknown-none --release \
+    ${NO_DEFAULT_FEATURES:+--no-default-features} \
     ${FEATURES:+--features "$FEATURES"}
 
 # Fail loudly if the PVH note went missing. Without it both loaders silently

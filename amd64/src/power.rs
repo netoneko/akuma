@@ -176,7 +176,7 @@ fn energy_mwh(raw: &[u8; BLOCK_LEN]) -> u64 {
 // `powersaved` (userspace) owns the *policy* — how long an idle keyboard
 // precedes which dim level, `/proc/power` being its only input. This side owns
 // only the *effect*: one recorded percentage, applied to the framebuffer
-// console (`multiboot2::fb_set_dim`) and reported back through both files. A
+// console (`drivers::fb_set_dim`) and reported back through both files. A
 // machine with no console records the number all the same, so the facts stay
 // honest where there is nothing to dim.
 // ---------------------------------------------------------------------------
@@ -198,7 +198,7 @@ pub fn dim_pct() -> u8 {
 pub fn set_dim_pct(pct: u8) {
     let pct = pct.clamp(1, 100);
     DIM_PCT.store(pct, Ordering::Release);
-    crate::multiboot2::fb_set_dim(pct);
+    crate::drivers::fb_set_dim(pct);
 }
 
 /// Longest `/dev/power` snapshot; the facts are two short lines.

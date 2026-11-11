@@ -58,7 +58,7 @@ const DNS_TIMEOUT_US: u64 = 5_000_000;
 /// whatever Linux happens to have at 313 — `finit_module`, as it turns out.
 const AKUMA_PRIVATE_BASE: u64 = 0x1000;
 
-pub(super) fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
     if nr >= AKUMA_PRIVATE_BASE {
         return akuma_private(nr, [a1, a2, a3, a4, a5, a6]);
     }
@@ -622,15 +622,15 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
             {
                 crate::fbdev::release(p.tgid);
             }
-            // The tap: host sockets and the gateway's slots go back (`crate::kvm::tun`).
+            // The tap: host sockets and the gateway's slots go back (`drivers::Hypervisor`).
             if crate::fd::is_dev_tun(a1) {
-                crate::kvm::tun::release();
+                crate::drivers::hypervisor_tun_release();
             }
-            // A `/dev/wifi0` descriptor's read cursor (`crate::wifi`).
+            // A `/dev/wifi0` descriptor's read cursor (`drivers::Wireless`).
             if crate::fd::is_dev_wifi(a1)
                 && let Some(p) = current_process()
             {
-                crate::wifi::release(p.tgid, a1 as u32);
+                crate::drivers::wireless_release(p.tgid, a1 as u32);
             }
             to_glue(call, [a1, 0, 0, 0, 0, 0])
         }
@@ -682,10 +682,10 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
                         crate::fbdev::release(p.tgid);
                     }
                     if crate::fd::is_dev_tun(f) {
-                        crate::kvm::tun::release();
+                        crate::drivers::hypervisor_tun_release();
                     }
                     if crate::fd::is_dev_wifi(f) {
-                        crate::wifi::release(p.tgid, fd);
+                        crate::drivers::wireless_release(p.tgid, fd);
                     }
                 }
             }
@@ -832,12 +832,12 @@ fn mem(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // `a6` is the file offset. It was dropped until 2026-09-07 because only
         // anonymous mappings were served and an anonymous `mmap`'s offset is
         // ignored; a file mapping cannot ignore it.
-        // Census stub (`kvm::api`): a `/dev/kvm` descriptor maps as anonymous memory, enough to see
+        // Census stub (the hypervisor driver): a `/dev/kvm` descriptor maps as anonymous memory, enough to see
         // what the VMM does with the vCPU's run page.
         Syscall::Mmap if let Some(id) = crate::fd::dev_kvm_api_id(a5) => {
-            crate::kvm::api::note_mmap(a5, a1, a2, a3, a4, a6);
+            crate::drivers::hypervisor_api_note_mmap(a5, akuma_primitives::addr::VirtAddr::new(a1 as usize), a2, a3, a4, a6);
             // A vCPU descriptor maps the run page; the others (nothing maps them) get anonymous memory.
-            let r = crate::kvm::api::mmap_vcpu(id, a1, a2, a3, a4);
+            let r = crate::drivers::hypervisor_api_mmap_vcpu(id, a1, a2, a3, a4);
             if r == crate::fd::errno::ENODEV { crate::mm::sys_mmap(a1, a2, a3, a4 | 0x20, u64::MAX, 0) } else { r }
         }
         Syscall::Mmap => crate::mm::sys_mmap(a1, a2, a3, a4, a5, a6),
@@ -1528,7 +1528,8 @@ fn system(call: Syscall, a: [u64; 6]) -> Option<u64> {
 /// shared user-copy loop, and an x86 arm for `akuma_mmu::get_current_ttbr0`.
 /// The prologue itself needed nothing: it reaches `akuma_exec::threading`,
 /// which **is** `akuma-threading`, the scheduler this target has run since A1.
-pub(super) fn to_glue(call: Syscall, args: [u64; 6]) -> u64 {
+#[must_use]
+pub fn to_glue(call: Syscall, args: [u64; 6]) -> u64 {
     akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args)
 }
 

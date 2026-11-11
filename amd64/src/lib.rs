@@ -73,21 +73,18 @@ mod fs;
 mod futex;
 #[cfg(target_arch = "x86_64")]
 mod gdt;
-mod hda;
+/// The per-class driver seam and the services drivers may use.
+///
+/// `crates/akuma-drivers-amd64` registers into it; the machine half never names a driver.
+#[cfg(target_arch = "x86_64")]
+pub mod drivers;
 #[cfg(target_arch = "x86_64")]
 mod usermode;
-#[cfg(target_arch = "x86_64")]
-mod i2c;
 mod idt;
 #[cfg(target_arch = "x86_64")]
 mod input;
 #[cfg(target_arch = "x86_64")]
 mod kbd;
-/// The SVM hypervisor seed (`docs/archive/AKUMA_KVM.md`): a CPUID probe on
-/// every boot and, behind `kvmtest`, a trivial guest. Spec-first — no Linux
-/// code; the data vocabulary lives in `akuma-svm-amd64`.
-#[cfg(target_arch = "x86_64")]
-mod kvm;
 #[cfg(target_arch = "x86_64")]
 mod lapic;
 #[cfg(target_arch = "x86_64")]
@@ -113,13 +110,6 @@ mod pci;
 /// The `reboot(2)` syscall and the x86 machine reset under it.
 #[cfg(target_arch = "x86_64")]
 mod reboot;
-/// ryzen's RTL8852CE wifi card, up to running firmware (`rtw89`, wifi stage W1).
-#[cfg(target_arch = "x86_64")]
-mod rtw89;
-/// The station on that card: `/dev/wifi0`'s radio, the recorded join replayed
-/// around its own frames (`rtw89wifi`, wifi stages W3/W4).
-#[cfg(target_arch = "x86_64")]
-mod rtw89_sta;
 /// A span of RAM as a block device, so a machine with no storage driver can
 /// still mount the root filesystem its boot loader left in memory.
 mod ramdisk;
@@ -149,16 +139,15 @@ mod shmpages;
 mod sock;
 /// `clone(CLONE_VM|CLONE_THREAD)`: threads sharing one address space.
 mod thread;
-mod touchpad;
-/// The shared `akuma_mmu::UserAddressSpace`, exercised at boot. It has no other
-/// runtime caller on this target until item C1 folds `usermode.rs` in — which
-/// is why B3's widening of it needs a test that is not a `cargo check`.
-mod uas;
 mod uaccess;
 #[cfg(target_arch = "x86_64")]
 mod splash;
+/// The boot suite's view of this crate (`crates/akuma-kernel-tests-amd64`): one
+/// re-export per item it reaches. Not an API — see the module.
+#[cfg(all(target_arch = "x86_64", not(feature = "no-tests")))]
+#[doc(hidden)]
+pub mod testing;
 mod watchdog;
-mod wifi;
 mod xhci;
 
 #[cfg(target_arch = "x86_64")]
@@ -202,7 +191,10 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
 ///
 /// The bin's `kmain` symbol, which `boot.s` calls by name, calls this.
 #[cfg(target_arch = "x86_64")]
-pub fn kmain(hvm_start_info: u64) -> ! {
+pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
+    // The bin's hook (`akuma_kernel::entry!`'s argument), as on the multiboot2 path: it
+    // registers the boot suite (`akuma-kernel-tests-amd64`) and touches nothing else.
+    before_main();
     serial::init();
 
     // The print hook, before anything prints through a shared crate:
@@ -264,7 +256,7 @@ pub fn kmain(hvm_start_info: u64) -> ! {
     }
     // `/dev/wifi0` (`wifisim`): on this path too, so a VMM guest can test the
     // tool and the device without hardware.
-    wifi::init(cmdline);
+    crate::drivers::wireless_init(cmdline);
     // `/proc/power`: after `mem::init`, because mapping the EC window allocates
     // page-table frames.
     power::init(&machine, cmdline);
@@ -290,7 +282,7 @@ pub fn kmain(hvm_start_info: u64) -> ! {
         pci::scan();
         pci::report();
         xhci::quiesce_all();
-        hda::init(machine::flag(hvm_start_info, "hdatest"));
+        drivers::sound_init(machine::flag(hvm_start_info, "hdatest"));
     }
 
     // Block devices, after the heap (the virtio HAL allocates DMA buffers from
@@ -341,10 +333,10 @@ pub fn kmain(hvm_start_info: u64) -> ! {
             // `start_secondaries` so the APs enable SVM too. Opt-in like `pci`:
             // a plain PVH boot (Firecracker) has no SVM and prints nothing new.
             if machine::flag(hvm_start_info, "kvmtest") || machine::flag(hvm_start_info, "kvmctl") {
-                kvm::init(cmdline);
+                crate::drivers::hypervisor_init(cmdline);
                 // After the root mount (above): the Linux rung reads its kernel
                 // off the filesystem.
-                kvm::late(cmdline);
+                crate::drivers::hypervisor_late(cmdline);
             }
             boot::bring_up_secondaries(machine.madt.as_ref(), &facts, cmdline, &keep_out);
         });
@@ -359,12 +351,9 @@ pub fn kmain(hvm_start_info: u64) -> ! {
             boot::dhcp_then_clock();
             net::spawn_netpoll();
             // A service guest (`kvmserve`) needs the host's network: start it now.
-            kvm::spawn_service(cmdline);
+            crate::drivers::hypervisor_spawn_service(cmdline);
         }
     }
-
-    #[cfg(not(feature = "no-tests"))]
-    let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", crate::boot::suite_emit);
 
     // The whole suite, shared with the multiboot2 entry point. It was written
     // out separately in both until 2026-09-07, and the two lists had drifted —
@@ -374,7 +363,6 @@ pub fn kmain(hvm_start_info: u64) -> ! {
     let si = &machine.start_info;
     #[cfg(not(feature = "no-tests"))]
     let verdict = boot::self_tests(
-        &mut t,
         &boot::SuiteCtx {
             machine: &machine,
             facts: &facts,

@@ -50,7 +50,7 @@ use akuma_tty::TerminalState;
 /// Tell the console's line discipline how big the screen is, in `(rows, cols)`.
 ///
 /// What `TIOCGWINSZ` then answers for every console-attached process — see
-/// `multiboot2::fb_grid`. A no-op before [`init`].
+/// `drivers::fb_grid`. A no-op before [`init`].
 pub fn set_size(rows: u16, cols: u16) {
     if let Some(term) = terminal_state() {
         let mut ts = term.lock();
@@ -234,7 +234,7 @@ const PUMP_OUT: usize = 256;
 pub fn pump_once() -> bool {
     // The touchpad is polled whether or not a console process is attached: its
     // consumer is `/dev/input/mouse0`, not the tty.
-    crate::touchpad::poll();
+    crate::drivers::pointer_poll();
     let Some(ch) = channel() else {
         return false;
     };
@@ -257,13 +257,13 @@ pub fn pump_once() -> bool {
     // the line the program reads. Without this busybox's line editor waits out a
     // timeout at every prompt, and a TUI waits to learn the terminal's colours.
     if n < inbuf.len() {
-        n += crate::multiboot2::fb_take_reply(&mut inbuf[n..]);
+        n += crate::drivers::fb_take_reply(&mut inbuf[n..]);
     }
     // The pointer, for a program that turned mouse reporting on: reports are
     // typed in like keys (`CSI < b ; col ; row M`). Costs one console
     // `try_lock` and nothing else while no program has asked.
     if n < inbuf.len() {
-        n += crate::touchpad::console_bridge(&mut inbuf[n..]);
+        n += crate::drivers::pointer_console_bridge(&mut inbuf[n..]);
     }
     if n > 0 {
         // **Through the shared line discipline, not into the FIFO.**
@@ -323,7 +323,7 @@ pub fn pump_once() -> bool {
 
     // Output has gone quiet: put the cursor where typing will land. Idempotent
     // and `try_lock`ed, so doing it on every idle lap costs a comparison.
-    if !moved && let Some((rows, cols)) = crate::multiboot2::cursor_idle() {
+    if !moved && let Some((rows, cols)) = crate::drivers::cursor_idle() {
         // The console's grid changed under the program (a new screen margin):
         // `stty size` and `TIOCGWINSZ` must say so.
         set_size(rows, cols);

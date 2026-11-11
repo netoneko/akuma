@@ -53,7 +53,7 @@ use akuma_wpa::eapol::{self, Action, Supplicant};
 use spinning_top::Spinlock;
 
 use crate::rtw89::{Card, TX_DATA, TX_EAPOL, TX_MGMT, fnv1a};
-use crate::serial;
+use akuma_kernel_amd64::drivers::services::serial;
 
 /// This station's address. The card's own lives in its efuse, but only the
 /// address CAM entries `JOIN1`..`JOIN4` write carry a station address, so the
@@ -197,7 +197,7 @@ pub fn spawn() {
     if CARD.lock().is_none() {
         return;
     }
-    match crate::sched::spawn_daemon(daemon) {
+    match akuma_kernel_amd64::drivers::services::sched::spawn_daemon(daemon) {
         Some(slot) => SLOT.store(slot, Ordering::Release),
         None => say("no task slot for the station daemon"),
     }
@@ -227,7 +227,7 @@ pub fn request(c: &Command) {
     *REQUEST.lock() = Some(*c);
     let slot = SLOT.load(Ordering::Acquire);
     if slot != usize::MAX {
-        crate::sched::wake(slot);
+        akuma_kernel_amd64::drivers::services::sched::wake(slot);
     }
 }
 
@@ -236,7 +236,7 @@ pub fn request(c: &Command) {
 fn wake_daemon() {
     let slot = SLOT.load(Ordering::Acquire);
     if slot != usize::MAX {
-        crate::sched::wake(slot);
+        akuma_kernel_amd64::drivers::services::sched::wake(slot);
     }
 }
 
@@ -253,12 +253,12 @@ fn with_status(f: impl FnOnce(&mut Status)) {
 }
 
 fn now_us() -> u64 {
-    crate::net::uptime_us()
+    akuma_kernel_amd64::drivers::services::net::uptime_us()
 }
 
 /// Park for `ms` — the scheduler runs everyone else meanwhile.
 fn nap(ms: u64) {
-    crate::sched::block_until_deadline(now_us() + ms * 1000);
+    akuma_kernel_amd64::drivers::services::sched::block_until_deadline(now_us() + ms * 1000);
 }
 
 fn park_forever() -> ! {
@@ -824,7 +824,7 @@ impl Station {
 
         // The 4-way handshake.
         let mut snonce = [0u8; 32];
-        if !crate::net::rng_fill_checked(&mut snonce) {
+        if !akuma_kernel_amd64::drivers::services::net::rng_fill_checked(&mut snonce) {
             say("no randomness for the SNonce");
             return Err(JoinError::Timeout);
         }
@@ -1008,7 +1008,7 @@ impl Station {
             }
         });
         if delivered > 0 {
-            crate::net::wake_netpoll();
+            akuma_kernel_amd64::drivers::services::net::wake_netpoll();
         }
         // What the stack sent, out as protected data frames.
         let mut eth = [0u8; FRAME_MAX];
@@ -1333,7 +1333,7 @@ fn next_seq() -> u16 {
     static NEXT: AtomicU32 = AtomicU32::new(u32::MAX);
     if NEXT.load(Ordering::Relaxed) == u32::MAX {
         let mut r = [0u8; 2];
-        let seed = if crate::net::rng_fill_checked(&mut r) { u32::from(u16::from_le_bytes(r)) } else { (now_us() & 0xfff) as u32 };
+        let seed = if akuma_kernel_amd64::drivers::services::net::rng_fill_checked(&mut r) { u32::from(u16::from_le_bytes(r)) } else { (now_us() & 0xfff) as u32 };
         let _ = NEXT.compare_exchange(u32::MAX, seed & 0xfff, Ordering::Relaxed, Ordering::Relaxed);
     }
     (NEXT.fetch_add(1, Ordering::Relaxed) & 0xfff) as u16

@@ -24,7 +24,7 @@
 //! rate/format/channel ioctl without remembering it. Every readback it used to
 //! declare success read a phantom. See `docs/archive/AKUMA_AMD64_HDA_AUDIO_BRIEF.md`.
 
-use crate::serial;
+use akuma_kernel_amd64::drivers::services::{lapic, pci, sched, serial, usermode};
 use akuma_hda::codec::{self, Kind, PinRole, VerbBus, VerbList};
 use akuma_hda::stream::{self, PlayRing, SampleFormat};
 use akuma_dma::align::{A128, A4K};
@@ -111,7 +111,7 @@ impl RegsW16 for Mmio {
 // ---------------------------------------------------------------------------
 
 fn now_us() -> Option<u64> {
-    crate::lapic::tsc_uptime_us()
+    lapic::tsc_uptime_us()
 }
 
 /// A bounded wait. Uses the TSC when it is calibrated and a spin count when it
@@ -473,7 +473,7 @@ impl Hda {
 
     fn idle(&self) {
         if self.may_yield {
-            crate::sched::yield_now();
+            sched::yield_now();
         } else {
             core::hint::spin_loop();
         }
@@ -756,12 +756,12 @@ fn print_verify(h: &mut Hda, pin: u8, dac: u8) {
 /// the box boots without sound. `selftest` plays a one-second tone through the
 /// same write path `wavplay` uses.
 pub fn init(selftest: bool) {
-    let Some(dev) = crate::pci::find_class(akuma_pci::class::MULTIMEDIA, akuma_pci::subclass::AUDIO) else {
+    let Some(dev) = pci::find_class(akuma_pci::class::MULTIMEDIA, akuma_pci::subclass::AUDIO) else {
         p("[HDA] no audio-class function on the bus\n");
         return;
     };
     // The census: on the trashcan the NVIDIA HDMI function is class 04:03 too.
-    crate::pci::for_each(|d| {
+    pci::for_each(|d| {
         if d.header.is_audio() {
             p("[HDA] audio function ");
             hx(u64::from(d.header.vendor_id), 4);
@@ -775,35 +775,35 @@ pub fn init(selftest: bool) {
         p("[HDA] first 04:03 function is not Intel; leaving audio off\n");
         return;
     }
-    crate::pci::enable(addr, true);
+    pci::enable(addr, true);
 
     // What Linux's `azx_init_pci` does for every Intel controller: route all
     // controller traffic through traffic class 0 (config 0x44 TCSEL[2:0]) and
     // turn off no-snoop (config 0x78 DEVC bit 11), so that device DMA is
     // coherent with the CPU caches. Firmware may leave either set.
-    let tcsel = crate::pci::read_u16_config(addr, 0x44);
-    let devc = crate::pci::read_u16_config(addr, 0x78);
-    crate::pci::write_u16_config(addr, 0x44, tcsel & !0x7);
-    crate::pci::write_u16_config(addr, 0x78, devc & !(1 << 11));
+    let tcsel = pci::read_u16_config(addr, 0x44);
+    let devc = pci::read_u16_config(addr, 0x78);
+    pci::write_u16_config(addr, 0x44, tcsel & !0x7);
+    pci::write_u16_config(addr, 0x78, devc & !(1 << 11));
     p("[HDA] pci tcsel 0x");
     hx(u64::from(tcsel), 4);
     p("->0x");
-    hx(u64::from(crate::pci::read_u16_config(addr, 0x44)), 4);
+    hx(u64::from(pci::read_u16_config(addr, 0x44)), 4);
     p(" devc 0x");
     hx(u64::from(devc), 4);
     p("->0x");
-    hx(u64::from(crate::pci::read_u16_config(addr, 0x78)), 4);
+    hx(u64::from(pci::read_u16_config(addr, 0x78)), 4);
     p("\n");
 
     // Power: a healthy controller is already D0. Cycling D3->D0 on one that is
     // wedges it (every BAR0 byte then reads 0xff), so only ever write D0 back
     // when PMCSR says it is something else.
-    let cfg = crate::pci::config_space(addr);
+    let cfg = pci::config_space(addr);
     for cap in akuma_pci::capabilities(&cfg, dev.header.capabilities_pointer) {
         if cap.id == akuma_pci::capability_id::POWER_MANAGEMENT {
-            let pmcsr = crate::pci::read_u16_config(addr, cap.offset + 4);
+            let pmcsr = pci::read_u16_config(addr, cap.offset + 4);
             if akuma_pci::pm::power_state(pmcsr) != akuma_pci::pm::D0 {
-                crate::pci::write_u16_config(addr, cap.offset + 4, pmcsr & !akuma_pci::pm::POWER_STATE_MASK);
+                pci::write_u16_config(addr, cap.offset + 4, pmcsr & !akuma_pci::pm::POWER_STATE_MASK);
                 delay_us(10_000);
                 p("[HDA] PCI power state was not D0; wrote D0\n");
             }
@@ -815,8 +815,8 @@ pub fn init(selftest: bool) {
         p("[HDA] BAR0 absent\n");
         return;
     };
-    let (size, _) = crate::pci::probe_bar_size(addr, 0);
-    let Some(win) = crate::pci::map_bar_window(bar, size.max(0x4000)) else {
+    let (size, _) = pci::probe_bar_size(addr, 0);
+    let Some(win) = pci::map_bar_window(bar, size.max(0x4000)) else {
         p("[HDA] BAR0 map failed\n");
         return;
     };
@@ -1026,7 +1026,7 @@ fn tone(ms: u32) {
 fn dsp_write(data: &[u8]) -> usize {
     match HDA.lock().as_mut() {
         Some(h) => {
-            h.may_yield = crate::usermode::current_process().is_some();
+            h.may_yield = usermode::current_process().is_some();
             h.write(data)
         }
         None => 0,
@@ -1035,7 +1035,7 @@ fn dsp_write(data: &[u8]) -> usize {
 
 fn dsp_stop() {
     if let Some(h) = HDA.lock().as_mut() {
-        h.may_yield = crate::usermode::current_process().is_some();
+        h.may_yield = usermode::current_process().is_some();
         h.drain();
         if h.underruns != 0 {
             p("[HDA] playback underruns: ");
@@ -1051,7 +1051,7 @@ fn dsp_stop() {
 fn with_params(f: impl FnOnce(&mut Hda) -> bool) -> bool {
     match HDA.lock().as_mut() {
         Some(h) => {
-            h.may_yield = crate::usermode::current_process().is_some();
+            h.may_yield = usermode::current_process().is_some();
             h.drain();
             f(h)
         }
