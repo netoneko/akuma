@@ -274,16 +274,12 @@ default = [
     "fs-cache",
     "sc-aio", "sc-sysv-ipc", "sc-containers",
     "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
-    # Kernel half of the process-per-session sshd. Default since 2026-08-10 —
-    # without it the stack RSTs past 8 simultaneous arrivals and sshd cannot
-    # reach its own max_sessions of 24.
-    "many-sessions",
     # Linux reboot(2) -> PSCI SYSTEM_RESET/SYSTEM_OFF. In `default` since
     # 2026-08-25 — see the `sc-reboot` feature definition below for why it was
     # gated and why that reason no longer applies.
     "sc-reboot",
 ]
-no-tests = ["akuma-net/small-sockets", "akuma-exceptions/no-tests", "akuma-exec/no-tests", "akuma-syscalls-glue/no-tests", "akuma-kernel-core/no-tests", "akuma-kernel-glue/no-tests", "akuma-kernel-tests-aarch64/no-tests"]
+no-tests = ["akuma-exceptions/no-tests", "akuma-exec/no-tests", "akuma-syscalls-glue/no-tests", "akuma-kernel-core/no-tests", "akuma-kernel-glue/no-tests", "akuma-kernel-tests-aarch64/no-tests"]
 
 # Target Firecracker's aarch64 microVM instead of QEMU `virt`.
 #
@@ -299,18 +295,6 @@ no-tests = ["akuma-net/small-sockets", "akuma-exceptions/no-tests", "akuma-exec/
 # depends on vCPU count. See docs/archive/FIRECRACKER_PORT.md.
 platform-firecracker = ["akuma-config/platform-firecracker", "akuma-virtio/platform-firecracker", "akuma-kernel-glue/platform-firecracker", "akuma-kernel-tests-aarch64/platform-firecracker"]
 
-# Support for a server handling many simultaneous connections: a deeper
-# per-listener backlog and a larger socket budget (see
-# `crates/akuma-net/src/socket.rs` `MAX_BACKLOG`). IN `default` — it is the
-# kernel half of the process-per-session `userspace/sshd`, whose `fork-sessions`
-# feature is also on by default.
-#
-# It costs ~1 MB of heap per listening socket plus ~44 KB of BSS, so
-# `extreme-size` stays out: that profile builds `--no-default-features` and
-# `kernel_profile_extreme` additionally overrides the constants, so it keeps the
-# original 8-deep backlog either way. See
-# `docs/runbooks/build-extreme-size.md` for the matching sshd build.
-many-sessions = ["akuma-net/many-sessions"]
 # Allow ONLY rump_tests to compile even when `no-tests` is set — used by the
 # devbox to verify rump regression guards at boot without pulling in the full
 # test suite (which requires default features smoltcp types etc.).

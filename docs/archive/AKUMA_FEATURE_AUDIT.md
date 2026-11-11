@@ -123,6 +123,26 @@ predicted to suit it (`REDIS_ROUND_TRIP_CEILING.md`). Removed:
 `[NICSTAT]` keeps its `orphan`/`tx_stall` columns, always 0, so parsers do not shift.
 `akuma-net-nic`'s unsafe budget went from 13 to 9. The default image's sections are unchanged.
 
+## `many-sessions` and `small-sockets` removed (2026-11-11)
+
+`many-sessions` was the kernel half of the process-per-session sshd. It raised the listener
+backlog from 8 to 32 and lifted `small-sockets` builds' socket table to 512. The owner's
+call was that the kernel should not carry a mode for one daemon; whoever needs sshd sized
+differently configures sshd. Every build now has `MAX_BACKLOG` = 8, the value amd64,
+`extreme-size` and the rump devbox always had.
+
+`small-sockets` went with it. It was set only by AArch64 `no-tests`, and without
+`many-sessions` it would have dropped the devbox to 32 smoltcp sockets: one 8-deep listener
+plus 24 sessions would fill it. The table is now 256 everywhere but `kernel_profile_extreme`
+(32). This also takes `small-sockets` out of `no-tests`, one of its three AArch64-only
+entries (the parity baseline ratcheted).
+
+Known cost: a burst of more than 8 simultaneous connections gets RSTs (measured on sshd:
+8/8, 12/16, 17/24). The note on what to do is `docs/reference/build-profiles.md`
+§ Listener backlog. Gates: HVF `SMP=2` 323/0, `SMP=4` 321/0, and `SMP=1` 314/1 (the open
+`thread_slot_reclaim_on_spawn` failure). Lima devbox `SMP=4`: epoll 0 FAIL / 1 DIVERGE,
+futex all pass.
+
 ## amd64 `console-notify`, `linux-file-io`, `reboot-trace` made unconditional (2026-11-11)
 
 All three were in amd64's `default`, and no amd64 kernel can build without its defaults: the

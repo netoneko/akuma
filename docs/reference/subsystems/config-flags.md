@@ -33,8 +33,7 @@ Source: `Cargo.toml:73-105`.
 ```
 smp-shared, smoltcp, sound, rump, fs-cache,
 sc-aio, sc-sysv-ipc, sc-containers,
-sc-timerfd, sc-eventfd, sc-pidfd, sc-epoll,
-many-sessions
+sc-timerfd, sc-eventfd, sc-pidfd, sc-epoll
 ```
 
 There is no `neko`/`kernel-tls`/`tls-rsa` feature anymore — the in-kernel
@@ -53,7 +52,7 @@ HTTPS client anywhere in this tree now; use a userspace tool.
 | `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. | `Cargo.toml:378` |
 | `rump-tests` | Compiles only `rump_tests` even under `no-tests` — used by the devbox to verify rump regression guards at boot without pulling in the full boot-test suite. | `Cargo.toml:142` |
 | `userspace-sshd` | Selects the herd-less startup path: `AUTO_START_HERD` off, kernel spawns `/bin/sshd` directly via `AUTO_START_SSHD`. Drives `config::ENABLE_USERSPACE_SSHD`. There is only ever one sshd (userspace) now — this no longer toggles between a built-in and a userspace server, only who starts the userspace one. | `Cargo.toml:386` |
-| `many-sessions` | Deepens the per-listener backlog (8→32) and raises the socket budget on `small-sockets` builds — the kernel half of the process-per-session `/bin/sshd` (its `fork-sessions` feature is the userspace half). **In `default`** since 2026-08-10 — without it the stack RSTs past 8 simultaneous arrivals. Costs ~1 MB heap per listening socket + ~44 KB BSS. `kernel_profile_extreme` overrides the constants back to 8/32 regardless. | `Cargo.toml:138` |
+| (`many-sessions`) | **Removed 2026-11-11.** The listener backlog is 8 on every build; configure sshd for it or raise `MAX_BACKLOG` — [`../build-profiles.md`](../build-profiles.md) § Listener backlog. |
 | `devbox` | Meta-feature = `["rump-default", "userspace-sshd", "sc-reboot"]`. Built `--no-default-features` (`scripts/build_devbox.sh`), so `sc-reboot` is listed explicitly here even though it's also in `default` now — this feature set doesn't inherit `default`'s members. | `Cargo.toml:393` |
 | `devbox-smoltcp` | Meta-feature = `["userspace-sshd", "smp-shared"]` — the **default** devbox. Keeps smoltcp; both members are no-ops here since they're already in `default` (this build does NOT pass `--no-default-features`) — `sc-reboot` used to be listed a third time for the same reason before it moved into `default` itself (2026-08-25). | `Cargo.toml:405` |
 
@@ -86,7 +85,7 @@ re-add what they need. `Cargo.toml:361-369`.
 | `sound` | virtio-sound output (`/dev/dsp`). The only thing that still compiles `virtio-drivers` (and `zerocopy`, `safe-mmio`, `bitflags` 2, `thiserror`): block and net are driven in-tree (`archive/AKUMA_VIRTIO_IN_TREE.md`). | `Cargo.toml` |
 | `extreme` | Profile discriminator for build.rs (tighter IMAGE_SIZE/stack). | `Cargo.toml:337` |
 | `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. **In `default`**, so any build that doesn't pass `--no-default-features` has it. Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)`. Observe it via the `[FSCACHE]` PSTATS line. Not combinable with `extreme`. | `Cargo.toml:356` |
-| `no-tests` | Drops boot self-test suites; sets `akuma-net/small-sockets`. | `Cargo.toml:125` |
+| `no-tests` | Drops boot self-test suites. | `Cargo.toml:125` |
 
 ### Crate features the amd64 kernels leave off
 
@@ -109,7 +108,7 @@ What a tokio program calls, and so what may be left off, is measured by B10's ce
 | `akuma-syscalls-glue/akuma-native` | Akuma's own numbers (asm-generic 300-328; `0x1000 +` that on x86_64): `spawn`, `spawn_ext`, `waitpid`, `kill`, the terminal and cursor calls, `resolve_host`, `uptime`, `time`, `get_version`, `core_init`, `set_box_stack`, `close_child_stdin`, `set_tpidr_el0`. libakuma's programs use them. In glue's `default`; named by the bin and `akuma-amd64`. Off, the numbers fall to `ENOSYS`. `spawn`/`spawn_ext` also need `exec`. | `crates/akuma-syscalls-glue/Cargo.toml` |
 | `akuma-runtime-tokio/shell` | Not a tokio feature: the 23 calls glue serves that a shell and its tools make and no tokio program does (job control, the other ids, limits and accounting, `sync`, `membarrier`, the clock and hostname setters). Taoxichuan's own `shell` feature (in its `default`) turns it on; `--no-default-features` builds a kernel that serves only the tokio surface. | `crates/akuma-runtime-tokio/Cargo.toml`, `taoxichuan/Cargo.toml` |
 
-`userspace-sshd` and `many-sessions` are documented under
+`userspace-sshd` is documented under
 [Networking stack](#networking-stack) above, alongside the other
 sshd-related features.
 

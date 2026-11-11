@@ -7,12 +7,9 @@ edition = "2024"
 default = []
 # Per-packet RX/TX/poll timing. MEASUREMENT BUILDS ONLY.
 net-profile = []
-# Raise the socket budget on size-constrained profiles.
-many-sessions = []
 # The raw L2 path for NIC1 (`/dev/net/tap0`). A NIC driver, so it lives here
 # with the others — the device-independent half is `akuma-rump`.
 rump = ["dep:akuma-rump"]
-small-sockets = []
 # The Realtek RTL8169/8168 as an `ExternalDevice` variant — amd64 bare metal.
 # Off by default; the driver logic is `akuma-net-rtl8169`, this feature adds the
 # MMIO/DMA glue and the `smoltcp::phy::Device` shim.

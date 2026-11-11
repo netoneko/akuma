@@ -52,16 +52,13 @@ the cooperative executor's known limits (`LIMITATIONS.md` §1-§2): one OS threa
 no fault isolation between sessions, and one blocking syscall stalls every
 session.
 
-The kernel half (`many-sessions`: 32-deep listener backlog, larger socket table,
-~1 MB of heap per listening socket) is **already off** on this profile — it is
-not in the `--no-default-features` list, and `kernel_profile_extreme` overrides
-the constants back to 8/32 regardless. Nothing to do there; the consequence is
-that this image RSTs past 8 simultaneous connection *arrivals*, which is the
-behaviour it has always had.
+The kernel has no sshd-specific half: the listener backlog is 8 on every build,
+so this image RSTs past 8 simultaneous connection *arrivals*, like every other.
+`kernel_profile_extreme` keeps the smoltcp socket table at 32.
 
 ## Other memory traps on this profile
 
-- **`small-sockets` / `kernel_profile_extreme`** cap the smoltcp socket table at
+- **`kernel_profile_extreme`** caps the smoltcp socket table at
   32 total, shared by every process. A leak or a pile of `TIME_WAIT` sockets
   shows up as `bind`/`accept` failures long before anything reports OOM.
 - **No in-kernel HTTPS anywhere.** `kernel-tls` was deleted from the whole
@@ -91,7 +88,7 @@ ssh -o StrictHostKeyChecking=no root@localhost -p 2222
 ## Background
 
 - [`docs/reference/build-profiles.md`](../reference/build-profiles.md) — the
-  profile/feature matrix and where `many-sessions` sits in it.
+  profile/feature matrix and the listener-backlog note.
 - [`userspace/sshd/docs/PROCESS_PER_SESSION.md`](../../userspace/sshd/docs/PROCESS_PER_SESSION.md)
   — what `fork-sessions` does, and its measured behaviour.
 - `acceptance/05` — the extreme-size acceptance playbook.

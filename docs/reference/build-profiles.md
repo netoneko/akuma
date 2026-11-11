@@ -187,7 +187,7 @@ extreme vs release) and two open defects it surfaced:
 
 `release` builds with cargo's normal default feature resolution: `smp-shared`
 (which includes the BKL carve-outs), `smoltcp`, `sound`, `rump`, `fs-cache`,
-`many-sessions`, and all eight `sc-*` syscall families (`Cargo.toml:126-142`).
+and all eight `sc-*` syscall families (`Cargo.toml:126-142`).
 There is no `neko`/`kernel-tls`/`tls-rsa` to drop anywhere — those features
 were deleted from `Cargo.toml` entirely (commit `bade6ab` for TLS,
 `e9d08f1` for the editor) rather than being opt-out. `devbox`/`extreme-size`
@@ -196,37 +196,38 @@ pass `--no-default-features` and explicitly re-add only what they want;
 
 | Target | Drops vs. default | Adds vs. default |
 |---|---|---|
-| `extreme-size` | `smp-shared`, `sound`, `rump`, `fs-cache`, `many-sessions`, all `sc-*` | `no-tests`, `extreme`, `userspace-sshd` |
-| `devbox` | `smoltcp`, `smp-shared`, `fs-cache`, `many-sessions` | `devbox` (→ `rump-default` + `userspace-sshd`), `rump-tests`, `no-tests` |
+| `extreme-size` | `smp-shared`, `sound`, `rump`, `fs-cache`, all `sc-*` | `no-tests`, `extreme`, `userspace-sshd` |
+| `devbox` | `smoltcp`, `smp-shared`, `fs-cache` | `devbox` (→ `rump-default` + `userspace-sshd`), `rump-tests`, `no-tests` |
 | `devbox-smoltcp` | — (inherits default set) | `devbox-smoltcp` (→ `userspace-sshd` + `smp-shared`, the latter a no-op since it's already default), `no-tests` |
 
-### `many-sessions` and the userspace sshd
+### Listener backlog and the userspace sshd
 
-`many-sessions` (default since 2026-08-10) deepens the per-listener backlog from
-8 to 32 and raises the smoltcp socket table on `small-sockets` builds, so a
-server can absorb more than 8 *simultaneous arrivals*. It is the kernel half of
-the process-per-session `/bin/sshd`; the userspace half is that binary's own
-`fork-sessions` feature, also default-on. See
-[`userspace/sshd/docs/PROCESS_PER_SESSION.md`](../../userspace/sshd/docs/PROCESS_PER_SESSION.md).
+Every build's listener backlog is **8** (`MAX_BACKLOG` in
+`crates/akuma-net/src/socket.rs`): a listener is a pool of 8 pre-listening
+sockets, and a 9th simultaneous *arrival* gets a RST however fast the server
+accepts. The `many-sessions` feature that raised it to 32 (and the
+`small-sockets` cap `no-tests` used to set) was removed 2026-11-11; the smoltcp
+socket table is 256 everywhere but `extreme-size` (32).
 
-Cost: ~1 MB of heap per *listening* socket, plus ~44 KB of BSS where the socket
-table also grows. Every `--no-default-features` target above therefore drops it
-automatically, and `kernel_profile_extreme` overrides the constants back to 8/32
-even if the feature is somehow enabled — a belt-and-braces guard so adding
-`many-sessions` to `extreme-size`'s feature list later cannot quietly cost a
-megabyte per listener against the 4 MB floor.
+The kernel no longer carries a mode for sshd. `/bin/sshd` defaults to a process
+per session with `max_sessions` = 24, which a burst of connections cannot reach
+through an 8-deep backlog (measured 8/8, 12/16, 17/24). Configure sshd for the
+image instead:
 
-**If `extreme-size` (or any low-RAM image) shows memory pressure, build sshd
-without its half too** — the kernel side is already off there, but the binary is
-shared across images and defaults to a process per session:
+- connect in smaller bursts, or lower sshd's `max_sessions` to what you need;
+- on a low-RAM image, build the cooperative single-process sshd:
 
 ```bash
 SSHD_FORK_SESSIONS=0 userspace/build.sh --sshd-only
 ```
 
-That reverts `/bin/sshd` to the single-process cooperative executor: one process
-serving all sessions, no `fork()` per connection. See
-[`docs/runbooks/build-extreme-size.md`](../runbooks/build-extreme-size.md).
+- if a server really needs more simultaneous arrivals, raise `MAX_BACKLOG` and
+  rebuild the kernel. Each entry is 32 KB of heap per listener, and
+  `smoltcp_net::MAX_SOCKETS` must cover a full backlog plus the accepted
+  connections.
+
+See [`userspace/sshd/docs/PROCESS_PER_SESSION.md`](../../userspace/sshd/docs/PROCESS_PER_SESSION.md)
+and [`docs/runbooks/build-extreme-size.md`](../runbooks/build-extreme-size.md).
 
 `devbox-smoltcp` keeps the full
 default feature set and only layers its feature on top, rather than starting

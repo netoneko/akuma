@@ -403,7 +403,7 @@ client bugs from userspace.
 | `SO_RCVBUF` / `SO_SNDBUF` | accepted and ignored; buffers are fixed at 16 KB each direction (`TCP_{RX,TX}_BUFFER_SIZE`) | honoured |
 | `shutdown(2)` | implemented 2026-08-20. `SHUT_WR` sends the FIN (smoltcp `close()` → `FinWait1`, so the socket can still receive); `SHUT_RD` is local-only (`KernelSocket::recv_shutdown`, later `recv`s report EOF). Neither frees the fd | half-closes the connection |
 | `TCP_NODELAY` | tracked, but Nagle is off unconditionally (`set_nagle_enabled(false)`) and delayed ACK is disabled | configurable |
-| listen backlog | a **hard** ceiling of pre-created sockets (8, or 32 with `many-sessions`), not a hint — past it the peer gets RST. Self-healing since 2026-08-20; census in `/proc/net/tcp`'s `BACKLOG` column | soft SYN-queue hint |
+| listen backlog | a **hard** ceiling of pre-created sockets (8), not a hint — past it the peer gets RST. Self-healing since 2026-08-20; census in `/proc/net/tcp`'s `BACKLOG` column | soft SYN-queue hint |
 | `recv` on a connection the peer **reset** | `ECONNRESET`. Distinct from a graceful FIN, which stays `read() == 0` | same |
 | address families | `AF_INET` only; `AF_INET6` is `EAFNOSUPPORT` | both |
 | socket budget | 128 fds (`socket::MAX_SOCKETS`) over 32–256 smoltcp sockets depending on features, 32 KB of heap each | ulimit-bound |

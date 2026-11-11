@@ -1383,3 +1383,9 @@ and there were no panics.
 
 These were default-on and could not be turned off (no amd64 build drops its defaults), so the cfgs went.
 amd64 TCG gate: 829/0 at `SMP=1` and 839/0 at `SMP=2`, the same as before.
+
+## `many-sessions` / `small-sockets` removed (2026-11-11)
+
+The listener backlog is 8 and the smoltcp table is 256 (32 on extreme) on both kernels,
+which leaves one less networking difference between them. Details and gates are in
+`AKUMA_FEATURE_AUDIT.md`.

@@ -8,7 +8,6 @@ edition = "2024"
 # native stack. The kernel disables it for the devbox (rump-only) by depending on
 # this crate with `default-features = false` and NOT re-enabling `smoltcp`.
 default = ["smoltcp"]
-small-sockets = ["akuma-net-nic/small-sockets"]
 # Device-level NIC instrumentation (`nicstat`): per-packet RX/TX/poll timing and
 # byte counts, plus how long blocking socket waits park in `blocking_relax`.
 # MEASUREMENT BUILDS ONLY — never ship it. Off by default and every recorder is
@@ -16,13 +15,6 @@ small-sockets = ["akuma-net-nic/small-sockets"]
 # (same discipline as the kernel's `bkl-profile`). Forwarded from the kernel's
 # feature of the same name; the kernel prints the windowed delta as `[NICSTAT]`.
 net-profile = ["akuma-net-nic/net-profile"]
-# Raise the per-listener backlog (socket.rs `MAX_BACKLOG`) and, on the
-# size-constrained profiles, the total socket budget (smoltcp_net.rs
-# `MAX_SOCKETS`), so a server can absorb more simultaneous *arrivals* than the
-# default 8. Costs ~1 MB of heap per listening socket, so it is opt-in.
-# Paired with `userspace/sshd`'s `fork-sessions` feature — see that crate's
-# `[features]` for why the two are turned on together.
-many-sessions = ["akuma-net-nic/many-sessions"]
 # Real shared-kernel SMP. Gates the `PreemptGuard` critical-section preemption
 # guards (runtime.rs): under the Big Kernel Lock the base NETWORK/SOCKET_TABLE
 # spinlocks must never be held across a context switch. A no-op otherwise, so

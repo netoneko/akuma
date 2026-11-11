@@ -210,7 +210,7 @@ tick means a `NETWORK` holder is sleeping while holding it.
 |---|---|---|
 | `SYSCALL_DEBUG_NET_ENABLED` (`src/config.rs:526`) | false | Per-call tracing in recv/sendto/epoll/socket. **Best first toggle** for "is the syscall reaching the kernel?" |
 | `NETWORK_THREAD_RATIO` (`src/config.rs:222`) | 4 | Network thread boosted every N ticks. 2=50% (aggressive), 8=12.5%. Boost targets the **registered** network thread (`set_network_thread_id`), not slot 0. |
-| `MAX_SOCKETS` (`smoltcp_net.rs:30`) | 256 (32 on `small-sockets`/`size`) | TCP buffers 16 KB RX + 16 KB TX each |
+| `MAX_SOCKETS` (`smoltcp_net.rs:30`) | 256 (32 on `extreme-size`) | TCP buffers 16 KB RX + 16 KB TX each |
 | `ENABLE_PREEMPTION_WATCHDOG` | true | Catches preemption-stall hangs |
 | Live counters | — | `is_ready()`, `is_dhcp_configured()`, `poll_count()`, `tx_drop_count()` — check first for "is the stack alive?" |
 

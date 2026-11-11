@@ -16,7 +16,6 @@
     "no-tests": {
       "only_aarch64": [
         "akuma-exec/no-tests",
-        "akuma-net/small-sockets",
         "akuma-syscalls-glue/no-tests"
       ],
       "only_amd64": []
