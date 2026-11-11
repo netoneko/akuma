@@ -77,6 +77,18 @@ pub fn heap_size() -> usize {
     HEAP_BYTES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Total usable RAM this boot found (`ram_total` in [`init_reserving`]), for callers that need
+/// it after memory bring-up and have no `Facts` of their own still in scope — `exec_runtime`'s
+/// stack-size policy (`akuma_mem_policy::compute_user_stack_size`), called from
+/// `install_shared_sinks`, which `init_reserving`'s own doc says must run after this.
+static RAM_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Bytes of usable RAM this boot found. `0` before [`init_reserving`] runs.
+#[must_use]
+pub fn ram_bytes() -> usize {
+    RAM_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 const PAGE_SIZE: usize = 4096;
 
 unsafe extern "C" {
@@ -257,6 +269,7 @@ pub fn init_reserving(
             (roomiest, fits as usize, roomiest.floor)
         });
     HEAP_BYTES.store(heap_bytes, core::sync::atomic::Ordering::Relaxed);
+    RAM_BYTES.store(ram_total as usize, core::sync::atomic::Ordering::Relaxed);
     let heap_start = heap_at as usize;
     let heap_end = heap_start + heap_bytes;
 

@@ -116,6 +116,36 @@ pub fn compute_heap_size(ram_size: usize, code_and_stack: usize, manual_override
     }
 }
 
+/// Decide a user thread/process stack size for a given RAM size.
+///
+/// Extracted from `akuma-config::compute_user_stack_size` (AArch64-only until now; amd64 never
+/// called it and instead hardcoded a flat ceiling, `ELF_STACK_MAX_PAGES * 4096` = 8 MiB,
+/// regardless of RAM — see `amd64/src/exec_runtime.rs`). `manual_override`, like every other
+/// function here, is the caller's own escape hatch (`USER_STACK_SIZE_OVERRIDE`).
+///
+/// `ram / 2048` clamped to `[128 KiB, 8 MiB]`, rounded up to a 4 KiB page:
+/// 256 MiB RAM → 128 KiB (floor), 1 GiB → 512 KiB, 4 GiB+ → 2 MiB (unchanged from history up to
+/// the 8 MiB ceiling). Below 256 MiB this is the one function in the crate whose floor is a hard
+/// *minimum* workable stack (128 KiB), not a "never below what's left" budget like
+/// [`compute_heap_size`] — a thread needs some usable stack to run at all, so this never scales
+/// below that no matter how little RAM is left.
+#[must_use]
+pub fn compute_user_stack_size(ram_size_bytes: usize, manual_override: usize) -> usize {
+    if manual_override != 0 {
+        return manual_override;
+    }
+    const MIN_STACK: usize = 128 * 1024;
+    const MAX_STACK: usize = 8 * 1024 * 1024;
+    let computed = ram_size_bytes / 2048;
+    if computed < MIN_STACK {
+        MIN_STACK
+    } else if computed > MAX_STACK {
+        MAX_STACK
+    } else {
+        (computed + 0xFFF) & !0xFFF
+    }
+}
+
 /// Decide how many thread slots get a stack allocated (`thread_limit`, capped at `max_threads`).
 ///
 /// Thread stacks come from the PMM (the user-pages pool), so on a small machine the full thread
@@ -220,6 +250,20 @@ pub const JAVA_MIN: Option<Requirement> = None;
 mod tests {
     use super::*;
     const MB: usize = 1024 * 1024;
+
+    /// Matches the doc comment's own worked examples, and the hard 128 KiB floor at tiny RAM
+    /// (never scales below a workable stack, unlike every other function here).
+    #[test]
+    fn user_stack_size_matches_history_and_has_a_hard_floor() {
+        for &(ram_mb, exp_kb) in &[(256, 128), (512, 256), (1024, 512), (2048, 1024)] {
+            assert_eq!(compute_user_stack_size(ram_mb * MB, 0), exp_kb * 1024, "{ram_mb}MB RAM");
+        }
+        for &ram_mb in &[1usize, 8, 24, 64, 128] {
+            assert_eq!(compute_user_stack_size(ram_mb * MB, 0), 128 * 1024, "{ram_mb}MB RAM floor");
+        }
+        assert_eq!(compute_user_stack_size(64 * 1024 * MB, 0), 8 * MB, "ceiling at huge RAM");
+        assert_eq!(compute_user_stack_size(24 * MB, 7), 7, "manual override wins");
+    }
 
     /// Large RAM (>= 256MB): exact historical values must be preserved.
     #[test]

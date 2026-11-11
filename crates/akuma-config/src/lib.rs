@@ -984,40 +984,12 @@ pub const TRACE_TKILL: bool = false;
 
 /// Compute user process stack size based on available RAM.
 ///
-/// Returns `USER_STACK_SIZE_OVERRIDE` if non-zero, otherwise scales:
-///   - 256 MB RAM → 128 KB (minimum)
-///   - 512 MB RAM → 256 KB
-///   - 1 GB RAM   → 512 KB  
-///   - 2 GB RAM   → 1 MB
-///   - 4 GB+ RAM  → 2 MB (maximum)
-///
-/// The formula is: stack_size = RAM / 2048, clamped to [128KB, 2MB]
+/// See `akuma_mem_policy::compute_user_stack_size` — moved there (config flag sweep,
+/// 2026-11-11) so amd64 (which never called this at all, and hardcoded a flat 8 MiB ceiling
+/// instead; see `amd64/src/exec_runtime.rs`) and both tokio kernels can share the same policy.
+/// No longer `const fn`: nothing called it from a const context, and the shared crate's version
+/// isn't one.
 #[must_use]
-pub const fn compute_user_stack_size(ram_size_bytes: usize) -> usize {
-    if USER_STACK_SIZE_OVERRIDE != 0 {
-        return USER_STACK_SIZE_OVERRIDE;
-    }
-    
-    const MIN_STACK: usize = 128 * 1024;  // 128 KB minimum
-    const MAX_STACK: usize = 8 * 1024 * 1024;  // 8 MB maximum
-    
-    // RAM / 2048 gives us nice scaling:
-    // 256 MB / 2048 = 128 KB
-    // 512 MB / 2048 = 256 KB
-    // 1 GB / 2048 = 512 KB
-    // 2 GB / 2048 = 1 MB
-    // 4 GB / 2048 = 2 MB
-    // 8 GB / 2048 = 4 MB
-    // 16 GB / 2048 = 8 MB
-    let computed = ram_size_bytes / 2048;
-    
-    // Clamp to [MIN_STACK, MAX_STACK]
-    if computed < MIN_STACK {
-        MIN_STACK
-    } else if computed > MAX_STACK {
-        MAX_STACK
-    } else {
-        // Round up to nearest 4KB page boundary
-        (computed + 0xFFF) & !0xFFF
-    }
+pub fn compute_user_stack_size(ram_size_bytes: usize) -> usize {
+    akuma_mem_policy::compute_user_stack_size(ram_size_bytes, USER_STACK_SIZE_OVERRIDE)
 }

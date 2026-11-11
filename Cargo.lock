@@ -154,6 +154,7 @@ dependencies = [
 name = "akuma-config"
 version = "0.1.0"
 dependencies = [
+ "akuma-mem-policy",
  "akuma-primitives",
 ]
 
@@ -1226,6 +1227,7 @@ dependencies = [
  "akuma-firecracker",
  "akuma-fpcache",
  "akuma-gic",
+ "akuma-mem-policy",
  "akuma-middleware",
  "akuma-mmu",
  "akuma-net",
@@ -1272,6 +1274,7 @@ dependencies = [
  "akuma-isolation",
  "akuma-lapic-amd64",
  "akuma-machine-facts",
+ "akuma-mem-policy",
  "akuma-middleware",
  "akuma-mmap",
  "akuma-mmu",

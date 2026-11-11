@@ -519,11 +519,18 @@ fn config() -> ExecConfig {
         // into glue: `RLIMIT_STACK` is this number, and `busybox ulimit -s`
         // reported 32 where the program actually has 512 KiB.
         //
-        // The limit is real here: `ELF_STACK_PAGES` are mapped at exec and the
-        // rest up to `ELF_STACK_MAX_PAGES` is one demand-paged region
-        // (`mm::lazy_stack_region`), so a program that recurses past it takes a
-        // `#PF` nothing will service — the value is the hard edge, not a hint.
-        user_stack_size: crate::usermode::ELF_STACK_MAX_PAGES * 4096,
+        // Was a flat `ELF_STACK_MAX_PAGES * 4096` (8 MiB) regardless of RAM — the one stack
+        // knob amd64 never shared with AArch64's `compute_user_stack_size` (config flag sweep,
+        // 2026-11-11; AArch64 has called it since before this crate existed, amd64 just never
+        // did). `ram_bytes()` is `0` before memory bring-up; `install_shared_sinks` (which calls
+        // this through `exec_runtime::init`) is documented to run after it, so that should never
+        // happen here, but `compute_user_stack_size(0, _)` still returns a sane 128 KiB floor
+        // rather than something degenerate if it ever does.
+        //
+        // This changes the *ceiling* RLIMIT_STACK reports and demand-paging stops at
+        // (`mm::lazy_stack_region`) — `ELF_STACK_PAGES` (the pages eagerly mapped at exec,
+        // `usermode.rs`) is a separate, still-flat constant, deliberately not touched here.
+        user_stack_size: akuma_config::compute_user_stack_size(akuma_boot_amd64::mem::ram_bytes()),
         // Off, and off in `sched.rs` too — see `boot_stack_base` above.
         enable_stack_canaries: false,
         stack_canary: 0,
