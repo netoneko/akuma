@@ -4,7 +4,7 @@ Akuma as a Firecracker microVM on an **AWS bare-metal host**, and the packaging
 that gets the root filesystem there.
 
 The sibling of `overlays/devbox-firecracker` (Firecracker on a local Lima VM),
-`overlays/devbox-smoltcp` (QEMU, smoltcp, real SMP) and `overlays/devbox` (QEMU,
+`overlays/devbox/run-smoltcp.sh` (QEMU, smoltcp, real SMP) and `overlays/devbox` (QEMU,
 rump).
 
 - **Infrastructure** lives in a separate repo, `akuma-terraform`: the metal

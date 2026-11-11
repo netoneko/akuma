@@ -309,7 +309,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   no hook. The four `src/config.rs` tunables arrive at `init` as an
   `FpcacheConfig`, which is the one real cost: the kill switch stopped being a
   const-folded branch and became a relaxed atomic load (+304 B `.text`, +16 B
-  `.bss`, 0 B of `extreme-size` image). **`src/config.rs` stays the single source
+  `.bss`, 0 B of the old 4 MB `extreme` image). **`src/config.rs` stays the single source
   of truth** — the `src/file_page_cache.rs` shim reads the consts and hands them
   over, so do not add a second copy in the crate.
   The **networking family** is four crates since 2026-08-30
@@ -317,7 +317,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   forbid `unsafe`. `akuma-net` is the smoltcp stack (`smoltcp_net/`, 14 modules)
   plus the AF_INET socket table and DNS; it holds **no `unsafe`**.
   `akuma-net-nic` is the device — DMA frame arenas (`frames`), the virtio-net
-  wrapper (`nic`), the `net-noalloc` rings, `nicstat`, the NIC MMIO doorbell
+  wrapper (`nic`), `nicstat`, the NIC MMIO doorbell
   (`irq`), the rump tap, and smoltcp's two `Device` impls. **Every `unsafe` line
   in networking is in it**, behind one stated DMA contract at the top of
   `nic.rs`: a buffer handed to `receive_begin`/`transmit_begin` is owned by the
@@ -375,7 +375,8 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   is not one.
   `akuma-bkl` is the BKL protocol and the spinlocks under it — and since
   2026-09-01 also `akuma_bkl::policy`, the **decision** to take it or skip it:
-  the seven `no-bkl-*` phase toggles and the per-syscall opt-out bitmap, moved
+  the seven `no-bkl-*` phase toggles (runtime atomics; the compile-time
+  `no-bkl-*` features were folded into `smp-shared`) and the per-syscall opt-out bitmap, moved
   out of `src/smp_shared.rs` (which went 1173 -> 808 lines,
   `docs/archive/AKUMA_SMP_SHARED_SPLIT.md`). Each toggle is a relaxed atomic load
   with a **paired setter that is not test-only** — every phase in
@@ -422,8 +423,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `required-features = ["cli"]` so a bare `cargo build`/`test` at the repo root
   never tries to cross-compile it for the kernel's own target.
   `akuma-boot` holds the Linux `reboot(2)` ABI decode for the `sc-reboot`
-  syscall (`src/syscall/reboot.rs`) — in `default` since 2026-08-25 (only
-  `extreme-size`, which builds `--no-default-features`, excludes it) — **and
+  syscall (`src/syscall/reboot.rs`) — in `default` since 2026-08-25 — **and
   since 2026-09-01 `system_reset`/`system_off` themselves**, so it decodes *and*
   performs. It keeps `#![forbid(unsafe_code)]` because the `smc`/`hvc` lives in
   the sibling `akuma-psci`, not here — absorbing it would have cost the ban, the
@@ -449,9 +449,10 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 - `scripts/` — Build and debug helpers
 - `overlays/devbox/` — Devbox distro rootfs + `run.sh` / `run-smoltcp.sh`
 - `bootstrap/` — Alpine apk bootstrap assets
-- `acceptance/` — Numbered acceptance test playbooks: 05, 10, 11, 13 are the
-  live set (extreme-size 4 MB floor, self-host, rump, `cargo install`-built
-  agent); `acceptance/archive/` holds the rest, superseded or subsumed
+- `acceptance/` — Numbered acceptance test playbooks: 10, 11, 13 are the
+  live set (self-host, rump, `cargo install`-built agent); `acceptance/archive/`
+  holds the rest, superseded or subsumed — 05 (the 4 MB floor) since the
+  `extreme` feature was removed 2026-11-11
   (`docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`).
 - `proposals/` — In-flight design proposals
 
@@ -537,7 +538,6 @@ A build target is **profile + feature set**, always selected together. Details
 and tradeoffs in `docs/reference/build-profiles.md`.
 
 ```bash
-scripts/build_extreme_size.sh                             # extreme-size (4.0 MB floor, userspace sshd + paws, single-core)
 scripts/build_devbox_smoltcp.sh && overlays/devbox/run-smoltcp.sh  # default devbox (userspace sshd)
 scripts/build_devbox.sh && overlays/devbox/run.sh         # rump devbox (deferred; needs RUMP_NIC=1)
 ```
@@ -549,7 +549,11 @@ That is *the* SMP. The `smp` feature is the separate, experimental
 (build.rs panics), so building it needs `--no-default-features`.
 
 Profiles are only `release`, `extreme-size` and `release-debug` — a build target
-is `--release` plus a feature set.
+is `--release` plus a feature set. `extreme-size` is **codegen only**
+(`opt-level = "z"`, fat LTO): no cfg reads the profile, so it builds the same
+kernel as `--release` for a given feature set. The 4 MB-floor `extreme` feature,
+`userspace-sshd` and `fs-cache` (the ext2 block cache, now always on) were
+removed 2026-11-11 (`docs/archive/AKUMA_FEATURE_AUDIT.md`).
 
 ## VM Access
 
@@ -593,8 +597,7 @@ the "ssh never came up at all" diagnostic path only.
 
 If you *are* reading a boot log for something else, `-a` is mandatory — QEMU
 emits a control byte that makes plain `grep` treat the log as binary and print
-nothing. And note there are two startup paths for sshd: `extreme-size` has the
-kernel spawn it, every other profile lets herd do it.
+nothing. herd starts sshd on every build.
 
 **Never `pkill -f qemu-system-aarch64`.** Other VMs belonging to the user may be
 running (they use `INSTANCE=N`, which maps ssh to `2222 + 100*N`). Kill only the

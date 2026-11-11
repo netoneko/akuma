@@ -1,6 +1,6 @@
 # devbox-firecracker
 
-Akuma as a Firecracker microVM. The sibling of `overlays/devbox-smoltcp` (QEMU,
+Akuma as a Firecracker microVM. The sibling of `overlays/devbox/run-smoltcp.sh` (QEMU,
 smoltcp, real SMP) and `overlays/devbox` (QEMU, rump).
 
 **Status: works at 1 vCPU, SSH included.** Boots, mounts its ext2 root, passes
