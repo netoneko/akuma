@@ -578,6 +578,28 @@ kernel as `--release` for a given feature set. The 4 MB-floor `extreme` feature,
 `userspace-sshd` and `fs-cache` (the ext2 block cache, now always on) were
 removed 2026-11-11 (`docs/archive/AKUMA_FEATURE_AUDIT.md`).
 
+### amd64 builds: default to `headless`
+
+```bash
+cargo build -p akuma-amd64 --target x86_64-unknown-none --release \
+    --no-default-features --features headless      # build/check, Firecracker/TCG smoke boots
+```
+
+**Build `headless` unless the kernel actually has to run on ryzen or trashcan as
+the host.** The plain `--release` default pulls in `akuma-fbcon` (`fbcon` is in
+`all`), which needs the `crates/akuma-fbcon/vendor/spleen` git submodule — a
+clone over the network the first time it's fetched. `headless`
+(`storage-and-input`: NVMe, xHCI, i8042) never touches that crate, so a
+compile check, a clippy pass or a Firecracker/TCG boot gate neither needs the
+submodule nor pays for cloning it.
+
+Use the plain default (every driver: `fbcon hda i8042 kvm nvme touchpad wifi
+xhci`) only when the point of the build is to actually boot on real hardware —
+ryzen (the machine with the SVM hypervisor and a real GRUB framebuffer) or
+trashcan (the Intel test box with a serial line; it already builds `headless`
+in practice since it has no hypervisor and no framebuffer use). Table and full
+feature list: `docs/reference/build-profiles.md` § amd64 images.
+
 ## VM Access
 
 SSH on port 2222: `ssh -o StrictHostKeyChecking=no root@localhost -p 2222`
