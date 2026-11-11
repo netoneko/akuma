@@ -108,6 +108,15 @@ Concretely:
   heap-free by construction, padding included. The risk is always an
   *argument expression* that allocates before formatting starts.
 
+- **Don't** allocate while holding a console sink's lock. The allocator itself
+  prints: `akuma-alloc`'s heap monitor reports a crossed threshold through
+  `safe_print!`, and on amd64 every print reaches the framebuffer console's
+  `CONSOLE` lock (`multiboot2::mirror_byte`). An allocation made under that lock
+  that crosses a threshold re-enters the lock and spins forever. Size the
+  allocation under the lock, drop the lock, allocate, then lock again to install
+  it (`multiboot2::fb_enable_double_buffer`;
+  [`AMD64_FB_BACK_BUFFER_DEADLOCK.md`](../../archive/AMD64_FB_BACK_BUFFER_DEADLOCK.md)).
+
 Two narrow exemptions, both established by the audit rather than assumed:
 
 1. **Genuinely variable-cardinality output** — a loop over a runtime-sized

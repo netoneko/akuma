@@ -105,7 +105,7 @@ struct Framebuffer {
     height: usize,
     format: PixelFormat,
     bytes_per_pixel: usize,
-    /// The RAM copy every draw lands in once [`Framebuffer::enable_back`] has run;
+    /// The RAM copy every draw lands in once [`fb_enable_double_buffer`] has run;
     /// `None` until the heap exists (and for a mode it cannot mirror), in which
     /// case draws go straight to the scanout as they always did.
     back: Option<Back>,
@@ -130,6 +130,25 @@ struct Back {
 }
 
 impl Back {
+    /// A clean copy of `stride * height` dwords, or `None` if the heap cannot
+    /// hold it. Called **without** the console lock (see [`fb_enable_double_buffer`]).
+    fn new(stride: usize, height: usize) -> Option<Self> {
+        let len = stride.checked_mul(height)?;
+        let mut pix = alloc::vec::Vec::new();
+        let mut dlo = alloc::vec::Vec::new();
+        let mut dhi = alloc::vec::Vec::new();
+        if pix.try_reserve_exact(len).is_err()
+            || dlo.try_reserve_exact(height).is_err()
+            || dhi.try_reserve_exact(height).is_err()
+        {
+            return None;
+        }
+        pix.resize(len, 0u32);
+        dlo.resize(height, u32::MAX);
+        dhi.resize(height, 0u32);
+        Some(Self { pix, stride, dlo, dhi })
+    }
+
     #[inline]
     fn mark(&mut self, y: usize, x0: usize, x1: usize) {
         // x1 <= width < 2^32 and y < height: both checked by the callers.
@@ -143,33 +162,13 @@ impl Back {
 }
 
 impl Framebuffer {
-    /// Start mirroring draws in RAM. Needs the heap, so it is not part of
-    /// [`Framebuffer::new`]; fallible allocation, and `false` (direct drawing keeps
-    /// working) when it fails or the mode is not 32 bits per pixel on a dword pitch.
-    /// The caller repaints afterwards, since what is on the glass is not in the copy.
-    fn enable_back(&mut self) -> bool {
-        if self.back.is_some() {
-            return true;
-        }
+    /// The shape of the RAM copy this mode needs, `(dwords per row, rows)`, or
+    /// `None` for a mode it cannot mirror (not 32 bits per pixel on a dword pitch).
+    fn back_shape(&self) -> Option<(usize, usize)> {
         if self.bytes_per_pixel != 4 || !self.pitch.is_multiple_of(4) {
-            return false;
+            return None;
         }
-        let stride = self.pitch / 4;
-        let Some(len) = stride.checked_mul(self.height) else { return false };
-        let mut pix = alloc::vec::Vec::new();
-        let mut dlo = alloc::vec::Vec::new();
-        let mut dhi = alloc::vec::Vec::new();
-        if pix.try_reserve_exact(len).is_err()
-            || dlo.try_reserve_exact(self.height).is_err()
-            || dhi.try_reserve_exact(self.height).is_err()
-        {
-            return false;
-        }
-        pix.resize(len, 0u32);
-        dlo.resize(self.height, u32::MAX);
-        dhi.resize(self.height, 0u32);
-        self.back = Some(Back { pix, stride, dlo, dhi });
-        true
+        Some((self.pitch / 4, self.height))
     }
 
     fn new(fb: &akuma_multiboot2::Framebuffer) -> Option<Self> {
@@ -528,11 +527,31 @@ static CRASHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool:
 /// [`Back`]). Call once the heap exists; a no-op without a console, and a failed
 /// allocation leaves the direct-drawing console exactly as it was. Returns whether
 /// the back buffer is on, for the `[fb]` line.
+///
+/// **The allocation happens without the console lock.** The copy is `pitch * height`
+/// bytes — 34 MB at 3840x2160 — and `akuma-alloc`'s heap monitor prints when usage
+/// crosses a threshold. That print reaches [`mirror_byte`], which takes this same
+/// lock, so allocating under it deadlocked the core on a 4K panel: the boot froze
+/// after the `pmm:` line (`docs/archive/AMD64_FB_BACK_BUFFER_DEADLOCK.md`).
 pub fn fb_enable_double_buffer() -> bool {
+    let shape = {
+        let mut g = CONSOLE.lock();
+        let Some(c) = g.as_mut() else { return false };
+        let fb = c.0.surface_mut();
+        if fb.back.is_some() {
+            return true;
+        }
+        fb.back_shape()
+    };
+    let Some((stride, height)) = shape else { return false };
+    let Some(back) = Back::new(stride, height) else { return false };
     let mut g = CONSOLE.lock();
     let Some(c) = g.as_mut() else { return false };
-    if !c.0.surface_mut().enable_back() {
-        return false;
+    let fb = c.0.surface_mut();
+    // Only the boot core calls this, once; a copy installed meanwhile would be
+    // dropped here, and freeing does not print.
+    if fb.back.is_none() {
+        fb.back = Some(back);
     }
     // What is on the glass is not in the copy: redraw it all from the grid.
     c.0.repaint();
