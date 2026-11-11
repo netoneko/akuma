@@ -1,0 +1,28 @@
+[package]
+name = "akuma-drivers-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The amd64 kernel's device drivers: the wiring between the host-tested driver crates and the machine half's per-class registration seam. One feature per driver."
+
+[lints]
+workspace = true
+
+# One feature per driver. A driver whose feature is off is not compiled, and `register` does
+# not install it, so the machine half's probe for that class does nothing. `all` is what the
+# bin's default (bare-metal) image enables; `amd64/bin/Cargo.toml` names the smaller sets.
+[features]
+all = ["hda"]
+# Intel HD Audio playback behind `/dev/dsp`.
+hda = ["dep:akuma-hda", "dep:akuma-dma", "dep:akuma-pci", "dep:akuma-primitives", "dep:akuma-virtio", "dep:spinning_top"]
+
+# Kernel-only. Specs are copied from `amd64/Cargo.toml` exactly, default features included:
+# a dependency named here with more features than the kernel names would turn them on for the
+# whole kernel through feature unification.
+[target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
+akuma-kernel-amd64 = { path = "../../amd64", default-features = false }
+akuma-primitives = { path = "../akuma-primitives", optional = true }
+akuma-dma = { path = "../akuma-dma", optional = true }
+akuma-hda = { path = "../akuma-hda", optional = true }
+akuma-pci = { path = "../akuma-pci", optional = true }
+akuma-virtio = { path = "../akuma-virtio", optional = true }
+spinning_top = { version = "0.3", optional = true }

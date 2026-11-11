@@ -92,6 +92,7 @@ dependencies = [
 name = "akuma-amd64"
 version = "0.0.9"
 dependencies = [
+ "akuma-drivers-amd64",
  "akuma-kernel",
  "akuma-kernel-amd64",
  "akuma-kernel-tests-amd64",
@@ -174,6 +175,19 @@ version = "0.1.0"
 [[package]]
 name = "akuma-dns"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-drivers-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-dma",
+ "akuma-hda",
+ "akuma-kernel-amd64",
+ "akuma-pci",
+ "akuma-primitives",
+ "akuma-virtio",
+ "spinning_top",
+]
 
 [[package]]
 name = "akuma-dwi2c"
@@ -453,7 +467,6 @@ dependencies = [
  "akuma-fpcache-rw",
  "akuma-fpu-amd64",
  "akuma-gdt",
- "akuma-hda",
  "akuma-hid",
  "akuma-i2c-hid",
  "akuma-idt-amd64",

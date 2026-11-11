@@ -1135,7 +1135,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // sits after `mem::init_reserving` because `map_bar` allocates frames, and
     // it is best-effort like every other device bring-up on this path: a miss
     // prints one line and boots on. `hdatest` plays a one-second tone.
-    crate::hda::init(info.cmdline().split_ascii_whitespace().any(|t| t == "hdatest"));
+    crate::drivers::sound_init(info.cmdline().split_ascii_whitespace().any(|t| t == "hdatest"));
 
     // The SVM hypervisor seed (AKUMA_KVM.md): one `[KVM]` probe line per
     // boot; `kvmtest` on the command line runs the trivial guest. After

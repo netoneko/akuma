@@ -242,7 +242,6 @@ akuma-port = { path = "../crates/akuma-port" }
 akuma-gdt = { path = "../crates/akuma-gdt" }
 # Pure HDA register half (GCAP decode, version gate), host-tested; the metal
 # half (PCI walk, BAR0 map) lives in this target hda.rs.
-akuma-hda = { path = "../crates/akuma-hda" }
 # xHCI (USB 3.0 host controller) layout + TRB/context bit math, host-tested
 # against register values read off `00:14.0` on the reference machine. The
 # MMIO/DMA half is `src/xhci.rs`. Persistence: the only spare disk is trapped in

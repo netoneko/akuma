@@ -136,7 +136,9 @@ pub fn device_count() -> usize {
 }
 
 /// Turn on memory-space decode, I/O-space decode and (optionally) bus
-/// mastering for a device a driver is about to use. `mask_intx` also sets the
+/// mastering for a device a driver is about to use.
+///
+/// `mask_intx` also sets the
 /// Interrupt Disable bit — for a **polled** driver (no IDT vector wired for the
 /// device), which is every driver on this target: an unmasked legacy INTx from
 /// a running controller lands on an unhandled vector and takes the machine down.
@@ -263,10 +265,9 @@ pub fn map_bar_window(bar: Bar, len: u64) -> Option<akuma_primitives::mmio::Mmio
     paging::map_device_window(address, len)
 }
 
-/// Print the enumerated devices — the amd64 equivalent of an `lspci`, worth
-/// having every bare-metal boot for the same reason `machine::report` is.
 /// The whole 256-byte config image, for capability walks the stored
 /// header cannot answer.
+#[must_use]
 pub fn config_space(addr: Address) -> [u8; 256] {
     let mut out = [0u8; 256];
     read_config_space(addr, &mut out);
@@ -274,6 +275,7 @@ pub fn config_space(addr: Address) -> [u8; 256] {
 }
 
 /// Read a config-space word via its containing dword.
+#[must_use]
 pub fn read_u16_config(addr: Address, offset: u8) -> u16 {
     let d = read_u32(addr, offset & !3);
     if offset & 2 != 0 { (d >> 16) as u16 } else { d as u16 }
@@ -292,6 +294,8 @@ pub fn write_u16_config(addr: Address, offset: u8, value: u16) {
     write_u32(addr, base, d);
 }
 
+/// Print the enumerated devices — the amd64 equivalent of an `lspci`, worth
+/// having every bare-metal boot for the same reason `machine::report` is.
 pub fn report() {
     let n = device_count();
     serial::puts("  pci:  ");

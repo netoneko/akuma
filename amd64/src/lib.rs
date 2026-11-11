@@ -73,7 +73,11 @@ mod fs;
 mod futex;
 #[cfg(target_arch = "x86_64")]
 mod gdt;
-mod hda;
+/// The per-class driver seam and the services drivers may use.
+///
+/// `crates/akuma-drivers-amd64` registers into it; the machine half never names a driver.
+#[cfg(target_arch = "x86_64")]
+pub mod drivers;
 #[cfg(target_arch = "x86_64")]
 mod usermode;
 #[cfg(target_arch = "x86_64")]
@@ -294,7 +298,7 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
         pci::scan();
         pci::report();
         xhci::quiesce_all();
-        hda::init(machine::flag(hvm_start_info, "hdatest"));
+        drivers::sound_init(machine::flag(hvm_start_info, "hdatest"));
     }
 
     // Block devices, after the heap (the virtio HAL allocates DMA buffers from
