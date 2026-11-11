@@ -362,6 +362,10 @@ what is unconfirmed: [`../../archive/AKUMA_FIRECRACKER_KVM.md`](../../archive/AK
 
 * **Firecracker on `/dev/kvm`: the to-do list that ends the KVM work** is in [`../../archive/AKUMA_FIRECRACKER_KVM.md`](../../archive/AKUMA_FIRECRACKER_KVM.md) § *Before the KVM work is finished*: CPU **affinity** (placing vCPU threads and `sched_setaffinity`), the I/O APIC, `GET/SET_LAPIC`, more than one vCPU, seccomp, a kernel-stack guard, a real `HLT` block, an irqfd waker, NetBSD, and lifting the one-VM exclusivity.
 
+* **`akuma-kvm-amd64` has no host tests.** The crate is kernel-only (`cfg(target_os = "none")`), so
+  `cargo test` never sees it; only `akuma-svm-amd64`'s vocabulary and device models are host-tested.
+  Future work in [`AKUMA_MULTIARCH_ATTEMPT_0.md`](../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md)
+  § *Host tests for `akuma-kvm-amd64`*.
 * **Large guest->host transfers wedge the guest** (96 MiB+ through the relay), on the old kernel too; the host's
   `/bin/ssh` client spins while the relay's host socket stays full. Evidence and next experiments:
   [`KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE.md`](../../archive/KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE.md).

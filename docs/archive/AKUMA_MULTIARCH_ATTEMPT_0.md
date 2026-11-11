@@ -1756,3 +1756,26 @@ and `register` installs `akuma_kvm_amd64::HYPERVISOR`.
 - Stale `amd64/src/kvm/` paths in live docs and code comments (stale since `887d601f`) now point
   at the crate.
 
+### Future work: host tests for `akuma-kvm-amd64`
+
+The crate is gated to `cfg(all(target_arch = "x86_64", target_os = "none"))` like the drivers crate,
+so `cargo test` never compiles it. Its pure parts would be tested the way `akuma-svm-amd64`'s are, by
+moving them down into that crate (or a sibling with no kernel dependency) and leaving the wiring here.
+Candidates, by how little they touch the kernel (counted 2026-11-11):
+
+- **`api/platform.rs`** (238 lines, no `services::`): the in-kernel PIT/PIC/LAPIC aggregate behind
+  `CREATE_IRQCHIP` and its `offer`/`accept`/`next_event_us`. It already depends only on
+  `akuma-svm-amd64`'s models and two `linux.rs` items.
+- **`relay.rs`** (703 lines, no `services::`): the gateway's outbound TCP/DNS/forward state against host
+  sockets. Its decisions (slot lifecycle, `OutPhase` transitions) can be split from the `akuma_net::socket`
+  calls behind a small trait, the `akuma-net-yarn` "callers supply only the effects" shape.
+- **`linux.rs` pure functions:** `get_reg`/`set_reg` (the ModRM register-number map over
+  `GuestRegs` + VMCB), `init_vmcb`, `set_pvh_state`/`set_startup_state` (checkable against
+  `akuma-svm-amd64`'s §15.5.1 consistency checks), `spec_cmdline`/`cmdline_with_tsc`, and `mmio_emulate`
+  over a fake `MmioDev`.
+- **ioctl argument decoding in `api.rs` / `api/vcpu.rs`** (memslot checks, `KVM_SET_REGS` and
+  `KVM_SET_SREGS` layouts) where it is not already in `akuma-kvm-abi`.
+
+None of this needs SVM hardware, which is the point: today every change to these paths is
+compile-only until it reaches the ryzen.
+
