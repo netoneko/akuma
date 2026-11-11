@@ -3,15 +3,29 @@
 //!
 //! Moved out of `usermode.rs` 2026-11-10 (W2 of
 //! `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`), unchanged: that file was 9.3 kLoC
-//! and a third of it was tests. Declared under `cfg(not(feature = "no-tests"))`,
-//! so nothing here reaches a `no-tests` image; the gates that used to sit on each
-//! item are the one gate on the module. It is a child of `usermode` rather than a
-//! sibling because the tests reach its private state — `Image`'s fields, `PROCS`,
-//! `reap_exec_process` — and a child sees that without widening anything.
+//! and a third of it was tests. Moved again 2026-11-11, out of the kernel into this
+//! crate, unchanged but for the paths. The kernel state the tests reach (`Image`'s
+//! fields, the spawn table, `reap_exec_process`, ...) is `pub` inside the kernel's
+//! private `usermode` module and re-exported only through
+//! `akuma_kernel_amd64::testing::usermode`, which is all this file sees.
 
-use super::dispatch::to_glue;
-use super::*;
+use akuma_kernel_amd64::testing as k;
+use akuma_kernel_amd64::testing::usermode::*;
+use akuma_kernel_amd64::testing::{loader, serial};
+use akuma_mmap::PhysFrame;
+use akuma_mmu::{PteProt, UserAddressSpace};
 use akuma_selftest::Suite;
+use akuma_syscalls_abi::Syscall;
+use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
+
+/// The two constructors only the suite uses, as a trait: `Image` is the kernel's type, and a
+/// crate cannot add inherent methods to a type it does not own. With the trait in scope the
+/// call sites still read `Image::new(..)` / `Image::from_elf(..)`.
+trait TestImage: Sized {
+    fn new(msg: &[u8], rounds: u32, delay: u32, status: u32) -> Option<Self>;
+    fn from_elf(image: &[u8]) -> Result<(Self, loader::LoadedImage), &'static str>;
+}
 
 /// Where the test's user code and stack live.
 ///
@@ -143,7 +157,7 @@ fn build_user_program(
     n
 }
 
-impl Image {
+impl TestImage for Image {
     /// Build an image that prints `msg` `rounds` times then exits with
     /// `status`.
     ///
@@ -163,7 +177,7 @@ impl Image {
         // whatever the ledger has taken on — the explicit `space.free()` +
         // `free_all_frames` pair this replaces.
         let (Some(mut code), Some(stack)) =
-            (crate::phys::FreshFrame::alloc_zeroed(), crate::phys::FreshFrame::alloc_zeroed())
+            (k::phys::FreshFrame::alloc_zeroed(), k::phys::FreshFrame::alloc_zeroed())
         else {
             return None;
         };
@@ -190,9 +204,7 @@ impl Image {
             regions: Vec::new(),
         })
     }
-}
 
-impl Image {
     /// Build a process from a linked ELF image.
     ///
     /// The address space comes back **from** the loader rather than going into
@@ -218,7 +230,7 @@ impl Image {
 /// `threadprobe` both `mmap`. An unregistered self-test process would have got
 /// `None` from the accessors and failed with no explanation.
 ///
-/// Registered before [`crate::sched::publish_task`], the same order every other
+/// Registered before [`k::sched::publish_task`], the same order every other
 /// caller uses, and returning the `(pid, task_slot)` pair the teardown needs.
 /// The parent is pid 1: these run before `run_init`, so there is no real
 /// parent, and 1 is what `current_pid()` answers for the boot task driving them.
@@ -235,7 +247,7 @@ fn start_test_process(
     cmdline.extend_from_slice(name.as_bytes());
     cmdline.push(0);
     register_exec_process(pid, 1, task_slot, image, image_top, name, &cmdline, None, None, None);
-    crate::sched::publish_task(task_slot);
+    k::sched::publish_task(task_slot);
     Some((pid, task_slot))
 }
 
@@ -256,7 +268,7 @@ fn wait_test_exit(pid: u32, spins: u64) -> u64 {
     let mut n = 0u64;
     while !ch.has_exited() && n < spins {
         n += 1;
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
     if ch.has_exited() { i64::from(ch.exit_code()).cast_unsigned() } else { u64::MAX }
 }
@@ -365,7 +377,7 @@ pub fn spawn_test(t: &mut Suite) {
     }
 
     // Non-blocking reads so the driver keeps polling `waitpid` too.
-    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+    k::fd::sys_fcntl(stdout_fd, 4, 0x800);
 
     let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut status = u64::MAX;
@@ -376,7 +388,7 @@ pub fn spawn_test(t: &mut Suite) {
         if spins > 500_000 {
             break;
         }
-        let n = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        let n = k::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
         if n != 0 && n < ERRNO_FLOOR {
             out.extend_from_slice(&buf[..n as usize]);
         }
@@ -385,7 +397,7 @@ pub fn spawn_test(t: &mut Suite) {
             status = ((st >> 8) & 0xff) as u64;
             break;
         }
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
 
     t.check(
@@ -406,10 +418,10 @@ pub fn spawn_test(t: &mut Suite) {
     // to report EOF *about*.
     t.check_eq(
         "spawn: reading the child's stdout after the reap is EBADF",
-        crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64),
-        crate::fd::errno::EBADF,
+        k::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        k::fd::errno::EBADF,
     );
-    crate::fd::sys_close(stdout_fd);
+    k::fd::sys_close(stdout_fd);
     t.check_eq(
         "spawn: teardown leaks nothing",
         akuma_pmm::free_count() as u64,
@@ -443,16 +455,16 @@ pub fn spawn_stale_group_state_test(t: &mut Suite) {
         t.check("stale group: a free spawn slot to poison", false);
         return;
     };
-    crate::thread::set_group_exit_status(next, (-(SIGTERM.cast_signed())).cast_unsigned());
-    crate::thread::set_group_exiting(next);
+    k::thread::set_group_exit_status(next, (-(SIGTERM.cast_signed())).cast_unsigned());
+    k::thread::set_group_exiting(next);
 
     let path = b"/bin/hello\0";
     let arg0 = b"hello\0";
     let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
     let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
     if !t.check("stale group: sys_spawn returned a handle", r < ERRNO_FLOOR) {
-        crate::thread::clear_group_exit_status(next);
-        crate::thread::clear_group_exiting(next);
+        k::thread::clear_group_exit_status(next);
+        k::thread::clear_group_exiting(next);
         return;
     }
     let pid = (r & 0xFFFF_FFFF) as u32;
@@ -462,20 +474,20 @@ pub fn spawn_stale_group_state_test(t: &mut Suite) {
         spawn_row_of(pid).map_or(u64::MAX, |off| (off + SPAWN_SLOT_BASE) as u64),
         next as u64,
     );
-    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+    k::fd::sys_fcntl(stdout_fd, 4, 0x800);
 
     let mut buf = [0u8; 64];
     let mut st: i32 = -1;
     let mut reaped = false;
     for _ in 0..500_000u32 {
-        let _ = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        let _ = k::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
         if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
             reaped = true;
             break;
         }
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
-    crate::fd::sys_close(stdout_fd);
+    k::fd::sys_close(stdout_fd);
     t.check("stale group: the child was reaped", reaped);
     // Two checks, so a failure says which half broke: a signal death here is
     // the stale-status kill itself; a wrong exit code with no signal is
@@ -511,14 +523,14 @@ pub fn spawn_stale_group_state_test(t: &mut Suite) {
 /// anywhere in this test would let a hardcoded answer pass it, which is the
 /// same reason the doc's own reproduction uses that window.
 pub fn winsize_to_child_test(t: &mut Suite) {
-    use crate::fd::errno;
+    use k::fd::errno;
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
     const TIOCGWINSZ: u64 = 0x5413;
     const TIOCSWINSZ: u64 = 0x5414;
     const ROWS: u16 = 50;
     const COLS: u16 = 132;
 
-    if crate::fs::read_file("/bin/hello").is_err() {
+    if k::fs::read_file("/bin/hello").is_err() {
         t.note("winsize: /bin/hello not on the disk; skipped", 0);
         return;
     }
@@ -542,7 +554,7 @@ pub fn winsize_to_child_test(t: &mut Suite) {
     let winsz: [u16; 4] = [ROWS, COLS, 0, 0];
     t.check_eq(
         "winsize: TIOCSWINSZ on the child's stdout is accepted",
-        crate::fd::sys_ioctl(stdout_fd, TIOCSWINSZ, winsz.as_ptr() as u64),
+        k::fd::sys_ioctl(stdout_fd, TIOCSWINSZ, winsz.as_ptr() as u64),
         0,
     );
 
@@ -586,7 +598,7 @@ pub fn winsize_to_child_test(t: &mut Suite) {
     let mut got = [0u16; 4];
     t.check_eq(
         "winsize: TIOCGWINSZ on a console fd succeeds",
-        crate::fd::sys_ioctl(0, TIOCGWINSZ, got.as_mut_ptr() as u64),
+        k::fd::sys_ioctl(0, TIOCGWINSZ, got.as_mut_ptr() as u64),
         0,
     );
     t.check_eq(
@@ -606,7 +618,7 @@ pub fn winsize_to_child_test(t: &mut Suite) {
     // copies four bytes in from userspace before it touches any state.
     t.check_eq(
         "winsize: an unreadable TIOCSWINSZ argument is EFAULT",
-        crate::fd::sys_ioctl(stdout_fd, TIOCSWINSZ, 0x1000),
+        k::fd::sys_ioctl(stdout_fd, TIOCSWINSZ, 0x1000),
         errno::EFAULT,
     );
 
@@ -620,7 +632,7 @@ pub fn winsize_to_child_test(t: &mut Suite) {
     t.check(
         "winsize: the parent's stdout is a ChildStdout naming this child",
         matches!(
-            crate::fd::table_get(stdout_fd),
+            k::fd::table_get(stdout_fd),
             Some(akuma_exec::process::FileDescriptor::ChildStdout(p)) if p == pid
         ),
     );
@@ -634,17 +646,17 @@ pub fn winsize_to_child_test(t: &mut Suite) {
         if spins > 500_000 {
             break;
         }
-        let _ = crate::fd::sys_read(stdout_fd, sink.as_mut_ptr() as u64, sink.len() as u64);
+        let _ = k::fd::sys_read(stdout_fd, sink.as_mut_ptr() as u64, sink.len() as u64);
         let mut st: i32 = -1;
         if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
             break;
         }
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
-    crate::fd::sys_close(stdout_fd);
+    k::fd::sys_close(stdout_fd);
     t.check(
         "winsize: and names nobody once the descriptor is closed",
-        crate::fd::table_get(stdout_fd).is_none(),
+        k::fd::table_get(stdout_fd).is_none(),
     );
 }
 
@@ -675,11 +687,11 @@ pub fn session_terminal_is_private_test(t: &mut Suite) {
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
     const ISIG: u32 = 0x1;
 
-    if crate::fs::read_file("/bin/hello").is_err() {
+    if k::fs::read_file("/bin/hello").is_err() {
         t.note("session-term: /bin/hello not on the disk; skipped", 0);
         return;
     }
-    let Some(console_ts) = crate::console::terminal_state() else {
+    let Some(console_ts) = k::console::terminal_state() else {
         t.note("session-term: no console terminal state; skipped", 0);
         return;
     };
@@ -732,14 +744,14 @@ pub fn session_terminal_is_private_test(t: &mut Suite) {
         if spins > 500_000 {
             break;
         }
-        let _ = crate::fd::sys_read(stdout_fd, sink.as_mut_ptr() as u64, sink.len() as u64);
+        let _ = k::fd::sys_read(stdout_fd, sink.as_mut_ptr() as u64, sink.len() as u64);
         let mut st: i32 = -1;
         if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
             break;
         }
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
-    crate::fd::sys_close(stdout_fd);
+    k::fd::sys_close(stdout_fd);
 }
 
 /// The `console_notify` syscall (Akuma-private 322), the kernel half of
@@ -749,7 +761,7 @@ pub fn session_terminal_is_private_test(t: &mut Suite) {
 /// length is `a2`, that a zero length is `EINVAL` and a bad pointer is `EFAULT`,
 /// and that the number resolves at all rather than falling through to `ENOSYS`.
 pub fn console_notify_test(t: &mut Suite) {
-    use crate::fd::errno;
+    use k::fd::errno;
     const NR: u64 = 0x1000 + 322;
 
     t.check_eq(
@@ -778,7 +790,7 @@ pub fn console_notify_test(t: &mut Suite) {
 pub fn busybox_test(t: &mut Suite) {
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
 
-    if crate::fs::read_file("/bin/busybox").is_err() {
+    if k::fs::read_file("/bin/busybox").is_err() {
         t.note("busybox: not on the disk; skipped", 0);
         return;
     }
@@ -798,7 +810,7 @@ pub fn busybox_test(t: &mut Suite) {
     }
     let pid = (r & 0xFFFF_FFFF) as u32;
     let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
-    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+    k::fd::sys_fcntl(stdout_fd, 4, 0x800);
 
     let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut status = u64::MAX;
@@ -809,7 +821,7 @@ pub fn busybox_test(t: &mut Suite) {
         if spins > 2_000_000 {
             break;
         }
-        let n = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        let n = k::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
         if n != 0 && n < ERRNO_FLOOR {
             out.extend_from_slice(&buf[..n as usize]);
         }
@@ -818,9 +830,9 @@ pub fn busybox_test(t: &mut Suite) {
             status = ((st >> 8) & 0xff) as u64;
             break;
         }
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
-    crate::fd::sys_close(stdout_fd);
+    k::fd::sys_close(stdout_fd);
 
     t.check_eq("busybox: exited 0", status, 0);
     t.check(
@@ -844,7 +856,7 @@ pub fn busybox_test(t: &mut Suite) {
 pub fn execve_test(t: &mut Suite) {
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
 
-    if crate::fs::read_file("/bin/busybox").is_err() || crate::fs::read_file("/bin/sh").is_err() {
+    if k::fs::read_file("/bin/busybox").is_err() || k::fs::read_file("/bin/sh").is_err() {
         t.note("execve: busybox /bin/sh not on the disk; skipped", 0);
         return;
     }
@@ -863,7 +875,7 @@ pub fn execve_test(t: &mut Suite) {
     }
     let pid = (r & 0xFFFF_FFFF) as u32;
     let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
-    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+    k::fd::sys_fcntl(stdout_fd, 4, 0x800);
 
     let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut status = u64::MAX;
@@ -874,7 +886,7 @@ pub fn execve_test(t: &mut Suite) {
         if spins > 3_000_000 {
             break;
         }
-        let n = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        let n = k::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
         if n != 0 && n < ERRNO_FLOOR {
             out.extend_from_slice(&buf[..n as usize]);
         }
@@ -883,9 +895,9 @@ pub fn execve_test(t: &mut Suite) {
             status = ((st >> 8) & 0xff) as u64;
             break;
         }
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
-    crate::fd::sys_close(stdout_fd);
+    k::fd::sys_close(stdout_fd);
 
     t.check_eq("execve: `sh -c \"uname -a\"` exited 0", status, 0);
     t.check(
@@ -915,7 +927,7 @@ fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
     }
     let pid = (r & 0xFFFF_FFFF) as u32;
     let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
-    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+    k::fd::sys_fcntl(stdout_fd, 4, 0x800);
 
     let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut status = u64::MAX;
@@ -926,7 +938,7 @@ fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
         if spins > 4_000_000 {
             break;
         }
-        let n = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        let n = k::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
         if n != 0 && n < ERRNO_FLOOR {
             out.extend_from_slice(&buf[..n as usize]);
         }
@@ -935,9 +947,9 @@ fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
             status = ((st >> 8) & 0xff) as u64;
             break;
         }
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
-    crate::fd::sys_close(stdout_fd);
+    k::fd::sys_close(stdout_fd);
     Some((status, out))
 }
 
@@ -950,7 +962,7 @@ fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
 /// call's temporary mask. `ENOSYS` (this kernel's answer until 2026-11-02)
 /// made ash's loop spin with every signal blocked.
 pub fn sigsuspend_test(t: &mut Suite) {
-    if crate::fs::read_file("/bin/busybox").is_err() || crate::fs::read_file("/bin/sh").is_err() {
+    if k::fs::read_file("/bin/busybox").is_err() || k::fs::read_file("/bin/sh").is_err() {
         t.note("sigsuspend: busybox /bin/sh not on the disk; skipped", 0);
         return;
     }
@@ -986,7 +998,7 @@ pub fn sigsuspend_test(t: &mut Suite) {
 /// filesystem**, not by trusting the shell's exit status: the pre-fix failure
 /// exited 0 and left an empty file, so a status check alone scores it green.
 pub fn redirect_test(t: &mut Suite) {
-    if crate::fs::read_file("/bin/busybox").is_err() || crate::fs::read_file("/bin/sh").is_err() {
+    if k::fs::read_file("/bin/busybox").is_err() || k::fs::read_file("/bin/sh").is_err() {
         t.note("redirect: busybox /bin/sh not on the disk; skipped", 0);
         return;
     }
@@ -1176,7 +1188,7 @@ pub fn redirect_test(t: &mut Suite) {
         return;
     };
     t.check_eq("redirect: `echo … > file` exited 0", status, 0);
-    let written = crate::fs::read_file("/tmp/redir.txt");
+    let written = k::fs::read_file("/tmp/redir.txt");
     t.check("redirect: the redirected file exists", written.is_ok());
     t.check(
         "redirect: the redirected bytes reached the file",
@@ -1195,7 +1207,7 @@ pub fn redirect_test(t: &mut Suite) {
     };
     t.check_eq("redirect: `>` for the append case exited 0", astatus, 0);
     let _ = run_sh_capture(b"echo TWO >> /tmp/app.txt\0");
-    let appended = crate::fs::read_file("/tmp/app.txt");
+    let appended = k::fs::read_file("/tmp/app.txt");
     t.check(
         "redirect: `>>` kept the first line",
         appended.as_ref().is_ok_and(|d| d.windows(3).any(|w| w == b"ONE")),
@@ -1264,7 +1276,7 @@ pub fn redirect_test(t: &mut Suite) {
     // *exit status* is 0 proves nothing about the bytes.
     let _ = run_sh_capture(b"echo AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA > /tmp/tr.txt\0");
     let _ = run_sh_capture(b"echo x > /tmp/tr.txt\0");
-    let truncated = crate::fs::read_file("/tmp/tr.txt");
+    let truncated = k::fs::read_file("/tmp/tr.txt");
     t.check_eq(
         "redirect: `>` truncates a longer file to just the new bytes",
         truncated.as_ref().map_or(u64::MAX, |d| d.len() as u64),
@@ -1275,7 +1287,7 @@ pub fn redirect_test(t: &mut Suite) {
         truncated.as_ref().is_ok_and(|d| !d.windows(2).any(|w| w == b"AA")),
     );
     let _ = run_sh_capture(b": > /tmp/empty.txt\0");
-    let empty = crate::fs::read_file("/tmp/empty.txt");
+    let empty = k::fs::read_file("/tmp/empty.txt");
     t.check("redirect: a zero-byte `>` still creates the file", empty.is_ok());
     t.check_eq(
         "redirect: and creates it empty",
@@ -1285,7 +1297,7 @@ pub fn redirect_test(t: &mut Suite) {
     let _ = run_sh_capture(b"echo quiet 2> /tmp/noerr.txt\0");
     t.check(
         "redirect: `2>` creates its file even when nothing is written to it",
-        crate::fs::read_file("/tmp/noerr.txt").is_ok(),
+        k::fs::read_file("/tmp/noerr.txt").is_ok(),
     );
 
     t.check_eq(
@@ -1320,14 +1332,14 @@ pub fn redirect_test(t: &mut Suite) {
 /// is genuinely this caller's — the same relationship a shell has to its own.
 pub fn wait4_ownership_test(t: &mut Suite) {
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
-    use crate::fd::errno;
+    use k::fd::errno;
 
     // No children yet: the answer must be ECHILD, not "block" and not ESRCH.
     let mut st: i32 = -1;
     let r = sys_waitpid(u64::MAX, core::ptr::addr_of_mut!(st) as u64, 0);
     t.check_eq("wait4: no children -> ECHILD", r, errno::ECHILD);
 
-    if crate::fs::read_file("/bin/hello").is_err() {
+    if k::fs::read_file("/bin/hello").is_err() {
         t.note("wait4: /bin/hello not on the disk; ownership half skipped", 0);
         return;
     }
@@ -1355,9 +1367,9 @@ pub fn wait4_ownership_test(t: &mut Suite) {
         if r != 0 {
             break r;
         }
-        crate::sched::yield_now();
+        k::sched::yield_now();
     };
-    crate::fd::sys_close(stdout_fd);
+    k::fd::sys_close(stdout_fd);
     t.check_eq("wait4: -1 reaps our own child by pid", reaped, u64::from(pid));
 
     // And once it is reaped we are childless again. This is the assertion that
@@ -1371,7 +1383,7 @@ pub fn wait4_ownership_test(t: &mut Suite) {
 pub fn fork_test(t: &mut Suite) {
     const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
 
-    if crate::fs::read_file("/bin/busybox").is_err() || crate::fs::read_file("/bin/sh").is_err() {
+    if k::fs::read_file("/bin/busybox").is_err() || k::fs::read_file("/bin/sh").is_err() {
         t.note("fork: busybox /bin/sh not on the disk; skipped", 0);
         return;
     }
@@ -1386,7 +1398,7 @@ pub fn fork_test(t: &mut Suite) {
     }
     let pid = (r & 0xFFFF_FFFF) as u32;
     let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
-    crate::fd::sys_fcntl(stdout_fd, 4, 0x800);
+    k::fd::sys_fcntl(stdout_fd, 4, 0x800);
 
     let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let mut status = u64::MAX;
@@ -1397,7 +1409,7 @@ pub fn fork_test(t: &mut Suite) {
         if spins > 4_000_000 {
             break;
         }
-        let n = crate::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+        let n = k::fd::sys_read(stdout_fd, buf.as_mut_ptr() as u64, buf.len() as u64);
         if n != 0 && n < ERRNO_FLOOR {
             out.extend_from_slice(&buf[..n as usize]);
         }
@@ -1406,9 +1418,9 @@ pub fn fork_test(t: &mut Suite) {
             status = ((st >> 8) & 0xff) as u64;
             break;
         }
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
-    crate::fd::sys_close(stdout_fd);
+    k::fd::sys_close(stdout_fd);
 
     t.check_eq("fork: `sh -c \"uname; echo DONE\"` exited 0", status, 0);
     t.check(
@@ -1531,12 +1543,12 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     // x86_64 288 is `accept4`, the only accept mio (so tokio) ever calls. It
     // had no row until 2026-09-23 and answered `ENOSYS`; fd 0 is not a
     // socket, so a row that reaches `sock::sys_accept4` says `ENOTSOCK`.
-    t.check_eq("dispatch: accept4 (288) reaches the socket layer", d(288), crate::fd::errno::ENOTSOCK);
+    t.check_eq("dispatch: accept4 (288) reaches the socket layer", d(288), k::fd::errno::ENOTSOCK);
     t.check_eq("dispatch: glue accepts setgid", d(106), 0);
     t.check_eq("dispatch: glue accepts capset", d(126), 0);
-    t.check_eq("dispatch: capget with a NULL header is EFAULT", d(125), crate::fd::errno::EFAULT);
+    t.check_eq("dispatch: capget with a NULL header is EFAULT", d(125), k::fd::errno::EFAULT);
     // `fallocate(0, 0, 0, 0)`: a row that reaches glue says `EINVAL` (len 0); no row says `ENOSYS`.
-    t.check_eq("dispatch: fallocate (285) reaches glue", d(285), crate::fd::errno::EINVAL);
+    t.check_eq("dispatch: fallocate (285) reaches glue", d(285), k::fd::errno::EINVAL);
     // `getgroups` is the pair that makes the two-number shape earn itself:
     // asm-generic 158 is `getgroups`, x86_64 158 is `arch_prctl`, and this
     // kernel answers both. `size == 0` is the probe form and must report the
@@ -1600,13 +1612,13 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     const CLOCK_MONOTONIC: u64 = 1;
     let mut ts = [0i64; 2];
     let r1 = syscall_dispatch(228, CLOCK_MONOTONIC, ts.as_mut_ptr() as u64, 0, 0, 0, 0);
-    let kernel_us = crate::net::uptime_us();
+    let kernel_us = k::net::uptime_us();
     let syscall_us = (ts[0].cast_unsigned()) * 1_000_000 + (ts[1].cast_unsigned()) / 1_000;
     t.check_eq("dispatch: glue answers clock_gettime", r1, 0);
     t.check("dispatch: the monotonic clock is not stuck at zero", syscall_us != 0);
     t.check(
         "dispatch: and it is this kernel's clock, not another one",
-        kernel_us.abs_diff(syscall_us) <= u64::from(crate::lapic::US_PER_TICK_TARGET),
+        kernel_us.abs_diff(syscall_us) <= u64::from(k::lapic::US_PER_TICK_TARGET),
     );
 
     // `prlimit64(0, RLIMIT_STACK, NULL, &old)`. The old arm was `=> 0` and
@@ -1628,7 +1640,7 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     // that was correct only because it was dead.
     t.check(
         "dispatch: RLIMIT_STACK is the user stack, not the kernel one",
-        rlim[0] != crate::sched::STACK_SIZE as u64,
+        rlim[0] != k::sched::STACK_SIZE as u64,
     );
 
     // `getrandom(buf, len, 0)` through glue, which reaches `RDRAND` only via
@@ -1772,8 +1784,8 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     // A live `msgget`/`msgsnd`/`msgrcv` round trip, IPC_PRIVATE so it cannot
     // collide with anything else the suite creates.
     let msqid = syscall_dispatch(68, 0, 0o600, 0, 0, 0, 0);
-    t.check("dispatch: glue accepts msgget(IPC_PRIVATE)", !crate::fd::errno::is_err(msqid));
-    if !crate::fd::errno::is_err(msqid) {
+    t.check("dispatch: glue accepts msgget(IPC_PRIVATE)", !k::fd::errno::is_err(msqid));
+    if !k::fd::errno::is_err(msqid) {
         #[repr(C)]
         struct Msgbuf { mtype: i64, data: [u8; 5] }
         let mut out = Msgbuf { mtype: 0, data: [0; 5] };
@@ -1810,12 +1822,12 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
 
     // A live tmpfs mount/write/unmount round trip, through the real
     // dispatcher for `mount`/`umount2` and the same native VFS helpers the
-    // redirect suite above uses to observe the effect (`crate::fs::*`,
+    // redirect suite above uses to observe the effect (`k::fs::*`,
     // `akuma_vfs_glue`'s facade) rather than a hand-rolled openat/read/write
     // sequence. The disk image survives a boot, so clear any leftover before
     // creating it, same discipline as the symlink probe below.
-    let _ = crate::fs::remove_dir("/mount-probe");
-    let dir_ok = crate::fs::create_dir("/mount-probe").is_ok();
+    let _ = k::fs::remove_dir("/mount-probe");
+    let dir_ok = k::fs::create_dir("/mount-probe").is_ok();
     t.check("mount: probe directory created", dir_ok);
     if dir_ok {
         let mount_target = b"/mount-probe\0";
@@ -1830,14 +1842,14 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
             0,
         );
         t.check_eq("dispatch: glue accepts mount(tmpfs)", mount_rc, 0);
-        if !crate::fd::errno::is_err(mount_rc) {
+        if !k::fd::errno::is_err(mount_rc) {
             t.check(
                 "mount: a file written after mounting lands on the new tmpfs",
-                crate::fs::write_file("/mount-probe/hello.txt", b"MOUNTOK").is_ok(),
+                k::fs::write_file("/mount-probe/hello.txt", b"MOUNTOK").is_ok(),
             );
             t.check(
                 "mount: and reads back the exact bytes",
-                crate::fs::read_file("/mount-probe/hello.txt").is_ok_and(|d| d == b"MOUNTOK"),
+                k::fs::read_file("/mount-probe/hello.txt").is_ok_and(|d| d == b"MOUNTOK"),
             );
             let umount_rc = syscall_dispatch(166, mount_target.as_ptr() as u64, 0, 0, 0, 0, 0);
             t.check_eq("dispatch: glue accepts umount2", umount_rc, 0);
@@ -1847,12 +1859,12 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
             // filesystem, not a write straight through to `/mount-probe`.
             t.check(
                 "mount: the file is gone once the tmpfs is unmounted",
-                crate::fs::read_file("/mount-probe/hello.txt").is_err(),
+                k::fs::read_file("/mount-probe/hello.txt").is_err(),
             );
         }
         t.check(
             "mount: cleanup removes the probe directory",
-            crate::fs::remove_dir("/mount-probe").is_ok(),
+            k::fs::remove_dir("/mount-probe").is_ok(),
         );
     }
 
@@ -1964,7 +1976,7 @@ pub fn identity_cost_test(t: &mut Suite) {
     };
     let image = Image { space, entry: 0, stack: 0, regions: Vec::new() };
     let pid = alloc_pid();
-    let task = crate::sched::current_task();
+    let task = k::sched::current_task();
     register_exec_process(pid, 1, task, image, 0, "cost-probe", b"cost-probe\0", None, None, None);
 
     if !t.check("identity: the running task resolves to its process", current_process().is_some()) {
@@ -2029,7 +2041,7 @@ pub fn smoke_test(t: &mut Suite) {
     // address resolves to different frames, and to nothing in the kernel's space.
     let pa_a = a.space.translate(USER_CODE_VA);
     let pa_b = b.space.translate(USER_CODE_VA);
-    let pa_k = crate::paging::translate(USER_CODE_VA);
+    let pa_k = k::paging::translate(USER_CODE_VA);
 
     let (Some(a), Some(b)) = (
         start_test_process(0, a, 0, "ring3-a"),
@@ -2043,9 +2055,9 @@ pub fn smoke_test(t: &mut Suite) {
     serial::puts("  -- userspace output follows --\n");
     // Drive the round-robin from the boot task until both processes finish.
     let mut spins = 0u64;
-    while !crate::sched::all_user_tasks_finished() && spins < 10_000 {
+    while !k::sched::all_user_tasks_finished() && spins < 10_000 {
         spins += 1;
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
 
     t.check("ring3: both spaces map the test VA", pa_a.is_some() && pa_b.is_some());
@@ -2116,13 +2128,13 @@ pub fn preempt_test(t: &mut Suite) {
     t.check("preempt: processes spawned", true);
 
     serial::puts("  -- userspace output follows (no yields) --\n");
-    crate::lapic::start_timer();
+    k::lapic::start_timer();
     let mut spins = 0u64;
-    while !crate::sched::all_user_tasks_finished() && spins < 100_000 {
+    while !k::sched::all_user_tasks_finished() && spins < 100_000 {
         spins += 1;
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
-    crate::lapic::stop_timer();
+    k::lapic::stop_timer();
 
     let len = WRITE_SEQ_LEN.load(Ordering::Relaxed).min(WRITE_SEQ.len() as u64);
     let switches = (base + 1..len)
@@ -2164,7 +2176,7 @@ pub fn smp_parallel_test(t: &mut Suite) {
     const ROUNDS: u32 = 3;
     const DELAY: u32 = 8_000_000;
 
-    if crate::smp::online_cpus() < 2 {
+    if k::smp::online_cpus() < 2 {
         t.note("smp: one core online, ring-3 parallelism check skipped", 1);
         return;
     }
@@ -2191,13 +2203,13 @@ pub fn smp_parallel_test(t: &mut Suite) {
     t.check("smp ring3: processes spawned", true);
 
     serial::puts("  -- userspace output follows (two cores) --\n");
-    crate::lapic::start_timer();
+    k::lapic::start_timer();
     let mut spins = 0u64;
-    while !crate::sched::all_user_tasks_finished() && spins < 100_000_000 {
+    while !k::sched::all_user_tasks_finished() && spins < 100_000_000 {
         spins += 1;
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
-    crate::lapic::stop_timer();
+    k::lapic::stop_timer();
 
     let len = WRITE_SEQ_LEN.load(Ordering::Relaxed).min(WRITE_SEQ.len() as u64);
     let cpus = (base..len).fold(0u64, |acc, i| {
@@ -2316,7 +2328,7 @@ pub fn elf_test(t: &mut Suite) {
     // From the filesystem when there is one. This is the whole point of the
     // stage: the bytes came off a disk the kernel discovered, through a
     // filesystem it mounted, found by path — rather than out of its own `.rodata`.
-    let from_disk = crate::fs::read_file("/bin/hello");
+    let from_disk = k::fs::read_file("/bin/hello");
     let image: &[u8] = if let Ok(bytes) = from_disk.as_deref() {
         {
             // The embedded copy and the on-disk copy come from two different
@@ -2484,7 +2496,7 @@ pub fn elf_test(t: &mut Suite) {
 /// `Rust std`'s spawn and got `ENOSYS`, which surfaced as
 /// `could not exec the linker` (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
 fn socketpair_test(t: &mut Suite) {
-    use crate::fd::errno;
+    use k::fd::errno;
 
     // The row itself. `53` is x86_64's number and the one a program sends.
     t.check(
@@ -2516,7 +2528,7 @@ fn socketpair_test(t: &mut Suite) {
     );
     t.check_eq(
         "socketpair: b reads what a wrote",
-        crate::fd::sys_read(b, got.as_mut_ptr() as u64, 4),
+        k::fd::sys_read(b, got.as_mut_ptr() as u64, 4),
         4,
     );
     t.check("socketpair: and the bytes match", got == msg);
@@ -2530,18 +2542,18 @@ fn socketpair_test(t: &mut Suite) {
     );
     t.check_eq(
         "socketpair: a reads it",
-        crate::fd::sys_read(a, got.as_mut_ptr() as u64, 4),
+        k::fd::sys_read(a, got.as_mut_ptr() as u64, 4),
         4,
     );
     t.check("socketpair: and those bytes match too", got == back);
 
     // The close path runs `unix_sock_close` and both pipe closes — the hooks
     // that were `not_wired!` panics until 2026-09-12.
-    t.check_eq("socketpair: closing one end", crate::fd::sys_close(a), 0);
-    t.check_eq("socketpair: closing the other", crate::fd::sys_close(b), 0);
+    t.check_eq("socketpair: closing one end", k::fd::sys_close(a), 0);
+    t.check_eq("socketpair: closing the other", k::fd::sys_close(b), 0);
     t.check_eq(
         "socketpair: a closed endpoint is EBADF",
-        crate::fd::sys_read(a, got.as_mut_ptr() as u64, 4),
+        k::fd::sys_read(a, got.as_mut_ptr() as u64, 4),
         errno::EBADF,
     );
 
@@ -2717,7 +2729,7 @@ pub fn fdprobe_test(t: &mut Suite) {
     /// what each one claims.
     const ALL_OK: u64 = 0xFFF;
 
-    let Ok(image) = crate::fs::read_file("/bin/fdprobe") else {
+    let Ok(image) = k::fs::read_file("/bin/fdprobe") else {
         t.note("fdprobe: not on the disk; skipped", 0);
         return;
     };
@@ -2850,9 +2862,9 @@ pub fn thread_test(t: &mut Suite) {
 
     // No thread of the probe may outlive it. `run_process` drains before it
     // finishes, so a non-zero count here means that drain is not working —
-    // which is the use-after-free of a page table that `crate::thread`'s
+    // which is the use-after-free of a page table that `k::thread`'s
     // lifetime rule exists to prevent, seen before it can happen.
-    t.check_eq("thread: no thread outlived the process", crate::thread::live_count(5) as u64, 0);
+    t.check_eq("thread: no thread outlived the process", k::thread::live_count(5) as u64, 0);
 
     finish_test_process(started.0, started.1);
     t.check_eq(
@@ -2912,17 +2924,17 @@ pub fn kill_test(t: &mut Suite) {
     // Let it reach the state: three workers registered, then a few hundred
     // more rounds so the parkers are parked and the spinner has been ticked.
     let mut spins = 0u64;
-    while crate::thread::live_count(SLOT) < WORKERS && spins < 200_000 {
+    while k::thread::live_count(SLOT) < WORKERS && spins < 200_000 {
         spins += 1;
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
-    t.check_eq("kill: the probe's threads came up", crate::thread::live_count(SLOT) as u64, WORKERS as u64);
+    t.check_eq("kill: the probe's threads came up", k::thread::live_count(SLOT) as u64, WORKERS as u64);
     for _ in 0..500 {
-        crate::sched::yield_now();
+        k::sched::yield_now();
     }
 
     let cross_before = akuma_threading::cross_thread_terminations();
-    let t0 = crate::net::uptime_us();
+    let t0 = k::net::uptime_us();
     // Through the dispatcher, not `signal::sys_kill` directly: the defect this
     // check exists for was the `Syscall::Kill` *arm* (it forwarded to glue),
     // and a check that called the native function could not tell the two
@@ -2931,14 +2943,14 @@ pub fn kill_test(t: &mut Suite) {
         syscall_dispatch(Syscall::Kill.to_x86_64(), u64::from(pid), 9, 0, 0, 0, 0), 0);
 
     let status = wait_test_exit(pid, 400_000);
-    let took_us = crate::net::uptime_us().saturating_sub(t0);
+    let took_us = k::net::uptime_us().saturating_sub(t0);
     t.check("kill: the group finished", status != u64::MAX);
     // Well under the 2 s grace the old path always paid; the tick that reaches
     // the spinner is 10 ms.
     t.check("kill: the group was gone within a second", took_us < 1_000_000);
     t.check_eq("kill: no thread was terminated by a peer",
         akuma_threading::cross_thread_terminations() as u64, cross_before as u64);
-    t.check_eq("kill: every thread row came back", crate::thread::live_count(SLOT) as u64, 0);
+    t.check_eq("kill: every thread row came back", k::thread::live_count(SLOT) as u64, 0);
     t.check_eq("kill: the status is a SIGKILL death", status, SIGKILL_STATUS);
     // A `kill(2)` at a dead pid: the row is a zombie until reaped, which is
     // still "exists" (0) — by pid and by its process group (Linux keeps a
@@ -2951,7 +2963,7 @@ pub fn kill_test(t: &mut Suite) {
 
     finish_test_process(pid, task_slot);
     t.check_eq("kill: a reaped process group is ESRCH",
-        kill62((-(i64::from(pid))) as u64, 0), crate::fd::errno::ESRCH);
+        kill62((-(i64::from(pid))) as u64, 0), k::fd::errno::ESRCH);
     t.check_eq("kill: teardown leaks nothing", akuma_pmm::free_count() as u64, free_before as u64);
 }
 

@@ -32,7 +32,8 @@ pub fn nothing_before_main() {}
 ///
 /// On amd64: `kmain` (PVH: QEMU, Firecracker, the in-tree KVM guest) and `kmain_mb2`
 /// (GRUB/multiboot2, the bare-metal path), which `akuma-boot-amd64`'s `boot.s` calls once it
-/// reaches long mode. The optional argument is accepted and ignored there.
+/// reaches long mode. The optional `before_main` runs first thing in both; the bin registers
+/// its boot self-tests there (`akuma-kernel-tests-amd64`).
 #[cfg(target_arch = "x86_64")]
 #[macro_export]
 macro_rules! entry {
@@ -42,12 +43,12 @@ macro_rules! entry {
     ($before_main:path) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn kmain(hvm_start_info: u64) -> ! {
-            $crate::kmain(hvm_start_info)
+            $crate::kmain(hvm_start_info, $before_main)
         }
 
         #[unsafe(no_mangle)]
         pub extern "C" fn kmain_mb2(info_phys: u64) -> ! {
-            $crate::kmain_mb2($crate::PhysAddr::new(info_phys))
+            $crate::kmain_mb2($crate::PhysAddr::new(info_phys), $before_main)
         }
     };
 }

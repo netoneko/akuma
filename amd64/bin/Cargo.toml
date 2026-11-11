@@ -12,7 +12,7 @@ workspace = true
 # here; one missing is a cargo error naming it, not a silent no-op.
 [features]
 default = ["akuma-kernel-amd64/default"]
-ring0-preempt = ["akuma-kernel-amd64/ring0-preempt"]
+ring0-preempt = ["akuma-kernel-amd64/ring0-preempt", "akuma-kernel-tests-amd64/ring0-preempt"]
 syscall-debug-info = ["akuma-kernel-amd64/syscall-debug-info"]
 pmm-forensics = ["akuma-kernel-amd64/pmm-forensics"]
 mm-forensics = ["akuma-kernel-amd64/mm-forensics"]
@@ -23,11 +23,13 @@ sc-timerfd = ["akuma-kernel-amd64/sc-timerfd"]
 sc-pidfd = ["akuma-kernel-amd64/sc-pidfd"]
 sc-aio = ["akuma-kernel-amd64/sc-aio"]
 sc-containers = ["akuma-kernel-amd64/sc-containers"]
-no-tests = ["akuma-kernel-amd64/no-tests"]
+no-tests = ["akuma-kernel-amd64/no-tests", "akuma-kernel-tests-amd64/no-tests"]
 
 [dependencies]
 akuma-kernel = { path = "../../crates/akuma-kernel" }
 akuma-kernel-amd64 = { path = "..", default-features = false }
+# The boot suite. Empty under `no-tests`, where `main.rs` does not name it either.
+akuma-kernel-tests-amd64 = { path = "../../crates/akuma-kernel-tests-amd64" }
 
 [[bin]]
 name = "akuma-amd64"

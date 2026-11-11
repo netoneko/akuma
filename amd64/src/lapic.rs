@@ -155,6 +155,8 @@ fn mask_legacy_pics() {
 
 /// Map the LAPIC, enable it, and start a periodic timer. Interrupts stay masked;
 /// the caller decides when to `sti`.
+// The boot suite checks the result; `late_init` has nothing to do on failure but carry on.
+#[allow(clippy::must_use_candidate)]
 pub fn init() -> bool {
     mask_legacy_pics();
 

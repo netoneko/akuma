@@ -940,7 +940,11 @@ fn init_console(info: &BootInfo<'_>) -> Result<ConsoleUp, &'static str> {
 // The information block's size field is a `u32` at an 8-byte-aligned address
 // (the multiboot2 ABI); the byte pointer is how the physmap hands it over.
 #[allow(clippy::cast_ptr_alignment)]
-pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr) -> ! {
+pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> ! {
+    // The bin's hook (`akuma_kernel::entry!`'s argument): it registers the boot suite, which
+    // lives in `akuma-kernel-tests-amd64` because this crate cannot depend on it. It only
+    // stores function pointers, so it runs first, before anything it could depend on.
+    before_main();
     let info_phys = info.get();
     ega_text(0, "Akuma/amd64: multiboot2 entry reached");
     // Probe for a UART and configure it if one answers. This path never called
@@ -1259,8 +1263,6 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr) -> ! {
         cycle_forever(have_net)
     }
 
-    let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", crate::boot::suite_emit);
-
     // The whole suite, shared with the PVH entry point.
     //
     // This path used to carry its own copy, and the two had drifted: it was
@@ -1270,7 +1272,6 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr) -> ! {
     // that runs on real silicon, and invisible because both paths still said
     // `0 failed`. See `boot::self_tests`.
     let verdict = crate::boot::self_tests(
-        &mut t,
         &crate::boot::SuiteCtx {
             machine: &machine,
             facts: &facts,

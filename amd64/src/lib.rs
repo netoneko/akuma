@@ -157,6 +157,11 @@ mod uas;
 mod uaccess;
 #[cfg(target_arch = "x86_64")]
 mod splash;
+/// The boot suite's view of this crate (`crates/akuma-kernel-tests-amd64`): one
+/// re-export per item it reaches. Not an API — see the module.
+#[cfg(all(target_arch = "x86_64", not(feature = "no-tests")))]
+#[doc(hidden)]
+pub mod testing;
 mod watchdog;
 mod wifi;
 mod xhci;
@@ -202,7 +207,10 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
 ///
 /// The bin's `kmain` symbol, which `boot.s` calls by name, calls this.
 #[cfg(target_arch = "x86_64")]
-pub fn kmain(hvm_start_info: u64) -> ! {
+pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
+    // The bin's hook (`akuma_kernel::entry!`'s argument), as on the multiboot2 path: it
+    // registers the boot suite (`akuma-kernel-tests-amd64`) and touches nothing else.
+    before_main();
     serial::init();
 
     // The print hook, before anything prints through a shared crate:
@@ -363,9 +371,6 @@ pub fn kmain(hvm_start_info: u64) -> ! {
         }
     }
 
-    #[cfg(not(feature = "no-tests"))]
-    let mut t = akuma_selftest::Suite::new("Akuma/amd64 self-test", crate::boot::suite_emit);
-
     // The whole suite, shared with the multiboot2 entry point. It was written
     // out separately in both until 2026-09-07, and the two lists had drifted —
     // the bare-metal path was not running `fork`, `execve`, `spawn`, busybox,
@@ -374,7 +379,6 @@ pub fn kmain(hvm_start_info: u64) -> ! {
     let si = &machine.start_info;
     #[cfg(not(feature = "no-tests"))]
     let verdict = boot::self_tests(
-        &mut t,
         &boot::SuiteCtx {
             machine: &machine,
             facts: &facts,

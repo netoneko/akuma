@@ -2418,7 +2418,9 @@ extern "C" fn ring0_setter() -> ! {
 
 #[cfg(all(feature = "ring0-preempt", not(feature = "no-tests")))]
 /// `ring0-preempt`: the tick switches a thread out of kernel code that does not hold
-/// the BKL. A spinner that never yields waits for a flag only a second thread sets; on
+/// the BKL.
+///
+/// A spinner that never yields waits for a flag only a second thread sets; on
 /// one core it can see the flag only if the tick took it off the CPU.
 pub fn ring0_preempt_smoke_test(t: &mut Suite) {
     let before = ring0_preemptions();

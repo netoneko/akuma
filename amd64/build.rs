@@ -1,5 +1,6 @@
 //! Two jobs: export the kernel's linker script to the bin (`amd64/bin`), and
-//! build the guest programs the kernel's ELF loader consumes.
+//! build the guest programs the boot suite's ELF loader tests consume (and
+//! `mkdisk.sh` puts on the disk).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -29,7 +30,7 @@ fn kernel_link_args(dir: &str) {
 }
 
 /// Compile and link `userspace/amd64/<name>/<name>.rs` into a static ELF64 the
-/// kernel embeds with `include_bytes!`.
+/// boot suite embeds with `include_bytes!`.
 ///
 /// The sources live under `userspace/` because that is where this tree keeps
 /// programs that run in ring 3, even though these are not members of that cargo
@@ -91,5 +92,10 @@ fn build_user_program(dir: &str, name: &str) {
          `rustup target add x86_64-unknown-none`"
     );
 
-    println!("cargo:rustc-env=USER_{}_ELF={}", name.to_uppercase(), out.display());
+    // `links` metadata, not `rustc-env`: the kernel library embeds none of these. The boot
+    // suite (`crates/akuma-kernel-tests-amd64`) does, and its `build.rs` reads them as
+    // `DEP_AKUMA_KERNEL_AMD64_USER_<NAME>_ELF`. They are built here rather than there because
+    // `mkdisk.sh` copies `hello.elf` and `fdprobe.elf` onto the disk of every image, a
+    // `no-tests` one included.
+    println!("cargo:user_{name}_elf={}", out.display());
 }

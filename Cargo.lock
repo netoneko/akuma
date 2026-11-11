@@ -94,6 +94,7 @@ version = "0.0.9"
 dependencies = [
  "akuma-kernel",
  "akuma-kernel-amd64",
+ "akuma-kernel-tests-amd64",
 ]
 
 [[package]]
@@ -602,6 +603,27 @@ dependencies = [
  "log",
  "smoltcp",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-kernel-tests-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-cpu",
+ "akuma-exec",
+ "akuma-kernel-amd64",
+ "akuma-kernel-core",
+ "akuma-mmap",
+ "akuma-mmu",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-selftest",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-linux",
+ "akuma-threading",
+ "akuma-user-access",
+ "akuma-vfs-glue",
 ]
 
 [[package]]

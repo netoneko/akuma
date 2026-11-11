@@ -58,7 +58,7 @@ const DNS_TIMEOUT_US: u64 = 5_000_000;
 /// whatever Linux happens to have at 313 — `finit_module`, as it turns out.
 const AKUMA_PRIVATE_BASE: u64 = 0x1000;
 
-pub(super) fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
     if nr >= AKUMA_PRIVATE_BASE {
         return akuma_private(nr, [a1, a2, a3, a4, a5, a6]);
     }
@@ -1528,7 +1528,8 @@ fn system(call: Syscall, a: [u64; 6]) -> Option<u64> {
 /// shared user-copy loop, and an x86 arm for `akuma_mmu::get_current_ttbr0`.
 /// The prologue itself needed nothing: it reaches `akuma_exec::threading`,
 /// which **is** `akuma-threading`, the scheduler this target has run since A1.
-pub(super) fn to_glue(call: Syscall, args: [u64; 6]) -> u64 {
+#[must_use]
+pub fn to_glue(call: Syscall, args: [u64; 6]) -> u64 {
     akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args)
 }
 

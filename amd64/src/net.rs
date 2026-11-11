@@ -71,11 +71,14 @@ use crate::serial;
 /// against.
 const US_PER_TICK: u64 = 10_000;
 
+/// Microseconds since boot: the TSC when it is calibrated, LAPIC ticks otherwise.
+///
 /// `clock.rs`'s SNTP bootstrap (2026-09-05) uses this same source for its own
 /// round-trip timing — one uptime source for the whole target, not two that
 /// could disagree. `pub` rather than `pub(crate)` because `mod net;` is
 /// itself private, which already bounds this to the crate (clippy's
 /// `redundant_pub_crate`).
+#[must_use]
 pub fn uptime_us() -> u64 {
     crate::lapic::tsc_uptime_us().unwrap_or_else(|| crate::lapic::ticks() * US_PER_TICK)
 }

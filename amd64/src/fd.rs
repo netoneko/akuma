@@ -323,6 +323,7 @@ fn cur_table() -> &'static akuma_exec::process::SharedFdTable {
 /// Clone `fd`'s description out of the calling table, or `None` if the fd
 /// names nothing — a closed descriptor, one out of range, or a console
 /// descriptor.
+#[must_use]
 pub fn table_get(fd: u64) -> Option<FileDescriptor> {
     table_get_in(cur_table(), fd)
 }
@@ -712,6 +713,8 @@ pub fn is_nonblocking(fd: u64) -> bool {
 /// `F_DUPFD` now allocates the lowest free fd from **0**, not from
 /// [`FIRST_FILE_FD`] — Linux's "lowest available" — which is the same
 /// convergence `openat` made in batch 2d.
+// Its result is informational; callers that cannot act on it ignore it.
+#[allow(clippy::must_use_candidate)]
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     // `F_ADD_SEALS` / `F_GET_SEALS` (memfd): accepted and not enforced — Firecracker seals the
     // ring buffer it maps twice and only checks that the call succeeded. No seal is ever reported.
@@ -1117,6 +1120,9 @@ pub fn sys_pipe2(fds: u64, flags: u64) -> u64 {
 /// `SharedFdTable::with_stdio`). The console itself is unaffected: it is
 /// answered by number in `read`/`write` through [`console_end`], not by a
 /// descriptor this could close.
+// `close(2)`'s result: cleanup paths that cannot act on a failure ignore it, as Linux
+// callers routinely do.
+#[allow(clippy::must_use_candidate)]
 pub fn sys_close(fd: u64) -> u64 {
     akuma_syscalls_glue::fs::sys_close(fd as u32)
 }
@@ -1180,6 +1186,7 @@ pub fn sys_close(fd: u64) -> u64 {
 ///   arm) rather than under the lock.
 /// - **`EPOLLET` edges are re-armed** after a pipe or socket read, which this
 ///   arm never did.
+#[must_use]
 pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
@@ -2233,6 +2240,7 @@ pub fn sys_access(path: u64) -> u64 {
 ///   not `ENOTTY`.** Glue's first line is `current_process_shared()`. Only the
 ///   boot task can be in that state, and `boot_row_register` is the answer the
 ///   suite already uses for it (4b batch 2b).
+#[must_use]
 pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     if let Some(id) = dev_kvm_api_id(fd) {
         return crate::kvm::api::ioctl(fd, id, req as u32, arg);
@@ -2746,6 +2754,7 @@ fn proc_consistency_check(t: &mut Suite) {
 ///
 /// The AArch64 kernel has had this since long before: `register_at_syscall_process`,
 /// used 25 times in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`.
+#[must_use]
 pub fn boot_row_register() -> usize {
     let tid = akuma_exec::threading::current_thread_id();
     akuma_exec::process::register_process(1, akuma_exec::process::make_test_process(1));
@@ -2792,6 +2801,8 @@ pub fn boot_row_register() -> usize {
 /// that way the identity costs a permanent page and `identity: probe teardown
 /// leaks nothing` reports it, correctly. Draining is what makes the
 /// registration a loan rather than a leak.
+// Its result is informational; callers that cannot act on it ignore it.
+#[allow(clippy::must_use_candidate)]
 pub fn boot_row_release(tid: usize) -> usize {
     // The console channel [`boot_row_register`] took out. Left behind, the next
     // boot row to land on this slot inherits it — and so would any unrelated
