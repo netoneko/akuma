@@ -135,10 +135,6 @@ pub mod uaccess {
     pub use crate::uaccess::smoke_test;
 }
 
-pub mod uas {
-    pub use crate::uas::{live_l0_registry_test, smoke_test};
-}
-
 /// Ring 3: the process machinery the `usermode` tests drive by hand.
 pub mod usermode {
     pub use crate::usermode::{

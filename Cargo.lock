@@ -610,6 +610,7 @@ name = "akuma-kernel-tests-amd64"
 version = "0.1.0"
 dependencies = [
  "akuma-bkl",
+ "akuma-boot-amd64",
  "akuma-cpu",
  "akuma-exec",
  "akuma-kernel-amd64",

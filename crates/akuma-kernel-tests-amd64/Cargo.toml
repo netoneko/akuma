@@ -21,6 +21,7 @@ ring0-preempt = []
 [target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
 akuma-kernel-amd64 = { path = "../../amd64", default-features = false }
 akuma-bkl = { path = "../akuma-bkl" }
+akuma-boot-amd64 = { path = "../akuma-boot-amd64" }
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-exec = { path = "../akuma-exec", features = ["bkl-smp"] }
 akuma-kernel-core = { path = "../akuma-kernel-core", features = ["bkl-smp"] }

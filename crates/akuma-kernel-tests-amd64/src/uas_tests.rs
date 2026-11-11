@@ -29,14 +29,14 @@
 //! walks `self.root` explicitly rather than the installed tables — that
 //! property is itself worth pinning, and `translate`-after-`map` is what pins
 //! it.
+//!
+//! Moved whole from `amd64/src/uas.rs` (2026-11-11): the module was nothing but this suite,
+//! and it reaches only `akuma-mmu` and `akuma-boot-amd64`, never the kernel's own state.
 
-#[cfg(not(feature = "no-tests"))]
 use akuma_mmu::{user_flags, UserAddressSpace};
-#[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
-#[cfg(not(feature = "no-tests"))]
-use crate::phys::phys_ptr;
+use akuma_boot_amd64::phys::phys_ptr;
 
 /// A VA in the lower half, clear of anything the kernel maps. The address space
 /// under test is private, so this only has to avoid colliding with itself.
@@ -56,7 +56,6 @@ const PTE_COW: u64 = 1 << 9;
 const PTE_NX: u64 = 1 << 63;
 const PTE_ADDR: u64 = 0x000f_ffff_ffff_f000;
 
-#[cfg(not(feature = "no-tests"))]
 pub fn smoke_test(t: &mut Suite) {
     let Some(mut uas) = UserAddressSpace::new() else {
         t.check("uas: new", false);
@@ -222,7 +221,6 @@ pub fn smoke_test(t: &mut Suite) {
     drop_returns_frames_test(t);
 }
 
-#[cfg(not(feature = "no-tests"))]
 /// The walk refuses a virtual address in the kernel's half — on **both** map
 /// entry points, and without allocating a page table on the way to saying no.
 ///
@@ -317,7 +315,6 @@ fn upper_half_refusal_test(t: &mut Suite) {
     akuma_pmm::free_page(frame.addr, 0);
 }
 
-#[cfg(not(feature = "no-tests"))]
 /// The PTE-level entry points step 5a added, and the CoW marker they carry.
 ///
 /// `map_page`/`alloc_and_map` above take an **AArch64** flag word and decode it
@@ -400,7 +397,6 @@ fn pte_level_test(t: &mut Suite) {
     akuma_pmm::free_page(fresh, 0);
 }
 
-#[cfg(not(feature = "no-tests"))]
 /// `UserAddressSpace::drop` hands every frame it holds back to the PMM.
 ///
 /// The destructor is what step 5a replaced `Process::free`'s
@@ -454,7 +450,6 @@ fn drop_returns_frames_test(t: &mut Suite) {
     );
 }
 
-#[cfg(not(feature = "no-tests"))]
 /// The three range walks C1 step 5a needs, on a private address space.
 ///
 /// These are the one capability `akuma-mmu` did not have and `amd64/src/mm.rs`
@@ -607,7 +602,6 @@ fn range_walk_test(t: &mut Suite, uas: &mut UserAddressSpace) {
     }
 }
 
-#[cfg(not(feature = "no-tests"))]
 /// The per-core live-L0 registry `UserAddressSpace::drop` gates on.
 ///
 /// **This is the prerequisite for letting an address space drop at all on this
@@ -638,7 +632,7 @@ pub fn live_l0_registry_test(t: &mut Suite) {
     // address-space switch has gone through `paging::activate`. Placed early it
     // fails, which is what it did on its first run — the check was right and its
     // position was wrong.
-    let live = crate::paging::active_root();
+    let live = akuma_boot_amd64::paging::active_root();
     t.check(
         "l0reg: the running root is published once processes have switched",
         akuma_mmu::any_core_on_l0(live as usize).is_some(),

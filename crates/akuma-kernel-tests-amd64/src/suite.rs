@@ -82,7 +82,7 @@ fn run(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     // through and C1 folds this kernel onto. Right after `paging::smoke_test`
     // because the two are the same job done twice, and a divergence between
     // them is easiest to read when their results are adjacent.
-    k::uas::smoke_test(t);
+    crate::uas_tests::smoke_test(t);
     k::idt::smoke_test(t);
     k::idt::user_copy_smoke_test(t);
     k::uaccess::smoke_test(t, cx.smap);
@@ -155,7 +155,7 @@ fn run(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     // The per-core live-L0 registry, here rather than with the rest of
     // `uas::smoke_test` because it asks about switches that have actually
     // happened — see the function's own note.
-    k::uas::live_l0_registry_test(t);
+    crate::uas_tests::live_l0_registry_test(t);
 
     // The other cores. `nosmp` boots single-core: a bring-up lever, not policy —
     // on a machine whose only console is a framebuffer, `[BKL] stuck` chatter
