@@ -622,9 +622,9 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
             {
                 crate::fbdev::release(p.tgid);
             }
-            // The tap: host sockets and the gateway's slots go back (`crate::kvm::tun`).
+            // The tap: host sockets and the gateway's slots go back (`drivers::Hypervisor`).
             if crate::fd::is_dev_tun(a1) {
-                crate::kvm::tun::release();
+                crate::drivers::hypervisor_tun_release();
             }
             // A `/dev/wifi0` descriptor's read cursor (`drivers::Wireless`).
             if crate::fd::is_dev_wifi(a1)
@@ -682,7 +682,7 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
                         crate::fbdev::release(p.tgid);
                     }
                     if crate::fd::is_dev_tun(f) {
-                        crate::kvm::tun::release();
+                        crate::drivers::hypervisor_tun_release();
                     }
                     if crate::fd::is_dev_wifi(f) {
                         crate::drivers::wireless_release(p.tgid, fd);
@@ -832,12 +832,12 @@ fn mem(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // `a6` is the file offset. It was dropped until 2026-09-07 because only
         // anonymous mappings were served and an anonymous `mmap`'s offset is
         // ignored; a file mapping cannot ignore it.
-        // Census stub (`kvm::api`): a `/dev/kvm` descriptor maps as anonymous memory, enough to see
+        // Census stub (the hypervisor driver): a `/dev/kvm` descriptor maps as anonymous memory, enough to see
         // what the VMM does with the vCPU's run page.
         Syscall::Mmap if let Some(id) = crate::fd::dev_kvm_api_id(a5) => {
-            crate::kvm::api::note_mmap(a5, a1, a2, a3, a4, a6);
+            crate::drivers::hypervisor_api_note_mmap(a5, akuma_primitives::addr::VirtAddr::new(a1 as usize), a2, a3, a4, a6);
             // A vCPU descriptor maps the run page; the others (nothing maps them) get anonymous memory.
-            let r = crate::kvm::api::mmap_vcpu(id, a1, a2, a3, a4);
+            let r = crate::drivers::hypervisor_api_mmap_vcpu(id, a1, a2, a3, a4);
             if r == crate::fd::errno::ENODEV { crate::mm::sys_mmap(a1, a2, a3, a4 | 0x20, u64::MAX, 0) } else { r }
         }
         Syscall::Mmap => crate::mm::sys_mmap(a1, a2, a3, a4, a5, a6),

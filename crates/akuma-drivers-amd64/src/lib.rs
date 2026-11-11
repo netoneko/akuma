@@ -30,6 +30,9 @@ mod fbcon;
 
 #[cfg(feature = "hda")]
 mod hda;
+#[cfg(feature = "kvm")]
+#[allow(unsafe_code)]
+mod kvm;
 #[cfg(feature = "touchpad")]
 mod i2c;
 #[cfg(feature = "touchpad")]
@@ -63,4 +66,6 @@ pub fn register() {
     });
     #[cfg(feature = "wifi")]
     akuma_kernel_amd64::drivers::register_wireless(&wifi::WIRELESS);
+    #[cfg(feature = "kvm")]
+    akuma_kernel_amd64::drivers::register_hypervisor(&kvm::HYPERVISOR);
 }

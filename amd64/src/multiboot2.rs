@@ -310,7 +310,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // boot; `kvmtest` on the command line runs the trivial guest. After
     // `mem::init_reserving` (it allocates frames) and on the BSP only —
     // EFER.SVME and VM_HSAVE_PA are per-core, rung 2 enables the APs.
-    crate::kvm::init(info.cmdline());
+    crate::drivers::hypervisor_init(info.cmdline());
 
     // `/proc/power`. After `mem::init_reserving` for the same reason as `hda`:
     // mapping the EC window allocates page-table frames.
@@ -405,7 +405,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
         // place as the PVH path's call in `lib.rs`; the BSP only, so the
         // thread cannot migrate off the core that enabled SVM.
         if have_fs {
-            crate::kvm::late(cmdline);
+            crate::drivers::hypervisor_late(cmdline);
         }
         crate::boot::bring_up_secondaries(machine.madt.as_ref(), &facts, cmdline, &mb2_keep_out());
     };
@@ -548,7 +548,7 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
         // spawned it.
         crate::net::spawn_netpoll();
         // A service guest (`kvmserve`) listens on this host's stack: start it now.
-        crate::kvm::spawn_service(cmdline);
+        crate::drivers::hypervisor_spawn_service(cmdline);
         if cmdline.split_ascii_whitespace().any(|t| t == "netprobe") {
             crate::net::enable_probe();
         }

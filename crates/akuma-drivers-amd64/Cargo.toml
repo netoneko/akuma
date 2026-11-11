@@ -11,7 +11,7 @@ workspace = true
 # not install it, so the machine half's probe for that class does nothing. `all` is what the
 # bin's default (bare-metal) image enables; `amd64/bin/Cargo.toml` names the smaller sets.
 [features]
-all = ["fbcon", "hda", "touchpad", "wifi"]
+all = ["fbcon", "hda", "kvm", "touchpad", "wifi"]
 # The framebuffer text console on GRUB's linear framebuffer, with the boot splash and
 # `/dev/fb0`'s registration. Off, the multiboot2 boot is headless: its console is the serial
 # port (the bare-metal reference machine has no UART, so a build for it wants this on).
@@ -32,6 +32,16 @@ wifi = [
     "dep:akuma-wifi", "dep:akuma-rtw89", "dep:akuma-ieee80211", "dep:akuma-wpa", "dep:akuma-net",
     "dep:akuma-pci", "dep:akuma-dma", "dep:akuma-primitives", "dep:spinning_top",
 ]
+# The AMD SVM hypervisor: `/dev/kvm0`, the `/dev/kvm` ioctl surface and the `/dev/net/tun`
+# tap behind its gateway (`docs/reference/subsystems/kvm.md`). AMD only; off, none of the
+# three nodes opens, as on a CPU without SVM.
+kvm = [
+    "dep:akuma-svm-amd64", "dep:akuma-vm-spec", "dep:akuma-kvm-abi", "dep:akuma-affinity",
+    "dep:akuma-bkl", "dep:akuma-cpu", "dep:akuma-dmesg", "dep:akuma-exec", "dep:akuma-exec-core",
+    "dep:akuma-mmu", "dep:akuma-net", "dep:akuma-pmm", "dep:akuma-primitives",
+    "dep:akuma-syscalls-glue", "dep:akuma-threading", "dep:akuma-vfs-glue", "dep:akuma-virtio",
+    "dep:spinning_top",
+]
 # Intel HD Audio playback behind `/dev/dsp`.
 hda = ["dep:akuma-hda", "dep:akuma-dma", "dep:akuma-pci", "dep:akuma-primitives", "dep:akuma-virtio", "dep:spinning_top"]
 
@@ -41,24 +51,37 @@ hda = ["dep:akuma-hda", "dep:akuma-dma", "dep:akuma-pci", "dep:akuma-primitives"
 [target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
 akuma-kernel-amd64 = { path = "../../amd64", default-features = false }
 akuma-primitives = { path = "../akuma-primitives", optional = true }
+akuma-affinity = { path = "../akuma-affinity", optional = true }
+akuma-bkl = { path = "../akuma-bkl", optional = true }
 akuma-boot-amd64 = { path = "../akuma-boot-amd64", optional = true }
 akuma-cpu = { path = "../akuma-cpu", optional = true }
 akuma-dma = { path = "../akuma-dma", optional = true }
+akuma-dmesg = { path = "../akuma-dmesg", optional = true }
 akuma-dwi2c = { path = "../akuma-dwi2c", optional = true }
+akuma-exec = { path = "../akuma-exec", features = ["bkl-smp"], optional = true }
+akuma-exec-core = { path = "../akuma-exec-core", optional = true }
 akuma-fbcon = { path = "../akuma-fbcon", optional = true }
 akuma-fbdev = { path = "../akuma-fbdev", optional = true }
 akuma-hda = { path = "../akuma-hda", optional = true }
 akuma-hid = { path = "../akuma-hid", optional = true }
 akuma-ieee80211 = { path = "../akuma-ieee80211", optional = true }
+akuma-kvm-abi = { path = "../akuma-kvm-abi", optional = true }
+akuma-mmu = { path = "../akuma-mmu", optional = true }
 akuma-i2c-hid = { path = "../akuma-i2c-hid", optional = true }
 akuma-multiboot2 = { path = "../akuma-multiboot2", optional = true }
 akuma-net = { path = "../akuma-net", features = ["rtl8169"], optional = true }
 akuma-pagetable = { path = "../akuma-pagetable", optional = true }
 akuma-pci = { path = "../akuma-pci", optional = true }
+akuma-pmm = { path = "../akuma-pmm", optional = true }
 akuma-rtw89 = { path = "../akuma-rtw89", optional = true }
 akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64", optional = true }
+akuma-svm-amd64 = { path = "../akuma-svm-amd64", optional = true }
+akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, features = ["smoltcp", "exec", "akuma-native", "bkl-smp"], optional = true }
+akuma-threading = { path = "../akuma-threading", optional = true }
 akuma-touchpad = { path = "../akuma-touchpad", optional = true }
+akuma-vfs-glue = { path = "../akuma-vfs-glue", features = ["bkl-smp"], optional = true }
 akuma-virtio = { path = "../akuma-virtio", optional = true }
+akuma-vm-spec = { path = "../akuma-vm-spec", optional = true }
 akuma-wifi = { path = "../akuma-wifi", optional = true }
 akuma-wpa = { path = "../akuma-wpa", optional = true }
 spinning_top = { version = "0.3", optional = true }

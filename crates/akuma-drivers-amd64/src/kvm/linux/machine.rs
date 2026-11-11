@@ -37,7 +37,7 @@
 //! **Cross-processor signals** are state words and a kick, in that order: the sender changes
 //! the target's atomics (`state`, `sipi`, `init`, a local APIC's pending bits under the device
 //! lock), sets its `poke` flag, then interrupts its core with the wake IPI
-//! ([`crate::smp::kick_core`]). The target clears `poke` at the top of its loop and re-checks
+//! ([`akuma_kernel_amd64::drivers::services::smp::kick_core`]). The target clears `poke` at the top of its loop and re-checks
 //! it with interrupts masked just before it sleeps, so a kick that lands between its last look
 //! and its `hlt` is not lost (an IPI taken at the wrong moment is consumed by the handler, not
 //! latched). A target running its guest takes a `#VMEXIT` for the IPI and looks again.
@@ -220,7 +220,7 @@ impl Shared {
     /// Tell processor `j`'s task to look again, whichever core it is on.
     fn poke(&self, j: usize) {
         self.cpu[j].poke.store(true, Ordering::Release);
-        crate::smp::kick_core(usize::from(self.place[j]));
+        akuma_kernel_amd64::drivers::services::smp::kick_core(usize::from(self.place[j]));
     }
 
     /// Can no processor ever run again? (Called by a task whose own group has nothing runnable.)
@@ -267,7 +267,7 @@ fn lock_dev(sh: &Shared) -> spinning_top::guard::SpinlockGuard<'_, Devices> {
         if let Some(g) = sh.dev.try_lock() {
             return g;
         }
-        crate::smp::bkl_drop_window();
+        akuma_kernel_amd64::drivers::services::smp::bkl_drop_window();
         core::hint::spin_loop();
     }
 }
@@ -296,13 +296,13 @@ struct Job {
     group: u32,
 }
 
-static JOBS: [Spinlock<Option<Job>>; crate::smp::MAX_CPUS] = [const { Spinlock::new(None) }; crate::smp::MAX_CPUS];
-static WORKERS: [AtomicBool; crate::smp::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::smp::MAX_CPUS];
+static JOBS: [Spinlock<Option<Job>>; akuma_kernel_amd64::drivers::services::smp::MAX_CPUS] = [const { Spinlock::new(None) }; akuma_kernel_amd64::drivers::services::smp::MAX_CPUS];
+static WORKERS: [AtomicBool; akuma_kernel_amd64::drivers::services::smp::MAX_CPUS] = [const { AtomicBool::new(false) }; akuma_kernel_amd64::drivers::services::smp::MAX_CPUS];
 
 /// A worker lives for the kernel's life on its core and serves whatever job is posted for it;
 /// it sleeps (a tick is the latency of a new machine) while there is none.
 extern "C" fn worker_task() -> ! {
-    let core = crate::smp::cpu_index();
+    let core = akuma_kernel_amd64::drivers::services::smp::cpu_index();
     loop {
         let job = JOBS[core].lock().take();
         if let Some(Job { sh, group }) = job {
@@ -310,8 +310,8 @@ extern "C" fn worker_task() -> ! {
             // Dropping the Arc is the signal the coordinator waits for.
             drop(sh);
         } else {
-            crate::sched::yield_now();
-            crate::sched::allow_tick();
+            akuma_kernel_amd64::drivers::services::sched::yield_now();
+            akuma_kernel_amd64::drivers::services::sched::allow_tick();
         }
     }
 }
@@ -321,7 +321,7 @@ fn ensure_worker(core: usize) -> bool {
     if WORKERS[core].load(Ordering::Acquire) {
         return true;
     }
-    let Some(slot) = crate::sched::spawn_daemon_on(worker_task, core) else {
+    let Some(slot) = akuma_kernel_amd64::drivers::services::sched::spawn_daemon_on(worker_task, core) else {
         return false;
     };
     WORKERS[core].store(true, Ordering::Release);
@@ -344,7 +344,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
     let guest = sh.guest;
     let nrips = sh.nrips;
     let service = sh.service;
-    let me = crate::smp::cpu_index();
+    let me = akuma_kernel_amd64::drivers::services::smp::cpu_index();
     let members = || (0..MAX_VCPUS).filter(move |&j| group & (1 << j) != 0 && j < sh.n_cpu);
     let first_member = members().next().unwrap_or(0);
 
@@ -376,7 +376,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
     let mut next_relay_us = 0u64;
     let mut next_status_us = 0u64;
     let started_us = sh.started_us;
-    let mut next_acct_us = crate::net::uptime_us() + ACCT_PERIOD_US;
+    let mut next_acct_us = akuma_kernel_amd64::drivers::services::net::uptime_us() + ACCT_PERIOD_US;
 
     // IRQs on for the whole run: with V_INTR_MASKING the host IF at VMRUN gates physical
     // interrupts, and a tick must reach the host.
@@ -390,7 +390,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
         for j in members() {
             sh.cpu[j].poke.store(false, Ordering::Release);
         }
-        let now_us = crate::net::uptime_us();
+        let now_us = akuma_kernel_amd64::drivers::services::net::uptime_us();
         if !service {
             // The rehearsal guests are bounded; a service guest is not.
             if c.exits >= MAX_EXITS {
@@ -424,7 +424,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
             // expects that.
             akuma_cpu::daif::mask_irq();
             let t0 = akuma_cpu::tsc::rdtsc();
-            crate::sched::yield_now();
+            akuma_kernel_amd64::drivers::services::sched::yield_now();
             acct.yielded += akuma_cpu::tsc::rdtsc().wrapping_sub(t0);
             akuma_cpu::daif::unmask_irq();
             if now_us >= next_acct_us {
@@ -555,16 +555,16 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
                     let dg = lock_dev(sh);
                     members().filter(|&j| sh.cpu[j].state() == CpuState::Halted).filter_map(|j| dg.plat.next_event_us(j)).min()
                 };
-                let mut wait = due.map(|d| d.saturating_sub(crate::net::uptime_us()));
+                let mut wait = due.map(|d| d.saturating_sub(akuma_kernel_amd64::drivers::services::net::uptime_us()));
                 if owner {
                     // The relay's `accept` and the lease check run from this loop.
                     let cap = if lock_dev(sh).relay.as_ref().is_some_and(Relay::active) { OWNER_ACTIVE_CAP_US } else { OWNER_IDLE_CAP_US };
                     wait = Some(wait.map_or(cap, |w| w.min(cap)));
                 }
                 if let Some(w) = wait {
-                    let _ = crate::lapic::arm_oneshot_in_us(w);
+                    let _ = akuma_kernel_amd64::drivers::services::lapic::arm_oneshot_in_us(w);
                 }
-                crate::sched::allow_tick();
+                akuma_kernel_amd64::drivers::services::sched::allow_tick();
                 acct.sleep += akuma_cpu::tsc::rdtsc().wrapping_sub(sleep_t0);
                 akuma_cpu::daif::unmask_irq();
             } else {
@@ -605,7 +605,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
         }
         if let Some(due) = due {
             akuma_cpu::daif::mask_irq();
-            let _ = crate::lapic::arm_oneshot_in_us(due.saturating_sub(crate::net::uptime_us()));
+            let _ = akuma_kernel_amd64::drivers::services::lapic::arm_oneshot_in_us(due.saturating_sub(akuma_kernel_amd64::drivers::services::net::uptime_us()));
             akuma_cpu::daif::unmask_irq();
         }
         crumb(0x57);
@@ -740,11 +740,11 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
                     break 'run;
                 }
                 if io.is_in {
-                    let val = u64::from(plat.io_in(io.port, io.size, pit::ticks_from_us(crate::net::uptime_us()))) & io.mask();
+                    let val = u64::from(plat.io_in(io.port, io.size, pit::ticks_from_us(akuma_kernel_amd64::drivers::services::net::uptime_us()))) & io.mask();
                     let rax = v.rax();
                     v.set_rax(if io.size == 4 { val } else { (rax & !io.mask()) | val });
                 } else {
-                    plat.io_out(io.port, io.size, (v.rax() & io.mask()) as u32, pit::ticks_from_us(crate::net::uptime_us()));
+                    plat.io_out(io.port, io.size, (v.rax() & io.mask()) as u32, pit::ticks_from_us(akuma_kernel_amd64::drivers::services::net::uptime_us()));
                 }
                 v.complete_instruction(v.exitinfo2());
                 if plat.reset_requested {
@@ -832,7 +832,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
                     dump_code(&sh.ram, &v, v.rip());
                     break 'run;
                 };
-                let now = lapic::bus_ticks_from_us(crate::net::uptime_us());
+                let now = lapic::bus_ticks_from_us(akuma_kernel_amd64::drivers::services::net::uptime_us());
                 mmio_emulate(&a, &mut LapicDev { lapic: &mut plat.lapics[i], off, now }, &mut v, regs);
             }
             ExitCode::Npf if net.is_some() && (NET_BASE..NET_BASE + NET_LEN).contains(&v.exitinfo2()) => {
@@ -1049,7 +1049,7 @@ pub fn run(nrips: bool, vm: &Vm) {
         Guest::Linux | Guest::LinuxApic => cmdline_with_tsc(
             &mut cmd,
             if guest == Guest::LinuxApic { LINUX_APIC_CMDLINE } else { LINUX_CMDLINE },
-            crate::lapic::tsc_hz() / 1000,
+            akuma_kernel_amd64::drivers::services::lapic::tsc_hz() / 1000,
             if disk.is_some() { ROOT_ARGS } else { NO_DISK_ARGS },
         ),
         // The Akuma guest calibrates its own TSC against the virtual PIT.
@@ -1118,7 +1118,7 @@ pub fn run(nrips: bool, vm: &Vm) {
     // processors may share a core).
     let n_cpu = vm.vcpus();
     let service = guest.is_service();
-    let here = crate::smp::cpu_index();
+    let here = akuma_kernel_amd64::drivers::services::smp::cpu_index();
     // Where each processor runs: a service guest by its spec against the machine's `kvmcores=`,
     // everything else on the core it was started from, as it always was.
     let place = if service {
@@ -1172,10 +1172,10 @@ pub fn run(nrips: bool, vm: &Vm) {
         None
     };
     let relay = service.then(|| Relay::new(vm.forwards(), outbound));
-    if crate::lapic::tsc_uptime_us().is_none() {
+    if akuma_kernel_amd64::drivers::services::lapic::tsc_uptime_us().is_none() {
         p("[KVM] linux: warning: host uptime is 10 ms ticks; PIT timing will be coarse\n");
     }
-    let started_us = crate::net::uptime_us();
+    let started_us = akuma_kernel_amd64::drivers::services::net::uptime_us();
     let mut plat = Platform::new(guest, n_cpu);
     plat.last_tx_us = started_us;
     let sh = Arc::new(Shared {
@@ -1200,13 +1200,13 @@ pub fn run(nrips: bool, vm: &Vm) {
     });
 
     // Groups: one per distinct host core, the owner's (processor 0's) first.
-    let mut group_of_core = [0u32; crate::smp::MAX_CPUS];
+    let mut group_of_core = [0u32; akuma_kernel_amd64::drivers::services::smp::MAX_CPUS];
     for i in 0..n_cpu {
         group_of_core[usize::from(sh.place[i])] |= 1 << i;
     }
     // A core the host did not start at boot (`smp=` cut it off) is started now, for this VM.
     for (core, &group) in group_of_core.iter().enumerate() {
-        if group != 0 && !crate::smp::ensure_started(core) {
+        if group != 0 && !akuma_kernel_amd64::drivers::services::smp::ensure_started(core) {
             p("[KVM] linux: could not start core ");
             dec(core as u64);
             p("\n");
@@ -1218,15 +1218,15 @@ pub fn run(nrips: bool, vm: &Vm) {
     // host save area) is per core. A boot-time rehearsal is already there.
     let mut started = true;
     if owner_core != here {
-        started = crate::sched::repin_current(owner_core);
+        started = akuma_kernel_amd64::drivers::services::sched::repin_current(owner_core);
         if !started {
             p("[KVM] linux: could not move the VM task to its core\n");
-            let _ = crate::sched::repin_current(here);
+            let _ = akuma_kernel_amd64::drivers::services::sched::repin_current(here);
         }
     }
     let mut workers = 0usize;
     if started {
-        for core in 0..crate::smp::MAX_CPUS {
+        for core in 0..akuma_kernel_amd64::drivers::services::smp::MAX_CPUS {
             if group_of_core[core] == 0 || core == owner_core {
                 continue;
             }
@@ -1246,7 +1246,7 @@ pub fn run(nrips: bool, vm: &Vm) {
         for &core in &sh.place[..n_cpu] {
             reserve |= 1 << core;
         }
-        crate::sched::reserve_cores(reserve | super::super::boot_reserved());
+        akuma_kernel_amd64::drivers::services::sched::reserve_cores(reserve | super::super::boot_reserved());
     }
 
     crumb(0x55);
@@ -1272,7 +1272,7 @@ pub fn run(nrips: bool, vm: &Vm) {
     // must be too before anything they share is torn down. A worker that never started still
     // holds its job; take those back.
     sh.request_stop("run ended", false);
-    for core in 0..crate::smp::MAX_CPUS {
+    for core in 0..akuma_kernel_amd64::drivers::services::smp::MAX_CPUS {
         if group_of_core[core] != 0 && core != owner_core
             && let Some(job) = JOBS[core].lock().take() {
                 drop(job);
@@ -1283,20 +1283,20 @@ pub fn run(nrips: bool, vm: &Vm) {
     let mut waited = 0u32;
     while Arc::strong_count(&sh) > 1 {
         akuma_cpu::daif::mask_irq();
-        let _ = crate::lapic::arm_oneshot_in_us(500);
-        crate::sched::allow_tick();
+        let _ = akuma_kernel_amd64::drivers::services::lapic::arm_oneshot_in_us(500);
+        akuma_kernel_amd64::drivers::services::sched::allow_tick();
         akuma_cpu::daif::unmask_irq();
-        crate::sched::yield_now();
+        akuma_kernel_amd64::drivers::services::sched::yield_now();
         waited += 1;
         if waited.is_multiple_of(4000) {
             p("[KVM] linux: still waiting for a virtual processor's task\n");
         }
     }
     if service {
-        crate::sched::reserve_cores(super::super::boot_reserved());
+        akuma_kernel_amd64::drivers::services::sched::reserve_cores(super::super::boot_reserved());
     }
     if owner_core != here && started {
-        let _ = crate::sched::repin_current(here);
+        let _ = akuma_kernel_amd64::drivers::services::sched::repin_current(here);
     }
     report(&sh, n_cpu);
 }

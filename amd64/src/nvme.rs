@@ -457,8 +457,9 @@ pub fn open_partition(number: u32) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Lend partition `number` to the hypervisor's guest: a **second** window, validated like the
-/// first and refused when it is the host's partition or overlaps it (the host's root is never
+/// Lend partition `number` to the hypervisor's guest.
+///
+/// A **second** window, validated like the first and refused when it is the host's partition or overlaps it (the host's root is never
 /// the guest's disk). One at a time. Returns its size in bytes.
 pub fn open_guest_partition(number: u32) -> Result<u64, &'static str> {
     let mut g = NVME.lock();

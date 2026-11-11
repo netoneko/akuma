@@ -203,8 +203,9 @@ pub mod errno {
     /// "The image was rejected by the loader" — `exec_load_errno`'s default
     /// for a rejection string it does not recognise.
     pub const ENOEXEC: u64 = (-8i64) as u64;
-    /// The argument or environment list is longer than the initial stack
-    /// builder will place ([`crate::loader::MAX_ARGV`] / `MAX_ENVP`). Linux
+    /// The argument or environment list is too long.
+    ///
+    /// Longer than the initial stack builder will place ([`crate::loader::MAX_ARGV`] / `MAX_ENVP`). Linux
     /// answers this when `argv` exceeds `ARG_MAX`; this target answers it for
     /// the same reason, and answering it **at all** is the point — truncating
     /// instead handed `ld` a command line with its inputs missing and cost a
@@ -218,7 +219,9 @@ pub mod errno {
     /// `FUTEX_WAIT` ran out of time. The one errno a futex wait can return
     /// that no other syscall here produces.
     pub const ETIMEDOUT: u64 = (-110i64) as u64;
-    /// Interrupted. The one errno this kernel originates rather than reports:
+    /// Interrupted.
+    ///
+    /// The one errno this kernel originates rather than reports:
     /// a thread whose group called `exit_group` gets it for the syscall it was
     /// in the middle of, so the call fails rather than acting on a dying
     /// address space.
@@ -594,7 +597,7 @@ fn open_power(flags: u32) -> u64 {
 
 /// `open("/dev/kvm0")`: a `DevKvm` descriptor, when the hypervisor is armed (`kvmctl`).
 fn open_kvm(flags: u32) -> u64 {
-    if !crate::kvm::svm_armed() {
+    if !crate::drivers::hypervisor_armed() {
         return errno::ENOENT;
     }
     let Some(proc) = akuma_exec::process::current_process_shared() else {
@@ -898,17 +901,17 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     if resolved == "/dev/power" {
         return open_power(flags);
     }
-    // `/dev/kvm0`: the hypervisor's control device (`crate::kvm::ctl`), when armed.
+    // `/dev/kvm0`: the hypervisor's control device (`drivers::Hypervisor`), when armed.
     if resolved == "/dev/kvm0" {
         return open_kvm(flags);
     }
-    // `/dev/kvm`: the census stub (`crate::kvm::api`), only with the `kvmapi` boot flag.
-    if resolved == "/dev/kvm" && crate::kvm::api::enabled() {
-        return crate::kvm::api::open(flags);
+    // `/dev/kvm`: the census stub (`drivers::Hypervisor`), only with the `kvmapi` boot flag.
+    if resolved == "/dev/kvm" && crate::drivers::hypervisor_api_enabled() {
+        return crate::drivers::hypervisor_api_open(flags);
     }
     // `/dev/net/tun`: the tap for a userspace VMM's NIC, behind the hypervisor's gateway.
-    if resolved == "/dev/net/tun" {
-        return crate::kvm::tun::open(flags);
+    if resolved == "/dev/net/tun" && crate::drivers::hypervisor_present() {
+        return crate::drivers::hypervisor_tun_open(flags);
     }
     // `/dev/input/mouse0`: the touchpad's pointer stream (`crate::touchpad`).
     if resolved == "/dev/input/mouse0" {
@@ -1200,7 +1203,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     }
     // `/dev/net/tun`: one frame behind its virtio-net header, or `EAGAIN`.
     if is_dev_tun(fd) {
-        return crate::kvm::tun::read(buf, len.min(MAX_IO) as usize);
+        return crate::drivers::hypervisor_tun_read(buf, len.min(MAX_IO) as usize);
     }
     // `/dev/input/mouse0`: whole 8-byte pointer records, or `EAGAIN`.
     if is_dev_mouse(fd) {
@@ -1208,7 +1211,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     }
     // `/dev/kvm0`: the guest's console stream, `EAGAIN` while it is quiet, 0 once it ended.
     if is_dev_kvm(fd) {
-        return crate::kvm::ctl::dev_read(buf, len.min(MAX_IO) as usize);
+        return crate::drivers::hypervisor_ctl_read(buf, len.min(MAX_IO) as usize);
     }
     // `/dev/power`: the kernel's idle/dim facts, fresh per read.
     if is_dev_power(fd) {
@@ -2243,10 +2246,10 @@ pub fn sys_access(path: u64) -> u64 {
 #[must_use]
 pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     if let Some(id) = dev_kvm_api_id(fd) {
-        return crate::kvm::api::ioctl(fd, id, req as u32, arg);
+        return crate::drivers::hypervisor_api_ioctl(fd, id, req as u32, arg);
     }
     if is_dev_tun(fd) {
-        return crate::kvm::tun::ioctl(req as u32, arg);
+        return crate::drivers::hypervisor_tun_ioctl(req as u32, arg);
     }
     // The fbdev requests, on a `/dev/fb0` descriptor only.
     if is_dev_fb(fd) {

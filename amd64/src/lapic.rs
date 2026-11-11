@@ -490,6 +490,7 @@ pub fn arm_deadline() {
 /// [`restore_periodic`] bringing the periodic tick back once the shot fires), so
 /// the host tick resumes by itself; and like it, called with interrupts off on the
 /// core whose timer it touches. A shot already in flight that fires sooner stays.
+#[must_use]
 pub fn arm_oneshot_in_us(us: u64) -> bool {
     // Interrupts off for the whole arm, whatever the caller's `IF` was: see `arm_deadline`.
     akuma_primitives::irq::with_irqs_disabled(|| {

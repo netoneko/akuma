@@ -1198,7 +1198,7 @@ fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
     use crate::fd::errno;
     // A tap frame is one `writev`: splitting it per segment would send the header as its own frame.
     if crate::fd::is_dev_tun(fd) {
-        return crate::kvm::tun::writev(iov, cnt as usize);
+        return crate::drivers::hypervisor_tun_writev(iov, cnt as usize);
     }
     let cnt = (cnt as usize).min(1024);
     let mut total: u64 = 0;
@@ -1229,7 +1229,7 @@ fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
 fn sys_readv(fd: u64, iov: u64, cnt: u64) -> u64 {
     use crate::fd::errno;
     if crate::fd::is_dev_tun(fd) {
-        return crate::kvm::tun::readv(iov, cnt as usize);
+        return crate::drivers::hypervisor_tun_readv(iov, cnt as usize);
     }
     let cnt = (cnt as usize).min(1024);
     let mut total: u64 = 0;
@@ -1586,14 +1586,14 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
         return crate::drivers::wireless_dev_write(buf, len as usize);
     }
 
-    // `/dev/net/tun`: one frame behind its virtio-net header (`crate::kvm::tun`).
+    // `/dev/net/tun`: one frame behind its virtio-net header (`drivers::Hypervisor`).
     if crate::fd::is_dev_tun(fd) {
-        return crate::kvm::tun::write(buf, len as usize);
+        return crate::drivers::hypervisor_tun_write(buf, len as usize);
     }
 
-    // `/dev/kvm0`: a VM spec, `stop` or `status` (`crate::kvm::ctl`). Refused whole.
+    // `/dev/kvm0`: a VM spec, `stop` or `status` (`drivers::Hypervisor`). Refused whole.
     if crate::fd::is_dev_kvm(fd) {
-        return crate::kvm::ctl::dev_write(buf, len as usize);
+        return crate::drivers::hypervisor_ctl_write(buf, len as usize);
     }
 
     // `/dev/input/mouse0`: control lines (`natural`, `natural=0|1`) — the
@@ -3967,7 +3967,7 @@ fn sys_fork() -> u64 {
     // The parent-slot bound this used to check (`>= PROC_SLOTS`) is gone with
     // the hand-rolled slot search; `current_process()` inside `fork_process` is
     // the same question asked of the authoritative table.
-    crate::kvm::api::note_fork();
+    crate::drivers::hypervisor_note_fork();
     let child_pid = alloc_pid();
     match akuma_exec::process::fork_process(child_pid, 0) {
         Ok(pid) => u64::from(pid),

@@ -3426,8 +3426,9 @@ fn va_placement_check(t: &mut Suite) {
     );
 }
 
-/// Point the calling process's `[start, start + len)` at the contiguous physical block at `pa`:
-/// the hypervisor's "direct memory transfer" for a VMM's guest RAM (`kvm::api`,
+/// Point the calling process's `[start, start + len)` at the contiguous physical block at `pa`.
+///
+/// The hypervisor's "direct memory transfer" for a VMM's guest RAM (the hypervisor driver's `kvm::api`,
 /// `docs/archive/AKUMA_FIRECRACKER_KVM.md`). A page already present keeps its bytes (copied into the
 /// block) and its old frame goes back through the ledger exactly as `munmap` would; an absent page
 /// becomes the block's zeroed page. The new leaves are **borrowed**, like `mmap_framebuffer`'s: not in
@@ -3436,6 +3437,7 @@ fn va_placement_check(t: &mut Suite) {
 /// `start`/`len`/`pa` are page aligned. `false`: out of page-table frames partway (what was moved stays
 /// moved, and consistent). Only the calling thread's TLB is flushed: call before the VMM has other
 /// threads touching the range.
+#[must_use]
 pub fn remap_user_to_phys(start: usize, len: usize, pa: usize) -> bool {
     use akuma_mmu::MemAttr;
     let page = PAGE_SIZE as usize;
@@ -3467,11 +3469,13 @@ pub fn remap_user_to_phys(start: usize, len: usize, pa: usize) -> bool {
     .unwrap_or(false)
 }
 
-/// Map the physical frames `frames` (page-aligned addresses, in order) into the calling process as one
-/// read-write shared region, at `addr` with `MAP_FIXED` or at a fresh address. The frames are
+/// Map the physical frames `frames` (page-aligned addresses, in order) into the calling process.
+///
+/// One read-write shared region, at `addr` with `MAP_FIXED` or at a fresh address. The frames are
 /// **borrowed**, as `mmap_framebuffer`'s are: recorded as a region, absent from the ledger, so no
-/// teardown path hands them to the allocator. For the hypervisor's vCPU run page (`kvm::api`), which
+/// teardown path hands them to the allocator. For the hypervisor's vCPU run page (the hypervisor driver's `kvm::api`), which
 /// the kernel keeps writing through the physmap while the VMM reads it. Returns the address or an errno.
+#[must_use]
 pub fn mmap_frames(addr: u64, flags: u32, prot: u32, frames: &[usize]) -> u64 {
     use akuma_syscalls_linux::flags::map::MAP_FIXED;
     let pages = frames.len();

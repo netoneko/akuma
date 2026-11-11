@@ -85,11 +85,6 @@ mod idt;
 mod input;
 #[cfg(target_arch = "x86_64")]
 mod kbd;
-/// The SVM hypervisor seed (`docs/archive/AKUMA_KVM.md`): a CPUID probe on
-/// every boot and, behind `kvmtest`, a trivial guest. Spec-first — no Linux
-/// code; the data vocabulary lives in `akuma-svm-amd64`.
-#[cfg(target_arch = "x86_64")]
-mod kvm;
 #[cfg(target_arch = "x86_64")]
 mod lapic;
 #[cfg(target_arch = "x86_64")]
@@ -338,10 +333,10 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
             // `start_secondaries` so the APs enable SVM too. Opt-in like `pci`:
             // a plain PVH boot (Firecracker) has no SVM and prints nothing new.
             if machine::flag(hvm_start_info, "kvmtest") || machine::flag(hvm_start_info, "kvmctl") {
-                kvm::init(cmdline);
+                crate::drivers::hypervisor_init(cmdline);
                 // After the root mount (above): the Linux rung reads its kernel
                 // off the filesystem.
-                kvm::late(cmdline);
+                crate::drivers::hypervisor_late(cmdline);
             }
             boot::bring_up_secondaries(machine.madt.as_ref(), &facts, cmdline, &keep_out);
         });
@@ -356,7 +351,7 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
             boot::dhcp_then_clock();
             net::spawn_netpoll();
             // A service guest (`kvmserve`) needs the host's network: start it now.
-            kvm::spawn_service(cmdline);
+            crate::drivers::hypervisor_spawn_service(cmdline);
         }
     }
 

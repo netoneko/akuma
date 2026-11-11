@@ -26,9 +26,9 @@ use akuma_kvm_abi::state::{CPUID_ENTRY_LEN, CpuidEntry, LIST_HDR};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spinning_top::Spinlock;
 
-use crate::fd::errno;
-use crate::phys::FreshFrame;
-use crate::serial;
+use akuma_kernel_amd64::drivers::services::errno;
+use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
+use akuma_kernel_amd64::drivers::services::serial;
 use alloc::boxed::Box;
 use platform::Platform;
 use vcpu::Vcpu;
@@ -222,7 +222,7 @@ fn owner_gone(owner: u32) -> bool {
 }
 
 fn current_tgid() -> u32 {
-    crate::usermode::current_process().map_or(0, |p| p.tgid)
+    akuma_kernel_amd64::drivers::services::usermode::current_process().map_or(0, |p| p.tgid)
 }
 
 fn new_handle(kind: Kind, vcpu: u8) -> u64 {
@@ -244,7 +244,7 @@ fn new_handle(kind: Kind, vcpu: u8) -> u64 {
 pub fn open(flags: u32) -> u64 {
     reap_handles();
     let r = new_handle(Kind::System, 0);
-    if r.cast_signed() >= 0 && flags & crate::fd::open_flags::O_CLOEXEC != 0
+    if r.cast_signed() >= 0 && flags & akuma_kernel_amd64::drivers::services::fd::open_flags::O_CLOEXEC != 0
         && let Some(proc) = akuma_exec::process::current_process_shared()
     {
         proc.set_cloexec(r as u32);
@@ -261,7 +261,7 @@ fn answer(h: Handle, op: Op, arg: u64) -> u64 {
         Op::GetApiVersion => 12,
         Op::CheckExtension => u64::from(CAPS_YES.contains(&(arg as u32))),
         Op::GetSupportedCpuid => supported_cpuid(arg),
-        Op::GetMsrIndexList => if crate::uaccess::write_val::<u32>(arg, 0) { 0 } else { errno::EFAULT },
+        Op::GetMsrIndexList => if akuma_kernel_amd64::drivers::services::uaccess::write_val::<u32>(arg, 0) { 0 } else { errno::EFAULT },
         Op::GetVcpuMmapSize => RUN_MAP_SIZE,
         Op::CreateVm => create_vm(),
         Op::SetTssAddr => with_vm(|v| {
@@ -313,7 +313,7 @@ fn answer(h: Handle, op: Op, arg: u64) -> u64 {
         Op::GetSregs => with_vcpu(h.vcpu, |vc, p| {
             let mut out = [0u8; akuma_kvm_abi::state::SREGS_LEN];
             vc.get_sregs(p).encode(&mut out);
-            if crate::uaccess::write_bytes(arg, &out) { 0 } else { errno::EFAULT }
+            if akuma_kernel_amd64::drivers::services::uaccess::write_bytes(arg, &out) { 0 } else { errno::EFAULT }
         }),
         Op::GetLapic | Op::SetLapic => 0, // slice 3: the LAPIC register image
         Op::Run => run_vcpu(h.vcpu),
@@ -322,13 +322,13 @@ fn answer(h: Handle, op: Op, arg: u64) -> u64 {
 
 /// `SET_MSRS`: a header `{nmsrs, pad}` and that many 16-byte entries; returns how many were taken.
 fn set_msrs(h: Handle, arg: u64) -> u64 {
-    let Some(n) = crate::uaccess::read_val::<u32>(arg).map(|n| n as usize) else { return errno::EFAULT };
+    let Some(n) = akuma_kernel_amd64::drivers::services::uaccess::read_val::<u32>(arg).map(|n| n as usize) else { return errno::EFAULT };
     if n > 64 {
         return errno::E2BIG;
     }
     let mut buf = [0u8; 64 * akuma_kvm_abi::state::MSR_ENTRY_LEN];
     let len = n * akuma_kvm_abi::state::MSR_ENTRY_LEN;
-    if !crate::uaccess::read_bytes(arg + akuma_kvm_abi::state::LIST_HDR as u64, &mut buf[..len]) {
+    if !akuma_kernel_amd64::drivers::services::uaccess::read_bytes(arg + akuma_kvm_abi::state::LIST_HDR as u64, &mut buf[..len]) {
         return errno::EFAULT;
     }
     with_vcpu(h.vcpu, |vc, p| vc.set_msrs(&buf[..len], n, p) as u64)
@@ -336,13 +336,13 @@ fn set_msrs(h: Handle, arg: u64) -> u64 {
 
 /// `SET_CPUID2`: a header `{nent, pad}` and that many 40-byte entries.
 fn set_cpuid2(h: Handle, arg: u64) -> u64 {
-    let Some(n) = crate::uaccess::read_val::<u32>(arg).map(|n| n as usize) else { return errno::EFAULT };
+    let Some(n) = akuma_kernel_amd64::drivers::services::uaccess::read_val::<u32>(arg).map(|n| n as usize) else { return errno::EFAULT };
     if n > vcpu::MAX_CPUID {
         return errno::E2BIG;
     }
     let mut buf = [0u8; vcpu::MAX_CPUID * CPUID_ENTRY_LEN];
     let len = n * CPUID_ENTRY_LEN;
-    if !crate::uaccess::read_bytes(arg + LIST_HDR as u64, &mut buf[..len]) {
+    if !akuma_kernel_amd64::drivers::services::uaccess::read_bytes(arg + LIST_HDR as u64, &mut buf[..len]) {
         return errno::EFAULT;
     }
     with_vcpu(h.vcpu, |vc, _| if vc.set_cpuid(&buf[..len], n) { 0 } else { errno::E2BIG })
@@ -424,7 +424,7 @@ fn with_vcpu(id: u8, f: impl FnOnce(&mut Vcpu, &mut Platform) -> u64) -> u64 {
 
 fn user_bytes<const N: usize>(arg: u64) -> Option<[u8; N]> {
     let mut b = [0u8; N];
-    crate::uaccess::read_bytes(arg, &mut b).then_some(b)
+    akuma_kernel_amd64::drivers::services::uaccess::read_bytes(arg, &mut b).then_some(b)
 }
 
 fn run_vcpu(id: u8) -> u64 {
@@ -469,12 +469,12 @@ pub fn mmap_vcpu(id: u32, addr: u64, len: u64, prot: u64, flags: u64) -> u64 {
     }
     let pas = irq_off(|| VM.lock().as_ref().map(|v| v.run_pas[h.vcpu as usize]));
     let Some(pas) = pas else { return errno::EINVAL };
-    crate::mm::mmap_frames(addr, flags as u32, prot as u32, &pas[..pages])
+    akuma_kernel_amd64::drivers::services::mm::mmap_frames(addr, flags as u32, prot as u32, &pas[..pages])
 }
 
 fn set_memory_region(arg: u64) -> u64 {
     let mut raw = [0u8; slots::ARG_LEN];
-    if !crate::uaccess::read_bytes(arg, &mut raw) {
+    if !akuma_kernel_amd64::drivers::services::uaccess::read_bytes(arg, &mut raw) {
         return errno::EFAULT;
     }
     let Some(r) = Region::parse(&raw) else { return errno::EFAULT };
@@ -502,7 +502,7 @@ fn set_memory_region(arg: u64) -> u64 {
             return errno::ENOMEM;
         }
     };
-    if !crate::mm::remap_user_to_phys(r.uaddr as usize, r.size as usize, pa as usize) {
+    if !akuma_kernel_amd64::drivers::services::mm::remap_user_to_phys(r.uaddr as usize, r.size as usize, pa as usize) {
         super::ctl::uncarve(off);
         return errno::ENOMEM;
     }
@@ -523,12 +523,12 @@ fn set_memory_region(arg: u64) -> u64 {
 
 fn irqfd(arg: u64) -> u64 {
     let mut raw = [0u8; IRQFD_LEN];
-    if !crate::uaccess::read_bytes(arg, &mut raw) {
+    if !akuma_kernel_amd64::drivers::services::uaccess::read_bytes(arg, &mut raw) {
         return errno::EFAULT;
     }
     let Some(a) = Irqfd::parse(&raw) else { return errno::EFAULT };
     let deassign = a.flags & 1 != 0;
-    let id = crate::fd::eventfd_id_of(u64::from(a.fd));
+    let id = akuma_kernel_amd64::drivers::services::fd::eventfd_id_of(u64::from(a.fd));
     with_vm(|v| {
         if deassign {
             for s in &mut v.irqfds {
@@ -556,11 +556,11 @@ fn irqfd(arg: u64) -> u64 {
 
 fn ioeventfd(arg: u64) -> u64 {
     let mut raw = [0u8; IOEVENTFD_LEN];
-    if !crate::uaccess::read_bytes(arg, &mut raw) {
+    if !akuma_kernel_amd64::drivers::services::uaccess::read_bytes(arg, &mut raw) {
         return errno::EFAULT;
     }
     let Some(a) = Ioeventfd::parse(&raw) else { return errno::EFAULT };
-    let id = crate::fd::eventfd_id_of(a.fd.cast_unsigned().into());
+    let id = akuma_kernel_amd64::drivers::services::fd::eventfd_id_of(a.fd.cast_unsigned().into());
     with_vm(|v| {
         if a.flags & IOEVENTFD_DEASSIGN != 0 {
             for s in &mut v.ioeventfds {
@@ -675,13 +675,13 @@ fn leaves(out: &mut [(u32, u32); MAX_LEAVES]) -> usize {
 }
 
 fn supported_cpuid(arg: u64) -> u64 {
-    let Some(nent) = crate::uaccess::read_val::<u32>(arg) else {
+    let Some(nent) = akuma_kernel_amd64::drivers::services::uaccess::read_val::<u32>(arg) else {
         return errno::EFAULT;
     };
     let mut table = [(0u32, 0u32); MAX_LEAVES];
     let n = leaves(&mut table);
     if (nent as usize) < n {
-        let _ = crate::uaccess::write_val::<u32>(arg, n as u32);
+        let _ = akuma_kernel_amd64::drivers::services::uaccess::write_val::<u32>(arg, n as u32);
         return (-7i64) as u64; // E2BIG
     }
     for (i, &(leaf, sub)) in table[..n].iter().enumerate() {
@@ -689,18 +689,18 @@ fn supported_cpuid(arg: u64) -> u64 {
         let f = akuma_svm_amd64::cpuid::filter(leaf, [r.eax, r.ebx, r.ecx, r.edx]);
         let mut bytes = [0u8; CPUID_ENTRY_LEN];
         CpuidEntry { function: leaf, index: sub, flags: 0, eax: f[0], ebx: f[1], ecx: f[2], edx: f[3] }.encode(&mut bytes);
-        if !crate::uaccess::write_bytes(arg + LIST_HDR as u64 + (i * CPUID_ENTRY_LEN) as u64, &bytes) {
+        if !akuma_kernel_amd64::drivers::services::uaccess::write_bytes(arg + LIST_HDR as u64 + (i * CPUID_ENTRY_LEN) as u64, &bytes) {
             return errno::EFAULT;
         }
     }
-    let _ = crate::uaccess::write_val::<u32>(arg, n as u32);
+    let _ = akuma_kernel_amd64::drivers::services::uaccess::write_val::<u32>(arg, n as u32);
     0
 }
 
 /// The bytes of the argument structure (first `n`), eight words per line.
 fn dump(arg: u64, n: usize) {
     let mut b = [0u8; 288];
-    if !crate::uaccess::read_bytes(arg, &mut b[..n]) {
+    if !akuma_kernel_amd64::drivers::services::uaccess::read_bytes(arg, &mut b[..n]) {
         serial::puts("(arg unreadable)\n");
         return;
     }
@@ -737,6 +737,6 @@ fn var_len(arg: u64, req: u32) -> Option<usize> {
         0x4000_ae89 | 0xc000_ae88 => (16, 0),
         _ => return None,
     };
-    let n = crate::uaccess::read_val::<u32>(arg)? as usize;
+    let n = akuma_kernel_amd64::drivers::services::uaccess::read_val::<u32>(arg)? as usize;
     Some(8 + stride * n.min(6))
 }

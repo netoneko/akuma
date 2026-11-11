@@ -393,6 +393,153 @@ pub fn wireless_release(tgid: u32, fd: u32) {
     }
 }
 
+/// Hypervisor: the AMD SVM host (`/dev/kvm0`, the `/dev/kvm` ioctl surface, the
+/// `/dev/net/tun` tap behind its gateway).
+///
+/// Every node it serves is a char device, so the class is the char-device edge for those
+/// three nodes: `fd`'s `open`/`read`/`ioctl` and `usermode`'s `write`/`writev`/`readv`/`close`
+/// arms forward here, as do `fork` and `mmap`'s notes for the ioctl surface. The descriptor
+/// kinds (`FileDescriptor::DevKvm`, ..) stay in `fd`: they are the fd table's vocabulary.
+/// Without a driver none of the nodes opens (`ENOENT`, as on a CPU without SVM).
+pub struct Hypervisor {
+    /// The SVM probe and, by command line, the rehearsal guests (BSP, after `mem::init`).
+    pub init: fn(&str),
+    /// After the root mount and the LAPIC timer: the guests that read a kernel off disk.
+    pub late: fn(&str),
+    /// Once the host's network runs: a service guest (`kvmserve`).
+    pub spawn_service: fn(&str),
+    /// Per application processor: its host save area and `EFER.SVME`.
+    pub ap_hook: fn(),
+    /// `/dev/kvm0` opens (`kvmctl` armed the hypervisor).
+    pub armed: fn() -> bool,
+    /// `read(2)` on `/dev/kvm0`: the guest's console stream.
+    pub ctl_read: fn(buf: u64, len: usize) -> u64,
+    /// `write(2)` on `/dev/kvm0`: a VM spec, `stop` or `status`.
+    pub ctl_write: fn(buf: u64, len: usize) -> u64,
+    /// `/dev/kvm` opens (`kvmapi`/`kvmctl`).
+    pub api_enabled: fn() -> bool,
+    pub api_open: fn(flags: u32) -> u64,
+    pub api_ioctl: fn(fd: u64, id: u32, req: u32, arg: u64) -> u64,
+    /// A `fork` is about to copy the descriptors.
+    pub api_note_fork: fn(),
+    /// An `mmap` of a `/dev/kvm` descriptor, recorded.
+    pub api_note_mmap: fn(fd: u64, addr: u64, len: u64, prot: u64, flags: u64, off: u64),
+    /// Map a vCPU's run page; `ENODEV` for a descriptor that is not a vCPU.
+    pub api_mmap_vcpu: fn(id: u32, addr: u64, len: u64, prot: u64, flags: u64) -> u64,
+    pub tun_open: fn(flags: u32) -> u64,
+    pub tun_release: fn(),
+    pub tun_read: fn(buf: u64, len: usize) -> u64,
+    pub tun_write: fn(buf: u64, len: usize) -> u64,
+    pub tun_readv: fn(iov: u64, cnt: usize) -> u64,
+    pub tun_writev: fn(iov: u64, cnt: usize) -> u64,
+    pub tun_ioctl: fn(req: u32, arg: u64) -> u64,
+    /// The gateway has a frame for the tap (the poll family's readiness).
+    pub tun_has_frame: fn() -> bool,
+}
+
+static HYPERVISOR: Registered<&'static Hypervisor> = Registered::new("no hypervisor registered");
+
+/// Install the hypervisor. Idempotent by `Registered`'s contract.
+pub fn register_hypervisor(driver: &'static Hypervisor) {
+    HYPERVISOR.register(driver);
+}
+
+#[must_use]
+pub fn hypervisor_present() -> bool {
+    HYPERVISOR.is_registered()
+}
+
+pub fn hypervisor_init(cmdline: &str) {
+    if let Some(d) = HYPERVISOR.get() {
+        (d.init)(cmdline);
+    }
+}
+
+pub fn hypervisor_late(cmdline: &str) {
+    if let Some(d) = HYPERVISOR.get() {
+        (d.late)(cmdline);
+    }
+}
+
+pub fn hypervisor_spawn_service(cmdline: &str) {
+    if let Some(d) = HYPERVISOR.get() {
+        (d.spawn_service)(cmdline);
+    }
+}
+
+pub fn hypervisor_ap_hook() {
+    if let Some(d) = HYPERVISOR.get() {
+        (d.ap_hook)();
+    }
+}
+
+#[must_use]
+pub fn hypervisor_armed() -> bool {
+    HYPERVISOR.get().is_some_and(|d| (d.armed)())
+}
+
+#[must_use]
+pub fn hypervisor_api_enabled() -> bool {
+    HYPERVISOR.get().is_some_and(|d| (d.api_enabled)())
+}
+
+pub fn hypervisor_note_fork() {
+    if let Some(d) = HYPERVISOR.get() {
+        (d.api_note_fork)();
+    }
+}
+
+pub fn hypervisor_api_note_mmap(
+    fd: u64,
+    addr: akuma_primitives::addr::VirtAddr,
+    len: u64,
+    prot: u64,
+    flags: u64,
+    off: u64,
+) {
+    if let Some(d) = HYPERVISOR.get() {
+        (d.api_note_mmap)(fd, addr.get() as u64, len, prot, flags, off);
+    }
+}
+
+pub fn hypervisor_tun_release() {
+    if let Some(d) = HYPERVISOR.get() {
+        (d.tun_release)();
+    }
+}
+
+#[must_use]
+pub fn hypervisor_tun_has_frame() -> bool {
+    HYPERVISOR.get().is_some_and(|d| (d.tun_has_frame)())
+}
+
+/// The rest answer `ENOENT` (an open) or `ENODEV` without a driver. Only the opens are
+/// reachable then: no descriptor of these kinds can exist without one.
+macro_rules! hypervisor_forward {
+    ($($(#[$m:meta])* fn $name:ident => $field:ident ($($a:ident: $t:ty),*) -> u64 or $none:ident;)*) => {$(
+        $(#[$m])*
+        #[must_use]
+        pub fn $name($($a: $t),*) -> u64 {
+            HYPERVISOR.get().map_or(crate::fd::errno::$none, |d| (d.$field)($($a),*))
+        }
+    )*};
+}
+
+hypervisor_forward! {
+    fn hypervisor_ctl_read => ctl_read(buf: u64, len: usize) -> u64 or ENODEV;
+    fn hypervisor_ctl_write => ctl_write(buf: u64, len: usize) -> u64 or ENODEV;
+    fn hypervisor_api_open => api_open(flags: u32) -> u64 or ENOENT;
+    fn hypervisor_api_ioctl => api_ioctl(fd: u64, id: u32, req: u32, arg: u64) -> u64 or ENODEV;
+    fn hypervisor_api_mmap_vcpu => api_mmap_vcpu(id: u32, addr: u64, len: u64, prot: u64, flags: u64)
+        -> u64 or ENODEV;
+    fn hypervisor_tun_open => tun_open(flags: u32) -> u64 or ENOENT;
+    fn hypervisor_tun_read => tun_read(buf: u64, len: usize) -> u64 or ENODEV;
+    fn hypervisor_tun_write => tun_write(buf: u64, len: usize) -> u64 or ENODEV;
+    fn hypervisor_tun_readv => tun_readv(iov: u64, cnt: usize) -> u64 or ENODEV;
+    fn hypervisor_tun_writev => tun_writev(iov: u64, cnt: usize) -> u64 or ENODEV;
+    fn hypervisor_tun_ioctl => tun_ioctl(req: u32, arg: u64) -> u64 or ENODEV;
+}
+
 /// What a driver may use of the machine half.
 pub mod services {
     /// The VFS's view of driver-owned device nodes.
@@ -418,7 +565,37 @@ pub mod services {
         pub use crate::fs::{metadata, read_at, resolve_symlinks};
     }
     pub mod errno {
-        pub use crate::fd::errno::{EAGAIN, EFAULT, EINVAL, EIO, ENODEV, EOPNOTSUPP};
+        pub use crate::fd::errno::{
+            E2BIG, EAGAIN, EBADF, EBUSY, EEXIST, EFAULT, EINTR, EINVAL, EIO, EMFILE, ENODEV,
+            ENOENT, ENOMEM, ENOTTY, EOPNOTSUPP, ESRCH,
+        };
+    }
+    /// The fd table's view a driver needs: `O_CLOEXEC` and an eventfd's identity.
+    pub mod fd {
+        pub use crate::fd::eventfd_id_of;
+        pub mod open_flags {
+            pub use crate::fd::open_flags::O_CLOEXEC;
+        }
+    }
+    /// User mappings of physical frames (the hypervisor's guest RAM and run pages).
+    pub mod mm {
+        pub use crate::mm::{mmap_frames, remap_user_to_phys};
+    }
+    /// A guest disk on an NVMe partition.
+    pub mod nvme {
+        pub use crate::nvme::{
+            close_guest_partition, flush, guest_read, guest_write, open_guest_partition,
+        };
+    }
+    pub mod phys {
+        pub use crate::phys::{FreshFrame, KERNEL_VMA};
+    }
+    /// Cores: which one, how many, waking and starting them, the BKL window.
+    pub mod smp {
+        pub use crate::smp::{
+            bkl_drop_window, cpu_index, ensure_started, is_deferred, kick_core, online_cpus,
+            MAX_CPUS,
+        };
     }
     pub mod input {
         pub use crate::input::note_input;
@@ -436,10 +613,10 @@ pub mod services {
         pub use crate::polltime::{spin_us, ticks_ms, tsc, tsc_hz};
     }
     pub mod uaccess {
-        pub use crate::uaccess::{read_bytes, write_bytes};
+        pub use crate::uaccess::{read_bytes, read_val, write_bytes, write_val};
     }
     pub mod lapic {
-        pub use crate::lapic::{tsc_hz, tsc_uptime_us};
+        pub use crate::lapic::{arm_oneshot_in_us, tsc_hz, tsc_uptime_us, US_PER_TICK_TARGET};
     }
     pub mod pci {
         pub use crate::pci::{
@@ -449,7 +626,11 @@ pub mod services {
         };
     }
     pub mod sched {
-        pub use crate::sched::{block_until_deadline, spawn_daemon, wake, yield_now};
+        pub use crate::sched::{
+            affinity_of, allow_tick, block_until_deadline, fpu_restore_live, fpu_save_live,
+            halted_tsc, repin_current, reserve_cores, spawn_daemon, spawn_daemon_on, unpin_current,
+            wake, yield_now, FxArea,
+        };
     }
     pub mod serial {
         pub use crate::serial::{put_dec, put_hex, put_hexn, puts};

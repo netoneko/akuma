@@ -17,11 +17,11 @@ use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
 use super::platform::{Offer, Platform, Source};
-use crate::fd::errno;
+use akuma_kernel_amd64::drivers::services::errno;
 use crate::kvm::linux::{Guest, GuestRegs, INTR0_BASE, get_reg, init_vmcb, save_host, set_reg, vmrun_regs};
 use crate::kvm::{enable_on_core, next_rip};
-use crate::phys::FreshFrame;
-use crate::sched::FxArea;
+use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
+use akuma_kernel_amd64::drivers::services::sched::FxArea;
 
 pub(super) const MAX_CPUID: usize = 96;
 /// The run mapping is two pages: the structure, then room for the coalesced-MMIO ring.
@@ -75,13 +75,13 @@ static IRQS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(
 /// Log the first few of an event kind (the `kvmapi` census instrument).
 fn note(what: &str, v: u64, n: u32) {
     if n < 12 {
-        crate::serial::puts("[kvmapi] ");
-        crate::serial::puts(what);
-        crate::serial::puts(" 0x");
-        crate::serial::put_hexn(v, 8);
-        crate::serial::puts(" #");
-        crate::serial::put_dec(u64::from(n));
-        crate::serial::puts("\n");
+        akuma_kernel_amd64::drivers::services::serial::puts("[kvmapi] ");
+        akuma_kernel_amd64::drivers::services::serial::puts(what);
+        akuma_kernel_amd64::drivers::services::serial::puts(" 0x");
+        akuma_kernel_amd64::drivers::services::serial::put_hexn(v, 8);
+        akuma_kernel_amd64::drivers::services::serial::puts(" #");
+        akuma_kernel_amd64::drivers::services::serial::put_dec(u64::from(n));
+        akuma_kernel_amd64::drivers::services::serial::puts("\n");
     }
 }
 
@@ -346,7 +346,7 @@ struct Pinned;
 
 impl Drop for Pinned {
     fn drop(&mut self) {
-        crate::sched::unpin_current();
+        akuma_kernel_amd64::drivers::services::sched::unpin_current();
     }
 }
 
@@ -373,12 +373,12 @@ pub(super) fn run(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Tabl
 static PLACED_TRACED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn placed_core(id: usize) -> Option<usize> {
-    let wanted = crate::sched::affinity_of(akuma_exec::threading::current_thread_id());
+    let wanted = akuma_kernel_amd64::drivers::services::sched::affinity_of(akuma_exec::threading::current_thread_id());
     let kvm = crate::kvm::vm_cores();
     if wanted == 0 && kvm == 1 {
         return None;
     }
-    let online = crate::smp::online_cpus();
+    let online = akuma_kernel_amd64::drivers::services::smp::online_cpus();
     let allowed = if kvm == 1 { akuma_affinity::online_mask(online) } else { kvm };
     let placed = akuma_vm_spec::cores::place(wanted, allowed, |c| (c as usize) < online, id + 1)?;
     Some(usize::from(*placed.get(id.min(akuma_vm_spec::cores::MAX_PLACED - 1))?))
@@ -386,25 +386,25 @@ fn placed_core(id: usize) -> Option<usize> {
 
 fn run_pinned(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64, ev: &Events) -> u64 {
     // The core must have SVM on and the thread must stay on it.
-    let mut me = placed_core(vc.id).unwrap_or_else(crate::smp::cpu_index);
+    let mut me = placed_core(vc.id).unwrap_or_else(akuma_kernel_amd64::drivers::services::smp::cpu_index);
     if PLACED_TRACED.fetch_or(1 << (vc.id & 31), core::sync::atomic::Ordering::Relaxed) & (1 << (vc.id & 31)) == 0 {
         akuma_primitives::safe_print!(
             128,
             "[KVM] vcpu {} -> core {} (thread affinity {:#x}, kvmcores {:#x})\n",
             vc.id,
             me,
-            crate::sched::affinity_of(akuma_exec::threading::current_thread_id()),
+            akuma_kernel_amd64::drivers::services::sched::affinity_of(akuma_exec::threading::current_thread_id()),
             crate::kvm::vm_cores()
         );
     }
     for _ in 0..3 {
-        if !crate::sched::repin_current(me) {
+        if !akuma_kernel_amd64::drivers::services::sched::repin_current(me) {
             return errno::EAGAIN;
         }
-        if crate::smp::cpu_index() == me {
+        if akuma_kernel_amd64::drivers::services::smp::cpu_index() == me {
             break;
         }
-        me = crate::smp::cpu_index();
+        me = akuma_kernel_amd64::drivers::services::smp::cpu_index();
     }
     let _pin = Pinned;
     if !enable_on_core(me) {
@@ -421,7 +421,7 @@ fn run_pinned(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, n
 }
 
 fn io_ticks() -> u64 {
-    svm::pit::ticks_from_us(crate::net::uptime_us())
+    svm::pit::ticks_from_us(akuma_kernel_amd64::drivers::services::net::uptime_us())
 }
 
 fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64, ev: &Events, _core: usize) -> u64 {
@@ -444,10 +444,10 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
         // Other host threads (the VMM's own device thread, the network) get the core between entries:
         // the kernel switches cooperatively, and the switch expects interrupts masked.
         akuma_cpu::daif::mask_irq();
-        crate::sched::yield_now();
+        akuma_kernel_amd64::drivers::services::sched::yield_now();
         akuma_cpu::daif::unmask_irq();
         ev.poll_irqs(plat);
-        let now = crate::net::uptime_us();
+        let now = akuma_kernel_amd64::drivers::services::net::uptime_us();
         // Offer the best vector (bringing the PIT and the APIC timer up to now), and find when the next
         // timer will want a host interrupt.
         let (offered, due) = with_plat(plat, |p| (p.offer(id, now), p.next_event_us(id)));
@@ -475,20 +475,20 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
         // A host interrupt at the guest's next deadline (or this quantum's end) ends the entry.
         let wake = due.unwrap_or(u64::MAX).min(now + QUANTUM_US);
         akuma_cpu::daif::mask_irq();
-        let _ = crate::lapic::arm_oneshot_in_us(wake.saturating_sub(crate::net::uptime_us()));
+        let _ = akuma_kernel_amd64::drivers::services::lapic::arm_oneshot_in_us(wake.saturating_sub(akuma_kernel_amd64::drivers::services::net::uptime_us()));
         akuma_cpu::daif::unmask_irq();
 
         save_host(host_pa);
-        crate::sched::fpu_save_live(&mut host_fpu);
-        crate::sched::fpu_restore_live(&vc.fpu[0]);
+        akuma_kernel_amd64::drivers::services::sched::fpu_save_live(&mut host_fpu);
+        akuma_kernel_amd64::drivers::services::sched::fpu_restore_live(&vc.fpu[0]);
         // SAFETY: the VMCB and host-save frames are live and owned by `vc`; SVM is enabled on this core
         // (`enable_on_core`) and the thread is pinned to it.
         let unlocked = Unlocked::new();
         unsafe { vmrun_regs(vmcb_pa, host_pa, &mut vc.regs) };
         drop(unlocked);
-        crate::sched::fpu_save_live(&mut vc.fpu[0]);
+        akuma_kernel_amd64::drivers::services::sched::fpu_save_live(&mut vc.fpu[0]);
         host_fpu.sanitize();
-        crate::sched::fpu_restore_live(&host_fpu);
+        akuma_kernel_amd64::drivers::services::sched::fpu_restore_live(&host_fpu);
 
         let mut v = Vmcb::new(vc.vmcb.bytes_mut());
         trace_exit(v.exitcode(), v.rip(), v.exitinfo1(), v.exitinfo2());
@@ -599,7 +599,7 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
                 };
                 if let Some(base) = lapic_off {
                     let off = gpa - base;
-                    let now = svm::lapic::bus_ticks_from_us(crate::net::uptime_us());
+                    let now = svm::lapic::bus_ticks_from_us(akuma_kernel_amd64::drivers::services::net::uptime_us());
                     with_plat(plat, |p| {
                         let mut dev = LapicDev { lapic: p.lapic(id), off, now };
                         emulate(&a, &mut dev, &mut v, &mut vc.regs);
@@ -748,7 +748,7 @@ fn idle(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, ev: &Events) -> Option
             return Some(errno::EINTR);
         }
         ev.poll_irqs(plat);
-        let now = crate::net::uptime_us();
+        let now = akuma_kernel_amd64::drivers::services::net::uptime_us();
         let (offer, due, can_wake): (Option<Offer>, Option<u64>, bool) =
             with_plat(plat, |p| (p.offer(id, now), p.next_event_us(id), p.can_wake(id)));
         if let Some(o) = offer {
@@ -763,7 +763,7 @@ fn idle(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, ev: &Events) -> Option
         }
         idle_note(vc, now, due, can_wake);
         akuma_cpu::daif::mask_irq();
-        crate::sched::block_until_deadline(deadline.max(now + 50));
+        akuma_kernel_amd64::drivers::services::sched::block_until_deadline(deadline.max(now + 50));
         akuma_cpu::daif::unmask_irq();
     }
 }
@@ -785,7 +785,7 @@ mod evring {
     static HEAD: AtomicUsize = AtomicUsize::new(0);
 
     pub(super) fn push(kind: u8, a: u64, b: u64, c: u64) {
-        let us = crate::net::uptime_us() & 0x00ff_ffff_ffff_ffff;
+        let us = akuma_kernel_amd64::drivers::services::net::uptime_us() & 0x00ff_ffff_ffff_ffff;
         let at = HEAD.fetch_add(1, Relaxed) % N * WORDS;
         RING[at].store(u64::from(kind) << 56 | us, Relaxed);
         RING[at + 1].store(a, Relaxed);
@@ -850,16 +850,16 @@ fn idle_note(vc: &mut Vcpu, now: u64, due: Option<u64>, can_wake: bool) {
         let v = vc.vmcb();
         (v.rip(), v.rflags())
     };
-    let s = crate::serial::puts;
+    let s = akuma_kernel_amd64::drivers::services::serial::puts;
     s("[kvmapi] vcpu idle turns=");
-    crate::serial::put_dec(u64::from(n));
+    akuma_kernel_amd64::drivers::services::serial::put_dec(u64::from(n));
     s(" rip=0x");
-    crate::serial::put_hexn(rip, 16);
+    akuma_kernel_amd64::drivers::services::serial::put_hexn(rip, 16);
     s(" rflags=0x");
-    crate::serial::put_hexn(rflags, 8);
+    akuma_kernel_amd64::drivers::services::serial::put_hexn(rflags, 8);
     s(" due_in_us=");
     match due {
-        Some(d) => crate::serial::put_dec(d.saturating_sub(now)),
+        Some(d) => akuma_kernel_amd64::drivers::services::serial::put_dec(d.saturating_sub(now)),
         None => s("none"),
     }
     s(" can_wake=");
@@ -888,16 +888,16 @@ fn trace_exit(code: u64, rip: u64, i1: u64, i2: u64) {
     if n >= 24 && !n.is_multiple_of(8192) {
         return;
     }
-    let s = crate::serial::puts;
+    let s = akuma_kernel_amd64::drivers::services::serial::puts;
     s("[kvmapi] exit #");
-    crate::serial::put_dec(u64::from(n));
+    akuma_kernel_amd64::drivers::services::serial::put_dec(u64::from(n));
     s(" code=0x");
-    crate::serial::put_hexn(code, 4);
+    akuma_kernel_amd64::drivers::services::serial::put_hexn(code, 4);
     s(" rip=0x");
-    crate::serial::put_hexn(rip, 16);
+    akuma_kernel_amd64::drivers::services::serial::put_hexn(rip, 16);
     s(" i1=0x");
-    crate::serial::put_hexn(i1, 8);
+    akuma_kernel_amd64::drivers::services::serial::put_hexn(i1, 8);
     s(" i2=0x");
-    crate::serial::put_hexn(i2, 8);
+    akuma_kernel_amd64::drivers::services::serial::put_hexn(i2, 8);
     s("\n");
 }

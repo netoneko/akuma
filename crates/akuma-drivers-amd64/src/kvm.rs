@@ -39,9 +39,9 @@
 //! The first guest that writes RCX before an intercepted instruction
 //! would otherwise corrupt the host in flight.
 
-use crate::phys::FreshFrame;
-use crate::serial;
-use crate::smp;
+use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
+use akuma_kernel_amd64::drivers::services::serial;
+use akuma_kernel_amd64::drivers::services::smp;
 use akuma_cpu::msr::{self, Msr};
 use akuma_svm_amd64 as svm;
 use akuma_vm_spec::Spec;
@@ -183,7 +183,7 @@ pub fn init(cmdline: &str) {
             VM_CORES.store(mask, Ordering::Relaxed);
             // The cores handed to the hypervisor are the hypervisor's from boot: the host
             // schedules nothing on them, whether or not a VM is running (core 0 never).
-            crate::sched::reserve_cores(mask);
+            akuma_kernel_amd64::drivers::services::sched::reserve_cores(mask);
         }
     }
     if want_test {
@@ -550,7 +550,7 @@ static IOPM: Iopm = Iopm(svm::iopm::with_port(
 /// `linker.ld` bakes into every section (`AT(ADDR(...) - KERNEL_VMA)`) and
 /// `multiboot2.rs`'s PAT init already makes.
 fn image_pa<T>(r: &T) -> u64 {
-    core::ptr::from_ref::<T>(r) as u64 - crate::phys::KERNEL_VMA
+    core::ptr::from_ref::<T>(r) as u64 - akuma_kernel_amd64::drivers::services::phys::KERNEL_VMA
 }
 
 // ---------------------------------------------------------------------------
@@ -2016,3 +2016,28 @@ unsafe fn vmrun(vmcb_pa: u64, guest_rcx: u64, guest_rdx: u64, guest_rbx: u64) ->
     }
     (rcx, rdx)
 }
+
+/// The SVM hypervisor, as the machine half's hypervisor class.
+pub static HYPERVISOR: akuma_kernel_amd64::drivers::Hypervisor = akuma_kernel_amd64::drivers::Hypervisor {
+    init,
+    late,
+    spawn_service,
+    ap_hook,
+    armed: svm_armed,
+    ctl_read: ctl::dev_read,
+    ctl_write: ctl::dev_write,
+    api_enabled: api::enabled,
+    api_open: api::open,
+    api_ioctl: api::ioctl,
+    api_note_fork: api::note_fork,
+    api_note_mmap: api::note_mmap,
+    api_mmap_vcpu: api::mmap_vcpu,
+    tun_open: tun::open,
+    tun_release: tun::release,
+    tun_read: tun::read,
+    tun_write: tun::write,
+    tun_readv: tun::readv,
+    tun_writev: tun::writev,
+    tun_ioctl: tun::ioctl,
+    tun_has_frame: tun::has_frame,
+};

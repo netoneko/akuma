@@ -34,7 +34,7 @@
 //! The phase's pass is the kernel's banner arriving on the emulated COM1.
 
 use super::{crumb, dec, dump_exit, dump_state, enable_on_core, hx, image_pa, next_rip, p, Iopm, Msrpm};
-use crate::phys::FreshFrame;
+use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
 use akuma_svm_amd64 as svm;
 use akuma_svm_amd64::devices::{MsrStore, Uart};
 use akuma_svm_amd64::lapic::{self, IpiMode, Lapic};
@@ -572,7 +572,7 @@ enum HostDisk {
     /// [`MemLease`] when the run ends, so a restarting guest does not leak its image.
     Mem { base: u64, bytes: u64, off: Option<u64> },
     /// A GPT partition of the NVMe disk, used **in place** through the driver's second window
-    /// ([`crate::nvme::open_guest_partition`]): the guest's writes are the partition's.
+    /// ([`akuma_kernel_amd64::drivers::services::nvme::open_guest_partition`]): the guest's writes are the partition's.
     Nvme { bytes: u64 },
 }
 
@@ -583,7 +583,7 @@ impl Drop for DiskLease {
     fn drop(&mut self) {
         match self.0 {
             Some(HostDisk::Mem { base, bytes, off }) => release_mem(base, bytes, off),
-            Some(HostDisk::Nvme { .. }) => crate::nvme::close_guest_partition(),
+            Some(HostDisk::Nvme { .. }) => akuma_kernel_amd64::drivers::services::nvme::close_guest_partition(),
             _ => {}
         }
     }
@@ -665,7 +665,7 @@ impl HostDisk {
 
     /// GPT partition `number` of the NVMe disk, lent to the guest (refused if it is the host's).
     fn nvme_partition(number: u32) -> Option<Self> {
-        match crate::nvme::open_guest_partition(number) {
+        match akuma_kernel_amd64::drivers::services::nvme::open_guest_partition(number) {
             Ok(bytes) => Some(Self::Nvme { bytes }),
             Err(why) => {
                 p("[KVM] linux: refused: NVMe partition ");
@@ -713,7 +713,7 @@ impl Disk for HostDisk {
         match *self {
             Self::Virtio(i) => akuma_virtio::block::read_bytes_at(i, offset, dst).is_ok(),
             Self::File(path) => akuma_vfs_glue::read_at(path.as_str(), offset as usize, dst).is_ok_and(|n| n == dst.len()),
-            Self::Nvme { .. } => crate::nvme::guest_read(offset, dst).is_ok(),
+            Self::Nvme { .. } => akuma_kernel_amd64::drivers::services::nvme::guest_read(offset, dst).is_ok(),
             Self::Mem { base, bytes, .. } => {
                 offset.checked_add(dst.len() as u64).is_some_and(|end| end <= bytes)
                     && akuma_mmu::copy_from_phys((base + offset) as usize, dst)
@@ -726,7 +726,7 @@ impl Disk for HostDisk {
         match *self {
             Self::Virtio(i) => akuma_virtio::block::write_bytes_at(i, offset, src).is_ok(),
             Self::File(path) => akuma_vfs_glue::write_at(path.as_str(), offset as usize, src).is_ok_and(|n| n == src.len()),
-            Self::Nvme { .. } => crate::nvme::guest_write(offset, src).is_ok(),
+            Self::Nvme { .. } => akuma_kernel_amd64::drivers::services::nvme::guest_write(offset, src).is_ok(),
             Self::Mem { base, bytes, .. } => {
                 offset.checked_add(src.len() as u64).is_some_and(|end| end <= bytes)
                     && akuma_mmu::copy_to_phys((base + offset) as usize, src)
@@ -737,7 +737,7 @@ impl Disk for HostDisk {
     fn flush(&mut self) -> bool {
         let _bkl = self.bkl();
         match self {
-            Self::Nvme { .. } => crate::nvme::flush().is_ok(),
+            Self::Nvme { .. } => akuma_kernel_amd64::drivers::services::nvme::flush().is_ok(),
             _ => true,
         }
     }
@@ -1046,7 +1046,7 @@ impl Platform {
     /// the banner matcher.
     fn console(&mut self, b: u8) {
         self.tx_bytes += 1;
-        self.last_tx_us = crate::net::uptime_us();
+        self.last_tx_us = akuma_kernel_amd64::drivers::services::net::uptime_us();
         let one = [b];
         p(core::str::from_utf8(&one).unwrap_or("?"));
         self.banner.feed(b);
@@ -1511,14 +1511,14 @@ struct Acct {
     last_exits: u64,
     /// Per-kind exit counts at the last report: hlt, lapic page, port I/O, MSR, host irq, NIC, disk.
     last_kinds: [u64; 7],
-    last_halt: [u64; crate::smp::MAX_CPUS],
+    last_halt: [u64; akuma_kernel_amd64::drivers::services::smp::MAX_CPUS],
 }
 
 impl Acct {
     fn new() -> Self {
-        let mut last_halt = [0; crate::smp::MAX_CPUS];
+        let mut last_halt = [0; akuma_kernel_amd64::drivers::services::smp::MAX_CPUS];
         for (c, h) in last_halt.iter_mut().enumerate() {
-            *h = crate::sched::halted_tsc(c);
+            *h = akuma_kernel_amd64::drivers::services::sched::halted_tsc(c);
         }
         Self { guest: 0, sleep: 0, yielded: 0, relay: 0, last_tsc: akuma_cpu::tsc::rdtsc(), last_exits: 0, last_kinds: [0; 7], last_halt }
     }
@@ -1550,8 +1550,8 @@ impl Acct {
         Self::pct("% relay=", self.relay, wall);
         Self::pct("% other=", other, wall);
         p("%  busy:");
-        for (c, last) in self.last_halt.iter_mut().enumerate().take(crate::smp::online_cpus().min(crate::smp::MAX_CPUS)) {
-            let h = crate::sched::halted_tsc(c);
+        for (c, last) in self.last_halt.iter_mut().enumerate().take(akuma_kernel_amd64::drivers::services::smp::online_cpus().min(akuma_kernel_amd64::drivers::services::smp::MAX_CPUS)) {
+            let h = akuma_kernel_amd64::drivers::services::sched::halted_tsc(c);
             let halted = h.wrapping_sub(*last).min(wall);
             *last = h;
             p(" c");
@@ -1559,7 +1559,7 @@ impl Acct {
             Self::pct("=", wall - halted, wall);
             p("%");
         }
-        let hz = crate::lapic::tsc_hz().max(1);
+        let hz = akuma_kernel_amd64::drivers::services::lapic::tsc_hz().max(1);
         let per_s = |d: u64| (u128::from(d) * u128::from(hz) / u128::from(wall)) as u64;
         p("  exits/s=");
         dec(per_s(exits - self.last_exits));
@@ -1574,7 +1574,7 @@ impl Acct {
     }
 
     const fn zero() -> Self {
-        Self { guest: 0, sleep: 0, yielded: 0, relay: 0, last_tsc: 0, last_exits: 0, last_kinds: [0; 7], last_halt: [0; crate::smp::MAX_CPUS] }
+        Self { guest: 0, sleep: 0, yielded: 0, relay: 0, last_tsc: 0, last_exits: 0, last_kinds: [0; 7], last_halt: [0; akuma_kernel_amd64::drivers::services::smp::MAX_CPUS] }
     }
 }
 
