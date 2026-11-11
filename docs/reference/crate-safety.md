@@ -1,7 +1,14 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-11-11 (evening) with `python3 scripts/cloc_akuma.py src crates`:
-**102 of 139 crates** forbid `unsafe`. 101950 of 103012 production lines (99.0%) sit outside any
+**Grade: A** — regenerated 2026-11-11 (late) with `python3 scripts/cloc_akuma.py src crates`:
+**102 of 139 crates** forbid `unsafe`. 110653 of 111814 production lines (99.0%) sit outside any
+`unsafe` block; 366 production sites across `crates/` (445 with tests), 0 inside enforced crates. The
+15 new production sites are the SVM hypervisor's (`vmrun`, MSRs, the physmap), which moved from
+`amd64/src/kvm*` into `akuma-drivers-amd64` behind its `kvm` feature (`amd64/src` 56 -> 41 in
+`unsafe-budget.json`, total unchanged at 407); they are allowed on `mod kvm` alone, as the
+framebuffer console's one site is on `mod fbcon`.
+
+The run before, 2026-11-11 (evening): **102 of 139 crates** forbid `unsafe`. 101950 of 103012 production lines (99.0%) sit outside any
 `unsafe` block; 351 production sites across `crates/` (430 with tests), 0 inside enforced crates. The
 three new crates are the boot suites that left the two kernels' trees and the amd64 driver crate, and
 none of them forbids. `akuma-kernel-tests-aarch64` and `akuma-kernel-tests-amd64` are almost

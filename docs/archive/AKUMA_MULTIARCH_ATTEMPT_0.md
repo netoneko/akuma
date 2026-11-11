@@ -1592,10 +1592,9 @@ completes it. The history was not rewritten. Bisecting across the pair needs bot
 - **Not moved yet, in the machine half for these reasons:**
   - **`xhci`**: the USB keyboard *and* USB storage (`root=/dev/sda1`). The headless image
     needs it, so it was not first in line; it is a block-and-input class.
-  - **`kvm`**: `/dev/kvm0` is welded to `fd`'s open/ioctl arms and `usermode`'s dispatch.
-    It needs a char-device class before it can move.
+  - **`kvm`**: moved later, in `887d601f` (below).
   - **`nvme`, `ramdisk`, `blk`**: the boot disk. They need the block class.
-  - **`rtw89`/`rtw89_sta`/`wifi`**: the net class, and they share `pci` with `net`'s RTL8169.
+  - **`rtw89`/`rtw89_sta`/`wifi`**: moved later, in `337cdb7b` (below).
   - **`fbdev`**: `/dev/fb0`'s mmap and `FBIOGET_*`, part of `fd`/`mm`. It is inert without a
     display driver, because nothing registers a geometry.
   - **`splash`**: inert without a console, because `splash::begin` is gated on
@@ -1623,10 +1622,81 @@ framebuffer tag, and GRUB's framebuffer is not touched.
   - TCG: SMP=1 **829/0** and SMP=2 **839/0**, check names identical to the default image's.
     **No test drops out**, because the suite never tested a driver that left: TCG has no
     framebuffer, HDA or touchpad, and none of their probes is a suite check.
-- **Size.** `rust-size` text is 25.38 MB for the default image and 4.54 MB for `headless`
-  (`akuma-fbcon`'s baked fonts are most of the difference).
+- **Size.** `rust-size` text (Berkeley, so `.text` plus `.rodata`) is 25.38 MB for the
+  default image and 4.54 MB for `headless` (`akuma-fbcon`'s baked fonts are most of the
+  difference). Per-section numbers after the next round are below.
 - **Not verified.** A headless image booting through GRUB on trashcan: the multiboot2 path
   cannot be booted here.
 
 Docs: `docs/reference/build-profiles.md` § amd64 images; `config-flags.md` (`all-drivers`,
 `fbcon`, `hda`, `touchpad`, `headless`, `NO_DEFAULT_FEATURES`).
+
+### Second round: stripped guest programs, Wi-Fi and KVM (2026-11-11)
+
+Prompted by measurements of the `headless` image (`llvm-nm --size-sort`, `llvm-size -A`). Same
+gates per commit: TCG default and headless at SMP=1 **829/0** and SMP=2 **839/0** with identical
+check names; clippy for default, `no-tests`, `ring0-preempt`, `headless` and
+`headless,no-tests`, plus each new feature alone and in `headless`. The ratchet totals stayed
+at unsafe 407 and addr 692.
+
+| commit | what | budget moves |
+|---|---|---|
+| `a58becf2` | `amd64/build.rs` builds the guest test programs with `-C strip=debuginfo` | none |
+| `337cdb7b` | `wifi.rs`, `rtw89.rs`, `rtw89_sta.rs` (2,630 lines) behind `wifi`; the wireless class | none (the three files hold neither) |
+| `887d601f` | `kvm.rs` + `kvm/` (8 files, 8,674 lines) behind `kvm`; the hypervisor class | unsafe amd64/src 56 -> 41, drivers 1 -> 16; addr amd64 79 -> 62, drivers 4 -> 21 |
+
+**The guest programs.** `sigregs.elf` was 742,760 bytes, about 707 KB of it `.debug_*`, and
+`fdprobe.elf` was 737,808. They are now 20,160 and 15,200. `hello` (13,192), `threadprobe`
+(9,544) and `killprobe` (9,240) did not change; they had no DWARF to begin with. Nothing reads
+the debug info: not the loader, not the suite, not `mkdisk.sh`. The symbol table stays (a few
+KB) so `llvm-nm` can still name a faulting guest `rip`. The headless image's `.rodata` fell
+722,624 bytes.
+
+**The wireless class** (`drivers::Wireless`, 10 entries) is the edge between a radio and the
+stack, not a general net-device registry. The RTL8169 stays `net`'s own wired NIC through
+`akuma-net`'s `ExternalDevice`. A wireless driver hands `net` its `FrameQueues` (`link`), which
+`net` makes the interface when `is_link`. The other entries:
+- **Probe steps.** `init` registers `/dev/wifi0`'s backend; `card_init` runs after the root
+  mount, because the firmware is a file; `spawn` starts the station daemon.
+- **Reset.** `shutdown_for_reset` stops the card's DMA before a warm reset.
+- **The device node.** `/dev/wifi0`'s `present`, `dev_read`, `dev_write` and `release`.
+
+`KCMDLINE=wifisim` under TCG shows the default image registering `/dev/wifi0` through the class
+and the headless one having none. The card itself is compile-verified only; it exists on ryzen.
+
+**The hypervisor class** (`drivers::Hypervisor`, 21 entries) is the char-device edge for the
+three nodes it serves (`/dev/kvm0`, `/dev/kvm`, `/dev/net/tun`). It carries `fd`'s open, read
+and ioctl arms, `usermode`'s write, writev, readv and close arms, `fork`'s and `mmap`'s notes,
+the boot hooks and the poll family's `tun_has_frame`. The descriptor kinds stay in `fd`, because
+they are the fd table's vocabulary.
+
+Without the driver, nothing opens. `/dev/net/tun` used to open unconditionally and is now gated
+on `hypervisor_present`. The `mmap` note's forwarder takes a `VirtAddr`, so the seam adds no
+untyped address parameter.
+
+Moving `kvm/ctl.rs` into `crates/` exposed a hand-rolled `fmt::Write` buffer. The pre-commit
+console-print rule scans `crates/*/src` but not `amd64/src`. It is now
+`akuma_primitives::console::StackWriter<192>`, with the same truncation. The SVM path is
+compile-verified only, because TCG has no SVM.
+
+**Image sizes** (`llvm-size -A`; the first row is the coordinator's measurement before this
+round):
+
+| image | step | `.text` | `.rodata` | `.bss` |
+|---|---|---:|---:|---:|
+| headless | before | 2,910,991 | 1,632,480 | 5,728,408 |
+| headless | stripped ELFs | 2,910,991 | 909,856 | 5,728,408 |
+| headless | + `wifi` off | 2,794,047 | 328,600 | 1,193,368 |
+| headless | + `kvm` off | **2,452,479** | **249,752** | **1,149,848** |
+| headless + no-tests | before | 2,698,575 | 810,264 | (5,696,920) |
+| headless + no-tests | + `wifi` off | 2,606,367 | 237,072 | 1,161,624 |
+| headless + no-tests | + `kvm` off | **2,255,855** | **154,576** | **1,118,360** |
+| default | after all three | 3,053,311 | 21,598,896 | 5,811,096 |
+
+The headless + no-tests `.bss` "before" figure is from my own build at the start of the round.
+That image embeds no guest programs, so stripping them does not change it. Headless, end to end:
+`.text` -16%, `.rodata` -85%, `.bss` -80%.
+
+**Still in the machine half:** `xhci` (keyboard and USB storage), `nvme`/`ramdisk`/`blk` (the
+block class), `fbdev`, `splash`, `input`/`kbd`, `pci`. The reasons are in the first-round list
+above.

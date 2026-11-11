@@ -18,9 +18,10 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `akuma-kernel-tests-aarch64`: it reaches the kernel only through `akuma_kernel_amd64::testing`
   (one re-export per item) and installs itself with `boot::register_self_tests` from the bin's
   `before_main`; a `no-tests` image does not link it. `akuma-drivers-amd64` is the amd64 driver
-  wiring, **one feature per driver** (`fbcon`, `hda`, `touchpad`; `all` is the bin's default,
+  wiring, **one feature per driver** (`fbcon`, `hda`, `kvm`, `touchpad`, `wifi`; `all` is the bin's default,
   `headless` the lean test-box set — `docs/reference/build-profiles.md` § amd64 images): each
-  driver registers a per-class table (`amd64/src/drivers.rs`: display, sound, pointer) whose
+  driver registers a per-class table (`amd64/src/drivers.rs`: display, sound, pointer, wireless,
+  hypervisor) whose
   forwarders read "absent" when nothing registered, and reaches the kernel only through
   `drivers::services`. **Never add a driver `cfg` to the machine half**; add a class slot.
   `akuma-fdtable` is the fd table's state machine — lowest-free allocation,
