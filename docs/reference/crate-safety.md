@@ -458,7 +458,7 @@ host-test.
 | `akuma-net-unix` | the AF_UNIX state machine — codec, name table, rendezvous, framing, shutdown, credentials, datagram resolution |
 | `akuma-syscalls-linux` | the Linux ABI: syscall numbers, `repr(C)` wire structs and their layout assertions, flag tables |
 | `akuma-firecracker` | FDT parsing for the Firecracker microVM device map |
-| `akuma-bkl` | the BKL protocol, the spinlocks under it, and `policy` — the decision to take it or skip it (the seven `no-bkl-*` phase toggles, the per-syscall opt-out bitmap) |
+| `akuma-bkl` | the BKL protocol, the spinlocks under it, and `policy` — the decision to take it or skip it (the runtime BKL phase toggles, the per-syscall opt-out bitmap) |
 | `akuma-elf` | the ELF64 parser and program-header walk |
 | `akuma-fpcache` | the shared file-page cache: physical frames for read-only file-backed mappings, keyed `(inode, mount id, offset)` and reference-counted through the CoW refcount |
 

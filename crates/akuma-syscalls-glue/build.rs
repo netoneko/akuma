@@ -1,39 +1,14 @@
 fn main() {
     // Every `kernel_*` cfg this crate's source reads must be forwarded, or it
-    // silently compiles the other arm. `src/syscall/` read six of them.
-    // Exactly the cfgs this crate's source reads.
+    // silently compiles the other arm. Exactly the cfgs this crate's source reads.
     //
-    // **Grep for both spellings.** A first pass used
-    // `grep -rohE 'cfg\(kernel_[a-z_]+'` and found three, missing the four
-    // `no-bkl` gates because they are written `cfg!(all(kernel_smp_shared,
-    // kernel_no_bkl_vfs))` — the macro form, not the attribute. The build then
-    // failed with 199 `unexpected cfg condition name` errors. Use
-    // `grep -rohE 'kernel_[a-z_]+'` and filter by hand.
-    for c in [
-        "kernel_smp_shared",
-        "kernel_tests",
-        "kernel_profile_extreme",
-        "kernel_no_bkl_network",
-        "kernel_no_bkl_vfs",
-        "kernel_no_bkl_mm",
-        "kernel_no_bkl_drivers",
-    ] {
+    // **Grep for both spellings**, the attribute and the `cfg!(..)` macro form:
+    // `grep -rohE 'kernel_[a-z_]+'` and filter by hand. The BKL carve-outs
+    // (`cfg!(kernel_smp_shared)` in each family's `COMPILED_IN`) were their own
+    // `kernel_no_bkl_*` cfgs until 2026-11-11; `smp-shared` now implies them, and
+    // A/B is the runtime toggles in `akuma_bkl::policy`.
+    for c in ["kernel_smp_shared", "kernel_tests", "kernel_profile_extreme"] {
         println!("cargo::rustc-check-cfg=cfg({c})");
-    }
-
-    // The BKL phase toggles, forwarded from the bin's `no-bkl-*` features. Each
-    // one is read as `cfg!(all(kernel_smp_shared, kernel_no_bkl_X))`, so a
-    // missing forward silently reports the carve-out as absent.
-    for (feat, cfg) in [
-        ("CARGO_FEATURE_NO_BKL_NETWORK", "kernel_no_bkl_network"),
-        ("CARGO_FEATURE_NO_BKL_VFS", "kernel_no_bkl_vfs"),
-        ("CARGO_FEATURE_NO_BKL_MM", "kernel_no_bkl_mm"),
-        ("CARGO_FEATURE_NO_BKL_DRIVERS", "kernel_no_bkl_drivers"),
-    ] {
-        println!("cargo:rerun-if-env-changed={feat}");
-        if std::env::var(feat).is_ok() {
-            println!("cargo:rustc-cfg={cfg}");
-        }
     }
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
     if std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok() {

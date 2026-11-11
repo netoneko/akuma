@@ -25,7 +25,7 @@ use akuma_exec::process::MmapRegion;
 pub(super) struct MmBkl;
 
 impl GuardToggle for MmBkl {
-    const COMPILED_IN: bool = cfg!(all(kernel_smp_shared, kernel_no_bkl_mm));
+    const COMPILED_IN: bool = cfg!(kernel_smp_shared);
     #[inline]
     fn enabled() -> bool {
         #[cfg(kernel_smp_shared)]

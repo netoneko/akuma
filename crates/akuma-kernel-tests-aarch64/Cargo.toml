@@ -10,7 +10,7 @@ workspace = true
 # Each is a flag the suite reads with `cfg(feature = ...)`, and nothing else: the root
 # package forwards its own feature of the same name here, and it, not this crate, turns the
 # kernel crates' features on. `no-tests`, `extreme`, `smp-shared`, `bkl-profile`,
-# `no-bkl-network`, `no-bkl-process`, `sound` and `platform-firecracker` are read by `build.rs`
+# `sound` and `platform-firecracker` are read by `build.rs`
 # instead, to derive the same `kernel_*` cfgs the root's `build.rs` does.
 [features]
 smp-shared = []
@@ -27,8 +27,6 @@ fs-cache = []
 epoll-waker-trace = []
 net-waker-park = []
 net-profile = []
-no-bkl-network = []
-no-bkl-process = []
 sound = []
 platform-firecracker = []
 

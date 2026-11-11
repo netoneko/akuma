@@ -1419,34 +1419,34 @@ pub(crate) struct Ext2State {
 }
 
 /// Non-preemption/IRQ guard held for the lifetime of an [`Ext2State`] lock hold under
-/// `no-bkl-vfs`; a zero-sized no-op otherwise.
+/// `smp-shared`; a zero-sized no-op otherwise.
 ///
 /// Every ext2 lock hold does real block I/O (see [`Ext2Filesystem::read_block`]), so it
 /// must never be descheduled mid-hold: the Big Kernel Lock is released on an EL1→EL0
 /// return, and a stranded `state` guard means any other core that then spins for it does
 /// so *while holding the BKL* — the holder can never be rescheduled to release it, and
-/// every core piles into the BKL wait. With `no-bkl-vfs` the same guard additionally
+/// every core piles into the BKL wait. Under `smp-shared` the same guard additionally
 /// masks local IRQs, so a core inside an ext2 critical section without the BKL can't take
 /// a nested IRQ whose `enter_kernel()` hard-spins for the BKL while this core holds the
 /// inner lock (AB-BA — the SMP=4 wedge `no-bkl-network` closed the same way).
 ///
 /// **IRQs are masked around the non-blocking `try_*` and the resulting hold only, never
 /// across the acquisition backoff** — see [`Ext2Filesystem::read_state`].
-#[cfg(feature = "no-bkl-vfs")]
+#[cfg(feature = "smp-shared")]
 type StateHoldGuard = akuma_primitives::PreemptGuard;
-#[cfg(not(feature = "no-bkl-vfs"))]
+#[cfg(not(feature = "smp-shared"))]
 type StateHoldGuard = NoStateHold;
 
-/// The `StateHoldGuard` stand-in when `no-bkl-vfs` is off: a ZST that compiles to nothing.
+/// The `StateHoldGuard` stand-in when `smp-shared` is off: a ZST that compiles to nothing.
 ///
 /// Deliberately **not** `Copy`, and carrying an empty `Drop`, so that the explicit
 /// `drop(hold)` before each backoff spin type-checks identically in both configurations —
 /// without it, the same source line is a real release in one build and a lint
 /// (`dropping_copy_types` / `drop_non_drop`) in the other.
-#[cfg(not(feature = "no-bkl-vfs"))]
+#[cfg(not(feature = "smp-shared"))]
 struct NoStateHold;
 
-#[cfg(not(feature = "no-bkl-vfs"))]
+#[cfg(not(feature = "smp-shared"))]
 impl Drop for NoStateHold {
     fn drop(&mut self) {}
 }
@@ -1454,9 +1454,9 @@ impl Drop for NoStateHold {
 /// Take a [`StateHoldGuard`] for one `try_*` attempt (and, on success, the hold).
 #[inline]
 fn state_hold_guard() -> StateHoldGuard {
-    #[cfg(feature = "no-bkl-vfs")]
+    #[cfg(feature = "smp-shared")]
     return akuma_primitives::PreemptGuard::new();
-    #[cfg(not(feature = "no-bkl-vfs"))]
+    #[cfg(not(feature = "smp-shared"))]
     NoStateHold
 }
 
@@ -1711,7 +1711,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// The [`StateHoldGuard`] is taken *per attempt*, immediately before the
     /// non-blocking try, and either kept (success — it now covers the hold) or
     /// dropped before the backoff spin. It deliberately does **not** wrap the whole
-    /// wait: under `no-bkl-vfs` that guard masks local IRQs, and this wait is
+    /// wait: under `smp-shared` that guard masks local IRQs, and this wait is
     /// unbounded, so masking across it would starve this core's timer for the whole
     /// contended window — and if the current holder were a thread on this core,
     /// nothing could ever run to release it. Masking only the try + hold gives the

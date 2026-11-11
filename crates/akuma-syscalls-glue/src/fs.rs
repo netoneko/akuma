@@ -25,7 +25,7 @@ use akuma_net::socket::{self, libc_errno};
 pub(super) struct VfsBkl;
 
 impl GuardToggle for VfsBkl {
-    const COMPILED_IN: bool = cfg!(all(kernel_smp_shared, kernel_no_bkl_vfs));
+    const COMPILED_IN: bool = cfg!(kernel_smp_shared);
     #[inline]
     fn enabled() -> bool {
         #[cfg(kernel_smp_shared)]
@@ -84,7 +84,7 @@ pub(super) type VfsBklGuard = ToggledGuard<VfsBkl>;
 pub(super) struct DriverBkl;
 
 impl GuardToggle for DriverBkl {
-    const COMPILED_IN: bool = cfg!(all(kernel_smp_shared, kernel_no_bkl_drivers));
+    const COMPILED_IN: bool = cfg!(kernel_smp_shared);
     #[inline]
     fn enabled() -> bool {
         #[cfg(kernel_smp_shared)]
@@ -2019,7 +2019,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     // measurement window the audit flagged (`BKL_PHASE7_AUDIT.md` §5, 7c: "10.5% for
     // a converted syscall's prologue/epilogue is high enough that either the window
     // starts too late or the re-acquire costs more than expected"). This guard's only
-    // live cfg is `kernel_smp_shared`+`kernel_no_bkl_vfs`; without both it's a no-op.
+    // live cfg is `kernel_smp_shared`; without it it's a no-op.
     let _vfs_bkl = VfsBklGuard::new();
 
     let path = akuma_vfs_glue::resolve_symlinks(&path);

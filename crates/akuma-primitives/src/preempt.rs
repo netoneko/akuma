@@ -367,14 +367,13 @@ pub fn check_preemption_watchdog() -> Option<u64> {
     None
 }
 
-/// RAII guard that disables scheduler preemption (and, under the BKL-drop
-/// features, masks local IRQs) for the lifetime of a kernel spinlock critical
-/// section.
+/// RAII guard that disables scheduler preemption and, under `smp-shared`, masks
+/// local IRQs, for the lifetime of a kernel spinlock critical section.
 ///
-/// # `no-bkl-*`: local IRQs are masked for the hold too
+/// # Local IRQs are masked for the hold too
 ///
-/// With the Big Kernel Lock dropped around a subsystem's syscalls (network:
-/// `no-bkl-network`, VFS: `no-bkl-vfs`), a core can be inside one of those
+/// `smp-shared` drops the Big Kernel Lock around whole syscall families
+/// (network, VFS, process, mm, drivers), so a core can be inside one of those
 /// critical sections *without* owning the BKL. A nested IRQ then runs
 /// `enter_kernel()`, which hard-spins with IRQs masked until the BKL frees —
 /// while THIS core still holds the inner spinlock. If the current BKL owner is
@@ -385,8 +384,10 @@ pub fn check_preemption_watchdog() -> Option<u64> {
 /// the window nest-free, so a core can never be caught "holding an inner lock,
 /// waiting for the BKL".
 ///
-/// Plain `smp-shared` builds don't need it — there EL1 always holds the BKL, so
-/// the nested `enter_kernel` is the idempotent owner fast path.
+/// The mask is unconditional under `smp-shared`, even while a runtime toggle in
+/// `akuma_bkl::policy` has put a family back under the BKL. The separate
+/// compile-time `no-bkl-*` features that once made it optional were folded into
+/// `smp-shared` on 2026-11-11 (`docs/archive/AKUMA_FEATURE_AUDIT.md`, F2).
 ///
 /// # Lift history
 ///
@@ -404,8 +405,8 @@ pub struct PreemptGuard {
     /// `smp-shared`; other builds carry no state.
     #[cfg(kernel_smp_shared)]
     active: bool,
-    /// Saved DAIF to restore on drop (`no-bkl-*` builds only — see type doc).
-    #[cfg(all(kernel_smp_shared, any(kernel_no_bkl_network, kernel_no_bkl_vfs)))]
+    /// Saved DAIF to restore on drop (see type doc).
+    #[cfg(kernel_smp_shared)]
     saved_daif: u64,
 }
 
@@ -419,13 +420,9 @@ impl PreemptGuard {
             // reason the net crate used a callback pointer, and why this works
             // during early boot and in host tests alike.
             disable_preemption();
-            let active = true;
             // Mask IRQs AFTER disabling preemption so drop's reverse order
             // re-enables preemption only once IRQs are live again.
-            #[cfg(any(kernel_no_bkl_network, kernel_no_bkl_vfs))]
-            return Self { active, saved_daif: crate::irq::irq_save_mask() };
-            #[cfg(not(any(kernel_no_bkl_network, kernel_no_bkl_vfs)))]
-            return Self { active };
+            Self { active: true, saved_daif: crate::irq::irq_save_mask() }
         }
         #[cfg(not(kernel_smp_shared))]
         Self {}
@@ -445,7 +442,7 @@ impl Drop for PreemptGuard {
         // Restore IRQs first (reverse of new's order), then re-enable preemption
         // — so a timer IRQ can't preempt us between enable_preemption and the
         // DAIF restore.
-        #[cfg(all(kernel_smp_shared, any(kernel_no_bkl_network, kernel_no_bkl_vfs)))]
+        #[cfg(kernel_smp_shared)]
         crate::irq::irq_restore(self.saved_daif);
         #[cfg(kernel_smp_shared)]
         if self.active {

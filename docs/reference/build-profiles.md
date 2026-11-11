@@ -186,7 +186,7 @@ extreme vs release) and two open defects it surfaced:
 ## Feature deltas vs. default `release`
 
 `release` builds with cargo's normal default feature resolution: `smp-shared`
-(+ its six `no-bkl-*` carve-outs), `smoltcp`, `sound`, `rump`, `fs-cache`,
+(which includes the BKL carve-outs), `smoltcp`, `sound`, `rump`, `fs-cache`,
 `many-sessions`, and all eight `sc-*` syscall families (`Cargo.toml:126-142`).
 There is no `neko`/`kernel-tls`/`tls-rsa` to drop anywhere — those features
 were deleted from `Cargo.toml` entirely (commit `bade6ab` for TLS,
@@ -196,8 +196,8 @@ pass `--no-default-features` and explicitly re-add only what they want;
 
 | Target | Drops vs. default | Adds vs. default |
 |---|---|---|
-| `extreme-size` | `smp-shared` (+ `no-bkl-*`), `sound`, `rump`, `fs-cache`, `many-sessions`, all `sc-*` | `no-tests`, `extreme`, `userspace-sshd` |
-| `devbox` | `smoltcp`, `smp-shared` (+ `no-bkl-*`), `fs-cache`, `many-sessions` | `devbox` (→ `rump-default` + `userspace-sshd`), `rump-tests`, `no-tests` |
+| `extreme-size` | `smp-shared`, `sound`, `rump`, `fs-cache`, `many-sessions`, all `sc-*` | `no-tests`, `extreme`, `userspace-sshd` |
+| `devbox` | `smoltcp`, `smp-shared`, `fs-cache`, `many-sessions` | `devbox` (→ `rump-default` + `userspace-sshd`), `rump-tests`, `no-tests` |
 | `devbox-smoltcp` | — (inherits default set) | `devbox-smoltcp` (→ `userspace-sshd` + `smp-shared`, the latter a no-op since it's already default), `no-tests` |
 
 ### `many-sessions` and the userspace sshd

@@ -1,12 +1,6 @@
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
     println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_network)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_vfs)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_process)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_mm)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_drivers)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_irq)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
     println!("cargo::rustc-check-cfg=cfg(kernel_console_lock)");
@@ -24,92 +18,6 @@ fn main() {
     let smp_shared = std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok();
     if smp_shared {
         println!("cargo:rustc-cfg=kernel_smp_shared");
-    }
-
-    // BKL-free network path (Phase 2 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md).
-    // `cfg(kernel_no_bkl_network)` makes the smoltcp net syscalls drop the BKL for their
-    // duration; only meaningful under shared-kernel SMP (nothing to drop otherwise). The
-    // gate is emitted independently of `smp_shared` so the net.rs guard can compile-check
-    // in either combination — its body is additionally `cfg(kernel_smp_shared)`-gated so
-    // it stays a no-op without real SMP.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_NETWORK");
-    let no_bkl_network = std::env::var("CARGO_FEATURE_NO_BKL_NETWORK").is_ok();
-    if no_bkl_network {
-        println!("cargo:rustc-cfg=kernel_no_bkl_network");
-    }
-
-    // BKL-free VFS path (Phase 4 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md),
-    // mirroring `kernel_no_bkl_network`. `cfg(kernel_no_bkl_vfs)` makes the fs
-    // syscalls drop the BKL for their duration; only meaningful under shared-kernel
-    // SMP. Emitted independently of `smp_shared` so the VFS guard body (gated on
-    // `all(kernel_smp_shared, kernel_no_bkl_vfs)`) can compile-check in either
-    // combination — its body is additionally `cfg(kernel_smp_shared)`-gated so it
-    // stays a no-op without real SMP, exactly like the net guard.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_VFS");
-    let no_bkl_vfs = std::env::var("CARGO_FEATURE_NO_BKL_VFS").is_ok();
-    if no_bkl_vfs {
-        println!("cargo:rustc-cfg=kernel_no_bkl_vfs");
-    }
-
-    // BKL-free fork page-copy (Phase 3 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md),
-    // mirroring `kernel_no_bkl_network` / `kernel_no_bkl_vfs`. `cfg(kernel_no_bkl_process)`
-    // makes `fork_process` drop the BKL for its CoW share/demote pass, relying on the
-    // address space's own `as_lock` (the same lock the CoW fault handler already takes
-    // BKL-free) plus `COW_REFCOUNTS`. Only meaningful under shared-kernel SMP, and
-    // included in the `smp-shared` feature set since 2026-07-31 (same as net and vfs).
-    // Emitted independently of `smp_shared` so the guard body (gated on
-    // `all(kernel_smp_shared, kernel_no_bkl_process)`) can compile-check in either
-    // combination.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_PROCESS");
-    if std::env::var("CARGO_FEATURE_NO_BKL_PROCESS").is_ok() {
-        println!("cargo:rustc-cfg=kernel_no_bkl_process");
-    }
-
-    // BKL-free memory-management syscalls (Phase 5 of
-    // docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), mirroring `kernel_no_bkl_vfs`.
-    // `cfg(kernel_no_bkl_mm)` makes `sys_mprotect`/`sys_madvise`/`sys_munmap`/
-    // `sys_mremap`/`sys_mmap` drop the BKL for their duration, relying on
-    // `Process::as_lock` (page tables), `Process::vm_lock` (mmap_regions AND the
-    // mmap free-list — extended to cover the latter as part of this carve, see
-    // `Process::vm_alloc_mmap`/`vm_free_mmap`), `LAZY_REGION_TABLE`, PMM/
-    // FRAME_TRACKER, and `SHARED_FILE_MAPPINGS` — all already independent of the
-    // BKL. Only meaningful under shared-kernel SMP. Emitted independently of
-    // `smp_shared` so the guard body (gated on `all(kernel_smp_shared,
-    // kernel_no_bkl_mm)`) can compile-check in either combination.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_MM");
-    if std::env::var("CARGO_FEATURE_NO_BKL_MM").is_ok() {
-        println!("cargo:rustc-cfg=kernel_no_bkl_mm");
-    }
-
-    // BKL-free device-driver syscalls (Phase 6 of
-    // docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), mirroring `kernel_no_bkl_mm`.
-    // `cfg(kernel_no_bkl_drivers)` makes the device-driver syscall paths
-    // (`sys_getrandom`, `sys_read`/`sys_pread64` on `/dev/urandom`, and
-    // `sys_write` on `/dev/dsp`) drop the BKL for their duration, relying on each
-    // driver's own fine-grained Spinlock — `RNG_DEVICE`, `SOUND_DEVICE` — for
-    // cross-core mutual exclusion instead. Only
-    // meaningful under shared-kernel SMP. Emitted independently of `smp_shared` so
-    // the guard body (gated on `all(kernel_smp_shared, kernel_no_bkl_drivers)`)
-    // can compile-check in either combination. The block device (`BLOCK_DEVICE`)
-    // and network device (`NETWORK`) are already BKL-free via `no-bkl-vfs` and
-    // `no-bkl-network` respectively; this phase covers the remaining drivers.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_DRIVERS");
-    if std::env::var("CARGO_FEATURE_NO_BKL_DRIVERS").is_ok() {
-        println!("cargo:rustc-cfg=kernel_no_bkl_drivers");
-    }
-
-    // BKL-free timer-IRQ dispatch (Phase 7a of
-    // docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7, docs/archive/BKL_PHASE7_AUDIT.md
-    // §2.3/§5). `cfg(kernel_no_bkl_irq)` makes `rust_irq_handler_with_sp` dispatch the
-    // timer IRQ (27, the only device IRQ registered) without ever calling
-    // `enter_kernel`/`reconcile_for_spsr` — the handler's state (the alarm queue's own
-    // Spinlock, per-thread preemption-watchdog atomics, raw GIC MMIO) no longer needs the
-    // BKL. Only meaningful under shared-kernel SMP. Emitted independently of `smp_shared`
-    // so the guard body (gated on `all(kernel_smp_shared, kernel_no_bkl_irq)`) can
-    // compile-check in either combination, exactly like the other `no-bkl-*` gates.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_IRQ");
-    if std::env::var("CARGO_FEATURE_NO_BKL_IRQ").is_ok() {
-        println!("cargo:rustc-cfg=kernel_no_bkl_irq");
     }
 
     // BKL-hold attribution build. Turns on the per-tag profiler in

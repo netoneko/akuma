@@ -184,8 +184,7 @@ block, where the surrounding `msr vbar_el1` / `isb` sequence has to stay one uni
 ### Preemption
 
 `PreemptGuard` disables scheduler preemption for a kernel spinlock critical
-section, and under the BKL-drop features (`no-bkl-network`, `no-bkl-vfs`) also
-masks local IRQs for the hold. That second half prevents the SMP=4 AB-BA wedge:
+section, and under `smp-shared` also masks local IRQs for the hold. That second half prevents the SMP=4 AB-BA wedge:
 a BKL-free core inside an inner spinlock, a nested IRQ hard-spinning on the BKL,
 and the BKL owner spinning on that same inner lock. See
 [`locking.md`](locking.md).
@@ -237,14 +236,13 @@ corruption or wedge somewhere else entirely.
 
 | Feature | Effect here |
 |---|---|
-| `smp-shared` | `PreemptGuard` actually disables preemption |
-| `no-bkl-network`, `no-bkl-vfs` | the guard additionally masks local IRQs for the hold |
+| `smp-shared` | `PreemptGuard` actually disables preemption and masks local IRQs for the hold |
 | `extreme` | `MAX_THREADS` 256 → 64 (the per-slot statics are BSS whether used or not) |
 
 Forwarded from the bin crate's `Cargo.toml` **directly** as well as through
 `akuma-exec`, deliberately: relying on cargo's feature unification via a third
 crate means a graph without that crate (`cargo test -p akuma-ext2`) silently gets
-the no-op. `akuma-ext2` forwards `no-bkl-vfs` for the same reason.
+the no-op. `akuma-ext2` forwards `smp-shared` for the same reason.
 
 **This is guarded by a boot self-test.** `test_preempt_guard_is_live`
 (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`) asserts the guard is non-zero-sized, that nesting is

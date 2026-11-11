@@ -6,6 +6,11 @@
 > across all of them, but the underlying BKL-removal effort is itself grade **C** —
 > check `smp-shared.md` and the archive docs below for what has landed since
 > this was written.
+>
+> **The `no-bkl-*` names below are carve-outs, not features.** Each was a Cargo
+> feature until 2026-11-11, always on under `smp-shared`. They were folded into
+> `smp-shared` then, and their cfgs now read `kernel_smp_shared`. A/B one with its
+> runtime toggle in `akuma_bkl::policy` (`docs/archive/AKUMA_FEATURE_AUDIT.md` F2).
 
 This is the distilled "how to add a lock, or remove one, without re-deriving
 the lessons from scratch" reference. It is not a history — for the blow-by-blow
@@ -35,8 +40,10 @@ socket `read`/`write`), `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
 (`fork_process`'s CoW page-copy window), `no-bkl-mm`
 (`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`), `no-bkl-drivers`
 (`getrandom`, `/dev/urandom` read/pread, `/dev/dsp` write), and `no-bkl-irq` (the timer IRQ's dispatch in
-`rust_irq_handler_with_sp`). All six are default-on in `smp-shared`
-(since 2026-08-01). `no-bkl-process` is the first that is not about I/O: it overlaps a
+`rust_irq_handler_with_sp`). The first five are part of `smp-shared`. `no-bkl-irq`'s
+dispatch-site gate lived in the SGI scheduler's IRQ path and was deleted with it
+(2026-11-11, `AKUMA_MULTIARCH_ATTEMPT_0.md` § "The SGI scheduler is deleted"); what
+follows about it is that path's history. `no-bkl-process` is the first that is not about I/O: it overlaps a
 CPU-bound page copy with peer-core EL1 rather than a disk or wire wait, and it is
 the first to lean on a *page-table* inner lock (`as_lock`) rather than a
 subsystem's own state locks. `no-bkl-mm` is the first phase picked by the plan

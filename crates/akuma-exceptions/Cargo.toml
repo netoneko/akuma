@@ -16,13 +16,6 @@ workspace = true
 # single-core profiles (extreme-size, devbox) build.
 smp-shared = []
 
-# BKL-free timer-IRQ dispatch (Phase 7a), forwarded from the bin crate's
-# `no-bkl-irq`. Gates the fast path in `rust_irq_handler_with_sp` that
-# dispatches a non-scheduler IRQ without ever taking the BKL. Only meaningful
-# together with `smp-shared`; the guard body is additionally gated on that, so
-# it compiles to nothing in either single-cfg combination.
-no-bkl-irq = []
-
 
 # Compile the boot self-test surface out (`kernel_tests` cfg NOT emitted):
 # `el1_sync_gpr_clobber_mask`'s GPR-transparency probe, the `TEST_SIGFRAME_*`

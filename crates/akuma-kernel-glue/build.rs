@@ -6,7 +6,6 @@
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
     println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_network)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
     println!("cargo::rustc-check-cfg=cfg(kernel_console_lock)");
@@ -16,11 +15,6 @@ fn main() {
     let smp_shared = std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok();
     if smp_shared {
         println!("cargo:rustc-cfg=kernel_smp_shared");
-    }
-
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_NETWORK");
-    if std::env::var("CARGO_FEATURE_NO_BKL_NETWORK").is_ok() {
-        println!("cargo:rustc-cfg=kernel_no_bkl_network");
     }
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BKL_PROFILE");

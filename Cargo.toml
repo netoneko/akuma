@@ -324,146 +324,17 @@ rump-tests = ["akuma-kernel-glue/rump-tests", "akuma-kernel-tests-aarch64/rump-t
 # docs/reference/subsystems/smp-shared.md and docs/archive/SMP_SHARED.md. The
 # experimental one-kernel-per-core alternative (`smp`) was removed 2026-08-10 —
 # docs/archive/TRIM_FAT_MULTIKERNEL.md.
-# Includes `no-bkl-network` (BKL-free native net syscalls) by default since
-# 2026-07-24: validated at SMP=4 under a real BitTorrent swarm + ssh hammer
-# (0 wedges, 0 corruption) after the socket-refcount / wait_until / pipe-SIGPIPE
-# fixes. To A/B against the BKL-held net path, remove it from this list.
-# Includes `no-bkl-vfs` (BKL-free VFS syscalls) since 2026-07-25 — same pattern
-# as net: every piece of VFS state already carries its own spinlock, so the BKL
-# is redundant for fs syscalls. Remove from this list to A/B.
-# Includes `no-bkl-process` (BKL-free fork page-copy) since 2026-07-31: the CoW
-# fault handler already edited the parent's PTEs BKL-free under the address
-# space's `as_lock`, so the BKL was redundant for fork's copy too. Validated at
-# SMP=4 (3 boots × 10 rounds fork-hammer: 0 faults, 0 partial child output, 0
-# `[BKL] stuck`) and contention-confirmed by a same-source `bkl-profile` A/B
-# (`clone` 19.5% → 2.5%, 8.6× fewer spins). Remove from this list to A/B.
-# Includes `no-bkl-irq` (BKL-free timer-IRQ dispatch, Phase 7a) since
-# 2026-08-01: the timer is the only device IRQ this kernel registers, and its
-# handler's state (the alarm queue's own Spinlock, per-thread preemption-
-# watchdog atomics, raw GIC MMIO) no longer needs the BKL. Validated at SMP=2/4
-# boot self-test (0 PANIC/WILD/SPURIOUS, the BKL-hold-state invariant test
-# passing) and a same-binary `bkl-profile` A/B on the contention regimen
-# (`irq/sched` 24.7% → 10.2%, 6/6 digests exact both sides). Remove from this
-# list to A/B.
+# Also runs five syscall families without the Big Kernel Lock — network, VFS,
+# fork's page copy, mm and the drivers (Phases 2-6 of
+# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md) — and turns on the IRQ masking
+# in `PreemptGuard` that makes that safe. Each was its own `no-bkl-*` feature until
+# 2026-11-11, when they were folded in: every shipped build had all of them on,
+# and A/B is the runtime toggles in `akuma_bkl::policy` (same binary, no
+# rebuild). `docs/archive/AKUMA_FEATURE_AUDIT.md` F2.
 # Measurement only: `test_epoll_socket_waker` prints when its waker started, when it called
 # `wake_all`, when the waiter returned, and on which cores (`[epoll-waker-trace]`). Off everywhere.
 epoll-waker-trace = ["akuma-kernel-tests-aarch64/epoll-waker-trace"]
-smp-shared = ["akuma-exec/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-exceptions/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "no-bkl-network", "no-bkl-vfs", "no-bkl-process", "no-bkl-mm", "no-bkl-drivers", "no-bkl-irq", "akuma-syscalls-glue/smp-shared", "akuma-kernel-core/smp-shared", "akuma-kernel-glue/smp-shared", "akuma-kernel-tests-aarch64/smp-shared"]
-
-# Run the native (smoltcp) network syscalls WITHOUT the Big Kernel Lock — the
-# first subsystem carved out of the BKL (docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md
-# Phase 2). Only meaningful together with `smp-shared` (and included in it by
-# default): build.rs emits `cfg(kernel_no_bkl_network)` from
-# CARGO_FEATURE_NO_BKL_NETWORK, and the net syscall entry points then DROP the
-# BKL for their duration, relying on the existing fine-grained NETWORK /
-# SOCKET_TABLE / fd-table spinlocks for cross-core mutual exclusion instead
-# (PreemptGuard additionally masks IRQs for those holds — see
-# crates/akuma-net/src/runtime.rs). A no-op (byte-for-byte unchanged) on every
-# build that doesn't set both features.
-no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network", "akuma-primitives/no-bkl-network", "akuma-syscalls-glue/no-bkl-network", "akuma-kernel-tests-aarch64/no-bkl-network"]
-
-# Run the VFS syscalls WITHOUT the Big Kernel Lock — Phase 4 of
-# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the second subsystem carved out
-# of the BKL (mirrors `no-bkl-network`). Only meaningful together with
-# `smp-shared` (and included in it by default): build.rs emits
-# `cfg(kernel_no_bkl_vfs)` from CARGO_FEATURE_NO_BKL_VFS, and the fs syscall
-# entry points then DROP the BKL for their duration, relying on the existing
-# fine-grained MOUNT_TABLE / Ext2Filesystem::state (RwSpinlock) / block_cache /
-# BLOCK_DEVICE / fd-table spinlocks for cross-core mutual exclusion.
-# PreemptGuard (lifted to `akuma_exec::sync` from akuma-net) additionally masks
-# IRQs for the ext2/block-device holds — the same hardening that closed the
-# SMP=4 ABBA wedge in net's Phase 2. A no-op (byte-for-byte unchanged) on every
-# build that doesn't set both features.
-no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-ext2/no-bkl-vfs", "akuma-net/no-bkl-vfs", "akuma-primitives/no-bkl-vfs", "akuma-syscalls-glue/no-bkl-vfs"]
-
-# Run `fork_process`'s CoW share/demote pass WITHOUT the Big Kernel Lock — Phase 3 of
-# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the third subsystem carved out (after
-# net and vfs) and the first that is NOT about I/O: `clone` was the largest remaining
-# non-irq/sched BKL holder once every syscall attribution had ever named was converted.
-# build.rs emits `cfg(kernel_no_bkl_process)` from CARGO_FEATURE_NO_BKL_PROCESS, and
-# `fork_process` then drops the BKL for the page-copy window, relying on the address
-# space's own `as_lock` — the SAME lock the CoW fault handler already takes BKL-free —
-# held in bounded chunks around every parent-page-table access, plus the existing
-# COW_REFCOUNTS / PMM / allocator spinlocks. Steps 5–8 (ProcessInfo, THREAD_CONTEXTS
-# capture, thread spawn, register+READY) stay fully BKL-held: they touch state with no
-# inner lock, where the BKL IS the lock.
-#
-# Included in `smp-shared` since 2026-07-31 (same as net and vfs). To A/B against the
-# BKL-held fork path, drop it from the `smp-shared` list above and rebuild — and note
-# that alternating feature sets is exactly the workflow the stale-`.bin` bug in
-# scripts/cargo_runner.sh used to corrupt (fixed 2026-07-31; see
-# docs/archive/BKL_PROCESS_CARVE_OUT.md §9.8). There is also a runtime kill switch,
-# `smp_shared::set_process_bkl_drop_enabled(false)`, which needs no rebuild.
-# A no-op (byte-for-byte unchanged) on every build that doesn't set both features.
-no-bkl-process = ["akuma-exec/no-bkl-process", "akuma-kernel-tests-aarch64/no-bkl-process"]
-
-# Run the memory-management syscalls (`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`)
-# WITHOUT the Big Kernel Lock — Phase 5 of
-# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the fourth subsystem carved out.
-# Included in `smp-shared` since 2026-08-01 (same as net/vfs/process). Unlike
-# net/vfs/process, this phase's own audit found two real gaps rather than
-# rediscovering an existing lock: `ProcessMemory::free_regions` was a plain
-# unguarded `Vec` (fixed by folding it under the existing `Process::vm_lock`, see
-# `Process::vm_alloc_mmap`/`vm_free_mmap`), and `sys_mmap`'s OOM/reclaim sweep
-# mutated page tables with no `as_lock` hold at all (fixed by taking a per-page
-# `as_lock_hold` in `reclaim_clean_file_pages`). With those closed, every piece of
-# state these syscalls touch — `Process::as_lock` (page tables), `Process::vm_lock`
-# (`mmap_regions` + the mmap free-list), `LAZY_REGION_TABLE`, PMM/FRAME_TRACKER, and
-# `SHARED_FILE_MAPPINGS` — already carries its own fine-grained lock independent of
-# the BKL. build.rs emits `cfg(kernel_no_bkl_mm)` from CARGO_FEATURE_NO_BKL_MM.
-# Unlike net/vfs/process, attribution has never named an mm syscall as a real
-# contention target (`mmap` was 2.4% of the last measured pool, itself since cut
-# 67% by the `netpoll_drain` carve, §20 of BKL_VFS_CARVE_OUT.md) — this phase is
-# plan-driven, not evidence-driven. A no-op (byte-for-byte unchanged) on every
-# build that doesn't set both features. Unlike net/vfs/process, none of the
-# underlying locks (`as_lock`, `vm_lock`, `LAZY_REGION_TABLE`, PMM) need to know
-# this feature exists — their IRQ-masking is already unconditional (`as_lock` on
-# `kernel_smp_shared` alone, the rest always-on), not conditionally gated on being
-# reachable from a BKL-free window the way `PreemptGuard` is for net/vfs (see
-# BKL_VFS_CARVE_OUT.md §19.3) — so this is a bin-crate-only feature with nothing
-# to forward into `akuma-exec`.
-no-bkl-mm = ["akuma-syscalls-glue/no-bkl-mm"]
-
-# Run the device-driver syscalls (`getrandom`, `read`/`pread64` on `/dev/urandom`,
-# and `write` on `/dev/dsp`) WITHOUT the Big Kernel
-# Lock — Phase 6 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md, the fifth
-# subsystem carved out. Included in `smp-shared` since 2026-08-01 (same as
-# net/vfs/process/mm). Like the preceding phases, every piece of state these
-# syscalls touch already carries its own fine-grained Spinlock — `RNG_DEVICE`
-# (virtio-rng, polling) and `SOUND_DEVICE` (virtio-sound, polling) — so the BKL
-# is redundant for them. The block device
-# (`BLOCK_DEVICE`) and network device (`NETWORK`) are already BKL-free via
-# `no-bkl-vfs` / `no-bkl-network`; this phase covers the remaining drivers.
-# build.rs emits `cfg(kernel_no_bkl_drivers)` from CARGO_FEATURE_NO_BKL_DRIVERS.
-# Like `no-bkl-mm`, none of the underlying driver locks need to know this feature
-# exists — their Spinlock acquisition is already unconditional — so this is a
-# bin-crate-only feature with nothing to forward into `akuma-exec`. A no-op
-# (byte-for-byte unchanged) on every build that doesn't set both features.
-# Note: this kernel has no graphics output at all. virtio-gpu never existed here,
-# and the ramfb path was removed 2026-08-31
-# (docs/archive/FRAMEBUFFER_REMOVED.md).
-no-bkl-drivers = ["akuma-syscalls-glue/no-bkl-drivers"]
-
-# Run the timer IRQ (27) dispatch WITHOUT the Big Kernel Lock — Phase 7a of
-# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7 (see
-# docs/archive/BKL_PHASE7_AUDIT.md §2.3/§5). The timer is the only device IRQ this
-# kernel registers (`irq::register_handler(27, timer::timer_irq_handler)`), and its
-# handler no longer touches anything the BKL alone protects: the alarm queue has its
-# own `Spinlock` (this same phase), the preemption watchdog and fork-in-progress
-# check are per-thread/global atomics, and the GIC ack/EOI/SGI-trigger calls are raw
-# MMIO — all already cross-core safe independent of the BKL. build.rs emits
-# `cfg(kernel_no_bkl_irq)` from CARGO_FEATURE_NO_BKL_IRQ. Unlike net/vfs/process/mm,
-# this isn't a syscall-entry carve-out (no dropped-BKL "window" — the device-IRQ
-# path in `rust_irq_handler_with_sp` simply never calls `enter_kernel`/
-# `reconcile_for_spsr` at all, so there is nothing to reconcile: no context switch
-# happens on this path, and the interrupted thread's own BKL hold state is left
-# completely untouched). Included in `smp-shared` since 2026-08-01, after the boot
-# self-test suite (SMP=2/4) and a same-binary `bkl-profile` A/B on the contention
-# regimen validated it (`irq/sched` 24.7% → 10.2%, 6/6 digests exact both sides,
-# 0 stuck/RECOVERED/PANIC/WILD/SPURIOUS both sides) — see
-# docs/archive/BKL_PHASE7A_TIMER_IRQ_CARVE_OUT.md §5. Remove from the `smp-shared`
-# list to A/B against the BKL-held path.
-no-bkl-irq = ["akuma-exceptions/no-bkl-irq"]
+smp-shared = ["akuma-exec/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-exceptions/smp-shared", "akuma-gic/smp-shared", "akuma-net/smp-shared", "akuma-primitives/smp-shared", "akuma-ext2/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-kernel-core/smp-shared", "akuma-kernel-glue/smp-shared", "akuma-kernel-tests-aarch64/smp-shared"]
 
 # BKL-hold attribution (measurement builds only — never ship it). Enables the
 # per-tag BKL profiler in `akuma_exec::sync` for the whole boot and makes the

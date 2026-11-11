@@ -149,20 +149,19 @@ when its `cfg` cannot hold in a `no-tests` world. Before the feature existed
 ### SMP / Big Kernel Lock
 
 `smp-shared` is the real shared-kernel SMP model — one shared kernel across
-all cores under real cross-core locks. The `no-bkl-*` features are carve-outs
-from the Big Kernel Lock and are only meaningful together with `smp-shared`;
-each is a byte-for-byte no-op on any build that doesn't set both. See
-[`locking.md`](locking.md) for the carve-out playbook and the syscall→lock map.
+all cores under real cross-core locks. It also runs five syscall families without
+the Big Kernel Lock: network, VFS, fork's page copy, mm and the drivers. And it makes
+`PreemptGuard` mask local IRQs for inner-lock holds, which is what makes those
+carve-outs safe. There is no compile-time switch per family. The six `no-bkl-*`
+features were folded into `smp-shared` on 2026-11-11, because every build of both
+kernels had them all on; `no-bkl-irq` had gated nothing since the SGI scheduler was
+deleted (`docs/archive/AKUMA_FEATURE_AUDIT.md` F2). A/B a family with its **runtime**
+toggle, described below. See [`locking.md`](locking.md) for the carve-out playbook
+and the syscall→lock map.
 
 | Feature | cfg emitted | In `smp-shared` by default? | Effect |
 |---|---|---|---|
-| `smp-shared` | `kernel_smp_shared` | — | One kernel across all cores; activates the BKL. **In `default`** since 2026-08-10 — this is *the* SMP now, not a separate profile/CLI opt-in (the one-kernel-per-core "multikernel" `smp` feature was removed the same day). |
-| `no-bkl-network` | `kernel_no_bkl_network` | **yes** (since 2026-07-24) | smoltcp net syscalls + socket `read`/`write` run BKL-free on `SOCKET_TABLE`/`NETWORK`. |
-| `no-bkl-vfs` | `kernel_no_bkl_vfs` | **yes** (since 2026-07-25) | fs syscalls run BKL-free on the ext2/block-cache/fd-table spinlocks. |
-| `no-bkl-process` | `kernel_no_bkl_process` | **yes** (since 2026-07-31) | `fork_process`'s CoW page-copy window runs BKL-free on the address space's `as_lock`, held in 64-page IRQ-masked chunks. Also emitted by `crates/akuma-exec/build.rs` (the only carve-out whose guard is constructed outside the bin crate). |
-| `no-bkl-mm` | `kernel_no_bkl_mm` | **yes** (since 2026-08-01) | `mprotect`/`madvise`/`munmap`/`mremap`/`mmap` run BKL-free on `as_lock`/`vm_lock`/`LAZY_REGION_TABLE`/PMM/`SHARED_FILE_MAPPINGS`. Plan-driven, not attribution-driven — bin-crate-only, nothing forwarded to `akuma-exec`. |
-| `no-bkl-drivers` | `kernel_no_bkl_drivers` | **yes** (since 2026-08-01) | `getrandom`, `/dev/urandom`, `/dev/dsp`, `fb_*` run BKL-free on their own driver spinlocks (`RNG_DEVICE`/`SOUND_DEVICE`/`FB_STATE`). Bin-crate-only. |
-| `no-bkl-irq` | `kernel_no_bkl_irq` | **yes** (since 2026-08-01) | Timer IRQ (27) dispatch runs BKL-free — the only device IRQ this kernel registers. A/B: `irq/sched` BKL contention 24.7% → 10.2%. |
+| `smp-shared` | `kernel_smp_shared` | — | One kernel across all cores; activates the BKL and the five BKL carve-outs. **In `default`** since 2026-08-10 — this is *the* SMP now, not a separate profile/CLI opt-in (the one-kernel-per-core "multikernel" `smp` feature was removed the same day). |
 | `bkl-profile` | `kernel_bkl_profile` | **no — measurement only** | Per-tag BKL-hold profiler + periodic `[BKLPROF]` histogram. Perturbs timing; never ship it. |
 | `read-profile` | *(feature only)* | **no — measurement only** | Per-stage `read(2)` accounting: `sys_read`'s `File` arm, `handle_syscall` and the EL0 handler each time themselves, and a `[READPROF]` window prints every 256 file reads — which stage of a warm read is validation, fd lookup, the staging allocation, ext2, the user copy, or the two wrappers. Answers what neither `bkl-profile` ("which syscall held the lock") nor `net-profile` ("how long was the device busy") can: the split *inside* one syscall. **Single-core only** (the wrapper spans are handed up by one flag — run `SMP=1`), and **never read wall-clock throughput off this build**: the dump's own console write is ~55 ms per window. Use `scripts/benchmarks/read_stage_profile.py`, which drops windows with mixed request sizes or preempted samples. Background: `docs/archive/EXT2_READ_PATH_STAGE_PROFILE.md`. |
 | `CONSOLE_LOCK` (env) | `kernel_console_lock` | **default-on in `release`; off in `extreme-size`** | Cross-core spinlock + owner-core-ID reentrancy guard around `console::emit`'s UART write loop, so two cores under `smp-shared` can't byte-interleave each other's lines at the shared PL011 register. Default-on for `release` (OPT_LEVEL != "z") since 2026-08-11 after SMP=4 verification; off in `extreme-size` (single-core target, lock is pure overhead). `CONSOLE_LOCK=0` opt-out (debug), `CONSOLE_LOCK=1` force-on in `extreme-size` (test). Background: `docs/archive/UART_SMP_INTERLEAVE_FIX.md`. |

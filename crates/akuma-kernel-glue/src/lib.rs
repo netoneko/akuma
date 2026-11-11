@@ -1559,12 +1559,11 @@ fn netpoll_drain_step() {
         // transitively `SOCKET_TABLE` via the post-drop wake pass) is already behind
         // its own `PreemptGuard`-protected lock, so the drain doesn't need the BKL for
         // exclusivity — same precedent as `NetBklGuard` (src/syscall/net.rs), whose
-        // mechanism this reuses directly. Gated on `kernel_no_bkl_network`
-        // specifically, not just `kernel_smp_shared`: that is what makes
-        // `PreemptGuard::new()` mask IRQs for the inner `NETWORK` hold, which is what
+        // mechanism this reuses directly. Safe because under `kernel_smp_shared`
+        // `PreemptGuard::new()` also masks IRQs for the inner `NETWORK` hold, which is what
         // keeps a nested IRQ from ever observing this core "holding NETWORK, wanting
         // the BKL" — the AB-BA shape the `PreemptGuard` doc warns about.
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        #[cfg(kernel_smp_shared)]
         akuma_exec::bkl::dropped_window_open();
         // Re-arm the netpoll doorbell BEFORE draining, not after.
         //
@@ -1599,7 +1598,7 @@ fn netpoll_drain_step() {
                 break; // Safety cap to avoid starving other threads
             }
         }
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        #[cfg(kernel_smp_shared)]
         akuma_exec::bkl::dropped_window_close();
     }
 }

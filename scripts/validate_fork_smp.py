@@ -183,8 +183,9 @@ def main():
     boots = int(os.environ.get("BOOTS", "3"))
     rounds = int(os.environ.get("ROUNDS", "10"))
     smp = os.environ.get("SMP", "4")
-    # Overridable so the same harness validates a BKL carve-out build, e.g.
-    #   FEATURES=devbox-smoltcp,no-tests,no-bkl-process scripts/validate_fork_smp.py
+    # Overridable so the same harness validates another build, e.g.
+    #   FEATURES=devbox-smoltcp,no-tests,bkl-profile scripts/validate_fork_smp.py
+    # (BKL carve-outs are A/B'd with their runtime toggles, not features.)
     features = os.environ.get("FEATURES", "devbox-smoltcp,no-tests")
     disk = os.environ.get("DISK", "devbox.img")
     memory = os.environ.get("MEMORY", "4096")

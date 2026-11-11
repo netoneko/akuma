@@ -955,11 +955,11 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
         // docs/archive/BKL_PHASE7_AUDIT.md §3): every piece of state `poll()` touches is
         // already behind its own `PreemptGuard`-protected `NETWORK`/`SOCKET_TABLE` lock —
         // same precedent as the `netpoll_drain` carve in `src/main.rs`
-        // (`BKL_VFS_CARVE_OUT.md` §19–20), whose mechanism this reuses directly. Gated on
-        // `kernel_no_bkl_network` specifically, not `kernel_smp_shared` alone: that is what
-        // makes `PreemptGuard::new()` mask IRQs for the inner holds, which is what keeps a
-        // nested IRQ from ever observing this core "holding NETWORK, wanting the BKL".
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        // (`BKL_VFS_CARVE_OUT.md` §19–20), whose mechanism this reuses directly. Safe because
+        // under `kernel_smp_shared` `PreemptGuard::new()` also masks IRQs for the inner
+        // holds, which keeps a nested IRQ from ever observing this core "holding NETWORK,
+        // wanting the BKL".
+        #[cfg(kernel_smp_shared)]
         akuma_exec::bkl::dropped_window_open();
         // The drain below is `#[cfg(feature = "smoltcp")]`, so on a rump-only
         // build nothing ever assigns this and the `mut` is genuinely unused.
@@ -971,7 +971,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
                 progress = akuma_net::smoltcp_net::poll();
             }
         }
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        #[cfg(kernel_smp_shared)]
         akuma_exec::bkl::dropped_window_close();
 
         let mut kernel_events = alloc::vec![];
@@ -1297,7 +1297,7 @@ pub fn pselect6_timeout_us(
 
         // BKL carve-out (Phase 7b piece 1) — see the identical comment on the
         // `sys_epoll_pwait` poll() call above.
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        #[cfg(kernel_smp_shared)]
         akuma_exec::bkl::dropped_window_open();
         // The drain below is `#[cfg(feature = "smoltcp")]`, so on a rump-only
         // build nothing ever assigns this and the `mut` is genuinely unused.
@@ -1309,7 +1309,7 @@ pub fn pselect6_timeout_us(
                 progress = akuma_net::smoltcp_net::poll();
             }
         }
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        #[cfg(kernel_smp_shared)]
         akuma_exec::bkl::dropped_window_close();
         let mut ready_count: u64 = 0;
         let mut out_read = [0u64; fdset::MAX_WORDS];
@@ -1741,7 +1741,7 @@ pub fn ppoll_timeout_us(fds_ptr: u64, nfds: usize, timeout_us: Option<u64>) -> S
 
         // BKL carve-out (Phase 7b piece 1) — see the identical comment on the
         // `sys_epoll_pwait` poll() call above.
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        #[cfg(kernel_smp_shared)]
         akuma_exec::bkl::dropped_window_open();
         // The drain below is `#[cfg(feature = "smoltcp")]`, so on a rump-only
         // build nothing ever assigns this and the `mut` is genuinely unused.
@@ -1753,7 +1753,7 @@ pub fn ppoll_timeout_us(fds_ptr: u64, nfds: usize, timeout_us: Option<u64>) -> S
                 progress = akuma_net::smoltcp_net::poll();
             }
         }
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
+        #[cfg(kernel_smp_shared)]
         akuma_exec::bkl::dropped_window_close();
         let mut ready_count = 0;
 

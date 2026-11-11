@@ -80,8 +80,8 @@ GDB_PORT="${GDB_PORT:-$((1234 + INSTANCE))}"
 # in 0.1s" cargo line that looks like a normal cache hit.
 #
 # That breaks exactly the workflow this repo relies on most: a same-source A/B that
-# alternates feature sets (e.g. `--features …,no-bkl-vfs` vs without, or any BKL
-# carve-out validation). Observed 2026-07-31: a `devbox-smoltcp` boot whose ELF had the
+# alternates feature sets (e.g. `--features …,bkl-profile` vs without, or any
+# measurement build). Observed 2026-07-31: a `devbox-smoltcp` boot whose ELF had the
 # in-kernel SSH server compiled OUT still printed "[Main] Spawning built-in SSH server
 # thread" and served the in-kernel banner, because the .bin was from a plain
 # `smp-shared` build minutes earlier.

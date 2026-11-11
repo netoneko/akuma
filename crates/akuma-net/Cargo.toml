@@ -55,19 +55,6 @@ many-sessions = ["akuma-net-nic/many-sessions"]
 # non-SMP builds are byte-for-byte unchanged. Forwarded from the kernel's
 # `smp-shared` feature. See docs/reference/subsystems/smp-shared.md.
 smp-shared = []
-# Run native net syscalls without the Big Kernel Lock (Phase 2 of
-# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate.
-# Upgrades PreemptGuard to also mask local IRQs for NETWORK/SOCKET_TABLE holds,
-# so a BKL-free core can never be caught holding an inner spinlock while a
-# nested IRQ hard-spins on the BKL (AB-BA wedge). Only meaningful with
-# `smp-shared`.
-no-bkl-network = []
-# Run the VFS paths without the Big Kernel Lock (Phase 4 of the BKL fine-grained
-# locking plan), forwarded from the bin crate so the `kernel_no_bkl_vfs` cfg
-# reaches akuma-net's `PreemptGuard` (the IRQ-masking arm fires under
-# `any(no-bkl-network, no-bkl-vfs)`). No akuma-net code is itself cfg-gated on
-# this — VFS lives in the kernel crate; only the guard's cfg union needs it.
-no-bkl-vfs = []
 # The native smoltcp TCP/IP stack: the smoltcp_net/socket/dns/http modules and
 # everything with smoltcp types in its signatures. Optional so a rump-only build
 # (devbox) can compile it out entirely. The rump path (rump_tap + the kernel

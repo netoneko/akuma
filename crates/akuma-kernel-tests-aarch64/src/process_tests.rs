@@ -4821,7 +4821,7 @@ fn test_fork_bkl_drop() {
     {
         set_process_bkl_drop_enabled(true);
         let _g = ProcessBklGuard::new();
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_process))]
+        #[cfg(kernel_smp_shared)]
         if !bkl::in_dropped_window() {
             fails += 1;
             crate::safe_print!(96, "[Test] fork-bkl-drop: guard did not open the window\n");

@@ -1361,3 +1361,11 @@ under `collector-recycles` `claim_slot` takes only `FREE` slots. The fix returns
 retryable constant when that feature is on, and leaves the amd64 path unchanged. Before
 the fix 4/4 runs failed, after it 4/4 passed. Record:
 [`AARCH64_SPAWN_RECLAIM_SKIPPED.md`](AARCH64_SPAWN_RECLAIM_SKIPPED.md).
+
+## Feature pruning F2: `no-bkl-*` folded into `smp-shared` (2026-11-11)
+
+This is the first pruning step before the single-bin merge. Six features left both kernels'
+manifests; they were on in every build of both kernels, and `no-bkl-irq` had gated nothing since
+the SGI deletion. Section sizes are unchanged, and the boot suites match the pre-change runs (HVF
+314/1, 323/0, 321/0; amd64 TCG 829/0, 839/0). Details:
+[`AKUMA_FEATURE_AUDIT.md`](AKUMA_FEATURE_AUDIT.md) § "F2 applied".

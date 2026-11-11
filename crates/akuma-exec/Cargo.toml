@@ -29,29 +29,11 @@ extreme = ["akuma-primitives/extreme", "akuma-elf?/extreme", "akuma-threading/ex
 # Lets this crate's build.rs emit `cfg(kernel_smp_shared)` so the Big Kernel Lock
 # (`bkl`) is active; with it off, `bkl` compiles to zero-overhead no-ops and the
 # default/other builds are unaffected. See docs/reference/subsystems/smp-shared.md.
+#
+# Also turns on the BKL-free fork page-copy (`ProcessBklGuard`, process/bkl_guard.rs),
+# the separate `no-bkl-process` feature until 2026-11-11; A/B is its runtime toggle,
+# `akuma_bkl::policy`.
 smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared", "akuma-elf?/smp-shared", "akuma-threading/smp-shared", "akuma-el0-entry/smp-shared"]
-
-# Disable BKL usage for network operations (Phase 2 testing).
-# When enabled, network syscalls skip BKL acquisition and use the new
-# fine-grained network locks instead. Other subsystems still use BKL.
-# Used for testing network BKL-free operations before full BKL removal.
-no-bkl-network = ["akuma-primitives/no-bkl-network"]
-
-# Disable BKL usage for VFS operations (Phase 4 of
-# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate.
-# Upgrades PreemptGuard to also mask local IRQs for fs-internal spinlock holds
-# (ext2 state/block_cache, BLOCK_DEVICE, MOUNT_TABLE), so a BKL-free core can
-# never be caught holding an inner spinlock while a nested IRQ hard-spins on
-# the BKL (AB-BA wedge — same shape as `no-bkl-network`). Only meaningful with
-# `smp-shared`.
-no-bkl-vfs = ["akuma-primitives/no-bkl-vfs"]
-
-# Run `fork_process`'s CoW share/demote pass WITHOUT the Big Kernel Lock (Phase 3 of
-# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate. Makes
-# this crate's build.rs emit `cfg(kernel_no_bkl_process)`, activating `ProcessBklGuard`
-# (process/bkl_guard.rs) and the chunked `as_lock` holds it depends on. Only meaningful
-# with `smp-shared`.
-no-bkl-process = []
 
 # Mirrors the bin crate's `syscall-debug-info`. OFF by default.
 #

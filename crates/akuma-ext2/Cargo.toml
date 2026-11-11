@@ -20,8 +20,9 @@ extreme = []
 # Off by default; opt in via the kernel's `fs-cache` feature. See
 # docs/AKUMA_SELF_HOSTING.md §7a/§7b.
 fs-cache = []
-# Run the ext2 paths without the Big Kernel Lock (Phase 4 of
-# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate.
+# Real shared-kernel SMP, under which the VFS syscalls run without the Big Kernel
+# Lock (Phase 4 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md; the separate
+# `no-bkl-vfs` feature until 2026-11-11), forwarded from the kernel.
 # Wraps the `state` (RecoverableCell) holds — and therefore, transitively, every
 # `block_cache` access, which is only ever reached with a state guard held — in
 # `akuma_exec::sync::PreemptGuard`, so a core running an fs syscall WITHOUT the
@@ -30,12 +31,12 @@ fs-cache = []
 # Forwarded to `akuma-primitives` so the guard's IRQ-masking half is active even
 # in a graph that does not include `akuma-exec` (e.g. `cargo test -p akuma-ext2`);
 # previously this relied on cargo unifying `akuma-exec`'s copy of the feature.
-no-bkl-vfs = ["akuma-primitives/no-bkl-vfs"]
+smp-shared = ["akuma-primitives/smp-shared"]
 
 [dependencies]
 akuma-vfs = { path = "../akuma-vfs" }
 # `Registered` (the lock-free `InodeFreedHook` cell) + `PreemptGuard` (the
-# IRQ-masking inner-lock guard under `no-bkl-vfs`). These two symbols were the ENTIRE reason
+# IRQ-masking inner-lock guard under `smp-shared`). These two symbols were the ENTIRE reason
 # this crate depended on `akuma-exec` — the 23.8k-line execution crate, for a
 # ~40-line RAII guard and a ~40-line cell. Both live in the dependency-free leaf
 # now, so that edge is gone: see

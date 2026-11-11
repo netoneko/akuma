@@ -77,12 +77,42 @@ A ratchet, not an equality check: it records today's differences between the 16 
 Whether each is intentional for the metal build is the owner's call; the checker only stops a
 fourth from appearing unnoticed.
 
-## Proposed simplifications (none applied)
+## F2 applied (2026-11-11): the `no-bkl-*` features are folded into `smp-shared`
+
+All six are gone from every manifest: the root, `amd64`, `amd64/bin`, glue, the tests crate and
+the leaf crates. Their cfgs read `kernel_smp_shared`. 26 code sites changed: 20 were
+`all(kernel_smp_shared, kernel_no_bkl_X)`, and `PreemptGuard`'s IRQ-mask arm was
+`any(kernel_no_bkl_network, kernel_no_bkl_vfs)` nested inside `kernel_smp_shared`. `akuma-ext2`'s
+`no-bkl-vfs` became its own `smp-shared` (forwarding `akuma-primitives/smp-shared`), which both
+kernels' `smp-shared` now forwards.
+
+- **Nothing changes in a shipped build.** Both kernels' `smp-shared` already enabled every
+  `no-bkl-*` that applied to them (amd64 had all but `no-bkl-irq`). Every site was already
+  gated on `kernel_smp_shared` too, and every crate that read one gets `smp-shared` on both
+  kernels (`akuma-primitives` through `akuma-exec`).
+- **Section sizes.** The default AArch64 image's `.text`/`.rodata`/`.data`/`.bss` are
+  identical. amd64's `.text` is 16 bytes smaller: per-function sizes are identical, and the only
+  difference is which name identical-code-folding kept for one 0x65-byte `drop_glue`.
+- **`no-bkl-irq` was already dead.** Its last code site was the SGI scheduler's IRQ path, deleted
+  in `cd1d8f17`. Only `akuma-exceptions/build.rs` still derived the cfg, and nothing read it.
+- **A/B** stays with the runtime toggles in `akuma_bkl::policy`. No script passed a `no-bkl-*`
+  feature; the two that named one did so in comments, now repointed.
+- **Feature parity.** The ratchet's shared set went from 16 names to 12, and `smp-shared`'s
+  forwarding differs between the kernels only by `akuma-net`/`akuma-primitives`, which amd64 gets
+  transitively.
+
+Gates: clippy on default, devbox-smoltcp, devbox (rump), amd64 (base and
+`ring0-preempt,no-tests`) and the host. Unsafe 414, addr 700. HVF boot suite: 314/1, 323/0 and
+321/0 at SMP=1, 2 and 4, the same as before the change (the one failure is the open
+`thread_slot_reclaim_on_spawn`, `AARCH64_SPAWN_RECLAIM_SKIPPED.md`). amd64 TCG: 829/0 at SMP=1 and
+839/0 at SMP=2.
+
+## Proposed simplifications
 
 | # | change | risk | gate |
 |---|---|---|---|
 | F1 | One shared feature table: a `akuma-kernel-features`-style doc + a check script that asserts the 16 common names forward the same crates in root and `amd64/` | none (a checker) | script in CI/pre-commit |
-| F2 | Fold the six compile-time `no-bkl-*` into `smp-shared`; A/B stays on the runtime toggles | medium: 76 cfg sites, SMP behaviour | AArch64 boot suite byte-identical; amd64 TCG SMP=1 826/0; SMP gates need KVM/metal |
+| F2 | **Applied 2026-11-11, see above.** Fold the six compile-time `no-bkl-*` into `smp-shared`; A/B stays on the runtime toggles | medium: 76 cfg sites, SMP behaviour | AArch64 boot suite byte-identical; amd64 TCG SMP=1 826/0; SMP gates need KVM/metal |
 | F3 | **Revised 2026-11-10:** keep the instrumentation (none is dead); optionally retire `net-direct-waker` (null A/B) | low | build matrix |
 | F4 | Make `sc-*` one group feature `linux-extra-syscalls` (still individually settable for `extreme-size`) | low | `extreme-size` image size must not move |
 | F5 | `rump` per D1: one name, off by default on amd64, `cargo tree` leak check | low | tree check |

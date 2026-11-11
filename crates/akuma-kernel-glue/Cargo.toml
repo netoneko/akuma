@@ -65,19 +65,8 @@ smp-shared = [
     "akuma-syscalls-glue/smp-shared",
     "akuma-kernel-core/smp-shared",
     "akuma-entry/smp-shared",
-    "no-bkl-network",
-    "no-bkl-vfs",
-    "no-bkl-process",
-    "no-bkl-mm",
-    "no-bkl-drivers",
-    "no-bkl-irq",
+    "akuma-ext2/smp-shared",
 ]
-no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network", "akuma-primitives/no-bkl-network", "akuma-syscalls-glue/no-bkl-network"]
-no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-net/no-bkl-vfs", "akuma-primitives/no-bkl-vfs", "akuma-syscalls-glue/no-bkl-vfs"]
-no-bkl-process = ["akuma-exec/no-bkl-process"]
-no-bkl-mm = ["akuma-syscalls-glue/no-bkl-mm"]
-no-bkl-drivers = ["akuma-syscalls-glue/no-bkl-drivers"]
-no-bkl-irq = ["akuma-exceptions/no-bkl-irq"]
 net-profile = ["akuma-net/net-profile", "akuma-kernel-core/net-profile"]
 bkl-profile = ["akuma-kernel-core/bkl-profile"]
 smoltcp = ["akuma-net/smoltcp", "akuma-syscalls-glue/smoltcp", "akuma-kernel-core/smoltcp"]

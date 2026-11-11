@@ -2,10 +2,6 @@
   "common": [
     "fs-cache",
     "net-noalloc",
-    "no-bkl-drivers",
-    "no-bkl-mm",
-    "no-bkl-network",
-    "no-bkl-process",
     "no-tests",
     "sc-aio",
     "sc-containers",
@@ -35,15 +31,9 @@
     "smp-shared": {
       "only_aarch64": [
         "akuma-net/smp-shared",
-        "akuma-primitives/smp-shared",
-        "no-bkl-irq",
-        "no-bkl-vfs"
+        "akuma-primitives/smp-shared"
       ],
-      "only_amd64": [
-        "akuma-exec/no-bkl-vfs",
-        "akuma-ext2/no-bkl-vfs",
-        "akuma-syscalls-glue/no-bkl-vfs"
-      ]
+      "only_amd64": []
     }
   }
 }
