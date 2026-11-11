@@ -2858,7 +2858,7 @@ pub fn current_pid() -> u32 {
     // distinction has to be made rather than inherited.
     //
     // Getting this wrong is silent and it bit immediately: this function is the
-    // **futex namespace** (`crate::futex::namespace`, `(tgid, uaddr)`), so a
+    // **futex namespace** (then `crate::futex::namespace`, `(tgid, uaddr)`), so a
     // thread waking its parent enqueued on one key and woke another. The
     // `threadprobe` parent parked in `FUTEX_WAIT` forever and the boot suite
     // reported `0xffff…` — the never-stored sentinel — on two runs in three,

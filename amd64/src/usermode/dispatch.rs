@@ -1103,8 +1103,11 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // divergence was.
         Syscall::Gettid => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         // `futex` — x86_64 202. Six arguments, which is why `syscall_entry`
-        // now forwards `a6`.
-        Syscall::Futex => crate::futex::sys_futex(a1, a2, a3, a4, a5, a6),
+        // forwards `a6`. Glue's (`akuma_syscalls_glue::sync`) since 2026-11-11:
+        // this kernel had its own wait loop and waiter table over the same
+        // `akuma-syscalls-sync` decisions, and one table is what lets a
+        // kernel-internal wake and a user `FUTEX_WAKE` reach the same waiters.
+        Syscall::Futex => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         // `wait4(pid, wstatus, options, rusage)` — x86_64 61. **Served by
         // `akuma-syscalls-glue` since 2026-09-10**, which is the whole point of
         // this target registering an exit `ProcessChannel` per child

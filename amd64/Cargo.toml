@@ -414,20 +414,8 @@ akuma-pipes = { path = "../crates/akuma-pipes" }
 # `sys_select` (`fd.rs`): `apk` waits for socket writability through `select`
 # and wedged its TLS fetch while the syscall was `ENOSYS`.
 akuma-syscalls-poll = { path = "../crates/akuma-syscalls-poll" }
-# The futex family's pure logic: the op decode, the `(tgid, uaddr)` key
-# namespace, the waiter table, the deadline algebra and the `WAKE_OP` opcode.
-# Wired 2026-09-06 with `clone(CLONE_VM)` — see `src/futex.rs`.
-#
-# Only the *decisions* are shared. The AArch64 kernel half is
-# `akuma-syscalls-glue::sync`, 947 lines of which 22 references are
-# `akuma_exec::threading` — that crate's park/wake, thread states and
-# `tpidr_el1`. `cargo check -p akuma-syscalls-glue --target x86_64-unknown-none`
-# fails on `UserAddressSpace::ttbr0`, `invalidate_icache_for_page_va` and the
-# rest of the aarch64 page-table walker, so reusing the kernel half means
-# porting `akuma-mmu` first (§11.4's dependency, not §11.2's). That split is
-# the crate's own stated design: "the kernel performs every effect", and here
-# the effect is parking a thread on a scheduler the two targets do not share.
-akuma-syscalls-sync = { path = "../crates/akuma-syscalls-sync" }
+# No `akuma-syscalls-sync`: `futex(2)` is `akuma-syscalls-glue::sync`'s since
+# 2026-11-11, which carries that crate itself.
 # The process family's pure decisions (clone kinds, exit scope, wait status, execve's budget).
 akuma-syscalls-proc = { path = "../crates/akuma-syscalls-proc" }
 # The user-copy primitive: `copy_from_user_safe` and its x86_64 `rep movsb`

@@ -212,9 +212,6 @@ pub mod errno {
     pub const EEXIST: u64 = (-17i64) as u64;
     // `ENOTEMPTY`/`EIO`/`EROFS`/`ENOSPC` left with `fs_err_errno` (4b batch 3c):
     // the folded arms map `FsError` through `akuma-syscalls-glue`'s table now.
-    /// `FUTEX_WAIT` ran out of time. The one errno a futex wait can return
-    /// that no other syscall here produces.
-    pub const ETIMEDOUT: u64 = (-110i64) as u64;
     /// Interrupted.
     ///
     /// The one errno this kernel originates rather than reports:

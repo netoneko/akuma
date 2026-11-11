@@ -713,7 +713,7 @@ pub fn install_untimed_park_backstop() {
     // and `claim_slot` handed its slot to a new thread that inherited the
     // entry. `FUTEX_WAKE(uaddr, 1)` then spends itself on the corpse and the
     // live waiter sleeps on. See `AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §13.
-    threading::set_slot_purge_callback(crate::futex::purge_task);
+    threading::set_slot_purge_callback(akuma_syscalls_glue::futex_purge_tid);
 }
 
 /// How many times a thread has parked.
@@ -1135,7 +1135,7 @@ pub fn idle_loop() -> ! {
                 // next question is *which* futex — that is this.
                 //
                 if DUMP_FUTEX_WAITERS {
-                    crate::futex::dump_waiters();
+                    akuma_syscalls_glue::futex_dump();
                 }
                 if DUMP_SLOT_TABLE {
                     akuma_primitives::safe_print!(96,

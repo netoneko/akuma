@@ -1910,7 +1910,7 @@ that:
 | family | amd64 copy | glue's | why it stayed local | plan |
 |---|---|---|---|---|
 | sockets | `sock.rs` (818 L, wiring over `akuma_net::socket`) | `net.rs` | both wire the same crate; never folded | **done** (Slice 1, below) |
-| futex | `futex.rs` (450 L, effects over `akuma-syscalls-sync`) | `sync.rs` | glue's used `akuma_exec::threading` when amd64 had its own scheduler (the `amd64/Cargo.toml` note is from then); both are on `akuma-threading` now | route to glue, delete |
+| futex | `futex.rs` (450 L, effects over `akuma-syscalls-sync`) | `sync.rs` | glue's used `akuma_exec::threading` when amd64 had its own scheduler (the `amd64/Cargo.toml` note is from then); both are on `akuma-threading` now | **done** (Slice 2, below) |
 | signals | `kill`/`tkill`/`tgkill` via `akuma-syscalls-glue-amd64::kill`; `rt_sigreturn` and delivery | `signal.rs`/`proc.rs` | the x86 `kill -9` fix went into the x86 copy | diff the two, keep the stronger, one copy; sigframe and `rt_sigreturn` stay per-arch |
 | fd I/O | `fd.rs` (3.8 kL): read/write/open/stat/dup/fcntl/ioctl/poll/select/getdents | `fs.rs`/`poll.rs` | device kinds glue does not know (`DevKvm`, `DevTun`, `DevWifi`, `DevFb`, `DevMouse`, `DevPower`) and x86 `struct stat`/open-flag translation | device kinds through `SyscallHooks` (it already carries `dev_mouse_has_events`/`dev_tun_has_frame`); x86 ABI translation from `akuma-syscalls-glue-amd64`, which the tokio kernel already uses for exactly this; then route |
 | mm | `mm.rs` (3.5 kL) | `mem.rs` | shared-writable file pages (`shmpages`), `/dev/fb0` and `/dev/kvm` mappings, the fork walk (M3) | last: diff per call, hooks for the device mappings |
@@ -1996,3 +1996,55 @@ Gates:
 
 `sock.rs` had also been answering every non-socket fd `ENOTSOCK`. The one boot check that depended on
 it, `dispatch: accept4 (288) reaches the socket layer`, passes an unopened fd 0 and now expects `EBADF`.
+
+### Slice 2: futex (2026-11-11)
+
+x86_64 202 now goes `to_glue`, and `amd64/src/futex.rs` (450 lines) is deleted. Its callers were
+rewired to glue:
+
+| caller | now |
+|---|---|
+| `thread::teardown`'s `clear_child_tid` wake | `futex_wake` |
+| the slot-purge callback and `teardown`'s purge | `futex_purge_tid` |
+| `akuma-exec`'s `futex_wake` hook | `futex_wake` itself |
+| the `DUMP_FUTEX_WAITERS` diagnostic | `futex_dump` |
+
+`amd64/Cargo.toml` drops `akuma-syscalls-sync`.
+
+**Why it could fold now.** The Cargo note said glue's `sync` could not build for amd64 and parked
+on a scheduler the targets did not share. Both stopped being true with B3 and the `akuma-threading`
+hook. Glue's waiter id is `akuma_threading::current_thread_id()`, which on amd64 is the arch hook
+reading the per-CPU task slot, so purge and wake name the same thing the old table did. Its park
+(`schedule_blocking`) and wake (`wake_by_handle`) are the ones glue's pipe waits already use on this
+target. The two copies' wait loops differed in what ends a wait, and that is the one change made to
+glue:
+
+| input | amd64's loop | glue's loop | now |
+|---|---|---|---|
+| pending signal | masked by the thread's signal mask | **unmasked** (`peek_pending_signal`) | masked: a blocked signal ended every wait with `EINTR` and musl's retry spun, on AArch64 too |
+| deferred kill | via `should_interrupt_blocking_syscall` | `has_pending_kill` | kept; amd64's `drain` posts it with `request_thread_kill` |
+| interrupt flag | via `should_interrupt_blocking_syscall` (the leader's route out, the `-j4` fix) | absent | `is_current_interrupted()` added |
+| group exit flag | `thread::should_leave_now()` | absent | not needed: `drain` posts the deferred kill to the same threads |
+
+amd64's key namespace pinned `shared_file_mapping = false`; glue's asks the memory map. That is a
+change for the better, unexercised by the probes.
+
+Gates:
+- clippy across the slice-1 matrix;
+- amd64 TCG 836 (`SMP=1`) and 846 (`SMP=2`), default and `headless`, unchanged;
+- AArch64 HVF 315 (`SMP=1`) and 321 (`SMP=4`), unchanged;
+- `scripts/futex_suite.py`'s four probes, built for x86_64 musl and run in an amd64 herd guest under
+  TCG (`SMP=2`), on the slice-1 kernel and on this one. All PASS on both: `futexops` 5/5, `futexkey`
+  3/3, `futextest` 7/7 phases, `futexkill` worst `exit_group` -> reaped 0 ms over 5 rounds. A
+  second full pass also passed;
+- `futexops` 3.2 s per run on an idle host (baseline 3.8 s). The first run read 15 s while the TCG
+  gate was building on the same host.
+
+**The amd64 freeze is not DNS.** Every amd64 herd guest booted this session eventually stopped:
+console silent, vCPU at 100 %, ssh gone. The pre-sockets kernel stopped between 525 and 613 s of
+uptime after an unanswered `nslookup`. The slice-1 kernel stopped between about 30 and 54 s, idle,
+right after a passing probe run. This slice's kernel stopped between 386 and 417 s, idle after two
+probe passes. A slice-1 guest that only did refused connects survived 70 s. The times look random and
+follow no workload. All of it ran under TCG on a laptop on battery, so host throttling is not ruled
+out. It is open, and it predates both slices. The next step is the same freeze under
+`ring0-preempt`, with `GDB=1` attached when it stops to read where the vCPU is.

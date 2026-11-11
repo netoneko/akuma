@@ -466,12 +466,15 @@ fn teardown(slot: usize) {
     let Some(t) = THREADS.lock()[slot].take() else { return };
     if t.clear_child_tid != 0 {
         let _ = crate::uaccess::write_val::<u32>(t.clear_child_tid, 0);
-        crate::futex::sys_futex(t.clear_child_tid, u64::from(FUTEX_WAKE_PRIVATE), 1, 0, 0, 0);
+        // Glue's kernel-internal wake: both namespaces, since a joiner may
+        // have waited with or without `FUTEX_PRIVATE_FLAG` (musl's
+        // `pthread_join` uses `priv = 0`).
+        akuma_syscalls_glue::futex_wake(crate::usermode::current_pid(), t.clear_child_tid as usize, 1);
     }
     // The slot this thread ran on becomes reusable the moment it is `Finished`.
     // Anything of its still on the futex table would then name whoever inherits
     // it, and absorb a wake meant for them.
-    crate::futex::purge_task(t.task);
+    akuma_syscalls_glue::futex_purge_tid(t.task);
     // Same argument for the identity map: a stale `tid -> pid` row would hand
     // the next occupant of this slot the dead thread's process.
     //
@@ -505,11 +508,6 @@ fn teardown(slot: usize) {
         akuma_exec::process::unregister_process(pid);
     }
 }
-
-/// `FUTEX_WAKE | FUTEX_PRIVATE_FLAG`, the op `teardown`'s wake uses. Spelled
-/// here rather than reached through `akuma_syscalls_linux` so the one place
-/// the kernel *originates* a futex op is visible in this file.
-const FUTEX_WAKE_PRIVATE: u32 = 1 | 128;
 
 /// Ask every thread of `proc_slot` other than the caller to leave ring 3, and
 /// wait for them.

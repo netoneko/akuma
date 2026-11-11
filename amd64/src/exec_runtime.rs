@@ -463,18 +463,10 @@ fn runtime() -> ExecRuntime {
             bkl_free_io(|| akuma_vfs_glue::read_at_by_inode(path, inode, off, buf).map_err(|_| -1))
         },
 
-        // ── wired 5b slice 4 ──────────────────────────────────────────────
-        // `akuma-exec` calls this from `clear_child_tid` on process exit —
-        // the `pthread_join` wake. It was a `not_wired!` panic on the grounds
-        // that `crate::futex` is "keyed by its own task ids, a different
-        // namespace from `akuma-exec`'s pids"; that named the wrong half of the
-        // table. The waiter *identity* is a scheduler task slot, but the
-        // **key** is `(tgid, uaddr)`, and since 5b slice 2 that tgid is
-        // `current_pid()`, i.e. `akuma-exec`'s own pid. So the argument arrives
-        // in the namespace the table already uses and needs no translation.
-        futex_wake: |tgid, uaddr, count| {
-            let _ = crate::futex::wake_key(tgid, uaddr, count);
-        },
+        // `akuma-exec` calls this from `clear_child_tid` on process exit — the
+        // `pthread_join` wake. Glue's, as on AArch64: one waiter table for both
+        // kernels since the futex fold (2026-11-11).
+        futex_wake: akuma_syscalls_glue::futex_wake,
     }
 }
 

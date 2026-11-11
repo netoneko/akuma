@@ -69,8 +69,6 @@ mod fd;
 mod fbdev;
 #[cfg(target_arch = "x86_64")]
 mod fs;
-/// `futex(2)`: the effects half, over `akuma-syscalls-sync`'s decisions.
-mod futex;
 #[cfg(target_arch = "x86_64")]
 mod gdt;
 /// The per-class driver seam and the services drivers may use.

@@ -355,7 +355,7 @@ What `/proc/stat` still shows as busy on an idle amd64 box is mostly real: the
 boot thread (tid 0) *is* init's kernel thread and spins while init waits, and
 the netpoll daemon polls by design (measured 2026-10-02 on a 2-core QEMU: tid 0
 billed 100% and tid 1 about 44% across an idle 8 s window). Threads that `hlt` on
-their own (`futex.rs` timed waits) are still billed for the halt.
+their own are still billed for the halt.
 
 ## time / uptime
 
