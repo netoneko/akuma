@@ -285,9 +285,9 @@ number (`fs_magic`: `ext2`→`0xEF53`, `proc`→`0x9FA0`, `memfs`/`tmpfs`→
 **This code lives in `fs.rs`, not `container.rs`, on purpose.** `STATFS`/
 `FSTATFS` dispatch unconditionally in `syscall/mod.rs` — they are ordinary
 POSIX syscalls, not container-specific — but `container` is `#[cfg(feature =
-"sc-containers")]`-gated and absent from the `extreme-size` build. The
+"sc-containers")]`-gated and absent from a build without that family. The
 functions were briefly implemented in `container.rs` during the same change
-and had to move once `extreme-size` clippy caught the missing-module
+and had to move once the (since-removed) `extreme` clippy caught the missing-module
 compile error; `mount`/`umount2`/`mount_in_ns` and everything else box-shaped
 stay in `container.rs`, correctly gated.
 

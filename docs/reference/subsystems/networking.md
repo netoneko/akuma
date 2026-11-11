@@ -242,8 +242,7 @@ commonly nets one frame**.
 
 > **Corrected 2026-08-30.** This said "a single `rx_buffer: [u8; 2048]` and a
 > single `rx_token`", which was wrong on both counts by then. The buffer is
-> `RX_BUFFER_LEN` — **65,568** bytes on every profile but `extreme-size`, which
-> keeps 2 KB — because Firecracker will not read a frame from the tap until the
+> `RX_BUFFER_LEN` — **65,568** bytes on every build — because Firecracker will not read a frame from the tap until the
 > driver has posted 65,562 bytes of receive capacity in total
 > (`archive/AKUMA_FIRECRACKER_KVM.md` §5.1). And it is not a struct field: it
 > lives in BSS, because `NetworkState` is built on the kernel stack before being

@@ -47,9 +47,11 @@ done
 echo "clippy: akuma (release)"
 cargo clippy --release -- -D warnings || exit 1
 
-echo "clippy: akuma (extreme-size)"
+# A build without the default features (no smp-shared, no syscall families), under
+# the size-optimised profile: the configuration the default set never compiles.
+echo "clippy: akuma (extreme-size profile, --no-default-features)"
 cargo clippy --profile extreme-size --no-default-features \
-    --features no-tests,smoltcp,extreme,userspace-sshd -- -D warnings || exit 1
+    --features no-tests,smoltcp -- -D warnings || exit 1
 
 echo "tests"
 cargo test --target "$HOST_TARGET" || exit 1

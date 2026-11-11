@@ -42,10 +42,8 @@ SSH_BASE = [
     "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10", "-p", "2222", "root@localhost",
 ]
 
-# Both startup paths: extreme-size has the kernel spawn sshd, every other profile
-# lets herd do it. Match both so the poll does not silently hang if the profile
-# changes — and match `Started` alone as well, because the console is shared and
-# another thread's line lands MID-MARKER routinely:
+# Both spellings of the herd startup line, and `Started` alone as well, because
+# the console is shared and another thread's line lands MID-MARKER routinely:
 #     [herd] Started [syscall] socket(type=TCP) = fd 3
 # which cost one full arm before it was noticed. The log marker is only a hint
 # here anyway; `wait_ready` confirms with a real ssh round trip.

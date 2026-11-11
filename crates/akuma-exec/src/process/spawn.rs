@@ -339,13 +339,6 @@ pub fn spawn_process_with_creds(
     // demand-paged path loader (`from_elf_path`), which maps segments lazily
     // from the file and keeps heap use flat regardless of binary size.  Small
     // binaries keep the well-trodden whole-file path.
-    //
-    // On the size profile every binary uses the demand-paged path so the kernel
-    // heap never needs a scratch buffer sized to the binary (tcc is 723 KB —
-    // the whole reason 8 MB couldn't load it despite having >700 KB PMM free).
-    #[cfg(kernel_profile_extreme)]
-    const HEAP_SLURP_MAX: usize = 0;
-    #[cfg(not(kernel_profile_extreme))]
     const HEAP_SLURP_MAX: usize = 1024 * 1024; // 1 MiB
     // Marked as being executed BEFORE the file is read or stat'ed for loading (`ETXTBSY`), inside the namespace override the read uses.
     let text = match (runtime().text_pin)(elf_path) {
@@ -357,19 +350,16 @@ pub fn spawn_process_with_creds(
     };
     let stat_size = (runtime().file_size)(elf_path).ok().map(|s| s as usize);
 
-    // Pick the loader. Prefer the demand-paged path loader whenever slurping is
-    // disabled (size profile, HEAP_SLURP_MAX == 0) OR the binary is large.
+    // Pick the loader. Prefer the demand-paged path loader when the binary is
+    // large.
     //
     // CRITICAL: this must NOT fall back to a whole-file read_file() merely
     // because file_size() returned None. That hole meant a transient stat
     // failure under memory pressure routed a 723 KB binary (tcc) into a single
     // ~706 KB kernel-heap slurp; with the heap watermark already high the alloc
     // failed in a kernel thread with no current process, so alloc_error_handler
-    // had nothing to kill and panicked the whole kernel (EC=0x3c BRK). On the
-    // size profile we now always use the path loader and re-stat if needed,
-    // never slurp.
-    let want_demand_paged =
-        HEAP_SLURP_MAX == 0 || matches!(stat_size, Some(sz) if sz > HEAP_SLURP_MAX);
+    // had nothing to kill and panicked the whole kernel (EC=0x3c BRK).
+    let want_demand_paged = matches!(stat_size, Some(sz) if sz > HEAP_SLURP_MAX);
 
     let mut process = if want_demand_paged {
         // The path loader needs a size; re-stat if the first stat failed rather

@@ -40,9 +40,7 @@ which writes the UART directly with IRQs disabled on the current core
 > `build.rs`). With it on, the whole per-call byte sequence is atomic
 > across cores, and a panic / sync exception landing while this core
 > already holds the lock takes the reentrant fast path instead of
-> self-deadlocking. Off in size/extreme (single-core targets); opt out
-> in `release` with `CONSOLE_LOCK=0`, force-on in size with
-> `CONSOLE_LOCK=1`. Background and verification:
+> self-deadlocking. On in every build; opt out with `CONSOLE_LOCK=0`. Background and verification:
 > `docs/archive/UART_SMP_INTERLEAVE_FIX.md`.
 
 ## Formatting without heap allocation

@@ -71,7 +71,7 @@ MAIN_REPO = os.path.dirname(_COMMON_GIT_DIR) or REPO
 CLIPPY_CONFIGS = [
     ("release", ["--release"]),
     ("extreme-size", ["--profile", "extreme-size", "--no-default-features",
-                      "--features", "no-tests,smoltcp,extreme,userspace-sshd"]),
+                      "--features", "no-tests,smoltcp"]),
     ("devbox-smoltcp", ["--release", "--features", "devbox-smoltcp,no-tests"]),
     ("devbox-rump", None),  # features scraped from scripts/build_devbox.sh below
 ]

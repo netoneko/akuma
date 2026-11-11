@@ -29,7 +29,6 @@ akuma-not-even-once = { path = "../akuma-not-even-once" }
 [features]
 # Mirrors the root package's toggles that this crate's own build.rs and modules
 # read. `smp-shared` gates the entire secondary-core half.
-extreme = []
 no-tests = []
 smp-shared = ["akuma-boot-aarch64/secondary", "akuma-gic/smp-shared", "akuma-kernel-core/smp-shared", "akuma-exceptions/smp-shared"]
 platform-firecracker = ["akuma-kernel-core/platform-firecracker", "akuma-boot-aarch64/platform-firecracker"]

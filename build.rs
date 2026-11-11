@@ -1,5 +1,4 @@
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
     println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
@@ -37,10 +36,7 @@ fn main() {
     // Verified safe under `SMP=4` + `cargo build -j4` self-host load on
     // 2026-08-11 (see docs/archive/UART_SMP_INTERLEAVE_FIX.md).
     //
-    // Default ON for the `release` profile (anything with OPT_LEVEL != "z").
-    // The size/extreme profiles are single-core targets where the lock is pure
-    // overhead, so they stay off unless `CONSOLE_LOCK=1` forces it on for an
-    // opt-in test. `CONSOLE_LOCK=0` is an explicit opt-out for `release`.
+    // Default ON; `CONSOLE_LOCK=0` is an explicit opt-out.
     //
     // `platform-firecracker` used to be excluded here, and that exclusion was a
     // correctness matter rather than an optimization: the lock is acquired inside
@@ -60,18 +56,10 @@ fn main() {
     // Single-vCPU keeps the deadlock-free behaviour, multi-vCPU gets serialized
     // output, and neither depends on a build-time guess about `vcpu_count`.
     //
-    // Still off for the size/extreme profiles: those are single-core targets where
-    // even the compiled-in atomic load is pure overhead. `CONSOLE_LOCK=1` forces it
-    // on there, `CONSOLE_LOCK=0` opts out of `release`. Background on why the lock
-    // exists at all: docs/archive/UART_SMP_INTERLEAVE_FIX.md.
+    // Background on why the lock exists at all:
+    // docs/archive/UART_SMP_INTERLEAVE_FIX.md.
     println!("cargo:rerun-if-env-changed=CONSOLE_LOCK");
-    let size_opt_for_console = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
-    let console_lock_default_on = !size_opt_for_console;
-    let console_lock = match std::env::var("CONSOLE_LOCK").as_deref() {
-        Ok("0") => false,                       // explicit opt-out
-        Ok("1") => true,                        // explicit opt-in (size/extreme)
-        _      => console_lock_default_on,      // release default-on
-    };
+    let console_lock = std::env::var("CONSOLE_LOCK").as_deref() != Ok("0");
     if console_lock {
         println!("cargo:rustc-cfg=kernel_console_lock");
     }
@@ -115,27 +103,13 @@ fn main() {
         println!("cargo:rustc-cfg=kernel_audio");
     }
 
-    // Boot self-test suite present. Mirrors the `not(any(feature = "no-tests",
-    // kernel_profile_extreme))` condition main.rs used to repeat a dozen times, so
-    // kernel APIs whose only other caller was the in-kernel shell can say "keep me
-    // where either the shell or the tests need me" in one cfg.
-    let kernel_tests = std::env::var("CARGO_FEATURE_NO_TESTS").is_err()
-        && std::env::var("OPT_LEVEL").as_deref() != Ok("z");
+    // Boot self-test suite present unless `no-tests`.
+    let kernel_tests = std::env::var("CARGO_FEATURE_NO_TESTS").is_err();
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_TESTS");
     if kernel_tests {
         println!("cargo:rustc-cfg=kernel_tests");
     }
 
-    // OPT_LEVEL is "z" only for profile.extreme-size (the one size-optimised
-    // profile). PROFILE is always "release" for inherited profiles, so we
-    // cannot use that.
-    let size_opt = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
-
-    // `extreme-size` and `size` are indistinguishable via OPT_LEVEL (both "z"), so
-    // the `extreme` Cargo feature (set only by build_extreme_size.sh) is the
-    // discriminator. Cargo exposes it to build scripts as CARGO_FEATURE_EXTREME.
-    let extreme_profile = size_opt && std::env::var("CARGO_FEATURE_EXTREME").is_ok();
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EXTREME");
     // linker.ld now derives the boot-stack reservation (STACK_BOTTOM / STACK_TOP /
     // IMAGE_RESERVE) from the actual linked image size, so there is no longer a
     // per-profile IMAGE_SIZE here nor a --defsym=STACK_BOTTOM to inject. Still
@@ -143,21 +117,12 @@ fn main() {
     // cache hit.
     println!("cargo:rerun-if-changed=linker.ld");
 
-    if extreme_profile {
-        println!("cargo:rustc-cfg=kernel_profile_extreme");
-    }
-
     // Boot-stack size, injected into linker.ld as the BOOT_STACK_SIZE symbol.
     // ALWAYS passed (linker.ld has no PROVIDE default — a PROVIDE would override
-    // the defsym under LLD, the historical STACK_BOTTOM no-op bug).
-    //   release/size: 1 MB — the boot test suite runs deep on thread 0.
-    //   extreme:      32 KB — no test suite (no-tests); thread 0's measured stack
-    //                 high-water is ~10 KB (docs/EXTREME_STACK_TRIMMING.md), and
-    //                 its exception stack is a separate PMM allocation. Reclaims
-    //                 ~992 KB to the user-page pool (≈17% of RAM at the 4.5 MB
-    //                 floor). config::KERNEL_STACK_SIZE is NOT used for the boot
-    //                 stack bounds (main.rs derives them from STACK_TOP/BOTTOM).
-    let boot_stack_size: usize = if extreme_profile { 32 * 1024 } else { 1024 * 1024 };
+    // the defsym under LLD, the historical STACK_BOTTOM no-op bug). 1 MB: the boot
+    // test suite runs deep on thread 0. config::KERNEL_STACK_SIZE is NOT used for
+    // the boot stack bounds (main.rs derives them from STACK_TOP/BOTTOM).
+    let boot_stack_size: usize = 1024 * 1024;
     println!("cargo:rustc-link-arg=--defsym=BOOT_STACK_SIZE={boot_stack_size}");
     // The build identity (`AKUMA_GIT_SHA`, `AKUMA_BUILD_PROFILE`) moved to
     // `crates/akuma-syscalls-glue/build.rs` on 2026-09-01, with `src/syscall/`.

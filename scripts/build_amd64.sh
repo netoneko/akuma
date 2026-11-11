@@ -6,7 +6,7 @@ set -e
 # stand-in) or amd64/run-firecracker.sh; make a disk with amd64/mkdisk.sh.
 #
 # FEATURES=no-tests compiles the boot suite out — the same opt-in the AArch64
-# devbox and extreme-size targets build with (amd64/run.sh passes it through):
+# devbox targets build with (amd64/run.sh passes it through):
 #
 #   FEATURES=no-tests sh scripts/build_amd64.sh
 FEATURES="${FEATURES:-}"

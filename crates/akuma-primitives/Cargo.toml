@@ -7,12 +7,6 @@ edition = "2024"
 workspace = true
 
 [features]
-# Profile discriminator forwarded from the bin crate's `extreme` feature, so
-# build.rs can emit `cfg(kernel_profile_extreme)` and `MAX_THREADS` drops 256 → 64
-# (the per-slot statics here are BSS whether used or not, and the size profiles
-# target a 4 MB RAM floor).
-extreme = []
-
 # Real (shared-kernel) SMP. Without it `PreemptGuard` is a zero-sized no-op and
 # the preemption counters are never touched. With it the guard also masks local
 # IRQs for the hold, which keeps a BKL-free core from being caught holding an

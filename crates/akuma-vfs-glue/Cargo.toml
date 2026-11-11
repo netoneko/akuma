@@ -61,14 +61,10 @@ akuma-syscalls-net = { path = "../akuma-syscalls-net" }
 akuma-syscalls-ipc = { path = "../akuma-syscalls-ipc", optional = true }
 
 [features]
-# All four are forwarded from the bin, which owns the real definitions. They gate
-# exactly what they gated when this code was `src/vfs/`: `extreme-size` builds
-# --no-default-features and must not gain a byte of container, reboot-sync or
-# SysV-IPC code from the crate split.
+# Forwarded from the bin, which owns the real definitions. They gate exactly what
+# they gated when this code was `src/vfs/`.
 sc-sysv-ipc = ["dep:akuma-syscalls-ipc"]
 sc-containers = ["akuma-isolation/containers"]
-# Discriminates extreme-size from size in build.rs; forwarded from the bin.
-extreme = []
 sc-reboot = []
 # So build.rs can emit `kernel_smp_shared` — see its header for why that matters.
 smp-shared = []

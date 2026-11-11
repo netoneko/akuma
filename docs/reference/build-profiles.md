@@ -19,7 +19,7 @@ apart entirely by feature set, not profile.
 | Target | Profile | Build command | Networking | Purpose |
 |---|---|---|---|---|
 | **release** (default) | `release` | `cargo build --release` / `cargo run --release` | smoltcp (native) + userspace `/bin/sshd`; rump not compiled in (`--features rump` makes it available per box) | Day-to-day development image. Full `default` feature set: sound, real shared-kernel SMP (`smp-shared`), `linux-extra-syscalls` (every `sc-*` family). No in-kernel TLS/shell/editor — those were deleted 2026-08-10, see [below](#there-is-no-built-in-ssh-server). |
-| **extreme-size** | `extreme-size` (inherits `release`) | `scripts/build_extreme_size.sh` | smoltcp + userspace `/bin/sshd`, **no HTTPS** | 4 MB RAM floor target. `opt-level = "z"`, LTO, `codegen-units = 1`, tighter stack/heap constants via `cfg(kernel_profile_extreme)`. No in-kernel TLS anywhere in this tree (not extreme-specific — see below); use a userspace HTTPS tool. Compiles again since `fix-extreme-size` — see [Fixed](#fixed-extreme-size-build-breakage-was-broken-at-d3f28d6). |
+| **extreme-size** | `extreme-size` (inherits `release`) | `cargo build --profile extreme-size [--no-default-features --features …]` | whatever the feature set selects | **Codegen only**: `opt-level = "z"`, fat LTO, `codegen-units = 1`, stripped. Builds the same kernel as `--release` for a given feature set, just smaller. The 4 MB-floor `extreme` feature behind it was removed 2026-11-11 ([`../archive/EXTREME_SIZE_BUILD.md`](../archive/EXTREME_SIZE_BUILD.md)). |
 | **devbox** | `release` | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | **rump only** (no smoltcp) | *(deferred — see `devbox-smoltcp`.)* Rump-stack workstation image: NetBSD rump as box 0's default stack. `--no-default-features`, so smoltcp is compiled out. |
 | **devbox-smoltcp** (default devbox) | `release` | `scripts/build_devbox_smoltcp.sh` / `overlays/devbox/run-smoltcp.sh` | smoltcp (native) + userspace `/bin/sshd` | The **default** "develop inside Akuma" image (2026-07-19). Native smoltcp stack for box 0 + real shared-kernel SMP (`SMP=N`). Keeps the default feature set layered on top (`+= devbox-smoltcp,no-tests`, no `--no-default-features`). rump_server work is deferred. |
 
@@ -34,7 +34,7 @@ File size is not image size: `release`'s 4.4 MB on disk is 3.3 MB of `text`, and
 an unstripped build inflates the file without changing a byte of code.
 
 ```bash
-llvm-size target/aarch64-unknown-none/extreme-size/akuma
+llvm-size target/aarch64-unknown-none/release/akuma
 ```
 
 `llvm-size`/`llvm-nm` are not on `PATH` — they ship in the toolchain:
@@ -44,7 +44,8 @@ Numbers drift with every feature/dependency change — rebuild locally rather
 than trusting a snapshot table here; the `size` profile these numbers used to
 be measured against was removed 2026-08-10 (see
 [Profiles were consolidated](#profiles-were-consolidated-2026-08-10)), so
-`release` and `extreme-size` are the only two worth comparing now.
+`release` and `extreme-size` (the same feature set, different codegen) are the
+only two worth comparing now.
 
 ### Attributing bytes to subsystems
 
@@ -52,7 +53,8 @@ be measured against was removed 2026-08-10 (see
 that keeps symbols. Override per-invocation rather than editing `Cargo.toml`:
 
 ```bash
-scripts/build_extreme_size.sh --config 'profile.extreme-size.strip=false'
+cargo build --profile extreme-size --no-default-features --features no-tests,smoltcp \
+    --config 'profile.extreme-size.strip=false'
 scripts/symbol_sizes.py target/aarch64-unknown-none/extreme-size/akuma --top 30
 ```
 
@@ -99,17 +101,15 @@ locals instead of addresses.
 
 Not in any profile. `crates/akuma-ssh`, `src/ssh/`, the in-kernel shell, the
 in-kernel editor and all kernel cryptography were **deleted** on 2026-08-10;
-every image serves SSH from the userspace `/bin/sshd`. The `extreme-size`
-profile was the last holdout and lost it too once `acceptance/archive/08` was verified
-passing at 4.0 MB over userspace sshd — see
+every image serves SSH from the userspace `/bin/sshd`, started by herd. The
+4 MB `extreme` build was the last holdout and lost it too once
+`acceptance/archive/08` was verified passing at 4.0 MB over userspace sshd — see
 [`../archive/BUILTIN_SSH_REMOVAL.md`](../archive/BUILTIN_SSH_REMOVAL.md).
 
-> **`userspace-sshd` used to be a runtime switch and is no longer a gate at
-> all.** It once only set `config::ENABLE_USERSPACE_SSHD`, skipping the *startup*
-> branch while the whole SSH-2 server stayed linked in. Today it selects the
-> herd-less startup path: `AUTO_START_HERD` off, kernel spawns
-> `/bin/sshd --shell /bin/paws` directly (`AUTO_START_SSHD`). That is the
-> `extreme-size` default and what makes the 4.0 MB floor work.
+The `userspace-sshd` feature (a herd-less startup path where the kernel spawned
+`/bin/sshd` itself, `AUTO_START_SSHD`) went with the `extreme` feature on
+2026-11-11: it was only ever selected together with it. `AUTO_START_HERD` is
+`true` on every build.
 
 ### What went with it
 
@@ -127,9 +127,9 @@ no kernel-side fallback if `/bin/sshd` is missing from the disk.
 
 ### By the numbers (measured, not attributed)
 
-`extreme-size`, same commit, built both ways (this was the measurement that
-motivated deleting the built-in server from `extreme-size` too, rather than
-leaving it as the one profile that kept it):
+The 4 MB `extreme` build, same commit, built both ways (this was the
+measurement that motivated deleting the built-in server there too, rather than
+leaving it as the one build that kept it):
 
 | | built-in SSH | compiled out | delta |
 |---|---|---|---|
@@ -146,8 +146,8 @@ server's system-thread stack, which is never spawned. The image shrink converts
 to free RAM 1:1 — the kernel image occupies PMM pages, so `Code+Stack` loses
 precisely the pages `User pages` gains.
 
-Dropping herd as well (possible only now that `config::AUTO_START_SSHD` can
-start `/bin/sshd` without a supervisor) takes 4.5 MB idle free RAM from 968 KB
+Dropping herd as well (the since-removed `config::AUTO_START_SSHD` started
+`/bin/sshd` without a supervisor) took 4.5 MB idle free RAM from 968 KB
 to **2712 KB**. Full derivation, including the herd-less measurement and two
 defects it surfaced: [`../archive/BUILTIN_SSH_REMOVAL.md`](../archive/BUILTIN_SSH_REMOVAL.md).
 
@@ -155,15 +155,13 @@ defects it surfaced: [`../archive/BUILTIN_SSH_REMOVAL.md`](../archive/BUILTIN_SS
 
 `bootstrap/etc/herd/enabled/sshd.conf` now starts the userspace sshd on
 **port 22** (host `2222`), so every profile answers on the documented port —
-the userspace `/bin/sshd` is the only server on every profile now, started
-either by herd or directly by the kernel's `AUTO_START_SSHD` on `extreme-size`
-(never both — `AUTO_START_HERD` is `!(extreme && userspace-sshd)`, so there is
-no double-bind). A disk populated before 2026-08-10 still carries `--port 23`;
+the userspace `/bin/sshd`, started by herd, is the only server on every
+profile. A disk populated before 2026-08-10 still carries `--port 23`;
 re-overlay `bootstrap/etc/`.
 
 ## Fixed: `extreme-size` build breakage (was broken at `d3f28d6`)
 
-`scripts/build_extreme_size.sh` used to fail with 17 × `E0433` (15 ×
+The (since-removed) `scripts/build_extreme_size.sh` used to fail with 17 × `E0433` (15 ×
 `file_page_cache`, 2 × `container`). Both were `mod` declarations sitting under a
 `#[cfg]` that belonged to another module; fixed on `fix-extreme-size`.
 
@@ -175,8 +173,8 @@ unconditional and `fw_cfg` went back under `sc-framebuffer`. (`fw_cfg` and the
 [`../archive/FRAMEBUFFER_REMOVED.md`](../archive/FRAMEBUFFER_REMOVED.md); this
 paragraph is kept because the page-cache half of the fix still stands.)
 
-Compiling the shared file-page cache into `extreme-size` costs **+9,888 B text
-(+1.4 %)**, and it is live there (`[FPCACHE] entries=390 hits=12` on a 64 MB
+Compiling the shared file-page cache into the 4 MB build cost **+9,888 B text
+(+1.4 %)**, and it was live there (`[FPCACHE] entries=390 hits=12` on a 64 MB
 boot with one `curl`).
 
 Full write-up, plus the `curl` matrix (built-in vs `/bin/curl`, plain vs `-v`,
@@ -186,19 +184,20 @@ extreme vs release) and two open defects it surfaced:
 ## Feature deltas vs. default `release`
 
 `release` builds with cargo's normal default feature resolution: `smp-shared`
-(which includes the BKL carve-outs), `smoltcp`, `sound`, `fs-cache`,
-`linux-extra-syscalls` (the seven `sc-*` families) and `sc-reboot`.
+(which includes the BKL carve-outs), `smoltcp`, `sound`,
+`linux-extra-syscalls` (the seven `sc-*` families) and `sc-reboot`. The ext2
+block cache is not a feature: it is on in every build (the `fs-cache` feature
+was folded in 2026-11-11).
 There is no `neko`/`kernel-tls`/`tls-rsa` to drop anywhere — those features
 were deleted from `Cargo.toml` entirely (commit `bade6ab` for TLS,
-`e9d08f1` for the editor) rather than being opt-out. `devbox`/`extreme-size`
-pass `--no-default-features` and explicitly re-add only what they want;
+`e9d08f1` for the editor) rather than being opt-out. `devbox` passes
+`--no-default-features` and explicitly re-adds only what it wants;
 `devbox-smoltcp` layers on top of `default` instead:
 
 | Target | Drops vs. default | Adds vs. default |
 |---|---|---|
-| `extreme-size` | `smp-shared`, `sound`, `fs-cache`, all `sc-*` | `no-tests`, `extreme`, `userspace-sshd` |
-| `devbox` | `smoltcp`, `smp-shared`, `fs-cache` | `rump-default` (→ `rump`), `userspace-sshd`, `no-tests` |
-| `devbox-smoltcp` | — (inherits default set) | `devbox-smoltcp` (→ `userspace-sshd` + `smp-shared`, the latter a no-op since it's already default), `no-tests` |
+| `devbox` | `smoltcp`, `smp-shared` | `rump-default` (→ `rump`), `no-tests` |
+| `devbox-smoltcp` | — (inherits default set) | `devbox-smoltcp` (now only an alias for `smp-shared`, already default), `no-tests` |
 
 ### Listener backlog and the userspace sshd
 
@@ -207,7 +206,7 @@ Every build's listener backlog is **8** (`MAX_BACKLOG` in
 sockets, and a 9th simultaneous *arrival* gets a RST however fast the server
 accepts. The `many-sessions` feature that raised it to 32 (and the
 `small-sockets` cap `no-tests` used to set) was removed 2026-11-11; the smoltcp
-socket table is 256 everywhere but `extreme-size` (32).
+socket table is 256 everywhere.
 
 The kernel no longer carries a mode for sshd. `/bin/sshd` defaults to a process
 per session with `max_sessions` = 24, which a burst of connections cannot reach
@@ -227,16 +226,16 @@ SSHD_FORK_SESSIONS=0 userspace/build.sh --sshd-only
   connections.
 
 See [`userspace/sshd/docs/PROCESS_PER_SESSION.md`](../../userspace/sshd/docs/PROCESS_PER_SESSION.md)
-and [`docs/runbooks/build-extreme-size.md`](../runbooks/build-extreme-size.md).
+and [`docs/archive/EXTREME_SIZE_BUILD.md`](../archive/EXTREME_SIZE_BUILD.md).
 
 `devbox-smoltcp` keeps the full
 default feature set and only layers its feature on top, rather than starting
-from `--no-default-features` (unlike `extreme-size`/`devbox`).
+from `--no-default-features` (unlike `devbox`).
 
 ## Which one do I want?
 
 - **Developing/debugging the kernel day to day** → `release` (`cargo run --release`).
-- **Verifying the kernel still fits a 4 MB VM** → `extreme-size`. No in-kernel HTTPS; use a userspace tool if you need TLS.
+- **A smaller image of the same kernel** → `--profile extreme-size` with the feature set you want. There is no longer a 4 MB-floor target.
 - **Working inside Akuma as a Unix box (self-hosted toolchain, editor, daily use)** → `devbox-smoltcp` (the default devbox: native smoltcp + real SMP; `overlays/devbox/run-smoltcp.sh`). The rump `devbox` is deferred but still boots via `overlays/devbox/run.sh` (needs `RUMP_NIC=1`).
 - **Exercising real (shared-kernel) SMP** → nothing to do; it is in `--release`. Set `SMP=N` at run time. See `docs/reference/subsystems/smp-shared.md`.
 
@@ -251,7 +250,7 @@ codegen:
 | profile | what it actually changes |
 |---|---|
 | `release` | `panic = "abort"` |
-| `extreme-size` | `opt-level = "z"`, `lto`, `codegen-units = 1`, `strip`, `panic = "immediate-abort"` |
+| `extreme-size` | `opt-level = "z"`, `lto`, `codegen-units = 1`, `strip` |
 | `release-debug` | `debug = true` (DWARF for lldb) |
 
 Practical cost: artifacts for different feature sets now share

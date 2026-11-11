@@ -276,8 +276,7 @@ meaningful.
   now 65568. DHCP completing (`[SmolNet] DHCP configured`, `IP: 10.0.2.15/24`) is
   the cheap proof — `DHCPREQUEST` cannot be sent by a guest that never received
   the offer. Measured inbound throughput on metal: **~15 MB/s**.
-  **`extreme-size` keeps the 2 KB buffer on purpose and therefore has no inbound
-  networking here.**
+  Every build posts the full 65,568-byte buffer.
 - **Two packaging gaps make a working guest look broken.** Neither is
   Firecracker's fault and both cost time on 2026-08-21: the `devbox` image root
   has **no busybox applet links** (so every command is `not found` until

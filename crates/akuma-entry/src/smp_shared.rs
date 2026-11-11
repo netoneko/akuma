@@ -146,7 +146,7 @@ pub use akuma_bkl::policy::{
 // The A/B setters, and the three getters whose last production reader was the
 // exception path (which reads `akuma_bkl::policy::` directly since 2026-09-01),
 // are now touched only by the boot self-tests — `process_tests.rs`, which
-// `no-tests` builds (`devbox-smoltcp`, extreme-size) compile out while denying
+// `no-tests` builds (`devbox-smoltcp`, the rump devbox) compile out while denying
 // unused imports. Same shape as `pmm.rs`'s tests-only re-exports.
 #[allow(unused_imports)]
 pub use akuma_bkl::policy::{

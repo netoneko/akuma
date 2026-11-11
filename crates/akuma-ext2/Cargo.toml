@@ -13,13 +13,6 @@ workspace = true
 # a drain sweeps up to `DEFERRED_FREE_SLOTS` entries and runs tens of thousands
 # of times per build, so it is the one counter here with a real hot-path cost.
 pmm-instr = []
-extreme = []
-# Large, RAM-sized, clock-eviction block cache (replaces the tiny 64-slot ring).
-# Keeps the read-only toolchain (.so + rlibs) resident across the hundreds of
-# rustc/cc/ld spawns in a self-host build instead of re-streaming it off disk.
-# Off by default; opt in via the kernel's `fs-cache` feature. See
-# docs/AKUMA_SELF_HOSTING.md §7a/§7b.
-fs-cache = []
 # Real shared-kernel SMP, under which the VFS syscalls run without the Big Kernel
 # Lock (Phase 4 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md; the separate
 # `no-bkl-vfs` feature until 2026-11-11), forwarded from the kernel.

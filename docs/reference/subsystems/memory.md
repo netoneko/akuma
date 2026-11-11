@@ -42,8 +42,8 @@ filed against it was a signal-return defect, not CoW
 
 ### Kernel regions (computed by `compute_memory_layout`)
 
-- **Code+Stack** = `max(ram/16, MIN_CODE_AND_STACK_BYTES)`; extreme clamped via `MEM_CALC_CLAMP_MB`=4. **Invariant:** must cover `BOOT_STACK_TOP + 1 MB guard`.
-- **Heap** = dynamic (seeded ~1 MB `size` / ~4 MB `release`, grows from PMM). The "fixed 16 MB heap" in `archive/MEMORY_LAYOUT.md` is **superseded**.
+- **Code+Stack** = `max(ram/16, MIN_CODE_AND_STACK_BYTES)`; `MEM_CALC_CLAMP_MB` (0 = off) can clamp the RAM it is computed from. **Invariant:** must cover `BOOT_STACK_TOP + 1 MB guard`.
+- **Heap** = dynamic (seeded ~4 MB, grows from PMM). The "fixed 16 MB heap" in `archive/MEMORY_LAYOUT.md` is **superseded**.
 - **User pages** = remainder.
 - **Device MMIO VAs:** L0[1] → `0x80_0000_0000+` (GIC), `0x80_0000_2000` (UART), `0x80_0000_4000` (VirtIO). **Invariant:** devices must NOT live in L0[0] (the bun 93 MB collision).
 

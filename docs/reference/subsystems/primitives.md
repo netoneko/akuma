@@ -237,7 +237,6 @@ corruption or wedge somewhere else entirely.
 | Feature | Effect here |
 |---|---|
 | `smp-shared` | `PreemptGuard` actually disables preemption and masks local IRQs for the hold |
-| `extreme` | `MAX_THREADS` 256 → 64 (the per-slot statics are BSS whether used or not) |
 
 Forwarded from the bin crate's `Cargo.toml` **directly** as well as through
 `akuma-exec`, deliberately: relying on cargo's feature unification via a third

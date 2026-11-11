@@ -8,8 +8,7 @@
 //!
 //! The suite still spells the kernel's subsystems as `crate::x`, as it did in the bin. The
 //! re-exports below are the same ones `src/main.rs` carried for it, so the move changed no
-//! test. A build with `no-tests` (or the `extreme-size` profile) has no `kernel_tests` cfg
-//! and this crate is only an empty `register`.
+//! test. A build with `no-tests` has no `kernel_tests` cfg and this crate is only an empty `register`.
 //!
 //! Kernel-only: on any other target the crate is empty.
 
@@ -79,7 +78,7 @@ mod network_tests;
 mod process_tests;
 #[cfg(kernel_tests)]
 mod pthread_tests;
-#[cfg(all(not(kernel_profile_extreme), feature = "rump"))]
+#[cfg(feature = "rump")]
 mod rump_tests;
 #[cfg(kernel_tests)]
 mod sync_tests;
@@ -105,6 +104,6 @@ pub fn register() {
         #[cfg(feature = "smoltcp")]
         process_network_tests: process_tests::run_network_tests,
     });
-    #[cfg(all(not(kernel_profile_extreme), feature = "rump"))]
+    #[cfg(feature = "rump")]
     akuma_kernel_glue::set_rump_tests_hook(rump_tests::run_all_tests);
 }

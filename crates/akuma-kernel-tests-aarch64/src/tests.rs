@@ -531,8 +531,9 @@ pub fn run_all() -> bool {
 /// `try_lock` never succeeds, or if `snapshot_from`'s offsets are wrong against
 /// a ring that has already wrapped during a real boot.
 ///
-/// Skipped as a pass on a build with the ring disabled (`extreme-size` selects
-/// `Ring<0>`); "no history" is that build's correct behaviour, not a failure.
+/// Skipped as a pass on a build with the ring disabled (`DMESG_CAP == 0`
+/// selects `Ring<0>`); "no history" is that build's correct behaviour, not a
+/// failure.
 fn test_dmesg_ring_captured_boot() -> bool {
     console::print("\n[TEST] dmesg console history\n");
 

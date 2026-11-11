@@ -258,8 +258,8 @@ fn write_inner(id: u32, data: &[u8], raise_sigpipe: bool) -> Result<usize, i32> 
 /// is in its matching read, so a full buffer always has a live drainer on the other
 /// side. Do **not** reach for this on a pipe whose reader might be the same thread.
 // Callers live on the rump-sysproxy paths (`not(smoltcp)` sendmsg, `feature = "rump"`
-// proxy) and in the boot tests; size/extreme (smoltcp + no-tests, no rump) compile none
-// of them. Allow rather than cfg-mirror three caller gates.
+// proxy) and in the boot tests; a smoltcp + no-tests build without rump compiles
+// none of them. Allow rather than cfg-mirror three caller gates.
 #[allow(dead_code)]
 pub fn pipe_write_all_blocking(id: u32, data: &[u8]) -> Result<(), i32> {
     let mut off = 0usize;

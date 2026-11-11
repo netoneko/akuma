@@ -26,8 +26,8 @@ Akuma isolates processes into **boxes**, each with its own:
 - A process spawns into or `join_box`s into another box for isolation.
 
 **A kernel without containers has one box.** `akuma-isolation`'s `containers` feature
-(forwarded by every kernel's `sc-containers`; off in Taoxichuan and AArch64
-`extreme-size`) compiles the box half: `overlay_fs`, `subdir_fs` and the live
+(forwarded by every kernel's `sc-containers`; off in Taoxichuan and in any
+`--no-default-features` build that does not re-add it) compiles the box half: `overlay_fs`, `subdir_fs` and the live
 `box_registry` with its `hierarchy`/`access` walks. Without it, `box_registry` is
 `host_only`: the same functions, answered for box 0 by construction (no table, no
 lock; nothing is a box's primary, a kill cascade is the box itself, box 0 reaches

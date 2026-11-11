@@ -254,9 +254,9 @@ umount2".
   the high field is `i_dir_acl`). The first regular file past 2 GiB sets `RO_COMPAT_LARGE_FILE`
   (`archive/EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES.md`).
 - **`getdents64`:** directory cache fix (`archive/GETDENTS64_DIR_CACHE_FIX.md`).
-- **`fs-cache` feature** (`Cargo.toml`): large ext2 block cache (clock
-  eviction) — keeps the read-only toolchain resident across the many process
-  spawns in a self-host `cargo build`. Opt-in; not combinable with `extreme`.
+- **Block cache** (`akuma-ext2`'s `ClockBlockCache`, on in every build): large
+  ext2 block cache (clock eviction) — keeps the read-only toolchain resident
+  across the many process spawns in a self-host `cargo build`.
   Gives ~19× metadata speedup. See `archive/AKUMA_SELF_HOSTING.md` §7c.
 - **Write path:** ext2 is read-write; `write_at` avoids heap slurp.
 - **Hard links** (2026-10-14): `Filesystem::link`, real on ext2 (and the

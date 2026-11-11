@@ -331,30 +331,8 @@ pub fn set_network_thread_id(tid: usize) {
 /// `MAX_THREADS` until `set_thread_limit` is called during early boot.
 static THREAD_LIMIT: AtomicUsize = AtomicUsize::new(MAX_THREADS);
 
-// ── Lazy thread-stack allocation (size profile) ──────────────────────────────
-// On the size profile the per-slot stacks (128 KB system / 64 KB user from PMM)
-// are not all pre-allocated at boot — that reserved ~1.28 MB at thread_limit=14
-// while only ~3 threads run at idle. Instead we keep a small WARM FLOOR of FREE
-// pre-allocated stacks per class so the common single-session/single-process
-// spawn is always warm and can't fail, and allocate/free the rest on demand
-// (ensure_slot_stack on claim, free-above-floor in cleanup_terminated). On
-// release every slot is still pre-allocated (no per-spawn alloc, guaranteed
-// availability). Idle saving at 8 MB ≈ 0.8 MB. See docs/LOW_MEMORY_ENVIRONMENT.md.
-// extreme: no warm floor at all. System threads (async-main, SSH) spawn once at
-// boot and never recycle, so a warm *system* reserve is dead weight. The warm
-// *user* stack is the 64 KB that lingers after a process exits (the post-workload
-// step we measured at the floor); free it too. The next user spawn re-allocates
-// its 16 contiguous pages — at the floor workloads are ~serial, so the just-freed
-// stack is immediately available. extreme implies kernel_profile_extreme, so the
-// size branch below must exclude it.
-#[cfg(kernel_profile_extreme)]
-const WARM_FREE_SYSTEM: usize = 0;
-#[cfg(kernel_profile_extreme)]
-const WARM_FREE_USER: usize = 0;
-
 // ── Stack high-water probe ───────────────────────────────────────────────────
-// To right-size the 128 KB system / 64 KB user kernel stacks for the extreme
-// target we need the *true* peak usage. When this is on, freshly-allocated
+// To right-size the system / user kernel stacks we need the *true* peak usage. When this is on, freshly-allocated
 // stacks are painted with `STACK_SENTINEL`; `stack_high_water` then scans for the
 // deepest write — an UPPER bound on usage (any write, even a zero, breaks the
 // sentinel), so sizing to peak+margin is safe. Costs a memset per stack alloc;
@@ -377,10 +355,8 @@ fn published_trap_frame(tid: usize) -> Option<UserTrapFrame> {
     akuma_switch::read_published::<UserTrapFrame>(CURRENT_TRAP_FRAME[tid].load(Ordering::Acquire) as usize)
 }
 
-// Recorded peak usage per class (bytes), so a short-lived user thread's
-// high-water survives the free that WARM_FREE_USER=0 does immediately on exit.
-// Updated in `free_stack_for_slot` (teardown) and `report_stack_high_water`
-// (live long-running system threads). Only meaningful when STACK_USAGE_PROBE.
+// Recorded peak usage per class (bytes). Updated in `report_stack_high_water`.
+// Only meaningful when STACK_USAGE_PROBE.
 static STACK_PEAK_SYSTEM: AtomicUsize = AtomicUsize::new(0);
 static STACK_PEAK_USER: AtomicUsize = AtomicUsize::new(0);
 
@@ -392,8 +368,7 @@ static STACK_PEAK_USER: AtomicUsize = AtomicUsize::new(0);
 const ATOMIC_USIZE_ZERO: AtomicUsize = AtomicUsize::new(0);
 static CANARY_REPORTED_BASE: [AtomicUsize; MAX_THREADS] = [ATOMIC_USIZE_ZERO; MAX_THREADS];
 // Boot-stack (thread 0) bounds, recorded by `paint_boot_stack` so the report can
-// scan it. The boot stack is the 1 MB elephant; its true high-water decides
-// whether it can be halved for the extreme target.
+// scan it. The boot stack is the 1 MB elephant.
 static BOOT_STACK_BASE: AtomicUsize = AtomicUsize::new(0);
 static BOOT_STACK_TOP: AtomicUsize = AtomicUsize::new(0);
 
@@ -460,7 +435,7 @@ pub fn stack_high_water(slot: usize) -> Option<(usize, usize)> {
 }
 
 /// Print a `[Stack]` high-water line: the deepest-used slot in each class and its
-/// peak vs the configured stack size. Drives the extreme stack right-sizing.
+/// peak vs the configured stack size.
 pub fn report_stack_high_water() {
     if !STACK_USAGE_PROBE {
         return;
@@ -1590,9 +1565,9 @@ fn claim_free_slot(start: usize, end: usize) -> Option<usize> {
     None
 }
 
-/// Ensure a just-claimed slot has a stack allocated (lazy stacks). A no-op when
-/// the stack is already present — always the case on release (every slot is
-/// pre-allocated) and for warm-floor slots on the size profile. Returns false if
+/// Ensure a just-claimed slot has a stack allocated. A no-op when the stack is
+/// already present, which `ThreadPool::init` makes the case for every slot up to
+/// the thread limit at boot. Returns false if
 /// the PMM cannot back the stack, in which case the caller must release the slot.
 fn ensure_slot_stack(slot_idx: usize, size: usize) -> bool {
     let _guard = IrqGuard::new();
@@ -2378,45 +2353,16 @@ fn cleanup_terminated_internal(any_caller: bool, ignore_cooldown: bool) -> usize
             // Drop the dead occupant's EL0 trap-frame pointer. `clear_current_trap_frame`
             // (the SVC epilogue) is the only other clear, and no exit path reaches it:
             // `return_to_kernel` never returns to the epilogue, and a peer-killed thread
-            // never runs it at all. The frame lives on THIS slot's kernel stack, which
-            // `free_stack_for_slot` below hands back to the PMM — so leaving the entry set
-            // arms every reader (`get_saved_user_context`, `current_trap_frame_elr`,
+            // never runs it at all. The frame lives on THIS slot's kernel stack, which the
+            // next occupant reuses — so leaving the entry set arms every reader
+            // (`get_saved_user_context`, `current_trap_frame_elr`,
             // `dump_thread_resume_points`, none of which validate) with a pointer into
-            // freed memory the moment the slot is recycled. Must precede the stack free.
+            // another thread's frames the moment the slot is recycled.
             CURRENT_TRAP_FRAME[i].store(0, Ordering::Release);
             // Reset per-thread sigaltstack so the next occupant starts clean.
             THREAD_SIGALTSTACK_SP[i].store(0, Ordering::Release);
             THREAD_SIGALTSTACK_SIZE[i].store(0, Ordering::Release);
             THREAD_SIGALTSTACK_FLAGS[i].store(2, Ordering::Release); // SS_DISABLE
-
-            // Lazy stacks (size profile): return this slot's stack to the PMM
-            // unless that would drop the warm free-stack floor for its class.
-            // Safe here — the thread has terminated and cooled down, so it is no
-            // longer executing on this stack. Done BEFORE the canary re-init
-            // below, which then naturally skips the now-empty stack (base == 0).
-            #[cfg(kernel_profile_extreme)]
-            {
-                let _guard = IrqGuard::new();
-                let mut pool = POOL.lock();
-                let reserved = config().reserved_threads;
-                let (start, end, floor) = if i < reserved {
-                    (1, reserved, WARM_FREE_SYSTEM)
-                } else {
-                    (reserved, thread_limit(), WARM_FREE_USER)
-                };
-                // Count stacks already kept warm (FREE + allocated) in this class,
-                // excluding slot `i` which is still TERMINATED at this point.
-                let warm_free = (start..end)
-                    .filter(|&j| {
-                        j != i
-                            && THREAD_STATES[j].load(Ordering::SeqCst) == thread_state::FREE
-                            && pool.stacks[j].is_allocated()
-                    })
-                    .count();
-                if warm_free >= floor {
-                    pool.free_stack_for_slot(i);
-                }
-            }
 
             // Re-initialize canary for reuse
             if config().enable_stack_canaries {
@@ -3768,14 +3714,10 @@ impl ThreadPool {
 
         // Stack pre-allocation.
         //
-        // release: pre-allocate every slot up to thread_limit (system stacks for
+        // Pre-allocate every slot up to thread_limit (system stacks for
         // 1..reserved, user stacks for reserved..thread_limit) — guaranteed
         // available, no per-spawn allocation.
         //
-        // size profile: lazy stacks. Pre-allocate only a small WARM FLOOR of FREE
-        // stacks per class; ensure_slot_stack grows the rest on demand at spawn
-        // and cleanup_terminated frees back to the floor on recycle. This avoids
-        // reserving ~1 MB of PMM for slots that are idle most of the time.
         // Slots a secondary core has already adopted as its idle thread are skipped
         // by every loop below: that core is RUNNING on the stack it registered, and
         // `allocate_stack_for_slot` would overwrite both `stacks[i]` and
@@ -3784,7 +3726,6 @@ impl ThreadPool {
         // `validate_current_sp`, the canary check and the high-water probe all read
         // `stacks[i]` — while the core kept running on its `.bss` boot stack. See
         // `is_adopted_core_idle` and docs/archive/SMP_ADOPTED_IDLE_SLOT_CLOBBER.md.
-        #[cfg(not(kernel_profile_extreme))]
         {
             for i in 1..config().reserved_threads {
                 if is_adopted_core_idle(i) {
@@ -3802,30 +3743,6 @@ impl ThreadPool {
                 assert!(
                     self.allocate_stack_for_slot(i, config().user_thread_stack_size),
                     "boot: failed to allocate user thread stack for slot {}", i
-                );
-            }
-        }
-        #[cfg(kernel_profile_extreme)]
-        {
-            let sys_end = (1 + WARM_FREE_SYSTEM).min(config().reserved_threads);
-            for i in 1..sys_end {
-                if is_adopted_core_idle(i) {
-                    continue;
-                }
-                assert!(
-                    self.allocate_stack_for_slot(i, config().system_thread_stack_size),
-                    "boot: failed to allocate warm system thread stack for slot {}", i
-                );
-            }
-            let user_start = config().reserved_threads;
-            let user_end = (user_start + WARM_FREE_USER).min(thread_limit());
-            for i in user_start..user_end {
-                if is_adopted_core_idle(i) {
-                    continue;
-                }
-                assert!(
-                    self.allocate_stack_for_slot(i, config().user_thread_stack_size),
-                    "boot: failed to allocate warm user thread stack for slot {}", i
                 );
             }
         }
@@ -3878,47 +3795,6 @@ impl ThreadPool {
         // The exception stack is at the very top of the kernel stack
         self.slots[slot_idx].exception_stack_top = (stack_info.top & !0xF) as u64;
         true
-    }
-
-    /// Free a PMM-backed stack for a specific slot.
-    fn free_stack_for_slot(&mut self, slot_idx: usize) {
-        let stack = &self.stacks[slot_idx];
-        if stack.is_allocated() {
-            // Capture the high-water before the painted stack goes away, so a
-            // short-lived user thread's peak survives this free (WARM_FREE_USER=0
-            // frees on every exit). Cheap scan; only when the probe is on.
-            if STACK_USAGE_PROBE {
-                record_stack_peak(
-                    slot_idx,
-                    stack_region(stack.base, stack.size).high_water(config().canary_words * 8),
-                );
-            }
-            // Overflow verdict, taken here because this is the last moment the
-            // evidence exists — the frames go back to the PMM on the next line and
-            // are handed to somebody else. `init_stack_canary` paints the canary at
-            // every stack's base and nothing repaints it while the thread lives, so
-            // a broken pattern is proof this thread ran off the bottom, and the
-            // bytes below it belonged to whatever the PMM had placed there.
-            //
-            // Reported rather than merely counted because the alternative is what
-            // this check was added for: a 10 KB run-off past a 64 KB user-thread
-            // stack landed in a *user process's L3 page table*, zeroed three PTEs
-            // mid-`sys_spawn`, and surfaced as an unrelated SIGSEGV in the process
-            // whose mapping had vanished. Nothing anywhere said "stack overflow" —
-            // `check_all_stack_canaries` existed but had no callers.
-            // See `docs/archive/EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md`.
-            if config().enable_stack_canaries && !check_stack_canary(stack.base) {
-                safe_print!(160,
-                    "[STACK-OVERFLOW] tid={} ran off its {}KB kernel stack (base={:#x}) — \
-                     kernel memory below it was corrupted\n",
-                    slot_idx, stack.size / 1024, stack.base);
-            }
-            let page_size = 4096;
-            let pages = (stack.size + page_size - 1) / page_size;
-            let phys_addr = mmu::virt_to_phys(stack.base);
-            akuma_pmm::free_pages_contiguous(phys_addr, pages);
-            self.stacks[slot_idx] = StackInfo::empty();
-        }
     }
 
     /// Select next ready thread (round-robin) - LOCK-FREE for state transitions
@@ -6010,18 +5886,16 @@ pub fn check_all_stack_canaries() -> Vec<usize> {
 /// Report every **live** thread whose stack canary has been overrun, once per
 /// thread, and return how many new ones were found.
 ///
-/// The teardown check in `ThreadPool::free_stack_for_slot` only fires when a
-/// thread exits, which is exactly the case an overflow can prevent: if the run-off
-/// corrupts something that hangs or panics the box, the thread never reaches
-/// teardown and the report is never printed. This is the periodic counterpart —
+/// Periodic, so an overrun is reported even when the run-off hangs or panics
+/// the box before anything else notices —
 /// cheap enough for the idle loop (one `canary_words`-word read per allocated
 /// slot, no allocation, no `POOL` lock held across the reads) and latched per slot
 /// so a broken canary is announced once, not every sweep.
 ///
 /// The latch key is the reported stack's **base**, not just its slot: a slot whose
-/// stack was freed and re-allocated (`WARM_FREE_USER == 0` does that on every user
-/// process exit) comes back at a different base with a freshly painted canary, and
-/// must be able to report again. Keying on the base also keeps this lock-free —
+/// stack is re-allocated comes back at a different base with a freshly painted
+/// canary, and must be able to report again. Keying on the base also keeps this
+/// lock-free —
 /// there is no re-arm hook to place inside `init_stack_canary`, which runs under
 /// the `POOL` lock and could not take it again. See
 /// `docs/archive/EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md`.

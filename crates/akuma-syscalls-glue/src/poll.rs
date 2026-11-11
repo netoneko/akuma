@@ -114,7 +114,7 @@ fn any_fd_wants_rump_poll_interval(fds: &[u32]) -> bool {
     fds.iter().any(|&fd| fd_wants_rump_poll_interval(fd as i32))
 }
 
-// Sole caller is `sys_epoll_pwait`; the extreme build (no `sc-epoll`, no `rump`)
+// Sole caller is `sys_epoll_pwait`; a build with no `sc-epoll` and no `rump`
 // compiles neither the rump variant above nor the caller. Allow rather than
 // mirroring the sc-epoll gate here.
 #[allow(dead_code)]

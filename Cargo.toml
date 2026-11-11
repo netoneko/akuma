@@ -169,7 +169,7 @@ pointers_in_nomem_asm_block = "allow"
 dead_code = "deny"
 unused_imports = "deny"
 unused_variables = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_extreme)', 'cfg(kernel_tests)', 'cfg(ext2_fs_cache)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_tests)'] }
 
 [package]
 name = "akuma"
@@ -201,11 +201,9 @@ panic = "abort"
 lto = "thin"
 
 
-# The only size-optimised profile (the `size` profile was removed 2026-08-10: it
-# had no unique feature, no acceptance coverage, and was the sole reason
-# `kernel_profile_size` was emitted for two profiles). `build.rs` keys the
-# extreme behaviour off the `extreme` FEATURE, not the profile — they are
-# selected together by scripts/build_extreme_size.sh.
+# The only size-optimised profile. Codegen only: since 2026-11-11 there is no
+# `extreme` feature or `kernel_profile_extreme` cfg, so `--profile extreme-size`
+# builds the same kernel as `--release` for any feature set, just smaller.
 [profile.extreme-size]
 inherits = "release"
 opt-level = "z"
@@ -270,7 +268,6 @@ default = [
     "smp-shared",
     "smoltcp",
     "sound",
-    "fs-cache",
     "linux-extra-syscalls",
     # Linux reboot(2) -> PSCI SYSTEM_RESET/SYSTEM_OFF. In `default` since
     # 2026-08-25 — see the `sc-reboot` feature definition below for why it was
@@ -417,32 +414,7 @@ sound = ["akuma-virtio/sound", "akuma-kernel-glue/sound", "akuma-kernel-tests-aa
 # kernel with `gic-version=3` in the QEMU command line when using the default
 # (GICv3) driver — see scripts/cargo_runner.sh.
 
-# Profile discriminator (NOT a syscall gate). build_extreme_size.sh enables it so
-# build.rs can pick a tighter IMAGE_SIZE / STACK_BOTTOM than the `size` profile.
-# build.rs reads it via CARGO_FEATURE_EXTREME and emits cfg(kernel_profile_extreme).
-# Forwarded to akuma-exec and akuma-ext2 so their build.rs emits the same cfg
-# (warm-stack floor + kernel-stack right-sizing in akuma-exec; block-cache gate
-# in akuma-ext2).
-extreme = ["akuma-exec/extreme", "akuma-ext2/extreme", "akuma-primitives/extreme", "akuma-vfs-glue/extreme", "akuma-config/extreme", "akuma-syscalls-glue/extreme", "akuma-kernel-core/extreme", "akuma-kernel-glue/extreme", "akuma-kernel-tests-aarch64/extreme"]
 
-# Large RAM-sized ext2 block cache with clock eviction (crates/akuma-ext2). Keeps
-# the read-only toolchain resident across the many process spawns in a self-host
-# `cargo build`, instead of re-reading it off virtio-blk per spawn. The cache cap
-# is auto-derived from detected RAM at mount (`min(RAM/8, 384 MB)`, src/fs.rs).
-#
-# In `default` since 2026-08-02. Without it `akuma-ext2` falls back to
-# `BlockRingCache`: 64 slots / 256 KB, FIFO, linear-scan lookup. That is far
-# smaller than a single demand-fault's 1 MB readahead, so a fault evicts its own
-# double-indirect blocks ~4x while filling, and every page of a >4 MB file costs
-# two extra indirect block reads off virtio-blk. Measured on the rustc workload
-# (`docs/archive/BKL_RUSTC_SCALING_BASELINE.md`): `rustc --version` — zero
-# compilation — spent 1.43 s in 118 instruction-abort demand-page faults, 12.1 ms
-# each, against `librustc_driver` (63 MB) + `libLLVM` (176 MB).
-#
-# The `size`/`extreme` builds pass --no-default-features and do not re-add this,
-# so they are unaffected. Never combined with `extreme` (the 4 MB profile has no
-# cache at all) — akuma-ext2's build.rs gates the cfg on that.
-fs-cache = ["akuma-ext2/fs-cache", "akuma-kernel-tests-aarch64/fs-cache"]
 
 # Per-family syscall gates, normally selected together as `linux-extra-syscalls`.
 # The seven families together: what a Linux program expects beyond the core set.
@@ -469,32 +441,12 @@ sc-epoll        = ["akuma-syscalls-glue/sc-epoll", "akuma-kernel-glue/sc-epoll",
 # then route to rump with no herd box + no `join_box` needed. Implies `rump`.
 rump-default = ["rump", "akuma-kernel-glue/rump-default"]
 
-# Disable the built-in (in-kernel, smoltcp) SSH server so the ONLY sshd is the
-# userspace /bin/sshd started by herd. Drives `config::ENABLE_USERSPACE_SSHD`
-# (src/config.rs) via cfg!(feature = ...). Off by default (the normal image
-# keeps its built-in SSH). The devbox needs this: with rump the default stack,
-# the built-in server (which is smoltcp-only) would be the one thing still on
-# the native stack.
-userspace-sshd = ["akuma-config/userspace-sshd"]
-# The minimal self-hosting kernel (docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md):
-# the composition root's name in the tree. Build with --no-default-features plus a
-# platform feature (scripts/build_taoxichuan_fc.sh). One line per stage that pulls a crate.
-taoxichuan = ["no-tests", "extreme", "userspace-sshd"]
-
-
-# ── devbox-smoltcp: the DEFAULT devbox going forward ─────────────────────────
-# A dev image on the NATIVE smoltcp stack (NOT rump — rump_server work is
-# deferred), with the built-in in-kernel SSH dropped (`userspace-sshd` → the
-# userspace /bin/sshd from herd serves SSH over smoltcp instead) and real
-# shared-kernel SMP (`smp-shared`). The INVERSE of `devbox` (rump-default):
-# keep smoltcp, drop the built-in ssh, add real SMP. Built with the
-# plain `--release` by scripts/build_devbox_smoltcp.sh and layered on
-# the default (smoltcp-carrying) feature set — which is also where it now gets
-# `sc-reboot` from, since unlike `devbox` this build does NOT pass
-# `--no-default-features`. Because smoltcp stays in, the
-# `userspace-sshd` compile guard in main.rs is satisfied. See
-# docs/reference/subsystems/smp-shared.md and overlays/devbox/README.md.
-devbox-smoltcp = ["userspace-sshd", "smp-shared"]
+# ── devbox-smoltcp: the default devbox ───────────────────────────────────────
+# An alias the devbox scripts and benchmarks name: the default feature set
+# already is the smoltcp devbox (`smp-shared` is in `default`, and there is no
+# built-in SSH server to drop). Kept so `--features devbox-smoltcp,no-tests`
+# keeps working.
+devbox-smoltcp = ["smp-shared"]
 
 [lints]
 workspace = true

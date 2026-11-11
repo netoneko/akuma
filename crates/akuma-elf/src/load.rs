@@ -356,13 +356,8 @@ fn log_segment(what: &str, vaddr: usize, filesz: usize, memsz: usize, flags: u32
 
 /// How many file bytes [`map_segment_eager`] reads at once.
 ///
-/// One page on the extreme profile, whose interpreter load goes by path to keep
-/// peak heap under 10 KB (see `interp.rs`). 64 KiB everywhere else: a 250 MB
-/// Chromium loaded by path is ~3 800 reads at this size and ~61 000 at one
-/// page, each of which resolves the path again.
-#[cfg(kernel_profile_extreme)]
-const SEGMENT_READ_WINDOW: usize = PAGE_SIZE;
-#[cfg(not(kernel_profile_extreme))]
+/// 64 KiB: a 250 MB Chromium loaded by path is ~3 800 reads at this size and
+/// ~61 000 at one page, each of which resolves the path again.
 const SEGMENT_READ_WINDOW: usize = 64 * 1024;
 
 /// Map one PT_LOAD segment eagerly: allocate each page and copy its file-backed

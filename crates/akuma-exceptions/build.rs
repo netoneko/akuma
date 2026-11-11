@@ -13,8 +13,8 @@ fn main() {
 
     // The bin crate's `no-tests` feature compiles the boot self-test surface
     // out. Absence of the feature = `kernel_tests` ON, exactly mirroring the
-    // bin crate's build.rs (extreme-size/devbox pass `no-tests`; the default
-    // build does not).
+    // bin crate's build.rs (the devbox passes `no-tests`; the default build does
+    // not).
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_TESTS");
     if std::env::var("CARGO_FEATURE_NO_TESTS").is_err() {
         println!("cargo:rustc-cfg=kernel_tests");

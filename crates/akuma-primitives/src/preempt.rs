@@ -42,11 +42,9 @@ use crate::safe_print;
 /// Compile-time ceiling on thread slots, and the size of every per-slot static
 /// in this module.
 ///
-/// 256 on normal profiles: this is BSS whether used or not, and a few hundred KB
-/// is free on a multi-GB box, while 64 was measurably binding (one process could
-/// hold ~52 threads, and 16-way `pthread_create` load hit genuine exhaustion).
-/// `size`/`extreme-size` keep 64 — they target a 4 MB RAM floor where that BSS is
-/// real money and nothing there spawns hundreds of threads.
+/// 256 on AArch64: this is BSS whether used or not, and a few hundred KB is free
+/// on a multi-GB box, while 64 was measurably binding (one process could hold
+/// ~52 threads, and 16-way `pthread_create` load hit genuine exhaustion).
 ///
 /// **Not the working limit.** `akuma_exec::threading::compute_thread_limit` picks
 /// that at boot from actual RAM and clamps to this value.
@@ -64,12 +62,10 @@ use crate::safe_print;
 /// `.bss` for the per-slot arrays, which that target has, and the benefit is
 /// the ceiling a `cargo -j4` self-host needs (cargo, four `rustc`s, and every
 /// child each hold slots at once).
-#[cfg(all(not(kernel_profile_extreme), target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub const MAX_THREADS: usize = 512;
-#[cfg(all(not(kernel_profile_extreme), not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 pub const MAX_THREADS: usize = 256;
-#[cfg(kernel_profile_extreme)]
-pub const MAX_THREADS: usize = 64;
 
 /// Preemption disabled longer than this warrants a watchdog warning (100 ms).
 pub const PREEMPTION_WATCHDOG_WARN_US: u64 = 100_000;

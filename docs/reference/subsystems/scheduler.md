@@ -13,8 +13,7 @@ For real (shared-kernel) SMP, see [`smp-shared.md`](smp-shared.md).
 
 ## Threading model
 
-- **Preemptive**, fixed-size thread pool. `MAX_THREADS`=256 slots (**64 under
-  the `size`/`extreme-size` profile**); defined in `akuma_primitives::preempt`,
+- **Preemptive**, fixed-size thread pool. `MAX_THREADS`=256 slots (512 on amd64); defined in `akuma_primitives::preempt`,
   re-exported via `threading/types.rs` and `config`. Runtime cap `THREAD_LIMIT`
   clamped to `[RESERVED_THREADS+1, MAX_THREADS]`.
 - **Stacks** come from PMM (`alloc_pages_contiguous_zeroed`); per-thread sizes
@@ -76,7 +75,7 @@ the CPU.
   the switch takes for CPU-time accounting), and the thread is `RUNNING` (not half-way into
   a park or its own termination).
 - **Tick.** 1 ms (`TIMER_INTERVAL_US`, `src/config.rs`; the host WFI probe can lengthen it),
-  10 ms on `extreme-size`. **Idle cores are tickless**: an idle thread arms its core's timer
+  **Idle cores are tickless**: an idle thread arms its core's timer
   for the earliest parked deadline or alarm (capped at 10 ms), halts, and re-arms the tick
   when it runs again (`akuma-kernel-glue`'s `hooked.rs`). No self-SGI per tick: the timer
   interrupt is itself the preemption point.

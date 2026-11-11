@@ -1661,7 +1661,7 @@ impl BlockDevice for RecordingDevice {
 /// ring may have evicted mid-op. The old write-through cache paid a cold
 /// device read per data block on top of that — 4 for this file. What this
 /// asserts: data blocks contribute zero, i.e. reads ≤ the metadata working
-/// set, and — the sharp version, under `fs-cache` where nothing evicts —
+/// set, and — the sharp version, with a cache big enough that nothing evicts —
 /// exactly zero.
 #[test]
 fn writeback_read_after_write_is_warm() {
@@ -1681,8 +1681,7 @@ fn writeback_read_after_write_is_warm() {
         reads <= 9,
         "read-after-write performed {reads} device reads; data blocks must be cache hits (write-through residue?)"
     );
-    #[cfg(feature = "fs-cache")]
-    assert_eq!(reads, 0, "fs-cache is big enough that nothing evicts; expected zero reads");
+    assert_eq!(reads, 0, "the cache is big enough that nothing evicts; expected zero reads");
 }
 
 /// Every mutating op ends in `flush_meta`, so when the op returns the device
@@ -1947,8 +1946,7 @@ fn writeback_coherence_oracle_zero_mismatches() {
 }
 
 // ============================================================================
-// ClockBlockCache (large block cache, feature `fs-cache`) unit tests.
-// Compiled whenever `cfg(test)` is active (the cache type is `cfg(any(ext2_fs_cache, test))`).
+// ClockBlockCache (the block cache) unit tests.
 // ============================================================================
 
 use crate::ext2::{ClockBlockCache, cache_stats, set_cache_cap_bytes};

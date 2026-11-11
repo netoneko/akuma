@@ -216,9 +216,9 @@ fd over an AF_UNIX socket, or keep `reattach` as an exception.
    of heap (`AKUMA_AMD64_PTY.md` §3), about the same as the lazily allocated `LineDiscipline` a pty
    `TerminalState` already costs (`tty.md`). Fork is the real risk:
    `FPCACHE_UNDERSIZED_AT_LOW_RAM.md` measured `/bin/sh: can't fork: Out of memory` after ~9 sessions
-   at 4.5 MB, and `build-extreme-size.md:27-49` builds sshd without `fork-sessions` for that reason.
+   at 4.5 MB, and `EXTREME_SIZE_BUILD.md:27-49` builds sshd without `fork-sessions` for that reason.
    **sshd's own `libakuma` fork() for the shell has been the path since 2026-11-05**, so the 4 MB
-   gate (`acceptance/05_meow_tcc_extreme_4mb.md`) is already exposed. I found no record of it being
+   gate (`acceptance/archive/05_meow_tcc_extreme_4mb.md`) is already exposed. I found no record of it being
    rerun after `811456e5`. A shared-page-table vfork child (AArch64 has it) avoids the CoW share of
    sshd's pages; `fork()` does not. Neither was measured here.
 4. **amd64 has no real vfork.** `clone(CLONE_VM|CLONE_VFORK)` is a CoW fork with the parent running on
@@ -381,5 +381,5 @@ box loses `SpawnOptions` and the `reattach` poll loop.
 - `docs/archive/TAOXICHUAN_CLEANUP_PLAN.md` (steps 2e and "No private syscall"; B11),
   `docs/archive/TAOXICHUAN_SSH_STDIN_PUMP.md`, `docs/archive/TAOXICHUAN_B10_SYSCALL_CENSUS.md`,
   `docs/archive/AKUMA_AMD64_PTY.md`, `docs/archive/FPCACHE_UNDERSIZED_AT_LOW_RAM.md`,
-  `docs/archive/AKUMA_ARCH_CONVERGENCE_RESEARCH.md`, `docs/runbooks/build-extreme-size.md`,
-  `acceptance/05_meow_tcc_extreme_4mb.md`.
+  `docs/archive/AKUMA_ARCH_CONVERGENCE_RESEARCH.md`, `docs/archive/EXTREME_SIZE_BUILD.md`,
+  `acceptance/archive/05_meow_tcc_extreme_4mb.md`.

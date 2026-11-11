@@ -285,7 +285,7 @@ table). Linux wait-status encoding (`encode_wait_status`): normal exit
 ## reboot
 
 `sys_reboot` (`REBOOT` 142, `src/syscall/reboot.rs`) — **`sc-reboot`**, in
-`default` since 2026-08-25 (only `extreme-size` excludes it — see
+`default` since 2026-08-25 (the rump devbox re-adds it explicitly — see
 [`../config-flags.md`](../config-flags.md)). Gated to box 0:
 `caller_may_reboot` returns `EPERM` for any caller with `box_id != 0`, checked
 before the magic/cmd decode — a PSCI reset/off takes every box down with it,

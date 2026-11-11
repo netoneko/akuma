@@ -56,9 +56,8 @@ property, not a size trade — see
 - Used by **every profile**. There is no other sshd.
 - **Started two different ways.** Normally herd launches it from
   `/etc/herd/enabled/sshd.conf` (`--port 22` since 2026-08-10, so host `2222` as
-  documented; disks populated before that still say `--port 23`). On
-  `extreme + userspace-sshd` there is no herd, and `config::AUTO_START_SSHD`
-  spawns `/bin/sshd --port 22 --shell /bin/sh` directly from `kernel_main`.
+  documented; disks populated before that still say `--port 23`). herd is
+  the only thing that starts it (`AUTO_START_HERD` is `true` on every build).
 - **The session environment is built from scratch** (`session_env`): `HOME`,
   `USER`, `LOGNAME` and `PATH` always, `ENV=/etc/profile`, and `TERM` only for
   a pty. Nothing is inherited from sshd's own environment. A variable a program

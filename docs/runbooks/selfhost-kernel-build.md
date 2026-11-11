@@ -539,7 +539,7 @@ VM and triggers a pointless reboot every time.
 
 #### 5.2a Boot the **`devbox-smoltcp`** kernel, or you get the in-kernel shell
 
-The host kernel that runs the self-host VM must be built with the userspace-sshd
+The host kernel that runs the self-host VM must be built with the devbox
 feature set — the same one §5 builds *inside* the guest:
 
 ```bash
@@ -964,8 +964,8 @@ same tree.
   > actually prompted this warning was
   > [`../archive/SELFHOST_ZERO_PAGE_HUNT.md`](../archive/SELFHOST_ZERO_PAGE_HUNT.md),
   > which has nothing to do with LTO, and chasing `lto` first cost real time.
-- **`fs-cache` feature** is already **on** — it is in `default`, so
-  `--features devbox-smoltcp,no-tests` includes it. Nothing to add. The lever is
+- **The ext2 block cache** is already **on** — every build has it. Nothing
+  to add. The lever is
   its *size*: `src/fs.rs` caps it at `min(RAM/8, 384 MB)` at mount. The ceiling
   was 128 MB until 2026-08-05, which was sized against `rustc --version` rather
   than a real compile and left the cache pegged full and evicting; 384 MB cut

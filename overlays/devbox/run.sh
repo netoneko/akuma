@@ -2,9 +2,9 @@
 # Boot the Akuma devbox: single kernel (no SMP), rump networking as the only stack.
 # RUMP_NIC=1 adds /dev/net/tap0 (virtio-mmio-bus.4) and forwards host :2223 -> box :22.
 # Built with the `devbox` profile + `devbox` feature (scripts/build_devbox.sh):
-# rump is the DEFAULT stack for box 0 (rump-default) and there is no built-in SSH
-# (userspace-sshd) — the kernel brings up box 0's rump_server at boot and the only
-# sshd is the userspace /bin/sshd (herd), running unboxed on that rump stack.
+# rump is the DEFAULT stack for box 0 (rump-default) — the kernel brings up box 0's
+# rump_server at boot and the only sshd is the userspace /bin/sshd (herd), running
+# unboxed on that rump stack.
 # See overlays/devbox/README.md.
 set -euo pipefail
 
@@ -29,6 +29,6 @@ echo "  ssh -o StrictHostKeyChecking=no -p $SSH_PORT root@localhost"
 echo
 
 # Same feature set as scripts/build_devbox.sh: --no-default-features drops smoltcp
-# (and the smoltcp-coupled built-in SSH) entirely; rump is the only stack.
-DEVBOX_FEATURES="rump-default,userspace-sshd,sc-reboot,sound,no-tests,linux-extra-syscalls"
+# entirely; rump is the only stack.
+DEVBOX_FEATURES="rump-default,sc-reboot,sound,no-tests,linux-extra-syscalls"
 exec cargo run --release --no-default-features --features "$DEVBOX_FEATURES"

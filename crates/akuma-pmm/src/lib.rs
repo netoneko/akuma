@@ -1462,7 +1462,7 @@ pub fn cow_ledger_record(pa: usize, is_dec: bool, before: u16, after: u16) {
 // kernel-test-suite-only call site (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs` via
 // `crate::pmm::cow_event_count`) is gated in `src/pmm.rs`'s thin wrapper
 // instead; this stays always-compiled and relies on LTO to strip it from
-// builds where that wrapper compiles out (extreme-size / `no-tests`).
+// builds where that wrapper compiles out (`no-tests`).
 pub fn cow_event_count(pa: usize) -> usize {
     if !config().cow_ref_ledger {
         return 0;

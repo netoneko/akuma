@@ -85,7 +85,6 @@ pub fn init() -> Result<(), FsError> {
     // allocated in Ext2Filesystem::new). Cap at min(12.5% RAM, 384 MB): enough to
     // keep the read-only toolchain's hot pages resident across the many
     // rustc/cc/ld spawns, bounded so it can't starve user pages.
-    // No-op unless the kernel is built with the `fs-cache` feature.
     //
     // The ceiling was 128 MB from 2026-08-02 to 2026-08-05. That was too small:
     // it was sized against `rustc --version` (~71 distinct 1 MB windows), which

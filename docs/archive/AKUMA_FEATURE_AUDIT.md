@@ -206,6 +206,45 @@ and no script enabled either. Removed:
 `wait_until` uses `WaitPolicy::promiscuous()`, as every build did. The epoll family's
 `ScanRegistered` kind and the model-only `LightSleep` stay.
 
+## `extreme`, `userspace-sshd` and `fs-cache` removed (2026-11-11)
+
+`extreme` selected the 4 MB-floor build: `cfg(kernel_profile_extreme)` (also emitted by several
+build scripts on `OPT_LEVEL=z` alone) shrank thread stacks, the heap seed, `MAX_THREADS` (64),
+`MAX_SOCKETS` (32), the NIC RX buffer (2 KB), the dmesg ring, `MAX_ARG_STRLEN`, `HEAP_SLURP_MAX`,
+the boot stack (32 KB) and the timer probe, dropped the ext2 block cache and the console lock,
+and turned the boot suite off. `userspace-sshd` was only ever selected with it (the herd-less
+`AUTO_START_SSHD` path). Both are gone; `AUTO_START_HERD` is `true` on every build.
+
+The `extreme-size` **profile** stays, as codegen only (`opt-level = "z"`, fat LTO, one CGU,
+stripped). `AKUMA_BUILD_PROFILE` still reports it. `--profile extreme-size --no-default-features
+--features no-tests,smoltcp` is the pre-commit hook's size-profile clippy line.
+
+`fs-cache` (the ext2 `ClockBlockCache`) is folded in: `BlockRingCache` and the direct-device arms
+are deleted, and every build has the clock cache - including the rump devbox and Taoxichuan,
+which did not before (16 MB cap unless the kernel sets one).
+
+How: a cfg partial evaluator over the atoms `kernel_profile_extreme=false`,
+`feature="extreme"=false`, `feature="userspace-sshd"=false`, `ext2_fs_cache=true`,
+`feature="fs-cache"=true`, one rewrite per rescan, every change printed for review; then a hand
+sweep of comments that described the removed behaviour. Four build scripts became empty and were
+deleted (`akuma-{config,elf,net,ext2}`). `HookConfig::extreme` is `HookConfig::quiet`.
+`scripts/build_extreme_size.sh` and `scripts/build_taoxichuan_fc.sh` (which used the removed
+root `taoxichuan` feature) are deleted; `docs/runbooks/build-extreme-size.md` is
+`EXTREME_SIZE_BUILD.md` here and `acceptance/05` is in `acceptance/archive/`.
+
+No crate dropped out of any image: the removal deleted constants and arms, not dependencies.
+
+| image | before | after |
+|---|---|---|
+| default | `.text` 3,340,252 | identical (`.rodata` +24 B) |
+| devbox-smoltcp | 1,883,516 | +8 B |
+| rump devbox | 1,672,352 | +10,740 B (gains the block cache) |
+| amd64 | 3,035,375 | +32 B |
+| `extreme-size` profile | 632,224 / bss 462,016 (old `extreme`) | 654,324 / bss 595,584 (full-size constants) |
+
+`smp-shared` is not yet removable: Taoxichuan, the host tests and the rump devbox build without
+it (252 cfg sites in 35 files). It needs its own step - deciding what Taoxichuan gets.
+
 ## Proposed simplifications
 
 | # | change | risk | gate |
@@ -213,7 +252,7 @@ and no script enabled either. Removed:
 | F1 | One shared feature table: a `akuma-kernel-features`-style doc + a check script that asserts the 16 common names forward the same crates in root and `amd64/` | none (a checker) | script in CI/pre-commit |
 | F2 | **Applied 2026-11-11, see above.** Fold the six compile-time `no-bkl-*` into `smp-shared`; A/B stays on the runtime toggles | medium: 76 cfg sites, SMP behaviour | AArch64 boot suite byte-identical; amd64 TCG SMP=1 826/0; SMP gates need KVM/metal |
 | F3 | **Revised 2026-11-10:** keep the instrumentation (none is dead); optionally retire `net-direct-waker` (null A/B) | low | build matrix |
-| F4 | Make `sc-*` one group feature `linux-extra-syscalls` (still individually settable for `extreme-size`) | low | `extreme-size` image size must not move |
+| F4 | **Applied 2026-11-11.** Make `sc-*` one group feature `linux-extra-syscalls` (still individually settable) | low | images unchanged |
 | F5 | `rump` per D1: one name, off by default on amd64, `cargo tree` leak check | low | tree check |
 
 ## Background

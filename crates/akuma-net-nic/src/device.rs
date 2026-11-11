@@ -32,17 +32,8 @@ use crate::nicstat;
 /// the same total, but `virtio-drivers` does not offer that feature, so the
 /// capacity has to come from a single descriptor.
 ///
-/// `extreme-size` keeps 2 KB: it boots in 4 MB of RAM, where 64 KB of BSS is
-/// 1.6% of the machine, and it is a QEMU target — its acceptance test is the
-/// 4 MB floor (`acceptance/05`). Running *that* profile under Firecracker would
-/// have no inbound networking.
-///
 /// See `docs/archive/AKUMA_FIRECRACKER_KVM.md` §5.1.
-pub const RX_BUFFER_LEN: usize = if cfg!(kernel_profile_extreme) {
-    2048
-} else {
-    65_568
-};
+pub const RX_BUFFER_LEN: usize = 65_568;
 
 /// The single receive buffer.
 ///

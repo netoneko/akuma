@@ -751,7 +751,7 @@ printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></h
 # `/tmp`: real writes landed 2026-09-04 (`fd::sys_write_file`/`fs::write_file`),
 # and `akuma-ext2`'s `write_file` requires the parent directory to already
 # exist — it does not create one, matching `open(2)`. tcc's own acceptance
-# tests on the AArch64 side (`acceptance/05_meow_tcc_extreme_4mb.md`) write
+# tests on the AArch64 side (`acceptance/archive/05_meow_tcc_extreme_4mb.md`) write
 # their output to `/tmp`, so this target's tcc port follows the same path
 # rather than inventing a different convention.
 "$DEBUGFS" -w -R "mkdir /tmp" "$IMG" >/dev/null 2>&1

@@ -12,10 +12,8 @@ akuma-primitives = { path = "../akuma-primitives" }
 [features]
 # All forwarded from the bin, which owns the real definitions. They must arrive,
 # or a gated const silently compiles its other arm — see build.rs.
-extreme = []
 platform-firecracker = []
 syscall-debug-info = []
-userspace-sshd = []
 
 [lints]
 workspace = true

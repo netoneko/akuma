@@ -19,11 +19,6 @@ no-tests = []
 # Enabled by the AArch64 kernel's crates (`akuma-syscalls-glue/exec`,
 # `akuma-kernel-glue`, `akuma-exceptions`, the bin).
 elf-loader = ["dep:akuma-elf", "dep:embedded-io-async"]
-# Profile discriminator forwarded from the bin crate's `extreme` feature
-# (build_extreme_size.sh). Lets this crate's build.rs emit
-# `cfg(kernel_profile_extreme)` so threading can trim the warm-stack floor and
-# right-size kernel stacks for the extreme low-memory target. NOT a syscall gate.
-extreme = ["akuma-primitives/extreme", "akuma-elf?/extreme", "akuma-threading/extreme", "akuma-el0-entry/extreme"]
 
 # Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared` feature.
 # Lets this crate's build.rs emit `cfg(kernel_smp_shared)` so the Big Kernel Lock

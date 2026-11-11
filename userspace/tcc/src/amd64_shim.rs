@@ -310,7 +310,7 @@ const MAP_PRIVATE_ANON: u64 = 0x02 | 0x20;
 /// committed up front, not a reservation. 16 MiB is comfortably under that
 /// cap and well above the ~4 MiB peak working set tcc's own aarch64
 /// acceptance test measures for a `-static` compile
-/// (`acceptance/05_meow_tcc_extreme_4mb.md`) on a much tighter machine; if a
+/// (`acceptance/archive/05_meow_tcc_extreme_4mb.md`) on a much tighter machine; if a
 /// larger source file needs more, this is the number to raise, not the design
 /// to replace — `sys_mmap`'s frame budget is set by the PMM's free pool, not
 /// by anything this crate can see, and QEMU's default run boots with

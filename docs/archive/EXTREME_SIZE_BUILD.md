@@ -1,5 +1,12 @@
 # Build the `extreme-size` image (and keep it small)
 
+> **Archived 2026-11-11.** The `extreme` feature (and with it the 4 MB floor
+> target, its `kernel_profile_extreme` cfg and `scripts/build_extreme_size.sh`)
+> was removed; the `extreme-size` Cargo *profile* stays as codegen only
+> (`opt-level = "z"`, fat LTO) and builds the same kernel as `--release` for any
+> feature set. Kept as the record of how the 4 MB build worked — the steps below
+> no longer run. See `docs/archive/AKUMA_FEATURE_AUDIT.md`.
+
 **Stability: B — verify behaviour.** The 4 MB RAM floor target. Full profile
 background in [`docs/reference/build-profiles.md`](../reference/build-profiles.md);
 this runbook is the do-it procedure plus the memory traps that bite here and

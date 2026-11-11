@@ -174,7 +174,7 @@ mod timerfd;
 /// check keys off this, so it is the one place the caller's identity is
 /// decided. It lives here rather than in `container` because `proc`'s
 /// `SPAWN_EXT` / `SET_BOX_STACK` gate on it too, and those are dispatched even
-/// when `sc-containers` is off (extreme-size).
+/// when `sc-containers` is off.
 pub fn caller_box_and_pid() -> (u64, u32) {
     akuma_exec::process::current_process_shared().map_or((0, 0), |p| (p.box_id, p.pid))
 }
@@ -439,8 +439,8 @@ pub use akuma_syscalls_linux::{
 // the native (smoltcp) socket surface; a rump-only build compiles none of it.
 #[cfg(feature = "smoltcp")]
 pub use akuma_syscalls_linux::{IfConfHdr, SockAddrHw, Timeval};
-// Split out only because `unused_imports` is `deny` and an `extreme-size` build
-// compiles no epoll surface at all.
+// Split out only because `unused_imports` is `deny` and a build without
+// `sc-epoll` compiles no epoll surface at all.
 #[cfg(feature = "sc-epoll")]
 pub use akuma_syscalls_linux::EpollEvent;
 
@@ -538,8 +538,8 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
 /// The crate takes the config consts as a parameter rather than reading them,
 /// which is what makes every gate combination reachable from a host test —
 /// `PROCESS_SYSCALL_STATS` and `PROC_SYSCALL_LOG_ENABLED` are `true` in every
-/// profile but `kernel_profile_extreme`, so the off-arms were previously only
-/// testable by building a different kernel.
+/// build, so the off-arms would otherwise only be testable by building a
+/// different kernel.
 ///
 /// `identity` is the one field that is a decision rather than a mirror of an
 /// existing const — see `akuma_syscalls::IdentitySource` and the note on

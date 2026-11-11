@@ -25,7 +25,6 @@ Start from the symptom or task on the left.
 | An **on-box agent** (`meow`/`kot`) was asked to build/compile the kernel — no recon, just the loop | [`build-kernel-on-box.md`](build-kernel-on-box.md) — `kbuild`, confirm the ELF, and when (not) to `kinstall` + reboot the box's default GRUB entry |
 | Putting a nightly Rust toolchain inside the Akuma/amd64 guest | [`stage-rust-toolchain-amd64.md`](stage-rust-toolchain-amd64.md) — musl host, `--force-non-host`, loop-mount the image; and the `LD_LIBRARY_PATH`/`$ORIGIN` trap that makes `rustc` unable to find its own `.so` |
 | Building the devbox image | [`build-devbox.md`](build-devbox.md) |
-| Building the `extreme-size` (4 MB floor) image | [`build-extreme-size.md`](build-extreme-size.md) |
 | Debugging the devbox (SSH down, cargo crash, 100% CPU) | [`debug-devbox.md`](debug-devbox.md) |
 | Recovering a wedged / hung / 100%-CPU VM | [`recover-wedged-vm.md`](recover-wedged-vm.md) |
 | Debugging networking (native smoltcp stack) | [`debug-network.md`](debug-network.md) |

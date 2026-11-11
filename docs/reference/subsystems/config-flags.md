@@ -18,7 +18,7 @@ profiles exist since the 2026-08-10 consolidation removed five that were pure
 | Profile | Inherits | Used by | Notes |
 |---|---|---|---|
 | `release` | — | default `cargo run` / `cargo build` | full `default` feature set, including real shared-kernel SMP (`smp-shared`) |
-| `extreme-size` | `release` | `scripts/build_extreme_size.sh` | `opt-level=z`, LTO, `codegen-units=1`; 4 MB floor; `--no-default-features` re-adds a minimal set |
+| `extreme-size` | `release` | `cargo build --profile extreme-size …` (manual) | codegen only: `opt-level=z`, LTO, `codegen-units=1`, stripped. The same kernel as `release` for a given feature set; no cfg reads the profile since the `extreme` feature was removed 2026-11-11 |
 | `release-debug` | `release` | `cargo build --profile release-debug --features ...` (manual only) | adds `debug = true` (DWARF) for source-level `lldb` against the gdbstub |
 
 `devbox` and `devbox-smoltcp` are **not** profiles — both build on plain
@@ -31,7 +31,7 @@ Source: `Cargo.toml:73-105`.
 
 `default` (`Cargo.toml:109-124`):
 ```
-smp-shared, smoltcp, sound, fs-cache,
+smp-shared, smoltcp, sound,
 linux-extra-syscalls, sc-reboot
 ```
 
@@ -55,9 +55,9 @@ HTTPS client anywhere in this tree now; use a userspace tool.
 | `smoltcp` | Native smoltcp TCP/IP stack on NIC0; DNS/HTTP depend on it. (No longer gates a built-in SSH server — that was deleted entirely, not just from non-smoltcp builds.) | `Cargo.toml:315` |
 | `rump` | **Off by default** since 2026-11-11. Raw L2 tap path on NIC1 (`/dev/net/tap0`) for a userspace NetBSD rump stack, the sysproxy client, and the rump regression guards, which every `rump` build runs at boot even with `no-tests` (the old `rump-tests`). NIC1 only exists with `RUMP_NIC=1`. Acceptance 11 builds it with box 0 on the native stack. | `Cargo.toml:309` |
 | `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. The rump devbox's feature; it replaces the removed `devbox` bundle. A separate feature because the AArch64 kernel reads no boot command line to choose it at runtime. | `Cargo.toml:378` |
-| `userspace-sshd` | Selects the herd-less startup path: `AUTO_START_HERD` off, kernel spawns `/bin/sshd` directly via `AUTO_START_SSHD`. Drives `config::ENABLE_USERSPACE_SSHD`. There is only ever one sshd (userspace) now — this no longer toggles between a built-in and a userspace server, only who starts the userspace one. | `Cargo.toml:386` |
+| (`userspace-sshd`) | **Removed 2026-11-11** with `extreme`, the only build that selected it. herd starts `/bin/sshd` on every build. |
 | (`many-sessions`) | **Removed 2026-11-11.** The listener backlog is 8 on every build; configure sshd for it or raise `MAX_BACKLOG` — [`../build-profiles.md`](../build-profiles.md) § Listener backlog. |
-| `devbox-smoltcp` | Meta-feature = `["userspace-sshd", "smp-shared"]` — the **default** devbox. Keeps smoltcp; both members are no-ops here since they're already in `default` (this build does NOT pass `--no-default-features`) — `sc-reboot` used to be listed a third time for the same reason before it moved into `default` itself (2026-08-25). | `Cargo.toml:405` |
+| `devbox-smoltcp` | Alias for `smp-shared` — the **default** devbox's feature. A no-op on top of `default` (this build does NOT pass `--no-default-features`); kept so existing build lines still resolve. | `Cargo.toml` |
 
 > **Drift note:** `overlays/devbox/README.md:142,211`
 > still say "Phase 2 will build with `--no-default-features`" and "smoltcp is
@@ -79,15 +79,15 @@ re-add what they need. `Cargo.toml:361-369`.
 | `sc-eventfd` | 2 (needs ExecRuntime stub when off) | |
 | `sc-pidfd` | 2 | |
 | `sc-epoll` | 2 | |
-| `sc-reboot` | — | **In `default`** since 2026-08-25 (was devbox-only before — the plan had been to land it alongside a self-hosted kexec, which was scoped and rejected, so there was no reason left to gate it). `extreme-size` still excludes it (`--no-default-features`, own explicit list). Linux `reboot(2)` (`nr` 142) → PSCI `SYSTEM_RESET`/`SYSTEM_OFF`. ABI decode in `crates/akuma-boot` (host-tested); the PSCI call reuses `smp_shared`'s existing SMC/HVC conduit code, so `sc-reboot` depends on `smp-shared`. **Box-0 only**: `caller_may_reboot` (`src/syscall/reboot.rs`) returns `EPERM` for any caller with `box_id != 0` — a whole-machine PSCI reset/off would take every other box down with it, so it gets the same host-only restriction `mount`/`umount` already have (`caller_may_mount`, `src/syscall/container.rs`). See [`syscalls/proc.md`](syscalls/proc.md#reboot) and [`../../archive/AKUMA_BOOT_EXTRACTION.md`](../../archive/AKUMA_BOOT_EXTRACTION.md). |
+| `sc-reboot` | — | **In `default`** since 2026-08-25 (was devbox-only before — the plan had been to land it alongside a self-hosted kexec, which was scoped and rejected, so there was no reason left to gate it). Linux `reboot(2)` (`nr` 142) → PSCI `SYSTEM_RESET`/`SYSTEM_OFF`. ABI decode in `crates/akuma-boot` (host-tested); the PSCI call reuses `smp_shared`'s existing SMC/HVC conduit code, so `sc-reboot` depends on `smp-shared`. **Box-0 only**: `caller_may_reboot` (`src/syscall/reboot.rs`) returns `EPERM` for any caller with `box_id != 0` — a whole-machine PSCI reset/off would take every other box down with it, so it gets the same host-only restriction `mount`/`umount` already have (`caller_may_mount`, `src/syscall/container.rs`). See [`syscalls/proc.md`](syscalls/proc.md#reboot) and [`../../archive/AKUMA_BOOT_EXTRACTION.md`](../../archive/AKUMA_BOOT_EXTRACTION.md). |
 
 ### Other
 
 | Feature | Effect | Source |
 |---|---|---|
 | `sound` | virtio-sound output (`/dev/dsp`). The only thing that still compiles `virtio-drivers` (and `zerocopy`, `safe-mmio`, `bitflags` 2, `thiserror`): block and net are driven in-tree (`archive/AKUMA_VIRTIO_IN_TREE.md`). | `Cargo.toml` |
-| `extreme` | Profile discriminator for build.rs (tighter IMAGE_SIZE/stack). | `Cargo.toml:337` |
-| `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. **In `default`**, so any build that doesn't pass `--no-default-features` has it. Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)`. Observe it via the `[FSCACHE]` PSTATS line. Not combinable with `extreme`. | `Cargo.toml:356` |
+| (`extreme`) | **Removed 2026-11-11** — it selected the 4 MB-floor constants (stacks, heap seed, socket table, no block cache). The `extreme-size` profile stays, codegen only. [`../../archive/EXTREME_SIZE_BUILD.md`](../../archive/EXTREME_SIZE_BUILD.md). | |
+| (`fs-cache`) | **Folded in 2026-11-11**: the ext2 clock-eviction block cache is on in every build (both kernels, Taoxichuan, host tests). Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)`, 16 MB if the kernel never sets one. Observe it via the `[FSCACHE]` PSTATS line. | `crates/akuma-ext2` |
 | `no-tests` | Drops boot self-test suites. | `Cargo.toml:125` |
 
 ### Crate features the amd64 kernels leave off
@@ -110,10 +110,6 @@ What a tokio program calls, and so what may be left off, is measured by B10's ce
 |---|---|---|
 | `akuma-syscalls-glue/akuma-native` | Akuma's own numbers (asm-generic 300-328; `0x1000 +` that on x86_64): `spawn`, `spawn_ext`, `waitpid`, `kill`, the terminal and cursor calls, `resolve_host`, `uptime`, `time`, `get_version`, `core_init`, `set_box_stack`, `close_child_stdin`, `set_tpidr_el0`. libakuma's programs use them. In glue's `default`; named by the bin and `akuma-amd64`. Off, the numbers fall to `ENOSYS`. `spawn`/`spawn_ext` also need `exec`. | `crates/akuma-syscalls-glue/Cargo.toml` |
 | `akuma-runtime-tokio/shell` | Not a tokio feature: the 23 calls glue serves that a shell and its tools make and no tokio program does (job control, the other ids, limits and accounting, `sync`, `membarrier`, the clock and hostname setters). Taoxichuan's own `shell` feature (in its `default`) turns it on; `--no-default-features` builds a kernel that serves only the tokio surface. | `crates/akuma-runtime-tokio/Cargo.toml`, `taoxichuan/Cargo.toml` |
-
-`userspace-sshd` is documented under
-[Networking stack](#networking-stack) above, alongside the other
-sshd-related features.
 
 ### The `akuma-amd64` package
 
@@ -164,7 +160,7 @@ and the syscall→lock map.
 | `smp-shared` | `kernel_smp_shared` | — | One kernel across all cores; activates the BKL and the five BKL carve-outs. **In `default`** since 2026-08-10 — this is *the* SMP now, not a separate profile/CLI opt-in (the one-kernel-per-core "multikernel" `smp` feature was removed the same day). |
 | `bkl-profile` | `kernel_bkl_profile` | **no — measurement only** | Per-tag BKL-hold profiler + periodic `[BKLPROF]` histogram. Perturbs timing; never ship it. |
 | `read-profile` | *(feature only)* | **no — measurement only** | Per-stage `read(2)` accounting: `sys_read`'s `File` arm, `handle_syscall` and the EL0 handler each time themselves, and a `[READPROF]` window prints every 256 file reads — which stage of a warm read is validation, fd lookup, the staging allocation, ext2, the user copy, or the two wrappers. Answers what neither `bkl-profile` ("which syscall held the lock") nor `net-profile` ("how long was the device busy") can: the split *inside* one syscall. **Single-core only** (the wrapper spans are handed up by one flag — run `SMP=1`), and **never read wall-clock throughput off this build**: the dump's own console write is ~55 ms per window. Use `scripts/benchmarks/read_stage_profile.py`, which drops windows with mixed request sizes or preempted samples. Background: `docs/archive/EXT2_READ_PATH_STAGE_PROFILE.md`. |
-| `CONSOLE_LOCK` (env) | `kernel_console_lock` | **default-on in `release`; off in `extreme-size`** | Cross-core spinlock + owner-core-ID reentrancy guard around `console::emit`'s UART write loop, so two cores under `smp-shared` can't byte-interleave each other's lines at the shared PL011 register. Default-on for `release` (OPT_LEVEL != "z") since 2026-08-11 after SMP=4 verification; off in `extreme-size` (single-core target, lock is pure overhead). `CONSOLE_LOCK=0` opt-out (debug), `CONSOLE_LOCK=1` force-on in `extreme-size` (test). Background: `docs/archive/UART_SMP_INTERLEAVE_FIX.md`. |
+| `CONSOLE_LOCK` (env) | `kernel_console_lock` | **default-on** | Cross-core spinlock + owner-core-ID reentrancy guard around `console::emit`'s UART write loop, so two cores under `smp-shared` can't byte-interleave each other's lines at the shared PL011 register. On in every build since 2026-11-11 (it was off under `opt-level = "z"`, the old single-core `extreme` target). `CONSOLE_LOCK=0` opt-out (debug). Background: `docs/archive/UART_SMP_INTERLEAVE_FIX.md`. |
 | `sound` + platform | `kernel_audio` | **on for QEMU virt; off for `platform-firecracker`** | The virtio-sound driver and `/dev/dsp`. Firecracker implements net/block/balloon/vsock/rng and no sound device — confirmed by the FDT it emits (`docs/reference/firecracker/fdt/`), which carries three virtio nodes, none of them sound. With this off, `src/main.rs` provides a stub `audio` module mirroring `akuma-virtio`'s own feature-off `imp`, so the syscall layer compiles unchanged and `/dev/dsp` never opens (`is_available()` is false, the gate `syscall/fs.rs` already applied). The boot probe is skipped too: walking eight virtio slots to report "not available" every boot is noise. Asserted by `test_platform_device_gates`. |
 
 Each carve-out also has a **runtime** toggle (default on) for same-binary A/B and
@@ -181,7 +177,7 @@ unbalances the BKL ticket FIFO).
 
 | Var | Default | Effect |
 |---|---|---|
-| `MEMORY` | (per script) | Guest RAM. Devbox: 4096. Self-host: 14336. Extreme: 4096K (4.0 MB floor). |
+| `MEMORY` | (per script) | Guest RAM. Devbox: 4096. Self-host: 14336. |
 | `DISK` | `disk.img` | Disk image path. |
 | `INSTANCE` | `0` | Instance id (affects SSH port, logging). |
 | `SNAPSHOT` | unset | `1` boots from a QEMU snapshot (writes discarded). |
@@ -238,9 +234,9 @@ These are **compile-time** `pub const bool` — toggle in source and rebuild.
 | Knob | Default | Effect | Source |
 |---|---|---|---|
 | `USER_STACK_SIZE_OVERRIDE` | `0` (auto-scale) | Set e.g. `8MB` to debug Bun/JSC stack depth. | `config.rs:71` |
-| `USER_THREAD_STACK_SIZE` | `cfg(kernel_profile_extreme)`-gated (512KB release / 64KB extreme-size) | Per userspace thread stack. | `config.rs:53-56` |
-| `SYSTEM_THREAD_STACK_SIZE` | `cfg(kernel_profile_extreme)`-gated (512KB release / 96KB extreme-size) | Kernel-side system thread stack. | `config.rs:30-38` |
-| `MAX_ARG_STRLEN` | `cfg(kernel_profile_extreme)`-gated (`128KB` release / `4KB` extreme-size) | Max single arg string (Linux = 128KB). | `config.rs:167-170` |
+| `USER_THREAD_STACK_SIZE` | 512 KB | Per userspace thread stack. | `crates/akuma-config` |
+| `SYSTEM_THREAD_STACK_SIZE` | 512 KB | Kernel-side system thread stack. | `crates/akuma-config` |
+| `MAX_ARG_STRLEN` | 128 KB | Max single arg string (Linux = 128KB). | `crates/akuma-config` |
 | `KERNEL_HEAP_SIZE_MB` | `0` (auto) | Override kernel heap size. | `config.rs:351` |
 | `ENABLE_STACK_CANARIES` | `true` | Stack-overflow detection. | `config.rs:158` |
 
@@ -262,9 +258,7 @@ These are **compile-time** `pub const bool` — toggle in source and rebuild.
 
 | Knob | Default | Effect | Source |
 |---|---|---|---|
-| `AUTO_START_HERD` | `!(extreme && userspace-sshd)` | Spawn `/bin/herd daemon` after the network comes up. Off **only** in the extreme+`userspace-sshd` combination, where herd plus its service tree costs more RAM than a 4 MB box has to spare. | `config.rs` |
-| `AUTO_START_SSHD` | `userspace-sshd && !AUTO_START_HERD` | Spawn `/bin/sshd --port 22 --shell /bin/sh` straight from `kernel_main` when there is no supervisor — otherwise the image has no way in. Never both this and herd's sshd (they would collide on the port). | `config.rs` |
-| `ENABLE_USERSPACE_SSHD` | `cfg!(feature = "userspace-sshd")` | Legacy name from when there was a built-in server to suppress; that server no longer exists on any profile (deleted 2026-08-10), so this now just gates which startup path (`AUTO_START_HERD` vs `AUTO_START_SSHD`) spawns the one userspace `/bin/sshd`. | `config.rs` |
+| `AUTO_START_HERD` | `true` | Spawn `/bin/herd daemon` after the network comes up; herd starts `/bin/sshd`. (The herd-less `AUTO_START_SSHD` path went with the `extreme`/`userspace-sshd` features, 2026-11-11.) | `crates/akuma-config` |
 
 ### Test gates (boot self-tests)
 

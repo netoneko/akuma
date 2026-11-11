@@ -236,7 +236,7 @@ elif [ "$use_hvf" = "1" ]; then
   #
   # Measured 2026-08-28 on an unmodified tree, SMP=4: 256M (this script's own
   # default), 512M and 1024M all assert; 2048M passes 316/0 and boots to SSH.
-  # Warn rather than fail, because a `no-tests` build (devbox, extreme-size)
+  # Warn rather than fail, because a `no-tests` build (the devboxes)
   # compiles none of that and is genuinely fine at 256M — and this script
   # cannot tell the two apart from the ELF alone.
   #
@@ -252,7 +252,7 @@ elif [ "$use_hvf" = "1" ]; then
     echo "[cargo_runner]   'Assertion failed: (isv) ... hvf.c' and qemu exit 134 —" >&2
     echo "[cargo_runner]   that is this configuration, NOT a kernel bug." >&2
     echo "[cargo_runner]   Use MEMORY=2048M, or HVF=0 for TCG. A no-tests build" >&2
-    echo "[cargo_runner]   (devbox / extreme-size) is unaffected; ignore this." >&2
+    echo "[cargo_runner]   (the devboxes) is unaffected; ignore this." >&2
     echo "[cargo_runner]   docs/archive/QEMU_HVF_ISV_BUG.md 'Root cause 5'." >&2
   fi
 else

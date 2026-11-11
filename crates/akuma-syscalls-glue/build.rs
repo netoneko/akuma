@@ -7,7 +7,7 @@ fn main() {
     // (`cfg!(kernel_smp_shared)` in each family's `COMPILED_IN`) were their own
     // `kernel_no_bkl_*` cfgs until 2026-11-11; `smp-shared` now implies them, and
     // A/B is the runtime toggles in `akuma_bkl::policy`.
-    for c in ["kernel_smp_shared", "kernel_tests", "kernel_profile_extreme"] {
+    for c in ["kernel_smp_shared", "kernel_tests"] {
         println!("cargo::rustc-check-cfg=cfg({c})");
     }
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
@@ -18,12 +18,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_TESTS");
     if std::env::var("CARGO_FEATURE_NO_TESTS").is_err() {
         println!("cargo:rustc-cfg=kernel_tests");
-    }
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EXTREME");
-    if std::env::var("OPT_LEVEL").as_deref() == Ok("z")
-        && std::env::var("CARGO_FEATURE_EXTREME").is_ok()
-    {
-        println!("cargo:rustc-cfg=kernel_profile_extreme");
     }
 
     // ---- build identity -------------------------------------------------
@@ -141,12 +135,11 @@ fn main() {
         .unwrap_or_else(|| "0.0.0".to_string());
     println!("cargo:rustc-env=AKUMA_KERNEL_VERSION={kernel_version}");
 
-    // Mirrors the binary's old three-way choice. The inputs are the same two
-    // features this file already keys off above.
+    // The `extreme-size` profile is the only one at opt-level "z"; it names the
+    // codegen, not a feature set.
     let smp_shared = std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok();
-    let extreme = std::env::var("OPT_LEVEL").as_deref() == Ok("z")
-        && std::env::var("CARGO_FEATURE_EXTREME").is_ok();
-    let build_profile = if extreme {
+    let size_opt = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
+    let build_profile = if size_opt {
         "extreme-size"
     } else if smp_shared {
         "release-smp-shared"

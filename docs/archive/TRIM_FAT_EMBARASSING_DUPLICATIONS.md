@@ -31,7 +31,7 @@ verified against the tree 2026-08-15 (dependency graph check: `akuma-virtio`,
 
 **~~Known blocker, owned by no phase:~~ FIXED 2026-08-13.** ssh sessions died
 instantly on the extreme-size profile, blocking
-`acceptance/05_meow_tcc_extreme_4mb.md`. Root cause: the profile's 64 KB
+`acceptance/archive/05_meow_tcc_extreme_4mb.md`. Root cause: the profile's 64 KB
 user-thread **kernel stack** was ~10 KB too small for the sshd session path
 (measured 74 KB), and the overrun zeroed three PTEs in the session process's own
 L3 page table — surfacing as a SIGSEGV with no relationship to the corruption.
@@ -1915,7 +1915,7 @@ where ssh works — same code, drivable box. The feature was removed afterwards.
 > **The extreme-size sshd fault is a degradation, and "pre-existing" undersells
 > it.** All the A/B above establishes is that *this phase* did not cause it. It
 > is not pre-existing in the sense of never having worked:
-> `acceptance/05_meow_tcc_extreme_4mb.md` — one of the four live playbooks —
+> `acceptance/archive/05_meow_tcc_extreme_4mb.md` — one of the four live playbooks —
 > drives `ssh()` against this exact profile throughout (`pkg install`,
 > `exec /tmp/hello_c`), so it was written against a working extreme-size sshd.
 > **That playbook is therefore currently unrunnable.**

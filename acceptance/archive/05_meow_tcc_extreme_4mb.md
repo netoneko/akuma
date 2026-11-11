@@ -1,5 +1,9 @@
 # Acceptance: meow uses scratch to clone a repo, then compiles and runs hello.c on the extreme kernel at 4.0 MB
 
+> **Archived 2026-11-11**: the `extreme` feature this playbook builds was removed
+> (`docs/archive/EXTREME_SIZE_BUILD.md`). The `extreme-size` profile still exists,
+> but it no longer builds a 4 MB kernel.
+
 Verify the full agentic pipeline — meow clones `akuma-playground` with `scratch`,
 compiles `hello.c` from the cloned repo with our static `tcc`, and runs the output
 — on the **extreme-size** kernel at **4.0 MB** RAM.
@@ -193,7 +197,7 @@ working sets do not overlap.
 |---|---|
 | VM never reaches SSH | boot OOM — kernel image or stack reserve grew; check `IMAGE_RESERVE` |
 | `/bin/scratch` or `/bin/git` missing | the image was populated before `scratch` was built. Run `userspace/build.sh --scratch-only`, then re-run `scripts/populate_disk.sh` (it creates the `git -> scratch` symlink). There is no package manager to fall back on — `pkg` is gone (see step 4) |
-| `tcc: error: file 'tcc' not found` | the login shell passed the command name twice. **FIXED** 2026-08-13 — [`docs/archive/PAWS_DUPLICATED_ARGV0.md`](../docs/archive/PAWS_DUPLICATED_ARGV0.md). If it reappears, `/bin/paws` on the image predates the fix; rebuild and re-stage it |
+| `tcc: error: file 'tcc' not found` | the login shell passed the command name twice. **FIXED** 2026-08-13 — [`docs/archive/PAWS_DUPLICATED_ARGV0.md`](../../docs/archive/PAWS_DUPLICATED_ARGV0.md). If it reappears, `/bin/paws` on the image predates the fix; rebuild and re-stage it |
 | the compiled binary segfaults | it was linked **without** `-static`. tcc's default (dynamic) output links cleanly and then crashes; keep `-static -B /usr/lib/tcc` exactly as written above |
 | `scratch clone` OOM | rare at 4.0 MB — scratch's peak (TLS + pack buffer) is ~300 KB; check kernel serial log for `anon alloc failed` |
 | `scratch clone` fails with network error | DNS or TLS failure; verify the host has internet access and `github.com` is reachable from the guest via `nslookup github.com` |

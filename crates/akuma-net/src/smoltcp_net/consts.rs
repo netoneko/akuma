@@ -5,12 +5,9 @@ use super::*;
 // Constants
 // ============================================================================
 
-/// Ceiling on the smoltcp socket set's static storage. `extreme-size` keeps 32
-/// against its 4 MB floor (a socket is 32 KB of buffers).
-#[cfg(not(kernel_profile_extreme))]
+/// Ceiling on the smoltcp socket set's static storage (a socket is 32 KB of
+/// buffers).
 pub(crate) const MAX_SOCKETS: usize = 256;
-#[cfg(kernel_profile_extreme)]
-pub(crate) const MAX_SOCKETS: usize = 32;
 
 /// Where [`SOCKET_SOFT_CAP`] starts, and the size the table behaves as until
 /// pressure forces it wider.
@@ -23,9 +20,9 @@ pub(crate) const MAX_SOCKETS: usize = 32;
 /// because `TimeWait` accumulates faster than the 30 s timeout releases. A
 /// 2048-slot table measured **848 req/s against 1,052 at 128**.
 ///
-/// Derived rather than per-profile so `extreme-size` (32 slots) starts at its
-/// own ceiling and never grows, while the devbox starts at the 128 that
-/// measured best and keeps the rest as headroom.
+/// Derived so a smaller `MAX_SOCKETS` starts at its own ceiling and never
+/// grows, while the default starts at the 128 that measured best and keeps
+/// the rest as headroom.
 pub(crate) const SOCKET_SOFT_CAP_START: usize = if MAX_SOCKETS < 128 { MAX_SOCKETS } else { 128 };
 
 // Reduced from 64KB to 16KB per direction to save heap memory.

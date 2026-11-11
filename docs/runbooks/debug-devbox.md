@@ -24,7 +24,6 @@ symptom on the left. For build/verify steps, see
 | box 0 rump stack not up yet | No `box=0 proxy ready` line | Wait ~5-10s (DHCP + handshake). herd sshd has `start_delay_ms=10000` + `restart=true` |
 | Wrong SSH port | `ssh -p 22` | Use `-p 2223` (or `RUMP_SSH_PORT`) |
 | Host key changed after rebuild | `REMOTE HOST IDENTIFICATION HAS CHANGED` | `ssh-keygen -R "[localhost]:2223"` |
-| Built-in SSH started instead of userspace | Log lacks `[Main] Built-in SSH server disabled` | Confirm `userspace-sshd` feature is on (`devbox` feature implies it) |
 | Port 2223 busy on host | `ssh` connects then drops | `pkill -9 qemu-system-aarch64` or set `RUMP_SSH_PORT` |
 
 ### SSH slow / first-connection lag

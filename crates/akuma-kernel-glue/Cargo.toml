@@ -53,7 +53,6 @@ pmm-instr = ["akuma-pmm/pmm-instr", "akuma-kernel-core/pmm-instr", "akuma-ext2/p
 # Mirrors the root package's own toggles of the same name — see
 # `akuma-kernel-core/Cargo.toml` for why each needs its own copy here rather
 # than relying on root's build.rs (build scripts are per-package).
-extreme = ["akuma-entry/extreme"]
 no-tests = ["akuma-kernel-core/no-tests", "akuma-entry/no-tests"]
 smp-shared = [
     "akuma-exec/smp-shared",

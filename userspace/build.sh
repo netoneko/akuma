@@ -132,7 +132,7 @@ build_member() {
         # Opt OUT of process-per-session sshd back to the single-process
         # cooperative executor (userspace/sshd/Cargo.toml `fork-sessions`, on by
         # default). For memory-constrained images where a process per session is
-        # the wrong trade — see docs/runbooks/build-extreme-size.md.
+        # the wrong trade — see docs/archive/EXTREME_SIZE_BUILD.md.
         #
         # --no-default-features drops `akuma` too, so re-add it: it is what
         # links libakuma, and the binary cannot build without it. Re-add

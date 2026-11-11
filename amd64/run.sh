@@ -29,7 +29,7 @@ DISK="${DISK:-}"
 
 # FEATURES=a,b builds with extra cargo features. The one that matters today is
 # `no-tests`, which compiles the boot suite out — the same opt-in the AArch64
-# devbox and `extreme-size` targets build with. Without a way to boot it from
+# devbox targets build with. Without a way to boot it from
 # here, that feature could only ever be *compiled*, and a build configuration
 # nobody boots is a build configuration that rots.
 #

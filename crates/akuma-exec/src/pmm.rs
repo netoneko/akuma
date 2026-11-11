@@ -48,7 +48,7 @@ pub use akuma_pmm::cow_ref_dec;
 /// its last one on 2026-09-01, when the file-page cache moved to
 /// `akuma-fpcache` and began calling `akuma_pmm` directly — what is left are the
 /// CoW refcount self-tests in `crates/akuma-kernel-tests-aarch64/src/tests.rs` and `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, which
-/// `extreme-size` compiles out (`no-tests`) while still building with
+/// a `no-tests` build compiles out while still building with
 /// `-D unused-imports`.
 #[allow(unused_imports)]
 pub use akuma_pmm::{cow_ref_count, cow_ref_inc};
@@ -200,8 +200,8 @@ pub fn free_page_at(frame: PhysFrame, site: akuma_pmm::FreeSite) {
 /// production caller, and it moved to `crates/akuma-alloc`, which talks to
 /// `akuma_pmm` in raw `usize` PAs and needs no `PhysFrame` conversion. What is
 /// left are the PMM boot self-tests in `crates/akuma-kernel-tests-aarch64/src/tests.rs`, which do want the typed
-/// form — so the wrapper follows them. Without the gate, `extreme-size`
-/// (`no-tests` + `-D dead-code`) fails to build.
+/// form — so the wrapper follows them. Without the gate, a `no-tests` build
+/// (`-D dead-code`) fails.
 #[cfg(kernel_tests)]
 pub fn alloc_pages_contiguous_zeroed(count: usize) -> Option<PhysFrame> {
     akuma_pmm::alloc_pages_contiguous_zeroed(count).map(PhysFrame::new)

@@ -66,7 +66,7 @@ builtin-paws = ["akuma", "dep:paws"]
 # a process per session is the wrong trade:
 #     SSHD_FORK_SESSIONS=0 userspace/build.sh --sshd-only
 # which drops to the cooperative single-process executor. See
-# `docs/runbooks/build-extreme-size.md` and
+# `docs/archive/EXTREME_SIZE_BUILD.md` and
 # `userspace/sshd/docs/PROCESS_PER_SESSION.md`.
 fork-sessions = []
 

@@ -1401,3 +1401,10 @@ point it now matches amd64, which never had rump.
 
 The seven `sc-*` families are one group on both kernels, under the same name. Images are
 byte-identical (`AKUMA_FEATURE_AUDIT.md`).
+
+## `extreme`, `userspace-sshd`, `fs-cache` removed (2026-11-11)
+
+The 4 MB `extreme` build and its `kernel_profile_extreme` cfg are gone; the `extreme-size` profile
+stays as codegen only. `fs-cache` is folded in, so every build, both arches and Taoxichuan
+included, has the ext2 clock cache. Default images unchanged; the rump devbox gains 10.7 KB for
+the cache (`AKUMA_FEATURE_AUDIT.md`). One cfg dimension fewer for the unification.

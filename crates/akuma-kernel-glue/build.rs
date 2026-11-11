@@ -4,7 +4,6 @@
 // features, so this crate needs its own build script (see
 // `akuma-kernel-core/build.rs` for the same pattern, one layer down).
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
     println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
@@ -23,27 +22,13 @@ fn main() {
     }
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_TESTS");
-    let kernel_tests = std::env::var("CARGO_FEATURE_NO_TESTS").is_err()
-        && std::env::var("OPT_LEVEL").as_deref() != Ok("z");
+    let kernel_tests = std::env::var("CARGO_FEATURE_NO_TESTS").is_err();
     if kernel_tests {
         println!("cargo:rustc-cfg=kernel_tests");
     }
 
-    let size_opt = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
-
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EXTREME");
-    let extreme_profile = size_opt && std::env::var("CARGO_FEATURE_EXTREME").is_ok();
-    if extreme_profile {
-        println!("cargo:rustc-cfg=kernel_profile_extreme");
-    }
-
     println!("cargo:rerun-if-env-changed=CONSOLE_LOCK");
-    let console_lock_default_on = !size_opt;
-    let console_lock = match std::env::var("CONSOLE_LOCK").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => console_lock_default_on,
-    };
+    let console_lock = std::env::var("CONSOLE_LOCK").as_deref() != Ok("0");
     if console_lock {
         println!("cargo:rustc-cfg=kernel_console_lock");
     }

@@ -191,8 +191,8 @@ pub fn init() {
 /// and must not run under a mount-table lock.
 ///
 /// Was gated on `sc-reboot` while that syscall was its only caller;
-/// `sync(2)`'s ungated arm is a caller on every build now, so the gate (and
-/// its extreme-size dead-code rationale) is gone.
+/// `sync(2)`'s ungated arm is a caller on every build now, so the gate is
+/// gone.
 pub fn sync_all_filesystems() -> Result<(), FsError> {
     let mut seen: Vec<Arc<dyn Filesystem>> = Vec::new();
     {
@@ -1821,7 +1821,7 @@ fn fpcache_init(total_ram_bytes: usize) {
 /// This crate briefly carried a `VfsGlueConfig` struct and `src/vfs.rs` populated
 /// it at boot. That is the pattern `akuma-config` exists to retire: a `const`
 /// that becomes runtime config stops const-folding whatever it gates, and the
-/// two `/proc` flags below cost a page of `extreme-size` while they were loads.
+/// two `/proc` flags below cost a page of `.text` while they were loads.
 /// They fold again now, with no `#[cfg]` duplication needed here at all.
 const fn cfg_proc_syscall_log_enabled() -> bool {
     akuma_config::PROC_SYSCALL_LOG_ENABLED

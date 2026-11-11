@@ -16,7 +16,7 @@ workspace = true
 # cfg — a build without it would run four cores with no lock at all. Enforced by
 # a const assert in `smp.rs`, so a `--no-default-features` build fails loudly
 # rather than booting corrupt.
-default = ["smp-shared", "fs-cache", "linux-extra-syscalls"]
+default = ["smp-shared", "linux-extra-syscalls"]
 # The seven families together: what a Linux program expects beyond the core set.
 # In `default`. The families stay individually settable. Same name and members as
 # the AArch64 kernel's group, whose `sc-reboot` is deliberately outside it.
@@ -34,15 +34,6 @@ linux-extra-syscalls = ["sc-aio", "sc-sysv-ipc", "sc-containers", "sc-timerfd", 
 # timeout holding the BKL and presented as `[BKL] stuck` on every other core —
 # `docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-11.
 smp-shared = ["akuma-exec/smp-shared", "akuma-kernel-core/smp-shared", "akuma-syscalls-glue/smp-shared", "akuma-vfs-glue/smp-shared", "akuma-ext2/smp-shared"]
-# The ext2 block cache forwarded to the aarch64 default (root Cargo.toml has
-# `fs-cache` in `default` since 2026-08-02). Without it this target runs the
-# 64-slot FIFO ring, which a single ssh session thrashes: every connection
-# execs `/bin/sh` (~25 blocks) + `dmesg`/`grep` through 64 slots, evicting
-# `/etc/sshd/authorized_keys` between reads — so every auth re-reads it off
-# the USB disk, the one device that stalls. 16 MiB default cap
-# (`DEFAULT_CACHE_CAP_BYTES`); the kernel never calls `set_cache_cap_bytes`.
-fs-cache = ["akuma-ext2/fs-cache"]
-
 # Preempt ring 0. Syscalls run with `IF` set once the BKL is taken, and the timer
 # switches a thread in kernel code when `akuma_threading::el1_preemptible` allows it
 # (preemption not disabled, scheduler pool unlocked, thread RUNNING) **and this core

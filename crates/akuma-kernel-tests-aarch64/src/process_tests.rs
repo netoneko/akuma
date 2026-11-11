@@ -501,8 +501,8 @@ pub fn run_all_tests() {
     // Wedge regression (§7k.2): fault/exit path must re-enable IRQs before the
     // terminal yield loop, else a fault-with-IRQs-masked wedges the whole VM.
     test_fault_exit_enables_irqs_before_yield();
-    // Stack-size inversion regression (§7k): release must not be provisioned with
-    // less kernel stack than the constrained size/extreme profiles.
+    // Stack-size inversion regression (§7k): the kernel stacks must not shrink
+    // back below the floor that self-host needs.
     test_kernel_stack_sizes_sane();
     test_far_kernel_identity_range_policy();
     test_sa_siginfo_frame_offsets_for_x1_x2();
@@ -929,9 +929,8 @@ pub fn run_all_tests() {
     // are stable.  Prints grep-able `[BENCH]` lines.
     run_cow_benchmarks();
 
-    // ext2 large block cache (feature `fs-cache`): re-reading a file must hit the
+    // ext2 block cache: re-reading a file must hit the
     // cache, not re-stream it off disk (docs/AKUMA_SELF_HOSTING.md §7a/§7b).
-    #[cfg(feature = "fs-cache")]
     test_fs_cache_warm_reread_hits();
 
     // Writable MAP_SHARED file-backed mmap writeback: pages written through the
@@ -3476,7 +3475,7 @@ fn test_procfs_box_isolation() {
     // below hold either way — a file that does not exist is one a box cannot
     // read — but the POSITIVE ones assert a facility the flag removes, so they
     // must not run when it is off. Turning `PROC_SYSCALL_LOG_ENABLED` off is a
-    // supported configuration (`kernel_profile_extreme` forces it), and without
+    // supported configuration (a const in `akuma-config`), and without
     // this gate it fails three cases here and panics the boot.
     let log_on = crate::config::PROC_SYSCALL_LOG_ENABLED;
 
@@ -4645,7 +4644,7 @@ fn test_fchmodat() {
     }
 }
 
-/// The `fs-cache` block cache must serve reads of a resident file without
+/// The ext2 block cache must serve reads of a resident file without
 /// touching the device — the whole point of keeping the toolchain resident
 /// across the many spawns in a self-host build. Writes a multi-block temp file,
 /// reads it twice, and asserts both passes are pure cache hits.
@@ -4672,7 +4671,6 @@ fn test_fchmodat() {
 /// not exist (`CACHE_CAP_BYTES` is read only when the cache is constructed), and
 /// inventing one purely to keep this assertion alive is not worth a new public
 /// entry point into the cache.
-#[cfg(feature = "fs-cache")]
 fn test_fs_cache_warm_reread_hits() {
     const PATH: &str = "/tmp/fs_cache_selftest.bin";
     const LEN: usize = 64 * 1024; // 16 × 4 KB blocks
@@ -5175,8 +5173,8 @@ fn test_mm_bkl_drop() {
 ///
 /// This asserts the implication in the direction that can actually hurt: *if the
 /// driver is compiled in, the machine must have the device.* The converse is
-/// fine and normal — `extreme-size` drops the driver on QEMU virt, which has the
-/// device.
+/// fine and normal — a build may leave the driver out on a machine that has
+/// the device.
 ///
 /// Why it is worth a boot test rather than trusting the cfgs: the two halves live
 /// in different files. The capability lives in `platform.rs` and the gate in
@@ -10033,12 +10031,8 @@ fn test_fault_exit_enables_irqs_before_yield() {
 fn test_kernel_stack_sizes_sane() {
     let sys = config::SYSTEM_THREAD_STACK_SIZE;
     let usr = config::USER_THREAD_STACK_SIZE;
-    // (sys_floor, usr_floor) per profile. Release must dominate the constrained
-    // profiles (whose ceilings are 128 KB sys / 64 KB usr).
-    #[cfg(not(kernel_profile_extreme))]
-    let (sys_floor, usr_floor) = (256 * 1024usize, 256 * 1024usize); // release
-    #[cfg(kernel_profile_extreme)]
-    let (sys_floor, usr_floor) = (96 * 1024usize, 64 * 1024usize); // extreme
+    // (sys_floor, usr_floor): what release self-host needs.
+    let (sys_floor, usr_floor) = (256 * 1024usize, 256 * 1024usize);
     if sys >= sys_floor && usr >= usr_floor {
         crate::safe_print!(96,
             "[Test] kernel_stack_sizes_sane PASSED (system={}KB user={}KB)\n",
@@ -12712,16 +12706,16 @@ fn test_mmap_file_oom_survives() {
     };
 
     // The failure mode depends on how file-backed mmap is serviced:
-    //  - lazy (MMAP_FILE_BACKED_LAZY, the size/extreme profiles): the mmap
+    //  - lazy (MMAP_FILE_BACKED_LAZY, the default): the mmap
     //    succeeds and pages fault in on touch. With clean file-page eviction
     //    (try_evict_ro_page hooked into alloc_page_zeroed_user), touching a
     //    file larger than RAM usually SUCCEEDS (exit 0) — clean RO pages are
     //    reclaimed under pressure; only when nothing is evictable does the
     //    process get OOM-SIGSEGV'd (exit -11). Both outcomes are valid.
-    //  - eager (release): the region is allocated up front. Same eviction
+    //  - eager (`MMAP_FILE_BACKED_LAZY = false`): the region is allocated up front. Same eviction
     //    logic: success (exit 0) or ENOMEM (exit 2) depending on pressure.
     // Either way the kernel must stay up — which is the whole point — so we
-    // accept the profile-appropriate exit code(s) and always assert survival.
+    // accept the mode-appropriate exit code(s) and always assert survival.
     let lazy = crate::config::MMAP_FILE_BACKED_LAZY;
     crate::safe_print!(192,
         "  [..] test_mmap_file_oom_survives: mmap {} ({} MB) vs {} MB RAM — expect {}\n",
@@ -12743,7 +12737,7 @@ fn test_mmap_file_oom_survives() {
 
     let free_before = pmm::free_count();
     // Kernel-heap growth is legitimate PMM consumption, not a leak: the ext2
-    // block cache (fs-cache, default since 7cf9348) allocates its chunks on the
+    // block cache allocates its chunks on the
     // heap while this test streams a >RAM file through ext2, and claimed heap
     // spans are only returned to the PMM once *entirely* free (see
     // `allocator::SpanReport`). Snapshot committed pages so the conservation
@@ -12798,7 +12792,7 @@ fn test_mmap_file_oom_survives() {
             //
             // Conservation check: every page the dead process consumed must be
             // back, EXCEPT pages the kernel heap legitimately claimed while the
-            // test ran (fs-cache chunks — permanent by design, they ARE the
+            // test ran (block-cache chunks — permanent by design, they ARE the
             // cache). heap_growth is re-read each iteration because
             // reclaim_to_pmm() can shrink it (returning fully-free spans), which
             // raises free_after and lowers the allowance in lockstep.
@@ -20643,9 +20637,6 @@ fn test_preempt_guard_is_live() {
     // MAX_THREADS is now defined in `akuma-primitives` and re-exported by
     // `akuma-exec`; they cannot disagree, but the profile gate that picks 256 vs
     // 64 is evaluated in the leaf crate's build.rs, so confirm it landed.
-    #[cfg(kernel_profile_extreme)]
-    let threads_ok = MAX_THREADS == 64;
-    #[cfg(not(kernel_profile_extreme))]
     let threads_ok = MAX_THREADS == 256;
     let agree_ok = MAX_THREADS == akuma_exec::threading::MAX_THREADS;
 

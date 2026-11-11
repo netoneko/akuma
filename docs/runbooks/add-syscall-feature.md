@@ -3,7 +3,7 @@
 How to add a new kernel syscall family behind a `sc-*` feature gate and keep
 all build configs in sync.
 
-> The devbox + size/extreme builds use `--no-default-features` and re-add
+> The rump devbox build uses `--no-default-features` and re-adds
 **specific** `sc-*` features. If you add a new family and forget one build
 script, that build silently drops it.
 

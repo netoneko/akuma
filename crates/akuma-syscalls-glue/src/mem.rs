@@ -579,9 +579,9 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     }
 
     // When MMAP_FILE_BACKED_LAZY is set, demand-page file-backed mmaps instead
-    // of eagerly allocating all frames. Default on the size profile where PMM
-    // is tight (8 MB): eagerly mapping a 600 KB shared library exhausts user
-    // pages before the process can start. Pages are faulted in via
+    // of eagerly allocating all frames (on by default): eagerly mapping a
+    // large shared library costs its whole size in user pages before the
+    // process can start. Pages are faulted in via
     // LazySource::File, same mechanism as demand-paged ELFs.
     // Writable MAP_SHARED is lazy-eligible too since 2026-09-22 (the shared
     // plan's change for parity-db's 1 GiB reserves); it is recorded for

@@ -2,8 +2,8 @@
 """Ratchet on feature drift between the two full kernels' manifests.
 
 The AArch64 kernel (root `Cargo.toml`) and the amd64 kernel (`amd64/Cargo.toml`) each carry a
-hand-written feature table, and 16 names appear in both (`smp-shared`, `fs-cache`, the seven
-`sc-*`, ...). Each must forward the same *crate* features, or a flag turned on for one kernel is
+hand-written feature table, and 16 names appear in both (`smp-shared`, the seven `sc-*`,
+...). Each must forward the same *crate* features, or a flag turned on for one kernel is
 silently not turned on for the other (`docs/archive/AKUMA_FEATURE_AUDIT.md`, finding 1).
 
 Not every difference is a bug: the root kernel forwards through `akuma-kernel-{core,glue}`, which

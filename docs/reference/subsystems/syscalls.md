@@ -152,7 +152,7 @@ See [`../../runbooks/add-syscall-feature.md`](../../runbooks/add-syscall-feature
     this VA been filled in yet", where a `PROT_NONE` guard must read as present.
 - **musl compatibility:** `archive/MUSL_COMPATIBILITY.md`. musl is the userspace
   libc; the kernel aims to run unmodified musl-linked binaries.
-- **`MAX_ARG_STRLEN`:** 128 KB release / 8 KB size / 4 KB extreme (`config.rs:147`). The Go forktest 128 KB fix is a notable regression guard.
+- **`MAX_ARG_STRLEN`:** 128 KB (`crates/akuma-config`). The Go forktest 128 KB fix is a notable regression guard.
 
 ## Blocking vs non-blocking
 

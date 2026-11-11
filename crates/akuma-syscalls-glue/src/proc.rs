@@ -874,30 +874,9 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     let Ok(text) = akuma_vfs_glue::text_pin(&resolved_path) else {
         return ENOMEM;
     };
-    // On the size profile the heap seed is 1 MB. Reading a large binary
-    // (e.g. the 700+ KB system linker that tcc invokes) would exhaust it.
-    // Read just the first 256 bytes — enough for shebang detection — and
-    // use the path-based loader for the actual ELF.
-    #[cfg(kernel_profile_extreme)]
-    let mut file_data: Option<alloc::vec::Vec<u8>> = {
-        let mut head = alloc::vec![0u8; 256];
-        match akuma_vfs_glue::fs::read_at(&resolved_path, 0, &mut head) {
-            Ok(n) => { head.truncate(n); Some(head) }
-            Err(akuma_vfs_glue::FsError::Internal) => None,
-            Err(e) => {
-                // Gated 2026-08-30: this is the PATH search, not an error. A shell
-                // or cargo resolving `cc`/`rustc` probes every PATH entry in turn,
-                // so a miss per entry is the NORMAL case and the flood scales with
-                // PATH length x exec count. A genuinely unreadable binary still
-                // surfaces as the execve's errno to the caller.
-                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                    akuma_primitives::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
-                }
-                return super::fs::fs_error_to_errno(e);
-            }
-        }
-    };
-    #[cfg(not(kernel_profile_extreme))]
+    // Read the whole file (shebang detection + the in-memory ELF load). An
+    // `Internal` read error leaves `file_data` empty and the path-based loader
+    // does the ELF load instead.
     let mut file_data = {
         // M5c hold-shortening: DROP the BKL around the whole-file ELF read so peer cores can
         // enter the kernel while this core waits on disk (execve's dominant BKL-held window).
@@ -939,12 +918,6 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         drop(text);
         return exec_shebang(resolved_path, data, args, env);
     }
-
-
-    // On the size profile file_data only holds the 256-byte shebang probe —
-    // always use replace_image_from_path for the actual ELF load.
-    #[cfg(kernel_profile_extreme)]
-    let mut file_data: Option<alloc::vec::Vec<u8>> = None;
 
     // Resolve the on-demand load's file size before entering the exclusive
     // window so the stat-failure early return stays outside it.

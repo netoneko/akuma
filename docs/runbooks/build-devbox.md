@@ -116,7 +116,7 @@ Equivalent build-only: `scripts/build_devbox.sh`.
 
 ```
 cargo run --release --no-default-features --features \
-  rump-default,userspace-sshd,sc-reboot,sound,no-tests,linux-extra-syscalls
+  rump-default,sc-reboot,sound,no-tests,linux-extra-syscalls
 ```
 
 (There is no `devbox` Cargo *profile* — only `release`, `extreme-size`, and

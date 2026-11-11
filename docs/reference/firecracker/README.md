@@ -332,8 +332,9 @@ Never write a literal upper bound for a kernel-address test.
   that never received the offer, and that is precisely the step that used to be
   missing.
 
-  **`extreme-size` still keeps the 2 KB buffer on purpose and therefore has no
-  inbound networking here.** Historical detail below.
+  Every build has the 65,568-byte buffer (the 4 MB `extreme` build that kept
+  2 KB, and so had no inbound networking here, was removed 2026-11-11).
+  Historical detail below.
 
 - **Throughput and CPU cost, measured 2026-08-21** on `m6g.metal`, 1 vCPU,
   1024 MiB, guest pulling a 20 MiB file over HTTP from the host's `10.0.2.2`:

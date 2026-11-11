@@ -261,19 +261,10 @@ pub fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize {
         // them — keeping it small leaves more user pages for the thread pool +
         // processes.
         //
-        // On the `size` profile (small-RAM target) we drop the floor to 4 MB:
-        // that frees 4 MB that would otherwise be wasted on heap that the kernel
-        // doesn't use, and on a 24 MB box nearly doubles the user-page pool
-        // (5 MB → 9 MB), which is the difference between tcc's ELF load
-        // failing and fitting.  On release we keep the 8 MB floor for headroom.
-        //
-        // For RAM >= 128 MB, ram/8 dominates the floor (16 MB+), so this only
-        // shrinks the heap below 128 MB.
-        // On the size profile, seed the heap with only 512 KB — the PmmOomHandler
-        // grows it on demand from PMM.  On release keep 4 MB (was 8 MB) for headroom.
-        #[cfg(kernel_profile_extreme)]
-        const SMALL_FLOOR: usize = 512 * 1024;
-        #[cfg(not(kernel_profile_extreme))]
+        // The floor is 4 MB (was 8 MB): on a 24 MB box that nearly doubles the
+        // user-page pool (5 MB → 9 MB), and the PmmOomHandler grows the heap on
+        // demand from PMM. For RAM >= 128 MB, ram/8 dominates the floor
+        // (16 MB+), so this only shrinks the heap below 128 MB.
         const SMALL_FLOOR: usize = 4 * MB;
         const MIN_USER: usize = 4 * MB;
         let cap = ram_size
@@ -462,8 +453,8 @@ pub(crate) fn build_exec_runtime(
         // Derive the boot-stack size from the linker symbols (the single
         // source of truth — BOOT_STACK_SIZE via --defsym, profile-dependent)
         // rather than config::KERNEL_STACK_SIZE, so slot-0's StackInfo bounds
-        // and canary placement always match the actual reservation even when
-        // the extreme profile shrinks it. See linker.ld / build.rs.
+        // and canary placement always match the actual reservation. See
+        // linker.ld / build.rs.
         kernel_stack_size: boot_stack_top - boot_stack_base,
         // Real boot-stack bounds, read from the linker-derived STACK_BOTTOM /
         // STACK_TOP symbols above. The threading crate must NOT hardcode these
@@ -554,13 +545,13 @@ fn boot_test_hooks() -> BootTestHooks {
 /// independently of `kernel_tests` — every `rump` build runs it, `no-tests` or
 /// not — so it gets its own hook rather than a
 /// field on [`BootTestHooks`].
-#[cfg(all(target_os = "none", not(kernel_profile_extreme), feature = "rump"))]
+#[cfg(all(target_os = "none", feature = "rump"))]
 static RUMP_TESTS_HOOK: akuma_primitives::Registered<fn()> = akuma_primitives::Registered::new(
     "akuma-kernel-glue: rump tests hook not registered — \
      call akuma_kernel_glue::set_rump_tests_hook() from rust_start first",
 );
 
-#[cfg(all(target_os = "none", not(kernel_profile_extreme), feature = "rump"))]
+#[cfg(all(target_os = "none", feature = "rump"))]
 pub fn set_rump_tests_hook(f: fn()) {
     RUMP_TESTS_HOOK.register(f);
 }
@@ -808,8 +799,8 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
         ram
     });
 
-    // Memory layout. All the policy (boot-stack cover, code+stack floor, the
-    // extreme reserve-RAM clamp) lives in `compute_memory_layout` + `config`, so
+    // Memory layout. All the policy (boot-stack cover, code+stack floor)
+    // lives in `compute_memory_layout` + `config`, so
     // the boot path here is just "compute, then verify". The sanity guard below
     // re-checks the result before any allocation — a wrong reserve constant must
     // refuse to boot rather than silently corrupt kernel memory under load.
@@ -837,9 +828,9 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     let heap_end = heap_start + heap_size;
     let user_end = user_pages_start + user_pages_size;
     // The actual boot-stack bottom is the STACK_BOTTOM linker symbol, not a
-    // hardcoded `top - 1 MB` — the extreme profile shrinks BOOT_STACK_SIZE, so
-    // assuming 1 MB here would compute a bogus bottom (below the kernel image)
-    // and the overlap guard below would be checking the wrong region.
+    // hardcoded `top - 1 MB` — BOOT_STACK_SIZE is set by build.rs, and a
+    // hardcoded size that drifted from it would compute a bogus bottom and the
+    // overlap guard below would be checking the wrong region.
     let boot_stack_bottom = stack_bottom;
     let layout_ok =
         kernel_end <= heap_start &&                // kernel binary fits in code+stack
@@ -1776,7 +1767,7 @@ fn run_async_main() -> ! {
     // Rump sysproxy / scheduling regression guards. Compile under `rump` (so
     // they also run on default-smoltcp builds that opt a herd box into rump),
     // not gated on `rump-default`. See `crates/akuma-kernel-tests-aarch64/src/rump_tests.rs`.
-    #[cfg(all(not(kernel_profile_extreme), feature = "rump"))]
+    #[cfg(feature = "rump")]
     // `require`, not `get`: this static and `rust_start`'s registration carry the
     // identical cfg, so an absent hook here means the two drifted apart — and the
     // old `if let Some` spelling turned that into a regression suite silently not
@@ -1830,23 +1821,6 @@ fn run_async_main() -> ! {
     } else {
         (0, None)
     };
-
-    // No supervisor: start the userspace sshd ourselves, or the box has no way in.
-    // Port 22 (the QEMU hostfwd target) with /bin/sh as the login shell — the same
-    // command line herd's sshd.conf would hand it, minus the core pinning.
-    if config::AUTO_START_SSHD && _herd_tid == 0 && fs::is_initialized() {
-        const SSHD_PATH: &str = "/bin/sshd";
-        let sshd_args: [&str; 4] = ["--port", "22", "--shell", config::USERSPACE_SSHD_SHELL];
-        if fs::exists(SSHD_PATH) {
-            crate::safe_print!(64, "[Main] Starting userspace sshd (no supervisor)...\n");
-            match process::spawn_process(SSHD_PATH, Some(&sshd_args), None) {
-                Ok(tid) => crate::safe_print!(64, "[Main] sshd started (tid={})\n", tid),
-                Err(e) => crate::safe_print!(64, "[Main] ERROR: Failed to start sshd: {}\n", e),
-            }
-        } else {
-            crate::safe_print!(64, "[Main] WARNING: /bin/sshd not found, no SSH available\n");
-        }
-    }
 
     // Loop iteration counter for debugging hangs
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -1995,9 +1969,8 @@ fn run_async_main() -> ! {
             // that readable without cross-referencing three separate lines and a
             // `[PSTATS]` for the free count.
             //
-            // `stackpg` is the kernel thread-stack pool, which on every profile but
-            // `extreme` is eagerly allocated for ALL slots at boot and never
-            // reclaimed — so unlike the two caches it is a floor, not a cache.
+            // `stackpg` is the kernel thread-stack pool, which is eagerly
+            // allocated for ALL slots at boot and never reclaimed — so unlike the two caches it is a floor, not a cache.
             #[cfg(feature = "pmm-instr")]
             {
                 let (low, user_oom) = akuma_pmm::pressure_stats();
@@ -2286,7 +2259,7 @@ fn run_async_main() -> ! {
         // idle loop in smp_shared.rs). A pending RX/timer/SGI IRQ makes WFI return at
         // once, so burst draining is unaffected, while the peer core gets a BKL window
         // every iteration.
-        // The hooked scheduler takes the same halt without `smp-shared` too (extreme-size):
+        // The hooked scheduler takes the same halt without `smp-shared` too (the rump devbox):
         // its `yield_now` returns at once when nothing else can run, so a bare yield loop
         // spun the only core at 100 %. The BKL calls are no-ops without `smp-shared`. A
         // READY peer still gets the core: the tick preempts this thread mid-`wfi`, on both
@@ -2347,7 +2320,7 @@ const VIRTIO_MMIO_SPI_BASE: u32 = platform::machine::VIRTIO_INTID_BASE;
 /// `docs/archive/LOOPBACK_RING_CONVERSION.md`.
 ///
 /// Only exists where it is used: the doorbell is about waking *peer* cores, so a
-/// single-core build (`extreme-size` drops `smp-shared`) has nobody to poke.
+/// build without `smp-shared` has nobody to poke.
 #[cfg(all(feature = "smoltcp", kernel_smp_shared))]
 #[cfg(target_os = "none")]
 static NETPOLL_WAKE_PENDING: core::sync::atomic::AtomicBool =
@@ -2547,7 +2520,7 @@ async fn memory_monitor() -> ! {
         buf.flush();
 
         // Stack high-water (no-op unless the probe const is on): right-sizing data
-        // for the extreme kernel stacks. Printed on its own line to keep [Mem] short.
+        // for the kernel stacks. Printed on its own line to keep [Mem] short.
         akuma_exec::threading::report_stack_high_water();
 
 

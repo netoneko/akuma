@@ -55,7 +55,7 @@ log = { version = "0.4", default-features = false }
 # unreachable and `-D dead-code` fires on code no build ships without.
 #
 # **The bin must therefore use `default-features = false`** — same as it does for
-# `akuma-net` — or an `extreme-size` build would silently gain smoltcp.
+# `akuma-net` — or a `--no-default-features` build would silently gain smoltcp.
 default = ["smoltcp", "exec", "akuma-native"]
 
 # Every one is forwarded from the bin, which owns the real definitions.
@@ -63,7 +63,6 @@ sc-reboot = ["dep:akuma-boot"]
 sc-sysv-ipc = ["dep:akuma-syscalls-ipc"]
 smp-shared = []
 no-tests = []
-extreme = []
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
 sc-aio = []
 sc-containers = ["akuma-isolation/containers"]

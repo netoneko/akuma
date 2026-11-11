@@ -19,9 +19,7 @@
 use alloc::string::String;
 use alloc::format;
 
-#[cfg(not(kernel_profile_extreme))]
 use akuma_primitives::irq;
-#[cfg(not(kernel_profile_extreme))]
 use akuma_timer::ArchHw;
 
 pub use akuma_timer::read_frequency;
@@ -242,16 +240,8 @@ pub fn probe_irq_nop(_irq: u32) {
 /// main.rs:849, this is main.rs:955 — so it publishes the probing core for
 /// [`probe_irq_nop`], which shares its handler slot with every secondary's
 /// live periodic tick. See that function for what happens without it.
-///
-/// Skipped (returns the compiled default) on `kernel_profile_extreme`: a 4 MB
-/// single-core box keeps its historical 10 ms and needs no probing.
 #[must_use]
 pub fn probe_host_tick() -> u64 {
-    #[cfg(kernel_profile_extreme)]
-    {
-        crate::config::TIMER_INTERVAL_US
-    }
-    #[cfg(not(kernel_profile_extreme))]
     {
         // Publish before unmasking: the first sample's IRQ can land immediately.
         PROBING_CORE.store(
