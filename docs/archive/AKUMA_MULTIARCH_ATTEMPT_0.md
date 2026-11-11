@@ -1498,3 +1498,135 @@ relied on; it is on the same open list (`SGI_SCHEDULER_RESIDUE.md`). The M5c ste
 
 Gates: HVF default SMP=1/2/4, 0 `[Test]` failures and the same PASSED set as the previous
 commit; amd64 TCG SMP=1 829/0, SMP=2 839/0; clippy 9 targets, host tests.
+
+## `akuma-kernel-tests-amd64` and `akuma-drivers-amd64` (2026-11-11)
+
+The first two rows of the three-way split planned above ("Added to the plan 2026-11-11"). One
+commit per step, on branch `worktree-agent-ab5da208db8b5f991`. The amd64 TCG gate for every
+commit was SMP=1 **829 passed, 0 failed** and SMP=2 **839 passed, 0 failed**, the same as the
+baseline, with the check *names* diffed against the baseline run, not just the count. Ratchets:
+`unsafe` 407 and untyped address parameters 692 at every commit. Sites moved between
+components; the totals did not change.
+
+| commit | what moved | budgets |
+|---|---|---|
+| `02b1c1b2` | the boot suite: `boot::self_tests` -> `crates/akuma-kernel-tests-amd64/src/suite.rs` (291 lines), `amd64/src/usermode/tests.rs` -> `usermode_tests.rs` (3 008, `git mv`) | none |
+| `1eb782f2` | `amd64/src/uas.rs` (the `akuma-mmu` walker suite, 675) -> `uas_tests.rs` | none |
+| `ecabfbb7` | the driver crate, with HD Audio (`hda.rs`, 1 092) behind `hda`; the sound class | addr amd64 83 -> 82, drivers 0 -> 1 |
+| `06a80f57` | the I2C-HID touchpad (`touchpad.rs` 784 + `i2c.rs` 252) behind `touchpad`; the pointer class | addr amd64 82 -> 80, drivers 1 -> 3 |
+| `9c3de257` | the framebuffer console (~850 lines of `multiboot2.rs` -> `fbcon.rs`) behind `fbcon`; the display class; the `headless` image | unsafe amd64/src 57 -> 56, drivers 0 -> 1; addr amd64 80 -> 79, drivers 3 -> 4 |
+
+**`02b1c1b2` does not build alone.** Its hook was still running when `uas.rs` was renamed with
+`git mv`, and the rename went into that commit without the edits that went with it. `1eb782f2`
+completes it. The history was not rewritten. Bisecting across the pair needs both commits.
+
+### The tests crate
+
+- **How the kernel reaches the suite.** It can't depend on the suite: the suite calls the
+  kernel, so that would be a cycle. `boot::self_tests` is now
+  `(SELF_TESTS.require())(cx)`, an `akuma_primitives::Registered<fn(&SuiteCtx) -> Verdict>`.
+  The suite fills that slot in `akuma_kernel_tests_amd64::register()`. The bin calls `register()`
+  from its `before_main` hook, which is the new argument of `akuma_kernel::entry!`; both
+  `kmain` and `kmain_mb2` call `before_main` first.
+- **`no-tests`.** The bin names the crate only under `cfg(not(feature = "no-tests"))`, and
+  the crate's own `lib.rs` is `#![cfg(not(feature = "no-tests"))]`, so a `no-tests` image links
+  nothing from it. `boot::register_self_tests` is cfg'd out of the kernel too.
+- **The probe ELFs.** The ELFs the suite runs (`USER_{HELLO,THREADPROBE,KILLPROBE,SIGREGS}_ELF`)
+  were `rustc-env` of `amd64/build.rs`, so only `amd64` could see them. `amd64/build.rs` now
+  emits them as `links` metadata. The tests crate's `build.rs` reads them as
+  `DEP_AKUMA_KERNEL_AMD64_USER_*_ELF` and re-emits them for itself.
+- **Visibility.** The suite reaches the kernel only through `akuma_kernel_amd64::testing`.
+  That module is `#[doc(hidden)] pub` and cfg'd out under `no-tests`, and it lists one
+  re-export per item, so the list is the whole test-only surface. The items behind it were
+  made `pub` inside their still-private modules, which is the narrowest visibility a
+  re-export from another crate allows.
+  - Per-file `smoke_test`s: `blk`, `fd`, `fs`, `idt`, `lapic`, `mem`, `mm`, `net`, `paging`,
+    `pci`, `pipe`, `reboot`, `sched`, `shootdown`, `signal`, `smp`, `sock`, `uaccess`, `xhci`.
+  - Boot plumbing: `boot::{bring_up_secondaries, wire_console_and_syscalls, suite_emit,
+    SuiteCtx, Verdict}`.
+  - `usermode`'s process and spawn surface (`Image` and its fields, `spawn_process_task`,
+    `SPAWN`, `sys_spawn`/`sys_waitpid`/`sys_write`, `syscall_dispatch`, `to_glue`,
+    `WRITE_SEQ*`, ...).
+  - `loader::{load, read_user, LoadedImage}`.
+  - The `fd` syscalls the tests drive, and seven errnos.
+  - The `sched` counters.
+  - `thread`'s group-exit setters.
+- **New pub items needed new lints.** Once exported, items attracted clippy's
+  `must_use_candidate` and `too_long_first_doc_paragraph`. They got `#[must_use]`, an
+  `allow` with a reason where callers ignore the result, or a split first paragraph.
+- **What did not move.** The per-file inline suites stay in `amd64/src` (92 `no-tests` cfgs
+  remain there, some of them bring-up switches rather than tests; the largest suite is `fd.rs`'s
+  ~1.1 kL). They read module-private state (`fd`'s table internals,
+  `install`, `covered_by`, `console::channel`), so moving them means either widening that
+  state or rewriting the tests against the public surface. The suite reaches them as
+  `testing::<module>::smoke_test`. They are the next candidate once a module's state has a
+  public face of its own.
+
+### The drivers crate
+
+- **The seam.** `amd64/src/drivers.rs` has one `Registered` slot per class, each holding a
+  table of function pointers: `Sound` (`init`), `Pointer` (discover, init, poll, present,
+  has_events, `/dev/input/mouse0` read and write, console bridge) and `Display` (20 entries,
+  held as `&'static` because `mirror_byte` runs per printed byte). The machine half calls
+  forwarding functions that read "absent" when nothing registered: `ENODEV`, `0`, `false`,
+  `None`, or no-op. `akuma_drivers_amd64::register()` fills a slot for each driver its
+  features compiled in, so the machine half has no driver `cfg` at all.
+- **What a driver may use.** Drivers reach the kernel only through `drivers::services`, one
+  re-export per item, the drivers' counterpart of `testing`.
+- **Features.** One per driver: `fbcon`, `hda`, `touchpad`. `all` enables all three. On the
+  bin, `all-drivers` is in `default`, so the default image is unchanged. Each driver is also a
+  bin feature of its own.
+- **`unsafe`.** The crate is `deny(unsafe_code)` with one `allow`, on `fbcon` for its
+  `MmioWindow::new`. That site moved here; it is not new.
+- **Verification.**
+  - `hda` was booted under QEMU q35 with `intel-hda`: `[HDA] ready (/dev/dsp)`, and the
+    self-test tone played.
+  - `touchpad` and `fbcon` are compile-verified only. TCG boots the PVH path, which has no
+    framebuffer and no I2C-HID, and their probes run on the multiboot2 path, which needs GRUB.
+    **Their first boot is the metal.**
+- **No longer reachable through `crate::multiboot2::`.** On the `fbcon` move, everything the
+  console did went behind `drivers::` under the same names. The machine half keeps
+  `ega_text`, the output of last resort, and the `fbtrace` stand-in.
+  `drivers::mirror_byte` falls back to `multiboot2::fb_trace_byte` when no console drew the
+  byte, which is what the old `else` arm did.
+- **Not moved yet, in the machine half for these reasons:**
+  - **`xhci`**: the USB keyboard *and* USB storage (`root=/dev/sda1`). The headless image
+    needs it, so it was not first in line; it is a block-and-input class.
+  - **`kvm`**: `/dev/kvm0` is welded to `fd`'s open/ioctl arms and `usermode`'s dispatch.
+    It needs a char-device class before it can move.
+  - **`nvme`, `ramdisk`, `blk`**: the boot disk. They need the block class.
+  - **`rtw89`/`rtw89_sta`/`wifi`**: the net class, and they share `pci` with `net`'s RTL8169.
+  - **`fbdev`**: `/dev/fb0`'s mmap and `FBIOGET_*`, part of `fd`/`mm`. It is inert without a
+    display driver, because nothing registers a geometry.
+  - **`splash`**: inert without a console, because `splash::begin` is gated on
+    `console.is_ok()`.
+  - **`input`/`kbd`**: the i8042 and the console's input queue, used by every boot.
+  - **`pci`**: enumeration is shared by the NIC, the watchdog and reboot, and the drivers
+    reach it as a service.
+
+### The `headless` image
+
+`--no-default-features --features headless` on the bin (`NO_DEFAULT_FEATURES=1 FEATURES=headless
+sh amd64/run.sh` under TCG) builds the machine half's defaults and the boot suite with no
+optional driver. That means no framebuffer console, no splash, no `/dev/fb0`, no sound and no
+touchpad, and `akuma-fbcon`, `-hda`, `-touchpad`, `-i2c-hid` and `-dwi2c` are absent from
+`cargo tree`. The console is the serial port. On the multiboot2 path the banner says
+`fb: none, headless (no display driver in this build ..)`, the same as on a machine without a
+framebuffer tag, and GRUB's framebuffer is not touched.
+
+- **What it keeps, and why.** It keeps what a test box needs. All of it is in the machine
+  half rather than behind a feature: serial, the GRUB-module ramdisk, NVMe, xHCI (keyboard and
+  USB storage) and the RTL8169. **xHCI stays deliberately**: on a box whose keyboard or root
+  disk is USB, it is the only path to either.
+- **Gates.**
+  - clippy: clean for `headless` and for `headless,no-tests`.
+  - TCG: SMP=1 **829/0** and SMP=2 **839/0**, check names identical to the default image's.
+    **No test drops out**, because the suite never tested a driver that left: TCG has no
+    framebuffer, HDA or touchpad, and none of their probes is a suite check.
+- **Size.** `rust-size` text is 25.38 MB for the default image and 4.54 MB for `headless`
+  (`akuma-fbcon`'s baked fonts are most of the difference).
+- **Not verified.** A headless image booting through GRUB on trashcan: the multiboot2 path
+  cannot be booted here.
+
+Docs: `docs/reference/build-profiles.md` § amd64 images; `config-flags.md` (`all-drivers`,
+`fbcon`, `hda`, `touchpad`, `headless`, `NO_DEFAULT_FEATURES`).
