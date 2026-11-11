@@ -1561,6 +1561,19 @@ pub fn socket_shutdown(idx: usize, how: i32) -> Result<(), i32> {
     Ok(())
 }
 
+/// A blocking send/recv whose `SO_SNDTIMEO`/`SO_RCVTIMEO` ran out reports
+/// `EAGAIN`, as Linux does. [`wait_until`] says `ETIMEDOUT`, which is right for
+/// the connect wait that shares it and wrong here.
+/// How long a blocking UDP receive with no `SO_RCVTIMEO` waits before
+/// `ETIMEDOUT` — see [`socket_recv_udp`].
+#[cfg(feature = "smoltcp")]
+const UDP_RECV_CAP_US: u64 = 10_000_000;
+
+#[cfg(feature = "smoltcp")]
+fn timeout_is_eagain(r: Result<(), i32>) -> Result<(), i32> {
+    r.map_err(|e| if e == libc_errno::ETIMEDOUT { libc_errno::EAGAIN } else { e })
+}
+
 #[cfg(feature = "smoltcp")]
 pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32> {
     let (handle, sndtimeo) = with_table(|table| {
@@ -1581,7 +1594,7 @@ pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32>
         // 5 s cap. A blocking write that cannot make room in the transmit
         // buffer must block, not invent an `ETIMEDOUT` the caller never asked
         // for — see `KernelSocket::sndtimeo_us`.
-        wait_until(|| with_network(|net| smoltcp_net::tcp_get(&net.sockets, handle, smoltcp::socket::tcp::Socket::can_send)).flatten().unwrap_or(true), sndtimeo)?;
+        timeout_is_eagain(wait_until(|| with_network(|net| smoltcp_net::tcp_get(&net.sockets, handle, smoltcp::socket::tcp::Socket::can_send)).flatten().unwrap_or(true), sndtimeo))?;
     }
 
     let res = with_network(|net| {
@@ -1657,11 +1670,11 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
         // the one that made a 2 s `SO_RCVTIMEO` fire at 30041 ms. POSIX: a
         // blocking read with no `SO_RCVTIMEO` blocks until data, EOF or a
         // signal.
-        wait_until(|| with_network(|net| {
+        timeout_is_eagain(wait_until(|| with_network(|net| {
             smoltcp_net::tcp_get(&net.sockets, handle, |socket| {
                 tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected)
             }).unwrap_or(true)
-        }).unwrap_or(true), rcvtimeo)?;
+        }).unwrap_or(true), rcvtimeo))?;
     }
 
     let res = with_network(|net| {
@@ -1741,9 +1754,9 @@ pub fn socket_send_udp(idx: usize, buf: &[u8], dest: SocketAddrV4) -> Result<usi
 
 #[cfg(feature = "smoltcp")]
 pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(usize, SocketAddrV4), i32> {
-    let handle = with_table(|table| {
-        if let Some(Some(KernelSocket { inner: SocketType::Datagram { handle, .. }, .. })) = table.get(idx) {
-            Some(*handle)
+    let (handle, rcvtimeo) = with_table(|table| {
+        if let Some(Some(sock @ KernelSocket { inner: SocketType::Datagram { handle, .. }, .. })) = table.get(idx) {
+            Some((*handle, sock.rcvtimeo_us))
         } else {
             None
         }
@@ -1755,10 +1768,20 @@ pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(us
             return Err(libc_errno::EAGAIN);
         }
     } else {
-        wait_until(|| {
+        // `SO_RCVTIMEO` when set, as the TCP path has, expiring as `EAGAIN`.
+        // This ignored the option, so a 200 ms timeout waited 10 s and failed
+        // with `ETIMEDOUT`, an errno no `recv(2)` gives.
+        //
+        // **Unset, it is still the 10 s `ETIMEDOUT` cap — a pinned divergence:
+        // Linux blocks forever.** Kept while an unanswered `nslookup` wedges the
+        // amd64 kernel with or without it (open, 2026-11-11:
+        // `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "Slice 1: sockets"), so
+        // that lifting it is not mistaken for the cause.
+        let waited = wait_until(|| {
             smoltcp_net::poll();
             smoltcp_net::udp_can_recv(handle)
-        }, Some(10_000_000))?;
+        }, Some(rcvtimeo.unwrap_or(UDP_RECV_CAP_US)));
+        if rcvtimeo.is_some() { timeout_is_eagain(waited) } else { waited }?;
     }
 
     let (len, endpoint) = smoltcp_net::udp_socket_recv(handle, buf).map_err(|()| libc_errno::EIO)?;

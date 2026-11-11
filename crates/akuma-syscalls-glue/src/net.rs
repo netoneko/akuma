@@ -109,12 +109,25 @@ pub(super) type NetBklGuard = ToggledGuard<NetBkl>;
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
     let _net_bkl = NetBklGuard::new();
-    let base_type = sock_type & 0xFF;
-    let cloexec = sock_type & 0x80000 != 0;
-    let nonblock = sock_type & 0x800 != 0;
-    if domain != 2 || (base_type != 1 && base_type != 2) {
+    use akuma_syscalls_linux::net::sock_flags::{SOCK_CLOEXEC, SOCK_NONBLOCK};
+    // Linux's split of `type`: the low four bits are the type, the rest may
+    // only be the two flags. A bad family is `EAFNOSUPPORT`; a type this stack
+    // does not serve is `EINVAL` — it was `EAFNOSUPPORT` for both until the
+    // amd64 kernel's own `socket` arm, which had the Linux split, folded into
+    // this one (2026-11-11).
+    let base_type = sock_type & 0xf;
+    let flags = (sock_type & !0xf).cast_unsigned();
+    let cloexec = flags & SOCK_CLOEXEC != 0;
+    let nonblock = flags & SOCK_NONBLOCK != 0;
+    if flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
+        return EINVAL;
+    }
+    if domain != 2 {
         akuma_primitives::safe_print!(96, "[syscall] socket(domain={}, type=0x{:x}): unsupported\n", domain, sock_type);
         return EAFNOSUPPORT;
+    }
+    if base_type != 1 && base_type != 2 {
+        return EINVAL;
     }
     if let Some(idx) = socket::alloc_socket(base_type) {
         if let Some(proc) = akuma_exec::process::current_process_shared() {
@@ -241,7 +254,7 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     akuma_primitives::safe_print!(96, "[syscall] bind(fd={}, port={}, ip={}.{}.{}.{})\n", fd, addr.port, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3]);
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return EBADF,
+        None => return not_a_socket(fd),
     };
     match socket::socket_bind(idx, addr) {
         Ok(()) => 0,
@@ -257,67 +270,64 @@ pub(super) fn sys_listen(fd: u32, backlog: i32) -> u64 {
     let _net_bkl = NetBklGuard::new();
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return EBADF,
+        None => return not_a_socket(fd),
     };
-    match socket::socket_listen(idx, backlog as usize) {
+    // Linux reads a negative backlog as "as many as allowed" and 0 as one;
+    // `socket_listen` clamps the top, and 0 would build no handles at all.
+    let backlog = usize::try_from(backlog).map_or(usize::MAX, |b| b.max(1));
+    match socket::socket_listen(idx, backlog) {
         Ok(()) => 0,
         Err(e) => neg_errno(e),
     }
 }
 
-#[cfg(feature = "smoltcp")]
-pub(super) fn sys_accept(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
-    let _net_bkl = NetBklGuard::new();
-    if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
-    if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
-    let idx = match get_socket_from_fd(fd) {
-        Some(i) => i,
-        None => return EBADF,
-    };
-    let nonblock = fd_is_nonblock(fd);
-    match socket::socket_accept(idx, nonblock) {
-        Ok((new_idx, addr)) => {
-            let proc = match akuma_exec::process::current_process_shared() {
-                Some(p) => p,
-                None => return ESRCH,
-            };
-            if addr_ptr != 0 {
-                let sa = SockAddrIn::from_addr(&addr);
-                let _ = write_user_val(addr_ptr, &sa);
-            }
-            u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx)))
-        }
-        Err(e) => neg_errno(e),
-    }
-}
-
+/// `accept4(2)`; `accept(2)` is this with `flags == 0`.
+///
+/// Folded in from the amd64 kernel's own arm (2026-11-11), which had three
+/// things this one lacked: an unknown flag bit is `EINVAL` before anything is
+/// dequeued, `*addrlen` is written, and an `EAGAIN` re-arms the listener's
+/// `EPOLLET` edge — tokio's accept loop waits on that edge, and without the
+/// re-arm the next connection was never reported to it.
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u64 {
+    use akuma_syscalls_linux::net::sock_flags::{SOCK_CLOEXEC, SOCK_NONBLOCK};
+    if flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
+        return EINVAL;
+    }
     let _net_bkl = NetBklGuard::new();
     if addr_ptr != 0 && !validate_user_ptr(addr_ptr, 16) { return EFAULT; }
     if len_ptr != 0 && !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return EBADF,
+        None => return not_a_socket(fd),
     };
     let nonblock = fd_is_nonblock(fd);
     match socket::socket_accept(idx, nonblock) {
         Ok((new_idx, addr)) => {
-            let proc = match akuma_exec::process::current_process_shared() {
-                Some(p) => p,
-                None => return ESRCH,
+            let Some(proc) = akuma_exec::process::current_process_shared() else {
+                // Nobody to hand the connection to; leaving it in the table
+                // would leak a connection no descriptor can reach.
+                socket::remove_socket(new_idx);
+                return ESRCH;
             };
             if addr_ptr != 0 {
                 let sa = SockAddrIn::from_addr(&addr);
                 let _ = write_user_val(addr_ptr, &sa);
+                if len_ptr != 0 {
+                    let _ = write_user_val(len_ptr, &(core::mem::size_of::<SockAddrIn>() as u32));
+                }
             }
             let new_fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(new_idx));
-            use akuma_syscalls_linux::net::sock_flags::{SOCK_CLOEXEC, SOCK_NONBLOCK};
             if flags & SOCK_CLOEXEC != 0 { proc.set_cloexec(new_fd); }
             if flags & SOCK_NONBLOCK != 0 { proc.set_nonblock(new_fd); }
             u64::from(new_fd)
         }
-        Err(e) => neg_errno(e),
+        Err(e) => {
+            if e == libc_errno::EAGAIN {
+                super::poll::epoll_on_fd_drained(fd);
+            }
+            neg_errno(e)
+        }
     }
 }
 
@@ -342,7 +352,7 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return EBADF,
+        None => return not_a_socket(fd),
     };
     let nonblock = fd_is_nonblock(fd);
     match socket::socket_connect(idx, addr, nonblock) {
@@ -374,7 +384,7 @@ pub(super) fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return EBADF,
+        None => return not_a_socket(fd),
     };
     let (port, bound_ip) = socket::with_socket(idx, |s| (s.bind_port.unwrap_or(0), s.bind_ip))
         .unwrap_or((0, socket::INADDR_ANY));
@@ -411,7 +421,7 @@ pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
     if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return EBADF,
+        None => return not_a_socket(fd),
     };
 
     let remote = socket::with_socket(idx, |sock| {
@@ -551,7 +561,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
     
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return EBADF,
+        None => return not_a_socket(fd),
     };
 
     if socket::is_udp_socket(idx) {
@@ -636,7 +646,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
     };
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return EBADF,
+        None => return not_a_socket(fd),
     };
     let nonblock = fd_is_nonblock(fd);
 
@@ -793,7 +803,7 @@ pub(super) fn sys_setsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
 
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return EBADF,
+        None => return not_a_socket(fd),
     };
 
     match level {
@@ -1029,7 +1039,7 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
 // `dead_code = "deny"` did not catch it; as a crate it does.
 #[cfg(feature = "smoltcp")]
 fn gather_iovecs(iovs: &[super::fs::IoVec]) -> Result<alloc::vec::Vec<u8>, u64> {
-    let total: usize = iovs.iter().map(|v| v.iov_len).sum();
+    let total = iovs.iter().fold(0usize, |a, v| a.saturating_add(v.iov_len));
     if total == 0 {
         return Ok(alloc::vec::Vec::new());
     }
@@ -1301,6 +1311,9 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         return EFAULT;
     }
 
+    // Linux's `UIO_MAXIOV`. Unbounded, a hostile `msg_iovlen` reached the
+    // infallible `vec!` below: up to 64 GiB of iovecs on a `u32` count.
+    if msg.msg_iovlen > UIO_MAXIOV { return EMSGSIZE; }
     let iov_size = msg.msg_iovlen as usize * core::mem::size_of::<super::fs::IoVec>();
     if msg.msg_iovlen != 0 && !validate_user_ptr(msg.msg_iov, iov_size) { return EFAULT; }
     let mut iovs = alloc::vec![super::fs::IoVec { iov_base: 0, iov_len: 0 }; msg.msg_iovlen as usize];
@@ -1318,24 +1331,19 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         return flat(unix_sendmsg(fd, &msg, &iovs, _flags));
     }
 
-    if msg.msg_iovlen == 0 { return 0; }
-    let iov = &iovs[0];
-    if iov.iov_len == 0 { return 0; }
-    if !validate_user_ptr(iov.iov_base, iov.iov_len as usize) { return EFAULT; }
-
     let _net_bkl = NetBklGuard::new();
 
-    let mut kernel_buf = match alloc_net_bounce(iov.iov_len) {
-        Some(b) => b,
-        None => return ENOMEM,
+    // Every iovec, coalesced: this sent `iovs[0]` alone until the amd64
+    // kernel's own `sendmsg` — which gathered — folded into it (2026-11-11).
+    let kernel_buf = match gather_iovecs(&iovs) {
+        Ok(b) => b,
+        Err(e) => return e,
     };
-    if copy_from_user(&mut kernel_buf, iov.iov_base).is_err() {
-        return EFAULT;
-    }
+    if kernel_buf.is_empty() { return 0; }
 
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return EBADF,
+        None => return not_a_socket(fd),
     };
 
     if socket::is_udp_socket(idx) {
@@ -1455,6 +1463,9 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         return EFAULT;
     }
 
+    // Linux's `UIO_MAXIOV`. Unbounded, a hostile `msg_iovlen` reached the
+    // infallible `vec!` below: up to 64 GiB of iovecs on a `u32` count.
+    if msg.msg_iovlen > UIO_MAXIOV { return EMSGSIZE; }
     let iov_size = msg.msg_iovlen as usize * core::mem::size_of::<super::fs::IoVec>();
     if msg.msg_iovlen != 0 && !validate_user_ptr(msg.msg_iov, iov_size) { return EFAULT; }
     let mut iovs = alloc::vec![super::fs::IoVec { iov_base: 0, iov_len: 0 }; msg.msg_iovlen as usize];
@@ -1470,22 +1481,22 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
         return flat(unix_recvmsg(fd, msg_ptr, &mut msg, &iovs, _flags));
     }
 
-    if msg.msg_iovlen == 0 { return 0; }
-    let iov = &mut iovs[0];
-    if iov.iov_len == 0 { return 0; }
-    if !validate_user_ptr(iov.iov_base, iov.iov_len as usize) { return EFAULT; }
+    // Every iovec's capacity, scattered back below: this filled `iovs[0]`
+    // alone until the amd64 kernel's own `recvmsg` folded into it (2026-11-11).
+    let total = iovs.iter().fold(0usize, |a, v| a.saturating_add(v.iov_len));
+    if total == 0 { return 0; }
 
     // Past the pipe-backed unix-socket branch: safe to drop the BKL (see sys_sendto).
     let _net_bkl = NetBklGuard::new();
 
-    let mut kernel_buf = match alloc_net_bounce(iov.iov_len) {
+    let mut kernel_buf = match alloc_net_bounce(total) {
         Some(b) => b,
         None => return ENOMEM,
     };
 
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
-        None => return EBADF,
+        None => return not_a_socket(fd),
     };
     let nonblock = fd_is_nonblock(fd);
 
@@ -1500,9 +1511,10 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                     akuma_primitives::tprint!(96, "[UDP] recvmsg OK: {} bytes from {}.{}.{}.{}:{}\n",
                         n, ip[0], ip[1], ip[2], ip[3], from.port);
                 }
-                if copy_to_user(iov.iov_base, &kernel_buf[..n]).is_err() {
-                    return EFAULT;
-                }
+                let n = match scatter_iovecs(&iovs, &kernel_buf[..n]) {
+                    Ok(n) => n,
+                    Err(e) => return e,
+                };
                 if msg.msg_name != 0 && msg.msg_namelen >= core::mem::size_of::<SockAddrIn>() as u32
                     && validate_user_ptr(msg.msg_name, core::mem::size_of::<SockAddrIn>()) {
                         let sa = SockAddrIn::from_addr(&from);
@@ -1528,9 +1540,10 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                     akuma_primitives::tprint!(96, "[TCP] recvmsg fd={} got={}\n", fd, n);
                 }
-                if copy_to_user(iov.iov_base, &kernel_buf[..n]).is_err() {
-                    return EFAULT;
-                }
+                let n = match scatter_iovecs(&iovs, &kernel_buf[..n]) {
+                    Ok(n) => n,
+                    Err(e) => return e,
+                };
                 msg.msg_controllen = 0;
                 msg.msg_flags = 0;
                 let _ = write_user_val(msg_ptr, &msg);
@@ -1559,6 +1572,22 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
 pub(super) fn get_socket_from_fd(fd: u32) -> Option<usize> {
     let proc = akuma_exec::process::current_process_shared()?;
     if let Some(akuma_exec::process::FileDescriptor::Socket(idx)) = proc.get_fd(fd) { Some(idx) } else { None }
+}
+
+/// Linux's `UIO_MAXIOV`: the most iovecs one `sendmsg`/`recvmsg` may name.
+#[cfg(feature = "smoltcp")]
+const UIO_MAXIOV: u32 = 1024;
+
+/// The errno for an `fd` [`get_socket_from_fd`] did not resolve: `EBADF` when
+/// no such descriptor is open, `ENOTSOCK` when it is open and is something
+/// else, as Linux answers. Every AF_INET call answered `EBADF` for both until
+/// the amd64 kernel's own socket arms were folded into these (2026-11-11);
+/// that kernel had always said `ENOTSOCK`, and `bind(1, ..)` is how a caller
+/// learns its descriptor is a pipe rather than a socket.
+#[cfg(feature = "smoltcp")]
+pub(super) fn not_a_socket(fd: u32) -> u64 {
+    let open = akuma_exec::process::current_process_shared().is_some_and(|p| p.get_fd(fd).is_some());
+    if open { ENOTSOCK } else { EBADF }
 }
 
 pub(super) fn fd_is_nonblock(fd: u32) -> bool {
@@ -1983,11 +2012,7 @@ pub(super) fn dispatch_accept(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) 
     }
     #[cfg(feature = "smoltcp")]
     {
-        if flags == 0 {
-            sys_accept(fd, addr_ptr, len_ptr)
-        } else {
-            sys_accept4(fd, addr_ptr, len_ptr, flags)
-        }
+        sys_accept4(fd, addr_ptr, len_ptr, flags)
     }
     #[cfg(not(feature = "smoltcp"))]
     {

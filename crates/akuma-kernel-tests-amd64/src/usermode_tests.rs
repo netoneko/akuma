@@ -1541,9 +1541,11 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     t.check_eq("dispatch: glue answers getegid 0", d(108), 0);
     t.check_eq("dispatch: glue accepts setuid", d(105), 0);
     // x86_64 288 is `accept4`, the only accept mio (so tokio) ever calls. It
-    // had no row until 2026-09-23 and answered `ENOSYS`; fd 0 is not a
-    // socket, so a row that reaches `sock::sys_accept4` says `ENOTSOCK`.
-    t.check_eq("dispatch: accept4 (288) reaches the socket layer", d(288), k::fd::errno::ENOTSOCK);
+    // had no row until 2026-09-23 and answered `ENOSYS`. fd 0 is not open in
+    // the boot suite, so a row that reaches glue's `net::dispatch_accept`
+    // says `EBADF` (`ENOTSOCK` is for an open descriptor that is not a
+    // socket; the local copy this replaced said `ENOTSOCK` for both).
+    t.check_eq("dispatch: accept4 (288) reaches the socket layer", d(288), k::fd::errno::EBADF);
     t.check_eq("dispatch: glue accepts setgid", d(106), 0);
     t.check_eq("dispatch: glue accepts capset", d(126), 0);
     t.check_eq("dispatch: capget with a NULL header is EFAULT", d(125), k::fd::errno::EFAULT);

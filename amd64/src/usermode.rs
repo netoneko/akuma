@@ -1573,7 +1573,7 @@ fn owns_non_console_channel() -> bool {
 ///   before any I/O. Two `CLONE_FILES` siblings writing one descriptor each
 ///   read a stale cursor here and wrote over each other on disk.
 /// - **A socket write re-arms the `EPOLLET` edge** on a short write, which this
-///   kernel's `sock::send` path never did.
+///   kernel's own socket write path never did.
 /// - **A pipe write blocks with the scheduler's backstop.** Glue parks through
 ///   `akuma_threading::park_indefinitely`, which this target now gives a 1 s
 ///   deadline (`sched::BACKSTOP_US`) — the prerequisite that had to land before

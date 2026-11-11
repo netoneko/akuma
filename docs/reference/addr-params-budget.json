@@ -1,6 +1,6 @@
 {
   "untyped_address_params": {
-    "amd64": 58,
+    "amd64": 51,
     "crates/akuma-alloc": 3,
     "crates/akuma-boot-aarch64": 1,
     "crates/akuma-boot-amd64": 15,
@@ -47,7 +47,7 @@
     "crates/akuma-stack": 1,
     "crates/akuma-svm-amd64": 18,
     "crates/akuma-switch": 4,
-    "crates/akuma-syscalls-glue": 40,
+    "crates/akuma-syscalls-glue": 39,
     "crates/akuma-syscalls-mem": 10,
     "crates/akuma-threading": 8,
     "crates/akuma-tokio-kernel-aarch64": 16,

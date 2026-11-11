@@ -171,10 +171,6 @@ fn path_is_dir(path: &str) -> bool {
 pub mod errno {
     pub const EBADF: u64 = (-9i64) as u64;
     pub const ENOTSOCK: u64 = (-88i64) as u64;
-    /// `sendto` with no destination on a socket that has no connected
-    /// peer. Linux's answer, and c-ares acts on it correctly where it
-    /// treated `EBADF` as its own descriptor bookkeeping being wrong.
-    pub const EDESTADDRREQ: u64 = (-89i64) as u64;
     pub const EAFNOSUPPORT: u64 = (-97i64) as u64;
     pub const ENOENT: u64 = (-2i64) as u64;
     /// The caller is not allowed to do this — `spawn`'s `SPAWN_FLAG_CONSOLE`
@@ -448,20 +444,6 @@ fn install(desc: FileDescriptor) -> u64 {
     u64::from(fd)
 }
 
-/// Allocate a descriptor for an already-created socket.
-///
-/// Sockets live in the same table as files, as `FileDescriptor::Socket(idx)` —
-/// the same variant the AArch64 kernel uses, carrying the same index into the
-/// same `akuma_net::socket` table. Sharing the table is what makes `read` and
-/// `write` work on a socket without the caller knowing.
-///
-/// The socket table entry's initial reference is consumed by this first
-/// insert; every later copy bumps through [`clone_refs`].
-pub fn alloc_socket_fd(idx: usize) -> Option<u64> {
-    let fd = install(FileDescriptor::Socket(idx));
-    (!errno::is_err(fd)).then_some(fd)
-}
-
 /// The socket index behind `fd`, or `None` if it is not a socket.
 #[must_use]
 pub fn socket_index(fd: u64) -> Option<usize> {
@@ -471,19 +453,8 @@ pub fn socket_index(fd: u64) -> Option<usize> {
     })
 }
 
-/// Is `fd` one end of an AF_UNIX pair?
-///
-/// The socket syscalls on this target are served by `crate::sock`, which knows
-/// only `FileDescriptor::Socket` — an index into the smoltcp table. AF_UNIX is
-/// a different object with a different implementation (`akuma-syscalls-glue`'s
-/// `unixsock`, two pipes behind it), and asking `socket_index` about one
-/// answers `None`, which `sys_recvfrom` reports as `ENOTSOCK`: "that descriptor
-/// is not a socket" about a descriptor `socketpair(2)` just returned.
-///
-/// So the family has to be decided before the implementation is chosen, which
-/// is the shape glue's own dispatchers already have ("try AF_UNIX first, then
-/// the native stack"). This is that test, for the arms this target still serves
-/// itself.
+/// Is `fd` one end of an AF_UNIX pair? Only the `recvfrom` tripwire asks now:
+/// the socket syscalls are glue's, which decides the family itself.
 #[must_use]
 pub fn is_unix_socket(fd: u64) -> bool {
     matches!(table_get(fd), Some(FileDescriptor::UnixSocket { .. }))
@@ -729,7 +700,7 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     akuma_syscalls_glue::fs::sys_fcntl(fd as u32, cmd as u32, arg)
 }
 
-/// Copy `len` bytes in from a user pointer. Public for `sock`.
+/// Copy `len` bytes in from a user pointer.
 ///
 /// `None` on a bad range or a fault — the caller returns `EFAULT`. Fault-safe
 /// through `crate::uaccess` since 2026-09-05; a bad pointer used to halt here.
@@ -737,13 +708,6 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
 pub fn copy_in(ptr: u64, len: u64) -> Option<Vec<u8>> {
     let mut out = alloc::vec![0u8; len as usize];
     crate::uaccess::read_bytes(ptr, &mut out).then_some(out)
-}
-
-/// Copy out to a user pointer. Public for `sock`. Returns the byte count, or
-/// `errno::EFAULT` — see [`copy_to_user`].
-#[must_use]
-pub fn copy_out(ptr: u64, src: &[u8]) -> u64 {
-    copy_to_user(ptr, src)
 }
 
 

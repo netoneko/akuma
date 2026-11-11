@@ -15,8 +15,8 @@
 //!    [`time`], [`system`]. A family answers `None` for a call it does not own.
 //!
 //! **A variant belongs to exactly one family**, and all of its arms — a guarded
-//! `AF_UNIX` arm and the unguarded one after it — stay together in that
-//! family's `match`, in their original order. That is what keeps the split
+//! arm and the unguarded one after it — stay together in that family's
+//! `match`, in their original order. That is what keeps the split
 //! behaviour-preserving: the families are disjoint, so the order they are tried
 //! in cannot change which arm answers. Adding a row to `akuma-syscalls-abi`
 //! means adding its arm to one family; a decoded call no family claims prints
@@ -871,8 +871,8 @@ fn mem(call: Syscall, a: [u64; 6]) -> Option<u64> {
     })
 }
 
-/// Sockets. A guarded arm sends `AF_UNIX` to glue; the unguarded one after it
-/// is this kernel's TCP/IP.
+/// Sockets: all glue's. `akuma_syscalls_glue::net` picks the family (AF_UNIX
+/// or this kernel's smoltcp TCP/IP) itself.
 #[allow(clippy::inline_always)] // one switch, not eight calls: see the module doc
 #[inline(always)]
 fn net(call: Syscall, a: [u64; 6]) -> Option<u64> {
@@ -884,66 +884,28 @@ fn net(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // `Process::fds`, which is the table `crate::fd` allocates into, and
         // `read`/`write`/`close` on this target are already glue's.
         Syscall::Socketpair => to_glue(call, [a1, a2, a3, a4, 0, 0]),
-        // **AF_UNIX first, then the native stack** — same rule as `Sendto`/
-        // `Recvfrom` below. `socket(AF_UNIX, …)` used to answer `EAFNOSUPPORT`
-        // here (nca's IPC listener, `os error 97`); glue's `unixsock` has always
-        // been compiled in and serves `bind`/`listen`/`accept`/`connect` for the
-        // descriptors it hands out, so the family is decided by the domain at
-        // `socket` and by the descriptor everywhere after.
-        Syscall::Socket if a1 == AF_UNIX => to_glue(call, [a1, a2, a3, 0, 0, 0]),
-        Syscall::Socket => crate::sock::sys_socket(a1, a2, a3),
-        Syscall::Bind if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, 0, 0, 0]),
-        Syscall::Bind => crate::sock::sys_bind(a1, a2, a3),
-        Syscall::Listen if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, 0, 0, 0, 0]),
-        Syscall::Listen => crate::sock::sys_listen(a1, a2),
-        Syscall::Accept if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, 0, 0, 0]),
-        Syscall::Accept => crate::sock::sys_accept(a1, a2, a3),
-        Syscall::Accept4 if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, a4, 0, 0]),
-        Syscall::Accept4 => crate::sock::sys_accept4(a1, a2, a3, a4),
-        Syscall::Connect if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, 0, 0, 0]),
-        Syscall::Connect => crate::sock::sys_connect(a1, a2, a3),
-        // `a5` is the destination/source `struct sockaddr *` — Linux's 5th
-        // argument, which the entry asm's shuffle keeps (only the 6th,
-        // `addrlen`, is dropped; see `syscall_entry`'s comment on why that was
-        // safe until now). Needed for UDP: unlike a connected TCP socket, a
-        // UDP `sendto` has no peer to fall back on, and musl's DNS resolver
-        // never `connect()`s its query socket — it addresses every nameserver
-        // by hand on each `sendto`. See `sock::sys_sendto`.
-        // **AF_UNIX first, then the native stack** — the shape glue's own
-        // dispatchers have, and the reason these two arms are guarded rather
-        // than left to `crate::sock`. A `socketpair(2)` endpoint is not a
-        // `FileDescriptor::Socket`, so `sock::sys_recvfrom` answers `ENOTSOCK`
-        // for a descriptor the kernel handed out three syscalls earlier — which
-        // is what Rust `std` hit the moment `socketpair` started working
-        // (`the CLOEXEC pipe failed: Not a socket`). Its spawn channel is a
-        // `SOCK_SEQPACKET` pair, so it `recv`s rather than `read`s, and `recv`
-        // on this target had no AF_UNIX arm at all.
-        //
-        // Glue's `sys_sendto`/`sys_recvfrom` test the family themselves and
-        // serve AF_UNIX from `unixsock`; the hop is here so `crate::sock` stays
-        // the smoltcp implementation rather than growing a second family.
-        Syscall::Sendto if crate::fd::is_unix_socket(a1) => {
-            to_glue(call, [a1, a2, a3, a4, a5, a6])
-        }
-        Syscall::Sendto => crate::sock::sys_sendto(a1, a2, a3, a5),
-        // Both families, then the busy-loop tripwire: the 2026-09-25 kot spin
-        // was ~720k `recvfrom`/s from one thread and no log named the socket.
+        // **Glue's, both families.** Glue's `net::dispatch_*` decide AF_UNIX
+        // vs AF_INET themselves — by the domain at `socket`, by the descriptor
+        // after — and serve AF_INET from the same `akuma_net::socket` table.
+        // These arms used to split the families here and send AF_INET to a
+        // second implementation in `crate::sock`; that was folded into glue
+        // 2026-11-11 (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "Slice 1:
+        // sockets"). The history each local arm carried — musl's resolver
+        // needing `SOCK_NONBLOCK` applied, c-ares' connected-UDP `send`,
+        // `socketpair` endpoints answering `ENOTSOCK`, crashpad's
+        // `SO_PASSCRED` — is about behaviour glue already had.
+        Syscall::Socket | Syscall::Bind | Syscall::Connect | Syscall::Accept => to_glue(call, [a1, a2, a3, 0, 0, 0]),
+        Syscall::Listen => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        Syscall::Accept4 => to_glue(call, [a1, a2, a3, a4, 0, 0]),
+        Syscall::Sendto => to_glue(call, [a1, a2, a3, a4, a5, a6]),
+        // Then the busy-loop tripwire: the 2026-09-25 kot spin was ~720k
+        // `recvfrom`/s from one thread and no log named the socket.
         Syscall::Recvfrom => {
-            let unix = crate::fd::is_unix_socket(a1);
-            let r = if unix {
-                to_glue(call, [a1, a2, a3, a4, a5, a6])
-            } else {
-                crate::sock::sys_recvfrom(a1, a2, a3, a5)
-            };
-            crate::sock::recv_spin_tripwire(a1, a3, a4, r, unix);
+            let r = to_glue(call, [a1, a2, a3, a4, a5, a6]);
+            crate::sock::recv_spin_tripwire(a1, a3, a4, r, crate::fd::is_unix_socket(a1));
             r
         }
-        // AF_UNIX first, as for `Sendmsg`: `crate::sock` answered `ENOTSOCK`
-        // for a unix fd, and Chromium's crashpad `CHECK`-crashes the browser
-        // on `setsockopt(SO_PASSCRED)` failing (2026-10-08). Glue accepts the
-        // `SOL_SOCKET` options on a unix socket, as it always has on AArch64.
-        Syscall::Setsockopt if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, a4, a5, 0]),
-        Syscall::Setsockopt => crate::sock::sys_setsockopt(a1, a2, a3, a4, a5),
+        Syscall::Setsockopt => to_glue(call, [a1, a2, a3, a4, a5, 0]),
         // `getsockopt`/`shutdown` never had a native `crate::sock` arm at all —
         // unlike `Setsockopt`/`Sendto`, there is no "second family" to avoid
         // growing by going through glue; `net::dispatch_getsockopt`/
@@ -971,21 +933,10 @@ fn net(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // `AKUMA_AMD64_MEMORY_CLOSEOUT.md` §"the errno, not the feature"
         // records for `madvise`.
         Syscall::Getsockname | Syscall::Getpeername => to_glue(call, [a1, a2, a3, 0, 0, 0]),
-        // `sendmsg`/`recvmsg` — x86_64 46/47. musl's DNS resolver on this
-        // build uses these, not `sendto`/`recvfrom`; without them `poll`
-        // correctly reported a UDP reply readable and `recvmsg` came back
-        // `ENOSYS`, so `apk`'s own name resolution spun forever. See
-        // `sock::sys_sendmsg`/`sock::sys_recvmsg`.
-        //
-        // **AF_UNIX first**, same rule as `Socket`/`Sendto` above: a unix fd
-        // is not a `FileDescriptor::Socket`, so `crate::sock` answered it
-        // `ENOTSOCK` — plain unix `sendmsg` did not work on this target, and
-        // glue's is where `SCM_RIGHTS` lives (Chromium's IPC passes 600+ fds
-        // loading one page).
-        Syscall::Sendmsg if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, 0, 0, 0]),
-        Syscall::Recvmsg if crate::fd::is_unix_socket(a1) => to_glue(call, [a1, a2, a3, 0, 0, 0]),
-        Syscall::Sendmsg => crate::sock::sys_sendmsg(a1, a2, a3),
-        Syscall::Recvmsg => crate::sock::sys_recvmsg(a1, a2, a3),
+        // `sendmsg`/`recvmsg` — x86_64 46/47; musl's DNS resolver uses these.
+        // Glue's carry `SCM_RIGHTS` for AF_UNIX (Chromium's IPC passes 600+ fds
+        // loading one page) and the full iovec walk for AF_INET.
+        Syscall::Sendmsg | Syscall::Recvmsg => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         _ => return None,
     })
 }

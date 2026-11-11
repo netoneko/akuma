@@ -1909,7 +1909,7 @@ that:
 
 | family | amd64 copy | glue's | why it stayed local | plan |
 |---|---|---|---|---|
-| sockets | `sock.rs` (818 L, wiring over `akuma_net::socket`) | `net.rs` | both wire the same crate; never folded | route to glue, delete |
+| sockets | `sock.rs` (818 L, wiring over `akuma_net::socket`) | `net.rs` | both wire the same crate; never folded | **done** (Slice 1, below) |
 | futex | `futex.rs` (450 L, effects over `akuma-syscalls-sync`) | `sync.rs` | glue's used `akuma_exec::threading` when amd64 had its own scheduler (the `amd64/Cargo.toml` note is from then); both are on `akuma-threading` now | route to glue, delete |
 | signals | `kill`/`tkill`/`tgkill` via `akuma-syscalls-glue-amd64::kill`; `rt_sigreturn` and delivery | `signal.rs`/`proc.rs` | the x86 `kill -9` fix went into the x86 copy | diff the two, keep the stronger, one copy; sigframe and `rt_sigreturn` stay per-arch |
 | fd I/O | `fd.rs` (3.8 kL): read/write/open/stat/dup/fcntl/ioctl/poll/select/getdents | `fs.rs`/`poll.rs` | device kinds glue does not know (`DevKvm`, `DevTun`, `DevWifi`, `DevFb`, `DevMouse`, `DevPower`) and x86 `struct stat`/open-flag translation | device kinds through `SyscallHooks` (it already carries `dev_mouse_has_events`/`dev_tun_has_frame`); x86 ABI translation from `akuma-syscalls-glue-amd64`, which the tokio kernel already uses for exactly this; then route |
@@ -1923,3 +1923,76 @@ amd64 harness (`scripts/utils/amd64_*.py`), the AArch64 HVF suite where glue its
 ryzen Firecracker lane before the slice counts as done. Every divergence found between the two copies
 gets pinned in the slice's commit (research doc §7), not silently resolved.
 
+### Slice 1: sockets (2026-11-11)
+
+Every AF_INET socket arm in `amd64/src/usermode/dispatch.rs` now calls `to_glue`. That covers
+`socket`, `bind`, `listen`, `accept`, `accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`
+and `setsockopt`. The AF_UNIX guards went with them, because glue's `net::dispatch_*` already decide the
+family from the domain at `socket` and from the descriptor after it.
+
+`amd64/src/sock.rs` went from 818 lines to its kernel-only parts:
+- the `recvfrom` busy-loop tripwire, which reads this kernel's task slots;
+- the `close` hook that `exec_runtime` hands `akuma-exec`;
+- the boot self-test, which now calls `usermode::syscall_dispatch` by x86_64 number, so each check
+  also proves its arm routes to glue.
+
+`fd::alloc_socket_fd`, `fd::copy_out` and `errno::EDESTADDRREQ` lost their last callers and were
+deleted.
+
+Both copies wrapped the same `akuma_net::socket` table, so they differed only at the argument
+boundary. The divergences found:
+
+| | amd64's copy | glue's (AArch64) | now (both) |
+|---|---|---|---|
+| `socket(AF_INET, 99)` | `EINVAL` | `EAFNOSUPPORT` | `EINVAL`, as Linux gives |
+| unknown flag bit in `socket`'s type | ignored | ignored (masked `& 0xff`) | `EINVAL`, as Linux gives |
+| AF_INET call on an open non-socket fd | `ENOTSOCK` | `EBADF` | `ENOTSOCK` (`net::not_a_socket`); `EBADF` stays for an unopened fd |
+| `accept4` with an unknown flag | `EINVAL` | accepted | `EINVAL` |
+| `accept`/`accept4` `*addrlen` | written | never written | written (16) |
+| `accept` `EAGAIN` | re-arms the listener's `EPOLLET` edge | did not | re-arms |
+| `listen(fd, 0)` | clamped to 1 | 0 handles, so the listener never accepted | clamped to 1; a negative backlog means the maximum |
+| `accept` with no process after dequeue | (n/a) | leaked the connection | the connection is removed |
+
+Each fix went into glue, so the AArch64 kernel gets it too.
+
+Glue was the stronger copy in one respect: `setsockopt` honours `SO_RCVTIMEO`/`SO_SNDTIMEO`, which the
+amd64 copy accepted and dropped.
+
+A live probe found three more gaps, all on both kernels. It runs 25 AF_INET checks over loopback,
+pushed in over ssh to an amd64 guest booted with herd under TCG (`SMP=2`).
+
+| | was | now |
+|---|---|---|
+| AF_INET `sendmsg` | sent `iovs[0]` only | coalesces every iovec (`gather_iovecs`); the amd64 copy did, up to 8 |
+| AF_INET `recvmsg` | filled `iovs[0]` only | scatters across every iovec (`scatter_iovecs`) |
+| `msg_iovlen` | unbounded, into an infallible `vec!` (up to 64 GiB on its `u32`) | over `UIO_MAXIOV` (1024) is `EMSGSIZE`, as Linux |
+| UDP blocking `recv` | ignored `SO_RCVTIMEO`; a fixed 10 s, then `ETIMEDOUT` | honours it, and its expiry is `EAGAIN` (TCP send/recv too, which honoured the timeout but said `ETIMEDOUT`) |
+
+The 10 s cap stays when no `SO_RCVTIMEO` is set. That is a pinned divergence: Linux blocks forever.
+
+Pinned, not fixed:
+- **An `accept` of a `127.0.0.1` connect reports the peer as `10.0.2.15`**, the interface address.
+  It is the stack's source-address choice for loopback, which both deleted copies passed through
+  unchanged.
+- **An unanswered `busybox nslookup` wedges the amd64 kernel** under TCG at `SMP=2`. The serial
+  console stops, the vCPU sits at 99 % and ssh never answers again. The pre-change kernel (the
+  previous code commit's ELF, same disk, same boot) wedges identically, so it is not this slice. A
+  refused `connect`, a 200 ms `SO_RCVTIMEO` wait and 40 s of idle all survive. Not yet run down.
+  The suspect is amd64's in-kernel net wait (`net_blocking_relax` halts without switching tasks
+  unless a sleeper is due, and ring-0 code is not preempted). Measured on battery, off the home
+  network, so the DNS packet had nowhere to go. The ryzen and trashcan lanes were not run.
+
+Gates:
+- clippy on the seven amd64 sets, the AArch64 default / `no-tests` / `rump` / rump-only sets, and
+  Taoxichuan on both architectures;
+- amd64 TCG 836/0 (`SMP=1`) and 846/0 (`SMP=2`), default and `headless`, against a 829/839 baseline;
+  the difference is the new checks;
+- AArch64 HVF 315 (`SMP=1`) and 321 (`SMP=4`) `PASSED`, with the same pre-existing `[threads] SPAWN
+  FAILED` line the earlier runs on this branch print;
+- `akuma-net` host tests;
+- the live probe 24/25, the one being the pinned peer address;
+- ten fresh ssh sessions;
+- repeated refused connects with a liveness check after each.
+
+`sock.rs` had also been answering every non-socket fd `ENOTSOCK`. The one boot check that depended on
+it, `dispatch: accept4 (288) reaches the socket layer`, passes an unopened fd 0 and now expects `EBADF`.
