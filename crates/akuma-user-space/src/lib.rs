@@ -67,6 +67,9 @@ use alloc::vec::Vec;
 use spinning_top::Spinlock;
 
 pub mod instr;
+mod pins;
+
+pub use pins::MappingPins;
 
 /// Every physical frame one user address space is responsible for.
 ///

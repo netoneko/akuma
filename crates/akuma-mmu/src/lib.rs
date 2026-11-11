@@ -203,7 +203,7 @@ use akuma_mmap::PhysFrame;
 // Both architectures' `UserAddressSpace` carries one — the AArch64 struct since
 // `akuma-user-space` was split out, the x86_64 one since B3 widened it
 // (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`).
-use akuma_user_space::FrameLedger;
+use akuma_user_space::{FrameLedger, MappingPins};
 use akuma_primitives::irq::{with_irqs_disabled, IrqGuard};
 
 /// MMU initialization state
@@ -1772,6 +1772,10 @@ pub struct UserAddressSpace {
     /// Whether this address space allocated `asid` and frees it on drop. `false`
     /// for a thread view, which borrows its owner's ([`Self::new_thread_view`]).
     asid_owned: bool,
+    /// The inodes this address space's file mappings keep alive
+    /// ([`Self::pin_mapped_inode`]). Empty in a borrowed view: the mappings, and
+    /// the pins, belong to the owner.
+    mapping_pins: MappingPins,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1799,6 +1803,7 @@ impl UserAddressSpace {
             ledger: FrameLedger::new(false),
             asid,
             asid_owned: true,
+            mapping_pins: MappingPins::new(),
         };
         addr_space.add_kernel_mappings().ok()?;
         instr::as_new();
@@ -1838,6 +1843,7 @@ impl UserAddressSpace {
             ledger: FrameLedger::new(true),
             asid,
             asid_owned: true,
+            mapping_pins: MappingPins::new(),
         })
     }
 
@@ -1876,6 +1882,7 @@ impl UserAddressSpace {
             ledger: FrameLedger::new(true),
             asid: owner_asid,
             asid_owned: false,
+            mapping_pins: MappingPins::new(),
         }
     }
 
@@ -2553,6 +2560,55 @@ fn publish_and_install_ttbr0(ttbr0: u64) {
     publish_l0_end(token);
 }
 
+/// The inode pins, the same on both targets: each struct carries a
+/// `mapping_pins: MappingPins` (`akuma-user-space`, host-tested), and these are
+/// the only way to reach it.
+impl UserAddressSpace {
+    /// Keep `inode`'s data alive while a mapping in this address space names it.
+    ///
+    /// A demand-paged file mapping reads its pages long after `mmap` returned,
+    /// usually after the descriptor was closed (`ld.so` closes it at once).
+    /// Without a pin the filesystem may free the inode on `unlink` and reissue
+    /// its number, and the mapping then faults in zeros or another file's bytes
+    /// with nothing logged (root cause #2 of the self-host `rustc` ICE,
+    /// `docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14).
+    ///
+    /// Idempotent per inode, and `inode == 0` pins nothing. Call it on the
+    /// **owner's** address space (the thread-group leader's), never a thread's
+    /// view: a view drops with its thread and would take the pin with it.
+    pub fn pin_mapped_inode(&mut self, inode: u32) {
+        self.mapping_pins.pin(inode);
+    }
+
+    /// Release `inode`'s pin. The caller has just removed a mapping of it and
+    /// checked that no surviving mapping in this address space names it.
+    pub fn unpin_mapped_inode(&mut self, inode: u32) {
+        self.mapping_pins.unpin(inode);
+    }
+
+    /// Drop every pin whose inode `still_mapped` no longer answers `true` for:
+    /// the release half for a caller that can only answer over its whole
+    /// surviving region list. Without a release, `munmap` freed the pages and
+    /// kept the claim on the file, and a long-lived process accumulated one
+    /// permanent pin per inode it had ever mapped, until the pin table
+    /// saturated and ext2 stopped freeing unlinked files.
+    pub fn retain_mapped_inode_pins(&mut self, still_mapped: impl Fn(u32) -> bool) {
+        self.mapping_pins.retain(still_mapped);
+    }
+
+    /// Take the same pins `other` holds: a `fork` child inherits its parent's
+    /// file mappings, so it must inherit their claim on the files.
+    pub fn inherit_mapped_inode_pins(&mut self, other: &Self) {
+        self.mapping_pins.inherit(&other.mapping_pins);
+    }
+
+    /// Whether this address space pins `inode` (diagnostics and tests).
+    #[must_use]
+    pub fn pins_mapped_inode(&self, inode: u32) -> bool {
+        self.mapping_pins.contains(inode)
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
@@ -3123,10 +3179,9 @@ pub struct UserAddressSpace {
     /// having to know they exist. `akuma_mmap::MmapRegion` cannot hold them at
     /// all: that crate's `[dependencies]` table is empty and load-bearing.
     ///
-    /// The AArch64 struct has no such field because its lazy file regions carry
-    /// their own pin inside `LazySource::File`; this target demand-pages from
-    /// `mmap_regions`, which has nowhere to put one.
-    mapping_pins: alloc::vec::Vec<akuma_primitives::InodePin>,
+    /// The AArch64 struct carries the same set (`akuma_user_space::MappingPins`);
+    /// the methods are shared ([`Self::pin_mapped_inode`]).
+    mapping_pins: MappingPins,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3158,66 +3213,7 @@ impl UserAddressSpace {
         // down table, and a frame the PMM has re-issued *as an L0* is a live
         // table, not a stale reference.
         unnote_freed_l0(root as u64 & L0_BASE_MASK);
-        Some(Self { root, ledger: FrameLedger::new(false), mapping_pins: alloc::vec::Vec::new() })
-    }
-
-    /// Keep `inode`'s data alive for as long as this address space exists.
-    ///
-    /// Idempotent per inode: a program that maps one shared object three times
-    /// (`ld.so` maps the same file once per segment) takes one pin, not three.
-    /// The count is a global table of bounded size, and an entry held per
-    /// *mapping* rather than per *file* is how it saturates — a saturated pin
-    /// table answers "pinned" for everything and stalls the filesystem's
-    /// deferred frees, which is a failure this tree has already had once
-    /// (`docs/archive/EXT2_UNLINK_INODE_BLOCK_LEAK.md`).
-    ///
-    /// `inode == 0` means "no inode identity", and pins nothing.
-    pub fn pin_mapped_inode(&mut self, inode: u32) {
-        if inode == 0 || self.mapping_pins.iter().any(|p| p.inode() == inode) {
-            return;
-        }
-        self.mapping_pins.push(akuma_primitives::InodePin::new(inode));
-    }
-
-    /// Drop every pin whose inode `still_mapped` no longer answers `true` for.
-    ///
-    /// **The release half of [`pin_mapped_inode`](Self::pin_mapped_inode), and
-    /// for a year there was none.** The pins live in this struct because it
-    /// "dies exactly when the mappings do — on `exec` and on exit"; that is true
-    /// of the *address space* and false of an individual mapping, so a
-    /// `munmap` released the pages and kept the claim on the file. A long-lived
-    /// process that maps and unmaps files — every `ld.so`, every build tool —
-    /// accumulated one permanent pin per distinct inode it had ever mapped.
-    ///
-    /// The visible failure is a space leak, not a memory one, and it needs the
-    /// pin table to saturate before it shows: past its 1024 slots `is_pinned`
-    /// answers `true` for *every* inode, so ext2 defers every `unlink`'s block
-    /// free onto a 256-slot list that then never drains, because the pins that
-    /// would release it are held by a process that is still running.
-    /// `ext2probe`'s `reclaim[pinned]` phase measured **0 %** of deleted bytes
-    /// returned on this target against 85 % on AArch64 — which does not have the
-    /// bug, because its pin rides inside `LazySource::File` in the lazy region
-    /// and dies with the region.
-    ///
-    /// Taking the predicate rather than an inode is what makes this correct
-    /// rather than approximately correct: a pin is per *inode* and per address
-    /// space, one mapping may be unmapped while three others still name the same
-    /// file (`ld.so` maps one shared object once per segment), and only the
-    /// caller's surviving region list can answer whether the last one has gone.
-    pub fn retain_mapped_inode_pins(&mut self, still_mapped: impl Fn(u32) -> bool) {
-        self.mapping_pins.retain(|p| still_mapped(p.inode()));
-    }
-
-    /// Take the same pins `other` holds — a `fork` child inherits its parent's
-    /// file mappings, so it must inherit their claim on the files.
-    ///
-    /// Without this the child's mappings are pinned only by the parent's, and a
-    /// parent that execs or exits while the child still faults leaves the child
-    /// reading an inode nothing keeps alive.
-    pub fn inherit_mapped_inode_pins(&mut self, other: &Self) {
-        for pin in &other.mapping_pins {
-            self.pin_mapped_inode(pin.inode());
-        }
+        Some(Self { root, ledger: FrameLedger::new(false), mapping_pins: MappingPins::new() })
     }
 
     /// A borrowed view of an existing address space (`CLONE_VM` / `vfork`):
@@ -3244,7 +3240,7 @@ impl UserAddressSpace {
             ledger: FrameLedger::new(true),
             // A borrowed view pins nothing: the mappings — and the pins that
             // keep their files alive — belong to the owner, which outlives it.
-            mapping_pins: alloc::vec::Vec::new(),
+            mapping_pins: MappingPins::new(),
         })
     }
 
@@ -3256,7 +3252,7 @@ impl UserAddressSpace {
         Self {
             root: parent_l0_phys,
             ledger: FrameLedger::new(true),
-            mapping_pins: alloc::vec::Vec::new(),
+            mapping_pins: MappingPins::new(),
         }
     }
 

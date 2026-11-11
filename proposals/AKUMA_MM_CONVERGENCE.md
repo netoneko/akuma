@@ -11,7 +11,8 @@ deferred there because it cannot be done one call at a time.*
 | 1. `LazyRegion` stores `Prot` | **done** — `Option<Prot>`, the `u64` only at `LazyRegionMap`'s edges (exact, host-tested); boot suites, `mem_suite` 11/11 |
 | — | **`MAP_FIXED` leak fixed first** (2026-11-12): glue's `MAP_FIXED` kept every replaced eager frame until exit and left an overlapping record in the list. It now goes through `unmap_range`, `munmap`'s body. A prerequisite for step 5, since this `mem.rs` becomes amd64's mm too ([`AKUMA_MAP_FIXED_EAGER_LEAK.md`](../docs/archive/AKUMA_MAP_FIXED_EAGER_LEAK.md)) |
 | 2 | folded into step 4 (below) |
-| 3–6 | open |
+| 3. pin set in the shared `UserAddressSpace` | **done** (2026-11-12): `akuma_user_space::MappingPins` held by both structs, methods shared. AArch64 pins on `push_lazy_region_with_source`, fork's `propagate_lazy_regions_to_child`, exec and spawn (deferred segments), and releases when `munmap` removes the last region naming the inode. Thread views (`clone_lazy_regions`) pin nothing. Boot test `test_lazy_file_regions_pin_in_address_space`; `ext2probe` `SPACE OK`; `mem_suite` 12/12 |
+| 4–6 | open |
 
 ## Goal
 
@@ -71,15 +72,11 @@ kernels' fault paths consume that and nothing else; AArch64 encodes `prot` with
 `user_flags::to_pte`, amd64 with `PteProt::from_region`.
 
 **Inode lifetime moves to the address space.** `MmapRegion` cannot hold an `InodePin`; `akuma-mmap`
-has an empty dependency table on purpose. The pin set amd64 already keeps in its `UserAddressSpace`
-(one pin per distinct inode, released when the address space drops) moves into the shared
-`UserAddressSpace`, so AArch64 gets the same mechanism.
-
-This changes AArch64 behaviour: today a pin goes away when its region is unmapped; after this, an
-unlinked file that was mapped keeps its blocks until the process exits or execs. That is bounded by
-the number of distinct files a process maps, and it is already amd64's behaviour. Releasing a pin when
-the last region naming its inode goes is possible, since `munmap` returns the detached regions. It is
-a follow-up if a long-lived process is ever found to hold unlinked files.
+has an empty dependency table on purpose. The pin set amd64 keeps in its `UserAddressSpace` (one pin
+per distinct inode, released when the last region naming it goes) moves into the shared
+`UserAddressSpace`, so AArch64 gets the same mechanism and the same lifetime it has today. (An earlier
+draft of this section said amd64 held pins until the address space dropped; amd64 already released
+them through `retain_mapped_inode_pins`.)
 
 **File reads by path survive only where they must.** `LazySource` keeps a path so a fill can
 `read_at(path, ..)` when the inode is 0. `FileBacking` has no path. Every mapping glue creates has an
@@ -137,11 +134,13 @@ Reading the code for step 2 changed four parts of the plan above.
   to delete the source in step 4, is two rewrites of the 15 call sites. Instead, step 4 keeps
   `LazySource` as the fault path's *view*, built from the one list under its lock, so the fault
   code does not change in the step that moves the storage.
-- **Pins are refcounted per inode, released with the last region that names it.** This replaces
-  "held until the address space drops" above. It keeps AArch64's current lifetime: an unmapped
-  file stops pinning its blocks. amd64 gets that lifetime too, instead of the longer one it has
-  today. The map lives in the shared `UserAddressSpace` (step 3). `munmap`, `MAP_FIXED` and
-  `mremap` release a pin through the regions they detach.
+- **Pins are released with the last region that names the inode.** Both kernels already had that
+  lifetime: AArch64 through each region's `InodePin`, amd64 through `retain_mapped_inode_pins`. The
+  set lives in the shared `UserAddressSpace` (step 3, done). `munmap`, `MAP_FIXED` and `mremap`
+  release a pin through the regions they detach. One gap is left for step 4: a `push` that
+  replaces a region at the same start address drops the old region's `InodePin` but not the
+  address space's pin, which then lasts until exit. Nothing pushes over a live region today,
+  since `MAP_FIXED` unmaps first.
 - **`MmapRegion` needs a `lazy` marker.** Three AArch64 readers of the eager list assume
   every record in it is backed by present pages:
   - `eager_region_flags_for_page_fault`;

@@ -1001,6 +1001,10 @@ pub fn run_all_tests() {
     // record left in the list, and the replaced frames back in the PMM.
     test_map_fixed_replaces_eager_mapping();
 
+    // The address space's pin on a mapped file follows the lazy regions that
+    // name it: taken on push and on fork, released with the last region.
+    test_lazy_file_regions_pin_in_address_space();
+
     // `no-bkl-drivers` (Phase 6): DriverBklGuard's ledger balance across
     // sys_getrandom and the sys_fb_* entry points, on early-error paths and a
     // real guarded path, plus the runtime kill switch.
@@ -5176,6 +5180,74 @@ fn test_map_fixed_replaces_eager_mapping() {
     } else {
         crate::safe_print!(64, "[Test] map-fixed-replaces-eager FAILED ({} cases)\n", fails);
         panic!("test_map_fixed_replaces_eager_mapping: {fails} cases failed");
+    }
+}
+
+/// The address space's pin on a mapped file (`UserAddressSpace::pin_mapped_inode`,
+/// mm convergence step 3) follows the lazy file regions that name the inode.
+///
+/// A file region pushed for a process pins its inode in that process's address
+/// space as well as in the region's own `LazySource`. Removing one of two
+/// regions naming the file keeps the pin; removing the last releases it. A fork
+/// child's address space pins what its inherited regions name. Step 4 deletes
+/// the `LazySource` pin, and this is what keeps those files alive then.
+///
+/// The inode is synthetic: the pin table counts numbers and needs no file.
+fn test_lazy_file_regions_pin_in_address_space() {
+    use akuma_exec::process::{
+        register_process, unregister_process, with_process, push_lazy_region_with_source,
+        munmap_lazy_regions_in_range, propagate_lazy_regions_to_child, lazy_regions_snapshot,
+        LazySource,
+    };
+    use akuma_primitives::inode_pin::pin_count;
+
+    const INO: u32 = 0x7EED_0001;
+    const A: usize = 0x14_0000_0000;
+    const B: usize = 0x14_0010_0000;
+    let pid: u32 = 7721;
+    register_process(pid, make_test_process(pid));
+
+    let src = || LazySource::file(alloc::string::String::from("/pin-test"), 1, INO, 0, 0x2000, A);
+    let as_pins = || with_process(pid, |p| p.with_address_space(|a| a.pins_mapped_inode(INO))).unwrap_or(false);
+    let mut fails = 0u32;
+    let mut check = |ok: bool, what: &str| {
+        if !ok {
+            fails += 1;
+            crate::safe_print!(128, "[Test] lazy-file-pins: {} (pin_count={})\n", what, pin_count(INO));
+        }
+    };
+
+    let _ = push_lazy_region_with_source(pid, A, 0x2000, 0, src());
+    let _ = push_lazy_region_with_source(pid, B, 0x1000, 0, src());
+    check(as_pins(), "push did not pin in the address space");
+    // Two region pins and one address-space pin, not one per region.
+    check(pin_count(INO) == 3, "want 3 pins after two pushes");
+
+    // Fork: the child's address space pins what it inherits.
+    let child_pid: u32 = 7722;
+    let child = make_test_process(child_pid);
+    let snapshot: alloc::vec::Vec<_> = lazy_regions_snapshot(pid).map_or_else(alloc::vec::Vec::new, |m| m.into_values().collect());
+    let _ = propagate_lazy_regions_to_child(&snapshot, &child);
+    drop(snapshot);
+    check(child.with_address_space(|a| a.pins_mapped_inode(INO)), "fork child's address space did not pin");
+    drop(child);
+    check(pin_count(INO) == 3, "dropping the child did not release its pins");
+
+    let _ = munmap_lazy_regions_in_range(pid, A, 0x1000); // clip: A's tail still names it
+    check(as_pins(), "a clip released the pin");
+    let _ = munmap_lazy_regions_in_range(pid, A + 0x1000, 0x1000); // A gone, B remains
+    check(as_pins(), "released while region B still names the file");
+    let _ = munmap_lazy_regions_in_range(pid, B, 0x1000); // the last one
+    check(!as_pins(), "the last region went and the pin stayed");
+    check(pin_count(INO) == 0, "pins left after every region went");
+
+    unregister_process(pid);
+
+    if fails == 0 {
+        crate::safe_print!(96, "[Test] lazy-file-regions-pin-in-address-space PASSED\n");
+    } else {
+        crate::safe_print!(96, "[Test] lazy-file-regions-pin-in-address-space FAILED ({} cases)\n", fails);
+        panic!("test_lazy_file_regions_pin_in_address_space: {fails} cases failed");
     }
 }
 

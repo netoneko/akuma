@@ -147,6 +147,21 @@ fn push_deferred_regions(lazy: &mut LazyRegionMap, segments: &[DeferredLazySegme
     }
 }
 
+/// Pin, in the image's own address space, the inode of every file-backed
+/// segment [`push_deferred_regions`] registers. Kept apart from that function so
+/// a caller holding the region lock never takes the address-space lock inside it.
+#[cfg(not(feature = "elf-loader"))]
+const fn pin_deferred_inodes(_aspace: &mut mmu::UserAddressSpace, _segments: &[DeferredLazySegment]) {}
+
+#[cfg(feature = "elf-loader")]
+fn pin_deferred_inodes(aspace: &mut mmu::UserAddressSpace, segments: &[DeferredLazySegment]) {
+    for seg in segments {
+        if let Some(fs) = &seg.file_source {
+            aspace.pin_mapped_inode(fs.inode);
+        }
+    }
+}
+
 /// Everything [`Process::install_image`] needs to know about a freshly loaded
 /// program, and nothing about **how** it was loaded.
 ///
@@ -280,7 +295,9 @@ impl Process {
         // `replace` swaps the inner address space and refreshes the lock-free
         // scalar mirror (`ttbr0`/`shared`) in one step; the returned old address
         // space drops here, freeing its page-table frames.
-        drop(self.address_space.replace(inst.address_space));
+        let mut new_space = inst.address_space;
+        pin_deferred_inodes(&mut new_space, inst.deferred_segments);
+        drop(self.address_space.replace(new_space));
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: AS swapped\n");
         self.entry_point.store(inst.entry_point, Ordering::Relaxed);
         self.brk.store(inst.brk, Ordering::Relaxed);
@@ -417,6 +434,7 @@ impl Process {
         // heap or deep-stack touch would SIGSEGV.
         let mut lazy_regions = LazyRegionMap::new();
         push_deferred_regions(&mut lazy_regions, &loaded.deferred_segments);
+        pin_deferred_inodes(&mut loaded.address_space, &loaded.deferred_segments);
 
         let process_info_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or(ElfError::OutOfMemory)?;
         track_frame(process_info_frame, FrameSource::UserData);

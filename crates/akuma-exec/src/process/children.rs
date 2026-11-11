@@ -1178,11 +1178,15 @@ impl LazyRegionMap {
     /// shape — `F`ull / `P`refix / `S`uffix / `M`iddle-split — carried out for the
     /// caller's `[LR*]` debug line; region splitting is where this code has gone
     /// wrong before, and the shape is the first thing you want in the log.
+    ///
+    /// The second value is the inode of a file region removed **whole** (0
+    /// otherwise): a clip leaves a piece naming the same file, a full removal
+    /// may have taken the last mapping of it ([`Self::names_inode`]).
     pub fn munmap_one_overlap(
         &mut self,
         range_start: usize,
         range_end: usize,
-    ) -> Option<(char, usize, usize)> {
+    ) -> Option<((char, usize, usize), u32)> {
         let key = self
             .regions
             .range(..range_end)
@@ -1201,7 +1205,7 @@ impl LazyRegionMap {
 
         if clip_start == reg_start && clip_end == reg_end {
             self.regions.remove(&key);
-            Some(('F', reg_start, reg_size / 4096))
+            Some((('F', reg_start, reg_size / 4096), reg_source.pinned_inode()))
         } else if clip_start == reg_start {
             // Trim prefix: remove old entry, insert remainder at new start_va.
             self.regions.remove(&key);
@@ -1211,11 +1215,11 @@ impl LazyRegionMap {
                 prot: reg_prot,
                 source: reg_source,
             });
-            Some(('P', clip_start, (clip_end - clip_start) / 4096))
+            Some((('P', clip_start, (clip_end - clip_start) / 4096), 0))
         } else if clip_end == reg_end {
             // Trim suffix: shorten the existing entry in place (key unchanged).
             self.regions.get_mut(&key).unwrap().size = clip_start - reg_start;
-            Some(('S', clip_start, (reg_end - clip_start) / 4096))
+            Some((('S', clip_start, (reg_end - clip_start) / 4096), 0))
         } else {
             // Middle split: shorten left piece, insert right piece.
             self.regions.get_mut(&key).unwrap().size = clip_start - reg_start;
@@ -1225,8 +1229,15 @@ impl LazyRegionMap {
                 prot: reg_prot,
                 source: reg_source,
             });
-            Some(('M', clip_start, (clip_end - clip_start) / 4096))
+            Some((('M', clip_start, (clip_end - clip_start) / 4096), 0))
         }
+    }
+
+    /// Whether any region still reads from `inode`. Linear in the region
+    /// count, and run only after a file region is removed whole.
+    #[must_use]
+    pub fn names_inode(&self, inode: u32) -> bool {
+        self.regions.values().any(|r| r.source.pinned_inode() == inode)
     }
 
     /// Debug iterator (first 8 regions) for `lazy_region_debug`.
@@ -1440,7 +1451,15 @@ pub fn push_lazy_region(pid: Pid, start_va: usize, size: usize, page_flags: u64)
 
 pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page_flags: u64, source: LazySource) -> usize {
     let Some(proc) = lookup_process_shared(pid) else { return 0 };
-    with_irqs_disabled(|| proc.lazy_regions.lock().push(start_va, size, page_flags, source))
+    let inode = source.pinned_inode();
+    let count = with_irqs_disabled(|| proc.lazy_regions.lock().push(start_va, size, page_flags, source));
+    // The address space's pin, beside the one inside `source`. `pid` is the
+    // thread-group id, so this is the owner's address space, not a thread's
+    // view. Taken after the region lock is released: the two never nest.
+    if inode != 0 {
+        proc.with_address_space(|a| a.pin_mapped_inode(inode));
+    }
+    count
 }
 
 /// Copy every lazy-region descriptor in `parent_regions` into `child`.
@@ -1474,7 +1493,15 @@ pub fn propagate_lazy_regions_to_child(parent_regions: &[LazyRegion], child: &Pr
     }
     // Only the child's lock is taken, and the parent snapshot was produced
     // before this call — the two maps' locks never nest.
-    with_irqs_disabled(|| child.lazy_regions.lock().extend_from_slice(parent_regions))
+    let count = with_irqs_disabled(|| child.lazy_regions.lock().extend_from_slice(parent_regions));
+    // The child's address space pins what its inherited file regions name,
+    // after the region lock is released.
+    child.with_address_space(|a| {
+        for r in parent_regions {
+            a.pin_mapped_inode(r.source.pinned_inode());
+        }
+    });
+    count
 }
 
 /// Derive a CoW-forked child's `mmap_regions` from its parent's, and `munmap`'s
@@ -1643,8 +1670,18 @@ pub fn munmap_lazy_regions_in_range(pid: Pid, unmap_addr: usize, unmap_len: usiz
 
 fn munmap_lazy_region_overlapping(pid: Pid, range_start: usize, range_end: usize) -> Option<(usize, usize)> {
     let proc = lookup_process_shared(pid)?;
-    let (op, freed_start, freed_pages) =
-        with_irqs_disabled(|| proc.lazy_regions.lock().munmap_one_overlap(range_start, range_end))?;
+    // A region removed whole may have been the last to name its file. The
+    // check and the removal share one hold, so the answer is about the map
+    // the removal left.
+    let ((op, freed_start, freed_pages), orphaned) = with_irqs_disabled(|| {
+        let mut map = proc.lazy_regions.lock();
+        let (removed, inode) = map.munmap_one_overlap(range_start, range_end)?;
+        let orphaned = if inode != 0 && !map.names_inode(inode) { inode } else { 0 };
+        Some((removed, orphaned))
+    })?;
+    if orphaned != 0 {
+        proc.with_address_space(|a| a.unpin_mapped_inode(orphaned));
+    }
     log::debug!("[LR{}] pid={} munmap {:#x}+{:#x} ({} pages)",
         op, pid, freed_start, freed_pages * 4096, freed_pages);
     Some((freed_start, freed_pages))
@@ -2093,6 +2130,30 @@ mod lazy_region_propagation_tests {
         // Full unmap of everything that is left.
         while map.munmap_one_overlap(0x1000_0000, 0x1000_4000).is_some() {}
         assert_eq!(pin_count(ino), 0, "unmapping it all must release every pin");
+    }
+
+    #[test]
+    fn only_a_whole_removal_reports_the_inode_and_names_inode_sees_the_rest() {
+        // munmap releases the address space's pin when a whole removal reports
+        // an inode that `names_inode` no longer finds; a clip must report none.
+        let ino = 50_011;
+        let mut map = LazyRegionMap::new();
+        map.push(0x1000_0000, 0x4000, 0x1, file_source("/lib.so", ino));
+        map.push(0x2000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
+
+        let (_, reported) = map.munmap_one_overlap(0x1000_0000, 0x1000_1000).unwrap(); // prefix
+        assert_eq!(reported, 0);
+        let ((op, _, _), reported) = map.munmap_one_overlap(0x1000_1000, 0x1000_4000).unwrap();
+        assert_eq!((op, reported), ('F', ino));
+        assert!(map.names_inode(ino), "the second mapping still names it");
+
+        let (_, reported) = map.munmap_one_overlap(0x2000_0000, 0x2000_1000).unwrap();
+        assert_eq!(reported, ino);
+        assert!(!map.names_inode(ino));
+
+        map.push(0x3000_0000, 0x1000, 0x1, LazySource::Zero);
+        let (_, reported) = map.munmap_one_overlap(0x3000_0000, 0x3000_1000).unwrap();
+        assert_eq!(reported, 0, "an anonymous region pins nothing");
     }
 
     #[test]

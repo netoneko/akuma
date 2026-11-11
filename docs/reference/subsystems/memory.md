@@ -427,6 +427,22 @@ with IRQs masked, so there is no verdict to print.
   realloc safety.
 - **Eviction:** `try_evict_ro_page` + `reclaim_clean_file_pages` evict clean
   `AP_RO_ALL` file-backed pages under pressure (lets models > RAM run).
+- **Mapped files stay alive through the address space's pins.** A demand-paged file mapping
+  reads its inode long after `close` and `unlink`, so the owner's `UserAddressSpace` pins every
+  inode its file mappings name (`pin_mapped_inode`; the set is `akuma_user_space::MappingPins`).
+  The rules, the same on both kernels:
+  - **One pin per distinct inode**, not per mapping. The pin table is global and bounded, and a
+    saturated table stalls ext2's deferred frees.
+  - **Released when the last mapping naming the inode goes**, not when the address space drops.
+    AArch64 checks after `munmap` removes a file region whole (`LazyRegionMap::names_inode`);
+    amd64 calls `retain_mapped_inode_pins` over its surviving regions.
+  - **On the owner's address space**, never a thread's view, which drops with its thread.
+  - **Fork inherits; exec and exit drop.** A fork child pins what its inherited regions name.
+    `exec` pins the new image's file-backed segments in the new address space.
+
+  On AArch64 each `LazySource::File` also holds its own `InodePin` until mm convergence step 4
+  removes it (`proposals/AKUMA_MM_CONVERGENCE.md`). Boot test
+  `test_lazy_file_regions_pin_in_address_space`.
 
 ### The mmu map/demote surface is safe — its obligations are not optional
 

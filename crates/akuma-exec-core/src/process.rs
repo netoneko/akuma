@@ -442,6 +442,16 @@ pub enum LazySource {
 }
 
 impl LazySource {
+    /// The inode this source keeps alive, or 0 for an anonymous source (and for
+    /// a file read by path, which has no inode identity).
+    #[must_use]
+    pub const fn pinned_inode(&self) -> u32 {
+        match self {
+            Self::File { inode, .. } => *inode,
+            Self::Zero => 0,
+        }
+    }
+
     /// The only way to build a [`LazySource::File`]: takes the pin on `inode`
     /// as part of construction, so a caller cannot create an unpinned mapping.
     #[must_use]
