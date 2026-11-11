@@ -182,9 +182,9 @@ fn altstack_flag_rules() {
 const DISPOSITIONS: [Disposition; 3] = [Disposition::Ignore, Disposition::Default, Disposition::Handler];
 
 /// Every target `tkill_action` can be asked about: no process, or one of the
-/// three dispositions in or out of the caller's group.
-fn targets() -> impl Iterator<Item = Option<(Disposition, bool)>> {
-    core::iter::once(None).chain(DISPOSITIONS.into_iter().flat_map(|d| [Some((d, false)), Some((d, true))]))
+/// three dispositions.
+fn targets() -> impl Iterator<Item = Option<Disposition>> {
+    core::iter::once(None).chain(DISPOSITIONS.into_iter().map(Some))
 }
 
 #[test]
@@ -215,32 +215,34 @@ fn a_thread_with_no_process_drops_everything() {
 #[test]
 fn each_branch() {
     use Disposition::{Default, Handler, Ignore};
-    use TkillAction::{Drop, ExitOwnGroup, Pend, PendInterrupt};
+    use TkillAction::{Drop, Pend, PendInterrupt};
     const TERM: u64 = 15;
     const CHLD: u64 = 17;
     // SIGKILL: no mask, no handler, no ignore.
     for d in DISPOSITIONS {
-        assert_eq!(tkill_action(SIGKILL, Some((d, true)), u64::MAX), ExitOwnGroup);
-        assert_eq!(tkill_action(SIGKILL, Some((d, false)), u64::MAX), PendInterrupt);
+        assert_eq!(tkill_action(SIGKILL, Some(d), u64::MAX), PendInterrupt);
+        assert_eq!(tkill_action(SIGKILL, Some(d), 0), PendInterrupt);
     }
-    assert_eq!(tkill_action(TERM, Some((Ignore, true)), 0), Drop);
-    assert_eq!(tkill_action(TERM, Some((Handler, true)), 0), Pend);
-    assert_eq!(tkill_action(TERM, Some((Handler, false)), bit(TERM)), Pend);
-    assert_eq!(tkill_action(CHLD, Some((Default, true)), 0), Drop);
-    // The branch the boot suite used to cover through a kernel thread.
-    assert_eq!(tkill_action(TERM, Some((Default, false)), bit(TERM)), Pend);
-    assert_eq!(tkill_action(TERM, Some((Default, true)), bit(TERM)), Pend);
-    assert_eq!(tkill_action(TERM, Some((Default, true)), 0), ExitOwnGroup);
-    assert_eq!(tkill_action(TERM, Some((Default, false)), 0), PendInterrupt);
+    assert_eq!(tkill_action(TERM, Some(Ignore), 0), Drop);
+    assert_eq!(tkill_action(TERM, Some(Handler), 0), Pend);
+    assert_eq!(tkill_action(TERM, Some(Handler), bit(TERM)), Pend);
+    assert_eq!(tkill_action(CHLD, Some(Default), 0), Drop);
+    assert_eq!(tkill_action(TERM, Some(Default), bit(TERM)), Pend);
+    // A fatal default never acts inside `tkill`: pend and interrupt, and the
+    // target's own return to user mode runs the exit (2026-11-11).
+    assert_eq!(tkill_action(TERM, Some(Default), 0), PendInterrupt);
     // SIGUSR1 to a sibling thread with no handler kills the group, as on Linux.
-    assert_eq!(tkill_action(10, Some((Default, true)), 0), ExitOwnGroup);
+    assert_eq!(tkill_action(10, Some(Default), 0), PendInterrupt);
+    // Blocked signals are never discarded, whatever the disposition (Linux).
+    assert_eq!(tkill_action(CHLD, Some(Default), bit(CHLD)), Pend);
+    assert_eq!(tkill_action(TERM, Some(Ignore), bit(TERM)), Pend);
 }
 
 /// Exhaustive: every signal, target and blocked state, against the rules
 /// stated as properties rather than as the function's own branches.
 #[test]
 fn exhaustive_sweep_holds_the_invariants() {
-    let mut seen = [false; 4];
+    let mut seen = [false; 3];
     for sig in 1..=64 {
         for target in targets() {
             for blocked in [false, true] {
@@ -248,39 +250,29 @@ fn exhaustive_sweep_holds_the_invariants() {
                 let a = tkill_action(sig, target, mask);
                 seen[a as usize] = true;
                 let ctx = (sig, target, blocked, a);
-                let kills = matches!(a, TkillAction::ExitOwnGroup | TkillAction::PendInterrupt);
-                // Nothing reaches the caller's group unless the target is in it.
-                if a == TkillAction::ExitOwnGroup {
-                    assert!(matches!(target, Some((_, true))), "{ctx:?}");
-                }
+                let interrupts = a == TkillAction::PendInterrupt;
                 // A thread with no process is never acted on.
-                if target.is_none() {
+                let Some(d) = target else {
+                    assert_eq!(a, TkillAction::Drop, "{ctx:?}");
+                    continue;
+                };
+                if sig == SIGKILL {
+                    // SIGKILL cannot be blocked, ignored or handled.
+                    assert!(interrupts, "{ctx:?}");
+                    continue;
+                }
+                if blocked {
+                    // Blocked: never lost, never an interrupt.
+                    assert_eq!(a, TkillAction::Pend, "{ctx:?}");
+                    continue;
+                }
+                // Unblocked: only a fatal default interrupts.
+                assert_eq!(interrupts, d == Disposition::Default && fatal_by_default(sig), "{ctx:?}");
+                if d == Disposition::Ignore {
                     assert_eq!(a, TkillAction::Drop, "{ctx:?}");
                 }
-                if sig != SIGKILL {
-                    // A blocked signal never acts now, and is never lost while
-                    // something would run it (a handler, or a fatal default).
-                    if blocked {
-                        assert!(!kills, "{ctx:?}");
-                    }
-                    if let Some((d, _)) = target {
-                        // Only a fatal default kills, and only unblocked.
-                        if kills {
-                            assert!(d == Disposition::Default && fatal_by_default(sig) && !blocked, "{ctx:?}");
-                        }
-                        if d == Disposition::Ignore {
-                            assert_eq!(a, TkillAction::Drop, "{ctx:?}");
-                        }
-                        if d == Disposition::Handler {
-                            assert_eq!(a, TkillAction::Pend, "{ctx:?}");
-                        }
-                        if d == Disposition::Default && fatal_by_default(sig) && blocked {
-                            assert_eq!(a, TkillAction::Pend, "{ctx:?}");
-                        }
-                    }
-                } else if target.is_some() {
-                    // SIGKILL cannot be blocked, ignored or handled.
-                    assert!(kills, "{ctx:?}");
+                if d == Disposition::Handler {
+                    assert_eq!(a, TkillAction::Pend, "{ctx:?}");
                 }
             }
         }

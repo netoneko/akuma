@@ -14,8 +14,8 @@ repeated.
 > against it (Go, rustc, multikernel, rump) rather than fs-syscall bugs
 > themselves; the actual VFS/ext2/procfs layer underneath has been dormant
 > since March 2026. The recurring lesson: **most "missing" POSIX semantics
-> here are silent gaps, not errors** — `O_EXCL`, real hardlinks, and
-> `faccessat2`'s access-mode bits are all accepted and silently ignored
+> here are silent gaps, not errors** — real hardlinks and
+> `faccessat2`'s access-mode bits are accepted and silently ignored
 > rather than rejected or partially honored; don't assume an error-free
 > return means full POSIX behavior.
 
@@ -115,17 +115,32 @@ For a real path:
   if `mode & 0o7777 != 0`, `chmod`'d to that mode.
 - File exists and `O_TRUNC` set → truncated to zero via the same
   `write_file(path, &[])`.
-- **`O_EXCL` is not implemented at all** — there is no `open_flags::O_EXCL`
-  constant and no check for it anywhere in `fs.rs`. `O_CREAT|O_EXCL` on an
-  already-existing file silently succeeds and (if `O_TRUNC` is also set,
-  which many `O_EXCL` callers don't set) may truncate it, instead of
-  returning `EEXIST`. Anything relying on `O_EXCL` for exclusive-create
-  locking semantics will not get them here.
+- **Four flag refusals come first**, from what is at the resolved path with its last
+  component not followed (`open_refusal`, before any device or `/proc/self/fd` arm), in
+  Linux's order: `O_NOFOLLOW` on a symlink is `ELOOP` (not with `O_PATH`, which opens the
+  link); `O_CREAT|O_EXCL` on anything present is `EEXIST`; `O_CREAT` on a directory is
+  `EISDIR`; `O_DIRECTORY` on anything but a directory is `ENOTDIR`. Nothing is looked up
+  unless one of those flags is set. These are glue's for every kernel; a kernel's own
+  `openat` preamble must not restate them. The oracle is
+  `userspace/forktest/c_stress/fdrefuse.c`, whose output on Linux and on both kernels is
+  identical ([`AKUMA_MULTIARCH_ATTEMPT_0.md`](../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md),
+  "Slice 4: fd").
 - `O_CLOEXEC` is honored (`proc.set_cloexec`); `O_APPEND` is honored at
   `read`/`write` time (see below), not at open time.
 - **The fd is bound to an inode here, once** (`vfs::open_file_inode`), together
   with an `InodePin` on it, so `read`/`pread64` need no directory walk of their
   own — see `read`/`pread64` below.
+
+## `read` / `write` / `pread64` / `pwrite64` — the refusals
+
+- A `File` descriptor not opened for the call is `EBADF`: `read`/`pread64` need access
+  mode `O_RDONLY` or `O_RDWR`, `write`/`pwrite64` need `O_WRONLY` or `O_RDWR`, and an
+  `O_PATH` descriptor allows neither (`akuma_syscalls_linux::flags::open::{may_read,
+  may_write}`). `readv`/`writev` inherit it through `read`/`write`.
+- `pread64`/`pwrite64` on a descriptor with no file position (pipe, socket, terminal,
+  eventfd, pidfd, a kernel's own character device) is `ESPIPE`, never `EBADF`: musl's
+  `FILE` layer falls back to `read()` on `ESPIPE` and gives up on `EBADF`. A `BlockDev`
+  stays `EBADF`, since it has a position and the arm does not serve it.
 
 ## `read` / `pread64` — bound to an inode, not to a name
 
@@ -340,7 +355,10 @@ stay in `container.rs`, correctly gated.
   `EINVAL`; a valid-but-non-seekable fd (pipe, socket, tty, eventfd, ...) →
   `ESPIPE` — this three-way split matters because musl/Rust std probe
   seekability of stdio by calling `lseek(fd, 0, SEEK_CUR)` and branch on
-  `ESPIPE` specifically.
+  `ESPIPE` specifically. A `whence` past `SEEK_HOLE` is `EINVAL` on every open
+  descriptor (after the `EBADF` check, as on Linux), and `/dev/null`, `/dev/zero`
+  and `/dev/urandom` answer `0` whatever the offset, which is Linux's `null_lseek`
+  and `noop_llseek`.
 - **`renameat2`'s `RENAME_NOREPLACE`/`RENAME_EXCHANGE` are only partially
   real:** `RENAME_NOREPLACE` does check-then-`EEXIST` if the destination
   exists; both flags together → `EINVAL`; but there is no actual atomic

@@ -103,7 +103,8 @@ pub(super) fn sys_reattach(pid: u32, force: u32) -> u64 {
                     && let Some(ref channel) = proc.channel {
                         channel.write(TERM_RESET_SEQUENCE);
                     }
-                super::proc::sys_kill(previous_holder, 15 /* SIGTERM */);
+                // Best effort: a holder that already exited is the outcome wanted.
+                let _ = super::signal::sys_kill(u64::from(previous_holder), 15 /* SIGTERM */);
             }
             // Mirror what `screen`/`tmux` do on attach: hand the target the
             // caller's real terminal size and nudge it to repaint. Neither
@@ -129,7 +130,8 @@ pub(super) fn sys_reattach(pid: u32, force: u32) -> u64 {
             // `cat`. Goes through the same disposition-aware path `kill(2)`
             // uses, not a raw pend, so SA_RESTART and everything else already
             // hardened there applies here too.
-            super::proc::sys_kill(pid, 28);
+            // Best effort: the resize already happened; a lost SIGWINCH only skips a repaint.
+            let _ = super::signal::sys_kill(u64::from(pid), 28);
             0
         }
         // `box grab` (screen -d-style) distinguishes "already attached" —

@@ -482,6 +482,17 @@ pub fn sys_exit_group_pub(code: i32) -> ! {
 
 pub(super) fn sys_exit_group(code: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
+        // One teardown per group. A sibling already claimed it: that sibling's
+        // `kill_thread_group` is (or will be) waiting for this thread to die, so
+        // die here, the way a posted deferred kill ends a thread at its EL0
+        // boundary. Running a second teardown would make the two wait on each
+        // other for the full 2 s grace (`SharedSignalTable::claim_group_exit`).
+        if !proc.signal_actions.claim_group_exit() {
+            akuma_exec::threading::mark_thread_terminated(akuma_exec::threading::current_thread_id());
+            loop {
+                akuma_exec::threading::yield_now();
+            }
+        }
         if akuma_config::FUTEX_DBG_ENABLED {
             akuma_primitives::tprint!(96, "[exit94] tid={} pid={} tgid={}\n",
                 akuma_exec::threading::current_thread_id(), proc.pid, proc.tgid);
@@ -596,6 +607,48 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
     code as u64
 }
 
+/// `clone(CLONE_VM | CLONE_THREAD | ...)`: one more thread of the caller's group.
+///
+/// Asm-generic argument order. Every kernel's thread arm; the flags are already
+/// validated (`akuma_syscalls_proc::clone::decode`).
+///
+/// The child inherits the caller's signal mask and, without `CLONE_SETTLS`, its
+/// TLS base (both in `akuma_exec::process::clone_thread`). A thread-slot or
+/// process-table limit is `EAGAIN`, which `pthread_create` reports as such; a
+/// zero stack is `EINVAL` (Linux would run the child on the caller's stack, which
+/// is never what a caller of this arm meant); being out of memory is `ENOMEM`.
+pub fn clone_thread(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) -> u64 {
+    // **Collect before claiming.** Every thread is a `Process` row with its own
+    // ASID, and an exited thread's row is only RETIRED: its ASID and slot come
+    // back when a drain runs. The drain sites are on exit and reap paths, so a
+    // thread-churning workload (`futextest` step 6, 500 create/join rounds) retired
+    // rows faster than anything collected them: amd64 filled its process table and
+    // panicked, AArch64 ran out of ASIDs (`[asid] EXHAUSTED`) and `pthread_create`
+    // failed. The one path that consumes slots is the one that pays for collecting
+    // them. Syscall entry holds no address-space, region or lifecycle lock, only
+    // the BKL, which is the context the other drain sites run in; and a row is
+    // dropped only past its cooldown, so this never frees the caller's own.
+    akuma_exec::process::reclaim::drain_retired_if_requested();
+    match akuma_exec::process::clone_thread(stack, tls, parent_tid, child_tid, flags) {
+        Ok(tid) => {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
+                akuma_primitives::tprint!(64, "[clone] new thread TID={}\n", tid);
+            }
+            u64::from(tid)
+        }
+        Err(e) => {
+            akuma_primitives::safe_print!(128, "[syscall] clone_thread failed: {}\n", e);
+            if e.contains("stack must be non-zero") {
+                EINVAL
+            } else if e.contains("memory") || e.contains("address space") {
+                ENOMEM
+            } else {
+                EAGAIN
+            }
+        }
+    }
+}
+
 pub(super) fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) -> u64 {
     sys_clone_pidfd(flags, stack, parent_tid, tls, child_tid, 0)
 }
@@ -625,22 +678,16 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         return ENOSYS;
     }
 
+    // Linux's two `EINVAL` combinations: `CLONE_THREAD` without `CLONE_SIGHAND`,
+    // `CLONE_SIGHAND` without `CLONE_VM`. The rule is the shared decode's, which
+    // the x86 kernels already asked; this arm made a thread of the first and
+    // answered `ENOSYS` for the second (`userspace/forktest/c_stress/cloneflags.c`).
+    if akuma_syscalls_proc::clone::decode(flags, stack).is_err() {
+        return EINVAL;
+    }
+
     if flags & CLONE_THREAD != 0 && flags & CLONE_VM != 0 {
-        // POSIX: a new thread inherits the creating thread's (per-thread) signal mask.
-        let parent_mask = akuma_exec::threading::thread_signal_mask();
-        match akuma_exec::process::clone_thread(stack, tls, parent_tid, child_tid, flags) {
-            Ok(tid) => {
-                akuma_exec::threading::seed_thread_signal_mask(tid as usize, parent_mask);
-                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
-                    akuma_primitives::tprint!(64, "[clone] new thread TID={}\n", tid);
-                }
-                return u64::from(tid);
-            }
-            Err(e) => {
-                akuma_primitives::safe_print!(128, "[syscall] clone_thread failed: {}\n", e);
-                return EAGAIN;
-            }
-        }
+        return clone_thread(flags, stack, parent_tid, tls, child_tid);
     }
 
     // Route to fork_process for known fork-like flag combinations:
@@ -1974,34 +2021,6 @@ pub fn sys_close_child_stdin(pid: u32) -> u64 {
         Ok(()) => 0,
         Err(_) => ESRCH,
     }
-}
-
-pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
-    if pid == 0 { return 0; }
-    // Linux: kill(pid <= 0, ...) targets a process group; we don't support
-    // those semantics, so return EPERM for "operation not permitted".
-    if pid <= 1 { return EPERM; }
-
-    // Box, then uid (`check_signal`). Before the probe below, so `kill(pid, 0)`
-    // cannot reveal a process in a box the caller cannot see.
-    if let Err(e) = akuma_exec::process::check_signal_pid(pid) {
-        return super::signal::deny_errno(e);
-    }
-
-    // sig=0 is a "does the process exist?" probe — don't actually send anything.
-    if sig == 0 {
-        return if akuma_exec::process::lookup_process_shared(pid).is_some() { 0 } else { ESRCH };
-    }
-
-    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED || akuma_config::SYSCALL_DEBUG_NET_ENABLED {
-        akuma_primitives::tprint!(96, "[signal] kill(pid={}, sig={})\n", pid, sig);
-    }
-
-    // Per-pid delivery (thread-group interrupt+pend, SIGKILL hard-kill, and
-    // the no-live-thread fallback) lives in `akuma_exec::process::deliver_signal`
-    // now, shared with `kill_foreground_group`'s per-member broadcast (used by the
-    // kernel's Ctrl-C/SIGINT handling — see `write_to_process_stdin`).
-    if akuma_exec::process::deliver_signal(pid, sig) { 0 } else { ESRCH }
 }
 
 #[cfg(feature = "akuma-native")]

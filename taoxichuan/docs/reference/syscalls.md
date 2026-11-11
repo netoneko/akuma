@@ -105,7 +105,7 @@ Every arm `dispatch_inner` keeps after the steps above:
 | 15 | `rt_sigreturn` | `child::sigreturn_arm` | restores the frame `push_handler` saved |
 | 56, 57, 58 | `clone`, `fork`, `vfork` | `child::fork_arm` | `akuma-syscalls-proc::clone::decode`: `CLONE_THREAD` → `clone_thread`, everything else → `fork_process` ([`processes.md`](processes.md)) |
 | 59 | `execve` | `child::exec_real_task` | the boot thread has no process to replace: `ENOSYS` |
-| 62, 200, 234 | `kill`, `tkill`, `tgkill` | `akuma_syscalls_glue_amd64::kill` | the x86 kernels' shared bodies: pend, and interrupt the target only when the default action kills |
+| 62, 200, 234 | `kill`, `tkill`, `tgkill` | `akuma_syscalls_glue::signal::{sys_kill,sys_tkill,sys_tgkill}` | every kernel's shared bodies: pend, and interrupt the target only when the default action kills |
 
 ## Facts the shared layers rely on
 

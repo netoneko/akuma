@@ -1773,10 +1773,11 @@ pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(us
         // with `ETIMEDOUT`, an errno no `recv(2)` gives.
         //
         // **Unset, it is still the 10 s `ETIMEDOUT` cap — a pinned divergence:
-        // Linux blocks forever.** Kept while an unanswered `nslookup` wedges the
-        // amd64 kernel with or without it (open, 2026-11-11:
-        // `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "Slice 1: sockets"), so
-        // that lifting it is not mistaken for the cause.
+        // Linux blocks forever.** It was kept so that lifting it would not be
+        // mistaken for the cause of the amd64 "freeze" after an unanswered
+        // `nslookup`; that turned out to be QEMU livelocked by the LAPIC timer,
+        // unrelated to this wait (`docs/archive/AMD64_LAPIC_PERIODIC_SWITCH_QEMU_LIVELOCK.md`).
+        // Lifting it is now a separate, ordinary change.
         let waited = wait_until(|| {
             smoltcp_net::poll();
             smoltcp_net::udp_can_recv(handle)

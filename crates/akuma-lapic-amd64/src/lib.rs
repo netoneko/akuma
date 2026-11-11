@@ -214,6 +214,19 @@ pub fn on_tick() -> u64 {
 /// slow on a 100 MHz bus — is told at length in `amd64/src/lapic.rs`'s
 /// `start_timer`, whose body this is.)
 pub fn start_timer() {
+    // **Stop the timer before switching it to periodic.** The caller is usually
+    // `restore_periodic`, after `arm_oneshot` left a one-shot count behind — as
+    // small as 1 (`arm_deadline`'s `.max(1)`). Writing the periodic LVT first
+    // makes the timer periodic *with that count* until the next store lands: a
+    // 32 ns period. QEMU recomputes the timer on the LVT write and runs it from
+    // its main loop with the BQL held; at that period the timer list never
+    // catches up, the vCPU's next MMIO store (the count below) waits on the BQL
+    // forever, and slirp, the monitor and every other vCPU starve with it — ssh
+    // gone, guest healthy (`docs/archive/AMD64_LAPIC_PERIODIC_SWITCH_QEMU_LIVELOCK.md`).
+    // A zero initial count stops the timer, so no intermediate state has a
+    // period at all. Hardware would only have taken a burst; the order is right
+    // on both.
+    write_reg(REG_TIMER_INIT, 0);
     write_reg(REG_TIMER_DIV, TIMER_DIV_16);
     write_reg(REG_LVT_TIMER, u32::from(TIMER_VECTOR) | LVT_TIMER_PERIODIC);
     write_reg(REG_TIMER_INIT, TIMER_COUNT.load(Ordering::Relaxed));

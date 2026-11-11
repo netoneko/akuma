@@ -1195,62 +1195,20 @@ pub fn exit_current_group() {
 /// segment ends the walk and the total so far (or the error, if nothing was
 /// written) is returned, per POSIX.
 fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
-    use crate::fd::errno;
-    // A tap frame is one `writev`: splitting it per segment would send the header as its own frame.
-    if crate::fd::is_dev_tun(fd) {
-        return crate::drivers::hypervisor_tun_writev(iov, cnt as usize);
+    if let Some(r) = akuma_syscalls_glue::chardev::vectored(fd as u32, true, iov, cnt) {
+        return r;
     }
-    let cnt = (cnt as usize).min(1024);
-    let mut total: u64 = 0;
-    for i in 0..cnt {
-        let e = iov + (i as u64) * 16;
-        // One `struct iovec { void *base; size_t len }` of the user's array.
-        let Some([base, len]) = crate::uaccess::read_val::<[u64; 2]>(e) else {
-            return if total == 0 { errno::EFAULT } else { total };
-        };
-        if len == 0 {
-            continue;
-        }
-        let n = sys_write(fd, base, len);
-        if errno::is_err(n) {
-            // An errno (top of the u64 range). Return it only if nothing has
-            // gone out yet; otherwise report the partial success.
-            return if total == 0 { n } else { total };
-        }
-        total += n;
-        if n < len {
-            break;
-        }
-    }
-    total
+    // glue-amd64's loop, with this kernel's `write` per entry so the console
+    // and its devices are reached the way a plain `write` reaches them.
+    akuma_syscalls_glue_amd64::vectored(fd, iov, cnt, sys_write)
 }
 
 /// `readv(fd, iov, iovcnt)` — the mirror of [`sys_writev`].
 fn sys_readv(fd: u64, iov: u64, cnt: u64) -> u64 {
-    use crate::fd::errno;
-    if crate::fd::is_dev_tun(fd) {
-        return crate::drivers::hypervisor_tun_readv(iov, cnt as usize);
+    if let Some(r) = akuma_syscalls_glue::chardev::vectored(fd as u32, false, iov, cnt) {
+        return r;
     }
-    let cnt = (cnt as usize).min(1024);
-    let mut total: u64 = 0;
-    for i in 0..cnt {
-        let e = iov + (i as u64) * 16;
-        let Some([base, len]) = crate::uaccess::read_val::<[u64; 2]>(e) else {
-            return if total == 0 { errno::EFAULT } else { total };
-        };
-        if len == 0 {
-            continue;
-        }
-        let n = crate::fd::sys_read(fd, base, len);
-        if errno::is_err(n) {
-            return if total == 0 { n } else { total };
-        }
-        total += n;
-        if n < len {
-            break;
-        }
-    }
-    total
+    akuma_syscalls_glue_amd64::vectored(fd, iov, cnt, crate::fd::sys_read)
 }
 
 /// `sysinfo(2)` — memory totals for `busybox free` / `top`. The struct layout
@@ -1581,32 +1539,7 @@ fn owns_non_console_channel() -> bool {
 pub fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     const EFAULT: u64 = (-14i64) as u64;
 
-    // `/dev/wifi0`: command lines for the wifi driver (`drivers::Wireless`).
-    if crate::fd::is_dev_wifi(fd) {
-        return crate::drivers::wireless_dev_write(buf, len as usize);
-    }
-
-    // `/dev/net/tun`: one frame behind its virtio-net header (`drivers::Hypervisor`).
-    if crate::fd::is_dev_tun(fd) {
-        return crate::drivers::hypervisor_tun_write(buf, len as usize);
-    }
-
-    // `/dev/kvm0`: a VM spec, `stop` or `status` (`drivers::Hypervisor`). Refused whole.
-    if crate::fd::is_dev_kvm(fd) {
-        return crate::drivers::hypervisor_ctl_write(buf, len as usize);
-    }
-
-    // `/dev/input/mouse0`: control lines (`natural`, `natural=0|1`) — the
-    // scroll-direction toggle (`crate::touchpad::dev_write`).
-    if crate::fd::is_dev_mouse(fd) {
-        return crate::drivers::pointer_dev_write(buf, len as usize);
-    }
-
-    // `/dev/power`: `dim=<percent>` lines for the power daemon's lever
-    // (`crate::power`). Parsed whole before any line applies.
-    if crate::fd::is_dev_power(fd) {
-        return crate::power::dev_write(buf, len as usize);
-    }
+    // This kernel's own devices are `crate::chardev`'s, reached from glue's `sys_write`.
 
     // See the header: first, and by both spellings — **unless this process's
     // stdout belongs to a channel of its own**, which is what an `ssh` session's
@@ -1624,12 +1557,9 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     let console_write = crate::fd::console_end(fd) == Some(crate::fd::ConsoleEnd::Write)
         && !owns_non_console_channel();
     if !console_write {
-        // The `O_ACCMODE` refusal glue's `File` arm does not make — see
-        // `fd::write_mode_refusal`, which is where the finding is written down.
-        if let Some(e) = crate::fd::write_mode_refusal(fd) {
-            return e;
-        }
-        return akuma_syscalls_glue::fs::sys_write(fd, buf, len as usize);
+        // The x86 kernels' shared body: glue's arm behind the `O_RDONLY`
+        // refusal glue's `File` arm does not make.
+        return akuma_syscalls_glue_amd64::write(fd, buf, len);
     }
     // An unbound 1 or 2, or a bound `Stdout`/`Stderr`: the console, full stop.
     if len > MAX_WRITE {
@@ -2763,27 +2693,6 @@ pub static SPAWN: SpawnTable = SpawnTable::new();
 #[must_use]
 pub fn alloc_pid() -> u32 {
     akuma_exec::process::allocate_pid()
-}
-
-/// The `clone(2)` flag bits this kernel names.
-///
-/// Spelled out rather than reached through `akuma-syscalls-linux`: these are
-/// architecture-independent Linux constants, and the one that matters here —
-/// `CLONE_SETTLS` — pairs with an x86_64-specific *argument position*, so
-/// keeping the two facts in one file is worth more than the deduplication.
-pub mod clone_flags {
-    // `CLONE_VM` left 2026-11-01: the thread/spawn/fork decision is
-    // `akuma_syscalls_proc::clone::decode` now.
-    pub const CLONE_THREAD: u64 = 0x0001_0000;
-    pub const CLONE_SETTLS: u64 = 0x0008_0000;
-    // `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`
-    // are **not** here since the `clone` fold: the shared
-    // `akuma_exec::process::clone_thread` is the only reader of those three
-    // now — it decides which pointer gets the tid and which gets the zero-and-
-    // wake at exit — and a second copy of the bits beside a path that no longer
-    // consults them is how the two drift. `trace_clone_flags` still names them,
-    // from its own literal table, because a trace line has to name a bit
-    // whether or not this file acts on it.
 }
 
 /// Bytes of argv kept per process for `/proc/<pid>/cmdline`.
@@ -4510,7 +4419,7 @@ pub fn spawn_record_exit(proc_slot: usize, status: i32) {
 // `current_stdout_pipe`.** They answered "which pipe serves this task's fd
 // 0/1/2" out of the `Spawn` row, and every read, write and poll of an unbound
 // 0/1/2 called one of them. A spawned child's stdio is descriptors now, so
-// `fd::pipe_read_id`/`pipe_write_id` answer the same question from the table
+// the descriptor table answers the same question (`fd::pipe_read_id`), the one
 // the rest of the module already trusts, and an unbound 0/1/2 means exactly
 // one thing again: the console.
 //

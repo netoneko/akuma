@@ -227,10 +227,6 @@ pub mod errno {
     /// Permission denied. `mmap` on a descriptor that is not a regular file —
     /// Linux's answer for a mapping request the descriptor cannot back.
     pub const EACCES: u64 = (-13i64) as u64;
-    /// Too many symbolic links. The one errno here that is not a report of a
-    /// failure but a *refusal to follow*: `open(link, O_NOFOLLOW)`. Named for
-    /// the loop it usually means, and used by Linux for the flag as well.
-    pub const ELOOP: u64 = (-40i64) as u64;
 
     /// Does a syscall return value carry an errno? Linux errnos are `1..=4095`,
     /// returned as `(-errno) as u64` — the very top of the range. Anything below
@@ -513,77 +509,6 @@ fn dev_node_of(fd: u64) -> Option<&'static str> {
     .flatten()
 }
 
-/// `open("/dev/fb0")`: take the screen for the calling thread group and hand
-/// back a `DevFb` descriptor. See `crate::fbdev`.
-fn open_framebuffer(flags: u32) -> u64 {
-    if crate::fbdev::geometry().is_none() {
-        return errno::ENOENT;
-    }
-    let Some(proc) = akuma_exec::process::current_process_shared() else {
-        return errno::ESRCH;
-    };
-    if let Err(e) = crate::fbdev::open(proc.tgid) {
-        return e;
-    }
-    let fd = proc.alloc_fd(FileDescriptor::DevFb);
-    if flags & open_flags::O_CLOEXEC != 0 {
-        proc.set_cloexec(fd);
-    }
-    u64::from(fd)
-}
-
-/// `open("/dev/wifi0")`: a `DevWifi` descriptor, when a wifi backend exists.
-/// See `drivers::Wireless`.
-fn open_wifi(flags: u32) -> u64 {
-    if !crate::drivers::wireless_present() {
-        return errno::ENOENT;
-    }
-    let Some(proc) = akuma_exec::process::current_process_shared() else {
-        return errno::ESRCH;
-    };
-    let fd = proc.alloc_fd(FileDescriptor::DevWifi);
-    if flags & open_flags::O_CLOEXEC != 0 {
-        proc.set_cloexec(fd);
-    }
-    u64::from(fd)
-}
-
-/// `open("/dev/power")`: a `DevPower` descriptor. Always there — the kernel
-/// facts (`idle_ms=`, `dim=`) exist on a machine with no battery and no
-/// framebuffer, and refusing the open would make the daemon's probe look like
-/// a kernel too old to answer.
-fn open_power(flags: u32) -> u64 {
-    let Some(proc) = akuma_exec::process::current_process_shared() else {
-        return errno::ESRCH;
-    };
-    let fd = proc.alloc_fd(FileDescriptor::DevPower);
-    if flags & open_flags::O_CLOEXEC != 0 {
-        proc.set_cloexec(fd);
-    }
-    u64::from(fd)
-}
-
-/// `open("/dev/kvm0")`: a `DevKvm` descriptor, when the hypervisor is armed (`kvmctl`).
-fn open_kvm(flags: u32) -> u64 {
-    if !crate::drivers::hypervisor_armed() {
-        return errno::ENOENT;
-    }
-    let Some(proc) = akuma_exec::process::current_process_shared() else {
-        return errno::ESRCH;
-    };
-    let fd = proc.alloc_fd(FileDescriptor::DevKvm(0));
-    if flags & open_flags::O_CLOEXEC != 0 {
-        proc.set_cloexec(fd);
-    }
-    u64::from(fd)
-}
-
-/// Is `fd` a `/dev/kvm0` descriptor?
-#[must_use]
-pub fn is_dev_kvm(fd: u64) -> bool {
-    table_with(fd, |d| matches!(d, FileDescriptor::DevKvm(0))).unwrap_or(false)
-}
-
 /// The eventfd id behind descriptor `fd` of the calling process, if it is an eventfd.
 #[must_use]
 pub fn eventfd_id_of(fd: u64) -> Option<u32> {
@@ -604,59 +529,10 @@ pub fn dev_kvm_api_id(fd: u64) -> Option<u32> {
     .flatten()
 }
 
-/// Is `fd` a `/dev/net/tun` descriptor?
-#[must_use]
-pub fn is_dev_tun(fd: u64) -> bool {
-    table_with(fd, |d| matches!(d, FileDescriptor::DevTun)).unwrap_or(false)
-}
-
-/// Is `fd` a `/dev/wifi0` descriptor?
-#[must_use]
-pub fn is_dev_wifi(fd: u64) -> bool {
-    table_with(fd, |d| matches!(d, FileDescriptor::DevWifi)).unwrap_or(false)
-}
-
-/// `open("/dev/input/mouse0")`: a `DevMouse` descriptor, only when the
-/// touchpad came up — a machine without one has no node (`ENOENT`).
-fn open_mouse(flags: u32) -> u64 {
-    if !crate::drivers::pointer_present() {
-        return errno::ENOENT;
-    }
-    let Some(proc) = akuma_exec::process::current_process_shared() else {
-        return errno::ESRCH;
-    };
-    let fd = proc.alloc_fd(FileDescriptor::DevMouse);
-    if flags & open_flags::O_CLOEXEC != 0 {
-        proc.set_cloexec(fd);
-    }
-    u64::from(fd)
-}
-
-/// Is `fd` a `/dev/input/mouse0` descriptor?
-#[must_use]
-pub fn is_dev_mouse(fd: u64) -> bool {
-    table_with(fd, |d| matches!(d, FileDescriptor::DevMouse)).unwrap_or(false)
-}
-
-/// Is `fd` a `/dev/power` descriptor?
-#[must_use]
-pub fn is_dev_power(fd: u64) -> bool {
-    table_with(fd, |d| matches!(d, FileDescriptor::DevPower)).unwrap_or(false)
-}
-
 /// Is `fd` a `/dev/fb0` descriptor?
 #[must_use]
 pub fn is_dev_fb(fd: u64) -> bool {
     table_with(fd, |d| matches!(d, FileDescriptor::DevFb)).unwrap_or(false)
-}
-
-/// The pipe id behind `fd` if it is a `PipeWrite` descriptor.
-#[must_use]
-pub fn pipe_write_id(fd: u64) -> Option<usize> {
-    table_get(fd).and_then(|d| match d {
-        FileDescriptor::PipeWrite(p) => Some(p as usize),
-        _ => None,
-    })
 }
 
 /// Is `fd` marked `O_NONBLOCK`? `false` for anything not in the table.
@@ -687,14 +563,7 @@ pub fn is_nonblocking(fd: u64) -> bool {
 // Its result is informational; callers that cannot act on it ignore it.
 #[allow(clippy::must_use_candidate)]
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
-    // `F_ADD_SEALS` / `F_GET_SEALS` (memfd): accepted and not enforced — Firecracker seals the
-    // ring buffer it maps twice and only checks that the call succeeded. No seal is ever reported.
-    const F_ADD_SEALS: u64 = 1033;
-    const F_GET_SEALS: u64 = 1034;
-    if cmd == F_ADD_SEALS || cmd == F_GET_SEALS {
-        return if table_with(fd, |_| ()).is_some() { 0 } else { errno::EBADF };
-    }
-    akuma_syscalls_glue::fs::sys_fcntl(fd as u32, cmd as u32, arg)
+    akuma_syscalls_glue_amd64::fcntl(fd, cmd, arg)
 }
 
 /// Copy `len` bytes in from a user pointer.
@@ -744,16 +613,6 @@ pub fn trace_user_cstr(ptr: u64) {
     }
 }
 
-/// Read a NUL-terminated path from user memory.
-///
-/// Bounded at 256 bytes, which is `PATH_MAX` for every path this kernel can
-/// resolve; a longer one is a rejection rather than a truncation, because a
-/// truncated path names a *different file* and opening it silently would be
-/// worse than failing.
-fn path_from_user(ptr: u64) -> Option<alloc::string::String> {
-    alloc::string::String::from_utf8(crate::uaccess::read_cstr(ptr, 256)?).ok()
-}
-
 // `resolve_at` — the local `*at` dirfd ladder — left with the arms that used
 // it (`openat` in batch 2d, `newfstatat` in 3b, `utimensat`/`access` in 3c).
 // `akuma_syscalls_glue::fs::resolve_path_at` is the one ladder now, and it
@@ -795,15 +654,9 @@ fn path_from_user(ptr: u64) -> Option<alloc::string::String> {
 /// symlink through glue like everything else under `/proc`, and an `ssh`
 /// session's `^C` becomes a `SIGINT` instead of a `0x03` byte.
 ///
-/// **3. The refusals glue does not make.** `O_DIRECTORY`, `O_EXCL`,
-/// `O_NOFOLLOW` and `O_CREAT`-on-a-directory are all enforced here and by
-/// nothing in `akuma-syscalls-glue`, so folding them away would have deleted
-/// four working checks — three of which this target grew *because* a real
-/// program tripped over their absence. They are stated as a preamble rather
-/// than pushed into glue because that arm is the AArch64 kernel's too, and
-/// adding a refusal there is a behaviour change on a kernel this pass has no
-/// loop to verify against. `docs/archive/AKUMA_AMD64_4B_FOLD_BATCH2D.md` § "The
-/// three flags" records what moving them would cost and buy.
+/// **3. The flag refusals** (`O_DIRECTORY`, `O_EXCL`, `O_NOFOLLOW`, `O_CREAT`
+/// on a directory) are glue's `openat_path`'s, for both kernels, since
+/// 2026-11-11 (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "Slice 4: fd").
 ///
 /// **4. A block node is `ENODEV`, not a raw descriptor.** Glue serves
 /// `/dev/vdX` as a `BlockDev` descriptor (`docs/archive/RAW_BLOCK_DEVICE_FD.md`);
@@ -818,7 +671,7 @@ fn path_from_user(ptr: u64) -> Option<alloc::string::String> {
 /// exist — zero keys loaded, and every fetched index reported `UNTRUSTED
 /// signature` no matter how correct the fetch and the keys were. It is
 /// `akuma_syscalls_glue::fs::resolve_path_at` that answers it now, for both
-/// kernels, and [`resolve_at`] — this module's own ladder, still used by the
+/// kernels, and `resolve_at` — this module's own ladder, once used by the
 /// arms that have not folded — is no longer in the `open` path at all. Two
 /// differences come with that swap and both are gains: a bogus negative
 /// `dirfd` is `EBADF` rather than `ENOTDIR`, and `AT_FDCWD` resolves against
@@ -828,8 +681,7 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
     let flags = akuma_syscalls_abi::open_flags::x86_64_to_aarch64(flags_ as u32);
 
     // 1024, matching glue's own `copy_from_user_str` bound, so the preamble
-    // cannot refuse a path the arm behind it would have accepted. It was 256
-    // ([`path_from_user`]), which is what every unfolded arm still uses.
+    // cannot refuse a path the arm behind it would have accepted.
     let Some(raw) = crate::uaccess::read_cstr(path, 1024)
         .and_then(|b| alloc::string::String::from_utf8(b).ok())
     else {
@@ -845,39 +697,8 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
         return errno::EBADF;
     };
 
-    // `/dev/fb0` is this kernel's own device, not glue's: the screen's owner
-    // is decided here (`fbdev::open`, `EBUSY` for a second process) and the
-    // descriptor is a `DevFb`, which `mmap`, `ioctl`, `fstat` and `close`
-    // recognise. A machine with no boot framebuffer has no node at all.
-    if resolved == "/dev/fb0" {
-        return open_framebuffer(flags);
-    }
-    // `/dev/wifi0`, likewise this kernel's own: the wireless driver serves it (`drivers::Wireless`).
-    if resolved == "/dev/wifi0" {
-        return open_wifi(flags);
-    }
-
-    // `/dev/power`: the power daemon's control device (`crate::power`), on
-    // every machine — a box with no EC and no screen still has idle facts.
-    if resolved == "/dev/power" {
-        return open_power(flags);
-    }
-    // `/dev/kvm0`: the hypervisor's control device (`drivers::Hypervisor`), when armed.
-    if resolved == "/dev/kvm0" {
-        return open_kvm(flags);
-    }
-    // `/dev/kvm`: the census stub (`drivers::Hypervisor`), only with the `kvmapi` boot flag.
-    if resolved == "/dev/kvm" && crate::drivers::hypervisor_api_enabled() {
-        return crate::drivers::hypervisor_api_open(flags);
-    }
-    // `/dev/net/tun`: the tap for a userspace VMM's NIC, behind the hypervisor's gateway.
-    if resolved == "/dev/net/tun" && crate::drivers::hypervisor_present() {
-        return crate::drivers::hypervisor_tun_open(flags);
-    }
-    // `/dev/input/mouse0`: the touchpad's pointer stream (`crate::touchpad`).
-    if resolved == "/dev/input/mouse0" {
-        return open_mouse(flags);
-    }
+    // This kernel's own devices (fb, wifi, power, kvm, tun, mouse) are
+    // `crate::chardev`'s, reached from glue's `openat_path`.
 
     // A **block** node is refused rather than served — see the header. A
     // table lookup, no I/O, so it is asked unconditionally.
@@ -887,86 +708,19 @@ pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
         return errno::ENODEV;
     }
 
-    // `O_NOFOLLOW`: Linux's `ELOOP` on a final component that is a symlink.
-    //
-    // This used to be spelled as *skipping* the symlink walk, which is the
-    // weaker half of the flag and answered `ENOENT` — the walk skipped, the
-    // existence probe then run against the link inode, which ext2 reports as
-    // `NotAFile`. Glue resolves unconditionally, so the choice here was between
-    // Linux's answer and silently following a link a caller asked not to
-    // follow. `is_symlink` is the exact predicate: `resolve_symlinks` reads the
-    // link off the *whole* path and never walks intermediate components, so
-    // "the path glue would rewrite" and "the final component is a link" are the
-    // same question in this tree.
-    if flags & open_flags::O_NOFOLLOW != 0 && akuma_vfs_glue::is_symlink(&resolved) {
-        return errno::ELOOP;
-    }
-
-    // The three that need to know what is already there. One `metadata` for all
-    // of them, taken only when a flag that reads it is set — an `open` with
-    // none of them pays nothing.
-    let creating = flags & open_flags::O_CREAT != 0;
-    let wants_dir = flags & open_flags::O_DIRECTORY != 0;
-    let excl = creating && flags & open_flags::O_EXCL != 0;
-    if creating || wants_dir {
-        let md = fs::metadata(&resolved);
-        let is_dir = md.as_ref().is_ok_and(|m| m.is_dir);
-        let present = md.is_ok();
-        // `O_CREAT` on a path that is already a directory must fail, not
-        // silently start writing a same-named file. Glue refuses a *write*
-        // open of a directory (`may_open`'s answer) and this is the other
-        // half: `open("/etc", O_CREAT)` with no access mode gets past that one.
-        if creating && is_dir {
-            return errno::EISDIR;
-        }
-        // `O_DIRECTORY` on something that is not one. **Below the existence
-        // question, not above it**, and the first draft of this check had it
-        // above: `open("/no/such/path", O_DIRECTORY)` must be `ENOENT`, because
-        // "there is no such file" outranks "and it would not have been a
-        // directory". Placed early it answered `ENOTDIR` for every missing path
-        // that carried the flag — which is the sort of thing that sends a
-        // caller looking for a directory it never asked about. Glue answers the
-        // `ENOENT`; this arm only refuses what is there.
-        //
-        // The flag was **never read at all** before the word was re-encoded at
-        // the top: the bit ring 3 sets is `0o200000`, which in the encoding
-        // every shared crate here uses is `O_DIRECT`, so
-        // `open("/bin/busybox", O_RDONLY|O_DIRECTORY)` handed back a working
-        // descriptor on a regular file.
-        if wants_dir && present && !is_dir {
-            return errno::ENOTDIR;
-        }
-        // `O_CREAT | O_EXCL` on a path that already exists is `EEXIST`, which
-        // is the *whole* contract of `O_EXCL`: it is how a caller claims a lock
-        // file or an atomic temp name, and succeeding anyway tells two of them
-        // they both won.
-        if excl && present {
-            return errno::EEXIST;
-        }
-    }
-
     // **The row's descriptor ceiling.** Glue's `alloc_fd` has none — a
     // `BTreeMap` grows — and here that is not merely a policy difference:
     // [`MAX_FDS`] is also this module's *lookup* bound ([`table_get_in`],
     // [`is_bound`] and [`is_nonblocking`] all refuse a number at or above it),
     // so a descriptor glue handed out past the ceiling would be a successful
-    // `open` that every later syscall answers `EBADF` for. Asked here, one
-    // lock, where [`install`] asks it for every descriptor this module still
-    // allocates itself.
+    // `open` that every later syscall answers `EBADF` for.
     if cur_table().table.lock().len() >= MAX_FDS {
         return errno::EMFILE;
     }
 
-    // `mode` reaches the filesystem for the first time here: this arm ignored
-    // it (`_mode`) and every file this target created came out with whatever
-    // `write_file` picked. Glue `chmod`s a created file to `mode & 0o7777`,
-    // which is what makes a `tcc`-built binary executable without a `chmod +x`.
-    akuma_syscalls_glue::flat(akuma_syscalls_glue::fs::openat_path(
-        dirfd as i32,
-        &resolved,
-        flags,
-        mode as u32,
-    ))
+    // Glue's arm, refusals and this kernel's devices included. The path is
+    // absolute, so glue does not resolve it a second time.
+    akuma_syscalls_glue::flat(akuma_syscalls_glue::fs::openat_path(dirfd as i32, &resolved, flags, mode as u32))
 }
 
 /// The `open(2)` flag bits, **asm-generic encoding** — the tree's own table,
@@ -1019,10 +773,7 @@ pub fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     if newfd >= MAX_FDS as u64 {
         return errno::EBADF;
     }
-    if oldfd == newfd {
-        return if table_get(oldfd).is_some() { newfd } else { errno::EBADF };
-    }
-    akuma_syscalls_glue::fs::sys_dup3(oldfd as u32, newfd as u32, 0)
+    akuma_syscalls_glue_amd64::dup2(oldfd, newfd)
 }
 
 /// `dup3(oldfd, newfd, flags)` — x86_64 292. **Glue's arm** (4b batch 3c)
@@ -1155,105 +906,25 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    // `/dev/wifi0`: this descriptor's snapshot of the driver state.
-    if is_dev_wifi(fd) {
-        let Some(proc) = akuma_exec::process::current_process_shared() else {
-            return errno::ESRCH;
-        };
-        return crate::drivers::wireless_dev_read(proc.tgid, fd as u32, buf, len.min(MAX_IO) as usize);
-    }
-    // `/dev/net/tun`: one frame behind its virtio-net header, or `EAGAIN`.
-    if is_dev_tun(fd) {
-        return crate::drivers::hypervisor_tun_read(buf, len.min(MAX_IO) as usize);
-    }
-    // `/dev/input/mouse0`: whole 8-byte pointer records, or `EAGAIN`.
-    if is_dev_mouse(fd) {
-        return crate::drivers::pointer_dev_read(buf, len.min(MAX_IO) as usize);
-    }
-    // `/dev/kvm0`: the guest's console stream, `EAGAIN` while it is quiet, 0 once it ended.
-    if is_dev_kvm(fd) {
-        return crate::drivers::hypervisor_ctl_read(buf, len.min(MAX_IO) as usize);
-    }
-    // `/dev/power`: the kernel's idle/dim facts, fresh per read.
-    if is_dev_power(fd) {
-        return crate::power::dev_read(buf, len.min(MAX_IO) as usize);
-    }
-    if len > MAX_IO && is_regular_file(fd) {
-        return read_file_full(len, |done, chunk| {
-            akuma_syscalls_glue::fs::sys_read(fd, buf + done, chunk)
-        });
-    }
-    akuma_syscalls_glue::fs::sys_read(fd, buf, len.min(MAX_IO) as usize)
+    akuma_syscalls_glue_amd64::read(fd, buf, len)
 }
 
-/// Linux's ceiling on one `read`/`write` (`MAX_RW_COUNT`, `INT_MAX` rounded
-/// down to a page): a larger request is served as this many bytes.
-const MAX_RW_COUNT: u64 = 0x7fff_f000;
-
-/// Serve a regular-file `read`/`pread` of `len > MAX_IO` bytes the way Linux
-/// does: **all of it**, unless the file ends or an error intervenes.
-///
-/// # Why (2026-10-08)
-///
-/// Every file read on this target was clamped to [`MAX_IO`] (64 KiB) — here,
-/// and again inside glue's `File` arms. A short read is legal POSIX, but Linux
-/// never gives one on a regular file before EOF, and programs lean on that: a
-/// single `pread(fd, buf, size, 0)` of Chromium's 776 865-byte V8 snapshot
-/// returned 65 536 here and the whole file on Linux (`snapprobe`, beside
-/// `chromeprobe.c`). Anything that reads a file in one call and checks the count
-/// saw a truncated file.
-///
-/// # How
-///
-/// `chunk(done, n)` performs one glue read of `n <= MAX_IO` bytes into the user
-/// buffer at offset `done` (and, for `pread`, at file offset `offset + done`).
-/// The loop stops at a short chunk (EOF), on an error, or when `len` is met. An
-/// error after some bytes arrived returns the bytes, as Linux does; an error on
-/// the first chunk is the errno. Each chunk keeps glue's 64 KiB kernel buffer,
-/// so the kernel's allocation per call is unchanged; only the number of calls
-/// grows with the request.
-///
-/// Not atomic against another thread reading the same description: Linux holds
-/// `f_pos_lock` across the whole read, and this takes the cursor one chunk at a
-/// time, so two concurrent `read`s of one fd can interleave chunks. Nothing on
-/// the path that motivated this shares a description between readers.
-fn read_file_full(len: u64, mut chunk: impl FnMut(u64, usize) -> u64) -> u64 {
-    let len = len.min(MAX_RW_COUNT);
-    let mut done = 0u64;
-    while done < len {
-        let want = (len - done).min(MAX_IO);
-        let n = chunk(done, want as usize);
-        if n.cast_signed() < 0 {
-            return if done > 0 { done } else { n };
-        }
-        done += n;
-        if n < want {
-            break;
-        }
-    }
-    done
-}
-
-/// `pread64(fd, buf, count, offset)` — x86_64 syscall 17. **Glue's arm** (4b
-/// batch 3a) behind the errno this target refuses to give up.
+/// `pread64(fd, buf, count, offset)` — x86_64 syscall 17. **Glue's arm**,
+/// behind this kernel's unbound console descriptors.
 ///
 /// A read from an explicit offset that **does not move the descriptor's
 /// cursor**. That is the whole difference from [`sys_read`], and it is why the
 /// two are separate arms in glue as well.
 ///
-/// # `ESPIPE` is the preamble
+/// # `ESPIPE`
 ///
 /// A pipe, socket or console descriptor has no offset to read from, and Linux
 /// says `ESPIPE` for that — a *seekability* answer, distinct from "no such
-/// descriptor". Glue's arm answers `_ => EBADF` for all three, and the
-/// difference is not cosmetic: **musl's `FILE` layer falls back to `read()` on
-/// `ESPIPE` and gives up on `EBADF`**, so the wrong one turns a working
-/// unseekable stream into a closed file. Moving this into glue is a behaviour
-/// change on the AArch64 kernel, whose verification loop does not run on this
-/// machine, so it stays here and is stated rather than assumed absent.
-///
-/// Asked ahead of the table lookup, so the answer is about the *kind* of
-/// descriptor rather than about whether a file happens to sit behind it.
+/// descriptor": **musl's `FILE` layer falls back to `read()` on `ESPIPE` and
+/// gives up on `EBADF`**. Glue answers it for every descriptor without a
+/// position (`userspace/forktest/c_stress/fdrefuse.c`). The one case left here
+/// is a console end that is not in the table at all, which glue would call
+/// `EBADF`.
 ///
 /// # Why this exists at all
 ///
@@ -1273,36 +944,11 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    // See the header. A `/dev` character node **is** seekable — `pread` on
-    // `/dev/zero` is ordinary — so the nodes are deliberately not in this
-    // guard; glue serves all three, and the offset changes nothing for any of
-    // them.
-    if socket_index(fd).is_some()
-        || pipe_read_id(fd).is_some()
-        || pipe_write_id(fd).is_some()
-        || console_end(fd).is_some()
-    {
+    // See the header: an unbound console end, which glue cannot see.
+    if console_end(fd).is_some() && !is_bound(fd) {
         return errno::ESPIPE;
     }
-    if len > MAX_IO && is_regular_file(fd) {
-        // A negative offset stays glue's `EINVAL` on the first chunk.
-        return read_file_full(len, |done, chunk| {
-            akuma_syscalls_glue::fs::sys_pread64(
-                fd as u32,
-                buf + done,
-                chunk,
-                offset.cast_signed().wrapping_add(done.cast_signed()),
-            )
-        });
-    }
-    akuma_syscalls_glue::fs::sys_pread64(
-        fd as u32,
-        buf,
-        // Clamped for [`sys_read`]'s reason: glue's `/dev/zero` and
-        // `/dev/urandom` arms allocate whatever ring 3 asked for.
-        len.min(MAX_IO) as usize,
-        offset.cast_signed(),
-    )
+    akuma_syscalls_glue_amd64::pread64(fd, buf, len, offset)
 }
 
 /// Copy `dst.len()` bytes of `fd`'s cached contents starting at byte `offset`
@@ -1461,35 +1107,9 @@ pub fn is_regular_file(fd: u64) -> bool {
     .is_some_and(|p| !path_is_dir(&p))
 }
 
-/// Is a `write(2)` on `fd` refused by the descriptor's **access mode**?
-///
 /// `Some(EBADF)` when `fd` names a regular file opened `O_RDONLY`, `None`
-/// otherwise — including for every descriptor kind that is not a file, which
-/// glue answers for itself.
-///
-/// # This is a gap in the shared arm, not a divergence this target wanted
-///
-/// `akuma_syscalls_glue::fs::sys_write`'s `File` arm does not look at
-/// `KernelFile::flags` at all, so on the AArch64 kernel a descriptor obtained
-/// with `open(path, O_RDONLY)` is a **write capability**: the bytes reach the
-/// filesystem and `write(2)` reports success. `O_ACCMODE` is checked at
-/// `open(2)` for whether the *file* may be written (`may_open`) and then never
-/// again for whether this *description* may.
-///
-/// This target has always refused it (the arm this replaces opened with the
-/// test), and 4b batch 3a's fold would have imported the gap silently — which
-/// is the one thing the fold rules forbid. So the refusal is asked here, ahead
-/// of the delegation.
-///
-/// **It is not moved into glue** for the reason batch 2d gives for `openat`'s
-/// three flags: it is a behaviour change on the other kernel and the AArch64
-/// verification loop does not run on this machine. Recorded as an open issue in
-/// `docs/archive/AKUMA_AMD64_4B_FOLD_BATCH3.md` rather than fixed blind — a
-/// program that has been writing through a read-only descriptor would start
-/// getting `EBADF`, and that program deserves a boot behind the change.
-///
-/// `O_ACCMODE == 0` is `O_RDONLY`; the word is asm-generic by the time it is
-/// stored (`sys_openat` re-encodes it), so [`open_flags`] is the right table.
+/// otherwise. `write(2)` gets this refusal from glue's `sys_write`;
+/// `mm::sys_mmap` asks it to refuse a shared-writable mapping of such an fd.
 #[must_use]
 pub fn write_mode_refusal(fd: u64) -> Option<u64> {
     table_with(fd, |d| match d {
@@ -1504,18 +1124,14 @@ pub fn write_mode_refusal(fd: u64) -> Option<u64> {
 ///
 /// A forward, not a second implementation, and the same shape as
 /// [`sys_close`]: the dispatcher's `write` arm is `usermode::sys_write`, which
-/// keeps the serial console and hands everything else here. The
-/// [`write_mode_refusal`] is asked on this path too, so a kernel-side check
-/// gets the answer ring 3 gets.
+/// keeps the serial console and hands everything else here. The `O_RDONLY`
+/// refusal is glue's, so a kernel-side check gets the answer ring 3 gets.
 ///
 /// Named `_file` because that is what its callers write to; it will serve a
 /// pipe, a socket or a `/dev` node just as well, since glue's arm dispatches on
 /// the descriptor and not on the name of this function.
 pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
-    if let Some(e) = write_mode_refusal(fd) {
-        return e;
-    }
-    akuma_syscalls_glue::fs::sys_write(fd, buf, len as usize)
+    akuma_syscalls_glue_amd64::write(fd, buf, len)
 }
 
 /// Akuma's own `poll_input_event(buf, len, timeout_us)` — a **raw** keystroke.
@@ -1632,23 +1248,13 @@ fn console_has_input() -> bool {
 }
 
 
-/// `lseek(fd, offset, whence)` — **served by `akuma-syscalls-glue`** (4b batch
-/// 3a), behind one arm this kernel keeps.
+/// `lseek(fd, offset, whence)` — **served by `akuma-syscalls-glue`**, with the
+/// register decode this target needs.
 ///
-/// # The one arm that stays
-///
-/// A `/dev` character node. Linux seeks one to exactly the offset asked for —
-/// `/dev/null` and `/dev/zero` are contentless and infinite, so no position is
-/// out of range and none of them means anything — and glue answers `0` for
-/// `DevNull`/`DevZero` and `ESPIPE` for `DevUrandom`/`DevTty`, which has no
-/// arm at all. Handing this over would trade a Linux answer for a matching
-/// one; fixing it in glue is a behaviour change on the AArch64 kernel, whose
-/// verification loop does not run on this machine (batch 2d records the same
-/// call for `openat`'s three flags). So it is a stated divergence, asked with
-/// one table lookup, ahead of the delegation.
-///
-/// The cursor stays at 0 for all three whences because nothing moves it: the
-/// read and write arms never touch a node's `position`.
+/// This kernel kept one arm of its own until 2026-11-11: a `/dev` character
+/// node, seeked to the offset asked for. Linux answers `0` for `/dev/null`,
+/// `/dev/zero` and `/dev/urandom` whatever the offset
+/// (`userspace/forktest/c_stress/fdrefuse.c`), which is glue's answer now.
 ///
 /// # What the fold gained
 ///
@@ -1664,27 +1270,6 @@ fn console_has_input() -> bool {
 ///   `EBADF` — glue separates the two, where this arm's console guard could
 ///   not.
 pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
-    // See the header. Ahead of the delegation, and one table lookup with no I/O
-    // behind it.
-    //
-    // **`/dev/tty` is excluded**, and it is the reason this test is no longer
-    // `is_some()`. A terminal is not seekable and Linux answers `ESPIPE` for
-    // one; glue's arm already does exactly that (its `_ =>` after the
-    // `DevNull`/`DevZero` and `File`/`BlockDev` arms). Before the console
-    // channel landed the exclusion was unnecessary because a `DevTty`
-    // descriptor could not exist here — glue's `openat` refused `/dev/tty` with
-    // `ENODEV` for want of a terminal channel. It can exist now, and without
-    // this it would seek to whatever offset it was handed.
-    if dev_node_of(fd).is_some_and(|n| n != "tty") {
-        const SEEK_SET: u64 = 0;
-        const SEEK_CUR: u64 = 1;
-        const SEEK_END: u64 = 2;
-        if !matches!(whence, SEEK_SET | SEEK_CUR | SEEK_END) {
-            return errno::EINVAL;
-        }
-        let delta = offset.cast_signed();
-        return if delta < 0 { errno::EINVAL } else { delta as u64 };
-    }
     akuma_syscalls_glue::fs::sys_lseek(
         // Truncating rather than refusing a number past `u32`: glue's own
         // dispatch spells `args[0] as u32`, so a folded arm must decode the
@@ -1764,73 +1349,7 @@ const STAT_SIZE: usize = core::mem::size_of::<akuma_syscalls_abi::stat::X8664>()
 /// failed on standard output: Bad file descriptor` after writing the whole
 /// pack.
 pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
-    // `/dev/fb0`: a character device, major 29 minor 0, size 0 — what Linux
-    // reports for an fbdev node (the size is `FBIOGET_FSCREENINFO`'s business).
-    // `/dev/wifi0`: a misc character device (10, 242), root-only.
-    if is_dev_wifi(fd) {
-        let g = akuma_syscalls_linux::Stat {
-            st_ino: 19,
-            st_mode: 0o020_600,
-            st_nlink: 1,
-            st_rdev: (10 << 8) | 0xF2,
-            st_blksize: 4096,
-            ..Default::default()
-        };
-        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
-        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
-    }
-    // `/dev/input/mouse0`: Linux's mousedev (13, 32), readable by all.
-    if is_dev_mouse(fd) {
-        let g = akuma_syscalls_linux::Stat {
-            st_ino: 21,
-            st_mode: 0o020_644,
-            st_nlink: 1,
-            st_rdev: (13 << 8) | 32,
-            st_blksize: 4096,
-            ..Default::default()
-        };
-        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
-        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
-    }
-    // `/dev/kvm0`: a misc character device (10, 244), root-only — the next free minor.
-    if is_dev_kvm(fd) {
-        let g = akuma_syscalls_linux::Stat {
-            st_ino: 22,
-            st_mode: 0o020_600,
-            st_nlink: 1,
-            st_rdev: (10 << 8) | 0xF4,
-            st_blksize: 4096,
-            ..Default::default()
-        };
-        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
-        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
-    }
-    // `/dev/power`: a misc character device (10, 243), root-only — the next
-    // free misc minor beside wifi0's.
-    if is_dev_power(fd) {
-        let g = akuma_syscalls_linux::Stat {
-            st_ino: 20,
-            st_mode: 0o020_600,
-            st_nlink: 1,
-            st_rdev: (10 << 8) | 0xF3,
-            st_blksize: 4096,
-            ..Default::default()
-        };
-        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
-        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
-    }
-    if is_dev_fb(fd) {
-        let g = akuma_syscalls_linux::Stat {
-            st_ino: 17,
-            st_mode: 0o020_660,
-            st_nlink: 1,
-            st_rdev: (29 << 8),
-            st_blksize: 4096,
-            ..Default::default()
-        };
-        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
-        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
-    }
+    // This kernel's own devices are `crate::chardev`'s, reached from glue's `fstat_fill`.
     if crate::usermode::current_process().is_none() && console_end(fd).is_some() && !is_bound(fd) {
         // `S_IFCHR | 0620`, size 0 — the answer the old `encode_stat` gave, in
         // the x86_64 layout the converter also produces.
@@ -1843,13 +1362,7 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         let x = akuma_syscalls_abi::stat::to_x86_64(&g);
         return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
     }
-    match akuma_syscalls_glue::fs::fstat_fill(fd as u32) {
-        Ok(g) => {
-            let x = akuma_syscalls_abi::stat::to_x86_64(&g);
-            if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT }
-        }
-        Err(e) => e,
-    }
+    akuma_syscalls_glue_amd64::fstat(fd, statbuf)
 }
 
 /// `statfs(path, buf)` — x86_64 137, **glue's arm** (4b batch 3b).
@@ -1881,23 +1394,14 @@ pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
 /// — `Process::cwd`-relative; `/` until a `chdir` moves it (served since
 /// 2026-09-12).
 pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
+    // `AT_EMPTY_PATH` with an empty path is `fstat(dirfd)`, which on this
+    // kernel may be one of its own devices: asked here, by one byte, before
+    // glue-amd64 (whose own `fstat` knows only glue's descriptors).
     const AT_EMPTY_PATH: u64 = 0x1000;
-    let Some(raw) = path_from_user(path) else {
-        return errno::EFAULT;
-    };
-    if raw.is_empty() {
-        if flags & AT_EMPTY_PATH != 0 {
-            return sys_fstat(dirfd, statbuf);
-        }
-        return errno::ENOENT;
+    if flags & AT_EMPTY_PATH != 0 && crate::uaccess::read_val::<u8>(path) == Some(0) {
+        return sys_fstat(dirfd, statbuf);
     }
-    match akuma_syscalls_glue::fs::newfstatat_fill(dirfd as i32, &raw, flags as u32) {
-        Ok(g) => {
-            let x = akuma_syscalls_abi::stat::to_x86_64(&g);
-            if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT }
-        }
-        Err(e) => e,
-    }
+    akuma_syscalls_glue_amd64::newfstatat(dirfd, path, statbuf, flags)
 }
 
 /// `statx(dirfd, path, flags, mask, buf)` — x86_64 332. **Glue's arm** (4b
@@ -1955,15 +1459,7 @@ pub fn sys_statx(dirfd: u64, path: u64, flags: u64, mask: u64, buf: u64) -> u64 
 /// real — see [`poll_console_state`], which is the one thing on this target
 /// glue's map cannot know.
 pub fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> u64 {
-    let timeout = match timeout_ms as i32 {
-        ms if ms < 0 => None,
-        ms => Some((ms as u64).saturating_mul(1_000)),
-    };
-    akuma_syscalls_glue::flat(akuma_syscalls_glue::poll::ppoll_timeout_us(
-        fds,
-        nfds as usize,
-        timeout,
-    ))
+    akuma_syscalls_glue_amd64::poll(fds, nfds, timeout_ms)
 }
 
 /// `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271. **Glue's
@@ -2027,25 +1523,7 @@ pub fn sys_ppoll(fds: u64, nfds: u64, timeout: u64, sigmask: u64) -> u64 {
 /// waits before calling `accept` waited forever. Glue's probe asks
 /// `listener_ready`, which also reaps backlog handles that died unaccepted.
 pub fn sys_select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64) -> u64 {
-    let deadline = if timeout == 0 {
-        None
-    } else {
-        // `struct timeval { i64 tv_sec, i64 tv_usec }` — 16 bytes.
-        let Some([sec, usec]) = crate::uaccess::read_val::<[i64; 2]>(timeout) else {
-            return errno::EFAULT;
-        };
-        if sec < 0 || !(0..1_000_000).contains(&usec) {
-            return errno::EINVAL;
-        }
-        Some((sec as u64).saturating_mul(1_000_000).saturating_add(usec as u64))
-    };
-    akuma_syscalls_glue::flat(akuma_syscalls_glue::poll::pselect6_timeout_us(
-        nfds as usize,
-        readfds,
-        writefds,
-        exceptfds,
-        deadline,
-    ))
+    akuma_syscalls_glue_amd64::select(nfds, readfds, writefds, exceptfds, timeout)
 }
 
 /// **This target's *unbound* console, for the poll family's readiness map** —
@@ -2206,16 +1684,7 @@ pub fn sys_access(path: u64) -> u64 {
 ///   suite already uses for it (4b batch 2b).
 #[must_use]
 pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
-    if let Some(id) = dev_kvm_api_id(fd) {
-        return crate::drivers::hypervisor_api_ioctl(fd, id, req as u32, arg);
-    }
-    if is_dev_tun(fd) {
-        return crate::drivers::hypervisor_tun_ioctl(req as u32, arg);
-    }
-    // The fbdev requests, on a `/dev/fb0` descriptor only.
-    if is_dev_fb(fd) {
-        return crate::fbdev::ioctl(req as u32, arg);
-    }
+    // This kernel's own devices are `crate::chardev`'s, reached from glue's `term::sys_ioctl`.
     // The by-number/by-descriptor console, plus a `/dev/tty` fd. See the header:
     // the `fd < FIRST_FILE_FD` term is the fake tty and is the reason this
     // preamble exists at all.

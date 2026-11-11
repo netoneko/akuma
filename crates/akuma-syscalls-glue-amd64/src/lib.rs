@@ -34,21 +34,14 @@
 
 extern crate alloc;
 
-pub mod kill;
-
 use akuma_exec::process::FileDescriptor;
 use akuma_syscalls_abi::Syscall;
 use akuma_syscalls_glue as glue;
-use akuma_syscalls_linux::flags::open as o;
 
 const EBADF: u64 = (-9i64) as u64;
 const EFAULT: u64 = (-14i64) as u64;
-const EEXIST: u64 = (-17i64) as u64;
-const ENOTDIR: u64 = (-20i64) as u64;
-const EISDIR: u64 = (-21i64) as u64;
 const EINVAL: u64 = (-22i64) as u64;
 const ENOENT: u64 = (-2i64) as u64;
-const ELOOP: u64 = (-40i64) as u64;
 
 const AT_FDCWD: u64 = (-100i64) as u64;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -101,8 +94,11 @@ pub fn dispatch(nr: u64, a: [u64; 6]) -> Option<u64> {
         Syscall::Openat => openat(a[0], a[1], a[2], a[3]),
         Syscall::Read => read(a[0], a[1], a[2]),
         Syscall::Write => write(a[0], a[1], a[2]),
-        Syscall::Readv => vectored(a[0], a[1], a[2], read),
-        Syscall::Writev => vectored(a[0], a[1], a[2], write),
+        // A device that takes the call whole (`glue::chardev::vectored`), else the loop.
+        Syscall::Readv => glue::chardev::vectored(a[0] as u32, false, a[1], a[2])
+            .unwrap_or_else(|| vectored(a[0], a[1], a[2], read)),
+        Syscall::Writev => glue::chardev::vectored(a[0] as u32, true, a[1], a[2])
+            .unwrap_or_else(|| vectored(a[0], a[1], a[2], write)),
         Syscall::Pread64 => pread64(a[0], a[1], a[2], a[3]),
         Syscall::Fstat => fstat(a[0], a[1]),
         Syscall::Newfstatat => newfstatat(a[0], a[1], a[2], a[3]),
@@ -161,39 +157,12 @@ pub fn to_glue(call: Syscall, a: [u64; 6]) -> u64 {
 }
 
 /// `openat(dirfd, path, flags, mode)` with the x86_64 flags permuted to glue's.
-///
-/// Also the four checks glue's `openat_path` leaves to its caller
-/// (`O_NOFOLLOW` on a symlink, `O_CREAT` on a directory, `O_DIRECTORY` on a
-/// file, `O_EXCL` on anything present): amd64's preamble, minus its devices.
+/// The flag refusals (`O_NOFOLLOW`, `O_CREAT` on a directory, `O_DIRECTORY` on a
+/// file, `O_EXCL`) are glue's, for every kernel.
 #[must_use]
 pub fn openat(dirfd: u64, path: u64, flags_x86: u64, mode: u64) -> u64 {
     let flags = akuma_syscalls_abi::open_flags::x86_64_to_aarch64(flags_x86 as u32);
-    let Ok(raw) = glue::copy_from_user_str(path, 1024) else {
-        return EFAULT;
-    };
-    let Ok(resolved) = glue::fs::resolve_path_at(dirfd as i32, &raw) else {
-        return EBADF;
-    };
-    if flags & o::O_NOFOLLOW != 0 && akuma_vfs_glue::is_symlink(&resolved) {
-        return ELOOP;
-    }
-    let creating = flags & o::O_CREAT != 0;
-    let wants_dir = flags & o::O_DIRECTORY != 0;
-    if creating || wants_dir {
-        let md = akuma_vfs_glue::metadata(&resolved);
-        let is_dir = md.as_ref().is_ok_and(|m| m.is_dir);
-        let present = md.is_ok();
-        if creating && is_dir {
-            return EISDIR;
-        }
-        if wants_dir && present && !is_dir {
-            return ENOTDIR;
-        }
-        if creating && flags & o::O_EXCL != 0 && present {
-            return EEXIST;
-        }
-    }
-    glue::flat(glue::fs::openat_path(dirfd as i32, &resolved, flags, mode as u32))
+    glue::flat(glue::fs::sys_openat(dirfd as i32, path, flags, mode as u32))
 }
 
 /// Whether `fd` names a regular file in the caller's table (not a directory,
@@ -255,23 +224,20 @@ pub fn pread64(fd: u64, buf: u64, len: u64, off: u64) -> u64 {
     glue::fs::sys_pread64(fd as u32, buf, len.min(MAX_IO) as usize, off.cast_signed())
 }
 
-/// `write(fd, buf, len)`: glue's arm, after the one check it leaves to its
-/// caller — a file opened `O_RDONLY` refuses writes with `EBADF`.
+/// `write(fd, buf, len)`: glue's arm, in the shape [`vectored`] takes.
 #[must_use]
 pub fn write(fd: u64, buf: u64, len: u64) -> u64 {
-    let read_only = akuma_exec::process::current_process_shared().and_then(|p| {
-        p.with_fd(fd as u32, |d| matches!(d, FileDescriptor::File(f) if f.flags & o::O_ACCMODE == o::O_RDONLY))
-    });
-    if read_only == Some(true) {
-        return EBADF;
-    }
     glue::fs::sys_write(fd, buf, len as usize)
 }
 
 /// `readv`/`writev`: one `read`/`write` per non-empty `iovec`, stopping at the
 /// first short transfer (continuing would splice the stream) and reporting
 /// progress over a later error. At most 1024 entries (`IOV_MAX`).
-fn vectored(fd: u64, iov: u64, cnt: u64, one: fn(u64, u64, u64) -> u64) -> u64 {
+///
+/// Public so a kernel whose `read`/`write` serve devices of its own can pass
+/// those as `one` and keep this loop.
+#[must_use]
+pub fn vectored(fd: u64, iov: u64, cnt: u64, one: fn(u64, u64, u64) -> u64) -> u64 {
     let mut total = 0u64;
     for i in 0..cnt.min(1024) {
         let mut entry = [0u64; 2];

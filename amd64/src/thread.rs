@@ -262,37 +262,21 @@ pub fn current_thread_slot() -> usize {
 }
 
 /// `clone(flags, child_stack, parent_tid, child_tid, tls)` — x86_64 56, the
-/// `CLONE_VM` arm. **Served by `akuma_exec::process::clone_thread` since the
-/// ring-3 seam's `clone` fold**; what is left here is this target's argument
-/// checks and its errno vocabulary.
+/// thread arm. **Glue's `proc::clone_thread`**, one copy for both kernels:
+/// the flag rules, the errno mapping, and (in `akuma_exec`) the signal mask
+/// and the `CLONE_SETTLS` rule, and the retired-row drain that keeps thread churn
+/// from exhausting the process table and the ASIDs. What stays here is this
+/// kernel's own state: a caller with no process slot.
 ///
 /// x86_64's argument order is its own — `tls` **last**, after `child_tid`,
-/// where most architectures put it fourth — which is why the forward reorders
+/// where asm-generic puts it fourth — which is why the forward reorders
 /// rather than passing straight through.
 ///
-/// # The three refusals, kept
-///
-/// All three predate the fold and none is expressible in the shared path,
-/// which takes flags it has already been told are a thread clone:
-///
-/// * **`CLONE_THREAD` is required.** `CLONE_VM` without it is a distinct
-///   thing — a process that shares memory, which some sandboxes ask for — and
-///   it needs its own `wait4` semantics. Refuse rather than approximate: a
-///   "thread" a parent's `wait4` never reaps hangs the parent, which is much
-///   harder to read than an `ENOSYS` at the call.
-/// * **`CLONE_SETTLS` is required.** Without it a musl thread runs on the
-///   *parent's* `%fs`, so both write one `struct pthread` and the first thing
-///   to break is `errno`. There is no sane base to invent.
-/// * **a stack is required.** The shared path checks this too (and says so);
-///   checked here as well so the errno is `EINVAL` rather than a generic
-///   failure string turned into `EAGAIN`.
-///
-/// # Errno mapping
-///
-/// `clone_thread` returns `&'static str`, and the two failures a caller must
-/// tell apart are the resource limits: `EAGAIN` is what `pthread_create`
-/// already knows how to report and what Linux returns at the thread or task
-/// ceiling. Everything else is `ENOMEM`.
+/// Until 2026-11-11 this arm also refused a thread without `CLONE_SETTLS`
+/// (`EINVAL`), on the reasoning that it would run on the parent's `%fs`. Linux
+/// runs it on the parent's `%fs`, and Go's runtime asks for exactly that: its
+/// flag word has no `CLONE_SETTLS` and the child sets its TLS itself
+/// (`userspace/forktest/c_stress/cloneflags.c`).
 pub fn sys_clone_thread(
     flags: u64,
     child_stack: u64,
@@ -300,35 +284,6 @@ pub fn sys_clone_thread(
     child_tid: u64,
     tls: u64,
 ) -> u64 {
-    use crate::usermode::clone_flags::*;
-
-    // **Collect before claiming.** Every `pthread_create` on this target
-    // registers a `Process` row (see `teardown`'s note), and the five existing
-    // drain sites are all on *process* exit/reap paths — none on the thread
-    // one. So a thread-churning workload retires rows that nobody collects:
-    // `futextest` step 6 took the table from empty to
-    // `Process table full (256 slots, 246 reclaimable RETIRED)` and panicked
-    // the kernel, with 96% of the table collectable at that instant.
-    //
-    // Draining here rather than at teardown is deliberate. `register_process`'s
-    // own comment explains why reclaim cannot run from inside the spawn path:
-    // it executes `Process::drop`, which frees page tables and releases an
-    // ASID, and a caller already holding those locks self-deadlocks. Syscall
-    // entry is before any of that — no address-space lock, no region lock — and
-    // it is the same context the other `drain_retired_if_requested` sites run
-    // in. It is also demand-driven: the one path that consumes slots is the one
-    // that pays for collecting them.
-    akuma_exec::process::reclaim::drain_retired_if_requested();
-
-    if flags & CLONE_THREAD == 0 {
-        return errno::ENOSYS;
-    }
-    if child_stack == 0 {
-        return errno::EINVAL;
-    }
-    if flags & CLONE_SETTLS == 0 {
-        return errno::EINVAL;
-    }
     // A task that is not running a registered process has no thread group to
     // join. `current_proc_slot` answering `usize::MAX` is how that shows up,
     // and `bind_clone_child` would have nothing to key its row on.
@@ -336,36 +291,8 @@ pub fn sys_clone_thread(
         return errno::ENOSYS;
     }
 
-    // **The argument order is `(stack, tls, parent_tid, child_tid, flags)`** —
-    // `clone_thread`'s own, which is neither x86_64's syscall order (`flags`
-    // first, `tls` **last**) nor asm-generic's. Getting it wrong here does not
-    // fail: it hands `flags` to `stack`, and the child enters ring 3 on a
-    // plausible-looking address that is the parent's. The first `clone` after
-    // the fold did exactly that and faulted on its first `popq` with
-    // `cr2 == rsp` — the probe pushes the child's entry point onto the child
-    // stack before the `syscall` and the child pops it back off, so a wrong
-    // `sp` is a fault on the very first instruction. Spelled out per-argument
-    // rather than positionally, so a future reader is not asked to trust the
-    // order.
-    match akuma_exec::process::clone_thread(
-        /* stack */ child_stack,
-        /* tls */ tls,
-        /* parent_tid_ptr */ parent_tid,
-        /* child_tid_ptr */ child_tid,
-        /* flags */ flags,
-    ) {
-        Ok(tid) => u64::from(tid),
-        Err(e) => {
-            serial::puts("  [clone] ");
-            serial::puts(e);
-            serial::puts("\n");
-            if e.contains("table full") || e.contains("thread slot") {
-                errno::EAGAIN
-            } else {
-                errno::ENOMEM
-            }
-        }
-    }
+    // asm-generic order: `(flags, stack, parent_tid, tls, child_tid)`.
+    akuma_syscalls_glue::proc::clone_thread(flags, child_stack, parent_tid, tls, child_tid)
 }
 
 /// **The `ChildKind::Thread` half of `ExecRuntime::bind_child_task`** — give a

@@ -1192,24 +1192,6 @@ pub fn sys_rt_sigreturn() -> u64 {
     .unwrap_or(errno::EFAULT)
 }
 
-/// `tkill(2)` — x86_64 200: the x86 kernels' shared body,
-/// `akuma_syscalls_glue_amd64::kill::tkill` (moved there 2026-11-01; its doc keeps the
-/// `raise(3)` history).
-pub fn sys_tkill(tid: u32, sig: u32) -> u64 {
-    akuma_syscalls_glue_amd64::kill::tkill(tid, sig)
-}
-
-/// `tgkill(2)` — x86_64 234: see [`sys_tkill`].
-pub fn sys_tgkill(tgid: u32, tid: u32, sig: u32) -> u64 {
-    akuma_syscalls_glue_amd64::kill::tgkill(tgid, tid, sig)
-}
-
-/// `kill(2)` — x86_64 62: the x86 kernels' shared body, `akuma_syscalls_glue_amd64::kill`
-/// (moved there from here 2026-11-01; its doc keeps this target's history).
-pub fn sys_kill(pid: u64, sig: u64) -> u64 {
-    akuma_syscalls_glue_amd64::kill::kill(pid, sig)
-}
-
 // ===========================================================================
 // Boot self-tests
 // ===========================================================================

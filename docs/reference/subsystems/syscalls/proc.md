@@ -272,15 +272,17 @@ table). Linux wait-status encoding (`encode_wait_status`): normal exit
 
 ## kill / tkill
 
-`sys_kill` (`KILL` 302, Linux 129):
+`signal::sys_kill` (glue; Linux 129, Akuma 302, x86_64 62), one copy for every kernel:
 
-- **SIGKILL (9)** bypasses handlers entirely → `kill_thread_group(tgid)` +
-  `kill_process_with_signal(pid, 9)` (hard-kill). SIGKILL/SIGSTOP bypass the
-  signal mask in `take_pending_signal`.
-- Other signals: `pend_signal_for_thread` on the main thread **and** all
-  same-`tgid` siblings (each `pend` calls `wake()` internally). **Set all
-  `interrupt_thread` flags first, then pend** — the reverse order races
-  (wake before flag → thread re-blocks).
+- **Every signal, SIGKILL included, is pended** with `pend_signal_to_group` on
+  each thread of the target group, and each thread takes it at its own return
+  to user mode. SIGKILL/SIGSTOP bypass the signal mask in `take_pending_signal`.
+  There is no hard kill from the caller's core
+  ([`signal.md`](signal.md) "`kill`, `tkill` and `tgkill`: one copy, and SIGKILL is a pend").
+- `pend_signal_to_group` **sets every `interrupt_thread` flag first, then
+  pends**; the reverse order races (wake before flag → thread re-blocks).
+- Groups (`0`, `-pgid`, `-1`) walk the table once into a fixed array, leaders
+  only, then filter by `check_signal_pid` outside the IRQ-off callback.
 
 ## reboot
 

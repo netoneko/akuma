@@ -347,13 +347,32 @@ pub fn check_signal_tid(tid: u32) -> Result<(), akuma_exec::process::SignalDeny>
     }
 }
 
-pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
+/// `tkill(2)`, for both kernels (one copy since 2026-11-11; the x86 kernels had
+/// their own in `akuma-syscalls-glue-amd64::kill` until then).
+///
+/// Every signal is **pended**, never acted on here: what to do is
+/// `akuma_syscalls_signal::tkill_action`'s (host-tested; its doc has the rules and
+/// why no fatal default runs inside `tkill` any more), and a fatal one is carried
+/// out by the target's own return to user mode — `apply_default_signal_action` on
+/// AArch64, `signal::deliver_pending` on amd64 — which is the only place each
+/// kernel knows how a thread leaves user mode.
+///
+/// **Not `ProcessChannel::interrupted`.** That flag is the Ctrl-C sledgehammer:
+/// glue's dispatch prologue reads it on every syscall and ends the process with
+/// `EINTR`, `SA_RESTART`- and disposition-blind. Setting it from here made
+/// `raise(3)` fail: musl's `raise` is block-all / `tgkill` / restore, and the
+/// `EINTR` landed on the restore, leaving the signal blocked for good. The
+/// per-thread `EINTR` decision is `interrupt_thread`'s, taken only for a signal
+/// that will act.
+pub fn sys_tkill(tid: u32, sig: u32) -> u64 {
     use akuma_syscalls_signal::{Disposition, TkillAction};
     if let Err(e) = check_signal_tid(tid) {
         return deny_errno(e);
     }
     if sig == 0 { return 0; }
     if sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }
+    let slot = tid as usize;
+    if slot >= akuma_exec::threading::MAX_THREADS { return ESRCH; }
 
     if akuma_config::TRACE_TKILL {
         akuma_primitives::safe_print!(128, "[signal] tkill(tid={}, sig={}) from slot={}\n",
@@ -364,20 +383,14 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
     // *target* thread's mask (docs/SIGNAL_DELIVERY_FORKTEST_EVIDENCE.md §D).
     // A tid with no process (a kernel thread `check_signal_tid` let the host
     // reach) or a process already gone is `None`, and the decision drops it.
-    // What to do is `akuma_syscalls_signal::tkill_action`'s (host-tested, the
-    // rules and their reasons are there); this function only looks up and acts.
-    let target_mask = akuma_exec::threading::thread_signal_mask_of(tid as usize);
-    let target_pid = akuma_exec::process::find_pid_by_thread(tid as usize);
-    let target = target_pid.and_then(|pid| {
-        let proc = akuma_exec::process::lookup_process_shared(pid)?;
-        let handler = proc.signal_actions.actions.lock()[(sig - 1) as usize].handler;
-        let disposition = match handler {
+    let target_mask = akuma_exec::threading::thread_signal_mask_of(slot);
+    let target = akuma_exec::process::find_pid_by_thread(slot)
+        .and_then(akuma_exec::process::lookup_process_shared)
+        .map(|proc| match proc.signal_actions.actions.lock()[(sig - 1) as usize].handler {
             akuma_exec::process::SignalHandler::Ignore => Disposition::Ignore,
             akuma_exec::process::SignalHandler::Default => Disposition::Default,
             akuma_exec::process::SignalHandler::UserFn(_) => Disposition::Handler,
-        };
-        Some((disposition, akuma_exec::process::read_current_pid() == Some(pid)))
-    });
+        });
     let action = akuma_syscalls_signal::tkill_action(u64::from(sig), target, target_mask);
 
     if akuma_config::TRACE_TKILL {
@@ -387,25 +400,26 @@ pub(super) fn sys_tkill(tid: u32, sig: u32) -> u64 {
 
     match action {
         TkillAction::Drop => {}
-        TkillAction::Pend => akuma_exec::threading::pend_signal_for_thread(tid as usize, sig),
+        TkillAction::Pend => akuma_exec::threading::pend_signal_for_thread(slot, sig),
         TkillAction::PendInterrupt => {
-            akuma_exec::threading::pend_signal_for_thread(tid as usize, sig);
-            akuma_exec::process::interrupt_thread(tid as usize);
-        }
-        TkillAction::ExitOwnGroup => {
-            super::proc::sys_exit_group(-(sig as i32));
+            // The interrupt bit first, then the pend (which wakes the slot): a
+            // park that finds no `UserFn` handler re-parks unless the bit is
+            // already up when it re-checks.
+            akuma_exec::process::interrupt_thread(slot);
+            akuma_exec::threading::pend_signal_for_thread(slot, sig);
         }
     }
     0
 }
 
-/// tgkill(tgid, tid, sig) — like tkill but the thread must belong to thread
-/// group `tgid`. POSIX/Linux: if `tid` names a live thread whose thread-group id
+/// `tgkill(tgid, tid, sig)`: `tkill`, with the thread required to be in `tgid`.
+///
+/// POSIX/Linux: if `tid` names a live thread whose thread-group id
 /// is not `tgid`, fail with ESRCH (prevents mis-delivery to a recycled tid that
 /// now lives in a different process). If the thread isn't known we fall through
 /// to `tkill`'s own handling (best-effort, matches the old behavior for kernel
 /// threads with no owning process). See docs/AKUMA_SELF_HOSTING.md §7k.5.
-pub(super) fn sys_tgkill(tgid: u32, tid: u32, sig: u32) -> u64 {
+pub fn sys_tgkill(tgid: u32, tid: u32, sig: u32) -> u64 {
     if let Some(pid) = akuma_exec::process::find_pid_by_thread(tid as usize)
         && let Some(proc) = akuma_exec::process::lookup_process_shared(pid)
         && proc.tgid != tgid
@@ -413,6 +427,116 @@ pub(super) fn sys_tgkill(tgid: u32, tid: u32, sig: u32) -> u64 {
         return ESRCH;
     }
     sys_tkill(tid, sig)
+}
+
+/// `kill(2)`, for every kernel.
+///
+/// One copy since 2026-11-11; it was the x86 kernels'
+/// `akuma-syscalls-glue-amd64::kill` from 2026-10-09, and glue's own `proc::sys_kill`
+/// served AArch64 and Akuma-private 302 until then).
+///
+/// **Every signal, SIGKILL included, is pended on the target's thread group and
+/// its waits interrupted** (`pend_signal_to_group`); each thread takes it at its
+/// own next return to user mode, and a fatal one exits there. A thread spinning in
+/// user code is reached by the timer interrupt's return on both kernels. The old
+/// AArch64 SIGKILL — `kill_thread_group` + `kill_process_with_signal`, marking the
+/// victims' slots `TERMINATED` **from the killer's core** — is what the amd64 kernel
+/// could not survive (2 s per `kill -9` of a threaded process, leaked rows, two
+/// hard hangs: `docs/archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`); it stays only
+/// under `deliver_signal`, for the terminal's `^C` path.
+///
+/// Targets follow Linux: `pid > 0` one process, `0` the caller's group, `-1`
+/// everyone but init and the caller's group, `pid < -1` the group `-pid`. Glue's
+/// previous copy refused every one of the group forms (`EPERM`, or `ESRCH` for a
+/// negative pid read as a huge `u32`). Group delivery walks the process table once
+/// into a fixed array — no `Vec` on a path that runs while the machine is in
+/// trouble — and addresses each thread group through its leader, so a thread's own
+/// row (`pid != tgid`) is never a second delivery to the same group.
+#[must_use]
+pub fn sys_kill(pid: u64, sig: u64) -> u64 {
+    use akuma_exec::process::{kill_target, pend_signal_to_group, KillTarget};
+    if sig as usize > akuma_exec::process::MAX_SIGNALS {
+        return EINVAL;
+    }
+    let sig = sig as u32;
+    // `pid_t` is 32 bits in a 64-bit register: `kill(-53, 9)` arrives as
+    // `0xffff_ffff_ffff_ffcb`, and the truncation is what recovers `-53`.
+    let target = kill_target((pid as u32).cast_signed());
+    match target {
+        KillTarget::Pid(target) => {
+            // init is not a target (`EPERM`).
+            if target == 1 && sig != 0 {
+                return EPERM;
+            }
+            // Box, then uid — before the `sig == 0` probe, so probing cannot
+            // find a process in a box the caller cannot see. A pid with no
+            // process is `Invisible`, i.e. `ESRCH`.
+            if let Err(e) = akuma_exec::process::check_signal_pid(target) {
+                return deny_errno(e);
+            }
+            if sig == 0 {
+                return 0;
+            }
+            if akuma_config::SYSCALL_DEBUG_INFO_ENABLED || akuma_config::SYSCALL_DEBUG_NET_ENABLED {
+                akuma_primitives::tprint!(96, "[signal] kill(pid={}, sig={})\n", target, sig);
+            }
+            if pend_signal_to_group(target, sig) { 0 } else { ESRCH }
+        }
+        KillTarget::OwnGroup | KillTarget::Group(_) | KillTarget::All => {
+            let me = akuma_exec::process::current_process_shared();
+            let (my_tgid, my_pgid) = me.map_or((0, 0), |p| (p.tgid, p.pgid));
+            let group = match target {
+                KillTarget::Group(g) => Some(g),
+                KillTarget::OwnGroup => Some(my_pgid),
+                _ => None,
+            };
+            // Leaders only (`pid == tgid`): one delivery per thread group.
+            // Fixed array — the callback runs with IRQs disabled and may not
+            // allocate.
+            let mut targets = [0u32; akuma_exec::process::MAX_PROCESSES];
+            let mut count = 0usize;
+            akuma_exec::process::for_each_process(|p| {
+                if p.pid != p.tgid || count >= targets.len() {
+                    return;
+                }
+                let wanted = match group {
+                    Some(g) => p.pgid == g,
+                    // `kill(-1)`: everything but init and the caller's group.
+                    None => p.pid > 1 && p.tgid != my_tgid,
+                };
+                if wanted {
+                    targets[count] = p.pid;
+                    count += 1;
+                }
+            });
+            // Filter outside the callback (it runs IRQs-off; `check_signal`
+            // takes the box-registry lock). Linux's rule for a group or
+            // `kill(-1)`: signal every member you may, succeed if that was at
+            // least one, else EPERM if something was only refused by uid and
+            // ESRCH if nothing reachable existed. Without it, `kill(-1, 9)`
+            // from inside a box killed every process on the machine.
+            let (mut sent, mut forbidden) = (0usize, false);
+            for &t in &targets[..count] {
+                match akuma_exec::process::check_signal_pid(t) {
+                    Ok(()) => {
+                        if sig != 0 {
+                            pend_signal_to_group(t, sig);
+                        }
+                        sent += 1;
+                    }
+                    Err(akuma_exec::process::SignalDeny::Forbidden) => forbidden = true,
+                    Err(akuma_exec::process::SignalDeny::Invisible) => {}
+                }
+            }
+            if sent > 0 {
+                0
+            } else if forbidden {
+                EPERM
+            } else {
+                ESRCH
+            }
+        }
+    }
 }
 
 /// Helper for other syscalls (like pipe write) to send SIGPIPE

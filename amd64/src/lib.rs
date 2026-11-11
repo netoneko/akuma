@@ -52,6 +52,7 @@ mod banner;
 #[cfg(target_arch = "x86_64")]
 mod blk;
 mod boot;
+mod chardev;
 #[cfg(target_arch = "x86_64")]
 mod clock;
 /// The serial console as a `ProcessChannel` — the producer `akuma-syscalls-glue`'s

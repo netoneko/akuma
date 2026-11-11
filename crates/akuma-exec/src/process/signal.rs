@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spinning_top::Spinlock;
 
 use crate::process::types::{Pid, ProcessState, SignalAction, MAX_SIGNALS};
@@ -15,13 +16,31 @@ use crate::threading;
 /// via Arc — matching Linux CLONE_SIGHAND behavior. Fork/Spawn creates a fresh table.
 pub struct SharedSignalTable {
     pub actions: Spinlock<[SignalAction; MAX_SIGNALS]>,
+    /// Some thread of this group has begun the group's exit (Linux's
+    /// `SIGNAL_GROUP_EXIT`, which lives in the same shared `signal_struct`).
+    /// Only `CLONE_THREAD` shares this table, so "the table" is "the group".
+    group_exit: AtomicBool,
 }
 
 impl SharedSignalTable {
     pub fn new() -> Self {
         Self {
             actions: Spinlock::new([SignalAction::default(); MAX_SIGNALS]),
+            group_exit: AtomicBool::new(false),
         }
+    }
+
+    /// Claim the group's exit. `true` for exactly one caller per group: the
+    /// thread that runs the teardown (`kill_thread_group` and the rest of
+    /// `exit_group`). Every later caller must not run it too. Each teardown
+    /// grace-waits for its siblings to die, so two of them in one group wait on
+    /// each other for the whole `KILL_GRACE_US` (2 s). A group `SIGKILL`, pended
+    /// on every thread and taken by each one at its own return to user mode,
+    /// did that on every kill
+    /// (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md` "Slice 3: signals").
+    #[must_use]
+    pub fn claim_group_exit(&self) -> bool {
+        !self.group_exit.swap(true, Ordering::AcqRel)
     }
 
     /// A private copy of this table, for `fork`/`vfork`.
@@ -55,6 +74,7 @@ impl SharedSignalTable {
     pub fn clone_for_fork(&self) -> Self {
         Self {
             actions: Spinlock::new(*self.actions.lock()),
+            group_exit: AtomicBool::new(false),
         }
     }
 }
@@ -246,13 +266,13 @@ pub fn check_signal_pid(pid: Pid) -> Result<(), SignalDeny> {
 }
 
 /// Deliver `sig` to `pid`'s whole thread group (target + CLONE_THREAD siblings),
-/// or hard-kill it if it has no live thread to interrupt. This is `sys_kill`'s
-/// per-pid delivery logic, factored out so [`kill_foreground_group`] can reuse it
-/// for each member of a process group instead of duplicating it.
+/// or hard-kill it if it has no live thread to interrupt. Since 2026-11-11 its
+/// only caller is [`kill_foreground_group`] (Ctrl-C from a console session):
+/// `kill(2)`, `tkill`/`tgkill` and `pidfd_send_signal` on every kernel pend
+/// through glue's `signal::sys_kill`/`sys_tkill` instead.
 ///
 /// Returns `true` if the process was found (delivered to a live thread, or
-/// hard-killed via the fallback) — `sys_kill` maps that to its 0-vs-`ESRCH`
-/// return value.
+/// hard-killed via the fallback).
 pub fn deliver_signal(pid: Pid, sig: u32) -> bool {
     let Some(proc) = lookup_process_shared(pid) else {
         return kill_process_with_signal(pid, sig).is_ok();
@@ -262,14 +282,11 @@ pub fn deliver_signal(pid: Pid, sig: u32) -> bool {
     // SIGKILL (9) is unconditional — bypass signal delivery entirely. On
     // Linux, SIGKILL cannot be caught or ignored. Hard-kill the thread group.
     //
-    // **AArch64 only in practice.** amd64's `kill(2)` does not come through
-    // here any more (`amd64/src/signal.rs::sys_kill`, 2026-10-09): on that
-    // target a thread leaves ring 3 only through its own syscall return or a
-    // tick, so it takes `pend_signal_to_group` for every signal, 9 included,
-    // and `kill_thread_group`'s cross-core `mark_thread_terminated` never runs
-    // there. Measured before that: a `kill -9` of any threaded process cost
-    // the full 2 s `KILL_GRACE_US` (no amd64 path consumes `PENDING_KILL`),
-    // and every hard-terminated thread leaked its `amd64::thread::THREADS` row
+    // **AArch64 console Ctrl-C only.** No syscall reaches this any more
+    // (2026-11-11, `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md` "Slice 3:
+    // signals"): `kill(2)` pends SIGKILL like any other signal, and each
+    // thread takes it at its own next return to user mode. amd64 cannot
+    // survive the cross-core `mark_thread_terminated` below at all
     // (`docs/archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`).
     if sig == 9 {
         crate::process::kill_thread_group(pid, l0_phys, -9);

@@ -3544,6 +3544,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
     const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
     const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+    const CLONE_SETTLS: u64 = 0x0008_0000;
     // Reject stack=0: a thread with SP=0 will immediately crash at a near-zero
     // address (e.g. FAR=0x28) when it tries to access stack variables.  This
     // happens when Go's vfork child leaks -ENOSYS into clone flags, causing
@@ -3593,7 +3594,13 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     let mut child_ctx = parent_ctx;
     child_ctx.set_child_return_zero();
     child_ctx.sp = stack;
-    child_ctx.set_tls_base(tls);
+    // Without `CLONE_SETTLS` the thread keeps the parent's TLS base, as on Linux,
+    // and `tls` is not an argument at all. Go's runtime passes no `CLONE_SETTLS`
+    // and sets its TLS itself in the child
+    // (`userspace/forktest/c_stress/cloneflags.c`).
+    if flags & CLONE_SETTLS != 0 {
+        child_ctx.set_tls_base(tls);
+    }
     child_ctx.set_unprivileged_entry();
     // Override the (possibly stale) inherited root with the live, canonical
     // shared address-space one — see the comment where `shared_ttbr0` is captured.

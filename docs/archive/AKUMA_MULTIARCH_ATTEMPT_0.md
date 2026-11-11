@@ -2091,3 +2091,311 @@ small absolute floor — and gate it with a boot test at a RAM size below today'
 (Firecracker `mem_size_mib` in the 128-384 MiB range) alongside the existing 2048 MiB default, on
 both `headless` and the full driver set. Not scheduled against a slice yet; filed here because the
 unified build's own stated smaller-footprint goal is what exposed it.
+**Correction (2026-11-11, later the same day): it was QEMU, not the guest.** The guest kept running
+throughout: its clock, scheduler, netpoll daemon and sshd's accept loop were all live. QEMU's main loop
+was stuck in its timer list holding the BQL, with both vCPUs blocked on it mid-MMIO store. The trigger
+was `akuma_lapic_amd64::start_timer` writing the periodic LVT before the new count, leaving a 32 ns
+periodic timer for one store. Unrelated to either slice. Fixed by zeroing the count first:
+`docs/archive/AMD64_LAPIC_PERIODIC_SWITCH_QEMU_LIVELOCK.md`.
+
+### Slice 3: signals (2026-11-11)
+
+`kill`, `tkill` and `tgkill` are one copy, glue's `signal::{sys_kill, sys_tkill, sys_tgkill}`, on
+every kernel. x86_64 62/200/234 go `to_glue`; the Taoxichuan arms call glue's functions by name;
+`crates/akuma-syscalls-glue-amd64/src/kill.rs` (237 lines) and the three amd64 wrappers in
+`amd64/src/signal.rs` are deleted, and so is glue's `proc::sys_kill`. The x86 body was the stronger
+one and became glue's: every signal, SIGKILL included, is pended on the target group and taken by
+each thread at its own return to user mode. AArch64 used to hand SIGKILL to `deliver_signal`, whose
+SIGKILL arm marks the victims' slots `TERMINATED` from the killer's core. That arm now serves only
+console Ctrl-C (`kill_foreground_group`).
+
+The decision `akuma_syscalls_signal::tkill_action` is now `{Drop, Pend, PendInterrupt}`. The
+pinned divergences, each a change for both kernels unless noted:
+
+| case | before | now |
+|---|---|---|
+| fatal default to the caller's own group (`ExitOwnGroup`) | AArch64 called `sys_exit_group` inside `tkill`; wrong exit on amd64 | pend + interrupt; the caller dies at the return it is about to make |
+| blocked fatal signal | amd64 interrupted the target's wait | pend only (a blocked signal never ends a wait) |
+| blocked default-ignore signal, or `SIG_IGN` + blocked | glue dropped it | pended, as on Linux (the disposition can change before unblock) |
+| SIGKILL to a tid with a stale table entry | depended on the disposition read | always pend + interrupt |
+| `kill(pid, SIGKILL)` on AArch64 | hard kill from the caller's core, 2 s grace for a victim stuck in the kernel | pend; a victim that never returns to user mode is no longer forced out |
+| amd64 Akuma 302 and `pidfd_send_signal(SIGKILL)` | reached `deliver_signal`'s hard kill, which amd64 cannot survive | pend (`pidfd_send_signal` now `EINVAL`s `sig > 64`) |
+| `tkill` of an unknown in-range tid | 0 | still 0 (Linux: `ESRCH`); pinned |
+| `kill(-pgid)` on AArch64 | `ESRCH` | works |
+
+**Two defects found by the gates and fixed in the slice:**
+
+1. **Every group SIGKILL cost 2 s on AArch64.** With SIGKILL pended on every thread, each thread
+   takes the fatal default and calls `sys_exit_group`; each one's `kill_thread_group` grace-waits for
+   its siblings, which are in their own grace waits. killtree read 2006-2016 ms on every round, with
+   25 `[ktg] grace expired` lines. Fix: Linux's `SIGNAL_GROUP_EXIT` as
+   `SharedSignalTable::claim_group_exit` (the table is shared by exactly the `CLONE_THREAD` group).
+   The first caller runs the teardown; a later one marks its own slot `TERMINATED` and parks, as a
+   posted deferred kill does at the EL0 boundary. amd64 does not use glue's `sys_exit_group`.
+2. **amd64 `kill` could fail with `EINTR` and send nothing.** Glue's dispatch prologue answers `EINTR`,
+   without running the call, while the caller's interrupt bit is up. amd64's own `sys_kill` was called
+   directly and never saw that gate. Once routed, `sigregs`'s `kill(child, SIGKILL)` raced a SIGUSR1
+   from the child landing on the other core, returned `EINTR`, and the child was orphaned: the boot
+   suite at `SMP=2` failed `sigregs: teardown leaks nothing` and `wait4: no children -> ECHILD` in 3
+   of 5 runs (the pre-slice kernel 0 of 7). Found with a temporary print in `sys_kill`: the failing
+   run had no SIGKILL from the parent at all. Fix: the signal senders join the signal-state calls the
+   gate exempts. Linux never fails `kill` with `EINTR`.
+
+Gates:
+
+- clippy clean on amd64 default, `no-tests`, `ring0-preempt`, `headless`, `headless,no-tests`,
+  `headless,kvm`, `--no-default-features`; AArch64 default, `no-tests`, the rump devbox set;
+  Taoxichuan x86_64 and aarch64. Host tests (`akuma-syscalls-signal` 17, glue, glue-amd64), unsafe
+  budget and address-param ratchets: ok.
+- AArch64 HVF boot suite 315 (`SMP=1`), 323 (`SMP=2`), 321 (`SMP=4`); the one `FAILED` line at 1 and
+  4 is `thread_slot_reclaim`'s own `SPAWN FAILED` print and is in the baseline log too.
+- amd64 TCG 836 (`SMP=1`), 846 (`SMP=2`, 8 of 8 runs, and `headless` 2 of 2), 846 (`SMP=4`).
+- killtree, 8 rounds of modes 1-4, AArch64 HVF `SMP=4`:
+
+  | | baseline (HEAD `63652251`) | this slice |
+  |---|---|---|
+  | SIGKILL browser, tree | 28-32 ms | 14-15 ms |
+  | SIGKILL group | `ESRCH`, per-pid fallback | 11-12 ms |
+  | SIGTERM group, 300 ms, SIGKILL | 2012-2015 ms | 312 ms (the 300 ms is the probe's pause) |
+  | worst tree | 2015 ms | 312 ms |
+  | `[ktg] grace expired` lines | 7 | 0 |
+
+- killtree on amd64 TCG `SMP=2`: PASS, worst 308 ms, SIGKILL rounds 34-110 ms, no grace expiry. Not
+  measured on the pre-slice amd64 kernel.
+- `abortsig`, `pthread_kill_eintr`, `sigsusprobe`: PASS on both. `sigprobe`: all 12 rungs on amd64.
+
+**Future work** (found by this slice's gates, not fixed in it):
+
+- **amd64 process groups outside a pty session.** `setpgid`, `getpgid` and `getsid` are real only for
+  a process whose session a pty controls (`pty::sys_{setpgid,getpgid,getsid}_gated`, since
+  `5ceb3bb0`, 2026-10-05). Everywhere else `setpgid` returns 0 and changes nothing, and `getpgid`
+  reports 1. That was the stub's behaviour from the first amd64 checkpoint, and it was kept
+  deliberately because nothing on the console side had been tested against job control. `setsid`
+  is real everywhere. Consequences:
+  - `kill(-pgid)` for a group made with `setpgid` in a non-pty process (`ssh host cmd`, a service
+    under herd) is `ESRCH`. killtree passes on amd64 only through its per-pid fallback. A minimal
+    repro (fork, child `setpgid(0, 0)`, parent `kill(-child, 9)`) read `setpgid=0 pgid=1` and
+    `ESRCH` on amd64, and worked on AArch64.
+  - **Suspected, not tested:** if every non-pty process reads group 1, `kill(0, sig)` from one of
+    them signals every leader whose group reads 1, possibly herd and sshd, not just the caller's
+    group. Check in a VM before relying on either answer.
+  - Fix: make the three calls real everywhere, as on AArch64, with the console Ctrl-C path
+    (`kill_foreground_group`) re-tested, since that is the job-control reader the gate protected.
+- **AArch64 `sigprobe` rung 9.** A write to a present read-only page reports `si_code`
+  `SEGV_MAPERR` (1) where Linux reports `SEGV_ACCERR` (2); rungs 10-12 are never reached. This is in
+  the EL0 fault path, which this slice did not touch, and it was not run on the baseline kernel.
+  Next: run it on the baseline, then find where `akuma-exceptions` chooses the code for a
+  permission fault.
+- **AArch64 SIGKILL of a thread that never returns to user mode.** `kill(pid, 9)` used to force it
+  out after a 2 s grace. Now only the teardown's deferred kill does, and only once some thread of the
+  group has started `exit_group`. A group whose every thread is stuck in the kernel is not reaped by
+  `kill -9`. Linux does not force such a thread out either; a stuck kernel thread is a bug of its
+  own.
+- **`tkill` of an unknown in-range tid returns 0** (Linux: `ESRCH`). Pinned, not fixed: it was the
+  pre-slice behaviour on both kernels.
+
+### Slice 4: fd (2026-11-11)
+
+Three steps, each its own commit:
+
+1. amd64's fd layer becomes `akuma-syscalls-glue-amd64`, the x86 copy Taoxichuan already runs.
+2. amd64's devices move behind glue hooks.
+3. The Linux-correct refusals move into glue itself, for both kernels.
+
+**Step 1: amd64 runs glue-amd64's fd layer.** `amd64/src/fd.rs` was a second copy of glue-amd64:
+`openat`'s four refusals (`O_NOFOLLOW`, `O_CREAT` on a directory, `O_DIRECTORY` on a file,
+`O_EXCL`), chunked `read`/`pread` past 64 KiB, the `O_RDONLY` write refusal, the `struct stat`
+conversion, the `poll`/`select` timeouts, `dup2`'s `old == new` rule and the `fcntl` seal commands.
+Those bodies are gone. Each amd64 arm keeps only what is its own, then calls glue-amd64:
+
+| arm | kept on amd64 | then |
+|---|---|---|
+| `openat` | fb, wifi, power, kvm, tun, mouse opens; block node `ENODEV`; the `MAX_FDS` ceiling | `openat_resolved` (new: the path is resolved once) |
+| `read` | the six device reads | `read` |
+| `pread64` | `ESPIPE` on a pipe, socket or console | `pread64` |
+| `write` | the device writes, the serial console | `write` |
+| `readv`/`writev` | the tun calls | `vectored` (now public), with amd64's own `read`/`write` per entry |
+| `fstat` | the device stats, the boot task's unbound console | `fstat` |
+| `newfstatat` | `AT_EMPTY_PATH` with an empty path goes to amd64's `fstat` | `newfstatat` |
+| `dup2` / `fcntl` / `poll` / `select` | `dup2`'s `MAX_FDS` bound | the same names |
+
+No behaviour change was intended, and none was seen. Gates: clippy (amd64, Taoxichuan x86_64 and
+aarch64); glue-amd64 host tests; amd64 TCG 836/846/846 at `SMP=1/2/4`, `headless` 836/846; an ssh
+shell smoke covering redirects, `>>`, pipes, `stat` of a file, a directory and `/dev/null`, a 1.1 MB
+`dd` copy compared with `cmp`, `set -C` refusing an existing file, `cd`, and `/dev/zero` and
+`/dev/urandom` reads.
+
+**Found on the way, pre-existing:** on amd64 an `ssh host cmd` session returns nothing on the
+client's stderr. `echo x >&2` and `ls /missing` print nothing, and `2>&1` works. The kernel before
+this step does the same. This is an sshd/session item, logged here for the fd follow-up.
+
+**Step 2: amd64's devices are glue's `chardev` hooks.** Step 1 left one reason for an amd64 fd arm to
+exist: `/dev/fb0`, `/dev/wifi0`, `/dev/power`, `/dev/kvm0` and `/dev/kvm`, `/dev/net/tun` and
+`/dev/input/mouse0` are this kernel's drivers, and each arm asked "is this descriptor one of mine?"
+before calling glue. That question is now asked by glue. `akuma_syscalls_glue::chardev` holds one
+`CharDevOps` table (`open`, `read`, `write`, `vectored`, `ioctl`, `fstat`, `close`), which a kernel
+registers at boot. `amd64/src/chardev.rs` is amd64's table, made of the code that left `fd.rs`,
+`usermode.rs` and the dispatcher. Glue calls it from:
+
+| glue arm | hook |
+|---|---|
+| `fs::openat_path`, after the path is resolved | `open` |
+| `fs::sys_read`, `fs::sys_write`, before the pty match | `read`, `write` |
+| `readv`/`writev` (amd64's `usermode`, glue-amd64's `dispatch`) | `vectored`: only the tun takes the call whole |
+| `term::sys_ioctl`, before the pty lookup | `ioctl` |
+| `fs::fstat_fill` | `fstat` |
+| `fs::sys_close`, `fs::sys_close_range`, after the entry left the table | `close` |
+
+Every hook answers `Option`, and `None` is glue's own arm: the hooks only see the six `Dev*` variants
+(`chardev::is_chardev`), a device returns `None` where amd64 never answered for it, and a kernel that
+registers nothing (AArch64, Taoxichuan) gets `None` throughout. amd64's `close` and `close_range` arms
+are now plain `to_glue`; `close_range` no longer collects the range into a `Vec` to run the releases
+first. `dup3` replacing a device descriptor still does not release it, as before; this is pinned for
+step 3 rather than changed here.
+
+Gates: clippy (amd64 default, `headless`, `no-tests`; AArch64; Taoxichuan); glue-amd64 host tests;
+the unsafe budget; amd64 TCG 836/846/846 at `SMP=1/2/4`, `headless` 846 at `SMP=2`; AArch64 HVF
+315/323/321 at `SMP=1/2/4`, the same as the signals slice. On a live amd64 herd VM a static probe
+opened `/dev/power` with `O_CLOEXEC` and checked the results:
+
+- `fstat`: `S_IFCHR`, mode 0600, rdev 10:243, ino 20;
+- `F_GETFD`: `FD_CLOEXEC` set;
+- `readv` over two 8-byte `iovec`s: 16 bytes;
+- `TCGETS`: `ENOTTY`;
+- `/dev/fb0` and `/dev/wifi0` on microvm: `ENOENT`;
+- `close`, then `fstat`: `EBADF`;
+- reopen without `O_CLOEXEC`: the flag clear.
+
+A write of `dim=50` came back in the next read, and the shell smoke passed.
+
+**Pre-existing, unchanged:** `/dev/power` renders a fresh snapshot on every read and never returns
+0, so `cat /dev/power` does not end. `powerd` reads once. Path `stat`s of these nodes
+(`ls -l /dev/power`) fail with `ENOENT` because the VFS has no entries for them; only the
+descriptor answers.
+
+**Step 3: the refusals are glue's, for both kernels.** Steps 1 and 2 left the Linux-correct
+refusals where they were: in glue-amd64 (`openat`'s four, the `O_RDONLY` write) and in amd64's own
+preambles (`pread64`'s `ESPIPE`, the `/dev` `lseek`). Each had a comment saying it stayed out of glue
+because the change would land on AArch64 too, and AArch64 was not verified from this machine. Both
+kernels are verified here now (HVF and TCG), and Linux gives an oracle: `userspace/forktest/c_stress/fdrefuse.c`,
+22 rows, run as the same static musl binary on Linux 7.0 (Lima `fc`) and on each kernel.
+
+Before the step, against Linux:
+
+| row | Linux | AArch64 | amd64 |
+|---|---|---|---|
+| `O_CREAT\|O_EXCL` on a present file | `EEXIST` | opened | `EEXIST` |
+| `O_DIRECTORY` on a file | `ENOTDIR` | opened | `ENOTDIR` |
+| `O_CREAT` on a directory | `EISDIR` | opened | `EISDIR` |
+| `O_NOFOLLOW` on a symlink | `ELOOP` | opened | `ELOOP` |
+| `write` on `O_RDONLY` | `EBADF` | wrote | `EBADF` |
+| `pwrite` on `O_RDONLY` | `EBADF` | wrote | wrote |
+| `read`/`pread` on `O_WRONLY` | `EBADF` | read | read |
+| `pread`/`pwrite` on a pipe | `ESPIPE` | `EBADF` | `ESPIPE`/`EBADF` |
+| `pread`/`pwrite` on a socketpair | `ESPIPE` | `EBADF` | `EBADF` |
+| `lseek(/dev/null\|zero, 100)` | 0 | 0 | 100 |
+| `lseek(/dev/urandom, 100)` | 0 | `ESPIPE` | 100 |
+| `lseek` with `whence` 7 | `EINVAL` | 0 | `EINVAL` |
+
+AArch64 was wrong on the most rows, and `O_EXCL` was the worst of them: exclusive create, the
+primitive lock files and `mkstemp` races rely on, silently succeeded on a file that was already
+there. amd64's two `lseek` answers came from a preamble whose comment said Linux seeks a `/dev` node
+to the offset asked for. Linux does not (`null_lseek` returns 0, `/dev/urandom` is `noop_llseek`);
+glue's `0` was right and amd64 had overridden it. amd64's `pread` on a socketpair was `EBADF` despite
+its `ESPIPE` preamble, because `socket_index` knows only this kernel's own socket table, not AF_UNIX
+pairs.
+
+What moved:
+
+- `akuma_syscalls_linux::flags::open::{may_read, may_write}`: the access-mode rule, with `O_PATH`
+  and mode 3 granting neither; host-tested.
+- `ELOOP` (40) joins `akuma_primitives::errno`; glue-amd64's private copies of `EEXIST`, `ENOTDIR`,
+  `EISDIR` and `ELOOP` are gone.
+- glue `fs::open_refusal`: the four, in Linux's order (`EEXIST` before `EISDIR` for
+  `O_CREAT|O_EXCL` on a directory, where glue-amd64 had them the other way round). It runs before
+  any device or `/proc/self/fd` arm, does no lookup unless one of the three flags is set, and takes
+  the VFS BKL drop for the lookups it does make.
+- glue `sys_read`/`sys_write`/`sys_pread64`/`sys_pwrite64`: `EBADF` by access mode; the `_` arm of
+  the two positioned calls is `ESPIPE`, with `BlockDev` kept `EBADF`.
+- glue `sys_lseek`: `EBADF`, then `whence > SEEK_HOLE` `EINVAL`, then `/dev/urandom` joins the 0 arm.
+- Removed: glue-amd64's `openat_resolved` (amd64 calls `fs::openat_path` directly) and its `write`
+  check; amd64's `pread64` preamble down to the unbound console fds glue cannot see; amd64's
+  `lseek` arm; the `pipe_write_id` helper that was left unused.
+
+Still amd64's: the `MAX_FDS` ceiling on `openat`/`dup2`/`dup3` (it is this kernel's lookup bound
+too, so it is not only a policy), and the block-node `ENODEV`.
+
+Gates:
+
+- clippy: amd64 default, `headless`, `no-tests`; AArch64; Taoxichuan.
+- Host tests for `akuma-syscalls-linux`.
+- Boot suites: amd64 TCG 836/846/846, `headless` 846; AArch64 HVF 315/323/321. Both are unchanged
+  from step 2.
+- `fdrefuse`: identical to Linux on both kernels.
+- An ssh shell smoke on both kernels: `>>`, `set -C`, `sed -i`, `cp -r`, `find`, a 1.2 MB
+  `dd`/`cp`/`cmp`, `mv`, a symlink, `sort -o`, and a busybox `tar` round trip.
+
+**Not changed, pinned:**
+
+- `dup3` replacing a device descriptor still does not release the device (step 2).
+- `pread` on a `TimerFd` answers `EAGAIN` and on an `EpollFd` `EINVAL`, where Linux's `ESPIPE`
+  check comes first.
+- `pread` on a `BlockDev` is `EBADF`.
+
+### Slice 5: mm (deferred, 2026-11-11)
+
+Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral
+`akuma_mmap::Prot`, filled by its own `mm::fault_in`. AArch64 splits them: eager regions in
+`mmap_regions`, lazy ones in `Process::lazy_regions`, whose entries carry **AArch64 PTE bits**
+(`page_flags: u64`) and which `akuma-exceptions`' fault handler reads. Glue's `mem.rs` writes the
+second shape, so routing amd64's `mmap` to it would hand its fault path regions it cannot read; even
+`brk` depends on which fault path knows the heap. Converging is one region model and one fault path.
+That touches AArch64's self-host and CoW fault path, so it gets a design doc first; the threads
+slice went ahead of it.
+
+### Slice 6: threads (2026-11-11)
+
+Thread creation was already one copy: both kernels call `akuma_exec::process::clone_thread`. What
+differed was the arm around it. `userspace/forktest/c_stress/cloneflags.c` is the oracle: raw
+`clone` syscalls, because musl's `clone()` refuses `CLONE_VM` without `CLONE_VFORK` before the kernel
+sees it. Before the slice:
+
+| case | Linux 7.0 | AArch64 | amd64 |
+|---|---|---|---|
+| Go's flag word, no `CLONE_SETTLS` | ran | ran | `EINVAL` |
+| `pthread_create`'s flag word | ran | ran | ran |
+| `CLONE_VM\|CLONE_THREAD` without `CLONE_SIGHAND` | `EINVAL` | ran | `EINVAL` |
+| `CLONE_SIGHAND` without `CLONE_VM` | `EINVAL` | `ENOSYS` | `EINVAL` |
+
+amd64 refused every Go OS thread. It required `CLONE_SETTLS` on the reasoning that a thread without it
+"runs on the parent's `%fs`". On Linux it does, and Go's runtime asks for exactly that, then sets
+its TLS itself in the child.
+
+Shared code had the matching bug. `clone_thread` installed the `tls` argument unconditionally, so
+a thread made without `CLONE_SETTLS` got whatever the register held. It now keeps the parent's TLS
+base unless `CLONE_SETTLS` is set.
+
+Now:
+
+- glue's `sys_clone` asks `akuma_syscalls_proc::clone::decode` for the two `EINVAL` combinations,
+  the rule the x86 kernels already used.
+- glue `proc::clone_thread` is every kernel's thread arm. It drains retired process rows first:
+  amd64 did that to stop thread churn from filling the process table, and it is one copy now.
+  It maps a thread-slot or table limit to `EAGAIN`, a zero stack to `EINVAL` and memory to
+  `ENOMEM`.
+- Removed:
+  - glue's second, post-ready seed of the signal mask, since `clone_thread` seeds it before ready;
+  - amd64's `CLONE_THREAD`, stack and `CLONE_SETTLS` refusals and its errno mapping;
+  - `usermode::clone_flags`.
+- amd64 keeps one check, a caller with no process slot.
+
+Gates: `cloneflags` matches Linux on both kernels. `thrprobe` (8 × 12 threads) and
+`pthread_kill_eintr` pass on both, and `futextest` passes on amd64. Clippy is clean on amd64
+(default, `headless`, `no-tests`), AArch64 and Taoxichuan. The boot suites hold: amd64 TCG
+836/846/846, `headless` 846; AArch64 HVF 315/323/321.
+
+**Found on the way, pre-existing:** on AArch64, `futextest` step 6 (500 thread create/join rounds)
+fails with `[asid] EXHAUSTED` in `UserAddressSpace::new_shared`. Repeated runs leave the box unable
+to spawn a process, and ssh stops answering. The kernel from before any slice (`mrg`, 16:43) behaves
+the same, and the drain at clone does not cure it, so ASIDs are leaked, not slow to come back.
+Next item.
