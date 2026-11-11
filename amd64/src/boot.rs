@@ -188,6 +188,8 @@ pub fn install_shared_sinks() {
         // The fifth: the tap node's gateway queue (`/dev/net/tun`), a relaxed flag the pump refreshes.
         dev_tun_has_frame: crate::drivers::hypervisor_tun_has_frame,
     });
+    // This kernel's character devices, behind glue's fd arms (`crate::chardev`).
+    crate::chardev::register();
     // The wake effect for the **one** pipe table (4b batch 2b). This target
     // shares `akuma-syscalls-glue`'s table rather than keeping a second
     // instance of `akuma_pipes::PipeTable` — two instances meant two id

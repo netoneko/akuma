@@ -53,6 +53,12 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     // A pseudo-terminal answers every terminal request itself, from its own
     // pair rather than the process's console `TerminalState`; only the four
     // descriptor-level requests (`FIONBIO`, `FIOCLEX`, ...) fall through.
+    // A device its kernel serves itself (`chardev`).
+    if let Some(d) = proc.get_fd(fd)
+        && let Some(r) = super::chardev::ioctl(fd, &d, cmd, arg)
+    {
+        return r;
+    }
     let pty = match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::PtyMaster(n)) => Some((n, true)),
         Some(akuma_exec::process::FileDescriptor::PtySlave(n)) => Some((n, false)),

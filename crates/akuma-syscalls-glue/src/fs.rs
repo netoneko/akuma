@@ -363,6 +363,10 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // Pseudo-terminals read through their own module: fixed buffers, no heap
     // copy of `count` (the arms below allocate one), and the pty's own
     // `VMIN`/`VTIME`, `O_NONBLOCK` and hangup answers.
+    // A device its kernel serves itself (`chardev`).
+    if let Some(r) = super::chardev::read(fd_num as u32, &fd, buf_ptr, count) {
+        return r;
+    }
     match fd {
         akuma_exec::process::FileDescriptor::PtyMaster(n) => return super::pty::read(fd_num as u32, n, true, buf_ptr, count),
         akuma_exec::process::FileDescriptor::PtySlave(n) => return super::pty::read(fd_num as u32, n, false, buf_ptr, count),
@@ -1081,6 +1085,10 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     };
 
     // Pseudo-terminals: see the matching arm in `sys_read`.
+    // A device its kernel serves itself (`chardev`).
+    if let Some(r) = super::chardev::write(fd_num as u32, &fd, buf_ptr, count) {
+        return r;
+    }
     match fd {
         akuma_exec::process::FileDescriptor::PtyMaster(n) => return super::pty::write(fd_num as u32, n, true, buf_ptr, count),
         akuma_exec::process::FileDescriptor::PtySlave(n) => return super::pty::write(fd_num as u32, n, false, buf_ptr, count),
@@ -1960,6 +1968,11 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
         }
     };
 
+    // A device its kernel serves itself (`chardev`): the resolved path names it.
+    if let Some(r) = super::chardev::open(&path, flags) {
+        return if (r as i64) < 0 { Err(r) } else { Ok(r) };
+    }
+
     // `open("/proc/self/fd/N")` is a *magic* link on Linux: it reopens the file
     // the descriptor holds, whatever its name is now. Here `/proc/<pid>/fd/N`
     // is an ordinary symlink to the fd's recorded path, so a file unlinked after
@@ -2354,6 +2367,7 @@ pub fn sys_close(fd: u32) -> u64 {
             // concurrent `cargo build` spawns from nca's multi-threaded runtime.
             proc.clear_cloexec(fd);
             proc.clear_nonblock(fd);
+            super::chardev::close(fd, &entry);
             match entry {
                 akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
                 akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
@@ -2419,6 +2433,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
             // number while this fd's `nonblock` bit is still stale.
             proc.clear_cloexec(fd);
             proc.clear_nonblock(fd);
+            super::chardev::close(fd, &entry);
             match entry {
                 akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
                 akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
@@ -2534,7 +2549,12 @@ pub fn fstat_fill(fd: u32) -> Result<Stat, u64> {
     let proc = akuma_exec::process::current_process_shared().ok_or(ESRCH)?;
 
     let mut stat = Stat::default();
-    let res = match proc.get_fd(fd) {
+    let entry = proc.get_fd(fd);
+    // A device its kernel serves itself (`chardev`).
+    if let Some(r) = entry.as_ref().and_then(super::chardev::fstat) {
+        return r;
+    }
+    let res = match entry {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
             // Only this arm reaches the on-disk VFS; every other arm below synthesizes a
             // Stat from constants (or forwards cross-core, which must keep the BKL).

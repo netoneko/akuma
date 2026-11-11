@@ -612,28 +612,9 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // error), and the boot suite had to have a **process identity**, since
         // every descriptor-freeing arm in glue resolves
         // `current_process_shared()` first.
-        Syscall::Close => {
-            // Closing a `/dev/fb0` descriptor gives the screen back to the
-            // console (`fbdev`). Any one of the owner's descriptors: POSIX
-            // record locks follow the same rule, and a program holding two
-            // `fb0` fds is not a case anything here produces.
-            if crate::fd::is_dev_fb(a1)
-                && let Some(p) = current_process()
-            {
-                crate::fbdev::release(p.tgid);
-            }
-            // The tap: host sockets and the gateway's slots go back (`drivers::Hypervisor`).
-            if crate::fd::is_dev_tun(a1) {
-                crate::drivers::hypervisor_tun_release();
-            }
-            // A `/dev/wifi0` descriptor's read cursor (`drivers::Wireless`).
-            if crate::fd::is_dev_wifi(a1)
-                && let Some(p) = current_process()
-            {
-                crate::drivers::wireless_release(p.tgid, a1 as u32);
-            }
-            to_glue(call, [a1, 0, 0, 0, 0, 0])
-        }
+        // A device descriptor's release (the screen, the tap, wifi0's cursor) is
+        // `crate::chardev::close`, which glue's `sys_close` calls.
+        Syscall::Close => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         // `lseek(fd, offset, whence)` — **glue's arm behind one preamble**
         // (4b batch 3a): a `/dev` character node, which Linux seeks to the
         // offset asked for and glue answers `0`/`ESPIPE` for. Not routed
@@ -664,33 +645,9 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // shim dropped `dirfd`; glue's `sys_faccessat2` honours it.
         Syscall::Faccessat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Faccessat2 => to_glue(call, [a1, a2, a3, a4, 0, 0]),
-        // `close_range(first, last, flags)`: glue frees the descriptors, but the three
-        // amd64-only device descriptors (`/dev/fb0`, the tap, `/dev/wifi0`) are given back by
-        // `Syscall::Close`'s preamble — so run those hooks for every open fd in the range first,
-        // exactly as the per-fd fallback (`close` in a loop) did while this was `ENOSYS`.
-        Syscall::CloseRange => {
-            if a3 & 4 == 0
-                && let Some(p) = current_process()
-            {
-                let (lo, hi) = (a1 as u32, a2 as u32);
-                let fds: alloc::vec::Vec<u32> = akuma_primitives::irq::with_irqs_disabled(|| {
-                    p.fds.table.lock().range(lo..=hi).map(|(&fd, _)| fd).collect()
-                });
-                for fd in fds {
-                    let f = u64::from(fd);
-                    if crate::fd::is_dev_fb(f) {
-                        crate::fbdev::release(p.tgid);
-                    }
-                    if crate::fd::is_dev_tun(f) {
-                        crate::drivers::hypervisor_tun_release();
-                    }
-                    if crate::fd::is_dev_wifi(f) {
-                        crate::drivers::wireless_release(p.tgid, fd);
-                    }
-                }
-            }
-            to_glue(call, [a1, a2, a3, 0, 0, 0])
-        }
+        // `close_range(first, last, flags)`: glue frees the descriptors and calls
+        // `crate::chardev::close` for each device among them.
+        Syscall::CloseRange => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         // `dup(fd)` — x86_64 32. `apk` dups a reopened index fd during
         // signature-verification I/O setup; `ENOSYS` here made it report
         // `UNTRUSTED signature` over a fetch that was fine (see

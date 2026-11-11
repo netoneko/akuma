@@ -2186,3 +2186,47 @@ shell smoke covering redirects, `>>`, pipes, `stat` of a file, a directory and `
 **Found on the way, pre-existing:** on amd64 an `ssh host cmd` session returns nothing on the
 client's stderr. `echo x >&2` and `ls /missing` print nothing, and `2>&1` works. The kernel before
 this step does the same. This is an sshd/session item, logged here for the fd follow-up.
+
+**Step 2: amd64's devices are glue's `chardev` hooks.** Step 1 left one reason for an amd64 fd arm to
+exist: `/dev/fb0`, `/dev/wifi0`, `/dev/power`, `/dev/kvm0` and `/dev/kvm`, `/dev/net/tun` and
+`/dev/input/mouse0` are this kernel's drivers, and each arm asked "is this descriptor one of mine?"
+before calling glue. That question is now asked by glue. `akuma_syscalls_glue::chardev` holds one
+`CharDevOps` table (`open`, `read`, `write`, `vectored`, `ioctl`, `fstat`, `close`), which a kernel
+registers at boot. `amd64/src/chardev.rs` is amd64's table, made of the code that left `fd.rs`,
+`usermode.rs` and the dispatcher. Glue calls it from:
+
+| glue arm | hook |
+|---|---|
+| `fs::openat_path`, after the path is resolved | `open` |
+| `fs::sys_read`, `fs::sys_write`, before the pty match | `read`, `write` |
+| `readv`/`writev` (amd64's `usermode`, glue-amd64's `dispatch`) | `vectored`: only the tun takes the call whole |
+| `term::sys_ioctl`, before the pty lookup | `ioctl` |
+| `fs::fstat_fill` | `fstat` |
+| `fs::sys_close`, `fs::sys_close_range`, after the entry left the table | `close` |
+
+Every hook answers `Option`, and `None` is glue's own arm: the hooks only see the six `Dev*` variants
+(`chardev::is_chardev`), a device returns `None` where amd64 never answered for it, and a kernel that
+registers nothing (AArch64, Taoxichuan) gets `None` throughout. amd64's `close` and `close_range` arms
+are now plain `to_glue`; `close_range` no longer collects the range into a `Vec` to run the releases
+first. `dup3` replacing a device descriptor still does not release it, as before; this is pinned for
+step 3 rather than changed here.
+
+Gates: clippy (amd64 default, `headless`, `no-tests`; AArch64; Taoxichuan); glue-amd64 host tests;
+the unsafe budget; amd64 TCG 836/846/846 at `SMP=1/2/4`, `headless` 846 at `SMP=2`; AArch64 HVF
+315/323/321 at `SMP=1/2/4`, the same as the signals slice. On a live amd64 herd VM a static probe
+opened `/dev/power` with `O_CLOEXEC` and checked the results:
+
+- `fstat`: `S_IFCHR`, mode 0600, rdev 10:243, ino 20;
+- `F_GETFD`: `FD_CLOEXEC` set;
+- `readv` over two 8-byte `iovec`s: 16 bytes;
+- `TCGETS`: `ENOTTY`;
+- `/dev/fb0` and `/dev/wifi0` on microvm: `ENOENT`;
+- `close`, then `fstat`: `EBADF`;
+- reopen without `O_CLOEXEC`: the flag clear.
+
+A write of `dim=50` came back in the next read, and the shell smoke passed.
+
+**Pre-existing, unchanged:** `/dev/power` renders a fresh snapshot on every read and never returns
+0, so `cat /dev/power` does not end. `powerd` reads once. Path `stat`s of these nodes
+(`ls -l /dev/power`) fail with `ENOENT` because the VFS has no entries for them; only the
+descriptor answers.

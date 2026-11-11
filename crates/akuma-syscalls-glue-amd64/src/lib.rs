@@ -99,8 +99,11 @@ pub fn dispatch(nr: u64, a: [u64; 6]) -> Option<u64> {
         Syscall::Openat => openat(a[0], a[1], a[2], a[3]),
         Syscall::Read => read(a[0], a[1], a[2]),
         Syscall::Write => write(a[0], a[1], a[2]),
-        Syscall::Readv => vectored(a[0], a[1], a[2], read),
-        Syscall::Writev => vectored(a[0], a[1], a[2], write),
+        // A device that takes the call whole (`glue::chardev::vectored`), else the loop.
+        Syscall::Readv => glue::chardev::vectored(a[0] as u32, false, a[1], a[2])
+            .unwrap_or_else(|| vectored(a[0], a[1], a[2], read)),
+        Syscall::Writev => glue::chardev::vectored(a[0] as u32, true, a[1], a[2])
+            .unwrap_or_else(|| vectored(a[0], a[1], a[2], write)),
         Syscall::Pread64 => pread64(a[0], a[1], a[2], a[3]),
         Syscall::Fstat => fstat(a[0], a[1]),
         Syscall::Newfstatat => newfstatat(a[0], a[1], a[2], a[3]),

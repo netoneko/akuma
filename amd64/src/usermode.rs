@@ -1195,8 +1195,8 @@ pub fn exit_current_group() {
 /// segment ends the walk and the total so far (or the error, if nothing was
 /// written) is returned, per POSIX.
 fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
-    if crate::fd::is_dev_tun(fd) {
-        return crate::drivers::hypervisor_tun_writev(iov, cnt as usize);
+    if let Some(r) = akuma_syscalls_glue::chardev::vectored(fd as u32, true, iov, cnt) {
+        return r;
     }
     // glue-amd64's loop, with this kernel's `write` per entry so the console
     // and its devices are reached the way a plain `write` reaches them.
@@ -1205,8 +1205,8 @@ fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
 
 /// `readv(fd, iov, iovcnt)` — the mirror of [`sys_writev`].
 fn sys_readv(fd: u64, iov: u64, cnt: u64) -> u64 {
-    if crate::fd::is_dev_tun(fd) {
-        return crate::drivers::hypervisor_tun_readv(iov, cnt as usize);
+    if let Some(r) = akuma_syscalls_glue::chardev::vectored(fd as u32, false, iov, cnt) {
+        return r;
     }
     akuma_syscalls_glue_amd64::vectored(fd, iov, cnt, crate::fd::sys_read)
 }
@@ -1539,32 +1539,7 @@ fn owns_non_console_channel() -> bool {
 pub fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     const EFAULT: u64 = (-14i64) as u64;
 
-    // `/dev/wifi0`: command lines for the wifi driver (`drivers::Wireless`).
-    if crate::fd::is_dev_wifi(fd) {
-        return crate::drivers::wireless_dev_write(buf, len as usize);
-    }
-
-    // `/dev/net/tun`: one frame behind its virtio-net header (`drivers::Hypervisor`).
-    if crate::fd::is_dev_tun(fd) {
-        return crate::drivers::hypervisor_tun_write(buf, len as usize);
-    }
-
-    // `/dev/kvm0`: a VM spec, `stop` or `status` (`drivers::Hypervisor`). Refused whole.
-    if crate::fd::is_dev_kvm(fd) {
-        return crate::drivers::hypervisor_ctl_write(buf, len as usize);
-    }
-
-    // `/dev/input/mouse0`: control lines (`natural`, `natural=0|1`) — the
-    // scroll-direction toggle (`crate::touchpad::dev_write`).
-    if crate::fd::is_dev_mouse(fd) {
-        return crate::drivers::pointer_dev_write(buf, len as usize);
-    }
-
-    // `/dev/power`: `dim=<percent>` lines for the power daemon's lever
-    // (`crate::power`). Parsed whole before any line applies.
-    if crate::fd::is_dev_power(fd) {
-        return crate::power::dev_write(buf, len as usize);
-    }
+    // This kernel's own devices are `crate::chardev`'s, reached from glue's `sys_write`.
 
     // See the header: first, and by both spellings — **unless this process's
     // stdout belongs to a channel of its own**, which is what an `ssh` session's
