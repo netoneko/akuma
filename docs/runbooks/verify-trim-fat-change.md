@@ -169,7 +169,7 @@ cargo test --target "$HOST" 2>&1 \
 
 ### Can this be a host test rather than a boot test?
 
-Ask before reaching for `src/process_tests.rs`. The bar is lower than it looks:
+Ask before reaching for `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`. The bar is lower than it looks:
 `akuma-exec` already runs 210 host tests, `with_irqs_disabled` is a no-op off
 `target_os = "none"`, `current_thread_id` is `akuma_primitives::preempt::current_tid`,
 and the wake path is atomic-array bookkeeping — **registering and signalling a

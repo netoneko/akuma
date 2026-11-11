@@ -202,7 +202,7 @@ What that hung was `redis:alpine`'s entrypoint, whose privilege-drop gate is
 `has_cap() { setpriv -d | grep -q 'Capability bounding set:.*\bsetuid\b'; }` —
 so `box run redis:alpine` parked before it ever reached the credential wall
 below. Fixed 2026-08-20; boot-suite check `test_prctl_capbset_is_bounded`
-(`src/process_tests.rs`). The general shape: **an accepting no-op is only safe
+(`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`). The general shape: **an accepting no-op is only safe
 for a setter. For a query that a caller uses to discover a bound, "yes" to
 everything is an infinite loop.**
 

@@ -228,7 +228,7 @@ elif [ "$use_hvf" = "1" ]; then
   echo "[cargo_runner] accelerator: HVF (-accel hvf -cpu host). HVF=0 to force TCG." >&2
 
   # HVF + a boot-test build + under 2 GB = `Assertion failed: (isv)` and QEMU
-  # exits 134 before the suite finishes. `src/tests.rs`'s user-copy trampoline
+  # exits 134 before the suite finishes. `crates/akuma-kernel-tests-aarch64/src/tests.rs`'s user-copy trampoline
   # test deliberately runs a copy off the end of mapped kernel memory; below
   # 2048 that cliff lands where HVF cannot resolve the access as plain RAM, so
   # it reports ISV=0 and QEMU asserts instead of the guest taking the fault.

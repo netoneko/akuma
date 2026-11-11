@@ -352,7 +352,7 @@ or directory` rather than `can't open`, which is the only tell that the file was
 found and the *read* was what failed
 ([`../../archive/DEVBOX_ISSUES.md`](../../archive/DEVBOX_ISSUES.md) Issue 4).
 `read_at`'s whitelist must name every path `read_file` renders; the boot-suite
-check is `test_procfs_virtual_files_are_readable` (`src/process_tests.rs`),
+check is `test_procfs_virtual_files_are_readable` (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`),
 which drives `openat` + `read` rather than calling `read_file` — testing the
 renderer directly is what kept the gap invisible.
 

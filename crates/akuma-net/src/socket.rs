@@ -438,7 +438,7 @@ where F: FnOnce(&KernelSocket) -> R
 /// Exists because the properties that matter — a parked waiter registers itself
 /// so `wake_all` can reach it, and a waiter nothing ever wakes still returns on
 /// the backstop instead of hanging — are not reachable through the public socket
-/// API without a live TCP peer. Used by `src/process_tests.rs`.
+/// API without a live TCP peer. Used by `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`.
 #[cfg(feature = "smoltcp")]
 #[doc(hidden)]
 pub fn wait_until_for_boot_test(

@@ -177,7 +177,7 @@ pub fn fork_page_count_for_len(len: usize) -> Option<usize> {
 /// Pure, and deliberately so: both fork arms call it and its four regression
 /// cases are host tests in this file. It previously existed as an inline
 /// expression in each arm plus a **third copy in the boot suite**
-/// (`src/process_tests.rs`, a `fork_code_start` helper the tests exercised
+/// (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, a `fork_code_start` helper the tests exercised
 /// *instead of* this logic — so they could not fail when production drifted).
 /// See `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.11.
 #[must_use]
@@ -3921,7 +3921,7 @@ mod fork_copy_math_tests {
     //! Host tests for [`fork_code_start`] and [`fork_page_count_for_len`] — the
     //! pure arithmetic behind `fork_process`'s copy range.
     //!
-    //! These four `code_start` cases were **boot** tests in `src/process_tests.rs`
+    //! These four `code_start` cases were **boot** tests in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`
     //! (`test_fork_code_start_*`, `test_fork_brk_len_no_underflow_go_binary`) that
     //! exercised a `fork_code_start` helper defined *in the test file* — a mirror
     //! of the production expression, so they could not fail when production
@@ -4110,7 +4110,7 @@ mod grace_kill_tests {
 /// Lives here, in the crate that owns `Process`, rather than in the boot suite
 /// that grew it. It moved on 2026-09-01 for a structural reason: `src/syscall/`
 /// reached `crate::process_tests::make_test_process` from four of its own
-/// `cfg(kernel_tests)` blocks, and `src/process_tests.rs` reaches 352 symbols
+/// `cfg(kernel_tests)` blocks, and `crates/akuma-kernel-tests-aarch64/src/process_tests.rs` reaches 352 symbols
 /// back into `src/syscall/` — a cycle that blocked `src/syscall/` from becoming
 /// a crate (`docs/archive/SRC_SYSCALL_EXTRACTION.md`, Blocker 2). It was a
 /// 43-line function with **zero** `crate::` references, so it simply belonged

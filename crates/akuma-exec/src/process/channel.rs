@@ -638,7 +638,7 @@ pub fn remove_terminal_state(thread_id: usize) -> Option<Arc<Spinlock<terminal::
 ///
 /// What is therefore **not** covered here, and needs the boot suite: that a
 /// woken thread actually runs. `test_process_channel_write_bounded_backpressure`
-/// in `src/process_tests.rs` is the in-VM half.
+/// in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs` is the in-VM half.
 #[cfg(test)]
 mod tests {
     use super::*;

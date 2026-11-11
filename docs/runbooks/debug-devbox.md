@@ -11,7 +11,7 @@ symptom on the left. For build/verify steps, see
   a control byte that makes plain `grep` treat the log as binary — use
   `grep -a`.
 - **rump_server log** (in-VM): `/var/log/box/0/rump_server.log`.
-- **Boot self-tests** (`src/process_tests.rs`, `src/pthread_tests.rs`) halt on
+- **Boot self-tests** (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, `crates/akuma-kernel-tests-aarch64/src/pthread_tests.rs`) halt on
   regression.
 
 ## Symptom → cause → fix

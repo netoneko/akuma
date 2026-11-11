@@ -47,7 +47,7 @@ pub use akuma_pmm::cow_ref_dec;
 /// `cow_ref_count` has never had a production caller here. `cow_ref_inc` lost
 /// its last one on 2026-09-01, when the file-page cache moved to
 /// `akuma-fpcache` and began calling `akuma_pmm` directly — what is left are the
-/// CoW refcount self-tests in `src/tests.rs` and `src/process_tests.rs`, which
+/// CoW refcount self-tests in `crates/akuma-kernel-tests-aarch64/src/tests.rs` and `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, which
 /// `extreme-size` compiles out (`no-tests`) while still building with
 /// `-D unused-imports`.
 #[allow(unused_imports)]
@@ -199,7 +199,7 @@ pub fn free_page_at(frame: PhysFrame, site: akuma_pmm::FreeSite) {
 /// `#[cfg(kernel_tests)]` since 2026-08-31: the kernel heap was this shim's only
 /// production caller, and it moved to `crates/akuma-alloc`, which talks to
 /// `akuma_pmm` in raw `usize` PAs and needs no `PhysFrame` conversion. What is
-/// left are the PMM boot self-tests in `src/tests.rs`, which do want the typed
+/// left are the PMM boot self-tests in `crates/akuma-kernel-tests-aarch64/src/tests.rs`, which do want the typed
 /// form — so the wrapper follows them. Without the gate, `extreme-size`
 /// (`no-tests` + `-D dead-code`) fails to build.
 #[cfg(kernel_tests)]

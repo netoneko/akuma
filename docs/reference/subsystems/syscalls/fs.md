@@ -240,7 +240,7 @@ Two details worth not re-deriving:
   "bad argument" and stops a caller from retrying without the flag; `EOPNOTSUPP`
   is Linux's own answer and invites the retry.
 
-Boot-suite check: `test_pvec2` (`src/process_tests.rs`), whose load-bearing case
+Boot-suite check: `test_pvec2` (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`), whose load-bearing case
 is the two-iovec positional write — an offset that fails to advance between
 iovecs makes the second overwrite the first.
 

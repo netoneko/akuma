@@ -170,7 +170,7 @@ thread-slot echo of the `register_process` rule in
 where the caller controls its own lock context.
 
 > ⚠ **Untested by the boot suite.** `test_thread_slot_reclaim_on_spawn`
-> (`src/process_tests.rs:1273`) drives `spawn_user_thread_fn`, i.e. only the
+> (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs:1273`) drives `spawn_user_thread_fn`, i.e. only the
 > `_fn_internal` row. The `_initializing` row is covered only by the userspace
 > repro (`userspace/forktest/c_stress/futextest.c` phase 2).
 

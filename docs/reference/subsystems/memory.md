@@ -293,8 +293,8 @@ Full investigation, including how the locks were named without debug info and th
 three ways the regression test was wrong first:
 [`../../archive/PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md`](../../archive/PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md).
 
-Regression tests: `pmm_heap_lock_order` (`src/tests.rs`, single-core) and
-`pmm_heap_lock_order_smp` (`src/process_tests.rs`, cross-core). **Both detect a
+Regression tests: `pmm_heap_lock_order` (`crates/akuma-kernel-tests-aarch64/src/tests.rs`, single-core) and
+`pmm_heap_lock_order_smp` (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, cross-core). **Both detect a
 regression by HANGING the boot suite, not by failing** — the `PMM` side spins
 with IRQs masked, so there is no verdict to print.
 

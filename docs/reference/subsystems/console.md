@@ -135,7 +135,7 @@ Two narrow exemptions, both established by the audit rather than assumed:
    `is_print_registered()` and skips the format-and-print entirely when unset.
    A diagnostic must never be the thing that panics.
 
-Boot self-tests (`src/tests.rs`, `src/process_tests.rs`, `src/shell_tests.rs`)
+Boot self-tests (`crates/akuma-kernel-tests-aarch64/src/tests.rs`, `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, `src/shell_tests.rs`)
 are out of scope — they run in ordinary thread context at boot, never inside
 IRQ/lock/allocator-reentrant code, and their `format!` calls mostly build test
 fixture paths rather than console content. Likewise `/proc` file *contents*

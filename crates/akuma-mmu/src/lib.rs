@@ -4798,7 +4798,7 @@ mod icache_tests {
     // On the host target the cache-maintenance asm is compiled out, so this only
     // guards that `sync_icache_range` is callable and that the `len == 0` and
     // sub-cache-line cases don't panic / over-run. The real coherency proof is the
-    // on-target boot self-test `test_icache_sync_rewrites_code` (src/process_tests.rs),
+    // on-target boot self-test `test_icache_sync_rewrites_code` (crates/akuma-kernel-tests-aarch64/src/process_tests.rs),
     // which writes + rewrites executable code and runs it (docs/AKUMA_SELF_HOSTING.md §7j).
     #[test]
     fn sync_icache_range_handles_edge_lengths() {

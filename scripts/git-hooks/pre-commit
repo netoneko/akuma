@@ -30,7 +30,7 @@ fi
 
 echo "console-print rule: no format!/alloc::format! feeding a console print call"
 VIOLATIONS="$(grep -rnE '(print_str|safe_print!|tprint!|console::print)[!(].*(format!|alloc::format!)' src/ crates/*/src/ --include='*.rs' \
-    | grep -vE '^src/(tests|process_tests|shell_tests)\.rs:')"
+    | grep -vE '^(src|crates/akuma-kernel-tests-aarch64/src)/(tests|process_tests|shell_tests)\.rs:')"
 if [ -n "$VIOLATIONS" ]; then
     echo "$VIOLATIONS"
     echo "ERROR: format!/alloc::format! result passed into a console print call — heap allocation on a console path."

@@ -2749,7 +2749,7 @@ fn proc_consistency_check(t: &mut Suite) {
 /// sites, so the triple is written here rather than there.
 ///
 /// The AArch64 kernel has had this since long before: `register_at_syscall_process`,
-/// used 25 times in `src/process_tests.rs`.
+/// used 25 times in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`.
 pub fn boot_row_register() -> usize {
     let tid = akuma_exec::threading::current_thread_id();
     akuma_exec::process::register_process(1, akuma_exec::process::make_test_process(1));

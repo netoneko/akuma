@@ -111,7 +111,7 @@ fn shebang_line_of(path: &str) -> Option<(String, Option<String>)> {
 /// `interp1`.
 ///
 /// Public so the boot suite can drive it against the real VFS
-/// (`spawn_resolves_a_shebang_script` in `src/process_tests.rs`) without
+/// (`spawn_resolves_a_shebang_script` in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`) without
 /// spawning a process during boot; the pure halves it is built from are
 /// host-tested in `shebang_tests` below.
 pub fn resolve_shebang_chain(resolved: &str, display: &str) -> (String, Vec<String>) {

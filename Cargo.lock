@@ -40,6 +40,7 @@ dependencies = [
  "akuma-kernel",
  "akuma-kernel-core",
  "akuma-kernel-glue",
+ "akuma-kernel-tests-aarch64",
  "akuma-locks-rw",
  "akuma-net",
  "akuma-net-unix",
@@ -572,6 +573,34 @@ dependencies = [
  "akuma-vfs-glue",
  "akuma-virtio",
  "log",
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-kernel-tests-aarch64"
+version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-cpu",
+ "akuma-entry",
+ "akuma-exceptions",
+ "akuma-exec",
+ "akuma-ext2",
+ "akuma-isolation",
+ "akuma-kernel-core",
+ "akuma-kernel-glue",
+ "akuma-net",
+ "akuma-net-yarn",
+ "akuma-phys",
+ "akuma-primitives",
+ "akuma-syscalls",
+ "akuma-syscalls-linux",
+ "akuma-tty",
+ "akuma-vfs",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "log",
+ "smoltcp",
  "spinning_top",
 ]
 

@@ -9378,7 +9378,7 @@ extern "C" fn waker_test_park_trampoline() -> ! {
 /// dispatches to the phantom slot and hits the scheduler's `[SGI-S FATAL]
 /// new_sp=0x0` halt — the exact failure mode already documented on
 /// `test_kill_thread_group_reaps_futex_blocked_sibling` in
-/// `src/process_tests.rs`, which independently arrived at the same fix: use a
+/// `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, which independently arrived at the same fix: use a
 /// really-spawned slot, not a bare one.
 ///
 /// A valid context alone isn't quite enough, though: unlike the old bare-slot

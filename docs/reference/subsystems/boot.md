@@ -53,9 +53,9 @@ For debugging, see [`../../runbooks/debug-boot-hang.md`](../../runbooks/debug-bo
 
 ## Boot self-test mechanism
 
-- **Modules:** `src/tests.rs`, `src/async_tests.rs`, `src/daif_tests.rs`,
-  `src/fs_tests.rs`, `src/sync_tests.rs`, `src/pthread_tests.rs`,
-  `src/process_tests.rs`, `src/shell_tests.rs`.
+- **Modules:** `crates/akuma-kernel-tests-aarch64/src/tests.rs`, `crates/akuma-kernel-tests-aarch64/src/async_tests.rs`, `crates/akuma-kernel-tests-aarch64/src/daif_tests.rs`,
+  `crates/akuma-kernel-tests-aarch64/src/fs_tests.rs`, `crates/akuma-kernel-tests-aarch64/src/sync_tests.rs`, `crates/akuma-kernel-tests-aarch64/src/pthread_tests.rs`,
+  `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, `src/shell_tests.rs`.
 - **Order** (`src/main.rs:911+`): DAIF → memory → async → (after fs mount) fs →
   threading → futex sync → pthread → process → shell → benchmarks.
 - **Halt on regression:** returns false → `!!! … TESTS FAILED - HALTING !!!` →

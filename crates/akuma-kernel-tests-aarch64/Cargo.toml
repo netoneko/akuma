@@ -1,0 +1,60 @@
+[package]
+name = "akuma-kernel-tests-aarch64"
+version = "0.1.0"
+edition = "2024"
+description = "The AArch64 root kernel's boot self-test suite (moved out of src/ so the bin is only its entry). Registered through akuma_kernel::entry!'s before_main."
+
+[lints]
+workspace = true
+
+# Each is a flag the suite reads with `cfg(feature = ...)`, and nothing else: the root
+# package forwards its own feature of the same name here, and it, not this crate, turns the
+# kernel crates' features on. `no-tests`, `extreme`, `smp-shared`, `bkl-profile`,
+# `no-bkl-network`, `no-bkl-process`, `sound` and `platform-firecracker` are read by `build.rs`
+# instead, to derive the same `kernel_*` cfgs the root's `build.rs` does.
+[features]
+smp-shared = []
+no-tests = []
+extreme = []
+bkl-profile = []
+smoltcp = ["dep:smoltcp"]
+rump = []
+rump-tests = []
+sc-containers = []
+sc-epoll = []
+sc-pidfd = []
+fs-cache = []
+epoll-waker-trace = []
+net-waker-park = []
+net-profile = []
+no-bkl-network = []
+no-bkl-process = []
+sound = []
+platform-firecracker = []
+
+# Kernel-only, like the suite. Every spec is copied from the root manifest **exactly**,
+# default features included: a dependency named here with more features than the root
+# names would turn them on for the whole kernel through feature unification.
+[target.'cfg(all(target_arch = "aarch64", target_os = "none"))'.dependencies]
+akuma-alloc = { path = "../akuma-alloc" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-entry = { path = "../akuma-entry" }
+akuma-exceptions = { path = "../akuma-exceptions" }
+akuma-exec = { path = "../akuma-exec", features = ["elf-loader"] }
+akuma-ext2 = { path = "../akuma-ext2" }
+akuma-isolation = { path = "../akuma-isolation", default-features = false }
+akuma-kernel-core = { path = "../akuma-kernel-core" }
+akuma-kernel-glue = { path = "../akuma-kernel-glue" }
+akuma-net = { path = "../akuma-net", default-features = false }
+akuma-net-yarn = { path = "../akuma-net-yarn" }
+akuma-phys = { path = "../akuma-phys" }
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-syscalls = { path = "../akuma-syscalls" }
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+akuma-tty = { path = "../akuma-tty" }
+akuma-vfs = { path = "../akuma-vfs" }
+akuma-vfs-glue = { path = "../akuma-vfs-glue" }
+akuma-virtio = { path = "../akuma-virtio" }
+log = { version = "0.4", default-features = false }
+smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
+spinning_top = "0.3"

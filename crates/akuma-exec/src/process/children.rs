@@ -2208,7 +2208,7 @@ mod fault_slot_tests {
     //! Host unit tests for [`FaultSlot::reclaim_report`] — the pure half of the
     //! per-page demand-paging slot's observability. `fault_slot_acquire` itself
     //! needs a live thread slot and a registered process, so it stays in the boot
-    //! suite (`src/process_tests.rs`); the classification does not.
+    //! suite (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`); the classification does not.
     use super::*;
 
     /// The hot outcomes must stay silent: this runs on every demand-paging fault,

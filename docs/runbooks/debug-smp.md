@@ -39,7 +39,7 @@ SMP=4 cargo run --profile release-smp-shared --features smp-shared     # -smp 4
 ```
 
 `SMP=N` (cargo_runner.sh) sets QEMU `-smp N`. Boot self-tests
-(`src/process_tests.rs::test_smp_shared_*`) run when tests are compiled in (no
+(`crates/akuma-kernel-tests-aarch64/src/process_tests.rs::test_smp_shared_*`) run when tests are compiled in (no
 `no-tests`). The devbox image is `--features devbox-smoltcp` (adds `no-tests`).
 
 ## Symptom → cause → fix

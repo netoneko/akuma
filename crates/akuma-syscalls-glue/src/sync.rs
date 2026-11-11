@@ -589,7 +589,7 @@ pub fn futex_purge_tid(tid: usize) {
     });
 }
 
-/// Test hooks for the boot self-test in `src/process_tests.rs`.
+/// Test hooks for the boot self-test in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`.
 ///
 /// The requeue table logic below was factored out of two byte-identical copies
 /// (FUTEX_REQUEUE / FUTEX_CMP_REQUEUE) while masking IRQs, so it is exactly the kind of

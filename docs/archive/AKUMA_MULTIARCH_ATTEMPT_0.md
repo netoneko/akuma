@@ -1313,3 +1313,40 @@ segv=0. Extreme at 16 MB: `sigspin` 5/5, panics=0; its single SEGV is the same t
 fault the baseline shows. amd64 under TCG: 829/0 at SMP=1, 839/0 at SMP=2, and 841/0 with
 `ring0-preempt`. `nm` shows `kmain` and `kmain_mb2`, now defined by the macro in the bin, at the
 same addresses as M7a. **multiboot2: not booted** (the ryzen Pop rig and the trashcan are down).
+
+## The AArch64 boot tests leave the bin: `akuma-kernel-tests-aarch64` (2026-11-11)
+
+The 35 kL of AArch64 boot self-tests (`src/tests.rs` and its eight siblings) moved with `git mv`
+into a new crate, **`akuma-kernel-tests-aarch64`**. It is gated as a whole to
+`all(target_arch = "aarch64", target_os = "none")`, so it is empty on the host and under amd64. Its
+one entry point is `register()`, which installs the `BootTestHooks` and the rump-tests hook.
+`src/main.rs` drops to the allocator, the panic handler and
+`akuma_kernel::entry!(akuma_kernel_tests_aarch64::register);`. The AArch64 bin is now as thin
+as amd64's, which is the precondition for one bin over both targets.
+
+- **cfgs.** The suite read eight `kernel_*` cfgs that the root `build.rs` derived for the bin. The crate
+  derives the same eight from its own features in its `build.rs`: `kernel_tests`,
+  `kernel_profile_extreme`, `kernel_smp_shared`, `kernel_bkl_profile`, `kernel_no_bkl_{network,process}`
+  and `kernel_audio`. The root forwards 18 features to it by name.
+- **Dependencies** are copied from the root manifest spec for spec, `default-features = false`
+  included. `cargo tree -e normal` with features is identical to M7b's for every package except
+  the new crate.
+- **Repointed** every live reference to the old `src/<test>.rs` paths (42 files; `docs/archive`
+  is left as history), plus the pre-commit hook's exemption regex.
+- **addr ratchet** `--update`, net 0 (700). M7b had committed `akuma-kernel` at +1 without running
+  the check, and the move repays it.
+
+**Gates.** Clippy is clean in default, devbox-smoltcp, extreme, devbox (rump) and on the host. Host
+tests pass, and the unsafe budget is unchanged at 414. Both images print the same 419 test strings,
+and the extreme image is the same size.
+
+*Boot suite, QEMU HVF on the Mac, two runs per cell, M7b and this build:* identical. SMP=2 323/0,
+SMP=4 321/0, and SMP=1 314/1 in **both**. The one failure is a real bug that predates the move
+(next section).
+
+*Boot suite, Lima KVM rig:* devbox at SMP=4 gives epoll 0 FAIL (1 known DIVERGE) and futex all
+pass. Extreme 16 MB gives `sigspin` 5/5. The boot suite at first failed `test_epoll_socket_waker`
+7 of 7 (9.4–11.8 ms against the 8 ms bound). **That came from the laptop running on battery, not from the move:** rerun
+on battery, the unchanged M7b image failed it the same way (10.7 and 10.4 ms) where it had passed 3/3
+an hour earlier on mains. Back on AC power, this build gave 314/0 and 322/0 at SMP=1 and 2, and at SMP=4
+the known flake (8.14 ms; `main` fails it at SMP=4 too, see W3b). **Run latency-bound gates on mains power.**

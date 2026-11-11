@@ -110,7 +110,7 @@ Regression: `sync::tests::kernel_lock_barge_against_waiters_does_not_leak_servin
 self-heal repairs the counters, so a leaking build still ends balanced (it just pays a 20M
 spin freeze per leak). The leak-specific signal is `kernel_lock_lost_ticket_recoveries()`
 — non-zero there means a ticket was genuinely lost, full stop. The boot self-test
-`test_no_bkl_ticket_recoveries` (`src/process_tests.rs:874`) currently asserts the
+`test_no_bkl_ticket_recoveries` (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs:874`) currently asserts the
 *aggregate* `kernel_lock_recoveries()` instead, which — per the false-alarm note just
 above — can fail on a healthy run that merely saw `reticket-skipped` bursts under real
 contention; treat a failure there as "go check `kernel_lock_lost_ticket_recoveries()`",
@@ -716,7 +716,7 @@ reclaiming inside `register_process`. The `ACTIVE -> RETIRED` CAS
 unregistering the same pid concurrently used to both find it and both attempt
 to free it; now exactly one wins the transition and the other's call is a no-op.
 Two new boot self-tests (`test_process_reclaim_respects_cooldown`,
-`test_unregister_process_second_call_loses_cas`, `src/process_tests.rs`) pin
+`test_unregister_process_second_call_loses_cas`, `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`) pin
 both properties, mirroring `test_thread_slot_reclaim_on_spawn`. See
 [`BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md`](../../archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md).
 

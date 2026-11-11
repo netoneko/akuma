@@ -1459,7 +1459,7 @@ pub fn cow_ledger_record(pa: usize, is_dec: bool, before: u16, after: u16) {
 
 // No `#[cfg(kernel_tests)]` here: that cfg is emitted only by the kernel
 // binary's own `build.rs` (`src/`), unreachable from this crate. The
-// kernel-test-suite-only call site (`src/process_tests.rs` via
+// kernel-test-suite-only call site (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs` via
 // `crate::pmm::cow_event_count`) is gated in `src/pmm.rs`'s thin wrapper
 // instead; this stays always-compiled and relies on LTO to strip it from
 // builds where that wrapper compiles out (extreme-size / `no-tests`).

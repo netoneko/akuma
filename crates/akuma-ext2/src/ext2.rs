@@ -843,7 +843,7 @@ enum Scan {
 //    prove — any accidental padding changes the size and fails the build).
 // 2. The `parse`/`serialize` impls under "On-disk layout codec" restate each
 //    offset as an explicit little-endian read/write, bounds-checked and
-//    host-endian-independent. Round-trip tests in `src/tests.rs` prove the two
+//    host-endian-independent. Round-trip tests in `crates/akuma-kernel-tests-aarch64/src/tests.rs` prove the two
 //    statements agree; a misplaced offset fails a test instead of a live disk.
 //
 // Nothing reinterprets these structs as bytes any more — every read from a

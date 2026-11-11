@@ -253,7 +253,7 @@ meaningful.
    `vcpu_count` assumption shows up.
 5. **The boot suite runs.** `grep -ac PASSED` on the log. Note the count is
    expected to differ from the QEMU figure (289 PASSED / 0 FAILED as of
-   2026-08-21) because ~20 assertions in `src/tests.rs` bake in QEMU virt's
+   2026-08-21) because ~20 assertions in `crates/akuma-kernel-tests-aarch64/src/tests.rs` bake in QEMU virt's
    `0x4000_0000..0x8000_0000` as "kernel RAM". Under Firecracker that range is the
    MMIO window: some of those fail loudly, and — the real hazard — others **pass
    vacuously** while covering nothing. Reworking them against
@@ -304,7 +304,7 @@ meaningful.
   `kernel_audio` (build.rs) compile out `src/ramfb.rs`, `src/fw_cfg.rs` and the
   virtio-sound driver on this platform — 0 such symbols against 14 in the QEMU
   build. Do not chase `[SND]`/`[ramfb]` lines here; they are gone by design.
-- **`src/tests.rs` map assertions** — see §7 step 5.
+- **`crates/akuma-kernel-tests-aarch64/src/tests.rs` map assertions** — see §7 step 5.
 
 ---
 

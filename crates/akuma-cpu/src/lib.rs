@@ -1687,7 +1687,7 @@ pub mod sysreg {
     ///
     /// Added 2026-09-01. The reader above already lived here, so a bare
     /// `asm!("msr fpcr, …")` in the boot suite was the *only* `asm!` in
-    /// `src/tests.rs` and the asymmetry — read admitted, write open-coded — was
+    /// `crates/akuma-kernel-tests-aarch64/src/tests.rs` and the asymmetry — read admitted, write open-coded — was
     /// the accident. Writes to FPCR belong here.
     #[inline(always)]
     pub fn set_fpcr(val: u64) {

@@ -30,14 +30,15 @@
 //! `src/` extraction `akuma-kernel-core` started. `src/main.rs` keeps only
 //! what has to live in the actual bin crate: the `#![no_std]`/`#![no_main]`
 //! attributes, `#[global_allocator]`, `#[alloc_error_handler]`,
-//! `#[panic_handler]`, and the `rust_start` entry stub the boot assembly
-//! `bl`s — plus the boot self-test suite, which stays in `src/` per the
-//! original request.
+//! `#[panic_handler]`, and `akuma_kernel::entry!`, which defines the
+//! `rust_start` symbol the boot assembly `bl`s and calls [`start`]. The boot
+//! self-test suite is `akuma-kernel-tests-aarch64` (moved out of `src/`
+//! 2026-11-11).
 //!
-//! Every module below is re-exported back into `src/main.rs`'s crate root
+//! Every module below is re-exported at `akuma-kernel-tests-aarch64`'s root
 //! (`pub use akuma_kernel_glue::x;`), the same trick `akuma-kernel-core` uses,
 //! so the ~thousands of `crate::x::y` call sites in the test files — which
-//! are descendants of the BIN crate's root, not this one — resolve unchanged.
+//! are descendants of THAT crate's root, not this one — resolve unchanged.
 //! `kernel_main`, `halt`, and the memory-layout helpers
 //! (`compute_heap_size`/`compute_memory_layout`/`reserve_calc_ram`/
 //! `compute_thread_limit`/`MemoryLayout`) were `pub(crate)` or private in
@@ -87,11 +88,10 @@ pub use akuma_kernel_core::timer;
 #[cfg(target_os = "none")]
 pub use akuma_kernel_core::timer::GLOBAL_POLL_STEP;
 
-// akuma-virtio re-exports. `block`/`rng`/`audio` are ALSO re-exported
-// separately at the bin crate's own root (`src/main.rs`) because
-// `process_tests.rs` reaches them via `crate::block`/`crate::rng`/
-// `crate::audio` as a descendant of the bin crate, not this one — two
-// independent bindings to the same upstream crate, not a conflict.
+// akuma-virtio re-exports. `rng`/`audio` are ALSO re-exported separately at
+// `akuma-kernel-tests-aarch64`'s root, because `process_tests.rs` reaches them
+// as `crate::rng`/`crate::audio` from that crate — two independent bindings to
+// the same upstream crate, not a conflict.
 pub use akuma_virtio::{audio, block, rng};
 
 // `boot`/`smp_shared` carry `global_asm!` blocks using GNU-as/ELF section
@@ -497,13 +497,13 @@ pub(crate) fn build_exec_runtime(
     (rt, cfg)
 }
 
-/// Boot self-test suite entry points, registered once from `src/main.rs`'s
-/// `rust_start` before it calls [`kernel_main`].
+/// Boot self-test suite entry points, registered once by
+/// `akuma_kernel_tests_aarch64::register`, the `before_main` the root bin hands
+/// `akuma_kernel::entry!`, before [`kernel_main`] runs.
 ///
-/// The test files (`tests.rs`, `daif_tests.rs`, ...) stay in `src/` per the
-/// original request — they are the ONE thing this crate cannot depend on,
-/// since `src/` is the bin crate and depends on THIS crate, not the other way
-/// around. `kernel_main`/`run_async_main` used to call them by bare module
+/// The test files (`tests.rs`, `daif_tests.rs`, ...) are
+/// `akuma-kernel-tests-aarch64`, the ONE thing this crate cannot depend on: it
+/// depends on THIS crate, not the other way around. `kernel_main`/`run_async_main` used to call them by bare module
 /// name when they were crate-root siblings in `main.rs`; now they go through
 /// this hook, the same `OnceCopy`-backed boot-registered-function pattern
 /// `akuma_primitives::console::set_print_hook` already uses for `console::print`.
@@ -550,7 +550,7 @@ fn boot_test_hooks() -> BootTestHooks {
     BOOT_TEST_HOOKS.require()
 }
 
-/// The rump regression-guard suite (`src/rump_tests.rs`) is gated
+/// The rump regression-guard suite (`crates/akuma-kernel-tests-aarch64/src/rump_tests.rs`) is gated
 /// independently of `kernel_tests` — it can run on a `no-tests` build when
 /// `rump-tests` is explicitly on — so it gets its own hook rather than a
 /// field on [`BootTestHooks`].
@@ -601,8 +601,8 @@ fn thread_nr_for_alloc_hook() -> u64 {
 /// boot assembly and [`kernel_main`].
 ///
 /// `before_main` runs after the console hook is installed and before `kernel_main`; the root
-/// kernel registers its boot self-tests there ([`set_boot_test_hooks`]), because the suite lives
-/// in the bin crate and this crate cannot depend back on it.
+/// kernel registers its boot self-tests there ([`set_boot_test_hooks`]), because the suite
+/// (`akuma-kernel-tests-aarch64`) depends on this crate and this crate cannot depend back on it.
 #[cfg(target_os = "none")]
 pub fn start(dtb_ptr: usize, before_main: fn()) -> ! {
     // FIRST statement in the kernel's Rust entry, before any output at all: point
@@ -1786,7 +1786,7 @@ fn run_async_main() -> ! {
 
     // Rump sysproxy / scheduling regression guards. Compile under `rump` (so
     // they also run on default-smoltcp builds that opt a herd box into rump),
-    // not gated on `rump-default`. See `src/rump_tests.rs`.
+    // not gated on `rump-default`. See `crates/akuma-kernel-tests-aarch64/src/rump_tests.rs`.
     #[cfg(all(
         not(kernel_profile_extreme),
         feature = "rump",
@@ -2580,7 +2580,7 @@ async fn memory_monitor() -> ! {
 /// T1 guards is *compiled out*, and T2's effect is only visible as a throughput
 /// difference under load. They are asserted by reading the source text.
 ///
-/// They used to live in `src/rump_tests.rs` as boot-suite tests, which embedded
+/// They used to live in `crates/akuma-kernel-tests-aarch64/src/rump_tests.rs` as boot-suite tests, which embedded
 /// `include_str!` of this file (126 KB) plus `rump_proxy.rs` (78 KB) into the
 /// **kernel image** — ~200 KB of `.rodata` in every build that compiled the boot
 /// suite. Moved here 2026-09-03: `#[cfg(test)]` means the embedding now happens

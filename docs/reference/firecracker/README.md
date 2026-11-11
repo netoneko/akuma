@@ -378,7 +378,7 @@ Never write a literal upper bound for a kernel-address test.
 - ~~**Networking untested.**~~ `VIRTIO_INTID_BASE = 32` is exercised: the
   verified boot above took a DHCP lease and carried an SSH session, both of
   which require virtio-net interrupts to be delivered at that base.
-- **`src/tests.rs` bakes in QEMU's map.** ~20 sites treat
+- **`crates/akuma-kernel-tests-aarch64/src/tests.rs` bakes in QEMU's map.** ~20 sites treat
   `0x4000_0000..0x8000_0000` as kernel RAM; under Firecracker that is the MMIO
   window. Some fail loudly, others pass vacuously, so the two `PASSED` counts are
   not comparable *in kind* even where they agree in number.

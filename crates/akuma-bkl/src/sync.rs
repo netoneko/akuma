@@ -10,7 +10,7 @@
 //! with writer priority, a stuck-spin diagnostic and an `unsafe impl
 //! lock_api::RawRwLock` — and those three `unsafe` sites were most of the reason
 //! this crate could not `forbid`. It had **zero consumers**: every `RwSpinlock`
-//! in the tree (`akuma-ext2`'s `Ext2State`, `src/tests.rs`) is
+//! in the tree (`akuma-ext2`'s `Ext2State`, `crates/akuma-kernel-tests-aarch64/src/tests.rs`) is
 //! `spinning_top::RwSpinlock`, a *different type with the same name*, which is
 //! exactly why nobody noticed. Only its own 11 tests used it.
 //!

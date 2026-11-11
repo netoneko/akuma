@@ -343,7 +343,7 @@ limitations accepted and documented rather than silently left).
   subprocess sharing its parent's controlling terminal. Host-tested directly
   (`spawn.rs`'s `terminal_inheritance_tests`) and end-to-end
   (`test_box_crossing_spawn_gets_fresh_terminal_state`,
-  `src/process_tests.rs`, `sc-containers`-gated): registers a `TerminalState`
+  `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, `sc-containers`-gated): registers a `TerminalState`
   under the test thread's id, spawns once same-box and once into a fresh
   box, and compares `Arc` identity both times.
 - **Key translation** (`akuma_ssh::util::translate_input_keys`): the

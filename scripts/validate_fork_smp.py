@@ -39,7 +39,7 @@ FAULT_PATTERNS = [
 ]
 
 # Literal template lines the kernel prints as *documentation* at boot (the bun-install
-# memory-requirements banner in `src/tests.rs`), which contain the same words as a real
+# memory-requirements banner in `crates/akuma-kernel-tests-aarch64/src/tests.rs`), which contain the same words as a real
 # fault report. Without this, every boot "crashes" on line ~634 before the hammer even
 # starts — which is exactly what `fork_hammer_result.txt` recorded.
 FAULT_FALSE_POSITIVES = [

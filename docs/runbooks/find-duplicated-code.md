@@ -108,7 +108,7 @@ back as parameters).
 - **Treat the numbers as a floor, never an estimate.** The two virtio `Hal`
   impls are ~120 lines of functionally identical code; CPD reports 35, because a
   single substituted call expression breaks the token run.
-- **Test files are ~31% of the tree** (`src/tests.rs`, `src/process_tests.rs`,
+- **Test files are ~31% of the tree** (`crates/akuma-kernel-tests-aarch64/src/tests.rs`, `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`,
   and the smaller `*_tests.rs`). Split them out before quoting a figure — they
   turn out to be *less* duplicated than production code, so lumping them in
   understates the real problem.

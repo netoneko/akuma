@@ -859,7 +859,7 @@ pub mod test_hooks {
     }
 
     /// `(own_slot, stamped own generation, live generation of that slot)`.
-    /// `test_identity_generation_detects_recycle` (`src/process_tests.rs`)
+    /// `test_identity_generation_detects_recycle` (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`)
     /// asserts the last two diverge after a recycle and that the stale entry
     /// does not resolve to the slot's next occupant.
     pub fn generation_state(tid: usize) -> (u16, u32, u32) {

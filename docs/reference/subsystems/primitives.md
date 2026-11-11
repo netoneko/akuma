@@ -247,7 +247,7 @@ crate means a graph without that crate (`cargo test -p akuma-ext2`) silently get
 the no-op. `akuma-ext2` forwards `no-bkl-vfs` for the same reason.
 
 **This is guarded by a boot self-test.** `test_preempt_guard_is_live`
-(`src/process_tests.rs`) asserts the guard is non-zero-sized, that nesting is
+(`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`) asserts the guard is non-zero-sized, that nesting is
 counted, and that `MAX_THREADS` matches the profile. A healthy boot prints:
 
 ```

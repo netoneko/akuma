@@ -102,7 +102,7 @@ pub(crate) fn register_services() {
 // ---------------------------------------------------------------------------
 // Regression probe: is the EL1 sync exception transparent to x4-x18?
 //
-// Gated on `kernel_tests` like `src/process_tests.rs`, its only caller: the
+// Gated on `kernel_tests` like `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, its only caller: the
 // extreme-size profile drops the boot suite, and a probe that provokes a data
 // abort has no business in a build that will never assert on it.
 // ---------------------------------------------------------------------------
