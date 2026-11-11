@@ -1,6 +1,6 @@
 //! Preemptive threading: the fixed-size thread pool, the lock-free per-thread
 //! state arrays, the context switch, park/wake, per-thread stacks and overflow
-//! detection, and the `thread_start` / SGI-scheduler trampolines.
+//! detection.
 //!
 //! # What this crate is for
 //!
@@ -493,35 +493,6 @@ static CURRENT_TRAP_FRAME: [AtomicU64; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
-/// ON-CPU gate for the cross-core stack-sharing races (the SMP=4 boot-storm EL1
-/// crashes / BKL_RUSTC_SCALING_BASELINE.md §5.1 corruption family).
-///
-/// Set while a thread is (or may still be) executing on some core; a thread may
-/// be PICKED by a scheduler only when its gate is clear. Two distinct races
-/// require this, and thread STATE alone catches neither:
-///
-/// 1. **Switch-out tail.** `commit_switch` marks the outgoing thread READY and
-///    POOL is released when `sgi_scheduler_handler_with_sp` returns — but the
-///    switching core keeps EXECUTING ON THE OUTGOING THREAD'S KERNEL STACK
-///    until the vector asm's `mov sp, x0` (Rust epilogues, BKL reconcile and
-///    tag bookkeeping all run on it after POOL is gone). A peer picking the
-///    thread in that window resumes it onto a stack still in use.
-/// 2. **Wake-before-switch-out.** `schedule_blocking` stores WAITING (often
-///    with an already-expired deadline) while the thread is STILL RUNNING,
-///    before its yield-SGI fires. A peer's wake-pass / `mark_thread_ready`
-///    flips it READY and a peer scheduler resumes it from its STALE `ctx.sp`
-///    (the previous switch-out's frame) while it is still running elsewhere —
-///    a double-run on one stack. Observed as EL1 `ret` into kernel data /
-///    `ELR=0x8` with SP in another thread's stack, and as §5.1's ERET to EL0
-///    with a kernel register file.
-///
-/// Protocol: `commit_switch` sets the gate for the INCOMING thread (and
-/// defensively re-asserts the outgoing thread's, which stays set from its own
-/// switch-in); the outgoing tid is recorded per-core and its gate is cleared by
-/// `rust_switch_finished`, called from the vector asm immediately AFTER
-/// `mov sp, x0`. Bringup sites (boot thread, per-core idle claim) set the gate
-/// for the thread they start life running. Pickers and the slot recycler skip
-/// gated threads.
 // `ON_CPU` and `PER_CORE_OFFCPU` live in `akuma-switch`, beside `rust_switch_finished` which clears them.
 
 /// Per-thread *expected* TTBR0 L0 base — the physical page-table root this
@@ -760,97 +731,10 @@ static WOKEN_STATES: [AtomicBool; MAX_THREADS] = {
     [INIT; MAX_THREADS]
 };
 
-/// Wakeup-locality hint: the tid of a thread just promoted READY by an explicit
-/// `wake()` (futex/cond signal), which the scheduler prefers to run NEXT (once)
-/// instead of waiting a full round-robin cycle. Set in [`ThreadWaker::wake`],
-/// consumed (swapped to `MAX_THREADS`) in `schedule_indices`.
-///
-/// GATED OFF ([`WAKEUP_LOCALITY_HINT`] = false): tried as a rump-sysproxy latency
-/// fix; measured NO improvement (the per-syscall cost is not the woken-thread
-/// scheduling delay — woken threads already run promptly via the SGI), so it
-/// stays disabled to keep baseline round-robin behavior. Kept for a future,
-/// more-targeted use. The real latency lever is the fiber rumpuser backend.
-/// Re-tested 2026-08-19 against the llama.cpp `-t N` barrier collapse: flipping
-/// it ON made decode WORSE (tg16 `-t 2`: 2.5 -> 1.15 tok/s) — the single-slot
-/// hint preempts the producer thread that still has compute left. Keep it off.
-static PREEMPT_WAKE_TID: AtomicUsize = AtomicUsize::new(MAX_THREADS);
-
-/// Master switch for the [`PREEMPT_WAKE_TID`] wakeup-locality experiment. Off:
-/// the hint is never set, so the scheduler is exactly baseline round-robin.
-const WAKEUP_LOCALITY_HINT: bool = false;
-
-/// Consecutive involuntary ticks each thread has declined displacement for (the
-/// scheduler's bounded displacement bypass — see `schedule_indices`). Relaxed:
-/// only the core currently running the slot's thread writes its counter.
-static DISPLACE_DEFER: [AtomicU8; MAX_THREADS] = {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INIT: AtomicU8 = AtomicU8::new(0);
-    [INIT; MAX_THREADS]
-};
-
-/// Wake-deadline preemption (2026-08-18, `SCHEDULING_AUDIT.md` /
-/// `SCHEDULING_INVESTIGATION.md`): when the scheduler's deadline wake-pass
-/// promotes a WAITING thread to READY (its sleep/timer deadline expired), arm
-/// [`PREEMPT_WAKE_TID`] so it runs on the NEXT switch instead of joining the
-/// back of the round-robin queue.
-///
-/// Before this, eligibility was not execution: a thread whose sleep deadline
-/// had expired waited a full round-robin pass (one timeslice per runnable
-/// thread), giving short sleeps a hard floor of ~tick × runnable-threads
-/// (~35 ms measured at 3 runnable threads, 10 ms tick) and making every
-/// poll-interval cap (`BLOCKING_POLL_INTERVAL_US`,
-/// `RUMP_BLOCKING_POLL_INTERVAL_US`) inert below that floor.
-///
-/// Distinct from [`WAKEUP_LOCALITY_HINT`]: that gate arms the same hint from
-/// an explicit `ThreadWaker::wake` (futex/cond) and was measured NOT to help
-/// the rump sysproxy; this one arms it from the *deadline* wake-pass, where
-/// the measurement says the cost lives. Keep the two experiments separate.
-///
-/// Fairness: the hint fires once per wake; the preempted thread stays READY
-/// and keeps its rotation position, so a periodic short sleeper steals only
-/// its own runtime (~µs per tick), never a peer's quantum. When several
-/// sleepers expire in the same pass, the earliest deadline wins the hint and
-/// the rest wait their rotation as before.
-const WAKE_DEADLINE_PREEMPT: bool = true;
-
-/// Signal-wake preemption (2026-08-28,
-/// `docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md` §"Re-verified"):
-/// arm [`PREEMPT_WAKE_TID`] when [`pend_signal_for_thread`] promotes a thread
-/// READY, so a thread that must report `EINTR` runs on the NEXT switch instead
-/// of a full round-robin pass later.
-///
-/// This is the third, independently-gated arm on the same one-slot hint, and it
-/// exists because the other two do not cover signals:
-///
-/// - [`WAKEUP_LOCALITY_HINT`] arms it for *every* explicit `wake()`
-///   (futex/cond). Measured harmful and stays off — it preempts a producer that
-///   still has compute left (llama decode 2.5 -> 1.15 tok/s).
-/// - [`WAKE_DEADLINE_PREEMPT`] arms it from the *deadline* wake-pass only, so a
-///   signal-woken thread never sees it.
-///
-/// The measurement that motivates this arm: `pthread_kill` a thread blocked in
-/// a pipe `read`, single signal, SMP=1, 1 ms tick. The pending bit is observed
-/// correctly (`DELIVERED_SIGNALS` does its job) and the `EINTR` decision ->
-/// handler-frame setup takes 185 us — but the woken thread waits **4.4 ms** to
-/// be picked, and needs a further round to get back out to EL0, for a
-/// **11-27 ms** per-signal round trip. jobserver-rs re-signals every **10 ms**
-/// and gives up after 100 attempts, so the report lands after the caller has
-/// already declared the thread leaked. That is the same "eligibility is not
-/// execution" floor [`WAKE_DEADLINE_PREEMPT`] was added for, reached by a
-/// different path.
-///
-/// Why the llama regression does not apply here: a signal wake is not a
-/// compute-handoff. It means "this thread must observe something now", it is
-/// rare (not a per-iteration hot path), and the woken thread's next act is to
-/// return to userspace rather than to consume a work item a peer is still
-/// producing. Fairness is unchanged from the deadline arm: the hint fires once
-/// per wake and the preempted thread stays READY, keeping its rotation slot.
-const SIGNAL_WAKE_PREEMPT: bool = true;
-
-/// Real shared-kernel SMP: which thread slots are per-core idle threads. Idle threads
-/// are skipped by the round-robin scan — a core only ever runs ITS OWN idle, chosen
-/// explicitly as the fallback in `schedule_indices` — so one core can never pick
-/// another core's idle. Slot 0 (the boot/idle thread) is marked idle for core 0 at init.
+/// Real shared-kernel SMP: which thread slots are per-core idle threads. A core only
+/// ever runs ITS OWN idle (the target's `ArchHooks::can_run` answers that for
+/// [`pick_next`]), so one core can never pick another core's idle. Slot 0 (the
+/// boot/idle thread) is marked idle for core 0 at init.
 static IS_IDLE_THREAD: [AtomicBool; MAX_THREADS] = {
     const INIT: AtomicBool = AtomicBool::new(false);
     [INIT; MAX_THREADS]
@@ -858,8 +742,7 @@ static IS_IDLE_THREAD: [AtomicBool; MAX_THREADS] = {
 
 /// Per-core idle thread slot (index into the pool), or -1 if none assigned. Core 0 is
 /// slot 0 (the boot thread); each secondary registers its own via
-/// [`register_core_idle`]. `schedule_indices` falls back to this core's idle when no
-/// non-idle thread is READY.
+/// [`register_core_idle`].
 static IDLE_SLOT_FOR_CORE: [AtomicI32; MAX_CORES] = {
     const INIT: AtomicI32 = AtomicI32::new(-1);
     [INIT; MAX_CORES]
@@ -906,7 +789,7 @@ pub fn slot_stack_bounds(slot: usize) -> Option<(usize, usize)> {
 /// Exists for `init`, which must not trample slots that are ALREADY LIVE. On the
 /// self-test image `smp_shared::bringup_secondaries()` runs BEFORE `threading::init`
 /// (see `src/main.rs`), so by the time init runs, each secondary core has claimed a
-/// slot via [`adopt_current_as_core_idle`] and is *executing on it right now*. Init's
+/// slot via [`adopt_core_idle`] and is *executing on it right now*. Init's
 /// job is to set up FREE slots; for these it must keep its hands off.
 ///
 /// Reads [`IS_IDLE_THREAD`] rather than the pool, because that is what
@@ -1591,12 +1474,11 @@ pub fn ensure_pool_stack_top(slot: usize, size: usize) -> Option<usize> {
 }
 
 /// Adopt the context this core is running — a secondary's boot stack, `stack_base` and
-/// `stack_size` bytes up — as core `core_id`'s idle thread, on the hooked path: the
-/// [`adopt_current_as_core_idle`] of a kernel whose switch is a call.
+/// `stack_size` bytes up — as core `core_id`'s idle thread.
 ///
-/// The stack is recorded and its canary painted for the reason that function gives (the
+/// The stack is recorded and its canary painted because the
 /// pool's bounds are what `slot_stack_bounds` and the canary sweep read; the stack is
-/// static `.bss`, so nothing else paints it). The thread register names the slot before
+/// static `.bss`, so nothing else paints it. The thread register names the slot before
 /// it is latched running. The caller marks the slot unpickable (its `can_run`) before
 /// this core can first switch away from it. Call with interrupts masked, once per core.
 #[cfg(target_os = "none")]
@@ -2002,7 +1884,7 @@ fn mark_thread_waiting(idx: usize, wake_time_us: u64) {
             // F8 evidence tripwire: an unconditional WAITING publication can
             // overwrite a cross-thread TERMINATED (the reap-mid-exit race); a
             // waker's WAITING->READY CAS then completes a resurrection the
-            // guarded paths (`mark_thread_ready`, `commit_switch`,
+            // guarded paths (`mark_thread_ready`, the switch's demotion,
             // `resume_running_unless_terminated`) all refuse.
             let loc = core::panic::Location::caller();
             safe_print!(160, "[REVIVE] tid={} TERMINATED->WAITING at={}:{} by_tid={}\n",
@@ -2435,23 +2317,9 @@ pub use akuma_primitives::preempt::{
 };
 
 
-/// x86_64 stub — real shared-kernel SMP is out of scope for this pass (see
-/// `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md`); nothing calls this here.
-#[cfg(target_os = "none")]
-pub fn adopt_current_as_core_idle(
-    _core_id: usize,
-    _exc_stack_top: u64,
-    _stack_base: usize,
-    _stack_size: usize,
-) -> Option<usize> {
-    None
-}
-
 // ============================================================================
 // Thread Constants
 // ============================================================================
-
-// The thread-entry assembly (`thread_start`, `thread_start_closure`) lives in `akuma-switch`.
 
 // ============================================================================
 // The context switch — a function call, on both architectures
@@ -2468,12 +2336,10 @@ pub fn adopt_current_as_core_idle(
 // The never-run thread's first frame (`build_closure_context`, seven words: `r15 r14 r13 r12 rbx rbp rflags` and
 // the return address) is written by `akuma-switch`.
 
-/// Simple round-robin pick of the next `READY`/`RUNNING` slot after
-/// `from`, wrapping. Deliberately not [`ThreadPool::schedule_indices`] —
-/// that method's SMP/priority/network-thread-boost logic is real scheduling
-/// policy for the AArch64 multi-core scheduler this pass does not attempt to
-/// match; this mirrors `amd64::sched::yield_now`'s own plain scan instead,
-/// which is exactly what a single-core, cooperative-only switch needs.
+/// The scheduler's pick, on both kernels: plain round-robin over the
+/// `READY`/`RUNNING` slots after `from`, wrapping, claiming the winner's
+/// [`ON_CPU`] gate. There is no priority, boost or run-next hint; the SGI
+/// scheduler's went with it (docs/archive/SGI_SCHEDULER_RESIDUE.md).
 fn pick_next(from: usize, hooks: ArchHooks) -> Option<usize> {
     for step in 1..=MAX_THREADS {
         let candidate = (from + step) % MAX_THREADS;
@@ -2859,43 +2725,6 @@ pub fn abandon_slot(slot: usize) {
     }
 }
 
-/// Reserve a slot number for an identity that is not a pool thread.
-///
-/// The M2 spawn crossing (taoxichuan) runs its child on the crossing's own
-/// band and keys its ring records on the spawn-ring slot index — a number
-/// the fork path ALSO hands out as a threading tid. Without a reservation
-/// the pool's `claim_free_slot` sees the number FREE and gives it to the
-/// next fork child, which then stomps the live shell's cross record, SpawnSlot
-/// and fd table (boot ph-2: `bind tid=2 shell=2`, echo's EPIPE, cat parked
-/// forever on a destroyed pipe). `INITIALIZING` is never picked by a scheduler
-/// and never reusable; the reserve is permanent for this boot, which is the
-/// point — a crossing identity is not a thread that exits.
-pub fn reserve_slot(slot: usize) -> bool {
-    if slot >= MAX_THREADS {
-        return false;
-    }
-    // A TERMINATED slot is equally takeable: its thread is dead by
-    // definition, and the fork path's own recycler would otherwise hand the
-    // number right back out from under the crossing (boot ph-4: session 3's
-    // reserve of ring slot 3 refused against session 2's TERMINATED child,
-    // the fork claim reclaimed it, and the session shell collided with its
-    // own first child again).
-    for state in [thread_state::FREE, thread_state::TERMINATED] {
-        if THREAD_STATES[slot]
-            .compare_exchange(
-                state,
-                thread_state::INITIALIZING,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
-        {
-            return true;
-        }
-    }
-    false
-}
-
 /// Mark the running thread terminated and switch away for good.
 ///
 /// Never returns: the picker only takes `READY`/`RUNNING`, so once the state is
@@ -3156,14 +2985,12 @@ pub fn slot_debug(slot: usize) -> (u8, u8) {
 
 /// Ready every `WAITING` thread whose wake deadline has passed.
 ///
-/// The x86_64 counterpart of the wake-pass at the top of
-/// [`ThreadPool::schedule_indices`], and it exists for the same reason: nothing
-/// else moves a thread out of `WAITING` when its timeout — rather than a waker
+/// Nothing else moves a thread out of `WAITING` when its timeout — rather than a waker
 /// — is what should release it. Without this, [`schedule_blocking`] with a
-/// deadline parks forever on this target, and every timed `futex` wait,
+/// deadline parks forever, and every timed `futex` wait,
 /// `nanosleep` and `poll` timeout built on it hangs.
 ///
-/// **CAS, not store**, for the reason the AArch64 pass documents at length: a
+/// **CAS, not store**: a
 /// lock-free [`ThreadWaker::wake`], or a cross-thread kill's `TERMINATED`, can
 /// land between the load and the write, and an unconditional `READY` store
 /// would overwrite it — resurrecting a thread that was killed, or stamping
@@ -3346,8 +3173,7 @@ fn yield_switch() -> bool {
         }
     };
 
-    // CPU-time accounting — this arch's arm of what `commit_switch` does for
-    // the generic path (bill `cur`'s elapsed slice into `TOTAL_CPU_TIMES`,
+    // CPU-time accounting (bill `cur`'s elapsed slice into `TOTAL_CPU_TIMES`,
     // stamp `next`'s `start_time_us`), under the same `POOL` lock
     // `get_thread_cpu_time`'s live-delta read already takes. Without this,
     // `try_yield` was the *only* switch path on this target and never
@@ -3364,7 +3190,7 @@ fn yield_switch() -> bool {
         }
         pool.slots[next].start_time_us = now;
     }
-    // And the other half of `commit_switch`'s bookkeeping: which core `next`
+    // And the other half of the bookkeeping: which core `next`
     // is about to run on. Without it every slot stayed at the 0xFF "never
     // scheduled" sentinel, so `/proc/stat`'s per-core bucketing
     // (`akuma-vfs-glue`'s `cpu_time_snapshot`) billed nothing to any `cpuN`
@@ -3596,15 +3422,7 @@ extern "C" fn thread_exit_stub() -> ! {
 pub struct ThreadPool {
     slots: [ThreadSlot; MAX_THREADS],
     stacks: [StackInfo; MAX_THREADS],
-    current_idx: usize,
     initialized: bool,
-    /// Counter for proportional scheduling of thread 0
-    /// Thread 0 gets boosted when this reaches NETWORK_THREAD_RATIO
-    network_boost_counter: u32,
-    /// Global round-robin index for fair thread rotation
-    /// This ensures all threads get scheduled, not just the first ready one
-    /// after the current thread.
-    round_robin_idx: usize,
 }
 
 impl ThreadPool {
@@ -3612,10 +3430,7 @@ impl ThreadPool {
         Self {
             slots: [const { ThreadSlot::empty() }; MAX_THREADS],
             stacks: [const { StackInfo::empty() }; MAX_THREADS],
-            current_idx: 0,
             initialized: false,
-            network_boost_counter: 0,
-            round_robin_idx: 0,
         }
     }
 
@@ -3782,373 +3597,6 @@ impl ThreadPool {
         true
     }
 
-    /// Select next ready thread (round-robin) - LOCK-FREE for state transitions
-    ///
-    /// # Preemption rules:
-    /// - `voluntary=true`: Thread yielded voluntarily (yield_now) - always switch
-    /// - `voluntary=false`: Timer-triggered preemption
-    ///   - If preemption is explicitly disabled: Don't switch
-    ///   - Otherwise: always preemptible
-    ///
-    /// Pick the next thread for `core_id` to run. Returns `Some((old, new))` if a
-    /// switch is needed. Under real shared-kernel SMP this runs serialized by the Big
-    /// Kernel Lock (the whole IRQ/scheduler excursion holds it), so two cores never
-    /// execute this concurrently and the RUNNING state alone prevents double-running a
-    /// thread. Per-core idle threads (see [`IS_IDLE_THREAD`]) are skipped by the
-    /// round-robin scan; a core falls back only to ITS OWN idle. `core_id` is 0 on
-    /// single-core builds, so behavior there is unchanged.
-    pub fn schedule_indices(
-        &mut self,
-        voluntary: bool,
-        core_id: usize,
-        interrupted_el0: bool,
-    ) -> Option<(usize, usize)> {
-        // Use TPIDRRO_EL0 register for current thread ID - more reliable than atomic
-        let current_idx = get_current_thread_register();
-
-        // Wake-pass: mark READY any WAITING thread whose wake deadline has passed.
-        // This MUST run on every scheduler entry — including involuntary
-        // (timer-tick) entries where the current thread has preemption disabled
-        // (e.g. an idle thread halted in `idle_halt`'s WFI). The preemption check
-        // below only suppresses the context SWITCH; if it also suppressed the
-        // wake-pass, every sleeping thread's wakeup (nanosleep, schedule_blocking,
-        // condvar/futex timeouts) would be delayed by however long the idle thread
-        // stays preempt-disabled, inflating sleep latency by whole ticks. The
-        // wake-pass only flips state + SEVs; it never switches context, so running
-        // it with preemption disabled is safe. (Reordering it to the top is also
-        // what makes `idle_halt`'s preempt-guarded WFI cheap for accounting
-        // without costing wakeup latency.)
-        let now = (runtime().uptime_us)();
-        let mut woke_any = false;
-        // Earliest-deadline woken thread, for the run-next hint below.
-        let mut hint_tid = usize::MAX;
-        let mut hint_deadline = u64::MAX;
-        for i in 0..MAX_THREADS {
-            if THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::WAITING {
-                let wake_time = WAKE_TIMES[i].load(Ordering::SeqCst);
-                if wake_time > 0 && now >= wake_time {
-                    // Wake this thread — CAS, not store: a lock-free ThreadWaker::wake
-                    // (or a cross-thread kill's TERMINATED) can land between our load
-                    // and this write; an unconditional READY store would overwrite it
-                    // (see ThreadWaker::wake for the corruption that enables). The
-                    // WAKE_TIMES clear only follows a transition WE own; the woken
-                    // thread can't re-park before it lands because parking requires
-                    // running, and running requires a switch under POOL — held here.
-                    if THREAD_STATES[i]
-                        .compare_exchange(
-                            thread_state::WAITING,
-                            thread_state::READY,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        )
-                        .is_ok()
-                    {
-                        WAKE_TIMES[i].store(0, Ordering::SeqCst);
-                        woke_any = true;
-                        if wake_time < hint_deadline {
-                            hint_deadline = wake_time;
-                            hint_tid = i;
-                        }
-                    }
-                }
-            }
-        }
-        // Wake-deadline preemption: the thread whose deadline expired earliest
-        // runs NEXT, not after a full round-robin pass. Consumed by the `hinted`
-        // swap below in this same call (or the next entry, if the preemption
-        // gate returns early). A plain store: with WAKEUP_LOCALITY_HINT off we
-        // are the only writer; if both gates are ever on, last-writer-wins is
-        // benign — the consumer re-validates READY/ON_CPU before using it.
-        if WAKE_DEADLINE_PREEMPT && hint_tid != usize::MAX {
-            PREEMPT_WAKE_TID.store(hint_tid, Ordering::SeqCst);
-        }
-        // Send event to wake any threads in WFI
-        if woke_any {
-            akuma_cpu::park::sev();
-        }
-
-        // For timer-triggered preemption, first check if preemption is explicitly disabled.
-        // (Only gates the context switch — the wake-pass above already ran.)
-        if !voluntary && is_preemption_disabled() {
-            return None;
-        }
-
-        // Involuntary-displacement bypass: on a timer tick that would swap out a
-        // thread still doing real work (RUNNING, not idle, didn't yield or block),
-        // first try handing the queued READY work to an IDLE peer core instead.
-        // `wake_remote_idle` rings the lowest idle peer's scheduler SGI and reports
-        // whether one existed; if so, this core keeps its thread and the idle core
-        // picks the READY thread up within SGI latency. Without this, the global
-        // round-robin displaced a compute thread on some core every tick whenever
-        // ANY other thread was READY — even with cores sitting idle — so threads
-        // of one process kept losing their barrier partners for ~a tick at a time
-        // (the llama.cpp `-t N` 14-22x decode collapse).
-        //
-        // BOUNDED, not unconditional: an unbounded bypass let a spinning thread
-        // monopolize its core for as long as any core anywhere was idle, which
-        // starved sshd/netpoll onto one shared core under llama `-t 3` load
-        // (973 preemption-watchdog hits, dropped ssh handshakes). A thread may
-        // decline displacement at most DISPLACEMENT_IMMUNITY_TICKS-1 consecutive
-        // ticks — an effective ~5 ms timeslice — then rotates exactly as before,
-        // so a queued READY thread waits a bounded few ticks, never forever.
-        // When every core is busy the bypass does nothing at all.
-        //
-        // EL0-ONLY: the bypass (and the keep-running fallback below) apply only
-        // when the tick interrupted USERSPACE. Under smp-shared "the BKL is held
-        // iff a core is in EL1", so a thread interrupted mid-EL1 is a BKL holder
-        // — the per-tick switch (to idle, whose loop drops the BKL around WFI,
-        // or to another thread via the dropped-window ledger) is the RELEASE
-        // VALVE for long kernel excursions. Keeping an EL1 thread pinned wedged
-        // the boot suite's FS tests in a `[BKL] stuck` storm (thread 0 held the
-        // BKL through bulk ext2 I/O forever, every secondary starved).
-        let displacement_bypass = |current_idx: usize| -> bool {
-            const DISPLACEMENT_IMMUNITY_TICKS: u8 = 5;
-            if voluntary
-                || !interrupted_el0
-                || IS_IDLE_THREAD[current_idx].load(Ordering::Relaxed)
-                || THREAD_STATES[current_idx].load(Ordering::SeqCst) != thread_state::RUNNING
-            {
-                return false;
-            }
-            let deferred = DISPLACE_DEFER[current_idx].load(Ordering::Relaxed);
-            if deferred >= DISPLACEMENT_IMMUNITY_TICKS - 1 {
-                DISPLACE_DEFER[current_idx].store(0, Ordering::Relaxed);
-                return false;
-            }
-            if (runtime().wake_remote_idle)() {
-                DISPLACE_DEFER[current_idx].store(deferred + 1, Ordering::Relaxed);
-                true
-            } else {
-                DISPLACE_DEFER[current_idx].store(0, Ordering::Relaxed);
-                false
-            }
-        };
-
-        // Proportional scheduling for the network polling thread (run_async_main).
-        // The network thread gets boosted every NETWORK_THREAD_RATIO scheduler ticks,
-        // giving it a 1/N share of CPU time (e.g., 25% with ratio=4).
-        let net_tid = NETWORK_THREAD_ID.load(Ordering::Relaxed);
-        if net_tid != usize::MAX && current_idx != net_tid {
-            self.network_boost_counter += 1;
-            if self.network_boost_counter >= config().network_thread_ratio {
-                self.network_boost_counter = 0;
-                if THREAD_STATES[net_tid].load(Ordering::SeqCst) == thread_state::READY
-                    && ON_CPU[net_tid].load(Ordering::SeqCst) == 0
-                {
-                    // Boost-path arm of the displacement bypass: if an idle peer can
-                    // run the net thread, don't take this core's working thread.
-                    if displacement_bypass(current_idx) {
-                        return None;
-                    }
-                    // Same ON_CPU latch as commit_switch (this path bypasses it).
-                    ON_CPU[current_idx].store(1, Ordering::SeqCst);
-                    ON_CPU[net_tid].store(1, Ordering::SeqCst);
-                    if core_id < MAX_CORES {
-                        PER_CORE_OFFCPU[core_id].store(current_idx, Ordering::SeqCst);
-                    }
-                    // Atomic re-READY of the outgoing thread — see commit_switch for
-                    // why this must not be a check-then-store.
-                    let _ = THREAD_STATES[current_idx].try_update(
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                        |s| (s != thread_state::TERMINATED && s != thread_state::WAITING)
-                            .then_some(thread_state::READY),
-                    );
-                    THREAD_STATES[net_tid].store(thread_state::RUNNING, Ordering::SeqCst);
-                    self.slots[net_tid].start_time_us = now;
-                    set_current_thread_register(net_tid);
-                    self.current_idx = net_tid;
-                    return Some((current_idx, net_tid));
-                }
-            }
-        }
-        // If current thread is the network thread, or counter hasn't reached ratio, use round-robin below
-
-        // EXPERIMENTAL (Failure D falsification test, see `config::PRIORITIZE_NEVER_SCHEDULED`):
-        // unconditionally prefer any READY thread that has never once been scheduled
-        // (`LAST_CORE == 0xFF`) over the wakeup-locality hint and the round-robin scan
-        // below. Not fairness-preserving by design — this is a diagnostic override, not
-        // a real scheduling policy.
-        let never_scheduled = if config().prioritize_never_scheduled {
-            let mut found = None;
-            for i in 0..MAX_THREADS {
-                if i != current_idx
-                    && !IS_IDLE_THREAD[i].load(Ordering::Relaxed)
-                    && THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::READY
-                    && ON_CPU[i].load(Ordering::SeqCst) == 0
-                    && LAST_CORE[i].load(Ordering::Relaxed) == 0xFF
-                {
-                    found = Some(i);
-                    break;
-                }
-            }
-            found
-        } else {
-            None
-        };
-
-        // Wakeup locality: if a thread was just woken by an explicit signal
-        // (futex/cond), prefer running it NEXT (once) so a producer→consumer
-        // handoff doesn't wait a full round-robin cycle behind ~20 ready threads.
-        // This is the dominant per-syscall cost for the rump sysproxy. Consumed
-        // (swap to MAX_THREADS) so it fires once; the preempted current thread
-        // stays READY below, so round-robin fairness is preserved across ticks.
-        let hinted = PREEMPT_WAKE_TID.swap(MAX_THREADS, Ordering::SeqCst);
-        let next_idx = if let Some(idx) = never_scheduled {
-            idx
-        } else if hinted < MAX_THREADS
-            && hinted != current_idx
-            && !IS_IDLE_THREAD[hinted].load(Ordering::Relaxed)
-            && THREAD_STATES[hinted].load(Ordering::SeqCst) == thread_state::READY
-            && ON_CPU[hinted].load(Ordering::SeqCst) == 0
-        {
-            hinted
-        } else {
-            // Find next ready thread using GLOBAL round-robin index
-            // This ensures fair rotation through ALL threads, not just starting from current.
-            // Without this, threads 10, 11 would never run if 8, 9 are always ready and
-            // the scheduler always runs from a low-numbered system thread.
-            //
-            // Skip per-core idle threads: they are never taken by the scan (a core only
-            // runs ITS OWN idle, chosen as the fallback below), so one core can't grab
-            // another core's idle under SMP.
-            let mut next_idx = (self.round_robin_idx + 1) % MAX_THREADS;
-            let start_idx = next_idx;
-
-            loop {
-                let state = THREAD_STATES[next_idx].load(Ordering::SeqCst);
-
-                if state == thread_state::READY
-                    && next_idx != current_idx
-                    && !IS_IDLE_THREAD[next_idx].load(Ordering::Relaxed)
-                    && ON_CPU[next_idx].load(Ordering::SeqCst) == 0
-                {
-                    // Round-robin arm of the displacement bypass (see above): an
-                    // idle peer takes the READY thread; this core keeps working.
-                    if displacement_bypass(current_idx) {
-                        return None;
-                    }
-                    // Found a ready, non-idle thread to switch TO.
-                    break;
-                }
-
-                next_idx = (next_idx + 1) % MAX_THREADS;
-
-                if next_idx == start_idx {
-                    // No non-idle READY thread anywhere. If the current thread is still
-                    // RUNNING (an involuntary tick preempted it, it did not block or
-                    // yield) AND it was interrupted in EL0, keep it on this core:
-                    // switching it out to idle here made every CPU-bound thread bounce
-                    // core -> idle -> another core on every timer tick (the peer core's
-                    // next tick picked it back up), costing a context switch +
-                    // cache/TLB locality per tick and — for multi-threaded processes —
-                    // regularly removing a barrier partner from execution for ~a tick,
-                    // which is what collapsed llama.cpp `-t N` decode 14-22x. RUNNING
-                    // is the safe gate against double-run: a RUNNING thread is never
-                    // picked by a peer core's scan (only READY is). The EL0 gate is the
-                    // safe gate against BKL starvation: an EL1-interrupted thread is a
-                    // BKL holder under smp-shared, and the idle switch below is the
-                    // release valve that lets peer cores enter the kernel (see the
-                    // displacement_bypass comment above — omitting this wedged the
-                    // boot suite's FS tests in a `[BKL] stuck` storm). A WAITING
-                    // (blocked) or READY (yielded) current thread also still falls
-                    // through to the idle switch, which is what takes it off-CPU.
-                    if interrupted_el0
-                        && THREAD_STATES[current_idx].load(Ordering::SeqCst)
-                            == thread_state::RUNNING
-                    {
-                        return None;
-                    }
-                    // Fall back to THIS core's idle thread so
-                    // the core has something to run (single-core: idle is slot 0, the
-                    // original behavior of dropping to idle when nothing else is ready).
-                    let idle = IDLE_SLOT_FOR_CORE[core_id].load(Ordering::Relaxed);
-                    if idle < 0 || idle as usize == current_idx {
-                        // No idle registered yet, or we're already on our idle: stay put.
-                        return None;
-                    }
-                    let idle = idle as usize;
-                    if ON_CPU[idle].load(Ordering::SeqCst) != 0 {
-                        // Should be unreachable (only THIS core runs its idle), but
-                        // never switch onto a stack another core may still be on.
-                        return None;
-                    }
-                    self.commit_switch(current_idx, idle, now);
-                    return Some((current_idx, idle));
-                }
-            }
-
-            // Update global round-robin index to where we found the next thread
-            // This ensures the NEXT scheduling decision continues from here
-            self.round_robin_idx = next_idx;
-            next_idx
-        };
-
-        self.commit_switch(current_idx, next_idx, now);
-        Some((current_idx, next_idx))
-    }
-
-    /// Apply a scheduler switch decision: bill the outgoing thread's CPU time, flip it
-    /// back to READY (unless TERMINATED/WAITING), mark the incoming thread RUNNING, and
-    /// publish it as this core's current thread (TPIDRRO_EL0). Shared by the normal
-    /// round-robin path and the per-core idle fallback.
-    fn commit_switch(&mut self, current_idx: usize, next_idx: usize, now: u64) {
-        // ON_CPU protocol (see its doc): the incoming thread is about to run on
-        // this core; the outgoing thread's gate stays set (re-asserted here for
-        // robustness) until `rust_switch_finished` clears it after the vector
-        // asm's `mov sp, x0` — this core keeps executing on its kernel stack
-        // until then, well after POOL is released. SeqCst orders the latch
-        // before the READY publication below for any SeqCst reader (pickers).
-        ON_CPU[current_idx].store(1, Ordering::SeqCst);
-        ON_CPU[next_idx].store(1, Ordering::SeqCst);
-        let core = bkl::current_core_id() as usize;
-        if core < MAX_CORES {
-            PER_CORE_OFFCPU[core].store(current_idx, Ordering::SeqCst);
-        }
-
-        // Accumulate CPU time for the thread being scheduled out.
-        let start = self.slots[current_idx].start_time_us;
-        if start > 0 {
-            let elapsed = now.saturating_sub(start);
-            TOTAL_CPU_TIMES[current_idx].fetch_add(elapsed, Ordering::Relaxed);
-        }
-
-        // Put the outgoing thread back to READY — unless it is TERMINATED or
-        // WAITING (WAITING keeps its state so the wake-pass handles it). This
-        // must be one atomic RMW, not check-then-store: `mark_thread_terminated`
-        // is called cross-thread with no lock (kill_thread_group), so a
-        // TERMINATED can land between a load here and a plain READY store —
-        // resurrecting a killed thread whose address space teardown is already
-        // under way. It would then be picked by a peer and run on freed (and
-        // possibly recycled) page tables.
-        let _ = THREAD_STATES[current_idx].try_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |s| (s != thread_state::TERMINATED && s != thread_state::WAITING)
-                .then_some(thread_state::READY),
-        );
-        let prev = THREAD_STATES[next_idx].swap(thread_state::RUNNING, Ordering::SeqCst);
-        if prev == thread_state::TERMINATED {
-            // F8 evidence tripwire: the pick scan only accepts READY, so a
-            // TERMINATED here means a cross-thread kill landed between the scan
-            // and this commit — the switch will now run a thread whose teardown
-            // (and possibly address space) is already being reclaimed.
-            safe_print!(128, "[SGI-S PICKED-TERMINATED] new_tid={} old_tid={}\n",
-                next_idx, current_idx);
-        }
-        // Record the core the incoming thread is now running on. commit_switch always
-        // runs on the core that will run next_idx (single runqueue, each core schedules
-        // itself), so current_core_id() is authoritative.
-        LAST_CORE[next_idx].store(bkl::current_core_id() as u8, Ordering::Relaxed);
-
-        // Update timing (still in slot, but we own it)
-        self.slots[next_idx].start_time_us = now;
-
-        // Update current thread in CPU register (authoritative, per-core source of truth)
-        set_current_thread_register(next_idx);
-        self.current_idx = next_idx; // Legacy mirror (only validate_current_sp reads it)
-    }
-
     pub fn thread_stats(&self) -> (usize, usize, usize) {
         let mut ready = 0;
         let mut running = 0;
@@ -4202,43 +3650,6 @@ fn check_stack_canary(stack_base: usize) -> bool {
 // ============================================================================
 
 static POOL: Spinlock<ThreadPool> = Spinlock::new(ThreadPool::new());
-/// Per-core "the next scheduler SGI on THIS core is a voluntary switch" flags.
-///
-/// PER-CORE, not global (fixed 2026-07-21): the voluntary setters (`yield_now`,
-/// `schedule_blocking`, `request_voluntary_reschedule`) always pair the flag with a
-/// SELF-targeted scheduler SGI, so producer and consumer are the same core. With one
-/// global flag, a PEER core's concurrent timer SGI would `swap` the flag away — its
-/// involuntary tick ran as voluntary (bypassing that core's preemption-disabled
-/// check) while the yielding core's SGI ran as INVOLUNTARY, silently eating the
-/// yield. Mostly-invisible when involuntary switches could stand in for the lost
-/// voluntary one, but fatal for a thread whose involuntary path is gated (a
-/// `LifecycleGuard` holder in a cooperative wait loop spins forever in EL1 holding
-/// the BKL — the SMP=4 fork-hammer wedge, `[WATCHDOG] disabled at lifecycle.rs`).
-static VOLUNTARY_SCHEDULE: [AtomicBool; MAX_CORES] = {
-    const INIT: AtomicBool = AtomicBool::new(false);
-    [INIT; MAX_CORES]
-};
-static SGI_DEBUG_ONCE: AtomicBool = AtomicBool::new(false);
-
-/// This core's voluntary-reschedule flag (see [`VOLUNTARY_SCHEDULE`]). Core 0 on
-/// non-SMP and host builds.
-#[inline]
-fn voluntary_schedule_flag() -> &'static AtomicBool {
-    &VOLUNTARY_SCHEDULE[bkl::current_core_id() as usize % MAX_CORES]
-}
-
-/// Enable SGI debug for next yield (one-shot)
-pub fn set_sgi_debug(enable: bool) {
-    SGI_DEBUG_ONCE.store(enable, Ordering::SeqCst);
-}
-
-/// Mark the next scheduler SGI on THIS core as a VOLUNTARY switch, so `schedule_indices`
-/// switches away even when preemption is explicitly disabled for the current thread.
-/// Used by an IRQ-context cross-core wakeup that readies a thread and must preempt the
-/// current one now. Pair with a self-targeted scheduler-SGI trigger.
-pub fn request_voluntary_reschedule() {
-    voluntary_schedule_flag().store(true, Ordering::Release);
-}
 
 /// Initialize the thread pool
 pub fn init() {
@@ -4273,7 +3684,7 @@ pub fn init() {
     // hands a live slot back to the allocator, and the next `claim_free_slot` — the
     // async-main thread, in practice — hands out a slot another core is executing on.
     // Two threads, one slot: the boot stall this order was long assumed to just
-    // "collide" on. Leave adopted idles alone; `adopt_current_as_core_idle` already
+    // "collide" on. Leave adopted idles alone; `adopt_core_idle` already
     // stored RUNNING and latched their ON_CPU gate.
     // See docs/archive/SMP_ADOPTED_IDLE_SLOT_CLOBBER.md.
     for i in 1..MAX_THREADS {
@@ -4312,7 +3723,7 @@ pub fn yield_now() {
 /// accounting honest while doing so.
 ///
 /// The scheduler bills a thread for its entire quantum residency
-/// (`now - start_time_us` at switch-out in [`ThreadPool::schedule_indices`]).
+/// (`now - start_time_us` at switch-out).
 /// A raw `wfi` in an idle loop would therefore be billed as busy CPU — inflating
 /// `TIME(ms)`/`CPU%` for the idle threads even though the core is halted (the
 /// issue-#11/#2 accounting symptom: `top` shows tens of seconds of `TIME(ms)`
@@ -4338,8 +3749,8 @@ pub fn idle_halt() {
     // `blocking_relax_net` (`wait_until` → Promiscuous park), or the netpoll
     // thread between laps — it is fatal at SMP=1: the parked waiter stays
     // RUNNING, sole owner of the only core, inside a preempt-disabled `wfi`;
-    // every timer tick runs the wake-pass but `schedule_indices` then
-    // declines the switch (`!voluntary && is_preemption_disabled()`), and no
+    // every timer tick runs the wake-pass but the tick then declines the
+    // switch ([`el1_preemptible`]: preemption is disabled), and no
     // running thread remains to raise the voluntary SGI that could
     // un-suppress it. Whole-kernel freeze, no panic, ~3 % host CPU:
     // docs/archive/SECOND_LISTENER_SMP1_FREEZE.md §2a (GDB-proven).
@@ -4364,8 +3775,8 @@ pub fn idle_halt() {
         // timer tick *mid-WFI* — the residency including the halt lands in
         // its CPU-time bucket before we can correct it, and the correction
         // (start_time_us bump below) is discarded at the next switch-in.
-        // With preemption disabled the timer's involuntary schedule_indices
-        // returns None early (`!voluntary && is_preemption_disabled()`), so
+        // With preemption disabled the timer's involuntary switch is declined
+        // ([`el1_preemptible`]), so
         // the halt is neither billed nor switched. WFI still wakes on the
         // very same timer IRQ (and on device IRQs), and the voluntary
         // yield_now() that follows this in the idle loop bypasses the
@@ -4561,14 +3972,6 @@ pub fn any_saved_ctx_on_l0(l0_base: u64) -> Option<(usize, u8)> {
     SAVED_ROOT_PROBE.get().and_then(|p| p(l0_base))
 }
 
-/// Test hook: swap a slot's saved-context TTBR0, returning the previous value
-/// (boot-suite self-tests only — they can't get a real thread parked with a
-/// chosen stale TTBR0 in its saved context).
-#[doc(hidden)]
-pub fn test_swap_saved_ctx_ttbr0(_slot: usize, _ttbr0: u64) -> u64 {
-    0
-}
-
 /// Test/diagnostic accessor: whether `tid`'s [`ON_CPU`] gate is set.
 pub fn on_cpu_flag(tid: usize) -> bool {
     tid < MAX_THREADS && ON_CPU[tid].load(Ordering::SeqCst) != 0
@@ -4702,10 +4105,6 @@ impl ThreadWaker {
                 )
                 .is_ok()
             {
-                // Wakeup locality (gated off — see PREEMPT_WAKE_TID / WAKEUP_LOCALITY_HINT).
-                if WAKEUP_LOCALITY_HINT {
-                    PREEMPT_WAKE_TID.store(tid, Ordering::SeqCst);
-                }
                 // Trigger SGI to ensure scheduler runs and picks up the thread
                 (runtime().trigger_sgi)(0);
                 // Under real shared-kernel SMP, also nudge the woken thread's last-known
@@ -4829,7 +4228,7 @@ fn publish_waiting_and_take_pending_wake(tid: usize, wake_time_us: u64) -> bool 
     // Same guard as the park loop: `kill_thread_group` may have marked us TERMINATED,
     // and resuming as RUNNING would return to user mode with freed resources. One
     // atomic RMW — a TERMINATED landing between a load and a plain store would be
-    // overwritten (see commit_switch).
+    // overwritten.
     resume_running_unless_terminated(tid);
     true
 }
@@ -5234,18 +4633,12 @@ pub fn pend_signal_for_thread(tid: usize, sig: u32) {
     if sig <= 64 {
         let bit = 1u64 << (sig - 1);
         PENDING_SIGNALS[tid].fetch_or(bit, Ordering::Release);
+        // `wake()` makes the slot READY, which is eligibility, not execution: the
+        // thread waits its turn in [`pick_next`]'s round-robin scan. The SGI
+        // scheduler had a run-next hint for this (`SIGNAL_WAKE_PREEMPT`,
+        // docs/archive/PTHREAD_KILL_EINTR_DELIVERY_STARVATION.md); the hint went
+        // with that scheduler, see docs/archive/SGI_SCHEDULER_RESIDUE.md.
         get_waker_for_thread(tid).wake();
-        // A signal is only useful if the target gets to look at it. `wake()` has
-        // made the slot READY, which is eligibility, not execution: without the
-        // hint the thread joins the back of the round-robin queue and does not
-        // report its `EINTR` for ~tick x runnable-threads. See
-        // [`SIGNAL_WAKE_PREEMPT`] for the measurement.
-        if SIGNAL_WAKE_PREEMPT
-            && tid != current_thread_id()
-            && THREAD_STATES[tid].load(Ordering::SeqCst) == thread_state::READY
-        {
-            PREEMPT_WAKE_TID.store(tid, Ordering::SeqCst);
-        }
     }
 }
 
@@ -5383,24 +4776,6 @@ where
     Ok(slot_idx)
 }
 
-/// Count available system thread slots
-///
-/// Returns the number of free slots in the system thread range (1..RESERVED_THREADS).
-pub fn system_threads_available() -> usize {
-    // Lock-free: count free system thread slots
-    count_free_slots(1, config().reserved_threads)
-}
-
-/// Count active system threads
-///
-/// Returns the number of non-free slots in the system thread range (1..RESERVED_THREADS).
-pub fn system_threads_active() -> usize {
-    // Lock-free: count non-free system thread slots
-    (1..config().reserved_threads)
-        .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::FREE)
-        .count()
-}
-
 // ============================================================================
 // User Process Thread API
 // ============================================================================
@@ -5470,33 +4845,7 @@ pub fn user_threads_available() -> usize {
     count_free_slots(config().reserved_threads, thread_limit())
 }
 
-/// Count active user threads
-///
-/// Returns the number of non-free slots in the user thread range.
-pub fn user_threads_active() -> usize {
-    // Lock-free: count non-free user thread slots
-    (config().reserved_threads..thread_limit())
-        .filter(|&i| THREAD_STATES[i].load(Ordering::Relaxed) != thread_state::FREE)
-        .count()
-}
-
 // Note: is_thread_terminated is defined above using lock-free atomics
-
-/// Get the state of a specific thread (for debugging) - LOCK-FREE
-pub fn get_thread_state_enum(thread_id: usize) -> Option<ThreadState> {
-    if thread_id >= MAX_THREADS {
-        return None;
-    }
-    let state = THREAD_STATES[thread_id].load(Ordering::Relaxed);
-    Some(match state {
-        thread_state::FREE => ThreadState::Free,
-        thread_state::READY => ThreadState::Ready,
-        thread_state::RUNNING => ThreadState::Running,
-        thread_state::TERMINATED => ThreadState::Terminated,
-        thread_state::INITIALIZING => ThreadState::Ready, // Treat as ready for display
-        _ => ThreadState::Free,
-    })
-}
 
 /// The calling thread's EL0 register file, from the sync trap frame its syscall entry published
 /// (`set_current_trap_frame`) — `ArchHooks::read_user_context` for the AArch64 root kernel under
@@ -5661,24 +5010,11 @@ pub fn dump_thread_resume_points() {
     (process().dump_orphan_processes)();
 }
 
-
-/// x86_64 stub — this diagnostic reads the AArch64 fake-IRQ-frame layout
-/// that has no counterpart in this pass's cooperative-only switch.
-pub fn get_saved_kernel_resume(_thread_id: usize) -> Option<(u64, u64, u64)> {
-    None
-}
-
-/// Count of `get_saved_user_context` calls that found no live EL0 trap frame.
-/// Every one of them used to launch a child at its parent's *initial exec* entry
-/// point; see the function docs.
+/// Count of `get_saved_user_context` calls that found no live EL0 trap frame; it
+/// rate-limits their `[NO-TRAPFRAME]` line. Every one of them used to launch a
+/// child at its parent's *initial exec* entry point; see the function docs.
+#[cfg(target_os = "none")]
 static NO_TRAP_FRAME_CHILDREN: AtomicU64 = AtomicU64::new(0);
-
-/// How many `get_saved_user_context` calls found no live EL0 trap frame this boot.
-/// Non-zero means fork/vfork/clone syscalls are being refused — read the
-/// `[NO-TRAPFRAME]` lines for the caller.
-pub fn no_trap_frame_child_count() -> u64 {
-    NO_TRAP_FRAME_CHILDREN.load(Ordering::Relaxed)
-}
 
 
 /// The user-mode context to give a new child of `thread_id` — the x86_64 arm.
@@ -5730,73 +5066,6 @@ pub fn get_saved_user_context(thread_id: usize) -> Option<UserContext> {
 // ============================================================================
 // Stack Protection Functions
 // ============================================================================
-
-/// Check all thread stacks for overlap (debug/diagnostic)
-/// Returns list of (thread_a, thread_b) pairs that overlap
-pub fn check_stack_overlaps() -> Vec<(usize, usize)> {
-    // Copy stack info while holding lock (quick), process outside
-    let stacks: [StackInfo; MAX_THREADS] = with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        pool.stacks
-    });
-
-    // O(n²) check done outside critical section
-    let mut overlaps = Vec::new();
-    for i in 0..MAX_THREADS {
-        for j in (i + 1)..MAX_THREADS {
-            if stacks[i].overlaps(&stacks[j]) {
-                overlaps.push((i, j));
-            }
-        }
-    }
-    overlaps
-}
-
-/// Get stack bounds for a thread
-pub fn get_stack_bounds(thread_id: usize) -> Option<(usize, usize)> {
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        if thread_id < MAX_THREADS && pool.stacks[thread_id].is_allocated() {
-            Some((pool.stacks[thread_id].base, pool.stacks[thread_id].top))
-        } else {
-            None
-        }
-    })
-}
-
-/// Validate current stack pointer is within bounds
-pub fn validate_current_sp() -> bool {
-    let sp: usize = akuma_cpu::reg::sp();
-
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        let current = pool.current_idx;
-        pool.stacks[current].contains(sp)
-    })
-}
-
-/// Check all thread stack canaries for corruption
-/// Returns list of thread IDs with corrupted canaries
-pub fn check_all_stack_canaries() -> Vec<usize> {
-    if !config().enable_stack_canaries {
-        return Vec::new();
-    }
-
-    // Copy stack info quickly while holding lock
-    let stacks: [StackInfo; MAX_THREADS] = with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        pool.stacks
-    });
-
-    // Check canaries outside critical section (memory reads can be slow)
-    let mut bad = Vec::new();
-    for i in 1..MAX_THREADS {
-        if stacks[i].is_allocated() && !check_stack_canary(stacks[i].base) {
-            bad.push(i);
-        }
-    }
-    bad
-}
 
 /// Report every **live** thread whose stack canary has been overrun, once per
 /// thread, and return how many new ones were found.
@@ -5855,13 +5124,6 @@ pub fn first_idle_stack_base() -> Option<(usize, usize)> {
         let free = THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE;
         (free && stacks[i].is_allocated()).then_some((i, stacks[i].base))
     })
-}
-
-/// Check if there are any threads ready to run
-pub fn has_ready_threads() -> bool {
-    // Use atomic THREAD_STATES array (lock-free)
-    (0..MAX_THREADS)
-        .any(|i| THREAD_STATES[i].load(Ordering::Relaxed) == thread_state::READY)
 }
 
 // ============================================================================
@@ -5966,16 +5228,6 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
     }
 
     threads
-}
-
-pub fn dump_stack_info() {
-    let threads = list_kernel_threads();
-
-    for t in threads {
-        let size_kb = t.stack_size / 1024;
-        let used_kb = t.stack_used / 1024;
-        safe_print!(192, "Thread ID: {} State: {} Stack Size: {} KB Used: {} KB\n", t.tid, t.state, size_kb, used_kb);
-    }
 }
 
 // ============================================================================

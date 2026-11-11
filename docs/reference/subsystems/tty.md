@@ -84,7 +84,7 @@ process). `ingest` returns `NoMemory` if that allocation fails (`read` -> `ENOME
   `slave_poll`.
 - **Sharing**: one `TerminalState` per session (a helper's `TCSETS` re-cooks a TUI's terminal);
   one pair per pty.
-- **`^C` and job control**: `kill_process_group` spares the group leader only while the
+- **`^C` and job control**: `kill_foreground_group` spares the group leader only while the
   foreground group is the session shell's own. `TerminalState::session_pgid` (set with
   `set_session_leader`) remembers that group; `spares_leader()` is true only then, and
   `akuma_exec::process::kill_foreground_group` includes the leader otherwise (a job-control shell

@@ -1999,7 +1999,7 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
 
     // Per-pid delivery (thread-group interrupt+pend, SIGKILL hard-kill, and
     // the no-live-thread fallback) lives in `akuma_exec::process::deliver_signal`
-    // now, shared with `kill_process_group`'s per-member broadcast (used by the
+    // now, shared with `kill_foreground_group`'s per-member broadcast (used by the
     // kernel's Ctrl-C/SIGINT handling — see `write_to_process_stdin`).
     if akuma_exec::process::deliver_signal(pid, sig) { 0 } else { ESRCH }
 }

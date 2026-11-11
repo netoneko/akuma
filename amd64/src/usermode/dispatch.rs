@@ -1258,7 +1258,7 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // session leader; `setpgid`/`setsid` accept and report id 1.
         // `getpgid`/`getsid` still answer `1` — **deliberately, and the reason is
         // the console**. `TerminalState::foreground_pgid` defaults to 1 and
-        // `kill_process_group` excludes the group leader, which is what makes
+        // `kill_foreground_group` excludes the group leader, which is what makes
         // `^C` reach `init`'s children and not `init` (`crate::console`). A shell
         // that read a real `getpgid` and then `TIOCSPGRP`'d it would move that
         // target, and nothing here has been tested against job control. Fold

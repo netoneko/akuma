@@ -99,13 +99,6 @@ pub fn dmesg_snapshot_from(skip: usize, out: &mut [u8]) -> usize {
     DMESG.try_lock().map_or(0, |r| r.snapshot_from(skip, out))
 }
 
-/// Discard the buffered console history.
-pub fn dmesg_clear() {
-    if let Some(mut ring) = DMESG.try_lock() {
-        ring.clear();
-    }
-}
-
 /// Total console bytes ever emitted, including those since evicted.
 #[must_use]
 pub fn dmesg_total() -> u64 {

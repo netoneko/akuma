@@ -329,16 +329,6 @@ impl KernelSocket {
         }
     }
 
-    /// How many wakers are registered on this socket right now.
-    ///
-    /// Diagnostic, and the boot suite's evidence that a blocking waiter actually
-    /// announced itself before parking: this read zero for `accept`/`recv` until
-    /// `wait_until` started registering (docs/archive/AKUMA_NET_ISSUES.md §8).
-    #[must_use]
-    pub fn waker_count(&self) -> usize {
-        self.wakers.lock().len()
-    }
-
     /// Wake all threads waiting for I/O on this socket.
     pub fn wake_all(&self) {
         let mut wakers = self.wakers.lock();
@@ -1040,41 +1030,6 @@ pub struct DebugStream {
     pub completed: bool,
     /// `Closed` — after a dial, a refusal or a local reset.
     pub dead: bool,
-}
-
-/// Read-only peek at the stream socket behind a kernel socket index.
-///
-/// For a kernel-side connect wait that wants to trace what the stack is doing
-/// (TAOXICHUAN's stage-7 connect trace). Nothing here mutates, prints, or
-/// allocates: one `NETWORK` read.
-#[cfg(feature = "smoltcp")]
-#[must_use]
-pub fn debug_stream_peek(idx: usize) -> Option<DebugStream> {
-    let h = with_table(|table| {
-        if let Some(Some(sock)) = table.get(idx)
-            && let SocketType::Stream(handle) = sock.inner
-        {
-            return Some(handle);
-        }
-        None
-    })?;
-    with_network(|net| {
-        smoltcp_net::tcp_get(&net.sockets, h, |s: &smoltcp::socket::tcp::Socket| {
-            let st = s.state();
-            DebugStream {
-                state: state_name(st),
-                remote: s.remote_endpoint().map(|ep| {
-                    let smoltcp::wire::IpAddress::Ipv4(a) = ep.addr;
-                    (a.octets(), ep.port)
-                }),
-                send_q: s.send_queue(),
-                recv_q: s.recv_queue(),
-                completed: connect_completed(st),
-                dead: st == tcp::State::Closed,
-            }
-        })
-    })
-    .flatten()
 }
 
 /// `smoltcp::socket::tcp::State` as the name the state machine's docs use.
@@ -1831,39 +1786,6 @@ pub fn is_udp_socket(idx: usize) -> bool {
     })
 }
 
-/// Does a UDP socket have a datagram queued to read?
-///
-/// A thin, `idx`-addressed wrapper around [`smoltcp_handle_for`] +
-/// [`smoltcp_net::udp_can_recv`], for a caller that has no smoltcp handle of
-/// its own and no epoll/readiness-map machinery to route through — the amd64
-/// target's `poll(2)`, whose own doc used to say "nothing on this target
-/// polls a socket". That stopped being true the day a UDP client showed up:
-/// musl's stub DNS resolver `sendto`s a query and then `poll`s the same socket
-/// waiting for the reply, so a `poll` that always reports a socket "not ready"
-/// makes every hostname lookup read as a timeout no matter how fast the
-/// network answers.
-#[must_use]
-/// The connected UDP socket's `connect(2)` peer, if any. A `send(2)`/`write(2)`
-/// (and a `sendto(2)` with a null address) on a datagram socket goes to this;
-/// with none, the caller answers `ENOTCONN` the way Linux does.
-#[cfg(feature = "smoltcp")]
-pub fn socket_udp_peer(idx: usize) -> Option<SocketAddrV4> {
-    with_table(|table| {
-        if let Some(Some(KernelSocket { inner: SocketType::Datagram { peer, .. }, .. })) = table.get(idx) {
-            *peer
-        } else {
-            None
-        }
-    })
-}
-
-#[cfg(feature = "smoltcp")]
-#[must_use]
-pub fn socket_udp_recv_ready(idx: usize) -> bool {
-    smoltcp_net::poll();
-    matches!(smoltcp_handle_for(idx), Some((handle, true)) if smoltcp_net::udp_can_recv(handle))
-}
-
 /// `(recv_ready, send_ready)` for a stream socket, right now — the readiness
 /// probe behind `poll(2)`/`select(2)` on targets whose fd tables ask this
 /// crate directly.
@@ -1901,51 +1823,6 @@ pub fn socket_tcp_ready(idx: usize) -> (bool, bool) {
             (
                 tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected),
                 socket.can_send(),
-            )
-        })
-    })
-    .flatten()
-    .unwrap_or((false, false))
-}
-
-/// The two EOF facts the epoll readiness map needs for a TCP socket (stage
-/// 12, taoxichuan's `FdState::Tcp`): `(dead, peer_closed)`.
-///
-/// `dead` is the socket fully closed **after** having been connected
-/// (`was_connected && !is_active()`) — the HUP-only answer that keeps a
-/// waiter from parking forever on a connection that will never progress.
-/// `peer_closed` is the peer's FIN seen (`!may_recv()` after the handshake
-/// completed — the guard that keeps `SynSent` from announcing a half-close,
-/// `docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md`). Mirrors
-/// `akuma-syscalls-glue/src/net.rs`'s `socket_is_dead_tcp` /
-/// `socket_peer_closed_tcp`; lives here because the smoltcp handles and the
-/// `was_connected` latch are this crate's private state.
-#[cfg(feature = "smoltcp")]
-#[must_use]
-pub fn socket_tcp_eof(idx: usize) -> (bool, bool) {
-    smoltcp_net::poll();
-    let Some((handle, false)) = smoltcp_handle_for(idx) else {
-        return (false, false);
-    };
-    let was_connected = with_table(|table| {
-        let sock = table.get_mut(idx)?.as_mut()?;
-        if !sock.was_connected
-            && with_network(|net| {
-                smoltcp_net::tcp_get(&net.sockets, handle, |s| tcp_reached_established(s.state()))
-            })
-            .flatten()
-            .unwrap_or(false)
-        {
-            sock.was_connected = true;
-        }
-        Some(sock.was_connected)
-    })
-    .unwrap_or(false);
-    with_network(|net| {
-        smoltcp_net::tcp_get(&net.sockets, handle, |socket| {
-            (
-                (was_connected && !socket.is_active()),
-                (!socket.may_recv() && tcp_reached_established(socket.state())),
             )
         })
     })
@@ -2039,26 +1916,6 @@ pub fn tcp_recv_snapshot(idx: usize) -> Option<TcpRecvSnapshot> {
         })
     });
     Some(snap)
-}
-
-/// The table facts a `getsockname(2)` arm reports.
-///
-/// This socket's bound (or allocated ephemeral) port and its recorded bind
-/// address — `0.0.0.0` when nothing was bound. The caller decides what an unbound address
-/// means (taoxichuan substitutes the interface's address, the way Linux's
-/// connected-socket getsockname shows the routed source). Session Q:
-/// c-ares calls getsockname on its DNS socket and "Could not contact DNS
-/// servers" without an answer.
-#[must_use]
-#[cfg(feature = "smoltcp")]
-pub fn socket_local_addr(idx: usize) -> Option<([u8; 4], u16)> {
-    with_table(|table| {
-        if let Some(Some(sock)) = table.get(idx) {
-            sock.bind_port.map(|p| (sock.bind_ip, p))
-        } else {
-            None
-        }
-    })
 }
 
 /// Get the default peer for a connected UDP socket

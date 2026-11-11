@@ -431,10 +431,6 @@ impl Process {
         }
     }
 
-    /// Get a reference to the shared fd table (for direct access in sys_close_range, etc.)
-    pub fn fd_table(&self) -> &Arc<SharedFdTable> {
-        &self.fds
-    }
 }
 
 /// Regression coverage for `docs/archive/CONCURRENT_WRITE_POSITION_RACE.md` — the

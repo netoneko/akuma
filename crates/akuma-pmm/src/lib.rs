@@ -1342,11 +1342,6 @@ pub fn record_free_at(pa: usize, tid: u32, site: FreeSite) {
     FREE_LEDGER_PA[idx].store(pa, Ordering::Release);
 }
 
-/// Back-compat shim: record with no site attribution.
-pub fn record_free(pa: usize, tid: u32) {
-    record_free_at(pa, tid, FreeSite::Unknown);
-}
-
 /// Most recent ledger entry for `pa`, as `(tid, seq)` — `None` if this frame has
 /// not been freed inside the ring's window.
 #[must_use]
@@ -2049,13 +2044,6 @@ static RAM_REGION_BASE: [AtomicUsize; MAX_RAM_REGIONS] =
 static RAM_REGION_END: [AtomicUsize; MAX_RAM_REGIONS] =
     [const { AtomicUsize::new(0) }; MAX_RAM_REGIONS];
 static RAM_REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// How many more [`add_ram`] calls will be accepted. Ask **before** sizing a
-/// span across regions you then cannot describe.
-#[must_use]
-pub fn ram_region_capacity() -> usize {
-    MAX_RAM_REGIONS - RAM_REGION_COUNT.load(Ordering::Acquire)
-}
 
 pub fn alloc_page() -> Option<usize> {
     if let Some(pa) = alloc_page_once() {

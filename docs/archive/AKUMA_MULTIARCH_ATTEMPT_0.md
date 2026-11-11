@@ -1446,3 +1446,16 @@ Gates:
 - HVF default: SMP=1 (two runs), SMP=2 and SMP=4 all have 0 `[Test]` failures, with
   `thread_slot_reclaim_on_spawn PASSED` in each.
 - amd64 TCG: SMP=1 829/0, SMP=2 839/0.
+
+## Second dead-code pass: the SGI scheduler's residue (2026-11-11)
+
+A scan for `pub` items with no caller found ~1,100 lines the SGI scheduler's deletion had left
+compiling: its picker, `commit_switch`, its per-core flags, and the run-next hint. Two fixes
+lived in that hint (the nanosleep floor of 2026-08-18 and the signal-wake half of the
+`pthread_kill` fix) and have done nothing since the call switch took over. Recorded as open,
+not re-implemented: [`SGI_SCHEDULER_RESIDUE.md`](SGI_SCHEDULER_RESIDUE.md).
+
+Gates:
+- HVF default: SMP=1/2/4, 0 `[Test]` failures; the PASSED set equals the previous run's minus
+  the deleted `borrow_tracker_disabled_no_serial_flood`.
+- amd64 TCG: SMP=1 829/0, SMP=2 839/0.

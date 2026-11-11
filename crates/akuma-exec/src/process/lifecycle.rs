@@ -36,7 +36,7 @@
 //!
 //! - **IRQs stay enabled** — timer ticks, device IRQs and the scheduler wake-pass all
 //!   still run; block I/O completes. Only the context *switch* is deferred
-//!   (`ThreadPool::schedule_indices` returns `None` for involuntary entries).
+//!   (`threading::el1_preemptible` declines the timer's switch).
 //! - **Voluntary switches still work** — an op that yields or blocks (`yield_now`,
 //!   `blocking_relax`, a file read) switches away normally. While it waits, the op is
 //!   not mid-mutation of shared state (the yield points in these ops all sit outside

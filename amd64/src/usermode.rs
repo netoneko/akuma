@@ -4358,7 +4358,7 @@ pub fn sys_spawn(
     // (`spawn_process_with_channel_ext`); a spawn's terminal state is fresh
     // (the `None` above), so there is no caller's group to clobber.
     //
-    // `kill_process_group` excludes the **leader**, so this names the shell and
+    // `kill_foreground_group` excludes the **leader**, so this names the shell and
     // reaches everything the shell forks — which is the job that should die on
     // `^C`, and not the shell running it.
     if let Some(proc) = akuma_exec::process::lookup_process_shared(pid) {

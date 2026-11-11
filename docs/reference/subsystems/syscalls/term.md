@@ -160,8 +160,8 @@ userspace copy (`userspace/libakuma/src/lib.rs`). Fields:
 - **`last_core`** (offset 25) — the MPIDR aff0 of the core the thread last
   ran on; `0xFF` means never scheduled. Populated from
   `threading::get_thread_last_core`, which reads a lock-free
-  `LAST_CORE: [AtomicU8; MAX_THREADS]` array written in the scheduler's
-  `commit_switch` (in `akuma-exec`). It is deliberately **not** a
+  `LAST_CORE: [AtomicU8; MAX_THREADS]` array the switch writes
+  (`akuma-threading`). It is deliberately **not** a
   `ThreadSlot` field: `sys_get_cpu_stats` must not take `POOL.lock` (a
   nested user-copy fault while holding it self-deadlocks the core — see the
   `USER_COPY_FAULT_HANDLER` note in `threading/mod.rs`), so every per-thread

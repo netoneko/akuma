@@ -39,35 +39,32 @@ use akuma_stack::StackRegion;
 /// be PICKED by a scheduler only when its gate is clear. Two distinct races
 /// require this, and thread STATE alone catches neither:
 ///
-/// 1. **Switch-out tail.** `commit_switch` marks the outgoing thread READY and
-///    POOL is released when `sgi_scheduler_handler_with_sp` returns — but the
-///    switching core keeps EXECUTING ON THE OUTGOING THREAD'S KERNEL STACK
-///    until the vector asm's `mov sp, x0` (Rust epilogues, BKL reconcile and
-///    tag bookkeeping all run on it after POOL is gone). A peer picking the
-///    thread in that window resumes it onto a stack still in use.
+/// 1. **Switch-out tail.** The outgoing thread is READY again before the
+///    switching core has left its kernel stack: the core keeps EXECUTING ON
+///    THE OUTGOING THREAD'S STACK until the switch has moved SP. A peer picking
+///    the thread in that window resumes it onto a stack still in use.
 /// 2. **Wake-before-switch-out.** `schedule_blocking` stores WAITING (often
 ///    with an already-expired deadline) while the thread is STILL RUNNING,
 ///    before its yield-SGI fires. A peer's wake-pass / `mark_thread_ready`
-///    flips it READY and a peer scheduler resumes it from its STALE `ctx.sp`
+///    flips it READY and a peer scheduler resumes it from its STALE saved SP
 ///    (the previous switch-out's frame) while it is still running elsewhere —
 ///    a double-run on one stack. Observed as EL1 `ret` into kernel data /
 ///    `ELR=0x8` with SP in another thread's stack, and as §5.1's ERET to EL0
 ///    with a kernel register file.
 ///
-/// Protocol: `commit_switch` sets the gate for the INCOMING thread (and
-/// defensively re-asserts the outgoing thread's, which stays set from its own
-/// switch-in); the outgoing tid is recorded per-core and its gate is cleared by
-/// `rust_switch_finished`, called from the vector asm immediately AFTER
-/// `mov sp, x0`. Bringup sites (boot thread, per-core idle claim) set the gate
-/// for the thread they start life running. Pickers and the slot recycler skip
-/// gated threads.
+/// Protocol: the picker's 0→1 CAS on the INCOMING thread's gate is its claim
+/// (`akuma_threading::pick_next`); the outgoing thread's gate stays set from its
+/// own switch-in. The switch records the outgoing tid in [`PER_CORE_OFFCPU`] and
+/// [`rust_switch_finished`] clears its gate once this core is off that stack.
+/// Bringup sites (boot thread, per-core idle claim) set the gate for the thread
+/// they start life running. Pickers and the slot recycler skip gated threads.
 pub static ON_CPU: [AtomicU8; MAX_THREADS] = {
     const INIT: AtomicU8 = AtomicU8::new(0);
     [INIT; MAX_THREADS]
 };
 
 /// Per-core: the tid whose [`ON_CPU`] gate this core must clear once the
-/// vector asm has switched SP (`usize::MAX` = none pending). Sized by
+/// switch has moved SP (`usize::MAX` = none pending). Sized by
 /// `types::MAX_CORES`, the SMP bringup cap.
 pub static PER_CORE_OFFCPU: [AtomicUsize; MAX_CORES] = {
     const INIT: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -75,11 +72,10 @@ pub static PER_CORE_OFFCPU: [AtomicUsize; MAX_CORES] = {
 };
 
 
-/// Clear the outgoing thread's off-CPU gate; the vector asm and the trampolines below call it.
+/// Clear the outgoing thread's off-CPU gate; the switch and the trampolines below call it.
 ///
-/// Called immediately after `mov sp, x0`: this core is
-/// now off the outgoing thread's kernel stack, so peers may pick that thread up (or recycle its slot). Clears
-/// the off-CPU gate `commit_switch` latched. Runs with IRQs masked on the incoming thread's stack; takes no locks.
+/// Called once SP has moved: this core is now off the outgoing thread's kernel stack, so peers may pick that
+/// thread up (or recycle its slot). Runs with IRQs masked on the incoming thread's stack; takes no locks.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_switch_finished() {
     let core = akuma_bkl::bkl::current_core_id() as usize;
@@ -297,17 +293,6 @@ pub fn word_cell(idx: usize, field: CtxField) -> &'static AtomicU64 {
 // ── the switch ──────────────────────────────────────────────────────────────────────────────────────────
 
 
-
-extern "C" fn thread_start() -> ! { panic!("not on bare metal aarch64") }
-extern "C" fn thread_start_closure() -> ! { panic!("not on bare metal aarch64") }
-
-/// Address of the SGI path's `extern "C"` thread entry trampoline.
-#[must_use]
-pub fn thread_start_addr() -> u64 { thread_start as *const () as u64 }
-
-/// Address of the SGI path's closure entry trampoline (`x19` = fn, `x20` = data, `x21` = IRQ-mask flag).
-#[must_use]
-pub fn thread_start_closure_addr() -> u64 { thread_start_closure as *const () as u64 }
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(

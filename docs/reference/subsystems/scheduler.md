@@ -152,7 +152,8 @@ tick that lands while it is held (the switch would spin on this core's own hold)
   the deadline (`wake_pass`) readies it. A wake for a thread on a halted core sends that
   core a scheduler SGI.
 - **`Waker`** (`ThreadWaker`, `threading/mod.rs:3351`, `wake()` at `:3363`) — `wake()` sets the sticky
-  `WOKEN_STATES` flag + `PREEMPT_WAKE_TID`. Used by wait queues, epoll, and the
+  `WOKEN_STATES` flag and readies the thread; it joins the round-robin scan like any other
+  (no run-next hint, `archive/SGI_SCHEDULER_RESIDUE.md`). Used by wait queues, epoll, and the
   SSH `current_thread_waker()`.
 - **Wait queues** (see `archive/WAIT_QUEUES.md`): a thread registers a `Waker`
   on a wait queue, then `schedule_blocking()`. The producer fires the waker.

@@ -1004,7 +1004,7 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // scheduler. No-op with a single QEMU CPU. (docs/archive/SMP_SHARED.md)
     //
     // Bringup TIMING depends on the image, because the secondary immediately calls
-    // `adopt_current_as_core_idle` to claim a thread-pool slot:
+    // `adopt_core_idle` to claim a thread-pool slot:
     //
     //  * Boot SELF-TEST image (tests compiled in): bring up HERE, before `threading::init`,
     //    so the M0–M4 `test_smp_shared_*` self-tests find the secondaries already online.
@@ -1180,7 +1180,7 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     allocator::enable_preemption_safe_alloc();
 
     // RUNTIME image (`no-tests`): bring secondaries up HERE — after the thread pool and
-    // preemptive scheduler are live — so each secondary's `adopt_current_as_core_idle`
+    // preemptive scheduler are live — so each secondary's `adopt_core_idle`
     // claims a distinct slot from the initialized allocator and never collides with the
     // async-main thread spawned below. (The self-test image brought them up earlier, before
     // `threading::init`; see the note there.) Combined with the network path's cross-core

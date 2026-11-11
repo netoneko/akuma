@@ -72,7 +72,7 @@ real SMP) — see `scripts/build_devbox_smoltcp.sh` and
    `secondary_entry_shared` trampoline (asm, `.text.boot`), which loads the BSP's
    **shared** boot `TTBR0`/`TTBR1` and tail-calls `secondary_shared_start`.
 3. `secondary_shared_start(_ctx, core_idx)` (M2c) adopts its boot context as this core's
-   idle thread (`adopt_current_as_core_idle` → `TPIDRRO_EL0`, `register_core_idle`),
+   idle thread (`adopt_core_idle` → `TPIDRRO_EL0`, `register_core_idle`),
    inits its per-PE GIC receive path (CPU interface + redistributor + scheduler SGI 0 +
    timer PPI 27; device space is identity-mapped via boot L1[0]), installs the shared
    `exception_vector_table`, arms the shared 10 ms CNTV tick, enables IRQs, and enters an

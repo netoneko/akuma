@@ -149,7 +149,7 @@ pub fn pty_close(n: u32, master: bool) {
 
 /// Deliver `signo` to every process (thread-group leader) in group `pgid`.
 ///
-/// Unlike `kill_process_group` — the console's `^C`, which deliberately spares
+/// Unlike `kill_foreground_group` — the console's `^C`, which deliberately spares
 /// the group leader — this is `killpg(2)`: the leader is a member. Group 0 and
 /// group 1 are refused outright: 0 is "no foreground group", and 1 is `init`'s
 /// and with it every console process, which a terminal emulator's `^C` must
@@ -158,7 +158,7 @@ fn signal_pgrp(pgid: u32, signo: u32) {
     if pgid <= 1 {
         return;
     }
-    // Fixed array, as in `kill_process_group`: the callback runs with IRQs
+    // Fixed array, as in `kill_group`: the callback runs with IRQs
     // masked and must not allocate.
     let mut targets = [0u32; akuma_exec::process::MAX_PROCESSES];
     let mut count = 0;

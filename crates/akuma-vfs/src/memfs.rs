@@ -109,11 +109,6 @@ impl MemoryFilesystem {
         }
     }
 
-    /// Set a callback that provides the current Unix time in seconds.
-    pub fn set_time_fn(&mut self, f: fn() -> u64) {
-        self.time_fn = Some(f);
-    }
-
     fn navigate<'a>(node: &'a FsNode, path: &str) -> Result<&'a FsNode, FsError> {
         let components: Vec<&str> = path
             .trim_matches('/')

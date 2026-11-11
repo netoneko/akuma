@@ -807,7 +807,6 @@ pub fn run_all_tests() {
     test_rwspinlock_table_concurrent_reads();
     test_process_table_register_get_unregister();
     test_lookup_process_shim_returns_valid_ref();
-    test_borrow_tracker_increments();
     test_get_current_process_returns_arc();
     test_lock_free_iteration();
     test_slot_recycling();
@@ -815,7 +814,6 @@ pub fn run_all_tests() {
     test_sigkill_goroutine_does_not_kill_leader();
     test_zombie_stays_for_wait4_reap();
     test_orphan_children_become_zombies();
-    test_borrow_tracker_disabled_no_serial_flood();
     test_process_table_capacity();
     test_wait4_reaps_zombie();
     // Phase 7e "Free" half: deferred process-table reclamation
@@ -18777,30 +18775,6 @@ fn test_lookup_process_shim_returns_valid_ref() {
     }
 }
 
-/// Verify the borrow tracker increments on lookup_process calls.
-fn test_borrow_tracker_increments() {
-    use akuma_exec::process::{register_process, unregister_process, lookup_process_shared};
-    use akuma_exec::process::diag::BORROW_TRACKING_ENABLED;
-
-    if !BORROW_TRACKING_ENABLED {
-        console::print("[Test] borrow_tracker_increments SKIPPED (tracking disabled)\n");
-        return;
-    }
-
-    let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-    register_process(pid, make_test_process(pid));
-
-    // Each lookup_process call increments borrow count (monotonic, no dec at call sites)
-    let _ = lookup_process_shared(pid);
-    let _ = lookup_process_shared(pid);
-    // If we got here without a panic, the tracker is working
-    // (it logs [BORROW-ALIAS] but does not panic)
-
-    let _ = unregister_process(pid);
-
-    console::print("[Test] borrow_tracker_increments PASSED\n");
-}
-
 /// Verify current_process returns None in kernel context (no user process mapped).
 fn test_get_current_process_returns_arc() {
     use akuma_exec::process::current_process_shared;
@@ -19023,21 +18997,6 @@ fn test_orphan_children_become_zombies() {
         crate::safe_print!(128,
             "[Test] orphan_children_become_zombies FAILED: p_z={} c_z={} p_in={} c_in={}\n",
             parent_zombie, child_zombie, parent_in_table, child_in_table);
-    }
-}
-
-/// Verify borrow tracker is disabled and doesn't flood serial output.
-/// When enabled, the monotonic counter triggers log_borrow_alias on every
-/// lookup_process call after the first, flooding serial under heavy load
-/// (go build: 3000+ prints per PID). This caused timing-related crashes.
-fn test_borrow_tracker_disabled_no_serial_flood() {
-    use akuma_exec::process::diag::BORROW_TRACKING_ENABLED;
-
-    if BORROW_TRACKING_ENABLED {
-        console::print("[Test] borrow_tracker_disabled_no_serial_flood FAILED (tracking is enabled!)\n");
-        console::print("       WARNING: go build will be unusably slow due to serial flood\n");
-    } else {
-        console::print("[Test] borrow_tracker_disabled_no_serial_flood PASSED\n");
     }
 }
 

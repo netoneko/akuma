@@ -124,15 +124,6 @@ pub fn socket_soft_cap() -> usize {
     SOCKET_SOFT_CAP.load(Ordering::Relaxed)
 }
 
-/// How many socket slots have been reclaimed under pressure since boot.
-///
-/// The count lives in [`crate::SOCKET_SLOTS_RECLAIMED`] so `/proc/health` can
-/// read it on a build with the stack compiled out.
-#[must_use]
-pub fn reclaimed_slot_count() -> u64 {
-    crate::SOCKET_SLOTS_RECLAIMED.load(Ordering::Relaxed)
-}
-
 #[must_use]
 pub fn socket_create() -> Option<SocketHandle> {
     with_network(|net| {

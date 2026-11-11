@@ -2184,45 +2184,6 @@ fn alloc_page_zeroed_user() -> Option<akuma_exec::PhysFrame> {
     akuma_pmm::alloc_page_zeroed_user().map(akuma_exec::PhysFrame::new)
 }
 
-/// Default exception handler - logs unexpected exceptions
-/// CRITICAL: Must NOT return if ELR/SPSR are invalid, or ERET will crash!
-pub fn default_exception() {
-    note_exception_entry();
-    note_exc_class(3);
-    let esr = akuma_cpu::sysreg::esr_el1();
-    let elr = akuma_cpu::sysreg::elr_el1();
-    let spsr = akuma_cpu::sysreg::spsr_el1();
-    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
-    let sp = akuma_cpu::reg::sp() as u64;
-    let ec = (esr >> 26) & 0x3F;
-    let tid = akuma_exec::threading::current_thread_id();
-    
-    // Use stack-only print to avoid heap allocation in exception context
-    crate::safe_print!(128, "[Exception] Default handler: EC={:#x}, ELR={:#x}, SPSR={:#x}\n",
-        ec, elr, spsr);
-    crate::safe_print!(96, "  Thread={}, TTBR0={:#x}, SP={:#x}\n", tid, ttbr0, sp);
-    
-    // Check for dangerous ERET conditions
-    let target_el = spsr & 0xF;
-    if target_el == 0 {
-        crate::safe_print!(128, "  WARNING: SPSR indicates EL0 - ERET would go to user mode!\n");
-    }
-    if elr == 0 {
-        crate::safe_print!(128, "  WARNING: ELR=0 - ERET would jump to address 0!\n");
-    }
-    if elr < 0x4000_0000 && target_el != 0 {
-        crate::safe_print!(96, "  WARNING: ELR={:#x} looks like user address but SPSR is EL1!\n", elr);
-    }
-    
-    // If ERET would be dangerous, halt instead of returning
-    if elr == 0 || (target_el == 0 && elr < 0x4000_0000) {
-        crate::safe_print!(64, "  HALTING to prevent invalid ERET\n");
-        loop {
-            akuma_cpu::park::wfe();
-        }
-    }
-}
-
 /// IRQ / SGI entry: the root kernel's `akuma-vectors-aarch64` front end calls this from its
 /// `El0Irq`/`El1Irq` handlers.
 ///

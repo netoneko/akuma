@@ -32,7 +32,6 @@ mod adopted;
 mod fresh;
 pub mod spawn;
 pub mod exec;
-pub mod diag;
 pub mod lifecycle;
 pub mod bkl_guard;
 pub mod reclaim;
@@ -1149,29 +1148,6 @@ impl Process {
         with_irqs_disabled(|| self.memory.free_mmap(start, size));
     }
 
-    /// Run `f` holding this address space's page-table lock with preemption
-    /// disabled — the shared-kernel-SMP (M5b) primitive that lets a user page
-    /// fault mutate page tables **without** the Big Kernel Lock while still
-    /// excluding concurrent AS-mutating syscalls and sibling faults on the same
-    /// address space.
-    ///
-    /// `f` MUST be short and self-contained: PTE writes + frame tracking only. It MUST
-    /// NOT allocate frames, do block I/O, or yield while held — do that work before/
-    /// after (on private frames), exactly like [`Process::vm_with_regions`]. IRQs are
-    /// disabled for the whole hold, so (a) the lock is never carried across a context
-    /// switch (the "spinlock across switch" deadlock class), and (b) a nested timer IRQ
-    /// can't acquire the BKL behind our back and leak it (a lock→BKL inversion) —
-    /// the fault fast path holds this lock *instead of* the BKL. See
-    /// docs/archive/SMP_SHARED_M5_FAULT_LOCK_PLAN.md.
-    ///
-    /// On builds without `kernel_bkl_smp` this is a bare (uncontended) spinlock
-    /// hold with no IRQ change — see [`ProcAddressSpace::lock`].
-    #[inline]
-    pub fn with_as_locked<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _g = self.address_space.lock();
-        f()
-    }
-
     /// Run `f` with `&mut UserAddressSpace` under this address space's lock (with
     /// IRQs masked on `smp-shared`) — the accessor that lets the shared-reference
     /// (`&Process`) syscall paths call the `&mut self` page-table mutators
@@ -1192,13 +1168,6 @@ impl Process {
         f(&mut g)
     }
 
-    /// Set command line arguments for this process
-    ///
-    /// Arguments will be passed to the process via the ProcessInfo page.
-    pub fn set_args(&mut self, args: &[&str]) {
-        self.image.lock().args = args.iter().map(|s| String::from(*s)).collect();
-    }
-    
     /// Set current working directory for this process
     pub fn set_cwd(&mut self, cwd: &str) {
         self.cwd = String::from(cwd);
@@ -1301,12 +1270,6 @@ impl Process {
     pub fn write_stdout(&self, data: &[u8]) {
         let mut stdout = self.stdout.lock();
         stdout.write_with_limit(data, config().proc_stdout_max_size);
-    }
-
-    /// Take captured stdout (transfers ownership)
-    pub fn take_stdout(&self) -> Vec<u8> {
-        let mut stdout = self.stdout.lock();
-        core::mem::take(&mut stdout.data)
     }
 
     /// Get current program break

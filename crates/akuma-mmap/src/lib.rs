@@ -25,7 +25,7 @@
 //!   region algebra. A crate that cannot lock cannot get it wrong.
 //! - `eager_region_flags_for_page_fault`, `eager_regions_containing`,
 //!   `update_eager_region_flags`, `munmap_lazy_regions_in_range`,
-//!   `record_mmap_region`, `remove_mmap_region`, `share_rw_range` — all pid-keyed:
+//!   `share_rw_range` — all pid-keyed:
 //!   they resolve a process before they can touch a region list.
 //! - `FaultAccess` / `lazy_map_flags` (`akuma_exec::mmu::types`) — demand-paging
 //!   *policy*, the seam between the data-abort and instruction-abort arms of the EL0

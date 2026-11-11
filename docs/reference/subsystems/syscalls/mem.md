@@ -343,8 +343,7 @@ first-fit scan over `mmap_regions`, which needs the list in address order.
 Since 2026-09-17 that order is an **invariant maintained by every writer, on
 both kernels**, and it is what lets every walk over the list be a binary search.
 `akuma_mmap::insert_region_sorted` owns it and documents it; the writers are
-amd64's `mmap`/`mremap`, AArch64's `mmap`/`mremap` (`akuma-syscalls-glue`) and
-`akuma_exec::process::record_mmap_region`. Everything else in `akuma-mmap`
+amd64's `mmap`/`mremap` and AArch64's `mmap`/`mremap` (`akuma-syscalls-glue`). Everything else in `akuma-mmap`
 already preserved order: `inherit_mmap_regions_for_cow_child` maps over its
 input, `mprotect_eager_regions_in_range` drains in order and emits each region's
 pieces ascending, `detach_eager_regions_in_range` leaves survivors in the slot

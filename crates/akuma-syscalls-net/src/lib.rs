@@ -41,22 +41,6 @@ pub mod cmd {
     pub const SIOCGIFMTU: u32 = 0x8921;
     pub const SIOCGIFHWADDR: u32 = 0x8927;
 
-    /// Is `cmd` one this crate answers? A caller routes these to
-    /// [`super::siocgifreq_reply`] / [`super::siocgifconf_record`] *before* the
-    /// `fd > 2 → ENOTTY` gate that every other non-tty ioctl hits.
-    #[must_use]
-    pub const fn is_interface_query(cmd: u32) -> bool {
-        matches!(
-            cmd,
-            SIOCGIFCONF
-                | SIOCGIFFLAGS
-                | SIOCGIFADDR
-                | SIOCGIFBRDADDR
-                | SIOCGIFNETMASK
-                | SIOCGIFMTU
-                | SIOCGIFHWADDR
-        )
-    }
 }
 
 /// `IFF_*` flag combinations (`linux/if.h`).

@@ -12,6 +12,11 @@ probe failed **9 of 10** by-hand runs at SMP=1. See
 [§ Re-verified 2026-08-28](#re-verified-2026-08-28--the-first-fix-did-not-hold).
 The guard is that probe, a Tier 3 exercise rather than a boot test.
 
+**Correction 2026-11-11:** of the second fix's two halves, `SIGNAL_WAKE_PREEMPT` no longer
+does anything: its hint was read only by the SGI scheduler's picker, which is gone. The other
+half, `SIGFRAME_ACTIVE` (the one that took the probe from 9/10 to 15/15), is still in place.
+The probe has not been re-run since: [`SGI_SCHEDULER_RESIDUE.md`](SGI_SCHEDULER_RESIDUE.md).
+
 ## Summary
 
 A blocking syscall reports `EINTR` by **observing** a pending-signal bit in its

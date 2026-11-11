@@ -138,6 +138,6 @@
     "crates/akuma-uart": 1,
     "crates/akuma-user-access": 20,
     "crates/akuma-vectors-aarch64": 4,
-    "crates/akuma-virtio": 17
+    "crates/akuma-virtio": 15
   }
 }

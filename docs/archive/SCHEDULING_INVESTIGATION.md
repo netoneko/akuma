@@ -1,5 +1,11 @@
 # Terminal stutter: every short sleep costs a full round-robin pass
 
+**Correction 2026-11-11:** `WAKE_DEADLINE_PREEMPT`, half of the fix below, no longer
+does anything. Its run-next hint (`PREEMPT_WAKE_TID`) was read only by the SGI scheduler's
+picker, and the call-switch scheduler that replaced it (default since `e85f53dd`, the only
+one since `cd1d8f17`) scans plain round-robin. The tick half stands (3 ms today). The
+nanosleep floor has not been re-measured since: [`SGI_SCHEDULER_RESIDUE.md`](SGI_SCHEDULER_RESIDUE.md).
+
 **Date:** 2026-08-17/18
 **Status:** **The kernel-scheduler fix below is real and stands. The
 freezes it didn't fix were a separate, nca-side bug — also found and fixed

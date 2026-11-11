@@ -3,11 +3,10 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::sync::Arc;
 
 use crate::runtime::config;
 use crate::process::types::{Pid, YieldOnce};
-use crate::process::channel::{ProcessChannel, get_channel};
+use crate::process::channel::get_channel;
 use crate::process::children::{lookup_process_shared, read_current_pid};
 #[cfg(feature = "elf-loader")]
 use crate::process::spawn::spawn_process_with_channel_cwd;
@@ -128,13 +127,6 @@ pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, env: Option<&[Str
     crate::threading::cleanup_terminated();
 
     Ok((exit_code, output))
-}
-
-/// Get the process channel for a running process by thread ID
-///
-/// Used by the SSH shell to get a handle for interrupting a process.
-pub fn get_process_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
-    get_channel(thread_id)
 }
 
 #[cfg(feature = "elf-loader")]

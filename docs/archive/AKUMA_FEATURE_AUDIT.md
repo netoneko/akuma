@@ -375,6 +375,26 @@ inherited them. Fixed, with a boot test:
 Not dead, just missing: x86_64 `sendfile` (40) is `ENOSYS` on amd64, and so is AArch64's (71). No
 `sendfile` exists in glue. busybox `cat` falls back to `read`.
 
+## Second pass: `pub` items with no caller (2026-11-11)
+
+The first pass only looked at items that carried an `allow`. The lint never checks `pub`
+items, so the second pass listed every `pub fn`/`static`/`const`/type whose name appears
+nowhere else in the tree with comments stripped (`git ls-files` Rust, assembly, linker,
+manifest, Python and shell files; vendored trees excluded), then followed the compiler's
+`dead_code` warnings through the same 11 configurations until they stopped.
+
+- **286 candidates.** About 200 are hardware register vocabulary (EHCI, xHCI, HID, NVMe,
+  RTL8169, I2C, HDA, 802.11, SVM, `AT_*`, `MAIR_*`) and stay: they model a spec.
+- **Most of the rest was residue of the SGI scheduler**, deleted in `cd1d8f17` but leaving
+  everything it alone called: its picker `ThreadPool::schedule_indices` (~300 lines),
+  `commit_switch`, the voluntary-switch flags, and the run-next hint `PREEMPT_WAKE_TID`, which
+  the signal path still wrote. Full list and the two fixes that went with that hint:
+  [`SGI_SCHEDULER_RESIDUE.md`](SGI_SCHEDULER_RESIDUE.md).
+- `akuma-exec`'s `process::diag` (a borrow tracker that could not work, and lock timers with no
+  caller), and ~40 single functions across 18 crates.
+- `unsafe` budget 409 → 407 (`akuma-virtio`'s unused `transmit_begin`/`transmit_complete`);
+  untyped address parameters 700 → 692.
+
 ## Proposed simplifications
 
 | # | change | risk | gate |

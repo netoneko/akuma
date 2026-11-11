@@ -7,7 +7,7 @@ use crate::process::Process;
 use crate::process::types::{Pid, ProcessInfo, PROCESS_INFO_ADDR, LazyRegion, LazySource, MmapRegion, ProcessInfo2, ProcessState};
 use crate::process::channel::{ProcessChannel, get_channel};
 use crate::process::table::{THREAD_PID_MAP, find_process};
-use crate::runtime::{with_irqs_disabled, runtime, PhysFrame};
+use crate::runtime::{with_irqs_disabled, runtime};
 use akuma_tty as terminal;
 
 /// Registry mapping child PIDs to (ProcessChannel, parent_pid)
@@ -724,7 +724,7 @@ pub fn read_current_pid() -> Option<Pid> {
 /// [`lookup_process`] so two cores faulting in different address spaces don't both
 /// materialize `&'static mut` to the same object (aliasing UB). Every address-space
 /// mutation the fault path needs is a `&self` method (`track_user_frame`,
-/// `track_page_table_frame`, `vm_with_regions`, `with_as_locked`) or a free function
+/// `track_page_table_frame`, `vm_with_regions`, `with_address_space`) or a free function
 /// (`mmu::map_user_page*`); the actual cross-core mutual exclusion on the raw
 /// page-table writes comes from [`Process::address_space`]'s lock, not from
 /// `&mut` exclusivity.
@@ -735,9 +735,7 @@ pub fn read_current_pid() -> Option<Pid> {
 /// leader (`as_owner`), which cannot be freed while the faulting thread runs, so the
 /// reference is sound there. Foreign-PID lookups must stay on the BKL slow path.
 pub fn lookup_process_shared(pid: Pid) -> Option<&'static Process> {
-    let proc = crate::process::table::active_process_ref(pid)?;
-    crate::process::diag::borrow_inc(pid);
-    Some(proc)
+    crate::process::table::active_process_ref(pid)
 }
 
 /// Outcome of [`fault_slot_acquire`] — how the per-page demand-paging slot was won.
@@ -912,7 +910,7 @@ pub fn fault_slot_release(as_owner: Pid, page_va: usize) {
 /// PID the same way (thread-to-PID map first, then the ProcessInfo page).
 ///
 /// This is the accessor for the Phase 7e "Access" migration: reads and calls
-/// to `&self` methods (fd table, `vm_*`, `with_as_locked`, `Arc` fields) go
+/// to `&self` methods (fd table, `vm_*`, `with_address_space`, `Arc` fields) go
 /// through this; plain-field *writes* go through [`with_current_process`] /
 /// `table::with_process` instead, so no call site materializes a long-lived
 /// `&'static mut Process` (aliasing UB when two cores hold one to the same
@@ -997,21 +995,6 @@ pub fn alloc_mmap(size: usize) -> usize {
                 proc.pid, size, proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed), proc.memory.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
             0
         }
-    }
-}
-
-/// Record a new mmap region for the current process
-///
-/// Called by sys_mmap after allocating frames.
-/// The frames Vec should contain all physical frames for this region.
-pub fn record_mmap_region(start_va: usize, frames: Vec<PhysFrame>) {
-    let pid = address_space_owner_pid_for_fault().unwrap_or(0);
-    if let Some(proc) = lookup_process_shared(pid) {
-        // Sorted insert: the region list is kept in address order so `munmap`'s
-        // clip-and-split and the fault path can binary-search it. See
-        // `akuma_mmap::insert_region_sorted`, which documents the invariant and
-        // names every writer that has to hold it.
-        proc.vm_with_regions(|r| insert_region_sorted(r, MmapRegion::owned(start_va, frames)));
     }
 }
 
@@ -1627,11 +1610,6 @@ pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize,
     with_irqs_disabled(|| proc.lazy_regions.lock().update_flags(range_start, range_size, new_flags));
 }
 
-pub fn remove_lazy_region(pid: Pid, start_va: usize) -> Option<LazyRegion> {
-    let proc = lookup_process_shared(pid)?;
-    with_irqs_disabled(|| proc.lazy_regions.lock().remove(start_va))
-}
-
 /// Handle munmap across all lazy regions overlapping [unmap_addr, unmap_addr+unmap_len).
 pub fn munmap_lazy_regions_in_range(pid: Pid, unmap_addr: usize, unmap_len: usize) -> Vec<(usize, usize)> {
     let unmap_end = unmap_addr + unmap_len;
@@ -1699,37 +1677,6 @@ pub fn clone_lazy_regions(from_pid: Pid, to_pid: Pid) {
 /// so call only from non-pressure contexts.
 pub fn lazy_regions_snapshot(pid: Pid) -> Option<BTreeMap<usize, LazyRegion>> {
     lookup_process_shared(pid).map(|p| with_irqs_disabled(|| p.lazy_regions.lock().clone_all()))
-}
-
-/// Check if a virtual address falls within any lazy region.
-pub fn is_in_lazy_region(va: usize) -> bool {
-    lazy_region_lookup(va).is_some()
-}
-
-/// Remove and return mmap region starting at the given VA
-pub fn remove_mmap_region(start_va: usize) -> Option<Vec<PhysFrame>> {
-    let pid = address_space_owner_pid_for_fault().unwrap_or(0);
-    let proc = lookup_process_shared(pid)?;
-    
-    // Find & remove the region under vm_lock (pure Vec op).
-    let region = proc.vm_with_regions(|r| {
-        r.iter().position(|reg| reg.start_va == start_va).map(|idx| r.remove(idx))
-    })?;
-
-    // RECLAIM: Add the freed range to free_regions. Size from `pages` (the
-    // authoritative extent) so a CoW-inherited region — which owns no frames —
-    // still recycles its full VA range rather than zero bytes.
-    proc.vm_free_mmap(region.start_va, region.len_bytes());
-
-    Some(region.frames)
-}
-
-/// Get stack bounds for current process
-pub fn get_stack_bounds() -> (usize, usize) {
-    match current_process_shared() {
-        Some(p) => (p.memory.stack_bottom.load(core::sync::atomic::Ordering::Relaxed), p.memory.stack_top.load(core::sync::atomic::Ordering::Relaxed)),
-        None => (0, 0),
-    }
 }
 
 

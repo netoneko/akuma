@@ -247,7 +247,7 @@ pub fn check_signal_pid(pid: Pid) -> Result<(), SignalDeny> {
 
 /// Deliver `sig` to `pid`'s whole thread group (target + CLONE_THREAD siblings),
 /// or hard-kill it if it has no live thread to interrupt. This is `sys_kill`'s
-/// per-pid delivery logic, factored out so [`kill_process_group`] can reuse it
+/// per-pid delivery logic, factored out so [`kill_foreground_group`] can reuse it
 /// for each member of a process group instead of duplicating it.
 ///
 /// Returns `true` if the process was found (delivered to a live thread, or
@@ -447,49 +447,10 @@ pub fn pend_signal_to_group(pid: Pid, sig: u32) -> bool {
     true
 }
 
-/// Deliver `sig` to every process whose `.pgid` is `pgid` (POSIX `kill(-pgid,
-/// sig)` group semantics).
-///
-/// `fork`/`clone` propagate `.pgid` from parent to child (a plain
-/// non-job-control shell never calls `setpgid`, so it and everything it execs
-/// share one `pgid`), so this reaches a shell's foreground child without
-/// needing to track "whichever pid is currently in the foreground" — the
-/// mechanism a terminal's INTR character (Ctrl-C) needs. See
-/// `write_to_process_stdin`'s ISIG handling and
-/// `docs/archive/CTRL_C_SIGINT_DELIVERY.md`.
-///
-/// Deliberately excludes the group **leader** (`p.pid == pgid` — by
-/// construction, in every case this is called for, that's the interactive
-/// login shell itself: `spawn_process_with_channel_ext` sets a freshly
-/// spawned top-level process's own `.pgid` to its own `pid`,
-/// `crates/akuma-exec/src/process/image.rs:296`). Live-tested 2026-08-24:
-/// broadcasting to the leader too killed the shell (and the whole SSH
-/// session with it) on roughly 2 of 3 runs — real Unix relies on the shell
-/// protecting itself with `SIG_IGN`, and something in that path is not
-/// reliable here (`SIG_IGN` is correctly stored and honored, and `fork`/
-/// `vfork` both correctly give the child a private `signal_actions` copy —
-/// see `deliver_signal`'s and `SharedSignalTable::clone_for_fork`'s doc
-/// comments — so the exact mechanism is still unattributed; this exclusion
-/// sidesteps it rather than fixes it). Excluding the leader is safe for
-/// every caller of this function today: it exists solely for the terminal's
-/// INTR-character handling in `write_to_process_stdin`, not as a general
-/// `kill(-pgid, sig)` primitive, and the thing that should die on Ctrl-C is
-/// the foreground job, never the shell running it.
-///
-/// Returns how many group members it delivered to — **the number the `[ISIG]`
-/// trace in [`crate::process::write_to_process_stdin`] prints**. Zero is the
-/// interesting value: it means the INTR character reached the line discipline,
-/// named a `foreground_pgid`, and found nothing carrying that `pgid` — which is
-/// a `^C` that raises a signal at nobody and is indistinguishable, from the
-/// terminal, from one that never arrived.
-pub fn kill_process_group(pgid: Pid, sig: u32) -> usize {
-    kill_group(pgid, sig, false)
-}
-
 /// A terminal signal (`^C`, `^\\`) for the foreground group `pgid` of a terminal
 /// whose session shell's group is `session_pgid`: the shell is spared, a job is not.
 ///
-/// [`kill_process_group`] always spares the leader, which is right while the
+/// Sparing the leader is right while the
 /// foreground group *is* the shell's ([`akuma_tty::TerminalState::spares_leader`]).
 /// A job-control shell (busybox `sh -i`) instead makes each job its own group
 /// and `TIOCSPGRP`s to it, and then the leader is the job — sparing it left

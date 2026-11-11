@@ -21,7 +21,7 @@ stateDiagram-v2
         [*] --> Free
         Free --> Initializing : claim_free_slot CAS
         Initializing --> Ready : spawn or clone_thread
-        Ready --> Running : schedule_indices (POOL try_lock, IRQ ctx)
+        Ready --> Running : pick_next (ON_CPU gate CAS)
         Running --> Ready : preempt or yield
         Running --> Blocked : schedule_blocking
         Blocked --> Ready : ThreadWaker.wake (lock-free)

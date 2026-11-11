@@ -400,12 +400,6 @@ impl RecoverableRwLock {
 
     // ── introspection (diagnostics, boot self-tests, the model's oracle) ────
 
-    /// The tid currently owning the write hold, if any.
-    pub fn writer_tid(&self) -> Option<usize> {
-        let o = self.owner.load(Ordering::Acquire);
-        (o != NO_OWNER).then_some(o)
-    }
-
     /// How many read holds `tid` currently carries (including phantom
     /// reservations — see [`Self::try_read`]).
     pub fn reader_holds(&self, tid: usize) -> usize {

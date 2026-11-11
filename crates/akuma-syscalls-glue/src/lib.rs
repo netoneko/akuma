@@ -663,7 +663,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         //   reported 130.
         // - The killing is the **signal's** job and has been since 2026-08-24
         //   (`docs/archive/CTRL_C_SIGINT_DELIVERY.md`): the same
-        //   `kill_process_group` that raises this flag pends `SIGINT`, whose
+        //   `kill_foreground_group` that raises this flag pends `SIGINT`, whose
         //   default action terminates at the next return to userspace. The
         //   stamp was belt-and-braces from before delivery worked, and what it
         //   actually did was overwrite the truth with a guess.

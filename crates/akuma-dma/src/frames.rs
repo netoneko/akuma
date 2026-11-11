@@ -87,12 +87,6 @@ impl<const SLOTS: usize, const LEN: usize> FrameArena<SLOTS, LEN> {
         SLOTS
     }
 
-    /// Bytes per slot.
-    #[must_use]
-    pub const fn slot_len(&self) -> usize {
-        LEN
-    }
-
     /// A raw slice pointer to slot `slot`, or `None` if out of range.
     ///
     /// **Forming the pointer is safe; dereferencing it is not.** That split is

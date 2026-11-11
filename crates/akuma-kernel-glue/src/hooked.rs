@@ -179,8 +179,7 @@ fn saved_root_probe(l0_base: u64) -> Option<(usize, u8)> {
 }
 
 /// Boot-suite hook: record `root` as `slot`'s saved root under its current generation,
-/// returning the previous record — the hooked path's `threading::test_swap_saved_ctx_ttbr0`,
-/// which stages "an off-CPU thread still carries this root" for the free-gate test. Never
+/// returning the previous record. It stages "an off-CPU thread still carries this root" for the free-gate test. Never
 /// call this outside tests.
 #[doc(hidden)]
 pub fn test_swap_saved_root(slot: usize, root: u64) -> u64 {

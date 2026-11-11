@@ -112,12 +112,6 @@ impl Pipe {
         self.write_closed
     }
 
-    /// Should a consumer act on this pipe now — data waiting, or EOF to report?
-    #[must_use]
-    pub fn is_readable(&self) -> bool {
-        !self.buf.is_empty() || self.write_closed
-    }
-
     /// Append up to [`Self::room`] bytes. Returns how many were taken; a short
     /// count (including 0) means the buffer is full and the caller retries the
     /// rest. Writing to a closed pipe still returns 0 rather than erroring — the

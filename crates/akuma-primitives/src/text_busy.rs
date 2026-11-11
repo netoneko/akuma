@@ -71,12 +71,6 @@ pub fn is_busy(fs: u32, inode: u32) -> bool {
     fs != 0 && inode != 0 && KEYS.iter().any(|s| s.load(Ordering::Acquire) == key(fs, inode))
 }
 
-/// How many inodes are being executed (diagnostics and tests).
-#[must_use]
-pub fn busy_count() -> usize {
-    KEYS.iter().filter(|s| s.load(Ordering::Acquire) != 0).count()
-}
-
 fn acquire(k: u64) -> bool {
     let _l = lock();
     let mut free = None;
