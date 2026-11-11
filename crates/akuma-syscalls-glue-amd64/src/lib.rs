@@ -172,13 +172,22 @@ pub fn openat(dirfd: u64, path: u64, flags_x86: u64, mode: u64) -> u64 {
     let Ok(resolved) = glue::fs::resolve_path_at(dirfd as i32, &raw) else {
         return EBADF;
     };
-    if flags & o::O_NOFOLLOW != 0 && akuma_vfs_glue::is_symlink(&resolved) {
+    openat_resolved(dirfd, &resolved, flags, mode)
+}
+
+/// [`openat`] from a resolved path and asm-generic `flags`.
+///
+/// For a kernel that looks at the resolved path first, to serve a device of
+/// its own, without reading and resolving it twice.
+#[must_use]
+pub fn openat_resolved(dirfd: u64, resolved: &str, flags: u32, mode: u64) -> u64 {
+    if flags & o::O_NOFOLLOW != 0 && akuma_vfs_glue::is_symlink(resolved) {
         return ELOOP;
     }
     let creating = flags & o::O_CREAT != 0;
     let wants_dir = flags & o::O_DIRECTORY != 0;
     if creating || wants_dir {
-        let md = akuma_vfs_glue::metadata(&resolved);
+        let md = akuma_vfs_glue::metadata(resolved);
         let is_dir = md.as_ref().is_ok_and(|m| m.is_dir);
         let present = md.is_ok();
         if creating && is_dir {
@@ -191,7 +200,7 @@ pub fn openat(dirfd: u64, path: u64, flags_x86: u64, mode: u64) -> u64 {
             return EEXIST;
         }
     }
-    glue::flat(glue::fs::openat_path(dirfd as i32, &resolved, flags, mode as u32))
+    glue::flat(glue::fs::openat_path(dirfd as i32, resolved, flags, mode as u32))
 }
 
 /// Whether `fd` names a regular file in the caller's table (not a directory,
@@ -269,7 +278,11 @@ pub fn write(fd: u64, buf: u64, len: u64) -> u64 {
 /// `readv`/`writev`: one `read`/`write` per non-empty `iovec`, stopping at the
 /// first short transfer (continuing would splice the stream) and reporting
 /// progress over a later error. At most 1024 entries (`IOV_MAX`).
-fn vectored(fd: u64, iov: u64, cnt: u64, one: fn(u64, u64, u64) -> u64) -> u64 {
+///
+/// Public so a kernel whose `read`/`write` serve devices of its own can pass
+/// those as `one` and keep this loop.
+#[must_use]
+pub fn vectored(fd: u64, iov: u64, cnt: u64, one: fn(u64, u64, u64) -> u64) -> u64 {
     let mut total = 0u64;
     for i in 0..cnt.min(1024) {
         let mut entry = [0u64; 2];

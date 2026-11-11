@@ -2151,3 +2151,38 @@ Gates:
   own.
 - **`tkill` of an unknown in-range tid returns 0** (Linux: `ESRCH`). Pinned, not fixed: it was the
   pre-slice behaviour on both kernels.
+
+### Slice 4: fd (2026-11-11)
+
+Three steps, each its own commit:
+
+1. amd64's fd layer becomes `akuma-syscalls-glue-amd64`, the x86 copy Taoxichuan already runs.
+2. amd64's devices move behind glue hooks.
+3. The Linux-correct refusals move into glue itself, for both kernels.
+
+**Step 1: amd64 runs glue-amd64's fd layer.** `amd64/src/fd.rs` was a second copy of glue-amd64:
+`openat`'s four refusals (`O_NOFOLLOW`, `O_CREAT` on a directory, `O_DIRECTORY` on a file,
+`O_EXCL`), chunked `read`/`pread` past 64 KiB, the `O_RDONLY` write refusal, the `struct stat`
+conversion, the `poll`/`select` timeouts, `dup2`'s `old == new` rule and the `fcntl` seal commands.
+Those bodies are gone. Each amd64 arm keeps only what is its own, then calls glue-amd64:
+
+| arm | kept on amd64 | then |
+|---|---|---|
+| `openat` | fb, wifi, power, kvm, tun, mouse opens; block node `ENODEV`; the `MAX_FDS` ceiling | `openat_resolved` (new: the path is resolved once) |
+| `read` | the six device reads | `read` |
+| `pread64` | `ESPIPE` on a pipe, socket or console | `pread64` |
+| `write` | the device writes, the serial console | `write` |
+| `readv`/`writev` | the tun calls | `vectored` (now public), with amd64's own `read`/`write` per entry |
+| `fstat` | the device stats, the boot task's unbound console | `fstat` |
+| `newfstatat` | `AT_EMPTY_PATH` with an empty path goes to amd64's `fstat` | `newfstatat` |
+| `dup2` / `fcntl` / `poll` / `select` | `dup2`'s `MAX_FDS` bound | the same names |
+
+No behaviour change was intended, and none was seen. Gates: clippy (amd64, Taoxichuan x86_64 and
+aarch64); glue-amd64 host tests; amd64 TCG 836/846/846 at `SMP=1/2/4`, `headless` 836/846; an ssh
+shell smoke covering redirects, `>>`, pipes, `stat` of a file, a directory and `/dev/null`, a 1.1 MB
+`dd` copy compared with `cmp`, `set -C` refusing an existing file, `cd`, and `/dev/zero` and
+`/dev/urandom` reads.
+
+**Found on the way, pre-existing:** on amd64 an `ssh host cmd` session returns nothing on the
+client's stderr. `echo x >&2` and `ls /missing` print nothing, and `2>&1` works. The kernel before
+this step does the same. This is an sshd/session item, logged here for the fd follow-up.

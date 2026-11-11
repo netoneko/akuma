@@ -1195,62 +1195,20 @@ pub fn exit_current_group() {
 /// segment ends the walk and the total so far (or the error, if nothing was
 /// written) is returned, per POSIX.
 fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
-    use crate::fd::errno;
-    // A tap frame is one `writev`: splitting it per segment would send the header as its own frame.
     if crate::fd::is_dev_tun(fd) {
         return crate::drivers::hypervisor_tun_writev(iov, cnt as usize);
     }
-    let cnt = (cnt as usize).min(1024);
-    let mut total: u64 = 0;
-    for i in 0..cnt {
-        let e = iov + (i as u64) * 16;
-        // One `struct iovec { void *base; size_t len }` of the user's array.
-        let Some([base, len]) = crate::uaccess::read_val::<[u64; 2]>(e) else {
-            return if total == 0 { errno::EFAULT } else { total };
-        };
-        if len == 0 {
-            continue;
-        }
-        let n = sys_write(fd, base, len);
-        if errno::is_err(n) {
-            // An errno (top of the u64 range). Return it only if nothing has
-            // gone out yet; otherwise report the partial success.
-            return if total == 0 { n } else { total };
-        }
-        total += n;
-        if n < len {
-            break;
-        }
-    }
-    total
+    // glue-amd64's loop, with this kernel's `write` per entry so the console
+    // and its devices are reached the way a plain `write` reaches them.
+    akuma_syscalls_glue_amd64::vectored(fd, iov, cnt, sys_write)
 }
 
 /// `readv(fd, iov, iovcnt)` — the mirror of [`sys_writev`].
 fn sys_readv(fd: u64, iov: u64, cnt: u64) -> u64 {
-    use crate::fd::errno;
     if crate::fd::is_dev_tun(fd) {
         return crate::drivers::hypervisor_tun_readv(iov, cnt as usize);
     }
-    let cnt = (cnt as usize).min(1024);
-    let mut total: u64 = 0;
-    for i in 0..cnt {
-        let e = iov + (i as u64) * 16;
-        let Some([base, len]) = crate::uaccess::read_val::<[u64; 2]>(e) else {
-            return if total == 0 { errno::EFAULT } else { total };
-        };
-        if len == 0 {
-            continue;
-        }
-        let n = crate::fd::sys_read(fd, base, len);
-        if errno::is_err(n) {
-            return if total == 0 { n } else { total };
-        }
-        total += n;
-        if n < len {
-            break;
-        }
-    }
-    total
+    akuma_syscalls_glue_amd64::vectored(fd, iov, cnt, crate::fd::sys_read)
 }
 
 /// `sysinfo(2)` — memory totals for `busybox free` / `top`. The struct layout
@@ -1624,12 +1582,9 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     let console_write = crate::fd::console_end(fd) == Some(crate::fd::ConsoleEnd::Write)
         && !owns_non_console_channel();
     if !console_write {
-        // The `O_ACCMODE` refusal glue's `File` arm does not make — see
-        // `fd::write_mode_refusal`, which is where the finding is written down.
-        if let Some(e) = crate::fd::write_mode_refusal(fd) {
-            return e;
-        }
-        return akuma_syscalls_glue::fs::sys_write(fd, buf, len as usize);
+        // The x86 kernels' shared body: glue's arm behind the `O_RDONLY`
+        // refusal glue's `File` arm does not make.
+        return akuma_syscalls_glue_amd64::write(fd, buf, len);
     }
     // An unbound 1 or 2, or a bound `Stdout`/`Stderr`: the console, full stop.
     if len > MAX_WRITE {
