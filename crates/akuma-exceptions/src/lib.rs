@@ -434,11 +434,11 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
     let ttbr0_proc = akuma_exec::process::current_process_shared()
         .map_or(0, |p| p.address_space.ttbr0());
     // Compare the L0 base (bits 47:0) and the ASID (bits 63:48) separately —
-    // they mean very different things here. A CLONE_THREAD child is *supposed*
-    // to run under a ttbr0 whose ASID differs from its own `Process`: it is
-    // handed the parent's ttbr0 verbatim (`shared_ttbr0` in `clone_thread`)
-    // while `new_shared` gives its Process a fresh ASID over the same L0. So
-    // "ASID differs" is routine and must not be flagged. A differing **L0
+    // they mean very different things here. A CLONE_THREAD child runs under
+    // the parent's ttbr0 verbatim (`shared_ttbr0` in `clone_thread`), and its
+    // `Process` holds that same ASID (`new_thread_view`); a vfork child's
+    // `Process` has an ASID of its own over the same L0. So "ASID differs" is
+    // not a defect and must not be flagged. A differing **L0
     // base** is the real defect: the core is executing in a third party's page
     // tables, which is the cross-address-space aliasing theory (T1) in
     // docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md §3c.
@@ -450,7 +450,7 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
         if base_differs {
             "  *** AS MISMATCH: L0 BASE DIFFERS (foreign page tables) ***"
         } else if asid_differs {
-            "  (asid differs only — normal for a cloned thread)"
+            "  (asid differs only — not a defect)"
         } else { "" });
     // Discriminators for the AS MISMATCH stories (see thread_expected_l0 /
     // thread_switch_ins docs): expected==0 ⇒ the thread ran with the tripwire

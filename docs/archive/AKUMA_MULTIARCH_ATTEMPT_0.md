@@ -2357,3 +2357,9 @@ fails with `[asid] EXHAUSTED` in `UserAddressSpace::new_shared`. Repeated runs l
 to spawn a process, and ssh stops answering. The kernel from before any slice (`mrg`, 16:43) behaves
 the same, and the drain at clone does not cure it, so ASIDs are leaked, not slow to come back.
 Next item.
+
+*Correction (2026-11-11, later the same day):* not a leak. With a pause between rounds nothing
+fails, however many rounds run; without one, every thread's unused ASID is held through two 10 ms
+cooldowns and the pool runs dry in flight. Threads now share their group's ASID, and a full
+process table, the next limit behind it, is waited out rather than panicking:
+[`AKUMA_THREAD_ASID_SHARE.md`](AKUMA_THREAD_ASID_SHARE.md).

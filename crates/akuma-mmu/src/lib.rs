@@ -1642,6 +1642,10 @@ struct SharedL0Entry {
     deferred_user_frames: Option<BTreeMap<usize, u32>>,
     deferred_pt_frames: Option<Vec<PhysFrame>>,
     deferred_l0: Option<PhysFrame>,
+    /// The owner's ASID, parked with its frames when the owner dropped while
+    /// views were alive. Thread views ([`UserAddressSpace::new_thread_view`])
+    /// run under it, so it is freed by the last view, never before.
+    deferred_asid: Option<u16>,
 }
 
 /// Temporary: an entry removed from `SHARED_L0_TABLE` while it still carries a
@@ -1765,6 +1769,9 @@ pub struct UserAddressSpace {
     /// in this struct is the AArch64 page-table walker.
     ledger: FrameLedger,
     asid: u16,
+    /// Whether this address space allocated `asid` and frees it on drop. `false`
+    /// for a thread view, which borrows its owner's ([`Self::new_thread_view`]).
+    asid_owned: bool,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1791,6 +1798,7 @@ impl UserAddressSpace {
             l0_frame,
             ledger: FrameLedger::new(false),
             asid,
+            asid_owned: true,
         };
         addr_space.add_kernel_mappings().ok()?;
         instr::as_new();
@@ -1821,6 +1829,7 @@ impl UserAddressSpace {
                     deferred_user_frames: None,
                     deferred_pt_frames: None,
                     deferred_l0: None,
+                    deferred_asid: None,
                 });
         });
         instr::as_new_shared();
@@ -1828,7 +1837,46 @@ impl UserAddressSpace {
             l0_frame: PhysFrame { addr: parent_l0_phys },
             ledger: FrameLedger::new(true),
             asid,
+            asid_owned: true,
         })
+    }
+
+    /// A thread's view of its group's address space (`clone(CLONE_VM |
+    /// CLONE_THREAD)`): the owner's L0 **and the owner's ASID**, as on Linux,
+    /// where the ASID belongs to the mm and every thread shares it.
+    ///
+    /// [`Self::new_shared`] allocates a fresh ASID for the view. A thread never
+    /// ran under it (`clone_thread` hands the child the parent's `ttbr0`
+    /// verbatim), yet held it until its row was reclaimed, so a burst of
+    /// thread create/join exhausted the 256 ASIDs within a few hundred rounds and
+    /// every `fork`/`spawn` failed until reclaim caught up
+    /// (`userspace/forktest/c_stress/thrchurn.c`). A view made here costs no
+    /// ASID. The owner's ASID outlives the owner while any view is alive: an
+    /// owner that drops first parks it in `SHARED_L0_TABLE` with its frames,
+    /// and the last view frees it.
+    ///
+    /// `owner_asid` is the ASID in the owner's `ttbr0` (bits 63:48).
+    #[must_use]
+    pub fn new_thread_view(parent_l0_phys: usize, owner_asid: u16) -> Self {
+        with_irqs_disabled(|| {
+            let mut table = SHARED_L0_TABLE.lock();
+            table.entry(parent_l0_phys)
+                .and_modify(|e| e.ref_count += 1)
+                .or_insert(SharedL0Entry {
+                    ref_count: 1,
+                    deferred_user_frames: None,
+                    deferred_pt_frames: None,
+                    deferred_l0: None,
+                    deferred_asid: None,
+                });
+        });
+        instr::as_new_shared();
+        Self {
+            l0_frame: PhysFrame { addr: parent_l0_phys },
+            ledger: FrameLedger::new(true),
+            asid: owner_asid,
+            asid_owned: false,
+        }
     }
 
     fn add_kernel_mappings(&self) -> Result<(), &'static str> {
@@ -2508,6 +2556,10 @@ fn publish_and_install_ttbr0(ttbr0: u64) {
 #[cfg(target_arch = "aarch64")]
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
+        // Whether the end of this drop returns `self.asid`; see each branch.
+        let mut free_own_asid = self.asid_owned;
+        // An owner's ASID handed over by the last view (`new_thread_view`).
+        let mut parked_asid: Option<u16> = None;
         #[allow(clippy::let_unit_value)]
         let _ledger = instr::as_drop_enter(
             self.ledger.is_shared(),
@@ -2536,17 +2588,23 @@ impl Drop for UserAddressSpace {
                 let pt_frames = self.ledger.take_page_table_frames();
                 let l0 = self.l0_frame;
                 let n_uf = user_frames.len();
+                let owner_asid = self.asid;
                 let stored = with_irqs_disabled(|| {
                     let mut table = SHARED_L0_TABLE.lock();
                     if let Some(entry) = table.get_mut(&l0_addr) {
                         entry.deferred_user_frames = Some(user_frames);
                         entry.deferred_pt_frames = Some(pt_frames);
                         entry.deferred_l0 = Some(l0);
+                        // Thread views run under this ASID: it goes when they do.
+                        entry.deferred_asid = Some(owner_asid);
                         true
                     } else {
                         false
                     }
                 });
+                // Parked: the last view frees it. Not parked (the views all went
+                // between the check and the store): it is ours to free below.
+                free_own_asid = !stored;
                 // Temporary: no entry to park in, so the map died inside the
                 // closure above. Stop counting its entries as live.
                 if !stored { instr::uf_silent(n_uf); }
@@ -2572,6 +2630,7 @@ impl Drop for UserAddressSpace {
                         let uf = entry.deferred_user_frames.take();
                         let pf = entry.deferred_pt_frames.take();
                         let l0 = entry.deferred_l0.take();
+                        parked_asid = entry.deferred_asid.take();
                         table.remove(&l0_addr);
                         return (uf, pf, l0);
                     }
@@ -2592,7 +2651,7 @@ impl Drop for UserAddressSpace {
                 // Same TTBR liveness gate as the owner-drop branch: the killer-side
                 // hard-terminate in `kill_thread_group` can leave a straggler's core
                 // parked on this very L0 while the last software view drops here.
-                free_or_defer_as_frames(l0.addr, self.asid, l0, uf, pf, "last-view");
+                free_or_defer_as_frames(l0.addr, parked_asid.unwrap_or(self.asid), l0, uf, pf, "last-view");
             }
         }
         // Whatever the branch above did not take (a shared view's own map) dies
@@ -2616,8 +2675,13 @@ impl Drop for UserAddressSpace {
         // Flushing first closes it: by the time the ASID is allocatable again, no
         // translation for it remains. `tlbi aside1is` is inner-shareable, so peers are
         // covered too.
-        let _ = flush_tlb_asid(self.asid, TlbTarget::AllCores);
-        with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
+        //
+        // A thread view returns no ASID of its own (it borrowed its owner's), and
+        // the last view returns the owner's if the owner parked it.
+        for asid in [free_own_asid.then_some(self.asid), parked_asid].into_iter().flatten() {
+            let _ = flush_tlb_asid(asid, TlbTarget::AllCores);
+            with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(asid));
+        }
         instr::as_drop_exit(_ledger);
     }
 }
@@ -3182,6 +3246,18 @@ impl UserAddressSpace {
             // keep their files alive — belong to the owner, which outlives it.
             mapping_pins: alloc::vec::Vec::new(),
         })
+    }
+
+    /// A thread's view: [`Self::new_shared`], since this target has no ASID to
+    /// share (the AArch64 form gives the view its owner's). `_owner_asid` is the
+    /// high half of the owner's [`Self::ttbr0`], always 0 here.
+    #[must_use]
+    pub fn new_thread_view(parent_l0_phys: usize, _owner_asid: u16) -> Self {
+        Self {
+            root: parent_l0_phys,
+            ledger: FrameLedger::new(true),
+            mapping_pins: alloc::vec::Vec::new(),
+        }
     }
 
     // ── scalar identity ────────────────────────────────────────────────────
@@ -4153,8 +4229,9 @@ pub fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) -> (Tab
 /// Widening to all-ASID rather than "pass the right ASID" is deliberate: a
 /// single L0 table can be live under **several** ASIDs at once, because
 /// `UserAddressSpace::new_shared` allocates a fresh ASID while reusing the
-/// parent's `l0_frame` (CLONE_VM threads and vfork-fastpath children), and
-/// `activate()` installs that view's own ASID. One PTE edit therefore has to
+/// parent's `l0_frame` (vfork-fastpath children; CLONE_VM threads share the
+/// owner's ASID through `new_thread_view`), and `activate()` installs that
+/// view's own ASID. One PTE edit therefore has to
 /// invalidate every ASID aliasing those tables, which is what `vaae1is`
 /// ("VA, All-ASID, EL1") does. Same instruction as `flush_tlb_page`.
 #[inline]

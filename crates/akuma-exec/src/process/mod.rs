@@ -898,8 +898,10 @@ pub struct InheritOverrides {
     /// fan out by this field, and lazy regions are keyed by it.
     pub tgid: Pid,
     /// `fork`: a fresh [`UserAddressSpace`] with the parent's pages CoW-shared
-    /// into it. `vfork`/`clone_thread`: `UserAddressSpace::new_shared(parent_l0)`
-    /// — the same L0 table under a new ASID.
+    /// into it. `vfork`: `UserAddressSpace::new_shared(parent_l0)` — the same
+    /// L0 table under a new ASID. `clone_thread`:
+    /// `UserAddressSpace::new_thread_view(parent_l0, parent_asid)` — the same L0
+    /// under the parent's ASID, as on Linux, where the ASID is the mm's.
     pub address_space: UserAddressSpace,
     /// `fork`: a freshly allocated frame, mapped at `PROCESS_INFO_ADDR` and
     /// written with the child's identity. `vfork`/`clone_thread`: the **parent's**
@@ -2522,6 +2524,7 @@ impl ChildReaping {
 /// diagnostic snapshot); `fork`/`vfork` pass a no-op.
 fn spawn_child_thread_and_publish(
     mut new_proc: Box<Process>,
+    slot: table::ProcessSlot,
     child_ctx: &UserContext,
     parent_tid: usize,
     sigaltstack: ChildSigaltstack,
@@ -2591,7 +2594,7 @@ fn spawn_child_thread_and_publish(
     }
 
     lifecycle_trace("[FORK-DBG] child-publish: registering process\n");
-    register_process(child_pid, new_proc);
+    table::register_reserved(child_pid, new_proc, slot);
 
     before_ready(tid);
 
@@ -3192,6 +3195,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     if (runtime().is_memory_low)() {
         return Err("Kernel memory low, cannot fork");
     }
+    // The child's table slot, before anything is built: see `ProcessSlot`.
+    let slot = table::reserve_process_slot().ok_or(table::PROCESS_TABLE_FULL)?;
     let parent = current_process_shared().ok_or("No current process")?;
     let parent_pid = parent.pid;
     // (The thread-group id the lazy-region enumeration keys off now lives with
@@ -3304,6 +3309,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     lifecycle_trace("[FORK-DBG] step7: spawning child thread\n");
     spawn_child_thread_and_publish(
         new_proc,
+        slot,
         &child_ctx,
         parent_tid,
         ChildSigaltstack::Inherit,
@@ -3344,6 +3350,8 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     if (runtime().is_memory_low)() {
         return Err("Kernel memory low, cannot vfork");
     }
+    // The child's table slot, before anything is built: see `ProcessSlot`.
+    let slot = table::reserve_process_slot().ok_or(table::PROCESS_TABLE_FULL)?;
     let parent = current_process_shared().ok_or("No current process")?;
     let parent_pid = parent.pid;
 
@@ -3392,6 +3400,7 @@ pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str
     // pid, so the map is the child's only identity.
     spawn_child_thread_and_publish(
         new_proc,
+        slot,
         &child_ctx,
         parent_tid,
         ChildSigaltstack::Inherit,
@@ -3555,13 +3564,20 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     if (runtime().is_memory_low)() {
         return Err("Kernel memory low, cannot clone thread");
     }
+    // The thread's table slot, before anything is built: see `ProcessSlot`.
+    let slot = table::reserve_process_slot().ok_or(table::PROCESS_TABLE_FULL)?;
     let parent = current_process_shared().ok_or("No current process")?;
     let parent_pid = parent.pid;
     let child_pid = allocate_pid();
 
     let parent_l0_phys = parent.address_space.ttbr0() & 0x0000_FFFF_FFFF_F000;
-    let shared_as = mmu::UserAddressSpace::new_shared(parent_l0_phys as usize)
-        .ok_or("Failed to create shared address space")?;
+    // The owner's ASID, not a fresh one: the child runs under the parent's
+    // `ttbr0` verbatim (`shared_ttbr0` below), ASID included, so the view takes
+    // that ASID rather than holding a second it never runs under.
+    let shared_as = mmu::UserAddressSpace::new_thread_view(
+        parent_l0_phys as usize,
+        (parent.address_space.ttbr0() >> 48) as u16,
+    );
     mmu::as_trace(format_args!("[AS-NEW] pid={} l0=0x{:x} asid=0x{:x} via=clone parent={}\n",
         child_pid, parent_l0_phys, shared_as.asid(), parent_pid));
     // CLONE_VM: the child shares the parent's address space, so its kernel
@@ -3613,6 +3629,7 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
     // registered and before the child can execute an instruction.
     let tid = spawn_child_thread_and_publish(
         new_proc,
+        slot,
         &child_ctx,
         parent_tid,
         ChildSigaltstack::ForceDisabled,

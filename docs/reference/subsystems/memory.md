@@ -17,11 +17,8 @@ filed against it was a signal-return defect, not CoW
 ([`AMD64_FORK_VS_THREADS_SEGV`](../../archive/AMD64_FORK_VS_THREADS_SEGV.md)).
 
 > **Stability: C (active risk).** Highest-churn subsystem through 2026-06.
-> Four items still OPEN: per-run kernel-heap creep; reclaim-after-OOM below
-> ~5 MB; a full process table panicking instead of failing the spawn (see
-> [OPEN: a full process table still panics the
-> kernel](#open-a-full-process-table-still-panics-the-kernel)); and the
-> user-page escalation giving up while parked memory is still inside its
+> Three items still OPEN: per-run kernel-heap creep; reclaim-after-OOM below
+> ~5 MB; and the user-page escalation giving up while parked memory is still inside its
 > reclaim cooldown (see [KNOWN GAP: a premature give-up while memory is merely
 > cooling](#known-gap-a-premature-give-up-while-memory-is-merely-cooling)),
 > which is also currently invisible at runtime. The recurring
@@ -333,8 +330,9 @@ with IRQs masked, so there is no verdict to print.
 
 - **Share path** (`fork_process`, `COW_FORK_ENABLED`): `cow_share_range` →
   per page `cow_ref_inc(pa)` + child `map_page(RO)` + `track_user_frame`; then
-  parent `demote_range_to_ro`; `flush_tlb_asid(0)` (all ASIDs — sibling threads
-  share L0 with different ASIDs).
+  parent `demote_range_to_ro`; `flush_tlb_asid(0)` (all ASIDs — a vfork child
+  runs the parent's L0 under an ASID of its own; see
+  [Address-space slots: ASIDs and table rows](#address-space-slots-asids-and-table-rows)).
 - **Fault path** (write to RO page, `exceptions.rs`): alloc copy,
   `track_user_frame(new)`, `remove_user_frame(old)`, `cow_ref_dec(old)`.
 - **Data structure:** `user_frames: BTreeMap<PA, u32>` (refcount = in-AS mapping
@@ -763,36 +761,57 @@ self-deadlocks. So:
 | thread 0's idle loop; the `smp-shared` per-core idle loop | the regime where `netpoll_maint` is starved |
 | `alloc_page_zeroed_user` step 2 | demand-paging pressure |
 | `netpoll_maint`, 100 ms (pre-existing) | steady state |
+| `akuma_syscalls_glue::proc::retry_while_full`, at every attempt of `clone`/`fork`/`vfork` | thread churn, which consumes rows faster than exits collect them |
 
-Adding a *sixth* site means auditing its ambient lock context first. If you
-cannot, call `request_retired_reclaim()` instead and let one of the five
+Adding another site means auditing its ambient lock context first. If you
+cannot, call `request_retired_reclaim()` instead and let one of these
 collect.
 
 Runtime toggle `process::reclaim::set_pressure_reclaim_enabled` (default on) is
 both the kill switch and the same-binary A/B lever used by
 `test_retired_reclaim_pressure_ab`.
 
-### OPEN: a full process table still panics the kernel
+### Address-space slots: ASIDs and table rows
 
-`register_process` is **infallible**. On a full-table miss it prints
-`Process table full (256 slots)` and `panic!`s — even when every one of those
-`MAX_PROCESSES` slots is a RETIRED zombie whose memory is reclaimable and whose
-only problem is that no collector has run yet. It deliberately does not reclaim
-inline; that call site is ruled out by the self-deadlock in the module note
-above, and the ban is correct.
+Three fixed pools bound how many processes and threads can exist at once, and an
+exited thread holds a place in two of them for a while after it is joined:
 
-What is *not* correct is the panic. The intended fix is to return an error when
-`retired_process_count() > 0` so fork/clone/spawn surface `-EAGAIN` instead of
-halting the box — "collector starved, retry" rather than "kernel dead". It was
-left out of the pressure-reclaim change because making `register_process`
-fallible means threading a `Result` through every fork/clone/spawn caller, a
-wider diff than the whole collector mechanism.
+| Pool | Size | An exited thread holds it until |
+|---|---|---|
+| thread slots (`akuma-threading`) | 248 user slots | the slot is recycled, `THREAD_CLEANUP_COOLDOWN_US` (10 ms) after exit |
+| process-table rows (`process::table`) | `MAX_PROCESSES` = 256 | its row is reclaimed, `PROCESS_RECLAIM_COOLDOWN_US` (10 ms) after the slot recycle retired it |
+| ASIDs (AArch64 `ASID_ALLOCATOR`) | 256 | **never held by a thread**; see below |
 
-Until then the mitigation is indirect: the five drain sites above make a
-zombie-full table far less reachable than it was, but they do not make it
-impossible — a spawn storm that outruns every collector still ends in the
-panic. Treat `Process table full` as this open item, not as a genuine
-capacity limit.
+Rules:
+
+- **A thread runs under its group's ASID.** `clone_thread` builds the child's
+  address space with `UserAddressSpace::new_thread_view(l0, owner_asid)`, which
+  allocates no ASID. That matches the hardware: the child's context carries the
+  parent's `ttbr0`, ASID included. The owner's ASID outlives the owner while any
+  view is alive: an owner that drops first parks the ASID in its
+  `SHARED_L0_TABLE` entry beside its frames, and the last view flushes and frees
+  it. `new_shared` (a vfork child, the boot tests) still allocates an ASID of
+  its own. A thread created *by* a vfork child would run under that ASID, which
+  the vfork child frees when it drops; POSIX leaves anything but `exec`/`_exit`
+  in a vfork child undefined, and this is not guarded.
+- **A process-table row is reserved before the child is built.** `fork_process`,
+  `vfork_process`, `clone_thread`, AArch64 `spawn` and amd64 `sys_spawn` call
+  `reserve_process_slot()` first and register with `register_reserved`, whose
+  claim cannot miss (`ProcessSlot` states why). A full table is refused at that
+  point with `PROCESS_TABLE_FULL`, while there is nothing to undo. Plain
+  `register_process` still panics on a full table and is for boot and tests
+  only: **a runtime creation path must not call it.**
+- **A full table is waited out, not reported.** `retry_while_full` (glue) runs
+  `clone`/`fork`/`vfork` again after a 1 ms park when the refusal was
+  `PROCESS_TABLE_FULL` or `NO_FREE_USER_SLOTS`, for up to 100 ms, draining
+  before every attempt; only then does the caller see `EAGAIN` (amd64 `fork`:
+  `ENOMEM`). Linux does not fail `pthread_create` because exited threads are
+  still cooling, and here the capacity always comes back within the two
+  cooldowns. Spawn is not retried.
+
+`userspace/forktest/c_stress/thrchurn.c` is the gate: `thrchurn 2000 0 1`
+creates and joins threads with no pause and must report `0 failed`. Background:
+[`AKUMA_THREAD_ASID_SHARE.md`](../../archive/AKUMA_THREAD_ASID_SHARE.md).
 
 ### Reading the signature
 

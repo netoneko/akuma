@@ -2936,6 +2936,10 @@ pub fn register_exec_process(
     // that later takes its stdin from the channel too would answer it the same
     // way and be handed the *serial line's* channel.
     channel: Option<alloc::sync::Arc<akuma_exec::process::ProcessChannel>>,
+    // The table slot the caller reserved before it made the task, so a full
+    // table was refused while there was nothing to undo
+    // (`akuma_exec::process::ProcessSlot`).
+    slot: akuma_exec::process::ProcessSlot,
 ) {
     use alloc::boxed::Box;
     use alloc::string::String;
@@ -2943,7 +2947,7 @@ pub fn register_exec_process(
 
     use akuma_exec::process::{
         FreshProcess, LazyRegionMap, Process, ProcessChannel, ProcessMemory, SharedFdTable, register_channel,
-        register_child_channel, register_process, thread_pid_map_insert,
+        register_child_channel, register_reserved, thread_pid_map_insert,
     };
 
     let stack_bottom = ELF_STACK_TOP - (ELF_STACK_MAX_PAGES as u64 * 4096);
@@ -3120,7 +3124,7 @@ pub fn register_exec_process(
         // re-arm come with it.
         channel: channel.clone().or_else(|| console_attached.then(crate::console::channel).flatten()),
     }));
-    register_process(pid, proc);
+    register_reserved(pid, proc, slot);
     thread_pid_map_insert(task_slot, pid);
     // Tell the console pump who to address its keystrokes to, so `^C` goes
     // through the line discipline's `ISIG` branch instead of arriving as a
@@ -3878,7 +3882,7 @@ fn sys_fork() -> u64 {
     // the same question asked of the authoritative table.
     crate::drivers::hypervisor_note_fork();
     let child_pid = alloc_pid();
-    match akuma_exec::process::fork_process(child_pid, 0) {
+    match akuma_syscalls_glue::proc::retry_while_full(|| akuma_exec::process::fork_process(child_pid, 0)) {
         Ok(pid) => u64::from(pid),
         Err(e) => {
             // Named, not swallowed. Every failure inside `fork_process` is a
@@ -3900,7 +3904,7 @@ fn sys_fork() -> u64 {
 fn sys_spawn_clone(child_stack: u64) -> u64 {
     use crate::fd::errno;
     let child_pid = alloc_pid();
-    match akuma_exec::process::fork_process(child_pid, child_stack) {
+    match akuma_syscalls_glue::proc::retry_while_full(|| akuma_exec::process::fork_process(child_pid, child_stack)) {
         Ok(pid) => u64::from(pid),
         Err(e) => {
             serial::puts("  [spawn-clone] ");
@@ -4221,6 +4225,13 @@ pub fn sys_spawn(
     // gets — there is nothing spawn-specific left to bind.
     let child_fds = alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::with_stdio());
 
+    // The child's process-table slot, refused here while the task does not exist
+    // yet (`akuma_exec::process::ProcessSlot`). Glue's `spawn` arm has no wait
+    // and retry for this; a caller sees `EAGAIN`.
+    let Some(table_slot) = akuma_exec::process::reserve_process_slot() else {
+        return errno::EAGAIN;
+    };
+
     let Some(task_slot) = spawn_process_task(slot, root) else {
         // `child` drops here: the image is freed by the same destructor that
         // would have freed it out of `PROCS`. `child_fds` drops unregistered and
@@ -4263,6 +4274,7 @@ pub fn sys_spawn(
         // `pty` spawn (`akuma-exec`'s `spawn.rs`).
         None,
         channel,
+        table_slot,
     );
 
     // **The session's foreground process group.**
@@ -4711,6 +4723,10 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     };
     let init_image_top = ld.end_va;
     let root = proc.space.ttbr0();
+    let Some(table_slot) = akuma_exec::process::reserve_process_slot() else {
+        serial::puts("  [init] process table full\n");
+        return false;
+    };
     let Some(task_slot) = spawn_process_task(6, root) else {
         serial::puts("  [init] no task slot\n");
         return false;
@@ -4725,7 +4741,7 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
     // `run_process` reads init's entry point and stack out of this
     // registration, so publishing first would race a task with nowhere to start
     // against the register that gives it one.
-    register_exec_process(1, 0, task_slot, proc, init_image_top, path, &INIT_CMDLINE.lock().clone(), None, None, None);
+    register_exec_process(1, 0, task_slot, proc, init_image_top, path, &INIT_CMDLINE.lock().clone(), None, None, None, table_slot);
     // **The console's producer**, started here and nowhere earlier.
     //
     // After the registration, so the channel it fills already belongs to a

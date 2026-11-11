@@ -262,6 +262,7 @@ pub fn run_all_tests() {
     // `PreemptGuard` must actually disable preemption. Cheap, no spawning, and it
     // catches a failure mode that is otherwise invisible — see the fn doc.
     test_preempt_guard_is_live();
+    test_process_slot_reservation_bounds();
     test_identity_lazy_restamp();
     test_identity_generation_detects_recycle();
     test_identity_recycled_slot_rejected();
@@ -20329,6 +20330,40 @@ fn test_identity_generation_detects_recycle() {
 /// The bound is as load-bearing as the repair: without it an entry whose pid
 /// never registers would trade one permanent slow path for a permanent table
 /// scan, which is strictly worse than what was there before.
+/// `reserve_process_slot` grants exactly the free rows and no more, and a
+/// dropped reservation is returned.
+///
+/// That bound is what lets `register_reserved` claim without a failure path:
+/// fork, vfork, clone and spawn reserve before they build anything, and a full
+/// table is refused there instead of panicking in `register_process` after the
+/// child's thread slot exists (`docs/archive/AKUMA_THREAD_ASID_SHARE.md`). Runs
+/// before the suite spawns anything, so no claim races the count. A
+/// `ProcessSlot` is zero-sized, so holding 256 of them allocates nothing.
+fn test_process_slot_reservation_bounds() {
+    use akuma_exec::process::table::{process_count, reserve_process_slot, retired_process_count, MAX_PROCESSES};
+
+    let free = MAX_PROCESSES - (process_count() + retired_process_count());
+    let mut held = alloc::vec::Vec::new();
+    while let Some(slot) = reserve_process_slot() {
+        held.push(slot);
+        if held.len() > MAX_PROCESSES {
+            break;
+        }
+    }
+    let granted = held.len();
+    let refused_when_full = reserve_process_slot().is_none();
+    drop(held);
+    let returned = reserve_process_slot().is_some();
+
+    if granted == free && refused_when_full && returned {
+        console::print("[Test] process_slot_reservation_bounds PASSED\n");
+    } else {
+        crate::safe_print!(160,
+            "[Test] process_slot_reservation_bounds FAILED: granted={} free={} refused_when_full={} returned={}\n",
+            granted, free, refused_when_full, returned);
+    }
+}
+
 fn test_identity_lazy_restamp() {
     use akuma_exec::process::table::{self, test_hooks as ih};
     use core::sync::atomic::Ordering;

@@ -1666,7 +1666,11 @@ pub fn mark_thread_ready(idx: usize) {
 /// reclaim-and-retry pass. Every producer that wants the retry must return this
 /// constant: the retry matches on the string, so a differently spelled error
 /// silently skips it.
-const NO_FREE_USER_SLOTS: &str = "No free user thread slots";
+/// The error a user spawn returns when no thread slot is free even after
+/// reclaiming the cooled-down ones. Public so a caller can tell it, by value,
+/// from a hard failure: the slots it waits on come back within the cleanup
+/// cooldown (`akuma_syscalls_glue::proc::retry_while_full`).
+pub const NO_FREE_USER_SLOTS: &str = "No free user thread slots";
 
 /// Spawn a user thread but keep it in INITIALIZING state
 pub fn spawn_user_thread_initializing(

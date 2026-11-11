@@ -617,19 +617,48 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
 /// process-table limit is `EAGAIN`, which `pthread_create` reports as such; a
 /// zero stack is `EINVAL` (Linux would run the child on the caller's stack, which
 /// is never what a caller of this arm meant); being out of memory is `ENOMEM`.
+/// Run a process- or thread-creating `f`, waiting out a full table.
+///
+/// An exited thread holds its thread slot for the cleanup cooldown and then its
+/// process row for the reclaim cooldown, 10 ms each, so a create/join loop
+/// (`thrchurn`, `futextest` step 6) can have all 248 slots or all 256 rows held
+/// by threads that have already exited. Linux does not fail `pthread_create`
+/// for that, and the capacity comes back on its own; so a refusal for either
+/// table ([`PROCESS_TABLE_FULL`](akuma_exec::process::PROCESS_TABLE_FULL),
+/// [`NO_FREE_USER_SLOTS`](akuma_exec::threading::NO_FREE_USER_SLOTS)) parks
+/// 1 ms and tries again, for up to 100 ms, before it reaches the caller as an
+/// error. Any other error returns at once.
+///
+/// **Collect before claiming.** The drain at the top of each attempt is what
+/// returns RETIRED rows (and, on AArch64, their ASIDs) to the table; the drain
+/// sites are otherwise on exit and reap paths, which a churning workload
+/// outruns. Syscall entry holds no address-space, region or lifecycle lock, only
+/// the BKL, which is the context the other drain sites run in; and a row is
+/// dropped only past its cooldown, so this never frees the caller's own.
+/// A refused reservation requests the drain, so the retry is the one that
+/// collects.
+pub fn retry_while_full<T>(mut f: impl FnMut() -> Result<T, &'static str>) -> Result<T, &'static str> {
+    const PARK_US: u64 = 1_000;
+    const BUDGET_US: u64 = 100_000;
+    let start = akuma_primitives::clock::uptime_us();
+    loop {
+        akuma_exec::process::reclaim::drain_retired_if_requested();
+        match f() {
+            Err(e)
+                if (e == akuma_exec::process::PROCESS_TABLE_FULL
+                    || e == akuma_exec::threading::NO_FREE_USER_SLOTS)
+                    && akuma_primitives::clock::uptime_us().saturating_sub(start) < BUDGET_US =>
+            {
+                let now = akuma_primitives::clock::uptime_us();
+                akuma_exec::threading::schedule_blocking(now + PARK_US);
+            }
+            r => return r,
+        }
+    }
+}
+
 pub fn clone_thread(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) -> u64 {
-    // **Collect before claiming.** Every thread is a `Process` row with its own
-    // ASID, and an exited thread's row is only RETIRED: its ASID and slot come
-    // back when a drain runs. The drain sites are on exit and reap paths, so a
-    // thread-churning workload (`futextest` step 6, 500 create/join rounds) retired
-    // rows faster than anything collected them: amd64 filled its process table and
-    // panicked, AArch64 ran out of ASIDs (`[asid] EXHAUSTED`) and `pthread_create`
-    // failed. The one path that consumes slots is the one that pays for collecting
-    // them. Syscall entry holds no address-space, region or lifecycle lock, only
-    // the BKL, which is the context the other drain sites run in; and a row is
-    // dropped only past its cooldown, so this never frees the caller's own.
-    akuma_exec::process::reclaim::drain_retired_if_requested();
-    match akuma_exec::process::clone_thread(stack, tls, parent_tid, child_tid, flags) {
+    match retry_while_full(|| akuma_exec::process::clone_thread(stack, tls, parent_tid, child_tid, flags)) {
         Ok(tid) => {
             if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::tprint!(64, "[clone] new thread TID={}\n", tid);
@@ -728,11 +757,13 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         // use the full copy.  Gated by config so it can be toggled off.
         let use_vfork_fastpath = flags & CLONE_VFORK != 0
             && akuma_exec::runtime::config().vfork_fastpath_enabled;
-        let fork_result = if use_vfork_fastpath {
-            akuma_exec::process::vfork_process(child_pid, stack)
-        } else {
-            akuma_exec::process::fork_process(child_pid, stack)
-        };
+        let fork_result = retry_while_full(|| {
+            if use_vfork_fastpath {
+                akuma_exec::process::vfork_process(child_pid, stack)
+            } else {
+                akuma_exec::process::fork_process(child_pid, stack)
+            }
+        });
         match fork_result {
             Ok(new_pid) => {
                 // POSIX/Linux: a fork() child inherits the parent's signal mask. Only the

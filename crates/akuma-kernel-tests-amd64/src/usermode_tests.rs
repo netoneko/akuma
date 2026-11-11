@@ -241,12 +241,13 @@ fn start_test_process(
     name: &str,
 ) -> Option<(u32, usize)> {
     let root = image.space.ttbr0();
+    let table_slot = akuma_exec::process::reserve_process_slot()?;
     let task_slot = spawn_process_task(slot, root)?;
     let pid = alloc_pid();
     let mut cmdline = alloc::vec::Vec::with_capacity(name.len() + 1);
     cmdline.extend_from_slice(name.as_bytes());
     cmdline.push(0);
-    register_exec_process(pid, 1, task_slot, image, image_top, name, &cmdline, None, None, None);
+    register_exec_process(pid, 1, task_slot, image, image_top, name, &cmdline, None, None, None, table_slot);
     k::sched::publish_task(task_slot);
     Some((pid, task_slot))
 }
@@ -1979,7 +1980,11 @@ pub fn identity_cost_test(t: &mut Suite) {
     let image = Image { space, entry: 0, stack: 0, regions: Vec::new() };
     let pid = alloc_pid();
     let task = k::sched::current_task();
-    register_exec_process(pid, 1, task, image, 0, "cost-probe", b"cost-probe\0", None, None, None);
+    let Some(table_slot) = akuma_exec::process::reserve_process_slot() else {
+        t.check("identity: probe process slot reserved", false);
+        return;
+    };
+    register_exec_process(pid, 1, task, image, 0, "cost-probe", b"cost-probe\0", None, None, None, table_slot);
 
     if !t.check("identity: the running task resolves to its process", current_process().is_some()) {
         finish_test_process(pid, task);

@@ -11,7 +11,6 @@ use alloc::format;
 use crate::runtime::{runtime, config};
 use crate::process::types::{Pid, DEFAULT_ENV};
 use crate::process::channel::{ProcessChannel, register_channel, remove_channel};
-use crate::process::table::{register_process};
 use crate::process::children::{lookup_process_shared, current_terminal_state};
 use crate::process::lifecycle::LifecycleGuard;
 
@@ -547,6 +546,10 @@ pub fn spawn_process_with_creds(
     // Get the PID before boxing
     let pid = process.pid;
 
+    // The table slot, while a refusal still has nothing to undo: see `ProcessSlot`.
+    let slot = super::table::reserve_process_slot()
+        .ok_or_else(|| format!("{} spawning {path}", super::table::PROCESS_TABLE_FULL))?;
+
     // Box the process for heap allocation (fallible to avoid kernel panic on OOM)
     let boxed_process = Box::try_new(process)
         .map_err(|_| format!("Failed to allocate Process struct for {path}"))?;
@@ -560,7 +563,7 @@ pub fn spawn_process_with_creds(
     // CRITICAL: Register the process in the table immediately.
     // This ensures that lookup_process_shared(pid) works as soon as this function returns,
     // allowing reattach() to succeed without races.
-    register_process(pid, boxed_process);
+    super::table::register_reserved(pid, boxed_process, slot);
 
     // Register the channel for the thread ID placeholder (0 for now, will be updated)
     // Actually, current_channel() now uses the field in Process struct, so this is mostly for legacy.
