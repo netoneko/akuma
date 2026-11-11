@@ -67,7 +67,7 @@ The recommended image is the **`devbox-smoltcp`** meta-feature on the
 empty alias kept for the scripts):
 
 ```
-cargo run --release --features devbox-smoltcp,no-tests   # run-smoltcp.sh
+cargo run --release --features no-tests   # run-smoltcp.sh
 scripts/build_devbox_smoltcp.sh                                             # build-only
 
 [features]

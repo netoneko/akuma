@@ -100,7 +100,7 @@ HOST=$(rustc -vV | grep '^host:' | cut -d' ' -f2)
 cargo clippy --release
 cargo clippy --profile extreme-size --no-default-features \
       --features no-tests,smoltcp
-cargo clippy --release --features devbox-smoltcp,no-tests
+cargo clippy --release --features no-tests
 cargo clippy --release --no-default-features --features \
       "$(grep -oE 'DEVBOX_FEATURES="[^"]*"' scripts/build_devbox.sh | head -1 | sed 's/.*="//;s/"//')"
 

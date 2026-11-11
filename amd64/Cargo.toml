@@ -181,7 +181,7 @@ sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-contain
 # The initialisation the suite performs inline — the LAPIC, the console fd and
 # the syscall MSRs — is `boot::late_init`, which this build calls instead. See
 # `self_tests`' own header for the rule that keeps the two in step.
-no-tests = ["akuma-kernel-core/no-tests"]
+no-tests = ["akuma-kernel-core/no-tests", "akuma-exec/no-tests", "akuma-syscalls-glue/no-tests"]
 
 [dependencies]
 # Stage A of the amd64 bring-up: the kernel's own memory management, running on

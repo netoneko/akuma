@@ -56,7 +56,7 @@ HTTPS client anywhere in this tree now; use a userspace tool.
 | `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. The rump devbox's feature; it replaces the removed `devbox` bundle. A separate feature because the AArch64 kernel reads no boot command line to choose it at runtime. | `Cargo.toml:378` |
 | (`userspace-sshd`) | **Removed 2026-11-11** with `extreme`, the only build that selected it. herd starts `/bin/sshd` on every build. |
 | (`many-sessions`) | **Removed 2026-11-11.** The listener backlog is 8 on every build; configure sshd for it or raise `MAX_BACKLOG` — [`../build-profiles.md`](../build-profiles.md) § Listener backlog. |
-| `devbox-smoltcp` | An empty feature — the **default** devbox's name. A no-op on top of `default` (this build does NOT pass `--no-default-features`); kept so existing build lines still resolve. | `Cargo.toml` |
+| (`devbox-smoltcp`) | **Removed 2026-11-11** (it had become an empty alias). The default devbox is `--release --features no-tests`; `scripts/build_devbox_smoltcp.sh` builds it. | `Cargo.toml` |
 
 > **Drift note:** `overlays/devbox/README.md:142,211`
 > still say "Phase 2 will build with `--no-default-features`" and "smoltcp is
@@ -123,7 +123,7 @@ cargo reports an error rather than silently ignoring the feature.
 | Feature | Effect | Source |
 |---|---|---|
 | *(no SMP feature)* | Shared-kernel SMP is unconditional: `amd64/Cargo.toml` turns on `bkl-smp` on every shared crate it depends on, and `const _: () = assert!(akuma_bkl::ACTIVE)` in `amd64/src/smp.rs` fails the build if one is ever missed (the BKL's entry points are no-ops without it). The `smp-shared` feature was removed 2026-11-11. | `amd64/Cargo.toml` |
-| `no-tests` | Drops the boot self-test suite, as on AArch64. `boot::self_tests` and every `*_test`/`smoke_test` function in `amd64/src` disappear and `boot::late_init` performs the bring-up the suite otherwise does on the way past (the LAPIC, the secondaries, the console fd, the syscall MSRs, the timer, `sti`) — the same call the runtime `skiptests` command-line lever makes. Verified by booting, not only by compiling. | `amd64/Cargo.toml` |
+| `no-tests` | Drops the boot self-test suite, as on AArch64. `boot::self_tests` and every `*_test`/`smoke_test` function in `amd64/src` disappear and `boot::late_init` performs the bring-up the suite otherwise does on the way past (the LAPIC, the secondaries, the console fd, the syscall MSRs, the timer, `sti`) — the same call the runtime `skiptests` command-line lever makes. Verified by booting, not only by compiling. Forwards to `akuma-kernel-core`, `akuma-exec` and `akuma-syscalls-glue`, as AArch64's does, so their test-only helpers leave the image too (−1.9 KB `.text`). | `amd64/Cargo.toml` |
 | `syscall-debug-info` | Off. Forwards the AArch64 kernel's compile-time syscall debug mode (`akuma-config`, `akuma-syscalls`, `akuma-syscalls-time`, `akuma-exec`). On amd64 it prints glue's per-arm `[syscall]` lines only; the `[FORK-DBG]`/`[TRAMP]` traces never fire, because fork and exec are this target's own. For "which syscall failed" use the runtime `strace_err` flag instead: [`../../runbooks/trace-failing-syscalls-amd64.md`](../../runbooks/trace-failing-syscalls-amd64.md). | `amd64/Cargo.toml` |
 
 | Env knob | Effect | Source |
@@ -139,7 +139,7 @@ when its `cfg` cannot hold in a `no-tests` world. Before the feature existed
 
 | cfg | Emitted when | Gates |
 |---|---|---|
-| `kernel_tests` | `!no-tests && OPT_LEVEL != "z"` | Kernel APIs the boot suite needs — `src/main.rs`'s boot self-test suite (`{tests,process_tests,sync_tests,pthread_tests,network_tests}.rs`). There is no `kernel_builtin_ssh` cfg anymore; the in-kernel SSH server, shell, and editor it used to gate were deleted outright on 2026-08-10, not compiled-out-by-cfg (`docs/archive/BUILTIN_SSH_REMOVAL.md`). |
+| `kernel_tests` | `!no-tests` | Kernel APIs the boot suite needs — `src/main.rs`'s boot self-test suite (`{tests,process_tests,sync_tests,pthread_tests,network_tests}.rs`). There is no `kernel_builtin_ssh` cfg anymore; the in-kernel SSH server, shell, and editor it used to gate were deleted outright on 2026-08-10, not compiled-out-by-cfg (`docs/archive/BUILTIN_SSH_REMOVAL.md`). |
 
 ### SMP / Big Kernel Lock
 

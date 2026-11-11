@@ -12,13 +12,6 @@
     "syscall-debug-info"
   ],
   "drift": {
-    "no-tests": {
-      "only_aarch64": [
-        "akuma-exec/no-tests",
-        "akuma-syscalls-glue/no-tests"
-      ],
-      "only_amd64": []
-    },
     "sc-sysv-ipc": {
       "only_aarch64": [
         "akuma-vfs-glue/sc-sysv-ipc"

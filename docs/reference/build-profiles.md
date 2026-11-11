@@ -21,7 +21,7 @@ apart entirely by feature set, not profile.
 | **release** (default) | `release` | `cargo build --release` / `cargo run --release` | smoltcp (native) + userspace `/bin/sshd`; rump not compiled in (`--features rump` makes it available per box) | Day-to-day development image. Full `default` feature set: sound, real shared-kernel SMP (`smp-shared`), `linux-extra-syscalls` (every `sc-*` family). No in-kernel TLS/shell/editor — those were deleted 2026-08-10, see [below](#there-is-no-built-in-ssh-server). |
 | **extreme-size** | `extreme-size` (inherits `release`) | `cargo build --profile extreme-size [--no-default-features --features …]` | whatever the feature set selects | **Codegen only**: `opt-level = "z"`, fat LTO, `codegen-units = 1`, stripped. Builds the same kernel as `--release` for a given feature set, just smaller. The 4 MB-floor `extreme` feature behind it was removed 2026-11-11 ([`../archive/EXTREME_SIZE_BUILD.md`](../archive/EXTREME_SIZE_BUILD.md)). |
 | **devbox** | `release` | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | **rump only** (no smoltcp) | *(deferred — see `devbox-smoltcp`.)* Rump-stack workstation image: NetBSD rump as box 0's default stack. `--no-default-features`, so smoltcp is compiled out. |
-| **devbox-smoltcp** (default devbox) | `release` | `scripts/build_devbox_smoltcp.sh` / `overlays/devbox/run-smoltcp.sh` | smoltcp (native) + userspace `/bin/sshd` | The **default** "develop inside Akuma" image (2026-07-19). Native smoltcp stack for box 0 + real shared-kernel SMP (`SMP=N`). Keeps the default feature set layered on top (`+= devbox-smoltcp,no-tests`, no `--no-default-features`). rump_server work is deferred. |
+| **devbox-smoltcp** (default devbox) | `release` | `scripts/build_devbox_smoltcp.sh` / `overlays/devbox/run-smoltcp.sh` | smoltcp (native) + userspace `/bin/sshd` | The **default** "develop inside Akuma" image (2026-07-19). Native smoltcp stack for box 0 + real shared-kernel SMP (`SMP=N`). Keeps the default feature set layered on top (`+= no-tests`, no `--no-default-features`). rump_server work is deferred. |
 
 Binary sizes are intentionally not tabulated here — they drift with every
 feature/dependency change. See [Measuring an image](#measuring-an-image) for
@@ -84,7 +84,7 @@ this environment, so `lldb` targeting QEMU's gdbstub is the debugger of
 record) instead of raw PC/LR addresses.
 
 ```bash
-cargo build --profile release-debug --features devbox-smoltcp,no-tests
+cargo build --profile release-debug --features no-tests
 ```
 
 Nothing selects this profile unless asked for by name — `release`
@@ -197,7 +197,7 @@ were deleted from `Cargo.toml` entirely (commit `bade6ab` for TLS,
 | Target | Drops vs. default | Adds vs. default |
 |---|---|---|
 | `devbox` | `smoltcp` | `rump-default` (→ `rump`), `no-tests` |
-| `devbox-smoltcp` | — (inherits default set) | `devbox-smoltcp` (now an empty feature), `no-tests` |
+| `devbox-smoltcp` | — (inherits default set) | `no-tests` |
 
 ### Listener backlog and the userspace sshd
 
@@ -255,7 +255,7 @@ codegen:
 
 Practical cost: artifacts for different feature sets now share
 `target/aarch64-unknown-none/release/`, so switching between e.g. plain release
-and `--features devbox-smoltcp,no-tests` forces a rebuild instead of hitting a warm
+and `--features no-tests` forces a rebuild instead of hitting a warm
 per-profile cache.
 
 ## Known inconsistencies

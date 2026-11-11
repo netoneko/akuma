@@ -5,7 +5,7 @@
 # kernel across cores). The inverse of run.sh (rump-only, single kernel).
 # rump_server work is deferred; use run.sh for the rump path.
 #
-# Built with `--release` + the `devbox-smoltcp` feature
+# Built with `--release --features no-tests`
 # (scripts/build_devbox_smoltcp.sh). QEMU forwards host :2222 -> box :22 (the smoltcp
 # runner default). See overlays/devbox/README.md.
 set -euo pipefail
@@ -30,11 +30,10 @@ echo "Once you see the userspace sshd listening, connect with:"
 echo "  ssh -o StrictHostKeyChecking=no -p $SSH_PORT root@localhost"
 echo
 
-# Keep the DEFAULT feature set (smoltcp/kernel-tls stay in); layer the devbox-smoltcp
-# meta-feature (userspace-sshd + smp-shared) + no-tests. Matches build_devbox_smoltcp.sh.
+# Keep the DEFAULT feature set (smoltcp/kernel-tls stay in); add no-tests. Matches build_devbox_smoltcp.sh.
 #
 # This list MUST stay in sync with scripts/build_devbox_smoltcp.sh: this script
 # runs its own `cargo run`, so whatever is missing here gets rebuilt *without*
 # it, silently replacing the image that script just produced.
-DEVBOX_SMOLTCP_FEATURES="devbox-smoltcp,no-tests"
+DEVBOX_SMOLTCP_FEATURES="no-tests"
 exec cargo run --release --features "$DEVBOX_SMOLTCP_FEATURES"

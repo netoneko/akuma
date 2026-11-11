@@ -40,7 +40,7 @@ SMP=4 cargo run --release     # -smp 4
 
 `SMP=N` (cargo_runner.sh) sets QEMU `-smp N`. Boot self-tests
 (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs::test_smp_shared_*`) run when tests are compiled in (no
-`no-tests`). The devbox image is `--features devbox-smoltcp` (adds `no-tests`).
+`no-tests`). The devbox image is `--features no-tests`.
 
 ## Symptom → cause → fix
 
@@ -194,7 +194,7 @@ lldb target/aarch64-unknown-none/release-smp-shared/akuma \
   -o "gdb-remote localhost:1235" -o "thread backtrace all"
 ```
 
-For the devbox image add `DISK=devbox.img` and `--features devbox-smoltcp,no-tests`.
+For the devbox image add `DISK=devbox.img` and `--features no-tests`.
 `thread backtrace all` shows every core; the BKL `owner` in a `[BKL] stuck` line is
 `aff0 + 1`, so `owner=1` is core 0 (the BSP).
 

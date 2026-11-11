@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Self-host: shallow-clone akuma inside the VM and build the smoltcp-devbox SMP kernel.
 
-Target is `--profile release-smp-shared --features devbox-smoltcp,no-tests`, which
+Target is `--profile release-smp-shared --features no-tests`, which
 inherits `profile.release` (`panic = "abort"`) and therefore links against the
 precompiled `aarch64-unknown-none` std — no `-Z build-std`, no `rust-src` needed.
 
@@ -89,7 +89,7 @@ if __name__ == '__main__':
     # 3. the build under test
     step('build',
          ENVP + '/usr/bin/cargo build -p akuma --profile release-smp-shared '
-                '--features devbox-smoltcp,no-tests '
+                '--features no-tests '
                 '--manifest-path /src/github.com/netoneko/akuma/Cargo.toml -j1',
          budget=14400)
 

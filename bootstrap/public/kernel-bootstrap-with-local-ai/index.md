@@ -98,7 +98,7 @@ Build the devbox-shaped kernel: userspace sshd via herd, real shared-kernel
 SMP, native smoltcp network stack (no rump), boot self-tests compiled out.
 
 ```bash
-cargo build --release --features devbox-smoltcp,no-tests
+cargo build --release --features no-tests
 ```
 
 Expected: a clean `Finished` line, and
@@ -244,7 +244,7 @@ sets it up; `--local` flags target KVM metal directly).
 
 ```bash
 # 1. FC-shaped kernel: raw Image with the ARM64 header, load-linked at 0x80300000
-FC_FEATURES=devbox-smoltcp,no-tests overlays/devbox-firecracker/build.sh
+FC_FEATURES=no-tests overlays/devbox-firecracker/build.sh
 #   -> akuma-fc.bin; the script asserts _boot's address and the Image magic,
 #      because a wrong load address is a silent hang, not an error
 
@@ -274,7 +274,7 @@ expected to fail under nested virt — judge by `FAILED` > 1, not `FAILED=0`):
 You are done when ALL of these hold — verify each, in order:
 
 - [ ] `git branch --show-current` → `post-release-improvements`
-- [ ] `cargo build --release --features devbox-smoltcp,no-tests` → `Finished`
+- [ ] `cargo build --release --features no-tests` → `Finished`
 - [ ] `simple-kernel-devbox.img` exists and `bootstrap.sh` printed its `Done:` banner
 - [ ] `grep -a "SSHD. Listening" boot.log` matches
 - [ ] `ssh -p 2222 root@localhost 'uname -a'` prints your commit id
@@ -286,7 +286,7 @@ You are done when ALL of these hold — verify each, in order:
 
 The whole point of the devbox: change things and re-verify.
 
-- **Kernel change** → `cargo build --release --features devbox-smoltcp,no-tests`,
+- **Kernel change** → `cargo build --release --features no-tests`,
   kill the VM (`pkill -f qemu-system-aarch64`), re-run step 5, re-verify step 6.
   Reboot takes ~10 s; `ssh-keygen -R "[localhost]:2222"` only after *image*
   rebuilds, not kernel rebuilds (the host key lives in the image).

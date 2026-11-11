@@ -35,7 +35,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 SSH_PORT = 2222
 REDIS_PORT = 4444
-FEATURES = "devbox-smoltcp,no-tests,net-profile"
+FEATURES = "no-tests,net-profile"
 # The upstream redis:alpine rootfs unpacked by ATTEMPT_0 §2's workaround. Using
 # the box (not the guest's own apk redis) keeps the binary identical to the one
 # in the Docker control container.

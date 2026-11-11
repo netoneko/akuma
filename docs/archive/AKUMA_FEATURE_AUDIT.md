@@ -289,6 +289,26 @@ Gates:
 `proposals/` was cleared the same day: its six files moved to `docs/archive/`, each with a banner
 saying what became of it.
 
+## `devbox-smoltcp` and `epoll-waker-trace` removed; amd64 `no-tests` forwards fully (2026-11-11)
+
+- **`devbox-smoltcp`** had been an empty feature since `smp-shared` went. The devbox is
+  `--release --features no-tests`. 45 feature strings in scripts, overlays and docs dropped
+  the name. It is still the *image's* name (`scripts/build_devbox_smoltcp.sh`,
+  `overlays/devbox/run-smoltcp.sh`).
+- **`epoll-waker-trace`** was a one-off stamp set in `test_epoll_socket_waker`, used once to
+  answer whether the multiarch refactor caused that test's failure (it did not;
+  `AKUMA_MULTIARCH_ATTEMPT_0.md`). It is deleted with its module.
+- **Parity check:**
+  - **`no-tests`** on amd64 forwarded only to `akuma-kernel-core`. `akuma-exec`'s and
+    `akuma-syscalls-glue`'s `kernel_tests`-gated helpers (`futex_requeue_table`, the
+    `sys_{get,set}sockopt` wrappers, pmm forwarders) stayed in the runtime image. It now
+    forwards like AArch64's: amd64 `no-tests` `.text` is 2,833,167 → 2,831,215 (−1,952 B).
+    Boots to `uname` at SMP=1 and 2 (TCG).
+  - **`sc-sysv-ipc`** not forwarding to `akuma-vfs-glue` is intended and stays the one pinned
+    drift: that crate's `/proc/sysvipc/msg` lives in a `ProcFilesystem` amd64 does not mount
+    (`amd64/Cargo.toml`). Forwarding it would compile dead code.
+  - The parity baseline is ratcheted to 1 drift of 10.
+
 ## Proposed simplifications
 
 | # | change | risk | gate |

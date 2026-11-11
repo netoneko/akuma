@@ -335,7 +335,7 @@ ls -lh "$SIMPLE_KERNEL_DISK"
 cat <<EOF
 
 Next steps:
-  1. Build the kernel:        scripts/build_devbox_smoltcp.sh   (or cargo build --release --features devbox-smoltcp,no-tests)
+  1. Build the kernel:        scripts/build_devbox_smoltcp.sh   (or cargo build --release --features no-tests)
   2. Boot it with this disk:  overlays/simple-kernel-devbox/run.sh
   3. Connect:                 ssh -o StrictHostKeyChecking=no -p 2222 root@localhost
      (first boot generates the host key; after a REBUILD run: ssh-keygen -R "[localhost]:2222")

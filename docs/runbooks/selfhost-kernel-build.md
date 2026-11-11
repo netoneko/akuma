@@ -69,7 +69,7 @@ boot behind a watchdog storm — impersonates a kernel regression.
 > Config: the devbox image's own tree at
 > `/src/github.com/netoneko/akuma` (`52ba7d4c`), SMP=4, MEMORY=4096, HVF, and
 > the exact `build_devbox_smoltcp.sh` line:
-> `cargo clean && cargo build --release --features devbox-smoltcp,no-tests -j4 --offline`.
+> `cargo clean && cargo build --release --features no-tests -j4 --offline`.
 > Three consecutive trials: **44.51 / 44.63 / 44.75 s** (±0.12 s), each clean
 > removing 543 files / 79 MiB and rebuilding it — real work, not a cache resume;
 > ELF 2,690,480 B. A same-day run on the identical configuration reported 41.66 s,
@@ -93,7 +93,7 @@ Timing is a property of the **configuration**, so record it alongside the
 number. This one is:
 
 ```bash
-DISK=devbox.img MEMORY=8192 SMP=4 cargo run --release --features devbox-smoltcp,no-tests
+DISK=devbox.img MEMORY=8192 SMP=4 cargo run --release --features no-tests
 # in-guest, per trial:
 cargo clean && cargo build --release -p akuma -j4 --offline
 ```
@@ -145,7 +145,7 @@ Two fixes, and use both:
    | build | files in `deps/` |
    |---|---|
    | in-guest `cargo build -p akuma` (default features) | **86** |
-   | host `--features devbox-smoltcp,no-tests` | **95** (32 `.d` + 31 `.rmeta` + 31 `.rlib` + 1 binary) |
+   | host `--features no-tests` | **95** (32 `.d` + 31 `.rmeta` + 31 `.rlib` + 1 binary) |
 
    Both are "one complete clean kernel build", and they differ — which is the
    whole reason to calibrate against *your* configuration rather than inherit a
@@ -208,9 +208,9 @@ path and not the network.
 
 ```sh
 cargo build -p akuma --profile release-smp-shared \
-    --features devbox-smoltcp,no-tests -j4      # deps
+    --features no-tests -j4      # deps
 cargo build -p akuma --profile release-smp-shared \
-    --features devbox-smoltcp,no-tests -j1      # final crate — see §5
+    --features no-tests -j1      # final crate — see §5
 ```
 
 Result, verified end to end:
@@ -543,7 +543,7 @@ The host kernel that runs the self-host VM must be built with the devbox
 feature set — the same one §5 builds *inside* the guest:
 
 ```bash
-cargo build --release --features devbox-smoltcp,no-tests
+cargo build --release --features no-tests
 ```
 
 A kernel from before 2026-08-10 built without these features serves port 22 from

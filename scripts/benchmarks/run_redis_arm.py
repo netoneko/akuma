@@ -31,7 +31,7 @@ def ssh(cmd, timeout=120):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True)
-    ap.add_argument("--features", default="devbox-smoltcp,no-tests,net-profile")
+    ap.add_argument("--features", default="no-tests,net-profile")
     ap.add_argument("--requests", type=int, default=20000)
     ap.add_argument("--clients", type=int, default=20)
     ap.add_argument("--pipelines", default="1,16")

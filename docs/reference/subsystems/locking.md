@@ -949,7 +949,7 @@ footprint and sums per-tag spins over just those windows. `analyze.py`'s default
 whole-boot view is diluted by bringup and idle.
 
 ```
-cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile
+cargo build --profile release-smp-shared --features no-tests,bkl-profile
 ```
 
 Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`

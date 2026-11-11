@@ -216,7 +216,7 @@ panic = "abort"
 # against the gdbstub (see docs/reference/scripts/multi-vm.md) instead of raw
 # addresses. OFF BY DEFAULT: nothing selects this profile unless explicitly
 # requested — `cargo build --profile release-debug --features
-# devbox-smoltcp,no-tests` (or whatever feature set you're debugging).
+# no-tests` (or whatever feature set you're debugging).
 # `cargo build --release` (the real target) is byte-for-byte unaffected.
 #
 # Only use this on a bug you can ALREADY reproduce reliably. `lockprobe.py`
@@ -286,10 +286,6 @@ no-tests = ["akuma-exceptions/no-tests", "akuma-exec/no-tests", "akuma-syscalls-
 # depends on vCPU count. See docs/archive/FIRECRACKER_PORT.md.
 platform-firecracker = ["akuma-config/platform-firecracker", "akuma-virtio/platform-firecracker", "akuma-kernel-glue/platform-firecracker", "akuma-kernel-tests-aarch64/platform-firecracker"]
 
-# Measurement only: `test_epoll_socket_waker` prints when its waker started, when it called
-# `wake_all`, when the waiter returned, and on which cores (`[epoll-waker-trace]`). Off everywhere.
-epoll-waker-trace = ["akuma-kernel-tests-aarch64/epoll-waker-trace"]
-
 # BKL-hold attribution (measurement builds only — never ship it). Enables the
 # per-tag BKL profiler in `akuma_exec::sync` for the whole boot and makes the
 # async-main loop print a periodic `[BKLPROF]` delta histogram: which syscall /
@@ -298,7 +294,7 @@ epoll-waker-trace = ["akuma-kernel-tests-aarch64/epoll-waker-trace"]
 # Phase 0 estimate that scheduler/IRQ holds ~70% of contended time was never
 # measured under a real userspace workload). Costs a shared-line store on every
 # kernel entry, so it perturbs timing-sensitive tests — enable it explicitly:
-#   cargo build --release --features devbox-smoltcp,no-tests,bkl-profile
+#   cargo build --release --features no-tests,bkl-profile
 bkl-profile = ["akuma-kernel-core/bkl-profile", "akuma-kernel-glue/bkl-profile", "akuma-kernel-tests-aarch64/bkl-profile"]
 
 # Device-level NIC instrumentation (measurement builds only — never ship it).
@@ -310,7 +306,7 @@ bkl-profile = ["akuma-kernel-core/bkl-profile", "akuma-kernel-glue/bkl-profile",
 # stack time. Costs two CNTVCT reads per packet, so it perturbs the very path it
 # measures: read the RATIOS between counters, not the absolute throughput of a
 # run made with it on. Enable explicitly:
-#   cargo build --release --features devbox-smoltcp,no-tests,net-profile
+#   cargo build --release --features no-tests,net-profile
 # Parsed by scripts/benchmarks/bench_nic_rtt.py.
 net-profile = ["akuma-net/net-profile", "akuma-kernel-core/net-profile", "akuma-kernel-glue/net-profile", "akuma-kernel-tests-aarch64/net-profile"]
 
@@ -415,12 +411,6 @@ sc-epoll        = ["akuma-syscalls-glue/sc-epoll", "akuma-kernel-glue/sc-epoll",
 # `rump_proxy::start_default_stack`. Every unboxed process's AF_INET syscalls
 # then route to rump with no herd box + no `join_box` needed. Implies `rump`.
 rump-default = ["rump", "akuma-kernel-glue/rump-default"]
-
-# ── devbox-smoltcp: the default devbox ───────────────────────────────────────
-# An empty alias the devbox scripts and benchmarks name: the default feature set
-# already is the smoltcp devbox. Kept so `--features devbox-smoltcp,no-tests`
-# keeps working.
-devbox-smoltcp = []
 
 [lints]
 workspace = true

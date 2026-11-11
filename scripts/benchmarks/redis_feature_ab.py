@@ -22,8 +22,8 @@ Load comes from `rtt_load.py` (blocking sockets, 32 processes) because
 
 Usage:
     scripts/benchmarks/redis_feature_ab.py \
-        --arms "base=devbox-smoltcp,no-tests,net-profile" \
-               "prof=devbox-smoltcp,no-tests,net-profile,read-profile"
+        --arms "base=no-tests,net-profile" \
+               "prof=no-tests,net-profile,read-profile"
 """
 
 import argparse

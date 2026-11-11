@@ -10,11 +10,10 @@ set -e
 # via scripts/build_devbox.sh, but this smoltcp image is the recommended devbox.
 #
 # Unlike build_devbox.sh we do NOT pass --no-default-features: smoltcp must stay IN
-# (the userspace sshd routes over it). We layer the
-# `devbox-smoltcp` meta-feature (userspace-sshd + smp-shared) plus `no-tests` (this is
-# a runtime target; skip the boot self-test suite) on top of the default set. Built
-# with plain `--release`: the `smp-shared` FEATURE gates the code, and the profile
-# that used to pair with it added no codegen of its own (removed 2026-08-10).
+# (the userspace sshd routes over it). The devbox is the default set plus `no-tests`
+# (a runtime target; skip the boot self-test suite), built with plain `--release`.
+# There is no devbox feature of its own: `devbox-smoltcp` was an empty alias and was
+# removed 2026-11-11.
 #
 # Run with overlays/devbox/run-smoltcp.sh (SMP=N, no RUMP_NIC, host :2222 -> :22).
 # Extra args are forwarded (e.g. scripts/build_devbox_smoltcp.sh --quiet).
@@ -23,7 +22,7 @@ set -e
 # build. How sshd serves sessions is sshd's own build/config
 # (SSHD_FORK_SESSIONS=0 userspace/build.sh --sshd-only for the cooperative one;
 # docs/reference/build-profiles.md § Listener backlog).
-DEVBOX_SMOLTCP_FEATURES="devbox-smoltcp,no-tests"
+DEVBOX_SMOLTCP_FEATURES="no-tests"
 cargo build \
     --release \
     --features "$DEVBOX_SMOLTCP_FEATURES" \

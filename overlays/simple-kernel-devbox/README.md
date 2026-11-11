@@ -85,7 +85,7 @@ Knobs (`run.sh`): `SIMPLE_KERNEL_DISK`, `MEMORY` (4096), `SMP` (2),
 Same image, Firecracker loader. Build the FC-shaped kernel and pass the disk:
 
 ```bash
-FC_FEATURES=devbox-smoltcp,no-tests overlays/devbox-firecracker/build.sh   # -> akuma-fc.bin
+FC_FEATURES=no-tests overlays/devbox-firecracker/build.sh   # -> akuma-fc.bin
 FC_DISK=$PWD/simple-kernel-devbox.img overlays/devbox-firecracker/run.sh   # mac: via Lima (default)
 FC_DISK=$PWD/simple-kernel-devbox.img overlays/devbox-firecracker/run.sh --local   # KVM metal
 ```

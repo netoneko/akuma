@@ -14,7 +14,7 @@ boots but is deferred.
 | File | Role |
 |---|---|
 | `bootstrap.sh` | Host build: build `herd`+`sshd` → create image → base binaries → wipe `/etc` → lay down the overlay `/etc` → apk-stable + nightly Rust. |
-| `run-smoltcp.sh` | **Default.** `release` profile + `devbox-smoltcp` feature (an empty feature, default features kept). No `RUMP_NIC`; box 0 is native smoltcp. SSH is the userspace `/bin/sshd` on `:2222`. `SMP=` env var controls core count (default 2). |
+| `run-smoltcp.sh` | **Default.** `release` profile + `no-tests` (default features kept). No `RUMP_NIC`; box 0 is native smoltcp. SSH is the userspace `/bin/sshd` on `:2222`. `SMP=` env var controls core count (default 2). |
 | `run.sh` | Deferred. `release` profile, `--no-default-features` + `rump-default` (see `scripts/build_devbox.sh`), single kernel. `RUMP_NIC=1` brings up the second NIC rump DHCPs on. SSH on `:2223`. |
 | `rootfs/` | The **sole** source of the image's `/etc` — `bootstrap.sh` wipes whatever `bootstrap/etc/` shipped and replaces it wholesale. |
 | `README.md` | Full walkthrough: quick start for both paths, the feature-flag mechanics, verification steps, and a papercut backlog. |
