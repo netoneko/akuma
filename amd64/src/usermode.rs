@@ -4847,11 +4847,11 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
         && let Ok(text) = core::str::from_utf8(&conf)
         && !crate::splash::defer_config(text)
     {
-        let _ = crate::multiboot2::fb_apply_config(text);
+        let _ = crate::drivers::fb_apply_config(text);
     }
-    if let Some((rows, cols)) = crate::multiboot2::fb_grid() {
+    if let Some((rows, cols)) = crate::drivers::fb_grid() {
         crate::console::set_size(rows, cols);
-        crate::multiboot2::fb_summary();
+        crate::drivers::fb_summary();
     }
     // The USB keyboard, if the xHCI controller is up (a USB root disk, or the
     // `usb` flag): enumerate it before the pump starts reading input, so the

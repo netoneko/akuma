@@ -180,12 +180,18 @@ version = "0.1.0"
 name = "akuma-drivers-amd64"
 version = "0.1.0"
 dependencies = [
+ "akuma-boot-amd64",
+ "akuma-cpu",
  "akuma-dma",
  "akuma-dwi2c",
+ "akuma-fbcon",
+ "akuma-fbdev",
  "akuma-hda",
  "akuma-hid",
  "akuma-i2c-hid",
  "akuma-kernel-amd64",
+ "akuma-multiboot2",
+ "akuma-pagetable",
  "akuma-pci",
  "akuma-primitives",
  "akuma-ryzen-amd64",
@@ -464,7 +470,6 @@ dependencies = [
  "akuma-exec",
  "akuma-exec-core",
  "akuma-ext2",
- "akuma-fbcon",
  "akuma-fbdev",
  "akuma-fdtable",
  "akuma-fpcache",

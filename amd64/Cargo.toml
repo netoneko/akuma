@@ -172,8 +172,9 @@ sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-contain
 # Compile the boot self-test suite **out**.
 #
 # The same opt-in the AArch64 kernel has (root `Cargo.toml`), and it means the
-# same thing here: `boot::self_tests` and every `*_test`/`smoke_test` function
-# in `amd64/src` disappear, leaving a kernel that boots straight into `init`.
+# same thing here: the bin stops linking `akuma-kernel-tests-amd64` (the boot
+# suite) and every `*_test`/`smoke_test` function left in `amd64/src`
+# disappears, leaving a kernel that boots straight into `init`.
 # The devbox and `extreme-size` targets build with it on the other
 # architecture; on this one it is what makes the line count honest, because
 # `scripts/cloc_akuma.py` attributes an item to the *test* bucket exactly when
@@ -182,7 +183,8 @@ sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-contain
 #
 # The initialisation the suite performs inline — the LAPIC, the console fd and
 # the syscall MSRs — is `boot::late_init`, which this build calls instead. See
-# `self_tests`' own header for the rule that keeps the two in step.
+# the suite's header (`crates/akuma-kernel-tests-amd64/src/suite.rs`) for the
+# rule that keeps the two in step.
 no-tests = ["akuma-kernel-core/no-tests", "akuma-exec/no-tests", "akuma-syscalls-glue/no-tests"]
 
 [dependencies]
@@ -219,9 +221,6 @@ akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
 # [FAIL] used to print and the boot then finished announcing success.
 akuma-lapic-amd64 = { path = "../crates/akuma-lapic-amd64" }
 akuma-selftest = { path = "../crates/akuma-selftest" }
-# The framebuffer text console. The bare-metal reference machine has no UART at
-# all, so on a GRUB boot this is the only way the kernel can say anything.
-akuma-fbcon = { path = "../crates/akuma-fbcon" }
 # Parsing GRUB's information block. A crate, with tests, because the first
 # version of this parser lived in amd64/src/multiboot2.rs and had a one-byte
 # offset error that could only be found by rebooting the machine.

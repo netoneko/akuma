@@ -905,7 +905,7 @@ extern "C" fn ap_entry64(index: u64) -> ! {
     enable_sse();
     let _ = enable_xsave();
     // This core's own PAT, so the write-combining framebuffer is WC here too.
-    crate::multiboot2::pat_init_ap();
+    crate::drivers::pat_init_ap();
     gdt::init_cpu(idx, PERCPU[idx].stack_top.load(Ordering::Relaxed));
     idt::load();
     install_percpu(idx);

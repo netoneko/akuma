@@ -57,14 +57,12 @@ pub fn print() {
 /// boot's cat is a slightly different one. The version line is not repeated: `uname`
 /// carries it.
 pub fn print_visible() {
-    use akuma_fbcon::splash::art_color;
-
     fn put(s: &str) {
         for b in s.bytes() {
             if b == b'\n' {
-                crate::multiboot2::mirror_byte(b'\r');
+                crate::drivers::mirror_byte(b'\r');
             }
-            crate::multiboot2::mirror_byte(b);
+            crate::drivers::mirror_byte(b);
         }
     }
 
@@ -73,17 +71,17 @@ pub fn print_visible() {
     for (y, line) in ART.lines().enumerate() {
         let mut last = None;
         for (x, ch) in line.bytes().enumerate() {
-            if ch != b' ' {
-                let c = art_color(ch, x, y, t_ms);
-                // Only when the colour changes: runs of one character share it.
-                if last != Some((c.r, c.g, c.b)) {
-                    let mut w = akuma_primitives::console::StackWriter::<24>::new();
-                    let _ = core::fmt::Write::write_fmt(&mut w, format_args!("\x1b[38;2;{};{};{}m", c.r, c.g, c.b));
-                    put(w.as_str());
-                    last = Some((c.r, c.g, c.b));
-                }
+            // Only when the colour changes: runs of one character share it.
+            if ch != b' '
+                && let Some(c @ (r, g, b)) = crate::drivers::display_art_color(ch, x, y, t_ms)
+                && last != Some(c)
+            {
+                let mut w = akuma_primitives::console::StackWriter::<24>::new();
+                let _ = core::fmt::Write::write_fmt(&mut w, format_args!("\x1b[38;2;{r};{g};{b}m"));
+                put(w.as_str());
+                last = Some(c);
             }
-            crate::multiboot2::mirror_byte(ch);
+            crate::drivers::mirror_byte(ch);
         }
         put("\x1b[0m\n");
     }

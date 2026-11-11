@@ -11,7 +11,14 @@ workspace = true
 # not install it, so the machine half's probe for that class does nothing. `all` is what the
 # bin's default (bare-metal) image enables; `amd64/bin/Cargo.toml` names the smaller sets.
 [features]
-all = ["hda", "touchpad"]
+all = ["fbcon", "hda", "touchpad"]
+# The framebuffer text console on GRUB's linear framebuffer, with the boot splash and
+# `/dev/fb0`'s registration. Off, the multiboot2 boot is headless: its console is the serial
+# port (the bare-metal reference machine has no UART, so a build for it wants this on).
+fbcon = [
+    "dep:akuma-fbcon", "dep:akuma-fbdev", "dep:akuma-multiboot2", "dep:akuma-pagetable",
+    "dep:akuma-boot-amd64", "dep:akuma-cpu", "dep:akuma-primitives", "dep:spinning_top",
+]
 # The laptop's I2C-HID touchpad (DesignWare I2C controller) behind `/dev/input/mouse0`.
 touchpad = [
     "dep:akuma-dwi2c", "dep:akuma-hid", "dep:akuma-i2c-hid", "dep:akuma-touchpad",
@@ -26,11 +33,17 @@ hda = ["dep:akuma-hda", "dep:akuma-dma", "dep:akuma-pci", "dep:akuma-primitives"
 [target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
 akuma-kernel-amd64 = { path = "../../amd64", default-features = false }
 akuma-primitives = { path = "../akuma-primitives", optional = true }
+akuma-boot-amd64 = { path = "../akuma-boot-amd64", optional = true }
+akuma-cpu = { path = "../akuma-cpu", optional = true }
 akuma-dma = { path = "../akuma-dma", optional = true }
 akuma-dwi2c = { path = "../akuma-dwi2c", optional = true }
+akuma-fbcon = { path = "../akuma-fbcon", optional = true }
+akuma-fbdev = { path = "../akuma-fbdev", optional = true }
 akuma-hda = { path = "../akuma-hda", optional = true }
 akuma-hid = { path = "../akuma-hid", optional = true }
 akuma-i2c-hid = { path = "../akuma-i2c-hid", optional = true }
+akuma-multiboot2 = { path = "../akuma-multiboot2", optional = true }
+akuma-pagetable = { path = "../akuma-pagetable", optional = true }
 akuma-pci = { path = "../akuma-pci", optional = true }
 akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64", optional = true }
 akuma-touchpad = { path = "../akuma-touchpad", optional = true }

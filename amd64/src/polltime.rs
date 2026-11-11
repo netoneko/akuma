@@ -24,6 +24,7 @@
 /// constant (`docs/archive/AKUMA_AMD64_USB_XHCI.md` § "Clock finding").
 const TSC_HZ_FALLBACK: u64 = 4_000_000_000;
 
+#[must_use]
 pub fn tsc_hz() -> u64 {
     match crate::lapic::tsc_hz() {
         0 => TSC_HZ_FALLBACK,

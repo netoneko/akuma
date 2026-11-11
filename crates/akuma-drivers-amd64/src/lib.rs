@@ -18,7 +18,15 @@
 
 #![no_std]
 #![cfg(all(target_arch = "x86_64", target_os = "none"))]
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: the framebuffer console maps its framebuffer once
+// (`MmioWindow::new`), and that one site is allowed on its module.
+#![deny(unsafe_code)]
+
+extern crate alloc;
+
+#[cfg(feature = "fbcon")]
+#[allow(unsafe_code)]
+mod fbcon;
 
 #[cfg(feature = "hda")]
 mod hda;
@@ -30,6 +38,8 @@ mod touchpad;
 /// Install every driver this build compiled in. The bin's `before_main`, before either entry
 /// point probes anything.
 pub fn register() {
+    #[cfg(feature = "fbcon")]
+    akuma_kernel_amd64::drivers::register_display(&fbcon::DISPLAY);
     #[cfg(feature = "hda")]
     akuma_kernel_amd64::drivers::register_sound(akuma_kernel_amd64::drivers::Sound {
         init: hda::init,

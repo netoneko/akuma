@@ -73,7 +73,7 @@ pub fn open(tgid: u32) -> Result<(), u64> {
             Open::Busy => return Err(errno::EBUSY),
             Open::Acquire => {
                 if OWNER.compare_exchange(0, tgid, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                    crate::multiboot2::fb_mute();
+                    crate::drivers::fb_mute();
                     return Ok(());
                 }
                 // Lost the race to another opener; decide again against it.
@@ -85,7 +85,7 @@ pub fn open(tgid: u32) -> Result<(), u64> {
 /// Give the screen back if `tgid` owns it: unmute the console and repaint it.
 pub fn release(tgid: u32) {
     if tgid != 0 && OWNER.compare_exchange(tgid, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-        crate::multiboot2::fb_unmute_and_repaint();
+        crate::drivers::fb_unmute_and_repaint();
     }
 }
 

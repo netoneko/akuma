@@ -237,7 +237,7 @@ fn draw(t_ms: u64) {
     title = a.as_str();
     uname = b.as_str();
     status = d.as_str();
-    crate::multiboot2::fb_splash_frame(banner::ART, &[title, uname, status, e.as_str()], t_ms);
+    crate::drivers::fb_splash_frame(banner::ART, &[title, uname, status, e.as_str()], t_ms);
 }
 
 extern "C" fn splash_daemon() -> ! {
@@ -273,7 +273,7 @@ pub fn end_for_console() {
         return;
     }
     let conf = PENDING_CONF.lock().take();
-    if let Some((rows, cols)) = crate::multiboot2::fb_splash_end(conf.as_deref(), true) {
+    if let Some((rows, cols)) = crate::drivers::fb_splash_end(conf.as_deref(), true) {
         crate::console::set_size(rows, cols);
     }
     // For `dmesg` only: did the animation actually run? (A boot that spends its time in
@@ -325,7 +325,7 @@ pub fn crash() {
         return;
     }
     serial::set_fb_quiet(false);
-    let _ = crate::multiboot2::fb_splash_end(None, false);
+    let _ = crate::drivers::fb_splash_end(None, false);
     serial::replay_klog_tail_to_fb(REPLAY_BYTES);
 }
 

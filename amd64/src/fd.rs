@@ -2467,7 +2467,7 @@ fn console_ioctl(req: u64, arg: u64) -> Option<u64> {
                 // request clamped to the screen), so `stty size` never claims a
                 // size the glass does not have.
                 let (rows, cols) = if crate::console::is_console_terminal(&ts) {
-                    crate::multiboot2::fb_set_view(cols, rows).unwrap_or((rows, cols))
+                    crate::drivers::fb_set_view(cols, rows).unwrap_or((rows, cols))
                 } else {
                     (rows, cols)
                 };
