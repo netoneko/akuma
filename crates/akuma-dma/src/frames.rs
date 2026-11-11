@@ -3,7 +3,8 @@
 //! # What this replaces
 //!
 //! Five `static mut` byte arrays — `smoltcp_net`'s `RX_BUFFER` and
-//! `LOOPBACK_BUFS`, `virtio_rings`' `RX_BUFS`, `TX_BUFS` and `TX_DISCARD` —
+//! `LOOPBACK_BUFS`, and the since-removed `virtio_rings`' `RX_BUFS`, `TX_BUFS`
+//! and `TX_DISCARD` —
 //! reached through three near-identical accessor pairs, each carrying a
 //! hand-written safety argument that said the same thing: one device, one
 //! owner, serialised by `NETWORK`.

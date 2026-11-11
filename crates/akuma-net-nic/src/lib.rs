@@ -53,8 +53,6 @@ pub mod device;
 pub mod loopback;
 /// A link that meets the stack at two frame queues (`ExternalDevice::Queued`).
 pub mod queued;
-#[cfg(feature = "net-noalloc")]
-pub mod virtio_rings;
 #[cfg(feature = "rump")]
 pub mod rump_tap;
 

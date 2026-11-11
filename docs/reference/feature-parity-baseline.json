@@ -1,7 +1,6 @@
 {
   "common": [
     "fs-cache",
-    "net-noalloc",
     "no-tests",
     "sc-aio",
     "sc-containers",

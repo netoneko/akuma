@@ -3,7 +3,7 @@
 
 Sibling of `run_nic_ab.py` (HTTP round trips); this one drives the **pipelined**
 workload, which is the shape `AKUMA_NET_ISSUES.md` §7 says the static rings
-(`net-noalloc`) should suit and which was never measured.
+(`net-noalloc`, since removed) should suit.
 
 Redis comes from apk (`apk add redis`), not `box pull` — that is Issue 18 in
 DEVBOX_ISSUES and is still open. The server runs on guest port 4444, which the

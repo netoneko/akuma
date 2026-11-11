@@ -3,11 +3,7 @@
 use core::sync::atomic::Ordering;
 use smoltcp::phy::Device;
 use smoltcp::time::Instant;
-// The single-buffer receive path and its counters exist only without
-// `net-noalloc`; with it, `virtio_rings` owns the buffers and the accounting.
-// The counters are used by both paths (the staged-transmit branch counts sent/dropped frames).
 use crate::counters::C;
-#[cfg(not(feature = "net-noalloc"))]
 use crate::frames::{FrameArena, FrameLease};
 
 use crate::nic::Nic;
@@ -48,10 +44,9 @@ pub const RX_BUFFER_LEN: usize = if cfg!(kernel_profile_extreme) {
     65_568
 };
 
-/// The single receive buffer of the pre-`net-noalloc` path.
+/// The single receive buffer.
 ///
-/// In BSS rather than a [`VirtioSmoltcpDevice`] field, for the same reason
-/// `virtio_rings` keeps its frame storage there: `NetworkState` is built on the
+/// In BSS rather than a [`VirtioSmoltcpDevice`] field: `NetworkState` is built on the
 /// kernel stack by [`init`] and then moved into `NETWORK`, so a field this size
 /// would be a 64 KB stack temporary on a 96 KB system stack.
 ///
@@ -61,19 +56,15 @@ pub const RX_BUFFER_LEN: usize = if cfg!(kernel_profile_extreme) {
 /// cover — `receive_begin` until `receive_complete`, when the device owns the
 /// buffer by DMA — is exactly the life of the lease
 /// `VirtioSmoltcpDevice::rx_posted` holds. See `frames.rs`.
-#[cfg(not(feature = "net-noalloc"))]
 pub(crate) static RX_ARENA: FrameArena<1, RX_BUFFER_LEN> = FrameArena::new();
 
 /// The arena slot the single-buffer path uses. There is only one.
-#[cfg(not(feature = "net-noalloc"))]
 const RX_SLOT: usize = 0;
 
 pub struct VirtioSmoltcpDevice {
     inner: Nic,
-    /// The single transmit buffer of the pre-`net-noalloc` path. Also the
-    /// saturation-fallback staging buffer's counterpart.
-    #[cfg(not(feature = "net-noalloc"))]
-    tx_buffer: [u8; 2048],
+    /// The single transmit buffer.
+        tx_buffer: [u8; 2048],
     /// The receive buffer currently posted to the device: its token, and the
     /// arena lease that keeps the slot exclusively ours for as long as the
     /// device owns it by DMA.
@@ -83,24 +74,14 @@ pub struct VirtioSmoltcpDevice {
     /// `receive_complete()` once `poll_receive()` says it has been filled. The
     /// lease is the other half: holding it is what makes "untouched until
     /// completion" a fact rather than a comment.
-    #[cfg(not(feature = "net-noalloc"))]
-    rx_posted: Option<(u16, FrameLease<'static, 1, RX_BUFFER_LEN>)>,
+        rx_posted: Option<(u16, FrameLease<'static, 1, RX_BUFFER_LEN>)>,
     /// The lease for a completed frame that has been handed up to smoltcp as an
     /// `RxToken` and not yet finished with.
     ///
-    /// Released at the top of the next [`Self::take_rx_frame`], which is the
-    /// same point the `net-noalloc` path re-posts a released slot and for the
-    /// same reason: by the time smoltcp asks for another frame, `consume` has
-    /// returned on the previous one.
-    #[cfg(not(feature = "net-noalloc"))]
-    rx_handed_up: Option<FrameLease<'static, 1, RX_BUFFER_LEN>>,
-    /// Receive slots posted to the device. Buffers live in BSS, not here — see
-    /// `virtio_rings`.
-    #[cfg(feature = "net-noalloc")]
-    rx: crate::virtio_rings::RxRing,
-    /// Transmit slots in flight.
-    #[cfg(feature = "net-noalloc")]
-    tx: crate::virtio_rings::TxRing,
+    /// Released at the top of the next [`Self::take_rx_frame`]: by the time
+    /// smoltcp asks for another frame, `consume` has returned on the previous
+    /// one.
+        rx_handed_up: Option<FrameLease<'static, 1, RX_BUFFER_LEN>>,
 }
 
 impl VirtioSmoltcpDevice {
@@ -108,16 +89,9 @@ impl VirtioSmoltcpDevice {
     pub const fn new(inner: Nic) -> Self {
         Self {
             inner,
-            #[cfg(not(feature = "net-noalloc"))]
-            tx_buffer: [0u8; 2048],
-            #[cfg(not(feature = "net-noalloc"))]
-            rx_posted: None,
-            #[cfg(not(feature = "net-noalloc"))]
-            rx_handed_up: None,
-            #[cfg(feature = "net-noalloc")]
-            rx: crate::virtio_rings::RxRing::new(),
-            #[cfg(feature = "net-noalloc")]
-            tx: crate::virtio_rings::TxRing::new(),
+                        tx_buffer: [0u8; 2048],
+                        rx_posted: None,
+                        rx_handed_up: None,
         }
     }
 
@@ -133,42 +107,13 @@ impl VirtioSmoltcpDevice {
     /// lifetime: smoltcp's `RxToken` borrows it for exactly as long as
     /// `consume` runs, which is not a lifetime this function can name.
     ///
-    /// The two implementations differ in one thing that matters: with
-    /// `net-noalloc` the device always has a *ring* of buffers posted, so a
-    /// burst drains without an MMIO notify per frame. Without it there is one
-    /// buffer, and every single packet costs a fresh `receive_begin`.
+    /// There is one receive buffer, so every packet costs a fresh
+    /// `receive_begin`. A ring of them (the `net-noalloc` feature, removed
+    /// 2026-11-11) measured worse; see `docs/archive/AKUMA_FEATURE_AUDIT.md`.
     /// `pub(crate)` for `loopback::LoopbackAwareDevice`, which wraps this device
     /// and drives its receive path directly. That wrapper is the only caller.
     pub(crate) fn take_rx_frame(&mut self) -> Option<(*mut u8, usize)> {
-        #[cfg(feature = "net-noalloc")]
-        {
-            // Reap first: this runs once per poll lap, which is the only place
-            // TX completions get harvested promptly. Leaving it to the next
-            // `claim` means a slot stays in flight for as long as nothing is
-            // transmitted — which, on a request/response workload, is exactly
-            // the gap between requests.
-            self.tx.reap(&mut self.inner);
-            // Re-post whatever the previous call released. Safe to do here and
-            // not earlier: an outstanding `RxToken` has been consumed by the
-            // time smoltcp asks for another frame.
-            self.rx.refill(&mut self.inner);
-            let Some((slot, hdr, len)) = self.rx.take_frame(&mut self.inner) else {
-                nicstat::record_rx_empty();
-                return None;
-            };
-            // Bounds-checked by the arena; `hdr + len <= FRAME_BUF` was checked
-            // by `take_frame`. No intermediate reference: the caller wants a
-            // pointer, so go pointer-to-pointer and never mint a `&mut` that
-            // could alias. The slot stays leased by the ring until the next
-            // `take_frame` releases it, which covers the RxToken's life.
-            let base = crate::virtio_rings::RX_ARENA.slot_ptr(slot)?;
-            // Forming the pointer is safe; `hdr < FRAME_BUF` per the check above,
-            // so it stays inside the slot the arena just bounds-checked, which is
-            // what the caller's deref relies on.
-            Some((base.cast::<u8>().wrapping_add(hdr), len))
-        }
-        #[cfg(not(feature = "net-noalloc"))]
-        {
+                {
             // Release the frame handed up last time. smoltcp has finished with
             // it — `RxToken::consume` returned before it asked for another —
             // and the slot has to be free before phase 1 can re-post it.
@@ -229,11 +174,8 @@ impl VirtioSmoltcpDevice {
     /// wire — that is how loopback traffic is intercepted without this function
     /// needing to know what loopback is.
     ///
-    /// With `net-noalloc` the frame is staged directly in a ring slot and
-    /// submitted with `transmit_begin`, which returns immediately; the device's
-    /// completion is reaped on a later pass. Without it, every frame goes
-    /// through `NetRaw::send`, which spins until the host consumes the
-    /// descriptor — 20-26 us per packet with `NETWORK` held and IRQs masked
+    /// Every frame goes through `NetRaw::send`, which spins until the host
+    /// consumes the descriptor — 20-26 us per packet with `NETWORK` held and IRQs masked
     /// (`docs/archive/AKUMA_NET_ISSUES.md` §3.2).
     /// `pub(crate)` for the same reason as [`Self::take_rx_frame`] — the
     /// loopback wrapper diverts frames through it.
@@ -243,57 +185,7 @@ impl VirtioSmoltcpDevice {
         fill: impl FnOnce(&mut [u8]) -> R,
         divert: impl FnOnce(&[u8]) -> bool,
     ) -> R {
-        #[cfg(feature = "net-noalloc")]
-        {
-            use crate::virtio_rings::{FRAME_BUF, TX_DISCARD_ARENA};
-            if let Some(mut frame) = self.tx.claim(&mut self.inner) {
-                // `transmit_begin` sends whatever is in the buffer verbatim, so
-                // the virtio header has to be written into it here — unlike
-                // `send`, which prepends its own.
-                let hdr = self.inner.fill_buffer_header(&mut frame);
-                let end = hdr.saturating_add(len).min(FRAME_BUF);
-                let res = fill(&mut frame[hdr..end]);
-                if divert(&frame[hdr..end]) {
-                    // Never submitted, so the slot was never marked in flight.
-                    // Dropping the lease here is what releases it.
-                    return res;
-                }
-                let t = nicstat::start();
-                let ok = self.tx.submit(&mut self.inner, frame, end);
-                nicstat::record_tx(t, end - hdr, ok);
-                if ok {
-                    C.tx_frames_sent.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    C.tx_drop_count.fetch_add(1, Ordering::Relaxed);
-                }
-                return res;
-            }
-            // Every slot was still in flight after `CLAIM_SPINS` reaps. The
-            // frame is dropped — smoltcp retransmits — but `consume`'s contract
-            // still requires the fill closure to run, so it writes into a buffer
-            // nothing reads. Falling back to `NetRaw::send` here would be
-            // a bug, not a slow path: see `TxRing::claim`.
-            //
-            // A diverted (loopback) frame is unaffected by NIC saturation, so it
-            // is still delivered.
-            let end = len.min(FRAME_BUF);
-            // SAFETY: the discard buffer is write-only garbage — nothing ever
-            // reads it back and it is never submitted to the device — and
-            // `NETWORK` is held, so no other core is in this function. The
-            // bounds are the arena's. Deliberately NOT `with_slot`: a refusal
-            // there would leave no correct way to honour `consume`'s contract
-            // that the fill closure runs against a buffer of the length smoltcp
-            // asked for, and handing it a shorter one can panic inside smoltcp.
-            let discard = unsafe { &mut *TX_DISCARD_ARENA.first_slot_ptr() };
-            let res = fill(&mut discard[..end]);
-            if divert(&discard[..end]) {
-                return res;
-            }
-            C.tx_drop_count.fetch_add(1, Ordering::Relaxed);
-            res
-        }
-        #[cfg(not(feature = "net-noalloc"))]
-        {
+                {
             let end = len.min(self.tx_buffer.len());
             let res = fill(&mut self.tx_buffer[..end]);
             if divert(&self.tx_buffer[..end]) {

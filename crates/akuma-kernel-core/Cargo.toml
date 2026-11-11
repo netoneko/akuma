@@ -57,7 +57,6 @@ net-profile = ["akuma-net/net-profile"]
 platform-firecracker = ["akuma-boot-aarch64/platform-firecracker"]
 bkl-profile = []
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
-net-noalloc = ["akuma-net/net-noalloc"]
 
 [lints]
 workspace = true

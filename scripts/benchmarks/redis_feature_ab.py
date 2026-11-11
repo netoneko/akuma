@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """A/B kernel feature sets against the round-trip ceiling.
 
-Built to re-open one verdict in particular. `AKUMA_NET_ISSUES.md` §12 recorded
+Built to re-open one verdict in particular (the `net-noalloc` rings, since
+measured at −14.6 % here and removed 2026-11-11; the harness still A/Bs any two
+feature sets). `AKUMA_NET_ISSUES.md` §12 recorded
 `net-noalloc` — the static RX/TX rings that make transmit **non-blocking** — as
 "NEUTRAL, still off". That was measured with `bench_nic_rtt.py`, which is
 **serial**, and a serial client never reaches the throughput ceiling: it is
@@ -21,7 +23,7 @@ Load comes from `rtt_load.py` (blocking sockets, 32 processes) because
 Usage:
     scripts/benchmarks/redis_feature_ab.py \
         --arms "base=devbox-smoltcp,no-tests,net-profile" \
-               "rings=devbox-smoltcp,no-tests,net-profile,net-noalloc"
+               "prof=devbox-smoltcp,no-tests,net-profile,read-profile"
 """
 
 import argparse

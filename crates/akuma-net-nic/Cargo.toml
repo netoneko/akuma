@@ -5,10 +5,6 @@ edition = "2024"
 
 [features]
 default = []
-# Static RX/TX frame rings + a non-blocking transmit path. Forwarded from the
-# kernel feature of the same name; OFF by default — it measured worse on
-# latency. See docs/archive/AKUMA_NET_ISSUES.md §7.
-net-noalloc = []
 # Per-packet RX/TX/poll timing. MEASUREMENT BUILDS ONLY.
 net-profile = []
 # Raise the socket budget on size-constrained profiles.

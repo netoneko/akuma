@@ -192,13 +192,9 @@ pub fn maybe_dump(now_us: u64) {
 
     let irqs_now = smoltcp_net::nic_irq_count();
     let irqs = irqs_now.saturating_sub(PREV_NIC_IRQS.swap(irqs_now, Ordering::Relaxed));
-    // `orphan` and `tx_stall` are cumulative, not windowed: both should be
-    // exactly zero forever, so the useful question is "has it ever happened",
-    // not "how often this window". A non-zero `tx_stall` means `TX_RING` is too
-    // shallow for the offered load and those frames took the old blocking path.
-    #[cfg(feature = "net-noalloc")]
-    let (orphan, tx_stall) = akuma_net::virtio_rings::ring_health();
-    #[cfg(not(feature = "net-noalloc"))]
+    // `orphan` and `tx_stall` were the transmit ring's health counters; the ring
+    // (`net-noalloc`) was removed 2026-11-11, so they are always 0. Kept in the
+    // line so `[NICSTAT]` parsers see the same columns.
     let (orphan, tx_stall) = (0u64, 0u64);
     let laps_now = NETPOLL_LAPS.load(Ordering::Relaxed);
     let laps = laps_now.saturating_sub(PREV_NETPOLL_LAPS.swap(laps_now, Ordering::Relaxed));

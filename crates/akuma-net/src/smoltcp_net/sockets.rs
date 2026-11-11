@@ -170,7 +170,7 @@ pub fn socket_create() -> Option<SocketHandle> {
         // ACK *and* the response. Measured on redis PING at every core count:
         // exactly 1.97-2.00 tx packets per rx packet. Each transmit costs
         // ~14.9 us of `add_notify_wait_pop` spin inside the `NETWORK` lock
-        // (`virtio_rings.rs` header), so the duplicate is ~15 us of the 69 us
+        // (`docs/archive/AKUMA_NET_ISSUES.md` §7), so the duplicate is ~15 us of the 69 us
         // serialized budget that sets the throughput ceiling.
         //
         // The old comment here justified `None` as avoiding a ~65KB/10ms

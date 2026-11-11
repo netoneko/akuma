@@ -107,6 +107,22 @@ Gates: clippy on default, devbox-smoltcp, devbox (rump), amd64 (base and
 `thread_slot_reclaim_on_spawn`, `AARCH64_SPAWN_RECLAIM_SKIPPED.md`). amd64 TCG: 829/0 at SMP=1 and
 839/0 at SMP=2.
 
+## `net-noalloc` removed (2026-11-11)
+
+Owner's call: nobody uses it. It was off in both kernels, and every measurement went against it:
+HTTP p90 2.9x worse (`AKUMA_NET_ISSUES.md` §7), and −14.6 % redis throughput on the workload
+predicted to suit it (`REDIS_ROUND_TRIP_CEILING.md`). Removed:
+
+- `akuma-net-nic/src/virtio_rings.rs` (370 lines);
+- the ring arm of `device.rs`'s receive and transmit paths;
+- `irq::nic_kick_tx`;
+- the four `Nic` methods only the ring called (`submit_tx`, `complete_tx`, `poll_transmit`,
+  `fill_buffer_header`) and `nicstat::record_tx_complete`;
+- the feature from all six manifests.
+
+`[NICSTAT]` keeps its `orphan`/`tx_stall` columns, always 0, so parsers do not shift.
+`akuma-net-nic`'s unsafe budget went from 13 to 9. The default image's sections are unchanged.
+
 ## Proposed simplifications
 
 | # | change | risk | gate |

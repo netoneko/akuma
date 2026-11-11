@@ -29,7 +29,6 @@ sc-sysv-ipc = ["akuma-kernel-amd64/sc-sysv-ipc"]
 sc-containers = ["akuma-kernel-amd64/sc-containers"]
 console-notify = ["akuma-kernel-amd64/console-notify"]
 no-tests = ["akuma-kernel-amd64/no-tests"]
-net-noalloc = ["akuma-kernel-amd64/net-noalloc"]
 
 [dependencies]
 akuma-kernel = { path = "../../crates/akuma-kernel" }
