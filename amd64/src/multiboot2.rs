@@ -78,6 +78,53 @@ pub fn ega_text(row: usize, s: &str) {
     }
 }
 
+/// The firmware framebuffer of **this** boot: physical address and length, recorded by
+/// [`kmain_mb2`] from the information block GRUB handed over, before anything else could
+/// run. `0` length = none (no tag, not direct-colour, or above the physmap).
+static BOOT_FB_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BOOT_FB_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Set once [`framebuffer_window`] has handed the window out.
+static BOOT_FB_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Record the framebuffer of the boot that actually happened. Private on purpose: a
+/// `BootInfo` can be built from any bytes, so only the one GRUB passed may decide what
+/// [`framebuffer_window`] maps.
+fn record_boot_framebuffer(info: &BootInfo<'_>) {
+    use core::sync::atomic::Ordering;
+    let Some(fb) = info.framebuffer() else { return };
+    if !matches!(fb.kind, akuma_multiboot2::FramebufferKind::Rgb) {
+        return;
+    }
+    let len = fb.size_bytes();
+    // A framebuffer above what boot.s maps cannot be written; refuse it rather than fault.
+    if len == 0 || fb.addr.checked_add(len).is_none_or(|end| end > crate::phys::PHYSMAP_LIMIT) {
+        return;
+    }
+    BOOT_FB_ADDR.store(fb.addr, Ordering::Relaxed);
+    BOOT_FB_LEN.store(len, Ordering::Release);
+}
+
+/// The firmware framebuffer as an MMIO window, **once** per boot; `None` without one, or
+/// on a second call.
+///
+/// The display driver's only way to the framebuffer. It cannot name an address: the
+/// window is the one [`record_boot_framebuffer`] took from this boot's information
+/// block, so safe code cannot point it at RAM.
+#[must_use]
+pub fn framebuffer_window() -> Option<MmioWindow> {
+    use core::sync::atomic::Ordering;
+    let len = BOOT_FB_LEN.load(Ordering::Acquire);
+    if len == 0 || BOOT_FB_TAKEN.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let addr = BOOT_FB_ADDR.load(Ordering::Relaxed);
+    // SAFETY: the firmware's framebuffer, as GRUB reported it for this boot, checked by
+    // `record_boot_framebuffer` to lie entirely below `PHYSMAP_LIMIT`, which boot.s maps
+    // through the physmap. It is device memory no allocator owns, never freed or moved,
+    // and handed out once (`BOOT_FB_TAKEN`), so this is the only window over it.
+    Some(unsafe { MmioWindow::new((PHYSMAP_BASE + addr) as usize, len as usize) })
+}
+
 /// Where the bytes the framebuffer **would** get go when there is no
 /// framebuffer: QEMU's debug port, so a PVH boot (which has none) can show what
 /// the quiet policy lets through (`serial::set_fb_quiet`). Set by the `fbtrace`
@@ -143,6 +190,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
         ega_text(1, "FAIL: information block too short");
         crate::halt();
     };
+    record_boot_framebuffer(&info);
     // `nofb`: do not touch the framebuffer at all — for a machine run as a
     // headless test target (ryzen's reboot loop, `overlays/ryzen/`).
     let console = if info.cmdline().split_ascii_whitespace().any(|t| t == "nofb") {

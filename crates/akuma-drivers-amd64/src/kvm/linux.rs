@@ -19,7 +19,7 @@
 //!
 //! `VMRUN` saves only RSP/RAX/RIP/RFLAGS of the host; every other GPR is
 //! shared. A test guest that touches two registers can round-trip them by
-//! hand (`kvm::vmrun`); Linux uses all of them, so [`vmrun_regs`] loads the
+//! hand (`switch::run`); Linux uses all of them, so `switch::run_with_regs` loads the
 //! guest's whole register file before `VMRUN` and stores it straight after,
 //! before any Rust runs. The state `VMRUN` does *not* swap (FS/GS/TR/LDTR,
 //! `KernelGsBase`, `STAR`/`LSTAR`/`CSTAR`/`SFMASK`, `SYSENTER_*`) rides
@@ -377,108 +377,8 @@ pub(super) const MSR_PAT: u32 = 0x277;
 pub(super) const MSR_TSC: u32 = 0x10;
 pub(super) const MSR_APIC_BASE: u32 = 0x1B;
 
-/// The guest's general registers: the ones `VMRUN` does not carry (RAX, RSP,
-/// RIP and RFLAGS live in the VMCB). Field order is the asm's offsets.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub(super) struct GuestRegs {
-    pub(super) rbx: u64, // 0x00
-    pub(super) rcx: u64, // 0x08
-    pub(super) rdx: u64, // 0x10
-    pub(super) rsi: u64, // 0x18
-    pub(super) rdi: u64, // 0x20
-    pub(super) rbp: u64, // 0x28
-    pub(super) r8: u64,  // 0x30
-    pub(super) r9: u64,  // 0x38
-    pub(super) r10: u64, // 0x40
-    pub(super) r11: u64, // 0x48
-    pub(super) r12: u64, // 0x50
-    pub(super) r13: u64, // 0x58
-    pub(super) r14: u64, // 0x60
-    pub(super) r15: u64, // 0x68
-}
+pub(super) use akuma_svm_switch_amd64::GuestRegs;
 
-/// Enter the guest once: load its register file, `VMLOAD` its FS/GS/TR/LDTR
-/// and syscall MSRs, `VMRUN`, and on the way out store its registers,
-/// `VMSAVE` its state and `VMLOAD` the host's back.
-///
-/// # Safety
-/// `vmcb_pa` must be the 4 KiB-aligned physical address of a fully initialized
-/// VMCB held alive by the caller; `host_pa` that of a VMCB-format page the
-/// caller has already `VMSAVE`d the host's own FS/GS/TR/LDTR/MSR state into
-/// (it is `VMLOAD`ed after every exit — a stale one points the kernel's `%gs`
-/// at nothing); and the core must have `EFER.SVME` and `VM_HSAVE_PA` set as for
-/// [`super::vmrun`]. Returns with GIF set (`stgi`).
-#[inline(never)]
-pub(super) unsafe fn vmrun_regs(vmcb_pa: u64, host_pa: u64, regs: &mut GuestRegs) {
-    // SAFETY: per the contract above. The stack pushes are balanced (so no
-    // `nostack`); RBX and RBP cannot be operands and are saved by hand; every
-    // other GPR is declared clobbered, which is the shared-register contract;
-    // RSP is the host's again at #VMEXIT, so `[rsp]`/`[rsp+8]` are intact.
-    unsafe {
-        core::arch::asm!(
-            "push rbp",
-            "push rbx",
-            "push rsi",
-            "push rdi",
-            "mov rbx, [rdi + 0x00]",
-            "mov rcx, [rdi + 0x08]",
-            "mov rdx, [rdi + 0x10]",
-            "mov rsi, [rdi + 0x18]",
-            "mov rbp, [rdi + 0x28]",
-            "mov r8,  [rdi + 0x30]",
-            "mov r9,  [rdi + 0x38]",
-            "mov r10, [rdi + 0x40]",
-            "mov r11, [rdi + 0x48]",
-            "mov r12, [rdi + 0x50]",
-            "mov r13, [rdi + 0x58]",
-            "mov r14, [rdi + 0x60]",
-            "mov r15, [rdi + 0x68]",
-            "mov rdi, [rdi + 0x20]",
-            "clgi",
-            "vmload rax",
-            "vmrun rax",
-            "vmsave rax",
-            // RAX is the VMCB PA again (the host's own); the guest's
-            // registers are all still in the file. Spill them.
-            "mov rax, [rsp]",
-            "mov [rax + 0x00], rbx",
-            "mov [rax + 0x08], rcx",
-            "mov [rax + 0x10], rdx",
-            "mov [rax + 0x18], rsi",
-            "mov [rax + 0x20], rdi",
-            "mov [rax + 0x28], rbp",
-            "mov [rax + 0x30], r8",
-            "mov [rax + 0x38], r9",
-            "mov [rax + 0x40], r10",
-            "mov [rax + 0x48], r11",
-            "mov [rax + 0x50], r12",
-            "mov [rax + 0x58], r13",
-            "mov [rax + 0x60], r14",
-            "mov [rax + 0x68], r15",
-            "mov rax, [rsp + 8]",
-            "vmload rax",
-            "stgi",
-            "add rsp, 16",
-            "pop rbx",
-            "pop rbp",
-            inout("rax") vmcb_pa => _,
-            inout("rsi") host_pa => _,
-            inout("rdi") core::ptr::from_mut(regs) => _,
-            lateout("rcx") _,
-            lateout("rdx") _,
-            lateout("r8") _,
-            lateout("r9") _,
-            lateout("r10") _,
-            lateout("r11") _,
-            lateout("r12") _,
-            lateout("r13") _,
-            lateout("r14") _,
-            lateout("r15") _,
-            options()
-        );
-    }
-}
 
 /// Where a guest's RAM came from, so it goes back there.
 enum RamSrc {
@@ -1693,15 +1593,6 @@ fn set_startup_state(v: &mut Vmcb<'_>, vector: u8) {
     v.set_v_intr(ctrl::V_INTR_MASKING);
 }
 
-/// `VMSAVE` the host's own FS/GS/TR/LDTR/syscall-MSR state into the page at `host_pa`, which
-/// `vmrun_regs` loads back after every exit. A service guest does this before every entry:
-/// it yields to other host tasks between entries, and one of them may have moved
-/// `KernelGsBase` or `FS_BASE`, which a stale save would put back.
-pub(super) fn save_host(host_pa: u64) {
-    // SAFETY: `host_pa` is a frame the caller owns, 4-KiB-aligned; VMSAVE writes the 4 KiB
-    // state-save layout into it and nothing else.
-    unsafe { core::arch::asm!("vmsave rax", in("rax") host_pa, options(nostack)) };
-}
 
 fn static_msrpm() -> &'static Msrpm {
     &MSRPM_ALL

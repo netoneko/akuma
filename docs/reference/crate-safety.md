@@ -1,7 +1,15 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-11-11 (late) with `python3 scripts/cloc_akuma.py src crates`:
-**102 of 139 crates** forbid `unsafe`. 110653 of 111814 production lines (99.0%) sit outside any
+**Grade: A** — regenerated 2026-11-11 (night) with `python3 scripts/cloc_akuma.py src crates`:
+**102 of 140 crates** forbid `unsafe`. 110723 of 111886 production lines (99.0%) sit outside any
+`unsafe` block; 363 production sites across `crates/` (442 with tests), 0 inside enforced crates. The
+new crate is `akuma-svm-switch-amd64`, the SVM world switch (`VMRUN`/`VMSAVE`/`VMLOAD`, `EFER.SVME`,
+`VM_HSAVE_PA`; 6 sites). `akuma-drivers-amd64` went 16 -> 7: what remains is entering a guest, whose
+contract (the guest reaches only memory it owns) no type states yet. The framebuffer window's one
+site moved back into `amd64/src/multiboot2.rs` (41 -> 42), and the vCPU box lost its `Box::from_raw`
+([`AKUMA_MULTIARCH_ATTEMPT_0.md`](../archive/AKUMA_MULTIARCH_ATTEMPT_0.md)).
+
+The run before, 2026-11-11 (late): **102 of 139 crates** forbid `unsafe`. 110653 of 111814 production lines (99.0%) sit outside any
 `unsafe` block; 366 production sites across `crates/` (445 with tests), 0 inside enforced crates. The
 15 new production sites are the SVM hypervisor's (`vmrun`, MSRs, the physmap), which moved from
 `amd64/src/kvm*` into `akuma-drivers-amd64` behind its `kvm` feature (`amd64/src` 56 -> 41 in

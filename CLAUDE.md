@@ -283,7 +283,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   own comment listed 44, and a `comm` truncation that could panic the kernel on
   a UTF-8 boundary (`docs/archive/AKUMA_AMD64_STREAMLINING.md` §4b).
   `akuma-svm-amd64` is the **SVM hypervisor's vocabulary and device models** (2026-10-22;
-  `forbid(unsafe_code)`, no dependencies; `amd64/src/kvm*.rs` owns every `unsafe`): the VMCB
+  `forbid(unsafe_code)`, no dependencies; the instructions are `akuma-svm-switch-amd64`'s): the VMCB
   layouts each pinned to its APM table, `cpuid::filter`, NPT encodings, PVH/ELF loading, and the
   pure models a Linux guest — and, since 2026-10-22, **Akuma's own kernel** (`kvmakuma`,
   `docs/archive/AKUMA_KVM_AKUMA_GUEST.md`) — runs on: 8254 `pit`, 8259 `pic`, xAPIC `lapic`
@@ -296,6 +296,14 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   store. **Never set FADT `HW_REDUCED_ACPI`** (Linux then drops the PIC/PIT and the device IRQ
   vanishes) and **no Linux/KVM source may be read** — only the APM, the virtio/ACPI specs and
   datasheets (`docs/reference/subsystems/kvm.md`, `docs/runbooks/kvm-linux-guest.md`).
+  `akuma-svm-switch-amd64` is the **world switch** (2026-11-11): the only crate that executes
+  `VMRUN`/`VMSAVE`/`VMLOAD` or writes `EFER.SVME`/`VM_HSAVE_PA`. `enable` takes a `HostSaveArea`
+  (made only by giving up a `FreshFrame`, consumed, so no page is two cores' save area) and
+  checks CPUID and `VM_CR.SVMDIS` first; `HostState::save` is `VMSAVE` into an owned page. Only
+  `run`/`run_with_regs` stay `unsafe fn`: the guest reaches whatever its VMCB's nested page table
+  and permission maps let it, and guest RAM is carved physical ranges, not an owning type. That
+  is the one kind of `unsafe` left in `akuma-drivers-amd64` (7 call sites, `deny` not `forbid`).
+  **Never open-code an SVM instruction in the wiring.**
   `akuma-vm-spec` is **what a VM is, before anything runs it** (2026-10-22; `forbid(unsafe_code)`,
   no dependencies): the `Spec` (kernel, cmdline, RAM, vCPUs, disk, forwards, backend), its parser and
   `key=value` wire text, Firecracker's field names as aliases, the first-fit `arena` over the

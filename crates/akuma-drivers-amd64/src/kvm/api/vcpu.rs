@@ -18,7 +18,8 @@ use spinning_top::Spinlock;
 
 use super::platform::{Offer, Platform, Source};
 use akuma_kernel_amd64::drivers::services::errno;
-use crate::kvm::linux::{Guest, GuestRegs, INTR0_BASE, get_reg, init_vmcb, save_host, set_reg, vmrun_regs};
+use crate::kvm::linux::{Guest, GuestRegs, INTR0_BASE, get_reg, init_vmcb, set_reg};
+use akuma_svm_switch_amd64::{self as switch, HostState};
 use crate::kvm::{enable_on_core, next_rip};
 use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
 use akuma_kernel_amd64::drivers::services::sched::FxArea;
@@ -98,7 +99,7 @@ enum Pending {
 pub(super) struct Vcpu {
     id: usize,
     vmcb: FreshFrame,
-    host: FreshFrame,
+    host: HostState,
     /// The run mapping's frames (the VMM maps them; the kernel writes exits through the physmap).
     pub(super) run: [FreshFrame; RUN_PAGES],
     regs: GuestRegs,
@@ -123,7 +124,7 @@ fn heap_array<T: Clone, const N: usize>(v: T) -> Option<Box<[T; N]>> {
 impl Vcpu {
     pub(super) fn new(id: usize) -> Option<Self> {
         let mut vmcb = FreshFrame::alloc_zeroed()?;
-        let host = FreshFrame::alloc_zeroed()?;
+        let host = HostState::alloc()?;
         let run = [FreshFrame::alloc_zeroed()?, FreshFrame::alloc_zeroed()?];
         init_vmcb(vmcb.bytes_mut(), Guest::Akuma, 0, id as u32 + 1);
         Some(Self {
@@ -428,8 +429,7 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
     let mem = SlotMem(slots);
     let id = vc.id;
     let nrips = true;
-    let host_pa = vc.host.pa().get();
-    let vmcb_pa = vc.vmcb.pa().get();
+    let vmcb_pa = vc.vmcb.pa();
     let mut first = true;
 
     // Finish what the previous exit left the VMM to do.
@@ -478,13 +478,15 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
         let _ = akuma_kernel_amd64::drivers::services::lapic::arm_oneshot_in_us(wake.saturating_sub(akuma_kernel_amd64::drivers::services::net::uptime_us()));
         akuma_cpu::daif::unmask_irq();
 
-        save_host(host_pa);
+        vc.host.save();
         akuma_kernel_amd64::drivers::services::sched::fpu_save_live(&mut host_fpu);
         akuma_kernel_amd64::drivers::services::sched::fpu_restore_live(&vc.fpu[0]);
-        // SAFETY: the VMCB and host-save frames are live and owned by `vc`; SVM is enabled on this core
-        // (`enable_on_core`) and the thread is pinned to it.
+        // SAFETY: the VMCB is live and owned by `vc`, for a guest built by `init_vmcb`: nested paging over
+        // the memslot table `build_npt` made, whose leaves are the VM's own memslots, with the I/O and MSR
+        // permission maps `init_vmcb` installs. `vc.host` was saved just above, on this core, where
+        // `enable_on_core` succeeded and to which the thread is pinned.
         let unlocked = Unlocked::new();
-        unsafe { vmrun_regs(vmcb_pa, host_pa, &mut vc.regs) };
+        unsafe { switch::run_with_regs(vmcb_pa, &vc.host, &mut vc.regs) };
         drop(unlocked);
         akuma_kernel_amd64::drivers::services::sched::fpu_save_live(&mut vc.fpu[0]);
         host_fpu.sanitize();

@@ -135,11 +135,12 @@ impl Framebuffer {
             blue_pos: fb.format.blue_pos,
             blue_size: fb.format.blue_size,
         };
-        // SAFETY: the firmware's framebuffer, mapped by `boot.s` through the
-        // physmap and checked above to lie entirely below `MAPPED_LIMIT` (the
-        // physmap's own limit); never freed or moved, and 4 KiB-aligned (a
-        // multiboot2 framebuffer address is a BAR).
-        let win = unsafe { MmioWindow::new((PHYSMAP_BASE + fb.addr) as usize, size as usize) };
+        // The machine half maps the framebuffer of this boot, once; the driver cannot
+        // name an address of its own.
+        let win = boot::framebuffer_window()?;
+        if win.len() < size as usize {
+            return None;
+        }
         Some(Self {
             win,
             pitch: fb.pitch as usize,

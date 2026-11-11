@@ -9,9 +9,11 @@
 //! then relocates onto wherever the PMM put a frame — the shape a real
 //! loader stands on. The data side (VMCB vocabulary,
 //! §15.5.1 guest-state validation, NPT encodings) lives in
-//! `akuma-svm-amd64` and is host-tested; this module is only the wiring and
-//! the three `unsafe` sites the CPU actually requires (two MSR writes and the
-//! `vmrun` itself).
+//! `akuma-svm-amd64` and is host-tested; the instructions (`VMRUN`, `VMSAVE`,
+//! `VMLOAD`, the `EFER.SVME`/`VM_HSAVE_PA` writes) are `akuma-svm-switch-amd64`'s;
+//! this module is only the wiring, and its one kind of `unsafe` is entering a
+//! guest ([`switch::run`]), whose contract — the guest reaches only what its
+//! VMCB lets it — only the wiring can discharge.
 //!
 //! Spec-first: no Linux/KVM code was consulted (GPL); every constant traces to
 //! the APM citation recorded in the crate or the milestone doc.
@@ -43,6 +45,8 @@ use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
 use akuma_kernel_amd64::drivers::services::serial;
 use akuma_kernel_amd64::drivers::services::smp;
 use akuma_cpu::msr::{self, Msr};
+use akuma_svm_switch_amd64::{self as switch, HostSaveArea};
+use spinning_top::Spinlock;
 use akuma_svm_amd64 as svm;
 use akuma_vm_spec::Spec;
 use akuma_svm_amd64::{ctrl, intr0, intr1, save, ExitCode, Seg, SegAttr, Vmcb};
@@ -411,11 +415,11 @@ static SVM_WANTED: AtomicBool = AtomicBool::new(false);
 /// `Fn8000_000A.EDX[NRIPS]`, remembered from the probe for [`late`].
 static NRIPS: AtomicBool = AtomicBool::new(false);
 
-/// Per-core host save area physical addresses (§15.30.4: one live,
-/// 4-KiB-aligned page per core, distinct from every VMCB). Reserved by the
-/// BSP at probe time and deliberately leaked — `VM_HSAVE_PA` holds each
-/// for the life of the kernel.
-static HSAVE_PA: [AtomicU64; smp::MAX_CPUS] = [const { AtomicU64::new(0) }; smp::MAX_CPUS];
+/// Per-core host save areas (§15.30.4: one live, 4-KiB-aligned page per core,
+/// distinct from every VMCB), reserved by the BSP at probe time. Each is taken
+/// by its core's [`enable_on_core`] and handed to `VM_HSAVE_PA` for the life of
+/// the kernel.
+static HSAVE: [Spinlock<Option<HostSaveArea>>; smp::MAX_CPUS] = [const { Spinlock::new(None) }; smp::MAX_CPUS];
 
 /// Which cores have `EFER.SVME` set.
 static SVM_ENABLED: [AtomicBool; smp::MAX_CPUS] =
@@ -425,8 +429,8 @@ static SVM_ENABLED: [AtomicBool; smp::MAX_CPUS] =
 /// bring-up. Returns false if the BSP's own frame could not be had.
 fn reserve_hsaves() -> bool {
     let mut bsp = false;
-    for (idx, slot) in HSAVE_PA.iter().enumerate() {
-        if slot.load(Ordering::Relaxed) != 0 {
+    for (idx, slot) in HSAVE.iter().enumerate() {
+        if SVM_ENABLED[idx].load(Ordering::Acquire) || slot.lock().is_some() {
             bsp |= idx == 0;
             continue;
         }
@@ -436,7 +440,7 @@ fn reserve_hsaves() -> bool {
             }
             continue;
         };
-        slot.store(f.publish() as u64, Ordering::Relaxed);
+        *slot.lock() = Some(HostSaveArea::new(f));
         bsp |= idx == 0;
     }
     bsp
@@ -452,19 +456,12 @@ fn enable_on_core(idx: usize) -> bool {
     if enabled.load(Ordering::Relaxed) {
         return true;
     }
-    let hsave = HSAVE_PA[idx].load(Ordering::Relaxed);
-    if hsave == 0 {
+    let Some(area) = HSAVE[idx].lock().take() else {
+        return false;
+    };
+    if switch::enable(area).is_err() {
         return false;
     }
-    // SAFETY: `VM_HSAVE_PA` must hold a live 4-KiB-aligned page distinct
-    // from every VMCB (§15.30.4): this is the frame `reserve_hsaves`
-    // zeroed and leaked, which nothing else maps or frees.
-    unsafe { msr::write(Msr::VmHsavePa, hsave) };
-    // SAFETY: `EFER.SVME` enables `VMRUN` on this core (§15.4). The
-    // read-modify-write preserves what paging and syscall init already set
-    // (LME, LMA, NXE, SCE).
-    let efer = msr::read(Msr::Efer);
-    unsafe { msr::write(Msr::Efer, efer | svm::msr::EFER_SVME) };
     enabled.store(true, Ordering::Release);
     true
 }
@@ -715,7 +712,11 @@ fn trivial_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(7);
-        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa().get(), guest_rcx, guest_rdx, 0) };
+        // SAFETY: `vmcb_f` is this function's own VMCB, alive across the call. The guest is a fixed
+        // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
+        // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
+        // succeeded on this core.
+        let (rcx_out, rdx_out) = unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
         crumb(8);
@@ -979,7 +980,11 @@ fn longmode_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(0x17);
-        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa().get(), guest_rcx, guest_rdx, 0) };
+        // SAFETY: `vmcb_f` is this function's own VMCB, alive across the call. The guest is a fixed
+        // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
+        // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
+        // succeeded on this core.
+        let (rcx_out, rdx_out) = unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
         crumb(0x18);
@@ -1315,7 +1320,11 @@ fn twolvl_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(0x37);
-        let (rcx_out, rdx_out) = unsafe { vmrun(vmcb_f.pa().get(), guest_rcx, guest_rdx, 0) };
+        // SAFETY: `vmcb_f` is this function's own VMCB, alive across the call. The guest is a fixed
+        // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
+        // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
+        // succeeded on this core.
+        let (rcx_out, rdx_out) = unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, 0) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
         crumb(0x38);
@@ -1610,8 +1619,12 @@ fn pvh_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(0x47);
+        // SAFETY: `vmcb_f` is this function's own VMCB, alive across the call. The guest is a fixed
+        // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
+        // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
+        // succeeded on this core.
         let (rcx_out, rdx_out) =
-            unsafe { vmrun(vmcb_f.pa().get(), guest_rcx, guest_rdx, l.start_gpa) };
+            unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, l.start_gpa) };
         guest_rcx = rcx_out;
         guest_rdx = rdx_out;
         crumb(0x48);
@@ -1883,7 +1896,11 @@ fn consistency_ladder() {
         }
 
         crumb(0x22 + i as u8);
-        unsafe { vmrun(vmcb_f.pa().get(), 0, 0, 0) };
+        // SAFETY: `vmcb_f` is this function's own VMCB, alive across the call. The guest is a fixed
+        // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
+        // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
+        // succeeded on this core.
+        let _ = unsafe { switch::run(vmcb_f.pa(), 0, 0, 0) };
         let v = Vmcb::new(vmcb_f.bytes_mut());
         if ExitCode::from_u64(v.exitcode()) == ExitCode::Invalid {
             p("rejected\n");
@@ -1960,62 +1977,6 @@ fn dump_state(v: &Vmcb<'_>) {
     p("\n");
 }
 
-/// `VMRUN` (§15.4): RAX carries the VMCB physical address. RSP, RAX, RIP
-/// and RFLAGS are the host's own again on #VMEXIT (the host save area);
-/// every other GP register is shared with the guest, so the asm declares
-/// them all clobbered, feeds RCX/RDX in as the guest's starting values,
-/// and returns what the guest left in them.
-///
-/// # Safety
-/// `vmcb_pa` must be the 4 KiB-aligned physical address of a fully
-/// initialized VMCB page held alive by the caller, and the core must have
-/// `VM_HSAVE_PA` pointed at a live host save area with `EFER.SVME` set.
-/// Returns with GIF set (`stgi`).
-///
-/// RBX is delivered by hand: LLVM reserves it as an inline-asm operand, so
-/// the value rides in through r15 and the asm pushes the host's RBX, loads
-/// it, and restores it after the exit — the guest entered with EBX set,
-/// which is exactly what the PVH handoff convention demands (start_info's
-/// guest-physical address), and what no earlier phase needed. RBP is
-/// saved and restored by hand around the VMRUN (it is the frame pointer, so
-/// it cannot be an operand): VMRUN does not restore it, and a Linux guest uses
-/// it freely.
-#[inline(never)]
-unsafe fn vmrun(vmcb_pa: u64, guest_rcx: u64, guest_rdx: u64, guest_rbx: u64) -> (u64, u64) {
-    let (rcx, rdx);
-    // SAFETY: per the contract above — VMRUN with RAX = VMCB PA; the host
-    // state it needs (EFER.SVME, VM_HSAVE_PA) is installed by the caller.
-    unsafe {
-        // `stgi` straight after the exit: #VMEXIT leaves GIF clear, and with GIF
-        // clear no interrupt, NMI or SMI reaches the host — the timer goes
-        // silent and the watchdog resets the box (metal, 2026-10-21; the CMOS
-        // breadcrumb read 9 = the guest had finished).
-        core::arch::asm!(
-            "push rbp",
-            "push rbx",
-            "mov rbx, r15",
-            "vmrun rax",
-            "pop rbx",
-            "pop rbp",
-            "stgi",
-            inlateout("rax") vmcb_pa => _,
-            inlateout("rcx") guest_rcx => rcx,
-            inlateout("rdx") guest_rdx => rdx,
-            inlateout("r15") guest_rbx => _,
-            lateout("rsi") _,
-            lateout("rdi") _,
-            lateout("r8") _,
-            lateout("r9") _,
-            lateout("r10") _,
-            lateout("r11") _,
-            lateout("r12") _,
-            lateout("r13") _,
-            lateout("r14") _,
-            options()
-        );
-    }
-    (rcx, rdx)
-}
 
 /// The SVM hypervisor, as the machine half's hypervisor class.
 pub static HYPERVISOR: akuma_kernel_amd64::drivers::Hypervisor = akuma_kernel_amd64::drivers::Hypervisor {

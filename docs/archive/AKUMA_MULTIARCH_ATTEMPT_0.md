@@ -1576,8 +1576,9 @@ completes it. The history was not rewritten. Bisecting across the pair needs bot
 - **Features.** One per driver: `fbcon`, `hda`, `touchpad`. `all` enables all three. On the
   bin, `all-drivers` is in `default`, so the default image is unchanged. Each driver is also a
   bin feature of its own.
-- **`unsafe`.** The crate is `deny(unsafe_code)` with one `allow`, on `fbcon` for its
-  `MmioWindow::new`. That site moved here; it is not new.
+- **`unsafe`.** The crate is `deny(unsafe_code)`. It arrived with one `allow`, on `fbcon` for
+  its `MmioWindow::new`, and took 15 more with `kvm` (16). Now 7, all one kind; see "Shrinking
+  the drivers crate's `unsafe`" below.
 - **Verification.**
   - `hda` was booted under QEMU q35 with `intel-hda`: `[HDA] ready (/dev/dsp)`, and the
     self-test tone played.
@@ -1700,3 +1701,38 @@ That image embeds no guest programs, so stripping them does not change it. Headl
 **Still in the machine half:** `xhci` (keyboard and USB storage), `nvme`/`ramdisk`/`blk` (the
 block class), `fbdev`, `splash`, `input`/`kbd`, `pci`. The reasons are in the first-round list
 above.
+
+## Shrinking the drivers crate's `unsafe` (2026-11-11)
+
+`akuma-drivers-amd64` went from 16 production `unsafe` sites to 7. The question was whether it could
+carry `forbid(unsafe_code)`; the answer is "not yet", and the 7 are the reason.
+
+- **`kvm/api.rs`, the vCPU box (1 -> 0).** `boxed` built a `Box<[T; 1]>` with `Box::from_raw`. It now
+  goes through `Vec::into_boxed_slice().try_into()`, which is the same allocation, safely.
+- **`fbcon`, the framebuffer window (1 -> 0 here, +1 in `amd64/src`).** The `MmioWindow::new` over
+  GRUB's framebuffer moved into the machine half: `multiboot2::framebuffer_window()` records the
+  boot framebuffer's address and length from the boot info, checks it is an RGB framebuffer inside
+  the physmap, and hands the window out **once per boot**. The claim "these bytes are the
+  framebuffer and nobody else maps them" is a fact about the boot, so the boot code makes it. fbcon
+  now has no `allow`.
+- **SVM (13 -> 7): `akuma-svm-switch-amd64`.** A new leaf crate, the only one that executes `VMRUN`,
+  `VMSAVE`, `VMLOAD` or writes `EFER.SVME`/`VM_HSAVE_PA` (6 sites, budget 0 -> 6).
+  - `enable(HostSaveArea)` is safe. A `HostSaveArea` is made only by giving up a `FreshFrame` and is
+    consumed by `enable`, so one page is never two cores' save area. `enable` checks CPUID and
+    `VM_CR.SVMDIS` before touching either MSR. The per-core reserve became
+    `[Spinlock<Option<HostSaveArea>>; MAX_CPUS]`.
+  - `HostState::save` is safe: `VMSAVE` into a page the value owns alone.
+  - `run`/`run_with_regs` stay `unsafe fn`, and their 7 call sites in the wiring are what is left.
+    The obligation is that the guest reaches only what it owns. That is a property of the VMCB's
+    nested page table and permission maps. The wiring's guest RAM is physical ranges carved from the
+    `kvmmem=` reserve (or a contiguous PMM run) and tracked by arena offset, not by an owning type,
+    so no type can state it. Closing it means a guest-memory type that owns the carved range, an
+    `Npt` built only from such types inside the leaf, and a check at `run` that the VMCB has nested
+    paging on with `nCR3` at that `Npt`. That is a rewrite of `Ram`, the memslot table and both
+    `build_npt`s, and it can only be verified on SVM hardware.
+- **Budget.** Drivers 16 -> 7, leaf 0 -> 6, `amd64/src` 41 -> 42: 405 in total (from 407).
+- **Verification.** Clippy is clean on the default, `no-tests`, `ring0-preempt`, `headless` and
+  `headless,no-tests` images; the amd64 TCG boot suite passes: default and headless, SMP=1 829/0 and SMP=2 839/0. **The SVM path is
+  compile-verified only**: TCG boots PVH with no guest, the trashcan has no SVM, and rig kernels do
+  not go on the ryzen metal. The asm is byte-for-byte the old asm with the operands renamed.
+

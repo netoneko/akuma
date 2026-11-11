@@ -5,7 +5,7 @@
     "crates/akuma-boot-aarch64": 1,
     "crates/akuma-boot-amd64": 15,
     "crates/akuma-cpu": 10,
-    "crates/akuma-drivers-amd64": 21,
+    "crates/akuma-drivers-amd64": 17,
     "crates/akuma-elf": 11,
     "crates/akuma-elf-exec": 3,
     "crates/akuma-entry": 4,

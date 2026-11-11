@@ -46,6 +46,8 @@ use super::*;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use spinning_top::Spinlock;
+use akuma_primitives::addr::PhysAddr;
+use akuma_svm_switch_amd64::{self as switch, HostState};
 
 /// Longest the owner sleeps with nothing to do and no relayed connection: bounds the latency of
 /// a new connection (the relay's `accept` runs from this loop) and of a lease check.
@@ -348,7 +350,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
     let members = || (0..MAX_VCPUS).filter(move |&j| group & (1 << j) != 0 && j < sh.n_cpu);
     let first_member = members().next().unwrap_or(0);
 
-    let Some(mut host_f) = FreshFrame::alloc_zeroed() else {
+    let Some(mut host) = HostState::alloc() else {
         sh.request_stop("no frame for the host save area", true);
         return;
     };
@@ -357,10 +359,8 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
         return;
     }
     // The host's FS/GS/TR/LDTR/syscall-MSR state, parked in a VMCB-format page that
-    // `vmrun_regs` loads back after every exit.
-    let host_pa = host_f.pa().get();
-    let _ = host_f.bytes_mut();
-    save_host(host_pa);
+    // `switch::run_with_regs` loads back after every exit.
+    host.save();
 
     let mut vmcbs = [const { None::<FreshFrame> }; MAX_VCPUS];
     for j in members() {
@@ -610,7 +610,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
         }
         crumb(0x57);
         if service {
-            save_host(host_pa);
+            host.save();
         }
         // A service guest runs with the BKL released: on a many-core host the network and wifi
         // tasks (and every syscall) wait on it, and a guest entry can last a whole quantum. The
@@ -621,9 +621,11 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
             akuma_bkl::bkl::dropped_window_open();
         }
         let guest_t0 = akuma_cpu::tsc::rdtsc();
-        // SAFETY: the VMCB and the host save image are live frames this function owns; SVM is
-        // enabled on this core (`enable_on_core`).
-        unsafe { vmrun_regs(vmcb_of_pa(&vmcbs, i), host_pa, &mut regs_all[i]) };
+        // SAFETY: the VMCB is a live frame this function owns, for a guest built by `init_vmcb`:
+        // nested paging over `build_npt`'s table, which maps only this machine's own RAM, with the
+        // I/O and MSR permission maps `init_vmcb` installs.
+        // `host` was saved on this core, where `enable_on_core` succeeded.
+        unsafe { switch::run_with_regs(vmcb_of_pa(&vmcbs, i), &host, &mut regs_all[i]) };
         acct.guest += akuma_cpu::tsc::rdtsc().wrapping_sub(guest_t0);
         if service {
             akuma_bkl::bkl::dropped_window_close();
@@ -957,8 +959,8 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
 }
 
 /// A VMCB frame's physical address.
-fn vmcb_of_pa(frames: &[Option<FreshFrame>; MAX_VCPUS], cpu: usize) -> u64 {
-    frames[cpu].as_ref().expect("a VMCB is allocated for every virtual processor").pa().get()
+fn vmcb_of_pa(frames: &[Option<FreshFrame>; MAX_VCPUS], cpu: usize) -> PhysAddr {
+    frames[cpu].as_ref().expect("a VMCB is allocated for every virtual processor").pa()
 }
 
 /// The `late()`/service entry: set a guest up, run it on its placed cores and report.

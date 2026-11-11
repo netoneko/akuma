@@ -18,14 +18,14 @@
 
 #![no_std]
 #![cfg(all(target_arch = "x86_64", target_os = "none"))]
-// `deny`, not `forbid`: the framebuffer console maps its framebuffer once
-// (`MmioWindow::new`), and that one site is allowed on its module.
+// `deny`, not `forbid`: `kvm` enters guests through `akuma_svm_switch_amd64::run`, an
+// `unsafe fn` whose contract (the guest reaches only memory it owns) no type states yet; the
+// `allow` is on that module only.
 #![deny(unsafe_code)]
 
 extern crate alloc;
 
 #[cfg(feature = "fbcon")]
-#[allow(unsafe_code)]
 mod fbcon;
 
 #[cfg(feature = "hda")]

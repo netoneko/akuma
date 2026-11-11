@@ -1,0 +1,15 @@
+[package]
+name = "akuma-svm-switch-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The AMD SVM world switch: the only crate that executes VMRUN, VMSAVE, VMLOAD and the EFER.SVME / VM_HSAVE_PA writes, behind owned types (a per-core host save area, a host state page) and one stated contract for entering a guest"
+
+[lints]
+workspace = true
+
+# Kernel-only: every item is an x86-64 instruction that only exists in ring 0. On any other
+# target the crate is empty (the `akuma-drivers-amd64` precedent).
+[target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-phys = { path = "../akuma-phys" }
+akuma-primitives = { path = "../akuma-primitives" }

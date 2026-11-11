@@ -548,7 +548,7 @@ pub mod services {
     }
     /// The EGA text line, the output of last resort before any console exists.
     pub mod boot {
-        pub use crate::multiboot2::ega_text;
+        pub use crate::multiboot2::{ega_text, framebuffer_window};
     }
     /// `/dev/fb0`'s registration (the display driver offers its framebuffer there).
     pub mod fbdev {

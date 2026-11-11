@@ -207,6 +207,7 @@ dependencies = [
  "akuma-rtw89",
  "akuma-ryzen-amd64",
  "akuma-svm-amd64",
+ "akuma-svm-switch-amd64",
  "akuma-syscalls-glue",
  "akuma-threading",
  "akuma-touchpad",
@@ -989,6 +990,15 @@ version = "0.1.0"
 dependencies = [
  "akuma-ryzen-amd64",
  "smoltcp",
+]
+
+[[package]]
+name = "akuma-svm-switch-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-phys",
+ "akuma-primitives",
 ]
 
 [[package]]

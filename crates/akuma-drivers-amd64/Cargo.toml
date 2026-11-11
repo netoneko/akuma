@@ -36,7 +36,7 @@ wifi = [
 # tap behind its gateway (`docs/reference/subsystems/kvm.md`). AMD only; off, none of the
 # three nodes opens, as on a CPU without SVM.
 kvm = [
-    "dep:akuma-svm-amd64", "dep:akuma-vm-spec", "dep:akuma-kvm-abi", "dep:akuma-affinity",
+    "dep:akuma-svm-amd64", "dep:akuma-svm-switch-amd64", "dep:akuma-vm-spec", "dep:akuma-kvm-abi", "dep:akuma-affinity",
     "dep:akuma-bkl", "dep:akuma-cpu", "dep:akuma-dmesg", "dep:akuma-exec", "dep:akuma-exec-core",
     "dep:akuma-mmu", "dep:akuma-net", "dep:akuma-pmm", "dep:akuma-primitives",
     "dep:akuma-syscalls-glue", "dep:akuma-threading", "dep:akuma-vfs-glue", "dep:akuma-virtio",
@@ -76,6 +76,7 @@ akuma-pmm = { path = "../akuma-pmm", optional = true }
 akuma-rtw89 = { path = "../akuma-rtw89", optional = true }
 akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64", optional = true }
 akuma-svm-amd64 = { path = "../akuma-svm-amd64", optional = true }
+akuma-svm-switch-amd64 = { path = "../akuma-svm-switch-amd64", optional = true }
 akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, features = ["smoltcp", "exec", "akuma-native", "bkl-smp"], optional = true }
 akuma-threading = { path = "../akuma-threading", optional = true }
 akuma-touchpad = { path = "../akuma-touchpad", optional = true }

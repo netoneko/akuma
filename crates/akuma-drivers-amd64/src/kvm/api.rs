@@ -83,7 +83,8 @@ struct Vm {
     pit: bool,
     tss: u64,
     /// The vCPUs; `None` while one is inside `RUN` (its thread owns it) or not yet created.
-    vcpus: [Option<Box<Vcpu>>; MAX_VCPUS],
+    /// A one-element array rather than `Box<Vcpu>`: [`boxed`] makes it fallibly without a cast.
+    vcpus: [Option<Box<[Vcpu; 1]>>; MAX_VCPUS],
     created: [bool; MAX_VCPUS],
     /// Host-physical addresses of each vCPU's run frames, for `mmap`.
     run_pas: [[usize; vcpu::RUN_PAGES]; MAX_VCPUS],
@@ -385,7 +386,7 @@ fn create_vcpu(id: u64) -> u64 {
         return r;
     }
     let Some(vc) = Vcpu::new(id).and_then(boxed) else { return errno::ENOMEM };
-    let pas = [vc.run[0].pa().as_usize(), vc.run[1].pa().as_usize()];
+    let pas = [vc[0].run[0].pa().as_usize(), vc[0].run[1].pa().as_usize()];
     let r = with_vm(|v| {
         v.created[id] = true;
         v.run_pas[id] = pas;
@@ -399,14 +400,13 @@ fn create_vcpu(id: u64) -> u64 {
 }
 
 /// One fallible heap allocation holding `v` (the vCPU is kept off the kernel stack: 32 KiB is all there is).
-fn boxed<T>(v: T) -> Option<Box<T>> {
+/// The result stays a one-element array: turning it into `Box<T>` is a pointer cast, and
+/// indexing `[0]` costs nothing.
+fn boxed<T>(v: T) -> Option<Box<[T; 1]>> {
     let mut one = alloc::vec::Vec::new();
     one.try_reserve_exact(1).ok()?;
     one.push(v);
-    let b: Box<[T; 1]> = one.into_boxed_slice().try_into().ok()?;
-    let ptr = Box::into_raw(b).cast::<T>();
-    // SAFETY: `[T; 1]` and `T` have the same layout, and the allocation is the one `Vec` made for one `T`.
-    Some(unsafe { Box::from_raw(ptr) })
+    one.into_boxed_slice().try_into().ok()
 }
 
 /// Run `f` on vCPU `id` if it is here (not running on another thread).
@@ -416,7 +416,7 @@ fn with_vcpu(id: u8, f: impl FnOnce(&mut Vcpu, &mut Platform) -> u64) -> u64 {
         let mut plat = PLAT.lock();
         let (Some(v), Some(p)) = (vm.as_mut(), plat.as_mut()) else { return errno::EINVAL };
         match v.vcpus[id as usize].as_mut() {
-            Some(vc) => f(vc, p),
+            Some(vc) => f(&mut vc[0], p),
             None => errno::EBUSY,
         }
     })
@@ -436,7 +436,7 @@ fn run_vcpu(id: u8) -> u64 {
         }
         let npt_pa = v.npt.as_ref()?.pml4.pa().get();
         let mut vc = v.vcpus[id as usize].take()?;
-        vc.refresh_events(&v.ioeventfds, &v.irqfds);
+        vc[0].refresh_events(&v.ioeventfds, &v.irqfds);
         Some((vc, v.slots, npt_pa))
     });
     let Some((mut vc, slots, npt_pa)) = taken else { return errno::EBUSY };
@@ -448,7 +448,7 @@ fn run_vcpu(id: u8) -> u64 {
         });
         return errno::EINVAL;
     }
-    let r = vcpu::run(&mut vc, &PLAT, &slots, npt_pa);
+    let r = vcpu::run(&mut vc[0], &PLAT, &slots, npt_pa);
     irq_off(|| {
         if let Some(v) = VM.lock().as_mut() {
             v.vcpus[id as usize] = Some(vc);
