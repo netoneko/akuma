@@ -673,24 +673,16 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             // discipline as the `File` arm above, since it's the same
             // underlying disk I/O `akuma_vfs_glue::ext2` drives.
             let _vfs_bkl = VfsBklGuard::new();
-            let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
-            if pos >= capacity {
-                0 // EOF: dd reading past the end of the device
-            } else {
-                let to_read = count.min((capacity - pos) as usize).min(64 * 1024);
-                let mut temp = alloc::vec![0u8; to_read];
-                match akuma_virtio::block::read_bytes_at(idx as usize, pos, &mut temp) {
-                    Ok(()) => {
-                        if copy_to_user(buf_ptr, &temp).is_err() {
-                            return EFAULT;
-                        }
-                        if let Some(proc) = akuma_exec::process::current_process_shared() {
-                            proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::BlockDev { pos, .. } = entry { *pos += to_read as u64; });
-                        }
-                        to_read as u64
+            match blockdev_read_at(idx, pos, buf_ptr, count) {
+                Ok(n) => {
+                    if n > 0
+                        && let Some(proc) = akuma_exec::process::current_process_shared()
+                    {
+                        proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::BlockDev { pos, .. } = entry { *pos += n as u64; });
                     }
-                    Err(_) => EIO,
+                    n as u64
                 }
+                Err(e) => e,
             }
         }
         #[cfg(feature = "smoltcp")]
@@ -1050,11 +1042,44 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
         }
         akuma_exec::process::FileDescriptor::TimerFd(_) => EAGAIN,
         akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
-        // A block device has a position and Linux serves `pread` on one; this
-        // arm does not, and `ESPIPE` would tell the caller it is a stream.
-        akuma_exec::process::FileDescriptor::BlockDev { .. } => EBADF,
+        // At `offset`, leaving the descriptor's position alone, as `read` would
+        // read at it.
+        akuma_exec::process::FileDescriptor::BlockDev { idx, .. } => {
+            let _vfs_bkl = VfsBklGuard::new();
+            blockdev_read_at(idx, offset as u64, buf_ptr, count).map_or_else(|e| e, |n| n as u64)
+        }
         _ => ESPIPE
     }
+}
+
+/// Up to 64 KiB of block device `idx` from byte `pos` into user memory; `Ok(0)` at
+/// or past its end (`dd` reading off the end). The caller holds the VFS BKL: this
+/// is the disk I/O `akuma_vfs_glue::ext2` drives (`docs/archive/RAW_BLOCK_DEVICE_FD.md`).
+/// The bounce buffer is allocated fallibly (`ENOMEM`).
+fn blockdev_read_at(idx: u32, pos: u64, buf_ptr: u64, count: usize) -> Result<usize, u64> {
+    let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
+    if pos >= capacity {
+        return Ok(0);
+    }
+    let to_read = count.min(usize::try_from(capacity - pos).unwrap_or(usize::MAX)).min(64 * 1024);
+    let mut temp = alloc::vec::Vec::new();
+    temp.try_reserve_exact(to_read).map_err(|_| ENOMEM)?;
+    temp.resize(to_read, 0u8);
+    akuma_virtio::block::read_bytes_at(idx as usize, pos, &mut temp).map_err(|_| EIO)?;
+    copy_to_user(buf_ptr, &temp).map_err(|_| EFAULT)?;
+    Ok(to_read)
+}
+
+/// `data` onto block device `idx` at byte `pos`, cut short at its end; `ENOSPC` at
+/// or past it. The caller holds the VFS BKL, as for [`blockdev_read_at`].
+fn blockdev_write_at(idx: u32, pos: u64, data: &[u8]) -> Result<usize, u64> {
+    let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
+    if pos >= capacity {
+        return Err(ENOSPC);
+    }
+    let clamped = data.len().min(usize::try_from(capacity - pos).unwrap_or(usize::MAX));
+    akuma_virtio::block::write_bytes_at(idx as usize, pos, &data[..clamped]).map_err(|_| EIO)?;
+    Ok(clamped)
 }
 
 /// `pwrite64(fd, buf, count, offset)`: the refusals of [`sys_pread64`], for writing.
@@ -1084,8 +1109,23 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
             }
         }
         akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom | akuma_exec::process::FileDescriptor::DevZero => count as u64,
-        // See `sys_pread64`.
-        akuma_exec::process::FileDescriptor::BlockDev { .. } => EBADF,
+        // At `offset`, position untouched; at most 64 KiB, a short write like `read`'s.
+        akuma_exec::process::FileDescriptor::BlockDev { idx, writable, .. } => {
+            if !writable {
+                return EBADF;
+            }
+            let _vfs_bkl = VfsBklGuard::new();
+            let len = count.min(64 * 1024);
+            let mut buf = alloc::vec::Vec::new();
+            if buf.try_reserve_exact(len).is_err() {
+                return ENOMEM;
+            }
+            buf.resize(len, 0u8);
+            if copy_from_user(&mut buf, buf_ptr).is_err() {
+                return EFAULT;
+            }
+            blockdev_write_at(idx, offset as u64, &buf).map_or_else(|e| e, |n| n as u64)
+        }
         _ => ESPIPE
     }
 }
@@ -1332,16 +1372,13 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     if total_written > 0 { return total_written as u64; }
                     return EBADF;
                 }
-                let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
-                if write_pos as u64 >= capacity {
-                    if total_written > 0 { return total_written as u64; }
-                    return ENOSPC;
-                }
-                let clamped = this_chunk.min((capacity - write_pos as u64) as usize);
-                if akuma_virtio::block::write_bytes_at(idx as usize, write_pos as u64, &buf_slice[..clamped]).is_err() {
-                    if total_written > 0 { return total_written as u64; }
-                    return EIO;
-                }
+                let clamped = match blockdev_write_at(idx, write_pos as u64, &buf_slice[..this_chunk]) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        if total_written > 0 { return total_written as u64; }
+                        return e;
+                    }
+                };
                 write_pos += clamped;
                 let new_pos = write_pos as u64;
                 if let Some(proc) = akuma_exec::process::current_process_shared() {

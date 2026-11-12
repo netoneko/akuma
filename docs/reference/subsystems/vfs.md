@@ -189,7 +189,9 @@ Details that bite:
 - **`open()` on `vda`..`vdd` returns a working raw block fd**
   (`FileDescriptor::BlockDev { idx, pos, writable }`,
   [`../../archive/RAW_BLOCK_DEVICE_FD.md`](../../archive/RAW_BLOCK_DEVICE_FD.md),
-  implemented 2026-08-25) — `read`/`write`/`lseek`/`fstat` all work, backed by
+  implemented 2026-08-25) — `read`/`write`/`pread64`/`pwrite64`/`lseek`/`fstat`
+  all work (`pread64`/`pwrite64` at their offset, the position untouched, up to
+  64 KiB a call), backed by
   the block driver's byte-granular `read_bytes_at`/`write_bytes_at`
   (`crates/akuma-virtio/src/block.rs`), so no sector-alignment burden lands on
   the syscall layer. **Write-open of a *mounted* device is refused with

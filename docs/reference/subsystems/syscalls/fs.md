@@ -152,7 +152,9 @@ For a real path:
 - `pread64`/`pwrite64` on a descriptor with no file position (pipe, socket, terminal,
   eventfd, pidfd, a kernel's own character device) is `ESPIPE`, never `EBADF`: musl's
   `FILE` layer falls back to `read()` on `ESPIPE` and gives up on `EBADF`. A `BlockDev`
-  stays `EBADF`, since it has a position and the arm does not serve it.
+  has a position and is served, through the same `blockdev_read_at`/`blockdev_write_at`
+  as `read`/`write`: at the offset, the position untouched, at most 64 KiB a call, `0`
+  past the end for a read and `ENOSPC` for a write; `pwrite64` on a read-only open is `EBADF`.
 
 ## `read` / `pread64` — bound to an inode, not to a name
 

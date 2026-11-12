@@ -2340,7 +2340,7 @@ Gates:
 - `dup3` replacing a device descriptor still does not release the device (step 2).
 - `pread` on a `TimerFd` answers `EAGAIN` and on an `EpollFd` `EINVAL`, where Linux's `ESPIPE`
   check comes first.
-- `pread` on a `BlockDev` is `EBADF`.
+- `pread` on a `BlockDev` is `EBADF` (served since 2026-11-12, "Block devices serve `pread`/`pwrite`").
 
 **Step 4 (2026-11-12): the fd legacy spellings are folds, and fold into the shared arm.** On amd64
 `open` (2), `stat` (4), `lstat` (6) and `pipe` (22) called `crate::fd` directly, a second entry into
@@ -2600,6 +2600,7 @@ is 500. The `vda_*` rows (Akuma only) agree across the two kernels: read-only op
 read, ext2 magic `0xef53`, write-open `EBUSY`. `fdrefuse` is unchanged and identical.
 
 **Still pinned:** `pread` on a raw block descriptor is `EBADF` (the probe uses `lseek`+`read`).
+Served since 2026-11-12, below.
 
 Gates: amd64 TCG boot suite 829/839/839 at SMP 1/2/4, 0 failed (+6 checks: the `/dev/vda` read
 path, the write-open `EBUSY`, the empty path); AArch64 HVF suite 312/320/318 with the 3 known
@@ -2806,6 +2807,21 @@ lines) with `syscall_errno_compliance PASSED`; clippy on AArch64, the amd64 `hea
 The `init=` change above passed the same gates after it was committed: amd64 831/841/841, ring-3
 OK, AArch64 312/320/318, host tests.
 
+### Block devices serve `pread`/`pwrite` (2026-11-12)
+
+glue's `read`/`write` served a raw block descriptor and its `pread64`/`pwrite64` answered `EBADF`
+(Linux serves both). The positional halves are now `blockdev_read_at`/`blockdev_write_at`, used by all
+four: at most 64 KiB a call, `0` past the end for a read, `ENOSPC` for a write, and the bounce buffers
+are allocated fallibly (`ENOMEM`). `pwrite64` on a read-only open is `EBADF`, as `write` already was.
+
+Checked with a static musl probe on both kernels (`/dev/vda`, mounted, so it opens read-only):
+`pread` at 4096 matches `lseek`+`read` there, the position stays at 512, `pread` past the end is 0,
+and `pwrite` is `EBADF`. On AArch64 with a scratch `DISK2` (`/dev/vdb`, writable): `pwrite` of 512
+bytes at an unaligned 8199 reads back through both `pread` and `lseek`+`read`.
+
+Gates: amd64 suite 831/841/841, ring-3 OK; AArch64 312/320/318 (the known `SPAWN FAILED` lines);
+clippy on AArch64 and amd64 `headless`.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral
@@ -2816,6 +2832,14 @@ second shape, so routing amd64's `mmap` to it would hand its fault path regions 
 `brk` depends on which fault path knows the heap. Converging is one region model and one fault path.
 That touches AArch64's self-host and CoW fault path, so it gets a design doc first; the threads
 slice went ahead of it.
+
+*Correction, 2026-11-12:* the design doc is
+[`proposals/AKUMA_MM_CONVERGENCE.md`](../../proposals/AKUMA_MM_CONVERGENCE.md), and all seven of its
+steps landed on this branch the same day. There is one region model (lazy regions joined
+`mmap_regions`). `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `msync` and `brk` are glue's on
+both kernels, and the shared writable page table is one. What `amd64/src/mm.rs` still holds is the
+machine half the proposal keeps per architecture: the page-fault fill (`fault_in`), I-cache and PTE
+encoding, and device mappings. Merging the two fault fills is out of that proposal's scope.
 
 ### Slice 6: threads (2026-11-11)
 
