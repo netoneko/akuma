@@ -258,6 +258,33 @@ pub fn spawn_process_with_creds(
     pty: bool,
     creds: Option<super::Creds>,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
+    spawn_process_named(path, None, false, args, env, stdin, cwd, box_id, pty, creds)
+}
+
+#[cfg(feature = "elf-loader")]
+/// [`spawn_process_with_creds`] with the child's `argv[0]` chosen by the
+/// caller, as `execve` and `posix_spawn` do; `None` names it by `path`. A
+/// multi-call binary dispatches on it (`/bin/busybox` as `ls`). A `#!` script
+/// replaces it with the interpreter, as Linux does.
+///
+/// `own_terminal` gives the child a fresh `TerminalState` even where
+/// [`spawn_inherits_terminal`] would share the caller's: amd64's `spawn` always
+/// has (a session's window size must land on the child, and a multiplexing
+/// `sshd`'s non-pty sessions must not share one waker slot); AArch64 passes
+/// `false`.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_process_named(
+    path: &str,
+    argv0: Option<&str>,
+    own_terminal: bool,
+    args: Option<&[&str]>,
+    env: Option<&[String]>,
+    stdin: Option<&[u8]>,
+    cwd: Option<&str>,
+    box_id: u64,
+    pty: bool,
+    creds: Option<super::Creds>,
+) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
     // NOTE: the LifecycleGuard is acquired at the PUBLISH point (just before
     // `register_process`, below), NOT here. The whole load phase above it — path/
     // namespace resolution, stat, the ELF read from ext2 — does block I/O and
@@ -305,7 +332,7 @@ pub fn spawn_process_with_creds(
 
     let mut full_args = Vec::new();
     if shebang_prefix.is_empty() {
-        full_args.push(path.to_string());
+        full_args.push(argv0.unwrap_or(path).to_string());
     } else {
         full_args.extend_from_slice(&shebang_prefix);
     }
@@ -468,7 +495,7 @@ pub fn spawn_process_with_creds(
     // `Process::new` already gives every process its own fresh
     // `TerminalState` (`process/mod.rs`), so either condition just keeps
     // that instead of overwriting it.
-    if spawn_inherits_terminal(pty, box_id) && let Some(shared_state) = current_terminal_state() {
+    if !own_terminal && spawn_inherits_terminal(pty, box_id) && let Some(shared_state) = current_terminal_state() {
         if config().syscall_debug_info_enabled {
             log::debug!("[Process] Inheriting shared terminal state at {:p} for PID {}", Arc::as_ptr(&shared_state), process.pid);
         }

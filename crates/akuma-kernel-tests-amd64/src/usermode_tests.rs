@@ -343,7 +343,18 @@ pub fn spawn_test(t: &mut Suite) {
     // fd 2 is `Stderr` and not a second name for fd 1: they are distinct
     // descriptors onto one channel, so a `dup2(file, 1)` leaves stderr on the
     // session exactly as the two-names-on-one-pipe arrangement did.
-    {
+    //
+    // **Unless the child has already exited.** A spawn's thread is runnable on
+    // any core the moment `sys_spawn` returns, and `hello` is short: at SMP=4 it
+    // can run to `exit_group` — whose first act is `close_all` — before this
+    // reads its table. The table is populated when the `Process` is built, so
+    // a live child never shows it empty; empty means swept, and the stdout and
+    // exit-status checks below still prove the child ran on its channel.
+    let swept = akuma_exec::process::with_process(pid, |p| p.fds.table.lock().is_empty())
+        .unwrap_or(true);
+    if swept {
+        t.note("spawn: child exited before its fd table was read; stdio checks skipped", 0);
+    } else {
         use akuma_exec::process::FileDescriptor;
         let stdio = akuma_exec::process::with_process(pid, |p| {
             let t = p.fds.table.lock();
@@ -470,9 +481,21 @@ pub fn spawn_stale_group_state_test(t: &mut Suite) {
     }
     let pid = (r & 0xFFFF_FFFF) as u32;
     let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
+    // The row is bound on the child's own thread as it first runs
+    // (`ExecRuntime::bind_child_task`, which also clears the stale group state
+    // before the child's first instruction), so it can appear after `sys_spawn`
+    // has returned.
+    let mut row = None;
+    for _ in 0..100_000u32 {
+        row = spawn_row_of(pid);
+        if row.is_some() {
+            break;
+        }
+        k::sched::yield_now();
+    }
     t.check_eq(
         "stale group: the child took the poisoned slot",
-        spawn_row_of(pid).map_or(u64::MAX, |off| (off + SPAWN_SLOT_BASE) as u64),
+        row.map_or(u64::MAX, |off| (off + SPAWN_SLOT_BASE) as u64),
         next as u64,
     );
     k::fd::sys_fcntl(stdout_fd, 4, 0x800);

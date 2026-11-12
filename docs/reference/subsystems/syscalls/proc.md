@@ -105,7 +105,10 @@ PID + open fds; strips O_CLOEXEC fds); not spawn-as-exec.
   an `akuma_syscalls_proc::exec::Budget` — `MAX_ARG_STRLEN` per string, argv
   *and* envp; NULL/empty argv becomes `[path]`.
   Akuma's `spawn` (301) reads its arguments through the same function on both
-  kernels.
+  kernels, and both make the child through glue's `spawn_request`
+  (`akuma_exec::process::spawn_process_named`). The exception is amd64's
+  `SPAWN_FLAG_CONSOLE`, whose stdio is the console. amd64 passes
+  `own_terminal = true`, so every 301 child gets its own `TerminalState`.
 - `run` (shared): execute permission on the symlink-resolved path, the
   `ETXTBSY` pin, the `#!` hop, `ExecArch::{read, load}`, then — past the point
   of no return — `stop_siblings`, the `MAP_SHARED` write-back, and inside

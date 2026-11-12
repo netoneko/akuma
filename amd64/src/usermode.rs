@@ -3754,6 +3754,28 @@ pub fn sys_spawn(
         Ok(r) => r,
         Err(r) => return r,
     };
+    // A child that writes its own channel — every spawn but the console's — is
+    // made by the shared spawn (`akuma-exec`, through glue's `spawn_request`),
+    // as on the AArch64 kernel and as `spawn_ext` already was here.
+    if !console {
+        let seed = if stdin_ptr != 0 && stdin_len != 0 {
+            crate::fd::copy_in(stdin_ptr, stdin_len.min(64 * 1024))
+        } else {
+            None
+        };
+        let pid = match akuma_syscalls_glue::proc::spawn_request(req, seed.as_deref(), pty, true) {
+            Ok(pid) => pid,
+            Err(e) => return e,
+        };
+        let stdout_fd = crate::fd::install_child_stdout(pid);
+        if crate::fd::errno::is_err(stdout_fd) {
+            return errno::EMFILE;
+        }
+        return u64::from(pid) | (stdout_fd << 32);
+    }
+
+    // `SPAWN_FLAG_CONSOLE`: the console's own shell, loaded and registered here
+    // (its stdio is the console, which the shared spawn has no notion of).
     let (path, argv_owned, envp_owned) = (req.path, req.argv, req.envp);
     let path = path.as_str();
     let head = match crate::fs::read_image_head(path) {
@@ -3795,61 +3817,13 @@ pub fn sys_spawn(
 
     let root = child.space.ttbr0();
 
-    // **The session channel — this child's whole stdio, and nothing else.**
-    //
-    // One `ProcessChannel` serving all three jobs, which is verbatim what an
-    // AArch64 spawn does (`akuma_exec::process::spawn_process_with_channel_ext`
-    // plus glue's `sys_spawn`): the child's I/O (`Process::channel`, below), its
-    // exit status (`register_channel(task_slot, ..)`), and the caller's handle
-    // on it (`register_child_channel` + the `ChildStdout(pid)` descriptor
-    // returned at the bottom).
-    //
-    // Until 2026-09-11 this was **two pipes** — `bind_stdio` put the stdin
-    // pipe's read end at fd 0 and the stdout pipe's write end at fd 1 and 2, and
-    // the caller got a `PipeRead` on the other end. That was a second
-    // implementation of session stdio, living beside the shared one because
-    // `sys_spawn` here predates it, and it is what kept an `ssh` session's shell
-    // from having a line discipline at all: glue's `Stdin` read arm serves
-    // cooked input and writes its **echo** to this channel's *stdout* FIFO, so a
-    // session split across a channel and a pipe has its echo land where nothing
-    // reads. There is no drain to add — there is a parallel implementation to
-    // delete, which is what this is.
-    //
-    // **Except for a console child, which has none** — `channel` is `None` and
-    // `register_exec_process` reads that, together with fd 0 being `Stdin`, as
-    // "this is the console's process" and hands it `console::channel()` and the
-    // shared `TerminalState`. The exit channel it registers for `wait4` is then
-    // a fresh one that nothing writes to, so the `ChildStdout` the caller gets
-    // back reads EOF at exit and nothing before it — the right shape for a
-    // supervisor, whose child's output is on the screen, not in a pipe.
-    let channel = (!console).then(|| {
-        let ch = alloc::sync::Arc::new(akuma_exec::process::ProcessChannel::new());
-        // `is_terminal()` is what glue's `Stdin` arm selects cooked input on, what
-        // gates `/dev/tty`, and what `write_to_process_stdin`'s ISIG branch reads —
-        // so `SPAWN_FLAG_PTY` decides whether `^C` is a signal or a byte. A plain
-        // `spawn` (herd's services, the boot suite's `run_sh_capture`) is a pipe and
-        // must not have its stream cooked.
-        ch.set_terminal(pty);
-        ch
-    });
-
-    // Seed the child's stdin, if the caller supplied any (`spawn_with_stdin`).
-    //
-    // **Closed straight after**, as the AArch64 spawn does: a seed is the whole
-    // input, and a child that reads past it must see EOF rather than block on a
-    // writer that will never come. `sshd` passes no seed for either an
-    // interactive shell or an `exec` channel — it feeds them through
-    // `/proc/<pid>/fd/0` and ends them with `close_child_stdin` — so this is the
-    // in-kernel callers' path only.
-    if let Some(channel) = &channel
-        && stdin_ptr != 0
-        && stdin_len != 0
-        && let Some(seed) = crate::fd::copy_in(stdin_ptr, stdin_len.min(64 * 1024))
-    {
-        channel.write_stdin(&seed);
-        channel.close_stdin();
-    }
-
+    // **The console's process has no channel**: `register_exec_process` reads
+    // `None`, with fd 0 being `Stdin`, as "this is the console's process" and
+    // hands it `console::channel()` and the shared `TerminalState`. The exit
+    // channel it registers for `wait4` is a fresh one nothing writes to, so the
+    // `ChildStdout` the caller gets back reads EOF at exit — the right shape for
+    // a supervisor, whose child's output is on the screen. Every other spawn
+    // is `spawn_request`'s, above.
     // fd 0/1/2 = `Stdin`/`Stdout`/`Stderr`, served from the channel by glue's
     // own arms. `with_stdio()`, the same table every other registered process
     // gets — there is nothing spawn-specific left to bind.
@@ -3903,7 +3877,7 @@ pub fn sys_spawn(
         // two concurrent sessions must not share one. Same rule as the AArch64
         // `pty` spawn (`akuma-exec`'s `spawn.rs`).
         None,
-        channel,
+        None,
         table_slot,
     );
 
@@ -3928,9 +3902,7 @@ pub fn sys_spawn(
     // A quiet boot's splash hands the screen to the shell **before** the child can
     // be scheduled — it is cleared here, so the first prompt lands on a clean
     // console, not under an animation.
-    if console {
-        crate::splash::end_for_console();
-    }
+    crate::splash::end_for_console();
 
     // Last, as in `sys_fork`: identity and stdio in place before anything can
     // schedule the child.
@@ -3949,9 +3921,7 @@ pub fn sys_spawn(
     // child-channel registration through glue's own arm.
     // The console shell exists, so the framebuffer is its now: from here the TV
     // shows the shell and not the kernel's diagnostics (`serial::FB_QUIET`).
-    if console {
-        serial::set_fb_quiet(true);
-    }
+    serial::set_fb_quiet(true);
     let stdout_fd = crate::fd::install_child_stdout(pid);
     if crate::fd::errno::is_err(stdout_fd) {
         // The child is already running; it will just write into a channel nobody

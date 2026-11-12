@@ -1721,13 +1721,6 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     // unreadable string fails the call (`E2BIG`/`EFAULT`) instead of ending
     // the list where it stood.
     let req = super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget())?;
-    let path = req.path;
-    // `spawn_process_with_channel_ext` takes argv without argv[0] (it names
-    // the program by `path`) and the strings as UTF-8.
-    let args_vec: Vec<String> = req.argv.into_iter().skip(1).map(utf8_lossy_owned).collect();
-    let env_vec: Vec<String> = req.envp.into_iter().map(utf8_lossy_owned).collect();
-    let args_refs: Vec<&str> = args_vec.iter().map(String::as_str).collect();
-    
     let stdin_data = if stdin_ptr != 0 {
         if !BYPASS_VALIDATION.load(Ordering::Acquire)
             && !validate_user_ptr(stdin_ptr, stdin_len) { return Err(EFAULT); }
@@ -1739,21 +1732,52 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     } else {
         None
     };
-    
-    let stdin_slice = stdin_data.as_deref();
+    let pid = spawn_request(req, stdin_data.as_deref(), pty, false)?;
+    let Some(proc) = akuma_exec::process::current_process_shared() else {
+        return Err(ESRCH);
+    };
+    Ok(u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32))
+}
 
-    match akuma_exec::process::spawn_process_with_channel_ext(&path, Some(&args_refs), Some(&env_vec), stdin_slice, None, 0, pty) {
+/// Akuma's `spawn` (301) once its arguments are in the kernel, for both kernels.
+///
+/// The child is made by `akuma-exec`'s spawn, named by the caller's
+/// `argv[0]`, and its exit channel registered to the caller (pid 0 for a
+/// kernel task). The caller installs the `ChildStdout` descriptor, which is
+/// per kernel (amd64 has a table for kernel tasks).
+///
+/// An image that cannot be stat'ed is that errno (`ENOENT` for a missing
+/// file); any other failure is `ENOMEM`, with the reason printed.
+/// `own_terminal`: see `akuma_exec::process::spawn_process_named`.
+#[cfg(feature = "exec")]
+pub fn spawn_request(
+    req: super::execve::Request,
+    stdin: Option<&[u8]>,
+    pty: bool,
+    own_terminal: bool,
+) -> Result<u32, u64> {
+    let super::execve::Request { path, argv, envp } = req;
+    if let Err(e) = akuma_vfs_glue::file_size(&akuma_vfs_glue::resolve_symlinks(&path)) {
+        return Err(super::fs::fs_error_to_errno(e));
+    }
+    let mut argv = argv.into_iter().map(utf8_lossy_owned);
+    let argv0 = argv.next();
+    let args_vec: Vec<String> = argv.collect();
+    let env_vec: Vec<String> = envp.into_iter().map(utf8_lossy_owned).collect();
+    let args_refs: Vec<&str> = args_vec.iter().map(String::as_str).collect();
+    match akuma_exec::process::spawn_process_named(
+        &path, argv0.as_deref(), own_terminal, Some(&args_refs), Some(&env_vec), stdin, None, 0, pty, None,
+    ) {
         Ok((_tid, ch, pid)) => {
-            if let Some(proc) = akuma_exec::process::current_process_shared() {
-                akuma_exec::process::register_child_channel(pid, ch, proc.pid);
-                return Ok(u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32));
-            }
+            let spawner = akuma_exec::process::current_process_shared().map_or(0, |p| p.pid);
+            akuma_exec::process::register_child_channel(pid, ch, spawner);
+            Ok(pid)
         }
         Err(e) => {
-            akuma_primitives::safe_print!(128, "[sys_spawn] path={} failed: {}\n", path, e);
+            akuma_primitives::safe_print!(128, "[spawn] path={} failed: {}\n", path, e);
+            Err(ENOMEM)
         }
     }
-    Err(ENOMEM)
 }
 
 #[cfg(feature = "exec")]

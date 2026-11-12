@@ -2510,6 +2510,40 @@ probe image built on the Mac): boot suite 833/0, and `auxvprobe` (both parities)
 run: an amd64 self-host build.
 
 
+### Spawn: one implementation, except the console's (2026-11-12)
+
+amd64's 301 now makes every child that has a channel of its own through glue's
+`spawn_request`, i.e. `akuma-exec`'s spawn, the path AArch64's 301 and both kernels'
+`spawn_ext` take. `spawn_request(req, stdin, pty, own_terminal)` is what glue's `sys_spawn`
+calls too: the `file_size` precheck, `argv[0]` passed through (it was always `path`), and
+`register_child_channel`. amd64 returns `pid | ChildStdout fd << 32` as before. What stays on
+amd64's own path is `SPAWN_FLAG_CONSOLE`, whose stdio is the console and has no shared
+counterpart. That path is now console-only, and its `channel` is always `None`.
+
+Two differences surfaced, both now parameters of `akuma_exec::process::spawn_process_named`
+(`spawn_process_with_creds` is that function with `(None, false)`):
+
+- **`argv0`**: the shared spawn always used `path`. amd64's spawn and Linux use the
+  caller's `argv[0]`.
+- **`own_terminal`**: a non-pty AArch64 child shares its caller's `TerminalState`
+  (`spawn_inherits_terminal`). amd64 gives every 301 child a fresh one. `sshd`
+  multiplexes sessions from one process, and the winsize boot test pins that one session's
+  `TIOCSWINSZ` does not reach another's. amd64 passes `true`.
+
+Two tests learned that the child is now placed by the scheduler, not on its spawner's core:
+`spawn_stale_group_state_test` waits for the child's `SPAWN` row (bound on its first run by
+`bind_child_task`), and `spawn_test` skips its fd-table checks when the child has already
+run to `exit_group`'s `close_all`.
+
+The placement also exposed an older amd64 gap. A kernel thread that polls by yielding while
+holding the BKL never acknowledged a TLB shootdown (ring 0 runs with `IF` clear). The child
+shell's `fork` on the other core then spun in `wait_for_acks` until the boot suite's
+`run_sh_capture` timed out: 2 of 4 `SMP=2` boots under host load, 0 of 4 on HEAD. `yield_now`
+now services the mailbox: [`AMD64_YIELD_POLLER_SHOOTDOWN_DEAF`](AMD64_YIELD_POLLER_SHOOTDOWN_DEAF.md).
+
+amd64's `SPAWN` rows stay: `bind_child_task` writes them for every process, and `waitpid` (303)
+and the console path read them.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral

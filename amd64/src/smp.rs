@@ -1080,3 +1080,18 @@ pub fn smoke_test(t: &mut Suite, expected_aps: usize, started: usize) {
         t.note("smp: ticks on a cpu", ticks_on(idx));
     }
 }
+
+/// A peer core's `(current_task, idle_task, halted, ticks)`, for the
+/// `[TLB] stuck` report: whether the silent core is idle, halted, or running a
+/// task (and which) is the first question that report has to answer. Relaxed
+/// reads of another core's block — a snapshot, not a synchronised view.
+#[must_use]
+pub fn peer_snapshot(idx: usize) -> (usize, usize, bool, u64) {
+    let b = &PERCPU[idx];
+    (
+        b.current_task.load(Ordering::Relaxed),
+        b.idle_task.load(Ordering::Relaxed),
+        HALTED[idx].load(Ordering::Relaxed),
+        b.ticks.load(Ordering::Relaxed),
+    )
+}

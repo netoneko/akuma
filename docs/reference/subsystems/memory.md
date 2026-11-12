@@ -16,6 +16,14 @@ serialized on the thread-group leader's address-space lock. The Go/crush startup
 filed against it was a signal-return defect, not CoW
 ([`AMD64_FORK_VS_THREADS_SEGV`](../../archive/AMD64_FORK_VS_THREADS_SEGV.md)).
 
+**amd64 shootdown acks need a service point.** Ring 0 runs with `IF` clear, so a core in
+kernel code acknowledges a shootdown only by servicing its own mailbox: the BKL ticket wait
+(`bkl_spin_assist`), `sched::yield_now`, and any IRQ-masked poll loop that calls
+`shootdown::masked_wait_assist()`. A new kernel loop that waits without yielding must call
+the assist, or a sender spins in `wait_for_acks` (`[TLB] stuck … missing=<that core>`; the
+report prints the missing core's task and `halted` flag). See
+[`AMD64_YIELD_POLLER_SHOOTDOWN_DEAF`](../../archive/AMD64_YIELD_POLLER_SHOOTDOWN_DEAF.md).
+
 > **Stability: C (active risk).** Highest-churn subsystem through 2026-06.
 > Three items still OPEN: per-run kernel-heap creep; reclaim-after-OOM below
 > ~5 MB; and the user-page escalation giving up while parked memory is still inside its

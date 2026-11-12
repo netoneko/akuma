@@ -279,6 +279,25 @@ pub fn wait_for_acks() {
             serial::puts(" missing=0x");
             serial::put_hex(missing);
             serial::puts("\n");
+            // Who the silent core is running: a task with `halted=0` is a
+            // poller deaf to the IPI (ring 0 runs with `IF` clear), which is
+            // what told the yield-loop case apart from an idle core.
+            for idx in 0..peers {
+                if missing & (1u64 << idx) != 0 {
+                    let (cur, idle, halted, ticks) = smp::peer_snapshot(idx);
+                    serial::puts("  [TLB] core ");
+                    serial::put_dec(idx as u64);
+                    serial::puts(" task=");
+                    serial::put_dec(cur as u64);
+                    serial::puts(" idle=");
+                    serial::put_dec(idle as u64);
+                    serial::puts(" halted=");
+                    serial::put_dec(u64::from(halted));
+                    serial::puts(" ticks=");
+                    serial::put_dec(ticks);
+                    serial::puts("\n");
+                }
+            }
         }
         core::hint::spin_loop();
     }

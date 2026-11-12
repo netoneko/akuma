@@ -2133,6 +2133,17 @@ pub fn allow_tick_counts() -> (u64, u64) {
 /// depth it is handed.
 pub fn yield_now() {
     note_yield(1);
+    // **A yield is where a polling kernel thread hears a shootdown.** Ring 0
+    // runs with `IF` clear, so a kernel loop that polls by yielding — the boot
+    // suite's `run_sh_capture` driving `sys_read` + `sys_waitpid` — takes no
+    // IPI unless its core goes idle, and while it holds the BKL it never sits
+    // in the ticket wait whose assist would ack instead. A `fork` on the other
+    // core (its share pass broadcasts BKL-free) then spun in `wait_for_acks`
+    // for as long as the poller polled: `[TLB] stuck … missing=<poller's core>`
+    // and a timed-out child, 2 of 4 `SMP=2` boots under host load
+    // (`docs/archive/AMD64_YIELD_POLLER_SHOOTDOWN_DEAF.md`). Servicing here is
+    // the IPI landing at this instruction; nothing pending costs one load.
+    crate::shootdown::masked_wait_assist();
     smp::bkl_drop_window();
     if smp::take_need_resched() {
         TICK_YIELDS.fetch_add(1, Ordering::Relaxed);
