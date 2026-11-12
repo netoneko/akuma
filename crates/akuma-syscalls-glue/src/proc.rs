@@ -1674,7 +1674,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     } else {
         None
     };
-    let pid = spawn_request(req, stdin_data.as_deref(), pty, false)?;
+    let pid = spawn_request(req, stdin_data.as_deref(), pty, false, None)?;
     let Some(proc) = akuma_exec::process::current_process_shared() else {
         return Err(ESRCH);
     };
@@ -1690,13 +1690,15 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
 ///
 /// An image that cannot be stat'ed is that errno (`ENOENT` for a missing
 /// file); any other failure is `ENOMEM`, with the reason printed.
-/// `own_terminal`: see `akuma_exec::process::spawn_process_named`.
+/// `own_terminal` and `attach`: see `akuma_exec::process::spawn_process_named`
+/// and `Attach` (a console's shell, a kernel's init).
 #[cfg(feature = "exec")]
 pub fn spawn_request(
     req: super::execve::Request,
     stdin: Option<&[u8]>,
     pty: bool,
     own_terminal: bool,
+    attach: Option<akuma_exec::process::Attach>,
 ) -> Result<u32, u64> {
     let super::execve::Request { path, argv, envp } = req;
     if let Err(e) = akuma_vfs_glue::file_size(&akuma_vfs_glue::resolve_symlinks(&path)) {
@@ -1708,7 +1710,7 @@ pub fn spawn_request(
     let env_vec: Vec<String> = envp.into_iter().map(utf8_lossy_owned).collect();
     let args_refs: Vec<&str> = args_vec.iter().map(String::as_str).collect();
     match akuma_exec::process::spawn_process_named(
-        &path, argv0.as_deref(), own_terminal, Some(&args_refs), Some(&env_vec), stdin, None, 0, pty, None,
+        &path, argv0.as_deref(), own_terminal, Some(&args_refs), Some(&env_vec), stdin, None, 0, pty, None, attach,
     ) {
         Ok((_tid, ch, pid)) => {
             let spawner = akuma_exec::process::current_process_shared().map_or(0, |p| p.pid);

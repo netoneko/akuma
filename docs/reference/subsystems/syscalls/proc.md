@@ -106,9 +106,15 @@ PID + open fds; strips O_CLOEXEC fds); not spawn-as-exec.
   *and* envp; NULL/empty argv becomes `[path]`.
   Akuma's `spawn` (301) reads its arguments through the same function on both
   kernels, and both make the child through glue's `spawn_request`
-  (`akuma_exec::process::spawn_process_named`). The exception is amd64's
-  `SPAWN_FLAG_CONSOLE`, whose stdio is the console. amd64 passes
+  (`akuma_exec::process::spawn_process_named`). amd64 passes
   `own_terminal = true`, so every 301 child gets its own `TerminalState`.
+  **Init and amd64's `SPAWN_FLAG_CONSOLE` children use the same spawn**, with
+  `Attach`: the child's I/O channel and `TerminalState` are the console's (and,
+  for init, its pid is 1) instead of fresh ones. The spawn's own fresh channel
+  stays the child's *exit* identity in both cases. `Attach` is applied before
+  the child is published, so the child cannot write before it is attached, and
+  everything init needs from the console (size, pump, keyboard) is set up
+  before the spawn, not after it.
 - `run` (shared): execute permission on the symlink-resolved path, the
   `ETXTBSY` pin, the `#!` hop, `ExecArch::{read, load}`, then — past the point
   of no return — `stop_siblings`, the `MAP_SHARED` write-back, and inside

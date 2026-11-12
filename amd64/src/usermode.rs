@@ -2691,48 +2691,6 @@ pub fn alloc_pid() -> u32 {
     akuma_exec::process::allocate_pid()
 }
 
-/// Bytes of argv kept per process for `/proc/<pid>/cmdline`.
-///
-/// A shell command line, not a program's whole argument vector: 256 bytes holds
-/// every command a person types and every `sh -c "..."` a session runs, and
-/// caps what an `execve` with a pathological argv can add to the process table.
-/// `ps` shows the COMMAND column truncated, which is what `ps` does anyway.
-const CMDLINE_MAX: usize = 256;
-
-/// The init program's `/proc/1/cmdline`, recorded by [`run_init`].
-///
-/// Init has no `Spawn` entry — it runs in process slot 6, below
-/// [`SPAWN_SLOT_BASE`], and predates the spawn table entirely — so its name
-/// lives here. Without it `ps` listed every session's shell and not the thing
-/// that started them, which is the one line a person checks first.
-static INIT_CMDLINE: Spinlock<alloc::vec::Vec<u8>> = Spinlock::new(alloc::vec::Vec::new());
-
-/// Flatten argv into the `/proc/<pid>/cmdline` form: each element
-/// NUL-terminated, the whole thing capped at [`CMDLINE_MAX`].
-///
-/// The cap truncates **whole bytes, not whole elements** — same as Linux, whose
-/// `cmdline` is just the argv block clipped at the page it lives on, and same
-/// as what a reader that splits on NUL expects.
-fn flatten_cmdline<'a>(args: impl IntoIterator<Item = &'a [u8]>) -> alloc::vec::Vec<u8> {
-    let mut out = alloc::vec::Vec::new();
-    for a in args {
-        if out.len() >= CMDLINE_MAX {
-            break;
-        }
-        let room = CMDLINE_MAX - out.len();
-        let take = a.len().min(room.saturating_sub(1));
-        out.extend_from_slice(&a[..take]);
-        out.push(0);
-    }
-    out
-}
-
-/// Record init's argv so `/proc/1` can describe it. Called once by [`run_init`].
-fn set_init_cmdline<'a>(args: impl IntoIterator<Item = &'a [u8]>) {
-    *INIT_CMDLINE.lock() = flatten_cmdline(args);
-}
-
-
 /// The pid of the process making the current syscall — what `/proc/self`
 /// resolves to.
 ///
@@ -3703,6 +3661,7 @@ const SPAWN_FLAG_CONSOLE: u64 = 2;
 /// because a spawned child's stdout is a pipe and `sshd` reads that. Moving fd 0
 /// onto the channel therefore has to move fd 1/2 with it, which is a different
 /// piece (see the `ioctl` header in `crate::fd`).
+#[must_use]
 pub fn sys_spawn(
     path_ptr: u64,
     argv_ptr: u64,
@@ -3755,7 +3714,7 @@ pub fn sys_spawn(
         } else {
             None
         };
-        let pid = match akuma_syscalls_glue::proc::spawn_request(req, seed.as_deref(), pty, true) {
+        let pid = match akuma_syscalls_glue::proc::spawn_request(req, seed.as_deref(), pty, true, None) {
             Ok(pid) => pid,
             Err(e) => return e,
         };
@@ -3766,161 +3725,32 @@ pub fn sys_spawn(
         return u64::from(pid) | (stdout_fd << 32);
     }
 
-    // `SPAWN_FLAG_CONSOLE`: the console's own shell, loaded and registered here
-    // (its stdio is the console, which the shared spawn has no notion of).
-    let (path, argv_owned, envp_owned) = (req.path, req.argv, req.envp);
-    let path = path.as_str();
-    let head = match crate::fs::read_image_head(path) {
-        Ok(head) => head,
-        Err(e) => return akuma_syscalls_glue::fs::fs_error_to_errno(e),
+    // `SPAWN_FLAG_CONSOLE`: the console's own shell, made by the shared spawn
+    // with the console's channel and terminal attached
+    // (`akuma_exec::process::Attach`). Its fresh spawn channel is what the
+    // caller's `ChildStdout` and `wait` see, and reads EOF at exit: the right
+    // shape for a supervisor, whose child's output is on the screen.
+    let (Some(channel), Some(terminal)) = (crate::console::channel(), crate::console::terminal_state()) else {
+        return errno::ENODEV;
     };
-    let argv_refs: alloc::vec::Vec<&[u8]> =
-        argv_owned.iter().map(alloc::vec::Vec::as_slice).collect();
-    let envp_refs: alloc::vec::Vec<&[u8]> =
-        envp_owned.iter().map(alloc::vec::Vec::as_slice).collect();
-    // Kept for `/proc/<pid>/cmdline`: the loader writes argv onto the child's
-    // stack and this vector is dropped, so this is the last chance to record it.
-    let spawn_cmdline = flatten_cmdline(argv_refs.iter().copied());
-    let spawner_pid = current_pid();
-
-    // Same collect-first as `sys_fork`'s search, and for the same reason: the
-    // reaper frees the process, this frees the row.
-    sweep_reaped_spawn_rows();
-    // A free process slot in the spawn range. The `SPAWN` row is the oracle
-    // since 5b slice 4 — it was `PROCS`, and `fork` consulted both, which is
-    // the divergence that made this function and that one disagree about how
-    // full the machine was.
-    let slot = SPAWN.first_free_slot();
-    let Some(slot) = slot else {
-        return errno::ENOMEM;
-    };
-
-    let (child, img) = match Image::from_elf_path_argv_envp(&head.resolved, &argv_refs, &envp_refs) {
-        Ok(p) => p,
-        Err(e) => {
-            serial::puts("  [spawn] load failed: ");
-            serial::puts(e);
-            serial::puts("\n");
-            // Same misattribution `sys_execve` carried: every rejection printed
-            // as `Out of memory`. Same honest mapping.
-            return exec_load_errno(e);
-        }
-    };
-
-    let root = child.space.ttbr0();
-
-    // **The console's process has no channel**: `register_exec_process` reads
-    // `None`, with fd 0 being `Stdin`, as "this is the console's process" and
-    // hands it `console::channel()` and the shared `TerminalState`. The exit
-    // channel it registers for `wait4` is a fresh one nothing writes to, so the
-    // `ChildStdout` the caller gets back reads EOF at exit — the right shape for
-    // a supervisor, whose child's output is on the screen. Every other spawn
-    // is `spawn_request`'s, above.
-    // fd 0/1/2 = `Stdin`/`Stdout`/`Stderr`, served from the channel by glue's
-    // own arms. `with_stdio()`, the same table every other registered process
-    // gets — there is nothing spawn-specific left to bind.
-    let child_fds = alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::with_stdio());
-
-    // The child's process-table slot, refused here while the task does not exist
-    // yet (`akuma_exec::process::ProcessSlot`). Glue's `spawn` arm has no wait
-    // and retry for this; a caller sees `EAGAIN`.
-    let Some(table_slot) = akuma_exec::process::reserve_process_slot() else {
-        return errno::EAGAIN;
-    };
-
-    let Some(task_slot) = spawn_process_task(slot, root) else {
-        // `child` drops here: the image is freed by the same destructor that
-        // would have freed it out of `PROCS`. `child_fds` drops unregistered and
-        // holds nothing refcounted — the stdio triple names no resource — so
-        // there is nothing to unwind, where the pipe version had to release
-        // three pipe-end references in a stated order.
-        return errno::ENOMEM;
-    };
-
-    let pid = alloc_pid();
-    // 5b slice 1: register the child with `akuma-exec`'s process table and
-    // publish `task_slot → pid`, so `current_process_shared()` resolves for
-    // this child from its first syscall. The heap starts where the loaded image
-    // ends — the same `LoadedImage::end_va` the loader reported and `mm.rs`'s
-    // placer agrees with.
-    //
-    // 5b slice 4: the image itself is moved in here, and this happens **before**
-    // `publish_task` below, because `run_process` reads the child's entry point
-    // and stack back out of it.
-    register_exec_process(
-        pid,
-        spawner_pid,
-        task_slot,
-        child,
-        img.end_va,
-        // **The path, not `argv[0]`.** `Process::image_name` is what
-        // `/proc/<pid>/exe` reports — a symlink to the binary since the
-        // interception in `akuma-syscalls-glue` moved into procfs — and
-        // `argv[0]` is a *name a caller chose*, not a path: `readlink
-        // /proc/self/exe` answered `readlink`, and `ls -l` showed
-        // `/proc/self/exe -> ls`, neither of which opens anything. `comm`
-        // is unaffected: `akuma_procfs::ProcStat::comm` takes the basename,
-        // so `ps` still shows `ls` while `exe` names `/bin/ls`.
-        path,
-        &spawn_cmdline,
-        Some(child_fds),
-        // A spawned child gets a **fresh** terminal state, deliberately: that
-        // is the state `sshd` then writes the client's window size into, and
-        // two concurrent sessions must not share one. Same rule as the AArch64
-        // `pty` spawn (`akuma-exec`'s `spawn.rs`).
-        None,
-        None,
-        table_slot,
-    );
-
-    // **The session's foreground process group.**
-    //
-    // `TerminalState::default()` seeds `foreground_pgid = 1`, which is `init`'s
-    // — so without this a `^C` on an ssh session would broadcast `SIGINT` at
-    // `init`'s group rather than at the session's. The AArch64 spawn sets the
-    // same field, for the same reason and unconditionally
-    // (`spawn_process_with_channel_ext`); a spawn's terminal state is fresh
-    // (the `None` above), so there is no caller's group to clobber.
-    //
-    // `kill_foreground_group` excludes the **leader**, so this names the shell and
-    // reaches everything the shell forks — which is the job that should die on
-    // `^C`, and not the shell running it.
-    if let Some(proc) = akuma_exec::process::lookup_process_shared(pid) {
-        proc.terminal_state.lock().set_session_leader(pid);
-    }
-
-    SPAWN.set(slot - SPAWN_SLOT_BASE, Spawn { pid, exec_slot: task_slot });
-
-    // A quiet boot's splash hands the screen to the shell **before** the child can
-    // be scheduled — it is cleared here, so the first prompt lands on a clean
-    // console, not under an animation.
+    // A quiet boot's splash hands the screen to the shell **before** the child
+    // can be scheduled, so the first prompt lands on a clean console.
     crate::splash::end_for_console();
-
-    // Last, as in `sys_fork`: identity and stdio in place before anything can
-    // schedule the child.
-    crate::sched::publish_task(task_slot);
-
-    // The caller's handle on the child's output: a `ChildStdout(pid)`, which
-    // glue's read arm resolves through `get_child_channel(pid)` to the very
-    // channel above — blocking, `O_NONBLOCK`-aware, `EINTR`-able, and reporting
-    // EOF from `has_exited()` rather than from a writer count. Verbatim what
-    // glue's own `sys_spawn` hands back on the other kernel.
-    //
-    // It replaced a `PipeRead` on the stdout pipe, and two things came with the
-    // swap for free: `TIOCSWINSZ` aimed at the child now resolves through glue's
-    // `ChildStdout(pid)` arm (this file's `child_pipe_set_winsize` shim existed
-    // only because a `PipeRead` does not name a child), and `close(2)` drops the
-    // child-channel registration through glue's own arm.
+    let attach = akuma_exec::process::Attach { channel, terminal, pid: None };
+    let pid = match akuma_syscalls_glue::proc::spawn_request(req, None, false, false, Some(attach)) {
+        Ok(pid) => pid,
+        Err(e) => return e,
+    };
+    crate::console::set_attached_pid(pid);
     // The console shell exists, so the framebuffer is its now: from here the TV
     // shows the shell and not the kernel's diagnostics (`serial::FB_QUIET`).
     serial::set_fb_quiet(true);
     let stdout_fd = crate::fd::install_child_stdout(pid);
     if crate::fd::errno::is_err(stdout_fd) {
         // The child is already running; it will just write into a channel nobody
-        // reads. Report the failure — `sshd` drops the session.
+        // reads. Report the failure.
         return errno::EMFILE;
     }
-
     u64::from(pid) | (stdout_fd << 32)
 }
 
@@ -4063,6 +3893,7 @@ pub fn sys_close_child_stdin(pid: u64) -> u64 {
 /// the child's descriptors were closed in glue's exit path) where glue's decides
 /// from the child channel (set after); one copy needed one signal, and it is the
 /// channel's (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "One waitpid").
+#[must_use]
 pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     let r = akuma_syscalls_glue::proc::sys_waitpid(pid as u32, status_ptr);
     after_reap();
@@ -4179,64 +4010,27 @@ pub fn spawn_row_of(pid: u32) -> Option<usize> {
 /// is a server that never reads the console. Both are the same binaries the
 /// aarch64 devbox runs, compiled for `x86_64-unknown-none` against a ported
 /// `libakuma`.
-pub fn run_init(path: &str, args: &[&str]) -> bool {
-    // Resolved first, like `execve`'s `read_image_head`: a usr-merged root has
-    // `/bin -> usr/bin` and `sh -> bash`, and `read_file` follows neither.
-    let Ok(image) = crate::fs::read_file(&crate::fs::resolve_symlinks(path)) else {
+pub fn run_init(path: &str, args: &[&str]) {
+    // A missing init is reported and the boot halts as before. Resolved first: a
+    // usr-merged root has `/bin -> usr/bin` and `sh -> bash`.
+    if crate::fs::read_image_head(path).is_err() {
         serial::puts("  [init] not on the disk: ");
         serial::puts(path);
         serial::puts("\n");
-        return false;
-    };
+        return;
+    }
     // argv[0] is the path; `args` (from `initargs=`) follow. A multicall binary
     // like busybox dispatches on `argv[1]` when `argv[0]`'s basename is
     // `busybox`, so `initargs=uname,-a` runs its `uname` applet.
-    let mut argv_owned: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::with_capacity(1 + args.len());
-    argv_owned.push(path.as_bytes());
+    let mut argv: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::with_capacity(1 + args.len());
+    argv.push(path.as_bytes().to_vec());
     for a in args {
-        argv_owned.push(a.as_bytes());
+        argv.push(a.as_bytes().to_vec());
     }
-    // Init has no `Spawn` entry, so `/proc/1` reads its argv from here.
-    set_init_cmdline(argv_owned.iter().copied());
-    let (proc, ld) = match Image::from_elf_argv(&image, &argv_owned) {
-        Ok(p) => p,
-        Err(e) => {
-            serial::puts("  [init] failed to load: ");
-            serial::puts(e);
-            serial::puts("\n");
-            return false;
-        }
-    };
-    let init_image_top = ld.end_va;
-    let root = proc.space.ttbr0();
-    let Some(table_slot) = akuma_exec::process::reserve_process_slot() else {
-        serial::puts("  [init] process table full\n");
-        return false;
-    };
-    let Some(task_slot) = spawn_process_task(6, root) else {
-        serial::puts("  [init] no task slot\n");
-        return false;
-    };
-    // 5b slice 1: init is pid 1 on this target — `sshd`'s `getpid` says so, and
-    // every process not in the process table falls back to the same answer — so
-    // the registered identity names that pid. Nothing unregisters it: init runs
-    // until the machine stops, and the boot loop after this never returns while
-    // it lives.
+
+    // Everything init's first instructions may rely on happens **before** the
+    // spawn, which publishes it: the shared spawn schedules the child at once.
     //
-    // 5b slice 4: the image goes in with it, and `publish_task` comes after —
-    // `run_process` reads init's entry point and stack out of this
-    // registration, so publishing first would race a task with nowhere to start
-    // against the register that gives it one.
-    register_exec_process(1, 0, task_slot, proc, init_image_top, path, &INIT_CMDLINE.lock().clone(), None, None, None, table_slot);
-    // **The console's producer**, started here and nowhere earlier.
-    //
-    // After the registration, so the channel it fills already belongs to a
-    // process; before `publish_task`, so init cannot reach its first `read(0)`
-    // with nothing draining the UART. Not during the self-test suite: the pump
-    // owns `input::getb` destructively once it runs, and the suite's own
-    // console checks (`fd::console_nonblock_test`) are written against an idle
-    // line — starting it there would add a second reader of the hardware for no
-    // gain, since no test types.
     // The screen's real size into the console's terminal state (so `stty size`
     // and every program asking `TIOCGWINSZ` see the framebuffer grid, not a
     // default 24x80), and the one-line geometry summary at the end of the boot
@@ -4275,10 +4069,32 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
         serial::puts(e);
         serial::puts("\n");
     }
+    // **The console's producer**, started here and nowhere earlier: before init
+    // exists, so init cannot reach its first `read(0)` with nothing draining the
+    // UART; not during the self-test suite, whose console checks are written
+    // against an idle line (the pump owns `input::getb` destructively once it
+    // runs). A keystroke typed before init is attached takes the console's
+    // no-process path (`console::ATTACHED_PID`).
     if !crate::console::spawn_pump() {
         serial::puts("  [init] WARNING: no task slot for the console pump — the console will not deliver input\n");
     }
-    crate::sched::publish_task(task_slot);
+
+    // **Init is the shared spawn's**, as every other process is since 2026-11-12:
+    // pid 1 (`sshd`'s `getpid` says so, and `reparent_children_to` names it),
+    // attached to the console's channel and terminal (`Attach`), spawned by no
+    // process (its parent is 0). Nothing unregisters it: init runs until the
+    // machine stops.
+    let (Some(channel), Some(terminal)) = (crate::console::channel(), crate::console::terminal_state()) else {
+        serial::puts("  [init] no console\n");
+        return;
+    };
+    let req = akuma_syscalls_glue::execve::Request { path: alloc::string::String::from(path), argv, envp: alloc::vec::Vec::new() };
+    let attach = akuma_exec::process::Attach { channel, terminal, pid: Some(1) };
+    if let Err(e) = akuma_syscalls_glue::proc::spawn_request(req, None, false, false, Some(attach)) {
+        akuma_primitives::safe_print!(64, "  [init] failed to start: errno {}\n", e.cast_signed());
+        return;
+    }
+    crate::console::set_attached_pid(1);
     // The sign-on banner, last thing before the init program starts: on the HP
     // box the console is a television, and this is what is on it when sshd comes
     // up.
@@ -4323,7 +4139,6 @@ pub fn run_init(path: &str, args: &[&str]) -> bool {
         }
     }
     serial::puts("\n-- init exited --\n");
-    true
 }
 
 

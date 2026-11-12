@@ -258,7 +258,23 @@ pub fn spawn_process_with_creds(
     pty: bool,
     creds: Option<super::Creds>,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
-    spawn_process_named(path, None, false, args, env, stdin, cwd, box_id, pty, creds)
+    spawn_process_named(path, None, false, args, env, stdin, cwd, box_id, pty, creds, None)
+}
+
+/// A process that takes over a terminal that already exists, instead of being
+/// given a channel of its own: a console's shell, or a kernel's init.
+///
+/// `channel` becomes the child's **I/O** channel (`Process::channel`) and
+/// `terminal` its `TerminalState`, both set before the process is published, so
+/// its first write cannot land anywhere else (a `reattach` after the spawn would
+/// race the child's first instructions). The spawn's own fresh channel is still
+/// what the child's tid and its parent's `wait` see, as for any spawn: it carries
+/// the exit status and nothing else. `pid` fixes the child's pid (init is 1);
+/// `None` keeps the one the loader allocated.
+pub struct Attach {
+    pub channel: Arc<ProcessChannel>,
+    pub terminal: Arc<spinning_top::Spinlock<akuma_tty::TerminalState>>,
+    pub pid: Option<Pid>,
 }
 
 #[cfg(feature = "elf-loader")]
@@ -284,6 +300,7 @@ pub fn spawn_process_named(
     box_id: u64,
     pty: bool,
     creds: Option<super::Creds>,
+    attach: Option<Attach>,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
     // NOTE: the LifecycleGuard is acquired at the PUBLISH point (just before
     // `register_process`, below), NOT here. The whole load phase above it — path/
@@ -458,7 +475,21 @@ pub fn spawn_process_named(
     }
 
     // Set the channel in the process struct (UNIFIED I/O)
-    process.channel = Some(channel.clone());
+    let attach_terminal = match attach {
+        Some(Attach { channel: io, terminal, pid }) => {
+            process.channel = Some(io);
+            if let Some(pid) = pid {
+                process.pid = pid;
+                process.tgid = pid;
+                process.pgid = pid;
+            }
+            Some(terminal)
+        }
+        None => {
+            process.channel = Some(channel.clone());
+            None
+        }
+    };
 
     // Inherit terminal state from caller if available — but NOT for a `pty`
     // spawn, and NOT for a spawn that crosses into a different box. `pty`
@@ -495,7 +526,9 @@ pub fn spawn_process_named(
     // `Process::new` already gives every process its own fresh
     // `TerminalState` (`process/mod.rs`), so either condition just keeps
     // that instead of overwriting it.
-    if !own_terminal && spawn_inherits_terminal(pty, box_id) && let Some(shared_state) = current_terminal_state() {
+    if let Some(terminal) = attach_terminal {
+        process.terminal_state = terminal;
+    } else if !own_terminal && spawn_inherits_terminal(pty, box_id) && let Some(shared_state) = current_terminal_state() {
         if config().syscall_debug_info_enabled {
             log::debug!("[Process] Inheriting shared terminal state at {:p} for PID {}", Arc::as_ptr(&shared_state), process.pid);
         }

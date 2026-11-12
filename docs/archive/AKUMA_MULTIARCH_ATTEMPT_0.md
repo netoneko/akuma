@@ -2649,6 +2649,47 @@ Gates: amd64 TCG suite 829/839/839, 0 failed; ring-3 harness OK; AArch64 HVF 312
 both kernels at SMP=2, 10 ssh sessions each returned their own exit status, and a shell saw
 `exit 1..5`, a `SIGTERM` death as 143 and a background `wait` as 7.
 
+### Init and the console on the shared spawn (2026-11-12)
+
+amd64 had kept two process-creation paths of its own after 301 moved to the shared spawn:
+`run_init` (`Image::from_elf_argv` -> `spawn_process_task` -> `register_exec_process(1, ..)` ->
+`publish_task`) and 301's `SPAWN_FLAG_CONSOLE` branch. Both now go through glue's
+`spawn_request`, i.e. `akuma_exec::process::spawn_process_named`, with one new parameter:
+
+```rust
+pub struct Attach { channel: Arc<ProcessChannel>, terminal: Arc<Spinlock<TerminalState>>, pid: Option<Pid> }
+```
+
+With `Attach`, the child's I/O channel (`Process::channel`) and `TerminalState` are the given
+ones rather than fresh ones, and `pid: Some(1)` gives init its pid (and tgid and pgid). The
+fresh channel the spawn makes is still registered as the child's **exit** identity, so
+`waitpid` and `has_exited` behave the same for a console child as for any other. `Attach` is
+applied before the child is published, so the child cannot write before it is attached.
+
+**Order changed in `run_init`.** The old path registered init, did the console set-up, then
+published the task. The shared spawn publishes at once, so the set-up now happens first:
+splash end (unless init is `herd`), `/etc/console.conf`, framebuffer grid -> console size,
+USB keyboard, console pump. Then the spawn, then `console::set_attached_pid(1)`, the banner and
+the boot task's parked wait. `INIT_CMDLINE` (init's private `/proc/1/cmdline` store) is gone:
+the shared `Process` keeps argv like every other process's. `run_init` returns `()`. Both
+callers ignored its `bool`.
+
+Still in amd64 and used only by the boot suite: `spawn_process_task`, `register_exec_process`,
+`Image::from_elf_argv`. Deleting them means rewriting the tests that build processes by hand.
+
+Gates: amd64 TCG suite 829/839/839, 0 failed; ring-3 harness OK (`INIT=/bin/sshd`;
+`/proc/1/cmdline` and `ps` show `/bin/sshd` as pid 1); 10 ssh sessions and the exit-status
+script as in "One waitpid"; `INIT=/bin/busybox INITARGS=sh` on the serial console (pid 1, line
+input, pipes, background `wait`, `-- init exited --` on `exit 3`); `INIT=/bin/herd` with the
+disk's `console = true` service (pid 69 on the console terminal, `console.rc` sourced, `stty
+size` 24 80, `^C` -> `[ISIG]` -> `sleep` killed by `SIGINT`, the shell continues); AArch64 HVF
+312/320/318 (`akuma-exec` and glue changed); clippy on every target.
+
+**Next: the console becomes optional.** Of `run_init`'s steps, everything before the spawn and
+the `Attach` itself exists for the console. A headless akuma, Taoxichuan or Shanghai image does
+not need it. Taoxichuan's builder already makes it opt-in (`Kernel::console()`); the plan is
+the same shape for the unified front.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral
