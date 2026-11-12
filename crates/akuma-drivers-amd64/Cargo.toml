@@ -56,11 +56,11 @@ i8042 = ["dep:akuma-port", "dep:spinning_top"]
 # Intel HD Audio playback behind `/dev/dsp`.
 hda = ["dep:akuma-hda", "dep:akuma-dma", "dep:akuma-pci", "dep:akuma-primitives", "dep:akuma-virtio", "dep:spinning_top"]
 
-# Kernel-only. Specs are copied from `amd64/Cargo.toml` exactly, default features included:
+# Kernel-only. Specs are copied from `crates/akuma-kernel-amd64/Cargo.toml` exactly, default features included:
 # a dependency named here with more features than the kernel names would turn them on for the
 # whole kernel through feature unification.
 [target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
-akuma-kernel-amd64 = { path = "../../amd64", default-features = false }
+akuma-kernel-amd64 = { path = "../akuma-kernel-amd64", default-features = false }
 akuma-kvm-amd64 = { path = "../akuma-kvm-amd64", optional = true }
 akuma-primitives = { path = "../akuma-primitives", optional = true }
 akuma-boot-amd64 = { path = "../akuma-boot-amd64", optional = true }

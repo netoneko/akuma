@@ -3,7 +3,7 @@
 //! page `akuma-boot-amd64`'s `boot.s` carries, walks up to long mode on a
 //! page-table root built here, and lands in [`ap_entry64`].
 //!
-//! The twin of `amd64/src/smp.rs` (1,202 lines, welded to amd64's `sched` and
+//! The twin of `crates/akuma-kernel-amd64/src/smp.rs` (1,202 lines, welded to amd64's `sched` and
 //! `lapic`); this file keeps only what bring-up needs, so the extraction into
 //! `akuma-smp-amd64` has a small surface to move. Design: ring 3 runs in
 //! parallel, every kernel entry takes one big lock (`akuma-bkl`), so the

@@ -13,7 +13,7 @@
 //!   is what a **static-PIE** emits, not an interpreter name — read as a
 //!   path it would turn into a failed file read for a binary that needs
 //!   none);
-//! * the entry decision in `amd64/src/loader.rs`'s `finish()` ("ring 3 is
+//! * the entry decision in `crates/akuma-kernel-amd64/src/loader.rs`'s `finish()` ("ring 3 is
 //!   entered in the linker, which brings the program up itself" — the cross
 //!   target is the interpreter's entry when one was mapped, while `AT_ENTRY`
 //!   stays the *program's*);

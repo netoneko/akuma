@@ -44,7 +44,7 @@ One fix is in shared glue: `akuma-syscalls-glue`'s `copy_from_user_str`. These c
 
 ## Causes and fix
 
-**One frame per shared file page** (`shmpages.rs`, amd64's `amd64/src/shmpages.rs` on this kernel's frames). The
+**One frame per shared file page** (`shmpages.rs`, amd64's `crates/akuma-kernel-amd64/src/shmpages.rs` on this kernel's frames). The
 decisions are `akuma-fpcache-rw`'s, already host-tested for amd64. A writable `MAP_SHARED` file mapping is now lazy
 like any other, and its record carries `shared` (bit 38; the page index moved to 39..=63, offsets below 128 GiB).
 `lazy::fill_shared` looks the page up by `(root mount, inode, page)`:

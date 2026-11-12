@@ -10,7 +10,7 @@ workspace = true
 # The machine half, chosen by the target. `target_os = "none"` too: `cfg(target_arch)` alone is
 # the *host's* under `cargo test`, and neither kernel's entry exists for a host.
 [target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
-akuma-kernel-amd64 = { path = "../../amd64" }
+akuma-kernel-amd64 = { path = "../akuma-kernel-amd64" }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "none"))'.dependencies]
 akuma-kernel-glue = { path = "../akuma-kernel-glue" }

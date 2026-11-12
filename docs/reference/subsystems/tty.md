@@ -5,7 +5,7 @@
 
 `crates/akuma-tty` is pure, `#![forbid(unsafe_code)]`, has **no dependencies** and nothing in it
 locks. The kernel keeps the acting half: `akuma-syscalls-glue/src/{term,pty}.rs` (ioctls, user
-copies, wakers, the table lock), `akuma-exec`'s `ProcessChannel`, `amd64/src/console.rs`.
+copies, wakers, the table lock), `akuma-exec`'s `ProcessChannel`, `crates/akuma-kernel-amd64/src/console.rs`.
 
 | module | what | who calls it |
 |---|---|---|

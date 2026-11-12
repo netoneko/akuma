@@ -45,7 +45,7 @@ walker and x86 walker behind one name), `akuma-mmap`'s region algebra, `akuma_mm
 `akuma_syscalls_mem::mmap::plan` (which kind of mapping a request asks for). The split is in what
 they write into `Process`:
 
-| | AArch64 (glue `mem.rs`, `akuma-exceptions`) | amd64 (`amd64/src/mm.rs`, 3.5 kL) |
+| | AArch64 (glue `mem.rs`, `akuma-exceptions`) | amd64 (`crates/akuma-kernel-amd64/src/mm.rs`, 3.5 kL) |
 |---|---|---|
 | eager mappings | `Process::mmap_regions` (`MmapRegion`, `prot: Prot`) | `Process::mmap_regions` |
 | demand-paged mappings | `Process::lazy_regions`, a `BTreeMap` of `LazyRegion`, keyed by tgid through `push_lazy_region(pid, ..)` | the same `mmap_regions` list: a region is lazy simply by having pages not yet present |

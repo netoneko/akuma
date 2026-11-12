@@ -4,7 +4,7 @@
 **Scope:** the first two steps of item **C1** in
 `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` — deciding how the amd64 kernel and
 `akuma-syscalls-glue` agree on what a syscall number *means*, and collapsing
-`amd64/src/usermode.rs`'s two dispatch matches into one neutral table plus a
+`crates/akuma-kernel-amd64/src/usermode.rs`'s two dispatch matches into one neutral table plus a
 named list of x86-only legacy spellings.
 **Status:** landed. No arm has been folded into glue yet; that is step 3.
 **Prompt:** `proposals/NEXT_AGENT_AMD64_C1_USERMODE_FOLD.md`.
@@ -83,7 +83,7 @@ dispatch; both are facts about Linux either way.
 
 ## What the dispatcher looks like now
 
-`amd64/src/usermode.rs::syscall_dispatch` was **two matches in two styles** — 67
+`crates/akuma-kernel-amd64/src/usermode.rs::syscall_dispatch` was **two matches in two styles** — 67
 raw x86_64 numbers written as `return`, then 31 typed arms after
 `Syscall::from_x86_64` — with no principle separating them. The prompt reads
 that as arbitrary; measuring it showed the split was *almost* principled and the

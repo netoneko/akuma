@@ -1,7 +1,7 @@
 # Intel HD Audio (amd64)
 
 Source: `crates/akuma-hda` (pure, host-tested, `forbid(unsafe_code)`),
-`amd64/src/hda.rs` (registers, DMA memory, the `/dev/dsp` backend),
+`crates/akuma-kernel-amd64/src/hda.rs` (registers, DMA memory, the `/dev/dsp` backend),
 `crates/akuma-virtio/src/audio.rs` (`hda_backend`: the one dispatch point).
 Bring-up history and the failed first attempt: the runbook
 [`../../../archive/AKUMA_AMD64_HDA_AUDIO_BRIEF.md`](../../../archive/AKUMA_AMD64_HDA_AUDIO_BRIEF.md).

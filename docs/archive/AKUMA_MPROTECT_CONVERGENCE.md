@@ -27,7 +27,7 @@ and nothing copied. The same path would also have granted a write to a shared re
 page from `akuma-fpcache` mapped `MAP_PRIVATE`, writing into the page every other mapper of
 that file reads.
 
-amd64's own `mprotect` (`amd64/src/mm.rs`) had the rule: a writable page whose frame is still
+amd64's own `mprotect` (`crates/akuma-kernel-amd64/src/mm.rs`) had the rule: a writable page whose frame is still
 shared is mapped read-only and CoW-marked, unless its region is shared by identity
 (`MAP_SHARED`, where CoW would mean "stop sharing").
 

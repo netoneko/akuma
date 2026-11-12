@@ -294,11 +294,11 @@ smoltcp are not needed to test them. Background:
 ## One implementation, both kernels
 
 The amd64 kernel serves every socket syscall through
-`akuma_syscalls_glue::net`'s `dispatch_*` (`amd64/src/usermode/dispatch.rs`,
+`akuma_syscalls_glue::net`'s `dispatch_*` (`crates/akuma-kernel-amd64/src/usermode/dispatch.rs`,
 `net`), which picks AF_UNIX or AF_INET itself. **Do not add a socket arm that
 calls anything but `to_glue`**: amd64 had its own AF_INET implementation over
 the same `akuma_net::socket` table until 2026-11-11, and the two had drifted in
-the argument errnos below. What is left in `amd64/src/sock.rs` is the
+the argument errnos below. What is left in `crates/akuma-kernel-amd64/src/sock.rs` is the
 `recvfrom` busy-loop tripwire, the `close` hook and the boot self-test.
 
 Argument errnos, as Linux gives them:

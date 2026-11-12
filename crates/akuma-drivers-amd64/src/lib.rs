@@ -12,7 +12,7 @@
 //! What a driver may use of the machine half is `akuma_kernel_amd64::drivers::services`, one
 //! re-export per item.
 //!
-//! Moved out of `amd64/src` one driver per commit from 2026-11-11
+//! Moved out of `crates/akuma-kernel-amd64/src` one driver per commit from 2026-11-11
 //! (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`). Kernel-only: on any other target the crate is
 //! empty.
 

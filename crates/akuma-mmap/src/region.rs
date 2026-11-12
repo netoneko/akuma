@@ -1626,7 +1626,7 @@ mod file_backing_tests {
     /// Checked against the predecessor as an oracle rather than against expected
     /// values: a wrong answer here does not crash, it serves a fault from the
     /// wrong region — the same reason `maps_skip_lookup_check` is written this
-    /// way in `amd64/src/fd.rs`.
+    /// way in `crates/akuma-kernel-amd64/src/fd.rs`.
     #[test]
     fn region_lookup_matches_the_scan_it_replaced() {
         let regions = alloc::vec![

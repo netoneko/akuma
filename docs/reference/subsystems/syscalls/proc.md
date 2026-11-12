@@ -127,7 +127,7 @@ PID + open fds; strips O_CLOEXEC fds); not spawn-as-exec.
   large one from its path (`FsError::Internal` → `load_exec_path`,
   demand-paged), kills siblings with `Process::kill_exec_siblings`, installs on
   the caller's own process under `with_own_process_exclusive`, and `enter`
-  `eret`s. amd64 (`Amd64Exec`, `amd64/src/usermode.rs`): reads the head,
+  `eret`s. amd64 (`Amd64Exec`, `crates/akuma-kernel-amd64/src/usermode.rs`): reads the head,
   maps every segment as it loads, `thread::drain`s siblings, installs on the
   thread-group leader, and `enter` arms `exec_pending` and returns 0.
 - **`enter` may not return (AArch64)**, so nothing in `run`'s frames owns heap

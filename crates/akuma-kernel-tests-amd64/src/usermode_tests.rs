@@ -48,7 +48,7 @@ const USER_STACK_VA: usize = 0x41_0000;
 /// and every stage before Stage M — so the loader is still exercised on a
 /// machine with no storage.
 ///
-/// The two are byte-identical: `amd64/build.rs` compiles the program into
+/// The two are byte-identical: `crates/akuma-kernel-amd64/build.rs` compiles the program into
 /// `OUT_DIR` and `amd64/mkdisk.sh` copies that same file into the image. That is
 /// what makes the fallback honest rather than a second, drifting program — and
 /// `elf_test` checks it, because "identical" is an assumption about two build
@@ -1705,7 +1705,7 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     t.check("dispatch: timerfd_settime 286 -> 86", hop(Syscall::TimerfdSettime, 286, nr::TIMERFD_SETTIME));
     t.check("dispatch: timerfd_gettime 287 -> 87", hop(Syscall::TimerfdGettime, 287, nr::TIMERFD_GETTIME));
 
-    // `pidfd_open`(434) is a **shared-number** dispatch (`amd64/src/
+    // `pidfd_open`(434) is a **shared-number** dispatch (`crates/akuma-kernel-amd64/src/
     // usermode.rs`'s third match block), not a `Syscall` row — 434 must NOT
     // decode through the neutral table, or the shared-number arm and a table
     // row would silently race for the same number.

@@ -21,7 +21,7 @@ updated, the `curl` binary is present and linked. The gate runs over the exec-on
 no ash session: one command per connection, e.g. `/bin/ssh -p 2224 root@localhost 'apk add curl'`).
 
 Facts from your own stage-4 RESULT.md (`/root/dev-cycle/taoxichuan-s4/RESULT.md`), which you should treat as the starting
-point: outbound is untried (`Gateway::out_accept`/`out_refuse`, `vm_outbound`, `amd64/src/kvm/relay.rs`); DNS must be
+point: outbound is untried (`Gateway::out_accept`/`out_refuse`, `vm_outbound`, `crates/akuma-kernel-amd64/src/kvm/relay.rs`); DNS must be
 decided (`akuma-net`'s `dns.rs` vs what the full-kernel guest uses); there is no wall clock (`utc_seconds` is `None`,
 CLOCK_REALTIME is boot-relative; the boot-time SNTP client lives in `akuma-syscalls-time`); `writev`, `fstat`, `readlink`
 and `uname`-class arms are missing; the 1 MiB mmap and brk slabs were never pressure-tested; `ls /bin` fails (stat and

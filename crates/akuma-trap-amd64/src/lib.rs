@@ -3,7 +3,7 @@
 //!
 //! # What this replaces
 //!
-//! `amd64/src/idt.rs` had five hand-written assembly entries (`#PF`/`#GP` and the
+//! `crates/akuma-kernel-amd64/src/idt.rs` had five hand-written assembly entries (`#PF`/`#GP` and the
 //! other error-code vectors through one macro, the no-error-code vectors and the
 //! LAPIC timer through hand copies), each calling an `extern "C"` dispatcher that
 //! took `*mut InterruptStackFrame, *mut TrapRegs` and opened with
@@ -143,7 +143,7 @@ const _: () = {
 
 /// Non-zero once `CR4.SMAP` is set. The error-code stubs test it before their
 /// `clac`, which would `#UD` on a CPU without SMAP (Haswell). Written by
-/// `amd64/src/uaccess.rs`'s `init_smap`.
+/// `crates/akuma-kernel-amd64/src/uaccess.rs`'s `init_smap`.
 pub static SMAP_ACTIVE: AtomicU8 = AtomicU8::new(0);
 
 /// Which trap a handler is being run for.

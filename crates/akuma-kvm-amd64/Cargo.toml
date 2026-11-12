@@ -10,7 +10,7 @@ workspace = true
 # Kernel-only (the `akuma-drivers-amd64` precedent). Specs are copied from that crate exactly,
 # default features included, so moving here turned no feature on for the kernel.
 [target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
-akuma-kernel-amd64 = { path = "../../amd64", default-features = false }
+akuma-kernel-amd64 = { path = "../akuma-kernel-amd64", default-features = false }
 akuma-affinity = { path = "../akuma-affinity" }
 akuma-bkl = { path = "../akuma-bkl" }
 akuma-cpu = { path = "../akuma-cpu" }

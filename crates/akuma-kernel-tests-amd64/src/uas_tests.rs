@@ -1,7 +1,7 @@
 //! The shared [`akuma_mmu::UserAddressSpace`], exercised on real hardware.
 //!
 //! This is now the **only** x86 user-space walker on this target: step 5a
-//! deleted `amd64/src/paging.rs`'s `AddressSpace` and pointed `mm.rs`, `idt.rs`,
+//! deleted `crates/akuma-kernel-amd64/src/paging.rs`'s `AddressSpace` and pointed `mm.rs`, `idt.rs`,
 //! `loader.rs`, `usermode.rs` and `fd.rs` at this type
 //! (`docs/archive/AKUMA_AMD64_STEP5A_ONE_WALKER.md`). It has real runtime
 //! callers now, which changes what this suite is *for* rather than making it
@@ -30,7 +30,7 @@
 //! property is itself worth pinning, and `translate`-after-`map` is what pins
 //! it.
 //!
-//! Moved whole from `amd64/src/uas.rs` (2026-11-11): the module was nothing but this suite,
+//! Moved whole from `crates/akuma-kernel-amd64/src/uas.rs` (2026-11-11): the module was nothing but this suite,
 //! and it reaches only `akuma-mmu` and `akuma-boot-amd64`, never the kernel's own state.
 
 use akuma_mmu::{user_flags, UserAddressSpace};
@@ -452,7 +452,7 @@ fn drop_returns_frames_test(t: &mut Suite) {
 
 /// The three range walks C1 step 5a needs, on a private address space.
 ///
-/// These are the one capability `akuma-mmu` did not have and `amd64/src/mm.rs`
+/// These are the one capability `akuma-mmu` did not have and `crates/akuma-kernel-amd64/src/mm.rs`
 /// cannot be ported without: `munmap`, `mprotect`, `mremap`, `madvise`, `fork`'s
 /// CoW demote and `/proc/self/maps` are all written against a *table* walk here,
 /// where the AArch64 kernel iterates VAs from its region list

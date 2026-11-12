@@ -22,7 +22,7 @@
 //!   `poll`/`select`'s millisecond and `timeval` timeouts, and chunked large
 //!   reads (glue serves at most [`MAX_IO`] bytes per call).
 //!
-//! Moved out of `amd64/src/fd.rs` for Taoxichuan's adoption of glue
+//! Moved out of `crates/akuma-kernel-amd64/src/fd.rs` for Taoxichuan's adoption of glue
 //! (`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md` step 2c-B): the alternative was a
 //! third copy. A kernel's own devices (amd64's kvm, tun, wifi, framebuffer, its
 //! console ends) are intercepted by the kernel *before* it calls in here; this

@@ -20,7 +20,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `before_main`; a `no-tests` image does not link it. `akuma-drivers-amd64` is the amd64 driver
   wiring, **one feature per driver** (`fbcon`, `hda`, `i8042`, `kvm`, `nvme`, `touchpad`, `wifi`, `xhci`; `all` is the bin's default,
   `headless` the lean test-box set — `docs/reference/build-profiles.md` § amd64 images): each
-  driver registers a per-class table (`amd64/src/drivers.rs`: display, sound, pointer, wireless,
+  driver registers a per-class table (`crates/akuma-kernel-amd64/src/drivers.rs`: display, sound, pointer, wireless,
   hypervisor, usb, nvme, keyboard) whose
   forwarders read "absent" when nothing registered, and reaches the kernel only through
   `drivers::services`. **Never add a driver `cfg` to the machine half**; add a class slot.
@@ -60,7 +60,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   the `static` itself, a length and alignment in its type, a borrow word that turns a
   second overlapping `&mut` into a panic, volatile `get`/`set` for cells a *device*
   writes, and a bounds-checked cache `flush` — plus `FrameArena`/`FrameLease`, moved
-  from `akuma-net-nic`. It is why `amd64/src/{xhci,hda}.rs` hold no `unsafe`. **Never
+  from `akuma-net-nic`. It is why `crates/akuma-kernel-amd64/src/{xhci,hda}.rs` hold no `unsafe`. **Never
   write `from_raw_parts_mut((&raw mut BUF).cast(), N)` for a DMA buffer again.** Its
   counterpart for registers is `akuma_primitives::mmio::MmioWindow` (bounds- and
   alignment-checked, one `unsafe` per mapped BAR in `pci::map_bar_window`).
@@ -70,7 +70,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `fn(&mut Trap)` registered per `Kind`; and the 256-gate table as atomics with `lidt`
   its only `unsafe`. They replaced `idt.rs`'s five hand-written asm entries and
   eighteen `&mut *frame` sites (38 -> 4 sites in `idt.rs`). **Add a trap = one
-  `Kind` arm + one `register` line; never `&mut *` a stub's pointer in `amd64/`.**
+  `Kind` arm + one `register` line; never `&mut *` a stub's pointer in `crates/akuma-kernel-amd64/`.**
   The AArch64 counterpart is `akuma-trap-aarch64` (2026-10-19): a `FrameHandle` over the
   EL0 `UserTrapFrame` (volatile accessors, `snapshot`/`store`), made once at
   `rust_sync_el0_handler`; `akuma-exceptions` went 83 -> 38 sites. **Never write
@@ -183,7 +183,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `docs/reference/subsystems/networking.md` records), the netmask/broadcast
   derivation, the `/proc/net/dev` column format. It was inside
   `akuma-syscalls-glue`, which does not build for `x86_64-unknown-none`; now
-  both `akuma-syscalls-glue::net` and `amd64/src/fd.rs` consume it and cannot
+  both `akuma-syscalls-glue::net` and `crates/akuma-kernel-amd64/src/fd.rs` consume it and cannot
   drift. Depends only on `akuma-syscalls-linux`; the user-memory copies and the
   `FileDescriptor::Socket` gate stay with each caller.
   Further families move out on the same model when a family has real
@@ -196,7 +196,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   generating the enum, both decodes, both encodes and `ALL` together, so a
   transposed digit can only be transposed once; the x86_64 number is a literal
   and the aarch64 one is a **path into `akuma-syscalls-linux`**, which is what
-  stops the tables drifting. `amd64/src/usermode.rs` decodes through it and a
+  stops the tables drifting. `crates/akuma-kernel-amd64/src/usermode.rs` decodes through it and a
   folded arm hands glue `to_aarch64()`; **glue's own `match syscall_num` is
   untouched**, so the AArch64 `.text` stays byte-identical and the cost —
   asm-generic numbers inside glue on an x86_64 kernel — is pinned rather than
@@ -207,7 +207,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `open`, `stat`, `poll`, `select`, `fork`, `mkdir`, `symlink`, `arch_prctl`,
   `time` and 12 more have none. The fixed rewrites (`open` -> `openat(AT_FDCWD, ..)` and
   18 more) are `akuma_syscalls_abi::legacy::fold`, applied by both x86_64 kernels before
-  dispatch so a legacy spelling reaches its modern spelling's arm; the rest stay arms in `amd64/`. The
+  dispatch so a legacy spelling reaches its modern spelling's arm; the rest stay arms in `crates/akuma-kernel-amd64/`. The
   first pass over that list found x86_64 88 (`symlink`) dispatching to
   `sys_utimensat`, which returns 0 — so `ln -s` reported success and created
   nothing for months.
@@ -593,7 +593,10 @@ kernel by default and the amd64 one with `--target x86_64-unknown-none` (artifac
 `target/x86_64-unknown-none/release/akuma`). Its dependencies are per-target tables and its
 `[features]` table serves both; `src/main.rs` is the root, `src/{aarch64,amd64}.rs` each half's
 bin items. The old `amd64/bin` package `akuma-amd64` is gone; installed kernels on the boxes
-keep their file names (`/boot/akuma-amd64`, the ESP's `EFI/akuma/akuma-amd64`).
+keep their file names (`/boot/akuma-amd64`, the ESP's `EFI/akuma/akuma-amd64`). The amd64
+machine half is the crate `crates/akuma-kernel-amd64` (it was `amd64/` until 2026-11-12);
+`amd64/` keeps only its run, disk and staging scripts (`run.sh`, `mkdisk.sh`,
+`run-firecracker.sh`, ...).
 
 **Build `headless` unless the kernel actually has to run on ryzen or trashcan as
 the host.** The plain `--release` default pulls in `akuma-fbcon` (`fbcon` is in

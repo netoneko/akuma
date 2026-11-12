@@ -40,7 +40,7 @@ Linux refuses the write (`ETXTBSY`, "Text file busy"); this kernel had no such r
 The filesystem check, `FsError::TextBusy`, `Filesystem::identity` and the `openat` refusal are shared, so what these kernels needed was the pin.
 It lives in `akuma_exec::process::ProcessImage::text` (lock-protected, next to `exe`, which has the same lifecycle):
 
-- **Taken before the read, moved in after the install.** aarch64 `do_execve` (`akuma-syscalls-glue`) and amd64 `do_execve` (`amd64/src/usermode.rs`)
+- **Taken before the read, moved in after the install.** aarch64 `do_execve` (`akuma-syscalls-glue`) and amd64 `do_execve` (`crates/akuma-kernel-amd64/src/usermode.rs`)
   call `akuma_vfs_glue::text_pin(path)` right after the execute-permission check and hand it to `Process::set_text` once the image is
   installed. **On success both functions `eret`/abandon their frame, so a pin left in a local would be permanent**: the shebang branch drops it
   explicitly (the script is data; the recursion pins the interpreter) and the success path moves it into the process.

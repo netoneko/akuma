@@ -424,7 +424,7 @@ def deploy(repo=".", branch=None, timeout=600,
     # build *succeeds* against the old code, and the numbers you then read look
     # like your change did nothing.
     #
-    # Measured 2026-09-07: `amd64/src/boot.rs` was new, the patch carried the
+    # Measured 2026-09-07: `crates/akuma-kernel-amd64/src/boot.rs` was new, the patch carried the
     # edits to `main.rs`/`multiboot2.rs` that referenced it and not the file
     # itself, and the box shipped a kernel byte-identical to the previous one.
     # The md5 in `stage_akuma.sh`'s output was the only evidence.

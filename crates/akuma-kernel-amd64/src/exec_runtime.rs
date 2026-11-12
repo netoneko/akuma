@@ -163,7 +163,7 @@ macro_rules! not_wired {
         panic!(concat!(
             "amd64: ExecRuntime::", $name, " was called but is not wired yet (", $step, "). ",
             "A syscall folded into akuma-syscalls-glue has reached a subsystem this target ",
-            "still serves from amd64/src. See amd64/src/exec_runtime.rs."
+            "still serves from crates/akuma-kernel-amd64/src. See crates/akuma-kernel-amd64/src/exec_runtime.rs."
         ))
     };
 }
@@ -584,7 +584,7 @@ fn config() -> ExecConfig {
 /// That function registers seven upward surfaces at once — the BKL yield hook,
 /// `akuma-mmu`'s scheduler gates, the PMM's surviving-mapper walk, the prefault
 /// hook, `akuma-threading`'s whole table — against subsystems this target
-/// serves from `amd64/src` and in an order `boot.rs` has not reached yet. So
+/// serves from `crates/akuma-kernel-amd64/src` and in an order `boot.rs` has not reached yet. So
 /// this registers the two tables it needs, **and each further hook explicitly
 /// when a step starts depending on it**, rather than taking all seven and
 /// finding out which ones fire.

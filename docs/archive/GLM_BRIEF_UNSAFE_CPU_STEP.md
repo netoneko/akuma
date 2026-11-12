@@ -21,7 +21,7 @@ Work ONLY on this branch. Commit incrementally with real messages.
 The unsafe block is not needed at all in either; they contain only address
 arithmetic (`&raw const` + cast + `add` + `as u64`), which is safe:
 1. crates/akuma-tokio-kernel-amd64/src/lib.rs:170  `trap_top_for`
-2. amd64/src/gdt.rs:100  `TRAP_STACK` end-address computation
+2. crates/akuma-kernel-amd64/src/gdt.rs:100  `TRAP_STACK` end-address computation
 
 Delete the `unsafe {}` (keep the explanatory comment, reworded from SAFETY to
 why-the-value-is-right). Verify each with a build (below).
@@ -35,22 +35,22 @@ already; follow the existing style: closed, named, doc-commented):
   deliberately unsafe at call sites — replace call sites with these NAMED
   writers, one semantic per fn, doc comment states the exact bits):
   - `ctlreg::enable_fpu()` — CR0.EM=0, CR0.MP=1, CR0.NE-ish bits used by
-    amd64/src/smp.rs:944 and tk lib.rs:617 (`enable_cpu_features`)
-  - `ctlreg::enable_xsave()` — CR4.OSXSAVE (1<<18), amd64/src/smp.rs:994
-  - `ctlreg::enable_smep_smap()` — CR4.SMEP|SMAP per CPUID, amd64/src/uaccess.rs:194
-  - `ctlreg::set_cr0_wp()` — CR0.WP (1<<16), tk lib.rs:1834 and amd64/src/uaccess.rs:212
+    crates/akuma-kernel-amd64/src/smp.rs:944 and tk lib.rs:617 (`enable_cpu_features`)
+  - `ctlreg::enable_xsave()` — CR4.OSXSAVE (1<<18), crates/akuma-kernel-amd64/src/smp.rs:994
+  - `ctlreg::enable_smep_smap()` — CR4.SMEP|SMAP per CPUID, crates/akuma-kernel-amd64/src/uaccess.rs:194
+  - `ctlreg::set_cr0_wp()` — CR0.WP (1<<16), tk lib.rs:1834 and crates/akuma-kernel-amd64/src/uaccess.rs:212
 - `interrupts::{on, off}` — `sti` / `cli` (nomem, nostack, preserves_flags):
-  amd64/src/lapic.rs:406,671,682; amd64/src/boot.rs:339; amd64/src/clock.rs:455
-- `park::halt()` — `cli; hlt` loop: amd64/src/main.rs:490, tk lib.rs:1998
+  crates/akuma-kernel-amd64/src/lapic.rs:406,671,682; crates/akuma-kernel-amd64/src/boot.rs:339; crates/akuma-kernel-amd64/src/clock.rs:455
+- `park::halt()` — `cli; hlt` loop: crates/akuma-kernel-amd64/src/main.rs:490, tk lib.rs:1998
   (check akuma-cpu already has a park module with wfi/wfi_mwait — extend it)
-- `rdrand() -> Option<u64>` — CPUID-gated: amd64/src/net.rs and
+- `rdrand() -> Option<u64>` — CPUID-gated: crates/akuma-kernel-amd64/src/net.rs and
   crates/akuma-tokio-kernel-amd64/src/net.rs have byte-identical asm
 - `msr::set_kernel_gs_base(base)` — canonical-checked like the existing
-  set_fs_base/set_user_gs_base: amd64/src/smp.rs:204
-- PAT init named fn for amd64/src/multiboot2.rs:299 `Msr::Pat` write
+  set_fs_base/set_user_gs_base: crates/akuma-kernel-amd64/src/smp.rs:204
+- PAT init named fn for crates/akuma-kernel-amd64/src/multiboot2.rs:299 `Msr::Pat` write
   (if a PAT helper exists elsewhere, reuse it instead)
 
-Then replace each call site. Kernel selftest blocks in amd64/src/sched.rs that
+Then replace each call site. Kernel selftest blocks in crates/akuma-kernel-amd64/src/sched.rs that
 use sti/cli may also move — only if it does not change test semantics.
 
 Do NOT do audit steps 3–7 (PhysSlice, SVM, AP bring-up, ring3, gdt per-cpu,
@@ -69,10 +69,10 @@ lapic, pte walker) — later stages.
   final report.
 - Gate: `python3 scripts/check_unsafe_budget.py` must pass; then
   `python3 scripts/check_unsafe_budget.py --update` and INCLUDE the budget
-  diff in a commit — the ratchet must show the decrease (expected: amd64/src
+  diff in a commit — the ratchet must show the decrease (expected: crates/akuma-kernel-amd64/src
   80→≈67, akuma-tokio-kernel-amd64 29→≈22, and small named-fn increases
   inside akuma-cpu only).
-- Also run `python3 scripts/cloc_akuma.py --json --by-file amd64/src crates/akuma-tokio-kernel-amd64 crates/akuma-cpu` and record site counts before/after.
+- Also run `python3 scripts/cloc_akuma.py --json --by-file crates/akuma-kernel-amd64/src crates/akuma-tokio-kernel-amd64 crates/akuma-cpu` and record site counts before/after.
 
 ## Finish
 

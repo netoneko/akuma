@@ -120,7 +120,7 @@ pub fn compute_heap_size(ram_size: usize, code_and_stack: usize, manual_override
 ///
 /// Extracted from `akuma-config::compute_user_stack_size` (AArch64-only until now; amd64 never
 /// called it and instead hardcoded a flat ceiling, `ELF_STACK_MAX_PAGES * 4096` = 8 MiB,
-/// regardless of RAM — see `amd64/src/exec_runtime.rs`). `manual_override`, like every other
+/// regardless of RAM — see `crates/akuma-kernel-amd64/src/exec_runtime.rs`). `manual_override`, like every other
 /// function here, is the caller's own escape hatch (`USER_STACK_SIZE_OVERRIDE`).
 ///
 /// `ram / 2048` clamped to `[128 KiB, 8 MiB]`, rounded up to a 4 KiB page:

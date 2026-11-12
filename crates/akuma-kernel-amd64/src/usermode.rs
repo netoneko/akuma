@@ -3560,7 +3560,7 @@ pub fn after_reap() {
 
 /// The interactive console's half of [`run_init`]: everything init's first
 /// `read(0)` and `TIOCGWINSZ` rely on, done before init exists. The `console`
-/// feature (`amd64/Cargo.toml`).
+/// feature (`crates/akuma-kernel-amd64/Cargo.toml`).
 #[cfg(feature = "console")]
 fn console_before_init(path: &str) {
     // The screen's real size into the console's terminal state (so `stty size`

@@ -427,7 +427,7 @@ procedure is [`../../runbooks/debug-delayed-first-byte.md`](../../runbooks/debug
 dependency-light leaf (only `akuma-syscalls-linux`) holding the `struct ifreq`
 marshalling, the `SIOCGIFCONF` record + 40-byte stride, the netmask/broadcast
 derivation, and the `/proc/net/dev` column format, all host-tested. Both kernels
-now consume it: `akuma-syscalls-glue::net` (aarch64) and `amd64/src/fd.rs` (the
+now consume it: `akuma-syscalls-glue::net` (aarch64) and `crates/akuma-kernel-amd64/src/fd.rs` (the
 amd64 port, which had none of this before and where `busybox ifconfig` now
 works). The extraction is specifically so the stride trap below can only be
 written once. The glue keeps the user-memory reads/writes and the
@@ -521,7 +521,7 @@ clock all come through it. It sends A queries over a plain UDP socket
 (`akuma-dns`), walks the resolver list on a timeout **or an answer without a
 record**, and retransmits every 1.5 s. Until 2026-10-18 AArch64 used smoltcp's
 DNS socket (`smoltcp_net::dns_query`, now deleted along with that socket's slot)
-and amd64 had its own copy (`amd64/src/dns.rs`, deleted); they differed exactly
+and amd64 had its own copy (`crates/akuma-kernel-amd64/src/dns.rs`, deleted); they differed exactly
 where it mattered: smoltcp fails on the first `NXDOMAIN`, and a resolver that
 `NXDOMAIN`s a name another answers is a measured case (the HP box's uplink;
 QEMU slirp's forwarder answered `NXDOMAIN` for `example.com` while `1.1.1.1`

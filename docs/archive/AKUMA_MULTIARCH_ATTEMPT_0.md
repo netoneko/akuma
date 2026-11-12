@@ -136,7 +136,7 @@ at the call site.
 | M2 MachineFacts | — | `akuma-machine-facts` + adapters + both kernels report it; **no consumer reads it yet** except `smp::trampoline_page_available` (M2c) | **half** |
 | M6 scheduler | AArch64 full kernel onto hooked path | `akuma-threading/hooked` exists and `akuma-tokio-kernel-aarch64` uses it; the root kernel does not | **open** (D3 decided) |
 | M7 kit | `akuma-kernel` front + machine halves | not started | **open** |
-| amd64 on `akuma-kernel-core`/`-glue` | "consumes none" | still true (`amd64/Cargo.toml` has neither) | **open — the real remaining convergence** |
+| amd64 on `akuma-kernel-core`/`-glue` | "consumes none" | still true (`crates/akuma-kernel-amd64/Cargo.toml` has neither) | **open — the real remaining convergence** |
 
 ### What that means for the plan
 
@@ -160,7 +160,7 @@ at the call site.
 ## M3 — the fork walk's decision table (option ii)
 
 - **M3a (done): `akuma_user_tree::fork_leaf(Backing, Span, writable, cow) -> ForkLeaf`** with
-  `ForkLeaf::{Device, ShareWritable, DemoteBoth, ShareReadOnly}`, and `amd64/src/usermode.rs`'s
+  `ForkLeaf::{Device, ShareWritable, DemoteBoth, ShareReadOnly}`, and `crates/akuma-kernel-amd64/src/usermode.rs`'s
   `share_parent_memory_into` now classifies each leaf through it (the four arm bodies are unchanged;
   only their conditions moved). Two host tests: the truth table, and
   **`fork_leaf_agrees_with_plan_clone`** — for every `(shared, writable, cow)` it derives the raw x86
@@ -222,7 +222,7 @@ that is D4's sequencing question, still open.
 
 The research doc's own rule (§4): *"Do not start by creating the kit crate ... the kit front
 (`entry!` + cfg re-export) is ~50 lines and can arrive last, when the amd64 bin is thin."* The bin is not
-thin: `amd64/src` is 53 kL, `usermode.rs` alone 9.3 kL (1,346 L `syscall_dispatch`, 2,661 L of boot
+thin: `crates/akuma-kernel-amd64/src` is 53 kL, `usermode.rs` alone 9.3 kL (1,346 L `syscall_dispatch`, 2,661 L of boot
 self-tests), and amd64 still consumes neither `akuma-kernel-core` nor `akuma-kernel-glue`. A front crate
 now would re-export two kernels that share a name and nothing else — the "thin witness" the doc warns
 about. Preconditions, in order: (a) amd64 on `kernel-core`'s neutral spine (console rules, config,
@@ -233,7 +233,7 @@ rename/hoist.
 
 ### Added to the plan 2026-11-11: the tests crate and the drivers-wiring crate
 
-`amd64/src` (56.9 kL) does not split two ways (tests and drivers). It splits three ways, and
+`crates/akuma-kernel-amd64/src` (56.9 kL) does not split two ways (tests and drivers). It splits three ways, and
 each destination gets its own crate:
 
 | destination | what | crate |
@@ -484,8 +484,8 @@ herd. A baseline flake, recorded so the pair reads honestly; not investigated.
 
 ### W2a — the boot self-tests move to `usermode/tests.rs` (2026-11-10)
 
-`amd64/src/usermode.rs` was 9,277 lines and a third of it was `#[cfg(not(feature = "no-tests"))]`
-items. They are now the child module `amd64/src/usermode/tests.rs` (2,979 lines moved, unchanged): the
+`crates/akuma-kernel-amd64/src/usermode.rs` was 9,277 lines and a third of it was `#[cfg(not(feature = "no-tests"))]`
+items. They are now the child module `crates/akuma-kernel-amd64/src/usermode/tests.rs` (2,979 lines moved, unchanged): the
 22 `pub fn *_test(t: &mut Suite)` entry points, their private helpers (`run_sh_capture`,
 `for_each_pt_load`, `socketpair_test`, `argv_capacity_test`, `reject_test`, ...), the test-process
 plumbing (`start_test_process`, `wait_test_exit`, `finish_test_process`), the hand-assembled program
@@ -517,7 +517,7 @@ walker to buy a property the agreement test already guarantees. Not doing it.
 ### W2b — `syscall_dispatch` moves to `usermode/dispatch.rs`, split by family (2026-11-10)
 
 The 1,338-line dispatcher (939 of them comments) and the C1 seam (`to_glue`, `to_glue_raw`) are now
-`amd64/src/usermode/dispatch.rs`. Its four stages keep their order: Akuma-private numbers
+`crates/akuma-kernel-amd64/src/usermode/dispatch.rs`. Its four stages keep their order: Akuma-private numbers
 (`akuma_private`, the old 230-line `return match`), the x86-only legacy folds and the shared-number
 calls (inline, verbatim), then the decoded `Syscall` table — which was one ~900-line `match` and is now
 eight family functions, `fs` (53 arms), `poll` (9), `mem` (9), `net` (25), `process` (23), `signal` (7),
@@ -812,7 +812,7 @@ ISAs. Akuma does not answer `getcpu`, so only the combined bucket fills. p50 / p
 | this branch | 26 / 75 | 235 / 495 | 52 / 100 | 322 / 825 |
 
 The refactor did not move either kernel's wake path. The amd64 baseline is `c2f58d79^`, because
-`3baa8e88`'s amd64 kernel does not link (`shootdown_entry` defined in both `amd64/src/shootdown.rs`
+`3baa8e88`'s amd64 kernel does not link (`shootdown_entry` defined in both `crates/akuma-kernel-amd64/src/shootdown.rs`
 and `akuma-boot-amd64`, from `c2f58d79`). Hooked differs from SGI in shape, not by a clear margin
 either way.
 
@@ -849,7 +849,7 @@ which path waits for the tick (a halted peer core not sent a wake IPI is the fir
 **Line count, same script on all three trees** (`scripts/cloc_akuma.py`, no arguments): fork point
 `0b78d0cb` 129,055 production / 70,590 test; `main` today 129,247 / 70,644; this branch 129,874 /
 70,946. The branch is **+819 production lines**, all additions: `akuma-kernel-glue` +236 (hooked
-machine half), `akuma-machine-facts` +178 (new), `amd64/src` +96, `akuma-entry` +94,
+machine half), `akuma-machine-facts` +178 (new), `crates/akuma-kernel-amd64/src` +96, `akuma-entry` +94,
 `akuma-threading` +79, the rest +136. Nothing is removed yet, because the hooked scheduler sits
 beside the SGI one behind a feature. The reductions come with making hooked the AArch64 default and
 deleting the SGI path, and with amd64 adopting `akuma-kernel-glue`. That size is not measured.
@@ -1277,7 +1277,7 @@ Gates: clippy clean for default, devbox-smoltcp, amd64 (base and `ring0-preempt`
 ## M7a — the amd64 kernel is a library behind a two-symbol bin (2026-11-11)
 
 The first move of M7, done the way B15 did it for the tokio kit: code moves under a library
-first, and the front crate arrives after. `amd64/src/main.rs` became `amd64/src/lib.rs` (a
+first, and the front crate arrives after. `crates/akuma-kernel-amd64/src/main.rs` became `crates/akuma-kernel-amd64/src/lib.rs` (a
 `git mv`, so its history follows), and the package gained a `[lib]` named
 `akuma_kernel_amd64`, after the machine half it is headed to be (research doc §9.3). The new
 `main.rs` is 21 lines: the two `#[unsafe(no_mangle)] extern "C"` symbols `boot.s` calls (`kmain`,
@@ -1318,7 +1318,7 @@ crate and glue cannot depend back on it. Its `rust_start` body moved into
 amd64 needed one more package split. The bin cannot use the front while it shares a package
 with the library: `akuma-amd64 → akuma-kernel → akuma-amd64` is a cycle. So:
 
-- `amd64/` is now package **`akuma-kernel-amd64`**, library only. All `amd64/src/...` paths
+- `amd64/` is now package **`akuma-kernel-amd64`**, library only. All `crates/akuma-kernel-amd64/src/...` paths
   are unchanged. Its `build.rs` exports `linker.ld` as `links` metadata instead of passing
   `-T` itself.
 - **`amd64/bin/`** is package **`akuma-amd64`**. It holds the 11-line `main.rs`
@@ -1510,11 +1510,11 @@ components; the totals did not change.
 
 | commit | what moved | budgets |
 |---|---|---|
-| `02b1c1b2` | the boot suite: `boot::self_tests` -> `crates/akuma-kernel-tests-amd64/src/suite.rs` (291 lines), `amd64/src/usermode/tests.rs` -> `usermode_tests.rs` (3 008, `git mv`) | none |
-| `1eb782f2` | `amd64/src/uas.rs` (the `akuma-mmu` walker suite, 675) -> `uas_tests.rs` | none |
+| `02b1c1b2` | the boot suite: `boot::self_tests` -> `crates/akuma-kernel-tests-amd64/src/suite.rs` (291 lines), `crates/akuma-kernel-amd64/src/usermode/tests.rs` -> `usermode_tests.rs` (3 008, `git mv`) | none |
+| `1eb782f2` | `crates/akuma-kernel-amd64/src/uas.rs` (the `akuma-mmu` walker suite, 675) -> `uas_tests.rs` | none |
 | `ecabfbb7` | the driver crate, with HD Audio (`hda.rs`, 1 092) behind `hda`; the sound class | addr amd64 83 -> 82, drivers 0 -> 1 |
 | `06a80f57` | the I2C-HID touchpad (`touchpad.rs` 784 + `i2c.rs` 252) behind `touchpad`; the pointer class | addr amd64 82 -> 80, drivers 1 -> 3 |
-| `9c3de257` | the framebuffer console (~850 lines of `multiboot2.rs` -> `fbcon.rs`) behind `fbcon`; the display class; the `headless` image | unsafe amd64/src 57 -> 56, drivers 0 -> 1; addr amd64 80 -> 79, drivers 3 -> 4 |
+| `9c3de257` | the framebuffer console (~850 lines of `multiboot2.rs` -> `fbcon.rs`) behind `fbcon`; the display class; the `headless` image | unsafe crates/akuma-kernel-amd64/src 57 -> 56, drivers 0 -> 1; addr amd64 80 -> 79, drivers 3 -> 4 |
 
 **`02b1c1b2` does not build alone.** Its hook was still running when `uas.rs` was renamed with
 `git mv`, and the rename went into that commit without the edits that went with it. `1eb782f2`
@@ -1532,7 +1532,7 @@ completes it. The history was not rewritten. Bisecting across the pair needs bot
   the crate's own `lib.rs` is `#![cfg(not(feature = "no-tests"))]`, so a `no-tests` image links
   nothing from it. `boot::register_self_tests` is cfg'd out of the kernel too.
 - **The probe ELFs.** The ELFs the suite runs (`USER_{HELLO,THREADPROBE,KILLPROBE,SIGREGS}_ELF`)
-  were `rustc-env` of `amd64/build.rs`, so only `amd64` could see them. `amd64/build.rs` now
+  were `rustc-env` of `crates/akuma-kernel-amd64/build.rs`, so only `amd64` could see them. `crates/akuma-kernel-amd64/build.rs` now
   emits them as `links` metadata. The tests crate's `build.rs` reads them as
   `DEP_AKUMA_KERNEL_AMD64_USER_*_ELF` and re-emits them for itself.
 - **Visibility.** The suite reaches the kernel only through `akuma_kernel_amd64::testing`.
@@ -1554,7 +1554,7 @@ completes it. The history was not rewritten. Bisecting across the pair needs bot
 - **New pub items needed new lints.** Once exported, items attracted clippy's
   `must_use_candidate` and `too_long_first_doc_paragraph`. They got `#[must_use]`, an
   `allow` with a reason where callers ignore the result, or a split first paragraph.
-- **What did not move.** The per-file inline suites stay in `amd64/src` (92 `no-tests` cfgs
+- **What did not move.** The per-file inline suites stay in `crates/akuma-kernel-amd64/src` (92 `no-tests` cfgs
   remain there, some of them bring-up switches rather than tests; the largest suite is `fd.rs`'s
   ~1.1 kL). They read module-private state (`fd`'s table internals,
   `install`, `covered_by`, `console::channel`), so moving them means either widening that
@@ -1564,7 +1564,7 @@ completes it. The history was not rewritten. Bisecting across the pair needs bot
 
 ### The drivers crate
 
-- **The seam.** `amd64/src/drivers.rs` has one `Registered` slot per class, each holding a
+- **The seam.** `crates/akuma-kernel-amd64/src/drivers.rs` has one `Registered` slot per class, each holding a
   table of function pointers: `Sound` (`init`), `Pointer` (discover, init, poll, present,
   has_events, `/dev/input/mouse0` read and write, console bridge) and `Display` (20 entries,
   held as `&'static` because `mirror_byte` runs per printed byte). The machine half calls
@@ -1642,9 +1642,9 @@ at unsafe 407 and addr 692.
 
 | commit | what | budget moves |
 |---|---|---|
-| `a58becf2` | `amd64/build.rs` builds the guest test programs with `-C strip=debuginfo` | none |
+| `a58becf2` | `crates/akuma-kernel-amd64/build.rs` builds the guest test programs with `-C strip=debuginfo` | none |
 | `337cdb7b` | `wifi.rs`, `rtw89.rs`, `rtw89_sta.rs` (2,630 lines) behind `wifi`; the wireless class | none (the three files hold neither) |
-| `887d601f` | `kvm.rs` + `kvm/` (8 files, 8,674 lines) behind `kvm`; the hypervisor class | unsafe amd64/src 56 -> 41, drivers 1 -> 16; addr amd64 79 -> 62, drivers 4 -> 21 |
+| `887d601f` | `kvm.rs` + `kvm/` (8 files, 8,674 lines) behind `kvm`; the hypervisor class | unsafe crates/akuma-kernel-amd64/src 56 -> 41, drivers 1 -> 16; addr amd64 79 -> 62, drivers 4 -> 21 |
 
 **The guest programs.** `sigregs.elf` was 742,760 bytes, about 707 KB of it `.debug_*`, and
 `fdprobe.elf` was 737,808. They are now 20,160 and 15,200. `hello` (13,192), `threadprobe`
@@ -1676,7 +1676,7 @@ on `hypervisor_present`. The `mmap` note's forwarder takes a `VirtAddr`, so the 
 untyped address parameter.
 
 Moving `kvm/ctl.rs` into `crates/` exposed a hand-rolled `fmt::Write` buffer. The pre-commit
-console-print rule scans `crates/*/src` but not `amd64/src`. It is now
+console-print rule scans `crates/*/src` but not `crates/akuma-kernel-amd64/src`. It is now
 `akuma_primitives::console::StackWriter<192>`, with the same truncation. The SVM path is
 compile-verified only, because TCG has no SVM.
 
@@ -1709,7 +1709,7 @@ carry `forbid(unsafe_code)`; the answer is "not yet", and the 7 are the reason.
 
 - **`kvm/api.rs`, the vCPU box (1 -> 0).** `boxed` built a `Box<[T; 1]>` with `Box::from_raw`. It now
   goes through `Vec::into_boxed_slice().try_into()`, which is the same allocation, safely.
-- **`fbcon`, the framebuffer window (1 -> 0 here, +1 in `amd64/src`).** The `MmioWindow::new` over
+- **`fbcon`, the framebuffer window (1 -> 0 here, +1 in `crates/akuma-kernel-amd64/src`).** The `MmioWindow::new` over
   GRUB's framebuffer moved into the machine half: `multiboot2::framebuffer_window()` records the
   boot framebuffer's address and length from the boot info, checks it is an RGB framebuffer inside
   the physmap, and hands the window out **once per boot**. The claim "these bytes are the
@@ -1730,7 +1730,7 @@ carry `forbid(unsafe_code)`; the answer is "not yet", and the 7 are the reason.
     `Npt` built only from such types inside the leaf, and a check at `run` that the VMCB has nested
     paging on with `nCR3` at that `Npt`. That is a rewrite of `Ram`, the memslot table and both
     `build_npt`s, and it can only be verified on SVM hardware.
-- **Budget.** Drivers 16 -> 7, leaf 0 -> 6, `amd64/src` 41 -> 42: 405 in total (from 407).
+- **Budget.** Drivers 16 -> 7, leaf 0 -> 6, `crates/akuma-kernel-amd64/src` 41 -> 42: 405 in total (from 407).
 - **Verification.** Clippy is clean on the default, `no-tests`, `ring0-preempt`, `headless` and
   `headless,no-tests` images; the amd64 TCG boot suite passes: default and headless, SMP=1 829/0 and SMP=2 839/0. **The SVM path is
   compile-verified only**: TCG boots PVH with no guest, the trashcan has no SVM, and rig kernels do
@@ -1753,7 +1753,7 @@ and `register` installs `akuma_kvm_amd64::HYPERVISOR`.
 - Gates: clippy clean on six feature sets (incl. `headless,kvm`); amd64 TCG default and headless SMP=1 829/0, SMP=2 839/0.
 - Budget: drivers 7 -> 0, `akuma-kvm-amd64` 0 -> 7, total unchanged at 405. The 13 untyped address
   parameters moved with the code (`addr-params-budget.json`).
-- Stale `amd64/src/kvm/` paths in live docs and code comments (stale since `887d601f`) now point
+- Stale `crates/akuma-kernel-amd64/src/kvm/` paths in live docs and code comments (stale since `887d601f`) now point
   at the crate.
 
 ### Future work: host tests for `akuma-kvm-amd64`
@@ -1844,10 +1844,10 @@ through the "testable" list largest-risk-first, taking `akuma-exceptions`, `akum
 
 ## The storage and keyboard drivers join the drivers crate (2026-11-11)
 
-xHCI (2.5 kL), NVMe (0.6 kL) and the i8042 keyboard (0.5 kL) moved from `amd64/src` into
+xHCI (2.5 kL), NVMe (0.6 kL) and the i8042 keyboard (0.5 kL) moved from `crates/akuma-kernel-amd64/src` into
 `akuma-drivers-amd64` with `git mv`, each behind its own feature (`xhci`, `nvme`, `i8042`; all three
 in `all`, and in the new `storage-and-input`, which the bin's `headless` now enables). Three new class
-slots in `amd64/src/drivers.rs`, in the existing shape (a `Registered` table of function pointers,
+slots in `crates/akuma-kernel-amd64/src/drivers.rs`, in the existing shape (a `Registered` table of function pointers,
 forwarders that read "absent"):
 
 - **`Usb`**: init, shutdown, the `/dev/sda` byte I/O and flush, the boot keyboard, and the boot
@@ -1875,7 +1875,7 @@ What did **not** move, and why:
 **`unsafe` went down, not sideways.** `kbd.rs` carried a hand-rolled bounded lock (`UnsafeCell`, an
 `unsafe impl Sync`, a `&mut *` in the guard), two sites. It is now `spinning_top::Spinlock::try_lock`
 in the same bounded loop (give up after `1 << 22` attempts and report "no key"), so the
-drivers crate stays `forbid`. `amd64/src` 42 -> 40; total 405 -> 403. NVMe and xHCI held no `unsafe`
+drivers crate stays `forbid`. `crates/akuma-kernel-amd64/src` 42 -> 40; total 405 -> 403. NVMe and xHCI held no `unsafe`
 (BAR windows from `pci::map_bar_window`, `DmaArray` for DMA). Four untyped address parameters moved
 with the code.
 
@@ -1891,7 +1891,7 @@ ryzen rig or the metal.
 ## The convergence, re-evaluated against the tree (2026-11-11, evening)
 
 "The big merge" is one kernel build for both architectures: the neutral half shared, two machine
-halves. With the drivers out, `amd64/src` is 33 kL. What is still a second copy of something AArch64
+halves. With the drivers out, `crates/akuma-kernel-amd64/src` is 33 kL. What is still a second copy of something AArch64
 gets from a shared crate turns out to be much narrower than the 9.3 plan assumed. The checks behind
 that:
 
@@ -1902,7 +1902,7 @@ that:
   amd64 builds with the same `akuma-native` feature set as AArch64. Glue's families no longer name the
   AArch64 walker (`akuma_mmu`: 0 references in `fs`/`mem`/`net`/`sync`/`signal`/`proc`).
 - **The dispatcher is mostly glue already:** 95 of the 136 decoded arms in
-  `amd64/src/usermode/dispatch.rs` hand the call to glue (`to_glue`, which converts the number to
+  `crates/akuma-kernel-amd64/src/usermode/dispatch.rs` hand the call to glue (`to_glue`, which converts the number to
   asm-generic). The x86-only legacy spellings (`open`, `stat`, `fork`, ...) stay amd64's by rule, since
   they have no asm-generic number.
 - **What is still local**, and is the convergence:
@@ -1910,7 +1910,7 @@ that:
 | family | amd64 copy | glue's | why it stayed local | plan |
 |---|---|---|---|---|
 | sockets | `sock.rs` (818 L, wiring over `akuma_net::socket`) | `net.rs` | both wire the same crate; never folded | **done** (Slice 1, below) |
-| futex | `futex.rs` (450 L, effects over `akuma-syscalls-sync`) | `sync.rs` | glue's used `akuma_exec::threading` when amd64 had its own scheduler (the `amd64/Cargo.toml` note is from then); both are on `akuma-threading` now | **done** (Slice 2, below) |
+| futex | `futex.rs` (450 L, effects over `akuma-syscalls-sync`) | `sync.rs` | glue's used `akuma_exec::threading` when amd64 had its own scheduler (the `crates/akuma-kernel-amd64/Cargo.toml` note is from then); both are on `akuma-threading` now | **done** (Slice 2, below) |
 | signals | `kill`/`tkill`/`tgkill` via `akuma-syscalls-glue-amd64::kill`; `rt_sigreturn` and delivery | `signal.rs`/`proc.rs` | the x86 `kill -9` fix went into the x86 copy | diff the two, keep the stronger, one copy; sigframe and `rt_sigreturn` stay per-arch |
 | fd I/O | `fd.rs` (3.8 kL): read/write/open/stat/dup/fcntl/ioctl/poll/select/getdents | `fs.rs`/`poll.rs` | device kinds glue does not know (`DevKvm`, `DevTun`, `DevWifi`, `DevFb`, `DevMouse`, `DevPower`) and x86 `struct stat`/open-flag translation | device kinds through `SyscallHooks` (it already carries `dev_mouse_has_events`/`dev_tun_has_frame`); x86 ABI translation from `akuma-syscalls-glue-amd64`, which the tokio kernel already uses for exactly this; then route |
 | mm | `mm.rs` (3.5 kL) | `mem.rs` | shared-writable file pages (`shmpages`), `/dev/fb0` and `/dev/kvm` mappings, the fork walk (M3) | last: diff per call, hooks for the device mappings |
@@ -1925,12 +1925,12 @@ gets pinned in the slice's commit (research doc §7), not silently resolved.
 
 ### Slice 1: sockets (2026-11-11)
 
-Every AF_INET socket arm in `amd64/src/usermode/dispatch.rs` now calls `to_glue`. That covers
+Every AF_INET socket arm in `crates/akuma-kernel-amd64/src/usermode/dispatch.rs` now calls `to_glue`. That covers
 `socket`, `bind`, `listen`, `accept`, `accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`
 and `setsockopt`. The AF_UNIX guards went with them, because glue's `net::dispatch_*` already decide the
 family from the domain at `socket` and from the descriptor after it.
 
-`amd64/src/sock.rs` went from 818 lines to its kernel-only parts:
+`crates/akuma-kernel-amd64/src/sock.rs` went from 818 lines to its kernel-only parts:
 - the `recvfrom` busy-loop tripwire, which reads this kernel's task slots;
 - the `close` hook that `exec_runtime` hands `akuma-exec`;
 - the boot self-test, which now calls `usermode::syscall_dispatch` by x86_64 number, so each check
@@ -1999,7 +1999,7 @@ it, `dispatch: accept4 (288) reaches the socket layer`, passes an unopened fd 0 
 
 ### Slice 2: futex (2026-11-11)
 
-x86_64 202 now goes `to_glue`, and `amd64/src/futex.rs` (450 lines) is deleted. Its callers were
+x86_64 202 now goes `to_glue`, and `crates/akuma-kernel-amd64/src/futex.rs` (450 lines) is deleted. Its callers were
 rewired to glue:
 
 | caller | now |
@@ -2009,7 +2009,7 @@ rewired to glue:
 | `akuma-exec`'s `futex_wake` hook | `futex_wake` itself |
 | the `DUMP_FUTEX_WAITERS` diagnostic | `futex_dump` |
 
-`amd64/Cargo.toml` drops `akuma-syscalls-sync`.
+`crates/akuma-kernel-amd64/Cargo.toml` drops `akuma-syscalls-sync`.
 
 **Why it could fold now.** The Cargo note said glue's `sync` could not build for amd64 and parked
 on a scheduler the targets did not share. Both stopped being true with B3 and the `akuma-threading`
@@ -2103,7 +2103,7 @@ periodic timer for one store. Unrelated to either slice. Fixed by zeroing the co
 `kill`, `tkill` and `tgkill` are one copy, glue's `signal::{sys_kill, sys_tkill, sys_tgkill}`, on
 every kernel. x86_64 62/200/234 go `to_glue`; the Taoxichuan arms call glue's functions by name;
 `crates/akuma-syscalls-glue-amd64/src/kill.rs` (237 lines) and the three amd64 wrappers in
-`amd64/src/signal.rs` are deleted, and so is glue's `proc::sys_kill`. The x86 body was the stronger
+`crates/akuma-kernel-amd64/src/signal.rs` are deleted, and so is glue's `proc::sys_kill`. The x86 body was the stronger
 one and became glue's: every signal, SIGKILL included, is pended on the target group and taken by
 each thread at its own return to user mode. AArch64 used to hand SIGKILL to `deliver_signal`, whose
 SIGKILL arm marks the victims' slots `TERMINATED` from the killer's core. That arm now serves only
@@ -2202,7 +2202,7 @@ Three steps, each its own commit:
 2. amd64's devices move behind glue hooks.
 3. The Linux-correct refusals move into glue itself, for both kernels.
 
-**Step 1: amd64 runs glue-amd64's fd layer.** `amd64/src/fd.rs` was a second copy of glue-amd64:
+**Step 1: amd64 runs glue-amd64's fd layer.** `crates/akuma-kernel-amd64/src/fd.rs` was a second copy of glue-amd64:
 `openat`'s four refusals (`O_NOFOLLOW`, `O_CREAT` on a directory, `O_DIRECTORY` on a file,
 `O_EXCL`), chunked `read`/`pread` past 64 KiB, the `O_RDONLY` write refusal, the `struct stat`
 conversion, the `poll`/`select` timeouts, `dup2`'s `old == new` rule and the `fcntl` seal commands.
@@ -2234,7 +2234,7 @@ exist: `/dev/fb0`, `/dev/wifi0`, `/dev/power`, `/dev/kvm0` and `/dev/kvm`, `/dev
 `/dev/input/mouse0` are this kernel's drivers, and each arm asked "is this descriptor one of mine?"
 before calling glue. That question is now asked by glue. `akuma_syscalls_glue::chardev` holds one
 `CharDevOps` table (`open`, `read`, `write`, `vectored`, `ioctl`, `fstat`, `close`), which a kernel
-registers at boot. `amd64/src/chardev.rs` is amd64's table, made of the code that left `fd.rs`,
+registers at boot. `crates/akuma-kernel-amd64/src/chardev.rs` is amd64's table, made of the code that left `fd.rs`,
 `usermode.rs` and the dispatcher. Glue calls it from:
 
 | glue arm | hook |
@@ -2857,7 +2857,7 @@ manifest that forwarded every machine-half feature. It is now the root package `
   panic handler) and `src/amd64.rs` (driver and suite registration) each end in `entry!`.
   Both modules are gated on `target_os = "none"` as well, or an Apple-silicon host check would
   compile the AArch64 one.
-- `build.rs` branches on `CARGO_CFG_TARGET_ARCH`: x86_64 passes `amd64/linker.ld` from the
+- `build.rs` branches on `CARGO_CFG_TARGET_ARCH`: x86_64 passes `crates/akuma-kernel-amd64/linker.ld` from the
   machine half's `links` metadata, AArch64 keeps its cfgs and `--defsym`s.
 - The artifact is `target/x86_64-unknown-none/release/akuma` and the build is `-p akuma
   --target x86_64-unknown-none`. Scripts, runbooks and reference docs were renamed. File names
@@ -2882,7 +2882,7 @@ slice went ahead of it.
 [`proposals/AKUMA_MM_CONVERGENCE.md`](../../proposals/AKUMA_MM_CONVERGENCE.md), and all seven of its
 steps landed on this branch the same day. There is one region model (lazy regions joined
 `mmap_regions`). `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `msync` and `brk` are glue's on
-both kernels, and the shared writable page table is one. What `amd64/src/mm.rs` still holds is the
+both kernels, and the shared writable page table is one. What `crates/akuma-kernel-amd64/src/mm.rs` still holds is the
 machine half the proposal keeps per architecture: the page-fault fill (`fault_in`), I-cache and PTE
 encoding, and device mappings. Merging the two fault fills is out of that proposal's scope.
 
@@ -3130,3 +3130,25 @@ it is in the image, so **feature-gating removes lines and linker-dropped dead co
 Lines are not effort: an `unsafe` line or a page-table walker costs more to read than a decoder arm
 (`AUDIT_SURFACE_METHODOLOGY.md`). Moving code into a dependency, or generating it where it is not counted,
 lowers the number without lowering the review.
+
+## The amd64 machine half is a crate (2026-11-12)
+
+After the one-exit steps (`proposals/AKUMA_ONE_EXIT.md`) left it with no per-target table of
+its own beside akuma-exec's, `amd64/` moved to `crates/akuma-kernel-amd64` (`Cargo.toml`,
+`build.rs`, `linker.ld`, `src/`, `README.md`). `amd64/` keeps only the scripts that run and stage
+the kernel (`run.sh`, `mkdisk.sh`, `run-firecracker.sh`, ...): about 25 scripts and docs name
+them by path, and they are not part of the crate.
+
+- Manifest paths: the crate's own `../crates/x` became `../x`; root and the four dependents point
+  at `crates/akuma-kernel-amd64`; the workspace's explicit `"amd64"` member went (`crates/*` covers it).
+- `build.rs` reaches `userspace/amd64` one level further up.
+- 1,464 path references in 414 files were rewritten, the archive included. Excluded from the
+  rewrite: other crates' `-amd64/src` names, `userspace/amd64/...` (the ring-3 programs), and
+  `firecracker-amd64`.
+- The budget gates key by component, so `amd64/src` (unsafe, copy, `mut`) and `amd64`
+  (address parameters) became `crates/akuma-kernel-amd64` with the same budgets. `cloc_akuma.py`
+  keeps the crate in its "amd64 bin" bucket so its reports compare across the move.
+
+Gates: amd64 suite 826/836/836, AArch64 312/320/318, probes and ssh sessions as at step 4,
+clippy `-D warnings` on both targets, host tests, unsafe/address/copy budgets within budget.
+`scripts/check_feature_parity.py` fails, as it already did at HEAD before the move.

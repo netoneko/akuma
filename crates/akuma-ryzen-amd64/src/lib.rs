@@ -65,7 +65,7 @@
 // Zero `unsafe`, and it can stay that way. Every dangerous operation this crate
 // would otherwise need — dereferencing a VMM-supplied physical address — is on
 // the far side of [`mem::PhysMem`], which the *caller* implements. The kernel's
-// impl is three lines with one bounds check (`amd64/src/machine.rs`); the tests'
+// impl is three lines with one bounds check (`crates/akuma-kernel-amd64/src/machine.rs`); the tests'
 // impl is a list of byte spans. That split is what makes a parser of hostile,
 // attacker-adjacent input host-testable and provably memory-safe at the same
 // time. `forbid`, not `deny`, so no module can opt back in.

@@ -12,7 +12,7 @@ that mattered: every other file syscall here reads a descriptor `openat`
 produced, so until it folded, `read`, `lseek`, `fstat` and `getdents64` were
 folding against a descriptor built by a second implementation.
 
-`amd64/src/fd.rs`: **+248 / −297**. The body that went is the `AT_FDCWD` ladder,
+`crates/akuma-kernel-amd64/src/fd.rs`: **+248 / −297**. The body that went is the `AT_FDCWD` ladder,
 symlink resolution, the `/dev` character nodes, the existence and
 parent-directory probes, `O_CREAT`/`O_TRUNC` through `write_file`, the
 `O_APPEND` seed, and the descriptor allocation. What replaced it is a preamble

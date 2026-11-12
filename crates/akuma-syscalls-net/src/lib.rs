@@ -21,7 +21,7 @@
 //! `akuma_net::smoltcp_net::interface_snapshot()` on both kernels) and does
 //! the user copies; this decides the bytes.
 //!
-//! Extracted 2026-09-05 so `amd64/src/fd.rs` can answer these without
+//! Extracted 2026-09-05 so `crates/akuma-kernel-amd64/src/fd.rs` can answer these without
 //! re-deriving the `struct ifreq` offsets — the trap
 //! `docs/reference/subsystems/networking.md` records (a tightly-packed 32-byte
 //! `SIOCGIFCONF` record vs. the 40-byte stride callers actually use) is the

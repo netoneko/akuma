@@ -63,7 +63,7 @@ const HERD_AVAILABLE_DIR: &str = "/etc/herd/available";
 /// "requested".
 ///
 /// Loopback TCP rather than an AF_UNIX path because the amd64 kernel has no
-/// AF_UNIX (`amd64/src/sock.rs::sys_socket` answers `EAFNOSUPPORT`) and herd
+/// AF_UNIX (`crates/akuma-kernel-amd64/src/sock.rs::sys_socket` answers `EAFNOSUPPORT`) and herd
 /// runs on both kernels.
 ///
 /// This replaced `/etc/herd/control/<svc>.{start,stop}` marker files, which the

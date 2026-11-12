@@ -105,7 +105,7 @@ before comparing anything: `mmapsum: pread failed at 0`.
 
 Verified it is the syscall and not the file: `wc -c /tmp/mem_suite_data` on the
 same guest returns the right 262144, so `open`/`read`/`fstat` are all fine. There
-is no arm for x86_64 syscall **17** in `amd64/src/usermode.rs`.
+is no arm for x86_64 syscall **17** in `crates/akuma-kernel-amd64/src/usermode.rs`.
 
 Cheap to fix, and worth it — `pread` is how every archive reader and every
 `rustc` metadata load reaches into a file.
@@ -122,7 +122,7 @@ Cheap to fix, and worth it — `pread` is how every archive reader and every
 ### 2. `mmap_file` — file-backed `mmap` is refused on purpose
 
 `mmap(262144) failed`. This is the one **deliberate** refusal left in
-`amd64/src/mm.rs`: serving a file-backed mapping as anonymous memory would look
+`crates/akuma-kernel-amd64/src/mm.rs`: serving a file-backed mapping as anonymous memory would look
 like a working call and hand the caller a file full of zeros. It needs a page
 cache, which is the last item of the B trunk.
 

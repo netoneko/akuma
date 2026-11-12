@@ -13,7 +13,7 @@ This document is the narrative: what was wrong, in what order it was found, and
 which checks were worth their cost.
 
 Code: `crates/akuma-hda/src/{verb,codec,stream}.rs` (pure, host-tested,
-`forbid(unsafe_code)`), `amd64/src/hda.rs` (registers, DMA memory, `/dev/dsp`
+`forbid(unsafe_code)`), `crates/akuma-kernel-amd64/src/hda.rs` (registers, DMA memory, `/dev/dsp`
 backend), `crates/akuma-virtio/src/audio.rs` (`hda_backend::Ops`), and one hook
 in `akuma-exec` (`ExecRuntime::dsp_close`). Branch on litter:
 `cats/claude/hda-rewrite` (`9f8d821e`, `0b800634`, `96656504`), built on the

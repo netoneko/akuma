@@ -1,6 +1,6 @@
 //! The `futex(2)` syscall body, shared by the two bare-metal kernels.
 //!
-//! `amd64/src/futex.rs` (folded into `akuma-syscalls-glue::sync` 2026-11-11, so the
+//! `crates/akuma-kernel-amd64/src/futex.rs` (folded into `akuma-syscalls-glue::sync` 2026-11-11, so the
 //! amd64 kernel no longer uses this file) and `taoxichuan/src/futex.rs` each
 //! carried a copy of the
 //! same dispatch and the same three non-blocking operations (`wake`, `requeue`,

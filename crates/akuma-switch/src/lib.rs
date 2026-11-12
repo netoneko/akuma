@@ -310,7 +310,7 @@ akuma_threading_x86_switch_context:
      * is how this port shipped originally: `IF` has to belong to the task, not
      * to whoever last ran on this core. A syscall (interrupts off) that yields
      * to a kernel task (interrupts on) must come back with them off, and it did
-     * not until `amd64/src/sched.rs` Stage U — the resumer's state leaked into
+     * not until `crates/akuma-kernel-amd64/src/sched.rs` Stage U — the resumer's state leaked into
      * the resumed, presenting as an unrelated intermittent hang. Restored here
      * 2026-09-06 before anything adopts this switch
      * (`docs/archive/AKUMA_PIPES_EXTRACTION.md` § "two of them disagree"). */

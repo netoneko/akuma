@@ -19,7 +19,7 @@ through `to_glue` into `akuma-syscalls-glue`'s `fs.rs`, and `fd.rs`'s five
 implementations — plus `fd_path_debug` and `fs_err_str`, which only fed
 `renameat`'s diagnostic print — are deleted. The legacy x86 shims (82/83/84/
 87/88/89) hand glue the asm-generic number with `AT_FDCWD` in the dirfd slots.
-The VFS underneath was already shared (`amd64/src/fs.rs` re-exports
+The VFS underneath was already shared (`crates/akuma-kernel-amd64/src/fs.rs` re-exports
 `akuma_vfs_glue`), so the arms answer identically by construction; what
 changed is who owns the code.
 

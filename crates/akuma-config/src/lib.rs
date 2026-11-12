@@ -986,7 +986,7 @@ pub const TRACE_TKILL: bool = false;
 ///
 /// See `akuma_mem_policy::compute_user_stack_size` — moved there (config flag sweep,
 /// 2026-11-11) so amd64 (which never called this at all, and hardcoded a flat 8 MiB ceiling
-/// instead; see `amd64/src/exec_runtime.rs`) and both tokio kernels can share the same policy.
+/// instead; see `crates/akuma-kernel-amd64/src/exec_runtime.rs`) and both tokio kernels can share the same policy.
 /// No longer `const fn`: nothing called it from a const context, and the shared crate's version
 /// isn't one.
 #[must_use]

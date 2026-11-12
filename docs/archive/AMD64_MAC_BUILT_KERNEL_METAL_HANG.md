@@ -99,7 +99,7 @@ symbols differ in size**, e.g. `akuma_syscalls_glue::sync::sys_futex` 4,937 vs 7
 program laid out and inlined differently.
 
 Also different: the **build host** (aarch64 macOS vs x86_64 Linux) for every `build.rs` and
-proc-macro — `amd64/build.rs`, `akuma-fbcon`'s font tables, `tcc`. Not compared yet.
+proc-macro — `crates/akuma-kernel-amd64/build.rs`, `akuma-fbcon`'s font tables, `tcc`. Not compared yet.
 
 ## What this means, and what it does not
 

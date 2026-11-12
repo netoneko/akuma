@@ -7,7 +7,7 @@ the shell on the TV (the boot log shows the real key reports decoding). `^C` and
 
 The HP box's only console is the framebuffer GRUB hands the kernel, and its only
 local input is a USB keyboard that **the kernel drives natively over xHCI**
-(`amd64/src/xhci.rs`). Since 2026-10-01 a login shell runs on that console
+(`crates/akuma-kernel-amd64/src/xhci.rs`). Since 2026-10-01 a login shell runs on that console
 beside `sshd`.
 
 > **Do not rely on the firmware's PS/2 emulation (`kbd.rs`).** It was the first
@@ -35,12 +35,12 @@ and the TV showed the boot log and then nothing. The fix is one more service:
 | piece | where | what it does |
 |---|---|---|
 | `console = true` | `userspace/herd/src/main.rs` | spawns the service with `SPAWN_FLAG_CONSOLE` and a full environment (`PATH`, `HOME`, `TERM`) |
-| `SPAWN_FLAG_CONSOLE` (2) | `amd64/src/usermode.rs` `sys_spawn` | the child is made by the shared spawn with `Attach` = the console channel and the shared `TerminalState` — exactly what `init` gets. Refused (`EPERM`) unless the **caller** is itself console-attached, so an ssh session cannot take the keyboard |
-| the pump | `amd64/src/console.rs` | keyboard -> line discipline (`^C` -> `SIGINT`) -> the shell; the shell's echo -> screen |
-| native USB keyboard | `amd64/src/xhci.rs` `init_keyboard` / `keyboard_poll` | a **second xHCI slot** beside the disk's: enumerate the boot-keyboard interface, `SET_CONFIGURATION`, Configure Endpoint (interrupt IN), `SET_PROTOCOL(boot)`, keep one 8-byte report in flight; decode with `akuma-usb`'s `BootKeyboardDecoder` into a key FIFO that `input::getb` drains. Reports are taken in `Xhci::next_event`, the one place events are consumed, so a disk read cannot swallow one |
-| Backspace = `0x7f` | `amd64/src/kbd.rs`, `akuma-usb` keymap | was `0x08`, which cooked-mode `read(0)` does not treat as erase |
+| `SPAWN_FLAG_CONSOLE` (2) | `crates/akuma-kernel-amd64/src/usermode.rs` `sys_spawn` | the child is made by the shared spawn with `Attach` = the console channel and the shared `TerminalState` — exactly what `init` gets. Refused (`EPERM`) unless the **caller** is itself console-attached, so an ssh session cannot take the keyboard |
+| the pump | `crates/akuma-kernel-amd64/src/console.rs` | keyboard -> line discipline (`^C` -> `SIGINT`) -> the shell; the shell's echo -> screen |
+| native USB keyboard | `crates/akuma-kernel-amd64/src/xhci.rs` `init_keyboard` / `keyboard_poll` | a **second xHCI slot** beside the disk's: enumerate the boot-keyboard interface, `SET_CONFIGURATION`, Configure Endpoint (interrupt IN), `SET_PROTOCOL(boot)`, keep one 8-byte report in flight; decode with `akuma-usb`'s `BootKeyboardDecoder` into a key FIFO that `input::getb` drains. Reports are taken in `Xhci::next_event`, the one place events are consumed, so a disk read cannot swallow one |
+| Backspace = `0x7f` | `crates/akuma-kernel-amd64/src/kbd.rs`, `akuma-usb` keymap | was `0x08`, which cooked-mode `read(0)` does not treat as erase |
 | arrows + key repeat | `crates/akuma-usb` keymap/decoder, `xhci::keyboard_poll` | navigation keys emit Linux-console escape sequences; a USB boot keyboard never repeats a held key, so the decoder remembers the held key and the pump re-emits it after 400 ms every 35 ms. Backspace is `0x7f` here too (the USB keymap still said `0x08` until 2026-10-01) |
-| quiet framebuffer | `amd64/src/serial.rs` `set_fb_quiet` | once the console shell is spawned the TV shows the shell and its echo only; `[probe]`/`[herd]`/`[BKL]`/`[PSTATS]` stay in `dmesg`; a panic or fatal exception reopens it; boot flag `fbverbose` disables it. Console traffic uses `putb_tty`; pid 1's (`herd`'s) writes do not |
+| quiet framebuffer | `crates/akuma-kernel-amd64/src/serial.rs` `set_fb_quiet` | once the console shell is spawned the TV shows the shell and its echo only; `[probe]`/`[herd]`/`[BKL]`/`[PSTATS]` stay in `dmesg`; a panic or fatal exception reopens it; boot flag `fbverbose` disables it. Console traffic uses `putb_tty`; pid 1's (`herd`'s) writes do not |
 | ANSI subset | `crates/akuma-fbcon/src/console.rs` | busybox's line editor emits `\b`, `ESC[nD`, `ESC[J`, `ESC[K`; they used to be drawn as glyphs |
 | cursor | same, + `multiboot2::cursor_idle` | a block, drawn when output goes quiet, removed by the next byte |
 

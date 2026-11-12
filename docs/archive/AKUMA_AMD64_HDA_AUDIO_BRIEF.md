@@ -90,7 +90,7 @@ path that is already built and already has a client:
 
 **First job, before any hardware work: find out how much of that column
 actually runs on amd64.** This target has its own `open`/`write`/`ioctl` in
-`amd64/src/fd.rs` and does not go through every glue crate AArch64 does — that
+`crates/akuma-kernel-amd64/src/fd.rs` and does not go through every glue crate AArch64 does — that
 asymmetry is this port's characteristic bug (`docs/archive/AKUMA_AMD64_SWITCH_FREED_CR3_UAF.md`
 is the canonical example: a fix that was real, and absent here, because the
 second arm was registered by a function amd64 never calls). Find the amd64

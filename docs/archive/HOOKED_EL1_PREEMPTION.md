@@ -85,5 +85,5 @@ See the multiarch log, section "The hooked scheduler preempts EL1".
 - `docs/archive/SECOND_LISTENER_SMP1_FREEZE.md`: why a non-idle halter must stay preemptible.
 - `docs/archive/TRIM_FAT_COOPERATIVE_SCHEDULING.md`: the SGI path's own cooperative class,
   removed 2026-08-11.
-- `amd64/src/sched.rs` `preempt_if_needed`: why amd64 still does not preempt ring 0 (its heap
+- `crates/akuma-kernel-amd64/src/sched.rs` `preempt_if_needed`: why amd64 still does not preempt ring 0 (its heap
   lock does not mask interrupts).

@@ -19,7 +19,7 @@
 //!   `akuma_primitives::preempt` around each copy; `akuma-exceptions`'s EL1 sync
 //!   handler reads it and rewrites `ELR_EL1`.
 //! * **x86_64** arms nothing. `current_tid()` is a constant 0 there, so a
-//!   per-thread slot would be one kernel-wide word. `amd64/src/idt.rs`'s
+//!   per-thread slot would be one kernel-wide word. `crates/akuma-kernel-amd64/src/idt.rs`'s
 //!   page-fault path asks [`user_copy_fixup`] whether the faulting `rip` is
 //!   inside the copy loop and rewrites the saved `rip` only then — a one-entry
 //!   exception table (`docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md`).
@@ -232,7 +232,7 @@ __arch_copy_user_fault:
 // a constant 0 on this target (`akuma_primitives::preempt`), so the per-thread
 // slot would be one kernel-wide word — and a task preempted mid-copy would leave
 // it armed for whatever faults next. Instead the page-fault handler
-// (`amd64/src/idt.rs`) asks [`user_copy_fixup`] whether the faulting `rip` lies
+// (`crates/akuma-kernel-amd64/src/idt.rs`) asks [`user_copy_fixup`] whether the faulting `rip` lies
 // in `[__arch_copy_user_region_start, __arch_copy_user_region_end)`, and only
 // then rewrites the saved `rip` to `__arch_copy_user_fault`. That is Linux's
 // exception-table shape: the *instruction* decides, not a flag, so there is
@@ -260,7 +260,7 @@ __arch_copy_user_fault:
 // A NON-CANONICAL address (bit 47 not sign-extended into 48..63) raises #GP,
 // not #PF. Two lines hold it: `USER_VA_LIMIT` is the canonical bound on this
 // target (below), so no validated pointer reaches here with one; and
-// `amd64/src/idt.rs` runs vector 13 through the same fixup query as vector 14,
+// `crates/akuma-kernel-amd64/src/idt.rs` runs vector 13 through the same fixup query as vector 14,
 // so a raw caller still gets EFAULT rather than a halt (the boot test takes
 // one on purpose).
 //
@@ -273,7 +273,7 @@ __arch_copy_user_fault:
 #[cfg(target_arch = "x86_64")]
 global_asm!(
     r#"
-    /* Naming the section is mandatory — see amd64/src/sched.rs for why a
+    /* Naming the section is mandatory — see crates/akuma-kernel-amd64/src/sched.rs for why a
      * missing `.section` puts code in .bss and fails the link. */
     .section .text
 .global __arch_copy_user_memory
@@ -286,7 +286,7 @@ global_asm!(
     /* Whether `CR4.SMAP` is set, as one byte. Defined here rather than in Rust
      * so the asm's `[rip + …]` and the Rust setter reach the same object under
      * every platform's symbol convention — the same arrangement the region
-     * labels above already use. `amd64/src/uaccess.rs::init_smap` is what sets
+     * labels above already use. `crates/akuma-kernel-amd64/src/uaccess.rs::init_smap` is what sets
      * it, right after it sets the CR4 bit. */
     .section .data
 __akuma_user_access_smap_active:
@@ -304,10 +304,10 @@ __arch_copy_user_memory:
      * faults unless EFLAGS.AC is set. `stac`/`clac` are the declaration, and
      * they are `#UD` on a CPU (or a VMM) without SMAP — hence the flag test
      * rather than an unconditional pair. Same shape, and the same reason, as
-     * the exception stubs in `amd64/src/idt.rs`.
+     * the exception stubs in `crates/akuma-kernel-amd64/src/idt.rs`.
      *
      * Absent until 2026-09-07. This crate's copy was the tree's *second* user
-     * copy on x86_64 and the only one without the brackets: `amd64/src/uaccess.rs`
+     * copy on x86_64 and the only one without the brackets: `crates/akuma-kernel-amd64/src/uaccess.rs`
      * has had them since SMAP was turned on (2026-09-05), and the boot suite
      * even asserts "an unbracketed kernel read of a user page is refused". It
      * went unnoticed because nothing on this target called this function with a
@@ -370,7 +370,7 @@ __arch_copy_user_fault:
 /// x86_64: the address a page fault at `rip` should resume at, if `rip` is
 /// inside the user-copy loop — the one place a kernel-mode `#PF` is not fatal.
 ///
-/// The exception-table check, as one comparison. `amd64/src/idt.rs`'s page-fault
+/// The exception-table check, as one comparison. `crates/akuma-kernel-amd64/src/idt.rs`'s page-fault
 /// path calls this after demand paging has declined the fault and before it
 /// declares the fault fatal. `None` for every other `rip`, including the fixup
 /// trampoline itself, which cannot fault.
@@ -814,7 +814,7 @@ pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> R
 /// x86_64: the same primitive, recovered through the page-fault handler's
 /// exception-table check instead of an armed per-thread trampoline.
 ///
-/// Nothing is armed and nothing is disarmed around the copy. `amd64/src/idt.rs`
+/// Nothing is armed and nothing is disarmed around the copy. `crates/akuma-kernel-amd64/src/idt.rs`
 /// decides recovery from the faulting `rip` alone ([`user_copy_fixup`]), so a
 /// fault outside `__arch_copy_user_memory` is exactly as fatal as it was before
 /// this existed, and a task preempted mid-copy leaves no state for the next

@@ -6,7 +6,7 @@
 //! userspace's `FS`/`GS` bases, its `xsave` area, which core it may run on - the
 //! things an [`akuma_threading::ArchHooks`] switch has to install on the CPU.
 //!
-//! This crate was `amd64/src/sched.rs`'s hook section (`docs/archive/AKUMA_AMD64_SCHED_
+//! This crate was `crates/akuma-kernel-amd64/src/sched.rs`'s hook section (`docs/archive/AKUMA_AMD64_SCHED_
 //! CRATE.md`). It is generic over a [`Platform`] because the two kernels differ in exactly
 //! the things a switch touches: the per-thread user-context record (`UserCtx` on the
 //! metal kernel, the syscall bands on Taoxichuan), how a page-table root is made current,

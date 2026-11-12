@@ -49,7 +49,7 @@ pub enum SegProt {
 /// What [`crate::load_elf`] and its helpers require of an address space.
 ///
 /// Implementors: `akuma_mmu::UserAddressSpace` (AArch64, in this crate) and
-/// `amd64/src/paging.rs`'s `AddressSpace` (x86_64, in that target).
+/// `crates/akuma-kernel-amd64/src/paging.rs`'s `AddressSpace` (x86_64, in that target).
 pub trait UserPages: Sized {
     /// A fresh, empty user address space, or `None` if a frame for its top-level
     /// table could not be had.

@@ -2,7 +2,7 @@
 name = "akuma-boot-amd64"
 version = "0.1.0"
 edition = "2024"
-description = "The amd64 boot kit, extracted from amd64/src: the PVH/multiboot2 trampoline (boot.s), the physmap translations (phys.rs), the kernel's own page-table mappings (paging.rs), and the heap+PMM bring-up (mem.rs) — everything a composed amd64 kernel needs before it can allocate, pulled as crates instead of inherited as modules"
+description = "The amd64 boot kit, extracted from crates/akuma-kernel-amd64/src: the PVH/multiboot2 trampoline (boot.s), the physmap translations (phys.rs), the kernel's own page-table mappings (paging.rs), and the heap+PMM bring-up (mem.rs) — everything a composed amd64 kernel needs before it can allocate, pulled as crates instead of inherited as modules"
 
 [lints]
 workspace = true

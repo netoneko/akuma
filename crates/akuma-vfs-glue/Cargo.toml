@@ -37,7 +37,7 @@ akuma-primitives = { path = "../akuma-primitives" }
 # mounted" on amd64 and that the amd64 kernel "renders `/proc` from its own
 # process tables". Both stopped being true at 5b slice 3, when amd64 began
 # registering every process with `akuma-exec` and mounting this filesystem
-# (`amd64/src/fs.rs::init_vfs`); its own synthetic `/proc` in `fd.rs` was
+# (`crates/akuma-kernel-amd64/src/fs.rs::init_vfs`); its own synthetic `/proc` in `fd.rs` was
 # deleted in 4b batch 2c. **One `/proc` implementation serves both kernels**
 # (docs/archive/AKUMA_PROC_TREE_UNIFICATION.md).
 akuma-procfs = { path = "../akuma-procfs" }

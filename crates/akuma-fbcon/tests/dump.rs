@@ -43,7 +43,7 @@ fn console(w: usize, h: usize) -> Console<Mem> {
     con
 }
 
-const ART: &str = include_str!("../../../amd64/src/akuma_40.txt");
+const ART: &str = include_str!("../../../crates/akuma-kernel-amd64/src/akuma_40.txt");
 
 #[test]
 #[ignore = "writes images; run on demand"]

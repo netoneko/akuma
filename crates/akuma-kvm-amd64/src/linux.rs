@@ -78,7 +78,7 @@ const CHUNK_COPY: usize = 1 << 20;
 /// The Akuma guest's disk when the machine has no second virtio-blk device.
 const AKUMA_DISK_IMAGE_PATH: &str = "/boot/akuma-guest-root.img";
 /// The Akuma guest's RAM. The kernel takes a fixed 512 MiB heap
-/// (`amd64/src/mem.rs` `HEAP_SIZE`) out of one region and refuses to boot when the
+/// (`crates/akuma-kernel-amd64/src/mem.rs` `HEAP_SIZE`) out of one region and refuses to boot when the
 /// region is smaller; the rest is its frame allocator. The nested page table covers
 /// 4 GiB (`svm::rammap`), which bounds this.
 const AKUMA_RAM_BYTES: u64 = 768 << 20;
@@ -106,7 +106,7 @@ const QUANTUM_US: u64 = 500;
 /// How often a service guest reports where its task's time went (`Acct`).
 const ACCT_PERIOD_US: u64 = 5_000_000;
 /// The line the Akuma kernel prints when every processor the MADT listed is up
-/// (`amd64/src/smp.rs`): the SMP guest's pass needs it.
+/// (`crates/akuma-kernel-amd64/src/smp.rs`): the SMP guest's pass needs it.
 const SMP_UP_LINE: &[u8] = b"smp:  2 cpus online";
 
 /// The tiny-root Akuma guest's command-line tail: its only program is `/bin/hello`.

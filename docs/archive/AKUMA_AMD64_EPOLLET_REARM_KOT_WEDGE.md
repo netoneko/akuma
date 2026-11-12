@@ -64,7 +64,7 @@ bug, and it points at the one thing the amd64 socket path does differently.
 
 On amd64, `read(2)`/`write(2)` go through `akuma-syscalls-glue` (shared with
 AArch64), but **`sendto`/`recvfrom`/`sendmsg`/`recvmsg` are served by
-`amd64/src/sock.rs`**, a second implementation kept native because the entry
+`crates/akuma-kernel-amd64/src/sock.rs`**, a second implementation kept native because the entry
 asm drops the 6th syscall argument.
 
 Glue's versions of those four calls maintain the edge-triggered state:
@@ -117,8 +117,8 @@ All in the working tree, not committed.
 - `crates/akuma-syscalls-abi/src/lib.rs`: row
   `Accept4 => ACCEPT4 = 288, nr::ACCEPT4;` (asm-generic 242), pinned by both
   numbers in `the_cargo_batch_carries_both_numbers`.
-- `amd64/src/usermode.rs`: `Syscall::Accept4 => crate::sock::sys_accept4(a1, a2, a3, a4)`.
-- `amd64/src/sock.rs`: `sys_accept4` — `sys_accept` is now `sys_accept4(.., 0)`.
+- `crates/akuma-kernel-amd64/src/usermode.rs`: `Syscall::Accept4 => crate::sock::sys_accept4(a1, a2, a3, a4)`.
+- `crates/akuma-kernel-amd64/src/sock.rs`: `sys_accept4` — `sys_accept` is now `sys_accept4(.., 0)`.
   Unknown flag bits → `EINVAL` (as Linux); `SOCK_NONBLOCK`/`SOCK_CLOEXEC` are
   applied to the **accepted** fd. The nonblock bit is load-bearing: tokio
   reads an accepted fd until `EAGAIN`, so a blocking one parks a worker inside
@@ -126,7 +126,7 @@ All in the working tree, not committed.
 
 ### 4.2 The re-arm (the actual fix)
 
-`amd64/src/sock.rs`, mirroring glue rule for rule:
+`crates/akuma-kernel-amd64/src/sock.rs`, mirroring glue rule for rule:
 
 - `tcp_received(fd)` → `akuma_syscalls_glue::poll::epoll_on_fd_drained`, called
   by `recv` (for `recvfrom`) and `sys_recvmsg`'s TCP arm after every
@@ -145,7 +145,7 @@ UDP arms are unchanged, matching glue (which doesn't re-arm UDP either).
 ### 4.3 Also in the same build
 
 - Removed the temporary `[wp0>]`/`[wp1>]`/`[wp>]` per-`write(2)` console trace
-  from `amd64/src/usermode.rs` (handoff lead 2). It printed on every write from
+  from `crates/akuma-kernel-amd64/src/usermode.rs` (handoff lead 2). It printed on every write from
   every non-leader thread — for tokio, every socket write — at ~2.4 µs/byte of
   trapping MMIO, part of it under the BKL.
 - `amd64/mkdisk.sh` (from the previous session, already uncommitted): pre-grow
@@ -211,7 +211,7 @@ the host — and ryzen-fc's workers run at ~300 syscalls/s with no spinner. The
 z.ai-over-TLS path on this box already has a history
 ([`AKUMA_AMD64_MEOW_TLS_STALL.md`](AKUMA_AMD64_MEOW_TLS_STALL.md): EOF on a live
 socket after think time). Candidates, untested: `sys_writev`
-(`amd64/src/usermode.rs`) returning `0` in some case a caller loops on — it
+(`crates/akuma-kernel-amd64/src/usermode.rs`) returning `0` in some case a caller loops on — it
 loops `sys_write` per iovec and returns the running total, so an iovec array
 whose entries are all zero-length, or a first `sys_write` of `0`, yields `0`,
 which a caller may retry forever; or a socket whose `EPOLLOUT` is now re-armed

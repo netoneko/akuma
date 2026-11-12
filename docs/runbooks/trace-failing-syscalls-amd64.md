@@ -27,7 +27,7 @@ single `tprint!` so SMP cannot shred it:
 
 - `nr` is the **x86_64** number, and the errno after `->` is **decimal**.
 - Path arguments are decoded for the path-taking calls (`trace_paths` in
-  `amd64/src/usermode.rs`: `open`, `stat`, `execve`, `mkdir`, `unlink`,
+  `crates/akuma-kernel-amd64/src/usermode.rs`: `open`, `stat`, `execve`, `mkdir`, `unlink`,
   `symlink`, `readlink`, every `*at`, `rename*`, `statx`, …). For an `*at`
   call the dirfd is `a1`.
 - `EAGAIN`, `EINTR` and `ETIMEDOUT` are left out; a polling program returns
@@ -81,14 +81,14 @@ prints, so look for:
 [syscall] no row for x86_64 nr=40 — returning ENOSYS (add it to akuma-syscalls-abi's table)
 ```
 
-The first means a missing arm (fix in `amd64/src/usermode.rs`), the second a
+The first means a missing arm (fix in `crates/akuma-kernel-amd64/src/usermode.rs`), the second a
 missing row (fix in `crates/akuma-syscalls-abi`). To audit every row against
 the arms at once, from the repo root:
 
 ```sh
 sed -n '/syscall_table! *{/,/^}/p' crates/akuma-syscalls-abi/src/lib.rs \
   | grep -oE '^\s*[A-Z][A-Za-z0-9]+\s*=>' | awk '{print $1}' \
-  | while read v; do grep -q "Syscall::$v\b" amd64/src/usermode.rs || echo "NO ARM: $v"; done
+  | while read v; do grep -q "Syscall::$v\b" crates/akuma-kernel-amd64/src/usermode.rs || echo "NO ARM: $v"; done
 ```
 
 ## 5. Correlate with the kernel's own log
@@ -103,7 +103,7 @@ saves it to `/tmp/dmesg.txt` and `run-fc.sh` dumps it to `out/dmesg.txt`.
   a result line. That's useful for a short program and far too much for
   Chromium (~100 k calls). The entry line now decodes the same paths as
   `[sc!]`.
-- **`--features syscall-debug-info`** (compile-time, `amd64/Cargo.toml`)
+- **`--features syscall-debug-info`** (compile-time, `crates/akuma-kernel-amd64/Cargo.toml`)
   forwards the AArch64 kernel's debug mode: glue's per-arm `[syscall]` lines.
   Its `[FORK-DBG]`/`[TRAMP]` lifecycle traces print **nothing** on amd64,
   whose fork and exec are its own. In the Chromium run it added 244 lines and

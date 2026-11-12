@@ -213,7 +213,7 @@ impl PteLayout {
 
 /// What `fork` does with one **decoded** leaf.
 ///
-/// This is the decision `amd64/src/usermode.rs`'s fork walk (`share_parent_memory_into`) makes per page,
+/// This is the decision `crates/akuma-kernel-amd64/src/usermode.rs`'s fork walk (`share_parent_memory_into`) makes per page,
 /// where the walker hands over `(prot, cow, attr)` rather than a raw entry and so cannot call
 /// [`PteLayout::plan_clone`].
 ///

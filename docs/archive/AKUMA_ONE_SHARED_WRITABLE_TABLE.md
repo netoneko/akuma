@@ -8,7 +8,7 @@
 After 5e both kernels ran glue's `mmap`, `munmap`, `mremap` and `madvise`, but a writable
 `MAP_SHARED` file mapping still went one of two ways, picked by a `shared_write_backing` hook:
 
-- **amd64** served it from its shared writable page table (`amd64/src/shmpages.rs` over
+- **amd64** served it from its shared writable page table (`crates/akuma-kernel-amd64/src/shmpages.rs` over
   `akuma-fpcache-rw`): one frame per `(mount, inode, page)` for every mapper, write-back by path or
   by inode, `write(2)` copied into the mapped frames, fork sharing by identity
   ([`AKUMA_AMD64_SHARED_WRITABLE_PAGES.md`](AKUMA_AMD64_SHARED_WRITABLE_PAGES.md)).
@@ -37,7 +37,7 @@ After 5e both kernels ran glue's `mmap`, `munmap`, `mremap` and `madvise`, but a
   file mapping. When the mapping is executable it runs `sync_icache_range` on the frame, as the
   private path would.
 
-**Deleted:** `amd64/src/shmpages.rs`; amd64's `sys_msync` (and dispatch's nr-26 pre-route),
+**Deleted:** `crates/akuma-kernel-amd64/src/shmpages.rs`; amd64's `sys_msync` (and dispatch's nr-26 pre-route),
 `shared_write_backing`, `release_shared_write`, `release_shared_write_mappings`,
 `WriteBackRegion`, `snapshot_shared_write`, `flush_shared_write`, `write_back_target_ok` and
 `fd::file_write_identity`; glue's `SharedFileMapping`, `SHARED_FILE_MAPPINGS`,

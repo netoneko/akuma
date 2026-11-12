@@ -20,7 +20,7 @@ OSes, one NIC — worth one audit.
   read-only from Pop and read `/var/log/ryzen/klog-*.all`. Boots 262–266
   (Nov 2–5) inspected; 266 is the session that ended at 20:06 when the box
   was rebooted to Pop.
-- Source: `amd64/src/rtw89.rs`, `amd64/src/rtw89_sta.rs`,
+- Source: `crates/akuma-kernel-amd64/src/rtw89.rs`, `crates/akuma-kernel-amd64/src/rtw89_sta.rs`,
   `crates/akuma-rtw89/src/script.rs`.
 
 ## Hardware
@@ -31,7 +31,7 @@ Realtek RTL8852CE (`rtw89_8852ce`), Lenovo ideapad platform, AP `Onyxia`
 calibrated; see fix 5). Firmware in use everywhere:
 `rtw89/rtw8852c_fw-1.bin` 0.27.122.0. Pop cannot load `rtw8852c_fw-2.bin`
 ("Direct firmware load ... failed with error -2" — linux-firmware too old);
-akuma deliberately parses only the fw-1 format (`amd64/src/rtw89.rs:74-78`).
+akuma deliberately parses only the fw-1 format (`crates/akuma-kernel-amd64/src/rtw89.rs:74-78`).
 
 ## Findings — Pop (Linux)
 
@@ -66,7 +66,7 @@ The `wifi`/`wifiauto` herd services already run the chip **without power
 save** (no power-save H2C anywhere in the rtw89 driver), and the firmware's
 beacon-filter report (`RTW89_MAC_C2H_FUNC_BCNFLTR_RPT`, bits 9:8 = beacon
 loss) is triaged by `BEACON_GRACE_MS = 5000`
-(`amd64/src/rtw89_sta.rs:105-107`): a loss report is believed only when
+(`crates/akuma-kernel-amd64/src/rtw89_sta.rs:105-107`): a loss report is believed only when
 nothing from the AP arrived for 5 s; otherwise
 "beacon loss ignored: the access point's frames still arrive".
 
@@ -89,7 +89,7 @@ Two more facts from klog-266:
 Same blob on both OSes: Pop's drop loop is power-save-driven and stops when
 power save is off; akuma already runs power-save-free and sees ~1 loss per
 boot. Moving to `rtw8852c_fw-2.bin` would require teaching akuma's parser a
-new fw format (`amd64/src/rtw89.rs:76`) for no measured benefit. Skip.
+new fw format (`crates/akuma-kernel-amd64/src/rtw89.rs:76`) for no measured benefit. Skip.
 
 ## akuma fix plan (ranked; not yet started)
 

@@ -2,7 +2,7 @@
  *
  * The companion of shmcoh.c (which asks the one question: are two processes' mappings live?).
  * This walks each path the amd64 shared writable page table (crates/akuma-fpcache-rw,
- * amd64/src/shmpages.rs, 2026-10-03) had to get right, one numbered rung each, and prints
+ * crates/akuma-kernel-amd64/src/shmpages.rs, 2026-10-03) had to get right, one numbered rung each, and prints
  * before every rung so a hang names its rung. Same binary runs on Linux: every rung is
  * Linux behaviour, and `PASS` there is the ground truth.
  *

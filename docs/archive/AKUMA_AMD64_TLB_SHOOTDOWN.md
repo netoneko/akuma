@@ -68,7 +68,7 @@ half never changes after boot), mailbox store, `EOI`.
 
 ## What was wired where
 
-- `amd64/src/shootdown.rs` (new) — vector **33** (32 is the timer, 0xFF
+- `crates/akuma-kernel-amd64/src/shootdown.rs` (new) — vector **33** (32 is the timer, 0xFF
   spurious), per-core `PENDING`/`ACKED`/`SERVICED` mailboxes, generation
   counter, hand-assembled entry stub on the timer's pattern (`swapgs` on a
   ring-3 origin), `broadcast`/`wait_for_acks`, and the boot self-test. The

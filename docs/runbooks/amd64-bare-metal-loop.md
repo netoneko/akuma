@@ -43,7 +43,7 @@ Two things make this worth doing *before* forming a theory:
 `GRUB_DEFAULT="Akuma/amd64"`'s entry in `/etc/grub.d/45_akuma` carries
 ` netprobe` on its `multiboot2` line. Keep it there.
 
-It turns on `amd64/src/net.rs`'s `print_probe_line` plus the NIC's DMA layout,
+It turns on `crates/akuma-kernel-amd64/src/net.rs`'s `print_probe_line` plus the NIC's DMA layout,
 and `enable_probe()` prints them **immediately before `run_init`** so they land
 at the bottom of the log rather than scrolling off — written for exactly the
 case where the console is a television being photographed.
@@ -773,7 +773,7 @@ multiboot2 /boot/akuma/akuma-amd64 init=/bin/herd netprobe
 | `pci` + `usbroot` | **PVH/QEMU only** (`-M q35`): scan PCI, and mount `/dev/sda1` from the xHCI USB disk the way `root=/dev/sda1` does on the metal. With `-device qemu-xhci -device usb-storage -device usb-kbd` this is the only off-metal rig for the USB stack and keyboard — `scripts/utils/amd64_console_probe.py --usb` |
 | `fbtrace` | PVH only: send what the framebuffer *would* show to QEMU's port-`0xE9` debug console (`FBTRACE=<file> sh amd64/run.sh`), because that machine has no framebuffer and the quiet policy is otherwise unobservable |
 | `root=/dev/nvme0n1pN` | **multiboot2 only** (2026-10-06): drive the NVMe SSD (`crates/akuma-drivers-amd64/src/nvme.rs`) and mount GPT partition N as the root. Only that partition's LBA range is ever read or written, and both GPT CRCs must check. A partition without ext2 is refused before any write, and the boot falls back to the RAM image. Built for ryzen (`overlays/ryzen/`, p3); the trashcan has no NVMe |
-| `wdt` / `wdt=<s>` | arm the **AMD FCH hardware watchdog** (`amd64/src/watchdog.rs`, default 60 s, 10–65535): reset the machine if the BSP takes no timer interrupt for that long. Gated on the chipset (`1022:790b` rev ≥ `0x51`), so the trashcan's Intel board logs "not armed". Stopped before an orderly reset |
+| `wdt` / `wdt=<s>` | arm the **AMD FCH hardware watchdog** (`crates/akuma-kernel-amd64/src/watchdog.rs`, default 60 s, 10–65535): reset the machine if the BSP takes no timer interrupt for that long. Gated on the chipset (`1022:790b` rev ≥ `0x51`), so the trashcan's Intel board logs "not armed". Stopped before an orderly reset |
 | `wdttest` | arm the watchdog, then wedge with interrupts off instead of starting `init`, to prove the reset fires. **Refuses** (and boots normally) if the watchdog did not arm |
 | `nofb` | do not touch the framebuffer: boot headless, everything to `dmesg`. A framebuffer that cannot be used (none, not direct-colour, unmapped) now also means headless rather than a halt |
 | `rtw89` | (multiboot2, after the root mount) bring ryzen's **RTL8852CE** up to running firmware and shut it down again — wifi stage W1; `[rtw]` lines say how far it got — [`../reference/subsystems/wifi.md`](../reference/subsystems/wifi.md) |

@@ -38,7 +38,7 @@ reads — the one hook the park loop consults — so the sibling's wait returns
 
 ## 2. Inode mtimes divided by a million, twice
 
-`amd64/src/fs.rs` passed `wall_clock_secs` — seconds — to `Ext2Filesystem::new`,
+`crates/akuma-kernel-amd64/src/fs.rs` passed `wall_clock_secs` — seconds — to `Ext2Filesystem::new`,
 whose parameter is named `utc_time_us` and whose consumer is:
 
 ```rust
@@ -123,7 +123,7 @@ eligibility, not delivery. The thread wakes inside its wait, re-checks its own
 condition, finds it unchanged and parks again, never reaching the syscall return
 where `deliver_pending` runs. Defect 1 seen from user space.
 
-The cause was one line in `amd64/src/exec_runtime.rs`:
+The cause was one line in `crates/akuma-kernel-amd64/src/exec_runtime.rs`:
 
 ```rust
 // No signal delivery on this target at all — that is A2.

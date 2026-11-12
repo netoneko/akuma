@@ -1,6 +1,6 @@
 //! 802.11 frames for Akuma's in-kernel wifi station.
 //!
-//! The rtw89 driver (`amd64/src/rtw89.rs`) moves frames; this crate decides
+//! The rtw89 driver (`crates/akuma-kernel-amd64/src/rtw89.rs`) moves frames; this crate decides
 //! what they say. It is the station half of what Linux splits between
 //! mac80211 and wpa_supplicant, cut down to one case: a station joining one
 //! access point, open or WPA2-PSK (CCMP), on a 2.4 or 5 GHz channel.

@@ -9,7 +9,7 @@ marked **UNCHECKED**.
 
 ## 0. What session pb changed (the foundation this plan stands on)
 
-- `crates/akuma-lapic-amd64` (new, extracted from `amd64/src/lapic.rs` 1121→~719 lines):
+- `crates/akuma-lapic-amd64` (new, extracted from `crates/akuma-kernel-amd64/src/lapic.rs` 1121→~719 lines):
   xAPIC window (`read_reg`/`write_reg`), `eoi`, `TICKS`/`ticks`/`advance_tick`/`on_tick`,
   `start_timer`/`stop_timer`/`timer_running`, `delay_counts`, `timer_current_count`,
   `arm_oneshot`, `credit_ticks`, `calibrate` (8254 channel-0, verbatim) + `pit_wait_us`,
@@ -42,7 +42,7 @@ marked **UNCHECKED**.
 ### `akuma_threading::ThreadConfig` (lib.rs:163-179; 15 fields)
 Pure numbers/flags (stack sizes, canaries, boot stack, cleanup cooldown…). amd64 fills
 them from its config; the twin fills **UNCHECKED** values copied from amd64's
-`config()` (amd64/src/exec_runtime.rs `fn config()` — not read line-by-line this
+`config()` (crates/akuma-kernel-amd64/src/exec_runtime.rs `fn config()` — not read line-by-line this
 session). None need a timer.
 
 ### `akuma_threading::ProcessHooks` (lib.rs:184-198; 7 fn fields)
@@ -95,7 +95,7 @@ session). None need a timer.
   outliving one read, `git clone`'s helper pump).
 
 The switch happens in **`timer_trap`** (taoxichuan/src/main.rs) — the same place amd64
-puts it (`timer_trap` at amd64/src/idt.rs:1300-1339: count, acknowledge, then
+puts it (`timer_trap` at crates/akuma-kernel-amd64/src/idt.rs:1300-1339: count, acknowledge, then
 `preempt_if_needed(from_user)`): on the interrupted task's own trap stack, with IF
 clear (interrupt gate), allocation-free. `from_user = t.from_ring3()` decides:
 ring 3 and the idle loop may be switched away from; **ring 0 is only asked**
@@ -134,17 +134,17 @@ kernel". The moment two tasks can block, that identity breaks:
 
 | need | provider | state |
 |---|---|---|
-| AP startup path (INIT-SIPI, `send_init`/`send_startup`, `init_ap`) | `amd64/src/lapic.rs` (IPI face kept there on purpose: `send_fixed`/`send_init`/`send_startup` over `akuma_lapic_amd64::write_reg(REG_ICR_*)`) | exists in amd64; NOT a crate — extract per rule 3 when the slice comes |
-| per-cpu `%gs` block, `NO_CPU`, `MAX_CPUS`, wake vector | `amd64/src/smp.rs` | exists; not a crate |
-| per-core tick bookkeeping (per-core TICKS, oneshot arrays, TSC offsets) | `amd64/src/lapic.rs` oneshot/TSC-sync parts + `crate::smp::cpu_index` | exists in amd64; the crate's `on_tick` is the single-core core of it |
+| AP startup path (INIT-SIPI, `send_init`/`send_startup`, `init_ap`) | `crates/akuma-kernel-amd64/src/lapic.rs` (IPI face kept there on purpose: `send_fixed`/`send_init`/`send_startup` over `akuma_lapic_amd64::write_reg(REG_ICR_*)`) | exists in amd64; NOT a crate — extract per rule 3 when the slice comes |
+| per-cpu `%gs` block, `NO_CPU`, `MAX_CPUS`, wake vector | `crates/akuma-kernel-amd64/src/smp.rs` | exists; not a crate |
+| per-core tick bookkeeping (per-core TICKS, oneshot arrays, TSC offsets) | `crates/akuma-kernel-amd64/src/lapic.rs` oneshot/TSC-sync parts + `crate::smp::cpu_index` | exists in amd64; the crate's `on_tick` is the single-core core of it |
 | BKL | `crates/akuma-bkl` (`ProcessBkl`, `bkl_free_io`, sync) | exists; amd64 already uses it |
 | slot table | `crates/akuma-slot-table` | exists (**UNCHECKED** — not read this session) |
 | scheduler core (states, wake generations, park discipline) | `crates/akuma-threading` | exists; that is the whole point of the seam |
 | the KVM guest's LAPIC model (xAPIC page + timer) and 8254 `pit` | `akuma-svm-amd64`'s `lapic`, `akuma-port`'s `PIT` | exists (guest fact) |
-| TLB shootdown transport | `amd64/src/shootdown.rs` + `lapic::send_fixed` | exists in amd64 |
+| TLB shootdown transport | `crates/akuma-kernel-amd64/src/shootdown.rs` + `lapic::send_fixed` | exists in amd64 |
 
 The plan doc must say: SMP boot needs `smp.rs`'s AP path + per-cpu `%gs` + IPIs,
-all three already in `amd64/src/` — the slice is an extraction + wiring, not a
+all three already in `crates/akuma-kernel-amd64/src/` — the slice is an extraction + wiring, not a
 rewrite. Booting extra cores is NOT this slice.
 
 ## 5. Proposed M4 slice list (each = one boot unless said)

@@ -3,7 +3,7 @@
 //! Three kernels make one. The AArch64 kernel loads an ELF (`Process::from_elf`,
 //! `image.rs`); the tokio kernels adopt a root their task record owns
 //! (`Process::adopted`, `adopted.rs`); the amd64 kernel registers what its own
-//! loader built (`register_exec_process`, `amd64/src/usermode.rs`). Each used to
+//! loader built (`register_exec_process`, `crates/akuma-kernel-amd64/src/usermode.rs`). Each used to
 //! spell the whole 45-field `Process` literal, and 28 of those initialisers were
 //! the same text in all three — a new process's signal table, sigaltstack,
 //! robust list, cwd, namespace, stdio buffers, counters. They are written once,

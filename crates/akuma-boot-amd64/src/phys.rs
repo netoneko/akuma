@@ -41,7 +41,7 @@
 pub const PHYSMAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 /// Base of the device window (PML4 slot 257).
 pub const DEVMAP_BASE: u64 = 0xFFFF_8080_0000_0000;
-/// Base the kernel image is linked at (PML4 slot 511); see `amd64/linker.ld`.
+/// Base the kernel image is linked at (PML4 slot 511); see `crates/akuma-kernel-amd64/linker.ld`.
 pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
 
 /// How much physical memory the physmap covers.

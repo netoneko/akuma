@@ -43,7 +43,7 @@ additionally gated on `target_arch = "aarch64"`. Confirmed safe: neither is
 called from `akuma-exec`, `akuma-threading`, `akuma-elf`, or
 `akuma-user-access` (the four crates this whole effort exists to unblock for
 x86_64) — their only callers are `akuma-kernel-glue`/`akuma-kernel-core`, which
-are not in `amd64/Cargo.toml` and have no x86_64 discovery path (PVH boot uses
+are not in `crates/akuma-kernel-amd64/Cargo.toml` and have no x86_64 discovery path (PVH boot uses
 `crates/akuma-ryzen-amd64`, not a DTB).
 
 **No AArch64 runtime behavior changed.** Every gate that previously read
@@ -94,8 +94,8 @@ not a standalone `.rlib`) and called `get_boot_ttbr0`, `get_current_ttbr0`,
    (`grep -ci 'adrp\|tlbi\b'` → 0) — the stub bodies were selected, not the
    real ones, confirmed rather than assumed.
 
-The probe (the `akuma-mmu` dependency line in `amd64/Cargo.toml` and the call
-block in `amd64/src/main.rs::kmain`) was reverted after verification —
+The probe (the `akuma-mmu` dependency line in `crates/akuma-kernel-amd64/Cargo.toml` and the call
+block in `crates/akuma-kernel-amd64/src/main.rs::kmain`) was reverted after verification —
 `git diff --stat amd64/` is empty. Per the proposal's explicit non-goal, this
 pass does not wire `amd64/` to actually use `akuma-mmu`.
 

@@ -57,7 +57,7 @@ method only the aarch64 side has — CoW sharing, ASID, lazy regions, all of
 it — simply fails to compile for `x86_64`, which is the honest boundary of
 what this pass proves.
 
-**Ported directly from `amd64/src/paging.rs`, not redesigned** — that file
+**Ported directly from `crates/akuma-kernel-amd64/src/paging.rs`, not redesigned** — that file
 already built exactly this vocabulary and encoding, including a `Prot`
 matching item 1's proposed shape and real `read_cr3`/`write_cr3`/`invlpg`
 wrappers with a comment citing item 3 by name:
@@ -124,7 +124,7 @@ akuma-mmu x86_64: translate() is None after unmap_page   [OK]
 Full boot: **177 self-tests passed, 0 failed** (the pre-existing 173 plus
 these 4) — no regression anywhere else in the amd64 self-test suite. The
 probe was reverted after — `git diff --stat amd64/` is empty (the
-`amd64/Cargo.toml` dependency line and the `kmain` block were both removed).
+`crates/akuma-kernel-amd64/Cargo.toml` dependency line and the `kmain` block were both removed).
 
 One unrelated finding along the way, ruled out rather than chased: booting
 with `DISK=none` also strips `amd64/run.sh`'s NIC configuration (both live in
@@ -148,5 +148,5 @@ crates above it usable there yet.
 ## Next
 
 `proposals/AKUMA_THREADING_ARCH_PORTABILITY.md` (written alongside this doc),
-and — once that lands — the actual rewire of `amd64/src/usermode.rs` onto
+and — once that lands — the actual rewire of `crates/akuma-kernel-amd64/src/usermode.rs` onto
 `akuma-exec::process` this whole effort has been building toward.

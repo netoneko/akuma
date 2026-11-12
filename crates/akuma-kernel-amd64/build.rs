@@ -56,13 +56,13 @@ fn kernel_link_args(dir: &str) {
 ///
 /// `panic=abort` because there is no unwinder and no `eh_personality`.
 fn build_user_program(dir: &str, name: &str) {
-    let user = format!("{dir}/../userspace/amd64");
+    let user = format!("{dir}/../../userspace/amd64");
     let src = format!("{user}/{name}/{name}.rs");
     let script = format!("{user}/user.ld");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join(format!("{name}.elf"));
 
-    println!("cargo:rerun-if-changed=../userspace/amd64/{name}/{name}.rs");
-    println!("cargo:rerun-if-changed=../userspace/amd64/user.ld");
+    println!("cargo:rerun-if-changed=../../userspace/amd64/{name}/{name}.rs");
+    println!("cargo:rerun-if-changed=../../userspace/amd64/user.ld");
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let status = Command::new(rustc)

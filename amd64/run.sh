@@ -18,7 +18,7 @@ HERE=$(dirname "$0")
 cd "$HERE/.."
 
 MEMORY="${MEMORY:-2048}"
-# Cores. The kernel starts every LAPIC the MADT lists (amd64/src/smp.rs), so
+# Cores. The kernel starts every LAPIC the MADT lists (crates/akuma-kernel-amd64/src/smp.rs), so
 # this is the whole SMP switch; `SMP=1` is the single-core boot every stage
 # before Stage U ran.
 SMP="${SMP:-1}"

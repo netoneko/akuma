@@ -18,7 +18,7 @@
 //! maps) and the **decisions** that
 //! are pure functions of a VMCB's bytes — the VMRUN consistency checks of
 //! §15.5.1, which the hardware answers with `VMEXIT_INVALID` and no
-//! diagnostics. `amd64/src/kvm.rs` owns every `unsafe` (the two MSR writes
+//! diagnostics. `crates/akuma-kernel-amd64/src/kvm.rs` owns every `unsafe` (the two MSR writes
 //! and the `VMRUN` itself); it calls [`Vmcb`] over an already zero-filled
 //! page and never names a field offset of its own.
 //!
@@ -1354,7 +1354,7 @@ pub mod tables {
 /// fault and the run stops there, naming the address.
 ///
 /// Everything here is pure: the map and the leaf placement are decisions, host-tested;
-/// the kernel's `FreshFrame` allocation and the `VMRUN` itself stay in `amd64/src/kvm*`.
+/// the kernel's `FreshFrame` allocation and the `VMRUN` itself stay in `crates/akuma-kernel-amd64/src/kvm*`.
 pub mod rammap {
     use crate::npt::leaf_2m;
 
@@ -1861,7 +1861,7 @@ pub mod elf {
     /// The note naming the PVH 32-bit entry: name "Xen", type 18.
     ///
     /// The type is `XEN_ELFNOTE_PHYS32_ENTRY`, whose descriptor is the entry's
-    /// guest-physical address. Pinned against `amd64/src/boot.s` (which
+    /// guest-physical address. Pinned against `crates/akuma-kernel-amd64/src/boot.s` (which
     /// emits this very note and is what QEMU's and Firecracker's PVH loaders
     /// boot) and against the Firecracker CI `vmlinux-6.1.128`'s own note
     /// (`readobj --notes`: owner Xen, type 0x12). It was 9 until 2026-10-22 —

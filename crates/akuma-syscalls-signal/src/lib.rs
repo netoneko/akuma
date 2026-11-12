@@ -5,7 +5,7 @@
 //! handler from `oldact`; std's child-side `signal(SIGPIPE, SIG_DFL)` fails the
 //! whole spawn when that reads back as `SIG_ERR`), and `rt_sigprocmask` only has
 //! to keep a word. Both of those are in here, host-tested, so the amd64 kernel's
-//! delivery code (`amd64/src/signal.rs`) can adopt the same decode arms.
+//! delivery code (`crates/akuma-kernel-amd64/src/signal.rs`) can adopt the same decode arms.
 //!
 //! What stays with the kernel: the user-memory copies (`act`, `oldact`, `set`,
 //! `oldset`), the errno table, per-task storage, and anything that *acts* on a

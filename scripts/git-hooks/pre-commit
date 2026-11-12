@@ -40,9 +40,16 @@ fi
 
 for crate in crates/*/; do
     name="$(basename "$crate")"
+    # The amd64 machine half is x86_64-only by design (a `compile_error!` on any
+    # other arch); it is linted below for its own target instead.
+    case "$name" in akuma-kernel-amd64) continue ;; esac
     echo "clippy: $name"
     cargo clippy -p "$name" --target "$HOST_TARGET" -- -D warnings || exit 1
 done
+
+echo "clippy: akuma (amd64, headless)"
+cargo clippy -p akuma --target x86_64-unknown-none --release \
+    --no-default-features --features headless -- -D warnings || exit 1
 
 echo "clippy: akuma (release)"
 cargo clippy --release -- -D warnings || exit 1

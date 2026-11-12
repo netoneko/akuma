@@ -137,7 +137,7 @@ suite note as the regression tripwire.
 
 ## 2026-09-26: the `yield_now` dropped-window exception is removed
 
-**What changed.** `amd64/src/sched.rs`'s `yield_now()` no longer skips taking the
+**What changed.** `crates/akuma-kernel-amd64/src/sched.rs`'s `yield_now()` no longer skips taking the
 BKL for a thread inside a dropped window (`akuma_bkl::bkl::in_dropped_window()`).
 Every cooperative switch now happens with the lock held again: a caller that
 does not hold it takes it for the switch and gives it back once it resumes. That
@@ -167,7 +167,7 @@ earlier sightings were netpoll; netpoll itself yields only *outside* its windows
 so a ring-3 socket `read(2)`'s wait loop is the likelier caller).
 
 The boot suite's `debug: every context switch held the kernel lock`
-(`amd64/src/idt.rs`) asserts `switches_without_bkl() == 0` and always did. It
+(`crates/akuma-kernel-amd64/src/idt.rs`) asserts `switches_without_bkl() == 0` and always did. It
 passed only because nothing in the suite yields inside a dropped window. The
 `hook_switch_to` comment saying a non-zero count was "expected telemetry" was
 corrected in the same change.
@@ -249,15 +249,15 @@ cycle.
 **The mechanism found, which this doc's §1-3 did not name:** `read(2)` on a
 socket fd (as opposed to `sock.rs`'s dedicated `recvfrom`/`sendto`, see the
 correction below) folds into the **shared** `akuma_syscalls_glue::fs::sys_read`
-(`amd64/src/fd.rs:989`), whose `Socket` arm *does* wrap the blocking
+(`crates/akuma-kernel-amd64/src/fd.rs:989`), whose `Socket` arm *does* wrap the blocking
 `socket_recv` call in `NetBklGuard`/`dropped_window_open()` — the same carve-
 out AArch64 uses, correctly ported. The gap was one level up, in the
-scheduler's own cooperative yield: `amd64/src/sched.rs`'s `yield_now()` (the
+scheduler's own cooperative yield: `crates/akuma-kernel-amd64/src/sched.rs`'s `yield_now()` (the
 function `blocking_relax`/`wait_until`'s park loop calls every lap) checked
 only `smp::bkl_held()` before deciding whether to acquire the BKL "just for
 the switch" — it did not check whether the yielding thread was inside a
 *deliberately*-dropped-BKL window. Because the BKL is core-scoped and
-reentrant (`amd64/src/smp.rs`'s own design note), "take it for the switch,
+reentrant (`crates/akuma-kernel-amd64/src/smp.rs`'s own design note), "take it for the switch,
 give it back when this thread resumes" holds the lock for **every thread that
 runs on that core in between**, for as long as the yielding thread stays
 parked — which, for a wait loop whose condition never becomes true, is
@@ -265,12 +265,12 @@ unbounded. This is the exact bug class AArch64's `reconcile_for_spsr` +
 per-thread dropped-window ledger were built to close
 (`docs/archive/BKL_VFS_CARVE_OUT.md` §8) — reached here through the
 scheduler's explicit-call switch boundary instead of an eret epilogue, which
-`amd64/src/smp.rs`'s note that AArch64's `reconcile_for_spsr` "has no amd64
+`crates/akuma-kernel-amd64/src/smp.rs`'s note that AArch64's `reconcile_for_spsr` "has no amd64
 counterpart and needs none" does not cover (that note is correct for the
 *syscall entry/exit* boundary; the cooperative-yield boundary is a different
 thing).
 
-**The fix** (`amd64/src/sched.rs`, `yield_now()`) — **REMOVED 2026-09-26**; it
+**The fix** (`crates/akuma-kernel-amd64/src/sched.rs`, `yield_now()`) — **REMOVED 2026-09-26**; it
 allowed switches without the lock, which ended in two silent hangs; see the 2026-09-26
 section above: added a
 `akuma_bkl::bkl::in_dropped_window()` check alongside the existing
@@ -284,7 +284,7 @@ taken`, is pre-existing and unrelated); staged onto the trashcan's own
 checkout via `git apply` + `kbuild` for a real-hardware retest of the
 triggering scenario.
 
-**What this fix does NOT touch — §1's own finding stands.** `amd64/src/sock.rs`
+**What this fix does NOT touch — §1's own finding stands.** `crates/akuma-kernel-amd64/src/sock.rs`
 still has no BKL guard of any kind, confirmed unchanged by this pass. A thread
 blocked inside `sock.rs`'s native `sendto`/`recvfrom`/`accept`/`connect` never
 calls `dropped_window_open()` in the first place — it holds the BKL the whole
@@ -309,7 +309,7 @@ syscall entry point has **no opt-out mechanism wired in at all** — the
 per-syscall bitmap that lets AArch64 skip the entry acquire for exactly this
 syscall family (`nr::SOCKET`, `nr::ACCEPT`, `nr::CONNECT`, …,
 `crates/akuma-bkl/src/policy.rs` `SYSCALL_BKL_OPTOUT_SEED`) is never consulted
-by `amd64/src/usermode.rs`. The one thing that *is* BKL-free, and deliberately
+by `crates/akuma-kernel-amd64/src/usermode.rs`. The one thing that *is* BKL-free, and deliberately
 so, is the netpoll daemon's smoltcp drain (the packet-processing side) —
 mirroring AArch64's carve-out there. The blocking **wait** inside a socket
 syscall, however, uses the general-purpose `yield_now`, which only opens a
@@ -319,7 +319,7 @@ the AArch64-side fix for exactly this problem (`blocking_relax_net` /
 
 ## 1. Call path: syscall entry -> socket body (representative: `sendto`)
 
-1. `amd64/src/usermode.rs:824` `extern "C" fn syscall_handler(nr, a1..a6)` —
+1. `crates/akuma-kernel-amd64/src/usermode.rs:824` `extern "C" fn syscall_handler(nr, a1..a6)` —
    the x86_64 `syscall` trap lands here with `nr` as the **native x86_64**
    syscall number (confirmed by the trace arm at `usermode.rs:906` matching
    x86_64's `open=2`/`stat=4`/`lstat=6`/`access=21`/`chdir=80`, not
@@ -338,9 +338,9 @@ the AArch64-side fix for exactly this problem (`blocking_relax_net` /
    only, not a gate.
 4. `usermode.rs:1038` `syscall_dispatch(nr, ..)` decodes `nr` (raw x86_64
    number) and, for `sendto` (x86_64 44), calls into
-   `amd64/src/sock.rs:256` `sys_sendto`.
+   `crates/akuma-kernel-amd64/src/sock.rs:256` `sys_sendto`.
 5. `sock.rs:256-303` — no BKL guard of any kind (`grep -n "NetBklGuard\|
-   bkl_drop_window\|bkl_run_unlocked" amd64/src/sock.rs` returns nothing).
+   bkl_drop_window\|bkl_run_unlocked" crates/akuma-kernel-amd64/src/sock.rs` returns nothing).
    The function decodes the destination address (`fd::socket_index`,
    `sockaddr_in_from_user` — a `uaccess::read_bytes` user copy), then for a
    UDP socket copies the payload (`fd::copy_in`, `sock.rs:294`, another user
@@ -362,9 +362,9 @@ path itself.
 
 Not checked file-by-file to the same depth (out of the audit's time budget),
 but the same mechanism applies: `syscall_handler` takes the BKL unconditionally
-for **every** `nr`, and nothing under `amd64/src/` imports the opt-out bitmap,
+for **every** `nr`, and nothing under `crates/akuma-kernel-amd64/src/` imports the opt-out bitmap,
 so whatever `sys_epoll_wait`/`sys_ppoll` does is BKL-held for the same
-structural reason — confirm by reading `amd64/src/fd.rs`'s poll/epoll arms
+structural reason — confirm by reading `crates/akuma-kernel-amd64/src/fd.rs`'s poll/epoll arms
 directly if this needs a second citation; the entry-point argument above does
 not depend on which syscall it is.
 
@@ -379,13 +379,13 @@ policy per `active_wait_policy`, `socket.rs:754` — no `net-direct-waker` or
 `(runtime().blocking_relax)()` (`socket.rs:792`).
 
 amd64 wires `blocking_relax` to the **plain** `crate::sched::yield_now`
-(`amd64/src/net.rs:265-273`, specifically line 273:
+(`crates/akuma-kernel-amd64/src/net.rs:265-273`, specifically line 273:
 `blocking_relax: crate::sched::yield_now`) — the same function used for pipe
 reads, `wait4`, and every other generic kernel wait loop. Its own comment at
 `net.rs:270-272` states the design explicitly: *"drops the BKL for a moment so
 the other cores' syscalls get in — which is exactly what 'relax while
 blocked' has to mean under one lock."* "A moment" is
-`amd64/src/smp.rs:395-411` `bkl_drop_window()`: release the lock, spin
+`crates/akuma-kernel-amd64/src/smp.rs:395-411` `bkl_drop_window()`: release the lock, spin
 `DROP_WINDOW_SPINS = 4` (`smp.rs:360`) `core::hint::spin_loop()` iterations,
 **re-acquire it**, then (`sched.rs:2039` in `yield_now`) perform the actual
 `threading::yield_now()` context switch **while holding the BKL again**. The
@@ -417,7 +417,7 @@ serialized behind this for as long as the wait lasts.
 
 ## 3. What runs BKL-free: the netpoll drain
 
-`amd64/src/net.rs:542-590` `netpoll_daemon` — the daemon that calls
+`crates/akuma-kernel-amd64/src/net.rs:542-590` `netpoll_daemon` — the daemon that calls
 `smoltcp_net::poll()`/drains RX-TX — explicitly wraps only the drain call in a
 dropped-BKL window: `net.rs:571` `akuma_bkl::bkl::dropped_window_open()`,
 `net.rs:572` `drain_step()`, `net.rs:573` `dropped_window_close()`. The
@@ -429,9 +429,9 @@ answered."* So the packet-processing/poll side of networking is BKL-free by
 design and was fixed after being measured as a starvation source. The
 socket-syscall side (§1-2) was not given the same treatment.
 
-No dedicated NIC interrupt handler was found in `amd64/src/idt.rs` for the
+No dedicated NIC interrupt handler was found in `crates/akuma-kernel-amd64/src/idt.rs` for the
 virtio-net or `rtl8169` device (`grep -n "rtl8169\|virtio_net\|nic_irq"
-amd64/src/idt.rs` — no hits); RX/TX servicing on this target appears to be
+crates/akuma-kernel-amd64/src/idt.rs` — no hits); RX/TX servicing on this target appears to be
 pure cooperative polling through `netpoll_daemon`, not a hardware-IRQ path.
 This is an **inferred** conclusion from an absence of hits, not something
 positively confirmed by reading a working IRQ table — worth a second look if
@@ -472,7 +472,7 @@ found by inspection.
   check (`usermode.rs:824-991`).
 - No file under `amd64/` references `syscall_bkl_optout`/`SYSCALL_BKL_OPTOUT`
   (grep, exhaustive over `amd64/`).
-- `amd64/src/sock.rs` contains no BKL guard/drop of any kind (grep,
+- `crates/akuma-kernel-amd64/src/sock.rs` contains no BKL guard/drop of any kind (grep,
   exhaustive over the file).
 - `blocking_relax` for amd64's `NetRuntime` is the plain `sched::yield_now`
   (`net.rs:273`), and `yield_now`'s `bkl_drop_window` releases the lock for
@@ -488,7 +488,7 @@ found by inspection.
 - That `sys_epoll_wait`/`sys_ppoll`/`sys_pselect6` on amd64 follow the exact
   same BKL-held shape as the socket calls audited — inferred from the
   entry-point argument (§1) rather than read function-by-function in
-  `amd64/src/fd.rs`.
+  `crates/akuma-kernel-amd64/src/fd.rs`.
 - That there is genuinely no NIC hardware-interrupt path (only the polling
   daemon) — inferred from an absence of grep hits in `idt.rs`, not from
   tracing PCI/MSI setup to its end.

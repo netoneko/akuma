@@ -65,7 +65,7 @@ pub const PHYSMAP_OFFSET: usize = 0;
 
 /// Base of the amd64 kernel's physmap window (PML4 slot 256).
 ///
-/// Duplicated in `amd64/src/phys.rs` as `PHYSMAP_BASE` — which re-exports this
+/// Duplicated in `crates/akuma-kernel-amd64/src/phys.rs` as `PHYSMAP_BASE` — which re-exports this
 /// rather than restating it, so there is one value. It cannot live only there:
 /// `akuma-primitives` is a leaf crate and cannot depend on a binary.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -73,7 +73,7 @@ pub const PHYSMAP_OFFSET: usize = 0xFFFF_8000_0000_0000;
 
 /// How much physical memory the amd64 physmap covers: the first 64 GiB.
 ///
-/// The one value; `amd64/src/phys.rs` takes its `PHYSMAP_LIMIT` from here, and
+/// The one value; `crates/akuma-kernel-amd64/src/phys.rs` takes its `PHYSMAP_LIMIT` from here, and
 /// `boot.s` builds that many page directories from it. Unconditional (not
 /// `cfg`-gated like [`PHYSMAP_OFFSET`]) so [`physmap_contains`] can be tested on
 /// the host; it means nothing on AArch64, where the kernel map is the identity.
@@ -101,7 +101,7 @@ const fn below_physmap_limit(paddr: usize) -> bool {
 /// Base of the amd64 kernel's device (MMIO) window, PML4 slot 257.
 ///
 /// A second window rather than a range inside the physmap, because device
-/// registers must be mapped uncached and RAM must not be. See `amd64/src/phys.rs`.
+/// registers must be mapped uncached and RAM must not be. See `crates/akuma-kernel-amd64/src/phys.rs`.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub const DEVMAP_OFFSET: usize = 0xFFFF_8080_0000_0000;
 
@@ -109,12 +109,12 @@ pub const DEVMAP_OFFSET: usize = 0xFFFF_8080_0000_0000;
 ///
 /// The `-2 GiB` range `-C code-model=kernel` assumes:
 /// `.text`/`.rodata`/`.data`/`.bss` all live here, linked high and loaded low
-/// via `AT(ADDR(sec) - KERNEL_VMA)` in `amd64/linker.ld` — so the physical
+/// via `AT(ADDR(sec) - KERNEL_VMA)` in `crates/akuma-kernel-amd64/linker.ld` — so the physical
 /// address of a kernel object is its virtual address minus this. It is a
 /// **second alias of RAM**, distinct from the physmap: a `static` DMA buffer
 /// (`akuma-net-nic`'s frame arenas) has an address in this window, not the
 /// physmap, and [`virt_to_phys`] has to know both. Mirrors
-/// `amd64/src/phys.rs::KERNEL_VMA`.
+/// `crates/akuma-kernel-amd64/src/phys.rs::KERNEL_VMA`.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub const KERNEL_IMAGE_OFFSET: usize = 0xFFFF_FFFF_8000_0000;
 

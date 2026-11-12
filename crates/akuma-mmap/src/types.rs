@@ -20,7 +20,7 @@
 //! `GRANT_RECORDS_VS_DENY_RECORDS.md`'s bug, re-created by porting its fix.
 //!
 //! So [`Prot`] is what a region records now, and the bits live with the walker
-//! that writes them: `akuma_mmu::types` for AArch64, `amd64/src/paging.rs` for
+//! that writes them: `akuma_mmu::types` for AArch64, `crates/akuma-kernel-amd64/src/paging.rs` for
 //! x86_64. This is [`akuma_cow`](https://docs.rs/akuma-cow)'s shape — that crate
 //! takes `pte_writable: bool` and `marked: bool`, decoded booleans rather than a
 //! PTE, which is precisely why it already serves both kernels.

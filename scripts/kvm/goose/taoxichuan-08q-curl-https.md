@@ -26,9 +26,9 @@ No `fork`/`clone`: `sh` runs one simple command per ssh exec (no `;`, `&&`, `$(.
 
 ## Composition rule (mandatory)
 `taoxichuan/` is a composition root, not a kernel written from scratch (about 5,100 lines of its own next to 100+ crates and a full amd64 kernel that serves nearly every syscall you will meet). Before you write any syscall arm, subsystem or helper of more than about 20 lines:
-1. **Look first**: `grep -rn "<name>" crates/ amd64/src/` for the syscall or concept; `ls crates/` for the crate that owns it.
+1. **Look first**: `grep -rn "<name>" crates/ crates/akuma-kernel-amd64/src/` for the syscall or concept; `ls crates/` for the crate that owns it.
 2. **It exists in a crate**: add a path dependency and call it. Do not copy it.
-3. **It exists only in `amd64/src/`**: extract it into a crate first (`forbid(unsafe_code)` where it can), make `amd64/` depend on the crate too, then depend on it from `taoxichuan/`.
+3. **It exists only in `crates/akuma-kernel-amd64/src/`**: extract it into a crate first (`forbid(unsafe_code)` where it can), make `amd64/` depend on the crate too, then depend on it from `taoxichuan/`.
 3b. **It exists but is welded to `Process`/`akuma-exec`**: cut a seam, do not rewrite.
 4. **It exists nowhere**: write it, in a crate with host tests when the logic is pure, and say why in `RESULT-Q.md`.
 Report per arm or feature: *pulled* / *extracted* / *written new (why)*, and `wc -l taoxichuan/src/*.rs` at the start and end.

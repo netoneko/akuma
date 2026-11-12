@@ -43,7 +43,7 @@ smp = []
 #
 # The boot kit: PVH trampoline (boot.s — its `global_asm!` lives in the crate),
 # the physmap, kernel page tables, heap + PMM bring-up. One crate where
-# `amd64/src` used to be the only home of all four.
+# `crates/akuma-kernel-amd64/src` used to be the only home of all four.
 akuma-boot-amd64 = { path = "../akuma-boot-amd64" }
 akuma-pagetable = { path = "../akuma-pagetable" }
 akuma-phys = { path = "../akuma-phys" }
@@ -147,7 +147,7 @@ spinning_top = "0.3"
 akuma-tty = { path = "../akuma-tty" }
 # Stage 8 M4 session pb: the exec/threading ladder pulled for the preemption
 # foundation (linkage proved; the exec_runtime twin lands next session), and
-# the LAPIC timer face extracted from amd64/src/lapic.rs so both kernels share
+# the LAPIC timer face extracted from crates/akuma-kernel-amd64/src/lapic.rs so both kernels share
 # one implementation. akuma-port rides along: this kernel now masks the legacy
 # PICs before arming the timer, exactly as amd64's lapic::init does.
 akuma-exec = { path = "../akuma-exec" }

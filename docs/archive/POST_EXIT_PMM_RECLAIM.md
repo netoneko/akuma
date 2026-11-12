@@ -333,7 +333,7 @@ if (runtime().drain_in_flight)(i) {
   `drain_in_flight: process::reclaim::drain_in_flight` — a new
   `pub(crate) fn drain_in_flight(tid: usize) -> bool` reading `DRAINING[tid]`.
 - Host stub `akuma-threading/src/test_support.rs` (~line 72): `|_| false`.
-- amd64 stub `amd64/src/sched.rs` (~line 368): `|_| false`.
+- amd64 stub `crates/akuma-kernel-amd64/src/sched.rs` (~line 368): `|_| false`.
 
 ### Why the interleaving is now impossible
 

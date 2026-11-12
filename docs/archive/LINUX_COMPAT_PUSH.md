@@ -31,14 +31,14 @@ than creates.
 ### 1.1 The private numbers
 
 Numbers are asm-generic (AArch64); on amd64 each is `AKUMA_PRIVATE_BASE (0x1000) + n`
-(`userspace/libakuma/src/lib.rs:138`, `amd64/src/usermode/dispatch.rs:59`). Defined in
+(`userspace/libakuma/src/lib.rs:138`, `crates/akuma-kernel-amd64/src/usermode/dispatch.rs:59`). Defined in
 `crates/akuma-syscalls-linux/src/nr.rs:85-149` and `:285`; mirrored in `libakuma` twice
 (`lib.rs:180-330`, one module per architecture). 321 and 323 are reserved (removed framebuffer calls,
 `nr.rs:111-123`), 304 and 306 are unused. **25 entries: 24 live on AArch64, 21 on amd64.**
 
 `akuma-native` (`crates/akuma-syscalls-glue/Cargo.toml:89`, 21 `cfg` sites in `lib.rs`) already gates
 the arms for all of them except the box family (gated by `sc-containers`) and `mount_in_ns`. It is in
-glue's `default` and named explicitly by both kernels (`Cargo.toml:890`, `amd64/Cargo.toml:568`), so
+glue's `default` and named explicitly by both kernels (`Cargo.toml:890`, `crates/akuma-kernel-amd64/Cargo.toml:568`), so
 it is always on today. Taoxichuan builds without it ("Off, the numbers fall to `ENOSYS`",
 `docs/reference/subsystems/config-flags.md:109`).
 
@@ -111,7 +111,7 @@ not three. `kami` uses `std::process::Command` (Linux calls) and is not a caller
 Kernel-internal spawns that stay no matter what: `crates/akuma-kernel-glue/src/lib.rs:1807`
 (`spawn_process_with_channel` for herd), `:1833` (`spawn_process` for sshd on `extreme-size`),
 `rump_proxy.rs:1449,1507` (rump servers); amd64 builds init through `spawn_process_task`
-(`amd64/src/usermode.rs:2581,4787`). Linux's kernel also execs init itself; these are the equivalent.
+(`crates/akuma-kernel-amd64/src/usermode.rs:2581,4787`). Linux's kernel also execs init itself; these are the equivalent.
 Only two non-test callers reach the *syscall-shaped* `spawn_process_with_channel_ext` /
 `spawn_process_with_creds`: glue `proc.rs:1814` and `:1922`.
 
@@ -128,7 +128,7 @@ Only two non-test callers reach the *syscall-shaped* `spawn_process_with_channel
 | `SPAWN_FLAG_PTY` | `open("/dev/ptmx")`, `TIOCSPTLCK(0)`, `TIOCGPTN`, `fork`; child `setsid`, `open("/dev/pts/N")`, `TIOCSCTTY`, `dup3` to 0/1/2, `execve`; window size by `TIOCSWINSZ` on the master | **Yes, on both kernels.** `crates/akuma-syscalls-glue/src/pty.rs` (64 slots, `TIOCSPTLCK/GTPN/GPTPEER/SCTTY/NOTTY/GWINSZ/SWINSZ/GPGRP/SPGRP/GSID`, `ISIG` to the foreground group, hangup rules); `setsid` `proc.rs:139`; `ptmx` in `akuma-vfs/src/dev.rs:88`; `FdState::Pty` readiness for `poll`/`epoll`. Spec and 31/31 `ptyprobe` on amd64 QEMU at SMP=1 and 4 and on the metal: `docs/archive/AKUMA_AMD64_PTY.md` §6 | nothing in the kernel. AArch64 is "served by the same glue" per that doc, but **`ptyprobe` has not been recorded on AArch64** (unverified). Known gaps from §5 of that doc: `kill(-pgid)` unsupported by `sys_kill` (`proc.rs:2010`: `pid <= 1` is `EPERM`), no output flow control |
 | `SPAWN_FLAG_CONSOLE` (amd64) | none: a child of the console process **inherits** the console channel | the amd64 shell already runs everything this way: `busybox sh` forks, children share the console channel (`usermode.rs:1505-1540`, `console_attached` at `:3060`) | herd as `init` must redirect service output itself (see section 3, case 2). The `EPERM` policy ("only a console-attached process may hand the console on", `usermode.rs:4151-4161`) disappears, because inheritance is the mechanism |
 | `SPAWN_EXT` box entry | `fork`; child: an entry call for the box, `chdir`, `setgroups`/`setgid`/`setuid`, `execve` | creds: `setuid/setgid/setresuid/setgroups` `glue lib.rs:1089-1097`; `chroot` `:858`; `chdir`. **There is no `setns`, `unshare` or `pivot_root` in the tree** (`grep` finds only the constant `CLONE_NEWNS` in `akuma-syscalls-linux/src/proc.rs:120`) | the entry primitive. See 2.1 |
-| `REGISTER_BOX`, `KILL_BOX`, `SET_BOX_STACK`, `MOUNT_IN_NS` | none: Linux has no registry of namespaces with a policy that "box 0 composes the mount table from outside" (`containers.md`, "Mount policy") | `/proc/boxes` already exposes the registry read-only (`akuma-vfs-glue/src/proc.rs:1092`); precedent for a control file instead of a syscall: `amd64/src/kvm/ctl.rs` (`/dev/kvm0` takes `Spec` key=value text, `akuma-vm-spec`) | see 2.2 |
+| `REGISTER_BOX`, `KILL_BOX`, `SET_BOX_STACK`, `MOUNT_IN_NS` | none: Linux has no registry of namespaces with a policy that "box 0 composes the mount table from outside" (`containers.md`, "Mount policy") | `/proc/boxes` already exposes the registry read-only (`akuma-vfs-glue/src/proc.rs:1092`); precedent for a control file instead of a syscall: `crates/akuma-kernel-amd64/src/kvm/ctl.rs` (`/dev/kvm0` takes `Spec` key=value text, `akuma-vm-spec`) | see 2.2 |
 | `REATTACH` | pty master ownership: the runner of the box holds the master and bridges it; `box grab` would need to obtain that fd | `SCM_RIGHTS` exists on AF_UNIX (`glue net.rs:1201-1264`, `unixsock.rs:261`); `containers.md` says amd64 has no AF_UNIX (that line may be stale, unverified) | `pidfd_getfd` is absent (`grep` finds no row). See 2.3 |
 | `WAITPID` | `wait4(pid, &st, WNOHANG)` or blocking `wait4` | yes; `libakuma` already does this under `linux-abi` (`lib.rs:2567`) | nothing. The native one only matches `spawn` children (amd64 by `spawner_pid`, `containers.md`) |
 | `AKUMA_KILL` | `kill(pid, sig)` | the same handler `proc::sys_kill` | only `libakuma`'s constants: Linux `kill` is 129 (AArch64) and 62 (x86_64) and is missing from `libakuma`'s tables |
@@ -139,7 +139,7 @@ Only two non-test callers reach the *syscall-shaped* `spawn_process_with_channel
 | `SET_CURSOR_POSITION`, `HIDE/SHOW_CURSOR`, `CLEAR_SCREEN` | `write(1, "\x1b[..")` | yes | nothing: the kernel arms literally write those escape strings to the channel (`term.rs:455-487`), so these are four wrappers of `write` |
 | `POLL_INPUT_EVENT` | raw termios (`VMIN=0`) plus `ppoll`/`read` on fd 0 | `ppoll` yes; "readiness for a session stdin fd is decided in glue/poll from the channel" (`tty.md`) | the timeout semantics (`u64::MAX` blocks) become a `ppoll` timeout. A process with no channel gets `ENOMEM` from the private call today |
 | `GET_CPU_STATS` | `/proc/<pid>/stat` and `/proc/boxes` | `/proc/<pid>/stat` (44 fields, `akuma-procfs`), `/proc/<pid>/status`, `/proc/boxes` exist. `akuma-procfs/src/tree.rs:60` carries `box_id` per process | whether `status` prints the box id and whether `stat` field 39 (`processor`) is filled: **unverified**. If not, add a `Box:` line to `/proc/<pid>/status`. `box` needs pid-to-box and name |
-| `RESOLVE_HOST` | a stub resolver in userspace: read `/etc/resolv.conf`, UDP query | UDP sockets yes. `crates/akuma-dns` is `no_std`, `forbid(unsafe)`, effects-based (`build_query`, `parse_response`, `resolve_a`), exactly what `libakuma` could link | a nameserver source. The kernel does not write `/etc/resolv.conf` (no writer found under `crates/`, `src/`, `amd64/src/`); it is disk content (`overlays/`, box overlays). The in-kernel resolver stays regardless: the SNTP bootstrap uses it |
+| `RESOLVE_HOST` | a stub resolver in userspace: read `/etc/resolv.conf`, UDP query | UDP sockets yes. `crates/akuma-dns` is `no_std`, `forbid(unsafe)`, effects-based (`build_query`, `parse_response`, `resolve_a`), exactly what `libakuma` could link | a nameserver source. The kernel does not write `/etc/resolv.conf` (no writer found under `crates/`, `src/`, `crates/akuma-kernel-amd64/src/`); it is disk content (`overlays/`, box overlays). The in-kernel resolver stays regardless: the SNTP bootstrap uses it |
 | `CONSOLE_NOTIFY` | `write` to `/dev/kmsg` or `/dev/console` | **neither node exists**: `akuma-vfs/src/dev.rs` has `null random tty ptmx fb0 ...`, and a test asserts `console` is absent (`dev.rs:326`) | one dev node whose write does `serial::puts` with the existing framing and 512-byte cap |
 | `SET_TPIDR_EL0` | write `TPIDR_EL0` from EL0 | n/a | nothing; delete |
 | `CORE_INIT` | none | n/a | nothing; delete, and herd's `core` key |
@@ -234,7 +234,7 @@ fd over an AF_UNIX socket, or keep `reattach` as an exception.
    in-kernel function (`test_spawned_child_not_a_tty` `:8379`, `..._pty_is_a_tty` `:8421`,
    `test_box_crossing_spawn_gets_fresh_terminal_state` `:8463`, `test_spawn_resolves_a_shebang_script`
    `:10724`, 31 references to `spawn_process*` in total) survive or die with the ext variants.
-   amd64: `amd64/src/usermode/tests.rs:754-766` (`console_notify`), `:1562`, `:1792` (box family "exercised
+   amd64: `crates/akuma-kernel-amd64/src/usermode/tests.rs:754-766` (`console_notify`), `:1562`, `:1792` (box family "exercised
    live"). Shared: `crates/akuma-syscalls/src/tests.rs:119-134,369,433-435`.
 7. **Credentials.** `SPAWN_EXT`'s `uid/gid/groups` are applied atomically before the child's first
    instruction (`proc.rs:1721-1752`, `spawn.rs:535`). In fork+exec the child runs as the caller until

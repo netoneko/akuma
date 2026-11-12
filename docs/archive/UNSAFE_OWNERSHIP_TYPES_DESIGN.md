@@ -60,7 +60,7 @@ indeterminate state. Retires: the two demand-fill slices, the CoW `copy_nonoverl
 Check first: the `frame_pool` batch is consumed across a loop with early exits; model the pool as `Vec<Option<FreshFrame>>` and `publish` each as it is mapped, so a mid-loop failure drops (frees) the rest.
 
 ### 2.2 `PinnedFrame<'t>` for table-held shared frames
-`amd64/src/shmpages.rs` (`wrote`, `zeroed`) writes through the physmap to a frame that the shared-page table pins: "the table holds a reference for as long as the entry exists, and the entry cannot go
+`crates/akuma-kernel-amd64/src/shmpages.rs` (`wrote`, `zeroed`) writes through the physmap to a frame that the shared-page table pins: "the table holds a reference for as long as the entry exists, and the entry cannot go
 while this hold is taken". That sentence *is* the type:
 
 ```rust
@@ -108,7 +108,7 @@ bootable under HVF locally). `claim_fixed` is the open question; if (1) shows th
 
 ## 4. Per-CPU state: `LocalCpu`
 
-`amd64/src/gdt.rs` (3 sites), `akuma-tokio-kernel-amd64` (`set_rsp0`, GDT/TSS init, 3-5 sites) and the `GS_BASE` write all mean the same claim: *I am this CPU, no other core touches its slot of this table, and I cannot be preempted off it.*
+`crates/akuma-kernel-amd64/src/gdt.rs` (3 sites), `akuma-tokio-kernel-amd64` (`set_rsp0`, GDT/TSS init, 3-5 sites) and the `GS_BASE` write all mean the same claim: *I am this CPU, no other core touches its slot of this table, and I cannot be preempted off it.*
 
 ```rust
 pub struct LocalCpu { id: CpuId, _not_send: PhantomData<*mut ()> }      // !Send !Sync: cannot leave the core it was made on
@@ -124,7 +124,7 @@ impl LocalCpu {
 
 ## 5. The SVM run loop: a token that proves SVM is on
 
-`amd64/src/kvm.rs` + `kvm/linux.rs`: the `EFER.SVME`/`VM_HSAVE_PA` enable pair, five `vmrun` call sites, `vmrun`/`vmrun_regs`/`vmsave` and their asm (audit B1: ~14 sites). The claims are (a) SVM is enabled on *this* core before any
+`crates/akuma-kernel-amd64/src/kvm.rs` + `kvm/linux.rs`: the `EFER.SVME`/`VM_HSAVE_PA` enable pair, five `vmrun` call sites, `vmrun`/`vmrun_regs`/`vmsave` and their asm (audit B1: ~14 sites). The claims are (a) SVM is enabled on *this* core before any
 `vmrun`, (b) the VMCB being run is a page nothing else touches, (c) the host-save area is registered.
 
 ```rust

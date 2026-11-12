@@ -46,9 +46,9 @@ written for" — with its message and doc comment updated to say so explicitly
 and point at the follow-on proposal.
 
 **This is not a formality the way the other four are.** Unlike the `akuma-mmu`
-gate fix, which had `amd64/src/paging.rs` as an already-proven port target,
+gate fix, which had `crates/akuma-kernel-amd64/src/paging.rs` as an already-proven port target,
 there is nothing to port here — see the proposal doc for why
-`amd64/src/sched.rs`'s cooperative-only switch is not a smaller version of
+`crates/akuma-kernel-amd64/src/sched.rs`'s cooperative-only switch is not a smaller version of
 this SGI-interrupt/fake-IRQ-frame mechanism. Calling this function on
 `x86_64` today is a deliberate, documented panic, not a missing feature that
 happens to compile.
@@ -81,7 +81,7 @@ panic), then:
    resulting ELF (101,069 disassembly lines) contains zero AArch64 mnemonics.
 
 Probe reverted after — `git diff --stat amd64/` shows only the intentional
-`amd64/Cargo.toml` version bump (0.1.0 → 0.0.7, to match the main kernel's
+`crates/akuma-kernel-amd64/Cargo.toml` version bump (0.1.0 → 0.0.7, to match the main kernel's
 own version), nothing from the probe.
 
 ## What this does NOT do

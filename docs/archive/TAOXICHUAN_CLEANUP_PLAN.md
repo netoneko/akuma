@@ -115,7 +115,7 @@ instances are two id spaces: a folded `close` closed the wrong pipe. So the tabl
   fixed point before anything else lands on top.
 
 **The x86_64 ABI layer over glue becomes a crate (decided 2026-11-01, before the flip).** Glue speaks asm-generic, so amd64
-does not hand it x86_64 fd calls raw. `amd64/src/fd.rs` holds a translation layer: open-flag permutation (`openat`),
+does not hand it x86_64 fd calls raw. `crates/akuma-kernel-amd64/src/fd.rs` holds a translation layer: open-flag permutation (`openat`),
 asm-generic -> x86_64 `struct stat` (`fstat`, `newfstatat`), timeout conversion (`poll`, `select`), `dup2`'s `old == new` rule,
 `pipe` -> `pipe2`, plus the legacy numbers with no asm-generic twin (`open` 2, `stat` 4, `lstat` 6, `poll` 7, `access` 21,
 `pipe` 22, `select` 23, `dup2` 33, `epoll_create` 213, `epoll_wait` 232). Measured: of its 23 `sys_*` shims, the translating ones
@@ -126,8 +126,8 @@ a third copy. So:
 
 | step | what |
 |---|---|
-| 2c-B1 | new crate `akuma-syscalls-glue-amd64` (the `-glue` exception: it calls glue, so it is not host-testable; `-amd64`: x86_64 ABI only): the translating shims moved out of `amd64/src/fd.rs`, a `dispatch_fd(nr, args) -> Option<u64>` over x86_64 numbers including the legacy ones, and the stat/flag translations' host tests where they are pure. User memory through `akuma-user-access`. |
-| 2c-B2 | amd64 calls it after its device intercepts. Gate: amd64 boot suite on QEMU TCG (`amd64/run.sh`) plus `scripts/box_amd64_suite.py`. `amd64/src/fd.rs` shrinks by the moved shims. |
+| 2c-B1 | new crate `akuma-syscalls-glue-amd64` (the `-glue` exception: it calls glue, so it is not host-testable; `-amd64`: x86_64 ABI only): the translating shims moved out of `crates/akuma-kernel-amd64/src/fd.rs`, a `dispatch_fd(nr, args) -> Option<u64>` over x86_64 numbers including the legacy ones, and the stat/flag translations' host tests where they are pure. User memory through `akuma-user-access`. |
+| 2c-B2 | amd64 calls it after its device intercepts. Gate: amd64 boot suite on QEMU TCG (`amd64/run.sh`) plus `scripts/box_amd64_suite.py`. `crates/akuma-kernel-amd64/src/fd.rs` shrinks by the moved shims. |
 | 2c-B3 | Taoxichuan's flip (below) calls `dispatch_fd` instead of `handle_syscall` for the fd family. |
 
 Risks carried over from amd64: glue takes the BKL-shaped guards (`NetBklGuard`) and expects the exec runtime hooks
@@ -179,7 +179,7 @@ crates; 789 of Taoxichuan's 1,669 image `unsafe` lines are third-party):
 - `lock_api` (276 image lines) out of `akuma-exec`, onto `akuma-bkl`'s own locks; `heapless` (289) stays: smoltcp
   0.12 depends on it unconditionally (neighbor cache, routes, the interface, DHCP), and forking smoltcp is out of scope
   (user, 2026-11-01);
-- dedupe what repeats in `amd64/src` (22 `asm!`, the `CR3` writes, volatile reads `MmioWindow`/`DmaArray` cover);
+- dedupe what repeats in `crates/akuma-kernel-amd64/src` (22 `asm!`, the `CR3` writes, volatile reads `MmioWindow`/`DmaArray` cover);
 - measure `unsafe` *outside* named contract crates (`akuma-cpu`, `-port`, `-dma`, `-user-access`, `-alloc`, ...) as
   the number to drive to zero, rather than the total.
 

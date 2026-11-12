@@ -207,7 +207,7 @@ pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
 ///
 /// For a kernel with no signal delivery: amd64 answers a broken pipe with
 /// `EPIPE` alone, which is "the whole of Linux's answer that applies" there
-/// (`amd64/src/fd.rs`, `write_pipe`). Spelled as a second entry point rather
+/// (`crates/akuma-kernel-amd64/src/fd.rs`, `write_pipe`). Spelled as a second entry point rather
 /// than as a global policy flag so the choice is visible at the call site that
 /// makes it, and so nothing can change it after boot.
 pub fn pipe_write_no_sigpipe(id: u32, data: &[u8]) -> Result<usize, i32> {
@@ -403,7 +403,7 @@ pub fn pipe_pollers_count(id: u32) -> usize {
 /// two only differ on an id nobody holds — kept distinct rather than merged so a
 /// stale id reports "not ready" instead of manufacturing a readable event.
 ///
-/// **`amd64/src/pipe.rs` takes the crate's answer instead**, and that divergence
+/// **`crates/akuma-kernel-amd64/src/pipe.rs` takes the crate's answer instead**, and that divergence
 /// is deliberate rather than drift: the fixed slot array it replaced reported on
 /// the array entry, not on a live pipe, so "missing" was never a state it could
 /// answer `false` for, and it has no epoll/`tokio` callers pinned to this one.
@@ -470,7 +470,7 @@ pub fn pipe_live_count() -> usize {
 /// A policy, not a table rule, so it is here and not in `akuma-pipes`. Each
 /// pipe can hold up to `PIPE_CAPACITY` of kernel buffer claimed on a userspace
 /// request, so a bound turns a leak into a refusal that announces itself.
-/// amd64 enforced this alone until 2026-11-12 (`amd64/src/pipe.rs`). The
+/// amd64 enforced this alone until 2026-11-12 (`crates/akuma-kernel-amd64/src/pipe.rs`). The
 /// sample-then-create below is soft by one race: concurrent creators can land
 /// a few over it, which is fine for a policy nothing indexes.
 pub const MAX_PIPES: usize = 2048;

@@ -44,7 +44,7 @@ intermittently unreachable, when in fact there was never a single hub to
 begin with.
 
 Real Linux's `bind()` returns `EADDRINUSE` in exactly this situation; Akuma's
-never did, on either architecture — `amd64/src/sock.rs::sys_bind` and the
+never did, on either architecture — `crates/akuma-kernel-amd64/src/sock.rs::sys_bind` and the
 AArch64 syscall path both call straight into this same `akuma_net::socket`
 function, so the gap was never arch-specific, only *found* on amd64 because
 that is where three-resident litter deployment happened first.

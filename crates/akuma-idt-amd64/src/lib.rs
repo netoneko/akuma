@@ -3,7 +3,7 @@
 //!
 //! # What this replaces
 //!
-//! `amd64/src/idt.rs` held the table as `static mut IDT: [Entry; 256]`, reached
+//! `crates/akuma-kernel-amd64/src/idt.rs` held the table as `static mut IDT: [Entry; 256]`, reached
 //! only through `&raw mut` and written by four `unsafe` blocks, each vouching for
 //! the same fact: "single core, interrupts masked, written before `lidt`". That
 //! was a promise about *when*, made at every call site, for a table whose only

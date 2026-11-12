@@ -11,7 +11,7 @@
 
 `akuma-vfs-glue`'s `ProcFilesystem` is mounted at `/proc`. It compiled for this
 target since C1 step 4a and was deliberately left unmounted, with the reason
-recorded in `amd64/Cargo.toml`: it renders from `akuma-exec`'s process table,
+recorded in `crates/akuma-kernel-amd64/Cargo.toml`: it renders from `akuma-exec`'s process table,
 and this target registered nothing there, so mounting it *would have replaced a
 working synthetic `/proc` with a report of an empty machine*. Slices 1-2 spent
 that reason.

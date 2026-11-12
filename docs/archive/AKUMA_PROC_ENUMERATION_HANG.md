@@ -62,7 +62,7 @@ a cache that is rebuilt on each call).
 The user's reading is that this shows up on **long-running** boxes. Plausible
 mechanisms to check, in order of cost:
 
-1. the `/proc` directory cache (`dir_cache` in `amd64/src/fd.rs` header) grows
+1. the `/proc` directory cache (`dir_cache` in `crates/akuma-kernel-amd64/src/fd.rs` header) grows
    with every process ever spawned and is re-walked per call, so a getdents
    buffer that never fits makes the caller re-ask forever;
 2. a stale pid-table row (a slot freed but still listed) whose entry never

@@ -62,7 +62,7 @@ use the probe.)
 
 ## Why amd64 does not have it
 
-amd64's `sys_pread64` (`amd64/src/fd.rs`) goes through `akuma_syscalls_glue::fs::sys_pread64`, which asks the filesystem, not an
+amd64's `sys_pread64` (`crates/akuma-kernel-amd64/src/fd.rs`) goes through `akuma_syscalls_glue::fs::sys_pread64`, which asks the filesystem, not an
 fd-local copy. This is a Taoxichuan glue bug. It belongs to the file-description model that
 `TAOXICHUAN_CRATE_EXTRACTION_PLAN.md` § X7 proposes moving into the shared crates, which is not started.
 

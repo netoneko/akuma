@@ -1,9 +1,9 @@
 //! The LAPIC's timer face and the clocks measured against it, extracted from
-//! `amd64/src/lapic.rs` per the composition rule ("extract into a crate only
+//! `crates/akuma-kernel-amd64/src/lapic.rs` per the composition rule ("extract into a crate only
 //! what lives only there"): the register-page window, end-of-interrupt, the
 //! tick counter, the periodic timer arm/stop, the 8254 PIT calibration, and
 //! the TSC rate/uptime math — **one implementation, two consumers**. The
-//! amd64 kernel (`amd64/src/lapic.rs`) re-exports these and keeps the parts
+//! amd64 kernel (`crates/akuma-kernel-amd64/src/lapic.rs`) re-exports these and keeps the parts
 //! that need its own modules (IPI/ICR, per-core oneshot bookkeeping, AP
 //! bring-up, self-tests); taoxichuan consumes it directly. The KVM guest's
 //! LAPIC model (`akuma-svm-amd64`'s `lapic`, xAPIC page + timer) is what both
@@ -31,7 +31,7 @@ use akuma_port::PIT;
 use akuma_primitives::{mmio::MmioWindow, OnceCopy};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-// ── constants (verbatim from amd64/src/lapic.rs) ────────────────────────────
+// ── constants (verbatim from crates/akuma-kernel-amd64/src/lapic.rs) ────────────────────────────
 
 /// The IA32_APIC_BASE fields this crate reads: the page's physical base.
 pub const APIC_BASE_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -211,7 +211,7 @@ pub fn on_tick() -> u64 {
 /// The count comes from [`calibrate`] when a PIT was there to calibrate
 /// against, and from [`UNCALIBRATED_COUNT`] when there was not. (The error
 /// story — `100_000` at divide-16 being 6x fast on a 1 GHz KVM APIC and 1.6x
-/// slow on a 100 MHz bus — is told at length in `amd64/src/lapic.rs`'s
+/// slow on a 100 MHz bus — is told at length in `crates/akuma-kernel-amd64/src/lapic.rs`'s
 /// `start_timer`, whose body this is.)
 pub fn start_timer() {
     // **Stop the timer before switching it to periodic.** The caller is usually
@@ -305,7 +305,7 @@ pub fn calibrated_count() -> u32 {
 /// The full story — channel 0 not channel 2 (no port-0x61 board glue, so it
 /// works on QEMU `microvm`), the read-back command instead of an IRQ, the
 /// bounded wait for machines with no PIT at all, and the plausibility bands —
-/// is in `amd64/src/lapic.rs`'s `calibrate`, whose body this is. The TSC rides
+/// is in `crates/akuma-kernel-amd64/src/lapic.rs`'s `calibrate`, whose body this is. The TSC rides
 /// along on the same load: one PIT period measures both clocks.
 pub fn calibrate() -> bool {
     /// Ticks of the PIT in one target period.

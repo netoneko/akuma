@@ -43,7 +43,7 @@ The pend itself worked. `pend_signal_to_group` set the bit and the interrupt fla
 ever consumed them.
 
 amd64 did not have this hole: there, a thread leaves ring 3 through its own syscall return or a
-tick, and both deliver (`amd64/src/signal.rs`).
+tick, and both deliver (`crates/akuma-kernel-amd64/src/signal.rs`).
 
 ## Fix (hooked scheduler only)
 

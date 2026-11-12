@@ -35,7 +35,7 @@ IMG="${1:-target/x86_64-unknown-none/release/amd64-root.img}"
 # itself reported (`failed to commit …: No such file or directory`, its
 # rename() finding no tmp file because the write that should have created it
 # had already failed silently at `close(2)`; see that function's own comment
-# in `amd64/src/fd.rs`). 128 MiB left headroom for a handful of dependency
+# in `crates/akuma-kernel-amd64/src/fd.rs`). 128 MiB left headroom for a handful of dependency
 # chains — but not for real use: `apk add tar tcc` plus the staged musl-dev
 # filled it on the HP box and the next write truncated a binary
 # (`[spawn] load failed: image is shorter than elf64 header`). **512 MiB
@@ -61,7 +61,7 @@ DEBUGFS=$(find_tool debugfs) || {
     exit 1
 }
 
-# The guest ELF, wherever cargo put it. Built by amd64/build.rs into OUT_DIR, so
+# The guest ELF, wherever cargo put it. Built by crates/akuma-kernel-amd64/build.rs into OUT_DIR, so
 # the path carries a hash and has to be searched for rather than spelled.
 HELLO=$(find target/x86_64-unknown-none/release/build -name hello.elf 2>/dev/null | head -1)
 FDPROBE=$(find target/x86_64-unknown-none/release/build -name fdprobe.elf 2>/dev/null | head -1)
@@ -115,7 +115,7 @@ done
 #     `std::rt::init` — is the actual thing rustc's own binaries run, not a
 #     hand-rolled approximation. That prologue is where the self-hosting
 #     blockers live; see `docs/archive/AKUMA_AMD64_RUST_STD.md`.
-#   * `rustc` directly, not cargo, for the same reason `amd64/build.rs` does it:
+#   * `rustc` directly, not cargo, for the same reason `crates/akuma-kernel-amd64/build.rs` does it:
 #     one file, no dependencies, and a nested cargo would want its own target
 #     directory to avoid the parent's lock.
 #   * staged onto the disk rather than `include_bytes!`d into the kernel. It is
@@ -341,7 +341,7 @@ fi
 # fetched here directly rather than through that crate, because its own
 # `build.rs` is pinned to the aarch64 download URLs and bootstrap paths.
 # `apk.static` is `-static-pie` (`ET_DYN`, no `PT_INTERP`) — loadable only
-# since `amd64/src/loader.rs` grew static-PIE support the same day; see that
+# since `crates/akuma-kernel-amd64/src/loader.rs` grew static-PIE support the same day; see that
 # file's module header for why the kernel does *not* process its `DT_RELR`
 # relocations itself (musl's own startup code does, once it can find its
 # program headers via `AT_PHDR`).
@@ -505,7 +505,7 @@ if [ -f "$BB" ]; then
     # stand-in. `sh` stays: nothing else provides it.
     #
     # `reboot`/`halt`/`poweroff` are still worth calling out: `reboot(2)` is
-    # wired (`amd64/src/reboot.rs`), so they are how that box gets shut down
+    # wired (`crates/akuma-kernel-amd64/src/reboot.rs`), so they are how that box gets shut down
     # cleanly from a session instead of by holding its power button.
     #
     # A gap no applet list fixes: anything needing a pipeline or a redirect.
@@ -706,7 +706,7 @@ fi
 # convention) — but nothing points a guest resolver at it without this file.
 # musl's resolver reads `/etc/resolv.conf` and, finding none, falls back to
 # `127.0.0.1`, so `wget http://a-hostname/` failed with "bad address" even
-# though outbound TCP itself worked (`amd64/README.md`'s curl/wget check).
+# though outbound TCP itself worked (`crates/akuma-kernel-amd64/README.md`'s curl/wget check).
 #
 # Three servers, and the two public ones are NOT a fallback that costs a
 # timeout on a VMM: **musl queries every nameserver at once** (`__res_msend`
@@ -715,7 +715,7 @@ fi
 # hypervisor's proxy answers first under a VMM, and on the HP box, where
 # `10.0.2.3` is nothing at all, Cloudflare and Google do. That machine's own
 # router is deliberately not in the list, for the reason
-# `BARE_METAL_STATIC_V4` gives in `amd64/src/net.rs`: a household gateway may
+# `BARE_METAL_STATIC_V4` gives in `crates/akuma-kernel-amd64/src/net.rs`: a household gateway may
 # not be a resolver, and this is a box with no keyboard to fix it from.
 # `RESOLV_NS="1.1.1.1 8.8.8.8"` replaces the list.
 "$DEBUGFS" -w -R "mkdir /etc" "$IMG" >/dev/null 2>&1
@@ -735,7 +735,7 @@ printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></h
 # `/proc`, as an empty directory.
 #
 # This target synthesizes exactly one file under it (`/proc/net/dev`, in
-# `amd64/src/fd.rs`) and has no process filesystem at all, so this buys nothing
+# `crates/akuma-kernel-amd64/src/fd.rs`) and has no process filesystem at all, so this buys nothing
 # for anything that wants to *read* `/proc`. What it buys is the tools that
 # merely check whether it is there: busybox `reboot` opens `/proc` to find init
 # before it will reboot, and without the directory refuses with `can't open

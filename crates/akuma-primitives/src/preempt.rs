@@ -53,7 +53,7 @@ use crate::safe_print;
 /// once, and on 2026-08-04 raising only one silently did nothing.
 ///
 /// **512 on x86_64**, and that is a target-specific number rather than a
-/// tidier universal one. `amd64/src/sched.rs` raised its own table 96 → 512 on
+/// tidier universal one. `crates/akuma-kernel-amd64/src/sched.rs` raised its own table 96 → 512 on
 /// 2026-09-06 against a measurement: on the bare-metal reference box a real
 /// session runs dozens of commands, every command is a slot and `fork` takes a
 /// second, so 96 was a few minutes of work before `spawn` returned `None` and

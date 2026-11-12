@@ -153,7 +153,7 @@ child's registered fd 0/1/2 *are* its pipes, which is the fact
 `child_of_stdout_pipe` now reads. They were green before this change and are the
 reason it is safe.
 
-**AArch64 is untouched** — every edit is in `amd64/src/usermode.rs`. No shared
+**AArch64 is untouched** — every edit is in `crates/akuma-kernel-amd64/src/usermode.rs`. No shared
 crate changed, so no binary or boot A/B was owed.
 
 ## Background

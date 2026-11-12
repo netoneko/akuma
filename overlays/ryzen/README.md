@@ -139,7 +139,7 @@ litter/kami`, and **copy `crates/akuma-fbcon/vendor/spleen/*` in from the main
 checkout** (a submodule; a worktree gets it empty, and `akuma-fbcon`'s build
 script panics). `AKUMA_SRC=/src/kami-wt kbuild -j 4 --features no-tests`: 29 s
 and 27 s incremental against `/root/ktarget` at `smp=8`. `uname` then shows a stale
-revision (`amd64/build.rs` does not rerun when the worktree's HEAD moves; a
+revision (`crates/akuma-kernel-amd64/build.rs` does not rerun when the worktree's HEAD moves; a
 kernel built in a *Mac* worktree stamps the main checkout's HEAD the same way);
 identify kernels by `md5sum`, or check a symbol with `nm`.
 
@@ -206,7 +206,7 @@ itself).
 
 ## The NVMe root
 
-`root=/dev/nvme0n1p3` makes the kernel drive the SSD itself (`amd64/src/nvme.rs`
+`root=/dev/nvme0n1p3` makes the kernel drive the SSD itself (`crates/akuma-kernel-amd64/src/nvme.rs`
 over `crates/akuma-nvme`). It takes the controller from UEFI (9 ms on this
 drive), reads the GPT (both CRCs checked), and from then on touches **only
 p3's LBA range**. Every offset is checked against that window before a command
@@ -229,7 +229,7 @@ is about 35–50 s of firmware and boot, plus:
 ## The watchdog
 
 `wdt` (or `wdt=<seconds>`, 10–65535) arms the AMD FCH watchdog, the block Linux
-drives with `sp5100_tco`, from `amd64/src/watchdog.rs`. It is gated on the
+drives with `sp5100_tco`, from `crates/akuma-kernel-amd64/src/watchdog.rs`. It is gated on the
 chipset (`1022:790b` revision ≥ `0x51`) and set to reset on expiry. It is armed
 before the root mount, so a hung NVMe or USB bring-up is covered. It is petted
 once a second from the BSP's timer interrupt and stopped right before an

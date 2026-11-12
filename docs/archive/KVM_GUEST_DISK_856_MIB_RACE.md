@@ -37,8 +37,8 @@ The guest still booted (`BOOT OK ... ready_in=45s`), because everything the batt
 
 ## Where the number comes from (code, read-only)
 
-- `amd64/src/kvm/linux/machine.rs:1054` prints `d.sectors() >> 11` as MiB.
-- `amd64/src/kvm/linux.rs:683-690`: for a file-backed disk, `sectors()` is `akuma_vfs_glue::file_size(path) / SECTOR`.
+- `crates/akuma-kernel-amd64/src/kvm/linux/machine.rs:1054` prints `d.sectors() >> 11` as MiB.
+- `crates/akuma-kernel-amd64/src/kvm/linux.rs:683-690`: for a file-backed disk, `sectors()` is `akuma_vfs_glue::file_size(path) / SECTOR`.
 
 So `file_size()` returned about 897.6 MB at the moment the VM started, for a file whose size was 1 GiB seconds earlier on every other view.
 

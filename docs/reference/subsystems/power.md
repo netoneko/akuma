@@ -20,7 +20,7 @@ uevent. Three sources, selected at boot:
 
 Decode, render and integration live in `akuma-power`
 (`#![forbid(unsafe_code)]`, no allocation, host-tested against bytes measured
-on the real machine); `amd64/src/power.rs` is only the physmap scan, the
+on the real machine); `crates/akuma-kernel-amd64/src/power.rs` is only the physmap scan, the
 device mapping and the volatile reads. The field map and its Linux ground
 truth: [`archive/AKUMA_ACPI_POWER.md`](../../archive/AKUMA_ACPI_POWER.md).
 
@@ -41,7 +41,7 @@ one one-shot of up to **100 ticks (1 s)** — the budget ramping with
 consecutive quiet laps (`akuma-kacho::WakeBudget`), floored again by the first
 wake that finds work. `idlesleep=<ticks>` caps the ceiling lower.
 
-Three invariants, each stated where it is enforced (`amd64/src/lapic.rs`, `akuma-lapic-amd64`):
+Three invariants, each stated where it is enforced (`crates/akuma-kernel-amd64/src/lapic.rs`, `akuma-lapic-amd64`):
 
 1. **Deadline precision is not traded away.** A sub-tick futex deadline arms
    an exact one-shot (`arm_deadline`) and the long shot refuses to cover it;
@@ -83,7 +83,7 @@ A dedicated userspace binary (`userspace/powersaved/`, herd-supervised — the
 between the meter and a lever:
 
 - **Input**: `/proc/power` once a second — its `idle_ms=` fact (console-input
-  inactivity; `amd64/src/input.rs` records the last keystroke across the
+  inactivity; `crates/akuma-kernel-amd64/src/input.rs` records the last keystroke across the
   i8042, USB HID and serial) and, on a metered machine, `power_mw=`. The
   daemon's 1 Hz read is also what keeps the energy ledger integrating.
 - **Policy**: a staircase of idle thresholds and brightness steps, pure code
@@ -93,7 +93,7 @@ between the meter and a lever:
   repeatable; `after_ms=` moves the first step); a malformed argv exits
   rather than silently dimming on defaults.
 - **Effect**: only on a *change*, one `dim=<pct>` line to `/dev/power` — the
-  kernel's control device (`amd64/src/power.rs`'s `dev_read`/`dev_write`,
+  kernel's control device (`crates/akuma-kernel-amd64/src/power.rs`'s `dev_read`/`dev_write`,
   misc 10:243, the `wifi0` shape). The kernel clamps, applies the factor to
   the framebuffer console (`multiboot2::fb_set_dim` → `akuma-fbcon`'s global
   dim + `repaint()`), and reports it back as `dim=` in both files.

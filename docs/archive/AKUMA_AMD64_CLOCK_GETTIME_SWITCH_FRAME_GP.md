@@ -102,12 +102,12 @@ revision would shift addresses.
    `owner=2` → holder is `core_id=1`. `idt.rs`'s `EXCEPTION core=1` is the raw
    `cpu_index()` (no `+1`). **Same core** — core 1 held the BKL while performing
    this switch (switches on amd64 are only safe under the BKL,
-   `amd64/src/sched.rs:987-1000`), and the three waiters (`core_id` 3, 0, 2,
+   `crates/akuma-kernel-amd64/src/sched.rs:987-1000`), and the three waiters (`core_id` 3, 0, 2,
    printed as `core=4/1/3` due to the `+1` offset) spun 2–4M times and never
    stopped, because `idt::fatal()` halts without releasing anything.
 
 6. **`c0ffee15deadbeef`** in the raw `[rsp/physmap]` dump is not garbage — it is
-   `amd64/src/sched.rs:1366`'s `STACK_CANARY`, a deliberate 4-word sentinel
+   `crates/akuma-kernel-amd64/src/sched.rs:1366`'s `STACK_CANARY`, a deliberate 4-word sentinel
    painted at the base (bottom) of every amd64 kernel/trap stack
    (`paint_canary`), checked on both sides of every switch
    (`check_canaries`, `:1650`, called from `hook_switch_to` before
@@ -147,7 +147,7 @@ revision would shift addresses.
                  -- ATTEMPTED, REVERTED same night: wedged the box at the
                  *netpoll daemon's* first parks ("[SWITCH NO-BKL] from=4 to=1
                  core=1 via=block_until_deadline", then silence, twice).
-                 Live in `amd64/src/sched.rs:892-901` as a still-reverted comment.
+                 Live in `crates/akuma-kernel-amd64/src/sched.rs:892-901` as a still-reverted comment.
               3. A reconcile in amd64's ring-3 return paths (syscall exit,
                  enter_user, IRQ epilogues) mirroring AArch64's
                  reconcile_for_spsr -- NOT DONE, explicitly listed as pending.
@@ -155,7 +155,7 @@ revision would shift addresses.
 2026-09-22  <- this crash
 ```
 
-`console::pump_daemon` (`amd64/src/console.rs:392`, spawned via
+`console::pump_daemon` (`crates/akuma-kernel-amd64/src/console.rs:392`, spawned via
 `crate::sched::spawn_daemon`) is spawned from `boot.rs:273`
 (`console::init()`), before `net::spawn_netpoll()` (`multiboot2.rs:552`, later
 in network bring-up) — so it plausibly still gets a lower, earlier slot number
@@ -271,7 +271,7 @@ switch, before `x86_check_incoming_frame`:
   anywhere earlier in the boot → the overflowing culprit for Theory C.
 - Neither → favors Theory A or B.
 
-Also worth a plain read: `git log -p --since=2026-09-20 -- amd64/src/sched.rs
+Also worth a plain read: `git log -p --since=2026-09-20 -- crates/akuma-kernel-amd64/src/sched.rs
 crates/akuma-threading/src/lib.rs` for anything touching `yield_now`,
 `block_current`, `block_until_deadline`, `x86_pick_next`, or the BKL-drop-window
 helpers since the revert, not already accounted for in the two archive docs

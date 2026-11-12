@@ -19,8 +19,8 @@ fault-check mark; (5) merge-readiness.
 
 ## pi §1. What the other kernels do when idle (the idle contract)
 
-Read from the crates and amd64/src (pulled, not re-derived):
-- `amd64/src/kvm/linux/machine.rs:517` — "A halted processor wakes when something can be
+Read from the crates and crates/akuma-kernel-amd64/src (pulled, not re-derived):
+- `crates/akuma-kernel-amd64/src/kvm/linux/machine.rs:517` — "A halted processor wakes when something can be
   offered to it": when a vCPU halts, the HOST loop flips Halted->Runnable on `plat.offer()`.
 - `machine.rs:460-465` — the host pumps the relay every 200 us (`next_relay_us`), and prints
   cpu0 state when a relayed connection waits on a halted cpu0 ("nothing is going to wake it").

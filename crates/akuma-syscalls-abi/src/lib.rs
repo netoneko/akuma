@@ -53,7 +53,7 @@
 //! # One table, four views
 //!
 //! Widened 2026-09-07 from 36 variants to 80 (82 since 2026-10-15) for **C1**, the fold of
-//! `amd64/src/usermode.rs` into `akuma-syscalls-glue`
+//! `crates/akuma-kernel-amd64/src/usermode.rs` into `akuma-syscalls-glue`
 //! (`proposals/NEXT_AGENT_AMD64_C1_USERMODE_FOLD.md`). Glue dispatches on
 //! asm-generic numbers and the amd64 kernel is handed x86_64 ones, so something
 //! has to translate; this enum is that translation, applied once at the amd64
@@ -108,7 +108,7 @@
 //!    crate exists to solve was recognized industry-wide and stopped being
 //!    reproduced going forward. A row for one of these would violate
 //!    `tables_disagree_where_linux_does` by construction (`to_x86_64() ==
-//!    to_aarch64()`), so they are not rows: `amd64/src/usermode.rs` dispatches
+//!    to_aarch64()`), so they are not rows: `crates/akuma-kernel-amd64/src/usermode.rs` dispatches
 //!    them straight through by their one shared number, no `Syscall` variant
 //!    or translation involved. `pidfd_open` is the first of these this target
 //!    dispatches.
@@ -336,7 +336,7 @@ syscall_table! {
     /// (slower, silently) or fails, depending on the caller's fallback.
     Linkat     => LINKAT     = 265, nr::LINKAT;
     /// Change owner, `*at`-style. The x86-only `fchown`(93) shims to it in
-    /// `amd64/src/usermode.rs`, the same way `chmod`(90) shims to `fchmodat`.
+    /// `crates/akuma-kernel-amd64/src/usermode.rs`, the same way `chmod`(90) shims to `fchmodat`.
     Fchownat   => FCHOWNAT   = 260, nr::FCHOWNAT;
     /// `fchown(fd, uid, gid)` — x86_64 93, asm-generic 55. A row since
     /// 2026-10-14; before it, x86_64 93 was shimmed onto `fchownat` with the fd
@@ -385,7 +385,7 @@ syscall_table! {
     /// `epoll_create1(flags)`. musl's `epoll_create(size)` narrows to this
     /// with `flags = 0` (size is advisory and discarded) rather than issuing
     /// a distinct number, so `epoll_create`(213) is the one legacy spelling
-    /// that shims to it in `amd64/src/usermode.rs`.
+    /// that shims to it in `crates/akuma-kernel-amd64/src/usermode.rs`.
     EpollCreate1 => EPOLL_CREATE1 = 291, nr::EPOLL_CREATE1;
     EpollCtl     => EPOLL_CTL     = 233, nr::EPOLL_CTL;
     /// `epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)`.
@@ -482,7 +482,7 @@ syscall_table! {
     // ── identity ───────────────────────────────────────────────────────────
     // What these *return* on the amd64 target is a separate question from what
     // they are called: `getpid` answers a literal 1 and the uid/gid family
-    // answers 0 there. Those are pinned decisions in `amd64/src/usermode.rs`,
+    // answers 0 there. Those are pinned decisions in `crates/akuma-kernel-amd64/src/usermode.rs`,
     // not properties of this table.
     Getpid     => GETPID     = 39,  nr::GETPID;
     Getppid    => GETPPID    = 110, nr::GETPPID;
@@ -825,7 +825,7 @@ pub mod legacy {
 /// `O_DSYNC`, `O_ASYNC`, `O_NOATIME`, `O_CLOEXEC`, `O_PATH` and `__O_TMPFILE`
 /// — which is exactly what makes this dangerous. A reader who spot-checks
 /// `O_CREAT` and `O_CLOEXEC` concludes the encodings agree, and
-/// `amd64/src/fd.rs` said so in a comment for months
+/// `crates/akuma-kernel-amd64/src/fd.rs` said so in a comment for months
 /// ("on x86_64 they happen to share the same numeric encoding").
 ///
 /// # Why it is a *silent* wrong answer, twice over
@@ -1323,7 +1323,7 @@ mod tests {
 
     /// Only four bits move. This is the claim the module's table makes, and it
     /// is the one a reader is most likely to assume without checking — the
-    /// comment in `amd64/src/fd.rs` asserted the *opposite* ("they happen to
+    /// comment in `crates/akuma-kernel-amd64/src/fd.rs` asserted the *opposite* ("they happen to
     /// share the same numeric encoding") for months.
     #[test]
     fn exactly_four_bits_are_permuted() {

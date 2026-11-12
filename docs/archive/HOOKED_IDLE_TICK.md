@@ -85,4 +85,4 @@ Tables: the multiarch log, section "Idle cost at SMP=4".
 
 - `docs/archive/HOOKED_IDLE_CPU_BURN.md`: the SMP=1 half of the idle cost.
 - `docs/archive/HOOKED_EL1_PREEMPTION.md`: the preemption this relies on.
-- `amd64/src/lapic.rs` `arm_deadline`: amd64's idle deadline, the model for this one.
+- `crates/akuma-kernel-amd64/src/lapic.rs` `arm_deadline`: amd64's idle deadline, the model for this one.

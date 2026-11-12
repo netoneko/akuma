@@ -12,13 +12,13 @@ production lines (99.0%) sit outside any `unsafe` block; 363 production sites ac
 with tests), 0 inside enforced crates. The new crate is `akuma-svm-switch-amd64`, the SVM world switch (`VMRUN`/`VMSAVE`/`VMLOAD`, `EFER.SVME`,
 `VM_HSAVE_PA`; 6 sites). `akuma-drivers-amd64` went 16 -> 7: what remains is entering a guest, whose
 contract (the guest reaches only memory it owns) no type states yet. The framebuffer window's one
-site moved back into `amd64/src/multiboot2.rs` (41 -> 42), and the vCPU box lost its `Box::from_raw`
+site moved back into `crates/akuma-kernel-amd64/src/multiboot2.rs` (41 -> 42), and the vCPU box lost its `Box::from_raw`
 ([`AKUMA_MULTIARCH_ATTEMPT_0.md`](../archive/AKUMA_MULTIARCH_ATTEMPT_0.md)).
 
 The run before, 2026-11-11 (late): **102 of 139 crates** forbid `unsafe`. 110653 of 111814 production lines (99.0%) sit outside any
 `unsafe` block; 366 production sites across `crates/` (445 with tests), 0 inside enforced crates. The
 15 new production sites are the SVM hypervisor's (`vmrun`, MSRs, the physmap), which moved from
-`amd64/src/kvm*` into `akuma-drivers-amd64` behind its `kvm` feature (`amd64/src` 56 -> 41 in
+`crates/akuma-kernel-amd64/src/kvm*` into `akuma-drivers-amd64` behind its `kvm` feature (`crates/akuma-kernel-amd64/src` 56 -> 41 in
 `unsafe-budget.json`, total unchanged at 407); they are allowed on `mod kvm` alone, as the
 framebuffer console's one site is on `mod fbcon`.
 
@@ -28,7 +28,7 @@ three new crates are the boot suites that left the two kernels' trees and the am
 none of them forbids. `akuma-kernel-tests-aarch64` and `akuma-kernel-tests-amd64` are almost
 entirely test code, and the amd64 one keeps the `akuma-mmu` walker suite's physical-frame reads. `akuma-drivers-amd64`
 is `deny(unsafe_code)` with one `allow`, on the framebuffer console's single `MmioWindow::new`, which
-moved out of `amd64/src/multiboot2.rs` (`amd64/src` 57 -> 56 in `unsafe-budget.json`;
+moved out of `crates/akuma-kernel-amd64/src/multiboot2.rs` (`crates/akuma-kernel-amd64/src` 57 -> 56 in `unsafe-budget.json`;
 [`AKUMA_MULTIARCH_ATTEMPT_0.md`](../archive/AKUMA_MULTIARCH_ATTEMPT_0.md)).
 
 The run before, earlier 2026-11-11: **102 of 136 crates** forbid `unsafe`. 101402 of 102477 production lines (99.0%) sit outside any `unsafe`
@@ -79,7 +79,7 @@ pulled out for the Taoxichuan kernel. Nine forbid from their first commit:
 `akuma-fpu-amd64` and `akuma-user-tree`. Three cannot, because they *are* the
 machine edge: `akuma-boot-amd64` (10 sites), `akuma-ring3-amd64` (8) and
 `akuma-sched-amd64` (52 — the context switch and FP save/restore, moved out of
-`amd64/src/sched.rs`, which is not counted here). The 2026-10-16 **Open** item
+`crates/akuma-kernel-amd64/src/sched.rs`, which is not counted here). The 2026-10-16 **Open** item
 below is closed: `akuma-net-rtl8169`, `akuma-usb` and `akuma-pci` each read 0
 sites now.
 
@@ -105,7 +105,7 @@ The run before, 2026-10-18, headline **not** regenerated, added
 **`akuma-port`**, which cannot: it is the only crate that executes `in`/`out`, so
 its `unsafe` is four `asm!` blocks in `src/raw.rs` (4 sites, 16 lines) behind the
 crate's one `#[allow(unsafe_code)]` under `#![deny(unsafe_code)]` — every device
-type in the crate is safe. It replaced `amd64/src/port.rs` and the `unsafe` block
+type in the crate is safe. It replaced `crates/akuma-kernel-amd64/src/port.rs` and the `unsafe` block
 at each of its 22 call sites: tree-wide `unsafe` went 812 -> 789 sites and
 2838 -> 2745 lines (`cloc_akuma.py src crates amd64`; amd64 alone 342 -> 315
 sites). Regenerated 2026-10-16
@@ -124,7 +124,7 @@ I²C register map, timings and abort decode). The 2026-10-12 run (62 of 82)
 added **`akuma-cmos-rtc`**
 (the PC CMOS clock's decode — UIP wait, BCD/binary, 12/24-hour, century,
 civil-to-Unix, plausibility — 0 sites; the two port accesses stay in
-`amd64/src/clock.rs`). The 2026-10-06 run (fourth that day) counted 59 of
+`crates/akuma-kernel-amd64/src/clock.rs`). The 2026-10-06 run (fourth that day) counted 59 of
 79; it added **`akuma-ieee80211`**
 (233 production lines, 0 sites): beacons, information elements, the RSN
 element, for wifi stage W2; and `akuma-rtw89` grew to 1393 production lines
@@ -132,13 +132,13 @@ element, for wifi stage W2; and `akuma-rtw89` grew to 1393 production lines
 sites. The run before added **`akuma-rtw89`**: the RTL8852CE power-on, DMA
 setup and firmware download for wifi stage W1, replayed in host tests
 against Linux's register trace of the same card. Its MMIO/DMA half is
-`amd64/src/rtw89.rs` ([`subsystems/wifi.md`](subsystems/wifi.md)). Before that, **`akuma-wifi`**
+`crates/akuma-kernel-amd64/src/rtw89.rs` ([`subsystems/wifi.md`](subsystems/wifi.md)). Before that, **`akuma-wifi`**
 (the `/dev/wifi0` protocol and the simulated radio, 0 sites;
 [`subsystems/wifi.md`](subsystems/wifi.md)). Earlier the same day, also carrying the ban
 from its first commit: **`akuma-nvme`** (582 production lines, 0 sites). That is
 the NVMe register/queue/Identify/PRP/GPT logic, with a partition window every
 access is checked against. Its MMIO/DMA half is `crates/akuma-drivers-amd64/src/nvme.rs`, which
-lives in `amd64/` and is not counted here (`overlays/ryzen/`,
+is not counted here (`overlays/ryzen/`,
 [`AKUMA_AMD64_ON_RYZEN_LAPTOP.md`](../archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md)
 § 9). Most of the other six new forbidding crates since 2026-09-06
 (`akuma-fbcon`, `akuma-pty`, `akuma-hda`, …) arrived without a regeneration.

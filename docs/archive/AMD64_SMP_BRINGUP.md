@@ -12,10 +12,10 @@ PVH path) and the OVMF+GRUB rig with `-smp 4` (162/162, the multiboot2 path),
 The aarch64 kernel went shared-kernel SMP with a Big Kernel Lock first and
 fine-grained locks later (`docs/reference/subsystems/smp-shared.md`,
 `BKL_FINE_GRAINED_LOCKING_PLAN.md`). This is the amd64 target taking the same
-first step, and it is one module plus edits: `amd64/src/smp.rs` (per-CPU
+first step, and it is one module plus edits: `crates/akuma-kernel-amd64/src/smp.rs` (per-CPU
 state, the BKL, AP bring-up, the self-test), a trampoline in `boot.s`, and
 changes in `sched.rs`, `usermode.rs`, `idt.rs`, `gdt.rs`, `lapic.rs`,
-`serial.rs`. `amd64/README.md` § "SMP" is the current-state summary; this
+`serial.rs`. `crates/akuma-kernel-amd64/README.md` § "SMP" is the current-state summary; this
 document is what happened on the way.
 
 ## 1. What "SMP" means here
@@ -271,16 +271,16 @@ found.
 
 | Path | |
 |---|---|
-| `amd64/src/smp.rs` | per-CPU block, BKL, AP bring-up, `ap_entry64`, the SMP self-test |
-| `amd64/src/boot.s` | `ap_trampoline_start..end`: 16→32→64-bit, its own GDT, the mailbox |
-| `amd64/src/sched.rs` | `on_cpu`/`pinned`/`idle`/`bkl_depth`/`fx` per task, `Reserved`, `idle_loop`, `register_idle_task`, `try_switch` |
-| `amd64/src/usermode.rs` | `gs:`-relative `syscall_entry`, `swapgs`, `bkl_enter`/`leave`, `enter_user`, `kill_current_from_fault`, `WRITE_CPU`, `smp_parallel_test` |
-| `amd64/src/idt.rs` | `timer_entry`/`timer_dispatch`, conditional `swapgs` in the stubs, `user_fault`, `load` |
-| `amd64/src/gdt.rs` | GDT/TSS per core, `init_cpu` |
-| `amd64/src/lapic.rs` | `init_ap`, `apic_id`, ICR IPIs, `delay_counts`, per-core ticks |
-| `amd64/src/sock.rs` | `accept`'s `addrlen` and `recvmsg`'s `msg_namelen` through `uaccess` (§3.5) |
-| `amd64/src/multiboot2.rs` | RSDP → MADT from the loader's tag, the SMP block after `preempt_test`, `initargs=`, `serial::init` (§3.6) |
-| `amd64/src/kbd.rs`, `amd64/src/input.rs` | polled i8042 keyboard; console input from UART or keyboard, whichever has a byte (not SMP — found while testing the bare-metal boot; `AKUMA_AMD64_ON_HP_500_502NJ.md`) |
+| `crates/akuma-kernel-amd64/src/smp.rs` | per-CPU block, BKL, AP bring-up, `ap_entry64`, the SMP self-test |
+| `crates/akuma-kernel-amd64/src/boot.s` | `ap_trampoline_start..end`: 16→32→64-bit, its own GDT, the mailbox |
+| `crates/akuma-kernel-amd64/src/sched.rs` | `on_cpu`/`pinned`/`idle`/`bkl_depth`/`fx` per task, `Reserved`, `idle_loop`, `register_idle_task`, `try_switch` |
+| `crates/akuma-kernel-amd64/src/usermode.rs` | `gs:`-relative `syscall_entry`, `swapgs`, `bkl_enter`/`leave`, `enter_user`, `kill_current_from_fault`, `WRITE_CPU`, `smp_parallel_test` |
+| `crates/akuma-kernel-amd64/src/idt.rs` | `timer_entry`/`timer_dispatch`, conditional `swapgs` in the stubs, `user_fault`, `load` |
+| `crates/akuma-kernel-amd64/src/gdt.rs` | GDT/TSS per core, `init_cpu` |
+| `crates/akuma-kernel-amd64/src/lapic.rs` | `init_ap`, `apic_id`, ICR IPIs, `delay_counts`, per-core ticks |
+| `crates/akuma-kernel-amd64/src/sock.rs` | `accept`'s `addrlen` and `recvmsg`'s `msg_namelen` through `uaccess` (§3.5) |
+| `crates/akuma-kernel-amd64/src/multiboot2.rs` | RSDP → MADT from the loader's tag, the SMP block after `preempt_test`, `initargs=`, `serial::init` (§3.6) |
+| `crates/akuma-kernel-amd64/src/kbd.rs`, `crates/akuma-kernel-amd64/src/input.rs` | polled i8042 keyboard; console input from UART or keyboard, whichever has a byte (not SMP — found while testing the bare-metal boot; `AKUMA_AMD64_ON_HP_500_502NJ.md`) |
 | `crates/akuma-multiboot2` | `BootInfo::rsdp` |
 | `crates/akuma-ryzen-amd64` | `acpi::rsdp_from_bytes` |
 | `amd64/run.sh` | `SMP=N` |

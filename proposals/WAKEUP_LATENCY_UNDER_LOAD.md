@@ -109,5 +109,5 @@ still sets the slice length for step 3's fairness.
 - [`docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md`](../docs/archive/RUMP_SYSPROXY_LATENCY_FIX.md)
 - [`docs/archive/HOOKED_IDLE_TICK.md`](../docs/archive/HOOKED_IDLE_TICK.md): AArch64's
   tickless idle.
-- `amd64/src/lapic.rs` (`arm_deadline`, `arm_idle_shot`), `amd64/src/sched.rs` (`idle_loop`),
+- `crates/akuma-kernel-amd64/src/lapic.rs` (`arm_deadline`, `arm_idle_shot`), `crates/akuma-kernel-amd64/src/sched.rs` (`idle_loop`),
   `crates/akuma-threading/src/lib.rs` (`pick_next`, `wake_pass`, `schedule_blocking`).

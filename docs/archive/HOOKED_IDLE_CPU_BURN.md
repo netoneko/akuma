@@ -64,4 +64,4 @@ Devbox and the gates: see the multiarch log, section "Hooked: the idle CPU burn"
 - `docs/archive/SECOND_LISTENER_SMP1_FREEZE.md`: why a non-idle halter must not hold the core.
 - `docs/archive/KNOWN_ISSUES.md` issue #11: the same ping-pong on the SGI path, fixed there by
   `idle_halt`'s `wfi`.
-- `amd64/src/sched.rs`: `credit_halted_time` in amd64's idle loop.
+- `crates/akuma-kernel-amd64/src/sched.rs`: `credit_halted_time` in amd64's idle loop.

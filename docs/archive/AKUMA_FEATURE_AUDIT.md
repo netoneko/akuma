@@ -10,7 +10,7 @@ measured starting point. Read-only audit; nothing changed yet.
 | manifest | features |
 |---|---:|
 | root `Cargo.toml` (AArch64 kernel) | 39 (+ `default`) |
-| `amd64/Cargo.toml` | 22 (+ `default`) |
+| `crates/akuma-kernel-amd64/Cargo.toml` | 22 (+ `default`) |
 | `akuma-kernel-glue` / `-core` (forwarding layers) | 22 / 9 |
 | all `crates/*/Cargo.toml` | 193 |
 
@@ -36,7 +36,7 @@ measured starting point. Read-only audit; nothing changed yet.
    **Checked 2026-11-10 against the whole tree (not just scripts/docs): none is dead.** My first
    pass grepped only `scripts/ overlays/ acceptance/ docs/runbooks docs/reference` and reported
    `leak-instr`, `pmm-instr`, `net-direct-waker`, `reboot-trace` as zero-reference — wrong. Each has
-   live `cfg` sites (`leak-instr` 40, `pmm-instr` 12, `reboot-trace` 2 in `amd64/src/reboot.rs`,
+   live `cfg` sites (`leak-instr` 40, `pmm-instr` 12, `reboot-trace` 2 in `crates/akuma-kernel-amd64/src/reboot.rs`,
    added 2026-10-07 for "who called reboot(2)") and archive write-ups; `pmm-forensics` and
    `mm-forensics` are named in the `docs/README.md` symptom matrix (the `mmap` double-populate
    hunt) and used by the tokio kernel. They are hunting tools kept for the next hunt.
@@ -252,7 +252,7 @@ kernels; `SMP=1` is the same image on one core.
 
 - **The single-core arms are deleted** wherever only Akuma compiles them: `akuma-entry`,
   `akuma-exceptions`, `akuma-kernel-glue`, `akuma-kernel-core`, `akuma-kernel-tests-aarch64`,
-  `amd64/src` (the cfg resolver folded `kernel_smp_shared` to true). These crates no longer emit
+  `crates/akuma-kernel-amd64/src` (the cfg resolver folded `kernel_smp_shared` to true). These crates no longer emit
   the cfg or carry the feature.
 - **The 16 crates Taoxichuan shares keep the switch**, renamed `bkl-smp` / `cfg(kernel_bkl_smp)`:
   akuma-bkl, -cpu, -dma, -el0-entry, -exec, -ext2, -gic, -mmu, -net, -net-nic, -primitives,
@@ -260,7 +260,7 @@ kernels; `SMP=1` is the same image on one core.
   without it and serializes under its own ticket lock. Host tests use the off arms. Unifying the
   two locks is [`proposals/ONE_BIG_KERNEL_LOCK.md`](../../proposals/ONE_BIG_KERNEL_LOCK.md).
 - **How it is wired:**
-  - The root `Cargo.toml` turns `bkl-smp` on through `akuma-kernel-glue`, and `amd64/Cargo.toml`
+  - The root `Cargo.toml` turns `bkl-smp` on through `akuma-kernel-glue`, and `crates/akuma-kernel-amd64/Cargo.toml`
     on each shared dependency.
   - `akuma_bkl::ACTIVE` (`cfg!(kernel_bkl_smp)`) is const-asserted by both kernels, so a missed
     forward fails the build. It replaces amd64's `BKL_REQUIRES_SMP_SHARED`.
@@ -305,9 +305,9 @@ saying what became of it.
     forwards like AArch64's: amd64 `no-tests` `.text` is 2,833,167 → 2,831,215 (−1,952 B).
     Boots to `uname` at SMP=1 and 2 (TCG).
   - **`sc-sysv-ipc`** not forwarding to `akuma-vfs-glue` was first recorded here as intended,
-    on the word of an `amd64/Cargo.toml` comment saying amd64 does not mount that crate's
+    on the word of an `crates/akuma-kernel-amd64/Cargo.toml` comment saying amd64 does not mount that crate's
     `ProcFilesystem`. **That was wrong** (corrected the same day): amd64 has mounted it as
-    its `/proc` since multiarch 5b slice 3 (`amd64/src/fs.rs`), so amd64 had the queue
+    its `/proc` since multiarch 5b slice 3 (`crates/akuma-kernel-amd64/src/fs.rs`), so amd64 had the queue
     syscalls but no `/proc/sysvipc/msg`. Fixed in the next section.
 
 ## `sc-sysv-ipc` folded into `linux-extra-syscalls` (2026-11-11)

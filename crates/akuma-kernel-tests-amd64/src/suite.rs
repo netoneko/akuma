@@ -1,6 +1,6 @@
 //! The suite's one list: what runs, in what order, on both boot paths.
 //!
-//! Moved from `amd64/src/boot.rs` unchanged but for the paths: each `x::smoke_test` the
+//! Moved from `crates/akuma-kernel-amd64/src/boot.rs` unchanged but for the paths: each `x::smoke_test` the
 //! kernel still carries inline is reached through `akuma_kernel_amd64::testing` (`k` here).
 
 use akuma_kernel_amd64::testing as k;

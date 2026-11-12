@@ -56,7 +56,7 @@ reproduces it on demand.
 2. `KernelPhysMap::table_addr` (the walker's physmap view in `akuma-mmu`) asserts
    `akuma_primitives::addr::physmap_contains(pa)` and names the frame. Before, it was a bare
    `pa + PHYSMAP_OFFSET`: the `akuma-pagetable` docs said a frame outside the physmap
-   "fails loudly", which was true of `amd64/src/phys.rs::phys_to_virt` but never of this
+   "fails loudly", which was true of `crates/akuma-kernel-amd64/src/phys.rs::phys_to_virt` but never of this
    one. A bad table is now a panic with the frame in the message rather than an anonymous
    `#PF`. `PHYSMAP_LIMIT` has one definition (`akuma-primitives::addr`); `phys.rs` takes it
    from there.

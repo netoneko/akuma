@@ -9,7 +9,7 @@
 //!
 //! That is a whole kernel bin on either architecture. [`entry!`] expands to the symbols the
 //! target's boot assembly calls, and each symbol calls into the machine half the target
-//! selects: `akuma-kernel-amd64` (`amd64/`) on `x86_64-unknown-none`, `akuma-kernel-glue` on
+//! selects: `akuma-kernel-amd64` on `x86_64-unknown-none`, `akuma-kernel-glue` on
 //! AArch64. It is the same shape as `akuma-tokio-kernel`, one level up
 //! (`docs/archive/AKUMA_ARCH_CONVERGENCE_RESEARCH.md` §4, option C).
 //!

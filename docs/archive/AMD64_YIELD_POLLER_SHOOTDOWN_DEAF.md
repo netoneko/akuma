@@ -1,6 +1,6 @@
 # amd64: a kernel thread that polls by yielding never acked a TLB shootdown (2026-11-12)
 
-**Status: fixed in the tree (`amd64/src/sched.rs` `yield_now`), verified on QEMU TCG
+**Status: fixed in the tree (`crates/akuma-kernel-amd64/src/sched.rs` `yield_now`), verified on QEMU TCG
 under host load. Not a metal finding; nothing seen on the metal is attributed to it.**
 
 ## Symptom

@@ -224,7 +224,7 @@ pub fn sync_all_filesystems() -> Result<(), FsError> {
 /// virtio, a GRUB-placed RAM image and a USB partition, two of which are not block
 /// devices this crate can name. So that kernel had orphaned-lock recovery silently off
 /// while every hook *looked* wired, and the first fix for it was a second registry in
-/// `amd64/src/fs.rs`. One registry over the trait object both kernels already mount
+/// `crates/akuma-kernel-amd64/src/fs.rs`. One registry over the trait object both kernels already mount
 /// through is the shape that cannot drift again
 /// (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md` §8.3).
 ///

@@ -1,7 +1,7 @@
 //! The framebuffer console: GRUB's linear framebuffer as a terminal, write-combined, double
 //! buffered, with the boot splash and the console's pointer cell.
 //!
-//! Moved from `amd64/src/multiboot2.rs` (2026-11-11) unchanged but for the paths; it is the
+//! Moved from `crates/akuma-kernel-amd64/src/multiboot2.rs` (2026-11-11) unchanged but for the paths; it is the
 //! display class of `akuma_kernel_amd64::drivers`. The machine half keeps the EGA text line
 //! (`ega_text`, the output of last resort) and the `fbtrace` stand-in, and reaches everything
 //! here through the registered `Display` table, so a build without the `fbcon` feature has

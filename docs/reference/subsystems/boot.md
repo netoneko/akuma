@@ -57,7 +57,7 @@ and stay out of its way. The three kernel families do it differently today:
 
 ### amd64, in order
 
-`run_init(path, args)` (`amd64/src/usermode.rs`) is four stages:
+`run_init(path, args)` (`crates/akuma-kernel-amd64/src/usermode.rs`) is four stages:
 
 1. **Find init.** `Init` from the boot line (above), then `fs::read_image_head(path)`, which follows symlinks
    (`/bin -> usr/bin`). Missing: `[init] not on the disk`, and the boot stops.

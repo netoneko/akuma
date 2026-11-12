@@ -11,7 +11,7 @@ workspace = true
 #
 # Every constant here is a function of the AMD APM (24593 rev 3.45) tables, so
 # the crate tests on the host with nothing to vendor. The kernel module that
-# executes VMRUN (`amd64/src/kvm.rs`) owns every `unsafe`; this crate is
+# executes VMRUN (`crates/akuma-kernel-amd64/src/kvm.rs`) owns every `unsafe`; this crate is
 # `#![forbid(unsafe_code)]` and builds the VMCB as typed data on an already
 # zero-filled page.
 #

@@ -113,7 +113,7 @@ question of the authoritative table.
 
 ## 5. What the fold deleted
 
-`amd64/src/usermode.rs`: **6413 → 6247 lines**, and four items became
+`crates/akuma-kernel-amd64/src/usermode.rs`: **6413 → 6247 lines**, and four items became
 unreferenced — which is the check that the fold is a fold and not a second
 implementation living beside the first:
 

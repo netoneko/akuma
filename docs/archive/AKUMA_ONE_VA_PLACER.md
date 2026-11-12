@@ -11,7 +11,7 @@ The kernels placed `mmap`s differently:
   (`free_regions`). `munmap` pushed freed ranges onto the list, and first fit took from it before
   bumping.
 - **amd64** did a first-fit scan over the sorted region list from a cursor, wrapping once
-  (`amd64/src/mm.rs`, 2026-09-17), with no free list.
+  (`crates/akuma-kernel-amd64/src/mm.rs`, 2026-09-17), with no free list.
 
 Moving amd64's `munmap` to glue would have pushed ranges onto a list that amd64's placer never
 reads, so the list would grow without bound. Keeping both placers would mean two answers to "is

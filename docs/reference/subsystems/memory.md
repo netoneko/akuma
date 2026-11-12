@@ -6,7 +6,7 @@ fork, and userspace address spaces. For debugging, see
 
 **This document is the AArch64 kernel's.** The **amd64** target has had its own
 copy-on-write `fork` since 2026-09-06 and shares none of the machinery here —
-its page tables, its PTE marker bit and its fault arm are all in `amd64/`. What
+its page tables, its PTE marker bit and its fault arm are all in `crates/akuma-kernel-amd64/`. What
 the two kernels *do* share is the **decision** (`crates/akuma-cow`) and the
 per-address-space frame ledger (`crates/akuma-user-space`), both host-tested.
 See [`../../archive/AKUMA_AMD64_COW.md`](../../archive/AKUMA_AMD64_COW.md);
@@ -682,7 +682,7 @@ still-mapped page costs a future re-read while freeing nothing now.
 
 **Stability: B — verify behaviour.** Landed 2026-08-05. **Both kernels since
 2026-09-13** — the amd64 kernel consumes the same `akuma-fpcache`, through its
-own demand-paged file mappings (`amd64/src/mm.rs`'s `fill_file_pages`); what is
+own demand-paged file mappings (`crates/akuma-kernel-amd64/src/mm.rs`'s `fill_file_pages`); what is
 written below about keying, references, sizing and invalidation holds there
 unchanged. Two differences worth knowing: it maps a cached frame through
 `FrameLedger::adopt_user_frame` rather than the AArch64 fault path's three-pass

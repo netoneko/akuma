@@ -29,8 +29,8 @@ Probes: `userspace/abiprobe` and `userspace/ext2probe` if a syscall's bytes need
 
 ## Composition rule (mandatory)
 `taoxichuan/` is a **composition root**, not a kernel written from scratch. It is 4,856 newly written lines with 19 `akuma-*` path dependencies (`grep -c '^akuma-' taoxichuan/Cargo.toml`).
-Before you write any arm, subsystem or helper of more than about 20 lines: (1) **look first** - `grep -rn "<name>" crates/ amd64/src/`; (2) **it exists in a crate**: add a path dependency and call it;
-(3) **only in `amd64/src/`**: extract it into an `akuma-<thing>` crate first, make both kernels depend on it; (3b) **welded to `Process`/`akuma-exec`**: cut the seam (leaf crate or feature) and say what it costs;
+Before you write any arm, subsystem or helper of more than about 20 lines: (1) **look first** - `grep -rn "<name>" crates/ crates/akuma-kernel-amd64/src/`; (2) **it exists in a crate**: add a path dependency and call it;
+(3) **only in `crates/akuma-kernel-amd64/src/`**: extract it into an `akuma-<thing>` crate first, make both kernels depend on it; (3b) **welded to `Process`/`akuma-exec`**: cut the seam (leaf crate or feature) and say what it costs;
 (4) **exists nowhere**: write it in a crate with host tests and say why in RESULT-M. Expected new surface: the console will name each `[sc] unhandled` call the unpacker hits (`ftruncate`, `sendfile`, perhaps `fchmod`/`utimensat`/`symlink`/`fsync`/`rename`); for each, find the existing implementation first
 (`akuma-syscalls-glue`, `akuma-ext2`'s truncate and write paths, `akuma-vfs-glue`). Report per change *pulled / extracted / cut / written new (why)*, `wc -l taoxichuan/src/*.rs` at start and end, and the dependency count.
 A session that closes its gates and makes `taoxichuan/src` smaller is better than one that does not.

@@ -115,7 +115,7 @@ sc-timerfd = ["akuma-syscalls-glue/sc-timerfd"]
 # **identically** on x86_64 and asm-generic (both post-Linux-5.1 syscalls,
 # unified across architectures on purpose) and so have no
 # `akuma-syscalls-abi` row — see that crate's module doc, rule 3 — and are
-# dispatched by their one shared number directly in `amd64/src/usermode.rs`.
+# dispatched by their one shared number directly in `crates/akuma-kernel-amd64/src/usermode.rs`.
 sc-pidfd = ["akuma-syscalls-glue/sc-pidfd"]
 # `io_setup`/`io_destroy`/`io_submit`/`io_cancel`/`io_getevents` — Linux
 # native AIO. `io_submit`/`io_cancel`/`io_getevents` are stubs in glue (no
@@ -156,13 +156,13 @@ sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-contain
 #
 # The same opt-in the AArch64 kernel has (root `Cargo.toml`), and it means the
 # same thing here: the bin stops linking `akuma-kernel-tests-amd64` (the boot
-# suite) and every `*_test`/`smoke_test` function left in `amd64/src`
+# suite) and every `*_test`/`smoke_test` function left in `crates/akuma-kernel-amd64/src`
 # disappears, leaving a kernel that boots straight into `init`.
 # The devbox and `extreme-size` targets build with it on the other
 # architecture; on this one it is what makes the line count honest, because
 # `scripts/cloc_akuma.py` attributes an item to the *test* bucket exactly when
 # its `cfg` cannot hold in a `no-tests` world. Before this feature existed
-# `amd64/src` measured **0.0% test** against ~4 000 lines of boot suite.
+# `crates/akuma-kernel-amd64/src` measured **0.0% test** against ~4 000 lines of boot suite.
 #
 # The initialisation the suite performs inline — the LAPIC, the console fd and
 # the syscall MSRs — is `boot::late_init`, which this build calls instead. See
@@ -178,49 +178,49 @@ no-tests = ["akuma-kernel-core/no-tests", "akuma-exec/no-tests", "akuma-syscalls
 # 2026-09-08 `akuma-cpu` is also a direct dependency — `daif`'s x86 arms
 # (`cli`/`sti`/`pushfq`) are real, and `paging.rs`/`exec_runtime.rs` consume
 # them directly instead of private copies.
-akuma-alloc = { path = "../crates/akuma-alloc" }
+akuma-alloc = { path = "../akuma-alloc" }
 # The boot kit — boot.s, the physmap, the kernel's own page tables, heap+PMM
 # bring-up — pulled as a crate since the Taoxichuan stage-1 extraction
 # (2026-10-24) so the composed kernel (`taoxichuan/`) and this one share one
 # boot block instead of two copies that drift. `phys.rs`, the walker half of
 # `paging.rs` and the policy half of `mem.rs` are re-export shims onto it.
-akuma-boot-amd64 = { path = "../crates/akuma-boot-amd64" }
-akuma-pmm = { path = "../crates/akuma-pmm" }
-akuma-cpu = { path = "../crates/akuma-cpu" }
-akuma-affinity = { path = "../crates/akuma-affinity" }
+akuma-boot-amd64 = { path = "../akuma-boot-amd64" }
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-affinity = { path = "../akuma-affinity" }
 # The Big Kernel Lock (`smp.rs`'s `bkl_enter`/`bkl_leave` forward here).
-akuma-bkl = { path = "../crates/akuma-bkl" }
-akuma-sched-amd64 = { path = "../crates/akuma-sched-amd64" }
+akuma-bkl = { path = "../akuma-bkl" }
+akuma-sched-amd64 = { path = "../akuma-sched-amd64" }
 # Syscall identity across architectures. Proposal item 5's shape, and the amd64
 # port is why it exists: `akuma-syscalls-linux::nr` is asm-generic (aarch64)
 # numbering, and x86_64 Linux numbers everything differently.
-akuma-syscalls-abi = { path = "../crates/akuma-syscalls-abi" }
+akuma-syscalls-abi = { path = "../akuma-syscalls-abi" }
 # Shared boot self-test harness. Gives the tally the amd64 target lacked: a
 # [FAIL] used to print and the boot then finished announcing success.
-akuma-lapic-amd64 = { path = "../crates/akuma-lapic-amd64" }
-akuma-selftest = { path = "../crates/akuma-selftest" }
+akuma-lapic-amd64 = { path = "../akuma-lapic-amd64" }
+akuma-selftest = { path = "../akuma-selftest" }
 # Parsing GRUB's information block. A crate, with tests, because the first
-# version of this parser lived in amd64/src/multiboot2.rs and had a one-byte
+# version of this parser lived in crates/akuma-kernel-amd64/src/multiboot2.rs and had a one-byte
 # offset error that could only be found by rebooting the machine.
-akuma-multiboot2 = { path = "../crates/akuma-multiboot2" }
+akuma-multiboot2 = { path = "../akuma-multiboot2" }
 # The Realtek RTL8169/8168/8111 driver, for the onboard NIC of the bare-metal
 # reference machine. Nothing calls it yet — that needs PCI enumeration — but it
 # belongs to this target, which is the only one with the part.
-akuma-net-rtl8169 = { path = "../crates/akuma-net-rtl8169" }
+akuma-net-rtl8169 = { path = "../akuma-net-rtl8169" }
 # PCI configuration-space parsing — the header, BAR decode and capability list,
 # host-tested against config space read off the bare-metal reference machine.
 # `src/pci.rs` is the `0xCF8`/`0xCFC` mechanism half; this is the parsing.
-akuma-pci = { path = "../crates/akuma-pci" }
+akuma-pci = { path = "../akuma-pci" }
 # Legacy port I/O as typed devices (COM1, CMOS, 8259, 8254, i8042, PCI config,
 # reset control, debugcon): the only crate that executes `in`/`out`.
-akuma-port = { path = "../crates/akuma-port" }
+akuma-port = { path = "../akuma-port" }
 # The GDT/TSS as data: descriptors, the TSS descriptor packing, and the
 # syscall/sysret selector arithmetic (compile-time asserted).
-akuma-gdt = { path = "../crates/akuma-gdt" }
+akuma-gdt = { path = "../akuma-gdt" }
 # Linux `reboot(2)` ABI decode, shared with the aarch64 kernel's `sc-reboot`.
 # `src/pci.rs`'s sibling `src/reboot.rs` adds the x86 reset that `akuma-boot`'s
 # own `system_reset` (a PSCI `smc`) cannot do here.
-akuma-boot = { path = "../crates/akuma-boot", default-features = false }
+akuma-boot = { path = "../akuma-boot", default-features = false }
 # **C1 step 6**: the tree's one ELF loader. `src/loader.rs` used to parse and
 # place images itself — through the same vetted `elf` 0.7 crate this one uses,
 # so there was one parser and two placers. There is one of each now: this crate
@@ -228,33 +228,33 @@ akuma-boot = { path = "../crates/akuma-boot", default-features = false }
 # module's header for why the layout stayed). Already in the link graph through
 # `akuma-syscalls-glue`; named here because this crate calls it, and because
 # `exec_runtime.rs` has to register its four VFS callbacks.
-akuma-elf = { path = "../crates/akuma-elf" }
+akuma-elf = { path = "../akuma-elf" }
 # The pure PT_INTERP / entry decisions, shared with taoxichuan (the
 # composition root). `finish()`'s cross-target decision rides the same fn.
-akuma-elf-exec = { path = "../crates/akuma-elf-exec" }
+akuma-elf-exec = { path = "../akuma-elf-exec" }
 # The virtio-blk driver, used unmodified. What this target supplies is the three
 # machine facts it cannot discover — where the transport is, how the slots are
 # spaced, and how to translate an address — via `akuma-primitives::addr`.
-akuma-virtio = { path = "../crates/akuma-virtio" }
+akuma-virtio = { path = "../akuma-virtio" }
 # `set_virtio_window`, `set_print_hook`, and the phys<->virt translation the
 # virtio HAL uses. Reached transitively already; named here because this crate
 # now calls it directly.
-akuma-primitives = { path = "../crates/akuma-primitives" }
+akuma-primitives = { path = "../akuma-primitives" }
 # The boot command line, kept once; `init=`/`initargs=` through `akuma_params::init`, the reader the AArch64 kernel uses too.
-akuma-params = { path = "../crates/akuma-params" }
+akuma-params = { path = "../akuma-params" }
 # The fd table's parts (`Names`/`FlagSet`) that `KERNEL_TABLE`'s static is
 # made of; the state machine itself comes in through `akuma-exec`.
-akuma-fdtable = { path = "../crates/akuma-fdtable" }
+akuma-fdtable = { path = "../akuma-fdtable" }
 # Page tables in memory + the amd64 walker; and the entry format it walks.
-akuma-pagetable = { path = "../crates/akuma-pagetable" }
-akuma-pte-amd64 = { path = "../crates/akuma-pte-amd64" }
-akuma-idt-amd64 = { path = "../crates/akuma-idt-amd64" }
-akuma-trap-amd64 = { path = "../crates/akuma-trap-amd64" }
+akuma-pagetable = { path = "../akuma-pagetable" }
+akuma-pte-amd64 = { path = "../akuma-pte-amd64" }
+akuma-idt-amd64 = { path = "../akuma-idt-amd64" }
+akuma-trap-amd64 = { path = "../akuma-trap-amd64" }
 # The machine description: the PVH handoff block, the virtio-MMIO command line,
 # and ACPI. Host-tested against bytes measured on both machines, which is why
 # `hvm.rs`, `cmdline.rs` and `acpi.rs` are no longer modules here.
-akuma-ryzen-amd64 = { path = "../crates/akuma-ryzen-amd64" }
-akuma-machine-facts = { path = "../crates/akuma-machine-facts" }
+akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64" }
+akuma-machine-facts = { path = "../akuma-machine-facts" }
 # The neutral spine both kernels share (multiarch W1): today amd64 consumes its
 # `klog` (the `log` crate sink). The AArch64-only modules (`console`, `timer`,
 # `platform`, `ntp_boot`, `irq::register_handler`) and their GIC/boot deps are
@@ -269,15 +269,15 @@ akuma-machine-facts = { path = "../crates/akuma-machine-facts" }
 # BKL-held, so one stalled xHCI transfer spun its full one-second timeout holding
 # the BKL (`docs/archive/AKUMA_AMD64_USB_XHCI.md` § 2026-09-11). Was the
 # `smp-shared` feature, required, until 2026-11-11.
-akuma-kernel-core = { path = "../crates/akuma-kernel-core", features = ["bkl-smp"] }
-akuma-user-tree = { path = "../crates/akuma-user-tree" }
+akuma-kernel-core = { path = "../akuma-kernel-core", features = ["bkl-smp"] }
+akuma-user-tree = { path = "../akuma-user-tree" }
 # The filesystem, used unmodified. Its whole interface to a disk is a two-method
 # `BlockDevice` trait, which is exactly what `akuma-virtio` exposes — see
 # `src/fs.rs` for how short the adaptation is.
-akuma-ext2 = { path = "../crates/akuma-ext2", features = ["bkl-smp"] }
+akuma-ext2 = { path = "../akuma-ext2", features = ["bkl-smp"] }
 # The `Filesystem` trait `Ext2Filesystem` implements, plus `FsError`/`Metadata`
 # and the `MS_*` flag words a mount record carries.
-akuma-vfs = { path = "../crates/akuma-vfs" }
+akuma-vfs = { path = "../akuma-vfs" }
 # **C1 step 4a**: the kernel-side VFS *instance* — the global mount table, the
 # path walk (CWD, `..`, symlinks), the synthetic `/dev` and `/etc/mtab` nodes.
 # `src/fs.rs` carried its own `Spinlock<Option<MountTable>>` and a `with_fs`
@@ -286,37 +286,37 @@ akuma-vfs = { path = "../crates/akuma-vfs" }
 # prerequisite for folding the VFS syscall arms
 # (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md` § C1 step 4). Already in the link
 # graph through `akuma-syscalls-glue`; named here because this crate calls it.
-akuma-vfs-glue = { path = "../crates/akuma-vfs-glue", features = ["bkl-smp"] }
+akuma-vfs-glue = { path = "../akuma-vfs-glue", features = ["bkl-smp"] }
 spinning_top = "0.3"
 # The tree's tuning knobs, for `MMAP_EAGER_MAX_PAGES` — how many pages a mapping
 # may have before it is demand-paged instead of populated at `mmap` time. Read
 # from here rather than restated locally so the two kernels cannot be tuned
 # differently by accident; it is the only thing this target takes from the crate.
-akuma-config = { path = "../crates/akuma-config" }
+akuma-config = { path = "../akuma-config" }
 # Only for `syscall-debug-info`'s feature forwarding: glue depends on both, and
 # a feature can only be switched on through a crate this one names.
-akuma-syscalls = { path = "../crates/akuma-syscalls", optional = true }
-akuma-syscalls-time = { path = "../crates/akuma-syscalls-time", optional = true }
+akuma-syscalls = { path = "../akuma-syscalls", optional = true }
+akuma-syscalls-time = { path = "../akuma-syscalls-time", optional = true }
 # `mmap`'s mapping-kind decode and `MAP_FIXED` validation — a pure function of
 # the argument bits, host-tested, with seven pinned divergences from Linux. Used
 # rather than re-derived so this target cannot drift from the AArch64 kernel on
 # exactly the arguments where Linux compatibility is subtle.
-akuma-syscalls-mem = { path = "../crates/akuma-syscalls-mem" }
+akuma-syscalls-mem = { path = "../akuma-syscalls-mem" }
 # The shared flag tables the decode is written against.
-akuma-syscalls-linux = { path = "../crates/akuma-syscalls-linux" }
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 # The read-only interface-introspection marshalling (`SIOCGIF*`,
 # `/proc/net/dev`) — the byte layout `busybox ifconfig` reads, shared with the
 # aarch64 kernel so the two cannot drift on the `struct ifreq` stride.
-akuma-syscalls-net = { path = "../crates/akuma-syscalls-net" }
+akuma-syscalls-net = { path = "../akuma-syscalls-net" }
 # The console history ring behind `dmesg` (`syslog(2)` action decode + the
 # wrap/skip arithmetic), shared with the AArch64 kernel's `console::dmesg_*`.
 # `src/serial.rs` used to hand-roll this as a `static mut [u8; 64 * 1024]` with
 # four raw-pointer helpers; its one arithmetic bug made a 4 KiB staging buffer
 # the silent ceiling on a 64 KiB `dmesg`, on the one machine whose console has
 # no scrollback. The ring is host-tested; what stays here is the lock.
-akuma-dmesg = { path = "../crates/akuma-dmesg" }
-akuma-power = { path = "../crates/akuma-power" }
-akuma-kacho = { path = "../crates/akuma-kacho" }
+akuma-dmesg = { path = "../akuma-dmesg" }
+akuma-power = { path = "../akuma-power" }
+akuma-kacho = { path = "../akuma-kacho" }
 # The `/proc/<pid>/{stat,status,cmdline}` byte formats, shared with the AArch64
 # kernel's `ProcFilesystem`. That filesystem *compiles* here since C1 step 4a
 # brought `akuma-vfs-glue` in, but it is not mounted: it renders from
@@ -324,30 +324,30 @@ akuma-kacho = { path = "../crates/akuma-kacho" }
 # mounting it would replace a working synthetic `/proc` with an empty machine.
 # The formats are shared either way, and the formats are where a divergence is
 # invisible: `ps` finds `utime` by counting to field 14 of a 44-field line.
-akuma-procfs = { path = "../crates/akuma-procfs" }
+akuma-procfs = { path = "../akuma-procfs" }
 # The FPU save area's sizes, offsets, power-on image and `sanitize` rule (shared with taoxichuan).
-akuma-fpu-amd64 = { path = "../crates/akuma-fpu-amd64" }
+akuma-fpu-amd64 = { path = "../akuma-fpu-amd64" }
 # The per-process frame ledger — which physical frames a process holds and how
 # many VAs map each, with the two-counts rule and 14 host tests. Replaced this
 # target's `FrameSet`, a 2048-entry flat array with no refcounts whose ceiling
 # was reachable from a shell (`sh: can't fork: Out of memory`). The refcount is
 # also CoW's teardown prerequisite. Shared with the AArch64 kernel's
 # `UserAddressSpace`, so the two targets account for user frames identically.
-akuma-user-space = { path = "../crates/akuma-user-space" }
+akuma-user-space = { path = "../akuma-user-space" }
 # `PhysFrame`, the ledger's currency.
-akuma-mmap = { path = "../crates/akuma-mmap" }
+akuma-mmap = { path = "../akuma-mmap" }
 # The shared file-page cache: one physical frame per `(mount, inode, offset)`,
 # however many processes map it. Adopted 2026-09-13 with demand-paged file
 # mappings — the two are one change, since a cache is only reachable from a path
 # that fills pages one at a time.
-akuma-fpcache = { path = "../crates/akuma-fpcache" }
+akuma-fpcache = { path = "../akuma-fpcache" }
 # Its writable sibling (2026-10-03): one frame per page of a writable
 # `MAP_SHARED` file mapping, shared by every process that maps it, for as long
 # as any does — the coherence SQLite's WAL index needs. `src/shmpages.rs`.
-akuma-fpcache-rw = { path = "../crates/akuma-fpcache-rw" }
+akuma-fpcache-rw = { path = "../akuma-fpcache-rw" }
 # `/dev/fb0`'s decisions (ioctl answers, FBIOPUT acceptance, single owner,
 # mmap bounds), host-tested. `src/fbdev.rs` is the device.
-akuma-fbdev = { path = "../crates/akuma-fbdev" }
+akuma-fbdev = { path = "../akuma-fbdev" }
 # The shared MMU crate. Its x86 `UserAddressSpace` is **the** user-space page
 # table on this target since C1 step 5a: `mm.rs`, `idt.rs`, `loader.rs`,
 # `usermode.rs` and `fd.rs` all map through it, and `paging.rs` lost its own
@@ -356,60 +356,60 @@ akuma-fbdev = { path = "../crates/akuma-fbdev" }
 # encoder both walkers share, so `x86_prot_matches_amd64_encoding` pins one
 # implementation rather than an agreement between two.
 # `docs/archive/AKUMA_AMD64_STEP5A_ONE_WALKER.md`.
-akuma-mmu = { path = "../crates/akuma-mmu" }
+akuma-mmu = { path = "../akuma-mmu" }
 # The copy-on-write write-fault decision — four outcomes from (live PTE, CoW
 # marker, share count), host-tested. Shared with the AArch64 kernel so both
 # distinguish "already repaired", "read-only on purpose", "sole owner" and
 # "genuinely shared" the same way; each of those four is a real incident in this
 # tree, and getting one wrong is silent in every direction.
-akuma-cow = { path = "../crates/akuma-cow" }
+akuma-cow = { path = "../akuma-cow" }
 # `global_namespace()` — the `Namespace` every `akuma_exec::Process` carries.
 # There are no boxes on this target, so every registered process names the one
 # global namespace, exactly as `Process::from_image` does on AArch64.
-akuma-isolation = { path = "../crates/akuma-isolation", default-features = false }
+akuma-isolation = { path = "../akuma-isolation", default-features = false }
 # The console line discipline: canonical mode, echo, backspace, Ctrl+D, and
 # `map_cr_to_nl`. Hand-rolling a console reader hits the CR-vs-NL bug on the
 # first Enter keypress; this crate is the tree's answer and is dependency-free.
-akuma-tty = { path = "../crates/akuma-tty" }
+akuma-tty = { path = "../akuma-tty" }
 # `FileDescriptor` and `KernelFile` — the tree's descriptor types. The unsafe-free
 # core of `akuma-exec`, behind only `akuma-primitives`/`akuma-mmap`/
 # `akuma-syscalls-linux`, all of which build for this target.
-akuma-exec-core = { path = "../crates/akuma-exec-core" }
+akuma-exec-core = { path = "../akuma-exec-core" }
 # The networking stack: smoltcp, the AF_INET socket table and DNS. Used
 # unmodified; `src/net.rs` supplies the twelve `NetRuntime` hooks.
-akuma-net = { path = "../crates/akuma-net", features = ["rtl8169"] }
+akuma-net = { path = "../akuma-net", features = ["rtl8169"] }
 # The SNTP wire protocol + boot-time retry loop (`src/clock.rs`, 2026-09-05) —
 # pure, host-tested, `#![no_std]`, zero dependencies. Extracted out of
 # `akuma-syscalls-time` specifically so this target could reach it without also
 # needing that crate's `akuma-exec` dependency, which does not build here.
-akuma-sntp = { path = "../crates/akuma-sntp" }
+akuma-sntp = { path = "../akuma-sntp" }
 # The CMOS real-time clock's decode (2026-10-12): seeds the wall clock at
 # boot so a machine with no network — the QEMU rehearsals, a wifi boot before
 # the join — still stamps inodes with the right year; SNTP corrects it after.
-akuma-cmos-rtc = { path = "../crates/akuma-cmos-rtc" }
+akuma-cmos-rtc = { path = "../akuma-cmos-rtc" }
 # The pure byte-FIFO half of a pipe (buffer, 64 KiB cap, closable write end, the
 # empty-vs-EOF rule), host-tested. `sys_spawn` wires a child's stdio to these;
 # `src/pipe.rs` is the `static` array + lock around it. The tree's full kernel
 # pipe is `akuma-syscalls-glue`, which does not build for this target.
-akuma-pipe = { path = "../crates/akuma-pipe" }
-akuma-pipes = { path = "../crates/akuma-pipes" }
+akuma-pipe = { path = "../akuma-pipe" }
+akuma-pipes = { path = "../akuma-pipes" }
 # The `select(2)`/`pselect6` fd-set marshalling and the readiness vocabulary
 # (`akuma_syscalls_poll::fdset`), host-tested — the same module the AArch64
 # kernel marshals its poll family through. First consumer on this target was
 # `sys_select` (`fd.rs`): `apk` waits for socket writability through `select`
 # and wedged its TLS fetch while the syscall was `ENOSYS`.
-akuma-syscalls-poll = { path = "../crates/akuma-syscalls-poll" }
+akuma-syscalls-poll = { path = "../akuma-syscalls-poll" }
 # No `akuma-syscalls-sync`: `futex(2)` is `akuma-syscalls-glue::sync`'s since
 # 2026-11-11, which carries that crate itself.
 # The process family's pure decisions (clone kinds, exit scope, wait status, execve's budget).
-akuma-syscalls-proc = { path = "../crates/akuma-syscalls-proc" }
+akuma-syscalls-proc = { path = "../akuma-syscalls-proc" }
 # The user-copy primitive: `copy_from_user_safe` and its x86_64 `rep movsb`
 # loop, plus `user_copy_fixup`, which `idt.rs`'s page-fault path consults to
 # turn a fault inside that loop into a returned EFAULT instead of a halt. The
 # first arch-neutral crate on this target whose *mechanism* had to be built
 # here rather than ported (`docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md`).
-akuma-user-access = { path = "../crates/akuma-user-access" }
-# The scheduler. `amd64/src/sched.rs` was an independent one until 2026-09-07 —
+akuma-user-access = { path = "../akuma-user-access" }
+# The scheduler. `crates/akuma-kernel-amd64/src/sched.rs` was an independent one until 2026-09-07 —
 # its own thread table, states, context switch, picker and park/wake — which
 # meant this target ran a second, weaker copy of a state machine this crate had
 # already hardened against a decade of AArch64 incidents (slot generations,
@@ -417,14 +417,14 @@ akuma-user-access = { path = "../crates/akuma-user-access" }
 # TSS, MSR, `fxsave` and lock-depth effects the scheduler is not allowed to
 # know about, registered as `X86ArchHooks`.
 # `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` calls this A1.
-akuma-threading = { path = "../crates/akuma-threading" }
+akuma-threading = { path = "../akuma-threading" }
 # Orphaned-lock recovery for ext2. Only `register_backstop` is named here — the
 # lock type itself is `akuma-ext2`'s business — and only because the backstop is
 # a **waiter-side** rescue: a thread blocked on a mount whose writer died drives
 # the very slot sweep that frees it, which is the half the idle loop's collector
 # cannot cover (it does not run while the box is busy). See
 # `crate::fs::install_reap_hooks`.
-akuma-locks-rw = { path = "../crates/akuma-locks-rw" }
+akuma-locks-rw = { path = "../akuma-locks-rw" }
 # **C1**: the shared syscall dispatcher and its per-family implementations —
 # the crate this target's `usermode.rs` is being folded into
 # (`docs/archive/AKUMA_AMD64_C1_DISPATCH_VOCABULARY.md`, step 3 onward).
@@ -436,15 +436,15 @@ akuma-locks-rw = { path = "../crates/akuma-locks-rw" }
 # because `exec_runtime.rs` builds its `ExecRuntime`/`ExecConfig` tables —
 # without that registration the first syscall folded into glue panics in
 # `akuma_exec::runtime::config()`, which is a `Registered` cell.
-akuma-exec = { path = "../crates/akuma-exec", features = ["bkl-smp"] }
+akuma-exec = { path = "../akuma-exec", features = ["bkl-smp"] }
 # `exec`: box's `SPAWN_EXT` (private 315) is glue's `sys_spawn_ext`, which loads
 # through `akuma-exec`'s ELF loader. Row 8 of the tokio dependency analysis
 # (`3e2bb725`) put that path behind the feature and left it off here, so every
 # `box run` answered "failed to spawn" until 2026-11-01. Taoxichuan has no box
 # and keeps it off.
-akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp", "exec", "akuma-native", "bkl-smp"] }
+akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, features = ["smoltcp", "exec", "akuma-native", "bkl-smp"] }
 # The x86-only syscall bodies both x86 kernels share; so far `kill` (moved from `signal.rs`).
-akuma-syscalls-glue-amd64 = { path = "../crates/akuma-syscalls-glue-amd64" }
+akuma-syscalls-glue-amd64 = { path = "../akuma-syscalls-glue-amd64" }
 
 # The bin is the root package `akuma` (`src/amd64.rs`), which forwards every feature above
 # under the same name: `cargo build -p akuma --target x86_64-unknown-none`, artifact

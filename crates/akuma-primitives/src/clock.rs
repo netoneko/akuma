@@ -80,7 +80,7 @@ pub fn uptime_us() -> u64 {
 // policy — and the amd64 kernel must not depend on it to answer "what time is
 // it": its clock is a PIT-calibrated LAPIC and its RTC is an SNTP packet. So
 // that kernel kept its own `(anchor_unix, anchor_uptime)` pair in
-// `amd64/src/clock.rs`, and `akuma-syscalls-time` — shared by both kernels —
+// `crates/akuma-kernel-amd64/src/clock.rs`, and `akuma-syscalls-time` — shared by both kernels —
 // read `akuma_timer`'s. Two anchors, one of which every amd64 `clock_settime`
 // wrote and every amd64 `clock_gettime` did not read. Here there is one, and
 // the two kernels install the *uptime* under it rather than the wall clock

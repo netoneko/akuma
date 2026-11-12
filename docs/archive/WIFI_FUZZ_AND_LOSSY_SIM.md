@@ -40,8 +40,8 @@ does a malformed, spoofed, lost or duplicated input do here":
 | `akuma-rtw89::rx::parse`, `Ring` | sound: the `written` and `pkt_size` claims are both checked against the buffer; the ring's modulo keeps every index inside. 200k mutations, no finding |
 | `akuma-wifi::cmd` | **finding 7** (empty SSID); the parser itself survives 200k random lines |
 | `akuma-wifi::status`, `hex` | sound: every representable status round-trips through 4 KiB; a truncated read parses or fails, never panics. `Status::parse` fails the whole read on one unparsable `bss` field — strict, acceptable, noted |
-| `amd64/src/wifi.rs` (the device) | sound: 512-byte cap, all lines parsed before any applied, cursors fixed-size and LRU. Not host-testable; read only |
-| `amd64/src/rtw89_sta.rs`: `attempt` (the handshake loop) | one EAPOL message per lap and the rest left to the AP's retransmission: correct and now simulated. `Goodbye` mid-handshake, `Rekey` before keys, MIC counting: fine |
+| `crates/akuma-kernel-amd64/src/wifi.rs` (the device) | sound: 512-byte cap, all lines parsed before any applied, cursors fixed-size and LRU. Not host-testable; read only |
+| `crates/akuma-kernel-amd64/src/rtw89_sta.rs`: `attempt` (the handshake loop) | one EAPOL message per lap and the rest left to the AP's retransmission: correct and now simulated. `Goodbye` mid-handshake, `Rekey` before keys, MIC counting: fine |
 | `rtw89_sta.rs`: `idle` | **finding 6** (pairwise rekey); the from-AP filter, the clear/undecrypted/replay triage, and the beacon-loss grace are right. `trace_tcp`: **finding 2** |
 | `rtw89_sta.rs`: `join_wanted`, `link_lost`, `find`, `BAD_BSS`, `sweep` | reasonable; `BAD_BSS` is never cleared on success (harmless with one AP, alternates with two); a stale cached channel costs a ~12 s triple attempt before `forget_network` rescans — could be one attempt then rescan. Left as is, noted |
 | `userspace/wifi` `cmd_auto` | **finding 8**; `join()` returning at the kernel's first `failed` while the kernel keeps retrying is fine with the new wait on `associating` |
@@ -64,7 +64,7 @@ after the join. Fixed: the cut frame must still hold a header
 
 ### 2. `trace_tcp` panicked on an IPv4 total length under the header — a kernel abort from any peer (reading)
 
-`amd64/src/rtw89_sta.rs` logs the first 40 TCP SYN/RST segments with their
+`crates/akuma-kernel-amd64/src/rtw89_sta.rs` logs the first 40 TCP SYN/RST segments with their
 checksums. It sliced the packet to the IP total length, then `p[12..20]` and
 `p[ihl..]` — a total length of 0 (or any value under `ihl`) panicked. The
 packet comes through the access point from anyone on the LAN, or from the

@@ -101,7 +101,7 @@ pub fn render(
 /// Append the kernel's own power facts to a `/proc/power` buffer.
 ///
 /// They follow [`render`]'s battery lines: `idle_ms=` (console input
-/// inactivity, `amd64/src/input.rs`) and `dim=` (the global console dim factor
+/// inactivity, `crates/akuma-kernel-amd64/src/input.rs`) and `dim=` (the global console dim factor
 /// the power daemon drives through `/dev/power`).
 ///
 /// These are facts about the *machine*, not the battery, which is why they are

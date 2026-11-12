@@ -4,7 +4,7 @@
 //! Akuma has no supplicant: the WPA2 handshake runs in the kernel, so userspace
 //! only *chooses* a network and hands the driver one line — "join this network
 //! with this key" — and reads back what the driver is doing. Both halves of
-//! that live here, so the kernel (`amd64/src/wifi.rs`) and the tool
+//! that live here, so the kernel (`crates/akuma-kernel-amd64/src/wifi.rs`) and the tool
 //! (`userspace/wifi`) cannot disagree on the grammar:
 //!
 //! | module | |

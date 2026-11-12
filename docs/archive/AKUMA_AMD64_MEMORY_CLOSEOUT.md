@@ -64,7 +64,7 @@ and `open(2)` gave different answers about whether a file existed.
 
 ## 1. `pread64` — one arm, and a correction to the brief
 
-x86_64 syscall 17 was not dispatched at all. `amd64/src/fd.rs` grew
+x86_64 syscall 17 was not dispatched at all. `crates/akuma-kernel-amd64/src/fd.rs` grew
 `sys_pread64`, which is `sys_read` with one difference that is the entire
 contract: **it does not move `file.position`.** The two cannot share a body for
 exactly that reason.

@@ -310,7 +310,7 @@ Telemetry from one `kami https://tumblr.com` session (`/tmp/kami-input.log`,
   isolation: one per cross-site iframe; pids 138 -> 400), then
   `[zygote_linux.cc:426] FATAL Check failed: Too many open files in system (23)`,
   `NOTREACHED hit. Did not receive ping from zygote child`, `Failed to send
-  GetTerminationStatus message to zygote`. `ENFILE` is `amd64/src/pipe.rs`'s
+  GetTerminationStatus message to zygote`. `ENFILE` is `crates/akuma-kernel-amd64/src/pipe.rs`'s
   machine-wide `MAX_PIPES` (256; a `socketpair` is two pipes). Raised to 2048.
   **Unverified live** until the kernel is rebuilt and tumblr reloaded.
 - kami does not react to a dead renderer (`Inspector.targetCrashed` /
@@ -847,7 +847,7 @@ Akuma; the same static binaries run on both):
   ping-pong is 3 us on Akuma (Linux 15 us, Akuma hands off on the waker's
   core). When the waker stays busy the woken thread waits 141 us median on the
   metal, p90 1.9 ms (Linux 5 us) — a halted core learns of work at its next
-  tick (`amd64/src/smp.rs`, "No wake IPI"); under KVM 1 us.
+  tick (`crates/akuma-kernel-amd64/src/smp.rs`, "No wake IPI"); under KVM 1 us.
 - `timerlat.c`: **timed waits are the cost.** A `FUTEX_WAIT_BITSET` with an
   absolute deadline (every `pthread_cond_timedwait`, so Chromium's compositor
   scheduler, thread pool and `WaitableEvent::TimedWait`) overshoots by a whole
@@ -856,7 +856,7 @@ Akuma; the same static binaries run on both):
   less (0.2-1.3 ms median, p90 up to 2.5 ms). Measured under Firecracker; on the
   metal only `wakelat` ran before the box rebooted (its `nanosleep(100 us)`
   there: 959 us median, 6.4 ms p90, 29 ms max). The path is
-  `amd64/src/futex.rs::wait` -> `sched::block_until_deadline`, whose doc says
+  `crates/akuma-kernel-amd64/src/futex.rs::wait` -> `sched::block_until_deadline`, whose doc says
   "resolution is the LAPIC tick (10 ms)"; the measurement says one tick *more*
   than the rounded-up deadline. A frame pipeline with several such waits is
   the 50-90 ms.
@@ -904,7 +904,7 @@ rebooted into Pop by `netwatch` (DNS unanswered 120 s).
 
 Found by the trace and fixed in the tree: the network service took `EMFILE`
 from `socket(2)` 200+ times in 15 s (`[sc!] nr=41 -> -24`) because
-`amd64/src/fd.rs` capped a process at **256** descriptors while `prlimit64`
+`crates/akuma-kernel-amd64/src/fd.rs` capped a process at **256** descriptors while `prlimit64`
 reported 1024; now 1024 (Chromium record, Fix 31). Not isolated as the
 metal's killer: two of the no-crash runs were on the 256 kernel.
 

@@ -408,7 +408,7 @@ boxed service.
 
 The box syscalls are the same shared code on both kernels; amd64 dispatches the
 private numbers (315-318, 324, 325) to `akuma-syscalls-glue` from
-`amd64/src/usermode.rs`. What differs, and must stay true:
+`crates/akuma-kernel-amd64/src/usermode.rs`. What differs, and must stay true:
 
 - **Namespaces**: `exec_runtime.rs` forwards `get_box_namespace` /
   `set_spawn_namespace` / `clear_spawn_namespace` to `akuma-vfs-glue`, and

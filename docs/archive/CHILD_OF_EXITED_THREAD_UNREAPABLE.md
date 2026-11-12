@@ -38,7 +38,7 @@ Reproduced without claude (python on the trashcan, `scripts` scratch `reap2.py`)
 Linux keeps the child with the thread group, so the third case is reaped there.
 
 Also found: `waitid(2)` was `ENOSYS` on amd64 (`os.waitid` and `waitid(P_PIDFD, ...)` both), though
-`akuma-syscalls-glue` has an implementation. Wired the same evening: `Syscall::Waitid` in `amd64/src/usermode.rs` goes to glue like
+`akuma-syscalls-glue` has an implementation. Wired the same evening: `Syscall::Waitid` in `crates/akuma-kernel-amd64/src/usermode.rs` goes to glue like
 `wait4` and sweeps the reaped `SPAWN` rows. Checked on the trashcan (python/ctypes): `P_PID` with `WNOWAIT` leaves the child,
 the next call reaps it (`CLD_EXITED`, status 7), then `ECHILD`; `WNOHANG` on a live child returns 0 with `si_pid` 0;
 `P_PIDFD` blocks until exit; `P_ALL` finds an exited child; `P_PIDFD` on the caller's own pidfd gives `ECHILD` (Go's probe).

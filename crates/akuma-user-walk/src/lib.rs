@@ -8,7 +8,7 @@
 //! is here, with host tests. What is *effect* stays in the kernel behind [`Walk`]: translating a page,
 //! breaking copy-on-write before a write, touching the frame (the only `unsafe`).
 //!
-//! `amd64/src/uaccess.rs` is a different mechanism (SMAP-bracketed copies recovered by the fault handler,
+//! `crates/akuma-kernel-amd64/src/uaccess.rs` is a different mechanism (SMAP-bracketed copies recovered by the fault handler,
 //! `akuma-user-access`) and is deliberately not folded into this: the two share a *range rule*, not a copy.
 
 extern crate alloc;

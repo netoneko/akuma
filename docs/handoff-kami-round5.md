@@ -69,7 +69,7 @@ with `cargo build -p akuma --target x86_64-unknown-none --release` by
   Linux 72 ms median key->frame, Akuma metal 120, Akuma/KVM 160. Cross-thread
   wakes are fast (3 us). **Timed futex waits overshoot by a full 10 ms tick**
   (1 ms -> 10.0 ms median, 16 ms -> 26.3; Linux +0.12 ms); `nanosleep`/
-  `epoll_pwait` overshoot 0.2-1.3 ms. Path: `amd64/src/futex.rs::wait` ->
+  `epoll_pwait` overshoot 0.2-1.3 ms. Path: `crates/akuma-kernel-amd64/src/futex.rs::wait` ->
   `sched::block_until_deadline` -> `akuma_threading::schedule_blocking`, tick
   resolution, and the data says one tick *beyond* the rounded-up deadline.
 - **Tumblr**: loads under Firecracker (6/6 runs, 4 and 8 vCPUs, kami itself,
@@ -88,7 +88,7 @@ with `cargo build -p akuma --target x86_64-unknown-none --release` by
    does the wake pass run before the scheduler picks?). Then the real fix:
    a one-shot LAPIC timer (or TSC-deadline) armed for the earliest pending
    deadline on the core, so a halted core wakes *at* the deadline, not at the
-   next 10 ms tick. `amd64/src/lapic.rs` is periodic-only today. Gate:
+   next 10 ms tick. `crates/akuma-kernel-amd64/src/lapic.rs` is periodic-only today. Gate:
    `timerlat` under Firecracker then on the metal (expect every row's median
    overshoot under 0.5 ms), then `probe/scroll_try.py`/`stable_try.py` on the
    metal: the target is key->frame at or below 90 ms. Watch `wakelat`'s

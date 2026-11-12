@@ -9,7 +9,7 @@ precedent established), supervised by herd like every resident service.
 
 Once a second it reads `/proc/power`, takes the kernel's `idle_ms=` fact
 (console-input inactivity — a keystroke on the keyboard, serial or USB HID
-resets it inside `amd64/src/input.rs`), and applies the idle staircase:
+resets it inside `crates/akuma-kernel-amd64/src/input.rs`), and applies the idle staircase:
 
 | idle | brightness (with the default `base_pct=100`) |
 |---|---|
@@ -28,7 +28,7 @@ Nothing is written on quiet seconds.
 - **Policy** — `src/lib.rs`, pure, host-tested:
   `cargo test -p powersaved --lib --no-default-features`
 - **Effects** — `src/main.rs`: read a file, maybe write one line, sleep.
-- **Lever** — the kernel's: `/dev/power` (`amd64/src/power.rs`'s `dev_read` /
+- **Lever** — the kernel's: `/dev/power` (`crates/akuma-kernel-amd64/src/power.rs`'s `dev_read` /
   `dev_write`) → `multiboot2::fb_set_dim` → `akuma-fbcon`'s global dim factor
   and `repaint()`.
 

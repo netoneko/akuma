@@ -188,7 +188,7 @@ fn weak_fill(buf: &mut [u8]) {
 /// One word from `RDRAND`, retrying transient failures ten times; `None`
 /// when the hardware stays out of entropy. The instruction (and those
 /// retries — Intel's own recommendation) is `akuma_cpu::rng::rdrand`'s, a
-/// byte-identical twin of the copy this file and `amd64/src/net.rs` each
+/// byte-identical twin of the copy this file and `crates/akuma-kernel-amd64/src/net.rs` each
 /// carried until it moved there.
 #[cfg(target_arch = "x86_64")]
 fn rdrand_word() -> Option<u64> {

@@ -10,9 +10,9 @@ continue. Linux (Pop) then also complains about the clock. Something Akuma does 
 0x70/0x71, with the RTC in the first 14) in a state the firmware's checksum rejects. Nobody has found the cause yet.
 
 ## Suspects the user already has (look at each, with evidence from the code, then say yes/no/maybe)
-1. `write_rtc_from_sntp` in `amd64/src/clock.rs` and `crates/akuma-cmos-rtc/src/lib.rs` `write()`: it sets SET (status B bit 7),
+1. `write_rtc_from_sntp` in `crates/akuma-kernel-amd64/src/clock.rs` and `crates/akuma-cmos-rtc/src/lib.rs` `write()`: it sets SET (status B bit 7),
    writes the date registers and the century (0x32), clears SET. A reset between "set" and "clear" leaves the RTC halted with SET=1.
-2. `crumb()` in `amd64/src/kvm.rs`: writes a step number into CMOS byte **0x7F** during the SVM rehearsal and `kvmtest` paths. Byte
+2. `crumb()` in `crates/akuma-kernel-amd64/src/kvm.rs`: writes a step number into CMOS byte **0x7F** during the SVM rehearsal and `kvmtest` paths. Byte
    0x7F is inside the range many firmwares checksum. Find every caller and when it runs (is it on every boot with `kvmctl`?).
 3. The reboot itself: `reboot -f` (the `sc-reboot` syscall, `crates/akuma-boot`) can land in the middle of a CMOS access (index
    written, data not yet; or the SET window above).
@@ -23,7 +23,7 @@ continue. Linux (Pop) then also complains about the clock. Something Akuma does 
   those, or does the reset path leave 0x0F in a state the firmware misreads?
 * `kvm.rs` line ~484: the static `IOPM` for the rehearsal guests intercepts ONLY port 0x80, so those guests run port I/O natively on
   the real chip. The Linux/Akuma guests use `IOPM_ALL` (`kvm/linux.rs`), which intercepts everything; confirm that EVERY VMCB path
-  (kvmtest guests, kvm0 guests, the `/dev/kvm` node in `amd64/src/kvm/api/`) uses the all-intercept map, and that the guest's port
+  (kvmtest guests, kvm0 guests, the `/dev/kvm` node in `crates/akuma-kernel-amd64/src/kvm/api/`) uses the all-intercept map, and that the guest's port
   0x70/0x71 handling (`kvm/linux.rs` ~1130-1180) never forwards a write to the real ports. A guest Akuma kernel runs the SAME
   `clock.rs`, so a leaked CMOS write from a guest would hit the host chip.
 * Anything else that writes ports 0x70-0x73 or the RTC registers: `grep -rn "CMOS\|0x70\|0x71\|0x72\|0x73" amd64 crates --include=*.rs`.

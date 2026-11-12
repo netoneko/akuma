@@ -8,7 +8,7 @@ kvm.md § Outbound networking; this is how it was built and checked.
 
 A slirp-style proxy, with the host as the NAT. The gateway (`crates/akuma-svm-amd64/src/gateway.rs`, pure,
 `forbid(unsafe)`, no allocation) answers the guest as the far end of any outside address and the host
-(`amd64/src/kvm/relay.rs`) makes the real connection:
+(`crates/akuma-kernel-amd64/src/kvm/relay.rs`) makes the real connection:
 
 1. guest SYN to `a.b.c.d:p` -> slot `Asked` (the SYN is held; the gateway's TCP has no retransmit timer and
    the guest's own SYN retries are ignored while the host dials);

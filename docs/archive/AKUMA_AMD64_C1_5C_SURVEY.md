@@ -136,5 +136,5 @@ outputs — 5b is genuinely finished.
   `spawn_child_thread_and_publish`.
 - `crates/akuma-exec/src/process/image.rs` — `replace_image_from`,
   `kill_exec_siblings`.
-- `amd64/src/thread.rs` — `drain`, `wake_group`, `current_is_main`, and the
+- `crates/akuma-kernel-amd64/src/thread.rs` — `drain`, `wake_group`, `current_is_main`, and the
   lifetime rule the drain enforces.

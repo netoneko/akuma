@@ -52,7 +52,7 @@ Notes against the brief's example list: the "raw pointer in the trap/context-swi
 (`TRAP_STACKS`, `TSS`, `GDT`, `TRAP_STACK` — main.rs 211/238) are class A-shaped but raw-pointer
 only (never references) and live in the boot path; they go with slice 2's cell but their
 obligation is one-core-boot rather than IF-clear. `akuma-user-access`'s fault-returning copy loop
-does **not** apply: its x86 story needs the exception-table fixup in `amd64/src/idt.rs`, while
+does **not** apply: its x86 story needs the exception-table fixup in `crates/akuma-kernel-amd64/src/idt.rs`, while
 taoxichuan deliberately uses translate-then-copy because "the kernel's physmap writes never
 fault" (`docs/archive/TAOXICHUAN_COW_FORK.md`) — class C is a *decision table*, not a missing
 crate (see §5 Q4, doc-wins note).
@@ -113,7 +113,7 @@ PTE encodings stay local (`PTE_W`/`PTE_COW` bit 9 per COW_FORK doc); `akuma-pte-
 forbids and carries the bit algebra — reuse, don't duplicate. `akuma_mmu` has the analogous
 `copy_from_phys`/`copy_to_phys` (SYSCALL_UNSAFE_CLEANUP table, "newly checked") but AArch64/`akuma-boot`
 shaped; the amd64 physmap lives in `akuma-boot-amd64`, so the views belong there, shared with
-`amd64/src/paging.rs` (§4).
+`crates/akuma-kernel-amd64/src/paging.rs` (§4).
 
 **Before → after (representative, `cow_resolve`, main.rs:360):**
 ```rust
@@ -135,7 +135,7 @@ becomes a crate with host tests).
 
 ### D1 → adopt existing safe wrappers; consolidate the window (needs §5 Q1)
 - `outb`/`inb` (net.rs 46/56, `raw_uart` main.rs ~5332) → **`akuma_port`** exists for exactly
-  this (4 asm sites behind one `allow(unsafe_code)`; it already replaced `amd64/src/port.rs`).
+  this (4 asm sites behind one `allow(unsafe_code)`; it already replaced `crates/akuma-kernel-amd64/src/port.rs`).
   Raw violation of "never open-code an instruction a safe wrapper exists for" today.
 - `rdtsc` (net.rs 98) → `akuma_cpu::tsc` exists.
 - `pause` (net.rs 67) → `core::hint::spin_loop()` (its non-x86 arm already is that; on x86_64 it
@@ -227,20 +227,20 @@ test old-vs-new wire bytes, per extraction plan §2.4), struct_bytes move, noop 
 `check_unsafe_budget.py --update` ratchets 131 → ~26 into the ledger; crate-safety.md run note.
 **Final: ~26 sites, ~22% of today; classes A/C/D1/G zero.**
 
-## 4. Shared with `amd64/src/` (85 sites today)
+## 4. Shared with `crates/akuma-kernel-amd64/src/` (85 sites today)
 
-- **`TableFrame`/`Frame`** land once in `akuma-boot-amd64` and serve both kernels — `amd64/src/paging.rs`
+- **`TableFrame`/`Frame`** land once in `akuma-boot-amd64` and serve both kernels — `crates/akuma-kernel-amd64/src/paging.rs`
   (7 sites) has the identical physmap shape; its walks become safe over the same ctor. Biggest
   shared win; do S3 with amd64's paging.rs open beside you and file the adoption ticket same-day.
-- **`PerSlot`**: `amd64/src/sched.rs` (17 sites, biggest file) has the same per-slot statics; the
+- **`PerSlot`**: `crates/akuma-kernel-amd64/src/sched.rs` (17 sites, biggest file) has the same per-slot statics; the
   atomic borrow word is correct cross-core too (it *is* the DmaArray design). `akuma_slot_table`
   remains the right tool where heap `Box`es + BKL scans are the shape (akuma-exec); inline arrays
   are the sched/idt shape. idt.rs (15) partially — its trap-path raw pointers may prefer staying.
 - **`akuma-fpu-amd64`** (extraction plan §2.5): taoxichuan's FX is the second consumer; the plan
   already exists — this plan's S2/S4 adopts its types.
-- **Already done in amd64, reuse, don't rewrite:** `akuma_port` (amd64/src/port.rs replaced,
+- **Already done in amd64, reuse, don't rewrite:** `akuma_port` (crates/akuma-kernel-amd64/src/port.rs replaced,
   22 call sites cleaned — net.rs is taoxichuan's laggard copy of that same pattern);
-  `akuma-user-access` (its x86 fixup lives in amd64/src/idt.rs — do NOT bolt it onto taoxichuan's
+  `akuma-user-access` (its x86 fixup lives in crates/akuma-kernel-amd64/src/idt.rs — do NOT bolt it onto taoxichuan's
   no-fault copy design); extraction-plan slices 1-2 done and taoxichuan already adopted them
   (`akuma_mmap::HoleSet` = the munmap/mremap hole table; `akuma-syscalls-signal` = the real
   per-task handler table — both in the 2026-10-30 log entries).

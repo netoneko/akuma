@@ -1,6 +1,6 @@
 //! The `akuma-exec` / `akuma-threading` runtime twin — taoxichuan's
 //! registration of the hook tables the shared scheduler crates read, the twin
-//! of `amd64/src/exec_runtime.rs::init` + `amd64/src/sched.rs`'s registration
+//! of `crates/akuma-kernel-amd64/src/exec_runtime.rs::init` + `crates/akuma-kernel-amd64/src/sched.rs`'s registration
 //! block (plan `docs/archive/TAOXICHUAN_M4_SCHED_LITE_PLAN.md` § 1, slice 1).
 //!
 //! **Written new, not extracted**: this file is taoxichuan's own glue (the
@@ -102,7 +102,7 @@ pub extern "C" fn idle_main() -> ! {
         // pass inside `try_yield` readies it. So a due deadline is a reason to
         // yield too, or a timed park (glue's `nanosleep`, a `poll`/`epoll`
         // timeout) on an otherwise idle core never expires. amd64's wait
-        // loops ask the same question (`amd64/src/net.rs`).
+        // loops ask the same question (`crates/akuma-kernel-amd64/src/net.rs`).
         let due = akuma_threading::wake_is_due(akuma_threading::earliest_wake_time(), crate::net::uptime_us());
         if due || akuma_threading::runnable_exists() {
             #[cfg(feature = "trace-err")]

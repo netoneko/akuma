@@ -65,7 +65,7 @@
 //!   child would copy (or COW-manage) the full 4 KiB to inherit three stdio
 //!   descriptors. The kernel spawns shells constantly; paying per-fd is the
 //!   right gradient. It would also lose `const`-constructible emptiness,
-//!   which `amd64/src/fd.rs`'s `KERNEL_TABLE` static needs.
+//!   which `crates/akuma-kernel-amd64/src/fd.rs`'s `KERNEL_TABLE` static needs.
 //! - **`akuma-slot-table`** is the *process* table's lock-free store: atomic
 //!   slot states, reuse generations, deferred reclamation for readers that
 //!   can outrun a reaper. Nothing reads this table without holding its
@@ -89,7 +89,7 @@
 //!
 //! The state machine itself is ceiling-free; a ceiling is *policy*, and the
 //! kernel's 1024 (`MAX_FDS`) is enforced at its call sites
-//! (`amd64/src/fd.rs::install`, `sys_dup2`). [`FdTable::free_below`] is the
+//! (`crates/akuma-kernel-amd64/src/fd.rs::install`, `sys_dup2`). [`FdTable::free_below`] is the
 //! parameterized query for any caller that wants the check where the crate
 //! can see it: it answers `None` instead of a number at or above the ceiling.
 

@@ -1,6 +1,6 @@
 //! The 16550 COM-port console, minimal: configure, probe, emit.
 //!
-//! This is the machine half of `amd64/src/serial.rs`, extracted (2026-10-24,
+//! This is the machine half of `crates/akuma-kernel-amd64/src/serial.rs`, extracted (2026-10-24,
 //! the Taoxichuan stage-1 composition) so a composed kernel can pull a console
 //! as a crate rather than inheriting the full module. What was kept is exactly
 //! what works before anything else exists:
@@ -10,7 +10,7 @@
 //!   best-effort bounded lock and the same CRLF translation;
 //! * [`present`]/[`getb`]/[`has_byte`] — the polled receive side.
 //!
-//! What was deliberately **left behind** in `amd64/src/serial.rs` is every layer
+//! What was deliberately **left behind** in `crates/akuma-kernel-amd64/src/serial.rs` is every layer
 //! that assumes more machine than "a COM port": the `akuma-dmesg` ring behind
 //! `dmesg`/`sys_syslog`, the framebuffer mirror (`multiboot2::mirror_byte`), the
 //! splash notetaker, the fatal-mode gate (`begin_fatal`) and the quiet-boot
@@ -34,7 +34,7 @@ const LSR_THR_EMPTY: u8 = 1 << 5;
 const LSR_DATA_READY: u8 = 1 << 0;
 
 /// One writer at a time, per call — the same policy and the same reasons as
-/// `amd64/src/serial.rs`'s `LOCK`: serialised per call so a line assembled from
+/// `crates/akuma-kernel-amd64/src/serial.rs`'s `LOCK`: serialised per call so a line assembled from
 /// `puts`/`put_hex`/`put_dec` stays readable, and **best-effort** on purpose,
 /// because a core that cannot get the lock within the budget must still be able
 /// to report. The budget is spins, not time: no clock is up yet.
@@ -105,7 +105,7 @@ pub fn present() -> bool {
 
 /// The raw emitter: no lock, no present-check short-circuit, just the
 /// transmit drain and the write. Every public function holds [`LOCK`] once and
-/// calls this per byte — the same shape as `amd64/src/serial.rs`'s
+/// calls this per byte — the same shape as `crates/akuma-kernel-amd64/src/serial.rs`'s
 /// `putb_raw`, and for the same reason: the lock is best-effort and re-taking
 /// it from inside itself would spin the whole [`LOCK_BUDGET`] per byte.
 fn putb_raw(byte: u8) {

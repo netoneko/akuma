@@ -47,13 +47,13 @@ Both clocks this crate reads are `akuma_primitives::clock`'s:
 | | what it is | who installs it |
 |---|---|---|
 | `uptime_us()` | monotonic microseconds since boot, a boot-registered `OnceCopy` hook | `akuma_exec::runtime::register`, from each kernel's `ExecRuntime::uptime_us` — AArch64 passes `akuma_timer::uptime_us` (CNTVCT/CNTFRQ), amd64 passes `net::uptime_us` (`lapic::ticks() * 10_000`) |
-| `utc_time_us(at)` / `set_utc_time_us(unix, at)` | the UTC offset, one `AtomicU64`, `None` until something sets it | PL031/NTP on AArch64 (`akuma-kernel-core`'s `timer`/`ntp_boot`), SNTP on amd64 (`amd64/src/clock.rs`), and `clock_settime`/`settimeofday`/`adjtimex` from ring 3 on either |
+| `utc_time_us(at)` / `set_utc_time_us(unix, at)` | the UTC offset, one `AtomicU64`, `None` until something sets it | PL031/NTP on AArch64 (`akuma-kernel-core`'s `timer`/`ntp_boot`), SNTP on amd64 (`crates/akuma-kernel-amd64/src/clock.rs`), and `clock_settime`/`settimeofday`/`adjtimex` from ring 3 on either |
 
 **It was `akuma_timer`'s until 2026-09-12** — both halves — and that is worth
 knowing because `akuma-timer` is the *AArch64 generic timer*: `uptime_us` there
 is `cntvct_el0()/cntfrq_el0()`, whose x86_64 arms in `akuma-cpu` are stubs
 returning `0`. So on the amd64 kernel every read in this crate was zero and the
-UTC offset was one nothing on that target ever wrote, while `amd64/src/clock.rs`
+UTC offset was one nothing on that target ever wrote, while `crates/akuma-kernel-amd64/src/clock.rs`
 kept a second anchor of its own. Two clocks, each internally plausible.
 `docs/archive/AKUMA_AMD64_C3_CLOCK.md` is the whole story; the rules that came
 out of it:
@@ -367,7 +367,7 @@ argument validation needed since neither takes a pointer.
 
 Every syscall in this file is served on **both** kernels since 2026-09-12.
 Before that the amd64 kernel had four of them as local arms in
-`amd64/src/usermode.rs` and answered `ENOSYS` to `clock_getres`,
+`crates/akuma-kernel-amd64/src/usermode.rs` and answered `ENOSYS` to `clock_getres`,
 `clock_nanosleep`, `clock_adjtime`, `setitimer`, `times`, `getrusage` and
 `alarm` — not because the implementation was missing (it is here, and glue
 links into that kernel) but because `akuma-syscalls-abi` had no row mapping the

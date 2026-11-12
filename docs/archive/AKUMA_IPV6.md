@@ -8,7 +8,7 @@ Not a bug — a missing feature, already pinned as one in
 
 - `sys_socket` accepts `domain == 2` (`AF_INET`) only; anything else,
   `AF_INET6` included, is `EAFNOSUPPORT` (97). Both syscall layers enforce
-  this: `crates/akuma-syscalls-glue/src/net.rs` and `amd64/src/sock.rs:66`.
+  this: `crates/akuma-syscalls-glue/src/net.rs` and `crates/akuma-kernel-amd64/src/sock.rs:66`.
 - That errno is load-bearing today:
   `crates/akuma-kernel-glue/src/rump_proxy.rs:523` relies on curl's
   `AF_INET6` probe failing so the box falls back to IPv4. The rump devbox
@@ -39,7 +39,7 @@ Not a bug — a missing feature, already pinned as one in
 |---|---|---|
 | Enable `proto-ipv6` in the three Cargo.tomls; re-measure the extreme-size (4 MB floor) image | XS | root, `akuma-net`, `akuma-net-nic` |
 | `sockaddr_in6` wire type + parse/marshal beside `SockAddrIn` (`socket.rs:111`) | S | `akuma-net`, `akuma-syscalls-linux` |
-| Plumb `AF_INET6` through both syscall layers: every `SockAddrIn` site (~15 in glue, plus `amd64/src/sock.rs` / `amd64/src/net.rs`) gets a family dispatch | M | `akuma-syscalls-glue/src/net.rs` (2225 lines), `amd64/src/sock.rs`, `amd64/src/net.rs` (1384 lines) |
+| Plumb `AF_INET6` through both syscall layers: every `SockAddrIn` site (~15 in glue, plus `crates/akuma-kernel-amd64/src/sock.rs` / `crates/akuma-kernel-amd64/src/net.rs`) gets a family dispatch | M | `akuma-syscalls-glue/src/net.rs` (2225 lines), `crates/akuma-kernel-amd64/src/sock.rs`, `crates/akuma-kernel-amd64/src/net.rs` (1384 lines) |
 | Interface config: v6 address + default route, `::1`; NDP arrives with the smoltcp flag | S–M | `smoltcp_net/init.rs`, `smoltcp_net/iface.rs` |
 | Address autoconfiguration | the open question | no DHCPv6 in smoltcp 0.12; static config is easy, SLAAC depends on how completely smoltcp handles router advertisements |
 | DNS AAAA in the resolver | S | `crates/akuma-net/src/dns.rs` (249 lines) |

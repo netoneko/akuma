@@ -1163,7 +1163,7 @@ static PREV_L0: [AtomicU64; TTBR_TRACK_CORES] = [ATOMIC_U64_ZERO; TTBR_TRACK_COR
 /// about two cases (single-core, and the AArch64 multikernel where every caller
 /// wants `0`) and there is now a third it did not anticipate: **amd64 is real
 /// SMP without `kernel_bkl_smp`**, running four cores off its own ticket BKL
-/// in `amd64/src/smp.rs`. There every core would have published into slot 0,
+/// in `crates/akuma-kernel-amd64/src/smp.rs`. There every core would have published into slot 0,
 /// and the last writer would erase the record of a table a *peer* core is still
 /// running on — which is the precise thing this registry exists to prevent, so
 /// the gate would have been worse than absent.
@@ -2844,7 +2844,7 @@ impl Drop for UserAddressSpace {
 // x86_64 UserAddressSpace — Phase 4 of proposals/AKUMA_MMU_ARCH_PORTABILITY.md
 // ============================================================================
 //
-// A minimal x86_64 body, ported directly from `amd64/src/paging.rs` (which
+// A minimal x86_64 body, ported directly from `crates/akuma-kernel-amd64/src/paging.rs` (which
 // already built this exact vocabulary and encoding — see that file's own
 // header) rather than redesigned. Deliberately NOT the aarch64 struct's peer
 // in features: no ASID/PCID, no lazy regions, no multi-core epoch tracking, and
@@ -2854,7 +2854,7 @@ impl Drop for UserAddressSpace {
 // error here, which is the honest boundary of what this port proves.
 //
 // **It is the amd64 kernel's only user-space walker since step 5a.** That
-// sentence used to read "no runtime caller"; `amd64/src/paging.rs` lost its
+// sentence used to read "no runtime caller"; `crates/akuma-kernel-amd64/src/paging.rs` lost its
 // `AddressSpace` and `mm.rs`/`idt.rs`/`loader.rs`/`usermode.rs`/`fd.rs` all map
 // through this (`docs/archive/AKUMA_AMD64_STEP5A_ONE_WALKER.md`). Three things
 // arrived with those callers and are x86-only for stated reasons: the PTE-level
@@ -2866,7 +2866,7 @@ impl Drop for UserAddressSpace {
 /// The amd64 page-permission vocabulary and encoder — `akuma-pte-amd64`'s,
 /// re-exported so every `akuma_mmu::{PteProt, MemAttr, encode_pte}` call site is
 /// unchanged. They lived here until 2026-10-18; the bits are pure data and the
-/// kernel's own walker (`amd64/src/paging.rs`) needs them without this crate's
+/// kernel's own walker (`crates/akuma-kernel-amd64/src/paging.rs`) needs them without this crate's
 /// `UserAddressSpace`.
 #[cfg(any(target_arch = "x86_64", test))]
 pub use akuma_pte_amd64::{MemAttr, PteProt, encode_pte};
@@ -2876,7 +2876,7 @@ pub use akuma_pte_amd64::{MemAttr, PteProt, encode_pte};
 ///
 /// A struct rather than a `(usize, u64, PteProt)` tuple for one reason: `pa`
 /// and the raw entry are both integers of the same width, and the two range
-/// walks this replaces in `amd64/src/paging.rs` passed them adjacently. A
+/// walks this replaces in `crates/akuma-kernel-amd64/src/paging.rs` passed them adjacently. A
 /// transposition there compiles and produces a mapping of the flag word.
 #[cfg(any(target_arch = "x86_64", test))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -2906,7 +2906,7 @@ pub struct Leaf {
 /// three. **Policy stays with the caller**: whether a writable region may
 /// become a writable *PTE* depends on the frame's CoW share count, which is a
 /// PMM question this crate deliberately does not ask
-/// (`amd64/src/mm.rs::pte_prot_for`).
+/// (`crates/akuma-kernel-amd64/src/mm.rs::pte_prot_for`).
 #[cfg(any(target_arch = "x86_64", test))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LeafAction {
@@ -2996,7 +2996,7 @@ use akuma_pagetable::amd64 as x86_walk;
 /// to find it later.
 ///
 /// Until C1 step 6 the only thing standing in the way of that was
-/// `amd64/src/loader.rs` refusing a `PT_LOAD` outside the lower half, one
+/// `crates/akuma-kernel-amd64/src/loader.rs` refusing a `PT_LOAD` outside the lower half, one
 /// `if` in one caller, against `p_vaddr` read from a file ring 3 chose. Its
 /// replacement `akuma-elf` has no such check — and neither did any other
 /// caller, so the guard belonged to the walk all along rather than to the one
@@ -3640,7 +3640,7 @@ impl UserAddressSpace {
     /// architectures genuinely cannot share a body. AArch64 has no CoW bit: a
     /// demoted page is indistinguishable from an `mprotect(PROT_READ)` one, and
     /// `akuma-cow` is handed `refs > 0` in place of a marker. x86 has bit 9
-    /// free, `amd64/src/paging.rs` uses it, and `akuma_cow`'s pinned divergence
+    /// free, `crates/akuma-kernel-amd64/src/paging.rs` uses it, and `akuma_cow`'s pinned divergence
     /// note names this target as the one that passes a real PTE bit. Demoting
     /// without setting it would make every CoW fault here look like a genuine
     /// protection violation.
@@ -5017,16 +5017,16 @@ mod icache_tests {
 
 /// The x86 permission encoding, pinned against the walker that already ships.
 ///
-/// `amd64/src/paging.rs` has its own `PteProt`/`encode` pair driving the amd64
+/// `crates/akuma-kernel-amd64/src/paging.rs` has its own `PteProt`/`encode` pair driving the amd64
 /// kernel's page tables, and its boot self-test asserts each of these six
 /// values. This crate's copy is the one the *shared* crates reach through
 /// `UserAddressSpace`, so the two must agree exactly or a page mapped through
-/// `akuma-exec` and a page mapped through `amd64/src/mm.rs` get different
+/// `akuma-exec` and a page mapped through `crates/akuma-kernel-amd64/src/mm.rs` get different
 /// permissions from the same region.
 ///
 /// Spelled as hex literals for the same reason `prot_roundtrips_to_todays_bits`
 /// is: a test written against `x86_encode`'s own constants would pass even if
-/// they drifted. These were read off `amd64/src/paging.rs`'s
+/// they drifted. These were read off `crates/akuma-kernel-amd64/src/paging.rs`'s
 /// `region_prot_roundtrip_check`.
 ///
 /// Compiled on any host via the `cfg(test)` half of the gate on the encoding —

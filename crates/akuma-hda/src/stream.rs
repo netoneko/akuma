@@ -1,7 +1,7 @@
 //! Stream-side arithmetic: the format word, PCM conversion, the buffer
 //! descriptor list and the playback ring's bookkeeping.
 //!
-//! Everything here is a function of its inputs. The metal half (`amd64/src/hda.rs`)
+//! Everything here is a function of its inputs. The metal half (`crates/akuma-kernel-amd64/src/hda.rs`)
 //! owns the DMA memory and the registers; it asks this module *what* to write.
 
 /// OSS `AFMT_U8`.

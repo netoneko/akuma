@@ -30,7 +30,7 @@ No single factor separates passes from stalls.
 
 Kernel = `c523598a` + a lock-free trace ring in `akuma-threading` (park / waker / wake-pass /
 resume events, per-thread enable, printed by the idle loop's 30 s block) + `DUMP_FUTEX_WAITERS` and
-`DUMP_SLOT_TABLE` flipped on in `amd64/src/sched.rs`. In a stalled Bun (tgid 37):
+`DUMP_SLOT_TABLE` flipped on in `crates/akuma-kernel-amd64/src/sched.rs`. In a stalled Bun (tgid 37):
 
 - **Every thread of the process is parked in a futex wait** (`park=futex.rs:297`, untimed, woken only
   by the 1 s untimed-park backstop and going straight back to sleep; one worker is in a timed
@@ -78,7 +78,7 @@ the helpers' futex calls (same tgid) to see whether the latch wake was issued an
 thread 6/6, JIT off 5/6), which points at the concurrent collector — and JavaScriptCore's collector
 **suspends the mutator with a signal**: `pthread_kill(main, SIGUSR1)`, then waits for main's handler to
 post a semaphore. The main thread is parked in `FUTEX_WAIT` (on a stack latch) when the signal
-arrives. The signal wakes it (the spurious `k2`/`k4` ready in the trace) but `amd64/src/futex.rs`'s
+arrives. The signal wakes it (the spurious `k2`/`k4` ready in the trace) but `crates/akuma-kernel-amd64/src/futex.rs`'s
 wait loop only asked `should_interrupt_blocking_syscall()`, which **deliberately skips `SA_RESTART`
 handlers** ("not reporting it makes the loop take another pass — a restart"). That is fine for
 `read`/`write` but wrong for a loop that never returns to user mode: delivery happens at syscall
@@ -108,7 +108,7 @@ stall still reproduced there with stdin keys. Not explained.
 ## Candidate causes (superseded)
 
 - A wake lost on the `FUTEX_CMP_REQUEUE` / condvar path musl uses for WTF's condvars
-  (`amd64/src/futex.rs`, `akuma-syscalls-sync`), e.g. the waiter moved to a key the later
+  (`crates/akuma-kernel-amd64/src/futex.rs`, `akuma-syscalls-sync`), e.g. the waiter moved to a key the later
   `FUTEX_WAKE` does not reach.
 - The enqueue/park/resume protocol under SMP (`akuma_threading::schedule_blocking`,
   `publish_waiting_and_take_pending_wake`, `x86_wake_pass`) — a wake that dequeues the waiter but

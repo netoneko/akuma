@@ -158,7 +158,7 @@ impl Context {
 
 /// x86_64's `Context`: one saved stack pointer, nothing else.
 ///
-/// Ported from `amd64/src/sched.rs`'s own `Context` (proven — that file's
+/// Ported from `crates/akuma-kernel-amd64/src/sched.rs`'s own `Context` (proven — that file's
 /// `smoke_test` runs real cooperative+preemptive round-robin scheduling
 /// today). Everything the AArch64 struct carries as named fields — the
 /// callee-saved registers, the return address — lives on the task's own

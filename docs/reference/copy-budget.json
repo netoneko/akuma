@@ -1,5 +1,5 @@
 {
-  "amd64/src": 25,
+  "crates/akuma-kernel-amd64": 25,
   "crates/akuma-bkl": 7,
   "crates/akuma-exec": 60,
   "crates/akuma-exec-core": 1,

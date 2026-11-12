@@ -28,13 +28,13 @@ runs commands, with no ssh involved.
 
 ## What already exists (read from the tree 2026-10-01, not run)
 
-- A **framebuffer console** under GRUB/multiboot2 (`amd64/src/multiboot2.rs`,
+- A **framebuffer console** under GRUB/multiboot2 (`crates/akuma-kernel-amd64/src/multiboot2.rs`,
   `FbConsole`); `serial::puts` already mirrors output to it. The TV is already
   the box's only console.
-- A **keyboard**: `amd64/src/kbd.rs`, i8042 scancode set 1, polled, working
+- A **keyboard**: `crates/akuma-kernel-amd64/src/kbd.rs`, i8042 scancode set 1, polled, working
   through the firmware's USB-to-PS/2 emulation (no USB stack involved). No
   arrow or function keys, no repeat handling beyond the keyboard's own.
-- A **console input pump** (`amd64/src/console.rs`, `input.rs`) and a shared
+- A **console input pump** (`crates/akuma-kernel-amd64/src/console.rs`, `input.rs`) and a shared
   `TerminalState` line discipline, so a process attached to the console reads
   keystrokes and echoes to the screen.
 - Boot runs `init=/bin/herd`, which starts `sshd` (and `hda-capture` on this
@@ -133,7 +133,7 @@ draft, at 2228 bytes, was refused `TooLong`.
 >
 > FEATURE: boot the trashcan, look at the TV, see a working /bin/sh prompt that takes keystrokes from the keyboard and runs commands. No ssh. The framebuffer already shows the boot log and kbd.rs reads a PS/2 keyboard via firmware emulation. Nothing is known to start a shell on the console; nobody has confirmed the keyboard works. Check both first.
 >
-> LOOK AT: amd64/src/{console,input,kbd,multiboot2}.rs, usermode.rs run_init, /etc/herd/enabled, docs/runbooks/amd64-bare-metal-loop.md ("Working on the box"). grep docs/archive before theorising.
+> LOOK AT: crates/akuma-kernel-amd64/src/{console,input,kbd,multiboot2}.rs, usermode.rs run_init, /etc/herd/enabled, docs/runbooks/amd64-bare-metal-loop.md ("Working on the box"). grep docs/archive before theorising.
 >
 > RULES (from the HDA attempt): a readback is evidence only if you know the thing it reads exists. "It printed OK" is not "it works"; say how you would tell. Commit locally before every install; do not push, touch credentials, or force anything. If a kernel won't boot, a human picks the old GRUB entry.
 >
@@ -299,7 +299,7 @@ draft, at 2228 bytes, was refused `TooLong`.
   `kot --no-local-nag`. The TV-console feature (`/bin/sh` visible on the TV,
   keystrokes from the keyboard, no ssh) is handed to a single Claude Code
   session; the acceptance is unchanged. Facts that session should start from
-  (read from the tree, not run): `amd64/src/console.rs` already owns the
+  (read from the tree, not run): `crates/akuma-kernel-amd64/src/console.rs` already owns the
   console `ProcessChannel` + shared `TerminalState`, and `pump_once` bridges
   `input::getb()` (keyboard) in and the line discipline's echo out to the
   serial/framebuffer; `usermode::run_init` registers init as pid 1 and starts

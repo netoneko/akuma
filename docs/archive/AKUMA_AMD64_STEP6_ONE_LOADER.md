@@ -11,7 +11,7 @@ collision" is the measurement this step acted on.
 
 ## What this step did
 
-`amd64/src/loader.rs` was a second ELF loader beside `crates/akuma-elf`: it
+`crates/akuma-kernel-amd64/src/loader.rs` was a second ELF loader beside `crates/akuma-elf`: it
 parsed the headers, placed the `PT_LOAD` segments, read `PT_INTERP`, mapped the
 dynamic linker, and then built the initial stack. The **first four** of those are
 `akuma-elf`'s now. The fifth stayed, and where the line falls is the whole of the
@@ -107,7 +107,7 @@ is one constant and one answer.
 
 ### amd64 never registered `akuma-elf`'s VFS hooks
 
-`amd64/src/exec_runtime.rs::init` calls `akuma_exec::runtime::register`, not
+`crates/akuma-kernel-amd64/src/exec_runtime.rs::init` calls `akuma_exec::runtime::register`, not
 `akuma_exec::init` — deliberately, because that function registers seven upward
 surfaces at once against subsystems this target serves itself. `akuma-elf`'s four
 callbacks are registered there now, explicitly. Unregistered, `crate::vfs()`
@@ -119,7 +119,7 @@ crate's design working; it still had to be wired.
 
 This is the part of the step that was not a port.
 
-`amd64/src/loader.rs` refused a `PT_LOAD` whose extent left the lower half —
+`crates/akuma-kernel-amd64/src/loader.rs` refused a `PT_LOAD` whose extent left the lower half —
 `seg_end > USER_VA_LIMIT`, one `if` in one caller, against a `p_vaddr` read from
 a file ring 3 chose. `akuma-elf` has no such check, and neither did anything
 below it.

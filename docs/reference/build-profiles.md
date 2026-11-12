@@ -246,7 +246,7 @@ The amd64 kernel is the same package as the AArch64 one, built for the other tar
 (`-p akuma --target x86_64-unknown-none --release`); its feature table is in
 [`subsystems/config-flags.md`](subsystems/config-flags.md#amd64-features). Its
 device drivers are `crates/akuma-drivers-amd64`, one feature per driver, and the machine
-half reaches each class through a registration slot (`amd64/src/drivers.rs`), so a driver
+half reaches each class through a registration slot (`crates/akuma-kernel-amd64/src/drivers.rs`), so a driver
 left out takes its probe with it and the class reads as absent.
 
 | Image | Build | What it is |

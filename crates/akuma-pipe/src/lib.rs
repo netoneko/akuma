@@ -15,7 +15,7 @@
 //!
 //! No lock, no global table, no poller/waker registry, no syscall numbers, no
 //! `fd`. Those belong to whatever integrates this — on the amd64 target that is
-//! `amd64/src/pipe.rs`, a `spin`-locked fixed array of `Pipe`s indexed by a
+//! `crates/akuma-kernel-amd64/src/pipe.rs`, a `spin`-locked fixed array of `Pipe`s indexed by a
 //! `PipeId`. The tree's full kernel pipe
 //! (`akuma_syscalls_glue::pipe::KernelPipe`) has the same buffer/cap/short-write
 //! shape and additionally a `pollers` map for waking parked readers; that crate
@@ -71,7 +71,7 @@ impl Pipe {
     /// a write can always make progress once the buffer drains.
     ///
     /// `const` so an integrator can hold `Pipe`s in a `static` fixed array
-    /// without an initialiser function (`amd64/src/pipe.rs`).
+    /// without an initialiser function (`crates/akuma-kernel-amd64/src/pipe.rs`).
     #[must_use]
     pub const fn with_capacity(capacity: usize) -> Self {
         Self {

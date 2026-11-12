@@ -729,7 +729,7 @@ impl UserContext {
 /// separate struct with the same name.
 ///
 /// **The field list is not a design choice — it is what the `syscall_entry`
-/// assembly saves**, and nothing more. `amd64/src/usermode.rs`'s `UserCtx` is
+/// assembly saves**, and nothing more. `crates/akuma-kernel-amd64/src/usermode.rs`'s `UserCtx` is
 /// where those bytes live per *task slot*, written by that assembly at fixed
 /// offsets; this is the same information as a value, so a process's first entry
 /// to ring 3 can be described the way the AArch64 side describes it.

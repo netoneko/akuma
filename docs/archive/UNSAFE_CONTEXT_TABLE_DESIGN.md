@@ -244,7 +244,7 @@ Rust borrow), `akuma_phys::Frame`, `akuma_trap_aarch64::FrameHandle`, `akuma-dma
   Rust's abstract model; it removes tearing and gives the paths one door, it does not make them formally defined. Making them formally defined needs the owner's writes
   to be atomic too (`Context` fields as `AtomicU64`), which the switch asm and `Context: Copy` rule out.
 * **Re-scoped: §3.2 `Initializing` token.** `x86_seed_entry(slot, ..)` is public and is called by three kernels (`akuma-tokio-kernel-amd64` x2,
-  `akuma-tokio-kernel-aarch64`, `amd64/src/sched.rs`) with slot ids they obtained *without* `claim_free_slot` (`IDLE_TID`, fixed task slots). A linear token would have
+  `akuma-tokio-kernel-aarch64`, `crates/akuma-kernel-amd64/src/sched.rs`) with slot ids they obtained *without* `claim_free_slot` (`IDLE_TID`, fixed task slots). A linear token would have
   to cross those crates, i.e. a protocol change in four places for roughly eight internal sites (the spawn paths and `adopt_current_as_core_idle`). Not worth the risk
   without an amd64 metal loop in the same session; revisit as its own change if the count matters.
 * **Re-scoped: §2b crash-dump move.** The EL1 dump's four raw reads are interleaved with the handler's real logic; lifting them into the forensics crate makes the call

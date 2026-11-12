@@ -22,7 +22,7 @@
 //!
 //! One row left that table on 2026-09-11.
 //! `is_current_interrupted` read "no signals" until then, and that reason
-//! expired: this target delivers signals now (`amd64/src/signal.rs`). It is
+//! expired: this target delivers signals now (`crates/akuma-kernel-amd64/src/signal.rs`). It is
 //! wired to `should_interrupt_blocking_syscall` — the same function the AArch64
 //! kernel gives this hook (`akuma-kernel-glue`), the union of the deferred-kill
 //! bit, the Ctrl-C / `sys_kill` bit and the per-thread `pthread_kill` set — so a
@@ -463,7 +463,7 @@ pub fn init_rtl8169(regs: akuma_primitives::mmio::MmioWindow, static_v4: StaticI
 /// Resolvers tried after the interface's own, by `akuma_net::dns::resolve_ipv4`:
 /// Cloudflare, then Google — the two a `-netdev user` slirp NATs straight through
 /// and a household router almost never blocks. This is the policy half of what
-/// `amd64/src/dns.rs` carried: a *configured* resolver that answers some names
+/// `crates/akuma-kernel-amd64/src/dns.rs` carried: a *configured* resolver that answers some names
 /// and `NXDOMAIN`s others is a measured case (the HP box's uplink for
 /// `example.com`, 2026-09-06; QEMU slirp's forwarder, 2026-10-18), and the walk
 /// to a server that will answer is what makes one lookup succeed.

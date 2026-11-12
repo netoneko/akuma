@@ -108,7 +108,7 @@ All three kernels serve both from glue. **Whoever delivers signals at the
 syscall return owns the slot from there:** a handler frame records the saved
 mask as `uc_sigmask`, and a return that enters no handler must put the saved
 mask back itself. The x86 kernels take the slot once per return
-(`amd64/src/signal.rs::deliver_pending`, Taoxichuan's
+(`crates/akuma-kernel-amd64/src/signal.rs::deliver_pending`, Taoxichuan's
 `child::deliver_at_return`) and do both; AArch64 takes it only while building a
 frame, so a woken-then-discarded signal leaves the temporary mask installed
 (open, [`archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md`](../../../archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md)).

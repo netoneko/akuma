@@ -131,10 +131,10 @@ about the clock as well. The user's guess: a reboot interrupts a write to the ch
 
 **Suspects, user's:**
 
-1. `write_rtc_from_sntp` (`amd64/src/clock.rs` → `akuma_cmos_rtc::write`, SNTP time written back to the RTC the way Linux's
+1. `write_rtc_from_sntp` (`crates/akuma-kernel-amd64/src/clock.rs` → `akuma_cmos_rtc::write`, SNTP time written back to the RTC the way Linux's
    `sync_cmos_clock` does). It sets SET (status B bit 7), writes the date/time registers and the century (0x32), clears SET. A reset in
    that window leaves the RTC stopped with SET=1 and a half-written date.
-2. `crumb()` in `amd64/src/kvm.rs`: breadcrumb bytes written to CMOS **0x7F** during the SVM rehearsal/`kvmtest` paths (so a run that
+2. `crumb()` in `crates/akuma-kernel-amd64/src/kvm.rs`: breadcrumb bytes written to CMOS **0x7F** during the SVM rehearsal/`kvmtest` paths (so a run that
    resets the machine can be diagnosed). Many firmwares checksum the whole CMOS range; 0x7F may be inside it.
 3. The reboot landing in the middle of a CMOS access (index written, data not; or the SET window).
 
@@ -199,7 +199,7 @@ Measured from goose's own session database (`/root/.local/share/goose/sessions/s
 | prose written to the user | 3.6 k chars | 8.1 k chars | |
 
 **Timeline of the bug session** (seconds from the first message): 0 task read; **700 s (11 m 40 s, 47 tool calls)** investigating
-before the first source edit (`amd64/src/kvm.rs`); 949 s first `kbuild` (51 s of the 88 s of tool time); 1,017 s the fresh kernel started as
+before the first source edit (`crates/akuma-kernel-amd64/src/kvm.rs`); 949 s first `kbuild` (51 s of the 88 s of tool time); 1,017 s the fresh kernel started as
 a `kvm0` guest (`AKUMA-GUEST-DONE`, `exc=0`); **1,100 s (18 m 20 s) `git commit`**; 1,242 s last call. Tool calls: ~65 % reading/searching
 (`grep`, `sed -n`, `cat` of the CMOS, clock, reboot and VMCB code), 12 `edit`s over four files, one build, one guest boot, one install.
 The commit message, `READY-FOR-REBOOT` and `QUESTIONS.md` it wrote were accurate when checked against the code and the reboot tests.

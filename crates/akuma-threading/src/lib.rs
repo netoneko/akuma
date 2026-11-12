@@ -3030,7 +3030,7 @@ fn wake_pass() {
 /// thread when something runs it, and a halted core runs it at its next
 /// interrupt. With only the periodic tick, a deadline was served up to one tick
 /// late; the amd64 kernel arms a one-shot timer for this value instead
-/// (`amd64/src/lapic.rs`, `arm_deadline`). Lock-free and allocation-free; a
+/// (`crates/akuma-kernel-amd64/src/lapic.rs`, `arm_deadline`). Lock-free and allocation-free; a
 /// racing wake or new park only makes the answer stale by one halt, and the
 /// halt's own wake path re-reads it.
 #[must_use]
@@ -4278,7 +4278,7 @@ static UNTIMED_PARK_BACKSTOP_WAKES: AtomicU64 = AtomicU64::new(0);
 /// the default — `0`, meaning `u64::MAX`, meaning exactly the behaviour every
 /// call site had before this existed — is the one AArch64 keeps.
 ///
-/// It moved here from `amd64/src/sched.rs`'s `block_current`, which could only
+/// It moved here from `crates/akuma-kernel-amd64/src/sched.rs`'s `block_current`, which could only
 /// cover the four parks that kernel wrote itself. Every blocking arm in
 /// `akuma-syscalls-glue` parks through [`park_indefinitely`] now, so a target
 /// that sets this gets the tripwire on all 28 of them — which is what let the

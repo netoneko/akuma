@@ -1,5 +1,5 @@
 //! This kernel as `akuma-sched-amd64` sees it: the scheduler's machine half, shared with the metal kernel
-//! (`amd64/src/sched.rs`), over Taoxichuan's own state.
+//! (`crates/akuma-kernel-amd64/src/sched.rs`), over Taoxichuan's own state.
 //!
 //! The crate performs a switch - page-table root, ring-3 trap stack, FS/GS bases, FP/SIMD state - and decides
 //! `can_run`; the [`Tx`] platform answers what is this kernel's: roots come from the task record (so an `exec`

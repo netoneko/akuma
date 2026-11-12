@@ -86,7 +86,7 @@ build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
 (measurements taken 2026-09-07) with the walk current in the dated boxes.
 
 > **B1 and B2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_MMAP_REGIONS.md`.
-> `amd64/src/mm.rs` is no longer a bump allocator: `akuma-mmap` holds the region
+> `crates/akuma-kernel-amd64/src/mm.rs` is no longer a bump allocator: `akuma-mmap` holds the region
 > table (`Process::regions`, per address space, under its own lock),
 > `PteProt::from_region` is the crate's x86 backend with all six `Prot::ALL`
 > variants pinned bit-for-bit, and the `#PF` handler demand-pages out of the
@@ -135,7 +135,7 @@ build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
 > insertions, 0 deletions), and `src/` was not touched.
 
 > **A1 and A2 are DONE (2026-09-07)** — `docs/archive/AKUMA_AMD64_BLOCKING.md`.
-> `amd64/src/sched.rs` no longer contains a scheduler: `akuma-threading` is the
+> `crates/akuma-kernel-amd64/src/sched.rs` no longer contains a scheduler: `akuma-threading` is the
 > scheduler on both architectures, and what is left is the machine effects
 > (`CR3`, TSS trap stack, FS/GS bases, `fxsave`, BKL depth, per-core current
 > slot) registered as `X86ArchHooks`. Pipes, `futex` and `wait4` park instead of
@@ -159,7 +159,7 @@ build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
 > x86 `UserAddressSpace` went **6 public methods to 38**: the `akuma-user-space`
 > ledger, the scalar identity (`ttbr0`/`l0_phys`/`asid`/`is_shared`), the
 > mapping and permission surface, and `impl UserPages`. Everything above the
-> gate in the tree below is now deletions from `amd64/src`.
+> gate in the tree below is now deletions from `crates/akuma-kernel-amd64/src`.
 >
 > The `u64`-vs-`Prot` mismatch the box below does not mention was the substance:
 > `akuma-exec` passes AArch64 PTE flag words, and the x86 walker cannot read
@@ -174,7 +174,7 @@ build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
 > a region record on one architecture and a page-table encoding on the other.
 > `akuma-syscalls-glue` is the first shared crate to name the type, and it
 > failed to compile — the lucky outcome. Renamed `PteProt`, matching
-> `amd64/src/paging.rs`'s own.
+> `crates/akuma-kernel-amd64/src/paging.rs`'s own.
 >
 > **And a real leak, found by running rather than reading:** `map_page` — the
 > walk that allocates the first three tables of every address space — used the
@@ -183,7 +183,7 @@ build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
 > bug on this target found by a live probe, after B1's two.
 >
 > Verified QEMU **405/0** (`SMP=1`, was 357) and **414/0** (`SMP=4`, was 366) —
-> +48 both, one new suite (`amd64/src/uas.rs`) and nothing else moved — and on
+> +48 both, one new suite (`crates/akuma-kernel-amd64/src/uas.rs`) and nothing else moved — and on
 > **bare metal, 407/0 with all 48 `uas:` checks passing** (HP 500-502nj, RAM
 > image). aarch64 proven unchanged by section compare against `HEAD`: `.text`,
 > `.rodata` and `.data` **byte-identical**.
@@ -200,7 +200,7 @@ build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
 > vocabularies now meet in one place: `akuma-syscalls-abi::Syscall` went **36
 > variants to 80**, generated from a single `syscall_table!` row per call so the
 > enum, both decodes, both encodes and `ALL` cannot drift, and
-> `amd64/src/usermode.rs` decodes through it. **`akuma-syscalls-glue` was not
+> `crates/akuma-kernel-amd64/src/usermode.rs` decodes through it. **`akuma-syscalls-glue` was not
 > touched** — the AArch64 kernel's `.text`, `.rodata` and `.data` are proven
 > byte-identical against `HEAD`.
 >
@@ -387,7 +387,7 @@ build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
 > error, no panic — the same shape as step 1's syscall numbers. So the two
 > tables become one before any arm moves.
 >
-> `amd64/src/fs.rs`'s `static MOUNTS`, its `with_fs` (which held the mount-table
+> `crates/akuma-kernel-amd64/src/fs.rs`'s `static MOUNTS`, its `with_fs` (which held the mount-table
 > spinlock **across disk I/O**) and twelve one-line wrappers are `pub use
 > akuma_vfs_glue::{…}` now. The non-test half of the file went **195 → 125 code
 > lines** and gained, none of it written here: a real path walk (`..`, `.`,
@@ -427,7 +427,7 @@ build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
 > from `current_process_shared()`: it needs a registered `akuma_exec::Process`,
 > whose `address_space` field is a `ProcAddressSpace`, which wraps
 > `akuma_mmu::UserAddressSpace` **and nothing else**. So a `Process` cannot be
-> built around `amd64/src/paging.rs`'s `AddressSpace`, and the "two x86 walkers"
+> built around `crates/akuma-kernel-amd64/src/paging.rs`'s `AddressSpace`, and the "two x86 walkers"
 > item — which C1's hand-off calls a parallel cleanup to do "as its own step" —
 > is step 5's *first half*, not a sibling of it. Everything else in the stack
 > (`akuma-elf`, `akuma-exec`, `akuma-user-space`) already builds for the target
@@ -544,7 +544,7 @@ build ran on **Firecracker's virtio-blk disk**, not on the bare-metal box's
 > AArch64 `.text`/`.rodata`/`.data` all **byte-identical**.
 >
 > **Next was step 6, and it landed the same day (2026-09-08) —**
-> `docs/archive/AKUMA_AMD64_STEP6_ONE_LOADER.md`. `amd64/src/loader.rs` no
+> `docs/archive/AKUMA_AMD64_STEP6_ONE_LOADER.md`. `crates/akuma-kernel-amd64/src/loader.rs` no
 > longer parses or places an ELF: `akuma-elf` does the loading and this file
 > keeps only `build_stack`, which is shape **(c)** of the hand-off's three. The
 > VA-layout question resolved cleanly — `INTERP_BASE` moving `0x4000_0000` ->
@@ -1279,7 +1279,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   `/proc/<pid>/fd/0`) and that kernel never reads a console device at
    │   all, while here the console **is** one, polled destructively from
    │   inside the reading thread.
-   │   So: `amd64/src/console.rs`, one channel + one `TerminalState` + a
+   │   So: `crates/akuma-kernel-amd64/src/console.rs`, one channel + one `TerminalState` + a
    │   **pump** — the console's answer to `sshd`'s `bridge_process`, both
    │   directions in one daemon (`getb` → `write_stdin` → wake; the echo
    │   glue writes to the channel's stdout FIFO → `serial::putb`).
@@ -1354,7 +1354,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   branch. **What no amd64 code did was look.** So `kill(2)` would
    │   have returned 0 and done nothing — `deliver_signal` returns `true`
    │   whether or not it reached a thread.
-   │   So: `amd64/src/signal.rs`, the x86_64 counterpart to
+   │   So: `crates/akuma-kernel-amd64/src/signal.rs`, the x86_64 counterpart to
    │   `akuma_exceptions::try_deliver_signal` — a syscall-return epilogue,
    │   an `rt_sigframe` on the user stack, and `rt_sigreturn`. **One new
    │   return path for both directions** (`.Lsig_return`, `UserCtx` +3
@@ -1527,7 +1527,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │   linked into this kernel since B3's gate, and serving the family
    │   for the *other* one — read `akuma_timer::uptime_us`, i.e. CNTVCT,
    │   i.e. **`0` on x86 forever**, against a UTC offset nothing on this
-   ▼   target ever wrote. Meanwhile `amd64/src/clock.rs` kept its own
+   ▼   target ever wrote. Meanwhile `crates/akuma-kernel-amd64/src/clock.rs` kept its own
    │   `(anchor_unix, anchor_uptime)` pair that `usermode.rs`'s own arms
    │   and the two `utc_time_us` hooks read. Two clocks, each internally
    │   plausible. Folding first would have been silent, and `nanosleep`
@@ -1895,7 +1895,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
         [**corrected 09-18:** those two numbers divide to **6.9x**, not
         30-50x. The 30-50x belongs to the single-crate `akuma-exec`
         anchor, not to the whole graph.]
-        code: `amd64/src/loader.rs` § `MAX_ARGV` / `MAX_ENVP`
+        code: `crates/akuma-kernel-amd64/src/loader.rs` § `MAX_ARGV` / `MAX_ENVP`
    ▼
  [09-14 … 09-16] ═══ THE BREAK ═══ THREE DAYS, NO COMMITS
    │
@@ -2009,7 +2009,7 @@ diagram is the receipt. Read downwards; it ends where "The tree" below begins.
    │
    ├──► **`resolve_host` NXDOMAIN'd on an IP literal.** `akuma_net::dns`
    │   has always short-circuited `localhost` and a dotted quad — twice,
-   │   even — and `amd64/src/dns.rs::resolve_a` (a separate A-record
+   │   even — and `crates/akuma-kernel-amd64/src/dns.rs::resolve_a` (a separate A-record
    │   client, written because `smoltcp_net::dns_query` hung here) had
    │   neither. Only `no_std` callers could see it: musl resolves for
    │   itself. One `akuma_net::dns::resolve_literal` now, host-tested.
@@ -2712,7 +2712,7 @@ Two properties of the shape:
   port can start today.
 - **The gate is one `cargo check`**: `cargo check -p akuma-syscalls-glue
   --target x86_64-unknown-none` going clean is the objective mid-point.
-  Everything above it is deletions from `amd64/src`; everything below it is
+  Everything above it is deletions from `crates/akuma-kernel-amd64/src`; everything below it is
   parity with what the AArch64 self-host already has.
 
 ## `usermode.rs`'s floor (measured 2026-09-09, **re-measured 2026-09-11**)
@@ -2771,7 +2771,7 @@ get a comment naming what they fold to), `sys_execve` **227**, `sys_spawn`
 One cheap move remains available and is independent of everything:
 **the test lines are ~30% of the file and are not debt** — they are
 `no-tests`-gated and do not ship in the small profile. Splitting them into
-`amd64/src/usermode_tests.rs` is mechanical. Worth doing when it stops being the
+`crates/akuma-kernel-amd64/src/usermode_tests.rs` is mechanical. Worth doing when it stops being the
 thing that makes the file hard to read, not as an end in itself.
 
 ## Open issues found by probing the bare-metal box (2026-09-07)
@@ -2816,7 +2816,7 @@ The console shows where it surfaces:
 [close] persist failed for "/nosuchdir/file": not found
 ```
 
-`amd64/src/fd.rs` buffers a created file in memory and writes it through at
+`crates/akuma-kernel-amd64/src/fd.rs` buffers a created file in memory and writes it through at
 `close`. That close path is *deliberately* report-and-return-0 — its comment
 explains why (the data is already unreachable and Linux's errno slots are
 taken), and it exists because a silent loss here once surfaced as `apk`'s
@@ -2929,7 +2929,7 @@ through the pipe to the channel to the socket.
 
 Two candidates, and they are the two A2 items:
 
-- **Pipes.** `amd64/src/pipe.rs`'s `fire()` currently drops `Wake`s on the floor
+- **Pipes.** `crates/akuma-kernel-amd64/src/pipe.rs`'s `fire()` currently drops `Wake`s on the floor
   (A2 names this explicitly). A reader blocked on the child's stdout after the
   child exits gets no EOF wake, so `sshd` never learns the command finished.
 - **`wait4`.** It spins rather than blocking (A2 again), and the spin is what
@@ -3046,7 +3046,7 @@ when the far side goes away nor re-checks pending signals when it is woken,
 so a process in that wait is uninterruptible until reboot. It held no
 filesystem lock (a disk soak ran around it for the whole time), so it leaks a
 process and a channel, not the disk. Fix belongs in the `ProcessChannel`
-write path (`amd64/src/fd.rs` / the sshd session close): on channel close,
+write path (`crates/akuma-kernel-amd64/src/fd.rs` / the sshd session close): on channel close,
 wake every writer with `EPIPE`; and any sleep on the channel must be
 signal-interruptible so SIGKILL takes it out regardless.
 
@@ -3087,7 +3087,7 @@ Items 1-5 above are closed by their own notes. Checked against the ryzen metal
 Not work items — pinned seams. The end state is not zero platform differences;
 it is every difference either behind a named seam or written down as a pinned
 divergence. Difference-by-duplication (the third category, most of
-`amd64/src` today) is what this plan deletes.
+`crates/akuma-kernel-amd64/src` today) is what this plan deletes.
 
 | seam | AArch64 | x86_64 |
 |---|---|---|
@@ -3110,7 +3110,7 @@ divergence. Difference-by-duplication (the third category, most of
    **B3 followed this (2026-09-07)** and it paid twice: every divergence is
    named at the method that has it (the table in
    `AKUMA_AMD64_B3_ADDRESS_SPACE.md` §5), and pinning `PteProt::from_region`
-   against `amd64/src/paging.rs`'s six literals is what keeps the two x86
+   against `crates/akuma-kernel-amd64/src/paging.rs`'s six literals is what keeps the two x86
    walkers from drifting before C1 deletes one of them. It also found the
    sharper form of this caution: same type name, two `cfg` impls, **plus a glob
    re-export** is a silent per-architecture type substitution — see §3.
@@ -3329,7 +3329,7 @@ which the SNTP/DNS attempt to `1.1.1.1` makes it do. Transmit worked; receive
 did not.
 
 **Do not read "no ssh on .123" as a wedge.** `.123` is only ever the DHCP
-lease. `amd64/src/net.rs:393` sets `BARE_METAL_STATIC_V4 = 192.168.1.220`, and
+lease. `crates/akuma-kernel-amd64/src/net.rs:393` sets `BARE_METAL_STATIC_V4 = 192.168.1.220`, and
 `crates/akuma-net/src/smoltcp_net/init.rs:105` installs it **at bring-up,
 before DHCP runs**. With no RX there is no lease, so the box sits on `.220`
 for the whole boot while every tool in the loop knocks on `.123`. Probe both.
@@ -3496,7 +3496,7 @@ process instead of as CPU contention between four.
 
 Both were added 2026-09-18 for the `-j4` wedge, which is root-caused and fixed
 (`docs/archive/` — the KTG stale-tid exit stamp). They fire from the same
-30-second PSTATS block in `amd64/src/sched.rs` and what they cost now is
+30-second PSTATS block in `crates/akuma-kernel-amd64/src/sched.rs` and what they cost now is
 console.
 
 That cost is not cosmetic on this target. **The console is the debugger here**
@@ -3635,7 +3635,7 @@ of evidence and both are partly wrong; the corrections are marked inline there.
 
 ### The flag
 
-`amd64/src/net.rs:731` — `static PROBE_ON: AtomicBool = AtomicBool::new(false)`,
+`crates/akuma-kernel-amd64/src/net.rs:731` — `static PROBE_ON: AtomicBool = AtomicBool::new(false)`,
 set by the **`netprobe`** kernel command-line flag (`boot.rs:574`). The GRUB
 entry was:
 

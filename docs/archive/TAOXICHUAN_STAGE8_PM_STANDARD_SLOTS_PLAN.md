@@ -5,7 +5,7 @@
 Plan for the supervisor to execute session by session. Taoxichuan stops hand-rolling
 process slots, the spawn crossing and its scheduler scaffolding, and becomes a
 composition of `akuma-exec` / `akuma-threading` / `akuma-slot-table` / `akuma-fdtable`
-/ `akuma-pipes` / `akuma-syscalls-*` in the way `amd64/src/` is. Every claim names
+/ `akuma-pipes` / `akuma-syscalls-*` in the way `crates/akuma-kernel-amd64/src/` is. Every claim names
 file:line; `UNCHECKED` marks what this session did not read. Planning only — no
 kernel code changed here. Branch `rust-org-il-experiment`, push `litter` only.
 
@@ -29,11 +29,11 @@ thesis; S5/S6 are stage-8/9 enablers, not process-model items.
 |---|---|---|---|
 | 1 | Taoxichuan already consumes the crates for fork/fd/pipes/net/fs: it calls `akuma_exec::process::fork_process`, registers the four hook tables, and its syscall arms route into `akuma-fdtable`/`akuma-pipes`/`akuma-net`/`akuma-ext2` | HOLDS | `taoxichuan/src/child.rs:908` (`fork_process(child_pid, 0)`); `exec_twin.rs:262+` (`init` registering ExecRuntime/ExecConfig/ThreadRuntime/ThreadConfig/ProcessHooks/X86ArchHooks); `taoxichuan/docs/reference/syscalls.md` table (`decides` column names the crates) |
 | 2 | The kernel scheduling policy is `akuma-exec`/`akuma-threading` (fixed pool, `THREAD_STATES`, round-robin); **`crates/akuma-scheduler` is a discrete-event simulator, not kernel policy** — the brief's premise that it owns "the scheduling policy" is WRONG per the code; the code wins | WRONG (crate role) | `crates/akuma-scheduler/src/lib.rs:1-10` ("Discrete-event simulator for Akuma's scheduler placement policy… a model, not the kernel"); policy doc `docs/reference/subsystems/scheduler.md:13-32` (`THREAD_STATES` in `crates/akuma-exec/src/threading/mod.rs:292`; `akuma-threading` is where all scheduler `unsafe` lives, its `src/lib.rs:1-24`) |
-| 3 | amd64's init: `boot::late_init` → `exec_runtime::init()` (registers runtime, `reserve_pid_floor(2)`), then `usermode::run_init` loads the image, spawns the task slot, `register_exec_process(1, …)`, publishes | HOLDS | `amd64/src/boot.rs:128`; `amd64/src/exec_runtime.rs:614-641`; `amd64/src/usermode.rs:8845-8905` |
-| 4 | amd64 `sys_fork` is a thin fold over `akuma_exec::process::fork_process`; the three things shared code cannot name (CR3 root, SPAWN row, proc_slot) bind through `ExecRuntime::bind_child_task`; fork and clone share the crate call (clone passes `child_stack`) | HOLDS | `amd64/src/usermode.rs:5520-5575` (fork), `:5585` (clone w/ stack), the five-slice comment at `:5525-5540` |
+| 3 | amd64's init: `boot::late_init` → `exec_runtime::init()` (registers runtime, `reserve_pid_floor(2)`), then `usermode::run_init` loads the image, spawns the task slot, `register_exec_process(1, …)`, publishes | HOLDS | `crates/akuma-kernel-amd64/src/boot.rs:128`; `crates/akuma-kernel-amd64/src/exec_runtime.rs:614-641`; `crates/akuma-kernel-amd64/src/usermode.rs:8845-8905` |
+| 4 | amd64 `sys_fork` is a thin fold over `akuma_exec::process::fork_process`; the three things shared code cannot name (CR3 root, SPAWN row, proc_slot) bind through `ExecRuntime::bind_child_task`; fork and clone share the crate call (clone passes `child_stack`) | HOLDS | `crates/akuma-kernel-amd64/src/usermode.rs:5520-5575` (fork), `:5585` (clone w/ stack), the five-slice comment at `:5525-5540` |
 | 5 | Today taoxichuan fork/execve/wait4 only work inside the spawned shell: `fork_arm_real` answers `EPERM` for the boot task (`depth 0`), and "execve outside any task context" is a listed gap; that is why sshd needs private `SPAWN` | HOLDS | `taoxichuan/src/child.rs:868-886` (depth gate); `taoxichuan/docs/reference/syscalls.md` § "Known deliberate gaps" (execve outside task context) and rows 56/57/61 |
 | 6 | `libakuma`'s `linux-abi` feature exists and is exactly fork+pipe2+dup3+execve (`spawn_full`) and `wait4(WNOHANG)` (`waitpid_status`); **but no build in the tree enables it today** (grep over `*.sh`/`*.toml`: only libakuma's own definition) — S3 makes taoxichuan its first consumer | HOLDS (feature exists; adoption UNCHECKED for runtime behaviour) | `userspace/libakuma/src/lib.rs:2195-2260` (`#[cfg(feature = "linux-abi")] fn spawn_full` = pipe, fork, dup3, close×2, execve), `:2493-2513` (`waitpid_status` = `wait4(WNOHANG)`), `Cargo.toml:19` (`linux-abi = []`); repo-wide grep for `linux-abi` outside `userspace/libakuma/`: no hits |
-| 7 | amd64's dispatcher is two disjoint tables: a legacy `match nr` for x86-only numbers (its `X86_ONLY` list includes 82,83,84,87,88,89,90,92,94), each translating to a `Syscall::*` and routing into `akuma-syscalls-glue` (e.g. `83 => to_glue(Syscall::Mkdirat, [AT_FDCWD, …])`), plus the `Syscall` table; a boot smoke test asserts no number is in both. This is the shape to adopt — the numbers come **through** `akuma-syscalls-abi`, not from new taoxichuan arms | HOLDS | `amd64/src/usermode.rs:1511`, `:1658-1693`, the `X86_ONLY` table + `dispatch_smoke_test` at `:7506-7530` |
+| 7 | amd64's dispatcher is two disjoint tables: a legacy `match nr` for x86-only numbers (its `X86_ONLY` list includes 82,83,84,87,88,89,90,92,94), each translating to a `Syscall::*` and routing into `akuma-syscalls-glue` (e.g. `83 => to_glue(Syscall::Mkdirat, [AT_FDCWD, …])`), plus the `Syscall` table; a boot smoke test asserts no number is in both. This is the shape to adopt — the numbers come **through** `akuma-syscalls-abi`, not from new taoxichuan arms | HOLDS | `crates/akuma-kernel-amd64/src/usermode.rs:1511`, `:1658-1693`, the `X86_ONLY` table + `dispatch_smoke_test` at `:7506-7530` |
 | 8 | The lost-wakeup class disappears with the M2 crossing: a design where the parent's wait is a registered thread park and the child is an ordinary published slot has no suspended parent frame (`CrossSave`/`EXEC_SAVE`) to lose; the pool cannot pick a slot left `INITIALIZING`, which is exactly the state an M2 SPAWN child's slot stays in | HOLDS (by design; verified only by gate at S3) | pl stall facts (`/root/dev-cycle/taoxichuan-s7/RESULT-pl.md`: last rung `EXE loaded`, nothing parked, child runs, crossing never resumes); pool gate `docs/reference/subsystems/scheduler.md:28-32` ("INITIALIZING exists so the scheduler cannot pick a slot whose context is half-built"); `taoxichuan/docs/reference/processes.md` § SPAWN crossing |
 | 9 | Current gates state on the merge tree: F1, PK1, PK2 (ALL PASS), P1–P5 green; stages 6/7 (apk, curl HTTPS) green; the apk-spawn stall is the only open defect and needs the box's KVM timing (10/10 clean under supervisor's QEMU TCG) | HOLDS | `RESULT-pj.md` premise rows 2–3; `taoxichuan/docs/README.md` § Status; brief 09m ("10 of 10 boots clean") |
 
@@ -48,12 +48,12 @@ are function-start line numbers from that pass. `wc -l`: child.rs 1,936; exec_tw
 | piece | lines (spans) | owner today | the crate/file that replaces it | gap |
 |---|---|---|---|---|
 | SpawnSlot ring + `CrossSave` + `SlotStacks` + `SlotCross` types and accessors (`cross_mut`/`save_ptr`/`slots`/`nested_active`) | ≈225 (40–265) | private | `akuma-slot-table` (the lock-free per-slot store under `akuma-exec`'s process table, `crates/akuma-slot-table/src/lib.rs:1-45`) + `akuma-exec` `Process` rows + `akuma-threading` pool states | the ring conflates three things the crates split: thread slot (pool), pid↔process (process table), crossing save area (dies with M2). `PARENT_OF`'s slot-reuse lesson (pj-4: slots reused across pids 16..19) is why the crate keys parent links by pid |
-| spawn-args marshaling (`child_write`, `read_ptr_array`, `read_user_string`, `read_spawn_args`) | ≈155 (289–443) | private | keep, but shared: amd64 does argv/envp copy in the loader/`Image::from_elf_argv` path with `akuma_exec::process::user_access` helpers (`amd64/src/exec_runtime.rs` doc lines 12–16) | taoxichuan keeps its `copy_from_user`/`copy_to_user` physmap pair (`main.rs:843/868`); the SPAWN-only parts die with M2, the argv/envp readers are reused by exec |
+| spawn-args marshaling (`child_write`, `read_ptr_array`, `read_user_string`, `read_spawn_args`) | ≈155 (289–443) | private | keep, but shared: amd64 does argv/envp copy in the loader/`Image::from_elf_argv` path with `akuma_exec::process::user_access` helpers (`crates/akuma-kernel-amd64/src/exec_runtime.rs` doc lines 12–16) | taoxichuan keeps its `copy_from_user`/`copy_to_user` physmap pair (`main.rs:843/868`); the SPAWN-only parts die with M2, the argv/envp readers are reused by exec |
 | M2 SPAWN crossing (`spawn_arm`, `exec_replace`, `exec_return`, `child_enter`, `child_exit`, `exit_cross`) | ≈535 (919–1129, 1129–1254, 1254–1298, 1298–1351, 1351–1404, 1404–1454) | private | **deleted**: sshd → `libakuma::linux-abi` spawn (fork+execve, premise 6); the nested-child syscall band ("lower half of the parent's band", processes.md) and `CrossSave` naked-function contract die with it | none — this is the private machinery the thesis excludes. Rollback: keep arms behind a const until the sshd gate passes |
 | real fork (`bind_child_task`, `capture_user_context`, `fork_arm_real`, `register_shell_process`) | ≈255 (443–525, 746–789, 868–919, 789–868) | private glue over the crate | amd64's equivalents: `bind_child_task` hook stays (binds CR3/slot/proc_slot — `usermode.rs:5541-5546`); `capture_user_context` stays (arch); `register_shell_process` is replaced by init registration (S1); `NEXT_PID` static → the crate's pid allocation (amd64 `alloc_pid`, `usermode.rs:5557`) | depth gate (1..3, `child.rs:880-886`) is a ring artifact — real slots have no depth; the gate dies when every task is a slot |
 | sched glue (`sched_kstack_top`, `sched_task_slot_of`, `sched_root_of`, `is_real_task`, `task_exit_real`, `slot_fs_of`, `set_slot_fs`, `stamp_child_parent`, `parent_of`) | ≈120 (525–664) | private | `switch_to`'s five effects stay (`exec_twin.rs:113-166`); `task_exit_real` → the crate's exit path + child-channel wake (amd64 slice-3 shape, `usermode.rs:5531-5534`); `PARENT_OF` map → `Process::parent_pid` as the only link (amd64 `sys_waitpid` comment, `usermode.rs:6165-6172`) | fs shadow (per-slot `IA32_FS_BASE`) is a real one-core need — keep; amd64 carries fs in `UserCtx`/per-CPU instead |
 | wait family (`wait4_arm`, `wait4_real`, `wait4_arm_blocking_scan`, `waitpid_arm`, `close_stdin_arm`, `read_child_out`) | ≈200 (1652–1855) | private scans over the ring | amd64's `sys_waitpid` shape: `akuma_exec::process::find_process` + `is_child_of` + `exited` + park on the child channel (`usermode.rs:6153-6195+`); `WAITPID`/`CLOSE_CHILD_STDIN` deleted with SPAWN | "wait4 is parent-owned" rules (ECHILD for strangers, never park on them) are already the crate's `is_child_of_group` decision (pj pulled it); what remains private is only the scan plumbing |
-| arch hooks/helpers (`sleep_us`, `leak_stacks`, `prepare_task_slot`, `write_user_context`, `read_user_context`) | ≈80 (1855–1936) | private, but they ARE the `X86ArchHooks` arms | keep (amd64 analogs: `amd64/src/sched.rs:2143` `prepare_task_slot`, `:1694`/`:1738` write/read_user_context) | leaked 64 KiB kernel + 32 KiB trap stacks are the twin of amd64's `Stacks` (`sched.rs:327-355`); keep |
+| arch hooks/helpers (`sleep_us`, `leak_stacks`, `prepare_task_slot`, `write_user_context`, `read_user_context`) | ≈80 (1855–1936) | private, but they ARE the `X86ArchHooks` arms | keep (amd64 analogs: `crates/akuma-kernel-amd64/src/sched.rs:2143` `prepare_task_slot`, `:1694`/`:1738` write/read_user_context) | leaked 64 KiB kernel + 32 KiB trap stacks are the twin of amd64's `Stacks` (`sched.rs:327-355`); keep |
 
 Sum of groups ≈ 1,570 L; the rest of the file is constructors/consts/comments.
 **Deletion target after S3+S4: ≈ 1,050–1,200 L** (crossing 535 + ring types ~200 +
@@ -64,7 +64,7 @@ of hooks, capture, and fs shadow.
 
 | piece | lines | owner today | replaces it | gap |
 |---|---|---|---|---|
-| `current_slot`/`set_current_slot`/`shell_tid`/`uptime_us`/`switch_to` | ≈110 (55–166) | twin (kernel glue) | none — this is the amd64 `hook_switch_to`+per-CPU block equivalent (`amd64/src/sched.rs:401-497`) | `switch_to` lacks amd64's FPU save (`FxArea`, `sched.rs:116-278`) — see R6 |
+| `current_slot`/`set_current_slot`/`shell_tid`/`uptime_us`/`switch_to` | ≈110 (55–166) | twin (kernel glue) | none — this is the amd64 `hook_switch_to`+per-CPU block equivalent (`crates/akuma-kernel-amd64/src/sched.rs:401-497`) | `switch_to` lacks amd64's FPU save (`FxArea`, `sched.rs:116-278`) — see R6 |
 | `idle_main`/`seed_idle`/`tick_window`/`allow_tick`/`init`/`idle_slot`/`can_run`/`transfer_lock_depth` | ≈160 (185–318) | twin | amd64 `idle_loop` (`sched.rs:1387+`) + `register_hooks` (`sched.rs:790`) | after S1, `can_run`/tick gates must cover the now-slotted init; `idle_main` gains the retired-reclaim drain amd64 has (`sched.rs:1418-1421`) |
 | the four config constructors (`thread_runtime`/`thread_config`/`process_hooks`/`exec_runtime`/`exec_config`) | ≈200 (319–486, 564–599) | twin | none — this IS the amd64 `exec_runtime.rs::runtime()/config()` analog | `ProcessHooks.pid_for_thread` reads the SpawnSlot ring today; re-point at the crate process table in S2 |
 | `twin_fork_share_memory`/`twin_bind_child_task`/`twin_enter_user` | ≈77 (487–563) | twin hooks | same roles as amd64's `fork_share_memory`/`bind_child_task`/`enter_ring3` | `twin_bind_child_task` calls `child::bind_child_task` — the one place the ring leaks into the hooks; re-point in S2 |
@@ -73,9 +73,9 @@ of hooks, capture, and fs shadow.
 
 | piece | lines | owner today | replaces it | gap |
 |---|---|---|---|---|
-| `Task` record + `task()`/`task_slots`/`set_task_slot` | ≈90 (721–810) | private (16 fixed tasks; fd table + root + brk each) | `akuma-exec` `Process` (brk, signal table, parent) + `akuma-fdtable` per process; amd64 has no Task record — fd effects live in `amd64/src/fd.rs` over `akuma-fdtable` | keep short-term: it is the fd-effects owner the arms need; fold into Process-fields slice-by-slice (not this switch's critical path) |
+| `Task` record + `task()`/`task_slots`/`set_task_slot` | ≈90 (721–810) | private (16 fixed tasks; fd table + root + brk each) | `akuma-exec` `Process` (brk, signal table, parent) + `akuma-fdtable` per process; amd64 has no Task record — fd effects live in `crates/akuma-kernel-amd64/src/fd.rs` over `akuma-fdtable` | keep short-term: it is the fd-effects owner the arms need; fold into Process-fields slice-by-slice (not this switch's critical path) |
 | `clone_user_half`/`clone_user_tree`/`fork_share_memory` | ≈115 (3251–3367) | private effect hook | stays as the `ExecRuntime::fork_share_memory` arm (amd64's is also target-local, `usermode.rs` fork hook); `akuma-cow` exists for a later CoW slice | eager copy is the honest answer today (gaps.md) |
-| `load_task` (ELF load + stack build) | ≈240 (3367–3608) | private | `akuma-elf-exec` owns the pure exec decisions (PT_INTERP rule etc., `crates/akuma-elf-exec/src/lib.rs:1-12` — it names taoxichuan's loader as one of the three it exists to unify); amd64 wraps them in `amd64/src/loader.rs` (713 L) | S5. Note the crate doc says taoxichuan maps through `akuma-ring3-amd64` — verify which parts of `load_task` are already crate calls before rewriting (UNCHECKED line-by-line) |
+| `load_task` (ELF load + stack build) | ≈240 (3367–3608) | private | `akuma-elf-exec` owns the pure exec decisions (PT_INTERP rule etc., `crates/akuma-elf-exec/src/lib.rs:1-12` — it names taoxichuan's loader as one of the three it exists to unify); amd64 wraps them in `crates/akuma-kernel-amd64/src/loader.rs` (713 L) | S5. Note the crate doc says taoxichuan maps through `akuma-ring3-amd64` — verify which parts of `load_task` are already crate calls before rewriting (UNCHECKED line-by-line) |
 | boot program list (`Prog`, `parse_programs`, `run_program`, `task_done`, `spawn`) | ≈280 (3044–3251, 3608–3668) | private init-by-list | S4: init registered as pid 1, each Prog a fork+exec child, waited with the crate wait | the boot task's NO_SLOT ring-3 residency is what the tick's slotted-current gate protects (`scheduling.md` § two gates) — S4 removes the resident |
 | `dispatch_inner` | ≈1,400 (1647–3044), ~175 match arms | arms per `syscalls.md` table (~90 rows; ~45 rows already name a crate as decider) | S6: legacy numbers route through `akuma-syscalls-abi` → `akuma-syscalls-glue` (amd64 two-table shape, premise 7); private rows that die with M2: SPAWN 0x1301, WAITPID 0x1303, CLOSE_CHILD_STDIN 0x1326, the M2 clone arm | the arm count barely shrinks — the *deciders* move; count of arms that become pure calls into `akuma-syscalls-*` families: ≈30 of the fs/stat/dirent/time/uts/poll rows are glue-adoptable when a stage needs them; fd/net rows already are crate calls with local marshaling |
 
@@ -86,13 +86,13 @@ of hooks, capture, and fs shadow.
 `akuma-pipes` (semantics already crate-owned); `clone_ref`/`release*` (247–290)
 are the fd refcount effects. No private scheduling lives here; only `park_once`
 re-points when the M2 pipe-park (PIPEPARK site) moves onto the threading park.
-amd64 analog: `amd64/src/pipe.rs` (369 L, same shape).
+amd64 analog: `crates/akuma-kernel-amd64/src/pipe.rs` (369 L, same shape).
 
 ## 2. How amd64 does it, concretely
 
 ### 2.1 One `fork` + `execve` + `wait4`
 
-- **fork** — `amd64/src/usermode.rs:5520` `sys_fork`: `alloc_pid()` →
+- **fork** — `crates/akuma-kernel-amd64/src/usermode.rs:5520` `sys_fork`: `alloc_pid()` →
   `akuma_exec::process::fork_process(child_pid, 0)` (`:5563`). The crate does the
   whole fold (its five slices are listed in the comment `:5525-5540`): child address
   space through the `ExecRuntime::fork_share_memory` hook, fd table through
@@ -104,7 +104,7 @@ amd64 analog: `amd64/src/pipe.rs` (369 L, same shape).
   proc_slot. Child exit path: the crate's `ProcessChannel`/`CHILD_CHANNELS` slice
   (slice 3) is where a waiter registers.
 - **execve** — `usermode.rs:5112` `sys_execve`: resolve symlinks + read image head
-  (`fs.rs`), `Image::from_elf_argv` (`amd64/src/loader.rs`; `akuma-elf` +
+  (`fs.rs`), `Image::from_elf_argv` (`crates/akuma-kernel-amd64/src/loader.rs`; `akuma-elf` +
   `akuma-elf-exec` decisions), then the process/image swap inside `akuma-exec`, and
   the `enter_user` hook (`usermode::enter_ring3`) owns the return-to-ring-3 loop and
   teardown (`exec_runtime.rs` doc, `runtime()` field table). The new image starts
@@ -120,9 +120,9 @@ amd64 analog: `amd64/src/pipe.rs` (369 L, same shape).
   `sched::wake` (`:1200`); amd64 additionally arms `install_untimed_park_backstop`
   (`:1082`) — the lost-wakeup insurance whose absence pl found in taoxichuan's
   crossing.
-- **preemption** — `amd64/src/lapic.rs:88` `on_tick` does two atomics +
+- **preemption** — `crates/akuma-kernel-amd64/src/lapic.rs:88` `on_tick` does two atomics +
   `sched::set_need_resched`; the timer return path calls
-  `sched::preempt_if_needed(from_user)` (`amd64/src/idt.rs:1382` → `sched.rs:944`):
+  `sched::preempt_if_needed(from_user)` (`crates/akuma-kernel-amd64/src/idt.rs:1382` → `sched.rs:944`):
   BKL enter, `yield_now` (`sched.rs:2539`), BKL leave. The switch itself is
   `hook_switch_to` (`sched.rs:439`): CR3, fxsave/fxrstor order, syscall stack,
   trap stack.
@@ -132,7 +132,7 @@ amd64 analog: `amd64/src/pipe.rs` (369 L, same shape).
 
 ### 2.2 One SSH session start
 
-1. Boot: `amd64/src/main.rs:209` `kmain` → `boot::early_init` (GDT, per-CPU/BKL,
+1. Boot: `crates/akuma-kernel-amd64/src/main.rs:209` `kmain` → `boot::early_init` (GDT, per-CPU/BKL,
    IDT, SMAP, `sched::init` — `boot.rs:94-100`) → `boot::late_init` calls
    `exec_runtime::init()` (`boot.rs:128`) which registers `ExecRuntime`+`ExecConfig`
    and `reserve_pid_floor(2)` so the first allocated pid is 2 — **pid 1 belongs to
@@ -154,7 +154,7 @@ amd64 analog: `amd64/src/pipe.rs` (369 L, same shape).
 **Nothing blocks the switch.** The pieces taoxichuan lacks are of two kinds:
 (a) already crate-side (`fork_process`, the process table over `akuma-slot-table`,
 `is_child_of_group`, exit channels, `akuma-elf-exec` decisions) — pull, don't
-extract; (b) target glue that amd64 also keeps in `amd64/src/` (`run_init`
+extract; (b) target glue that amd64 also keeps in `crates/akuma-kernel-amd64/src/` (`run_init`
 registration ≈80 L, `spawn_process_task`, `publish_task`, `hook_switch_to`,
 `FxArea`) — write taoxichuan's own ≈150 L in `exec_twin.rs`/`child.rs`/`main.rs`,
 mirroring aarch64's `akuma_kernel_glue::build_exec_runtime` precedent
@@ -349,7 +349,7 @@ each row names where it is recorded.
 |---|---|---|---|
 | R1 | **Stale thread slot on bind** — a bind that seeds only one of proc_slot/thread_slot lets `enter_ring3` read the previous occupant's slot and walk into thread-exit teardown for a process that never ran (triple fault) | `docs/archive/BUG_FIX_LIST.md:2343` | code read at S1: taoxichuan's `bind_child_task` (`child.rs:443`) must stamp both; assert in the hook |
 | R2 | **Stale trap frame across a preempting switch** — a tick that switches must leave the interrupted frame on the interrupted task's own stack, or the next ring-3 trap lands on a foreign stack | `taoxichuan/docs/reference/scheduling.md` § two gates (`arm_trap_stack`); `docs/archive/CONTEXT_SWITCH_BUGS.md:49,97` (IRQs stay masked through the switch) | already paid for in slice 3; S2's new park must use the same `x86_yield` path — code read + the PK battery |
-| R3 | **Switch while IRQs masked / stale CR3** — switching onto a dead fork-child's CR3 (exec-swept, zero pages) kills the resumed task; single-core reload discipline: CR3 per switch, 0 = leave for idle | `docs/archive/TAOXICHUAN_M4_SLICE3_PE_RESULT.md:161`; `taoxichuan/docs/reference/scheduling.md` § switch_to | S2: the exit path must tear the slot down before the slot number is reusable (pool `TERMINATED → FREE` cooldown is the crate's job — verify `x86_reaps` runs, amd64 needed a reaper for exactly this, `amd64/src/sched.rs:1421-1426`) |
+| R3 | **Switch while IRQs masked / stale CR3** — switching onto a dead fork-child's CR3 (exec-swept, zero pages) kills the resumed task; single-core reload discipline: CR3 per switch, 0 = leave for idle | `docs/archive/TAOXICHUAN_M4_SLICE3_PE_RESULT.md:161`; `taoxichuan/docs/reference/scheduling.md` § switch_to | S2: the exit path must tear the slot down before the slot number is reusable (pool `TERMINATED → FREE` cooldown is the crate's job — verify `x86_reaps` runs, amd64 needed a reaper for exactly this, `crates/akuma-kernel-amd64/src/sched.rs:1421-1426`) |
 | R4 | **fd-table refcounts on fork** — the first post-fork close destroyed a pipe under two live fds until the counted-`clone_ref` walk existed; the pipeline deadlock family came from this | `taoxichuan/docs/reference/processes.md` § real fork; `docs/archive/TAOXICHUAN_M4_SLICE3_PH_RESULT.md` | already crate-owned (`akuma-fdtable` fork_copy + `pipes.rs:247` clone_ref); S3's clone reroute must keep taking the counted refs — P1–P5 are the gate |
 | R5 | **TLS/fs base on exec** — a depth-2 exec entered the new image with the outgoing task's TLS pointer; `fs:0x28` stack-guard read hit unmapped bss (PK2) | `taoxichuan/docs/reference/processes.md` § fs discipline; `RESULT-pj.md` pi findings | keep the exec-zeroes-fs rule verbatim through S3/S5; gate: PK2 |
 | R6 | **FPU/SSE state is not saved across switches** (amd64 `FxArea` fxsave/fxrstor, `sched.rs:116-278`; taoxichuan `switch_to` has no FPU arm) — if ring 3 uses SSE today, preemption can corrupt FPU users; today's gates passing suggests either no FPU use or laziness UNCHECKED | gap, not yet recorded | one host-free probe: read `fault_trap` (`main.rs:262`) for a `#NM` arm + check CR0.TS at boot (one boot); if ring 3 touches SSE, an FxArea slice must precede S5 (stage 9 rustc needs it regardless). Not a blocker for S0–S4 on current evidence |
@@ -387,7 +387,7 @@ carried there); `docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md`,
 `docs/reference/subsystems/scheduler.md` (§ threading model, slot state machine),
 `scripts/check_unsafe_budget.py` (sites-not-lines; new crates start at budget 0);
 `userspace/sshd/Cargo.toml`, `userspace/libakuma/src/lib.rs` (`linux-abi`,
-`spawn_full`, `waitpid_status`, `spawn_pty`); `amd64/src/`: `exec_runtime.rs`
+`spawn_full`, `waitpid_status`, `spawn_pty`); `crates/akuma-kernel-amd64/src/`: `exec_runtime.rs`
 (all), `usermode.rs` windows (`sys_fork`, `sys_execve`, `sys_waitpid`,
 `AKUMA_PRIVATE_BASE`, `run_init`, `X86_ONLY`), `sched.rs` windows
 (`preempt_if_needed`, `idle_loop`, hook table), `lapic.rs::on_tick`, `boot.rs`

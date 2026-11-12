@@ -9,7 +9,7 @@
 
 ## 1. What it was
 
-Four defects in `amd64/src/fd.rs`, which said so itself in five places —
+Four defects in `crates/akuma-kernel-amd64/src/fd.rs`, which said so itself in five places —
 "**no process on this target has one**":
 
 | symptom | mechanism |
@@ -35,7 +35,7 @@ reads a console input device at all — there is no UART reader anywhere in
 console **is** an input device, polled destructively through `input::getb`, and
 until now it was polled from inside the reading thread itself.
 
-So the piece is `amd64/src/console.rs` (303 lines): one `ProcessChannel`, one
+So the piece is `crates/akuma-kernel-amd64/src/console.rs` (303 lines): one `ProcessChannel`, one
 `TerminalState`, and a **pump** — the console's answer to `sshd`'s
 `bridge_process`, one daemon carrying both directions.
 

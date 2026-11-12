@@ -1071,7 +1071,7 @@ fn populate_file_page_by_inode(
 ///
 /// # Why this target had no hook, and what that cost (4b batch 3a)
 ///
-/// `amd64/src/uaccess.rs`'s header said, correctly when it was written: *"There
+/// `crates/akuma-kernel-amd64/src/uaccess.rs`'s header said, correctly when it was written: *"There
 /// is no 'is it mapped' walk here and no prefault: this target has no lazy user
 /// regions yet, so the copy either succeeds or faults, and the fault is
 /// recovered. When lazy regions arrive, the walk goes here."* Lazy regions

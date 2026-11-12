@@ -61,7 +61,7 @@ which is a *living* document — re-measure and rewrite it in place rather than
 appending a new snapshot.
 
 The report also splits the tree by PLATFORM. The repo is two kernels — the
-AArch64 bin (``src/``) and the amd64 bin (``amd64/``) — over one shared crate
+AArch64 bin (``src/``) and the amd64 machine half (``crates/akuma-kernel-amd64``) — over one shared crate
 pool. Which pool a crate belongs to is derived from the
 ``#[cfg(target_arch = ...)]`` attributes the lexer already parsed, never from a
 hand-kept table: a crate naming exactly one arch is arch-only, anything else is
@@ -71,7 +71,7 @@ the gap between them is the duplication the shared-crate extraction has not yet
 absorbed.
 
 Usage:
-    scripts/cloc_akuma.py                      # defaults to src/ crates/ amd64/src/ taoxichuan/src/
+    scripts/cloc_akuma.py                      # defaults to src/ crates/ crates/akuma-kernel-amd64/src/ taoxichuan/src/
     scripts/cloc_akuma.py src crates --by-file
     scripts/cloc_akuma.py --json
     scripts/cloc_akuma.py --all-languages      # also C, asm, shell, TOML, Markdown, ...
@@ -1320,7 +1320,7 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
         print(f"{'unsafe sites by scope':<26}{'total':>11}{'production':>12}{'test':>8}")
         print(rule(W))
         # One row per root that was actually counted. `bins` used to be reported as
-        # a single "src/", which silently folded `amd64/src` into the AArch64
+        # a single "src/", which silently folded `crates/akuma-kernel-amd64/src` into the AArch64
         # kernel's number; the two kernels are different programs and the
         # port's `unsafe` is the one being driven down.
         def root_of(comp: str) -> str:
@@ -1408,7 +1408,7 @@ def cargo_tree(pkg: str, triple: str, features: str = "", default: bool = True):
 #: manifest -> (cargo package, target triple) for the kernels `linked_crates` can ask cargo about.
 KERNEL_PACKAGES = {
     "Cargo.toml": ("akuma", "aarch64-unknown-none"),
-    os.path.join("amd64", "Cargo.toml"): ("akuma", "x86_64-unknown-none"),
+    os.path.join("crates", "akuma-kernel-amd64", "Cargo.toml"): ("akuma", "x86_64-unknown-none"),
     os.path.join("taoxichuan", "Cargo.toml"): ("taoxichuan", "x86_64-unknown-none"),
 }
 
@@ -1449,7 +1449,7 @@ def platform_buckets(files: list) -> dict:
     """Group every component into a platform bucket, derived from the source.
 
     The tree is two kernels over one shared crate pool: `src/` is the AArch64
-    bin (root `Cargo.toml`), `amd64/` is the second bin, `crates/` serve
+    bin (root `Cargo.toml`), `crates/akuma-kernel-amd64` is the amd64 machine half, `crates/` serve
     whichever kernels link them. Which kernel links a crate is read from the
     Cargo dependency graph (path dependencies, transitively):
 
@@ -1471,14 +1471,16 @@ def platform_buckets(files: list) -> dict:
         comp_arches.setdefault(component_of(fc.path), set()).update(fc.arches)
 
     a64 = linked_crates("Cargo.toml")
-    x64 = linked_crates(os.path.join("amd64", "Cargo.toml"))
+    x64 = linked_crates(os.path.join("crates", "akuma-kernel-amd64", "Cargo.toml"))
     have_graph = bool(a64 or x64)
 
     buckets: dict = {}
     for comp, arches in comp_arches.items():
         if comp == "src" or comp.startswith("src" + os.sep):
             buckets.setdefault("aarch64 bin", []).append(comp)
-        elif comp == "amd64" or comp.startswith("amd64" + os.sep):
+        # The machine half moved from `amd64/` to `crates/akuma-kernel-amd64` (2026-11-12);
+        # it stays in this bucket so reports compare across the move.
+        elif comp == os.path.join("crates", "akuma-kernel-amd64"):
             buckets.setdefault("amd64 bin", []).append(comp)
         elif comp == "taoxichuan" or comp.startswith("taoxichuan" + os.sep):
             buckets.setdefault("taoxichuan bin", []).append(comp)
@@ -1589,7 +1591,7 @@ def print_platform_report(files: list, W: int) -> None:
 #: --filter-platform` resolves target-specific dependencies against.
 EXTERNAL_KERNELS = {
     "aarch64": ("Cargo.toml", "aarch64-unknown-none"),
-    "amd64": (os.path.join("amd64", "Cargo.toml"), "x86_64-unknown-none"),
+    "amd64": (os.path.join("crates", "akuma-kernel-amd64", "Cargo.toml"), "x86_64-unknown-none"),
     "taoxichuan": (os.path.join("taoxichuan", "Cargo.toml"), "x86_64-unknown-none"),
 }
 
@@ -1695,7 +1697,7 @@ AUDIT_KERNELS = {
                          "x86_64-unknown-none", "no-tests", True),
     "taoxichuan-aarch64": (os.path.join("taoxichuan", "Cargo.toml"), "taoxichuan",
                            "aarch64-unknown-none", "no-tests", True),
-    "akuma-amd64": (os.path.join("amd64", "Cargo.toml"), "akuma",
+    "akuma-amd64": (os.path.join("crates", "akuma-kernel-amd64", "Cargo.toml"), "akuma",
                     "x86_64-unknown-none", "no-tests", True),
     "akuma-aarch64": ("Cargo.toml", "akuma", "aarch64-unknown-none", "no-tests", True),
 }
@@ -2770,15 +2772,14 @@ def emit_json(files: list, paths: list) -> None:
     )
 
 
-# `amd64/src`, not `amd64`: the bin's directory also holds `mkdisk.sh`, `Cargo.toml`,
-# a README and linker/boot scaffolding, which this counter would report as code.
-# The platform split keys on the `amd64/` prefix, so the narrower root changes nothing there.
-DEFAULT_PATHS = ["src", "crates", os.path.join("amd64", "src"), os.path.join("taoxichuan", "src")]
+# The amd64 machine half is `crates/akuma-kernel-amd64` (it was `amd64/` until 2026-11-12, when
+# this list named `amd64/src` to skip the scripts beside it), so `crates` covers it.
+DEFAULT_PATHS = ["src", "crates", os.path.join("taoxichuan", "src")]
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("paths", nargs="*", default=DEFAULT_PATHS, help="files/dirs (default: src crates amd64/src taoxichuan/src)")
+    ap.add_argument("paths", nargs="*", default=DEFAULT_PATHS, help="files/dirs (default: src crates taoxichuan/src)")
     ap.add_argument("--by-file", action="store_true", help="per-file table")
     ap.add_argument("--top", type=int, default=15, help="show N largest files (0 = off)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")

@@ -7,7 +7,7 @@
 //! rather than in each driver means a new NIC gets correct numbers for free.
 //! `/proc/net/dev` used to print literal zeros, so `ifconfig` could not tell a
 //! NIC moving nothing from one moving thousands of frames a second
-//! (`amd64/src/net.rs`, `netpoll_daemon`'s doc).
+//! (`crates/akuma-kernel-amd64/src/net.rs`, `netpoll_daemon`'s doc).
 //!
 //! Eight relaxed adds' worth of state, no allocation. `tx` counts frames
 //! *handed to the device*; a refusal further down shows up as `tx_drop`

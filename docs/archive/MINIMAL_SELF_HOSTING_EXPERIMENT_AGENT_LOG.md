@@ -153,7 +153,7 @@ whole-docs trace the user asked for (every mention, one table).
   (see below). Firecracker/Lima host-track setup in progress.
 
 - 2026-10-24 *(Sonnet)*: handover. State found: goose-glm is 25+ min into the
-  stage-1 turn, reading only (surveying `amd64/src` vs the crate tree), box on
+  stage-1 turn, reading only (surveying `crates/akuma-kernel-amd64/src` vs the crate tree), box on
   `taoxichuan-s1` @ 96b3585c, no commits, no `RESULT.md`. Kimi's host-track
   claims (aarch64 stage 1 PASS under Firecracker, an `init-script` stage-2 prep
   in `akuma-config` / `akuma-kernel-glue`, `taoxichuan-fc.bin`) are **not in the
@@ -987,7 +987,7 @@ with no `RESULT-B.md`.
 ### Supervisor lapse — the composition rule was dropped from the briefs for stages 6-7 (found 2026-10-25, user's question)
 
 **What happened.** The experiment's pinned composition rule (`MINIMAL_SELF_HOSTING_EXPERIMENT.md` § Process: pull as few crates as possible;
-extract into a crate first where the logic still lives in `amd64/src/`; the goal is a *composition root*, not a new kernel) was carried by
+extract into a crate first where the logic still lives in `crates/akuma-kernel-amd64/src/`; the goal is a *composition root*, not a new kernel) was carried by
 the briefs for stages 1-4 and silently left out of 06a, 06b, 06c, 07, 07b and 07c-draft. The supervisor (Sonnet) wrote each brief from
 the previous session's result and never re-read the doc's pinned sections. The user noticed from the size of the kernel source.
 
@@ -1001,7 +1001,7 @@ During the stage 7C planning session goose also noted that `taoxichuan/src/net.r
 (`akuma-port` owns port I/O).
 
 **Fix, and what was learned.**
-- `scripts/kvm/goose/BRIEF_TEMPLATE.md` now has a mandatory "Composition rule" section (look in `crates/` and `amd64/src/` first, depend or
+- `scripts/kvm/goose/BRIEF_TEMPLATE.md` now has a mandatory "Composition rule" section (look in `crates/` and `crates/akuma-kernel-amd64/src/` first, depend or
   extract, report *pulled / extracted / written new* and `wc -l taoxichuan/src/*.rs` before and after), and the protocol in the experiment doc
   lists it as rule 5.
 - Stage 7C was converted into a **planning-only** session (`taoxichuan-07c-trim-plan.md`): inventory every arm against the existing crates, find
@@ -1020,7 +1020,7 @@ existing crates and cutting them (seams or features) down to the requirement, no
 (`akuma-exec-core`, `akuma-sntp` cut out of `akuma-syscalls-time` "so this target could reach it without also needing that crate's `akuma-exec` dependency",
 `akuma-pipe`, `akuma-fdtable`, `akuma-syscalls-{poll,mem,net,sync}`), and it is why the amd64 kernel exists at all, so feasibility is not in question.
 
-**What the evidence shows we were doing instead.** `taoxichuan/Cargo.toml` has 17 `akuma-*` dependencies; `amd64/Cargo.toml` has about 70. The crates amd64 uses and
+**What the evidence shows we were doing instead.** `taoxichuan/Cargo.toml` has 17 `akuma-*` dependencies; `crates/akuma-kernel-amd64/Cargo.toml` has about 70. The crates amd64 uses and
 Taoxichuan does not include exactly what the rest of stage 6 needs: `akuma-sntp` and `akuma-cmos-rtc` (clock), `akuma-syscalls-poll` (the `select`/`ppoll` apk waits on),
 `akuma-syscalls-mem`, `akuma-syscalls-net`, `akuma-syscalls-{linux,abi}` (wire structs), `akuma-pipe`, `akuma-exec-core`, `akuma-port`, `akuma-tty`. The stage-7 trim
 plan (session C) checked 11 crates and classed anything welded to `Process`/`akuma-exec` as "keep (no callable twin)"; it never considered cutting the weld, because the
@@ -1132,7 +1132,7 @@ Five families, one commit each (stat+statfs, getdents64, uname, time structs, `n
 - **Cuts:** `nr_name` 95 -> 21 lines (the ABI crate's `Syscall::from_x86_64`; names are now CamelCase, console-only), getdents -13, uname -7, time -3; the stat family went up by about 22 lines of documentation
   but lost the literal offset table. One local 5-line `struct_bytes()` helper was extracted once four wire structs went through it.
 - **Supervisor-visible lapse (goose):** one commit (`1e665116`) was pushed with the build red (E0308) because a chained command's grep matched "error" yet exited 0; fixed forward in `cd93f821` before any boot.
-- **Left un-pulled, for step 3's extraction pass:** nanosleep's timespec read, `sock.rs`'s timeout timevals, the iovec pairs. Candidates found by diffing `amd64/Cargo.toml` against `taoxichuan/Cargo.toml`
+- **Left un-pulled, for step 3's extraction pass:** nanosleep's timespec read, `sock.rs`'s timeout timevals, the iovec pairs. Candidates found by diffing `crates/akuma-kernel-amd64/Cargo.toml` against `taoxichuan/Cargo.toml`
   (not acted on): `akuma-vfs-glue`, `akuma-user-access`, `akuma-pipe`/`akuma-pipes`, `akuma-elf`, `akuma-syscalls-time`, `akuma-syscalls-poll`.
 - Host tests need `--target $HOST` here (the workspace `.cargo/config.toml` pins aarch64-unknown-none).
 
@@ -1154,7 +1154,7 @@ with a short prompt, per the runbook): 110 + 22 tool calls, 5.4M + 0.9M input to
   `taoxichuan/src` 4,744 -> 4,856 lines (it grew: the milestone bought the fetcher's syscall surface).
 - **OPEN, found here: a refused outbound dial is never signalled to the guest.** With the repositories file live and no listener on :8123, the relay refuses the SYN (`gw_syns=9/10 gw_refused=9/10 resets=0`) but sends
   the guest no RST, so the guest's connect/select never returns: vCPU pinned `c4=100%`, console silent, and the host ssh client burns 10 retries (~13 min) per exec. Goose worked around it in the gate scripts
-  only (mirror started first; H1's listener moved to :8124; genuinely-offline installs use `--no-network`). The relay itself (`amd64/src/kvm/relay.rs` / the gateway in `akuma-svm-amd64`) still needs to
+  only (mirror started first; H1's listener moved to :8124; genuinely-offline installs use `--no-network`). The relay itself (`crates/akuma-kernel-amd64/src/kvm/relay.rs` / the gateway in `akuma-svm-amd64`) still needs to
   answer a refused dial with an RST. Any apk or curl against a dead mirror will hang the guest until then.
 - **Other findings:** herd rotates `vm-dev.log` mid-boot (the old log holds the guest-disk line; `boot_dev.sh` now checks both sides, `4fc359de`); the host forward died early in about a third of the batteries over
   sessions K and L (script restart-once recovers it, but a restarted run is `restarts=1` and needs a clean rerun for the gate); `[sc] unhandled Ftruncate (77)` and nr 40 (sendfile) were tolerated and are the likely
@@ -1196,7 +1196,7 @@ candidate for its own small session before M4 or inside it.
 ### Stage 8 session N (2026-10-26): the process-model PLAN for stages 8-12 (planning only)
 
 **Result.** Brief `scripts/kvm/goose/taoxichuan-08n-process-model-plan.md`, goose session 15 min (17:23-17:38 UTC), 58 tool calls, 1.5M input tokens, zero boots, zero source changes. Output: `docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md`
-(157 lines, seven sections, anchors and `cargo tree` counts checked in-tree; the supervisor spot-checked `sys_fork` at `amd64/src/usermode.rs:5520`, `fork_process` at `crates/akuma-exec/src/process/mod.rs:3194` and the 642-line `amd64/src/exec_runtime.rs`). `taoxichuan-s4` @ `d6d0d772`.
+(157 lines, seven sections, anchors and `cargo tree` counts checked in-tree; the supervisor spot-checked `sys_fork` at `crates/akuma-kernel-amd64/src/usermode.rs:5520`, `fork_process` at `crates/akuma-exec/src/process/mod.rs:3194` and the 642-line `crates/akuma-kernel-amd64/src/exec_runtime.rs`). `taoxichuan-s4` @ `d6d0d772`.
 - **Load-bearing discovery:** the amd64 fork path is not welded shut. `sys_fork` is already a thin fold over `akuma_exec::process::fork_process`; amd64's whole consumption cost is one registration file (`exec_runtime.rs`) plus a scheduler hookup (`X86ArchHooks` over `akuma-threading`). `akuma-mmu` is dual-arch.
 - **Recommended route:** pull `akuma-exec` whole (all pieces resolve for `x86_64-unknown-none`; node counts: exec 84, threading 40, mmu 29, pipe(s) 1-2, cow 1, exec-core 6). Fork/vfork/wait4/threads and pipes pulled; execve cut at the `install_image` seam keeping taoxichuan's eager loader; CoW deferred
   (eager-copy fork through the `fork_share_memory` hook, since taoxichuan has no page-fault handler and `fault_trap` kills). One honest write-new exception: a SPAWN-shaped blocking fork (about 150-250 lines) as a temporary scaffold that lifts the one-command gate before the scheduler lands.
@@ -1245,7 +1245,7 @@ The caps (weekly about 205M, 5-hour about 34M) are therefore Flash-only and unaf
 ### Stage 8 session O (2026-10-26): M5 dynamic PIE — extraction done, first dynamic exec still faults (continues in O2)
 
 **Result: M5 NOT closed.** Brief `scripts/kvm/goose/taoxichuan-08o-pt-interp.md`; goose session 20261026_30, 17:43-19:18 UTC, **223 tool calls, 19.7M input tokens** (brief budget 200; the supervisor steered at call ~210 after 110 calls without a commit). `taoxichuan-s4` @ `b3807175` (3 commits: `5bd2caec` extraction + loader, `b8f893c4` `[tmp]` diagnostics, `b3807175` default-members). Full detail: `RESULT-O.md` on the box (`/root/dev-cycle/taoxichuan-s7/`).
-- **Premise audit paid again:** the brief said the interp/auxv logic was welded to `UserAddressSpace` in `amd64/src/loader.rs`; it is a 710-line adapter over `akuma-elf` already. Syscalls "said to be served" for ldso were partly ENOSYS: `PREAD64` missing, `MAP_FIXED` anonymous-only (ENODEV file-backed), `FUTEX`/`SIGALTSTACK`/`SET_ROBUST_LIST`/`PRLIMIT64` unarmed.
+- **Premise audit paid again:** the brief said the interp/auxv logic was welded to `UserAddressSpace` in `crates/akuma-kernel-amd64/src/loader.rs`; it is a 710-line adapter over `akuma-elf` already. Syscalls "said to be served" for ldso were partly ENOSYS: `PREAD64` missing, `MAP_FIXED` anonymous-only (ENODEV file-backed), `FUTEX`/`SIGALTSTACK`/`SET_ROBUST_LIST`/`PRLIMIT64` unarmed.
 - **Composition:** new leaf crate `akuma-elf-exec` (401 lines, zero deps, `forbid(unsafe)`, 8 host tests); `akuma-elf` (19/19 host tests) and `amd64/` (`finish()` cross decision) pulled onto it. taoxichuan adds the ldso mapping in `load_task`, file-backed `MMAP`, `PREAD64`, monotonic `mmap_cur`. `taoxichuan/src` 4916 -> 5134 lines (+70 are `[tmp]` prints); `akuma-*` deps 19 -> 20.
 - **The fault (CORRECTED 2026-10-26 by session O2, see below: the "wrong bytes in the child's page tables" below was an artifact of the diagnostic itself, and the ldso mapping was not at fault; the real defect was the copy's source index):** `curl --version` dies deterministically on the first dynamic exec: control reaches the ldso entry (`0x3006c185`, rsp correct, `AT_BASE=0x30000000`) but the bytes read back through the child's page tables there are not the file's (`8b 24 48 74 ...` where the file has `48 31 ed 48 89 e7 ...`), then `PageFault rip=0xfffffffff9bcd08d`. The `vec@entry` print (Vec wrong vs mapping wrong) is in the tree but boot 4 stalled at the ssh layer before exec (new anomaly, two connections, auth OK, no `[SSH] Exec`).
 - **Static path:** `apk add curl` (b1) passed on all four boots. Supervisor check on the merge (`e2f728ea`): `scripts/build_taoxichuan_fc.sh` + Lima boot: 162 lines, `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`.
@@ -1273,7 +1273,7 @@ The caps (weekly about 205M, 5-hour about 34M) are therefore Flash-only and unaf
 - **Host track:** merged build via `scripts/build_taoxichuan_fc.sh`, Lima `fc` boot: 163 lines (162 baseline plus one Firecracker VMM message about vCPU resume), `Ext2 filesystem mounted`, `sshd started`, 0 `Fault|PANIC|sig!`.
 - **Size:** `taoxichuan/src` 5,134 -> 5,096 lines (the `[tmp]` prints came out); `akuma-*` deps 20. Quota after: week 64% (130.1M), 5-hour window 1%.
 - **Process:** O2 was cheaper than O by a wide margin (128 calls and about 10M against 223 calls and 19.7M) on the same defect, because a fresh context started from O's RESULT file and one discriminating boot. The 200-call overrun and 110 calls without a commit in O were the cost of keeping a long context; the L2/M2 continuation pattern worked again.
-- **Open / discrepancy:** O2 reports the host `akuma-amd64` package does not compile at this HEAD (5 x E0425 in `amd64/src/mem.rs`) and calls it fallout of the `b3807175` workspace commit; session O reported the *same five errors at clean `d6d0d772`*, before any of this work. The two reports disagree on cause; not resolved here. `apk info -L curl` repro is the next boot. `FUTEX`/`SIGALTSTACK`/`SET_ROBUST_LIST`/`PRLIMIT64` are still ENOSYS, and e1 raised no `[sc] unhandled`, so a multithreaded dynamic binary is the next loader frontier.
+- **Open / discrepancy:** O2 reports the host `akuma-amd64` package does not compile at this HEAD (5 x E0425 in `crates/akuma-kernel-amd64/src/mem.rs`) and calls it fallout of the `b3807175` workspace commit; session O reported the *same five errors at clean `d6d0d772`*, before any of this work. The two reports disagree on cause; not resolved here. `apk info -L curl` repro is the next boot. `FUTEX`/`SIGALTSTACK`/`SET_ROBUST_LIST`/`PRLIMIT64` are still ENOSYS, and e1 raised no `[sc] unhandled`, so a multithreaded dynamic binary is the next loader frontier.
 - **Next:** `apk info -L curl` NULL-write crash, then stage 7 (curl HTTPS) now that a dynamic curl runs, the probe-inventory session P, and the process-model M1/M2.
 
 
@@ -1331,7 +1331,7 @@ Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart 
 **Result.** Goose session 20261027_12, 68 calls, one boot, about 3M tokens; `taoxichuan-s4` @ `2619a243` (two reverts of the Q8 heartbeat, `35dfe1a0` and `5f7bf7b8`, plus `[tmp]` per-event markers). No gate moved. Q2 still not passed.
 - **The race theory did not survive its own evidence** (the supervisor had asked for the timeline before any client change). Redirect-shape session (`cat /tmp/h > /tmp/h2`), client capped at 60 s: server-side complete, guest healthy, later sessions (`alive3`, `cat /tmp/h2`) served normally, `h2` holds the full file; the client's exit code 0 means it **received** the exit-status. The passing plain session's client, by contrast, left without it (`close-wait end peer_hung=true saw_close=false`). So "the client receives nothing" is not the wedge signature, and a client-only exit race does not explain the failure.
 - **Q7's guest spin (`io=0 hlt=0`, netpoll never called) did NOT reproduce.** Candidates for Q7's terminal state, neither proven: stacked hung-client zombies exhausting the port-22 forward slots (so new clients never reach the guest: no Auth line, guest innocent), or a real guest-side spin that this boot did not show.
-- **OPEN, host kernel, NOT licensed to change:** after the session, relay slot 0 froze (`up_pending=176`, `to_host` frozen, `host_send_blocked` climbing +500/s, `tcp_state=close_wait`) with no `[KVM] relay: host socket ... failed` line all boot. In `amd64/src/kvm/relay.rs::shuttle`, `socket_send` can EAGAIN forever and teardown requires `p.host_eof && p.guest_eof_passed && conn.is_closed()` while `guest_eof_passed` needs `p.up_len == 0`: a zombie slot with no error path and no bound. One defect, two plausible symptoms (a stuck client, slot exhaustion). A bound on the up-chunk (a retry cap and an abort in the `note_err` style) is the obvious fix but changes the host VMM kernel, which this experiment does not rebuild; **the user's decision**.
+- **OPEN, host kernel, NOT licensed to change:** after the session, relay slot 0 froze (`up_pending=176`, `to_host` frozen, `host_send_blocked` climbing +500/s, `tcp_state=close_wait`) with no `[KVM] relay: host socket ... failed` line all boot. In `crates/akuma-kernel-amd64/src/kvm/relay.rs::shuttle`, `socket_send` can EAGAIN forever and teardown requires `p.host_eof && p.guest_eof_passed && conn.is_closed()` while `guest_eof_passed` needs `p.up_len == 0`: a zombie slot with no error path and no bound. One defect, two plausible symptoms (a stuck client, slot exhaustion). A bound on the up-chunk (a retry cap and an abort in the `note_err` style) is the obvious fix but changes the host VMM kernel, which this experiment does not rebuild; **the user's decision**.
 - **Marker design lesson:** the first marker set landed in the `fork-sessions` serve loop, which `amd64/mkdisk.sh:172`'s feature set compiles out; markers must go in the live single-process loop. `net.rs` has only per-lap print sites, so it stayed printless (the Q7 flood).
 - **Next (Q10):** get the Q2 verdict from the console with bounded clients killed by PID (the verdict rule is the console's `Exit status`), q2a/q2 immediately after q1 on a fresh boot, relay slot state printed before each exec; then strip the markers, clippy, and the clean-boot E1/E2 and main battery.
 
@@ -1360,7 +1360,7 @@ Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart 
 - **Tokenomics.** Today (T-Y) about 14M GLM-5.3-Flash tokens, about 6% of the weekly cap (week 1% -> 6%).
 - **Supervisor misreads, corrected openly:** claimed `ring3-amd64` was shared with the main amd64 kernel (only `taoxichuan` depends on it); read `tB`/`F1` consoles as empty when they held only host stats after a wedged boot; `strings` hid one-character client lines.
 
-**Open.** (a) `cargo build -p akuma-amd64 --target x86_64-unknown-none --release` fails (5 x E0425, `amd64/src/mem.rs:117`): this branch's `43edbffc` boot-kit extraction left a test-only function using `PHYSMAP_LIMIT`/`PAGE_SIZE`; it builds with `--features no-tests`, which metal kernels use. (b) `ring3-amd64`'s 64 KiB array and the extracted crates (`akuma-boot-amd64`, `akuma-comconsole`, `akuma-elf-exec`, `akuma-ring3-amd64`, `akuma-syscalls-eventfd`) get a proper review after the experiment, user's call. (c) The `apk add curl` restart rate versus the pre-fork kernel was never measured (session Y was stopped by the user's decision to skip it). (d) Pipes and the real process model (`TAOXICHUAN_PROCESS_MODEL_PLAN.md` M3/M4) are the next real work; M2's blocking fork is throwaway scaffolding by design. (e) The trashcan (HP box) was offline; an amd64 `--features no-tests` deploy is staged but not done.
+**Open.** (a) `cargo build -p akuma-amd64 --target x86_64-unknown-none --release` fails (5 x E0425, `crates/akuma-kernel-amd64/src/mem.rs:117`): this branch's `43edbffc` boot-kit extraction left a test-only function using `PHYSMAP_LIMIT`/`PAGE_SIZE`; it builds with `--features no-tests`, which metal kernels use. (b) `ring3-amd64`'s 64 KiB array and the extracted crates (`akuma-boot-amd64`, `akuma-comconsole`, `akuma-elf-exec`, `akuma-ring3-amd64`, `akuma-syscalls-eventfd`) get a proper review after the experiment, user's call. (c) The `apk add curl` restart rate versus the pre-fork kernel was never measured (session Y was stopped by the user's decision to skip it). (d) Pipes and the real process model (`TAOXICHUAN_PROCESS_MODEL_PLAN.md` M3/M4) are the next real work; M2's blocking fork is throwaway scaffolding by design. (e) The trashcan (HP box) was offline; an amd64 `--features no-tests` deploy is staged but not done.
 
 ### Stage 8, session pa (2026-10-27): M3 pipes — `pipe2`/`pipe` + small pipelines; the new suite `run_pipes.sh` P1-P5 PASS
 
@@ -1375,7 +1375,7 @@ Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart 
 ### Stage 8, session pb (2026-10-28): M4 foundation — `akuma-exec`/`akuma-threading` linked, a PIT-calibrated LAPIC tick under ring 3, the SMP-ready sched-lite plan
 
 **User's decisions this session:** the kernel gets preemption (the cooperative-only design the supervisor first floated is withdrawn) and the design is SMP-ready, with booting extra cores a later slice. **Result.** (PB1) `akuma-exec` + `akuma-threading` link into `taoxichuan` (nm: 41 + 56 symbols; ELF 917,416 B); (PB3) `run_pipes.sh` P1-P5 and the F1 spot check still pass with the deps pulled; (PB5) `lapic: id=0 timer vector=32 periodic; calibrated=1 counts/tick=624937`, and one 200k-iteration ring-3 exec shows `[TICK pre] n=20337` -> `[TICK post] n=20361`, exit 0 (supervisor read the console, boot 2 starts at log line 12030 and the only `PANIC` is boot 1's at 12019); (PB4) `docs/archive/TAOXICHUAN_M4_SCHED_LITE_PLAN.md`: hook tables for `ThreadRuntime`/`ThreadConfig`/`ProcessHooks`/`X86ArchHooks`/`ExecRuntime`, the blocking syscalls and the switch in `timer_trap`, the `SYSCALL_STACK` interaction, the SMP list, the slice list. Merged as the net diff `f2b15e6c..c3a37692`. Lima aarch64 host-track boot: 163 lines (excluding `[WATCHDOG]`), mount + sshd, 0 faults. amd64 `cargo check --features no-tests` clean, clippy clean, unsafe budget ok.
-- **Extracted.** `crates/akuma-lapic-amd64` from `amd64/src/lapic.rs` (1121 -> 719 lines; amd64 re-exports it, the IPI face stays there). `forbid(unsafe_code)`, budget 0. **It has no host tests** (the moved code had only in-kernel suites): a gap to close before the SMP slice.
+- **Extracted.** `crates/akuma-lapic-amd64` from `crates/akuma-kernel-amd64/src/lapic.rs` (1121 -> 719 lines; amd64 re-exports it, the IPI face stays there). `forbid(unsafe_code)`, budget 0. **It has no host tests** (the moved code had only in-kernel suites): a gap to close before the SMP slice.
 - **Boot 1 panic:** `lapic_init` ran before the PMM/heap registration and `map_device` allocates page-table frames; moved after (`9dc684ef`).
 - **Premise corrections (goose):** `ThreadRuntime` has 4 IPI/IRQ-bound fields, not 2; `fork_process`'s subject is `ProcessImage`, not `Process`. `dd` does not exist on the guest (no `/dev` at all); a shell loop is the tick gate. Goose: about 81 calls, 2 of 3 boots, quota in the entry above this one's session.
 - **Open for M4 slice 1:** `forkprobe` is the named M4 gate (libakuma, builds x86_64 static); `timer_trap` is where the task switch lands, ring 3 and idle only, never ring 0.
@@ -1390,7 +1390,7 @@ Supervisor check, no goose spend: `scratch` (a 7,011-line git client over Smart 
 ### Process finding (2026-10-28): this supervising session deviated from the plan — too many tips in briefs and steers, instead of pointing at docs and giving general instructions
 
 Recorded at the user's request. The runbook (`scripts/kvm/goose/SUPERVISOR_RUNBOOK.md` § One milestone = one session) says the brief carries **no hints about the bug: docs and probes yes**, and the handoff for this session said goose reads docs rarely and source heavily, so *quote the relevant doc passage or the probe list*. The supervisor (Sonnet 5.5) did the opposite in three of four briefs and in some steers:
-- **Briefs pa, pb, pc** (`taoxichuan-09a-pipes.md`, `-09b-m4-deps.md`, `-09c-m4-twin.md`) carried source-level pointers (file and line ranges in `amd64/src/fd.rs`, `sched.rs`, `exec_runtime.rs`, `child.rs`, `akuma-threading`), pb and pc prescribed step lists, and pa named the answer: it told goose where reference counting belongs (`fork_copy` -> `clone_ref`, the `CLOSE` arm) and listed premise 8 as "the likely bug". Goose then confirmed exactly that. The premise table was meant to test the brief's claims, not to hand over the diagnosis.
+- **Briefs pa, pb, pc** (`taoxichuan-09a-pipes.md`, `-09b-m4-deps.md`, `-09c-m4-twin.md`) carried source-level pointers (file and line ranges in `crates/akuma-kernel-amd64/src/fd.rs`, `sched.rs`, `exec_runtime.rs`, `child.rs`, `akuma-threading`), pb and pc prescribed step lists, and pa named the answer: it told goose where reference counting belongs (`fork_copy` -> `clone_ref`, the `CLOSE` arm) and listed premise 8 as "the likely bug". Goose then confirmed exactly that. The premise table was meant to test the brief's claims, not to hand over the diagnosis.
 - **Steer 1 of pd** told goose what to build (register a `Process` for the shell and call `fork_process` behind the flag) when goose had already found the problem itself (premise 2, WRONG) and the brief already required the selectable flag. The earlier pa/pb/pc steers were process-only (commit, write `RESULT-*.md`, hold the push).
 - **Brief pd** was rewritten before sending, at the user's instruction ("point to docs, not source, it will find the source"): goal, gates, docs, no line numbers, no decomposition.
 - **Where the plan was followed:** the composition-rule block stays in every brief (the template requires it); briefs went as files; sessions ran through `retry_goose.sh`; every result was verified on the console and with `od -c` by the supervisor, not from goose's narration.
@@ -1531,7 +1531,7 @@ For the story. Each line names the decider. "User" is the owner of the experimen
 ### pn S2 and a local finding about the stall (2026-10-30, supervisor)
 
 Decided and done by the supervisor under the user's "keep working autonomously" (commit fcfd5f4d):
-- **Legacy path fold extracted** from `amd64/src/usermode.rs` into `akuma_syscalls_abi::legacy` (ten x86-only numbers, host tests, the `symlink`-dirfd-second and `AT_REMOVEDIR`/`AT_SYMLINK_NOFOLLOW` cases pinned); amd64 and Taoxichuan both call it. This is pn's route C for the legacy numbers, done as the plan said.
+- **Legacy path fold extracted** from `crates/akuma-kernel-amd64/src/usermode.rs` into `akuma_syscalls_abi::legacy` (ten x86-only numbers, host tests, the `symlink`-dirfd-second and `AT_REMOVEDIR`/`AT_SYMLINK_NOFOLLOW` cases pinned); amd64 and Taoxichuan both call it. This is pn's route C for the legacy numbers, done as the plan said.
 - **Real `mprotect`** (re-map each present page with the requested R/W/X; `PROT_NONE` stays a no-op), `sigaltstack` (per-task record read back), `membarrier` (decode from `akuma-syscalls-mem`, one fence), and a `[nosys] nr=N` console line once per unserved number (the gap list for free). A/B on `tcc -run`: old kernel `PageFault code=0x15` (instruction fetch on an RW page), new kernel prints.
 - `rustc --version` after S2: no `[nosys]` lines left; it dies only at the ctrlc handler thread (needs S4).
 - **A bug the fold exposed, fixed:** the `UNLINKAT` arm read its flags from arg4; `unlinkat(dirfd, path, flags)` has them third, so `rmdir` never worked on this kernel.
@@ -1923,7 +1923,7 @@ SME/TSME.
 1. **SMEP / SMAP / UMIP (present): cheap, for Taoxichuan.**
    - These stop the kernel from executing user pages (SMEP) or touching them outside explicit copy windows (SMAP); UMIP hides
      descriptor-table instructions from ring 3.
-   - Akuma amd64 already turns on SMAP, SMEP and `CR0.WP` (`amd64/src/boot.rs`, `uaccess::init_smap`). No CR4 setup was found
+   - Akuma amd64 already turns on SMAP, SMEP and `CR0.WP` (`crates/akuma-kernel-amd64/src/boot.rs`, `uaccess::init_smap`). No CR4 setup was found
      in Taoxichuan. Under KVM with `-cpu host` the guest gets these too, so it is the cheapest hardening win available.
 2. **NPT-enforced guest kernel W^X (SVM + nested paging, present): the closest thing to an enclave that can be built here.**
    - Because Akuma owns the hypervisor, after a guest boots it can mark the guest kernel's code pages read+execute-only (and

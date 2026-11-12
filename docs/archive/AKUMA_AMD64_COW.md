@@ -97,7 +97,7 @@ diagnostics were added before the cause was found, and two of them never fired,
 which was itself the information: it was neither slot exhaustion in `PROCS`/
 `SPAWN` nor a failure inside `fork_from`.
 
-It was `amd64/src/sched.rs`: **`finish()` sets `State::Finished` and nothing ever
+It was `crates/akuma-kernel-amd64/src/sched.rs`: **`finish()` sets `State::Finished` and nothing ever
 set `Unused` again.** `MAX_TASKS = 512` was therefore a ceiling on *total
 processes for the life of the boot*, not on concurrency. `sh` reported
 `can't fork: Out of memory`, naming the one resource that was not exhausted.
@@ -152,12 +152,12 @@ mislead a bug hunt — the Go/crush startup crash was chased for three sessions 
 sibling thread's fault" on the strength of this section, and it was a signal-return bug
 ([`AMD64_FORK_VS_THREADS_SEGV.md`](AMD64_FORK_VS_THREADS_SEGV.md)). The current state:
 
-- **SMP>1 is supported.** `amd64/src/shootdown.rs` (2026-09-09) is the IPI that makes
+- **SMP>1 is supported.** `crates/akuma-kernel-amd64/src/shootdown.rs` (2026-09-09) is the IPI that makes
   `TlbTarget::AllCores` real on x86: the share pass demotes the parent's leaves under the owner's
   address-space lock and flushes `AllCores` once at the end of the walk, waiting for every peer on
   the edited root to acknowledge; the `Copy` arm of the break flushes `AllCores` before it frees
   the old frame. Self-host builds at `-j4` have run on it since.
-- **Threads exist** (`amd64/src/thread.rs`, `clone(CLONE_VM|CLONE_THREAD)`), so the `cowstale`
+- **Threads exist** (`crates/akuma-kernel-amd64/src/thread.rs`, `clone(CLONE_VM|CLONE_THREAD)`), so the `cowstale`
   class is live here. What closes it: the share pass, `install_filled_page` and `cow_write_fault`
   all take the **thread-group leader's** `address_space` lock (a sibling's own is a fresh-lock
   `new_shared` view that would exclude nothing), and the break reads the PTE under that hold and

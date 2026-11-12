@@ -1,5 +1,5 @@
 //! Stage A: bring up the kernel heap and the physical frame allocator on x86_64
-//! — the machine half of `amd64/src/mem.rs`, extracted so a composed kernel
+//! — the machine half of `crates/akuma-kernel-amd64/src/mem.rs`, extracted so a composed kernel
 //! pulls one `mem::init` rather than inheriting the module.
 //!
 //! # Ordering, which is not obvious and not optional

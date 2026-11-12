@@ -37,7 +37,7 @@ slot**: amd64's tid *is* that slot (`gs:[32]`, what `current_tid` returns under
 long after the task slot could otherwise be reissued — can still name the key it
 inserted.
 
-`amd64/src/usermode.rs`'s own `Process`/`PROCS`/`Spawn` tables **stay**. This
+`crates/akuma-kernel-amd64/src/usermode.rs`'s own `Process`/`PROCS`/`Spawn` tables **stay**. This
 slice adds a second, authoritative registration beside them; deleting the local
 ones is slices 2-4. That is deliberate: it makes the slice reversible and keeps
 the diff readable against a 4 000-line file.

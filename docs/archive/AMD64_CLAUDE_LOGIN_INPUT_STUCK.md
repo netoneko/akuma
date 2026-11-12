@@ -223,7 +223,7 @@ its pid; no exit was lost. Four early children `execve` then `exit_group(128)`.
 Do not count the single-run passes as fixes. Anything claimed from this rig needs 3+ runs per arm.
 
 Build note: `claude-fixes` HEAD does not link for amd64 (`duplicate symbol: shootdown_entry`,
-defined in both `amd64/src/shootdown.rs` and `akuma-boot-amd64`, from `c2f58d79`); the
+defined in both `crates/akuma-kernel-amd64/src/shootdown.rs` and `akuma-boot-amd64`, from `c2f58d79`); the
 experiment was built on `d60ce6e4`.
 
 ### 2026-11-09 (later): the metal hang, and what the klog showed

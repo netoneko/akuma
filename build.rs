@@ -18,7 +18,7 @@ fn main() {
 
 /// Hand the kernel binary its linker script.
 ///
-/// `akuma-kernel-amd64` owns `amd64/linker.ld` and exports its path as `links` metadata
+/// `akuma-kernel-amd64` owns `crates/akuma-kernel-amd64/linker.ld` and exports its path as `links` metadata
 /// (`DEP_AKUMA_KERNEL_AMD64_LINKER_SCRIPT`), because a dependency's `rustc-link-arg` never
 /// reaches the binary that depends on it. `rustc-link-arg-bins` scopes it to this package's bin.
 fn amd64() {

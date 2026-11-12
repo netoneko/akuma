@@ -9,7 +9,7 @@
 //! - [`detach_eager_regions_in_range`] — `munmap`'s clip-and-split.
 //! - [`Prot`], the **architecture-neutral** permission vocabulary a region records.
 //!   The PTE bits it encodes to live with the walker that writes them —
-//!   `akuma_mmu::types` on AArch64, `amd64/src/paging.rs` on x86_64. See
+//!   `akuma_mmu::types` on AArch64, `crates/akuma-kernel-amd64/src/paging.rs` on x86_64. See
 //!   `types.rs` for why the data had to move even though the code compiled.
 //!
 //! # What is deliberately NOT in here

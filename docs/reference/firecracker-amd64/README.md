@@ -32,7 +32,7 @@ FC_HOST=user@host amd64/dump-machine.sh                 # 1, 2, 4 and 8 vCPUs
 FC_HOST=user@host VCPU_LIST="1 16" amd64/dump-machine.sh
 ```
 
-The same three facts can be read from Akuma's own boot log — `amd64/src/machine.rs`
+The same three facts can be read from Akuma's own boot log — `crates/akuma-kernel-amd64/src/machine.rs`
 prints them every boot — which is the cross-check. The Linux capture is the
 independent second opinion.
 

@@ -122,4 +122,4 @@ Unchanged by this fix (the deployed kernel gives the same results under TCG):
 - [`INFINITY_ON_TAOXICHUAN.md`](INFINITY_ON_TAOXICHUAN.md): the run that hit it.
 - [`TAOXICHUAN_BUGS_FOUND_2026_10_30.md`](TAOXICHUAN_BUGS_FOUND_2026_10_30.md): the 16 GiB slab, the
   address-space half of the same rustc failure.
-- `amd64/src/mm.rs`: the region-table design this kernel does not have.
+- `crates/akuma-kernel-amd64/src/mm.rs`: the region-table design this kernel does not have.

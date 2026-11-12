@@ -2,7 +2,7 @@
 
 Continuation of this session's `akuma-mmu`/`akuma-threading` portability work.
 Where those two crates each had a proven AArch64→x86_64 port target
-(`amd64/src/paging.rs`, `amd64/src/sched.rs`), this crate does not — and an
+(`crates/akuma-kernel-amd64/src/paging.rs`, `crates/akuma-kernel-amd64/src/sched.rs`), this crate does not — and an
 isolated experiment toward building one found a real, reproducible ABI
 problem worth recording precisely.
 
@@ -19,7 +19,7 @@ copy loop that silently corrupted `read(2)` results ~50% of the time).
 
 ## No proven port target exists
 
-`amd64/src/usermode.rs` — the closest thing amd64 has to a user-copy path —
+`crates/akuma-kernel-amd64/src/usermode.rs` — the closest thing amd64 has to a user-copy path —
 says so about itself, on `sys_write`:
 
 > Reading `buf` from ring 0 works because `CR4.SMAP` is not enabled... That
@@ -52,7 +52,7 @@ site that assumes user-copy already works — the same reasoning
 
 Before committing to a design, ran the same kind of targeted experiment this
 session used for the threading switch: **can `page_fault` in
-`amd64/src/idt.rs` redirect `iretq` by rewriting the faulting `rip`?** This
+`crates/akuma-kernel-amd64/src/idt.rs` redirect `iretq` by rewriting the faulting `rip`?** This
 is the x86 equivalent of AArch64's `ELR_EL1` rewrite, and the prerequisite
 for any real fault-recovery copy mechanism.
 
@@ -69,7 +69,7 @@ succeeding or failing safely. Confirmed by disassembling the linked binary
 at the faulting `rip` (`objdump -d`): it landed mid-way through an unrelated
 `movq $0x1, %rax` a few bytes before the actual target label.
 
-**This was reverted immediately** (`git checkout -- amd64/src/idt.rs`) —
+**This was reverted immediately** (`git checkout -- crates/akuma-kernel-amd64/src/idt.rs`) —
 `amd64/`'s diff is empty. It was never left in a state that could ship.
 
 ### What this means, and what it doesn't

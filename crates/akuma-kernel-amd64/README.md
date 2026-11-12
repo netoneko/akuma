@@ -75,7 +75,7 @@ it like real Linux does — which broke apk's own 128 KiB-buffer read of a
 including exactly why `AT_PHDR` computed as `base + e_phoff` crashed busybox
 before it was fixed: `docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.29.
 
-The clock followed the next day: a **boot-time SNTP client** (`amd64/src/
+The clock followed the next day: a **boot-time SNTP client** (`crates/akuma-kernel-amd64/src/
 clock.rs`, plus a DNS client, now the shared `akuma-dns`) — `clock_gettime`/`gettimeofday`/`time` now
 answer with real Unix time, and `apk update`'s TLS handshake against the real
 Alpine CDN no longer fails with "server certificate not trusted" — verified
@@ -387,10 +387,10 @@ and each entry has one of three reasons:
 
 | crate | why amd64 does not use it |
 |---|---|
-| `akuma-elf` | **No longer blocked — but still not used here.** It called exactly three methods on `UserAddressSpace`; those are the `UserPages` trait since 2026-09-06 and the crate builds for `x86_64-unknown-none` (`docs/archive/AKUMA_ELF_ARCH_NEUTRAL.md`). `amd64/src/loader.rs` remains its own, so this row is now a live duplication to close rather than a blocked dependency |
+| `akuma-elf` | **No longer blocked — but still not used here.** It called exactly three methods on `UserAddressSpace`; those are the `UserPages` trait since 2026-09-06 and the crate builds for `x86_64-unknown-none` (`docs/archive/AKUMA_ELF_ARCH_NEUTRAL.md`). `crates/akuma-kernel-amd64/src/loader.rs` remains its own, so this row is now a live duplication to close rather than a blocked dependency |
 | `akuma-mmu` | **It builds for x86_64.** What does not is the `UserAddressSpace` *type* inside it, which is `#[cfg(target_arch = "aarch64")]` — the L0–L3 walker with ASIDs and `TTBR`. Its ledger half was extracted to `akuma-user-space` and **amd64 does use that**, as its `FrameSet`. Earlier editions of this table said the whole crate was blocked; that was never checked and was wrong |
 | `akuma-mmap` | **Blocked on item 1.** `MmapRegion.flags` is a raw AArch64 PTE `u64`; the two encodings share no field. This costs `munmap`'s clip-and-split and lazy regions. It no longer costs a region list to replace `MAX_PROC_FRAMES` — that cap is gone, replaced by `akuma-user-space`'s `FrameLedger` |
-| `akuma-syscalls-glue` (incl. its `pipe`) | **Not reached yet** (it needs `akuma-exec`). `amd64/src/{fd,usermode}.rs` hold the file/spawn/pipe syscall bodies; the pure pipe buffer was extracted to `akuma-pipe` rather than re-derived. Until 2026-09-05 it could not build at all, through `akuma-user-access`'s AArch64 asm |
+| `akuma-syscalls-glue` (incl. its `pipe`) | **Not reached yet** (it needs `akuma-exec`). `crates/akuma-kernel-amd64/src/{fd,usermode}.rs` hold the file/spawn/pipe syscall bodies; the pure pipe buffer was extracted to `akuma-pipe` rather than re-derived. Until 2026-09-05 it could not build at all, through `akuma-user-access`'s AArch64 asm |
 | `akuma-uart`, `akuma-gic`, `akuma-psci`, `akuma-exceptions`, `akuma-el0-entry`, `akuma-entry`, `akuma-timer`, `akuma-fdt`, `akuma-firecracker` | **Different hardware.** PL011 vs a 16550 on I/O ports, GICv3 vs LAPIC, PSCI vs nothing, an FDT vs a PVH block. Genuinely arch- or machine-specific |
 | `akuma-exec`, `akuma-exec-core`, `akuma-threading`, `akuma-slot-table`, `akuma-syscalls`, `akuma-kernel-core`, `akuma-kernel-glue`, `akuma-vfs-glue`, `akuma-bkl` | **Not reached yet.** The process/exec/SMP layer. `akuma-exec-core` supplied `FileDescriptor`/`KernelFile`; its `Process` and the fork/exec of `akuma-exec` are what Stage T (§3.26) needs |
 | `akuma-rump`, `akuma-fpcache`, `akuma-kacho`, `akuma-isolation`, `akuma-syscalls-{poll,sync,time,ipc,log}`, `akuma-config` | **Not needed yet.** All build for `x86_64-unknown-none`; none has a consumer on this target |
@@ -531,7 +531,7 @@ networking took a `#UD` because of that. `run.sh` passes `-cpu max`.
 Two different ways a program gets onto this target, for two different reasons:
 
 - **`userspace/amd64/`** — one directory each, compiled straight by `rustc`
-  from `amd64/build.rs` and embedded with `include_bytes!`. This predates
+  from `crates/akuma-kernel-amd64/build.rs` and embedded with `include_bytes!`. This predates
   Stage N (ext2), and stayed the shape for the ELF loader's own self-tests
   (`hello`, `fdprobe`): a loader test should not depend on the filesystem it
   is not testing. See `userspace/amd64/README.md` for how to add one.

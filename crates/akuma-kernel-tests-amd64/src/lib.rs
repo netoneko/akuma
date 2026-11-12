@@ -1,6 +1,6 @@
 //! The amd64 kernel's boot self-test suite.
 //!
-//! Moved out of `amd64/src` (2026-11-11, `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`) so the
+//! Moved out of `crates/akuma-kernel-amd64/src` (2026-11-11, `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`) so the
 //! machine half carries no test driver: the suite's list and order (`suite`, was
 //! `boot::self_tests`), the ring-3 tests (`usermode_tests`, was `usermode/tests.rs`) and the
 //! `akuma-mmu` walker's (`uas_tests`, was `uas.rs`). Both entry

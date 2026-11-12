@@ -11,7 +11,7 @@ dim step (`powersaved`: 60 s, 180 s, 600 s of console idle).
 
 ## Cause
 
-`amd64/src/multiboot2.rs`'s `Framebuffer` drew every pixel **straight into the scanned-out,
+`crates/akuma-kernel-amd64/src/multiboot2.rs`'s `Framebuffer` drew every pixel **straight into the scanned-out,
 write-combining framebuffer** (`fill`/`put` on an `MmioWindow`); `flush()` was only an `sfence`.
 So whatever order a program painted in was the order the panel showed:
 

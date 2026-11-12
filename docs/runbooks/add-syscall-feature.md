@@ -17,7 +17,7 @@ script, that build silently drops it.
    Tier 1 (pure dead weight when off) vs Tier 2 (needs an ExecRuntime stub —
    see step 3). Default-on by adding it to the `linux-extra-syscalls` group (in `default`) —
    on **both** kernels: root `Cargo.toml` (which also forwards the amd64 half's feature) and
-   `amd64/Cargo.toml`, so the group keeps one meaning.
+   `crates/akuma-kernel-amd64/Cargo.toml`, so the group keeps one meaning.
 
 2. **Add the submodule** `src/syscall/<name>.rs`, gated:
    ```rust

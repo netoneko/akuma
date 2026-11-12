@@ -1,6 +1,6 @@
 //! The smallest init that proves a guest ran something: print one line, exit.
 //!
-//! Not part of the kernel build (`amd64/build.rs` builds the loader self-check
+//! Not part of the kernel build (`crates/akuma-kernel-amd64/build.rs` builds the loader self-check
 //! `hello`, which reports through its exit status and prints nothing). This one
 //! is compiled by `scripts/kvm/akuma_hello_rootfs.sh` into a 2 MiB ext2 whose only
 //! file is `/bin/hello`, the whole root of the "Akuma on Akuma, hello world" run

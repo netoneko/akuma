@@ -81,7 +81,7 @@ succeeds** is the line that names the bug. In musl, `send(fd,buf,len,flags)` is
 
 ### 1. `SOCK_NONBLOCK` / `SOCK_CLOEXEC` were parsed off and discarded
 
-`amd64/src/sock.rs`'s `sys_socket` masked the flag bits out of `type` with
+`crates/akuma-kernel-amd64/src/sock.rs`'s `sys_socket` masked the flag bits out of `type` with
 `SOCK_TYPE_MASK` and never applied them, so **every socket was blocking however
 it was asked for**. AArch64 has applied both since it was written
 (`akuma_syscalls_glue::net::sys_socket`); this was an amd64-only omission.
@@ -126,7 +126,7 @@ to glue exactly as `Getsockopt` already was.
 
 ## The assumption underneath all of it
 
-`amd64/src/usermode.rs`'s dispatcher carries this comment, and it was correct
+`crates/akuma-kernel-amd64/src/usermode.rs`'s dispatcher carries this comment, and it was correct
 when written:
 
 > *"a UDP `sendto` has no peer to fall back on, and musl's DNS resolver never

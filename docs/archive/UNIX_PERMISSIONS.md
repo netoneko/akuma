@@ -37,7 +37,7 @@ for every existing workload** (§6.1).
 ## 2. Current state (verified 2026-10-14)
 
 Syscalls now live in `crates/akuma-syscalls-glue`; amd64 folds into the same
-handlers (`amd64/src/usermode.rs:2305`), so **one implementation serves both
+handlers (`crates/akuma-kernel-amd64/src/usermode.rs:2305`), so **one implementation serves both
 kernels**.
 
 | Fact | Location |
@@ -358,7 +358,7 @@ Each row is its own commit; rows marked ⚠ change what the system permits.
    trait (§5.2), procfs `hidepid`-style restriction on `/proc/<pid>/{fd,environ}`.
 
 Everything from step 3 lands in `akuma-syscalls-glue`, so amd64 gets it for free;
-check `amd64/src/usermode.rs` routes `setgroups`/`setresgid`/`setfsuid` (x86_64
+check `crates/akuma-kernel-amd64/src/usermode.rs` routes `setgroups`/`setresgid`/`setfsuid` (x86_64
 numbers differ) before calling it done.
 
 ---

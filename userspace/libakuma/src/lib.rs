@@ -349,7 +349,7 @@ pub mod syscall {
         pub const CLOSE_RANGE: u64 = 436;
         /// Real x86_64 `reboot(2)` — **169**, not the asm-generic 142 (which is
         /// `s390_pci_mmio_write`-adjacent territory on this arch, not reboot).
-        /// `amd64/src/usermode.rs` dispatches `Syscall::Reboot` straight to
+        /// `crates/akuma-kernel-amd64/src/usermode.rs` dispatches `Syscall::Reboot` straight to
         /// `crate::reboot::sys_reboot`. See [`super::super::reboot`].
         pub const REBOOT: u64 = 169;
     }
@@ -437,7 +437,7 @@ pub struct ProcessInfo {
 ///
 /// * The `linux-abi` feature — the page is not a thing on standard Linux.
 /// * **`target_arch = "x86_64"`, unconditionally.** The amd64 kernel does not
-///   map it: `amd64/src/usermode.rs` states `process_info_phys: 0` — "the
+///   map it: `crates/akuma-kernel-amd64/src/usermode.rs` states `process_info_phys: 0` — "the
 ///   ProcessInfo page is **not mapped, not allocated, and not missed**" —
 ///   reasoning about the *kernel's* `read_current_pid`, which on that target
 ///   resolves identity through `THREAD_PID_MAP` instead. That reasoning is
@@ -1410,7 +1410,7 @@ pub struct Stat {
 
 /// The x86_64 `struct stat` — 144 bytes. See [`Stat`]'s doc above for why this
 /// is a separate definition rather than a shared one; it mirrors
-/// `amd64/src/fd.rs`'s `encode_stat` field for field.
+/// `crates/akuma-kernel-amd64/src/fd.rs`'s `encode_stat` field for field.
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -2145,7 +2145,7 @@ pub fn spawn_pty(path: &str, args: Option<&[&str]>, env: &[&str]) -> Option<Spaw
 /// getting a pipe or a session channel of its own. Honoured only by the amd64
 /// kernel (the one whose console is an input device); the AArch64 kernel
 /// ignores the bit and spawns an ordinary piped child. Keep in sync with
-/// `SPAWN_FLAG_CONSOLE` in `amd64/src/usermode.rs`.
+/// `SPAWN_FLAG_CONSOLE` in `crates/akuma-kernel-amd64/src/usermode.rs`.
 pub const SPAWN_FLAG_CONSOLE: u64 = 2;
 
 /// Spawn a child attached to the machine's console (see [`SPAWN_FLAG_CONSOLE`]).
@@ -2521,7 +2521,7 @@ pub const SIGKILL: u32 = 9;
 /// Request a whole-machine restart via `reboot(2)` — the same magic/cmd musl's
 /// `reboot()` wrapper sends. Both kernels decode it through the shared,
 /// host-tested `akuma_boot::decode` (`crates/akuma-syscalls-glue/src/reboot.rs`
-/// on AArch64, `amd64/src/reboot.rs` on x86_64), so this is the one call a
+/// on AArch64, `crates/akuma-kernel-amd64/src/reboot.rs` on x86_64), so this is the one call a
 /// userspace program needs — no `/bin/busybox reboot` or any other on-disk
 /// binary required, which is the point: it works even when nothing else on
 /// the disk can be exec'd. `paws`'s `reboot` builtin (`userspace/paws`) is the

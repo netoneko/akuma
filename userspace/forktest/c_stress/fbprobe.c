@@ -1,6 +1,6 @@
 /* fbprobe — /dev/fb0 through the Linux fbdev ABI, raw syscalls only.
  *
- * The kernel side is amd64/src/fbdev.rs + crates/akuma-fbdev (2026-10-03). Same binary runs on a
+ * The kernel side is crates/akuma-kernel-amd64/src/fbdev.rs + crates/akuma-fbdev (2026-10-03). Same binary runs on a
  * Linux box with a framebuffer, which is how its expected output is calibrated. Prints a rung
  * before each step so a hang names itself; exit 0 only if every rung passed.
  *

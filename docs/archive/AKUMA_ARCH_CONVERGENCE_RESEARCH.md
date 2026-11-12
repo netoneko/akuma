@@ -167,7 +167,7 @@ Less than the line counts suggest, but the load-bearing pieces are the worst one
 
 ## 3. The classification
 
-### 3.1 Extract — neutral logic out of `amd64/src/` into the shared crates
+### 3.1 Extract — neutral logic out of `crates/akuma-kernel-amd64/src/` into the shared crates
 
 Ordered by leverage; each item names the crate that already owns the decisions, so
 extraction is *adoption + moving effects*, not design work.
@@ -242,7 +242,7 @@ shape, with the gaps named:
 | TLB shootdown | IPI + `invlpg` (`akuma-boot-amd64` stub) | SGI + `TLBI …is` | REDUCING §3's "who" vocabulary is the open seam — an `invalidate(who, range)` neutral call with two impls closes it |
 | machine discovery | `akuma-multiboot2` + `akuma-ryzen-amd64` (ACPI/HVM start info) | `akuma-fdt` + `akuma-firecracker::describe` | both feed the neutral `MachineFacts` (M2) |
 | console device | COM1 via `akuma-port` | PL011 via `akuma-uart` | `akuma_primitives::console` hook stays neutral |
-| hypervisor host | `akuma-svm-amd64` + `amd64/src/kvm*` | — (AMD-V is an ISA fact) | `akuma-kvm-abi` already shared; an eventual aarch64 VHE backend slots in without re-shape |
+| hypervisor host | `akuma-svm-amd64` + `crates/akuma-kernel-amd64/src/kvm*` | — (AMD-V is an ISA fact) | `akuma-kvm-abi` already shared; an eventual aarch64 VHE backend slots in without re-shape |
 | drivers that exist on one side only | xHCI, NVMe, HDA, rtl8169, rtw89, i2c-hid, touchpad | rump stack, `akuma-net-unix` | protocol cores are already neutral crates; only machine wiring is local |
 
 ---
@@ -286,7 +286,7 @@ endpoints' metal-equivalent paths.
 
 | slice | content | gate beyond the standard battery |
 |---|---|---|
-| M0 | Census like B21 A0: classify every `amd64/src` file arch/neutral/neutral-after-hook with line counts; freeze baseline battery outputs under KVM (candidate-vs-HEAD discipline comes from taoxichuan's rig) | a table in this doc's follow-up; KVM baseline of `amd64/run.sh` + Firecracker boot recorded |
+| M0 | Census like B21 A0: classify every `crates/akuma-kernel-amd64/src` file arch/neutral/neutral-after-hook with line counts; freeze baseline battery outputs under KVM (candidate-vs-HEAD discipline comes from taoxichuan's rig) | a table in this doc's follow-up; KVM baseline of `amd64/run.sh` + Firecracker boot recorded |
 | M1 | **One boot spine** (E1): `boot::sequence(&MachineFacts)` in `akuma-boot-amd64`, both `kmain`s become fact-collectors, one capability-gated self-test list | PVH (KVM/Firecracker) *and* MB2 (TCG grub image) boot the same suite; amd64 metal entry unchanged |
 | M2 | **`MachineFacts` seam**: generalize `akuma-kernel-core::platform`'s machine-table idea into the neutral machine description both discovery paths fill (FDT on aarch64, PVH info/ACPI/MADT on amd64): RAM, console, timer, IRQ controller, SMP count, RNG, reboot conduit, disk/net presence | aarch64 kernel boots QEMU virt + Firecracker unchanged; amd64 unchanged; the seam has host tests |
 | M3 | mm adoption (E3): amd64's tree walk switches to `akuma-user-tree` plans (the GLM slice 3 remainder); `mm.rs` policy arms to `akuma-mmap` | amd64 fork/CoW battery + `cow_leak_gate`-equivalent (delta 0) under KVM; aarch64 untouched |
@@ -323,7 +323,7 @@ native coin of KVM:
   `scripts/amd64_selfhost_build.py` (in-guest kernel build) — both run inside the
   KVM guest, which is exactly why KVM access changes the merge's economics: the
   gates that used to need the ryzen now run on the bench.
-- kvm0 (the SVM hypervisor under `amd64/src/kvm*`) is unaffected by the merge and
+- kvm0 (the SVM hypervisor under `crates/akuma-kernel-amd64/src/kvm*`) is unaffected by the merge and
   needs metal/nested-SVM; it is *not* part of the KVM gate matrix. Linux-KVM and
   kvm0 are different machineries and must not be conflated in gates or docs.
 
@@ -358,7 +358,7 @@ known flake, and a KVM-vs-TCG comparison would manufacture phantom regressions).
   looser `rt_sigaction` vs the crate's strict `check`. A convergence slice that
   "simplifies" one of these breaks a kernel silently — each has a host test; the
   rule is one test per value.
-- **The unsafe budget is a ratchet.** `amd64/src` is at 57 production sites; E1–E9
+- **The unsafe budget is a ratchet.** `crates/akuma-kernel-amd64/src` is at 57 production sites; E1–E9
   must net *down*. New crates land at 0 or the gate fails by design.
 - **The self-host gates are behaviour.** The amd64 kernel builds itself in the guest
   (`scripts/amd64_selfhost_build.py`, `AKUMA_SELF_HOSTING_AMD64.md`), and taoxichuan
@@ -424,7 +424,7 @@ known flake, and a KVM-vs-TCG comparison would manufacture phantom regressions).
 **The slices** (each = host tests on touched crates + budget gate + docs in the same
 commit + the KVM gate named below):
 
-- [ ] **M0 — census + baseline.** Classify every `amd64/src` file arch / neutral /
+- [ ] **M0 — census + baseline.** Classify every `crates/akuma-kernel-amd64/src` file arch / neutral /
   neutral-after-hook (B21 A0's method); freeze battery outputs under KVM for
   candidate-vs-HEAD comparison.
 - [ ] **M1 — one boot spine (E1).** `boot::sequence(&MachineFacts)` in
@@ -467,7 +467,7 @@ accelerator**; Linux-KVM gates never stand in for kvm0/nested-SVM gates.
                                                                         Linux-KVM gates never
    THE LADDER                                                           stand in for kvm0/nested-SVM
    .........
-      M0  census of amd64/src + KVM baseline frozen
+      M0  census of crates/akuma-kernel-amd64/src + KVM baseline frozen
        |
       M1  ONE BOOT SPINE (E1)
        |    boot::sequence(&MachineFacts); one capability-gated

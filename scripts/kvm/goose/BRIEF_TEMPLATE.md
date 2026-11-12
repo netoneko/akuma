@@ -42,18 +42,18 @@ herd rotates `vm-dev.log` mid-boot. Update this block when a session proves a ne
 `taoxichuan/` is a **composition root**, not a kernel written from scratch. At the start of stage 7 it was 4,450 newly written lines
 (`main.rs` 2,928) next to 101 existing crates and a full amd64 kernel that already implements nearly every syscall you will meet.
 Before you write any syscall arm, subsystem or helper of more than about 20 lines:
-1. **Look first**: `grep -rn "<name>" crates/ amd64/src/` for the syscall or concept; skim `docs/reference/crate-safety.md` and
+1. **Look first**: `grep -rn "<name>" crates/ crates/akuma-kernel-amd64/src/` for the syscall or concept; skim `docs/reference/crate-safety.md` and
    `ls crates/` for the crate that owns it (`akuma-syscalls-glue` and the `akuma-syscalls-*` family, `akuma-fdtable`, `akuma-vfs`,
    `akuma-ext2`, `akuma-net`, `akuma-exec`, `akuma-ring3-amd64`, `akuma-svm-amd64`).
 2. **It exists in a crate**: add a path dependency and call it. Do not copy it.
-3. **It exists only in `amd64/src/`**: extract it into a crate first (`akuma-<thing>`, named for what it owns; keep `#![forbid(unsafe_code)]`
+3. **It exists only in `crates/akuma-kernel-amd64/src/`**: extract it into a crate first (`akuma-<thing>`, named for what it owns; keep `#![forbid(unsafe_code)]`
    where it can, `scripts/check_unsafe_budget.py` gates new `unsafe`), make `amd64/` depend on the crate too, then depend on it from
    `taoxichuan/`. One implementation, two consumers.
 3b. **It exists, but welded to `Process`/`akuma-exec`**: that is a seam to cut, not a reason to write it again. The tree's own method is extracting the pure
    part into a leaf crate the process model does not reach (`akuma-exec-core`, `akuma-sntp` split out of `akuma-syscalls-time`, `akuma-pipe`, `akuma-fdtable`); a cargo
    feature that makes the heavy dependency optional is the other way. Say which, and what it costs (`akuma-syscalls-glue` has 28 path deps; every one of its features is a
    syscall-family toggle and none cuts `akuma-exec`, so the cut does not exist yet).
-   **Survey first**: diff `amd64/Cargo.toml`'s `akuma-*` dependencies against `taoxichuan/Cargo.toml`'s. The ones amd64 uses and Taoxichuan does not (e.g. `akuma-sntp`,
+   **Survey first**: diff `crates/akuma-kernel-amd64/Cargo.toml`'s `akuma-*` dependencies against `taoxichuan/Cargo.toml`'s. The ones amd64 uses and Taoxichuan does not (e.g. `akuma-sntp`,
    `akuma-cmos-rtc`, `akuma-syscalls-{linux,abi,poll,mem,net}`, `akuma-pipe`, `akuma-exec-core`, `akuma-port`, `akuma-tty`) are the first candidates for every milestone.
 4. **It exists nowhere**: write it, in a crate with host tests where the logic is pure, and say why in the RESULT file.
 In every RESULT file report, per arm or feature you added: *pulled* / *extracted* / *written new (why)*, and `wc -l taoxichuan/src/*.rs`

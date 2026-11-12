@@ -12,7 +12,7 @@
 //!
 //! * a **mechanism**: form the `0xCF8` address word, do the `inl`/`outl`, and
 //!   the write-1s/read-back/restore dance that sizes a BAR (in
-//!   `amd64/src/pci.rs`, because it is `unsafe` port I/O), and
+//!   `crates/akuma-kernel-amd64/src/pci.rs`, because it is `unsafe` port I/O), and
 //! * **parsing**: the type-0 header, the BAR encoding, the capability list —
 //!
 //! and this crate is the second half, so it can be host-tested against real

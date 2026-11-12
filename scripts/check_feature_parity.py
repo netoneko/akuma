@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ratchet on feature drift between the two full kernels' manifests.
 
-The AArch64 kernel (root `Cargo.toml`) and the amd64 kernel (`amd64/Cargo.toml`) each carry a
+The AArch64 kernel (root `Cargo.toml`) and the amd64 kernel (`crates/akuma-kernel-amd64/Cargo.toml`) each carry a
 hand-written feature table, and 16 names appear in both (`smp-shared`, the seven `sc-*`,
 ...). Each must forward the same *crate* features, or a flag turned on for one kernel is
 silently not turned on for the other (`docs/archive/AKUMA_FEATURE_AUDIT.md`, finding 1).
@@ -27,7 +27,7 @@ import tomllib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "docs", "reference", "feature-parity-baseline.json")
-A64, AMD64 = "Cargo.toml", os.path.join("amd64", "Cargo.toml")
+A64, AMD64 = "Cargo.toml", os.path.join("crates", "akuma-kernel-amd64", "Cargo.toml")
 
 
 def load(path):
