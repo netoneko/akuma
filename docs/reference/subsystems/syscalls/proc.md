@@ -104,6 +104,8 @@ PID + open fds; strips O_CLOEXEC fds); not spawn-as-exec.
 - `read_request` (shared with Taoxichuan): path against `cwd`, argv/envp under
   an `akuma_syscalls_proc::exec::Budget` — `MAX_ARG_STRLEN` per string, argv
   *and* envp; NULL/empty argv becomes `[path]`.
+  Akuma's `spawn` (301) reads its arguments through the same function on both
+  kernels.
 - `run` (shared): execute permission on the symlink-resolved path, the
   `ETXTBSY` pin, the `#!` hop, `ExecArch::{read, load}`, then — past the point
   of no return — `stop_siblings`, the `MAP_SHARED` write-back, and inside

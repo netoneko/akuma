@@ -2475,8 +2475,34 @@ with no altstack set, and `akuma-exceptions` re-pends such a signal on purpose (
 Go's `SIGURG` before `mstart`'s `sigaltstack`); Linux delivers it on the thread stack. The
 pthread rung involves no `execve`.
 
-Next: `spawn` (`sys_spawn`/`register_exec_process`/`spawn_process_task` on amd64, ~750 lines)
-onto the same `ExecArch` loads.
+### Spawn's arguments: one reader (2026-11-12)
+
+The first piece of `spawn`. Both kernels' `spawn` (Akuma's 301) now read path, argv and envp through
+`execve::read_request`, the reader `execve` uses. amd64's `user_cstr`, `user_strv` and
+`process_relative_path` are deleted.
+
+On AArch64 this changes glue's `sys_spawn`, which used `parse_argv_array`:
+
+- an over-long (`MAX_ARG_STRLEN`) or unreadable argv/envp string is `E2BIG`/`EFAULT`;
+  `parse_argv_array` ended the list there and spawned with what it had, the truncation
+  `execve` stopped doing in 2026-08;
+- a relative path resolves against the caller's `cwd`, as amd64's spawn and both `execve`s do;
+- a path may be `PATH_MAX` long (was 512 on AArch64, 256 on amd64).
+
+`spawn_ext` (315) is unchanged and still glue's on both kernels.
+
+What keeps amd64's 301 apart is not the arguments: it registers a `SPAWN` row and a task slot
+(`spawn_process_task`, `register_exec_process`) that its own `waitpid` (303) and the console
+(`SPAWN_FLAG_CONSOLE`) read, and ten boot tests call it directly. `spawn_ext` children on the same
+kernel go through `akuma-exec`'s `spawn_process_with_creds` and are reaped without a row, so the
+row is not load-bearing for reaping; converging 301 means routing it to glue and giving
+`SPAWN_FLAG_CONSOLE` a home there. That needs the ssh-session harness
+(`scripts/utils/amd64_ring3_check.py`) as its gate.
+
+Gates: clippy (AArch64; amd64 `headless`, `headless,no-tests`; amd64 tests crate; Taoxichuan);
+boot suites unchanged (amd64 TCG 823/833/833, AArch64 HVF 312/320/318); `sshd` sessions on
+both, which spawn their shells through 301.
+
 
 ### Slice 5: mm (deferred, 2026-11-11)
 

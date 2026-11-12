@@ -3258,23 +3258,6 @@ fn report_unknown_syscall(nr: u64) {
     serial::puts(" — returning ENOSYS (add it to akuma-syscalls-abi's table)\n");
 }
 
-/// Read a NUL-terminated string from user memory, bounded.
-fn user_cstr(ptr: u64, max: usize) -> Option<alloc::vec::Vec<u8>> {
-    crate::uaccess::read_cstr(ptr, max)
-}
-
-/// Parse a NULL-terminated array of C-string pointers, bounded at `max`
-/// entries — `None` if the caller's array is longer than that.
-///
-/// **`None` rather than a short list, and that distinction is the whole
-/// function.** Until 2026-09-12 this returned whatever fitted, so an `execve`
-/// with more arguments than [`loader::MAX_ARGV`] started the program with a
-/// command line that was well-formed and wrong. `rustc` and `collect2` both
-/// build linker invocations of forty-odd arguments; the linker ran without its
-/// `-o` and without its inputs, and said so in its own vocabulary
-/// (`no input files`, `cannot open output file a.out`) with nothing pointing
-/// at the kernel. `E2BIG` is what Linux answers and is impossible to
-/// misattribute.
 /// One `execve`'s argument budget, across argv and envp together
 /// (`akuma_syscalls_proc::exec`): the initial stack is where every string lands
 /// ([`loader::build_stack`]), so half of it is the honest ceiling on their total.
@@ -3284,51 +3267,6 @@ fn exec_arg_budget() -> akuma_syscalls_proc::exec::Budget {
         akuma_config::MAX_ARG_STRLEN,
         ELF_STACK_PAGES * 4096 / 2,
     )
-}
-
-fn user_strv(
-    ptr: u64,
-    max: usize,
-    budget: &mut akuma_syscalls_proc::exec::Budget,
-) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
-    // `budget` ([`exec_arg_budget`]) is charged as each string is read.
-    // Refusing here rather than at the stack build keeps the kernel from copying
-    // megabytes out of ring 3 to build an argv that cannot be placed — and
-    // `build_stack` still has its own `rsp < base` check, because this one is
-    // about the copy and that one is about the arithmetic.
-    let mut out = alloc::vec::Vec::new();
-    if ptr == 0 {
-        return Some(out);
-    }
-    let entry = |i: usize| crate::uaccess::read_val::<u64>(ptr + (i as u64) * 8).unwrap_or(0);
-    for i in 0..max {
-        // A bad array pointer ends the list, like a NULL entry would.
-        let p = entry(i);
-        if p == 0 {
-            return Some(out);
-        }
-        // **An over-long string fails the whole call; it does not end the
-        // list.** This read was capped at 512 bytes and answered `None` by
-        // returning what it had so far, which is the silent-truncation shape
-        // this tree has paid for twice: session 3's `argv` cap of 16 ran every
-        // linker without its inputs, and glue's own `parse_argv_array` had the
-        // identical `break` (rustc saw `--check-cfg` with its value gone).
-        // Measured 2026-09-13: `sh -c "<667-byte command>"` lost the command
-        // and the child reported `sh: -c requires an argument` — a 512-byte
-        // argument is nothing unusual in a `cargo`-generated `rustc` line.
-        //
-        // `MAX_ARG_STRLEN` is the shared cap glue uses, so the two kernels
-        // refuse the same argument rather than one of them mangling it.
-        let s = user_cstr(p, akuma_config::MAX_ARG_STRLEN)?;
-        budget.charge(s.len()).ok()?;
-        out.push(s);
-    }
-    // `max` entries and still no terminator: the caller has more to say than
-    // this target can place on the initial stack.
-    if entry(max) != 0 {
-        return None;
-    }
-    Some(out)
 }
 
 /// `Image::from_elf_argv_envp`'s rejection strings, mapped to the errno Linux
@@ -3363,38 +3301,6 @@ fn exec_load_errno(e: &str) -> u64 {
         return errno::ENOENT;
     }
     errno::ENOEXEC
-}
-
-/// A path from ring 3, resolved the way the calling process means it.
-///
-/// **`execve("./prog")` must mean the process's own directory, not `/`.** This
-/// target's `execve` and `sys_spawn` handed the raw string to
-/// `crate::fs::read_image`, which resolves symlinks and nothing else, so every
-/// relative path was read as if it started at the root. Two failures, and the
-/// second is the dangerous one:
-///
-/// * `cargo build && ./target/debug/prog` reported `not found` for a binary
-///   `ls` had just listed in that very directory — relative `open` goes through
-///   glue's `sys_openat`, which resolves against `cwd`, so the two syscalls
-///   disagreed about what a path meant.
-/// * With a same-named file at the root, the exec **silently ran the wrong
-///   program**: `cd /tmp/hi/target/debug && ./hi` ran `/hi`, left over from an
-///   earlier session, and printed its output as if it were the build's.
-///
-/// `execve` resolves through glue's `execve::read_request`; `sys_spawn` still
-/// restates the rule here (until spawn is shared too): absolute paths are already absolute, a relative
-/// path is joined to `Process::cwd`, and a caller with no registered process
-/// (a kernel task running the boot suite) keeps what it passed.
-///
-/// Not PATH lookup — `execve(2)` does not search `PATH` and neither does this.
-fn process_relative_path(path: &str) -> alloc::string::String {
-    if path.starts_with('/') {
-        return alloc::string::String::from(path);
-    }
-    match current_process() {
-        Some(proc) => akuma_vfs_glue::resolve_path(&proc.cwd, path),
-        None => alloc::string::String::from(path),
-    }
 }
 
 /// `execve(path, argv, envp)` — x86_64 syscall 59: glue's `execve::run` over
@@ -3833,43 +3739,26 @@ pub fn sys_spawn(
         }
     }
 
-    let Some(path_bytes) = user_cstr(path_ptr, 256) else {
-        return errno::EFAULT;
+    // Path against the caller's `cwd`, argv/envp under one budget: the same
+    // reader as `execve` (glue's `execve::read_request`) and as the AArch64
+    // kernel's `spawn`.
+    let mut budget = exec_arg_budget();
+    let req = match akuma_syscalls_glue::execve::read_request(
+        path_ptr,
+        argv_ptr,
+        envp_ptr,
+        loader::MAX_ARGV,
+        loader::MAX_ENVP,
+        &mut budget,
+    ) {
+        Ok(r) => r,
+        Err(r) => return r,
     };
-    let Ok(path) = core::str::from_utf8(&path_bytes) else {
-        return errno::EINVAL;
-    };
-
-    // Same helper as `sys_execve`: symlink-resolved, chunked, fallible — so a
-    // spawn of a link, or of any binary over 16 MiB, loads instead of failing
-    // as ENOENT. The VFS error is passed through, not flattened.
-    // Cwd-relative, exactly as `sys_execve` is — a spawn of `./prog` from a
-    // shell means the shell's directory.
-    let path = process_relative_path(path);
+    let (path, argv_owned, envp_owned) = (req.path, req.argv, req.envp);
     let path = path.as_str();
     let head = match crate::fs::read_image_head(path) {
         Ok(head) => head,
         Err(e) => return akuma_syscalls_glue::fs::fs_error_to_errno(e),
-    };
-
-    // argv[0] defaults to the path if the caller passed none.
-    let mut budget = exec_arg_budget();
-    let argv_owned = {
-        let Some(mut v) = user_strv(argv_ptr, loader::MAX_ARGV, &mut budget) else {
-            return crate::fd::errno::E2BIG;
-        };
-        if v.is_empty() {
-            v.push(path_bytes.clone());
-        }
-        v
-    };
-    // The environment, which this arm named `_envp` and threw away until
-    // `AMD64_SSH_TERM_SIZE_NOT_PASSED.md` break 8: **no** environment reached
-    // any spawned child on this target, so anything reading `TERM`, `PATH`,
-    // `HOME` or `TZ` got nothing. `sys_execve` has always honoured it through
-    // the same loader entry point; this is that call, with the same caps.
-    let Some(envp_owned) = user_strv(envp_ptr, loader::MAX_ENVP, &mut budget) else {
-        return crate::fd::errno::E2BIG;
     };
     let argv_refs: alloc::vec::Vec<&[u8]> =
         argv_owned.iter().map(alloc::vec::Vec::as_slice).collect();

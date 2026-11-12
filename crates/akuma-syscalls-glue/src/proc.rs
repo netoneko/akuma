@@ -877,9 +877,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // never the count: the counts here are only a sanity bound, and the real
     // byte limit is the stack builder's refusal (`E2BIG`) once the strings
     // and their pointer arrays do not fit the eager stack.
-    let stack = akuma_exec::runtime::config().user_stack_size;
-    let mut budget = akuma_syscalls_proc::exec::Budget::new(usize::MAX, akuma_config::MAX_ARG_STRLEN, stack);
-    let req = match super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut budget) {
+    let req = match super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget()) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -895,10 +893,25 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     do_execve(req)
 }
 
-/// The most argv (and, separately, envp) entries `execve` reads; see
-/// [`sys_execve`].
+/// The most argv (and, separately, envp) entries `execve` and `spawn` read;
+/// see [`sys_execve`].
 #[cfg(feature = "exec")]
 const EXEC_MAX_STRINGS: usize = 1 << 20;
+
+/// `execve`'s and `spawn`'s argument budget: `MAX_ARG_STRLEN` per string and
+/// the user stack in all. The stack builder's `E2BIG` is the real limit; this
+/// one stops the copy out of user memory before it gets that far.
+#[cfg(feature = "exec")]
+fn native_arg_budget() -> akuma_syscalls_proc::exec::Budget {
+    let stack = akuma_exec::runtime::config().user_stack_size;
+    akuma_syscalls_proc::exec::Budget::new(usize::MAX, akuma_config::MAX_ARG_STRLEN, stack)
+}
+
+/// A string from user memory as UTF-8, without a copy when it already is.
+#[cfg(feature = "exec")]
+fn utf8_lossy_owned(b: Vec<u8>) -> String {
+    String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
 
 /// An argv as the debug line prints it, `["a", "b"]`, without building it on the heap.
 #[cfg(feature = "exec")]
@@ -1703,16 +1716,17 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     // as a terminal so the kernel line discipline runs (sshd sets it for an
     // interactive login shell — the client's `pty-req`).
     let pty = (flags & SPAWN_FLAG_PTY) != 0;
-    let path = copy_from_user_str(path_ptr, 512)?;
-    
-    let args_vec = parse_argv_array(argv_ptr);
-    let env_vec = parse_argv_array(envp_ptr);
-    
-    let args_refs: Vec<&str> = if args_vec.len() > 1 {
-        args_vec.iter().skip(1).map(alloc::string::String::as_str).collect()
-    } else {
-        Vec::new()
-    };
+    // Path against the caller's `cwd`, argv/envp under one budget: the same
+    // reader as `execve` and as the amd64 kernel's `spawn`. An over-long or
+    // unreadable string fails the call (`E2BIG`/`EFAULT`) instead of ending
+    // the list where it stood.
+    let req = super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget())?;
+    let path = req.path;
+    // `spawn_process_with_channel_ext` takes argv without argv[0] (it names
+    // the program by `path`) and the strings as UTF-8.
+    let args_vec: Vec<String> = req.argv.into_iter().skip(1).map(utf8_lossy_owned).collect();
+    let env_vec: Vec<String> = req.envp.into_iter().map(utf8_lossy_owned).collect();
+    let args_refs: Vec<&str> = args_vec.iter().map(String::as_str).collect();
     
     let stdin_data = if stdin_ptr != 0 {
         if !BYPASS_VALIDATION.load(Ordering::Acquire)
