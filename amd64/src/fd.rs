@@ -152,21 +152,6 @@ use crate::serial;
 // the arms that used it (`utimensat`, 4b batch 3c). `akuma-syscalls-glue`'s
 // `fs_error_to_errno` is the one table now.
 
-/// Does the path this descriptor names a directory?
-///
-/// The replacement for `Entry::is_dir`, which was a bool five constructors had
-/// to set correctly and which `akuma-syscalls-glue` does not have — glue
-/// refuses a write open of a directory at `open(2)` and otherwise lets the VFS
-/// answer, so this target grew the same shape ahead of the fold.
-///
-/// `/proc` used to be asked of a synthetic view here, ahead of the VFS, because
-/// this target rendered that namespace itself. It does not any more: the
-/// mounted `ProcFilesystem` answers `metadata` for `/proc` and everything under
-/// it, so one question suffices.
-fn path_is_dir(path: &str) -> bool {
-    fs::metadata(path).is_ok_and(|m| m.is_dir)
-}
-
 /// Linux errno values, negated as the kernel ABI returns them.
 pub mod errno {
     pub const EBADF: u64 = (-9i64) as u64;
@@ -951,97 +936,6 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
     akuma_syscalls_glue_amd64::pread64(fd, buf, len, offset)
 }
 
-/// Copy `dst.len()` bytes of `fd`'s cached contents starting at byte `offset`
-/// into `dst`, returning how many were actually available.
-///
-/// The backing for `mmap(MAP_PRIVATE, fd)` — see `mm::sys_mmap`. `None` means
-/// `fd` is not a regular file, which is the one case a file mapping must refuse
-/// rather than serve.
-///
-/// Bytes past the end of the file are **not written**, so the caller's buffer
-/// keeps whatever it had there. Every caller hands in a freshly zeroed page,
-/// which is what makes that the right split: a mapping that extends past EOF
-/// reads as zeros, exactly as `mmap(2)` specifies for the partial last page.
-///
-/// The descriptor's bytes at `offset`, for `mmap(MAP_PRIVATE, fd)` — see
-/// `mm::sys_mmap`. `None` means `fd` is not a regular file, which is the one
-/// case a file mapping must refuse rather than serve.
-///
-/// Bytes past the end of the file are **not written**, so the caller's buffer
-/// keeps whatever it had there. Every caller hands in a freshly zeroed page,
-/// which is what makes that the right split: a mapping that extends past EOF
-/// reads as zeros, exactly as `mmap(2)` specifies for the partial last page.
-///
-/// A `/proc` file is rendered by its filesystem per read; a real file's page
-/// comes off the VFS.
-pub fn file_bytes_at(fd: u64, offset: usize, dst: &mut [u8]) -> Option<usize> {
-    // A directory needs no guard of its own: `fs::read_at` below refuses one
-    // (`NotAFile`), and this function's contract is already `None` for
-    // anything a `MAP_PRIVATE` file mapping must not be served from.
-    // **By inode, not by path** — the same read `read(2)` does, for the same
-    // reason and with much more at stake here.
-    //
-    // `read_at(path, ..)` resolves the path from the mount table down, per call.
-    // This function is called **once per 4 KiB page of a file mapping**, so a
-    // 300 MB shared object cost ~76 800 full directory walks and ~76 800 heap
-    // allocations for the `String` clone — inside `sys_mmap`, holding the BKL,
-    // while every other core spun. That is what made `rustc --version` (which
-    // maps `librustc_driver` and reads a sliver of it) take 16 s on the metal
-    // and fill the console with `[BKL] stuck … tag=9`.
-    //
-    // `open(2)` already resolved this descriptor to an inode and pinned it, so
-    // the walk was re-deriving something the fd has been holding all along.
-    // With `inode != 0` the path is not touched at all, which is why it is only
-    // cloned when there is no inode to use.
-    let (path, mount_id, inode) = table_with(fd, |d| match d {
-        FileDescriptor::File(f) => {
-            let inode = f.inode();
-            let path = if inode == 0 { Some(f.path.clone()) } else { None };
-            Some((path, f.mount_id(), inode))
-        }
-        _ => None,
-    })??;
-    // Real file: the page comes off the VFS. A read error fills nothing —
-    // the caller's freshly zeroed page shows through, which is the same
-    // answer "past EOF" gets, and the only kind thing a fault path can do
-    // with an I/O error anyway.
-    fs::read_at_open_file(path.as_deref().unwrap_or(""), mount_id, inode, offset, dst).ok()
-}
-
-/// The file identity a **demand-paged mapping** must remember: `(mount_id,
-/// inode, size)`.
-///
-/// `None` for anything that cannot be mapped lazily — a descriptor that is not a
-/// file, or one `open(2)` resolved no inode for (`inode == 0`, "read by path").
-/// A lazy mapping outlives the descriptor that created it: `ld.so` `mmap`s a
-/// shared object and closes the fd immediately, and every fault after that has
-/// no fd to ask. The pair is what [`akuma_vfs_glue::fs::read_at_open_file`]
-/// needs to answer without one, and it is the same pair the page cache is keyed
-/// by — an inode number alone does not name a file across two mounts.
-///
-/// The **size** is read here, once, rather than at each fault: it is where the
-/// file's data stops, and a mapping may legitimately extend past it — `mmap(2)`
-/// specifies the remainder of the last page, and every page after it, as zero.
-/// A fault path that re-`stat`ed to learn that would pay a metadata read per
-/// page for a number that, for a `MAP_PRIVATE` mapping, is not allowed to
-/// change the mapping's contents anyway.
-#[must_use]
-pub fn file_identity(fd: u64) -> Option<(u32, u32, usize)> {
-    // A `/dev` node has no inode to map from, exactly as in `is_regular_file`.
-    if dev_node_of(fd).is_some() {
-        return None;
-    }
-    let (path, mount_id, inode) = table_with(fd, |d| match d {
-        FileDescriptor::File(f) => Some((f.path.clone(), f.mount_id(), f.inode())),
-        _ => None,
-    })??;
-    if inode == 0 {
-        return None;
-    }
-    let meta = akuma_vfs_glue::fs::metadata_open_file(&path, mount_id, inode).ok()?;
-    Some((mount_id, inode, meta.size as usize))
-}
-
 /// Read from a file **by inode**, with no descriptor involved.
 ///
 /// [`file_bytes_at`]'s counterpart for a mapping whose fd is long gone. The two
@@ -1080,43 +974,6 @@ pub fn file_write_identity(fd: u64) -> Option<(alloc::string::String, u32, u32, 
     }
     let meta = akuma_vfs_glue::fs::metadata_open_file(&path, mount_id, inode).ok()?;
     Some((path, mount_id, inode, meta.size as usize))
-}
-
-/// Is `fd` a regular file — something `mmap` can back a mapping with?
-///
-/// Separate from [`file_bytes_at`] because `mmap` has to refuse a socket, a pipe
-/// or a directory **before** it places a region, and a zero-byte answer from the
-/// copy is not the same thing as "this cannot be mapped".
-#[must_use]
-pub fn is_regular_file(fd: u64) -> bool {
-    // A `/dev` node is a `KernelFile` here too, and it is **not** mappable:
-    // `file_bytes_at` would ask `fs::read_at` for bytes the node has no inode
-    // to hold, and a file mapping served as zeros is the one failure
-    // `sys_mmap`'s file arm exists to refuse.
-    if dev_node_of(fd).is_some() {
-        return false;
-    }
-    // "Not a directory", asked of the path. A `/proc` *file* stays
-    // mappable exactly as it was — [`file_bytes_at`] serves it from a fresh
-    // render — and a synthetic `/proc` directory is refused.
-    table_with(fd, |d| match d {
-        FileDescriptor::File(f) => Some(f.path.clone()),
-        _ => None,
-    })
-    .flatten()
-    .is_some_and(|p| !path_is_dir(&p))
-}
-
-/// `Some(EBADF)` when `fd` names a regular file opened `O_RDONLY`, `None`
-/// otherwise. `write(2)` gets this refusal from glue's `sys_write`;
-/// `mm::sys_mmap` asks it to refuse a shared-writable mapping of such an fd.
-#[must_use]
-pub fn write_mode_refusal(fd: u64) -> Option<u64> {
-    table_with(fd, |d| match d {
-        FileDescriptor::File(f) => (f.flags & open_flags::O_ACCMODE == 0).then_some(errno::EBADF),
-        _ => None,
-    })
-    .flatten()
 }
 
 /// `write(fd, buf, len)` on a **file** descriptor — **glue's arm** (4b batch

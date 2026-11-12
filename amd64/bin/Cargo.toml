@@ -39,7 +39,6 @@ headless = ["akuma-kernel-amd64/default", "akuma-drivers-amd64/storage-and-input
 ring0-preempt = ["akuma-kernel-amd64/ring0-preempt", "akuma-kernel-tests-amd64/ring0-preempt"]
 syscall-debug-info = ["akuma-kernel-amd64/syscall-debug-info"]
 pmm-forensics = ["akuma-kernel-amd64/pmm-forensics"]
-mm-forensics = ["akuma-kernel-amd64/mm-forensics"]
 linux-extra-syscalls = ["akuma-kernel-amd64/linux-extra-syscalls"]
 sc-epoll = ["akuma-kernel-amd64/sc-epoll"]
 sc-eventfd = ["akuma-kernel-amd64/sc-eventfd"]

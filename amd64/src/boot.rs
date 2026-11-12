@@ -190,6 +190,7 @@ pub fn install_shared_sinks() {
         // `munmap`'s amd64 half: shared writable file pages live in
         // `shmpages`, which glue's frame sweep does not know.
         release_shared_write: crate::mm::release_shared_write,
+        shared_write_backing: crate::mm::shared_write_backing,
     });
     // This kernel's character devices, behind glue's fd arms (`crate::chardev`).
     crate::chardev::register();

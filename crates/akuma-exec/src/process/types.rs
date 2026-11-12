@@ -101,6 +101,20 @@ impl ProcessMemory {
     /// `kernel_va_end()` for why this must track RAM size.
     pub const KERNEL_VA_END: usize   = 0xC000_0000;
 
+    /// The part of the user half no user mapping may take: the AArch64
+    /// kernel's RAM identity map, whose dynamic top scales with RAM (the 2 GB
+    /// const put mappings inside it on bigger machines, the rustc MEMORY>2GB
+    /// crash). amd64 keeps its kernel in the upper half and has none; its
+    /// dynamic linker loads at 1 GiB (`INTERP_BASE`), inside the AArch64 hole.
+    #[must_use]
+    pub fn kernel_hole() -> core::ops::Range<usize> {
+        if cfg!(all(target_arch = "x86_64", target_os = "none")) {
+            0..0
+        } else {
+            Self::KERNEL_VA_START..crate::mmu::kernel_va_end()
+        }
+    }
+
     /// Place `size` bytes: first fit over `regions` from the cursor, wrapping
     /// once, inside `[mmap_base, mmap_limit)` and never in the kernel RAM
     /// identity-map hole. Advances the cursor past the placement.
@@ -113,10 +127,7 @@ impl ProcessMemory {
         let w = akuma_mmap::place::Window {
             lo: self.mmap_base.load(Ordering::Relaxed),
             hi: self.mmap_limit.load(Ordering::Relaxed),
-            // Dynamic top, which scales with RAM: the 2 GB-machine const put
-            // mappings inside the identity map on bigger machines (the rustc
-            // MEMORY>2GB crash).
-            hole: Self::KERNEL_VA_START..crate::mmu::kernel_va_end(),
+            hole: Self::kernel_hole(),
         };
         let base = akuma_mmap::place::find_free_va_from(regions, size, self.next_mmap.load(Ordering::Relaxed), &w).0?;
         self.next_mmap.store(base + size, Ordering::Relaxed);

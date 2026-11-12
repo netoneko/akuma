@@ -82,6 +82,7 @@ pub fn install(k: Kernel) {
         dev_mouse_has_events: || false,
         dev_tun_has_frame: || false,
         release_shared_write: |_, _| {},
+        shared_write_backing: |_, _| akuma_syscalls_glue::mem::SharedWrite::Glue,
     });
     // Pipe wakes go to the thread by number, with a fresh handle: the handle a
     // parked writer recorded is not trusted to still name its slot.

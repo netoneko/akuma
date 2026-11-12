@@ -1437,6 +1437,12 @@ pub struct SyscallHooks {
     /// sweep knows nothing about; the AArch64 kernel's live in glue's own
     /// `SHARED_FILE_MAPPINGS` and it registers `|_, _| {}`.
     pub release_shared_write: fn(usize, usize),
+
+    /// Who keeps a writable `MAP_SHARED` file mapping of `(fd, offset)`
+    /// coherent: glue's write-back records (the AArch64 kernel, `|_, _|
+    /// SharedWrite::Glue`), or the kernel's shared writable table, which needs
+    /// the returned record on the region (amd64).
+    pub shared_write_backing: fn(i32, usize) -> mem::SharedWrite,
 }
 
 static HOOKS: akuma_primitives::OnceCopy<SyscallHooks> = akuma_primitives::OnceCopy::new();
@@ -1490,6 +1496,9 @@ pub(crate) mod hooks {
     }
     pub fn dev_tun_has_frame() -> bool {
         HOOKS.get().is_some_and(|h| (h.dev_tun_has_frame)())
+    }
+    pub fn shared_write_backing(fd: i32, offset: usize) -> crate::mem::SharedWrite {
+        HOOKS.get().map_or(crate::mem::SharedWrite::Glue, |h| (h.shared_write_backing)(fd, offset))
     }
     pub fn release_shared_write(start: usize, end: usize) {
         if let Some(h) = HOOKS.get() {

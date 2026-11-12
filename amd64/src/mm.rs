@@ -157,15 +157,6 @@ pub const MMAP_BASE: usize = 0x1_0000_0000;
 /// it by construction rather than by collision test.
 const MMAP_TOP: usize = 0x7000_0000_0000;
 
-/// The largest `len` this call will consider, for
-/// [`akuma_syscalls_mem::mmap::len_too_large`].
-///
-/// A bound rather than trust: `len` comes from a ring-3 register and drives
-/// `0..pages` loops. Past this the answer is `ENOMEM` — Linux's answer for a
-/// length it cannot map — rather than the old `EINVAL`, which was wrong for a
-/// caller that simply asked for more memory than exists.
-const MMAP_VA_SPAN: usize = MMAP_TOP - MMAP_BASE;
-
 /// One past the last user address. Above this is the kernel's half.
 ///
 /// Only `MAP_FIXED` needs it: automatic placement is confined to
@@ -179,17 +170,6 @@ const MMAP_VA_SPAN: usize = MMAP_TOP - MMAP_BASE;
 /// image at 511), so there is nothing of the kernel's down here to overlap. The
 /// half-space check below is the whole guard.
 const USER_VA_LIMIT: usize = 0x0000_8000_0000_0000;
-
-/// How many pages this target maps eagerly before `plan` calls a mapping lazy.
-///
-/// `akuma_config::MMAP_EAGER_MAX_PAGES`, the same 16 the AArch64 kernel uses,
-/// read from the shared config rather than restated — this is a tuning knob and
-/// two copies of a knob is one knob and one bug.
-///
-/// It was `usize::MAX` until 2026-09-07, which said "never lazy" honestly
-/// because there was no region table for the `#PF` handler to consult. There is
-/// now, and [`fault_in`] is what consults it.
-const EAGER_MAX_PAGES: usize = akuma_config::MMAP_EAGER_MAX_PAGES;
 
 /// This kernel's automatic-placement window. No hole: there is no identity
 /// map in the lower half here (`phys.rs`).
@@ -224,103 +204,6 @@ pub fn register_lazy_stack(top: u64, eager_pages: usize, max_pages: usize) {
     usermode::with_current_regions(|regions| insert_region_sorted(regions, region));
 }
 
-/// `mm-forensics`: prove the range `sys_mmap` is about to hand back is free.
-///
-/// Three independent readings of "free", because the interesting failures are
-/// the ones where they disagree:
-///
-/// * **`[MM-UNSORTED]`** — the region list is not in address order. The placer
-///   binary-searches it (`partition_point`) and terminates its scan on "the
-///   first region starting at or past `cand + len` proves the gap below is
-///   clear"; both are wrong on an unsorted list, and the O(1) guard inside the
-///   scan only compares the last two entries, so a list disordered anywhere
-///   else passes it. Reported before the other two, because it explains them.
-/// * **`[MM-OVERLAP]`** — a region record already covers part of the range.
-/// * **`[MM-LIVEPTE]`** — a present PTE already covers part of the range, which
-///   a region check cannot see: pages are mapped here that no region ever
-///   claimed (an ELF image under a `MAP_FIXED`, `unmap_range`'s own note), and
-///   a lost region record shows up as this and nothing else.
-///
-/// A `MAP_FIXED` placement is checked too. It is allowed to *replace*, but
-/// `unmap_range` has already retired what it replaced by the time this runs, so
-/// the range must be clear for it as well — a fixed mapping that still finds
-/// something there means the teardown missed it.
-///
-/// Reports and carries on rather than halting: the corruption this hunts is
-/// already loose by the time a later program notices it, and one line naming
-/// the address is worth more than a dead machine. Each report is a single
-/// [`StackWriter`](akuma_primitives::console::StackWriter) flush, for the reason
-/// `idt::user_fault` states — two cores reporting at once through several
-/// `puts` shred each other's lines.
-#[cfg(feature = "mm-forensics")]
-fn check_placement_free(base: usize, byte_len: usize, fixed: bool) {
-    use core::fmt::Write as _;
-
-    PLACEMENTS_CHECKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let end = base.saturating_add(byte_len);
-    let kind = if fixed { "fixed" } else { "auto" };
-
-    let overlap = usermode::with_current_regions(|regions| {
-        let unsorted = regions
-            .windows(2)
-            .position(|w| w[0].start_va > w[1].start_va);
-        let hit = regions
-            .iter()
-            .find(|r| r.start_va < end && r.start_va.saturating_add(r.len_bytes()) > base)
-            .map(|r| (r.start_va, r.len_bytes()));
-        (unsorted, hit, regions.len())
-    });
-    let Some((unsorted, hit, n_regions)) = overlap else {
-        return; // no process: nothing placed anything
-    };
-
-    if let Some(at) = unsorted {
-        let mut w = akuma_primitives::console::StackWriter::<256>::new();
-        let _ = writeln!(
-            w,
-            "[MM-UNSORTED] region list out of order at index {at} of {n_regions} \
-             (pid={}, placing {kind} 0x{base:x}..0x{end:x})",
-            crate::usermode::current_pid()
-        );
-        w.flush();
-    }
-
-    if let Some((r_start, r_len)) = hit {
-        let mut w = akuma_primitives::console::StackWriter::<256>::new();
-        let _ = writeln!(
-            w,
-            "[MM-OVERLAP] {kind} placement 0x{base:x}..0x{end:x} overlaps region \
-             0x{r_start:x}..0x{:x} (pid={}, {n_regions} regions)",
-            r_start.saturating_add(r_len),
-            crate::usermode::current_pid()
-        );
-        w.flush();
-    }
-
-    // The page table's own answer. Counted rather than listed: a range that is
-    // wholly live would otherwise print thousands of lines.
-    let mut live = 0usize;
-    let mut first_live = 0usize;
-    let _ = usermode::with_current_address_space(|uas| {
-        uas.for_each_leaf_in_range(base, end, |leaf| {
-            if live == 0 {
-                first_live = leaf.va;
-            }
-            live += 1;
-        });
-    });
-    if live != 0 {
-        let mut w = akuma_primitives::console::StackWriter::<256>::new();
-        let _ = writeln!(
-            w,
-            "[MM-LIVEPTE] {kind} placement 0x{base:x}..0x{end:x} already has {live} \
-             present page(s), first at 0x{first_live:x} (pid={})",
-            crate::usermode::current_pid()
-        );
-        w.flush();
-    }
-}
-
 /// How many placements [`check_placement_free`] has inspected.
 ///
 /// The positive control, and it is not optional: an instrument that reports
@@ -329,12 +212,6 @@ fn check_placement_free(base: usize, byte_len: usize, fixed: bool) {
 /// fault line, which is the one place a failing run is guaranteed to reach.
 pub static PLACEMENTS_CHECKED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
-
-/// The compiled-out half. An empty body rather than a `cfg` at the call site so
-/// the check cannot be forgotten when a second placement path appears.
-#[cfg(not(feature = "mm-forensics"))]
-#[inline(always)]
-fn check_placement_free(_base: usize, _byte_len: usize, _fixed: bool) {}
 
 /// Is the caller a slotted user task with an address space of its own?
 ///
@@ -366,448 +243,20 @@ fn pte_prot_for(prot: Prot, pa: usize) -> (PteProt, bool) {
     }
 }
 
-/// `mmap(addr, len, prot, flags, fd, offset)`.
-pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> u64 {
-    if len == 0 {
-        return errno::EINVAL;
-    }
-    let (prot32, flags32) = (prot as u32, flags as u32);
-    // `fd` arrives as a `u64` and Linux's is a signed `int`: the "no file"
-    // sentinel is -1, which is `u64::MAX` here, and truncating to `i32` is what
-    // turns it back into the -1 `plan` compares against.
-    let fd32 = fd as i32;
-
-    // Alignment first, before anything else looks at the request: the AArch64
-    // kernel does the same, and the ordering is asserted by its boot suite.
-    if akuma_syscalls_mem::mmap::fixed_addr_unaligned_einval(addr as usize, flags32) {
-        return errno::EINVAL;
-    }
-    // A fixed placement is checked against the user half here, beside the
-    // alignment rule and ahead of everything with an effect — the same reason
-    // the alignment check is first. `addr == 0` is a fixed request for the null
-    // page, which is never a real one and would make a null dereference
-    // succeed. Saturating, because `len` is a ring-3 register and a wrap would
-    // turn "spans the whole address space" into "fits".
-    if flags32 & (akuma_syscalls_linux::flags::map::MAP_FIXED
-        | akuma_syscalls_linux::flags::map::MAP_FIXED_NOREPLACE)
-        != 0
-    {
-        let want = addr as usize;
-        if want < PAGE_SIZE as usize
-            || want.saturating_add(len as usize) > USER_VA_LIMIT
-        {
-            return errno::EINVAL;
+/// The `shared_write_backing` hook: a writable `MAP_SHARED` file mapping on
+/// this kernel is served from the shared writable table (`shmpages`), which
+/// faults read through the region's [`akuma_mmap::SharedWriteBack`] record.
+/// The record carries the path the flush writes through; the inode pin comes
+/// with the region's file backing. No write identity (a `/dev` node, no
+/// inode) is a refusal: there is nothing to write back to.
+pub fn shared_write_backing(fd: i32, offset: usize) -> akuma_syscalls_glue::mem::SharedWrite {
+    use akuma_syscalls_glue::mem::SharedWrite;
+    match crate::fd::file_write_identity(u64::from(fd as u32)) {
+        Some((path, mount_id, inode, _size)) => {
+            SharedWrite::Table(akuma_mmap::SharedWriteBack { mount_id, inode, offset, path })
         }
+        None => SharedWrite::Refuse,
     }
-    if akuma_syscalls_mem::mmap::len_too_large(len as usize, MMAP_VA_SPAN) {
-        return errno::ENOMEM;
-    }
-
-    let pages = len.div_ceil(PAGE_SIZE) as usize;
-    let plan = akuma_syscalls_mem::mmap::plan(prot32, flags32, fd32, pages, EAGER_MAX_PAGES);
-
-    // `/dev/fb0`: the device's pixels, not a file's bytes — its own path, ahead
-    // of every file-mapping rule below (none of which apply to device memory).
-    if crate::fd::is_dev_fb(fd) {
-        return mmap_framebuffer(addr, len, prot32, flags32, offset);
-    }
-
-    // File-backed mappings (2026-09-07). The refusal that used to live here was
-    // right about the danger and too broad about the remedy — see the module
-    // header's "What a file mapping is here".
-    if plan.is_file_backed {
-        // Writable `MAP_SHARED` used to be refused here (`ENOSYS`) — right
-        // about the danger, and the refusal outlived its usefulness: what the
-        // refusal wanted was a page cache, and what ParityDB/`MmapMut` needs
-        // is narrower. Delivered 2026-09-22, per `Plan`'s own documented
-        // design ("mapped eagerly and written back on munmap/msync"): the
-        // mapping is served eager from the file exactly like any other eager
-        // file mapping below, the region carries a
-        // `MmapRegion::shared_write` record, and the flush is whole-region —
-        // no dirty tracking — on `munmap` (`unmap_range`), `msync`
-        // ([`sys_msync`]) and `madvise(MADV_DONTNEED)`
-        // (`dontneed_range`). Coherence caveats live on that record's doc.
-        //
-        // What is still refused, for the reasons the old arm gave:
-        // - an fd not opened for writing (`EACCES`): accepting the mapping
-        //   and dropping the writes would be the silent lie the old comment
-        //   warned about, one layer down;
-        // - a file with no write identity (a `/dev` node, or no path) —
-        //   there is nothing to write back *to*.
-        if plan.is_shared_writable {
-            if crate::fd::write_mode_refusal(fd).is_some() {
-                return errno::EACCES;
-            }
-            if crate::fd::file_write_identity(fd).is_none() {
-                return errno::EACCES;
-            }
-        }
-        // Linux requires a page-aligned offset and says `EINVAL` otherwise.
-        // Ahead of the descriptor probe because it is decidable from the
-        // arguments alone, which is the ordering rule the rest of this function
-        // follows and what lets the boot suite assert it with no open file.
-        if !offset.is_multiple_of(PAGE_SIZE) {
-            return errno::EINVAL;
-        }
-        // A socket, pipe or directory has no bytes to map.
-        if !crate::fd::is_regular_file(fd) {
-            return errno::EACCES;
-        }
-    }
-
-    // `PROT_WRITE | PROT_EXEC` is granted, as Linux grants it. Until
-    // 2026-10-08 it was refused here with `EINVAL` ("a JIT is not something
-    // this target supports"), and the same rule sat in `sys_mprotect`. V8 is
-    // a JIT: every Chromium renderer reserves a 512 MB `PROT_NONE` code range
-    // and then `mprotect`s the whole of it RWX, and the refusal killed each one
-    // on a `CHECK` (`[Fault] #BP`) while the browser waited for a renderer
-    // that never came. The ELF loader keeps its own stance for *segments*.
-    // Gate: `jitprobe.c`, on Linux first.
-    let region_prot = Prot::from_prot(prot32);
-
-    // Everything past this point has an **effect on an address space**, so there
-    // has to be one. Kept below the argument checks rather than above them
-    // because the ordering is load-bearing: the AArch64 kernel refuses a
-    // malformed request before it resolves a process, its boot suite asserts
-    // that, and a kernel-test caller with no current task must see `EINVAL`
-    // where Linux gives `EINVAL` — not `ESRCH`.
-    if !have_address_space() {
-        return errno::ESRCH;
-    }
-
-    let fixed = flags32 & akuma_syscalls_linux::flags::map::MAP_FIXED != 0;
-    let noreplace = !fixed && flags32 & akuma_syscalls_linux::flags::map::MAP_FIXED_NOREPLACE != 0;
-    let byte_len = pages * PAGE_SIZE as usize;
-
-    let base = if fixed {
-        let want = addr as usize;
-        // Rounding `len` up to a page can push the end past the half-space that
-        // the raw `len` cleared above, so the rounded extent is re-checked here.
-        if want.saturating_add(byte_len) > USER_VA_LIMIT {
-            return errno::EINVAL;
-        }
-        // `MAP_FIXED` **replaces**: whatever is there goes away first, mappings
-        // and region records alike. Doing this before reserving is what keeps
-        // the new region from being clipped by the teardown of the old one.
-        region_trace(format_args!(
-            "[MMT] MAP_FIXED va=0x{want:x} pages={pages} prot={:?} pid={}\n",
-            region_prot,
-            usermode::current_mm_pid(),
-        ));
-        unmap_range(want, want + byte_len);
-        want
-    } else if noreplace {
-        // `MAP_FIXED_NOREPLACE` (2026-10-09): exactly `addr`, or `EEXIST` if
-        // anything is mapped there — never moved, never replacing. It fell
-        // through to the hint arm before, so a free `addr` came back as
-        // wherever the cursor was (`forktest/c_stress/altstackexec.c`: the
-        // probe's fixed altstack landed elsewhere). Overlap is judged against
-        // the region list **and** the page table, because the ELF image, the
-        // stack and `brk` are mapped without a region record here. The page
-        // walk is capped (256 MiB); past that only the region list is asked.
-        let want = addr as usize;
-        if want.saturating_add(byte_len) > USER_VA_LIMIT {
-            return errno::EINVAL;
-        }
-        let overlaps = usermode::with_current_regions_and_cursor(|regions, _| {
-            regions.iter().any(|r| {
-                let end = r.start_va + r.pages * PAGE_SIZE as usize;
-                r.start_va < want + byte_len && want < end
-            })
-        })
-        .unwrap_or(true);
-        const WALK_CAP_PAGES: usize = 65_536;
-        let mapped = (0..pages.min(WALK_CAP_PAGES))
-            .any(|i| crate::paging::translate(want + i * PAGE_SIZE as usize).is_some());
-        if overlaps || mapped {
-            return errno::EEXIST;
-        }
-        want
-    } else {
-        // Without `MAP_FIXED` an address is a hint, and hints are advisory.
-        //
-        // Cursor and list under one hold: see `with_current_regions_and_cursor`.
-        // The cursor is advanced past the placement so the next `mmap` starts
-        // where this one ended instead of re-walking the arena from `MMAP_BASE`.
-        let Some(found) = usermode::with_current_regions_and_cursor(|regions, cursor| {
-            let hint = cursor.load(core::sync::atomic::Ordering::Relaxed);
-            let placed = find_free_va_from(regions, pages, hint).0;
-            if let Some(base) = placed {
-                cursor.store(
-                    base.saturating_add(byte_len),
-                    core::sync::atomic::Ordering::Relaxed,
-                );
-            }
-            placed
-        })
-        .flatten()
-        else {
-            return errno::ENOMEM;
-        };
-        found
-    };
-
-    // Reserve, then populate. The region goes in **first**, under the lock, so a
-    // concurrent `mmap` on another core cannot pick the same range; the frames
-    // are allocated after the lock is dropped, so the PMM is never entered from
-    // inside it. A `MAP_SHARED|MAP_ANONYMOUS` region is marked as such —
-    // `fork` must share it by identity rather than copy-on-write, or a child's
-    // write becomes invisible to the parent.
-    // **A read-only file mapping is demand-paged** (2026-09-13), which is the
-    // single largest thing this target was doing differently from the AArch64
-    // kernel and the reason a `cargo` build here was memory- and I/O-bound.
-    //
-    // Eagerly, `mmap`ping `librustc_driver.so` allocated ~76 000 frames and read
-    // 300 MB off ext2 before the call returned — for a library the linker then
-    // touches a few megabytes of. Every page of that was paid for twice: once in
-    // wall-clock inside the `mmap` (measured 2.2 µs/page, holding the BKL, which
-    // is where the `[BKL] stuck … tag=9` storms came from) and once in physical
-    // memory that could not be reclaimed while the mapping lived.
-    //
-    // What makes it possible is the record below: `MmapRegion::file` remembers
-    // *which* file and *where in it*, so [`fault_in`] can answer a page later.
-    // The identity is `(mount_id, inode)` and not the fd — `ld.so` closes the
-    // descriptor the moment the mapping exists, and every fault after that has
-    // no fd to ask.
-    //
-    // Gated on the same `akuma_config::MMAP_FILE_BACKED_LAZY` the AArch64 kernel
-    // reads, and `plan.file_lazy_eligible` — every file mapping, writable
-    // `MAP_SHARED` included since the write-back record gave it a coherent
-    // story without residency. A file with no inode identity
-    // (`file_identity` answers `None`) stays eager: there is nothing to fault
-    // against.
-    let lazy_file: Option<FileBacking> = if akuma_config::MMAP_FILE_BACKED_LAZY
-        && plan.file_lazy_eligible
-    {
-        // `file_lazy_eligible` is every file mapping since shared-writable
-        // joined it — see the `Plan` field's doc. The recorded `filesz` is
-        // the EOF *at mmap time*; a file that grows under the mapping is
-        // handled at fault time (the fill reads the file's current bytes)
-        // and at flush time (the write-back re-queries the size).
-        crate::fd::file_identity(fd).map(|(mount_id, inode, size)| FileBacking {
-            mount_id,
-            inode,
-            offset: offset as usize,
-            // What is left of the file from this mapping's own offset — the
-            // rest of the mapping is zero-fill. A mapping that starts past EOF
-            // is all zeros, which is what `mmap(2)` says and what
-            // `saturating_sub` gives.
-            filesz: size.saturating_sub(offset as usize),
-            // An `mmap` maps from a page-aligned file offset: no lead.
-            lead: 0,
-        })
-    } else {
-        None
-    };
-
-    // The write-back record, for a writable `MAP_SHARED` file mapping. The
-    // flush runs on the *record*, not the fd, so it carries the full identity
-    // (path included — `fd::file_write_identity`) from the start: parity-db
-    // keeps its files open for the mapping's life, but `ld.so`'s habit of
-    // closing the descriptor is one `Drop` ordering away from a flush with
-    // nothing to name, and the record costs one `String` at `mmap` time.
-    // Pinned against `unlink` like the lazy fill's inode: the blocks must
-    // survive until the last flush lands.
-    let shared_write = if plan.is_shared_writable {
-        crate::fd::file_write_identity(fd).map(|(path, mount_id, inode, size)| {
-            pin_mapping_inode(inode);
-            let _ = size;
-            akuma_mmap::SharedWriteBack {
-                mount_id,
-                inode,
-                offset: offset as usize,
-                path,
-            }
-        })
-    } else {
-        None
-    };
-
-    // `mm-forensics`: is `base` actually free? Nothing else in the kernel asks,
-    // and a placement that overlaps a live mapping is silent until the program's
-    // own memory turns out to be wrong. Before the record goes in, so the region
-    // being placed is not itself the overlap that is reported.
-    check_placement_free(base, byte_len, fixed);
-
-    let mut region = MmapRegion::inherited_with_prot(base, pages, region_prot);
-    if plan.shared_anon {
-        region = region.shared_anon();
-    }
-    if let Some(sw) = shared_write {
-        region = region.shared_writable(sw);
-    }
-    if let Some(file) = lazy_file {
-        // The pin **before** the region is published: from the moment a fault
-        // can reach this mapping, the inode it names has to be one the
-        // filesystem will not free and reissue under it. That is root cause #2
-        // of the AArch64 self-host `rustc` ICE, arriving here with the lazy path
-        // that makes it reachable (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md`).
-        pin_mapping_inode(file.inode);
-        region = region.file_backed(file);
-    }
-    usermode::with_current_regions(|regions| insert_region_sorted(regions, region));
-    region_trace(format_args!(
-        "[MMT] insert  va=0x{base:x} pages={pages} prot={:?} pid={}\n",
-        region_prot,
-        usermode::current_mm_pid(),
-    ));
-
-    if lazy_file.is_some() {
-        // Nothing is allocated and nothing is read. `fault_in` fills pages from
-        // the file as they are touched, which for a shared object is a few per
-        // cent of it.
-        return base as u64;
-    }
-
-    // **Pinned divergence: a `MAP_SHARED | MAP_ANONYMOUS` mapping is never lazy
-    // here**, whatever `plan` says. Such a region is shared with a `fork` child
-    // *by identity* — same frames, mapped writable in both — and `fork_from`
-    // does that by walking the parent's present leaves. A page that has not been
-    // faulted in yet is not a leaf, so each side would demand-page its own
-    // private frame and the mapping would silently behave like `MAP_PRIVATE`.
-    // Sharing a not-yet-existing page needs a backing object this target does
-    // not have; populating up front is the honest alternative, and a shared
-    // anonymous mapping is a coordination area rather than a big reservation.
-    if plan.use_lazy && !plan.shared_anon {
-        // Nothing is allocated. The pages arrive through `fault_in` on first
-        // touch, and a `PROT_NONE` reservation never gets any at all — which is
-        // the whole point of reserving.
-        return base as u64;
-    }
-
-    // A file-backed mapping is filled from the file; an anonymous one is zeroed.
-    // `plan.use_lazy` is false for every file mapping (the crate decides that),
-    // so control only reaches here for a file after the lazy return above.
-    let file_source = plan.is_file_backed.then_some((fd, offset as usize));
-
-    // Duration instrumentation, measured against the TSC — not
-    // `net::uptime_us`, whose LAPIC tick does not advance inside a syscall
-    // (`IF` clear), so a bare counter read here would measure 0
-    // (`sched.rs`'s frozen-clock note). TEMPORARY: the `cargo -j4` guest fill
-    // and console saw 429 `[BKL] stuck … tag=9` lines in one boot, all of
-    // them this loop holding the BKL; this print says how long one mmap
-    // actually holds it and at which file sizes the cost sits.
-    let t0 = akuma_cpu::tsc::rdtsc();
-    // **File fills are batched.** One `file_bytes_at` call per 4 KiB page made
-    // ext2 re-resolve the inode, re-derive block mappings and allocate its
-    // `phys_blocks` scratch `Vec` per page — the measured 2.2 µs/page (8 MB in
-    // 4.4 ms) was mostly that fixed cost, paid 76 000 times for one
-    // `librustc_driver` mapping. Reading a 64 KiB chunk and fanning it out to
-    // 16 frames amortizes it away; a transient bounded `Vec`, one per file
-    // mapping, is the only allocation added.
-    //
-    // The chunk read answers the same bytes the per-page reads did, and that
-    // equivalence rests on two things this loop must do and the per-page path
-    // got for free:
-    //
-    // - **The buffer carries its own zeros.** `file_bytes_at` takes a `&mut
-    //   [u8]` and fills a prefix; `populate_file_page` zeroed the frame first,
-    //   so a short answer at EOF left zeros behind it. Here the buffer is
-    //   reused across chunks, so anything past the `n` bytes read is the
-    //   *previous* chunk's data unless it is cleared — the file would be
-    //   mapped with a 60 KiB slice of itself repeated at the tail. Cleared
-    //   below on every read, including the `n == 0` whole-chunk-past-EOF case.
-    // - **A `Vec` with reserved capacity is still empty.** `try_reserve` sets
-    //   capacity, not length, and `&mut v` derefs to a zero-length slice: the
-    //   read would fill nothing, the fan-out would index past the end and the
-    //   kernel would panic on the first file mapping of 16 pages or more.
-    //   `resize` is what makes the buffer a buffer.
-    //
-    // TEMPORARY instrumentation note: `[mmap-t]` below measures the whole
-    // loop, so the A/B is direct (2026-09-13: 2048 pages 4408 µs before).
-    const CHUNK_PAGES: usize = 16;
-    let chunk_bytes = CHUNK_PAGES * PAGE_SIZE as usize;
-    // A failed allocation just means the per-page path below runs; the mmap
-    // still succeeds, which is the right shape for a transient scratch buffer
-    // on a path that must not turn memory pressure into a failed syscall.
-    let mut chunk: Option<Vec<u8>> = file_source.and_then(|_| {
-        let mut v: Vec<u8> = Vec::new();
-        if v.try_reserve(chunk_bytes).is_ok() {
-            v.resize(chunk_bytes, 0);
-            Some(v)
-        } else {
-            None
-        }
-    });
-    let mut batch_failed = false;
-    let mut i = 0usize;
-    while i < pages {
-        let va = base + i * PAGE_SIZE as usize;
-        match file_source {
-            Some((fd, off)) if chunk.is_some() && i + CHUNK_PAGES <= pages => {
-                let buf = chunk.as_mut().expect("guarded by the arm above");
-                // `None` is "not a regular file" — a failure, exactly as it was
-                // per page. A short answer is not: it is the tail of the file,
-                // whose remainder `mmap(2)` specifies as zero.
-                match crate::fd::file_bytes_at(fd, off + i * PAGE_SIZE as usize, buf) {
-                    None => {
-                        batch_failed = true;
-                        break;
-                    }
-                    Some(n) => buf[n.min(chunk_bytes)..].fill(0),
-                }
-                for j in 0..CHUNK_PAGES {
-                    let src = &buf[j * PAGE_SIZE as usize..(j + 1) * PAGE_SIZE as usize];
-                    // `Raced` is not a failure: a peer core populated this
-                    // page while the chunk was being read, and its copy is the
-                    // one that counts. Only `Failed` stops the batch.
-                    if matches!(
-                        populate_file_page_from(va + j * PAGE_SIZE as usize, region_prot, src),
-                        FilledPage::Failed
-                    ) {
-                        batch_failed = true;
-                        break;
-                    }
-                }
-                // Checked here and not only by the `for` above: a `break` out of
-                // the fan-out leaves this loop's own condition untouched, and
-                // without this the fill would carry on allocating frames for
-                // every remaining page of a mapping already being torn down.
-                if batch_failed {
-                    break;
-                }
-                i += CHUNK_PAGES;
-            }
-            other => {
-                let filled = match other {
-                    Some((fd, off)) => {
-                        populate_file_page(va, region_prot, fd, off + i * PAGE_SIZE as usize)
-                    }
-                    None => populate_page(va, region_prot),
-                };
-                if !filled {
-                    batch_failed = true;
-                    break;
-                }
-                i += 1;
-            }
-        }
-    }
-    if batch_failed {
-        // Out of memory partway through. Unlike the pre-region version,
-        // which leaked the pages it had already mapped because it had no
-        // record of them, this can undo exactly what it did.
-        unmap_range(base, base + byte_len);
-        return errno::ENOMEM;
-    }
-    if pages >= 16 && MMAP_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
-        // TEMPORARY instrumentation (2026-09-13), now gated: this fired on
-        // every mapping of 16 pages or more, and rustc mmaps constantly — an
-        // in-guest build wrote hundreds of these lines to the UART *while
-        // compiling*. The print, not the timing, was the cost; `rdtsc` is a
-        // few cycles and stays. Flip `mm::MMAP_TRACE` for the A/B.
-        let dt = akuma_cpu::tsc::rdtsc().wrapping_sub(t0);
-        let hz = crate::lapic::tsc_hz();
-        let us = if hz != 0 { dt / (hz / 1_000_000) } else { 0 };
-        serial::puts("  [mmap-t] pages=");
-        serial::put_dec(pages as u64);
-        serial::puts(" file=");
-        serial::put_dec(u64::from(file_source.is_some()));
-        serial::puts(" us=");
-        serial::put_dec(us);
-        serial::puts("\n");
-    }
-    base as u64
 }
 
 /// `mmap` of `/dev/fb0`: map the boot framebuffer into ring 3,
@@ -827,7 +276,7 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64
 /// ledger and carry no share count, which is what keeps every teardown path
 /// from handing device memory to the page allocator (`unmap_range` frees only
 /// what the ledger tracks; `fork` maps a non-write-back leaf verbatim).
-fn mmap_framebuffer(addr: u64, len: u64, prot: u32, flags: u32, offset: u64) -> u64 {
+pub fn mmap_framebuffer(addr: u64, len: u64, prot: u32, flags: u32, offset: u64) -> u64 {
     use akuma_syscalls_linux::flags::map::{MAP_FIXED, MAP_SHARED};
     let Some(g) = crate::fbdev::geometry() else { return errno::ENODEV };
     let shared = flags & MAP_SHARED != 0;
@@ -881,17 +330,6 @@ fn mmap_framebuffer(addr: u64, len: u64, prot: u32, flags: u32, offset: u64) -> 
         return errno::ENOMEM;
     }
     base as u64
-}
-
-/// Keep a demand-paged mapping's file alive for as long as the mapping is.
-///
-/// Delegates to the address space, which is where the pins live and why:
-/// `akuma_mmu::UserAddressSpace::pin_mapped_inode`. It is the **leader's**
-/// address space — the same owner `with_current_regions` answers for — so a
-/// `CLONE_THREAD` thread's `mmap` pins where its region record went, not into a
-/// view that dies with the thread.
-fn pin_mapping_inode(inode: u32) {
-    usermode::with_current_address_space(|uas| uas.pin_mapped_inode(inode));
 }
 
 /// Allocate, zero, map and record one anonymous page at `va`.
@@ -1123,93 +561,6 @@ pub fn note_fault_refusal(va: u64, why: &str) {
     }
 }
 
-/// Bounded region-surgery trace for the fork-vs-threads SIGSEGV hunt
-/// (`docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`). The repro's mmap/munmap
-/// population is small enough that a capped print of every `MAP_FIXED` replace
-/// and every region detach fits on the console, and the sequence beside the
-/// refusal line is the whole story of how a `PROT_NONE` reservation came to
-/// cover an address the program had mapped read-write. Stays in the tree
-/// behind the toggle, off by default.
-pub static REGION_TRACE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// One trace line, if [`REGION_TRACE`] is on.
-pub fn region_trace(fmt: core::fmt::Arguments<'_>) {
-    if REGION_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
-        let mut w = akuma_primitives::console::StackWriter::<160>::new();
-        let _ = core::fmt::write(&mut w, fmt);
-        w.flush();
-    }
-}
-
-/// Allocate, **fill from a file**, map and record one page at `va`.
-///
-/// [`populate_page`]'s sibling, and the difference is the whole reason
-/// file-backed `mmap` was refused here until 2026-09-07: this function is what
-/// stops the mapping being anonymous memory wearing a file's name.
-///
-/// # The failure this is built to make impossible
-///
-/// `mm.rs`'s header used to say a file mapping was `ENOSYS` because serving one
-/// as anonymous memory "would look like a working call and hand the caller a
-/// file full of zeros". That danger is real and it is *not* removed by having a
-/// fill path — it is removed by making the fill path unable to silently skip.
-/// So:
-///
-/// - The frame is zeroed **first**, then overwritten with what the file has.
-///   Zero is therefore the value of a byte past EOF and of nothing else.
-/// - [`crate::fd::file_bytes_at`] returns `None` for a descriptor that is not a
-///   regular file, and that is a **failure of this function**, not a zero-byte
-///   fill. `sys_mmap` also refuses such a descriptor up front; the second check
-///   is here because this is the function that would otherwise produce the
-///   zeros, and a guard at the point of harm outlives a guard at the caller.
-/// - A short answer is *not* a failure: it is a page that straddles EOF, whose
-///   tail `mmap(2)` specifies as zero.
-///
-/// # What this is not
-///
-/// A page cache. Every mapping gets its **own copy** of every page, so two
-/// processes mapping one file hold two sets of frames and a write through
-/// `MAP_PRIVATE` cannot be seen by anyone — which is what `MAP_PRIVATE` means,
-/// so it is correct and merely expensive. Writable `MAP_SHARED` needs the
-/// sharing to be real, and gets it from [`fill_shared_write_pages`] instead.
-fn populate_file_page(va: usize, prot: Prot, fd: u64, offset: usize) -> bool {
-    let Some(frame) = akuma_pmm::alloc_page() else {
-        return false;
-    };
-    // The frame is unpublished until it is mapped below, so the view is the only
-    // accessor for its duration.
-    let read = akuma_mmu::with_phys_bytes_mut(frame, 0, PAGE_SIZE as usize, |page| {
-        // Zeroed before the fill, never instead of it.
-        page.fill(0);
-        crate::fd::file_bytes_at(fd, offset, page).is_some()
-    });
-    if read != Some(true) {
-        // Not a regular file. Refuse rather than map the zeros just written.
-        akuma_pmm::free_page(frame, 0);
-        return false;
-    }
-    let (pte, cow) = pte_prot_for(prot, frame);
-    // The file read is deliberately **outside** the address-space hold: it takes
-    // the descriptor table, and taking that lock underneath this one would be
-    // the only place in this module where the two are ordered that way.
-    match install_filled_page(va, PhysFrame::new(frame), pte, cow) {
-        PageInstall::Mapped => true,
-        // A peer served this page first. `true`, not `false`: the page is
-        // present, which is what the caller asked for. See
-        // [`install_filled_page`].
-        PageInstall::Raced => {
-            akuma_pmm::free_page(frame, 0);
-            note_fault_race(va);
-            true
-        }
-        PageInstall::Failed => {
-            akuma_pmm::free_page(frame, 0);
-            false
-        }
-    }
-}
-
 /// Allocate, **fill from an already-read buffer**, map and record one page.
 ///
 /// [`populate_file_page`]'s batched twin — [`sys_mmap`]'s fill loop reads a
@@ -1348,13 +699,6 @@ pub static FILE_PAGES_FILLED: core::sync::atomic::AtomicU64 =
 /// number worth watching when several compilers run at once.
 pub static FILE_PAGES_SHARED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
-
-/// Enables the `[mmap-t]` per-mapping timing print (see `fill_file_pages`).
-/// Off by default: the print fired on every ≥16-page mmap and an in-guest
-/// rustc build flooded the UART with it while compiling. Same shape as
-/// `usermode::SYSCALL_TRACE` — a diagnostics toggle, not a test-only gate.
-pub static MMAP_TRACE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 
 /// How many pages one file fault brings in.
 ///
@@ -2628,6 +1972,12 @@ enum DontneedRelease {
     Reap(akuma_fpcache_rw::Key),
 }
 
+/// `mmap` as ring 3 reaches it: glue's.
+#[cfg(not(feature = "no-tests"))]
+fn mmap_glue(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> u64 {
+    crate::usermode::to_glue(akuma_syscalls_abi::Syscall::Mmap, [addr, len, prot, flags, fd, offset])
+}
+
 #[cfg(not(feature = "no-tests"))]
 /// The refusals and the arithmetic, which are the parts a guest program cannot
 /// easily reach.
@@ -2647,10 +1997,10 @@ pub fn smoke_test(t: &mut Suite) {
     // -1, the "no file" sentinel, as it arrives from a 64-bit register.
     const NO_FD: u64 = u64::MAX;
 
-    t.check_eq("mmap: zero length is EINVAL", sys_mmap(0, 0, 3, ANON, NO_FD, 0), errno::EINVAL);
+    t.check_eq("mmap: zero length is EINVAL", mmap_glue(0, 0, 3, ANON, NO_FD, 0), errno::EINVAL);
     t.check_eq(
-        "mmap: a length past the VA window is ENOMEM",
-        sys_mmap(0, (MMAP_VA_SPAN + 1) as u64, 3, ANON, NO_FD, 0),
+        "mmap: a length past the user half is ENOMEM",
+        mmap_glue(0, USER_VA_LIMIT as u64, 3, ANON, NO_FD, 0),
         errno::ENOMEM,
     );
     // File-backed mappings (2026-09-07). This arm used to assert that **every**
@@ -2667,10 +2017,13 @@ pub fn smoke_test(t: &mut Suite) {
     // the arguments with no open file is the refusal of a shared-writable
     // request on a descriptor that cannot be a write identity: same fd 5, no
     // process, `EACCES` from the identity probe before anything is placed.
+    // The descriptor rules (not a file, not writable, no write identity:
+    // `EACCES`) need the caller's fd table, so with no process they answer
+    // `ESRCH`; `mem_suite`'s probes cover them from ring 3.
     t.check_eq(
-        "mmap: a writable MAP_SHARED file mapping on a non-file fd is EACCES",
-        sys_mmap(0, 4096, u64::from(PROT_WRITE) | 1, MAP_SHARED, 5, 0),
-        errno::EACCES,
+        "mmap: a writable MAP_SHARED file mapping with no process is ESRCH",
+        mmap_glue(0, 4096, u64::from(PROT_WRITE) | 1, MAP_SHARED, 5, 0),
+        errno::ESRCH,
     );
     t.check_eq(
         "mmap: msync is served, not ENOSYS (nr 26 routed before the table)",
@@ -2679,7 +2032,7 @@ pub fn smoke_test(t: &mut Suite) {
     );
     t.check_eq(
         "mmap: a file mapping at an unaligned offset is EINVAL",
-        sys_mmap(0, 4096, 1, 0, 5, 1),
+        mmap_glue(0, 4096, 1, 0, 5, 1),
         errno::EINVAL,
     );
     // The descriptor probe. Nothing is open here, so fd 5 is not a regular file
@@ -2688,25 +2041,25 @@ pub fn smoke_test(t: &mut Suite) {
     // against. `populate_file_page` refuses the same thing a second time, at the
     // point where the zeros would otherwise be written.
     t.check_eq(
-        "mmap: a file mapping on a descriptor that is not a file is EACCES",
-        sys_mmap(0, 4096, 1, 0, 5, 0),
-        errno::EACCES,
+        "mmap: a file mapping with no process is ESRCH (the fd is asked after)",
+        mmap_glue(0, 4096, 1, 0, 5, 0),
+        errno::ESRCH,
     );
     // Granted since 2026-10-08 (V8's code range), so in the boot suite — no
     // current process — it must reach the address-space step and say so.
     t.check_eq(
         "mmap: writable+executable is accepted (ESRCH here: no process, not EINVAL)",
-        sys_mmap(0, 4096, u64::from(PROT_WRITE | PROT_EXEC), ANON, NO_FD, 0),
+        mmap_glue(0, 4096, u64::from(PROT_WRITE | PROT_EXEC), ANON, NO_FD, 0),
         errno::ESRCH,
     );
     t.check_eq(
         "mmap: an unaligned MAP_FIXED address is EINVAL",
-        sys_mmap(0x5000_1001, 4096, 3, ANON | u64::from(MAP_FIXED), NO_FD, 0),
+        mmap_glue(0x5000_1001, 4096, 3, ANON | u64::from(MAP_FIXED), NO_FD, 0),
         errno::EINVAL,
     );
     t.check_eq(
         "mmap: MAP_FIXED over the kernel half is EINVAL",
-        sys_mmap(USER_VA_LIMIT as u64, 4096, 3, ANON | u64::from(MAP_FIXED), NO_FD, 0),
+        mmap_glue(USER_VA_LIMIT as u64, 4096, 3, ANON | u64::from(MAP_FIXED), NO_FD, 0),
         errno::EINVAL,
     );
     t.check_eq(
@@ -2747,7 +2100,7 @@ pub fn smoke_test(t: &mut Suite) {
     // refusal that returned it here would mean the ordering had slipped.
     t.check_eq(
         "mmap: a valid anonymous request with no process is ESRCH, not a mapping",
-        sys_mmap(0, 4096, 3, ANON, NO_FD, 0),
+        mmap_glue(0, 4096, 3, ANON, NO_FD, 0),
         errno::ESRCH,
     );
 

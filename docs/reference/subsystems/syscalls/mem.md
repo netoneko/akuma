@@ -59,7 +59,7 @@ extraction stays A/B-able against what it replaced. Numbering matches
 | 3 | `MADV_FREE` returns `EINVAL` — deliberate: Redis reads it as "older kernel" and starts, where a fabricated 0 sends it into a self-check it cannot pass without `/proc/<pid>/smaps` | `diverge_madv_free_is_einval_not_success` |
 | 4 | every other advice returns success without acting, including ones Linux implements | `diverge_unknown_advice_reports_success` |
 | 5 | a shrinking `mremap` returns the old address and leaves the tail mapped; Linux unmaps it | `diverge_shrink_is_in_place_and_leaves_the_tail_mapped` |
-| 6 | `MAP_FIXED_NOREPLACE` is alignment-validated then treated as `MAP_FIXED`, without the "fail if occupied" check | — |
+| 6 | *(resolved 2026-11-12)* `MAP_FIXED_NOREPLACE` refuses an occupied range with `EEXIST` on both kernels | `mapnoreplace` probe |
 | 7 | `membarrier` recognises only `QUERY`/`PRIVATE_EXPEDITED`/`REGISTER_PRIVATE_EXPEDITED`; `GLOBAL` (1) and the `SYNC_CORE` family are `EINVAL` | `diverge_global_and_unknown_commands_are_einval` |
 
 `/proc/<pid>/` is not populated (no `smaps`, `maps`, `statm`), which `smapsdirty`
@@ -174,33 +174,45 @@ All always-on (no `sc-*` gate; see [`../syscalls.md`](../syscalls.md) "The
 
 ## Argument validation & error codes
 
-**`mmap`** (`sys_mmap`, `mem.rs:189`):
-- `len == 0` → `EINVAL`.
-- `PROT_WRITE | PROT_EXEC` is **granted**, on both kernels, as Linux grants
-  it (2026-10-08). `akuma_mmap::Prot::from_prot` maps it to the `RW` token,
-  which is "read, write and execute": before that date it dropped the
-  execute bit on AArch64, and the amd64 kernel refused the request outright
-  with `EINVAL` in both `mmap` and `mprotect`. V8 needs it on its 512 MB code
-  range, and every Chromium renderer died on the refusal. Gate `jitprobe.c`
-  (`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fix 18). The ELF
-  loader's refusal of a writable+executable *segment* is a separate rule and
-  stands.
-- `MAP_FIXED`/`MAP_FIXED_NOREPLACE` with `addr != 0` and `addr & 0xFFF != 0` →
-  `EINVAL` (`mmap_fixed_addr_unaligned_einval`). This check runs **before**
-  `lookup_process` specifically so a kernel-test caller with no current
-  process still gets `EINVAL`, not `ESRCH` — a crash regression test
-  (`crash14: addr = 0xffffffffffffffea`) pins this ordering.
-- No current/owner process → `ESRCH`.
-- `MAP_FIXED`/`MAP_FIXED_NOREPLACE` overlapping the kernel identity-map range
-  (`mmap_fixed_overlaps_kernel_va`, scales with `kernel_va_end()`) → `EINVAL`.
-  Guards against Go's runtime committing heap arenas with `MAP_FIXED` onto the
-  kernel's RAM identity map (silent corruption otherwise).
+**`mmap`** (`sys_mmap`, glue — both kernels since 2026-11-12; amd64 keeps only
+`/dev/fb0` and the `/dev/kvm` census in its dispatcher). Everything decidable
+from the arguments is refused **before** the process lookup, so a kernel-test
+caller with no current process gets Linux's errno, not `ESRCH` (a crash
+regression test, `crash14: addr = 0xffffffffffffffea`, pins the ordering):
+- `len == 0` → `EINVAL`; `len` past the user half → `ENOMEM`.
+- `PROT_WRITE | PROT_EXEC` is **granted**, as Linux grants it. V8 needs it on
+  its 512 MB code range (`jitprobe.c`,
+  `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fix 18). The ELF loader's
+  refusal of a writable+executable *segment* is a separate rule and stands.
+- `MAP_FIXED`/`MAP_FIXED_NOREPLACE`: unaligned `addr` → `EINVAL`; `addr` below
+  one page, or the range past `akuma_mmu::USER_VA_END` → `EINVAL`; the range
+  overlapping the kernel's RAM identity map (`ProcessMemory::kernel_hole()`:
+  AArch64 only, scales with RAM; empty on amd64, whose `ld.so` loads at 1 GiB)
+  → `EINVAL`.
+- A file mapping at an unaligned offset → `EINVAL`.
+- No owner process → `ESRCH`.
+- A file mapping whose fd is not a regular file (socket, pipe, directory, a
+  `/dev` node) → `EACCES`; `/dev/zero` maps as anonymous memory. A writable
+  `MAP_SHARED` mapping of an fd not opened for writing → `EACCES`, and of a
+  file the kernel's shared table cannot key (no inode) → `EACCES`.
+- `MAP_FIXED_NOREPLACE` over anything — a region, or a page no region records
+  (page walk capped at 256 MiB) → `EEXIST`. `MAP_FIXED_NOREPLACE` wins over
+  `MAP_FIXED` when both are set, as on Linux.
 - No gap in the placement window for a non-fixed request (`vm_alloc_mmap`) → `ENOMEM`.
 - Eager frame batch alloc fails, and reclaim-and-retry also fails: a writable
   `MAP_SHARED` file-backed mapping → `ENOMEM` (must stay eager to track pages
   for writeback — no safe lazy fallback); everything else silently degrades
   to a lazy region instead of failing (see `../memory.md` "Userspace memory
   model" — lazy anonymous mmap).
+
+**A `MAP_SHARED|MAP_ANONYMOUS` mapping is never demand-paged.** Fork shares it
+by identity by walking the parent's present pages; a page not yet faulted is
+not one, and each side would fault a private frame. Writable `MAP_SHARED` file
+mappings go one of two ways, chosen by the `shared_write_backing` hook: glue's
+write-back records (AArch64) or the kernel's shared writable table, with the
+record on the region (amd64, `shmpages`) — until step 6 of
+`proposals/AKUMA_MM_CONVERGENCE.md` makes the table both kernels'
+([`AKUMA_ONE_MMAP.md`](../../../archive/AKUMA_ONE_MMAP.md)).
 
 **`mremap`** (`sys_mremap`, `mem.rs:400`):
 - `new_size == 0` → `EINVAL`; `old_addr` misaligned → `EINVAL`.

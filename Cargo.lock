@@ -1061,6 +1061,7 @@ dependencies = [
  "akuma-cpu",
  "akuma-exec",
  "akuma-isolation",
+ "akuma-mmap",
  "akuma-mmu",
  "akuma-net",
  "akuma-net-unix",

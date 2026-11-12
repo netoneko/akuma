@@ -795,9 +795,12 @@ fn mem(call: Syscall, a: [u64; 6]) -> Option<u64> {
             crate::drivers::hypervisor_api_note_mmap(a5, akuma_primitives::addr::VirtAddr::new(a1 as usize), a2, a3, a4, a6);
             // A vCPU descriptor maps the run page; the others (nothing maps them) get anonymous memory.
             let r = crate::drivers::hypervisor_api_mmap_vcpu(id, a1, a2, a3, a4);
-            if r == crate::fd::errno::ENODEV { crate::mm::sys_mmap(a1, a2, a3, a4 | 0x20, u64::MAX, 0) } else { r }
+            if r == crate::fd::errno::ENODEV { to_glue(call, [a1, a2, a3, a4 | 0x20, u64::MAX, 0]) } else { r }
         }
-        Syscall::Mmap => crate::mm::sys_mmap(a1, a2, a3, a4, a5, a6),
+        // `/dev/fb0`: the device's pixels, mapped write-combining — this
+        // kernel's own device, ahead of glue's file rules.
+        Syscall::Mmap if crate::fd::is_dev_fb(a5) => crate::mm::mmap_framebuffer(a1, a2, a3 as u32, a4 as u32, a6),
+        Syscall::Mmap => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         Syscall::Munmap => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `madvise(addr, len, advice)`. Answered `ENOSYS` for everything until
         // 2026-09-07, which is the *wrong* way to say "not implemented": Linux

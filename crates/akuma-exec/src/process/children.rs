@@ -1408,9 +1408,16 @@ pub fn push_lazy_region(pid: Pid, start_va: usize, size: usize, page_flags: u64)
 
 /// Register a lazy region on `pid`'s list. Returns the list's length after.
 pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page_flags: u64, source: LazySource) -> usize {
+    push_lazy_mmap_region(pid, lazy_mmap_region(start_va, size, page_flags, &source))
+}
+
+/// Register a prebuilt lazy region (a file-backed one may carry a
+/// `shared_write` record) on `pid`'s list, pinning its file. Returns the
+/// list's length after.
+pub fn push_lazy_mmap_region(pid: Pid, region: MmapRegion) -> usize {
     let Some(proc) = lookup_process_shared(pid) else { return 0 };
-    let inode = source.pinned_inode();
-    let region = lazy_mmap_region(start_va, size, page_flags, &source);
+    let (start_va, size) = (region.start_va, region.len_bytes());
+    let inode = region.file.map_or(0, |f| f.inode);
     let (inserted, count) = proc.vm_with_regions(|r| {
         let ins = insert_lazy_region(r, region);
         (ins, r.len())

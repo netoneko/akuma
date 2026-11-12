@@ -359,13 +359,8 @@ pub use akuma_syscalls_mem::mmap::fixed_addr_unaligned_einval as mmap_fixed_addr
 /// which is how the overflow defect in it became visible.
 #[must_use]
 pub fn mmap_fixed_overlaps_kernel_va(addr: usize, len: usize) -> bool {
-    use akuma_exec::process::types::ProcessMemory;
-    akuma_syscalls_mem::mmap::fixed_overlaps_kernel_va(
-        addr,
-        len,
-        ProcessMemory::KERNEL_VA_START,
-        akuma_exec::mmu::kernel_va_end(),
-    )
+    let hole = akuma_exec::process::types::ProcessMemory::kernel_hole();
+    !hole.is_empty() && akuma_syscalls_mem::mmap::fixed_overlaps_kernel_va(addr, len, hole.start, hole.end)
 }
 
 pub(super) fn sys_brk(new_brk: usize) -> u64 {
@@ -478,6 +473,26 @@ fn mmap_eager_to_lazy_fallback(
     mmap_addr as u64
 }
 
+/// Who keeps a writable `MAP_SHARED` file mapping coherent — the
+/// `shared_write_backing` hook's answer.
+pub enum SharedWrite {
+    /// Glue's write-back records (`SHARED_FILE_MAPPINGS`).
+    Glue,
+    /// The kernel's shared writable table, which faults read through this
+    /// record on the region. The mapping must be demand-paged.
+    Table(akuma_mmap::SharedWriteBack),
+    /// Nothing to write back to (no inode identity): `EACCES`.
+    Refuse,
+}
+
+/// Can this path's bytes be mapped? Not a `/dev` node (no inode holds its
+/// bytes: a mapping would be zeros posing as the file) and not a directory.
+fn mappable_path(path: &str) -> bool {
+    let dev_node = path.starts_with("/dev/") && akuma_vfs_glue::dev_node(path).is_some();
+    let dir = akuma_vfs_glue::metadata(path).is_ok_and(|m| m.is_dir);
+    !dev_node && !dir
+}
+
 pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, offset: usize) -> u64 {
     if len == 0 { return EINVAL; }
     // A length larger than the user address space cannot be mapped, and must be
@@ -489,6 +504,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         return ENOMEM;
     }
     let pages = len.div_ceil(4096);
+    let byte_len = pages * 4096;
     // The region's neutral record and the page table's AArch64 encoding — one
     // `u64` until 2026-09-06, two vocabularies since. See `akuma_mmap::types`.
     let page_prot = akuma_exec::mmu::Prot::from_prot(prot);
@@ -504,77 +520,128 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     let plan = akuma_syscalls_mem::mmap::plan(
         prot, flags, fd, pages, akuma_config::MMAP_EAGER_MAX_PAGES,
     );
-    let is_fixed = flags & MAP_FIXED != 0;
+    // `MAP_FIXED_NOREPLACE` wins over `MAP_FIXED`, as on Linux.
     let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
+    let is_fixed = flags & MAP_FIXED != 0 && !is_fixed_noreplace;
     let _ = MAP_POPULATE; // consumed by `plan`; subsumed by the lazy fallback below
 
-    // Like `len == 0`, an unaligned MAP_FIXED / MAP_FIXED_NOREPLACE address is
-    // EINVAL before any process lookup. Otherwise `handle_syscall` from kernel
-    // tests (no current user task) returns ESRCH instead of EINVAL.
+    // Everything decidable from the arguments is refused before the process
+    // lookup, so a kernel-test caller with no current task sees Linux's errno
+    // rather than ESRCH (asserted by both boot suites).
     if mmap_fixed_addr_unaligned_einval(addr, flags) {
         return EINVAL;
     }
-
-    let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
-    let proc = match akuma_exec::process::lookup_process_shared(owner_pid) {
-        Some(p) => p,
-        None => return ESRCH,
-    };
-    let _mm_window = MmBklGuard::new();
-
-    let mmap_addr = if (is_fixed || is_fixed_noreplace) && addr != 0 {
-        // Reject MAP_FIXED mappings that overlap the kernel identity-map range.
-        // The Go runtime uses MAP_FIXED to commit its heap arenas; without this
-        // guard a process can map user pages at e.g. 0x8000_0000, overlapping the
-        // kernel's physical-RAM identity map and causing silent memory corruption.
-        if mmap_fixed_overlaps_kernel_va(addr, pages * 4096) {
+    if is_fixed || is_fixed_noreplace {
+        // The null page is never a real fixed placement (it would make a null
+        // dereference succeed), and a fixed range must stay in the user half.
+        // Saturating: `len` is a user register, and a wrap would read as "fits".
+        if addr < 4096 || addr.saturating_add(byte_len) > akuma_exec::mmu::USER_VA_END {
+            return EINVAL;
+        }
+        // The AArch64 kernel's RAM identity map: the Go runtime commits its
+        // heap arenas with MAP_FIXED, and a user page there corrupts the kernel.
+        if mmap_fixed_overlaps_kernel_va(addr, byte_len) {
             if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
-                akuma_primitives::tprint!(128, "[mmap] REJECT MAP_FIXED kernel VA: pid={} addr=0x{:x} len=0x{:x}\n",
-                proc.pid, addr, pages * 4096);
+                akuma_primitives::tprint!(128, "[mmap] REJECT MAP_FIXED kernel VA: addr=0x{:x} len=0x{:x}\n",
+                    addr, byte_len);
             }
             return EINVAL;
         }
-        if is_fixed {
-            // Whatever was mapped here goes, exactly as `munmap` would remove
-            // it, and a reservation takes its place so the placer cannot hand
-            // the range to a sibling while this call fills it.
-            unmap_range(proc, addr, addr + pages * 4096);
-            proc.vm_install_region(MmapRegion::demand_paged(addr, pages, Some(akuma_exec::mmu::Prot::NONE)));
+    }
+    if plan.is_file_backed && offset & 0xFFF != 0 {
+        return EINVAL;
+    }
+
+    let Some(proc) = current_owner() else { return ESRCH };
+
+    // The descriptor, for a file mapping: what to read, and whether it may be
+    // mapped at all. A socket, pipe, directory or `/dev` node has no bytes to
+    // map; serving zeros instead is the silent lie this refuses. `/dev/zero`
+    // is the exception Linux makes: anonymous memory.
+    let file: Option<(alloc::string::String, u32, u32)> = if plan.is_file_backed {
+        match proc.get_fd(fd as u32) {
+            Some(akuma_exec::process::FileDescriptor::File(f)) => {
+                if !mappable_path(&f.path) {
+                    return EACCES;
+                }
+                if plan.is_shared_writable && !akuma_syscalls_linux::flags::open::may_write(f.flags) {
+                    return EACCES;
+                }
+                Some((f.path.clone(), f.mount_id(), f.inode()))
+            }
+            Some(akuma_exec::process::FileDescriptor::DevZero) => None,
+            _ => return EACCES,
+        }
+    } else {
+        None
+    };
+    let mut shared_write = if plan.is_shared_writable && file.is_some() {
+        crate::hooks::shared_write_backing(fd, offset)
+    } else {
+        SharedWrite::Glue
+    };
+    if matches!(shared_write, SharedWrite::Refuse) {
+        return EACCES;
+    }
+    let _mm_window = MmBklGuard::new();
+
+    let reservation = || MmapRegion::demand_paged(addr, pages, Some(akuma_exec::mmu::Prot::NONE));
+    let mmap_addr = if is_fixed {
+        // Whatever was mapped here goes, exactly as `munmap` would remove
+        // it, and a reservation takes its place so the placer cannot hand
+        // the range to a sibling while this call fills it.
+        unmap_range(proc, addr, addr + byte_len);
+        proc.vm_install_region(reservation());
+        addr
+    } else if is_fixed_noreplace {
+        // Exactly `addr`, or EEXIST if anything is there: a region, or a page
+        // no region records. The page walk is capped at 256 MiB; past that
+        // only the region list is asked.
+        const WALK_CAP_PAGES: usize = 65_536;
+        let mapped = proc.with_address_space(|a| (0..pages.min(WALK_CAP_PAGES)).any(|i| a.is_mapped(addr + i * 4096)));
+        let end = addr + byte_len;
+        let reserved = !mapped && proc.vm_with_regions(|r| {
+            let clear = !akuma_exec::process::regions_overlapping(r, addr, end)
+                .iter()
+                .any(|x| x.start_va < end && addr < x.start_va + x.len_bytes());
+            if clear {
+                akuma_exec::process::insert_region_sorted(r, reservation());
+            }
+            clear
+        });
+        if !reserved {
+            return EEXIST;
         }
         addr
-    } else if let Some(a) = proc.vm_alloc_mmap(pages * 4096) { a } else {
+    } else if let Some(a) = proc.vm_alloc_mmap(byte_len) { a } else {
         if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
             akuma_primitives::safe_print!(192, "[mmap] REJECT: pid={} size=0x{:x} next=0x{:x} limit=0x{:x}\n",
-            proc.pid, pages * 4096,
+            proc.pid, byte_len,
             proc.memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed),
             proc.memory.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
         }
         return ENOMEM;
     };
 
-    let is_file_backed = plan.is_file_backed;
+    let is_file_backed = file.is_some();
 
-    // Writable MAP_SHARED on a file-backed mapping has true shared-page semantics:
-    // writes through the mapping must become visible in the file. Akuma has no
-    // unified page cache, so we honor this by mapping it EAGERLY (resident,
-    // writable, populated from the file) and writing the pages back to the file on
-    // munmap/msync/exit (see SHARED_FILE_MAPPINGS). Read-only MAP_SHARED has no
-    // writes to flush, so it stays on the cheap lazy MAP_PRIVATE-equivalent path.
-    let is_shared_writable = plan.is_shared_writable;
+    // Writable MAP_SHARED on a file: writes through the mapping must reach the
+    // file. Either the kernel's shared writable table serves the pages
+    // (`SharedWrite::Table`, demand-paged only), or glue records the mapping
+    // and writes its present pages back on munmap/msync/exit
+    // (`SHARED_FILE_MAPPINGS`).
+    let is_shared_writable = plan.is_shared_writable && is_file_backed;
 
-    // MAP_POPULATE requests eager pre-faulting; it suppresses lazy allocation.
-    // MADV_WILLNEED can also trigger pre-faulting on existing lazy regions.
     // Anonymous private mappings above MMAP_EAGER_MAX_PAGES are demand-paged
-    // (zero-fill on first touch) rather than eagerly allocated+zeroed+mapped.
-    // This is the "lazy/zero-on-demand population" win from COW_OPTIMIZATIONS.md:
-    // pages that are never touched are never allocated, which cuts the physical
-    // footprint (the rustc trace ended near OOM from eager over-commit). Small
-    // mappings stay eager — see config::MMAP_EAGER_MAX_PAGES for the rationale.
-    let use_lazy = plan.use_lazy;
-
-    if use_lazy {
-        let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
+    // (zero-fill on first touch); MAP_POPULATE suppresses that (`plan`).
+    //
+    // **A `MAP_SHARED|MAP_ANONYMOUS` mapping is never lazy.** Fork shares it by
+    // identity by walking the parent's present pages; a page not faulted in
+    // yet is not one, so each side would demand-page a private frame and the
+    // mapping would behave as `MAP_PRIVATE`. Sharing a page that does not exist
+    // yet needs a backing object neither kernel has, so it is populated now.
+    if plan.use_lazy && !plan.shared_anon {
+        let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, byte_len, page_flags);
         if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
             akuma_primitives::tprint!(192, "[mmap] pid={} len=0x{:x} prot=0x{:x} flags=0x{:x} = 0x{:x} (lazy, {} regions)\n",
                 proc.pid, len, prot, flags, mmap_addr, count);
@@ -582,54 +649,48 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         return mmap_addr as u64;
     }
 
-    // When MMAP_FILE_BACKED_LAZY is set, demand-page file-backed mmaps instead
-    // of eagerly allocating all frames (on by default): eagerly mapping a
-    // large shared library costs its whole size in user pages before the
-    // process can start. Pages are faulted in via
-    // LazySource::File, same mechanism as demand-paged ELFs.
-    // Writable MAP_SHARED is lazy-eligible too since 2026-09-22 (the shared
-    // plan's change for parity-db's 1 GiB reserves); it is recorded for
-    // present-page writeback below instead of being forced eager.
+    // Demand-page file mappings (MMAP_FILE_BACKED_LAZY, on by default): eagerly
+    // mapping a large shared library costs its whole size before the process
+    // can start. A lazy file region reads by `(mount, inode)` only, so a file
+    // without that identity (no inode, or a size that would not read) takes the
+    // eager path below, which reads once at mmap time.
     if akuma_config::MMAP_FILE_BACKED_LAZY && plan.file_lazy_eligible
-        && let Some(akuma_exec::process::FileDescriptor::File(ref f)) = proc.get_fd(fd as u32)
+        && let Some((path, fd_mount, fd_inode)) = &file
         && let (mount_id, inode, filesz) = {
             // Path→inode resolution reads ext2 metadata (real I/O on a cold cache) —
             // take the dropped-BKL window for it like every other on-disk read path
             // (Phase 2e of the no-bkl-vfs carve-out).
             let _vfs_window = super::fs::VfsBklGuard::new();
-            resolve_file_extent(&f.path, f.mount_id(), f.inode(), offset, len)
+            resolve_file_extent(path, *fd_mount, *fd_inode, offset, len)
         }
-        // A lazy file region reads by `(mount, inode)` only. A file without that
-        // identity (no inode on its filesystem, or a size that would not read)
-        // takes the eager path below, which reads by path once at mmap time.
         && inode != 0 && mount_id != 0 {
-            let path = f.path.clone();
-            let source = akuma_exec::process::LazySource::file(
-                mount_id,
-                inode,
-                offset,
-                filesz,
-                mmap_addr,
-            );
-            let count = akuma_exec::process::push_lazy_region_with_source(
-                proc.tgid, mmap_addr, pages * 4096, page_flags, source);
-            // Writable MAP_SHARED arrives here since the shared plan made it
-            // lazy-eligible (see `SharedFileMapping`). Record it, or its writes
-            // never reach the file: this return used to skip the registration
-            // the eager path below does.
-            if is_shared_writable {
-                SHARED_FILE_MAPPINGS.lock().insert(
-                    (proc.tgid, mmap_addr),
-                    SharedFileMapping { path: path.clone(), file_offset: offset, len, lazy: true },
-                );
-            }
+            let source = akuma_exec::process::LazySource::file(mount_id, inode, offset, filesz, mmap_addr);
+            let region = akuma_exec::process::lazy_mmap_region(mmap_addr, byte_len, page_flags, &source);
+            let region = if let SharedWrite::Table(rec) = core::mem::replace(&mut shared_write, SharedWrite::Glue) {
+                region.shared_writable(rec)
+            } else {
+                if is_shared_writable {
+                    SHARED_FILE_MAPPINGS.lock().insert(
+                        (proc.tgid, mmap_addr),
+                        SharedFileMapping { path: path.clone(), file_offset: offset, len, lazy: true },
+                    );
+                }
+                region
+            };
+            let count = akuma_exec::process::push_lazy_mmap_region(proc.tgid, region);
             if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
                 akuma_primitives::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (lazy-file{}, {} regions)\n",
-                    proc.pid, fd, &path, offset, len, mmap_addr,
+                    proc.pid, fd, path, offset, len, mmap_addr,
                     if is_shared_writable { ", shared-writable" } else { "" }, count);
             }
             return mmap_addr as u64;
         }
+    if matches!(shared_write, SharedWrite::Table(_)) {
+        // The table keys pages by inode; without one there is nothing coherent
+        // to serve.
+        proc.vm_release_reservation(mmap_addr, byte_len);
+        return EACCES;
+    }
 
     // Batch-allocate all pages in a single PMM lock acquisition, then map
     // them with no_flush and issue a single TLB flush after the loop.
@@ -679,8 +740,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // --kv-cache-file): MMAP_FILE_BACKED_LAZY routes read-only file mmaps to the
     // demand-paged path on every profile.
     if is_file_backed {
-        if let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
-            let path = f.path;
+        if let Some((path, mount_id, inode)) = &file {
             let _vfs_window = super::fs::VfsBklGuard::new();
             let mut file_off = offset;
             let mut bytes_read = 0usize;
@@ -694,7 +754,8 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 // frame is freshly allocated and not yet in any page table, so
                 // nothing can observe the intermediate state.
                 let page_buf = &mut fill_buf[..chunk];
-                match akuma_vfs_glue::fs::read_at(&path, file_off, page_buf) {
+                // By inode when the fd has one (a `/proc` file renders by path).
+                match akuma_vfs_glue::fs::read_at_open_file(path, *mount_id, *inode, file_off, page_buf) {
                     Ok(n) => {
                         if !akuma_exec::mmu::copy_to_phys(frame.addr, &fill_buf[..n]) {
                             break; // the PMM just handed us this frame; cannot happen
