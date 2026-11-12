@@ -9088,7 +9088,7 @@ fn test_virtio_sound_output() {
 /// that were rewritten to specific errnos:
 ///   - `mmap(_, 0, …)` → EINVAL
 ///   - `bind(bad_fd, …)` → EBADF
-///   - `setpgid(non_existent_pid, …)` → ESRCH
+///   - `setpgid(non_existent_pid, …)` and `getsid(non_existent_pid)` → ESRCH
 ///   - xattr stubs (nr 5, 6, 16) → EOPNOTSUPP (-95), never -96 (the old
 ///     `(!95i64) as u64` bug that surfaced as Go `compile` SIGSEGV at
 ///     errno-shaped FARs; see docs/GO_COMPILE_CRASH_DEBUGGING.md).
@@ -9112,6 +9112,11 @@ fn test_syscall_errno_compliance() {
     // setpgid against a definitely-nonexistent pid: ESRCH, not ENOENT/EPERM.
     let sp_ret = crate::syscall::handle_syscall(NR_SETPGID, &[0xFFFF_FFFE, 0, 0, 0, 0, 0]);
     let sp_ok = sp_ret == ESRCH;
+    // getsid is served (glue, both kernels, 2026-11-12) rather than ENOSYS: a
+    // missing pid is ESRCH like setpgid's.
+    const NR_GETSID: u64 = 156;
+    let gs_ret = crate::syscall::handle_syscall(NR_GETSID, &[0xFFFF_FFFE, 0, 0, 0, 0, 0]);
+    let sp_ok = sp_ok && gs_ret == ESRCH;
 
     // xattr stubs must return -EOPNOTSUPP (-95 = 0xffffffa9) bit-exact.
     // The previous `(!95i64) as u64` returned -96 (EPFNOSUPPORT) which
@@ -9148,9 +9153,9 @@ fn test_syscall_errno_compliance() {
         console::print("[Test] syscall_errno_compliance PASSED\n");
     } else {
         crate::safe_print!(
-            224,
-            "[Test] syscall_errno_compliance FAILED: mmap={} bind={} setpgid={} setxattr={} lsetxattr={} fremovexattr={} getprio={} setprio={} argv_cap={}\n",
-            mmap_ret as i64, bind_ret as i64, sp_ret as i64,
+            240,
+            "[Test] syscall_errno_compliance FAILED: mmap={} bind={} setpgid={} getsid={} setxattr={} lsetxattr={} fremovexattr={} getprio={} setprio={} argv_cap={}\n",
+            mmap_ret as i64, bind_ret as i64, sp_ret as i64, gs_ret as i64,
             xa_set as i64, xa_lset as i64, xa_frm as i64,
             getprio_ret as i64, setprio_ret as i64, crate::config::MAX_ARG_STRLEN,
         );

@@ -2785,8 +2785,26 @@ Checked: busybox as init on the serial console, `sleep 30` then `^C`, gives `mem
 (`members=1`); 10 ssh sessions plain and with `-tt`; amd64 suite 831/841/841, ring-3 OK.
 
 Not fixed by this: `^C` in an **interactive ssh** session on amd64 (`ssh -tt` with a typed `sleep 30`)
-does nothing, the same with or without this change, because sshd's sessions have no terminal at all
-there (next section).
+does nothing, the same with or without this change, because sshd's sessions had no terminal at all.
+That one was on both kernels, and was fixed separately the same day:
+[`SSH_SESSIONS_HAD_NO_PTY.md`](SSH_SESSIONS_HAD_NO_PTY.md).
+
+### `setsid` and `getsid`: glue's on both kernels (2026-11-12)
+
+glue had two `setsid`s, `proc::sys_setsid` (AArch64, through glue's dispatch) and
+`pty::sys_setsid` (amd64, called directly), with identical bodies. With `setpgid`/`getpgid`
+already glue's, the gated pair (`pty::sys_setpgid_gated`, `sys_getpgid_gated`) had no callers
+left. Both copies and the dead pair are gone. amd64 sends all four calls to glue's dispatch, and
+`getsid` moved into it (`pty::sys_getsid`: the controlling pty's session leader, or 1 for a process
+no pty controls). So the AArch64 kernel serves `getsid` now; it answered `ENOSYS` before.
+`syscall_errno_compliance` (AArch64 boot suite) checks that a missing pid gives `ESRCH`.
+
+Gates: amd64 suite 831/841/841, ring-3 OK; AArch64 312/320/318 (the three known `SPAWN FAILED`
+lines) with `syscall_errno_compliance PASSED`; clippy on AArch64, the amd64 `headless` and
+`server,no-tests` images, the machine half and the amd64 test crate; host tests.
+
+The `init=` change above passed the same gates after it was committed: amd64 831/841/841, ring-3
+OK, AArch64 312/320/318, host tests.
 
 ### Slice 5: mm (deferred, 2026-11-11)
 

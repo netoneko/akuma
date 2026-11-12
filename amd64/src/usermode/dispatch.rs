@@ -1114,13 +1114,11 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // `setpgid(job, job)` + `TIOCSPGRP(job)` lets `^C` reach the job. Until then they
         // were real only inside a pty session and accepted no-ops elsewhere, and on the
         // serial console `^C` went to an empty group (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`,
-        // "Job control on the amd64 console"). `getsid` stays the pty-gated answer: glue has
-        // no session model beyond a pty's, and the AArch64 kernel does not serve it at all.
-        // `setsid` is real everywhere: it is how a pty child gets a group of its own
-        // before `TIOCSCTTY`. `akuma_syscalls_glue::pty`.
-        Syscall::Getpgid | Syscall::Setpgid => to_glue(call, [a1, a2, 0, 0, 0, 0]),
-        Syscall::Getsid => akuma_syscalls_glue::pty::sys_getsid_gated(a1 as u32),
-        Syscall::Setsid => akuma_syscalls_glue::pty::sys_setsid(),
+        // "Job control on the amd64 console"). `setsid` and `getsid` are glue's too: `getsid`
+        // names the controlling pty's leader, or 1 for a process no pty controls.
+        Syscall::Getpgid | Syscall::Setpgid | Syscall::Getsid | Syscall::Setsid => {
+            to_glue(call, [a1, a2, 0, 0, 0, 0])
+        }
         Syscall::Getrusage => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `waitid(idtype, id, infop, options, rusage)` — x86_64 247, glue's (`sys_waitid`: `P_PID`/`P_ALL`/
         // `P_PIDFD`, `WNOHANG`/`WNOWAIT`, the same group-wise child lookup and `ECHILD` rules as `wait4`).
