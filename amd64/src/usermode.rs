@@ -1742,10 +1742,10 @@ impl Image {
     /// As [`Self::from_elf_argv_envp`], loading the image off the file at
     /// `path` (symlink-resolved) a window at a time rather than from a copy in
     /// the heap — what `execve` and `sys_spawn` use (`loader::load_path`).
-    fn from_elf_path_argv_envp(
+    fn from_elf_path_argv_envp<S: AsRef<[u8]>>(
         path: &str,
-        argv: &[&[u8]],
-        envp: &[&[u8]],
+        argv: &[S],
+        envp: &[S],
     ) -> Result<(Self, loader::LoadedImage), &'static str> {
         Self::with_stack(loader::load_path(path)?, argv, envp)
     }
@@ -1755,10 +1755,10 @@ impl Image {
     /// `akuma_elf::attach_stack`, the AArch64 kernel's builder, at this target's
     /// fixed top with `AT_HWCAP` 0. On a failure the loaded space drops inside
     /// it, which frees every frame the load placed.
-    fn with_stack(
+    fn with_stack<S: AsRef<[u8]>>(
         (loaded, img): (akuma_elf::LoadedElf<UserAddressSpace>, loader::LoadedImage),
-        argv: &[&[u8]],
-        envp: &[&[u8]],
+        argv: &[S],
+        envp: &[S],
     ) -> Result<(Self, loader::LoadedImage), &'static str> {
         if argv.is_empty() || argv.len() > loader::MAX_ARGV || envp.len() > loader::MAX_ENVP {
             return Err("argv must hold 1..=MAX_ARGV entries and envp at most MAX_ENVP");
@@ -3331,42 +3331,6 @@ fn user_strv(
     Some(out)
 }
 
-/// `execve(path, argv, envp)` — x86_64 syscall 59.
-///
-/// This target has no `fork`, so `execve` is only ever the tail of a spawned
-/// task: `sshd`/`run_init` start a shell with `sys_spawn`, and the shell running
-/// `sh -c "<cmd>"` `execve`s the command directly (ash does not fork for the
-/// single-command `-c` form — verified with `strace`). The running task keeps
-/// its process slot, its pipes and its pid; only the image behind it changes.
-///
-/// # The swap happens here now
-///
-/// It used to be parked in `static mut PENDING_EXEC` and performed by
-/// [`run_process`] after the `leave` path returned, "because a page-table
-/// switch and a frame free do not belong inside the syscall asm". They still do
-/// not, and they still are not: this function runs on the kernel stack in
-/// ordinary Rust, well outside `syscall_entry`, and
-/// [`crate::sched::set_current_space_root`] is documented safe mid-flight —
-/// every address space shares the kernel's upper half, so the stack this runs
-/// on stays mapped across the `mov cr3`.
-///
-/// What the deferral actually bought was somewhere to *keep* the new image, and
-/// 5b slice 4 deleted the array it was kept in. The order below is the part
-/// that matters and is the same order `run_process` used:
-///
-/// 1. install the new address space on the registered process (which hands back
-///    the old one, rather than dropping it);
-/// 2. switch `CR3` off the old space;
-/// 3. **then** drop the old space, freeing its frames and page tables.
-///
-/// Nothing between (1) and (3) touches user memory — the syscall return path
-/// with `leave` set restores a kernel stack pointer and returns into kernel
-/// code — so there is no window in which a fault could reach a table that has
-/// been freed or a root that has been replaced.
-///
-/// On success this does not really "return": it sets `leave` and `exec_pending`
-/// and the next thing the task does is re-enter ring 3 at the new entry. On
-/// failure it returns a negative errno and the caller runs on.
 /// `Image::from_elf_argv_envp`'s rejection strings, mapped to the errno Linux
 /// would return — the honest replacement for the blanket `ENOMEM` that stood
 /// here, which turned a missing `PT_INTERP` file into
@@ -3417,8 +3381,8 @@ fn exec_load_errno(e: &str) -> u64 {
 ///   program**: `cd /tmp/hi/target/debug && ./hi` ran `/hi`, left over from an
 ///   earlier session, and printed its output as if it were the build's.
 ///
-/// The rule is glue's `sys_execve`, restated here because this kernel does not
-/// route `execve` through it: absolute paths are already absolute, a relative
+/// `execve` resolves through glue's `execve::read_request`; `sys_spawn` still
+/// restates the rule here (until spawn is shared too): absolute paths are already absolute, a relative
 /// path is joined to `Process::cwd`, and a caller with no registered process
 /// (a kernel task running the boot suite) keeps what it passed.
 ///
@@ -3433,7 +3397,11 @@ fn process_relative_path(path: &str) -> alloc::string::String {
     }
 }
 
-fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {    use crate::fd::errno;
+/// `execve(path, argv, envp)` — x86_64 syscall 59: glue's `execve::run` over
+/// [`Amd64Exec`]. On success it returns 0 into the new image (see
+/// [`Amd64Exec`]); on failure a negative errno to the caller's own image.
+fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    use crate::fd::errno;
 
     let slot = current_proc_slot();
     if slot >= PROC_SLOTS {
@@ -3456,372 +3424,138 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {    use crate
         Ok(r) => r,
         Err(r) => return r,
     };
-    let (path, argv_owned, envp_owned) = (req.path, req.argv, req.envp);
-    do_execve(slot, path, argv_owned, envp_owned)
+    akuma_syscalls_glue::execve::run(&Amd64Exec { slot, entered: core::cell::Cell::new((0, 0, 0)) }, req)
 }
 
-/// The image-loading half of `execve`, split out so a `#!` script can recurse
-/// into it with the interpreter's path and a rebuilt argv — same shape as
-/// `sys_execve`'s split into this and [`sys_execve`] itself, and the same
-/// split AArch64's `akuma-syscalls-glue::proc` already has
-/// (`sys_execve`/`do_execve`). `slot` is threaded through rather than
-/// recomputed: it names the *calling task*, which a shebang hop does not
-/// change.
-fn do_execve(
+/// This kernel's half of `execve`; the rest is glue's `execve::run`, shared
+/// with the AArch64 kernel (2026-11-12).
+///
+/// It reads only the file's head, maps every segment as it loads, and returns
+/// into the new image through the syscall exit path: `enter` arms
+/// `UserCtx::exec_pending` and returns 0, and `.Lexec_return` zeroes the
+/// register file and `sysret`s to the new entry.
+struct Amd64Exec {
+    /// The calling task's process slot, which a `#!` hop does not change.
     slot: usize,
-    path: alloc::string::String,
-    argv_owned: alloc::vec::Vec<alloc::vec::Vec<u8>>,
-    envp_owned: alloc::vec::Vec<alloc::vec::Vec<u8>>,
-) -> u64 {
-    use crate::fd::errno;
+    /// `(entry, stack, CR3 root)` of the installed image, from `install` to `enter`.
+    entered: core::cell::Cell<(u64, u64, u64)>,
+}
 
-    // Execute permission (`EACCES`), the same check AArch64's glue `do_execve`
-    // makes — this target has its own exec path, so it does not get that one
-    // for free. Against the symlink-resolved path, as the image read below
-    // resolves it: an apk wrapper is a link, and the link's own mode is 0777.
-    // A `#!` hop re-enters here with the interpreter, which is checked too.
-    if let Err(e) = akuma_syscalls_glue::perm::check(
-        &akuma_vfs_glue::resolve_symlinks(&path),
-        akuma_isolation::dac::MAY_EXEC,
-    ) {
-        return e;
+impl akuma_syscalls_glue::execve::ExecArch for Amd64Exec {
+    type Image = crate::fs::ImageHead;
+    type Loaded = (Image, loader::LoadedImage);
+
+    fn read(&self, path: &str) -> Result<Self::Image, u64> {
+        // BKL-free (`EXEC_BKL_DROP_ENABLED`): on a USB disk whose transfer
+        // stalled this read was the multi-second BKL hold behind the `[BKL]
+        // stuck` storm of 2026-09-11 (`exec_runtime.rs` § "The exec-side BKL
+        // drop"). The errno is the table's, not a blanket ENOENT: an `IoError`
+        // on a cache-cold binary once printed as "not found" for files that
+        // exist. Only the head is read; the loader reads the image off the file
+        // a window at a time (`loader::load_path`).
+        crate::exec_runtime::bkl_free_io(|| crate::fs::read_image_head(path))
+            .map_err(akuma_syscalls_glue::fs::fs_error_to_errno)
     }
 
-    // Mark the file as being executed BEFORE its bytes are read (`ETXTBSY`, `docs/archive/ETXTBSY_TEXT_BUSY.md`), so it cannot be
-    // rewritten between the read and the mark. It must reach `Process::set_text` or be dropped before this function can `eret`: the
-    // frame is abandoned on success, and a pin left in it would keep the file busy forever.
-    let Ok(text) = akuma_vfs_glue::text_pin(&akuma_vfs_glue::resolve_symlinks(&path)) else {
-        return errno::ENOMEM;
-    };
-
-    // The image read runs BKL-free per `EXEC_BKL_DROP_ENABLED` — on a USB disk
-    // whose transfer stalled, this read is the multi-second BKL hold behind the
-    // `[BKL] stuck` storm of 2026-09-11 (`exec_runtime.rs` § "The exec-side
-    // BKL drop"). Everything after it needs the BKL again (the image switch
-    // edits live page tables, and the shootdown argument assumes the BKL is
-    // outermost), so the guard is scoped to exactly this read.
-    //
-    // The errno is the table's, not a blanket ENOENT: during the stall,
-    // `read_file` failing with `IoError` on cache-cold binaries printed as
-    // "not found" for files that exist — `/bin/ls` "missing" while
-    // `/bin/busybox` (block-cache-hot) ran — which sent the investigation
-    // hunting for a broken rootfs.
-    //
-    // Only the head is read here, since 2026-10-08: the loader reads the image
-    // off the file a window at a time (`loader::load_path`), so the binary's
-    // size is no longer a kernel-heap demand (`fs::read_image_head`). The head
-    // read resolves symlinks — the raw read once handed the *link text* to the
-    // loader, and every apk-installed wrapper is a link.
-    let head = match crate::exec_runtime::bkl_free_io(|| crate::fs::read_image_head(&path)) {
-        Ok(head) => head,
-        Err(e) => return akuma_syscalls_glue::fs::fs_error_to_errno(e),
-    };
-    let image = head.head();
-
-    // `#!interpreter [arg]` — added 2026-09-20; this target had never had any
-    // shebang handling and handed the raw script bytes straight to the ELF
-    // loader, which rejected them as `ENOEXEC` (docs/README.md's symptom
-    // matrix, "execve of a `#!` script fails with Exec format error"). A shell
-    // hides this by retrying a non-ELF child itself, so it only showed up the
-    // moment something else — `rustc` execing its linker, `apk`'s hooks —
-    // called `execve` directly. Same parser and argv-construction rule as the
-    // AArch64 kernel's `akuma-syscalls-glue::proc::exec_shebang`, both
-    // host-tested in `akuma-exec`'s `shebang_tests`, so the two cannot drift.
-    if image.len() >= 2 && image[0] == b'#' && image[1] == b'!' {
-        let line = &image[..image.len().min(akuma_exec::process::SHEBANG_MAX)];
-        let Some((interpreter, shebang_arg)) = akuma_exec::process::parse_shebang(line) else {
-            return errno::ENOENT;
-        };
-        // Owned, before `image` (which `interpreter`/`shebang_arg` borrow) is
-        // dropped — the recursive `do_execve` below may `eret` on success and
-        // abandon every frame here, so nothing large may still be borrowed.
-        let interp_argv0 = alloc::string::String::from(interpreter);
-        let interp_arg = shebang_arg.map(alloc::string::String::from);
-        drop(head);
-
-        // Symlink-resolved, like the AArch64 side: a `#!/bin/sh` reached
-        // through a symlink must still load the real interpreter, and
-        // `interp_argv0` (as written in the `#!` line) stays what argv[0]
-        // becomes — collapsing the two loses the interpreter's identity for a
-        // multi-call binary that dispatches on argv[0] (busybox).
-        let interp_path = akuma_vfs_glue::resolve_symlinks(&interp_argv0);
-
-        let mut new_argv: alloc::vec::Vec<alloc::vec::Vec<u8>> = akuma_exec::process::shebang_hop(
-            &interp_argv0,
-            interp_arg.as_deref(),
-            &path,
-            &[],
-        )
-        .into_iter()
-        .map(alloc::string::String::into_bytes)
-        .collect();
-        if argv_owned.len() > 1 {
-            new_argv.extend(argv_owned.into_iter().skip(1));
-        }
-        drop(path);
-        // The script is data; its interpreter is what runs, and the recursion marks that.
-        drop(text);
-
-        return do_execve(slot, interp_path, new_argv, envp_owned);
+    fn head<'a>(&self, image: &'a Self::Image) -> &'a [u8] {
+        image.head()
     }
 
-    let argv_refs: alloc::vec::Vec<&[u8]> =
-        argv_owned.iter().map(alloc::vec::Vec::as_slice).collect();
-    let envp_refs: alloc::vec::Vec<&[u8]> =
-        envp_owned.iter().map(alloc::vec::Vec::as_slice).collect();
-
-    let (next, ld) = match Image::from_elf_path_argv_envp(&head.resolved, &argv_refs, &envp_refs) {
-        Ok(p) => p,
-        Err(e) => {
+    fn load(&self, image: Self::Image, _path: &str, argv: &[alloc::vec::Vec<u8>], envp: &[alloc::vec::Vec<u8>]) -> Result<Self::Loaded, u64> {
+        Image::from_elf_path_argv_envp(&image.resolved, argv, envp).map_err(|e| {
             serial::puts("  [execve] load failed: ");
             serial::puts(e);
             serial::puts("\n");
-            // The image was rejected; the caller's own image is untouched, so
-            // this is a real errno return, not a leave.
-            return exec_load_errno(e);
+            exec_load_errno(e)
+        })
+    }
+
+    fn stop_siblings(&self) {
+        // `drain` sets the group-exit flag, wakes every sibling so a parked
+        // `FUTEX_WAIT` does not wait out the scheduler backstop, and spins
+        // (bounded) until none is live. Only from the main thread: `THREADS`
+        // holds non-main threads, so a non-leader caller would wait its full
+        // budget for itself. POSIX makes that caller the leader; this target has
+        // no leader transfer, and says so.
+        if crate::thread::current_is_main() {
+            crate::thread::drain(self.slot);
+        } else if crate::thread::live_count(self.slot) > 1 {
+            serial::puts("  [execve] from a non-leader thread with live siblings; \
+                          they are not killed (no leader transfer on this target)\n");
         }
-    };
-
-    // `/proc/<pid>/cmdline` follows the new image. Without this, `ps` reported
-    // every process under the name of whatever `fork`ed it — a shell session
-    // showed a column of `sh`, which is the shape that makes `ps` useless
-    // rather than merely incomplete.
-    //
-    // 5b slice 2 deleted `Spawn::cmdline`, the second copy, and refreshed the
-    // registered process's display `name` here. **It did not refresh `args`**,
-    // and `args` is what `/proc/<pid>/cmdline` — and therefore `ps`'s COMMAND
-    // column, through `ProcEntry::name`— is actually rendered from
-    // (`proc_entry_of`), so an `execve`d process still listed the argv of
-    // whatever spawned it. Slice 4 refreshes both, which is what that slice's
-    // note already claimed. Recorded once and used once, in the same lock as
-    // the entry point, so no reader can pair a new image with an old argv.
-    let exec_cmdline = flatten_cmdline(argv_refs.iter().copied());
-    // **The resolved path, not `argv[0]`** — same reason as `sys_spawn`'s
-    // registration: `image.name` is what `/proc/<pid>/exe` reports, and
-    // `argv[0]` is a name the caller chose rather than something that opens.
-    // `ps` is unaffected — `akuma_procfs::ProcStat::comm` takes the basename.
-    // **Resolved through symlinks**, so `/proc/<pid>/exe` names the binary
-    // and not the spelling. Chromium starts every child with
-    // `execve("/proc/self/exe", …)` and then finds its own files next to
-    // `readlink("/proc/self/exe")`; recording the literal path made that
-    // `/proc/self/exe` again, the directory `/proc/self`, and the child died
-    // `FATAL: Error loading V8 startup snapshot file` (2026-10-08). Resolved
-    // here, before the swap, `/proc/self` is still the *caller*, whose binary
-    // is exactly what a re-exec of itself runs.
-    let new_name = akuma_vfs_glue::resolve_symlinks(&path);
-
-    let pid = current_pid();
-    let new_root = next.space.ttbr0();
-    let new_brk = ld.end_va;
-    let new_entry = next.entry;
-    let new_stack = next.stack;
-    let stack_bottom = (ELF_STACK_TOP - (elf_stack_max_pages() as u64 * 4096)) as usize;
-
-    // **POSIX: `execve` destroys every other thread of the calling process.**
-    // This target did not, and slice 4 is what made the omission concrete: the
-    // address space the swap below replaces and frees is the one a `CLONE_VM`
-    // sibling is still executing in. `free_or_defer_as_frames` parks the frames
-    // while another core's `CR3` stands on that L0, so the sibling is not
-    // reading freed memory — it is running the *old program* in a process that
-    // has become a different one, and the parked frames come back only when it
-    // finally leaves. `akuma-exec`'s own `replace_image` calls
-    // `kill_exec_siblings` at exactly this point, and this is that.
-    //
-    // `drain` sets the group-exit flag, wakes every sibling so a parked
-    // `FUTEX_WAIT` does not have to wait out the scheduler backstop, and spins
-    // (bounded) until none is live. It is safe to yield here: the new image is
-    // built but nothing has been swapped, so a failure at this point leaves the
-    // caller's own image untouched. `clear_group_exiting` below is what lets
-    // the new program's first thread run.
-    //
-    // **Only from the main thread**, and the restriction is carried rather than
-    // hidden: `THREADS` holds non-main threads, so `live_count` includes a
-    // *non-leader* caller and `drain` would spin its full budget waiting for
-    // the thread that is calling it, then print `DRAIN INCOMPLETE`. POSIX says
-    // that caller becomes the group leader and the others die — leader transfer
-    // is a thing this target's thread model does not have, so the honest
-    // behaviour for that case is the one it has always had, said out loud.
-    if crate::thread::current_is_main() {
-        crate::thread::drain(slot);
-    } else if crate::thread::live_count(slot) > 1 {
-        serial::puts("  [execve] from a non-leader thread with live siblings; \
-                      they are not killed (no leader transfer on this target)\n");
-    }
-    // The old image's writable `MAP_SHARED` file mappings die with it: write
-    // them back and release their shared pages now, while the old address
-    // space is still the current one — its `Drop` inside `install_image` would
-    // do neither. Same call the exit epilogue makes.
-    if let Some(p) = current_mm_process() {
-        akuma_syscalls_glue::mem::release_shared_write_mappings(p);
     }
 
-    // Built **before** the hold below. `with_process` runs its closure with
-    // interrupts disabled and states that it must not allocate on the heap, so
-    // everything that allocates is done here and only moved in there.
-    let new_args: alloc::vec::Vec<alloc::string::String> = exec_cmdline
-        .split(|b| *b == 0)
-        .filter(|a| !a.is_empty())
-        .map(|a| alloc::string::String::from_utf8_lossy(a).into_owned())
-        .collect();
-
-    // Step 1: install the new image on the registered process — **the shared
-    // `Process::install_image` since 2026-09-11**, which is the half of
-    // `execve` that is about the process rather than about the ELF.
-    //
-    // The load above stays this target's (`Image::from_elf_argv_envp`, i.e.
-    // `akuma-elf`'s `load_elf` plus `loader::build_stack`): C1 step 6 kept that
-    // stack builder deliberately, and the shared `replace_image` begins by
-    // loading its own way. `ImageInstall` is the seam between the two, and it
-    // carries only what the install needs to know — no `ImageSource`, no
-    // deferred segments (this target maps eagerly, so the slice is empty).
-    //
-    // **Three POSIX obligations arrive with it that this function did not
-    // perform**, and none is cosmetic:
-    //
-    // * `clear_child_tid` is reset. A `CLONE_CHILD_CLEARTID` address from the
-    //   *previous* image would otherwise be zeroed-and-woken at exit — a write
-    //   to whatever the new program has at that VA.
-    // * custom signal handlers go back to `SIG_DFL` (`SIG_IGN` preserved).
-    //   Recorded here as "inert today, correct the moment `rt_sigaction` stops
-    //   being a stub"; it stopped on 2026-09-11 and this is live — an `execve`
-    //   that kept the old image's handler addresses would jump the new program
-    //   into whatever is at that VA on its first signal.
-    // * the alternate signal stack is disabled; it pointed into the old space.
-    //
-    // The old address space and the old region list are dropped **inside**, not
-    // returned to be dropped here. That was this function's own arrangement for
-    // a good reason — `UserAddressSpace::drop` frees every user frame and page
-    // table, which is not work for a closure `with_process` runs with
-    // interrupts disabled — and the reason does not apply to `install_image`:
-    // it takes `&self` and interior locks, at normal priority. It also
-    // `deactivate()`s first, so the hardware is off the old tables before they
-    // are freed, which is the ordering this function achieved with
-    // `set_current_space_root` and which is now stated where it is relied on.
-    // **The thread group leader's `Process`, not the calling task's own.** The
-    // block this replaced resolved through `with_process(current_pid(), ..)`,
-    // and `current_pid()` is the *tgid* since the `clone` fold — so this is the
-    // same process it always installed onto, named through the accessor that
-    // says which one it means. `current_process()` would be the own-half and
-    // would install the new image onto a non-leader thread's own `Process`,
-    // leaving the group leader running the program that was just replaced.
-    //
-    // `execve` replaces an address space, which is a property of the thread
-    // *group*, so the leader is right on both counts — the same reasoning
-    // `current_mm_process` carries for the fault path.
-    let Some((_, proc)) = akuma_exec::process::current_thread_tgid_process() else {
-        // Unreachable by construction since 5b slice 4: every process task is
-        // registered before it is published, so a task running `execve` has a
-        // registered process. Say so rather than proceeding — the new image
-        // would have nowhere to be recorded and the task would re-enter ring 3
-        // at the old entry point in the new space.
-        serial::puts("  [execve] no registered process for pid ");
-        serial::put_dec(u64::from(pid));
-        serial::puts("\n");
-        return errno::ESRCH;
-    };
-    if let Err(e) = proc.install_image(akuma_exec::process::ImageInstall {
-        address_space: next.space,
-        entry_point: new_entry as usize,
-        sp: new_stack as usize,
-        brk: new_brk as usize,
-        stack_bottom,
-        stack_top: ELF_STACK_TOP as usize,
-        mmap_floor: crate::mm::MMAP_BASE,
-        args: &new_args,
-        // This target maps every segment eagerly (`loader::load`), so there is
-        // nothing for the shared lazy path to defer.
-        deferred_segments: &[],
-    }) {
-        serial::puts("  [execve] install failed: ");
-        serial::puts(&e);
-        serial::puts("\n");
-        return errno::ENOMEM;
+    fn with_target(&self, f: impl FnOnce(&akuma_exec::process::Process) -> u64) -> u64 {
+        // The thread group leader's `Process`: an address space belongs to the
+        // group, and the calling task's own half would leave the leader running
+        // the program just replaced.
+        if let Some((_, proc)) = akuma_exec::process::current_thread_tgid_process() {
+            f(proc)
+        } else {
+            // Every process task is registered before it is published, so this
+            // is unreachable by construction; say so rather than enter the old
+            // entry point in a new space.
+            serial::puts("  [execve] no registered process for pid ");
+            serial::put_dec(u64::from(current_pid()));
+            serial::puts("\n");
+            crate::fd::errno::ESRCH
+        }
     }
-    // The new image's executable is busy for as long as it runs (the old image's mark is released).
-    proc.set_text(text);
-    // `install_image` cleared the region list; the stack's demand-grown part is
-    // one region, registered as at first exec (`Image::with_stack`).
-    crate::mm::register_lazy_stack(ELF_STACK_TOP, ELF_STACK_PAGES, elf_stack_max_pages());
-    // The display name is the syscall layer's, on both kernels —
-    // `install_image`'s doc says so, because it is the *resolved path* here and
-    // `argv[0]` would be a name the caller chose rather than something that
-    // opens. `/proc/<pid>/exe` reports `exe`, which only this line and spawn
-    // write — `name` is the `comm` that `prctl(PR_SET_NAME)` may rename later.
-    // (`/proc` identity and the close-on-exec sweep are glue's
-    // `execve::commit`, below, shared with Taoxichuan.)
 
-    // Image replacement committed — *now* close the close-on-exec descriptors.
-    // POSIX's point of no return: a successful `execve` closes every
-    // `FD_CLOEXEC` fd, and a failed one (every `return errno::*` above) leaves
-    // them untouched, which is why this sits after the install rather than
-    // before it.
-    //
-    // **This target had no sweep at all**, and the cost was not a leak — it was
-    // a hang. `git`'s `start_command` creates a notify pipe whose write end is
-    // `FD_CLOEXEC`, forks, closes the parent's copy of that end, and then
-    // *blocks in `read()`* on the read end: a successful exec closes the
-    // child's copy, the pipe runs out of writers, and the read returns EOF,
-    // which is how the parent learns the exec worked. With the write end
-    // surviving the exec there is no EOF, so `git` never returns from that read
-    // and never sends `capabilities` to the helper it just started — both sides
-    // parked, the helper on a stdin nobody will write.
-    //
-    // Traced 2026-09-18: `nr=3 a1=0x8` (close 8) then `nr=0 a1=0x7` (read 7),
-    // never returning, with the per-pipe dump showing `bytes=0 writers>0` on
-    // every live pipe. The AArch64 kernel has done this since its own
-    // `execve` was written (`akuma-syscalls-glue`'s `sys_execve`); the sweep is
-    // shared code and this call site is what was missing.
-    // `docs/archive/AMD64_TRASHCAN_ISSUES.md` §1.
-    let new_args_bytes: alloc::vec::Vec<alloc::vec::Vec<u8>> =
-        new_args.iter().map(|a| a.clone().into_bytes()).collect();
-    akuma_syscalls_glue::execve::commit(proc, &new_name, &new_args_bytes);
-
-    // A new program in an existing slot starts with a clean group: a stale
-    // `exit_group` flag from the image just replaced would kill its first
-    // thread at its first syscall.
-    crate::thread::clear_group_exiting(slot);
-    // Step 2: `CR3` onto the new space, and record it on the task slot so the
-    // next switch into this task installs the same thing.
-    //
-    // `install_image` left the hardware on the **boot** root
-    // (`UserAddressSpace::deactivate`) rather than on the new space: it has no
-    // opinion about which address space a caller wants active afterwards, and
-    // on the other kernel the `eret` path decides. Here it is this line, and it
-    // must run before ring 3 is re-entered — which `run_process`'s loop does
-    // immediately after this syscall returns.
-    //
-    // The old space and the old region list are already gone, dropped inside
-    // the install *after* that `deactivate` — which is the ordering the two
-    // explicit `drop`s that used to stand here were arranging by hand.
-    crate::sched::set_current_space_root(new_root);
-
-    // **Return into the new image**, rather than leaving ring 3 and being sent
-    // back in by a loop.
-    //
-    // `user_rip`/`user_rsp` are where the syscall return path takes the program
-    // counter and stack from — the first is true only since this change. The
-    // ordinary return pops the `rcx`/`r11` that the `syscall` instruction
-    // itself delivered; `[rax + 32]` was written for `vfork`'s benefit alone
-    // and nothing read it on the way out. `exec_pending` now selects
-    // `.Lexec_return`, which reads both, zeroes the register file and
-    // `sysret`s. `leave` is deliberately **not** set: leaving ring 3 is what
-    // made `execve` need a loop to get back in.
-    //
-    // Under the BKL, interrupts off inside a syscall; only this task reads these
-    // fields.
-    let armed = crate::sched::with_current_uctx(|u| {
-        u.user_rip = new_entry;
-        u.user_rsp = new_stack;
-        u.exec_pending = 1;
-    });
-    if armed.is_none() {
-        // Nothing to return through. The old image is already gone, so there is
-        // no program to return to either; say so rather than `sysret`ing
-        // somewhere arbitrary.
-        serial::puts("  [execve] no UserCtx on this task\n");
-        return errno::ENOSYS;
+    fn install(&self, proc: &akuma_exec::process::Process, (next, ld): Self::Loaded) -> Result<(), u64> {
+        let root = next.space.ttbr0();
+        self.entered.set((next.entry, next.stack, root));
+        let stack_bottom = (ELF_STACK_TOP - (elf_stack_max_pages() as u64 * 4096)) as usize;
+        if let Err(e) = proc.install_image(akuma_exec::process::ImageInstall {
+            address_space: next.space,
+            entry_point: next.entry as usize,
+            sp: next.stack as usize,
+            brk: ld.end_va as usize,
+            stack_bottom,
+            stack_top: ELF_STACK_TOP as usize,
+            mmap_floor: crate::mm::MMAP_BASE,
+            // `execve::commit` records the argv.
+            args: &[],
+            // Every segment is mapped eagerly (`loader::load_path`).
+            deferred_segments: &[],
+        }) {
+            serial::puts("  [execve] install failed: ");
+            serial::puts(&e);
+            serial::puts("\n");
+            return Err(crate::fd::errno::ENOMEM);
+        }
+        // `install_image` cleared the region list; the stack's demand-grown
+        // part is one region, registered as at first exec (`Image::with_stack`).
+        crate::mm::register_lazy_stack(ELF_STACK_TOP, ELF_STACK_PAGES, elf_stack_max_pages());
+        Ok(())
     }
-    0
+
+    fn enter(&self, _proc: &akuma_exec::process::Process) -> u64 {
+        let (entry, stack, root) = self.entered.get();
+        // A new program in an existing slot starts with a clean group: a stale
+        // `exit_group` flag from the image just replaced would kill its first
+        // thread at its first syscall.
+        crate::thread::clear_group_exiting(self.slot);
+        // `install_image` left the hardware on the boot root; `CR3` onto the new
+        // space, recorded on the task slot so the next switch installs it too.
+        crate::sched::set_current_space_root(root);
+        // Return into the new image: `exec_pending` selects `.Lexec_return`,
+        // which takes `user_rip`/`user_rsp`, zeroes the register file and
+        // `sysret`s. `leave` is not set. Under the BKL; only this task reads
+        // these fields.
+        let armed = crate::sched::with_current_uctx(|u| {
+            u.user_rip = entry;
+            u.user_rsp = stack;
+            u.exec_pending = 1;
+        });
+        if armed.is_none() {
+            // The old image is already gone, so there is no program to return
+            // to either; say so rather than `sysret`ing somewhere arbitrary.
+            serial::puts("  [execve] no UserCtx on this task\n");
+            return crate::fd::errno::ENOSYS;
+        }
+        0
+    }
 }
 
 /// `fork` (57) / `vfork` (58) / plain `clone(SIGCHLD, 0)` (56).

@@ -89,10 +89,10 @@ enum ImageSource<'a> {
 #[cfg(feature = "elf-loader")]
 impl ImageSource<'_> {
     /// Load the image and build its initial user stack.
-    fn load(
+    fn load<S: AsRef<[u8]>>(
         &self,
-        args: &[String],
-        env: &[String],
+        args: &[S],
+        env: &[S],
         interp_prefix: Option<&str>,
     ) -> Result<LoadedWithStack<akuma_mmu::UserAddressSpace>, ElfError> {
         let stack_size = config().user_stack_size;
@@ -108,6 +108,30 @@ impl ImageSource<'_> {
             ),
         }
     }
+}
+
+/// A program loaded for `execve` and not yet installed on any process: the
+/// address space with its segments and initial stack. Dropping it frees them.
+#[cfg(feature = "elf-loader")]
+pub struct LoadedExec(LoadedWithStack<akuma_mmu::UserAddressSpace>);
+
+#[cfg(feature = "elf-loader")]
+fn load_exec<S: AsRef<[u8]>>(source: &ImageSource<'_>, args: &[S], env: &[S]) -> Result<LoadedExec, String> {
+    crate::process::lifecycle_trace("[FORK-DBG] replace_image: loading ELF\n");
+    source.load(args, env, None).map(LoadedExec).map_err(|e| format!("Failed to load ELF: {}", e))
+}
+
+/// Load an image already in the kernel heap, for [`Process::install_loaded`].
+#[cfg(feature = "elf-loader")]
+pub fn load_exec_bytes<S: AsRef<[u8]>>(elf_data: &[u8], args: &[S], env: &[S]) -> Result<LoadedExec, String> {
+    load_exec(&ImageSource::Bytes(elf_data), args, env)
+}
+
+/// Load an image off disk (demand-paged, or eagerly on a kernel that set
+/// [`set_eager_path_loads`]), for [`Process::install_loaded`].
+#[cfg(feature = "elf-loader")]
+pub fn load_exec_path<S: AsRef<[u8]>>(path: &str, file_size: usize, args: &[S], env: &[S]) -> Result<LoadedExec, String> {
+    load_exec(&ImageSource::Path { path, file_size }, args, env)
 }
 
 /// Register the loader's demand-paged segments as lazy regions.
@@ -218,21 +242,33 @@ impl Process {
     /// until these two were merged, so whichever half of exec a binary's size
     /// selected was invisible to lifecycle tracing. They now cover both sources.
     fn replace_image_from(&self, source: ImageSource<'_>, args: &[String], env: &[String]) -> Result<(), String> {
-        crate::process::lifecycle_trace("[FORK-DBG] replace_image: loading ELF\n");
-        let interp_prefix: Option<&str> = None;
-        let loaded = source.load(args, env, interp_prefix)
-            .map_err(|e| format!("Failed to load ELF: {}", e))?;
-        crate::process::lifecycle_trace("[FORK-DBG] replace_image: ELF loaded, deactivating old AS\n");
+        let loaded = load_exec(&source, args, env)?;
+        self.kill_exec_siblings();
+        self.install_loaded(loaded, args)
+    }
 
+    #[cfg(feature = "elf-loader")]
+    /// POSIX: `execve` destroys every other thread of the caller's group. Called
+    /// once the new image has loaded (the point of no return) and before the
+    /// destructive swap; see [`kill_exec_siblings`].
+    pub fn kill_exec_siblings(&self) {
         kill_exec_siblings(self.pid, self.tgid);
+    }
 
-        // Serialize the DESTRUCTIVE window against preemption under shared-kernel SMP —
-        // from the AS deactivate/swap and `mmap_regions.clear()` onward the process is
-        // half-built and must not be observable mid-flight (runbook hypothesis 1, the
-        // SMP=4 heterogeneous SIGSEGVs). Acquired AFTER the ELF load above: the load
-        // allocates/copies for milliseconds and, for an `ImageSource::Path`, does block
-        // I/O — holding the preemption-disable guard across such waits wedges the box
-        // (see `process/lifecycle.rs` and the spawn.rs load-phase note).
+    #[cfg(feature = "elf-loader")]
+    /// Install a program [`load_exec_bytes`]/[`load_exec_path`] loaded.
+    ///
+    /// `args` is the `/proc/<pid>/cmdline` the install records; a caller that
+    /// sets it itself afterwards (`akuma-syscalls-glue`'s `execve::commit`)
+    /// passes `&[]`.
+    ///
+    /// The install serializes the destructive window against preemption
+    /// (`LifecycleGuard`), which is why the load is a separate step: it
+    /// allocates for milliseconds and, from a path, does block I/O, and holding
+    /// the guard across such waits wedges the box (`process/lifecycle.rs`).
+    pub fn install_loaded(&self, loaded: LoadedExec, args: &[String]) -> Result<(), String> {
+        let loaded = loaded.0;
+        crate::process::lifecycle_trace("[FORK-DBG] replace_image: ELF loaded, deactivating old AS\n");
         self.install_image(ImageInstall {
             address_space: loaded.address_space,
             entry_point: loaded.entry_point,

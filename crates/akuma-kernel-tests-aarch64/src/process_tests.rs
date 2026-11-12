@@ -10794,9 +10794,11 @@ fn test_failed_exec_preserves_cloexec_fds() {
 
     // Attempt the doomed execve. `do_execve` returns an errno on failure (it
     // only enters user mode on success), so it is safe to call here.
-    let argv = alloc::vec![alloc::string::String::from(TMP_PATH)];
-    let env: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    let ret = crate::syscall::proc::do_execve(alloc::string::String::from(TMP_PATH), argv, env);
+    let ret = crate::syscall::proc::do_execve(crate::syscall::execve::Request {
+        path: alloc::string::String::from(TMP_PATH),
+        argv: alloc::vec![TMP_PATH.as_bytes().to_vec()],
+        envp: alloc::vec::Vec::new(),
+    });
 
     // The exec must have FAILED (a successful one never returns) and the
     // close-on-exec fd must survive intact.

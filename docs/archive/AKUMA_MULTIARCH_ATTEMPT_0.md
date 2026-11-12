@@ -2414,6 +2414,70 @@ lines. Not run: an amd64 self-host.
 Open: AArch64 has no `MAX_ARG_STRLEN` cap on an envp string (`envmax`'s `envstr`; argv strings are
 capped), unchanged by this step.
 
+### One execve (2026-11-12)
+
+The second piece of converging `execve`, after the stack builder: both kernels' `execve` is now
+`akuma_syscalls_glue::execve::run` over a per-kernel `ExecArch`. amd64's `do_execve` (~380 lines)
+and glue's AArch64 `do_execve`/`exec_shebang` are gone.
+
+`run` owns everything the two copies agreed on: execute permission on the symlink-resolved path,
+the `ETXTBSY` pin, the `#!` hop (one parser, `akuma_exec::process::{parse_shebang, shebang_hop}`),
+the `MAP_SHARED` write-back, `set_text`, glue's `execve::commit` (`/proc` exe/comm/cmdline, the
+close-on-exec sweep, caught handlers to `SIG_DFL`) and the `vfork` wake. `ExecArch` is what
+differs:
+
+| hook | AArch64 (`NativeExec`, glue `proc.rs`) | amd64 (`Amd64Exec`, `usermode.rs`) |
+|---|---|---|
+| `read` | whole file in a BKL-dropped window; `FsError::Internal` → load from the path | the head only, `bkl_free_io` |
+| `load` | `akuma_exec::process::load_exec_{bytes,path}` | `Image::from_elf_path_argv_envp` (eager) |
+| `stop_siblings` | `Process::kill_exec_siblings` | `thread::drain` (main thread only) |
+| `with_target` | `with_own_process_exclusive` | `current_thread_tgid_process` |
+| `install` | `Process::install_loaded` | `install_image` + `register_lazy_stack` |
+| `enter` | `enter_user_mode_checked`, never returns | arm `exec_pending`, return 0 |
+
+To give AArch64 a load step separate from the install, `akuma-exec`'s `replace_image_from` is now
+`load_exec` + `kill_exec_siblings` + `install_loaded`, each public; `replace_image[_from_path]`
+stay as wrappers (the boot tests call them). `akuma-elf`'s three `load_elf_with_stack*` take any
+`S: AsRef<[u8]>`, so the argv/envp `read_request` produces as bytes go to the stack builder
+without a `String` copy.
+
+Behaviour changes, each deliberate:
+
+1. **AArch64 reads argv/envp through `execve::read_request`.** envp strings are now capped at
+   `MAX_ARG_STRLEN` like argv (the open item from the stack-builder step): `envmax` reports
+   `envstr 130048 ok, 131072 -> E2BIG` on both kernels. A NULL or empty argv becomes `[path]`. An
+   unreadable argv/envp pointer is `EFAULT` where AArch64 used to end the list there. Counts are
+   unbounded in practice (2^20) and the byte budget is the user stack; the stack builder's
+   `E2BIG` is still the real limit (`envcount 41472`, `envbytes 1024000` on AArch64 at 2 GiB,
+   amd64 unchanged at 256 / 256000).
+2. **AArch64 kills sibling threads and writes back shared mappings after the load succeeds**, in
+   that order. It wrote the mappings back *before* the load, so a failed `execve` lost its
+   `MAP_SHARED` writable mappings and kept running.
+3. **`comm` is the basename on AArch64** (`commit`), as on amd64 and Linux; it was the full path.
+   `/proc/<pid>/stat` already took the basename.
+4. **A script's argv names it by the cwd-resolved path, not the symlink-resolved one** on
+   AArch64: `/tmp/s2link` runs with `$0=/tmp/s2link`, as on Linux and amd64.
+5. **The close-on-exec sweep releases `flock`s and `/dev/dsp`** on AArch64
+   (`close_cloexec_fds_releasing`); its hand-written loop skipped both.
+
+Gates: clippy (AArch64; amd64 `headless`, `headless,no-tests`; the amd64 tests crate;
+Taoxichuan); host tests (`akuma-elf`, `akuma-exec`, `akuma-syscalls-glue`); boot suites
+unchanged, amd64 TCG `headless` 823/833/833 and AArch64 HVF 312/320/318 at SMP 1/2/4 (the
+AArch64 run must use `MEMORY=2048M`: at the runner's 256M default
+`far_kernel_identity_range_policy` does not print, because `kernel_va_end` scales with RAM).
+Probes on both kernels: `auxvprobe` all seven at both env parities, `envmax` as above, `execenv`,
+`exeprobe`, and `#!` through a direct, a symlinked and a relative path. AArch64 devbox self-host
+`-j4` (89 crates rebuilt) EXIT=0 in 1m17s with no tripwire lines. Not run: an amd64 self-host.
+
+**Found on the way, pre-existing:** `altstackexec`'s "exec'd image trap" and "pthread after
+churn" rungs fail on AArch64 (pass on amd64). Both raise `SIGTRAP` at an `SA_ONSTACK` handler
+with no altstack set, and `akuma-exceptions` re-pends such a signal on purpose (a workaround for
+Go's `SIGURG` before `mstart`'s `sigaltstack`); Linux delivers it on the thread stack. The
+pthread rung involves no `execve`.
+
+Next: `spawn` (`sys_spawn`/`register_exec_process`/`spawn_process_task` on amd64, ~750 lines)
+onto the same `ExecArch` loads.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral

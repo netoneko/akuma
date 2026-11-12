@@ -97,14 +97,31 @@ bearing for `wait4`/CHILD_CHANNELS keying, so the change needs its own pass.
 
 ## execve
 
-`do_execve` → `Process::replace_image[_from_path]`
-(`crates/akuma-exec/src/process/image.rs`): **true in-place image replacement**
-(preserves PID + open fds; strips O_CLOEXEC fds). Not spawn-as-exec. Calls
-`vfork_complete(child_pid)` to wake a blocked parent.
+**One `execve` for both Akuma kernels**: `akuma_syscalls_glue::execve::run`
+over a per-kernel `ExecArch`. **True in-place image replacement** (preserves
+PID + open fds; strips O_CLOEXEC fds); not spawn-as-exec.
 
-Loader pick (see [`../../abi/linux-compat.md`](../../abi/linux-compat.md)
-"ELF loading"): `read_file()` first; on `FsError` (binary > 16 MB), fall back
-to `load_elf_from_path` (page-at-a-time via `vfs::read_at()`).
+- `read_request` (shared with Taoxichuan): path against `cwd`, argv/envp under
+  an `akuma_syscalls_proc::exec::Budget` — `MAX_ARG_STRLEN` per string, argv
+  *and* envp; NULL/empty argv becomes `[path]`.
+- `run` (shared): execute permission on the symlink-resolved path, the
+  `ETXTBSY` pin, the `#!` hop, `ExecArch::{read, load}`, then — past the point
+  of no return — `stop_siblings`, the `MAP_SHARED` write-back, and inside
+  `with_target`: `install`, `set_text`, `execve::commit` (`/proc` exe/comm/
+  cmdline, close-on-exec sweep, caught handlers to `SIG_DFL`),
+  `vfork_complete`, `enter`. Everything before `stop_siblings` returns an errno
+  with the caller's image untouched.
+- `ExecArch` is what differs. AArch64 (`NativeExec`, glue `proc.rs`): reads a
+  small binary whole (BKL-dropped window) and loads it from memory, loads a
+  large one from its path (`FsError::Internal` → `load_exec_path`,
+  demand-paged), kills siblings with `Process::kill_exec_siblings`, installs on
+  the caller's own process under `with_own_process_exclusive`, and `enter`
+  `eret`s. amd64 (`Amd64Exec`, `amd64/src/usermode.rs`): reads the head,
+  maps every segment as it loads, `thread::drain`s siblings, installs on the
+  thread-group leader, and `enter` arms `exec_pending` and returns 0.
+- **`enter` may not return (AArch64)**, so nothing in `run`'s frames owns heap
+  when it is called: the shebang hop and the install closure drop every buffer
+  first ([`../thread-lifecycle.md`](../thread-lifecycle.md) §4 rule 1).
 
 **Argument size on Taoxichuan.** The initial stack's argv/envp/auxv block is
 sized by what it holds (`akuma_ring3_amd64::stack_block_len`); there is no fixed
@@ -117,8 +134,8 @@ table is how a 570-argument `rustc` line failed
 ### `#!` scripts
 
 Both `execve` **and** `spawn` resolve them, through one shared parser
-(`akuma_exec::process::{parse_shebang, shebang_hop}`): `exec_shebang`
-(`src/syscall/proc.rs`) for the exec path, `resolve_shebang_chain`
+(`akuma_exec::process::{parse_shebang, shebang_hop}`): `execve::run`
+(`crates/akuma-syscalls-glue/src/execve.rs`) for the exec path, `resolve_shebang_chain`
 (`crates/akuma-exec/src/process/spawn.rs`) for the SPAWN abi, and
 Taoxichuan's `exec_real_task` (`crates/akuma-tokio-kernel-amd64/src/child.rs`),
 which had no `#!` support until 2026-11-03
@@ -132,7 +149,7 @@ Two rules that are easy to get wrong and were both wrong here until 2026-08-16:
 
 - **`argv[0]` is the interpreter as *written* in the `#!` line, never its
   symlink-resolved target.** The resolved path is for loading the image only.
-  `exec_shebang` used to shadow one with the other, which is fatal rather than
+  The exec path used to shadow one with the other, which is fatal rather than
   cosmetic on a busybox system: busybox dispatches entirely on `argv[0]`, so
   `#!/bin/sh` ran `/bin/busybox` with `argv[0]="/bin/busybox"` and busybox never
   knew it was meant to be a shell.

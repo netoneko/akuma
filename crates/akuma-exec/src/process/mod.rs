@@ -40,6 +40,8 @@ pub use lifecycle::LifecycleGuard;
 // `execve`'s load/install seam — see `image::ImageInstall`. Re-exported beside
 // the other process types because both kernels' syscall layers build one.
 pub use image::ImageInstall;
+#[cfg(feature = "elf-loader")]
+pub use image::{load_exec_bytes, load_exec_path, LoadedExec};
 pub use fresh::FreshProcess;
 pub use address_space::{AddressSpaceGuard, AssistedSpinlock, ProcAddressSpace};
 pub use bkl_guard::{process_bkl_drop_enabled, set_process_bkl_drop_enabled, ProcessBklGuard};

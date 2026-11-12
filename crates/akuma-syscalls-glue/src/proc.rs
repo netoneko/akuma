@@ -873,314 +873,166 @@ pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
 
 #[cfg(feature = "exec")]
 pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
-    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let path = match copy_from_user_str(path_ptr, 1024) {
-        Ok(p) => p,
-        Err(e) => {
-            akuma_primitives::safe_print!(64, "[syscall] execve: path copy failed with {} pid={}\n", e as i64, pid);
-            return e;
-        },
+    // Linux bounds the bytes (`ARG_MAX`) and each string (`MAX_ARG_STRLEN`),
+    // never the count: the counts here are only a sanity bound, and the real
+    // byte limit is the stack builder's refusal (`E2BIG`) once the strings
+    // and their pointer arrays do not fit the eager stack.
+    let stack = akuma_exec::runtime::config().user_stack_size;
+    let mut budget = akuma_syscalls_proc::exec::Budget::new(usize::MAX, akuma_config::MAX_ARG_STRLEN, stack);
+    let req = match super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut budget) {
+        Ok(r) => r,
+        Err(e) => return e,
     };
+    // Gated 2026-08-30: once per `execve` at up to 2048 bytes, a `cargo build`
+    // prints a full rustc/ld command line per compilation unit. Turn
+    // `syscall-debug-info` on to get it back (`scripts/bkl_smp_regimen/
+    // analyze_workload.py` needs it); 2048 so a linker's `-o <output>` survives
+    // (`docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §4.5).
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-        akuma_primitives::tprint!(128, "[syscall] execve(path=\"{}\", argv_ptr=0x{:x}, envp_ptr=0x{:x}) PID {}\n", path, argv_ptr, envp_ptr, pid);
+        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        akuma_primitives::tprint!(2048, "[syscall] execve(path=\"{}\", args={}) PID {}\n", req.path, ArgvDisplay(&req.argv), pid);
     }
+    do_execve(req)
+}
 
-    let resolved_path = if path.starts_with('/') {
-        path
-    } else if let Some(proc) = akuma_exec::process::current_process_shared() {
-        akuma_vfs_glue::resolve_path(&proc.cwd, &path)
-    } else {
-        path
-    };
-    let resolved_path = akuma_vfs_glue::resolve_symlinks(&resolved_path);
+/// The most argv (and, separately, envp) entries `execve` reads; see
+/// [`sys_execve`].
+#[cfg(feature = "exec")]
+const EXEC_MAX_STRINGS: usize = 1 << 20;
 
-    let mut args = Vec::new();
-    if argv_ptr != 0 {
-        let mut i = 0;
-        loop {
-            let mut str_ptr: u64 = 0;
-            if read_user_into(&mut str_ptr, argv_ptr + i * 8).is_err() {
-                break;
+/// An argv as the debug line prints it, `["a", "b"]`, without building it on the heap.
+#[cfg(feature = "exec")]
+struct ArgvDisplay<'a>(&'a [Vec<u8>]);
+
+#[cfg(feature = "exec")]
+impl core::fmt::Display for ArgvDisplay<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("[")?;
+        for (i, a) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
             }
-            if str_ptr == 0 { break; }
-            // Fail the whole execve (E2BIG, Linux semantics) if an argument can't
-            // be copied — most often because it exceeds MAX_ARG_STRLEN. Previously
-            // this `break`d, which silently dropped the over-long arg AND every arg
-            // after it, then exec'd a corrupt argv (e.g. rustc saw `--check-cfg`
-            // with its giant value truncated away → "Argument to option missing").
-            if let Ok(s) = copy_from_user_str(str_ptr, akuma_config::MAX_ARG_STRLEN) { args.push(s) } else {
-                akuma_primitives::safe_print!(96, "[syscall] execve: argv[{}] too long or unreadable (cap={}) — E2BIG\n",
-                    i, akuma_config::MAX_ARG_STRLEN);
-                return E2BIG;
-            }
-            i += 1;
+            write!(f, "{:?}", core::str::from_utf8(a).unwrap_or("<non-utf8>"))?;
         }
+        f.write_str("]")
     }
+}
 
-    let env = parse_argv_array(envp_ptr);
+/// `execve` once its arguments are in the kernel: the shared
+/// [`super::execve::run`] over this kernel's [`NativeExec`].
+#[cfg(feature = "exec")]
+pub fn do_execve(req: super::execve::Request) -> u64 {
+    super::execve::run(&NativeExec, req)
+}
 
-    // Gated 2026-08-30, same reasoning as the `[PROC-EXIT]` line above: it was
-    // unconditional for the reason below, and that reason has aged out. The line
-    // fires once per `execve` at up to 2048 bytes — a `cargo build` in the guest
-    // prints a full rustc/ld command line per compilation unit, which is what
-    // makes the serial log unreadable during an in-VM build. Turn
-    // `syscall-debug-info` on to get it back (that also re-enables the
-    // pre-resolution `argv_ptr`/`envp_ptr` line above, and is what
-    // `scripts/bkl_smp_regimen/analyze_workload.py` now needs).
-    //
-    // Was: unconditional. 192 bytes truncated a linker's full argv (output path
-    // included) well before the interesting part — see
-    // docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §4.5,
-    // "no `ld` line names the crate proves nothing". Widened so the `-o <output>`
-    // argument survives for `cc`/`collect2`/`ld` invocations.
-    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-        akuma_primitives::tprint!(2048, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
-    }
+/// The AArch64 kernel's half of `execve`.
+///
+/// A file the heap can take is read whole and loaded from memory; one it
+/// cannot (`FsError::Internal` from the read) is loaded from its path, its
+/// segments demand-paged. The new image starts with an `eret` from inside the
+/// syscall, so [`ExecArch::enter`](super::execve::ExecArch::enter) never returns.
+#[cfg(feature = "exec")]
+struct NativeExec;
 
-    do_execve(resolved_path, args, env)
+#[cfg(feature = "exec")]
+enum NativeImage {
+    /// The whole file.
+    Bytes(Vec<u8>),
+    /// Too big to read whole: loaded from the path. No head, so no `#!` check.
+    Path { size: usize },
 }
 
 #[cfg(feature = "exec")]
-pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
-    // Execute permission (`EACCES`). Root passes on any file with some x bit;
-    // see `akuma_isolation::dac::may`. Set-user-ID bits are never honoured:
-    // credentials pass through `execve` unchanged.
-    if let Err(e) = super::perm::check(&resolved_path, akuma_isolation::dac::MAY_EXEC) {
-        return e;
-    }
-    // Mark the file as being executed BEFORE its bytes are read, so it cannot be rewritten between the read and the mark (`ETXTBSY`,
-    // `docs/archive/ETXTBSY_TEXT_BUSY.md`). It must reach `Process::set_text` or be dropped before the `eret` below: this frame is
-    // abandoned on success, and a pin left in it would keep the file busy forever.
-    let Ok(text) = akuma_vfs_glue::text_pin(&resolved_path) else {
-        return ENOMEM;
-    };
-    // Read the whole file (shebang detection + the in-memory ELF load). An
-    // `Internal` read error leaves `file_data` empty and the path-based loader
-    // does the ELF load instead.
-    let mut file_data = {
-        // M5c hold-shortening: DROP the BKL around the whole-file ELF read so peer cores can
-        // enter the kernel while this core waits on disk (execve's dominant BKL-held window).
-        // Safe: this runs before `replace_image` touches the process, and the read goes only
-        // through the VFS/ext2/block locks (all BKL-independent) — the same profile as the
-        // proven file-fault drop. The dropped-window ledger keeps the window BKL-free across
-        // timer ticks (a bare leave/enter pair let the first tick re-hold the BKL for the
-        // rest of the read); the syscall wrapper's leave_kernel still balances it.
+impl super::execve::ExecArch for NativeExec {
+    type Image = NativeImage;
+    type Loaded = akuma_exec::process::LoadedExec;
+
+    fn read(&self, path: &str) -> Result<NativeImage, u64> {
+        // M5c hold-shortening: the BKL is DROPPED around the whole-file read so
+        // peer cores can enter the kernel while this core waits on disk
+        // (execve's dominant BKL-held window). Safe: nothing has touched the
+        // process yet, and the read goes only through the VFS/ext2/block locks.
+        // The dropped-window ledger keeps the window BKL-free across timer
+        // ticks; the syscall wrapper's leave_kernel still balances it.
         #[cfg(kernel_bkl_smp)]
-        let exec_dropped_bkl = akuma_bkl::policy::exec_bkl_drop_enabled();
+        let dropped = akuma_bkl::policy::exec_bkl_drop_enabled();
         #[cfg(kernel_bkl_smp)]
-        if exec_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
-        let read_result = akuma_vfs_glue::fs::read_file(&resolved_path);
+        if dropped { akuma_exec::bkl::dropped_window_open(); }
+        let read = akuma_vfs_glue::fs::read_file(path);
         #[cfg(kernel_bkl_smp)]
-        if exec_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
-        match read_result {
-            Ok(data) => Some(data),
-            Err(akuma_vfs_glue::FsError::Internal) => None,
-            Err(e) => {
-                // Gated 2026-08-30: this is the PATH search, not an error. A shell
-                // or cargo resolving `cc`/`rustc` probes every PATH entry in turn,
-                // so a miss per entry is the NORMAL case and the flood scales with
-                // PATH length x exec count. A genuinely unreadable binary still
-                // surfaces as the execve's errno to the caller.
-                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                    akuma_primitives::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+        if dropped { akuma_exec::bkl::dropped_window_close(); }
+        match read {
+            Ok(data) => Ok(NativeImage::Bytes(data)),
+            Err(akuma_vfs_glue::FsError::Internal) => match akuma_vfs_glue::file_size(path) {
+                Ok(size) => Ok(NativeImage::Path { size: size as usize }),
+                Err(e) => {
+                    akuma_primitives::safe_print!(128, "[syscall] execve: failed to stat {}\n", path);
+                    Err(super::fs::fs_error_to_errno(e))
                 }
-                return super::fs::fs_error_to_errno(e);
-            }
+            },
+            // A PATH search misses once per entry, so a miss is the normal case
+            // and is not printed.
+            Err(e) => Err(super::fs::fs_error_to_errno(e)),
         }
-    };
-
-    if file_data.as_ref().is_some_and(|d| d.len() >= 2 && d[0] == b'#' && d[1] == b'!') {
-        // Owned handoff: exec_shebang frees the script bytes (and the original
-        // argv) BEFORE recursing into do_execve — the inner exec's eret abandons
-        // every frame below it, so nothing big may still be owned here.
-        let data = file_data.take().unwrap_or_default();
-        // The script is data; its interpreter is what runs, and the recursion marks that.
-        drop(text);
-        return exec_shebang(resolved_path, data, args, env);
     }
 
-    // Resolve the on-demand load's file size before entering the exclusive
-    // window so the stat-failure early return stays outside it.
-    let file_size = if file_data.is_none() {
-        match akuma_vfs_glue::file_size(&resolved_path) {
-            Ok(sz) => sz as usize,
-            Err(e) => {
-                akuma_primitives::safe_print!(128, "[syscall] execve: failed to stat {}\n", resolved_path);
-                return super::fs::fs_error_to_errno(e);
-            }
+    fn head<'a>(&self, image: &'a NativeImage) -> &'a [u8] {
+        match image {
+            NativeImage::Bytes(d) => d,
+            NativeImage::Path { .. } => &[],
         }
-    } else {
-        0
-    };
-
-    // The destructive window. `with_own_process_exclusive` resolves the pid from
-    // this thread itself and checks the BKL, so the two mechanical clauses of
-    // `with_process_exclusive`'s contract are discharged in the crate that owns
-    // `Process` rather than asserted here; the no-nesting clause is why this stays
-    // the one enumerated call site (Phase 7f owns converting the window itself).
-    // The old image's writable `MAP_SHARED` file mappings die with it: written
-    // back and released from the shared table now, while its address space is
-    // still the current one — `replace_image`'s teardown would do neither.
-    if let Some(p) = super::mem::current_owner() {
-        super::mem::release_shared_write_mappings(p);
     }
-    let ret = {
-        akuma_exec::process::with_own_process_exclusive(move |proc| {
-    let replace_result = if let Some(data) = file_data.take() {
-        let r = proc.replace_image(&data, &args, &env);
-        // Free the whole-file image buffer HERE, success or failure. The
-        // enter_user_mode below erets to EL0 and never returns, so any heap
-        // still owned by this frame at that point is leaked kernel heap —
-        // this exact leak (~1.1 MB per `busybox sh` execve) ratcheted the
-        // heap into the [OOM] wall under exec-heavy load (the rustc hammer).
-        drop(data);
-        r
-    } else {
-        proc.replace_image_from_path(&resolved_path, file_size, &args, &env)
-    };
 
-    if let Err(e) = replace_result {
-        akuma_primitives::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
-        // `replace_image` returns a stringly-typed error from the ELF loader;
-        // a "Failed to load ELF: ..." message means the binary is malformed
-        // (missing PT_LOAD, bad magic, etc.) — Linux returns ENOEXEC for that.
-        //
-        // NOTE: close-on-exec fds are *not* closed until after this point.  On
-        // Linux, `execve` only closes O_CLOEXEC descriptors once it has
-        // committed to replacing the image (the point of no return).  If we
-        // closed them earlier and then failed here, the process would resume at
-        // the failed `execve` with a corrupted fd table.  For a libstd
-        // fork+exec child that means its O_CLOEXEC error-report pipe would
-        // already be gone, so it could neither report the exec failure to the
-        // parent nor leave the parent's handshake pipe in a coherent state.
-        return if e.contains("do not fit") {
-            E2BIG
-        } else if e.contains("Failed to load ELF") {
-            ENOEXEC
-        } else {
-            ENOMEM
+    fn load(&self, image: NativeImage, path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Self::Loaded, u64> {
+        let r = match image {
+            // The whole-file buffer is freed as this arm ends, success or not:
+            // a heap buffer still owned when `enter` `eret`s is leaked (~1.1 MB
+            // per `busybox sh` exec once ratcheted the heap into the OOM wall).
+            NativeImage::Bytes(data) => akuma_exec::process::load_exec_bytes(&data, argv, envp),
+            NativeImage::Path { size } => akuma_exec::process::load_exec_path(path, size, argv, envp),
         };
-    }
-    // `/proc/<pid>/exe` follows the new image (`ProcessImage::exe`). This
-    // kernel never refreshed it, so an exec'd process kept reporting whatever
-    // it was spawned as. `name` (the `comm`) is left as it was.
-    {
-        proc.image.lock().exe.clone_from(&resolved_path);
-    }
-    // The new image's executable is busy for as long as it runs (the old image's mark is released).
-    proc.set_text(text);
-
-    // Image replacement committed — *now* close the close-on-exec descriptors.
-    // This is the POSIX "point of no return": a successful execve closes every
-    // O_CLOEXEC fd, while a failed one (handled above) leaves them untouched.
-    let closed_fds = proc.close_cloexec_fds();
-    for (_fd, entry) in closed_fds {
-        match entry {
-            akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => super::pipe::pipe_close_write(pipe_id),
-            akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => super::pipe::pipe_close_read(pipe_id),
-            akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
-                super::pipe::pipe_close_read(rx);
-                super::pipe::pipe_close_write(tx);
-                super::unixsock::unix_sock_close(sock);
+        r.map_err(|e| {
+            akuma_primitives::safe_print!(128, "[syscall] execve: load failed for {}: {}\n", path, e);
+            // A "Failed to load ELF: ..." string means the binary is malformed
+            // (no PT_LOAD, bad magic) — Linux's `ENOEXEC`. "do not fit" is the
+            // stack builder refusing argv/envp.
+            if e.contains("do not fit") {
+                E2BIG
+            } else if e.contains("Failed to load ELF") {
+                ENOEXEC
+            } else {
+                ENOMEM
             }
-            akuma_exec::process::FileDescriptor::Socket(idx) => akuma_net::socket::remove_socket(idx),
-            akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
-                akuma_exec::process::remove_child_channel(child_pid);
-            }
-            #[cfg(feature = "sc-eventfd")]
-            akuma_exec::process::FileDescriptor::EventFd(efd_id) => super::eventfd::eventfd_close(efd_id),
-            #[cfg(feature = "sc-epoll")]
-            akuma_exec::process::FileDescriptor::EpollFd(epoll_id) => super::poll::epoll_destroy(epoll_id),
-            #[cfg(feature = "sc-pidfd")]
-            akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => super::pidfd::pidfd_close(pidfd_id),
-            akuma_exec::process::FileDescriptor::PtyMaster(n) => super::pty::pty_close(n, true),
-            akuma_exec::process::FileDescriptor::PtySlave(n) => super::pty::pty_close(n, false),
-            _ => {}
-        }
-    }
-
-    proc.image.lock().name.clone_from(&resolved_path);
-
-    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-        akuma_primitives::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
-    }
-
-    // This frame is abandoned by the eret below (enter_user_mode never
-    // returns), so destructors will not run: explicitly free every heap
-    // local the closure still owns. args/env were last used by
-    // replace_image*; resolved_path by the name/debug lines above.
-    drop(args);
-    drop(env);
-    drop(resolved_path);
-
-    // Wake any CLONE_VFORK parent that was blocked waiting for this exec.
-    // Must happen before enter_user_mode (which never returns).
-    let pid = proc.pid;
-    vfork_complete(pid);
-
-    proc.address_space.activate();
-
-    // Never returns. The `_checked` form refuses a context whose SPSR does not
-    // target EL0, which is what let the raw one be `unsafe`.
-    let ctx = proc.image.lock().context;
-    akuma_exec::process::enter_user_mode_checked(&ctx);
         })
-    };
-    // `None` means the process vanished between `current_pid` and the lookup;
-    // a successful exec never gets here (enter_user_mode does not return).
-    ret.unwrap_or(ESRCH)
-}
+    }
 
-#[cfg(feature = "exec")]
-fn exec_shebang(script_path: String, file_data: Vec<u8>, original_args: Vec<String>, env: Vec<String>) -> u64 {
-    // Parse everything we need out of `file_data` into OWNED strings first:
-    // this function recurses into do_execve, whose successful exec erets and
-    // abandons every frame below it — so the script bytes and the original
-    // argv must be freed BEFORE the recursion, not after it "returns".
-    // Shared with `spawn`'s shebang path so the two cannot drift: one parser, one
-    // argv-construction rule, both host-tested in akuma-exec's `shebang_tests`.
-    let head = &file_data[..file_data.len().min(akuma_exec::process::SHEBANG_MAX)];
-    let Some((interpreter, shebang_arg)) = akuma_exec::process::parse_shebang(head) else {
-        akuma_primitives::safe_print!(128, "[syscall] execve: invalid shebang in {}\n", script_path);
-        return ENOENT;
-    };
-
-    // TWO different strings, and collapsing them is a real bug. `interp_argv0` is
-    // the interpreter AS WRITTEN in the `#!` line and is what Linux puts in
-    // argv[0]; `interp_path` is the symlink-resolved file to actually load. This
-    // used to shadow one with the other, so an interpreter reached through a
-    // symlink lost its identity — and busybox is a multi-call binary that
-    // dispatches ENTIRELY on argv[0], so `#!/bin/sh` ran as `/bin/busybox` with
-    // argv[0]="/bin/busybox" and busybox had no idea it was meant to be a shell.
-    // See docs/archive/DEVBOX_ISSUES.md Issue 14.
-    let interp_argv0 = String::from(interpreter);
-    let interp_arg = shebang_arg.map(String::from);
-    drop(file_data); // last borrow (interpreter/shebang_arg) ended above
-
-    let interp_path = akuma_vfs_glue::resolve_symlinks(&interp_argv0);
-
-    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-        if let Some(ref arg) = interp_arg {
-            akuma_primitives::safe_print!(128, "[syscall] execve: shebang {} {} {}\n", interp_argv0, arg, script_path);
-        } else {
-            akuma_primitives::safe_print!(128, "[syscall] execve: shebang {} {}\n", interp_argv0, script_path);
+    fn stop_siblings(&self) {
+        if let Some(p) = akuma_exec::process::current_process_shared() {
+            p.kill_exec_siblings();
         }
     }
 
-    let mut new_args =
-        akuma_exec::process::shebang_hop(&interp_argv0, interp_arg.as_deref(), &script_path, &[]);
-    if original_args.len() > 1 {
-        new_args.extend_from_slice(&original_args[1..]);
+    fn with_target(&self, f: impl FnOnce(&akuma_exec::process::Process) -> u64) -> u64 {
+        // Resolves the pid from this thread and checks the BKL, discharging
+        // `with_process_exclusive`'s two mechanical clauses in the crate that
+        // owns `Process`. `None`: the process vanished.
+        akuma_exec::process::with_own_process_exclusive(f).unwrap_or(ESRCH)
     }
-    drop(original_args);
-    drop(script_path);
 
-    // If `interp_path` is ITSELF a script, do_execve recurses here and this
-    // function sees the resolved path as its `script_path` — one level deeper the
-    // as-written name is gone. `spawn`'s `resolve_shebang_chain` walks the whole
-    // chain in one pass and does not have that hole; matching it here means
-    // threading both names through do_execve's signature.
-    do_execve(interp_path, new_args, env)
+    fn install(&self, proc: &akuma_exec::process::Process, loaded: Self::Loaded) -> Result<(), u64> {
+        proc.install_loaded(loaded, &[]).map_err(|e| {
+            akuma_primitives::safe_print!(128, "[syscall] execve: install failed: {}\n", e);
+            ENOMEM
+        })
+    }
+
+    fn enter(&self, proc: &akuma_exec::process::Process) -> u64 {
+        proc.address_space.activate();
+        // Never returns. The `_checked` form refuses a context whose SPSR does
+        // not target EL0.
+        let ctx = proc.image.lock().context;
+        akuma_exec::process::enter_user_mode_checked(&ctx);
+    }
 }
 
 /// Fill `wait4`'s `rusage` for the child being reaped: its CPU time as `ru_utime`

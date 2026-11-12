@@ -4,7 +4,6 @@
 //! their stacks here; [`attach_stack`] takes where the stack goes and the
 //! `AT_HWCAP` word, which are the two things that differ.
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use akuma_mmap::{PAGE_SIZE, span};
@@ -235,21 +234,21 @@ fn compute_stack_top(brk: usize, has_interp: bool) -> usize {
     core::cmp::min(aligned, MAX_STACK_TOP)
 }
 
-pub fn load_elf_with_stack<A: UserPages>(
+pub fn load_elf_with_stack<A: UserPages, S: AsRef<[u8]>>(
     elf_data: &[u8],
-    args: &[String],
-    env: &[String],
+    args: &[S],
+    env: &[S],
     stack_size: usize,
     interp_prefix: Option<&str>,
 ) -> Result<LoadedWithStack<A>, ElfError> {
     attach_stack(load_elf(elf_data, interp_prefix)?, args, env, None, stack_size, auxv::AARCH64_HWCAP)
 }
 
-pub fn load_elf_with_stack_from_path<A: UserPages>(
+pub fn load_elf_with_stack_from_path<A: UserPages, S: AsRef<[u8]>>(
     path: &str,
     file_size: usize,
-    args: &[String],
-    env: &[String],
+    args: &[S],
+    env: &[S],
     stack_size: usize,
     interp_prefix: Option<&str>,
 ) -> Result<LoadedWithStack<A>, ElfError> {
@@ -269,10 +268,10 @@ pub fn load_elf_with_stack_from_path<A: UserPages>(
 /// For a kernel whose `#PF` handler does not serve `akuma-exec`'s lazy-region
 /// table (amd64 pages from `Process::regions`). Heap use stays flat — the file is
 /// never held whole — which is the other reason the path loader exists.
-pub fn load_elf_with_stack_eager_from_path<A: UserPages>(
+pub fn load_elf_with_stack_eager_from_path<A: UserPages, S: AsRef<[u8]>>(
     path: &str,
-    args: &[String],
-    env: &[String],
+    args: &[S],
+    env: &[S],
     stack_size: usize,
     interp_prefix: Option<&str>,
 ) -> Result<LoadedWithStack<A>, ElfError> {
