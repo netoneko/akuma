@@ -8,7 +8,7 @@ description = "The amd64 kernel's boot self-test suite (moved out of amd64/src s
 workspace = true
 
 # Each is a flag the suite reads with `cfg(feature = ...)`, and nothing else: the bin
-# (`amd64/bin`) forwards its own feature of the same name here, and it, not this crate,
+# (the root package `akuma`) forwards its own feature of the same name here, and it, not this crate,
 # turns the kernel's features on.
 [features]
 # The whole crate compiles to an empty `register`, and the bin does not call even that.

@@ -100,11 +100,11 @@ FC_KEEP_DISK="${FC_KEEP_DISK:-}"
 #   FC_HOST=netoneko@ryzen FC_RESTART=1 amd64/run-firecracker.sh
 FC_RESTART="${FC_RESTART:-}"
 [ -n "$FC_RESTART" ] && FC_KEEP_DISK=1
-KERNEL=target/x86_64-unknown-none/release/akuma-amd64
+KERNEL=target/x86_64-unknown-none/release/akuma
 
 SSH="ssh -o StrictHostKeyChecking=no -i $FC_KEY"
 
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release
+cargo build -p akuma --target x86_64-unknown-none --release
 
 $SSH "$FC_HOST" "mkdir -p ~/$FC_DIR"
 if [ -n "$FC_RESTART" ]; then

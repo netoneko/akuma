@@ -323,7 +323,7 @@ export LD_LIBRARY_PATH=/mnt/ak/usr/local/rust/lib:/mnt/ak/usr/lib:/mnt/ak/lib
 export PATH=/mnt/ak/usr/local/rust/bin:$PATH
 export HOME=/mnt/ak/root CARGO_HOME=/mnt/ak/root/.cargo CARGO_TARGET_DIR=/root/prime-target
 cd /mnt/ak/src/github.com/netoneko/akuma && cargo fetch --locked   # prime the cache
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release --offline -j8
+cargo build -p akuma --target x86_64-unknown-none --release --offline -j8
 ```
 
 That is the *exact* cargo, rustc and cache the box will use, at Ubuntu's speed
@@ -354,7 +354,7 @@ Staged and verified this way on 2026-09-19, all `--offline`: the kernel in
 ```
 ssh akuma "reboot -f"          # NOTE: now returns to Akuma, not Ubuntu
    ... hpbox.deploy()                       # box lands on a commit + your patch
-   ... cargo build -p akuma-amd64 --target x86_64-unknown-none --release
+   ... cargo build -p akuma --target x86_64-unknown-none --release
    ... sh amd64/mkdisk.sh
    ... cp to /boot/akuma/{akuma-amd64,root.img}; grub-reboot "Akuma/amd64"
 ssh -F /dev/null -p 22 root@192.168.1.123 "reboot"   # -> Akuma
@@ -599,7 +599,7 @@ caller reading only stdout sees an empty success.
 - **Staging the bare-metal root for a self-host build: source from git,
   `vendor/` from `cargo vendor`, toolchain from the Firecracker image.** Two
   things bite here. The toolchain on `sdb1` shipped only
-  `x86_64-unknown-linux-musl`, so `cargo build -p akuma-amd64` died at the second
+  `x86_64-unknown-linux-musl`, so `cargo build -p akuma` died at the second
   crate with `E0463: can't find crate for core` — and the rlibs must come from
   the *same* rustc build, so a laptop's nightly will not do. And **`vendor/` and
   the `replace-with = "vendored-sources"` block are not in git**: copy a tree out
@@ -621,7 +621,7 @@ caller reading only stdout sees an empty success.
   ```
 
 - **Build the kernel on the metal with `nosmp`.** A clean 95-crate
-  `cargo build -p akuma-amd64 -j1` completes in **22 m 54 s** at one core
+  `cargo build -p akuma -j1` completes in **22 m 54 s** at one core
   (`kbuild -c`). At SMP=4 it does not complete at all — see the next rule. For
   reference the same build is **3 m 43 s** in the Firecracker guest at SMP=1;
   that gap is storage, not the CPU (it is the same machine — the guest's root is
@@ -918,7 +918,7 @@ regression gate and an eliminator, not a reproducer.
 ### The PMM forensics build
 
 ```bash
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release \
+cargo build -p akuma --target x86_64-unknown-none --release \
       --features pmm-forensics
 ```
 

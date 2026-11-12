@@ -27,6 +27,7 @@ dependencies = [
  "akuma-boot",
  "akuma-config",
  "akuma-cpu",
+ "akuma-drivers-amd64",
  "akuma-entry",
  "akuma-exceptions",
  "akuma-exec",
@@ -38,9 +39,11 @@ dependencies = [
  "akuma-isolation",
  "akuma-kacho",
  "akuma-kernel",
+ "akuma-kernel-amd64",
  "akuma-kernel-core",
  "akuma-kernel-glue",
  "akuma-kernel-tests-aarch64",
+ "akuma-kernel-tests-amd64",
  "akuma-locks-rw",
  "akuma-net",
  "akuma-net-unix",
@@ -86,16 +89,6 @@ dependencies = [
  "akuma-primitives",
  "spinning_top",
  "talc",
-]
-
-[[package]]
-name = "akuma-amd64"
-version = "0.0.9"
-dependencies = [
- "akuma-drivers-amd64",
- "akuma-kernel",
- "akuma-kernel-amd64",
- "akuma-kernel-tests-amd64",
 ]
 
 [[package]]

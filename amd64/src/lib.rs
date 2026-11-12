@@ -1,6 +1,6 @@
 //! The amd64 kernel: everything but its two entry symbols.
 //!
-//! The bin (`amd64/bin`, package `akuma-amd64`) is `akuma_kernel::entry!()`, which
+//! The bin (the root package `akuma`, `src/amd64.rs`) is `akuma_kernel::entry!()`, which
 //! defines `kmain` (PVH) and `kmain_mb2` (multiboot2), the symbols `akuma-boot-amd64`'s
 //! `boot.s` jumps to, and calls [`kmain`] / [`kmain_mb2`] here. The rest of the kernel (the
 //! allocator, the panic handler, every subsystem) is this library, which `akuma-kernel`
@@ -44,7 +44,7 @@ extern crate alloc;
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!(
     "akuma-kernel-amd64 is an x86_64 target: build the kernel with \
-     `cargo build -p akuma-amd64 --target x86_64-unknown-none` (or amd64/run.sh)"
+     `cargo build -p akuma --target x86_64-unknown-none` (or amd64/run.sh)"
 );
 
 #[cfg(target_arch = "x86_64")]

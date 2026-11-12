@@ -13,7 +13,7 @@
 set -eu
 LOG=${1:?usage: udp_stall_repro.sh LOG [SECONDS]}
 MAX=${2:-120}
-KERNEL=${KERNEL:-target/x86_64-unknown-none/release/akuma-amd64}
+KERNEL=${KERNEL:-target/x86_64-unknown-none/release/akuma}
 BUSYBOX=${BUSYBOX:-target/x86_64-unknown-none/release/busybox-x86_64}
 HERE=$(dirname "$0")
 W=$(mktemp -d)

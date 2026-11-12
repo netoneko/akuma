@@ -584,9 +584,16 @@ removed 2026-11-11 (`docs/archive/AKUMA_FEATURE_AUDIT.md`).
 ### amd64 builds: default to `headless`
 
 ```bash
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release \
+cargo build -p akuma --target x86_64-unknown-none --release \
     --no-default-features --features headless      # build/check, Firecracker/TCG smoke boots
 ```
+
+**One kernel package for both architectures** (2026-11-12): the root `akuma` is the AArch64
+kernel by default and the amd64 one with `--target x86_64-unknown-none` (artifact
+`target/x86_64-unknown-none/release/akuma`). Its dependencies are per-target tables and its
+`[features]` table serves both; `src/main.rs` is the root, `src/{aarch64,amd64}.rs` each half's
+bin items. The old `amd64/bin` package `akuma-amd64` is gone; installed kernels on the boxes
+keep their file names (`/boot/akuma-amd64`, the ESP's `EFI/akuma/akuma-amd64`).
 
 **Build `headless` unless the kernel actually has to run on ryzen or trashcan as
 the host.** The plain `--release` default pulls in `akuma-fbcon` (`fbcon` is in

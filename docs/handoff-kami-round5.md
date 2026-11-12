@@ -59,7 +59,7 @@ itself on a pty) or `probes-once.sh` (`wakelat` + `timerlat`). Artifacts land in
 container restarts by itself). Firecracker is `/home/netoneko/bin/firecracker`,
 not on root's PATH. A wifi-like link: `tc qdisc add dev tap0 root netem rate
 600kbit delay 30ms loss 3%` (and `del` after). Push a kernel built on the Mac
-with `cargo build -p akuma-amd64 --target x86_64-unknown-none --release` by
+with `cargo build -p akuma --target x86_64-unknown-none --release` by
 `scp` to `/root/cdp-probe/`. Linux control for anything in-guest:
 `docker run --rm -v ...:/p akuma-cdp-probe-new <cmd>` on the same box.
 

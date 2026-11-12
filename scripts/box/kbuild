@@ -6,7 +6,7 @@
 #               build proves much less)
 #     -j N      jobs, default 1; `-j 4` is the normal setting on a multi-core box (stable for weeks —
 #               the old SMP corruption/wedges are fixed, docs/archive/AMD64_J4_BUILD_CRASH_HUNT.md)
-#     -p PKG    package, default akuma-amd64
+#     -p PKG    package, default akuma
 #     --online  drop --offline (needed only after adding a dependency)
 #
 # Output lands in $CARGO_TARGET_DIR (default /root/ktarget), which is where
@@ -17,7 +17,7 @@
 set -e
 . /etc/akuma-dev.env
 
-JOBS=1; PKG=akuma-amd64; CLEAN=0; OFFLINE=--offline
+JOBS=1; PKG=akuma; CLEAN=0; OFFLINE=--offline
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) CLEAN=1; shift ;;

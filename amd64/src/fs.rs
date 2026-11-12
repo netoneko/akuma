@@ -431,7 +431,7 @@ pub fn init_vfs() {
     // the rest of the kernel 128 MB. That is fine until something asks for a big
     // contiguous block: `execve` reads the whole binary into the heap on this
     // target, and `rust-lld` — the linker the kernel's own build finishes with —
-    // is **158 MB**. Measured 2026-09-18, an in-guest `cargo build -p akuma-amd64`
+    // is **158 MB**. Measured 2026-09-18, an in-guest `cargo build -p akuma`
     // died at `[ALLOC FAIL] requested=65536 heap_total=512MB heap_used=510MB`
     // one allocation after `[HEAP] 505MB used (alloc=165777608 bytes)`.
     //

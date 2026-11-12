@@ -9,7 +9,7 @@ workspace = true
 
 # One feature per driver. A driver whose feature is off is not compiled, and `register` does
 # not install it, so the machine half's probe for that class does nothing. `all` is what the
-# bin's default (bare-metal) image enables; `amd64/bin/Cargo.toml` names the smaller sets.
+# bin's default (bare-metal) image enables; the root `Cargo.toml` names the smaller sets.
 [features]
 all = ["fbcon", "hda", "i8042", "kvm", "nvme", "touchpad", "wifi", "xhci"]
 # The bin's `no-tests`: drivers register no boot-suite checks.

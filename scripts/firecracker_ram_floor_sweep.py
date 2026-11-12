@@ -34,10 +34,10 @@ Usage:
         [--command /bin/forktest_parent] [--args "-duration=4s"] [--smp 1,2,4]
 
 Example (amd64 headless, no-tests build, forktest as the workload):
-    cargo build -p akuma-amd64 --target x86_64-unknown-none --release \\
+    cargo build -p akuma --target x86_64-unknown-none --release \\
         --no-default-features --features no-tests
     scripts/firecracker_ram_floor_sweep.py amd64hl \\
-        target/x86_64-unknown-none/release/akuma-amd64 /path/to/disk.img \\
+        target/x86_64-unknown-none/release/akuma /path/to/disk.img \\
         512,384,256,192,128,96,64,48,40,32,28,24,20,16,12,10,8
 """
 import argparse

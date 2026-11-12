@@ -1,8 +1,33 @@
+//! One build script for the one kernel package. The target decides which half runs: the amd64
+//! kernel needs only its linker script, the AArch64 one its cfgs and `--defsym`s.
+
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
     println!("cargo::rustc-check-cfg=cfg(kernel_console_lock)");
     println!("cargo::rustc-check-cfg=cfg(kernel_audio)");
+
+    match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86_64") => amd64(),
+        Ok("aarch64") => aarch64(),
+        // A host build (`cargo test` at the root never builds this bin, but `cargo check`
+        // for the host may): neither kernel links, so there is nothing to pass.
+        _ => {}
+    }
+}
+
+/// Hand the kernel binary its linker script.
+///
+/// `akuma-kernel-amd64` owns `amd64/linker.ld` and exports its path as `links` metadata
+/// (`DEP_AKUMA_KERNEL_AMD64_LINKER_SCRIPT`), because a dependency's `rustc-link-arg` never
+/// reaches the binary that depends on it. `rustc-link-arg-bins` scopes it to this package's bin.
+fn amd64() {
+    let script = std::env::var("DEP_AKUMA_KERNEL_AMD64_LINKER_SCRIPT")
+        .expect("akuma-kernel-amd64 exports its linker script");
+    println!("cargo:rustc-link-arg-bins=-T{script}");
+}
+
+fn aarch64() {
 
     // BKL-hold attribution build. Turns on the per-tag profiler in
     // `akuma_exec::sync` for the whole boot and has the async-main loop dump a

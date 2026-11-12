@@ -1408,7 +1408,7 @@ def cargo_tree(pkg: str, triple: str, features: str = "", default: bool = True):
 #: manifest -> (cargo package, target triple) for the kernels `linked_crates` can ask cargo about.
 KERNEL_PACKAGES = {
     "Cargo.toml": ("akuma", "aarch64-unknown-none"),
-    os.path.join("amd64", "Cargo.toml"): ("akuma-amd64", "x86_64-unknown-none"),
+    os.path.join("amd64", "Cargo.toml"): ("akuma", "x86_64-unknown-none"),
     os.path.join("taoxichuan", "Cargo.toml"): ("taoxichuan", "x86_64-unknown-none"),
 }
 
@@ -1695,7 +1695,7 @@ AUDIT_KERNELS = {
                          "x86_64-unknown-none", "no-tests", True),
     "taoxichuan-aarch64": (os.path.join("taoxichuan", "Cargo.toml"), "taoxichuan",
                            "aarch64-unknown-none", "no-tests", True),
-    "akuma-amd64": (os.path.join("amd64", "Cargo.toml"), "akuma-amd64",
+    "akuma-amd64": (os.path.join("amd64", "Cargo.toml"), "akuma",
                     "x86_64-unknown-none", "no-tests", True),
     "akuma-aarch64": ("Cargo.toml", "akuma", "aarch64-unknown-none", "no-tests", True),
 }

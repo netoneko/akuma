@@ -40,7 +40,7 @@ For debugging, see [`../../runbooks/debug-boot-hang.md`](../../runbooks/debug-bo
 The last thing every Akuma kernel does at boot is start one userspace program
 and stay out of its way. The three kernel families do it differently today:
 
-| | AArch64 `akuma` | amd64 `akuma-amd64` | Taoxichuan / Shanghai (`akuma-tokio-kernel-*`) |
+| | AArch64 `akuma` | amd64 `akuma` (`--target x86_64-unknown-none`) | Taoxichuan / Shanghai (`akuma-tokio-kernel-*`) |
 |---|---|---|---|
 | Which program | `init=`/`initargs=`; default `/bin/herd daemon`; none if `config::AUTO_START_HERD` is off | `init=`/`initargs=`; default `/bin/sh` on a GRUB boot, none on a PVH boot | `init=` |
 | Where the line comes from | the DTB's `/chosen/bootargs` (`INIT=`/`INITARGS=` to `cargo run`) | PVH start info, or GRUB's command line (`INIT=`/`INITARGS=` to `amd64/run.sh`) | the same, per arch |

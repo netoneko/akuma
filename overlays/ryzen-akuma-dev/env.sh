@@ -11,7 +11,7 @@ PART=${PART:-}
 OV=${OV:-$AKUMA_SRC/overlays/ryzen-akuma-dev}
 VM=vm-dev-part                          # herd service name (and /var/run/herd/<VM>.vm)
 GUEST_KERNEL=${GUEST_KERNEL:-/boot/akuma-guest-dev}   # NEVER /boot/akuma-amd64*: that is the host's
-KBUILD_ELF=${KBUILD_ELF:-/root/ktarget/x86_64-unknown-none/release/akuma-amd64}
+KBUILD_ELF=${KBUILD_ELF:-/root/ktarget/x86_64-unknown-none/release/akuma}
 SSH_PORT=${SSH_PORT:-2224}              # host port forwarded to the guest's sshd (22)
 OUT=${OUT:-/root/dev-cycle/ryzen-akuma-dev}
 # One kvm0 VM at a time: every other VM service is stopped before ours starts.

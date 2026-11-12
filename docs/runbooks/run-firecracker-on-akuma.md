@@ -15,7 +15,7 @@ the Akuma kernel works) and a root image (`scripts/kvm/akuma_guest_rootfs.sh`). 
 ## 1. Rehearse on QEMU TCG (no ryzen)
 
 ```sh
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release --features no-tests
+cargo build -p akuma --target x86_64-unknown-none --release --features no-tests
 scripts/kvm/akuma_guest_rootfs.sh /tmp/guestroot.img target/x86_64-unknown-none/release/busybox-x86_64
 # FCDIR GCCDIR MUSLDIR = extracted apks (firecracker, libgcc, musl); CENSUS_DIR holds fc/ gcc/ musl/
 CENSUS_DIR=... GUEST_IMG=/tmp/guestroot.img ROOT_MB=96 \
@@ -31,7 +31,7 @@ Do not edit the scripts while a run is alive (the shell reads them as it goes).
 ## 2. On the ryzen
 
 Build **on the ryzen** (a Mac-built kernel hangs there): from Pop, a fresh clone of the pushed branch (the font
-submodule `crates/akuma-fbcon/vendor/spleen` is copied from another checkout), `cargo build -p akuma-amd64 --target
+submodule `crates/akuma-fbcon/vendor/spleen` is copied from another checkout), `cargo build -p akuma --target
 x86_64-unknown-none --release --features no-tests` with `CARGO_TARGET_DIR` set, copy to p3's
 `/boot/akuma-amd64.verify`, `sh overlays/ryzen/arm.sh 29` (entry 30, `kvmctl kvmmem=4096`), wait for Akuma
 (`ssh -p 2222 root@<wifi address>`). Stage `firecracker`, a `vm.json` and the guest images under `/root/fc/`

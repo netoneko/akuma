@@ -2839,6 +2839,34 @@ Gates: amd64 831/841 at SMP 1/2. At SMP=4 two runs both gave 837 with 0 failures
 child exited before its fd table was read; stdio checks skipped`, a skip the test takes by design
 when the child wins that race. Ring-3 OK; AArch64 312/320/318.
 
+### One kernel package: `akuma` builds both (2026-11-12)
+
+The amd64 bin was its own package, `akuma-amd64` in `amd64/bin`, a 20-line `main.rs` plus a
+manifest that forwarded every machine-half feature. It is now the root package `akuma` built for
+`x86_64-unknown-none`:
+
+- `Cargo.toml`: `akuma-kernel` is the one unconditional dependency. The AArch64 dependencies
+  moved under `cfg(all(target_arch = "aarch64", target_os = "none"))`, and the amd64 ones
+  (`akuma-kernel-amd64`, `akuma-drivers-amd64`, `akuma-kernel-tests-amd64`) sit under the
+  x86_64 table. One `[features]` table serves both. A shared name lists both kernels' parts
+  (`no-tests`, `linux-extra-syscalls`, the `sc-*` set, `syscall-debug-info`, `pmm-forensics`),
+  and the half naming the other architecture's crates does nothing, because cargo does not
+  activate an inactive target's dependencies. `default` is both defaults, so an amd64 image that
+  leaves something out still says `--no-default-features` (`headless`, `server`), as before.
+- `src/main.rs` is the crate root; `src/aarch64.rs` (the old `main.rs`: allocator, OOM policy,
+  panic handler) and `src/amd64.rs` (driver and suite registration) each end in `entry!`.
+  Both modules are gated on `target_os = "none"` as well, or an Apple-silicon host check would
+  compile the AArch64 one.
+- `build.rs` branches on `CARGO_CFG_TARGET_ARCH`: x86_64 passes `amd64/linker.ld` from the
+  machine half's `links` metadata, AArch64 keeps its cfgs and `--defsym`s.
+- The artifact is `target/x86_64-unknown-none/release/akuma` and the build is `-p akuma
+  --target x86_64-unknown-none`. Scripts, runbooks and reference docs were renamed. File names
+  on the boxes (`/boot/akuma-amd64`, `EFI/akuma/akuma-amd64`, `$OUT/akuma-amd64`) were not:
+  GRUB configs on the ryzen and the HP box name them.
+
+The amd64 image is 88 bytes smaller (symbol names); `cloc_akuma.py --audit akuma-amd64` reads
+the new package. Gates: see the commit.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral

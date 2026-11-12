@@ -3,8 +3,8 @@
 #
 #   scripts/kvm/akuma_rehearse.sh LOG [SECONDS]
 #
-# Env: KERNEL  the amd64 kernel (default target/x86_64-unknown-none/release/akuma-amd64,
-#              built with: cargo build -p akuma-amd64 --target x86_64-unknown-none
+# Env: KERNEL  the amd64 kernel (default target/x86_64-unknown-none/release/akuma,
+#              built with: cargo build -p akuma --target x86_64-unknown-none
 #              --release --features no-tests). It is both the host and, copied to
 #              /boot/akuma-guest, the guest.
 #      BUSYBOX static x86_64 busybox (default target/x86_64-unknown-none/release/busybox-x86_64)
@@ -24,7 +24,7 @@
 set -eu
 LOG=${1:?usage: akuma_rehearse.sh LOG [SECONDS]}
 MAX=${2:-240}
-KERNEL=${KERNEL:-target/x86_64-unknown-none/release/akuma-amd64}
+KERNEL=${KERNEL:-target/x86_64-unknown-none/release/akuma}
 BUSYBOX=${BUSYBOX:-target/x86_64-unknown-none/release/busybox-x86_64}
 EXTRA=${EXTRA:-}
 HERE=$(dirname "$0")

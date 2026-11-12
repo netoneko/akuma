@@ -237,21 +237,21 @@ from `--no-default-features` (unlike `devbox`).
 - **Developing/debugging the kernel day to day** → `release` (`cargo run --release`).
 - **A smaller image of the same kernel** → `--profile extreme-size` with the feature set you want. There is no longer a 4 MB-floor target.
 - **Working inside Akuma as a Unix box (self-hosted toolchain, editor, daily use)** → `devbox-smoltcp` (the default devbox: native smoltcp + real SMP; `overlays/devbox/run-smoltcp.sh`). The rump `devbox` is deferred but still boots via `overlays/devbox/run.sh` (needs `RUMP_NIC=1`).
-- **A lean amd64 kernel for a bare-metal test box** → `-p akuma-amd64 --no-default-features --features headless` ([amd64 images](#amd64-images)).
+- **A lean amd64 kernel for a bare-metal test box** → `-p akuma --no-default-features --features headless` ([amd64 images](#amd64-images)).
 - **Exercising real (shared-kernel) SMP** → nothing to do; it is in `--release`. Set `SMP=N` at run time. See `docs/reference/subsystems/smp-shared.md`.
 
 ## amd64 images
 
-The amd64 kernel is a separate package (`-p akuma-amd64 --target x86_64-unknown-none
---release`); its feature table is in
-[`subsystems/config-flags.md`](subsystems/config-flags.md#the-akuma-amd64-package). Its
+The amd64 kernel is the same package as the AArch64 one, built for the other target
+(`-p akuma --target x86_64-unknown-none --release`); its feature table is in
+[`subsystems/config-flags.md`](subsystems/config-flags.md#amd64-features). Its
 device drivers are `crates/akuma-drivers-amd64`, one feature per driver, and the machine
 half reaches each class through a registration slot (`amd64/src/drivers.rs`), so a driver
 left out takes its probe with it and the class reads as absent.
 
 | Image | Build | What it is |
 |---|---|---|
-| **default** (bare metal) | `cargo build -p akuma-amd64 --target x86_64-unknown-none --release` | Every driver (`all-drivers`: `fbcon`, `hda`, `i8042`, `kvm`, `nvme`, `touchpad`, `wifi`, `xhci`) and the boot suite. The image for a machine that is used (HP box, ryzen). |
+| **default** (bare metal) | `cargo build -p akuma --target x86_64-unknown-none --release` | Every driver (`all-drivers`: `fbcon`, `hda`, `i8042`, `kvm`, `nvme`, `touchpad`, `wifi`, `xhci`) and the boot suite. The image for a machine that is used (HP box, ryzen). |
 | **headless** (bare-metal test box) | `... --no-default-features --features headless`; boot under TCG with `NO_DEFAULT_FEATURES=1 FEATURES=headless sh amd64/run.sh` | The machine half's defaults, the boot suite, and only the storage and keyboard drivers (`storage-and-input`: `nvme`, `xhci`, `i8042`). No framebuffer console (the console is the serial port, GRUB's framebuffer is not touched), no splash, no `/dev/fb0`, no sound, no touchpad, no Wi-Fi (`/dev/wifi0`, the rtw89 card), no hypervisor (`/dev/kvm0`, `/dev/kvm`, `/dev/net/tun`), and none of their crates linked. For a test box with a serial line (trashcan, an Intel CPU: the hypervisor is AMD SVM only). |
 | **server** (reached over ssh) | `... --no-default-features --features server` | `headless` without the interactive console (the `console` feature) and without the keyboard drivers: storage only (`storage`: `nvme`, `xhci`). The serial line carries the kernel log and init's stdout/stderr, and nothing reads it: no console pump task, no USB keyboard enumeration, init's stdin is EOF, and 301's `SPAWN_FLAG_CONSOLE` (herd's `console = true`) is `ENODEV`. For a machine whose console is ssh. |
 | **no-tests** | `--features no-tests` (combines with `headless` or `server`) | Drops the boot suite (`akuma-kernel-tests-amd64` is not linked). |

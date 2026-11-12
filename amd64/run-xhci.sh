@@ -35,9 +35,9 @@ DISK="${DISK:-target/usbdisk.img}"
 LOG="${LOG:-target/xhci-serial.log}"
 # Extra tokens for the kernel command line (`skiptests`, `strace`, `init=...`).
 EXTRA="${EXTRA:-}"
-KERNEL=target/x86_64-unknown-none/release/akuma-amd64
+KERNEL=target/x86_64-unknown-none/release/akuma
 
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release
+cargo build -p akuma --target x86_64-unknown-none --release
 
 # The fixture: an MBR, an ext2 `sda1` at LBA 2048 and a scratch `sda2` at LBA
 # 134217728, matching the real drive. Sparse, so the 64 GiB costs ~256 MiB.

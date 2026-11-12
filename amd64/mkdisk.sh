@@ -66,7 +66,7 @@ DEBUGFS=$(find_tool debugfs) || {
 HELLO=$(find target/x86_64-unknown-none/release/build -name hello.elf 2>/dev/null | head -1)
 FDPROBE=$(find target/x86_64-unknown-none/release/build -name fdprobe.elf 2>/dev/null | head -1)
 [ -n "$HELLO" ] || {
-    echo "hello.elf not found — run 'cargo build -p akuma-amd64 --target x86_64-unknown-none --release' first" >&2
+    echo "hello.elf not found — run 'cargo build -p akuma --target x86_64-unknown-none --release' first" >&2
     exit 1
 }
 

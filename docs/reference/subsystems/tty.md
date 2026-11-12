@@ -104,7 +104,7 @@ at `INGEST_CHUNK` for what it takes from the channel in canonical mode.
 
 ```sh
 cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2) -p akuma-tty    # 99 tests
-cargo check; cargo check -p akuma-amd64 --target x86_64-unknown-none
+cargo check; cargo check -p akuma --target x86_64-unknown-none
 python3 scripts/check_unsafe_budget.py
 ```
 

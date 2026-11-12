@@ -14,7 +14,8 @@ linker = "scripts/link_kernel.sh"
 
 rustflags = ["-C", "link-arg=-Tlinker.ld"]
 
-# amd64 bring-up target (`amd64/`, package `akuma-amd64`).
+# amd64 target: the root package `akuma` built with `--target x86_64-unknown-none`
+# (machine half `amd64/`, package `akuma-kernel-amd64`).
 #
 # Only the relocation model lives here, and it is a property of the *target*
 # rather than of any one package: a bare-metal x86_64 image is linked to a fixed
@@ -24,7 +25,7 @@ rustflags = ["-C", "link-arg=-Tlinker.ld"]
 # against local symbol".
 #
 # No `runner` and no `-T` here on purpose. The linker script is passed by
-# amd64/build.rs as `rustc-link-arg-bins`, so it applies to the kernel binary
+# the root build.rs as `rustc-link-arg-bins`, so it applies to the kernel binary
 # and not to the per-crate `cargo build -p <crate> --target x86_64-unknown-none`
 # probes that measure how much of the tree is arch-neutral — those build rlibs,
 # and a stray link script in their flag set is noise at best.

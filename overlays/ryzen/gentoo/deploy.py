@@ -3,7 +3,7 @@
     python3 overlays/ryzen/gentoo/deploy.py [entry]     # default 17 (18 = + strace_err)
 
 If the Gentoo box is up it is asked to reboot to Pop first (over its own sshd on
-2222). Then: kernel from target/x86_64-unknown-none/release/akuma-amd64 ->
+2222). Then: kernel from target/x86_64-unknown-none/release/akuma ->
 the ESP, optionally p7's /akuma-init.sh from ./akuma-init.sh (--init), arm the
 entry, reboot, and wait for 2222 + 4444. Needs scripts/utils/hpbox.py.
 """
@@ -41,7 +41,7 @@ if up(2222):
 t0 = time.time()
 while time.time() - t0 < 300 and hpbox.ryzen_root('uptime')[0] != 0:
     time.sleep(8)
-kernel = open(os.path.join(ROOT, 'target/x86_64-unknown-none/release/akuma-amd64'), 'rb').read()
+kernel = open(os.path.join(ROOT, 'target/x86_64-unknown-none/release/akuma'), 'rb').read()
 r = subprocess.run(hpbox.RZ_ROOT + ['cat > /root/akuma-amd64.new && cp /root/akuma-amd64.new '
                                     '/boot/efi/EFI/akuma/akuma-amd64 && sync && md5sum /boot/efi/EFI/akuma/akuma-amd64'],
                    input=kernel, capture_output=True, timeout=600)

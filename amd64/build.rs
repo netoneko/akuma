@@ -1,4 +1,4 @@
-//! Two jobs: export the kernel's linker script to the bin (`amd64/bin`), and
+//! Two jobs: export the kernel's linker script to the bin (the root package `akuma`), and
 //! build the guest programs the boot suite's ELF loader tests consume (and
 //! `mkdisk.sh` puts on the disk).
 
@@ -22,7 +22,7 @@ fn main() {
 /// including the per-crate `cargo build -p <crate> --target x86_64-unknown-none`
 /// probes used to measure how much of the tree is arch-neutral. And a
 /// dependency's `rustc-link-arg` never reaches the binary that depends on it, so
-/// the path travels as `links` metadata: `amd64/bin/build.rs` reads it as
+/// the path travels as `links` metadata: the root `build.rs` reads it as
 /// `DEP_AKUMA_KERNEL_AMD64_LINKER_SCRIPT` and passes it with `rustc-link-arg-bins`.
 fn kernel_link_args(dir: &str) {
     println!("cargo:linker_script={dir}/linker.ld");
