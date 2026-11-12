@@ -1300,8 +1300,10 @@ fn system(call: Syscall, a: [u64; 6]) -> Option<u64> {
         Syscall::Getrandom => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         // `sysinfo(struct sysinfo *)` — x86_64 99. `busybox free`/`top` read
         // total/free RAM from here, not from `/proc/meminfo`, and a missing one
-        // means `used = total - free - …` underflows to 18 quintillion.
-        Syscall::Sysinfo => sys_sysinfo(a1),
+        // means `used = total - free - …` underflows to 18 quintillion. Glue's, as on
+        // AArch64 (2026-11-12): amd64's copy also put the kernel heap in `bufferram`,
+        // which is not buffer memory; that field is 0 now on both.
+        Syscall::Sysinfo => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         // `syslog(type, buf, len)` — x86_64 103 (`klogctl`). Backed by the
         // console ring buffer in `serial.rs`, so `busybox dmesg` returns the
         // kernel's own boot/diagnostic output over ssh — the only way to read

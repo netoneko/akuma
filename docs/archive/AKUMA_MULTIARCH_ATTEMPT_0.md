@@ -2827,6 +2827,18 @@ bytes at an unaligned 8199 reads back through both `pread` and `lseek`+`read`.
 Gates: amd64 suite 831/841/841, ring-3 OK; AArch64 312/320/318 (the known `SPAWN FAILED` lines);
 clippy on AArch64 and amd64 `headless`.
 
+### `sysinfo` is glue's (2026-11-12)
+
+amd64 had its own `sysinfo`. It differed from glue's in two fields. `procs` was the process
+table's count where glue said 1, and glue now counts. `bufferram` was the kernel heap's allocated
+bytes where glue said 0. The heap is not buffer memory, so that field is 0 on both now. amd64's
+copy and its `proc_count` helper are deleted. `busybox free` and `uptime` read correctly on both
+kernels.
+
+Gates: amd64 831/841 at SMP 1/2. At SMP=4 two runs both gave 837 with 0 failures: `spawn:
+child exited before its fd table was read; stdio checks skipped`, a skip the test takes by design
+when the child wins that race. Ring-3 OK; AArch64 312/320/318.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral

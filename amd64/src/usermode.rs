@@ -1211,44 +1211,6 @@ fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
     akuma_syscalls_glue_amd64::vectored(fd, iov, cnt, sys_write)
 }
 
-/// `sysinfo(2)` — memory totals for `busybox free` / `top`. The struct layout
-/// is `akuma_syscalls_linux::proc::Sysinfo` (LP64, host-tested, shared with the
-/// AArch64 kernel). `mem_unit = 1` so every `*ram` field is already in bytes;
-/// a `0` there is what makes `free` print `16.0E`.
-fn sys_sysinfo(out: u64) -> u64 {
-    use akuma_syscalls_linux::proc::Sysinfo;
-    if out == 0 {
-        return crate::fd::errno::EFAULT;
-    }
-    let page = 4096u64;
-    let heap = akuma_alloc::stats();
-    let info = Sysinfo {
-        uptime: i64::try_from(crate::net::uptime_us() / 1_000_000).unwrap_or(i64::MAX),
-        totalram: akuma_pmm::total_count() as u64 * page,
-        freeram: akuma_pmm::free_count() as u64 * page,
-        bufferram: heap.allocated as u64,
-        procs: proc_count(),
-        mem_unit: 1,
-        ..Sysinfo::default()
-    };
-    let bytes = info.to_bytes();
-    if !crate::uaccess::write_bytes(out, &bytes) {
-        return crate::fd::errno::EFAULT;
-    }
-    0
-}
-
-/// A rough count of live processes, for `sysinfo`'s `procs`. Best-effort — the
-/// number is cosmetic in `free`/`top` on this target.
-fn proc_count() -> u16 {
-    // `akuma-exec`'s table since 5b slice 4, which is the only process table
-    // there is now. It answers a slightly different question than the array it
-    // replaced — registered processes rather than occupied process slots — and
-    // for a cosmetic `sysinfo` field the registered count is the better one:
-    // it is what `ps` lists.
-    akuma_exec::process::process_count().min(u16::MAX as usize) as u16
-}
-
 /// `memfd_create(name, flags)`: an unlinked file under `/tmp`, so `ftruncate` and a `MAP_SHARED` mmap
 /// (twice, at adjacent addresses, as Firecracker's ring buffers do) behave as on a memfd. The name is
 /// only a debugging label on Linux and is not read here. Costs ext2 blocks, not a tmpfs page.

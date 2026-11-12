@@ -1361,7 +1361,9 @@ pub(super) fn sys_sysinfo(info_ptr: usize) -> u64 {
         uptime: (akuma_primitives::clock::uptime_us() / 1_000_000).cast_signed(),
         totalram: akuma_exec::pmm::total_count() as u64 * 4096,
         freeram: akuma_exec::pmm::free_count() as u64 * 4096,
-        procs: 1,
+        // Registered processes, what `ps` lists (amd64's answer before the fold;
+        // this was a literal 1).
+        procs: u16::try_from(akuma_exec::process::process_count()).unwrap_or(u16::MAX),
         mem_unit: 1,
         ..Sysinfo::default()
     };
