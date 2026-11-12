@@ -68,6 +68,8 @@ akuma-machine-facts = { path = "../akuma-machine-facts" }
 # allocator `paging` and `virtio` allocate through.
 akuma-alloc = { path = "../akuma-alloc" }
 akuma-pmm = { path = "../akuma-pmm" }
+# user_stack_size's policy (config flag sweep, 2026-11-11), shared with every other kernel.
+akuma-mem-policy = { path = "../akuma-mem-policy" }
 # Shared frames for read-only file pages (`lazy.rs`): one copy of each page of
 # `librustc_driver` however many `rustc`s map it.
 akuma-fpcache = { path = "../akuma-fpcache" }

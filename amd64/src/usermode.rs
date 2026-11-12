@@ -84,7 +84,12 @@ pub const ELF_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
 /// `exec_runtime.rs`'s `user_stack_size`.
 pub const ELF_STACK_PAGES: usize = 128;
 
-/// How far the main stack may grow: 8 MiB, Linux's default `RLIMIT_STACK`.
+/// How far the main stack may grow, in pages.
+///
+/// The shared RAM-scaled policy (`akuma_config::compute_user_stack_size`,
+/// RAM/2048 between 128 KiB and 8 MiB, the number AArch64 uses), and never less than the
+/// [`ELF_STACK_PAGES`] exec maps eagerly. This is also `RLIMIT_STACK`
+/// (`exec_runtime.rs`), so the limit a program reads is the edge it has.
 ///
 /// Only [`ELF_STACK_PAGES`] of it are mapped at exec; the rest below is one
 /// anonymous demand-paged region ([`crate::mm::lazy_stack_region`]), so a
@@ -94,7 +99,10 @@ pub const ELF_STACK_PAGES: usize = 128;
 /// (2026-10-15, `docs/archive/AKUMA_GENTOO.md`). The same shape is a likely
 /// suspect for the Python `_blake2` crash recorded in
 /// `AKUMA_GENTOO_PORTAGE_CRASH.md`.
-pub const ELF_STACK_MAX_PAGES: usize = 2048;
+#[must_use]
+pub fn elf_stack_max_pages() -> usize {
+    (akuma_config::compute_user_stack_size(akuma_boot_amd64::mem::ram_bytes()) / 4096).max(ELF_STACK_PAGES)
+}
 
 
 
@@ -1755,7 +1763,7 @@ impl Image {
         let stack = loader::build_stack(&mut space, ELF_STACK_TOP, ELF_STACK_PAGES, argv, envp, &img)?;
 
         let entry = img.entry;
-        let regions = alloc::vec![crate::mm::lazy_stack_region(ELF_STACK_TOP, ELF_STACK_PAGES, ELF_STACK_MAX_PAGES)];
+        let regions = alloc::vec![crate::mm::lazy_stack_region(ELF_STACK_TOP, ELF_STACK_PAGES, elf_stack_max_pages())];
         Ok((Self { space, entry, stack, regions }, img))
     }
 
@@ -2948,7 +2956,7 @@ pub fn register_exec_process(
         register_child_channel, register_reserved, thread_pid_map_insert,
     };
 
-    let stack_bottom = ELF_STACK_TOP - (ELF_STACK_MAX_PAGES as u64 * 4096);
+    let stack_bottom = ELF_STACK_TOP - (elf_stack_max_pages() as u64 * 4096);
 
     // **Is this process attached to the console?**
     //
@@ -3607,7 +3615,7 @@ fn do_execve(
     let new_brk = ld.end_va;
     let new_entry = next.entry;
     let new_stack = next.stack;
-    let stack_bottom = (ELF_STACK_TOP - (ELF_STACK_MAX_PAGES as u64 * 4096)) as usize;
+    let stack_bottom = (ELF_STACK_TOP - (elf_stack_max_pages() as u64 * 4096)) as usize;
 
     // **POSIX: `execve` destroys every other thread of the calling process.**
     // This target did not, and slice 4 is what made the omission concrete: the
@@ -3731,7 +3739,7 @@ fn do_execve(
     proc.set_text(text);
     // `install_image` cleared the region list; the stack's demand-grown part is
     // one region, registered as at first exec (`Image::with_stack`).
-    crate::mm::register_lazy_stack(ELF_STACK_TOP, ELF_STACK_PAGES, ELF_STACK_MAX_PAGES);
+    crate::mm::register_lazy_stack(ELF_STACK_TOP, ELF_STACK_PAGES, elf_stack_max_pages());
     // The display name is the syscall layer's, on both kernels —
     // `install_image`'s doc says so, because it is the *resolved path* here and
     // `argv[0]` would be a name the caller chose rather than something that

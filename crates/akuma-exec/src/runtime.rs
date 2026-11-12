@@ -399,8 +399,10 @@ pub struct ExecConfig {
     pub proc_stdin_max_size: usize,
     pub proc_stdout_max_size: usize,
     pub cow_fork_enabled: bool,
-    /// Enable the vfork fast-path (shared-AS child for CLONE_VFORK). See
-    /// `config::VFORK_FASTPATH_ENABLED`.
+    /// Enable the vfork fast-path (shared-AS child for CLONE_VFORK). No single
+    /// global default (removed, config flag sweep 2026-11-11): each kernel sets
+    /// this field itself — `true` in `akuma-kernel-glue` (AArch64 root), `false`
+    /// in amd64's `exec_runtime.rs` and both tokio kernels.
     pub vfork_fastpath_enabled: bool,
 
     /// Let a `tkill`/`tgkill` (`pthread_kill`) signal interrupt a blocking
@@ -408,8 +410,10 @@ pub struct ExecConfig {
     pub pthread_kill_eintr_enabled: bool,
 
     /// Share physical frames between read-only file-backed mappings. Gates
-    /// [`crate::memmath::is_shareable_mapping`]. See
-    /// `config::SHARED_FILE_PAGES_ENABLED`.
+    /// [`crate::memmath::is_shareable_mapping`]. No single global default
+    /// (removed, config flag sweep 2026-11-11): each kernel sets this field
+    /// itself — `true` in `akuma-kernel-glue` (AArch64 root), `false` in
+    /// amd64's `exec_runtime.rs` and both tokio kernels.
     pub shared_file_pages_enabled: bool,
 }
 

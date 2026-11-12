@@ -466,8 +466,11 @@ fn exec_config() -> ExecConfig {
         system_thread_stack_size: akuma_ring3_amd64::SYSCALL_STACK_SIZE,
         user_thread_stack_size: akuma_ring3_amd64::SYSCALL_STACK_SIZE,
         // What glue's `prlimit64(RLIMIT_STACK)` reports (nothing else reads it on
-        // this kernel: the loader is its own): the 8 MiB the main stack may grow to.
-        user_stack_size: crate::STACK_MAX as usize,
+        // this kernel: the loader is its own). Was the flat `STACK_MAX` (8 MiB) regardless of
+        // RAM; now the same RAM-proportional policy every other kernel uses (config flag sweep,
+        // 2026-11-11) — `akuma_pmm::total_count() * 4096` is the same RAM-size proxy
+        // `akuma_fpcache::init` already reads elsewhere in this kernel.
+        user_stack_size: akuma_mem_policy::compute_user_stack_size(akuma_pmm::total_count() * 4096, 0),
         enable_stack_canaries: false,
         stack_canary: 0,
         canary_words: 0,

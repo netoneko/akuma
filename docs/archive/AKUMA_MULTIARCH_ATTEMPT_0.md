@@ -2049,6 +2049,48 @@ follow no workload. All of it ran under TCG on a laptop on battery, so host thro
 out. It is open, and it predates both slices. The next step is the same freeze under
 `ring0-preempt`, with `GDB=1` attached when it stops to read where the vCPU is.
 
+## Open issue: heap auto-sizing does not scale down for the unified build's smaller footprints (2026-11-11)
+
+Found while boot-gating the config flag sweep (`config-flag-sweep` branch) on amd64 `headless`
+under local Firecracker: at `mem_size_mib=512` (511 MiB usable, one RAM region past the 1 MiB
+floor), boot failed with
+
+```
+[FATAL] heap ends 0x0000000020703000 but the region holding it ends 0x0000000020000000
+```
+
+**Root cause** (`crates/akuma-boot-amd64/src/mem.rs::heap_size_for`): the heap-size policy is a
+two-step function with no floor that respects actual available RAM —
+
+```rust
+pub const HEAP_SIZE: usize = 512 * 1024 * 1024;        // every machine under the threshold
+pub const HEAP_SIZE_LARGE: usize = 1024 * 1024 * 1024; // >= LARGE_HEAP_RAM_THRESHOLD
+pub const LARGE_HEAP_RAM_THRESHOLD: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+```
+
+Below 8 GiB, every machine gets a flat 512 MiB heap request regardless of how much RAM it
+actually has. At `mem_size_mib=512` the single usable region is itself only 511 MiB, so the flat
+request cannot fit *by construction* — before even subtracting the kernel image, PMM bookkeeping
+or boot stack. `pick()` falls back to the same oversized `HEAP_SIZE` a second time
+(`.or_else(|| pick(HEAP_SIZE))`) rather than to anything RAM-proportional, so there is no smaller
+value to fall back to. Booting at `mem_size_mib=2048` (the project's usual default) worked and
+passed the full suite (802/0); the bug only shows at a genuinely small machine.
+
+**Why this matters for the unified build specifically**: the drivers-crate split and the
+`headless`/`storage-and-input` feature set (2026-11-11, this same day) exist to make a small,
+test-box-sized amd64 image — the explicit goal in "docs: stripped guest programs, the wifi and kvm
+features, headless sizes" (`2062fc32`). A smaller binary and a smaller feature set do not help if
+the heap floor alone already needs 512 MiB+ to boot at all; `KERNEL_HEAP_SIZE_MB` (manual override,
+`config.rs`) is a workaround per-boot, not a fix to the default policy. AArch64 is unaudited here —
+unknown whether its own heap-sizing path (`akuma-kernel-core`) has the same flat-floor shape; worth
+checking as part of the same pass, since convergence is supposed to make the two agree.
+
+**Next step**: make `heap_size_for` (or its AArch64 equivalent, once compared) scale from actual
+usable RAM rather than stepping between two fixed sizes — e.g. a fraction of `usable_ram` with a
+small absolute floor — and gate it with a boot test at a RAM size below today's 512 MiB floor
+(Firecracker `mem_size_mib` in the 128-384 MiB range) alongside the existing 2048 MiB default, on
+both `headless` and the full driver set. Not scheduled against a slice yet; filed here because the
+unified build's own stated smaller-footprint goal is what exposed it.
 **Correction (2026-11-11, later the same day): it was QEMU, not the guest.** The guest kept running
 throughout: its clock, scheduler, netpoll daemon and sshd's accept loop were all live. QEMU's main loop
 was stuck in its timer list holding the BQL, with both vCPUs blocked on it mid-MMIO store. The trigger
@@ -2363,3 +2405,96 @@ fails, however many rounds run; without one, every thread's unused ASID is held 
 cooldowns and the pool runs dry in flight. Threads now share their group's ASID, and a full
 process table, the next limit behind it, is waited out rather than panicking:
 [`AKUMA_THREAD_ASID_SHARE.md`](AKUMA_THREAD_ASID_SHARE.md).
+
+## RAM floor: how low amd64 actually goes (2026-11-11/12)
+
+The heap-sizing bug above (flat 512 MiB heap request, no floor proportional to actual RAM) is
+fixed: `crates/akuma-mem-policy` is a new, pure, host-unit-tested crate holding
+`compute_heap_size`, `compute_thread_limit`, `compute_memory_layout`, `compute_user_stack_size` and
+`reserve_calc_ram`, each taking a `manual_override` instead of reading a config const directly.
+Wired into **all four** kernels (AArch64 root, amd64 root, Taoxichuan's amd64 half, Shanghai's
+AArch64 half) — not just amd64, which is where the bug was found. `compute_user_stack_size`
+replaced three separate flat 8 MiB stack-ceiling constants (amd64 root's `ELF_STACK_MAX_PAGES *
+4096`, Taoxichuan-amd64's `STACK_MAX`, Taoxichuan-aarch64's `USER_STACK_MAX`) with one
+RAM-proportional formula.
+
+Also merged in while this was in flight: `origin/akuma-multiarch-attempt-0`'s LAPIC periodic-timer
+fix (`docs/archive/AMD64_LAPIC_PERIODIC_SWITCH_QEMU_LIVELOCK.md`) and its fd-layer/signals/threads
+slices — `config-flag-sweep` is at merge commit `332ad7f6`, 8 commits ahead of where it branched
+from `akuma-multiarch-attempt-0`.
+
+**Floor numbers** — amd64 headless, `no-tests` build, `forktest_parent -duration=4s` as the
+workload, Firecracker PVH guest, no NIC:
+
+| SMP | Floor (RAM, passes) | Next step down (fails) |
+|---|---|---|
+| 1 | 24 MiB | 20 MiB — real `[FATAL]` PMM exhaustion |
+| 2 | 24 MiB | 20 MiB — real `[FATAL]` PMM exhaustion |
+| 4 | 28 MiB | 24 MiB — real `[FATAL]` PMM exhaustion |
+
+All three floors are genuine out-of-memory FATALs, not harness artifacts — confirmed only after
+three stacked **test-harness** bugs (none of them kernel bugs) were found and fixed in the sweep
+driver:
+
+1. A marker-substring race: matching the bare substring `"paws"` against the kernel's own
+   `-- running /bin/paws --` announcement line, which appears *before* the real `paws v0.3.0`
+   shell-ready banner — sent the test's typed command before the shell could read it.
+2. Stray/duplicate `firecracker` processes, left over from earlier manual debugging in the same
+   scratch directory, racing the sweep's own VM for the shared `akuma-vm.json`/`disk.img`.
+3. The real one: the driver script wrote a command to firecracker's stdin, then did a blind
+   `time.sleep(per_cmd_wait)` with **zero reads** of its stdout. The guest's console output backs
+   up in the unread OS pipe; once it backs up enough, firecracker's write to that pipe blocks,
+   which stalls the guest — the shell never even echoes the next typed command. A `select()`
+   "ready" result only promises *some* bytes, not a full line, so a later fix that kept draining
+   continuously still intermittently hung: a *blocking* `readline()` after `select()` can wait
+   forever for the rest of a line that never arrives if the peer stalls. The real fix was a
+   non-blocking read of the fd (`fcntl` + `os.read()` + manual line-splitting) so no read call can
+   ever block past its own `select()` timeout.
+
+**Better approach, not yet used for the numbers above**: driving an interactive shell over a pipe
+is inherently fragile (see the three bugs). `herd` (the real service supervisor, normally used as
+`init=` over ssh) reports a `oneshot` service's completion straight on the console —
+`[herd] Oneshot service <name> completed` — with **no stdin interaction needed at all**: boot, read
+the console for a fixed time budget, done. A `/etc/herd/enabled/forktest.conf` (`oneshot = true`,
+`command = /bin/forktest_parent`, `args = -duration=4s`) staged onto the disk image and
+`init=/bin/herd` on the boot line sidesteps the whole class of bug above. Confirmed working on
+amd64 headless at `mem_size_mib=512`. The floor numbers in the table were taken with the
+interactive-shell harness (now fixed); re-running them through `herd` instead would be the natural
+next step, and is probably worth it before trusting the exact low-end numbers (24/24/28 MiB) too
+far.
+
+## Taoxichuan: spawn fails under a no-NIC Firecracker config, not yet understood (2026-11-12)
+
+While trying the same floor-finding approach on Taoxichuan (`taoxichuan` binary, amd64 half,
+`no-tests`), every attempt to run an external program failed, independent of RAM size and
+independent of which program:
+
+- `init=/bin/paws` directly as pid 1: the shell prints its banner and prompt, but the **first**
+  blocking read for a keystroke — even for a pure builtin like `echo`, no exec involved — hits
+  `[nosys] nr=4409` and paws then calls `exit(0)`, ending the session.
+- `init=/bin/herd`: `bind()` on the control socket fails with `[nosys] nr=4415` (expected-ish, no
+  NIC), but then **every** service spawn (`console`, `forktest`, `sshd`) fails too, with
+  `[nosys] nr=4397` — `[herd] Failed to start <svc>`.
+
+None of 4409/4397/4415 match any named syscall constant anywhere in `akuma-syscalls-abi`'s x86_64
+table — they don't look like real (if unimplemented) syscall numbers so much as a corrupted/garbage
+value landing in whatever register supplies the syscall number (`fr.rax`) at dispatch time. The
+values are deterministic and close together (within ~20), consistent with low bits of nearby
+addresses rather than noise, but the exact mechanism is not found — `child.rs`'s
+`pack_frame`/`unpack_frame` (the `rt_sigreturn` signal-frame save/restore, which does write `rax`
+back from a saved word array) is a plausible area, not a confirmed one.
+
+**Confirmed pre-existing, not introduced by the merge above**: reproduces identically on
+`taoxichuan` built from plain `origin/akuma-multiarch-attempt-0` (no `akuma-mem-policy`, no fd/LAPIC
+merge) at `mem_size_mib=2048` (big enough that the old flat-heap bug doesn't mask it).
+
+**Not yet reconciled** with normal usage: Taoxichuan's own README says it boots with virtio-net +
+DHCP and `init=` normally `sshd`, and ssh with interactive input is reported to work fine in that
+setup. Every reproduction above used a Firecracker config with **no virtio-net device**
+(`"network-interfaces": []`) and `init=` set directly to `/bin/paws` or `/bin/herd`, bypassing sshd
+entirely — a combination the normal dev loop (`docs/runbooks/build-and-boot.md`,
+`scripts/kvm/goose/boot_dev.sh`) does not use. Whether this is a real spawn-path bug that normal
+usage simply never exercises, or an artifact specific to the no-NIC/non-sshd boot path used here, is
+open. Left here rather than chased further; the next step is reproducing against the actual
+documented dev-loop setup (real NIC, `init=/bin/sshd`) before concluding anything about Taoxichuan's
+RAM floor.

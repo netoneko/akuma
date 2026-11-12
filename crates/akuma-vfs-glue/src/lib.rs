@@ -1829,7 +1829,10 @@ const fn cfg_proc_sysvipc_enabled() -> bool {
 }
 
 const fn cfg_shared_file_pages_enabled() -> bool {
-    akuma_config::SHARED_FILE_PAGES_ENABLED
+    // `akuma_config::SHARED_FILE_PAGES_ENABLED` removed (config flag sweep,
+    // 2026-11-11): never flipped since 2026-08-05. Kept as a function so every
+    // call site here is unchanged.
+    true
 }
 
 const fn cfg_syscall_debug_info_enabled() -> bool {

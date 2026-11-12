@@ -1635,7 +1635,7 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     t.check_eq("dispatch: glue accepts prlimit64", prlimit_rc, 0);
     t.check(
         "dispatch: and writes a real RLIMIT_STACK (the old arm wrote nothing)",
-        rlim[0] == (ELF_STACK_MAX_PAGES * 4096) as u64 && rlim[1] == rlim[0],
+        rlim[0] == (elf_stack_max_pages() * 4096) as u64 && rlim[1] == rlim[0],
     );
     // The limit reported must be the stack a program actually gets, and this is
     // the check that says which one that is. `exec_runtime.rs` supplied the

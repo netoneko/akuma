@@ -16,6 +16,8 @@ akuma-firecracker = { path = "../akuma-firecracker" }
 akuma-gic = { path = "../akuma-gic" }
 akuma-mmu = { path = "../akuma-mmu" }
 akuma-pmm = { path = "../akuma-pmm" }
+# user_stack_size's policy (config flag sweep, 2026-11-11), shared with every other kernel.
+akuma-mem-policy = { path = "../akuma-mem-policy" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-psci = { path = "../akuma-psci" }
 akuma-timer = { path = "../akuma-timer" }

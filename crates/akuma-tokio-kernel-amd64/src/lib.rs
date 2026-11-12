@@ -229,13 +229,6 @@ pub(crate) fn gdt_init_cpu(cpu: usize) {
 
 static IDT: idt_lib::Idt = idt_lib::Idt::new();
 
-/// The one trap handler: name the kind, the rip, the cr2, and stop. A fault in
-/// this kernel is a bug in this kernel; there is no userspace to deliver it to
-/// and no scheduler to defer it through, so the honest report is the full
-/// frame and a halt. The `[Fault]` token is the gate's vocabulary.
-/// How far a user stack may grow (8 MiB); core's, shared with aarch64.
-pub(crate) use akuma_tokio_kernel_core::loader::STACK_MAX;
-
 /// A not-present fault just under a task's stack region is the stack growing
 /// (core's `grow_user_stack`, over this machine's tree).
 fn grow_user_stack(cr2: u64) -> bool {
@@ -281,6 +274,14 @@ fn cow_prepare_write(root: u64, va: u64) -> bool {
     cow::prepare_write::<lazy::Amd64>(root, va)
 }
 
+/// The one trap handler: name the kind, the rip, the cr2, and stop. A fault in
+/// this kernel is a bug in this kernel; there is no userspace to deliver it to
+/// and no scheduler to defer it through, so the honest report is the full
+/// frame and a halt. The `[Fault]` token is the gate's vocabulary.
+///
+/// (Moved here from above `grow_user_stack` — config flag sweep, 2026-11-11 — where it had
+/// ended up misattached to the now-removed `STACK_MAX` re-export; this is the function it was
+/// actually describing.)
 fn fault_trap(t: &mut Trap<'_>) {
     let user = t.from_ring3();
     if user {

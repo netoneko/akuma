@@ -45,6 +45,7 @@ pub fn init_reserving(facts: &Facts, reserved: &[(u64, u64)]) -> bool {
             evict_clean_file_pages: |_| 0,
             shrink_page_cache: |_| 0,
         },
+        akuma_config::KERNEL_HEAP_SIZE_MB,
     )
 }
 

@@ -77,6 +77,18 @@ pub fn heap_size() -> usize {
     HEAP_BYTES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Total usable RAM this boot found (`ram_total` in [`init_reserving`]), for callers that need
+/// it after memory bring-up and have no `Facts` of their own still in scope — `exec_runtime`'s
+/// stack-size policy (`akuma_mem_policy::compute_user_stack_size`), called from
+/// `install_shared_sinks`, which `init_reserving`'s own doc says must run after this.
+static RAM_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Bytes of usable RAM this boot found. `0` before [`init_reserving`] runs.
+#[must_use]
+pub fn ram_bytes() -> usize {
+    RAM_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 const PAGE_SIZE: usize = 4096;
 
 unsafe extern "C" {
@@ -92,7 +104,7 @@ const fn align_up(v: usize, to: usize) -> usize {
 ///
 /// Reads only `facts.ram()`: the regions either boot protocol reported as RAM.
 pub fn init(facts: &Facts, forensics: bool, hooks: akuma_pmm::PmmHooks) -> bool {
-    init_reserving(facts, &[], forensics, hooks)
+    init_reserving(facts, &[], forensics, hooks, 0)
 }
 
 /// How a region of RAM ended up being used, for the boot-log accounting.
@@ -159,11 +171,17 @@ impl Usable {
 /// `forensics` turns on the PMM's quarantine/premature-free/CoW-ledger
 /// instruments (see `akuma-amd64`'s `pmm-forensics` feature for the costs);
 /// `hooks` are registered verbatim into `akuma_pmm`.
+///
+/// `manual_heap_size_mb` is the caller's own manual-override knob (amd64's `KERNEL_HEAP_SIZE_MB`,
+/// if it has one; `0` means no override) — threaded through to `akuma_mem_policy::compute_heap_size`
+/// rather than read from any config crate here, so this crate stays dependency-free. See the config
+/// flag sweep's heap-sizing fix (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md` § "Open issue").
 pub fn init_reserving(
     facts: &Facts,
     reserved: &[(u64, u64)],
     forensics: bool,
     hooks: akuma_pmm::PmmHooks,
+    manual_heap_size_mb: usize,
 ) -> bool {
     let kernel_end = core::ptr::addr_of!(_kernel_end) as u64;
     // From the 1 MiB floor, not from `_kernel_start` (2 MiB): the layout above
@@ -225,13 +243,33 @@ pub fn init_reserving(
         let at = |u: Usable| heap_start_in(u, want as u64, &taken).map(|s| (u, want, s));
         kernel_home.and_then(at).or_else(|| at(roomiest))
     };
+    // The RAM-proportional fallback (`akuma-mem-policy`, config flag sweep 2026-11-11):
+    // `heap_size_for`'s flat request (512 MiB / 1 GiB) is what amd64 has always asked for first,
+    // unchanged — this is only the retry, for when that flat request does not fit. The retry used
+    // to be the SAME flat value a second time, which cannot fit any better the second time either;
+    // on a genuinely small machine (511 MiB usable, one region) that meant the heap could FATAL
+    // outright asking for a 512 MiB heap out of 511 MiB of RAM. `code_and_stack` here is the
+    // kernel's own known low-memory footprint (`kernel.1 - kernel.0`); amd64 has no single
+    // AArch64-style "code+boot-stack" reserve at RAM base, so this is the closest analogue — the
+    // one quantity amd64 already knows is definitely taken.
+    let scaled_heap = akuma_mem_policy::compute_heap_size(
+        ram_total as usize,
+        (kernel.1 - kernel.0) as usize,
+        manual_heap_size_mb,
+    );
     let (heap_home, heap_bytes, heap_at) = pick(heap_size_for(facts.ram_bytes()))
-        .or_else(|| pick(HEAP_SIZE))
-        // Nothing fits at either size. Keep the historical choice so the
-        // explicit diagnostic below reports against the same region it always
-        // did.
-        .unwrap_or((roomiest, HEAP_SIZE, roomiest.floor));
+        .or_else(|| pick(scaled_heap))
+        // Nothing fit even the proportional size (a fragmented machine with no region roomy
+        // enough). Last resort: whatever the roomiest region actually has past its floor, capped
+        // at the proportional request and never below 1 MiB — guaranteed to fit `heap_home`,
+        // unlike the flat `HEAP_SIZE` this branch used to report against (the exact FATAL this
+        // whole fallback chain exists to avoid; see the module doc's "Open issue").
+        .unwrap_or_else(|| {
+            let fits = core::cmp::max(core::cmp::min(scaled_heap as u64, roomiest.room()), 1024 * 1024);
+            (roomiest, fits as usize, roomiest.floor)
+        });
     HEAP_BYTES.store(heap_bytes, core::sync::atomic::Ordering::Relaxed);
+    RAM_BYTES.store(ram_total as usize, core::sync::atomic::Ordering::Relaxed);
     let heap_start = heap_at as usize;
     let heap_end = heap_start + heap_bytes;
 
