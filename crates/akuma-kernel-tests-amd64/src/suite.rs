@@ -224,6 +224,7 @@ fn run(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
 
     crate::usermode_tests::redirect_test(t);
     crate::usermode_tests::sigsuspend_test(t);
+    crate::usermode_tests::closed_stdin_test(t);
     // Hand pid 1 back before `run_init` claims it for the real init process.
     let drained = k::fd::boot_row_release(usermode_boot_tid);
     t.check("usermode: the borrowed identity was reclaimed", drained >= 1);

@@ -1003,6 +1003,65 @@ pub fn sigsuspend_test(t: &mut Suite) {
     );
 }
 
+/// A closed stdin ends an interactive shell, including one already parked in
+/// `poll` on it.
+///
+/// busybox's line editor polls fd 0 before it reads. Until 2026-11-12 a closed
+/// stdin did not poll readable (only buffered data did), and `close_stdin` woke
+/// nobody, so the shell slept forever on a descriptor whose `read` would have
+/// returned 0. That is what the `server` image's init hit: its stdin is closed
+/// because nothing feeds it. The shell here is `sh -i` on its own channel; the
+/// prompt in its stdout says it reached the editor, and the extra yields give it
+/// time to park before the close.
+pub fn closed_stdin_test(t: &mut Suite) {
+    const ERRNO_FLOOR: u64 = 0xFFFF_FFFF_FFFF_F000;
+    if k::fs::read_file("/bin/busybox").is_err() || k::fs::read_file("/bin/sh").is_err() {
+        t.note("closed stdin: busybox /bin/sh not on the disk; skipped", 0);
+        return;
+    }
+    let path = b"/bin/sh\0";
+    let (a0, ai) = (b"sh\0", b"-i\0");
+    let argv: [u64; 3] = [a0.as_ptr() as u64, ai.as_ptr() as u64, 0];
+    // A terminal on fd 0 (`SPAWN_FLAG_PTY`), or ash never starts its line editor
+    // and reads without polling, which was never broken.
+    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, SPAWN_FLAG_PTY);
+    if r >= ERRNO_FLOOR {
+        t.check("closed stdin: sh -i spawned", false);
+        return;
+    }
+    let pid = (r & 0xFFFF_FFFF) as u32;
+    let stdout_fd = (r >> 32) & 0xFFFF_FFFF;
+    let Some(ch) = akuma_exec::process::get_child_channel(pid) else {
+        t.check("closed stdin: the child has a channel", false);
+        k::fd::sys_close(stdout_fd);
+        return;
+    };
+    let mut spins = 0u64;
+    while !ch.has_stdout_data() && !ch.has_exited() && spins < 4_000_000 {
+        spins += 1;
+        k::sched::yield_now();
+    }
+    t.check("closed stdin: the shell printed its prompt", ch.has_stdout_data());
+    for _ in 0..20_000 {
+        k::sched::yield_now();
+    }
+    ch.close_stdin();
+    let mut st: i32 = -1;
+    let mut reaped = false;
+    for _ in 0..4_000_000u64 {
+        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+            reaped = true;
+            break;
+        }
+        k::sched::yield_now();
+    }
+    if !reaped {
+        let _ = akuma_exec::process::kill_process(pid);
+    }
+    t.check("closed stdin: the parked shell saw EOF and exited", reaped);
+    k::fd::sys_close(stdout_fd);
+}
+
 /// Shell redirection and pipelines — `dup2` and `pipe(2)`, end to end.
 ///
 /// These are the two things a build system cannot do without, and until

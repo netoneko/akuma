@@ -693,7 +693,11 @@ fn epoll_check_fd_readiness_at(fd_num: u32, requested: u32, waker: Option<&Waker
                     if waker.is_some() {
                         ch.add_poller(tid);
                     }
-                    FdState::Stdin { has_data: ch.has_stdin_data() }
+                    // A closed stdin is readable too: `read` returns 0 (EOF) at once,
+                    // and a program that polls before it reads (busybox's line
+                    // editor) has to be told so, or it parks for good. Linux also
+                    // sets `POLLHUP` here; this reports `POLLIN` only.
+                    FdState::Stdin { has_data: ch.has_stdin_data() || ch.is_stdin_closed() }
                 } else {
                     FdState::Stdin { has_data: false }
                 }

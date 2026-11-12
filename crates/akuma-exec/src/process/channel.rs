@@ -218,9 +218,13 @@ impl ProcessChannel {
         self.is_terminal.load(Ordering::Acquire)
     }
 
-    /// Mark stdin as closed (no more data will be arriving)
+    /// Mark stdin as closed (no more data will be arriving), and wake every
+    /// thread parked in `poll` on it: a closed stdin is readable (`read` returns
+    /// 0), and a poller registered before the close would otherwise sleep until
+    /// its timeout, or forever without one.
     pub fn close_stdin(&self) {
         self.stdin_closed.store(true, Ordering::Release);
+        self.wake_pollers();
     }
 
     /// Check if stdin is closed

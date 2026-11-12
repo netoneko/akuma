@@ -82,6 +82,7 @@ proves the probe is asking the right question).
 | more ready fds than `maxevents` | a ready-list rotation, so nobody starves | the interest list is walked in ascending fd order and truncated, deterministically | `the_interest_list_is_walked_in_ascending_fd_order` |
 | `epoll_pwait`/`ppoll`/`pselect6` `sigmask` | applied for the duration of the wait | accepted and discarded (see "Argument validation" below) | — |
 | an fd `close()`d while still in an interest list | dropped implicitly by `eventpoll_release_file` | pruned lazily, on the next `epoll_pwait` scan | `pruning_a_closed_fd_is_what_stops_a_synthetic_hup_err` |
+| a stdin (or `/dev/tty`) whose channel is closed | `POLLIN\|POLLHUP` | `POLLIN` only: glue maps "closed" to `FdState::Stdin { has_data: true }`, which is what makes `read`'s `0` reachable for a program that polls first | amd64 boot suite `closed stdin: the parked shell saw EOF and exited` |
 | `EPOLL_CTL_ADD` of an epoll into another that is a loop, or nests deeper than 4 | `ELOOP` / `EINVAL` at the ADD | accepted; the readiness probe stops descending at depth 4 and reports that level not ready | `nested_epoll_readable_only_while_inner_ready` covers the ordinary case only |
 
 `POLLPRI`/`exceptfds` being always empty is **not** on this list: Akuma has no
@@ -342,6 +343,12 @@ few crashes `MAX_SOCKETS` was exhausted, so the next `bun install`'s DNS
 resolver hung waiting on a UDP socket that could never be allocated. Fixed
 by routing the EL1 fault-recovery pad through `return_to_kernel(-14)`
 (proper fd/socket cleanup) instead of looping forever. See Background.
+
+**A closed stdin is readable, and closing it wakes the pollers.** glue's `Stdin`/`DevTty` probe
+reports `has_data` for buffered input *or* a closed channel (`read` then returns 0), and
+`ProcessChannel::close_stdin` calls `wake_pollers`. Both halves are needed: the first answers a
+poll that starts after the close, the second ends one parked before it.
+[`archive/CLOSED_STDIN_NEVER_POLLED_READABLE.md`](../../../archive/CLOSED_STDIN_NEVER_POLLED_READABLE.md).
 
 ## Background
 
