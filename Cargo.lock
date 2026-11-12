@@ -528,6 +528,7 @@ dependencies = [
  "akuma-user-access",
  "akuma-user-space",
  "akuma-user-tree",
+ "akuma-usermode-amd64",
  "akuma-vfs",
  "akuma-vfs-glue",
  "akuma-virtio",
@@ -1416,6 +1417,14 @@ version = "0.1.0"
 [[package]]
 name = "akuma-user-walk"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-usermode-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-gdt",
+]
 
 [[package]]
 name = "akuma-vectors-aarch64"

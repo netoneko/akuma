@@ -174,8 +174,8 @@ impl PerCpu {
 /// `akuma-cpu`'s `percpu` module in the same change.
 const OFFSETS_PINNED: () = {
     assert!(core::mem::offset_of!(PerCpu, self_ptr) == 0);
-    assert!(core::mem::offset_of!(PerCpu, current_uctx) == 8);
-    assert!(core::mem::offset_of!(PerCpu, scratch) == 16);
+    assert!(core::mem::offset_of!(PerCpu, current_uctx) == akuma_usermode_amd64::PERCPU_CURRENT_UCTX);
+    assert!(core::mem::offset_of!(PerCpu, scratch) == akuma_usermode_amd64::PERCPU_SCRATCH);
     assert!(core::mem::offset_of!(PerCpu, index) == 24);
     assert!(core::mem::offset_of!(PerCpu, current_task) == 32);
 };

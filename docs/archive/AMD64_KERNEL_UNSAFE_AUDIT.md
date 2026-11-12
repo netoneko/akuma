@@ -4,7 +4,7 @@
 
 ## Status (2026-11-12, late)
 
-37 -> 18 -> 7.
+37 -> 18 -> 7 -> 3.
 
 First pass (37 -> 18): the CR3 chain (9, checked `activate`), the scheduler self-test counters (2,
 atomics), the no-op waker (`Waker::noop`), `machine.rs` and the crash dump's memory peek
@@ -30,11 +30,24 @@ Verified: amd64 boot suite (default features, SMP=2) 836/836, clippy `-D warning
 `headless` and `headless,no-tests`, host tests of the touched crates. Not yet booted: the multiboot2
 paths (the suite boots PVH on virtio).
 
-Left (7): `usermode.rs` 4 (ring-3 entry, unwind, LSTAR: the `akuma-usermode-amd64` crate),
-`multiboot2.rs` 2 (framebuffer window, `RamSpan` claim), `smp.rs` `GsBase`. Still open from the
-soundness list: `read_val`'s `T: Copy + Default` still admits `bool` and `char`, which have invalid
-bit patterns; every caller passes an integer or an ABI struct, and a `UserPod` trait is the real
-fix.
+Third pass (7 -> 3): the ring-3 crossing moved to `akuma-usermode-amd64` (2 sites: one `unsafe
+extern` block, the MSR install). It owns `UserCtx` and the assembly, verbatim apart from three
+additions:
+- `enter_user_mode` and `enter_user_mode_forked` refuse (`ud2`) a `rip` with any of bits 63..47 set
+  and a null `gs:[8]`, so they are declared `safe fn`. `sysretq` to a non-canonical `rcx` raises
+  `#GP` in ring 0 on Intel; the kernel now turns such an entry into a `SIGSEGV` exit before it
+  releases the BKL.
+- `kernel_rsp` is private to the crate and both exits clear it, so `unwind` (the old
+  `unwind_to_kernel` asm) refuses unless the running task's `enter_user_mode` frame is live.
+- `smp.rs`'s `OFFSETS_PINNED` asserts the per-CPU offsets against the crate's
+  `PERCPU_CURRENT_UCTX`/`PERCPU_SCRATCH`.
+
+Left (3): `multiboot2.rs` 2 (framebuffer window, `RamSpan` claim), `smp.rs` `GsBase`. Each is one
+claim about memory or a register made once at boot from firmware-supplied facts. Next: merge the
+crossing with `akuma-ring3-amd64` (Taoxichuan's), which has no unwind, fork entry or `UserCtx`.
+Still open from the soundness list: `read_val`'s `T: Copy + Default` still admits `bool` and `char`,
+which have invalid bit patterns; every caller passes an integer or an ABI struct, and a `UserPod`
+trait is the real fix.
 
 ## Soundness first
 1. uaccess::read_val<T: Copy> (uaccess.rs:310-322) builds a T from user bytes; T: Copy admits bool/char/enums/&'static T; exported to forbid(unsafe) drivers (drivers.rs:825). Same in akuma_user_access::read_user_into / as_user_bytes_mut. Fix: `unsafe trait UserPod` for ABI structs.

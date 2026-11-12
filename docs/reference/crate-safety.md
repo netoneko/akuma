@@ -1,14 +1,18 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-11-12 (late) with `python3 scripts/cloc_akuma.py src crates`:
-**105 of 143 crates** forbid `unsafe`. 125776 of 126991 production lines (99.0%) sit outside any
-`unsafe` block; 376 production sites across `crates/` (474 with tests), 0 inside enforced crates.
-`akuma-kernel-amd64` went 37 -> 18: every CR3 write goes through the checked
-`akuma_pagetable::amd64::activate`, the wake IPI is a `akuma-trap-amd64` kind, device reads go
-through `MmioWindow`s from `map_device_window`, RAM reads through `akuma_phys::peek_ram`, the RAM
-disk is an `akuma_phys::RamSpan` (one claim, at the module reservation), and the triple-fault reset
-is `akuma_idt_amd64::reset_by_triple_fault`. `akuma-phys` 9 -> 12 and `akuma-idt-amd64` 1 -> 2 took
-the moved operations. What is left and why: [`AMD64_KERNEL_UNSAFE_AUDIT.md`](../archive/AMD64_KERNEL_UNSAFE_AUDIT.md).
+**Grade: A** — regenerated 2026-11-12 (night) with `python3 scripts/cloc_akuma.py src crates`:
+**105 of 144 crates** forbid `unsafe`. 125926 of 127082 production lines (99.1%) sit outside any
+`unsafe` block; 367 production sites across `crates/` (465 with tests), 0 inside enforced crates.
+`akuma-kernel-amd64` went 37 -> 3. The CR3 writes go through the checked
+`akuma_pagetable::amd64::activate`; the wake IPI is an `akuma-trap-amd64` kind; device reads use
+`MmioWindow`s; RAM reads `akuma_phys::peek_ram`; the RAM disk is an `akuma_phys::RamSpan`; the
+reset is `akuma_idt_amd64::reset_by_triple_fault`; the GDT/TSS are `akuma-percpu-gdt-amd64`'s;
+user copies are `akuma_user_access::copy_{from,to}_user_upper_half`; the AP trampoline is an
+`akuma_boot_amd64::ap::TrampolinePage`; and the ring-3 crossing is the new
+`akuma-usermode-amd64` (2 sites). Left: the framebuffer window, the RAM-disk claim and the
+`GS_BASE` write. Detail: [`AMD64_KERNEL_UNSAFE_AUDIT.md`](../archive/AMD64_KERNEL_UNSAFE_AUDIT.md).
+
+The run before, 2026-11-12 (late): 376 production sites (474 with tests), `akuma-kernel-amd64` 18.
 
 The run before, 2026-11-12: 391 production sites (490 with tests).
 `akuma-kvm-amd64` took the ban: entering a guest is safe

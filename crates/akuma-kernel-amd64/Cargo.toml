@@ -219,6 +219,9 @@ akuma-port = { path = "../akuma-port" }
 akuma-gdt = { path = "../akuma-gdt" }
 # The per-core GDT/TSS storage and `lgdt`/`ltr`, behind a once-per-slot claim.
 akuma-percpu-gdt-amd64 = { path = "../akuma-percpu-gdt-amd64" }
+# The ring-3 crossing: `syscall_entry`, the entries into ring 3, the unwind,
+# the STAR/LSTAR install, and the `UserCtx` layout their assembly indexes.
+akuma-usermode-amd64 = { path = "../akuma-usermode-amd64" }
 # Linux `reboot(2)` ABI decode, shared with the aarch64 kernel's `sc-reboot`.
 # `src/pci.rs`'s sibling `src/reboot.rs` adds the x86 reset that `akuma-boot`'s
 # own `system_reset` (a PSCI `smc`) cannot do here.

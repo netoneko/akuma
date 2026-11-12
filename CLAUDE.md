@@ -75,6 +75,11 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   EL0 `UserTrapFrame` (volatile accessors, `snapshot`/`store`), made once at
   `rust_sync_el0_handler`; `akuma-exceptions` went 83 -> 38 sites. **Never write
   `(*frame).x0` in a handler.**
+  `akuma-usermode-amd64` (2026-11-12) is the full amd64 kernel's **ring-3 crossing**: `syscall_entry`,
+  `enter`/`enter_forked` (safe: the stubs refuse a non-user `rip` and a null per-CPU `UserCtx`),
+  `unwind`, the STAR/LSTAR/FMASK install, and the `UserCtx` layout the assembly indexes (`kernel_rsp`
+  is private to it). Taoxichuan's counterpart is `akuma-ring3-amd64`; the two are to merge. **Never
+  put ring-3 entry assembly back in `crates/akuma-kernel-amd64/`.**
   `akuma_cpu::msr` is the closed set of MSRs the kernel touches (`Msr` enum): reads
   safe, `write` unsafe (so the kernel's own `GS_BASE`, which every per-CPU read
   dereferences, stays `unsafe` at its one call site), and `set_fs_base`/`set_user_gs_base`

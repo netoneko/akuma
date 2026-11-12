@@ -1,0 +1,16 @@
+[package]
+name = "akuma-usermode-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The full amd64 kernel's ring-3 crossing: syscall entry stub, sysret/fork entries, unwind, STAR/LSTAR install"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `Msr::{Efer, Star, Lstar, Fmask}`: the closed MSR set; no `wrmsr` of its own.
+akuma-cpu = { path = "../akuma-cpu" }
+# `star()` and `USER_CS`/`USER_SS`: `sysretq` derives the user selectors from
+# STAR, and `.Lsig_return`'s `iretq` frame names them, so both come from the
+# table's own row order.
+akuma-gdt = { path = "../akuma-gdt" }

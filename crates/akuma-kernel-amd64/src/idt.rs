@@ -1172,7 +1172,7 @@ fn user_fault(
 }
 
 /// The signal a ring-3 fault raises.
-const SIGSEGV: u32 = 11;
+pub const SIGSEGV: u32 = 11;
 
 /// `SIGTRAP`, the signal a ring-3 `#DB` is.
 const SIGTRAP: u32 = 5;
