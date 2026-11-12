@@ -320,6 +320,16 @@ case "$KERNEL_DROPOFF" in
     ;;
 esac
 
+# INIT / INITARGS: the kernel's `init=` / `initargs=` (comma-separated), passed as the DTB's
+# `/chosen/bootargs`; APPEND adds any other words. Unset, the kernel starts `herd daemon`.
+# The same names `amd64/run.sh` takes. `docs/reference/subsystems/boot.md` § Init.
+BOOTARGS="${APPEND:-}"
+[ -n "${INIT:-}" ] && BOOTARGS="$BOOTARGS init=$INIT"
+[ -n "${INITARGS:-}" ] && BOOTARGS="$BOOTARGS initargs=$INITARGS"
+BOOTARGS="${BOOTARGS# }"
+APPEND_ARGS=()
+[ -n "$BOOTARGS" ] && APPEND_ARGS=(-append "$BOOTARGS")
+
 QEMU_ARGS=(
   -semihosting
   -machine virt,gic-version=3
@@ -340,6 +350,7 @@ QEMU_ARGS=(
   "${DROPOFF_ARGS[@]}"
   "${ACTION_ARGS[@]}"
   -kernel "$BIN"
+  "${APPEND_ARGS[@]}"
   "${GDB_ARGS[@]}"
 )
 

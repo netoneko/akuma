@@ -24,6 +24,8 @@ akuma-gic = { path = "../akuma-gic" }
 akuma-kernel-core = { path = "../akuma-kernel-core" }
 akuma-machine-facts = { path = "../akuma-machine-facts" }
 akuma-mem-policy = { path = "../akuma-mem-policy" }
+# The boot command line (`/chosen/bootargs`), kept once; `init=`/`initargs=` read through `akuma_params::init`.
+akuma-params = { path = "../akuma-params" }
 akuma-net = { path = "../akuma-net", default-features = false }
 akuma-pmm = { path = "../akuma-pmm" }
 akuma-primitives = { path = "../akuma-primitives" }

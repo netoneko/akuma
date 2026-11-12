@@ -2746,6 +2746,26 @@ Open, found on the way and not changed here:
   group of its own, so `^C` does work there. The AArch64 kernel's `setpgid` is ungated; one of
   the two answers has to win when dispatch converges.
 
+### `init=` on both kernels, one reader (2026-11-12)
+
+The AArch64 kernel read no boot command line at all: it started `/bin/herd daemon`, hard-wired. amd64
+read `init=`/`initargs=` three times over (`machine::init_path`/`init_args` re-parsing the PVH start
+info for each word, and `multiboot2::init_path`), with the GRUB path splitting `initargs=` itself.
+
+Now both kernels keep the line once in `akuma-params` (the crate Taoxichuan already captured into):
+AArch64 from the DTB's `/chosen/bootargs` inside the DTB closure, where the blob is still valid
+(`capture_bootargs`), amd64 from either entry point (`boot::keep_cmdline`). Init is chosen by one
+host-tested reader, `akuma_params::init::Init`, and `run_init` takes that `Init`. What stays per
+kernel is only the default: `herd daemon` on AArch64, `/bin/sh` on a GRUB boot, nothing on PVH.
+`scripts/cargo_runner.sh` passes `INIT`/`INITARGS` (and `APPEND`) as `-append`, the names
+`amd64/run.sh` already used. The AArch64 main loop's "herd channel" is now init's.
+
+Checked by hand: AArch64 with no line starts `herd daemon` as before; `INIT=/bin/sshd
+INITARGS=--port,22,--no-banner` boots with sshd as init (no herd) and serves ssh; amd64
+`init=/bin/busybox initargs=uname,-a` runs one applet and reaches `-- init exited --`;
+`init=/bin/sshd` serves 10 ssh sessions; `akuma-params` host tests; clippy on AArch64 and the three
+amd64 images.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral

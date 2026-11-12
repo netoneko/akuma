@@ -396,6 +396,22 @@ pub fn token_value<'a>(cmdline: &'a str, prefix: &str) -> Option<&'a str> {
     cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix(prefix))
 }
 
+/// Keep the boot command line (`akuma_params::capture`), once, for both entry points: what
+/// `init=`/`initargs=` are read from at the end of the boot (`akuma_params::init`, shared with
+/// the AArch64 kernel). A failure is reported and leaves the line empty: the defaults apply.
+pub fn keep_cmdline(cmdline: &str) {
+    let r = akuma_params::capture(|buf| {
+        if cmdline.len() > buf.len() {
+            return Err(akuma_params::Failure::TooLong);
+        }
+        buf[..cmdline.len()].copy_from_slice(cmdline.as_bytes());
+        Ok(cmdline.len())
+    });
+    if r.is_err() {
+        crate::serial::puts("  [params] the command line was not kept: init= and initargs= are ignored\n");
+    }
+}
+
 /// Apply the boot flags that steer the running kernel rather than the boot:
 /// `fbverbose`, `fbtrace`, `strace`, `strace_err`, `strace_pid=`, `strace_nr=`,
 /// `nopidfd`.

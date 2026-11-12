@@ -17,6 +17,8 @@
 //! a crate cannot read `init=`, `epoch=` or another crate's keys. What a crate needs is described by the [`ParamSource`] trait, so
 //! its parser takes the cmdline view in the kernel, a fixture in a host test, or a compiled-in table, and cannot tell.
 
+pub mod init;
+
 use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
 use akuma_primitives::{OnceCopy, TakeOnce};

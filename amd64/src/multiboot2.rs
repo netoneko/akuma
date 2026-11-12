@@ -191,6 +191,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
         crate::halt();
     };
     record_boot_framebuffer(&info);
+    crate::boot::keep_cmdline(info.cmdline());
     // `nofb`: do not touch the framebuffer at all — for a machine run as a
     // headless test target (ryzen's reboot loop, `overlays/ryzen/`).
     let console = if info.cmdline().split_ascii_whitespace().any(|t| t == "nofb") {
@@ -611,13 +612,13 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
 
     if run_shell {
         crate::splash::phase(2);
-        let path = init_path(cmdline);
-        // `initargs=a,b,c`, comma-separated as on the PVH path: `init=/bin/busybox
-        // initargs=uname,-a` runs one applet and exits.
-        let args: alloc::vec::Vec<&str> = cmdline
-            .split_ascii_whitespace()
-            .find_map(|t| t.strip_prefix("initargs="))
-            .map_or_default(|v| v.split(',').filter(|s| !s.is_empty()).collect());
+        // `init=`/`initargs=` (`akuma_params::init`, shared with the PVH path and the
+        // AArch64 kernel), `/bin/sh` when the line names none: a GRUB boot is a machine
+        // someone sits at. `init=/bin/busybox initargs=uname,-a` runs one applet and exits.
+        let init = akuma_params::init::Init::from_line_or(
+            akuma_params::line(),
+            akuma_params::init::Init::new("/bin/sh", ""),
+        );
         // stdout reaches the screen through the mirror, and stdin is the i8042
         // (`kbd`, the firmware's USB emulation) through `console`'s pump, which
         // `run_init` starts. A program that reads fd 0 here gets the keyboard
@@ -628,20 +629,8 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
         if cmdline.split_ascii_whitespace().any(|t| t == "wdttest") {
             crate::watchdog::wedge_for_test();
         }
-        crate::usermode::run_init(path, &args);
+        crate::usermode::run_init(init);
     }
-}
-
-/// The `init=` argument from the boot loader's command line, or `/bin/sh`.
-fn init_path(cmdline: &str) -> &str {
-    for word in cmdline.split(' ') {
-        if let Some(rest) = word.strip_prefix("init=")
-            && !rest.is_empty()
-        {
-            return rest;
-        }
-    }
-    "/bin/sh"
 }
 
 /// Bring up the xHCI + USB mass-storage stack, sanity-check `/dev/sda`'s MBR,

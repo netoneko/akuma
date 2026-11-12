@@ -240,6 +240,8 @@ akuma-virtio = { path = "../crates/akuma-virtio" }
 # virtio HAL uses. Reached transitively already; named here because this crate
 # now calls it directly.
 akuma-primitives = { path = "../crates/akuma-primitives" }
+# The boot command line, kept once; `init=`/`initargs=` through `akuma_params::init`, the reader the AArch64 kernel uses too.
+akuma-params = { path = "../crates/akuma-params" }
 # The fd table's parts (`Names`/`FlagSet`) that `KERNEL_TABLE`'s static is
 # made of; the state machine itself comes in through `akuma-exec`.
 akuma-fdtable = { path = "../crates/akuma-fdtable" }

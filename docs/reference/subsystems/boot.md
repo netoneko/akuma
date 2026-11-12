@@ -42,18 +42,24 @@ and stay out of its way. The three kernel families do it differently today:
 
 | | AArch64 `akuma` | amd64 `akuma-amd64` | Taoxichuan / Shanghai (`akuma-tokio-kernel-*`) |
 |---|---|---|---|
-| Which program | `/bin/herd daemon`, fixed; only if `config::AUTO_START_HERD` | `init=` (default `/bin/sh`), argv from `initargs=a,b,c` | `init=` |
+| Which program | `init=`/`initargs=`; default `/bin/herd daemon`; none if `config::AUTO_START_HERD` is off | `init=`/`initargs=`; default `/bin/sh` on a GRUB boot, none on a PVH boot | `init=` |
+| Where the line comes from | the DTB's `/chosen/bootargs` (`INIT=`/`INITARGS=` to `cargo run`) | PVH start info, or GRUB's command line (`INIT=`/`INITARGS=` to `amd64/run.sh`) | the same, per arch |
 | Started by | `kernel_main` (`crates/akuma-kernel-glue/src/lib.rs`), `spawn_process_with_channel` | `usermode::run_init`, from `lib.rs` (PVH) and `multiboot2.rs` (GRUB) | the builder's `run_init()` |
 | pid | whatever the allocator gives | 1 (`Attach { pid: Some(1) }`) | 1 |
 | stdio | its own channel; the main loop copies its output to the UART. Nothing reads the UART | the console channel and terminal (`Attach`) | COM1 if the kernel calls `.console()` |
 | Console input | none | the console pump (`console` feature) | none |
 | When it exits | `[Herd] Process exited with code N`; the kernel keeps running | `-- init exited --`; the boot task returns | exit code printed, then halt |
 
+**One reader.** Both Akuma kernels keep the boot line once (`akuma_params::capture`; AArch64 in
+`capture_bootargs`, amd64 in `boot::keep_cmdline` on both entry points) and choose init with
+`akuma_params::init::Init` (`from_line` / `from_line_or`, host-tested). Only the defaults differ.
+`initargs=` is comma-separated (`initargs=uname,-a`), and `argv[0]` is always the path.
+
 ### amd64, in order
 
 `run_init(path, args)` (`amd64/src/usermode.rs`) is four stages:
 
-1. **Find init.** `fs::read_image_head(path)`, which follows symlinks
+1. **Find init.** `Init` from the boot line (above), then `fs::read_image_head(path)`, which follows symlinks
    (`/bin -> usr/bin`). Missing: `[init] not on the disk`, and the boot stops.
 2. **The console** (`console_before_init`). With the `console` feature: end the
    splash unless init is `herd` (herd's console service ends it), apply

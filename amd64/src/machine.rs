@@ -57,28 +57,6 @@ pub fn describe(start_info_pa: u64) -> MachineDescription {
     d
 }
 
-/// The value of an `init=` token on the boot command line, copied into `buf`.
-///
-/// Which program gets the console after the self-tests. `paws` is a shell and
-/// wants a terminal; `httpd` is a server and wants none, so the choice cannot be
-/// baked in — and the command line is where a machine already tells this kernel
-/// things (`docs/reference/firecracker-amd64/README.md`).
-///
-/// Returns `None` when there is no such token, which means "no init": the boot
-/// halts after its verdict, as it did before there was anything to run.
-pub fn init_path(start_info_pa: u64, buf: &mut [u8]) -> Option<&str> {
-    cmdline_token(start_info_pa, "init=", buf)
-}
-
-/// The value of an `initargs=` token — the arguments to pass the init program,
-/// **comma-separated** (the command line splits on whitespace, so a space
-/// cannot appear inside one token). `initargs=uname,-a` runs `busybox uname -a`.
-///
-/// `None` when absent: the init program is run with just its path as `argv[0]`.
-pub fn init_args(start_info_pa: u64, buf: &mut [u8]) -> Option<&str> {
-    cmdline_token(start_info_pa, "initargs=", buf)
-}
-
 /// Is a bare `flag` token present on the command line? For `strace` (syscall
 /// tracing during bring-up).
 pub fn flag(start_info_pa: u64, flag: &str) -> bool {
@@ -115,19 +93,6 @@ pub fn cmdline(start_info_pa: u64, buf: &mut [u8]) -> &str {
     let n = line.len().min(buf.len());
     buf[..n].copy_from_slice(&line.as_bytes()[..n]);
     core::str::from_utf8(&buf[..n]).unwrap_or("")
-}
-
-fn cmdline_token<'a>(start_info_pa: u64, prefix: &str, buf: &'a mut [u8]) -> Option<&'a str> {
-    let mut scratch = [0u8; 512];
-    let si = akuma_ryzen_amd64::StartInfo::parse(&Physmap, start_info_pa)?;
-    let cmdline = si.cmdline(&Physmap, &mut scratch)?;
-    let value = cmdline
-        .split_ascii_whitespace()
-        .find_map(|t| t.strip_prefix(prefix))?;
-    // Copied out because `scratch` dies with this frame.
-    let n = value.len().min(buf.len());
-    buf[..n].copy_from_slice(&value.as_bytes()[..n]);
-    core::str::from_utf8(&buf[..n]).ok()
 }
 
 /// Print what the machine said. A dump, not a configuration step.

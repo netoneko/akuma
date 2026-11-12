@@ -530,6 +530,29 @@ pub fn start(dtb_ptr: usize, before_main: fn()) -> ! {
     kernel_main(dtb_ptr)
 }
 
+/// Keep `/chosen/bootargs` as the boot command line (`akuma_params::capture`), once, while the
+/// DTB is still mapped: the blob is not valid past heap init. No DTB, no `/chosen` or no
+/// `bootargs` is an empty line, which every reader takes as "nothing set".
+#[cfg(target_os = "none")]
+fn capture_bootargs(fdt: Option<&akuma_fdt::Fdt<'_>>) {
+    let bootargs = fdt
+        .and_then(|f| f.find_node("/chosen"))
+        .and_then(|n| n.property("bootargs")?.as_str())
+        .unwrap_or("");
+    let r = akuma_params::capture(|buf| {
+        if bootargs.len() > buf.len() {
+            return Err(akuma_params::Failure::TooLong);
+        }
+        buf[..bootargs.len()].copy_from_slice(bootargs.as_bytes());
+        Ok(bootargs.len())
+    });
+    match r {
+        Ok(line) if !line.is_empty() => safe_print!(160, "[Boot] command line: {}\n", line),
+        Ok(_) => {}
+        Err(e) => safe_print!(96, "[Boot] command line not kept ({:?}): defaults apply\n", e),
+    }
+}
+
 /// Main kernel initialization - all safe code
 #[cfg(target_os = "none")]
 pub fn kernel_main(dtb_ptr: usize) -> ! {
@@ -675,6 +698,7 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
             safe_print!(64, "[DTB] none at 0x{:x}\n", akuma_fdt::resolve(dtb_ptr));
         }
         let fdt = dtb.and_then(akuma_fdt::Dtb::parse);
+        capture_bootargs(fdt.as_ref());
 
         let outcome = platform::install_fdt_device_map(fdt.as_ref());
         match outcome {
@@ -1677,24 +1701,31 @@ fn run_async_main() -> ! {
     // Enable IRQs for the main loop
     akuma_primitives::irq::unmask_irqs();
 
-    // Auto-start herd process supervisor
-    let (_herd_tid, mut herd_channel) = if config::AUTO_START_HERD && fs::is_initialized() {
-        const HERD_PATH: &str = "/bin/herd";
-        const HERD_ARGS: &[&str] = &["daemon"];
-        if fs::exists(HERD_PATH) {
-            crate::safe_print!(64, "[Main] Starting herd supervisor...\n");
-            match process::spawn_process_with_channel(HERD_PATH, Some(HERD_ARGS), None) {
-                Ok((tid, channel, _pid)) => {
-                    crate::safe_print!(64, "[Main] Herd started (tid={})\n", tid);
+    // Init: what `init=`/`initargs=` on the boot line name (`akuma_params::init`, the reader
+    // amd64 uses too), and `herd daemon` when it names nothing, which is what this kernel has
+    // always started. `config::AUTO_START_HERD` still switches init off altogether. Its stdout
+    // is a channel of its own, which the loop below copies to the UART; nothing reads the UART
+    // for it (this kernel has no interactive console). `docs/reference/subsystems/boot.md` § Init.
+    let (_init_tid, mut init_channel) = if config::AUTO_START_HERD && fs::is_initialized() {
+        let init = akuma_params::init::Init::from_line_or(
+            akuma_params::line(),
+            akuma_params::init::Init::new("/bin/herd", "daemon"),
+        );
+        if fs::exists(init.path) {
+            let args: alloc::vec::Vec<&str> = init.args().collect();
+            crate::safe_print!(160, "[Main] Starting init: {} {}\n", init.path, init.args);
+            match process::spawn_process_with_channel(init.path, Some(&args), None) {
+                Ok((tid, channel, pid)) => {
+                    crate::safe_print!(64, "[Main] init started (pid={}, tid={})\n", pid, tid);
                     (tid, Some(channel))
                 }
                 Err(e) => {
-                    crate::safe_print!(64, "[Main] ERROR: Failed to start herd: {}\n", e);
+                    crate::safe_print!(160, "[Main] ERROR: failed to start init {}: {}\n", init.path, e);
                     (0, None)
                 }
             }
         } else {
-            crate::safe_print!(64, "[Main] WARNING: /bin/herd not found, supervisor disabled\n");
+            crate::safe_print!(160, "[Main] WARNING: init {} not found, nothing started\n", init.path);
             (0, None)
         }
     } else {
@@ -2107,8 +2138,8 @@ fn run_async_main() -> ! {
             akuma_exec::bkl::current_core_id(),
             akuma_exec::sync::HOLD_TAG_NETPOLL_HERD,
         );
-        // Poll herd output
-        if let Some(ref channel) = herd_channel {
+        // Poll init's output
+        if let Some(ref channel) = init_channel {
             if let Some(output) = channel.try_read() {
                 for &byte in &output {
                     console::print_char(byte as char);
@@ -2116,8 +2147,8 @@ fn run_async_main() -> ! {
             }
             if channel.has_exited() {
                 let exit_code = channel.exit_code();
-                crate::safe_print!(64, "[Herd] Process exited with code {}\n", exit_code);
-                herd_channel = None;
+                crate::safe_print!(64, "[Main] init exited with code {}\n", exit_code);
+                init_channel = None;
             }
         }
         

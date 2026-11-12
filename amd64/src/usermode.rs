@@ -4079,11 +4079,13 @@ fn console_before_init(_path: &str) {
 /// only when the binary is on the disk, so a machine without it still reaches
 /// the "all self-tests passed" line and halts as before.
 ///
-/// Selected by `init=` on the boot command line. `paws` is the shell; `httpd`
+/// Selected by `init=`/`initargs=` on the boot command line (`akuma_params::init`).
+/// `paws` is the shell; `httpd`
 /// is a server that never reads the console. Both are the same binaries the
 /// aarch64 devbox runs, compiled for `x86_64-unknown-none` against a ported
 /// `libakuma`.
-pub fn run_init(path: &str, args: &[&str]) {
+pub fn run_init(init: akuma_params::init::Init<'_>) {
+    let path = init.path;
     // A missing init is reported and the boot halts as before. Resolved first: a
     // usr-merged root has `/bin -> usr/bin` and `sh -> bash`.
     if crate::fs::read_image_head(path).is_err() {
@@ -4095,11 +4097,9 @@ pub fn run_init(path: &str, args: &[&str]) {
     // argv[0] is the path; `args` (from `initargs=`) follow. A multicall binary
     // like busybox dispatches on `argv[1]` when `argv[0]`'s basename is
     // `busybox`, so `initargs=uname,-a` runs its `uname` applet.
-    let mut argv: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::with_capacity(1 + args.len());
+    let mut argv: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::with_capacity(1 + init.args().count());
     argv.push(path.as_bytes().to_vec());
-    for a in args {
-        argv.push(a.as_bytes().to_vec());
-    }
+    argv.extend(init.args().map(|a| a.as_bytes().to_vec()));
 
     // Everything init's first instructions may rely on happens **before** the
     // spawn, which publishes it: the shared spawn schedules the child at once.

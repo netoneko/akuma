@@ -221,6 +221,7 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
     // way rather than each parsing the line its own way.
     let mut cmdline_buf = [0u8; 512];
     let cmdline = machine::cmdline(hvm_start_info, &mut cmdline_buf);
+    boot::keep_cmdline(cmdline);
 
     // Read the machine's description of itself. After `drop_identity_map`
     // because every read goes through the physmap, and after `idt::init` because
@@ -387,22 +388,9 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
     // multiboot2 path documents at length. A failed check is a line in `dmesg`,
     // not a reason to make the machine unreachable.
     if have_fs {
-        let mut init_buf = [0u8; 128];
-        let mut args_buf = [0u8; 256];
-        // Copy the path out first: `init_path` and `init_args` both borrow a
-        // fresh parse of the command line, so they cannot both be live.
-        let mut path_store = [0u8; 128];
-        let path_len = machine::init_path(hvm_start_info, &mut init_buf)
-            .map(|p| {
-                let n = p.len().min(path_store.len());
-                path_store[..n].copy_from_slice(&p.as_bytes()[..n]);
-                n
-            });
-        if let Some(path_len) = path_len {
-            let path = core::str::from_utf8(&path_store[..path_len]).unwrap_or("");
-            let args_str = machine::init_args(hvm_start_info, &mut args_buf).unwrap_or("");
-            let args: alloc::vec::Vec<&str> =
-                args_str.split(',').filter(|s| !s.is_empty()).collect();
+        // `init=`/`initargs=` (`akuma_params::init`, the reader both kernels share). A PVH
+        // boot that names no init runs none: it halts after its verdict.
+        if let Some(init) = akuma_params::init::Init::from_line(akuma_params::line()) {
             // Leave the timer running for the init program: it drives preemption
             // (so a busy server cannot starve the netpoll daemon) and advances
             // the clock `akuma-net`'s wait deadlines are measured against. The
@@ -411,7 +399,7 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
                 lapic::start_timer();
             }
             boot::apply_runtime_flags(cmdline);
-            usermode::run_init(path, &args);
+            usermode::run_init(init);
         }
     }
 

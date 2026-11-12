@@ -547,6 +547,7 @@ cargo build --release
 cargo run --release                     # QEMU via scripts/cargo_runner.sh
 MEMORY=2048 cargo run --release         # Override RAM
 GDB=1 cargo run --release               # QEMU gdbstub on :1234
+INIT=/bin/sshd INITARGS=--port,22 cargo run --release  # init= other than herd (both kernels: boot.md § Init)
 scripts/create_disk.sh                  # (Re)create ext2 disk image
 scripts/populate_disk.sh                # Populate disk with userspace binaries
 userspace/build.sh                      # Build all userspace binaries

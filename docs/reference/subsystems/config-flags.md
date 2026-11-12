@@ -190,6 +190,8 @@ unbalances the BKL ticket FIFO).
 | Var | Default | Effect |
 |---|---|---|
 | `MEMORY` | (per script) | Guest RAM. Devbox: 4096. Self-host: 14336. |
+| `INIT` / `INITARGS` | unset | The kernel's `init=` / `initargs=` (comma-separated), passed to QEMU as `-append`, i.e. the DTB's `/chosen/bootargs`. Unset, the kernel starts `/bin/herd daemon`. The same names `amd64/run.sh` takes; both kernels read them through `akuma_params::init` ([`boot.md` § Init](boot.md#init)). | `cargo_runner.sh` |
+| `APPEND` | unset | Any other boot-line words, before `init=`/`initargs=`. | `cargo_runner.sh` |
 | `DISK` | `disk.img` | Disk image path. |
 | `INSTANCE` | `0` | Instance id (affects SSH port, logging). |
 | `SNAPSHOT` | unset | `1` boots from a QEMU snapshot (writes discarded). |
